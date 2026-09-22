@@ -1,643 +1,695 @@
-# Codex Task — Simplify and Tighten DexMani Real Runtime Semantics
+# Codex Task — Tighten DexMani Real Runtime Semantics Without Growing the Runtime
 
-## Task status
+## Status and execution rule
 
-This task is based on the current `main` fact-checked at commit:
+This task was re-reviewed against current `main` at:
 
-`46ba86710a62cda1233d522d62fc20627ad1dd4d`
+`15cd48dc01bc00fae513d2ca5769de45a9c67183`
 
-Before editing, re-read the current repository state and `AGENTS.md`. If `main` has moved, preserve the intent below and reconcile against the new code instead of mechanically applying stale line-level assumptions.
+The implementation code beneath this task is still the behavior fact-checked in parent commit `46ba86710a62cda1233d522d62fc20627ad1dd4d`.
 
-## Repository intent
+Before editing:
 
-`dexmani_real` is a personal PhD research repository for:
+1. read `AGENTS.md`;
+2. inspect `git status --short`;
+3. inspect current definitions/usages rather than trusting line numbers in this document;
+4. preserve unrelated user changes;
+5. do not run hardware-affecting code.
 
-- dexterous real-robot data collection;
-- VR/HTS teleoperation;
-- xArm7 + XHand control;
-- RGB-D / point-cloud / proprioception / tactile observations;
-- learned-policy real-robot evaluation.
+If `main` moved, reconcile this task against the new code while preserving its intent. Do not mechanically restore mechanisms that newer code already removed.
 
-It is **not** a generic robotics runtime, production serving system, distributed command transaction layer, or generic dataset framework.
-
-Priorities remain:
-
-**physical safety > experiment correctness > research iteration speed > readability > generic extensibility > enterprise robustness**
-
-Prefer the smallest implementation that preserves the actual research and hardware guarantees.
-
-Do not replace deleted mechanisms with equivalent machinery under new names.
+This is one focused implementation pass. Do not stop after partial edits if the remaining work is offline and within scope.
 
 ---
 
-# 1. Verified baseline — do not regress
+# 1. Repository intent
 
-The latest code already fixed several previous review findings. Treat these as correct baseline behavior.
+`dexmani_real` is a personal PhD research repository for:
 
-## 1.1 Point-cloud observation semantics
+- real-robot dexterous data collection;
+- VR/HTS and keyboard teleoperation;
+- xArm7 + XHand control;
+- RGB-D / point-cloud / proprioception / tactile observations;
+- physical replay;
+- learned-policy real-robot evaluation.
 
-Preserve the current split:
+It is **not** a generic robotics platform, production serving stack, distributed command transaction layer, or generic dataset framework.
+
+Priorities:
+
+**physical safety > experiment correctness > research iteration speed > readability > generic extensibility > enterprise robustness**
+
+Prefer delete, then inline, then merge. Add abstractions only for a real hardware/resource boundary or demonstrated duplication.
+
+---
+
+# 2. Verified baseline — preserve exactly
+
+The latest code already corrected earlier review findings. Do not regress them.
+
+## 2.1 Point-cloud observation semantics
+
+Preserve:
 
 - point-cloud-only policy:
-  - consumes the latest fresh published point cloud;
-  - does **not** look up the source RGB-D frame;
+  - latest fresh published point cloud;
+  - no lookup of its historical source RGB-D frame;
 - RGB-only policy:
-  - consumes the latest fresh RGB frame;
+  - latest fresh RGB;
 - RGB + point-cloud policy:
-  - uses `source_camera_sequence` to require exact source-frame identity.
+  - exact source identity via `source_camera_sequence`.
 
-`source_camera_sequence` is useful scientific provenance. Do not remove it.
+`source_camera_sequence` is scientifically useful provenance. Keep it.
 
-Do not reintroduce a point-cloud-only dependency on historical camera-ring retention.
+Do not make point-cloud-only rollout depend on camera-ring history.
 
-## 1.2 Cartesian IK self-collision
+## 2.2 Cartesian IK collision semantics
 
-Preserve the current behavior:
+Preserve:
 
-- teleop hand target is prepared first;
-- policy `action_ee` hand target is prepared first;
-- `planner.set_hand_qpos(final_prepared_hand)` is applied before Cartesian IK;
-- online IK rejects self-colliding target configurations;
-- return-home planning uses appropriate measured/final hand geometry.
+- final prepared hand target is installed into the planner before teleop / `action_ee` IK;
+- online Cartesian IK rejects self-colliding target configurations;
+- return-home planning uses the intended measured/final hand geometry.
 
-Do not add normal-runtime current-to-target path/environment collision checking.
+Do not add current-to-target transition, environment, workspace, or table path collision checking to normal teleop/eval/replay.
 
-Full path collision/workspace/table planning remains owned by planned `return_home`.
+Full path planning remains owned by planned `return_home`.
 
-## 1.3 Command transport
+## 2.3 Command transport and motion authority
 
 Preserve latest-target semantics:
 
 ```text
-controller
+high-level controller
   -> latest RobotCommand mailbox
   -> worker observes newest sequence
-  -> final run_id/safety check
-  -> SDK
+  -> run_id / safety check at SDK boundary
+  -> vendor SDK
 ```
 
-Do not introduce:
+Keep `run_id` as the stale-work lifecycle fence.
+
+Do not add:
 
 - command ACK/adoption;
-- command IDs as public/scientific identity;
-- actuator ledgers;
-- ordered command FIFO;
+- public/scientific command IDs;
+- ordered action FIFO;
 - single-inflight transactions;
-- command lease machinery.
+- adoption/reached ledgers;
+- command leases.
 
-Keep `run_id` as the lifecycle stale-work fence.
-
-## 1.4 xArm / XHand control philosophy
+## 2.4 Hardware control philosophy
 
 Preserve:
 
 - xArm Mode 6 absolute targets and controller-side online replanning;
 - XHand validated absolute position targets;
-- relaxed XHand HOME completion on accepted send rather than strict measured convergence;
-- arm/hand worker processes as the sole SDK owners.
+- relaxed XHand HOME completion on accepted SDK send;
+- one owning process per live hardware SDK.
 
 Do not add:
 
 - host-side xArm trajectory interpolation;
-- 200/300 Hz XHand target resend;
-- hidden actuator slew filters;
-- timestamp waypoint scheduling.
+- XHand target interpolation;
+- 200/300 Hz repeated hand sends;
+- hidden software slew filters;
+- future timestamp waypoint scheduling.
 
-## 1.5 Data architecture
+## 2.5 Data architecture
 
 Preserve:
 
 - raw episodes as experiment source of truth;
-- actual monotonic timestamps;
+- actual monotonic experiment timestamps;
 - strict whole-episode raw -> canonical Zarr admission;
-- no row dropping, interpolation, repair, or silent salvage;
-- canonical Zarr as a full fixed training cache;
-- current recorder transaction / atomic publication architecture unless a concrete bug is found.
+- no row repair, resampling, interpolation, splitting, or silent salvage;
+- canonical Zarr as the full fixed training cache;
+- recorder transaction / atomic publication behavior unless a concrete bug is found.
 
-Do not change raw schema v32 merely for field-cleanliness.
+Do not migrate raw schema v32 merely for field cleanliness.
 
 ---
 
-# 2. Goal of this task
+# 3. Scope
 
-Make one narrow cleanup pass that improves correctness while reducing runtime/configuration complexity.
+Implement only these changes:
 
-The task should accomplish exactly these high-value changes:
-
-1. enforce control-rate compatibility with latest-target worker service rates;
-2. make observation freshness producer-owned and cadence-derived;
-3. move XHand read-failure timeout to the XHand hardware config owner;
-4. fail fast when a recorded teleop demonstration becomes permanently inadmissible;
+1. enforce service-rate compatibility for every research-semantic latest-target command producer;
+2. make normal observation freshness producer-owned and cadence-derived;
+3. move XHand feedback-read failure timeout to XHand hardware config;
+4. immediately terminate a recorded teleop demo after its first permanently inadmissible control row;
 5. remove the arbitrary point-count whitelist;
-6. stop busy-spinning the 30 Hz arm/hand worker service loops;
-7. remove dead/self-proof `camera_requested` / `pointcloud_requested` shared state;
-8. add lightweight policy timing summary statistics.
+6. make arm/hand 30 Hz worker timing sleep-only;
+7. remove dead/self-proof `camera_requested` and `pointcloud_requested` state;
+8. add lightweight, accurately named policy timing summaries.
 
-Do **not** expand scope into a runtime redesign.
+No runtime redesign.
 
 ---
 
-# 3. Required change A — control-rate compatibility
+# 4. Change A — command producer rate vs worker service rate
 
-## Problem
+## Why
 
 `robot_command_ring` is a latest-target mailbox with `maxlen=1`.
 
-Arm and hand workers currently service commands at `runtime.arm.loop_hz` and `runtime.hand.loop_hz`.
+Publishing faster than the relevant actuator worker service cadence can systematically overwrite intended high-level targets before the SDK observes them.
 
-If a controller publishes targets faster than the relevant worker can observe them, intermediate intended control targets can be overwritten before reaching the SDK.
+The validation here is deliberately modest:
 
-This is valid latest-target transport behavior, but it violates the meaning of a configured research control grid if allowed silently.
+> prevent a configured high-level producer cadence from exceeding its relevant worker cadence.
 
-The current default is fine:
+This is **not** an ACK guarantee that every target reaches hardware. Latest-target semantics remain intentional.
+
+Do not introduce a 2x margin, scheduler, phase lock, or delivery accounting.
+
+Use a tiny floating-point tolerance so mathematically equal rates are accepted.
+
+## 4.1 VR teleop
+
+At the central cross-section config boundary, currently `validate_config(cfg)` in `dexmani_real/config/experiment.py`:
+
+```python
+limiting_hz = cfg.arm.loop_hz
+if cfg.policy.hand_enabled:
+    limiting_hz = min(limiting_hz, cfg.hand.loop_hz)
+```
+
+Reject when:
 
 ```text
-teleop = 16 Hz
-arm worker = 30 Hz
-hand worker = 30 Hz
+cfg.teleop.control_hz > limiting_hz
 ```
 
-The missing piece is a boundary validation that prevents future invalid configs/checkpoints.
+within a small numerical tolerance.
 
-## Implementation
+Do not use the stale variable name `runtime` inside `validate_config`; the argument is `cfg`.
 
-### Teleop configuration
+## 4.2 Keyboard jog / camera calibration control cadence
 
-In the central experiment cross-section validation boundary (currently `validate_config()` in `dexmani_real/config/experiment.py`), validate:
+`keyboard_teleop.control_hz` drives arm-only latest-target command production in keyboard jog and camera-calibration motion.
+
+Validate centrally:
+
+```text
+cfg.keyboard_teleop.control_hz <= cfg.arm.loop_hz
+```
+
+The hand worker does not limit this arm-only command path.
+
+## 4.3 Learned policy
+
+In `validate_policy_runtime_compatibility(policy_spec, runtime)`:
 
 ```python
-worker_hz = runtime.arm.loop_hz
-if runtime.policy.hand_enabled:
-    worker_hz = min(worker_hz, runtime.hand.loop_hz)
-
-runtime.teleop.control_hz <= worker_hz
+policy_hz = 1.0 / float(policy_spec.control_dt_s)
+limiting_hz = min(runtime.arm.loop_hz, runtime.hand.loop_hz)
 ```
 
-Reject a teleop rate that exceeds the service rate of any actuator participating in teleop.
+Current Real policy deployment requires arm7 + hand12, so both worker rates matter.
 
-Keep the validation simple. No 2x safety factor, Nyquist-style rule, phase synchronization, or scheduling abstraction is needed.
+Reject if policy cadence exceeds the limiting worker cadence.
 
-### Learned policy configuration
+Report both rates in the error.
 
-In `validate_policy_runtime_compatibility()`:
+## 4.4 Physical replay
 
-```python
-policy_hz = 1.0 / policy_spec.control_dt_s
-worker_hz = min(runtime.arm.loop_hz, runtime.hand.loop_hz)
+Replay publishes every recorded arm+hand target once at `trajectory.fps`.
+
+In the existing replay preflight boundary, reject:
+
+```text
+trajectory.fps > min(runtime.arm.loop_hz, runtime.hand.loop_hz)
 ```
 
-Reject if `policy_hz > worker_hz`.
+before motion starts.
 
-Current Real learned-policy deployment requires arm7 + hand12, so both worker rates matter.
-
-Use a numerically reasonable comparison; do not reject equality because of floating-point representation noise.
-
-Error messages should report the policy/teleop rate and limiting worker rate.
+Do not change replay scheduling itself.
 
 ## Acceptance
 
-- 16 Hz teleop + 30 Hz workers: pass.
-- 30 Hz controller + 30 Hz workers: pass.
-- controller > 30 Hz with 30 Hz relevant worker: reject before startup.
-- no new runtime scheduler or transport state.
+- default VR teleop 16 Hz + workers 30 Hz: pass;
+- keyboard 30 Hz + arm worker 30 Hz: pass;
+- learned policy 16 Hz + workers 30 Hz: pass;
+- replay 16 Hz + workers 30 Hz: pass;
+- any relevant producer configured above its limiting worker rate: fail before motion/startup;
+- no new delivery protocol.
 
 ---
 
-# 4. Required change B — producer-owned freshness
+# 5. Change B — producer-owned normal observation freshness
 
-## Problem
+## Current problem
 
-Current normal observation freshness is overly permissive and owned by the wrong config section:
-
-```text
-PolicyParams.arm_state_stale_threshold_s  = 0.5 s
-PolicyParams.hand_state_stale_threshold_s = 1.0 s
-CameraParams.max_frame_age_s              = 0.25 s
-```
-
-At 30 Hz these correspond to roughly 15, 30, and 7.5 producer periods.
-
-A dexterous policy should not continue treating hand/tactile state from almost one second ago as current.
-
-Freshness is a property of the producer cadence, not of a learned policy.
-
-## Target semantics
-
-Use one internal research-runtime rule:
+Current normal observation freshness is both overly permissive and partly owned by `PolicyParams`:
 
 ```text
-normal observation freshness = 4 nominal producer periods
+arm state     0.5 s
+hand state    1.0 s
+camera        0.25 s
 ```
 
-At 30 Hz this is approximately 133 ms.
+At 30 Hz that is roughly 15, 30, and 7.5 producer periods.
 
-This provides a scheduling cushion while keeping stale data bounded to only a small number of physical updates.
+A controller should not treat nearly one-second-old hand/tactile feedback as current.
 
-## Implementation
+## Target rule
 
-Use one private/internal constant, e.g.:
+Use one internal rule for **normal runtime observation consumption**:
+
+```text
+max usable age = 4 nominal producer periods
+```
+
+At 30 Hz:
+
+```text
+4 / 30 ~= 0.133 s
+```
+
+This is an implementation constant, not a YAML research knob.
+
+Use a small private helper/constant in the owning config module if that avoids repetition. Do not add a generic timing framework.
+
+## 5.1 Arm
+
+Remove:
+
+```text
+PolicyParams.arm_state_stale_threshold_s
+```
+
+Expose a derived, non-dataclass-field property on `ArmParams`, preferably named clearly to distinguish it from homing-specific freshness, e.g.:
 
 ```python
-_OBSERVATION_FRESHNESS_PERIODS = 4.0
+ArmParams.feedback_max_age_s
 ```
 
-Avoid adding a new user-facing YAML knob.
+computed from `loop_hz`.
 
-### Arm
+Update all normal arm-feedback consumers currently reading the policy field, including camera calibration paths.
 
-Remove normal arm observation freshness from `PolicyParams`.
+### Important
 
-Expose it from the arm producer config as a derived property:
+Do **not** replace or reinterpret:
 
-```python
-ArmParams.state_max_age_s
-    = _OBSERVATION_FRESHNESS_PERIODS / loop_hz
+```text
+ArmParams.homing.state_max_age_s
 ```
 
-Update normal observation consumers and camera calibration paths that currently read `runtime.policy.arm_state_stale_threshold_s`.
+That is a separate planned-homing contract and remains unchanged.
 
-### Hand
+## 5.2 Hand
 
-Remove normal hand observation freshness from `PolicyParams`.
+Remove:
+
+```text
+PolicyParams.hand_state_stale_threshold_s
+```
 
 Expose:
 
 ```python
-HandParams.state_max_age_s
-    = _OBSERVATION_FRESHNESS_PERIODS / loop_hz
+HandParams.feedback_max_age_s
 ```
+
+derived from `loop_hz`.
 
 Update:
 
 - normal observation assembly;
-- return-home measured-hand freshness use;
-- any other actual hand-state freshness consumer.
+- return-home measured-hand freshness;
+- all other actual hand-feedback freshness consumers.
 
-### Camera
+## 5.3 Camera and derived point cloud
 
-Remove user-configurable normal `max_frame_age_s` as a dataclass field and make it a cadence-derived property:
+Remove `CameraParams.max_frame_age_s` as a user-configurable dataclass field.
 
-```python
-CameraParams.max_frame_age_s
-    = _OBSERVATION_FRESHNESS_PERIODS / fps
+Retain the same public property name if convenient, but derive it from:
+
+```text
+4 / fps
 ```
 
-Preserve `source_stall_timeout_s` as an independent hardware/source failure timeout.
+Point-cloud freshness remains tied to the source camera cadence because the published cloud keeps the source camera acquisition timestamp.
 
-Its meaning is different:
+Preserve:
 
-- `max_frame_age_s`: whether a consumer may still use the latest sample;
-- `source_stall_timeout_s`: when the camera producer declares source failure.
+```text
+CameraParams.source_stall_timeout_s
+```
 
-Keep validation that the stall timeout is greater than normal frame freshness.
+as an independent producer-failure timeout.
 
-### Important exclusions
+Keep the invariant:
 
-Do **not** conflate this task with:
+```text
+source_stall_timeout_s > derived max_frame_age_s
+```
 
-- `HomingParams.state_max_age_s`, which belongs to the dedicated planned homing procedure;
-- VR/HTS freshness, whose producer cadence is not being normalized in this task;
-- device failure/reconnect timeouts.
+## 5.4 VR
 
-Do not add adaptive frequency estimation.
+Do not change VR/HTS freshness in this task.
 
-## Config migration philosophy
+Its producer cadence and source semantics differ from the fixed-rate arm/hand/camera producers.
 
-Do not add backward-compatibility aliases for removed freshness keys.
+## Configuration semantics
 
-This repository intentionally validates external config strictly. Update repository-owned docs/examples/config references instead.
+Derived freshness should not become another persisted/user-editable field.
+
+Do not add backward-compatibility aliases for removed external config keys. Repository config loading intentionally rejects stale unknown fields.
+
+Search and update repository-owned docs/examples if any reference the removed keys.
 
 ---
 
-# 5. Required change C — move XHand read-failure timeout to HandParams
+# 6. Change C — XHand feedback failure timeout belongs to HandParams
 
-## Problem
+## Current problem
 
-`PolicyParams.hand_disconnect_timeout_s` is passed to the XHand worker as the state-read failure timeout.
+`PolicyParams.hand_disconnect_timeout_s` is actually passed to `hand_loop()` as the duration for repeated `get_state()` failure before worker failure.
 
-This is hardware producer behavior, not learned-policy behavior.
+That is XHand hardware producer behavior.
 
 ## Implementation
 
-Move/rename the setting into `HandParams`, preferably with semantics matching actual use, e.g.:
+Move/rename it to `HandParams`, preferably:
 
 ```python
 state_read_failure_timeout_s: float = 1.0
 ```
 
-Validate it in `HandParams.validate()`.
+Validate finite and positive in `HandParams.validate()`.
 
-Simplify the worker boundary where practical:
+Prefer simplifying the worker signature to:
 
 ```python
 def hand_loop(shared, config):
-    ...
-    timeout = config.state_read_failure_timeout_s
 ```
 
-Update all process construction call sites.
+and read the timeout from `config` internally.
 
-Remove the old field from `PolicyParams`.
+Update **all** current process constructors, including:
 
-Do not introduce a generic reconnect state machine.
+- teleop;
+- learned-policy deployment;
+- keyboard teleop;
+- physical replay;
+- any other repository search hit.
 
-## Preserve two different time scales
+Remove the old `PolicyParams` field and validation.
 
-Normal sample freshness and device failure timeout must remain distinct:
+## Preserve distinct meanings
+
+Do not merge:
 
 ```text
-~133 ms:
-latest sample is no longer usable by controller
-
-1.0 s:
-worker has failed to obtain usable feedback long enough to declare hardware/runtime failure
+~133 ms normal feedback freshness
+1.0 s repeated hardware feedback-read failure timeout
 ```
 
----
+A stale sample should stop being usable well before the worker declares the hardware path failed.
 
-# 6. Required change D — fail fast on invalid recorded teleop demonstrations
-
-## Verified current mismatch
-
-During teleop, `FRAME_IK_FAIL` / `FRAME_RETARGET_FAIL` rows are recorded, but the loop waits for `max_consecutive_errors=10` before pausing.
-
-Offline `validate_episode()` rejects the entire episode on the **first** non-`FRAME_OK` row.
-
-Therefore once the first failed row occurs during recording, that demonstration is permanently inadmissible for canonical training export.
-
-Continuing to record it wastes operator time and produces data known to be unusable for training.
-
-## Required behavior
-
-### Recording teleop
-
-On the first non-`FRAME_OK` control row:
-
-1. preserve/write that failed raw row exactly as today;
-2. mark the episode technically invalid/incomplete;
-3. immediately stop the recording episode / revoke active motion through existing lifecycle helpers;
-4. retain the partial raw episode so the failure reason remains inspectable;
-5. give a concrete stop reason such as `ik_failure` or `retarget_failure`.
-
-Do not silently drop the failed row.
-
-Do not salvage the previous rows into canonical training data.
-
-### Unrecorded/debug teleop
-
-A failed control tick may continue to behave as a skipped command.
-
-If automatic pause after repeated failures is useful for debug UX, keep a small module-local implementation constant rather than a user-facing experiment parameter.
-
-## Simplification
-
-Remove `PolicyParams.max_consecutive_errors`.
-
-Do not create a generic episode-validity state machine.
-
-Use the existing recorder/lifecycle functions.
+Do not add reconnect machinery.
 
 ---
 
-# 7. Required change E — remove the point-count whitelist
+# 7. Change D — recorded teleop fails fast on the first inadmissible control row
 
-## Problem
+## Verified behavior
 
-The current runtime unnecessarily restricts point counts to:
+`run_control_grid_tick()` already:
+
+1. computes the target/status;
+2. records the row when recording is active;
+3. returns `FRAME_OK`, `FRAME_IK_FAIL`, or `FRAME_RETARGET_FAIL`.
+
+Offline admission rejects the whole episode on the first non-`FRAME_OK` row.
+
+Therefore, after the first failed recorded row, continuing that recording cannot produce a canonical training episode.
+
+## Required recording behavior
+
+Immediately after `run_control_grid_tick(...)` returns:
+
+- if recording is active and `status != FRAME_OK`:
+  1. keep the failed row already written by `run_control_grid_tick()`;
+  2. call the existing teleop `stop(...)` path with:
+     - `save=True`;
+     - concrete reason (`ik_failure` or `retarget_failure`);
+     - `incomplete=True`;
+  3. continue the outer loop.
+
+The existing `stop(..., incomplete=True)` already:
+
+- revokes motion;
+- marks recorder technical status invalid;
+- requests recorder finalization with partial retention intent;
+- sets recording state false.
+
+**Do not call `recorder.join_stop()` synchronously from the 16 Hz control-tick path.**
+
+Let the existing `poll_stop()` / recorder transaction finish asynchronously.
+
+Do not change recorder transaction semantics.
+
+## Unrecorded/debug teleop
+
+Keep the useful existing behavior that repeated control failures eventually pause debug teleop, but remove it from user-facing experiment config.
+
+Replace `PolicyParams.max_consecutive_errors` with a small private teleop-loop implementation constant (retain current value 10 unless current code gives a concrete reason otherwise).
+
+Reset the local failure counter on a fresh begin/resume.
+
+For recorded teleop, the first failed row always wins; the debug threshold must never delay invalid-demo termination.
+
+---
+
+# 8. Change E — remove arbitrary point-count whitelist
+
+## Current problem
+
+Realtime/deployment code currently restricts point counts to:
 
 ```python
 {1024, 2048, 4096, 8192}
 ```
 
-The actual infrastructure already supports dynamically sized fixed deployment buffers and `PointCloudConfig` already validates `num_points` as a positive integer.
+But:
 
-The whitelist blocks legitimate 3D research ablations such as 512, 768, 1536, 3072, etc.
+- `PointCloudConfig` already validates `num_points` as a positive integer;
+- realtime IPC dtype is dynamically built per deployment;
+- policy/runtime compatibility already compares runtime point count to PolicySpec shape.
 
-## Required contract
+The whitelist blocks legitimate research ablations.
 
-Only require:
+## Final contract
+
+Require only:
 
 ```text
-N is a positive integer
+N is a positive non-bool integer
 point cloud is float32 [N, 6]
 runtime PointCloudConfig.num_points == PolicySpec point_cloud.shape[0]
 ```
 
 ## Remove
 
-Remove `SUPPORTED_POINT_CLOUD_COUNTS` and all imports/usages from at least:
+Delete `SUPPORTED_POINT_CLOUD_COUNTS` and all imports/usages.
+
+Current known locations include:
 
 - `dexmani_real/ipc/schema.py`;
 - `dexmani_real/ipc/channels.py`;
 - `dexmani_real/sensor/pointcloud_worker.py`;
 - `dexmani_real/deployment/config.py`;
 - `examples/export_policy_zarr.py`;
-- `examples/visualize_episode.py`;
-- any other current source location found by repository search.
+- `examples/visualize_episode.py`.
 
-### Specific replacements
+Search current `main` for any others.
+
+## Specific behavior
 
 `make_pointcloud_frame_dtype(num_points)`:
-- validate positive integer;
-- create the dynamic dtype.
+- reject bool;
+- reject non-integer values;
+- reject `<= 0`;
+- build dynamic dtype otherwise.
 
 `RuntimeChannelsConfig.pointcloud_num_points`:
-- validate positive integer;
-- no enumerated choices.
+- positive integer only.
 
-Policy compatibility:
-- require `shape == [positive N, 6]`, dtype `float32`;
-- separately require runtime N to equal policy N.
+Policy point-cloud capability:
+- dtype `float32`;
+- rank 2;
+- second dimension exactly 6;
+- first dimension positive;
+- runtime N must separately equal policy N.
 
 CLI tools:
-- use `type=int`;
-- remove `choices=...`;
-- rely on the owning config/processing boundary to reject non-positive values.
+- remove enumerated `choices`;
+- preserve simple integer parsing;
+- validate at the owning config/processing boundary.
 
-Do not add a maximum-memory planner or a replacement whitelist.
+Do not replace the whitelist with another arbitrary maximum or memory planner.
 
 ---
 
-# 8. Required change F — make arm/hand worker rate limiting sleep-only
-
-## Verified fact
+# 9. Change F — arm/hand worker LoopRate should sleep, not busy-spin
 
 `LoopRate` already supports owner-selected `busy_wait=False`.
 
-Recorder already uses this correctly.
+Do not rewrite `LoopRate`.
 
-Arm and hand currently construct:
-
-```python
-LoopRate(config.loop_hz, label="arm")
-LoopRate(config.loop_hz, label="hand")
-```
-
-Production default therefore busy-spins in the final timing window.
-
-These 30 Hz loops are SDK command-admission / feedback-update service loops, not hard-real-time low-level servo clocks.
-
-## Implementation
-
-Use:
+Change only the SDK service loops:
 
 ```python
 LoopRate(config.loop_hz, label="arm", busy_wait=False)
 LoopRate(config.loop_hz, label="hand", busy_wait=False)
 ```
 
-Do not rewrite `LoopRate` in this task.
+These are 30 Hz command-admission / feedback-update service loops, not low-level hard-real-time servo clocks.
 
-Do not remove its deterministic-test clock/sleep injection or other utility behavior merely for cleanup.
+Do not change control-grid timing mechanisms in teleop/policy/calibration as part of this item.
 
-Fix stale wording such as:
+Fix stale comments/docs that call `arm.loop_hz` or `hand.loop_hz` a physical "servo rate".
 
-```python
-loop_hz: float = 30.0  # arm_loop servo rate
-```
-
-Use accurate terminology:
+Preferred wording:
 
 ```text
 worker command-admission / feedback-update rate
 ```
 
-Do the same wherever documentation implies worker Hz is the hardware's physical servo frequency.
-
 ---
 
-# 9. Required change G — remove dead requested flags
+# 10. Change G — delete dead/self-proof requested flags
 
 ## `camera_requested`
 
-Current source has no meaningful consumer of `shared.camera_requested.value`.
+There is no meaningful runtime consumer of `shared.camera_requested.value`.
 
-Process construction already determines whether a camera worker exists.
-
-Remove the dead state.
-
-## `pointcloud_requested`
-
-Its only meaningful use is currently a point-cloud worker startup self-check:
-
-```python
-if not shared.pointcloud_requested.value:
-    raise RuntimeError(...)
-```
-
-But the process exists only because the parent explicitly spawned it.
-
-This check proves an already-established fact and adds no useful safety.
+Process construction already determines whether the camera process exists.
 
 Remove it.
 
-## Remove the full wiring
+## `pointcloud_requested`
 
-Delete the requested fields from:
+Its current runtime purpose is a point-cloud worker startup self-check, even though the parent explicitly decides whether to spawn that worker.
+
+Remove it and the startup assertion.
+
+## Remove full wiring
+
+Delete requested fields/arguments from:
 
 - `RuntimeChannelsConfig`;
+- `RuntimeChannelsConfig.from_runtime()`;
 - validation;
-- `from_runtime()`;
 - `RuntimeChannels`;
 - shared resource allocation;
-- teleop/deployment/calibration call sites;
-- point-cloud startup assertion;
-- stale comments/docs.
+- teleop/deployment/calibration session construction;
+- point-cloud worker startup;
+- docs/comments.
 
-## Do not over-optimize allocation
+## Do not over-optimize IPC allocation
 
-Continue allocating the current standard rings even when a workflow does not use every ring.
+Keep the current standard rings allocated.
 
-Do **not** make camera/point-cloud rings Optional merely to save a small amount of shared memory.
-
-Avoid introducing `None` checks and workflow-specific channel shapes.
+Do **not** make camera/point-cloud rings optional and do not add workflow-specific `None` channel shapes just to save small amounts of shared memory.
 
 ---
 
-# 10. Required change H — lightweight policy timing summary
+# 11. Change H — lightweight policy timing summary with accurate semantics
 
 ## Goal
 
-Measure whether synchronous inference actually limits real execution without building a tracing framework.
+Determine whether synchronous policy inference materially reduces the achieved action cadence without building a tracing system.
 
-Current summary reports only mean inference time.
+## Inference
 
-Add lightweight in-process summary statistics.
+Continue collecting inference latency and report:
 
-## Track
+- mean;
+- p95;
+- max.
 
-Across policy execution:
+## Action-step interval
 
-- inference latency: mean / p95 / max;
-- successful action publish interval: mean / p95 / max;
-- effective action rate derived from mean successful publish interval;
-- configured control rate for comparison.
+Track the interval between successive **successful PolicyRunner action steps** using the existing `stamp`:
 
-Use actual publication timestamps.
+- when `execute=True`, `stamp` is the actual host publication timestamp returned by `publish_command()`;
+- when `execute=False`, `stamp` is the local monotonic step timestamp used by the dry-run path.
 
-Reset the "previous publication" timestamp at the start of each episode so inter-episode HOME/operator gaps do not contaminate publish-interval statistics.
+Therefore name/log this metric accurately as an action-step interval/effective action-step Hz, and include `execute=<bool>` in the summary.
 
-It is fine for aggregate arrays/statistics to span multiple episodes as long as cross-episode intervals are excluded.
+Do not claim dry-run intervals are hardware publication intervals.
 
-If an IK failure causes a skipped publication, the later larger successful-publication interval should remain visible; that is real execution behavior.
+Reset the previous-step timestamp in `_begin()` so inter-episode HOME/operator gaps are excluded.
 
-## Keep it simple
+If a failed IK step produces no action publication, the larger interval before the next successful action step should remain visible; it reflects real runner behavior.
 
-- log the summary at worker shutdown;
-- do not add HDF5/raw fields;
-- do not add IPC telemetry;
-- do not add a generic profiler;
-- do not add history-reset counters in this task.
+Report:
 
-A small local helper for mean/p95/max is acceptable if it reduces duplication.
+- configured action rate `1 / control_dt_s`;
+- action-step interval mean / p95 / max;
+- effective action-step Hz from mean interval.
+
+Handle empty/one-sample cases without NumPy warnings or divide-by-zero.
+
+## Do not add
+
+- HDF5/raw timing fields;
+- IPC telemetry;
+- generic profiler/tracer;
+- history-reset counters;
+- worker timing instrumentation.
 
 ---
 
-# 11. Explicit non-goals / forbidden scope expansion
+# 12. Explicit non-goals
 
-Do not implement any of the following in this task:
+Do not implement:
 
 - XHand command-before-feedback reordering;
-- a separate tactile thread/process;
+- separate tactile worker/thread;
 - arm worker 30 -> 60 Hz;
-- hand worker frequency increase;
+- hand worker rate increase;
 - xArm host-side interpolation;
-- XHand command interpolation;
+- XHand interpolation;
 - async policy inference;
 - inference/actuation overlap;
 - future timestamp scheduling;
 - stale-prefix action pruning;
 - actuator latency compensation;
 - online sensor resampling;
-- missing-frame repeat/interpolation;
-- generic tracing/telemetry framework;
-- new tests directory;
+- missing-frame repetition/interpolation;
+- generic tracing/observability infrastructure;
+- new committed tests directory;
 - raw schema migration;
 - recorder protocol redesign;
 - collision architecture redesign.
 
-These require either hardware measurements or a separate research requirement.
+### XHand ordering
 
-### XHand ordering note
+Current hand worker reads feedback before normal command admission.
 
-Current XHand worker reads feedback before admitting the next normal command.
+That may add latency if `get_state()` is slow, but it also means a successful feedback read precedes each newly admitted target.
 
-Although moving command admission first might reduce latency if `get_state()` is slow, the current order also ensures a successful feedback read before a new target is sent.
-
-Do **not** change this without hardware latency evidence.
-
-Commissioning measurement belongs after this software task, not inside it.
+Do not change that ordering without hardware timing evidence.
 
 ---
 
-# 12. File-level guidance
+# 13. Expected files and dependency search
 
-Expected files to inspect/change include, but are not limited to:
+Likely files include:
 
 ```text
 dexmani_real/config/defaults.py
 dexmani_real/config/experiment.py
 dexmani_real/deployment/config.py
+dexmani_real/deployment/runner.py
+dexmani_real/deployment/session.py
+
 dexmani_real/runtime/observation.py
 
 dexmani_real/robot/arm_worker.py
@@ -646,68 +698,87 @@ dexmani_real/robot/arm_homing.py
 
 dexmani_real/teleop/loop.py
 dexmani_real/teleop/session.py
+dexmani_real/teleop/keyboard_session.py
+
+dexmani_real/replay/session.py
+dexmani_real/replay/trajectory.py
+
+dexmani_real/calibration/camera/motion.py
+dexmani_real/calibration/camera/session.py
 
 dexmani_real/ipc/schema.py
 dexmani_real/ipc/channels.py
 
 dexmani_real/sensor/pointcloud_worker.py
 
-dexmani_real/deployment/runner.py
-dexmani_real/deployment/session.py
-
 examples/export_policy_zarr.py
 examples/visualize_episode.py
 ```
 
-Search actual current definitions/usages before editing; do not assume this list is exhaustive.
+Search actual current definitions/usages before editing. The list is guidance, not a mandate to touch every file.
 
-Avoid touching these areas unless required by an actual dependency of the changes above:
+Avoid touching unless required by a real dependency:
 
 ```text
 planning/collision.py
 planning/kinematics/ik.py
 point-cloud algorithm internals
 recording/storage raw schema
-recorder transaction implementation
+recording transaction internals
 dataset whole-episode admission semantics
 ```
 
-The latest versions of the collision/point-cloud observation fixes are intentional.
+---
+
+# 14. Implementation order
+
+Use this order to reduce churn and make failures local:
+
+1. config ownership changes:
+   - derived freshness;
+   - XHand failure timeout move;
+   - remove max-consecutive-errors knob;
+   - central teleop/keyboard rate validation;
+2. update all consumers/call sites of removed config;
+3. policy and replay rate compatibility;
+4. point-count whitelist removal end-to-end;
+5. dead requested-state removal end-to-end;
+6. teleop recorded-failure fail-fast;
+7. arm/hand sleep-only rate limiter;
+8. policy timing summary;
+9. repository-wide stale-reference cleanup;
+10. offline validation.
+
+Do not create temporary compatibility layers just to stage the refactor.
 
 ---
 
-# 13. Documentation/config cleanup
+# 15. Documentation cleanup
 
-After code changes:
+Update repository-owned comments/docs only where changed semantics require it.
 
-- update README/config comments if they reference removed freshness fields, requested flags, supported point counts, or worker "servo rate";
-- make it clear that:
-  - teleop control frequency is owned by teleop config;
-  - learned-policy action spacing is owned by `PolicySpec.control_dt_s`;
-  - arm/hand `loop_hz` is worker service cadence, not physical low-level servo frequency;
-  - normal observation freshness is cadence-derived;
-- do not add lengthy design-manifesto docstrings to source files;
-- keep durable rationale in `AGENTS.md` / README only when needed.
+Make clear that:
 
-Do not add compatibility aliases for removed config fields.
+- VR teleop rate is owned by `teleop.control_hz`;
+- keyboard/calibration jog rate is owned by `keyboard_teleop.control_hz`;
+- learned-policy action spacing is owned by `PolicySpec.control_dt_s`;
+- replay cadence comes from the recorded trajectory;
+- arm/hand `loop_hz` is worker service cadence, not hardware physical servo frequency;
+- normal arm/hand/camera freshness is derived from producer cadence.
+
+Do not add long design-manifesto docstrings to source.
+
+Do not add backward-compatibility aliases for removed config keys.
 
 ---
 
-# 14. Validation strategy
+# 16. Validation
 
-Do not run hardware-affecting code.
-
-Start by inspecting:
-
-```bash
-git status --short
-```
-
-Preserve unrelated changes.
+No hardware execution.
 
 ## Required low-cost checks
 
-Run if available:
+Run when available:
 
 ```bash
 python -m compileall -q dexmani_real examples
@@ -715,40 +786,51 @@ ruff check --select F401,F821,F822,F823 dexmani_real examples
 git diff --check
 ```
 
-If Ruff is unavailable, report it; do not install or upgrade the experiment environment.
+If Ruff is unavailable, report it. Do not install/upgrade the experiment environment.
 
-## Focused offline smoke checks
+## Focused one-off offline smoke checks
 
-Use small one-off pure-Python checks, not a new committed tests directory.
+Do not add a committed `tests/` directory.
 
-Verify at minimum:
+### Rate contracts
 
-### Rate compatibility
+Verify:
 
-- teleop 16 Hz, workers 30 Hz -> pass;
-- controller 30 Hz, workers 30 Hz -> pass;
-- controller > limiting worker Hz -> fail;
-- policy `control_dt_s = 1/16`, workers 30 Hz -> pass;
-- policy > worker rate -> fail.
+- VR teleop 16, workers 30 -> pass;
+- keyboard 30, arm worker 30 -> pass;
+- policy 16, workers 30 -> pass;
+- replay 16, workers 30 -> pass;
+- each producer above its limiting relevant worker -> reject.
 
 ### Freshness
 
-At 30 Hz:
+For 30 Hz producer:
 
 ```text
-state/frame max age ~= 4 / 30 s
+normal max age ~= 4 / 30 s
 ```
 
 Verify:
 
-- arm observation uses arm producer-derived freshness;
-- hand observation uses hand producer-derived freshness;
-- camera/cloud use camera producer-derived freshness;
-- homing-specific timeout/freshness semantics were not accidentally replaced.
+- arm uses `ArmParams` derived feedback freshness;
+- hand uses `HandParams` derived feedback freshness;
+- camera/cloud use camera-derived freshness;
+- homing-specific `ArmParams.homing.state_max_age_s` remains unchanged;
+- VR freshness remains unchanged.
 
-### Point-cloud count
+### XHand timeout ownership
 
-Verify arbitrary legitimate positive counts such as:
+Repository runtime code should no longer reference:
+
+```text
+PolicyParams.hand_disconnect_timeout_s
+```
+
+and all hand-worker constructors should use the simplified hardware-owned config path.
+
+### Point-cloud counts
+
+Verify representative counts:
 
 ```text
 512
@@ -756,103 +838,120 @@ Verify arbitrary legitimate positive counts such as:
 3072
 ```
 
-can construct the point-cloud config / IPC dtype / runtime-policy compatibility path when shapes match.
+work through relevant config / IPC dtype / policy compatibility paths when shapes match.
 
-Verify zero/negative/bool counts are rejected at the owning boundary.
+Verify bool, zero, negative, and non-integer counts fail at an owning boundary.
 
-### Teleop invalid demonstration behavior
+### Recorded teleop failure
 
-Using pure logic/mocks only:
+With pure logic/mocks only:
 
-- first recorded `FRAME_IK_FAIL` row is retained and immediately ends/invalidates the episode;
-- first recorded `FRAME_RETARGET_FAIL` behaves likewise;
-- no row is silently discarded or converted to `FRAME_OK`;
-- unrecorded debug control does not require recorder lifecycle behavior.
+- first recorded `FRAME_IK_FAIL` row is submitted before stop;
+- first recorded `FRAME_RETARGET_FAIL` row is submitted before stop;
+- the existing non-blocking `stop(save=True, incomplete=True)` path is requested immediately;
+- no control-loop `join_stop()` was added;
+- unrecorded repeated-failure debug behavior still pauses after the private threshold.
 
-### Dead-state cleanup
+### Dead state / stale config search
 
-Repository search should show no source-code runtime use/definition of:
+No runtime source definition/use of:
 
 ```text
 camera_requested
 pointcloud_requested
 SUPPORTED_POINT_CLOUD_COUNTS
-PolicyParams.arm_state_stale_threshold_s
-PolicyParams.hand_state_stale_threshold_s
-PolicyParams.hand_disconnect_timeout_s
-PolicyParams.max_consecutive_errors
+arm_state_stale_threshold_s
+hand_state_stale_threshold_s
+hand_disconnect_timeout_s
+max_consecutive_errors
 ```
 
-Occurrences inside this task document are expected and should not count as stale runtime code.
+Occurrences in `codex_task.md` are expected.
 
 ### Timing summary
 
-Exercise the pure summary logic with synthetic timing samples or by directly instantiating the minimal relevant helper state where possible.
+Exercise the pure summary/statistic path with:
 
-Verify no divide-by-zero / empty-array warnings when no inference/publication samples exist.
+- no samples;
+- one sample;
+- multiple synthetic samples.
+
+No warnings/divide-by-zero.
 
 ---
 
-# 15. Hardware commissioning — report only, do not execute
+# 17. Final diff review
 
-This task must **not** perform hardware validation.
+Before handoff:
 
-At handoff, explicitly list the following recommended commissioning measurements for a later authorized real-robot session:
+1. inspect `git diff --stat`;
+2. inspect `git diff`;
+3. search for deleted symbols/stale terminology;
+4. confirm no unrelated architecture changes;
+5. confirm no hardware code was executed;
+6. confirm no raw schema change;
+7. confirm no new worker/thread/process/protocol was introduced.
 
-1. XHand `get_state()` duration:
-   - mean / p95 / max;
-2. XHand `send_action()` duration:
-   - mean / p95 / max;
-3. high-level arm command publication -> actual xArm SDK send latency:
-   - mean / p95 / max;
-4. policy inference:
-   - mean / p95 / max;
-5. actual successful action publication interval / effective action Hz.
+Prefer deleting obsolete imports/validation branches over leaving compatibility debris.
 
-These measurements decide later, in a separate task, whether there is evidence for:
+---
 
-- XHand command/read decoupling;
+# 18. Hardware commissioning — report only
+
+Do not execute these measurements in this task.
+
+Recommend for a later authorized hardware session:
+
+1. XHand `get_state()` latency: mean / p95 / max;
+2. XHand `send_action()` latency: mean / p95 / max;
+3. high-level arm target publication -> xArm SDK send latency: mean / p95 / max;
+4. policy inference latency: mean / p95 / max;
+5. real successful action publication interval / effective action Hz.
+
+Only those measurements should motivate later decisions about:
+
+- XHand feedback/command decoupling;
 - arm worker 30 -> 60 Hz;
 - async policy inference.
 
-Do not pre-implement those mechanisms.
+Do not pre-implement them.
 
 ---
 
-# 16. Final acceptance criteria
+# 19. Final acceptance criteria
 
-The task is complete only when all of the following are true:
+Complete only when:
 
-- latest-target command semantics remain unchanged;
-- xArm Mode 6 control semantics remain unchanged;
-- XHand normal absolute-target and relaxed HOME semantics remain unchanged;
-- current online IK self-collision behavior with final prepared hand target remains unchanged;
-- point-cloud-only and RGB+point-cloud semantics remain unchanged;
-- teleop and learned-policy rates cannot silently exceed relevant worker service rates;
+- latest-target transport and run_id fencing are unchanged;
+- xArm Mode 6 and XHand absolute-target semantics are unchanged;
+- relaxed XHand HOME semantics are unchanged;
+- current Cartesian IK + final-hand self-collision semantics are unchanged;
+- point-cloud-only and RGB+point-cloud semantics are unchanged;
+- VR teleop, keyboard/calibration jog, learned policy, and physical replay cannot be configured to publish faster than their relevant worker service cadence;
 - normal arm/hand/camera freshness is producer-owned and cadence-derived;
-- XHand state-read failure timeout is hardware-owned, not policy-owned;
-- a recorded teleop episode stops immediately after its first permanently inadmissible control row, while preserving that raw failure row;
+- homing-specific and VR freshness semantics are not accidentally changed;
+- XHand state-read failure timeout is hardware-owned;
+- a recorded teleop episode immediately terminates after the first recorded IK/retarget failure row without blocking recorder finalization in the control tick;
 - arbitrary positive point counts are supported;
-- arm/hand 30 Hz worker loops no longer busy-spin for deadline precision;
-- dead `camera_requested` / `pointcloud_requested` shared state is gone;
-- policy shutdown summary reports useful inference and actual publication timing;
-- no new scheduler, ACK protocol, worker, thread, process, compatibility layer, or raw schema version was introduced;
-- source/docs contain no stale references caused by the removed config/state;
-- offline checks pass, or unavailable optional tooling is clearly reported;
-- hardware validation is explicitly left pending.
+- arm/hand workers no longer busy-spin for 30 Hz service timing;
+- `camera_requested` / `pointcloud_requested` are gone;
+- policy timing summary is accurate for execute and dry-run modes;
+- no scheduler, ACK layer, compatibility layer, raw schema version, worker, thread, or process was added;
+- offline checks pass or unavailable optional tooling is explicitly reported;
+- hardware validation remains pending.
 
 ---
 
-# 17. Handoff format
+# 20. Handoff
 
-When finished, report concisely:
+Report concisely:
 
 1. files changed;
 2. semantic changes;
-3. code/config deleted;
-4. offline checks run and results;
+3. deleted config/state/validation;
+4. offline checks and results;
 5. anything not validated because it requires hardware;
-6. the five commissioning measurements listed above;
-7. any deviation from this task, with the exact reason.
+6. the five commissioning measurements above;
+7. any deviation from this task and exact reason.
 
-Do not claim hardware correctness from offline smoke checks.
+Do not claim hardware correctness from offline checks.
