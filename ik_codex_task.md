@@ -185,10 +185,13 @@ Stage B: physical-state recovery
    current_qpos -> CLIK
    |
    v
-collect current-target, continuity-valid kinematic candidates
+collect/rank current-target, continuity-valid base candidates
+   |
+   +-> best candidate collision-free and not near limit?
+   |      yes -> RETURN (no Jacobian/null search)
    |
    v
-choose best current-target redundancy anchor
+choose best current-target redundancy anchor only when needed
    |
    v
 Stage C: structured null-space search
@@ -432,6 +435,8 @@ Use it consistently:
 
 Update `deployment/smoke_test.py` accordingly.
 
+Because `deployment.action.make_action_planner(..., control_dt_s=...)` currently forwards this value only to `make_online_ik_config()`, remove the stale `control_dt_s` argument from `make_action_planner()` and its `PolicyRunner` call as part of the same cleanup.
+
 Do not preserve the old `control_dt_s` argument as an unused compatibility branch.
 
 ---
@@ -504,13 +509,30 @@ prev_cmd -> current_qpos
 
 Collect non-duplicate candidates that satisfy all non-collision hard constraints.
 
-A candidate may remain in this kinematic pool even if it self-collides; collision can be escaped by redundancy and must not destroy a useful current-target anchor.
+Before invoking null-space search, rank the `prev/current` base candidates using the cheap base score (no Jacobian/manipulability term), then collision-check them in that order.
+
+If the best available base candidate is collision-free and outside the operational joint-limit search margin, return it immediately. This is the **base fallback return path** and must also perform zero Jacobian/manipulability calculations.
+
+If a collision-free base candidate is inside the joint-limit search margin, retain it as a safe fallback but enter null-space search to look for a better exact posture. If redundancy search fails to improve it, return the original collision-free base candidate.
+
+If all usable base candidates self-collide, keep those exact kinematic solutions available as redundancy anchors; collision can be escaped by redundancy and must not destroy a useful current-target anchor.
 
 A branch-invalid candidate must never be a redundancy anchor.
+
+Cache collision results already computed for base candidates so the same q is not collision-checked twice later.
 
 ---
 
 ## 10. Stage C: null-space as a solution generator
+
+Null-space search is **conditional**, not the default cost of every non-fast frame.
+
+Enter Stage C only when at least one of these is true:
+
+- no collision-free base candidate exists but there is a pre-collision-valid current-target anchor;
+- the best collision-free base candidate is inside the operational joint-limit search margin.
+
+Do not compute a Jacobian merely to ask whether manipulability might be slightly better elsewhere. Manipulability is evaluated only after Stage C is already justified by redundancy needs.
 
 ### 10.1 Choose an anchor on the current target manifold
 
@@ -584,6 +606,8 @@ nullity == 1
 ```
 
 Only in that regular case perform the structured 1-D null search.
+
+This effective-rank test is a **search guard**, not a validity gate. A collision-free base candidate remains executable even when the conditioned Jacobian is near/rank deficient.
 
 If rank < 6:
 
@@ -674,12 +698,13 @@ Do not use dexterity quality as a hard rejection threshold.
 
 Do not compute singularity margin on the normal fast path.
 
-Only compute it when:
+Only compute it after Stage C has already been entered, and only when multiple exact executable/possibly-executable candidates need quality comparison.
 
-- fallback has produced multiple exact candidates that need ranking; or
-- the Jacobian was already required for null-space search and its value can be reused.
+The anchor Jacobian/SVD may be reused. Other candidates get Jacobians only if their dexterity term can actually affect a multi-candidate ranking.
 
-If there is only one viable fallback candidate, manipulability cannot change selection and should not force extra Jacobian work.
+If there is only one viable candidate, manipulability cannot change selection and must not force extra Jacobian work.
+
+Do not use a low manipulability value by itself to trigger Stage C in this first implementation; doing so would put Jacobian work back onto otherwise executable fallback frames.
 
 ### 11.3 No candidate-pool rescaling
 
@@ -731,16 +756,23 @@ Collision remains a hard execution constraint.
 
 A candidate that would be returned immediately must be collision checked before return.
 
-### Fallback
+### Base fallback before null search
 
-Do not collision-check every fallback candidate before scoring.
+After `prev/current` have been tried, rank those base candidates without manipulability, collision-check in base-score order, and immediately return the first collision-free candidate that is not near an operational limit.
 
-Instead:
+This prevents ordinary non-fast frames from paying null-space/Jacobian costs.
+
+A collision-free near-limit base candidate is cached as a safe fallback while Stage C searches for a better posture.
+
+### Null-search fallback
+
+After Stage C has generated corrected null candidates:
 
 1. collect exact candidates that pass all non-collision hard constraints;
-2. compute fallback quality and sort them;
-3. check endpoint self-collision in score order;
-4. return the first collision-free candidate.
+2. compute the soft quality terms only as needed and sort them;
+3. reuse any cached collision results;
+4. check previously unchecked endpoint self-collision in score order;
+5. return the first collision-free candidate.
 
 A self-colliding exact candidate can still serve as a null-space anchor before final selection.
 
@@ -762,7 +794,9 @@ Default:
 - policy EEF: on;
 - keyboard/calibration: off.
 
-Try it only after structured continuation/current/null-space search has failed to produce an executable candidate.
+Try it only when continuation/current/null-space search has failed to produce **any executable candidate**.
+
+Do not run the random fallback merely because an already executable base candidate is near a limit or has lower secondary quality; in that case return the safe base candidate after bounded null search fails to improve it.
 
 Sample directly inside:
 
@@ -1136,11 +1170,11 @@ Inspect it first; do not let an offline check connect hardware.
 
 Use one-off offline Python checks/mocks to verify:
 
-1. **Fast path cost contract**
-   - prev seed success;
-   - no Jacobian/manipulability call;
-   - one collision query before return;
-   - no random/null fallback.
+1. **Fast/base path cost contract**
+   - prev fast seed success: no Jacobian/manipulability call, one collision query, no fallback;
+   - non-fast but collision-free/non-near-limit prev/current base candidate: return without Jacobian/null search;
+   - collision-free near-limit base candidate: Stage C may run, but the cached base is returned if no better executable null candidate is found;
+   - self-colliding base candidate: may anchor Stage C but is never returned.
 
 2. **Operational-limit invariant**
    - construct a runtime profile narrower than model limits;
@@ -1240,6 +1274,8 @@ The task is complete only when all of the following are true.
 ### Performance
 
 - Normal fast path performs no Jacobian/manipulability calculation.
+- A collision-free, non-near-limit `prev/current` base fallback also returns without Jacobian/null-space search.
+- Null-space/Jacobian work occurs only for the explicit redundancy triggers above.
 - Random x3 is gone.
 - Fallback collision checks occur in score order and stop on the first free candidate.
 - No duplicate final FK/collision pass exists after an unchanged/selected solution.
@@ -1297,9 +1333,13 @@ normal frame:
     -> endpoint collision
     -> publish exact validated q
 
-hard frame:
+non-fast frame:
     prev/current exact candidates
-    -> choose current-target redundancy anchor
+    -> rank/check base candidates
+    -> if executable and not near limit: return without Jacobian
+
+redundancy-needed frame:
+    collision-only or near-limit current-target anchor
     -> conditioned-Jacobian SVD
     -> bounded null +/- predictor seeds
     -> CLIK correction
