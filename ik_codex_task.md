@@ -6,8 +6,8 @@ Implement this task against the current `main` baseline reviewed at:
 
 - repository: `haoyangzhanglab/dexmani_real`
 - implementation baseline reviewed at: `1d3a96d1f64a8114941b1f9ac83020db7d171183`
-- this task specification was last reviewed on top of `a050f7683c780040334732cd339539994e993644`; that later commit only added this task file and did not change runtime code
-- the IK/deployment implementation is effectively the code introduced through `f681fdc6a6d9ff2e1cc6e8dee5cd203013a8da41`; the final `1d3a96d` implementation-side commit only simplifies standing documentation.
+- the IK/deployment implementation is effectively the code introduced through `f681fdc6a6d9ff2e1cc6e8dee5cd203013a8da41`; the final `1d3a96d` implementation-side commit only simplifies standing documentation
+- later commits that only revise this task file do not change the implementation baseline; before executing the task, re-check current `main` and stop/reconcile if newer runtime-code commits have appeared.
 
 Read and follow `AGENTS.md` first. Before editing, run `git status --short` and preserve unrelated work.
 
@@ -730,7 +730,7 @@ score =
   + previous_command_weight * distance_to_previous_command
   + joint_limit_weight * operational_joint_limit_penalty
   + pose_weight * normalized_pose_cost
-  - singularity_margin_weight * manip_quality
+  - singularity_margin_weight * dexterity_quality
 ```
 
 Start from the current relative weights where possible:
