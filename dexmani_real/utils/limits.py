@@ -1,12 +1,7 @@
-"""Shared joint-limit hierarchy validation for the XHand device.
+"""Validate XHand limits: rated ⊇ mechanical ⊇ command envelopes.
 
-The XHand has a three-level joint-limit hierarchy::
-
-    rated (hardware hard-stop envelope) ⊇ mechanical (model envelope) ⊇ command (operational)
-
-Runtime config may narrow but never widen the rated envelope, and command
-bounds must stay inside mechanical bounds.  This single helper keeps the three
-layers from drifting apart.
+Runtime settings may narrow the rated hard limits; command bounds must
+remain within the mechanical model bounds.
 """
 
 from __future__ import annotations

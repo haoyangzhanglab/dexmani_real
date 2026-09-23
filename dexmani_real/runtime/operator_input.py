@@ -148,13 +148,9 @@ class KeyboardInput:
         self._saved_termios: list | None = None
 
     def _accept_control_press(self, signal: OperatorCommand, now_s: float) -> bool:
-        """Return whether a physical key-down edge should emit *signal*.
+        """Emit once per key-down/release cycle, ignoring OS auto-repeat.
 
-        ``pynput`` delivers operating-system auto-repeat as repeated press
-        callbacks.  A control is therefore emitted only once until its matching
-        release callback arrives.  Optional time debounce remains available for
-        callers that need it, but the default is edge-triggered with no added
-        operator latency.
+        Optional time debounce filters rapid presses; the default uses key edges only.
         """
         with self._lock:
             if not self._callbacks_active or self._commands_quiesced:
@@ -431,14 +427,9 @@ class KeyboardInput:
         self.stop()
 
     def poll(self, timeout: float = 0.05) -> list[OperatorCommand]:
-        """Drain all pending OperatorCommands from the keyboard buffer.
+        """Drain pending commands, waiting up to timeout seconds if empty.
 
-        Args:
-            timeout: Seconds to wait if buffer is empty (default 0.05s).
-                     Use 0 for completely non-blocking poll.
-
-        Returns:
-            List of OperatorCommand values (may be empty).
+        Use timeout=0 for non-blocking polling; the returned list may be empty.
         """
         if not np.isfinite(timeout) or timeout < 0.0:
             raise ValueError("timeout must be finite and non-negative")
@@ -515,17 +506,9 @@ class KeyboardInput:
             self._events.clear()
 
     def drain_signal(self, target: OperatorCommand | None) -> int:
-        """Remove all occurrences of *target* from the buffer, preserving others.
+        """Remove target commands, preserve others, and return the removal count.
 
-        Use to suppress auto-repeat of a trigger signal after a blocking
-        operation, without discarding unrelated signals the user may have
-        pressed during the block.
-
-        Args:
-            target: The signal to remove.  ``None`` is a no-op (returns 0).
-
-        Returns:
-            Number of signals removed.
+        None is a no-op returning 0. Use after blocking operations to clear repeats.
         """
         if target is None:
             return 0

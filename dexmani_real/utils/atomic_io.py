@@ -57,12 +57,10 @@ def atomic_publish(src: str | Path, dst: str | Path) -> Path:
 def atomic_json_dump(
     obj: object, path: str | Path, *, indent: int = 2, ensure_ascii: bool = True
 ) -> Path:
-    """Atomically write ``obj`` as JSON, overwriting any existing target.
+    """Atomically replace calibration/config JSON, allowing an existing target.
 
-    Mirrors the proven ``mkstemp -> dump -> flush -> fsync -> replace -> fsync
-    parent`` sequence.  Unlike ``atomic_publish`` (which refuses to overwrite),
-    this is for calibration/config artifacts legitimately overwritten in place:
-    a crash can never leave the target truncated or absent.
+    Uses mkstemp -> dump -> flush -> fsync -> replace -> fsync(parent).
+    Unlike atomic_publish, overwrites are intentional.
     """
     target = Path(path)
     parent = target.parent

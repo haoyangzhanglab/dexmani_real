@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Usage: ``python examples/xhand_diagnostics.py``.
+"""Usage: python examples/xhand_diagnostics.py
 
-Reads device identity, joints and tactile health through the native SDK in a
-crash-isolated worker. Connects to hardware; sends no motion commands.
-Use the supervised teleop/home workflows for motion. No offline --help mode.
+Reads live XHand identity, joints and tactile health in a crash-isolated SDK worker.
+No motion commands or offline --help mode; use supervised teleop/home for motion.
 """
 
 from __future__ import annotations
@@ -68,8 +67,6 @@ def _joint_payload_problem(state: Any) -> str | None:
 
 
 class XHandDiagnostics:
-    """Read-only SDK diagnostics in the child process."""
-
     def __init__(self, hand_id: int = 0) -> None:
         # Keep the native SDK inside the crash-isolated worker.
         from xhand_controller import xhand_control  # type: ignore[import-untyped]  # isort: skip
@@ -266,7 +263,6 @@ class XHandDiagnostics:
 
 
 def _serial_port_problem(serial_port: str) -> str | None:
-    """Return a preflight error without opening or otherwise touching a TTY."""
     port = Path(serial_port)
     try:
         mode = port.stat().st_mode
@@ -283,7 +279,6 @@ def _serial_port_problem(serial_port: str) -> str | None:
 
 
 def _choose_communication(xhand_exam: XHandDiagnostics) -> bool:
-    """Prompt user to choose EtherCAT or RS485 and open the device."""
     while True:
         choice = input("Communication method (1=EtherCAT, 2=RS485): ").strip()
         if choice == "1":
@@ -298,7 +293,6 @@ def _choose_communication(xhand_exam: XHandDiagnostics) -> bool:
 
 
 def _run_hardware_session() -> int:
-    """Run one SDK session inside the crash-isolated worker process."""
     xhand_exam = XHandDiagnostics(hand_id=0)
 
     if not _choose_communication(xhand_exam):
@@ -318,7 +312,6 @@ def _run_hardware_session() -> int:
 
 
 def _disable_worker_core_dump() -> None:
-    """Do not leave a large core file when the closed-source SDK aborts."""
     try:
         import resource
 
@@ -328,7 +321,6 @@ def _disable_worker_core_dump() -> None:
 
 
 def _run_isolated_hardware_session() -> int:
-    """Keep a native SDK abort from terminating the user's launcher process."""
     command = [sys.executable, str(Path(__file__).resolve()), _HARDWARE_WORKER_ARG]
     completed = subprocess.run(command, check=False)
     if completed.returncode == -signal.SIGABRT:

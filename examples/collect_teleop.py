@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Run one hardware-affecting VR teleoperation and collection session.
+"""Usage: python examples/collect_teleop.py
 
-The session can command xArm7/XHand and, unless disabled, records a raw episode.
+Controls xArm7/XHand via VR and records raw episodes unless disabled.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ def _task_name_arg(value: str) -> str:
 
 
 def _positive_float(value: str) -> float:
-    """Argparse type: positive finite float."""
     result = float(value)
     if not math.isfinite(result) or result <= 0:
         raise argparse.ArgumentTypeError(f"must be finite and > 0, got {value}")

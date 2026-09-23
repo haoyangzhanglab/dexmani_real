@@ -53,30 +53,12 @@ def ema_smooth_pose(
     alpha_pos: float,
     alpha_rot: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """EMA in Cartesian space: position R³ + rotation vector so(3).
+    """Smooth an EEF target before IK with independent position/rotation EMA.
 
-    Smooths a 6-DOF EEF target pose before IK.  Position uses standard
-    Euclidean EMA; orientation converts the quaternion to a rotation
-    vector (axis * angle), applies EMA in so(3), then converts back.
-
-    Rotation-vector EMA naturally takes the short geodesic path on S³
-    (magnitude = angle ∈ [0, π]) without the overhead of scipy Slerp.
-
-    Position and rotation are smoothed with independent factors because
-    they have different noise profiles and human motion bandwidths:
-    position benefits from higher α (lower latency), rotation from lower
-    α (stronger filtering of orientation jitter).
-
-    Args:
-        target_pos: (3,) target EEF position in meters.
-        target_quat_wxyz: (4,) target EEF orientation quaternion (w, x, y, z).
-        prev_pos: (3,) previous smoothed position.
-        prev_quat_wxyz: (4,) previous smoothed orientation quaternion.
-        alpha_pos: Smoothing factor for position in [0, 1].  1.0 = no smoothing.
-        alpha_rot: Smoothing factor for rotation in [0, 1].  1.0 = no smoothing.
-
-    Returns:
-        ``(pos_smoothed, quat_wxyz_smoothed)`` — both float64 copies.
+    Positions are (3,) meters; quaternions are (4,) WXYZ. Rotation scales the
+    shortest relative rotation vector from the previous smoothed orientation.
+    Each alpha is clipped to [0, 1]; 1 disables smoothing for that component.
+    Returns float64 (position, quaternion) arrays.
     """
     alpha_pos = float(np.clip(alpha_pos, 0.0, 1.0))
     alpha_rot = float(np.clip(alpha_rot, 0.0, 1.0))

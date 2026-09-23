@@ -177,15 +177,10 @@ class XArm7Kinematics:
         return jacobian[:, : self.dof]
 
     def compute_eef_jacobian_and_pose_world(self, qpos: np.ndarray) -> tuple[np.ndarray, "Pose"]:
-        """Compute EEF Jacobian and world-frame pose in a **single** FK call.
+        """Return (jacobian, pose_world) from one FK computation.
 
-        Use this in hot paths where both Jacobian and pose are needed
-        (e.g. differential IK) to avoid redundant ``compute_forward_kinematics``.
-
-        Returns:
-            (jacobian, pose_world) — both in world frame.
-            Jacobian columns map joint velocities to world-frame spatial velocity
-            [v_world; ω_world].  Pose is the world-frame EEF pose.
+        Both use the world frame; Jacobian columns map joint velocities to
+        spatial velocity [v_world; omega_world].
         """
         # Reject NaN/Inf before Pinocchio FK to protect the C++ engine.
         if not np.all(np.isfinite(qpos)):
@@ -232,18 +227,9 @@ class XArm7Kinematics:
 
     @staticmethod
     def manipulability_from_jacobian(J: np.ndarray) -> float:
-        """Yoshikawa manipulability from a pre-computed Jacobian.
+        """Compute Yoshikawa sqrt(det(J @ J.T)) from a (6, dof) Jacobian, without FK.
 
-        Use this in hot paths where the Jacobian is already available
-        (e.g. after ``compute_eef_jacobian``) to avoid redundant FK.
-
-        Args:
-            J: 6×dof end-effector Jacobian matrix.
-
-        Returns:
-            sqrt(det(J @ Jᵀ)), clamped to ≥ 0.
-            Returns 0.0 on non-finite Jacobian (NaN/Inf) — zero
-            manipulability triggers downstream rejection gates.
+        Clamped to >= 0; non-finite inputs return 0 to trigger rejection gates.
         """
         if not np.all(np.isfinite(J)):
             return 0.0

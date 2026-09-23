@@ -114,14 +114,9 @@ def _table_clearance_m(
 
 
 def interpolate_waypoints(path: np.ndarray, max_step: float) -> np.ndarray:
-    """Linearly densify a sparse joint path so each step ≤ max_step rad.
+    """Densify (W, J) waypoints so each joint step is <= max_step radians.
 
-    Args:
-        path:     (W, J) array of joint-space waypoints.
-        max_step: maximum joint change per step (radians).
-
-    Returns:
-        (D, J) dense path (D ≥ W).
+    Returns a float64 (D, J) path.
     """
     if len(path) <= 1:
         return path.astype(np.float64)
@@ -140,23 +135,11 @@ def wrap_nearest_equivalent(
     joint_limit_lower: tuple[float, ...],
     joint_limit_upper: tuple[float, ...],
 ) -> np.ndarray:
-    """Select the nearest limit-valid equivalent of each joint.
+    """Shift joints with range > 2*pi to the nearest limit-valid equivalent.
 
-    Equivalent joints are those where the joint limit span exceeds 2*pi
-    (J1, J3, J5, J7 on xArm7).  For each such joint, the value is shifted
-    by an integer multiple of 2*pi so it is as close as possible to the
-    corresponding reference value while remaining inside hardware limits.
-
-    Non-equivalent joints are returned unchanged.
-
-    Args:
-        qpos:               Joint positions to wrap (shape broadcastable to 1D).
-        reference:          Reference positions (same shape as *qpos*).
-        joint_limit_lower:  Hardware lower limits (rad).
-        joint_limit_upper:  Hardware upper limits (rad).
-
-    Returns:
-        Wrapped qpos (float64, same shape as input).
+    Uses integer multiples of 2*pi; other joints stay unchanged. Positions,
+    reference and limits must be matching finite 1-D arrays in radians.
+    Returns a float64 copy with the same shape.
     """
     result = np.asarray(qpos, dtype=np.float64).copy()
     lo = np.asarray(joint_limit_lower, dtype=np.float64)

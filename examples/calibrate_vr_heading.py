@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Calibrate ``T_vr_to_robot`` from live VR orientation samples.
+"""Usage: python examples/calibrate_vr_heading.py
 
-This starts the VR receiver, writes ``config/vr_transform.json`` after quality
-checks, and never connects to or commands the robot.
+Uses live VR samples to save config/vr_transform.json after quality checks; no robot connection.
 """
 
 from __future__ import annotations
@@ -45,8 +44,6 @@ _AUDIO_IDLE_TIMEOUT_S = 5.0
 
 @dataclass(frozen=True)
 class HeadingCalibrationConfig:
-    """Tunable parameters for VR heading calibration."""
-
     duration_s: float = 10.0
     port: int = 8000
     vr_ready_timeout_s: float = 120.0
@@ -117,10 +114,7 @@ def _quality_grade(
     excellent_std_deg: float = 2.0,
     good_std_deg: float = 5.0,
 ) -> dict[str, float | str]:
-    """Grade calibration quality from per-frame theta scatter.
-
-    Returns machine-readable metrics consumed by the runtime preflight.
-    """
+    """Grade heading scatter for runtime preflight."""
     fwd_2d = forwards[:, :2]
     norms = np.linalg.norm(fwd_2d, axis=1)
     mask = (norms >= _MIN_FORWARD_NORM) & inlier
@@ -144,7 +138,6 @@ def _quality_grade(
 
 
 def _wait_for_vr_tracking(shared: RuntimeChannels, timeout_s: float) -> bool:
-    """Block until VR tracking data is observed, or return False on timeout."""
     deadline = time.monotonic() + timeout_s
     last_print = 0.0
     while time.monotonic() < deadline:
@@ -165,7 +158,6 @@ def _wait_for_vr_tracking(shared: RuntimeChannels, timeout_s: float) -> bool:
 
 
 def _shutdown_vr_receiver(shared: RuntimeChannels, vr_proc: mp.Process) -> bool:
-    """Return whether the receiver and every IPC resource stopped cleanly."""
     if vr_proc.pid is None:
         shared.is_running.value = False
         return shared.close()
@@ -189,7 +181,6 @@ def _shutdown_vr_receiver(shared: RuntimeChannels, vr_proc: mp.Process) -> bool:
 
 
 def _play_completion_audio() -> None:
-    """Request the canonical completion cue without affecting calibration success."""
     audio: AudioFeedback | None = None
     try:
         audio = AudioFeedback()

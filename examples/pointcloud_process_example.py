@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Usage: ``python examples/pointcloud_process_example.py [--save-dir DIR]``.
+"""Usage: python examples/pointcloud_process_example.py [--save-dir DIR]
 
-Hardware- and GUI-affecting L515 tabletop point-cloud and table-plane diagnostic.
-It connects to RealSense and opens OpenCV/Open3D windows. It uses the resolved
-table plane by default and enters deterministic multi-frame table calibration
-only after operator confirmation. A new fit is used immediately; publishing
-``desk_plane.json`` requires separate confirmation and affects both perception
-cropping and table-aware collision geometry on the next runtime resolution.
-``--save-dir`` atomically saves the aligned RGB-D source, raw and processed
-xArm-base clouds, and complete offline reconstruction metadata.
+Live RealSense/OpenCV/Open3D diagnostic; --save-dir saves RGB-D, clouds and reconstruction metadata.
+Table fitting needs confirmation; the fit is used immediately. Publishing desk_plane.json
+needs separate confirmation and affects perception and collision geometry on the next run.
 """
 
 from __future__ import annotations
@@ -58,8 +53,6 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class PointCloudDiagnosticConfig:
-    """Configuration for the interactive point-cloud diagnostic."""
-
     rgb_resolution: tuple[int, int] = (640, 480)
     depth_resolution: tuple[int, int] = (640, 480)
     fps: int = 30
@@ -89,10 +82,7 @@ _SENSOR_OPTIONS: list[tuple[str, rs.option]] = [
 
 
 def _jet_colormap(values: np.ndarray) -> np.ndarray:
-    """MATLAB-style jet colormap for normalized values in [0, 1].
-
-    Returns float [..., 3] in [0, 1].
-    """
+    """Map normalized [0, 1] values to float RGB [..., 3] in [0, 1]."""
     t = np.clip(values, 0.0, 1.0)
     red = np.where(
         t < 0.375,
@@ -117,7 +107,6 @@ def _jet_colormap(values: np.ndarray) -> np.ndarray:
 
 
 def _make_depth_vis(depth_m: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
-    """Render metric depth as an 8-bit BGR image for OpenCV."""
     valid = np.isfinite(depth_m) & (depth_m > 0.0)
     safe = np.where(valid, depth_m, vmin)
     normalized = (safe - float(vmin)) / (float(vmax) - float(vmin))
@@ -131,7 +120,6 @@ def _show_rgbd_panels(
     depth_m: np.ndarray,
     cfg: PointCloudDiagnosticConfig,
 ) -> None:
-    """Show same-resolution depth-to-color aligned RGB and depth."""
     if not cfg.show_rgbd_panels:
         return
     try:
@@ -171,7 +159,6 @@ def _show_rgbd_panels(
 
 
 def _print_depth_stats(depth_m: np.ndarray, vmin: float, vmax: float) -> None:
-    """Print 2-D depth-gate statistics for the diagnostic view."""
     print("\n" + "=" * 60)
     print("2-D Depth Gate (diagnostic view)")
     print("=" * 60)
@@ -181,12 +168,10 @@ def _print_depth_stats(depth_m: np.ndarray, vmin: float, vmax: float) -> None:
         f"  Range [{vmin:.2f}, {vmax:.2f}] m:  {int(valid.sum()):6d} / "
         f"{depth_m.size} pixels  ({ratio * 100:.1f}%)"
     )
-    # The production builder applies its own local depth-support and flying-
-    # pixel decisions; this panel intentionally reports only the depth gate.
+    # Depth gate only; production also filters local support and flying pixels.
 
 
 def _tprint(label: str, key: str, timings: dict[str, float]) -> None:
-    """Print a single timing line with ASCII bar."""
     ms = timings.get(key, 0.0)
     pipeline_ms = max(timings.get("pipeline_total", 1.0), 0.001)
     if math.isnan(ms):
@@ -200,7 +185,6 @@ def _tprint(label: str, key: str, timings: dict[str, float]) -> None:
 
 
 def _stage_label(key: str) -> str:
-    """Human-readable label for a timing stage key."""
     return {
         "capture": "Frame capture",
         "extrinsics": "Extrinsics load",
@@ -273,7 +257,6 @@ def _save_diagnostic_snapshot(
     pointcloud_config: PointCloudConfig,
     camera_info: dict,
 ) -> Path:
-    """Durably publish one self-contained offline point-cloud tuning snapshot."""
     color = np.asarray(rgb)
     depth = np.asarray(depth_raw)
     if color.dtype != np.uint8 or color.ndim != 3 or color.shape[2] != 3:
@@ -369,19 +352,13 @@ def _save_diagnostic_snapshot(
 
 
 def _print_build_stage_timings(prefix: str, values: dict[str, float]) -> None:
-    """Print compact stage timings from one build or benchmark percentile."""
     print(f"  {prefix}:")
     for field in _BUILD_TIMING_FIELDS:
         print(f"    {field.removesuffix('_ms'):<24s} {values[field]:5.1f} ms")
 
 
 def _connect_camera(cfg: PointCloudDiagnosticConfig) -> RealSenseCamera:
-    """Connect camera and return it.
-
-    Connection time is deliberately not timed: it is a one-time hardware
-    init (pipeline start + warmup frames), not a per-frame pipeline stage, and
-    its multi-second duration would dominate the per-stage timing chart.
-    """
+    """Connect and warm up; exclude this one-time cost from per-frame timings."""
     camera = RealSenseCamera(
         RealSenseCameraConfig(
             depth_resolution=cfg.depth_resolution,
@@ -400,7 +377,6 @@ def _connect_camera(cfg: PointCloudDiagnosticConfig) -> RealSenseCamera:
 
 
 def _print_device_info(camera: RealSenseCamera) -> dict:
-    """Print device info and read back sensor options.  Returns info dict with 'serial'."""
     info = camera.get_device_info()
     print("=" * 60)
     print(f"Device:   {info.get('name', '')}")
@@ -481,7 +457,6 @@ def _load_extrinsics(camera_info: dict) -> tuple[np.ndarray, float]:
 
 
 def _resolve_table_plane_path(runtime: ExperimentConfig) -> Path:
-    """Resolve the shared table calibration path from runtime configuration."""
     table = runtime.environment.table
     if table.plane_path is None:
         raise RuntimeError("runtime table calibration has no plane_path")
@@ -500,7 +475,6 @@ def _calibrate_table(
     plane_path: Path,
     frame_count: int,
 ) -> tuple[tuple[float, float, float, float], float]:
-    """Fit a deterministic multi-frame table plane and optionally publish it."""
     print("\n" + "=" * 60)
     print("Table Plane Calibration (multi-frame RANSAC)")
     print("=" * 60)
@@ -574,7 +548,6 @@ def _build_cloud(
     config: PointCloudConfig,
     table_plane_abcd: tuple[float, float, float, float] | None,
 ) -> np.ndarray:
-    """Build and report one production point cloud."""
     print("\n" + "=" * 60)
     print("Point-Cloud Pipeline (depth_to_color -> xArm-base)")
     print("=" * 60)
@@ -656,7 +629,6 @@ def _benchmark_production_pipeline(
     table_plane_abcd: tuple[float, float, float, float] | None,
     frame_count: int = 20,
 ) -> tuple[np.ndarray, dict[str, float]]:
-    """Measure processing and capture-to-cloud p50/p95 on fresh RGB-D frames."""
     elapsed_ms: list[float] = []
     end_to_end_ms: list[float] = []
     stage_samples: dict[str, list[float]] = {field: [] for field in _BUILD_TIMING_FIELDS}
@@ -715,7 +687,6 @@ def _benchmark_production_pipeline(
 
 
 def _print_timing_summary(timings: dict[str, float]) -> None:
-    """Print per-stage timing with ASCII bar charts."""
     print("\n" + "=" * 60)
     print("Per-Stage Timing Summary")
     print("=" * 60)
@@ -746,7 +717,6 @@ def _print_timing_summary(timings: dict[str, float]) -> None:
 
 
 def _build_workspace_box(workspace: tuple[float, ...]) -> "o3d.geometry.LineSet":
-    """Build a green wireframe box for the workspace crop volume."""
     import open3d as o3d
 
     ws = workspace
@@ -788,7 +758,6 @@ def _visualize_result(
     T_xarm_base_from_color: np.ndarray,
     config: PointCloudConfig,
 ) -> None:
-    """Visualize final xArm-base point cloud with coordinate frames and crop box."""
     import open3d as o3d
 
     base_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
@@ -812,7 +781,6 @@ def _visualize_result(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the hardware diagnostic and return a process exit status."""
     args = _parse_args(argv)
     save_dir = None if args.save_dir is None else args.save_dir.expanduser().resolve()
     if save_dir is not None and save_dir.exists() and not save_dir.is_dir():
@@ -843,8 +811,7 @@ def main(argv: list[str] | None = None) -> int:
             "yes",
         }
         if calibrate_table:
-            # The diagnostic uses the exact runtime point-cloud policy. The
-            # new fit is used immediately whether or not it is published.
+            # Use the new fit immediately, even without saving it.
             table_plane_abcd, calibration_ms = _calibrate_table(
                 camera=camera,
                 geometry=geometry,
@@ -869,8 +836,7 @@ def main(argv: list[str] | None = None) -> int:
             all_timings["desk_calib"] = math.nan
             print("  Table calibration skipped; table crop is disabled by runtime config.")
 
-        # Use a post-calibration frame for the reported production result;
-        # never apply a newly fitted plane to a stale pre-calibration frame.
+        # Apply the fitted plane to a fresh post-calibration frame.
         rgb, depth_raw, _, _ = _capture_frame(camera)
 
         result = _build_cloud(

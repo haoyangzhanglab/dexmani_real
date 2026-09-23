@@ -201,15 +201,10 @@ def adaptive_retargeting_xhand(
     scale: float,
     palm_scale: float,
 ) -> np.ndarray:
-    """Scale the pinky chain and optional wrist-to-MCP baseline on a copy.
+    """Return a copy of (21, 3) MANO landmarks with the pinky chain scaled.
 
-    Args:
-        landmarks: (21, 3) array in MANO coordinate space.
-        scale: Uniform MCP→TIP segment scale.
-        palm_scale: Wrist→MCP baseline scale; 1.0 is a no-op.
-
-    Returns:
-        (21, 3) array with pinky chain scaled (new copy, input unchanged).
+    scale multiplies MCP-to-TIP segments; palm_scale multiplies wrist-to-MCP
+    (1 leaves the baseline unchanged).
     """
     landmarks = np.asarray(landmarks, dtype=np.float64).copy()
     if landmarks.shape != (21, 3) or not np.all(np.isfinite(landmarks)):
@@ -411,28 +406,14 @@ _FINGERTIP_INDICES = np.array([4, 8, 12, 16, 20], dtype=np.intp)
 
 
 class TAGHandRetargeter:
-    """VR-to-XHand retargeting via TAG's two-stage NLopt optimization.
+    """Retarget VR to XHand with TAG's two-stage NLopt optimizer.
 
-    Same protocol as ``DexPilotHandRetargeter`` (``__init__``, ``retarget()``, ``reset()``)
-    so the policy loop can use either class without code changes.
+    Pipeline: (21, 3) operator landmarks -> palm/MANO frame -> pinky scaling
+    -> tips [4, 8, 12, 16, 20] minus wrist[0] -> R_mano_to_urdf -> solve
+    -> remap model joints to (12,) SDK order.
 
-    Pipeline::
-
-        VR landmarks (21,3) operator frame
-            → _estimate_palm_frame + _OPERATOR2MANO_RIGHT  (MANO frame)
-            → adaptive_retargeting_xhand                    (pinky chain scaling)
-            → extract fingertips [4,8,12,16,20] - wrist[0]  (wrist-centered)
-            → rotate by R_mano_to_urdf                      (align to URDF frame)
-            → HandOptimizer.solve()                         (two-stage NLopt)
-            → model→SDK joint order remap
-            → (12,) SDK-order qpos
-
-    Parameters
-    ----------
-    hand_type:
-        ``"right"`` (default).
-    debug:
-        If True, log per-frame retargeting timing.
+    Shares retarget()/reset() with DexPilotHandRetargeter. hand_type defaults
+    to right; debug enables per-frame timing logs.
     """
 
     def __init__(

@@ -305,24 +305,11 @@ class IKGeometry:
         weights: tuple[float, ...] | np.ndarray,
         delta: np.ndarray | None = None,
     ) -> float:
-        """Per-joint weighted, range-normalised L2 distance (ref: LeFranX weighted_ik.cpp:62-69).
+        """Rank IK candidates by sqrt(sum_j w_j * (delta_j / range_j)²).
 
-        Formula: ``sqrt(Σ wⱼ · (Δqⱼ / rangeⱼ)²)``
-
-        - Δq is the wrapped equivalent-angle delta (handles ±2π ambiguity).
-        - Each joint's delta is divided by its hardware range, so 1° on a
-          joint with 238° range counts more than 1° on a joint with 720° range.
-        - Per-joint weights ``wⱼ`` then scale the normalised squared error:
-          higher weight → that joint is "expensive" to move away from current.
-
-        This is the metric that LeFranX uses for ``current_distance`` in their
-        multi-objective IK scoring function.  In DexMani it is used by the
-        teleop position-IK fallback to rank candidates.
-
-        Args:
-            delta: Pre-computed wrapped delta from ``compute_qpos_delta``.
-                   When provided, avoids a redundant ``compute_qpos_delta``
-                   call (hot-path optimisation).
+        Uses hardware ranges and wrapped equivalent-angle deltas; larger weights
+        penalize motion more. Optional delta reuses compute_qpos_delta output.
+        Reference: LeFranX weighted_ik.cpp:62-69 (current_distance).
         """
         qpos = ensure_qpos(qpos, self.dof, "qpos")
         reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")

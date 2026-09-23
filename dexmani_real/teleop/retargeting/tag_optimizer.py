@@ -21,47 +21,21 @@ logger = get_logger(__name__)
 
 
 class HandOptimizer:
-    """Two-stage NLopt hand retargeting optimizer.
+    """Minimize fingertip squared error with analytic Pinocchio gradients.
 
-    Minimizes ||FK(q) - target||² via analytic Pinocchio gradients.
+    Joint limits are (dof,) radians; finger lengths are (finger_num,) meters,
+    scaled by robot/human * finger_scale_boost. ftol_abs_s* and maxeval_s*
+    set each stage's NLopt tolerance and evaluation budget.
 
-    Parameters
-    ----------
-    urdf_path:
-        Absolute path to XHand URDF file.
-    fingertip_frame_names:
-        URDF frame names for the 5 fingertip links.
-    joint_limits_lower / joint_limits_upper:
-        Joint bounds (rad), shape (dof,).
-    finger_lengths_robot / finger_lengths_human:
-        Finger lengths (m), shape (finger_num,).  Scale = robot/human * boost.
-    finger_scale_boost:
-        Multiplier on the robot/human length ratio (1.2 = slight over-extension).
-    smooth_weight:
-        Temporal smoothness weight in Stage 1 objective.
-    ftol_abs_s1 / maxeval_s1:
-        Stage 1 NLopt convergence tolerance / max evaluations.
-    ftol_abs_s2 / maxeval_s2:
-        Stage 2 NLopt convergence tolerance / max evaluations.
-    pinch_base_weight:
-        Base weight for thumb-to-finger attraction in Stage 2.
-    pinch_start_dist_m / pinch_full_dist_m:
-        Distance thresholds (m) for pinch activation ramp.
-    pinch_ema_alpha:
-        EMA smoothing factor for pinch activation (0.0 = frozen, 1.0 = instant).
-    pinch_skip_threshold:
-        Skip Stage 2 when max(pinch_factors) < this value.
-    reg_stage1_weight / reg_last_weight:
-        Stage 2 regularization: anchor to Stage 1 solution / previous frame.
-    prior_weight:
-        Human-flexion prior weight γ: pulls the solved joints toward the
-        per-frame human flexion reference (``q_prior`` passed to ``solve``) in
-        both stages, masked to the 10 flexion joints by ``prior_mask``. 0.0
-        disables the prior.
-    prior_mask:
-        (dof,) 0/1 weight mask selecting which joints the prior applies to
-        (1 = flexion joints, 0 = unmapped joints such as thumb_rota1 /
-        index_bend).  Required when ``prior_weight > 0``.
+    Stage 1 adds temporal smoothness. Stage 2 adds thumb-to-finger attraction
+    with pinch_base_weight and a start/full distance ramp in meters.
+    pinch_ema_alpha spans frozen (0) to instant (1); Stage 2 is skipped when
+    max(pinch_factors) < pinch_skip_threshold. reg_stage1_weight and
+    reg_last_weight anchor Stage 2 to Stage 1 and the previous frame.
+
+    Both stages apply prior_weight toward q_prior. Zero disables the prior;
+    otherwise prior_mask is required: (dof,) zeros/ones selecting the 10 flexion
+    joints, excluding unmapped joints such as thumb_rota1 and index_bend.
     """
 
     def __init__(
@@ -176,17 +150,11 @@ class HandOptimizer:
     def solve(
         self, fingertip_positions: np.ndarray, q_prior: np.ndarray | None = None
     ) -> np.ndarray | None:
-        """Solve one frame: fingertip positions → joint angles.
+        """Solve wrist-centered fingertips (finger_num, 3) in the URDF frame.
 
-        Args:
-            fingertip_positions: (finger_num, 3) target positions in URDF frame,
-                centered at wrist origin.
-            q_prior: Optional (dof,) per-frame human-flexion reference in
-                Pinocchio model order.  Only used when ``prior_weight > 0``.
-
-        Returns:
-            (dof,) joint angles in Pinocchio model order, or ``None`` when
-            Stage 1 fails. The caller must record failure without a new target.
+        q_prior is an optional (dof,) human-flexion reference in Pinocchio order,
+        used when prior_weight > 0. Returns (dof,) angles in that order, or None
+        on Stage 1 failure; the caller must record failure without a new target.
         """
         fingertip_positions = np.asarray(fingertip_positions, dtype=np.float64)
         if fingertip_positions.shape != (self.finger_num, 3):

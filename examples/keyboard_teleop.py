@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Run a hardware-affecting keyboard teleoperation session.
+"""Usage: python examples/keyboard_teleop.py
 
-The session commands xArm7 and can also command XHand unless ``--no-hand`` is set.
+Controls xArm7 and, unless --no-hand is set, XHand.
 """
 
 from __future__ import annotations

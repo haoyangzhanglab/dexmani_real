@@ -1,11 +1,7 @@
-"""Non-blocking voice prompt player for teleop state transitions.
+"""Play assets/audio/*.wav prompts without blocking the control loop.
 
-Plays pre-recorded .wav files via system audio (aplay/paplay) in a daemon
-thread so the configured control loop is never blocked. Only one prompt plays at
-a time — a new play() call cancels any in-progress playback.
-
-Events are short keys (e.g. "begin", "save") that map to filenames under
-assets/audio/.  Missing player or file degrades silently to a log warning.
+A daemon thread uses aplay/paplay; play() cancels the current prompt.
+Missing players or files produce a warning and skip playback.
 """
 
 from __future__ import annotations
@@ -126,17 +122,12 @@ class AudioFeedback:
             self._condition.notify_all()
 
     def queue(self, event: str) -> None:
-        """Queue a voice prompt to play after the current one finishes.
-
-        Unlike :meth:`play`, which cancels any in-progress playback and
-        plays immediately, ``queue`` appends the event to a sequential
-        playback queue.  If nothing is currently playing, the queued
-        event starts immediately.
+        """Append a prompt after pending playback, or start immediately if idle.
 
         Usage::
 
-            audio.play("calibrated")   # starts playing immediately
-            audio.queue("begin")       # plays after "calibrated" finishes
+            audio.play("calibrated")
+            audio.queue("begin")
         """
         path = self._event_path(event)
         if path is None:

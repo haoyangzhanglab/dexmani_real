@@ -1,24 +1,10 @@
 #!/usr/bin/env python3
-"""Research-facing entry point for one recorded DexMani Policy evaluation session.
+"""Usage: python examples/run_policy.py EXPERIMENT [--artifact A] [--inference-steps N]
+       [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]
 
-``python examples/run_policy.py EXPERIMENT [--artifact A] [--inference-steps N]
-[--seed S] [--num-episodes N] [--max-duration SEC] [--device D]`` runs one
-persistent multi-episode physical session (H -> scene setup -> B -> S).
-Required recording failure ends the invalid evaluation with a nonzero result.
-Before any hardware starts, run_config.yaml records the full resolved runtime,
-public policy specification, artifact and session settings. Task success remains
-an independent offline judgment.
-
-Inference is synchronous: each query supplies PolicySpec.n_action_steps actions,
-dispatched in order at a cadence anchored to actual publication. The next query
-starts one control period after the previous publish; the new chunk's first
-action publishes immediately after inference, without an extra control period.
-Late inference never triggers catch-up dispatch. Fixed-FPS video is for viewing;
-use HDF5 timestamps for actual control timing.
-
-The command always connects to hardware (the lifecycle starts the policy
-child first and waits for its READY before any actuator or camera worker), so
-do not run it outside a supervised robot session.
+Runs supervised physical evaluation (H -> scene setup -> B -> S), saving run_config.yaml.
+Recording failure invalidates evaluation; judge task success offline.
+Synchronous action chunks never catch up late inference; use HDF5 timestamps for timing.
 """
 
 from __future__ import annotations
@@ -106,7 +92,6 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _safe_selector_parts(selector: Any) -> tuple[str, str, str]:
-    """Accept only the canonical policy/task/experiment selector shape."""
     if not isinstance(selector, str):
         raise ValueError("Policy selector must be a string")
     parts = tuple(selector.split("/"))
@@ -119,14 +104,12 @@ def _safe_selector_parts(selector: Any) -> tuple[str, str, str]:
 
 
 def _inspect_policy_experiment(experiment: str, *, artifact: str | None) -> Any:
-    """Inspect and pin metadata through Policy without constructing a model."""
     from dexmani_policy.deployment import inspect_experiment
 
     return inspect_experiment(experiment, artifact=artifact)
 
 
 def _session_directory(root: Path, selector: str) -> Path:
-    """Create and return ``rollouts/<policy>/<task>/<experiment>/session_<ts>``."""
     parts = _safe_selector_parts(selector)
     base = root / Path(*parts)
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -153,7 +136,6 @@ def _write_run_config(
     runtime: Any,
     info: Any,
 ) -> None:
-    """Write the resolved experimental conditions before any worker starts."""
     import yaml
 
     from dexmani_real.config.experiment import config_as_dict
@@ -199,7 +181,6 @@ def _print_summary(
     max_running_s: float,
     session_dir: Path,
 ) -> None:
-    """Print the small operator-facing resolved session facts."""
     spec = info.spec
     fields = tuple(field.name for field in spec.observation_fields)
     print("── Policy Evaluation Session ──")

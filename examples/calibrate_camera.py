@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Run the hardware-affecting xArm7/RealSense eye-to-hand calibration workflow.
+"""Usage: python examples/calibrate_camera.py --hand-geometry {absent,secured-home}
 
-The interactive session can command the arm and writes ``cameras.json`` after
-ENTER. ``--hand-geometry`` is a required physical-state assertion, not a geometry
-selector: use ``absent`` only without a mounted XHand, or ``secured-home`` only
-when the mounted hand is physically fixed at its configured home pose. Current
-Cartesian IK endpoint self-collision and return-home path checks conservatively
-use the fixed-home XHand envelope for both assertions.
+Moves xArm7 and saves cameras.json on ENTER. Use absent only without XHand;
+secured-home requires a hand fixed at home. Both use the fixed-home collision envelope.
 """
 
 from __future__ import annotations

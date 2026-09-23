@@ -1,9 +1,7 @@
-"""PolicySpec compatibility and narrow policy-runtime configuration.
+"""Validate PolicySpec cadence against actuator worker service rates.
 
-Policy owns raw tensor shapes, modalities and action-grid spacing. Real
-validates that cadence against actuator worker service rates.
-This module only validates their boundary and carries pickle-safe experiment
-identity into the spawned worker; it never imports Policy or Torch.
+Policy defines tensor shapes, modalities and action spacing. Worker settings
+are pickle-safe; this module imports neither Policy nor Torch.
 """
 
 from __future__ import annotations
@@ -171,15 +169,11 @@ def validate_num_episodes(num_episodes: Any) -> int:
 
 @dataclass(frozen=True)
 class RolloutRecordingConfig:
-    """Resolved recording inputs for one physical policy rollout session.
+    """Recording inputs for a physical rollout, with an absolute session data_dir.
 
-    ``data_dir`` is an isolated absolute output directory (the session
-    directory); the CLI owns selector/path validation before workers start.
-    This pickle-safe object carries only evidence-recording inputs — the run
-    plan (episodes, per-episode budget) is run configuration owned by the
-    lifecycle, never part of the recording correctness contract. Task success
-    is judged offline from the published raw episodes, and the runtime records
-    only technical stop reasons.
+    The CLI validates paths before workers start. Episode counts and budgets
+    belong to lifecycle configuration. Runtime records technical stop reasons;
+    task success is judged offline from raw episodes.
     """
 
     data_dir: str

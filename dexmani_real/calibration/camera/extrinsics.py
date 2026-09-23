@@ -1,36 +1,14 @@
-"""Camera extrinsics loader.
+"""Load eye-to-hand or eye-in-hand extrinsics from cameras.json.
 
-Loads per-camera extrinsics from a bundled cameras.json data file.
-Supports eye-to-hand (static camera) and eye-in-hand (end-effector mounted).
+Each camera entry stores serial, type and pose (XYZ meters, WXYZ quaternion),
+converted to a 4x4 transform at load time. Runtime intrinsics come from RealSense
+and are recorded in HDF5 /meta; calibration_capture is diagnostic provenance.
 
-The storage format is a human-readable pose::
+Usage::
 
-       {
-         "camera_0": {
-           "serial": "241322110633",
-           "type": "eye_to_hand",
-           "pose": {
-             "position": [0.5, -0.35, 0.82],
-             "orientation": [1.0, 0.0, 0.0, 0.0]
-           }
-         }
-       }
-
-   ``position`` is XYZ in meters, ``orientation`` is WXYZ quaternion.
-   Converted to a 4×4 homogeneous matrix at load time.
-
-Intrinsics (K matrix) are read from the RealSense hardware at runtime and stored
-into HDF5 /meta for self-contained episodes. New calibration entries may also
-carry a ``calibration_capture`` snapshot (stream geometry, intrinsics,
-distortion, solver residuals, and timestamp) for provenance; it is diagnostic
-and is not used as runtime intrinsics.
-
-Usage:
     calib = CameraExtrinsics()
-    cam = calib.resolve_name_by_serial(connected_serial)  # robust: pick by serial
-    T_base_camera = calib.get_extrinsics(cam)                                     # eye-to-hand
-    T_base_camera = calib.get_extrinsics(cam, T_base_eef=T_base_eef)              # eye-in-hand
-    meta = calib.to_meta_dict(cam, expected_serial=connected_serial)  # verified /meta
+    cam = calib.resolve_name_by_serial(connected_serial)
+    T_base_camera = calib.get_extrinsics(cam)  # eye-in-hand also needs T_base_eef
 """
 
 from __future__ import annotations
@@ -47,15 +25,7 @@ from dexmani_real import PACKAGE_DIR
 
 
 def _pose_to_matrix(position: list[float], orientation: list[float]) -> np.ndarray:
-    """Convert pose (position XYZ + orientation WXYZ quaternion) to 4×4 homogeneous matrix.
-
-    Args:
-        position: [x, y, z] in meters.
-        orientation: [w, x, y, z] quaternion (scalar-first).
-
-    Returns:
-        (4, 4) homogeneous transformation matrix, float64.
-    """
+    """Convert XYZ meters and a WXYZ quaternion to a float64 (4, 4) transform."""
     from scipy.spatial.transform import Rotation as R
 
     position_value = np.asarray(position, dtype=np.float64)
@@ -171,15 +141,9 @@ class CameraExtrinsics:
             self._entries[cam_name] = entry
 
     def resolve_name_by_serial(self, serial: str) -> str:
-        """Return the camera_name whose entry matches ``serial``.
+        """Select calibration by the connected camera's serial, not a fixed name.
 
-        This is the robust way to pick a calibration entry: select by the
-        actually-connected camera's serial instead of a hard-coded name, so a
-        stale/placeholder entry under a familiar name (e.g. "camera_0") can
-        never be used by mistake.
-
-        Raises:
-            KeyError: if no entry matches, or if more than one does.
+        Raises KeyError if zero or multiple entries match.
         """
         matches = [n for n, e in self._entries.items() if e.serial == serial]
         if not matches:
@@ -224,18 +188,11 @@ class CameraExtrinsics:
         return T_base_eef @ entry.T_eef_camera
 
     def to_meta_dict(self, cam_name: str, expected_serial: str | None = None) -> dict:
-        """Return extrinsics values for HDF5 /meta attributes.
+        """Return camera serial, type and a flattened 4x4 extrinsic for HDF5 /meta.
 
-        Contains camera_serial, camera_type, and either
-        camera_T_world_camera (eye_to_hand, world frame) or camera_T_eef_camera
-        (eye_in_hand) as a 4x4 flat list.
-
-        camera_K is not included here — intrinsics are read from the
-        RealSense hardware at recording time and written to HDF5 separately.
-
-        If ``expected_serial`` is given, verifies the entry belongs to that
-        physical camera and raises ValueError on mismatch — so a wrong
-        camera_name can never silently poison recorded data.
+        The transform is camera_T_world_camera (eye-to-hand) or camera_T_eef_camera
+        (eye-in-hand). Intrinsics are recorded separately from live RealSense data.
+        Raises ValueError if the entry does not match a supplied expected_serial.
         """
         if expected_serial is not None:
             self.verify_serial(cam_name, expected_serial)

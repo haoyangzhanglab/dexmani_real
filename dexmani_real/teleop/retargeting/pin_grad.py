@@ -49,13 +49,7 @@ class PinGrad:
     """
 
     def __init__(self, urdf_path: str, fingertip_frame_names: list[str]) -> None:
-        """Build Pinocchio model and resolve fingertip frame IDs.
-
-        Args:
-            urdf_path: Absolute path to the XHand URDF file.
-            fingertip_frame_names: URDF ``<frame>`` names for the 5 fingertips
-                (e.g. ``"right_hand_thumb_rota_tip"``).
-        """
+        """Load the XHand URDF and resolve the five fingertip frame names."""
         names = validate_fingertip_frame_names(fingertip_frame_names)
         self.model = pin.buildModelFromUrdf(urdf_path, pin.JointModelFreeFlyer())
         self.data = self.model.createData()
@@ -82,16 +76,10 @@ class PinGrad:
     def compute_position_gradient(
         self, qpos_floating: np.ndarray, target_pos: np.ndarray
     ) -> tuple[np.ndarray, float]:
-        """Analytic gradient of squared fingertip position error.
+        """Return joint-only (gradient, loss) for sum_i ||FK_tip_i(q) - target_i||².
 
-        ∂/∂q  Σ_i ||FK_tip_i(q) - target_i||²
-
-        Args:
-            qpos_floating: (19,) generalized coords [freeflyer(7) | joints(12)].
-            target_pos:     (N, 3) target fingertip positions in URDF frame.
-
-        Returns:
-            (grad: (dof,), loss: float) — gradient w.r.t. joint DOFs only.
+        qpos_floating is (19,) [freeflyer(7) | joints(12)]; target_pos is (N, 3)
+        in the URDF frame. The gradient has shape (dof,).
         """
         self.update_kinematics(qpos_floating)
 

@@ -162,15 +162,11 @@ def validate_annotation_task_name_override(
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
-    """Accept either one episode directory or a task directory of episodes.
+    """Return absolute paths for one episode or a task's episode_* directories.
 
-    Task roots discover only explicit ``episode_*`` subdirectories
-    (ManiUniCon-style convention). A corrupt ``episode_*`` directory is still
-    discovered and must fail loudly downstream; it is never silently filtered
-    by a ``data.h5`` existence check. The direct single-episode root
-    (``root/data.h5``) path is unchanged. Returned paths are absolute so
-    persisted source provenance remains independent of the caller's working
-    directory.
+    Task discovery includes corrupt episode_* directories so downstream checks
+    reject them explicitly; it does not filter by data.h5 existence.
+    A root containing data.h5 is treated as a single episode.
     """
     root = Path(input_root).resolve()
     if not root.is_dir():

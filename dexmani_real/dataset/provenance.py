@@ -1,9 +1,7 @@
-"""Raw-episode workflow provenance classification for fixed-dt teleop consumers.
+"""Classify raw workflows for fixed-dt teleop processing and physical replay.
 
-Policy-eval rollouts carry synchronous/irregular execution timing (real
-inference-boundary gaps) and must not silently enter the fixed-dt teleop
-processing pipeline or the teleop-only physical replay workflow. This module is
-the single classifier both consumers share, so the two boundaries never drift.
+Policy rollouts have irregular inference gaps and must not enter either
+teleop-only workflow.
 """
 
 from __future__ import annotations

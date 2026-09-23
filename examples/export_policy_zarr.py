@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Export raw episodes directly to policy Zarr; --dry-run executes the same transforms."""
+"""Usage: python examples/export_policy_zarr.py episodes/<task_name> [--dry-run]
+
+Exports raw episodes to canonical Zarr; --dry-run runs the same transforms without writing.
+"""
 
 from __future__ import annotations
 
@@ -81,10 +84,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-# Source roots whose contents must never receive derived export output. They
-# are anchored to the REPOSITORY root, not the caller's working directory, so
-# the guard holds no matter where the tool is invoked from.
-# Historical data directories remain write-protected even though their loader is gone.
+# Protect repository-relative raw, legacy processed and rollout data.
 _PROTECTED_SOURCE_ROOTS = ("episodes", "episodes_processed", "rollouts")
 
 
@@ -93,14 +93,7 @@ def _resolve_output_path(
     default_path: Path,
     input_root: Path,
 ) -> Path:
-    """Resolve the export target and keep it outside every protected source.
-
-    Symlinks are followed, so a link that escapes into raw/rollout
-    data is refused by its resolved location. Overwriting any existing output
-    is refused by the occupied-target check before either mode runs. The
-    returned path is the same one the checks resolved (``~`` expanded), so
-    safety, the occupied-target refusal, and the real export all agree.
-    """
+    """Reject outputs inside protected sources or existing Zarr stores, following symlinks."""
     candidate = default_path if output is None else output
     resolved = candidate.expanduser().resolve(strict=False)
     protected = [(_REPO_ROOT / name).resolve(strict=False) for name in _PROTECTED_SOURCE_ROOTS]
@@ -115,15 +108,11 @@ def _resolve_output_path(
             raise ValueError(
                 f"output target {resolved} must not resolve inside the existing Zarr store {parent}"
             )
-    # Return the path the checks actually resolved. Without the expansion a
-    # ``~``-prefixed --output would be validated at the home directory and
-    # then written to a literal ``~/`` tree under the working directory.
+    # Expand ~ for writing as well as checking.
     return candidate.expanduser()
 
 
 def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
-    """Derive the policy store path and required task name from one input directory."""
-
     task_name = (
         input_root.parent.name
         if (input_root / "data.h5").exists() or input_root.name.startswith("episode_")
@@ -141,8 +130,6 @@ def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
 
 
 class _ExportProgress:
-    """Render the data-layer's cumulative progress events as one bar per phase."""
-
     _PHASE_LABELS = {"convert": ("raw to policy Zarr", "episode")}
 
     def __init__(self) -> None:
@@ -169,7 +156,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         default_output_path, task_name = _resolve_task_paths(args.input_root)
-        # Preflight and real export share the identical output contract.
         output_path = _resolve_output_path(args.output, default_output_path, args.input_root)
         config = PolicyZarrExportConfig(
             chunk_frames=args.chunk_frames,
@@ -180,9 +166,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
     progress = _ExportProgress()
     report: dict
-    # Preflight and real export share the identical output contract: an
-    # occupied target is refused up front in BOTH modes, exactly as the
-    # export transaction would refuse it.
+    # Dry runs also reject occupied targets.
     if target_is_occupied(output_path):
         print(
             f"error: refusing to overwrite existing output: {output_path}",

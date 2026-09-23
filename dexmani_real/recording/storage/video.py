@@ -1,19 +1,15 @@
-"""Video codec utilities for HDF5 episode recording.
+"""Encode and decode H.264 MP4 sidecars for HDF5 episodes.
 
-Provides streaming H.264 encoding (write) and frame decoding (read) for
-camera data stored as MP4 sidecar files alongside HDF5 episodes.
-
-Typical usage (encode)::
+Encode::
 
     with VideoEncoder(path, fps=16.0, width=640, height=480) as enc:
         for frame in camera_frames:
             enc.write_frame(frame)
 
-Typical usage (decode)::
+Decode::
 
     with VideoDecoder(path) as dec:
         all_frames = dec.read_all()
-        single = dec.read_frame(42)
 """
 
 from __future__ import annotations
@@ -33,22 +29,11 @@ logger = get_logger(__name__)
 
 @dataclass
 class VideoEncoderConfig:
-    """Configuration for real-time H.264 video encoding.
+    """Real-time H.264 settings: libx264 + yuv444p preserves full chroma.
 
-    Attributes:
-        codec: FFmpeg encoder name. ``libx264`` (YUV) — the standard choice
-            for player-compatible MP4.  ``libx264rgb`` exists but produces
-            RGB-native streams that most players misinterpret as YUV
-            (washed-out / color-shifted output).  We use ``libx264`` +
-            ``yuv444p`` for full chroma resolution with automatic
-            RGB↔YUV conversion in the encode/decode path.
-        crf: Constant Rate Factor (0–51).  0 = lossless, 18 = visually
-            near-lossless (default), 23 = default, 51 = worst.
-        preset: libx264 speed/compression preset.  ``ultrafast`` is the
-            right choice for real-time encoding at moderate resolutions.
-        pixel_format: Pixel format string. ``yuv444p`` preserves full
-            chroma resolution (no subsampling) for CV data fidelity.
-            ``rgb24`` is only valid with ``libx264rgb`` (avoid — see above).
+    RGB/YUV conversion is automatic; libx264rgb may display incorrect colors
+    in players. crf ranges from 0 (lossless) to 51 (worst), default 18;
+    ultrafast favors encoding speed. rgb24 requires libx264rgb.
     """
 
     codec: str = "libx264"
@@ -58,14 +43,10 @@ class VideoEncoderConfig:
 
 
 class VideoEncoder:
-    """Streaming H.264 encoder that writes a ``.mp4`` sidecar file.
+    """Write MP4 frames sequentially in the recorder process.
 
-    Frames are written sequentially by the owning recorder process.
-
-    The output container is created lazily on the first frame so the
-    constructor never blocks on I/O.  Call :meth:`close` (or use the
-    context manager) to finalise the MP4 — otherwise the file will be
-    unplayable.
+    Opens the container on the first frame. close() or a context manager must
+    finalize the MP4 for playback.
     """
 
     def __init__(
@@ -172,12 +153,10 @@ class VideoEncoder:
 
 
 class VideoDecoder:
-    """Read frames from an MP4 sidecar file back into numpy arrays.
+    """Decode MP4 frames to NumPy arrays, in bulk or by index.
 
-    Supports both sequential bulk reads (``read_all()``) and indexed
-    single-frame reads (``read_frame(idx)``).  Indexed reads seek to the
-    nearest keyframe and decode forward, so random access is O(N) in the
-    worst case — pre-decode to memory for interactive use.
+    Indexed reads decode forward from a keyframe; prefer read_all() for
+    interactive scrubbing to avoid repeated seeks.
     """
 
     def __init__(self, path: Path) -> None:
@@ -221,13 +200,7 @@ class VideoDecoder:
                     yield frame.to_ndarray(format="rgb24")
 
     def read_frame(self, index: int) -> np.ndarray:
-        """Decode a single frame by index.
-
-        Note: this seeks to the nearest keyframe and decodes forward to
-        ``index``, so repeated random access is inefficient.  For
-        interactive scrubbing, call ``read_all()`` once and index into
-        the result.
-        """
+        """Decode from the nearest keyframe to index; prefer read_all() for repeated access."""
         if not self._opened:
             self._open()
         if self._container is None:

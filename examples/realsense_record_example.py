@@ -1,27 +1,9 @@
 #!/usr/bin/env python3
-"""Usage: ``python examples/realsense_record_example.py``.
+"""Usage: python examples/realsense_record_example.py
 
-Hardware- and GUI-affecting interactive RealSense RGB-D and point-cloud
-diagnostic. It connects to a camera, opens OpenCV/Open3D windows, and restores
-the camera's initial auto-exposure-priority value on exit. The point-cloud window
-switches explicitly between the complete unprocessed depth-to-color cloud and the
-canonical processed production cloud.
-
-Keyboard controls::
-
-    q / Esc    Quit
-    p          Toggle point cloud display
-    s          Switch RAW full <-> PROCESSED
-    f          Freeze/unfreeze the point-cloud frame
-    r          Reset to defaults
-    c          Print current config
-    d          Toggle depth colormap (jet <-> gray)
-    a          Toggle auto-exposure priority ON <-> OFF
-
-The ``a`` key toggles ``auto_exposure_priority`` live (Auto Exposure stays ON),
-so you can watch the RGB brighten/darken and the fps jump between ~16.7 Hz
-(priority ON, exposure ~60 ms in a dark scene) and ~30 Hz (priority OFF). The
-pre-test priority value is restored automatically on exit.
+Live RealSense RGB-D/Open3D diagnostic; restores auto-exposure priority on exit.
+Keys: q/Esc quit, p cloud, s raw/processed, f freeze, r reset, c config, d colormap, a exposure.
+Exposure priority allows longer exposure at lower FPS; auto exposure stays on.
 """
 
 from __future__ import annotations
@@ -48,8 +30,6 @@ _WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
 
 @dataclass(frozen=True)
 class RealSenseDiagnosticConfig:
-    """Configuration for camera connection and interactive display."""
-
     fps: int = 30
     depth_resolution: tuple[int, int] = (640, 480)
     color_resolution: tuple[int, int] = (640, 480)
@@ -59,10 +39,7 @@ class RealSenseDiagnosticConfig:
 
 @dataclass
 class PointCloudDisplayState:
-    """Mutable point-cloud display state toggled via keyboard.
-
-    Not frozen -- state is mutated in place by key handlers.
-    """
+    """Keyboard-controlled point-cloud display state."""
 
     show: bool = False
     colormap: str = "jet"
@@ -83,8 +60,6 @@ class PointCloudDisplayState:
 
 @dataclass
 class FrameStats:
-    """Per-frame timing and quality metrics."""
-
     read_ms: float = 0.0
     pcd_ms: float = 0.0
     valid_ratio: float = 0.0
@@ -93,10 +68,8 @@ class FrameStats:
 
 
 class NonBlockingPCDViewer:
-    """Non-blocking open3d point-cloud window -- create on first frame, update thereafter."""
-
     def __init__(self, point_size: float = 3.0) -> None:
-        # Keep optional Open3D lifecycle state explicit because its stubs are incomplete.
+        # Open3D stubs lack these lifecycle types.
         self._vis: Any | None = None
         self._pcd: Any | None = None
         self._frame: Any | None = None
@@ -104,7 +77,6 @@ class NonBlockingPCDViewer:
         self.point_size = point_size
 
     def update(self, points: np.ndarray) -> bool:
-        """Display one production-format cloud; return false after window close."""
         import open3d as o3d
 
         if points.dtype != np.float32 or points.ndim != 2 or points.shape[1] != 6:
@@ -152,7 +124,6 @@ class NonBlockingPCDViewer:
 def _overlay_text(
     img: np.ndarray, lines: list[str], x: int = 10, y_start: int = 22, step: int = 22
 ) -> None:
-    """Draw green HUD text lines on an image."""
     for i, line in enumerate(lines):
         cv2.putText(
             img,
@@ -186,10 +157,7 @@ def _depth_valid_ratio(depth: np.ndarray, min_d: float, max_d: float) -> float:
 
 
 def _make_gray_depth_vis(depth: np.ndarray, min_d: float, max_d: float) -> np.ndarray:
-    """Grayscale depth visualization (near=white, far=black).
-
-    Complements ``_make_jet_depth_vis`` which only produces jet colormap.
-    """
+    """Grayscale metric depth: near=white, far=black."""
     depth_f32 = depth.astype(np.float32)
     valid = np.isfinite(depth_f32) & (depth_f32 > 0)
     depth_clip = np.clip(depth_f32, min_d, max_d)
@@ -201,7 +169,6 @@ def _make_gray_depth_vis(depth: np.ndarray, min_d: float, max_d: float) -> np.nd
 
 
 def _list_cameras() -> list[dict[str, str]]:
-    """Enumerate connected RealSense cameras with retry."""
     for attempt in range(3):
         try:
             cameras = RealSenseCamera.list_cameras()
@@ -229,7 +196,6 @@ def _list_cameras() -> list[dict[str, str]]:
 
 
 def _test_lifecycle(test_cfg: RealSenseDiagnosticConfig) -> bool:
-    """Connect, verify intrinsics, disconnect (idempotent checks included)."""
     print("\n-- 1. connect/disconnect lifecycle --")
 
     config = RealSenseCameraConfig(
@@ -275,7 +241,6 @@ def _test_lifecycle(test_cfg: RealSenseDiagnosticConfig) -> bool:
 
 
 def _compute_rolling_stats(history: deque[FrameStats]) -> dict[str, float]:
-    """Compute rolling averages from frame stats history."""
     if not history:
         return dict(fps=0, read_ms=0, pcd_ms=0, total_ms=0, valid=0, points=0)
     mean_total_ms = float(np.mean([sample.total_ms for sample in history]))
@@ -297,7 +262,6 @@ def _build_hud_lines(
     geometry: RGBDGeometry,
     production: PointCloudConfig,
 ) -> list[str]:
-    """Build HUD overlay text lines."""
     depth_intrinsics = geometry.depth
     lines = [
         f"frame={frame_count}  fps={stats['fps']:.1f}  total={stats['total_ms']:.1f}ms",
@@ -330,7 +294,6 @@ def _build_key_actions(
     viewer: NonBlockingPCDViewer,
     production: PointCloudConfig,
 ) -> dict[int, Callable[[], None]]:
-    """Build the key-action dispatch table for the current loop state."""
     return {
         ord("p"): lambda: _toggle_pcd(state, viewer),
         ord("s"): lambda: _toggle_cloud_mode(state),
@@ -348,7 +311,6 @@ def _handle_keyboard(
     camera: RealSenseCamera,
     production: PointCloudConfig,
 ) -> bool:
-    """Process keyboard input.  Returns False if quit requested."""
     if key in (ord("q"), 27):
         return False
 
@@ -418,7 +380,6 @@ def _compute_base_from_color(serial: str | None, calibration: CameraExtrinsics) 
 
 
 def _find_color_sensor(camera: RealSenseCamera) -> Any:
-    """Return the color sensor from the live pipeline profile."""
     if camera.profile is None:
         raise RuntimeError("camera pipeline profile is unavailable")
     device = camera.profile.get_device()
@@ -477,7 +438,6 @@ def _run_rgbd_test(
     table_plane_abcd: tuple[float, float, float, float] | None,
     calibration: CameraExtrinsics,
 ) -> dict:
-    """Run interactive RGB-D live capture + point cloud visualization."""
     print("\n-- 2. RGB-D live capture + point cloud --")
     print(
         "   q/Esc=quit  p=pcd  s=raw/processed  f=freeze "
@@ -645,7 +605,6 @@ def _run_rgbd_test(
 
 
 def main() -> int:
-    """Run the hardware diagnostic and return a process exit status."""
     test_cfg = RealSenseDiagnosticConfig()
 
     # Validate policy and calibration files before enumerating or opening a camera.
@@ -697,8 +656,7 @@ def main() -> int:
         return 1
     print(f"Connected: {camera.get_device_info()}")
 
-    # Capture the pre-test auto_exposure_priority so we can restore it on exit,
-    # even if 'a' was toggled during the session.
+    # Restore the initial exposure priority on exit, including after keyboard changes.
     original_priority = _get_ae_priority(camera)
     if original_priority is not None:
         state_name = "OFF" if original_priority < 0.5 else "ON"

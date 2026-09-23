@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Physically replay one raw-v32 episode on xArm7 and XHand.
+"""Usage: python examples/replay_episode.py episodes/<task_name>/<episode_dir>
 
-This is a hardware-affecting entry point and writes replay evaluation results.
+Physically replays raw-v32 targets on xArm7/XHand and writes evaluation results.
 """
 
 from __future__ import annotations
@@ -32,8 +32,6 @@ logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class ReplayRuntimeSelection:
-    """Resolved runtime config and physical replay provenance."""
-
     runtime: ExperimentConfig
     acceleration_deg_s2: float
     joint_speed_deg_s: float

@@ -212,16 +212,7 @@ class XArm7MotionPlanner:
         )
 
     def __getattr__(self, name: str):
-        """Proxy passthrough methods to self.kin, self.ik_mgr, or self.mplib_planner.
-
-        Callers use ``planner.compute_eef_pose_world(q)`` as before — the proxy
-        routes to ``self.kin.compute_eef_pose_world(q)`` transparently.
-
-        Only fires when normal attribute lookup fails (i.e. the method is not
-        defined on XArm7MotionPlanner directly).  ``self.kin``, ``self.ik_mgr``,
-        and ``self.mplib_planner`` are regular attributes set in ``__init__`` and
-        are never proxied.
-        """
+        """Delegate missing attributes to kinematics, IK, then MPlib."""
         for delegate in (self.kin, self.ik_mgr, self.mplib_planner):
             if hasattr(delegate, name):
                 return getattr(delegate, name)

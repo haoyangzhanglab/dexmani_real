@@ -1,19 +1,13 @@
-"""Reader for the current transactional HDF5 episode format.
+"""Read published episodes containing data.h5, depth.h5 and rgb.mp4.
 
-Reads camera frames from DexMani episodes. Non-camera datasets
-(arm_qpos, hand_qpos, flags, etc.) are accessed directly through
-:attr:`h5f` — a merged view of the episode HDF5 sidecars.
-
-An episode is one published directory containing ``data.h5``, ``depth.h5``,
-and ``rgb.mp4``. Other raw layouts require an external migration tool.
+h5f merges non-camera HDF5 datasets; camera methods read RGB-D sidecars.
+Other raw layouts require external migration.
 
 Usage::
 
     with EpisodeReader("episode_001") as reader:
         arm_qpos = reader.h5f["arm_qpos"][:]
-
-        rgb_frame  = reader.read_camera_frame("rgb", 42)
-        all_depth  = reader.read_camera_all("depth")
+        rgb_frame = reader.read_camera_frame("rgb", 42)
 """
 
 from __future__ import annotations

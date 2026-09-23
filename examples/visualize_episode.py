@@ -1,17 +1,7 @@
 #!/usr/bin/env python3
-"""Usage: ``python examples/visualize_episode.py EPISODE [--info] [--max-frames N]``.
+"""Usage: python examples/visualize_episode.py EPISODE [--info] [--max-frames N]
 
-Self-contained Rerun visualizer for current raw DexMani episodes. Offline
-only: connects to no hardware and writes no files; it opens a Rerun viewer unless
-``--info`` is selected. Episodes display a canonical fixed-size ``(N, 6)`` point
-cloud derived with the same production implementation used by offline processing
-and deployment.
-
-Examples::
-
-  python examples/visualize_episode.py episodes/<task_name>/<episode_dir>
-  python examples/visualize_episode.py episodes/<task_name>/<episode_dir> --info
-  python examples/visualize_episode.py episodes/<task_name>/<episode_dir> --max-frames 500
+Offline raw-episode Rerun viewer with production point clouds; --info prints a summary.
 """
 
 from __future__ import annotations
@@ -22,7 +12,6 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-# Set a quiet Rerun logging default unless the operator already configured one.
 os.environ.setdefault("RUST_LOG", "error")
 
 import h5py
@@ -76,7 +65,6 @@ _EEF_COLOR = (255, 255, 255)
 
 
 def _eef_position_or_none(eef_row: np.ndarray) -> np.ndarray | None:
-    """Return a finite derived EEF position, or clear an invalid row."""
     row = np.asarray(eef_row, dtype=np.float64)
     if row.shape != (9,) or not np.all(np.isfinite(row)):
         return None
@@ -84,7 +72,6 @@ def _eef_position_or_none(eef_row: np.ndarray) -> np.ndarray | None:
 
 
 def _fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None:
-    """Return finite derived fingertips, or clear an invalid row."""
     row = np.asarray(fingertip_row, dtype=np.float32)
     if row.ndim != 2 or row.shape != HAND_FINGERTIP_SHAPE or not np.all(np.isfinite(row)):
         return None
@@ -92,7 +79,6 @@ def _fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None
 
 
 def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
-    """Group top-level HDF5 datasets by category (arm, hand, action, vr, camera, flags, meta)."""
     available_keys = {k for k in h5f.keys() if isinstance(h5f[k], h5py.Dataset)}
     classified: dict[str, list[str]] = {}
 
@@ -105,7 +91,6 @@ def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
 
 
 def print_episode_info(h5_path: str) -> None:
-    """Print a human-readable summary of the episode structure without opening Rerun."""
     with EpisodeReader(h5_path) as reader:
         if not reader.min_frames_met:
             print(
@@ -166,8 +151,6 @@ def print_episode_info(h5_path: str) -> None:
 
 
 class EpisodeVisualizer:
-    """Load an HDF5 episode and stream it into Rerun for interactive 3D viewing."""
-
     def __init__(
         self,
         h5_path: str,
@@ -183,7 +166,6 @@ class EpisodeVisualizer:
                 logger.warning("Episode is below the configured minimum recording duration")
             self._h5f = self._reader.h5f
 
-            # Preload the RGB-D sidecars once for Rerun.
             self._rgb_cache = self._reader.read_camera_all("rgb")
             self._depth_cache = self._reader.read_camera_all("depth")
             logger.info("Pre-decoded %d RGB-D frames", self._rgb_cache.shape[0])
@@ -254,7 +236,6 @@ class EpisodeVisualizer:
             raise
 
     def _resolve_frame_count(self, max_frames: int | None) -> int:
-        """Resolve the fixed-grid frame count and validate camera alignment."""
         raw = int(self._h5f["meta"].attrs.get("num_frames", 0))
         if raw <= 0:
             raise ValueError("episode /meta num_frames must be positive")
@@ -266,7 +247,6 @@ class EpisodeVisualizer:
         return raw
 
     def _preload_state(self) -> dict[str, np.ndarray]:
-        """Read all non-camera datasets into memory, truncated to T frames."""
         state: dict[str, np.ndarray] = {}
         for _category, keys in self._available.items():
             if _category == "camera":
@@ -307,7 +287,6 @@ class EpisodeVisualizer:
         return state
 
     def _build_blueprint(self) -> rrb.Blueprint:
-        """Build Rerun view layout from detected data categories."""
         has_state = bool(self._available.get("arm") or self._available.get("hand"))
         has_action = bool(self._available.get("action"))
         has_flags = bool(self._available.get("flags"))
@@ -368,7 +347,6 @@ class EpisodeVisualizer:
         return rrb.Blueprint(rrb.Horizontal(contents=columns))
 
     def _log_static(self) -> None:
-        """Log per-series labels, camera pinhole, and extrinsics once."""
         for category, keys in self._available.items():
             if category == "camera":
                 continue
@@ -435,7 +413,6 @@ class EpisodeVisualizer:
         return f"{category}/{key}"
 
     def log_step(self, step_idx: int) -> None:
-        """Log camera, canonical point cloud, fingertips, and state."""
         rr.set_time_sequence("step", step_idx)
         if "timestamp" in self._state:
             rr.set_time_seconds("time", float(self._state["timestamp"][step_idx]))
@@ -485,13 +462,12 @@ class EpisodeVisualizer:
         )
 
     def _log_fingertips(self, step_idx: int) -> None:
-        """Render hand_fingertip FK positions as per-finger colored keypoints."""
         fp_data = self._state.get("hand_fingertip")
         if fp_data is None:
             return
         fp = _fingertip_positions_or_none(fp_data[step_idx])
         if fp is None:
-            # Never leave the previous frame's spheres behind on invalid rows.
+            # Clear stale geometry on invalid rows.
             rr.log("fingertips", rr.Clear(recursive=False))
             return
 
@@ -505,13 +481,12 @@ class EpisodeVisualizer:
         )
 
     def _log_eef(self, step_idx: int) -> None:
-        """Render derived EEF position; clear the entity for invalid joint state."""
         ee_data = self._state.get("arm_ee")
         if ee_data is None:
             return
         position = _eef_position_or_none(ee_data[step_idx])
         if position is None:
-            # Never leave the previous frame's sphere behind on invalid rows.
+            # Clear stale geometry on invalid rows.
             rr.log("eef", rr.Clear(recursive=False))
             return
         rr.log(
@@ -561,7 +536,6 @@ class EpisodeVisualizer:
         return self._pointcloud_processing_ns / self._pointcloud_processed_frames / 1e6
 
     def close(self) -> None:
-        """Release HDF5/video resources and disconnect from Rerun."""
         if hasattr(self, "_reader") and self._reader is not None:
             self._reader.close()
             self._reader = None  # type: ignore[assignment]

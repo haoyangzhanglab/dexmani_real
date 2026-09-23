@@ -1,22 +1,14 @@
-"""Standalone Pinocchio collision model for xArm7 + XHand.
+"""Pinocchio self-collision checks for xArm7 + XHand, independent of MPlib.
 
-Builds a lightweight Pinocchio self-collision model from the collision URDF,
-independent of MPlib. Uses T-Rex's ``pin.computeCollisions()`` pattern.
-
-A single unified SRDF controls collision pair filtering:
-
-- ``xarm7_xhand.srdf`` — unified SRDF used by both 7-DOF and 19-DOF modes.
-  Enables arm-wrist to hand collision detection while keeping hand self-collision
-  disabled. The 19-DOF model retains 255 active pairs: 17 arm-arm and
-  238 arm-hand; no hand-hand pairs remain active.
+Uses T-Rex's pin.computeCollisions() pattern. Both models share
+xarm7_xhand.srdf: arm-arm and arm-hand checks, with hand self-collision
+disabled. The 19-DOF model has 17 arm-arm and 238 arm-hand active pairs.
 
 Usage::
 
-    from dexmani_real.planning.collision import CollisionModel
-
     cm = CollisionModel()
-    cm.check_self_collision(qpos)           # bool
-    cm.check_self_collision_details(qpos)   # CollisionInfo
+    cm.check_self_collision(qpos)          # bool
+    cm.check_self_collision_details(qpos)  # CollisionInfo
 """
 
 from __future__ import annotations
@@ -107,26 +99,11 @@ CollisionInfo._NO_COLLISION = CollisionInfo(in_collision=False)
 
 
 class CollisionModel:
-    """Standalone Pinocchio self-collision model for xArm7 + XHand.
+    """Self-collision model with fixed or active hand joints.
 
-    Two modes, sharing the **same unified SRDF**:
-
-    - **7-DOF** (default, ``hand_dof=False``): arm-only collision model from the
-      collision URDF (hand joints merged as fixed).  Accepts ``qpos`` of shape
-      ``(7,)``.
-
-    - **19-DOF** (``hand_dof=True``): full arm + hand collision model from the
-      full URDF (hand joints active).  Accepts ``qpos`` of shape ``(19,)`` —
-      first 7 are arm joints, last 12 are hand joints.
-
-    Both modes use ``xarm7_xhand.srdf``, which enables arm-wrist
-    to hand collision detection and keeps hand self-collision disabled.
-
-    Parameters:
-        hand_dof: If True, build a 19-DOF model with active hand joints.
-        urdf_path: Path to the collision URDF (overrides default).
-        srdf_path: Path to the collision SRDF (overrides default).
-        package_dir: Mesh resolution directory.
+    hand_dof=False uses the 7-DOF collision URDF with a fixed hand;
+    hand_dof=True uses the full URDF with qpos = [arm(7), hand(12)].
+    urdf_path/srdf_path override the models; package_dir resolves meshes.
     """
 
     def __init__(
@@ -343,24 +320,13 @@ class CollisionModel:
         )
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
-        """Set the current hand joint configuration for auto-expansion.
+        """Set finite (12,) hand angles in radians before each arm collision check.
 
-        In ``hand_dof`` mode, collision check methods accept 7-DOF arm qpos
-        and automatically concatenate with this buffer to form a full 19-DOF
-        qpos.  Call this each frame before arm collision checks.
-
-        Accepts hand qpos in **user order** (native hardware order):
-        ``[thumb_bend, thumb_rota1, thumb_rota2, index_bend, index_j1, index_j2,
-        mid_j1, mid_j2, ring_j1, ring_j2, pinky_j1, pinky_j2]``.
-
-        Internally reorders to URDF joint order for correct Pinocchio FK:
-        ``[index_…, mid_…, pinky_…, ring_…, thumb_…]``.
-
-        Args:
-            hand_qpos: 12-DOF hand joint angles [rad] in **user order**.
-
-        Raises:
-            ValueError: If shape is wrong or values contain NaN/Inf.
+        In hand_dof mode, 7-DOF arm inputs expand using this hand configuration.
+        Input SDK order is [thumb_bend, thumb_rota1, thumb_rota2, index_bend,
+        index_j1, index_j2, mid_j1, mid_j2, ring_j1, ring_j2, pinky_j1, pinky_j2];
+        it is remapped to URDF order [index, mid, pinky, ring, thumb].
+        Raises ValueError for wrong shape or non-finite values.
         """
         hand_qpos = np.asarray(hand_qpos, dtype=np.float64)
         if hand_qpos.shape != (_HAND_DOF_COUNT,):
@@ -418,13 +384,10 @@ class CollisionModel:
         return self._pin_update(qpos, stop_at_first=True)
 
     def minimum_hand_frame_z(self, arm_qpos: np.ndarray) -> float:
-        """Return the lowest XHand link-frame origin in the robot base frame.
+        """Return the lowest XHand link-frame origin in robot-base coordinates.
 
-        The active hand configuration comes from ``set_hand_qpos`` in 19-DOF
-        mode; the fixed hand posture is used by the 7-DOF model.  Callers apply
-        an additional mesh-extent margin because frame origins are not surface
-        points.  This is substantially more orientation-aware than subtracting
-        a constant distance from the EEF origin.
+        Uses set_hand_qpos in 19-DOF mode, or the fixed hand in 7-DOF mode.
+        Callers must add a mesh-extent margin: frame origins are not surface points.
         """
         qpos = self._to_full_qpos(arm_qpos)
         self._pin.forwardKinematics(self._model, self._data, qpos)
