@@ -29,7 +29,11 @@ from scipy.spatial.transform import Rotation as R
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.calibration.table import fit_table_plane, publish_table_plane
-from dexmani_real.config.experiment import ExperimentConfig, resolve_experiment_config
+from dexmani_real.config.experiment import (
+    ExperimentConfig,
+    resolve_experiment_config,
+    resolve_table_plane,
+)
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.sensor.camera.realsense import (
@@ -551,7 +555,7 @@ def _calibrate_table(
         backup = publish_table_plane(plane_path, fit, confirmed=True)
         if backup is not None:
             print(f"  Backup: {backup}")
-        resolved_plane = resolve_experiment_config().environment.table.plane_abcd
+        resolved_plane = resolve_table_plane(resolve_experiment_config().environment.table)
         if not np.allclose(resolved_plane, fit.plane_abcd, rtol=0.0, atol=1e-12):
             raise RuntimeError("published plane failed runtime-config round-trip")
         print("  Published and runtime-config round-trip verified.")
@@ -852,7 +856,7 @@ def main(argv: list[str] | None = None) -> int:
             all_timings["desk_calib"] = calibration_ms
             table_plane_source = "calibrated_this_run"
         elif pcd_config.remove_table:
-            table_plane_abcd = runtime.environment.table.plane_abcd
+            table_plane_abcd = resolve_table_plane(runtime.environment.table)
             table_plane_source = "resolved_runtime"
             all_timings["desk_calib"] = math.nan
             print(

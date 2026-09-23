@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
+from dexmani_real.config.experiment import resolve_table_plane
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.ipc.schema import (
     make_pointcloud_frame_dtype,
@@ -100,7 +101,7 @@ class PointCloudLoopConfig:
             camera_calibration=CameraExtrinsics()
             if camera_calibration is None
             else camera_calibration,
-            table_plane_abcd=table.plane_abcd if pointcloud.remove_table else None,
+            table_plane_abcd=resolve_table_plane(table) if pointcloud.remove_table else None,
         )
 
 

@@ -37,7 +37,7 @@ import numpy as np
 import pyrealsense2 as rs
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
-from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.config.experiment import resolve_experiment_config, resolve_table_plane
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.sensor.camera.realsense import RealSenseCamera, RealSenseCameraConfig
@@ -652,7 +652,7 @@ def main() -> int:
     runtime = resolve_experiment_config()
     production = runtime.pointcloud
     table = runtime.environment.table
-    table_plane_abcd = table.plane_abcd if production.remove_table else None
+    table_plane_abcd = resolve_table_plane(table) if production.remove_table else None
     calibration = CameraExtrinsics()
 
     print("=" * 60)

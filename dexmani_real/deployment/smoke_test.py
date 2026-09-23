@@ -61,6 +61,132 @@ class DeploymentSmoke(unittest.TestCase):
         self.assertEqual(profile, make_online_ik_config(runtime, control_dt_s=dt))
 
 
+class TablePlaneSmoke(unittest.TestCase):
+    def test_default_export_records_current_plane(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import zarr
+
+        with tempfile.TemporaryDirectory() as directory:
+            plane_path = Path(directory) / "plane.json"
+            plane_path.write_text(json.dumps(dict(a=0, b=0, c=1, d=-0.1)))
+            runtime = resolve_experiment_config(
+                data={"environment": {"table": {"enabled": False, "plane_path": str(plane_path)}}}
+            )
+            with patch(
+                "dexmani_real.dataset.export.resolve_experiment_config", return_value=runtime
+            ):
+                target = export_fixture(directory)
+            root = zarr.open_group(str(target), mode="r")
+            self.assertEqual(
+                json.loads(root.attrs["point_cloud_table_plane_abcd_json"]), [0.0, 0.0, 1.0, -0.1]
+            )
+
+    def test_unused_plane_file_is_not_required(self):
+        import tempfile
+        from pathlib import Path
+
+        from dexmani_real.config.pointcloud import PointCloudConfig
+        from dexmani_real.dataset.contracts import ProcessingConfig
+        from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing = str(Path(directory) / "missing-plane.json")
+            for runtime_removal in (False, True):
+                runtime = resolve_experiment_config(
+                    data={
+                        "environment": {"table": {"enabled": False, "plane_path": missing}},
+                        "pointcloud": {"remove_table": runtime_removal},
+                    }
+                )
+                disabled = PointCloudConfig(remove_table=False)
+                self.assertIsNone(
+                    PointCloudLoopConfig.from_runtime(runtime, pointcloud=disabled).table_plane_abcd
+                )
+                self.assertIsNone(
+                    ProcessingConfig.from_runtime(runtime, pointcloud=disabled).table_plane_abcd
+                )
+                required = PointCloudConfig(remove_table=True)
+                with self.assertRaisesRegex(ValueError, "failed to load calibrated table plane"):
+                    PointCloudLoopConfig.from_runtime(runtime, pointcloud=required)
+                with self.assertRaisesRegex(ValueError, "failed to load calibrated table plane"):
+                    ProcessingConfig.from_runtime(runtime, pointcloud=required)
+            with self.assertRaisesRegex(ValueError, "failed to load calibrated table plane"):
+                resolve_experiment_config(
+                    data={"environment": {"table": {"enabled": True, "plane_path": missing}}}
+                )
+
+    def test_current_plane_and_invalid_required_geometry(self):
+        import json
+        import tempfile
+        from dataclasses import replace
+        from pathlib import Path
+
+        from dexmani_real.config.pointcloud import PointCloudConfig
+        from dexmani_real.dataset.contracts import ProcessingConfig
+        from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plane.json"
+            runtime = resolve_experiment_config(
+                data={"environment": {"table": {"enabled": False, "plane_path": str(path)}}}
+            )
+            required = PointCloudConfig()
+            for height in (0.1, 0.2):
+                path.write_text(json.dumps(dict(a=0, b=0, c=1, d=-height)))
+                expected = (0.0, 0.0, 1.0, -height)
+                self.assertEqual(
+                    PointCloudLoopConfig.from_runtime(
+                        runtime, pointcloud=required
+                    ).table_plane_abcd,
+                    expected,
+                )
+                self.assertEqual(ProcessingConfig.from_runtime(runtime).table_plane_abcd, expected)
+                collision = resolve_experiment_config(
+                    data={"environment": {"table": {"enabled": True, "plane_path": str(path)}}}
+                )
+                self.assertEqual(collision.environment.table.plane_abcd, expected)
+            for contents in (
+                "not json",
+                "{}",
+                '{"a":0,"b":0,"c":-1,"d":0}',
+                '{"a":0,"b":0,"c":1,"d":NaN}',
+            ):
+                path.write_text(contents)
+                with self.subTest(contents=contents):
+                    with self.assertRaisesRegex(ValueError, "table plane"):
+                        PointCloudLoopConfig.from_runtime(runtime, pointcloud=required)
+                    with self.assertRaisesRegex(ValueError, "table plane"):
+                        ProcessingConfig.from_runtime(runtime)
+                    with self.assertRaisesRegex(ValueError, "table plane"):
+                        resolve_experiment_config(
+                            data={"environment": {"table": {"plane_path": str(path)}}}
+                        )
+                    self.assertIsNone(
+                        PointCloudLoopConfig.from_runtime(
+                            runtime, pointcloud=replace(required, remove_table=False)
+                        ).table_plane_abcd
+                    )
+            inline = replace(
+                runtime,
+                environment=replace(
+                    runtime.environment,
+                    table=replace(
+                        runtime.environment.table, plane_path=None, plane_abcd=(0, 0, 1, -0.3)
+                    ),
+                ),
+            )
+            self.assertEqual(
+                PointCloudLoopConfig.from_runtime(inline, pointcloud=required).table_plane_abcd,
+                (0.0, 0.0, 1.0, -0.3),
+            )
+            with self.assertRaisesRegex(ValueError, "requires a current calibrated table plane"):
+                ProcessingConfig()
+
+
 class RawFixture:
     """In-memory recording reader; numerical export is the production path."""
 
@@ -245,7 +371,9 @@ class NumericalDeploymentSmoke(unittest.TestCase):
                 runtime,
                 environment=replace(
                     runtime.environment,
-                    table=replace(runtime.environment.table, enabled=False, plane_abcd=plane),
+                    table=replace(
+                        runtime.environment.table, enabled=False, plane_path=None, plane_abcd=plane
+                    ),
                 ),
             )
             cfg = PointCloudLoopConfig.from_runtime(

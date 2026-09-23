@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import zarr
 
+from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.dataset.contracts import (
     EpisodeAnnotation,
     ProcessingConfig,
@@ -117,7 +118,8 @@ def export_raw_to_zarr(
     Export computes each episode once; later rejection removes only owned staging.
     """
     config = config or PolicyZarrExportConfig()
-    processing = processing or ProcessingConfig()
+    if processing is None:
+        processing = ProcessingConfig.from_runtime(resolve_experiment_config())
     source, target = (
         Path(input_root).resolve(),
         Path(output_path).expanduser().resolve(),

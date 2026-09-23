@@ -9,7 +9,8 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import environment, hand
+from dexmani_real.config.defaults import hand
+from dexmani_real.config.experiment import resolve_table_plane
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
@@ -45,7 +46,7 @@ class ProcessingConfig:
     """
 
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
-    table_plane_abcd: tuple[float, float, float, float] | None = environment.table.plane_abcd
+    table_plane_abcd: tuple[float, float, float, float] | None = None
     hand_urdf_path: str = str(XHAND_RIGHT_URDF_PATH)
     fingertip_link_names: tuple[str, ...] = hand.fingertip_link_names
     handbase_position_eef_m: tuple[float, float, float] = hand.T_eef_handbase_pos_xyz
@@ -57,7 +58,7 @@ class ProcessingConfig:
         table = getattr(runtime, "environment").table
         values = {
             "pointcloud": getattr(runtime, "pointcloud"),
-            "table_plane_abcd": table.plane_abcd,
+            "table_plane_abcd": None,
             "fingertip_link_names": tuple(hand_config.fingertip_link_names),
             "handbase_position_eef_m": tuple(hand_config.T_eef_handbase_pos_xyz),
             "handbase_quat_eef_wxyz": tuple(hand_config.T_eef_handbase_quat_wxyz),
@@ -66,6 +67,8 @@ class ProcessingConfig:
         if unknown:
             raise TypeError(f"unknown ProcessingConfig override(s): {sorted(unknown)}")
         values.update(overrides)
+        if "table_plane_abcd" not in overrides and values["pointcloud"].remove_table:
+            values["table_plane_abcd"] = resolve_table_plane(table)
         return cls(**values)
 
     def __post_init__(self) -> None:

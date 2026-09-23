@@ -182,8 +182,9 @@ class TableCollisionConfig:
     """Calibrated table represented as a finite box below an upward plane.
 
     ``plane_abcd`` uses the robot-base/world convention ``ax+by+cz+d=0``.
-    Runtime resolution refreshes it from ``plane_path`` so perception and
-    table-aware planning/validation paths use the same calibration artifact.
+    Runtime resolution refreshes enabled collision geometry from ``plane_path``.
+    Perception reads that file separately when its effective point-cloud config
+    requires table removal, regardless of collision-table enablement.
     Fine teleoperation deliberately does not use this geometry to reject
     robot-table contact.
     """

@@ -30,7 +30,7 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
-from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.config.experiment import resolve_experiment_config, resolve_table_plane
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.dataset.contracts import ProcessingConfig
 from dexmani_real.dataset.pointcloud import (
@@ -278,7 +278,7 @@ class EpisodeVisualizer:
                 state[key] = np.asarray(data)
 
         # Raw stores physical joints; geometry is derived only for this viewer.
-        geometry = ProcessingConfig()
+        geometry = ProcessingConfig(pointcloud=PointCloudConfig(remove_table=False))
         arm = state["arm_qpos"]
         hand = state["hand_qpos"]
         arm_valid = np.all(np.isfinite(arm), axis=1)
@@ -630,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.pointcloud_num_points is not None:
             pointcloud_config = replace(pointcloud_config, num_points=args.pointcloud_num_points)
         table = runtime.environment.table
-        table_plane_abcd = table.plane_abcd if pointcloud_config.remove_table else None
+        table_plane_abcd = resolve_table_plane(table) if pointcloud_config.remove_table else None
 
     viz = EpisodeVisualizer(
         str(h5_path),

@@ -24,6 +24,7 @@ from dexmani_real.config.defaults import (
     KeyboardTeleopParams,
     PolicyParams,
     SafetyParams,
+    TableCollisionConfig,
     TAGRetargetingParams,
     TeleopTimingParams,
     VRParams,
@@ -169,6 +170,26 @@ def validate_config(cfg: ExperimentConfig) -> None:
         raise ValueError("keyboard workspace command margin leaves no interior workspace")
 
 
+def resolve_table_plane(table: TableCollisionConfig) -> tuple[float, float, float, float]:
+    """Read the current plane file, or use inline geometry when plane_path is null."""
+    if table.plane_path is None:
+        table.validate()
+        return tuple(float(value) for value in table.plane_abcd)
+    plane_path = Path(table.plane_path)
+    if not plane_path.is_absolute():
+        plane_path = Path(__file__).resolve().parents[2] / plane_path
+    try:
+        with plane_path.open(encoding="utf-8") as stream:
+            plane = json.load(stream)
+        resolved = dataclasses.replace(
+            table, plane_abcd=tuple(float(plane[k]) for k in ("a", "b", "c", "d"))
+        )
+        resolved.validate()
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"failed to load calibrated table plane from {plane_path}: {exc}") from exc
+    return resolved.plane_abcd
+
+
 def resolve_experiment_config(
     *,
     yaml_path: str | Path | None = None,
@@ -197,20 +218,8 @@ def resolve_experiment_config(
     )
     cfg = _patch(cfg, _overlay(loaded, _expand_dotted(cli_overrides)))
     table = cfg.environment.table
-    if table.plane_path is not None:
-        plane_path = Path(table.plane_path)
-        if not plane_path.is_absolute():
-            plane_path = Path(__file__).resolve().parents[2] / plane_path
-        try:
-            with plane_path.open(encoding="utf-8") as stream:
-                plane = json.load(stream)
-            table = dataclasses.replace(
-                table, plane_abcd=tuple(float(plane[k]) for k in ("a", "b", "c", "d"))
-            )
-        except (OSError, KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"failed to load calibrated table plane from {plane_path}: {exc}"
-            ) from exc
+    if table.enabled:
+        table = dataclasses.replace(table, plane_abcd=resolve_table_plane(table))
         cfg = dataclasses.replace(
             cfg, environment=dataclasses.replace(cfg.environment, table=table)
         )

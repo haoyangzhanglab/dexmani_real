@@ -315,6 +315,13 @@ depth scale, serial and hand mounting also come from current Real setup. Recalib
 not invalidate a trained policy. Rollout provenance records the effective point-cloud config
 and plane. New Policy Zarr schema v15 stores ordered `joint_names` and `pointcloud_config_json`.
 
+Experiment resolution requires the table-plane file when collision-table behavior is enabled.
+Perception loads it only when the effective point-cloud configuration enables table removal;
+unused runtime point-cloud defaults do not impose that requirement on RGB/joint policies.
+A configured plane file must load successfully; `plane_path: null` selects inline geometry.
+Historical calibration and descriptive algorithm labels remain provenance, not strict
+training-resume or deployment identity. Tensor definitions and trained preprocessing stay strict.
+
 With both repositories installed, run offline regressions without connecting hardware:
 
 ```bash
