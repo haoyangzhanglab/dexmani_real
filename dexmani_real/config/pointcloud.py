@@ -7,15 +7,12 @@ same immutable policy without importing camera or geometry dependencies.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 import numpy as np
 
-# These strings are part of the persisted Real-data and deployment contract,
-# not sensor implementation details.  Keeping them in the pure config owner
-# lets offline artifact checks validate point-cloud semantics without importing
-# camera, OpenCV, or geometry code.
+# Optional diagnostic/provenance labels; numerical configuration defines preprocessing.
 POINT_CLOUD_POLICY_ID = "depth_to_color_orthogonal_edge_table_voxel_radius_graph_v9"
 POINT_CLOUD_COLOR_SOURCE = "mean_rgb_of_aligned_depth_pixels_per_voxel"
 POINT_CLOUD_SAMPLING = "deterministic_coarse_voxel_stratified_hash_or_cyclic_pad"
@@ -32,6 +29,7 @@ POINT_CLOUD_TRANSFORM = (
 class PointCloudConfig:
     """Validated depth-to-color aligned RGB-D point-cloud policy."""
 
+    remove_table: bool = True
     num_points: int = 1024
     depth_min_m: float = 0.30
     depth_max_m: float = 1.50
@@ -71,6 +69,8 @@ class PointCloudConfig:
     sampling_coarse_voxel_stride: int = 3
 
     def __post_init__(self) -> None:
+        if type(self.remove_table) is not bool:
+            raise TypeError("remove_table must be bool")
         if (
             isinstance(self.num_points, bool)
             or not isinstance(self.num_points, (int, np.integer))
@@ -132,9 +132,16 @@ class PointCloudConfig:
         if any(low >= high for low, high in zip(lower, upper, strict=True)):
             raise ValueError("workspace lower bounds must be strictly below upper bounds")
 
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "PointCloudConfig":
+        if not isinstance(value, dict) or set(value) != {f.name for f in fields(cls)}:
+            raise ValueError("pointcloud config must contain all trained algorithm parameters")
+        return cls(**value)
+
     def to_dict(self) -> dict[str, Any]:
         """Return the stable persisted processing-policy representation."""
         return {
+            "remove_table": self.remove_table,
             "num_points": self.num_points,
             "depth_min_m": self.depth_min_m,
             "depth_max_m": self.depth_max_m,

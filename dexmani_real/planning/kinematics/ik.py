@@ -69,6 +69,16 @@ class OnlineIKConfig:
     nullspace_joint_limit_margin_deg: float = 15.0
 
 
+def make_online_ik_config(runtime, *, control_dt_s: float) -> OnlineIKConfig:
+    if not np.isfinite(control_dt_s) or control_dt_s <= 0:
+        raise ValueError("online IK control_dt_s must be finite and positive")
+    return OnlineIKConfig(
+        max_pose_error_pos_m=runtime.policy.ik_max_pose_error_pos_m,
+        max_pose_error_rot_rad=runtime.policy.ik_max_pose_error_rot_rad,
+        nullspace_step_size_deg=(runtime.policy.ik_nullspace_step_rate_deg_s * control_dt_s),
+    )
+
+
 class OnlineIKSolver:
     """MPlib position IK with prev_cmd seeding and fast-accept.
 

@@ -212,7 +212,7 @@ def _print_summary(
     print(f"Max duration   : {max_running_s:g} s per episode")
     print(f"Device         : {device}")
     print(f"Observation    : {' + '.join(fields)}")
-    print(f"Action         : {spec.action_key} ({spec.control_action_dim}D)")
+    print(f"Action         : {spec.action_mode}")
     print(f"Control        : {1.0 / spec.control_dt_s:g} Hz")
     print(f"Action chunk   : {spec.n_action_steps} steps; infer when queue is empty")
     print(f"Session dir    : {session_dir}")
@@ -241,9 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_policy_error(f"experiment inspection failed: {exc}")
         return 1
     inference_steps = (
-        args.inference_steps
-        if args.inference_steps is not None
-        else info.spec.default_inference_steps
+        args.inference_steps if args.inference_steps is not None else info.default_inference_steps
     )
 
     try:

@@ -197,7 +197,7 @@ def resolve_experiment_config(
     )
     cfg = _patch(cfg, _overlay(loaded, _expand_dotted(cli_overrides)))
     table = cfg.environment.table
-    if table.enabled and table.plane_path is not None:
+    if table.plane_path is not None:
         plane_path = Path(table.plane_path)
         if not plane_path.is_absolute():
             plane_path = Path(__file__).resolve().parents[2] / plane_path

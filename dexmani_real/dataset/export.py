@@ -32,7 +32,7 @@ from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 logger = logging.getLogger(__name__)
 
 POLICY_ZARR_SCHEMA_NAME = "dexmani-real-policy-zarr"
-POLICY_ZARR_SCHEMA_VERSION = 14
+POLICY_ZARR_SCHEMA_VERSION = 15
 
 
 class StaticSemanticsMismatch(ValueError):

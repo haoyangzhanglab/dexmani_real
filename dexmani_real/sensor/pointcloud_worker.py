@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -73,6 +73,10 @@ class PointCloudLoopConfig:
             raise TypeError("pointcloud must be a PointCloudConfig")
         if not isinstance(self.camera_calibration, CameraExtrinsics):
             raise TypeError("camera_calibration must be a preloaded CameraExtrinsics snapshot")
+        if not self.pointcloud.remove_table:
+            object.__setattr__(self, "table_plane_abcd", None)
+        elif self.table_plane_abcd is None:
+            raise ValueError("remove_table=True requires a current calibrated table plane")
         if self.table_plane_abcd is not None:
             plane = tuple(float(value) for value in self.table_plane_abcd)
             if len(plane) != 4 or not np.all(np.isfinite(plane)):
@@ -87,13 +91,16 @@ class PointCloudLoopConfig:
         cls,
         runtime: "ExperimentConfig",
         *,
-        num_points: int,
+        pointcloud: PointCloudConfig,
+        camera_calibration: CameraExtrinsics | None = None,
     ) -> "PointCloudLoopConfig":
         table = runtime.environment.table
         return cls(
-            pointcloud=replace(runtime.pointcloud, num_points=num_points),
-            camera_calibration=CameraExtrinsics(),
-            table_plane_abcd=table.plane_abcd if table.enabled else None,
+            pointcloud=pointcloud,
+            camera_calibration=CameraExtrinsics()
+            if camera_calibration is None
+            else camera_calibration,
+            table_plane_abcd=table.plane_abcd if pointcloud.remove_table else None,
         )
 
 

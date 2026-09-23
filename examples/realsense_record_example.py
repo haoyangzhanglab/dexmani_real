@@ -652,7 +652,7 @@ def main() -> int:
     runtime = resolve_experiment_config()
     production = runtime.pointcloud
     table = runtime.environment.table
-    table_plane_abcd = table.plane_abcd if table.enabled else None
+    table_plane_abcd = table.plane_abcd if production.remove_table else None
     calibration = CameraExtrinsics()
 
     print("=" * 60)

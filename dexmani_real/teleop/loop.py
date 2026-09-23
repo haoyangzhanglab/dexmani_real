@@ -6,7 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.planning import OnlineIKConfig, XArm7MotionPlanner
+from dexmani_real.planning import XArm7MotionPlanner
+from dexmani_real.planning.kinematics.ik import make_online_ik_config
 from dexmani_real.recording.client import RecorderClient
 from dexmani_real.recording.storage.schema import FRAME_IK_FAIL, FRAME_OK
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
@@ -95,11 +96,8 @@ def teleop_loop(shared, config):
 
     try:
         planner = XArm7MotionPlanner.create_default(
-            teleop_profile=OnlineIKConfig(
-                max_pose_error_pos_m=runtime.policy.ik_max_pose_error_pos_m,
-                max_pose_error_rot_rad=runtime.policy.ik_max_pose_error_rot_rad,
-                nullspace_step_size_deg=runtime.policy.ik_nullspace_step_rate_deg_s
-                / runtime.teleop.control_hz,
+            teleop_profile=make_online_ik_config(
+                runtime, control_dt_s=1.0 / runtime.teleop.control_hz
             )
         )
         calibration = load_vr_transform(

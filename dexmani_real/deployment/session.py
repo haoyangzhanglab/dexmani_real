@@ -1,12 +1,15 @@
 """Policy deployment process ownership and operator lifecycle."""
 
+import json
 import math
 import multiprocessing as mp
 import os
 import threading
 import time
 
+from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.experiment import ExperimentConfig
+from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.deployment.config import (
     FingertipAssemblerConfig,
     PolicyRuntimeConfig,
@@ -49,6 +52,9 @@ def _rollout_recorder_config(
     worker_config: PolicyRuntimeConfig,
     max_running_s: float,
     num_episodes: int,
+    *,
+    camera_calibration: CameraExtrinsics,
+    pointcloud_config: PointCloudLoopConfig | None,
 ) -> RecorderIOConfig:
     """Build the recorder capacity contract for one recorded rollout session.
 
@@ -66,8 +72,19 @@ def _rollout_recorder_config(
         max_frames=max_frames,
         control_hz=control_hz,
         min_frames=1,
+        camera_calibration=camera_calibration,
         provenance={
             "workflow": "policy_eval",
+            **(
+                {
+                    "pointcloud_config_json": json.dumps(pointcloud_config.pointcloud.to_dict()),
+                    "pointcloud_table_plane_abcd_json": json.dumps(
+                        pointcloud_config.table_plane_abcd
+                    ),
+                }
+                if pointcloud_config is not None
+                else {}
+            ),
             "policy_selector": worker_config.experiment,
             "checkpoint_name": worker_config.artifact,
             "inference_steps": str(worker_config.inference_steps),
@@ -100,6 +117,16 @@ def run_policy_deployment(
     # Cloud production needs a camera worker; pointcloud-only rows need no source-frame lookup.
     camera = cloud or "rgb" in fields or recording_config is not None
     points = fields["point_cloud"].shape[0] if cloud else runtime.pointcloud.num_points
+    camera_calibration = CameraExtrinsics() if cloud or recording_config is not None else None
+    pointcloud_config = (
+        PointCloudLoopConfig.from_runtime(
+            runtime,
+            pointcloud=PointCloudConfig.from_dict(policy_spec.pointcloud_config),
+            camera_calibration=camera_calibration,
+        )
+        if cloud
+        else None
+    )
     ctx = mp.get_context("spawn")
     shared = RuntimeChannels.create(
         prefix=prefix or f"dexmani_policy_{os.getpid()}",
@@ -144,7 +171,7 @@ def run_policy_deployment(
                 ctx.Process(
                     name="pointcloud",
                     target=pointcloud_loop,
-                    args=(shared, PointCloudLoopConfig.from_runtime(runtime, num_points=points)),
+                    args=(shared, pointcloud_config),
                 )
             )
         if recording_config:
@@ -155,7 +182,13 @@ def run_policy_deployment(
                     args=(
                         shared,
                         _rollout_recorder_config(
-                            runtime, recording_config, worker_config, max_running_s, num_episodes
+                            runtime,
+                            recording_config,
+                            worker_config,
+                            max_running_s,
+                            num_episodes,
+                            camera_calibration=camera_calibration,
+                            pointcloud_config=pointcloud_config,
                         ),
                     ),
                 )

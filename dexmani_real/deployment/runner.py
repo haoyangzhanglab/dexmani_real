@@ -5,14 +5,17 @@ from collections import deque
 
 import numpy as np
 
+from dexmani_real.deployment.action import (
+    decode_policy_action,
+    make_action_planner,
+    physical_action_dim,
+)
 from dexmani_real.deployment.observation import build_fingertip_runtime, build_policy_observation
-from dexmani_real.planning import OnlineIKConfig, Pose, XArm7MotionPlanner
-from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.recording.client import RecorderClient
 from dexmani_real.recording.frame import build_episode_frame
 from dexmani_real.recording.storage.schema import FRAME_IK_FAIL
 from dexmani_real.robot.commands import RobotCommand, publish_command
-from dexmani_real.robot.projection import project_arm_command, project_hand_command
+from dexmani_real.robot.projection import project_arm_command
 from dexmani_real.runtime.observation import ObservationHistory, read_observation
 from dexmani_real.runtime.safety import (
     RunEndReason,
@@ -24,34 +27,6 @@ from dexmani_real.runtime.safety import (
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-
-def decode_policy_action(
-    action,
-    policy_spec,
-    current_arm_qpos,
-    *,
-    previous_arm_command_qpos,
-    planner,
-    workspace,
-    hand_qpos_min_rad,
-    hand_qpos_max_rad,
-):
-    raw_hand = action[7:19] if policy_spec.action_key == "action" else action[9:21]
-    hand = project_hand_command(
-        raw_hand, qpos_min_rad=hand_qpos_min_rad, qpos_max_rad=hand_qpos_max_rad
-    )
-    if policy_spec.action_key == "action":
-        return action[:7], hand, None
-    planner.set_hand_qpos(hand)
-    position = np.clip(action[:3], workspace[:, 0], workspace[:, 1])
-    intent = np.concatenate((position, action[3:9]))
-    result = planner.solve_teleop_ik(
-        Pose(p=position, q=rot6d_to_quat_wxyz(action[3:9])),
-        current_arm_qpos,
-        current_arm_qpos if previous_arm_command_qpos is None else previous_arm_command_qpos,
-    )
-    return result.qpos if result.success else None, hand, intent
 
 
 class PolicyRunner:
@@ -94,15 +69,8 @@ class PolicyRunner:
         self.clip_count = 0
         self.max_clip_rad = 0.0
         self.publications = 0
-        self.planner = (
-            XArm7MotionPlanner.create_default(
-                teleop_profile=OnlineIKConfig(
-                    max_pose_error_pos_m=runtime.policy.ik_max_pose_error_pos_m,
-                    max_pose_error_rot_rad=runtime.policy.ik_max_pose_error_rot_rad,
-                )
-            )
-            if policy_spec.action_key == "action_ee"
-            else None
+        self.planner = make_action_planner(
+            policy_spec.action_mode, runtime, control_dt_s=policy_spec.control_dt_s
         )
         fields = {f.name for f in self.spec.observation_fields}
         self.requires_rgb = "rgb" in fields
@@ -255,7 +223,7 @@ class PolicyRunner:
                 prediction.shape
                 != (
                     self.spec.n_action_steps,
-                    self.spec.control_action_dim,
+                    physical_action_dim(self.spec.action_mode),
                 )
                 or not np.isfinite(prediction).all()
             ):
@@ -267,9 +235,9 @@ class PolicyRunner:
                 self._finish("required_observation_stale", incomplete=True)
                 return
         action = self.actions.popleft()
-        arm, prepared_hand, intent = decode_policy_action(
+        arm, prepared_hand, intent, hand_clip = decode_policy_action(
             action,
-            self.spec,
+            self.spec.action_mode,
             row.arm["qpos"][0],
             previous_arm_command_qpos=self.previous_arm,
             planner=self.planner,
@@ -291,7 +259,6 @@ class PolicyRunner:
             joint_lower_rad=self.runtime.arm.joint_limit_lower,
             joint_upper_rad=self.runtime.arm.joint_limit_upper,
         )
-        raw_hand = action[7:19] if self.spec.action_key == "action" else action[9:21]
         arm_change = prepared_arm - arm
         equivalent = (
             np.asarray(self.runtime.arm.joint_limit_upper)
@@ -299,9 +266,7 @@ class PolicyRunner:
             >= 2 * np.pi
         )
         arm_change[equivalent] = (arm_change[equivalent] + np.pi) % (2 * np.pi) - np.pi
-        clip = max(
-            float(np.max(np.abs(arm_change))), float(np.max(np.abs(prepared_hand - raw_hand)))
-        )
+        clip = max(float(np.max(np.abs(arm_change))), hand_clip)
         self.clip_count += int(clip > 1e-9)
         self.max_clip_rad = max(self.max_clip_rad, clip)
         command = RobotCommand(self.run_id, prepared_arm, prepared_hand)

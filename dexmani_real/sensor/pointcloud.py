@@ -635,6 +635,14 @@ def build_point_cloud_with_stats(
     """Build a cloud and return allocation-light stage diagnostics."""
     if not isinstance(config, PointCloudConfig):
         raise TypeError("config must be a PointCloudConfig")
+    if config.remove_table:
+        if table_plane_abcd is None:
+            raise ValueError("remove_table=True requires a current calibrated table plane")
+        plane = np.asarray(table_plane_abcd, dtype=np.float64)
+        if plane.shape != (4,) or not np.isfinite(plane).all() or plane[2] <= 0:
+            raise ValueError("table plane must be finite with an upward normal")
+    else:
+        table_plane_abcd = None
     _validate_color(color, geometry)
     started_ns = time.perf_counter_ns()
     elapsed_ms = {

@@ -57,7 +57,7 @@ class ProcessingConfig:
         table = getattr(runtime, "environment").table
         values = {
             "pointcloud": getattr(runtime, "pointcloud"),
-            "table_plane_abcd": table.plane_abcd if table.enabled else None,
+            "table_plane_abcd": table.plane_abcd,
             "fingertip_link_names": tuple(hand_config.fingertip_link_names),
             "handbase_position_eef_m": tuple(hand_config.T_eef_handbase_pos_xyz),
             "handbase_quat_eef_wxyz": tuple(hand_config.T_eef_handbase_quat_wxyz),
@@ -82,6 +82,10 @@ class ProcessingConfig:
             or np.linalg.norm(self.handbase_quat_eef_wxyz) <= 0
         ):
             raise ValueError("fingertip hand-mount transform is invalid")
+        if not self.pointcloud.remove_table:
+            object.__setattr__(self, "table_plane_abcd", None)
+        elif self.table_plane_abcd is None:
+            raise ValueError("remove_table=True requires a current calibrated table plane")
         if self.table_plane_abcd is not None:
             plane = tuple(float(v) for v in self.table_plane_abcd)
             if len(plane) != 4 or not np.all(np.isfinite(plane)) or plane[2] <= 0:

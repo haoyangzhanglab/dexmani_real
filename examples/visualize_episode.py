@@ -630,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.pointcloud_num_points is not None:
             pointcloud_config = replace(pointcloud_config, num_points=args.pointcloud_num_points)
         table = runtime.environment.table
-        table_plane_abcd = table.plane_abcd if table.enabled else None
+        table_plane_abcd = table.plane_abcd if pointcloud_config.remove_table else None
 
     viz = EpisodeVisualizer(
         str(h5_path),

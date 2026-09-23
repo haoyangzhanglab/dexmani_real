@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dexmani_real import ASSET_DIR
 
+XARM7_JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 8))
+
 ARM_DOF = 7
 HAND_DOF = 12
 HAND_FINGER_COUNT = 5
@@ -71,6 +73,8 @@ XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
 )
 if len(XHAND_SDK_JOINT_NAMES) != HAND_DOF or len(set(XHAND_SDK_JOINT_NAMES)) != HAND_DOF:
     raise RuntimeError("XHand SDK joint names must be unique and match HAND_DOF")
+
+ROBOT_JOINT_NAMES = (*XARM7_JOINT_NAMES, *XHAND_SDK_JOINT_NAMES)
 
 XHAND_MODEL_DIR = ASSET_DIR / "robots" / "xhand"
 # Arm planning model with the hand geometry fixed in its open/home posture.

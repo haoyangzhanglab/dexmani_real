@@ -8,7 +8,6 @@ from dexmani_real.deployment.config import FingertipAssemblerConfig
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base, make_arm_fk
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
-from dexmani_real.sensor.camera.transforms import resize_rgb
 
 
 def _requested_observation_fields(policy_spec: Any) -> set[str]:
@@ -67,10 +66,19 @@ def build_policy_observation(rows, policy_spec, *, fingertip_runtime=None):
             return None
         arrays["point_cloud"] = np.stack([r.point_cloud for r in rows])
     if "rgb" in requested:
-        field = next(f for f in policy_spec.observation_fields if f.name == "rgb")
-        arrays["rgb"] = np.stack(
-            [resize_rgb(r.camera["rgb"], height=field.shape[0], width=field.shape[1]) for r in rows]
-        )
+        images = [r.camera["rgb"] for r in rows]
+        if any(
+            not isinstance(image, np.ndarray)
+            or image.dtype != np.uint8
+            or image.ndim != 3
+            or image.shape[2] != 3
+            or min(image.shape[:2]) <= 0
+            for image in images
+        ):
+            raise ValueError("rgb must be raw uint8 HWC with three channels")
+        if any(image.shape != images[0].shape for image in images):
+            raise ValueError("rgb history must have stackable raw image shapes")
+        arrays["rgb"] = np.stack(images)
     if requested & {"eef_pose", "fingertip_points"}:
         arm_fk, hand_fk, cfg = fingertip_runtime
         poses = compute_eef_pose_history_xarm_base(joint[:, :7], arm_fk=arm_fk)
@@ -87,8 +95,12 @@ def build_policy_observation(rows, policy_spec, *, fingertip_runtime=None):
             ).astype(np.float32)
     result = {}
     for field in policy_spec.observation_fields:
-        values = np.ascontiguousarray(arrays[field.name], dtype=field.dtype)
-        if values.shape != (len(rows), *field.shape) or not np.isfinite(values).all():
+        values = np.ascontiguousarray(arrays[field.name])
+        if (
+            values.dtype != np.dtype(field.dtype)
+            or (field.name != "rgb" and values.shape != (len(rows), *field.shape))
+            or not np.isfinite(values).all()
+        ):
             raise ValueError(f"invalid policy observation {field.name}")
         result[field.name] = values
     return result

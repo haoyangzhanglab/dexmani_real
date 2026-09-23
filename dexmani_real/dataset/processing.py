@@ -41,13 +41,16 @@ from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.recording.storage.schema import DATASET_SPECS, FRAME_OK
 from dexmani_real.robot.model import (
     CONTACT_FORCE_REPRESENTATION,
+    HAND_FINGER_NAMES,
     HAND_FINGER_ORDER_ID,
+    ROBOT_JOINT_NAMES,
     TACTILE_FORCE_AXIS_LABELS,
     TACTILE_FORCE_POINT_ORDER,
     TACTILE_FORCE_REPRESENTATION,
     TACTILE_FORCE_SENSOR_ORDER,
     XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
     XHAND_SENSOR_NATIVE_AXES_FRAME,
+    XHAND_TACTILE_SENSOR_FINGER_IDS,
 )
 from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_COLOR_SOURCE,
@@ -193,7 +196,14 @@ def policy_semantics(reader: EpisodeReader, config: ProcessingConfig) -> dict[st
         "camera_intrinsic": camera.geometry.color.matrix().reshape(-1).tolist(),
         "camera_extrinsic": load_raw_episode_base_from_color(reader).tolist(),
         "camera_geometry": camera.geometry.to_dict(),
+        "joint_names": list(ROBOT_JOINT_NAMES),
         "joint_order": "xarm7_joint1_to_7+xhand_sdk_12",
+        "finger_names": list(HAND_FINGER_NAMES),
+        "tactile_sensor_ids": list(XHAND_TACTILE_SENSOR_FINGER_IDS),
+        "tactile_axis_names": ["fx", "fy", "fz"],
+        "tactile_point_indices": list(range(120)),
+        "point_cloud_features": ["x", "y", "z", "r", "g", "b"],
+        "rgb_channels": ["r", "g", "b"],
         "hand_current_unit": "mA",
         "arm_effort_unit": "sdk_native_unverified",
         "obs_alignment": "obs[t]_before_action[t]",
@@ -235,14 +245,7 @@ def policy_semantics(reader: EpisodeReader, config: ProcessingConfig) -> dict[st
         "camera_intrinsic_semantics": "native_color_intrinsics_for_depth_to_color_aligned_depth",
         "camera_extrinsic_semantics": "T_xarm_base_from_color;native_color_optical_to_xarm_base",
         "point_cloud_frame": "xarm_base",
-        "processing_config_json": canonical_json(
-            {
-                "pointcloud": config.pointcloud.to_dict(),
-                "table_plane_abcd": None
-                if config.table_plane_abcd is None
-                else list(config.table_plane_abcd),
-            }
-        ),
+        "pointcloud_config_json": canonical_json(config.pointcloud.to_dict()),
         "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
         "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
         "point_cloud_table_plane_abcd_json": canonical_json(

@@ -479,8 +479,8 @@ def _load_extrinsics(camera_info: dict) -> tuple[np.ndarray, float]:
 def _resolve_table_plane_path(runtime: ExperimentConfig) -> Path:
     """Resolve the shared table calibration path from runtime configuration."""
     table = runtime.environment.table
-    if not table.enabled or table.plane_path is None:
-        raise RuntimeError("runtime table calibration is disabled or has no plane_path")
+    if table.plane_path is None:
+        raise RuntimeError("runtime table calibration has no plane_path")
     path = Path(table.plane_path)
     if not path.is_absolute():
         path = Path(__file__).resolve().parents[1] / path
@@ -851,7 +851,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             all_timings["desk_calib"] = calibration_ms
             table_plane_source = "calibrated_this_run"
-        elif runtime.environment.table.enabled:
+        elif pcd_config.remove_table:
             table_plane_abcd = runtime.environment.table.plane_abcd
             table_plane_source = "resolved_runtime"
             all_timings["desk_calib"] = math.nan

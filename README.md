@@ -301,3 +301,23 @@ Ruff 命令不可用时，可尝试已有的 `python -m ruff`；若仍不可用�
 - full canonical Zarr export与whole-episode rejection；
 - representative dexmani_policy rollout；
 - emergency stop与shutdown。
+
+### Deployment preprocessing and offline checks
+
+Policy artifact owns observation modalities, exact ordered robot joints, control period,
+RGB preprocessing and point-cloud algorithm parameters. Real passes raw uint8 HWC RGB;
+Policy handles resizing, cropping and normalization. Point-cloud deployment uses the
+artifact configuration, even when `runtime.pointcloud` differs.
+
+`pointcloud.remove_table` controls perception independently of collision-table enablement.
+When enabled, it uses the current resolved Real table plane. Camera calibration, intrinsics,
+depth scale, serial and hand mounting also come from current Real setup. Recalibration does
+not invalidate a trained policy. Rollout provenance records the effective point-cloud config
+and plane. New Policy Zarr schema v15 stores ordered `joint_names` and `pointcloud_config_json`.
+
+With both repositories installed, run offline regressions without connecting hardware:
+
+```bash
+conda run --no-capture-output -n real_robot python -m dexmani_real.deployment.smoke_test
+conda run --no-capture-output -n policy python -m dexmani_policy.deployment.smoke_test
+```

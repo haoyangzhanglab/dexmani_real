@@ -1,6 +1,6 @@
 """PolicySpec compatibility and narrow policy-runtime configuration.
 
-Policy owns model shape, modality, horizon, and action-grid spacing. Real
+Policy owns raw tensor shapes, modalities and action-grid spacing. Real
 validates that cadence against actuator worker service rates.
 This module only validates their boundary and carries pickle-safe experiment
 identity into the spawned worker; it never imports Policy or Torch.
@@ -9,36 +9,18 @@ identity into the spawned worker; it never imports Policy or Torch.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Integral
 from pathlib import Path
 from typing import Any
 
-from dexmani_real.config.pointcloud import (
-    POINT_CLOUD_COLOR_SOURCE,
-    POINT_CLOUD_POLICY_ID,
-    POINT_CLOUD_SAMPLING,
-    POINT_CLOUD_TRANSFORM,
-)
+from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.ipc.schema import POINT_CLOUD_FEATURE_DIM
-from dexmani_real.planning.kinematics.arm_fk import (
-    EEF_POSE_ALGORITHM_ID,
-    EEF_POSE_DERIVATION,
-)
-from dexmani_real.planning.kinematics.fingertip import (
-    FINGERTIP_POINTS_DERIVATION,
-    FINGERTIP_POLICY_ID,
-)
 from dexmani_real.robot.model import (
-    HAND_FINGER_ORDER_ID,
-    TACTILE_FORCE_AXIS_LABELS,
-    TACTILE_FORCE_POINT_ORDER,
-    TACTILE_FORCE_REPRESENTATION,
-    TACTILE_FORCE_SENSOR_ORDER,
+    HAND_FINGER_NAMES,
+    ROBOT_JOINT_NAMES,
     XHAND_RIGHT_URDF_PATH,
-    XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
-    XHAND_SENSOR_NATIVE_AXES_FRAME,
+    XHAND_TACTILE_SENSOR_FINGER_IDS,
 )
 
 _SUPPORTED_OBSERVATION_FIELDS = frozenset(
@@ -100,86 +82,9 @@ def _validate_real_observation_capability(policy_spec: Any) -> tuple[Any, ...]:
                 raise ValueError(
                     "Policy point_cloud must be float32 [N, 6] with positive integer N"
                 )
-        elif name == "rgb" and (
-            len(shape) != 3 or shape[2] != 3 or dtype != "uint8" or shape[0] <= 0 or shape[1] <= 0
-        ):
-            raise ValueError("Policy rgb must be uint8 [H, W, 3] with positive H and W")
+        elif name == "rgb" and (shape != (None, None, 3) or dtype != "uint8"):
+            raise ValueError("Policy rgb must declare raw uint8 HWC with variable H/W")
     return fields
-
-
-def _validate_field_semantics(
-    field: Any,
-    *,
-    field_name: str,
-    expected: Mapping[str, object],
-) -> None:
-    semantics = getattr(field, "semantics", None)
-    if not isinstance(semantics, Mapping):
-        raise ValueError(f"{field_name} semantics mismatch")
-    for key, value in expected.items():
-        actual = semantics.get(key)
-        if actual != value or (isinstance(value, bool) and type(actual) is not bool):
-            raise ValueError(f"{field_name} {key} mismatch")
-
-
-def _expected_pointcloud_semantics() -> dict[str, str]:
-    return {
-        "representation": "xyzrgb",
-        "frame": "xarm_base",
-        "position_units": "m",
-        "color_order": "rgb",
-        "color_source": POINT_CLOUD_COLOR_SOURCE,
-        "policy_id": POINT_CLOUD_POLICY_ID,
-        "sampling": POINT_CLOUD_SAMPLING,
-        "transform": POINT_CLOUD_TRANSFORM,
-    }
-
-
-def _expected_fingertip_semantics(runtime: Any) -> dict[str, str]:
-    return {
-        "representation": "point_xyz",
-        "frame": "xarm_base",
-        "units": "m",
-        "finger_order": HAND_FINGER_ORDER_ID,
-        "derivation": FINGERTIP_POINTS_DERIVATION,
-        "policy_id": FINGERTIP_POLICY_ID,
-    }
-
-
-def _expected_tactile_force_semantics() -> dict[str, object]:
-    return {
-        "representation": TACTILE_FORCE_REPRESENTATION,
-        "finger_order": HAND_FINGER_ORDER_ID,
-        "sensor_order": TACTILE_FORCE_SENSOR_ORDER,
-        "point_order": TACTILE_FORCE_POINT_ORDER,
-        "axis_labels": TACTILE_FORCE_AXIS_LABELS,
-        "unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
-        "si_verified": False,
-        "spatial_geometry_verified": False,
-    }
-
-
-def _expected_contact_force_semantics() -> dict[str, object]:
-    return {
-        # Policy-contract vocabulary for the requested contact field; the
-        # dataset attr keeps the SDK calc_force representation string.
-        "representation": "per_finger_sensor_axes",
-        "frame": XHAND_SENSOR_NATIVE_AXES_FRAME,
-        "units": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
-        "si_verified": False,
-        "finger_order": HAND_FINGER_ORDER_ID,
-    }
-
-
-def _expected_eef_pose_semantics() -> dict[str, str]:
-    return {
-        "representation": "position_m_rot6d",
-        "frame": "xarm_base",
-        "position_units": "m",
-        "rotation_representation": "rot6d",
-        "derivation": EEF_POSE_DERIVATION,
-        "algorithm_id": EEF_POSE_ALGORITHM_ID,
-    }
 
 
 def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> None:
@@ -193,53 +98,29 @@ def validate_policy_runtime_compatibility(policy_spec: Any, runtime: Any) -> Non
             f"Policy action rate {policy_hz:g} Hz exceeds limiting worker rate {limiting_hz:g} Hz"
         )
     fields = _validate_real_observation_capability(policy_spec)
-    if policy_spec.requires_hand is not True:
-        raise ValueError(
-            "Real deployment requires hand actions because its control schema is arm7 + hand12"
-        )
-    if policy_spec.action_key not in {"action", "action_ee"}:
-        raise ValueError("Policy action_key is unsupported by Real")
-    expected_control_dim = 21 if policy_spec.action_key == "action_ee" else 19
-    if policy_spec.control_action_dim != expected_control_dim:
-        raise ValueError("Policy control_action_dim conflicts with its action_key")
-    fields_by_name = {field.name: field for field in fields}
-    contact_force = fields_by_name.get("contact_force")
-    if contact_force is not None:
-        _validate_field_semantics(
-            contact_force,
-            field_name="contact_force",
-            expected=_expected_contact_force_semantics(),
-        )
-    tactile_force = fields_by_name.get("tactile_force")
-    if tactile_force is not None:
-        _validate_field_semantics(
-            tactile_force,
-            field_name="tactile_force",
-            expected=_expected_tactile_force_semantics(),
-        )
-    point_cloud = fields_by_name.get("point_cloud")
-    if point_cloud is not None and runtime.pointcloud.num_points != point_cloud.shape[0]:
-        raise ValueError("Policy point_cloud shape does not match Real pointcloud config")
-    if point_cloud is not None:
-        _validate_field_semantics(
-            point_cloud,
-            field_name="point_cloud",
-            expected=_expected_pointcloud_semantics(),
-        )
-    fingertip_points = fields_by_name.get("fingertip_points")
-    if fingertip_points is not None:
-        _validate_field_semantics(
-            fingertip_points,
-            field_name="fingertip_points",
-            expected=_expected_fingertip_semantics(runtime),
-        )
-    eef_pose = fields_by_name.get("eef_pose")
-    if eef_pose is not None:
-        _validate_field_semantics(
-            eef_pose,
-            field_name="eef_pose",
-            expected=_expected_eef_pose_semantics(),
-        )
+    if tuple(policy_spec.joint_names) != ROBOT_JOINT_NAMES:
+        raise ValueError("Policy ordered joint_names do not match Real robot joints")
+    if policy_spec.action_mode not in {"joint", "eef"}:
+        raise ValueError("Policy action_mode must be joint or eef")
+    for field in fields:
+        expected = {}
+        if field.name == "point_cloud":
+            expected["features"] = ("x", "y", "z", "r", "g", "b")
+            config = PointCloudConfig.from_dict(policy_spec.pointcloud_config)
+            if config.num_points != field.shape[0]:
+                raise ValueError("Policy pointcloud config disagrees with its tensor shape")
+        if field.name == "rgb":
+            expected["channels"] = ("r", "g", "b")
+        if field.name in {"fingertip_points", "contact_force", "tactile_force"}:
+            expected["fingers"] = HAND_FINGER_NAMES
+        if field.name in {"contact_force", "tactile_force"}:
+            expected["sensors"] = XHAND_TACTILE_SENSOR_FINGER_IDS
+            expected["axes"] = ("fx", "fy", "fz")
+        if field.name == "tactile_force":
+            expected["points"] = tuple(range(120))
+        for axis, order in expected.items():
+            if tuple(field.ordering.get(axis, ())) != order:
+                raise ValueError(f"Policy {field.name} {axis} order does not match Real")
 
 
 @dataclass(frozen=True)
