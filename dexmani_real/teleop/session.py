@@ -8,6 +8,7 @@ from typing import Any
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.recording.io_worker import RecorderIOConfig, recorder_io_loop
+from dexmani_real.recording.recorder import HARD_MAX_RECORD_FRAMES
 from dexmani_real.robot.arm_worker import arm_loop as _arm_loop
 from dexmani_real.robot.hand_worker import hand_loop as _hand_loop
 from dexmani_real.robot.model import (
@@ -133,6 +134,16 @@ def run_teleop_experiment(
     task_name, operator = validate_task_name(task_name), validate_operator(operator)
     if not runtime.policy.hand_enabled and (runtime.policy.recording_enabled or not allow_no_hand):
         raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")
+    if runtime.policy.recording_enabled:
+        requested_rows = round(runtime.policy.max_record_duration_s * runtime.teleop.control_hz)
+        if not 0 < requested_rows < HARD_MAX_RECORD_FRAMES:
+            raise ValueError(
+                f"teleop recording requests {requested_rows} rows; require 0 < rows < "
+                f"hard limit {HARD_MAX_RECORD_FRAMES} "
+                f"(max_record_duration_s={runtime.policy.max_record_duration_s}, "
+                f"control_hz={runtime.teleop.control_hz}). Configure a positive, shorter "
+                "episode budget instead of increasing the recorder hard guard."
+            )
     repo_root = Path(__file__).resolve().parents[2]
     load_vr_transform(repo_root / "dexmani_real/config/vr_transform.json")
     if runtime.policy.recording_enabled:

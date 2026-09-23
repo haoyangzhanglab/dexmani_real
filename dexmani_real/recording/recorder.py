@@ -38,7 +38,7 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 # Defensive storage ceiling; normal episode budgets belong to the control owner.
-DEFAULT_MAX_RECORD_FRAMES: int = 10000
+HARD_MAX_RECORD_FRAMES: int = 10_000
 _MAX_PROVENANCE_VALUE_BYTES = 4096
 
 
@@ -102,7 +102,7 @@ class EpisodeRecorder:
     def __init__(
         self,
         data_dir: str,
-        max_frames: int = DEFAULT_MAX_RECORD_FRAMES,
+        max_frames: int = HARD_MAX_RECORD_FRAMES,
         control_hz: float = 16.0,
         min_frames: int = 50,
         camera_writer_config: CameraStreamWriterConfig | None = None,

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from queue import Empty
 from typing import Any
 
@@ -60,6 +61,25 @@ class RecorderIOConfig:
             self,
             "provenance",
             normalize_provenance_metadata(self.provenance),
+        )
+
+
+def _warn_stale_staging(data_dir: str) -> None:
+    # Both timestamp and explicit episode names use .tmp_<non-hidden episode name>.
+    staging = sorted(
+        path.name
+        for path in Path(data_dir).glob(".tmp_[!.]*")
+        if path.is_dir() and not path.is_symlink()
+    )
+    if staging:
+        logger.warning(
+            "Found %d stale recording staging directories in %s (up to 5 shown): %s. "
+            "They are not published raw episodes and may remain after forced termination "
+            "or interrupted recording I/O. They will not be automatically deleted or "
+            "recovered; inspect them and handle or remove them manually.",
+            len(staging),
+            data_dir,
+            ", ".join(staging[:5]),
         )
 
 
@@ -320,6 +340,7 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
     session = None
     crashed = False
     try:
+        _warn_stale_staging(config.data_dir)
         recorder = _create_episode_recorder(shared, config)
         session = _RecorderIOSession(shared, config, recorder)
         shared.recorder_ready.set()

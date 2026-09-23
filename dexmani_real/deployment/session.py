@@ -1,6 +1,7 @@
 """Policy deployment process ownership and operator lifecycle."""
 
 import json
+import math
 import multiprocessing as mp
 import os
 import threading
@@ -21,6 +22,7 @@ from dexmani_real.deployment.runner import policy_runner_loop
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.recording.io_worker import RecorderIOConfig, recorder_io_loop
+from dexmani_real.recording.recorder import HARD_MAX_RECORD_FRAMES
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.robot.hand_worker import hand_loop
@@ -99,6 +101,16 @@ def run_policy_deployment(
     num_episodes = validate_num_episodes(num_episodes)
     if recording_config is not None and (not execute or max_running_s is None):
         raise ValueError("recorded evaluation requires execute and a finite run budget")
+    if recording_config is not None:
+        control_dt_s = float(worker_config.spec.control_dt_s)
+        requested_rows = math.ceil(float(max_running_s) / control_dt_s)
+        if requested_rows >= HARD_MAX_RECORD_FRAMES:
+            raise ValueError(
+                f"policy recording requests {requested_rows} rows; require rows < "
+                f"hard limit {HARD_MAX_RECORD_FRAMES} "
+                f"(max_running_s={max_running_s}, control_dt_s={control_dt_s}). "
+                "Shorten the episode budget instead of increasing the recorder hard guard."
+            )
     fields = {f.name: f for f in policy_spec.observation_fields}
     cloud = "point_cloud" in fields
     # Cloud production needs a camera worker; pointcloud-only rows need no source-frame lookup.
