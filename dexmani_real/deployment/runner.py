@@ -99,7 +99,7 @@ class PolicyRunner:
             and int(self.shared.safety_state.value) == int(SafetyState.RUNNING)
         )
 
-    def _finish(self, reason, incomplete=False):
+    def _finish(self, reason, abnormal=False):
         if self.run_id is None:
             return
         revoke_motion_if_run_id(self.shared, self.run_id)
@@ -108,13 +108,10 @@ class PolicyRunner:
         self.history.clear()
         self.previous_arm = None
         if self.recorder is not None:
-            if incomplete:
+            if abnormal:
                 self.recorder.technical_status = "invalid"
-            self.recorder.stop_episode(save=True, reason=reason, retain_partial=incomplete)
-            result = self.recorder.join_stop()
-            if result.error:
-                self.shared.workflow_failed.value = True
-            self.shared.is_recording.value = False
+            self.recorder.stop_episode(save=True, reason=reason)
+            self.recorder.join_stop()
         self.completed += 1
         self.run_id = None
         self.shared.stop_request.value = int(StopRequest.NONE)
@@ -144,7 +141,6 @@ class PolicyRunner:
             ):
                 self.shared.workflow_failed.value = True
                 return
-            self.shared.is_recording.value = True
         with self.shared.motion_lock:
             epoch = (
                 begin_requested_motion(self.shared)
@@ -156,7 +152,6 @@ class PolicyRunner:
             if self.recorder is not None:
                 self.recorder.stop_episode(save=False, reason="start_cancelled")
                 self.recorder.join_stop()
-                self.shared.is_recording.value = False
             return
         self.run_id, self.started_ns = epoch
         self.previous_step_ns = None
@@ -176,7 +171,7 @@ class PolicyRunner:
         if not self._live() or self.shared.quit_requested.value:
             self._finish(
                 RunEndReason(int(self.shared.run_ended_reason.value)).name.lower(),
-                incomplete=bool(
+                abnormal=bool(
                     self.shared.error_state.value
                     or self.shared.estop_request.value
                     or self.shared.workflow_failed.value
@@ -184,7 +179,7 @@ class PolicyRunner:
             )
             return
         if self.shared.workflow_failed.value:
-            self._finish("workflow_failure", incomplete=True)
+            self._finish("workflow_failure", abnormal=True)
             return
         now = time.monotonic_ns()
         if self.max_running_s is not None and now - self.started_ns >= int(
@@ -196,7 +191,7 @@ class PolicyRunner:
             return
         row = self._row()
         if row is None:
-            self._finish("required_observation_stale", incomplete=True)
+            self._finish("required_observation_stale", abnormal=True)
             return
         self.history.append(row)
         if not self.actions:
@@ -204,7 +199,7 @@ class PolicyRunner:
                 self.history.padded(), self.spec, fingertip_runtime=self.fk
             )
             if observation is None:
-                self._finish("required_tactile_unavailable", incomplete=True)
+                self._finish("required_tactile_unavailable", abnormal=True)
                 return
             epoch = self.run_id
             start = time.monotonic_ns()
@@ -232,7 +227,7 @@ class PolicyRunner:
             # Execution feedback after a blocking query is telemetry, not a synthetic history row.
             row = self._row()
             if row is None:
-                self._finish("required_observation_stale", incomplete=True)
+                self._finish("required_observation_stale", abnormal=True)
                 return
         action = self.actions.popleft()
         arm, prepared_hand, intent, hand_clip = decode_policy_action(
@@ -295,7 +290,7 @@ class PolicyRunner:
         finally:
             self._finish(
                 "shutdown",
-                incomplete=bool(
+                abnormal=bool(
                     self.shared.workflow_failed.value
                     or self.shared.error_state.value
                     or self.shared.estop_request.value
@@ -375,7 +370,7 @@ def policy_runner_loop(
     except Exception:
         shared.workflow_failed.value = True
         if runner is not None:
-            runner._finish("policy_failure", incomplete=True)
+            runner._finish("policy_failure", abnormal=True)
         logger.exception("policy worker failed")
         raise
     finally:

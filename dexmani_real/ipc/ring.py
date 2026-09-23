@@ -5,7 +5,7 @@ Each ring has one serialized writer at a time and may have multiple readers.
 Odd/even markers prevent readers from accepting a slot while its payload is
 being overwritten.
 
-     New writes overwrite the oldest slot; recorder clients prevent unread row loss.
+     New writes overwrite the oldest slot; RecorderIO rejects episodes with lost rows.
 
 Usage:
     buf = SharedMemoryRingBuffer("vr_frames", VR_FRAME_DTYPE, maxlen=3, create=True)
@@ -115,7 +115,7 @@ TORN_WARN_INTERVAL_NS = 5 * 1_000_000_000
 
 
 class SharedMemoryRingBuffer:
-    """Lock-free, odd/even-seqlock FILO ring buffer in shared memory.
+    """Shared-memory ring with odd/even markers for consistent reads.
 
     Layout of the shared memory block:
         [0:8)     write_idx  (uint64, atomic — only producer writes, consumer reads)
@@ -133,8 +133,8 @@ class SharedMemoryRingBuffer:
     own cross-process write lock.
 
     Latest readers may skip overwritten frames. Exact-sequence readers
-    retrieve a resident frame or None; recorder clients track consumed slots
-    to prevent unread rows from being overwritten.
+    retrieve a resident frame or None; RecorderIO detects lost rows using its
+    local sequence cursor.
     """
 
     _OFF_WRITE_IDX = 0
@@ -260,7 +260,7 @@ class SharedMemoryRingBuffer:
 
         This method never scans or copies unrelated
         history slots. It is therefore suitable for a bounded FIFO consumer
-        that already knows the next sequence it must acknowledge. ``None``
+        that already knows the next sequence it must consume. ``None``
         means that the requested sequence is not resident or could not be read
         consistently; callers that require losslessness must not skip ahead.
         """

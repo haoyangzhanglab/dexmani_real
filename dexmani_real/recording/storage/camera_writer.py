@@ -69,7 +69,7 @@ class CameraStreamWriter:
         self.frame_count += 1
 
     def close(self):
-        # The parent process enforces the finalization deadline if disk/codec IO blocks.
+        # Caller waits and supervisor shutdown remain bounded if disk/codec IO blocks.
         failures = []
         for name in ("encoder", "depth_file"):
             resource = getattr(self, name)

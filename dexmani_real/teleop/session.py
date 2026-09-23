@@ -97,16 +97,8 @@ def _build_processes(
         processes.append(
             context.Process(name="camera", target=_camera_loop, args=(shared, camera_config))
         )
-        # Recorder still owns only episode serialization; the entry point
-        # selects the already-validated task parent directory.
         recorder_config = RecorderIOConfig(
             data_dir=str(repo_root / policy_config.runtime.policy.episodes_dir / task_name),
-            max_frames=int(
-                round(
-                    policy_config.runtime.policy.max_record_duration_s
-                    * policy_config.runtime.teleop.control_hz
-                )
-            ),
             control_hz=policy_config.runtime.teleop.control_hz,
             min_frames=int(
                 round(

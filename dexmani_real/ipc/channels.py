@@ -35,7 +35,7 @@ class RuntimeChannelsConfig:
     vr_ring_maxlen: int = 8
     arm_state_ring_maxlen: int = 8
     hand_state_ring_maxlen: int = 8
-    record_sample_ring_maxlen: int = 4
+    record_sample_ring_maxlen: int = 16
     pointcloud_num_points: int = 1024
     pointcloud_ring_maxlen: int = 8
 
@@ -114,14 +114,9 @@ class RuntimeChannels:
     run_started_monotonic_ns: Any  # start of the current RUNNING observation epoch
     # Latest software RUNNING termination; written under motion_lock.
     run_ended_reason: Any
-    recorder_finish_deadline_ns: Any  # recorder-owned; zero while idle
-    recorder_completed_ns: Any  # close completed before finish deadline; reset on START
     workflow_failed: Any  # sticky; never reuse IPC after failure/death
-    recorder_consumed_sequence: Any
-    record_episode_path: Any  # RecorderIO-owned identity for orphan diagnostics
 
     is_running: Any  # Main -> all
-    is_recording: Any  # policy -> arm/hand/camera
     # Sticky runtime/safety fault: supervision takes the FAULT shutdown path.
     error_state: Any
     # Session failure can use verified non-FAULT shutdown if no runtime fault occurred.
@@ -255,18 +250,10 @@ class RuntimeChannels:
         storage.run_id = ctx.Value("Q", 1)
         storage.run_started_monotonic_ns = ctx.Value("Q", 0)
         storage.run_ended_reason = ctx.Value("i", 0)
-        # Recorder may be killed at any instruction. Its shared status accesses
-        # must not acquire mutexes also needed by surviving workers/monitor.
-        # Ready events and consumed sequence have one writer; camera
-        # metadata is immutable after camera readiness.
-        storage.recorder_finish_deadline_ns = ctx.Value("q", 0, lock=False)
+        # A killed service must not strand a lock needed to report workflow failure.
         storage.workflow_failed = ctx.Value("b", False, lock=False)
-        storage.recorder_completed_ns = ctx.Value("q", 0, lock=False)
-        storage.recorder_consumed_sequence = ctx.Value("Q", 0, lock=False)
-        storage.record_episode_path = ctx.Array("c", b"\x00" * 4096, lock=False)
 
         storage.is_running = ctx.Value("b", True, lock=False)
-        storage.is_recording = ctx.Value("b", False)
         storage.error_state = ctx.Value("b", False)
         storage.estop_request = ctx.Value("b", False)
         storage.quit_requested = ctx.Value("b", False)

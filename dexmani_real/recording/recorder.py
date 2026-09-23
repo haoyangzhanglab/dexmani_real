@@ -37,6 +37,7 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+# Defensive storage ceiling; normal episode budgets belong to the control owner.
 DEFAULT_MAX_RECORD_FRAMES: int = 10000
 _MAX_PROVENANCE_VALUE_BYTES = 4096
 
@@ -108,6 +109,8 @@ class EpisodeRecorder:
     ) -> None:
         if not np.isfinite(control_hz) or control_hz <= 0:
             raise ValueError(f"control_hz must be positive, got {control_hz}")
+        if isinstance(max_frames, bool) or not isinstance(max_frames, int) or max_frames <= 0:
+            raise ValueError("max_frames must be a positive integer")
         self.data_dir = Path(data_dir)
         self.max_frames = max_frames
         self.control_hz = float(control_hz)
@@ -124,7 +127,6 @@ class EpisodeRecorder:
             raise ValueError("camera writer fps must match recorder control_hz")
         self._frame_count: int = 0
         self._recording: bool = False
-        self._max_frames_reached: bool = False
         self._start_time: float | None = None
         self._episode_dir: str | None = None  # episode_XXX/ directory
         self._temp_dir: str | None = None  # .tmp_episode_XXX/ directory
@@ -167,10 +169,6 @@ class EpisodeRecorder:
     @property
     def frame_count(self) -> int:
         return self._frame_count
-
-    @property
-    def max_frames_reached(self) -> bool:
-        return self._max_frames_reached
 
     def start_episode(
         self,
@@ -222,7 +220,6 @@ class EpisodeRecorder:
         self._temp_dir = str(tmp_dir)
         tmp_dir.mkdir(parents=True, exist_ok=False)
         self._frame_count = 0
-        self._max_frames_reached = False
         self._start_time = time.perf_counter()
         self._recording = True
         self._data_writer = None
@@ -258,11 +255,6 @@ class EpisodeRecorder:
             meta.attrs[f"provenance_{key}"] = value
 
     def _write_camera_meta_attrs(self, meta: h5py.Group) -> None:
-        """Camera identity/geometry attrs from _pending_meta (None entries skipped).
-
-        Idempotent — finalization re-runs it so values supplied late
-        still reach /meta after the initial lazy write.
-        """
         p = self._pending_meta
         calib = p.get("calib")
         camera_name = p.get("camera_name")
@@ -340,9 +332,7 @@ class EpisodeRecorder:
             return False
 
         if self._frame_count >= self.max_frames:
-            logger.warning("Episode reached max_frames=%d, auto-stopping.", self.max_frames)
-            self._max_frames_reached = True
-            return False
+            raise RuntimeError(f"recording exceeded hard frame limit {self.max_frames}")
 
         ts = float(frame.timestamp_s)
         if not np.isfinite(ts) or (
@@ -358,21 +348,12 @@ class EpisodeRecorder:
         writer = self._camera_writer
         if writer is None:
             raise RuntimeError("camera writer missing")
-        writer.write(*self._camera_payload(frame))
+        if frame.camera_rgb is None or frame.camera_depth is None:
+            raise ValueError("recorded row is missing RGB-D")
+        writer.write(frame.camera_rgb, frame.camera_depth)
         if len(self._pending_rows) >= self._flush_interval:
             self._flush_buffered()
-        if self._frame_count >= self.max_frames:
-            self._max_frames_reached = True
-            return False
         return True
-
-    def _camera_payload(self, frame: EpisodeFrame) -> tuple[np.ndarray, np.ndarray]:
-        """Every recorded row carries a complete camera sample."""
-        rgb = frame.camera_rgb
-        depth = frame.camera_depth
-        if rgb is None or depth is None:
-            raise ValueError("recorded row is missing RGB-D")
-        return rgb, depth
 
     def _ensure_hdf5(self) -> None:
         if self._data_writer is not None:
@@ -403,7 +384,6 @@ class EpisodeRecorder:
         reason: str = "",
         *,
         failure_note: str = "",
-        deadline_monotonic_ns: int | None = None,
     ) -> str | None:
         """Finish synchronously and return the reserved final path, including on discard.
 
@@ -412,8 +392,8 @@ class EpisodeRecorder:
         Empty episodes are discarded. Failures raise after cleanup; staging is kept
         as ``incomplete_*`` only after all writers release their resources.
 
-        A non-empty ``failure_note`` also preserves non-empty interrupted staging
-        when finalization succeeds. A clean operator discard deletes staging.
+        A non-empty ``failure_note`` reports a recording/storage failure and
+        prevents publication. A clean operator discard deletes staging.
         The caller must serialize this operation with all other recorder access.
         """
         if self._finishing:
@@ -429,17 +409,13 @@ class EpisodeRecorder:
             )
             save = False
         path = self._episode_dir
-        truncated = self._max_frames_reached
         self._recording = False
-        self._max_frames_reached = False
         self._finishing = True
         try:
             self._finish_episode_transaction(
                 save,
                 reason,
-                truncated,
                 failure_note=failure_note,
-                deadline_monotonic_ns=deadline_monotonic_ns,
             )
         finally:
             self._finishing = False
@@ -449,24 +425,16 @@ class EpisodeRecorder:
         self,
         save: bool,
         reason: str,
-        truncated: bool,
         *,
         failure_note: str = "",
-        deadline_monotonic_ns: int | None = None,
     ) -> None:
         """Finalize one transaction; retain any resource that failed cleanup."""
         failure = None
         try:
-            self._finalize_episode_files(
-                save, reason, truncated, deadline_monotonic_ns=deadline_monotonic_ns
-            )
+            self._finalize_episode_files(save and not failure_note, reason)
         except Exception as exc:
             failure = exc
             logger.error("episode finalization failed", exc_info=True)
-            try:
-                self._write_aborted_manifest(reason=reason, error=f"{type(exc).__name__}: {exc}")
-            except Exception:
-                logger.error("failed to publish aborted episode manifest", exc_info=True)
             try:
                 if self._camera_writer is not None:
                     self._camera_writer.close()
@@ -490,7 +458,7 @@ class EpisodeRecorder:
                             if failure is not None
                             else failure_note
                         )
-                        if failure is not None or (note and self._frame_count > 0):
+                        if failure is not None or note:
                             # Preserve failed partial episodes for offline diagnosis.
                             self._preserve_incomplete_staging(
                                 self._temp_dir,
@@ -502,6 +470,15 @@ class EpisodeRecorder:
                 except Exception as exc:
                     failure = exc
                     logger.error("temporary episode cleanup failed", exc_info=True)
+                    if self._temp_dir is not None:
+                        try:
+                            self._preserve_incomplete_staging(
+                                self._temp_dir, reason=reason, error=str(exc)
+                            )
+                        except Exception:
+                            logger.error("failed to preserve staging", exc_info=True)
+                        else:
+                            self._reset_episode_state()
                 else:
                     self._reset_episode_state()
         if failure is not None:
@@ -511,21 +488,25 @@ class EpisodeRecorder:
         self,
         save: bool,
         reason: str,
-        truncated: bool,
-        *,
-        deadline_monotonic_ns: int | None = None,
     ) -> None:
-        """Close and verify files before atomic publication."""
+        """Close and verify saved files before atomic publication."""
         duration = time.perf_counter() - (self._start_time or 0.0)
 
         writer = self._camera_writer
+        camera_frame_count = 0
+        if writer is not None:
+            writer.close()
+            if not writer.resources_released:
+                raise RuntimeError("camera writer resources were not released")
+            camera_frame_count = writer.frame_count
+            self._camera_writer = None
+        if not save:
+            if self._data_writer is not None:
+                self._data_writer.close()
+                self._data_writer = None
+            return
         if writer is None:
             raise RuntimeError("camera writer missing at episode stop")
-        writer.close()
-        if not writer.resources_released:
-            raise RuntimeError("camera writer resources were not released")
-        camera_frame_count = writer.frame_count
-        self._camera_writer = None
         if camera_frame_count != self._frame_count:
             raise RuntimeError(
                 f"camera/source row count mismatch: camera={camera_frame_count}, source={self._frame_count}"
@@ -558,35 +539,25 @@ class EpisodeRecorder:
             meta.attrs["has_camera"] = _had_rgb
             meta.attrs["has_timestamps"] = "timestamp" in data_writer.datasets
             meta.attrs["camera_stream_frames"] = camera_frame_count
-            meta.attrs["truncated"] = bool(truncated)
-            meta.attrs["stop_reason"] = reason or ("max_frames" if truncated else "manual")
+            meta.attrs["truncated"] = False
+            meta.attrs["stop_reason"] = reason or "manual"
             # Repeat the camera snapshot during finalization before the handle closes.
             self._write_camera_meta_attrs(meta)
 
         data_writer.update_meta(_write_final_meta)
         data_writer.close()
         self._data_writer = None
-        _final = self._episode_dir
-        _tmp = self._temp_dir
-        if _tmp is not None and _final is not None:
-            if save:
-                self._validate_temp_episode(Path(_tmp), self._frame_count)
-                if (
-                    deadline_monotonic_ns is not None
-                    and time.monotonic_ns() >= deadline_monotonic_ns
-                ):
-                    raise TimeoutError("episode close exceeded its original finalization deadline")
-                atomic_publish(_tmp, _final)
-                self._last_finish_saved = True
-                logger.info("Episode saved: %s frames=%d", _final, self._frame_count)
-            else:
-                self._write_aborted_manifest(reason=reason or "discarded", error="")
+        if self._episode_dir is None:
+            raise RuntimeError("episode final directory missing during finalization")
+        self._validate_temp_episode(Path(self._temp_dir), self._frame_count)
+        atomic_publish(self._temp_dir, self._episode_dir)
+        self._last_finish_saved = True
+        logger.info("Episode saved: %s frames=%d", self._episode_dir, self._frame_count)
 
     def _reset_episode_state(self) -> None:
         """Reset episode state only after all resources and staging are released."""
         self._data_writer = None
         self._recording = False
-        self._max_frames_reached = False
         self._frame_count = 0
         self._start_time = None
         self._episode_dir = None
@@ -594,24 +565,6 @@ class EpisodeRecorder:
         self._pending_rows.clear()
         self._camera_writer = None
         self._last_timestamp_s = None
-
-    def _write_aborted_manifest(self, *, reason: str, error: str) -> Path:
-        """Write a small failure report without embedding sample payloads."""
-        episode_name = Path(self._episode_dir or "aborted_episode_unknown").name
-        target = self.data_dir / f"{episode_name}.aborted.json"
-        suffix = 1
-        while target.exists():
-            target = self.data_dir / f"{episode_name}.{suffix}.aborted.json"
-            suffix += 1
-        payload = {
-            "episode": episode_name,
-            "status": "aborted",
-            "reason": reason,
-            "error": error,
-            "frame_count_before_abort": int(self._frame_count),
-            "created_wall_time_ns": time.time_ns(),
-        }
-        return atomic_json_dump(payload, target, indent=2, ensure_ascii=False)
 
     @staticmethod
     def _validate_temp_episode(temp_dir: Path, expected_frames: int) -> None:

@@ -31,9 +31,6 @@ from dexmani_real.recording.storage.schema import (
     validate_data_layout,
 )
 from dexmani_real.recording.storage.video import VideoDecoder
-from dexmani_real.utils.log import get_logger
-
-logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -195,11 +192,11 @@ class EpisodeReader:
             raise ValueError(f"depth frame count must match num_frames={frame_count}")
 
     def require_valid(self, purpose: str = "training") -> None:
-        """Reject technically incomplete recordings; diagnostic reads remain possible."""
+        """Reject technically invalid experiments; diagnostic reads remain possible."""
         attrs = self._h5f["meta"].attrs
         if attrs.get("technical_status", "invalid") != "valid":
             raise ValueError(f"{purpose} rejects technically invalid episodes")
-        # The parent may have lost the producer before STOP carried the failure.
+        # Historical captures may have been invalidated by a shutdown sidecar.
         import json
 
         result_path = self._path.with_name(self._path.name + ".result.json")
@@ -230,7 +227,7 @@ class EpisodeReader:
     def read_camera_frame(self, key: str, index: int) -> np.ndarray:
         """Read a single camera frame by index.
 
-        The MP4 sidecar must have exactly one frame per episode grid slot.
+        The MP4 sidecar must have exactly one frame per recorded control row.
         """
         if key == "rgb" and self._rgb_decoder is not None:
             n = self._rgb_decoder.frame_count

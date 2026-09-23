@@ -33,7 +33,6 @@ xArm、XHand、RealSense、HTS SDK，以及运动学/点云和 dexmani_policy �
 VR teleop 的控制频率由 `teleop.control_hz` 拥有，键盘 / 标定 jog 由 `keyboard_teleop.control_hz` 拥有；learned policy 的动作周期由 `PolicySpec.control_dt_s` 拥有，replay 使用录制轨迹的频率。
 这些动作生产频率不得高于相关执行器的 worker 服务频率（arm-only jog 只受 arm 限制）。`arm.loop_hz` / `hand.loop_hz` 是命令接收和反馈更新频率，不是硬件物理伺服频率。
 正常 arm / hand / camera 观测的新鲜度上限为各自生产周期的 4 倍（30 Hz 时约 133 ms）；点云沿用源相机采集时间。Homing 的 arm 新鲜度、VR 新鲜度和硬件读取失败超时各自独立。
-录制 teleop 的首个 IK / retarget 失败行会保留为诊断数据，并立即停止该无效 episode；录制收尾异步完成。
 
 ## 研究入口
 
@@ -74,6 +73,10 @@ VR teleop 的控制频率由 `teleop.control_hz` 拥有，键盘 / 标定 jog �
 C 不等于 stop 或 discard。pause 会撤销当前 motion epoch；resume 从 fresh robot / VR feedback 重新锚定。发生过 C 暂停的 raw episode 可以保留用于诊断；无论暂停时长、是否恢复，都不属于 clean training episode，canonical Zarr export 会整条拒绝并报告原因。
 
 录制模式下 camera 与 RecorderIO 是 required resources。只有显式 --no-record 才允许不录制的 teleop。camera / recorder 中途失败时，不应静默降级为无录制 teleop，也不应把残缺数据伪装成完整 demonstration。
+
+录制 teleop 的单次 IK / retarget 失败不发布新命令，保留诊断行并继续 episode；连续 10 次失败会暂停、清除参考，按 C 后使用新的 observation 重新锚定。含 non-OK 行或 pause 的 raw episode 仍整条拒绝导出训练数据。
+
+Teleop 按 `max_record_duration_s * control_hz` 的行预算结束录制；policy eval 按 `max_running_s` 结束。Recorder 只保留 10000 帧的防失控存储上限，超限属于 recording failure。SAVE 消费到明确 cutoff 后关闭、验证并原子发布；DISCARD 跳过未消费行并删除 staging。实验异常可保存为 v32 `technical_status=invalid` 的完整诊断 episode，只有真正的 recording/storage 失败才保留 incomplete staging。
 
 ## Control semantics
 
@@ -176,7 +179,7 @@ Zarr 是可重建的 training cache，不是第二份 runtime audit database。
 
 Zarr固定全量保存 learning-relevant dynamic modalities，使 dexmani_policy 再通过 sensor_modalities 选择实际模型输入。
 
-canonical Zarr v14 的 dynamic arrays 包括：
+canonical Zarr 的 dynamic arrays 包括：
 
 - joint_state；
 - arm_qvel；
@@ -221,7 +224,8 @@ Exporter 不修复 demonstration。
 
 整条拒绝的典型原因包括：
 
-- incomplete recording；
+- storage incomplete 或 `technical_status=invalid`；
+- 任意已记录的 pause；
 - 非 teleop training workflow；
 - 任意非 OK frame status；
 - 任意 tactile aggregate / dense invalid；
@@ -313,7 +317,7 @@ artifact configuration, even when `runtime.pointcloud` differs.
 When enabled, it uses the current resolved Real table plane. Camera calibration, intrinsics,
 depth scale, serial and hand mounting also come from current Real setup. Recalibration does
 not invalidate a trained policy. Rollout provenance records the effective point-cloud config
-and plane. New Policy Zarr schema v15 stores ordered `joint_names` and `pointcloud_config_json`.
+and plane. Policy Zarr schema v15 stores ordered `joint_names` and `pointcloud_config_json`.
 
 Experiment resolution requires the table-plane file when collision-table behavior is enabled.
 Perception loads it only when the effective point-cloud configuration enables table removal;

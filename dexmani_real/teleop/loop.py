@@ -9,7 +9,7 @@ import numpy as np
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import make_online_ik_config
 from dexmani_real.recording.client import RecorderClient
-from dexmani_real.recording.storage.schema import FRAME_IK_FAIL, FRAME_OK
+from dexmani_real.recording.storage.schema import FRAME_OK
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.runtime.observation import read_observation
@@ -58,18 +58,18 @@ def teleop_loop(shared, config):
     quit_deadline = 0.0
     next_tick = 0.0
     failures = 0
+    max_rows = round(runtime.policy.max_record_duration_s * runtime.teleop.control_hz)
 
-    def stop(save, reason, incomplete=False):
+    def stop(save, reason, abnormal=False):
         nonlocal active, paused, resume_requested
         revoke_motion(shared)
         if controller is not None:
             controller.clear_reference()
         active = paused = resume_requested = False
         if recorder is not None and recorder.is_recording:
-            if incomplete:
+            if abnormal:
                 recorder.technical_status = "invalid"
-            recorder.stop_episode(save=save, reason=reason, retain_partial=incomplete)
-        shared.is_recording.value = False
+            recorder.stop_episode(save=save, reason=reason)
 
     def pause(manual, mark_episode=True):
         nonlocal paused, resume_requested, pause_ns
@@ -127,16 +127,14 @@ def teleop_loop(shared, config):
             if not keyboard.healthy:
                 shared.estop_request.value = True
             if shared.estop_request.value or shared.error_state.value:
-                stop(True, "hardware_failure", incomplete=True)
+                stop(True, "hardware_failure", abnormal=True)
                 break
             if recorder is not None:
-                result = recorder.poll_stop()
-                if result.error:
-                    shared.workflow_failed.value = True
+                result = recorder.join_stop() if recorder.stop_pending else recorder.poll_stop()
                 if not recorder.is_recording and active:
-                    stop(True, result.reason or "recording_complete")
+                    stop(True, result.reason if result is not None else "recording_unavailable")
             if shared.workflow_failed.value and active:
-                stop(True, "required_recording_resource_failed", incomplete=True)
+                stop(True, "required_recording_resource_failed", abnormal=True)
             for cmd in keyboard.poll(timeout=0.005):
                 if cmd is OperatorCommand.EMERGENCY_STOP:
                     shared.estop_request.value = True
@@ -154,9 +152,7 @@ def teleop_loop(shared, config):
                     stop(cmd is not OperatorCommand.DISCARD, cmd.value.lower())
                     audio.play("discard" if cmd is OperatorCommand.DISCARD else "end")
                     if recorder is not None:
-                        result = recorder.join_stop()
-                        if result.error:
-                            shared.workflow_failed.value = True
+                        recorder.join_stop()
                     if cmd is OperatorCommand.HOME and not shared.error_state.value:
                         home_planner = home_planner or build_policy_home_planner(runtime)
                         audio.play("home")
@@ -207,11 +203,10 @@ def teleop_loop(shared, config):
                         continue
                     active = True
                     failures = 0
-                    shared.is_recording.value = recorder is not None
                     next_tick = time.monotonic()
                     audio.play("begin")
             if quit_pending and time.monotonic() >= quit_deadline:
-                stop(True, "quit_decision_timeout", incomplete=True)
+                stop(True, "quit_decision_timeout", abnormal=True)
                 shared.quit_requested.value = True
             if not active or shared.quit_requested.value:
                 continue
@@ -236,7 +231,7 @@ def teleop_loop(shared, config):
                         camera["timestamp_ns"], runtime.camera.max_frame_age_s
                     ):
                         shared.workflow_failed.value = True
-                        stop(True, "camera_unavailable", incomplete=True)
+                        stop(True, "camera_unavailable", abnormal=True)
                         continue
                 if not paused:
                     pause(False)
@@ -258,14 +253,15 @@ def teleop_loop(shared, config):
                         next_tick = time.monotonic()
                         audio.play("resume")
                 continue
-            recording = recorder is not None and recorder.is_recording
+            submitted_before = recorder.frame_count if recorder is not None else 0
             status = run_control_grid_tick(controller, shared, row, recorder)
-            if recording and status != FRAME_OK:
-                stop(
-                    True,
-                    "ik_failure" if status == FRAME_IK_FAIL else "retarget_failure",
-                    incomplete=True,
-                )
+            if (
+                recorder is not None
+                and not shared.workflow_failed.value
+                and recorder.frame_count > submitted_before
+                and recorder.frame_count >= max_rows
+            ):
+                stop(True, "max_record_duration")
                 continue
             next_tick = tick_started + 1 / runtime.teleop.control_hz
             failures = failures + 1 if status != FRAME_OK else 0
@@ -281,7 +277,7 @@ def teleop_loop(shared, config):
         if recorder is not None:
             if recorder.is_recording:
                 recorder.technical_status = "invalid"
-                recorder.stop_episode(save=True, reason="interrupted", retain_partial=True)
+                recorder.stop_episode(save=True, reason="interrupted")
             recorder.join_stop()
         keyboard.stop()
         audio.close()

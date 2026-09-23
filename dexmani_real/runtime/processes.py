@@ -101,12 +101,6 @@ def stop_processes_verified(
     # Fence before any blocking join; record the software end if still RUNNING.
     if int(shared.safety_state.value) == int(SafetyState.RUNNING):
         revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
-    if shared.is_recording.value and (
-        shared.error_state.value or shared.estop_request.value or shared.workflow_failed.value
-    ):
-        from dexmani_real.recording.client import write_recording_failure
-
-        write_recording_failure(shared, "invalid session interrupted recording")
     shared.is_running.value = False
     exits: list[ProcessExit] = []
     deadline = time.monotonic() + graceful_timeout_s

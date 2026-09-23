@@ -1,7 +1,6 @@
 """Policy deployment process ownership and operator lifecycle."""
 
 import json
-import math
 import multiprocessing as mp
 import os
 import threading
@@ -43,11 +42,9 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 _POLL_S = 0.05
-_ROLLOUT_RECORDER_FRAME_MARGIN = 4
 
 
 def _rollout_recorder_config(
-    runtime: ExperimentConfig,
     rollout: RolloutRecordingConfig,
     worker_config: PolicyRuntimeConfig,
     max_running_s: float,
@@ -56,20 +53,10 @@ def _rollout_recorder_config(
     camera_calibration: CameraExtrinsics,
     pointcloud_config: PointCloudLoopConfig | None,
 ) -> RecorderIOConfig:
-    """Build the recorder capacity contract for one recorded rollout session.
-
-    The frame capacity is DERIVED from the run-owner episode budget; recording
-    does not own or re-validate the run plan. The recorder-owned
-    ``provenance_*`` attributes carry the resolved experimental conditions
-    (pinned artifact, effective inference steps, seed, budget) so each
-    published raw episode is self-describing without any git or checksum
-    provenance.
-    """
+    """Record resolved policy experiment settings alongside the raw observations."""
     control_hz = 1.0 / float(worker_config.spec.control_dt_s)
-    max_frames = math.ceil(float(max_running_s) * control_hz) + _ROLLOUT_RECORDER_FRAME_MARGIN
     return RecorderIOConfig(
         data_dir=rollout.data_dir,
-        max_frames=max_frames,
         control_hz=control_hz,
         min_frames=1,
         camera_calibration=camera_calibration,
@@ -182,7 +169,6 @@ def run_policy_deployment(
                     args=(
                         shared,
                         _rollout_recorder_config(
-                            runtime,
                             recording_config,
                             worker_config,
                             max_running_s,

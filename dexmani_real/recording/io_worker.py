@@ -7,7 +7,6 @@ publication. Camera arrays use fixed seqlock ring slots rather than mp.Queue.
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from queue import Empty
@@ -17,7 +16,6 @@ import numpy as np
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.recording.client import (
-    RECORDER_STOP_TIMEOUT_S,
     RecordingResult,
     RecordingStarted,
     StartRecording,
@@ -41,28 +39,23 @@ logger = get_logger(__name__)
 @dataclass(frozen=True)
 class RecorderIOConfig:
     data_dir: str
-    max_frames: int
     control_hz: float
     min_frames: int
     camera_calibration: CameraExtrinsics = field(default_factory=CameraExtrinsics)
     poll_hz: float = 128.0
     provenance: Mapping[str, str] = field(default_factory=dict)
-    max_frames_stop_reason: str = "max_frames"
 
     def __post_init__(self) -> None:
         if (
-            self.max_frames <= 0
-            or self.min_frames < 0
+            self.min_frames < 0
             or not np.isfinite(self.control_hz)
             or not np.isfinite(self.poll_hz)
             or self.control_hz <= 0
             or self.poll_hz <= 0
         ):
-            raise ValueError("invalid RecorderIO capacity/rate configuration")
+            raise ValueError("invalid RecorderIO rate/min_frames configuration")
         if not isinstance(self.camera_calibration, CameraExtrinsics):
             raise TypeError("camera_calibration must be a preloaded CameraExtrinsics snapshot")
-        if not self.max_frames_stop_reason.strip():
-            raise ValueError("max_frames_stop_reason must be non-empty")
         object.__setattr__(
             self,
             "provenance",
@@ -135,7 +128,6 @@ def _create_episode_recorder(shared: Any, config: RecorderIOConfig) -> EpisodeRe
     depth_shape = (int(depth_dims[0]), int(depth_dims[1]))
     return EpisodeRecorder(
         data_dir=config.data_dir,
-        max_frames=config.max_frames,
         control_hz=config.control_hz,
         min_frames=config.min_frames,
         camera_writer_config=CameraStreamWriterConfig(
@@ -146,10 +138,15 @@ def _create_episode_recorder(shared: Any, config: RecorderIOConfig) -> EpisodeRe
     )
 
 
+def _fail_workflow(shared: Any) -> None:
+    with shared.motion_lock:
+        shared.workflow_failed.value = True
+        if int(shared.safety_state.value) == int(SafetyState.RUNNING):
+            revoke_motion(shared, SafetyState.ARMED, reason=RunEndReason.RECORDING_FAILURE)
+
+
 @dataclass
 class _RecorderIOSession:
-    """Recording state and sample FIFO; queues carry START/STOP messages."""
-
     shared: Any
     config: RecorderIOConfig
     recorder: EpisodeRecorder
@@ -157,13 +154,9 @@ class _RecorderIOSession:
     pending_stop: StopRecording | None = None
     fatal: bool = False
 
-    @classmethod
-    def create(cls, shared: Any, config: RecorderIOConfig, recorder: EpisodeRecorder):
-        return cls(shared, config, recorder, int(shared.recorder_consumed_sequence.value))
-
     @property
     def should_run(self) -> bool:
-        return bool(self.shared.is_running.value or self.recorder.is_recording)
+        return not self.fatal and bool(self.shared.is_running.value or self.recorder.is_recording)
 
     def _send_result(self, result: RecordingStarted | RecordingResult) -> None:
         self.shared.record_result_q.put(result, timeout=0.1)
@@ -171,13 +164,10 @@ class _RecorderIOSession:
     def _handle_start(self, control: StartRecording) -> None:
         if self.fatal or self.recorder.is_recording:
             raise RuntimeError("START while previous recording is active")
-        self.shared.recorder_finish_deadline_ns.value = 0
-        self.shared.recorder_completed_ns.value = 0
         try:
             if control.start_sequence != int(self.shared.record_sample_ring.latest_sequence) + 1:
                 raise RuntimeError("START must begin after the last committed sample")
             self.last_sample_sequence = control.start_sequence - 1
-            self.shared.recorder_consumed_sequence.value = self.last_sample_sequence
             metadata = _build_start_metadata(
                 self.shared,
                 task_label=control.task,
@@ -188,75 +178,39 @@ class _RecorderIOSession:
             )
             if not self.recorder.start_episode(**metadata):
                 raise RuntimeError("EpisodeRecorder refused start")
-            self.shared.record_episode_path.value = str(self.recorder.episode_path).encode()
         except Exception as exc:
             logger.error("RecorderIO start failed", exc_info=True)
+            self.fatal = True
+            _fail_workflow(self.shared)
             if self.recorder.is_recording:
                 self._begin_finalization(save=False, reason="start_error", error=str(exc))
                 return
             if not self.recorder.resources_released:
                 raise RuntimeError("episode start retained unreleased resources") from exc
-            self._send_result(
-                RecordingResult(
-                    saved=False,
-                    path=None,
-                    frame_count=0,
-                    reason="start_error",
-                    error=str(exc),
-                )
-            )
+            self._send_result(RecordingResult(reason="start_error", error=str(exc)))
             return
-        self._send_result(
-            RecordingStarted(
-                path=self.recorder.episode_path,
-                max_frames=self.config.max_frames,
-                max_frames_stop_reason=self.config.max_frames_stop_reason,
-            )
-        )
+        self._send_result(RecordingStarted(path=self.recorder.episode_path))
 
-    def _begin_finalization(
-        self,
-        *,
-        save: bool,
-        reason: str,
-        error: str = "",
-        retain_partial: bool = False,
-    ) -> None:
-        """Publish the fixed finalization deadline before blocking."""
+    def _begin_finalization(self, *, save: bool, reason: str, error: str = "") -> None:
         if not self.recorder.is_recording:
             return
-        if not self.shared.recorder_finish_deadline_ns.value:
-            self.shared.recorder_finish_deadline_ns.value = time.monotonic_ns() + int(
-                RECORDER_STOP_TIMEOUT_S * 1e9
-            )
-        deadline = int(self.shared.recorder_finish_deadline_ns.value)
-        path = self.recorder.episode_path or ""
+        path = self.recorder.episode_path
         frame_count = self.recorder.frame_count
         self.pending_stop = None
         published = False
         try:
-            path = self.recorder.finish_episode(
-                save,
-                reason,
-                failure_note=error or (f"episode interrupted: {reason}" if retain_partial else ""),
-                deadline_monotonic_ns=deadline,
-            )
-            published = bool(self.recorder.last_finish_saved)
+            self.recorder.finish_episode(save, reason, failure_note=error)
+            published = self.recorder.last_finish_saved
         except EpisodeFinalizationError as exc:
             error = str(exc)
+        if error:
+            self.fatal = True
+            _fail_workflow(self.shared)
         if not self.recorder.resources_released:
-            self.fatal = True
             raise RuntimeError("episode retained unreleased resources")
-        completed_ns = time.monotonic_ns()
-        if completed_ns >= deadline:
-            self.fatal = True
-            raise RuntimeError("episode finalization deadline/transport failed")
-        # This fact precedes Queue delivery: a late consumer must not expire an
-        # already completed close while the feeder is delivering its sole result.
-        self.shared.recorder_completed_ns.value = completed_ns
         self._send_result(
             RecordingResult(
-                saved=published and not error,
+                saved=published,
                 path=path,
                 frame_count=frame_count,
                 reason=reason,
@@ -264,39 +218,34 @@ class _RecorderIOSession:
                 min_frames_met=frame_count >= self.config.min_frames,
             )
         )
-        self.shared.recorder_finish_deadline_ns.value = 0
 
     def _fail_samples(self, reason: str, error: str) -> None:
-        """Revoke motion before potentially blocking on failed storage cleanup."""
         logger.error("RecorderIO %s: %s", reason, error)
-        with self.shared.motion_lock:
-            self.shared.workflow_failed.value = True
-            if int(self.shared.safety_state.value) == int(SafetyState.RUNNING):
-                revoke_motion(self.shared, reason=RunEndReason.RECORDING_FAILURE)
-        self._begin_finalization(save=False, reason=reason, error=error, retain_partial=True)
-        self.last_sample_sequence = int(self.shared.record_sample_ring.latest_sequence)
-        self.shared.recorder_consumed_sequence.value = self.last_sample_sequence
+        self.fatal = True
+        # Revoke before failed storage cleanup can block.
+        _fail_workflow(self.shared)
+        self._begin_finalization(save=False, reason=reason, error=error)
 
     def _handle_stop(self, control: StopRecording) -> None:
-        # A late STOP after a writer failure is not another result.
-        if not self.recorder.is_recording:
+        # A late or duplicate STOP cannot change the first result or cutoff.
+        if not self.recorder.is_recording or self.pending_stop is not None:
             return
-        if self.pending_stop is not None:
-            return  # Duplicate STOP cannot change intent, cutoff or deadline.
         latest = int(self.shared.record_sample_ring.latest_sequence)
         if not self.last_sample_sequence <= control.through_sequence <= latest:
             self._fail_samples(
                 "invalid_stop_boundary", "STOP boundary is outside committed samples"
             )
             return
-        self.pending_stop = control
         self.recorder.had_pause = control.had_pause
-        if control.technical_status == "invalid":
-            self.recorder.technical_status = "invalid"
-        self.shared.recorder_finish_deadline_ns.value = control.deadline_monotonic_ns
+        self.recorder.technical_status = control.technical_status
+        if not control.save:
+            # Discarded rows still occupy global sequence numbers across episodes.
+            self.last_sample_sequence = control.through_sequence
+            self._begin_finalization(save=False, reason=control.reason)
+            return
+        self.pending_stop = control
 
     def _drain_samples(self) -> None:
-        """Read consecutive samples up to the received STOP cutoff."""
         if not self.recorder.is_recording:
             return
         ring = self.shared.record_sample_ring
@@ -311,50 +260,42 @@ class _RecorderIOSession:
             result = ring.read_sequence(expected)
             if result is None or int(result[2]) != expected:
                 self._fail_samples(
-                    "sample_sequence_unavailable",
-                    f"sample sequence {expected} unavailable",
+                    "sample_sequence_unavailable", f"sample sequence {expected} unavailable"
                 )
                 return
             try:
-                # Copy arrays before allowing the producer to reuse the ring slot.
                 frame = decode_record_sample(result[0][0])
             except Exception as exc:
                 self._fail_samples("sample_decode_error", str(exc))
                 return
             self.last_sample_sequence = expected
-            self.shared.recorder_consumed_sequence.value = expected
             try:
-                before = self.recorder.frame_count
-                added = self.recorder.add_frame(frame)
-                # The last allowed row is accepted but returns False to signal capacity.
-                accepted_last = (
-                    self.recorder.max_frames_reached
-                    and self.recorder.frame_count == before + 1 == self.config.max_frames
-                )
-                if not added and not accepted_last:
-                    raise RuntimeError("recorder rejected a source row at capacity")
+                if not self.recorder.add_frame(frame):
+                    raise RuntimeError("recorder rejected a source row")
             except Exception as exc:
                 self._fail_samples("sample_write_error", str(exc))
                 return
         stop = self.pending_stop
         if stop is not None and self.last_sample_sequence == stop.through_sequence:
-            # A ring overflow cannot produce a complete episode.
-            error = (
-                f"recording aborted: {stop.reason}" if stop.reason == "sample_ring_overflow" else ""
-            )
-            self._begin_finalization(
-                save=stop.save and not error,
-                reason=stop.reason,
-                error=error,
-                retain_partial=stop.retain_partial or bool(error),
-            )
+            self._begin_finalization(save=True, reason=stop.reason)
 
     def shutdown(self) -> bool:
-        """An interrupted episode uses the same process and original deadline."""
         if self.recorder.is_recording:
-            self._begin_finalization(
-                save=False, reason="recorder_process_shutdown", retain_partial=True
-            )
+            if self.fatal:
+                self._begin_finalization(
+                    save=False, reason="recorder_failure", error="RecorderIO failed during capture"
+                )
+            else:
+                if self.pending_stop is None:
+                    self._handle_stop(
+                        StopRecording(
+                            save=True,
+                            reason="runtime_shutdown",
+                            through_sequence=int(self.shared.record_sample_ring.latest_sequence),
+                            technical_status="invalid",
+                        )
+                    )
+                self._drain_samples()
         return self.recorder.resources_released
 
     def step(self) -> None:
@@ -368,41 +309,27 @@ class _RecorderIOSession:
             self._handle_stop(control)
         elif control is not None:
             raise RuntimeError(f"unknown recorder command: {type(control).__name__}")
-        if (
-            (not self.shared.is_running.value)
-            and self.recorder.is_recording
-            and self.pending_stop is None
-        ):
-            # The runtime ended while an episode was still open: an
-            # interruption, not an operator discard.
-            self._handle_stop(
-                StopRecording(
-                    False,
-                    "runtime_shutdown",
-                    int(self.shared.record_sample_ring.latest_sequence),
-                    True,
-                )
-            )
-        self._drain_samples()
+        if not self.shared.is_running.value:
+            self.shutdown()
+        else:
+            self._drain_samples()
 
 
 def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
     """Record episodes until shutdown, reporting worker failures to supervision."""
-    recorder = None
     session = None
     crashed = False
     try:
         recorder = _create_episode_recorder(shared, config)
-        session = _RecorderIOSession.create(shared, config, recorder)
+        session = _RecorderIOSession(shared, config, recorder)
         shared.recorder_ready.set()
         limiter = LoopRate(config.poll_hz, label="recorder", busy_wait=False, warn_on_overrun=False)
         while session.should_run:
             session.step()
             limiter.wait()
     except Exception:
-        # Exit nonzero so the workflow supervisor classifies this worker failure.
         crashed = True
-        shared.workflow_failed.value = True
+        _fail_workflow(shared)
         if session is not None:
             session.fatal = True
         logger.error("RecorderIO process crashed", exc_info=True)
@@ -410,12 +337,11 @@ def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
         if session is not None:
             try:
                 if not session.shutdown():
-                    # Close did not confirm release; preserve staging.
                     crashed = True
-                    shared.workflow_failed.value = True
+                    _fail_workflow(shared)
             except Exception:
                 crashed = True
-                shared.workflow_failed.value = True
+                _fail_workflow(shared)
                 logger.error("RecorderIO shutdown failed", exc_info=True)
         shared.recorder_ready.clear()
         logger.info("RecorderIO exited")
