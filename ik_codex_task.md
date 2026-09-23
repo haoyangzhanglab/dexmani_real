@@ -5,8 +5,9 @@
 Implement this task against the current `main` baseline reviewed at:
 
 - repository: `haoyangzhanglab/dexmani_real`
-- reviewed HEAD: `1d3a96d1f64a8114941b1f9ac83020db7d171183`
-- the IK/deployment implementation is effectively the code introduced through `f681fdc6a6d9ff2e1cc6e8dee5cd203013a8da41`; the final `1d3a96d` commit only simplifies standing documentation.
+- implementation baseline reviewed at: `1d3a96d1f64a8114941b1f9ac83020db7d171183`
+- this task specification was last reviewed on top of `a050f7683c780040334732cd339539994e993644`; that later commit only added this task file and did not change runtime code
+- the IK/deployment implementation is effectively the code introduced through `f681fdc6a6d9ff2e1cc6e8dee5cd203013a8da41`; the final `1d3a96d` implementation-side commit only simplifies standing documentation.
 
 Read and follow `AGENTS.md` first. Before editing, run `git status --short` and preserve unrelated work.
 
@@ -295,7 +296,19 @@ runtime.arm.joint_limit_lower
 runtime.arm.joint_limit_upper
 ```
 
-These values are already validated to lie inside mechanical limits.
+These values are already validated against the repository's mechanical-limit constants, but the runtime planner must also validate them against the **actual MPlib/URDF model limits loaded in that process**.
+
+At OnlineIK/planner construction, require:
+
+```text
+shape == (7,)
+finite
+lower < upper
+runtime_lower >= model_lower - tolerance
+runtime_upper <= model_upper + tolerance
+```
+
+Fail fast on disagreement. Do **not** silently intersect, clip, widen, or replace runtime operational limits to hide a URDF/config mismatch.
 
 If an `OnlineIKConfig` is created without runtime operational limits, it may fall back to the model/URDF limits for internal planner-only use, but all real runtime Cartesian callers must use the resolved runtime limits.
 
@@ -363,7 +376,6 @@ class OnlineIKConfig:
     pose_rotation_weight: float = 0.5
 
     singularity_margin_weight: float = 0.02
-    jacobian_characteristic_length_m: float = 0.4
 
     joint_weights: tuple[float, ...] = (...)
     previous_command_joint_weights: tuple[float, ...] | None = (...)
@@ -382,6 +394,10 @@ Remove obsolete fields/concepts:
 - command-level `nullspace_joint_limit_margin_deg` naming.
 
 Do not add a large set of new tunables. Keep defaults local to `OnlineIKConfig` unless a real experiment needs YAML ownership.
+
+Do not invent a robot characteristic length only to make the manipulability formula look dimensionally tidy. Use the dimensionless conditioned-Jacobian metric specified below instead.
+
+The SVD effective-rank tolerance is an implementation constant, not an experiment knob. Use one documented relative tolerance (initially `1e-4`) consistently for rank diagnosis; do not expose it in YAML unless later data shows a real need.
 
 ---
 
@@ -498,7 +514,7 @@ A branch-invalid candidate must never be a redundancy anchor.
 
 ### 10.1 Choose an anchor on the current target manifold
 
-Choose the best candidate from the current target's non-collision-valid kinematic pool using base quality/continuity.
+Choose the best candidate from the current target's **pre-collision-valid** kinematic pool using base quality/continuity. Here pre-collision-valid means every non-collision hard constraint has passed; collision may be unchecked or known to be positive.
 
 The anchor must already satisfy:
 
@@ -515,7 +531,7 @@ It may be:
 
 Do not use an elbow-flipped/branch-jumped solution as the anchor.
 
-### 10.2 Scaled spatial Jacobian
+### 10.2 Conditioned spatial Jacobian
 
 At the anchor, compute the world Jacobian:
 
@@ -523,30 +539,47 @@ At the anchor, compute the world Jacobian:
 J = [Jv; Jw]
 ```
 
-Construct:
+Do not compare translational rows (meters/radian) and rotational rows (radians/radian) using an arbitrary fixed length constant.
+
+For **numerical rank diagnosis and dexterity quality only**, construct a dimensionless block-conditioned Jacobian:
 
 ```text
-J_scaled = [Jv / L; Jw]
+sv = max(||Jv||_F, eps)
+sw = max(||Jw||_F, eps)
+J_conditioned = [Jv / sv; Jw / sw]
 ```
 
-with `L = jacobian_characteristic_length_m` (default 0.4 m).
+If either block norm is non-finite or effectively zero, treat the Jacobian diagnostic as invalid/rank deficient; do not divide by zero.
 
-Use this same scaled Jacobian SVD for:
+This left row scaling is nonsingular in the regular case, so:
 
-- rank diagnosis;
-- 1-D null direction;
-- anchor singularity margin.
+```text
+null(J_conditioned) == null(J)
+```
 
-Row scaling is nonsingular and does not change the mathematical null space, while making translational/angular scaling explicit.
+Use one SVD of `J_conditioned` for:
+
+- effective-rank diagnosis;
+- null-space basis extraction;
+- dimensionless singularity/dexterity quality.
+
+Do not add a robot-specific characteristic-length tuning parameter in this task.
 
 ### 10.3 Rank handling
 
-Use a documented relative SVD tolerance.
+Use singular values `sigma` from `J_conditioned` and compute effective rank with the single internal relative tolerance:
+
+```text
+threshold = svd_rank_rtol * sigma_max
+rank = count(sigma > threshold)
+```
+
+with `svd_rank_rtol = 1e-4` initially.
 
 For regular xArm7 Cartesian IK:
 
 ```text
-rank(J_scaled) == 6
+rank(J_conditioned) == 6
 nullity == 1
 ```
 
@@ -563,13 +596,21 @@ Do not add an adaptive DLS implementation in this task.
 
 ### 10.4 Predictor -> corrector
 
-With SVD `J_scaled = U S Vh`, use:
+With full SVD `J_conditioned = U S Vh`, use:
 
 ```python
 n = Vh[-1]
 ```
 
 (sign is irrelevant because both directions are considered).
+
+Normalize the predictor direction by its largest joint component so the configured step has an unambiguous meaning:
+
+```text
+delta_desired = deg2rad(redundancy_seed_step_deg) * n / max(abs(n))
+```
+
+Then shrink `delta_desired` **uniformly along the same direction** as needed to stay inside operational limits. Do not clip individual joints, because per-joint clipping destroys the null-space direction.
 
 Construct two predictor seeds:
 
@@ -578,12 +619,12 @@ q_seed_plus  = q_anchor + alpha_plus  * n
 q_seed_minus = q_anchor - alpha_minus * n
 ```
 
-where each alpha is bounded so every seed is already inside operational limits.
+where each signed step is the largest feasible uniform fraction of `delta_desired` in that direction.
 
-The desired scale is approximately:
+When unconstrained by a nearby operational limit:
 
 ```text
-max(abs(delta_q)) ~= redundancy_seed_step_deg
+max(abs(delta_q)) == deg2rad(redundancy_seed_step_deg)
 ```
 
 (default 5 deg).
@@ -610,21 +651,24 @@ Keep manipulability as a weak fallback quality mechanism, but do not use the cur
 
 ### 11.1 Metric
 
-For each fallback candidate that participates in an actual comparison, compute:
+For each fallback candidate that participates in an actual comparison, compute the SVD of the same block-conditioned Jacobian:
 
 ```text
-sigma_min(J_scaled)
+J_conditioned = [Jv / max(||Jv||_F, eps);
+                 Jw / max(||Jw||_F, eps)]
 ```
 
-where:
+Use the dimensionless condition margin:
 
 ```text
-J_scaled = [Jv / L; Jw]
+dexterity_quality = sigma_min / max(sigma_max, eps)
 ```
 
-Use the smallest singular value as the local Cartesian singularity margin.
+which lies in `[0, 1]` for finite singular values and penalizes directional singularity without introducing an arbitrary translational-vs-rotational length scale.
 
-Do not use it as a hard rejection threshold.
+This is the project's manipulability/dexterity mechanism. Do not restore raw Yoshikawa `sqrt(det(J J^T))` in the online selector.
+
+Do not use dexterity quality as a hard rejection threshold.
 
 ### 11.2 Lazy evaluation
 
@@ -637,19 +681,19 @@ Only compute it when:
 
 If there is only one viable fallback candidate, manipulability cannot change selection and should not force extra Jacobian work.
 
-### 11.3 Candidate-pool normalization
+### 11.3 No candidate-pool rescaling
 
-Avoid normalizing against measured-posture Yoshikawa.
+Do not normalize manipulability against the measured posture and do not renormalize it by the current candidate pool.
 
-For a fallback comparison pool, normalize:
+The dimensionless:
 
 ```text
-manip_quality_i = sigma_min_i / max_j(sigma_min_j, eps)
+dexterity_quality = sigma_min / sigma_max
 ```
 
-so the term lies approximately in `[0, 1]`.
+already has stable `[0, 1]` semantics and is comparable across candidates.
 
-Then use it only as a weak tie-breaker.
+Use it only as a weak tie-breaker.
 
 ### 11.4 Score
 
@@ -669,7 +713,7 @@ Start from the current relative weights where possible:
 - previous-command distance: 0.25;
 - joint-limit penalty: 0.01;
 - pose accuracy: 0.1;
-- singularity margin: 0.02.
+- dimensionless dexterity/singularity margin: 0.02.
 
 Do not simultaneously retune all weights during this refactor.
 
@@ -728,7 +772,7 @@ operational_limits intersect [reference - delta, reference + delta]
 
 Do not sample then clip.
 
-Use a fixed RNG seed for reproducibility.
+Use a fixed per-solver RNG seed for reproducibility, and record the seed name/attempt in the structured report. Determinism means the same solver initialization plus the same solve-call history produces the same fallback sequence; do not use global NumPy RNG state.
 
 If a current-target redundancy anchor exists, use it as the random reference; otherwise use the previous command/current state as appropriate.
 
@@ -905,7 +949,42 @@ Keep `project_arm_command()` for joint-mode arm targets.
 
 ---
 
-## 18. Raw frame-status scope
+## 18. EEF decode result and projection telemetry
+
+The new structured IK diagnostics must reach policy evaluation; do not discard them inside `decode_policy_action()`.
+
+For EEF mode, surface the actual `IKResult` (or its report/failure kind) to `PolicyRunner` without re-running IK. A small explicit return record/dataclass is acceptable if it makes the current tuple unambiguous; do not build a framework.
+
+Also preserve projection provenance after removing post-IK arm projection:
+
+- **joint mode**: continue reporting arm-joint projection magnitude in radians plus hand projection magnitude in radians;
+- **EEF mode**: report workspace position clip magnitude in meters plus hand projection magnitude in radians;
+- do not combine meters and radians with one `max()`;
+- keep separate counters/maxima for arm-joint clip, workspace clip, and hand clip as applicable.
+
+For policy EEF, compute workspace clip telemetry from:
+
+```text
+raw_policy_position -> clipped_workspace_position
+```
+
+before IK.
+
+The persisted `arm_eef_intent` may continue to represent the final clipped high-level EEF target that was actually submitted to IK, preserving the existing action/recording semantics. The new clip telemetry explains how far the raw policy output was projected.
+
+On EEF IK failure, `PolicyRunner` must have access to:
+
+- `failure_kind`;
+- structured attempts/funnel;
+- IK latency;
+- workspace clip magnitude;
+- prepared hand target / hand clip magnitude.
+
+It may aggregate/log these diagnostics; do not add a large sidecar/telemetry subsystem in this task.
+
+---
+
+## 19. Raw frame-status scope
 
 Current VR mapping failure is still emitted as `FRAME_IK_FAIL`.
 
@@ -923,19 +1002,21 @@ A separate schema task can add a mapping-specific persisted status if desired.
 
 ---
 
-## 19. XHand model-order safety invariant
+## 20. XHand model-order safety invariant
 
 The online collision filter depends on the fixed SDK -> URDF hand-joint remap.
 
 Make the model order assumption explicit at model construction with minimal startup checks.
 
-Expose the expected URDF hand-joint sequence from `robot/model.py` instead of keeping it only as an unverified private tuple, then verify when constructing the full Pinocchio collision model:
+Expose the expected URDF hand-joint sequence from `robot/model.py` instead of keeping it only as an unverified private tuple, then verify when constructing the full Pinocchio collision model.
+
+Compare the model's **active non-fixed joints in q-vector order** (excluding Pinocchio's universe/root bookkeeping entry if present), not a raw names list with implementation-specific bookkeeping:
 
 ```text
-7 arm active joints + expected 12 hand URDF joints
+joint1 ... joint7 + expected 12 hand URDF joints
 ```
 
-and the expected nq.
+and require `nq == 19`.
 
 Keep the check direct; do not build a general model-schema framework.
 
@@ -945,7 +1026,7 @@ This is an offline/model correctness check, not a hardware safety protocol.
 
 ---
 
-## 20. Intentional real-hand mount offset
+## 21. Intentional real-hand mount offset
 
 Do **not** change the URDF mount or runtime transform as part of this task.
 
@@ -962,7 +1043,7 @@ No other geometry change is requested.
 
 ---
 
-## 21. Files expected to change
+## 22. Files expected to change
 
 Keep the diff focused. Expected paths include:
 
@@ -986,7 +1067,7 @@ Do not touch unrelated recording, point-cloud, dataset, or runtime lifecycle cod
 
 ---
 
-## 22. Implementation shape
+## 23. Implementation shape
 
 Keep `ik.py` direct. A small private candidate dataclass is appropriate, for example:
 
@@ -1024,7 +1105,7 @@ Do not introduce `IKStrategy`, `CandidateManager`, `ValidationRegistry`, generic
 
 ---
 
-## 23. Offline verification
+## 24. Offline verification
 
 The repository intentionally does not use a committed tests directory.
 
@@ -1064,20 +1145,25 @@ Use one-off offline Python checks/mocks to verify:
 2. **Operational-limit invariant**
    - construct a runtime profile narrower than model limits;
    - verify an IK result outside the operational limits is rejected or represented by an equivalent in-range solution;
-   - verify Cartesian caller does not modify a successful q afterward.
+   - verify Cartesian caller does not modify a successful q afterward;
+   - verify runtime limits outside the actually loaded model/URDF limits fail at construction rather than being silently intersected.
 
 3. **Null predictor-corrector**
    - create a valid current-target anchor;
+   - confirm unconstrained +/- predictors have exactly the configured max joint-component step;
+   - confirm near-limit predictors are uniformly shortened, not per-joint clipped;
    - confirm generated +/- seeds stay inside operational limits;
    - confirm final returned null candidate is a fresh CLIK solution, not the predictor q.
 
 4. **Rank handling**
-   - regular 6x7 Jacobian produces one null direction;
-   - mocked rank-deficient Jacobian skips the 1-D structured null search without numerical failure.
+   - regular 6x7 conditioned Jacobian produces one null direction;
+   - a mocked near/rank-deficient Jacobian below the relative SVD threshold skips the 1-D structured null search without numerical failure;
+   - rank deficiency never invalidates an otherwise executable base candidate.
 
-5. **Manipulability ranking**
+5. **Manipulability/dexterity ranking**
    - use mocked candidate Jacobians;
-   - confirm better singularity margin can break a close soft-quality tie;
+   - verify the conditioned metric is finite, dimensionless and in [0, 1];
+   - confirm better dexterity margin can break a close soft-quality tie;
    - confirm it cannot override a hard branch/limit/collision failure.
 
 6. **Collision ordering**
@@ -1091,6 +1177,8 @@ Use one-off offline Python checks/mocks to verify:
 8. **Caller behavior**
    - EEF mode publishes exact validated IK q;
    - joint mode still uses arm projection;
+   - policy EEF receives the original structured `IKResult` diagnostics without solving twice;
+   - workspace clip meters, arm-joint clip radians, and hand clip radians are not mixed into one scalar;
    - policy EEF failure still clears chunk and publishes nothing;
    - teleop failure still publishes nothing and does not update `prev_qpos_cmd`.
 
@@ -1126,13 +1214,13 @@ Do not set an invented success-rate threshold without data; report actual before
 
 ---
 
-## 24. Acceptance criteria
+## 25. Acceptance criteria
 
 The task is complete only when all of the following are true.
 
 ### Correctness
 
-- Cartesian IK uses runtime operational arm limits.
+- Cartesian IK uses runtime operational arm limits and validates them against the actually loaded model limits.
 - Successful Cartesian IK q is published unchanged.
 - No post-IK null-space command modification remains.
 - Null-space predictor points are never published.
@@ -1145,8 +1233,9 @@ The task is complete only when all of the following are true.
 - Search order is deterministic:
   `prev -> current -> null preferred/opposite -> optional one random`.
 - Null search uses the current target's valid kinematic anchor, not blindly the previous target posture.
-- Structured null search is skipped when the Jacobian does not have the expected regular rank-6 structure.
-- Manipulability is a weak fallback ranking term, not a hard threshold or direct gradient controller.
+- Structured 1-D null search is skipped when the conditioned Jacobian does not have the expected regular effective rank-6 structure; this does not invalidate an otherwise executable base candidate.
+- Null predictor steps are uniformly scaled along the null direction and never per-joint clipped.
+- Manipulability/dexterity is the dimensionless conditioned-Jacobian `sigma_min/sigma_max` weak fallback term, not a hard threshold or direct gradient controller.
 
 ### Performance
 
@@ -1160,6 +1249,7 @@ The task is complete only when all of the following are true.
 
 - Existing recoverable teleop behavior remains intact.
 - Existing policy EEF `clear chunk -> reobserve -> reinfer` behavior remains intact.
+- Policy EEF retains access to structured IK failure diagnostics and explicit workspace/hand projection telemetry.
 - No hidden EEF smoothing/relaxation is introduced.
 - Direct joint policy behavior remains intact.
 - Recorder/dataset lifecycle is not redesigned by this task.
@@ -1175,7 +1265,7 @@ The task is complete only when all of the following are true.
 
 ---
 
-## 25. Handoff report
+## 26. Handoff report
 
 At completion, report concisely:
 
@@ -1194,7 +1284,7 @@ Do not claim hardware validation unless separately and explicitly authorized.
 
 ---
 
-## 26. Final design summary
+## 27. Final design summary
 
 The intended end state is:
 
@@ -1210,10 +1300,10 @@ normal frame:
 hard frame:
     prev/current exact candidates
     -> choose current-target redundancy anchor
-    -> scaled-Jacobian SVD
+    -> conditioned-Jacobian SVD
     -> bounded null +/- predictor seeds
     -> CLIK correction
-    -> weak singularity-margin-aware scoring
+    -> weak dimensionless dexterity-margin-aware scoring
     -> collision in score order
     -> optional one deterministic basin fallback
     -> publish exact validated q
@@ -1229,7 +1319,7 @@ The key rules are:
 ```text
 CLIK guarantees Cartesian correctness.
 Null space generates alternative exact-solution basins.
-Manipulability helps rank legal redundancy postures.
+Conditioned-Jacobian dexterity helps rank legal redundancy postures.
 Hard execution constraints always dominate secondary quality.
 Validated q must equal published q.
 ```
