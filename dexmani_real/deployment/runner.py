@@ -11,6 +11,7 @@ from dexmani_real.deployment.action import (
     physical_action_dim,
 )
 from dexmani_real.deployment.observation import build_fingertip_runtime, build_policy_observation
+from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.recording.client import RecorderClient
 from dexmani_real.recording.frame import build_episode_frame
 from dexmani_real.recording.storage.schema import FRAME_IK_FAIL
@@ -66,12 +67,12 @@ class PolicyRunner:
         self.inference_ms = []
         self.action_step_intervals_ms = []
         self.previous_step_ns = None
-        self.clip_count = 0
-        self.max_clip_rad = 0.0
+        self.arm_clip_count = self.workspace_clip_count = self.hand_clip_count = 0
+        self.max_arm_clip_rad = self.max_workspace_clip_m = self.max_hand_clip_rad = 0.0
+        self.last_ik_result = None
+        self.ik_failure_counts = {}
         self.publications = 0
-        self.planner = make_action_planner(
-            policy_spec.action_mode, runtime, control_dt_s=policy_spec.control_dt_s
-        )
+        self.planner = make_action_planner(policy_spec.action_mode, runtime)
         fields = {f.name for f in self.spec.observation_fields}
         self.requires_rgb = "rgb" in fields
         self.requires_cloud = "point_cloud" in fields
@@ -230,7 +231,7 @@ class PolicyRunner:
                 self._finish("required_observation_stale", abnormal=True)
                 return
         action = self.actions.popleft()
-        arm, prepared_hand, intent, hand_clip = decode_policy_action(
+        decoded = decode_policy_action(
             action,
             self.spec.action_mode,
             row.arm["qpos"][0],
@@ -240,30 +241,43 @@ class PolicyRunner:
             hand_qpos_min_rad=self.runtime.hand.qpos_min_rad,
             hand_qpos_max_rad=self.runtime.hand.qpos_max_rad,
         )
+        arm, prepared_hand, intent = decoded.arm_qpos, decoded.hand_qpos, decoded.arm_eef_intent
+        self.last_ik_result = decoded.ik_result
+        self.workspace_clip_count += int(decoded.workspace_clip_m > 1e-9)
+        self.max_workspace_clip_m = max(self.max_workspace_clip_m, decoded.workspace_clip_m)
+        self.hand_clip_count += int(decoded.hand_clip_rad > 1e-9)
+        self.max_hand_clip_rad = max(self.max_hand_clip_rad, decoded.hand_clip_rad)
         if arm is None:
             self.actions.clear()
+            kind = decoded.ik_result.failure_kind
+            self.ik_failure_counts[kind.value] = self.ik_failure_counts.get(kind.value, 0) + 1
+            if kind == IKFailureKind.INVALID_OUTPUT:
+                raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
             if self.recorder:
                 self.recorder.add_frame(
                     build_episode_frame(row, frame_status=FRAME_IK_FAIL, arm_eef_intent=intent)
                 )
             self.next_step_ns = time.monotonic_ns() + int(self.spec.control_dt_s * 1e9)
             return
-        prepared_arm = project_arm_command(
-            arm,
-            row.arm["qpos"][0],
-            joint_lower_rad=self.runtime.arm.joint_limit_lower,
-            joint_upper_rad=self.runtime.arm.joint_limit_upper,
-        )
-        arm_change = prepared_arm - arm
-        equivalent = (
-            np.asarray(self.runtime.arm.joint_limit_upper)
-            - np.asarray(self.runtime.arm.joint_limit_lower)
-            >= 2 * np.pi
-        )
-        arm_change[equivalent] = (arm_change[equivalent] + np.pi) % (2 * np.pi) - np.pi
-        clip = max(float(np.max(np.abs(arm_change))), hand_clip)
-        self.clip_count += int(clip > 1e-9)
-        self.max_clip_rad = max(self.max_clip_rad, clip)
+        if self.spec.action_mode == "joint":
+            prepared_arm = project_arm_command(
+                arm,
+                row.arm["qpos"][0],
+                joint_lower_rad=self.runtime.arm.joint_limit_lower,
+                joint_upper_rad=self.runtime.arm.joint_limit_upper,
+            )
+            arm_change = prepared_arm - arm
+            equivalent = (
+                np.asarray(self.runtime.arm.joint_limit_upper)
+                - np.asarray(self.runtime.arm.joint_limit_lower)
+                >= 2 * np.pi
+            )
+            arm_change[equivalent] = (arm_change[equivalent] + np.pi) % (2 * np.pi) - np.pi
+            arm_clip = float(np.max(np.abs(arm_change)))
+            self.arm_clip_count += int(arm_clip > 1e-9)
+            self.max_arm_clip_rad = max(self.max_arm_clip_rad, arm_clip)
+        else:
+            prepared_arm = arm
         command = RobotCommand(self.run_id, prepared_arm, prepared_hand)
         stamp = publish_command(self.shared, command) if self.execute else time.monotonic_ns()
         if not stamp:
@@ -313,12 +327,19 @@ class PolicyRunner:
         )
         effective_hz = f"{1000 / mean_interval_ms:.2f}" if mean_interval_ms > 0 else "unavailable"
         logger.info(
-            "policy summary: execute=%s steps=%d clipped=%d max_clip_rad=%.5f configured_action_hz=%.2f "
+            "policy summary: execute=%s steps=%d arm_clipped=%d max_arm_clip_rad=%.5f "
+            "workspace_clipped=%d max_workspace_clip_m=%.5f hand_clipped=%d max_hand_clip_rad=%.5f "
+            "ik_failures=%s configured_action_hz=%.2f "
             "inference_ms[n=%d %s] action_step_interval_ms[n=%d %s] effective_action_step_hz=%s",
             self.execute,
             self.publications,
-            self.clip_count,
-            self.max_clip_rad,
+            self.arm_clip_count,
+            self.max_arm_clip_rad,
+            self.workspace_clip_count,
+            self.max_workspace_clip_m,
+            self.hand_clip_count,
+            self.max_hand_clip_rad,
+            self.ik_failure_counts,
             1 / self.spec.control_dt_s,
             len(self.inference_ms),
             statistics(self.inference_ms),

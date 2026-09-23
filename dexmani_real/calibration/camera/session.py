@@ -46,8 +46,9 @@ from dexmani_real.ipc.channels import (
     RuntimeChannelsConfig,
     read_arm_state_dict,
 )
-from dexmani_real.planning import OnlineIKConfig, XArm7MotionPlanner
+from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+from dexmani_real.planning.kinematics.ik import make_online_ik_config
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.runtime.observation import read_camera_frame, sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
@@ -117,7 +118,8 @@ def _build_planner(
 ) -> tuple[XArm7MotionPlanner, np.ndarray]:
     workspace = runtime.policy.workspace.as_array()
     planner = XArm7MotionPlanner.create_default(
-        teleop_profile=OnlineIKConfig(
+        online_ik_profile=make_online_ik_config(
+            runtime,
             max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
             max_pose_error_rot_rad=float(runtime.keyboard_teleop.ik_max_pose_error_rot_rad),
         ),

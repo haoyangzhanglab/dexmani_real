@@ -1,4 +1,4 @@
-"""Online IK solver — position IK with deterministic MPlib seeding."""
+"""Continuation-first Cartesian CLIK with bounded predictor/corrector redundancy search."""
 
 from __future__ import annotations
 
@@ -11,13 +11,18 @@ import numpy as np
 
 from dexmani_real.utils.log import get_logger
 
+from .pose import Pose, compute_pose_error
+
 if TYPE_CHECKING:
     from .arm_fk import XArm7Kinematics
     from .ik_geometry import IKGeometry
 
-from .pose import Pose, compute_pose_error, ensure_qpos
-
 logger = get_logger(__name__)
+
+# Relative rank diagnosis is a search guard, never an execution constraint.
+_SVD_RANK_RTOL = 1e-4
+_NUMERIC_EPS = 1e-12
+_MODEL_LIMIT_TOL_RAD = 1e-5
 
 
 @dataclass(kw_only=True)
@@ -26,744 +31,498 @@ class IKResult:
     qpos: np.ndarray | None
     reason: str = ""
     report: dict[str, Any] = field(default_factory=dict)
-    failure_kind: "IKFailureKind | None" = None
+    failure_kind: IKFailureKind | None = None
 
 
 class IKFailureKind(str, Enum):
-    """Machine-readable reason for a failed IK solve."""
-
-    NO_SOLUTION = "no_solution"
-    GEOMETRY_REJECTED = "geometry_rejected"
+    NO_SOLUTION_FOUND = "no_solution_found"
+    NO_VALID_CANDIDATE = "no_valid_candidate"
     INVALID_OUTPUT = "invalid_output"
 
 
 @dataclass(kw_only=True)
 class OnlineIKConfig:
-    """Online IK/servo configuration."""
+    """Bounded online search; all joint radii are maximum component displacements."""
 
     max_ik_jump_deg: tuple[float, ...] = (30, 30, 30, 35, 40, 40, 40)
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
-    position_ik_fast_accept_rad: float = np.deg2rad(8.0)
-    position_ik_num_random_seeds: int = 3
-    position_ik_seed_offset_deg: float = 5.0
-    teleop_ik_seed: int | None = 42
-    position_ik_manipulability_weight: float = 0.02
-    position_ik_limit_penalty_weight: float = 0.01
-    position_ik_velocity_weight: float = 0.25
-    position_ik_pose_accuracy_weight: float = 0.1
-    position_ik_pose_rot_weight: float = 0.5
-    position_ik_min_manipulability: float = 0.0
-    velocity_joint_weights: tuple[float, ...] | None = (
-        10.0,
-        4.0,
-        2.0,
-        1.0,
-        0.5,
-        0.6,
-        0.1,
-    )
+    fast_accept_max_delta_deg: float = 8.0
+    operational_joint_lower_rad: tuple[float, ...] | None = None
+    operational_joint_upper_rad: tuple[float, ...] | None = None
+    redundancy_seed_step_deg: float = 5.0
+    joint_limit_search_margin_deg: float = 15.0
+    enable_random_fallback: bool = False
+    random_fallback_step_deg: float = 5.0
+    random_seed: int | None = 42
+    previous_command_distance_weight: float = 0.25
+    joint_limit_penalty_weight: float = 0.01
+    pose_accuracy_weight: float = 0.1
+    pose_rotation_weight: float = 0.5
+    singularity_margin_weight: float = 0.02
     joint_weights: tuple[float, ...] = (4.0, 1.8, 1.2, 0.6, 0.6, 0.9, 0.35)
-    enable_nullspace_optimization: bool = True
-    nullspace_step_size_deg: float = 1.0
-    nullspace_joint_limit_margin_deg: float = 15.0
+    previous_command_joint_weights: tuple[float, ...] | None = (10, 4, 2, 1, 0.5, 0.6, 0.1)
 
 
-def make_online_ik_config(runtime, *, control_dt_s: float) -> OnlineIKConfig:
-    if not np.isfinite(control_dt_s) or control_dt_s <= 0:
-        raise ValueError("online IK control_dt_s must be finite and positive")
+def make_online_ik_config(
+    runtime,
+    *,
+    max_pose_error_pos_m: float | None = None,
+    max_pose_error_rot_rad: float | None = None,
+    enable_random_fallback: bool = False,
+) -> OnlineIKConfig:
     return OnlineIKConfig(
-        max_pose_error_pos_m=runtime.policy.ik_max_pose_error_pos_m,
-        max_pose_error_rot_rad=runtime.policy.ik_max_pose_error_rot_rad,
-        nullspace_step_size_deg=(runtime.policy.ik_nullspace_step_rate_deg_s * control_dt_s),
+        max_pose_error_pos_m=(
+            runtime.policy.ik_max_pose_error_pos_m
+            if max_pose_error_pos_m is None
+            else max_pose_error_pos_m
+        ),
+        max_pose_error_rot_rad=(
+            runtime.policy.ik_max_pose_error_rot_rad
+            if max_pose_error_rot_rad is None
+            else max_pose_error_rot_rad
+        ),
+        operational_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
+        operational_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
+        enable_random_fallback=enable_random_fallback,
     )
+
+
+@dataclass
+class _Candidate:
+    qpos: np.ndarray
+    attempt: dict[str, Any]
+    pos_err_m: float
+    rot_err_rad: float
+    max_physical_delta: float
+    distance_current: float
+    base_score: float
+    near_limit: bool
+    collision_free: bool | None = None
+    singularity_margin: float | None = None
+    score: float = 0.0
 
 
 class OnlineIKSolver:
-    """MPlib position IK with prev_cmd seeding and fast-accept.
+    """Exact CLIK candidates, measured-state representation and published-target continuity."""
 
-    Priority: prev_cmd seed (position IK) → multi-seed fallback → failure.
-    """
-
-    # Elbow-branch selection thresholds.
-    _ELBOW_FLIP_NEG_THRESH_RAD: float = np.deg2rad(-5.0)
-    _ELBOW_FLIP_POS_THRESH_RAD: float = np.deg2rad(15.0)
-    _ELBOW_FLIP_MIN_DELTA_RAD: float = np.deg2rad(40.0)
+    _ELBOW_FLIP_NEG_THRESH_RAD = np.deg2rad(-5.0)
+    _ELBOW_FLIP_POS_THRESH_RAD = np.deg2rad(15.0)
+    _ELBOW_FLIP_MIN_DELTA_RAD = np.deg2rad(40.0)
 
     def __init__(
         self,
         kin: XArm7Kinematics,
         ik_mgr: IKGeometry,
-        teleop_profile: OnlineIKConfig,
+        online_ik_profile: OnlineIKConfig,
         elbow_joint_index: int = 3,
     ) -> None:
-        self.kin = kin
-        self.ik_mgr = ik_mgr
-        self.profile = teleop_profile
+        self.kin, self.ik_mgr, self.profile = kin, ik_mgr, online_ik_profile
         self._elbow_joint_index = elbow_joint_index
-        self._nullspace_warn_last_s: float = 0.0
+        self._rng = np.random.default_rng(online_ik_profile.random_seed)
         self._failure_start: float | None = None
-        self._failure_warned: bool = False
-        self._rng = np.random.default_rng(teleop_profile.teleop_ik_seed)
+        self._failure_warned = False
+        model = np.asarray(ik_mgr.joint_limits, dtype=np.float64)
+        if kin.dof != 7 or model.shape != (7, 2) or not np.isfinite(model).all():
+            raise ValueError("online IK requires finite (7, 2) model limits")
+        if np.any(model[:, 0] >= model[:, 1]):
+            raise ValueError("online IK model limits must be ordered")
+        lower, upper = (
+            online_ik_profile.operational_joint_lower_rad,
+            online_ik_profile.operational_joint_upper_rad,
+        )
+        if lower is None and upper is None:
+            self.operational_limits = model.copy()
+        else:
+            lower, upper = np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)
+            if any(a.shape != (7,) or not np.isfinite(a).all() for a in (lower, upper)):
+                raise ValueError("operational lower/upper limits must both be finite (7,) arrays")
+            if np.any(lower >= upper):
+                raise ValueError("operational lower limits must be less than upper limits")
+            if np.any(lower < model[:, 0] - _MODEL_LIMIT_TOL_RAD) or np.any(
+                upper > model[:, 1] + _MODEL_LIMIT_TOL_RAD
+            ):
+                raise ValueError("runtime operational limits exceed the loaded model/URDF limits")
+            self.operational_limits = np.column_stack((lower, upper))
+        self._jump_limit = np.deg2rad(
+            ik_mgr.profile_array(online_ik_profile.max_ik_jump_deg, "max_ik_jump_deg")
+        )
+        self._weights = ik_mgr.profile_array(online_ik_profile.joint_weights, "joint_weights")
+        self._previous_weights = ik_mgr.profile_array(
+            online_ik_profile.previous_command_joint_weights
+            if online_ik_profile.previous_command_joint_weights is not None
+            else online_ik_profile.joint_weights,
+            "previous_command_joint_weights",
+        )
+        positive = (
+            online_ik_profile.max_pose_error_pos_m,
+            online_ik_profile.max_pose_error_rot_rad,
+            online_ik_profile.redundancy_seed_step_deg,
+            online_ik_profile.random_fallback_step_deg,
+        )
+        nonnegative = (
+            online_ik_profile.fast_accept_max_delta_deg,
+            online_ik_profile.joint_limit_search_margin_deg,
+            online_ik_profile.previous_command_distance_weight,
+            online_ik_profile.joint_limit_penalty_weight,
+            online_ik_profile.pose_accuracy_weight,
+            online_ik_profile.pose_rotation_weight,
+            online_ik_profile.singularity_margin_weight,
+        )
+        if (
+            any(not np.isfinite(v) or v <= 0 for v in positive)
+            or any(not np.isfinite(v) or v < 0 for v in nonnegative)
+            or any(
+                not np.isfinite(a).all() or np.any(a < 0)
+                for a in (self._jump_limit, self._weights, self._previous_weights)
+            )
+        ):
+            raise ValueError("online IK tolerances, radii and weights must be finite and valid")
 
     def solve(
-        self,
-        target_eef_pose_world: Pose,
-        current_qpos: np.ndarray,
-        previous_qpos_cmd: np.ndarray,
+        self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
     ) -> IKResult:
-        """Run teleop IK — prev_cmd seed, multi-seed fallback, explicit failure."""
-        t_start = time.perf_counter()
-
-        profile = self.profile
-        current_qpos = ensure_qpos(current_qpos, self.kin.dof, "current_qpos")
-        previous_qpos_cmd = ensure_qpos(previous_qpos_cmd, self.kin.dof, "previous_qpos_cmd")
-
-        qpos, report = self._solve_position_ik(
-            target_eef_pose_world, current_qpos, previous_qpos_cmd, profile
-        )
-
-        if qpos is not None:
-            result = self._command_from_target_qpos(
-                target_eef_pose_world=target_eef_pose_world,
-                current_qpos=current_qpos,
-                target_qpos=qpos,
-                profile=profile,
-                report=report,
-            )
-            result.report["ik_timing_ms"] = round((time.perf_counter() - t_start) * 1000.0, 1)
-        else:
-            dt_total_ms = (time.perf_counter() - t_start) * 1000
-            diagnostic = self._build_diagnostic(report)
+        start = time.perf_counter()
+        report: dict[str, Any] = {
+            "attempts": [],
+            "clik_calls": 0,
+            "collision_checks": 0,
+            "jacobian_calls": 0,
+            "funnel": dict.fromkeys(
+                (
+                    "attempted",
+                    "clik_converged",
+                    "operational_limits_valid",
+                    "continuity_valid",
+                    "hardware_valid",
+                    "pose_valid",
+                    "collision_free",
+                ),
+                0,
+            ),
+        }
+        try:
+            current = self._finite_q(current_qpos)
+            previous = self._finite_q(previous_qpos_cmd)
+            if (
+                not np.isfinite(target_eef_pose_world.p).all()
+                or not np.isfinite(target_eef_pose_world.q).all()
+            ):
+                raise ValueError("non-finite target pose")
+            selected, mode = self._search(target_eef_pose_world, current, previous, report)
+            if selected is not None:
+                report.update(
+                    seed=selected.attempt["seed"],
+                    mode=mode,
+                    best_score=selected.score,
+                    cmd_tracking_error_pos_m=selected.pos_err_m,
+                    cmd_tracking_error_rot_rad=selected.rot_err_rad,
+                    qpos_distance_to_current=selected.distance_current,
+                    max_qpos_cmd_delta_deg=float(np.rad2deg(selected.max_physical_delta)),
+                )
+                if selected.singularity_margin is not None:
+                    report["singularity_margin"] = selected.singularity_margin
+                result = IKResult(success=True, qpos=selected.qpos, report=report)
+            else:
+                kind = (
+                    IKFailureKind.NO_VALID_CANDIDATE
+                    if report["funnel"]["clik_converged"]
+                    else IKFailureKind.NO_SOLUTION_FOUND
+                )
+                reason = (
+                    "no_valid_candidate: "
+                    + ", ".join(dict.fromkeys(a["result"] for a in report["attempts"]))
+                    if kind == IKFailureKind.NO_VALID_CANDIDATE
+                    else "solver_no_convergence"
+                )
+                result = IKResult(
+                    success=False, qpos=None, reason=reason, failure_kind=kind, report=report
+                )
+        except (
+            ValueError,
+            RuntimeError,
+            TypeError,
+            FloatingPointError,
+            np.linalg.LinAlgError,
+        ) as exc:
+            # Model/numerical contract failures must not masquerade as local solver rejection.
+            report["invalid_output"] = str(exc)
             result = IKResult(
                 success=False,
                 qpos=None,
-                reason=diagnostic["summary"],
-                failure_kind=report.get("failure_kind", IKFailureKind.NO_SOLUTION),
-                report={
-                    **report,
-                    "diagnostic": diagnostic,
-                    "ik_timing_ms": round(dt_total_ms, 1),
-                },
+                reason=str(exc),
+                failure_kind=IKFailureKind.INVALID_OUTPUT,
+                report=report,
             )
-
-        if not result.success:
-            if self._failure_start is None:
-                self._failure_start = time.monotonic()
-            elif time.monotonic() - self._failure_start > 2.0 and not self._failure_warned:
-                logger.warning(
-                    "IK failed for %.1fs — no new target (reason: %s)",
-                    time.monotonic() - self._failure_start,
-                    result.reason,
-                )
-                self._failure_warned = True
-        else:
-            self._failure_start = None
-            self._failure_warned = False
-
+        report["ik_timing_ms"] = (time.perf_counter() - start) * 1000.0
+        if result.success:
+            self._failure_start, self._failure_warned = None, False
+        elif self._failure_start is None:
+            self._failure_start = time.monotonic()
+        elif time.monotonic() - self._failure_start > 2.0 and not self._failure_warned:
+            logger.warning(
+                "IK failed for %.1fs — no new target (reason: %s)",
+                time.monotonic() - self._failure_start,
+                result.reason,
+            )
+            self._failure_warned = True
         return result
 
-    def _solve_position_ik(
-        self,
-        target_eef_pose_world: Pose,
-        current_qpos: np.ndarray,
-        previous_qpos_cmd: np.ndarray,
-        profile: OnlineIKConfig,
-    ) -> tuple[np.ndarray | None, dict[str, Any]]:
-        """Position IK: prev_cmd seed with fast-accept, multi-seed fallback, scoring."""
-        target_pose_base = self.kin.world_to_base_pose(target_eef_pose_world)
-        jump_limit = np.deg2rad(
-            self.ik_mgr.profile_array(profile.max_ik_jump_deg, "max_ik_jump_deg")
-        )
-        fast_accept_rad = profile.position_ik_fast_accept_rad
-        weights = self.ik_mgr.profile_array(profile.joint_weights, "joint_weights")
+    @staticmethod
+    def _finite_q(value: np.ndarray) -> np.ndarray:
+        q = np.asarray(value, dtype=np.float64)
+        if q.shape != (7,) or not np.isfinite(q).all():
+            raise ValueError("IK joint vectors must be finite shape (7,)")
+        return q
 
-        attempts: list[str] = []
+    def _search(self, target, current, previous, report):
+        target_base = self.kin.to_mplib_pose(self.kin.world_to_base_pose(target))
+        pool: list[_Candidate] = []
+        for name, seed in (("prev_cmd", previous), ("current_qpos", current)):
+            candidate = self._try_clik(
+                name, seed, target_base, target, current, previous, pool, report
+            )
+            if candidate is None:
+                continue
+            pool.append(candidate)
+            if (
+                name == "prev_cmd"
+                and not candidate.near_limit
+                and candidate.max_physical_delta
+                <= np.deg2rad(self.profile.fast_accept_max_delta_deg)
+                and candidate.pos_err_m <= 0.5 * self.profile.max_pose_error_pos_m
+                and candidate.rot_err_rad <= 0.5 * self.profile.max_pose_error_rot_rad
+                and self._collision_free(candidate, report)
+            ):
+                return candidate, "fast"
 
-        # Normalize manipulability against the measured posture for scoring.
+        base = self._select_collision_free(sorted(pool, key=lambda c: c.base_score), report)
+        if base is not None and not base.near_limit:
+            return base, "base"
+        anchor = min(pool, key=lambda c: c.base_score) if pool else None
+        if anchor is not None:
+            direction = self._scaled_jacobian_svd(anchor, report)
+            if direction is not None:
+                for name, seed in self._make_null_seeds(anchor.qpos, direction):
+                    candidate = self._try_clik(
+                        name, seed, target_base, target, current, previous, pool, report
+                    )
+                    if candidate is not None:
+                        pool.append(candidate)
+            # Known collisions can anchor search, but cannot participate in final selection.
+            viable = [c for c in pool if c.collision_free is not False]
+            weight = self.profile.singularity_margin_weight
+            for candidate in viable:
+                # Dexterity lies in [0, 1], so it cannot reverse a base-score gap
+                # larger than its weight, even if cheaper candidates later collide.
+                if weight <= 0 or not any(
+                    other is not candidate
+                    and abs(other.base_score - candidate.base_score) <= weight
+                    for other in viable
+                ):
+                    continue
+                if candidate.singularity_margin is None:
+                    self._scaled_jacobian_svd(candidate, report)
+                candidate.score = candidate.base_score - weight * candidate.singularity_margin
+                candidate.attempt["score"] = candidate.score
+            selected = self._select_collision_free(sorted(viable, key=lambda c: c.score), report)
+            if selected is not None:
+                return selected, "null" if selected.attempt["seed"].startswith("null_") else "base"
+
+        if self.profile.enable_random_fallback:
+            reference = anchor.qpos if anchor is not None else previous
+            radius = np.deg2rad(self.profile.random_fallback_step_deg)
+            lower = np.maximum(self.operational_limits[:, 0], reference - radius)
+            upper = np.minimum(self.operational_limits[:, 1], reference + radius)
+            if np.all(lower <= upper):
+                seed = self._rng.uniform(lower, upper)
+                candidate = self._try_clik(
+                    "random", seed, target_base, target, current, previous, pool, report
+                )
+                if candidate is not None and self._collision_free(candidate, report):
+                    return candidate, "random"
+        return None, "failed"
+
+    def _try_clik(self, name, seed, target_base, target, current, previous, pool, report):
+        attempt = {"seed": name, "result": "invalid_output", "solve_ms": 0.0}
+        report["attempts"].append(attempt)
+        report["clik_calls"] += 1
+        report["funnel"]["attempted"] += 1
+        model = self.ik_mgr.mp_planner
+        start = time.perf_counter()
         try:
-            mu_current = self.kin.compute_manipulability(current_qpos)
-        except (ValueError, RuntimeError):
-            return None, {
-                "method": "position_ik",
-                "failure_reason": "measured manipulability evaluation failed",
-                "failure_kind": IKFailureKind.INVALID_OUTPUT,
-                "attempts": attempts,
-            }
-        if not np.isfinite(mu_current):
-            return None, {
-                "method": "position_ik",
-                "failure_reason": "measured manipulability is non-finite",
-                "failure_kind": IKFailureKind.INVALID_OUTPUT,
-                "attempts": attempts,
-            }
-
-        seeds = self._make_teleop_seeds(previous_qpos_cmd, current_qpos, profile)
-
-        candidates: list[
-            tuple[np.ndarray, str, float, float]
-        ] = []  # (qpos, seed_name, score, manipulability)
-        seen_qpos: list[np.ndarray] = []
-
-        for seed_name, seed in seeds:
-            _tik0 = time.perf_counter()
-            model = self.ik_mgr.mp_planner
-            raw_qpos, success, _ = model.pinocchio_model.compute_IK_CLIK(
+            raw, converged, _ = model.pinocchio_model.compute_IK_CLIK(
                 model.link_name_2_idx[model.move_group],
-                self.kin.to_mplib_pose(target_pose_base),
-                seed,
+                target_base,
+                seed.copy(),
                 [],
             )
-            _solve_ms = (time.perf_counter() - _tik0) * 1000.0
-            if not success or raw_qpos is None:
-                attempts.append(f"{seed_name}:mplib_failed({_solve_ms:.1f}ms)")
-                continue
+        finally:
+            attempt["solve_ms"] = (time.perf_counter() - start) * 1000.0
+        if raw is not None:
+            raw = self._finite_q(raw)
+        if not converged:
+            attempt["result"] = "solver_no_convergence"
+            return None
+        report["funnel"]["clik_converged"] += 1
+        if raw is None:
+            raise ValueError("CLIK reported convergence without a joint vector")
+        return self._prepare_candidate(raw, attempt, target, current, previous, pool, report)
 
-            raw_qpos = np.asarray(raw_qpos, dtype=np.float64)
-            # Numerical corruption is not an ordinary no-solution outcome.
-            if not np.all(np.isfinite(raw_qpos)):
-                attempts.append(f"{seed_name}:nan_qpos({_solve_ms:.1f}ms)")
-                return None, {
-                    "method": "position_ik",
-                    "failure_reason": "solver returned non-finite qpos",
-                    "failure_kind": IKFailureKind.INVALID_OUTPUT,
-                    "attempts": attempts,
-                }
-            # Canonicalize against physical encoder position to avoid long rotations.
-            qpos = np.asarray(
-                self.ik_mgr.canonicalize_qpos(raw_qpos, current_qpos),
-                dtype=np.float64,
+    def _prepare_candidate(self, raw, attempt, target, current, previous, pool, report):
+        # Mechanical equivalence survives narrowing the operational interval below 2*pi.
+        q = raw.copy()
+        mask = self.ik_mgr.equivalent_joint_mask
+        lo, hi = self.operational_limits.T
+        period = 2 * np.pi
+        k_min, k_max = (
+            np.ceil((lo[mask] - q[mask]) / period),
+            np.floor((hi[mask] - q[mask]) / period),
+        )
+        k = np.minimum(np.maximum(np.rint((current[mask] - q[mask]) / period), k_min), k_max)
+        q[mask] = np.where(k_min <= k_max, q[mask] + period * k, q[mask])
+        if not np.isfinite(q).all():
+            raise ValueError("canonical IK output is non-finite")
+        if np.any(q < lo) or np.any(q > hi):
+            attempt["result"] = "operational_limits"
+            return None
+        report["funnel"]["operational_limits_valid"] += 1
+        if any(np.max(np.abs(q - c.qpos)) < 1e-4 for c in pool):
+            attempt["result"] = "duplicate"
+            return None
+        delta_prev = self.ik_mgr.compute_qpos_delta(q, previous)
+        if np.any(np.abs(delta_prev) > self._jump_limit):
+            attempt["result"] = "jump"
+            return None
+        if self._has_elbow_flip(q, previous):
+            attempt["result"] = "elbow_flip"
+            return None
+        if np.linalg.norm(delta_prev) > np.deg2rad(120):
+            attempt["result"] = "branch_jump_l2"
+            return None
+        report["funnel"]["continuity_valid"] += 1
+        delta = self.ik_mgr.compute_qpos_delta(q, current)
+        distance = float(np.max(np.abs(delta)))
+        if np.max(np.abs(q - current)) - distance > np.deg2rad(90):
+            attempt["result"] = "band_switch"
+            return None
+        if distance > np.deg2rad(150):
+            attempt["result"] = "hw_dist"
+            return None
+        report["funnel"]["hardware_valid"] += 1
+        pos_err, rot_err = compute_pose_error(target, self.kin.compute_eef_pose_world(q))
+        if not np.isfinite((pos_err, rot_err)).all():
+            raise ValueError("IK FK/pose error is non-finite")
+        attempt.update(pos_err_m=pos_err, rot_err_rad=rot_err)
+        p = self.profile
+        if pos_err > p.max_pose_error_pos_m or rot_err > p.max_pose_error_rot_rad:
+            attempt["result"] = "pose_error"
+            return None
+        report["funnel"]["pose_valid"] += 1
+        score = (
+            self.ik_mgr.weighted_joint_distance(q, current, self._weights, delta=delta)
+            + p.previous_command_distance_weight
+            * self.ik_mgr.weighted_joint_distance(
+                q, previous, self._previous_weights, delta=delta_prev
             )
-            if not np.all(np.isfinite(qpos)):
-                attempts.append(f"{seed_name}:canonical_nan({_solve_ms:.1f}ms)")
-                return None, {
-                    "method": "position_ik",
-                    "failure_reason": "canonical IK qpos is non-finite",
-                    "failure_kind": IKFailureKind.INVALID_OUTPUT,
-                    "attempts": attempts,
-                }
-            outside, _ = self.ik_mgr.limit_violation(qpos, self.ik_mgr.joint_limits)
-            if np.any(outside):
-                attempts.append(f"{seed_name}:limits({_solve_ms:.1f}ms)")
-                continue
-            duplicate = False
-            for seen in seen_qpos:
-                seen_delta = self.ik_mgr.compute_qpos_delta(qpos, seen)
-                if not np.all(np.isfinite(seen_delta)):
-                    return None, {
-                        "method": "position_ik",
-                        "failure_reason": "IK qpos delta is non-finite",
-                        "failure_kind": IKFailureKind.INVALID_OUTPUT,
-                        "attempts": attempts,
-                    }
-                duplicate = duplicate or np.max(np.abs(seen_delta)) < 1e-4
-            if duplicate:
-                attempts.append(f"{seed_name}:duplicate({_solve_ms:.1f}ms)")
-                continue
-            seen_qpos.append(qpos.copy())
+            + p.joint_limit_penalty_weight
+            * self.ik_mgr.joint_limit_penalty(q, self.operational_limits)
+            + p.pose_accuracy_weight
+            * (
+                pos_err / p.max_pose_error_pos_m
+                + p.pose_rotation_weight * rot_err / p.max_pose_error_rot_rad
+            )
+        )
+        if not np.isfinite(score):
+            raise ValueError("IK candidate score is non-finite")
+        attempt.update(result="pose_valid", score=score)
+        return _Candidate(
+            q,
+            attempt,
+            pos_err,
+            rot_err,
+            distance,
+            float(np.linalg.norm(delta)),
+            score,
+            bool(np.min(np.minimum(q - lo, hi - q)) < np.deg2rad(p.joint_limit_search_margin_deg)),
+            score=score,
+        )
 
-            jacobian, eef_pose_world = self.kin.compute_eef_jacobian_and_pose_world(qpos)
-            pos_err, rot_err = compute_pose_error(target_eef_pose_world, eef_pose_world)
-            mu = self.kin.manipulability_from_jacobian(jacobian)
-            if not (
-                np.all(np.isfinite(jacobian))
-                and np.isfinite(pos_err)
-                and np.isfinite(rot_err)
-                and np.isfinite(mu)
+    def _collision_free(self, candidate, report):
+        if candidate.collision_free is None:
+            report["collision_checks"] += 1
+            candidate.collision_free = not self.ik_mgr.has_self_collision(candidate.qpos)
+            candidate.attempt["result"] = "ok" if candidate.collision_free else "self_collision"
+            report["funnel"]["collision_free"] += int(candidate.collision_free)
+        return candidate.collision_free
+
+    def _select_collision_free(self, candidates, report):
+        for candidate in candidates:
+            if self._collision_free(candidate, report):
+                return candidate
+        return None
+
+    def _scaled_jacobian_svd(self, candidate, report):
+        report["jacobian_calls"] += 1
+        jacobian = self.kin.compute_eef_jacobian_world(candidate.qpos)
+        if jacobian.shape != (6, 7) or not np.isfinite(jacobian).all():
+            raise ValueError("IK Jacobian must be finite shape (6, 7)")
+        norms = np.array([np.linalg.norm(jacobian[:3]), np.linalg.norm(jacobian[3:])])
+        if not np.isfinite(norms).all():
+            raise ValueError("IK Jacobian block norms are non-finite")
+        if np.any(norms <= _NUMERIC_EPS):
+            candidate.singularity_margin = 0.0
+            candidate.attempt.update(
+                effective_rank=0, singularity_margin=0.0, jacobian_diagnostic="degenerate_block"
+            )
+            return None
+        conditioned = jacobian / np.repeat(norms, 3)[:, None]
+        _, sigma, vh = np.linalg.svd(conditioned, full_matrices=True)
+        if not np.isfinite(sigma).all() or not np.isfinite(vh).all():
+            raise ValueError("conditioned Jacobian SVD is non-finite")
+        rank = int(np.count_nonzero(sigma > _SVD_RANK_RTOL * sigma[0]))
+        candidate.singularity_margin = float(sigma[-1] / max(sigma[0], _NUMERIC_EPS))
+        candidate.attempt.update(
+            effective_rank=rank,
+            singular_values=sigma.tolist(),
+            singularity_margin=candidate.singularity_margin,
+        )
+        return vh[-1] if rank == 6 else None
+
+    def _make_null_seeds(self, anchor, direction):
+        desired = (
+            np.deg2rad(self.profile.redundancy_seed_step_deg)
+            * direction
+            / np.max(np.abs(direction))
+        )
+        seeds = []
+        for sign in (1, -1):
+            delta = sign * desired
+            moving = np.abs(delta) > _NUMERIC_EPS
+            room = np.where(
+                delta > 0,
+                self.operational_limits[:, 1] - anchor,
+                anchor - self.operational_limits[:, 0],
+            )
+            fraction = min(1.0, float(np.min(room[moving] / np.abs(delta[moving]))))
+            if fraction < 1.0:
+                fraction = np.nextafter(fraction, 0.0)
+            seed = anchor + fraction * delta
+            if np.max(np.abs(seed - anchor)) <= 1e-8:
+                continue
+            if np.any(seed < self.operational_limits[:, 0]) or np.any(
+                seed > self.operational_limits[:, 1]
             ):
-                attempts.append(f"{seed_name}:invalid_kinematics({_solve_ms:.1f}ms)")
-                return None, {
-                    "method": "position_ik",
-                    "failure_reason": "IK kinematic acceptance output is non-finite",
-                    "failure_kind": IKFailureKind.INVALID_OUTPUT,
-                    "attempts": attempts,
-                }
-
-            passed, tag = self._validate_ik_candidate(
-                qpos,
-                pos_err,
-                rot_err,
-                mu,
-                previous_qpos_cmd,
-                jump_limit,
-                profile,
-            )
-            if not passed:
-                if tag == "invalid_output":
-                    return None, {
-                        "method": "position_ik",
-                        "failure_reason": "IK validation output is non-finite",
-                        "failure_kind": IKFailureKind.INVALID_OUTPUT,
-                        "attempts": attempts,
-                    }
-                attempts.append(f"{seed_name}:{tag}({_solve_ms:.1f}ms)")
                 continue
+            if not any(np.allclose(seed, old, atol=1e-8, rtol=0) for old in seeds):
+                seeds.append(seed)
+        seeds.sort(key=lambda q: self.ik_mgr.joint_limit_penalty(q, self.operational_limits))
+        return list(zip(("null_preferred", "null_opposite"), seeds))
 
-            delta_current = self.ik_mgr.compute_qpos_delta(qpos, current_qpos)
-            hw_dist_raw = float(np.max(np.abs(qpos - current_qpos)))
-            hw_dist = float(np.max(np.abs(delta_current)))
-            weighted_dist = self.ik_mgr.weighted_joint_distance(
-                qpos, current_qpos, weights, delta=delta_current
-            )
-            if not (
-                np.all(np.isfinite(delta_current))
-                and np.isfinite(hw_dist_raw)
-                and np.isfinite(hw_dist)
-                and np.isfinite(weighted_dist)
-            ):
-                return None, {
-                    "method": "position_ik",
-                    "failure_reason": "IK candidate distance is non-finite",
-                    "failure_kind": IKFailureKind.INVALID_OUTPUT,
-                    "attempts": attempts,
-                }
-
-            _hw_band_mismatch = hw_dist_raw - hw_dist
-            _hw_band_limit_rad = np.deg2rad(90.0)
-            if _hw_band_mismatch > _hw_band_limit_rad:
-                attempts.append(
-                    f"{seed_name}:band_switch(raw={np.rad2deg(hw_dist_raw):.0f}deg, wrapped={np.rad2deg(hw_dist):.0f}deg)"
-                )
-                continue
-
-            _hw_limit_rad = np.deg2rad(150.0)
-            if hw_dist > _hw_limit_rad:
-                attempts.append(
-                    f"{seed_name}:hw_dist({_solve_ms:.1f}ms, {np.rad2deg(hw_dist):.0f}deg)"
-                )
-                continue
-
-            attempts.append(f"{seed_name}:ok({_solve_ms:.1f}ms)")
-
-            if (
-                seed_name == "prev_cmd"
-                and hw_dist <= fast_accept_rad
-                # Fast-accept only when the previous-command solution tracks target.
-                and pos_err <= 0.5 * profile.max_pose_error_pos_m
-                and rot_err <= 0.5 * profile.max_pose_error_rot_rad
-            ):
-                return qpos, {
-                    "method": "position_ik",
-                    "seed": seed_name,
-                    "attempts": attempts,
-                }
-
-            score = self._score_candidate(
-                weighted_dist=weighted_dist,
-                manipulability=mu,
-                pos_err=pos_err,
-                rot_err=rot_err,
-                qpos=qpos,
-                previous_qpos_cmd=previous_qpos_cmd,
-                profile=profile,
-                mu_current=mu_current,
-            )
-            if not np.isfinite(score):
-                return None, {
-                    "method": "position_ik",
-                    "failure_reason": "IK candidate score is non-finite",
-                    "failure_kind": IKFailureKind.INVALID_OUTPUT,
-                    "attempts": attempts,
-                }
-            candidates.append((qpos.copy(), seed_name, score, mu))
-
-        if candidates:
-            candidates.sort(key=lambda c: c[2])  # lower score = better
-            best_qpos, best_name, best_score, best_mu = candidates[0]
-            return best_qpos, {
-                "method": "position_ik",
-                "seed": best_name,
-                "num_candidates": len(candidates),
-                "best_score": round(best_score, 4),
-                "best_manipulability": round(best_mu, 4),
-                "attempts": attempts,
-            }
-
-        return None, {
-            "method": "position_ik",
-            "failure_reason": f"all failed: {attempts}",
-            "attempts": attempts,
-        }
-
-    def _validate_ik_candidate(
-        self,
-        qpos: np.ndarray,
-        pos_err: float,
-        rot_err: float,
-        mu: float,
-        previous_qpos_cmd: np.ndarray,
-        jump_limit: np.ndarray,
-        profile: OnlineIKConfig,
-    ) -> tuple[bool, str]:
-        """Validate IK pose, manipulability, branch continuity and endpoint self-collision.
-
-        Returns (passed, tag) — tag is the first failing check name or "ok".
-        """
-        if pos_err > profile.max_pose_error_pos_m or rot_err > profile.max_pose_error_rot_rad:
-            return False, "pose_err"
-
-        if (
-            profile.position_ik_min_manipulability > 0
-            and mu < profile.position_ik_min_manipulability
-        ):
-            return False, "manipulability"
-
-        delta_prev = self.ik_mgr.compute_qpos_delta(qpos, previous_qpos_cmd)
-        if not np.all(np.isfinite(delta_prev)):
-            return False, "invalid_output"
-        if np.any(np.abs(delta_prev) > jump_limit):
-            return False, "jump"
-
-        if self._has_elbow_flip(qpos, previous_qpos_cmd):
-            return False, "elbow_flip"
-
-        # Catch multi-joint branch jumps that the J4-only elbow check misses.
-        if float(np.linalg.norm(delta_prev)) > np.deg2rad(120):
-            return False, "branch_jump_l2"
-
-        if self.ik_mgr.has_self_collision(qpos):
-            return False, "self_collision"
-
-        return True, "ok"
-
-    def _make_teleop_seeds(
-        self,
-        prev_cmd: np.ndarray,
-        current_qpos: np.ndarray,
-        profile: OnlineIKConfig,
-    ) -> list[tuple[str, np.ndarray]]:
-        """Try the previous command, measured pose, then perturbed seeds."""
-        seeds: list[tuple[str, np.ndarray]] = [
-            ("prev_cmd", prev_cmd.copy()),
-            ("current_qpos", current_qpos.copy()),
-        ]
-        offsets_rad = np.deg2rad(profile.position_ik_seed_offset_deg)
-        for i in range(profile.position_ik_num_random_seeds):
-            seed = prev_cmd + self._rng.uniform(-offsets_rad, offsets_rad, self.kin.dof)
-            seeds.append((f"random_{i}", seed))
-        unique: list[tuple[str, np.ndarray]] = []
-        for item in seeds:
-            if not any(
-                np.allclose(item[1], previous[1], atol=1e-8, rtol=0.0) for previous in unique
-            ):
-                unique.append(item)
-        return unique
-
-    def _score_candidate(
-        self,
-        weighted_dist: float,
-        manipulability: float,
-        pos_err: float,
-        rot_err: float,
-        qpos: np.ndarray,
-        previous_qpos_cmd: np.ndarray,
-        profile: OnlineIKConfig,
-        mu_current: float,
-    ) -> float:
-        """Score an IK candidate (lower is better).
-
-        = weighted_joint_distance + velocity_weight*velocity_dist
-          - manipulability_weight*normalized_mu + limit_penalty_weight*penalty
-          + pose_accuracy_weight*pose_cost.
-        """
-        limit_penalty = self.ik_mgr.joint_limit_penalty(qpos, self.ik_mgr.joint_limits)
-
-        vel_weights = (
-            profile.velocity_joint_weights
-            if profile.velocity_joint_weights is not None
-            else profile.joint_weights
-        )
-        velocity_dist = self.ik_mgr.weighted_joint_distance(qpos, previous_qpos_cmd, vel_weights)
-
-        # Normalize Yoshikawa manipulability to a unitless [0, 1] score.
-        normalized_mu = min(manipulability / max(mu_current, 1e-9), 1.0)
-
-        pose_cost = pos_err / max(
-            profile.max_pose_error_pos_m, 1e-6
-        ) + profile.position_ik_pose_rot_weight * (
-            rot_err / max(profile.max_pose_error_rot_rad, 1e-6)
-        )
-
-        return (
-            weighted_dist
-            + profile.position_ik_velocity_weight * velocity_dist
-            - profile.position_ik_manipulability_weight * normalized_mu
-            + profile.position_ik_limit_penalty_weight * limit_penalty
-            + profile.position_ik_pose_accuracy_weight * pose_cost
-        )
-
-    def _has_elbow_flip(self, candidate_qpos: np.ndarray, previous_qpos_cmd: np.ndarray) -> bool:
-        """Return True if candidate would cause an elbow branch flip vs previous command."""
-        prev_j4 = float(previous_qpos_cmd[self._elbow_joint_index])
-        cand_j4 = float(candidate_qpos[self._elbow_joint_index])
-        delta_j4 = abs(cand_j4 - prev_j4)
-
-        if prev_j4 < self._ELBOW_FLIP_NEG_THRESH_RAD and cand_j4 > self._ELBOW_FLIP_POS_THRESH_RAD:
-            return bool(delta_j4 > self._ELBOW_FLIP_MIN_DELTA_RAD)
-        if cand_j4 < self._ELBOW_FLIP_NEG_THRESH_RAD and prev_j4 > self._ELBOW_FLIP_POS_THRESH_RAD:
-            return bool(delta_j4 > self._ELBOW_FLIP_MIN_DELTA_RAD)
-        return False
-
-    @staticmethod
-    def _attempt_tag(attempt: str) -> str:
-        """Extract the rejection tag from an attempt string ``seed:tag(...)``."""
-        if ":" not in attempt:
-            return attempt
-        return attempt.split(":", 1)[1].split("(", 1)[0]
-
-    @classmethod
-    def _classify_attempts(cls, attempts: list[str]) -> str:
-        """Classify a failed IK run from its per-attempt tags.
-
-        ``unreachable`` is reserved for when *every* seed failed to converge.
-        Otherwise report the candidate rejection criterion, including
-        continuity, hardware distance, limits, pose error and self-collision.
-        """
-        tag_set = {cls._attempt_tag(a) for a in attempts}
-        if not tag_set:
-            return "unknown"
-        if tag_set == {"mplib_failed"}:
-            return "unreachable"
-        if tag_set & {"jump", "elbow_flip", "branch_jump_l2"}:
-            return "delta"
-        if tag_set & {"hw_dist", "band_switch"}:
-            return "hw_dist"
-        if "limits" in tag_set:
-            return "limits"
-        if "pose_err" in tag_set:
-            return "pose_error"
-        if "manipulability" in tag_set:
-            return "manipulability"
-        if "self_collision" in tag_set:
-            return "self_collision"
-        return "all_filtered"
-
-    @classmethod
-    def _build_diagnostic(cls, report: dict[str, Any]) -> dict[str, Any]:
-        """Classify failed IK attempts for local diagnostics."""
-        attempts = report.get("attempts")
-        classification = (
-            "invalid_output"
-            if report.get("failure_kind") == IKFailureKind.INVALID_OUTPUT
-            else cls._classify_attempts(attempts or [])
-        )
-        failure_reason = str(report.get("failure_reason", ""))
-        return {
-            "classification": classification,
-            "summary": f"Position IK [{classification}]: {failure_reason}",
-        }
-
-    def _failed_solution(
-        self,
-        qpos_cmd: np.ndarray,
-        current_qpos: np.ndarray,
-        reason: str,
-        report: dict[str, Any],
-        failure_kind: IKFailureKind = IKFailureKind.GEOMETRY_REJECTED,
-        **extra: Any,
-    ) -> IKResult:
-        """Build a failed IK result."""
-        try:
-            qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
-        except Exception:
-            qpos_delta = None
-        max_qpos_cmd_delta_deg: float | None = None
-        if qpos_delta is not None and np.all(np.isfinite(qpos_delta)):
-            max_qpos_cmd_delta_deg = float(np.rad2deg(np.max(np.abs(qpos_delta))))
-        failure_report = {
-            **report,
-            **extra,
-        }
-        if max_qpos_cmd_delta_deg is not None:
-            failure_report["max_qpos_cmd_delta_deg"] = max_qpos_cmd_delta_deg
-        return IKResult(
-            success=False,
-            qpos=None,
-            reason=reason,
-            report=failure_report,
-            failure_kind=failure_kind,
-        )
-
-    def _command_from_target_qpos(
-        self,
-        target_eef_pose_world: Pose,
-        current_qpos: np.ndarray,
-        target_qpos: np.ndarray,
-        profile: OnlineIKConfig,
-        report: dict[str, Any],
-    ) -> IKResult:
-        """Refine, verify FK error, and assemble IKResult."""
-        qpos_cmd = np.asarray(target_qpos, dtype=np.float64).copy()
-        if not np.all(np.isfinite(qpos_cmd)):
-            return self._failed_solution(
-                qpos_cmd,
-                current_qpos,
-                "Final IK command is non-finite",
-                report,
-                failure_kind=IKFailureKind.INVALID_OUTPUT,
-            )
-
-        # Null-space repulsion preserves EEF pose only to first order; validate FK below.
-        if profile.enable_nullspace_optimization:
-            try:
-                jacobian, _ = self.kin.compute_eef_jacobian_and_pose_world(qpos_cmd)
-                qpos_cmd = apply_nullspace_optimization(
-                    qpos_cmd,
-                    jacobian,
-                    self.ik_mgr.joint_limits,
-                    step_size_rad=np.deg2rad(profile.nullspace_step_size_deg),
-                    margin_deg=profile.nullspace_joint_limit_margin_deg,
-                )
-            except (ValueError, RuntimeError):
-                _now = time.monotonic()
-                if _now - self._nullspace_warn_last_s > 5.0:
-                    logger.warning(
-                        "Nullspace optimization failed — joint-limit repulsion degraded",
-                        exc_info=True,
-                    )
-                    self._nullspace_warn_last_s = _now
-
-        qpos_cmd = np.asarray(
-            self.ik_mgr.canonicalize_qpos(qpos_cmd, current_qpos), dtype=np.float64
-        )
-        if not np.all(np.isfinite(qpos_cmd)):
-            return self._failed_solution(
-                qpos_cmd,
-                current_qpos,
-                "Final canonical IK command is non-finite",
-                report,
-                failure_kind=IKFailureKind.INVALID_OUTPUT,
-            )
-        outside, _ = self.ik_mgr.limit_violation(qpos_cmd, self.ik_mgr.joint_limits)
-        if np.any(outside):
-            return self._failed_solution(
-                qpos_cmd,
-                current_qpos,
-                "Final IK command violates joint limits",
-                report,
-            )
-
-        cmd_pos_error, cmd_rot_error = self.kin.compute_world_pose_error(
-            target_eef_pose_world, qpos_cmd
-        )
-        if not (np.isfinite(cmd_pos_error) and np.isfinite(cmd_rot_error)):
-            return self._failed_solution(
-                qpos_cmd,
-                current_qpos,
-                "Final IK pose error is non-finite",
-                report,
-                failure_kind=IKFailureKind.INVALID_OUTPUT,
-            )
-        if (
-            cmd_pos_error > profile.max_pose_error_pos_m
-            or cmd_rot_error > profile.max_pose_error_rot_rad
-        ):
-            return self._failed_solution(
-                qpos_cmd,
-                current_qpos,
-                "Final IK command exceeds pose-error limits",
-                report,
-                cmd_tracking_error_pos_m=cmd_pos_error,
-                cmd_tracking_error_rot_rad=cmd_rot_error,
-            )
-
-        # Refinement can change a previously collision-free candidate.
-        if self.ik_mgr.has_self_collision(qpos_cmd):
-            return self._failed_solution(
-                qpos_cmd,
-                current_qpos,
-                "self_collision",
-                report,
-            )
-
-        qpos_delta = self.ik_mgr.compute_qpos_delta(qpos_cmd, current_qpos)
-        if not np.all(np.isfinite(qpos_delta)):
-            return self._failed_solution(
-                qpos_cmd,
-                current_qpos,
-                "Final IK command delta is non-finite",
-                report,
-                failure_kind=IKFailureKind.INVALID_OUTPUT,
-            )
-        result_report = {
-            **report,
-            "cmd_tracking_error_pos_m": cmd_pos_error,
-            "cmd_tracking_error_rot_rad": cmd_rot_error,
-            "qpos_distance_to_current": float(np.linalg.norm(qpos_delta)),
-            "max_qpos_cmd_delta_deg": float(np.rad2deg(np.max(np.abs(qpos_delta)))),
-        }
-        return IKResult(success=True, qpos=qpos_cmd, report=result_report)
-
-
-def nullspace_projector(J: np.ndarray, rcond: float = 1e-6) -> np.ndarray:
-    """Compute null-space projector N = I - J⁺J via SVD.
-
-    For xArm7 (6×7 Jacobian, rank 6): N is 7×7, symmetric, idempotent,
-    with one eigenvalue ≈ 1 and six ≈ 0.
-    """
-    if J.ndim != 2 or not np.all(np.isfinite(J)):
-        raise ValueError("Jacobian must be a finite 2-D array")
-    return np.eye(J.shape[1]) - np.linalg.pinv(J, rcond=rcond) @ J
-
-
-def joint_limit_gradient(
-    qpos: np.ndarray,
-    joint_limits: np.ndarray,
-    margin_deg: float = 15.0,
-) -> np.ndarray:
-    """Quadratic repulsive gradient from joint limits (C¹ continuous).
-
-    V(q) = ((margin-d)/margin)² for d < margin, else 0.
-    NaN-safe: returns zeros on non-finite input.
-    """
-    if not np.all(np.isfinite(qpos)):
-        return np.zeros_like(qpos)
-
-    margin = np.deg2rad(margin_deg)
-    low = joint_limits[:, 0]
-    high = joint_limits[:, 1]
-    grad = np.zeros(qpos.shape[0], dtype=np.float64)
-
-    for i in range(qpos.shape[0]):
-        d_low = qpos[i] - low[i]
-        d_high = high[i] - qpos[i]
-
-        if d_low < margin:
-            grad[i] = 2.0 * (margin - d_low) / (margin * margin)
-        elif d_high < margin:
-            grad[i] = -2.0 * (margin - d_high) / (margin * margin)
-
-    return grad
-
-
-def apply_nullspace_optimization(
-    qpos: np.ndarray,
-    jacobian: np.ndarray,
-    joint_limits: np.ndarray,
-    step_size_rad: float = np.deg2rad(1.0),
-    margin_deg: float = 15.0,
-) -> np.ndarray:
-    """Apply null-space joint-limit repulsion.
-
-    Projects the limit gradient into the self-motion manifold using the
-    null-space projector (J @ (qpos' - qpos) ≈ 0).  No posture objective is
-    applied away from joint limits: a fixed-magnitude homeward step can cross
-    the IK solution on successive frames and create a period-two command.
-    """
-    grad = joint_limit_gradient(qpos, joint_limits, margin_deg)
-
-    if not np.any(grad):
-        return qpos
-
-    N = nullspace_projector(jacobian)
-    dq = N @ grad
-    dq_max = float(np.max(np.abs(dq)))
-
-    if dq_max > step_size_rad and dq_max > 1e-12:
-        dq *= step_size_rad / dq_max
-
-    qpos_new = qpos + dq
-    # Skip refinement if the projected qpos crosses a hard joint limit.
-    if np.any(qpos_new < joint_limits[:, 0] - 1e-5) or np.any(qpos_new > joint_limits[:, 1] + 1e-5):
-        return qpos
-    return qpos_new
+    def _has_elbow_flip(self, candidate_qpos, previous_qpos_cmd):
+        prev = float(previous_qpos_cmd[self._elbow_joint_index])
+        cand = float(candidate_qpos[self._elbow_joint_index])
+        crosses = (
+            prev < self._ELBOW_FLIP_NEG_THRESH_RAD and cand > self._ELBOW_FLIP_POS_THRESH_RAD
+        ) or (cand < self._ELBOW_FLIP_NEG_THRESH_RAD and prev > self._ELBOW_FLIP_POS_THRESH_RAD)
+        return crosses and abs(cand - prev) > self._ELBOW_FLIP_MIN_DELTA_RAD

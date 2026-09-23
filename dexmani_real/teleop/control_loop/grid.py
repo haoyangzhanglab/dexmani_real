@@ -4,11 +4,12 @@ import numpy as np
 
 from dexmani_real.planning import Pose
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.recording.frame import build_episode_frame
 from dexmani_real.recording.storage.schema import FRAME_IK_FAIL, FRAME_OK, FRAME_RETARGET_FAIL
 from dexmani_real.robot.commands import RobotCommand, publish_command
-from dexmani_real.robot.projection import project_arm_command, project_hand_command
+from dexmani_real.robot.projection import project_hand_command
 from dexmani_real.teleop.control_loop.action_proposal import compute_target_eef_pose
 from dexmani_real.teleop.control_loop.hand_control import (
     HandRetargetObservationCache,
@@ -83,20 +84,16 @@ class TeleopController:
             except (ValueError, RuntimeError):
                 return None, FRAME_RETARGET_FAIL, intent
             self.planner.set_hand_qpos(hand)
-        solution = self.planner.solve_teleop_ik(
+        solution = self.planner.solve_online_ik(
             Pose(p=target.position_world_m, q=target.quat_world_wxyz),
             row.arm["qpos"][0],
             self.prev_qpos_cmd,
         )
+        if solution.failure_kind == IKFailureKind.INVALID_OUTPUT:
+            raise RuntimeError(f"online IK technical failure: {solution.reason}")
         if not solution.success:
             return None, FRAME_IK_FAIL, intent
-        arm = project_arm_command(
-            solution.qpos,
-            row.arm["qpos"][0],
-            joint_lower_rad=cfg.arm.joint_limit_lower,
-            joint_upper_rad=cfg.arm.joint_limit_upper,
-        )
-        self.ema_pos, self.ema_quat = target.position_world_m, target.quat_world_wxyz
+        arm = solution.qpos
         return RobotCommand(run_id, arm, hand), FRAME_OK, intent
 
 
@@ -108,6 +105,8 @@ def run_control_grid_tick(controller, shared, row, recorder=None):
         return status
     if stamp:
         controller.prev_qpos_cmd = target.arm_qpos.copy()
+        controller.ema_pos = intent[:3].copy()
+        controller.ema_quat = rot6d_to_quat_wxyz(intent[3:])
     if recorder is not None and recorder.is_recording:
         recorder.add_frame(
             build_episode_frame(

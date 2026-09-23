@@ -53,12 +53,11 @@ class DeploymentSmoke(unittest.TestCase):
 
     def test_online_ik_profile(self):
         runtime = resolve_experiment_config()
-        dt = 1.0 / runtime.teleop.control_hz
-        profile = make_online_ik_config(runtime, control_dt_s=dt)
-        self.assertEqual(
-            profile.nullspace_step_size_deg, runtime.policy.ik_nullspace_step_rate_deg_s * dt
-        )
-        self.assertEqual(profile, make_online_ik_config(runtime, control_dt_s=dt))
+        profile = make_online_ik_config(runtime)
+        self.assertEqual(profile.operational_joint_lower_rad, tuple(runtime.arm.joint_limit_lower))
+        self.assertEqual(profile.operational_joint_upper_rad, tuple(runtime.arm.joint_limit_upper))
+        self.assertFalse(profile.enable_random_fallback)
+        self.assertEqual(profile, make_online_ik_config(runtime))
 
 
 class TablePlaneSmoke(unittest.TestCase):
@@ -467,18 +466,19 @@ class NumericalDeploymentSmoke(unittest.TestCase):
         arm = np.asarray(runtime.arm.home_qpos)
         hand = np.deg2rad(runtime.hand.home_qpos_deg)
         result = decode_policy_action(np.r_[arm, hand], "joint", planner=None, **kwargs)
-        np.testing.assert_array_equal(result[0], arm)
-        np.testing.assert_array_equal(result[1], hand)
-        planner = make_action_planner("eef", runtime, control_dt_s=1 / 30)
+        np.testing.assert_array_equal(result.arm_qpos, arm)
+        np.testing.assert_array_equal(result.hand_qpos, hand)
+        planner = make_action_planner("eef", runtime)
         self.assertEqual(
-            planner.teleop_profile, make_online_ik_config(runtime, control_dt_s=1 / 30)
+            planner.online_ik_profile, make_online_ik_config(runtime, enable_random_fallback=True)
         )
         position, rotation = make_arm_fk().compute(arm)
         result = decode_policy_action(
             np.r_[position, rotation, hand], "eef", planner=planner, **kwargs
         )
-        self.assertIsNotNone(result[0])
-        actual_p, actual_r = make_arm_fk().compute(result[0])
+        self.assertIsNotNone(result.arm_qpos)
+        self.assertIs(result.arm_qpos, result.ik_result.qpos)
+        actual_p, actual_r = make_arm_fk().compute(result.arm_qpos)
         np.testing.assert_allclose(
             actual_p,
             np.clip(position, kwargs["workspace"][:, 0], kwargs["workspace"][:, 1]),
@@ -488,13 +488,15 @@ class NumericalDeploymentSmoke(unittest.TestCase):
         from unittest.mock import Mock
 
         failed = Mock()
-        failed.solve_teleop_ik.return_value = SimpleNamespace(success=False, qpos=None)
+        failed.solve_online_ik.return_value = SimpleNamespace(success=False, qpos=None)
         extreme_hand = hand + 100
         result = decode_policy_action(
             np.r_[position, rotation, extreme_hand], "eef", planner=failed, **kwargs
         )
-        self.assertIsNone(result[0])
-        np.testing.assert_array_equal(failed.set_hand_qpos.call_args.args[0], result[1])
+        self.assertIsNone(result.arm_qpos)
+        self.assertIs(result.ik_result, failed.solve_online_ik.return_value)
+        failed.solve_online_ik.assert_called_once()
+        np.testing.assert_array_equal(failed.set_hand_qpos.call_args.args[0], result.hand_qpos)
         for bad in (np.zeros(18), np.full(19, np.nan)):
             with self.assertRaises(ValueError):
                 decode_policy_action(bad, "joint", planner=None, **kwargs)

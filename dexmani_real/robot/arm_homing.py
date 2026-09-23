@@ -8,7 +8,8 @@ import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.channels import read_arm_state
-from dexmani_real.planning import OnlineIKConfig, Pose, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
+from dexmani_real.planning.kinematics.ik import make_online_ik_config
 from dexmani_real.planning.paths import (
     HomePathStatus,
     compute_band_alignment_path,
@@ -181,10 +182,7 @@ def build_policy_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
             base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
             workspace_bounds=workspace,
         ),
-        teleop_profile=OnlineIKConfig(
-            max_pose_error_pos_m=float(policy.ik_max_pose_error_pos_m),
-            max_pose_error_rot_rad=float(policy.ik_max_pose_error_rot_rad),
-        ),
+        online_ik_profile=make_online_ik_config(runtime),
         hand_dof=True,
         static_boxes=tuple(runtime.environment.static_boxes),
         table=runtime.environment.table,

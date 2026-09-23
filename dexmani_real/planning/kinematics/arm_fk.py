@@ -108,7 +108,7 @@ def compute_eef_pose_history_xarm_base(
 
 
 class XArm7Kinematics:
-    """Full kinematics with MPlib integration — FK, Jacobian, pose transforms, manipulability."""
+    """Full kinematics with MPlib integration — FK, Jacobian, pose transforms."""
 
     def __init__(
         self,
@@ -162,80 +162,25 @@ class XArm7Kinematics:
             return Pose(p=np.full(3, np.nan), q=np.full(4, np.nan))
         return pose_world
 
-    def compute_eef_jacobian(self, qpos: np.ndarray) -> np.ndarray:
-        # Entry points validate qpos and the base pose before this hot path.
+    def compute_eef_jacobian_world(self, qpos: np.ndarray) -> np.ndarray:
+        """Return [EEF linear velocity; angular velocity] in world axes."""
         if not np.all(np.isfinite(qpos)):
-            raise ValueError(f"compute_eef_jacobian: qpos contains NaN or Inf")
+            raise ValueError("compute_eef_jacobian_world: qpos contains NaN or Inf")
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
         self.pinocchio_model.compute_forward_kinematics(full_qpos)
         jacobian = np.asarray(
             self.pinocchio_model.compute_single_link_jacobian(full_qpos, self.eef_link_id, False),
             dtype=np.float64,
         )
-        if jacobian.shape[1] < self.dof:
-            raise RuntimeError(f"Jacobian has {jacobian.shape[1]} columns but dof is {self.dof}.")
-        return jacobian[:, : self.dof]
-
-    def compute_eef_jacobian_and_pose_world(self, qpos: np.ndarray) -> tuple[np.ndarray, "Pose"]:
-        """Return (jacobian, pose_world) from one FK computation.
-
-        Both use the world frame; Jacobian columns map joint velocities to
-        spatial velocity [v_world; omega_world].
-        """
-        # Reject NaN/Inf before Pinocchio FK to protect the C++ engine.
-        if not np.all(np.isfinite(qpos)):
-            raise ValueError("compute_eef_jacobian_and_pose_world: qpos contains NaN or Inf")
-        full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
-        self.pinocchio_model.compute_forward_kinematics(full_qpos)
-
-        # Pinocchio returns this Jacobian in the fixed-base frame.
-        jacobian_full = np.asarray(
-            self.pinocchio_model.compute_single_link_jacobian(full_qpos, self.eef_link_id, False),
-            dtype=np.float64,
-        )
-        if jacobian_full.shape[1] < self.dof:
-            raise RuntimeError(
-                f"Jacobian has {jacobian_full.shape[1]} columns but dof is {self.dof}."
-            )
-        jacobian_base = jacobian_full[:, : self.dof]
-
-        # Pose (base frame) — extracted from already-computed FK, no extra FK call.
-        link_pose = self.pinocchio_model.get_link_pose(self.eef_link_id)
-        pose_base = Pose(
-            p=np.asarray(link_pose.p, dtype=np.float64),
-            q=np.asarray(link_pose.q, dtype=np.float64),
-        )
-
-        # Transform spatial velocity from base frame to world frame.
-        R_b2w = quat_wxyz_to_rotmat(self.base_pose_world.q)
-        jacobian_world = np.empty_like(jacobian_base)
-        jacobian_world[:3, :] = R_b2w @ jacobian_base[:3, :]  # linear part
-        jacobian_world[3:, :] = R_b2w @ jacobian_base[3:, :]  # angular part
-
-        pose_world = self.base_to_world_pose(pose_base)
-
-        return jacobian_world, pose_world
-
-    def compute_manipulability(self, qpos: np.ndarray) -> float:
-        """Yoshikawa manipulability measure: sqrt(det(J * J^T)).
-
-        If you already have the Jacobian, use :meth:`manipulability_from_jacobian`
-        to avoid a redundant FK+Jacobian computation.
-        """
-        J = self.compute_eef_jacobian(qpos)
-        return self.manipulability_from_jacobian(J)
-
-    @staticmethod
-    def manipulability_from_jacobian(J: np.ndarray) -> float:
-        """Compute Yoshikawa sqrt(det(J @ J.T)) from a (6, dof) Jacobian, without FK.
-
-        Clamped to >= 0; non-finite inputs return 0 to trigger rejection gates.
-        """
-        if not np.all(np.isfinite(J)):
-            return 0.0
-        JJT = J @ J.T
-        det = float(np.linalg.det(JJT))
-        return np.sqrt(max(det, 0.0))
+        if jacobian.ndim != 2 or jacobian.shape[0] != 6 or jacobian.shape[1] < self.dof:
+            raise RuntimeError(f"Expected a (6, >= {self.dof}) Jacobian, got {jacobian.shape}")
+        jacobian = jacobian[:, : self.dof]
+        position = np.asarray(self.pinocchio_model.get_link_pose(self.eef_link_id).p)
+        # Pinocchio WORLD spatial twists refer to the base origin. Shift their
+        # linear component to the EEF origin before conditioning the two blocks.
+        linear = jacobian[:3] + np.cross(jacobian[3:].T, position).T
+        rotation = quat_wxyz_to_rotmat(self.base_pose_world.q)
+        return np.vstack((rotation @ linear, rotation @ jacobian[3:]))
 
     def compute_world_pose_error(
         self, target_eef_pose_world: Pose, qpos: np.ndarray

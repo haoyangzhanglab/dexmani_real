@@ -214,13 +214,8 @@ def _check_home_path_candidate(
     """Validate one dense path and return its first safety rejection."""
     sample_count = len(path)
     if planner.planning_profile.check_self_collision:
-        path_check = getattr(
-            planner.ik_mgr,
-            "check_path_combined_collisions",
-            planner.ik_mgr.check_path_collisions,
-        )
         try:
-            collision_result = path_check(path)
+            collision_result = planner.ik_mgr.check_path_combined_collisions(path)
         except Exception as exc:
             return HomePathCandidate(
                 candidate_name,
@@ -229,9 +224,7 @@ def _check_home_path_candidate(
                 sample_count=sample_count,
                 detail=str(exc),
             )
-        if collision_result.get(
-            "path_collision", collision_result.get("path_self_collision", False)
-        ):
+        if collision_result["path_collision"]:
             pairs = _collision_pairs(collision_result.get("collision"))
             reason = (
                 "environment_collision"

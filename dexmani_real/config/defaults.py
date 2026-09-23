@@ -446,6 +446,7 @@ class HandParams:
     home_timeout_s: float = 1.0
 
     fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
+    # Real adapter is 10 mm thinner than nominal CAD/URDF (-0.005 m mount).
     T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
     T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = (
         0.707107,
@@ -570,7 +571,6 @@ class PolicyParams:
 
     ik_max_pose_error_pos_m: float = 0.02
     ik_max_pose_error_rot_rad: float = np.deg2rad(5.0)
-    ik_nullspace_step_rate_deg_s: float = 50.0
 
     hand_enabled: bool = True
     hand_retargeting_type: str = "tag"
@@ -595,12 +595,10 @@ class PolicyParams:
         if (
             not np.isfinite(self.ik_max_pose_error_pos_m)
             or not np.isfinite(self.ik_max_pose_error_rot_rad)
-            or not np.isfinite(self.ik_nullspace_step_rate_deg_s)
             or self.ik_max_pose_error_pos_m <= 0
             or self.ik_max_pose_error_rot_rad <= 0
-            or self.ik_nullspace_step_rate_deg_s <= 0
         ):
-            raise ValueError("policy teleop IK limits must be finite and positive")
+            raise ValueError("policy online IK limits must be finite and positive")
         if self.hand_retargeting_type not in {"tag", "dexpilot"}:
             raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")
 

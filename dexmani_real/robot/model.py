@@ -86,7 +86,7 @@ XARM7_XHAND_SRDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand.srdf"
 XHAND_RIGHT_URDF_PATH = XHAND_MODEL_DIR / "xhand_right.urdf"
 
 # Hand joint order remap: XHand SDK → URDF / Pinocchio.
-_HAND_URDF_JOINT_NAMES: tuple[str, ...] = (
+XHAND_URDF_JOINT_NAMES: tuple[str, ...] = (
     "right_hand_index_bend_joint",
     "right_hand_index_joint1",
     "right_hand_index_joint2",
@@ -101,7 +101,7 @@ _HAND_URDF_JOINT_NAMES: tuple[str, ...] = (
     "right_hand_thumb_rota_joint2",
 )
 HAND_SDK_TO_URDF_IDX: tuple[int, ...] = tuple(
-    XHAND_SDK_JOINT_NAMES.index(name) for name in _HAND_URDF_JOINT_NAMES
+    XHAND_SDK_JOINT_NAMES.index(name) for name in XHAND_URDF_JOINT_NAMES
 )
 
 # Mechanical limits from the xArm7 robot model, radians.

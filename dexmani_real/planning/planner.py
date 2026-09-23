@@ -63,18 +63,17 @@ class MotionPlanningConfig:
 
 
 class XArm7MotionPlanner:
-    """Online IK and the current collision-checked home fallback.
+    """Online IK and collision-checked home planning.
 
     ``kin`` owns FK/Jacobians, ``ik_mgr`` owns joint/IK geometry, and
-    ``collision_model`` owns the current 19-DOF collision model. There is no
-    general Cartesian goal planner or multi-strategy candidate search.
+    ``collision_model`` owns the 19-DOF collision model.
     """
 
     def __init__(
         self,
         config: XArm7PlannerConfig,
         planning_profile: MotionPlanningConfig | None = None,
-        teleop_profile: OnlineIKConfig | None = None,
+        online_ik_profile: OnlineIKConfig | None = None,
         hand_dof: bool = True,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
@@ -84,7 +83,7 @@ class XArm7MotionPlanner:
         self.mplib = mplib
         self.config = config
         self.planning_profile = planning_profile or MotionPlanningConfig()
-        self.teleop_profile = teleop_profile or OnlineIKConfig()
+        self.online_ik_profile = online_ik_profile or OnlineIKConfig()
         self.workspace_bounds = None
         if config.workspace_bounds is not None:
             bounds = np.asarray(config.workspace_bounds, dtype=np.float64)
@@ -134,7 +133,7 @@ class XArm7MotionPlanner:
             joint_limits[:, 1], _cfg_upper, atol=1e-3
         ):
             logger.warning(
-                "URDF joint limits differ from defaults.arm — using URDF values.\n"
+                "URDF model limits differ from defaults.arm operational limits.\n"
                 "  URDF lower:  %s\n  defaults:    %s\n"
                 "  URDF upper:  %s\n  defaults:    %s",
                 joint_limits[:, 0],
@@ -169,10 +168,10 @@ class XArm7MotionPlanner:
         self.ik_mgr = IKGeometry(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
-        self.teleop_solver = OnlineIKSolver(
+        self.online_ik_solver = OnlineIKSolver(
             self.kin,
             self.ik_mgr,
-            self.teleop_profile,
+            self.online_ik_profile,
             elbow_joint_index=self._elbow_joint_index,
         )
 
@@ -184,29 +183,19 @@ class XArm7MotionPlanner:
     def create_default(
         cls,
         planning_profile: MotionPlanningConfig | None = None,
-        teleop_profile: OnlineIKConfig | None = None,
+        online_ik_profile: OnlineIKConfig | None = None,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
     ) -> "XArm7MotionPlanner":
-        """Factory with canonical URDF/SRDF and identity base_pose_world.
-
-        Centralises the invariant planner setup shared by keyboard_teleop and
-        calibrate_camera. Callers pass their own
-        *planning_profile* / *teleop_profile* to match their use case (teleop
-        tolerances are intentionally looser than the dataclass defaults).
-        """
+        """Build online IK and home planning with canonical assets and an identity base pose."""
         cfg = XArm7PlannerConfig(
             urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
             srdf_path=str(XARM7_XHAND_SRDF_PATH),
-            base_pose_world=Pose(
-                p=np.array([0.0, 0.0, 0.0]),
-                q=np.array([1.0, 0.0, 0.0, 0.0]),
-            ),
         )
         return cls(
             cfg,
-            planning_profile=planning_profile or MotionPlanningConfig(),
-            teleop_profile=teleop_profile or OnlineIKConfig(),
+            planning_profile=planning_profile,
+            online_ik_profile=online_ik_profile,
             static_boxes=static_boxes,
             table=table,
         )
@@ -225,10 +214,10 @@ class XArm7MotionPlanner:
     def set_base_pose(self, base_pose_world: Pose) -> None:
         self.kin.set_base_pose(base_pose_world)
 
-    def solve_teleop_ik(
+    def solve_online_ik(
         self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
     ) -> IKResult:
-        return self.teleop_solver.solve(target_eef_pose_world, current_qpos, previous_qpos_cmd)
+        return self.online_ik_solver.solve(target_eef_pose_world, current_qpos, previous_qpos_cmd)
 
     def plan_joint_qpos_path(
         self,
@@ -355,13 +344,11 @@ class XArm7MotionPlanner:
         midpoint (limit bounds are convex, so midpoint-outside implies the
         segment is problematic).
         """
-        # Joint limits check at midpoint (convex → midpoint suffices)
         mid = 0.5 * (prev + nxt)
         outside, _ = self.limit_violation(mid, limits)
         if np.any(outside):
             return False
 
-        # Sample three points (α = ¼, ½, ¾) along prev→nxt
         diff = nxt - prev
         q_quarter = prev + 0.25 * diff
         q_three_quarter = prev + 0.75 * diff

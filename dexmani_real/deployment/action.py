@@ -1,9 +1,11 @@
 """Decode physical policy actions using current robot geometry and limits."""
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from dexmani_real.planning import Pose, XArm7MotionPlanner
-from dexmani_real.planning.kinematics.ik import make_online_ik_config
+from dexmani_real.planning.kinematics.ik import IKResult, make_online_ik_config
 from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.robot.projection import project_hand_command
 
@@ -16,13 +18,23 @@ def physical_action_dim(action_mode):
     raise ValueError("action_mode must be joint or eef")
 
 
-def make_action_planner(action_mode, runtime, *, control_dt_s):
+def make_action_planner(action_mode, runtime):
     physical_action_dim(action_mode)
     if action_mode == "joint":
         return None
     return XArm7MotionPlanner.create_default(
-        teleop_profile=make_online_ik_config(runtime, control_dt_s=control_dt_s)
+        online_ik_profile=make_online_ik_config(runtime, enable_random_fallback=True)
     )
+
+
+@dataclass(frozen=True)
+class DecodedPolicyAction:
+    arm_qpos: np.ndarray | None
+    hand_qpos: np.ndarray
+    arm_eef_intent: np.ndarray | None
+    hand_clip_rad: float
+    workspace_clip_m: float = 0.0
+    ik_result: IKResult | None = None
 
 
 def decode_policy_action(
@@ -45,13 +57,21 @@ def decode_policy_action(
     )
     hand_clip = float(np.max(np.abs(hand - raw_hand)))
     if action_mode == "joint":
-        return action[:7], hand, None, hand_clip
+        return DecodedPolicyAction(action[:7], hand, None, hand_clip)
     planner.set_hand_qpos(hand)
     position = np.clip(action[:3], workspace[:, 0], workspace[:, 1])
+    workspace_clip = float(np.max(np.abs(position - action[:3])))
     intent = np.concatenate((position, action[3:9]))
-    result = planner.solve_teleop_ik(
+    result = planner.solve_online_ik(
         Pose(p=position, q=rot6d_to_quat_wxyz(action[3:9])),
         current_arm_qpos,
         current_arm_qpos if previous_arm_command_qpos is None else previous_arm_command_qpos,
     )
-    return result.qpos if result.success else None, hand, intent, hand_clip
+    return DecodedPolicyAction(
+        result.qpos if result.success else None,
+        hand,
+        intent,
+        hand_clip,
+        workspace_clip_m=workspace_clip,
+        ik_result=result,
+    )

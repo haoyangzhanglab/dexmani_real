@@ -1,8 +1,8 @@
-"""Pinocchio self-collision checks for xArm7 + XHand, independent of MPlib.
+"""Pinocchio self and static-environment collision checks for xArm7 + XHand.
 
 Uses T-Rex's pin.computeCollisions() pattern. Both models share
 xarm7_xhand.srdf: arm-arm and arm-hand checks, with hand self-collision
-disabled. The 19-DOF model has 17 arm-arm and 238 arm-hand active pairs.
+disabled.
 
 Usage::
 
@@ -23,10 +23,12 @@ from dexmani_real.robot.model import (
     ARM_JOINT_SHAPE,
     HAND_DOF,
     HAND_SDK_TO_URDF_IDX,
+    XARM7_JOINT_NAMES,
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_RIGHT_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
     XHAND_MODEL_DIR,
+    XHAND_URDF_JOINT_NAMES,
 )
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 
@@ -46,7 +48,7 @@ _HAND_USER_TO_URDF = HAND_SDK_TO_URDF_IDX
 
 @dataclass(frozen=True, slots=True)
 class CollisionPair:
-    """A single self-collision contact suitable for diagnostics and logs."""
+    """A collision contact suitable for diagnostics and logs."""
 
     link_name1: str
     link_name2: str
@@ -66,7 +68,7 @@ class CollisionPair:
 
 @dataclass
 class CollisionInfo:
-    """Structured self-collision diagnostic result."""
+    """Structured collision diagnostic result."""
 
     in_collision: bool
     collision_pairs: tuple[CollisionPair, ...] = ()
@@ -99,7 +101,7 @@ CollisionInfo._NO_COLLISION = CollisionInfo(in_collision=False)
 
 
 class CollisionModel:
-    """Self-collision model with fixed or active hand joints.
+    """Robot and static-environment collision model with fixed or active hand joints.
 
     hand_dof=False uses the 7-DOF collision URDF with a fixed hand;
     hand_dof=True uses the full URDF with qpos = [arm(7), hand(12)].
@@ -125,6 +127,19 @@ class CollisionModel:
         _srdf = srdf_path or _COLLISION_SRDF
 
         self._model = pin.buildModelFromUrdf(_urdf)
+        if hand_dof:
+            active = sorted(
+                (
+                    (joint.idx_q, self._model.names[i])
+                    for i, joint in enumerate(self._model.joints)
+                    if i != 0 and joint.nq > 0
+                ),
+            )
+            if self._model.nq != 19 or tuple(name for _, name in active) != (
+                *XARM7_JOINT_NAMES,
+                *XHAND_URDF_JOINT_NAMES,
+            ):
+                raise ValueError("collision model active q order must be xArm7 + XHand URDF joints")
         self._data = self._model.createData()
 
         self._collision_model = pin.buildGeomFromUrdf(
@@ -553,27 +568,6 @@ class CollisionModel:
     @staticmethod
     def _sample_count(q1: np.ndarray, q2: np.ndarray, step_size: float) -> int:
         return max(1, int(np.ceil(float(np.max(np.abs(q2 - q1))) / step_size)))
-
-    def _check_segment_free(self, q1: np.ndarray, q2: np.ndarray, step_size: float) -> bool:
-        """Dense joint-space interpolation with early exit on collision."""
-        step_size = self._validate_step_size(step_size)
-        q1 = self._to_full_qpos(q1)
-        q2 = self._to_full_qpos(q2)
-        diff = q2 - q1
-        n = self._sample_count(q1, q2, step_size)
-        for step in range(n + 1):
-            if self.check_self_collision(q1 + (step / n) * diff):
-                return False
-        return True
-
-    def check_segment_collision_free(
-        self,
-        q1: np.ndarray,
-        q2: np.ndarray,
-        step_size: float = 0.02,
-    ) -> bool:
-        """Check if the linear joint-space segment q1→q2 is self-collision-free."""
-        return self._check_segment_free(q1, q2, step_size)
 
     def check_combined_segment_collision_free(
         self,

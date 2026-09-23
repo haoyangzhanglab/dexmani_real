@@ -8,13 +8,13 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
-from dexmani_real.planning import OnlineIKConfig, Pose, XArm7MotionPlanner
+from dexmani_real.planning import Pose, XArm7MotionPlanner
+from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_config
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.robot.arm_worker import arm_loop
 from dexmani_real.robot.commands import RobotCommand, publish_command
 from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.robot.hand_worker import hand_loop
-from dexmani_real.robot.projection import project_arm_command
 from dexmani_real.runtime.observation import read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_processes_verified
@@ -43,7 +43,8 @@ def run_keyboard_experiment(runtime, *, no_hand):
     )
     cfg = runtime.keyboard_teleop
     planner = XArm7MotionPlanner.create_default(
-        teleop_profile=OnlineIKConfig(
+        online_ik_profile=make_online_ik_config(
+            runtime,
             max_pose_error_pos_m=cfg.ik_max_pose_error_pos_m,
             max_pose_error_rot_rad=cfg.ik_max_pose_error_rot_rad,
         )
@@ -52,6 +53,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
         planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
     workspace = runtime.policy.workspace.as_array()
     home_down = False
+    previous_command = None
     clean = False
     try:
         start_processes(shared, processes, runtime.safety.readiness_timeouts_s, started)
@@ -79,6 +81,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
             home_down = pressed
             row = read_observation(shared, runtime, require_hand=runtime.policy.hand_enabled)
             if row is None:
+                previous_command = None
                 if int(shared.safety_state.value) == int(SafetyState.RUNNING):
                     revoke_motion(shared)
                 time.sleep(0.02)
@@ -86,13 +89,14 @@ def run_keyboard_experiment(runtime, *, no_hand):
             dx, drpy = compute_cartesian_jog_delta(keys, cfg.delta_pos_m, cfg.delta_rpy_rad)
             moving = np.any(dx) or np.any(drpy)
             if not moving or pressed:
+                previous_command = None
                 if int(shared.safety_state.value) == int(SafetyState.RUNNING):
                     revoke_motion(shared)
             else:
-                if int(shared.safety_state.value) == int(SafetyState.ARMED) and not begin_motion(
-                    shared
-                ):
-                    break
+                if int(shared.safety_state.value) == int(SafetyState.ARMED):
+                    previous_command = None
+                    if not begin_motion(shared):
+                        break
                 epoch = int(shared.run_id.value)
                 qpos = row.arm["qpos"][0]
                 pose = planner.kin.compute_eef_pose_world(qpos)
@@ -106,15 +110,17 @@ def run_keyboard_experiment(runtime, *, no_hand):
                 ).as_quat(scalar_first=True)
                 if row.hand is not None:
                     planner.set_hand_qpos(row.hand["qpos"][0])
-                result = planner.solve_teleop_ik(Pose(p=pos, q=quat), qpos, qpos)
+                result = planner.solve_online_ik(
+                    Pose(p=pos, q=quat),
+                    qpos,
+                    qpos if previous_command is None else previous_command,
+                )
+                if result.failure_kind == IKFailureKind.INVALID_OUTPUT:
+                    raise RuntimeError(f"online IK technical failure: {result.reason}")
                 if result.success:
-                    target = project_arm_command(
-                        result.qpos,
-                        qpos,
-                        joint_lower_rad=runtime.arm.joint_limit_lower,
-                        joint_upper_rad=runtime.arm.joint_limit_upper,
-                    )
-                    publish_command(shared, RobotCommand(epoch, target))
+                    target = result.qpos
+                    if publish_command(shared, RobotCommand(epoch, target)):
+                        previous_command = target
             time.sleep(1 / cfg.control_hz)
     finally:
         keys.quiesce()

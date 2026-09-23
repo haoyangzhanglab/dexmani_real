@@ -14,10 +14,10 @@ from dexmani_real.calibration.camera.solver import CalibrationConfig, Calibratio
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
 from dexmani_real.planning import Pose, XArm7MotionPlanner
+from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import quat_multiply
 from dexmani_real.robot.arm_homing import ArmHomeConfig, execute_arm_home
 from dexmani_real.robot.commands import RobotCommand, publish_command
-from dexmani_real.robot.projection import project_arm_command
 from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
@@ -173,7 +173,6 @@ def _reject_calibration_motion(
         if not revoke_motion(shared, SafetyState.ARMED):
             set_calibration_fault(shared, "failed to stop rejected calibration motion")
             return
-    state.previous_command = state.current_qpos.copy()
     state.blocked_until_release = True
 
 
@@ -252,11 +251,13 @@ def run_calibration_motion_tick(
         max_rotation_lead_rad=calib_cfg.command_lookahead_frames * calib_cfg.delta_rpy_rad,
     )
 
-    ik_result = planner.solve_teleop_ik(
+    ik_result = planner.solve_online_ik(
         Pose(p=proposed_pos, q=proposed_quat),
         state.current_qpos,
         state.previous_command,
     )
+    if ik_result.failure_kind == IKFailureKind.INVALID_OUTPUT:
+        raise RuntimeError(f"online IK technical failure: {ik_result.reason}")
     if not ik_result.success or ik_result.qpos is None:
         now_s = time.monotonic()
         if now_s - state.last_ik_warning_s >= _IK_WARNING_INTERVAL_S:
@@ -265,12 +266,7 @@ def run_calibration_motion_tick(
         _reject_calibration_motion(shared, state, ik_result.reason or "IK rejected")
         return
 
-    q_cmd = project_arm_command(
-        ik_result.qpos,
-        state.current_qpos,
-        joint_lower_rad=runtime.arm.joint_limit_lower,
-        joint_upper_rad=runtime.arm.joint_limit_upper,
-    )
+    q_cmd = ik_result.qpos
     if publish_command(shared, RobotCommand(epoch, q_cmd)):
         state.previous_command = q_cmd
 

@@ -1,19 +1,7 @@
-"""Hand FK helper: compute fingertip positions from hand joint positions.
+"""Compute fingertip positions in hand_base from XHand SDK joint positions.
 
-Uses Pinocchio to compute forward kinematics for the hand URDF model,
-returning the 3D positions of five fingertips in the hand_base frame.
-
-Chain:
-  hand_qpos -> (hand URDF via Pinocchio) -> fingertip positions in hand_base
-
-IMPORTANT — Joint ordering:
-  The XHand SDK returns qpos in finger-grouped order:
-    [thumb(3), index(3), mid(2), ring(2), pinky(2)]
-  Pinocchio's buildModelFromUrdf reorders joints alphabetically:
-    [index(3), mid(2), pinky(2), ring(2), thumb(3)]
-  This differs from the URDF XML (which has thumb first) — Pinocchio
-  sorts by joint name at model build time, not by XML element order.
-  _SDK_TO_URDF_IDX remaps from SDK order to Pinocchio model order.
+SDK order is thumb/index/mid/ring/pinky; the model's active q order is
+index/mid/pinky/ring/thumb. The shared mapping is verified at construction.
 """
 
 from __future__ import annotations
@@ -26,6 +14,7 @@ from dexmani_real.robot.model import (
     HAND_FINGERTIP_SHAPE,
     HAND_JOINT_SHAPE,
     HAND_SDK_TO_URDF_IDX,
+    XHAND_URDF_JOINT_NAMES,
 )
 from dexmani_real.utils.log import get_logger
 
@@ -65,6 +54,16 @@ class HandKinematics:
         except Exception as e:
             logger.warning("HandKinematics: URDF loading failed for %s: %s", hand_urdf_path, e)
             return
+
+        active = sorted(
+            (
+                (joint.idx_q, self._model.names[i])
+                for i, joint in enumerate(self._model.joints)
+                if i != 0 and joint.nq > 0
+            ),
+        )
+        if self._model.nq != 12 or tuple(name for _, name in active) != XHAND_URDF_JOINT_NAMES:
+            raise ValueError("hand FK active q order must match XHand URDF joints")
 
         if fingertip_link_names is None:
             fingertip_link_names = [

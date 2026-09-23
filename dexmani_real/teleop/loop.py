@@ -96,9 +96,7 @@ def teleop_loop(shared, config):
 
     try:
         planner = XArm7MotionPlanner.create_default(
-            teleop_profile=make_online_ik_config(
-                runtime, control_dt_s=1.0 / runtime.teleop.control_hz
-            )
+            online_ik_profile=make_online_ik_config(runtime)
         )
         calibration = load_vr_transform(
             Path(__file__).resolve().parents[2] / config.vr_transform_path

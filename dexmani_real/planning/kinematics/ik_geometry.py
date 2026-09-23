@@ -33,8 +33,6 @@ class IKGeometry:
         self.equivalent_joint_mask = kinematics.equivalent_joint_mask
         self.mp_planner = kinematics.mp_planner
         self._cm = collision_model
-        # Equivalent-joint masks already guarantee a range of at least 2π.
-        self._periods_arr = np.where(self.equivalent_joint_mask, 2.0 * np.pi, 1.0)
 
     def resolve_planning_limits(
         self, profile: MotionPlanningConfig, reference_qpos: np.ndarray | None = None
@@ -52,7 +50,7 @@ class IKGeometry:
             reference_qpos = np.zeros(self.dof, dtype=np.float64)
         reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")
 
-        # Allow equivalent solutions near hardware limits by expanding the ±π window.
+        # Bound equivalent representations around the reference within model limits.
         mask = self.equivalent_joint_mask
         if np.any(mask):
             limits[mask, 0] = np.maximum(
@@ -63,18 +61,14 @@ class IKGeometry:
             )
         return limits
 
-    def _periods(self) -> np.ndarray:
-        return self._periods_arr
-
     def nearest_equivalent_qpos(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
-        return self.canonicalize_qpos(qpos, reference_qpos, limits=self.joint_limits, limit_tol=0.0)
+        return self.canonicalize_qpos(qpos, reference_qpos)
 
     def canonicalize_qpos(
         self,
         qpos: np.ndarray,
         reference_qpos: np.ndarray,
         limits: np.ndarray | None = None,
-        limit_tol: float = 1e-5,
     ) -> np.ndarray:
         qpos = ensure_qpos(qpos, self.dof, "qpos")
         reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")
@@ -116,11 +110,8 @@ class IKGeometry:
         qpos = ensure_qpos(qpos, self.dof, "qpos")
         reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")
         delta = qpos - reference_qpos
-        periods = self._periods()
-        half = periods[self.equivalent_joint_mask] / 2.0
-        delta[self.equivalent_joint_mask] = (delta[self.equivalent_joint_mask] + half) % periods[
-            self.equivalent_joint_mask
-        ] - half
+        mask = self.equivalent_joint_mask
+        delta[mask] = (delta[mask] + np.pi) % (2.0 * np.pi) - np.pi
         return delta
 
     def limit_violation(
@@ -150,10 +141,6 @@ class IKGeometry:
                 "Pass collision_model=... to IKGeometry constructor."
             )
 
-    def check_self_collision(self, qpos: np.ndarray) -> CollisionInfo:
-        self._require_collision_model()
-        return self._cm.check_self_collision_details(qpos)  # type: ignore[union-attr]
-
     def has_self_collision(self, qpos: np.ndarray) -> bool:
         """Robot endpoint self-collision only; excludes environment and table."""
         self._require_collision_model()
@@ -166,55 +153,6 @@ class IKGeometry:
     def check_collision(self, qpos: np.ndarray) -> CollisionInfo:
         self._require_collision_model()
         return self._cm.check_collision_details(qpos)  # type: ignore[union-attr]
-
-    def check_path_collisions(
-        self,
-        path: np.ndarray,
-        collision_step_size: float = 0.02,
-    ) -> dict[str, Any]:
-        """Check self-collision along path with dense interpolation (ref: dimos).
-
-        Linearly interpolates between consecutive waypoints at the given step
-        size and checks self-collision at every sampled point.  When a
-        collision is found, includes structured ``CollisionInfo`` at the
-        violating configuration for root-cause diagnostics.
-        """
-        self._require_collision_model()
-        path = np.asarray(path, dtype=np.float64)
-        if path.ndim != 2 or path.shape[1] != self.dof:
-            raise ValueError(f"path must have shape (N, {self.dof}), got {path.shape}")
-        if len(path) == 0:
-            return {"path_self_collision": False}
-        first_info = self.check_self_collision(path[0])
-        if first_info:
-            return {
-                "path_self_collision": True,
-                "collision_waypoint_index": 0,
-                "collision_waypoint_count": len(path),
-                "collision_step_size": collision_step_size,
-                "collision": first_info.to_dict(),
-            }
-        for i in range(len(path) - 1):
-            # Dense segment check — fast bool path for most points.
-            if not self._cm.check_segment_collision_free(  # type: ignore[union-attr]  # requires a configured CollisionModel (planner always builds one)
-                path[i],
-                path[i + 1],
-                collision_step_size,
-            ):
-                # Pinpoint the exact violating configuration and get full details.
-                collision_info = self._find_collision_in_segment(
-                    path[i],
-                    path[i + 1],
-                    collision_step_size,
-                )
-                return {
-                    "path_self_collision": True,
-                    "collision_waypoint_index": i,
-                    "collision_waypoint_count": len(path),
-                    "collision_step_size": collision_step_size,
-                    "collision": collision_info.to_dict() if collision_info else None,
-                }
-        return {"path_self_collision": False}
 
     def check_path_combined_collisions(
         self,
@@ -269,31 +207,6 @@ class IKGeometry:
         steps = max(1, int(np.ceil(float(np.max(np.abs(diff))) / step_size)))
         for step in range(steps + 1):
             info = self.check_collision(start + (step / steps) * diff)
-            if info:
-                return info
-        return None
-
-    def _find_collision_in_segment(
-        self,
-        start: np.ndarray,
-        end: np.ndarray,
-        step_size: float,
-    ) -> CollisionInfo | None:
-        """Locate the first self-colliding configuration in segment [start, end].
-
-        Returns structured ``CollisionInfo`` for the first collision found,
-        or ``None`` if the segment is collision-free (unexpected caller path).
-        """
-        diff = end - start
-        dist = float(np.max(np.abs(diff)))
-        if dist <= step_size:
-            info = self.check_self_collision(end)
-            return info if info else None
-        n_steps = int(np.ceil(dist / step_size))
-        for step in range(n_steps + 1):
-            alpha = step / n_steps
-            q = start + alpha * diff
-            info = self.check_self_collision(q)
             if info:
                 return info
         return None
