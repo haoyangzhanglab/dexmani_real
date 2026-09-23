@@ -1,6 +1,6 @@
-# DexMani Real Recording Simplification Task
+# DexMani Real Recording Runtime Simplification Task
 
-## 0. Scope and repository
+## 0. Scope and reviewed baseline
 
 Work only in:
 
@@ -14,51 +14,84 @@ This task file belongs at:
 ~/Desktop/dexmani_real/record_codex_task.md
 ~~~
 
-Reviewed remote head when this task was finalized:
+Reviewed remote baseline:
 
 ~~~text
 dexmani_real main
+aab1982e5a83bf48d25e0a5e202f3087b402254b
+~~~
+
+The code baseline immediately before this task file was added was:
+
+~~~text
 c9bbf5eed7e5b775c7c56237759aa8e68fc74fd3
 ~~~
 
-Inspect the local repository first. Local HEAD is authoritative if newer. Do not patch by stale line numbers.
+Inspect local `git status --short` and local HEAD first. Local code is authoritative if newer. Preserve unrelated work. Do not patch by stale line number.
 
-This is a personal PhD real-robot research repository. It is not a production recorder, distributed transaction system, generic dataset framework, or multi-user service.
+This is a personal PhD real-robot research repository, not a production recorder, distributed transaction system, generic dataset framework, or multi-user service.
 
 Optimize for:
 
 1. physical safety;
-2. correct experiment semantics;
+2. correct experiment/control semantics;
 3. raw-data integrity;
 4. fast research iteration;
 5. simple ownership and readable failure paths;
-6. minimal duplicated state and validation.
+6. minimal duplicated IPC/protocol state.
 
-Prefer delete -> inline -> merge -> rewrite. Do not replace removed complexity with a new abstraction carrying the same concept.
+Prefer delete -> inline -> merge -> rewrite. Do not remove a cheap mechanism that prevents a concrete bad experiment merely to reduce LOC.
 
 Reference projects are conceptual references only:
 
-- LeRobot: borrow simple episode UX and lightweight timing diagnostics; do not copy silent video-frame dropping.
-- ManiUniCon: borrow raw/offline separation; do not copy independent per-modality recording or online timestamp-grid resampling.
+- LeRobot: borrow simple episode UX and lightweight diagnostics; do not copy silent frame dropping.
+- ManiUniCon: borrow raw/offline separation; do not copy independent per-modality recording, online timestamp-grid filling, or min-length truncation.
 
 ---
 
-# 1. Core design rule
+# 1. Task boundary: runtime/protocol cleanup, not raw-schema migration
 
-The recording stack should preserve facts, not prove its own correctness through layers of status flags.
+This task MUST simplify recording runtime/control flow while keeping the current raw v32 persisted contract readable.
 
-The final model is:
+Do not bump the raw episode schema in this task.
+
+Do not delete or reinterpret current persisted v32 fields such as:
+
+- `technical_status`;
+- `had_pause`;
+- `timestamp`;
+- `min_frames_met`;
+- current timing/meta attrs;
+- current camera/calibration attrs.
+
+Do not redesign `EpisodeTiming` in this task.
+
+Do not remove the current min-frame metadata path in this task.
+
+Do not perform a broad HDF5 metadata cleanup in this task.
+
+Those are valid future cleanup topics, but combining them with recorder-runtime simplification would unnecessarily create historical-data migration risk.
+
+The main target here is:
+
+> Fix behavior and remove unnecessary cross-process/lifecycle machinery without changing the scientific raw layout.
+
+---
+
+# 2. Core recording architecture to preserve
+
+The intended architecture remains:
 
 ~~~text
 sensor workers
     ↓
-latest fresh samples
+latest required fresh samples
     ↓
-ObservationRow
+one immutable ObservationRow
     ↓
 controller / IK / retarget
     ↓
-publish valid RobotCommand
+publish valid RobotCommand only
     ↓
 build EpisodeFrame from the SAME ObservationRow
     ↓
@@ -66,427 +99,341 @@ record_sample_ring
     ↓
 RecorderIO
     ↓
-exact sequence drain through STOP cutoff
+sequence-aware serialization
     ↓
 staging files
     ↓
-close + structural validate
+close + structural validation
     ↓
 atomic publish
     ↓
 episode_*
 ~~~
 
-Raw data is experiment truth.
+Raw episodes are experiment source of truth.
 
-Training admission is an offline responsibility.
+Canonical training admission remains offline and whole-episode all-or-nothing.
 
 Do not introduce:
 
 - command ACK/adoption protocols;
-- per-sensor recording transactions;
-- online modality resampling;
-- synthetic repaired rows;
-- generic validity flags;
+- per-modality recording transactions;
+- runtime sensor resampling;
+- bad-row repair;
+- synthetic hold-action rows;
+- generic observation-valid flags;
 - quality scores;
 - temporal-contract frameworks;
-- compatibility layers for deleted recording mechanisms.
+- a replacement state machine with different names.
 
 ---
 
-# 2. Non-negotiable invariants
+# 3. Non-negotiable invariants
 
-Preserve these behaviors.
+## 3.1 Same control row
 
-## 2.1 One control row is one causal unit
+Controller and recorder must use the same ObservationRow.
 
-The controller and recorder must use the same immutable ObservationRow.
+Never re-read camera/state after control computation to manufacture the recorded observation for that action.
 
-Never re-read camera/state after control computation to construct the recorded row.
-
-Keep:
+Keep real experiment facts:
 
 - robot state;
 - RGB-D;
-- raw VR;
-- tactile/current;
+- VR data;
+- hand current/tactile and tactile validity;
 - final high-level command target;
+- pre-IK intent where currently defined;
 - frame status;
-- real source timestamps;
-- observation timestamp;
-- action publication timestamp.
+- observation/action/source timestamps.
 
-## 2.2 RecorderIO remains a separate process
+## 3.2 RecorderIO remains separate
 
-Do not move HDF5/video writes into the control loop.
+Do not move MP4/HDF5/filesystem work into the control loop.
 
-RecorderIO remains the single owner of episode serialization.
+## 3.3 No silent row loss
 
-## 2.3 No silent sample loss
+Keep exact sequence checks.
 
-Keep exact sequence-based draining.
+Missing/overwritten rows must remain a loud recording failure.
 
-If a source sequence has been overwritten or is unavailable:
+## 3.4 STOP cutoff remains explicit
 
-~~~text
-recording failure
-→ workflow_failed
-→ immediately revoke RUNNING motion
-→ retain diagnostic incomplete staging when possible
-~~~
+A save STOP must retain `through_sequence`.
 
-Never silently skip or truncate rows.
+RecorderIO must drain exactly through that sequence before normal finalization.
 
-## 2.4 STOP cutoff remains explicit
+Do not replace this with a boolean-only recording protocol.
 
-STOP must retain:
+## 3.5 Atomic publication remains
 
-~~~text
-through_sequence
-~~~
-
-RecorderIO must drain exactly through that sequence before final save.
-
-Do not replace this with a shared boolean-only recording state.
-
-## 2.5 Atomic publication remains
-
-A normal published episode must still use:
+Normal saved raw data still follows:
 
 ~~~text
 .tmp_episode_*
-    ↓ close
-    ↓ validate
-atomic rename
-    ↓
-episode_*
+→ close writers
+→ validate
+→ atomic rename
+→ episode_*
 ~~~
 
-Do not weaken this.
+## 3.6 Pause remains meaningful
 
-## 2.6 Tactile validity remains explicit
+Keep `had_pause`.
 
-XHand aggregate and dense tactile can fail independently while joint state remains usable.
+Pause/resume currently revokes motion, clears controller reference and requires fresh re-anchor. That is a real control discontinuity.
 
-Keep the existing tactile-validity fields.
+Raw -> Zarr may continue rejecting every `had_pause=True` teleop episode.
 
-## 2.7 Pause semantics remain explicit
+## 3.7 Required recorder failure remains fail-fast
 
-Keep had_pause.
-
-Pause/resume currently performs:
+If required recording becomes unavailable while RUNNING:
 
 ~~~text
-revoke motion
-clear controller reference
-wait for fresh post-pause state
-re-anchor
-resume
+workflow_failed = True
+→ immediately revoke active motion to ARMED
 ~~~
 
-This is a real control-reference discontinuity, not merely a large timestamp gap.
+Do not classify healthy arm/hand hardware as FAULT solely because RecorderIO failed.
 
-Whole-episode teleop training export may continue to reject had_pause=True.
+Do not delay this revoke until a later supervisor poll.
 
 ---
 
-# 3. First correctness fix: unify recoverable IK/retarget behavior
+# 4. P0 correctness fix: make teleop IK/retarget failures recoverable
 
 Current policy evaluation already treats Cartesian IK failure as recoverable:
 
 ~~~text
-IK failure
-→ do not publish a command
+IK fail
+→ no invalid command publication
 → record FRAME_IK_FAIL
 → clear remaining action chunk
-→ schedule next control step
+→ schedule next step
 → continue
 ~~~
 
-Teleop recording currently behaves differently:
+Current teleop recording instead terminates on the first non-OK frame.
 
-~~~text
-first non-OK frame
-→ stop recording immediately
-→ mark incomplete
-~~~
-
-Remove this inconsistency.
+Unify the semantics.
 
 ## Required teleop behavior
 
-After run_control_grid_tick():
+`run_control_grid_tick()` already returns `target=None` for retarget/IK failure, so no partial arm/hand command is published. Preserve this.
+
+After a control tick:
 
 ~~~text
 FRAME_OK
-  → publish valid command
-  → record normal row
+  → command may publish
+  → normal row recorded
 
 FRAME_IK_FAIL / FRAME_RETARGET_FAIL
-  → no invalid command publication
-  → record diagnostic row
-  → keep episode/runtime alive
+  → no new command published
+  → diagnostic row recorded
+  → keep teleop episode active
   → increment existing consecutive-failure counter
 ~~~
 
-Use the existing failure counter.
-
-When consecutive failures reach the existing threshold:
+Use the existing `_DEBUG_FAILURE_LIMIT` behavior:
 
 ~~~text
-pause
+repeated failures
+→ pause
 → revoke motion
-→ clear controller reference
-→ fresh re-anchor before resume
+→ clear reference
+→ require fresh post-pause re-anchor
 ~~~
 
-Do not turn ordinary IK/retarget failure into a recorder/storage failure.
+Do not:
 
-Do not invent hold-action rows.
+- auto-stop the episode on the first IK/retarget failure;
+- publish a hold command as fake action;
+- delete the failed raw row;
+- mark the recorder/storage path failed merely because control IK failed.
 
-Do not delete failed rows from raw data.
+Canonical teleop export must continue rejecting any episode containing a non-OK frame status.
 
-Raw -> canonical training export must continue to reject any episode containing non-OK frame status.
-
-Update stale README text that currently says the first IK/retarget failure immediately stops a recorded teleop episode.
+Update README text that currently says the first recorded IK/retarget failure immediately terminates the episode.
 
 ---
 
-# 4. Fix the current retain_partial semantic bug by removing the abstraction
+# 5. P0 correctness fix: remove `retain_partial`
 
-Current code can call:
+Current `save=True + retain_partial=True` semantics are inconsistent with atomic publication: a staging directory may already have been published before the later incomplete-preservation branch tries to rename it.
 
-~~~text
-save=True
-retain_partial=True
-~~~
+Do not patch this with more branches.
 
-and then atomic-publish the staging directory before the later incomplete-preservation branch sees it.
+Delete `retain_partial` from:
 
-Do not patch this with more conditionals.
-
-Delete retain_partial from the recording protocol.
-
-Remove it from:
-
-- RecorderClient.stop_episode();
-- StopRecording;
+- `RecorderClient.stop_episode()`;
+- `StopRecording`;
 - RecorderIO finalization helpers;
-- EpisodeRecorder failure_note logic where it exists only to model interrupted-but-structurally-valid episodes;
+- EpisodeRecorder finalization arguments used only for this concept;
 - teleop/policy callers.
 
-Use only two storage outcomes.
+Use the following storage distinction.
 
-## 4.1 Structurally complete raw episode
+## 5.1 Structurally complete raw capture
 
-If RecorderIO can:
+If RecorderIO successfully:
 
-- drain the required rows;
-- close writers;
-- validate files/layout;
-- atomic-publish;
+- owns all required source rows;
+- closes writers;
+- validates storage;
+- atomic-publishes;
 
-then the result is a normal:
+then it is a normal `episode_*` directory.
 
-~~~text
-episode_*
-~~~
+The experiment itself may still be abnormal, and current raw v32 `technical_status`, `had_pause`, frame status and termination metadata may describe that.
 
-Its experiment outcome is described by actual data such as:
+Do not call a structurally complete hardware/policy/observation failure an `incomplete_*` storage transaction.
 
-- termination_reason;
-- frame status;
-- had_pause;
-- timestamps;
-- workflow provenance.
+## 5.2 Storage/recording transaction failure
 
-An unsuccessful experiment does not automatically mean storage-incomplete data.
+Use `incomplete_episode_*` only for real recording transaction failure, for example:
 
-## 4.2 Storage-incomplete episode
-
-Only storage/transport failures create:
-
-~~~text
-incomplete_episode_*
-    failure_note.json
-~~~
-
-Examples:
-
-- record-ring overwrite;
-- missing expected source sequence;
+- ring overwrite before a required saved row was consumed;
+- missing expected sequence;
 - sample decode failure;
 - HDF5/video write failure;
-- final structural-validation failure;
-- RecorderIO crash during active serialization;
-- cleanup failure leaving uncertain files.
+- structural finalization/validation failure;
+- RecorderIO crash/cleanup failure leaving uncertain staging.
 
-Do not use incomplete_* merely because IK failed, a policy rollout timed out, a required observation became stale, or the operator ended an abnormal experiment.
-
----
-
-# 5. Keep required-recording failure fail-fast
-
-Do not remove the current immediate motion revoke when the required recorder becomes unusable.
-
-A real recording/transport failure means the experiment can no longer satisfy its required evidence capture.
-
-Required behavior:
-
-~~~text
-recording/storage transport failure
-→ workflow_failed = True
-→ if currently RUNNING, revoke motion to ARMED
-→ do not classify healthy arm/hand hardware as FAULT solely because recorder failed
-~~~
-
-Keep the hardware-fault vs workflow-failure distinction.
-
-Do not wait for a later supervisor poll before revoking motion.
+Keep `failure_note.json` only for this real storage-failure path.
 
 ---
 
-# 6. Simplify the recorder control/result protocol
+# 6. Preserve raw v32 `technical_status` for now; remove only the sidecar proof
 
-The current recorder protocol contains distributed-system-style proof state that is not justified for this single-workstation research stack.
+Do NOT remove the persisted `technical_status` contract in this task.
 
-## 6.1 Target control messages
+Do not reinterpret it under the same schema version.
 
-Keep StartRecording conceptually small:
+Keep the existing v32 field and existing training-side `require_valid()` meaning where required.
 
-~~~python
-StartRecording(
-    task,
-    operator,
-    start_sequence,
-    episode_name=None,
-)
-~~~
+However, remove the extra late-invalidating sidecar mechanism:
 
-Target StopRecording:
+- `write_recording_failure()`;
+- `episode_*.result.json`;
+- `record_episode_path` shared state;
+- `runtime/processes.py` logic that writes that sidecar.
 
-~~~python
-StopRecording(
-    save,
-    reason,
-    through_sequence,
-    had_pause,
-)
-~~~
+After sidecar removal, search all consumers of `shared.is_recording`.
 
-Delete from StopRecording:
+If it has no independent purpose, delete `shared.is_recording` and all writes to it.
 
-- retain_partial;
-- technical_status;
-- deadline_monotonic_ns.
+Do not replace the deleted sidecar with another marker file or shared validity flag.
 
-## 6.2 Target start result
+## 6.1 Ownerless runtime shutdown
 
-RecordingStarted should only return what the caller actually needs, ideally:
+If the runtime ends while RecorderIO still has an active recording and no explicit STOP was received, do not classify it as a storage-write failure merely because the owner disappeared.
 
-~~~python
-RecordingStarted(path)
-~~~
+Use the latest committed sample sequence as the emergency cutoff, close the transaction normally if possible, and mark the current v32 experiment status/termination as abnormal (for example `runtime_shutdown` + invalid technical status).
 
-Do not return recorder-owned episode-budget fields.
+If storage itself fails during that close, then preserve `incomplete_*`.
 
-## 6.3 Target final result
-
-Use a plain final result, conceptually:
-
-~~~python
-@dataclass(frozen=True)
-class RecordingResult:
-    saved: bool
-    path: str | None
-    frame_count: int
-    reason: str
-    error: str | None = None
-~~~
-
-poll_stop():
-
-~~~text
-None              -> still pending
-RecordingResult   -> finished
-~~~
-
-Do not represent "not finished yet" by constructing RecordingResult(done=False).
-
-Delete exactly-once result-delivery machinery such as:
-
-- done;
-- _terminal_result_delivered;
-- branches whose only job is preventing the same cached final result from being returned twice.
-
-A single owner may safely receive the same cached immutable final result again.
+The resulting abnormal but structurally complete raw episode must remain rejected by current training validity rules.
 
 ---
 
-# 7. Remove recorder finalization deadline proof state
+# 7. Simplify STOP finalization timing: remove cross-process deadline proof
 
-Delete the cross-process deadline/completion proof framework:
+Delete the shared deadline/completion proof framework:
 
-- StopRecording.deadline_monotonic_ns;
-- RecorderClient._finish_deadline_ns;
-- shared.recorder_finish_deadline_ns;
-- shared.recorder_completed_ns;
-- EpisodeRecorder finalization deadline parameter/checks;
-- "completed before deadline but queue delivery was late" logic.
+- `StopRecording.deadline_monotonic_ns`;
+- `RecorderClient._finish_deadline_ns`;
+- `shared.recorder_finish_deadline_ns`;
+- `shared.recorder_completed_ns`;
+- EpisodeRecorder deadline parameter/checks;
+- "completed before deadline but queue delivery was late" branches.
 
-Keep one caller-side bounded wait:
+Keep ordinary caller-side timeouts:
 
-~~~python
-recorder.join_stop(timeout=...)
-~~~
+- START acknowledgement timeout;
+- bounded STOP/join wait.
 
-If the wait expires:
+A conceptual finalization flow should be:
 
 ~~~text
-workflow_failed
+STOP
+→ RecorderIO finishes
+→ result queue
+→ client join_stop(timeout)
+~~~
+
+If the bounded client wait expires:
+
+~~~text
+recording transport considered unavailable
+→ workflow_failed
 → revoke if still RUNNING
-→ supervisor shutdown handles the stuck recorder
+→ supervisor handles shutdown
 ~~~
 
-A slow but eventually successful close is not scientific-data corruption.
+Do not declare already-written scientific data corrupt solely because close/result delivery was slow.
 
-Do not mark a structurally valid episode invalid merely because finalization exceeded an arbitrary storage deadline.
+Do not remove all recorder timeouts indiscriminately; remove only the duplicated cross-process proof state.
 
 ---
 
-# 8. Move experiment-duration ownership out of Recorder
+# 8. Simplify `RecordingResult` lifecycle
 
-Recorder should serialize until STOP. It should not decide experiment duration.
+Current `done=False` placeholder results and `_terminal_result_delivered` implement exactly-once message semantics inside a single-owner client.
 
-Delete recorder-owned:
+Remove that complexity.
 
-- max_frames;
-- _max_frames_reached;
-- max_frames_stop_reason;
-- RecorderIOConfig.max_frames;
-- RecordingStarted.max_frames;
-- RecorderClient._max_frames;
-- truncation logic used only by recorder capacity policy;
-- rollout recorder frame margin.
+Target behavior:
 
-## 8.1 Policy evaluation
+~~~python
+poll_stop() -> RecordingResult | None
+~~~
 
-PolicyRunner already owns max_running_s.
+where:
 
-Keep it as the sole rollout episode-duration owner.
+~~~text
+None             = still pending
+RecordingResult  = final result
+~~~
 
-Delete:
+A final immutable result may be cached and returned again safely.
+
+Delete state/branches whose only purpose is ensuring a final result is delivered exactly once.
+
+Keep real lifecycle state:
+
+- recording active;
+- stop pending;
+- recorder unavailable;
+- last final result;
+- episode path;
+- local submitted frame count.
+
+Keep START acknowledgement as a real boundary.
+
+---
+
+# 9. Move normal episode-length ownership out of Recorder, but retain a hard resource guard
+
+Recorder must not own normal experiment termination.
+
+## 9.1 Policy evaluation
+
+`PolicyRunner.max_running_s` remains the sole normal rollout-duration owner.
+
+Remove rollout normal-budget duplication such as:
 
 ~~~text
 _ROLLOUT_RECORDER_FRAME_MARGIN
 ceil(max_running_s * control_hz) + margin
+RecordingStarted.max_frames
+max_frames_stop_reason
+client auto-stop at recorder capacity
 ~~~
 
-from recorder configuration.
+## 9.2 Teleop
 
-## 8.2 Teleop
-
-Preserve current row-budget semantics for this task rather than silently switching to wall-clock semantics.
+Preserve current row-budget semantics in this task.
 
 The teleop owner may derive:
 
@@ -494,529 +441,423 @@ The teleop owner may derive:
 max_rows = round(max_record_duration_s * control_hz)
 ~~~
 
-After accepted raw-row submission reaches that budget:
+After successful raw-row submission reaches this owner budget:
 
 ~~~text
 stop(save=True, reason="max_record_duration")
 ~~~
 
-RecorderClient may keep a simple submitted frame_count because it is useful to the owner.
+Do not silently change this task into a wall-clock-duration redesign.
 
-The recorder backend itself must not auto-stop at capacity.
+## 9.3 Keep one simple hard recorder safety ceiling
 
-Do not combine this cleanup with an unrelated redesign of teleop duration semantics.
+Do NOT remove all frame-capacity protection.
 
----
+A simple high hard cap inside the storage writer is useful against runaway resource consumption.
 
-# 9. Remove the min-frames runtime/storage chain
+The hard cap:
 
-Current min_frames/min_frames_met is only a persisted quality warning, not an actual admission rule.
+- is not a normal experiment stop reason;
+- is not sent to RecorderClient in `RecordingStarted`;
+- does not use `max_frames_stop_reason`;
+- must not create a valid truncated episode;
+- if exceeded, behaves as a recording/resource failure.
 
-Delete:
+The existing `DEFAULT_MAX_RECORD_FRAMES` may remain or be simplified into this role.
 
-- min_record_duration_s if it has no remaining real behavior after this cleanup;
-- RecorderIOConfig.min_frames;
-- EpisodeRecorder.min_frames;
-- RecordingResult.min_frames_met;
-- meta min_frames_met;
-- EpisodeReader.min_frames_met;
-- visualizer warnings that exist only for this field.
+Prefer a direct exception/error over the current "accepted-last-row + False return + special-case" capacity protocol.
 
-If a future training pipeline requires a minimum episode length, implement the rule directly in offline dataset admission.
-
-Do not propagate a warning through config -> runtime -> storage -> reader.
+Normal teleop/policy limits should stop well before the hard guard.
 
 ---
 
-# 10. Increase real buffering instead of increasing protocol complexity
+# 10. Increase actual buffering: record ring 4 -> 16
 
-Current record_sample_ring_maxlen is 4.
-
-At 16 Hz this gives only about 250 ms of recorder backlog tolerance while RecorderIO performs video encoding and HDF5/filesystem writes.
-
-Change the default to:
+Change default:
 
 ~~~python
 record_sample_ring_maxlen = 16
 ~~~
 
-This gives about 1 s of transient backlog tolerance at 16 Hz and costs only tens of MiB of shared memory for current 640x480 RGB-D payloads.
+At 16 Hz this provides about one second of transient RecorderIO backlog tolerance.
 
-Do not copy LeRobot's behavior of dropping video frames when a queue is full.
+This is more useful than elaborate deadline/status machinery.
 
-Overflow remains a hard recording failure.
+Keep overflow as a hard recording failure.
+
+Do not copy LeRobot-style silent frame dropping.
 
 ---
 
-# 11. Remove shared recorder_consumed_sequence
+# 11. Remove shared `recorder_consumed_sequence`
 
-Current overwrite protection is duplicated:
+Current loss detection is duplicated:
 
-- producer pre-check using shared recorder_consumed_sequence;
-- RecorderIO backlog check using last_sample_sequence;
-- exact read_sequence(expected) verification.
+1. producer pre-check against shared consumed sequence;
+2. RecorderIO `latest - last_sample_sequence > ring.maxlen`;
+3. exact `read_sequence(expected)` check.
 
-Keep the latter two inside RecorderIO.
+Keep 2 and 3 inside RecorderIO.
 
 Delete:
 
-- shared.recorder_consumed_sequence;
-- producer-side overflow pre-check;
+- `shared.recorder_consumed_sequence`;
+- producer-side pre-overwrite proof;
 - RecorderIO writes to shared consumed sequence.
 
-RecorderIO keeps only its local:
+RecorderIO keeps a local `last_sample_sequence`.
 
-~~~text
-last_sample_sequence
-~~~
+If a required saved row has been overwritten or cannot be read exactly, fail loudly.
 
-Correctness requirement:
-
-~~~text
-if latest - last_sample_sequence > ring.maxlen
-or read_sequence(expected) fails
-→ loud recording failure
-~~~
-
-No silent loss is allowed.
+A producer overwrite may occur before detection; that is acceptable because the episode fails instead of silently corrupting data.
 
 ---
 
-# 12. Make DISCARD cheap and clean
+# 12. Make DISCARD cheap, but preserve sequence continuity
 
-Operator DISCARD and start-cancel are explicit statements that the data is not wanted.
+For `save=False`, the episode is intentionally unwanted.
 
-Do not fully finalize/validate/publish discarded data.
+Do not spend time finishing/validating data that will be deleted.
 
-For save=False:
+A discard path may:
 
 ~~~text
-stop production / establish stop
-→ close active writers
+stop further producer submission
+→ capture through_sequence
+→ close writers
 → delete staging
 → return saved=False
 ~~~
 
-It is acceptable to skip processing remaining unconsumed sample-ring rows because the entire episode is intentionally discarded.
+It may skip decoding/writing remaining unconsumed ring rows.
 
-Do not convert a normal discard into incomplete_*.
+However, because the record ring uses a global monotonically increasing sequence across episodes, a fast discard MUST advance RecorderIO's local sequence cursor to the discard cutoff before the next START.
 
-Do not write a clean-discard aborted manifest.
-
-Delete the normal .aborted.json path if it has no remaining real failure-diagnostic role.
-
-Storage failures should continue to use incomplete_* + failure_note.json.
-
----
-
-# 13. Remove technical-status/result-sidecar self-proof
-
-The current system has parallel validity sources:
+Conceptually:
 
 ~~~text
-HDF5 technical_status
-episode_*.result.json technical_status
-directory publication state
-frame_status
-termination_reason
-had_pause
+last_sample_sequence = through_sequence
 ~~~
 
-This is too many truths.
+after the discard is accepted/cleaned.
 
-The target meaning should be:
+This is required so the next START begins at the correct `latest_sequence + 1` boundary.
 
-~~~text
-episode_*           = structurally complete raw storage
-incomplete_episode* = storage transaction incomplete/failed
-~~~
+Do not let fast DISCARD create a false missing-sequence error in the next episode.
 
-Training eligibility belongs to dataset processing.
+Do not:
 
-Remove the late-invalidating sidecar mechanism:
+- create `incomplete_*` for a normal discard;
+- write a normal `.aborted.json`;
+- structurally validate data the user explicitly discarded.
 
-- write_recording_failure();
-- episode_*.result.json;
-- record_episode_path shared state;
-- EpisodeReader.require_valid() sidecar lookup.
-
-Remove technical_status once its remaining consumers are replaced by concrete facts.
-
-Do not silently reinterpret technical_status with a new meaning. If removing persisted technical_status changes the current raw metadata contract, perform one intentional schema bump and update all consumers together rather than keeping a compatibility branch.
-
-After sidecar removal, re-check whether shared.is_recording has any real consumer. If not, delete it.
+If an actual writer/cleanup failure occurs while discarding, report that real failure normally.
 
 ---
 
-# 14. Dataset admission after technical_status removal
+# 13. Remove normal `.aborted.json` clutter
 
-Raw -> canonical Zarr remains whole-episode all-or-nothing.
+Delete the clean-discard aborted-manifest behavior.
 
-Do not repair, split, resample, interpolate or silently salvage a trajectory.
+Normal:
 
-Teleop admission should use concrete facts:
+- DISCARD;
+- start-cancelled;
+- empty unwanted capture;
 
-1. published/current supported raw layout;
-2. workflow == teleop;
-3. had_pause == False;
-4. termination_reason is a normal teleop ending;
-5. every flag_frame_status == FRAME_OK;
-6. required tactile-valid fields are true;
-7. required floating arrays are finite;
-8. observation/action timestamps are positive and strictly increasing;
-9. no existing gross control-gap rule is violated;
-10. action timestamp does not precede observation completion;
-11. required source timestamps are present;
-12. RGB-D/calibration/layout checks pass.
+should leave no dataset artifact after successful cleanup.
 
-Define a small explicit normal-termination allowlist from actual current teleop reasons, for example the real equivalents of:
+Keep failure notes only with real `incomplete_*` storage failures.
 
-~~~text
-STOP
-HOME
-max_record_duration
-~~~
-
-Do not guess strings. Inspect OperatorCommand and the current stop() call sites and normalize the reason names once.
-
-Abnormal reasons such as hardware/resource failure, interrupted shutdown, camera unavailable, etc. must be rejected explicitly.
-
-Policy-eval raw episodes remain diagnostic/evaluation data and must not accidentally enter fixed-dt teleop training export.
+Do not replace `.aborted.json` with a differently named normal-discard manifest.
 
 ---
 
-# 15. Keep had_pause; do not create more persisted event flags
+# 14. Keep current training admission; do not add a second new validity framework
 
-had_pause is justified because it denotes a controller-reference reset.
+Because raw v32 `technical_status` remains in this task, do not simultaneously invent a new termination-reason validity ontology.
 
-Do not add analogous persisted flags such as:
+Keep current whole-episode admission based on the existing concrete checks:
 
-- had_ik_failure;
-- had_camera_stale;
-- had_workflow_failure;
-- had_timeout.
+- current supported raw schema/layout;
+- `technical_status` validity;
+- `had_pause == False`;
+- teleop workflow provenance;
+- all frame statuses OK;
+- tactile validity;
+- finite required arrays;
+- timestamp ordering/gross-gap checks;
+- action timestamp after observation;
+- source timestamps present;
+- RGB-D/calibration/geometry validity.
 
-Those events are already represented by:
+The important new effect from this task is:
 
-- frame_status;
-- termination_reason;
-- timestamps.
+- recoverable IK/retarget rows may now exist in otherwise continued raw teleop captures;
+- those rows are already rejected by the existing non-OK frame-status rule.
 
-Keep one fact per concept.
+Do not add row salvage, splitting, repair or resampling.
 
----
-
-# 16. Schema cleanup: do it once, not piecemeal
-
-The current raw schema is v32.
-
-Do not create several schema versions during this task.
-
-After runtime/lifecycle changes are stable, inspect whether a single next-version cleanup is worthwhile.
-
-Candidates include:
-
-- removing technical_status metadata;
-- removing task_success="unknown";
-- removing duplicated stop_reason vs termination_reason;
-- removing duplicated fps vs control_hz;
-- removing wall_fps if unused;
-- removing has_camera / has_timestamps / camera_stream_frames if structural validation already proves them;
-- removing truncated after recorder-owned max-frame logic disappears;
-- removing raw float timestamp if observation_timestamp_ns is the sole control-row time source;
-- removing IPC camera_present if recording rows always require RGB-D.
-
-Only remove persisted fields when all current consumers are updated in the same change.
-
-Do not add runtime compatibility branches for old schemas. Important old raw data can be migrated once if needed.
-
-If the schema cleanup creates too much unrelated risk, leave v32 persisted-field cleanup for a separate change after the runtime simplification is complete.
-
-Correct runtime behavior has higher priority than cosmetic HDF5 cleanup.
+A later raw-schema cleanup can replace `technical_status` with a more direct termination-based contract after migration is planned.
 
 ---
 
-# 17. EpisodeTiming cleanup
+# 15. Explicitly out of scope for this task
 
-Current EpisodeTiming.grid_duration_s is actually populated from recorded timestamp span, not a nominal grid duration.
+Do not modify these unless required to fix a direct regression from the changes above:
 
-Only retain timing abstractions with real consumers.
+- raw schema version;
+- raw float `timestamp` removal;
+- `camera_present` schema cleanup;
+- `min_frames` / `min_frames_met` persisted semantics;
+- duplicated legacy meta attrs such as `fps`, `wall_fps`, `stop_reason`, etc.;
+- `EpisodeTiming` redesign;
+- provenance normalization;
+- point-cloud/calibration ownership;
+- deployment artifact contracts;
+- IK solver algorithm/tolerances;
+- action semantics;
+- tactile semantics.
 
-Prefer eventually reducing to something like:
-
-~~~python
-EpisodeTiming(
-    rate_hz,
-    dt_s,
-)
-~~~
-
-Compute actual raw timestamp span on demand.
-
-Do not maintain grid/wall/non_sampled timing ontology unless a concrete consumer requires it.
-
-Do not combine this with runtime behavior changes if doing so expands the blast radius unnecessarily.
+Do not turn this task into a general recording-schema rewrite.
 
 ---
 
-# 18. Keep provenance validation
-
-Do not delete provenance merely because other validators are being removed.
-
-Current policy-eval provenance carries concrete experimental context including policy/checkpoint/inference and point-cloud configuration.
-
-Keep the existing lightweight normalization unless inspection proves a check has no actual purpose.
-
-This cleanup is about duplicated lifecycle/validity state, not deleting every validator.
-
----
-
-# 19. Keep EpisodeFinalizationError and local lifecycle guards that still separate recovery
+# 16. Keep useful local lifecycle guards
 
 Do not mechanically delete:
 
-- EpisodeFinalizationError;
-- _finishing;
-- resources_released;
-- local immutable result caching;
+- `EpisodeFinalizationError`;
+- `_finishing`;
+- `resources_released`;
+- START acknowledgement;
+- bounded client wait;
+- local final-result caching;
 
-if they still distinguish expected storage-finalization failure from an unexpected RecorderIO programming/process crash.
+if they still prevent or classify a concrete failure.
 
-Delete only machinery with no independent behavioral value.
+Simplification means removing redundant cross-process proof state, not removing every check.
 
 ---
 
-# 20. Expected ownership after the refactor
+# 17. Target ownership after refactor
 
 ## Teleop / PolicyRunner
 
 Own:
 
-- when an episode starts/stops;
-- experiment time/row budget;
-- operator commands;
-- IK retry/pause behavior;
-- termination reason.
+- episode begin/end;
+- operator/control termination;
+- normal episode budget;
+- IK/retarget recovery and pause behavior;
+- experiment-level technical status under current v32 semantics.
 
 ## RecorderClient
 
 Own:
 
 - START/STOP request lifecycle;
-- frame submission;
-- simple local frame count;
-- waiting for recorder results;
-- fail-fast workflow response when required recording becomes unavailable.
+- frame publication to the record ring;
+- local submitted frame count;
+- bounded wait for recorder result;
+- fail-fast reaction when required recorder transport is unavailable.
 
 ## RecorderIO
 
 Own:
 
-- record-sample sequence integrity;
-- backlog/overwrite detection;
-- draining through STOP cutoff;
-- serialization process failure.
+- local sequence cursor;
+- saved-row continuity;
+- STOP cutoff draining;
+- serialization worker health;
+- emergency abnormal close when owner/runtime disappears.
 
 ## EpisodeRecorder
 
-Own only storage:
+Own storage only:
 
-- staging directory;
-- file writers;
+- staging;
+- camera/HDF5 writers;
+- hard resource guard;
 - close;
 - structural validation;
-- atomic publication;
+- atomic publish;
 - incomplete storage preservation.
 
 ## Dataset processing
 
-Own:
+Own training eligibility and canonicalization.
 
-- training eligibility;
-- whole-episode rejection;
-- numerical transforms;
-- canonical Zarr generation.
-
-No other layer should invent a second validity system.
+No other layer should add another validity system.
 
 ---
 
-# 21. Likely files
+# 18. Likely files
 
-Inspect actual current code before editing. Likely relevant files include:
+Inspect actual code before editing. Likely relevant:
 
 ~~~text
 dexmani_real/recording/client.py
 dexmani_real/recording/io_worker.py
 dexmani_real/recording/recorder.py
-dexmani_real/recording/frame.py
-dexmani_real/recording/storage/schema.py
-dexmani_real/recording/storage/reader.py
 dexmani_real/ipc/channels.py
-dexmani_real/ipc/schema.py
 dexmani_real/teleop/loop.py
 dexmani_real/teleop/session.py
 dexmani_real/deployment/runner.py
 dexmani_real/deployment/session.py
 dexmani_real/runtime/processes.py
 dexmani_real/dataset/processing.py
-examples/visualize_episode.py
 README.md
 AGENTS.md
 ~~~
 
-Do not perform unrelated deployment, calibration, point-cloud, IK-algorithm or style refactors.
+Touch `recording/frame.py`, raw schema, reader, visualizer, etc. only if required by a concrete compile/runtime dependency from the above changes.
 
-Preserve the recently simplified deployment/action/calibration ownership from the current main branch.
-
----
-
-# 22. Required implementation order
-
-Use this order to minimize debugging cost.
-
-1. Inspect local git status and preserve unrelated work.
-2. Re-read actual current definitions and all consumers before editing.
-3. Make teleop IK/retarget failures recoverable and align them with policy-eval semantics.
-4. Remove retain_partial and fix episode/incomplete storage meaning.
-5. Increase record_sample_ring_maxlen from 4 to 16.
-6. Implement simple/fast DISCARD behavior and remove normal aborted manifests.
-7. Move max episode budget out of Recorder and remove recorder capacity auto-stop.
-8. Remove min-frames runtime/storage propagation.
-9. Simplify RecordingStarted / RecordingResult / poll_stop / join_stop.
-10. Remove shared finalization deadline/completed state.
-11. Remove shared recorder_consumed_sequence and producer-side duplicate overflow proof.
-12. Remove result-sidecar/record_episode_path machinery.
-13. Replace training dependence on technical_status with concrete termination/frame/pause checks.
-14. Remove technical_status cleanly; bump raw schema once only if required by persisted-contract policy.
-15. Re-check shared.is_recording and delete it if no independent consumer remains.
-16. Update README/AGENTS comments only where behavior changed.
-17. Run focused offline smoke checks.
-18. Search globally for stale fields/concepts before final handoff.
-
-Do not use git reset --hard.
-
-Do not run hardware-affecting examples.
+Do not perform unrelated deployment, calibration, point-cloud, IK-algorithm, schema or style refactors.
 
 ---
 
-# 23. Focused offline smoke checks
+# 19. Required implementation order
 
-The repository intentionally has no general committed tests directory. Use focused pure/offline checks and existing smoke-test style where appropriate.
+Use this order.
 
-At minimum validate these cases.
+1. Inspect `git status --short`, local HEAD and actual consumers.
+2. Trace the current recording path end-to-end:
+   ~~~text
+   teleop/policy owner
+   -> RecorderClient
+   -> record ring
+   -> RecorderIO
+   -> EpisodeRecorder
+   -> EpisodeReader/dataset admission
+   ~~~
+3. Make teleop IK/retarget failure recoverable.
+4. Remove `retain_partial` and correct complete-vs-incomplete storage semantics.
+5. Implement abnormal owner/runtime shutdown close without misclassifying it as storage failure.
+6. Change record ring default from 4 to 16.
+7. Move normal max-duration/max-row ownership out of Recorder; retain only a high hard guard.
+8. Add the sequence-safe fast DISCARD path and remove normal aborted manifests.
+9. Simplify RecordingStarted/RecordingResult/poll/join semantics.
+10. Remove shared finalization deadline/completed proof state.
+11. Remove shared consumed-sequence proof.
+12. Remove result sidecar + `record_episode_path`; delete `shared.is_recording` if now dead.
+13. Update stale README/comments.
+14. Run focused offline smoke checks.
+15. Search for dead references and inspect the full final diff.
 
-## Lifecycle
+Do not bump raw schema.
 
-### normal save
+Do not use `git reset --hard`.
+
+Do not execute hardware-affecting commands.
+
+---
+
+# 20. Required focused offline checks
+
+Use existing pure/offline smoke-test style or focused one-off tests. Do not restore a broad committed tests directory.
+
+## 20.1 Normal save
 
 ~~~text
 START
-→ N rows
+→ N exact source rows
 → STOP(save=True, cutoff=N)
-→ exact N rows
+→ exact rows serialized
+→ validation succeeds
 → episode_* published
 ~~~
 
-### discard
+## 20.2 STOP with RecorderIO backlog
+
+Ensure every sequence through cutoff is serialized exactly once.
+
+## 20.3 Transient teleop IK failure
+
+Verify:
+
+~~~text
+FRAME_IK_FAIL row recorded
+no RobotCommand published for failed tick
+episode remains active
+next control tick is allowed
+~~~
+
+Do the equivalent for retarget failure if practical without hardware.
+
+## 20.4 Repeated teleop failure
+
+Existing threshold still causes pause/re-anchor behavior.
+
+## 20.5 Policy-eval IK failure regression
+
+Existing behavior remains:
+
+~~~text
+failed diagnostic row
+action chunk cleared
+runtime continues
+~~~
+
+## 20.6 Training rejection
+
+A raw teleop episode containing any non-OK frame status is still rejected whole.
+
+A `had_pause=True` episode is still rejected whole.
+
+## 20.7 Normal discard
 
 ~~~text
 START
-→ rows
+→ some consumed and some unconsumed rows
 → DISCARD
+→ writers close
+→ staging deleted
+→ local recorder sequence cursor advances to cutoff
+→ next START accepts the next global sequence
 → no episode_*
 → no incomplete_*
 → no .aborted.json
 ~~~
 
-### start cancellation
+This check is important.
 
-~~~text
-START
-→ cancel before real run
-→ clean cleanup
-→ no persisted episode
-~~~
+## 20.8 Ring overwrite / missing sequence
 
-## Control failures
+Must:
 
-### transient teleop IK failure
+- fail loudly;
+- latch workflow failure;
+- revoke active motion;
+- not publish a normal episode.
 
-~~~text
-FRAME_IK_FAIL recorded
-→ no invalid RobotCommand publish
-→ episode remains active
-→ next control attempts continue
-~~~
+## 20.9 Real storage-write/finalization failure
 
-### repeated teleop failures
+Must not publish a normal `episode_*`.
 
-~~~text
-existing failure threshold reached
-→ pause
-→ controller reference cleared
-→ resume requires fresh post-pause re-anchor
-~~~
+Preserve useful `incomplete_*` staging after resources close when possible.
 
-### policy-eval IK failure
+## 20.10 Runtime/owner disappearance
 
-Verify existing behavior remains:
+With an active capture and no explicit STOP:
 
-~~~text
-diagnostic row
-→ action chunk cleared
-→ runtime continues
-~~~
+- use a bounded emergency cutoff;
+- attempt normal close of structurally usable raw data;
+- mark current v32 experiment status abnormal;
+- reject it via existing training validity;
+- only use `incomplete_*` if storage close itself fails.
 
-## Recorder integrity
+## 20.11 Result wait timeout
 
-### STOP with backlog
+Client fails the workflow and shutdown remains bounded without the removed shared deadline/completion proof fields.
 
-RecorderIO must drain every sequence through cutoff.
+## 20.12 Hard recorder frame ceiling
 
-### ring overwrite
-
-Must fail loudly, set workflow_failed and revoke motion.
-
-### missing expected sequence
-
-Must fail loudly.
-
-### write/finalization failure
-
-Must not publish normal episode_*.
-
-Preserve incomplete_* when useful diagnostic staging exists.
-
-### recorder result timeout
-
-Caller reports workflow failure and shutdown proceeds without shared deadline-proof state.
-
-## Dataset
-
-### normal teleop episode
-
-Exports successfully.
-
-### episode with any non-OK frame
-
-Whole episode rejected.
-
-### had_pause=True
-
-Whole episode rejected.
-
-### abnormal termination_reason
-
-Whole episode rejected.
-
-### policy_eval provenance
-
-Rejected by fixed-dt teleop exporter.
+Exceeding the defensive hard cap is a recording/resource failure, not a valid auto-stopped/truncated episode.
 
 ---
 
-# 24. Low-cost repository checks
+# 21. Low-cost repository checks
 
 Run:
 
@@ -1030,141 +871,152 @@ ruff check --select F401,F821,F822,F823,I dexmani_real examples
 git diff --check
 ~~~
 
-If Ruff is unavailable, report it. Do not install or upgrade packages merely to run the check.
+If Ruff is unavailable, report it; do not install/upgrade the experiment environment merely for linting.
 
-Also run relevant existing pure Python smoke tests already present in the repository if they do not connect hardware.
+Run relevant existing offline smoke tests that do not connect hardware.
 
-Never execute:
+Never run:
 
 - teleoperation;
-- policy rollout against hardware;
+- real policy rollout;
 - homing;
+- physical replay;
 - camera capture;
-- XHand/xArm SDK discovery;
+- live xArm/XHand/RealSense discovery;
 - calibration writes.
 
 ---
 
-# 25. Final stale-reference audit
+# 22. Final stale-reference audit
 
-Before finishing, search at least for:
+Search at minimum for:
 
 ~~~text
 retain_partial
-technical_status
-result.json
-write_recording_failure
-record_episode_path
+deadline_monotonic_ns
 recorder_finish_deadline_ns
 recorder_completed_ns
 recorder_consumed_sequence
+_terminal_result_delivered
 max_frames_stop_reason
 max_frames_reached
 _ROLLOUT_RECORDER_FRAME_MARGIN
-min_frames_met
-min_frames
 aborted.json
+write_recording_failure
+record_episode_path
 shared.is_recording
 FRAME_IK_FAIL
 FRAME_RETARGET_FAIL
+technical_status
 had_pause
-termination_reason
 ~~~
 
-Not every occurrence must become zero.
+Expected outcome:
 
-Expected remaining examples:
+- `retain_partial`: zero;
+- shared deadline/completed proof: zero;
+- shared consumed sequence: zero;
+- result-sidecar path: zero;
+- normal aborted manifest: zero;
+- rollout frame-margin/budget protocol: zero;
+- `shared.is_recording`: zero if no independent consumer remains;
+- `FRAME_IK_FAIL/FRAME_RETARGET_FAIL`: remain in diagnostics/control/data rejection;
+- `technical_status`: remains only because raw v32 contract is intentionally preserved;
+- `had_pause`: remains intentionally.
 
-- FRAME_IK_FAIL / FRAME_RETARGET_FAIL in frame diagnostics and dataset rejection;
-- had_pause in teleop recording metadata/admission;
-- termination_reason in raw metadata/admission.
-
-Every remaining removed-concept occurrence must have a concrete current purpose.
+Inspect every remaining occurrence rather than mechanically forcing all searches to zero.
 
 ---
 
-# 26. Acceptance criteria
+# 23. Acceptance criteria
 
 The task is complete only when all of the following are true.
 
-## Runtime semantics
+## Control behavior
 
-- teleop and action_ee policy evaluation treat isolated IK failure as recoverable;
-- failed IK never publishes an invalid new command;
-- repeated teleop failures use the existing pause/re-anchor path;
-- recorder/storage failure still revokes active motion immediately.
+- isolated teleop IK/retarget failures are recoverable;
+- failed control ticks publish no invalid new command;
+- repeated failures still use existing pause/fresh-reanchor behavior;
+- action_ee policy-eval failure semantics are not regressed.
 
-## Recording semantics
+## Required-recorder safety
 
-- controller and recorder reuse the same ObservationRow;
-- no silent row drop exists;
-- STOP cutoff is exact;
-- RecorderIO remains separate;
-- normal save still structurally validates before atomic publish;
-- episode_* means storage-complete raw data;
-- incomplete_* means storage/serialization failure, not merely experiment failure;
-- normal DISCARD leaves no dataset/manifest clutter.
+- real recorder/transport failure still immediately revokes active motion;
+- recorder failure remains workflow failure, not automatic arm/hand FAULT.
 
-## Simplicity
+## Recording integrity
 
-- retain_partial is gone;
-- deadline/completed cross-process proof state is gone;
-- exactly-once final-result delivery state is gone;
-- recorder no longer owns experiment max/min frame policy;
+- same ObservationRow is used for control and raw recording;
+- no silent row loss;
+- SAVE drains exact STOP cutoff;
+- normal saved data structurally validates before atomic publish;
+- storage failure cannot become normal `episode_*`;
+- abnormal-but-structurally-complete experiment data is not mislabeled as storage-incomplete.
+
+## DISCARD
+
+- discard does not unnecessarily serialize backlog;
+- discard advances the local sequence cursor correctly;
+- the next episode starts at the correct global sequence;
+- normal discard leaves no manifest/dataset clutter.
+
+## Complexity
+
+- `retain_partial` is gone;
+- shared finalization deadline/completed proof is gone;
+- exactly-once final-result delivery machinery is gone;
 - shared consumed-sequence proof is gone;
+- recorder no longer owns normal experiment duration;
 - result-sidecar invalidation is gone;
-- no replacement framework with equivalent complexity was introduced.
+- no equivalent replacement framework is introduced.
 
-## Data admission
+## Resource robustness
 
-- teleop training admission uses concrete experiment facts;
-- had_pause remains meaningful and enforced;
-- non-OK frame status rejects the whole episode;
-- abnormal termination rejects the whole episode;
-- policy_eval raw data does not enter teleop fixed-dt training;
-- no row repair/splitting/resampling is introduced.
+- record ring default is 16;
+- a simple high hard frame/resource guard remains;
+- exceeding it fails recording rather than producing a normal truncated episode.
 
-## Performance
+## Persisted-data scope
 
-- record_sample_ring default is 16;
-- no new blocking disk/video work is added to the control loop;
-- DISCARD is cheaper than SAVE;
-- no unnecessary polling/IPC state is added.
+- raw schema remains v32;
+- existing v32 persisted semantics are not silently reinterpreted;
+- no historical-data migration is required by this task.
 
-## Scope
+## Scope safety
 
-No regression or unrelated redesign in:
+No unrelated redesign/regression in:
 
-- arm/hand hardware worker behavior;
 - SafetyState;
 - run_id stale-command fencing;
-- robot-command latest-target semantics;
-- camera/point-cloud calibration ownership;
-- online IK algorithm itself;
-- tactile semantics;
-- raw->Zarr action semantics;
-- deployment action ownership.
+- latest-target RobotCommand semantics;
+- arm/hand workers;
+- camera/calibration;
+- point cloud;
+- online IK algorithm/tuning;
+- tactile validity;
+- action/action_ee semantics;
+- raw -> Zarr whole-episode policy.
 
 ---
 
-# 27. Final decision rule
+# 24. Final decision rule
 
-For every recording mechanism kept or added, ask:
+For every mechanism kept or added, ask:
 
-> What concrete bad experiment, lost row, corrupt file, unsafe continuation, or ambiguous scientific datum does this prevent?
+> What concrete bad experiment, lost row, corrupt file, unsafe continuation, or wrong episode boundary does this prevent?
 
 If the answer is only:
 
 > it proves another internal state is correct
 
-delete it.
+remove it.
 
-For every stored field, ask:
+For every proposed deletion, also ask:
 
-> Is this a real experiment fact that cannot be unambiguously derived from already stored facts?
+> Does this cheap mechanism currently protect a real hardware, storage, sequence, or historical-data invariant?
 
-If not, do not add another persisted truth.
+If yes, keep the invariant and simplify only its implementation.
 
-The target is not the smallest possible recorder.
+The target is not the shortest recorder.
 
-The target is the smallest recorder that is still reliable for repeated real-robot PhD experiments.
+The target is the smallest reliable runtime recorder for repeated real-robot PhD experiments, without forcing a raw-data migration in the same change.
