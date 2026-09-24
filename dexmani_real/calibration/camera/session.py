@@ -1,7 +1,7 @@
 """Interactive ArUco eye-to-hand calibration with xArm7 and a fixed RealSense camera.
 
 Estimates T_world_camera from an end-effector marker using five OpenCV hand-eye
-methods and saves accepted results to ``dexmani_real/config/cameras.json``.
+methods and saves accepted results to ``dexmani_real/calibration/state/cameras.json``.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 
+from dexmani_real.calibration import CAMERAS_PATH
 from dexmani_real.calibration.camera.motion import (
     CalibrationLoopState,
     HomeKeyOutcome,
@@ -29,7 +30,6 @@ from dexmani_real.calibration.camera.motion import (
 from dexmani_real.calibration.camera.solver import (
     ARUCO_DICT,
     ARUCO_DICT_NAME,
-    CAMERA_CALIBRATION_PATH,
     ArucoConfig,
     CalibrationConfig,
     CalibrationSamples,
@@ -65,11 +65,10 @@ _WINDOW_NAME = "ArUco Calibration"
 _CAMERA_WIDTH = 640
 _CAMERA_HEIGHT = 480
 _CAMERA_FPS = 30
-_CAMERA_WARMUP_FRAMES = 30
 
 
 def _detect_aruco_stable(
-    pipeline: Any,
+    shared: RuntimeChannels,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
     *,
@@ -85,7 +84,7 @@ def _detect_aruco_stable(
     for _ in range(n_frames):
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            frame = read_camera_frame(pipeline)
+            frame = read_camera_frame(shared)
             if (
                 frame
                 and frame["timestamp_ns"] > last_stamp
@@ -151,7 +150,6 @@ def _runtime_issue(shared: RuntimeChannels, arm_process: Any, max_age_s: float) 
 def _capture_calibration_sample(
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
-    pipeline: Any,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
     samples: CalibrationSamples,
@@ -165,7 +163,7 @@ def _capture_calibration_sample(
         return
     try:
         aruco_pose = _detect_aruco_stable(
-            pipeline,
+            shared,
             intrinsics,
             distortion,
             marker_size_m=aruco_config.marker_size_m,
@@ -368,7 +366,7 @@ def _solve_and_save_calibration(
         save_camera_calibration(
             T_world_camera,
             camera_serial,
-            CAMERA_CALIBRATION_PATH,
+            CAMERAS_PATH,
             calibration_capture=_calibration_capture_metadata(
                 intrinsics=intrinsics,
                 distortion=distortion,
@@ -389,7 +387,7 @@ def _solve_and_save_calibration(
 
 
 def _show_calibration_preview(
-    pipeline: Any,
+    shared: RuntimeChannels,
     detector: cv2.aruco.ArucoDetector,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
@@ -401,7 +399,7 @@ def _show_calibration_preview(
     max_frame_age_s: float,
 ) -> np.ndarray | None:
     """Poll and display the newest camera preview without blocking control."""
-    frame = read_camera_frame(pipeline)
+    frame = read_camera_frame(shared)
     display_image = previous_image
     if frame and sample_is_fresh(frame["timestamp_ns"], max_frame_age_s):
         image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
@@ -426,7 +424,6 @@ def _handle_calibration_sample_events(
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
-    pipeline: Any,
     serial: str,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
@@ -442,7 +439,6 @@ def _handle_calibration_sample_events(
             _capture_calibration_sample(
                 shared,
                 runtime,
-                pipeline,
                 intrinsics,
                 distortion,
                 state.samples,
@@ -491,7 +487,6 @@ def _run_calibration(
         set_calibration_fault(shared, "initial arm feedback is unavailable or unhealthy")
         return 1
 
-    pipeline: Any | None = None
     keys = KeyboardInput(
         suppress_echo=True,
         capture_commands=False,
@@ -504,7 +499,6 @@ def _run_calibration(
     keys_started = False
     window_created = False
     try:
-        pipeline = shared
         serial = shared.camera_serial.value.decode()
         geometry = json.loads(shared.camera_geometry.value.decode())["color"]
         intrinsics = np.array(
@@ -527,7 +521,6 @@ def _run_calibration(
             planner,
             workspace,
             arm_process,
-            pipeline,
             serial,
             intrinsics,
             distortion,
@@ -562,7 +555,6 @@ def _run_calibration_control_loop(
     planner: XArm7MotionPlanner,
     workspace: np.ndarray,
     arm_process: Any,
-    pipeline: Any,
     serial: str,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
@@ -592,7 +584,7 @@ def _run_calibration_control_loop(
         rate.wait()
         state.frame += 1
         display_image = _show_calibration_preview(
-            pipeline,
+            shared,
             preview_detector,
             intrinsics,
             distortion,
@@ -607,7 +599,6 @@ def _run_calibration_control_loop(
             shared,
             runtime,
             planner,
-            pipeline,
             serial,
             intrinsics,
             distortion,

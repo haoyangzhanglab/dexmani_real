@@ -190,7 +190,7 @@ class TableCollisionConfig:
     """
 
     enabled: bool = True
-    plane_path: str | None = "dexmani_real/config/desk_plane.json"
+    plane_path: str | None = "dexmani_real/calibration/state/table_plane.json"
     plane_abcd: tuple[float, float, float, float] = (0.0, 0.0, 1.0, -0.022)
     size_xy_m: tuple[float, float] = (2.0, 2.0)
     thickness_m: float = 0.04

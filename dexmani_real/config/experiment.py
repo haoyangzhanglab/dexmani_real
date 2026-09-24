@@ -51,7 +51,7 @@ class ExperimentConfig:
 
 
 def config_as_dict(value: Any) -> Any:
-    """Convert actual configuration values for on-demand YAML printing."""
+    """Convert configuration values for printing and run-configuration serialization."""
     if dataclasses.is_dataclass(value):
         return {f.name: config_as_dict(getattr(value, f.name)) for f in dataclasses.fields(value)}
     if isinstance(value, Mapping):
@@ -170,14 +170,22 @@ def validate_config(cfg: ExperimentConfig) -> None:
         raise ValueError("keyboard workspace command margin leaves no interior workspace")
 
 
+def resolve_table_plane_path(table: TableCollisionConfig) -> Path:
+    """Resolve the configured plane path relative to the repository root."""
+    if table.plane_path is None:
+        raise RuntimeError("runtime table calibration has no plane_path")
+    path = Path(table.plane_path).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[2] / path
+    return path.resolve()
+
+
 def resolve_table_plane(table: TableCollisionConfig) -> tuple[float, float, float, float]:
     """Read the current plane file, or use inline geometry when plane_path is null."""
     if table.plane_path is None:
         table.validate()
         return tuple(float(value) for value in table.plane_abcd)
-    plane_path = Path(table.plane_path)
-    if not plane_path.is_absolute():
-        plane_path = Path(__file__).resolve().parents[2] / plane_path
+    plane_path = resolve_table_plane_path(table)
     try:
         with plane_path.open(encoding="utf-8") as stream:
             plane = json.load(stream)

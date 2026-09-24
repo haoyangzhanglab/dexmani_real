@@ -13,11 +13,9 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real import PACKAGE_DIR
 from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.utils.atomic_io import atomic_json_dump
 
-CAMERA_CALIBRATION_PATH = PACKAGE_DIR / "config" / "cameras.json"
 ARUCO_DICT = cv2.aruco.DICT_7X7_50
 ARUCO_DICT_NAME = "7x7_50"
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Usage: python examples/calibrate_camera.py --hand-geometry {absent,secured-home}
 
-Moves xArm7 and saves cameras.json on ENTER. Use absent only without XHand;
-secured-home requires a hand fixed at home. Both use the fixed-home collision envelope.
+Moves xArm7 and saves dexmani_real/calibration/state/cameras.json on ENTER.
+Use absent only without XHand; secured-home requires a hand fixed at home.
+Both use the fixed-home collision envelope.
 """
 
 from __future__ import annotations

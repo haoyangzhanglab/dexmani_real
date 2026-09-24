@@ -412,8 +412,8 @@ class TAGHandRetargeter:
     -> tips [4, 8, 12, 16, 20] minus wrist[0] -> R_mano_to_urdf -> solve
     -> remap model joints to (12,) SDK order.
 
-    Shares retarget()/reset() with DexPilotHandRetargeter. hand_type defaults
-    to right; debug enables per-frame timing logs.
+    Uses right-hand geometry and shares retarget()/reset() with
+    DexPilotHandRetargeter. debug enables per-frame timing logs.
     """
 
     def __init__(
@@ -421,7 +421,6 @@ class TAGHandRetargeter:
         fingertip_link_names: tuple[str, ...],
         tag_config: Any,
         urdf_path: str,
-        hand_type: str = "right",
         debug: bool = False,
     ) -> None:
         from scipy.spatial.transform import Rotation
@@ -549,11 +548,7 @@ class TAGHandRetargeter:
 
 
 def pin_loading(urdf_path: str):
-    """Load a URDF with Pinocchio FreeFlyer model.
-
-    Extracted so TAGHandRetargeter.__init__ doesn't need a module-level
-    pinocchio import (consistent with the project's lazy-SDK-import pattern).
-    """
+    """Load a free-flyer URDF, importing Pinocchio only when constructing the backend."""
     import pinocchio as pin
 
     return pin.buildModelFromUrdf(urdf_path, pin.JointModelFreeFlyer())

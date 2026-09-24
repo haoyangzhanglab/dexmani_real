@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Usage: python examples/calibrate_vr_heading.py
 
-Uses live VR samples to save config/vr_transform.json after quality checks; no robot connection.
+Uses live VR samples to save dexmani_real/calibration/state/vr_transform.json
+after quality checks; no robot connection.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from datetime import datetime
 
 import numpy as np
 
-from dexmani_real import PACKAGE_DIR
+from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz, normalize_quat_wxyz
 from dexmani_real.runtime.processes import shutdown_processes_verified
@@ -29,8 +30,6 @@ from dexmani_real.teleop.vr_transform import (
     VR_TRANSFORM_SCHEMA_VERSION,
 )
 from dexmani_real.utils.atomic_io import atomic_json_dump
-
-_OUTPUT_PATH = PACKAGE_DIR / "config" / "vr_transform.json"
 
 _MIN_FORWARD_NORM = 1e-6
 _POLL_INTERVAL_S = 0.01
@@ -386,9 +385,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    if _OUTPUT_PATH.exists():
-        backup = _OUTPUT_PATH.with_suffix(f".json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        shutil.copy2(_OUTPUT_PATH, backup)
+    if VR_TRANSFORM_PATH.exists():
+        backup = VR_TRANSFORM_PATH.with_suffix(
+            f".json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        shutil.copy2(VR_TRANSFORM_PATH, backup)
         print(f"  backed up previous transform → {backup.name}")
 
     config = {
@@ -400,8 +401,8 @@ def main(argv: list[str] | None = None) -> int:
         "ref": args.ref,
         "quality": {**quality, "frames": inlier_frames},
     }
-    atomic_json_dump(config, _OUTPUT_PATH)
-    print(f"\nSaved to: {_OUTPUT_PATH}")
+    atomic_json_dump(config, VR_TRANSFORM_PATH)
+    print(f"\nSaved to: {VR_TRANSFORM_PATH}")
 
     _play_completion_audio()
     return 0

@@ -21,7 +21,6 @@ class TeleopConfig:
     task_label: str = ""
     operator: str = ""
     hand_urdf_path: str = field(default_factory=lambda: str(XHAND_RIGHT_URDF_PATH))
-    vr_transform_path: str = "dexmani_real/config/vr_transform.json"
 
     def __post_init__(self) -> None:
         if not self.hand_urdf_path:

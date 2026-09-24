@@ -1,1 +1,1 @@
-"""Shared utilities — schema, log, serialization, rate limiting, signal processing, and joint-limit helpers."""
+"""Atomic file operations, logging, loop timing, and joint-limit helpers."""

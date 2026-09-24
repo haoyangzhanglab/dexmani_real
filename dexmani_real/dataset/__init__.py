@@ -1,1 +1,1 @@
-"""Offline cleaning and policy-ready views for recorded episodes."""
+"""Whole-episode validation and canonical training-cache export from raw recordings."""

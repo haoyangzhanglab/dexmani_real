@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from dexmani_real.calibration import CAMERAS_PATH, VR_TRANSFORM_PATH
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.recording.io_worker import RecorderIOConfig, recorder_io_loop
@@ -55,14 +56,13 @@ def validate_operator(value: str) -> str:
     return value
 
 
-def _validate_recording_resources(repo_root: Path) -> None:
+def _validate_recording_resources() -> None:
     """Ensure files needed by recording and FK workers exist before startup."""
     required = (
         XARM7_XHAND_COLLISION_URDF_PATH,
         XARM7_XHAND_RIGHT_URDF_PATH,
         XARM7_XHAND_SRDF_PATH,
-        repo_root / "dexmani_real" / "config" / "cameras.json",
-        repo_root / "dexmani_real" / "config" / "vr_transform.json",
+        CAMERAS_PATH,
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
@@ -145,9 +145,9 @@ def run_teleop_experiment(
                 "episode budget instead of increasing the recorder hard guard."
             )
     repo_root = Path(__file__).resolve().parents[2]
-    load_vr_transform(repo_root / "dexmani_real/config/vr_transform.json")
+    load_vr_transform(VR_TRANSFORM_PATH)
     if runtime.policy.recording_enabled:
-        _validate_recording_resources(repo_root)
+        _validate_recording_resources()
     ctx = mp.get_context("spawn")
     shared = RuntimeChannels.create(
         prefix=f"dexmani_collect_{os.getpid()}",

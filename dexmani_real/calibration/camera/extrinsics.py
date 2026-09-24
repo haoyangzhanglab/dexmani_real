@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real import PACKAGE_DIR
+from dexmani_real.calibration import CAMERAS_PATH
 
 
 def _pose_to_matrix(position: list[float], orientation: list[float]) -> np.ndarray:
@@ -90,23 +90,18 @@ class CameraExtrinsicsEntry:
 
 
 class CameraExtrinsics:
-    def __init__(self, calib_path: str | None = None):
+    def __init__(self, calib_path: str | Path | None = None):
         if calib_path is None:
-            calib_path = self._resolve_default_path()
+            calib_path = CAMERAS_PATH
         self.calib_path = Path(calib_path).resolve()
         self._entries: dict[str, CameraExtrinsicsEntry] = {}
         self._load()
-
-    @classmethod
-    def _resolve_default_path(cls) -> str:
-        """Return the single authoritative cameras.json path."""
-        return str(PACKAGE_DIR / "config" / "cameras.json")
 
     def _load(self) -> None:
         if not self.calib_path.exists():
             raise FileNotFoundError(
                 f"Calibration file not found: {self.calib_path}\n"
-                "Create it at dexmani_real/config/cameras.json with format:\n"
+                f"Create it at {self.calib_path} with format:\n"
                 '  {"camera_0": {"serial": "...", "type": "eye_to_hand", '
                 '"pose": {"position": [x,y,z], "orientation": [w,x,y,z]}}}'
             )
@@ -173,7 +168,7 @@ class CameraExtrinsics:
     def get_extrinsics(self, cam_name: str, T_base_eef: np.ndarray | None = None) -> np.ndarray:
         """Return the camera extrinsic (4,4).
 
-        For eye_to_hand: returns the static T_world_camera from config (WORLD frame,
+        For eye_to_hand: returns the static T_world_camera from calibration (WORLD frame,
             consistent with recorded eef_pos / arm_ee).
         For eye_in_hand: computes T_base_eef @ T_eef_camera (in the frame of the
             passed eef pose), requires T_base_eef.

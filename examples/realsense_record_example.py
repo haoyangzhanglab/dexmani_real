@@ -619,13 +619,7 @@ def main() -> int:
     print("=" * 60)
     print(f"OpenCV       : {cv2.__version__}")
     print(f"NumPy        : {np.__version__}")
-    try:
-        import pyrealsense2 as rs  # noqa: F401
-
-        print("pyrealsense2 : installed")
-    except ImportError:
-        print("pyrealsense2 : NOT INSTALLED")
-        return 1
+    print("pyrealsense2 : installed")
 
     cameras = _list_cameras()
     if not cameras:

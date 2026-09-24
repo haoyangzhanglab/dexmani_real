@@ -2,10 +2,10 @@
 
 import signal
 import time
-from pathlib import Path
 
 import numpy as np
 
+from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import make_online_ik_config
 from dexmani_real.recording.client import RecorderClient
@@ -98,9 +98,7 @@ def teleop_loop(shared, config):
         planner = XArm7MotionPlanner.create_default(
             online_ik_profile=make_online_ik_config(runtime)
         )
-        calibration = load_vr_transform(
-            Path(__file__).resolve().parents[2] / config.vr_transform_path
-        )
+        calibration = load_vr_transform(VR_TRANSFORM_PATH)
         mapping = runtime.policy.vr_mapping
         mapper = VRWristMapper(
             pos_scale=mapping.pos_scale,

@@ -17,6 +17,8 @@
     python examples/collect_teleop.py --print-config
     python examples/collect_teleop.py --config experiment.yaml --print-config
 
+已接受的相机、桌面和 VR 标定状态保存在 `dexmani_real/calibration/state/`，由对应的标定入口显式更新。
+
 Teleop、键盘控制和 policy 分别使用各自的控制周期，replay 使用录制频率。动作生产频率不得高于相关执行器 worker 的服务频率；worker 频率不等于设备物理伺服频率。
 
 ## 常用入口

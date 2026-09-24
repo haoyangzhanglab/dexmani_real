@@ -1,1 +1,1 @@
-"""Robot hardware — xArm7 + XHand drivers, arm loop."""
+"""Worker-owned xArm7 and XHand control."""

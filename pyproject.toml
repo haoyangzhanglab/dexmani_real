@@ -30,7 +30,7 @@ exclude = ["tests*", "examples*", "assets*", "docs*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-"dexmani_real.config" = ["*.json"]
+"dexmani_real.calibration" = ["state/*.json"]
 
 [tool.isort]
 profile = "black"

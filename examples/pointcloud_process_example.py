@@ -2,7 +2,7 @@
 """Usage: python examples/pointcloud_process_example.py [--save-dir DIR]
 
 Live RealSense/OpenCV/Open3D diagnostic; --save-dir saves RGB-D, clouds and reconstruction metadata.
-Table fitting needs confirmation; the fit is used immediately. Publishing desk_plane.json
+Table fitting needs confirmation; the fit is used immediately. Publishing table_plane.json
 needs separate confirmation and affects perception and collision geometry on the next run.
 """
 
@@ -25,9 +25,9 @@ from scipy.spatial.transform import Rotation as R
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.calibration.table import fit_table_plane, publish_table_plane
 from dexmani_real.config.experiment import (
-    ExperimentConfig,
     resolve_experiment_config,
     resolve_table_plane,
+    resolve_table_plane_path,
 )
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
@@ -456,16 +456,6 @@ def _load_extrinsics(camera_info: dict) -> tuple[np.ndarray, float]:
     return base_from_color, elapsed
 
 
-def _resolve_table_plane_path(runtime: ExperimentConfig) -> Path:
-    table = runtime.environment.table
-    if table.plane_path is None:
-        raise RuntimeError("runtime table calibration has no plane_path")
-    path = Path(table.plane_path)
-    if not path.is_absolute():
-        path = Path(__file__).resolve().parents[1] / path
-    return path
-
-
 def _calibrate_table(
     *,
     camera: RealSenseCamera,
@@ -817,7 +807,7 @@ def main(argv: list[str] | None = None) -> int:
                 geometry=geometry,
                 T_xarm_base_from_color=T_xarm_base_from_color,
                 config=pcd_config,
-                plane_path=_resolve_table_plane_path(runtime),
+                plane_path=resolve_table_plane_path(runtime.environment.table),
                 frame_count=cfg.table_calibration_frames,
             )
             all_timings["desk_calib"] = calibration_ms
@@ -827,7 +817,7 @@ def main(argv: list[str] | None = None) -> int:
             table_plane_source = "resolved_runtime"
             all_timings["desk_calib"] = math.nan
             print(
-                "  Table calibration skipped; using resolved desk_plane.json: "
+                "  Table calibration skipped; using resolved table_plane.json: "
                 f"{np.round(table_plane_abcd, 6)}"
             )
         else:
