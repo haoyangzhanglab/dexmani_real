@@ -4,11 +4,13 @@
 
 Repository: `haoyangzhanglab/dexmani_real`
 
-Design baseline reviewed against `main` at commit:
+Implementation baseline reviewed against `main` at commit:
 
 ```text
 5e21b3df72cb956e00f7d8dd70e3acfc9ba10d0f
 ```
+
+The only later commit at the time of the final design review added this task document; re-check current HEAD before editing as required below.
 
 This task is a focused repository-structure cleanup. Do not broaden it into a configuration-framework rewrite.
 
@@ -134,13 +136,13 @@ After the migration, `dexmani_real/config/` should contain only Python configura
 
 ---
 
-## 2. Use `dexmani_real/calibration/__init__.py` as the single source of canonical state paths
+## 2. Keep fixed calibration resource paths in `dexmani_real/calibration/__init__.py`
 
 Do **not** create `calibration/paths.py`.
 
-The existing `dexmani_real/calibration/__init__.py` is intentionally tiny and is an appropriate resource boundary. Keep it side-effect free and dependent only on the standard library.
+The existing `dexmani_real/calibration/__init__.py` is intentionally tiny and is an appropriate resource boundary for calibration resources that are not runtime-configurable. Keep it side-effect free and dependent only on the standard library.
 
-Define canonical paths there, for example:
+Define the state directory and fixed camera/VR paths there, for example:
 
 ```python
 from pathlib import Path
@@ -148,15 +150,17 @@ from pathlib import Path
 CALIBRATION_STATE_DIR = Path(__file__).resolve().parent / "state"
 
 CAMERAS_PATH = CALIBRATION_STATE_DIR / "cameras.json"
-TABLE_PLANE_PATH = CALIBRATION_STATE_DIR / "table_plane.json"
 VR_TRANSFORM_PATH = CALIBRATION_STATE_DIR / "vr_transform.json"
 ```
+
+Do **not** force the table plane into the same absolute-path mechanism. `TableCollisionConfig.plane_path` is an actual serializable runtime configuration field with supported YAML/data overrides, so its default should remain a stable package-relative string and be resolved through the runtime resolver.
 
 Requirements:
 
 - Importing `dexmani_real.calibration` must not connect hardware.
-- Do not import camera SDKs, NumPy, calibration algorithms, or teleop code from `calibration/__init__.py`.
-- These constants are the only canonical package-internal defaults for the three state files.
+- Do not import camera SDKs, NumPy, calibration algorithms, config modules, or teleop code from `calibration/__init__.py`.
+- `CAMERAS_PATH` and `VR_TRANSFORM_PATH` are the fixed canonical package-internal locations for camera and VR state.
+- Table-state location is owned by `TableCollisionConfig.plane_path` plus `resolve_table_plane_path()`.
 - Explicit custom paths used by tests or supported overrides must continue to work.
 
 ---
@@ -165,19 +169,19 @@ Requirements:
 
 ### `dexmani_real/config/defaults.py`
 
-Import `TABLE_PLANE_PATH` from `dexmani_real.calibration`.
-
-Change the default for `TableCollisionConfig.plane_path` from the old repository-relative string:
+Change the default for `TableCollisionConfig.plane_path` from:
 
 ```python
 "dexmani_real/config/desk_plane.json"
 ```
 
-to the canonical state path, represented consistently with the existing string-typed field, e.g.:
+to the stable package-relative string:
 
 ```python
-plane_path: str | None = str(TABLE_PLANE_PATH)
+"dexmani_real/calibration/state/table_plane.json"
 ```
+
+Do **not** replace this serializable config value with an absolute `Path` or `str(TABLE_PLANE_PATH)`. `config_as_dict()`, `--print-config`, and persisted run configuration should not contain machine-specific checkout/site-packages prefixes.
 
 Preserve the current ability to override `plane_path` through YAML/data/CLI and preserve `None` semantics for inline `plane_abcd`.
 
@@ -309,8 +313,9 @@ Review `_validate_recording_resources()`:
 - Remove the duplicate VR-transform entry from recording-resource validation.
 - Keep camera calibration in recording-resource validation if the current recording path requires it.
 - Use `CAMERAS_PATH` rather than reconstructing the old path.
+- After those changes the helper should no longer need a `repo_root` argument; remove that now-unused parameter and update its call site.
 
-Do not remove `repo_root` wholesale if it is still legitimately used for episode/data paths or other repository resources.
+Keep the `repo_root` local in `run_teleop_experiment()` because the current process-building/data-directory path still legitimately uses it.
 
 ---
 
@@ -339,10 +344,9 @@ Do not add `--output`, `--calibration-dir`, rig/profile selection, or another pa
 
 The actual write is performed by the calibration session, so do not duplicate persistence logic here.
 
-Synchronize the user-facing entry point:
+Synchronize only the stale user-facing wording about the camera calibration output.
 
-- update stale wording about where `cameras.json` is saved
-- optionally import `CAMERAS_PATH` and print the canonical output path in the pre-run summary if this is concise and consistent with the current CLI UX
+Do not add another output-path print: `save_camera_calibration()` already reports the actual path after a successful write. Do not import `CAMERAS_PATH` into this example solely for duplicate display.
 
 Do not add a new output-path option.
 
@@ -505,17 +509,18 @@ Do not install or upgrade dependencies just to make optional checks available.
 Add/run a focused one-off pure-Python smoke check where possible that verifies the canonical files resolve and existing loaders can read them without hardware access, conceptually:
 
 ```python
-from dexmani_real.calibration import CAMERAS_PATH, TABLE_PLANE_PATH, VR_TRANSFORM_PATH
+from dexmani_real.calibration import CAMERAS_PATH, VR_TRANSFORM_PATH
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
-from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.config.experiment import resolve_experiment_config, resolve_table_plane_path
 from dexmani_real.teleop.vr_transform import load_vr_transform
 
 assert CAMERAS_PATH.is_file()
-assert TABLE_PLANE_PATH.is_file()
 assert VR_TRANSFORM_PATH.is_file()
 
+runtime = resolve_experiment_config()
+assert resolve_table_plane_path(runtime.environment.table).is_file()
+
 CameraExtrinsics()
-resolve_experiment_config()
 load_vr_transform(VR_TRANSFORM_PATH)
 ```
 
@@ -532,9 +537,9 @@ The task is complete only when all of the following hold:
 1. `dexmani_real/config/` contains only Python configuration code.
 2. The three accepted calibration JSON files live under `dexmani_real/calibration/state/`.
 3. `desk_plane.json` has been renamed to `table_plane.json`.
-4. `dexmani_real/calibration/__init__.py` is the single canonical source of those three default paths.
+4. `dexmani_real/calibration/__init__.py` owns the fixed canonical camera/VR paths, while the table path remains a stable serializable runtime-config value.
 5. Camera calibration writer and `CameraExtrinsics()` use the same canonical camera path.
-6. Runtime table loading and `pointcloud_process_example.py` use the same table-path resolver.
+6. Runtime table loading and `pointcloud_process_example.py` use the same table-path resolver, and default config serialization contains the stable package-relative table path rather than a machine-specific absolute path.
 7. VR calibration writer, teleop preflight, and teleop control-loop loader use the same canonical VR path.
 8. `TeleopConfig` no longer carries a fixed `vr_transform_path`.
 9. No compatibility fallback to the old `config/*.json` locations remains.
