@@ -403,6 +403,8 @@ Do not make `state/` a Python package.
 
 Ensure all three canonical JSON files remain available in editable installs and built packages.
 
+The repository's documented real-experiment workflow uses `python -m pip install -e .`. Do not introduce an external writable calibration directory, environment-variable storage layer, home-directory cache, or copy-on-write fallback merely to support writing calibration state from a non-editable/immutable installation. That is outside this task.
+
 ---
 
 ## 8. Ignore generated calibration backups
@@ -518,6 +520,7 @@ assert CAMERAS_PATH.is_file()
 assert VR_TRANSFORM_PATH.is_file()
 
 runtime = resolve_experiment_config()
+assert runtime.environment.table.plane_path == "dexmani_real/calibration/state/table_plane.json"
 assert resolve_table_plane_path(runtime.environment.table).is_file()
 
 CameraExtrinsics()
