@@ -1,4 +1,4 @@
-"""Keyboard Cartesian jogging with persistent, feedback-bounded command targets."""
+"""Keyboard Cartesian jogging with persistent command targets."""
 
 import multiprocessing as mp
 import os
@@ -19,7 +19,7 @@ from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_processes_verified
 from dexmani_real.runtime.safety import SafetyState, begin_motion, require_transition, revoke_motion
 from dexmani_real.runtime.supervisor import check_processes, start_processes
-from dexmani_real.teleop.jog import compute_cartesian_jog_delta, limit_cartesian_pose_lead
+from dexmani_real.teleop.jog import compute_cartesian_jog_delta
 from dexmani_real.utils.rate import LoopRate
 
 
@@ -53,8 +53,9 @@ def run_keyboard_experiment(runtime, *, no_hand):
         planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
     workspace = runtime.policy.workspace.as_array()
     home_down = False
-    # Keyboard command trajectory state, not a history of measured robot states.
-    previous_command_qpos = None
+    # Keep the operator target independent of tracking lag and IK pose residuals.
+    command_qpos = None
+    command_pose = None
     clean = False
     try:
         start_processes(shared, processes, runtime.safety.readiness_timeouts_s, started)
@@ -74,7 +75,8 @@ def run_keyboard_experiment(runtime, *, no_hand):
                 break
             pressed = keys.is_pressed("r")
             if pressed and not home_down:
-                previous_command_qpos = None
+                command_qpos = None
+                command_pose = None
                 revoke_motion(shared)
                 home_policy_robot(
                     shared,
@@ -86,59 +88,55 @@ def run_keyboard_experiment(runtime, *, no_hand):
             home_down = pressed
             row = read_observation(shared, runtime, require_hand=runtime.policy.hand_enabled)
             if row is None:
-                previous_command_qpos = None
+                command_qpos = None
+                command_pose = None
                 if int(shared.safety_state.value) == int(SafetyState.RUNNING):
                     revoke_motion(shared)
                 continue
             dx, drpy = compute_cartesian_jog_delta(keys, cfg.delta_pos_m, cfg.delta_rpy_rad)
             moving = np.any(dx) or np.any(drpy)
             if not moving or pressed:
-                previous_command_qpos = None
+                command_qpos = None
+                command_pose = None
                 if int(shared.safety_state.value) == int(SafetyState.RUNNING):
                     revoke_motion(shared)
             else:
                 if int(shared.safety_state.value) == int(SafetyState.ARMED):
-                    previous_command_qpos = None
+                    command_qpos = None
+                    command_pose = None
                     if not begin_motion(shared):
                         break
                 epoch = int(shared.run_id.value)
                 measured_qpos = row.arm["qpos"][0]
-                if previous_command_qpos is None:
-                    previous_command_qpos = measured_qpos.copy()
-                measured_pose = planner.kin.compute_eef_pose_world(measured_qpos)
-                previous_command_pose = planner.kin.compute_eef_pose_world(previous_command_qpos)
+                if command_qpos is None:
+                    command_qpos = measured_qpos.copy()
+                    command_pose = planner.kin.compute_eef_pose_world(measured_qpos)
                 pos = np.clip(
-                    previous_command_pose.p + dx,
+                    command_pose.p + dx,
                     workspace[:, 0] + cfg.workspace_command_margin_m,
                     workspace[:, 1] - cfg.workspace_command_margin_m,
                 )
                 quat = (
                     Rotation.from_euler("xyz", drpy)
-                    * Rotation.from_quat(previous_command_pose.q, scalar_first=True)
+                    * Rotation.from_quat(command_pose.q, scalar_first=True)
                 ).as_quat(scalar_first=True)
-                pos, quat = limit_cartesian_pose_lead(
-                    measured_pose.p,
-                    measured_pose.q,
-                    pos,
-                    quat,
-                    max_position_lead_m=cfg.command_lookahead_frames * cfg.delta_pos_m,
-                    max_rotation_lead_rad=cfg.command_lookahead_frames * cfg.delta_rpy_rad,
-                )
+                command_pose = Pose(p=pos, q=quat)
                 if row.hand is not None:
                     planner.set_hand_qpos(row.hand["qpos"][0])
                 result = planner.solve_online_ik(
-                    Pose(p=pos, q=quat),
+                    command_pose,
                     measured_qpos,
-                    previous_command_qpos,
+                    command_qpos,
                 )
                 if result.failure_kind == IKFailureKind.INVALID_OUTPUT:
                     raise RuntimeError(f"online IK technical failure: {result.reason}")
                 if result.success:
                     target = result.qpos
                     if publish_command(shared, RobotCommand(epoch, target)):
-                        previous_command_qpos = target.copy()
+                        command_qpos = target.copy()
                     else:
-                        previous_command_qpos = None
+                        command_qpos = None
+                        command_pose = None
     finally:
         keys.quiesce()
         report = shutdown_processes_verified(
