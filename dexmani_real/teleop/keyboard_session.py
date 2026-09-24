@@ -1,8 +1,7 @@
-"""Keyboard Cartesian jogging using latest feedback and absolute targets."""
+"""Keyboard Cartesian jogging with persistent, feedback-bounded command targets."""
 
 import multiprocessing as mp
 import os
-import time
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -20,7 +19,8 @@ from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_processes_verified
 from dexmani_real.runtime.safety import SafetyState, begin_motion, require_transition, revoke_motion
 from dexmani_real.runtime.supervisor import check_processes, start_processes
-from dexmani_real.teleop.jog import compute_cartesian_jog_delta
+from dexmani_real.teleop.jog import compute_cartesian_jog_delta, limit_cartesian_pose_lead
+from dexmani_real.utils.rate import LoopRate
 
 
 def run_keyboard_experiment(runtime, *, no_hand):
@@ -53,7 +53,8 @@ def run_keyboard_experiment(runtime, *, no_hand):
         planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
     workspace = runtime.policy.workspace.as_array()
     home_down = False
-    previous_command = None
+    # Keyboard command trajectory state, not a history of measured robot states.
+    previous_command_qpos = None
     clean = False
     try:
         start_processes(shared, processes, runtime.safety.readiness_timeouts_s, started)
@@ -63,7 +64,9 @@ def run_keyboard_experiment(runtime, *, no_hand):
             raise RuntimeError(f"hand home failed: {home_result.reason}")
         keys.start()
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
+        rate = LoopRate(cfg.control_hz, label="keyboard_teleop", busy_wait=False)
         while shared.is_running.value and check_processes(shared, started):
+            rate.wait()
             if shared.estop_request.value or shared.error_state.value or not keys.healthy:
                 break
             if keys.is_pressed("q"):
@@ -71,6 +74,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
                 break
             pressed = keys.is_pressed("r")
             if pressed and not home_down:
+                previous_command_qpos = None
                 revoke_motion(shared)
                 home_policy_robot(
                     shared,
@@ -78,50 +82,63 @@ def run_keyboard_experiment(runtime, *, no_hand):
                     build_policy_home_planner(runtime),
                     abort_requested=lambda: bool(shared.estop_request.value) or not keys.healthy,
                 )
+                rate.reset()
             home_down = pressed
             row = read_observation(shared, runtime, require_hand=runtime.policy.hand_enabled)
             if row is None:
-                previous_command = None
+                previous_command_qpos = None
                 if int(shared.safety_state.value) == int(SafetyState.RUNNING):
                     revoke_motion(shared)
-                time.sleep(0.02)
                 continue
             dx, drpy = compute_cartesian_jog_delta(keys, cfg.delta_pos_m, cfg.delta_rpy_rad)
             moving = np.any(dx) or np.any(drpy)
             if not moving or pressed:
-                previous_command = None
+                previous_command_qpos = None
                 if int(shared.safety_state.value) == int(SafetyState.RUNNING):
                     revoke_motion(shared)
             else:
                 if int(shared.safety_state.value) == int(SafetyState.ARMED):
-                    previous_command = None
+                    previous_command_qpos = None
                     if not begin_motion(shared):
                         break
                 epoch = int(shared.run_id.value)
-                qpos = row.arm["qpos"][0]
-                pose = planner.kin.compute_eef_pose_world(qpos)
+                measured_qpos = row.arm["qpos"][0]
+                if previous_command_qpos is None:
+                    previous_command_qpos = measured_qpos.copy()
+                measured_pose = planner.kin.compute_eef_pose_world(measured_qpos)
+                previous_command_pose = planner.kin.compute_eef_pose_world(previous_command_qpos)
                 pos = np.clip(
-                    pose.p + dx,
+                    previous_command_pose.p + dx,
                     workspace[:, 0] + cfg.workspace_command_margin_m,
                     workspace[:, 1] - cfg.workspace_command_margin_m,
                 )
                 quat = (
-                    Rotation.from_euler("xyz", drpy) * Rotation.from_quat(pose.q, scalar_first=True)
+                    Rotation.from_euler("xyz", drpy)
+                    * Rotation.from_quat(previous_command_pose.q, scalar_first=True)
                 ).as_quat(scalar_first=True)
+                pos, quat = limit_cartesian_pose_lead(
+                    measured_pose.p,
+                    measured_pose.q,
+                    pos,
+                    quat,
+                    max_position_lead_m=cfg.command_lookahead_frames * cfg.delta_pos_m,
+                    max_rotation_lead_rad=cfg.command_lookahead_frames * cfg.delta_rpy_rad,
+                )
                 if row.hand is not None:
                     planner.set_hand_qpos(row.hand["qpos"][0])
                 result = planner.solve_online_ik(
                     Pose(p=pos, q=quat),
-                    qpos,
-                    qpos if previous_command is None else previous_command,
+                    measured_qpos,
+                    previous_command_qpos,
                 )
                 if result.failure_kind == IKFailureKind.INVALID_OUTPUT:
                     raise RuntimeError(f"online IK technical failure: {result.reason}")
                 if result.success:
                     target = result.qpos
                     if publish_command(shared, RobotCommand(epoch, target)):
-                        previous_command = target
-            time.sleep(1 / cfg.control_hz)
+                        previous_command_qpos = target.copy()
+                    else:
+                        previous_command_qpos = None
     finally:
         keys.quiesce()
         report = shutdown_processes_verified(

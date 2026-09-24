@@ -610,6 +610,7 @@ class KeyboardTeleopParams:
     control_hz: float = 30.0
     delta_pos_m: float = 0.008
     delta_rpy_rad: float = 0.03
+    command_lookahead_frames: int = 5
     workspace_command_margin_m: float = 0.005
     ik_max_pose_error_pos_m: float = 0.002
     ik_max_pose_error_rot_rad: float = np.deg2rad(2.0)
@@ -632,6 +633,12 @@ class KeyboardTeleopParams:
             raise ValueError(f"delta_pos_m={self.delta_pos_m} must be > 0")
         if self.delta_rpy_rad <= 0:
             raise ValueError(f"delta_rpy_rad={self.delta_rpy_rad} must be > 0")
+        if (
+            not isinstance(self.command_lookahead_frames, int)
+            or isinstance(self.command_lookahead_frames, bool)
+            or self.command_lookahead_frames < 1
+        ):
+            raise ValueError("command_lookahead_frames must be an integer >= 1")
         if self.workspace_command_margin_m < 0:
             raise ValueError("workspace_command_margin_m must be non-negative")
         if self.ik_max_pose_error_pos_m <= 0 or self.ik_max_pose_error_rot_rad <= 0:
