@@ -85,11 +85,9 @@ def hand_loop(shared, config):
         rate = LoopRate(config.loop_hz, label="hand", busy_wait=False)
         while shared.is_running.value:
             if shared.estop_request.value:
-                _best_effort_passive(hand)
                 break
             state = hand.get_state()
             if shared.estop_request.value:
-                _best_effort_passive(hand)
                 break
             if state is None:
                 failure_started = failure_started or time.monotonic()

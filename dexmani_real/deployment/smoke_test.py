@@ -820,7 +820,7 @@ class XHandSafetySmoke(unittest.TestCase):
         hand.send_action.assert_not_called()
 
     def test_worker_revocation(self):
-        from unittest.mock import Mock, patch
+        from unittest.mock import Mock, call, patch
 
         from dexmani_real.robot.commands import RobotCommand
         from dexmani_real.robot.hand_worker import hand_loop
@@ -931,7 +931,10 @@ class XHandSafetySmoke(unittest.TestCase):
                     elif scenario in ("stale", "read_timeout"):
                         self.assertEqual(events, ["passive", "passive", "passive"])
                     elif scenario == "estop":
-                        self.assertEqual(events, ["passive", "passive"])
+                        self.assertEqual(events, ["passive"])
+                        self.assertEqual(
+                            hand.mock_calls[-2:], [call.set_passive(), call.disconnect()]
+                        )
                     else:
                         self.assertEqual(events, ["hold", "passive"])
                     hand.disconnect.assert_called_once()
@@ -1025,7 +1028,7 @@ class HandHomeSmoke(unittest.TestCase):
                 def submitted(*args):
                     self.assertLessEqual(args[3], runtime.hand.home_timeout_s)
                     if scenario == "budget":
-                        clock[0] += 0.99
+                        clock[0] += runtime.hand.home_timeout_s - 0.01
                     return HomeResult(True)
 
                 def sample():
@@ -1076,7 +1079,7 @@ class HandHomeSmoke(unittest.TestCase):
                     self.assertEqual(reads[0], 6 if scenario == "reset" else 3)
                 else:
                     self.assertEqual(shared.run_id.value, 3)
-                self.assertLess(clock[0], 11.02)
+                self.assertLess(clock[0], 10.0 + runtime.hand.home_timeout_s + 0.02)
 
     def test_tolerance_validation(self):
         from dataclasses import replace
@@ -1085,7 +1088,7 @@ class HandHomeSmoke(unittest.TestCase):
 
         cfg = HandParams()
         self.assertEqual(cfg.home_tolerance_deg, 5.0)
-        self.assertEqual(cfg.home_timeout_s, 1.0)
+        self.assertEqual(cfg.home_timeout_s, 2.0)
         for invalid in (0, -1, np.nan, np.inf):
             with self.assertRaisesRegex(ValueError, "home_tolerance_deg"):
                 replace(cfg, home_tolerance_deg=invalid).validate()

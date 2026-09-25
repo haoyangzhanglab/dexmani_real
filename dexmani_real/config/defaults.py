@@ -443,7 +443,7 @@ class HandParams:
     loop_hz: float = 30.0  # worker command-admission / feedback-update rate
     state_read_failure_timeout_s: float = 1.0
 
-    home_timeout_s: float = 1.0
+    home_timeout_s: float = 2.0
     home_tolerance_deg: float = 5.0
 
     fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
