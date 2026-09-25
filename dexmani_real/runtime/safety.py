@@ -55,16 +55,23 @@ def begin_motion(shared):
         return _begin_motion_locked(shared) is not None
 
 
+def _command_may_cross_sdk_locked(shared, *, run_id, required_safety_state=SafetyState.RUNNING):
+    """Check motion authority while the caller holds motion_lock."""
+    return (
+        shared.is_running.value
+        and not shared.error_state.value
+        and not shared.estop_request.value
+        and int(shared.run_id.value) == run_id
+        and int(shared.safety_state.value) == int(required_safety_state)
+        and required_safety_state in (SafetyState.ARMED, SafetyState.RUNNING)
+    )
+
+
 def command_may_cross_sdk(shared, *, run_id, required_safety_state=SafetyState.RUNNING):
     """Last software fence; no lock is held during the subsequent SDK call."""
     with shared.motion_lock:
-        return (
-            shared.is_running.value
-            and not shared.error_state.value
-            and not shared.estop_request.value
-            and int(shared.run_id.value) == run_id
-            and int(shared.safety_state.value) == int(required_safety_state)
-            and required_safety_state in (SafetyState.ARMED, SafetyState.RUNNING)
+        return _command_may_cross_sdk_locked(
+            shared, run_id=run_id, required_safety_state=required_safety_state
         )
 
 
@@ -135,14 +142,19 @@ def request_policy_start(shared, *, require_physical_home):
         return True
 
 
+def _begin_requested_motion_locked(shared):
+    """Consume a start request while the caller holds motion_lock."""
+    if not shared.start_request.value or shared.stop_request.value:
+        return None
+    epoch = _begin_motion_locked(shared)
+    if epoch is not None:
+        shared.start_request.value = False
+    return epoch
+
+
 def begin_requested_motion(shared):
     with shared.motion_lock:
-        if not shared.start_request.value or shared.stop_request.value:
-            return None
-        epoch = _begin_motion_locked(shared)
-        if epoch is not None:
-            shared.start_request.value = False
-        return epoch
+        return _begin_requested_motion_locked(shared)
 
 
 def request_policy_stop(shared, *, reason=RunEndReason.OPERATOR):

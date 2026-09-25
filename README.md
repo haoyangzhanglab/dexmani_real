@@ -43,6 +43,8 @@ Teleop、键盘控制和 policy 分别使用各自的控制周期，replay 使�
 
 键盘控制使用 WASD/方向键和 IJKL 微调，R 执行 planned HOME，Q 退出，ESC 急停。下节的 B/C/S/D/H 按键用于 VR teleop。
 
+物理回放只接受当前 raw schema 的 teleop episode；加载时拒绝失败控制行、空轨迹或非有限的动作/机器人状态。启动前需在操作者监督下将机器人置于录制起始姿态附近：机械臂和手部每个关节的误差均不得超过 10°，机械臂按限位内等价角比较。回放按录制频率逐条发布目标，Q 停止并保留已采集数据，结束后的 H 执行机器人 planned HOME。默认输出为 `replay_results/<episode_name>_replay/`，`--output` 必须指向不存在或为空的目录；采集到数据后保存 `replay_data.npz` 并计算一致性指标 `metrics.json`。
+
 ## Teleop 与录制
 
 Teleop 默认录制，显式无录制调试使用 `--no-record`。无手调试需同时使用 `--no-hand` 并禁用录制，且手必须已拆除或固定在配置的 home 姿态。
@@ -87,7 +89,9 @@ Canonical Zarr 是从 raw 重建的全量训练缓存，包含 learning-relevant
 
 Raw-to-Zarr 按完整 episode 接收或拒绝，不修复、切分、重采样或删除坏行。暂停、异常控制行、触觉无效、录制不完整或转换失败等情况会整条拒收并报告原因。批量导出可继续处理其他正常 episodes，但必须汇总拒绝原因。
 
-导出前可用 `--dry-run` 执行相同的转换与校验而不创建 Zarr。导出拒绝覆盖已有目标，也拒绝将目标放入 raw/rollout 来源目录；dry-run 同样检查目标路径。单个异常 episode 或没有可接收 episode 时返回失败。
+导出默认写入 `datasets/<task_name>.zarr`，可用 `--output` 指定新目标。`--dry-run` 执行相同的完整转换与校验而不创建 Zarr，仍需相应的运动学和点云依赖。
+
+导出拒绝覆盖已有目标；解析符号链接后，目标不能位于输入目录、仓库的 `episodes/`、`episodes_processed/`、`rollouts/` 或已有 Zarr 内部。`episodes_processed/` 仅作为历史数据保护目录保留，当前流程直接从 raw 生成 Zarr。dry-run 同样检查目标路径。单个异常 episode 或没有可接收 episode 时返回失败。
 
 ## Policy evaluation
 

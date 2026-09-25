@@ -145,7 +145,7 @@ class XArm7Kinematics:
     def compute_eef_pose_base(self, qpos: np.ndarray) -> Pose:
         # Entry points validate qpos and the base pose; this path stays allocation-light.
         if not np.all(np.isfinite(qpos)):
-            raise ValueError(f"compute_eef_pose_base: qpos contains NaN or Inf")
+            raise ValueError("compute_eef_pose_base: qpos contains NaN or Inf")
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
         self.pinocchio_model.compute_forward_kinematics(full_qpos)
         link_pose = self.pinocchio_model.get_link_pose(self.eef_link_id)

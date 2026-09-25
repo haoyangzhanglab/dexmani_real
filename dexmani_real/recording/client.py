@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.recording.frame import EpisodeFrame
-from dexmani_real.runtime.safety import RunEndReason, SafetyState, revoke_motion
+from dexmani_real.runtime.safety import RunEndReason, SafetyState, _revoke_motion_locked
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -83,7 +83,9 @@ class RecorderClient:
         """Stop motion when the required recording resource fails."""
         with self.shared.motion_lock:
             if int(self.shared.safety_state.value) == int(SafetyState.RUNNING):
-                revoke_motion(self.shared, SafetyState.ARMED, reason=RunEndReason.RECORDING_FAILURE)
+                _revoke_motion_locked(
+                    self.shared, SafetyState.ARMED, reason=RunEndReason.RECORDING_FAILURE
+                )
             self.technical_status = "invalid"
             self.shared.workflow_failed.value = True
         logger.error("Recording failed: %s", error)

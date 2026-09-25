@@ -184,9 +184,8 @@ class VideoDecoder:
     def iter_frames(self) -> Iterator[np.ndarray]:
         """Yield decoded RGB frames sequentially without retaining the video.
 
-        The iterator rewinds the stream before decoding.  It is intended for
-        offline transforms that write selected frames directly to another
-        container and must not materialize a full recording in memory.
+        The iterator rewinds the stream before decoding, so offline transforms
+        can consume every frame without retaining the full recording in memory.
         """
         if not self._opened:
             self._open()

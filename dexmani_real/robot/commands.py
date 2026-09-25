@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.ipc.schema import ROBOT_COMMAND_DTYPE
-from dexmani_real.runtime.safety import SafetyState, command_may_cross_sdk
+from dexmani_real.runtime.safety import SafetyState, _command_may_cross_sdk_locked
 
 
 @dataclass(frozen=True)
@@ -45,7 +45,7 @@ def read_robot_command(shared: Any) -> tuple[RobotCommand, int] | None:
 def publish_command(shared: Any, target: RobotCommand) -> int:
     """Return the host publication time, or zero when the motion epoch was revoked."""
     with shared.motion_lock:
-        if not command_may_cross_sdk(
+        if not _command_may_cross_sdk_locked(
             shared, run_id=target.run_id, required_safety_state=SafetyState.RUNNING
         ):
             return 0

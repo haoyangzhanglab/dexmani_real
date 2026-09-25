@@ -116,6 +116,8 @@ def export_raw_to_zarr(
 
     Dry-run consumes the same transformations/validation, without creating output.
     Export computes each episode once; later rejection removes only owned staging.
+    progress_callback(completed, total) counts processed source episodes, including
+    rejected and explicitly excluded episodes.
     """
     config = config or PolicyZarrExportConfig()
     if processing is None:
@@ -144,7 +146,7 @@ def export_raw_to_zarr(
     try:
         for index, episode in enumerate(episodes):
             if progress_callback:
-                progress_callback("convert", index, len(episodes))
+                progress_callback(index, len(episodes))
             annotation = annotations.get(episode.name, EpisodeAnnotation())
             if not annotation.include:
                 excluded.append(episode.name)
@@ -263,7 +265,7 @@ def export_raw_to_zarr(
             atomic_publish(staging, target)
             staging = None
         if progress_callback:
-            progress_callback("convert", len(episodes), len(episodes))
+            progress_callback(len(episodes), len(episodes))
         return dict(
             input_root=str(source),
             output_path=str(target),

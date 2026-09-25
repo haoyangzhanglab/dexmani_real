@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: python examples/replay_episode.py episodes/<task_name>/<episode_dir>
 
-Physically replays raw-v32 targets on xArm7/XHand and writes evaluation results.
+Physically replays current raw-schema targets on xArm7/XHand and writes evaluation results.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import yaml
 
 from dexmani_real.config.experiment import ExperimentConfig, resolve_experiment_config
@@ -56,7 +55,7 @@ Examples:
 
 Controls:
   Q     clean exit (save partial results)
-  H     return arm to home (post-replay prompt)
+  H     planned robot return-home (post-replay prompt)
   ESC   emergency stop
         """,
     )
@@ -132,9 +131,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Acc: {selection.acceleration_deg_s2:.0f}°/s²")
     print(f"  Joint speed: {selection.joint_speed_deg_s:.0f}°/s")
 
-    evaluate_consistency = bool(np.all(np.isfinite(trajectory.arm_qpos)))
-    if not evaluate_consistency:
-        print("Warning: arm_qpos is invalid; consistency metrics will be skipped.")
     if args.output is None:
         episode_name = resolve_episode_path(args.episode)[1]
         output_dir = str(Path(DEFAULT_OUTPUT_DIR) / f"{episode_name}_replay")
@@ -148,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             selection.runtime,
             EpisodeReplayConfig(
                 output_dir=output_dir,
-                evaluate_consistency=evaluate_consistency,
+                evaluate_consistency=True,
             ),
         )
     except Exception as exc:

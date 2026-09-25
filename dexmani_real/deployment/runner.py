@@ -23,7 +23,7 @@ from dexmani_real.runtime.safety import (
     RunEndReason,
     SafetyState,
     StopRequest,
-    begin_requested_motion,
+    _begin_requested_motion_locked,
     revoke_motion_if_run_id,
 )
 from dexmani_real.utils.log import get_logger
@@ -153,7 +153,7 @@ class PolicyRunner:
                 return
         with self.shared.motion_lock:
             epoch = (
-                begin_requested_motion(self.shared)
+                _begin_requested_motion_locked(self.shared)
                 if preparation_epoch == int(self.shared.run_id.value)
                 and not self.shared.quit_requested.value
                 else None

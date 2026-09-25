@@ -48,7 +48,7 @@ def _parser() -> argparse.ArgumentParser:
             "(default: datasets/<task_name>.zarr). The task identity always "
             "comes from the input directory. Existing outputs are refused, "
             "and the resolved target (symlinks followed) must not fall "
-            "inside the protected sources: episodes/, "
+            "inside the protected sources: episodes/, episodes_processed/, "
             "rollouts/, the input root, or an existing .zarr store."
         ),
     )
@@ -130,19 +130,14 @@ def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
 
 
 class _ExportProgress:
-    _PHASE_LABELS = {"convert": ("raw to policy Zarr", "episode")}
-
     def __init__(self) -> None:
-        self._phase: str | None = None
         self._bar: tqdm | None = None
 
-    def update(self, phase: str, completed: int, total: int) -> None:
-        if phase != self._phase:
-            self.close()
-            label, unit = self._PHASE_LABELS[phase]
-            self._bar = tqdm(total=total, desc=label, unit=unit, file=sys.stderr)
-            self._phase = phase
-        assert self._bar is not None
+    def update(self, completed: int, total: int) -> None:
+        if self._bar is None:
+            self._bar = tqdm(
+                total=total, desc="raw to policy Zarr", unit="episode", file=sys.stderr
+            )
         self._bar.update(completed - self._bar.n)
 
     def close(self) -> None:

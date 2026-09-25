@@ -52,7 +52,7 @@ class LoopRate:
         self._overdue_throttle: int = 0
         self._missed_slot_count = 0
 
-    def wait(self, *, phase_ms: dict[str, float] | None = None) -> None:
+    def wait(self) -> None:
         """Sleep until the next absolute cycle deadline with precision.
 
         Small overruns preserve the absolute schedule. Missing a full period
@@ -63,11 +63,6 @@ class LoopRate:
           1. Compute remaining time to the deadline
           2. If > 2ms: time.sleep(remaining - 1ms)
           3. Spin or sleep for the final window according to busy_wait
-
-        Optional caller-measured phases are appended only to an emitted overrun
-        warning. They measure host elapsed time, including descheduling within
-        each phase. Nested phases must not be added to their enclosing total.
-        They do not alter deadlines or measure OS scheduling separately.
         """
         now = self._clock()
         remaining = self._next_deadline - now
@@ -94,15 +89,11 @@ class LoopRate:
                 if self._warn_on_overrun and self._overdue_throttle <= 0:
                     logger.warning(
                         "Loop deadline missed: loop=%s period_ms=%.1f "
-                        "deadline_lateness_ms=%.1f missed_total=%d%s",
+                        "deadline_lateness_ms=%.1f missed_total=%d",
                         self.label,
                         self.period * 1000,
                         lateness * 1000,
                         self._missed_slot_count,
-                        ""
-                        if phase_ms is None
-                        else " "
-                        + " ".join(f"{name}={value:.3f}ms" for name, value in phase_ms.items()),
                     )
                     self._overdue_throttle = 50
                 elif self._warn_on_overrun:
