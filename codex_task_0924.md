@@ -583,11 +583,13 @@ Do not build elaborate test infrastructure solely to test one assignment if doin
 
 ---
 
-## 9. Required real-hardware validation
+## 9. Operator-only real-hardware validation after the Codex task
 
-Software checks cannot prove XHand physical behavior. After implementation, manually validate on the real hand.
+Software checks cannot prove XHand physical behavior. These checks are a **manual operator follow-up**, not part of the Codex execution.
 
-Required scenarios:
+**Codex must not run any hardware-affecting command in this task**, including XHand/xArm/RealSense discovery or connection, homing, teleoperation, rollout, replay, camera capture, calibration, or diagnostics that open hardware SDKs. Codex should implement the software patch, run only offline checks allowed by `AGENTS.md`, and report the following hardware checklist for the operator.
+
+Required manual scenarios:
 
 1. **RUNNING → normal Stop/Pause**
    - command a visible finger motion;
