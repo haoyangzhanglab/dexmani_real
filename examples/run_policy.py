@@ -189,7 +189,7 @@ def _print_summary(
     print(f"Artifact       : {artifact}")
     print(f"Inference steps: {inference_steps}")
     print(f"Seed           : {seed}")
-    print(f"Episodes to run  : {num_episodes} (saved episodes counted separately)")
+    print(f"Episodes to run  : {num_episodes} (begun episodes count even if recording fails)")
     print(f"Max duration   : {max_running_s:g} s per episode")
     print(f"Device         : {device}")
     print(f"Observation    : {' + '.join(fields)}")

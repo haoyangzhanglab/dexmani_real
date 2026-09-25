@@ -64,7 +64,7 @@ def _home_path(current, target, planner, config):
     start = (
         wrapped.waypoints[-1]
         if len(wrapped.waypoints)
-        else planner.ik_mgr.nearest_equivalent_qpos(target, current)
+        else planner.ik_geometry.nearest_equivalent_qpos(target, current)
     )
     alignment = compute_band_alignment_path(start, target, planner, **options)
     if alignment.status is HomePathStatus.UNSAFE:

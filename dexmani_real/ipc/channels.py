@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import camera
+from dexmani_real.config.hardware import CameraParams
 from dexmani_real.ipc.camera_ring import CameraRingBuffer
 from dexmani_real.ipc.ring import SharedMemoryRingBuffer
 from dexmani_real.ipc.schema import (
@@ -31,7 +31,7 @@ DISARMED_SAFETY_STATE_WIRE_VALUE = 0
 class RuntimeChannelsConfig:
     """Ring capacities, queue sizes, and camera resolution defaults."""
 
-    camera_ring_maxlen: int = field(default_factory=lambda: camera.ring_maxlen)
+    camera_ring_maxlen: int = CameraParams.ring_maxlen
     vr_ring_maxlen: int = 8
     arm_state_ring_maxlen: int = 8
     hand_state_ring_maxlen: int = 8
@@ -39,8 +39,8 @@ class RuntimeChannelsConfig:
     pointcloud_num_points: int = 1024
     pointcloud_ring_maxlen: int = 8
 
-    camera_rgb_shape: tuple[int, int, int] = field(default_factory=lambda: camera.rgb_shape)
-    camera_depth_shape: tuple[int, int] = field(default_factory=lambda: camera.depth_shape)
+    camera_rgb_shape: tuple[int, int, int] = field(default_factory=lambda: CameraParams().rgb_shape)
+    camera_depth_shape: tuple[int, int] = field(default_factory=lambda: CameraParams().depth_shape)
 
     arm_home_q_maxsize: int = 2
 
@@ -68,14 +68,18 @@ class RuntimeChannelsConfig:
         cls,
         runtime: object,
         *,
-        pointcloud_num_points: int = 1024,
+        pointcloud_num_points: int | None = None,
     ) -> "RuntimeChannelsConfig":
         cam = getattr(runtime, "camera")
         return cls(
             camera_ring_maxlen=int(cam.ring_maxlen),
             camera_rgb_shape=(int(cam.height), int(cam.width), 3),
             camera_depth_shape=(int(cam.height), int(cam.width)),
-            pointcloud_num_points=pointcloud_num_points,
+            pointcloud_num_points=(
+                runtime.pointcloud.num_points
+                if pointcloud_num_points is None
+                else pointcloud_num_points
+            ),
         )
 
 

@@ -2,6 +2,7 @@
 
 import time
 from collections import deque
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -30,6 +31,23 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 
+@dataclass
+class RolloutStats:
+    """Session-wide diagnostics; interval anchoring resets at each episode."""
+
+    inference_ms: list[float] = field(default_factory=list)
+    action_step_intervals_ms: list[float] = field(default_factory=list)
+    previous_step_ns: int | None = None
+    arm_clip_count: int = 0
+    workspace_clip_count: int = 0
+    hand_clip_count: int = 0
+    max_arm_clip_rad: float = 0.0
+    max_workspace_clip_m: float = 0.0
+    max_hand_clip_rad: float = 0.0
+    ik_failure_counts: dict[str, int] = field(default_factory=dict)
+    publications: int = 0
+
+
 class PolicyRunner:
     def __init__(
         self,
@@ -44,43 +62,32 @@ class PolicyRunner:
         num_episodes=1,
         recording_config=None,
     ):
-        self.shared, self.runtime, self.spec = (
-            shared,
-            runtime,
-            policy_spec,
-        )
-        self.model, self.fk = model_runtime, fingertip_runtime
-        self.execute, self.max_running_s, self.num_episodes = (
-            execute,
-            max_running_s,
-            num_episodes,
-        )
+        self.shared = shared
+        self.runtime = runtime
+        self.policy_spec = policy_spec
+        self.model = model_runtime
+        self.fingertip_runtime = fingertip_runtime
+        self.execute = execute
+        self.max_running_s = max_running_s
+        self.num_episodes = num_episodes
         self.recording_config = recording_config
         self.recorder = RecorderClient(shared) if recording_config is not None else None
         self.history = ObservationHistory(policy_spec.n_obs_steps, policy_spec.control_dt_s)
-        self.actions = deque()
+        self.action_queue = deque()
         self.run_id = None
         self.started_ns = 0
         self.next_step_ns = 0
         self.previous_arm = None
         self.completed = 0
-        self.inference_ms = []
-        self.action_step_intervals_ms = []
-        self.previous_step_ns = None
-        self.arm_clip_count = self.workspace_clip_count = self.hand_clip_count = 0
-        self.max_arm_clip_rad = self.max_workspace_clip_m = self.max_hand_clip_rad = 0.0
-        self.last_ik_result = None
-        self.ik_failure_counts = {}
-        self.publications = 0
+        self.stats = RolloutStats()
         self.planner = make_action_planner(policy_spec.action_mode, runtime)
-        fields = {f.name for f in self.spec.observation_fields}
-        self.requires_rgb = "rgb" in fields
+        fields = {f.name for f in self.policy_spec.observation_fields}
+        requires_rgb = "rgb" in fields
         self.requires_cloud = "point_cloud" in fields
-        self.requires_recording_camera = self.recorder is not None
-        self.requires_camera_payload = self.requires_rgb or self.requires_recording_camera
-        self.requires_rgb_cloud_identity = self.requires_rgb and self.requires_cloud
+        self.requires_camera_payload = requires_rgb or self.recorder is not None
+        self.requires_rgb_cloud_identity = requires_rgb and self.requires_cloud
 
-    def _row(self):
+    def _read_observation(self):
         return read_observation(
             self.shared,
             self.runtime,
@@ -90,7 +97,7 @@ class PolicyRunner:
             require_rgb_cloud_identity=self.requires_rgb_cloud_identity,
         )
 
-    def _live(self):
+    def _has_motion_authority(self):
         return (
             self.run_id is not None
             and self.shared.is_running.value
@@ -100,12 +107,14 @@ class PolicyRunner:
             and int(self.shared.safety_state.value) == int(SafetyState.RUNNING)
         )
 
-    def _finish(self, reason, abnormal=False, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY):
+    def _finish_episode(
+        self, reason, abnormal=False, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY
+    ):
         if self.run_id is None:
             return
         revoke_motion_if_run_id(self.shared, self.run_id, reason=run_end_reason)
         self.shared.physical_home_completed.value = False
-        self.actions.clear()
+        self.action_queue.clear()
         self.history.clear()
         self.previous_arm = None
         if self.recorder is not None:
@@ -120,8 +129,8 @@ class PolicyRunner:
         if self.completed >= self.num_episodes:
             self.shared.quit_requested.value = True
 
-    def _begin(self):
-        row = self._row()
+    def _begin_episode(self):
+        row = self._read_observation()
         if row is None:
             return
         if self.execute and (
@@ -155,10 +164,10 @@ class PolicyRunner:
                 self.recorder.join_stop()
             return
         self.run_id, self.started_ns = epoch
-        self.previous_step_ns = None
+        self.stats.previous_step_ns = None
         self.shared.physical_home_completed.value = False
         self.history.clear()
-        self.actions.clear()
+        self.action_queue.clear()
         self.next_step_ns = 0
         self.model.reset_episode()
 
@@ -167,10 +176,10 @@ class PolicyRunner:
             if self.shared.stop_request.value:
                 self.shared.stop_request.value = int(StopRequest.NONE)
             if self.shared.start_request.value and not self.shared.workflow_failed.value:
-                self._begin()
+                self._begin_episode()
             return
-        if not self._live() or self.shared.quit_requested.value:
-            self._finish(
+        if not self._has_motion_authority() or self.shared.quit_requested.value:
+            self._finish_episode(
                 RunEndReason(int(self.shared.run_ended_reason.value)).name.lower(),
                 abnormal=bool(
                     self.shared.error_state.value
@@ -180,60 +189,60 @@ class PolicyRunner:
             )
             return
         if self.shared.workflow_failed.value:
-            self._finish("workflow_failure", abnormal=True)
+            self._finish_episode("workflow_failure", abnormal=True)
             return
         now = time.monotonic_ns()
         if self.max_running_s is not None and now - self.started_ns >= int(
             self.max_running_s * 1e9
         ):
-            self._finish("timeout", run_end_reason=RunEndReason.TIMEOUT)
+            self._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
             return
         if now < self.next_step_ns:
             return
-        row = self._row()
+        row = self._read_observation()
         if row is None:
-            self._finish("required_observation_stale", abnormal=True)
+            self._finish_episode("required_observation_stale", abnormal=True)
             return
         self.history.append(row)
-        if not self.actions:
+        if not self.action_queue:
             observation = build_policy_observation(
-                self.history.padded(), self.spec, fingertip_runtime=self.fk
+                self.history.padded(), self.policy_spec, fingertip_runtime=self.fingertip_runtime
             )
             if observation is None:
-                self._finish("required_tactile_unavailable", abnormal=True)
+                self._finish_episode("required_tactile_unavailable", abnormal=True)
                 return
             epoch = self.run_id
             start = time.monotonic_ns()
             prediction = self.model.predict(observation)
-            self.inference_ms.append((time.monotonic_ns() - start) / 1e6)
-            if not self._live() or epoch != int(self.shared.run_id.value):
-                self.actions.clear()
+            self.stats.inference_ms.append((time.monotonic_ns() - start) / 1e6)
+            if not self._has_motion_authority() or epoch != int(self.shared.run_id.value):
+                self.action_queue.clear()
                 return
             if self.max_running_s is not None and time.monotonic_ns() - self.started_ns >= int(
                 self.max_running_s * 1e9
             ):
-                self._finish("timeout", run_end_reason=RunEndReason.TIMEOUT)
+                self._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
                 return
             prediction = np.asarray(prediction, dtype=np.float64)
             if (
                 prediction.shape
                 != (
-                    self.spec.n_action_steps,
-                    physical_action_dim(self.spec.action_mode),
+                    self.policy_spec.n_action_steps,
+                    physical_action_dim(self.policy_spec.action_mode),
                 )
                 or not np.isfinite(prediction).all()
             ):
                 raise ValueError("policy prediction violates shape/finite contract")
-            self.actions.extend(prediction)
+            self.action_queue.extend(prediction)
             # Execution feedback after a blocking query is telemetry, not a synthetic history row.
-            row = self._row()
+            row = self._read_observation()
             if row is None:
-                self._finish("required_observation_stale", abnormal=True)
+                self._finish_episode("required_observation_stale", abnormal=True)
                 return
-        action = self.actions.popleft()
+        action = self.action_queue.popleft()
         decoded = decode_policy_action(
             action,
-            self.spec.action_mode,
+            self.policy_spec.action_mode,
             row.arm["qpos"][0],
             previous_arm_command_qpos=self.previous_arm,
             planner=self.planner,
@@ -242,24 +251,27 @@ class PolicyRunner:
             hand_qpos_max_rad=self.runtime.hand.qpos_max_rad,
         )
         arm, prepared_hand, intent = decoded.arm_qpos, decoded.hand_qpos, decoded.arm_eef_intent
-        self.last_ik_result = decoded.ik_result
-        self.workspace_clip_count += int(decoded.workspace_clip_m > 1e-9)
-        self.max_workspace_clip_m = max(self.max_workspace_clip_m, decoded.workspace_clip_m)
-        self.hand_clip_count += int(decoded.hand_clip_rad > 1e-9)
-        self.max_hand_clip_rad = max(self.max_hand_clip_rad, decoded.hand_clip_rad)
+        self.stats.workspace_clip_count += int(decoded.workspace_clip_m > 1e-9)
+        self.stats.max_workspace_clip_m = max(
+            self.stats.max_workspace_clip_m, decoded.workspace_clip_m
+        )
+        self.stats.hand_clip_count += int(decoded.hand_clip_rad > 1e-9)
+        self.stats.max_hand_clip_rad = max(self.stats.max_hand_clip_rad, decoded.hand_clip_rad)
         if arm is None:
-            self.actions.clear()
+            self.action_queue.clear()
             kind = decoded.ik_result.failure_kind
-            self.ik_failure_counts[kind.value] = self.ik_failure_counts.get(kind.value, 0) + 1
+            self.stats.ik_failure_counts[kind.value] = (
+                self.stats.ik_failure_counts.get(kind.value, 0) + 1
+            )
             if kind == IKFailureKind.INVALID_OUTPUT:
                 raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
             if self.recorder:
                 self.recorder.add_frame(
                     build_episode_frame(row, frame_status=FRAME_IK_FAIL, arm_eef_intent=intent)
                 )
-            self.next_step_ns = time.monotonic_ns() + int(self.spec.control_dt_s * 1e9)
+            self.next_step_ns = time.monotonic_ns() + int(self.policy_spec.control_dt_s * 1e9)
             return
-        if self.spec.action_mode == "joint":
+        if self.policy_spec.action_mode == "joint":
             prepared_arm = project_arm_command(
                 arm,
                 row.arm["qpos"][0],
@@ -274,20 +286,20 @@ class PolicyRunner:
             )
             arm_change[equivalent] = (arm_change[equivalent] + np.pi) % (2 * np.pi) - np.pi
             arm_clip = float(np.max(np.abs(arm_change)))
-            self.arm_clip_count += int(arm_clip > 1e-9)
-            self.max_arm_clip_rad = max(self.max_arm_clip_rad, arm_clip)
+            self.stats.arm_clip_count += int(arm_clip > 1e-9)
+            self.stats.max_arm_clip_rad = max(self.stats.max_arm_clip_rad, arm_clip)
         else:
             prepared_arm = arm
         command = RobotCommand(self.run_id, prepared_arm, prepared_hand)
         stamp = publish_command(self.shared, command) if self.execute else time.monotonic_ns()
         if not stamp:
             return
-        if self.previous_step_ns is not None:
-            self.action_step_intervals_ms.append((stamp - self.previous_step_ns) / 1e6)
-        self.previous_step_ns = stamp
+        if self.stats.previous_step_ns is not None:
+            self.stats.action_step_intervals_ms.append((stamp - self.stats.previous_step_ns) / 1e6)
+        self.stats.previous_step_ns = stamp
         self.previous_arm = prepared_arm
-        self.publications += 1
-        self.next_step_ns = stamp + int(self.spec.control_dt_s * 1e9)
+        self.stats.publications += 1
+        self.next_step_ns = stamp + int(self.policy_spec.control_dt_s * 1e9)
         if self.recorder:
             self.recorder.add_frame(
                 build_episode_frame(row, command, action_timestamp_ns=stamp, arm_eef_intent=intent)
@@ -302,7 +314,7 @@ class PolicyRunner:
             self.shared.workflow_failed.value = True
             raise
         finally:
-            self._finish(
+            self._finish_episode(
                 "shutdown",
                 abnormal=bool(
                     self.shared.workflow_failed.value
@@ -323,7 +335,9 @@ class PolicyRunner:
             )
 
         mean_interval_ms = (
-            float(np.mean(self.action_step_intervals_ms)) if self.action_step_intervals_ms else 0.0
+            float(np.mean(self.stats.action_step_intervals_ms))
+            if self.stats.action_step_intervals_ms
+            else 0.0
         )
         effective_hz = f"{1000 / mean_interval_ms:.2f}" if mean_interval_ms > 0 else "unavailable"
         logger.info(
@@ -332,24 +346,24 @@ class PolicyRunner:
             "ik_failures=%s configured_action_hz=%.2f "
             "inference_ms[n=%d %s] action_step_interval_ms[n=%d %s] effective_action_step_hz=%s",
             self.execute,
-            self.publications,
-            self.arm_clip_count,
-            self.max_arm_clip_rad,
-            self.workspace_clip_count,
-            self.max_workspace_clip_m,
-            self.hand_clip_count,
-            self.max_hand_clip_rad,
-            self.ik_failure_counts,
-            1 / self.spec.control_dt_s,
-            len(self.inference_ms),
-            statistics(self.inference_ms),
-            len(self.action_step_intervals_ms),
-            statistics(self.action_step_intervals_ms),
+            self.stats.publications,
+            self.stats.arm_clip_count,
+            self.stats.max_arm_clip_rad,
+            self.stats.workspace_clip_count,
+            self.stats.max_workspace_clip_m,
+            self.stats.hand_clip_count,
+            self.stats.max_hand_clip_rad,
+            self.stats.ik_failure_counts,
+            1 / self.policy_spec.control_dt_s,
+            len(self.stats.inference_ms),
+            statistics(self.stats.inference_ms),
+            len(self.stats.action_step_intervals_ms),
+            statistics(self.stats.action_step_intervals_ms),
             effective_hz,
         )
 
 
-def policy_runner_loop(
+def run_policy_worker(
     shared,
     runtime,
     config,
@@ -373,14 +387,14 @@ def policy_runner_loop(
         )
         if model.spec != config.spec:
             raise ValueError("PolicySpec changed between inspect and load")
-        fk = build_fingertip_runtime(config.spec, fingertip_config)
+        fingertip_runtime = build_fingertip_runtime(config.spec, fingertip_config)
         model.warmup(samples=5)
         runner = PolicyRunner(
             shared,
             runtime,
             config.spec,
             model_runtime=model,
-            fingertip_runtime=fk,
+            fingertip_runtime=fingertip_runtime,
             execute=execute,
             max_running_s=max_running_s,
             num_episodes=num_episodes,
@@ -391,7 +405,7 @@ def policy_runner_loop(
     except Exception:
         shared.workflow_failed.value = True
         if runner is not None:
-            runner._finish("policy_failure", abnormal=True)
+            runner._finish_episode("policy_failure", abnormal=True)
         logger.exception("policy worker failed")
         raise
     finally:

@@ -54,7 +54,6 @@ class PinGrad:
         self.model = pin.buildModelFromUrdf(urdf_path, pin.JointModelFreeFlyer())
         self.data = self.model.createData()
         self.dof: int = self.model.nv - 6  # 12 for XHand
-        self._nv: int = self.model.nv
 
         # The optimizer always receives five targets in semantic finger order;
         # silently shortening this list shifts target-to-frame associations.

@@ -64,7 +64,7 @@ def _home(shared, arm, request):
     return mode_ready
 
 
-def arm_loop(shared, config):
+def run_arm_worker(shared, config):
     arm = XArm7(config)
     last_sequence = 0
     streaming_epoch = None

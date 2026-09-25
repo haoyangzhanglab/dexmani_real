@@ -38,11 +38,11 @@ logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
-class RecorderIOConfig:
+class RecorderWorkerConfig:
     data_dir: str
     control_hz: float
     min_frames: int
-    camera_calibration: CameraExtrinsics = field(default_factory=CameraExtrinsics)
+    camera_calibration: CameraExtrinsics
     poll_hz: float = 128.0
     provenance: Mapping[str, str] = field(default_factory=dict)
 
@@ -140,7 +140,7 @@ def _build_start_metadata(
     }
 
 
-def _create_episode_recorder(shared: Any, config: RecorderIOConfig) -> EpisodeRecorder:
+def _create_episode_recorder(shared: Any, config: RecorderWorkerConfig) -> EpisodeRecorder:
     sample_dtype = shared.record_sample_ring.dtype
     rgb_dims = sample_dtype.fields["camera_rgb"][0].shape
     depth_dims = sample_dtype.fields["camera_depth"][0].shape
@@ -168,7 +168,7 @@ def _fail_workflow(shared: Any) -> None:
 @dataclass
 class _RecorderIOSession:
     shared: Any
-    config: RecorderIOConfig
+    config: RecorderWorkerConfig
     recorder: EpisodeRecorder
     last_sample_sequence: int = 0
     pending_stop: StopRecording | None = None
@@ -335,7 +335,7 @@ class _RecorderIOSession:
             self._drain_samples()
 
 
-def recorder_io_loop(shared: Any, config: RecorderIOConfig) -> None:
+def run_recorder_worker(shared: Any, config: RecorderWorkerConfig) -> None:
     """Record episodes until shutdown, reporting worker failures to supervision."""
     session = None
     crashed = False

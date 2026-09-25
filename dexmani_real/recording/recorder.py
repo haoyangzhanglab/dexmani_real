@@ -18,7 +18,7 @@ import h5py  # type: ignore[import-untyped]
 import numpy as np
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
-from dexmani_real.config.defaults import camera
+from dexmani_real.config.hardware import CameraParams
 from dexmani_real.recording.frame import EpisodeFrame
 from dexmani_real.recording.storage.camera_writer import (
     CameraStreamWriter,
@@ -119,8 +119,8 @@ class EpisodeRecorder:
         self._data_writer: EpisodeDataWriter | None = None
         self._camera_writer: CameraStreamWriter | None = None
         self._camera_writer_config = camera_writer_config or CameraStreamWriterConfig(
-            rgb_shape=camera.rgb_shape,
-            depth_shape=camera.depth_shape,
+            rgb_shape=CameraParams().rgb_shape,
+            depth_shape=CameraParams().depth_shape,
             fps=self.control_hz,
         )
         if not np.isclose(self._camera_writer_config.fps, self.control_hz):

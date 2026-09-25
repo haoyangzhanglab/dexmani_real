@@ -10,8 +10,8 @@ from dexmani_real.recording.frame import build_episode_frame
 from dexmani_real.recording.storage.schema import FRAME_IK_FAIL, FRAME_OK, FRAME_RETARGET_FAIL
 from dexmani_real.robot.commands import RobotCommand, publish_command
 from dexmani_real.robot.projection import project_hand_command
-from dexmani_real.teleop.control_loop.action_proposal import compute_target_eef_pose
-from dexmani_real.teleop.control_loop.hand_control import (
+from dexmani_real.teleop.control.action_proposal import compute_target_eef_pose
+from dexmani_real.teleop.control.hand_retargeting import (
     HandRetargetObservationCache,
     compute_hand_command,
     reset_hand_retargeter,
@@ -27,22 +27,22 @@ class TeleopController:
         )
         self.hand_retargeter = hand_retargeter
         self.arm_fk = make_arm_fk()
-        self.cache = HandRetargetObservationCache()
-        self.prev_qpos_cmd = None
+        self.hand_observation_cache = HandRetargetObservationCache()
+        self.previous_arm_command = None
         if not runtime.policy.hand_enabled:
             self.planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
         self.clear_reference()
 
     def clear_reference(self):
         self.arm_mapper.clear()
-        self.ema_pos = self.ema_quat = None
-        self.cache.reset()
+        self.smoothed_eef_position = self.smoothed_eef_quaternion = None
+        self.hand_observation_cache.reset()
         reset_hand_retargeter(self.hand_retargeter)
 
     def reset_reference(self, row):
         self.clear_reference()
-        self.prev_qpos_cmd = row.arm["qpos"][0].copy()
-        pos, rot = self.arm_fk.compute(self.prev_qpos_cmd)
+        self.previous_arm_command = row.arm["qpos"][0].copy()
+        pos, rot = self.arm_fk.compute(self.previous_arm_command)
         self.arm_mapper.reset(
             wrist_pos=row.vr["wrist_pos"],
             wrist_quat_wxyz=row.vr["wrist_quat_wxyz"],
@@ -53,7 +53,7 @@ class TeleopController:
             reset_hand_retargeter(self.hand_retargeter, row.hand["qpos"][0])
         return self.arm_mapper.is_ready()
 
-    def compute(self, row, run_id):
+    def compute_command(self, row, run_id):
         cfg = self.runtime
         mapped = self.arm_mapper.map(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
         if mapped is None:
@@ -61,8 +61,8 @@ class TeleopController:
         target = compute_target_eef_pose(
             mapped["pos"],
             mapped["quat_wxyz"],
-            previous_position_world_m=self.ema_pos,
-            previous_quat_world_wxyz=self.ema_quat,
+            previous_position_world_m=self.smoothed_eef_position,
+            previous_quat_world_wxyz=self.smoothed_eef_quaternion,
             workspace_bounds_world_m=cfg.policy.workspace.as_array(),
             ema_alpha_position=cfg.policy.ema.alpha_pos,
             ema_alpha_rotation=cfg.policy.ema.alpha_rot,
@@ -73,7 +73,9 @@ class TeleopController:
         hand = None
         if cfg.policy.hand_enabled:
             try:
-                proposal = compute_hand_command(self.hand_retargeter, row.vr, self.cache)
+                proposal = compute_hand_command(
+                    self.hand_retargeter, row.vr, self.hand_observation_cache
+                )
                 if proposal is None:
                     return None, FRAME_RETARGET_FAIL, intent
                 hand = project_hand_command(
@@ -87,7 +89,7 @@ class TeleopController:
         solution = self.planner.solve_online_ik(
             Pose(p=target.position_world_m, q=target.quat_world_wxyz),
             row.arm["qpos"][0],
-            self.prev_qpos_cmd,
+            self.previous_arm_command,
         )
         if solution.failure_kind == IKFailureKind.INVALID_OUTPUT:
             raise RuntimeError(f"online IK technical failure: {solution.reason}")
@@ -97,16 +99,16 @@ class TeleopController:
         return RobotCommand(run_id, arm, hand), FRAME_OK, intent
 
 
-def run_control_grid_tick(controller, shared, row, recorder=None):
+def execute_control_step(controller, shared, row, recorder=None):
     epoch = int(shared.run_id.value)
-    target, status, intent = controller.compute(row, epoch)
+    target, status, intent = controller.compute_command(row, epoch)
     stamp = publish_command(shared, target) if target is not None else 0
     if int(shared.run_id.value) != epoch or (target is not None and not stamp):
         return status
     if stamp:
-        controller.prev_qpos_cmd = target.arm_qpos.copy()
-        controller.ema_pos = intent[:3].copy()
-        controller.ema_quat = rot6d_to_quat_wxyz(intent[3:])
+        controller.previous_arm_command = target.arm_qpos.copy()
+        controller.smoothed_eef_position = intent[:3].copy()
+        controller.smoothed_eef_quaternion = rot6d_to_quat_wxyz(intent[3:])
     if recorder is not None and recorder.is_recording:
         recorder.add_frame(
             build_episode_frame(

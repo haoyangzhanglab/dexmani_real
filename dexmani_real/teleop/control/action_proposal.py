@@ -1,8 +1,7 @@
 """Compute Cartesian teleoperation intent without side effects.
 
-The control-grid owner supplies observations and temporal state, then remains
-responsible for target publication and recording. Keeping this
-module pure makes proposal behavior testable without shared memory or hardware.
+TeleopController supplies the mapped pose and previous accepted target.
+Target publication and recording belong to execute_control_step.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from dexmani_real.planning.kinematics.pose import quat_multiply
 
 @dataclass(frozen=True)
 class EefTargetProposal:
-    """One mapped EEF target in the world frame, before and after filtering."""
+    """One world-frame EEF target after smoothing and workspace clipping."""
 
     position_world_m: np.ndarray
     quat_world_wxyz: np.ndarray

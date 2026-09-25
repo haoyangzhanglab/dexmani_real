@@ -1,16 +1,14 @@
 """VR receiver worker — crash-isolated HTS SDK wrapper.
 
-Primary entry point: ``vr_loop(shared)`` — mp.Process target, writes directly
+Primary entry point: ``run_vr_worker(shared, config)`` — mp.Process target, writes directly
 to RuntimeChannels.vr_ring.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import numpy as np
 
-from dexmani_real.config.defaults import vr
+from dexmani_real.config.hardware import VRParams
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -39,34 +37,14 @@ def _normalized_wxyz(value: object, name: str) -> np.ndarray:
     return quat / norm
 
 
-@dataclass
-class VRReceiverConfig:
-    """Configuration for VR receiver — defaults from vr singleton."""
-
-    transport: str = field(default_factory=lambda: vr.transport)
-    host: str = field(default_factory=lambda: vr.host)
-    port: int = field(default_factory=lambda: vr.port)
-    hand_side: str = field(default_factory=lambda: vr.hand_side)  # "both" needed for HeadFrame
-
-    @classmethod
-    def from_runtime(cls, runtime: object) -> "VRReceiverConfig":
-        cfg = getattr(runtime, "vr")
-        return cls(
-            transport=str(cfg.transport),
-            host=str(cfg.host),
-            port=int(cfg.port),
-            hand_side=str(cfg.hand_side),
-        )
-
-
-def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
+def run_vr_worker(shared, config: VRParams) -> None:
     """VR process entry point — writes directly to RuntimeChannels.vr_ring."""
 
-    cfg = config or VRReceiverConfig()
+    cfg = config
 
     from dexmani_real.ipc.schema import VR_FRAME_DTYPE
 
-    logger.debug("vr_loop: LOADING")
+    logger.debug("run_vr_worker: LOADING")
 
     try:
         from hand_tracking_sdk import (
@@ -94,13 +72,13 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
             )
         )
     except ImportError as e:
-        logger.error("vr_loop: SDK import failed: %s", e)
+        logger.error("run_vr_worker: SDK import failed: %s", e)
         raise
     except Exception as e:
-        logger.error("vr_loop: connect failed: %s", e)
+        logger.error("run_vr_worker: connect failed: %s", e)
         raise
 
-    logger.info("vr_loop: connected to HTS port=%d", cfg.port)
+    logger.info("run_vr_worker: connected to HTS port=%d", cfg.port)
 
     _latest_head_pos = np.full(3, np.nan)
     _latest_head_quat_wxyz = np.full(4, np.nan)
@@ -131,7 +109,7 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
                 _latest_head_sequence_id = head_sequence_id
                 _latest_head_recv_ts_ns = head_recv_ts_ns
             except (ValueError, TypeError, AttributeError):
-                logger.warning("vr_loop: invalid head pose rejected", exc_info=True)
+                logger.warning("run_vr_worker: invalid head pose rejected", exc_info=True)
             continue
 
         if not isinstance(event, HandFrame):
@@ -171,12 +149,12 @@ def vr_loop(shared, config: VRReceiverConfig | None = None) -> None:
             shared.vr_ring.write(frame)
             if not shared.vr_ready.is_set():
                 shared.vr_ready.set()
-                logger.debug("vr_loop: READY")
-                logger.info("vr_loop: ready (first valid right-hand frame received)")
+                logger.debug("run_vr_worker: READY")
+                logger.info("run_vr_worker: ready (first valid right-hand frame received)")
 
         except (ValueError, TypeError, AttributeError):
-            logger.warning("vr_loop: frame conversion error", exc_info=True)
+            logger.warning("run_vr_worker: frame conversion error", exc_info=True)
             continue
 
-    logger.debug("vr_loop: STOPPED")
-    logger.info("vr_loop: exited")
+    logger.debug("run_vr_worker: STOPPED")
+    logger.info("run_vr_worker: exited")

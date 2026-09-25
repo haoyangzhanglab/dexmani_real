@@ -1,6 +1,6 @@
 """DexMani configuration helpers."""
 
-from dexmani_real.config.defaults import (
+from dexmani_real.config.environment import (
     EnvironmentConfig,
     StaticCollisionBox,
     TableCollisionConfig,

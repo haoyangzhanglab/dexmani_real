@@ -11,12 +11,11 @@ from dexmani_real.replay.evaluation import evaluate_replay
 from dexmani_real.replay.replayer import ReplayOutcome, ReplayStatus, replay_targets
 from dexmani_real.replay.trajectory import verify_replay_preflight
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
-from dexmani_real.robot.arm_worker import arm_loop
-from dexmani_real.robot.hand_worker import hand_loop
+from dexmani_real.robot.arm_worker import run_arm_worker
+from dexmani_real.robot.hand_worker import run_hand_worker
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
-from dexmani_real.runtime.processes import shutdown_processes_verified
 from dexmani_real.runtime.safety import SafetyState, require_transition
-from dexmani_real.runtime.supervisor import check_processes, start_processes
+from dexmani_real.runtime.supervisor import RuntimeSupervisor
 
 DEFAULT_OUTPUT_DIR = "replay_results"
 
@@ -39,21 +38,21 @@ def replay_episode(trajectory, runtime, config):
         mp_context=ctx,
     )
     processes = [
-        ctx.Process(name="arm", target=arm_loop, args=(shared, runtime.arm)),
-        ctx.Process(name="hand", target=hand_loop, args=(shared, runtime.hand)),
+        ctx.Process(name="arm", target=run_arm_worker, args=(shared, runtime.arm)),
+        ctx.Process(name="hand", target=run_hand_worker, args=(shared, runtime.hand)),
     ]
-    started = []
+    supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
     keyboard = KeyboardInput(estop_callback=lambda: setattr(shared.estop_request, "value", True))
     outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="startup failed")
     try:
-        start_processes(shared, processes, runtime.safety.readiness_timeouts_s, started)
+        supervisor.start(processes)
         require_transition(shared, SafetyState.ARMED)
         keyboard.start()
         outcome = replay_targets(shared, runtime, trajectory, keyboard)
         if outcome.successful:
             print("H: planned return_home; Q: exit", flush=True)
             deadline = time.monotonic() + runtime.policy.post_teleop_timeout_s
-            while time.monotonic() < deadline and check_processes(shared, started):
+            while time.monotonic() < deadline and supervisor.check():
                 if not keyboard.healthy:
                     shared.estop_request.value = True
                 if shared.error_state.value or shared.estop_request.value:
@@ -77,9 +76,7 @@ def replay_episode(trajectory, runtime, config):
                     break
     finally:
         keyboard.quiesce()
-        report = shutdown_processes_verified(
-            shared,
-            started,
+        report = supervisor.shutdown(
             graceful_timeout_s=runtime.safety.shutdown_timeout_s,
             disarm_if_clean=outcome.successful,
         )

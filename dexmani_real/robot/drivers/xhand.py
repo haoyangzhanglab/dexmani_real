@@ -17,7 +17,7 @@ from typing import Any, Callable
 import numpy as np
 from xhand_controller import xhand_control as xhc  # type: ignore[import-untyped]
 
-from dexmani_real.config.defaults import HandParams
+from dexmani_real.config.hardware import HandParams
 from dexmani_real.robot.model import (
     HAND_DOF,
     HAND_FINGER_COUNT,

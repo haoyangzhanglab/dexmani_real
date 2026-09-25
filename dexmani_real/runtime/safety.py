@@ -68,22 +68,29 @@ def command_may_cross_sdk(shared, *, run_id, required_safety_state=SafetyState.R
         )
 
 
-def revoke_motion(shared, new_state=SafetyState.ARMED, *, reason=RunEndReason.EXECUTOR_BOUNDARY):
+def _revoke_motion_locked(
+    shared, new_state=SafetyState.ARMED, *, reason=RunEndReason.EXECUTOR_BOUNDARY
+):
+    """Revoke the current epoch while the caller holds motion_lock."""
     if new_state not in (SafetyState.ARMED, SafetyState.DISARMED, SafetyState.FAULT):
         raise ValueError("revocation must leave streaming mode")
-    with shared.motion_lock:
-        current = SafetyState(int(shared.safety_state.value))
-        if current == SafetyState.FAULT and new_state == SafetyState.ARMED:
-            return False
-        if current == SafetyState.RUNNING:
-            if shared.estop_request.value:
-                reason = RunEndReason.ESTOP
-            elif shared.error_state.value or new_state == SafetyState.FAULT:
-                reason = RunEndReason.HARDWARE_FAULT
-            shared.run_ended_reason.value = int(reason)
-        shared.run_id.value += 1
-        shared.safety_state.value = int(new_state)
+    current = SafetyState(int(shared.safety_state.value))
+    if current == SafetyState.FAULT and new_state == SafetyState.ARMED:
+        return False
+    if current == SafetyState.RUNNING:
+        if shared.estop_request.value:
+            reason = RunEndReason.ESTOP
+        elif shared.error_state.value or new_state == SafetyState.FAULT:
+            reason = RunEndReason.HARDWARE_FAULT
+        shared.run_ended_reason.value = int(reason)
+    shared.run_id.value += 1
+    shared.safety_state.value = int(new_state)
     return True
+
+
+def revoke_motion(shared, new_state=SafetyState.ARMED, *, reason=RunEndReason.EXECUTOR_BOUNDARY):
+    with shared.motion_lock:
+        return _revoke_motion_locked(shared, new_state, reason=reason)
 
 
 def revoke_motion_if_run_id(
@@ -96,7 +103,7 @@ def revoke_motion_if_run_id(
     with shared.motion_lock:
         if int(shared.run_id.value) != expected_run_id:
             return False
-        return revoke_motion(shared, new_state, reason=reason)
+        return _revoke_motion_locked(shared, new_state, reason=reason)
 
 
 def transition(shared, new_state):
@@ -144,5 +151,5 @@ def request_policy_stop(shared, *, reason=RunEndReason.OPERATOR):
         shared.physical_home_completed.value = False
         shared.stop_request.value = int(StopRequest.OPERATOR)
         if int(shared.safety_state.value) in (int(SafetyState.ARMED), int(SafetyState.RUNNING)):
-            return revoke_motion(shared, reason=reason)
+            return _revoke_motion_locked(shared, reason=reason)
         return True

@@ -113,16 +113,16 @@ class OnlineIKSolver:
     def __init__(
         self,
         kin: XArm7Kinematics,
-        ik_mgr: IKGeometry,
+        ik_geometry: IKGeometry,
         online_ik_profile: OnlineIKConfig,
         elbow_joint_index: int = 3,
     ) -> None:
-        self.kin, self.ik_mgr, self.profile = kin, ik_mgr, online_ik_profile
+        self.kin, self.ik_geometry, self.profile = kin, ik_geometry, online_ik_profile
         self._elbow_joint_index = elbow_joint_index
         self._rng = np.random.default_rng(online_ik_profile.random_seed)
         self._failure_start: float | None = None
         self._failure_warned = False
-        model = np.asarray(ik_mgr.joint_limits, dtype=np.float64)
+        model = np.asarray(ik_geometry.joint_limits, dtype=np.float64)
         if kin.dof != 7 or model.shape != (7, 2) or not np.isfinite(model).all():
             raise ValueError("online IK requires finite (7, 2) model limits")
         if np.any(model[:, 0] >= model[:, 1]):
@@ -145,10 +145,10 @@ class OnlineIKSolver:
                 raise ValueError("runtime operational limits exceed the loaded model/URDF limits")
             self.operational_limits = np.column_stack((lower, upper))
         self._jump_limit = np.deg2rad(
-            ik_mgr.profile_array(online_ik_profile.max_ik_jump_deg, "max_ik_jump_deg")
+            ik_geometry.profile_array(online_ik_profile.max_ik_jump_deg, "max_ik_jump_deg")
         )
-        self._weights = ik_mgr.profile_array(online_ik_profile.joint_weights, "joint_weights")
-        self._previous_weights = ik_mgr.profile_array(
+        self._weights = ik_geometry.profile_array(online_ik_profile.joint_weights, "joint_weights")
+        self._previous_weights = ik_geometry.profile_array(
             online_ik_profile.previous_command_joint_weights
             if online_ik_profile.previous_command_joint_weights is not None
             else online_ik_profile.joint_weights,
@@ -348,7 +348,7 @@ class OnlineIKSolver:
         report["attempts"].append(attempt)
         report["clik_calls"] += 1
         report["funnel"]["attempted"] += 1
-        model = self.ik_mgr.mp_planner
+        model = self.ik_geometry.mp_planner
         start = time.perf_counter()
         try:
             raw, converged, _ = model.pinocchio_model.compute_IK_CLIK(
@@ -372,7 +372,7 @@ class OnlineIKSolver:
     def _prepare_candidate(self, raw, attempt, target, current, previous, pool, report):
         # Mechanical equivalence survives narrowing the operational interval below 2*pi.
         q = raw.copy()
-        mask = self.ik_mgr.equivalent_joint_mask
+        mask = self.ik_geometry.equivalent_joint_mask
         lo, hi = self.operational_limits.T
         period = 2 * np.pi
         k_min, k_max = (
@@ -390,7 +390,7 @@ class OnlineIKSolver:
         if any(np.max(np.abs(q - c.qpos)) < 1e-4 for c in pool):
             attempt["result"] = "duplicate"
             return None
-        delta_prev = self.ik_mgr.compute_qpos_delta(q, previous)
+        delta_prev = self.ik_geometry.compute_qpos_delta(q, previous)
         if np.any(np.abs(delta_prev) > self._jump_limit):
             attempt["result"] = "jump"
             return None
@@ -401,7 +401,7 @@ class OnlineIKSolver:
             attempt["result"] = "branch_jump_l2"
             return None
         report["funnel"]["continuity_valid"] += 1
-        delta = self.ik_mgr.compute_qpos_delta(q, current)
+        delta = self.ik_geometry.compute_qpos_delta(q, current)
         distance = float(np.max(np.abs(delta)))
         if np.max(np.abs(q - current)) - distance > np.deg2rad(90):
             attempt["result"] = "band_switch"
@@ -420,13 +420,13 @@ class OnlineIKSolver:
             return None
         report["funnel"]["pose_valid"] += 1
         score = (
-            self.ik_mgr.weighted_joint_distance(q, current, self._weights, delta=delta)
+            self.ik_geometry.weighted_joint_distance(q, current, self._weights, delta=delta)
             + p.previous_command_distance_weight
-            * self.ik_mgr.weighted_joint_distance(
+            * self.ik_geometry.weighted_joint_distance(
                 q, previous, self._previous_weights, delta=delta_prev
             )
             + p.joint_limit_penalty_weight
-            * self.ik_mgr.joint_limit_penalty(q, self.operational_limits)
+            * self.ik_geometry.joint_limit_penalty(q, self.operational_limits)
             + p.pose_accuracy_weight
             * (
                 pos_err / p.max_pose_error_pos_m
@@ -451,7 +451,7 @@ class OnlineIKSolver:
     def _collision_free(self, candidate, report):
         if candidate.collision_free is None:
             report["collision_checks"] += 1
-            candidate.collision_free = not self.ik_mgr.has_self_collision(candidate.qpos)
+            candidate.collision_free = not self.ik_geometry.has_self_collision(candidate.qpos)
             candidate.attempt["result"] = "ok" if candidate.collision_free else "self_collision"
             report["funnel"]["collision_free"] += int(candidate.collision_free)
         return candidate.collision_free
@@ -516,7 +516,7 @@ class OnlineIKSolver:
                 continue
             if not any(np.allclose(seed, old, atol=1e-8, rtol=0) for old in seeds):
                 seeds.append(seed)
-        seeds.sort(key=lambda q: self.ik_mgr.joint_limit_penalty(q, self.operational_limits))
+        seeds.sort(key=lambda q: self.ik_geometry.joint_limit_penalty(q, self.operational_limits))
         return list(zip(("null_preferred", "null_opposite"), seeds))
 
     def _has_elbow_flip(self, candidate_qpos, previous_qpos_cmd):

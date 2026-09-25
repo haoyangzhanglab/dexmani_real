@@ -32,9 +32,6 @@ namespaces = false
 [tool.setuptools.package-data]
 "dexmani_real.calibration" = ["state/*.json"]
 
-[tool.isort]
-profile = "black"
-
 [tool.ruff]
 line-length = 100
 target-version = "py310"

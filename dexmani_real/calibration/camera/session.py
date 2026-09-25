@@ -49,13 +49,13 @@ from dexmani_real.ipc.channels import (
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import make_online_ik_config
-from dexmani_real.robot.arm_worker import arm_loop
+from dexmani_real.robot.arm_worker import run_arm_worker
 from dexmani_real.runtime.observation import read_camera_frame, sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_processes_verified
 from dexmani_real.runtime.safety import SafetyState, require_transition
 from dexmani_real.runtime.supervisor import wait_subsystem_ready
-from dexmani_real.sensor.camera.worker import CameraLoopConfig, camera_loop
+from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
@@ -128,85 +128,6 @@ def _build_planner(
     planner.workspace_bounds = workspace.copy()
     planner.set_hand_qpos(np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)))
     return planner, workspace
-
-
-def _runtime_issue(shared: RuntimeChannels, arm_process: Any, max_age_s: float) -> str | None:
-    if shared.estop_request.value:
-        return "e-stop is requested"
-    if shared.error_state.value:
-        return "a worker set the sticky error latch"
-    if int(shared.safety_state.value) == int(SafetyState.FAULT):
-        return "safety state is FAULT"
-    if not arm_process.is_alive():
-        return "arm worker exited"
-    arm = read_arm_state_dict(shared)
-    if arm is None or not sample_is_fresh(arm["timestamp_ns"], max_age_s):
-        return "arm feedback stale"
-    if shared.workflow_failed.value:
-        return "camera acquisition failed"
-    return None
-
-
-def _capture_calibration_sample(
-    shared: RuntimeChannels,
-    runtime: ExperimentConfig,
-    intrinsics: np.ndarray,
-    distortion: np.ndarray,
-    samples: CalibrationSamples,
-    aruco_config: ArucoConfig,
-) -> None:
-    """Append one marker/arm observation only when the arm stayed stationary."""
-    print(f"\n  [{len(samples) + 1}] capturing ArUco pose...", end=" ", flush=True)
-    arm_before, feedback_issue = _read_stationary_calibration_arm_state(shared, runtime)
-    if arm_before is None:
-        print(f"FAILED — before capture: {feedback_issue}, skipped")
-        return
-    try:
-        aruco_pose = _detect_aruco_stable(
-            shared,
-            intrinsics,
-            distortion,
-            marker_size_m=aruco_config.marker_size_m,
-            target_id=aruco_config.target_id,
-            max_frame_age_s=runtime.camera.max_frame_age_s,
-            n_frames=aruco_config.capture_frames,
-        )
-    except Exception as exc:
-        logger.warning("capture failed", exc_info=True)
-        print(f"FAILED — {exc}, skipped")
-        return
-
-    arm_after, feedback_issue = _read_stationary_calibration_arm_state(shared, runtime)
-    if arm_after is None:
-        print(f"FAILED — after capture: {feedback_issue}, skipped")
-        return
-    arm_before_qpos = np.asarray(arm_before["qpos"], dtype=np.float64)
-    arm_after_qpos = np.asarray(arm_after["qpos"], dtype=np.float64)
-    drift_rad = float(np.max(np.abs(arm_after_qpos - arm_before_qpos)))
-    convergence_rad = float(runtime.arm.homing.convergence_rad)
-    if drift_rad > convergence_rad:
-        print(
-            "FAILED — arm moved during capture "
-            f"({drift_rad:.4f}rad > {convergence_rad:.4f}rad), skipped"
-        )
-        return
-    if aruco_pose is None:
-        print("FAILED — marker not detected, skipped")
-        return
-
-    marker_rvec, marker_tvec = aruco_pose
-    eef_pos_base_m, eef_rot6d_base = make_arm_fk().compute(arm_after_qpos)
-    eef_rpy_base_rad = eef_rpy_from_rot6d(eef_rot6d_base)
-    samples.append(
-        eef_pos_base_m,
-        eef_rpy_base_rad,
-        marker_rvec,
-        marker_tvec,
-    )
-    print(
-        f"OK (total {len(samples)})  EE={np.round(eef_pos_base_m, 3)}m  "
-        f"marker_dist={np.linalg.norm(marker_tvec):.3f}m"
-    )
 
 
 def _read_stationary_calibration_arm_state(
@@ -386,266 +307,273 @@ def _solve_and_save_calibration(
     return T_world_camera
 
 
-def _show_calibration_preview(
-    shared: RuntimeChannels,
-    detector: cv2.aruco.ArucoDetector,
-    intrinsics: np.ndarray,
-    distortion: np.ndarray,
-    samples: CalibrationSamples,
-    calib_cfg: CalibrationConfig,
-    aruco_cfg: ArucoConfig,
-    marker_corners: np.ndarray,
-    previous_image: np.ndarray | None,
-    max_frame_age_s: float,
-) -> np.ndarray | None:
-    """Poll and display the newest camera preview without blocking control."""
-    frame = read_camera_frame(shared)
-    display_image = previous_image
-    if frame and sample_is_fresh(frame["timestamp_ns"], max_frame_age_s):
-        image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
-        display_image, _ = draw_calibration_overlay(
-            image,
-            detector,
-            intrinsics,
-            distortion,
-            n_samples=len(samples),
-            min_samples=calib_cfg.min_samples,
-            target_id=aruco_cfg.target_id,
-            marker_corners=marker_corners,
-            marker_size_m=aruco_cfg.marker_size_m,
+class CameraCalibrationSession:
+    """Own interactive calibration context, keyboard and preview lifetime."""
+
+    def __init__(
+        self, shared, runtime, planner, workspace, arm_process, calibration_config, aruco_config
+    ):
+        self.shared = shared
+        self.runtime = runtime
+        self.planner = planner
+        self.workspace = workspace
+        self.arm_process = arm_process
+        self.calibration_config = calibration_config
+        self.aruco_config = aruco_config
+
+    def _runtime_issue(self):
+        if self.shared.estop_request.value:
+            return "e-stop is requested"
+        if self.shared.error_state.value:
+            return "a worker set the sticky error latch"
+        if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
+            return "safety state is FAULT"
+        if not self.arm_process.is_alive():
+            return "arm worker exited"
+        arm = read_arm_state_dict(self.shared)
+        if arm is None or not sample_is_fresh(
+            arm["timestamp_ns"], self.runtime.arm.feedback_max_age_s
+        ):
+            return "arm feedback stale"
+        if self.shared.workflow_failed.value:
+            return "camera acquisition failed"
+        return None
+
+    def _capture_sample(self):
+        """Append one marker/arm observation only when the arm stayed stationary."""
+        print(f"\n  [{len(self.state.samples) + 1}] capturing ArUco pose...", end=" ", flush=True)
+        arm_before, feedback_issue = _read_stationary_calibration_arm_state(
+            self.shared, self.runtime
         )
-    if display_image is not None:
-        cv2.imshow(_WINDOW_NAME, display_image)
-    cv2.waitKey(1)
-    return display_image
-
-
-def _handle_calibration_sample_events(
-    shared: RuntimeChannels,
-    runtime: ExperimentConfig,
-    planner: XArm7MotionPlanner,
-    serial: str,
-    intrinsics: np.ndarray,
-    distortion: np.ndarray,
-    keys: KeyboardInput,
-    state: CalibrationLoopState,
-    calib_cfg: CalibrationConfig,
-    aruco_cfg: ArucoConfig,
-) -> None:
-    """Drain edge-triggered capture, undo, reject, and solve events."""
-    event = keys.pop_event()
-    while event is not None:
-        if event == "space":
-            _capture_calibration_sample(
-                shared,
-                runtime,
-                intrinsics,
-                distortion,
-                state.samples,
-                aruco_cfg,
+        if arm_before is None:
+            print(f"FAILED — before capture: {feedback_issue}, skipped")
+            return
+        try:
+            aruco_pose = _detect_aruco_stable(
+                self.shared,
+                self.intrinsics,
+                self.distortion,
+                marker_size_m=self.aruco_config.marker_size_m,
+                target_id=self.aruco_config.target_id,
+                max_frame_age_s=self.runtime.camera.max_frame_age_s,
+                n_frames=self.aruco_config.capture_frames,
             )
-        elif event == "backspace":
-            if state.samples.pop_last():
-                print(f"  undone, {len(state.samples)} remaining")
-            else:
-                print("  (no samples to undo)")
-        elif event == "x":
-            removed = state.samples.pop_worst()
-            if removed is None:
-                print("  (press ENTER first to evaluate quality, then X to remove worst)")
-            else:
-                index, residual_mm = removed
-                print(
-                    f"  removed worst frame #{index + 1} "
-                    f"(residual {residual_mm:.1f}mm), {len(state.samples)} remaining "
-                    "— press ENTER to recompute"
-                )
-        elif event == "enter":
-            transform = _solve_and_save_calibration(
-                state.samples,
-                planner,
-                serial,
-                calib_cfg,
-                intrinsics=intrinsics,
-                distortion=distortion,
-            )
-            state.calibration_saved = transform is not None
-        event = keys.pop_event()
+        except Exception as exc:
+            logger.warning("capture failed", exc_info=True)
+            print(f"FAILED — {exc}, skipped")
+            return
 
-
-def _run_calibration(
-    shared: RuntimeChannels,
-    runtime: ExperimentConfig,
-    planner: XArm7MotionPlanner,
-    workspace: np.ndarray,
-    arm_process: Any,
-    calib_cfg: CalibrationConfig,
-    aruco_cfg: ArucoConfig,
-) -> int:
-    state = read_initial_arm(shared, runtime)
-    if state is None:
-        set_calibration_fault(shared, "initial arm feedback is unavailable or unhealthy")
-        return 1
-
-    keys = KeyboardInput(
-        suppress_echo=True,
-        capture_commands=False,
-        capture_raw_events=True,
-        repeat_estop_callback=True,
-        estop_callback=lambda: set_calibration_fault(
-            shared, "operator e-stop callback", estop=True
-        ),
-    )
-    keys_started = False
-    window_created = False
-    try:
-        serial = shared.camera_serial.value.decode()
-        geometry = json.loads(shared.camera_geometry.value.decode())["color"]
-        intrinsics = np.array(
-            [[geometry["fx"], 0, geometry["ppx"]], [0, geometry["fy"], geometry["ppy"]], [0, 0, 1]],
-            dtype=np.float64,
+        arm_after, feedback_issue = _read_stationary_calibration_arm_state(
+            self.shared, self.runtime
         )
-        distortion = np.asarray(geometry["distortion_coeffs"], dtype=np.float64)
-        print(f"  Camera serial: {serial}")
+        if arm_after is None:
+            print(f"FAILED — after capture: {feedback_issue}, skipped")
+            return
+        arm_before_qpos = np.asarray(arm_before["qpos"], dtype=np.float64)
+        arm_after_qpos = np.asarray(arm_after["qpos"], dtype=np.float64)
+        drift_rad = float(np.max(np.abs(arm_after_qpos - arm_before_qpos)))
+        convergence_rad = float(self.runtime.arm.homing.convergence_rad)
+        if drift_rad > convergence_rad:
+            print(
+                "FAILED — arm moved during capture "
+                f"({drift_rad:.4f}rad > {convergence_rad:.4f}rad), skipped"
+            )
+            return
+        if aruco_pose is None:
+            print("FAILED — marker not detected, skipped")
+            return
+
+        marker_rvec, marker_tvec = aruco_pose
+        eef_pos_base_m, eef_rot6d_base = make_arm_fk().compute(arm_after_qpos)
+        eef_rpy_base_rad = eef_rpy_from_rot6d(eef_rot6d_base)
+        self.state.samples.append(
+            eef_pos_base_m,
+            eef_rpy_base_rad,
+            marker_rvec,
+            marker_tvec,
+        )
         print(
-            f"  Intrinsics: fx={intrinsics[0, 0]:.1f} "
-            f"fy={intrinsics[1, 1]:.1f} ({_CAMERA_WIDTH}x{_CAMERA_HEIGHT})"
-        )
-        keys.start()
-        keys_started = True
-        cv2.namedWindow(_WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
-        window_created = True
-        return _run_calibration_control_loop(
-            shared,
-            runtime,
-            planner,
-            workspace,
-            arm_process,
-            serial,
-            intrinsics,
-            distortion,
-            keys,
-            state,
-            calib_cfg,
-            aruco_cfg,
-        )
-    except KeyboardInterrupt:
-        set_calibration_fault(shared, "KeyboardInterrupt")
-        return 130
-    except Exception as exc:
-        logger.error("calibration session failed", exc_info=True)
-        set_calibration_fault(shared, f"calibration session failed: {exc}")
-        return 1
-    finally:
-        if keys_started:
-            try:
-                keys.stop()
-            except Exception:
-                logger.error("keyboard listener cleanup failed", exc_info=True)
-        if window_created:
-            try:
-                cv2.destroyWindow(_WINDOW_NAME)
-            except Exception:
-                logger.error("calibration window cleanup failed", exc_info=True)
-
-
-def _run_calibration_control_loop(
-    shared: RuntimeChannels,
-    runtime: ExperimentConfig,
-    planner: XArm7MotionPlanner,
-    workspace: np.ndarray,
-    arm_process: Any,
-    serial: str,
-    intrinsics: np.ndarray,
-    distortion: np.ndarray,
-    keys: KeyboardInput,
-    initial_state: dict[str, Any],
-    calib_cfg: CalibrationConfig,
-    aruco_cfg: ArucoConfig,
-) -> int:
-    max_age = runtime.arm.feedback_max_age_s
-    state = CalibrationLoopState.from_arm_state(initial_state)
-    marker_corners = marker_corners_3d(aruco_cfg.marker_size_m)
-    preview_detector = cv2.aruco.ArucoDetector(
-        cv2.aruco.getPredefinedDictionary(ARUCO_DICT),
-        cv2.aruco.DetectorParameters(),
-    )
-    rate = LoopRate(float(runtime.keyboard_teleop.control_hz), label="camera_calibration")
-
-    print(
-        f"\n  ArUco: {ARUCO_DICT_NAME} ID={aruco_cfg.target_id} "
-        f"size={aruco_cfg.marker_size_m * 1000:.1f}mm"
-    )
-    print("  Controls: WASD/arrows move, ←→/I/J/K/L rotate, SPACE capture, ENTER calibrate")
-    print(f"  Preview window: {_WINDOW_NAME} (green=detected, red=not found)")
-
-    display_image: np.ndarray | None = None
-    while shared.is_running.value:
-        rate.wait()
-        state.frame += 1
-        display_image = _show_calibration_preview(
-            shared,
-            preview_detector,
-            intrinsics,
-            distortion,
-            state.samples,
-            calib_cfg,
-            aruco_cfg,
-            marker_corners,
-            display_image,
-            runtime.camera.max_frame_age_s,
-        )
-        _handle_calibration_sample_events(
-            shared,
-            runtime,
-            planner,
-            serial,
-            intrinsics,
-            distortion,
-            keys,
-            state,
-            calib_cfg,
-            aruco_cfg,
+            f"OK (total {len(self.state.samples)})  EE={np.round(eef_pos_base_m, 3)}m  "
+            f"marker_dist={np.linalg.norm(marker_tvec):.3f}m"
         )
 
-        if keys.is_pressed("esc"):
-            set_calibration_fault(shared, "operator e-stop", estop=True)
-            return 1
-        if not keys.healthy:
-            set_calibration_fault(shared, "keyboard listener exited", estop=True)
-            return 1
-        issue = _runtime_issue(shared, arm_process, max_age)
-        if issue is not None:
-            set_calibration_fault(shared, issue)
+    def _show_preview(self):
+        """Poll and display the newest camera preview without blocking control."""
+        frame = read_camera_frame(self.shared)
+        if frame and sample_is_fresh(frame["timestamp_ns"], self.runtime.camera.max_frame_age_s):
+            image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
+            self.display_image, _ = draw_calibration_overlay(
+                image,
+                self.preview_detector,
+                self.intrinsics,
+                self.distortion,
+                n_samples=len(self.state.samples),
+                min_samples=self.calibration_config.min_samples,
+                target_id=self.aruco_config.target_id,
+                marker_corners=self.marker_corners,
+                marker_size_m=self.aruco_config.marker_size_m,
+            )
+        if self.display_image is not None:
+            cv2.imshow(_WINDOW_NAME, self.display_image)
+        cv2.waitKey(1)
+
+    def _handle_sample_events(self):
+        """Drain edge-triggered capture, undo, reject, and solve events."""
+        event = self.keys.pop_event()
+        while event is not None:
+            if event == "space":
+                self._capture_sample()
+            elif event == "backspace":
+                if self.state.samples.pop_last():
+                    print(f"  undone, {len(self.state.samples)} remaining")
+                else:
+                    print("  (no samples to undo)")
+            elif event == "x":
+                removed = self.state.samples.pop_worst()
+                if removed is None:
+                    print("  (press ENTER first to evaluate quality, then X to remove worst)")
+                else:
+                    index, residual_mm = removed
+                    print(
+                        f"  removed worst frame #{index + 1} "
+                        f"(residual {residual_mm:.1f}mm), {len(self.state.samples)} remaining "
+                        "— press ENTER to recompute"
+                    )
+            elif event == "enter":
+                transform = _solve_and_save_calibration(
+                    self.state.samples,
+                    self.planner,
+                    self.serial,
+                    self.calibration_config,
+                    intrinsics=self.intrinsics,
+                    distortion=self.distortion,
+                )
+                self.state.calibration_saved = transform is not None
+            event = self.keys.pop_event()
+
+    def run(self) -> int:
+        initial_state = read_initial_arm(self.shared, self.runtime)
+        if initial_state is None:
+            set_calibration_fault(self.shared, "initial arm feedback is unavailable or unhealthy")
             return 1
 
-        if keys.is_pressed("q"):
-            return finish_calibration_motion(shared, calibration_saved=state.calibration_saved)
-        state.current_qpos = read_arm_state_dict(shared)["qpos"]
-
-        home_outcome = handle_calibration_home_key(
-            shared,
-            runtime,
-            planner,
-            keys,
-            rate,
-            state,
+        self.keys = KeyboardInput(
+            suppress_echo=True,
+            capture_commands=False,
+            capture_raw_events=True,
+            repeat_estop_callback=True,
+            estop_callback=lambda: set_calibration_fault(
+                self.shared, "operator e-stop callback", estop=True
+            ),
         )
-        if home_outcome is HomeKeyOutcome.FAULT:
+        keys_started = False
+        window_created = False
+        try:
+            self.serial = self.shared.camera_serial.value.decode()
+            geometry = json.loads(self.shared.camera_geometry.value.decode())["color"]
+            self.intrinsics = np.array(
+                [
+                    [geometry["fx"], 0, geometry["ppx"]],
+                    [0, geometry["fy"], geometry["ppy"]],
+                    [0, 0, 1],
+                ],
+                dtype=np.float64,
+            )
+            self.distortion = np.asarray(geometry["distortion_coeffs"], dtype=np.float64)
+            print(f"  Camera serial: {self.serial}")
+            print(
+                f"  Intrinsics: fx={self.intrinsics[0, 0]:.1f} "
+                f"fy={self.intrinsics[1, 1]:.1f} ({_CAMERA_WIDTH}x{_CAMERA_HEIGHT})"
+            )
+            self.keys.start()
+            keys_started = True
+            cv2.namedWindow(_WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+            window_created = True
+            return self._run_control_loop(initial_state)
+        except KeyboardInterrupt:
+            set_calibration_fault(self.shared, "KeyboardInterrupt")
+            return 130
+        except Exception as exc:
+            logger.error("calibration session failed", exc_info=True)
+            set_calibration_fault(self.shared, f"calibration session failed: {exc}")
             return 1
-        if home_outcome is HomeKeyOutcome.COMPLETED:
-            continue
+        finally:
+            if keys_started:
+                try:
+                    self.keys.stop()
+                except Exception:
+                    logger.error("keyboard listener cleanup failed", exc_info=True)
+            if window_created:
+                try:
+                    cv2.destroyWindow(_WINDOW_NAME)
+                except Exception:
+                    logger.error("calibration window cleanup failed", exc_info=True)
 
-        run_calibration_motion_tick(
-            shared,
-            runtime,
-            planner,
-            workspace,
-            keys,
-            state,
-            calib_cfg,
+    def _run_control_loop(self, initial_state):
+        self.state = CalibrationLoopState.from_arm_state(initial_state)
+        self.marker_corners = marker_corners_3d(self.aruco_config.marker_size_m)
+        self.preview_detector = cv2.aruco.ArucoDetector(
+            cv2.aruco.getPredefinedDictionary(ARUCO_DICT),
+            cv2.aruco.DetectorParameters(),
         )
-    return 0
+        self.rate = LoopRate(
+            float(self.runtime.keyboard_teleop.control_hz), label="camera_calibration"
+        )
+
+        print(
+            f"\n  ArUco: {ARUCO_DICT_NAME} ID={self.aruco_config.target_id} "
+            f"size={self.aruco_config.marker_size_m * 1000:.1f}mm"
+        )
+        print("  Controls: WASD/arrows move, ←→/I/J/K/L rotate, SPACE capture, ENTER calibrate")
+        print(f"  Preview window: {_WINDOW_NAME} (green=detected, red=not found)")
+
+        self.display_image: np.ndarray | None = None
+        while self.shared.is_running.value:
+            self.rate.wait()
+            self.state.frame += 1
+            self._show_preview()
+            self._handle_sample_events()
+
+            if self.keys.is_pressed("esc"):
+                set_calibration_fault(self.shared, "operator e-stop", estop=True)
+                return 1
+            if not self.keys.healthy:
+                set_calibration_fault(self.shared, "keyboard listener exited", estop=True)
+                return 1
+            issue = self._runtime_issue()
+            if issue is not None:
+                set_calibration_fault(self.shared, issue)
+                return 1
+
+            if self.keys.is_pressed("q"):
+                return finish_calibration_motion(
+                    self.shared, calibration_saved=self.state.calibration_saved
+                )
+            self.state.current_qpos = read_arm_state_dict(self.shared)["qpos"]
+
+            home_outcome = handle_calibration_home_key(
+                self.shared,
+                self.runtime,
+                self.planner,
+                self.keys,
+                self.rate,
+                self.state,
+            )
+            if home_outcome is HomeKeyOutcome.FAULT:
+                return 1
+            if home_outcome is HomeKeyOutcome.COMPLETED:
+                continue
+
+            run_calibration_motion_tick(
+                self.shared,
+                self.runtime,
+                self.planner,
+                self.workspace,
+                self.keys,
+                self.state,
+                self.calibration_config,
+            )
+        return 0
 
 
 def run_camera_calibration(
@@ -688,11 +616,11 @@ def run_camera_calibration(
     exit_code = 1
     try:
         processes = [
-            ctx.Process(name="arm", target=arm_loop, args=(shared, runtime.arm)),
+            ctx.Process(name="arm", target=run_arm_worker, args=(shared, runtime.arm)),
             ctx.Process(
                 name="camera",
-                target=camera_loop,
-                args=(shared, CameraLoopConfig.from_runtime(runtime)),
+                target=run_camera_worker,
+                args=(shared, runtime.camera),
             ),
         ]
         for process in processes:
@@ -712,7 +640,7 @@ def run_camera_calibration(
         require_transition(shared, SafetyState.ARMED)
         print(f"  arm worker ready (Mode 6, {runtime.arm.loop_hz}Hz)")
 
-        exit_code = _run_calibration(
+        exit_code = CameraCalibrationSession(
             shared,
             runtime,
             planner,
@@ -720,7 +648,7 @@ def run_camera_calibration(
             arm_process,
             calib_cfg,
             aruco_cfg,
-        )
+        ).run()
     finally:
         started = [p for p in processes if p.pid is not None]
         if started:

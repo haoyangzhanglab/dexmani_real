@@ -65,7 +65,7 @@ class MotionPlanningConfig:
 class XArm7MotionPlanner:
     """Online IK and collision-checked home planning.
 
-    ``kin`` owns FK/Jacobians, ``ik_mgr`` owns joint/IK geometry, and
+    ``kin`` owns FK/Jacobians, ``ik_geometry`` owns joint/IK geometry, and
     ``collision_model`` owns the 19-DOF collision model.
     """
 
@@ -125,15 +125,15 @@ class XArm7MotionPlanner:
 
         # Diagnose drift between canonical Python hardware limits and the URDF.
         # Kinematic authority remains the URDF/MPlib model.
-        from dexmani_real.config.defaults import arm as _arm_cfg
+        from dexmani_real.config.hardware import ArmParams
 
-        _cfg_lower = np.asarray(_arm_cfg.joint_limit_lower, dtype=np.float64)
-        _cfg_upper = np.asarray(_arm_cfg.joint_limit_upper, dtype=np.float64)
+        _cfg_lower = np.asarray(ArmParams.joint_limit_lower, dtype=np.float64)
+        _cfg_upper = np.asarray(ArmParams.joint_limit_upper, dtype=np.float64)
         if not np.allclose(joint_limits[:, 0], _cfg_lower, atol=1e-3) or not np.allclose(
             joint_limits[:, 1], _cfg_upper, atol=1e-3
         ):
             logger.warning(
-                "URDF model limits differ from defaults.arm operational limits.\n"
+                "URDF model limits differ from ArmParams operational limits.\n"
                 "  URDF lower:  %s\n  defaults:    %s\n"
                 "  URDF upper:  %s\n  defaults:    %s",
                 joint_limits[:, 0],
@@ -142,7 +142,7 @@ class XArm7MotionPlanner:
                 _cfg_upper,
             )
         else:
-            logger.debug("URDF joint limits match defaults.arm (ok)")
+            logger.debug("URDF joint limits match ArmParams (ok)")
 
         dof = int(joint_limits.shape[0])
         equivalent_joint_mask = (joint_limits[:, 1] - joint_limits[:, 0]) > 2 * np.pi
@@ -165,12 +165,12 @@ class XArm7MotionPlanner:
             static_boxes=static_boxes,
             table=table,
         )
-        self.ik_mgr = IKGeometry(self.kin, collision_model=self.collision_model)
+        self.ik_geometry = IKGeometry(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
         self.online_ik_solver = OnlineIKSolver(
             self.kin,
-            self.ik_mgr,
+            self.ik_geometry,
             self.online_ik_profile,
             elbow_joint_index=self._elbow_joint_index,
         )
@@ -199,13 +199,6 @@ class XArm7MotionPlanner:
             static_boxes=static_boxes,
             table=table,
         )
-
-    def __getattr__(self, name: str):
-        """Delegate missing attributes to kinematics, IK, then MPlib."""
-        for delegate in (self.kin, self.ik_mgr, self.mplib_planner):
-            if hasattr(delegate, name):
-                return getattr(delegate, name)
-        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
         """Set hand geometry for online IK endpoints or planned return-home."""
@@ -241,8 +234,8 @@ class XArm7MotionPlanner:
         if not np.isfinite(planning_time_s) or planning_time_s <= 0.0:
             raise ValueError("planning_time_s must be finite and > 0")
 
-        target_qpos = self.canonicalize_qpos(target_qpos, current_qpos)
-        target_pose_world = self.compute_eef_pose_world(target_qpos)
+        target_qpos = self.ik_geometry.canonicalize_qpos(target_qpos, current_qpos)
+        target_pose_world = self.kin.compute_eef_pose_world(target_qpos)
         profile = self.planning_profile
         rrt_range = max(profile.rrt_range_options) if profile.rrt_range_options else 0.12
         result = self.mplib_planner.plan_qpos(
@@ -264,8 +257,6 @@ class XArm7MotionPlanner:
         path_result.report["rrt_range"] = rrt_range
         path_result.report["planning_time_s"] = float(planning_time_s)
         return path_result
-
-    # __getattr__ to self.kin / self.ik_mgr / self.mplib_planner.
 
     def result_from_mplib(
         self,
@@ -310,7 +301,7 @@ class XArm7MotionPlanner:
     def shortcut_smooth_path(
         self, path: np.ndarray, current_qpos: np.ndarray, profile: MotionPlanningConfig
     ) -> np.ndarray:
-        limits = self.resolve_planning_limits(profile, current_qpos)
+        limits = self.ik_geometry.resolve_planning_limits(profile, current_qpos)
         path = np.asarray(path, dtype=np.float64).copy()
         if len(path) <= 2:
             return path
@@ -345,7 +336,7 @@ class XArm7MotionPlanner:
         segment is problematic).
         """
         mid = 0.5 * (prev + nxt)
-        outside, _ = self.limit_violation(mid, limits)
+        outside, _ = self.ik_geometry.limit_violation(mid, limits)
         if np.any(outside):
             return False
 
@@ -357,7 +348,7 @@ class XArm7MotionPlanner:
         if profile.check_self_collision:
             for q in samples:
                 try:
-                    in_collision = self.ik_mgr.has_collision(q)
+                    in_collision = self.ik_geometry.has_collision(q)
                 except Exception:
                     logger.warning("shortcut collision check failed closed", exc_info=True)
                     return False
@@ -384,8 +375,10 @@ class XArm7MotionPlanner:
         target (e.g. return-to-home from a stretched pose).
         """
         try:
-            path = self.snap_path_to_nearest_equivalent(path, current_qpos)
-            path = self.canonicalize_path_to_planning_limits(path, current_qpos, profile)
+            path = self.ik_geometry.snap_path_to_nearest_equivalent(path, current_qpos)
+            path = self.ik_geometry.canonicalize_path_to_planning_limits(
+                path, current_qpos, profile
+            )
             path_before_smooth = path.copy()
             path = self.shortcut_smooth_path(path, current_qpos, profile)
         except ValueError as error:
@@ -491,7 +484,7 @@ class XArm7MotionPlanner:
         dense_path = interpolate_waypoints(path, max_step=0.02)
         for index, qpos in enumerate(dense_path):
             try:
-                position = self.compute_eef_pose_world(qpos).p
+                position = self.kin.compute_eef_pose_world(qpos).p
             except (ValueError, RuntimeError):
                 position = np.full(3, np.nan)
             if (
@@ -511,7 +504,7 @@ class XArm7MotionPlanner:
         path = interpolate_waypoints(np.stack([start_qpos, end_qpos]), max_step=0.02)
         for qpos in path:
             try:
-                position = self.compute_eef_pose_world(qpos).p
+                position = self.kin.compute_eef_pose_world(qpos).p
             except (ValueError, RuntimeError):
                 return False
             if not np.all(np.isfinite(position)):
@@ -527,7 +520,7 @@ class XArm7MotionPlanner:
         if not profile.check_self_collision:
             return None
         try:
-            collision_report = self.ik_mgr.check_path_combined_collisions(path)
+            collision_report = self.ik_geometry.check_path_combined_collisions(path)
         except Exception as exc:
             logger.warning("planned-path collision check failed closed", exc_info=True)
             report["collision_check_error"] = str(exc)
@@ -561,29 +554,29 @@ class XArm7MotionPlanner:
         diff = np.diff(path, axis=0) if len(path) > 1 else np.zeros((0, self.dof), dtype=np.float64)
         max_step = float(np.max(np.abs(diff))) if len(diff) > 0 else 0.0
         path_length = float(np.sum(np.linalg.norm(diff, axis=1))) if len(diff) > 0 else 0.0
-        terminal_pos_error, terminal_rot_error = self.compute_world_pose_error(
+        terminal_pos_error, terminal_rot_error = self.kin.compute_world_pose_error(
             target_eef_pose_world, path[-1]
         )
 
         eef_efficiency = 1.0
         if len(path) >= 3:
             eef_positions = np.array(
-                [self.compute_eef_pose_world(q).p for q in path], dtype=np.float64
+                [self.kin.compute_eef_pose_world(q).p for q in path], dtype=np.float64
             )
             eef_deltas = np.diff(eef_positions, axis=0)
             eef_path_len = float(np.sum(np.linalg.norm(eef_deltas, axis=1)))
             eef_straight = float(np.linalg.norm(eef_positions[-1] - eef_positions[0]))
             if eef_path_len > 1e-8:
                 eef_efficiency = eef_straight / eef_path_len
-        limits = self.resolve_planning_limits(profile, current_qpos)
-        outside, violation = self.path_limit_violation(path, limits)
+        limits = self.ik_geometry.resolve_planning_limits(profile, current_qpos)
+        outside, violation = self.ik_geometry.path_limit_violation(path, limits)
         report = {
             "num_waypoints": int(len(path)),
             "joint_path_length": path_length,
             "max_waypoint_delta_rad": max_step,
             "max_waypoint_delta_deg": float(np.rad2deg(max_step)),
             "start_qpos_error_rad": float(
-                np.max(np.abs(self.compute_qpos_delta(path[0], current_qpos)))
+                np.max(np.abs(self.ik_geometry.compute_qpos_delta(path[0], current_qpos)))
             ),
             "terminal_pos_error_m": terminal_pos_error,
             "terminal_rot_error_rad": terminal_rot_error,

@@ -57,7 +57,7 @@ def _validate_transform(value: np.ndarray, *, label: str) -> np.ndarray:
 
 
 @dataclass(frozen=True)
-class PointCloudLoopConfig:
+class PointCloudWorkerConfig:
     """Resolved processing policy for the realtime worker.
 
     Each cloud keeps its camera sequence and acquisition time. Consumers
@@ -93,14 +93,12 @@ class PointCloudLoopConfig:
         runtime: "ExperimentConfig",
         *,
         pointcloud: PointCloudConfig,
-        camera_calibration: CameraExtrinsics | None = None,
-    ) -> "PointCloudLoopConfig":
+        camera_calibration: CameraExtrinsics,
+    ) -> "PointCloudWorkerConfig":
         table = runtime.environment.table
         return cls(
             pointcloud=pointcloud,
-            camera_calibration=CameraExtrinsics()
-            if camera_calibration is None
-            else camera_calibration,
+            camera_calibration=camera_calibration,
             table_plane_abcd=resolve_table_plane(table) if pointcloud.remove_table else None,
         )
 
@@ -156,14 +154,14 @@ def _load_static_inputs(
     return None
 
 
-def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> None:
+def run_pointcloud_worker(shared: "RuntimeChannels", config: PointCloudWorkerConfig) -> None:
     """Consume only the newest camera sequence and publish fixed ``[N,6]`` clouds."""
-    if not isinstance(config, PointCloudLoopConfig):
-        raise TypeError("pointcloud_loop requires a PointCloudLoopConfig")
+    if not isinstance(config, PointCloudWorkerConfig):
+        raise TypeError("run_pointcloud_worker requires a PointCloudWorkerConfig")
     cfg = config
     expected_dtype = make_pointcloud_frame_dtype(cfg.pointcloud.num_points)
     if shared.pointcloud_ring.dtype != expected_dtype:
-        raise RuntimeError("pointcloud ring dtype does not match PointCloudLoopConfig num_points")
+        raise RuntimeError("pointcloud ring dtype does not match PointCloudWorkerConfig num_points")
 
     static_inputs = _load_static_inputs(shared, cfg.camera_calibration)
     if static_inputs is None:
@@ -225,14 +223,14 @@ def pointcloud_loop(shared: "RuntimeChannels", config: PointCloudLoopConfig) -> 
                 shared.pointcloud_ready.set()
                 ready = True
                 logger.info(
-                    "pointcloud_loop: ready (shape=(%d,6), frame=xarm_base)",
+                    "run_pointcloud_worker: ready (shape=(%d,6), frame=xarm_base)",
                     cfg.pointcloud.num_points,
                 )
     except Exception:
         shared.workflow_failed.value = True
         raise
     finally:
-        logger.info("pointcloud_loop: exited")
+        logger.info("run_pointcloud_worker: exited")
 
 
-__all__ = ["PointCloudLoopConfig", "pointcloud_loop"]
+__all__ = ["PointCloudWorkerConfig", "run_pointcloud_worker"]

@@ -6,27 +6,24 @@ from pathlib import Path
 from typing import Any
 
 from dexmani_real.calibration import CAMERAS_PATH, VR_TRANSFORM_PATH
+from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
-from dexmani_real.recording.io_worker import RecorderIOConfig, recorder_io_loop
+from dexmani_real.recording.io_worker import RecorderWorkerConfig, run_recorder_worker
 from dexmani_real.recording.recorder import HARD_MAX_RECORD_FRAMES
-from dexmani_real.robot.arm_worker import arm_loop as _arm_loop
-from dexmani_real.robot.hand_worker import hand_loop as _hand_loop
+from dexmani_real.robot.arm_worker import run_arm_worker
+from dexmani_real.robot.hand_worker import run_hand_worker
 from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_RIGHT_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
-    XHAND_RIGHT_URDF_PATH,
 )
-from dexmani_real.runtime.processes import shutdown_processes_verified
 from dexmani_real.runtime.safety import SafetyState, require_transition
-from dexmani_real.runtime.supervisor import run_supervisor, start_processes
-from dexmani_real.sensor.camera.worker import CameraLoopConfig
-from dexmani_real.sensor.camera.worker import camera_loop as _camera_loop
-from dexmani_real.sensor.vr_worker import VRReceiverConfig
-from dexmani_real.sensor.vr_worker import vr_loop as _vr_loop
+from dexmani_real.runtime.supervisor import RuntimeSupervisor
+from dexmani_real.sensor.camera.worker import run_camera_worker
+from dexmani_real.sensor.vr_worker import run_vr_worker
 from dexmani_real.teleop.config import TeleopConfig
-from dexmani_real.teleop.loop import teleop_loop
+from dexmani_real.teleop.runner import run_teleop_worker
 from dexmani_real.teleop.vr_transform import load_vr_transform
 from dexmani_real.utils.log import get_logger
 
@@ -80,25 +77,23 @@ def _build_processes(
     hand_enabled: bool,
     recording_enabled: bool,
 ) -> list[Any]:
-    policy_config = TeleopConfig.from_runtime(
+    policy_config = TeleopConfig(
         runtime,
         task_label=task_name,
         operator=operator,
-        hand_urdf_path=str(XHAND_RIGHT_URDF_PATH),
     )
     processes = [
-        context.Process(name="arm", target=_arm_loop, args=(shared, runtime.arm)),
-        context.Process(
-            name="vr", target=_vr_loop, args=(shared, VRReceiverConfig.from_runtime(runtime))
-        ),
-        context.Process(name="policy", target=teleop_loop, args=(shared, policy_config)),
+        context.Process(name="arm", target=run_arm_worker, args=(shared, runtime.arm)),
+        context.Process(name="vr", target=run_vr_worker, args=(shared, runtime.vr)),
+        context.Process(name="policy", target=run_teleop_worker, args=(shared, policy_config)),
     ]
     if recording_enabled:
-        camera_config = CameraLoopConfig.from_runtime(runtime)
+        camera_calibration = CameraExtrinsics()
         processes.append(
-            context.Process(name="camera", target=_camera_loop, args=(shared, camera_config))
+            context.Process(name="camera", target=run_camera_worker, args=(shared, runtime.camera))
         )
-        recorder_config = RecorderIOConfig(
+        recorder_config = RecorderWorkerConfig(
+            camera_calibration=camera_calibration,
             data_dir=str(repo_root / policy_config.runtime.policy.episodes_dir / task_name),
             control_hz=policy_config.runtime.teleop.control_hz,
             min_frames=int(
@@ -111,14 +106,14 @@ def _build_processes(
         )
         processes.append(
             context.Process(
-                name="recorder", target=recorder_io_loop, args=(shared, recorder_config)
+                name="recorder", target=run_recorder_worker, args=(shared, recorder_config)
             )
         )
     if hand_enabled:
         processes.append(
             context.Process(
                 name="hand",
-                target=_hand_loop,
+                target=run_hand_worker,
                 args=(
                     shared,
                     runtime.hand,
@@ -154,7 +149,7 @@ def run_teleop_experiment(
         config=RuntimeChannelsConfig.from_runtime(runtime),
         mp_context=ctx,
     )
-    started = []
+    supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
     try:
         processes = _build_processes(
             ctx,
@@ -170,19 +165,17 @@ def run_teleop_experiment(
         sensors = [
             by_name[name] for name in ("arm", "hand", "vr", "camera", "recorder") if name in by_name
         ]
-        start_processes(shared, sensors, runtime.safety.readiness_timeouts_s, started)
+        supervisor.start(sensors)
         require_transition(shared, SafetyState.ARMED)
-        start_processes(shared, [by_name["policy"]], runtime.safety.readiness_timeouts_s, started)
-        run_supervisor(shared, started)
+        supervisor.start([by_name["policy"]])
+        supervisor.run()
     except KeyboardInterrupt:
         shared.estop_request.value = True
     except Exception:
         shared.workflow_failed.value = True
         logger.exception("teleop session failed")
     finally:
-        report = shutdown_processes_verified(
-            shared,
-            started,
+        report = supervisor.shutdown(
             disarm_if_clean=True,
             graceful_timeout_s=runtime.safety.shutdown_timeout_s,
             service_process_names={"camera", "recorder", "vr", "policy", "pointcloud"},

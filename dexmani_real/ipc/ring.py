@@ -195,7 +195,6 @@ class SharedMemoryRingBuffer:
         )
         self._last_good: tuple[np.ndarray, int, int] | None = None
         self._last_torn_warn_ns = 0
-        self._last_torn_warn_k_ns = 0
 
         logger.debug(
             "SharedMemoryRingBuffer(name=%s, slot_size=%d, maxlen=%d, total=%d, create=%s)",

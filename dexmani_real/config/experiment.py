@@ -2,33 +2,31 @@
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import yaml
 
-from dexmani_real.config import defaults
-from dexmani_real.config.defaults import (
-    ArmParams,
-    CameraParams,
+from dexmani_real.config.control import (
     DexPilotRetargetingParams,
-    EnvironmentConfig,
-    HandParams,
     KeyboardTeleopParams,
     PolicyParams,
     SafetyParams,
-    TableCollisionConfig,
     TAGRetargetingParams,
     TeleopTimingParams,
-    VRParams,
 )
+from dexmani_real.config.environment import (
+    EnvironmentConfig,
+    StaticCollisionBox,
+    TableCollisionConfig,
+)
+from dexmani_real.config.hardware import ArmParams, CameraParams, HandParams, VRParams
 from dexmani_real.config.pointcloud import PointCloudConfig
 
 
@@ -36,18 +34,20 @@ from dexmani_real.config.pointcloud import PointCloudConfig
 class ExperimentConfig:
     """Runtime values validated together at the configuration loading boundary."""
 
-    arm: ArmParams
-    hand: HandParams
-    policy: PolicyParams
-    teleop: TeleopTimingParams
-    keyboard_teleop: KeyboardTeleopParams
-    vr: VRParams
-    safety: SafetyParams
-    camera: CameraParams
-    pointcloud: PointCloudConfig
-    tag_retargeting: TAGRetargetingParams
-    dexpilot_retargeting: DexPilotRetargetingParams
-    environment: EnvironmentConfig
+    arm: ArmParams = field(default_factory=ArmParams)
+    hand: HandParams = field(default_factory=HandParams)
+    policy: PolicyParams = field(default_factory=PolicyParams)
+    teleop: TeleopTimingParams = field(default_factory=TeleopTimingParams)
+    keyboard_teleop: KeyboardTeleopParams = field(default_factory=KeyboardTeleopParams)
+    vr: VRParams = field(default_factory=VRParams)
+    safety: SafetyParams = field(default_factory=SafetyParams)
+    camera: CameraParams = field(default_factory=CameraParams)
+    pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
+    tag_retargeting: TAGRetargetingParams = field(default_factory=TAGRetargetingParams)
+    dexpilot_retargeting: DexPilotRetargetingParams = field(
+        default_factory=DexPilotRetargetingParams
+    )
+    environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
 
 
 def config_as_dict(value: Any) -> Any:
@@ -89,8 +89,7 @@ def _patch(current: Any, changes: Any, path: str = "") -> Any:
         if not isinstance(changes, (tuple, list)):
             raise TypeError("environment.static_boxes must be an array")
         return tuple(
-            _patch(defaults.StaticCollisionBox(), box, f"{path}[{i}]")
-            for i, box in enumerate(changes)
+            _patch(StaticCollisionBox(), box, f"{path}[{i}]") for i, box in enumerate(changes)
         )
     if isinstance(current, bool) and not isinstance(changes, bool):
         raise TypeError(f"config {path!r} must be a boolean")
@@ -204,7 +203,7 @@ def resolve_experiment_config(
     data: Mapping[str, Any] | None = None,
     cli_overrides: Mapping[str, Any] | None = None,
 ) -> ExperimentConfig:
-    """Load YAML/data plus CLI overrides without changing global defaults."""
+    """Load YAML/data plus CLI overrides over a fresh experiment configuration."""
     if yaml_path is not None and data is not None:
         raise ValueError("provide at most one of yaml_path or data")
     loaded = data if data is not None else {}
@@ -218,12 +217,7 @@ def resolve_experiment_config(
             loaded = {}
     if not isinstance(loaded, Mapping):
         raise TypeError("experiment config root must be a mapping")
-    cfg = ExperimentConfig(
-        **{
-            f.name: copy.deepcopy(getattr(defaults, f.name))
-            for f in dataclasses.fields(ExperimentConfig)
-        }
-    )
+    cfg = ExperimentConfig()
     cfg = _patch(cfg, _overlay(loaded, _expand_dotted(cli_overrides)))
     table = cfg.environment.table
     if table.enabled:

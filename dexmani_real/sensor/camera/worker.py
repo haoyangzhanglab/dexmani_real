@@ -2,35 +2,14 @@
 
 import json
 import time
-from dataclasses import dataclass, fields
 
 import numpy as np
 
-from dexmani_real.config.defaults import CameraParams
+from dexmani_real.config.hardware import CameraParams
 from dexmani_real.ipc.schema import CAMERA_FRAME_HEADER_DTYPE
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-
-@dataclass(frozen=True)
-class CameraLoopConfig:
-    serial: str | None = None
-    width: int = 640
-    height: int = 480
-    fps: int = 30
-    warmup_frames: int = 10
-    source_stall_timeout_s: float = 2.0
-    l515_visual_preset: int = 5
-    l515_confidence_threshold: int | None = None
-    frame_queue_capacity: int = 2
-
-    @classmethod
-    def from_runtime(cls, runtime):
-        return cls(**{f.name: getattr(runtime.camera, f.name) for f in fields(cls)})
-
-    def __post_init__(self):
-        CameraParams(**{f.name: getattr(self, f.name) for f in fields(self)}).validate()
 
 
 def pack_camera_frame(rgb, depth_raw, *, timestamp_ns, depth_frame_number, color_frame_number):
@@ -48,7 +27,8 @@ def pack_camera_frame(rgb, depth_raw, *, timestamp_ns, depth_frame_number, color
     return header, rgb, depth_raw
 
 
-def camera_loop(shared, config):
+def run_camera_worker(shared, config: CameraParams) -> None:
+    config.validate()
     from dexmani_real.sensor.camera.realsense import (
         L515DepthConfig,
         RealSenseCamera,

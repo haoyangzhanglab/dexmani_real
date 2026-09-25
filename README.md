@@ -10,9 +10,9 @@
 
     python -m pip install -e .
 
-硬件 SDK、运动学/点云库和 `dexmani_policy` 依赖按实验机环境安装。普通 import 和配置解析不应连接设备，真实连接由对应 worker 显式建立。
+硬件 SDK、运动学/点云库和 `dexmani_policy` 依赖按实验机环境安装。普通 import 和配置解析不应连接设备；采集、部署和回放工作流由对应 worker 建立连接，诊断脚本在显式启动后连接设备。
 
-支持 `--config` 的入口按 CLI > YAML > [默认配置](dexmani_real/config/defaults.py) 解析。连接设备前可查看采集配置：
+支持 `--config` 的入口按 CLI > YAML > [ExperimentConfig 默认值](dexmani_real/config/experiment.py) 解析，每次解析创建独立配置。连接设备前可查看采集配置：
 
     python examples/collect_teleop.py --print-config
     python examples/collect_teleop.py --config experiment.yaml --print-config
@@ -29,17 +29,21 @@ Teleop、键盘控制和 policy 分别使用各自的控制周期，replay 使�
 | Keyboard jog / home | `python examples/keyboard_teleop.py --config experiment.yaml` | 真机 |
 | Physical replay | `python examples/replay_episode.py <episode> --config experiment.yaml` | 真机 |
 | Policy rollout | `python examples/run_policy.py <policy/task/experiment> --config experiment.yaml` | 真机；evaluation session |
-| Camera calibration | `python examples/calibrate_camera.py --config experiment.yaml ...` | 真机；标定 |
+| Camera calibration | `python examples/calibrate_camera.py --config experiment.yaml --hand-geometry absent` | 真机；仅在手已拆除时用 `absent`，固定在 home 的手用 `secured-home` |
 | VR heading calibration | `python examples/calibrate_vr_heading.py` | VR / HTS |
 | Canonical Zarr export | `python examples/export_policy_zarr.py episodes/<task>` | 离线 |
 | XHand diagnostics | `python examples/xhand_diagnostics.py` | 连接真机；诊断 |
+| RGB-D diagnostics | `python examples/realsense_record_example.py` | 连接相机；实时 RGB-D / 点云显示 |
+| Point-cloud diagnostics | `python examples/pointcloud_process_example.py` | 连接相机；点云检查与可选桌面标定，`--save-dir` 保存诊断快照 |
 | Inspect raw | `python examples/visualize_episode.py <episode> --info` | 离线 |
 
-完整参数以各入口 `--help` 为准。
+带参数解析的入口可通过 `--help` 查看完整参数。`xhand_diagnostics.py` 和 `realsense_record_example.py` 不支持 `--help`，直接运行会进入硬件诊断流程。
+
+键盘控制使用 WASD/方向键和 IJKL 微调，R 执行 planned HOME，Q 退出，ESC 急停。下节的 B/C/S/D/H 按键用于 VR teleop。
 
 ## Teleop 与录制
 
-Teleop 默认录制，显式无录制调试使用 `--no-record`。
+Teleop 默认录制，显式无录制调试使用 `--no-record`。无手调试需同时使用 `--no-hand` 并禁用录制，且手必须已拆除或固定在配置的 home 姿态。
 
 | 按键 | 操作 |
 |---|---|
@@ -53,7 +57,7 @@ Teleop 默认录制，显式无录制调试使用 `--no-record`。
 
 暂停撤销当前动作权限，恢复时从新鲜的机器人与 VR 观测重新锚定。发生暂停或控制异常的 episode 可保留用于诊断，但不作为 clean training demonstration 导出。
 
-录制依赖 camera 与 RecorderIO；它们失败时不会静默降级为无录制运行。Teleop 通过 `policy.max_record_duration_s` 配置正常 episode 预算，policy eval 通过 `--max-duration` 配置。录制预算必须严格小于 Recorder 的 hard guard，启动前会校验；过长时应缩短 episode，而不是提高资源保护上限。
+录制依赖相机与录制 worker；它们失败时不会静默降级为无录制运行。Teleop 通过 `policy.max_record_duration_s` 配置正常 episode 预算，policy eval 通过 `--max-duration` 配置。录制预算必须严格小于录制器的帧数硬上限，启动前会校验；过长时应缩短 episode。
 
 Raw episode 关闭、验证后才原子发布。启动时若发现 `.tmp_<episode_name>` 残留目录，只会给出 warning：它们不是已发布的 raw episodes，可能来自录制中断，需人工检查处理，不会自动删除或恢复。
 
@@ -77,11 +81,15 @@ Canonical Zarr 是从 raw 重建的全量训练缓存，包含 learning-relevant
 
 Raw-to-Zarr 按完整 episode 接收或拒绝，不修复、切分、重采样或删除坏行。暂停、异常控制行、触觉无效、录制不完整或转换失败等情况会整条拒收并报告原因。批量导出可继续处理其他正常 episodes，但必须汇总拒绝原因。
 
+导出前可用 `--dry-run` 执行相同的转换与校验而不创建 Zarr。导出拒绝覆盖已有目标，也拒绝将目标放入 raw/rollout 来源目录；dry-run 同样检查目标路径。单个异常 episode 或没有可接收 episode 时返回失败。
+
 ## Policy evaluation
 
 Policy artifact 定义模型输入、关节顺序、动作周期和训练时的预处理；当前 Real 配置提供现场标定与硬件几何。RGB 预处理由 Policy 负责，点云使用 artifact 配置与当前标定。模型输入语义保持一致，重新标定不要求重新训练。
 
 Policy worker 持有 model / CUDA，使用同步 inference 和本地 action chunk。推理期间动作权限已失效时，丢弃返回的旧动作。Pointcloud-only policy 不依赖源 RGB-D 帧仍驻留；同时输入 RGB 和点云时才匹配源帧。
+
+操作顺序为 H 回到初始姿态、布置场景、B 开始、S 停止；Q 退出，ESC 急停。HOME 完成后需要新的 B 才能开始；HOME 阻塞期间 S/Q 仍会立即撤销动作权限。`--num-episodes` 按实际开始并结束的 episode 计数，录制失败的 episode 也计入预算。
 
 Evaluation 数据用于评估与诊断，不能直接当作 teleop BC demonstration 导入训练缓存。任务成功与否需离线判断。
 
@@ -96,7 +104,7 @@ Evaluation 数据用于评估与诊断，不能直接当作 teleop BC demonstrat
     ruff check --select F401,F821,F822,F823,I dexmani_real examples
     git diff --check
 
-部署相关修改可在已安装依赖的环境中运行离线回归：
+配置、观测、数据转换、部署及设备边界修改可在已安装依赖的环境中运行离线回归；套件使用模拟 SDK，不连接硬件：
 
     python -m dexmani_real.deployment.smoke_test
 

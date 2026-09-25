@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.deployment.observation import build_policy_observation
 from dexmani_real.planning.kinematics.ik import make_online_ik_config
@@ -91,7 +92,7 @@ class TablePlaneSmoke(unittest.TestCase):
 
         from dexmani_real.config.pointcloud import PointCloudConfig
         from dexmani_real.dataset.contracts import ProcessingConfig
-        from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig
+        from dexmani_real.sensor.pointcloud_worker import PointCloudWorkerConfig
 
         with tempfile.TemporaryDirectory() as directory:
             missing = str(Path(directory) / "missing-plane.json")
@@ -104,14 +105,18 @@ class TablePlaneSmoke(unittest.TestCase):
                 )
                 disabled = PointCloudConfig(remove_table=False)
                 self.assertIsNone(
-                    PointCloudLoopConfig.from_runtime(runtime, pointcloud=disabled).table_plane_abcd
+                    PointCloudWorkerConfig.from_runtime(
+                        runtime, camera_calibration=CameraExtrinsics(), pointcloud=disabled
+                    ).table_plane_abcd
                 )
                 self.assertIsNone(
                     ProcessingConfig.from_runtime(runtime, pointcloud=disabled).table_plane_abcd
                 )
                 required = PointCloudConfig(remove_table=True)
                 with self.assertRaisesRegex(ValueError, "failed to load calibrated table plane"):
-                    PointCloudLoopConfig.from_runtime(runtime, pointcloud=required)
+                    PointCloudWorkerConfig.from_runtime(
+                        runtime, camera_calibration=CameraExtrinsics(), pointcloud=required
+                    )
                 with self.assertRaisesRegex(ValueError, "failed to load calibrated table plane"):
                     ProcessingConfig.from_runtime(runtime, pointcloud=required)
             with self.assertRaisesRegex(ValueError, "failed to load calibrated table plane"):
@@ -127,7 +132,7 @@ class TablePlaneSmoke(unittest.TestCase):
 
         from dexmani_real.config.pointcloud import PointCloudConfig
         from dexmani_real.dataset.contracts import ProcessingConfig
-        from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig
+        from dexmani_real.sensor.pointcloud_worker import PointCloudWorkerConfig
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "plane.json"
@@ -139,8 +144,8 @@ class TablePlaneSmoke(unittest.TestCase):
                 path.write_text(json.dumps(dict(a=0, b=0, c=1, d=-height)))
                 expected = (0.0, 0.0, 1.0, -height)
                 self.assertEqual(
-                    PointCloudLoopConfig.from_runtime(
-                        runtime, pointcloud=required
+                    PointCloudWorkerConfig.from_runtime(
+                        runtime, camera_calibration=CameraExtrinsics(), pointcloud=required
                     ).table_plane_abcd,
                     expected,
                 )
@@ -158,7 +163,9 @@ class TablePlaneSmoke(unittest.TestCase):
                 path.write_text(contents)
                 with self.subTest(contents=contents):
                     with self.assertRaisesRegex(ValueError, "table plane"):
-                        PointCloudLoopConfig.from_runtime(runtime, pointcloud=required)
+                        PointCloudWorkerConfig.from_runtime(
+                            runtime, camera_calibration=CameraExtrinsics(), pointcloud=required
+                        )
                     with self.assertRaisesRegex(ValueError, "table plane"):
                         ProcessingConfig.from_runtime(runtime)
                     with self.assertRaisesRegex(ValueError, "table plane"):
@@ -166,8 +173,10 @@ class TablePlaneSmoke(unittest.TestCase):
                             data={"environment": {"table": {"plane_path": str(path)}}}
                         )
                     self.assertIsNone(
-                        PointCloudLoopConfig.from_runtime(
-                            runtime, pointcloud=replace(required, remove_table=False)
+                        PointCloudWorkerConfig.from_runtime(
+                            runtime,
+                            camera_calibration=CameraExtrinsics(),
+                            pointcloud=replace(required, remove_table=False),
                         ).table_plane_abcd
                     )
             inline = replace(
@@ -180,7 +189,9 @@ class TablePlaneSmoke(unittest.TestCase):
                 ),
             )
             self.assertEqual(
-                PointCloudLoopConfig.from_runtime(inline, pointcloud=required).table_plane_abcd,
+                PointCloudWorkerConfig.from_runtime(
+                    inline, camera_calibration=CameraExtrinsics(), pointcloud=required
+                ).table_plane_abcd,
                 (0.0, 0.0, 1.0, -0.3),
             )
             with self.assertRaisesRegex(ValueError, "requires a current calibrated table plane"):
@@ -337,7 +348,10 @@ class NumericalDeploymentSmoke(unittest.TestCase):
         )
         from dexmani_real.deployment.config import validate_policy_runtime_compatibility
         from dexmani_real.sensor.pointcloud import build_point_cloud
-        from dexmani_real.sensor.pointcloud_worker import PointCloudLoopConfig, _load_static_inputs
+        from dexmani_real.sensor.pointcloud_worker import (
+            PointCloudWorkerConfig,
+            _load_static_inputs,
+        )
 
         raw = RawFixture()
         trained = PointCloudConfig(voxel_size_m=0.006)
@@ -376,8 +390,10 @@ class NumericalDeploymentSmoke(unittest.TestCase):
                     ),
                 ),
             )
-            cfg = PointCloudLoopConfig.from_runtime(
-                runtime, pointcloud=PointCloudConfig.from_dict(spec.pointcloud_config)
+            cfg = PointCloudWorkerConfig.from_runtime(
+                runtime,
+                camera_calibration=CameraExtrinsics(),
+                pointcloud=PointCloudConfig.from_dict(spec.pointcloud_config),
             )
             self.assertEqual(cfg.pointcloud.voxel_size_m, 0.006)
             self.assertEqual(cfg.table_plane_abcd, plane)
@@ -401,10 +417,10 @@ class NumericalDeploymentSmoke(unittest.TestCase):
             changed = build_point_cloud(**{**kwargs, "T_xarm_base_from_color": moved})
             self.assertFalse(np.allclose(changed, online))
         with self.assertRaisesRegex(ValueError, "table plane"):
-            PointCloudLoopConfig(trained, CameraExtrinsics(), None)
+            PointCloudWorkerConfig(trained, CameraExtrinsics(), None)
         disabled = replace(trained, remove_table=False)
         self.assertIsNone(
-            PointCloudLoopConfig(disabled, CameraExtrinsics(), (0, 0, 1, -0.6)).table_plane_abcd
+            PointCloudWorkerConfig(disabled, CameraExtrinsics(), (0, 0, 1, -0.6)).table_plane_abcd
         )
         a = build_point_cloud(**{**kwargs, "config": disabled, "table_plane_abcd": None})
         b = build_point_cloud(**{**kwargs, "config": disabled, "table_plane_abcd": (0, 0, 1, -0.6)})
@@ -654,17 +670,17 @@ class RuntimeBoundarySmoke(unittest.TestCase):
             runner.run_id = 1
             sample = row(np.zeros((12, 16, 3), np.uint8))
             sample.observation_timestamp_ns = time.monotonic_ns()
-            runner._row = Mock(return_value=sample)
+            runner._read_observation = Mock(return_value=sample)
             with patch("dexmani_real.deployment.runner.publish_command") as publish:
                 runner.step()
                 publish.assert_not_called()
-            self.assertFalse(runner.actions)
+            self.assertFalse(runner.action_queue)
 
     def test_warmup_before_ready(self):
         import threading
         from unittest.mock import Mock, patch
 
-        from dexmani_real.deployment.runner import policy_runner_loop
+        from dexmani_real.deployment.runner import run_policy_worker
 
         spec = observation_spec("joint_state")
         config = SimpleNamespace(
@@ -695,12 +711,12 @@ class RuntimeBoundarySmoke(unittest.TestCase):
             ):
                 if fail:
                     with self.assertRaises(RuntimeError):
-                        policy_runner_loop(shared, None, config, False)
+                        run_policy_worker(shared, None, config, False)
                     runner.assert_not_called()
                     self.assertFalse(shared.policy_ready.is_set())
                     self.assertTrue(shared.workflow_failed.value)
                 else:
-                    policy_runner_loop(shared, None, config, False)
+                    run_policy_worker(shared, None, config, False)
                     self.assertTrue(shared.policy_ready.is_set())
                 model.close.assert_called_once()
 
@@ -753,7 +769,7 @@ def motion_fixture(state):
 
 class XHandSafetySmoke(unittest.TestCase):
     def setUp(self):
-        from dexmani_real.config.defaults import HandParams
+        from dexmani_real.config.hardware import HandParams
 
         stack = ExitStack()
         self.addCleanup(stack.close)
@@ -823,7 +839,7 @@ class XHandSafetySmoke(unittest.TestCase):
         from unittest.mock import Mock, call, patch
 
         from dexmani_real.robot.commands import RobotCommand
-        from dexmani_real.robot.hand_worker import hand_loop
+        from dexmani_real.robot.hand_worker import run_hand_worker
         from dexmani_real.runtime.safety import SafetyState, revoke_motion
 
         for home in (False, True):
@@ -915,10 +931,10 @@ class XHandSafetySmoke(unittest.TestCase):
                             with self.assertRaisesRegex(
                                 RuntimeError, "revoke failed|feedback timed out"
                             ):
-                                hand_loop(shared, self.cfg)
+                                run_hand_worker(shared, self.cfg)
                             self.assertTrue(shared.error_state.value)
                         else:
-                            hand_loop(shared, self.cfg)
+                            run_hand_worker(shared, self.cfg)
                             self.assertFalse(shared.error_state.value)
                     self.assertEqual(send_ticks, [0, 3] if scenario == "replacement" else [0])
                     if home:
@@ -942,7 +958,7 @@ class XHandSafetySmoke(unittest.TestCase):
     def test_passive_cleanup_does_not_mask_fault(self):
         from unittest.mock import Mock, patch
 
-        from dexmani_real.robot.hand_worker import hand_loop
+        from dexmani_real.robot.hand_worker import run_hand_worker
         from dexmani_real.runtime.safety import SafetyState
 
         shared = motion_fixture(SafetyState.ARMED)
@@ -951,7 +967,7 @@ class XHandSafetySmoke(unittest.TestCase):
         hand.set_passive.side_effect = RuntimeError("cleanup failure")
         with patch.object(self.driver, "XHand", return_value=hand):
             with self.assertRaisesRegex(RuntimeError, "original read failure"):
-                hand_loop(shared, self.cfg)
+                run_hand_worker(shared, self.cfg)
         hand.disconnect.assert_called_once()
 
     def test_crc_home_converges(self):
@@ -1084,7 +1100,7 @@ class HandHomeSmoke(unittest.TestCase):
     def test_tolerance_validation(self):
         from dataclasses import replace
 
-        from dexmani_real.config.defaults import HandParams
+        from dexmani_real.config.hardware import HandParams
 
         cfg = HandParams()
         self.assertEqual(cfg.home_tolerance_deg, 5.0)
@@ -1126,7 +1142,7 @@ class TimeoutAndCameraSmoke(unittest.TestCase):
                 runner.run_id, runner.started_ns = epoch, started
                 sample = row(None)
                 sample.observation_timestamp_ns = clock[0]
-                runner._row = Mock(return_value=sample)
+                runner._read_observation = Mock(return_value=sample)
                 runner.recorder = Mock()
 
                 def predict(obs):

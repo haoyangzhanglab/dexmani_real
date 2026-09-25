@@ -81,13 +81,13 @@ Controls:
         "--acc",
         type=_positive_float,
         default=None,
-        help="Joint max acceleration (°/s²); must match the recording's resolved config.",
+        help="Joint max acceleration (°/s²); overrides YAML/defaults.",
     )
     parser.add_argument(
         "--speed",
         type=_positive_float,
         default=None,
-        help="Joint max speed (°/s); must match the recording's resolved config.",
+        help="Joint max speed (°/s); overrides YAML/defaults.",
     )
     return parser.parse_args(argv)
 

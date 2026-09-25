@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-record",
         action="store_true",
-        help="Run VR teleoperation without recording; camera and RecorderIO are not started.",
+        help="Run VR teleoperation without recording; camera and recorder workers are not started.",
     )
     parser.add_argument(
         "--config", type=str, default=None, help="YAML file with experiment overrides"

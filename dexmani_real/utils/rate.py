@@ -35,12 +35,11 @@ class LoopRate:
         ):
             raise ValueError(f"target_hz must be positive, got {target_hz}")
         if not isinstance(label, str) or not label.strip():
-            raise ValueError("rate manager label must be a non-empty string")
+            raise ValueError("loop label must be a non-empty string")
         if busy_wait is not None and not isinstance(busy_wait, bool):
             raise ValueError("busy_wait must be a bool or None")
         if not isinstance(warn_on_overrun, bool):
             raise ValueError("warn_on_overrun must be a bool")
-        self.target_hz = float(target_hz)
         self.label = label.strip()
         self.period = 1.0 / target_hz
         self._clock = time.perf_counter if clock is None else clock

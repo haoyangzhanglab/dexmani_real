@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from dexmani_real.config.defaults import ArmParams
+from dexmani_real.config.hardware import ArmParams
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
 from dexmani_real.utils.log import (
     capture_native_stdout,

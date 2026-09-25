@@ -66,7 +66,7 @@ def _best_effort_passive(hand):
         logger.warning("XHand cleanup passive send failed", exc_info=True)
 
 
-def hand_loop(shared, config):
+def run_hand_worker(shared, config):
     from dexmani_real.robot.drivers.xhand import XHand, XHandSendStatus
 
     hand = XHand(config)

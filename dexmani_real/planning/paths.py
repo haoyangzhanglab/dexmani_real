@@ -215,7 +215,7 @@ def _check_home_path_candidate(
     sample_count = len(path)
     if planner.planning_profile.check_self_collision:
         try:
-            collision_result = planner.ik_mgr.check_path_combined_collisions(path)
+            collision_result = planner.ik_geometry.check_path_combined_collisions(path)
         except Exception as exc:
             return HomePathCandidate(
                 candidate_name,
@@ -362,8 +362,8 @@ def compute_joint_home_path(
         # Use raw delta for the already-home check; wrapped deltas hide band mismatches.
         delta = float(np.max(np.abs(target - qpos)))
     else:
-        target = planner.ik_mgr.nearest_equivalent_qpos(home_qpos, qpos)
-        delta = float(np.max(np.abs(planner.ik_mgr.compute_qpos_delta(target, qpos))))
+        target = planner.ik_geometry.nearest_equivalent_qpos(home_qpos, qpos)
+        delta = float(np.max(np.abs(planner.ik_geometry.compute_qpos_delta(target, qpos))))
     if delta < np.deg2rad(0.15):
         return HomePathResult(HomePathStatus.ALREADY_HOME, _empty_home_path())
 

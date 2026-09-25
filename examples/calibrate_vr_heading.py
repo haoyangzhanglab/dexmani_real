@@ -18,11 +18,12 @@ from datetime import datetime
 import numpy as np
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
+from dexmani_real.config.hardware import VRParams
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz, normalize_quat_wxyz
 from dexmani_real.runtime.processes import shutdown_processes_verified
 from dexmani_real.runtime.supervisor import wait_subsystem_ready
-from dexmani_real.sensor.vr_worker import VRReceiverConfig, vr_loop
+from dexmani_real.sensor.vr_worker import run_vr_worker
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.vr_transform import (
     VR_TRANSFORM_CONVENTION,
@@ -235,14 +236,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  port:       {args.port}")
     print("=" * 55)
 
+    vr_config = VRParams(port=args.port)
+    vr_config.validate()
     ctx = mp.get_context("spawn")
     shared = RuntimeChannels.create(
         prefix="dexmani_vr_calib", config=RuntimeChannelsConfig(), mp_context=ctx
     )
     processes = [
-        ctx.Process(
-            name="vr", target=vr_loop, args=(shared, VRReceiverConfig(port=args.port)), daemon=True
-        )
+        ctx.Process(name="vr", target=run_vr_worker, args=(shared, vr_config), daemon=True)
     ]
     vr_proc = processes[0]
     forwards: list[np.ndarray] = []
@@ -256,8 +257,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not wait_subsystem_ready(
             shared,
-            [vr_proc],
-            {"vr": cfg.vr_ready_timeout_s},
+            vr_proc,
+            cfg.vr_ready_timeout_s,
         ):
             print("  ERROR: VR receiver startup timeout", flush=True)
             return 1

@@ -10,15 +10,14 @@ from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_config
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
-from dexmani_real.robot.arm_worker import arm_loop
+from dexmani_real.robot.arm_worker import run_arm_worker
 from dexmani_real.robot.commands import RobotCommand, publish_command
 from dexmani_real.robot.hand_homing import home_hand
-from dexmani_real.robot.hand_worker import hand_loop
+from dexmani_real.robot.hand_worker import run_hand_worker
 from dexmani_real.runtime.observation import read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput
-from dexmani_real.runtime.processes import shutdown_processes_verified
 from dexmani_real.runtime.safety import SafetyState, begin_motion, require_transition, revoke_motion
-from dexmani_real.runtime.supervisor import check_processes, start_processes
+from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.teleop.jog import compute_cartesian_jog_delta
 from dexmani_real.utils.rate import LoopRate
 
@@ -32,10 +31,12 @@ def run_keyboard_experiment(runtime, *, no_hand):
         config=RuntimeChannelsConfig.from_runtime(runtime),
         mp_context=ctx,
     )
-    processes = [ctx.Process(name="arm", target=arm_loop, args=(shared, runtime.arm))]
+    processes = [ctx.Process(name="arm", target=run_arm_worker, args=(shared, runtime.arm))]
     if runtime.policy.hand_enabled:
-        processes.append(ctx.Process(name="hand", target=hand_loop, args=(shared, runtime.hand)))
-    started = []
+        processes.append(
+            ctx.Process(name="hand", target=run_hand_worker, args=(shared, runtime.hand))
+        )
+    supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
     keys = KeyboardInput(
         suppress_echo=True,
         capture_commands=False,
@@ -58,7 +59,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
     command_pose = None
     clean = False
     try:
-        start_processes(shared, processes, runtime.safety.readiness_timeouts_s, started)
+        supervisor.start(processes)
         require_transition(shared, SafetyState.ARMED)
         home_result = home_hand(shared, runtime)
         if not home_result.ok:
@@ -66,7 +67,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
         keys.start()
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         rate = LoopRate(cfg.control_hz, label="keyboard_teleop", busy_wait=False)
-        while shared.is_running.value and check_processes(shared, started):
+        while shared.is_running.value and supervisor.check():
             rate.wait()
             if shared.estop_request.value or shared.error_state.value or not keys.healthy:
                 break
@@ -139,9 +140,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
                         command_pose = None
     finally:
         keys.quiesce()
-        report = shutdown_processes_verified(
-            shared,
-            started,
+        report = supervisor.shutdown(
             graceful_timeout_s=runtime.safety.shutdown_timeout_s,
             disarm_if_clean=clean,
         )

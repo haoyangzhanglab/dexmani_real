@@ -17,14 +17,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from dexmani_real.config.defaults import hand as hand_defaults
+from dexmani_real.config.hardware import HandParams
 from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
 )
 
-_BAUD_RATE_RS485 = hand_defaults.baudrate
-_DEFAULT_SERIAL_PORT = hand_defaults.device_name
+_BAUD_RATE_RS485 = HandParams.baudrate
+_DEFAULT_SERIAL_PORT = HandParams.device_name
 _RS485_COMBINED_FORCE_ERROR_CODE = 1_501_018
 _RS485_DISTRIBUTED_FORCE_ERROR_CODE = 1_501_019
 _RS485_TEMPERATURE_ERROR_CODE = 1_501_020
@@ -43,7 +43,7 @@ _RS485_TACTILE_STATUS_DETAIL = {
     _RS485_TEMPERATURE_ERROR_CODE: "temperature unavailable; force fields retained",
 }
 _RS485_CRC_ERROR_CODE = 1_501_070
-_RS485_POST_OPEN_SETTLE_S = hand_defaults.rs485_post_open_settle_s
+_RS485_POST_OPEN_SETTLE_S = HandParams.rs485_post_open_settle_s
 _RS485_READ_CRC_RETRY_COUNT = 2
 _RS485_CRC_RETRY_BACKOFF_S = 0.08
 _HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"

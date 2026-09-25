@@ -9,8 +9,8 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.defaults import hand
 from dexmani_real.config.experiment import resolve_table_plane
+from dexmani_real.config.hardware import HandParams
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
@@ -48,9 +48,9 @@ class ProcessingConfig:
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
     hand_urdf_path: str = str(XHAND_RIGHT_URDF_PATH)
-    fingertip_link_names: tuple[str, ...] = hand.fingertip_link_names
-    handbase_position_eef_m: tuple[float, float, float] = hand.T_eef_handbase_pos_xyz
-    handbase_quat_eef_wxyz: tuple[float, float, float, float] = hand.T_eef_handbase_quat_wxyz
+    fingertip_link_names: tuple[str, ...] = HandParams.fingertip_link_names
+    handbase_position_eef_m: tuple[float, float, float] = HandParams.T_eef_handbase_pos_xyz
+    handbase_quat_eef_wxyz: tuple[float, float, float, float] = HandParams.T_eef_handbase_quat_wxyz
 
     @classmethod
     def from_runtime(cls, runtime: object, **overrides: Any) -> "ProcessingConfig":
