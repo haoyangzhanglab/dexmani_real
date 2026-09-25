@@ -24,7 +24,6 @@ class ReplayStatus(str, Enum):
     REJECTED = "rejected"
     ESTOP = "estop"
     FAULT = "fault"
-    CLEANUP_FAILED = "cleanup_failed"
 
 
 @dataclass(frozen=True)

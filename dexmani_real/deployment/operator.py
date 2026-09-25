@@ -47,7 +47,7 @@ class PolicyOperator:
         )
 
     def _request_stop(self) -> None:
-        """Fence live motion when S/Q arrives while this thread is blocked by H."""
+        """Fence live motion when S/STOP arrives while this thread is blocked by H."""
         if not request_policy_stop(self.shared):
             self.shared.error_state.value = True
 
@@ -108,7 +108,7 @@ class PolicyOperator:
             elif signal is OperatorCommand.STOP:
                 # The keyboard completed the motion fence before enqueueing.
                 # STOP still suppresses HOME/BEGIN in this batch, but must
-                # not revoke again after the policy runner acknowledges it.
+                # not revoke again after the policy runner clears the stop request.
                 continue
             elif signal is OperatorCommand.PAUSE:
                 logger.warning("operator: C is not used in policy deployment; ignored")

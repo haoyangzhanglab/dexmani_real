@@ -117,13 +117,13 @@ class RuntimeChannels:
     run_id: Any  # controller advances it to invalidate old policy proposals
     # Latest software RUNNING termination; written under motion_lock.
     run_ended_reason: Any
-    workflow_failed: Any  # sticky; never reuse IPC after failure/death
+    # Sticky session failure can use verified non-FAULT shutdown without a runtime fault.
+    workflow_failed: Any
 
     is_running: Any  # Main -> all
     # Sticky runtime/safety fault: supervision takes the FAULT shutdown path.
     error_state: Any
-    # Session failure can use verified non-FAULT shutdown if no runtime fault occurred.
-    estop_request: Any  # policy -> arm/hand
+    estop_request: Any  # sticky emergency-stop request
     quit_requested: Any  # policy -> Main
     start_request: Any  # Main -> policy runner: B (start a new policy run)
     # Main/operator -> policy runner: true only after Main completed the
@@ -145,7 +145,7 @@ class RuntimeChannels:
     camera_ready: Any
     pointcloud_ready: Any
 
-    camera_depth_scale: Any  # depth scale (mm to meters)
+    camera_depth_scale: Any  # metres per raw depth unit, reported by the camera
     camera_serial: Any  # serial number string
     camera_geometry: Any  # static native RGB-D geometry JSON
     _closed: bool = field(init=False, repr=False, default=False)

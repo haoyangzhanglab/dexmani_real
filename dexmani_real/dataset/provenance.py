@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import Any
 
-POLICY_EVAL_WORKFLOW = "policy_eval"
 TELEOP_WORKFLOW = "teleop"
 _PROVENANCE_WORKFLOW_ATTR = "provenance_workflow"
 

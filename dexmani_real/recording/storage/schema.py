@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import numpy as np
 
 EPISODE_SCHEMA_VERSION = 32
-ARM_TARGET_DATASET = "action_arm_joint_target"
 
 
 @dataclass(frozen=True)

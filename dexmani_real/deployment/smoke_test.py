@@ -1,4 +1,7 @@
-"""Offline deployment regressions: python -m dexmani_real.deployment.smoke_test."""
+"""Offline data, deployment and mocked device regressions.
+
+Run with: python -m dexmani_real.deployment.smoke_test
+"""
 
 import unittest
 from contextlib import ExitStack, contextmanager

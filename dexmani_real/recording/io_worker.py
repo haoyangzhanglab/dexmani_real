@@ -29,7 +29,7 @@ from dexmani_real.recording.recorder import (
     normalize_provenance_metadata,
 )
 from dexmani_real.recording.storage.camera_writer import CameraStreamWriterConfig
-from dexmani_real.runtime.safety import RunEndReason, SafetyState, revoke_motion
+from dexmani_real.runtime.safety import RunEndReason, SafetyState, _revoke_motion_locked
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
@@ -162,7 +162,7 @@ def _fail_workflow(shared: Any) -> None:
     with shared.motion_lock:
         shared.workflow_failed.value = True
         if int(shared.safety_state.value) == int(SafetyState.RUNNING):
-            revoke_motion(shared, SafetyState.ARMED, reason=RunEndReason.RECORDING_FAILURE)
+            _revoke_motion_locked(shared, SafetyState.ARMED, reason=RunEndReason.RECORDING_FAILURE)
 
 
 @dataclass

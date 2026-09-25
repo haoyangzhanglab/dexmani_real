@@ -1,6 +1,6 @@
 """Read published episodes containing data.h5, depth.h5 and rgb.mp4.
 
-h5f merges non-camera HDF5 datasets; camera methods read RGB-D sidecars.
+h5f merges control datasets from data.h5 with depth from depth.h5; RGB is decoded from MP4.
 Other raw layouts require external migration.
 
 Usage::

@@ -80,8 +80,7 @@ def reset_hand_retargeter(
 ) -> None:
     """Reset hand retargeter state for a clean teleop start.
 
-    Seeds SLSQP warm-start from actual hardware pose so the first
-    retarget() call converges from near-optimum instead of the neutral midpoint.
+    Seeds the selected backend's warm start from measured hand joints when available.
     The teleop owner must clear its observation cache before retargeting resumes
     with this reset backend.
     """

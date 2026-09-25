@@ -19,6 +19,8 @@
 
 已接受的相机、桌面和 VR 标定状态保存在 `dexmani_real/calibration/state/`，由对应的标定入口显式更新。
 
+相机标定中，SPACE 采样，ENTER 求解并仅保存通过质量检查的结果，R 执行 planned HOME，Q 结束。退出是否成功还取决于 worker 正常停止与 DISARMED 检查。
+
 Teleop、键盘控制和 policy 分别使用各自的控制周期，replay 使用录制频率。动作生产频率不得高于相关执行器 worker 的服务频率；worker 频率不等于设备物理伺服频率。
 
 ## 常用入口
@@ -51,9 +53,11 @@ Teleop 默认录制，显式无录制调试使用 `--no-record`。无手调试�
 | C | 暂停 / 恢复 |
 | S | 停止并保存 |
 | D | 丢弃 |
-| H | Return-home |
-| Q | 退出 |
+| H | 停止并保存当前录制，然后 Return-home |
+| Q | 请求退出；录制中先暂停并等待保存/丢弃选择 |
 | ESC | 急停 |
+
+录制中按 Q 后，可用 S 保存、D 丢弃，或 H 保存并回 home，然后退出。超过 `policy.quit_save_timeout_s` 未选择时，尝试保存为异常 episode 后退出。
 
 暂停撤销当前动作权限，恢复时从新鲜的机器人与 VR 观测重新锚定。发生暂停或控制异常的 episode 可保留用于诊断，但不作为 clean training demonstration 导出。
 
@@ -77,6 +81,8 @@ xArm 与 XHand HOME 均以实测收敛判断完成。XHand 默认要求连续三
 
 Raw episode 是实验 source of truth，保留机器人状态、RGB-D 与标定、XHand 电流/触觉及其有效性、VR 源数据、真实时间戳、绝对动作目标和必要诊断。控制与录制复用当前观测快照，各模态按自身时间戳检查新鲜度。
 
+每个已发布 episode 包含 `data.h5`（控制行与元数据）、`depth.h5`（对齐到彩色图像的原始深度）和 `rgb.mp4`。深度值乘以相机提供的 `depth_scale` 才得到米。读取器只接受当前 raw schema；旧布局需在仓库外显式迁移。
+
 Canonical Zarr 是从 raw 重建的全量训练缓存，包含 learning-relevant modalities；`dexmani_policy` 在加载时选择模型输入。点云、FK 和 fingertips 在离线转换时生成，Zarr 不保存 runtime timing arrays 或 validity masks。`action` 与 `action_ee` 表示同一个最终目标，分别使用关节和末端空间描述。
 
 Raw-to-Zarr 按完整 episode 接收或拒绝，不修复、切分、重采样或删除坏行。暂停、异常控制行、触觉无效、录制不完整或转换失败等情况会整条拒收并报告原因。批量导出可继续处理其他正常 episodes，但必须汇总拒绝原因。
@@ -90,6 +96,8 @@ Policy artifact 定义模型输入、关节顺序、动作周期和训练时的�
 Policy worker 持有 model / CUDA，使用同步 inference 和本地 action chunk。推理期间动作权限已失效时，丢弃返回的旧动作。Pointcloud-only policy 不依赖源 RGB-D 帧仍驻留；同时输入 RGB 和点云时才匹配源帧。
 
 操作顺序为 H 回到初始姿态、布置场景、B 开始、S 停止；Q 退出，ESC 急停。HOME 完成后需要新的 B 才能开始；HOME 阻塞期间 S/Q 仍会立即撤销动作权限。`--num-episodes` 按实际开始并结束的 episode 计数，录制失败的 episode 也计入预算。
+
+会话输出位于 `rollouts/<policy>/<task>/<experiment>/session_*/`，包含 `run_config.yaml`、实际保存的 episode 目录和结束时的 `session_result.json`。Policy 模式不使用 C/D；同批收到 S/Q 时会忽略 H/B。
 
 Evaluation 数据用于评估与诊断，不能直接当作 teleop BC demonstration 导入训练缓存。任务成功与否需离线判断。
 
