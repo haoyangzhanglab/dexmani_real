@@ -82,6 +82,14 @@ def set_passive(self) -> XHandSendStatus:
 
 Keep these operations thin. Do not create a stop protocol or extra state machine.
 
+For `hold_current(qpos)`, treat the input as measured feedback rather than a new research/control target:
+
+- require the normal finite `(12,)` shape;
+- clip the measured pose to configured mechanical limits before sending;
+- then send it in POSITION mode.
+
+This prevents a tiny feedback/calibration overshoot beyond a rated limit from turning a safety hold into a rejected command. Do not loosen validation for normal `send_action()`; the clipping exception is only for the worker-local measured-pose hold primitive.
+
 ### 2.2 Centralize SDK send-status decoding
 
 The existing `send_action()` already maps XHand SDK return codes into:
@@ -136,7 +144,7 @@ A CRC-unconfirmed command must be treated as **possibly delivered**, therefore i
 
 ### 2.4 Revoke behavior
 
-On each hand-worker iteration, detect whether the stored authority is still valid using the existing:
+On each hand-worker iteration, after attempting the state read but **before processing HOME requests or new RobotCommands**, detect whether the stored authority is still valid using the existing:
 
 ```python
 command_may_cross_sdk(
@@ -161,21 +169,48 @@ If authority has been revoked:
 
 Do not add retry counters or retry queues. The existing ~30 Hz worker loop is the retry mechanism.
 
-Maintain the latest valid `qpos` locally so that a revoke can still attempt a hold if one state read is transiently unavailable. Do not require a brand-new blocking SDK read solely to perform a revoke.
+Maintain the latest valid measured pose locally together with its host-monotonic feedback timestamp, for example:
 
-If no valid measured qpos has ever been obtained and a physical revoke is required, fall back to best-effort passive rather than inventing a target.
+```python
+last_valid_qpos: np.ndarray | None
+last_valid_qpos_timestamp_ns: int | None
+```
+
+The revoke check must run even when the current `get_state()` call returns `None`. Do not structure the loop so that a transient read failure `continue` skips physical revoke handling.
+
+When authority is revoked:
+
+- prefer the qpos from the current successful state read;
+- otherwise use the cached qpos only if it is still fresh under the existing `config.feedback_max_age_s` semantics;
+- do not perform a new blocking SDK read solely for revoke handling.
+
+If no fresh-enough measured pose is available, fall back to `set_passive()` rather than commanding an arbitrarily stale pose.
+
+For this normal-revoke passive fallback:
+
+- `ACCEPTED`: clear `active_motion_authority`;
+- `CRC_UNCONFIRMED`: keep `active_motion_authority` so the next worker tick retries the safety action;
+- `REJECTED`: raise into the existing worker fault path.
+
+The cached-pose path is specifically for brief read dropouts; it must not convert a long sensor outage into a command toward an old pose.
 
 ### 2.5 E-stop and shutdown
 
 Behavior distinction:
 
-- Normal pause/stop/timeout/authority revocation: **hold current position**.
+- Normal pause/stop/timeout/authority revocation: **hold current position** when fresh-enough measured feedback is available; otherwise use passive as the safety fallback.
 - E-stop: **set passive immediately**, then exit the worker loop.
-- Final worker teardown/disconnect: perform best-effort passive before closing the SDK handle.
+- Final worker teardown: perform best-effort passive before closing the SDK handle.
 
-Do not allow a passive-send failure during cleanup to mask an already-active exception. Log cleanup failure and preserve the original failure semantics.
+Keep lifecycle actuation in the **hand worker**, not hidden inside `XHand.disconnect()`. Leave `disconnect()` as resource/device teardown so partial-connect error handling stays simple.
 
-It is acceptable for `disconnect()` itself to perform a best-effort passive request before closing, provided partial initialization is handled safely. Avoid duplicate complicated teardown logic.
+A small worker-local best-effort passive helper is acceptable. For E-stop/final cleanup, one best-effort passive call at each lifecycle site is enough:
+
+- `ACCEPTED`: continue teardown;
+- `CRC_UNCONFIRMED`: log the uncertainty and continue teardown;
+- `REJECTED` or exception: log the cleanup failure and continue teardown.
+
+Do not add passive retry counters or a teardown protocol. Do not allow a passive-send failure during `finally` to mask an already-active exception.
 
 ### 2.6 Important behavioral invariant
 
@@ -519,27 +554,30 @@ At minimum verify the following invariants with mocks/fakes where practical:
 9. Successful hold clears active authority.
 10. CRC-unconfirmed hold leaves active authority set so the next worker tick retries.
 11. Rejected hold enters the existing failure path.
-12. E-stop invokes passive behavior rather than trying to continue normal motion.
+12. A transient state-read failure does not skip revoke handling when a fresh-enough cached qpos exists.
+13. A stale/missing cached qpos uses passive fallback rather than commanding an old hold pose.
+14. `hold_current()` clips measured feedback to mechanical limits while normal `send_action()` remains strict.
+15. E-stop invokes passive behavior rather than trying to continue normal motion.
 
 ### HOME convergence
 
-13. Three distinct fresh samples with maximum joint error <= 5 degrees succeed.
-14. A sample with maximum joint error > 5 degrees resets the consecutive counter.
-15. Re-reading the same ring sample must not count as multiple convergence samples.
-16. Abort/authority loss fails HOME.
-17. Timeout fails HOME.
-18. CRC-unconfirmed HOME submission may still succeed if measured feedback actually converges.
+16. Three distinct fresh samples with maximum joint error <= 5 degrees succeed.
+17. A sample with maximum joint error > 5 degrees resets the consecutive counter.
+18. Re-reading the same ring sample must not count as multiple convergence samples.
+19. Abort/authority loss fails HOME.
+20. Timeout fails HOME.
+21. CRC-unconfirmed HOME submission may still succeed if measured feedback actually converges.
 
 ### Policy timeout
 
-19. PolicyRunner timeout revokes motion with `RunEndReason.TIMEOUT`.
-20. Main/session no longer independently enforces `max_running_s`.
-21. `run_started_monotonic_ns` no longer exists.
-22. Runner still measures episode duration from its local `self.started_ns`.
+22. PolicyRunner timeout revokes motion with `RunEndReason.TIMEOUT`.
+23. Main/session no longer independently enforces `max_running_s`.
+24. `run_started_monotonic_ns` no longer exists.
+25. Runner still measures episode duration from its local `self.started_ns`.
 
 ### Camera timestamp
 
-23. The realtime `RGBDFrame.timestamp_ns` equals the captured host `wait_return_monotonic_ns`, not a later processing timestamp.
+26. The realtime `RGBDFrame.timestamp_ns` equals the captured host `wait_return_monotonic_ns`, not a later processing timestamp.
 
 Do not build elaborate test infrastructure solely to test one assignment if doing so would increase complexity more than the implementation.
 
@@ -578,7 +616,8 @@ If passive mode creates an unacceptable physical hazard for the actual experimen
 The task is complete when all of the following are true:
 
 - XHand has explicit, minimal `hold_current()` and passive hardware semantics.
-- Normal authority loss physically replaces the prior XHand endpoint with a hold target.
+- Normal authority loss physically replaces the prior XHand endpoint with a hold target when fresh-enough measured feedback exists, with passive fallback when it does not.
+- Revoke handling still runs across transient state-read failures using only fresh-enough cached feedback.
 - E-stop/shutdown requests passive behavior.
 - Resumed position commands explicitly restore position mode.
 - `CRC_UNCONFIRMED` no longer crashes the hand worker.
