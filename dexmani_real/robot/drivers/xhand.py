@@ -68,6 +68,7 @@ _POST_EC_DISCONNECT_S = 2.0
 _TACTILE_BIAS_SAMPLE_COUNT = 5
 _TACTILE_VERIFY_SAMPLE_COUNT = 3
 _TACTILE_BIAS_SAMPLE_INTERVAL_S = 0.02
+_PASSIVE_MODE = 0
 _POSITION_MODE = 3
 # Post-bias no-contact residual bound for calibration verification, in XHand
 # SDK-native unknown units.
@@ -526,7 +527,33 @@ class XHand:
 
         try:
             for index, value in enumerate(target):
-                self._command.finger_command[index].position = float(value)
+                joint = self._command.finger_command[index]
+                joint.mode = _POSITION_MODE
+                joint.position = float(value)
+        except Exception:
+            logger.warning("XHand command preparation failed", exc_info=True)
+            return XHandSendStatus.REJECTED
+        return self._send_command()
+
+    def hold_current(self, qpos: np.ndarray) -> XHandSendStatus:
+        """Actively hold measured joint positions clipped to mechanical limits."""
+        measured = np.asarray(qpos, dtype=np.float64)
+        if measured.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(measured)):
+            raise ValueError("XHand.hold_current requires twelve finite joint positions")
+        return self.send_action(
+            np.clip(measured, self.cfg.mechanical_qpos_min_rad, self.cfg.mechanical_qpos_max_rad)
+        )
+
+    def set_passive(self) -> XHandSendStatus:
+        """Put every XHand joint into vendor passive mode."""
+        if self._control is None or self._command is None or not self.connected_flag:
+            raise RuntimeError("XHand command path is not initialized")
+        for index in range(HAND_DOF):
+            self._command.finger_command[index].mode = _PASSIVE_MODE
+        return self._send_command()
+
+    def _send_command(self) -> XHandSendStatus:
+        try:
             error = self._control.send_command(self.cfg.device_id, self._command)
         except Exception:
             logger.warning("XHand send_command raised", exc_info=True)

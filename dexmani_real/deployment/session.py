@@ -35,7 +35,6 @@ from dexmani_real.runtime.safety import (
     request_policy_start,
     request_policy_stop,
     require_transition,
-    revoke_motion_if_run_id,
 )
 from dexmani_real.runtime.supervisor import check_processes, start_processes
 from dexmani_real.sensor.camera.worker import CameraLoopConfig, camera_loop
@@ -210,12 +209,6 @@ def run_policy_deployment(
             if not operator_thread.is_alive():
                 shared.workflow_failed.value = True
                 break
-            if max_running_s is not None:
-                with shared.motion_lock:
-                    epoch = int(shared.run_id.value)
-                    start_ns = int(shared.run_started_monotonic_ns.value)
-                if start_ns and time.monotonic_ns() - start_ns >= int(max_running_s * 1e9):
-                    revoke_motion_if_run_id(shared, epoch, reason=RunEndReason.TIMEOUT)
             time.sleep(0.02)
     except KeyboardInterrupt:
         shared.estop_request.value = True

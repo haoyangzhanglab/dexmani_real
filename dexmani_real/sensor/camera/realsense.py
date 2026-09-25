@@ -630,7 +630,6 @@ class RealSenseCamera:
             int(color_frame.get_frame_timestamp_domain()) if color_frame else None
         )
         color_frame_number = int(color_frame.get_frame_number()) if color_frame else None
-        timestamp_ns = time.monotonic_ns()
         frame = RGBDFrame(
             rgb=rgb,
             depth=depth,
@@ -646,7 +645,7 @@ class RealSenseCamera:
             color_device_timestamp_s=color_timestamp_s,
             depth_timestamp_domain=depth_timestamp_domain,
             color_timestamp_domain=color_timestamp_domain,
-            timestamp_ns=timestamp_ns,
+            timestamp_ns=wait_return_monotonic_ns,
             frame_id=self.frame_id,
             depth_scale=float(self.depth_scale),
             camera_name=self.config.camera_name,

@@ -45,7 +45,6 @@ def _begin_motion_locked(shared):
         return None
     shared.run_id.value += 1
     started = time.monotonic_ns()
-    shared.run_started_monotonic_ns.value = started
     shared.run_ended_reason.value = int(RunEndReason.NONE)
     shared.safety_state.value = int(SafetyState.RUNNING)
     return int(shared.run_id.value), started
@@ -83,7 +82,6 @@ def revoke_motion(shared, new_state=SafetyState.ARMED, *, reason=RunEndReason.EX
                 reason = RunEndReason.HARDWARE_FAULT
             shared.run_ended_reason.value = int(reason)
         shared.run_id.value += 1
-        shared.run_started_monotonic_ns.value = 0
         shared.safety_state.value = int(new_state)
     return True
 

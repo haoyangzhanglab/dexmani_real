@@ -444,6 +444,7 @@ class HandParams:
     state_read_failure_timeout_s: float = 1.0
 
     home_timeout_s: float = 1.0
+    home_tolerance_deg: float = 5.0
 
     fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
     # Real adapter is 10 mm thinner than nominal CAD/URDF (-0.005 m mount).
@@ -526,6 +527,8 @@ class HandParams:
             raise ValueError("hand state_read_failure_timeout_s must be finite and positive")
         if not np.isfinite(self.home_timeout_s) or self.home_timeout_s <= 0:
             raise ValueError("hand home_timeout_s must be finite and positive")
+        if not np.isfinite(self.home_tolerance_deg) or self.home_tolerance_deg <= 0:
+            raise ValueError("hand home_tolerance_deg must be finite and positive")
         if len(self.fingertip_link_names) != 5 or any(
             not name for name in self.fingertip_link_names
         ):

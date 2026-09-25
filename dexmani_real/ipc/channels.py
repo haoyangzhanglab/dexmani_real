@@ -111,7 +111,6 @@ class RuntimeChannels:
     record_control_q: mp.Queue  # policy -> RecorderIO episode boundaries
     record_result_q: mp.Queue  # RecorderIO -> RecorderClient (sole consumer)
     run_id: Any  # controller advances it to invalidate old policy proposals
-    run_started_monotonic_ns: Any  # start of the current RUNNING observation epoch
     # Latest software RUNNING termination; written under motion_lock.
     run_ended_reason: Any
     workflow_failed: Any  # sticky; never reuse IPC after failure/death
@@ -248,7 +247,6 @@ class RuntimeChannels:
         storage.record_control_q = ctx.Queue(maxsize=8)
         storage.record_result_q = ctx.Queue(maxsize=8)
         storage.run_id = ctx.Value("Q", 1)
-        storage.run_started_monotonic_ns = ctx.Value("Q", 0)
         storage.run_ended_reason = ctx.Value("i", 0)
         # A killed service must not strand a lock needed to report workflow failure.
         storage.workflow_failed = ctx.Value("b", False, lock=False)

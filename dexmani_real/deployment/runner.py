@@ -100,10 +100,10 @@ class PolicyRunner:
             and int(self.shared.safety_state.value) == int(SafetyState.RUNNING)
         )
 
-    def _finish(self, reason, abnormal=False):
+    def _finish(self, reason, abnormal=False, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY):
         if self.run_id is None:
             return
-        revoke_motion_if_run_id(self.shared, self.run_id)
+        revoke_motion_if_run_id(self.shared, self.run_id, reason=run_end_reason)
         self.shared.physical_home_completed.value = False
         self.actions.clear()
         self.history.clear()
@@ -186,7 +186,7 @@ class PolicyRunner:
         if self.max_running_s is not None and now - self.started_ns >= int(
             self.max_running_s * 1e9
         ):
-            self._finish("timeout")
+            self._finish("timeout", run_end_reason=RunEndReason.TIMEOUT)
             return
         if now < self.next_step_ns:
             return
@@ -212,7 +212,7 @@ class PolicyRunner:
             if self.max_running_s is not None and time.monotonic_ns() - self.started_ns >= int(
                 self.max_running_s * 1e9
             ):
-                self._finish("timeout")
+                self._finish("timeout", run_end_reason=RunEndReason.TIMEOUT)
                 return
             prediction = np.asarray(prediction, dtype=np.float64)
             if (

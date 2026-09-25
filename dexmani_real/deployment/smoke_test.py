@@ -1,6 +1,7 @@
 """Offline deployment regressions: python -m dexmani_real.deployment.smoke_test."""
 
 import unittest
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -702,6 +703,478 @@ class RuntimeBoundarySmoke(unittest.TestCase):
                     policy_runner_loop(shared, None, config, False)
                     self.assertTrue(shared.policy_ready.is_set())
                 model.close.assert_called_once()
+
+
+@contextmanager
+def fake_sdk_driver(relative_path, module_name, sdk_name, sdk):
+    """Load driver code against a fake SDK without importing native device libraries."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+    from unittest.mock import patch
+
+    path = Path(__file__).resolve().parents[1] / relative_path
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(sys.modules, {sdk_name: sdk, module_name: module}):
+        spec.loader.exec_module(module)
+        yield module
+
+
+def motion_fixture(state):
+    from queue import Queue
+    from threading import Event, RLock
+    from unittest.mock import Mock
+
+    return SimpleNamespace(
+        **{
+            name: SimpleNamespace(value=value)
+            for name, value in dict(
+                is_running=True,
+                error_state=False,
+                estop_request=False,
+                workflow_failed=False,
+                quit_requested=False,
+                physical_home_completed=False,
+                stop_request=0,
+                start_request=False,
+                run_id=1,
+                run_ended_reason=0,
+                safety_state=int(state),
+            ).items()
+        },
+        motion_lock=RLock(),
+        hand_home_q=Queue(),
+        hand_home_result_q=Queue(),
+        hand_state_ring=Mock(),
+        hand_ready=Event(),
+    )
+
+
+class XHandSafetySmoke(unittest.TestCase):
+    def setUp(self):
+        from dexmani_real.config.defaults import HandParams
+
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        self.driver = stack.enter_context(
+            fake_sdk_driver(
+                "robot/drivers/xhand.py",
+                "dexmani_real.robot.drivers.xhand",
+                "xhand_controller",
+                SimpleNamespace(xhand_control=SimpleNamespace()),
+            )
+        )
+        self.cfg = HandParams()
+        self.target = np.deg2rad(self.cfg.home_qpos_deg)
+        self.status = self.driver.XHandSendStatus
+
+    def test_driver_modes_limits_and_statuses(self):
+        from unittest.mock import Mock
+
+        hand = self.driver.XHand(self.cfg)
+        hand.connected_flag = True
+        hand._command = SimpleNamespace(finger_command=[SimpleNamespace() for _ in range(12)])
+        hand._control = Mock()
+        for code, expected in (
+            (0, self.status.ACCEPTED),
+            (1_501_070, self.status.CRC_UNCONFIRMED),
+            (-1, self.status.REJECTED),
+        ):
+            hand._control.send_command.return_value = SimpleNamespace(error_code=code)
+            self.assertIs(hand.set_passive(), expected)
+            self.assertTrue(all(j.mode == 0 for j in hand._command.finger_command))
+            self.assertIs(hand.send_action(self.target), expected)
+            self.assertTrue(all(j.mode == 3 for j in hand._command.finger_command))
+            self.assertIs(hand.hold_current(self.target), expected)
+        hand._control.send_command.return_value = SimpleNamespace(error_code=0)
+        for bound, offset in (
+            (self.cfg.mechanical_qpos_max_rad, 0.001),
+            (self.cfg.mechanical_qpos_min_rad, -0.001),
+        ):
+            measured = np.asarray(bound) + offset
+            self.assertIs(hand.send_action(measured), self.status.REJECTED)
+            self.assertIs(hand.hold_current(measured), self.status.ACCEPTED)
+            np.testing.assert_array_equal([j.position for j in hand._command.finger_command], bound)
+        for invalid in (np.zeros(11), np.full(12, np.nan)):
+            with self.assertRaises(ValueError):
+                hand.hold_current(invalid)
+
+    def test_send_boundary(self):
+        from unittest.mock import Mock
+
+        from dexmani_real.robot.hand_worker import _send_target
+        from dexmani_real.runtime.safety import SafetyState, revoke_motion
+
+        shared = motion_fixture(SafetyState.RUNNING)
+        hand = Mock()
+        for status in (self.status.ACCEPTED, self.status.CRC_UNCONFIRMED):
+            hand.send_action.return_value = status
+            self.assertIs(_send_target(shared, hand, self.target, 1, self.cfg), status)
+        hand.send_action.return_value = self.status.REJECTED
+        with self.assertRaises(RuntimeError):
+            _send_target(shared, hand, self.target, 1, self.cfg)
+        revoke_motion(shared)
+        hand.send_action.reset_mock()
+        self.assertIsNone(_send_target(shared, hand, self.target, 1, self.cfg))
+        hand.send_action.assert_not_called()
+
+    def test_worker_revocation(self):
+        from unittest.mock import Mock, patch
+
+        from dexmani_real.robot.commands import RobotCommand
+        from dexmani_real.robot.hand_worker import hand_loop
+        from dexmani_real.runtime.safety import SafetyState, revoke_motion
+
+        for home in (False, True):
+            for scenario in (
+                "fresh",
+                "replacement",
+                "dropout",
+                "stale",
+                "rejected",
+                "estop",
+                "read_timeout",
+            ):
+                with self.subTest(home=home, scenario=scenario):
+                    shared = motion_fixture(SafetyState.ARMED if home else SafetyState.RUNNING)
+                    clock = [10.0]
+                    tick = [0]
+                    events = []
+                    state = SimpleNamespace(
+                        qpos=self.target.copy(),
+                        current_ma=np.zeros(12),
+                        tactile_aggregate_valid=False,
+                        tactile_dense_valid=False,
+                        commboard_err=(0,),
+                        jointboard_err=(0,),
+                        tipboard_err=(0,),
+                    )
+                    hand = Mock(is_connected=True, tactile_calibrated=False)
+                    send_ticks = []
+
+                    def send(target):
+                        send_ticks.append(tick[0])
+                        return self.status.CRC_UNCONFIRMED
+
+                    hand.send_action.side_effect = send
+
+                    def safety_send(kind):
+                        events.append(kind)
+                        if scenario == "rejected" and kind == "hold":
+                            return self.status.REJECTED
+                        return (
+                            self.status.CRC_UNCONFIRMED
+                            if len(events) == 1
+                            else self.status.ACCEPTED
+                        )
+
+                    hand.hold_current.side_effect = lambda q: safety_send("hold")
+                    hand.set_passive.side_effect = lambda: safety_send("passive")
+                    hand.get_state.side_effect = lambda: (
+                        None
+                        if tick[0] and scenario in ("dropout", "stale", "read_timeout")
+                        else state
+                    )
+                    command = RobotCommand(1, hand_qpos=self.target)
+                    if home:
+                        shared.hand_home_q.put((self.target, 1, 20_000_000_000))
+
+                    def wait():
+                        tick[0] += 1
+                        clock[0] += 0.2 if scenario in ("stale", "read_timeout") else 0.01
+                        if tick[0] == 1:
+                            if scenario == "estop":
+                                shared.estop_request.value = True
+                            elif home:
+                                # Same epoch, changed state must revoke ARMED HOME authority.
+                                shared.safety_state.value = int(SafetyState.RUNNING)
+                            else:
+                                revoke_motion(shared)
+                                if scenario == "replacement":
+                                    shared.hand_home_q.put(
+                                        (self.target, shared.run_id.value, 20_000_000_000)
+                                    )
+                        if tick[0] == (8 if scenario == "read_timeout" else 4):
+                            shared.is_running.value = False
+
+                    with (
+                        patch.object(self.driver, "XHand", return_value=hand),
+                        patch("dexmani_real.robot.hand_worker.LoopRate") as rate,
+                        patch(
+                            "dexmani_real.robot.hand_worker.read_robot_command",
+                            return_value=(command, 1)
+                            if not home or scenario == "replacement"
+                            else None,
+                        ),
+                        patch("time.monotonic", side_effect=lambda: clock[0]),
+                        patch("time.monotonic_ns", side_effect=lambda: int(clock[0] * 1e9)),
+                    ):
+                        rate.return_value.wait.side_effect = wait
+                        if scenario in ("rejected", "read_timeout"):
+                            with self.assertRaisesRegex(
+                                RuntimeError, "revoke failed|feedback timed out"
+                            ):
+                                hand_loop(shared, self.cfg)
+                            self.assertTrue(shared.error_state.value)
+                        else:
+                            hand_loop(shared, self.cfg)
+                            self.assertFalse(shared.error_state.value)
+                    self.assertEqual(send_ticks, [0, 3] if scenario == "replacement" else [0])
+                    if home:
+                        self.assertTrue(shared.hand_home_result_q.get_nowait()[1].ok)
+                    if scenario in ("fresh", "replacement", "dropout"):
+                        self.assertEqual(events, ["hold", "hold", "passive"])
+                        np.testing.assert_array_equal(
+                            hand.hold_current.call_args.args[0], self.target
+                        )
+                    elif scenario in ("stale", "read_timeout"):
+                        self.assertEqual(events, ["passive", "passive", "passive"])
+                    elif scenario == "estop":
+                        self.assertEqual(events, ["passive", "passive"])
+                    else:
+                        self.assertEqual(events, ["hold", "passive"])
+                    hand.disconnect.assert_called_once()
+
+    def test_passive_cleanup_does_not_mask_fault(self):
+        from unittest.mock import Mock, patch
+
+        from dexmani_real.robot.hand_worker import hand_loop
+        from dexmani_real.runtime.safety import SafetyState
+
+        shared = motion_fixture(SafetyState.ARMED)
+        hand = Mock()
+        hand.get_state.side_effect = RuntimeError("original read failure")
+        hand.set_passive.side_effect = RuntimeError("cleanup failure")
+        with patch.object(self.driver, "XHand", return_value=hand):
+            with self.assertRaisesRegex(RuntimeError, "original read failure"):
+                hand_loop(shared, self.cfg)
+        hand.disconnect.assert_called_once()
+
+    def test_crc_home_converges(self):
+        from unittest.mock import Mock, patch
+
+        from dexmani_real.ipc.schema import HAND_STATE_DTYPE
+        from dexmani_real.robot.hand_homing import home_hand
+        from dexmani_real.robot.hand_worker import _send_target
+        from dexmani_real.robot.home import HomeResult
+        from dexmani_real.runtime.safety import SafetyState
+
+        shared = motion_fixture(SafetyState.ARMED)
+        clock = [10.0]
+        hand = Mock()
+        hand.send_action.return_value = self.status.CRC_UNCONFIRMED
+
+        def submit(request):
+            target, epoch, _ = request
+            status = _send_target(shared, hand, target, epoch, self.cfg, home=True)
+            shared.hand_home_result_q.put((epoch, HomeResult(status is not None)))
+
+        def sample():
+            clock[0] += 0.01
+            frame = np.zeros(1, dtype=HAND_STATE_DTYPE)
+            frame["qpos"] = self.target
+            frame["timestamp_ns"] = int(clock[0] * 1e9)
+            return frame, 0, 1
+
+        shared.hand_home_q = Mock()
+        shared.hand_home_q.put_nowait.side_effect = submit
+        shared.hand_state_ring.read_latest.side_effect = sample
+        with (
+            patch("time.monotonic", side_effect=lambda: clock[0]),
+            patch("time.monotonic_ns", side_effect=lambda: int(clock[0] * 1e9)),
+            patch("time.sleep"),
+        ):
+            result = home_hand(shared, resolve_experiment_config())
+        self.assertTrue(result.ok)
+        self.assertEqual(shared.hand_state_ring.read_latest.call_count, 3)
+        hand.send_action.assert_called_once()
+
+
+class HandHomeSmoke(unittest.TestCase):
+    def test_convergence_and_total_budget(self):
+        from unittest.mock import patch
+
+        from dexmani_real.ipc.schema import HAND_STATE_DTYPE
+        from dexmani_real.robot.hand_homing import home_hand
+        from dexmani_real.robot.home import HomeResult
+        from dexmani_real.runtime.safety import SafetyState, revoke_motion
+
+        runtime = resolve_experiment_config()
+        target = np.deg2rad(runtime.hand.home_qpos_deg)
+        for scenario in (
+            "converged",
+            "reset",
+            "duplicate",
+            "stale",
+            "nan",
+            "timeout",
+            "abort",
+            "authority",
+            "estop",
+            "error",
+            "shutdown",
+            "budget",
+        ):
+            with self.subTest(scenario=scenario):
+                shared = motion_fixture(SafetyState.ARMED)
+                clock = [10.0]
+                reads = [0]
+                first_stamp = [None]
+
+                def submitted(*args):
+                    self.assertLessEqual(args[3], runtime.hand.home_timeout_s)
+                    if scenario == "budget":
+                        clock[0] += 0.99
+                    return HomeResult(True)
+
+                def sample():
+                    reads[0] += 1
+                    clock[0] += 0.001
+                    frame = np.zeros(1, dtype=HAND_STATE_DTYPE)
+                    frame["qpos"] = target
+                    stamp = int(clock[0] * 1e9)
+                    first_stamp[0] = first_stamp[0] or stamp
+                    if scenario == "duplicate":
+                        stamp = first_stamp[0]
+                    elif scenario == "stale":
+                        stamp -= 1_000_000_000
+                    elif scenario == "nan":
+                        frame["qpos"][0, 0] = np.nan
+                    elif scenario == "timeout" or (scenario == "reset" and reads[0] == 3):
+                        frame["qpos"][0, 0] += np.deg2rad(5.1)
+                    else:
+                        frame["qpos"][0, 0] += np.deg2rad(4.9)
+                    frame["timestamp_ns"] = stamp
+                    if scenario == "authority":
+                        revoke_motion(shared)
+                    elif scenario in ("estop", "error", "shutdown"):
+                        field = {
+                            "estop": "estop_request",
+                            "error": "error_state",
+                            "shutdown": "is_running",
+                        }[scenario]
+                        getattr(shared, field).value = scenario != "shutdown"
+                    return frame, 0, reads[0]
+
+                shared.hand_state_ring.read_latest.side_effect = sample
+                with (
+                    patch("dexmani_real.robot.hand_homing.wait_home_result", side_effect=submitted),
+                    patch("time.monotonic_ns", side_effect=lambda: int(clock[0] * 1e9)),
+                    patch(
+                        "time.sleep",
+                        side_effect=lambda delay: clock.__setitem__(0, clock[0] + delay),
+                    ),
+                ):
+                    result = home_hand(
+                        shared,
+                        runtime,
+                        abort_requested=lambda: scenario == "abort" and reads[0] > 0,
+                    )
+                self.assertEqual(result.ok, scenario in ("converged", "reset"))
+                if result.ok:
+                    self.assertEqual(reads[0], 6 if scenario == "reset" else 3)
+                else:
+                    self.assertEqual(shared.run_id.value, 3)
+                self.assertLess(clock[0], 11.02)
+
+    def test_tolerance_validation(self):
+        from dataclasses import replace
+
+        from dexmani_real.config.defaults import HandParams
+
+        cfg = HandParams()
+        self.assertEqual(cfg.home_tolerance_deg, 5.0)
+        self.assertEqual(cfg.home_timeout_s, 1.0)
+        for invalid in (0, -1, np.nan, np.inf):
+            with self.assertRaisesRegex(ValueError, "home_tolerance_deg"):
+                replace(cfg, home_tolerance_deg=invalid).validate()
+
+
+class TimeoutAndCameraSmoke(unittest.TestCase):
+    def test_runner_timeout_before_and_after_prediction(self):
+        from unittest.mock import Mock, patch
+
+        from dexmani_real.deployment.runner import PolicyRunner
+        from dexmani_real.runtime.safety import RunEndReason, SafetyState, begin_requested_motion
+
+        spec = observation_spec("joint_state")
+        spec.n_obs_steps, spec.n_action_steps, spec.control_dt_s, spec.action_mode = (
+            1,
+            1,
+            1 / 30,
+            "joint",
+        )
+        for during_prediction in (False, True):
+            shared = motion_fixture(SafetyState.ARMED)
+            clock = [10_000_000_000]
+            with patch("time.monotonic_ns", side_effect=lambda: clock[0]):
+                shared.start_request.value = True
+                epoch, started = begin_requested_motion(shared)
+                runner = PolicyRunner(
+                    shared,
+                    resolve_experiment_config(),
+                    spec,
+                    model_runtime=Mock(),
+                    fingertip_runtime=None,
+                    execute=True,
+                    max_running_s=1.0,
+                )
+                runner.run_id, runner.started_ns = epoch, started
+                sample = row(None)
+                sample.observation_timestamp_ns = clock[0]
+                runner._row = Mock(return_value=sample)
+                runner.recorder = Mock()
+
+                def predict(obs):
+                    clock[0] += 1_000_000_000
+                    return np.zeros((1, 19))
+
+                runner.model.predict.side_effect = predict
+                if not during_prediction:
+                    clock[0] += 1_000_000_000
+                with patch("dexmani_real.deployment.runner.publish_command") as publish:
+                    runner.step()
+                    publish.assert_not_called()
+                self.assertEqual(shared.run_ended_reason.value, RunEndReason.TIMEOUT)
+                self.assertEqual(shared.safety_state.value, SafetyState.ARMED)
+                self.assertIsNone(runner.run_id)
+                runner.recorder.stop_episode.assert_called_once_with(save=True, reason="timeout")
+
+    def test_camera_frame_return_timestamp(self):
+        from unittest.mock import Mock, patch
+
+        from dexmani_real.sensor.camera.worker import pack_camera_frame
+
+        with fake_sdk_driver(
+            "sensor/camera/realsense.py", "_smoke_realsense", "pyrealsense2", SimpleNamespace()
+        ) as driver:
+            camera = driver.RealSenseCamera()
+            camera.pipeline, camera.frame_queue, camera.depth_scale = Mock(), Mock(), 0.001
+            depth, color = Mock(), Mock()
+            depth.get_data.return_value = np.zeros((2, 2), np.uint16)
+            color.get_data.return_value = np.zeros((2, 2, 3), np.uint8)
+            for frame in (depth, color):
+                frame.get_frame_number.return_value = 7
+                frame.get_timestamp.return_value = 1000
+                frame.get_frame_timestamp_domain.return_value = 0
+            frames = camera.frame_queue.wait_for_frame.return_value.as_frameset.return_value
+            frames.get_depth_frame.return_value = depth
+            frames.get_color_frame.return_value = color
+            camera._depth_to_color_aligner = Mock()
+            camera._depth_to_color_aligner.process.return_value.get_depth_frame.return_value = depth
+            with patch("time.monotonic_ns", side_effect=[100, 200, 300, 400]):
+                result = camera.read(compute_depth=False)
+            self.assertEqual(result.timestamp_ns, 100)
+            self.assertEqual(result.timestamp_ns, result.wait_return_monotonic_ns)
+            header, _, _ = pack_camera_frame(
+                result.rgb,
+                result.depth_aligned_to_color_raw,
+                timestamp_ns=result.timestamp_ns,
+                depth_frame_number=7,
+                color_frame_number=7,
+            )
+            self.assertEqual(header["timestamp_ns"][0], 100)
 
 
 if __name__ == "__main__":
