@@ -28,6 +28,18 @@ The task was reviewed against main commit:
 
 Before editing, inspect the current tree and adapt to any newer commits without reverting unrelated work.
 
+### Execution scope
+
+Treat Phases 1-8 as the core refactor. Complete them in order unless the current source proves that a proposed change no longer reduces complexity or would violate an invariant. If that happens, keep the simpler current design and report the specific reason instead of forcing the target shape.
+
+Phases 9-10 are conditional cleanup. Perform them only when they clearly reduce complexity with a small, mechanically reviewable diff. By default, do **not** relocate the examples directory or the offline smoke suite merely to match the illustrative target tree.
+
+The reference repositories are design references only. Do not copy source code, add their dependencies, or reproduce their framework layers.
+
+Keep the repository importable and internally consistent at the end of every phase. Do not carry temporary old/new APIs across phases. Update all in-repository call sites before running that phase's checks.
+
+Unless explicitly requested by the caller, do not create commits, branches, or pull requests. Leave the implementation in the current working tree for review.
+
 ---
 
 ## 1. Repository priorities
@@ -1022,6 +1034,8 @@ Perform this only after the core source refactor is stable.
 
 It currently acts as a broad offline regression suite rather than deployment-only smoke coverage.
 
+**Default for this task: leave its path unchanged.** Only move/split it if the core refactor makes the current location actively misleading and the move remains small and mechanical.
+
 A later cleanup may move/split it under something like:
 
     dexmani_real/offline_checks/
@@ -1035,6 +1049,8 @@ If moving this suite would create disproportionate path/import churn, leave it i
 ### 14.2 examples/scripts/tools
 
 The repository currently mixes formal workflows and diagnostics in examples/.
+
+**Default for this task: keep existing CLI paths stable.** Naming/documentation cleanup is preferred over directory migration unless a move has a clear, immediate readability benefit and all user-facing commands can be updated mechanically.
 
 Formal workflows include:
 
@@ -1212,7 +1228,9 @@ Do not move constants merely to satisfy a cosmetic layering rule.
 
 Implement this as ordered, reviewable stages.
 
-Do not make one giant mechanical rewrite before checking intermediate correctness.
+At the start, run `git status --short` and preserve unrelated local changes. Do not reset, clean, checkout over, or reformat unrelated files.
+
+Do not make one giant mechanical rewrite before checking intermediate correctness. Finish one phase, update every affected call site, remove phase-local dead code, inspect the diff, and run the relevant offline checks before starting the next phase. A phase must not intentionally leave the repository in a half-renamed or dual-API state.
 
 Recommended sequence:
 
@@ -1224,8 +1242,8 @@ Recommended sequence:
 6. PolicyRunner cleanup + RolloutStats + CameraCalibrationSession;
 7. explicit calibration/config ownership;
 8. config responsibility split and singleton removal;
-9. retargeting/VR calibration cleanup;
-10. repository-level polish only when low-risk.
+9. retargeting/VR calibration cleanup, only when the resulting split is clearly simpler;
+10. repository-level polish only when low-risk; default to leaving existing CLI/offline-check paths stable.
 
 After each major phase:
 
@@ -1241,6 +1259,8 @@ If a later phase becomes significantly riskier because the current source has di
 ## 20. Offline validation
 
 Do not run hardware-affecting code.
+
+Before executing any Python module beyond compile/lint checks, inspect its imports, constructors, and entry point and confirm it cannot discover/connect hardware, open a camera/VR stream, write calibration state, home, replay, teleoperate, or execute policy motion. If there is doubt, do not run it.
 
 At minimum run the repository checks from AGENTS.md:
 
@@ -1378,7 +1398,9 @@ The final diff must not introduce generic framework layers that are not required
 
 ## 23. Final review before completion
 
-Before declaring the task complete:
+Before declaring the task complete, perform one final coherence review across definition -> producer -> transformation -> consumer -> side effect for every changed cross-process or persisted-data boundary.
+
+Then:
 
 1. Inspect git status and the complete diff.
 2. Check for unrelated changes.
@@ -1394,5 +1416,7 @@ Before declaring the task complete:
 12. Run all available offline checks.
 13. Report any check that could not run because of optional dependency availability.
 14. Report the separate hardware-validation checklist without executing it.
+15. Report which conditional Phase 9-10 cleanups were intentionally skipped and why; skipped cosmetic moves are not task failures.
+16. Summarize the final architecture in terms of ownership changes, deleted abstractions, and preserved behavior rather than raw file-count changes.
 
 The desired final result is a direct, explicit, research-oriented codebase: important state is visible, important ownership is visible, important safety ordering is visible, and numerical research logic remains simple and easy to inspect.
