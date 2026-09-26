@@ -51,6 +51,19 @@
 - 不修改真机安全边界、命令发布顺序、硬件 shutdown 逻辑。
 - 测试和迁移验收全部离线，不连接或驱动机器人。
 
+### 0.3 与当前 `AGENTS.md` 的已知设计冲突
+
+当前 `AGENTS.md` 的 Research data 段仍要求 Raw 持久化 raw VR、真实 timestamps、显式 tactile validity 和较多诊断；这与本任务经过 LeRobot / Diffusion Policy 对照后确定的 v34 目标冲突。
+
+本任务是对 **Research data 持久化 contract 的显式设计变更授权**，但不是对 hardware/runtime safety 的放宽授权。实施时：
+
+- 先按本文件完成代码事实核对；
+- 只修改与新 v34 data contract 冲突的 standing instructions；
+- 在代码已经实现并验证后，同一 change 中同步更新 `AGENTS.md` 的 Research data 描述和 README；
+- 保留 `AGENTS.md` 中所有 hardware safety、freshness、causal observation、run_id、shutdown 等要求；
+- “sensor ring 不发布 generic validity flag”的运行时原则继续成立；Raw 的 `frame_valid` 是 control-row 研究摘要，不是 sensor validity channel；
+- 仓库明确“不维护 committed tests 目录”，因此本任务不得新建 `tests/`；验证使用 focused one-off offline smoke checks、临时脚本和现有公共 contract。
+
 ---
 
 ## 1. 参考设计原则
@@ -159,7 +172,7 @@ v34 之后应长期冻结。只有 persisted scientific semantics 真正 breakin
 | `hand_tactile_force` | float32 | (5, 120, 3) | canonical XHand dense tactile payload |
 | `action_arm_joint_target` | float64 | (7,) | 本 control step 最终成功提交/发布边界所对应的 absolute arm joint target |
 | `action_hand_joint_target` | float64 | (12,) | 同一步最终 hand joint target |
-| `frame_valid` | bool | () | 本行是否构成一个正常、完整、因果成立、相机可用、动作已成功发布的 demonstration control step |
+| `frame_valid` | bool | () | 本行是否形成正常 control solution 且对应 joint target 成功进入 command publication boundary；该 row 已由 runtime 的 observation 构造边界保证所需 sensor freshness |
 
 媒体继续保持：
 
@@ -198,10 +211,20 @@ Legacy migration 必须先验证旧 validity flag 与 finite/non-finite payload 
 `frame_valid=True` 只表示核心 control-step demonstration 语义成立：
 
 - 正常 control solution，而不是 IK / retarget / safety fallback failure；
-- 需要的 robot observation usable；
-- observation / camera sample 通过 runtime 当时已有的 causal/freshness 条件；
+- 该 row 已经成功通过 runtime 的 observation 构造边界；不要在 recorder 内再次实现一套 freshness/causality 判定；
 - 最终 canonical joint target 成功进入定义明确的 command publication/commit boundary；
 - 该行的 core state/action payload 可解释。
+
+对当前 native teleop 路径，优先让 producer 直接从已有事实构造，例如：
+
+```text
+frame_valid =
+    (control_status == FRAME_OK)
+    AND (command is not None)
+    AND (publication succeeded)
+```
+
+因为 `ObservationRow` 本身只有在 required arm/hand/camera/VR freshness 检查通过后才存在。不要复制第二套 observation validity state machine。
 
 它**不表示**：
 
@@ -221,10 +244,13 @@ Native runtime 仍可保留内部 timestamp/freshness/safety mechanisms，但它
 ```text
 schema_version = 34
 task_label
-collection_source        # 当前 teleop；允许未来其它 collection source，但 exporter v15 只接受当前支持的 teleop 语义
+collection_source        # teleop / policy_rollout 等明确来源
 control_hz
 num_frames
+episode_valid            # session-level validity latch
 ```
+
+`episode_valid` 用来承接 **不能由单个 row 表达的整段生命周期失败**，例如 abnormal stop、operator pause 后仍保存、recording/runtime failure。它替代当前 `technical_status + had_pause` 作为训练准入所需的最小 episode-level 事实；不要仅删除旧字段而丢失这一信息。
 
 RGB-D payload 的最小解释信息：
 
@@ -239,22 +265,19 @@ camera_T_xarm_base_from_color
 depth_scale
 ```
 
-重建 FK / fingertip geometry 所需的研究静态信息必须有明确 provenance，优先复用现有 metadata key，避免无意义重命名：
+重建 fingertip geometry 时，**随真实物理 setup 变化且无法从图像/关节数据恢复的 hand mount calibration** 必须随 Raw 保存：
 
 ```text
-arm/robot kinematic model identity or content hash
-XHand URDF/model identity or content hash
-T_eef_handbase
-ordered fingertip link names
+T_eef_handbase position + orientation
 ```
 
-还应保存：
+不要把所有软件资产都升级成 Raw required schema。xArm/XHand model/URDF、ordered fingertip link names、producer git SHA 等属于软件/processing provenance：
 
-```text
-producer_git_sha
-```
+- 若已有低成本 metadata，可保留为 optional provenance；
+- 历史迁移必须在 migration report / explicit ProcessingConfig 中 pin；
+- 不要求每个 v34 episode 都重复保存 URDF content hash / git SHA 才能被 Reader 打开。
 
-如果当前代码已经用其它等价 metadata 表达上述事实，复用现有 key；不要为了形式统一重复保存同一信息。
+这样 Raw 保存物理标定，软件模型版本由代码版本和导出配置负责，不把 provenance 机制重新膨胀成 schema。
 
 ### 3.5 Raw v34 不再要求/持久化的逐帧字段
 
@@ -334,11 +357,13 @@ Reader 只做结构验证：
 - 10 个 required datasets 存在；
 - row count / shape / dtype 正确；
 - depth count/shape/dtype 正确；
-- RGB frame count 等于 `num_frames`；
+- RGB 文件存在且非空；Reader 不为了打开低维 Raw 而扫描/解码整段视频；
 - `control_hz > 0`；
+- `episode_valid` 为 bool；
 - camera intrinsics / depth scale 有效；
-- base-from-camera 为有限 rigid transform；
-- kinematic/static metadata structurally valid。
+- base-from-camera 和 `T_eef_handbase` 为有限 rigid transform。
+
+RGB 的实际 frame count / shape / dtype 在 whole-episode export 的 streaming pass 中一次性验证；不要让普通 Reader open 重复做媒体内容扫描。
 
 Reader **不做**：
 
@@ -367,23 +392,39 @@ Reader **不做**：
 
 ## 4. 删除非研究必要的 Raw admission / bookkeeping
 
-### 4.1 `technical_status`
+### 4.1 `technical_status` + `had_pause` → `episode_valid`
 
-不再作为 Reader 或 Zarr exporter 的准入条件。
+不再让 Reader / exporter 分别理解两套 lifecycle metadata。
 
-若其写入路径仍被 runtime publication lifecycle 使用，不要为“删字段”破坏 lifecycle；允许先降级为 non-contract metadata，再在确认无安全依赖后清理。
+将当前：
 
-最终训练准入不得再依赖：
-
-```python
-reader.require_valid(...)
+```text
+technical_status
+had_pause
 ```
 
-### 4.2 `had_pause`
+收敛成一个稳定 bool：
 
-不再作为 Zarr exporter 的持久化 metadata gate。
+```text
+episode_valid
+```
 
-正确做法是由 collection lifecycle 保证一个 published demonstration episode 的连续性；出现真正 pause 时终止/拒绝该 episode，而不是依赖离线 timestamp gap reconstruction。
+规则：
+
+- episode START 时初始化为 true；
+- abnormal stop / hardware/runtime/recording failure → false；
+- operator pause 发生后如果该 physical episode 仍被保存 → false；
+- normal uninterrupted operator save → true；
+- clean discard 不发布 episode；
+- termination reason 可以作为 optional diagnostic metadata 保留，但不作为 schema/admission 状态机。
+
+Zarr 准入要求：
+
+```python
+episode_valid and np.all(frame_valid)
+```
+
+因此可以删除 `reader.require_valid(...)` 和 exporter 对 `had_pause` 的独立分支，但不能丢失 session-level invalid latch。
 
 ### 4.3 provenance workflow classifier
 
@@ -513,6 +554,7 @@ tactile_force_axis_labels
 tactile_force_unit
 
 depth_scale_m_per_unit
+depth_invalid_value
 arm_effort_unit
 hand_current_unit
 ```
@@ -553,8 +595,6 @@ contact_force_si_verified
 
 tactile_force_si_verified
 tactile_force_spatial_geometry_verified
-
-depth_invalid_value            # uint16 + depth scale / payload contract 已足够时删除
 ```
 
 原则：
@@ -591,13 +631,21 @@ depth_invalid_value            # uint16 + depth scale / payload contract 已足�
 - task name 有效；
 - `collection_source` 为当前 exporter 支持的 teleop source。
 
-### 6.2 全部 control rows clean
+### 6.2 Episode lifecycle 与全部 control rows clean
+
+先要求：
+
+```python
+bool(meta["episode_valid"])
+```
+
+再要求：
 
 ```python
 np.all(frame_valid)
 ```
 
-只要任一 false：
+任一条件失败：
 
 ```text
 reject whole episode
@@ -644,10 +692,10 @@ reject whole episode
 - depth scale；
 - arm FK；
 - XHand FK；
-- hand mount；
-- fingertip link mapping。
+- Raw 中记录的 hand mount calibration；
+- explicit ProcessingConfig / tracked model assets 中的 fingertip link mapping。
 
-不要从“当前默认 runtime”静默补历史值。
+`T_eef_handbase` 必须从该 Raw episode 的物理标定读取，不要从“当前默认 runtime”静默补历史值。URDF / fingertip link names 则由明确的 processing/code version 提供，不要求复制进每个 Raw episode。
 
 ### 6.6 全部 derived modalities 成功
 
@@ -682,6 +730,7 @@ reject whole episode
 technical_status
 had_pause
 provenance workflow classifier
+technical_status / had_pause（由 episode_valid 取代）
 
 flag_frame_status enum
 hand_contact_valid
@@ -846,7 +895,20 @@ frame_valid = (
 
 不要把 tactile validity 并入 `frame_valid`；tactile invalid 由 NaN payload 表达，并在 full-modality Zarr admission 阶段整段拒绝。
 
-### 7.6 historical status 绝不能 numeric-copy
+### 7.6 legacy `episode_valid` 的构造
+
+Legacy v30 没有当前 `technical_status/had_pause`，不得伪造这些历史字段。v34 migrator 应直接判断“该历史 episode 是否有足够证据满足 v34 session-level validity contract”：
+
+- 使用真实 legacy stop/success/truncation metadata；
+- 使用历史 control-grid/lifecycle 实现；
+- 使用已存 row timeline / anchor continuity 作为证据之一；
+- 不把“缺少旧字段”自动解释为 true。
+
+证据足够时写 `episode_valid=True`；证据不足或存在 abnormal lifecycle 证据时写 false，并在 migration report 给出原因。
+
+`episode_valid` 是 **v34 canonical audit result**，不是声称历史文件当时已经拥有同名字段。
+
+### 7.7 historical status 绝不能 numeric-copy
 
 历史参考：
 
@@ -866,7 +928,7 @@ FRAME_RETARGET_FAIL = 2
 
 v34 不再持久化 detailed status enum。
 
-### 7.7 不迁入 v34 的 legacy 字段
+### 7.8 不迁入 v34 的 legacy 字段
 
 以下只留在 immutable v30 archive：
 
@@ -900,7 +962,7 @@ vr_landmarks
 head_quat_wxyz
 ```
 
-### 7.8 legacy tactile validity flags
+### 7.9 legacy tactile validity flags
 
 不迁入 v34，但转换前必须检查：
 
@@ -1076,13 +1138,17 @@ dexmani_real/dataset/pointcloud.py
 - 不改变 hardware safety；
 - 不为了删 Raw timestamp 删除 runtime 内部 timestamp。
 
-### 10.3 Tests / examples / docs
+### 10.3 Offline checks / examples / docs
 
-更新所有依赖 v33 field names 的 tests / examples。
+更新所有依赖 v33 field names 的 examples / smoke-check surfaces；**不要新建 committed `tests/` 目录**。
 
 新增 legacy migrator。
 
-实现完成后更新 `PICK_PLACE_TOY_MIGRATION.md`：
+实现完成后同步更新：
+
+- `AGENTS.md`：只更新与本次 Raw/Zarr data contract 冲突的 Research data standing instructions；
+- README：稳定工作流与当前 schema；
+- `PICK_PLACE_TOY_MIGRATION.md`：
 
 - 明确 v33 migration 不再是目标；
 - canonical path 改为 v30→v34→Zarr v15；
@@ -1124,7 +1190,7 @@ dexmani_policy/*
 3. 让 native recorder生成 `frame_valid`。
 4. 简化 reader。
 5. 保留 runtime safety/synchronization。
-6. 添加 v34 round-trip tests。
+6. 运行 focused one-off v34 round-trip smoke checks。
 
 ### Phase C — Raw→Zarr v15
 
@@ -1133,7 +1199,7 @@ dexmani_policy/*
 3. 保持 whole-episode transactional export。
 4. 保持完整 modalities。
 5. 减少 Zarr descriptive attrs，但严格保持 current `dexmani_policy` compatibility。
-6. 添加 exporter tests。
+6. 运行 focused one-off exporter smoke checks。
 
 ### Phase D — legacy migrator
 
@@ -1147,7 +1213,7 @@ dexmani_policy/*
 
 ### Phase E — Final verification
 
-1. 全部 tests。
+1. 完成所有 required offline smoke checks。
 2. `pick_place_toy` source hashes unchanged。
 3. Zarr contract smoke test。
 4. 文档更新。
@@ -1155,11 +1221,11 @@ dexmani_policy/*
 
 ---
 
-## 12. 测试要求
+## 12. 离线验证要求
 
-优先写小而精确的 unit/integration tests，不恢复庞大 smoke-suite。
+遵循 `AGENTS.md`：不新增 committed `tests/` 目录，不恢复庞大 smoke-suite。使用临时 Python 脚本、one-off assertions、migrator `--dry-run` 和现有公共 contract 完成以下 focused offline checks。
 
-### 12.1 Raw schema tests
+### 12.1 Raw schema smoke checks
 
 必须覆盖：
 
@@ -1172,32 +1238,35 @@ dexmani_policy/*
 - invalid camera calibration rejected；
 - unknown/typo canonical datasets 不被静默接受。
 
-### 12.2 `frame_valid` tests
+### 12.2 `frame_valid / episode_valid` smoke checks
 
 覆盖 native runtime source conditions：
 
-- normal row → true；
+- normal uninterrupted episode + normal row → episode_valid=true, frame_valid=true；
 - IK/retarget/control failure → false；
 - action publication failure → false；
 - observation invalid → false；
 - camera invalid/freshness failure → false；
-- tactile invalid alone不应偷偷改变 core `frame_valid`，但 full Zarr export 会拒绝。
+- tactile invalid alone不应偷偷改变 core `frame_valid`，但 full Zarr export 会拒绝；
+- abnormal stop → episode_valid=false；
+- pause 后仍保存 → episode_valid=false。
 
-### 12.3 Whole-episode Zarr tests
+### 12.3 Whole-episode Zarr smoke checks
 
 至少：
 
-1. 一个 clean episode → 全部 rows 写入。
-2. 中间一行 `frame_valid=False` → 整段 0 rows。
-3. 中间一行 tactile NaN → 整段 0 rows。
-4. point-cloud derivation 一帧失败 → 整段 0 rows。
-5. 两个 clean episodes → `episode_ends` 精确累计。
-6. 第一段失败、第二段成功 → 不残留 partial first-episode arrays。
-7. Zarr array key set仍为完整 canonical modality全集。
-8. Zarr schema name/version仍为 v15。
-9. 对当前 `dexmani_policy` consumer-required attrs 做 compatibility test。
+1. 一个 episode_valid=true 且所有 frame_valid=true 的 clean episode → 全部 rows 写入。
+2. episode_valid=false → 整段 0 rows。
+3. 中间一行 `frame_valid=False` → 整段 0 rows。
+4. 中间一行 tactile NaN → 整段 0 rows。
+5. point-cloud derivation 一帧失败 → 整段 0 rows。
+6. 两个 clean episodes → `episode_ends` 精确累计。
+7. 第一段失败、第二段成功 → 不残留 partial first-episode arrays。
+8. Zarr array key set仍为完整 canonical modality全集。
+9. Zarr schema name/version仍为 v15。
+10. 对当前 `dexmani_policy` consumer-required attrs 做 compatibility check。
 
-### 12.4 Legacy migration tests
+### 12.4 Legacy migration smoke checks
 
 构造最小 v30 fixture，覆盖：
 
@@ -1299,7 +1368,7 @@ derive(raw RGB-D,
 对于历史 `pick_place_toy`：
 
 - camera geometry 使用 raw/legacy 真实 metadata；
-- hand mount / models 使用已经追溯确认的历史配置；
+- hand mount 使用 Raw v34 中该 episode 自己的物理标定；URDF / fingertip links 使用已经追溯确认的 explicit processing/code version；
 - table plane 无法证明时，优先显式 `remove_table=False`，而不是套当前 table plane；
 - 一旦选择 processing config，同一个 Zarr 的 point-cloud tensor semantics必须统一；
 - Zarr 不需要重复保存每 episode camera calibration / table plane descriptive provenance。
@@ -1372,7 +1441,7 @@ Raw v34 本身不是 v16 理由。
 只有以下全部满足才算完成：
 
 - [ ] Raw v34 只有精简后的 canonical research arrays；v33 runtime trace fields 不再持久化。
-- [ ] Native recorder 的 `frame_valid` 语义有明确测试。
+- [ ] Native recorder 的 `frame_valid` 与 episode-level `episode_valid` 语义均通过 focused offline checks。
 - [ ] Runtime freshness / causal / safety 没有因 storage 简化而降低。
 - [ ] `EpisodeReader` 只负责 v34 结构验证，不承担 training admission。
 - [ ] 正常 reader 没有 legacy v30 分支。
@@ -1390,7 +1459,7 @@ Raw v34 本身不是 v16 理由。
 - [ ] 若真实 `pick_place_toy` 数据可用，Raw migration 保持 61 episodes / 14,309 rows。
 - [ ] current known bad episodes 不通过删行/切段进入 Zarr。
 - [ ] 当前 `dexmani_policy` 原样可以读取最终 Zarr。
-- [ ] 更新测试与 `PICK_PLACE_TOY_MIGRATION.md`，且文档只陈述实际执行过的结果。
+- [ ] 更新 `AGENTS.md` / README / `PICK_PLACE_TOY_MIGRATION.md`，standing instructions 与 v34 实现一致，且文档只陈述实际执行过的结果。
 
 ---
 
@@ -1404,8 +1473,9 @@ runtime:
 
 Raw v34:
     保存不可再生研究事实
-    + 一个稳定 frame_valid 总结
-    + 重建几何所需最小 calibration/kinematics
+    + frame_valid（row-level）
+    + episode_valid（session-level）
+    + camera / hand-mount 等真实物理 calibration
     不保存 runtime trace
 
 Zarr v15:
