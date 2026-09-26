@@ -145,9 +145,5 @@ def run_keyboard_experiment(runtime, *, no_hand):
         )
         keys.stop()
     return int(
-        not clean
-        or not report.shared_closed
-        or shared.error_state.value
-        or shared.estop_request.value
-        or any(x.exitcode != 0 or x.escalation != "graceful" for x in report.exits)
+        not clean or not report.clean or shared.error_state.value or shared.estop_request.value
     )

@@ -71,12 +71,6 @@ def _close_runtime_channels(shared: Any) -> bool:
         return False
 
 
-def _latch_unverified_shutdown_fault(shared: Any) -> None:
-    """Fail closed when a child might still access live IPC resources."""
-    shared.error_state.value = True
-    transition(shared, SafetyState.FAULT)
-
-
 def stop_processes_verified(
     shared: Any,
     processes: Iterable[Any],
@@ -120,7 +114,8 @@ def stop_processes_verified(
             exits.append(ProcessExit(process.name, process.exitcode, escalation))
 
     except Exception:
-        _latch_unverified_shutdown_fault(shared)
+        shared.error_state.value = True
+        transition(shared, SafetyState.FAULT)
         raise
 
     frozen_exits = tuple(exits)

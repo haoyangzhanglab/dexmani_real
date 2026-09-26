@@ -79,6 +79,8 @@ Cartesian IK 检查目标姿态的机器人自碰撞，并使用最终手部目�
 
 xArm 与 XHand HOME 均以实测收敛判断完成。XHand 默认要求连续三个不同的新鲜反馈样本中，每个关节的目标误差均不超过 5°；命令提交与收敛共用超时预算，默认 2 秒。后续机械臂规划使用新鲜实测手姿态，实际手部运动与机械臂路径仍需真机验证。
 
+会话结束时，确认全部子进程停止且没有物理故障后，安全状态变为 DISARMED。相机、VR、点云、录制或 policy 失败，以及共享内存关闭失败，仍会导致会话失败；DISARMED 不表示实验成功。arm/hand 异常退出、急停或已锁存的物理故障保持 FAULT；无法确认子进程停止时也进入 FAULT，并保留共享内存。
+
 ## 数据与训练缓存
 
 Raw episode 是实验 source of truth，保留机器人状态、RGB-D 与标定、XHand 电流/触觉及其有效性、VR 源数据、真实时间戳、绝对动作目标和必要诊断。控制与录制复用当前观测快照，各模态按自身时间戳检查新鲜度。
@@ -107,7 +109,9 @@ Policy worker 持有 model / CUDA，使用同步 inference 和本地 action chun
 
 会话输出位于 `rollouts/<policy>/<task>/<experiment>/session_*/`，包含 `run_config.yaml` 和实际保存的 episode 目录。Policy 模式不使用 C/D；同批收到 S/Q 时会忽略 H/B。
 
-会话执行结果由 CLI 退出码表示：正常完成或操作者退出且资源干净关闭时为 0；必需 worker/operator 异常、物理故障、急停、非正常 shutdown 或共享内存关闭失败时为非零。共享内存仅在确认全部子进程停止后释放。Policy 的未完成 active episode 若被异常中断，会按技术无效结束。
+会话执行结果由 CLI 退出码表示：正常完成或操作者退出且资源干净关闭时为 0；必需 worker/operator 异常、物理故障、急停、非正常 shutdown 或共享内存关闭失败时为非零。正常 S/Q 允许 policy 完成本地 episode 结束与录制收尾；若尚未正常结束的 active episode 被外部关闭打断，即使已收到 S/Q，也按技术无效结束。
+
+正常 Q 的 policy 收尾与后续 worker 停止共用 `safety.shutdown_timeout_s`，默认 65 秒；录制 STOP 等待默认 60 秒。录制收尾耗时会减少其他 worker 的剩余等待时间。
 
 Evaluation 数据用于评估与诊断，不能直接当作 teleop BC demonstration 导入训练缓存。任务成功与否需离线判断。
 

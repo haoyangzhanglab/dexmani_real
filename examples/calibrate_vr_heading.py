@@ -172,12 +172,9 @@ def _shutdown_vr_receiver(shared: RuntimeChannels, vr_proc: mp.Process) -> bool:
     except RuntimeError as exc:
         print(f"  ERROR: VR receiver shutdown could not be verified: {exc}")
         return False
-    clean = report.shared_closed and all(
-        item.exitcode == 0 and item.escalation == "graceful" for item in report.exits
-    )
-    if not clean:
+    if not report.clean:
         print(f"  ERROR: VR receiver shutdown was not clean: {report}")
-    return clean
+    return report.clean
 
 
 def _play_completion_audio() -> None:

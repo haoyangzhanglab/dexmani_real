@@ -672,13 +672,8 @@ def run_camera_calibration(
                     started,
                     graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
                 )
-                worker_exit_clean = all(
-                    item.exitcode == 0 and item.escalation == "graceful"
-                    for item in shutdown_report.exits
-                )
                 shutdown_clean = (
-                    worker_exit_clean
-                    and shutdown_report.shared_closed
+                    shutdown_report.clean
                     and not bool(shared.error_state.value)
                     and not bool(shared.estop_request.value)
                     and int(shared.safety_state.value) == int(SafetyState.DISARMED)

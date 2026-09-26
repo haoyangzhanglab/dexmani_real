@@ -80,12 +80,7 @@ def replay_episode(trajectory, runtime, config):
             graceful_timeout_s=runtime.safety.shutdown_timeout_s,
         )
         keyboard.stop()
-    if (
-        shared.error_state.value
-        or shared.estop_request.value
-        or not report.shared_closed
-        or any(x.exitcode != 0 or x.escalation != "graceful" for x in report.exits)
-    ):
+    if shared.error_state.value or shared.estop_request.value or not report.clean:
         outcome = ReplayOutcome(
             ReplayStatus.FAULT, outcome.replay_data, "hardware/shutdown failure"
         )
