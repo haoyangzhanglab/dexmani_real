@@ -7,7 +7,13 @@ from typing import Any, Mapping, cast
 
 import numpy as np
 
-__all__ = ["CameraIntrinsics", "RGBDGeometry"]
+__all__ = ["CameraIntrinsics", "RGBDGeometry", "validate_aligned_depth_distortion"]
+
+
+def validate_aligned_depth_distortion(model: str) -> None:
+    """Require a model implemented by canonical color-grid depth deprojection."""
+    if model not in {"distortion.none", "none", "distortion.brown_conrady", "brown_conrady"}:
+        raise ValueError(f"depth deprojection has no validated path for distortion model {model!r}")
 
 
 def _finite_positive(value: float, *, name: str) -> float:

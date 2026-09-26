@@ -25,7 +25,11 @@ from dexmani_real.config.pointcloud import (
     POINT_CLOUD_TRANSFORM,
     PointCloudConfig,
 )
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
+from dexmani_real.sensor.camera.geometry import (
+    CameraIntrinsics,
+    RGBDGeometry,
+    validate_aligned_depth_distortion,
+)
 
 _KERNEL_3X3 = np.ones((3, 3), dtype=np.uint8)
 
@@ -161,11 +165,12 @@ def _undistorted_depth_coordinates(
     intrinsics: CameraIntrinsics,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return normalized camera rays for color-grid depth pixels."""
+    validate_aligned_depth_distortion(intrinsics.distortion_model)
     xd = (columns.astype(np.float32) - np.float32(intrinsics.ppx)) / np.float32(intrinsics.fx)
     yd = (rows.astype(np.float32) - np.float32(intrinsics.ppy)) / np.float32(intrinsics.fy)
     if intrinsics.distortion_model in {"distortion.none", "none"}:
         x, y = xd, yd
-    elif intrinsics.distortion_model in {"distortion.brown_conrady", "brown_conrady"}:
+    else:
         # Invert the Brown-Conrady projection with the same fixed-point scheme
         # used by librealsense for deprojection.
         k1, k2, p1, p2, k3 = (np.float32(value) for value in intrinsics.distortion_coeffs)
@@ -177,11 +182,6 @@ def _undistorted_depth_coordinates(
             delta_y = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
             x = (xd - delta_x) / radial
             y = (yd - delta_y) / radial
-    else:
-        raise ValueError(
-            "depth deprojection has no validated path for distortion model "
-            f"{intrinsics.distortion_model!r}"
-        )
     return x, y
 
 

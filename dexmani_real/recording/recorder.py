@@ -22,7 +22,7 @@ from dexmani_real.recording.storage.schema import (
     DATASET_SPECS,
     EPISODE_SCHEMA_VERSION,
 )
-from dexmani_real.sensor.camera.geometry import RGBDGeometry
+from dexmani_real.sensor.camera.geometry import RGBDGeometry, validate_aligned_depth_distortion
 from dexmani_real.utils.atomic_io import atomic_publish
 from dexmani_real.utils.log import get_logger
 
@@ -181,6 +181,7 @@ class EpisodeRecorder:
         if not isinstance(camera_geometry, RGBDGeometry):
             raise TypeError("camera_geometry must be an RGBDGeometry instance")
         color = camera_geometry.color
+        validate_aligned_depth_distortion(color.distortion_model)
         expected_rgb_shape = (color.height, color.width, 3)
         expected_depth_shape = (color.height, color.width)
         if (

@@ -34,9 +34,15 @@ A point cloud is self-contained. Match its source camera frame only when the pol
 
 ## Research data
 
-Raw v34 episodes are the experiment source of truth. Preserve measured robot state, RGB-D, current/tactile payloads, final absolute joint targets, frame_valid, monotonic-false episode_valid, and physical camera/hand-mount calibration. Invalid tactile payloads contain NaN; runtime aggregate/dense validity remains explicit. Keep freshness, causal selection, publication clocks and fixed-dt continuity checks in runtime; do not persist timestamps, raw VR, detailed status, software provenance, or transport bookkeeping. Snapshot the resolved physical hand mount at recording START; Raw is its sole offline truth source. New recording requires complete eye-to-hand aligned RGB-D calibration before START.
+Raw v34 episodes are the experiment source of truth; the normal reader accepts only v34. Preserve measured robot state, RGB-D, current/tactile payloads, final absolute joint targets, frame_valid, monotonic-false episode_valid, and physical camera/hand-mount calibration. Keep freshness, causal selection, publication clocks and fixed-dt continuity checks in runtime; do not persist timestamps, raw VR, detailed status, software provenance, or transport bookkeeping.
 
-Canonical Zarr is a full training cache containing all learning-relevant modalities; `dexmani_policy` selects model inputs at load time. Do not include runtime timing arrays or validity masks.
+Actions describe targets published for that control step. Never substitute a previous target for an unpublished action; a recorded failure row without a published target uses NaN actions and frame_valid=false. If a failure path actually publishes a hold, preserve that target while keeping frame_valid=false. Structurally valid Raw may contain failed rows; reader acceptance does not establish training eligibility.
+
+Tactile payloads use XHand SDK-native values with software bias removed; their SI force unit is unverified. Native recording and Raw-to-Zarr apply no additional tactile scaling. Invalid tactile payloads contain NaN; runtime aggregate/dense validity remains explicit and independent of joint state and frame_valid.
+
+Snapshot the resolved physical hand mount at recording START; Raw is its sole offline truth source. New recording requires complete eye-to-hand aligned RGB-D calibration before START. The aligned color-grid distortion model must have a validated canonical depth-deprojection path. Keep this lightweight compatibility check shared by recording, Raw loading, and numerical deprojection; reject unsupported models before recording.
+
+Canonical Policy Zarr v15 is a full training cache containing all learning-relevant modalities; `dexmani_policy` selects model inputs at load time. Do not include runtime timing arrays or validity masks.
 
 Raw-to-Zarr admission is whole-episode all-or-nothing. Reject abnormal episodes with concrete reasons; do not repair, split, resample, drop bad rows, or silently salvage them. `action` and `action_ee` must describe the same final high-level target in different action spaces.
 

@@ -33,7 +33,7 @@ Teleop、键盘控制和 policy 分别使用各自的控制周期，replay 使�
 | Policy rollout | `python examples/run_policy.py <policy/task/experiment> --config experiment.yaml` | 真机；evaluation session |
 | Camera calibration | `python examples/calibrate_camera.py --config experiment.yaml --hand-geometry absent` | 真机；仅在手已拆除时用 `absent`，固定在 home 的手用 `secured-home` |
 | VR heading calibration | `python examples/calibrate_vr_heading.py` | VR / HTS |
-| Canonical Zarr export | `python examples/export_policy_zarr.py episodes/<task> --config export.yaml` | 离线 |
+| Canonical Zarr export | `python examples/export_policy_zarr.py <raw_v34_task_dir> --config export.yaml` | 离线；输入为包含完整 Raw v34 episodes 的任务目录 |
 | XHand diagnostics | `python examples/xhand_diagnostics.py` | 连接真机；诊断 |
 | RGB-D diagnostics | `python examples/realsense_record_example.py` | 连接相机；实时 RGB-D / 点云显示 |
 | Point-cloud diagnostics | `python examples/pointcloud_process_example.py` | 连接相机；点云检查与可选桌面标定，`--save-dir` 保存诊断快照 |
@@ -85,11 +85,17 @@ xArm 与 XHand HOME 均以实测收敛判断完成。XHand 默认要求连续三
 
 Raw v34 是实验 source of truth，保留机器人状态、RGB-D、XHand 电流/触觉、最终发布的绝对关节目标、`frame_valid`、`episode_valid` 和真实物理标定。无效触觉用 NaN 表达；运行时仍分别保留 aggregate/dense validity。控制与录制复用同一观测快照，新鲜度、因果选择、动作发布时间及连续性检查保留在 runtime，不再写入 Raw。
 
-每个已发布 episode 包含 `data.h5`（控制行与元数据）、`depth.h5`（对齐到彩色图像的原始深度）和 `rgb.mp4`。深度值乘以相机提供的 `depth_scale` 才得到米。当前 Raw schema 为 34，正常 reader 只接受 v34；历史布局通过独立离线工具迁移。Raw 不保存 VR 源数据、逐帧时间戳、详细状态枚举、operator 或软件 provenance。
+每个已发布 episode 包含 `data.h5`（控制行与元数据）、`depth.h5`（对齐到彩色图像的原始深度）和 `rgb.mp4`。深度值乘以相机提供的 `depth_scale` 才得到米。当前 Raw schema 为 34，reader、回放和训练导出均要求 v34 输入；旧版 Raw 不能直接作为当前工作流的输入。Raw 不保存 VR 源数据、逐帧时间戳、详细状态枚举、operator 或软件 provenance。
 
-录制 START 必须由当前相机 serial 成功解析完整 eye-to-hand 标定，并验证 live aligned RGB-D 几何、depth scale 和静态 base-from-color 变换；缺失或 eye-in-hand 均拒绝录制。Raw 仅保存彩色像素网格的内参与畸变、静态相机外参和深度尺度，并快照该次 resolved hand mount。离线指尖 FK 和可视化只能使用 episode 自己的 mount。
+`hand_contact` 和 `hand_tactile_force` 保存 XHand SDK-native、减去软件 bias 后的触觉值，SI 力单位尚未验证，不能标作牛顿。当前采集和 Raw→Zarr 不额外乘 0.1 或 10；导出直接保留这两个 float32 payload 的数值和顺序。
 
-`frame_valid` 表示正常控制解及其目标成功进入命令发布边界，不表示设备 ACK、到达或触觉有效。控制失败行仍保留，未发布目标可为 NaN。`episode_valid` 在一次 episode 中只能从 true 变为 false：暂停、异常终止、录制失败、相邻正常行的观测/发布时间间隔超过两个控制周期，或拒绝发布后仍继续录制，都会失效。终止时等待保存/丢弃选择本身不会使 clean episode 失效。
+录制 START 必须由当前相机 serial 成功解析完整 eye-to-hand 标定，并验证 live aligned RGB-D 几何、depth scale 和静态 base-from-color 变换；缺失或 eye-in-hand 均拒绝录制。对齐深度使用的彩色内参畸变模型也必须受 canonical 反投影支持：目前仅接受 `none` / `distortion.none` 和 `brown_conrady` / `distortion.brown_conrady`。不支持的模型在 START 和 Raw 加载时拒绝，数值反投影路径仍保留检查。
+
+Raw 仅保存彩色像素网格的内参与畸变、静态相机外参和深度尺度，并快照该次 resolved hand mount。离线指尖 FK 和可视化只能使用 episode 自己的 mount。
+
+`action_arm_joint_target` / `action_hand_joint_target` 表示本 control step 实际发布的最终绝对目标。录制的失败行若没有发布目标，action 保存为 NaN，不能复用上一条目标冒充本步动作；若失败路径确实发布了 hold，则保留真实 hold target。
+
+`frame_valid` 表示正常控制解及其目标成功进入命令发布边界，不表示设备 ACK、到达或触觉有效。失败行保持 `frame_valid=false`，包括实际发布了 hold 的失败行。`episode_valid` 在一次 episode 中只能从 true 变为 false：暂停、异常终止、录制失败、相邻正常行的观测/发布时间间隔超过两个控制周期，或拒绝发布后仍继续录制，都会失效。终止时等待保存/丢弃选择本身不会使 clean episode 失效。Reader 能打开 Raw 仅说明结构有效，不表示整段可用于训练。
 
 Raw 先写入 `.tmp_<episode_name>`，关闭文件并通过结构验证后，才经 fsync 和原子重命名持久化发布。录制失败时尝试释放 writer 并删除本次 staging；无法确认资源释放或清理失败时保留目录及 ownership，并拒绝新的 START，不覆盖原始录制异常。启动时发现残留 staging 只警告，需人工检查处理，不自动删除或恢复。
 
@@ -97,7 +103,7 @@ Canonical Zarr 是从 raw 重建的全量训练缓存，包含 learning-relevant
 
 Raw-to-Zarr 按完整 episode 接收或拒绝，不修复、切分、重采样或删除坏行。暂停、异常控制行、触觉无效、录制不完整或转换失败等情况会整条拒收并报告原因。批量导出可继续处理其他正常 episodes，但必须汇总拒绝原因。
 
-导出必须显式提供 `--config export.yaml`，library 调用必须提供 `ProcessingConfig`。历史桌面平面无法证明时使用：
+导出必须显式提供 `--config export.yaml`，library 调用必须提供 `ProcessingConfig`。历史桌面平面无法证明时，可将下面内容保存为 `export.yaml`；其余点云参数使用当前配置默认值，实验需要固定参数时应在该文件中显式设置：
 
 ```yaml
 pointcloud:
@@ -108,15 +114,14 @@ pointcloud:
 
 导出默认写入 `datasets/<task_name>.zarr`，可用 `--output` 指定新目标。`--dry-run` 执行相同的完整转换与校验而不创建 Zarr，仍需相应的运动学和点云依赖。
 
+例如，任务的 Raw v34 episodes 位于 `episodes/raw_v34/<task>/` 时，先完整验证，再导出到尚不存在的新目录：
+
+    python examples/export_policy_zarr.py episodes/raw_v34/<task> --config export.yaml --output datasets/<task>_new.zarr --dry-run
+    python examples/export_policy_zarr.py episodes/raw_v34/<task> --config export.yaml --output datasets/<task>_new.zarr
+
 Zarr 在目标父目录下写入 staging，完成后再次确认目标未占用，再在同一文件系统内重命名发布。它是可从 raw 重建的缓存，不逐块 fsync；导出失败时清理本次 staging，raw 保持不变。
 
 导出拒绝覆盖已有目标；解析符号链接后，目标不能位于输入目录、仓库的 `episodes/`、`episodes_processed/`、`rollouts/` 或已有 Zarr 内部。`episodes_processed/` 仅作为历史数据保护目录保留，当前流程直接从 raw 生成 Zarr。dry-run 同样检查目标路径。输入为单个异常 episode，或批量输入没有任何可接收 episode 时，返回失败。
-
-Legacy v30 的正式路径是 immutable v30 → 独立 `examples/migrate_raw_v30_to_v34.py` → Raw v34 → 正常 Zarr v15 exporter。先执行只读审计：
-
-    python examples/migrate_raw_v30_to_v34.py SOURCE_ROOT --output NEW_RAW_ROOT --dry-run --report REPORT_JSON
-
-实际迁移使用 `--evidence` 提供与源文件 SHA256 绑定、经过核实的动作/触觉/effort/几何及手部安装证据；没有证据时工具报告阻塞，不推测数值变换或安装位置。输出目录必须尚不存在。原始媒体不重编码、不重采样，坏 episode 保留完整 Raw，但不能通过删行或切段进入 Zarr。`pick_place_toy` 已按操作者补充证词迁移全部 61 段 Raw，并导出通过整段准入的 51 段 Zarr；证据边界、逐段结果和下游加载验收见 [PICK_PLACE_TOY_MIGRATION.md](PICK_PLACE_TOY_MIGRATION.md)。
 
 Raw v34 是稳定研究 contract；只有动作含义、核心 tensor 表示/顺序/形状或行对齐发生 breaking change 才升级版本。内部计时、日志和派生算法变化不要求升级 Raw。Policy Zarr 继续为 v15；只有 consumer-visible tensor contract 变化才考虑升级。
 

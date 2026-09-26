@@ -12,7 +12,11 @@ import numpy as np
 
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.recording.storage.reader import EpisodeReader
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
+from dexmani_real.sensor.camera.geometry import (
+    CameraIntrinsics,
+    RGBDGeometry,
+    validate_aligned_depth_distortion,
+)
 from dexmani_real.sensor.pointcloud import build_point_cloud
 
 
@@ -61,6 +65,7 @@ def load_raw_episode_camera_model(reader: EpisodeReader) -> RawEpisodeCameraMode
     if str(meta.get("camera_payload_mode", "")) != "depth_to_color_aligned_rgbd":
         raise ValueError("raw camera payload is not depth-to-color aligned RGB-D")
     color = _color_intrinsics_from_meta(meta)
+    validate_aligned_depth_distortion(color.distortion_model)
     geometry = RGBDGeometry(
         depth=color,
         color=color,

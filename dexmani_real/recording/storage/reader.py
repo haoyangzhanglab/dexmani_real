@@ -20,7 +20,7 @@ from dexmani_real.recording.storage.schema import (
     validate_data_layout,
 )
 from dexmani_real.recording.storage.video import VideoDecoder
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics
+from dexmani_real.sensor.camera.geometry import CameraIntrinsics, validate_aligned_depth_distortion
 
 
 class MergedH5File:
@@ -144,6 +144,7 @@ def _validate_color_camera_metadata(attrs: h5py.AttributeManager) -> None:
         distortion_model=_text_attr(attrs, "camera_color_distortion_model"),
         distortion_coeffs=tuple(float(value) for value in coefficients),
     )
+    validate_aligned_depth_distortion(intrinsics.distortion_model)
     if not np.allclose(matrix, intrinsics.matrix(), atol=1e-9, rtol=0.0):
         raise ValueError(
             "episode metadata camera_color_intrinsics is not a canonical pinhole matrix"

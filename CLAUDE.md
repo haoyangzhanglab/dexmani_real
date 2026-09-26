@@ -1,6 +1,7 @@
 # CLAUDE.md
 
-Follow [AGENTS.md](AGENTS.md) for repository safety, scope, and verification requirements.
-Use [README.md](README.md) for workflows; confirm implementation behavior from source and resolved configuration.
+Read [AGENTS.md](AGENTS.md) before editing or executing repository code. It is the shared source for scope, hardware safety, runtime and data contracts, and offline verification requirements.
 
-Keep Claude-specific guidance here only when needed; do not duplicate shared instructions or task plans.
+Use [README.md](README.md) for current operator workflows and configuration examples. Confirm behavior at the relevant source entry points and resolved configuration before changing it.
+
+Keep this file as the Claude entry point to those shared documents. Add only necessary Claude-specific guidance here; keep task plans, migration history, and temporary acceptance results out of standing instructions.
