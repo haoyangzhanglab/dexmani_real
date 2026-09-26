@@ -35,10 +35,8 @@ class ShutdownReport:
 def _finalize_shutdown_state(
     shared: Any,
     report: ShutdownReport,
-    *,
-    disarm_if_clean: bool,
 ) -> None:
-    """Latch physical failures, or disarm after a verified clean stop."""
+    """Latch physical failures, or disarm after verified terminal worker stop."""
     error_latched = bool(shared.error_state.value)
     estop_requested = bool(shared.estop_request.value)
     safety_state = int(shared.safety_state.value)
@@ -59,10 +57,9 @@ def _finalize_shutdown_state(
         transition(shared, SafetyState.FAULT)
         return
 
-    if disarm_if_clean and report.clean:
-        if not transition(shared, SafetyState.DISARMED):
-            shared.error_state.value = True
-            transition(shared, SafetyState.FAULT)
+    if not transition(shared, SafetyState.DISARMED):
+        shared.error_state.value = True
+        transition(shared, SafetyState.FAULT)
 
 
 def _close_runtime_channels(shared: Any) -> bool:
@@ -143,7 +140,6 @@ def shutdown_processes_verified(
     graceful_timeout_s: float = 5.0,
     terminate_timeout_s: float = 1.0,
     kill_timeout_s: float = 1.0,
-    disarm_if_clean: bool = False,
 ) -> ShutdownReport:
     """Stop workers, close verified IPC, and finalize physical safety."""
     frozen_exits = stop_processes_verified(
@@ -156,6 +152,6 @@ def shutdown_processes_verified(
 
     shared_closed = _close_runtime_channels(shared)
     report = ShutdownReport(frozen_exits, shared_closed=shared_closed)
-    _finalize_shutdown_state(shared, report, disarm_if_clean=disarm_if_clean)
+    _finalize_shutdown_state(shared, report)
     logger.debug("verified process shutdown: %s", report.exits)
     return report

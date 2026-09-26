@@ -184,7 +184,8 @@ class PolicyRunner:
             self._finish_episode(
                 reason.name.lower(),
                 abnormal=bool(
-                    self.shared.error_state.value
+                    not self.shared.is_running.value
+                    or self.shared.error_state.value
                     or self.shared.estop_request.value
                     or reason not in (RunEndReason.OPERATOR, RunEndReason.QUIT)
                 ),
@@ -318,6 +319,7 @@ class PolicyRunner:
                 reason = RunEndReason(int(self.shared.run_ended_reason.value))
                 normal_stop = (
                     failure is None
+                    and self.shared.is_running.value
                     and not self.shared.error_state.value
                     and not self.shared.estop_request.value
                     and reason in (RunEndReason.OPERATOR, RunEndReason.QUIT)

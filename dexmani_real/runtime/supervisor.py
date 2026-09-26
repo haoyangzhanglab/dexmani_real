@@ -89,7 +89,7 @@ class RuntimeSupervisor:
             time.sleep(0.02)
         return False
 
-    def shutdown(self, *, graceful_timeout_s=5.0, disarm_if_clean=False) -> ShutdownReport:
+    def shutdown(self, *, graceful_timeout_s=5.0) -> ShutdownReport:
         deadline = time.monotonic() + graceful_timeout_s
         if (
             self.shared.quit_requested.value
@@ -111,5 +111,4 @@ class RuntimeSupervisor:
             self.shared,
             self.started_processes,
             graceful_timeout_s=max(0.0, deadline - time.monotonic()),
-            disarm_if_clean=disarm_if_clean,
         )

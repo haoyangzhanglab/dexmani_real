@@ -142,7 +142,6 @@ def run_keyboard_experiment(runtime, *, no_hand):
         keys.quiesce()
         report = supervisor.shutdown(
             graceful_timeout_s=runtime.safety.shutdown_timeout_s,
-            disarm_if_clean=clean,
         )
         keys.stop()
     return int(

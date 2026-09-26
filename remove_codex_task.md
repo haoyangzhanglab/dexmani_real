@@ -623,7 +623,8 @@ Verify:
 - normal children + clean shutdown -> DISARMED and clean report;
 - nonphysical child crash -> failed session, no physical FAULT;
 - arm or hand child crash -> error_state + FAULT;
-- non-clean/unverified child shutdown -> FAULT and no unsafe shared-memory release;
+- confirmed nonphysical worker failure -> failed session with DISARMED after safe terminal shutdown;
+- physical worker failure -> FAULT; unverified child shutdown -> FAULT and no unsafe shared-memory release;
 - no shared replacement for workflow_failed.
 
 ### Recording failure propagation

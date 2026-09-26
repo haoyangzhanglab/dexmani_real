@@ -238,7 +238,6 @@ def run_policy_deployment(
                 )
                 raise RuntimeError("operator thread still uses channels; refusing SHM release")
         report = supervisor.shutdown(
-            disarm_if_clean=True,
             graceful_timeout_s=max(5.0, runtime.safety.shutdown_timeout_s),
         )
     return int(

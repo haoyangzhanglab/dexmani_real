@@ -78,7 +78,6 @@ def replay_episode(trajectory, runtime, config):
         keyboard.quiesce()
         report = supervisor.shutdown(
             graceful_timeout_s=runtime.safety.shutdown_timeout_s,
-            disarm_if_clean=outcome.successful,
         )
         keyboard.stop()
     if (

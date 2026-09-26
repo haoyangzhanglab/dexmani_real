@@ -176,7 +176,6 @@ def run_teleop_experiment(
         logger.exception("teleop session failed")
     finally:
         report = supervisor.shutdown(
-            disarm_if_clean=True,
             graceful_timeout_s=runtime.safety.shutdown_timeout_s,
         )
     return int(
