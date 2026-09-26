@@ -426,7 +426,7 @@ episode_valid and np.all(frame_valid)
 
 因此可以删除 `reader.require_valid(...)` 和 exporter 对 `had_pause` 的独立分支，但不能丢失 session-level invalid latch。
 
-### 4.3 provenance workflow classifier
+### 4.2 provenance workflow classifier
 
 删除复杂的 workflow classifier 对训练导出的依赖。
 
@@ -1149,11 +1149,10 @@ dexmani_real/dataset/pointcloud.py
 - `AGENTS.md`：只更新与本次 Raw/Zarr data contract 冲突的 Research data standing instructions；
 - README：稳定工作流与当前 schema；
 - `PICK_PLACE_TOY_MIGRATION.md`：
-
-- 明确 v33 migration 不再是目标；
-- canonical path 改为 v30→v34→Zarr v15；
-- 保留历史审计事实；
-- 不把未实际运行的 migration 写成已完成。
+  - 明确 v33 migration 不再是目标；
+  - canonical path 改为 v30→v34→Zarr v15；
+  - 保留历史审计事实；
+  - 不把未实际运行的 migration 写成已完成。
 
 ### 10.4 不得修改
 
@@ -1234,7 +1233,9 @@ dexmani_policy/*
 - wrong row count/shape/dtype rejected；
 - timestamps / VR / frame number 不再 required；
 - tactile NaN raw episode structurally可读；
-- RGB/depth count mismatch rejected；
+- depth count mismatch 在 Reader 结构校验阶段 rejected；
+- RGB file 缺失/空文件在 Reader 阶段 rejected；
+- RGB 实际 frame count / shape / dtype mismatch 在 whole-episode exporter streaming pass 中 rejected；
 - invalid camera calibration rejected；
 - unknown/typo canonical datasets 不被静默接受。
 
