@@ -250,7 +250,24 @@ num_frames
 episode_valid            # session-level validity latch
 ```
 
-`episode_valid` 用来承接 **不能由单个 row 表达的整段生命周期失败**，例如 abnormal stop、operator pause 后仍保存、recording/runtime failure。它替代当前 `technical_status + had_pause` 作为训练准入所需的最小 episode-level 事实；不要仅删除旧字段而丢失这一信息。
+`episode_valid` 用来承接 **不能由单个 row 表达的整段生命周期失败**，例如 abnormal stop、operator pause 后仍保存、recording/runtime failure、录制期间的 fixed-dt 连续性破坏。它替代当前 `technical_status + had_pause` 作为训练准入所需的最小 episode-level 事实；不要仅删除旧字段而丢失这一信息。
+
+v34 不再持久化以下非研究必需 episode metadata：
+
+```text
+operator
+wall_duration_s
+min_frames_met
+termination_reason
+camera_name
+camera_serial
+camera_type
+provenance_*
+```
+
+- `termination_reason`、operator 名称等若运行时仍有诊断价值，只进入日志 / `RecordingResult`，不进入 Raw schema。
+- 若删除后 `min_frames` / `min_record_duration_s` / operator 参数在 recording 路径中完全失去行为作用，应连同死 plumbing 一起删除，不保留“只为写 metadata”的参数。
+- `num_frames` 虽可由 arrays 推导，仍保留为廉价 finalization/integrity marker。
 
 RGB-D payload 的最小解释信息：
 
@@ -265,11 +282,27 @@ camera_T_xarm_base_from_color
 depth_scale
 ```
 
+v34 的 full-modality canonical Raw 只支持能够静态重建到 xArm base 的 **eye-to-hand** 相机：
+
+- recording START 前必须拿到非空 camera serial，并用它成功解析 calibration；
+- calibration entry 必须是 eye-to-hand；
+- live aligned RGB-D geometry 必须有效；
+- `depth_scale` 必须 finite 且 > 0；
+- `camera_T_xarm_base_from_color` 必须是 finite rigid transform；
+- 任一条件不满足，拒绝 START，不能只 warning 后继续录制。
+
+camera serial/name/type 只允许作为 START 时的临时 calibration lookup 输入；v34 只持久化最终解释 payload 所需的 aligned-color intrinsics/distortion、static base-from-color 和 depth scale。
+
+当前 eye-in-hand 若要支持，需要 exposure-time arm pose/timestamp 等新的持久化语义；在 v34 删除 per-frame camera timestamp 的设计下，不得静默接受 eye-in-hand。
+
 重建 fingertip geometry 时，**随真实物理 setup 变化且无法从图像/关节数据恢复的 hand mount calibration** 必须随 Raw 保存：
 
 ```text
-T_eef_handbase position + orientation
+handbase_position_eef_m
+handbase_quat_eef_wxyz
 ```
+
+这两个值必须在 recording START 时从该次实际 resolved runtime hand config 快照到 recorder，而不是等 Raw→Zarr 时再从“当前默认配置”读取。Reader 校验 finite、shape 和 quaternion normalization；Raw→Zarr fingertip derivation 必须使用 episode 自己的 hand mount。
 
 Raw 不保存 software provenance。以下内容均不进入 Raw episode metadata：
 
@@ -329,7 +362,24 @@ action_arm_ee
 
 这些信息仍永久存在于 immutable legacy source，用于历史审计；v34 不重复复制。
 
-### 3.6 不要删除 runtime correctness mechanisms
+### 3.6 Recording transport 也必须同步收敛
+
+v34 删除 persisted timestamp / diagnostics 后，不能只改 `data.h5` schema；controller→RecorderIO 的 shared-memory transport 和 writer 也必须同步删除死字段。
+
+最终要求：
+
+- `EpisodeFrame` 不再拥有 `timestamp_s`；
+- `build_episode_frame()` 只构造 v34 canonical data + RGB-D；
+- `make_record_sample_dtype()` 只包含 v34 row arrays + `camera_rgb` + `camera_depth`；
+- 删除 record-sample transport 的 `timestamp`；
+- 删除恒为 1 的 `camera_present`；`RecorderClient.add_frame()` 已要求每 row 必有 RGB-D；
+- `decode_record_sample()` 不再解释 timestamp/camera_present；
+- `EpisodeRecorder` 删除 `_last_timestamp_s`、persisted timestamp monotonic checks 和 timestamp row injection；
+- `EpisodeDataWriter.append()` 从任一 canonical batch array 推导 count，不得继续依赖 `data["timestamp"]`。
+
+record sample ring 的 sequence number 仍是 RecorderIO transport 完整性所必需的内部机制，不持久化，也不能删除。
+
+### 3.7 不要删除 runtime correctness mechanisms
 
 本任务删除的是 **持久化 schema / offline validation 依赖**，不是运行时安全与同步机制。
 
@@ -349,7 +399,7 @@ action_arm_ee
 
 不能仅删除检查后默认这种 episode 合格。
 
-### 3.7 Raw reader / schema validator
+### 3.8 Raw reader / schema validator
 
 `EpisodeReader` 只支持 v34。
 
@@ -382,7 +432,9 @@ Reader **不做**：
 - tactile finite判定；
 - FK / point-cloud derivation。
 
-### 3.8 schema extensibility
+删除依赖 persisted `timestamp` 的 `EpisodeTiming` wall/grid-span 计算。需要 nominal replay/training rate 的 consumer 直接读取 `control_hz`；可以保留一个简单的 `control_hz` / `dt` property，但不要重新创造 timing abstraction。
+
+### 3.9 schema extensibility
 
 不要再用“任何未知 runtime/debug dataset 都意味着新 schema version”的模式。
 
@@ -417,11 +469,16 @@ episode_valid
 规则：
 
 - episode START 时初始化为 true；
+- `episode_valid` 是 **monotonic false latch**：同一 episode 内一旦变 false，任何后续路径都不得恢复 true；
 - abnormal stop / hardware/runtime/recording failure → false；
-- operator pause 发生后如果该 physical episode 仍被保存 → false；
+- operator/sensor pause 发生后如果该 physical episode 仍被保存 → false；
+- active recording 中发生 fixed-dt control/sample continuity violation → false；
+- 正常 control target 计算成功但 command publication 因 motion authority/run_id 被拒绝，而 recording 随后仍继续 → false；
 - normal uninterrupted operator save → true；
 - clean discard 不发布 episode；
-- termination reason 可以作为 optional diagnostic metadata 保留，但不作为 schema/admission 状态机。
+- termination reason 只进入日志/`RecordingResult`，不持久化为第二套状态机。
+
+在 `RecorderClient -> StopRecording -> RecorderIO -> EpisodeRecorder` 边界上只传递最终 `episode_valid`。优先提供一个单向 `invalidate_episode()` 或等价的单调写法，替代到处分散修改 `technical_status/had_pause`。
 
 Zarr 准入要求：
 
@@ -431,7 +488,29 @@ episode_valid and np.all(frame_valid)
 
 因此可以删除 `reader.require_valid(...)` 和 exporter 对 `had_pause` 的独立分支，但不能丢失 session-level invalid latch。
 
-### 4.2 provenance workflow classifier
+
+### 4.2 fixed-dt 连续性必须在删除 timestamps 前前移到 runtime
+
+当前 v33 exporter 通过 persisted `observation_timestamp_ns/action_timestamp_ns` 拒绝超过两个 nominal periods 的 gap。v34 删除这些 timestamp 后，不能简单假定：
+
+```text
+logical_time = frame_index / control_hz
+```
+
+就等价于真实 fixed-dt demonstration。
+
+必须保留同等的研究正确性：
+
+- control owner / recording owner 使用 **仅运行时存在的 monotonic time** 监测连续有效 recording rows 的间隔；
+- 在同一个 active physical episode 中，如果相邻成功 demonstration rows 的真实间隔超过当前明确允许的阈值（默认沿用旧语义：> 2 nominal periods），则 latch `episode_valid=False`；
+- sensor pause/resume 已由 lifecycle 直接 invalidate，不需要再靠离线 timestamps 重建；
+- command publication 被拒绝后若 episode 立即正常结束，可以没有 fake row；若 recording 继续，则必须 invalidate，防止把缺失 control step 压缩成固定 dt；
+- 不为了维持 row 数生成 synthetic/held/fake action；
+- 该 monotonic timestamp 只用于 runtime 判定，不写入 Raw。
+
+只有这一 runtime continuity invariant 已经实现并有 offline check 后，才能删除 v33 persisted timestamp admission。
+
+### 4.3 collection_source 取代 provenance workflow classifier
 
 删除复杂的 workflow classifier 对训练导出的依赖。
 
@@ -440,6 +519,17 @@ Raw 只保留一个简单、明确的：
 ```text
 collection_source
 ```
+
+删除 recording 栈中的 generic `provenance: Mapping[str,str]`、`normalize_provenance_metadata()` 和全部 `provenance_*` 写盘逻辑。
+
+当前固定 source 值：
+
+```text
+teleop
+policy_rollout
+```
+
+teleop session 直接把 `collection_source="teleop"` 传给 recorder；policy deployment 传 `"policy_rollout"`。policy selector、checkpoint、seed、inference_steps、pointcloud config 等不写入 Raw。
 
 当前 Zarr v15 exporter 只接受已证明满足当前：
 
@@ -620,6 +710,30 @@ tactile_force_spatial_geometry_verified
 
 保持现有 `StaticSemanticsMismatch` 或等价的轻量机制。
 
+
+### 5.7 被删除 Raw 字段的仓库内 consumer 必须同步迁移
+
+本任务不是只改 recorder/exporter。所有直接消费被删除字段的当前代码都必须迁到 v34 contract，不能留一个“能写 v34、但仓库工具打不开”的半成品。
+
+至少包括：
+
+- `dexmani_real/replay/trajectory.py`
+  - 不再调用 `reader.require_valid()`；
+  - 不再读取 `provenance_workflow` / `flag_frame_status` / `reader.timing`；
+  - physical replay 要求 `collection_source == "teleop"`、`episode_valid=True`、`all(frame_valid)`、finite state/action；
+  - replay rate 直接来自 Raw `control_hz`。
+- `examples/visualize_episode.py`
+  - 删除 timestamp、旧 frame/camera flags、`min_frames_met` 展示依赖；
+  - frame quality 只显示 `frame_valid` / `episode_valid`；
+  - fingertip visualization 使用 Raw episode 的 hand mount，而不是当前 `ProcessingConfig` 默认 mount。
+- `dexmani_real/recording/__init__.py`
+  - 若 `EpisodeTiming` 删除，同步删除 export。
+- `dexmani_real/dataset/provenance.py`
+  - collection source 替代后若无其它真实 consumer，删除该模块，不保留 compatibility wrapper。
+
+全仓搜索所有被删除字段的 producer/consumer，不能只依赖上面清单。
+
+
 ---
 
 ## 6. Zarr whole-episode admission：从复杂 runtime proof 简化为研究必要检查
@@ -690,10 +804,10 @@ reject whole episode
 
 ### 6.5 静态 calibration / kinematics 可解释
 
-必须能用 Raw 中 pin 的真实研究 metadata 构造：
+必须能用 Raw 中保存的真实物理 metadata 和 exporter 当前显式配置构造：
 
-- camera model；
-- `T_xarm_base_from_color`；
+- aligned color-grid camera model；
+- static `T_xarm_base_from_color`；
 - depth scale；
 - arm FK；
 - XHand FK；
@@ -1121,19 +1235,37 @@ output_hashes
 
 Codex 实施前先搜索实际引用，再按依赖拓扑改，不要盲删。
 
-### 10.1 必改
+### 10.1 必改 / 必审查
 
 ```text
 dexmani_real/recording/storage/schema.py
 dexmani_real/recording/storage/reader.py
+dexmani_real/recording/storage/hdf5_writer.py
 dexmani_real/recording/frame.py
+dexmani_real/recording/client.py
+dexmani_real/recording/io_worker.py
+dexmani_real/recording/recorder.py
+dexmani_real/ipc/schema.py
+
+dexmani_real/teleop/control/controller.py
+dexmani_real/teleop/runner.py
+dexmani_real/teleop/session.py
+dexmani_real/deployment/runner.py
+dexmani_real/deployment/session.py
+
 dexmani_real/dataset/processing.py
 dexmani_real/dataset/contracts.py
 dexmani_real/dataset/export.py
 dexmani_real/dataset/pointcloud.py
+
+dexmani_real/replay/trajectory.py
+dexmani_real/recording/__init__.py
+examples/visualize_episode.py
 ```
 
-以及所有直接构造 `EpisodeFrame` / Raw meta / current source row 的 recorder/controller code。
+以及全仓所有直接构造 `EpisodeFrame`、record sample ring dtype、Raw meta、被删除字段或 current source row 的代码。
+
+`dexmani_real/dataset/provenance.py` 在 consumer 迁移完成后若无引用应删除。
 
 ### 10.2 Runtime observation / command code
 
@@ -1187,16 +1319,23 @@ dexmani_policy/*
 4. 追 `pick_place_toy` action lineage。
 5. 追 tactile 0.1 scale / bias lineage。
 6. 追 arm_tau、camera calibration、kinematics / hand mount。
-7. 把无法证明的项目写成明确 blocker，不猜。
+7. 审查 recording transport：EpisodeFrame、record_sample_ring、RecorderClient、RecorderIO、EpisodeRecorder、HDF5 writer 的字段闭包。
+8. 审查所有被删除 Raw 字段的仓库内 consumer（replay / visualizer / helpers）。
+9. 确认 fixed-dt gap 判定能在删除 persisted timestamps 前由 runtime episode_valid latch 接管。
+10. 把无法证明的项目写成明确 blocker，不猜。
 
 ### Phase B — Raw v34
 
 1. 修改 schema。
-2. 修改 frame serialization。
+2. 同步修改 EpisodeFrame、record_sample_ring dtype、RecorderClient/RecorderIO transport 和 HDF5 writer，彻底移除 persisted timestamp/camera_present 依赖。
 3. 让 native recorder生成 `frame_valid`。
-4. 简化 reader。
-5. 保留 runtime safety/synchronization。
-6. 运行 focused one-off v34 round-trip smoke checks。
+4. 将 technical_status + had_pause 收敛为 monotonic `episode_valid`，并加入 runtime fixed-dt continuity latch。
+5. recording START fail-closed 验证 eye-to-hand camera calibration/depth geometry。
+6. snapshot 并持久化本次 physical `T_eef_handbase`。
+7. 简化 reader，删除 EpisodeTiming persisted-timestamp 语义。
+8. 同步迁移 replay / visualizer 等 Raw consumers。
+9. 保留 runtime safety/synchronization/ring sequence/atomic publication。
+10. 运行 focused one-off v34 round-trip smoke checks。
 
 ### Phase C — Raw→Zarr v15
 
@@ -1231,11 +1370,13 @@ dexmani_policy/*
 
 遵循 `AGENTS.md`：不新增 committed `tests/` 目录，不恢复庞大 smoke-suite。使用临时 Python 脚本、one-off assertions、migrator `--dry-run` 和现有公共 contract 完成以下 focused offline checks。
 
-### 12.1 Raw schema smoke checks
+### 12.1 Raw schema / recording transport smoke checks
 
 必须覆盖：
 
 - valid v34 accepted；
+- record_sample ring dtype 不含 persisted `timestamp` / `camera_present` / v33 diagnostics；
+- EpisodeFrame/HDF5 writer 不再依赖 timestamp；
 - missing each required dataset rejected；
 - wrong row count/shape/dtype rejected；
 - timestamps / VR / frame number 不再 required；
@@ -1243,7 +1384,9 @@ dexmani_policy/*
 - depth count mismatch 在 Reader 结构校验阶段 rejected；
 - RGB file 缺失/空文件在 Reader 阶段 rejected；
 - RGB 实际 frame count / shape / dtype mismatch 在 whole-episode exporter streaming pass 中 rejected；
+- recording START 对缺失 camera serial、未解析 calibration、非 eye-to-hand、invalid depth scale/geometry fail closed；
 - invalid camera calibration rejected；
+- Raw hand mount 正确 snapshot、Reader 校验、fingertip derivation 使用 Raw mount；
 - unknown/typo canonical datasets 不被静默接受。
 
 ### 12.2 `frame_valid / episode_valid` smoke checks
@@ -1257,7 +1400,10 @@ dexmani_policy/*
 - camera invalid/freshness failure → false；
 - tactile invalid alone不应偷偷改变 core `frame_valid`，但 full Zarr export 会拒绝；
 - abnormal stop → episode_valid=false；
-- pause 后仍保存 → episode_valid=false。
+- pause 后仍保存 → episode_valid=false；
+- active episode 中相邻有效 recording rows gap > 2 nominal periods → episode_valid=false；
+- command publication 被拒绝后 recording 若继续 → episode_valid=false；
+- episode_valid 一旦 false，后续正常 row/STOP 不能恢复 true。
 
 ### 12.3 Whole-episode Zarr smoke checks
 
@@ -1290,7 +1436,18 @@ dexmani_policy/*
 - no fake timestamp fields；
 - no legacy diagnostic fields in v34。
 
-### 12.5 `pick_place_toy` local acceptance
+
+### 12.5 Raw consumer smoke checks
+
+至少覆盖：
+
+- v34 `load_trajectory()` 仅接受 teleop + episode_valid + all(frame_valid)；
+- replay fps 直接来自 `control_hz`；
+- visualizer/info 不引用 timestamp、old status/camera flags、min_frames_met；
+- visualizer fingertip geometry 使用 Raw hand mount；
+- 全仓无 `reader.require_valid` / `provenance_workflow` / `flag_frame_status` 等 v34 dead dependency（legacy migrator/历史文档除外）。
+
+### 12.6 `pick_place_toy` local acceptance
 
 如果本机有真实数据：
 
@@ -1449,10 +1606,17 @@ Raw v34 本身不是 v16 理由。
 只有以下全部满足才算完成：
 
 - [ ] Raw v34 只有精简后的 canonical research arrays；v33 runtime trace fields 不再持久化。
-- [ ] Native recorder 的 `frame_valid` 与 episode-level `episode_valid` 语义均通过 focused offline checks。
-- [ ] Runtime freshness / causal / safety 没有因 storage 简化而降低。
-- [ ] `EpisodeReader` 只负责 v34 结构验证，不承担 training admission。
+- [ ] Recording shared-memory transport / EpisodeFrame / HDF5 writer 同步去除 persisted timestamp、camera_present 和 v33 dead fields。
+- [ ] Native recorder 的 `frame_valid` 与 monotonic episode-level `episode_valid` 语义均通过 focused offline checks。
+- [ ] 删除 persisted timestamps 前，fixed-dt gap / skipped-publication continuity 已由 runtime episode_valid latch 接管。
+- [ ] Runtime freshness / causal / safety / ring-sequence cutoff / atomic publication 没有因 storage 简化而降低。
+- [ ] New v34 recording START 对完整 eye-to-hand camera calibration fail closed。
+- [ ] 每个 native v34 Raw snapshot 并保存真实 `T_eef_handbase`，Zarr/visualizer fingertip derivation 不读取当前默认 mount。
+- [ ] `EpisodeReader` 只负责 v34 结构验证，不承担 training admission，也不依赖 persisted timestamp。
 - [ ] 正常 reader 没有 legacy v30 分支。
+- [ ] Replay / visualizer / helpers 已迁移到 v34，不再引用被删除 Raw 字段。
+- [ ] Generic recording `provenance_*` machinery 已删除，Raw 只保留 `collection_source`。
+- [ ] operator/wall_duration/min_frames/termination reason/camera identity 等非研究必需 metadata 不再进入 v34 Raw。
 - [ ] Policy Zarr 保持 schema v15。
 - [ ] Policy Zarr 保持完整多模态全集。
 - [ ] Zarr exporter 对坏 Raw episode 整段拒绝，无 partial row/segment salvage。
@@ -1478,6 +1642,7 @@ Raw v34 本身不是 v16 理由。
 ```text
 runtime:
     负责 causal / freshness / safety / publication correctness
+    + active episode fixed-dt continuity / session validity latch
 
 Raw v34:
     保存不可再生研究事实
