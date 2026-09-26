@@ -271,13 +271,18 @@ depth_scale
 T_eef_handbase position + orientation
 ```
 
-不要把所有软件资产都升级成 Raw required schema。xArm/XHand model/URDF、ordered fingertip link names、producer git SHA 等属于软件/processing provenance：
+Raw 不保存 software provenance。以下内容均不进入 Raw episode metadata：
 
-- 若已有低成本 metadata，可保留为 optional provenance；
-- 历史迁移必须在 migration report / explicit ProcessingConfig 中 pin；
-- 不要求每个 v34 episode 都重复保存 URDF content hash / git SHA 才能被 Reader 打开。
+```text
+URDF/model identity or hash
+producer git SHA
+fingertip link configuration
+processing code/version identifiers
+```
 
-这样 Raw 保存物理标定，软件模型版本由代码版本和导出配置负责，不把 provenance 机制重新膨胀成 schema。
+这些属于当前代码/配置，而不是实验观测事实。不要因为“可复现”再建立额外 software provenance 字段或 hash 体系。
+
+Raw 只保存无法从实验之外恢复、且直接影响数值解释的真实物理标定，例如 camera calibration 和 `T_eef_handbase`。
 
 ### 3.5 Raw v34 不再要求/持久化的逐帧字段
 
@@ -693,9 +698,11 @@ reject whole episode
 - arm FK；
 - XHand FK；
 - Raw 中记录的 hand mount calibration；
-- explicit ProcessingConfig / tracked model assets 中的 fingertip link mapping。
+- exporter 当前显式提供的 processing configuration。
 
-`T_eef_handbase` 必须从该 Raw episode 的物理标定读取，不要从“当前默认 runtime”静默补历史值。URDF / fingertip link names 则由明确的 processing/code version 提供，不要求复制进每个 Raw episode。
+`T_eef_handbase` 必须从该 Raw episode 的物理标定读取，不要从“当前默认 runtime”静默补历史值。
+
+URDF、model hash、git SHA、fingertip link 配置都不写入 Raw，也不建立额外 provenance 记录。若 exporter 计算 fingertip geometry 需要 link names，它们只作为运行时配置使用；最终 Zarr 仅保留当前 `dexmani_policy` contract 硬要求的最小 tensor 解释字段。
 
 ### 6.6 全部 derived modalities 成功
 
@@ -846,10 +853,11 @@ with fixed finger/sensor/axis ordering and unknown-SI unit
 
 - old `arm_tau` 与 current `arm_effort` 的来源和数值语义；
 - historical camera geometry/depth scale；
-- arm model；
-- XHand model/URDF；
+- 当前 exporter 所使用的 arm / hand FK 实现能够正确解释这批 joint state；
 - hand mount；
-- fingertip link ordering。
+- fingertip geometry 所需的当前配置可用。
+
+这里的 URDF / link 配置只用于执行 deterministic FK，不作为 Raw 或 migration report 的持久化 provenance。
 
 只要能证明 deterministic equivalence，可以规范化；不能证明则 fail closed。
 
@@ -1083,12 +1091,11 @@ source_root
 output_root
 source_schema
 target_schema
-source_commit/lineage evidence
-migration_tool_git_sha
+lineage evidence summary
 action_mapping
 tactile_normalization
 camera_normalization
-kinematic provenance
+physical calibration decisions
 ```
 
 每 episode：
@@ -1369,7 +1376,7 @@ derive(raw RGB-D,
 对于历史 `pick_place_toy`：
 
 - camera geometry 使用 raw/legacy 真实 metadata；
-- hand mount 使用 Raw v34 中该 episode 自己的物理标定；URDF / fingertip links 使用已经追溯确认的 explicit processing/code version；
+- hand mount 使用 Raw v34 中该 episode 自己的物理标定；URDF / fingertip links 仅作为 exporter 当前配置使用，不写入 Raw 或 migration provenance；
 - table plane 无法证明时，优先显式 `remove_table=False`，而不是套当前 table plane；
 - 一旦选择 processing config，同一个 Zarr 的 point-cloud tensor semantics必须统一；
 - Zarr 不需要重复保存每 episode camera calibration / table plane descriptive provenance。
