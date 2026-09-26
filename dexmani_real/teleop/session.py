@@ -42,17 +42,6 @@ def validate_task_name(value: str) -> str:
     return value
 
 
-def validate_operator(value: str) -> str:
-    """Validate optional operator metadata against the recorder IPC boundary."""
-    if not isinstance(value, str):
-        raise ValueError("operator must be a string")
-    try:
-        value.encode("utf-8")
-    except UnicodeError as exc:
-        raise ValueError("operator must be valid UTF-8 text") from exc
-    return value
-
-
 def _validate_recording_resources() -> None:
     """Ensure files needed by recording and FK workers exist before startup."""
     required = (
@@ -73,14 +62,12 @@ def _build_processes(
     *,
     repo_root: Path,
     task_name: str,
-    operator: str,
     hand_enabled: bool,
     recording_enabled: bool,
 ) -> list[Any]:
     policy_config = TeleopConfig(
         runtime,
         task_label=task_name,
-        operator=operator,
     )
     processes = [
         context.Process(name="arm", target=run_arm_worker, args=(shared, runtime.arm)),
@@ -96,13 +83,9 @@ def _build_processes(
             camera_calibration=camera_calibration,
             data_dir=str(repo_root / policy_config.runtime.policy.episodes_dir / task_name),
             control_hz=policy_config.runtime.teleop.control_hz,
-            min_frames=int(
-                round(
-                    policy_config.runtime.policy.min_record_duration_s
-                    * policy_config.runtime.teleop.control_hz
-                )
-            ),
-            provenance={"workflow": "teleop"},
+            collection_source="teleop",
+            handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
+            handbase_quat_eef_wxyz=runtime.hand.T_eef_handbase_quat_wxyz,
         )
         processes.append(
             context.Process(
@@ -123,10 +106,8 @@ def _build_processes(
     return processes
 
 
-def run_teleop_experiment(
-    runtime, *, task_name=DEFAULT_TASK_NAME, operator="", allow_no_hand=False
-):
-    task_name, operator = validate_task_name(task_name), validate_operator(operator)
+def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, allow_no_hand=False):
+    task_name = validate_task_name(task_name)
     if not runtime.policy.hand_enabled and (runtime.policy.recording_enabled or not allow_no_hand):
         raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")
     if runtime.policy.recording_enabled:
@@ -158,7 +139,6 @@ def run_teleop_experiment(
             runtime,
             repo_root=repo_root,
             task_name=task_name,
-            operator=operator,
             hand_enabled=runtime.policy.hand_enabled,
             recording_enabled=runtime.policy.recording_enabled,
         )

@@ -27,13 +27,13 @@ Teleop、键盘控制和 policy 分别使用各自的控制周期，replay 使�
 
 | 工作流 | 命令 | 说明 |
 |---|---|---|
-| VR collection | `python examples/collect_teleop.py --config experiment.yaml --task-name <task> --operator <name>` | 真机；raw episode |
+| VR collection | `python examples/collect_teleop.py --config experiment.yaml --task-name <task>` | 真机；raw episode |
 | Keyboard jog / home | `python examples/keyboard_teleop.py --config experiment.yaml` | 真机 |
 | Physical replay | `python examples/replay_episode.py <episode> --config experiment.yaml` | 真机 |
 | Policy rollout | `python examples/run_policy.py <policy/task/experiment> --config experiment.yaml` | 真机；evaluation session |
 | Camera calibration | `python examples/calibrate_camera.py --config experiment.yaml --hand-geometry absent` | 真机；仅在手已拆除时用 `absent`，固定在 home 的手用 `secured-home` |
 | VR heading calibration | `python examples/calibrate_vr_heading.py` | VR / HTS |
-| Canonical Zarr export | `python examples/export_policy_zarr.py episodes/<task>` | 离线 |
+| Canonical Zarr export | `python examples/export_policy_zarr.py episodes/<task> --config export.yaml` | 离线 |
 | XHand diagnostics | `python examples/xhand_diagnostics.py` | 连接真机；诊断 |
 | RGB-D diagnostics | `python examples/realsense_record_example.py` | 连接相机；实时 RGB-D / 点云显示 |
 | Point-cloud diagnostics | `python examples/pointcloud_process_example.py` | 连接相机；点云检查与可选桌面标定，`--save-dir` 保存诊断快照 |
@@ -43,7 +43,7 @@ Teleop、键盘控制和 policy 分别使用各自的控制周期，replay 使�
 
 键盘控制使用 WASD/方向键和 IJKL 微调，R 执行 planned HOME，Q 退出，ESC 急停。下节的 B/C/S/D/H 按键用于 VR teleop。
 
-物理回放只接受当前 raw schema 的 teleop episode；加载时拒绝失败控制行、空轨迹或非有限的动作/机器人状态。启动前需在操作者监督下将机器人置于录制起始姿态附近：机械臂和手部每个关节的误差均不得超过 10°，机械臂按限位内等价角比较。回放按录制频率逐条发布目标，Q 停止并保留已采集数据，结束后的 H 执行机器人 planned HOME。默认输出为 `replay_results/<episode_name>_replay/`，`--output` 必须指向不存在或为空的目录；采集到数据后保存 `replay_data.npz` 并计算一致性指标 `metrics.json`。
+物理回放只接受 Raw v34 的 teleop episode；加载时拒绝 `episode_valid=false`、失败控制行、空轨迹或非有限的动作/机器人状态。启动前需在操作者监督下将机器人置于录制起始姿态附近：机械臂和手部每个关节的误差均不得超过 10°，机械臂按限位内等价角比较。回放按录制频率逐条发布目标，Q 停止并保留已采集数据，结束后的 H 执行机器人 planned HOME。默认输出为 `replay_results/<episode_name>_replay/`，`--output` 必须指向不存在或为空的目录；采集到数据后保存 `replay_data.npz` 并计算一致性指标 `metrics.json`。
 
 ## Teleop 与录制
 
@@ -61,7 +61,7 @@ Teleop 默认录制，显式无录制调试使用 `--no-record`。无手调试�
 
 录制中按 Q 后，可用 S 保存、D 丢弃，或 H 保存并回 home，然后退出。超过 `policy.quit_save_timeout_s` 未选择时，尝试保存为异常 episode 后退出。
 
-暂停撤销当前动作权限，恢复时从新鲜的机器人与 VR 观测重新锚定。发生暂停或控制异常的 episode 可保留用于诊断，但不作为 clean training demonstration 导出。
+C 暂停或传感器失效触发的暂停会撤销当前动作权限，并使当前 episode 失效；恢复时从新鲜的机器人与 VR 观测重新锚定。此类 episode 或包含控制异常的 episode 可保留用于诊断，但不能导出为训练数据。Q 终止录制后等待保存/丢弃选择期间不再写入控制行，等待本身不会使 episode 失效。
 
 录制依赖相机与录制 worker。已启动的必需 worker 意外退出或必需录制资源失效时，会撤销动作权限并结束会话，CLI 返回非零。相机、VR、点云、录制或 policy 进程失败属于实验失败；arm/hand 故障、急停或无法确认子进程停止按物理 FAULT 处理。
 
@@ -83,21 +83,42 @@ xArm 与 XHand HOME 均以实测收敛判断完成。XHand 默认要求连续三
 
 ## 数据与训练缓存
 
-Raw episode 是实验 source of truth，保留机器人状态、RGB-D 与标定、XHand 电流/触觉及其有效性、VR 源数据、真实时间戳、绝对动作目标和必要诊断。控制与录制复用当前观测快照，各模态按自身时间戳检查新鲜度。
+Raw v34 是实验 source of truth，保留机器人状态、RGB-D、XHand 电流/触觉、最终发布的绝对关节目标、`frame_valid`、`episode_valid` 和真实物理标定。无效触觉用 NaN 表达；运行时仍分别保留 aggregate/dense validity。控制与录制复用同一观测快照，新鲜度、因果选择、动作发布时间及连续性检查保留在 runtime，不再写入 Raw。
 
-每个已发布 episode 包含 `data.h5`（控制行与元数据）、`depth.h5`（对齐到彩色图像的原始深度）和 `rgb.mp4`。深度值乘以相机提供的 `depth_scale` 才得到米。当前 raw schema 为 33，读取时要求版本完全匹配；旧布局需在仓库外显式迁移。
+每个已发布 episode 包含 `data.h5`（控制行与元数据）、`depth.h5`（对齐到彩色图像的原始深度）和 `rgb.mp4`。深度值乘以相机提供的 `depth_scale` 才得到米。当前 Raw schema 为 34，正常 reader 只接受 v34；历史布局通过独立离线工具迁移。Raw 不保存 VR 源数据、逐帧时间戳、详细状态枚举、operator 或软件 provenance。
 
-Raw 先写入 `.tmp_<episode_name>`，关闭文件并通过结构验证后，才经 fsync 和原子重命名持久化发布。录制失败时释放 writer 并删除本次 staging；清理失败只记录错误并留下原目录，不覆盖原始录制异常。启动时发现残留 staging 只警告，需人工检查处理，不自动删除或恢复。
+录制 START 必须由当前相机 serial 成功解析完整 eye-to-hand 标定，并验证 live aligned RGB-D 几何、depth scale 和静态 base-from-color 变换；缺失或 eye-in-hand 均拒绝录制。Raw 仅保存彩色像素网格的内参与畸变、静态相机外参和深度尺度，并快照该次 resolved hand mount。离线指尖 FK 和可视化只能使用 episode 自己的 mount。
+
+`frame_valid` 表示正常控制解及其目标成功进入命令发布边界，不表示设备 ACK、到达或触觉有效。控制失败行仍保留，未发布目标可为 NaN。`episode_valid` 在一次 episode 中只能从 true 变为 false：暂停、异常终止、录制失败、相邻正常行的观测/发布时间间隔超过两个控制周期，或拒绝发布后仍继续录制，都会失效。终止时等待保存/丢弃选择本身不会使 clean episode 失效。
+
+Raw 先写入 `.tmp_<episode_name>`，关闭文件并通过结构验证后，才经 fsync 和原子重命名持久化发布。录制失败时尝试释放 writer 并删除本次 staging；无法确认资源释放或清理失败时保留目录及 ownership，并拒绝新的 START，不覆盖原始录制异常。启动时发现残留 staging 只警告，需人工检查处理，不自动删除或恢复。
 
 Canonical Zarr 是从 raw 重建的全量训练缓存，包含 learning-relevant modalities；`dexmani_policy` 在加载时选择模型输入。点云、FK 和 fingertips 在离线转换时生成，Zarr 不保存 runtime timing arrays 或 validity masks。`action` 与 `action_ee` 表示同一个最终目标，分别使用关节和末端空间描述。
 
 Raw-to-Zarr 按完整 episode 接收或拒绝，不修复、切分、重采样或删除坏行。暂停、异常控制行、触觉无效、录制不完整或转换失败等情况会整条拒收并报告原因。批量导出可继续处理其他正常 episodes，但必须汇总拒绝原因。
 
+导出必须显式提供 `--config export.yaml`，library 调用必须提供 `ProcessingConfig`。历史桌面平面无法证明时使用：
+
+```yaml
+pointcloud:
+  remove_table: false
+```
+
+需要去桌面时，在同一个配置中显式设置 `environment.table.plane_path: null` 和经过核实的 `environment.table.plane_abcd`；导出不会读取今天的默认桌面标定文件。点云算法参数使用该配置的 resolved 值，完整写入 Zarr；hand mount 始终来自 Raw。
+
 导出默认写入 `datasets/<task_name>.zarr`，可用 `--output` 指定新目标。`--dry-run` 执行相同的完整转换与校验而不创建 Zarr，仍需相应的运动学和点云依赖。
 
 Zarr 在目标父目录下写入 staging，完成后再次确认目标未占用，再在同一文件系统内重命名发布。它是可从 raw 重建的缓存，不逐块 fsync；导出失败时清理本次 staging，raw 保持不变。
 
-导出拒绝覆盖已有目标；解析符号链接后，目标不能位于输入目录、仓库的 `episodes/`、`episodes_processed/`、`rollouts/` 或已有 Zarr 内部。`episodes_processed/` 仅作为历史数据保护目录保留，当前流程直接从 raw 生成 Zarr。dry-run 同样检查目标路径。单个异常 episode 或没有可接收 episode 时返回失败。
+导出拒绝覆盖已有目标；解析符号链接后，目标不能位于输入目录、仓库的 `episodes/`、`episodes_processed/`、`rollouts/` 或已有 Zarr 内部。`episodes_processed/` 仅作为历史数据保护目录保留，当前流程直接从 raw 生成 Zarr。dry-run 同样检查目标路径。输入为单个异常 episode，或批量输入没有任何可接收 episode 时，返回失败。
+
+Legacy v30 的正式路径是 immutable v30 → 独立 `examples/migrate_raw_v30_to_v34.py` → Raw v34 → 正常 Zarr v15 exporter。先执行只读审计：
+
+    python examples/migrate_raw_v30_to_v34.py SOURCE_ROOT --output NEW_RAW_ROOT --dry-run --report REPORT_JSON
+
+实际迁移使用 `--evidence` 提供与源文件 SHA256 绑定、经过核实的动作/触觉/effort/几何及手部安装证据；没有证据时工具报告阻塞，不推测数值变换或安装位置。输出目录必须尚不存在。原始媒体不重编码、不重采样，坏 episode 保留完整 Raw，但不能通过删行或切段进入 Zarr。`pick_place_toy` 已按操作者补充证词迁移全部 61 段 Raw，并导出通过整段准入的 51 段 Zarr；证据边界、逐段结果和下游加载验收见 [PICK_PLACE_TOY_MIGRATION.md](PICK_PLACE_TOY_MIGRATION.md)。
+
+Raw v34 是稳定研究 contract；只有动作含义、核心 tensor 表示/顺序/形状或行对齐发生 breaking change 才升级版本。内部计时、日志和派生算法变化不要求升级 Raw。Policy Zarr 继续为 v15；只有 consumer-visible tensor contract 变化才考虑升级。
 
 ## Policy evaluation
 

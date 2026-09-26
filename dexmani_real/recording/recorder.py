@@ -1,23 +1,16 @@
-"""Serialize each controller sample as one raw episode row.
-
-Coordinate RGB-D sidecars and HDF5 writes, verify closed files, then publish
-atomically. EpisodeDataWriter writes data.h5; samples arrive as EpisodeFrame rows.
-"""
+"""Serialize Raw v34 control rows and publish completed episodes atomically."""
 
 from __future__ import annotations
 
-__all__ = ["EpisodeRecorder", "EpisodeFinalizationError", "normalize_provenance_metadata"]
+__all__ = ["EpisodeRecorder", "EpisodeFinalizationError"]
 
 import shutil
 import time
-from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
 
 import h5py  # type: ignore[import-untyped]
 import numpy as np
 
-from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.hardware import CameraParams
 from dexmani_real.recording.frame import EpisodeFrame
 from dexmani_real.recording.storage.camera_writer import (
@@ -28,8 +21,6 @@ from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
 from dexmani_real.recording.storage.schema import (
     DATASET_SPECS,
     EPISODE_SCHEMA_VERSION,
-    SOURCE_FRAME_DATASET_NAMES,
-    validate_data_layout,
 )
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.utils.atomic_io import atomic_publish
@@ -39,41 +30,9 @@ logger = get_logger(__name__)
 
 # Defensive storage ceiling; normal episode budgets belong to the control owner.
 HARD_MAX_RECORD_FRAMES: int = 10_000
-_MAX_PROVENANCE_VALUE_BYTES = 4096
-
-
-def normalize_provenance_metadata(
-    provenance: Mapping[str, object] | None,
-) -> dict[str, str]:
-    """Validate scalar episode provenance attributes.
-
-    The ``provenance_*`` namespace cannot override schema or camera metadata.
-    """
-    if provenance is None:
-        return {}
-    if not isinstance(provenance, Mapping):
-        raise TypeError("provenance must be a mapping of string keys and values")
-
-    normalized: dict[str, str] = {}
-    for key, value in provenance.items():
-        if (
-            not isinstance(key, str)
-            or not key
-            or not key.isascii()
-            or not key.isidentifier()
-            or key.startswith("provenance_")
-        ):
-            raise ValueError(
-                "provenance keys must be non-empty ASCII identifiers without the provenance_ prefix"
-            )
-        if not isinstance(value, str):
-            raise TypeError("provenance values must be strings")
-        if len(value.encode("utf-8")) > _MAX_PROVENANCE_VALUE_BYTES:
-            raise ValueError(
-                f"provenance values must be at most {_MAX_PROVENANCE_VALUE_BYTES} UTF-8 bytes"
-            )
-        normalized[key] = value
-    return normalized
+_RIGID_ATOL = 1e-6
+_MOUNT_QUAT_ATOL = 1e-6
+_COLLECTION_SOURCES = frozenset({"teleop", "policy_rollout"})
 
 
 class EpisodeFinalizationError(RuntimeError):
@@ -96,15 +55,49 @@ def _validate_explicit_episode_name(episode_name: str) -> None:
         )
 
 
+def _validate_rigid_transform(value: object, *, label: str) -> np.ndarray:
+    try:
+        transform = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be numeric") from exc
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError(f"{label} must be a finite 4x4 transform")
+    rotation = transform[:3, :3]
+    if (
+        not np.allclose(transform[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9, rtol=0.0)
+        or not np.allclose(rotation.T @ rotation, np.eye(3), atol=_RIGID_ATOL, rtol=0.0)
+        or not np.isclose(np.linalg.det(rotation), 1.0, atol=_RIGID_ATOL, rtol=0.0)
+    ):
+        raise ValueError(f"{label} must be a finite rigid homogeneous transform")
+    return transform.copy()
+
+
+def _validate_hand_mount(
+    handbase_position_eef_m: object,
+    handbase_quat_eef_wxyz: object,
+) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        position = np.asarray(handbase_position_eef_m, dtype=np.float64)
+        quaternion = np.asarray(handbase_quat_eef_wxyz, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("hand mount must be numeric") from exc
+    if position.shape != (3,) or not np.all(np.isfinite(position)):
+        raise ValueError("handbase_position_eef_m must have shape (3,) and finite values")
+    if quaternion.shape != (4,) or not np.all(np.isfinite(quaternion)):
+        raise ValueError("handbase_quat_eef_wxyz must have shape (4,) and finite values")
+    if not np.isclose(np.linalg.norm(quaternion), 1.0, atol=_MOUNT_QUAT_ATOL, rtol=0.0):
+        raise ValueError("handbase_quat_eef_wxyz must be unit length within 1e-6")
+    return position.copy(), quaternion.copy()
+
+
 class EpisodeRecorder:
-    """Write raw episodes through start_episode(), add_frame(), and finish_episode()."""
+    """Own one Raw v34 transaction from START through atomic publication."""
 
     def __init__(
         self,
         data_dir: str,
         max_frames: int = HARD_MAX_RECORD_FRAMES,
         control_hz: float = 16.0,
-        min_frames: int = 50,
         camera_writer_config: CameraStreamWriterConfig | None = None,
     ) -> None:
         if not np.isfinite(control_hz) or control_hz <= 0:
@@ -114,10 +107,6 @@ class EpisodeRecorder:
         self.data_dir = Path(data_dir)
         self.max_frames = max_frames
         self.control_hz = float(control_hz)
-        self.min_frames = int(min_frames)
-
-        self._data_writer: EpisodeDataWriter | None = None
-        self._camera_writer: CameraStreamWriter | None = None
         self._camera_writer_config = camera_writer_config or CameraStreamWriterConfig(
             rgb_shape=CameraParams().rgb_shape,
             depth_shape=CameraParams().depth_shape,
@@ -125,31 +114,23 @@ class EpisodeRecorder:
         )
         if not np.isclose(self._camera_writer_config.fps, self.control_hz):
             raise ValueError("camera writer fps must match recorder control_hz")
-        self._frame_count: int = 0
-        self._recording: bool = False
-        self._start_time: float | None = None
-        self._episode_dir: str | None = None  # episode_XXX/ directory
-        self._temp_dir: str | None = None  # .tmp_episode_XXX/ directory
-        self._pending_meta: dict[str, Any] = {}
-        self.technical_status = "valid"
-        self.had_pause = False
 
-        self._pending_rows: list[dict[str, Any]] = []
-        self._last_timestamp_s: float | None = None
+        self._data_writer: EpisodeDataWriter | None = None
+        self._camera_writer: CameraStreamWriter | None = None
+        self._frame_count = 0
+        self._recording = False
+        self._episode_dir: str | None = None
+        self._temp_dir: str | None = None
+        self._pending_meta: dict[str, object] = {}
+        self._episode_valid = True
+        self._pending_rows: list[dict[str, object]] = []
         self._flush_interval = 32
-
         self._finishing = False
         self._last_finish_saved = False
 
     @property
     def last_finish_saved(self) -> bool:
-        """Whether the most recent finish_episode actually published raw data.
-
-        The recorder is the sole owner of the transaction outcome: a discarded,
-        downgraded (zero-row), or failed finish reports ``False`` even when the
-        caller requested ``save=True``. Survives episode-state reset so the
-        finalizing worker can read it after the transaction completes.
-        """
+        """Whether the most recent finalization published one raw episode."""
         return self._last_finish_saved
 
     @property
@@ -170,185 +151,161 @@ class EpisodeRecorder:
     def frame_count(self) -> int:
         return self._frame_count
 
+    @property
+    def episode_valid(self) -> bool:
+        """The active episode's monotonic-false lifecycle latch."""
+        return self._episode_valid
+
+    def invalidate_episode(self) -> None:
+        """Record one non-recoverable lifecycle failure for the active episode."""
+        self._episode_valid = False
+
+    def _snapshot_start_metadata(
+        self,
+        *,
+        task_label: str,
+        collection_source: str,
+        camera_geometry: RGBDGeometry,
+        camera_T_xarm_base_from_color: object,
+        depth_scale: float,
+        handbase_position_eef_m: object,
+        handbase_quat_eef_wxyz: object,
+    ) -> dict[str, object]:
+        if not isinstance(task_label, str) or not task_label.strip():
+            raise ValueError("task_label must be a non-empty string")
+        if not isinstance(collection_source, str) or collection_source not in _COLLECTION_SOURCES:
+            raise ValueError(
+                f"collection_source must be one of {sorted(_COLLECTION_SOURCES)}, "
+                f"got {collection_source!r}"
+            )
+        if not isinstance(camera_geometry, RGBDGeometry):
+            raise TypeError("camera_geometry must be an RGBDGeometry instance")
+        color = camera_geometry.color
+        expected_rgb_shape = (color.height, color.width, 3)
+        expected_depth_shape = (color.height, color.width)
+        if (
+            self._camera_writer_config.rgb_shape != expected_rgb_shape
+            or self._camera_writer_config.depth_shape != expected_depth_shape
+        ):
+            raise ValueError(
+                "aligned RGB-D geometry must match recorder transport: "
+                f"expected rgb={self._camera_writer_config.rgb_shape}, "
+                f"depth={self._camera_writer_config.depth_shape}; "
+                f"got rgb={expected_rgb_shape}, depth={expected_depth_shape}"
+            )
+        try:
+            depth_scale_value = float(depth_scale)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("depth_scale must be numeric") from exc
+        if not np.isfinite(depth_scale_value) or depth_scale_value <= 0.0:
+            raise ValueError("depth_scale must be finite and positive")
+        transform = _validate_rigid_transform(
+            camera_T_xarm_base_from_color,
+            label="camera_T_xarm_base_from_color",
+        )
+        handbase_position, handbase_quaternion = _validate_hand_mount(
+            handbase_position_eef_m,
+            handbase_quat_eef_wxyz,
+        )
+        return {
+            "task_label": task_label,
+            "collection_source": collection_source,
+            "camera_payload_mode": "depth_to_color_aligned_rgbd",
+            "camera_color_width": color.width,
+            "camera_color_height": color.height,
+            "camera_color_intrinsics": color.matrix().reshape(-1).copy(),
+            "camera_color_distortion_model": color.distortion_model,
+            "camera_color_distortion_coeffs": np.asarray(
+                color.distortion_coeffs, dtype=np.float64
+            ).copy(),
+            "camera_T_xarm_base_from_color": transform.reshape(-1).copy(),
+            "depth_scale": depth_scale_value,
+            "handbase_position_eef_m": handbase_position,
+            "handbase_quat_eef_wxyz": handbase_quaternion,
+        }
+
     def start_episode(
         self,
-        task_label: str = "",
-        operator: str = "",
-        calib: CameraExtrinsics | None = None,
-        camera_geometry: RGBDGeometry | None = None,
-        camera_name: str | None = None,
-        camera_serial: str | None = None,
-        depth_scale: float | None = None,
-        provenance: Mapping[str, object] | None = None,
+        task_label: str,
+        collection_source: str,
+        camera_geometry: RGBDGeometry,
+        camera_T_xarm_base_from_color: object,
+        depth_scale: float,
+        handbase_position_eef_m: object,
+        handbase_quat_eef_wxyz: object,
         episode_name: str | None = None,
     ) -> bool:
-        """Open one episode transaction.
-
-        ``episode_name=None`` uses timestamp naming with a
-        same-second dedup suffix.  An explicit name selects the exact published
-        directory; an existing final or temporary directory with that name is
-        refused loudly (raised) instead of overwritten or silently renamed, so
-        a caller-supplied sequence like ``episode_001`` stays trustworthy.
-        """
-        normalized_provenance = normalize_provenance_metadata(provenance)
-        self.technical_status = "valid"
-        self.had_pause = False
+        """Validate and snapshot static experiment facts before opening staging."""
+        if self._finishing or not self.resources_released or self._recording:
+            return False
+        metadata = self._snapshot_start_metadata(
+            task_label=task_label,
+            collection_source=collection_source,
+            camera_geometry=camera_geometry,
+            camera_T_xarm_base_from_color=camera_T_xarm_base_from_color,
+            depth_scale=depth_scale,
+            handbase_position_eef_m=handbase_position_eef_m,
+            handbase_quat_eef_wxyz=handbase_quat_eef_wxyz,
+        )
         if episode_name is not None:
             _validate_explicit_episode_name(episode_name)
-        if self._finishing or not self.resources_released:
-            return False
-        if self._recording:
-            return False
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
         if episode_name is None:
             stamp = time.strftime("%Y%m%d_%H%M%S")
-            ep_dir = self.data_dir / f"episode_{stamp}"
-            tmp_dir = self.data_dir / f".tmp_episode_{stamp}"
+            episode_dir = self.data_dir / f"episode_{stamp}"
+            temp_dir = self.data_dir / f".tmp_episode_{stamp}"
             dedup = 1
-            while ep_dir.exists() or tmp_dir.exists():  # same-second collision → suffix
-                ep_dir = self.data_dir / f"episode_{stamp}_{dedup}"
-                tmp_dir = self.data_dir / f".tmp_episode_{stamp}_{dedup}"
+            while episode_dir.exists() or temp_dir.exists():
+                episode_dir = self.data_dir / f"episode_{stamp}_{dedup}"
+                temp_dir = self.data_dir / f".tmp_episode_{stamp}_{dedup}"
                 dedup += 1
         else:
-            ep_dir = self.data_dir / episode_name
-            tmp_dir = self.data_dir / f".tmp_{episode_name}"
-            if ep_dir.exists() or tmp_dir.exists():
-                raise FileExistsError(f"explicit episode name already exists: {ep_dir}")
+            episode_dir = self.data_dir / episode_name
+            temp_dir = self.data_dir / f".tmp_{episode_name}"
+            if episode_dir.exists() or temp_dir.exists():
+                raise FileExistsError(f"explicit episode name already exists: {episode_dir}")
 
-        self._episode_dir = str(ep_dir)
-        self._temp_dir = str(tmp_dir)
-        tmp_dir.mkdir(parents=True, exist_ok=False)
-        self._frame_count = 0
-        self._start_time = time.perf_counter()
-        self._recording = True
+        temp_dir.mkdir(parents=True, exist_ok=False)
+        # Construction may fail while the camera writer still owns a sidecar.
+        # Keep the staging owner visible until a successful transaction has
+        # established normal writer ownership or a caller investigates it.
+        self._temp_dir = str(temp_dir)
+        camera_writer = CameraStreamWriter(temp_dir, self._camera_writer_config)
+
+        self._episode_dir = str(episode_dir)
+        self._pending_meta = metadata
+        self._camera_writer = camera_writer
         self._data_writer = None
-
-        self._pending_meta = {
-            "task_label": task_label,
-            "operator": operator,
-            "calib": calib,
-            "camera_geometry": camera_geometry,
-            "camera_name": camera_name,
-            "camera_serial": camera_serial,
-            "depth_scale": depth_scale,
-            "provenance": normalized_provenance,
-        }
-
+        self._frame_count = 0
         self._pending_rows.clear()
-        self._last_timestamp_s = None
-        self._camera_writer = CameraStreamWriter(tmp_dir, self._camera_writer_config)
+        self._recording = True
+        self._episode_valid = True
+        self._last_finish_saved = False
         return True
 
-    def _write_meta_attrs(self, meta: h5py.Group) -> None:
-        """Write initial metadata through the data writer's owned HDF5 handle."""
-        p = self._pending_meta
-        meta.attrs["task_label"] = p.get("task_label", "")
-        meta.attrs["operator"] = p.get("operator", "")
-        meta.attrs["control_hz"] = self.control_hz  # nominal grid rate; dt = 1/control_hz
-        meta.attrs["camera_payload_mode"] = "depth_to_color_aligned_rgbd"
-        self._write_camera_meta_attrs(meta)
-
-        provenance = p.get("provenance") or {}
-        for key, value in provenance.items():
-            meta.attrs[f"provenance_{key}"] = value
-
-    def _write_camera_meta_attrs(self, meta: h5py.Group) -> None:
-        p = self._pending_meta
-        calib = p.get("calib")
-        camera_name = p.get("camera_name")
-        camera_serial = p.get("camera_serial")
-        if camera_serial is not None:
-            meta.attrs["camera_serial"] = str(camera_serial)
-        if camera_name is not None:
-            meta.attrs["camera_name"] = str(camera_name)
-        camera_geometry = p.get("camera_geometry")
-        if camera_geometry is not None and not isinstance(camera_geometry, RGBDGeometry):
-            raise TypeError("camera_geometry must be an RGBDGeometry instance")
-        if calib is not None and camera_name is not None:
-            # Verify a supplied serial against the named calibration entry.
-            calib_meta = calib.to_meta_dict(camera_name, expected_serial=camera_serial)
-            meta.attrs["camera_serial"] = calib_meta.get("camera_serial", "")
-            meta.attrs["camera_type"] = calib_meta.get("camera_type", "")
-            if camera_geometry is None:
-                raise RuntimeError("camera calibration requires native RGB-D geometry")
-            if "camera_T_world_camera" in calib_meta:
-                T_xarm_base_from_color = np.asarray(
-                    calib_meta["camera_T_world_camera"], dtype=np.float64
-                ).reshape(4, 4)
-                meta.attrs["camera_T_xarm_base_from_color"] = T_xarm_base_from_color.reshape(
-                    -1
-                ).tolist()
-                meta.attrs["camera_T_xarm_base_from_depth"] = (
-                    (T_xarm_base_from_color @ camera_geometry.T_color_from_depth)
-                    .reshape(-1)
-                    .tolist()
-                )
-            if "camera_T_eef_camera" in calib_meta:
-                T_eef_from_color = np.asarray(
-                    calib_meta["camera_T_eef_camera"], dtype=np.float64
-                ).reshape(4, 4)
-                meta.attrs["camera_T_eef_from_depth"] = (
-                    (T_eef_from_color @ camera_geometry.T_color_from_depth).reshape(-1).tolist()
-                )
-            meta.attrs["camera_calibration_source_optical_frame"] = "camera_color_optical"
-
-        if camera_geometry is not None:
-            meta.attrs["camera_depth_intrinsics"] = (
-                camera_geometry.depth.matrix().reshape(-1).tolist()
-            )
-            meta.attrs["camera_depth_width"] = camera_geometry.depth.width
-            meta.attrs["camera_depth_height"] = camera_geometry.depth.height
-            meta.attrs["camera_depth_distortion_model"] = camera_geometry.depth.distortion_model
-            meta.attrs["camera_depth_distortion_coeffs"] = list(
-                camera_geometry.depth.distortion_coeffs
-            )
-            meta.attrs["camera_color_intrinsics"] = (
-                camera_geometry.color.matrix().reshape(-1).tolist()
-            )
-            meta.attrs["camera_color_width"] = camera_geometry.color.width
-            meta.attrs["camera_color_height"] = camera_geometry.color.height
-            meta.attrs["camera_color_distortion_model"] = camera_geometry.color.distortion_model
-            meta.attrs["camera_color_distortion_coeffs"] = list(
-                camera_geometry.color.distortion_coeffs
-            )
-            meta.attrs["camera_T_color_from_depth"] = camera_geometry.T_color_from_depth.reshape(
-                -1
-            ).tolist()
-            meta.attrs["camera_geometry_frame_semantics"] = (
-                "native_depth_and_native_color_optical_frames"
-            )
-
-        # Raw uint16 depth units in meters (L515: 0.00025) — without this,
-        # offline consumers cannot convert /depth correctly.
-        depth_scale = p.get("depth_scale")
-        if depth_scale is not None:
-            meta.attrs["depth_scale"] = float(depth_scale)
+    def _write_initial_meta(self, meta: h5py.Group) -> None:
+        """Write the static Raw v34 snapshot through the writer-owned handle."""
+        for name, value in self._pending_meta.items():
+            meta.attrs[name] = value
+        meta.attrs["control_hz"] = self.control_hz
 
     def add_frame(self, frame: EpisodeFrame) -> bool:
-        """Append one control sample as one row without resampling."""
+        """Append one already-constructed control row without resampling."""
         if not self._recording:
             return False
-
         if self._frame_count >= self.max_frames:
             raise RuntimeError(f"recording exceeded hard frame limit {self.max_frames}")
-
-        ts = float(frame.timestamp_s)
-        if not np.isfinite(ts) or (
-            self._last_timestamp_s is not None and ts <= self._last_timestamp_s
-        ):
-            raise ValueError("recording timestamps must be finite and increasing")
-        if set(frame.data) != SOURCE_FRAME_DATASET_NAMES:
-            raise ValueError("episode source frame fields do not match the raw schema")
-        row = dict(frame.data, timestamp=ts)
-        self._pending_rows.append(row)
-        self._frame_count += 1
-        self._last_timestamp_s = ts
+        if set(frame.data) != set(DATASET_SPECS):
+            raise ValueError("episode frame fields do not match the Raw v34 schema")
+        if frame.camera_rgb is None or frame.camera_depth is None:
+            raise ValueError("recorded row is missing RGB-D")
         writer = self._camera_writer
         if writer is None:
             raise RuntimeError("camera writer missing")
-        if frame.camera_rgb is None or frame.camera_depth is None:
-            raise ValueError("recorded row is missing RGB-D")
+
+        self._pending_rows.append(dict(frame.data))
+        self._frame_count += 1
         writer.write(frame.camera_rgb, frame.camera_depth)
         if len(self._pending_rows) >= self._flush_interval:
             self._flush_buffered()
@@ -358,14 +315,13 @@ class EpisodeRecorder:
         if self._data_writer is not None:
             return
         if self._temp_dir is None:
-            raise RuntimeError("EpisodeRecorder: _temp_dir is None during HDF5 open")
+            raise RuntimeError("EpisodeRecorder has no staging directory during HDF5 open")
         self._data_writer = EpisodeDataWriter(
             Path(self._temp_dir) / "data.h5",
-            write_initial_meta=self._write_meta_attrs,
+            write_initial_meta=self._write_initial_meta,
         )
 
     def _flush_buffered(self) -> None:
-        """Append pending rows; the batch has no temporal semantics."""
         if not self._pending_rows:
             return
         self._ensure_hdf5()
@@ -377,21 +333,8 @@ class EpisodeRecorder:
         self._data_writer.append(batch)
         self._pending_rows.clear()
 
-    def finish_episode(
-        self,
-        save: bool = True,
-        reason: str = "",
-    ) -> str | None:
-        """Finish synchronously and return the reserved final path, including on discard.
-
-        Saving validates rows and publishes atomically. Short complete episodes are
-        allowed: ``min_frames_met`` is a quality label, not an admission gate.
-        Empty episodes are discarded. Failures raise after cleanup; staging is kept
-        only if writers or staging cleanup cannot be completed.
-
-        A clean operator discard deletes staging.
-        The caller must serialize this operation with all other recorder access.
-        """
+    def finish_episode(self, save: bool = True, reason: str = "") -> str | None:
+        """Close, verify, and atomically publish one complete episode when requested."""
         if self._finishing:
             raise RuntimeError("episode finalization is still active")
         if not self._recording:
@@ -399,9 +342,7 @@ class EpisodeRecorder:
         self._last_finish_saved = False
         if save and self._frame_count == 0:
             logger.warning(
-                "[RECORD] reason=%s saved_rows=0 — no source rows to publish; "
-                "discarding the empty staging",
-                reason or "manual",
+                "[RECORD] reason=%s saved_rows=0; discarding empty staging", reason or "manual"
             )
             save = False
         path = self._episode_dir
@@ -413,13 +354,9 @@ class EpisodeRecorder:
             self._finishing = False
         return path
 
-    def _finish_episode_transaction(
-        self,
-        save: bool,
-        reason: str,
-    ) -> None:
-        """Finalize one transaction; retain any resource that failed cleanup."""
-        failure = None
+    def _finish_episode_transaction(self, save: bool, reason: str) -> None:
+        """Finalize one transaction and retain staging only if cleanup fails."""
+        failure: Exception | None = None
         try:
             self._finalize_episode_files(save, reason)
         except Exception as exc:
@@ -439,128 +376,99 @@ class EpisodeRecorder:
             except Exception:
                 logger.warning("HDF5 cleanup failed", exc_info=True)
         finally:
-            # Keep staging in place until both writers have closed.
-            if self._camera_writer is None and self._data_writer is None:
+            if (
+                self._camera_writer is None
+                and self._data_writer is None
+                and self._temp_dir is not None
+            ):
                 try:
-                    if self._temp_dir is not None:
-                        self._discard_temp_files(self._temp_dir)
+                    self._discard_temp_files(self._temp_dir)
                 except Exception:
                     logger.warning(
                         "temporary episode cleanup failed; staging remains at %s",
                         self._temp_dir,
                         exc_info=True,
                     )
-                self._reset_episode_state()
+                else:
+                    self._reset_episode_state()
         if failure is not None:
             raise EpisodeFinalizationError(f"{type(failure).__name__}: {failure}") from failure
 
-    def _finalize_episode_files(
-        self,
-        save: bool,
-        reason: str,
-    ) -> None:
-        """Close and verify saved files before atomic publication."""
-        duration = time.perf_counter() - (self._start_time or 0.0)
-
-        writer = self._camera_writer
+    def _finalize_episode_files(self, save: bool, reason: str) -> None:
+        """Close all writers, validate closed files, then atomically publish."""
+        camera_writer = self._camera_writer
         camera_frame_count = 0
-        if writer is not None:
-            writer.close()
-            if not writer.resources_released:
+        if camera_writer is not None:
+            camera_writer.close()
+            if not camera_writer.resources_released:
                 raise RuntimeError("camera writer resources were not released")
-            camera_frame_count = writer.frame_count
+            camera_frame_count = camera_writer.frame_count
             self._camera_writer = None
         if not save:
             if self._data_writer is not None:
                 self._data_writer.close()
                 self._data_writer = None
             return
-        if writer is None:
+        if camera_writer is None:
             raise RuntimeError("camera writer missing at episode stop")
         if camera_frame_count != self._frame_count:
             raise RuntimeError(
-                f"camera/source row count mismatch: camera={camera_frame_count}, source={self._frame_count}"
+                "camera/source row count mismatch: "
+                f"camera={camera_frame_count}, source={self._frame_count}"
             )
 
         self._flush_buffered()
         self._ensure_hdf5()
-
         assert self._data_writer is not None
-        data_writer = self._data_writer
         if self._temp_dir is None:
-            raise RuntimeError("episode temp directory missing during finalization")
+            raise RuntimeError("episode staging directory missing during finalization")
 
-        def _write_final_meta(meta: h5py.Group) -> None:
+        def write_final_meta(meta: h5py.Group) -> None:
             meta.attrs["schema_version"] = EPISODE_SCHEMA_VERSION
-            meta.attrs["technical_status"] = self.technical_status
-            meta.attrs["had_pause"] = self.had_pause
-            meta.attrs["termination_reason"] = reason or "manual"
-            meta.attrs["wall_duration_s"] = duration
             meta.attrs["num_frames"] = self._frame_count
-            meta.attrs["min_frames_met"] = self._frame_count >= self.min_frames
+            meta.attrs["episode_valid"] = bool(self._episode_valid)
 
-        data_writer.update_meta(_write_final_meta)
-        data_writer.close()
+        self._data_writer.update_meta(write_final_meta)
+        self._data_writer.close()
         self._data_writer = None
         if self._episode_dir is None:
             raise RuntimeError("episode final directory missing during finalization")
         self._validate_temp_episode(Path(self._temp_dir), self._frame_count)
         atomic_publish(self._temp_dir, self._episode_dir)
         self._last_finish_saved = True
-        logger.info("Episode saved: %s frames=%d", self._episode_dir, self._frame_count)
+        logger.info(
+            "Episode saved: %s frames=%d episode_valid=%s reason=%s",
+            self._episode_dir,
+            self._frame_count,
+            self._episode_valid,
+            reason or "manual",
+        )
 
     def _reset_episode_state(self) -> None:
-        """Reset local episode ownership after all writers have closed."""
+        """Release transaction ownership without changing the final validity latch."""
         self._data_writer = None
         self._recording = False
         self._frame_count = 0
-        self._start_time = None
         self._episode_dir = None
         self._temp_dir = None
         self._pending_rows.clear()
+        self._pending_meta.clear()
         self._camera_writer = None
-        self._last_timestamp_s = None
 
     @staticmethod
     def _validate_temp_episode(temp_dir: Path, expected_frames: int) -> None:
-        """Verify closed files structurally before publication, without RGB decoding."""
-        paths = {
-            "data": temp_dir / "data.h5",
-            "depth": temp_dir / "depth.h5",
-            "rgb": temp_dir / "rgb.mp4",
-        }
-        missing = [name for name, path in paths.items() if not path.is_file()]
-        if missing:
-            raise RuntimeError(f"episode finalization missing modalities: {missing}")
-        with h5py.File(paths["data"], "r") as data_h5:
-            meta = data_h5.get("meta")
-            if meta is None or int(meta.attrs.get("num_frames", -1)) != expected_frames:
-                raise RuntimeError("data.h5 frame count metadata mismatch")
-            if int(meta.attrs.get("schema_version", -1)) != EPISODE_SCHEMA_VERSION:
-                raise RuntimeError("new writer produced an unexpected raw schema version")
-            datasets = {
-                key: dataset
-                for key, dataset in data_h5.items()
-                if isinstance(dataset, h5py.Dataset)
-            }
-            dataset_shapes = {key: tuple(dataset.shape) for key, dataset in datasets.items()}
-            dataset_dtypes = {key: dataset.dtype for key, dataset in datasets.items()}
-            layout_errors = validate_data_layout(
-                dataset_shapes,
-                dataset_dtypes,
-                frame_count=expected_frames,
-            )
-            if layout_errors:
-                raise RuntimeError("data.h5 episode layout mismatch: " + "; ".join(layout_errors))
-        for key in ("depth",):
-            with h5py.File(paths[key], "r") as sidecar:
-                if key not in sidecar or int(sidecar[key].shape[0]) != expected_frames:
-                    raise RuntimeError(f"{key} sidecar length mismatch")
-        if paths["rgb"].stat().st_size == 0:
-            raise RuntimeError("RGB sidecar is empty")
+        """Open closed staging with the v34 structural reader before publication."""
+        from dexmani_real.recording.storage.reader import EpisodeReader
+
+        with EpisodeReader(temp_dir) as reader:
+            if reader.num_frames != expected_frames:
+                raise RuntimeError(
+                    "data.h5 frame count metadata mismatch: "
+                    f"expected {expected_frames}, got {reader.num_frames}"
+                )
 
     @staticmethod
     def _discard_temp_files(tmp: str) -> None:
-        """Remove staging after resource release; expose incomplete cleanup."""
+        """Remove only this transaction's owned staging after writers are closed."""
         if Path(tmp).exists():
             shutil.rmtree(tmp)

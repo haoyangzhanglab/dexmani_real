@@ -38,57 +38,46 @@ def validate_rigid_transform(transform: np.ndarray, *, label: str) -> np.ndarray
     return value
 
 
-def _intrinsics_from_meta(meta: Any, *, stream: str) -> CameraIntrinsics:
-    prefix = f"camera_{stream}"
-    matrix = np.asarray(meta[f"{prefix}_intrinsics"], dtype=np.float64).reshape(3, 3)
+def _color_intrinsics_from_meta(meta: Any) -> CameraIntrinsics:
+    matrix = np.asarray(meta["camera_color_intrinsics"], dtype=np.float64).reshape(3, 3)
     if not np.allclose(matrix[2], (0.0, 0.0, 1.0), rtol=0.0, atol=1e-9):
-        raise ValueError(f"{prefix}_intrinsics must be a canonical pinhole matrix")
-    coefficients = tuple(float(value) for value in meta[f"{prefix}_distortion_coeffs"])
+        raise ValueError("camera_color_intrinsics must be a canonical pinhole matrix")
+    coefficients = tuple(float(value) for value in meta["camera_color_distortion_coeffs"])
     return CameraIntrinsics(
-        width=int(meta[f"{prefix}_width"]),
-        height=int(meta[f"{prefix}_height"]),
+        width=int(meta["camera_color_width"]),
+        height=int(meta["camera_color_height"]),
         fx=float(matrix[0, 0]),
         fy=float(matrix[1, 1]),
         ppx=float(matrix[0, 2]),
         ppy=float(matrix[1, 2]),
-        distortion_model=str(meta[f"{prefix}_distortion_model"]),
+        distortion_model=str(meta["camera_color_distortion_model"]),
         distortion_coeffs=cast(tuple[float, float, float, float, float], coefficients),
     )
 
 
 def load_raw_episode_camera_model(reader: EpisodeReader) -> RawEpisodeCameraModel:
-    """Load the depth-to-color aligned camera model persisted by the current raw schema."""
+    """Load the aligned color-grid camera model persisted by Raw v34."""
     meta = reader.h5f["meta"].attrs
     if str(meta.get("camera_payload_mode", "")) != "depth_to_color_aligned_rgbd":
         raise ValueError("raw camera payload is not depth-to-color aligned RGB-D")
-    native_geometry = RGBDGeometry(
-        depth=_intrinsics_from_meta(meta, stream="depth"),
-        color=_intrinsics_from_meta(meta, stream="color"),
-        T_color_from_depth=np.asarray(meta["camera_T_color_from_depth"], dtype=np.float64).reshape(
-            4, 4
-        ),
+    color = _color_intrinsics_from_meta(meta)
+    geometry = RGBDGeometry(
+        depth=color,
+        color=color,
+        T_color_from_depth=np.eye(4, dtype=np.float64),
     )
     depth_scale_m = float(meta["depth_scale"])
     if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
         raise ValueError("depth_scale must be finite and positive")
     return RawEpisodeCameraModel(
-        geometry=native_geometry.aligned_depth_to_color(),
+        geometry=geometry,
         depth_scale_m=depth_scale_m,
     )
 
 
 def load_raw_episode_base_from_color(reader: EpisodeReader) -> np.ndarray:
-    """Return the static color-camera to xArm-base transform for eye-to-hand."""
+    """Return Raw v34's static aligned-color camera to xArm-base transform."""
     meta = reader.h5f["meta"].attrs
-    camera_type = str(meta.get("camera_type", ""))
-    if camera_type == "eye_in_hand":
-        raise ValueError(
-            "raw xArm-base camera geometry for eye_in_hand requires arm pose "
-            "evaluated at color/depth exposure times, which is not persisted"
-        )
-    if camera_type != "eye_to_hand":
-        raise ValueError(f"unsupported camera_type {camera_type!r}")
-
     transform = validate_rigid_transform(
         np.asarray(meta["camera_T_xarm_base_from_color"]),
         label="camera_T_xarm_base_from_color",

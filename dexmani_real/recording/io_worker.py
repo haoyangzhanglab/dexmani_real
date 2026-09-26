@@ -7,8 +7,7 @@ publication. Camera arrays use fixed seqlock ring slots rather than mp.Queue.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty
 from typing import Any
@@ -26,7 +25,6 @@ from dexmani_real.recording.frame import decode_record_sample
 from dexmani_real.recording.recorder import (
     EpisodeFinalizationError,
     EpisodeRecorder,
-    normalize_provenance_metadata,
 )
 from dexmani_real.recording.storage.camera_writer import CameraStreamWriterConfig
 from dexmani_real.runtime.safety import RunEndReason, SafetyState, _revoke_motion_locked
@@ -41,27 +39,26 @@ logger = get_logger(__name__)
 class RecorderWorkerConfig:
     data_dir: str
     control_hz: float
-    min_frames: int
     camera_calibration: CameraExtrinsics
+    collection_source: str
+    handbase_position_eef_m: tuple[float, float, float]
+    handbase_quat_eef_wxyz: tuple[float, float, float, float]
     poll_hz: float = 128.0
-    provenance: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if (
-            self.min_frames < 0
-            or not np.isfinite(self.control_hz)
+            not np.isfinite(self.control_hz)
             or not np.isfinite(self.poll_hz)
             or self.control_hz <= 0
             or self.poll_hz <= 0
         ):
-            raise ValueError("invalid RecorderIO rate/min_frames configuration")
+            raise ValueError("invalid RecorderIO rate configuration")
         if not isinstance(self.camera_calibration, CameraExtrinsics):
             raise TypeError("camera_calibration must be a preloaded CameraExtrinsics snapshot")
-        object.__setattr__(
-            self,
-            "provenance",
-            normalize_provenance_metadata(self.provenance),
-        )
+        if self.collection_source not in {"teleop", "policy_rollout"}:
+            raise ValueError("collection_source must be teleop or policy_rollout")
+        for name in ("handbase_position_eef_m", "handbase_quat_eef_wxyz"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
 
 
 def _warn_stale_staging(data_dir: str) -> None:
@@ -106,37 +103,43 @@ def _build_start_metadata(
     shared: Any,
     *,
     task_label: str,
-    operator: str,
     episode_name: str | None,
     calibration: CameraExtrinsics,
-    provenance: Mapping[str, str],
+    collection_source: str,
+    handbase_position_eef_m: tuple[float, float, float],
+    handbase_quat_eef_wxyz: tuple[float, float, float, float],
 ) -> dict[str, Any]:
     """Snapshot recording metadata when START is received."""
-    depth_scale = (
-        float(shared.camera_depth_scale.value) if shared.camera_depth_scale.value != 0.0 else None
-    )
+    depth_scale = float(shared.camera_depth_scale.value)
+    if not np.isfinite(depth_scale) or depth_scale <= 0:
+        raise ValueError("recording START requires a finite positive camera depth scale")
     camera_serial = _shared_text(shared.camera_serial.value, default=None)
+    if not camera_serial or not camera_serial.strip():
+        raise ValueError("recording START requires a nonempty camera serial")
     camera_geometry_json = _shared_text(shared.camera_geometry.value, default="{}") or "{}"
     camera_geometry = _camera_geometry_from_shared(camera_geometry_json)
-    try:
-        camera_name = calibration.resolve_name_by_serial(camera_serial) if camera_serial else None
-    except (KeyError, FileNotFoundError):
-        camera_name = None
-        logger.warning(
-            "Camera serial %s not found in cameras.json — no extrinsics in /meta",
-            camera_serial,
-        )
+    camera_name = calibration.resolve_name_by_serial(camera_serial)
+    camera_meta = calibration.to_meta_dict(camera_name, expected_serial=camera_serial)
+    if camera_meta["camera_type"] != "eye_to_hand":
+        raise ValueError("Raw v34 recording requires eye-to-hand camera calibration")
+    sample_dtype = shared.record_sample_ring.dtype
+    color = camera_geometry.color
+    if sample_dtype.fields["camera_rgb"][0].shape != (
+        color.height,
+        color.width,
+        3,
+    ) or sample_dtype.fields["camera_depth"][0].shape != (color.height, color.width):
+        raise ValueError("recording START camera geometry disagrees with aligned RGB-D payload")
 
     return {
         "task_label": task_label,
-        "operator": operator,
         "episode_name": episode_name,
-        "calib": calibration,
         "camera_geometry": camera_geometry,
-        "camera_name": camera_name,
-        "camera_serial": camera_serial,
+        "camera_T_xarm_base_from_color": calibration.get_extrinsics(camera_name),
         "depth_scale": depth_scale,
-        "provenance": dict(provenance),
+        "collection_source": collection_source,
+        "handbase_position_eef_m": handbase_position_eef_m,
+        "handbase_quat_eef_wxyz": handbase_quat_eef_wxyz,
     }
 
 
@@ -149,7 +152,6 @@ def _create_episode_recorder(shared: Any, config: RecorderWorkerConfig) -> Episo
     return EpisodeRecorder(
         data_dir=config.data_dir,
         control_hz=config.control_hz,
-        min_frames=config.min_frames,
         camera_writer_config=CameraStreamWriterConfig(
             rgb_shape=rgb_shape,
             depth_shape=depth_shape,
@@ -191,10 +193,11 @@ class _RecorderIOSession:
             metadata = _build_start_metadata(
                 self.shared,
                 task_label=control.task,
-                operator=control.operator,
                 episode_name=control.episode_name,
                 calibration=self.config.camera_calibration,
-                provenance=self.config.provenance,
+                collection_source=self.config.collection_source,
+                handbase_position_eef_m=self.config.handbase_position_eef_m,
+                handbase_quat_eef_wxyz=self.config.handbase_quat_eef_wxyz,
             )
             if not self.recorder.start_episode(**metadata):
                 raise RuntimeError("EpisodeRecorder refused start")
@@ -221,6 +224,8 @@ class _RecorderIOSession:
         frame_count = self.recorder.frame_count
         self.pending_stop = None
         published = False
+        if error:
+            self.recorder.invalidate_episode()
         try:
             self.recorder.finish_episode(save and not error, reason)
             published = self.recorder.last_finish_saved
@@ -242,7 +247,6 @@ class _RecorderIOSession:
                     frame_count=frame_count,
                     reason=reason,
                     error=error or None,
-                    min_frames_met=frame_count >= self.config.min_frames,
                 )
             )
         except Exception:
@@ -269,8 +273,8 @@ class _RecorderIOSession:
                 "invalid_stop_boundary", "STOP boundary is outside committed samples"
             )
             return
-        self.recorder.had_pause = control.had_pause
-        self.recorder.technical_status = control.technical_status
+        if not control.episode_valid:
+            self.recorder.invalidate_episode()
         if not control.save:
             # Discarded rows still occupy global sequence numbers across episodes.
             self.last_sample_sequence = control.through_sequence
@@ -325,7 +329,7 @@ class _RecorderIOSession:
                             save=True,
                             reason="runtime_shutdown",
                             through_sequence=int(self.shared.record_sample_ring.latest_sequence),
-                            technical_status="invalid",
+                            episode_valid=False,
                         )
                     )
                 self._drain_samples()

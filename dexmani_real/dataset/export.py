@@ -11,7 +11,6 @@ from pathlib import Path
 import numpy as np
 import zarr
 
-from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.dataset.contracts import (
     EpisodeAnnotation,
     ProcessingConfig,
@@ -68,7 +67,7 @@ def export_raw_to_zarr(
     output_path: str | Path,
     config: PolicyZarrExportConfig | None = None,
     *,
-    processing: ProcessingConfig | None = None,
+    processing: ProcessingConfig,
     annotations_path: str | Path | None = None,
     task_name: str | None = None,
     dry_run: bool = False,
@@ -82,8 +81,8 @@ def export_raw_to_zarr(
     rejected and explicitly excluded episodes.
     """
     config = config or PolicyZarrExportConfig()
-    if processing is None:
-        processing = ProcessingConfig.from_runtime(resolve_experiment_config())
+    if not isinstance(processing, ProcessingConfig):
+        raise TypeError("processing must be an explicit ProcessingConfig")
     source, target = (
         Path(input_root).resolve(),
         Path(output_path).expanduser().resolve(),
@@ -138,7 +137,7 @@ def export_raw_to_zarr(
                         schema_version=POLICY_ZARR_SCHEMA_VERSION,
                         domain="real",
                         task_name=task,
-                        dt=float(reader.timing.grid_dt_s),
+                        dt=reader.dt,
                         **policy_semantics(reader, processing),
                     )
                     if first_attrs is None:

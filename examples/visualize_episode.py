@@ -19,9 +19,8 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
-from dexmani_real.config.experiment import resolve_experiment_config, resolve_table_plane
+from dexmani_real.config.hardware import HandParams
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.dataset.contracts import ProcessingConfig
 from dexmani_real.dataset.pointcloud import (
     RawEpisodePointCloudDeriver,
     load_raw_episode_base_from_color,
@@ -31,26 +30,28 @@ from dexmani_real.ipc.schema import validate_point_cloud_array
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
-from dexmani_real.recording import EpisodeReader, MergedH5File
-from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE
+from dexmani_real.recording import EpisodeReader
+from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE, XHAND_RIGHT_URDF_PATH
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
 
-_KNOWN_CATEGORIES: dict[str, set[str]] = {
-    "arm": {"arm_qpos"},
-    "hand": {"hand_qpos", "hand_contact"},
-    "action": {"action_arm_joint_target", "arm_eef_intent", "action_hand_joint_target"},
-    "vr": {"vr_wrist_pos", "vr_wrist_rot6d", "vr_landmarks"},
-    "camera": {"rgb", "depth"},
-    "flags": {
-        "flag_frame_status",
-        "flag_camera_fresh",
-        "camera_depth_frame_number",
-        "camera_color_frame_number",
-    },
-    "meta": {"timestamp"},
+_SERIES_GROUPS = {
+    "state": ("arm_effort", "arm_qpos", "arm_qvel", "hand_current", "hand_qpos"),
+    "action": ("action_arm_joint_target", "action_hand_joint_target"),
+    "flags": ("frame_valid",),
+}
+_FORCE_SERIES = {
+    "hand_contact_mag": (
+        "thumb (SDK-scaled)",
+        "index (SDK-scaled)",
+        "middle (SDK-scaled)",
+        "ring (SDK-scaled)",
+        "pinky (SDK-scaled)",
+    ),
+    "hand_force_thumb": ("Fx", "Fy", "Fz"),
+    "hand_force_index": ("Fx", "Fy", "Fz"),
 }
 
 _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
@@ -78,76 +79,35 @@ def _fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None
     return row
 
 
-def _classify_datasets(h5f: MergedH5File) -> dict[str, list[str]]:
-    available_keys = {k for k in h5f.keys() if isinstance(h5f[k], h5py.Dataset)}
-    classified: dict[str, list[str]] = {}
-
-    for category, known_keys in _KNOWN_CATEGORIES.items():
-        found = sorted(known_keys & available_keys)
-        if found:
-            classified[category] = found
-
-    return classified
-
-
 def print_episode_info(h5_path: str) -> None:
     with EpisodeReader(h5_path) as reader:
-        if not reader.min_frames_met:
-            print(
-                "WARNING: episode is below the configured minimum recording duration (quality label only)"
-            )
         f = reader.h5f
         keys = sorted(k for k in f.keys() if isinstance(f[k], h5py.Dataset))
-        groups = sorted(k for k in f.keys() if not isinstance(f[k], h5py.Dataset))
-
-        t_key = next((k for k in keys if k == "arm_qpos"), None)
-        t_key = t_key or next((k for k in keys if k == "timestamp"), keys[0])
-        t_frames = f[t_key].shape[0]
-        c_key = "rgb" if "rgb" in f else ("depth" if "depth" in f else None)
-        if c_key:
-            c_frames = f[c_key].shape[0]
-        else:
-            c_frames = None
-
         print(f"Episode:    {h5_path}")
-        print(f"State frames (T): {t_frames}")
-        if c_frames is not None:
-            print(f"Camera frames (C): {c_frames}  (ratio={c_frames / t_frames:.2f})")
+        print(f"Control/depth rows: {reader.num_frames}")
         print()
 
-        if "meta" in groups:
-            print("Meta:")
-            for attr in sorted(f["meta"].attrs.keys()):
-                print(f"  {attr}: {f['meta'].attrs[attr]}")
-            print()
+        print("Meta:")
+        for attr in sorted(f["meta"].attrs.keys()):
+            print(f"  {attr}: {f['meta'].attrs[attr]}")
+        print()
 
         print(f"Datasets ({len(keys)}):")
-        for key in sorted(keys):
+        for key in keys:
             ds = f[key]
             print(f"  {key:<28s} shape={str(ds.shape):<22s} dtype={str(ds.dtype):<10s}")
 
         print()
-        if "arm_qpos" in f:
-            q = f["arm_qpos"][:]
-            print(
-                f"arm_qpos  range: [{np.array2string(q.min(axis=0), precision=3, suppress_small=True)}]"
-            )
-            print(
-                f"                    [{np.array2string(q.max(axis=0), precision=3, suppress_small=True)}]"
-            )
-        if "hand_qpos" in f:
-            hq = f["hand_qpos"][:]
-            print(
-                f"hand_qpos range: [{np.array2string(hq.min(axis=0), precision=3, suppress_small=True)}]"
-            )
-            print(
-                f"                    [{np.array2string(hq.max(axis=0), precision=3, suppress_small=True)}]"
-            )
-        status = f["flag_frame_status"][:]
-        print(f"frame OK rate: {np.mean(status == 0):.2%}")
-        if "flag_camera_fresh" in f:
-            fresh = f["flag_camera_fresh"][:]
-            print(f"flag_camera_fresh rate: {fresh.mean():.2%}")
+        if reader.num_frames:
+            for key in ("arm_qpos", "hand_qpos"):
+                q = f[key][:]
+                low = np.array2string(q.min(axis=0), precision=3, suppress_small=True)
+                high = np.array2string(q.max(axis=0), precision=3, suppress_small=True)
+                print(f"{key} range: {low} .. {high}")
+        print(f"episode valid: {reader.episode_valid}")
+        frame_valid = f["frame_valid"][:]
+        rate = f"{np.mean(frame_valid):.2%}" if reader.num_frames else "n/a (empty episode)"
+        print(f"frame valid rate: {rate}")
 
 
 class EpisodeVisualizer:
@@ -162,44 +122,31 @@ class EpisodeVisualizer:
         self._h5_path = Path(h5_path)
         self._reader = EpisodeReader(h5_path)
         try:
-            if not self._reader.min_frames_met:
-                logger.warning("Episode is below the configured minimum recording duration")
             self._h5f = self._reader.h5f
+            self._logical_dt_s = self._reader.dt
 
             self._rgb_cache = self._reader.read_camera_all("rgb")
             self._depth_cache = self._reader.read_camera_all("depth")
             logger.info("Pre-decoded %d RGB-D frames", self._rgb_cache.shape[0])
 
-            self._available = _classify_datasets(self._h5f)
-            # _classify_datasets only scans HDF5 keys; RGB lives in the MP4 sidecar.
-            if "rgb" not in self._available.get("camera", []):
-                self._available.setdefault("camera", []).append("rgb")
-            logger.info(
-                "Detected %d categories: %s",
-                len(self._available),
-                sorted(self._available.keys()),
-            )
-
-            meta = self._h5f.get("meta")
-            if meta is None:
-                raise ValueError("episode is missing /meta")
+            meta = self._h5f["meta"].attrs
             self._camera_model = load_raw_episode_camera_model(self._reader)
             self._camera_K = self._camera_model.geometry.color.matrix()
             self._depth_meter = 1.0 / self._camera_model.depth_scale_m
-            self._T_xarm_base_from_color: np.ndarray | None = None
-            self._pc_enabled = point_cloud
-            camera_type = str(meta.attrs.get("camera_type", ""))
-            if camera_type == "eye_to_hand" or self._pc_enabled:
-                self._T_xarm_base_from_color = load_raw_episode_base_from_color(self._reader)
-
+            self._T_xarm_base_from_color = load_raw_episode_base_from_color(self._reader)
+            self._handbase_position_eef_m = np.asarray(
+                meta["handbase_position_eef_m"], dtype=np.float64
+            )
+            self._handbase_quat_eef_wxyz = np.asarray(
+                meta["handbase_quat_eef_wxyz"], dtype=np.float64
+            )
             self._pointcloud_deriver: RawEpisodePointCloudDeriver | None = None
             self._empty_pointcloud_frames = 0
             self._pointcloud_processing_ns = 0
             self._pointcloud_processed_frames = 0
-            if self._pc_enabled:
+            if point_cloud:
                 if pointcloud_config is None:
                     raise ValueError("point-cloud visualization requires resolved config")
-                assert self._T_xarm_base_from_color is not None
                 self._pointcloud_deriver = RawEpisodePointCloudDeriver(
                     reader=self._reader,
                     camera=self._camera_model,
@@ -236,7 +183,7 @@ class EpisodeVisualizer:
             raise
 
     def _resolve_frame_count(self, max_frames: int | None) -> int:
-        raw = int(self._h5f["meta"].attrs.get("num_frames", 0))
+        raw = self._reader.num_frames
         if raw <= 0:
             raise ValueError("episode /meta num_frames must be positive")
         camera_counts = [self._rgb_cache.shape[0], self._depth_cache.shape[0]]
@@ -247,18 +194,8 @@ class EpisodeVisualizer:
         return raw
 
     def _preload_state(self) -> dict[str, np.ndarray]:
-        state: dict[str, np.ndarray] = {}
-        for _category, keys in self._available.items():
-            if _category == "camera":
-                continue
-            for key in keys:
-                data = self._h5f[key][: self._T]
-                if data.ndim == 0:
-                    data = data[()]
-                state[key] = np.asarray(data)
+        state = {key: self._h5f[key][: self._T] for keys in _SERIES_GROUPS.values() for key in keys}
 
-        # Raw stores physical joints; geometry is derived only for this viewer.
-        geometry = ProcessingConfig(pointcloud=PointCloudConfig(remove_table=False))
         arm = state["arm_qpos"]
         hand = state["hand_qpos"]
         arm_valid = np.all(np.isfinite(arm), axis=1)
@@ -268,154 +205,83 @@ class EpisodeVisualizer:
         if np.any(arm_valid):
             state["arm_ee"][arm_valid] = compute_eef_pose_history_xarm_base(arm[arm_valid])
         if np.any(hand_valid):
-            hand_fk = HandKinematics(geometry.hand_urdf_path, list(geometry.fingertip_link_names))
+            hand_fk = HandKinematics(
+                str(XHAND_RIGHT_URDF_PATH), list(HandParams.fingertip_link_names)
+            )
             state["hand_fingertip"][hand_valid] = compute_fingertip_history_xarm_base(
                 arm[hand_valid],
                 hand[hand_valid],
                 hand_fk=hand_fk,
-                handbase_position_eef_m=np.asarray(geometry.handbase_position_eef_m),
-                handbase_quat_eef_wxyz=np.asarray(geometry.handbase_quat_eef_wxyz),
+                handbase_position_eef_m=self._handbase_position_eef_m,
+                handbase_quat_eef_wxyz=self._handbase_quat_eef_wxyz,
                 eef_pose_history=state["arm_ee"][hand_valid],
             )
 
-        if "hand_contact" in state:
-            contact = state["hand_contact"]
-            state["hand_contact_mag"] = np.linalg.norm(contact, axis=2)  # (T, 5)
-            state["hand_force_thumb"] = contact[:, 0, :].copy()  # (T, 3)
-            state["hand_force_index"] = contact[:, 1, :].copy()  # (T, 3)
+        contact = self._h5f["hand_contact"][: self._T]
+        state["hand_contact_mag"] = np.linalg.norm(contact, axis=2)
+        state["hand_force_thumb"] = contact[:, 0, :]
+        state["hand_force_index"] = contact[:, 1, :]
 
         return state
 
     def _build_blueprint(self) -> rrb.Blueprint:
-        has_state = bool(self._available.get("arm") or self._available.get("hand"))
-        has_action = bool(self._available.get("action"))
-        has_flags = bool(self._available.get("flags"))
-
-        columns: list[rrb.Container | rrb.View] = []
-
-        cam_views = []
-        if "rgb" in (self._available.get("camera") or []):
-            cam_views.append(rrb.Spatial2DView(origin="camera/color/rgb", name="RGB"))
-        if "depth" in (self._available.get("camera") or []):
-            cam_views.append(rrb.Spatial2DView(origin="depth/image", name="Depth"))
-        if cam_views:
-            columns.append(rrb.Vertical(contents=cam_views, name="Camera"))
-
-        if self._pc_enabled or "hand_fingertip" in self._state or "arm_ee" in self._state:
-            columns.append(
-                rrb.Spatial3DView(
-                    origin="/",
-                    name="Point Cloud",
-                    background=[0.12, 0.12, 0.14],
-                )
-            )
-
         ts_verticals = []
-
-        if has_state:
-            state_views = []
-            for key in self._available.get("arm", []) + self._available.get("hand", []):
-                if key in self._state and 1 <= self._state[key].ndim <= 2:
-                    state_views.append(rrb.TimeSeriesView(origin=f"state/{key}", name=key))
-            for fkey in ("hand_contact_mag", "hand_force_thumb", "hand_force_index"):
-                if fkey in self._state:
-                    state_views.append(rrb.TimeSeriesView(origin=f"state/{fkey}", name=fkey))
-            if state_views:
-                ts_verticals.append(rrb.Vertical(contents=state_views, name="State"))
-
-        if has_action:
-            action_views = []
-            for key in self._available.get("action", []):
-                if key in self._state and 1 <= self._state[key].ndim <= 2:
-                    action_views.append(rrb.TimeSeriesView(origin=f"action/{key}", name=key))
-            if action_views:
-                ts_verticals.append(rrb.Vertical(contents=action_views, name="Action"))
-
-        if has_flags:
-            flag_views = [
-                rrb.TimeSeriesView(origin=f"flags/{key}", name=key)
-                for key in self._available.get("flags", [])
-            ]
-            ts_verticals.append(rrb.Vertical(contents=flag_views, name="Flags"))
-
-        if ts_verticals:
-            if len(ts_verticals) == 1:
-                columns.append(ts_verticals[0])
-            else:
-                columns.append(rrb.Tabs(contents=ts_verticals, active_tab=0, name="Time Series"))
-
-        return rrb.Blueprint(rrb.Horizontal(contents=columns))
+        for category, keys in _SERIES_GROUPS.items():
+            if category == "state":
+                keys = (*keys, *_FORCE_SERIES)
+            views = [rrb.TimeSeriesView(origin=f"{category}/{key}", name=key) for key in keys]
+            ts_verticals.append(rrb.Vertical(contents=views, name=category.title()))
+        return rrb.Blueprint(
+            rrb.Horizontal(
+                rrb.Vertical(
+                    rrb.Spatial2DView(origin="camera/color/rgb", name="RGB"),
+                    rrb.Spatial2DView(origin="depth/image", name="Depth"),
+                    name="Camera",
+                ),
+                rrb.Spatial3DView(origin="/", name="Point Cloud", background=[0.12, 0.12, 0.14]),
+                rrb.Tabs(contents=ts_verticals, active_tab=0, name="Time Series"),
+            )
+        )
 
     def _log_static(self) -> None:
-        for category, keys in self._available.items():
-            if category == "camera":
-                continue
+        for category, keys in _SERIES_GROUPS.items():
             for key in keys:
-                if key not in self._state:
-                    continue
                 arr = self._state[key]
-                if arr.ndim > 2:
-                    continue  # skip 3D+ arrays
-                base = self._series_origin(category, key)
-                if arr.ndim <= 1:
+                base = f"{category}/{key}"
+                if arr.ndim == 1:
                     rr.log(base, rr.SeriesLine(name=key), static=True)
                 else:
                     for i in range(arr.shape[1]):
                         rr.log(f"{base}/{i}", rr.SeriesLine(name=f"{i}"), static=True)
 
-        if self._camera_K is not None:
-            rgb_shape = self._rgb_cache.shape
-            h, w = rgb_shape[1], rgb_shape[2]
-            rr.log(
-                "camera/color",
-                rr.Pinhole(
-                    image_from_camera=self._camera_K,
-                    resolution=[w, h],
-                    camera_xyz=rr.ViewCoordinates.RDF,
-                    image_plane_distance=1.25,
-                ),
-                static=True,
-            )
-            logger.info("Camera pinhole logged (%dx%d)", w, h)
-
-        if self._T_xarm_base_from_color is not None:
-            rr.log(
-                "camera/color",
-                rr.Transform3D(
-                    translation=self._T_xarm_base_from_color[:3, 3],
-                    mat3x3=self._T_xarm_base_from_color[:3, :3],
-                ),
-                static=True,
-            )
-
-        _force_series = {
-            "hand_contact_mag": (
-                "thumb (SDK-scaled)",
-                "index (SDK-scaled)",
-                "middle (SDK-scaled)",
-                "ring (SDK-scaled)",
-                "pinky (SDK-scaled)",
+        h, w = self._rgb_cache.shape[1:3]
+        rr.log(
+            "camera/color",
+            rr.Pinhole(
+                image_from_camera=self._camera_K,
+                resolution=[w, h],
+                camera_xyz=rr.ViewCoordinates.RDF,
+                image_plane_distance=1.25,
             ),
-            "hand_force_thumb": ("Fx", "Fy", "Fz"),
-            "hand_force_index": ("Fx", "Fy", "Fz"),
-        }
-        for fkey, labels in _force_series.items():
-            if fkey in self._state:
-                base = f"state/{fkey}"
-                for i, label in enumerate(labels):
-                    rr.log(f"{base}/{i}", rr.SeriesLine(name=label), static=True)
+            static=True,
+        )
+        logger.info("Camera pinhole logged (%dx%d)", w, h)
+        rr.log(
+            "camera/color",
+            rr.Transform3D(
+                translation=self._T_xarm_base_from_color[:3, 3],
+                mat3x3=self._T_xarm_base_from_color[:3, :3],
+            ),
+            static=True,
+        )
 
-    @staticmethod
-    def _series_origin(category: str, key: str) -> str:
-        """Entity path: arm/hand → state/<key>, others → <category>/<key>."""
-        if category in ("arm", "hand"):
-            return f"state/{key}"
-        return f"{category}/{key}"
+        for key, labels in _FORCE_SERIES.items():
+            for i, label in enumerate(labels):
+                rr.log(f"state/{key}/{i}", rr.SeriesLine(name=label), static=True)
 
     def log_step(self, step_idx: int) -> None:
         rr.set_time_sequence("step", step_idx)
-        if "timestamp" in self._state:
-            rr.set_time_seconds("time", float(self._state["timestamp"][step_idx]))
+        rr.set_time_seconds("time", step_idx * self._logical_dt_s)
         self._log_camera(step_idx)
         self._log_pointcloud(step_idx)
         self._log_fingertips(step_idx)
@@ -423,21 +289,15 @@ class EpisodeVisualizer:
         self._log_time_series(step_idx)
 
     def _log_camera(self, step_idx: int) -> None:
-        camera_keys = self._available.get("camera", [])
-        if not camera_keys:
-            return
-
-        if "rgb" in camera_keys:
-            rr.log("camera/color/rgb", rr.Image(self._rgb_cache[step_idx]))
-        if "depth" in camera_keys:
-            rr.log(
-                "depth/image",
-                rr.DepthImage(
-                    self._depth_cache[step_idx],
-                    meter=self._depth_meter,
-                    depth_range=(0, 10000),
-                ),
-            )  # clamp outliers to stabilize colormap
+        rr.log("camera/color/rgb", rr.Image(self._rgb_cache[step_idx]))
+        rr.log(
+            "depth/image",
+            rr.DepthImage(
+                self._depth_cache[step_idx],
+                meter=self._depth_meter,
+                depth_range=(0, 10000),  # Clamp outliers to stabilize the colormap.
+            ),
+        )
 
     def _log_pointcloud(self, step_idx: int) -> None:
         if self._pointcloud_deriver is None:
@@ -462,10 +322,7 @@ class EpisodeVisualizer:
         )
 
     def _log_fingertips(self, step_idx: int) -> None:
-        fp_data = self._state.get("hand_fingertip")
-        if fp_data is None:
-            return
-        fp = _fingertip_positions_or_none(fp_data[step_idx])
+        fp = _fingertip_positions_or_none(self._state["hand_fingertip"][step_idx])
         if fp is None:
             # Clear stale geometry on invalid rows.
             rr.log("fingertips", rr.Clear(recursive=False))
@@ -481,10 +338,7 @@ class EpisodeVisualizer:
         )
 
     def _log_eef(self, step_idx: int) -> None:
-        ee_data = self._state.get("arm_ee")
-        if ee_data is None:
-            return
-        position = _eef_position_or_none(ee_data[step_idx])
+        position = _eef_position_or_none(self._state["arm_ee"][step_idx])
         if position is None:
             # Clear stale geometry on invalid rows.
             rr.log("eef", rr.Clear(recursive=False))
@@ -499,27 +353,20 @@ class EpisodeVisualizer:
         )
 
     def _log_time_series(self, step_idx: int) -> None:
-        for category, keys in self._available.items():
-            if category == "camera":
-                continue
+        for category, keys in _SERIES_GROUPS.items():
             for key in keys:
-                if key not in self._state:
-                    continue
                 arr = self._state[key]
-                if arr.ndim > 2:
-                    continue  # skip 3D+ arrays
-                base = self._series_origin(category, key)
-                if arr.ndim <= 1:
+                base = f"{category}/{key}"
+                if arr.ndim == 1:
                     rr.log(base, rr.Scalar(float(arr[step_idx])))
                 else:
                     for i in range(arr.shape[1]):
                         rr.log(f"{base}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
-        for fkey in ("hand_contact_mag", "hand_force_thumb", "hand_force_index"):
-            if fkey in self._state:
-                arr = self._state[fkey]
-                for i in range(arr.shape[1]):
-                    rr.log(f"state/{fkey}/{i}", rr.Scalar(float(arr[step_idx, i])))
+        for key in _FORCE_SERIES:
+            arr = self._state[key]
+            for i in range(arr.shape[1]):
+                rr.log(f"state/{key}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
     @property
     def num_steps(self) -> int:
@@ -569,14 +416,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--point-cloud",
         action=argparse.BooleanOptionalAction,
-        default=None,
+        default=True,
         help=("Display the canonical point cloud (default: enabled)."),
     )
     parser.add_argument(
         "--pointcloud-num-points",
         type=int,
         default=None,
-        help="Override the current runtime point-cloud count.",
+        help="Override the no-table point-cloud count used for this offline view.",
     )
     args = parser.parse_args(argv)
     if args.max_frames is not None and args.max_frames <= 0:
@@ -592,26 +439,19 @@ def main(argv: list[str] | None = None) -> int:
         print_episode_info(str(h5_path))
         return 0
 
-    point_cloud_enabled = True if args.point_cloud is None else args.point_cloud
-    if args.pointcloud_num_points is not None and not point_cloud_enabled:
-        parser.error("--pointcloud-num-points requires an enabled point cloud")
-
-    runtime = resolve_experiment_config() if point_cloud_enabled else None
     pointcloud_config = None
-    table_plane_abcd = None
-    if runtime is not None:
-        pointcloud_config = runtime.pointcloud
+    if args.point_cloud:
+        # Raw stores no historical table plane. Keep table removal disabled
+        # rather than reading today's runtime calibration for an offline episode.
+        pointcloud_config = PointCloudConfig(remove_table=False)
         if args.pointcloud_num_points is not None:
             pointcloud_config = replace(pointcloud_config, num_points=args.pointcloud_num_points)
-        table = runtime.environment.table
-        table_plane_abcd = resolve_table_plane(table) if pointcloud_config.remove_table else None
 
     viz = EpisodeVisualizer(
         str(h5_path),
         max_frames=args.max_frames,
-        point_cloud=point_cloud_enabled,
+        point_cloud=args.point_cloud,
         pointcloud_config=pointcloud_config,
-        table_plane_abcd=table_plane_abcd,
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.num_steps)

@@ -19,10 +19,6 @@ from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
 )
 
-# Public dexmani_policy metadata vocabulary; this does not name a storage format.
-FINGERTIP_POINTS_DERIVATION = "fk_from_processed_joint_state"
-FINGERTIP_POLICY_ID = "arm_hand_fk_from_joint_state_v1"
-
 
 def compute_fingertip_points_xarm_base(
     arm_qpos: np.ndarray,
@@ -129,8 +125,6 @@ def compute_fingertip_history_xarm_base(
 
 
 __all__ = [
-    "FINGERTIP_POINTS_DERIVATION",
-    "FINGERTIP_POLICY_ID",
     "compute_fingertip_history_xarm_base",
     "compute_fingertip_points_xarm_base",
 ]

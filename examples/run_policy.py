@@ -4,13 +4,12 @@
 
 Runs supervised physical evaluation (H -> scene setup -> B -> S), saving run_config.yaml.
 Recording failure invalidates evaluation; judge task success offline.
-Synchronous action chunks never catch up late inference; use HDF5 timestamps for timing.
+Synchronous action chunks never catch up late inference; timing diagnostics remain in runtime.
 """
 
 from __future__ import annotations
 
 import argparse
-import getpass
 import math
 import subprocess
 import sys
@@ -270,7 +269,6 @@ def main(argv: list[str] | None = None) -> int:
     recording_config = RolloutRecordingConfig(
         data_dir=str(session_dir),
         task_label=info.task_name,
-        operator=getpass.getuser(),
     )
     _print_summary(
         info,

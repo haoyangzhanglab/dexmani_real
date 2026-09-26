@@ -19,26 +19,16 @@ from dexmani_real.dataset.pointcloud import (
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
 )
-from dexmani_real.dataset.provenance import (
-    read_provenance_workflow,
-    supports_fixed_dt_teleop,
-)
 from dexmani_real.planning.kinematics.arm_fk import (
-    EEF_POSE_ALGORITHM_ID,
     EEF_POSE_COMPONENTS,
-    EEF_POSE_DERIVATION,
     EEF_POSE_FRAME,
     compute_eef_pose_history_xarm_base,
 )
-from dexmani_real.planning.kinematics.fingertip import (
-    FINGERTIP_POINTS_DERIVATION,
-    FINGERTIP_POLICY_ID,
-    compute_fingertip_history_xarm_base,
-)
+from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
 from dexmani_real.recording.storage.reader import EpisodeReader
-from dexmani_real.recording.storage.schema import DATASET_SPECS, FRAME_OK
+from dexmani_real.recording.storage.schema import DATASET_SPECS
 from dexmani_real.robot.model import (
     CONTACT_FORCE_REPRESENTATION,
     HAND_FINGER_NAMES,
@@ -52,59 +42,34 @@ from dexmani_real.robot.model import (
     XHAND_SENSOR_NATIVE_AXES_FRAME,
     XHAND_TACTILE_SENSOR_FINGER_IDS,
 )
-from dexmani_real.sensor.pointcloud import (
-    POINT_CLOUD_COLOR_SOURCE,
-    POINT_CLOUD_POLICY_ID,
-    POINT_CLOUD_SAMPLING,
-    POINT_CLOUD_TRANSFORM,
-)
 
 
-def validate_episode(reader) -> int:
+def validate_episode(reader: EpisodeReader) -> int:
     """Admit every row of a complete teleop episode, or reject the whole episode."""
-    reader.require_valid(purpose="training export")
     source = reader.h5f
-    if bool(source["meta"].attrs.get("had_pause", False)):
-        raise ValueError("episode contains an operator or sensor pause")
-    workflow = read_provenance_workflow(source["meta"].attrs)
-    if not supports_fixed_dt_teleop(workflow):
-        raise ValueError(f"training requires teleop provenance, got {workflow!r}")
-    frames = int(source["meta"].attrs["num_frames"])
+    meta = source["meta"].attrs
+    frames = reader.num_frames
     if frames <= 0:
         raise ValueError("episode contains no rows")
-    status = source["flag_frame_status"][:]
-    bad = np.flatnonzero(status != FRAME_OK)
+    task_label = meta["task_label"]
+    if isinstance(task_label, bytes):
+        task_label = task_label.decode("utf-8")
+    validate_task_name(task_label)
+    collection_source = meta["collection_source"]
+    if isinstance(collection_source, bytes):
+        collection_source = collection_source.decode("utf-8")
+    if collection_source != "teleop":
+        raise ValueError(f"training requires teleop collection_source, got {collection_source!r}")
+    if not reader.episode_valid:
+        raise ValueError("episode_valid is false")
+    frame_valid = source["frame_valid"][:]
+    bad = np.flatnonzero(~frame_valid)
     if len(bad):
-        raise ValueError(f"non-OK frame status {status[bad[0]]} at row {bad[0]}")
-    for name in ("hand_contact_valid", "hand_tactile_force_valid"):
-        bad = np.flatnonzero(~source[name][:])
-        if len(bad):
-            raise ValueError(f"{name} false at row {bad[0]}")
+        raise ValueError(f"frame_valid is false at row {bad[0]}")
     for name, spec in DATASET_SPECS.items():
-        if spec.dtype.kind == "f" and name not in {"arm_eef_intent", "head_quat_wxyz"}:
+        if spec.dtype.kind == "f":
             if not np.isfinite(source[name][:]).all():
                 raise ValueError(f"{name}: non-finite values")
-    dt = reader.timing.grid_dt_s
-    for name in ("observation_timestamp_ns", "action_timestamp_ns"):
-        stamps = source[name][:]
-        if np.any(stamps == 0) or np.any(stamps[1:] <= stamps[:-1]):
-            raise ValueError(f"{name}: must be positive and strictly increasing")
-        gaps = np.diff(stamps.astype(np.int64))
-        if np.any(gaps > round(2 * dt * 1e9)):
-            raise ValueError(f"{name}: pause/missing-control gap exceeds 2 nominal periods")
-    if np.any(source["action_timestamp_ns"][:] < source["observation_timestamp_ns"][:]):
-        raise ValueError("action precedes observation completion")
-    for name in ("arm_timestamp_ns", "hand_timestamp_ns", "camera_timestamp_ns", "vr_timestamp_ns"):
-        if np.any(source[name][:] == 0):
-            raise ValueError(f"{name}: missing source timestamp")
-    camera = load_raw_episode_camera_model(reader)
-    load_raw_episode_base_from_color(reader)
-    geometry = camera.geometry.color
-    depth = source["depth"]
-    if depth.shape != (frames, geometry.height, geometry.width) or depth.dtype != np.dtype(
-        np.uint16
-    ):
-        raise ValueError("depth shape/dtype/frame count mismatch")
     return frames
 
 
@@ -187,13 +152,8 @@ def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
 
 def policy_semantics(reader: EpisodeReader, config: ProcessingConfig) -> dict[str, Any]:
     meta = reader.h5f["meta"].attrs
-    camera = load_raw_episode_camera_model(reader)
     return {
-        "camera_intrinsic": camera.geometry.color.matrix().reshape(-1).tolist(),
-        "camera_extrinsic": load_raw_episode_base_from_color(reader).tolist(),
-        "camera_geometry": camera.geometry.to_dict(),
         "joint_names": list(ROBOT_JOINT_NAMES),
-        "joint_order": "xarm7_joint1_to_7+xhand_sdk_12",
         "finger_names": list(HAND_FINGER_NAMES),
         "tactile_sensor_ids": list(XHAND_TACTILE_SENSOR_FINGER_IDS),
         "tactile_axis_names": ["fx", "fy", "fz"],
@@ -208,25 +168,17 @@ def policy_semantics(reader: EpisodeReader, config: ProcessingConfig) -> dict[st
         "action_semantics": "teleop_published_joint_target",
         "fingertip_points_frame": "xarm_base",
         "fingertip_points_unit": "m",
-        "fingertip_points_derivation": FINGERTIP_POINTS_DERIVATION,
-        "fingertip_points_policy_id": FINGERTIP_POLICY_ID,
         "fingertip_config_json": canonical_json(
             {
                 "fingertip_link_names": list(config.fingertip_link_names),
-                "handbase_position_eef_m": list(config.handbase_position_eef_m),
-                "handbase_quat_eef_wxyz": list(config.handbase_quat_eef_wxyz),
             }
         ),
         "eef_pose_frame": EEF_POSE_FRAME,
         "eef_pose_components": EEF_POSE_COMPONENTS,
-        "eef_pose_derivation": EEF_POSE_DERIVATION,
-        "eef_pose_algorithm_id": EEF_POSE_ALGORITHM_ID,
         "action_ee_frame": "xarm_base",
         "action_ee_components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
-        "contact_force_source": "raw_hand_contact_control_step",
         "contact_force_representation": CONTACT_FORCE_REPRESENTATION,
         "contact_force_unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
-        "contact_force_si_verified": False,
         "contact_force_frame": XHAND_SENSOR_NATIVE_AXES_FRAME,
         "tactile_force_representation": TACTILE_FORCE_REPRESENTATION,
         "tactile_force_finger_order": HAND_FINGER_ORDER_ID,
@@ -234,61 +186,49 @@ def policy_semantics(reader: EpisodeReader, config: ProcessingConfig) -> dict[st
         "tactile_force_point_order": TACTILE_FORCE_POINT_ORDER,
         "tactile_force_axis_labels": TACTILE_FORCE_AXIS_LABELS,
         "tactile_force_unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
-        "tactile_force_si_verified": False,
-        "tactile_force_spatial_geometry_verified": False,
         "depth_scale_m_per_unit": float(meta["depth_scale"]),
         "depth_invalid_value": 0,
-        "camera_intrinsic_semantics": "native_color_intrinsics_for_depth_to_color_aligned_depth",
-        "camera_extrinsic_semantics": "T_xarm_base_from_color;native_color_optical_to_xarm_base",
         "point_cloud_frame": "xarm_base",
         "pointcloud_config_json": canonical_json(config.pointcloud.to_dict()),
-        "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
-        "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
-        "point_cloud_table_plane_abcd_json": canonical_json(
-            None if config.table_plane_abcd is None else list(config.table_plane_abcd)
-        ),
-        "point_cloud_sampling": POINT_CLOUD_SAMPLING,
-        "point_cloud_transform": POINT_CLOUD_TRANSFORM,
     }
 
 
 def iter_policy_blocks(reader: EpisodeReader, config: ProcessingConfig, *, chunk_frames: int):
     """One episode of numeric state; bounded RGB-D/cloud chunks, never a task in RAM."""
-    frames = int(reader.h5f["meta"].attrs["num_frames"])
+    frames = reader.num_frames
     camera_model = load_raw_episode_camera_model(reader)
     geometry = camera_model.geometry
     transform = load_raw_episode_base_from_color(reader)
-    values = {}
-    arm_action = np.asarray(reader.h5f["action_arm_joint_target"][:], dtype=np.float32)
-    hand_action = np.asarray(reader.h5f["action_hand_joint_target"][:], dtype=np.float32)
-    arm_action_ee = compute_eef_pose_history_xarm_base(arm_action).astype(np.float32)
-    joint_state = np.concatenate(
-        (
-            np.asarray(reader.h5f["arm_qpos"][:], dtype=np.float32),
-            np.asarray(reader.h5f["hand_qpos"][:], dtype=np.float32),
-        ),
-        axis=1,
-    )
-    values["joint_state"] = joint_state
-    values["action"] = np.concatenate((arm_action, hand_action), axis=1)
-    values["action_ee"] = np.concatenate((arm_action_ee, hand_action), axis=1)
-    for name in ("arm_qvel", "arm_effort", "hand_current"):
-        values[name] = np.asarray(reader.h5f[name][:], dtype=np.float32)
-    values["contact_force"] = np.asarray(reader.h5f["hand_contact"][:], dtype=np.float32)
-    values["tactile_force"] = np.asarray(reader.h5f["hand_tactile_force"][:], dtype=np.float32)
+    arm_action = np.asarray(reader.h5f["action_arm_joint_target"][:], dtype=np.float64)
+    hand_action = np.asarray(reader.h5f["action_hand_joint_target"][:], dtype=np.float64)
+    arm_qpos = np.asarray(reader.h5f["arm_qpos"][:], dtype=np.float64)
+    hand_qpos = np.asarray(reader.h5f["hand_qpos"][:], dtype=np.float64)
+    action_ee_pose = compute_eef_pose_history_xarm_base(arm_action)
+    eef_pose = compute_eef_pose_history_xarm_base(arm_qpos)
+    joint_state = np.concatenate((arm_qpos, hand_qpos), axis=1)
     hand_fk = HandKinematics(config.hand_urdf_path, list(config.fingertip_link_names))
     if not hand_fk.is_ready():
         raise RuntimeError("policy fingertip FK startup failed")
-    eef_pose = compute_eef_pose_history_xarm_base(joint_state[:, :7])
-    values["eef_pose"] = eef_pose.astype(np.float32)
-    values["fingertip_points"] = compute_fingertip_history_xarm_base(
-        joint_state[:, :7],
-        joint_state[:, 7:19],
+    mount = reader.h5f["meta"].attrs
+    fingertip_points = compute_fingertip_history_xarm_base(
+        arm_qpos,
+        hand_qpos,
         hand_fk=hand_fk,
-        handbase_position_eef_m=np.asarray(config.handbase_position_eef_m, dtype=np.float64),
-        handbase_quat_eef_wxyz=np.asarray(config.handbase_quat_eef_wxyz, dtype=np.float64),
+        handbase_position_eef_m=np.asarray(mount["handbase_position_eef_m"], dtype=np.float64),
+        handbase_quat_eef_wxyz=np.asarray(mount["handbase_quat_eef_wxyz"], dtype=np.float64),
         eef_pose_history=eef_pose,
     )
+    values = {
+        "joint_state": joint_state.astype(np.float32),
+        "action": np.concatenate((arm_action, hand_action), axis=1).astype(np.float32),
+        "action_ee": np.concatenate((action_ee_pose, hand_action), axis=1).astype(np.float32),
+        "eef_pose": eef_pose.astype(np.float32),
+        "fingertip_points": fingertip_points.astype(np.float32),
+        "contact_force": np.asarray(reader.h5f["hand_contact"][:], dtype=np.float32),
+        "tactile_force": np.asarray(reader.h5f["hand_tactile_force"][:], dtype=np.float32),
+    }
+    for name in ("arm_qvel", "arm_effort", "hand_current"):
+        values[name] = np.asarray(reader.h5f[name][:], dtype=np.float32)
     pointcloud_deriver = RawEpisodePointCloudDeriver(
         reader=reader,
         camera=camera_model,
@@ -323,17 +263,8 @@ def iter_policy_blocks(reader: EpisodeReader, config: ProcessingConfig, *, chunk
         for key, value in block.items():
             if np.issubdtype(value.dtype, np.floating) and not np.isfinite(value).all():
                 raise ValueError(f"{key}: non-finite transformed values")
+        validate_canonical_rot6d(block["action_ee"][:, 3:9], label="action_ee")
         validate_canonical_rot6d(block["eef_pose"][:, 3:9], label="eef_pose")
-        cloud = block["point_cloud"]
-        lower, upper = np.asarray(config.pointcloud.workspace).reshape(2, 3)
-        if (
-            np.any(cloud[..., :3] < lower)
-            or np.any(cloud[..., :3] > upper)
-            or np.any(cloud[..., 3:] < 0)
-            or np.any(cloud[..., 3:] > 1)
-            or np.any(~np.any(np.linalg.norm(cloud[..., :3], axis=2) > 0, axis=1))
-        ):
-            raise ValueError("derived point cloud violates workspace/color contract")
         yield block
     if next(images, None) is not None:
         raise ValueError("RGB contains extra frames")

@@ -31,7 +31,6 @@ def make_action_planner(action_mode, runtime):
 class DecodedPolicyAction:
     arm_qpos: np.ndarray | None
     hand_qpos: np.ndarray
-    arm_eef_intent: np.ndarray | None
     hand_clip_rad: float
     workspace_clip_m: float = 0.0
     ik_result: IKResult | None = None
@@ -57,11 +56,10 @@ def decode_policy_action(
     )
     hand_clip = float(np.max(np.abs(hand - raw_hand)))
     if action_mode == "joint":
-        return DecodedPolicyAction(action[:7], hand, None, hand_clip)
+        return DecodedPolicyAction(action[:7], hand, hand_clip)
     planner.set_hand_qpos(hand)
     position = np.clip(action[:3], workspace[:, 0], workspace[:, 1])
     workspace_clip = float(np.max(np.abs(position - action[:3])))
-    intent = np.concatenate((position, action[3:9]))
     result = planner.solve_online_ik(
         Pose(p=position, q=rot6d_to_quat_wxyz(action[3:9])),
         current_arm_qpos,
@@ -70,7 +68,6 @@ def decode_policy_action(
     return DecodedPolicyAction(
         result.qpos if result.success else None,
         hand,
-        intent,
         hand_clip,
         workspace_clip_m=workspace_clip,
         ik_result=result,

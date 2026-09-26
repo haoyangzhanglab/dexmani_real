@@ -9,7 +9,6 @@ from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import make_online_ik_config
 from dexmani_real.recording.client import RecorderClient
-from dexmani_real.recording.storage.schema import FRAME_OK
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.runtime.observation import read_observation
@@ -51,7 +50,11 @@ class TeleopRunner:
         self.shared = shared
         self.config = config
         self.runtime = config.runtime
-        self.recorder = RecorderClient(shared) if self.runtime.policy.recording_enabled else None
+        self.recorder = (
+            RecorderClient(shared, control_hz=self.runtime.teleop.control_hz)
+            if self.runtime.policy.recording_enabled
+            else None
+        )
         self.keyboard = KeyboardInput(
             estop_callback=lambda: setattr(shared.estop_request, "value", True)
         )
@@ -78,7 +81,7 @@ class TeleopRunner:
         self.active = self.paused = self.resume_requested = False
         if self.recorder is not None and self.recorder.is_recording:
             if abnormal:
-                self.recorder.technical_status = "invalid"
+                self.recorder.invalidate_episode()
             self.recorder.stop_episode(save=save, reason=reason)
 
     def _pause(self, manual, mark_episode=True):
@@ -87,7 +90,7 @@ class TeleopRunner:
         if self.controller is not None:
             self.controller.clear_reference()
         if mark_episode and self.recorder is not None and self.recorder.is_recording:
-            self.recorder.had_pause = True
+            self.recorder.invalidate_episode()
         self.paused, self.resume_requested = True, not manual
         self.audio.play("pause")
 
@@ -119,7 +122,7 @@ class TeleopRunner:
             print("Begin requires fresh robot, VR and recording resources", flush=True)
             return
         if self.recorder is not None and not self.recorder.start_episode(
-            task_label=self.config.task_label, operator=self.config.operator
+            task_label=self.config.task_label
         ):
             return
         # START may block on disk; anchor only after it finishes.
@@ -198,7 +201,7 @@ class TeleopRunner:
 
     def _execute_control_step(self, row, tick_started):
         submitted_before = self.recorder.frame_count if self.recorder is not None else 0
-        status = execute_control_step(self.controller, self.shared, row, self.recorder)
+        control_ok = execute_control_step(self.controller, self.shared, row, self.recorder)
         if (
             self.recorder is not None
             and self.recorder.frame_count > submitted_before
@@ -207,7 +210,7 @@ class TeleopRunner:
             self._stop_episode(True, "max_record_duration")
             return
         self.next_tick = tick_started + 1 / self.runtime.teleop.control_hz
-        self.failures = self.failures + 1 if status != FRAME_OK else 0
+        self.failures = self.failures + 1 if not control_ok else 0
         if self.failures >= _DEBUG_FAILURE_LIMIT:
             self._pause(True)
 
@@ -307,7 +310,7 @@ class TeleopRunner:
             try:
                 if self.recorder is not None:
                     if self.recorder.is_recording:
-                        self.recorder.technical_status = "invalid"
+                        self.recorder.invalidate_episode()
                         self.recorder.stop_episode(save=True, reason="interrupted")
                     self.recorder.join_stop()
             except Exception as exc:

@@ -1,6 +1,5 @@
 """Policy deployment process ownership and operator lifecycle."""
 
-import json
 import math
 import multiprocessing as mp
 import os
@@ -43,39 +42,18 @@ logger = get_logger(__name__)
 def _rollout_recorder_config(
     rollout: RolloutRecordingConfig,
     worker_config: PolicyRuntimeConfig,
-    max_running_s: float,
-    num_episodes: int,
+    runtime,
     *,
     camera_calibration: CameraExtrinsics,
-    pointcloud_config: PointCloudWorkerConfig | None,
 ) -> RecorderWorkerConfig:
-    """Record resolved policy experiment settings alongside the raw observations."""
-    control_hz = 1.0 / float(worker_config.spec.control_dt_s)
+    """Snapshot the physical hand mount used by this recorded rollout."""
     return RecorderWorkerConfig(
         data_dir=rollout.data_dir,
-        control_hz=control_hz,
-        min_frames=1,
+        control_hz=1.0 / float(worker_config.spec.control_dt_s),
         camera_calibration=camera_calibration,
-        provenance={
-            "workflow": "policy_eval",
-            **(
-                {
-                    "pointcloud_config_json": json.dumps(pointcloud_config.pointcloud.to_dict()),
-                    "pointcloud_table_plane_abcd_json": json.dumps(
-                        pointcloud_config.table_plane_abcd
-                    ),
-                }
-                if pointcloud_config is not None
-                else {}
-            ),
-            "policy_selector": worker_config.experiment,
-            "checkpoint_name": worker_config.artifact,
-            "inference_steps": str(worker_config.inference_steps),
-            "n_action_steps": str(worker_config.spec.n_action_steps),
-            "seed": str(worker_config.seed),
-            "max_running_s": f"{float(max_running_s):.17g}",
-            "num_episodes": str(int(num_episodes)),
-        },
+        collection_source="policy_rollout",
+        handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
+        handbase_quat_eef_wxyz=runtime.hand.T_eef_handbase_quat_wxyz,
     )
 
 
@@ -188,10 +166,8 @@ def run_policy_deployment(
                         _rollout_recorder_config(
                             recording_config,
                             worker_config,
-                            max_running_s,
-                            num_episodes,
+                            runtime,
                             camera_calibration=camera_calibration,
-                            pointcloud_config=pointcloud_config,
                         ),
                     ),
                 )

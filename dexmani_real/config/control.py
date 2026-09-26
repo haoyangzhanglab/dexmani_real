@@ -76,7 +76,6 @@ class PolicyParams:
 
     recording_enabled: bool = True
     max_record_duration_s: float = 60.0
-    min_record_duration_s: float = 1.0
     episodes_dir: str = "episodes"
 
     ik_max_pose_error_pos_m: float = 0.02
@@ -92,14 +91,8 @@ class PolicyParams:
         )
         if not all(np.isfinite(value) and value > 0 for value in timing):
             raise ValueError("policy operator timeouts must be finite and positive")
-        if (
-            not np.isfinite(self.max_record_duration_s)
-            or not np.isfinite(self.min_record_duration_s)
-            or self.max_record_duration_s <= 0
-            or self.min_record_duration_s < 0
-            or self.min_record_duration_s > self.max_record_duration_s
-        ):
-            raise ValueError("recording durations must be finite, ordered, and non-negative")
+        if not np.isfinite(self.max_record_duration_s) or self.max_record_duration_s <= 0:
+            raise ValueError("max_record_duration_s must be finite and positive")
         if not self.episodes_dir:
             raise ValueError("policy episodes_dir must be non-empty")
         if (

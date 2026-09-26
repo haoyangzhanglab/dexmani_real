@@ -14,7 +14,6 @@ class TeleopConfig:
 
     runtime: ExperimentConfig
     task_label: str = ""
-    operator: str = ""
     hand_urdf_path: str = str(XHAND_RIGHT_URDF_PATH)
 
     def __post_init__(self) -> None:

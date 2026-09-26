@@ -1,302 +1,116 @@
-# pick_place_toy 数据审计与迁移适配方案
+# pick_place_toy：迁移结果与审计依据
 
-## 1. 文档范围与结论
+真实数据迁移和下游加载验收已于 **2026-09-27 完成**。正式路径为 immutable Raw v30 → 独立迁移工具 → Raw v34 → 正常 Zarr v15 exporter。正常 reader 仅接受 v34，`dexmani_policy` 未修改。
 
-本文件汇总 `episodes/pick_place_toy` 的离线检查结果、历史格式与当前代码的语义差异，以及后续迁移的实施条件。
+## 已发布数据
 
-- 检查日期：2026-09-26。
-- 当前代码基线：`436f8ba7dd1e5b70762e6ca0789bb226d9557138`。
-- 数据范围：61 个 episode，共 14,309 帧。
-- 当前 raw schema：v33；当前 canonical Policy Zarr schema：v15。两者是不同的版本体系。
-- 工作状态：已完成格式审计和迁移方案分析；尚未实施迁移、修改源数据或生成训练缓存。
-- 检查方式：只读离线检查，没有连接或操作机器人、手部和相机。
+| 数据 | 本机路径 | Episode 数 | 行数 |
+| --- | --- | ---: | ---: |
+| 原始 v30，保持只读 | `episodes/pick_place_toy` | 61 | 14,309 |
+| 已迁移 Raw v34 | `episodes/raw_v34/pick_place_toy` | 61 | 14,309 |
+| 已导出 Zarr v15，13 种模态 | `datasets/pick_place_toy.zarr` | 51 | 11,710 |
+| 未进入 Zarr，仍完整保留在 Raw | 见下表 | 10 | 2,599 |
 
-**现有数据全部声明为 raw v30，不能被当前读取器直接接受。** 当前导出程序的 `--dry-run` 已验证：61 段全部因版本不匹配被拒绝，最终返回 `export produced no included episodes`。
+183 个源文件的迁移前后及最终复核 SHA256 全部一致；122 个 RGB/depth 文件按字节复制，没有重编码或重采样。九个直接映射数组及行顺序保持不变，包括失败行和 NaN。输出经 staging 校验后原子发布，工具拒绝覆盖已有目标。
 
-迁移应区分两个目标：
+## 语义证据与映射
 
-| 目标 | 当前判断 |
+[A01–A19 操作者证词](outputs/data_refactor/pick_place_toy_operator_attestation.md)、[历史源码语义审计](outputs/data_refactor/pick_place_toy_source_semantics_audit.md)及[原始采集日志核对](outputs/data_refactor/pick_place_toy_original_log_evidence.json)共同支持此次人工语义审计。[迁移证据文件](outputs/data_refactor/pick_place_toy_migration_evidence.json)将依据绑定到各段三个源文件的 SHA256。
+
+操作者确认了采集方式、设备及关节语义、实际安装、相机标定、触觉归零和已完成的缩放、最终动作目标、观测先于动作、没有删行/重采样，以及暂停后保存退出和录制连续性。**这些是明确归属于操作者记忆的证词；没有恢复逐次 converter 执行日志、原始配置快照或动作发布时间戳。** 文件哈希、默认配置和历史源码本身不能单独证明这些采集事实。
+
+| 项目 | 本批次迁移决定 |
 | --- | --- |
-| 完整迁入 raw v33，供当前原始数据工作流使用 | 现有文件缺少真实动作发布时间等信息，暂不能无损完成 |
-| 保留旧 raw，生成符合当前训练语义的完整 Zarr | 有条件可行；必须先证明历史观测—动作对应、动作目标和模态语义，不能绕过证据缺失 |
+| 最终动作 | `action_arm_joint_sent` → `action_arm_joint_target`；`action_hand_joint` → `action_hand_joint_target`；不使用旧 `action_arm_ee` Cartesian intent |
+| Effort | `arm_tau` 原值 → `arm_effort`；SDK-native，SI 单位未验证，不标为 Nm |
+| 触觉 | 两个数组均 scale=1；保持原值和 NaN，不再乘 10，不重新归零 |
+| 相机 | 使用各段已有的 aligned RGB-D 内参、畸变、base-from-color 和 depth scale；不加载当前相机标定替代历史数据 |
+| 物理手部安装 | 位置 `[-0.015, 0, 0]` m、wxyz 四元数 `[0.707107, 0, 0.707107, 0]`；依据操作者确认及一致的历史配置，写入各段 Raw |
+| 离线几何 | mount 只读 Raw；URDF、指尖 link 顺序和点云处理参数来自显式 exporter 配置 |
+| 桌面平面 | 历史平面未获证明，显式 `remove_table=false` |
 
-建议优先评估第二条路径。训练缓存不保存运行时时间戳，不代表可以省略对原始数据时序正确性的审计。若无法证明训练所需的语义，也不能将数据标记为当前 canonical Zarr。
+旧 status 按 v30 解释：0 正常、2 IK 失败、4 retarget 失败。`frame_valid` 还要求 action queued、旧观测/相机标志有效、arm/hand connected 且 hand qpos 不 stale。保留了全部 31 个 false rows，不用证词覆盖已记录异常。触觉 validity 与数值一致性独立检查：有效必须全有限，无效必须含 NaN；矛盾时拒绝迁移，不填补或修复。
 
-## 2. 已完成的检查
+`episode_valid` 同时受源文件事实和生命周期证据约束，不能用 requested true 覆盖失败事实。相邻有效行间隔超过两个控制周期（16 Hz 下为 125 ms）的四段标为 false，其余 57 段依据证词、日志及源事实标为 true。Raw 不保存 synthetic timestamps 或旧诊断字段；这些历史证据保留在原始 v30 和报告中。
 
-### 2.1 文件与数值完整性
+## 整段拒绝的 10 个 episode
 
-| 项目 | 结果 |
+下表均为 `episode_20260827_` 前缀，行索引从 **0** 开始。“观测/相机无效”表示旧 `observation_valid` 和 `flag_camera_fresh` 同时为 false；具体物理原因尚未建立，不能断言相机硬件故障。
+
+| Episode 后缀 | 完整行数 | 源文件记录的异常 | 额外生命周期判定 |
+| --- | ---: | --- | --- |
+| `172305` | 304 | 行 264、265 观测/相机无效 | 有效行间隔 187.5 ms，episode_valid=false |
+| `175240` | 301 | 行 27、28 观测/相机无效 | 有效行间隔 187.5 ms，episode_valid=false |
+| `194525` | 286 | 行 238、239 IK 失败 | 有效行间隔 187.5 ms，episode_valid=false |
+| `195951` | 318 | 行 157 聚合和密集触觉含 NaN，旧 validity 均为 false | 触觉独立于 frame_valid，仍整段拒绝 |
+| `220112` | 223 | 行 220 观测/相机无效 | — |
+| `220747` | 313 | 行 51 观测/相机无效 | — |
+| `220919` | 225 | 行 94 观测/相机无效 | — |
+| `223607` | 240 | 行 18 观测/相机无效 | — |
+| `223729` | 192 | 行 111 观测/相机无效 | — |
+| `224527` | 197 | 行 133 观测/相机无效；行 140–158 IK 失败 | 有效行间隔 1250 ms，episode_valid=false |
+
+所有坏段均完整保留在 Raw，Zarr 中为 0 行；没有拆段、删除坏行、拼接、插值、平滑或重新采样。
+
+## 实际执行与验收
+
+实现起始代码基线为 `753d7ec36085c84f479da4855042c158582484a8`。完整结果保存在本机 `outputs/data_refactor/`（该目录不提交 Git）：
+
+| 记录 | 实际结果 |
 | --- | --- |
-| Episode 数量及帧数 | 61 段，14,309 帧；每段 165–331 帧 |
-| 必需文件 | 每段均存在 `data.h5`、`depth.h5`、`rgb.mp4` |
-| RGB | 全部 14,309 帧解码成功，尺寸为 640×480 |
-| Depth | 全部帧读取成功，尺寸为 640×480，dtype 为 `uint16`，无全零深度帧 |
-| 行数一致性 | 控制数组、深度数组和实际解码 RGB 帧数均与 `num_frames` 一致 |
-| 共有字段 | 与 v33 同名字段的形状和 dtype 均匹配 |
-| 相机几何 | 元数据通过当前相机模型和刚体变换校验 |
-| 深度尺度 | 全部为约 `0.00025 m/unit`，不可按毫米直接解释原始数值 |
-| 浮点有限性 | 除第 2.3 节列出的无效触觉行外，扫描到的其他浮点数组没有 NaN/Inf |
+| [有证据 dry-run](outputs/data_refactor/pick_place_toy_migration_attested_dry_run.json)及[迁移完成报告](outputs/data_refactor/pick_place_toy_migration_completed.json) | 实际迁移退出码 0；61 migrated、0 blocked/failed；逐段 v34 reader 重开、数组/媒体/源哈希验证通过 |
+| [FK 预检](outputs/data_refactor/pick_place_toy_preflight_fk.json) | 全部 measured/target arm 及 fingertip FK finite 检查通过 |
+| [显式导出配置](outputs/data_refactor/pick_place_toy_export.yaml) | 完整点云参数，remove_table=false，无第二份 hand mount |
+| [Zarr dry-run](outputs/data_refactor/pick_place_toy_zarr_dry_run.json)及[实际导出报告](outputs/data_refactor/pick_place_toy_zarr_export.json) | 全量逐帧转换；51 段通过、10 段拒绝，无额外派生失败；两次边界、拒绝集合和逐段模态哈希一致 |
+| [最终全量验收](outputs/data_refactor/pick_place_toy_final_validation.json) | 源及目标全部文件哈希、Raw 数组/标定/有效性、Zarr 全量读回及 Policy 加载通过 |
 
-全部 episode 的相机内参、相关外参和深度尺度在本次比较中一致。这只说明已存元数据一致且满足数学检查，不证明历史实物标定准确，也不证明生成点云后满足当前裁剪配置。
+最终验收检查了全部 13 种 Zarr 模态的逐段哈希和浮点有限性；每段关节/动作拼接、effort/current/触觉映射、EEF/指尖 FK 的 float32 数值逐元素一致，rot6d 合法。`episode_ends` 精确对应完整 Raw 段，终点为 11,710，无被拒绝段的残留行。
 
-### 2.2 时间与元数据
+未经修改的 `dexmani_policy` 公共 contract 和 CPU `BaseDataset` 分别通过 action(19) 与 action_ee(21)。两种模式各有 11,659 个 horizon=2 窗口，实际读取首/中/末窗口，覆盖 RGB、点云、触觉及几何等七种模型输入模态。
 
-- 全部 `control_hz=16`；观测锚点严格递增，相邻间隔均为 62,500,000 ns。
-- `timestamp` 同样严格递增，间隔为 0.0625 s。
-- 已存 arm、hand、camera、VR 源时间戳全部非零，并且不晚于对应旧观测锚点。
-- 相对于旧锚点，最大源样本年龄约为：arm 33.18 ms、hand 34.74 ms、camera 58.95 ms、VR 20.60 ms。
-- 全部 `task_label=pick_place_toy`、`success=True`、`truncated=False`、`stop_reason=manual`、`min_frames_met=True`，相机 writer 错误字符串为空。
-- 全部缺少 `technical_status`、`had_pause`、`provenance_workflow`、`termination_reason`。
+独立审查曾发现 legacy 连续性检查遗漏相邻有效行的间隔，已修复并验证 3dt 拒绝、2dt 接受及源失败事实不能被 true 覆盖。Synthetic v30→v34→v15 全链检查通过：8 段/24 行完整保留 Raw，仅唯一 clean 段的 3 行进入 Zarr；另覆盖触觉乘 10 公式、validity 矛盾、缺媒体报告、无证据不发布、拒绝覆盖、staging 清理和源哈希不变。Native v34 smoke 覆盖结构拒绝、失败/NaN 行、camera START fail-closed、Raw mount、连续性/暂停 latch、ring cutoff/drain/overflow 及整段 export rollback。
 
-上述旧标志不能替代当前技术有效性证明；固定网格间隔也不能单独证明没有暂停、重采样或历史数据处理。
-
-### 2.3 已发现的异常
-
-下表行索引均从 0 开始。状态码的含义需按旧代码解释，不能套用 v33 枚举。
-
-| Episode | 帧数 | 已发现问题 |
-| --- | ---: | --- |
-| `episode_20260827_172305` | 304 | 行 264、265 的旧 `observation_valid` 和 `flag_camera_fresh` 为 false |
-| `episode_20260827_175240` | 301 | 行 27、28 的上述两个标志为 false |
-| `episode_20260827_194525` | 286 | 2 帧 `flag_frame_status=2` |
-| `episode_20260827_195951` | 318 | 行 157 的聚合、密集触觉 validity 均为 false，两个触觉数组该行均含非有限值 |
-| `episode_20260827_220112` | 223 | 行 220 的两个旧观测/相机标志为 false |
-| `episode_20260827_220747` | 313 | 行 51 的两个旧观测/相机标志为 false |
-| `episode_20260827_220919` | 225 | 行 94 的两个旧观测/相机标志为 false |
-| `episode_20260827_223607` | 240 | 行 18 的两个旧观测/相机标志为 false |
-| `episode_20260827_223729` | 192 | 行 111 的两个旧观测/相机标志为 false |
-| `episode_20260827_224527` | 197 | 19 帧 `flag_frame_status=2`；行 133 的两个旧观测/相机标志为 false |
-
-全量统计为 14,288 帧状态 0、21 帧状态 2；8 段共 10 帧带有上述旧观测/相机无效标志。8 段中有 1 段与控制失败 episode 重合。
-
-这些相机异常行的源时间戳、深度帧号和彩色帧号都没有与前一行重复。仅凭当前文件无法解释所有 false 标志的来源，不能假定只是重复帧并直接放行。
-
-### 2.4 检查边界
-
-已执行逐段当前 `EpisodeReader` 尝试、HDF5 数组扫描、RGB-D 完整读取、相机元数据校验和官方导出 dry-run。
-
-尚未执行迁移后的完整 FK/指尖/点云转换、Policy 数据加载验收、模型训练或物理回放。官方 dry-run 在 schema 检查阶段即拒绝全部数据，不能将其解释为已验证后续转换逻辑。
-
-## 3. 当前格式和准入要求
-
-### 3.1 Raw v33 结构要求
-
-当前 `EpisodeReader` 要求版本恰好为 v33，并对 `data.h5` 的顶层数据集名称、行数、尾部形状和 dtype 严格校验；额外旧数据集也会被拒绝。
-
-每段数据均缺少以下 10 个当前字段：
-
-```text
-action_arm_joint_target
-action_hand_joint_target
-action_timestamp_ns
-arm_eef_intent
-arm_effort
-arm_timestamp_ns
-camera_timestamp_ns
-hand_timestamp_ns
-observation_timestamp_ns
-vr_timestamp_ns
-```
-
-每段均有以下 17 个不在当前 schema 中的旧字段：
-
-```text
-action_arm_ee
-action_arm_joint_sent
-action_hand_joint
-arm_connected
-arm_source_monotonic_ns
-arm_tau
-camera_health
-camera_source_monotonic_ns
-flag_action_queued
-flag_camera_fresh
-hand_connected
-hand_qpos_stale
-hand_source_monotonic_ns
-observation_anchor_monotonic_ns
-observation_valid
-tracking_error
-vr_source_monotonic_ns
-```
-
-因此，仅修改 `schema_version` 仍不能通过结构校验。
-
-### 3.2 训练与回放要求
-
-当前训练准入至少要求：
-
-1. `technical_status=valid`，明确的 `provenance_workflow=teleop`，且没有暂停。
-2. 非空 episode，每行控制状态均为 OK，聚合和密集触觉 validity 均为 true。
-3. 要求有限的浮点数组不存在 NaN/Inf；当前检查豁免 `arm_eef_intent` 和 `head_quat_wxyz`。
-4. 观测完成时间和动作发布时间均非零、严格递增，间隔不超过两个名义控制周期；动作时间不早于观测完成时间。
-5. 必需源时间戳存在，相机几何、RGB-D、点云及其他派生模态通过后续检查。
-
-`had_pause` 缺失在当前函数中默认按 false 读取，但这不能作为历史 episode 没有暂停的证据。`technical_status` 缺失默认视为 invalid，缺少 teleop provenance 也不能进入训练或回放。
-
-物理回放另有目标、关节限位和起始姿态等要求。训练缓存迁移不等于授权或证明物理回放可用。
-
-## 4. 必须明确的历史语义
-
-### 4.1 历史源码证据的适用范围
-
-已检查历史提交 `4bba54d` 中的 v30 schema、`recording/frame.py`、`teleop/episode_samples.py`、控制网格及相机 freshness 实现。
-
-该提交提供 v30 字段的历史实现参考，**并非本批数据实际采集或迁移版本的证明**。目录日期、文件中的版本号和参考提交日期不能替代完整的数据来源记录。
-
-### 4.2 观测锚点不等于观测完成时间
-
-历史 `observation_anchor_monotonic_ns` 用于控制网格的因果样本选择；当前 `observation_timestamp_ns` 在读取当前观测并检查新鲜度时产生。当前 `timestamp` 来自该观测时间，而 `action_timestamp_ns` 来自动作目标发布后的主机单调时钟。
-
-因此不得直接执行以下替代：
-
-- 用旧网格锚点冒充真实观测完成时间。
-- 用锚点、某个传感器时间或固定延迟生成动作发布时间。
-- 将 `flag_action_queued=True` 解释为已记录动作发布时间或实际 SDK 执行成功。
-
-严格的 raw v33 迁移需要找回真实记录，并证明它们与现有控制行一一对应。传感器时间不能恢复已经丢失的这些事件时间。
-
-### 4.3 动作空间必须描述同一个最终目标
-
-历史参考代码将 `action_arm_joint_sent` 和 `action_hand_joint` 描述为已提交的关节目标，将 `action_arm_ee` 保留为 Cartesian intent。后者可能与经过 IK、投影或其他处理后的最终关节目标不完全一致。
-
-确认本批数据的动作来源后，训练动作应按下式构造：
-
-```text
-action    = concat(final_arm_joint_target, final_hand_joint_target)
-action_ee = concat(FK(final_arm_joint_target), final_hand_joint_target)
-```
-
-旧 `action_arm_ee` 可保留为历史诊断意图，不直接充当训练 `action_ee`。观测 `eef_pose` 和 `fingertip_points` 则由观测关节状态计算。
-
-### 4.4 状态码和相机标志不能原样解释
-
-历史参考代码定义 `FRAME_IK_FAIL=2`、`FRAME_RETARGET_FAIL=4`；当前分别为 1、2。迁移诊断信息必须按旧枚举解释再转换，不能按数字直接复制。当前不存在对应值的旧状态必须保留其历史含义，不能映射为 OK。
-
-旧 `flag_camera_fresh` 同时考虑新帧、帧健康、episode 开始时间和年龄等条件。当前主要消费最新样本并检查新鲜度，不能机械地把两种判定视为同一含义。已有 false 标志需要独立解释；无法解释时，相关 episode 保持未准入。
-
-### 4.5 触觉、运动学和标定仍需追溯
-
-还需确认触觉是否经过历史缩放、偏置校正或顺序变更，以及动作与机器人状态的单位、关节顺序、EEF 定义和手部安装变换。
-
-60 段带有历史机器人模型和标定哈希；`episode_20260908_212811` 缺少本次比较的模型哈希。已有哈希是追溯线索，不自动证明与当前模型相同；缺失值也不能用当前文件哈希补成历史事实。
-
-## 5. 推荐迁移路径
-
-### 5.1 数据保护和输出边界
-
-将现有目录作为只读历史资料保留。迁移工具放在独立离线入口，不给正常读取器、采集、回放或部署增加旧格式兼容分支。
-
-转换前记录源文件哈希；转换后再次核对。输出写入新的目标目录，使用 staging 后发布，拒绝覆盖已有结果。旧诊断字段和真实时间戳继续保留在源数据及独立审计记录中；canonical Zarr 不增加运行时时间数组或 validity masks。
-
-不得修改源文件版本号，不生成带有伪造时间戳的中间 v33 文件，也不得通过修改正常导出器的准入条件使本批数据强行通过。
-
-### 5.2 准入分组
-
-目前可建立以下临时分组，后续证据可以改变待核实组的判断：
-
-| 分组 | Episode 数量 | 帧数 | 处理 |
-| --- | ---: | ---: | --- |
-| 已发现控制失败或无效触觉 | 3 | 801 | 按当前 clean demonstration 要求整段拒绝 |
-| 其余带旧观测/相机无效标志 | 7 | 1,798 | 暂不准入，核实异常原因 |
-| 未发现上述异常 | 51 | 11,710 | 仅为候选；继续验证来源、语义和派生模态 |
-| 合计 | 61 | 14,309 | 当前均未通过 v33 原始数据准入 |
-
-拒绝进入缓存不等于删除原始数据。所有决定以整个 episode 为单位，不删坏行、不拆段、不插值、不重采样，也不填补无效触觉。
-
-### 5.3 训练缓存适配
-
-一次性转换工具应先独立完成历史数据准入，再将已证明等价的数值字段交给当前派生逻辑。可复用当前 FK、指尖位置、RGB-D 和点云计算函数；不得构造虚假 reader 元数据来假装通过 v33 校验。
-
-候选映射如下；“候选”表示需要先核实本批数据的真实来源：
-
-| 旧内容 | 候选处理 |
-| --- | --- |
-| `arm_qpos`、`hand_qpos` | 拼接为 `joint_state`，保持 rad、关节顺序和行对应关系 |
-| `arm_qvel`、`hand_current` | 保留物理语义，按当前缓存 dtype 输出 |
-| `arm_tau` | 确认 SDK 来源后映射到 `arm_effort`，保持未验证 SI 单位的声明 |
-| 两组旧关节动作 | 确认为同一步最终发布目标后构造 `action` |
-| 最终关节动作的 FK | 构造 `action_ee`，不复用旧 Cartesian intent 作为最终目标 |
-| 触觉及 validity | validity 用于整段准入；有效数值进入完整缓存 |
-| RGB-D 和已存相机几何 | 保留逐行身份，由原始深度尺度和相机几何计算点云 |
-| 观测关节状态 | 计算 `eef_pose`、`fingertip_points` |
-
-缓存应包含全部学习相关模态，由 `dexmani_policy` 在加载时选择输入。点云参数、桌面平面、手部安装参数和模型文件必须显式确定，不能把当前环境标定未经核对地视为历史场景事实。
-
-### 5.4 输出 schema 的决策
-
-只有确认旧控制步满足当前训练的观测先于动作、因果样本选择、最终目标和模态语义，才可生成当前 canonical Zarr。迁移来源、工具版本、输入哈希、配置与逐段理由应记录在独立迁移报告中，不将缺失证据标为已验证。
-
-若必须改变观测对齐、动作定义或其他持久化语义，则需要新的 schema 及对应的 Policy 契约评估。不能仅修改版本号，或填入 `control_step_latest_causal` 等字符串，使校验器接受语义不同的数据。
-
-当关键语义无法确认时，应停止该 episode 的训练准入，保留诊断用途。另建 schema 也不能自动解决数据是否适合训练的问题。
-
-## 6. 实施步骤与验收
-
-### 6.1 先补齐来源证据
-
-需要查明：
-
-1. 本批文件是否经过旧脚本迁移、重采样或字段补写；最初录制文件、脚本、日志和配置是否还在。
-2. 实际录制或迁移版本，以及各模态与最终动作如何对齐到当前行。
-3. 暂停、异常退出和技术有效性的历史记录。
-4. 触觉单位与校正过程、模型/EEF/手部安装定义、相机与桌面标定来源。
-
-截至本文件编写时，尚未获得上述补充材料。缺失动作发布时间意味着不能仅凭现有文件完成严格 raw v33 迁移；训练缓存适配同样需要独立的语义证据。
-
-### 6.2 先审计，再转换
-
-第一阶段只输出迁移清单：逐段来源、字段检查、语义证据、准入结论、具体拒绝理由和无法恢复的信息。不得只输出一个整体成功标志。
-
-第二阶段只转换通过审计的完整 episode。先用少量已通过审计的数据验证全链路，再执行全量转换；转换期间任何 RGB-D、FK、指尖或点云失败都导致对应 episode 整段拒绝，输出结果不含其部分行。
-
-### 6.3 验收标准
-
-- 源数据哈希不变；准入 episode 的顺序和行数完整保留。
-- 直接映射字段符合预定 dtype 转换，动作没有新增裁剪、平滑、插值或偏移。
-- `action` 与 `action_ee` 的 arm 目标经同一 FK 一致，hand 目标一致。
-- 模态齐全，形状、dtype、有限性、旋转表示、点云范围和 RGB-D 对应关系正确。
-- `episode_ends` 与完整准入 episode 的累计行数一致，不跨 episode 拼接观测历史。
-- 通过 `dexmani_policy` 公共数据契约验证 joint/EEF 两种 action 布局和全部观测模态，并做最小数据加载检查。
-- 保存最终转换配置、输入哈希、逐段决定和检查结果；未执行的项目明确标记为未验证。
-
-验收不启动完整训练或真机回放。离线数据合格不等于硬件执行已验证。
-
-## 7. 代码依据与检查记录
-
-| 内容 | 当前源码 |
-| --- | --- |
-| Raw schema 和控制状态码 | [schema.py](dexmani_real/recording/storage/schema.py) |
-| 严格读取和技术有效性检查 | [reader.py](dexmani_real/recording/storage/reader.py) |
-| 当前录制字段来源 | [frame.py](dexmani_real/recording/frame.py) |
-| 观测完成时间 | [observation.py](dexmani_real/runtime/observation.py) |
-| 动作发布时间 | [commands.py](dexmani_real/robot/commands.py) |
-| 控制步的观测、动作和录制关系 | [controller.py](dexmani_real/teleop/control/controller.py) |
-| 训练准入和数值派生 | [processing.py](dexmani_real/dataset/processing.py) |
-| Canonical Zarr 输出契约 | [contracts.py](dexmani_real/dataset/contracts.py)、[export.py](dexmani_real/dataset/export.py) |
-| 相机几何读取与点云派生 | [pointcloud.py](dexmani_real/dataset/pointcloud.py) |
-| 回放加载边界 | [trajectory.py](dexmani_real/replay/trajectory.py) |
-
-历史参考可通过 `git show 4bba54d:<path>` 查看，重点路径为：
-
-```text
-dexmani_real/recording/storage/schema.py
-dexmani_real/recording/frame.py
-dexmani_real/teleop/episode_samples.py
-dexmani_real/teleop/control_loop/grid.py
-dexmani_real/teleop/control_loop/camera_freshness.py
-```
-
-本次还只读检查了相邻 `dexmani_policy` 仓库的 `dexmani_policy/datasets/real_policy_contract.py` 和 `base_dataset.py`，确认训练消费者要求明确的动作与观测对齐语义，而非仅满足张量形状。
-
-已执行的导出检查命令如下；`--output` 指向当时不存在的临时目标，dry-run 没有生成 Zarr：
+以下离线检查全部通过（当时 121 个 Python 文件）：
 
 ```bash
-DEXMANI_LOG_DIR=/tmp/dexmani_audit_logs \
-  /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python \
-  examples/export_policy_zarr.py episodes/pick_place_toy \
-  --dry-run --output /tmp/pick_place_toy_format_audit_output.zarr
+python -m compileall -q dexmani_real examples
+ruff format --check dexmani_real examples
+ruff check --select F401,F821,F822,F823,I dexmani_real examples
+git diff --check
 ```
 
-逐段临时检查记录位于 `/tmp/pick_place_toy_format_audit.json` 和 `/tmp/pick_place_toy_sidecar_audit.json`。这些文件可能被系统清理，不作为长期依据；本文件已记录关键结论、异常明细和实施条件。真正执行迁移时，应重新审计并将完整报告保存在持久化输出位置。
+没有执行训练、硬件连接、相机采集、物理回放或 rollout。离线验收不等于重新测量历史标定或真机安全验证。
+
+## 重现入口
+
+保留 [独立迁移工具](examples/migrate_raw_v30_to_v34.py)用于审计和重现；正常 reader 不承担历史版本兼容。现有结果不允许覆盖，以下命令须使用**尚不存在的新目标和新报告路径**：
+
+```bash
+python examples/migrate_raw_v30_to_v34.py episodes/pick_place_toy \
+  --output episodes/raw_v34/pick_place_toy_new \
+  --evidence outputs/data_refactor/pick_place_toy_migration_evidence.json \
+  --dry-run --report outputs/data_refactor/pick_place_toy_new_dry_run.json
+```
+
+审核报告后，去掉 `--dry-run` 并使用新的 `--report` 路径实际迁移，再执行正常导出：
+
+```bash
+python examples/export_policy_zarr.py episodes/raw_v34/pick_place_toy_new \
+  --config outputs/data_refactor/pick_place_toy_export.yaml \
+  --output datasets/pick_place_toy_new.zarr --chunk-frames 16
+```
+
+证据只适用于哈希绑定的这批源文件。源文件或历史事实变化时必须重新审计，不能复制 assertion 来绕过语义 gate。
+
+## 历史审计摘要
+
+以下是此前取得的历史事实，保留用于解释证据来源；旧 v33 迁移和旧 salvage 准入规则已不再使用。整理前的完整记录另存于本机[历史记录副本](outputs/data_refactor/pick_place_toy_migration_history.md)。
+
+- 2026-09-26 在代码基线 `436f8ba7dd1e5b70762e6ca0789bb226d9557138` 执行只读审计：61 段、每段 165–331 行，14,309 帧 RGB 全部解码、深度全部可读；640×480、uint16 深度无全零帧，RGB/深度/控制行数与 num_frames 一致。相机 metadata 一致且通过数学检查，深度尺度约 0.00025 m/unit；这不能单独证明物理标定正确。旧 v33 reader/export dry-run 在版本检查处拒绝全部数据，不能算后续 FK/点云验收。
+- 旧 control_hz=16，timestamp 和观测锚点严格递增且间隔 62.5 ms；源时间戳非零且不晚于锚点，最大年龄 arm 33.18、hand 34.74、camera 58.95、VR 20.60 ms。整齐网格本身不能证明历史上没有暂停或重采样。
+- 全部旧 task_label=pick_place_toy、success=true、truncated=false、stop_reason=manual、min_frames_met=true，camera writer 错误为空；没有 technical_status、had_pause、provenance_workflow、termination_reason。这些旧标志不等于当前有效性证明。
+- 旧 status 0 共 14,288 行、status 2 共 21 行；8 段共 10 行观测/相机 false，其中一段与 IK 失败重合。异常相机行的源时间戳和彩色/深度帧号并未重复，不能按“只是重复帧”放行。除上述触觉异常行，扫描到的其他浮点数组无 NaN/Inf。
+- 历史源码 `4bba54d` 提供 v30 producer/status/action 语义；`aac23d2` 之前曾在触觉 bias 捕获/减除前施加 0.1 scale。`data.h5` 的 mtime 晚于媒体；历史 v29→v30 converter 为 copy-only，但未找到对当前文件的实际调用记录。60 段含历史模型/标定哈希，`episode_20260908_212811` 缺少五项哈希；这些哈希未独立恢复全部采集工件。
+- 原始日志在 `~/.dexmani/logs` 匹配全部 61 段名称及行数。Aug27 的 60 段有五个无接触样本完成 tactile software bias、camera ready、16 Hz grid 的记录；Sep8 对应材料分布于 recorder/hand/camera/teleop 日志。三个 session 的 shutdown fault 出现在 recorder 停止之后，不证明录制行受影响。
+- 从提交 `23a789b` 恢复的[历史 salvage 清单](outputs/data_refactor/pick_place_toy_historical_salvage_manifest.json)记录 v25→独立 v26 副本、触觉乘 10、源不变。它只有集合级指纹，不能证明当前 v30 的逐文件变换；当前集合指纹与旧源和旧规范化集合均不同，metadata 变化也会影响哈希，不能据此再次缩放。
+- 补充证词前的[无证据 dry-run](outputs/data_refactor/pick_place_toy_migration.json)完成审计但 0 eligible；[首次实际尝试](outputs/data_refactor/pick_place_toy_migration_attempt.json)退出码 1，61 blocked、0 published、183 个源哈希不变，未创建目标。这些是历史失败记录，后来在取得并绑定操作者证词后才完成实际迁移。

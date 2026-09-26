@@ -137,7 +137,6 @@ def make_record_sample_dtype(rgb_shape, depth_shape) -> np.dtype:
     return np.dtype(
         [(name, spec.dtype, spec.tail_shape) for name, spec in DATASET_SPECS.items()]
         + [
-            ("camera_present", "u1"),
             ("camera_rgb", "u1", rgb_shape),
             ("camera_depth", "<u2", depth_shape),
         ],

@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-# Optional diagnostic/provenance labels; numerical configuration defines preprocessing.
+# Runtime log/snapshot labels; numerical configuration defines preprocessing.
 POINT_CLOUD_POLICY_ID = "depth_to_color_orthogonal_edge_table_voxel_radius_graph_v9"
 POINT_CLOUD_COLOR_SOURCE = "mean_rgb_of_aligned_depth_pixels_per_voxel"
 POINT_CLOUD_SAMPLING = "deterministic_coarse_voxel_stratified_hash_or_cyclic_pad"

@@ -46,7 +46,17 @@ class EpisodeDataWriter:
 
     def append(self, data: Mapping[str, np.ndarray]) -> None:
         """Append exactly this batch of newly emitted rows."""
-        count = len(data["timestamp"])
+        if not data:
+            raise RuntimeError("episode row batch is empty")
+        canonical_values = next(
+            (values for name, values in data.items() if name in DATASET_SPECS),
+            None,
+        )
+        if canonical_values is None:
+            raise RuntimeError("episode row batch has no canonical data array")
+        count = len(canonical_values)
+        # Validate every canonical array before opening or resizing HDF5, so a
+        # malformed producer batch cannot leave a partial row in the transaction.
         errors = validate_data_layout(
             {name: values.shape for name, values in data.items()},
             {name: values.dtype for name, values in data.items()},

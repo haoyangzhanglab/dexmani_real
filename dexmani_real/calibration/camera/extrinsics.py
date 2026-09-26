@@ -1,8 +1,10 @@
 """Load eye-to-hand or eye-in-hand extrinsics from cameras.json.
 
 Each camera entry stores serial, type and pose (XYZ meters, WXYZ quaternion),
-converted to a 4x4 transform at load time. Runtime intrinsics come from RealSense
-and are recorded in HDF5 /meta; calibration_capture is diagnostic provenance.
+converted to a 4x4 transform at load time. Recorder START resolves the connected
+serial and requires eye-to-hand calibration. Raw stores the static base-from-color
+transform and aligned color-grid intrinsics supplied by the live camera.
+The calibration file's calibration_capture section is diagnostic provenance.
 
 Usage::
 
@@ -168,8 +170,8 @@ class CameraExtrinsics:
     def get_extrinsics(self, cam_name: str, T_base_eef: np.ndarray | None = None) -> np.ndarray:
         """Return the camera extrinsic (4,4).
 
-        For eye_to_hand: returns the static T_world_camera from calibration (WORLD frame,
-            consistent with recorded eef_pos / arm_ee).
+        For eye_to_hand: returns the static T_world_camera from calibration;
+            DexMani calibrates this world frame to xArm base.
         For eye_in_hand: computes T_base_eef @ T_eef_camera (in the frame of the
             passed eef pose), requires T_base_eef.
         """
@@ -183,10 +185,10 @@ class CameraExtrinsics:
         return T_base_eef @ entry.T_eef_camera
 
     def to_meta_dict(self, cam_name: str, expected_serial: str | None = None) -> dict:
-        """Return camera serial, type and a flattened 4x4 extrinsic for HDF5 /meta.
+        """Return calibration identity and pose for runtime calibration lookup.
 
         The transform is camera_T_world_camera (eye-to-hand) or camera_T_eef_camera
-        (eye-in-hand). Intrinsics are recorded separately from live RealSense data.
+        (eye-in-hand). This dictionary is not the Raw metadata contract.
         Raises ValueError if the entry does not match a supplied expected_serial.
         """
         if expected_serial is not None:

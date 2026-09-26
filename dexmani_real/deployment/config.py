@@ -178,7 +178,6 @@ class RolloutRecordingConfig:
 
     data_dir: str
     task_label: str
-    operator: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.data_dir, str) or not self.data_dir.strip():
@@ -189,12 +188,10 @@ class RolloutRecordingConfig:
         resolved_data_dir = raw_data_dir.resolve(strict=False)
         if resolved_data_dir == resolved_data_dir.parent:
             raise ValueError("rollout data_dir must not be a filesystem root")
-        for field_name in ("task_label", "operator"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"rollout {field_name} must be non-empty")
-            if value != value.strip():
-                raise ValueError(f"rollout {field_name} must not have surrounding whitespace")
+        if not isinstance(self.task_label, str) or not self.task_label.strip():
+            raise ValueError("rollout task_label must be non-empty")
+        if self.task_label != self.task_label.strip():
+            raise ValueError("rollout task_label must not have surrounding whitespace")
         object.__setattr__(self, "data_dir", str(resolved_data_dir))
 
 

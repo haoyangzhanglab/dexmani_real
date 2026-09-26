@@ -34,7 +34,7 @@ A point cloud is self-contained. Match its source camera frame only when the pol
 
 ## Research data
 
-Raw episodes are the experiment source of truth. Preserve robot state, RGB-D/calibration, current/tactile and tactile validity, raw VR data, real timestamps, absolute control targets, and useful frame diagnostics. Do not persist runtime self-proof or transport bookkeeping.
+Raw v34 episodes are the experiment source of truth. Preserve measured robot state, RGB-D, current/tactile payloads, final absolute joint targets, frame_valid, monotonic-false episode_valid, and physical camera/hand-mount calibration. Invalid tactile payloads contain NaN; runtime aggregate/dense validity remains explicit. Keep freshness, causal selection, publication clocks and fixed-dt continuity checks in runtime; do not persist timestamps, raw VR, detailed status, software provenance, or transport bookkeeping. Snapshot the resolved physical hand mount at recording START; Raw is its sole offline truth source. New recording requires complete eye-to-hand aligned RGB-D calibration before START.
 
 Canonical Zarr is a full training cache containing all learning-relevant modalities; `dexmani_policy` selects model inputs at load time. Do not include runtime timing arrays or validity masks.
 

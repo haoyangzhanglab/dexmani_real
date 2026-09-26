@@ -6,10 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.dataset.provenance import TELEOP_WORKFLOW, read_provenance_workflow
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.recording.storage.reader import EpisodeReader
-from dexmani_real.recording.storage.schema import FRAME_OK
 
 
 @dataclass
@@ -38,11 +36,16 @@ def resolve_episode_path(raw_path: str) -> tuple[str, str]:
 def load_trajectory(episode_path):
     path, _ = resolve_episode_path(episode_path)
     with EpisodeReader(path) as reader:
-        reader.require_valid(purpose="physical replay")
         h5 = reader.h5f
-        if read_provenance_workflow(h5["meta"].attrs) != TELEOP_WORKFLOW:
-            raise ValueError("physical replay requires teleop provenance")
-        if np.any(h5["flag_frame_status"][:] != FRAME_OK):
+        meta = h5["meta"].attrs
+        collection_source = meta["collection_source"]
+        if isinstance(collection_source, bytes):
+            collection_source = collection_source.decode("utf-8")
+        if collection_source != "teleop":
+            raise ValueError("physical replay requires a teleop episode")
+        if not bool(meta["episode_valid"]):
+            raise ValueError("physical replay rejects an invalid episode")
+        if not np.all(h5["frame_valid"][:]):
             raise ValueError("physical replay cannot reproduce failed control rows")
         arm, hand, aq, hq = [
             h5[k][:]
@@ -58,8 +61,8 @@ def load_trajectory(episode_path):
         return TrajectoryData(
             path,
             len(arm),
-            reader.timing.rate_hz,
-            str(h5["meta"].attrs.get("task_label", "")),
+            reader.control_hz,
+            str(meta.get("task_label", "")),
             arm,
             hand,
             aq,

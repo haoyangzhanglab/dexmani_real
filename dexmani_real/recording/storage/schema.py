@@ -1,10 +1,10 @@
-"""The only supported raw episode layout: research control rows, schema v33."""
+"""The stable raw v34 layout for research control rows."""
 
 from dataclasses import dataclass
 
 import numpy as np
 
-EPISODE_SCHEMA_VERSION = 33
+EPISODE_SCHEMA_VERSION = 34
 
 
 @dataclass(frozen=True)
@@ -18,38 +18,22 @@ def _spec(dtype, tail_shape=()):
 
 
 DATASET_SPECS = {
-    "timestamp": _spec(np.float64),
-    "action_timestamp_ns": _spec(np.uint64),
     "arm_qpos": _spec(np.float64, (7,)),
     "arm_qvel": _spec(np.float64, (7,)),
+    # xArm SDK ``get_joint_states(num=3)`` effort telemetry. The SDK does not
+    # establish an SI torque unit, so its native numeric semantics are preserved.
     "arm_effort": _spec(np.float64, (7,)),
     "hand_qpos": _spec(np.float64, (12,)),
     "hand_current": _spec(np.float64, (12,)),
+    # XHand SDK-native, bias-corrected aggregate tactile values. Invalid
+    # aggregate samples are represented by NaN.
     "hand_contact": _spec(np.float32, (5, 3)),
-    # Tactile validity states only whether the bias-corrected payload of the
-    # selected hand sample is usable; it never encodes freshness, units,
-    # or contact state. Invalid payloads are persisted as NaN.
-    "hand_contact_valid": _spec(np.bool_),
+    # XHand SDK-native, bias-corrected dense tactile values. Invalid dense
+    # samples are represented by NaN independently of aggregate tactile state.
     "hand_tactile_force": _spec(np.float32, (5, 120, 3)),
-    "hand_tactile_force_valid": _spec(np.bool_),
     "action_arm_joint_target": _spec(np.float64, (7,)),
     "action_hand_joint_target": _spec(np.float64, (12,)),
-    "arm_eef_intent": _spec(np.float64, (9,)),
-    "flag_frame_status": _spec(np.uint8),
-    "observation_timestamp_ns": _spec(np.uint64),
-    "arm_timestamp_ns": _spec(np.uint64),
-    "hand_timestamp_ns": _spec(np.uint64),
-    "vr_timestamp_ns": _spec(np.uint64),
-    "camera_timestamp_ns": _spec(np.uint64),
-    "camera_depth_frame_number": _spec(np.uint64),
-    "camera_color_frame_number": _spec(np.uint64),
-    "vr_wrist_pos": _spec(np.float64, (3,)),
-    "vr_wrist_rot6d": _spec(np.float64, (6,)),
-    "vr_landmarks": _spec(np.float64, (21, 3)),
-    "head_quat_wxyz": _spec(np.float64, (4,)),
-}
-SOURCE_FRAME_DATASET_NAMES = frozenset(DATASET_SPECS) - {
-    "timestamp",
+    "frame_valid": _spec(np.bool_),
 }
 
 
@@ -69,8 +53,3 @@ def validate_data_layout(shapes, dtypes, *, frame_count: int) -> tuple[str, ...]
     for name in set(shapes) - DATASET_SPECS.keys():
         errors.append(f"unexpected data.h5 dataset: {name}")
     return tuple(errors)
-
-
-FRAME_OK = 0
-FRAME_IK_FAIL = 1
-FRAME_RETARGET_FAIL = 2

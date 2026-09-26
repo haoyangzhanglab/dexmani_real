@@ -15,7 +15,6 @@ from dexmani_real.deployment.observation import build_fingertip_runtime, build_p
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.recording.client import RecorderClient
 from dexmani_real.recording.frame import build_episode_frame
-from dexmani_real.recording.storage.schema import FRAME_IK_FAIL
 from dexmani_real.robot.commands import RobotCommand, publish_command
 from dexmani_real.robot.projection import project_arm_command
 from dexmani_real.runtime.observation import ObservationHistory, read_observation
@@ -71,7 +70,11 @@ class PolicyRunner:
         self.max_running_s = max_running_s
         self.num_episodes = num_episodes
         self.recording_config = recording_config
-        self.recorder = RecorderClient(shared) if recording_config is not None else None
+        self.recorder = (
+            RecorderClient(shared, control_hz=1.0 / policy_spec.control_dt_s)
+            if recording_config is not None
+            else None
+        )
         self.history = ObservationHistory(policy_spec.n_obs_steps, policy_spec.control_dt_s)
         self.action_queue = deque()
         self.run_id = None
@@ -123,7 +126,7 @@ class PolicyRunner:
         try:
             if self.recorder is not None:
                 if abnormal:
-                    self.recorder.technical_status = "invalid"
+                    self.recorder.invalidate_episode()
                 self.recorder.stop_episode(save=True, reason=reason)
                 self.recorder.join_stop()
         finally:
@@ -148,7 +151,6 @@ class PolicyRunner:
             cfg = self.recording_config
             if not self.recorder.start_episode(
                 task_label=cfg.task_label,
-                operator=cfg.operator,
                 episode_name=f"episode_{self.completed + 1:03d}",
             ):
                 raise RuntimeError("policy recorder refused START")
@@ -250,7 +252,7 @@ class PolicyRunner:
             hand_qpos_min_rad=self.runtime.hand.qpos_min_rad,
             hand_qpos_max_rad=self.runtime.hand.qpos_max_rad,
         )
-        arm, prepared_hand, intent = decoded.arm_qpos, decoded.hand_qpos, decoded.arm_eef_intent
+        arm, prepared_hand = decoded.arm_qpos, decoded.hand_qpos
         self.stats.workspace_clip_count += int(decoded.workspace_clip_m > 1e-9)
         self.stats.max_workspace_clip_m = max(
             self.stats.max_workspace_clip_m, decoded.workspace_clip_m
@@ -267,7 +269,9 @@ class PolicyRunner:
                 raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
             if self.recorder:
                 self.recorder.add_frame(
-                    build_episode_frame(row, frame_status=FRAME_IK_FAIL, arm_eef_intent=intent)
+                    build_episode_frame(row, frame_valid=False),
+                    observation_timestamp_ns=row.observation_timestamp_ns,
+                    publication_timestamp_ns=0,
                 )
             self.next_step_ns = time.monotonic_ns() + int(self.policy_spec.control_dt_s * 1e9)
             return
@@ -293,6 +297,8 @@ class PolicyRunner:
         command = RobotCommand(self.run_id, prepared_arm, prepared_hand)
         stamp = publish_command(self.shared, command) if self.execute else time.monotonic_ns()
         if not stamp:
+            if self.recorder is not None:
+                self.recorder.note_publication_rejected()
             return
         if self.stats.previous_step_ns is not None:
             self.stats.action_step_intervals_ms.append((stamp - self.stats.previous_step_ns) / 1e6)
@@ -302,7 +308,9 @@ class PolicyRunner:
         self.next_step_ns = stamp + int(self.policy_spec.control_dt_s * 1e9)
         if self.recorder:
             self.recorder.add_frame(
-                build_episode_frame(row, command, action_timestamp_ns=stamp, arm_eef_intent=intent)
+                build_episode_frame(row, command, frame_valid=True),
+                observation_timestamp_ns=row.observation_timestamp_ns,
+                publication_timestamp_ns=stamp,
             )
 
     def run(self):
@@ -333,7 +341,7 @@ class PolicyRunner:
                 )
                 if self.recorder is not None:
                     if self.recorder.is_recording:
-                        self.recorder.technical_status = "invalid"
+                        self.recorder.invalidate_episode()
                         self.recorder.stop_episode(save=True, reason="interrupted")
                     if self.recorder.stop_pending:
                         self.recorder.join_stop()

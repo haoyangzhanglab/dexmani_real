@@ -7,7 +7,6 @@ from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.recording.frame import build_episode_frame
-from dexmani_real.recording.storage.schema import FRAME_IK_FAIL, FRAME_OK, FRAME_RETARGET_FAIL
 from dexmani_real.robot.commands import RobotCommand, publish_command
 from dexmani_real.robot.projection import project_hand_command
 from dexmani_real.teleop.control.action_proposal import compute_target_eef_pose
@@ -57,7 +56,7 @@ class TeleopController:
         cfg = self.runtime
         mapped = self.arm_mapper.map(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
         if mapped is None:
-            return None, FRAME_IK_FAIL, None
+            return None, False, None
         target = compute_target_eef_pose(
             mapped["pos"],
             mapped["quat_wxyz"],
@@ -77,14 +76,14 @@ class TeleopController:
                     self.hand_retargeter, row.vr, self.hand_observation_cache
                 )
                 if proposal is None:
-                    return None, FRAME_RETARGET_FAIL, intent
+                    return None, False, intent
                 hand = project_hand_command(
                     proposal,
                     qpos_min_rad=cfg.hand.qpos_min_rad,
                     qpos_max_rad=cfg.hand.qpos_max_rad,
                 )
             except (ValueError, RuntimeError):
-                return None, FRAME_RETARGET_FAIL, intent
+                return None, False, intent
             self.planner.set_hand_qpos(hand)
         solution = self.planner.solve_online_ik(
             Pose(p=target.position_world_m, q=target.quat_world_wxyz),
@@ -94,17 +93,19 @@ class TeleopController:
         if solution.failure_kind == IKFailureKind.INVALID_OUTPUT:
             raise RuntimeError(f"online IK technical failure: {solution.reason}")
         if not solution.success:
-            return None, FRAME_IK_FAIL, intent
+            return None, False, intent
         arm = solution.qpos
-        return RobotCommand(run_id, arm, hand), FRAME_OK, intent
+        return RobotCommand(run_id, arm, hand), True, intent
 
 
 def execute_control_step(controller, shared, row, recorder=None):
     epoch = int(shared.run_id.value)
-    target, status, intent = controller.compute_command(row, epoch)
+    target, control_ok, intent = controller.compute_command(row, epoch)
     stamp = publish_command(shared, target) if target is not None else 0
     if int(shared.run_id.value) != epoch or (target is not None and not stamp):
-        return status
+        if recorder is not None:
+            recorder.note_publication_rejected()
+        return control_ok
     if stamp:
         controller.previous_arm_command = target.arm_qpos.copy()
         controller.smoothed_eef_position = intent[:3].copy()
@@ -112,7 +113,9 @@ def execute_control_step(controller, shared, row, recorder=None):
     if recorder is not None and recorder.is_recording:
         recorder.add_frame(
             build_episode_frame(
-                row, target, action_timestamp_ns=stamp, frame_status=status, arm_eef_intent=intent
-            )
+                row, target, frame_valid=control_ok and target is not None and bool(stamp)
+            ),
+            observation_timestamp_ns=row.observation_timestamp_ns,
+            publication_timestamp_ns=stamp,
         )
-    return status
+    return control_ok

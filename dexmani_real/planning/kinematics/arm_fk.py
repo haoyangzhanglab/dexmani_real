@@ -21,8 +21,6 @@ _ARM_FK_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)
 # Persisted EEF identity shared by raw-to-policy conversion and deployment.
 EEF_POSE_FRAME = "xarm_base"
 EEF_POSE_COMPONENTS = "position_m(3)+rot6d(6)"
-EEF_POSE_DERIVATION = "canonical_arm_fk_from_aligned_qpos"
-EEF_POSE_ALGORITHM_ID = "xarm7_custom_eef_pinocchio_fk_v1"
 
 
 @lru_cache(maxsize=1)

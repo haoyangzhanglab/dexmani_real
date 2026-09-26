@@ -15,7 +15,6 @@ from dexmani_real.config.experiment import config_as_dict, resolve_experiment_co
 from dexmani_real.teleop.session import (
     DEFAULT_TASK_NAME,
     run_teleop_experiment,
-    validate_operator,
     validate_task_name,
 )
 from dexmani_real.utils.log import get_logger
@@ -47,9 +46,6 @@ def main(argv: list[str] | None = None) -> int:
             "Task name used for recording metadata and episodes/<task_name>/; "
             f"default: {DEFAULT_TASK_NAME!r}."
         ),
-    )
-    parser.add_argument(
-        "--operator", type=str, default="", help="Operator name for recording metadata"
     )
     parser.add_argument(
         "--acc",
@@ -108,18 +104,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not bool(runtime.policy.hand_enabled) and not args.no_hand:
         parser.error("policy.hand_enabled=false requires explicit --no-hand confirmation")
-    operator = args.operator
-    if bool(runtime.policy.recording_enabled):
-        try:
-            operator = validate_operator(operator)
-        except ValueError as exc:
-            parser.error(str(exc))
 
     try:
         return run_teleop_experiment(
             runtime,
             task_name=args.task_name,
-            operator=operator,
             allow_no_hand=args.no_hand,
         )
     except Exception:
