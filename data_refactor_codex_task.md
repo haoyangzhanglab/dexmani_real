@@ -205,6 +205,8 @@ Legacy migration 必须先验证旧 validity flag 与 finite/non-finite payload 
 
 - `frame_valid` **不替代 tactile payload validity**。
 - 一个 control row 可以 `frame_valid=True` 但 tactile payload invalid；由于 Zarr 是模态全集，后续 whole-episode admission 仍会因 non-finite tactile 拒绝整段。
+- `frame_valid=False` 的 Raw row 允许 canonical action target 为 NaN（例如 IK/retarget failure 根本没有 final published target）；Raw writer/Reader 只做结构校验，不得为了“全 finite”丢掉真实失败 row。
+- 若失败路径实际发布了 hold target，则 action fields 应保存真实 published hold target，但 `frame_valid` 仍为 false；Zarr 会整段拒绝。
 
 ### 3.3 `frame_valid` 的稳定语义
 
@@ -266,7 +268,7 @@ provenance_*
 ```
 
 - `termination_reason`、operator 名称等若运行时仍有诊断价值，只进入日志 / `RecordingResult`，不进入 Raw schema。
-- 若删除后 `min_frames` / `min_record_duration_s` / operator 参数在 recording 路径中完全失去行为作用，应连同死 plumbing 一起删除，不保留“只为写 metadata”的参数。
+- 当前代码审查确认 `min_frames/min_frames_met` 仅用于质量标签、`operator` 仅用于录制 metadata；本重构应删除这些 recording plumbing。同步删除 `min_record_duration_s`（若全仓确认无其它行为 consumer）、teleop/deployment 中仅为 Raw metadata 服务的 operator 参数，以及 `RecordingResult.min_frames_met`。
 - `num_frames` 虽可由 arrays 推导，仍保留为廉价 finalization/integrity marker。
 
 RGB-D payload 的最小解释信息：
@@ -295,6 +297,13 @@ camera serial/name/type 只允许作为 START 时的临时 calibration lookup �
 
 当前 eye-in-hand 若要支持，需要 exposure-time arm pose/timestamp 等新的持久化语义；在 v34 删除 per-frame camera timestamp 的设计下，不得静默接受 eye-in-hand。
 
+`dexmani_real/dataset/pointcloud.py` 也必须随 v34 简化：
+
+- `load_raw_episode_camera_model()` 不再要求 `camera_depth_*` 或 `camera_T_color_from_depth`；
+- 直接用 persisted color-grid intrinsics/distortion 构造 aligned-depth camera model（aligned depth 与 RGB 共用 color pixel grid）；
+- `load_raw_episode_base_from_color()` 直接读取并校验 `camera_T_xarm_base_from_color`，不再依赖 persisted `camera_type`；
+- 不保留 native depth geometry compatibility fallback。legacy 几何转换只存在 one-off migrator。
+
 重建 fingertip geometry 时，**随真实物理 setup 变化且无法从图像/关节数据恢复的 hand mount calibration** 必须随 Raw 保存：
 
 ```text
@@ -302,7 +311,7 @@ handbase_position_eef_m
 handbase_quat_eef_wxyz
 ```
 
-这两个值必须在 recording START 时从该次实际 resolved runtime hand config 快照到 recorder，而不是等 Raw→Zarr 时再从“当前默认配置”读取。Reader 校验 finite、shape 和 quaternion normalization；Raw→Zarr fingertip derivation 必须使用 episode 自己的 hand mount。
+这两个值必须在 recording START 时从该次实际 resolved runtime hand config 快照到 recorder，而不是等 Raw→Zarr 时再从“当前默认配置”读取。实现上由 teleop/policy session 构造 `RecorderWorkerConfig` 时传入 resolved mount，`_build_start_metadata()` / `EpisodeRecorder` 只负责 snapshot/write。Reader 校验 finite、shape 和 quaternion normalization；Raw→Zarr fingertip derivation 必须使用 episode 自己的 hand mount。
 
 Raw 不保存 software provenance。以下内容均不进入 Raw episode metadata：
 
@@ -471,7 +480,8 @@ episode_valid
 - episode START 时初始化为 true；
 - `episode_valid` 是 **monotonic false latch**：同一 episode 内一旦变 false，任何后续路径都不得恢复 true；
 - abnormal stop / hardware/runtime/recording failure → false；
-- operator/sensor pause 发生后如果该 physical episode 仍被保存 → false；
+- 会在同一 physical episode 内恢复控制的 operator/sensor pause → false；
+- 纯终止阶段的 command-silent save/quit decision（控制不会再恢复，当前代码等价于 `mark_episode=False`）不因“等待保存选择”本身把原本 clean 的 episode 变 false；
 - active recording 中发生 fixed-dt control/sample continuity violation → false；
 - 正常 control target 计算成功但 command publication 因 motion authority/run_id 被拒绝，而 recording 随后仍继续 → false；
 - normal uninterrupted operator save → true；
@@ -657,7 +667,7 @@ hand_current_unit
 重要：
 
 - `pointcloud_config_json` 继续保存当前完整 point-cloud processing config；当前 `dexmani_policy` 会把它捕获进 strict resume semantics，不能为了最小化而只留下 `num_points/remove_table`。
-- `fingertip_config_json` 可缩减到当前 consumer 真正需要的 ordered `fingertip_link_names`，若没有其它 consumer 依赖。
+- 已核对当前 `dexmani_policy` consumer：`fingertip_config_json` 只硬要求 ordered `fingertip_link_names`。本重构应把该 JSON 缩到这一项，不再放 hand mount。
 - 在删任何 attr 前，全仓搜索 `dexmani_policy` 当前 consumer；无法证明 unused 的不要删除。
 
 ### 5.5 从 Zarr attrs 删除纯 descriptive / duplicate provenance
@@ -818,6 +828,13 @@ reject whole episode
 
 URDF、model hash、git SHA、fingertip link 配置都不写入 Raw，也不建立额外 provenance 记录。若 exporter 计算 fingertip geometry 需要 link names，它们只作为运行时配置使用；最终 Zarr 仅保留当前 `dexmani_policy` contract 硬要求的最小 tensor 解释字段。
 
+`T_eef_handbase` 在 offline dataset pipeline 中必须只有 **一个真值来源：Raw episode**：
+
+- 从 `ProcessingConfig` 删除 `handbase_position_eef_m` / `handbase_quat_eef_wxyz`；
+- Raw→Zarr / visualizer 均从 Raw meta 读取 mount；
+- online deployment 的 `FingertipAssemblerConfig` 仍可从当前 runtime hand config 获取 mount，因为它处理的是当前真机 observation，不是历史 Raw；
+- 已核对当前 `dexmani_policy`：`fingertip_config_json` 的硬要求只有五个 ordered `fingertip_link_names`。因此 Zarr 中该 JSON 应缩到 link names，不再重复 hand mount。
+
 ### 6.6 全部 derived modalities 成功
 
 对完整 episode 实际生成：
@@ -851,7 +868,6 @@ reject whole episode
 technical_status
 had_pause
 provenance workflow classifier
-technical_status / had_pause（由 episode_valid 取代）
 
 flag_frame_status enum
 hand_contact_valid
@@ -1250,8 +1266,10 @@ dexmani_real/ipc/schema.py
 dexmani_real/teleop/control/controller.py
 dexmani_real/teleop/runner.py
 dexmani_real/teleop/session.py
+dexmani_real/deployment/config.py
 dexmani_real/deployment/runner.py
 dexmani_real/deployment/session.py
+dexmani_real/config/control.py
 
 dexmani_real/dataset/processing.py
 dexmani_real/dataset/contracts.py
@@ -1260,6 +1278,8 @@ dexmani_real/dataset/pointcloud.py
 
 dexmani_real/replay/trajectory.py
 dexmani_real/recording/__init__.py
+examples/collect_teleop.py
+examples/run_policy.py
 examples/visualize_episode.py
 ```
 
@@ -1275,7 +1295,9 @@ examples/visualize_episode.py
 - 不改变 causal sample selection；
 - 不改变 robot command publication semantics；
 - 不改变 hardware safety；
-- 不为了删 Raw timestamp 删除 runtime 内部 timestamp。
+- 不为了删 Raw timestamp 删除 runtime 内部 timestamp；
+- 保留 START/STOP ring sequence cutoff、ring overflow detection、drain-through-stop-boundary、staging directory、closed-file verification、same-filesystem atomic publish、refuse-overwrite；
+- tactile aggregate/dense validity 继续留在 XHand driver / HAND_STATE_DTYPE，因为二者可独立失效；只是不再重复持久化到 Raw。
 
 ### 10.3 Offline checks / examples / docs
 
@@ -1331,11 +1353,13 @@ dexmani_policy/*
 3. 让 native recorder生成 `frame_valid`。
 4. 将 technical_status + had_pause 收敛为 monotonic `episode_valid`，并加入 runtime fixed-dt continuity latch。
 5. recording START fail-closed 验证 eye-to-hand camera calibration/depth geometry。
-6. snapshot 并持久化本次 physical `T_eef_handbase`。
-7. 简化 reader，删除 EpisodeTiming persisted-timestamp 语义。
-8. 同步迁移 replay / visualizer 等 Raw consumers。
-9. 保留 runtime safety/synchronization/ring sequence/atomic publication。
-10. 运行 focused one-off v34 round-trip smoke checks。
+6. 由 RecorderWorkerConfig snapshot 并持久化本次 physical `T_eef_handbase`；删除 offline ProcessingConfig 中重复 mount。
+7. 简化 aligned camera model loader，不再依赖 native depth geometry。
+8. 简化 reader，删除 EpisodeTiming persisted-timestamp 语义。
+9. 同步迁移 replay / visualizer 等 Raw consumers。
+10. 删除 generic provenance、operator/min_frames 等确认无研究行为的 dead recording plumbing。
+11. 保留 runtime safety/synchronization/ring sequence/atomic publication。
+12. 运行 focused one-off v34 round-trip smoke checks。
 
 ### Phase C — Raw→Zarr v15
 
@@ -1381,12 +1405,16 @@ dexmani_policy/*
 - wrong row count/shape/dtype rejected；
 - timestamps / VR / frame number 不再 required；
 - tactile NaN raw episode structurally可读；
+- frame_valid=false + NaN action target 的失败 row structurally可读；
 - depth count mismatch 在 Reader 结构校验阶段 rejected；
 - RGB file 缺失/空文件在 Reader 阶段 rejected；
 - RGB 实际 frame count / shape / dtype mismatch 在 whole-episode exporter streaming pass 中 rejected；
 - recording START 对缺失 camera serial、未解析 calibration、非 eye-to-hand、invalid depth scale/geometry fail closed；
 - invalid camera calibration rejected；
 - Raw hand mount 正确 snapshot、Reader 校验、fingertip derivation 使用 Raw mount；
+- ProcessingConfig 不再携带第二份 hand mount；
+- v34 pointcloud camera loader 只依赖 aligned color-grid geometry + static base-from-color；
+- Zarr `fingertip_config_json` 只含当前 consumer 必需的 ordered link names；
 - unknown/typo canonical datasets 不被静默接受。
 
 ### 12.2 `frame_valid / episode_valid` smoke checks
@@ -1611,12 +1639,14 @@ Raw v34 本身不是 v16 理由。
 - [ ] 删除 persisted timestamps 前，fixed-dt gap / skipped-publication continuity 已由 runtime episode_valid latch 接管。
 - [ ] Runtime freshness / causal / safety / ring-sequence cutoff / atomic publication 没有因 storage 简化而降低。
 - [ ] New v34 recording START 对完整 eye-to-hand camera calibration fail closed。
-- [ ] 每个 native v34 Raw snapshot 并保存真实 `T_eef_handbase`，Zarr/visualizer fingertip derivation 不读取当前默认 mount。
+- [ ] 每个 native v34 Raw snapshot 并保存真实 `T_eef_handbase`；offline ProcessingConfig 无重复 mount；Zarr/visualizer fingertip derivation 不读取当前默认 mount。
 - [ ] `EpisodeReader` 只负责 v34 结构验证，不承担 training admission，也不依赖 persisted timestamp。
 - [ ] 正常 reader 没有 legacy v30 分支。
 - [ ] Replay / visualizer / helpers 已迁移到 v34，不再引用被删除 Raw 字段。
 - [ ] Generic recording `provenance_*` machinery 已删除，Raw 只保留 `collection_source`。
-- [ ] operator/wall_duration/min_frames/termination reason/camera identity 等非研究必需 metadata 不再进入 v34 Raw。
+- [ ] 已确认 dead 的 operator/min_frames/min_record_duration recording plumbing 已删除。
+- [ ] wall_duration/termination reason/camera identity 等非研究必需 metadata 不再进入 v34 Raw。
+- [ ] v34 camera metadata 只有 aligned color-grid geometry + static base-from-color + depth scale，pointcloud loader 不再依赖 native depth geometry。
 - [ ] Policy Zarr 保持 schema v15。
 - [ ] Policy Zarr 保持完整多模态全集。
 - [ ] Zarr exporter 对坏 Raw episode 整段拒绝，无 partial row/segment salvage。
