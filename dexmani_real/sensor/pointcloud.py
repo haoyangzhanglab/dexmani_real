@@ -6,10 +6,8 @@ camera SDK, Open3D, shared memory, calibration files, or recording code.
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, cast
+from typing import cast
 
 import cv2
 import numpy as np
@@ -36,45 +34,11 @@ __all__ = [
     "POINT_CLOUD_POLICY_ID",
     "POINT_CLOUD_SAMPLING",
     "POINT_CLOUD_TRANSFORM",
-    "PointCloudBuildTimings",
-    "PointCloudBuildStats",
     "PointCloudConfig",
     "build_raw_point_cloud",
     "build_point_cloud",
-    "build_point_cloud_with_stats",
     "aligned_depth_points_in_base",
 ]
-
-
-@dataclass(frozen=True)
-class PointCloudBuildTimings:
-    """Per-frame elapsed times for the deterministic production stages."""
-
-    depth_filter_ms: float = 0.0
-    table_crop_ms: float = 0.0
-    deprojection_ms: float = 0.0
-    base_workspace_ms: float = 0.0
-    voxelization_ms: float = 0.0
-    spatial_outlier_filter_ms: float = 0.0
-    color_sampling_ms: float = 0.0
-    total_ms: float = 0.0
-
-
-@dataclass(frozen=True)
-class PointCloudBuildStats:
-    """Stage counts and elapsed times without retaining intermediate clouds."""
-
-    depth_valid_points: int = 0
-    depth_trusted_points: int = 0
-    table_rejected_points: int = 0
-    workspace_rejected_points: int = 0
-    cropped_points: int = 0
-    voxel_points: int = 0
-    radius_density_points: int = 0
-    spatial_inlier_points: int = 0
-    candidate_points: int = 0
-    failure_stage: str | None = None
-    timings: PointCloudBuildTimings = field(default_factory=PointCloudBuildTimings)
 
 
 def _depth_valid_mask(
@@ -610,29 +574,6 @@ def build_point_cloud(
     config: PointCloudConfig,
 ) -> np.ndarray | None:
     """Build aligned depth/color ``float32[num_points,6]`` in xArm-base frame."""
-    cloud, _stats = build_point_cloud_with_stats(
-        depth_raw=depth_raw,
-        color=color,
-        depth_scale_m=depth_scale_m,
-        geometry=geometry,
-        T_xarm_base_from_color=T_xarm_base_from_color,
-        table_plane_abcd=table_plane_abcd,
-        config=config,
-    )
-    return cloud
-
-
-def build_point_cloud_with_stats(
-    *,
-    depth_raw: np.ndarray,
-    color: np.ndarray,
-    depth_scale_m: float,
-    geometry: RGBDGeometry,
-    T_xarm_base_from_color: np.ndarray,
-    table_plane_abcd: tuple[float, float, float, float] | None,
-    config: PointCloudConfig,
-) -> tuple[np.ndarray | None, PointCloudBuildStats]:
-    """Build a cloud and return allocation-light stage diagnostics."""
     if not isinstance(config, PointCloudConfig):
         raise TypeError("config must be a PointCloudConfig")
     if config.remove_table:
@@ -644,39 +585,12 @@ def build_point_cloud_with_stats(
     else:
         table_plane_abcd = None
     _validate_color(color, geometry)
-    started_ns = time.perf_counter_ns()
-    elapsed_ms = {
-        "depth_filter_ms": 0.0,
-        "table_crop_ms": 0.0,
-        "deprojection_ms": 0.0,
-        "base_workspace_ms": 0.0,
-        "voxelization_ms": 0.0,
-        "spatial_outlier_filter_ms": 0.0,
-        "color_sampling_ms": 0.0,
-    }
-
-    def stats(**kwargs: Any) -> PointCloudBuildStats:
-        return PointCloudBuildStats(
-            **kwargs,
-            timings=PointCloudBuildTimings(
-                **elapsed_ms,
-                total_ms=(time.perf_counter_ns() - started_ns) / 1e6,
-            ),
-        )
-
-    stage_started_ns = time.perf_counter_ns()
     depth_m, valid = _depth_valid_mask(depth_raw, depth_scale_m=depth_scale_m, config=config)
-    valid_count = int(np.count_nonzero(valid))
     trusted = _reject_flying_depth(depth_m, valid, config)
     trusted_count = int(np.count_nonzero(trusted))
-    elapsed_ms["depth_filter_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
     if trusted_count == 0:
-        return None, stats(
-            depth_valid_points=valid_count,
-            failure_stage="depth_support",
-        )
+        return None
 
-    stage_started_ns = time.perf_counter_ns()
     if table_plane_abcd is not None:
         table_keep = _table_keep_mask(
             depth_m,
@@ -689,59 +603,28 @@ def build_point_cloud_with_stats(
             table_object_seed_min_pixels=config.table_object_seed_min_pixels,
         )
         table_kept_count = int(np.count_nonzero(table_keep))
-        table_rejected_count = trusted_count - table_kept_count
         if table_kept_count == 0:
-            elapsed_ms["table_crop_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
-            return None, stats(
-                depth_valid_points=valid_count,
-                depth_trusted_points=trusted_count,
-                table_rejected_points=table_rejected_count,
-                failure_stage="table_crop",
-            )
+            return None
     else:
-        table_rejected_count = 0
         table_keep = trusted
-    elapsed_ms["table_crop_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
 
-    stage_started_ns = time.perf_counter_ns()
     points_depth, rows, columns = _deproject_depth(depth_m, table_keep, geometry.depth)
     colors = color[rows, columns].astype(np.float32) / 255.0
-    elapsed_ms["deprojection_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
 
-    stage_started_ns = time.perf_counter_ns()
     points_base = _transform_points(points_depth, T_xarm_base_from_color)
     workspace_keep = _workspace_keep_mask(points_base, config.workspace)
     cropped_count = int(np.count_nonzero(workspace_keep))
-    workspace_rejected_count = int(workspace_keep.size - cropped_count)
     if cropped_count == 0:
-        elapsed_ms["base_workspace_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
-        return None, stats(
-            depth_valid_points=valid_count,
-            depth_trusted_points=trusted_count,
-            table_rejected_points=table_rejected_count,
-            workspace_rejected_points=workspace_rejected_count,
-            failure_stage="workspace_crop",
-        )
+        return None
     if cropped_count != workspace_keep.size:
         points_base = points_base[workspace_keep]
         colors = colors[workspace_keep]
-    elapsed_ms["base_workspace_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
 
-    stage_started_ns = time.perf_counter_ns()
     points_base, colors, voxel_keys = _voxel_means(points_base, colors, config.voxel_size_m)
-    elapsed_ms["voxelization_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
     voxel_count = points_base.shape[0]
     if voxel_count == 0:
-        return None, stats(
-            depth_valid_points=valid_count,
-            depth_trusted_points=trusted_count,
-            table_rejected_points=table_rejected_count,
-            workspace_rejected_points=workspace_rejected_count,
-            cropped_points=cropped_count,
-            failure_stage="voxelization",
-        )
+        return None
 
-    stage_started_ns = time.perf_counter_ns()
     density_keep, inlier = _radius_component_keep_masks(
         points_base,
         radius_m=config.outlier_radius_m,
@@ -750,42 +633,20 @@ def build_point_cloud_with_stats(
     )
     density_count = int(np.count_nonzero(density_keep))
     if density_count == 0:
-        elapsed_ms["spatial_outlier_filter_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
-        return None, stats(
-            depth_valid_points=valid_count,
-            depth_trusted_points=trusted_count,
-            table_rejected_points=table_rejected_count,
-            workspace_rejected_points=workspace_rejected_count,
-            cropped_points=cropped_count,
-            voxel_points=voxel_count,
-            failure_stage="radius_density",
-        )
+        return None
     inlier_count = int(np.count_nonzero(inlier))
     if inlier_count == 0:
-        elapsed_ms["spatial_outlier_filter_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
-        return None, stats(
-            depth_valid_points=valid_count,
-            depth_trusted_points=trusted_count,
-            table_rejected_points=table_rejected_count,
-            workspace_rejected_points=workspace_rejected_count,
-            cropped_points=cropped_count,
-            voxel_points=voxel_count,
-            radius_density_points=density_count,
-            failure_stage="radius_components",
-        )
+        return None
     points_base = points_base[inlier]
     colors = colors[inlier]
     voxel_keys = voxel_keys[inlier]
     candidate_indices = _spatial_candidate_indices(
         voxel_keys, config.num_points * config.outlier_candidate_multiplier
     )
-    candidate_count = int(candidate_indices.size)
     points_base = points_base[candidate_indices]
     colors = colors[candidate_indices]
     voxel_keys = voxel_keys[candidate_indices]
-    elapsed_ms["spatial_outlier_filter_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
 
-    stage_started_ns = time.perf_counter_ns()
     cloud = np.column_stack((points_base, colors)).astype(np.float32)
     result = _fixed_size_sample(
         cloud,
@@ -793,15 +654,4 @@ def build_point_cloud_with_stats(
         config.num_points,
         config.sampling_coarse_voxel_stride,
     )
-    elapsed_ms["color_sampling_ms"] = (time.perf_counter_ns() - stage_started_ns) / 1e6
-    return result, stats(
-        depth_valid_points=valid_count,
-        depth_trusted_points=trusted_count,
-        table_rejected_points=table_rejected_count,
-        workspace_rejected_points=workspace_rejected_count,
-        cropped_points=cropped_count,
-        voxel_points=voxel_count,
-        radius_density_points=density_count,
-        spatial_inlier_points=inlier_count,
-        candidate_points=candidate_count,
-    )
+    return result

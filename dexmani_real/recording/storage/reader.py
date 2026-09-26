@@ -190,15 +190,6 @@ class EpisodeReader:
         attrs = self._h5f["meta"].attrs
         if attrs.get("technical_status", "invalid") != "valid":
             raise ValueError(f"{purpose} rejects technically invalid episodes")
-        # Historical captures may have been invalidated by a shutdown sidecar.
-        import json
-
-        result_path = self._path.with_name(self._path.name + ".result.json")
-        if (
-            result_path.exists()
-            and json.loads(result_path.read_text()).get("technical_status") != "valid"
-        ):
-            raise ValueError(f"{purpose} rejects invalid episode result")
 
     @property
     def timing(self) -> EpisodeTiming:

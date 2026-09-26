@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Collection, Iterable
+from typing import Any, Iterable
 
-from dexmani_real.runtime.safety import RunEndReason, SafetyState, revoke_motion, transition
+from dexmani_real.runtime.safety import RunEndReason, SafetyState, _revoke_motion_locked, transition
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
+_PHYSICAL_PROCESS_NAMES = frozenset({"arm", "hand"})
 
 
 @dataclass(frozen=True)
@@ -24,39 +25,33 @@ class ShutdownReport:
     exits: tuple[ProcessExit, ...]
     shared_closed: bool
 
+    @property
+    def clean(self) -> bool:
+        return self.shared_closed and all(
+            item.exitcode == 0 and item.escalation == "graceful" for item in self.exits
+        )
+
 
 def _finalize_shutdown_state(
     shared: Any,
-    exits: tuple[ProcessExit, ...],
+    report: ShutdownReport,
     *,
     disarm_if_clean: bool,
-    service_process_names: Collection[str] = (),
 ) -> None:
-    """Latch post-join failures, or disarm only after a verified clean stop.
-
-    A confirmed-stopped ``service_process_names`` member's nonzero/escalated
-    exit fails the session (``workflow_failed``) without claiming a physical
-    fault. Any other (critical) process failing the same way remains FAULT.
-    This classification only applies after process termination is verified —
-    a child that cannot be confirmed stopped still faults the runtime.
-    """
+    """Latch physical failures, or disarm after a verified clean stop."""
     error_latched = bool(shared.error_state.value)
     estop_requested = bool(shared.estop_request.value)
     safety_state = int(shared.safety_state.value)
-    critical_worker_failed = any(
+    physical_worker_failed = any(
         (item.exitcode != 0 or item.escalation != "graceful")
-        and item.name not in service_process_names
-        for item in exits
-    )
-    service_worker_failed = any(
-        (item.exitcode != 0 or item.escalation != "graceful") and item.name in service_process_names
-        for item in exits
+        and item.name in _PHYSICAL_PROCESS_NAMES
+        for item in report.exits
     )
     faulted = (
         error_latched
         or estop_requested
         or safety_state == int(SafetyState.FAULT)
-        or critical_worker_failed
+        or physical_worker_failed
     )
 
     if faulted:
@@ -64,10 +59,7 @@ def _finalize_shutdown_state(
         transition(shared, SafetyState.FAULT)
         return
 
-    if service_worker_failed:
-        shared.workflow_failed.value = True
-
-    if disarm_if_clean:
+    if disarm_if_clean and report.clean:
         if not transition(shared, SafetyState.DISARMED):
             shared.error_state.value = True
             transition(shared, SafetyState.FAULT)
@@ -99,36 +91,40 @@ def stop_processes_verified(
     """Stop every worker without closing IPC that another local thread may use."""
     procs = list(processes)
     # Fence before any blocking join; record the software end if still RUNNING.
-    if int(shared.safety_state.value) == int(SafetyState.RUNNING):
-        revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
-    shared.is_running.value = False
+    with shared.motion_lock:
+        shared.is_running.value = False
+        if int(shared.safety_state.value) == int(SafetyState.RUNNING):
+            _revoke_motion_locked(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
     exits: list[ProcessExit] = []
-    deadline = time.monotonic() + graceful_timeout_s
-    for process in procs:
-        process.join(timeout=max(0.0, deadline - time.monotonic()))
+    try:
+        deadline = time.monotonic() + graceful_timeout_s
+        for process in procs:
+            process.join(timeout=max(0.0, deadline - time.monotonic()))
 
-    for process in procs:
-        escalation = "graceful"
-        if process.is_alive():
-            escalation = "terminate"
-            process.terminate()
-            process.join(timeout=terminate_timeout_s)
-        if process.is_alive():
-            escalation = "kill"
-            if not hasattr(process, "kill"):
-                _latch_unverified_shutdown_fault(shared)
+        for process in procs:
+            escalation = "graceful"
+            if process.is_alive():
+                escalation = "terminate"
+                process.terminate()
+                process.join(timeout=terminate_timeout_s)
+            if process.is_alive():
+                escalation = "kill"
+                if not hasattr(process, "kill"):
+                    raise RuntimeError(
+                        f"process {process.name} ignored SIGTERM and kill() is unavailable"
+                    )
+                process.kill()
+                process.join(timeout=kill_timeout_s)
+            if process.is_alive() or process.exitcode is None:
+                # Never unlink shared memory while a child may still access it.
                 raise RuntimeError(
-                    f"process {process.name} ignored SIGTERM and kill() is unavailable"
+                    f"process {process.name} could not be confirmed stopped; RuntimeChannels remains open"
                 )
-            process.kill()
-            process.join(timeout=kill_timeout_s)
-        if process.is_alive() or process.exitcode is None:
-            # Never unlink shared memory while a child may still access it.
-            _latch_unverified_shutdown_fault(shared)
-            raise RuntimeError(
-                f"process {process.name} could not be confirmed stopped; RuntimeChannels remains open"
-            )
-        exits.append(ProcessExit(process.name, process.exitcode, escalation))
+            exits.append(ProcessExit(process.name, process.exitcode, escalation))
+
+    except Exception:
+        _latch_unverified_shutdown_fault(shared)
+        raise
 
     frozen_exits = tuple(exits)
     log_stop = (
@@ -148,9 +144,8 @@ def shutdown_processes_verified(
     terminate_timeout_s: float = 1.0,
     kill_timeout_s: float = 1.0,
     disarm_if_clean: bool = False,
-    service_process_names: Collection[str] = (),
 ) -> ShutdownReport:
-    """Stop workers, finalize physical safety, then close IPC after verification."""
+    """Stop workers, close verified IPC, and finalize physical safety."""
     frozen_exits = stop_processes_verified(
         shared,
         processes,
@@ -159,13 +154,8 @@ def shutdown_processes_verified(
         kill_timeout_s=kill_timeout_s,
     )
 
-    _finalize_shutdown_state(
-        shared,
-        frozen_exits,
-        disarm_if_clean=disarm_if_clean,
-        service_process_names=service_process_names,
-    )
     shared_closed = _close_runtime_channels(shared)
     report = ShutdownReport(frozen_exits, shared_closed=shared_closed)
+    _finalize_shutdown_state(shared, report, disarm_if_clean=disarm_if_clean)
     logger.debug("verified process shutdown: %s", report.exits)
     return report

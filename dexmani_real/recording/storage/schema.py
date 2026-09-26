@@ -1,10 +1,10 @@
-"""The only supported raw episode layout: research control rows, schema v32."""
+"""The only supported raw episode layout: research control rows, schema v33."""
 
 from dataclasses import dataclass
 
 import numpy as np
 
-EPISODE_SCHEMA_VERSION = 32
+EPISODE_SCHEMA_VERSION = 33
 
 
 @dataclass(frozen=True)

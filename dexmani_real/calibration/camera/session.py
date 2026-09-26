@@ -53,7 +53,7 @@ from dexmani_real.robot.arm_worker import run_arm_worker
 from dexmani_real.runtime.observation import read_camera_frame, sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_processes_verified
-from dexmani_real.runtime.safety import SafetyState, require_transition
+from dexmani_real.runtime.safety import RunEndReason, SafetyState, require_transition, revoke_motion
 from dexmani_real.runtime.supervisor import wait_subsystem_ready
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.utils.log import get_logger
@@ -311,13 +311,22 @@ class CameraCalibrationSession:
     """Own interactive calibration context, keyboard and preview lifetime."""
 
     def __init__(
-        self, shared, runtime, planner, workspace, arm_process, calibration_config, aruco_config
+        self,
+        shared,
+        runtime,
+        planner,
+        workspace,
+        arm_process,
+        camera_process,
+        calibration_config,
+        aruco_config,
     ):
         self.shared = shared
         self.runtime = runtime
         self.planner = planner
         self.workspace = workspace
         self.arm_process = arm_process
+        self.camera_process = camera_process
         self.calibration_config = calibration_config
         self.aruco_config = aruco_config
 
@@ -335,8 +344,6 @@ class CameraCalibrationSession:
             arm["timestamp_ns"], self.runtime.arm.feedback_max_age_s
         ):
             return "arm feedback stale"
-        if self.shared.workflow_failed.value:
-            return "camera acquisition failed"
         return None
 
     def _capture_sample(self):
@@ -545,6 +552,11 @@ class CameraCalibrationSession:
                 set_calibration_fault(self.shared, issue)
                 return 1
 
+            if not self.camera_process.is_alive():
+                logger.error("camera worker exited: %s", self.camera_process.exitcode)
+                revoke_motion(self.shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
+                return 1
+
             if self.keys.is_pressed("q"):
                 return finish_calibration_motion(
                     self.shared, calibration_saved=self.state.calibration_saved
@@ -646,6 +658,7 @@ def run_camera_calibration(
             planner,
             workspace,
             arm_process,
+            processes[1],
             calib_cfg,
             aruco_cfg,
         ).run()

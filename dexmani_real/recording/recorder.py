@@ -32,7 +32,7 @@ from dexmani_real.recording.storage.schema import (
     validate_data_layout,
 )
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
-from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
+from dexmani_real.utils.atomic_io import atomic_publish
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -154,7 +154,7 @@ class EpisodeRecorder:
 
     @property
     def resources_released(self) -> bool:
-        """Whether storage owners and temporary transaction files were released."""
+        """Whether writers and local staging ownership have been released."""
         return self._camera_writer is None and self._data_writer is None and self._temp_dir is None
 
     @property
@@ -246,7 +246,6 @@ class EpisodeRecorder:
         meta.attrs["task_label"] = p.get("task_label", "")
         meta.attrs["operator"] = p.get("operator", "")
         meta.attrs["control_hz"] = self.control_hz  # nominal grid rate; dt = 1/control_hz
-        meta.attrs["fps"] = self.control_hz
         meta.attrs["camera_payload_mode"] = "depth_to_color_aligned_rgbd"
         self._write_camera_meta_attrs(meta)
 
@@ -382,18 +381,15 @@ class EpisodeRecorder:
         self,
         save: bool = True,
         reason: str = "",
-        *,
-        failure_note: str = "",
     ) -> str | None:
         """Finish synchronously and return the reserved final path, including on discard.
 
         Saving validates rows and publishes atomically. Short complete episodes are
         allowed: ``min_frames_met`` is a quality label, not an admission gate.
         Empty episodes are discarded. Failures raise after cleanup; staging is kept
-        as ``incomplete_*`` only after all writers release their resources.
+        only if writers or staging cleanup cannot be completed.
 
-        A non-empty ``failure_note`` reports a recording/storage failure and
-        prevents publication. A clean operator discard deletes staging.
+        A clean operator discard deletes staging.
         The caller must serialize this operation with all other recorder access.
         """
         if self._finishing:
@@ -412,11 +408,7 @@ class EpisodeRecorder:
         self._recording = False
         self._finishing = True
         try:
-            self._finish_episode_transaction(
-                save,
-                reason,
-                failure_note=failure_note,
-            )
+            self._finish_episode_transaction(save, reason)
         finally:
             self._finishing = False
         return path
@@ -425,13 +417,11 @@ class EpisodeRecorder:
         self,
         save: bool,
         reason: str,
-        *,
-        failure_note: str = "",
     ) -> None:
         """Finalize one transaction; retain any resource that failed cleanup."""
         failure = None
         try:
-            self._finalize_episode_files(save and not failure_note, reason)
+            self._finalize_episode_files(save, reason)
         except Exception as exc:
             failure = exc
             logger.error("episode finalization failed", exc_info=True)
@@ -453,34 +443,14 @@ class EpisodeRecorder:
             if self._camera_writer is None and self._data_writer is None:
                 try:
                     if self._temp_dir is not None:
-                        note = (
-                            f"{type(failure).__name__}: {failure}"
-                            if failure is not None
-                            else failure_note
-                        )
-                        if failure is not None or note:
-                            # Preserve failed partial episodes for offline diagnosis.
-                            self._preserve_incomplete_staging(
-                                self._temp_dir,
-                                reason=reason,
-                                error=note,
-                            )
-                        else:
-                            self._discard_temp_files(self._temp_dir)
-                except Exception as exc:
-                    failure = exc
-                    logger.error("temporary episode cleanup failed", exc_info=True)
-                    if self._temp_dir is not None:
-                        try:
-                            self._preserve_incomplete_staging(
-                                self._temp_dir, reason=reason, error=str(exc)
-                            )
-                        except Exception:
-                            logger.error("failed to preserve staging", exc_info=True)
-                        else:
-                            self._reset_episode_state()
-                else:
-                    self._reset_episode_state()
+                        self._discard_temp_files(self._temp_dir)
+                except Exception:
+                    logger.warning(
+                        "temporary episode cleanup failed; staging remains at %s",
+                        self._temp_dir,
+                        exc_info=True,
+                    )
+                self._reset_episode_state()
         if failure is not None:
             raise EpisodeFinalizationError(f"{type(failure).__name__}: {failure}") from failure
 
@@ -517,7 +487,6 @@ class EpisodeRecorder:
 
         assert self._data_writer is not None
         data_writer = self._data_writer
-        _had_rgb = camera_frame_count > 0
         if self._temp_dir is None:
             raise RuntimeError("episode temp directory missing during finalization")
 
@@ -526,23 +495,9 @@ class EpisodeRecorder:
             meta.attrs["technical_status"] = self.technical_status
             meta.attrs["had_pause"] = self.had_pause
             meta.attrs["termination_reason"] = reason or "manual"
-            meta.attrs["task_success"] = "unknown"
-            meta.attrs["duration"] = duration
             meta.attrs["wall_duration_s"] = duration
             meta.attrs["num_frames"] = self._frame_count
-            # Task success is intentionally judged offline from the published episode.
-            meta.attrs["fps"] = self.control_hz
-            meta.attrs["wall_fps"] = (
-                self._frame_count / duration if duration > 0 else self.control_hz
-            )
             meta.attrs["min_frames_met"] = self._frame_count >= self.min_frames
-            meta.attrs["has_camera"] = _had_rgb
-            meta.attrs["has_timestamps"] = "timestamp" in data_writer.datasets
-            meta.attrs["camera_stream_frames"] = camera_frame_count
-            meta.attrs["truncated"] = False
-            meta.attrs["stop_reason"] = reason or "manual"
-            # Repeat the camera snapshot during finalization before the handle closes.
-            self._write_camera_meta_attrs(meta)
 
         data_writer.update_meta(_write_final_meta)
         data_writer.close()
@@ -555,7 +510,7 @@ class EpisodeRecorder:
         logger.info("Episode saved: %s frames=%d", self._episode_dir, self._frame_count)
 
     def _reset_episode_state(self) -> None:
-        """Reset episode state only after all resources and staging are released."""
+        """Reset local episode ownership after all writers have closed."""
         self._data_writer = None
         self._recording = False
         self._frame_count = 0
@@ -609,41 +564,3 @@ class EpisodeRecorder:
         """Remove staging after resource release; expose incomplete cleanup."""
         if Path(tmp).exists():
             shutil.rmtree(tmp)
-
-    def _preserve_incomplete_staging(self, tmp: str, *, reason: str, error: str) -> None:
-        """Preserve failed partial episodes for offline diagnosis after all writers close.
-
-        Only this episode's staging is renamed. ``incomplete_*`` directories are
-        not valid raw episodes and stay outside ``episode_*`` discovery.
-        """
-        staging = Path(tmp)
-        if not staging.exists():
-            return
-        episode_name = Path(self._episode_dir or staging.name.removeprefix(".tmp_")).name
-        target = self.data_dir / f"incomplete_{episode_name}"
-        suffix = 1
-        while target.exists():
-            target = self.data_dir / f"incomplete_{episode_name}_{suffix}"
-            suffix += 1
-        staging.rename(target)
-        atomic_json_dump(
-            {
-                "episode": episode_name,
-                "status": "incomplete",
-                "reason": reason,
-                "error": error,
-                "frame_count_before_failure": int(self._frame_count),
-                "original_staging": staging.name,
-                "created_wall_time_ns": time.time_ns(),
-            },
-            target / "failure_note.json",
-            indent=2,
-            ensure_ascii=False,
-        )
-        logger.error(
-            "[RECORD] episode=%s reason=%s incomplete — partial staging "
-            "retained at %s (not a valid raw episode)",
-            episode_name,
-            reason,
-            target,
-        )

@@ -117,17 +117,19 @@ class PolicyRunner:
         self.action_queue.clear()
         self.history.clear()
         self.previous_arm = None
-        if self.recorder is not None:
-            if abnormal:
-                self.recorder.technical_status = "invalid"
-            self.recorder.stop_episode(save=True, reason=reason)
-            self.recorder.join_stop()
         self.completed += 1
         self.run_id = None
         self.shared.stop_request.value = int(StopRequest.NONE)
-        logger.info("policy episode %d ended: %s", self.completed, reason)
-        if self.completed >= self.num_episodes:
-            self.shared.quit_requested.value = True
+        try:
+            if self.recorder is not None:
+                if abnormal:
+                    self.recorder.technical_status = "invalid"
+                self.recorder.stop_episode(save=True, reason=reason)
+                self.recorder.join_stop()
+        finally:
+            logger.info("policy episode %d ended: %s", self.completed, reason)
+            if self.completed >= self.num_episodes:
+                self.shared.quit_requested.value = True
 
     def _begin_episode(self):
         row = self._read_observation()
@@ -149,8 +151,7 @@ class PolicyRunner:
                 operator=cfg.operator,
                 episode_name=f"episode_{self.completed + 1:03d}",
             ):
-                self.shared.workflow_failed.value = True
-                return
+                raise RuntimeError("policy recorder refused START")
         with self.shared.motion_lock:
             epoch = (
                 _begin_requested_motion_locked(self.shared)
@@ -175,21 +176,19 @@ class PolicyRunner:
         if self.run_id is None:
             if self.shared.stop_request.value:
                 self.shared.stop_request.value = int(StopRequest.NONE)
-            if self.shared.start_request.value and not self.shared.workflow_failed.value:
+            if self.shared.start_request.value:
                 self._begin_episode()
             return
         if not self._has_motion_authority() or self.shared.quit_requested.value:
+            reason = RunEndReason(int(self.shared.run_ended_reason.value))
             self._finish_episode(
-                RunEndReason(int(self.shared.run_ended_reason.value)).name.lower(),
+                reason.name.lower(),
                 abnormal=bool(
                     self.shared.error_state.value
                     or self.shared.estop_request.value
-                    or self.shared.workflow_failed.value
+                    or reason not in (RunEndReason.OPERATOR, RunEndReason.QUIT)
                 ),
             )
-            return
-        if self.shared.workflow_failed.value:
-            self._finish_episode("workflow_failure", abnormal=True)
             return
         now = time.monotonic_ns()
         if self.max_running_s is not None and now - self.started_ns >= int(
@@ -306,23 +305,43 @@ class PolicyRunner:
             )
 
     def run(self):
+        failure = None
         try:
             while self.shared.is_running.value and not self.shared.quit_requested.value:
                 self.step()
                 time.sleep(0.001)
-        except Exception:
-            self.shared.workflow_failed.value = True
-            raise
+        except Exception as exc:
+            failure = exc
+            self.shared.is_running.value = False
         finally:
-            self._finish_episode(
-                "shutdown",
-                abnormal=bool(
-                    self.shared.workflow_failed.value
-                    or self.shared.error_state.value
-                    or self.shared.estop_request.value
-                ),
-            )
+            try:
+                reason = RunEndReason(int(self.shared.run_ended_reason.value))
+                normal_stop = (
+                    failure is None
+                    and not self.shared.error_state.value
+                    and not self.shared.estop_request.value
+                    and reason in (RunEndReason.OPERATOR, RunEndReason.QUIT)
+                )
+                self._finish_episode(
+                    reason.name.lower() if normal_stop else "shutdown",
+                    abnormal=not normal_stop,
+                    run_end_reason=RunEndReason.POLICY_FAILURE
+                    if failure is not None
+                    else RunEndReason.RUNTIME_SHUTDOWN,
+                )
+                if self.recorder is not None:
+                    if self.recorder.is_recording:
+                        self.recorder.technical_status = "invalid"
+                        self.recorder.stop_episode(save=True, reason="interrupted")
+                    if self.recorder.stop_pending:
+                        self.recorder.join_stop()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+                logger.exception("policy recording cleanup failed")
             self._log_summary()
+        if failure is not None:
+            raise failure
 
     def _log_summary(self):
         def statistics(samples):
@@ -376,7 +395,7 @@ def run_policy_worker(
     from dexmani_policy.deployment import load_experiment
 
     model = None
-    runner = None
+    failure = None
     try:
         model = load_experiment(
             config.experiment,
@@ -402,12 +421,16 @@ def run_policy_worker(
         )
         shared.policy_ready.set()
         runner.run()
-    except Exception:
-        shared.workflow_failed.value = True
-        if runner is not None:
-            runner._finish_episode("policy_failure", abnormal=True)
+    except Exception as exc:
+        failure = exc
         logger.exception("policy worker failed")
         raise
     finally:
+        shared.policy_ready.clear()
         if model is not None:
-            model.close()
+            try:
+                model.close()
+            except Exception:
+                if failure is None:
+                    raise
+                logger.exception("policy model cleanup failed")

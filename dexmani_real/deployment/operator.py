@@ -60,13 +60,6 @@ class PolicyOperator:
     def run(self) -> None:
         try:
             self.keyboard.start()
-        except Exception:
-            # Without the e-stop keyboard the deployment must not run: fail closed
-            # so the supervisor observes a sticky fault and shuts down.
-            logger.error("operator: keyboard failed to start; latching error_state", exc_info=True)
-            self.shared.error_state.value = True
-            return
-        try:
             while not self.stop_event.is_set() and self.shared.is_running.value:
                 if self.keyboard.estop_latched or not self.keyboard.healthy:
                     self.shared.estop_request.value = True
@@ -92,13 +85,9 @@ class PolicyOperator:
                 if stop_in_batch:
                     logger.warning("operator: ignored B received in the same batch as S/Q")
                     continue
-                if (
-                    discard_begin_in_batch
-                    or self.shared.workflow_failed.value
-                    or not request_policy_start(
-                        self.shared,
-                        require_physical_home=self.planner is not None,
-                    )
+                if discard_begin_in_batch or not request_policy_start(
+                    self.shared,
+                    require_physical_home=self.planner is not None,
                 ):
                     logger.warning(
                         "operator: ignored B until a completed physical home "
@@ -156,7 +145,6 @@ class PolicyOperator:
                 completed
                 and self.shared.is_running.value
                 and not self.shared.quit_requested.value
-                and not self.shared.workflow_failed.value
                 and not self.shared.error_state.value
                 and not self.shared.estop_request.value
                 and int(self.shared.stop_request.value) == int(StopRequest.NONE)

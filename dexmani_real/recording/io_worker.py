@@ -158,9 +158,9 @@ def _create_episode_recorder(shared: Any, config: RecorderWorkerConfig) -> Episo
     )
 
 
-def _fail_workflow(shared: Any) -> None:
+def _revoke_recording_motion(shared: Any) -> None:
     with shared.motion_lock:
-        shared.workflow_failed.value = True
+        shared.is_running.value = False
         if int(shared.safety_state.value) == int(SafetyState.RUNNING):
             _revoke_motion_locked(shared, SafetyState.ARMED, reason=RunEndReason.RECORDING_FAILURE)
 
@@ -201,14 +201,17 @@ class _RecorderIOSession:
         except Exception as exc:
             logger.error("RecorderIO start failed", exc_info=True)
             self.fatal = True
-            _fail_workflow(self.shared)
+            _revoke_recording_motion(self.shared)
             if self.recorder.is_recording:
                 self._begin_finalization(save=False, reason="start_error", error=str(exc))
                 return
             if not self.recorder.resources_released:
                 raise RuntimeError("episode start retained unreleased resources") from exc
-            self._send_result(RecordingResult(reason="start_error", error=str(exc)))
-            return
+            try:
+                self._send_result(RecordingResult(reason="start_error", error=str(exc)))
+            except Exception:
+                logger.error("RecorderIO could not report START failure", exc_info=True)
+            raise
         self._send_result(RecordingStarted(path=self.recorder.episode_path))
 
     def _begin_finalization(self, *, save: bool, reason: str, error: str = "") -> None:
@@ -219,31 +222,41 @@ class _RecorderIOSession:
         self.pending_stop = None
         published = False
         try:
-            self.recorder.finish_episode(save, reason, failure_note=error)
+            self.recorder.finish_episode(save and not error, reason)
             published = self.recorder.last_finish_saved
         except EpisodeFinalizationError as exc:
-            error = str(exc)
+            if error:
+                logger.error("RecorderIO cleanup after %s failed", error, exc_info=True)
+            else:
+                error = str(exc)
         if error:
             self.fatal = True
-            _fail_workflow(self.shared)
+            _revoke_recording_motion(self.shared)
         if not self.recorder.resources_released:
-            raise RuntimeError("episode retained unreleased resources")
-        self._send_result(
-            RecordingResult(
-                saved=published,
-                path=path,
-                frame_count=frame_count,
-                reason=reason,
-                error=error or None,
-                min_frames_met=frame_count >= self.config.min_frames,
+            raise RuntimeError(error or "episode retained unreleased resources")
+        try:
+            self._send_result(
+                RecordingResult(
+                    saved=published,
+                    path=path,
+                    frame_count=frame_count,
+                    reason=reason,
+                    error=error or None,
+                    min_frames_met=frame_count >= self.config.min_frames,
+                )
             )
-        )
+        except Exception:
+            if not error:
+                raise
+            logger.error("RecorderIO could not report recording failure", exc_info=True)
+        if error:
+            raise RuntimeError(error)
 
     def _fail_samples(self, reason: str, error: str) -> None:
         logger.error("RecorderIO %s: %s", reason, error)
         self.fatal = True
         # Revoke before failed storage cleanup can block.
-        _fail_workflow(self.shared)
+        _revoke_recording_motion(self.shared)
         self._begin_finalization(save=False, reason=reason, error=error)
 
     def _handle_stop(self, control: StopRecording) -> None:
@@ -338,7 +351,7 @@ class _RecorderIOSession:
 def run_recorder_worker(shared: Any, config: RecorderWorkerConfig) -> None:
     """Record episodes until shutdown, reporting worker failures to supervision."""
     session = None
-    crashed = False
+    failure = None
     try:
         _warn_stale_staging(config.data_dir)
         recorder = _create_episode_recorder(shared, config)
@@ -348,9 +361,9 @@ def run_recorder_worker(shared: Any, config: RecorderWorkerConfig) -> None:
         while session.should_run:
             session.step()
             limiter.wait()
-    except Exception:
-        crashed = True
-        _fail_workflow(shared)
+    except Exception as exc:
+        failure = exc
+        _revoke_recording_motion(shared)
         if session is not None:
             session.fatal = True
         logger.error("RecorderIO process crashed", exc_info=True)
@@ -358,13 +371,15 @@ def run_recorder_worker(shared: Any, config: RecorderWorkerConfig) -> None:
         if session is not None:
             try:
                 if not session.shutdown():
-                    crashed = True
-                    _fail_workflow(shared)
-            except Exception:
-                crashed = True
-                _fail_workflow(shared)
+                    raise RuntimeError("RecorderIO retained unreleased resources")
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+                _revoke_recording_motion(shared)
                 logger.error("RecorderIO shutdown failed", exc_info=True)
         shared.recorder_ready.clear()
         logger.info("RecorderIO exited")
-    if crashed or (session is not None and session.fatal):
+    if failure is not None:
+        raise failure
+    if session is not None and session.fatal:
         raise RuntimeError("RecorderIO exited with a recording failure")

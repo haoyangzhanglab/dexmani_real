@@ -150,6 +150,7 @@ def run_teleop_experiment(
         mp_context=ctx,
     )
     supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
+    clean = False
     try:
         processes = _build_processes(
             ctx,
@@ -168,20 +169,20 @@ def run_teleop_experiment(
         supervisor.start(sensors)
         require_transition(shared, SafetyState.ARMED)
         supervisor.start([by_name["policy"]])
-        supervisor.run()
+        clean = supervisor.run()
     except KeyboardInterrupt:
         shared.estop_request.value = True
     except Exception:
-        shared.workflow_failed.value = True
         logger.exception("teleop session failed")
     finally:
         report = supervisor.shutdown(
             disarm_if_clean=True,
             graceful_timeout_s=runtime.safety.shutdown_timeout_s,
-            service_process_names={"camera", "recorder", "vr", "policy", "pointcloud"},
         )
-    return (
-        1
-        if shared.error_state.value or shared.workflow_failed.value or not report.shared_closed
-        else 0
+    return int(
+        not clean
+        or shared.error_state.value
+        or shared.estop_request.value
+        or int(shared.safety_state.value) == int(SafetyState.FAULT)
+        or not report.clean
     )

@@ -28,7 +28,7 @@ from dexmani_real.dataset.processing import (
     validate_episode,
 )
 from dexmani_real.recording.storage.reader import EpisodeReader
-from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
+from dexmani_real.utils.atomic_io import target_is_occupied
 
 logger = logging.getLogger(__name__)
 
@@ -61,44 +61,6 @@ class PolicyZarrExportConfig:
             raise ValueError("compression_level must be an integer in [0, 9]")
         if self.expected_task_name is not None:
             validate_task_name(self.expected_task_name)
-
-
-def _validate_staged_policy_zarr(
-    staging: Path,
-    *,
-    attrs: dict,
-    specs: dict,
-    episode_ends: list[int],
-    chunk_frames: int,
-) -> None:
-    """Check persisted structure before atomic publication."""
-    root = zarr.open_group(str(staging), mode="r")
-    if set(root.group_keys()) != {"data", "meta"} or set(root.array_keys()):
-        raise ValueError("staged policy root groups/keys mismatch")
-    if dict(root.attrs) != attrs:
-        raise ValueError("staged policy required attributes mismatch")
-    data, meta = root["data"], root["meta"]
-    if (
-        set(data.array_keys()) != set(specs)
-        or set(data.group_keys())
-        or set(meta.array_keys()) != {"episode_ends"}
-        or set(meta.group_keys())
-    ):
-        raise ValueError("staged policy array keys mismatch")
-    ends = meta["episode_ends"]
-    if ends.shape != (len(episode_ends),) or ends.dtype != np.dtype("int64"):
-        raise ValueError("staged episode_ends shape/dtype mismatch")
-    for start in range(0, len(episode_ends), chunk_frames):
-        if not np.array_equal(
-            ends[start : start + chunk_frames], episode_ends[start : start + chunk_frames]
-        ):
-            raise ValueError("staged episode_ends mismatch")
-    if not episode_ends or np.any(np.diff([0, *episode_ends]) <= 0):
-        raise ValueError("episode_ends must be positive and strictly increasing")
-    total = episode_ends[-1]
-    for key, (tail, dtype) in specs.items():
-        if data[key].shape != (total, *tail) or data[key].dtype != dtype:
-            raise ValueError(f"{key}: staged shape/dtype/row count mismatch")
 
 
 def export_raw_to_zarr(
@@ -255,14 +217,9 @@ def export_raw_to_zarr(
             root.create_group("meta").create_dataset(
                 "episode_ends", data=np.asarray(ends, dtype=np.int64)
             )
-            _validate_staged_policy_zarr(
-                staging,
-                attrs=first_attrs,
-                specs=first_specs,
-                episode_ends=ends,
-                chunk_frames=config.chunk_frames,
-            )
-            atomic_publish(staging, target)
+            if target_is_occupied(target):
+                raise FileExistsError(f"refusing to overwrite existing policy Zarr: {target}")
+            staging.rename(target)
             staging = None
         if progress_callback:
             progress_callback(len(episodes), len(episodes))
@@ -281,4 +238,7 @@ def export_raw_to_zarr(
         )
     finally:
         if staging is not None:
-            shutil.rmtree(staging)
+            try:
+                shutil.rmtree(staging)
+            except OSError:
+                logger.warning("Could not remove export staging %s", staging, exc_info=True)

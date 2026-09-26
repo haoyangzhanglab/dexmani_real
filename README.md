@@ -63,9 +63,9 @@ Teleop 默认录制，显式无录制调试使用 `--no-record`。无手调试�
 
 暂停撤销当前动作权限，恢复时从新鲜的机器人与 VR 观测重新锚定。发生暂停或控制异常的 episode 可保留用于诊断，但不作为 clean training demonstration 导出。
 
-录制依赖相机与录制 worker；它们失败时不会静默降级为无录制运行。Teleop 通过 `policy.max_record_duration_s` 配置正常 episode 预算，policy eval 通过 `--max-duration` 配置。录制预算必须严格小于录制器的帧数硬上限，启动前会校验；过长时应缩短 episode。
+录制依赖相机与录制 worker。已启动的必需 worker 意外退出或必需录制资源失效时，会撤销动作权限并结束会话，CLI 返回非零。相机、VR、点云、录制或 policy 进程失败属于实验失败；arm/hand 故障、急停或无法确认子进程停止按物理 FAULT 处理。
 
-Raw episode 关闭、验证后才原子发布。启动时若发现 `.tmp_<episode_name>` 残留目录，只会给出 warning：它们不是已发布的 raw episodes，可能来自录制中断，需人工检查处理，不会自动删除或恢复。
+Teleop 通过 `policy.max_record_duration_s` 配置正常 episode 预算，policy eval 通过 `--max-duration` 配置。录制预算必须严格小于录制器的帧数硬上限，启动前会校验；过长时应缩短 episode。
 
 ## 运动安全边界
 
@@ -83,13 +83,17 @@ xArm 与 XHand HOME 均以实测收敛判断完成。XHand 默认要求连续三
 
 Raw episode 是实验 source of truth，保留机器人状态、RGB-D 与标定、XHand 电流/触觉及其有效性、VR 源数据、真实时间戳、绝对动作目标和必要诊断。控制与录制复用当前观测快照，各模态按自身时间戳检查新鲜度。
 
-每个已发布 episode 包含 `data.h5`（控制行与元数据）、`depth.h5`（对齐到彩色图像的原始深度）和 `rgb.mp4`。深度值乘以相机提供的 `depth_scale` 才得到米。读取器只接受当前 raw schema；旧布局需在仓库外显式迁移。
+每个已发布 episode 包含 `data.h5`（控制行与元数据）、`depth.h5`（对齐到彩色图像的原始深度）和 `rgb.mp4`。深度值乘以相机提供的 `depth_scale` 才得到米。当前 raw schema 为 33，读取时要求版本完全匹配；旧布局需在仓库外显式迁移。
+
+Raw 先写入 `.tmp_<episode_name>`，关闭文件并通过结构验证后，才经 fsync 和原子重命名持久化发布。录制失败时释放 writer 并删除本次 staging；清理失败只记录错误并留下原目录，不覆盖原始录制异常。启动时发现残留 staging 只警告，需人工检查处理，不自动删除或恢复。
 
 Canonical Zarr 是从 raw 重建的全量训练缓存，包含 learning-relevant modalities；`dexmani_policy` 在加载时选择模型输入。点云、FK 和 fingertips 在离线转换时生成，Zarr 不保存 runtime timing arrays 或 validity masks。`action` 与 `action_ee` 表示同一个最终目标，分别使用关节和末端空间描述。
 
 Raw-to-Zarr 按完整 episode 接收或拒绝，不修复、切分、重采样或删除坏行。暂停、异常控制行、触觉无效、录制不完整或转换失败等情况会整条拒收并报告原因。批量导出可继续处理其他正常 episodes，但必须汇总拒绝原因。
 
 导出默认写入 `datasets/<task_name>.zarr`，可用 `--output` 指定新目标。`--dry-run` 执行相同的完整转换与校验而不创建 Zarr，仍需相应的运动学和点云依赖。
+
+Zarr 在目标父目录下写入 staging，完成后再次确认目标未占用，再在同一文件系统内重命名发布。它是可从 raw 重建的缓存，不逐块 fsync；导出失败时清理本次 staging，raw 保持不变。
 
 导出拒绝覆盖已有目标；解析符号链接后，目标不能位于输入目录、仓库的 `episodes/`、`episodes_processed/`、`rollouts/` 或已有 Zarr 内部。`episodes_processed/` 仅作为历史数据保护目录保留，当前流程直接从 raw 生成 Zarr。dry-run 同样检查目标路径。单个异常 episode 或没有可接收 episode 时返回失败。
 
@@ -101,7 +105,9 @@ Policy worker 持有 model / CUDA，使用同步 inference 和本地 action chun
 
 操作顺序为 H 回到初始姿态、布置场景、B 开始、S 停止；Q 退出，ESC 急停。HOME 完成后需要新的 B 才能开始；HOME 阻塞期间 S/Q 仍会立即撤销动作权限。`--num-episodes` 按实际开始并结束的 episode 计数，录制失败的 episode 也计入预算。
 
-会话输出位于 `rollouts/<policy>/<task>/<experiment>/session_*/`，包含 `run_config.yaml`、实际保存的 episode 目录和结束时的 `session_result.json`。Policy 模式不使用 C/D；同批收到 S/Q 时会忽略 H/B。
+会话输出位于 `rollouts/<policy>/<task>/<experiment>/session_*/`，包含 `run_config.yaml` 和实际保存的 episode 目录。Policy 模式不使用 C/D；同批收到 S/Q 时会忽略 H/B。
+
+会话执行结果由 CLI 退出码表示：正常完成或操作者退出且资源干净关闭时为 0；必需 worker/operator 异常、物理故障、急停、非正常 shutdown 或共享内存关闭失败时为非零。共享内存仅在确认全部子进程停止后释放。Policy 的未完成 active episode 若被异常中断，会按技术无效结束。
 
 Evaluation 数据用于评估与诊断，不能直接当作 teleop BC demonstration 导入训练缓存。任务成功与否需离线判断。
 
@@ -115,9 +121,5 @@ Evaluation 数据用于评估与诊断，不能直接当作 teleop BC demonstrat
     ruff format --check dexmani_real examples
     ruff check --select F401,F821,F822,F823,I dexmani_real examples
     git diff --check
-
-配置、观测、数据转换、部署及设备边界修改可在已安装依赖的环境中运行离线回归；套件使用模拟 SDK，不连接硬件：
-
-    python -m dexmani_real.deployment.smoke_test
 
 可选工具缺失时报告未完成的检查，不为检查安装或升级实验环境依赖。涉及实际运动、急停、暂停恢复、传感器失效和 shutdown 的行为，需另行授权真机验证。

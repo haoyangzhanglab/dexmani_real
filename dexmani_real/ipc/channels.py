@@ -117,8 +117,6 @@ class RuntimeChannels:
     run_id: Any  # controller advances it to invalidate old policy proposals
     # Latest software RUNNING termination; written under motion_lock.
     run_ended_reason: Any
-    # Sticky session failure can use verified non-FAULT shutdown without a runtime fault.
-    workflow_failed: Any
 
     is_running: Any  # Main -> all
     # Sticky runtime/safety fault: supervision takes the FAULT shutdown path.
@@ -252,8 +250,6 @@ class RuntimeChannels:
         storage.record_result_q = ctx.Queue(maxsize=8)
         storage.run_id = ctx.Value("Q", 1)
         storage.run_ended_reason = ctx.Value("i", 0)
-        # A killed service must not strand a lock needed to report workflow failure.
-        storage.workflow_failed = ctx.Value("b", False, lock=False)
 
         storage.is_running = ctx.Value("b", True, lock=False)
         storage.error_state = ctx.Value("b", False)

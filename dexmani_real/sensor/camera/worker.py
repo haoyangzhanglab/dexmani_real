@@ -86,8 +86,8 @@ def run_camera_worker(shared, config: CameraParams) -> None:
             last_frame, last_good_s = identity, time.monotonic()
             shared.camera_ready.set()
     except Exception:
-        shared.workflow_failed.value = True
         logger.exception("camera worker failed")
         raise
     finally:
+        shared.camera_ready.clear()
         cam.disconnect()

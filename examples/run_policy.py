@@ -299,21 +299,6 @@ def main(argv: list[str] | None = None) -> int:
         _print_lifecycle_error(f"lifecycle failed: {exc}")
         result = 1
 
-    from dexmani_real.utils.atomic_io import atomic_json_dump
-
-    try:
-        atomic_json_dump(
-            {
-                "technical_status": "valid" if result == 0 else "invalid",
-                "termination_reason": "session_finished" if result == 0 else "workflow_failed",
-                "task_success": "unknown",
-                "exit_code": result,
-            },
-            session_dir / "session_result.json",
-        )
-    except OSError as exc:
-        _print_lifecycle_error(f"could not persist session result: {exc}")
-        return 1
     return result
 
 

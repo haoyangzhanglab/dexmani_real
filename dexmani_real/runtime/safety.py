@@ -133,7 +133,6 @@ def request_policy_start(shared, *, require_physical_home):
             or not shared.is_running.value
             or shared.error_state.value
             or shared.estop_request.value
-            or shared.workflow_failed.value
             or shared.stop_request.value
             or (require_physical_home and not shared.physical_home_completed.value)
         ):
@@ -150,11 +149,6 @@ def _begin_requested_motion_locked(shared):
     if epoch is not None:
         shared.start_request.value = False
     return epoch
-
-
-def begin_requested_motion(shared):
-    with shared.motion_lock:
-        return _begin_requested_motion_locked(shared)
 
 
 def request_policy_stop(shared, *, reason=RunEndReason.OPERATOR):

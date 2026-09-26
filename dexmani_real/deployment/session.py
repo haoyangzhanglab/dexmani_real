@@ -27,8 +27,10 @@ from dexmani_real.robot.arm_worker import run_arm_worker
 from dexmani_real.robot.hand_worker import run_hand_worker
 from dexmani_real.runtime.processes import stop_processes_verified
 from dexmani_real.runtime.safety import (
+    RunEndReason,
     SafetyState,
     require_transition,
+    revoke_motion,
 )
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.sensor.camera.worker import run_camera_worker
@@ -127,6 +129,17 @@ def run_policy_deployment(
     supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
     operator_stop = threading.Event()
     operator_thread = None
+    operator_error = None
+    clean = False
+
+    def run_operator():
+        nonlocal operator_error
+        try:
+            operator.run()
+        except Exception as exc:
+            operator_error = exc
+            logger.exception("policy operator failed")
+
     try:
         policy = ctx.Process(
             name="policy",
@@ -189,25 +202,35 @@ def run_policy_deployment(
         operator = PolicyOperator(
             shared, runtime, planner, stop_event=operator_stop, execute=execute
         )
-        operator_thread = threading.Thread(target=operator.run)
+        operator_thread = threading.Thread(target=run_operator)
         operator_thread.start()
-        while shared.is_running.value and not shared.quit_requested.value:
+        while shared.is_running.value:
             if shared.error_state.value or shared.estop_request.value or not supervisor.check():
                 break
-            if not operator_thread.is_alive():
-                shared.workflow_failed.value = True
+            if operator_error is not None or not operator_thread.is_alive():
+                logger.error("policy operator stopped unexpectedly")
+                break
+            if shared.quit_requested.value:
+                clean = True
                 break
             time.sleep(0.02)
     except KeyboardInterrupt:
         shared.estop_request.value = True
     except Exception:
-        shared.workflow_failed.value = True
         logger.exception("policy session failed")
     finally:
         operator_stop.set()
-        if operator_thread is not None:
+        if not clean:
+            # Stop authorization before waiting for a thread that may be inside HOME.
+            with shared.motion_lock:
+                shared.is_running.value = False
+            if int(shared.safety_state.value) != int(SafetyState.DISARMED):
+                revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
+        if operator_thread is not None and operator_thread.ident is not None:
             operator_thread.join(timeout=5)
             if operator_thread.is_alive():
+                shared.error_state.value = True
+                revoke_motion(shared, SafetyState.FAULT)
                 stop_processes_verified(
                     shared,
                     supervisor.started_processes,
@@ -217,10 +240,12 @@ def run_policy_deployment(
         report = supervisor.shutdown(
             disarm_if_clean=True,
             graceful_timeout_s=max(5.0, runtime.safety.shutdown_timeout_s),
-            service_process_names={"policy", "camera", "pointcloud", "recorder"},
         )
-    return (
-        1
-        if shared.error_state.value or shared.workflow_failed.value or not report.shared_closed
-        else 0
+    return int(
+        not clean
+        or operator_error is not None
+        or shared.error_state.value
+        or shared.estop_request.value
+        or int(shared.safety_state.value) == int(SafetyState.FAULT)
+        or not report.clean
     )

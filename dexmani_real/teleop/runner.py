@@ -106,9 +106,7 @@ class TeleopRunner:
         )
 
     def _begin_episode(self):
-        if self.shared.workflow_failed.value or (
-            self.recorder is not None and self.recorder.stop_pending
-        ):
+        if self.recorder is not None and self.recorder.stop_pending:
             return
         row = read_observation(
             self.shared,
@@ -203,7 +201,6 @@ class TeleopRunner:
         status = execute_control_step(self.controller, self.shared, row, self.recorder)
         if (
             self.recorder is not None
-            and not self.shared.workflow_failed.value
             and self.recorder.frame_count > submitted_before
             and self.recorder.frame_count >= self.max_rows
         ):
@@ -215,6 +212,7 @@ class TeleopRunner:
             self._pause(True)
 
     def run(self) -> None:
+        failure = None
         try:
             planner = XArm7MotionPlanner.create_default(
                 online_ik_profile=make_online_ik_config(self.runtime)
@@ -261,8 +259,6 @@ class TeleopRunner:
                         self._stop_episode(
                             True, result.reason if result is not None else "recording_unavailable"
                         )
-                if self.shared.workflow_failed.value and self.active:
-                    self._stop_episode(True, "required_recording_resource_failed", abnormal=True)
                 for cmd in self.keyboard.poll(timeout=0.005):
                     if self._handle_operator_command(cmd):
                         break
@@ -270,8 +266,6 @@ class TeleopRunner:
                     self._stop_episode(True, "quit_decision_timeout", abnormal=True)
                     self.shared.quit_requested.value = True
                 if not self.active or self.shared.quit_requested.value:
-                    continue
-                if self.shared.workflow_failed.value:
                     continue
                 tick_started = time.monotonic()
                 if not self.paused and tick_started < self.next_tick:
@@ -294,9 +288,8 @@ class TeleopRunner:
                         if camera is None or not sample_is_fresh(
                             camera["timestamp_ns"], self.runtime.camera.max_frame_age_s
                         ):
-                            self.shared.workflow_failed.value = True
                             self._stop_episode(True, "camera_unavailable", abnormal=True)
-                            continue
+                            raise RuntimeError("required recording camera unavailable")
                     if not self.paused:
                         self._pause(False)
                     continue
@@ -304,20 +297,33 @@ class TeleopRunner:
                     self._try_resume(row)
                     continue
                 self._execute_control_step(row, tick_started)
-        except Exception:
-            self.shared.workflow_failed.value = True
+        except Exception as exc:
+            failure = exc
+            self.shared.is_running.value = False
             revoke_motion(self.shared)
             logger.exception("teleop failed")
-            raise
         finally:
             revoke_motion(self.shared)
-            if self.recorder is not None:
-                if self.recorder.is_recording:
-                    self.recorder.technical_status = "invalid"
-                    self.recorder.stop_episode(save=True, reason="interrupted")
-                self.recorder.join_stop()
-            self.keyboard.stop()
-            self.audio.close()
+            try:
+                if self.recorder is not None:
+                    if self.recorder.is_recording:
+                        self.recorder.technical_status = "invalid"
+                        self.recorder.stop_episode(save=True, reason="interrupted")
+                    self.recorder.join_stop()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+                logger.exception("teleop recording cleanup failed")
+            for close in (self.keyboard.stop, self.audio.close):
+                try:
+                    close()
+                except Exception as exc:
+                    if failure is None:
+                        failure = exc
+                    logger.exception("teleop resource cleanup failed")
+            self.shared.policy_ready.clear()
+        if failure is not None:
+            raise failure
 
 
 def run_teleop_worker(shared, config: TeleopConfig) -> None:

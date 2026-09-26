@@ -34,7 +34,7 @@ class RealSenseDiagnosticConfig:
     depth_resolution: tuple[int, int] = (640, 480)
     color_resolution: tuple[int, int] = (640, 480)
     warmup_frames: int = 10
-    stats_window: int = 100  # rolling-average window (frames)
+    fps_window: int = 100
 
 
 @dataclass
@@ -56,15 +56,6 @@ class PointCloudDisplayState:
         self.cloud_mode = "processed"
         self.frozen = False
         self.cached_cloud = None
-
-
-@dataclass
-class FrameStats:
-    read_ms: float = 0.0
-    pcd_ms: float = 0.0
-    valid_ratio: float = 0.0
-    point_count: int = 0
-    total_ms: float = 0.0
 
 
 class NonBlockingPCDViewer:
@@ -240,23 +231,13 @@ def _test_lifecycle(test_cfg: RealSenseDiagnosticConfig) -> bool:
     return True
 
 
-def _compute_rolling_stats(history: deque[FrameStats]) -> dict[str, float]:
-    if not history:
-        return dict(fps=0, read_ms=0, pcd_ms=0, total_ms=0, valid=0, points=0)
-    mean_total_ms = float(np.mean([sample.total_ms for sample in history]))
-    return dict(
-        fps=1000.0 / max(mean_total_ms, 0.001),
-        read_ms=float(np.mean([s.read_ms for s in history])),
-        pcd_ms=float(np.mean([s.pcd_ms for s in history])),
-        total_ms=float(np.mean([s.total_ms for s in history])),
-        valid=float(np.mean([s.valid_ratio for s in history])),
-        points=float(np.mean([s.point_count for s in history])),
-    )
-
-
 def _build_hud_lines(
     frame_count: int,
-    stats: dict[str, float],
+    fps: float,
+    read_ms: float,
+    pcd_ms: float,
+    valid_ratio: float,
+    point_count: int,
     state: PointCloudDisplayState,
     total_dropped: int,
     geometry: RGBDGeometry,
@@ -264,20 +245,20 @@ def _build_hud_lines(
 ) -> list[str]:
     depth_intrinsics = geometry.depth
     lines = [
-        f"frame={frame_count}  fps={stats['fps']:.1f}  total={stats['total_ms']:.1f}ms",
-        f"read={stats['read_ms']:.1f}ms  pcd={stats['pcd_ms']:.1f}ms  valid={stats['valid']:.3f}",
+        f"frame={frame_count}  fps={fps:.1f}",
+        f"read={read_ms:.1f}ms  pcd={pcd_ms:.1f}ms  valid={valid_ratio:.3f}",
         f"depthK=[{depth_intrinsics.fx:.0f},{depth_intrinsics.fy:.0f},"
         f"{depth_intrinsics.ppx:.0f},{depth_intrinsics.ppy:.0f}]",
     ]
     if state.show:
         if state.cloud_mode == "raw":
             lines.append(
-                f"PCD RAW FULL  n={stats['points']:.0f}  "
+                f"PCD RAW FULL  n={point_count}  "
                 f"filter/crop=OFF freeze={state.frozen} drop={total_dropped}"
             )
         else:
             lines.append(
-                f"PCD PROCESSED  n={stats['points']:.0f}  "
+                f"PCD PROCESSED  n={point_count}  "
                 f"vox={production.voxel_size_m:.3f} crop=production "
                 f"freeze={state.frozen} drop={total_dropped}"
             )
@@ -437,7 +418,7 @@ def _run_rgbd_test(
     production: PointCloudConfig,
     table_plane_abcd: tuple[float, float, float, float] | None,
     calibration: CameraExtrinsics,
-) -> dict:
+) -> None:
     print("\n-- 2. RGB-D live capture + point cloud --")
     print(
         "   q/Esc=quit  p=pcd  s=raw/processed  f=freeze "
@@ -446,7 +427,8 @@ def _run_rgbd_test(
 
     state = PointCloudDisplayState()
     viewer = NonBlockingPCDViewer(point_size=3.0)
-    stats_history: deque[FrameStats] = deque(maxlen=test_cfg.stats_window)
+    frame_intervals: deque[float] = deque(maxlen=test_cfg.fps_window)
+    previous_frame_start = None
     frame_count = 0
     total_dropped = 0
 
@@ -461,6 +443,9 @@ def _run_rgbd_test(
 
     while True:
         loop_start = time.perf_counter()
+        if previous_frame_start is not None:
+            frame_intervals.append(loop_start - previous_frame_start)
+        previous_frame_start = loop_start
 
         t0 = time.perf_counter()
         try:
@@ -540,19 +525,19 @@ def _run_rgbd_test(
         color_bgr = np.ascontiguousarray(frame_rgb[..., ::-1])
         panel = np.concatenate([color_bgr, depth_vis], axis=1)
 
-        total_ms = (time.perf_counter() - loop_start) * 1000.0
-        stats_history.append(
-            FrameStats(
-                read_ms=read_ms,
-                pcd_ms=pcd_ms,
-                valid_ratio=valid_ratio,
-                point_count=point_count,
-                total_ms=total_ms,
-            )
+        fps = len(frame_intervals) / sum(frame_intervals) if frame_intervals else 0.0
+        lines = _build_hud_lines(
+            frame_count,
+            fps,
+            read_ms,
+            pcd_ms,
+            valid_ratio,
+            point_count,
+            state,
+            total_dropped,
+            geometry,
+            production,
         )
-
-        stats = _compute_rolling_stats(stats_history)
-        lines = _build_hud_lines(frame_count, stats, state, total_dropped, geometry, production)
         _overlay_text(panel, lines)
         cv2.imshow(_WINDOW_NAME, panel)
 
@@ -568,40 +553,7 @@ def _run_rgbd_test(
     viewer.close()
     cv2.destroyAllWindows()
 
-    if stats_history:
-        reads = np.array([s.read_ms for s in stats_history])
-        totals = np.array([s.total_ms for s in stats_history])
-        pcds = np.array([s.pcd_ms for s in stats_history])
-        valids = np.array([s.valid_ratio for s in stats_history])
-        avg_total = float(totals.mean())
-        fps_avg = 1000.0 / avg_total if avg_total > 0 else 0.0
-
-        print(f"\n  -- Performance ({frame_count} frames) --")
-        print(f"  avg fps:          {fps_avg:.1f}")
-        print(f"  avg frame total:  {avg_total:.1f} ms  (max {totals.max():.1f} ms)")
-        print(f"  avg read(grab):   {float(reads.mean()):.1f} ms  (max {reads.max():.1f} ms)")
-        print(f"  avg pcd:          {float(pcds.mean()):.1f} ms")
-        print(f"  avg valid depth:  {float(valids.mean()):.3f}")
-        if total_dropped:
-            print(f"  pcd drops:        {total_dropped}")
-        return dict(
-            frames=frame_count,
-            avg_fps=fps_avg,
-            avg_read_ms=float(reads.mean()),
-            avg_pcd_ms=float(pcds.mean()),
-            avg_total_ms=avg_total,
-            avg_valid_ratio=float(valids.mean()),
-            drops=total_dropped,
-        )
-    return dict(
-        frames=0,
-        avg_fps=0,
-        avg_read_ms=0,
-        avg_pcd_ms=0,
-        avg_total_ms=0,
-        avg_valid_ratio=0,
-        drops=0,
-    )
+    print(f"Captured {frame_count} frames; point-cloud failures: {total_dropped}")
 
 
 def main() -> int:
@@ -659,9 +611,8 @@ def main() -> int:
             "-- press 'a' to toggle"
         )
 
-    result: dict = {}
     try:
-        result = _run_rgbd_test(
+        _run_rgbd_test(
             camera,
             test_cfg,
             production=production,
@@ -680,10 +631,6 @@ def main() -> int:
 
     print("\n" + "=" * 60)
     print("Test complete")
-    print(f"  Total frames:    {result.get('frames', 0)}")
-    print(f"  Avg fps:         {result.get('avg_fps', 0):.1f}")
-    print(f"  Avg latency:     {result.get('avg_total_ms', 0):.1f} ms")
-    print(f"  PCD drops:       {result.get('drops', 0)}")
     print("=" * 60)
     return 0
 

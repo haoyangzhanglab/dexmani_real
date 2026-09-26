@@ -9,7 +9,6 @@ needs separate confirmation and affects perception and collision geometry on the
 from __future__ import annotations
 
 import argparse
-import math
 import shutil
 import tempfile
 import time
@@ -42,7 +41,7 @@ from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_SAMPLING,
     POINT_CLOUD_TRANSFORM,
     aligned_depth_points_in_base,
-    build_point_cloud_with_stats,
+    build_point_cloud,
     build_raw_point_cloud,
 )
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
@@ -170,43 +169,6 @@ def _print_depth_stats(depth_m: np.ndarray, vmin: float, vmax: float) -> None:
     )
     # Depth gate only; production also filters local support and flying pixels.
 
-
-def _tprint(label: str, key: str, timings: dict[str, float]) -> None:
-    ms = timings.get(key, 0.0)
-    pipeline_ms = max(timings.get("pipeline_total", 1.0), 0.001)
-    if math.isnan(ms):
-        print(f"  {label:<30s}     --   (unavailable)")
-    elif ms < 0.01:
-        print(f"  {label:<30s}     --   (disabled)")
-    else:
-        pct = ms / pipeline_ms * 100
-        bar = "█" * max(1, int(pct / 2.5))
-        print(f"  {label:<30s} {ms:6.1f} ms  {bar}")
-
-
-def _stage_label(key: str) -> str:
-    return {
-        "capture": "Frame capture",
-        "extrinsics": "Extrinsics load",
-        "desk_calib": "Table plane calibration",
-        "pipeline_p50": "Fresh-frame pipeline p50",
-        "pipeline_p95": "Fresh-frame pipeline p95",
-        "pipeline_max": "Fresh-frame pipeline max",
-        "end_to_end_p50": "Capture-to-cloud p50",
-        "end_to_end_p95": "Capture-to-cloud p95",
-        "end_to_end_max": "Capture-to-cloud max",
-    }.get(key, key)
-
-
-_BUILD_TIMING_FIELDS = (
-    "depth_filter_ms",
-    "table_crop_ms",
-    "deprojection_ms",
-    "base_workspace_ms",
-    "voxelization_ms",
-    "spatial_outlier_filter_ms",
-    "color_sampling_ms",
-)
 
 _SNAPSHOT_SCHEMA_NAME = "dexmani-real-pointcloud-diagnostic-snapshot"
 _SNAPSHOT_SCHEMA_VERSION = 2
@@ -351,12 +313,6 @@ def _save_diagnostic_snapshot(
         raise
 
 
-def _print_build_stage_timings(prefix: str, values: dict[str, float]) -> None:
-    print(f"  {prefix}:")
-    for field in _BUILD_TIMING_FIELDS:
-        print(f"    {field.removesuffix('_ms'):<24s} {values[field]:5.1f} ms")
-
-
 def _connect_camera(cfg: PointCloudDiagnosticConfig) -> RealSenseCamera:
     """Connect and warm up; exclude this one-time cost from per-frame timings."""
     camera = RealSenseCamera(
@@ -409,12 +365,10 @@ def _print_device_info(camera: RealSenseCamera) -> dict:
 
 def _capture_frame(
     camera: RealSenseCamera,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """Capture one aligned frame and return RGB, raw/metric depth, and elapsed ms."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Capture one aligned frame and return RGB and raw/metric depth."""
     print("\nCapturing depth-to-color aligned RGBD frame...")
-    t0 = time.perf_counter()
     frame = camera.read()
-    capture_ms = (time.perf_counter() - t0) * 1000.0
 
     if frame.rgb is None:
         raise RuntimeError("RGB frame unavailable.")
@@ -431,13 +385,12 @@ def _capture_frame(
     print(f"  Depth:   shape={depth_m.shape}, valid={int((depth_m > 0).sum())}/{depth_m.size}")
     print(f"  Depth scale: {float(frame.depth_scale):.6f} m")
 
-    return rgb, depth_raw, depth_m, capture_ms
+    return rgb, depth_raw, depth_m
 
 
-def _load_extrinsics(camera_info: dict) -> tuple[np.ndarray, float]:
+def _load_extrinsics(camera_info: dict) -> np.ndarray:
     """Load T_xarm_base_from_color for aligned depth-to-color samples."""
     print("\nLoading extrinsics from cameras.json...")
-    t0 = time.perf_counter()
     calib = CameraExtrinsics()
     cam_name = calib.resolve_name_by_serial(str(camera_info.get("serial", "")))
     base_from_color = np.asarray(calib.get_extrinsics(cam_name), dtype=np.float64)
@@ -447,13 +400,12 @@ def _load_extrinsics(camera_info: dict) -> tuple[np.ndarray, float]:
     if not np.allclose(base_from_color[3], [0, 0, 0, 1], atol=1e-6):
         raise RuntimeError("Invalid homogeneous transform last row.")
 
-    elapsed = (time.perf_counter() - t0) * 1000.0
     pos = base_from_color[:3, 3]
     quat_xyzw = R.from_matrix(base_from_color[:3, :3]).as_quat()
     print(f"  Camera '{cam_name}' -> color/aligned-depth frame in xArm-base frame")
     print(f"  pos:         {np.round(pos, 4)} m")
     print(f"  quat (xyzw): {np.round(quat_xyzw, 4)}")
-    return base_from_color, elapsed
+    return base_from_color
 
 
 def _calibrate_table(
@@ -464,14 +416,13 @@ def _calibrate_table(
     config: PointCloudConfig,
     plane_path: Path,
     frame_count: int,
-) -> tuple[tuple[float, float, float, float], float]:
+) -> tuple[float, float, float, float]:
     print("\n" + "=" * 60)
     print("Table Plane Calibration (multi-frame RANSAC)")
     print("=" * 60)
     print("  Clear movable objects from the visible table before continuing.")
     input("  Press Enter to capture calibration frames...")
 
-    started = time.perf_counter()
     depth_frames: list[np.ndarray] = []
     for _ in range(max(1, frame_count)):
         frame = camera.read()
@@ -497,7 +448,6 @@ def _calibrate_table(
         point_batches.append(points)
     calibration_points = np.concatenate(point_batches, axis=0)
     fit = fit_table_plane(calibration_points)
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
 
     a, b, c, d = fit.plane_abcd
     print(f"  Plane: {a:.6f}x + {b:.6f}y + {c:.6f}z + {d:.6f} = 0")
@@ -525,7 +475,7 @@ def _calibrate_table(
         print("  Published and runtime-config round-trip verified.")
     else:
         print("  Calibration file unchanged; using the new fit for this run only.")
-    return fit.plane_abcd, elapsed_ms
+    return fit.plane_abcd
 
 
 def _build_cloud(
@@ -562,8 +512,7 @@ def _build_cloud(
     )
     print(f"  voxel_size_m={config.voxel_size_m}  table crop: {table_state}")
 
-    # Warm up once, then time the public operation.
-    _ = build_point_cloud_with_stats(
+    build_point_cloud(
         depth_raw=depth_raw,
         color=rgb,
         depth_scale_m=depth_scale_m,
@@ -574,7 +523,7 @@ def _build_cloud(
     )
 
     t0 = time.perf_counter()
-    result, stats = build_point_cloud_with_stats(
+    result = build_point_cloud(
         depth_raw=depth_raw,
         color=rgb,
         depth_scale_m=depth_scale_m,
@@ -584,27 +533,10 @@ def _build_cloud(
         config=config,
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    build_stage_timings = {
-        field: float(getattr(stats.timings, field)) for field in _BUILD_TIMING_FIELDS
-    }
-
-    print(
-        "  Stage counts: "
-        f"valid={stats.depth_valid_points} -> supported={stats.depth_trusted_points} "
-        f"-> table_reject={stats.table_rejected_points} "
-        f"-> workspace_reject={stats.workspace_rejected_points} "
-        f"-> crop={stats.cropped_points} -> voxel={stats.voxel_points} "
-        f"-> density={stats.radius_density_points} "
-        f"-> component={stats.spatial_inlier_points} "
-        f"-> candidate={stats.candidate_points}"
-    )
-    _print_build_stage_timings("Single-frame build stages", build_stage_timings)
-
     if result is not None:
         print(f"\n  Output: {result.shape[0]} points  ({elapsed_ms:.1f} ms)")
     else:
-        stage = stats.failure_stage or "unknown"
-        print(f"\n  Output: none (pipeline stopped at {stage})")
+        print(f"\n  Output: none ({elapsed_ms:.1f} ms)")
         result = np.zeros((0, 6), dtype=np.float32)
 
     return result
@@ -618,10 +550,9 @@ def _benchmark_production_pipeline(
     config: PointCloudConfig,
     table_plane_abcd: tuple[float, float, float, float] | None,
     frame_count: int = 20,
-) -> tuple[np.ndarray, dict[str, float]]:
+) -> np.ndarray:
     elapsed_ms: list[float] = []
     end_to_end_ms: list[float] = []
-    stage_samples: dict[str, list[float]] = {field: [] for field in _BUILD_TIMING_FIELDS}
     latest = np.zeros((0, 6), dtype=np.float32)
     for _ in range(frame_count):
         frame_started = time.perf_counter()
@@ -629,7 +560,7 @@ def _benchmark_production_pipeline(
         if frame.rgb is None or frame.depth_aligned_to_color_raw is None:
             raise RuntimeError("aligned RGB-D frame is unavailable")
         started = time.perf_counter()
-        cloud, stats = build_point_cloud_with_stats(
+        cloud = build_point_cloud(
             depth_raw=frame.depth_aligned_to_color_raw,
             color=frame.rgb,
             depth_scale_m=camera.get_depth_scale(),
@@ -640,70 +571,20 @@ def _benchmark_production_pipeline(
         )
         elapsed_ms.append((time.perf_counter() - started) * 1000.0)
         end_to_end_ms.append((time.perf_counter() - frame_started) * 1000.0)
-        for field in _BUILD_TIMING_FIELDS:
-            stage_samples[field].append(float(getattr(stats.timings, field)))
         if cloud is not None:
             latest = cloud
     values = np.asarray(elapsed_ms, dtype=np.float64)
     end_to_end_values = np.asarray(end_to_end_ms, dtype=np.float64)
-    timings = {
-        "pipeline_total": float(np.mean(values)),
-        "pipeline_p50": float(np.percentile(values, 50)),
-        "pipeline_p95": float(np.percentile(values, 95)),
-        "pipeline_max": float(np.max(values)),
-        "end_to_end_p50": float(np.percentile(end_to_end_values, 50)),
-        "end_to_end_p95": float(np.percentile(end_to_end_values, 95)),
-        "end_to_end_max": float(np.max(end_to_end_values)),
-    }
-    stage_p95 = {
-        field: float(np.percentile(stage_samples[field], 95)) for field in _BUILD_TIMING_FIELDS
-    }
-    timings.update({f"{field}_p95": value for field, value in stage_p95.items()})
     print(
-        "  Fresh-frame benchmark: "
-        f"n={frame_count} p50={timings['pipeline_p50']:.1f} ms "
-        f"p95={timings['pipeline_p95']:.1f} ms "
-        f"max={timings['pipeline_max']:.1f} ms "
-        "(target p95 < 40.0 ms)"
+        f"  Fresh-frame benchmark: n={frame_count} "
+        f"p50={np.percentile(values, 50):.1f} ms "
+        f"p95={np.percentile(values, 95):.1f} ms (target p95 < 40.0 ms)"
     )
     print(
-        "  Capture-to-cloud benchmark: "
-        f"p50={timings['end_to_end_p50']:.1f} ms "
-        f"p95={timings['end_to_end_p95']:.1f} ms "
-        f"max={timings['end_to_end_max']:.1f} ms"
+        f"  Capture-to-cloud benchmark: p50={np.percentile(end_to_end_values, 50):.1f} ms "
+        f"p95={np.percentile(end_to_end_values, 95):.1f} ms"
     )
-    _print_build_stage_timings("Build-stage p95", stage_p95)
-    return latest, timings
-
-
-def _print_timing_summary(timings: dict[str, float]) -> None:
-    print("\n" + "=" * 60)
-    print("Per-Stage Timing Summary")
-    print("=" * 60)
-
-    sections = [
-        ("Setup", ["capture", "extrinsics", "desk_calib"]),
-        (
-            "Point-Cloud Pipeline (per-frame steady-state)",
-            [
-                "pipeline_p50",
-                "pipeline_p95",
-                "pipeline_max",
-                "end_to_end_p50",
-                "end_to_end_p95",
-                "end_to_end_max",
-            ],
-        ),
-    ]
-
-    for title, keys in sections:
-        print(f"\n  -- {title} --")
-        for key in keys:
-            _tprint(f"  {_stage_label(key)}", key, timings)
-
-        if title.startswith("Point-Cloud"):
-            pipeline_ms = timings.get("pipeline_total", 0.0)
-            print(f"  {'  Point-cloud mean':<30s} {pipeline_ms:6.1f} ms")
+    return latest
 
 
 def _build_workspace_box(workspace: tuple[float, ...]) -> "o3d.geometry.LineSet":
@@ -776,7 +657,6 @@ def main(argv: list[str] | None = None) -> int:
     if save_dir is not None and save_dir.exists() and not save_dir.is_dir():
         raise NotADirectoryError(f"snapshot output root is not a directory: {save_dir}")
     cfg = PointCloudDiagnosticConfig()
-    all_timings: dict[str, float] = {}
 
     # Resolve and validate file-backed policy before connecting to hardware.
     runtime = resolve_experiment_config()
@@ -787,14 +667,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         camera_info = _print_device_info(camera)
 
-        rgb, _, depth_m, capture_ms = _capture_frame(camera)
-        all_timings["capture"] = capture_ms
+        rgb, _, depth_m = _capture_frame(camera)
         _print_depth_stats(depth_m, cfg.vis_depth_min_m, cfg.vis_depth_max_m)
         _show_rgbd_panels(rgb, depth_m, cfg)
 
         geometry = camera.get_geometry().aligned_depth_to_color()
-        T_xarm_base_from_color, extrinsics_ms = _load_extrinsics(camera_info)
-        all_timings["extrinsics"] = extrinsics_ms
+        T_xarm_base_from_color = _load_extrinsics(camera_info)
 
         calibrate_table = input("\nRun table calibration? [y/N] ").strip().lower() in {
             "y",
@@ -802,7 +680,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if calibrate_table:
             # Use the new fit immediately, even without saving it.
-            table_plane_abcd, calibration_ms = _calibrate_table(
+            table_plane_abcd = _calibrate_table(
                 camera=camera,
                 geometry=geometry,
                 T_xarm_base_from_color=T_xarm_base_from_color,
@@ -810,12 +688,10 @@ def main(argv: list[str] | None = None) -> int:
                 plane_path=resolve_table_plane_path(runtime.environment.table),
                 frame_count=cfg.table_calibration_frames,
             )
-            all_timings["desk_calib"] = calibration_ms
             table_plane_source = "calibrated_this_run"
         elif pcd_config.remove_table:
             table_plane_abcd = resolve_table_plane(runtime.environment.table)
             table_plane_source = "resolved_runtime"
-            all_timings["desk_calib"] = math.nan
             print(
                 "  Table calibration skipped; using resolved table_plane.json: "
                 f"{np.round(table_plane_abcd, 6)}"
@@ -823,11 +699,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             table_plane_abcd = None
             table_plane_source = "disabled"
-            all_timings["desk_calib"] = math.nan
             print("  Table calibration skipped; table crop is disabled by runtime config.")
 
         # Apply the fitted plane to a fresh post-calibration frame.
-        rgb, depth_raw, _, _ = _capture_frame(camera)
+        rgb, depth_raw, _ = _capture_frame(camera)
 
         result = _build_cloud(
             depth_raw=depth_raw,
@@ -863,18 +738,15 @@ def main(argv: list[str] | None = None) -> int:
                 camera_info=camera_info,
             )
             print(f"\nSaved point-cloud diagnostic snapshot: {snapshot_path}")
-        benchmark_result, t = _benchmark_production_pipeline(
+        benchmark_result = _benchmark_production_pipeline(
             camera=camera,
             geometry=geometry,
             T_xarm_base_from_color=T_xarm_base_from_color,
             config=pcd_config,
             table_plane_abcd=table_plane_abcd,
         )
-        all_timings.update(t)
         if benchmark_result.shape[0]:
             result = benchmark_result
-
-        _print_timing_summary(all_timings)
 
         if cfg.show_o3d:
             _visualize_result(result, T_xarm_base_from_color, pcd_config)

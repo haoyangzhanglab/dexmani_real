@@ -226,10 +226,8 @@ def run_pointcloud_worker(shared: "RuntimeChannels", config: PointCloudWorkerCon
                     "run_pointcloud_worker: ready (shape=(%d,6), frame=xarm_base)",
                     cfg.pointcloud.num_points,
                 )
-    except Exception:
-        shared.workflow_failed.value = True
-        raise
     finally:
+        shared.pointcloud_ready.clear()
         logger.info("run_pointcloud_worker: exited")
 
 
