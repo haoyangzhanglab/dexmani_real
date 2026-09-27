@@ -1,7 +1,8 @@
-"""Capability-based Raw reader, including a read-only legacy v34 adapter.
+"""Capability-based reader for the current Raw format.
 
-Known present fields are validated; additional fields do not invalidate an
-otherwise usable episode. Training/replay eligibility belongs to the consumer.
+Known present fields are validated; additive unknown fields do not invalidate an
+otherwise usable episode. Legacy Raw belongs to the explicit offline migration
+tool, not the normal runtime/export/replay path.
 """
 
 from __future__ import annotations
@@ -115,11 +116,11 @@ def _validate_hand_mount_metadata(attrs: h5py.AttributeManager) -> None:
 
 
 class EpisodeReader:
-    """Read immutable evidence without migrating it or deciding training eligibility."""
+    """Read current immutable Raw evidence without deciding training eligibility."""
 
     def __init__(self, episode_path: str | Path) -> None:
         self._path = Path(episode_path)
-        self._data = self._depth_file = self._rgb_decoder = None
+        self._data = self._rgb_decoder = None
         self._cache = {}
         if not self._path.is_dir():
             raise ValueError(f"episode must be a directory: {self._path}")
@@ -129,31 +130,15 @@ class EpisodeReader:
             if "meta" not in self._data or not isinstance(self._data["meta"], h5py.Group):
                 raise ValueError("episode is missing meta")
             attrs = self.meta
-            if "format" in attrs:
-                if _text_attr(attrs, "format") != RAW_FORMAT:
-                    raise ValueError(f"unsupported Raw format: {attrs['format']!r}")
-                self.is_legacy = False
-                _text_attr(attrs, "termination_reason")
-            else:
-                if _positive_int_attr(attrs, "schema_version") != 34:
-                    raise ValueError(
-                        "Raw requires format='dexmani.raw' or legacy schema_version=34"
-                    )
-                self.is_legacy = True
+            if _text_attr(attrs, "format") != RAW_FORMAT:
+                raise ValueError(
+                    f"unsupported Raw format; migrate the episode before use (expected {RAW_FORMAT!r})"
+                )
+            _text_attr(attrs, "termination_reason")
             self._num_frames = _positive_int_attr(attrs, "num_frames", allow_zero=True)
             self._control_hz = _positive_float_attr(attrs, "control_hz")
             _text_attr(attrs, "task_label")
             _text_attr(attrs, "collection_source")
-            self.legacy_episode_valid = None
-            if self.is_legacy:
-                valid = _scalar_attr(attrs, "episode_valid")
-                if not isinstance(valid, bool):
-                    raise ValueError("legacy episode_valid must be bool")
-                self.legacy_episode_valid = valid
-                if "depth" not in self._data and (self._path / "depth.h5").is_file():
-                    self._depth_file = h5py.File(self._path / "depth.h5", "r")
-                    if "depth" not in self._depth_file:
-                        raise ValueError("legacy depth.h5 is missing depth")
             self._validate_present_fields()
         except BaseException:
             self.close()
@@ -166,8 +151,6 @@ class EpisodeReader:
     @property
     def fields(self) -> frozenset[str]:
         names = {key for key, value in self._data.items() if isinstance(value, h5py.Dataset)}
-        if self._depth_file is not None:
-            names.add("depth")
         if self._rgb_path.is_file():
             names.add("rgb")
         return frozenset(names)
@@ -183,8 +166,6 @@ class EpisodeReader:
             raise ValueError(f"Raw {self._path.name} missing required metadata: {sorted(missing)}")
 
     def __getitem__(self, name):
-        if name == "depth" and self._depth_file is not None:
-            return self._depth_file["depth"]
         return self._data[name]
 
     @property
@@ -209,19 +190,11 @@ class EpisodeReader:
                     or array.dtype != spec.dtype
                 ):
                     raise ValueError(f"Raw {name}: incompatible shape/dtype")
-        if self.is_legacy and "frame_valid" in self._data:
-            array = self._data["frame_valid"]
-            if (
-                not isinstance(array, h5py.Dataset)
-                or array.shape != (self.num_frames,)
-                or array.dtype != np.bool_
-            ):
-                raise ValueError("legacy frame_valid: incompatible shape/dtype")
         fields = self.fields
         if fields & {"rgb", "depth"} or any(k.startswith("camera_") for k in self.meta):
             _validate_color_camera_metadata(self.meta)
-        if "depth" in self._data or self._depth_file is not None:
-            depth = self["depth"]
+        if "depth" in self._data:
+            depth = self._data["depth"]
             expected = (
                 self.num_frames,
                 int(self.meta["camera_color_height"]),
@@ -264,7 +237,7 @@ class EpisodeReader:
 
     def close(self) -> None:
         self._cache.clear()
-        for name in ("_rgb_decoder", "_depth_file", "_data"):
+        for name in ("_rgb_decoder", "_data"):
             resource = getattr(self, name)
             if resource is not None:
                 resource.close()
