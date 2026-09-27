@@ -453,7 +453,9 @@ class KeyboardInput:
                         signals = list(self._buffer)
                         self._buffer.clear()
                         return signals
-                time.sleep(0.005)  # 5 ms polling granularity
+                remaining = deadline - time.perf_counter()
+                if remaining > 0:
+                    time.sleep(min(0.005, remaining))
         return []
 
     @property

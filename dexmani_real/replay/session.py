@@ -1,8 +1,8 @@
 """Own robot processes, replay scheduling, optional return-home and diagnostics."""
 
+import math
 import multiprocessing as mp
 import os
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +12,7 @@ from dexmani_real.replay.replayer import ReplayOutcome, ReplayStatus, replay_tar
 from dexmani_real.replay.trajectory import verify_replay_preflight
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.robot.arm_worker import run_arm_worker
+from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.robot.hand_worker import run_hand_worker
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.safety import SafetyState, require_transition
@@ -24,6 +25,11 @@ DEFAULT_OUTPUT_DIR = "replay_results"
 class EpisodeReplayConfig:
     output_dir: str
     evaluate_consistency: bool
+    hand_start_duration_s: float = 0.5
+
+    def __post_init__(self):
+        if not math.isfinite(self.hand_start_duration_s) or self.hand_start_duration_s < 0:
+            raise ValueError("hand_start_duration_s must be finite and >= 0")
 
 
 def replay_episode(trajectory, runtime, config):
@@ -48,11 +54,26 @@ def replay_episode(trajectory, runtime, config):
         supervisor.start(processes)
         require_transition(shared, SafetyState.ARMED)
         keyboard.start()
-        outcome = replay_targets(shared, runtime, trajectory, keyboard)
+        home_result = home_hand(
+            shared,
+            runtime,
+            abort_requested=lambda: bool(shared.estop_request.value) or not keyboard.healthy,
+        )
+        if home_result.ok:
+            outcome = replay_targets(
+                shared,
+                runtime,
+                trajectory,
+                keyboard,
+                hand_start_duration_s=config.hand_start_duration_s,
+            )
+        else:
+            outcome = ReplayOutcome(
+                ReplayStatus.REJECTED, reason=f"startup hand home failed: {home_result.reason}"
+            )
         if outcome.successful:
             print("H: planned return_home; Q: exit", flush=True)
-            deadline = time.monotonic() + runtime.policy.post_teleop_timeout_s
-            while time.monotonic() < deadline and supervisor.check():
+            while shared.is_running.value and supervisor.check():
                 if not keyboard.healthy:
                     shared.estop_request.value = True
                 if shared.error_state.value or shared.estop_request.value:
@@ -73,7 +94,8 @@ def replay_episode(trajectory, runtime, config):
                         outcome = ReplayOutcome(
                             ReplayStatus.REJECTED, outcome.replay_data, "return_home failed"
                         )
-                    break
+                        break
+                    print("Return-home completed. H: planned return_home; Q: exit", flush=True)
     finally:
         keyboard.quiesce()
         report = supervisor.shutdown(
@@ -89,5 +111,6 @@ def replay_episode(trajectory, runtime, config):
         outcome.replay_data,
         evaluate_consistency=config.evaluate_consistency,
         output_dir=config.output_dir,
+        hand_start_duration_s=config.hand_start_duration_s,
     )
     return outcome

@@ -247,6 +247,7 @@ def evaluate_replay(
     *,
     evaluate_consistency: bool,
     output_dir: str,
+    hand_start_duration_s: float = 0.0,
 ) -> None:
     """Evaluate and persist samples captured by one physical replay."""
     if replay_data is None:
@@ -285,7 +286,7 @@ def evaluate_replay(
         raise
 
     report_consistency(metrics)
-    save_results(metrics, replay_data, output_dir)
+    save_results(metrics, replay_data, output_dir, hand_start_duration_s=hand_start_duration_s)
 
 
 def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str) -> Path:
@@ -303,7 +304,11 @@ def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str) -> Pat
 
 
 def save_results(
-    metrics: ReplayMetrics, replay_data: dict[str, np.ndarray], output_dir: str
+    metrics: ReplayMetrics,
+    replay_data: dict[str, np.ndarray],
+    output_dir: str,
+    *,
+    hand_start_duration_s: float = 0.0,
 ) -> None:
     """Save replay data and consistency metrics to output directory.
 
@@ -315,6 +320,11 @@ def save_results(
     output_path.mkdir(parents=True, exist_ok=True)
 
     metrics_dict: dict[str, object] = {
+        "hand_start": {
+            "requested_ramp_duration_s": hand_start_duration_s,
+            "target": "first_recorded_action" if hand_start_duration_s > 0 else "none",
+            "included_in_replay_rows": False,
+        },
         "episode_path": metrics.episode_path,
         "task_label": metrics.task_label,
         "speed_factor": metrics.speed_factor,

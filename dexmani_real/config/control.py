@@ -63,9 +63,6 @@ class TeleopTimingParams:
 class PolicyParams:
     """Shared experiment/control settings; learned policy timing is saved-Policy-config-owned."""
 
-    quit_save_timeout_s: float = 30.0
-    post_teleop_timeout_s: float = 60.0
-
     ema: EMAParams = field(default_factory=EMAParams)
 
     vr_mapping: VRMappingParams = field(default_factory=VRMappingParams)
@@ -83,12 +80,6 @@ class PolicyParams:
     hand_retargeting_type: str = "tag"
 
     def validate(self) -> None:
-        timing = (
-            self.quit_save_timeout_s,
-            self.post_teleop_timeout_s,
-        )
-        if not all(np.isfinite(value) and value > 0 for value in timing):
-            raise ValueError("policy operator timeouts must be finite and positive")
         if not np.isfinite(self.max_record_duration_s) or self.max_record_duration_s <= 0:
             raise ValueError("max_record_duration_s must be finite and positive")
         if not self.episodes_dir:

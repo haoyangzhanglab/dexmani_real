@@ -43,11 +43,12 @@ class RuntimeSupervisor:
         self.readiness_timeouts = readiness_timeouts
         self.started_processes = []
 
-    def start(self, processes) -> None:
+    def start(self, processes, *, wait_ready=True) -> None:
+        """Own child startup; a dependent worker may handle readiness when wait_ready=False."""
         for process in processes:
             process.start()
             self.started_processes.append(process)
-            if not wait_subsystem_ready(
+            if wait_ready and not wait_subsystem_ready(
                 self.shared, process, self.readiness_timeouts[process.name], check=self.check
             ):
                 raise RuntimeError(f"{process.name} failed to become ready")

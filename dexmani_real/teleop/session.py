@@ -16,7 +16,7 @@ from dexmani_real.robot.model import (
     XARM7_XHAND_SRDF_PATH,
 )
 from dexmani_real.runtime.safety import SafetyState, require_transition
-from dexmani_real.runtime.supervisor import RuntimeSupervisor
+from dexmani_real.runtime.supervisor import RuntimeSupervisor, wait_subsystem_ready
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.vr_worker import run_vr_worker
 from dexmani_real.teleop.config import TeleopConfig
@@ -58,8 +58,6 @@ def _build_processes(
     runtime: ExperimentConfig,
     *,
     task_name: str,
-    hand_enabled: bool,
-    recording_enabled: bool,
 ) -> list[Any]:
     policy_config = TeleopConfig(
         runtime,
@@ -70,11 +68,11 @@ def _build_processes(
         context.Process(name="vr", target=run_vr_worker, args=(shared, runtime.vr)),
         context.Process(name="policy", target=run_teleop_worker, args=(shared, policy_config)),
     ]
-    if recording_enabled:
+    if runtime.policy.recording_enabled:
         processes.append(
             context.Process(name="camera", target=run_camera_worker, args=(shared, runtime.camera))
         )
-    if hand_enabled:
+    if runtime.policy.hand_enabled:
         processes.append(
             context.Process(
                 name="hand",
@@ -119,14 +117,25 @@ def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, allow_no_hand
             shared,
             runtime,
             task_name=task_name,
-            hand_enabled=runtime.policy.hand_enabled,
-            recording_enabled=runtime.policy.recording_enabled,
         )
         by_name = {p.name: p for p in processes}
-        sensors = [by_name[name] for name in ("arm", "hand", "vr", "camera") if name in by_name]
+        sensors = [by_name[name] for name in ("arm", "hand", "camera") if name in by_name]
         supervisor.start(sensors)
         require_transition(shared, SafetyState.ARMED)
-        supervisor.start([by_name["policy"]])
+        supervisor.start([by_name["policy"]], wait_ready=False)
+        # Q may cancel initialization before policy_ready, without a worker failure.
+        ready = wait_subsystem_ready(
+            shared,
+            by_name["policy"],
+            runtime.safety.readiness_timeouts_s["policy"],
+            check=lambda: supervisor.check() and not shared.quit_requested.value,
+        )
+        if not ready and not shared.quit_requested.value:
+            raise RuntimeError("teleop initialization failed or timed out")
+        # policy_ready covers hand home, IK and retargeting initialization.
+        # The control owner waits for VR while keeping Q/ESC responsive.
+        if not shared.quit_requested.value:
+            supervisor.start([by_name["vr"]], wait_ready=False)
         clean = supervisor.run()
     except KeyboardInterrupt:
         shared.estop_request.value = True

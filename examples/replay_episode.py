@@ -43,6 +43,13 @@ def _positive_float(value: str) -> float:
     return result
 
 
+def _nonnegative_float(value: str) -> float:
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError(f"must be finite and >= 0, got {value}")
+    return result
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Physically replay a recorded trajectory on the xArm7 and XHand.",
@@ -55,7 +62,7 @@ Examples:
 
 Controls:
   Q     clean exit (save partial results)
-  H     planned robot return-home (post-replay prompt)
+  H     planned robot return-home, then wait for Q to exit (post-replay prompt)
   ESC   emergency stop
         """,
     )
@@ -75,6 +82,15 @@ Controls:
         type=str,
         default=None,
         help="Missing or empty directory for replay data and consistency metrics.",
+    )
+    parser.add_argument(
+        "--hand-start-duration",
+        type=_nonnegative_float,
+        default=0.5,
+        help=(
+            "Seconds to ramp XHand to the first target before replay (default: 0.5). "
+            "Rounded up to replay periods; 0 disables preparation for strict replay."
+        ),
     )
     parser.add_argument(
         "--acc",
@@ -145,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             EpisodeReplayConfig(
                 output_dir=output_dir,
                 evaluate_consistency=True,
+                hand_start_duration_s=args.hand_start_duration,
             ),
         )
     except Exception as exc:

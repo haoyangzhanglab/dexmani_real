@@ -39,7 +39,103 @@ class ReplayOutcome:
         return self.status in (ReplayStatus.COMPLETED, ReplayStatus.USER_QUIT)
 
 
-def replay_targets(shared, runtime, trajectory, keyboard):
+def _wait_replay(shared, keyboard, epoch, deadline):
+    """Keep operator input and lifecycle checks active during bounded waits."""
+    while True:
+        signals = keyboard.poll(timeout=0)
+        if not keyboard.healthy:
+            shared.estop_request.value = True
+        if shared.estop_request.value:
+            return ReplayOutcome(ReplayStatus.ESTOP, reason="operator emergency stop")
+        if (
+            shared.error_state.value
+            or not shared.is_running.value
+            or int(shared.run_id.value) != epoch
+        ):
+            return ReplayOutcome(ReplayStatus.FAULT, reason="hardware fault or epoch changed")
+        if OperatorCommand.QUIT in signals:
+            return ReplayOutcome(ReplayStatus.USER_QUIT)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.005, remaining))
+
+
+def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s):
+    """Prepare frame zero without adding synthetic rows to the recorded trajectory."""
+    arm_hold = project_arm_command(
+        row.arm["qpos"][0],
+        row.arm["qpos"][0],
+        joint_lower_rad=runtime.arm.joint_limit_lower,
+        joint_upper_rad=runtime.arm.joint_limit_upper,
+    )
+    hand_start = project_hand_command(
+        row.hand["qpos"][0],
+        qpos_min_rad=runtime.hand.qpos_min_rad,
+        qpos_max_rad=runtime.hand.qpos_max_rad,
+    )
+    hand_target = project_hand_command(
+        trajectory.action_hand_joint[0],
+        qpos_min_rad=runtime.hand.qpos_min_rad,
+        qpos_max_rad=runtime.hand.qpos_max_rad,
+    )
+    steps = max(1, int(np.ceil(duration_s * trajectory.fps)))
+    period = 1 / trajectory.fps
+    print(
+        f"XHand start: {steps * period:g}s ramp to first target, then wait for arrival. "
+        "Preparation is outside replay rows; initial hand state differs from Raw. "
+        "Q: stop; ESC: emergency stop",
+        flush=True,
+    )
+    step = 0
+    deadline = 0.0
+    final_stamp = None
+    last_sample = 0
+    consecutive = 0
+    while True:
+        interrupted = _wait_replay(shared, keyboard, epoch, deadline)
+        if interrupted is not None:
+            return interrupted
+        row = read_observation(shared, runtime)
+        if row is None:
+            return ReplayOutcome(ReplayStatus.REJECTED, reason="hand start feedback stale")
+        if np.max(np.abs(row.arm["qpos"][0] - arm_hold)) > np.deg2rad(10):
+            return ReplayOutcome(ReplayStatus.REJECTED, reason="arm moved during hand start")
+        if final_stamp is None:
+            progress = step / steps
+            weight = progress * progress * (3 - 2 * progress)
+            hand = (
+                hand_target if step == steps else hand_start + weight * (hand_target - hand_start)
+            )
+            stamp = publish_command(shared, RobotCommand(epoch, arm_hold, hand))
+            if not stamp:
+                return ReplayOutcome(ReplayStatus.REJECTED, reason="hand start authority revoked")
+            if step == steps:
+                final_stamp = stamp
+                last_sample = stamp
+            step += 1
+            deadline = stamp / 1e9 + period
+            continue
+
+        if time.monotonic() >= final_stamp / 1e9 + runtime.hand.home_timeout_s:
+            return ReplayOutcome(ReplayStatus.REJECTED, reason="hand start convergence timed out")
+        sample = int(row.hand["timestamp_ns"][0])
+        if sample > last_sample:
+            last_sample = sample
+            if np.max(np.abs(row.hand["qpos"][0] - hand_target)) <= np.deg2rad(
+                runtime.hand.home_tolerance_deg
+            ):
+                consecutive += 1
+            else:
+                consecutive = 0
+            # Only distinct fresh samples after the final publication establish arrival.
+            if consecutive >= 3:
+                print("XHand start ready; replaying recorded targets.", flush=True)
+                return None
+        deadline = time.monotonic() + 0.01
+
+
+def replay_targets(shared, runtime, trajectory, keyboard, *, hand_start_duration_s):
     capture = ReplayRecorder(trajectory.num_frames)
     status, reason = ReplayStatus.COMPLETED, ""
     fk = make_arm_fk()
@@ -65,18 +161,16 @@ def replay_targets(shared, runtime, trajectory, keyboard):
         return ReplayOutcome(ReplayStatus.REJECTED, reason="motion authority unavailable")
     epoch = int(shared.run_id.value)
     try:
+        if hand_start_duration_s > 0:
+            interrupted = _warm_up_hand(
+                shared, runtime, trajectory, keyboard, epoch, row, hand_start_duration_s
+            )
+            if interrupted is not None:
+                return interrupted
         for index in range(trajectory.num_frames):
-            signals = keyboard.poll(timeout=0)
-            if not keyboard.healthy:
-                shared.estop_request.value = True
-            if shared.estop_request.value:
-                status, reason = ReplayStatus.ESTOP, "operator emergency stop"
-                break
-            if shared.error_state.value or int(shared.run_id.value) != epoch:
-                status, reason = ReplayStatus.FAULT, "hardware fault or epoch changed"
-                break
-            if OperatorCommand.QUIT in signals:
-                status = ReplayStatus.USER_QUIT
+            interrupted = _wait_replay(shared, keyboard, epoch, 0.0)
+            if interrupted is not None:
+                status, reason = interrupted.status, interrupted.reason
                 break
             row = read_observation(shared, runtime)
             if row is None:
@@ -109,9 +203,10 @@ def replay_targets(shared, runtime, trajectory, keyboard):
                 hand_qpos=row.hand["qpos"][0],
                 arm_tracking_error=float(np.max(np.abs(arm - row.arm["qpos"][0]))),
             )
-            deadline = stamp / 1e9 + 1 / trajectory.fps
-            while time.monotonic() < deadline and not shared.estop_request.value:
-                time.sleep(min(0.005, max(0, deadline - time.monotonic())))
+            interrupted = _wait_replay(shared, keyboard, epoch, stamp / 1e9 + 1 / trajectory.fps)
+            if interrupted is not None:
+                status, reason = interrupted.status, interrupted.reason
+                break
     finally:
         revoke_motion(shared)
     return ReplayOutcome(status, capture.to_dict(), reason)

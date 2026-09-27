@@ -224,7 +224,7 @@ class CollisionModel:
         self._environment_obstacle_count = len(normalized_boxes) + int(self._table is not None)
 
         self._nq: int = self._model.nq
-        logger.info(
+        logger.debug(
             "CollisionModel ready: %d DOF%s, %d geometries, %d self pairs, "
             "%d static boxes, table=%s, %d environment pairs",
             self._nq,

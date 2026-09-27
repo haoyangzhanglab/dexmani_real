@@ -30,11 +30,10 @@ _EVENT_MAP: dict[str, str] = {
     "discard": "放弃保存轨迹.wav",
     "home": "即将回到初始姿态.wav",
     "home_done": "已经回到初始姿态.wav",
-    "emergency": "意外的事情出现了.wav",
     "quit": "准备退出遥操作.wav",
-    "quit_save_prompt": "已退出，是否需要保存轨迹.wav",
-    "calibrated": "轴向已标定.wav",
     "end": "操作结束.wav",
+    "emergency": "意外的事情出现了.wav",
+    "calibrated": "轴向已标定.wav",
 }
 
 _PLAYER_FALLBACK_MAX_RUNTIME_S = 0.25

@@ -43,27 +43,35 @@ Teleop、键盘控制和 policy 分别使用各自的控制周期，replay 使�
 
 键盘控制使用 WASD/方向键和 IJKL 微调，R 执行 planned HOME，Q 退出，ESC 急停。下节的 B/C/S/D/H 按键用于 VR teleop。
 
-物理回放只接受当前 `format="dexmani.raw"` 的 teleop episode；加载时拒绝空轨迹或非有限的动作/机器人状态。启动前需在操作者监督下将机器人置于录制起始姿态附近：机械臂和手部每个关节的误差均不得超过 10°，机械臂按限位内等价角比较。回放按录制频率逐条发布目标，Q 停止并保留已采集数据，结束后的 H 执行机器人 planned HOME。默认输出为 `replay_results/<episode_name>_replay/`，`--output` 必须指向不存在或为空的目录；采集到数据后保存 `replay_data.npz` 并计算一致性指标 `metrics.json`。
+物理回放只接受当前 `format="dexmani.raw"` 的 teleop episode；加载时拒绝空轨迹或非有限的动作/机器人状态。初始化完成后，先发送一次配置的 `hand.home_qpos_deg` 回零目标并等待手部到位，失败则退出。随后检查机械臂和手部与录制首帧实测姿态的每个关节误差均不得超过 10°，机械臂按限位内等价角比较；启动前需在操作者监督下将机械臂置于录制起始姿态附近。默认先保持机械臂当前姿态，用 0.5 秒 smoothstep 将手部从新鲜实测姿态过渡到首帧手部目标（时长向上取整到完整回放周期），再按 `hand.home_tolerance_deg` / `hand.home_timeout_s` 等待连续三个新鲜样本确认到位；反馈失效、机械臂偏离或到位超时则停止。准备阶段支持 Q/ESC 中止，不计入回放行。`--hand-start-duration 0` 可关闭这段准备以保留原始启动瞬态；启用时手部初始条件改变，`metrics.json` 的 `hand_start` 明确记录设置，首段指标不代表严格初态复现。正式回放仍按录制频率逐条发布原始目标，Q 停止并保留已采集数据，结束后的 H 执行机器人 planned HOME，成功后继续等待 Q 明确退出，不超时自动退出；回零失败、急停或硬件故障仍退出并保留已采集结果。默认输出为 `replay_results/<episode_name>_replay/`，`--output` 必须指向不存在或为空的目录；采集到数据后保存 `replay_data.npz` 并计算一致性指标 `metrics.json`。
 
 ## Teleop 与录制
 
 Teleop 默认录制，显式无录制调试使用 `--no-record`，此时不启动相机 worker 或录制 writer。无手调试需同时使用 `--no-hand` 并禁用录制，且手必须已拆除或固定在配置的 home 姿态。
 
+启动时先等待 arm/hand/camera 就绪；启用 XHand 时，连接和触觉标定流程结束后发送一次配置的 `hand.home_qpos_deg` 回零目标并等待到位，然后完成 IK 与手部重定向初始化。最后启动 VR 接收并等待 HTS APP 的首帧有效右手数据，终端输出“准备进入遥操作”。初始化回零和等待 VR 期间，Q 可正常取消启动、ESC 可急停；真实回零失败仍报错退出。等待 VR 超时按 `safety.readiness_timeouts_s.vr` 处理。正常按键操作通过语音反馈，终端不打印按键动作或按键列表，保留录制结果和故障诊断。
+
 | 按键 | 操作 |
 |---|---|
-| B | 开始 |
-| C | 暂停 / 恢复 |
-| S | 停止并保存 |
-| D | 丢弃 |
-| H | 停止并保存当前录制，然后 Return-home |
-| Q | 请求退出；录制中先暂停并等待保存/丢弃选择 |
+| B | 首次开始采集会话；会话开始后无操作 |
+| C | 暂停 / 恢复；恢复时开始新的 Raw episode |
+| S | 保存当前片段，保持暂停 |
+| D | 丢弃当前未完成片段，保持暂停 |
+| H | 仅执行 planned HOME；运行中先暂停控制 |
+| Q | 第一次准备退出，第二次确认退出；首次 B 成功前且无 capture 时可直接退出 |
 | ESC | 急停 |
 
-录制中按 Q 后，可用 S 保存、D 丢弃，或 H 保存并回 home，然后退出。超过 `policy.quit_save_timeout_s` 未选择时，丢弃 capture 后退出。
+语音对应实际操作结果：B 成功开始后播“遥操作启动”；C 暂停播“操作暂停”，成功恢复后播“工作继续”；S 实际保存成功后播“成功保存轨迹”，D 丢弃当前 capture 后播“放弃保存轨迹”，无待处理 capture 时不播报。首次 Q 播“准备退出遥操作”，确认退出播“操作结束”。H 开始回零前播“即将回到初始姿态”，仅成功到位后顺序播“已经回到初始姿态”；失败或中断不播到位提示。ESC/技术失败播“意外的事情出现了”。C 默认保存片段时先播保存结果，再播恢复提示；语音异步播放，退出收尾限时等待末条语音，避免立即关闭播放器将其截断。
 
-C 暂停或传感器失效触发的暂停会撤销动作权限，并将当前 capture 标为 discard-only。恢复时从新鲜机器人与 VR 观测重新锚定，只恢复控制，不重启或分段录制；此后不再接收录制行。S/H/Q 收尾时会丢弃该 capture 并明确记录原因，不能误认为已保存 demonstration。控制/发布失败、连续性中断和异常结束同样丢弃 teleop capture。正常 Q 后等待保存/丢弃选择本身不使 clean capture 失效。
+C 暂停会冻结当前 clean capture，暂不发布或删除；S/D 立即决定保存或丢弃。C 恢复会默认保存尚未处理的 clean capture，再 START 一个全新的 Raw episode，等待 START 之后的新鲜机器人与 VR 观测重新锚定，然后恢复运动，无需再次按 B。首次 B 同样要求 START 后的新观测，锚定与运动授权成功后才算会话开始。Raw 每个 episode 都是连续的固定 dt 轨迹，绝不跨暂停的墙钟时间或控制状态重置追加录制行。S/D 后会话仍保持暂停，C 可开始下一片段；已发布 Raw 不会被之后的 D 删除。
 
-录制依赖相机 worker 和控制进程内的单一 writer 线程。控制步复用当前观测的 RGB-D，通过容量为 16 行的本地 FIFO 非阻塞提交；不再复制整帧 RGB-D 到录制共享内存。writer 线程从打开到关闭独占 HDF5/PyAV，负责编码、写盘和发布；小型数值数组不压缩，深度仍使用 gzip level 1。START 等待 writer 就绪后才允许动作，保存/丢弃只在撤销动作权限后阻塞等待。
+H 只回 home，不决定数据去留；运行中按 H 会先冻结 capture，回零后保持暂停。片段的 `termination_reason` 保留首次控制边界原因，例如 C 暂停后再 S 保存仍为 `pause`，H 或 Q 不覆盖已有原因。直接 S 为 `stop`，直接 H 为 `home`。
+
+首次 Q 暂停并进入退出待确认状态，没有超时自动决策。S/D/H 后仍等待退出确认；第二次 Q 默认保存未处理的 clean capture 后退出，技术无效 capture 则丢弃。C 取消退出并按正常恢复流程开始新片段。HOME 执行期间 ESC 急停、Q 中断 HOME 并遵循同样的两阶段退出；C/S/D/H 被消费而不延迟执行，需要结束后重新按键。
+
+技术控制/发布失败或控制周期不连续会立即撤销运动并丢弃当前片段，保持可见暂停，不能套用手动暂停的默认保存规则。非相机观测失效同样暂停并丢弃，资源恢复后需手动 C 开始新片段；录制背压、writer 错误、必需相机失效及硬件/runtime 故障仍结束会话。异常退出丢弃未完成 capture。达到 `policy.max_record_duration_s` 时保存当前片段并保持暂停，C 才开始下一片段；无录制调试保留相同的手动暂停/恢复和两阶段退出语义。
+
+录制依赖相机 worker 和控制进程内的单一 writer 线程。控制步复用当前观测的 RGB-D，通过本地有界 FIFO 非阻塞提交，无额外整帧复制。writer 线程从打开到关闭独占 HDF5/PyAV，负责编码、写盘和发布。START 等待 writer 就绪后才允许动作，保存/丢弃只在撤销动作权限后阻塞等待。
 
 队列满或 writer 异常属于硬录制失败，不静默丢行；控制循环检测到后撤销动作权限并结束会话，CLI 返回非零。已启动的必需 worker 意外退出同样结束会话。相机、VR、点云、录制或 policy 失败属于实验失败；arm/hand 故障、急停或无法确认子进程停止按物理 FAULT 处理。
 
@@ -85,7 +93,7 @@ xArm 与 XHand HOME 均以实测收敛判断完成。XHand 默认要求连续三
 
 ## 数据与训练缓存
 
-当前 Raw 是不可变的实验 source of truth，不做原地改写：episode 在 `data.h5` 保存控制行、aligned Z16 深度和 metadata，RGB 使用 `rgb.mp4`；metadata 使用 `format="dexmani.raw"` 和最终 `termination_reason`，不保存 validity 字段或全局递增版本。正常 runtime / Reader / replay / export 只支持当前格式，不保留 legacy Raw compatibility branch。Reader 验证已有的已知字段，忽略额外未知字段；消费者通过 `require_fields(...)` 要求自己所需的能力。旧 Raw 格式不属于当前支持范围，仓库不再提供 v34 迁移 CLI；需要时应在仓库外或历史版本中单独处理，不向当前生产路径加入兼容逻辑。
+Raw 是不可变的实验 source of truth，不做原地改写：episode 在 `data.h5` 保存控制行、aligned Z16 深度和 metadata，RGB 使用 `rgb.mp4`；metadata 使用 `format="dexmani.raw"` 和最终 `termination_reason`，不保存 validity 字段或全局递增版本。Runtime / Reader / replay / export 只支持当前 Raw 格式。Reader 验证已有的已知字段，忽略额外未知字段；消费者通过 `require_fields(...)` 要求自己所需的能力。
 
 控制与录制复用同一观测快照。Raw 保留机器人状态、RGB-D、XHand 电流/触觉、实际发布的绝对关节目标和真实物理标定；不保存 VR、逐帧时间戳、transport bookkeeping 或软件 provenance。深度值乘以 `depth_scale` 才得到米。
 
@@ -115,7 +123,7 @@ python examples/export_policy_zarr.py episodes/<task>
 python examples/export_policy_zarr.py episodes/<task> --output datasets/<task>_curated.zarr --exclude episode_unwanted
 ```
 
-导出不再提供 `--dry-run`、task-name override 或 annotation rewriting。真实导出通过 owned staging 完成相同校验，失败不会留下已发布的部分 Zarr。拒绝覆盖已有目标；目标不能位于输入、仓库 `episodes/`、`episodes_processed/`、`rollouts/` 或已有 Zarr 内部。
+导出通过 owned staging 完成转换与校验，失败不会留下已发布的部分 Zarr。拒绝覆盖已有目标；目标不能位于输入、仓库 `episodes/`、`episodes_processed/`、`rollouts/` 或已有 Zarr 内部。
 
 Canonical 是可重建派生缓存，只支持当前 `format="dexmani.real.canonical"`。字段名和 semantic ID 的含义不可静默改变；不同表示使用新的描述性身份，算法选择记录实际 recipe。新增字段不影响不请求它的消费者。旧缓存直接从当前 Raw 重新导出，不维护格式兼容分支。
 

@@ -145,9 +145,9 @@ def run_vr_worker(shared, config: VRParams) -> None:
 
             shared.vr_ring.write(frame)
             if not shared.vr_ready.is_set():
-                shared.vr_ready.set()
                 logger.debug("run_vr_worker: READY")
                 logger.info("run_vr_worker: ready (first valid right-hand frame received)")
+                shared.vr_ready.set()
 
         except (ValueError, TypeError, AttributeError):
             logger.warning("run_vr_worker: frame conversion error", exc_info=True)

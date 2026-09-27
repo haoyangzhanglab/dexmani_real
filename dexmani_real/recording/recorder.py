@@ -180,6 +180,11 @@ class AsyncEpisodeRecorder:
     def accepting_frames(self):
         return self._recording and self._discard_reason is None
 
+    @property
+    def discard_reason(self):
+        """First technical failure invalidating the current teleop capture."""
+        return self._discard_reason
+
     def mark_discard(self, reason):
         """Latch a teleop capture as discard-only without closing live resources."""
         if self._recording and self._collection_source == "teleop" and self._discard_reason is None:
