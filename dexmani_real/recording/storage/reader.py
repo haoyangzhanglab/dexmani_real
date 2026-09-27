@@ -132,7 +132,8 @@ class EpisodeReader:
             attrs = self.meta
             if _text_attr(attrs, "format") != RAW_FORMAT:
                 raise ValueError(
-                    f"unsupported Raw format; migrate the episode before use (expected {RAW_FORMAT!r})"
+                    "unsupported Raw format; migrate the episode before use "
+                    f"(expected {RAW_FORMAT!r})"
                 )
             _text_attr(attrs, "termination_reason")
             self._num_frames = _positive_int_attr(attrs, "num_frames", allow_zero=True)
