@@ -293,13 +293,19 @@ def migrate(root: Path, *, keep_backups: bool = False) -> tuple[int, int]:
                 raise FileExistsError(f"migration backup already exists: {backup}")
 
             _build_current_staging(source, staging)
-            os.rename(source.path, backup)
+            try:
+                os.rename(source.path, backup)
+            except BaseException:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
             try:
                 atomic_publish(staging, source.path)
                 _validate_current_episode(source.path, source.num_frames)
             except BaseException:
                 if source.path.exists():
                     shutil.rmtree(source.path)
+                if staging.exists():
+                    shutil.rmtree(staging, ignore_errors=True)
                 os.rename(backup, source.path)
                 raise
             swapped.append((source.path, backup))
