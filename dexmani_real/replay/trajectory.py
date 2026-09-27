@@ -46,10 +46,6 @@ def load_trajectory(episode_path):
         reader.require_fields(
             "action_arm_joint_target", "action_hand_joint_target", "arm_qpos", "hand_qpos"
         )
-        if reader.is_legacy:
-            reader.require_fields("frame_valid")
-            if not reader.legacy_episode_valid or not np.all(reader["frame_valid"][:]):
-                raise ValueError("physical replay rejects legacy invalid episode/frame evidence")
         arm, hand, aq, hq = [
             h5[k][:]
             for k in (
