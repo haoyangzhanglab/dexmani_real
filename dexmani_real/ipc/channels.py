@@ -17,7 +17,6 @@ from dexmani_real.ipc.schema import (
     ROBOT_COMMAND_DTYPE,
     VR_FRAME_DTYPE,
     make_pointcloud_frame_dtype,
-    make_record_sample_dtype,
 )
 from dexmani_real.utils.log import get_logger
 
@@ -35,7 +34,6 @@ class RuntimeChannelsConfig:
     vr_ring_maxlen: int = 8
     arm_state_ring_maxlen: int = 8
     hand_state_ring_maxlen: int = 8
-    record_sample_ring_maxlen: int = 16
     pointcloud_num_points: int = 1024
     pointcloud_ring_maxlen: int = 8
 
@@ -50,7 +48,6 @@ class RuntimeChannelsConfig:
             self.vr_ring_maxlen,
             self.arm_state_ring_maxlen,
             self.hand_state_ring_maxlen,
-            self.record_sample_ring_maxlen,
             self.pointcloud_ring_maxlen,
             self.arm_home_q_maxsize,
         )
@@ -89,11 +86,9 @@ _RING_RESOURCE_NAMES = (
     "arm_state_ring",
     "hand_state_ring",
     "robot_command_ring",
-    "record_sample_ring",
     "pointcloud_ring",
 )
 _QUEUE_RESOURCE_NAMES = ("arm_home_q", "arm_home_result_q", "hand_home_q", "hand_home_result_q")
-_RECORDER_QUEUE_RESOURCE_NAMES = ("record_control_q", "record_result_q")
 
 
 @dataclass
@@ -105,15 +100,12 @@ class RuntimeChannels:
     arm_state_ring: SharedMemoryRingBuffer  # arm -> policy
     hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
     robot_command_ring: SharedMemoryRingBuffer  # latest current-run target mailbox
-    record_sample_ring: SharedMemoryRingBuffer  # policy -> RecorderIO fixed payload
     pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> policy
 
     arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, run_id, expires_ns)
     arm_home_result_q: Any
     hand_home_q: Any
     hand_home_result_q: Any
-    record_control_q: mp.Queue  # policy -> RecorderIO episode boundaries
-    record_result_q: mp.Queue  # RecorderIO -> RecorderClient (sole consumer)
     run_id: Any  # controller advances it to invalidate old policy proposals
     # Latest software RUNNING termination; written under motion_lock.
     run_ended_reason: Any
@@ -138,7 +130,6 @@ class RuntimeChannels:
     arm_ready: Any
     hand_ready: Any
     policy_ready: Any
-    recorder_ready: Any
     vr_ready: Any
     camera_ready: Any
     pointcloud_ready: Any
@@ -229,12 +220,6 @@ class RuntimeChannels:
             maxlen=1,
             create=True,
         )
-        storage.record_sample_ring = SharedMemoryRingBuffer(
-            f"{prefix}_record_sample",
-            dtype=make_record_sample_dtype(rgb_shape, depth_shape),
-            maxlen=cfg.record_sample_ring_maxlen,
-            create=True,
-        )
         storage.pointcloud_ring = SharedMemoryRingBuffer(
             f"{prefix}_pointcloud",
             dtype=make_pointcloud_frame_dtype(cfg.pointcloud_num_points),
@@ -246,8 +231,6 @@ class RuntimeChannels:
         storage.arm_home_result_q = ctx.Queue(maxsize=2)
         storage.hand_home_q = ctx.Queue(maxsize=2)
         storage.hand_home_result_q = ctx.Queue(maxsize=2)
-        storage.record_control_q = ctx.Queue(maxsize=8)
-        storage.record_result_q = ctx.Queue(maxsize=8)
         storage.run_id = ctx.Value("Q", 1)
         storage.run_ended_reason = ctx.Value("i", 0)
 
@@ -265,7 +248,6 @@ class RuntimeChannels:
         storage.arm_ready = ctx.Event()
         storage.hand_ready = ctx.Event()
         storage.policy_ready = ctx.Event()
-        storage.recorder_ready = ctx.Event()
         storage.vr_ready = ctx.Event()
         storage.camera_ready = ctx.Event()
         storage.pointcloud_ready = ctx.Event()
@@ -313,13 +295,6 @@ class RuntimeChannels:
                 continue
             if _attempt(f"{queue_name}.close", queue.close):
                 _attempt(f"{queue_name}.join_thread", queue.join_thread)
-
-        for queue_name in _RECORDER_QUEUE_RESOURCE_NAMES:
-            queue = getattr(self, queue_name, None)
-            if queue is None:
-                continue
-            _attempt(f"{queue_name}.cancel_join_thread", queue.cancel_join_thread)
-            _attempt(f"{queue_name}.close", queue.close)
 
         self._closed = not errors
         if self._closed:

@@ -1,69 +1,20 @@
-"""Read published Raw v34 episodes.
+"""Capability-based Raw reader, including a read-only legacy v34 adapter.
 
-The reader validates the on-disk contract without deciding whether an episode
-is eligible for training. Failed control rows and nonfinite research payloads
-remain readable for audit and whole-episode export rejection.
+Known present fields are validated; additional fields do not invalidate an
+otherwise usable episode. Training/replay eligibility belongs to the consumer.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
 
 import h5py
 import numpy as np
 
-from dexmani_real.recording.storage.schema import (
-    DATASET_SPECS,
-    EPISODE_SCHEMA_VERSION,
-    validate_data_layout,
-)
+from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT
 from dexmani_real.recording.storage.video import VideoDecoder
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics, validate_aligned_depth_distortion
-
-
-class MergedH5File:
-    """Transparent merged view of ``data.h5`` and camera HDF5 sidecars."""
-
-    __slots__ = ("_data", "_sidecars")
-
-    def __init__(self, data_h5f: h5py.File, sidecars: dict[str, h5py.File] | None = None) -> None:
-        self._data = data_h5f
-        self._sidecars = sidecars or {}
-
-    def __getitem__(self, key: str) -> Any:
-        sidecar = self._sidecars.get(key)
-        if sidecar is not None and key in sidecar:
-            return sidecar[key]
-        return self._data[key]
-
-    def __contains__(self, key: str) -> bool:
-        sidecar = self._sidecars.get(key)
-        return key in self._data or (sidecar is not None and key in sidecar)
-
-    def keys(self) -> list[str]:
-        keys = list(self._data.keys())
-        for sidecar in self._sidecars.values():
-            keys.extend(key for key in sidecar.keys() if key not in keys)
-        return keys
-
-    def __iter__(self):
-        return iter(self.keys())
-
-    def get(self, key: str, default: Any = None) -> Any:
-        try:
-            return self[key]
-        except KeyError:
-            return default
-
-    def close(self) -> None:
-        self._data.close()
-        seen: set[int] = set()
-        for sidecar in self._sidecars.values():
-            if id(sidecar) not in seen:
-                sidecar.close()
-                seen.add(id(sidecar))
 
 
 def _scalar_attr(attrs: h5py.AttributeManager, name: str) -> object:
@@ -164,62 +115,77 @@ def _validate_hand_mount_metadata(attrs: h5py.AttributeManager) -> None:
 
 
 class EpisodeReader:
-    """Read one published Raw v34 episode without training-admission gates."""
+    """Read immutable evidence without migrating it or deciding training eligibility."""
 
-    def __init__(self, h5_path: str | Path) -> None:
-        self._path = Path(h5_path)
-        self._closed = False
-        self._cache: dict[str, np.ndarray] = {}
+    def __init__(self, episode_path: str | Path) -> None:
+        self._path = Path(episode_path)
+        self._data = self._depth_file = self._rgb_decoder = None
+        self._cache = {}
         if not self._path.is_dir():
-            raise ValueError(f"episode must be a published directory: {self._path}")
-
-        paths = {
-            "data": self._path / "data.h5",
-            "depth": self._path / "depth.h5",
-            "rgb": self._path / "rgb.mp4",
-        }
-        missing = [name for name, path in paths.items() if not path.is_file()]
-        if missing:
-            raise FileNotFoundError(f"episode is missing required files {missing}: {self._path}")
-        if paths["rgb"].stat().st_size == 0:
-            raise ValueError(f"episode RGB file is empty: {paths['rgb']}")
-
-        self._rgb_path = paths["rgb"]
-        self._rgb_decoder: VideoDecoder | None = None
-        self._data_h5f = h5py.File(paths["data"], "r")
+            raise ValueError(f"episode must be a directory: {self._path}")
+        self._rgb_path = self._path / "rgb.mp4"
         try:
-            depth_h5f = h5py.File(paths["depth"], "r")
-        except Exception:
-            self._data_h5f.close()
-            raise
-        self._depth_h5f = depth_h5f
-        self._h5f = MergedH5File(self._data_h5f, {"depth": self._depth_h5f})
-        try:
-            if self.schema_version != EPISODE_SCHEMA_VERSION:
-                raise ValueError(
-                    f"unsupported episode schema v{self.schema_version}; expected v"
-                    f"{EPISODE_SCHEMA_VERSION}"
-                )
-            self._validate_layout()
-        except Exception:
+            self._data = h5py.File(self._path / "data.h5", "r")
+            if "meta" not in self._data or not isinstance(self._data["meta"], h5py.Group):
+                raise ValueError("episode is missing meta")
+            attrs = self.meta
+            if "format" in attrs:
+                if _text_attr(attrs, "format") != RAW_FORMAT:
+                    raise ValueError(f"unsupported Raw format: {attrs['format']!r}")
+                self.is_legacy = False
+                _text_attr(attrs, "termination_reason")
+            else:
+                if _positive_int_attr(attrs, "schema_version") != 34:
+                    raise ValueError(
+                        "Raw requires format='dexmani.raw' or legacy schema_version=34"
+                    )
+                self.is_legacy = True
+            self._num_frames = _positive_int_attr(attrs, "num_frames", allow_zero=True)
+            self._control_hz = _positive_float_attr(attrs, "control_hz")
+            _text_attr(attrs, "task_label")
+            _text_attr(attrs, "collection_source")
+            self.legacy_episode_valid = None
+            if self.is_legacy:
+                valid = _scalar_attr(attrs, "episode_valid")
+                if not isinstance(valid, bool):
+                    raise ValueError("legacy episode_valid must be bool")
+                self.legacy_episode_valid = valid
+                if "depth" not in self._data and (self._path / "depth.h5").is_file():
+                    self._depth_file = h5py.File(self._path / "depth.h5", "r")
+                    if "depth" not in self._depth_file:
+                        raise ValueError("legacy depth.h5 is missing depth")
+            self._validate_present_fields()
+        except BaseException:
             self.close()
             raise
 
     @property
-    def h5f(self) -> MergedH5File:
-        """Merged view of ``data.h5`` and the ``depth.h5`` sidecar."""
-        return self._h5f
+    def meta(self):
+        return self._data["meta"].attrs
 
     @property
-    def h5_path(self) -> Path:
-        return self._path
+    def fields(self) -> frozenset[str]:
+        names = {key for key, value in self._data.items() if isinstance(value, h5py.Dataset)}
+        if self._depth_file is not None:
+            names.add("depth")
+        if self._rgb_path.is_file():
+            names.add("rgb")
+        return frozenset(names)
 
-    @property
-    def schema_version(self) -> int:
-        meta = self._h5f.get("meta")
-        if not isinstance(meta, h5py.Group):
-            raise ValueError("episode is missing meta")
-        return _positive_int_attr(meta.attrs, "schema_version")
+    def require_fields(self, *names: str) -> None:
+        missing = set(names) - self.fields
+        if missing:
+            raise ValueError(f"Raw {self._path.name} missing required fields: {sorted(missing)}")
+
+    def require_metadata(self, *names: str) -> None:
+        missing = set(names) - self.meta.keys()
+        if missing:
+            raise ValueError(f"Raw {self._path.name} missing required metadata: {sorted(missing)}")
+
+    def __getitem__(self, name):
+        if name == "depth" and self._depth_file is not None:
+            return self._depth_file["depth"]
+        return self._data[name]
 
     @property
     def num_frames(self) -> int:
@@ -233,111 +199,79 @@ class EpisodeReader:
     def dt(self) -> float:
         return 1.0 / self._control_hz
 
-    @property
-    def episode_valid(self) -> bool:
-        return self._episode_valid
-
-    def _validate_layout(self) -> None:
-        """Validate v34 structure, static calibration, and physical mount."""
-        meta = self._h5f.get("meta")
-        if not isinstance(meta, h5py.Group):
-            raise ValueError("episode is missing meta")
-        attrs = meta.attrs
-        self._num_frames = _positive_int_attr(attrs, "num_frames", allow_zero=True)
-        self._control_hz = _positive_float_attr(attrs, "control_hz")
-        _text_attr(attrs, "task_label")
-        _text_attr(attrs, "collection_source")
-        episode_valid = _scalar_attr(attrs, "episode_valid")
-        if not isinstance(episode_valid, (bool, np.bool_)):
-            raise ValueError("episode metadata episode_valid must be bool")
-        self._episode_valid = bool(episode_valid)
-        _validate_color_camera_metadata(attrs)
-        _validate_hand_mount_metadata(attrs)
-
-        unexpected_entries = set(self._data_h5f.keys()) - ({"meta"} | set(DATASET_SPECS))
-        if unexpected_entries:
-            raise ValueError(f"unexpected data.h5 entries: {sorted(unexpected_entries)}")
-        datasets = {
-            key: value for key, value in self._data_h5f.items() if isinstance(value, h5py.Dataset)
-        }
-        errors = validate_data_layout(
-            {key: value.shape for key, value in datasets.items()},
-            {key: value.dtype for key, value in datasets.items()},
-            frame_count=self._num_frames,
-        )
-        if errors:
-            raise ValueError("episode layout invalid: " + "; ".join(errors))
-
-        depth_h5f = self._depth_h5f
-        if set(depth_h5f.keys()) != {"depth"}:
-            raise ValueError("depth.h5 must contain exactly the depth dataset")
-        depth = depth_h5f["depth"]
-        expected_depth_shape = (
-            self._num_frames,
-            _positive_int_attr(attrs, "camera_color_height"),
-            _positive_int_attr(attrs, "camera_color_width"),
-        )
-        if not isinstance(depth, h5py.Dataset) or depth.shape != expected_depth_shape:
-            raise ValueError(
-                f"depth shape must be {expected_depth_shape}, got {getattr(depth, 'shape', None)}"
+    def _validate_present_fields(self):
+        for name, spec in DATASET_SPECS.items():
+            if name in self._data:
+                array = self._data[name]
+                if (
+                    not isinstance(array, h5py.Dataset)
+                    or array.shape != (self.num_frames, *spec.tail_shape)
+                    or array.dtype != spec.dtype
+                ):
+                    raise ValueError(f"Raw {name}: incompatible shape/dtype")
+        if self.is_legacy and "frame_valid" in self._data:
+            array = self._data["frame_valid"]
+            if (
+                not isinstance(array, h5py.Dataset)
+                or array.shape != (self.num_frames,)
+                or array.dtype != np.bool_
+            ):
+                raise ValueError("legacy frame_valid: incompatible shape/dtype")
+        fields = self.fields
+        if fields & {"rgb", "depth"} or any(k.startswith("camera_") for k in self.meta):
+            _validate_color_camera_metadata(self.meta)
+        if "depth" in self._data or self._depth_file is not None:
+            depth = self["depth"]
+            expected = (
+                self.num_frames,
+                int(self.meta["camera_color_height"]),
+                int(self.meta["camera_color_width"]),
             )
-        if np.dtype(depth.dtype) != np.dtype(np.uint16):
-            raise ValueError(f"depth dtype must be uint16, got {depth.dtype}")
+            if (
+                not isinstance(depth, h5py.Dataset)
+                or depth.shape != expected
+                or depth.dtype != np.uint16
+            ):
+                raise ValueError(f"Raw depth must be uint16 with shape {expected}")
+        if "rgb" in fields and self._rgb_path.stat().st_size == 0:
+            raise ValueError("Raw RGB file is empty")
+        if any(k in self.meta for k in ("handbase_position_eef_m", "handbase_quat_eef_wxyz")):
+            _validate_hand_mount_metadata(self.meta)
 
-    def _decoder(self) -> VideoDecoder:
+    def _decoder(self):
+        self.require_fields("rgb")
         if self._rgb_decoder is None:
             self._rgb_decoder = VideoDecoder(self._rgb_path)
         return self._rgb_decoder
 
     def read_camera_frame(self, key: str, index: int) -> np.ndarray:
-        """Read one RGB or depth frame by index."""
-        if key == "rgb":
-            decoder = self._decoder()
-            if decoder.frame_count == 0:
-                raise ValueError(f"MP4 file contains no frames: {self._path}")
-            return decoder.read_frame(index)
-        if key in self._h5f:
-            return np.asarray(self._h5f[key][index])
-        raise KeyError(f"camera dataset {key!r} not found in {self._path}")
+        self.require_fields(key)
+        return self._decoder().read_frame(index) if key == "rgb" else np.asarray(self[key][index])
 
     def read_camera_all(self, key: str) -> np.ndarray:
-        """Read all camera frames, caching the requested modality."""
-        if key in self._cache:
-            return self._cache[key]
-        if key == "rgb":
-            data = self._decoder().read_all()
-            if data.shape[0] != self._num_frames:
-                raise ValueError(
-                    f"RGB length {data.shape[0]} does not match num_frames {self._num_frames}"
-                )
-        elif key in self._h5f:
-            data = np.asarray(self._h5f[key][:])
-        else:
-            raise KeyError(f"camera dataset {key!r} not found in {self._path}")
-        self._cache[key] = data
-        return data
+        self.require_fields(key)
+        if key not in self._cache:
+            data = self._decoder().read_all() if key == "rgb" else np.asarray(self[key][:])
+            if len(data) != self.num_frames:
+                raise ValueError(f"{key} length differs from num_frames")
+            self._cache[key] = data
+        return self._cache[key]
 
     def iter_camera_frames(self, key: str) -> Iterator[np.ndarray]:
-        """Yield RGB frames sequentially without retaining the episode."""
         if key != "rgb":
             raise ValueError("iter_camera_frames supports only MP4-backed RGB")
         yield from self._decoder().iter_frames()
 
     def close(self) -> None:
-        """Close sidecars and any lazily opened RGB decoder."""
-        if getattr(self, "_closed", False):
-            return
-        self._closed = True
         self._cache.clear()
-        if self._rgb_decoder is not None:
-            self._rgb_decoder.close()
-            self._rgb_decoder = None
-        if hasattr(self, "_h5f") and self._h5f is not None:
-            self._h5f.close()
-            self._h5f = None  # type: ignore[assignment]
+        for name in ("_rgb_decoder", "_depth_file", "_data"):
+            resource = getattr(self, name)
+            if resource is not None:
+                resource.close()
+                setattr(self, name, None)
 
-    def __enter__(self) -> "EpisodeReader":
+    def __enter__(self):
         return self
 
-    def __exit__(self, *args: object) -> None:
+    def __exit__(self, *args):
         self.close()

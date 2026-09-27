@@ -1,10 +1,9 @@
 """Raw episode recording and reading."""
 
-from .recorder import EpisodeRecorder
-from .storage.reader import EpisodeReader, MergedH5File
+from .recorder import AsyncEpisodeRecorder
+from .storage.reader import EpisodeReader
 
 __all__ = [
     "EpisodeReader",
-    "EpisodeRecorder",
-    "MergedH5File",
+    "AsyncEpisodeRecorder",
 ]

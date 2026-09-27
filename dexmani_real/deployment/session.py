@@ -7,8 +7,6 @@ import time
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.deployment.config import (
-    PolicyRuntimeConfig,
-    RolloutRecordingConfig,
     validate_max_running_s,
     validate_num_episodes,
     validate_policy_runtime_compatibility,
@@ -17,7 +15,6 @@ from dexmani_real.deployment.config import (
 from dexmani_real.deployment.operator import PolicyOperator
 from dexmani_real.deployment.runner import run_policy_worker
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
-from dexmani_real.recording.io_worker import RecorderWorkerConfig, run_recorder_worker
 from dexmani_real.robot.arm_homing import build_policy_home_planner
 from dexmani_real.robot.arm_worker import run_arm_worker
 from dexmani_real.robot.hand_worker import run_hand_worker
@@ -34,24 +31,6 @@ from dexmani_real.sensor.pointcloud_worker import PointCloudWorkerConfig, run_po
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-
-def _rollout_recorder_config(
-    rollout: RolloutRecordingConfig,
-    worker_config: PolicyRuntimeConfig,
-    runtime,
-    *,
-    camera_calibration: CameraExtrinsics,
-) -> RecorderWorkerConfig:
-    """Snapshot the physical hand mount used by this recorded rollout."""
-    return RecorderWorkerConfig(
-        data_dir=rollout.data_dir,
-        control_hz=1.0 / float(worker_config.info.control_dt_s),
-        camera_calibration=camera_calibration,
-        collection_source="policy_rollout",
-        handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
-        handbase_quat_eef_wxyz=runtime.hand.T_eef_handbase_quat_wxyz,
-    )
 
 
 def run_policy_deployment(
@@ -77,7 +56,7 @@ def run_policy_deployment(
     # Cloud production needs a camera worker; pointcloud-only rows need no source-frame lookup.
     camera = cloud or "rgb" in fields or recording_config is not None
     points = cloud_recipe.num_points if cloud else runtime.pointcloud.num_points
-    camera_calibration = CameraExtrinsics() if cloud or recording_config is not None else None
+    camera_calibration = CameraExtrinsics() if cloud else None
     pointcloud_config = (
         PointCloudWorkerConfig.from_runtime(
             runtime,
@@ -140,22 +119,6 @@ def run_policy_deployment(
                     name="pointcloud",
                     target=run_pointcloud_worker,
                     args=(shared, pointcloud_config),
-                )
-            )
-        if recording_config:
-            sensors.append(
-                ctx.Process(
-                    name="recorder",
-                    target=run_recorder_worker,
-                    args=(
-                        shared,
-                        _rollout_recorder_config(
-                            recording_config,
-                            worker_config,
-                            runtime,
-                            camera_calibration=camera_calibration,
-                        ),
-                    ),
                 )
             )
         supervisor.start(sensors)

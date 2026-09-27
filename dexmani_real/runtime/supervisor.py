@@ -97,8 +97,8 @@ class RuntimeSupervisor:
             and not self.shared.error_state.value
             and not self.shared.estop_request.value
         ):
-            # A normal quit must let the control owner send its final STOP before
-            # RecorderIO falls back to invalidating an interrupted capture.
+            # A normal quit lets the control owner finish its local writer
+            # before process shutdown can interrupt publication.
             if int(self.shared.safety_state.value) in (
                 int(SafetyState.ARMED),
                 int(SafetyState.RUNNING),

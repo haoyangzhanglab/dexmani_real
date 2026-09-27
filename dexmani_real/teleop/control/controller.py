@@ -101,21 +101,20 @@ class TeleopController:
 def execute_control_step(controller, shared, row, recorder=None):
     epoch = int(shared.run_id.value)
     target, control_ok, intent = controller.compute_command(row, epoch)
+    if recorder is not None:
+        recorder.check_error()
     stamp = publish_command(shared, target) if target is not None else 0
     if int(shared.run_id.value) != epoch or (target is not None and not stamp):
         if recorder is not None:
-            recorder.note_publication_rejected()
+            recorder.mark_discard("publication_rejected")
         return control_ok
     if stamp:
         controller.previous_arm_command = target.arm_qpos.copy()
         controller.smoothed_eef_position = intent[:3].copy()
         controller.smoothed_eef_quaternion = rot6d_to_quat_wxyz(intent[3:])
-    if recorder is not None and recorder.is_recording:
-        recorder.add_frame(
-            build_episode_frame(
-                row, target, frame_valid=control_ok and target is not None and bool(stamp)
-            ),
-            observation_timestamp_ns=row.observation_timestamp_ns,
-            publication_timestamp_ns=stamp,
-        )
+    if recorder is not None:
+        if not control_ok or target is None or not stamp:
+            recorder.mark_discard("control_failure")
+        if recorder.accepting_frames:
+            recorder.add_frame(build_episode_frame(row, target), step_timestamp_ns=stamp)
     return control_ok

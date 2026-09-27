@@ -60,8 +60,8 @@ def _color_intrinsics_from_meta(meta: Any) -> CameraIntrinsics:
 
 
 def load_raw_episode_camera_model(reader: EpisodeReader) -> RawEpisodeCameraModel:
-    """Load the aligned color-grid camera model persisted by Raw v34."""
-    meta = reader.h5f["meta"].attrs
+    """Load the aligned color-grid camera model from Raw physical metadata."""
+    meta = reader.meta
     if str(meta.get("camera_payload_mode", "")) != "depth_to_color_aligned_rgbd":
         raise ValueError("raw camera payload is not depth-to-color aligned RGB-D")
     color = _color_intrinsics_from_meta(meta)
@@ -81,8 +81,8 @@ def load_raw_episode_camera_model(reader: EpisodeReader) -> RawEpisodeCameraMode
 
 
 def load_raw_episode_base_from_color(reader: EpisodeReader) -> np.ndarray:
-    """Return Raw v34's static aligned-color camera to xArm-base transform."""
-    meta = reader.h5f["meta"].attrs
+    """Return Raw's static aligned-color camera to xArm-base transform."""
+    meta = reader.meta
     transform = validate_rigid_transform(
         np.asarray(meta["camera_T_xarm_base_from_color"]),
         label="camera_T_xarm_base_from_color",
@@ -104,7 +104,7 @@ class RawEpisodePointCloudDeriver:
 
     def derive(self, source_index: int, rgb: np.ndarray) -> np.ndarray | None:
         """Derive one ``float32[N,6]`` xArm-base cloud from a raw grid row."""
-        depth_raw = np.asarray(self.reader.h5f["depth"][source_index], dtype=np.uint16)
+        depth_raw = np.asarray(self.reader["depth"][source_index], dtype=np.uint16)
         return build_point_cloud(
             depth_raw=depth_raw,
             color=np.asarray(rgb, dtype=np.uint8),

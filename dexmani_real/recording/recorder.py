@@ -1,42 +1,61 @@
-"""Serialize Raw v34 control rows and publish completed episodes atomically."""
+"""Non-blocking local recording; one writer thread owns each Raw episode."""
 
 from __future__ import annotations
 
-__all__ = ["EpisodeRecorder", "EpisodeFinalizationError"]
-
+import json
 import shutil
+import threading
 import time
 from pathlib import Path
+from queue import Empty, Full, Queue
 
-import h5py  # type: ignore[import-untyped]
 import numpy as np
 
+from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.hardware import CameraParams
-from dexmani_real.recording.frame import EpisodeFrame
-from dexmani_real.recording.storage.camera_writer import (
-    CameraStreamWriter,
-    CameraStreamWriterConfig,
-)
 from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
-from dexmani_real.recording.storage.schema import (
-    DATASET_SPECS,
-    EPISODE_SCHEMA_VERSION,
-)
+from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT
+from dexmani_real.recording.storage.video import VideoDecoder, VideoEncoder
 from dexmani_real.sensor.camera.geometry import RGBDGeometry, validate_aligned_depth_distortion
-from dexmani_real.utils.atomic_io import atomic_publish
+from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-# Defensive storage ceiling; normal episode budgets belong to the control owner.
-HARD_MAX_RECORD_FRAMES: int = 10_000
+HARD_MAX_RECORD_FRAMES = 10_000
+RECORDER_START_TIMEOUT_S = 10.0
+RECORDER_STOP_TIMEOUT_S = 60.0
 _RIGID_ATOL = 1e-6
 _MOUNT_QUAT_ATOL = 1e-6
 _COLLECTION_SOURCES = frozenset({"teleop", "policy_rollout"})
+_STOP = object()
 
 
-class EpisodeFinalizationError(RuntimeError):
-    """An episode transaction failed; callers must also check resource release."""
+class RecordingError(RuntimeError):
+    """Required recording failed; the control owner must revoke motion."""
+
+
+class RecordingBackpressureError(RecordingError):
+    """The bounded sink cannot sustain the experiment's control rate."""
+
+
+def snapshot_recording_metadata(shared, runtime, *, collection_source):
+    """Resolve physical calibration at START, never during frame submission."""
+    serial = shared.camera_serial.value.rstrip(b"\x00").decode("utf-8")
+    if not serial.strip():
+        raise ValueError("recording START requires a nonempty camera serial")
+    geometry = RGBDGeometry.from_dict(json.loads(shared.camera_geometry.value.decode("utf-8")))
+    calibration = CameraExtrinsics()
+    name = calibration.resolve_name_by_serial(serial)
+    if calibration.to_meta_dict(name, expected_serial=serial)["camera_type"] != "eye_to_hand":
+        raise ValueError("Raw recording requires eye-to-hand camera calibration")
+    return dict(
+        collection_source=collection_source,
+        camera_geometry=geometry,
+        camera_T_xarm_base_from_color=calibration.get_extrinsics(name),
+        depth_scale=float(shared.camera_depth_scale.value),
+        handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
+        handbase_quat_eef_wxyz=runtime.hand.T_eef_handbase_quat_wxyz,
+    )
 
 
 def _validate_explicit_episode_name(episode_name: str) -> None:
@@ -90,75 +109,90 @@ def _validate_hand_mount(
     return position.copy(), quaternion.copy()
 
 
-class EpisodeRecorder:
-    """Own one Raw v34 transaction from START through atomic publication."""
+class AsyncEpisodeRecorder:
+    """One control-thread producer and one FIFO writer, with no recording IPC.
+
+    Construction is resource-free. START and finalization may block, so callers
+    must keep motion revoked throughout those boundaries. Frames transfer owned,
+    immutable camera references; the producer must not mutate them after submit.
+    """
 
     def __init__(
         self,
-        data_dir: str,
-        max_frames: int = HARD_MAX_RECORD_FRAMES,
-        control_hz: float = 16.0,
-        camera_writer_config: CameraStreamWriterConfig | None = None,
-    ) -> None:
+        data_dir,
+        max_frames=HARD_MAX_RECORD_FRAMES,
+        control_hz=16.0,
+        rgb_shape=None,
+        video_config=None,
+    ):
         if not np.isfinite(control_hz) or control_hz <= 0:
-            raise ValueError(f"control_hz must be positive, got {control_hz}")
-        if isinstance(max_frames, bool) or not isinstance(max_frames, int) or max_frames <= 0:
-            raise ValueError("max_frames must be a positive integer")
+            raise ValueError("recording control_hz must be finite and positive")
+        if type(max_frames) is not int or not 0 < max_frames <= HARD_MAX_RECORD_FRAMES:
+            raise ValueError(f"max_frames must be in [1, {HARD_MAX_RECORD_FRAMES}]")
         self.data_dir = Path(data_dir)
         self.max_frames = max_frames
         self.control_hz = float(control_hz)
-        self._camera_writer_config = camera_writer_config or CameraStreamWriterConfig(
-            rgb_shape=CameraParams().rgb_shape,
-            depth_shape=CameraParams().depth_shape,
-            fps=self.control_hz,
-        )
-        if not np.isclose(self._camera_writer_config.fps, self.control_hz):
-            raise ValueError("camera writer fps must match recorder control_hz")
-
-        self._data_writer: EpisodeDataWriter | None = None
-        self._camera_writer: CameraStreamWriter | None = None
-        self._frame_count = 0
+        self._rgb_shape = tuple(rgb_shape or CameraParams().rgb_shape)
+        if len(self._rgb_shape) != 3 or self._rgb_shape[2] != 3 or min(self._rgb_shape) <= 0:
+            raise ValueError("recording rgb_shape must be positive HWC with 3 channels")
+        self._video_config = video_config
+        self._thread = None
+        self._queue = Queue(maxsize=16)
+        self._ready = threading.Event()
+        self._error: BaseException | None = None
+        self._abort = False
         self._recording = False
-        self._episode_dir: str | None = None
-        self._temp_dir: str | None = None
-        self._pending_meta: dict[str, object] = {}
-        self._episode_valid = True
-        self._pending_rows: list[dict[str, object]] = []
-        self._flush_interval = 32
-        self._finishing = False
-        self._last_finish_saved = False
+        self._save = False
+        self._reason = ""
+        self._temp_dir = None
+        self._episode_dir = None
+        self._handles_released = True
+        self._frame_count = 0
+        self._written_frames = 0
+        self._saved = False
+        self._collection_source = None
+        self._discard_reason = None
+        self._last_step_ns = None
+        self._max_gap_ns = 2e9 / self.control_hz
 
     @property
-    def last_finish_saved(self) -> bool:
-        """Whether the most recent finalization published one raw episode."""
-        return self._last_finish_saved
-
-    @property
-    def resources_released(self) -> bool:
-        """Whether writers and local staging ownership have been released."""
-        return self._camera_writer is None and self._data_writer is None and self._temp_dir is None
-
-    @property
-    def is_recording(self) -> bool:
+    def is_recording(self):
         return self._recording
 
     @property
-    def episode_path(self) -> str | None:
-        """Reserved final path; raw data is published only after validation."""
-        return self._episode_dir
-
-    @property
-    def frame_count(self) -> int:
+    def frame_count(self):
+        """Number of accepted rows, retained until the next START."""
         return self._frame_count
 
     @property
-    def episode_valid(self) -> bool:
-        """The active episode's monotonic-false lifecycle latch."""
-        return self._episode_valid
+    def episode_path(self):
+        return self._episode_dir
 
-    def invalidate_episode(self) -> None:
-        """Record one non-recoverable lifecycle failure for the active episode."""
-        self._episode_valid = False
+    @property
+    def resources_released(self):
+        return (
+            (self._thread is None or not self._thread.is_alive())
+            and self._handles_released
+            and self._temp_dir is None
+        )
+
+    @property
+    def accepting_frames(self):
+        return self._recording and self._discard_reason is None
+
+    def mark_discard(self, reason):
+        """Latch a teleop capture as discard-only without closing live resources."""
+        if self._recording and self._collection_source == "teleop" and self._discard_reason is None:
+            self._discard_reason = reason
+
+    def _store_error(self, error):
+        if self._error is None:
+            self._error = error
+        self._abort = True
+
+    def check_error(self):
+        if self._error is not None:
+            raise RecordingError(f"Recording failed: {self._error}") from self._error
 
     def _snapshot_start_metadata(
         self,
@@ -184,14 +218,11 @@ class EpisodeRecorder:
         validate_aligned_depth_distortion(color.distortion_model)
         expected_rgb_shape = (color.height, color.width, 3)
         expected_depth_shape = (color.height, color.width)
-        if (
-            self._camera_writer_config.rgb_shape != expected_rgb_shape
-            or self._camera_writer_config.depth_shape != expected_depth_shape
-        ):
+        if self._rgb_shape != expected_rgb_shape or self._rgb_shape[:2] != expected_depth_shape:
             raise ValueError(
-                "aligned RGB-D geometry must match recorder transport: "
-                f"expected rgb={self._camera_writer_config.rgb_shape}, "
-                f"depth={self._camera_writer_config.depth_shape}; "
+                "aligned RGB-D geometry must match recording shape: "
+                f"expected rgb={self._rgb_shape}, "
+                f"depth={self._rgb_shape[:2]}; "
                 f"got rgb={expected_rgb_shape}, depth={expected_depth_shape}"
             )
         try:
@@ -227,249 +258,295 @@ class EpisodeRecorder:
 
     def start_episode(
         self,
-        task_label: str,
-        collection_source: str,
-        camera_geometry: RGBDGeometry,
-        camera_T_xarm_base_from_color: object,
-        depth_scale: float,
-        handbase_position_eef_m: object,
-        handbase_quat_eef_wxyz: object,
-        episode_name: str | None = None,
-    ) -> bool:
-        """Validate and snapshot static experiment facts before opening staging."""
-        if self._finishing or not self.resources_released or self._recording:
-            return False
-        metadata = self._snapshot_start_metadata(
-            task_label=task_label,
-            collection_source=collection_source,
-            camera_geometry=camera_geometry,
-            camera_T_xarm_base_from_color=camera_T_xarm_base_from_color,
-            depth_scale=depth_scale,
-            handbase_position_eef_m=handbase_position_eef_m,
-            handbase_quat_eef_wxyz=handbase_quat_eef_wxyz,
-        )
-        if episode_name is not None:
-            _validate_explicit_episode_name(episode_name)
+        *,
+        task_label,
+        collection_source,
+        camera_geometry,
+        camera_T_xarm_base_from_color,
+        depth_scale,
+        handbase_position_eef_m,
+        handbase_quat_eef_wxyz,
+        episode_name=None,
+    ):
+        self.check_error()
+        if self._recording or not self.resources_released:
+            raise RecordingError("previous recording still owns resources")
+        try:
+            metadata = self._snapshot_start_metadata(
+                task_label=task_label,
+                collection_source=collection_source,
+                camera_geometry=camera_geometry,
+                camera_T_xarm_base_from_color=camera_T_xarm_base_from_color,
+                depth_scale=depth_scale,
+                handbase_position_eef_m=handbase_position_eef_m,
+                handbase_quat_eef_wxyz=handbase_quat_eef_wxyz,
+            )
+            if episode_name is not None:
+                _validate_explicit_episode_name(episode_name)
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            stale = [
+                p.name
+                for p in self.data_dir.glob(".tmp_[!.]*")
+                if p.is_dir() and not p.is_symlink()
+            ]
+            if stale:
+                logger.warning(
+                    "Unpublished recording staging remains (inspect manually): %s",
+                    sorted(stale)[:5],
+                )
+            name = episode_name or f"episode_{time.strftime('%Y%m%d_%H%M%S')}"
+            suffix = 0
+            while True:
+                candidate = name if suffix == 0 else f"{name}_{suffix}"
+                destination = self.data_dir / candidate
+                staging = self.data_dir / f".tmp_{candidate}"
+                if not target_is_occupied(destination) and not target_is_occupied(staging):
+                    break
+                if episode_name is not None:
+                    raise FileExistsError(f"explicit episode name already exists: {destination}")
+                suffix += 1
+            staging.mkdir(exist_ok=False)
+            self._temp_dir, self._episode_dir = staging, destination
+            self._queue = Queue(maxsize=16)
+            self._ready.clear()
+            self._abort = self._save = self._saved = False
+            self._reason = ""
+            self._frame_count = self._written_frames = 0
+            self._collection_source = collection_source
+            self._discard_reason = None
+            self._last_step_ns = None
+            self._thread = threading.Thread(
+                target=self._write_episode, args=(metadata,), name="episode-writer", daemon=False
+            )
+            self._thread.start()
+            if not self._ready.wait(RECORDER_START_TIMEOUT_S):
+                raise TimeoutError("recording START timed out")
+            self.check_error()
+            self._recording = True
+            return True
+        except BaseException as exc:
+            self._store_error(exc)
+            # A thread stuck in native I/O retains its staging and handles. Never
+            # release them from another thread or accept another episode.
+            if self._thread is not None and self._thread.ident is not None:
+                self._thread.join(timeout=RECORDER_STOP_TIMEOUT_S)
+            else:
+                self._thread = None
+                if self._temp_dir is not None:
+                    try:
+                        shutil.rmtree(self._temp_dir)
+                        self._temp_dir = None
+                    except Exception:
+                        logger.error("Recording staging cleanup failed", exc_info=True)
+            raise RecordingError(f"recording START failed: {exc}") from exc
 
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        if episode_name is None:
-            stamp = time.strftime("%Y%m%d_%H%M%S")
-            episode_dir = self.data_dir / f"episode_{stamp}"
-            temp_dir = self.data_dir / f".tmp_episode_{stamp}"
-            dedup = 1
-            while episode_dir.exists() or temp_dir.exists():
-                episode_dir = self.data_dir / f"episode_{stamp}_{dedup}"
-                temp_dir = self.data_dir / f".tmp_episode_{stamp}_{dedup}"
-                dedup += 1
-        else:
-            episode_dir = self.data_dir / episode_name
-            temp_dir = self.data_dir / f".tmp_{episode_name}"
-            if episode_dir.exists() or temp_dir.exists():
-                raise FileExistsError(f"explicit episode name already exists: {episode_dir}")
-
-        temp_dir.mkdir(parents=True, exist_ok=False)
-        # Construction may fail while the camera writer still owns a sidecar.
-        # Keep the staging owner visible until a successful transaction has
-        # established normal writer ownership or a caller investigates it.
-        self._temp_dir = str(temp_dir)
-        camera_writer = CameraStreamWriter(temp_dir, self._camera_writer_config)
-
-        self._episode_dir = str(episode_dir)
-        self._pending_meta = metadata
-        self._camera_writer = camera_writer
-        self._data_writer = None
-        self._frame_count = 0
-        self._pending_rows.clear()
-        self._recording = True
-        self._episode_valid = True
-        self._last_finish_saved = False
-        return True
-
-    def _write_initial_meta(self, meta: h5py.Group) -> None:
-        """Write the static Raw v34 snapshot through the writer-owned handle."""
-        for name, value in self._pending_meta.items():
-            meta.attrs[name] = value
-        meta.attrs["control_hz"] = self.control_hz
-
-    def add_frame(self, frame: EpisodeFrame) -> bool:
-        """Append one already-constructed control row without resampling."""
-        if not self._recording:
-            return False
+    def add_frame(self, frame, *, step_timestamp_ns):
+        """Submit references only; discard-only captures remain cheap no-ops."""
+        self.check_error()
+        if not self.accepting_frames:
+            return
         if self._frame_count >= self.max_frames:
-            raise RuntimeError(f"recording exceeded hard frame limit {self.max_frames}")
-        if set(frame.data) != set(DATASET_SPECS):
-            raise ValueError("episode frame fields do not match the Raw v34 schema")
-        if frame.camera_rgb is None or frame.camera_depth is None:
-            raise ValueError("recorded row is missing RGB-D")
-        writer = self._camera_writer
-        if writer is None:
-            raise RuntimeError("camera writer missing")
-
-        self._pending_rows.append(dict(frame.data))
-        self._frame_count += 1
-        writer.write(frame.camera_rgb, frame.camera_depth)
-        if len(self._pending_rows) >= self._flush_interval:
-            self._flush_buffered()
-        return True
-
-    def _ensure_hdf5(self) -> None:
-        if self._data_writer is not None:
-            return
-        if self._temp_dir is None:
-            raise RuntimeError("EpisodeRecorder has no staging directory during HDF5 open")
-        self._data_writer = EpisodeDataWriter(
-            Path(self._temp_dir) / "data.h5",
-            write_initial_meta=self._write_initial_meta,
-        )
-
-    def _flush_buffered(self) -> None:
-        if not self._pending_rows:
-            return
-        self._ensure_hdf5()
-        batch = {
-            name: np.asarray([row[name] for row in self._pending_rows], dtype=spec.dtype)
-            for name, spec in DATASET_SPECS.items()
-        }
-        assert self._data_writer is not None
-        self._data_writer.append(batch)
-        self._pending_rows.clear()
-
-    def finish_episode(self, save: bool = True, reason: str = "") -> str | None:
-        """Close, verify, and atomically publish one complete episode when requested."""
-        if self._finishing:
-            raise RuntimeError("episode finalization is still active")
-        if not self._recording:
-            return None
-        self._last_finish_saved = False
-        if save and self._frame_count == 0:
-            logger.warning(
-                "[RECORD] reason=%s saved_rows=0; discarding empty staging", reason or "manual"
-            )
-            save = False
-        path = self._episode_dir
-        self._recording = False
-        self._finishing = True
-        try:
-            self._finish_episode_transaction(save, reason)
-        finally:
-            self._finishing = False
-        return path
-
-    def _finish_episode_transaction(self, save: bool, reason: str) -> None:
-        """Finalize one transaction and retain staging only if cleanup fails."""
-        failure: Exception | None = None
-        try:
-            self._finalize_episode_files(save, reason)
-        except Exception as exc:
-            failure = exc
-            logger.error("episode finalization failed", exc_info=True)
-            try:
-                if self._camera_writer is not None:
-                    self._camera_writer.close()
-            except Exception:
-                logger.warning("camera writer cleanup failed", exc_info=True)
-            if self._camera_writer is not None and self._camera_writer.resources_released:
-                self._camera_writer = None
-            try:
-                if self._data_writer is not None:
-                    self._data_writer.close()
-                    self._data_writer = None
-            except Exception:
-                logger.warning("HDF5 cleanup failed", exc_info=True)
-        finally:
-            if (
-                self._camera_writer is None
-                and self._data_writer is None
-                and self._temp_dir is not None
+            error = RecordingError(f"recording exceeded hard frame limit {self.max_frames}")
+            self._store_error(error)
+            raise error
+        if self._collection_source == "teleop":
+            if step_timestamp_ns <= 0 or (
+                self._last_step_ns is not None
+                and not 0 < step_timestamp_ns - self._last_step_ns <= self._max_gap_ns
             ):
-                try:
-                    self._discard_temp_files(self._temp_dir)
-                except Exception:
-                    logger.warning(
-                        "temporary episode cleanup failed; staging remains at %s",
-                        self._temp_dir,
-                        exc_info=True,
-                    )
-                else:
-                    self._reset_episode_state()
-        if failure is not None:
-            raise EpisodeFinalizationError(f"{type(failure).__name__}: {failure}") from failure
+                self.mark_discard("cadence_discontinuity")
+                return
+            self._last_step_ns = step_timestamp_ns
+        try:
+            self._queue.put_nowait(frame)
+        except Full as exc:
+            error = RecordingBackpressureError("recording queue full (capacity=16)")
+            self._store_error(error)
+            raise error from exc
+        self._frame_count += 1
 
-    def _finalize_episode_files(self, save: bool, reason: str) -> None:
-        """Close all writers, validate closed files, then atomically publish."""
-        camera_writer = self._camera_writer
-        camera_frame_count = 0
-        if camera_writer is not None:
-            camera_writer.close()
-            if not camera_writer.resources_released:
-                raise RuntimeError("camera writer resources were not released")
-            camera_frame_count = camera_writer.frame_count
-            self._camera_writer = None
-        if not save:
-            if self._data_writer is not None:
-                self._data_writer.close()
-                self._data_writer = None
-            return
-        if camera_writer is None:
-            raise RuntimeError("camera writer missing at episode stop")
-        if camera_frame_count != self._frame_count:
-            raise RuntimeError(
-                "camera/source row count mismatch: "
-                f"camera={camera_frame_count}, source={self._frame_count}"
-            )
+    def save_episode(self, reason="manual"):
+        return self._finish(save=True, reason=reason)
 
-        self._flush_buffered()
-        self._ensure_hdf5()
-        assert self._data_writer is not None
-        if self._temp_dir is None:
-            raise RuntimeError("episode staging directory missing during finalization")
+    def discard_episode(self, reason="discard"):
+        self._finish(save=False, reason=reason)
 
-        def write_final_meta(meta: h5py.Group) -> None:
-            meta.attrs["schema_version"] = EPISODE_SCHEMA_VERSION
-            meta.attrs["num_frames"] = self._frame_count
-            meta.attrs["episode_valid"] = bool(self._episode_valid)
+    def close(self):
+        """Discard an unfinished capture; callers must already have revoked motion."""
+        self._finish(save=False, reason="close")
 
-        self._data_writer.update_meta(write_final_meta)
-        self._data_writer.close()
-        self._data_writer = None
-        if self._episode_dir is None:
-            raise RuntimeError("episode final directory missing during finalization")
-        self._validate_temp_episode(Path(self._temp_dir), self._frame_count)
-        atomic_publish(self._temp_dir, self._episode_dir)
-        self._last_finish_saved = True
-        logger.info(
-            "Episode saved: %s frames=%d episode_valid=%s reason=%s",
-            self._episode_dir,
-            self._frame_count,
-            self._episode_valid,
-            reason or "manual",
-        )
-
-    def _reset_episode_state(self) -> None:
-        """Release transaction ownership without changing the final validity latch."""
-        self._data_writer = None
+    def _finish(self, *, save, reason):
         self._recording = False
-        self._frame_count = 0
-        self._episode_dir = None
-        self._temp_dir = None
-        self._pending_rows.clear()
-        self._pending_meta.clear()
-        self._camera_writer = None
+        thread = self._thread
+        if thread is None:
+            self.check_error()
+            return None
+        self._save = save and self._error is None and self._discard_reason is None
+        self._reason = self._discard_reason or reason
+        deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
+        if thread.is_alive() and not self._abort:
+            while thread.is_alive():
+                try:
+                    self._queue.put_nowait(_STOP)
+                    break
+                except Full:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    thread.join(timeout=min(0.01, remaining))
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            self._store_error(
+                TimeoutError("recording finalization timed out; staging remains owned")
+            )
+        self.check_error()
+        if not self.resources_released:
+            raise RecordingError("recording retained unreleased resources")
+        self._thread = None
+        return self._episode_dir if self._saved else None
+
+    def _write_episode(self, metadata):
+        video = data = None
+        rows = []
+        staging = self._temp_dir
+        self._handles_released = False
+
+        def initial_meta(meta):
+            for name, value in metadata.items():
+                meta.attrs[name] = value
+            meta.attrs["control_hz"] = self.control_hz
+
+        def flush_rows():
+            if rows:
+                data.append(
+                    {
+                        name: np.asarray([row[name] for row in rows], dtype=spec.dtype)
+                        for name, spec in DATASET_SPECS.items()
+                    }
+                )
+                rows.clear()
+
+        try:
+            # Assign each resource before opening it, so partial START failures
+            # retain an owner that can close it on this same thread.
+            data = EpisodeDataWriter(
+                staging / "data.h5",
+                write_initial_meta=initial_meta,
+                depth_shape=self._rgb_shape[:2],
+            )
+            data.open()
+            height, width, _ = self._rgb_shape
+            video = VideoEncoder(
+                staging / "rgb.mp4",
+                config=self._video_config,
+                fps=self.control_hz,
+                width=width,
+                height=height,
+            )
+            video.open()
+            self._ready.set()
+            while not self._abort:
+                try:
+                    frame = self._queue.get(timeout=0.05)
+                except Empty:
+                    continue
+                if frame is _STOP:
+                    break
+                if set(frame.data) != DATASET_SPECS.keys():
+                    raise ValueError("episode frame fields do not match Raw")
+                if frame.camera_rgb is None or frame.camera_depth is None:
+                    raise ValueError("recording requires RGB-D for every row")
+                if frame.camera_rgb.shape != self._rgb_shape or frame.camera_rgb.dtype != np.uint8:
+                    raise ValueError("RGB shape or dtype mismatch")
+                if self._collection_source == "teleop" and not all(
+                    np.isfinite(frame.data[key]).all()
+                    for key in (
+                        "arm_qpos",
+                        "hand_qpos",
+                        "action_arm_joint_target",
+                        "action_hand_joint_target",
+                    )
+                ):
+                    raise ValueError("teleop requires finite states and published targets")
+                video.write_frame(frame.camera_rgb)
+                data.append_depth(frame.camera_depth)
+                rows.append(frame.data)
+                self._written_frames += 1
+                if len(rows) >= 32:
+                    flush_rows()
+            if not self._abort:
+                flush_rows()
+
+                def final_meta(meta):
+                    meta.attrs["format"] = RAW_FORMAT
+                    meta.attrs["num_frames"] = self._written_frames
+                    meta.attrs["termination_reason"] = self._reason
+
+                data.update_meta(final_meta)
+            video.close()
+            data.close()
+            self._handles_released = True
+            if self._save and not self._abort and self._written_frames:
+                if (
+                    self._written_frames != self._frame_count
+                    or video.frame_count != self._written_frames
+                    or data.depth_frames != self._written_frames
+                ):
+                    raise RuntimeError("recording accepted/written/camera row count mismatch")
+                self._validate_temp_episode(staging, self._written_frames)
+                atomic_publish(staging, self._episode_dir, cancelled=lambda: self._abort)
+                self._saved = True
+                logger.info(
+                    "Episode saved: %s frames=%d reason=%s",
+                    self._episode_dir,
+                    self._written_frames,
+                    self._reason,
+                )
+            else:
+                logger.info(
+                    "Episode discarded: %s frames=%d reason=%s",
+                    self._episode_dir,
+                    self._written_frames,
+                    self._reason or "recording_failure",
+                )
+        except BaseException as exc:
+            self._store_error(exc)
+        finally:
+            # Report failure before cleanup, which may itself block on storage.
+            self._ready.set()
+            released = True
+            for resource in (video, data):
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except BaseException as exc:
+                        released = False
+                        self._store_error(exc)
+                        logger.error("Recording resource close failed", exc_info=True)
+            self._handles_released = released
+            if released:
+                try:
+                    if staging.exists():
+                        shutil.rmtree(staging)
+                    self._temp_dir = None
+                except BaseException as exc:
+                    self._store_error(exc)
+                    logger.error("Recording staging cleanup failed: %s", staging, exc_info=True)
+            # Release references to unconsumed images on failure without touching SHM.
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except Empty:
+                    break
 
     @staticmethod
-    def _validate_temp_episode(temp_dir: Path, expected_frames: int) -> None:
-        """Open closed staging with the v34 structural reader before publication."""
+    def _validate_temp_episode(temp_dir, expected_frames):
         from dexmani_real.recording.storage.reader import EpisodeReader
 
         with EpisodeReader(temp_dir) as reader:
+            reader.require_fields(*DATASET_SPECS, "rgb", "depth")
             if reader.num_frames != expected_frames:
-                raise RuntimeError(
-                    "data.h5 frame count metadata mismatch: "
-                    f"expected {expected_frames}, got {reader.num_frames}"
-                )
-
-    @staticmethod
-    def _discard_temp_files(tmp: str) -> None:
-        """Remove only this transaction's owned staging after writers are closed."""
-        if Path(tmp).exists():
-            shutil.rmtree(tmp)
+                raise RuntimeError("data.h5 frame count metadata mismatch")
+        with VideoDecoder(temp_dir / "rgb.mp4") as decoder:
+            if decoder.frame_count != expected_frames:
+                raise RuntimeError("RGB video frame count mismatch")

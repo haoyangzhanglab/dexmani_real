@@ -1,28 +1,31 @@
-"""Contracts for raw-to-policy numerical transforms."""
+"""Canonical multimodal representations and their numerical recipes."""
 
 from __future__ import annotations
 
 import dataclasses
-import json
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
 from dexmani_real.config.hardware import HandParams
-from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
-
-
-def canonical_json(value: Any) -> str:
-    """Serialize static metadata deterministically; reject NaN and infinity."""
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+from dexmani_real.config.pointcloud import (
+    POINT_CLOUD_COLOR_SOURCE,
+    POINT_CLOUD_SAMPLING,
+    POINT_CLOUD_TRANSFORM,
+    PointCloudConfig,
+)
+from dexmani_real.robot.model import (
+    CONTACT_FORCE_REPRESENTATION,
+    HAND_FINGER_NAMES,
+    ROBOT_JOINT_NAMES,
+    TACTILE_FORCE_POINT_ORDER,
+    TACTILE_FORCE_REPRESENTATION,
+    XHAND_SDK_JOINT_NAMES,
+    XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
+    XHAND_SENSOR_NATIVE_AXES_FRAME,
+    XHAND_TACTILE_SENSOR_FINGER_IDS,
+)
 
 
 def validate_task_name(value: str) -> str:
@@ -46,7 +49,6 @@ class ProcessingConfig:
 
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
-    hand_urdf_path: str = str(XHAND_RIGHT_URDF_PATH)
     fingertip_link_names: tuple[str, ...] = HandParams.fingertip_link_names
 
     @classmethod
@@ -66,8 +68,14 @@ class ProcessingConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.pointcloud, PointCloudConfig):
             raise TypeError("pointcloud must be a PointCloudConfig")
-        if not self.hand_urdf_path or len(self.fingertip_link_names) != 5:
-            raise ValueError("fingertip geometry requires a URDF and five link names")
+        if (
+            len(self.fingertip_link_names) != 5
+            or len(set(self.fingertip_link_names)) != 5
+            or any(
+                not isinstance(name, str) or not name.strip() for name in self.fingertip_link_names
+            )
+        ):
+            raise ValueError("fingertip geometry requires five distinct link names")
         if not self.pointcloud.remove_table:
             object.__setattr__(self, "table_plane_abcd", None)
         elif self.table_plane_abcd is None:
@@ -84,20 +92,6 @@ class ProcessingConfig:
         return values
 
 
-@dataclass(frozen=True)
-class EpisodeAnnotation:
-    """An operator may include/exclude an entire episode and set its task."""
-
-    include: bool = True
-    task_name: str | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.include, bool):
-            raise TypeError("episode include must be boolean")
-        if self.task_name is not None:
-            validate_task_name(self.task_name)
-
-
 _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "joint_state": ((19,), np.dtype(np.float32)),
     "arm_qvel": ((7,), np.dtype(np.float32)),
@@ -112,13 +106,13 @@ _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
 }
 
 
-def policy_array_specs(
+def canonical_array_specs(
     length: int,
     num_points: int,
     rgb_height: int,
     rgb_width: int,
 ) -> dict[str, tuple[tuple[int, ...], np.dtype[Any]]]:
-    """Policy array shapes and dtypes for one aligned RGB-D episode."""
+    """Canonical array shapes and dtypes for one aligned RGB-D episode."""
     specs = {
         name: ((length, *tail_shape), dtype)
         for name, (tail_shape, dtype) in _CORE_DATASET_SPECS.items()
@@ -131,3 +125,136 @@ def policy_array_specs(
         }
     )
     return specs
+
+
+CANONICAL_FORMAT = "dexmani.real.canonical"
+OPTIONAL_TELEMETRY = frozenset(
+    {"arm_qvel", "arm_effort", "hand_current", "contact_force", "tactile_force"}
+)
+FINGERTIP_KINEMATIC_MODEL = "xarm7_xhand_right"
+
+# These facts cannot be inferred from array shape/dtype. Field identities keep
+# their meaning; derived recipes may vary and are recorded separately below.
+CANONICAL_MODALITY_SEMANTICS = {
+    "joint_state": {
+        "semantic_id": "dexmani.joint_state",
+        "unit": "rad",
+        "joint_order": list(ROBOT_JOINT_NAMES),
+    },
+    "arm_qvel": {
+        "semantic_id": "dexmani.xarm.joint_velocity",
+        "unit": "rad/s",
+        "joint_order": list(ROBOT_JOINT_NAMES[:7]),
+        "missing": "nan",
+    },
+    "arm_effort": {
+        "semantic_id": "dexmani.xarm.effort.native",
+        "unit": "sdk_native_unverified",
+        "joint_order": list(ROBOT_JOINT_NAMES[:7]),
+        "missing": "nan",
+    },
+    "hand_current": {
+        "semantic_id": "dexmani.xhand.current",
+        "unit": "mA",
+        "joint_order": list(XHAND_SDK_JOINT_NAMES),
+        "missing": "nan",
+    },
+    "eef_pose": {
+        "semantic_id": "dexmani.eef_pose.xarm_base",
+        "frame": "xarm_base",
+        "components": "position_m(3)+rot6d(6)",
+        "rotation": "first_two_columns_column_major",
+        "recipe": {"kinematic_model": "xarm7", "eef_link": "custom_eef_link"},
+    },
+    "fingertip_points": {
+        "semantic_id": "dexmani.fingertip_points.xarm_base",
+        "frame": "xarm_base",
+        "unit": "m",
+        "finger_order": list(HAND_FINGER_NAMES),
+    },
+    "contact_force": {
+        "semantic_id": "dexmani.xhand.tactile_aggregate.native",
+        "representation": CONTACT_FORCE_REPRESENTATION,
+        "unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
+        "frame": XHAND_SENSOR_NATIVE_AXES_FRAME,
+        "finger_order": list(HAND_FINGER_NAMES),
+        "sensor_order": list(XHAND_TACTILE_SENSOR_FINGER_IDS),
+        "axis_order": ["fx", "fy", "fz"],
+        "missing": "nan",
+    },
+    "tactile_force": {
+        "semantic_id": "dexmani.xhand.tactile_dense.native",
+        "representation": TACTILE_FORCE_REPRESENTATION,
+        "unit": XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT,
+        "frame": XHAND_SENSOR_NATIVE_AXES_FRAME,
+        "finger_order": list(HAND_FINGER_NAMES),
+        "sensor_order": list(XHAND_TACTILE_SENSOR_FINGER_IDS),
+        "point_order": TACTILE_FORCE_POINT_ORDER,
+        "axis_order": ["fx", "fy", "fz"],
+        "missing": "nan",
+    },
+    "rgb": {
+        "semantic_id": "dexmani.rgb.aligned_color",
+        "channels": ["r", "g", "b"],
+        "range": [0, 255],
+    },
+    "depth": {
+        "semantic_id": "dexmani.depth.aligned_z16",
+        "unit": "camera_depth_unit",
+        "invalid_value": 0,
+        "grid": "aligned_color",
+    },
+    "point_cloud": {
+        "semantic_id": "dexmani.point_cloud.xyzrgb.xarm_base",
+        "frame": "xarm_base",
+        "features": ["x", "y", "z", "r", "g", "b"],
+        "xyz_unit": "m",
+        "rgb_range": [0, 1],
+        "derivation": {
+            "transform": POINT_CLOUD_TRANSFORM,
+            "color_source": POINT_CLOUD_COLOR_SOURCE,
+            "sampling": POINT_CLOUD_SAMPLING,
+        },
+    },
+    "action": {
+        "semantic_id": "dexmani.action.joint_absolute_published",
+        "unit": "rad",
+        "joint_order": list(ROBOT_JOINT_NAMES),
+    },
+    "action_ee": {
+        "semantic_id": "dexmani.action.ee_target",
+        "frame": "xarm_base",
+        "components": "eef_position_m(3)+eef_rot6d(6)+xhand_target_rad(12)",
+        "rotation": "first_two_columns_column_major",
+        "hand_joint_order": list(XHAND_SDK_JOINT_NAMES),
+        "recipe": {
+            "kinematic_model": "xarm7",
+            "eef_link": "custom_eef_link",
+            "source": "final_published_joint_target",
+        },
+    },
+}
+for _name, _contract in CANONICAL_MODALITY_SEMANTICS.items():
+    _contract["alignment"] = (
+        "published_target_for_current_control_step"
+        if _name in {"action", "action_ee"}
+        else "control_step_latest_causal_before_action"
+    )
+
+
+def canonical_modality_contracts(reader, config: ProcessingConfig):
+    contracts = {name: dict(attrs) for name, attrs in CANONICAL_MODALITY_SEMANTICS.items()}
+    contracts["depth"]["scale_m_per_unit"] = float(reader.meta["depth_scale"])
+    contracts["fingertip_points"]["recipe"] = {
+        "kinematic_model": FINGERTIP_KINEMATIC_MODEL,
+        "fingertip_link_names": list(config.fingertip_link_names),
+        "mount_source": "raw_episode",
+    }
+    contracts["point_cloud"]["recipe"] = config.pointcloud.to_dict()
+    # Export provenance is not a deployment calibration: live Real uses today's plane.
+    contracts["point_cloud"]["export_provenance"] = {
+        "table_plane_abcd": list(config.table_plane_abcd)
+        if config.table_plane_abcd is not None
+        else None,
+    }
+    return contracts

@@ -14,7 +14,6 @@ from pathlib import Path
 
 os.environ.setdefault("RUST_LOG", "error")
 
-import h5py
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
@@ -40,7 +39,6 @@ logger = get_logger(__name__)
 _SERIES_GROUPS = {
     "state": ("arm_effort", "arm_qpos", "arm_qvel", "hand_current", "hand_qpos"),
     "action": ("action_arm_joint_target", "action_hand_joint_target"),
-    "flags": ("frame_valid",),
 }
 _FORCE_SERIES = {
     "hand_contact_mag": (
@@ -81,15 +79,15 @@ def _fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None
 
 def print_episode_info(h5_path: str) -> None:
     with EpisodeReader(h5_path) as reader:
-        f = reader.h5f
-        keys = sorted(k for k in f.keys() if isinstance(f[k], h5py.Dataset))
+        f = reader
+        keys = sorted(f.fields - {"rgb"})
         print(f"Episode:    {h5_path}")
         print(f"Control/depth rows: {reader.num_frames}")
         print()
 
         print("Meta:")
-        for attr in sorted(f["meta"].attrs.keys()):
-            print(f"  {attr}: {f['meta'].attrs[attr]}")
+        for attr in sorted(f.meta.keys()):
+            print(f"  {attr}: {f.meta[attr]}")
         print()
 
         print(f"Datasets ({len(keys)}):")
@@ -100,14 +98,16 @@ def print_episode_info(h5_path: str) -> None:
         print()
         if reader.num_frames:
             for key in ("arm_qpos", "hand_qpos"):
+                if key not in f.fields:
+                    continue
                 q = f[key][:]
                 low = np.array2string(q.min(axis=0), precision=3, suppress_small=True)
                 high = np.array2string(q.max(axis=0), precision=3, suppress_small=True)
                 print(f"{key} range: {low} .. {high}")
-        print(f"episode valid: {reader.episode_valid}")
-        frame_valid = f["frame_valid"][:]
-        rate = f"{np.mean(frame_valid):.2%}" if reader.num_frames else "n/a (empty episode)"
-        print(f"frame valid rate: {rate}")
+        if reader.is_legacy:
+            print(f"legacy episode valid: {reader.legacy_episode_valid}")
+            if "frame_valid" in reader.fields:
+                print(f"legacy valid rows: {np.count_nonzero(reader['frame_valid'][:])}")
 
 
 class EpisodeVisualizer:
@@ -122,14 +122,27 @@ class EpisodeVisualizer:
         self._h5_path = Path(h5_path)
         self._reader = EpisodeReader(h5_path)
         try:
-            self._h5f = self._reader.h5f
+            self._reader.require_fields(
+                "rgb",
+                "depth",
+                "arm_qpos",
+                "arm_qvel",
+                "arm_effort",
+                "hand_qpos",
+                "hand_current",
+                "hand_contact",
+                "action_arm_joint_target",
+                "action_hand_joint_target",
+            )
+            self._reader.require_metadata("handbase_position_eef_m", "handbase_quat_eef_wxyz")
+            self._h5f = self._reader
             self._logical_dt_s = self._reader.dt
 
             self._rgb_cache = self._reader.read_camera_all("rgb")
             self._depth_cache = self._reader.read_camera_all("depth")
             logger.info("Pre-decoded %d RGB-D frames", self._rgb_cache.shape[0])
 
-            meta = self._h5f["meta"].attrs
+            meta = self._reader.meta
             self._camera_model = load_raw_episode_camera_model(self._reader)
             self._camera_K = self._camera_model.geometry.color.matrix()
             self._depth_meter = 1.0 / self._camera_model.depth_scale_m

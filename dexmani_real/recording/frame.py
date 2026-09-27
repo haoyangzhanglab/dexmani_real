@@ -17,8 +17,6 @@ class EpisodeFrame:
 def build_episode_frame(
     row,
     command=None,
-    *,
-    frame_valid: bool,
 ):
     arm, hand, camera = (
         row.arm[0],
@@ -49,7 +47,6 @@ def build_episode_frame(
             if command is not None and command.hand_qpos is not None
             else np.full(12, np.nan)
         ),
-        "frame_valid": frame_valid,
     }
     # Runtime flags may fail independently of joint telemetry. Never label a
     # nonfinite payload usable, or serialize an invalid payload as finite zeros.
@@ -60,15 +57,4 @@ def build_episode_frame(
         {k: np.array(v, dtype=DATASET_SPECS[k].dtype, copy=True) for k, v in values.items()},
         camera["rgb"],
         camera["depth"],
-    )
-
-
-def decode_record_sample(record):
-    return EpisodeFrame(
-        {
-            name: np.array(record[name], dtype=DATASET_SPECS[name].dtype, copy=True)
-            for name in DATASET_SPECS
-        },
-        np.array(record["camera_rgb"], copy=True),
-        np.array(record["camera_depth"], copy=True),
     )

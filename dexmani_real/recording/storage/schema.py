@@ -1,10 +1,10 @@
-"""The stable raw v34 layout for research control rows."""
+"""Strict current-writer fields; each published field keeps its meaning."""
 
 from dataclasses import dataclass
 
 import numpy as np
 
-EPISODE_SCHEMA_VERSION = 34
+RAW_FORMAT = "dexmani.raw"
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,6 @@ DATASET_SPECS = {
     "hand_tactile_force": _spec(np.float32, (5, 120, 3)),
     "action_arm_joint_target": _spec(np.float64, (7,)),
     "action_hand_joint_target": _spec(np.float64, (12,)),
-    "frame_valid": _spec(np.bool_),
 }
 
 

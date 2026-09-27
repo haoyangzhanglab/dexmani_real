@@ -36,17 +36,20 @@ def resolve_episode_path(raw_path: str) -> tuple[str, str]:
 def load_trajectory(episode_path):
     path, _ = resolve_episode_path(episode_path)
     with EpisodeReader(path) as reader:
-        h5 = reader.h5f
-        meta = h5["meta"].attrs
+        h5 = reader
+        meta = reader.meta
         collection_source = meta["collection_source"]
         if isinstance(collection_source, bytes):
             collection_source = collection_source.decode("utf-8")
         if collection_source != "teleop":
             raise ValueError("physical replay requires a teleop episode")
-        if not bool(meta["episode_valid"]):
-            raise ValueError("physical replay rejects an invalid episode")
-        if not np.all(h5["frame_valid"][:]):
-            raise ValueError("physical replay cannot reproduce failed control rows")
+        reader.require_fields(
+            "action_arm_joint_target", "action_hand_joint_target", "arm_qpos", "hand_qpos"
+        )
+        if reader.is_legacy:
+            reader.require_fields("frame_valid")
+            if not reader.legacy_episode_valid or not np.all(reader["frame_valid"][:]):
+                raise ValueError("physical replay rejects legacy invalid episode/frame evidence")
         arm, hand, aq, hq = [
             h5[k][:]
             for k in (

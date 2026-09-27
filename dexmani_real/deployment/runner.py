@@ -13,8 +13,12 @@ from dexmani_real.deployment.action import (
 )
 from dexmani_real.deployment.observation import build_fingertip_runtime, build_policy_observation
 from dexmani_real.planning.kinematics.ik import IKFailureKind
-from dexmani_real.recording.client import RecorderClient
 from dexmani_real.recording.frame import build_episode_frame
+from dexmani_real.recording.recorder import (
+    AsyncEpisodeRecorder,
+    RecordingError,
+    snapshot_recording_metadata,
+)
 from dexmani_real.robot.commands import RobotCommand, publish_command
 from dexmani_real.robot.projection import project_arm_command
 from dexmani_real.runtime.observation import ObservationHistory, read_observation
@@ -72,7 +76,11 @@ class PolicyRunner:
         self.num_episodes = num_episodes
         self.recording_config = recording_config
         self.recorder = (
-            RecorderClient(shared, control_hz=1.0 / policy_info.control_dt_s)
+            AsyncEpisodeRecorder(
+                recording_config.data_dir,
+                control_hz=1.0 / policy_info.control_dt_s,
+                rgb_shape=(runtime.camera.height, runtime.camera.width, 3),
+            )
             if recording_config is not None
             else None
         )
@@ -111,9 +119,7 @@ class PolicyRunner:
             and int(self.shared.safety_state.value) == int(SafetyState.RUNNING)
         )
 
-    def _finish_episode(
-        self, reason, abnormal=False, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY
-    ):
+    def _finish_episode(self, reason, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY):
         if self.run_id is None:
             return
         revoke_motion_if_run_id(self.shared, self.run_id, reason=run_end_reason)
@@ -126,10 +132,7 @@ class PolicyRunner:
         self.shared.stop_request.value = int(StopRequest.NONE)
         try:
             if self.recorder is not None:
-                if abnormal:
-                    self.recorder.invalidate_episode()
-                self.recorder.stop_episode(save=True, reason=reason)
-                self.recorder.join_stop()
+                self.recorder.save_episode(reason=reason)
         finally:
             self._log_summary()
             logger.info("policy episode %d ended: %s", self.completed, reason)
@@ -191,6 +194,9 @@ class PolicyRunner:
                 if not self.recorder.start_episode(
                     task_label=cfg.task_label,
                     episode_name=f"episode_{self.completed + 1:03d}",
+                    **snapshot_recording_metadata(
+                        self.shared, self.runtime, collection_source="policy_rollout"
+                    ),
                 ):
                     raise RuntimeError("policy recorder refused START")
             self.model.reset_episode()
@@ -226,13 +232,14 @@ class PolicyRunner:
             if not committed:
                 try:
                     if self.recorder is not None and self.recorder.is_recording:
-                        self.recorder.stop_episode(save=False, reason="start_cancelled")
-                        self.recorder.join_stop()
+                        self.recorder.discard_episode(reason="start_cancelled")
                 finally:
                     with self.shared.motion_lock:
                         self.shared.start_request.value = False
 
     def step(self):
+        if self.recorder is not None:
+            self.recorder.check_error()
         initial = None
         if self.run_id is None:
             with self.shared.motion_lock:
@@ -246,12 +253,6 @@ class PolicyRunner:
             reason = RunEndReason(int(self.shared.run_ended_reason.value))
             self._finish_episode(
                 reason.name.lower(),
-                abnormal=bool(
-                    not self.shared.is_running.value
-                    or self.shared.error_state.value
-                    or self.shared.estop_request.value
-                    or reason not in (RunEndReason.OPERATOR, RunEndReason.QUIT)
-                ),
             )
             return
         now = time.monotonic_ns()
@@ -264,7 +265,7 @@ class PolicyRunner:
             return
         row = initial[0] if initial is not None else self._read_observation()
         if row is None:
-            self._finish_episode("required_observation_stale", abnormal=True)
+            self._finish_episode("required_observation_stale")
             return
         if initial is None:
             self.history.append(row)
@@ -279,11 +280,13 @@ class PolicyRunner:
                 )
             )
             if observation is None:
-                self._finish_episode("required_tactile_unavailable", abnormal=True)
+                self._finish_episode("required_tactile_unavailable")
                 return
             epoch = self.run_id
             start = time.monotonic_ns()
             prediction = self.model.predict(observation)
+            if self.recorder is not None:
+                self.recorder.check_error()
             self.stats.inference_ms.append((time.monotonic_ns() - start) / 1e6)
             if not self._has_motion_authority() or epoch != int(self.shared.run_id.value):
                 self.action_queue.clear()
@@ -307,7 +310,7 @@ class PolicyRunner:
             # Execution feedback after a blocking query is telemetry, not a synthetic history row.
             row = self._read_observation()
             if row is None:
-                self._finish_episode("required_observation_stale", abnormal=True)
+                self._finish_episode("required_observation_stale")
                 return
         action = self.action_queue.popleft()
         decoded = decode_policy_action(
@@ -337,9 +340,8 @@ class PolicyRunner:
                 raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
             if self.recorder:
                 self.recorder.add_frame(
-                    build_episode_frame(row, frame_valid=False),
-                    observation_timestamp_ns=row.observation_timestamp_ns,
-                    publication_timestamp_ns=0,
+                    build_episode_frame(row),
+                    step_timestamp_ns=time.monotonic_ns(),
                 )
             self.next_step_ns = time.monotonic_ns() + int(self.policy_info.control_dt_s * 1e9)
             return
@@ -362,12 +364,16 @@ class PolicyRunner:
             self.stats.max_arm_clip_rad = max(self.stats.max_arm_clip_rad, arm_clip)
         else:
             prepared_arm = arm
+        if self.recorder is not None:
+            self.recorder.check_error()
         command = RobotCommand(self.run_id, prepared_arm, prepared_hand)
         stamp = publish_command(self.shared, command) if self.execute else time.monotonic_ns()
         if not stamp:
             self.stats.publication_rejections += 1
             if self.recorder is not None:
-                self.recorder.note_publication_rejected()
+                self.recorder.add_frame(
+                    build_episode_frame(row), step_timestamp_ns=time.monotonic_ns()
+                )
             return
         if self.stats.previous_step_ns is not None:
             self.stats.action_step_intervals_ms.append((stamp - self.stats.previous_step_ns) / 1e6)
@@ -377,9 +383,8 @@ class PolicyRunner:
         self.next_step_ns = stamp + int(self.policy_info.control_dt_s * 1e9)
         if self.recorder:
             self.recorder.add_frame(
-                build_episode_frame(row, command, frame_valid=True),
-                observation_timestamp_ns=row.observation_timestamp_ns,
-                publication_timestamp_ns=stamp,
+                build_episode_frame(row, command),
+                step_timestamp_ns=stamp,
             )
 
     def run(self):
@@ -402,18 +407,21 @@ class PolicyRunner:
                     and reason in (RunEndReason.OPERATOR, RunEndReason.QUIT)
                 )
                 self._finish_episode(
-                    reason.name.lower() if normal_stop else "shutdown",
-                    abnormal=not normal_stop,
-                    run_end_reason=RunEndReason.POLICY_FAILURE
+                    reason.name.lower()
+                    if normal_stop or reason in (RunEndReason.ESTOP, RunEndReason.HARDWARE_FAULT)
+                    else "policy_failure"
+                    if failure is not None
+                    else "shutdown",
+                    run_end_reason=RunEndReason.RECORDING_FAILURE
+                    if isinstance(failure, RecordingError)
+                    else RunEndReason.POLICY_FAILURE
                     if failure is not None
                     else RunEndReason.RUNTIME_SHUTDOWN,
                 )
                 if self.recorder is not None:
                     if self.recorder.is_recording:
-                        self.recorder.invalidate_episode()
-                        self.recorder.stop_episode(save=True, reason="interrupted")
-                    if self.recorder.stop_pending:
-                        self.recorder.join_stop()
+                        self.recorder.save_episode(reason="interrupted")
+                    self.recorder.close()
             except Exception as exc:
                 if failure is None:
                     failure = exc

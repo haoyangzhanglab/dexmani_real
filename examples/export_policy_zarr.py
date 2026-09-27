@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: python examples/export_policy_zarr.py episodes/<task_name> --config export.yaml
 
-Exports raw episodes to canonical Zarr; --dry-run runs the same transforms without writing.
+Exports complete Raw episodes to an immutable canonical Zarr generation.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from tqdm import tqdm
 from dexmani_real.config.experiment import resolve_experiment_config
 from dexmani_real.dataset.contracts import ProcessingConfig, validate_task_name
 from dexmani_real.dataset.export import (
-    PolicyZarrExportConfig,
+    CanonicalExportConfig,
     export_raw_to_zarr,
 )
 from dexmani_real.utils.atomic_io import target_is_occupied
@@ -28,7 +28,7 @@ from dexmani_real.utils.atomic_io import target_is_occupied
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Transform raw Real episodes to dexmani_policy Zarr."
+        description="Transform Raw Real episodes to a canonical multimodal Zarr."
     )
     parser.add_argument(
         "input_root",
@@ -60,13 +60,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Explicit processing YAML; table removal requires an inline audited table plane.",
     )
     parser.add_argument(
-        "--annotations",
-        type=Path,
-        help="Whole-episode include/task annotations; unknown episodes are rejected.",
-    )
-    parser.add_argument(
-        "--task-name",
-        help="Explicit task label override; must match the input task directory.",
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="EPISODE",
+        help="Exclude a whole episode by directory name; may be repeated.",
     )
     parser.add_argument(
         "--pointcloud-num-points",
@@ -75,14 +73,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--chunk-frames", type=int, default=100)
     parser.add_argument("--compression-level", type=int, default=3)
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=(
-            "Compute and validate raw inputs without creating a Zarr output. "
-            "Use this before a large export."
-        ),
-    )
     return parser
 
 
@@ -171,7 +161,7 @@ class _ExportProgress:
     def update(self, completed: int, total: int) -> None:
         if self._bar is None:
             self._bar = tqdm(
-                total=total, desc="raw to policy Zarr", unit="episode", file=sys.stderr
+                total=total, desc="Raw to canonical Zarr", unit="episode", file=sys.stderr
             )
         self._bar.update(completed - self._bar.n)
 
@@ -187,7 +177,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         default_output_path, task_name = _resolve_task_paths(args.input_root)
         output_path = _resolve_output_path(args.output, default_output_path, args.input_root)
-        config = PolicyZarrExportConfig(
+        config = CanonicalExportConfig(
             chunk_frames=args.chunk_frames,
             compression_level=args.compression_level,
             expected_task_name=task_name,
@@ -196,7 +186,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
     progress = _ExportProgress()
     report: dict
-    # Dry runs also reject occupied targets.
     if target_is_occupied(output_path):
         print(
             f"error: refusing to overwrite existing output: {output_path}",
@@ -215,9 +204,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_path,
             config,
             processing=processing,
-            annotations_path=args.annotations,
-            task_name=args.task_name,
-            dry_run=args.dry_run,
+            exclude=tuple(args.exclude),
             progress_callback=progress.update,
         )
     except (FileExistsError, FileNotFoundError, NotADirectoryError) as exc:
@@ -236,17 +223,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     finally:
         progress.close()
-    verb = "Validated" if args.dry_run else "Exported"
     print(
-        f"{verb} {report['episode_count']} episode(s), {report['total_frames']} frames.",
+        f"Exported {report['episode_count']} episode(s), {report['total_frames']} frames.",
         file=sys.stderr,
     )
     print(
-        f"Rejected {len(report['rejected_episodes'])} episode(s); excluded {len(report['excluded_episodes'])} by annotation.",
+        f"Explicitly excluded {len(report['excluded_episodes'])} episode(s).",
         file=sys.stderr,
     )
-    for rejected in report["rejected_episodes"]:
-        print(f"  {rejected['episode']}: {rejected['reason']}", file=sys.stderr)
     return 0
 
 

@@ -1,11 +1,9 @@
-"""Shared-memory ring buffer with latest and exact-sequence reads.
+"""Shared-memory ring buffer with latest-sample reads.
 
 Readers take owned copies from multiprocessing.shared_memory.
 Each ring has one serialized writer at a time and may have multiple readers.
 Odd/even markers prevent readers from accepting a slot while its payload is
 being overwritten.
-
-     New writes overwrite the oldest slot; RecorderIO rejects episodes with lost rows.
 
 Usage:
     buf = SharedMemoryRingBuffer("vr_frames", VR_FRAME_DTYPE, maxlen=3, create=True)
@@ -132,9 +130,7 @@ class SharedMemoryRingBuffer:
     x86_64 without CAS. Callers with multiple writer processes must hold their
     own cross-process write lock.
 
-    Latest readers may skip overwritten frames. Exact-sequence readers
-    retrieve a resident frame or None; RecorderIO detects lost rows using its
-    local sequence cursor.
+    Latest readers may skip overwritten frames; consumers check freshness.
     """
 
     _OFF_WRITE_IDX = 0
@@ -253,37 +249,6 @@ class SharedMemoryRingBuffer:
                 return self._last_good
         self._warn_torn_read()
         return self._last_good
-
-    def read_sequence(self, sequence: int) -> tuple[np.ndarray, int, int] | None:
-        """Ownership-copy one exact, still-resident logical sequence.
-
-        This method never scans or copies unrelated
-        history slots. It is therefore suitable for a bounded FIFO consumer
-        that already knows the next sequence it must consume. ``None``
-        means that the requested sequence is not resident or could not be read
-        consistently; callers that require losslessness must not skip ahead.
-        """
-        if sequence <= 0:
-            return None
-
-        slot = self._data_buf[sequence % self.maxlen]
-        seqlock = SeqlockSlot(
-            self._shm.buf,
-            self._HEADER_SIZE + (sequence % self.maxlen) * self._slot_size,
-        )
-        for _attempt in range(2):
-            marker1 = seqlock.marker
-            if not seqlock_is_complete(marker1) or seqlock_to_logical(marker1) != sequence:
-                return None
-            timestamp_ns = seqlock.timestamp_ns
-            data = slot["data"].copy().reshape(1)
-            if seqlock.verify(marker1) and seqlock_to_logical(marker1) == sequence:
-                return data, timestamp_ns, sequence
-        return None
-
-    @property
-    def latest_sequence(self) -> int:
-        return int(self._write_seq[0])
 
     def close(self) -> None:
         """Close the shared memory file descriptor (does NOT destroy)."""

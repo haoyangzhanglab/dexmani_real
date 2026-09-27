@@ -2,18 +2,23 @@
 
 import signal
 import time
+from pathlib import Path
 
 import numpy as np
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import make_online_ik_config
-from dexmani_real.recording.client import RecorderClient
+from dexmani_real.recording.recorder import (
+    AsyncEpisodeRecorder,
+    RecordingError,
+    snapshot_recording_metadata,
+)
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.runtime.observation import read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
-from dexmani_real.runtime.safety import begin_motion, revoke_motion
+from dexmani_real.runtime.safety import RunEndReason, begin_motion, revoke_motion
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.control.controller import TeleopController, execute_control_step
@@ -51,7 +56,13 @@ class TeleopRunner:
         self.config = config
         self.runtime = config.runtime
         self.recorder = (
-            RecorderClient(shared, control_hz=self.runtime.teleop.control_hz)
+            AsyncEpisodeRecorder(
+                Path(__file__).resolve().parents[2]
+                / self.runtime.policy.episodes_dir
+                / config.task_label,
+                control_hz=self.runtime.teleop.control_hz,
+                rgb_shape=(self.runtime.camera.height, self.runtime.camera.width, 3),
+            )
             if self.runtime.policy.recording_enabled
             else None
         )
@@ -81,8 +92,11 @@ class TeleopRunner:
         self.active = self.paused = self.resume_requested = False
         if self.recorder is not None and self.recorder.is_recording:
             if abnormal:
-                self.recorder.invalidate_episode()
-            self.recorder.stop_episode(save=save, reason=reason)
+                self.recorder.mark_discard(reason)
+            if save:
+                self.recorder.save_episode(reason=reason)
+            else:
+                self.recorder.discard_episode(reason=reason)
 
     def _pause(self, manual, mark_episode=True):
         revoke_motion(self.shared)
@@ -90,7 +104,7 @@ class TeleopRunner:
         if self.controller is not None:
             self.controller.clear_reference()
         if mark_episode and self.recorder is not None and self.recorder.is_recording:
-            self.recorder.invalidate_episode()
+            self.recorder.mark_discard("paused")
         self.paused, self.resume_requested = True, not manual
         self.audio.play("pause")
 
@@ -109,8 +123,6 @@ class TeleopRunner:
         )
 
     def _begin_episode(self):
-        if self.recorder is not None and self.recorder.stop_pending:
-            return
         row = read_observation(
             self.shared,
             self.runtime,
@@ -122,7 +134,8 @@ class TeleopRunner:
             print("Begin requires fresh robot, VR and recording resources", flush=True)
             return
         if self.recorder is not None and not self.recorder.start_episode(
-            task_label=self.config.task_label
+            task_label=self.config.task_label,
+            **snapshot_recording_metadata(self.shared, self.runtime, collection_source="teleop"),
         ):
             return
         # START may block on disk; anchor only after it finishes.
@@ -157,8 +170,6 @@ class TeleopRunner:
         elif cmd in (OperatorCommand.STOP, OperatorCommand.DISCARD, OperatorCommand.HOME):
             self._stop_episode(cmd is not OperatorCommand.DISCARD, cmd.value.lower())
             self.audio.play("discard" if cmd is OperatorCommand.DISCARD else "end")
-            if self.recorder is not None:
-                self.recorder.join_stop()
             if cmd is OperatorCommand.HOME and not self.shared.error_state.value:
                 self.home_planner = self.home_planner or build_policy_home_planner(self.runtime)
                 self.audio.play("home")
@@ -253,15 +264,7 @@ class TeleopRunner:
                     self._stop_episode(True, "hardware_failure", abnormal=True)
                     break
                 if self.recorder is not None:
-                    result = (
-                        self.recorder.join_stop()
-                        if self.recorder.stop_pending
-                        else self.recorder.poll_stop()
-                    )
-                    if not self.recorder.is_recording and self.active:
-                        self._stop_episode(
-                            True, result.reason if result is not None else "recording_unavailable"
-                        )
+                    self.recorder.check_error()
                 for cmd in self.keyboard.poll(timeout=0.005):
                     if self._handle_operator_command(cmd):
                         break
@@ -303,16 +306,21 @@ class TeleopRunner:
         except Exception as exc:
             failure = exc
             self.shared.is_running.value = False
-            revoke_motion(self.shared)
+            revoke_motion(
+                self.shared,
+                reason=RunEndReason.RECORDING_FAILURE
+                if isinstance(exc, RecordingError)
+                else RunEndReason.POLICY_FAILURE,
+            )
             logger.exception("teleop failed")
         finally:
             revoke_motion(self.shared)
             try:
                 if self.recorder is not None:
                     if self.recorder.is_recording:
-                        self.recorder.invalidate_episode()
-                        self.recorder.stop_episode(save=True, reason="interrupted")
-                    self.recorder.join_stop()
+                        self.recorder.mark_discard("interrupted")
+                        self.recorder.save_episode(reason="interrupted")
+                    self.recorder.close()
             except Exception as exc:
                 if failure is None:
                     failure = exc

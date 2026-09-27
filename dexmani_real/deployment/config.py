@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.dataset.contracts import (
+    CANONICAL_MODALITY_SEMANTICS,
+    FINGERTIP_KINEMATIC_MODEL,
+)
 
 _SUPPORTED_OBSERVATION_FIELDS = frozenset(
     {
@@ -46,13 +50,50 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
     if isinstance(dt, bool) or not isinstance(dt, (int, float)) or not math.isfinite(dt) or dt <= 0:
         raise ValueError("Real deployment requires saved real_runtime with positive control_dt_s")
     names = set(info.observation_fields)
-    if not names <= _SUPPORTED_OBSERVATION_FIELDS or "joint_state" not in names:
-        raise ValueError("Real supports only configured modalities including joint_state")
+    unsupported = names - _SUPPORTED_OBSERVATION_FIELDS
+    if unsupported:
+        raise ValueError(
+            f"Real has no live producer for requested modalities: {sorted(unsupported)}"
+        )
+    if "joint_state" not in names:
+        raise ValueError("Real deployment requires the joint_state observation")
+    contracts = info.modality_contracts
+    if not isinstance(contracts, dict):
+        raise ValueError("Real deployment requires saved modality_contracts")
+    action_key = {"joint": "action", "eef": "action_ee"}.get(info.action_mode)
+    if action_key is None:
+        raise ValueError(f"unsupported Real action mode: {info.action_mode!r}")
+    for name in names | {action_key}:
+        contract = contracts.get(name)
+        if not isinstance(contract, dict):
+            raise ValueError(f"Required modality {name!r} lacks its saved training contract")
+        for key, expected in CANONICAL_MODALITY_SEMANTICS[name].items():
+            if contract.get(key) != expected:
+                raise ValueError(f"Live modality {name!r} cannot provide the saved {key}")
+    if "fingertip_points" in names:
+        recipe = contracts["fingertip_points"].get("recipe", {})
+        if not isinstance(recipe, dict):
+            raise ValueError("Live fingertip_points requires a saved FK recipe")
+        links = recipe.get("fingertip_link_names")
+        if (
+            recipe.get("kinematic_model") != FINGERTIP_KINEMATIC_MODEL
+            or recipe.get("mount_source") != "raw_episode"
+            or not isinstance(links, list)
+            or len(links) != 5
+            or any(not isinstance(link, str) or not link for link in links)
+            or len(set(links)) != 5
+        ):
+            raise ValueError("Live fingertip_points cannot provide the saved FK representation")
     policy_hz = 1.0 / dt
     limiting_hz = min(runtime.arm.loop_hz, runtime.hand.loop_hz)
     if policy_hz > limiting_hz and not math.isclose(policy_hz, limiting_hz, rel_tol=1e-9):
         raise ValueError(f"Policy rate {policy_hz:g} Hz exceeds worker rate {limiting_hz:g} Hz")
-    return PointCloudConfig.from_dict(info.pointcloud_config) if "point_cloud" in names else None
+    if "point_cloud" in names:
+        recipe = contracts["point_cloud"].get("recipe")
+        if not isinstance(recipe, dict) or set(recipe) != set(PointCloudConfig().to_dict()):
+            raise ValueError("Live point_cloud requires a complete saved numerical recipe")
+        return PointCloudConfig.from_dict(recipe)
+    return None
 
 
 def validate_recording_budget(info, max_running_s):

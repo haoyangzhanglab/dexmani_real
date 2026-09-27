@@ -9,9 +9,7 @@ import numpy as np
 
 from dexmani_real.config.environment import WorkspaceBounds
 
-_READINESS_SUBSYSTEMS = frozenset(
-    {"arm", "hand", "camera", "pointcloud", "recorder", "policy", "vr"}
-)
+_READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "pointcloud", "policy", "vr"})
 
 
 @dataclass(frozen=True)
@@ -276,7 +274,6 @@ class SafetyParams:
             "hand": 15.0,
             "camera": 15.0,
             "pointcloud": 30.0,
-            "recorder": 15.0,
             "policy": 120.0,
             "vr": 120.0,
         }

@@ -43,10 +43,10 @@ class VideoEncoderConfig:
 
 
 class VideoEncoder:
-    """Write MP4 frames sequentially in the recorder process.
+    """Write MP4 frames sequentially on the episode writer thread.
 
-    Opens the container on the first frame. close() or a context manager must
-    finalize the MP4 for playback.
+    open() initializes the codec before START readiness; standalone callers may
+    still open on first write. close() finalizes the MP4 for playback.
     """
 
     def __init__(
@@ -95,15 +95,20 @@ class VideoEncoder:
         """
         if self._closed:
             return
-        self._closed = True
         if self._container is None:
+            self._closed = True
             return
-        if self._stream is not None:
-            for packet in self._stream.encode(None):  # type: ignore[attr-defined]
-                self._container.mux(packet)
-        self._container.close()
-        self._container = None
-        self._stream = None
+        try:
+            if self._stream is not None:
+                for packet in self._stream.encode(None):
+                    self._container.mux(packet)
+        finally:
+            # Even a codec flush error must release its file. If close itself
+            # fails, keep the handle visible for writer-thread cleanup retry.
+            self._stream = None
+            self._container.close()
+            self._container = None
+            self._closed = True
         logger.debug(
             "VideoEncoder closed: %s (%d frames)",
             self._path.name,
@@ -116,16 +121,10 @@ class VideoEncoder:
     def __exit__(self, *args: object) -> None:
         self.close()
 
-    def _write_frame_impl(self, frame: np.ndarray) -> None:
-        # Validate shape so we fail early with a clear message.
-        if frame.ndim != 3 or frame.shape[2] != 3:
-            raise ValueError(f"Expected (H, W, 3) uint8 RGB frame, got shape {frame.shape}")
-        if frame.shape[0] != self._height or frame.shape[1] != self._width:
-            raise ValueError(
-                f"Frame shape {(frame.shape[0], frame.shape[1])} does not match "
-                f"encoder size ({self._height}, {self._width})"
-            )
-
+    def open(self) -> None:
+        """Open and initialize the encoder on its sole owning thread."""
+        if self._closed:
+            raise RuntimeError("VideoEncoder is closed")
         if self._container is None:
             self._container = av.open(str(self._path), "w", format="mp4")
             # add_stream returns a VideoStream at runtime for video codecs;
@@ -138,6 +137,21 @@ class VideoEncoder:
                 "crf": str(self._cfg.crf),
                 "preset": self._cfg.preset,
             }
+
+            self._stream.codec_context.open()
+            self._container.start_encoding()
+
+    def _write_frame_impl(self, frame: np.ndarray) -> None:
+        # Validate shape so we fail early with a clear message.
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(f"Expected (H, W, 3) uint8 RGB frame, got shape {frame.shape}")
+        if frame.shape[0] != self._height or frame.shape[1] != self._width:
+            raise ValueError(
+                f"Frame shape {(frame.shape[0], frame.shape[1])} does not match "
+                f"encoder size ({self._height}, {self._width})"
+            )
+
+        self.open()
 
         # Convert RGB to the encoder pixel format; PyAV performs RGB→YUV.
         av_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")

@@ -2,14 +2,11 @@
 
 import multiprocessing as mp
 import os
-from pathlib import Path
 from typing import Any
 
 from dexmani_real.calibration import CAMERAS_PATH, VR_TRANSFORM_PATH
-from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
-from dexmani_real.recording.io_worker import RecorderWorkerConfig, run_recorder_worker
 from dexmani_real.recording.recorder import HARD_MAX_RECORD_FRAMES
 from dexmani_real.robot.arm_worker import run_arm_worker
 from dexmani_real.robot.hand_worker import run_hand_worker
@@ -60,7 +57,6 @@ def _build_processes(
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
     *,
-    repo_root: Path,
     task_name: str,
     hand_enabled: bool,
     recording_enabled: bool,
@@ -75,22 +71,8 @@ def _build_processes(
         context.Process(name="policy", target=run_teleop_worker, args=(shared, policy_config)),
     ]
     if recording_enabled:
-        camera_calibration = CameraExtrinsics()
         processes.append(
             context.Process(name="camera", target=run_camera_worker, args=(shared, runtime.camera))
-        )
-        recorder_config = RecorderWorkerConfig(
-            camera_calibration=camera_calibration,
-            data_dir=str(repo_root / policy_config.runtime.policy.episodes_dir / task_name),
-            control_hz=policy_config.runtime.teleop.control_hz,
-            collection_source="teleop",
-            handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
-            handbase_quat_eef_wxyz=runtime.hand.T_eef_handbase_quat_wxyz,
-        )
-        processes.append(
-            context.Process(
-                name="recorder", target=run_recorder_worker, args=(shared, recorder_config)
-            )
         )
     if hand_enabled:
         processes.append(
@@ -120,7 +102,6 @@ def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, allow_no_hand
                 f"control_hz={runtime.teleop.control_hz}). Configure a positive, shorter "
                 "episode budget instead of increasing the recorder hard guard."
             )
-    repo_root = Path(__file__).resolve().parents[2]
     load_vr_transform(VR_TRANSFORM_PATH)
     if runtime.policy.recording_enabled:
         _validate_recording_resources()
@@ -137,15 +118,12 @@ def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, allow_no_hand
             ctx,
             shared,
             runtime,
-            repo_root=repo_root,
             task_name=task_name,
             hand_enabled=runtime.policy.hand_enabled,
             recording_enabled=runtime.policy.recording_enabled,
         )
         by_name = {p.name: p for p in processes}
-        sensors = [
-            by_name[name] for name in ("arm", "hand", "vr", "camera", "recorder") if name in by_name
-        ]
+        sensors = [by_name[name] for name in ("arm", "hand", "vr", "camera") if name in by_name]
         supervisor.start(sensors)
         require_transition(shared, SafetyState.ARMED)
         supervisor.start([by_name["policy"]])

@@ -12,25 +12,28 @@ from dexmani_real.recording.storage.schema import DATASET_SPECS, validate_data_l
 
 
 class EpisodeDataWriter:
-    """Own and append controller source rows to one lazy HDF5 transaction."""
+    """Own and append controller source rows on the episode writer thread."""
 
     def __init__(
         self,
         path: str | Path,
         *,
         write_initial_meta: Callable[[h5py.Group], None],
+        depth_shape: tuple[int, int],
     ) -> None:
         self.path = Path(path)
         self._write_initial_meta = write_initial_meta
         self._file: h5py.File | None = None
         self._datasets: dict[str, h5py.Dataset] = {}
         self._flushed_frames = 0
+        self.depth_shape = depth_shape
+        self.depth_frames = 0
 
     @property
     def datasets(self) -> Mapping[str, h5py.Dataset]:
         return self._datasets
 
-    def _ensure_open(self) -> h5py.File:
+    def open(self) -> h5py.File:
         if self._file is None:
             self._file = h5py.File(self.path, "w")
             self._write_initial_meta(self._file.create_group("meta"))
@@ -40,9 +43,24 @@ class EpisodeDataWriter:
                     shape=(0,) + spec.tail_shape,
                     maxshape=(None,) + spec.tail_shape,
                     dtype=spec.dtype,
-                    compression="gzip",
                 )
+            self._depth = self._file.create_dataset(
+                "depth",
+                shape=(0, *self.depth_shape),
+                maxshape=(None, *self.depth_shape),
+                chunks=(1, *self.depth_shape),
+                dtype=np.uint16,
+                compression="gzip",
+                compression_opts=1,
+            )
         return self._file
+
+    def append_depth(self, depth: np.ndarray) -> None:
+        if depth.shape != self.depth_shape or depth.dtype != np.uint16:
+            raise ValueError("depth shape or dtype mismatch")
+        self._depth.resize(self.depth_frames + 1, axis=0)
+        self._depth[self.depth_frames] = depth
+        self.depth_frames += 1
 
     def append(self, data: Mapping[str, np.ndarray]) -> None:
         """Append exactly this batch of newly emitted rows."""
@@ -64,7 +82,7 @@ class EpisodeDataWriter:
         )
         if errors:
             raise RuntimeError("episode row batch mismatch: " + "; ".join(errors))
-        self._ensure_open()
+        self.open()
         end = self._flushed_frames + count
         for name, values in data.items():
             dataset = self._datasets[name]
@@ -74,7 +92,7 @@ class EpisodeDataWriter:
 
     def update_meta(self, write_meta: Callable[[h5py.Group], None]) -> None:
         """Apply final transaction metadata while retaining handle ownership."""
-        data_h5 = self._ensure_open()
+        data_h5 = self.open()
         write_meta(data_h5["meta"])
 
     def close(self) -> None:

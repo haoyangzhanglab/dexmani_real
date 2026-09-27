@@ -40,7 +40,7 @@ def fsync_tree(path: str | Path) -> None:
         _fsync_path(directory)
 
 
-def atomic_publish(src: str | Path, dst: str | Path) -> Path:
+def atomic_publish(src: str | Path, dst: str | Path, *, cancelled=None) -> Path:
     """Fsync and publish one unpublished artifact to an unoccupied target."""
     source = Path(src)
     target = Path(dst)
@@ -49,6 +49,10 @@ def atomic_publish(src: str | Path, dst: str | Path) -> Path:
     if target_is_occupied(target):
         raise FileExistsError(f"refusing to overwrite existing artifact: {target}")
     fsync_tree(source)
+    # A recording owner may time out while fsync is blocked. Do not publish
+    # that capture if the writer resumes after cancellation.
+    if cancelled is not None and cancelled():
+        raise RuntimeError("artifact publication cancelled")
     os.rename(source, target)
     _fsync_path(target.parent)
     return target

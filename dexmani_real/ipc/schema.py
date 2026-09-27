@@ -1,4 +1,4 @@
-"""NumPy cross-process schemas, with recording rows based on the raw layout."""
+"""NumPy cross-process sensor and command schemas."""
 
 from __future__ import annotations
 
@@ -130,20 +130,6 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
 )
 
 
-def make_record_sample_dtype(rgb_shape, depth_shape) -> np.dtype:
-    """Transport a raw row and its RGB-D payload to RecorderIO."""
-    from dexmani_real.recording.storage.schema import DATASET_SPECS
-
-    return np.dtype(
-        [(name, spec.dtype, spec.tail_shape) for name, spec in DATASET_SPECS.items()]
-        + [
-            ("camera_rgb", "u1", rgb_shape),
-            ("camera_depth", "<u2", depth_shape),
-        ],
-        align=True,
-    )
-
-
 __all__ = [
     "ARM_STATE_DTYPE",
     "CAMERA_FRAME_HEADER_DTYPE",
@@ -152,6 +138,5 @@ __all__ = [
     "POINT_CLOUD_FEATURE_DIM",
     "VR_FRAME_DTYPE",
     "make_pointcloud_frame_dtype",
-    "make_record_sample_dtype",
     "validate_point_cloud_array",
 ]
