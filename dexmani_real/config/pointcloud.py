@@ -134,8 +134,11 @@ class PointCloudConfig:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "PointCloudConfig":
-        if not isinstance(value, dict) or set(value) != {f.name for f in fields(cls)}:
-            raise ValueError("pointcloud config must contain all trained algorithm parameters")
+        if not isinstance(value, dict):
+            raise ValueError("pointcloud config must be a mapping")
+        unknown = set(value) - {f.name for f in fields(cls)}
+        if unknown:
+            raise ValueError(f"Unknown pointcloud config fields: {sorted(unknown)}")
         return cls(**value)
 
     def to_dict(self) -> dict[str, Any]:

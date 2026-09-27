@@ -141,16 +141,6 @@ def request_policy_start(shared, *, require_physical_home):
         return True
 
 
-def _begin_requested_motion_locked(shared):
-    """Consume a start request while the caller holds motion_lock."""
-    if not shared.start_request.value or shared.stop_request.value:
-        return None
-    epoch = _begin_motion_locked(shared)
-    if epoch is not None:
-        shared.start_request.value = False
-    return epoch
-
-
 def request_policy_stop(shared, *, reason=RunEndReason.OPERATOR):
     with shared.motion_lock:
         shared.start_request.value = False

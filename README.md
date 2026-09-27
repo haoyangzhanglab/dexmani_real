@@ -127,11 +127,22 @@ Raw v34 是稳定研究 contract；只有动作含义、核心 tensor 表示/顺
 
 ## Policy evaluation
 
-Policy artifact 定义模型输入、关节顺序、动作周期和训练时的预处理；当前 Real 配置提供现场标定与硬件几何。RGB 预处理由 Policy 负责，点云使用 artifact 配置与当前标定。模型输入语义保持一致，重新标定不要求重新训练。
+保存的 Policy 实验 `config.yaml` 定义模型、输入模态、动作周期、归一化模式与推理预处理；普通训练 checkpoint 提供 raw/EMA 权重和 fitted normalizer。不需要 deployment export。当前 Real 配置提供现场标定与硬件几何，点云采用保存的数值 recipe；RGB deterministic resize/center crop 由 Policy 执行。
+
+```bash
+conda run --no-capture-output -n real_robot python examples/run_policy.py <experiment_dir> --checkpoint best
+conda run --no-capture-output -n real_robot python examples/run_policy.py <policy/task/run> --checkpoint latest --weights raw --inference-steps 10
+```
+
+`--checkpoint` 默认为 best（实验根目录 `best_ckpt.json`），也可选 latest 或 checkpoints 中的文件名。`--weights ema|raw` 与 `--inference-steps` 显式覆盖保存的选择；不存在的 best/EMA 会报错。需要 hand_enabled=true 和训练时保存的非空 real_runtime。Parent 不加载模型权重；完成 pure preflight 后创建 session/SHM，policy restore/warmup 就绪后才启动硬件 workers。
+
+`--config experiment.yaml` 只设置当前 Real 硬件与运行参数；Policy 始终读取所选实验目录里的 `config.yaml`。未显式覆盖的 weights/NFE，best 使用 selection record，latest/文件名使用保存的 `eval.use_ema` / `eval.inference_steps`。
 
 Policy worker 持有 model / CUDA，使用同步 inference 和本地 action chunk。推理期间动作权限已失效时，丢弃返回的旧动作。Pointcloud-only policy 不依赖源 RGB-D 帧仍驻留；同时输入 RGB 和点云时才匹配源帧。
 
-操作顺序为 H 回到初始姿态、布置场景、B 开始、S 停止；Q 退出，ESC 急停。HOME 完成后需要新的 B 才能开始；HOME 阻塞期间 S/Q 仍会立即撤销动作权限。`--num-episodes` 按实际开始并结束的 episode 计数，录制失败的 episode 也计入预算。
+操作顺序为 H 回到初始姿态、布置场景、B 开始、S 停止；Q 退出，ESC 急停。HOME 完成后需要新的 B 才能开始。B 每次只尝试一次：检查新鲜 arm/hand HOME 状态与完整 padded observation，recorder START 后再次检查，失败则丢弃准备中的录制并等待新的 B；HOME 阻塞期间 S/Q 仍会立即撤销动作权限。`--num-episodes` 按实际开始并结束的 episode 计数，录制失败的 episode 也计入预算。
+
+每个实际开始的 episode 重置 Policy 固定 seed、EEF IK fallback RNG 和本地统计；结束时记录 timing/clipping/IK summary。`--max-duration` 从成功进入 RUNNING 起计时，是 cooperative runner budget；S/Q/ESC 与 run_id worker fence 负责撤销权限，包括推理阻塞期间的撤销。
 
 会话输出位于 `rollouts/<policy>/<task>/<experiment>/session_*/`，包含 `run_config.yaml` 和实际保存的 episode 目录。Policy 模式不使用 C/D；同批收到 S/Q 时会忽略 H/B。
 

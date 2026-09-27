@@ -63,7 +63,7 @@ class TeleopTimingParams:
 
 @dataclass(frozen=True)
 class PolicyParams:
-    """Shared experiment/control settings; learned policy timing is PolicySpec-owned."""
+    """Shared experiment/control settings; learned policy timing is saved-Policy-config-owned."""
 
     quit_save_timeout_s: float = 30.0
     post_teleop_timeout_s: float = 60.0

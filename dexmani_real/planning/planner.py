@@ -207,6 +207,9 @@ class XArm7MotionPlanner:
     def set_base_pose(self, base_pose_world: Pose) -> None:
         self.kin.set_base_pose(base_pose_world)
 
+    def reset_episode(self):
+        self.online_ik_solver.reset_episode()
+
     def solve_online_ik(
         self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
     ) -> IKResult:

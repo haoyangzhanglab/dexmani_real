@@ -179,6 +179,12 @@ class OnlineIKSolver:
         ):
             raise ValueError("online IK tolerances, radii and weights must be finite and valid")
 
+    def reset_episode(self):
+        """Repeat fallback seeds independently of earlier episode failures."""
+        self._rng = np.random.default_rng(self.profile.random_seed)
+        self._failure_start = None
+        self._failure_warned = False
+
     def solve(
         self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
     ) -> IKResult:

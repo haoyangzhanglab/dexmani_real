@@ -1,26 +1,23 @@
 """Policy deployment process ownership and operator lifecycle."""
 
-import math
 import multiprocessing as mp
 import os
 import threading
 import time
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
-from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.deployment.config import (
-    FingertipAssemblerConfig,
     PolicyRuntimeConfig,
     RolloutRecordingConfig,
     validate_max_running_s,
     validate_num_episodes,
     validate_policy_runtime_compatibility,
+    validate_recording_budget,
 )
 from dexmani_real.deployment.operator import PolicyOperator
 from dexmani_real.deployment.runner import run_policy_worker
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.recording.io_worker import RecorderWorkerConfig, run_recorder_worker
-from dexmani_real.recording.recorder import HARD_MAX_RECORD_FRAMES
 from dexmani_real.robot.arm_homing import build_policy_home_planner
 from dexmani_real.robot.arm_worker import run_arm_worker
 from dexmani_real.robot.hand_worker import run_hand_worker
@@ -49,7 +46,7 @@ def _rollout_recorder_config(
     """Snapshot the physical hand mount used by this recorded rollout."""
     return RecorderWorkerConfig(
         data_dir=rollout.data_dir,
-        control_hz=1.0 / float(worker_config.spec.control_dt_s),
+        control_hz=1.0 / float(worker_config.info.control_dt_s),
         camera_calibration=camera_calibration,
         collection_source="policy_rollout",
         handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
@@ -59,7 +56,7 @@ def _rollout_recorder_config(
 
 def run_policy_deployment(
     runtime,
-    policy_spec,
+    policy_info,
     worker_config,
     execute,
     *,
@@ -68,31 +65,23 @@ def run_policy_deployment(
     num_episodes=1,
     recording_config=None,
 ):
-    validate_policy_runtime_compatibility(policy_spec, runtime)
+    cloud_recipe = validate_policy_runtime_compatibility(policy_info, runtime)
     max_running_s = validate_max_running_s(max_running_s)
     num_episodes = validate_num_episodes(num_episodes)
     if recording_config is not None and (not execute or max_running_s is None):
         raise ValueError("recorded evaluation requires execute and a finite run budget")
     if recording_config is not None:
-        control_dt_s = float(worker_config.spec.control_dt_s)
-        requested_rows = math.ceil(float(max_running_s) / control_dt_s)
-        if requested_rows >= HARD_MAX_RECORD_FRAMES:
-            raise ValueError(
-                f"policy recording requests {requested_rows} rows; require rows < "
-                f"hard limit {HARD_MAX_RECORD_FRAMES} "
-                f"(max_running_s={max_running_s}, control_dt_s={control_dt_s}). "
-                "Shorten the episode budget instead of increasing the recorder hard guard."
-            )
-    fields = {f.name: f for f in policy_spec.observation_fields}
+        validate_recording_budget(policy_info, max_running_s)
+    fields = set(policy_info.observation_fields)
     cloud = "point_cloud" in fields
     # Cloud production needs a camera worker; pointcloud-only rows need no source-frame lookup.
     camera = cloud or "rgb" in fields or recording_config is not None
-    points = fields["point_cloud"].shape[0] if cloud else runtime.pointcloud.num_points
+    points = cloud_recipe.num_points if cloud else runtime.pointcloud.num_points
     camera_calibration = CameraExtrinsics() if cloud or recording_config is not None else None
     pointcloud_config = (
         PointCloudWorkerConfig.from_runtime(
             runtime,
-            pointcloud=PointCloudConfig.from_dict(policy_spec.pointcloud_config),
+            pointcloud=cloud_recipe,
             camera_calibration=camera_calibration,
         )
         if cloud
@@ -130,9 +119,6 @@ def run_policy_deployment(
                 max_running_s,
                 num_episodes,
                 recording_config,
-                FingertipAssemblerConfig.from_runtime(runtime)
-                if "fingertip_points" in fields
-                else None,
             ),
         )
         supervisor.start([policy])

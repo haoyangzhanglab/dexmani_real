@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Usage: python examples/run_policy.py EXPERIMENT [--artifact A] [--inference-steps N]
+"""Usage: python examples/run_policy.py EXPERIMENT [--checkpoint best|latest|FILE] [--weights ema|raw] [--inference-steps N]
        [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]
 
 Runs supervised physical evaluation (H -> scene setup -> B -> S), saving run_config.yaml.
@@ -53,21 +53,19 @@ def _parser() -> argparse.ArgumentParser:
         description="Run one persistent recorded policy-evaluation session"
     )
     parser.add_argument("experiment", metavar="EXPERIMENT")
-    parser.add_argument("--config", help="experiment YAML configuration")
     parser.add_argument(
-        "--artifact",
-        default=None,
-        help="deployment artifact filename in experiment/checkpoints/ "
-        "(default: deployment_latest.pt)",
+        "--config", help="Real hardware/runtime YAML; Policy uses experiment/config.yaml"
     )
+    parser.add_argument("--checkpoint", default="best", help="best, latest, or checkpoint filename")
+    parser.add_argument("--weights", choices=("ema", "raw"), default=None)
     parser.add_argument(
         "--inference-steps",
         type=_positive_int,
         default=None,
-        help="override the artifact's default inference steps (default: artifact default)",
+        help="override saved inference steps",
     )
     parser.add_argument(
-        "--seed", type=_nonnegative_int, default=0, help="per-session inference seed"
+        "--seed", type=_nonnegative_int, default=0, help="fixed inference seed reset each episode"
     )
     parser.add_argument(
         "--num-episodes",
@@ -84,7 +82,7 @@ def _parser() -> argparse.ArgumentParser:
         dest="max_running_s",
         type=_positive_running_seconds,
         default=60.0,
-        help="per-episode running-seconds budget after B (default: 60)",
+        help="cooperative duration budget from RUNNING admission (default: 60 seconds)",
     )
     parser.add_argument("--device", default="cuda:0")
     return parser
@@ -102,12 +100,6 @@ def _safe_selector_parts(selector: Any) -> tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
-def _inspect_policy_experiment(experiment: str, *, artifact: str | None) -> Any:
-    from dexmani_policy.deployment import inspect_experiment
-
-    return inspect_experiment(experiment, artifact=artifact)
-
-
 def _session_directory(root: Path, selector: str) -> Path:
     parts = _safe_selector_parts(selector)
     base = root / Path(*parts)
@@ -121,172 +113,103 @@ def _session_directory(root: Path, selector: str) -> Path:
     return candidate
 
 
-def _write_run_config(
-    session_dir: Path,
-    *,
-    experiment: str,
-    artifact: str,
-    inference_steps: int,
-    n_action_steps: int,
-    seed: int,
-    device: str,
-    num_episodes: int,
-    max_duration_s: float,
-    runtime: Any,
-    info: Any,
-) -> None:
+def _write_run_config(session_dir, *, args, runtime, info):
+    import dexmani_policy
     import yaml
 
     from dexmani_real.config.experiment import config_as_dict
 
-    root = Path(__file__).resolve().parents[1]
-
-    def git_fact(*args: str) -> str | None:
+    def head(root):
         try:
             return subprocess.check_output(
-                ["git", *args], cwd=root, text=True, stderr=subprocess.DEVNULL
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.DEVNULL
             ).strip()
         except (OSError, subprocess.CalledProcessError):
             return None
 
+    compact_info = config_as_dict(info)
+    compact_info["experiment_dir"] = str(info.experiment_dir)
+    compact_info["checkpoint_path"] = str(info.checkpoint_path)
     payload = {
+        "experiment": args.experiment,
+        "checkpoint": args.checkpoint,
+        "policy": compact_info,
         "runtime": config_as_dict(runtime),
-        "policy_spec": config_as_dict(info.spec),
-        "checkpoint_path": str(info.checkpoint_path),
-        "repository_head": git_fact("rev-parse", "HEAD"),
-        "repository_status": git_fact("status", "--short"),
-        "experiment": experiment,
-        "artifact": artifact,
-        "inference_steps": inference_steps,
-        "n_action_steps": n_action_steps,
-        "seed": seed,
-        "device": device,
-        "num_episodes": num_episodes,
-        "max_duration_s": float(max_duration_s),
+        "seed": args.seed,
+        "device": args.device,
+        "num_episodes": args.num_episodes,
+        "max_duration_s": args.max_running_s,
+        "dexmani_real_head": head(Path(__file__).resolve().parents[1]),
+        "dexmani_policy_head": head(Path(dexmani_policy.__file__).resolve().parents[1]),
     }
-    (session_dir / "run_config.yaml").write_text(
-        yaml.safe_dump(payload, sort_keys=False), encoding="utf-8"
-    )
-
-
-def _print_summary(
-    info: Any,
-    *,
-    device: str,
-    artifact: str,
-    inference_steps: int,
-    seed: int,
-    num_episodes: int,
-    max_running_s: float,
-    session_dir: Path,
-) -> None:
-    spec = info.spec
-    fields = tuple(field.name for field in spec.observation_fields)
-    print("── Policy Evaluation Session ──")
-    print(f"Experiment     : {info.selector}")
-    print(f"Policy         : {info.policy_name}")
-    print(f"Artifact       : {artifact}")
-    print(f"Inference steps: {inference_steps}")
-    print(f"Seed           : {seed}")
-    print(f"Episodes to run  : {num_episodes} (begun episodes count even if recording fails)")
-    print(f"Max duration   : {max_running_s:g} s per episode")
-    print(f"Device         : {device}")
-    print(f"Observation    : {' + '.join(fields)}")
-    print(f"Action         : {spec.action_mode}")
-    print(f"Control        : {1.0 / spec.control_dt_s:g} Hz")
-    print(f"Action chunk   : {spec.n_action_steps} steps; infer when queue is empty")
-    print(f"Session dir    : {session_dir}")
-    print("──────────────────────────────")
-    sys.stdout.flush()
-
-
-def _print_policy_error(message: str) -> None:
-    print(f"[POLICY] {message}", file=sys.stderr)
-
-
-def _print_compatibility_error(message: str) -> None:
-    print(f"[COMPAT] {message}", file=sys.stderr)
-
-
-def _print_lifecycle_error(message: str) -> None:
-    print(f"[LIFECYCLE] {message}", file=sys.stderr)
+    (session_dir / "run_config.yaml").write_text(yaml.safe_dump(payload, sort_keys=False))
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
 
     try:
-        info = _inspect_policy_experiment(args.experiment, artifact=args.artifact)
+        from dexmani_policy.deployment import (
+            inspect_policy,
+            load_experiment_config,
+            resolve_experiment,
+        )
+
+        experiment = resolve_experiment(args.experiment)
+        saved_config = load_experiment_config(experiment)
+        info = inspect_policy(
+            experiment,
+            config=saved_config,
+            checkpoint=args.checkpoint,
+            weights=args.weights,
+            inference_steps=args.inference_steps,
+        )
     except Exception as exc:
-        _print_policy_error(f"experiment inspection failed: {exc}")
+        print(f"[POLICY] experiment inspection failed: {exc}", file=sys.stderr)
         return 1
-    inference_steps = (
-        args.inference_steps if args.inference_steps is not None else info.default_inference_steps
-    )
 
     try:
         from dexmani_real.config.experiment import resolve_experiment_config
+        from dexmani_real.deployment.config import (
+            PolicyRuntimeConfig,
+            RolloutRecordingConfig,
+            validate_num_episodes,
+            validate_policy_runtime_compatibility,
+            validate_recording_budget,
+        )
 
         runtime = resolve_experiment_config(yaml_path=args.config)
+        validate_policy_runtime_compatibility(info, runtime)
+        validate_num_episodes(args.num_episodes)
+        validate_recording_budget(info, args.max_running_s)
+        selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
+        _safe_selector_parts(selector)
     except Exception as exc:
-        _print_compatibility_error(f"runtime resolution failed: {exc}")
+        print(f"[COMPAT] preflight failed: {exc}", file=sys.stderr)
         return 1
 
-    rollouts_root = Path(__file__).resolve().parents[1] / "rollouts"
     try:
-        session_dir = _session_directory(rollouts_root, info.selector)
-        _write_run_config(
-            session_dir,
-            experiment=info.selector,
-            artifact=info.checkpoint_name,
-            inference_steps=inference_steps,
-            n_action_steps=info.spec.n_action_steps,
-            seed=args.seed,
-            device=args.device,
-            num_episodes=args.num_episodes,
-            max_duration_s=args.max_running_s,
-            runtime=runtime,
-            info=info,
-        )
+        root = Path(__file__).resolve().parents[1] / "rollouts"
+        session_dir = _session_directory(root, selector)
+        _write_run_config(session_dir, args=args, runtime=runtime, info=info)
+        worker_config = PolicyRuntimeConfig(saved_config, info, args.device, args.seed)
+        recording_config = RolloutRecordingConfig(str(session_dir), info.task_name)
     except Exception as exc:
-        # Fail before any hardware or model process can start.
-        _print_compatibility_error(f"session setup failed: {exc}")
+        print(f"[COMPAT] session setup failed: {exc}", file=sys.stderr)
         return 1
 
-    from dexmani_real.deployment.config import (
-        PolicyRuntimeConfig,
-        RolloutRecordingConfig,
-    )
-
-    worker_config = PolicyRuntimeConfig(
-        experiment=info.selector,
-        device=args.device,
-        spec=info.spec,
-        seed=args.seed,
-        artifact=info.checkpoint_name,
-        inference_steps=inference_steps,
-    )
-    recording_config = RolloutRecordingConfig(
-        data_dir=str(session_dir),
-        task_label=info.task_name,
-    )
-    _print_summary(
-        info,
-        device=args.device,
-        artifact=info.checkpoint_name,
-        inference_steps=inference_steps,
-        seed=args.seed,
-        num_episodes=args.num_episodes,
-        max_running_s=args.max_running_s,
-        session_dir=session_dir,
-    )
-
+    print(f"Experiment: {info.experiment_dir}")
+    print(f"Checkpoint: {info.checkpoint_path.name} ({info.weights}); steps={info.inference_steps}")
+    print(f"Observations: {', '.join(info.observation_fields)}")
+    print(f"Action: {info.action_mode}; {1 / info.control_dt_s:g} Hz; chunk={info.n_action_steps}")
+    print(f"Episodes: {args.num_episodes}; cooperative budget={args.max_running_s:g} s")
+    print(f"Session: {session_dir}", flush=True)
     try:
         from dexmani_real.deployment.session import run_policy_deployment
 
-        result = run_policy_deployment(
+        return run_policy_deployment(
             runtime,
-            info.spec,
+            info,
             worker_config,
             True,
             max_running_s=args.max_running_s,
@@ -294,10 +217,8 @@ def main(argv: list[str] | None = None) -> int:
             recording_config=recording_config,
         )
     except Exception as exc:
-        _print_lifecycle_error(f"lifecycle failed: {exc}")
-        result = 1
-
-    return result
+        print(f"[LIFECYCLE] lifecycle failed: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

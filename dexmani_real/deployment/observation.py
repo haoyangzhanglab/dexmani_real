@@ -1,51 +1,41 @@
-"""Project real control-row history into the public PolicySpec observation mapping."""
+"""Project real control-row history into the requested Policy observation mapping."""
 
 from typing import Any
 
 import numpy as np
 
-from dexmani_real.deployment.config import FingertipAssemblerConfig
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base, make_arm_fk
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
+from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
 
-def _requested_observation_fields(policy_spec: Any) -> set[str]:
-    """Return source names directly from the validated ordered Policy fields."""
-    return {field.name for field in policy_spec.observation_fields}
-
-
-def build_fingertip_runtime(
-    policy_spec: Any,
-    fingertip_config: FingertipAssemblerConfig | None,
-) -> tuple[object, HandKinematics | None, FingertipAssemblerConfig | None] | None:
+def build_fingertip_runtime(policy_info: Any, runtime: Any):
     """Construct the local FK resources only when the observation requests them.
 
     ``eef_pose`` needs just the cached canonical ``ArmFK``; the hand FK and
     mount config are built only for ``fingertip_points``.  Both derive from
     the aligned arm qpos history, never from a second realtime EEF source.
     """
-    requested = _requested_observation_fields(policy_spec)
+    requested = set(policy_info.observation_fields)
     needs_hand_fk = "fingertip_points" in requested
     if not needs_hand_fk and "eef_pose" not in requested:
         return None
     if not needs_hand_fk:
         return make_arm_fk(), None, None
-    if not isinstance(fingertip_config, FingertipAssemblerConfig):
-        raise TypeError("fingertip_points requires FingertipAssemblerConfig")
     hand_fk = HandKinematics(
-        fingertip_config.hand_urdf_path,
-        list(fingertip_config.fingertip_link_names),
+        str(XHAND_RIGHT_URDF_PATH),
+        list(runtime.hand.fingertip_link_names),
     )
     if not hand_fk.is_ready():
         raise RuntimeError("fingertip FK startup failed")
-    return make_arm_fk(), hand_fk, fingertip_config
+    return make_arm_fk(), hand_fk, runtime.hand
 
 
-def build_policy_observation(rows, policy_spec, *, fingertip_runtime=None):
+def build_policy_observation(rows, policy_info, *, fingertip_runtime=None):
     if not rows:
         return None
-    requested = _requested_observation_fields(policy_spec)
+    requested = set(policy_info.observation_fields)
     if any(row.hand is None for row in rows):
         return None
     for name, field in (
@@ -66,6 +56,8 @@ def build_policy_observation(rows, policy_spec, *, fingertip_runtime=None):
             return None
         arrays["point_cloud"] = np.stack([r.point_cloud for r in rows])
     if "rgb" in requested:
+        if any(r.camera is None for r in rows):
+            return None
         images = [r.camera["rgb"] for r in rows]
         if any(
             not isinstance(image, np.ndarray)
@@ -88,19 +80,15 @@ def build_policy_observation(rows, policy_spec, *, fingertip_runtime=None):
                 joint[:, :7],
                 joint[:, 7:],
                 hand_fk=hand_fk,
-                handbase_position_eef_m=np.asarray(cfg.handbase_position_eef_m),
-                handbase_quat_eef_wxyz=np.asarray(cfg.handbase_quat_eef_wxyz),
+                handbase_position_eef_m=np.asarray(cfg.T_eef_handbase_pos_xyz),
+                handbase_quat_eef_wxyz=np.asarray(cfg.T_eef_handbase_quat_wxyz),
                 arm_fk=arm_fk,
                 eef_pose_history=poses,
             ).astype(np.float32)
     result = {}
-    for field in policy_spec.observation_fields:
-        values = np.ascontiguousarray(arrays[field.name])
-        if (
-            values.dtype != np.dtype(field.dtype)
-            or (field.name != "rgb" and values.shape != (len(rows), *field.shape))
-            or not np.isfinite(values).all()
-        ):
-            raise ValueError(f"invalid policy observation {field.name}")
-        result[field.name] = values
+    for name in policy_info.observation_fields:
+        values = np.ascontiguousarray(arrays[name])
+        if not np.isfinite(values).all():
+            raise ValueError(f"Nonfinite policy observation {name}")
+        result[name] = values
     return result

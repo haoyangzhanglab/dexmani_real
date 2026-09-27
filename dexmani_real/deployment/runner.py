@@ -22,7 +22,7 @@ from dexmani_real.runtime.safety import (
     RunEndReason,
     SafetyState,
     StopRequest,
-    _begin_requested_motion_locked,
+    _begin_motion_locked,
     revoke_motion_if_run_id,
 )
 from dexmani_real.utils.log import get_logger
@@ -32,7 +32,7 @@ logger = get_logger(__name__)
 
 @dataclass
 class RolloutStats:
-    """Session-wide diagnostics; interval anchoring resets at each episode."""
+    """Episode-local publication, timing and clipping diagnostics."""
 
     inference_ms: list[float] = field(default_factory=list)
     action_step_intervals_ms: list[float] = field(default_factory=list)
@@ -45,6 +45,7 @@ class RolloutStats:
     max_hand_clip_rad: float = 0.0
     ik_failure_counts: dict[str, int] = field(default_factory=dict)
     publications: int = 0
+    publication_rejections: int = 0
 
 
 class PolicyRunner:
@@ -52,7 +53,7 @@ class PolicyRunner:
         self,
         shared,
         runtime,
-        policy_spec,
+        policy_info,
         *,
         model_runtime,
         fingertip_runtime,
@@ -63,7 +64,7 @@ class PolicyRunner:
     ):
         self.shared = shared
         self.runtime = runtime
-        self.policy_spec = policy_spec
+        self.policy_info = policy_info
         self.model = model_runtime
         self.fingertip_runtime = fingertip_runtime
         self.execute = execute
@@ -71,11 +72,11 @@ class PolicyRunner:
         self.num_episodes = num_episodes
         self.recording_config = recording_config
         self.recorder = (
-            RecorderClient(shared, control_hz=1.0 / policy_spec.control_dt_s)
+            RecorderClient(shared, control_hz=1.0 / policy_info.control_dt_s)
             if recording_config is not None
             else None
         )
-        self.history = ObservationHistory(policy_spec.n_obs_steps, policy_spec.control_dt_s)
+        self.history = ObservationHistory(policy_info.n_obs_steps, policy_info.control_dt_s)
         self.action_queue = deque()
         self.run_id = None
         self.started_ns = 0
@@ -83,8 +84,8 @@ class PolicyRunner:
         self.previous_arm = None
         self.completed = 0
         self.stats = RolloutStats()
-        self.planner = make_action_planner(policy_spec.action_mode, runtime)
-        fields = {f.name for f in self.policy_spec.observation_fields}
+        self.planner = make_action_planner(policy_info.action_mode, runtime)
+        fields = set(self.policy_info.observation_fields)
         requires_rgb = "rgb" in fields
         self.requires_cloud = "point_cloud" in fields
         self.requires_camera_payload = requires_rgb or self.recorder is not None
@@ -130,57 +131,117 @@ class PolicyRunner:
                 self.recorder.stop_episode(save=True, reason=reason)
                 self.recorder.join_stop()
         finally:
+            self._log_summary()
             logger.info("policy episode %d ended: %s", self.completed, reason)
             if self.completed >= self.num_episodes:
                 self.shared.quit_requested.value = True
 
-    def _begin_episode(self):
+    def _start_observation(self):
         row = self._read_observation()
         if row is None:
-            return
+            logger.warning("policy B rejected: required observation unavailable")
+            return None
         if self.execute and (
             not self.shared.physical_home_completed.value
             or np.max(np.abs(row.arm["qpos"][0] - self.runtime.arm.home_qpos))
             > self.runtime.arm.homing.convergence_rad
+            or np.max(np.abs(row.hand["qpos"][0] - np.deg2rad(self.runtime.hand.home_qpos_deg)))
+            > np.deg2rad(self.runtime.hand.home_tolerance_deg)
         ):
-            self.shared.start_request.value = False
-            logger.warning("policy B requires home at the training start pose")
-            return
-        preparation_epoch = int(self.shared.run_id.value)
-        if self.recorder is not None:
-            cfg = self.recording_config
-            if not self.recorder.start_episode(
-                task_label=cfg.task_label,
-                episode_name=f"episode_{self.completed + 1:03d}",
-            ):
-                raise RuntimeError("policy recorder refused START")
-        with self.shared.motion_lock:
-            epoch = (
-                _begin_requested_motion_locked(self.shared)
-                if preparation_epoch == int(self.shared.run_id.value)
-                and not self.shared.quit_requested.value
-                else None
+            logger.warning("policy B requires completed HOME and current arm + hand home pose")
+            return None
+        try:
+            observation = build_policy_observation(
+                (row,) * self.policy_info.n_obs_steps,
+                self.policy_info,
+                fingertip_runtime=self.fingertip_runtime,
             )
-        if epoch is None:
+        except Exception:
+            # No motion or recording has begun; a fresh B may retry failed derivation.
+            logger.warning(
+                "policy B rejected: initial observation construction failed", exc_info=True
+            )
+            return None
+        if observation is None:
+            logger.warning("policy B rejected: required policy modality unavailable")
+            return None
+        return row, observation
+
+    def _begin_episode(self):
+        with self.shared.motion_lock:
+            requested = bool(self.shared.start_request.value)
+            self.shared.start_request.value = False
+            if (
+                not requested
+                or self.shared.stop_request.value
+                or self.shared.quit_requested.value
+                or not self.shared.is_running.value
+                or self.shared.error_state.value
+                or self.shared.estop_request.value
+                or int(self.shared.safety_state.value) != int(SafetyState.ARMED)
+            ):
+                return None
+            preparation_epoch = int(self.shared.run_id.value)
+        committed = False
+        try:
+            if self._start_observation() is None:
+                return None
             if self.recorder is not None:
-                self.recorder.stop_episode(save=False, reason="start_cancelled")
-                self.recorder.join_stop()
-            return
-        self.run_id, self.started_ns = epoch
-        self.stats.previous_step_ns = None
-        self.shared.physical_home_completed.value = False
-        self.history.clear()
-        self.action_queue.clear()
-        self.next_step_ns = 0
-        self.model.reset_episode()
+                cfg = self.recording_config
+                if not self.recorder.start_episode(
+                    task_label=cfg.task_label,
+                    episode_name=f"episode_{self.completed + 1:03d}",
+                ):
+                    raise RuntimeError("policy recorder refused START")
+            self.model.reset_episode()
+            if self.planner is not None:
+                self.planner.reset_episode()
+            # START and model reset may block: only a new row can authorize motion.
+            initial = self._start_observation()
+            if initial is None:
+                return None
+            with self.shared.motion_lock:
+                self.shared.start_request.value = False
+                epoch = (
+                    _begin_motion_locked(self.shared)
+                    if preparation_epoch == int(self.shared.run_id.value)
+                    and not self.shared.quit_requested.value
+                    and not self.shared.stop_request.value
+                    and (not self.execute or self.shared.physical_home_completed.value)
+                    else None
+                )
+            if epoch is None:
+                return None
+            self.run_id, self.started_ns = epoch
+            committed = True
+            self.shared.physical_home_completed.value = False
+            self.stats = RolloutStats()
+            self.history.clear()
+            self.history.append(initial[0])
+            self.action_queue.clear()
+            self.previous_arm = None
+            self.next_step_ns = 0
+            return initial
+        finally:
+            if not committed:
+                try:
+                    if self.recorder is not None and self.recorder.is_recording:
+                        self.recorder.stop_episode(save=False, reason="start_cancelled")
+                        self.recorder.join_stop()
+                finally:
+                    with self.shared.motion_lock:
+                        self.shared.start_request.value = False
 
     def step(self):
+        initial = None
         if self.run_id is None:
-            if self.shared.stop_request.value:
-                self.shared.stop_request.value = int(StopRequest.NONE)
+            with self.shared.motion_lock:
+                if self.shared.stop_request.value:
+                    self.shared.stop_request.value = int(StopRequest.NONE)
             if self.shared.start_request.value:
-                self._begin_episode()
-            return
+                initial = self._begin_episode()
+            if initial is None:
+                return
         if not self._has_motion_authority() or self.shared.quit_requested.value:
             reason = RunEndReason(int(self.shared.run_ended_reason.value))
             self._finish_episode(
@@ -201,14 +262,21 @@ class PolicyRunner:
             return
         if now < self.next_step_ns:
             return
-        row = self._read_observation()
+        row = initial[0] if initial is not None else self._read_observation()
         if row is None:
             self._finish_episode("required_observation_stale", abnormal=True)
             return
-        self.history.append(row)
+        if initial is None:
+            self.history.append(row)
         if not self.action_queue:
-            observation = build_policy_observation(
-                self.history.padded(), self.policy_spec, fingertip_runtime=self.fingertip_runtime
+            observation = (
+                initial[1]
+                if initial is not None
+                else build_policy_observation(
+                    self.history.padded(),
+                    self.policy_info,
+                    fingertip_runtime=self.fingertip_runtime,
+                )
             )
             if observation is None:
                 self._finish_episode("required_tactile_unavailable", abnormal=True)
@@ -229,8 +297,8 @@ class PolicyRunner:
             if (
                 prediction.shape
                 != (
-                    self.policy_spec.n_action_steps,
-                    physical_action_dim(self.policy_spec.action_mode),
+                    self.policy_info.n_action_steps,
+                    physical_action_dim(self.policy_info.action_mode),
                 )
                 or not np.isfinite(prediction).all()
             ):
@@ -244,7 +312,7 @@ class PolicyRunner:
         action = self.action_queue.popleft()
         decoded = decode_policy_action(
             action,
-            self.policy_spec.action_mode,
+            self.policy_info.action_mode,
             row.arm["qpos"][0],
             previous_arm_command_qpos=self.previous_arm,
             planner=self.planner,
@@ -273,9 +341,9 @@ class PolicyRunner:
                     observation_timestamp_ns=row.observation_timestamp_ns,
                     publication_timestamp_ns=0,
                 )
-            self.next_step_ns = time.monotonic_ns() + int(self.policy_spec.control_dt_s * 1e9)
+            self.next_step_ns = time.monotonic_ns() + int(self.policy_info.control_dt_s * 1e9)
             return
-        if self.policy_spec.action_mode == "joint":
+        if self.policy_info.action_mode == "joint":
             prepared_arm = project_arm_command(
                 arm,
                 row.arm["qpos"][0],
@@ -297,6 +365,7 @@ class PolicyRunner:
         command = RobotCommand(self.run_id, prepared_arm, prepared_hand)
         stamp = publish_command(self.shared, command) if self.execute else time.monotonic_ns()
         if not stamp:
+            self.stats.publication_rejections += 1
             if self.recorder is not None:
                 self.recorder.note_publication_rejected()
             return
@@ -305,7 +374,7 @@ class PolicyRunner:
         self.stats.previous_step_ns = stamp
         self.previous_arm = prepared_arm
         self.stats.publications += 1
-        self.next_step_ns = stamp + int(self.policy_spec.control_dt_s * 1e9)
+        self.next_step_ns = stamp + int(self.policy_info.control_dt_s * 1e9)
         if self.recorder:
             self.recorder.add_frame(
                 build_episode_frame(row, command, frame_valid=True),
@@ -349,7 +418,6 @@ class PolicyRunner:
                 if failure is None:
                     failure = exc
                 logger.exception("policy recording cleanup failed")
-            self._log_summary()
         if failure is not None:
             raise failure
 
@@ -370,12 +438,13 @@ class PolicyRunner:
         )
         effective_hz = f"{1000 / mean_interval_ms:.2f}" if mean_interval_ms > 0 else "unavailable"
         logger.info(
-            "policy summary: execute=%s steps=%d arm_clipped=%d max_arm_clip_rad=%.5f "
+            "policy episode summary: execute=%s steps=%d rejected=%d arm_clipped=%d max_arm_clip_rad=%.5f "
             "workspace_clipped=%d max_workspace_clip_m=%.5f hand_clipped=%d max_hand_clip_rad=%.5f "
             "ik_failures=%s configured_action_hz=%.2f "
             "inference_ms[n=%d %s] action_step_interval_ms[n=%d %s] effective_action_step_hz=%s",
             self.execute,
             self.stats.publications,
+            self.stats.publication_rejections,
             self.stats.arm_clip_count,
             self.stats.max_arm_clip_rad,
             self.stats.workspace_clip_count,
@@ -383,7 +452,7 @@ class PolicyRunner:
             self.stats.hand_clip_count,
             self.stats.max_hand_clip_rad,
             self.stats.ik_failure_counts,
-            1 / self.policy_spec.control_dt_s,
+            1 / self.policy_info.control_dt_s,
             len(self.stats.inference_ms),
             statistics(self.stats.inference_ms),
             len(self.stats.action_step_intervals_ms),
@@ -400,28 +469,19 @@ def run_policy_worker(
     max_running_s=None,
     num_episodes=1,
     recording_config=None,
-    fingertip_config=None,
 ):
-    from dexmani_policy.deployment import load_experiment
+    from dexmani_policy.deployment import load_policy
 
     model = None
     failure = None
     try:
-        model = load_experiment(
-            config.experiment,
-            device=config.device,
-            seed=config.seed,
-            artifact=config.artifact,
-            inference_steps=config.inference_steps,
-        )
-        if model.spec != config.spec:
-            raise ValueError("PolicySpec changed between inspect and load")
-        fingertip_runtime = build_fingertip_runtime(config.spec, fingertip_config)
-        model.warmup(samples=5)
+        model = load_policy(config.config, config.info, device=config.device, seed=config.seed)
+        fingertip_runtime = build_fingertip_runtime(config.info, runtime)
+        model.warmup(samples=5, rgb_hw=(runtime.camera.height, runtime.camera.width))
         runner = PolicyRunner(
             shared,
             runtime,
-            config.spec,
+            config.info,
             model_runtime=model,
             fingertip_runtime=fingertip_runtime,
             execute=execute,
