@@ -90,13 +90,16 @@ class TeleopRunner:
         if self.controller is not None:
             self.controller.clear_reference()
         self.active = self.paused = self.resume_requested = False
+        recording_discarded = False
         if self.recorder is not None and self.recorder.is_recording:
             if abnormal:
                 self.recorder.mark_discard(reason)
             if save:
-                self.recorder.save_episode(reason=reason)
+                recording_discarded = self.recorder.save_episode(reason=reason) is None
             else:
                 self.recorder.discard_episode(reason=reason)
+                recording_discarded = True
+        return recording_discarded
 
     def _pause(self, manual, mark_episode=True):
         revoke_motion(self.shared)
@@ -161,15 +164,26 @@ class TeleopRunner:
         if cmd is OperatorCommand.QUIT:
             revoke_motion(self.shared)
             if self.recorder is not None and self.recorder.is_recording:
+                discard_only = not self.recorder.accepting_frames
                 self._pause(True, mark_episode=False)
                 self.quit_pending = True
                 self.quit_deadline = time.monotonic() + self.runtime.policy.quit_save_timeout_s
-                print("Quit: S save, D discard, H save and home", flush=True)
+                print(
+                    "Quit: capture is discard-only; S/D discard, H discard and home"
+                    if discard_only
+                    else "Quit: S save, D discard, H save and home",
+                    flush=True,
+                )
             else:
                 self.shared.quit_requested.value = True
         elif cmd in (OperatorCommand.STOP, OperatorCommand.DISCARD, OperatorCommand.HOME):
-            self._stop_episode(cmd is not OperatorCommand.DISCARD, cmd.value.lower())
-            self.audio.play("discard" if cmd is OperatorCommand.DISCARD else "end")
+            recording_discarded = self._stop_episode(
+                cmd is not OperatorCommand.DISCARD, cmd.value.lower()
+            )
+            discarded = cmd is OperatorCommand.DISCARD or recording_discarded
+            self.audio.play("discard" if discarded else "end")
+            if recording_discarded and cmd is not OperatorCommand.DISCARD:
+                print("Capture discarded; no episode was published.", flush=True)
             if cmd is OperatorCommand.HOME and not self.shared.error_state.value:
                 self.home_planner = self.home_planner or build_policy_home_planner(self.runtime)
                 self.audio.play("home")
