@@ -1,170 +1,206 @@
 # DexMani Real
 
-面向个人 PhD 灵巧操作实验的真实机器人代码，用于 demonstration 采集、learned policy 部署与真机 evaluation。硬件为 xArm7、XHand、RealSense RGB-D 和 VR / HTS；模型训练与 policy implementation 位于相邻的 `dexmani_policy` 仓库。
+面向真实机器人灵巧操作研究的个人 PhD 代码库。
 
-本仓库会控制真实硬件。运行前检查机械限位、实验环境、标定与急停，并保持操作者在场。真机操作需明确授权；离线检查通过不代表真机安全验证通过。
+DexMani Real 聚焦 **real-world dexterous manipulation** 的实验闭环：真实机器人标定、遥操作示教、多模态数据采集、数据整理，以及 learned policy 的真机部署与评估。当前实验平台以 xArm7、XHand、RealSense RGB-D 与 VR / HTS 为核心；策略模型、训练与算法实验主要位于 `dexmani_policy`。
 
-## 安装与配置
+> 这是研究代码，不是通用机器人产品或 SDK 封装。仓库设计优先服务当前博士研究问题、实验可信度与快速迭代，而不是追求长期 API 兼容或通用平台化。
 
-要求 Python >= 3.10。在实验环境中安装本仓库，以下命令均从仓库根目录执行：
+## 研究定位
 
-    python -m pip install -e .
+本仓库主要承担四类工作：
 
-硬件 SDK、运动学/点云库和 `dexmani_policy` 依赖按实验机环境安装。普通 import 和配置解析不应连接设备；采集、部署和回放工作流由对应 worker 建立连接，诊断脚本在显式启动后连接设备。
+1. **真实机器人实验基础设施**  
+   管理机械臂、灵巧手、RGB-D 相机与 VR / HTS 等真实设备的实验入口和运行边界。
 
-支持 `--config` 的入口按 CLI > YAML > [ExperimentConfig 默认值](dexmani_real/config/experiment.py) 解析，每次解析创建独立配置。连接设备前可查看采集配置：
+2. **多模态示教与实验数据**  
+   采集真实机器人状态、RGB-D、点云、手部电流 / 触觉等与灵巧操作相关的观测，并保存可追溯的实验原始数据。
 
-    python examples/collect_teleop.py --print-config
-    python examples/collect_teleop.py --config experiment.yaml --print-config
+3. **从真实数据到策略训练的桥接**  
+   将 Raw episode 整理为可供策略训练使用的派生数据，同时保留原始实验事实与必要的处理信息。
 
-已接受的相机、桌面和 VR 标定状态保存在 `dexmani_real/calibration/state/`，由对应的标定入口显式更新。
+4. **learned policy 的真机闭环评估**  
+   将 `dexmani_policy` 中训练得到的策略接入真实机器人，在当前实验标定和安全边界下进行 rollout 与评估。
 
-相机标定中，SPACE 采样，ENTER 求解并仅保存通过质量检查的结果，R 执行 planned HOME，Q 结束。退出是否成功还取决于 worker 正常停止与 DISARMED 检查。
+本仓库**不试图**成为通用机器人中间件、硬件抽象框架、数据格式标准或模型训练框架。与学习算法直接相关的模型结构、训练流程和策略实现应优先放在 `dexmani_policy`。
 
-Teleop、键盘控制和 policy 分别使用各自的控制周期，replay 使用录制频率。动作生产频率不得高于相关执行器 worker 的服务频率；worker 频率不等于设备物理伺服频率。
+## 研究工作流
+
+典型实验链路为：
+
+```text
+实验环境与硬件准备
+        ↓
+相机 / 工作空间 / VR 等标定
+        ↓
+遥操作示教与 Raw episode 采集
+        ↓
+数据检查与离线处理
+        ↓
+Canonical training cache
+        ↓
+dexmani_policy 训练
+        ↓
+策略真机部署与 rollout
+        ↓
+实验结果分析
+```
+
+这个流程体现了本项目最重要的边界：
+
+- **Raw 数据是实验事实**，应尽量保持原始、可追溯和不可变。
+- **训练数据是可重建的派生物**，可以随研究需要重新处理和重新导出。
+- **标定属于当前实验现场状态**。相机外参、桌面平面、手部安装等信息应在新的实验设置下重新标定或确认，而不是被当作跨实验永久不变的接口契约。
+- **训练产物来自 `dexmani_policy`，真实执行边界属于 `dexmani_real`**。两个仓库通过必要的实验信息协作，不复制整套实现语义。
+
+## 实验平台
+
+| 组成 | 当前角色 |
+|---|---|
+| xArm7 | 机械臂运动与末端位姿控制 |
+| XHand | 五指灵巧操作、关节状态与触觉 / 电流观测 |
+| RealSense RGB-D | RGB、深度与 3D 几何观测 |
+| VR / HTS | 人类示教与遥操作输入 |
+| `dexmani_policy` | 策略训练、模型实现与推理逻辑 |
+
+硬件组合和实验设置可能随研究推进而变化。代码中出现的具体设备、标定结果或处理参数，应理解为当前研究平台的一部分，而不是项目对外承诺的固定标准。
+
+## 仓库结构
+
+```text
+dexmani_real/
+├── calibration/    # 实验标定与标定状态
+├── config/         # 实验配置
+├── robot/          # 机器人与灵巧手接口
+├── sensor/         # 真实传感器
+├── teleop/         # 遥操作
+├── runtime/        # 真机实验运行时
+├── ipc/            # 运行时进程间通信
+├── recording/      # 实验数据记录
+├── dataset/        # Raw 读取、处理与训练数据导出
+├── deployment/     # learned policy 真机接入
+├── planning/       # 与真实机器人运动相关的规划能力
+├── replay/         # 已录制轨迹的真实回放
+└── utils/          # 小型通用辅助代码
+
+examples/           # 面向实验人员的主要命令行入口
+```
+
+目录划分服务于“真实实验链路是否清晰”。除非研究问题确实需要，不应为了形式统一而增加额外 framework、registry、schema layer 或兼容层。
+
+## 安装
+
+要求 Python >= 3.10。
+
+```bash
+python -m pip install -e .
+```
+
+真实实验机还需要按当前硬件环境安装对应 SDK、几何 / 点云依赖以及 `dexmani_policy` 所需环境。仓库本身不会尝试把所有实验机软件依赖抽象成一个通用发行环境。
 
 ## 常用入口
 
-| 工作流 | 命令 | 说明 |
-|---|---|---|
-| VR collection | `python examples/collect_teleop.py --config experiment.yaml --task-name <task>` | 真机；raw episode |
-| Keyboard jog / home | `python examples/keyboard_teleop.py --config experiment.yaml` | 真机 |
-| Physical replay | `python examples/replay_episode.py <episode> --config experiment.yaml` | 真机 |
-| Policy rollout | `python examples/run_policy.py <policy/task/experiment> --config experiment.yaml` | 真机；evaluation session |
-| Camera calibration | `python examples/calibrate_camera.py --config experiment.yaml --hand-geometry absent` | 真机；仅在手已拆除时用 `absent`，固定在 home 的手用 `secured-home` |
-| VR heading calibration | `python examples/calibrate_vr_heading.py` | VR / HTS |
-| Canonical Zarr export | `python examples/export_policy_zarr.py <raw_task_dir>` | 离线；输入为包含当前 Raw episodes 的任务目录 |
-| XHand diagnostics | `python examples/xhand_diagnostics.py` | 连接真机；诊断 |
-| RGB-D diagnostics | `python examples/realsense_record_example.py` | 连接相机；实时 RGB-D / 点云显示 |
-| Point-cloud diagnostics | `python examples/pointcloud_process_example.py` | 连接相机；点云检查与可选桌面标定，`--save-dir` 保存诊断快照 |
-| Inspect raw | `python examples/visualize_episode.py <episode> --info` | 离线 |
+以下入口覆盖当前最常见的研究流程：
 
-带参数解析的入口可通过 `--help` 查看完整参数。`xhand_diagnostics.py` 和 `realsense_record_example.py` 不支持 `--help`，直接运行会进入硬件诊断流程。
-
-键盘控制使用 WASD/方向键和 IJKL 微调，R 执行 planned HOME，Q 退出，ESC 急停。下节的 B/C/S/D/H 按键用于 VR teleop。
-
-物理回放只接受当前 `format="dexmani.raw"` 的 teleop episode；加载时拒绝空轨迹或非有限的动作/机器人状态。初始化完成后，先发送一次配置的 `hand.home_qpos_deg` 回零目标并等待手部到位，失败则退出。随后检查机械臂和手部与录制首帧实测姿态的每个关节误差均不得超过 10°，机械臂按限位内等价角比较；启动前需在操作者监督下将机械臂置于录制起始姿态附近。默认先保持机械臂当前姿态，用 0.5 秒 smoothstep 将手部从新鲜实测姿态过渡到首帧手部目标（时长向上取整到完整回放周期），再按 `hand.home_tolerance_deg` / `hand.home_timeout_s` 等待连续三个新鲜样本确认到位；反馈失效、机械臂偏离或到位超时则停止。准备阶段支持 Q/ESC 中止，不计入回放行。`--hand-start-duration 0` 可关闭这段准备以保留原始启动瞬态；启用时手部初始条件改变，`metrics.json` 的 `hand_start` 明确记录设置，首段指标不代表严格初态复现。正式回放仍按录制频率逐条发布原始目标，Q 停止并保留已采集数据，结束后的 H 执行机器人 planned HOME，成功后继续等待 Q 明确退出，不超时自动退出；回零失败、急停或硬件故障仍退出并保留已采集结果。默认输出为 `replay_results/<episode_name>_replay/`，`--output` 必须指向不存在或为空的目录；采集到数据后保存 `replay_data.npz` 并计算一致性指标 `metrics.json`。
-
-## Teleop 与录制
-
-Teleop 默认录制，显式无录制调试使用 `--no-record`，此时不启动相机 worker 或录制 writer。无手调试需同时使用 `--no-hand` 并禁用录制，且手必须已拆除或固定在配置的 home 姿态。
-
-启动时先等待 arm/hand/camera 就绪；启用 XHand 时，连接和触觉标定流程结束后发送一次配置的 `hand.home_qpos_deg` 回零目标并等待到位，然后完成 IK 与手部重定向初始化。最后启动 VR 接收并等待 HTS APP 的首帧有效右手数据，终端输出“准备进入遥操作”。初始化回零和等待 VR 期间，Q 可正常取消启动、ESC 可急停；真实回零失败仍报错退出。等待 VR 超时按 `safety.readiness_timeouts_s.vr` 处理。正常按键操作通过语音反馈，终端不打印按键动作或按键列表，保留录制结果和故障诊断。
-
-| 按键 | 操作 |
+| 任务 | 入口 |
 |---|---|
-| B | 首次开始采集会话；会话开始后无操作 |
-| C | 暂停 / 恢复；恢复时开始新的 Raw episode |
-| S | 保存当前片段，保持暂停 |
-| D | 丢弃当前未完成片段，保持暂停 |
-| H | 仅执行 planned HOME；运行中先暂停控制 |
-| Q | 第一次准备退出，第二次确认退出；首次 B 成功前且无 capture 时可直接退出 |
-| ESC | 急停 |
+| VR 遥操作与示教采集 | `python examples/collect_teleop.py --help` |
+| 键盘调试 / 回零 | `python examples/keyboard_teleop.py --help` |
+| 相机标定 | `python examples/calibrate_camera.py --help` |
+| VR heading 标定 | `python examples/calibrate_vr_heading.py --help` |
+| Raw episode 检查 | `python examples/visualize_episode.py --help` |
+| 训练数据导出 | `python examples/export_policy_zarr.py --help` |
+| 真实轨迹回放 | `python examples/replay_episode.py --help` |
+| Policy rollout | `python examples/run_policy.py --help` |
 
-语音对应实际操作结果：B 成功开始后播“遥操作启动”；C 暂停播“操作暂停”，成功恢复后播“工作继续”；S 实际保存成功后播“成功保存轨迹”，D 丢弃当前 capture 后播“放弃保存轨迹”，无待处理 capture 时不播报。首次 Q 播“准备退出遥操作”，确认退出播“操作结束”。H 开始回零前播“即将回到初始姿态”，仅成功到位后顺序播“已经回到初始姿态”；失败或中断不播到位提示。ESC/技术失败播“意外的事情出现了”。C 默认保存片段时先播保存结果，再播恢复提示；语音异步播放，退出收尾限时等待末条语音，避免立即关闭播放器将其截断。
+具体参数、默认值和实验能力以入口的 `--help`、当前配置以及对应源码为准。README 只维护稳定的研究工作流，不复制容易过时的实现细节。
 
-C 暂停会冻结当前 clean capture，暂不发布或删除；S/D 立即决定保存或丢弃。C 恢复会默认保存尚未处理的 clean capture，再 START 一个全新的 Raw episode，等待 START 之后的新鲜机器人与 VR 观测重新锚定，然后恢复运动，无需再次按 B。首次 B 同样要求 START 后的新观测，锚定与运动授权成功后才算会话开始。Raw 每个 episode 都是连续的固定 dt 轨迹，绝不跨暂停的墙钟时间或控制状态重置追加录制行。S/D 后会话仍保持暂停，C 可开始下一片段；已发布 Raw 不会被之后的 D 删除。
+## 数据原则
 
-H 只回 home，不决定数据去留；运行中按 H 会先冻结 capture，回零后保持暂停。片段的 `termination_reason` 保留首次控制边界原因，例如 C 暂停后再 S 保存仍为 `pause`，H 或 Q 不覆盖已有原因。直接 S 为 `stop`，直接 H 为 `home`。
+### Raw episode
 
-首次 Q 暂停并进入退出待确认状态，没有超时自动决策。S/D/H 后仍等待退出确认；第二次 Q 默认保存未处理的 clean capture 后退出，技术无效 capture 则丢弃。C 取消退出并按正常恢复流程开始新片段。HOME 执行期间 ESC 急停、Q 中断 HOME 并遵循同样的两阶段退出；C/S/D/H 被消费而不延迟执行，需要结束后重新按键。
+Raw 是真实实验的 source of truth。它用于回答“实验当时实际观测到了什么、发布了什么目标、以什么状态结束”。
 
-技术控制/发布失败或控制周期不连续会立即撤销运动并丢弃当前片段，保持可见暂停，不能套用手动暂停的默认保存规则。非相机观测失效同样暂停并丢弃，资源恢复后需手动 C 开始新片段；录制背压、writer 错误、必需相机失效及硬件/runtime 故障仍结束会话。异常退出丢弃未完成 capture。达到 `policy.max_record_duration_s` 时保存当前片段并保持暂停，C 才开始下一片段；无录制调试保留相同的手动暂停/恢复和两阶段退出语义。
+基本原则：
 
-录制依赖相机 worker 和控制进程内的单一 writer 线程。控制步复用当前观测的 RGB-D，通过本地有界 FIFO 非阻塞提交，无额外整帧复制。writer 线程从打开到关闭独占 HDF5/PyAV，负责编码、写盘和发布。START 等待 writer 就绪后才允许动作，保存/丢弃只在撤销动作权限后阻塞等待。
+- 已发布 Raw 不做原地修补或语义重写。
+- 传感器缺测、动作未发布、异常终止等事实应被保留，而不是为了得到“更干净”的数据而事后改写。
+- demonstration 与 policy rollout 都应保留真实实验边界；失败 rollout 同样是实验结果。
+- 与实验可复现性相关的物理配置应保留必要 provenance，但不把一次实验的标定数值升级为全局固定协议。
 
-队列满或 writer 异常属于硬录制失败，不静默丢行；控制循环检测到后撤销动作权限并结束会话，CLI 返回非零。已启动的必需 worker 意外退出同样结束会话。相机、VR、点云、录制或 policy 失败属于实验失败；arm/hand 故障、急停或无法确认子进程停止按物理 FAULT 处理。
+### Canonical training cache
 
-Teleop 通过 `policy.max_record_duration_s` 配置正常 episode 预算，policy eval 通过 `--max-duration` 配置。录制预算必须严格小于录制器的帧数硬上限，启动前会校验；过长时应缩短 episode。
+Canonical 数据用于训练，是从 Raw 重建得到的派生缓存。
 
-## 运动安全边界
+它应满足：
 
-正常控制发送最新的绝对目标；`run_id` 防止暂停、停止或超时后的旧动作重新执行。记录的 action 表示高层目标，不承诺设备已消费或物理到达。
+- 对训练所需模态进行严格的一致性与有限值检查；
+- 保留必要的数值处理配置；
+- 不反向修改 Raw；
+- 当处理逻辑发生实质变化时，优先从 Raw 重新生成，而不是长期维护旧缓存兼容链。
 
-xArm 依赖目标限位和 SDK/controller 的速度、加速度控制；XHand 直接接收经过限位检查的绝对位置目标。XHand 正常撤权时使用新鲜实测姿态保持，反馈过期时回退到 passive 模式；急停与退出时也请求 passive 模式。
+当前项目使用 Zarr 作为主要训练缓存载体。字段的科学含义应由生成 / 消费代码与稳定文档共同保持清晰，而不是依靠重复的语义注册表在多个仓库之间同步。
 
-Cartesian IK 检查目标姿态的机器人自碰撞，并使用最终手部目标或新鲜实测手姿态。`--no-hand` 要求手已拆除或固定在配置的 home 姿态。
+## 与 dexmani_policy 的关系
 
-正常 teleop / eval / replay 不检查当前位置到目标的完整运动路径或环境碰撞。完整路径与环境避碰由 planned return-home 负责，实验仍需操作者现场监督。
+两个仓库的职责应保持简单：
 
-xArm 与 XHand HOME 均以实测收敛判断完成。XHand 默认要求连续三个不同的新鲜反馈样本中，每个关节的目标误差均不超过 5°；命令提交与收敛共用超时预算，默认 2 秒。后续机械臂规划使用新鲜实测手姿态，实际手部运动与机械臂路径仍需真机验证。
-
-会话结束时，确认全部子进程停止且没有物理故障后，安全状态变为 DISARMED。相机、VR、点云、录制或 policy 失败，以及共享内存关闭失败，仍会导致会话失败；DISARMED 不表示实验成功。arm/hand 异常退出、急停或已锁存的物理故障保持 FAULT；无法确认子进程停止时也进入 FAULT，并保留共享内存。
-
-## 数据与训练缓存
-
-Raw 是不可变的实验 source of truth，不做原地改写：episode 在 `data.h5` 保存控制行、aligned Z16 深度和 metadata，RGB 使用 `rgb.mp4`；metadata 使用 `format="dexmani.raw"` 和最终 `termination_reason`，不保存 validity 字段或全局递增版本。Runtime / Reader / replay / export 只支持当前 Raw 格式。Reader 验证已有的已知字段，忽略额外未知字段；消费者通过 `require_fields(...)` 要求自己所需的能力。
-
-控制与录制复用同一观测快照。Raw 保留机器人状态、RGB-D、XHand 电流/触觉、实际发布的绝对关节目标和真实物理标定；不保存 VR、逐帧时间戳、transport bookkeeping 或软件 provenance。深度值乘以 `depth_scale` 才得到米。
-
-`action_arm_joint_target` / `action_hand_joint_target` 的有限值表示本控制步确实发布的目标，NaN 表示没有发布相应动作。不得用前一条目标补齐未发布动作；实际发布的 hold 必须保留。Teleop 只发布完整、连续且成功发布动作的 demonstration。Policy rollout 是评估证据：普通 IK 不可执行步仍保存观测和 NaN-action 行；健康的录制前缀可在异常结束时连同 termination reason 保存，不能为了排除失败结果而删除 rollout。
-
-XHand 触觉保留 SDK-native、去软件 bias 后的数值，SI 牛顿单位尚未验证。Raw 和导出均不额外缩放；aggregate/dense 缺测分别使用 NaN，运行时 validity 仍相互独立。Raw 在 START 快照当前 resolved hand mount；离线 FK 只读取 Raw 安装参数。
-
-START 必须用当前相机 serial 解析完整 eye-to-hand 标定，验证 aligned RGB-D 几何、depth scale 和 base-from-color 变换。缺失或 eye-in-hand 均拒绝录制。彩色网格畸变模型必须受 canonical 反投影支持：当前仅接受 `none` / `distortion.none` 和 `brown_conrady` / `distortion.brown_conrady`。
-
-Raw 先写入 `.tmp_<episode_name>`；writer 关闭文件并结构验证后，经 fsync 和原子重命名发布。失败时仅清理本次拥有的 staging；无法确认释放或清理失败时保留 ownership 并拒绝新 START，原始错误不被覆盖。残留 staging 只警告，需人工检查，不自动恢复或删除。
-
-Canonical Zarr 使用 `format="dexmani.real.canonical"`，保持完整多模态缓存：`joint_state`、`arm_qvel`、`arm_effort`、`hand_current`、`eef_pose`、`fingertip_points`、`contact_force`、`tactile_force`、`rgb`、`depth`、`point_cloud`、`action`、`action_ee`。Root attrs 只保存 `format`、`task_name`、`dt`、`depth_scale_m_per_unit`、完整 `pointcloud_config` 和五个 `fingertip_link_names`；数组不保存重复的语义字典。一个 Zarr 的 aligned Z16 depth 使用唯一深度尺度，乘以 `depth_scale_m_per_unit` 得到米，0 表示无深度；RGB 为 uint8 RGB。
-
-`joint_state` / `action` 为 7 个 xArm 关节加 12 个 XHand SDK 顺序关节，单位 rad，顺序为 xArm `joint1`–`joint7`，随后是 [robot/model.py](dexmani_real/robot/model.py) 的 `XHAND_SDK_JOINT_NAMES`。`arm_qvel` 为 rad/s，`arm_effort` 为未验证 SI 单位的 SDK 原值，`hand_current` 为 mA。`eef_pose` 是 xArm base 下的位置米数加 rot6d（旋转矩阵前两列逐列排列）。`action` 为当前控制步实际发布的绝对关节目标；`action_ee` 为同一最终目标 FK 的 EEF position(3)+rot6d(6)+hand target(12)。观测取本控制步动作前最新的因果样本。
-
-`fingertip_points` 为 xArm base 下的米制位置，按保存的五个 link 顺序，默认 thumb/index/middle/ring/pinky；离线使用各 Raw episode 的 hand mount，部署使用当前安装参数。触觉按 thumb/index/middle/ring/pinky，对应 SDK sensor IDs 2/5/7/9/11；轴为传感器原生 fx/fy/fz，dense 每指 120 点保留 SDK raw-force 顺序。触觉数值已去软件 bias，不再缩放，SI 力单位未验证。`point_cloud` 为 xArm base 米制 XYZ + [0,1] RGB，实时与离线调用同一个数值处理函数。
-
-Point-cloud deployment 恢复完整训练数值参数，结合当前相机和桌面标定。`export_report.json` 的 `processing` 保存 resolved processing snapshot，包括离线 audited table plane；Policy runtime 不读取该报告或历史标定。训练到部署仅传递 `dt`，以及实际消费点云/指尖时所需的完整点云数值配置/link 选择。
-
-Raw-to-Canonical 在写入前预检所有候选 episode：空 episode、必需文件/字段缺失、Raw 数据形状/dtype 或必要元数据错误，以及任一必需浮点数组中的 NaN/Inf，均整条拒绝并跳过，包括触觉、电流和 effort 缺测。日志报告拒绝原因和首个异常行（从 0 开始）；输出目录中的 `export_report.json` 保存接受、自动拒绝和显式排除清单。全部被拒绝时不生成 Zarr。Raw 中的 NaN 仍保留为缺测证据，不修改原数据；不补值、切分、重采样或删帧。
-
-不支持的 Raw 格式/相机畸变模型、非 teleop 来源、跨 episode task/dt/depth scale/shape/dtype 不兼容、I/O 错误，以及 RGB 解码、FK、点云生成和 Zarr 写入错误仍终止整个导出并清理 staging。导出要求所有浮点输出有限，不使用动作幅度、触觉大小或任务成败等经验阈值筛选。`dexmani_policy` 的通用 Dataset 只加载选中的数组；canonical 浮点训练数据的有限性由严格导出负责。
-
-导出默认使用项目处理参数和当前桌面标定 `dexmani_real/calibration/state/table_plane.json`，将实际使用的平面参数保存到 `export_report.json` 的 processing snapshot。可用 `--config export.yaml` 覆盖处理参数；指定其他桌面平面时，在 YAML 中设置 `environment.table.plane_abcd` 和 `plane_path: null`，或用 `pointcloud.remove_table: false` 关闭桌面剔除。启用桌面剔除时，标定文件缺失或无效会使导出失败。
-
-```bash
-python examples/export_policy_zarr.py episodes/<task>
-# 人工筛选只排除完整 episode，可重复 --exclude；不修改 Raw 或 task 名称。
-python examples/export_policy_zarr.py episodes/<task> --output datasets/<task>_curated.zarr --exclude episode_unwanted
+```text
+dexmani_real
+真实传感器 / 机器人
+        ↓
+Raw experiment data
+        ↓
+processed training data
+        ↓
+dexmani_policy
+Dataset → Policy → Training → Checkpoint
+        ↓
+dexmani_real
+live observation → policy inference → safe robot execution
 ```
 
-导出通过 owned staging 完成转换与校验，失败不会留下已发布的部分 Zarr。拒绝覆盖已有目标；目标不能位于输入、仓库 `episodes/`、`episodes_processed/`、`rollouts/` 或已有 Zarr 内部。
+`dexmani_real` 不应复制策略网络、训练循环或通用 Dataset 逻辑；`dexmani_policy` 也不应承载真实硬件生命周期、现场标定和真机安全控制。
 
-Canonical 是可重建派生缓存，只支持当前 `format="dexmani.real.canonical"`。字段含义由生成/消费代码及本文说明定义，不维护额外语义 ABI；数值处理选择保存在 root attrs。新增字段不影响不请求它的消费者。旧缓存直接从当前 Raw 重新导出，不维护格式兼容分支。
+研究接口只保存真实复现实验所需的信息。对于点云、指尖几何等与训练数值处理直接相关的设置，可以随训练产物传递；相机外参、桌面平面等现场标定应使用当前实验环境的有效结果。
 
-## Policy evaluation
+## 真机安全
 
-保存的 Policy 实验 `config.yaml` 定义模型、输入模态、动作周期、归一化模式与推理预处理；普通训练 checkpoint 提供 raw/EMA 权重和 fitted normalizer。不需要 deployment export。当前 Real 配置提供现场标定与硬件几何，点云采用保存的数值 recipe；RGB deterministic resize/center crop 由 Policy 执行。
+本仓库能够连接并控制真实硬件。任何真机运行都应满足：
 
-```bash
-conda run --no-capture-output -n real_robot python examples/run_policy.py <experiment_dir> --checkpoint best
-conda run --no-capture-output -n real_robot python examples/run_policy.py <policy/task/run> --checkpoint latest --weights raw --inference-steps 10
-```
+- 操作者在场并具备立即急停能力；
+- 机械限位、工作空间、安装状态和实验环境已人工确认；
+- 所需标定在当前实验设置下有效；
+- 真机动作经过明确授权，不把离线测试结果当作真实安全证明；
+- 首次运行新代码、新策略或新实验设置时采用保守条件逐步验证。
 
-`--checkpoint` 默认为 best（实验根目录 `best_ckpt.json`），也可选 latest 或 checkpoints 中的文件名。`--weights ema|raw` 与 `--inference-steps` 显式覆盖保存的选择；不存在的 best/EMA 会报错。需要 hand_enabled=true 和训练时保存的非空 real_runtime。Parent 不加载模型权重；完成 pure preflight 后创建 session/SHM，policy restore/warmup 就绪后才启动硬件 workers。
+**不要把 import 成功、配置解析成功、compile / lint 通过或仿真结果视为真机安全验证。**
 
-`--config experiment.yaml` 只设置当前 Real 硬件与运行参数；Policy 始终读取所选实验目录里的 `config.yaml`。未显式覆盖的 weights/NFE，best 使用 selection record，latest/文件名使用保存的 `eval.use_ema` / `eval.inference_steps`。
+对于代码代理或自动化工具：除非用户明确授权，不得执行会连接设备、启动采集、写入标定、回零、遥操作、轨迹回放或 policy rollout 的命令。详细协作规则见 [AGENTS.md](AGENTS.md)。
 
-Policy worker 持有 model / CUDA，使用同步 inference 和本地 action chunk。推理期间动作权限已失效时，丢弃返回的旧动作。Pointcloud-only policy 不依赖源 RGB-D 帧仍驻留；同时输入 RGB 和点云时才匹配源帧。保存的 `real_runtime` 仅包含 `dt`，以及按输入模态需要保存的 `pointcloud` / `fingertip_link_names`；指尖 FK 恢复保存的 link 列表并使用当前安装参数。Canonical 中存在某个模态不等于 live Real 已支持：当前未实现的 live 模态会在模型/硬件启动前明确拒绝。Real deployment 要求当前 canonical 训练保存的数值 metadata；simulation config 不保存 `real_runtime`，会在 Real preflight 被拒绝。
+## 开发原则
 
-操作顺序为 H 回到初始姿态、布置场景、B 开始、S 停止；Q 退出，ESC 急停。HOME 完成后需要新的 B 才能开始。B 每次只尝试一次：检查新鲜 arm/hand HOME 状态与完整 padded observation，recorder START 后再次检查，失败则丢弃准备中的录制并等待新的 B；HOME 阻塞期间 S/Q 仍会立即撤销动作权限。`--num-episodes` 按实际开始并结束的 episode 计数，录制失败的 episode 也计入预算。
+DexMani Real 是长期演化的个人研究代码。维护时优先考虑：
 
-每个实际开始的 episode 重置 Policy 固定 seed、EEF IK fallback RNG 和本地统计；结束时记录 timing/clipping/IK summary。`--max-duration` 从成功进入 RUNNING 起计时，是 cooperative runner budget；S/Q/ESC 与 run_id worker fence 负责撤销权限，包括推理阻塞期间的撤销。
+1. 实验安全和科学可信度；
+2. 当前研究问题是否更容易验证；
+3. 数据是否可追溯、可重建；
+4. 代码是否简单、直接、容易检查；
+5. 最后才是通用性和长期兼容。
 
-会话输出位于 `rollouts/<policy>/<task>/<experiment>/session_*/`，包含 `run_config.yaml` 和实际保存的 episode 目录。Policy 模式不使用 C/D；同批收到 S/Q 时会忽略 H/B。
+如果一个旧抽象、兼容分支或文档已经不再服务当前研究，应优先删除，而不是继续包裹。对于一次性重构计划、验收清单和临时 Codex 任务文档，不应长期保留在仓库根目录。
 
-会话执行结果由 CLI 退出码表示：正常完成或操作者退出且资源干净关闭时为 0；必需 worker/operator 异常、物理故障、急停、非正常 shutdown 或共享内存关闭失败时为非零。正常 S/Q 允许 policy 完成本地 episode 结束与录制收尾；若尚未正常结束的 active episode 被外部关闭打断，即使已收到 S/Q，也以明确的异常 termination reason 保存健康录制前缀。
+代码代理的长期规则见 [AGENTS.md](AGENTS.md)。Claude 的入口说明见 [CLAUDE.md](CLAUDE.md)。
 
-正常 Q 的 policy 收尾与后续 worker 停止共用 `safety.shutdown_timeout_s`，默认 65 秒；录制 STOP 等待默认 60 秒。录制收尾耗时会减少其他 worker 的剩余等待时间。
+## 当前状态
 
-Evaluation 数据用于评估与诊断，不能直接当作 teleop BC demonstration 导入训练缓存。任务成功与否需离线判断。
+本项目处于持续研究与快速迭代阶段。接口、数据处理方式和实验流程会随论文问题与真实机器人实验经验演化。
 
-## 开发与离线检查
+因此，使用某项能力前请优先确认：
 
-开发约束见 [AGENTS.md](AGENTS.md)。源码、schema 和 resolved configuration 定义实现行为，README 只保留稳定工作流与操作约定。
+- 当前分支与配置；
+- 对应 `examples/` 入口；
+- 相关源码中的实际行为；
+- 当前实验平台与标定状态。
 
-纯逻辑修改使用一次性离线 smoke checks；仓库不维护 committed tests 目录，不运行真机入口作为测试。
-
-    python -m compileall -q dexmani_real examples
-    ruff format --check dexmani_real examples
-    ruff check --select F401,F821,F822,F823,I dexmani_real examples
-    git diff --check
-
-可选工具缺失时报告未完成的检查，不为检查安装或升级实验环境依赖。涉及实际运动、急停、暂停恢复、传感器失效和 shutdown 的行为，需另行授权真机验证。
+对于论文实验，应同时记录代码版本、训练配置、数据版本与真实实验设置，以便后续复现和分析。

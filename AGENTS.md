@@ -1,74 +1,220 @@
-# Working on DexMani Real
+# AGENTS.md — DexMani Real 协作约定
 
-This is a personal PhD research repository for real-robot dexterous data collection and learned-policy evaluation using xArm7, XHand, RealSense, and VR/HTS. Keep changes focused on these experiments.
+本文面向在本仓库中工作的代码代理。默认使用**中文**进行分析、计划、文档和结果说明；代码标识符、API 名称以及必要的机器人学 / 深度学习术语保留英文。
 
-## Priorities
+DexMani Real 是个人 PhD 灵巧操作研究仓库。工作的目标是让真实机器人实验更安全、更可信、更容易迭代，而不是把仓库扩展成通用机器人平台。
 
-Physical safety > experiment correctness > iteration speed > readability > generic extensibility.
+## 1. 决策优先级
 
-Prefer delete, then inline, then merge, then rewrite. Add abstractions only for actual hardware/resource boundaries or demonstrated duplication. Do not retain obsolete mechanisms or recreate them under new names.
+遇到设计取舍时，按以下顺序判断：
 
-## Hardware and safety
+1. **真实硬件安全**
+2. **实验正确性与科学可信度**
+3. **数据可追溯与结果可复现**
+4. **研究迭代效率**
+5. **代码清晰、简单、易检查**
+6. **通用性、兼容性和框架化**
 
-Do not execute hardware-affecting code without explicit authorization, including SDK discovery/connection, motion, homing, replay, teleoperation, rollout, camera capture, diagnostics, and calibration writes. Inspect relevant imports, constructors, and entry points before execution. Ordinary imports and constructors must not connect devices.
+不要为了“架构完整”“未来可能有用”或“形式统一”牺牲前五项。
 
-Keep xArm, XHand, and RealSense SDK objects in their respective workers; keep model/CUDA runtime in the policy worker. Shut down child processes before releasing shared memory.
+研究代码允许有明确的当前假设。没有真实需求时，不需要为所有硬件、所有数据格式、所有历史版本或所有潜在模型建立抽象层。
 
-Preserve finite SDK inputs, physical/rated joint limits, emergency stop, xArm speed/acceleration controls, SDK error handling, safe disconnect, and required sensor freshness. Fence stale commands with `run_id` at the last software boundary before SDK admission.
+## 2. 仓库边界
 
-Cartesian IK checks target self-collision using the final prepared hand target. Arm-only Cartesian control uses fresh measured hand geometry when available; hand-disabled operation assumes the hand is absent or secured at configured home. Normal teleop/eval/replay do not check transition paths or environment collisions; full collision/workspace/table path planning belongs to planned return-home.
+`dexmani_real` 负责真实世界实验链路，包括：
 
-Cartesian control may clip EEF workspace before IK. Do not add a generic FK workspace gate to joint policies. Normal arm/hand streaming uses validated absolute targets and device controls; do not add software delta/slew filters without an explicit design change.
+- 真实硬件和传感器接入；
+- 实验标定；
+- 遥操作与数据采集；
+- Raw experiment data；
+- 面向训练的离线处理；
+- learned policy 的真实机器人接入与评估；
+- 与真机相关的运行时安全边界。
 
-## Runtime and observations
+策略网络、训练循环、通用 Dataset / Agent 设计和算法研究原则上属于 `dexmani_policy`。
 
-Keep `SafetyState` simple: DISARMED / ARMED / RUNNING / FAULT. Commands use latest-target semantics with `run_id` as the lifecycle epoch. Do not add command identities, adoption/reached ledgers, ACKs, or command transactions. Ring sequence is an internal transport detail.
+修改跨仓库接口时，优先减少重复信息，只传递真实复现实验或部署所必需的内容。不要让两个仓库各自维护一套同义的数据语义表、能力 registry 或兼容协议。
 
-C remains operator-facing pause/resume. A clean operator pause freezes the pending capture; an unresolved clean capture defaults to save. Resume intentionally starts a new Raw episode before fresh post-START re-anchoring and motion authorization.
+## 3. 先理解研究问题，再改代码
 
-Publish only usable sensor samples; acquisition/derivation failures must not publish fake replacements or generic validity flags. Consumers use latest-sample freshness. XHand aggregate and dense tactile validity remain explicit because either can fail independently of joint state.
+开始修改前：
 
-Assemble one current observation snapshot per control step and reuse it for teleop and recording. Policy history belongs in a local control-row deque, not sensor-ring reconstruction.
+- 明确用户当前要解决的研究或实验问题；
+- 检查当前仓库状态，避免覆盖无关修改；
+- 从真实入口追踪相关数据流或控制流；
+- 找到生产者、变换、消费者以及可能的硬件副作用；
+- 区分“当前实验必须保持的行为”和“历史遗留实现”。
 
-A point cloud is self-contained. Match its source camera frame only when the policy consumes RGB and point cloud together; pointcloud-only rollout recording uses independent latest fresh camera telemetry.
+不要仅根据文件名、旧文档或抽象层猜测行为。README 描述稳定工作流；具体行为以当前源码和 resolved configuration 为准。
 
-## Research data
+如果可以通过删除旧逻辑、合并重复路径或缩小接口解决问题，优先这么做。
 
-Current Raw episodes use `format="dexmani.raw"`, with control rows and aligned depth in `data.h5` plus `rgb.mp4`. Normal runtime/export/replay code supports only this current format; do not add legacy Raw compatibility branches. Legacy data is outside the supported repository contract. Raw is immutable experiment evidence and is not rewritten in place. Validate known fields that are present, tolerate unknown additive fields, and let consumers require the capabilities they need. The current writer remains strict about its emitted fields.
+## 4. 真机操作是特殊权限
 
-Preserve measured robot state, RGB-D, current/tactile payloads, actual published absolute joint targets, physical camera/hand-mount calibration, and final `termination_reason`. New Raw has no persisted `frame_valid`, `episode_valid`, or global incremental schema version. Keep freshness, causal selection and cadence checks in runtime; do not persist per-row timestamps, raw VR, detailed status, software provenance, or transport bookkeeping.
+除非用户明确授权，**不得执行任何可能连接或改变真实设备状态的代码**。
 
-Finite action targets mean that target was published for that row; NaN means no corresponding action was published. Never substitute a previous target. Preserve an actual published hold. Publish only clean, temporally continuous fixed-dt teleop demonstrations: operator pause/resume is a Raw episode boundary, never an append across a wall-clock or control-state discontinuity. S/D finalize only the current capture, H only performs planned HOME, and Q uses explicit two-stage quit with no timeout. Technical control/publication failure, cadence discontinuity, recording failure or abnormal lifecycle invalidates the current capture; revoke motion promptly and discard it rather than silently streaming with a discard-only recorder. Recoverable failures require operator C to start a new segment with fresh resources. Abnormal cleanup never defaults to saving an unfinished teleop capture. Policy rollouts retain ordinary unexecutable steps as NaN-action rows and may save a healthy recorded prefix on abnormal termination with its reason. Do not delete policy-failure evidence to select successful rollouts.
+包括但不限于：
 
-Use a bounded local recorder FIFO with non-blocking submission and no additional full RGB-D copy. A single writer thread owns HDF5/PyAV from open through close. START readiness precedes motion authorization; blocking finalization follows motion revocation. Queue Full and writer errors are experiment failures, never silent drops.
+- 连接或探测 xArm、XHand、RealSense、VR / HTS；
+- 机械臂或灵巧手运动、回零、轨迹回放；
+- teleoperation；
+- policy rollout；
+- 实时相机采集和硬件诊断；
+- 写入或更新标定结果。
 
-Tactile payloads use XHand SDK-native values with software bias removed; their SI force unit is unverified. Native recording and Raw-to-Zarr apply no additional tactile scaling. Missing tactile payloads contain NaN; runtime aggregate/dense validity remains explicit and independent of joint state.
+如果不确定某个命令是否会产生硬件副作用，按“会产生”处理。
 
-Snapshot the resolved physical hand mount at recording START; Raw is its sole offline truth source. New recording requires complete eye-to-hand aligned RGB-D calibration before START. The aligned color-grid distortion model must have a validated canonical depth-deprojection path. Keep this lightweight compatibility check shared by recording, Raw loading, and numerical deprojection; reject unsupported models before recording.
+普通 import、配置解析、纯数据处理和离线检查应尽量保持无硬件副作用。不要为了测试一个纯逻辑改动而顺手启动真实设备。
 
-Canonical Zarr uses `format="dexmani.real.canonical"` and remains a general multimodal learning cache. Root attrs contain only format, task_name, dt, depth_scale_m_per_unit, complete pointcloud_config and fingertip_link_names. Preserve a single aligned-Z16 depth scale per store. Document array meanings in README; do not duplicate semantic dictionaries across export, training and deployment. The export report stores the resolved processing snapshot, including the audited training table plane. Deployment uses saved numerical point-cloud parameters and fingertip link choices with current Real calibration and physical hand mount. No runtime timing arrays or generic validity masks belong in Canonical.
+任何涉及运动控制、安全状态、急停、关节限位、碰撞检查、传感器 freshness 或资源释放的修改，都应保守处理并明确说明尚未进行的真机验证。
 
-Raw-to-Canonical export preflights all candidate episodes before writing. Reject and skip whole episodes with no rows, missing required files/fields, malformed Raw layouts/metadata, or NaN/Inf in any required floating array, including tactile/current/effort telemetry. Report rejection reasons and persist accepted/rejected/explicitly excluded episode lists in `export_report.json`; write no Zarr if none pass. Unsupported formats, incompatible task/dt/depth scale/array layouts, I/O errors and conversion failures remain fatal to the entire export. Do not repair, split, resample, drop bad rows or salvage partial episodes. Raw may retain missing telemetry as NaN; every floating output of the exporter must be finite. `action` and `action_ee` describe the same final target. `dexmani_policy` datasets remain domain-agnostic and load only selected arrays; canonical finiteness is the exporter’s responsibility. Deployment metadata capture saves only dt and consumed point-cloud numerical configuration/fingertip links. Canonical availability does not imply live Real availability: unsupported live modalities must fail before motion.
+## 5. 标定是实验状态，不是永久契约
 
-Canonical caches are regenerated from current Raw and only the current canonical format is supported. Published field names never silently change meaning; source code defines the numerical representation and README documents it. Persist numerical preprocessing choices without adding a semantic registry or deployment ABI. Additive fields do not invalidate consumers that do not request them. Do not introduce global schema-version compatibility chains or fabricate modalities that were never recorded.
+相机外参、桌面平面、手部安装、VR 对齐等标定信息描述的是**当前实验设置**。
 
-## Making changes
+因此：
 
-Check `git status --short` before editing and preserve unrelated changes. Trace the relevant definition, producer, transformation, consumer, and side effect from actual entry points; read both sides of changed process, policy, robot, and storage boundaries.
+- 新实验设置应重新标定或人工确认；
+- 标定结果可以作为实验 provenance 或当前运行时输入；
+- 不要把某一次标定数值硬编码成跨实验、跨机器或跨仓库的固定 ABI；
+- 不要用历史 desk plane、camera extrinsics 等数值去判断一个新实验是否“符合训练契约”；
+- 真机前应验证当前所需标定存在、有效且与当前物理设置一致。
 
-Source and resolved configuration define current behavior. Use `dexmani_policy` public interfaces. Validate external inputs at their owning boundary; avoid redundant internal validation or exception wrapping without recovery.
+训练时确实影响数值表示的 preprocessing 参数可以随训练产物保存；现场物理标定则应来自当前真实环境。
 
-Keep code direct and readable. Comments should explain non-obvious robotics, math, frames, units, SDK behavior, experimental rationale, attribution, and safety reasons, rather than repeat control flow or implementation history. Use Ruff formatting and import sorting when available.
+## 6. 科研数据原则
 
-README documents stable workflows and operating conventions. Keep implementation inventories and historical task plans out of standing instructions.
+### Raw 是实验事实
 
-## Offline checks
+Raw episode 是真实实验的 source of truth。
 
-Use focused one-off smoke checks for changed pure logic, especially transforms, FK/IK, retargeting, conversion, target clipping, and observation history. Do not add a committed tests directory or run hardware examples as tests. Offline checks are not hardware validation.
+- 已发布 Raw 不做原地修补。
+- 不为了让数据“好看”而删除失败证据或重写终止原因。
+- 缺测、未发布动作、异常终止等实验事实应被忠实保存。
+- policy rollout 的失败同样属于实验结果，不能只保留成功案例。
+- 若某段数据不适合训练，应在派生数据阶段排除，而不是篡改 Raw。
 
-    python -m compileall -q dexmani_real examples
-    ruff format --check dexmani_real examples
-    ruff check --select F401,F821,F822,F823,I dexmani_real examples
-    git diff --check
+### 派生数据可以重建
 
-If optional tools or dependencies are unavailable, report that rather than installing or upgrading the experiment environment. Review the final diff for unrelated changes, dead code/config, and stale documentation.
+Canonical / processed dataset 是训练缓存，不是第二份原始事实。
+
+- 处理过程应是确定、可解释和可追溯的；
+- 对训练必需的数值有效性保持严格；
+- 不静默插值、补模态、删坏帧或改变时间语义，除非这是明确的研究设计；
+- 处理逻辑发生实质变化时，优先从 Raw 重新导出；
+- 不为旧缓存长期维护复杂 migration / compatibility chain，除非当前实验明确依赖它。
+
+## 7. 研究代码的架构原则
+
+保持架构与真实研究边界一致。
+
+应该：
+
+- 让硬件资源、实验流程、数据处理和策略部署的责任清楚；
+- 在真实存在的设备、进程或数据边界处保留必要抽象；
+- 让配置表达实验选择，而不是隐藏控制流；
+- 删除已经失效的 legacy path；
+- 让核心科学语义在少数明确位置可读。
+
+避免：
+
+- 为潜在未来需求建立 registry / schema framework / capability framework；
+- 为单一实现创建多层 wrapper；
+- 在不同目录重复同一校验和同一语义定义；
+- 用异常包装隐藏原始硬件或数据错误；
+- 为保持历史兼容而让当前实验路径长期复杂化；
+- 把一次性 task plan、验收清单或迁移说明变成永久架构文档。
+
+“更少的代码、更少的状态、更少的跨仓库协议”通常优于额外抽象，但不能以削弱安全和实验正确性为代价。
+
+## 8. 修改真实控制链时
+
+修改与 robot / sensor / teleop / replay / deployment 相关的代码时，至少检查：
+
+- 是否改变了真实设备何时被连接；
+- 是否改变了动作何时获得或失去执行权限；
+- 是否改变了失败、暂停、退出和急停语义；
+- 是否改变了关节目标、坐标系、单位或时间含义；
+- 是否会让旧命令、旧观测或失效资源继续被使用；
+- 是否改变了实验记录与实际执行之间的对应关系。
+
+不要在没有明确研究动机的情况下额外加入平滑器、限幅器、补偿器、fallback 或自动恢复机制。此类机制会改变实验系统本身，需要作为设计决策单独审视。
+
+## 9. 修改数据链时
+
+修改 recording / dataset / export 时，优先回答：
+
+- 数据来自真实系统的哪一时刻；
+- 单位、坐标系和顺序是什么；
+- 缺测如何表示；
+- 动作代表“目标”“已发布目标”还是“实测状态”；
+- 是否破坏 Raw 的不可变性；
+- 训练缓存是否还能从 Raw 重建；
+- 是否会无意改变已有论文实验的语义。
+
+不要仅为了通过训练代码而伪造传感器值或把无效数据填成看似正常的数字。
+
+## 10. 修改 policy 部署边界时
+
+Real 侧只应关心真实执行真正需要的信息：
+
+- 当前策略消费哪些 live observations；
+- 策略输出的动作含义；
+- 控制频率 / 时间尺度；
+- 与数值表示直接相关且训练时固定的 preprocessing；
+- 当前真实环境的标定与硬件能力。
+
+不要把 `dexmani_policy` 内部训练实现、模型类别层级或数据集来源细节复制进 Real runtime。也不要把现场标定固化进 Policy artifact。
+
+## 11. 文档职责
+
+长期文档保持分工：
+
+- **README.md**：给研究者阅读，解释项目定位、研究工作流、仓库边界和主要入口。
+- **AGENTS.md**：给代码代理阅读，规定安全、科研数据和修改原则。
+- **CLAUDE.md**：Claude 的工作入口，只补充 Claude 工作方式，不复制整份 AGENTS。
+- **临时任务文档**：只用于一次性重构 / 验收；任务完成后应删除或移出长期主文档。
+
+不要在 README 中堆积类名、字段清单、状态机细节、每个按键行为或历史重构记录。实现细节容易变化，应留在代码、CLI help 和必要注释中。
+
+## 12. 语言与代码风格
+
+- 文档和协作说明以中文为主。
+- 代码保持直接、显式、易读。
+- 注释解释“为什么”，尤其是机器人学假设、坐标系、单位、数学约定、安全原因和实验设计；不要逐行复述代码。
+- 没有明确收益时不要新增依赖。
+- 不要把简单 helper 升级为 subsystem。
+- 与当前研究无关的“顺手重构”应避免。
+
+## 13. 验证原则
+
+默认先做离线验证，不做真机验证。
+
+推荐的基础检查：
+
+```bash
+python -m compileall -q dexmani_real examples
+ruff format --check dexmani_real examples
+ruff check dexmani_real examples
+git diff --check
+```
+
+根据改动增加有针对性的纯逻辑检查，例如几何变换、FK / IK、数据导出、配置解析或 observation 构造。
+
+如果环境缺少可选依赖，不要为了完成检查而擅自升级或重装真实实验环境；说明哪些检查未运行以及原因。
+
+任何离线检查通过都**不等价于**真实机器人验证。
+
+## 14. 完成修改前
+
+最终检查：
+
+- 修改是否真正服务用户提出的研究目标；
+- 是否引入了无必要的新抽象；
+- 是否留下 dead code、legacy alias 或过时文档；
+- README / AGENTS / CLAUDE 是否仍然描述长期稳定事实；
+- 是否意外改变了数据语义或真机安全边界；
+- 是否存在未说明的真机验证缺口；
+- 最终 diff 是否只包含预期修改。
+
+对于个人 PhD 研究仓库，宁可留下一个简单、可解释、能支撑论文实验的实现，也不要留下一个复杂但“看起来像平台”的系统。
