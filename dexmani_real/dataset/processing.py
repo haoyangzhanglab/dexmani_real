@@ -45,10 +45,6 @@ def validate_episode(reader: EpisodeReader) -> int:
         raise ValueError(f"training requires teleop collection_source, got {collection_source!r}")
     reader.require_fields(*DATASET_SPECS, "rgb", "depth")
     reader.require_metadata("handbase_position_eef_m", "handbase_quat_eef_wxyz")
-    if reader.is_legacy:
-        reader.require_fields("frame_valid")
-        if not reader.legacy_episode_valid or not np.all(reader["frame_valid"][:]):
-            raise ValueError("legacy episode has invalid episode/frame evidence")
     for name in ("arm_qpos", "hand_qpos", "action_arm_joint_target", "action_hand_joint_target"):
         if not np.isfinite(source[name][:]).all():
             raise ValueError(f"{name}: non-finite core values")
