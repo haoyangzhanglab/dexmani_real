@@ -104,10 +104,6 @@ def print_episode_info(h5_path: str) -> None:
                 low = np.array2string(q.min(axis=0), precision=3, suppress_small=True)
                 high = np.array2string(q.max(axis=0), precision=3, suppress_small=True)
                 print(f"{key} range: {low} .. {high}")
-        if reader.is_legacy:
-            print(f"legacy episode valid: {reader.legacy_episode_valid}")
-            if "frame_valid" in reader.fields:
-                print(f"legacy valid rows: {np.count_nonzero(reader['frame_valid'][:])}")
 
 
 class EpisodeVisualizer:
@@ -413,7 +409,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "episode",
         type=str,
-        help="Path to a current raw episode directory (data.h5/depth.h5/rgb.mp4).",
+        help="Path to a current Raw episode directory (data.h5/rgb.mp4).",
     )
     parser.add_argument(
         "--max-frames",
