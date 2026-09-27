@@ -6,6 +6,9 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import numpy as np
+from scipy.spatial.transform import Rotation
+
+from dexmani_real.planning.kinematics.pose import Pose, quat_multiply
 
 if TYPE_CHECKING:
     from dexmani_real.runtime.operator_input import KeyboardInput
@@ -18,6 +21,25 @@ CARTESIAN_JOG_KEYS = frozenset(
 def any_jog_key_held(active_keys: Iterable[str]) -> bool:
     """Check physical jog keys even when opposite increments cancel out."""
     return not CARTESIAN_JOG_KEYS.isdisjoint(active_keys)
+
+
+def propose_cartesian_jog_pose(
+    command_pose: Pose,
+    dx: np.ndarray,
+    drpy: np.ndarray,
+    position_lower: np.ndarray,
+    position_upper: np.ndarray,
+) -> tuple[Pose, np.ndarray, bool]:
+    """Project a jog proposal without advancing the published target reference."""
+    desired_position = command_pose.p + dx
+    position = np.clip(desired_position, position_lower, position_upper)
+    rotating = bool(np.any(drpy != 0.0))
+    changed = rotating or not np.array_equal(position, command_pose.p)
+    quaternion = command_pose.q.copy()
+    if rotating:
+        delta_quaternion = Rotation.from_euler("xyz", drpy).as_quat(scalar_first=True)
+        quaternion = quat_multiply(delta_quaternion, quaternion)
+    return Pose(p=position, q=quaternion), desired_position, changed
 
 
 def compute_cartesian_jog_delta(

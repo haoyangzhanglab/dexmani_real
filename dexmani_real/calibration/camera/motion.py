@@ -8,20 +8,22 @@ from enum import Enum
 from typing import Any
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 from dexmani_real.calibration.camera.solver import CalibrationConfig, CalibrationSamples
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import IKFailureKind
-from dexmani_real.planning.kinematics.pose import quat_multiply
 from dexmani_real.robot.arm_homing import ArmHomeConfig, execute_arm_home
 from dexmani_real.robot.commands import RobotCommand, publish_command
 from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
-from dexmani_real.teleop.jog import any_jog_key_held, compute_cartesian_jog_delta
+from dexmani_real.teleop.jog import (
+    any_jog_key_held,
+    compute_cartesian_jog_delta,
+    propose_cartesian_jog_pose,
+)
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
@@ -154,10 +156,10 @@ def _log_workspace_clipping(
     return last_warning_s
 
 
-def _reject_calibration_motion(
+def _stop_calibration_motion(
     shared: RuntimeChannels, state: CalibrationLoopState, reason: str
 ) -> None:
-    """Close the rejected jog epoch and require a fresh physical key press."""
+    """Revoke invalid authority and require a fresh physical key press."""
     state.command_qpos = None
     state.command_pose = None
     if (
@@ -170,7 +172,7 @@ def _reject_calibration_motion(
         return
     if int(shared.safety_state.value) == int(SafetyState.RUNNING):
         if not revoke_motion(shared, SafetyState.ARMED):
-            set_calibration_fault(shared, "failed to stop rejected calibration motion")
+            set_calibration_fault(shared, "failed to stop calibration motion")
             return
     state.blocked_until_release = True
 
@@ -184,31 +186,30 @@ def run_calibration_motion_tick(
     state: CalibrationLoopState,
     calib_cfg: CalibrationConfig,
 ) -> None:
-    """Accumulate operator deltas in the Cartesian command target."""
+    """Propose a jog target and commit it only after successful publication."""
     if shared.stop_request.value:
-        _reject_calibration_motion(shared, state, "command admission revoked")
+        _stop_calibration_motion(shared, state, "command admission revoked")
         with shared.motion_lock:
             shared.stop_request.value = 0
+        return
+    safety_state = int(shared.safety_state.value)
+    if (
+        shared.error_state.value
+        or shared.estop_request.value
+        or not shared.is_running.value
+        or safety_state not in (int(SafetyState.ARMED), int(SafetyState.RUNNING))
+    ):
+        _stop_calibration_motion(shared, state, "unexpected calibration motion state")
+        return
     active_keys = keys.pressed_keys()
     if state.blocked_until_release:
         if not any_jog_key_held(active_keys):
             state.blocked_until_release = False
         return
-    safety_state = int(shared.safety_state.value)
-    if safety_state not in (int(SafetyState.ARMED), int(SafetyState.RUNNING)):
-        state.command_qpos = None
-        state.command_pose = None
-        set_calibration_fault(shared, "unexpected calibration motion state")
-        return
     dx, drpy = compute_cartesian_jog_delta(keys, calib_cfg.delta_pos_m, calib_cfg.delta_rpy_rad)
     moving = bool(np.any(dx != 0.0) or np.any(drpy != 0.0))
     if not moving:
-        state.command_qpos = None
-        state.command_pose = None
-        if safety_state == int(SafetyState.RUNNING):
-            if not revoke_motion(shared, SafetyState.ARMED):
-                set_calibration_fault(shared, "failed to stop calibration motion")
-                return
+        # Idle lets Mode 6 finish/hold the last published endpoint.
         idle_interval = int(runtime.keyboard_teleop.idle_interval_frames)
         if state.frame % idle_interval == 0:
             measured_pose = planner.kin.compute_eef_pose_world(state.current_qpos)
@@ -219,38 +220,30 @@ def run_calibration_motion_tick(
             )
         return
 
-    if safety_state == int(SafetyState.ARMED):
-        state.command_qpos = None
-        state.command_pose = None
-        if not begin_motion(shared):
-            set_calibration_fault(shared, "failed to enter calibration motion")
-            return
-
     epoch = int(shared.run_id.value)
-    if state.command_qpos is None:
-        state.command_qpos = state.current_qpos.copy()
-        state.command_pose = planner.kin.compute_eef_pose_world(state.current_qpos)
+    baseline_qpos = state.command_qpos
+    baseline_pose = state.command_pose
+    if baseline_qpos is None:
+        baseline_qpos = state.current_qpos.copy()
+        baseline_pose = planner.kin.compute_eef_pose_world(state.current_qpos)
     workspace_margin_m = float(runtime.keyboard_teleop.workspace_command_margin_m)
     command_low = workspace[:, 0] + workspace_margin_m
     command_high = workspace[:, 1] - workspace_margin_m
-    desired_pos = state.command_pose.p + dx
-    proposed_pos = np.clip(desired_pos, command_low, command_high)
+    proposed_pose, desired_pos, changed = propose_cartesian_jog_pose(
+        baseline_pose, dx, drpy, command_low, command_high
+    )
     state.last_boundary_warning_s = _log_workspace_clipping(
         desired_pos,
-        proposed_pos,
+        proposed_pose.p,
         state.last_boundary_warning_s,
     )
-    proposed_quat = state.command_pose.q.copy()
-    if np.any(drpy != 0.0):
-        delta_quat = Rotation.from_euler("xyz", drpy).as_quat(scalar_first=True)
-        proposed_quat = quat_multiply(delta_quat, proposed_quat)
-
-    state.command_pose = Pose(p=proposed_pos, q=proposed_quat)
+    if not changed:
+        return
 
     ik_result = planner.solve_online_ik(
-        state.command_pose,
+        proposed_pose,
         state.current_qpos,
-        state.command_qpos,
+        baseline_qpos,
     )
     if ik_result.failure_kind == IKFailureKind.INVALID_OUTPUT:
         raise RuntimeError(f"online IK technical failure: {ik_result.reason}")
@@ -259,11 +252,26 @@ def run_calibration_motion_tick(
         if now_s - state.last_ik_warning_s >= _IK_WARNING_INTERVAL_S:
             logger.warning("IK rejected target: %s", ik_result.reason or "unknown")
             state.last_ik_warning_s = now_s
-        _reject_calibration_motion(shared, state, ik_result.reason or "IK rejected")
+        # Reject this proposal without stopping the last valid firmware endpoint.
+        state.blocked_until_release = True
         return
 
+    if safety_state == int(SafetyState.ARMED):
+        with shared.motion_lock:
+            # A revoke during IK must also fence the first jog proposal.
+            if int(shared.run_id.value) != epoch:
+                state.command_qpos = None
+                state.command_pose = None
+                return
+            if not begin_motion(shared):
+                state.command_qpos = None
+                state.command_pose = None
+                set_calibration_fault(shared, "failed to enter calibration motion")
+                return
+            epoch = int(shared.run_id.value)
     q_cmd = ik_result.qpos
     if publish_command(shared, RobotCommand(epoch, q_cmd)):
+        state.command_pose = proposed_pose
         state.command_qpos = q_cmd.copy()
     else:
         state.command_qpos = None
@@ -274,6 +282,6 @@ def run_calibration_motion_tick(
         print(
             f"[f={state.frame}] samples={len(state.samples)} "
             f"eef={np.round(measured_pose.p, 3)}m "
-            f"target={np.round(proposed_pos, 3)}m",
+            f"target={np.round(proposed_pose.p, 3)}m",
             flush=True,
         )

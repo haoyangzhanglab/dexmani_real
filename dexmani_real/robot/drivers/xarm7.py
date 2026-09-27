@@ -298,6 +298,36 @@ class XArm7:
                     raise RuntimeError("home dwell interrupted by position/velocity")
                 _publish(target, q, v, t)
 
+        def _restore_mode6_and_settle(target: np.ndarray) -> None:
+            # HOME includes stability after the firmware mode-switch transient.
+            _raise_abort()
+            self.enter_mode6()
+            deadline = time.monotonic() + self.cfg.homing.target_timeout_s + self.cfg.homing.dwell_s
+            stable_since: float | None = None
+            max_error = max_velocity = float("inf")
+            while time.monotonic() < deadline:
+                _raise_abort()
+                q, v, t = self.read()
+                if self.read_live_error_code() != 0:
+                    raise RuntimeError("controller error during post-Mode6 home settle")
+                _publish(target, q, v, t)
+                max_error = float(np.max(np.abs(q - target)))
+                max_velocity = float(np.max(np.abs(v)))
+                now = time.monotonic()
+                if _converged(target, q, v, self.cfg.homing.convergence_rad):
+                    if stable_since is None:
+                        stable_since = now
+                    if now - stable_since >= self.cfg.homing.dwell_s:
+                        return
+                else:
+                    stable_since = None
+                time.sleep(self.cfg.homing.step_interval_s)
+            raise RuntimeError(
+                "post-Mode6 home settle timeout "
+                f"(max joint position error={max_error:.6f}rad, "
+                f"max joint velocity={max_velocity:.6f}rad/s)"
+            )
+
         _raise_abort()
         qpos, qvel, _tau = self.read()
 
@@ -305,7 +335,7 @@ class XArm7:
             if not _converged(final_qpos, qpos, qvel, self.cfg.homing.convergence_rad):
                 raise RuntimeError("empty home path while away from canonical home")
             _dwell(final_qpos)
-            self.enter_mode6()
+            _restore_mode6_and_settle(final_qpos)
             return
 
         if float(np.max(np.abs(qpos - waypoints[0]))) > self.cfg.homing.convergence_rad:
@@ -314,7 +344,7 @@ class XArm7:
         targets = waypoints[1:]
         if len(targets) == 0:
             _dwell(final_qpos)
-            self.enter_mode6()
+            _restore_mode6_and_settle(final_qpos)
             return
 
         self.enter_mode0()
@@ -364,7 +394,7 @@ class XArm7:
         final_error = float(np.max(np.abs(current - final_qpos)))
         if final_error > self.cfg.homing.convergence_rad:
             raise RuntimeError(f"home final error {np.rad2deg(final_error):.2f}deg")
-        self.enter_mode6()
+        _restore_mode6_and_settle(final_qpos)
 
     def emergency_stop(self) -> None:
         """Best-effort emergency stop (requests State 4 without cutting power)."""

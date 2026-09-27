@@ -4,10 +4,9 @@ import multiprocessing as mp
 import os
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
-from dexmani_real.planning import Pose, XArm7MotionPlanner
+from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_config
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.robot.arm_worker import run_arm_worker
@@ -18,7 +17,7 @@ from dexmani_real.runtime.observation import read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.safety import SafetyState, begin_motion, require_transition, revoke_motion
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
-from dexmani_real.teleop.jog import compute_cartesian_jog_delta
+from dexmani_real.teleop.jog import compute_cartesian_jog_delta, propose_cartesian_jog_pose
 from dexmani_real.utils.rate import LoopRate
 
 
@@ -97,47 +96,53 @@ def run_keyboard_experiment(runtime, *, no_hand):
             dx, drpy = compute_cartesian_jog_delta(keys, cfg.delta_pos_m, cfg.delta_rpy_rad)
             moving = np.any(dx) or np.any(drpy)
             if not moving or pressed:
-                command_qpos = None
-                command_pose = None
-                if int(shared.safety_state.value) == int(SafetyState.RUNNING):
-                    revoke_motion(shared)
-            else:
-                if int(shared.safety_state.value) == int(SafetyState.ARMED):
-                    command_qpos = None
-                    command_pose = None
-                    if not begin_motion(shared):
-                        break
-                epoch = int(shared.run_id.value)
-                measured_qpos = row.arm["qpos"][0]
-                if command_qpos is None:
-                    command_qpos = measured_qpos.copy()
-                    command_pose = planner.kin.compute_eef_pose_world(measured_qpos)
-                pos = np.clip(
-                    command_pose.p + dx,
-                    workspace[:, 0] + cfg.workspace_command_margin_m,
-                    workspace[:, 1] - cfg.workspace_command_margin_m,
-                )
-                quat = (
-                    Rotation.from_euler("xyz", drpy)
-                    * Rotation.from_quat(command_pose.q, scalar_first=True)
-                ).as_quat(scalar_first=True)
-                command_pose = Pose(p=pos, q=quat)
-                if row.hand is not None:
-                    planner.set_hand_qpos(row.hand["qpos"][0])
-                result = planner.solve_online_ik(
-                    command_pose,
-                    measured_qpos,
-                    command_qpos,
-                )
-                if result.failure_kind == IKFailureKind.INVALID_OUTPUT:
-                    raise RuntimeError(f"online IK technical failure: {result.reason}")
-                if result.success:
-                    target = result.qpos
-                    if publish_command(shared, RobotCommand(epoch, target)):
-                        command_qpos = target.copy()
-                    else:
+                # Idle keeps Mode-6 authority and its last published endpoint alive.
+                continue
+            safety_state = int(shared.safety_state.value)
+            epoch = int(shared.run_id.value)
+            measured_qpos = row.arm["qpos"][0]
+            baseline_qpos = command_qpos
+            baseline_pose = command_pose
+            if baseline_qpos is None:
+                baseline_qpos = measured_qpos.copy()
+                baseline_pose = planner.kin.compute_eef_pose_world(measured_qpos)
+            proposed_pose, _, changed = propose_cartesian_jog_pose(
+                baseline_pose,
+                dx,
+                drpy,
+                workspace[:, 0] + cfg.workspace_command_margin_m,
+                workspace[:, 1] - cfg.workspace_command_margin_m,
+            )
+            if not changed:
+                continue
+            if row.hand is not None:
+                planner.set_hand_qpos(row.hand["qpos"][0])
+            result = planner.solve_online_ik(
+                proposed_pose,
+                measured_qpos,
+                baseline_qpos,
+            )
+            if result.failure_kind == IKFailureKind.INVALID_OUTPUT:
+                raise RuntimeError(f"online IK technical failure: {result.reason}")
+            if not result.success:
+                continue
+            if safety_state == int(SafetyState.ARMED):
+                with shared.motion_lock:
+                    # A revoke during IK must also fence the first jog proposal.
+                    if int(shared.run_id.value) != epoch:
                         command_qpos = None
                         command_pose = None
+                        continue
+                    if not begin_motion(shared):
+                        break
+                    epoch = int(shared.run_id.value)
+            target = result.qpos
+            if publish_command(shared, RobotCommand(epoch, target)):
+                command_pose = proposed_pose
+                command_qpos = target.copy()
+            else:
+                command_qpos = None
+                command_pose = None
     finally:
         keys.quiesce()
         report = supervisor.shutdown(
