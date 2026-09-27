@@ -34,7 +34,7 @@ A point cloud is self-contained. Match its source camera frame only when the pol
 
 ## Research data
 
-Raw episodes are immutable experiment evidence and are never migrated or rewritten in place. New episodes use `format="dexmani.raw"`, with control rows and aligned depth in `data.h5` plus `rgb.mp4`; the capability-based reader also reads legacy v34 sidecars without modifying them. Validate known fields that are present, tolerate unknown additive fields, and let consumers require the capabilities they need. The current writer remains strict about its emitted fields.
+Current Raw episodes use `format="dexmani.raw"`, with control rows and aligned depth in `data.h5` plus `rgb.mp4`. Normal runtime/export/replay code supports only this current format; it carries no legacy Raw compatibility branches. Legacy v34 data may be converted only by the explicit offline migration tool, which must reject any episode whose old validity evidence cannot be represented losslessly. After migration, Raw is immutable experiment evidence and is not rewritten in place. Validate known fields that are present, tolerate unknown additive fields, and let consumers require the capabilities they need. The current writer remains strict about its emitted fields.
 
 Preserve measured robot state, RGB-D, current/tactile payloads, actual published absolute joint targets, physical camera/hand-mount calibration, and final `termination_reason`. New Raw has no persisted `frame_valid`, `episode_valid`, or global incremental schema version. Keep freshness, causal selection and cadence checks in runtime; do not persist per-row timestamps, raw VR, detailed status, software provenance, or transport bookkeeping.
 
@@ -50,7 +50,7 @@ Canonical Zarr uses `format="dexmani.real.canonical"` and remains a general mult
 
 Raw-to-Canonical export is whole-episode and fail-fast, with only explicit whole-episode exclusion. Do not repair, split, resample, drop bad rows or salvage partial episodes. `action` and `action_ee` describe the same final target. Core state/actions and required derived values must be finite; optional telemetry may retain NaN. `dexmani_policy` loads only selected arrays and validates their capabilities, semantics and finiteness before normalizer fitting or model construction. Canonical availability does not imply live Real availability: unsupported live modalities must fail before motion.
 
-Canonical caches, including old v15 stores, are regenerated from Raw, never migrated in place. Published field names and semantic IDs never silently change meaning: use a new descriptive representation for a true semantic change, and persist the actual recipe for derived algorithm choices. Additive fields do not invalidate consumers that do not request them. Do not introduce global schema-version migration chains or fabricate modalities that were never recorded.
+Canonical caches are regenerated from current Raw and only the current canonical format is supported. Published field names and semantic IDs never silently change meaning: use a new descriptive representation for a true semantic change, and persist the actual recipe for derived algorithm choices. Additive fields do not invalidate consumers that do not request them. Do not introduce global schema-version compatibility chains or fabricate modalities that were never recorded.
 
 ## Making changes
 
