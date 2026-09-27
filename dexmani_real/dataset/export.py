@@ -16,7 +16,6 @@ from dexmani_real.dataset.contracts import (
     CANONICAL_FORMAT,
     ProcessingConfig,
     canonical_array_specs,
-    canonical_modality_contracts,
     validate_task_name,
 )
 from dexmani_real.dataset.pointcloud import load_raw_episode_camera_model
@@ -106,7 +105,7 @@ def export_raw_to_zarr(
     if not accepted:
         raise ValueError(f"all {len(selected)} selected episodes were rejected; no Zarr written")
     staging = root = data = None
-    first_attrs = first_tails = first_contracts = None
+    first_attrs = first_tails = None
     ends, offset = [], 0
     try:
         for index, episode in enumerate(accepted):
@@ -124,8 +123,14 @@ def export_raw_to_zarr(
                     frames, processing.pointcloud.num_points, camera.height, camera.width
                 )
                 tails = {key: (shape[1:], dtype) for key, (shape, dtype) in specs.items()}
-                attrs = dict(format=CANONICAL_FORMAT, task_name=task, dt=reader.dt)
-                contracts = canonical_modality_contracts(reader, processing)
+                attrs = dict(
+                    format=CANONICAL_FORMAT,
+                    task_name=task,
+                    dt=reader.dt,
+                    depth_scale_m_per_unit=float(reader.meta["depth_scale"]),
+                    pointcloud_config=processing.pointcloud.to_dict(),
+                    fingertip_link_names=list(processing.fingertip_link_names),
+                )
                 if first_attrs is not None:
                     if task != first_attrs["task_name"] or not np.isclose(
                         reader.dt, first_attrs["dt"], rtol=0, atol=1e-12
@@ -133,17 +138,17 @@ def export_raw_to_zarr(
                         raise ValueError(
                             f"{episode.name}: one canonical store requires uniform task and dt"
                         )
+                    if attrs["depth_scale_m_per_unit"] != first_attrs["depth_scale_m_per_unit"]:
+                        raise ValueError(f"{episode.name}: depth_scale_m_per_unit must be uniform")
                     for key in specs:
-                        if tails[key] != first_tails[key] or contracts[key] != first_contracts[key]:
-                            raise ValueError(
-                                f"{episode.name}: incompatible {key} shape or semantic/recipe contract; depth scale_m_per_unit must be uniform"
-                            )
+                        if tails[key] != first_tails[key]:
+                            raise ValueError(f"{episode.name}: incompatible {key} shape or dtype")
                 row_bytes = sum(
                     int(np.prod(tail)) * dtype.itemsize for tail, dtype in tails.values()
                 )
                 chunk = min(config.chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes))
                 if root is None:
-                    first_attrs, first_tails, first_contracts = attrs, tails, contracts
+                    first_attrs, first_tails = attrs, tails
                     target.parent.mkdir(parents=True, exist_ok=True)
                     staging = Path(
                         tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
@@ -153,14 +158,13 @@ def export_raw_to_zarr(
                     data = root.create_group("data")
                     compressor = zarr.get_codec({"id": "zstd", "level": config.compression_level})
                     for key, (tail, dtype) in tails.items():
-                        array = data.create_dataset(
+                        data.create_dataset(
                             key,
                             shape=(0, *tail),
                             chunks=(chunk, *tail),
                             dtype=dtype,
                             compressor=compressor,
                         )
-                        array.attrs.update(contracts[key])
                 for key, (tail, _) in tails.items():
                     data[key].resize((offset + frames, *tail))
                 count = 0
@@ -193,6 +197,7 @@ def export_raw_to_zarr(
             accepted_episodes=[episode.name for episode in accepted],
             rejected_episodes=rejected,
             excluded_episodes=sorted(excluded),
+            processing=processing.to_dict(),
         )
         (staging / "export_report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"

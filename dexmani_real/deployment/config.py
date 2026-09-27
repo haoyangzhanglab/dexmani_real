@@ -12,10 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.dataset.contracts import (
-    CANONICAL_MODALITY_SEMANTICS,
-    FINGERTIP_KINEMATIC_MODEL,
-)
 
 _SUPPORTED_OBSERVATION_FIELDS = frozenset(
     {
@@ -57,40 +53,23 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
         )
     if "joint_state" not in names:
         raise ValueError("Real deployment requires the joint_state observation")
-    contracts = info.modality_contracts
-    if not isinstance(contracts, dict):
-        raise ValueError("Real deployment requires saved modality_contracts")
-    action_key = {"joint": "action", "eef": "action_ee"}.get(info.action_mode)
-    if action_key is None:
+    if info.action_mode not in {"joint", "eef"}:
         raise ValueError(f"unsupported Real action mode: {info.action_mode!r}")
-    for name in (names | {action_key}) - {"point_cloud"}:
-        contract = contracts.get(name)
-        if not isinstance(contract, dict):
-            raise ValueError(f"Required modality {name!r} lacks its saved training contract")
-        for key, expected in CANONICAL_MODALITY_SEMANTICS[name].items():
-            if contract.get(key) != expected:
-                raise ValueError(f"Live modality {name!r} cannot provide the saved {key}")
     if "fingertip_points" in names:
-        recipe = contracts["fingertip_points"].get("recipe", {})
-        if not isinstance(recipe, dict):
-            raise ValueError("Live fingertip_points requires a saved FK recipe")
-        links = recipe.get("fingertip_link_names")
+        links = info.fingertip_link_names
         if (
-            recipe.get("kinematic_model") != FINGERTIP_KINEMATIC_MODEL
-            or recipe.get("mount_source") != "raw_episode"
-            or not isinstance(links, list)
+            not isinstance(links, (list, tuple))
             or len(links) != 5
-            or any(not isinstance(link, str) or not link for link in links)
+            or any(not isinstance(link, str) or not link.strip() for link in links)
             or len(set(links)) != 5
         ):
-            raise ValueError("Live fingertip_points cannot provide the saved FK representation")
+            raise ValueError("Live fingertip_points requires five distinct non-empty link names")
     policy_hz = 1.0 / dt
     limiting_hz = min(runtime.arm.loop_hz, runtime.hand.loop_hz)
     if policy_hz > limiting_hz and not math.isclose(policy_hz, limiting_hz, rel_tol=1e-9):
         raise ValueError(f"Policy rate {policy_hz:g} Hz exceeds worker rate {limiting_hz:g} Hz")
     if "point_cloud" in names:
-        cloud = contracts.get("point_cloud")
-        recipe = cloud.get("recipe") if isinstance(cloud, dict) else None
+        recipe = info.pointcloud_config
         if not isinstance(recipe, dict):
             raise ValueError("Live point_cloud requires saved numerical parameters")
         return PointCloudConfig.from_dict(recipe)

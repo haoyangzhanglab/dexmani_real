@@ -10,7 +10,6 @@ ARM_DOF = 7
 HAND_DOF = 12
 HAND_FINGER_COUNT = 5
 HAND_FINGER_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
-HAND_FINGER_ORDER_ID = "thumb_index_mid_ring_pinky"
 XHAND_TACTILE_SENSOR_FINGER_IDS: tuple[int, ...] = (2, 5, 7, 9, 11)
 XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID = {
     finger_id: index for index, finger_id in enumerate(XHAND_TACTILE_SENSOR_FINGER_IDS)
@@ -33,17 +32,6 @@ if (
     raise RuntimeError("XHand finger and tactile sensor orders must match five fingers")
 TACTILE_POINTS_PER_FINGER = 120
 TACTILE_AXIS_COUNT = 3
-
-# XHand contact_force is per-finger aggregate calc_force; tactile_force is dense
-# raw_force. Both use the SDK-native scale (SI Newton unverified) and per-finger
-# sensor axes (taxel geometry unverified). Tactile flags, not magnitude, give validity.
-CONTACT_FORCE_REPRESENTATION = "xhand_sdk_calc_force_fx_fy_fz_bias_corrected"
-TACTILE_FORCE_REPRESENTATION = "xhand_sdk_raw_force_fx_fy_fz_bias_corrected"
-TACTILE_FORCE_SENSOR_ORDER = "xhand_sdk_sensor_data_order"
-TACTILE_FORCE_POINT_ORDER = "xhand_sdk_sensor_data_raw_force_order"
-TACTILE_FORCE_AXIS_LABELS = "fx_fy_fz"
-XHAND_SDK_NATIVE_UNKNOWN_SI_UNIT = "xhand_sdk_native_unknown_si"
-XHAND_SENSOR_NATIVE_AXES_FRAME = "xhand_sensor_native_axes_per_finger"
 
 ARM_JOINT_SHAPE = (ARM_DOF,)
 HAND_JOINT_SHAPE = (HAND_DOF,)
@@ -72,8 +60,6 @@ XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
 )
 if len(XHAND_SDK_JOINT_NAMES) != HAND_DOF or len(set(XHAND_SDK_JOINT_NAMES)) != HAND_DOF:
     raise RuntimeError("XHand SDK joint names must be unique and match HAND_DOF")
-
-ROBOT_JOINT_NAMES = (*XARM7_JOINT_NAMES, *XHAND_SDK_JOINT_NAMES)
 
 XHAND_MODEL_DIR = ASSET_DIR / "robots" / "xhand"
 # Arm planning model with the hand geometry fixed in its open/home posture.

@@ -105,17 +105,19 @@ START 必须用当前相机 serial 解析完整 eye-to-hand 标定，验证 alig
 
 Raw 先写入 `.tmp_<episode_name>`；writer 关闭文件并结构验证后，经 fsync 和原子重命名发布。失败时仅清理本次拥有的 staging；无法确认释放或清理失败时保留 ownership 并拒绝新 START，原始错误不被覆盖。残留 staging 只警告，需人工检查，不自动恢复或删除。
 
-Canonical Zarr 使用 `format="dexmani.real.canonical"`，保持完整多模态缓存：`joint_state`、`arm_qvel`、`arm_effort`、`hand_current`、`eef_pose`、`fingertip_points`、`contact_force`、`tactile_force`、`rgb`、`depth`、`point_cloud`、`action`、`action_ee`。Root attrs 只保存 format/task/dt；单位、坐标系、顺序和 semantic ID 位于各数组 attrs，派生模态保存实际 recipe。一个 Zarr 的 Z16 depth 必须使用唯一 `scale_m_per_unit`，不混合不同深度尺度。
+Canonical Zarr 使用 `format="dexmani.real.canonical"`，保持完整多模态缓存：`joint_state`、`arm_qvel`、`arm_effort`、`hand_current`、`eef_pose`、`fingertip_points`、`contact_force`、`tactile_force`、`rgb`、`depth`、`point_cloud`、`action`、`action_ee`。Root attrs 只保存 `format`、`task_name`、`dt`、`depth_scale_m_per_unit`、完整 `pointcloud_config` 和五个 `fingertip_link_names`；数组不保存重复的语义字典。一个 Zarr 的 aligned Z16 depth 使用唯一深度尺度，乘以 `depth_scale_m_per_unit` 得到米，0 表示无深度；RGB 为 uint8 RGB。
 
-`action` 与 `action_ee` 来自同一个最终发布目标，后者由最终机械臂关节目标 FK 得到。Fingertip recipe 保存模型身份、link 列表及 Raw mount 来源，不记录工作站绝对 URDF 路径。Point-cloud attrs 保存数值 recipe 和离线使用的 audited table plane；保存到 policy runtime 的契约不携带历史桌面标定，部署仍使用当前 Real 标定。
+`joint_state` / `action` 为 7 个 xArm 关节加 12 个 XHand SDK 顺序关节，单位 rad，顺序为 xArm `joint1`–`joint7`，随后是 [robot/model.py](dexmani_real/robot/model.py) 的 `XHAND_SDK_JOINT_NAMES`。`arm_qvel` 为 rad/s，`arm_effort` 为未验证 SI 单位的 SDK 原值，`hand_current` 为 mA。`eef_pose` 是 xArm base 下的位置米数加 rot6d（旋转矩阵前两列逐列排列）。`action` 为当前控制步实际发布的绝对关节目标；`action_ee` 为同一最终目标 FK 的 EEF position(3)+rot6d(6)+hand target(12)。观测取本控制步动作前最新的因果样本。
 
-点云训练和部署只传递数值 recipe，不匹配 semantic ID 或 derivation 说明；保留 shape/dtype、有限性、点数及数值参数合法性检查。实时与离线调用同一个点云处理函数，部署恢复训练参数，其他模态仍检查其语义契约。
+`fingertip_points` 为 xArm base 下的米制位置，按保存的五个 link 顺序，默认 thumb/index/middle/ring/pinky；离线使用各 Raw episode 的 hand mount，部署使用当前安装参数。触觉按 thumb/index/middle/ring/pinky，对应 SDK sensor IDs 2/5/7/9/11；轴为传感器原生 fx/fy/fz，dense 每指 120 点保留 SDK raw-force 顺序。触觉数值已去软件 bias，不再缩放，SI 力单位未验证。`point_cloud` 为 xArm base 米制 XYZ + [0,1] RGB，实时与离线调用同一个数值处理函数。
+
+Point-cloud deployment 恢复完整训练数值参数，结合当前相机和桌面标定。`export_report.json` 的 `processing` 保存 resolved processing snapshot，包括离线 audited table plane；Policy runtime 不读取该报告或历史标定。训练到部署仅传递 `dt`，以及实际消费点云/指尖时所需的完整点云数值配置/link 选择。
 
 Raw-to-Canonical 在写入前预检所有候选 episode：空 episode、必需文件/字段缺失、Raw 数据形状/dtype 或必要元数据错误，以及任一必需浮点数组中的 NaN/Inf，均整条拒绝并跳过，包括触觉、电流和 effort 缺测。日志报告拒绝原因和首个异常行（从 0 开始）；输出目录中的 `export_report.json` 保存接受、自动拒绝和显式排除清单。全部被拒绝时不生成 Zarr。Raw 中的 NaN 仍保留为缺测证据，不修改原数据；不补值、切分、重采样或删帧。
 
-不支持的 Raw 格式/相机畸变模型、非 teleop 来源、跨 episode 契约不兼容、I/O 错误，以及 RGB 解码、FK、点云生成和 Zarr 写入错误仍终止整个导出并清理 staging。导出要求所有浮点输出有限，不使用动作幅度、触觉大小或任务成败等经验阈值筛选。`dexmani_policy` 继续只加载选中的数组，并在 normalizer 拟合和模型构造前拒绝其中的 NaN/Inf。
+不支持的 Raw 格式/相机畸变模型、非 teleop 来源、跨 episode task/dt/depth scale/shape/dtype 不兼容、I/O 错误，以及 RGB 解码、FK、点云生成和 Zarr 写入错误仍终止整个导出并清理 staging。导出要求所有浮点输出有限，不使用动作幅度、触觉大小或任务成败等经验阈值筛选。`dexmani_policy` 的通用 Dataset 只加载选中的数组；canonical 浮点训练数据的有限性由严格导出负责。
 
-导出默认使用项目处理参数和当前桌面标定 `dexmani_real/calibration/state/table_plane.json`，将实际使用的平面参数保存到点云 export provenance。可用 `--config export.yaml` 覆盖处理参数；指定其他桌面平面时，在 YAML 中设置 `environment.table.plane_abcd` 和 `plane_path: null`，或用 `pointcloud.remove_table: false` 关闭桌面剔除。启用桌面剔除时，标定文件缺失或无效会使导出失败。
+导出默认使用项目处理参数和当前桌面标定 `dexmani_real/calibration/state/table_plane.json`，将实际使用的平面参数保存到 `export_report.json` 的 processing snapshot。可用 `--config export.yaml` 覆盖处理参数；指定其他桌面平面时，在 YAML 中设置 `environment.table.plane_abcd` 和 `plane_path: null`，或用 `pointcloud.remove_table: false` 关闭桌面剔除。启用桌面剔除时，标定文件缺失或无效会使导出失败。
 
 ```bash
 python examples/export_policy_zarr.py episodes/<task>
@@ -125,7 +127,7 @@ python examples/export_policy_zarr.py episodes/<task> --output datasets/<task>_c
 
 导出通过 owned staging 完成转换与校验，失败不会留下已发布的部分 Zarr。拒绝覆盖已有目标；目标不能位于输入、仓库 `episodes/`、`episodes_processed/`、`rollouts/` 或已有 Zarr 内部。
 
-Canonical 是可重建派生缓存，只支持当前 `format="dexmani.real.canonical"`。字段名和 semantic ID 的含义不可静默改变；不同表示使用新的描述性身份，算法选择记录实际 recipe。新增字段不影响不请求它的消费者。旧缓存直接从当前 Raw 重新导出，不维护格式兼容分支。
+Canonical 是可重建派生缓存，只支持当前 `format="dexmani.real.canonical"`。字段含义由生成/消费代码及本文说明定义，不维护额外语义 ABI；数值处理选择保存在 root attrs。新增字段不影响不请求它的消费者。旧缓存直接从当前 Raw 重新导出，不维护格式兼容分支。
 
 ## Policy evaluation
 
@@ -140,7 +142,7 @@ conda run --no-capture-output -n real_robot python examples/run_policy.py <polic
 
 `--config experiment.yaml` 只设置当前 Real 硬件与运行参数；Policy 始终读取所选实验目录里的 `config.yaml`。未显式覆盖的 weights/NFE，best 使用 selection record，latest/文件名使用保存的 `eval.use_ema` / `eval.inference_steps`。
 
-Policy worker 持有 model / CUDA，使用同步 inference 和本地 action chunk。推理期间动作权限已失效时，丢弃返回的旧动作。Pointcloud-only policy 不依赖源 RGB-D 帧仍驻留；同时输入 RGB 和点云时才匹配源帧。保存的 `real_runtime.modality_contracts` 记录训练所用表示；指尖 FK 恢复保存的 link 列表并使用当前安装参数。Canonical 中存在某个模态不等于 live Real 已支持：当前未实现的 live 模态会在模型/硬件启动前明确拒绝。Real deployment 只支持由当前 canonical contract 训练并保存完整 `modality_contracts` 的实验。
+Policy worker 持有 model / CUDA，使用同步 inference 和本地 action chunk。推理期间动作权限已失效时，丢弃返回的旧动作。Pointcloud-only policy 不依赖源 RGB-D 帧仍驻留；同时输入 RGB 和点云时才匹配源帧。保存的 `real_runtime` 仅包含 `dt`，以及按输入模态需要保存的 `pointcloud` / `fingertip_link_names`；指尖 FK 恢复保存的 link 列表并使用当前安装参数。Canonical 中存在某个模态不等于 live Real 已支持：当前未实现的 live 模态会在模型/硬件启动前明确拒绝。Real deployment 要求当前 canonical 训练保存的数值 metadata；simulation config 不保存 `real_runtime`，会在 Real preflight 被拒绝。
 
 操作顺序为 H 回到初始姿态、布置场景、B 开始、S 停止；Q 退出，ESC 急停。HOME 完成后需要新的 B 才能开始。B 每次只尝试一次：检查新鲜 arm/hand HOME 状态与完整 padded observation，recorder START 后再次检查，失败则丢弃准备中的录制并等待新的 B；HOME 阻塞期间 S/Q 仍会立即撤销动作权限。`--num-episodes` 按实际开始并结束的 episode 计数，录制失败的 episode 也计入预算。
 

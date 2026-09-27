@@ -25,7 +25,7 @@ def build_fingertip_runtime(policy_info: Any, runtime: Any):
         return make_arm_fk(), None, None
     hand_fk = HandKinematics(
         str(XHAND_RIGHT_URDF_PATH),
-        list(policy_info.modality_contracts["fingertip_points"]["recipe"]["fingertip_link_names"]),
+        list(policy_info.fingertip_link_names),
     )
     if not hand_fk.is_ready():
         raise RuntimeError("fingertip FK startup failed")
