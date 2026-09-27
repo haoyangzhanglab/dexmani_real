@@ -63,7 +63,7 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
     action_key = {"joint": "action", "eef": "action_ee"}.get(info.action_mode)
     if action_key is None:
         raise ValueError(f"unsupported Real action mode: {info.action_mode!r}")
-    for name in names | {action_key}:
+    for name in (names | {action_key}) - {"point_cloud"}:
         contract = contracts.get(name)
         if not isinstance(contract, dict):
             raise ValueError(f"Required modality {name!r} lacks its saved training contract")
@@ -89,9 +89,10 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
     if policy_hz > limiting_hz and not math.isclose(policy_hz, limiting_hz, rel_tol=1e-9):
         raise ValueError(f"Policy rate {policy_hz:g} Hz exceeds worker rate {limiting_hz:g} Hz")
     if "point_cloud" in names:
-        recipe = contracts["point_cloud"].get("recipe")
-        if not isinstance(recipe, dict) or set(recipe) != set(PointCloudConfig().to_dict()):
-            raise ValueError("Live point_cloud requires a complete saved numerical recipe")
+        cloud = contracts.get("point_cloud")
+        recipe = cloud.get("recipe") if isinstance(cloud, dict) else None
+        if not isinstance(recipe, dict):
+            raise ValueError("Live point_cloud requires saved numerical parameters")
         return PointCloudConfig.from_dict(recipe)
     return None
 

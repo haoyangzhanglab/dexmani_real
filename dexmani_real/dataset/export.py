@@ -1,7 +1,8 @@
-"""Fail-fast whole-episode export to an atomically published canonical cache."""
+"""Preflight Raw episodes, then atomically export the accepted episodes in full."""
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import tempfile
@@ -24,7 +25,7 @@ from dexmani_real.dataset.processing import (
     iter_canonical_blocks,
     validate_episode,
 )
-from dexmani_real.recording.storage.reader import EpisodeReader
+from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
 from dexmani_real.utils.atomic_io import target_is_occupied
 
 logger = logging.getLogger(__name__)
@@ -62,10 +63,10 @@ def export_raw_to_zarr(
     exclude: tuple[str, ...] = (),
     progress_callback=None,
 ) -> dict:
-    """Publish every selected episode in full or fail without a partial output.
+    """Reject incomplete Raw episodes before writing; publish accepted episodes in full.
 
-    Explicit exclusions are names, never edits to Raw evidence. Unexpected
-    structural/semantic failures abort the owned staging instead of salvaging rows.
+    Only known data defects are skipped. I/O, compatibility and conversion failures
+    abort the export. Raw evidence is never edited.
     """
     config = config or CanonicalExportConfig()
     if not isinstance(processing, ProcessingConfig):
@@ -87,15 +88,32 @@ def export_raw_to_zarr(
     selected = [ep for ep in episodes if ep.name not in excluded]
     if not selected:
         raise ValueError("export has no selected episodes")
+    accepted, rejected = [], {}
+    for episode in selected:
+        try:
+            for name in ("data.h5", "rgb.mp4"):
+                try:
+                    (episode / name).stat()
+                except FileNotFoundError as exc:
+                    raise RawDataError(f"missing required file: {name}") from exc
+            with EpisodeReader(episode) as reader:
+                validate_episode(reader)
+        except RawDataError as exc:
+            rejected[episode.name] = str(exc)
+            logger.warning("Rejected %s: %s", episode.name, exc)
+        else:
+            accepted.append(episode)
+    if not accepted:
+        raise ValueError(f"all {len(selected)} selected episodes were rejected; no Zarr written")
     staging = root = data = None
     first_attrs = first_tails = first_contracts = None
     ends, offset = [], 0
     try:
-        for index, episode in enumerate(selected):
+        for index, episode in enumerate(accepted):
             if progress_callback:
-                progress_callback(index, len(selected))
+                progress_callback(index, len(accepted))
             with EpisodeReader(episode) as reader:
-                frames = validate_episode(reader)
+                frames = reader.num_frames
                 task = validate_task_name(reader.meta["task_label"])
                 if config.expected_task_name is not None and task != config.expected_task_name:
                     raise ValueError(
@@ -163,13 +181,7 @@ def export_raw_to_zarr(
         root.create_group("meta").create_dataset(
             "episode_ends", data=np.asarray(ends, dtype=np.int64)
         )
-        if target_is_occupied(target):
-            raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {target}")
-        staging.rename(target)
-        staging = None
-        if progress_callback:
-            progress_callback(len(selected), len(selected))
-        return dict(
+        report = dict(
             input_root=str(source),
             output_path=str(target),
             task_name=first_attrs["task_name"],
@@ -178,8 +190,20 @@ def export_raw_to_zarr(
             total_frames=offset,
             episode_ends=ends,
             dataset_keys=sorted(first_tails),
+            accepted_episodes=[episode.name for episode in accepted],
+            rejected_episodes=rejected,
             excluded_episodes=sorted(excluded),
         )
+        (staging / "export_report.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        if target_is_occupied(target):
+            raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {target}")
+        staging.rename(target)
+        staging = None
+        if progress_callback:
+            progress_callback(len(accepted), len(accepted))
+        return report
     except (ValueError, RuntimeError, OSError, KeyError) as exc:
         raise ValueError(f"{episode.name}: canonical export failed: {exc}") from exc
     finally:

@@ -18,6 +18,8 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
+from dexmani_real.config.environment import TableCollisionConfig
+from dexmani_real.config.experiment import resolve_table_plane
 from dexmani_real.config.hardware import HandParams
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.dataset.pointcloud import (
@@ -432,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
         "--pointcloud-num-points",
         type=int,
         default=None,
-        help="Override the no-table point-cloud count used for this offline view.",
+        help="Override the point-cloud count used for this offline view.",
     )
     args = parser.parse_args(argv)
     if args.max_frames is not None and args.max_frames <= 0:
@@ -449,10 +451,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     pointcloud_config = None
+    table_plane_abcd = None
     if args.point_cloud:
-        # Raw stores no historical table plane. Keep table removal disabled
-        # rather than reading today's runtime calibration for an offline episode.
-        pointcloud_config = PointCloudConfig(remove_table=False)
+        # Viewing assumes the table setup still matches the current calibration;
+        # camera geometry continues to come from the recorded Raw metadata.
+        pointcloud_config = PointCloudConfig()
+        table_plane_abcd = resolve_table_plane(TableCollisionConfig())
+        logger.info("Using current calibrated table plane: %s", table_plane_abcd)
         if args.pointcloud_num_points is not None:
             pointcloud_config = replace(pointcloud_config, num_points=args.pointcloud_num_points)
 
@@ -461,6 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         max_frames=args.max_frames,
         point_cloud=args.point_cloud,
         pointcloud_config=pointcloud_config,
+        table_plane_abcd=table_plane_abcd,
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.num_steps)

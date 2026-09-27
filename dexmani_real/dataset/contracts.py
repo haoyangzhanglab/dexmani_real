@@ -128,9 +128,6 @@ def canonical_array_specs(
 
 
 CANONICAL_FORMAT = "dexmani.real.canonical"
-OPTIONAL_TELEMETRY = frozenset(
-    {"arm_qvel", "arm_effort", "hand_current", "contact_force", "tactile_force"}
-)
 FINGERTIP_KINEMATIC_MODEL = "xarm7_xhand_right"
 
 # These facts cannot be inferred from array shape/dtype. Field identities keep

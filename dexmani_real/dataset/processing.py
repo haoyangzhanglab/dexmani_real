@@ -7,7 +7,6 @@ from pathlib import Path
 import numpy as np
 
 from dexmani_real.dataset.contracts import (
-    OPTIONAL_TELEMETRY,
     ProcessingConfig,
     validate_task_name,
 )
@@ -22,18 +21,17 @@ from dexmani_real.planning.kinematics.arm_fk import (
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.planning.kinematics.pose import validate_canonical_rot6d
-from dexmani_real.recording.storage.reader import EpisodeReader
+from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
 from dexmani_real.recording.storage.schema import DATASET_SPECS
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
 
 def validate_episode(reader: EpisodeReader) -> int:
     """Admit every row of a complete teleop episode, or reject the whole episode."""
-    source = reader
     meta = reader.meta
     frames = reader.num_frames
     if frames <= 0:
-        raise ValueError("episode contains no rows")
+        raise RawDataError("episode contains no rows")
     task_label = meta["task_label"]
     if isinstance(task_label, bytes):
         task_label = task_label.decode("utf-8")
@@ -45,9 +43,18 @@ def validate_episode(reader: EpisodeReader) -> int:
         raise ValueError(f"training requires teleop collection_source, got {collection_source!r}")
     reader.require_fields(*DATASET_SPECS, "rgb", "depth")
     reader.require_metadata("handbase_position_eef_m", "handbase_quat_eef_wxyz")
-    for name in ("arm_qpos", "hand_qpos", "action_arm_joint_target", "action_hand_joint_target"):
-        if not np.isfinite(source[name][:]).all():
-            raise ValueError(f"{name}: non-finite core values")
+    errors = []
+    for name, spec in DATASET_SPECS.items():
+        if not np.issubdtype(spec.dtype, np.floating):
+            continue
+        for start in range(0, frames, 256):
+            values = reader[name][start : start + 256]
+            bad_rows = np.flatnonzero(~np.isfinite(values).reshape(len(values), -1).all(axis=1))
+            if bad_rows.size:
+                errors.append(f"{name}: NaN/Inf at row {start + int(bad_rows[0])} (0-based)")
+                break
+    if errors:
+        raise RawDataError("; ".join(errors))
     return frames
 
 
@@ -144,12 +151,7 @@ def iter_canonical_blocks(reader: EpisodeReader, config: ProcessingConfig, *, ch
         )
         for key, value in block.items():
             if np.issubdtype(value.dtype, np.floating):
-                invalid = (
-                    np.isinf(value).any()
-                    if key in OPTIONAL_TELEMETRY
-                    else not np.isfinite(value).all()
-                )
-                if invalid:
+                if not np.isfinite(value).all():
                     raise ValueError(f"{key}: unsupported non-finite transformed values")
         validate_canonical_rot6d(block["action_ee"][:, 3:9], label="action_ee")
         validate_canonical_rot6d(block["eef_pose"][:, 3:9], label="eef_pose")

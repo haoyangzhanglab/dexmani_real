@@ -259,10 +259,18 @@ def _table_height_hysteresis_keep_mask(
     if rows.shape != columns.shape or rows.shape != signed_height_m.shape:
         raise ValueError("rows, columns, and signed heights must have equal shape")
 
-    # The >core mask is normally sparse over a tabletop. One 8-connected label
-    # pass is linear in image size and avoids iterative morphology. Requiring
-    # several high seed pixels prevents an isolated depth spike from preserving
-    # an otherwise table-like residual component.
+    # Scattered depth spikes must not jointly preserve a broad table residual.
+    # Require a coherent high patch before retaining its connected low surfaces.
+    seed_image = np.zeros(valid.shape, dtype=bool)
+    object_seeds = signed_height_m >= object_seed_height_m
+    seed_image[rows[object_seeds], columns[object_seeds]] = True
+    seed_labels, seed_count = label_connected_components(seed_image, structure=_KERNEL_3X3)
+    seed_sizes = np.bincount(seed_labels[seed_image], minlength=seed_count + 1)
+    reliable_seed = seed_sizes >= object_seed_min_pixels
+    reliable_seed[0] = False
+    if not np.any(reliable_seed):
+        return np.zeros(valid.shape, dtype=bool)
+
     above_core = signed_height_m > core_height_m
     above_core_image = np.zeros(valid.shape, dtype=bool)
     above_core_image[rows[above_core], columns[above_core]] = True
@@ -270,19 +278,10 @@ def _table_height_hysteresis_keep_mask(
         above_core_image,
         structure=_KERNEL_3X3,
     )
-    if component_count == 0:
-        return np.zeros(valid.shape, dtype=bool)
-
-    object_seeds = signed_height_m >= object_seed_height_m
-    valid_labels = component_labels[rows, columns]
-    seed_labels = valid_labels[object_seeds]
-    seed_counts = np.bincount(seed_labels, minlength=component_count + 1)
-    keep_component = seed_counts >= object_seed_min_pixels
+    keep_component = np.zeros(component_count + 1, dtype=bool)
+    keep_component[component_labels[reliable_seed[seed_labels]]] = True
     keep_component[0] = False
-
-    keep = np.zeros(valid.shape, dtype=bool)
-    keep[rows, columns] = keep_component[valid_labels]
-    return keep
+    return keep_component[component_labels]
 
 
 def _table_keep_mask(

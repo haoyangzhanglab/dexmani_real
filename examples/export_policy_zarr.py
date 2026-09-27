@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Usage: python examples/export_policy_zarr.py episodes/<task_name> --config export.yaml
+"""Usage: python examples/export_policy_zarr.py episodes/<task_name>
 
 Exports complete Raw episodes to an immutable canonical Zarr generation.
 """
@@ -17,7 +17,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 import yaml
 from tqdm import tqdm
 
-from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.config.experiment import resolve_experiment_config, resolve_table_plane
 from dexmani_real.dataset.contracts import ProcessingConfig, validate_task_name
 from dexmani_real.dataset.export import (
     CanonicalExportConfig,
@@ -56,8 +56,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=Path,
-        required=True,
-        help="Explicit processing YAML; table removal requires an inline audited table plane.",
+        default=None,
+        help="Optional processing YAML; defaults to project settings and current table calibration.",
     )
     parser.add_argument(
         "--exclude",
@@ -121,35 +121,14 @@ def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
     return Path("datasets") / f"{task_name}.zarr", task_name
 
 
-def _load_processing_config(path: Path) -> ProcessingConfig:
-    """Resolve export parameters without reading today's table calibration."""
-    if path.suffix.lower() not in {".yaml", ".yml"}:
-        raise ValueError("export config must use a .yaml or .yml suffix")
-    with path.open(encoding="utf-8") as stream:
-        data = yaml.safe_load(stream)
-    if not isinstance(data, dict) or not isinstance(data.get("pointcloud", {}), dict):
-        raise ValueError("export YAML and its pointcloud section must be mappings")
-    remove_table = data.get("pointcloud", {}).get("remove_table", True)
-    if type(remove_table) is not bool:
-        raise ValueError("pointcloud.remove_table must be boolean")
-    plane = None
-    if remove_table:
-        environment = data.get("environment", {})
-        table = environment.get("table", {}) if isinstance(environment, dict) else {}
-        if (
-            not isinstance(table, dict)
-            or "plane_abcd" not in table
-            or "plane_path" not in table
-            or table["plane_path"] is not None
-        ):
-            raise ValueError(
-                "table removal requires explicit environment.table.plane_abcd and "
-                "plane_path: null; use pointcloud.remove_table: false when unproven"
-            )
-        plane = table["plane_abcd"]
+def _load_processing_config(path: Path | None) -> ProcessingConfig:
+    """Snapshot the resolved table plane once for processing and export provenance."""
     runtime = resolve_experiment_config(
-        data=data,
+        yaml_path=path,
         cli_overrides={"environment.table.enabled": False},
+    )
+    plane = (
+        resolve_table_plane(runtime.environment.table) if runtime.pointcloud.remove_table else None
     )
     return ProcessingConfig.from_runtime(runtime, table_plane_abcd=plane)
 
@@ -225,6 +204,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         progress.close()
     print(
         f"Exported {report['episode_count']} episode(s), {report['total_frames']} frames.",
+        file=sys.stderr,
+    )
+    print(
+        f"Automatically rejected {len(report['rejected_episodes'])} episode(s).",
         file=sys.stderr,
     )
     print(

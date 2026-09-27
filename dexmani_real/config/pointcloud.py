@@ -13,12 +13,12 @@ from typing import Any
 import numpy as np
 
 # Runtime log/snapshot labels; numerical configuration defines preprocessing.
-POINT_CLOUD_POLICY_ID = "depth_to_color_orthogonal_edge_table_voxel_radius_graph_v9"
+POINT_CLOUD_POLICY_ID = "depth_to_color_orthogonal_edge_table_coherent_seed_voxel_radius_graph"
 POINT_CLOUD_COLOR_SOURCE = "mean_rgb_of_aligned_depth_pixels_per_voxel"
 POINT_CLOUD_SAMPLING = "deterministic_coarse_voxel_stratified_hash_or_cyclic_pad"
 POINT_CLOUD_TRANSFORM = (
     "depth_gate_and_cardinal_edge_support;depth_to_color_deprojection;"
-    "table_plane_height_hysteresis_crop_in_color_frame_before_deprojection;"
+    "table_plane_coherent_seed_height_hysteresis_crop_in_color_frame_before_deprojection;"
     "xarm_base_transform;workspace_crop;mean_voxel_xyz_and_rgb;"
     "single_radius_graph_density_and_component_outlier;spatial_candidate_cap;"
     "coarse_voxel_stratified_hash_or_cyclic_pad"
@@ -41,11 +41,13 @@ class PointCloudConfig:
     # intentionally treated as unreliable depth rather than preserved noise.
     edge_support_min_neighbors: int = 5
     # Pixels at or below the core height are unambiguously table. Components
-    # above the core are preserved down to that height only when enough pixels
-    # exceed the object-seed height. This removes low table residual islands
-    # without dilating the table mask into object boundaries.
+    # above the core are preserved down to that height only when connected to
+    # a sufficiently large 8-connected patch above the object-seed height.
+    # Scattered high noise pixels cannot preserve a low table residual island.
+    # Keep seeds above the broad 7--13 mm depth residuals seen on distant table
+    # surfaces, while retaining the lower core threshold for connected object bases.
     table_core_height_m: float = 0.007
-    table_object_seed_height_m: float = 0.013
+    table_object_seed_height_m: float = 0.016
     table_object_seed_min_pixels: int = 4
     workspace: tuple[float, float, float, float, float, float] = (
         0.0,
