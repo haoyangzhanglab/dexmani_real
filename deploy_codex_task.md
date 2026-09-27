@@ -212,74 +212,59 @@ Current physical calibration remains Real-owned at runtime.
 
 Replace the current broad deployment_data_semantics snapshot with this minimal extraction.
 
-## 6. Keep the training checkpoint simple
+## 6. Keep the training checkpoint focused
 
-Do not design another self-contained deployment checkpoint format.
+Do not redesign the training checkpoint format merely for deployment simplification.
 
-The normal training checkpoint should contain only training state and model states.
+The existing checkpoint container may remain close to its current structure if that is the smallest reliable change. Old checkpoint compatibility is explicitly out of scope, so a breaking cleanup is allowed, but a new format/version is not a goal by itself.
 
-A reasonable clean payload is:
+The normal training checkpoint should own training state and model states, for example:
 
-    {
-        "_format": "dexmani.train.v1",
-        "state": {
-            "epoch": ...,
-            "global_step": ...,
-            "next_micro_step": ...,
-            "ema_updater_step": ...,
-            "ema_decay": ...,
-            "rng_states": ...,
-            "resume_facts": {
-                "dataset_length": ...,
-                "batches_per_epoch": ...,
-                "world_size": ...
-            }
-        },
-        "weights": {
-            "model": ...,
-            "ema_model": ...,
-            "optimizer": ...,
-            "scheduler": ...
-        }
-    }
+    state:
+      epoch
+      global_step
+      next_micro_step
+      EMA updater state
+      RNG / resume-only facts
 
-The exact container may stay close to current CheckpointStore if that yields a smaller diff.
+    weights:
+      model
+      ema_model
+      optimizer
+      scheduler
 
-Delete obsolete checkpoint fields that only existed for the old contract path, including monitor if no real caller needs it.
+Delete fields only when they are genuinely obsolete after the deployment artifact path is removed.
 
-Do not copy the saved experiment config into every checkpoint.
+In particular:
 
-Do not copy Real runtime facts into every checkpoint.
+- do not copy the saved experiment config into every checkpoint;
+- do not copy Real runtime facts into every checkpoint;
+- do not add checkpoint inference metadata;
+- do not require parent-side weights_only/meta checkpoint inspection;
+- do not rename/restructure checkpoint fields unless the resulting implementation is actually simpler.
 
-Do not require parent-side weights_only checkpoint inspection.
+The parent Real process should inspect saved config.yaml; only the policy child loads the checkpoint.
 
-The parent Real process should inspect config.yaml; only the policy child loads the checkpoint.
+Because old checkpoints are explicitly unsupported, old-format rejection may stay simple. Do not implement migration.
 
-Because old checkpoints are explicitly unsupported, reject old formats with one short clear error. Do not implement migration.
+## 7. Do not broaden this task into a training-resume rewrite
 
-## 7. Simplify exact training resume without duplicating inference contracts
+Exact training resume may remain strict and may keep a dedicated training-only resume contract/facts if that is the safest and smallest implementation.
 
-Exact training resume may remain strict, but it must not create another persisted semantic model contract.
+The deployment refactor only requires that inference no longer depends on training-resume validation.
 
-Remove:
+Required cleanup:
 
-- build_agent_contract;
-- inference normalization contract parsing from checkpoint restore;
-- checkpoint-owned agent_config duplication when it already exists in saved experiment config;
-- deployment_data_semantics from resume contract.
+- remove deployment_data_semantics from the training resume contract once real_runtime in saved config replaces it;
+- stop using resume-contract agent/data/normalization semantics to construct or validate inference;
+- stop calling validate_resume_contract from offline or Real inference;
+- remove build_agent_contract or other resume helpers only if they become genuinely unused or if a small local simplification is obvious.
 
-Prefer strict resume based on:
+Do not rewrite DDP resume, loader cursor restoration, optimizer/scheduler resume, or RNG restoration merely to eliminate training-only duplication.
 
-1. saved experiment config.yaml versus current resolved resume configuration for resume-relevant sections;
-2. small checkpoint resume_facts for values only known after dataset/loader construction;
-3. strict model/EMA/optimizer/scheduler state loading;
-4. exact RNG restoration.
-
-Keep comparison code direct. A small helper selecting resume-relevant config sections is acceptable.
+Training resume strictness should remain training-owned. Inference should use saved config.yaml plus strict model state restoration.
 
 Do not build a schema registry or migration graph.
-
-Training resume strictness must never be invoked by inference.
 
 ## 8. One inference loader for offline and Real evaluation
 
