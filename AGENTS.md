@@ -1,196 +1,181 @@
-# AGENTS.md — DexMani Real 协作约定
+# AGENTS.md
 
-本文面向在本仓库中工作的代码代理。默认使用**中文**进行分析、计划、文档和结果说明；代码标识符、API 名称以及必要的机器人学 / 深度学习术语保留英文。
+DexMani Real 是个人 PhD 真实机器人灵巧操作研究仓库。本文定义代码代理在本仓库中的长期工作约束。
 
-DexMani Real 是个人 PhD 灵巧操作研究仓库。工作的目标是让真实机器人实验更安全、更可信、更容易迭代，而不是把仓库扩展成通用机器人平台。
+默认使用**中文**进行分析、计划、文档和结果说明；代码标识符与必要技术术语保留英文。
 
-## 1. 决策优先级
+## Scope
 
-遇到设计取舍时，按以下顺序判断：
+`dexmani_real` 负责：
 
-1. **真实硬件安全**
-2. **实验正确性与科学可信度**
-3. **数据可追溯与结果可复现**
-4. **研究迭代效率**
-5. **代码清晰、简单、易检查**
-6. **通用性、兼容性和框架化**
-
-不要为了“架构完整”“未来可能有用”或“形式统一”牺牲前五项。
-
-研究代码允许有明确的当前假设。没有真实需求时，不需要为所有硬件、所有数据格式、所有历史版本或所有潜在模型建立抽象层。
-
-## 2. 仓库边界
-
-`dexmani_real` 负责真实世界实验链路，包括：
-
-- 真实硬件和传感器接入；
-- 实验标定；
-- 遥操作与数据采集；
+- real robot / sensor integration；
+- calibration；
+- teleoperation 与 data collection；
 - Raw experiment data；
-- 面向训练的离线处理；
-- learned policy 的真实机器人接入与评估；
-- 与真机相关的运行时安全边界。
+- offline processing；
+- learned policy 的真实机器人 deployment 与 evaluation；
+- 与真实执行相关的 safety boundary。
 
-策略网络、训练循环、通用 Dataset / Agent 设计和算法研究原则上属于 `dexmani_policy`。
+模型结构、通用 Dataset、训练流程与算法实验原则上属于 `dexmani_policy`。
 
-修改跨仓库接口时，优先减少重复信息，只传递真实复现实验或部署所必需的内容。不要让两个仓库各自维护一套同义的数据语义表、能力 registry 或兼容协议。
+## Priorities
 
-## 3. 先理解研究问题，再改代码
+按以下顺序做工程取舍：
+
+```text
+hardware safety
+> scientific correctness
+> data traceability / reproducibility
+> research iteration speed
+> code simplicity
+> generic extensibility
+```
+
+这是研究代码。没有当前实验需求时，不为潜在未来场景增加 framework、registry、schema system、migration layer 或兼容分支。
+
+## Before Editing
 
 开始修改前：
 
-- 明确用户当前要解决的研究或实验问题；
-- 检查当前仓库状态，避免覆盖无关修改；
-- 从真实入口追踪相关数据流或控制流；
-- 找到生产者、变换、消费者以及可能的硬件副作用；
-- 区分“当前实验必须保持的行为”和“历史遗留实现”。
+1. 明确当前研究 / 实验目标；
+2. 检查相关入口、配置与调用链；
+3. 追踪 producer → transform → consumer → side effect；
+4. 区分当前有效行为与 legacy implementation；
+5. 保留与任务无关的现有修改。
 
-不要仅根据文件名、旧文档或抽象层猜测行为。README 描述稳定工作流；具体行为以当前源码和 resolved configuration 为准。
+具体行为以当前源码和 resolved configuration 为准，不根据旧文档或命名猜测。
 
-如果可以通过删除旧逻辑、合并重复路径或缩小接口解决问题，优先这么做。
+## Hardware Safety
 
-## 4. 真机操作是特殊权限
+除非用户明确授权，不执行任何可能连接或改变真实设备状态的命令，包括：
 
-除非用户明确授权，**不得执行任何可能连接或改变真实设备状态的代码**。
+- xArm / XHand motion、home、teleoperation；
+- replay、policy rollout；
+- RealSense / VR / HTS 实时连接与采集；
+- hardware diagnostics；
+- calibration write。
 
-包括但不限于：
+如果无法确定一个命令是否有硬件副作用，按“有”处理。
 
-- 连接或探测 xArm、XHand、RealSense、VR / HTS；
-- 机械臂或灵巧手运动、回零、轨迹回放；
-- teleoperation；
-- policy rollout；
-- 实时相机采集和硬件诊断；
-- 写入或更新标定结果。
+普通 import、配置解析和纯离线数据处理应保持无硬件副作用。离线 compile、lint、smoke test 或仿真结果不能作为真机安全证明。
 
-如果不确定某个命令是否会产生硬件副作用，按“会产生”处理。
+涉及 motion、limits、collision、emergency stop、sensor freshness、resource shutdown 的改动必须保守处理，并在结果中说明真机验证状态。
 
-普通 import、配置解析、纯数据处理和离线检查应尽量保持无硬件副作用。不要为了测试一个纯逻辑改动而顺手启动真实设备。
+## Data
 
-任何涉及运动控制、安全状态、急停、关节限位、碰撞检查、传感器 freshness 或资源释放的修改，都应保守处理并明确说明尚未进行的真机验证。
+### Raw
 
-## 5. 标定是实验状态，不是永久契约
+Raw 是实验 evidence。
 
-相机外参、桌面平面、手部安装、VR 对齐等标定信息描述的是**当前实验设置**。
+- 已发布 Raw 不原地修改；
+- 不伪造缺失 observation / action；
+- 不为了训练方便删除失败证据或重写 termination；
+- demonstration 和 rollout 都保留真实实验边界；
+- 训练筛选发生在派生数据阶段，而不是回写 Raw。
+
+### Processed Data
+
+Canonical / processed dataset 是可重建训练缓存。
+
+- processing 必须明确、可追溯；
+- 对训练所需数值保持严格有效性检查；
+- 不静默补模态、删坏帧、插值或改变时间语义，除非这是明确研究设计；
+- 处理逻辑实质变化时优先从 Raw 重新导出；
+- 不默认维护旧缓存 migration / compatibility。
+
+## Calibration
+
+camera extrinsics、desk plane、hand mount、VR alignment 等是**当前实验状态**，不是跨实验 ABI。
 
 因此：
 
-- 新实验设置应重新标定或人工确认；
-- 标定结果可以作为实验 provenance 或当前运行时输入；
-- 不要把某一次标定数值硬编码成跨实验、跨机器或跨仓库的固定 ABI；
-- 不要用历史 desk plane、camera extrinsics 等数值去判断一个新实验是否“符合训练契约”；
-- 真机前应验证当前所需标定存在、有效且与当前物理设置一致。
+- 物理设置变化后重新标定或确认；
+- 不将一次历史标定值硬编码为长期契约；
+- 不用历史标定数值判断新的实验是否“兼容”；
+- 训练 artifact 只保存真正与训练 numerical representation 相关的信息；
+- 真机运行使用当前实验环境的有效标定。
 
-训练时确实影响数值表示的 preprocessing 参数可以随训练产物保存；现场物理标定则应来自当前真实环境。
+## Architecture
 
-## 6. 科研数据原则
+保持真实责任边界清楚：
 
-### Raw 是实验事实
+```text
+hardware / sensors
+      ↓
+runtime / teleop / recording
+      ↓
+Raw
+      ↓
+dataset processing
+      ↓
+dexmani_policy
+      ↓
+deployment
+      ↓
+real robot
+```
 
-Raw episode 是真实实验的 source of truth。
+优先：
 
-- 已发布 Raw 不做原地修补。
-- 不为了让数据“好看”而删除失败证据或重写终止原因。
-- 缺测、未发布动作、异常终止等实验事实应被忠实保存。
-- policy rollout 的失败同样属于实验结果，不能只保留成功案例。
-- 若某段数据不适合训练，应在派生数据阶段排除，而不是篡改 Raw。
-
-### 派生数据可以重建
-
-Canonical / processed dataset 是训练缓存，不是第二份原始事实。
-
-- 处理过程应是确定、可解释和可追溯的；
-- 对训练必需的数值有效性保持严格；
-- 不静默插值、补模态、删坏帧或改变时间语义，除非这是明确的研究设计；
-- 处理逻辑发生实质变化时，优先从 Raw 重新导出；
-- 不为旧缓存长期维护复杂 migration / compatibility chain，除非当前实验明确依赖它。
-
-## 7. 研究代码的架构原则
-
-保持架构与真实研究边界一致。
-
-应该：
-
-- 让硬件资源、实验流程、数据处理和策略部署的责任清楚；
-- 在真实存在的设备、进程或数据边界处保留必要抽象；
-- 让配置表达实验选择，而不是隐藏控制流；
-- 删除已经失效的 legacy path；
-- 让核心科学语义在少数明确位置可读。
+- 删除 obsolete path；
+- 合并重复逻辑；
+- 缩小跨模块 / 跨仓库接口；
+- 在真实 hardware、process、data boundary 处保留必要抽象。
 
 避免：
 
-- 为潜在未来需求建立 registry / schema framework / capability framework；
-- 为单一实现创建多层 wrapper；
-- 在不同目录重复同一校验和同一语义定义；
-- 用异常包装隐藏原始硬件或数据错误；
-- 为保持历史兼容而让当前实验路径长期复杂化；
-- 把一次性 task plan、验收清单或迁移说明变成永久架构文档。
+- 单一实现上的多层 wrapper；
+- 重复 semantic dictionaries；
+- 无需求的 registry / capability framework；
+- 为历史兼容长期复杂化当前研究路径；
+- 把一次性 task plan 写成永久架构。
 
-“更少的代码、更少的状态、更少的跨仓库协议”通常优于额外抽象，但不能以削弱安全和实验正确性为代价。
+## Changing Runtime or Deployment
 
-## 8. 修改真实控制链时
+修改 `robot/`、`sensor/`、`teleop/`、`runtime/`、`replay/`、`deployment/` 时，检查是否改变：
 
-修改与 robot / sensor / teleop / replay / deployment 相关的代码时，至少检查：
+- device connection timing；
+- motion authorization / revocation；
+- pause / stop / fault / emergency behavior；
+- joint target、frame、unit 或 timing semantics；
+- stale command / stale observation handling；
+- recorded data 与实际执行之间的对应关系。
 
-- 是否改变了真实设备何时被连接；
-- 是否改变了动作何时获得或失去执行权限；
-- 是否改变了失败、暂停、退出和急停语义；
-- 是否改变了关节目标、坐标系、单位或时间含义；
-- 是否会让旧命令、旧观测或失效资源继续被使用；
-- 是否改变了实验记录与实际执行之间的对应关系。
+不要在没有明确研究动机时加入额外 smoothing、fallback、auto-recovery 或控制补偿；这些机制会改变实验系统本身。
 
-不要在没有明确研究动机的情况下额外加入平滑器、限幅器、补偿器、fallback 或自动恢复机制。此类机制会改变实验系统本身，需要作为设计决策单独审视。
+## Changing Data
 
-## 9. 修改数据链时
+修改 `recording/`、`dataset/` 或 export workflow 时，确认：
 
-修改 recording / dataset / export 时，优先回答：
+- 数据来自哪个实验时刻；
+- frame / unit / ordering 是否变化；
+- missing data 如何表示；
+- action 表示 command、published target 还是 measured state；
+- Raw 是否仍不可变；
+- processed data 是否仍可由 Raw 重建。
 
-- 数据来自真实系统的哪一时刻；
-- 单位、坐标系和顺序是什么；
-- 缺测如何表示；
-- 动作代表“目标”“已发布目标”还是“实测状态”；
-- 是否破坏 Raw 的不可变性；
-- 训练缓存是否还能从 Raw 重建；
-- 是否会无意改变已有论文实验的语义。
+不要为了让训练代码通过而把无效真实数据填成看似正常的值。
 
-不要仅为了通过训练代码而伪造传感器值或把无效数据填成看似正常的数字。
+## Code Style
 
-## 10. 修改 policy 部署边界时
+- 代码保持 direct、explicit、readable；
+- comments 解释 robotics / math / frame / unit / safety rationale，而不是复述控制流；
+- 没有明确收益时不增加依赖；
+- 简单 helper 不升级为 subsystem；
+- 与当前任务无关的重构不要顺手进行。
 
-Real 侧只应关心真实执行真正需要的信息：
+## Documentation
 
-- 当前策略消费哪些 live observations；
-- 策略输出的动作含义；
-- 控制频率 / 时间尺度；
-- 与数值表示直接相关且训练时固定的 preprocessing；
-- 当前真实环境的标定与硬件能力。
+- `README.md`：项目定位、workflow、quick start、主要入口。
+- `AGENTS.md`：代码代理的长期工作规则。
+- `CLAUDE.md`：Claude 的精简入口，不重复整份 AGENTS。
+- 临时 task / migration / acceptance notes 不作为长期根目录文档。
 
-不要把 `dexmani_policy` 内部训练实现、模型类别层级或数据集来源细节复制进 Real runtime。也不要把现场标定固化进 Policy artifact。
+README 不维护容易过时的类清单、字段级 runtime contract、状态机细节或历史重构说明。
 
-## 11. 文档职责
+## Offline Validation
 
-长期文档保持分工：
-
-- **README.md**：给研究者阅读，解释项目定位、研究工作流、仓库边界和主要入口。
-- **AGENTS.md**：给代码代理阅读，规定安全、科研数据和修改原则。
-- **CLAUDE.md**：Claude 的工作入口，只补充 Claude 工作方式，不复制整份 AGENTS。
-- **临时任务文档**：只用于一次性重构 / 验收；任务完成后应删除或移出长期主文档。
-
-不要在 README 中堆积类名、字段清单、状态机细节、每个按键行为或历史重构记录。实现细节容易变化，应留在代码、CLI help 和必要注释中。
-
-## 12. 语言与代码风格
-
-- 文档和协作说明以中文为主。
-- 代码保持直接、显式、易读。
-- 注释解释“为什么”，尤其是机器人学假设、坐标系、单位、数学约定、安全原因和实验设计；不要逐行复述代码。
-- 没有明确收益时不要新增依赖。
-- 不要把简单 helper 升级为 subsystem。
-- 与当前研究无关的“顺手重构”应避免。
-
-## 13. 验证原则
-
-默认先做离线验证，不做真机验证。
-
-推荐的基础检查：
+默认只运行无硬件副作用的检查：
 
 ```bash
 python -m compileall -q dexmani_real examples
@@ -199,22 +184,17 @@ ruff check dexmani_real examples
 git diff --check
 ```
 
-根据改动增加有针对性的纯逻辑检查，例如几何变换、FK / IK、数据导出、配置解析或 observation 构造。
+根据改动补充 focused pure-logic checks，例如 geometry、FK / IK、config、dataset processing 或 observation construction。
 
-如果环境缺少可选依赖，不要为了完成检查而擅自升级或重装真实实验环境；说明哪些检查未运行以及原因。
+缺少可选依赖时说明限制，不擅自升级真实实验环境。
 
-任何离线检查通过都**不等价于**真实机器人验证。
+## Completion
 
-## 14. 完成修改前
+完成任务前确认：
 
-最终检查：
-
-- 修改是否真正服务用户提出的研究目标；
-- 是否引入了无必要的新抽象；
-- 是否留下 dead code、legacy alias 或过时文档；
-- README / AGENTS / CLAUDE 是否仍然描述长期稳定事实；
-- 是否意外改变了数据语义或真机安全边界；
-- 是否存在未说明的真机验证缺口；
-- 最终 diff 是否只包含预期修改。
-
-对于个人 PhD 研究仓库，宁可留下一个简单、可解释、能支撑论文实验的实现，也不要留下一个复杂但“看起来像平台”的系统。
+- 修改直接服务当前研究目标；
+- 没有无必要的新抽象；
+- 没有 dead code、stale docs 或 legacy alias；
+- 没有意外改变 data / action / frame / timing semantics；
+- 真机未验证的部分已明确说明；
+- final diff 只包含预期修改。
