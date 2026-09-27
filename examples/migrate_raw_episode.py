@@ -202,7 +202,12 @@ def _build_current_staging(source: LegacyEpisode, staging: Path) -> None:
 
             def write_initial_meta(meta):
                 for name, value in old_attrs.items():
-                    if name not in {"schema_version", "episode_valid", "format", "termination_reason"}:
+                    if name not in {
+                        "schema_version",
+                        "episode_valid",
+                        "format",
+                        "termination_reason",
+                    }:
                         meta.attrs[name] = value
 
             writer = EpisodeDataWriter(
