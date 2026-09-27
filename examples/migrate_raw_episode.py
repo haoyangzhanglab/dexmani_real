@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Migrate clean legacy Raw v34 teleop episodes to the current Raw format.
+"""Migrate representable legacy Raw v34 teleop episodes to the current Raw format.
 
 This is an explicit one-time offline migration tool, not a runtime compatibility
-layer. It refuses legacy episodes whose validity evidence cannot be represented
-losslessly by the current clean-teleop Raw contract.
+layer. Legacy validity flags are audit-only lifecycle/quality metadata; admission
+requires structurally valid, finite core payloads and preserves every source row.
 """
 
 from __future__ import annotations
@@ -21,14 +21,19 @@ import h5py
 import numpy as np
 
 from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
-from dexmani_real.recording.storage.reader import EpisodeReader
+from dexmani_real.recording.storage.reader import (
+    EpisodeReader,
+    _positive_float_attr,
+    _validate_color_camera_metadata,
+    _validate_hand_mount_metadata,
+)
 from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT
 from dexmani_real.recording.storage.video import VideoDecoder
 from dexmani_real.utils.atomic_io import atomic_publish
 
 _LEGACY_SCHEMA_VERSION = 34
 _CHUNK_ROWS = 32
-_MIGRATED_TERMINATION_REASON = "legacy_v34_migrated_clean"
+_MIGRATED_TERMINATION_REASON = "legacy_v34_migrated"
 
 
 @dataclass(frozen=True)
@@ -36,6 +41,8 @@ class LegacyEpisode:
     path: Path
     num_frames: int
     depth_shape: tuple[int, int]
+    episode_valid: bool
+    invalid_frame_count: int
 
 
 def _scalar_attr(attrs, name):
@@ -94,9 +101,7 @@ def _classify_episode(path: Path) -> str:
             or not isinstance(version, (int, np.integer))
             or int(version) != _LEGACY_SCHEMA_VERSION
         ):
-            raise ValueError(
-                f"{path}: expected current format={RAW_FORMAT!r} or legacy schema v34"
-            )
+            raise ValueError(f"{path}: expected current format={RAW_FORMAT!r} or legacy schema v34")
     return "legacy"
 
 
@@ -118,13 +123,11 @@ def _inspect_legacy_episode(path: Path) -> LegacyEpisode:
         if int(_scalar_attr(attrs, "schema_version")) != _LEGACY_SCHEMA_VERSION:
             raise ValueError(f"{path}: not a legacy Raw v34 episode")
         if _text_attr(attrs, "collection_source") != "teleop":
-            raise ValueError(
-                f"{path}: migration supports clean legacy teleop demonstrations only"
-            )
+            raise ValueError(f"{path}: migration supports legacy teleop episodes only")
 
         episode_valid = _scalar_attr(attrs, "episode_valid")
-        if not isinstance(episode_valid, (bool, np.bool_)) or not bool(episode_valid):
-            raise ValueError(f"{path}: legacy episode_valid is not true")
+        if not isinstance(episode_valid, (bool, np.bool_)):
+            raise ValueError(f"{path}: legacy episode_valid must be a scalar bool")
 
         num_frames = _scalar_attr(attrs, "num_frames")
         if (
@@ -147,9 +150,14 @@ def _inspect_legacy_episode(path: Path) -> LegacyEpisode:
             not isinstance(frame_valid, h5py.Dataset)
             or frame_valid.shape != (num_frames,)
             or frame_valid.dtype != np.bool_
-            or not np.all(frame_valid[:])
         ):
-            raise ValueError(f"{path}: every legacy frame_valid must be true")
+            raise ValueError(f"{path}: legacy frame_valid must be bool with shape ({num_frames},)")
+        invalid_frame_count = int(np.count_nonzero(~frame_valid[:]))
+
+        _text_attr(attrs, "task_label")
+        _positive_float_attr(attrs, "control_hz")
+        _validate_color_camera_metadata(attrs)
+        _validate_hand_mount_metadata(attrs)
 
         for name, spec in DATASET_SPECS.items():
             array = data.get(name)
@@ -175,17 +183,28 @@ def _inspect_legacy_episode(path: Path) -> LegacyEpisode:
         height = int(_scalar_attr(attrs, "camera_color_height"))
         width = int(_scalar_attr(attrs, "camera_color_width"))
         if depth.shape != (num_frames, height, width) or depth.dtype != np.uint16:
-            raise ValueError(
-                f"{path}: legacy depth must be uint16 {(num_frames, height, width)}"
-            )
+            raise ValueError(f"{path}: legacy depth must be uint16 {(num_frames, height, width)}")
+        for start in range(0, num_frames, _CHUNK_ROWS):
+            depth[start : start + _CHUNK_ROWS]  # Surface corrupt compressed payloads before writes.
 
     with VideoDecoder(rgb_path) as decoder:
         if decoder.frame_count != num_frames:
             raise ValueError(
                 f"{path}: RGB frame count {decoder.frame_count} != num_frames {num_frames}"
             )
+        decoded = sum(1 for _ in decoder.iter_frames())
+        if decoded != num_frames:
+            raise ValueError(
+                f"{path}: decoded RGB frame count {decoded} != num_frames {num_frames}"
+            )
 
-    return LegacyEpisode(path=path, num_frames=num_frames, depth_shape=(height, width))
+    return LegacyEpisode(
+        path=path,
+        num_frames=num_frames,
+        depth_shape=(height, width),
+        episode_valid=bool(episode_valid),
+        invalid_frame_count=invalid_frame_count,
+    )
 
 
 def _build_current_staging(source: LegacyEpisode, staging: Path) -> None:
@@ -195,9 +214,10 @@ def _build_current_staging(source: LegacyEpisode, staging: Path) -> None:
     writer = None
     try:
         shutil.copy2(source.path / "rgb.mp4", staging / "rgb.mp4")
-        with h5py.File(source.path / "data.h5", "r") as old_data, h5py.File(
-            source.path / "depth.h5", "r"
-        ) as old_depth:
+        with (
+            h5py.File(source.path / "data.h5", "r") as old_data,
+            h5py.File(source.path / "depth.h5", "r") as old_depth,
+        ):
             old_attrs = dict(old_data["meta"].attrs)
 
             def write_initial_meta(meta):
@@ -285,6 +305,14 @@ def migrate(root: Path, *, keep_backups: bool = False) -> tuple[int, int]:
             continue
         legacy.append(_inspect_legacy_episode(episode))
 
+    print(
+        f"Legacy audit: episodes={len(legacy)}, "
+        f"episode_valid_false={sum(not source.episode_valid for source in legacy)}, "
+        f"frame_valid_false_episodes={sum(source.invalid_frame_count > 0 for source in legacy)}, "
+        f"frame_valid_false_rows={sum(source.invalid_frame_count for source in legacy)}",
+        file=sys.stderr,
+    )
+
     if not legacy:
         return 0, current
 
@@ -328,7 +356,7 @@ def migrate(root: Path, *, keep_backups: bool = False) -> tuple[int, int]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "One-time migration of clean legacy Raw v34 teleop episodes to the current "
+            "One-time migration of representable legacy Raw v34 teleop episodes to the current "
             "dexmani.raw layout. The normal reader intentionally has no legacy fallback."
         )
     )
