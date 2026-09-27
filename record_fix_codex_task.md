@@ -192,13 +192,16 @@ Preserve the current safe lifecycle ordering.
 
 For both teleop and policy evaluation:
 
-1. validate/snapshot required recording metadata;
+1. validate/snapshot the cheap required recording metadata on the control owner;
 2. create the staging directory;
-3. initialize writer resources;
-4. start the writer thread and prove it is ready;
-5. return from `start_episode()`;
-6. only then reacquire a fresh observation / reset references as currently required;
-7. only then grant motion authority.
+3. start the writer thread;
+4. the writer thread itself opens/owns all per-episode HDF5/video file handles, then signals local readiness or stores its first error;
+5. `start_episode()` waits with a bounded timeout for that local ready/error result and cleans up failed staging before returning/raising;
+6. return from `start_episode()`;
+7. only then reacquire a fresh observation / reset references as currently required;
+8. only then grant motion authority.
+
+Do not open an HDF5/PyAV handle on the control thread and later hand it to the writer thread. Single-thread ownership starts at file open.
 
 The existing design already intentionally allows recorder START to block before motion. Preserve that property.
 
@@ -388,9 +391,11 @@ A **minimal transient local discard reason** is allowed inside the recorder/tele
 Important:
 
 - C must remain an operator-facing control pause/resume feature unless a separate UX change is approved.
-- If C or another lifecycle event makes the current dataset episode unusable, mark the current staging capture for discard locally.
-- Stop accepting/writing additional useless recording rows when practical, but do not let recorder bookkeeping alter physical safety or re-anchoring behavior.
-- Do not invent automatic hidden episode segmentation.
+- If C or another lifecycle event makes the current dataset episode unusable, mark the current staging capture **discard-only** locally.
+- Once a teleop capture is discard-only, `add_frame()` should become a cheap no-op for that capture so resumed teleop does not keep burning CPU/disk on data that can never be published. The writer may finish draining rows already accepted before discard.
+- Do not synchronously close/delete writer resources from the live control path merely because C was pressed. Final close/delete belongs to the next safe episode boundary after motion authority is revoked.
+- S/H/Q/final cleanup must discard, not publish, a discard-only teleop capture; provide a clear operator log/message so S is not misread as having saved data.
+- Do not invent automatic hidden episode segmentation or silently start a new recorder on resume.
 
 The final published teleop dataset directory must contain only clean demonstrations.
 
@@ -671,6 +676,21 @@ rgb_range = [0, 1]
 recipe = { resolved PointCloudConfig numerical recipe }
 ```
 
+### `data/depth`
+
+Preserve the current Canonical depth representation in this task rather than silently changing units:
+
+```text
+semantic_id = "dexmani.depth.aligned_z16"
+unit = "camera_depth_unit"
+scale_m_per_unit = <resolved Raw depth scale>
+invalid_value = 0
+```
+
+Because one Zarr array has one static semantic contract, all included episodes in one canonical store must agree on the depth representation and `scale_m_per_unit`. If they do not, fail export clearly instead of mixing scales or silently converting only some episodes.
+
+A future metric-depth representation may be added under a new descriptive semantic/field, but do not change the existing canonical depth meaning in place.
+
 ### Actions
 
 Keep explicit stable semantics, e.g.:
@@ -753,7 +773,9 @@ May contain NaN as an explicit missing-sample marker:
 
 Do not add persisted generic validity masks merely to mirror NaN.
 
-When a future policy **selects** an optional modality such as `tactile_force`, its training dataset initialization must fail clearly if that selected modality contains unsupported NaN and the policy has no explicit mask/missing-data mechanism.
+When a future policy **selects** an optional modality such as `tactile_force`, the Real training build must fail clearly if that selected modality contains unsupported NaN and the policy has no explicit mask/missing-data mechanism.
+
+This validation must occur **before normalization statistics or model construction**. The current `build_dataset_and_normalizer()` order already calls the Real contract extraction after dataset instantiation but before `build_normalizer()`; preserve that ordering or make it stricter. Do not allow NaN to reach a normalizer and fail later with an opaque training error.
 
 This is consumer-specific capability validation.
 
@@ -896,6 +918,19 @@ This mirrors the existing point-cloud principle:
 
 > training representation recipe is checkpoint/dataset-owned; current physical calibration is Real-owned.
 
+## 8.5 Canonical capability is not automatically a live rollout capability
+
+A modality being present in Canonical Zarr does not by itself guarantee that real-time deployment currently knows how to produce it.
+
+Keep this distinction explicit.
+
+- `inspect_policy` / deployment setup must fail **before motion** with a clear error if a requested observation modality has no real-time producer in `build_policy_observation()` / the current runtime.
+- Do not allow an unsupported requested name to fall through to a late `KeyError`, warmup failure, or first-motion-step failure.
+- Existing live modalities such as RGB, point cloud, contact/tactile, EEF pose, and fingertip points must remain consistent with their saved training contracts.
+- If direct mappings for already available current observation fields (for example arm velocity/effort, hand current, or aligned depth) are trivial and required by an actual policy in this task, add them directly. Do not build a generic live-modality plugin system or expand deployment surface solely because Canonical stores a field.
+
+The policy/checkpoint contract therefore records what was trained, while Real deployment separately proves it can provide every requested modality now.
+
 ---
 
 # 9. Legacy Canonical Zarr v15
@@ -966,6 +1001,12 @@ Do not add a production-style event bus, transaction service, status ledger, mig
 
 # 12. Implementation sequence and gates
 
+Before editing, produce a concise implementation plan that traces the exact current call sites and deleted resources for all three milestones. The plan must distinguish:
+- changes that are fully offline-verifiable;
+- the Milestone-1 manual real-time gate;
+- coordinated `dexmani_policy` changes;
+- optional changes that should be skipped unless they delete more code than they add.
+
 Do not perform this as one unreviewable rewrite.
 
 ## Milestone 1 — recording transport only
@@ -978,9 +1019,11 @@ Goal:
 
 Keep Raw file/field semantics as close to current behavior as practical during this milestone so timing regressions can be isolated.
 
-Required offline checks plus manual real-time validation plan.
+Required offline checks plus a concrete manual real-time validation plan.
 
-Only after this passes, proceed.
+**Hard gate:** no hardware-affecting test is authorized by this task. After implementing Milestone 1 and passing all offline checks, stop and report the exact recording-OFF vs recording-ON manual validation procedure and the metrics to compare. Do **not** implement Milestone 2 or 3 in the same execution until the user explicitly reports/approves the Milestone-1 real-time gate (or explicitly authorizes proceeding without that hardware evidence).
+
+Planning may cover all milestones up front; implementation is gated here.
 
 ## Milestone 2 — Raw semantic cleanup
 
