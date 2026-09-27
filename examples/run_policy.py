@@ -209,7 +209,6 @@ def main(argv: list[str] | None = None) -> int:
 
         return run_policy_deployment(
             runtime,
-            info,
             worker_config,
             True,
             max_running_s=args.max_running_s,

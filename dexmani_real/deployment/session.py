@@ -56,7 +56,6 @@ def _rollout_recorder_config(
 
 def run_policy_deployment(
     runtime,
-    policy_info,
     worker_config,
     execute,
     *,
@@ -65,14 +64,15 @@ def run_policy_deployment(
     num_episodes=1,
     recording_config=None,
 ):
-    cloud_recipe = validate_policy_runtime_compatibility(policy_info, runtime)
+    info = worker_config.info
+    cloud_recipe = validate_policy_runtime_compatibility(info, runtime)
     max_running_s = validate_max_running_s(max_running_s)
     num_episodes = validate_num_episodes(num_episodes)
     if recording_config is not None and (not execute or max_running_s is None):
         raise ValueError("recorded evaluation requires execute and a finite run budget")
     if recording_config is not None:
-        validate_recording_budget(policy_info, max_running_s)
-    fields = set(policy_info.observation_fields)
+        validate_recording_budget(info, max_running_s)
+    fields = set(info.observation_fields)
     cloud = "point_cloud" in fields
     # Cloud production needs a camera worker; pointcloud-only rows need no source-frame lookup.
     camera = cloud or "rgb" in fields or recording_config is not None
