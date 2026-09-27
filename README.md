@@ -33,7 +33,8 @@ Teleop、键盘控制和 policy 分别使用各自的控制周期，replay 使�
 | Policy rollout | `python examples/run_policy.py <policy/task/experiment> --config experiment.yaml` | 真机；evaluation session |
 | Camera calibration | `python examples/calibrate_camera.py --config experiment.yaml --hand-geometry absent` | 真机；仅在手已拆除时用 `absent`，固定在 home 的手用 `secured-home` |
 | VR heading calibration | `python examples/calibrate_vr_heading.py` | VR / HTS |
-| Canonical Zarr export | `python examples/export_policy_zarr.py <raw_task_dir> --config export.yaml` | 离线；输入为包含完整 Raw episodes 的任务目录 |
+| Legacy Raw migration | `python examples/migrate_raw_episode.py episodes/pick_place_toy` | 离线；一次性将 clean v34 teleop Raw 转为当前格式 |
+| Canonical Zarr export | `python examples/export_policy_zarr.py <raw_task_dir> --config export.yaml` | 离线；输入为包含当前 Raw episodes 的任务目录 |
 | XHand diagnostics | `python examples/xhand_diagnostics.py` | 连接真机；诊断 |
 | RGB-D diagnostics | `python examples/realsense_record_example.py` | 连接相机；实时 RGB-D / 点云显示 |
 | Point-cloud diagnostics | `python examples/pointcloud_process_example.py` | 连接相机；点云检查与可选桌面标定，`--save-dir` 保存诊断快照 |
@@ -43,7 +44,7 @@ Teleop、键盘控制和 policy 分别使用各自的控制周期，replay 使�
 
 键盘控制使用 WASD/方向键和 IJKL 微调，R 执行 planned HOME，Q 退出，ESC 急停。下节的 B/C/S/D/H 按键用于 VR teleop。
 
-物理回放接受新 Raw 或 legacy v34 的 teleop episode；加载时拒绝空轨迹或非有限的动作/机器人状态，legacy v34 还必须通过原有 episode/frame validity 检查。启动前需在操作者监督下将机器人置于录制起始姿态附近：机械臂和手部每个关节的误差均不得超过 10°，机械臂按限位内等价角比较。回放按录制频率逐条发布目标，Q 停止并保留已采集数据，结束后的 H 执行机器人 planned HOME。默认输出为 `replay_results/<episode_name>_replay/`，`--output` 必须指向不存在或为空的目录；采集到数据后保存 `replay_data.npz` 并计算一致性指标 `metrics.json`。
+物理回放只接受当前 `format="dexmani.raw"` 的 teleop episode；加载时拒绝空轨迹或非有限的动作/机器人状态。旧 v34 必须先用离线迁移工具转换。启动前需在操作者监督下将机器人置于录制起始姿态附近：机械臂和手部每个关节的误差均不得超过 10°，机械臂按限位内等价角比较。回放按录制频率逐条发布目标，Q 停止并保留已采集数据，结束后的 H 执行机器人 planned HOME。默认输出为 `replay_results/<episode_name>_replay/`，`--output` 必须指向不存在或为空的目录；采集到数据后保存 `replay_data.npz` 并计算一致性指标 `metrics.json`。
 
 ## Teleop 与录制
 
@@ -85,7 +86,7 @@ xArm 与 XHand HOME 均以实测收敛判断完成。XHand 默认要求连续三
 
 ## 数据与训练缓存
 
-Raw 是不可变的实验 source of truth，不迁移、不原地重写。新 episode 在 `data.h5` 保存控制行、aligned Z16 深度和 metadata，RGB 使用 `rgb.mp4`；metadata 使用 `format="dexmani.raw"` 和最终 `termination_reason`，不再保存 validity 字段或全局递增版本。Reader 也能只读访问现有 v34 的 `data.h5 + depth.h5 + rgb.mp4`，legacy validity 仅作为训练/回放的旧数据接收证据。Reader 验证已有的已知字段，忽略额外未知字段；消费者通过 `require_fields(...)` 要求自己所需的能力。
+当前 Raw 是实验 source of truth：episode 在 `data.h5` 保存控制行、aligned Z16 深度和 metadata，RGB 使用 `rgb.mp4`；metadata 使用 `format="dexmani.raw"` 和最终 `termination_reason`，不保存 validity 字段或全局递增版本。正常 Reader / replay / export 只支持当前格式；旧 v34 不保留 runtime compatibility branch。Reader 验证已有的已知字段，忽略额外未知字段；消费者通过 `require_fields(...)` 要求自己所需的能力。
 
 控制与录制复用同一观测快照。Raw 保留机器人状态、RGB-D、XHand 电流/触觉、实际发布的绝对关节目标和真实物理标定；不保存 VR、逐帧时间戳、transport bookkeeping 或软件 provenance。深度值乘以 `depth_scale` 才得到米。
 
@@ -96,6 +97,14 @@ XHand 触觉保留 SDK-native、去软件 bias 后的数值，SI 牛顿单位尚
 START 必须用当前相机 serial 解析完整 eye-to-hand 标定，验证 aligned RGB-D 几何、depth scale 和 base-from-color 变换。缺失或 eye-in-hand 均拒绝录制。彩色网格畸变模型必须受 canonical 反投影支持：当前仅接受 `none` / `distortion.none` 和 `brown_conrady` / `distortion.brown_conrady`。
 
 Raw 先写入 `.tmp_<episode_name>`；writer 关闭文件并结构验证后，经 fsync 和原子重命名发布。失败时仅清理本次拥有的 staging；无法确认释放或清理失败时保留 ownership 并拒绝新 START，原始错误不被覆盖。残留 staging 只警告，需人工检查，不自动恢复或删除。
+
+旧 v34 只通过一次性离线工具迁移，不由正常 Reader 兼容。迁移工具只接受 `episode_valid=true`、全部 `frame_valid=true`、核心 state/action finite 的 teleop demonstration；它先对整个输入目录 preflight，再将 `depth.h5` 合并进新 `data.h5`、删除旧 validity/version 字段并写入当前 format。整批成功前保留隐藏备份，失败回滚；默认整批成功后删除备份，可用 `--keep-backups` 保留。对当前数据执行：
+
+```bash
+python examples/migrate_raw_episode.py episodes/pick_place_toy
+```
+
+迁移完成后，当前 Raw 再视为不可变证据，不做日常原地改写。
 
 Canonical Zarr 使用 `format="dexmani.real.canonical"`，保持完整多模态缓存：`joint_state`、`arm_qvel`、`arm_effort`、`hand_current`、`eef_pose`、`fingertip_points`、`contact_force`、`tactile_force`、`rgb`、`depth`、`point_cloud`、`action`、`action_ee`。Root attrs 只保存 format/task/dt；单位、坐标系、顺序和 semantic ID 位于各数组 attrs，派生模态保存实际 recipe。一个 Zarr 的 Z16 depth 必须使用唯一 `scale_m_per_unit`，不混合不同深度尺度。
 
@@ -113,7 +122,7 @@ python examples/export_policy_zarr.py episodes/<task> --config export.yaml --out
 
 导出不再提供 `--dry-run`、task-name override 或 annotation rewriting。真实导出通过 owned staging 完成相同校验，失败不会留下已发布的部分 Zarr。拒绝覆盖已有目标；目标不能位于输入、仓库 `episodes/`、`episodes_processed/`、`rollouts/` 或已有 Zarr 内部。
 
-Canonical 是可重建派生缓存，旧 v15 按需从 Raw 重新生成，不做原地 migration。字段名和 semantic ID 的含义不可静默改变；不同表示使用新的描述性身份，算法选择记录实际 recipe。新增字段不影响不请求它的消费者。禁止用 migration 凭空补出从未记录的模态。
+Canonical 是可重建派生缓存，只支持当前 `format="dexmani.real.canonical"`。字段名和 semantic ID 的含义不可静默改变；不同表示使用新的描述性身份，算法选择记录实际 recipe。新增字段不影响不请求它的消费者。旧缓存直接从当前 Raw 重新导出，不维护格式兼容分支。
 
 ## Policy evaluation
 
@@ -128,7 +137,7 @@ conda run --no-capture-output -n real_robot python examples/run_policy.py <polic
 
 `--config experiment.yaml` 只设置当前 Real 硬件与运行参数；Policy 始终读取所选实验目录里的 `config.yaml`。未显式覆盖的 weights/NFE，best 使用 selection record，latest/文件名使用保存的 `eval.use_ema` / `eval.inference_steps`。
 
-Policy worker 持有 model / CUDA，使用同步 inference 和本地 action chunk。推理期间动作权限已失效时，丢弃返回的旧动作。Pointcloud-only policy 不依赖源 RGB-D 帧仍驻留；同时输入 RGB 和点云时才匹配源帧。保存的 `real_runtime.modality_contracts` 记录训练所用表示；指尖 FK 恢复保存的 link 列表并使用当前安装参数。Canonical 中存在某个模态不等于 live Real 已支持：当前未实现的 live 模态会在模型/硬件启动前明确拒绝。旧的、缺少 modality contracts 的实验快照不能直接用于这条部署路径。
+Policy worker 持有 model / CUDA，使用同步 inference 和本地 action chunk。推理期间动作权限已失效时，丢弃返回的旧动作。Pointcloud-only policy 不依赖源 RGB-D 帧仍驻留；同时输入 RGB 和点云时才匹配源帧。保存的 `real_runtime.modality_contracts` 记录训练所用表示；指尖 FK 恢复保存的 link 列表并使用当前安装参数。Canonical 中存在某个模态不等于 live Real 已支持：当前未实现的 live 模态会在模型/硬件启动前明确拒绝。Real deployment 只支持由当前 canonical contract 训练并保存完整 `modality_contracts` 的实验。
 
 操作顺序为 H 回到初始姿态、布置场景、B 开始、S 停止；Q 退出，ESC 急停。HOME 完成后需要新的 B 才能开始。B 每次只尝试一次：检查新鲜 arm/hand HOME 状态与完整 padded observation，recorder START 后再次检查，失败则丢弃准备中的录制并等待新的 B；HOME 阻塞期间 S/Q 仍会立即撤销动作权限。`--num-episodes` 按实际开始并结束的 episode 计数，录制失败的 episode 也计入预算。
 
