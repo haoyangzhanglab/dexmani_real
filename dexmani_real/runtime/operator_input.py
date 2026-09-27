@@ -482,7 +482,7 @@ class KeyboardInput:
             return key in self._keys
 
     def pressed_keys(self) -> tuple[str, ...]:
-        """Return a stable snapshot of currently held keys for diagnostics."""
+        """Return a stable snapshot of currently held keys."""
         with self._lock:
             return tuple(sorted(self._keys))
 

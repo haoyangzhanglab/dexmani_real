@@ -1,8 +1,8 @@
 """Capability-based reader for the current Raw format.
 
 Known present fields are validated; additive unknown fields do not invalidate an
-otherwise usable episode. Legacy Raw belongs to the explicit offline migration
-tool, not the normal runtime/export/replay path.
+otherwise usable episode. Legacy Raw is unsupported by the normal
+runtime/export/replay path.
 """
 
 from __future__ import annotations
@@ -140,10 +140,7 @@ class EpisodeReader:
                 raise RawDataError("episode is missing meta")
             attrs = self.meta
             if _text_attr(attrs, "format") != RAW_FORMAT:
-                raise ValueError(
-                    "unsupported Raw format; migrate the episode before use "
-                    f"(expected {RAW_FORMAT!r})"
-                )
+                raise ValueError(f"unsupported Raw format (expected {RAW_FORMAT!r})")
             _text_attr(attrs, "termination_reason")
             self._num_frames = _positive_int_attr(attrs, "num_frames", allow_zero=True)
             self._control_hz = _positive_float_attr(attrs, "control_hz")

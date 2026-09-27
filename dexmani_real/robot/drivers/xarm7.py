@@ -4,7 +4,9 @@ One class (:class:`XArm7`) wraps connect / read / servo / home / stop / close.
 Error handling is fail-fast: no retry counters, no last-known fallbacks, no
 stop confirmation — the firmware is the final backstop.
 
-:meth:`XArm7.home` drives a collision-validated waypoint path in Mode 0 and
+Normal streaming uses Mode 6. :meth:`XArm7.home` executes collision-validated
+point-to-point milestones in Mode 0, restores Mode 6 itself, and verifies
+post-restoration position/velocity stability before returning success. It
 raises on failure (a plain :class:`RuntimeError`) or on a runtime interruption
 (:class:`HomeAborted`, so the caller can stop without latching a fault).
 """
@@ -149,8 +151,10 @@ class HomeAborted(RuntimeError):
 class XArm7:
     """xArm7 driver — the single owner of the controller connection.
 
-    Streaming uses Mode 6; home uses Mode 0. The worker restores Mode 6
-    before streaming resumes after a stop.
+    Streaming uses Mode 6. HOME executes validated milestones in Mode 0,
+    then restores Mode 6 and verifies position/velocity stability before
+    returning. After a State-4 stop on epoch revocation, the worker re-enters
+    Mode 6 before the next authorized streaming command.
     Failures raise: the arm worker's top-level handler latches the sticky
     error, and cleanup does a best-effort stop.
     """
@@ -248,7 +252,8 @@ class XArm7:
 
         Blocks the caller: the controller runs each Mode-0 point-to-point move
         (the path was already densely collision-checked by the planner).  The
-        controller is left in Mode 6 on a normal return; any failure or
+        method restores Mode 6 and verifies position/velocity convergence for
+        the configured dwell before returning success. Any failure or
         interruption raises, and the caller's fail-fast handler owns recovery.
         """
         waypoints = np.asarray(waypoints, dtype=np.float64)
@@ -302,7 +307,13 @@ class XArm7:
             # HOME includes stability after the firmware mode-switch transient.
             _raise_abort()
             self.enter_mode6()
-            deadline = time.monotonic() + self.cfg.homing.target_timeout_s + self.cfg.homing.dwell_s
+            # One polling interval lets the final dwell verification sample be scheduled.
+            deadline = (
+                time.monotonic()
+                + self.cfg.homing.target_timeout_s
+                + self.cfg.homing.dwell_s
+                + self.cfg.homing.step_interval_s
+            )
             stable_since: float | None = None
             max_error = max_velocity = float("inf")
             while time.monotonic() < deadline:

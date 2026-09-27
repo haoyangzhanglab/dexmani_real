@@ -58,7 +58,8 @@ class HomingParams:
     max_speed_deg_s: float = (
         30.0  # conservative Mode 0 joint speed; hardware validation required before tuning
     )
-    target_timeout_s: float = 0.5  # settling allowance added after distance/speed timing
+    # Bounded settling allowance for HOME milestones and Mode-6 restoration.
+    target_timeout_s: float = 0.5
     velocity_convergence_rad_s: float = 0.03
     dwell_s: float = 0.30
     convergence_timeout_s: float = 15.0

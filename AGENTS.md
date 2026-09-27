@@ -34,7 +34,7 @@ A point cloud is self-contained. Match its source camera frame only when the pol
 
 ## Research data
 
-Current Raw episodes use `format="dexmani.raw"`, with control rows and aligned depth in `data.h5` plus `rgb.mp4`. Normal runtime/export/replay code supports only this current format; it carries no legacy Raw compatibility branches. Legacy v34 data may be converted only by the explicit offline migration tool, which must reject any episode whose old validity evidence cannot be represented losslessly. After migration, Raw is immutable experiment evidence and is not rewritten in place. Validate known fields that are present, tolerate unknown additive fields, and let consumers require the capabilities they need. The current writer remains strict about its emitted fields.
+Current Raw episodes use `format="dexmani.raw"`, with control rows and aligned depth in `data.h5` plus `rgb.mp4`. Normal runtime/export/replay code supports only this current format; do not add legacy Raw compatibility branches. Legacy data is outside the supported repository contract. Raw is immutable experiment evidence and is not rewritten in place. Validate known fields that are present, tolerate unknown additive fields, and let consumers require the capabilities they need. The current writer remains strict about its emitted fields.
 
 Preserve measured robot state, RGB-D, current/tactile payloads, actual published absolute joint targets, physical camera/hand-mount calibration, and final `termination_reason`. New Raw has no persisted `frame_valid`, `episode_valid`, or global incremental schema version. Keep freshness, causal selection and cadence checks in runtime; do not persist per-row timestamps, raw VR, detailed status, software provenance, or transport bookkeeping.
 

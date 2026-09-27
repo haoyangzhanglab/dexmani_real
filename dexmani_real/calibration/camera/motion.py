@@ -156,27 +156,6 @@ def _log_workspace_clipping(
     return last_warning_s
 
 
-def _stop_calibration_motion(
-    shared: RuntimeChannels, state: CalibrationLoopState, reason: str
-) -> None:
-    """Revoke invalid authority and require a fresh physical key press."""
-    state.command_qpos = None
-    state.command_pose = None
-    if (
-        shared.error_state.value
-        or shared.estop_request.value
-        or not shared.is_running.value
-        or int(shared.safety_state.value) not in (int(SafetyState.ARMED), int(SafetyState.RUNNING))
-    ):
-        set_calibration_fault(shared, reason)
-        return
-    if int(shared.safety_state.value) == int(SafetyState.RUNNING):
-        if not revoke_motion(shared, SafetyState.ARMED):
-            set_calibration_fault(shared, "failed to stop calibration motion")
-            return
-    state.blocked_until_release = True
-
-
 def run_calibration_motion_tick(
     shared: RuntimeChannels,
     runtime: ExperimentConfig,
@@ -187,11 +166,6 @@ def run_calibration_motion_tick(
     calib_cfg: CalibrationConfig,
 ) -> None:
     """Propose a jog target and commit it only after successful publication."""
-    if shared.stop_request.value:
-        _stop_calibration_motion(shared, state, "command admission revoked")
-        with shared.motion_lock:
-            shared.stop_request.value = 0
-        return
     safety_state = int(shared.safety_state.value)
     if (
         shared.error_state.value
@@ -199,11 +173,12 @@ def run_calibration_motion_tick(
         or not shared.is_running.value
         or safety_state not in (int(SafetyState.ARMED), int(SafetyState.RUNNING))
     ):
-        _stop_calibration_motion(shared, state, "unexpected calibration motion state")
+        state.command_qpos = None
+        state.command_pose = None
+        set_calibration_fault(shared, "unexpected calibration motion state")
         return
-    active_keys = keys.pressed_keys()
     if state.blocked_until_release:
-        if not any_jog_key_held(active_keys):
+        if not any_jog_key_held(keys.pressed_keys()):
             state.blocked_until_release = False
         return
     dx, drpy = compute_cartesian_jog_delta(keys, calib_cfg.delta_pos_m, calib_cfg.delta_rpy_rad)
