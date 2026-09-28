@@ -87,6 +87,7 @@ def analyze_session(session):
         integrity[owner]["complete"] = complete
     q = traces["policy"].get("queries", {})
     p = traces["policy"].get("publications", {})
+    ends = traces["policy"].get("episode_ends", {})
     if not q or not p:
         raise ValueError("No policy query/publication evidence; was B pressed?")
     result = {
@@ -122,6 +123,9 @@ def analyze_session(session):
             },
             "boundaries": [],
         }
+        end_ns = np.asarray(
+            [t for r, t in zip(ends.get("run_id", []), ends.get("timestamp_ns", [])) if r == run]
+        )
         for old_id, new_id in zip(ids[:-1][boundary], ids[1:][boundary]):
             oc, nc = int(p["chunk_id"][old_id]), int(p["chunk_id"][new_id])
             previous = ids[p["chunk_id"][ids] == oc]
@@ -130,6 +134,12 @@ def analyze_session(session):
             if p["chunk_step"][new_id] != 0:
                 continue
             oi, ni = query_lookup[(int(run), oc)], query_lookup[(int(run), nc)]
+            if "episode" in q and q["episode"][oi] != q["episode"][ni]:
+                continue
+            if np.any(
+                (end_ns >= q["infer_start_ns"][oi]) & (end_ns <= p["publish_end_ns"][new_id])
+            ):
+                continue
             old, new = q["pred_action"][oi], q["pred_action"][ni]
             comparison = compare_chunks(old, new, n_obs_steps=nobs, n_action_steps=nact)
             entry = {
@@ -145,6 +155,25 @@ def analyze_session(session):
                 ),
                 "new_inference_ms": float((q["infer_end_ns"][ni] - q["infer_start_ns"][ni]) / 1e6),
             }
+            # A recovery pair needs consecutive accepted steps, not the next available row.
+            following = new_id + 1
+            if (
+                new_id == old_id + 1
+                and following < len(p["run_id"])
+                and p["accepted"][following]
+                and p["run_id"][following] == run
+                and p["chunk_id"][following] == nc
+                and p["chunk_step"][following] == 1
+                and not np.any(
+                    (end_ns >= q["infer_start_ns"][oi]) & (end_ns <= p["publish_end_ns"][following])
+                )
+            ):
+                entry["post_boundary_interval_ms"] = float(
+                    (p["publish_end_ns"][following] - p["publish_end_ns"][new_id]) / 1e6
+                )
+                entry["boundary_pair_span_ms"] = float(
+                    (p["publish_end_ns"][following] - p["publish_end_ns"][old_id]) / 1e6
+                )
             for part, sl in (("arm", slice(0, 7)), ("hand", slice(7, 19))):
                 entry[part] = {
                     name + "_deg": np.rad2deg(value[..., sl]).tolist()
@@ -159,6 +188,13 @@ def analyze_session(session):
                     float(a @ b / denom) if denom > 1e-12 else None
                 )
             run_report["boundaries"].append(entry)
+        for metric in ("post_boundary_interval_ms", "boundary_pair_span_ms", "query_drift_ms"):
+            run_report[metric] = statistics(
+                [entry[metric] for entry in run_report["boundaries"] if metric in entry]
+            )
+        run_report["boundary_recovery_skipped"] = (
+            len(run_report["boundaries"]) - run_report["boundary_pair_span_ms"]["count"]
+        )
         worker_times = {}
         for owner in ("arm", "hand"):
             commands = traces[owner].get("commands", {})
@@ -314,6 +350,10 @@ def write_analysis(session):
                 "",
                 f"## Run {run}",
                 f"发布间隔 ms：{metrics['publication_interval_ms']}",
+                f"boundary 后间隔 ms：{metrics['post_boundary_interval_ms']}",
+                f"boundary 恢复 pair span ms：{metrics['boundary_pair_span_ms']}",
+                f"跳过的不完整恢复 pair：{metrics['boundary_recovery_skipped']}",
+                f"query drift ms：{metrics['query_drift_ms']}",
                 f"末端目标步进 mm：{metrics['eef_published_step_mm']}",
                 f"arm：{metrics['arm']}",
                 f"hand：{metrics['hand']}",

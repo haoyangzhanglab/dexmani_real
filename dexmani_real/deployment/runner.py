@@ -276,6 +276,9 @@ class PolicyRunner:
             return
         if now < self.next_step_ns:
             return
+        # Observation, synchronous inference and publication share this tick's budget.
+        tick_start_ns = now
+        self.next_step_ns = tick_start_ns + int(self.policy_info.control_dt_s * 1e9)
         row = initial[0] if initial is not None else self._read_observation()
         if row is None:
             self._finish_episode("required_observation_stale")
@@ -325,7 +328,7 @@ class PolicyRunner:
                 )
             if self.recorder is not None:
                 self.recorder.check_error()
-            self.stats.inference_ms.append((time.monotonic_ns() - start) / 1e6)
+            self.stats.inference_ms.append((inference_end - start) / 1e6)
             if not self._has_motion_authority() or epoch != int(self.shared.run_id.value):
                 self.action_queue.clear()
                 return
@@ -378,7 +381,6 @@ class PolicyRunner:
                     build_episode_frame(row),
                     step_timestamp_ns=time.monotonic_ns(),
                 )
-            self.next_step_ns = time.monotonic_ns() + int(self.policy_info.control_dt_s * 1e9)
             return
         prepared_arm = arm
         self.stats.arm_clip_count += int(decoded.arm_clip_rad > 1e-9)
@@ -414,7 +416,6 @@ class PolicyRunner:
         self.stats.previous_step_ns = stamp
         self.previous_arm = prepared_arm
         self.stats.publications += 1
-        self.next_step_ns = stamp + int(self.policy_info.control_dt_s * 1e9)
         if self.recorder:
             self.recorder.add_frame(
                 build_episode_frame(row, command),
