@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -15,6 +13,7 @@ from scipy.spatial.transform import Rotation
 
 from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.utils.atomic_io import atomic_json_dump
+from dexmani_real.utils.geometry import validate_rigid_transform, validate_rotation_matrix
 
 ARUCO_DICT = cv2.aruco.DICT_7X7_50
 ARUCO_DICT_NAME = "7x7_50"
@@ -249,9 +248,7 @@ def _compute_closed_loop_errors(
         T_ee_marker = np.linalg.inv(T_base_ee) @ T_base_camera @ T_camera_marker
         positions.append(T_ee_marker[:3, 3].copy())
         R_ee_marker = T_ee_marker[:3, :3]
-        det_val = float(np.linalg.det(R_ee_marker))
-        if not np.isfinite(det_val) or abs(det_val - 1.0) > 0.01:
-            raise ValueError(f"degenerate T_ee_marker rotation (det={det_val:.3f})")
+        validate_rotation_matrix(R_ee_marker, name="T_ee_marker rotation")
         rotations.append(R_ee_marker)
 
     positions_arr = np.array(positions)
@@ -411,11 +408,7 @@ def save_camera_calibration(
     calibration_capture: Mapping[str, object] | None = None,
 ) -> None:
     """Write calibration result to cameras.json, preserving other entries."""
-    T_world_camera = np.asarray(T_world_camera, dtype=np.float64)
-    if T_world_camera.shape != (4, 4) or not np.all(np.isfinite(T_world_camera)):
-        raise ValueError("T_world_camera must be a finite 4x4 transform")
-    if not np.allclose(T_world_camera[3], [0.0, 0.0, 0.0, 1.0]):
-        raise ValueError("T_world_camera must have homogeneous final row [0, 0, 0, 1]")
+    T_world_camera = validate_rigid_transform(T_world_camera, label="T_world_camera")
     if not serial.strip():
         raise ValueError("camera serial must be non-empty")
     rot = Rotation.from_matrix(T_world_camera[:3, :3])
@@ -458,12 +451,6 @@ def save_camera_calibration(
         while f"camera_{idx}" in existing:
             idx += 1
         cam_name = f"camera_{idx}"
-
-    if json_path.exists():
-        backup = json_path.with_suffix(f".json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        # Copy before the atomic write so cameras.json is never briefly absent.
-        shutil.copy2(json_path, backup)
-        print(f"  backed up previous config → {backup.name}")
 
     existing[cam_name] = entry
     try:

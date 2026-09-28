@@ -8,7 +8,7 @@ import numpy as np
 
 from dexmani_real.dataset.contracts import (
     ProcessingConfig,
-    validate_task_name,
+    validate_task_identity,
 )
 from dexmani_real.dataset.pointcloud import (
     RawEpisodePointCloudDeriver,
@@ -26,7 +26,7 @@ from dexmani_real.recording.storage.schema import DATASET_SPECS
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
 
-def validate_episode(reader: EpisodeReader) -> int:
+def validate_canonical_teleop_episode(reader: EpisodeReader) -> int:
     """Admit every row of a complete teleop episode, or reject the whole episode."""
     meta = reader.meta
     frames = reader.num_frames
@@ -35,7 +35,7 @@ def validate_episode(reader: EpisodeReader) -> int:
     task_label = meta["task_label"]
     if isinstance(task_label, bytes):
         task_label = task_label.decode("utf-8")
-    validate_task_name(task_label)
+    validate_task_identity(task_label)
     collection_source = meta["collection_source"]
     if isinstance(collection_source, bytes):
         collection_source = collection_source.decode("utf-8")

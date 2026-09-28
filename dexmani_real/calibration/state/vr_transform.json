@@ -1,28 +1,7 @@
 {
-  "schema_version": 1,
-  "description": "Fixed VR-to-robot transform (FLU\u2192robot frame)",
-  "T_vr_to_robot": [
-    [
-      0.2666746542984278,
-      0.9637866095535951,
-      0.0
-    ],
-    [
-      -0.9637866095535951,
-      0.2666746542984278,
-      0.0
-    ],
-    [
-      0.0,
-      0.0,
-      1.0
-    ]
-  ],
-  "theta_deg": 74.5335151934751,
-  "convention": "R_z(-theta) maps VR FLU forward \u2192 robot base +X",
   "ref": "head",
+  "theta_deg": 74.5335151934751,
   "quality": {
-    "grade": "excellent",
     "std_deg": 0.2527781328442123,
     "max_deviation_deg": 0.5758639777159997,
     "frames": 649

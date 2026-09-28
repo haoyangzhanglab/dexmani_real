@@ -28,7 +28,7 @@ logger = get_logger(__name__)
 DEFAULT_TASK_NAME = "test"
 
 
-def validate_task_name(value: str) -> str:
+def validate_task_dir_name(value: str) -> str:
     """Validate one task name as a safe directory component."""
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError("task_name must be a non-empty string without surrounding whitespace")
@@ -87,7 +87,7 @@ def _build_processes(
 
 
 def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, allow_no_hand=False):
-    task_name = validate_task_name(task_name)
+    task_name = validate_task_dir_name(task_name)
     if not runtime.policy.hand_enabled and (runtime.policy.recording_enabled or not allow_no_hand):
         raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")
     if runtime.policy.recording_enabled:
@@ -142,7 +142,7 @@ def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, allow_no_hand
     except Exception:
         logger.exception("teleop session failed")
     finally:
-        report = supervisor.shutdown(
+        shutdown_clean = supervisor.shutdown(
             graceful_timeout_s=runtime.safety.shutdown_timeout_s,
         )
     return int(
@@ -150,5 +150,5 @@ def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, allow_no_hand
         or shared.error_state.value
         or shared.estop_request.value
         or int(shared.safety_state.value) == int(SafetyState.FAULT)
-        or not report.clean
+        or not shutdown_clean
     )

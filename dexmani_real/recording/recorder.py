@@ -18,14 +18,13 @@ from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT
 from dexmani_real.recording.storage.video import VideoDecoder, VideoEncoder
 from dexmani_real.sensor.camera.geometry import RGBDGeometry, validate_aligned_depth_distortion
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
+from dexmani_real.utils.geometry import validate_rigid_transform, validate_unit_quaternion_wxyz
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 HARD_MAX_RECORD_FRAMES = 10_000
 RECORDER_START_TIMEOUT_S = 10.0
 RECORDER_STOP_TIMEOUT_S = 60.0
-_RIGID_ATOL = 1e-6
-_MOUNT_QUAT_ATOL = 1e-6
 _COLLECTION_SOURCES = frozenset({"teleop", "policy_rollout"})
 _STOP = object()
 
@@ -74,23 +73,6 @@ def _validate_explicit_episode_name(episode_name: str) -> None:
         )
 
 
-def _validate_rigid_transform(value: object, *, label: str) -> np.ndarray:
-    try:
-        transform = np.asarray(value, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{label} must be numeric") from exc
-    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
-        raise ValueError(f"{label} must be a finite 4x4 transform")
-    rotation = transform[:3, :3]
-    if (
-        not np.allclose(transform[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9, rtol=0.0)
-        or not np.allclose(rotation.T @ rotation, np.eye(3), atol=_RIGID_ATOL, rtol=0.0)
-        or not np.isclose(np.linalg.det(rotation), 1.0, atol=_RIGID_ATOL, rtol=0.0)
-    ):
-        raise ValueError(f"{label} must be a finite rigid homogeneous transform")
-    return transform.copy()
-
-
 def _validate_hand_mount(
     handbase_position_eef_m: object,
     handbase_quat_eef_wxyz: object,
@@ -104,8 +86,7 @@ def _validate_hand_mount(
         raise ValueError("handbase_position_eef_m must have shape (3,) and finite values")
     if quaternion.shape != (4,) or not np.all(np.isfinite(quaternion)):
         raise ValueError("handbase_quat_eef_wxyz must have shape (4,) and finite values")
-    if not np.isclose(np.linalg.norm(quaternion), 1.0, atol=_MOUNT_QUAT_ATOL, rtol=0.0):
-        raise ValueError("handbase_quat_eef_wxyz must be unit length within 1e-6")
+    validate_unit_quaternion_wxyz(quaternion, name="handbase_quat_eef_wxyz")
     return position.copy(), quaternion.copy()
 
 
@@ -236,7 +217,7 @@ class AsyncEpisodeRecorder:
             raise ValueError("depth_scale must be numeric") from exc
         if not np.isfinite(depth_scale_value) or depth_scale_value <= 0.0:
             raise ValueError("depth_scale must be finite and positive")
-        transform = _validate_rigid_transform(
+        transform = validate_rigid_transform(
             camera_T_xarm_base_from_color,
             label="camera_T_xarm_base_from_color",
         )

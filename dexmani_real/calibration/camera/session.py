@@ -636,6 +636,9 @@ def run_camera_calibration(
             ),
         ]
         for process in processes:
+            if process.name not in runtime.safety.readiness_timeouts_s:
+                raise ValueError(f"active process {process.name!r} requires a readiness timeout")
+        for process in processes:
             process.start()
         arm_process = processes[0]
         for process in processes:
@@ -667,13 +670,13 @@ def run_camera_calibration(
         if started:
             try:
                 clean_exit = exit_code == 0
-                shutdown_report = shutdown_processes_verified(
+                workers_clean = shutdown_processes_verified(
                     shared,
                     started,
                     graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
                 )
                 shutdown_clean = (
-                    shutdown_report.clean
+                    workers_clean
                     and not bool(shared.error_state.value)
                     and not bool(shared.estop_request.value)
                     and int(shared.safety_state.value) == int(SafetyState.DISARMED)
@@ -681,7 +684,7 @@ def run_camera_calibration(
                 if clean_exit and not shutdown_clean:
                     logger.error(
                         "verified shutdown invalidated the clean control exit: %s",
-                        shutdown_report,
+                        workers_clean,
                     )
                     exit_code = 1
             except RuntimeError:

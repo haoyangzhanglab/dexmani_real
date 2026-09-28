@@ -1,4 +1,4 @@
-"""Preflight Raw episodes, then atomically export the accepted episodes in full."""
+"""Strict teleop admission into a rebuildable, one-task canonical cache."""
 
 from __future__ import annotations
 
@@ -16,13 +16,13 @@ from dexmani_real.dataset.contracts import (
     CANONICAL_FORMAT,
     ProcessingConfig,
     canonical_array_specs,
-    validate_task_name,
+    validate_task_identity,
 )
 from dexmani_real.dataset.pointcloud import load_raw_episode_camera_model
 from dexmani_real.dataset.processing import (
     discover_episode_dirs,
     iter_canonical_blocks,
-    validate_episode,
+    validate_canonical_teleop_episode,
 )
 from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
 from dexmani_real.utils.atomic_io import target_is_occupied
@@ -50,7 +50,7 @@ class CanonicalExportConfig:
         ):
             raise ValueError("compression_level must be an integer in [0, 9]")
         if self.expected_task_name is not None:
-            validate_task_name(self.expected_task_name)
+            validate_task_identity(self.expected_task_name)
 
 
 def export_raw_to_zarr(
@@ -60,6 +60,7 @@ def export_raw_to_zarr(
     *,
     processing: ProcessingConfig,
     exclude: tuple[str, ...] = (),
+    overwrite: bool = False,
     progress_callback=None,
 ) -> dict:
     """Reject incomplete Raw episodes before writing; publish accepted episodes in full.
@@ -71,10 +72,13 @@ def export_raw_to_zarr(
     if not isinstance(processing, ProcessingConfig):
         raise TypeError("processing must be an explicit ProcessingConfig")
     source, target = Path(input_root).resolve(), Path(output_path).expanduser().resolve()
-    if target == source or source in target.parents:
-        raise ValueError("output must be outside the raw input")
-    if target_is_occupied(Path(output_path).expanduser()) or target_is_occupied(target):
-        raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {target}")
+    if target == source or source in target.parents or target in source.parents:
+        raise ValueError("output and Raw input must not contain one another")
+    output = Path(output_path).expanduser()
+    if output.is_symlink():
+        raise ValueError("canonical output must not be a symlink")
+    if target_is_occupied(target):
+        _require_replaceable_cache(target, overwrite)
     if any(p.suffix == ".zarr" and p.exists() for p in target.parents):
         raise ValueError("output must not be inside an existing Zarr store")
     episodes = discover_episode_dirs(source)
@@ -96,7 +100,7 @@ def export_raw_to_zarr(
                 except FileNotFoundError as exc:
                     raise RawDataError(f"missing required file: {name}") from exc
             with EpisodeReader(episode) as reader:
-                validate_episode(reader)
+                validate_canonical_teleop_episode(reader)
         except RawDataError as exc:
             rejected[episode.name] = str(exc)
             logger.warning("Rejected %s: %s", episode.name, exc)
@@ -113,7 +117,7 @@ def export_raw_to_zarr(
                 progress_callback(index, len(accepted))
             with EpisodeReader(episode) as reader:
                 frames = reader.num_frames
-                task = validate_task_name(reader.meta["task_label"])
+                task = validate_task_identity(reader.meta["task_label"])
                 if config.expected_task_name is not None and task != config.expected_task_name:
                     raise ValueError(
                         f"{episode.name}: task_name={task!r}, expected {config.expected_task_name!r}"
@@ -131,6 +135,8 @@ def export_raw_to_zarr(
                     pointcloud_config=processing.pointcloud.to_dict(),
                     fingertip_link_names=list(processing.fingertip_link_names),
                 )
+                # Task is store organization; dt is a training/deployment numerical fact.
+                # Depth scale describes this cache's stored depth, not the Policy ABI.
                 if first_attrs is not None:
                     if task != first_attrs["task_name"] or not np.isclose(
                         reader.dt, first_attrs["dt"], rtol=0, atol=1e-12
@@ -202,8 +208,10 @@ def export_raw_to_zarr(
         (staging / "export_report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
+        _validate_staging(staging, first_tails, ends, config.chunk_frames)
         if target_is_occupied(target):
-            raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {target}")
+            _require_replaceable_cache(target, overwrite)
+            shutil.rmtree(target)
         staging.rename(target)
         staging = None
         if progress_callback:
@@ -217,3 +225,27 @@ def export_raw_to_zarr(
                 shutil.rmtree(staging)
             except OSError:
                 logger.warning("Could not remove export staging %s", staging, exc_info=True)
+
+
+def _require_replaceable_cache(target, overwrite):
+    if not overwrite:
+        raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {target}")
+    if target.is_symlink() or not target.is_dir():
+        raise ValueError("overwrite requires an existing canonical cache directory")
+    if zarr.open_group(str(target), mode="r").attrs.get("format") != CANONICAL_FORMAT:
+        raise ValueError("overwrite is only allowed for a canonical cache")
+
+
+def _validate_staging(path, tails, ends, chunk_frames):
+    """Read the complete staged cache before removing an explicitly replaced cache."""
+    root = zarr.open_group(str(path), mode="r")
+    if not np.array_equal(root["meta/episode_ends"][:], ends):
+        raise ValueError("staged episode boundaries differ from Raw")
+    for key, (tail, dtype) in tails.items():
+        array = root[f"data/{key}"]
+        if array.shape != (ends[-1], *tail) or array.dtype != dtype:
+            raise ValueError(f"{key}: staged shape/dtype mismatch")
+        for start in range(0, ends[-1], chunk_frames):
+            values = array[start : start + chunk_frames]
+            if np.issubdtype(dtype, np.floating) and not np.isfinite(values).all():
+                raise ValueError(f"{key}: staged nonfinite values")

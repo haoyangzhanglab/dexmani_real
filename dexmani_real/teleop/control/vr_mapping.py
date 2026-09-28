@@ -8,13 +8,10 @@ import numpy as np
 from transforms3d.axangles import axangle2mat, mat2axangle
 from transforms3d.quaternions import mat2quat, quat2mat
 
-from dexmani_real.planning.kinematics.pose import normalize_quat_wxyz
-from dexmani_real.teleop.vr_transform import validate_rotation_matrix
+from dexmani_real.utils.geometry import normalize_quat_wxyz, validate_rotation_matrix
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-_QUAT_NORM_EPS = 1e-12
 
 
 def _finite_vector(value: np.ndarray, shape: tuple[int, ...], name: str) -> np.ndarray:
@@ -23,15 +20,6 @@ def _finite_vector(value: np.ndarray, shape: tuple[int, ...], name: str) -> np.n
     if array.shape != shape or not np.all(np.isfinite(array)):
         raise ValueError(f"{name} must be a finite array with shape {shape}")
     return array.copy()
-
-
-def _unit_quat_wxyz(value: np.ndarray, name: str) -> np.ndarray:
-    """Validate and normalize one wxyz quaternion without identity fallback."""
-    quat = _finite_vector(value, (4,), name)
-    norm = float(np.linalg.norm(quat))
-    if norm < _QUAT_NORM_EPS:
-        raise ValueError(f"{name} norm is too small")
-    return quat / norm
 
 
 def _clip_signed_axis_angle(
@@ -55,7 +43,6 @@ class VRWristMapper:
         vr_to_robot_rot: np.ndarray | None = None,
         base_to_world_rot: np.ndarray | None = None,
         max_delta_rot_rad: float = 1.0,
-        max_per_frame_rot_rad: float = 0.52,
     ) -> None:
         if not np.isfinite(pos_scale):
             raise ValueError("pos_scale must be finite")
@@ -63,8 +50,6 @@ class VRWristMapper:
             raise ValueError("rot_scale must be finite and >= 0")
         if not np.isfinite(max_delta_rot_rad) or max_delta_rot_rad <= 0:
             raise ValueError("max_delta_rot_rad must be finite and > 0")
-        if not np.isfinite(max_per_frame_rot_rad) or max_per_frame_rot_rad <= 0:
-            raise ValueError("max_per_frame_rot_rad must be finite and > 0")
         self.pos_scale = pos_scale
         self.rot_scale = rot_scale
         self.vr_to_robot_rot = (
@@ -78,14 +63,12 @@ class VRWristMapper:
             else validate_rotation_matrix(base_to_world_rot, name="base_to_world_rot")
         )
         self.max_delta_rot_rad = max_delta_rot_rad
-        self.max_per_frame_rot_rad = max_per_frame_rot_rad
 
         self.wrist_pos0: np.ndarray | None = None
         self.wrist_rot0: np.ndarray | None = None
         self.eef_pos0: np.ndarray | None = None
         self.eef_rot0: np.ndarray | None = None
         self.last_quat_wxyz: np.ndarray | None = None
-        self._accepted_wrist_rot: np.ndarray | None = None
 
     def reset(
         self,
@@ -97,9 +80,9 @@ class VRWristMapper:
         # Validate before committing the new anchor; failed resets clear stale state.
         try:
             next_wrist_pos0 = _finite_vector(wrist_pos, (3,), "wrist_pos")
-            next_wrist_rot0 = quat2mat(_unit_quat_wxyz(wrist_quat_wxyz, "wrist_quat_wxyz"))
+            next_wrist_rot0 = quat2mat(normalize_quat_wxyz(wrist_quat_wxyz, name="wrist_quat_wxyz"))
             next_eef_pos0 = _finite_vector(eef_pos, (3,), "eef_pos")
-            next_eef_rot0 = quat2mat(_unit_quat_wxyz(eef_quat_wxyz, "eef_quat_wxyz"))
+            next_eef_rot0 = quat2mat(normalize_quat_wxyz(eef_quat_wxyz, name="eef_quat_wxyz"))
         except (TypeError, ValueError):
             self.clear()
             logger.warning(
@@ -114,7 +97,6 @@ class VRWristMapper:
         # Seed the quaternion in WORLD coordinates for continuity checks.
         _eef_rot0_world = self.base_to_world_rot @ self.eef_rot0
         self.last_quat_wxyz = mat2quat(_eef_rot0_world)
-        self._accepted_wrist_rot = self.wrist_rot0.copy()
 
     def map(
         self,
@@ -126,34 +108,17 @@ class VRWristMapper:
 
         try:
             current_wrist_pos = _finite_vector(wrist_pos, (3,), "wrist_pos")
-            wrist_rot = quat2mat(_unit_quat_wxyz(wrist_quat_wxyz, "wrist_quat_wxyz"))
+            wrist_rot = quat2mat(normalize_quat_wxyz(wrist_quat_wxyz, name="wrist_quat_wxyz"))
         except (TypeError, ValueError):
             logger.warning("VRWristMapper.map: invalid wrist pose — no target", exc_info=True)
             return None
-
-        # Advance from the previously accepted pose, not from a raw tracking
-        # sample. A clamped spike can therefore never bypass the next frame's
-        # rotation-rate bound.
-        accepted_wrist_rot = wrist_rot
-        if self._accepted_wrist_rot is not None:
-            frame_delta = wrist_rot @ self._accepted_wrist_rot.T
-            frame_delta_clamped, frame_angle, was_clamped = _clip_signed_axis_angle(
-                frame_delta, self.max_per_frame_rot_rad
-            )
-            if was_clamped:
-                logger.warning(
-                    "Per-frame rotation spike: %.1f° -> clamped to %.1f°",
-                    np.rad2deg(frame_angle),
-                    np.rad2deg(np.copysign(self.max_per_frame_rot_rad, frame_angle)),
-                )
-                accepted_wrist_rot = frame_delta_clamped @ self._accepted_wrist_rot
 
         delta_pos_vr = current_wrist_pos - self.wrist_pos0
         delta_pos_base = self.pos_scale * (self.vr_to_robot_rot @ delta_pos_vr)
         # Rotate the base-frame delta into world coordinates before adding it.
         delta_pos_world = self.base_to_world_rot @ delta_pos_base
 
-        delta_rot_vr = accepted_wrist_rot @ self.wrist_rot0.T  # type: ignore[union-attr]  # is_ready() gate above implies reset() ran (wrist_rot0 set)
+        delta_rot_vr = wrist_rot @ self.wrist_rot0.T  # type: ignore[union-attr]  # is_ready() gate above implies reset() ran (wrist_rot0 set)
         delta_rot_vr = self.scale_rot(delta_rot_vr)
         delta_rot_vr = self._clip_total_delta_rot(delta_rot_vr)
         # Re-express the VR rotation delta in robot-base axes.
@@ -174,7 +139,6 @@ class VRWristMapper:
             return None
 
         # Commit temporal state only after input and output validation succeeds.
-        self._accepted_wrist_rot = accepted_wrist_rot.copy()
         self.last_quat_wxyz = target_quat_wxyz.copy()
 
         return {
@@ -188,7 +152,6 @@ class VRWristMapper:
         self.eef_pos0 = None
         self.eef_rot0 = None
         self.last_quat_wxyz = None
-        self._accepted_wrist_rot = None
 
     def is_ready(self) -> bool:
         return all(
@@ -198,7 +161,6 @@ class VRWristMapper:
                 self.wrist_rot0,
                 self.eef_pos0,
                 self.eef_rot0,
-                self._accepted_wrist_rot,
             )
         )
 

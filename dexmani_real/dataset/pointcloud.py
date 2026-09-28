@@ -18,6 +18,7 @@ from dexmani_real.sensor.camera.geometry import (
     validate_aligned_depth_distortion,
 )
 from dexmani_real.sensor.pointcloud import build_point_cloud
+from dexmani_real.utils.geometry import validate_rigid_transform
 
 
 @dataclass(frozen=True)
@@ -26,20 +27,6 @@ class RawEpisodeCameraModel:
 
     geometry: RGBDGeometry
     depth_scale_m: float
-
-
-def validate_rigid_transform(transform: np.ndarray, *, label: str) -> np.ndarray:
-    """Return a validated finite rigid homogeneous 4x4 transform."""
-    value = np.asarray(transform, dtype=np.float64).reshape(4, 4)
-    rotation = value[:3, :3]
-    if (
-        not np.all(np.isfinite(value))
-        or not np.allclose(value[3], (0.0, 0.0, 0.0, 1.0), atol=1e-8, rtol=0.0)
-        or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5, rtol=0.0)
-        or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-5, rtol=0.0)
-    ):
-        raise ValueError(f"{label} must be a finite rigid homogeneous transform")
-    return value
 
 
 def _color_intrinsics_from_meta(meta: Any) -> CameraIntrinsics:
@@ -84,7 +71,7 @@ def load_raw_episode_base_from_color(reader: EpisodeReader) -> np.ndarray:
     """Return Raw's static aligned-color camera to xArm-base transform."""
     meta = reader.meta
     transform = validate_rigid_transform(
-        np.asarray(meta["camera_T_xarm_base_from_color"]),
+        np.asarray(meta["camera_T_xarm_base_from_color"]).reshape(4, 4),
         label="camera_T_xarm_base_from_color",
     )
     transform = transform.copy()

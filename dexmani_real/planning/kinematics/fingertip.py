@@ -9,7 +9,6 @@ import numpy as np
 from dexmani_real.planning.kinematics.pose import (
     Pose,
     compose_pose,
-    normalize_quat_wxyz,
     quat_wxyz_to_rotmat,
     rot6d_to_quat_wxyz,
 )
@@ -18,6 +17,7 @@ from dexmani_real.robot.model import (
     HAND_FINGERTIP_SHAPE,
     HAND_JOINT_SHAPE,
 )
+from dexmani_real.utils.geometry import normalize_quat_wxyz
 
 
 def compute_fingertip_points_xarm_base(

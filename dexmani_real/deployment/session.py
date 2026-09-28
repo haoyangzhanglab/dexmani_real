@@ -162,7 +162,7 @@ def run_policy_deployment(
                     graceful_timeout_s=runtime.safety.shutdown_timeout_s,
                 )
                 raise RuntimeError("operator thread still uses channels; refusing SHM release")
-        report = supervisor.shutdown(
+        shutdown_clean = supervisor.shutdown(
             graceful_timeout_s=max(5.0, runtime.safety.shutdown_timeout_s),
         )
     return int(
@@ -171,5 +171,5 @@ def run_policy_deployment(
         or shared.error_state.value
         or shared.estop_request.value
         or int(shared.safety_state.value) == int(SafetyState.FAULT)
-        or not report.clean
+        or not shutdown_clean
     )

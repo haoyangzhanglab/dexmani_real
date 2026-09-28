@@ -12,7 +12,7 @@ from dexmani_real.config.hardware import HandParams
 from dexmani_real.config.pointcloud import PointCloudConfig
 
 
-def validate_task_name(value: str) -> str:
+def validate_task_identity(value: str) -> str:
     """Validate the shared policy task identity, not a path component."""
     if not isinstance(value, str):
         raise TypeError("task_name must be a string")

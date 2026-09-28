@@ -145,10 +145,10 @@ def run_keyboard_experiment(runtime, *, no_hand):
                 command_pose = None
     finally:
         keys.quiesce()
-        report = supervisor.shutdown(
+        shutdown_clean = supervisor.shutdown(
             graceful_timeout_s=runtime.safety.shutdown_timeout_s,
         )
         keys.stop()
     return int(
-        not clean or not report.clean or shared.error_state.value or shared.estop_request.value
+        not clean or not shutdown_clean or shared.error_state.value or shared.estop_request.value
     )

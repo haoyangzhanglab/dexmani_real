@@ -7,9 +7,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from dexmani_real.deployment.action import (
-    decode_policy_action,
-    make_action_planner,
     physical_action_dim,
+    policy_action_intent,
 )
 from dexmani_real.deployment.observation import build_fingertip_runtime, build_policy_observation
 from dexmani_real.planning.kinematics.ik import IKFailureKind
@@ -19,8 +18,8 @@ from dexmani_real.recording.recorder import (
     RecordingError,
     snapshot_recording_metadata,
 )
+from dexmani_real.robot.action import ActionRealizer
 from dexmani_real.robot.commands import RobotCommand, publish_command
-from dexmani_real.robot.projection import project_arm_command
 from dexmani_real.runtime.observation import ObservationHistory, read_observation
 from dexmani_real.runtime.safety import (
     RunEndReason,
@@ -92,7 +91,7 @@ class PolicyRunner:
         self.previous_arm = None
         self.completed = 0
         self.stats = RolloutStats()
-        self.planner = make_action_planner(policy_info.action_mode, runtime)
+        self.realizer = ActionRealizer.for_mode(runtime, policy_info.action_mode)
         fields = set(self.policy_info.observation_fields)
         requires_rgb = "rgb" in fields
         self.requires_cloud = "point_cloud" in fields
@@ -200,8 +199,7 @@ class PolicyRunner:
                 ):
                     raise RuntimeError("policy recorder refused START")
             self.model.reset_episode()
-            if self.planner is not None:
-                self.planner.reset_episode()
+            self.realizer.reset_episode()
             # START and model reset may block: only a new row can authorize motion.
             initial = self._start_observation()
             if initial is None:
@@ -313,15 +311,10 @@ class PolicyRunner:
                 self._finish_episode("required_observation_stale")
                 return
         action = self.action_queue.popleft()
-        decoded = decode_policy_action(
-            action,
-            self.policy_info.action_mode,
+        decoded = self.realizer.realize(
+            policy_action_intent(action, self.policy_info.action_mode),
             row.arm["qpos"][0],
-            previous_arm_command_qpos=self.previous_arm,
-            planner=self.planner,
-            workspace=self.runtime.policy.workspace.as_array(),
-            hand_qpos_min_rad=self.runtime.hand.qpos_min_rad,
-            hand_qpos_max_rad=self.runtime.hand.qpos_max_rad,
+            self.previous_arm,
         )
         arm, prepared_hand = decoded.arm_qpos, decoded.hand_qpos
         self.stats.workspace_clip_count += int(decoded.workspace_clip_m > 1e-9)
@@ -345,25 +338,9 @@ class PolicyRunner:
                 )
             self.next_step_ns = time.monotonic_ns() + int(self.policy_info.control_dt_s * 1e9)
             return
-        if self.policy_info.action_mode == "joint":
-            prepared_arm = project_arm_command(
-                arm,
-                row.arm["qpos"][0],
-                joint_lower_rad=self.runtime.arm.joint_limit_lower,
-                joint_upper_rad=self.runtime.arm.joint_limit_upper,
-            )
-            arm_change = prepared_arm - arm
-            equivalent = (
-                np.asarray(self.runtime.arm.joint_limit_upper)
-                - np.asarray(self.runtime.arm.joint_limit_lower)
-                >= 2 * np.pi
-            )
-            arm_change[equivalent] = (arm_change[equivalent] + np.pi) % (2 * np.pi) - np.pi
-            arm_clip = float(np.max(np.abs(arm_change)))
-            self.stats.arm_clip_count += int(arm_clip > 1e-9)
-            self.stats.max_arm_clip_rad = max(self.stats.max_arm_clip_rad, arm_clip)
-        else:
-            prepared_arm = arm
+        prepared_arm = arm
+        self.stats.arm_clip_count += int(decoded.arm_clip_rad > 1e-9)
+        self.stats.max_arm_clip_rad = max(self.stats.max_arm_clip_rad, decoded.arm_clip_rad)
         if self.recorder is not None:
             self.recorder.check_error()
         command = RobotCommand(self.run_id, prepared_arm, prepared_hand)

@@ -7,13 +7,12 @@ from pathlib import Path
 import numpy as np
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
-from dexmani_real.planning import XArm7MotionPlanner
-from dexmani_real.planning.kinematics.ik import make_online_ik_config
 from dexmani_real.recording.recorder import (
     AsyncEpisodeRecorder,
     RecordingError,
     snapshot_recording_metadata,
 )
+from dexmani_real.robot.action import ActionRealizer
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.runtime.observation import read_observation
@@ -294,9 +293,7 @@ class TeleopRunner:
             raise RuntimeError(f"startup hand home failed: {home_result.reason}")
         if self._poll_blocking_commands():
             return False
-        planner = XArm7MotionPlanner.create_default(
-            online_ik_profile=make_online_ik_config(self.runtime)
-        )
+        realizer = ActionRealizer.for_mode(self.runtime, "eef")
         calibration = load_vr_transform(VR_TRANSFORM_PATH)
         mapping = self.runtime.policy.vr_mapping
         mapper = VRWristMapper(
@@ -307,7 +304,7 @@ class TeleopRunner:
             base_to_world_rot=np.eye(3),
         )
         self.controller = TeleopController(
-            planner, mapper, self.runtime, _build_hand_retargeter(self.config)
+            realizer, mapper, self.runtime, _build_hand_retargeter(self.config)
         )
         if self._poll_blocking_commands():
             return False

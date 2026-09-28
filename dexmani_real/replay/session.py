@@ -98,11 +98,11 @@ def replay_episode(trajectory, runtime, config):
                     print("Return-home completed. H: planned return_home; Q: exit", flush=True)
     finally:
         keyboard.quiesce()
-        report = supervisor.shutdown(
+        shutdown_clean = supervisor.shutdown(
             graceful_timeout_s=runtime.safety.shutdown_timeout_s,
         )
         keyboard.stop()
-    if shared.error_state.value or shared.estop_request.value or not report.clean:
+    if shared.error_state.value or shared.estop_request.value or not shutdown_clean:
         outcome = ReplayOutcome(
             ReplayStatus.FAULT, outcome.replay_data, "hardware/shutdown failure"
         )

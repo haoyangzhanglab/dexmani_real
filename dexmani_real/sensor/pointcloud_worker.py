@@ -29,6 +29,7 @@ from dexmani_real.sensor.pointcloud import (
     POINT_CLOUD_TRANSFORM,
     build_point_cloud,
 )
+from dexmani_real.utils.geometry import validate_rigid_transform
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -38,22 +39,6 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _IDLE_POLL_S = 0.001
-
-
-def _validate_transform(value: np.ndarray, *, label: str) -> np.ndarray:
-    transform = np.asarray(value, dtype=np.float64).reshape(4, 4)
-    if (
-        not np.all(np.isfinite(transform))
-        or not np.allclose(transform[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9)
-        or not np.allclose(
-            transform[:3, :3].T @ transform[:3, :3],
-            np.eye(3),
-            atol=1e-6,
-        )
-        or not np.isclose(np.linalg.det(transform[:3, :3]), 1.0, atol=1e-6)
-    ):
-        raise ValueError(f"{label} must be a finite rigid homogeneous transform")
-    return transform
 
 
 @dataclass(frozen=True)
@@ -123,7 +108,7 @@ def _resolve_base_from_color(
             "realtime point-cloud worker currently requires an eye_to_hand camera; "
             "eye_in_hand needs a separately synchronized arm-pose contract"
         )
-    return _validate_transform(
+    return validate_rigid_transform(
         calibration.get_extrinsics(camera_name),
         label="T_xarm_base_from_color",
     )

@@ -1,10 +1,10 @@
 """Process readiness and liveness; observation freshness belongs to control steps."""
 
+import math
 import time
 
 from dexmani_real.runtime.processes import (
     _PHYSICAL_PROCESS_NAMES,
-    ShutdownReport,
     shutdown_processes_verified,
 )
 from dexmani_real.runtime.safety import (
@@ -19,6 +19,8 @@ logger = get_logger(__name__)
 
 
 def wait_subsystem_ready(shared, process, timeout_s, *, check=None):
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError(f"{process.name}: readiness timeout must be finite and positive")
     event = getattr(shared, f"{process.name}_ready")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -46,10 +48,16 @@ class RuntimeSupervisor:
     def start(self, processes, *, wait_ready=True) -> None:
         """Own child startup; a dependent worker may handle readiness when wait_ready=False."""
         for process in processes:
+            # Even deferred readiness (Teleop VR/policy) requires an explicit budget.
+            timeout = self.readiness_timeouts.get(process.name)
+            if timeout is None or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError(
+                    f"active process {process.name!r} requires a finite positive readiness timeout"
+                )
             process.start()
             self.started_processes.append(process)
             if wait_ready and not wait_subsystem_ready(
-                self.shared, process, self.readiness_timeouts[process.name], check=self.check
+                self.shared, process, timeout, check=self.check
             ):
                 raise RuntimeError(f"{process.name} failed to become ready")
 
@@ -90,7 +98,7 @@ class RuntimeSupervisor:
             time.sleep(0.02)
         return False
 
-    def shutdown(self, *, graceful_timeout_s=5.0) -> ShutdownReport:
+    def shutdown(self, *, graceful_timeout_s=5.0) -> bool:
         deadline = time.monotonic() + graceful_timeout_s
         if (
             self.shared.quit_requested.value

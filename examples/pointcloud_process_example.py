@@ -45,6 +45,7 @@ from dexmani_real.sensor.pointcloud import (
     build_raw_point_cloud,
 )
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
+from dexmani_real.utils.geometry import validate_rigid_transform
 
 if TYPE_CHECKING:
     import open3d as o3d
@@ -395,10 +396,7 @@ def _load_extrinsics(camera_info: dict) -> np.ndarray:
     cam_name = calib.resolve_name_by_serial(str(camera_info.get("serial", "")))
     base_from_color = np.asarray(calib.get_extrinsics(cam_name), dtype=np.float64)
 
-    if base_from_color.shape != (4, 4):
-        raise RuntimeError(f"Invalid extrinsic shape: {base_from_color.shape}")
-    if not np.allclose(base_from_color[3], [0, 0, 0, 1], atol=1e-6):
-        raise RuntimeError("Invalid homogeneous transform last row.")
+    base_from_color = validate_rigid_transform(base_from_color, label="camera extrinsics")
 
     pos = base_from_color[:3, 3]
     quat_xyzw = R.from_matrix(base_from_color[:3, :3]).as_quat()
@@ -466,13 +464,8 @@ def _calibrate_table(
         "yes",
     }
     if confirmed:
-        backup = publish_table_plane(plane_path, fit, confirmed=True)
-        if backup is not None:
-            print(f"  Backup: {backup}")
-        resolved_plane = resolve_table_plane(resolve_experiment_config().environment.table)
-        if not np.allclose(resolved_plane, fit.plane_abcd, rtol=0.0, atol=1e-12):
-            raise RuntimeError("published plane failed runtime-config round-trip")
-        print("  Published and runtime-config round-trip verified.")
+        publish_table_plane(plane_path, fit, confirmed=True)
+        print("  Published table calibration.")
     else:
         print("  Calibration file unchanged; using the new fit for this run only.")
     return fit.plane_abcd

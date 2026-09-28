@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 
 from dexmani_real.calibration import CAMERAS_PATH
+from dexmani_real.utils.geometry import normalize_quat_wxyz, validate_rigid_transform
 
 
 def _pose_to_matrix(position: list[float], orientation: list[float]) -> np.ndarray:
@@ -36,10 +37,7 @@ def _pose_to_matrix(position: list[float], orientation: list[float]) -> np.ndarr
         raise ValueError("camera pose position/orientation must have shapes (3,) and (4,)")
     if not np.all(np.isfinite(position_value)) or not np.all(np.isfinite(orientation_value)):
         raise ValueError("camera pose must contain only finite values")
-    norm = float(np.linalg.norm(orientation_value))
-    if norm <= 1e-12:
-        raise ValueError("camera pose orientation must be a non-zero WXYZ quaternion")
-    orientation_value = orientation_value / norm
+    orientation_value = normalize_quat_wxyz(orientation_value)
     px, py, pz = (float(value) for value in position_value)
     w, x, y, z = (float(value) for value in orientation_value)
     T = np.eye(4, dtype=np.float64)
@@ -70,16 +68,7 @@ class CameraExtrinsicsEntry:
             transform = getattr(self, name)
             if transform is None:
                 continue
-            value = np.asarray(transform, dtype=np.float64)
-            if (
-                value.shape != (4, 4)
-                or not np.all(np.isfinite(value))
-                or not np.allclose(value[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9)
-                or not np.allclose(value[:3, :3].T @ value[:3, :3], np.eye(3), atol=1e-6)
-                or not np.isclose(np.linalg.det(value[:3, :3]), 1.0, atol=1e-6)
-            ):
-                raise ValueError(f"{name} must be a finite rigid homogeneous transform")
-            owned = value.copy()
+            owned = validate_rigid_transform(transform, label=name)
             owned.setflags(write=False)
             object.__setattr__(self, name, owned)
 

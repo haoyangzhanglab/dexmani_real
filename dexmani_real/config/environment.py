@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
+
 
 @dataclass(frozen=True)
 class WorkspaceBounds:
@@ -81,8 +83,7 @@ class StaticCollisionBox:
             raise ValueError(
                 "static collision box size_xyz_m must contain positive full side lengths"
             )
-        if not np.isclose(float(np.linalg.norm(quat)), 1.0, rtol=0.0, atol=1e-6):
-            raise ValueError("static collision box quat_wxyz must be a unit quaternion")
+        validate_unit_quaternion_wxyz(quat, name="static collision box quaternion")
 
 
 @dataclass(frozen=True)

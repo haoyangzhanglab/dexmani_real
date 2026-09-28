@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from dexmani_real.utils.geometry import normalize_quat_wxyz
+
 
 @dataclass
 class Pose:
@@ -18,11 +20,9 @@ class Pose:
 
     def __init__(self, p: Any, q: Any) -> None:
         self.p = np.asarray(p, dtype=np.float64).reshape(3)
-        self.q = np.asarray(q, dtype=np.float64).reshape(4)
-        norm = np.linalg.norm(self.q)
-        if norm <= 1e-12:
-            raise ValueError("Pose quaternion norm is too small.")
-        self.q = self.q / norm
+        self.q = normalize_quat_wxyz(q)
+        if not np.isfinite(self.p).all():
+            raise ValueError("Pose position must be finite")
 
     @classmethod
     def identity(cls) -> "Pose":
@@ -43,7 +43,6 @@ __all__ = [
     "compute_pose_error",
     "forward_from_quat_wxyz",
     "invert_pose",
-    "normalize_quat_wxyz",
     "quat_multiply",
     "quat_wxyz_to_rot6d",
     "quat_wxyz_to_rotmat",
@@ -127,15 +126,6 @@ def compute_pose_error(target: Pose, actual: Pose) -> tuple[float, float]:
     q_dot = abs(float(np.dot(target.q, actual.q)))
     rotation_error = 2.0 * np.arccos(min(1.0, q_dot))
     return position_error, rotation_error
-
-
-def normalize_quat_wxyz(q: np.ndarray) -> np.ndarray:
-    """Normalize a wxyz quaternion, returning identity on degenerate input."""
-    q = np.asarray(q, dtype=np.float64).reshape(4)
-    norm = float(np.linalg.norm(q))
-    if norm < 1e-12:
-        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-    return q / norm
 
 
 def validate_rot6d_geometry(
@@ -235,7 +225,7 @@ def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
 
 def quat_wxyz_to_rot6d(q_wxyz: np.ndarray) -> np.ndarray:
     """WXYZ quaternion → 6D rotation (first two columns of the 3×3 rotation matrix)."""
-    quat_xyzw = wxyz_to_xyzw(np.asarray(q_wxyz, dtype=np.float64).reshape(4))
+    quat_xyzw = wxyz_to_xyzw(normalize_quat_wxyz(q_wxyz))
     R = Rotation.from_quat(quat_xyzw).as_matrix()
     return np.concatenate([R[:, 0], R[:, 1]])
 
@@ -245,7 +235,7 @@ def quat_wxyz_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
 
     Uses scipy.spatial.transform.Rotation for numerical stability.
     """
-    quat_xyzw = wxyz_to_xyzw(np.asarray(q_wxyz, dtype=np.float64).reshape(4))
+    quat_xyzw = wxyz_to_xyzw(normalize_quat_wxyz(q_wxyz))
     return Rotation.from_quat(quat_xyzw).as_matrix()
 
 
@@ -260,5 +250,5 @@ def forward_from_quat_wxyz(q_wxyz: np.ndarray) -> np.ndarray:
     Applies the quaternion rotation to the canonical forward vector [1, 0, 0],
     returning the resulting direction in world coordinates.
     """
-    quat_xyzw = wxyz_to_xyzw(np.asarray(q_wxyz, dtype=np.float64).reshape(4))
+    quat_xyzw = wxyz_to_xyzw(normalize_quat_wxyz(q_wxyz))
     return Rotation.from_quat(quat_xyzw).apply(np.array([1.0, 0.0, 0.0]))

@@ -160,6 +160,8 @@ Canonical 数据是面向策略训练的派生缓存。
 
 Canonical 不是新的实验事实，也不承担长期格式兼容。
 
+一个 store 当前只组织一个 task；`dt` 必须一致，属于训练/部署数值语义。`depth_scale` 在 store 内保持一致以解释存储深度，不作为 Policy 兼容元数据。导出默认拒绝已有路径；`examples/export_policy_zarr.py --overwrite` 会先完整构建、验证 staging，再替换已有 canonical cache，始终不修改 Raw。
+
 ## Repository Layout
 
 ```text

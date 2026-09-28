@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: python examples/export_policy_zarr.py episodes/<task_name>
 
-Exports complete Raw episodes to an immutable canonical Zarr generation.
+Exports complete Raw episodes to a rebuildable canonical Zarr cache.
 """
 
 from __future__ import annotations
@@ -12,18 +12,18 @@ from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-
 import yaml
 from tqdm import tqdm
 
 from dexmani_real.config.experiment import resolve_experiment_config, resolve_table_plane
-from dexmani_real.dataset.contracts import ProcessingConfig, validate_task_name
+from dexmani_real.dataset.contracts import ProcessingConfig, validate_task_identity
 from dexmani_real.dataset.export import (
     CanonicalExportConfig,
     export_raw_to_zarr,
 )
 from dexmani_real.utils.atomic_io import target_is_occupied
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -37,7 +37,7 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "One raw task or episode directory. Exports to "
             "datasets/<task_name>.zarr by default (see --output); existing "
-            "output paths are refused."
+            "output paths require --overwrite."
         ),
     )
     parser.add_argument(
@@ -45,9 +45,9 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Alternative Zarr output path for a NEW generation of this task "
+            "Alternative Zarr cache output path for this task "
             "(default: datasets/<task_name>.zarr). The task identity always "
-            "comes from the input directory. Existing outputs are refused, "
+            "comes from the input directory. Existing caches require --overwrite, "
             "and the resolved target (symlinks followed) must not fall "
             "inside the protected sources: episodes/, episodes_processed/, "
             "rollouts/, the input root, or an existing .zarr store."
@@ -70,6 +70,11 @@ def _parser() -> argparse.ArgumentParser:
         "--pointcloud-num-points",
         type=int,
         default=None,
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Rebuild and validate staging before replacing an existing canonical cache.",
     )
     parser.add_argument("--chunk-frames", type=int, default=100)
     parser.add_argument("--compression-level", type=int, default=3)
@@ -113,7 +118,7 @@ def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
     if not task_name or task_name in {".", ".."}:
         raise ValueError("input_root must name one task directory, e.g. episodes/pick_place_toy")
     try:
-        task_name = validate_task_name(task_name)
+        task_name = validate_task_identity(task_name)
     except (TypeError, ValueError) as exc:
         raise ValueError(
             "input_root must name one valid task directory, e.g. episodes/pick_place_toy"
@@ -165,7 +170,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
     progress = _ExportProgress()
     report: dict
-    if target_is_occupied(output_path):
+    if target_is_occupied(output_path) and not args.overwrite:
         print(
             f"error: refusing to overwrite existing output: {output_path}",
             file=sys.stderr,
@@ -184,6 +189,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config,
             processing=processing,
             exclude=tuple(args.exclude),
+            overwrite=args.overwrite,
             progress_callback=progress.update,
         )
     except (FileExistsError, FileNotFoundError, NotADirectoryError) as exc:

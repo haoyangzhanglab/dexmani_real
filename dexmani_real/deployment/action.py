@@ -1,13 +1,8 @@
-"""Decode physical policy actions using current robot geometry and limits."""
-
-from dataclasses import dataclass
+"""Interpret physical model output as source-neutral intent."""
 
 import numpy as np
 
-from dexmani_real.planning import Pose, XArm7MotionPlanner
-from dexmani_real.planning.kinematics.ik import IKResult, make_online_ik_config
-from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
-from dexmani_real.robot.projection import project_hand_command
+from dexmani_real.robot.action import ActionIntent
 
 
 def physical_action_dim(action_mode):
@@ -18,57 +13,9 @@ def physical_action_dim(action_mode):
     raise ValueError("action_mode must be joint or eef")
 
 
-def make_action_planner(action_mode, runtime):
-    physical_action_dim(action_mode)
-    if action_mode == "joint":
-        return None
-    return XArm7MotionPlanner.create_default(
-        online_ik_profile=make_online_ik_config(runtime, enable_random_fallback=True)
-    )
-
-
-@dataclass(frozen=True)
-class DecodedPolicyAction:
-    arm_qpos: np.ndarray | None
-    hand_qpos: np.ndarray
-    hand_clip_rad: float
-    workspace_clip_m: float = 0.0
-    ik_result: IKResult | None = None
-
-
-def decode_policy_action(
-    action,
-    action_mode,
-    current_arm_qpos,
-    *,
-    previous_arm_command_qpos,
-    planner,
-    workspace,
-    hand_qpos_min_rad,
-    hand_qpos_max_rad,
-):
-    action = np.asarray(action)
+def policy_action_intent(action, action_mode):
+    action = np.asarray(action, dtype=np.float64)
     if action.shape != (physical_action_dim(action_mode),) or not np.isfinite(action).all():
         raise ValueError("physical action must have the expected shape and finite values")
-    raw_hand = action[7:19] if action_mode == "joint" else action[9:21]
-    hand = project_hand_command(
-        raw_hand, qpos_min_rad=hand_qpos_min_rad, qpos_max_rad=hand_qpos_max_rad
-    )
-    hand_clip = float(np.max(np.abs(hand - raw_hand)))
-    if action_mode == "joint":
-        return DecodedPolicyAction(action[:7], hand, hand_clip)
-    planner.set_hand_qpos(hand)
-    position = np.clip(action[:3], workspace[:, 0], workspace[:, 1])
-    workspace_clip = float(np.max(np.abs(position - action[:3])))
-    result = planner.solve_online_ik(
-        Pose(p=position, q=rot6d_to_quat_wxyz(action[3:9])),
-        current_arm_qpos,
-        current_arm_qpos if previous_arm_command_qpos is None else previous_arm_command_qpos,
-    )
-    return DecodedPolicyAction(
-        result.qpos if result.success else None,
-        hand,
-        hand_clip,
-        workspace_clip_m=workspace_clip,
-        ik_result=result,
-    )
+    split = 7 if action_mode == "joint" else 9
+    return ActionIntent(action_mode, action[:split].copy(), action[split:].copy())

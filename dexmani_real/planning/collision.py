@@ -30,6 +30,7 @@ from dexmani_real.robot.model import (
     XHAND_MODEL_DIR,
     XHAND_URDF_JOINT_NAMES,
 )
+from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 logger = get_logger(__name__)
@@ -266,8 +267,7 @@ class CollisionModel:
             raise ValueError("static collision box center/size/quaternion shapes are invalid")
         if not np.all(np.isfinite(np.concatenate((center, size, quat)))) or np.any(size <= 0.0):
             raise ValueError("static collision box values must be finite and sizes positive")
-        if not np.isclose(float(np.linalg.norm(quat)), 1.0, rtol=0.0, atol=1e-6):
-            raise ValueError("static collision box quaternion must have unit norm")
+        validate_unit_quaternion_wxyz(quat, name="static collision box quaternion")
         return {
             "name": name,
             "center_xyz_m": center.copy(),

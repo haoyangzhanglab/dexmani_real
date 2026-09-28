@@ -1,17 +1,15 @@
-"""Pure table-plane fitting plus explicit transactional calibration publish."""
+"""Pure table-plane fitting plus explicit calibration replacement."""
 
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from dexmani_real.utils.atomic_io import atomic_json_dump
 
 
 @dataclass(frozen=True)
@@ -59,7 +57,6 @@ class TablePlaneFit:
     def to_dict(self) -> dict[str, Any]:
         a, b, c, d = self.plane_abcd
         return {
-            "schema_version": 1,
             "a": a,
             "b": b,
             "c": c,
@@ -192,38 +189,13 @@ def fit_table_plane(
     )
 
 
-def publish_table_plane(path: str | Path, fit: TablePlaneFit, *, confirmed: bool) -> Path | None:
-    """Atomically publish a confirmed fit and return the backup path, if any."""
+def publish_table_plane(path: str | Path, fit: TablePlaneFit, *, confirmed: bool) -> None:
+    """Replace current calibration with a validated, explicitly confirmed fit."""
     if not confirmed:
         raise PermissionError("table calibration publish requires explicit confirmation")
     target = Path(path)
     if not target.parent.is_dir():
         raise FileNotFoundError(f"table calibration directory does not exist: {target.parent}")
-
-    backup: Path | None = None
-    if target.exists():
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        backup = target.with_suffix(f".json.bak.{timestamp}")
-        shutil.copy2(target, backup)
-
     payload = fit.to_dict()
     payload["calibrated_at_utc"] = datetime.now(timezone.utc).isoformat()
-    descriptor, staging_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
-    )
-    staging = Path(staging_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(staging, target)
-        with target.open("r", encoding="utf-8") as stream:
-            readback = json.load(stream)
-        stored = tuple(float(readback[name]) for name in ("a", "b", "c", "d"))
-        if not np.allclose(stored, fit.plane_abcd, rtol=0.0, atol=1e-12):
-            raise RuntimeError("table plane readback does not match published fit")
-    finally:
-        staging.unlink(missing_ok=True)
-    return backup
+    atomic_json_dump(payload, target, ensure_ascii=False)

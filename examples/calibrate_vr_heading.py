@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import math
 import multiprocessing as mp
-import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,17 +19,17 @@ import numpy as np
 from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.config.hardware import VRParams
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
-from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz, normalize_quat_wxyz
+from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz
 from dexmani_real.runtime.processes import shutdown_processes_verified
 from dexmani_real.runtime.supervisor import wait_subsystem_ready
 from dexmani_real.sensor.vr_worker import run_vr_worker
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.vr_transform import (
-    VR_TRANSFORM_CONVENTION,
     VR_TRANSFORM_MIN_FRAMES,
-    VR_TRANSFORM_SCHEMA_VERSION,
+    parse_vr_transform,
 )
 from dexmani_real.utils.atomic_io import atomic_json_dump
+from dexmani_real.utils.geometry import normalize_quat_wxyz
 
 _MIN_FORWARD_NORM = 1e-6
 _POLL_INTERVAL_S = 0.01
@@ -51,16 +50,12 @@ class HeadingCalibrationConfig:
     settle_s: float = 3.0
     min_frames: int = VR_TRANSFORM_MIN_FRAMES
     outlier_sigma: float = 3.0
-    excellent_std_deg: float = 2.0
-    good_std_deg: float = 5.0
 
     def __post_init__(self) -> None:
         if self.duration_s <= 0.0:
             raise ValueError("duration_s must be positive")
         if self.min_frames < 5:
             raise ValueError("min_frames must be at least 5")
-        if self.excellent_std_deg >= self.good_std_deg:
-            raise ValueError("excellent_std_deg must be less than good_std_deg")
 
 
 def _circular_mean(
@@ -106,15 +101,12 @@ def _circular_mean(
     return theta, mean_fwd, full_inlier
 
 
-def _quality_grade(
+def _quality_measurements(
     forwards: np.ndarray,
     theta_mean: float,
     inlier: np.ndarray,
-    *,
-    excellent_std_deg: float = 2.0,
-    good_std_deg: float = 5.0,
-) -> dict[str, float | str]:
-    """Grade heading scatter for runtime preflight."""
+) -> dict[str, float]:
+    """Measure heading scatter for runtime preflight."""
     fwd_2d = forwards[:, :2]
     norms = np.linalg.norm(fwd_2d, axis=1)
     mask = (norms >= _MIN_FORWARD_NORM) & inlier
@@ -124,14 +116,7 @@ def _quality_grade(
     std_deg = float(np.rad2deg(np.std(dtheta)))
     max_dev = float(np.rad2deg(float(np.max(np.abs(dtheta)))))
 
-    if std_deg < excellent_std_deg:
-        grade = "excellent"
-    elif std_deg < good_std_deg:
-        grade = "good"
-    else:
-        grade = "poor"
     return {
-        "grade": grade,
         "std_deg": std_deg,
         "max_deviation_deg": max_dev,
     }
@@ -162,7 +147,7 @@ def _shutdown_vr_receiver(shared: RuntimeChannels, vr_proc: mp.Process) -> bool:
         shared.is_running.value = False
         return shared.close()
     try:
-        report = shutdown_processes_verified(
+        shutdown_clean = shutdown_processes_verified(
             shared,
             [vr_proc],
             graceful_timeout_s=_JOIN_TIMEOUT_S,
@@ -172,9 +157,9 @@ def _shutdown_vr_receiver(shared: RuntimeChannels, vr_proc: mp.Process) -> bool:
     except RuntimeError as exc:
         print(f"  ERROR: VR receiver shutdown could not be verified: {exc}")
         return False
-    if not report.clean:
-        print(f"  ERROR: VR receiver shutdown was not clean: {report}")
-    return report.clean
+    if not shutdown_clean:
+        print("  ERROR: VR receiver shutdown was not clean")
+    return shutdown_clean
 
 
 def _play_completion_audio() -> None:
@@ -338,20 +323,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: only {inlier_frames} inlier frames remain (< {cfg.min_frames} required)")
         return 1
     theta_deg = float(np.rad2deg(theta_rad))
-    quality = _quality_grade(
+    quality = _quality_measurements(
         forwards_arr,
         theta_rad,
         inlier,
-        excellent_std_deg=cfg.excellent_std_deg,
-        good_std_deg=cfg.good_std_deg,
     )
 
-    cos_t = np.cos(theta_rad)
-    sin_t = np.sin(theta_rad)
-    T = np.array(
-        [[cos_t, sin_t, 0.0], [-sin_t, cos_t, 0.0], [0.0, 0.0, 1.0]],
-        dtype=np.float64,
-    )
+    config = {
+        "theta_deg": theta_deg,
+        "ref": args.ref,
+        "quality": {**quality, "frames": inlier_frames},
+        "calibrated_at": datetime.now().isoformat(),
+    }
+    calibration = parse_vr_transform(config, reject_poor=False)
+    T = calibration.transform
 
     corrected = T @ np.array([mean_fwd[0], mean_fwd[1], 0.0])
 
@@ -365,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  theta:         {theta_deg:.1f}°")
     print(
         "  quality:       "
-        f"{quality['grade']} (σ={float(quality['std_deg']):.1f}°, "
+        f"{calibration.quality.grade} (σ={float(quality['std_deg']):.1f}°, "
         f"max={float(quality['max_deviation_deg']):.1f}°)"
     )
     print(f"  verification:  T·forward = [{corrected[0]:.4f}, {corrected[1]:.4f}] (expect [1, 0])")
@@ -375,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"    [{T[2, 0]:.4f}, {T[2, 1]:.4f}, {T[2, 2]:.4f}]")
     print(f"{'=' * 55}")
 
-    if quality["grade"] == "poor" and not args.force:
+    if calibration.quality.grade == "poor" and not args.force:
         print(
             f"\n  NOT written: quality grade is 'poor' "
             f"(σ={float(quality['std_deg']):.1f}°). Re-collect a steadier sample, "
@@ -383,22 +368,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    if VR_TRANSFORM_PATH.exists():
-        backup = VR_TRANSFORM_PATH.with_suffix(
-            f".json.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
-        shutil.copy2(VR_TRANSFORM_PATH, backup)
-        print(f"  backed up previous transform → {backup.name}")
-
-    config = {
-        "schema_version": VR_TRANSFORM_SCHEMA_VERSION,
-        "description": "Fixed VR-to-robot transform (FLU→robot frame)",
-        "T_vr_to_robot": T.tolist(),
-        "theta_deg": theta_deg,
-        "convention": VR_TRANSFORM_CONVENTION,
-        "ref": args.ref,
-        "quality": {**quality, "frames": inlier_frames},
-    }
     atomic_json_dump(config, VR_TRANSFORM_PATH)
     print(f"\nSaved to: {VR_TRANSFORM_PATH}")
 

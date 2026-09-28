@@ -11,6 +11,5 @@
     "max_abs_residual_m": 0.005997754247353184,
     "rms_residual_m": 0.0016757401184060272,
     "tilt_deg": 1.6552193248511748
-  },
-  "schema_version": 1
+  }
 }

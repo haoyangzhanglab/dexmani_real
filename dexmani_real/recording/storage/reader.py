@@ -16,6 +16,7 @@ import numpy as np
 from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT
 from dexmani_real.recording.storage.video import VideoDecoder
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics, validate_aligned_depth_distortion
+from dexmani_real.utils.geometry import validate_rigid_transform, validate_unit_quaternion_wxyz
 
 
 class RawDataError(ValueError):
@@ -72,15 +73,11 @@ def _flat_float_attr(attrs: h5py.AttributeManager, name: str, size: int) -> np.n
     return value
 
 
-def _validate_rigid_transform(value: np.ndarray, *, label: str) -> None:
-    transform = value.reshape(4, 4)
-    rotation = transform[:3, :3]
-    if (
-        not np.allclose(transform[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9, rtol=0.0)
-        or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6, rtol=0.0)
-        or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-6, rtol=0.0)
-    ):
-        raise RawDataError(f"episode metadata {label} must be a finite rigid homogeneous transform")
+def _validate_camera_transform(value, *, label):
+    try:
+        validate_rigid_transform(value.reshape(4, 4), label=label)
+    except ValueError as exc:
+        raise RawDataError(f"episode metadata {label}: {exc}") from exc
 
 
 def _validate_color_camera_metadata(attrs: h5py.AttributeManager) -> None:
@@ -108,7 +105,7 @@ def _validate_color_camera_metadata(attrs: h5py.AttributeManager) -> None:
         raise RawDataError(
             "episode metadata camera_color_intrinsics is not a canonical pinhole matrix"
         )
-    _validate_rigid_transform(
+    _validate_camera_transform(
         _flat_float_attr(attrs, "camera_T_xarm_base_from_color", 16),
         label="camera_T_xarm_base_from_color",
     )
@@ -118,10 +115,10 @@ def _validate_color_camera_metadata(attrs: h5py.AttributeManager) -> None:
 def _validate_hand_mount_metadata(attrs: h5py.AttributeManager) -> None:
     _flat_float_attr(attrs, "handbase_position_eef_m", 3)
     quaternion = _flat_float_attr(attrs, "handbase_quat_eef_wxyz", 4)
-    if not np.isclose(np.linalg.norm(quaternion), 1.0, atol=1e-6, rtol=0.0):
-        raise RawDataError(
-            "episode metadata handbase_quat_eef_wxyz must be unit length within 1e-6"
-        )
+    try:
+        validate_unit_quaternion_wxyz(quaternion, name="handbase_quat_eef_wxyz")
+    except ValueError as exc:
+        raise RawDataError(f"episode metadata: {exc}") from exc
 
 
 class EpisodeReader:

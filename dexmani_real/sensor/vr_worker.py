@@ -10,11 +10,10 @@ import numpy as np
 
 from dexmani_real.config.hardware import VRParams
 from dexmani_real.planning.kinematics.pose import xyzw_to_wxyz
+from dexmani_real.utils.geometry import normalize_quat_wxyz
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-_QUAT_NORM_EPS = 1e-12
 
 
 def _finite_vector(value: object, shape: tuple[int, ...], name: str) -> np.ndarray:
@@ -23,14 +22,6 @@ def _finite_vector(value: object, shape: tuple[int, ...], name: str) -> np.ndarr
     if array.shape != shape or not np.all(np.isfinite(array)):
         raise ValueError(f"{name} must be a finite array with shape {shape}")
     return array.copy()
-
-
-def _normalized_wxyz(value: object, name: str) -> np.ndarray:
-    quat = _finite_vector(value, (4,), name)
-    norm = float(np.linalg.norm(quat))
-    if norm < _QUAT_NORM_EPS:
-        raise ValueError(f"{name} norm is too small")
-    return quat / norm
 
 
 def run_vr_worker(shared, config: VRParams) -> None:
@@ -96,7 +87,9 @@ def run_vr_worker(shared, config: VRParams) -> None:
                     event.head.qx, event.head.qy, event.head.qz, event.head.qw
                 )
                 head_pos = _finite_vector(head_flu_pos, (3,), "head_pos")
-                head_quat_wxyz = _normalized_wxyz(xyzw_to_wxyz(head_flu_quat), "head_quat_wxyz")
+                head_quat_wxyz = normalize_quat_wxyz(
+                    xyzw_to_wxyz(head_flu_quat), name="head_quat_wxyz"
+                )
                 head_sequence_id = int(event.sequence_id)
                 head_recv_ts_ns = int(event.recv_ts_ns)
                 if head_sequence_id < 0 or head_recv_ts_ns <= 0:
@@ -122,7 +115,7 @@ def run_vr_worker(shared, config: VRParams) -> None:
             flu_quat = unity_left_to_flu_rotation(wrist.qx, wrist.qy, wrist.qz, wrist.qw)
 
             wrist_pos = _finite_vector(flu_pos, (3,), "wrist_pos")
-            wrist_quat_wxyz = _normalized_wxyz(xyzw_to_wxyz(flu_quat), "wrist_quat_wxyz")
+            wrist_quat_wxyz = normalize_quat_wxyz(xyzw_to_wxyz(flu_quat), name="wrist_quat_wxyz")
             landmarks = _finite_vector(
                 [unity_left_to_flu_position(*p) for p in event.landmarks.points],
                 (21, 3),

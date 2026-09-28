@@ -9,8 +9,6 @@ import numpy as np
 
 from dexmani_real.config.environment import WorkspaceBounds
 
-_READINESS_SUBSYSTEMS = frozenset({"arm", "hand", "camera", "pointcloud", "policy", "vr"})
-
 
 @dataclass(frozen=True)
 class EMAParams:
@@ -272,12 +270,10 @@ class SafetyParams:
     shutdown_timeout_s: float = 65.0
 
     def validate(self) -> None:
-        if not self.readiness_timeouts_s or any(
+        if any(
             not name or not np.isfinite(value) or value <= 0
             for name, value in self.readiness_timeouts_s.items()
         ):
             raise ValueError("readiness timeout names/values must be non-empty, finite, and > 0")
-        if _READINESS_SUBSYSTEMS - self.readiness_timeouts_s.keys():
-            raise ValueError("readiness_timeouts_s is missing a runtime subsystem")
         if not np.isfinite(self.shutdown_timeout_s) or self.shutdown_timeout_s <= 0:
             raise ValueError("shutdown_timeout_s must be finite and positive")

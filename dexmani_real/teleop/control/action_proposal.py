@@ -11,24 +11,15 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.planning.kinematics.pose import quat_multiply
+from dexmani_real.utils.geometry import normalize_quat_wxyz
 
 
 @dataclass(frozen=True)
 class EefTargetProposal:
-    """One world-frame EEF target after smoothing and workspace clipping."""
+    """One world-frame EEF target after explicit smoothing."""
 
     position_world_m: np.ndarray
     quat_world_wxyz: np.ndarray
-
-
-def _normalize_quat(q: np.ndarray, *, name: str) -> np.ndarray:
-    value = np.asarray(q, dtype=np.float64)
-    if value.shape != (4,) or not np.all(np.isfinite(value)):
-        raise ValueError(f"{name} must be a finite (4,) quaternion")
-    norm = float(np.linalg.norm(value))
-    if norm < 1e-12:
-        raise ValueError(f"{name} quaternion norm is too small")
-    return value / norm
 
 
 def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
@@ -56,23 +47,23 @@ def ema_smooth_pose(
 
     Positions are (3,) meters; quaternions are (4,) WXYZ. Rotation scales the
     shortest relative rotation vector from the previous smoothed orientation.
-    Each alpha is clipped to [0, 1]; 1 disables smoothing for that component.
+    Each alpha must be in [0, 1]; 1 disables smoothing for that component.
     Returns float64 (position, quaternion) arrays.
     """
-    alpha_pos = float(np.clip(alpha_pos, 0.0, 1.0))
-    alpha_rot = float(np.clip(alpha_rot, 0.0, 1.0))
+    if not (0 <= alpha_pos <= 1 and 0 <= alpha_rot <= 1):
+        raise ValueError("EMA alpha must be in [0, 1]")
 
     pos = alpha_pos * np.asarray(target_pos, dtype=np.float64) + (1.0 - alpha_pos) * np.asarray(
         prev_pos, dtype=np.float64
     )
 
     # Interpolate relative rotation and choose the quaternion sign from adjacency.
-    prev_quat = _normalize_quat(prev_quat_wxyz, name="prev_quat_wxyz")
-    target_quat = _normalize_quat(target_quat_wxyz, name="target_quat_wxyz")
+    prev_quat = normalize_quat_wxyz(prev_quat_wxyz, name="prev_quat_wxyz")
+    target_quat = normalize_quat_wxyz(target_quat_wxyz, name="target_quat_wxyz")
     if float(np.dot(prev_quat, target_quat)) < 0.0:
         target_quat = -target_quat
     prev_conjugate = prev_quat * np.array([1.0, -1.0, -1.0, -1.0])
-    relative_quat = _normalize_quat(quat_multiply(prev_conjugate, target_quat), name="relative")
+    relative_quat = normalize_quat_wxyz(quat_multiply(prev_conjugate, target_quat), name="relative")
     rv = alpha_rot * _quat_to_rotvec(relative_quat)
 
     angle = float(np.linalg.norm(rv))
@@ -85,7 +76,7 @@ def ema_smooth_pose(
             [np.cos(half), axis[0] * np.sin(half), axis[1] * np.sin(half), axis[2] * np.sin(half)],
             dtype=np.float64,
         )
-        quat = _normalize_quat(quat_multiply(prev_quat, delta_quat), name="smoothed")
+        quat = normalize_quat_wxyz(quat_multiply(prev_quat, delta_quat), name="smoothed")
 
     return pos, quat
 
@@ -103,21 +94,12 @@ def compute_target_eef_pose(
     *,
     previous_position_world_m: np.ndarray | None,
     previous_quat_world_wxyz: np.ndarray | None,
-    workspace_bounds_world_m: np.ndarray,
     ema_alpha_position: float,
     ema_alpha_rotation: float,
 ) -> EefTargetProposal:
-    """Smooth and clamp one mapped world-frame EEF target."""
+    """Smooth one mapped world-frame EEF target."""
     raw_position_world_m = _finite_vector(mapped_position_world_m, (3,), "mapped_position_world_m")
-    raw_quat_world_wxyz = _finite_vector(mapped_quat_world_wxyz, (4,), "mapped_quat_world_wxyz")
-    workspace = np.asarray(workspace_bounds_world_m, dtype=np.float64)
-    if (
-        workspace.shape != (3, 2)
-        or not np.all(np.isfinite(workspace))
-        or np.any(workspace[:, 0] > workspace[:, 1])
-    ):
-        raise ValueError("workspace_bounds_world_m must be finite shape (3, 2) with lower <= upper")
-
+    raw_quat_world_wxyz = normalize_quat_wxyz(mapped_quat_world_wxyz)
     position_world_m = raw_position_world_m.copy()
     quat_world_wxyz = raw_quat_world_wxyz.copy()
     if previous_position_world_m is not None and previous_quat_world_wxyz is not None:
@@ -130,7 +112,6 @@ def compute_target_eef_pose(
             ema_alpha_rotation,
         )
 
-    position_world_m = np.clip(position_world_m, workspace[:, 0], workspace[:, 1])
     return EefTargetProposal(
         position_world_m=position_world_m,
         quat_world_wxyz=quat_world_wxyz,

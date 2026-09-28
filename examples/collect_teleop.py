@@ -15,7 +15,7 @@ from dexmani_real.config.experiment import config_as_dict, resolve_experiment_co
 from dexmani_real.teleop.session import (
     DEFAULT_TASK_NAME,
     run_teleop_experiment,
-    validate_task_name,
+    validate_task_dir_name,
 )
 from dexmani_real.utils.log import get_logger
 
@@ -24,7 +24,7 @@ logger = get_logger(__name__)
 
 def _task_name_arg(value: str) -> str:
     try:
-        return validate_task_name(value)
+        return validate_task_dir_name(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 

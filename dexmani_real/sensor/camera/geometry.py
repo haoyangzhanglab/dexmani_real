@@ -7,6 +7,8 @@ from typing import Any, Mapping, cast
 
 import numpy as np
 
+from dexmani_real.utils.geometry import validate_rigid_transform
+
 __all__ = ["CameraIntrinsics", "RGBDGeometry", "validate_aligned_depth_distortion"]
 
 
@@ -131,19 +133,7 @@ class RGBDGeometry:
     T_color_from_depth: np.ndarray
 
     def __post_init__(self) -> None:
-        transform = np.asarray(self.T_color_from_depth, dtype=np.float64)
-        if (
-            transform.shape != (4, 4)
-            or not np.all(np.isfinite(transform))
-            or not np.allclose(transform[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9)
-        ):
-            raise ValueError("T_color_from_depth must be a finite homogeneous 4x4 matrix")
-        rotation = transform[:3, :3]
-        if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6) or not np.isclose(
-            np.linalg.det(rotation), 1.0, atol=1e-6
-        ):
-            raise ValueError("T_color_from_depth rotation must be orthonormal with determinant +1")
-        transform = transform.copy()
+        transform = validate_rigid_transform(self.T_color_from_depth, label="T_color_from_depth")
         transform.setflags(write=False)
         object.__setattr__(self, "T_color_from_depth", transform)
 

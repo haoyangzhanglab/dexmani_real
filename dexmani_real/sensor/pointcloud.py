@@ -30,6 +30,7 @@ from dexmani_real.sensor.camera.geometry import (
     RGBDGeometry,
     validate_aligned_depth_distortion,
 )
+from dexmani_real.utils.geometry import validate_rigid_transform
 
 _KERNEL_3X3 = np.ones((3, 3), dtype=np.uint8)
 
@@ -222,22 +223,8 @@ def _deproject_depth(
     return np.ascontiguousarray(rays * z[:, None], dtype=np.float32), rows, columns
 
 
-def _validated_transform(transform: np.ndarray) -> np.ndarray:
-    matrix = np.asarray(transform, dtype=np.float64)
-    rotation = matrix[:3, :3] if matrix.shape == (4, 4) else np.empty((0, 0))
-    if (
-        matrix.shape != (4, 4)
-        or not np.all(np.isfinite(matrix))
-        or not np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-9)
-        or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6)
-        or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-6)
-    ):
-        raise ValueError("transform must be a finite rigid homogeneous 4x4 matrix")
-    return matrix
-
-
 def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
-    matrix = _validated_transform(transform)
+    matrix = validate_rigid_transform(transform)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("points must have shape [N,3]")
     return (points @ matrix[:3, :3].T + matrix[:3, 3]).astype(np.float32)
@@ -317,7 +304,7 @@ def _table_keep_mask(
     # Transform the plane into the aligned color-camera frame. Cached rays make
     # ``z * dot(plane_normal, ray) + offset`` equivalent to evaluating the
     # plane after deprojection, without allocating table points in 3-D.
-    plane_color = _validated_transform(T_xarm_base_from_color).T @ plane
+    plane_color = validate_rigid_transform(T_xarm_base_from_color).T @ plane
     rows, columns = np.nonzero(valid)
     plane_normal_color = tuple(float(value) for value in plane_color[:3])
     ray_plane_factors = _ray_plane_factors(intrinsics, plane_normal_color)
