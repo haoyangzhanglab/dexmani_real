@@ -20,14 +20,19 @@ This task file belongs at:
 ~/Desktop/dexmani_real/contract_cleanup_codex_task_0928.md
 ```
 
-Reviewed remote heads immediately before this task-file update:
+Reviewed source baseline and task-document baseline:
 
 ```text
-dexmani_real   92ed1343dc11125a7cbb49bc505b1b948c2d7864
-dexmani_policy 141b0337c148d4f2dd09ade11f4db660a8ab9c4d
+dexmani_real source behavior baseline   92ed1343dc11125a7cbb49bc505b1b948c2d7864
+dexmani_real task-doc review baseline   af449c14e0e9f7c5542c83592207f88db11cb3fd
+dexmani_policy verification baseline    141b0337c148d4f2dd09ade11f4db660a8ab9c4d
 ```
 
+The Real commit between the source-behavior baseline and the task-doc review baseline changed only this task document; the reviewed runtime/data behavior is therefore still the source-behavior baseline above.
+
 Inspect local HEADs first. Local code is authoritative if newer. Do not apply patches by stale line number.
+
+Treat this task file as an execution specification: **do not rewrite, delete, rename, or "clean up" it while implementing the task.**
 
 This is a personal PhD real-robot dexterous-manipulation repository. Optimize in this order:
 
@@ -103,6 +108,14 @@ Do not weaken:
 - whole-episode rejection rather than silent frame deletion/interpolation.
 
 The cleanup may make this ownership and naming clearer, but behavior stays strict.
+
+## 1.3 Task-local precedence for these two user decisions
+
+Sections 1.1 and 1.2 are explicit user instructions.
+
+If generic wording in `AGENTS.md` appears to conflict with these exact two choices, **Sections 1.1 and 1.2 take precedence for this task only**. In particular, do not reinterpret the general Raw-evidence guidance as permission to change P0-1, and do not reinterpret processed-data guidance as permission to weaken P0-2.
+
+Do not edit `AGENTS.md` merely to resolve this task-local exception.
 
 ---
 
@@ -208,6 +221,20 @@ Do not remove or weaken:
 - "never unlink shared memory while a worker may still access it".
 
 A duplicated hardware-boundary check is not automatically overengineering.
+
+## 2.6 Execution safety and scope discipline
+
+This task is large but bounded.
+
+- Work only in `dexmani_real`.
+- `dexmani_policy` is read-only verification context in this run. If a concrete Real↔Policy mismatch would require changing Policy code, report it in the final result instead of editing the sibling repository.
+- Do not connect to or probe xArm, XHand, RealSense, VR/HTS, or any other real hardware.
+- Do not run teleop, replay, policy rollout, hardware diagnostics, homing, or calibration-write commands.
+- Do not install/upgrade dependencies or rewrite the environment merely to make optional tests run.
+- Preserve unrelated local/uncommitted work. Never use `git reset --hard`, destructive checkout, or blanket restore.
+- Complete and validate one phase before proceeding to the next. If a phase gate is red, fix or clearly isolate that phase first; do not stack later refactors on top of a failing phase.
+- If current local code has materially diverged from a reviewed implementation detail, follow current behavior and the architectural intent of this task rather than forcing stale mechanics.
+- Do not commit, push, open a PR, or modify Git history unless the user separately asks. Leave a reviewable working-tree diff.
 
 ---
 
@@ -1207,6 +1234,7 @@ At minimum:
 
 ```bash
 python -m compileall -q dexmani_real examples
+ruff format --check dexmani_real examples
 ruff check dexmani_real examples
 git diff --check
 ```
@@ -1523,6 +1551,15 @@ The task is complete only when all of the following are true.
 - physical abnormal stop still produces FAULT.
 - session code no longer depends unnecessarily on a detailed shutdown-report protocol.
 - seqlock, freshness, source identity and `run_id` protections remain unchanged.
+
+## Scope / execution discipline
+
+- `dexmani_policy` was not modified.
+- this task specification file was not modified by the implementation run.
+- no hardware-connect, motion, replay, rollout, diagnostics or calibration-write command was executed.
+- no unrelated local work was discarded.
+- no commit/push/PR was created unless separately requested by the user.
+- every completed phase passed its focused gate before later phases were layered on top.
 
 ## Complexity
 
