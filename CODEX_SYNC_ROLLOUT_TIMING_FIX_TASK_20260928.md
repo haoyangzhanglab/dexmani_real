@@ -17,7 +17,7 @@
 2. 保留现有 chunked synchronous inference：动作队列为空时同步推理，逐控制步消费动作。
 3. 保留当前 Mode 6 + set_servo_angle(..., wait=False) 的 xArm joint online trajectory planning 控制方式。
 4. 不通过新机制掩盖问题：不引入 RTC、异步推理、未来动作定时队列、跨 chunk blending、EMA smoothing、额外插值、自动补偿或动作索引偏移。
-5. 证明修正只改变错误的时间节拍，不改变模型输入语义、模型输出动作内容、动作索引、安全授权和 Raw evidence 语义。
+5. 证明修正只改变错误的时间节拍，不改变模型输入 / 动作索引的定义、policy 调用与 action selection 语义、安全授权和 Raw evidence 语义。对于“同一保存输入 + 同一 RNG 状态”的离线回归，模型输出与所选动作必须一致；真机闭环中由于观测采样时刻和机器人轨迹会随 pacing 修正而变化，后续模型输出不要求与旧 rollout 数值相同。
 6. 真机实验只用于验证时间链路和实际运动结果；未获得真机数据前，不宣称机器人抖动已经修复。
 
 工程优先级遵循 AGENTS.md：
@@ -258,7 +258,7 @@ PolicyRunner.step() 已在 gate 前读取：
 
 1. inference calls == 2；
 2. publications == 16；
-3. action 内容与修改前相同；
+3. 在该确定性 fake-observation / fake-model 回归中，action 内容与修改前相同；
 4. pred_index 仍为：
 
        1,2,3,4,5,6,7,8,1,2,3,4,5,6,7,8
@@ -476,7 +476,7 @@ Codex 不得自行连接或驱动真实设备。
 
 - query cadence 不再由 inference latency 系统性膨胀；
 - boundary_pair_span 回到约 2 × dt 的同步 loop 时间预算；
-- action 索引、action 内容、观察历史语义未改变；
+- action 索引、policy/action selection 语义、观察历史定义未改变；同一保存输入与同一 RNG 下输出一致；
 - 没有 unexplained publication → SDK sequence 丢失；
 - safety / revoke 行为未退化；
 - diagnostics 完整；
