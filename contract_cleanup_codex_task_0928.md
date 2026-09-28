@@ -20,10 +20,10 @@ This task file belongs at:
 ~/Desktop/dexmani_real/contract_cleanup_codex_task_0928.md
 ```
 
-Reviewed remote heads when this task was finalized:
+Reviewed remote heads immediately before this task-file update:
 
 ```text
-dexmani_real   2082782068fc280b7b5d894c7f78a97268dc006d
+dexmani_real   92ed1343dc11125a7cbb49bc505b1b948c2d7864
 dexmani_policy 141b0337c148d4f2dd09ade11f4db660a8ab9c4d
 ```
 
@@ -43,6 +43,33 @@ The purpose of this task is **not** to build a generic robotics framework. It is
 The central architectural goal is:
 
 > **Source-specific code may decide what action is intended; only one source-agnostic Real path may decide how that intent becomes a physical target.**
+
+## 0.1 Reference architecture guidance
+
+LeFranX / LeRobot and ManiUniCon were reviewed only as design references for **boundary placement**:
+
+```text
+source / teleoperator / policy
+        ↓
+explicit adapter / intent
+        ↓
+robot-side realization / interface
+        ↓
+hardware
+```
+
+Use that separation principle, but do **not** copy their concrete hidden fallbacks, implicit clipping, current-joint substitution, zero-action substitution, or generic framework machinery.
+
+In particular:
+
+- LeFranX is useful as evidence that Teleoperator and Robot responsibilities can be separated, but its concrete teleoperation helpers contain smoothing/fallback choices that are not normative for DexMani Real.
+- ManiUniCon is useful as evidence that model-specific observation/action adaptation can be isolated from robot interfaces, but its generic RobotAction / wrapper structure and multi-layer clipping are broader than this personal research repository needs.
+- These projects are references only. Do not add them as dependencies, compatibility targets, runtime abstractions, or APIs.
+- When their implementation conflicts with the explicit DexMani design rules below, **DexMani's hardware-safety and scientific-semantics requirements win**.
+
+The intended result is therefore **not** “make DexMani look like LeFranX or ManiUniCon”. It is:
+
+> **keep DexMani's stricter real-robot safety/data guarantees while adopting a cleaner single-owner boundary for experiment semantics.**
 
 ---
 
