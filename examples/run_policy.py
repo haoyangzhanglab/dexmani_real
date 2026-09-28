@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-"""Usage: python examples/run_policy.py EXPERIMENT [--checkpoint best|latest|FILE] [--weights ema|raw] [--inference-steps N]
-       [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]
-
-Runs supervised physical evaluation (H -> scene setup -> B -> S), saving run_config.yaml.
-Recording failure invalidates evaluation; judge task success offline.
-Synchronous action chunks never catch up late inference; timing diagnostics remain in runtime.
-"""
+"""Usage: python examples/run_policy.py POLICY/TASK/EXPERIMENT [--config YAML] [--checkpoint best|latest|FILE]
+       [--weights ema|raw] [--inference-steps N] [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]
+真机评估：H 回零 → 布置场景 → B 开始 → S 停止；保存 rollout 与 run_config.yaml，任务成功由离线评估判定。"""
 
 from __future__ import annotations
 
