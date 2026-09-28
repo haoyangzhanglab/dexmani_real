@@ -11,6 +11,7 @@ from dexmani_real.robot.commands import read_robot_command
 from dexmani_real.robot.drivers.xarm7 import HomeAborted, XArm7, describe_controller_error
 from dexmani_real.robot.home import HomeResult
 from dexmani_real.robot.model import XARM7_HARD_LOWER, XARM7_HARD_UPPER
+from dexmani_real.runtime.diagnostics import DiagnosticWriter, trace_sdk_call, trace_unsent
 from dexmani_real.runtime.safety import SafetyState, command_may_cross_sdk
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
@@ -25,6 +26,27 @@ def _publish_feedback(shared, qpos, qvel, effort):
     frame["qpos"], frame["qvel"], frame["effort"] = qpos, qvel, effort
     frame["timestamp_ns"] = time.monotonic_ns()
     shared.arm_state_ring.write(frame)
+    return int(frame["timestamp_ns"][0])
+
+
+def _read_feedback(shared, arm, diagnostics):
+    start = time.monotonic_ns() if diagnostics is not None else 0
+    q, v, effort = arm.read()
+    end = time.monotonic_ns() if diagnostics is not None else 0
+    if arm.error_code:
+        raise RuntimeError(f"arm controller error: {arm.error_code}")
+    stamp = _publish_feedback(shared, q, v, effort)
+    if diagnostics is not None:
+        diagnostics.record(
+            "feedback",
+            run_id=int(shared.run_id.value),
+            read_start_ns=start,
+            read_end_ns=end,
+            timestamp_ns=stamp,
+            qpos=q,
+            qvel=v,
+            effort=effort,
+        )
 
 
 def _home(shared, arm, request):
@@ -64,14 +86,17 @@ def _home(shared, arm, request):
     return mode_ready
 
 
-def run_arm_worker(shared, config):
+def run_arm_worker(shared, config, diagnostics_dir=None):
     arm = XArm7(config)
     last_sequence = 0
     streaming_epoch = None
     stopped = False
+    diagnostics = None
     try:
+        if diagnostics_dir is not None:
+            diagnostics = DiagnosticWriter(diagnostics_dir, "arm")
         arm.connect()
-        _publish_feedback(shared, *arm.read())
+        _read_feedback(shared, arm, diagnostics)
         shared.arm_ready.set()
         rate = LoopRate(config.loop_hz, label="arm", busy_wait=False)
         while shared.is_running.value:
@@ -105,24 +130,49 @@ def run_arm_worker(shared, config):
                             )
                             if command_may_cross_sdk(shared, run_id=command.run_id):
                                 if issue:
+                                    trace_unsent(
+                                        diagnostics,
+                                        command.arm_qpos,
+                                        run_id=command.run_id,
+                                        sequence=sequence,
+                                        reason="unsafe_target",
+                                    )
                                     raise RuntimeError(f"unsafe arm target: {issue}")
                                 if stopped:
                                     arm.enter_mode6()
                                     stopped = False
                                 # Mode changes can block; recheck the lifecycle at actual send.
                                 if not command_may_cross_sdk(shared, run_id=command.run_id):
+                                    trace_unsent(
+                                        diagnostics,
+                                        command.arm_qpos,
+                                        run_id=command.run_id,
+                                        sequence=sequence,
+                                        reason="revoked_after_mode_change",
+                                    )
                                     continue
-                                code = arm.servo(command.arm_qpos)
+                                code = trace_sdk_call(
+                                    diagnostics,
+                                    arm.servo,
+                                    command.arm_qpos,
+                                    run_id=command.run_id,
+                                    sequence=sequence,
+                                )
                                 streaming_epoch = command.run_id
                                 if code != 0:
                                     error = arm.read_live_error_code()
                                     raise RuntimeError(
                                         f"arm SDK send failed: {code}; {describe_controller_error(error)}"
                                     )
-            q, v, effort = arm.read()
-            if arm.error_code:
-                raise RuntimeError(f"arm controller error: {arm.error_code}")
-            _publish_feedback(shared, q, v, effort)
+                            else:
+                                trace_unsent(
+                                    diagnostics,
+                                    command.arm_qpos,
+                                    run_id=command.run_id,
+                                    sequence=sequence,
+                                    reason="revoked",
+                                )
+            _read_feedback(shared, arm, diagnostics)
             rate.wait()
     except Exception:
         shared.error_state.value = True
@@ -131,3 +181,5 @@ def run_arm_worker(shared, config):
     finally:
         arm.stop()
         arm.close()
+        if diagnostics is not None:
+            diagnostics.close()

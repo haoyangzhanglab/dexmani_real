@@ -7,6 +7,7 @@ Current Real config owns physical capability; this module imports neither Policy
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,21 @@ _SUPPORTED_OBSERVATION_FIELDS = frozenset(
         "tactile_force",
     }
 )
+
+
+def with_action_steps(config: dict, n_action_steps: int | None) -> dict:
+    """Override only deployment chunk length, preserving the training snapshot."""
+    result = deepcopy(config)
+    if n_action_steps is None:
+        return result
+    if type(n_action_steps) is not int or n_action_steps < 1:
+        raise ValueError("n_action_steps must be a positive integer")
+    agent = result["agent"]
+    if agent["n_obs_steps"] - 1 + n_action_steps > agent["horizon"]:
+        raise ValueError("n_obs_steps - 1 + n_action_steps must not exceed horizon")
+    agent["n_action_steps"] = n_action_steps
+    result["n_action_steps"] = n_action_steps
+    return result
 
 
 def validate_max_running_s(max_running_s: float | None) -> float | None:
@@ -89,7 +105,7 @@ def validate_recording_budget(info, max_running_s):
 
 @dataclass(frozen=True)
 class PolicyRuntimeConfig:
-    """Spawn arguments; config is the already-read saved experiment snapshot."""
+    """Spawn arguments; config includes explicit deployment overrides."""
 
     config: dict
     info: Any

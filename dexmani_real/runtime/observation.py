@@ -62,6 +62,8 @@ class ObservationRow:
     vr: Mapping | None
     point_cloud: np.ndarray | None
     observation_timestamp_ns: int
+    pointcloud_timestamp_ns: int = 0
+    pointcloud_camera_sequence: int = 0
 
 
 def read_observation(
@@ -125,6 +127,8 @@ def read_observation(
         _freeze(vr),
         _freeze(cloud["point_cloud"]) if cloud is not None else None,
         now,
+        int(cloud["timestamp_ns"]) if cloud is not None else 0,
+        int(cloud["source_camera_sequence"]) if cloud is not None else 0,
     )
 
 

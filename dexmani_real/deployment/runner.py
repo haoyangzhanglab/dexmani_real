@@ -20,6 +20,7 @@ from dexmani_real.recording.recorder import (
 )
 from dexmani_real.robot.action import ActionRealizer
 from dexmani_real.robot.commands import RobotCommand, publish_command
+from dexmani_real.runtime.diagnostics import DiagnosticWriter
 from dexmani_real.runtime.observation import ObservationHistory, read_observation
 from dexmani_real.runtime.safety import (
     RunEndReason,
@@ -64,6 +65,7 @@ class PolicyRunner:
         max_running_s,
         num_episodes=1,
         recording_config=None,
+        diagnostics=None,
     ):
         self.shared = shared
         self.runtime = runtime
@@ -74,6 +76,9 @@ class PolicyRunner:
         self.max_running_s = max_running_s
         self.num_episodes = num_episodes
         self.recording_config = recording_config
+        self.diagnostics = diagnostics
+        self.chunk_id = -1
+        self.chunk_step = 0
         self.recorder = (
             AsyncEpisodeRecorder(
                 recording_config.data_dir,
@@ -122,6 +127,14 @@ class PolicyRunner:
         if self.run_id is None:
             return
         revoke_motion_if_run_id(self.shared, self.run_id, reason=run_end_reason)
+        if self.diagnostics is not None:
+            self.diagnostics.record(
+                "episode_ends",
+                run_id=self.run_id,
+                episode=self.completed + 1,
+                timestamp_ns=time.monotonic_ns(),
+                reason=reason,
+            )
         self.shared.physical_home_completed.value = False
         self.action_queue.clear()
         self.history.clear()
@@ -217,6 +230,8 @@ class PolicyRunner:
             if epoch is None:
                 return None
             self.run_id, self.started_ns = epoch
+            self.chunk_id = -1
+            self.chunk_step = 0
             committed = True
             self.shared.physical_home_completed.value = False
             self.stats = RolloutStats()
@@ -281,8 +296,33 @@ class PolicyRunner:
                 self._finish_episode("required_tactile_unavailable")
                 return
             epoch = self.run_id
+            self.chunk_id += 1
+            self.chunk_step = 0
             start = time.monotonic_ns()
-            prediction = self.model.predict(observation)
+            if self.diagnostics is None:
+                prediction = self.model.predict(observation)
+            else:
+                result = self.model.predict_with_diagnostics(observation)
+                prediction = result["control_action"]
+            inference_end = time.monotonic_ns()
+            if self.diagnostics is not None:
+                rows = self.history.padded()
+                self.diagnostics.record(
+                    "queries",
+                    run_id=self.run_id,
+                    episode=self.completed + 1,
+                    chunk_id=self.chunk_id,
+                    infer_start_ns=start,
+                    infer_end_ns=inference_end,
+                    observation_ns=[r.observation_timestamp_ns for r in rows],
+                    arm_ns=[int(r.arm["timestamp_ns"][0]) for r in rows],
+                    hand_ns=[int(r.hand["timestamp_ns"][0]) for r in rows],
+                    cloud_ns=[r.pointcloud_timestamp_ns for r in rows],
+                    cloud_camera_sequence=[r.pointcloud_camera_sequence for r in rows],
+                    pred_action=result["pred_action"],
+                    control_action=prediction,
+                    **{f"obs_{name}": value for name, value in observation.items()},
+                )
             if self.recorder is not None:
                 self.recorder.check_error()
             self.stats.inference_ms.append((time.monotonic_ns() - start) / 1e6)
@@ -311,6 +351,8 @@ class PolicyRunner:
                 self._finish_episode("required_observation_stale")
                 return
         action = self.action_queue.popleft()
+        chunk_step = self.chunk_step
+        self.chunk_step += 1
         decoded = self.realizer.realize(
             policy_action_intent(action, self.policy_info.action_mode),
             row.arm["qpos"][0],
@@ -344,7 +386,22 @@ class PolicyRunner:
         if self.recorder is not None:
             self.recorder.check_error()
         command = RobotCommand(self.run_id, prepared_arm, prepared_hand)
-        stamp = publish_command(self.shared, command) if self.execute else time.monotonic_ns()
+        context = None
+        if self.diagnostics is not None:
+            context = dict(
+                chunk_id=self.chunk_id,
+                chunk_step=chunk_step,
+                pred_index=self.policy_info.n_obs_steps - 1 + chunk_step,
+                raw_action=action,
+                execution_observation_ns=row.observation_timestamp_ns,
+                execution_arm_qpos=row.arm["qpos"][0],
+                execution_hand_qpos=row.hand["qpos"][0],
+            )
+        stamp = (
+            publish_command(self.shared, command, diagnostics=self.diagnostics, context=context)
+            if self.execute
+            else time.monotonic_ns()
+        )
         if not stamp:
             self.stats.publication_rejections += 1
             if self.recorder is not None:
@@ -454,12 +511,16 @@ def run_policy_worker(
     max_running_s=None,
     num_episodes=1,
     recording_config=None,
+    diagnostics_dir=None,
 ):
     from dexmani_policy.deployment import load_policy
 
     model = None
+    diagnostics = None
     failure = None
     try:
+        if diagnostics_dir is not None:
+            diagnostics = DiagnosticWriter(diagnostics_dir, "policy")
         model = load_policy(config.config, config.info, device=config.device, seed=config.seed)
         fingertip_runtime = build_fingertip_runtime(config.info, runtime)
         model.warmup(samples=5, rgb_hw=(runtime.camera.height, runtime.camera.width))
@@ -473,6 +534,7 @@ def run_policy_worker(
             max_running_s=max_running_s,
             num_episodes=num_episodes,
             recording_config=recording_config,
+            diagnostics=diagnostics,
         )
         shared.policy_ready.set()
         runner.run()
@@ -482,6 +544,8 @@ def run_policy_worker(
         raise
     finally:
         shared.policy_ready.clear()
+        if diagnostics is not None:
+            diagnostics.close()
         if model is not None:
             try:
                 model.close()

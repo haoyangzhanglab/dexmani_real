@@ -114,6 +114,20 @@ Checkpoint
 python examples/run_policy.py <experiment_dir> --checkpoint best
 ```
 
+可用 `--n-action-steps N` 覆盖本次部署的执行段长度；必须满足
+`n_obs_steps - 1 + N <= horizon`，不会改写训练配置或 checkpoint。
+实际长度和覆盖参数会保存在 `run_config.yaml`。
+
+需要定位预测换段或执行时序问题时，添加 `--diagnostics`。它在 session 的
+`diagnostics/` 中单独保存完整预测、实际模型输入和主机侧发布／SDK 时间，默认关闭。
+会话退出后离线分析：
+
+```bash
+python examples/analyze_rollout_diagnostics.py <session_dir>
+```
+
+报告包含诊断完整性、逻辑时间对齐的新旧预测、命令发送与关节反馈；SDK 调用时间不代表固件执行完成时间。
+
 策略 rollout 使用当前真实实验环境的有效标定与硬件状态。离线测试、仿真结果或 checkpoint 可加载均不等价于真机安全验证。
 
 ## Main Entry Points
