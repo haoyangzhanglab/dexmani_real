@@ -42,16 +42,13 @@ def read_robot_command(shared: Any) -> tuple[RobotCommand, int] | None:
     ), result[2]
 
 
-def publish_command(shared: Any, target: RobotCommand, *, diagnostics=None, context=None) -> int:
+def publish_command(shared: Any, target: RobotCommand) -> int:
     """Return the host publication time, or zero when the motion epoch was revoked."""
-    start = time.monotonic_ns() if diagnostics is not None else 0
-    sequence = stamp = 0
+    stamp = 0
     with shared.motion_lock:
-        if not _command_may_cross_sdk_locked(
+        if _command_may_cross_sdk_locked(
             shared, run_id=target.run_id, required_safety_state=SafetyState.RUNNING
         ):
-            pass
-        else:
             frame = np.zeros(1, dtype=ROBOT_COMMAND_DTYPE)
             frame["run_id"] = target.run_id
             for name in ("arm", "hand"):
@@ -59,18 +56,6 @@ def publish_command(shared: Any, target: RobotCommand, *, diagnostics=None, cont
                 frame[f"{name}_present"] = value is not None
                 if value is not None:
                     frame[f"{name}_qpos"] = value
-            sequence = shared.robot_command_ring.write(frame)
+            shared.robot_command_ring.write(frame)
             stamp = time.monotonic_ns()
-    if diagnostics is not None:
-        diagnostics.record(
-            "publications",
-            **(context or {}),
-            run_id=target.run_id,
-            sequence=sequence,
-            publish_start_ns=start,
-            publish_end_ns=stamp or time.monotonic_ns(),
-            accepted=bool(stamp),
-            arm_target=target.arm_qpos,
-            hand_target=target.hand_qpos,
-        )
     return stamp

@@ -42,7 +42,6 @@ def run_policy_deployment(
     max_running_s=None,
     num_episodes=1,
     recording_config=None,
-    diagnostics_dir=None,
 ):
     info = worker_config.info
     cloud_recipe = validate_policy_runtime_compatibility(info, runtime)
@@ -99,17 +98,12 @@ def run_policy_deployment(
                 max_running_s,
                 num_episodes,
                 recording_config,
-                diagnostics_dir,
             ),
         )
         supervisor.start([policy])
         sensors = [
-            ctx.Process(
-                name="arm", target=run_arm_worker, args=(shared, runtime.arm, diagnostics_dir)
-            ),
-            ctx.Process(
-                name="hand", target=run_hand_worker, args=(shared, runtime.hand, diagnostics_dir)
-            ),
+            ctx.Process(name="arm", target=run_arm_worker, args=(shared, runtime.arm)),
+            ctx.Process(name="hand", target=run_hand_worker, args=(shared, runtime.hand)),
         ]
         if camera:
             sensors.append(

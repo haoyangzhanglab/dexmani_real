@@ -9,7 +9,6 @@ from dexmani_real.ipc.schema import HAND_STATE_DTYPE
 from dexmani_real.robot.command_validation import check_worker_hand_target
 from dexmani_real.robot.commands import read_robot_command
 from dexmani_real.robot.home import HomeResult
-from dexmani_real.runtime.diagnostics import DiagnosticWriter, trace_sdk_call, trace_unsent
 from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.runtime.safety import SafetyState, command_may_cross_sdk
 from dexmani_real.utils.log import get_logger
@@ -34,7 +33,7 @@ def _publish_feedback(shared, state, tactile_calibrated):
     return int(frame["timestamp_ns"][0])
 
 
-def _send_target(shared, hand, target, run_id, config, *, home=False, diagnostics=None, sequence=0):
+def _send_target(shared, hand, target, run_id, config, *, home=False):
     from dexmani_real.robot.drivers.xhand import XHandSendStatus
 
     issue = check_worker_hand_target(
@@ -47,12 +46,10 @@ def _send_target(shared, hand, target, run_id, config, *, home=False, diagnostic
         run_id=run_id,
         required_safety_state=SafetyState.ARMED if home else SafetyState.RUNNING,
     ):
-        trace_unsent(diagnostics, target, run_id=run_id, sequence=sequence, reason="revoked")
         return None
     if issue:
-        trace_unsent(diagnostics, target, run_id=run_id, sequence=sequence, reason="unsafe_target")
         raise RuntimeError(f"unsafe hand target: {issue}")
-    status = trace_sdk_call(diagnostics, hand.send_action, target, run_id=run_id, sequence=sequence)
+    status = hand.send_action(target)
     if status is XHandSendStatus.REJECTED:
         raise RuntimeError(f"XHand SDK send failed: {status}")
     return status
@@ -69,7 +66,7 @@ def _best_effort_passive(hand):
         logger.warning("XHand cleanup passive send failed", exc_info=True)
 
 
-def run_hand_worker(shared, config, diagnostics_dir=None):
+def run_hand_worker(shared, config):
     from dexmani_real.robot.drivers.xhand import XHand, XHandSendStatus
 
     hand = XHand(config)
@@ -79,10 +76,7 @@ def run_hand_worker(shared, config, diagnostics_dir=None):
     active_motion_authority: tuple[int, SafetyState] | None = None
     last_valid_qpos = None
     last_valid_qpos_timestamp_ns = None
-    diagnostics = None
     try:
-        if diagnostics_dir is not None:
-            diagnostics = DiagnosticWriter(diagnostics_dir, "hand")
         hand.connect()
         try:
             hand.calibrate_tactile()
@@ -92,20 +86,11 @@ def run_hand_worker(shared, config, diagnostics_dir=None):
         while shared.is_running.value:
             if shared.estop_request.value:
                 break
-            read_start = time.monotonic_ns() if diagnostics is not None else 0
             state = hand.get_state()
-            read_end = time.monotonic_ns() if diagnostics is not None else 0
             if shared.estop_request.value:
                 break
             if state is None:
                 failure_started = failure_started or time.monotonic()
-                if diagnostics is not None:
-                    diagnostics.record(
-                        "read_failures",
-                        run_id=int(shared.run_id.value),
-                        read_start_ns=read_start,
-                        read_end_ns=read_end,
-                    )
             else:
                 failure_started = None
                 if not hand.is_connected:
@@ -121,16 +106,6 @@ def run_hand_worker(shared, config, diagnostics_dir=None):
                     shared, state, hand.tactile_calibrated
                 )
                 last_valid_qpos = state.qpos.copy()
-                if diagnostics is not None:
-                    diagnostics.record(
-                        "feedback",
-                        run_id=int(shared.run_id.value),
-                        read_start_ns=read_start,
-                        read_end_ns=read_end,
-                        timestamp_ns=last_valid_qpos_timestamp_ns,
-                        qpos=state.qpos,
-                        current_ma=state.current_ma,
-                    )
                 shared.hand_ready.set()
 
             revoked = active_motion_authority is not None and not command_may_cross_sdk(
@@ -189,8 +164,6 @@ def run_hand_worker(shared, config, diagnostics_dir=None):
                                 command.hand_qpos,
                                 command.run_id,
                                 config,
-                                diagnostics=diagnostics,
-                                sequence=sequence,
                             )
                             if status is not None:
                                 active_motion_authority = (command.run_id, SafetyState.RUNNING)
@@ -207,6 +180,3 @@ def run_hand_worker(shared, config, diagnostics_dir=None):
             shared.error_state.value = True
             logger.exception("XHand disconnect failed")
             raise
-        finally:
-            if diagnostics is not None:
-                diagnostics.close()

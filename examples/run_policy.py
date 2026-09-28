@@ -87,11 +87,6 @@ def _parser() -> argparse.ArgumentParser:
         help="cooperative duration budget from RUNNING admission (default: 60 seconds)",
     )
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument(
-        "--diagnostics",
-        action="store_true",
-        help="save full policy predictions and host publication/SDK timing sidecars",
-    )
     return parser
 
 
@@ -146,34 +141,11 @@ def _write_run_config(session_dir, *, args, runtime, info):
         "device": args.device,
         "num_episodes": args.num_episodes,
         "max_duration_s": args.max_running_s,
-        "diagnostics": args.diagnostics,
         "n_action_steps_override": args.n_action_steps,
         "dexmani_real_head": head(Path(__file__).resolve().parents[1]),
         "dexmani_policy_head": head(Path(dexmani_policy.__file__).resolve().parents[1]),
     }
     (session_dir / "run_config.yaml").write_text(yaml.safe_dump(payload, sort_keys=False))
-    if args.diagnostics:
-        diagnostics_dir = session_dir / "diagnostics"
-        diagnostics_dir.mkdir()
-        for name, root in (
-            ("dexmani_real", Path(__file__).resolve().parents[1]),
-            ("dexmani_policy", Path(dexmani_policy.__file__).resolve().parents[1]),
-        ):
-            diff = subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=root)
-            (diagnostics_dir / f"{name}.patch").write_bytes(diff)
-            # git diff omits new source files; retain the exact diagnostic implementation too.
-            untracked = (
-                subprocess.check_output(
-                    ["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=root
-                )
-                .decode()
-                .split("\0")
-            )
-            for relative in filter(None, untracked):
-                if relative.endswith(".py"):
-                    target = diagnostics_dir / "source" / name / relative
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes((root / relative).read_bytes())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -247,7 +219,6 @@ def main(argv: list[str] | None = None) -> int:
             max_running_s=args.max_running_s,
             num_episodes=args.num_episodes,
             recording_config=recording_config,
-            diagnostics_dir=str(session_dir / "diagnostics") if args.diagnostics else None,
         )
     except Exception as exc:
         print(f"[LIFECYCLE] lifecycle failed: {exc}", file=sys.stderr)
