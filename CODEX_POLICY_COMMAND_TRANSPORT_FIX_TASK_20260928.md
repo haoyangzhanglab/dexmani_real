@@ -184,7 +184,7 @@ sequence 继续来自 robot_command_ring.write(frame)。
 - captured_sequence 是事实来源；
 - captured_event 只用于高效唤醒 publisher，不能单独作为正确性证据；
 - 所有 sequence 比较必须以 captured_sequence 为准；
-- RuntimeChannels.close() 正确处理新增 IPC 对象；
+- Event / Value 使用 multiprocessing context 创建并可随 spawn 正确传递；它们不是 SharedMemoryRingBuffer / Queue，不要为其伪造 close()/unlink()；现有 RuntimeChannels.close() 只继续显式清理由本仓库实际拥有且需要 close/unlink 的 ring / queue 资源；
 - spawn / shutdown 语义保持可验证；
 - 不为此新增 registry 或抽象层。
 
@@ -268,7 +268,7 @@ dry-run / execute=False 不需要 delivery wait。
 修正后：
 
 - 普通 feedback / health polling 仍保持 config.loop_hz；
-- 非 policy、未请求 delivery guarantee 的 publisher 仍可按原 periodic latest-read 行为被消费；
+- 非 policy、未请求 delivery guarantee 的 publisher 仍按原 periodic latest-read 行为被消费：每个 ordinary worker feedback/poll tick 仍必须检查 mailbox；
 - policy publication 会 set 对应 wakeup event，使 worker 不必等待下一个 nominal 30 Hz poll 才读取 command；
 - hardware SDK 仍由原 worker 单线程独占。
 
@@ -286,9 +286,10 @@ SDK IO 必须继续在 worker 主执行线程串行完成。
 可将当前“每轮末尾固定 LoopRate.wait()”改为小型、直接的 event-driven loop：
 
 - 维护下一 feedback deadline；
-- 到 feedback deadline 时执行原有 feedback read / validity / error logic；
+- ordinary 30 Hz tick 到期时继续执行原有 mailbox poll 与 feedback / validity / error logic；尽量保持现有相对顺序：arm 为 command admission → feedback，hand 为 feedback → command admission；
 - feedback deadline 之间，用 command_wakeup.wait(timeout=remaining_to_feedback)；
 - policy command 到达时 wakeup 立即返回；
+- explicit wake path 不额外强制一次 feedback read，避免 command arrival 把 feedback rate 提高；
 - clear 自己的 wakeup event；
 - read_latest()；
 - 若 sequence != last_sequence：
