@@ -12,7 +12,7 @@ from dexmani_real.robot.model import (
     XARM7_HARD_UPPER,
     XHAND_FINGERTIP_LINK_NAMES,
 )
-from dexmani_real.utils.geometry import normalize_quat_wxyz
+from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
 from dexmani_real.utils.limits import validate_hand_limit_nesting
 
 _OBSERVATION_MAX_AGE_PERIODS = 4
@@ -360,7 +360,7 @@ class HandParams:
         )
         if transform.shape != (7,) or not np.all(np.isfinite(transform)):
             raise ValueError("hand base transform must contain seven finite values")
-        normalize_quat_wxyz(transform[3:], name="hand base quaternion")
+        validate_unit_quaternion_wxyz(transform[3:], name="hand base quaternion")
 
 
 @dataclass(frozen=True)

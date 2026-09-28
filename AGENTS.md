@@ -65,13 +65,21 @@ hardware safety
 
 ### Raw
 
-Raw 是实验 evidence。
+Raw 是实验 evidence。Raw immutability 从 capture 成功发布为 Raw 后开始。
 
-- 已发布 Raw 不原地修改；
+对已发布 Raw：
+
+- 保持 immutable，不原地修改；
 - 不伪造缺失 observation / action；
 - 不为了训练方便删除失败证据或重写 termination；
 - demonstration 和 rollout 都保留真实实验边界；
-- 训练筛选发生在派生数据阶段，而不是回写 Raw。
+- processed data 从 Raw 派生，训练筛选不回写 Raw。
+
+尚未发布的 Teleop capture 仍处于 acquisition / Raw-publication admission 阶段。
+control failure、publication failure 或 cadence contract failure 可以使整个 capture invalid。
+当前项目将 technical-invalid unpublished Teleop capture 整体 discard，不发布为 Raw；
+这是 acquisition / Raw-publication admission policy，不是修改或删除已发布 Raw。
+此规则不改变 rollout failure semantics，也不意味着所有失败实验都应 discard。
 
 ### Processed Data
 

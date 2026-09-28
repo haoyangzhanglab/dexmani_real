@@ -420,15 +420,15 @@ def save_camera_calibration(
         "type": "eye_to_hand",
         "pose": {
             "position": [
-                round(float(pos[0]), 6),
-                round(float(pos[1]), 6),
-                round(float(pos[2]), 6),
+                float(pos[0]),
+                float(pos[1]),
+                float(pos[2]),
             ],
             "orientation": [
-                round(float(quat_wxyz[0]), 6),
-                round(float(quat_wxyz[1]), 6),
-                round(float(quat_wxyz[2]), 6),
-                round(float(quat_wxyz[3]), 6),
+                float(quat_wxyz[0]),
+                float(quat_wxyz[1]),
+                float(quat_wxyz[2]),
+                float(quat_wxyz[3]),
             ],
         },
     }

@@ -11,10 +11,10 @@ def validate_rotation_matrix(value, *, name="rotation"):
     matrix = np.asarray(value, dtype=np.float64)
     if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
         raise ValueError(f"{name} must be a finite (3, 3) rotation")
-    if (
-        np.linalg.norm(matrix.T @ matrix - np.eye(3), ord="fro") > ROTATION_ATOL
-        or abs(np.linalg.det(matrix) - 1.0) > ROTATION_ATOL
-    ):
+    residual = matrix.T @ matrix - np.eye(3)
+    orthogonality_error = float(np.max(np.abs(residual)))
+    determinant_error = abs(float(np.linalg.det(matrix)) - 1.0)
+    if orthogonality_error > ROTATION_ATOL or determinant_error > ROTATION_ATOL:
         raise ValueError(f"{name} must be a proper SO(3) rotation")
     return matrix.copy()
 

@@ -70,6 +70,12 @@ class ActionRealizer:
         if any(q.shape != (7,) or not np.isfinite(q).all() for q in (current, previous)):
             raise ValueError("current and previous arm state must be finite (7,) vectors")
         cfg = self.runtime
+        if cfg.policy.hand_enabled:
+            if intent.hand is None:
+                raise ValueError("hand-enabled action realization requires a hand intent")
+        else:
+            if intent.hand is not None:
+                raise ValueError("hand-disabled action realization must not include a hand intent")
         hand = None
         hand_clip = 0.0
         if intent.hand is not None:

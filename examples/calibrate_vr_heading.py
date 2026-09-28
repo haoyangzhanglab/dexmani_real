@@ -12,7 +12,7 @@ import math
 import multiprocessing as mp
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -333,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
         "theta_deg": theta_deg,
         "ref": args.ref,
         "quality": {**quality, "frames": inlier_frames},
-        "calibrated_at": datetime.now().isoformat(),
+        "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     calibration = parse_vr_transform(config, reject_poor=False)
     T = calibration.transform

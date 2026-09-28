@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 
 from dexmani_real.calibration import CAMERAS_PATH
-from dexmani_real.utils.geometry import normalize_quat_wxyz, validate_rigid_transform
+from dexmani_real.utils.geometry import validate_rigid_transform, validate_unit_quaternion_wxyz
 
 
 def _pose_to_matrix(position: list[float], orientation: list[float]) -> np.ndarray:
@@ -37,7 +37,10 @@ def _pose_to_matrix(position: list[float], orientation: list[float]) -> np.ndarr
         raise ValueError("camera pose position/orientation must have shapes (3,) and (4,)")
     if not np.all(np.isfinite(position_value)) or not np.all(np.isfinite(orientation_value)):
         raise ValueError("camera pose must contain only finite values")
-    orientation_value = normalize_quat_wxyz(orientation_value)
+    orientation_value = validate_unit_quaternion_wxyz(
+        orientation_value, name="camera calibration orientation"
+    )
+    orientation_value = orientation_value / np.linalg.norm(orientation_value)
     px, py, pz = (float(value) for value in position_value)
     w, x, y, z = (float(value) for value in orientation_value)
     T = np.eye(4, dtype=np.float64)
