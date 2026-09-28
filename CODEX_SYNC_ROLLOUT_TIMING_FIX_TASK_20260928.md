@@ -2,7 +2,8 @@
 
 日期：2026-09-28  
 仓库：haoyangzhanglab/dexmani_real  
-目标基线：main @ 2452c223c417fc84b9642b9c49055cf52ab45659  
+代码基线（任务书加入前）：2452c223c417fc84b9642b9c49055cf52ab45659  
+执行基线：以 Codex 启动时的当前 HEAD / 工作树为准；不得 checkout、reset 或回退到上述旧 SHA；必须保留该 SHA 之后的任务书提交以及用户已有修改。  
 关联实验：maniflow/pick_place_toy/2026-09-28_04-48-18_42  
 关联分析：PICK_PLACE_TOY_ROLLOUT_ANALYSIS_20260928.md
 
@@ -126,13 +127,21 @@ hardware safety > scientific correctness > data traceability / reproducibility >
 
 采用最小修改。
 
-当 step() 真正进入一个 control tick 时，在执行 observation / inference 前固定本轮开始时间：
+PolicyRunner.step() 已在 gate 前读取：
 
-    tick_start_ns = time.monotonic_ns()
+    now = time.monotonic_ns()
 
-确认 tick 已到期后，立即设置：
+并通过：
 
+    if now < self.next_step_ns:
+        return
+
+因此，当该 gate 通过、step() 真正进入一个 control tick 时，直接复用这个已经判定到期的 `now` 作为本轮起点，不要再额外读取一次时钟：
+
+    tick_start_ns = now
     self.next_step_ns = tick_start_ns + dt_ns
+
+这样 tick 的 deadline 与 gate 使用同一个时间样本，避免不必要的二次时钟读取和语义漂移。
 
 随后执行现有：
 
@@ -268,7 +277,7 @@ hardware safety > scientific correctness > data traceability / reproducibility >
        stamps[9] - stamps[7] == 125 ms
 
 9. 普通 steady-state interval 保持 62.5 ms；
-10. diagnostics on/off 得到完全相同的 target 序列和发布时间序列。
+10. 在确定性 fake-clock 测试中，若 diagnostics stub 本身不推进 fake clock，diagnostics on/off 必须得到完全相同的 target 序列和发布时间序列；不要把这一断言外推为真实运行中诊断开销必须为零。
 
 注意：不要把第 6 项错误改成 62.5 ms。
 
@@ -528,18 +537,19 @@ Codex 不得自行连接或驱动真实设备。
 严格按以下顺序执行：
 
 1. 重新读取 AGENTS.md、本任务书、runner.py、tests/test_rollout_diagnostics.py；
-2. 确认工作树现状，保留用户已有修改；
-3. 只实现 runner timing + inference accounting 的最小代码修正；
-4. 更新 / 新增 focused offline tests；
-5. 运行 focused tests；
-6. 运行全套无硬件 offline validation；
-7. 检查 git diff；
-8. 如需要，仅增加诊断派生指标与对应测试；
-9. 再次运行 offline validation；
-10. 输出代码修正摘要、测试证据、未验证风险；
-11. 停止，不连接真实硬件；
-12. 等操作者执行 H1/H2 并提供 session 后，再做真机数据分析；
-13. 有真机证据后更新 PICK_PLACE_TOY_ROLLOUT_ANALYSIS_20260928.md。
+2. 确认当前 HEAD 与工作树现状；不得 checkout/reset 到任务书中的历史代码基线；保留用户已有修改，并确认自 2452c223 之后是否存在与本任务相关的代码变化；
+3. 本任务书是用户明确要求放在仓库根目录的执行文档；任务期间不要删除、移动或重命名它；
+4. 只实现 runner timing + inference accounting 的最小代码修正；
+5. 更新 / 新增 focused offline tests；
+6. 运行 focused tests；
+7. 运行全套无硬件 offline validation；
+8. 检查 git diff；
+9. 如需要，仅增加诊断派生指标与对应测试；
+10. 再次运行 offline validation；
+11. 输出代码修正摘要、测试证据、未验证风险；
+12. 停止，不连接真实硬件；
+13. 等操作者执行 H1/H2 并提供 session 后，再做真机数据分析；
+14. 有真机证据后更新 PICK_PLACE_TOY_ROLLOUT_ANALYSIS_20260928.md。
 
 ## 12. 最终交付物
 
