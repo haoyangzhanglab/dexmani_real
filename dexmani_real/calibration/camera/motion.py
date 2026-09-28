@@ -11,11 +11,11 @@ import numpy as np
 
 from dexmani_real.calibration.camera.solver import CalibrationConfig, CalibrationSamples
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.ipc.channels import RuntimeChannels, read_arm_state_dict
+from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.robot.arm_homing import ArmHomeConfig, execute_arm_home
-from dexmani_real.robot.commands import RobotCommand, publish_command
+from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
@@ -34,10 +34,17 @@ _IK_WARNING_INTERVAL_S = 1.0
 _BOUNDARY_WARN_INTERVAL_S = 2.0
 
 
-def read_initial_arm(shared: RuntimeChannels, runtime: ExperimentConfig) -> dict[str, Any] | None:
-    deadline_s = time.monotonic() + float(runtime.safety.readiness_timeouts_s["arm"])
+def read_arm_state_dict(robot):
+    state = robot.read_state().arm
+    return (
+        {name: state[name][0].copy() for name in state.dtype.names} if state is not None else None
+    )
+
+
+def read_initial_arm(runtime: ExperimentConfig, robot) -> dict[str, Any] | None:
+    deadline_s = time.monotonic() + float(runtime.arm.homing.convergence_timeout_s)
     while time.monotonic() < deadline_s:
-        state = read_arm_state_dict(shared)
+        state = read_arm_state_dict(robot)
         if state is not None and sample_is_fresh(
             state["timestamp_ns"], runtime.arm.feedback_max_age_s
         ):
@@ -84,8 +91,9 @@ class HomeKeyOutcome(str, Enum):
     FAULT = "fault"
 
 
-def finish_calibration_motion(shared, *, calibration_saved):
+def finish_calibration_motion(shared, *, robot, calibration_saved):
     revoke_motion(shared)
+    robot.stop()
     return 0 if calibration_saved else 2
 
 
@@ -96,6 +104,7 @@ def handle_calibration_home_key(
     keys: KeyboardInput,
     rate: LoopRate,
     state: CalibrationLoopState,
+    robot,
 ) -> HomeKeyOutcome:
     """Handle one return-home key edge and re-anchor the motion state."""
     home_pressed = keys.is_pressed("r")
@@ -112,18 +121,21 @@ def handle_calibration_home_key(
         if not revoke_motion(shared, SafetyState.ARMED):
             set_calibration_fault(shared, "failed to stop calibration motion before home")
             return HomeKeyOutcome.FAULT
+    robot.stop()
     home_result = execute_arm_home(
         shared,
         np.asarray(runtime.arm.home_qpos, dtype=np.float64),
+        robot=robot,
         planner=planner,
         config=ArmHomeConfig.from_runtime(runtime),
         estop_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
+        cancel_requested=lambda: bool(shared.quit_requested.value),
         progress=lambda message: print(f"  {message}", flush=True),
     )
     if shared.estop_request.value:
         set_calibration_fault(shared, "operator e-stop during homing")
         return HomeKeyOutcome.FAULT
-    refreshed = read_initial_arm(shared, runtime)
+    refreshed = read_initial_arm(runtime, robot)
     if refreshed is None:
         set_calibration_fault(shared, "fresh arm feedback unavailable after homing")
         return HomeKeyOutcome.FAULT
@@ -164,8 +176,9 @@ def run_calibration_motion_tick(
     keys: KeyboardInput,
     state: CalibrationLoopState,
     calib_cfg: CalibrationConfig,
+    robot,
 ) -> None:
-    """Propose a jog target and commit it only after successful publication."""
+    """Propose a jog target and commit it only after successful dispatch."""
     safety_state = int(shared.safety_state.value)
     if (
         shared.error_state.value
@@ -184,7 +197,7 @@ def run_calibration_motion_tick(
     dx, drpy = compute_cartesian_jog_delta(keys, calib_cfg.delta_pos_m, calib_cfg.delta_rpy_rad)
     moving = bool(np.any(dx != 0.0) or np.any(drpy != 0.0))
     if not moving:
-        # Idle lets Mode 6 finish/hold the last published endpoint.
+        # Idle lets Mode 6 finish/hold the last dispatched endpoint.
         idle_interval = int(runtime.keyboard_teleop.idle_interval_frames)
         if state.frame % idle_interval == 0:
             measured_pose = planner.kin.compute_eef_pose_world(state.current_qpos)
@@ -245,12 +258,9 @@ def run_calibration_motion_tick(
                 return
             epoch = int(shared.run_id.value)
     q_cmd = ik_result.qpos
-    if publish_command(shared, RobotCommand(epoch, q_cmd)):
-        state.command_pose = proposed_pose
-        state.command_qpos = q_cmd.copy()
-    else:
-        state.command_qpos = None
-        state.command_pose = None
+    robot.send_action(RobotCommand(epoch, q_cmd))
+    state.command_pose = proposed_pose
+    state.command_qpos = q_cmd.copy()
 
     if state.frame % calib_cfg.status_interval_frames == 0:
         measured_pose = planner.kin.compute_eef_pose_world(state.current_qpos)

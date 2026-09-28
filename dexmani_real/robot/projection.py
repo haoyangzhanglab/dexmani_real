@@ -1,4 +1,4 @@
-"""Finite absolute operational targets. Workers separately enforce physical limits."""
+"""Finite operational targets; the Robot also checks physical limits before SDK dispatch."""
 
 import numpy as np
 

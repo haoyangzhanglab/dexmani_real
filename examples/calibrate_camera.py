@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         runtime = resolve_experiment_config(
             yaml_path=args.config,
-            cli_overrides={"camera.serial": args.serial},
+            cli_overrides={"camera.serial": args.serial, "policy.hand_enabled": False},
         )
     except (
         KeyError,

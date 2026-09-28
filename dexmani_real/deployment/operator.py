@@ -1,7 +1,5 @@
 """Policy keyboard ownership and HOME/start/stop authorization ordering."""
 
-import threading
-
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import XArm7MotionPlanner
@@ -17,11 +15,10 @@ from dexmani_real.runtime.safety import (
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-_POLL_S = 0.05
 
 
 class PolicyOperator:
-    """Keep immediate motion fences responsive while the operator thread runs HOME."""
+    """Handle requests on the I/O owner; keyboard callbacks only revoke authority."""
 
     def __init__(
         self,
@@ -29,13 +26,13 @@ class PolicyOperator:
         runtime: ExperimentConfig,
         planner: XArm7MotionPlanner | None,
         *,
-        stop_event: threading.Event,
+        robot,
         execute: bool,
     ):
         self.shared = shared
+        self.robot = robot
         self.runtime = runtime
         self.planner = planner
-        self.stop_event = stop_event
         if not isinstance(execute, bool):
             raise TypeError("execute must be a boolean")
         if execute != (planner is not None):
@@ -47,7 +44,7 @@ class PolicyOperator:
         )
 
     def _request_stop(self) -> None:
-        """Fence live motion when S/STOP arrives while this thread is blocked by H."""
+        """Fence live motion when S/STOP arrives while the I/O owner is blocked by H."""
         if not request_policy_stop(self.shared):
             self.shared.error_state.value = True
 
@@ -57,21 +54,15 @@ class PolicyOperator:
             self.shared.error_state.value = True
         self.shared.quit_requested.value = True
 
-    def run(self) -> None:
-        try:
-            self.keyboard.start()
-            while not self.stop_event.is_set() and self.shared.is_running.value:
-                if self.keyboard.estop_latched or not self.keyboard.healthy:
-                    self.shared.estop_request.value = True
-                    return
-                if not self._handle_command_batch(self.keyboard.poll(timeout=_POLL_S)):
-                    return
-        finally:
-            self.keyboard.stop()
+    def poll(self) -> None:
+        if self.keyboard.estop_latched or not self.keyboard.healthy:
+            self.shared.estop_request.value = True
+            return
+        self._handle_command_batch(self.keyboard.poll(timeout=0))
 
-    def _handle_command_batch(self, signals) -> bool:
+    def _handle_command_batch(self, signals) -> None:
         # A physical B must be a fresh, post-home confirmation.  H blocks
-        # this thread while the arm moves, so begin events from the same
+        # the I/O owner while the arm moves, so begin events from the same
         # drained batch must not survive a successful home sequence.
         discard_begin_in_batch = False
         # Lifecycle-changing signals suppress Home and Begin in the same batch.
@@ -117,8 +108,7 @@ class PolicyOperator:
                 continue
             elif signal is OperatorCommand.EMERGENCY_STOP:
                 self.shared.estop_request.value = True
-                return False
-        return True
+                return
 
     def _run_home(self) -> bool:
         with self.shared.motion_lock:
@@ -138,6 +128,7 @@ class PolicyOperator:
             self.shared,
             self.runtime,
             self.planner,
+            robot=self.robot,
             abort_requested=self._home_abort_requested,
         )
         with self.shared.motion_lock:
@@ -168,9 +159,9 @@ class PolicyOperator:
         return True
 
     def _home_abort_requested(self) -> bool:
+        self.robot.check()
         return bool(
-            self.stop_event.is_set()
-            or not self.shared.is_running.value
+            not self.shared.is_running.value
             or self.shared.quit_requested.value
             or self.shared.error_state.value
             or self.shared.estop_request.value

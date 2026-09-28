@@ -259,11 +259,8 @@ class SafetyParams:
 
     readiness_timeouts_s: Mapping[str, float] = field(
         default_factory=lambda: {
-            "arm": 15.0,
-            "hand": 15.0,
             "camera": 15.0,
             "pointcloud": 30.0,
-            "policy": 120.0,
             "vr": 120.0,
         }
     )

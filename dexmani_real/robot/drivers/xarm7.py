@@ -153,9 +153,9 @@ class XArm7:
 
     Streaming uses Mode 6. HOME executes validated milestones in Mode 0,
     then restores Mode 6 and verifies position/velocity stability before
-    returning. After a State-4 stop on epoch revocation, the worker re-enters
+    returning. After a State-4 stop on epoch revocation, the local owner re-enters
     Mode 6 before the next authorized streaming command.
-    Failures raise: the arm worker's top-level handler latches the sticky
+    Failures raise: the local session handler latches the sticky
     error, and cleanup does a best-effort stop.
     """
 
@@ -163,6 +163,10 @@ class XArm7:
         cfg.validate()
         self.cfg = cfg
         self._api: Any = None
+
+    @property
+    def is_connected(self) -> bool:
+        return self._api is not None and bool(self._api.connected)
 
     def connect(self) -> None:
         """One-shot initialization ending in servo Mode 6.

@@ -1,11 +1,11 @@
-"""Final finite and physical-limit checks at the worker SDK boundary."""
+"""Final finite and physical-limit checks at the direct SDK boundary."""
 
 from __future__ import annotations
 
 import numpy as np
 
 
-def check_worker_arm_target(
+def check_arm_target(
     target_qpos_rad: np.ndarray,
     *,
     joint_limit_lower_rad: np.ndarray,
@@ -22,7 +22,7 @@ def check_worker_arm_target(
     return None
 
 
-def check_worker_hand_target(
+def check_hand_target(
     target_qpos_rad: np.ndarray,
     *,
     mechanical_lower_rad: np.ndarray,

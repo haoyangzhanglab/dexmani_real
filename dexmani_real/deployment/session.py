@@ -1,9 +1,7 @@
-"""Policy deployment process ownership and operator lifecycle."""
+"""Own the local policy/robot, sensor processes and operator lifecycle."""
 
 import multiprocessing as mp
 import os
-import threading
-import time
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.deployment.config import (
@@ -12,13 +10,13 @@ from dexmani_real.deployment.config import (
     validate_policy_runtime_compatibility,
     validate_recording_budget,
 )
+from dexmani_real.deployment.observation import build_fingertip_runtime
 from dexmani_real.deployment.operator import PolicyOperator
-from dexmani_real.deployment.runner import run_policy_worker
+from dexmani_real.deployment.runner import PolicyRunner
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.robot.arm_homing import build_policy_home_planner
-from dexmani_real.robot.arm_worker import run_arm_worker
-from dexmani_real.robot.hand_worker import run_hand_worker
-from dexmani_real.runtime.processes import stop_processes_verified
+from dexmani_real.robot.robot import DexManiRobot
+from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.safety import (
     RunEndReason,
     SafetyState,
@@ -35,7 +33,7 @@ logger = get_logger(__name__)
 
 def run_policy_deployment(
     runtime,
-    worker_config,
+    policy_config,
     execute,
     *,
     prefix=None,
@@ -43,7 +41,7 @@ def run_policy_deployment(
     num_episodes=1,
     recording_config=None,
 ):
-    info = worker_config.info
+    info = policy_config.info
     cloud_recipe = validate_policy_runtime_compatibility(info, runtime)
     max_running_s = validate_max_running_s(max_running_s)
     num_episodes = validate_num_episodes(num_episodes)
@@ -73,45 +71,23 @@ def run_policy_deployment(
         config=RuntimeChannelsConfig.from_runtime(runtime, pointcloud_num_points=points),
     )
     supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
-    operator_stop = threading.Event()
-    operator_thread = None
-    operator_error = None
+    robot = DexManiRobot(shared, runtime, check_services=supervisor.check)
+    model = operator = None
+    failure = None
     clean = False
-
-    def run_operator():
-        nonlocal operator_error
-        try:
-            operator.run()
-        except Exception as exc:
-            operator_error = exc
-            logger.exception("policy operator failed")
-
     try:
-        policy = ctx.Process(
-            name="policy",
-            target=run_policy_worker,
-            args=(
-                shared,
-                runtime,
-                worker_config,
-                execute,
-                max_running_s,
-                num_episodes,
-                recording_config,
-            ),
+        from dexmani_policy.deployment import load_policy
+
+        model = load_policy(
+            policy_config.config, info, device=policy_config.device, seed=policy_config.seed
         )
-        supervisor.start([policy])
-        sensors = [
-            ctx.Process(name="arm", target=run_arm_worker, args=(shared, runtime.arm)),
-            ctx.Process(name="hand", target=run_hand_worker, args=(shared, runtime.hand)),
-        ]
+        fingertip = build_fingertip_runtime(info, runtime)
+        model.warmup(samples=5, rgb_hw=(runtime.camera.height, runtime.camera.width))
+        robot.connect()
+        sensors = []
         if camera:
             sensors.append(
-                ctx.Process(
-                    name="camera",
-                    target=run_camera_worker,
-                    args=(shared, runtime.camera),
-                )
+                ctx.Process(name="camera", target=run_camera_worker, args=(shared, runtime.camera))
             )
         if cloud:
             sensors.append(
@@ -123,53 +99,44 @@ def run_policy_deployment(
             )
         supervisor.start(sensors)
         require_transition(shared, SafetyState.ARMED)
-        planner = build_policy_home_planner(runtime) if execute else None
         operator = PolicyOperator(
-            shared, runtime, planner, stop_event=operator_stop, execute=execute
+            shared,
+            runtime,
+            build_policy_home_planner(runtime) if execute else None,
+            robot=robot,
+            execute=execute,
         )
-        operator_thread = threading.Thread(target=run_operator)
-        operator_thread.start()
-        while shared.is_running.value:
-            if shared.error_state.value or shared.estop_request.value or not supervisor.check():
-                break
-            if operator_error is not None or not operator_thread.is_alive():
-                logger.error("policy operator stopped unexpectedly")
-                break
-            if shared.quit_requested.value:
-                clean = True
-                break
-            time.sleep(0.02)
-    except KeyboardInterrupt:
+        operator.keyboard.start()
+        robot.check_services = lambda: supervisor.check() and operator.keyboard.healthy
+        runner = PolicyRunner(
+            shared,
+            runtime,
+            info,
+            robot=robot,
+            poll_operator=operator.poll,
+            model_runtime=model,
+            fingertip_runtime=fingertip,
+            execute=execute,
+            max_running_s=max_running_s,
+            num_episodes=num_episodes,
+            recording_config=recording_config,
+        )
+        runner.run()
+        clean = bool(shared.quit_requested.value)
+    except KeyboardInterrupt as exc:
         shared.estop_request.value = True
-    except Exception:
+        failure = exc
+    except Exception as exc:
+        failure = exc
+        shared.error_state.value = True
         logger.exception("policy session failed")
     finally:
-        operator_stop.set()
-        if not clean:
-            # Stop authorization before waiting for a thread that may be inside HOME.
-            with shared.motion_lock:
-                shared.is_running.value = False
-            if int(shared.safety_state.value) != int(SafetyState.DISARMED):
-                revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
-        if operator_thread is not None and operator_thread.ident is not None:
-            operator_thread.join(timeout=5)
-            if operator_thread.is_alive():
-                shared.error_state.value = True
-                revoke_motion(shared, SafetyState.FAULT)
-                stop_processes_verified(
-                    shared,
-                    supervisor.started_processes,
-                    graceful_timeout_s=runtime.safety.shutdown_timeout_s,
-                )
-                raise RuntimeError("operator thread still uses channels; refusing SHM release")
-        shutdown_clean = supervisor.shutdown(
-            graceful_timeout_s=max(5.0, runtime.safety.shutdown_timeout_s),
+        revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
+        shutdown_clean = shutdown_local_runtime(
+            robot,
+            supervisor,
+            model=model,
+            keyboard=operator.keyboard if operator else None,
+            timeout_s=runtime.safety.shutdown_timeout_s,
         )
-    return int(
-        not clean
-        or operator_error is not None
-        or shared.error_state.value
-        or shared.estop_request.value
-        or int(shared.safety_state.value) == int(SafetyState.FAULT)
-        or not shutdown_clean
-    )
+    return int(not clean or failure is not None or not shutdown_clean)

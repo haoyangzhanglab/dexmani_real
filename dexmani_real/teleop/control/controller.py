@@ -1,4 +1,4 @@
-"""Current-row teleop mapping, absolute target publication and raw recording."""
+"""Current-row teleop mapping, absolute target dispatch and raw recording."""
 
 import numpy as np
 
@@ -7,7 +7,9 @@ from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.recording.frame import build_episode_frame
 from dexmani_real.robot.action import ActionIntent
-from dexmani_real.robot.commands import RobotCommand, publish_command
+from dexmani_real.robot.commands import RobotCommand
+from dexmani_real.robot.robot import DispatchError
+from dexmani_real.runtime.safety import revoke_motion
 from dexmani_real.teleop.control.action_proposal import compute_target_eef_pose
 from dexmani_real.teleop.control.hand_retargeting import (
     HandRetargetObservationCache,
@@ -30,6 +32,7 @@ class TeleopController:
         self.clear_reference()
 
     def clear_reference(self):
+        self.previous_arm_command = None
         self.arm_mapper.clear()
         self.smoothed_eef_position = self.smoothed_eef_quaternion = None
         self.hand_observation_cache.reset()
@@ -87,23 +90,38 @@ class TeleopController:
         return RobotCommand(run_id, realized.arm_qpos, realized.hand_qpos), True, realized.eef_pose
 
 
-def execute_control_step(controller, shared, row, recorder=None):
+def execute_control_step(controller, shared, robot, row, recorder=None):
     epoch = int(shared.run_id.value)
     target, control_ok, intent = controller.compute_command(row, epoch)
     if recorder is not None:
         recorder.check_error()
-    stamp = publish_command(shared, target) if target is not None else 0
-    if int(shared.run_id.value) != epoch or (target is not None and not stamp):
+    result = None
+    if target is not None:
+        try:
+            result = robot.send_action(target)
+        except DispatchError:
+            if recorder is not None:
+                recorder.mark_discard("dispatch_rejected")
+            revoke_motion(shared)
+            try:
+                robot.stop()
+            except Exception:
+                from dexmani_real.utils.log import get_logger
+
+                get_logger(__name__).exception("stop after teleop dispatch failure also failed")
+            raise
+    stamp = result.timestamp_ns if result is not None else 0
+    if int(shared.run_id.value) != epoch:
         if recorder is not None:
-            recorder.mark_discard("publication_rejected")
+            recorder.mark_discard("dispatch_rejected")
         return control_ok
-    if stamp:
+    if result is not None:
         controller.previous_arm_command = target.arm_qpos.copy()
         controller.smoothed_eef_position = intent[:3].copy()
         controller.smoothed_eef_quaternion = rot6d_to_quat_wxyz(intent[3:])
     if recorder is not None:
-        if not control_ok or target is None or not stamp:
+        if not control_ok or result is None:
             recorder.mark_discard("control_failure")
         if recorder.accepting_frames:
-            recorder.add_frame(build_episode_frame(row, target), step_timestamp_ns=stamp)
+            recorder.add_frame(build_episode_frame(row, target, result), step_timestamp_ns=stamp)
     return control_ok

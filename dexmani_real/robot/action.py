@@ -29,7 +29,7 @@ class ActionRealization:
     arm_clip_rad: float = 0.0
     hand_clip_rad: float = 0.0
     ik_result: IKResult | None = None
-    # Accepted Cartesian target feeds Teleop's explicit EMA only after publication.
+    # Accepted Cartesian target feeds Teleop's explicit EMA only after dispatch.
     eef_pose: np.ndarray | None = None
 
 

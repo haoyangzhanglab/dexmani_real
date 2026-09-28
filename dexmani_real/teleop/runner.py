@@ -1,6 +1,5 @@
 """Operator-supervised teleop with one current observation per real control step."""
 
-import signal
 import time
 from pathlib import Path
 
@@ -49,10 +48,12 @@ def _build_hand_retargeter(config: TeleopConfig):
 
 
 class TeleopRunner:
-    """Own operator, recording and control state for one teleop worker."""
+    """Own operator, recording and control state for one local teleop session."""
 
-    def __init__(self, shared, config: TeleopConfig):
+    def __init__(self, shared, config: TeleopConfig, robot, *, start_vr=None):
         self.shared = shared
+        self.robot = robot
+        self.start_vr = start_vr
         self.config = config
         self.runtime = config.runtime
         self.recorder = (
@@ -67,7 +68,9 @@ class TeleopRunner:
             else None
         )
         self.keyboard = KeyboardInput(
-            estop_callback=lambda: setattr(shared.estop_request, "value", True)
+            estop_callback=lambda: setattr(shared.estop_request, "value", True),
+            stop_callback=lambda: revoke_motion(shared),
+            quit_callback=lambda: revoke_motion(shared),
         )
         self.audio = AudioFeedback()
         self.controller = None
@@ -88,6 +91,7 @@ class TeleopRunner:
 
     def _pause_control(self, reason):
         revoke_motion(self.shared)
+        self.robot.stop()
         if self.controller is not None:
             self.controller.clear_reference()
         if (
@@ -121,11 +125,12 @@ class TeleopRunner:
             self._finish_capture(False, reason, announce=False)
 
     def _poll_blocking_commands(self, commands=()):
+        self.robot.check()
         aborted = False
         # Other keys are consumed, including the tail of the poll that contained H.
         # Q revokes HOME authority before any blocking capture finalization.
         for cmd in (*commands, *self.keyboard.poll(timeout=0)):
-            if cmd in (OperatorCommand.EMERGENCY_STOP, OperatorCommand.QUIT):
+            if cmd in (OperatorCommand.EMERGENCY_STOP, OperatorCommand.QUIT, OperatorCommand.STOP):
                 self._handle_operator_command(cmd)
                 aborted = True
         return bool(
@@ -140,12 +145,14 @@ class TeleopRunner:
         if self.resume_requested:
             return
         revoke_motion(self.shared)
+        self.robot.stop()
         self.paused = True
         if self.recorder is not None and self.recorder.is_recording:
             self._finish_capture(True, "pause")
         row = read_observation(
             self.shared,
             self.runtime,
+            self.robot,
             require_hand=self.runtime.policy.hand_enabled,
             require_camera=self.recorder is not None,
             require_vr=True,
@@ -203,6 +210,7 @@ class TeleopRunner:
                     self.shared,
                     self.runtime,
                     self.home_planner,
+                    robot=self.robot,
                     abort_requested=self._poll_blocking_commands,
                 ):
                     self.audio.queue("home_done")
@@ -230,7 +238,15 @@ class TeleopRunner:
                 else row.observation_timestamp_ns,
             )
         ):
-            if self.controller.reset_reference(row) and begin_motion(self.shared):
+            epoch = int(self.shared.run_id.value)
+            prepared = self.controller.reset_reference(row)
+            with self.shared.motion_lock:
+                authorized = (
+                    prepared
+                    and epoch == int(self.shared.run_id.value)
+                    and begin_motion(self.shared)
+                )
+            if authorized:
                 event = "resume" if self.active else "begin"
                 self.active = True
                 self.paused = self.resume_requested = False
@@ -244,7 +260,9 @@ class TeleopRunner:
         return False
 
     def _execute_control_step(self, row):
-        control_ok = execute_control_step(self.controller, self.shared, row, self.recorder)
+        control_ok = execute_control_step(
+            self.controller, self.shared, self.robot, row, self.recorder
+        )
         if self.recorder is not None and self.recorder.discard_reason is not None:
             self._invalidate_capture(self.recorder.discard_reason)
             return
@@ -256,7 +274,7 @@ class TeleopRunner:
         finished = time.monotonic()
         if self.next_tick <= finished:
             # Do not burst through missed ticks after a slow control step.
-            # The recorder still checks actual publication cadence.
+            # The recorder still checks actual dispatch cadence.
             self.next_tick = finished + self.control_dt
         if self.recorder is None:
             self.failures = self.failures + 1 if not control_ok else 0
@@ -270,6 +288,7 @@ class TeleopRunner:
                 self.shared.estop_request.value = True
             if self._poll_blocking_commands():
                 return False
+            self.robot.service_idle()
             if self.shared.vr_ready.wait(timeout=0.05):
                 # Consume startup keystrokes before accepting a new B after readiness.
                 return not self._poll_blocking_commands()
@@ -280,7 +299,10 @@ class TeleopRunner:
         # Sensor readiness follows XHand connection and the tactile calibration
         # attempt; reset before the slower IK/retargeting initialization.
         home_result = home_hand(
-            self.shared, self.runtime, abort_requested=self._poll_blocking_commands
+            self.shared,
+            self.runtime,
+            robot=self.robot,
+            abort_requested=self._poll_blocking_commands,
         )
         if not home_result.ok:
             if (
@@ -308,7 +330,8 @@ class TeleopRunner:
         )
         if self._poll_blocking_commands():
             return False
-        self.shared.policy_ready.set()
+        if self.start_vr is not None:
+            self.start_vr()
         if not self._wait_for_vr():
             return False
         print("准备进入遥操作", flush=True)
@@ -318,11 +341,15 @@ class TeleopRunner:
         failure = None
         try:
             self.keyboard.start()
-            signal.signal(
-                signal.SIGTERM, lambda *_: setattr(self.shared.is_running, "value", False)
+            check_services = self.robot.check_services
+            self.robot.check_services = lambda: (
+                (check_services is None or check_services()) and self.keyboard.healthy
             )
             ready = self._initialize()
             while ready and self.shared.is_running.value and not self.shared.quit_requested.value:
+                self.robot.check()
+                if not self.active or self.paused:
+                    self.robot.service_idle()
                 if not self.keyboard.healthy:
                     self.shared.estop_request.value = True
                 if self.shared.estop_request.value or self.shared.error_state.value:
@@ -334,6 +361,19 @@ class TeleopRunner:
                 if self.active and not self.paused:
                     timeout = min(timeout, max(0.0, self.next_tick - time.monotonic()))
                 commands = self.keyboard.poll(timeout=timeout)
+                if any(
+                    c in commands
+                    for c in (
+                        OperatorCommand.STOP,
+                        OperatorCommand.QUIT,
+                        OperatorCommand.EMERGENCY_STOP,
+                    )
+                ):
+                    commands = [
+                        c
+                        for c in commands
+                        if c not in (OperatorCommand.HOME, OperatorCommand.BEGIN)
+                    ]
                 for index, cmd in enumerate(commands):
                     if self._handle_operator_command(
                         cmd,
@@ -355,6 +395,7 @@ class TeleopRunner:
                 row = read_observation(
                     self.shared,
                     self.runtime,
+                    self.robot,
                     require_hand=self.runtime.policy.hand_enabled,
                     require_camera=self.recorder is not None,
                     require_vr=True,
@@ -392,15 +433,35 @@ class TeleopRunner:
         finally:
             revoke_motion(self.shared)
             try:
+                self.robot.stop()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+                logger.exception("teleop stop failed")
+            try:
+                if self.controller is not None:
+                    self.controller.clear_reference()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+                logger.exception("teleop reference cleanup failed")
+            try:
                 if self.recorder is not None:
                     if self.recorder.is_recording:
                         self.recorder.mark_discard("interrupted")
                         self._finish_capture(False, "interrupted", announce=False)
-                    self.recorder.close()
             except Exception as exc:
                 if failure is None:
                     failure = exc
                 logger.exception("teleop recording cleanup failed")
+            finally:
+                if self.recorder is not None:
+                    try:
+                        self.recorder.close()
+                    except Exception as exc:
+                        if failure is None:
+                            failure = exc
+                        logger.exception("teleop recorder close failed")
             try:
                 # Motion is revoked and recording is finalized. Let the exit
                 # or emergency cue finish before close() cancels the player.
@@ -415,10 +476,5 @@ class TeleopRunner:
                     if failure is None:
                         failure = exc
                     logger.exception("teleop resource cleanup failed")
-            self.shared.policy_ready.clear()
         if failure is not None:
             raise failure
-
-
-def run_teleop_worker(shared, config: TeleopConfig) -> None:
-    TeleopRunner(shared, config).run()

@@ -69,6 +69,7 @@ class ObservationRow:
 def read_observation(
     shared,
     runtime,
+    robot,
     *,
     require_hand=True,
     require_camera=False,
@@ -76,17 +77,17 @@ def read_observation(
     require_pointcloud=False,
     require_rgb_cloud_identity=False,
 ):
-    arm_result = shared.arm_state_ring.read_latest()
-    hand_result = shared.hand_state_ring.read_latest() if require_hand else None
+    state = robot.read_state()
+    if state is None:
+        return None
+    arm, hand = state.arm, state.hand if require_hand else None
     cloud_result = shared.pointcloud_ring.read_latest() if require_pointcloud else None
     if (
-        arm_result is None
-        or (require_hand and hand_result is None)
+        arm is None
+        or (require_hand and hand is None)
         or (require_pointcloud and cloud_result is None)
     ):
         return None
-    arm = arm_result[0]
-    hand = hand_result[0] if hand_result else None
     cloud = cloud_result[0][0] if cloud_result else None
     if require_rgb_cloud_identity:
         camera = (

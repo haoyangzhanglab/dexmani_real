@@ -133,6 +133,8 @@ def _write_run_config(session_dir, *, args, runtime, info):
     compact_info["experiment_dir"] = str(info.experiment_dir)
     compact_info["checkpoint_path"] = str(info.checkpoint_path)
     payload = {
+        "execution_path": "synchronous_direct_sdk_v1",
+        "observation_action_pairing": "control_tick_input_and_attempted_targets",
         "experiment": args.experiment,
         "checkpoint": args.checkpoint,
         "policy": compact_info,
@@ -197,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
         root = Path(__file__).resolve().parents[1] / "rollouts"
         session_dir = _session_directory(root, selector)
         _write_run_config(session_dir, args=args, runtime=runtime, info=info)
-        worker_config = PolicyRuntimeConfig(saved_config, info, args.device, args.seed)
+        policy_config = PolicyRuntimeConfig(saved_config, info, args.device, args.seed)
         recording_config = RolloutRecordingConfig(str(session_dir), info.task_name)
     except Exception as exc:
         print(f"[COMPAT] session setup failed: {exc}", file=sys.stderr)
@@ -214,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
 
         return run_policy_deployment(
             runtime,
-            worker_config,
+            policy_config,
             True,
             max_running_s=args.max_running_s,
             num_episodes=args.num_episodes,

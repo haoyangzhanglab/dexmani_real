@@ -43,7 +43,7 @@ HAND_TACTILE_FORCE_SHAPE = (
 )
 HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
 
-# XHand SDK joint order, used for all cross-process joint vectors.
+# XHand SDK joint order used by commands, feedback and Raw joint vectors.
 XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
     "right_hand_thumb_bend_joint",
     "right_hand_thumb_rota_joint1",

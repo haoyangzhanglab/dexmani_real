@@ -1,4 +1,4 @@
-"""Shared-memory rings, queues, events, and flags for runtime processes."""
+"""Shared-memory sensor rings, events, and flags for runtime processes."""
 
 from __future__ import annotations
 
@@ -12,9 +12,6 @@ from dexmani_real.config.hardware import CameraParams
 from dexmani_real.ipc.camera_ring import CameraRingBuffer
 from dexmani_real.ipc.ring import SharedMemoryRingBuffer
 from dexmani_real.ipc.schema import (
-    ARM_STATE_DTYPE,
-    HAND_STATE_DTYPE,
-    ROBOT_COMMAND_DTYPE,
     VR_FRAME_DTYPE,
     make_pointcloud_frame_dtype,
 )
@@ -28,31 +25,24 @@ DISARMED_SAFETY_STATE_WIRE_VALUE = 0
 
 @dataclass
 class RuntimeChannelsConfig:
-    """Ring capacities, queue sizes, and camera resolution defaults."""
+    """Sensor ring capacities and camera resolution defaults."""
 
     camera_ring_maxlen: int = CameraParams.ring_maxlen
     vr_ring_maxlen: int = 8
-    arm_state_ring_maxlen: int = 8
-    hand_state_ring_maxlen: int = 8
     pointcloud_num_points: int = 1024
     pointcloud_ring_maxlen: int = 8
 
     camera_rgb_shape: tuple[int, int, int] = field(default_factory=lambda: CameraParams().rgb_shape)
     camera_depth_shape: tuple[int, int] = field(default_factory=lambda: CameraParams().depth_shape)
 
-    arm_home_q_maxsize: int = 2
-
     def __post_init__(self) -> None:
         capacities = (
             self.camera_ring_maxlen,
             self.vr_ring_maxlen,
-            self.arm_state_ring_maxlen,
-            self.hand_state_ring_maxlen,
             self.pointcloud_ring_maxlen,
-            self.arm_home_q_maxsize,
         )
         if any(int(value) <= 0 for value in capacities):
-            raise ValueError("RuntimeChannels ring/queue capacities must be positive")
+            raise ValueError("RuntimeChannels ring capacities must be positive")
         if (
             isinstance(self.pointcloud_num_points, bool)
             or not isinstance(self.pointcloud_num_points, (int, np.integer))
@@ -83,53 +73,38 @@ class RuntimeChannelsConfig:
 _RING_RESOURCE_NAMES = (
     "camera_ring",
     "vr_ring",
-    "arm_state_ring",
-    "hand_state_ring",
-    "robot_command_ring",
     "pointcloud_ring",
 )
-_QUEUE_RESOURCE_NAMES = ("arm_home_q", "arm_home_result_q", "hand_home_q", "hand_home_result_q")
 
 
 @dataclass
 class RuntimeChannels:
     """Runtime channels created in Main before spawning child processes."""
 
-    camera_ring: CameraRingBuffer  # camera -> policy
-    vr_ring: SharedMemoryRingBuffer  # vr -> policy
-    arm_state_ring: SharedMemoryRingBuffer  # arm -> policy
-    hand_state_ring: SharedMemoryRingBuffer  # hand -> policy
-    robot_command_ring: SharedMemoryRingBuffer  # latest current-run target mailbox
-    pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> policy
+    camera_ring: CameraRingBuffer  # camera -> local observation consumers
+    vr_ring: SharedMemoryRingBuffer  # VR -> local teleop/calibration
+    pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> local policy
 
-    arm_home_q: mp.Queue  # requester -> arm HOME (waypoints, final_qpos, run_id, expires_ns)
-    arm_home_result_q: Any
-    hand_home_q: Any
-    hand_home_result_q: Any
-    run_id: Any  # controller advances it to invalidate old policy proposals
+    run_id: Any  # advancing the epoch invalidates pending motion commands
     # Latest software RUNNING termination; written under motion_lock.
     run_ended_reason: Any
 
-    is_running: Any  # Main -> all
+    is_running: Any  # session lifetime, shared with sensors
     # Sticky runtime/safety fault: supervision takes the FAULT shutdown path.
     error_state: Any
     estop_request: Any  # sticky emergency-stop request
-    quit_requested: Any  # policy -> Main
-    start_request: Any  # Main -> policy runner: B (start a new policy run)
-    # Main/operator -> policy runner: true only after Main completed the
+    quit_requested: Any  # operator or episode budget requests session exit
+    start_request: Any  # operator -> local policy runner: B
+    # Operator -> local policy runner: true only after the I/O owner completed the
     # authorized hand-home + collision-checked arm-home sequence.
     physical_home_completed: Any
-    # Main/operator -> policy runner: S request.
+    # Operator -> local policy runner: S request.
     stop_request: Any
 
-    safety_state: Any  # SafetyState enum (0-3), Main + policy write
-    # Serializes the motion permit and coupled-command ring writer. It is never
-    # held across hardware SDK calls.
+    safety_state: Any  # SafetyState enum (0-3), guarded by motion_lock
+    # Serializes motion permissions; never held across hardware SDK calls.
     motion_lock: Any
 
-    arm_ready: Any
-    hand_ready: Any
-    policy_ready: Any
     vr_ready: Any
     camera_ready: Any
     pointcloud_ready: Any
@@ -145,24 +120,19 @@ class RuntimeChannels:
         prefix: str = "dexmani",
         *,
         config: RuntimeChannelsConfig | None = None,
-        camera_rgb_shape: tuple[int, int, int] | None = None,
-        camera_depth_shape: tuple[int, int] | None = None,
         mp_context: Any | None = None,
     ) -> "RuntimeChannels":
-        """Create all rings, queues, flags, and events.
+        """Create sensor rings, flags, and events.
 
         Call once from Main before spawning child processes.
         """
         cfg = config or RuntimeChannelsConfig()
         ctx = mp_context or mp.get_context("spawn")
 
-        _rgb_shape = camera_rgb_shape or cfg.camera_rgb_shape
-        _depth_shape = camera_depth_shape or cfg.camera_depth_shape
-
         storage = cls.__new__(cls)
         storage._closed = False
         try:
-            cls._allocate_resources(storage, prefix, cfg, ctx, _rgb_shape, _depth_shape)
+            cls._allocate_resources(storage, prefix, cfg, ctx)
         except BaseException as allocation_error:
             try:
                 cleanup_succeeded = storage.close()
@@ -186,13 +156,11 @@ class RuntimeChannels:
         prefix: str,
         cfg: RuntimeChannelsConfig,
         ctx: Any,
-        rgb_shape: tuple[int, int, int],
-        depth_shape: tuple[int, int],
     ) -> None:
         storage.camera_ring = CameraRingBuffer(
             name=f"{prefix}_camera",
-            rgb_shape=rgb_shape,
-            depth_shape=depth_shape,
+            rgb_shape=cfg.camera_rgb_shape,
+            depth_shape=cfg.camera_depth_shape,
             maxlen=cfg.camera_ring_maxlen,
             create=True,
         )
@@ -202,24 +170,6 @@ class RuntimeChannels:
             maxlen=cfg.vr_ring_maxlen,
             create=True,
         )
-        storage.arm_state_ring = SharedMemoryRingBuffer(
-            f"{prefix}_arm_state",
-            dtype=ARM_STATE_DTYPE,
-            maxlen=cfg.arm_state_ring_maxlen,
-            create=True,
-        )
-        storage.hand_state_ring = SharedMemoryRingBuffer(
-            f"{prefix}_hand_state",
-            dtype=HAND_STATE_DTYPE,
-            maxlen=cfg.hand_state_ring_maxlen,
-            create=True,
-        )
-        storage.robot_command_ring = SharedMemoryRingBuffer(
-            f"{prefix}_robot_command",
-            dtype=ROBOT_COMMAND_DTYPE,
-            maxlen=1,
-            create=True,
-        )
         storage.pointcloud_ring = SharedMemoryRingBuffer(
             f"{prefix}_pointcloud",
             dtype=make_pointcloud_frame_dtype(cfg.pointcloud_num_points),
@@ -227,10 +177,6 @@ class RuntimeChannels:
             create=True,
         )
 
-        storage.arm_home_q = ctx.Queue(maxsize=cfg.arm_home_q_maxsize)
-        storage.arm_home_result_q = ctx.Queue(maxsize=2)
-        storage.hand_home_q = ctx.Queue(maxsize=2)
-        storage.hand_home_result_q = ctx.Queue(maxsize=2)
         storage.run_id = ctx.Value("Q", 1)
         storage.run_ended_reason = ctx.Value("i", 0)
 
@@ -245,9 +191,6 @@ class RuntimeChannels:
         storage.safety_state = ctx.Value("i", DISARMED_SAFETY_STATE_WIRE_VALUE)
         storage.motion_lock = ctx.RLock()
 
-        storage.arm_ready = ctx.Event()
-        storage.hand_ready = ctx.Event()
-        storage.policy_ready = ctx.Event()
         storage.vr_ready = ctx.Event()
         storage.camera_ready = ctx.Event()
         storage.pointcloud_ready = ctx.Event()
@@ -289,30 +232,9 @@ class RuntimeChannels:
             _attempt(f"{ring_name}.close", ring.close)
             _attempt(f"{ring_name}.unlink", ring.unlink, missing_ok=True)
 
-        for queue_name in _QUEUE_RESOURCE_NAMES:
-            queue = getattr(self, queue_name, None)
-            if queue is None:
-                continue
-            if _attempt(f"{queue_name}.close", queue.close):
-                _attempt(f"{queue_name}.join_thread", queue.join_thread)
-
         self._closed = not errors
         if self._closed:
             logger.debug("RuntimeChannels closed cleanly")
         else:
             logger.error("RuntimeChannels close incomplete: %s", ", ".join(errors))
         return self._closed
-
-
-def read_arm_state(shared: RuntimeChannels) -> np.ndarray | None:
-    """Read latest arm state from ring. Returns raw structured array or None."""
-    result = shared.arm_state_ring.read_latest()
-    if result is None:
-        return None
-    data, _ts_ns, _seq = result
-    return data
-
-
-def read_arm_state_dict(shared):
-    state = read_arm_state(shared)
-    return None if state is None else {name: state[name][0].copy() for name in state.dtype.names}

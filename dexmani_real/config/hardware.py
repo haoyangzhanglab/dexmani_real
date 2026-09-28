@@ -17,7 +17,6 @@ from dexmani_real.utils.limits import validate_hand_limit_nesting
 
 _OBSERVATION_MAX_AGE_PERIODS = 4
 
-
 _XHAND_RATED_QPOS_MIN_RAD: tuple[float, ...] = (
     0.0,
     -0.698,
@@ -64,7 +63,6 @@ class HomingParams:
     velocity_convergence_rad_s: float = 0.03
     dwell_s: float = 0.30
     convergence_timeout_s: float = 15.0
-    request_queue_timeout_s: float = 0.2
     state_max_age_s: float = 0.5
 
     def validate(self) -> None:
@@ -76,7 +74,6 @@ class HomingParams:
             self.velocity_convergence_rad_s,
             self.dwell_s,
             self.convergence_timeout_s,
-            self.request_queue_timeout_s,
             self.state_max_age_s,
         )
         if not all(np.isfinite(value) and value > 0 for value in values):
@@ -108,7 +105,7 @@ class ArmParams:
     max_joint_velocity_deg_per_s: float = 135.0  # 75% of the 180 deg/s SDK command limit
     # ~14.14 rad/s²; ~71% of the 20 rad/s² SDK limit.
     max_joint_acceleration_deg_per_s2: float = 810.0
-    loop_hz: float = 30.0  # worker command-admission / feedback-update rate
+    feedback_max_age_s: float = 4 / 30  # unchanged host feedback freshness budget
 
     ip: str = "192.168.1.111"
 
@@ -121,10 +118,6 @@ class ArmParams:
     tcp_load_cog_mm: tuple[float, float, float] = (16.3, 7.9, 109.5)
 
     homing: HomingParams = field(default_factory=HomingParams)
-
-    @property
-    def feedback_max_age_s(self) -> float:
-        return _OBSERVATION_MAX_AGE_PERIODS / self.loop_hz
 
     @property
     def max_joint_velocity_rad_per_s(self) -> float:
@@ -152,8 +145,8 @@ class ArmParams:
             raise ValueError("home_qpos must be within joint limits")
         if not self.ip:
             raise ValueError("arm ip must be non-empty")
-        if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
-            raise ValueError("arm loop_hz must be finite and positive")
+        if not np.isfinite(self.feedback_max_age_s) or self.feedback_max_age_s <= 0:
+            raise ValueError("arm feedback_max_age_s must be finite and positive")
         if not np.isfinite(self.table_z_surface_m):
             raise ValueError("table_z_surface_m must be finite")
         if not np.isfinite(self.hand_safety_margin_m) or self.hand_safety_margin_m < 0:
@@ -261,7 +254,7 @@ class HandParams:
         300,
     )
 
-    loop_hz: float = 30.0  # worker command-admission / feedback-update rate
+    feedback_max_age_s: float = 4 / 30  # unchanged host feedback freshness budget
     state_read_failure_timeout_s: float = 1.0
 
     home_timeout_s: float = 2.0
@@ -276,10 +269,6 @@ class HandParams:
         0.707107,
         0.0,
     )
-
-    @property
-    def feedback_max_age_s(self) -> float:
-        return _OBSERVATION_MAX_AGE_PERIODS / self.loop_hz
 
     def validate(self) -> None:
         if self.ethercat_slave_position < -1:
@@ -339,8 +328,8 @@ class HandParams:
             not isinstance(value, int) or value <= 0 for value in self.tor_max_ma
         ):
             raise ValueError("hand tor_max_ma must contain twelve positive integer mA limits")
-        if not np.isfinite(self.loop_hz) or self.loop_hz <= 0:
-            raise ValueError("hand loop_hz must be finite and positive")
+        if not np.isfinite(self.feedback_max_age_s) or self.feedback_max_age_s <= 0:
+            raise ValueError("hand feedback_max_age_s must be finite and positive")
         if (
             not np.isfinite(self.state_read_failure_timeout_s)
             or self.state_read_failure_timeout_s <= 0

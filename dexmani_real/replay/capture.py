@@ -23,6 +23,7 @@ class ReplayRecorder:
         self.arm_tracking_error = np.full(capacity, np.nan, dtype=np.float64)
         self.timestamps = np.full(capacity, np.nan, dtype=np.float64)
         self.hand_qpos = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
+        self.dispatch_status = np.zeros((capacity, 2), dtype=np.uint8)
         self.hand_cmd = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
 
     def record(
@@ -36,6 +37,7 @@ class ReplayRecorder:
         ts: float,
         *,
         hand_qpos: np.ndarray,
+        dispatch_status: tuple[int, int],
         arm_tracking_error: float | None = None,
     ) -> None:
         """Capture one replay row, preserving rejected candidates for diagnosis."""
@@ -43,6 +45,7 @@ class ReplayRecorder:
             raise ValueError("replay frame index must be non-negative")
         if idx >= self.capacity:
             return
+        self.dispatch_status[idx] = dispatch_status
         self.arm_qpos[idx] = arm_qpos
         self.eef_pos[idx] = eef_pos
         self.eef_rot6d[idx] = eef_rot6d
@@ -69,6 +72,8 @@ class ReplayRecorder:
         """Return copies of the populated prefix without pickle-only values."""
         count = self._count
         result = {
+            "execution_path": np.asarray("synchronous_direct_sdk_v1"),
+            "dispatch_status": self.dispatch_status[:count].copy(),
             "arm_qpos": self.arm_qpos[:count].copy(),
             "hand_qpos": self.hand_qpos[:count].copy(),
             "hand_cmd": self.hand_cmd[:count].copy(),

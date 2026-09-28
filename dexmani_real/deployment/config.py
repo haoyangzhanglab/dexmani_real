@@ -1,4 +1,4 @@
-"""Validate policy requirements against actuator worker service rates.
+"""Validate policy requirements against current physical and numerical configuration.
 
 Saved Policy config supplies modalities, cadence and the numerical cloud recipe.
 Current Real config owns physical capability; this module imports neither Policy nor Torch.
@@ -55,7 +55,7 @@ def validate_max_running_s(max_running_s: float | None) -> float | None:
 
 
 def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloudConfig | None:
-    """Check physical capability before allocating IPC or starting workers."""
+    """Check physical capability before allocating IPC or connecting devices."""
     if not runtime.policy.hand_enabled:
         raise ValueError("Dexterous policy deployment requires hand_enabled=true")
     dt = info.control_dt_s
@@ -80,10 +80,6 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
             or len(set(links)) != 5
         ):
             raise ValueError("Live fingertip_points requires five distinct non-empty link names")
-    policy_hz = 1.0 / dt
-    limiting_hz = min(runtime.arm.loop_hz, runtime.hand.loop_hz)
-    if policy_hz > limiting_hz and not math.isclose(policy_hz, limiting_hz, rel_tol=1e-9):
-        raise ValueError(f"Policy rate {policy_hz:g} Hz exceeds worker rate {limiting_hz:g} Hz")
     if "point_cloud" in names:
         recipe = info.pointcloud_config
         if not isinstance(recipe, dict):
@@ -105,7 +101,7 @@ def validate_recording_budget(info, max_running_s):
 
 @dataclass(frozen=True)
 class PolicyRuntimeConfig:
-    """Spawn arguments; config includes explicit deployment overrides."""
+    """Local model loading arguments; config includes explicit deployment overrides."""
 
     config: dict
     info: Any
@@ -126,7 +122,7 @@ def validate_num_episodes(num_episodes: Any) -> int:
 class RolloutRecordingConfig:
     """Recording inputs for a physical rollout, with an absolute session data_dir.
 
-    The CLI validates paths before workers start. Episode counts and budgets
+    The CLI validates paths before the session starts. Episode counts and budgets
     belong to lifecycle configuration. Runtime records technical stop reasons;
     task success is judged offline from raw episodes.
     """

@@ -9,7 +9,7 @@ from dexmani_real.deployment.action import (
     physical_action_dim,
     policy_action_intent,
 )
-from dexmani_real.deployment.observation import build_fingertip_runtime, build_policy_observation
+from dexmani_real.deployment.observation import build_policy_observation
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.recording.frame import build_episode_frame
 from dexmani_real.recording.recorder import (
@@ -18,8 +18,9 @@ from dexmani_real.recording.recorder import (
     snapshot_recording_metadata,
 )
 from dexmani_real.robot.action import ActionRealizer
-from dexmani_real.robot.commands import RobotCommand, publish_command
-from dexmani_real.runtime.observation import ObservationHistory, read_observation
+from dexmani_real.robot.commands import RobotCommand
+from dexmani_real.robot.robot import DispatchError
+from dexmani_real.runtime.observation import ObservationHistory, read_observation, sample_is_fresh
 from dexmani_real.runtime.safety import (
     RunEndReason,
     SafetyState,
@@ -39,6 +40,8 @@ class PolicyRunner:
         runtime,
         policy_info,
         *,
+        robot,
+        poll_operator=None,
         model_runtime,
         fingertip_runtime,
         execute,
@@ -47,6 +50,9 @@ class PolicyRunner:
         recording_config=None,
     ):
         self.shared = shared
+        self.robot = robot
+        self.poll_operator = poll_operator
+        self.robot.before_send = self._within_budget
         self.runtime = runtime
         self.policy_info = policy_info
         self.model = model_runtime
@@ -82,10 +88,18 @@ class PolicyRunner:
         return read_observation(
             self.shared,
             self.runtime,
+            self.robot,
             require_hand=True,
             require_camera=self.requires_camera_payload,
             require_pointcloud=self.requires_cloud,
             require_rgb_cloud_identity=self.requires_rgb_cloud_identity,
+        )
+
+    def _within_budget(self):
+        return (
+            self.run_id is None
+            or self.max_running_s is None
+            or time.monotonic_ns() - self.started_ns < int(self.max_running_s * 1e9)
         )
 
     def _has_motion_authority(self):
@@ -103,6 +117,13 @@ class PolicyRunner:
             return
         revoke_motion_if_run_id(self.shared, self.run_id, reason=run_end_reason)
         self.shared.physical_home_completed.value = False
+        stop_error = None
+        try:
+            self.robot.stop()
+        except Exception as exc:
+            stop_error = exc
+            logger.exception("episode stop failed")
+            reason = f"{reason}:stop_failure"
         self.action_queue.clear()
         self.history.clear()
         self.previous_arm = None
@@ -116,6 +137,8 @@ class PolicyRunner:
             logger.info("policy episode %d ended: %s", self.completed, reason)
             if self.completed >= self.num_episodes:
                 self.shared.quit_requested.value = True
+        if stop_error is not None:
+            raise stop_error
 
     def _start_observation(self):
         row = self._read_observation()
@@ -214,6 +237,7 @@ class PolicyRunner:
                         self.shared.start_request.value = False
 
     def step(self):
+        self.robot.check()
         if self.recorder is not None:
             self.recorder.check_error()
         initial = None
@@ -239,15 +263,17 @@ class PolicyRunner:
             return
         if now < self.next_step_ns:
             return
-        # Observation, synchronous inference and publication share this tick's budget.
+        # Observation, synchronous inference and dispatch share this tick's budget.
         tick_start_ns = now
         self.next_step_ns = tick_start_ns + int(self.policy_info.control_dt_s * 1e9)
         row = initial[0] if initial is not None else self._read_observation()
+        policy_row = row
         if row is None:
             self._finish_episode("required_observation_stale")
             return
         if initial is None:
             self.history.append(row)
+        execution_state = policy_row
         if not self.action_queue:
             observation = (
                 initial[1]
@@ -263,11 +289,16 @@ class PolicyRunner:
                 return
             epoch = self.run_id
             prediction = self.model.predict(observation)
+            self.robot.check()
+            if (
+                not self._has_motion_authority()
+                or self.shared.quit_requested.value
+                or epoch != int(self.shared.run_id.value)
+            ):
+                self._finish_episode("motion_revoked")
+                return
             if self.recorder is not None:
                 self.recorder.check_error()
-            if not self._has_motion_authority() or epoch != int(self.shared.run_id.value):
-                self.action_queue.clear()
-                return
             if self.max_running_s is not None and time.monotonic_ns() - self.started_ns >= int(
                 self.max_running_s * 1e9
             ):
@@ -285,14 +316,24 @@ class PolicyRunner:
                 raise ValueError("policy prediction violates shape/finite contract")
             self.action_queue.extend(prediction)
             # Execution feedback after a blocking query is telemetry, not a synthetic history row.
-            row = self._read_observation()
-            if row is None:
+            execution_state = self.robot.read_state()
+            if (
+                execution_state is None
+                or execution_state.arm is None
+                or execution_state.hand is None
+                or not sample_is_fresh(
+                    execution_state.arm["timestamp_ns"][0], self.runtime.arm.feedback_max_age_s
+                )
+                or not sample_is_fresh(
+                    execution_state.hand["timestamp_ns"][0], self.runtime.hand.feedback_max_age_s
+                )
+            ):
                 self._finish_episode("required_observation_stale")
                 return
         action = self.action_queue.popleft()
         decoded = self.realizer.realize(
             policy_action_intent(action, self.policy_info.action_mode),
-            row.arm["qpos"][0],
+            execution_state.arm["qpos"][0],
             self.previous_arm,
         )
         arm, prepared_hand = decoded.arm_qpos, decoded.hand_qpos
@@ -303,7 +344,7 @@ class PolicyRunner:
                 raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
             if self.recorder:
                 self.recorder.add_frame(
-                    build_episode_frame(row),
+                    build_episode_frame(policy_row),
                     step_timestamp_ns=time.monotonic_ns(),
                 )
             return
@@ -311,34 +352,81 @@ class PolicyRunner:
         if self.recorder is not None:
             self.recorder.check_error()
         command = RobotCommand(self.run_id, prepared_arm, prepared_hand)
-        stamp = (
-            publish_command(self.shared, command)
-            if self.execute
-            else time.monotonic_ns()
-        )
-        if not stamp:
-            if self.recorder is not None:
-                self.recorder.add_frame(
-                    build_episode_frame(row), step_timestamp_ns=time.monotonic_ns()
-                )
-            return
-        self.previous_arm = prepared_arm
+        result = None
+        dispatch_error = None
+        if self.execute:
+            try:
+                result = self.robot.send_action(command)
+            except DispatchError as exc:
+                result, dispatch_error = exc.result, exc
+                revoke_motion_if_run_id(self.shared, self.run_id)
+                try:
+                    self.robot.stop()
+                except Exception:
+                    logger.exception("stop after dispatch failure also failed")
+        if result is not None and result.continued and dispatch_error is None:
+            self.previous_arm = prepared_arm
+        elif not self.execute:
+            self.previous_arm = prepared_arm
         if self.recorder:
             self.recorder.add_frame(
-                build_episode_frame(row, command),
-                step_timestamp_ns=stamp,
+                build_episode_frame(policy_row, command, result),
+                step_timestamp_ns=result.timestamp_ns if result else time.monotonic_ns(),
             )
+        if dispatch_error is not None:
+            try:
+                reason = (
+                    "timeout"
+                    if not self._within_budget()
+                    else "motion_revoked"
+                    if dispatch_error.revoked
+                    else "dispatch_failure"
+                )
+                self._finish_episode(reason)
+            except Exception:
+                logger.exception("dispatch failure finalization also failed")
+                raise dispatch_error
+            if not dispatch_error.revoked:
+                raise dispatch_error
+        elif not self._within_budget():
+            self._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
 
     def run(self):
         failure = None
         try:
             while self.shared.is_running.value and not self.shared.quit_requested.value:
+                if self.poll_operator is not None:
+                    self.poll_operator()
+                if self.shared.estop_request.value or self.shared.error_state.value:
+                    break
+                if self.run_id is None:
+                    self.robot.service_idle()
                 self.step()
-                time.sleep(0.001)
+                remaining = (self.next_step_ns - time.monotonic_ns()) / 1e9
+                if self.run_id is None:
+                    time.sleep(0.005)
+                elif remaining > 0:
+                    time.sleep(min(0.005, remaining))
         except Exception as exc:
             failure = exc
+            self.shared.error_state.value = True
             self.shared.is_running.value = False
         finally:
+            if self.run_id is not None:
+                revoke_motion_if_run_id(
+                    self.shared,
+                    self.run_id,
+                    reason=RunEndReason.POLICY_FAILURE
+                    if failure
+                    else RunEndReason.RUNTIME_SHUTDOWN,
+                )
+            self.robot.before_send = None
+            try:
+                self.robot.stop()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+                logger.exception("policy stop failed")
             try:
                 reason = RunEndReason(int(self.shared.run_ended_reason.value))
                 normal_stop = (
@@ -363,55 +451,17 @@ class PolicyRunner:
                 if self.recorder is not None:
                     if self.recorder.is_recording:
                         self.recorder.save_episode(reason="interrupted")
-                    self.recorder.close()
             except Exception as exc:
                 if failure is None:
                     failure = exc
                 logger.exception("policy recording cleanup failed")
+            finally:
+                if self.recorder is not None:
+                    try:
+                        self.recorder.close()
+                    except Exception as exc:
+                        if failure is None:
+                            failure = exc
+                        logger.exception("policy recorder close failed")
         if failure is not None:
             raise failure
-
-
-def run_policy_worker(
-    shared,
-    runtime,
-    config,
-    execute,
-    max_running_s=None,
-    num_episodes=1,
-    recording_config=None,
-):
-    from dexmani_policy.deployment import load_policy
-
-    model = None
-    failure = None
-    try:
-        model = load_policy(config.config, config.info, device=config.device, seed=config.seed)
-        fingertip_runtime = build_fingertip_runtime(config.info, runtime)
-        model.warmup(samples=5, rgb_hw=(runtime.camera.height, runtime.camera.width))
-        runner = PolicyRunner(
-            shared,
-            runtime,
-            config.info,
-            model_runtime=model,
-            fingertip_runtime=fingertip_runtime,
-            execute=execute,
-            max_running_s=max_running_s,
-            num_episodes=num_episodes,
-            recording_config=recording_config,
-        )
-        shared.policy_ready.set()
-        runner.run()
-    except Exception as exc:
-        failure = exc
-        logger.exception("policy worker failed")
-        raise
-    finally:
-        shared.policy_ready.clear()
-        if model is not None:
-            try:
-                model.close()
-            except Exception:
-                if failure is None:
-                    raise
-                logger.exception("policy model cleanup failed")

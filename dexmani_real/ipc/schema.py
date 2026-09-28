@@ -1,4 +1,4 @@
-"""NumPy cross-process sensor and command schemas."""
+"""NumPy layouts for sensor IPC and local robot feedback."""
 
 from __future__ import annotations
 
@@ -62,18 +62,6 @@ def validate_point_cloud_array(
     return array
 
 
-# Latest absolute target. Presence bits support arm-only manual workflows.
-ROBOT_COMMAND_DTYPE = np.dtype(
-    [
-        ("run_id", "<u8"),
-        ("arm_present", "u1"),
-        ("hand_present", "u1"),
-        ("arm_qpos", "<f8", ARM_JOINT_SHAPE),
-        ("hand_qpos", "<f8", HAND_JOINT_SHAPE),
-    ],
-    align=True,
-)
-
 ARM_STATE_DTYPE = np.dtype(
     [
         ("qpos", "<f8", ARM_JOINT_SHAPE),
@@ -133,7 +121,6 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
 __all__ = [
     "ARM_STATE_DTYPE",
     "CAMERA_FRAME_HEADER_DTYPE",
-    "ROBOT_COMMAND_DTYPE",
     "HAND_STATE_DTYPE",
     "POINT_CLOUD_FEATURE_DIM",
     "VR_FRAME_DTYPE",

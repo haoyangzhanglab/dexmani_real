@@ -1,4 +1,4 @@
-"""Publish every raw target once at nominal dt, with current feedback."""
+"""Dispatch every raw target once at nominal dt, with current feedback."""
 
 import time
 from dataclasses import dataclass
@@ -9,11 +9,15 @@ import numpy as np
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.replay.capture import ReplayRecorder
-from dexmani_real.robot.commands import RobotCommand, publish_command
+from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.projection import project_arm_command, project_hand_command
+from dexmani_real.robot.robot import DispatchError
 from dexmani_real.runtime.observation import read_observation
 from dexmani_real.runtime.operator_input import OperatorCommand
 from dexmani_real.runtime.safety import begin_motion, revoke_motion
+from dexmani_real.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 class ReplayStatus(str, Enum):
@@ -39,14 +43,17 @@ class ReplayOutcome:
         return self.status in (ReplayStatus.COMPLETED, ReplayStatus.USER_QUIT)
 
 
-def _wait_replay(shared, keyboard, epoch, deadline):
+def _wait_replay(shared, keyboard, epoch, deadline, robot):
     """Keep operator input and lifecycle checks active during bounded waits."""
     while True:
+        robot.check()
         signals = keyboard.poll(timeout=0)
         if not keyboard.healthy:
             shared.estop_request.value = True
         if shared.estop_request.value:
             return ReplayOutcome(ReplayStatus.ESTOP, reason="operator emergency stop")
+        if shared.quit_requested.value:
+            return ReplayOutcome(ReplayStatus.USER_QUIT)
         if (
             shared.error_state.value
             or not shared.is_running.value
@@ -61,7 +68,7 @@ def _wait_replay(shared, keyboard, epoch, deadline):
         time.sleep(min(0.005, remaining))
 
 
-def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s):
+def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s, robot):
     """Prepare frame zero without adding synthetic rows to the recorded trajectory."""
     arm_hold = project_arm_command(
         row.arm["qpos"][0],
@@ -93,10 +100,10 @@ def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s)
     last_sample = 0
     consecutive = 0
     while True:
-        interrupted = _wait_replay(shared, keyboard, epoch, deadline)
+        interrupted = _wait_replay(shared, keyboard, epoch, deadline, robot)
         if interrupted is not None:
             return interrupted
-        row = read_observation(shared, runtime)
+        row = read_observation(shared, runtime, robot)
         if row is None:
             return ReplayOutcome(ReplayStatus.REJECTED, reason="hand start feedback stale")
         if np.max(np.abs(row.arm["qpos"][0] - arm_hold)) > np.deg2rad(10):
@@ -107,9 +114,7 @@ def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s)
             hand = (
                 hand_target if step == steps else hand_start + weight * (hand_target - hand_start)
             )
-            stamp = publish_command(shared, RobotCommand(epoch, arm_hold, hand))
-            if not stamp:
-                return ReplayOutcome(ReplayStatus.REJECTED, reason="hand start authority revoked")
+            stamp = robot.send_action(RobotCommand(epoch, arm_hold, hand)).timestamp_ns
             if step == steps:
                 final_stamp = stamp
                 last_sample = stamp
@@ -128,18 +133,18 @@ def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s)
                 consecutive += 1
             else:
                 consecutive = 0
-            # Only distinct fresh samples after the final publication establish arrival.
+            # Only distinct fresh samples after the final dispatch establish arrival.
             if consecutive >= 3:
                 print("XHand start ready; replaying recorded targets.", flush=True)
                 return None
         deadline = time.monotonic() + 0.01
 
 
-def replay_targets(shared, runtime, trajectory, keyboard, *, hand_start_duration_s):
+def replay_targets(shared, runtime, trajectory, keyboard, *, robot, hand_start_duration_s):
     capture = ReplayRecorder(trajectory.num_frames)
     status, reason = ReplayStatus.COMPLETED, ""
     fk = make_arm_fk()
-    row = read_observation(shared, runtime)
+    row = read_observation(shared, runtime, robot)
     if row is None:
         return ReplayOutcome(ReplayStatus.REJECTED, reason="fresh robot feedback unavailable")
     # Replay starts near the recorded posture; reposition separately with operator oversight.
@@ -163,16 +168,16 @@ def replay_targets(shared, runtime, trajectory, keyboard, *, hand_start_duration
     try:
         if hand_start_duration_s > 0:
             interrupted = _warm_up_hand(
-                shared, runtime, trajectory, keyboard, epoch, row, hand_start_duration_s
+                shared, runtime, trajectory, keyboard, epoch, row, hand_start_duration_s, robot
             )
             if interrupted is not None:
                 return interrupted
         for index in range(trajectory.num_frames):
-            interrupted = _wait_replay(shared, keyboard, epoch, 0.0)
+            interrupted = _wait_replay(shared, keyboard, epoch, 0.0, robot)
             if interrupted is not None:
                 status, reason = interrupted.status, interrupted.reason
                 break
-            row = read_observation(shared, runtime)
+            row = read_observation(shared, runtime, robot)
             if row is None:
                 status, reason = ReplayStatus.REJECTED, "robot feedback stale"
                 break
@@ -187,26 +192,52 @@ def replay_targets(shared, runtime, trajectory, keyboard, *, hand_start_duration
                 qpos_min_rad=runtime.hand.qpos_min_rad,
                 qpos_max_rad=runtime.hand.qpos_max_rad,
             )
-            stamp = publish_command(shared, RobotCommand(epoch, arm, hand))
-            if not stamp:
-                status, reason = ReplayStatus.REJECTED, "motion authority revoked"
-                break
+            dispatch_error = None
+            try:
+                result = robot.send_action(RobotCommand(epoch, arm, hand))
+            except DispatchError as exc:
+                result, dispatch_error = exc.result, exc
+                revoke_motion(shared)
+                try:
+                    robot.stop()
+                except Exception:
+                    shared.error_state.value = True
+                    logger.exception("stop after replay dispatch failure also failed")
+            stamp = result.timestamp_ns or time.monotonic_ns()
             pos, rot = fk.compute(row.arm["qpos"][0])
             capture.record(
                 index,
                 row.arm["qpos"][0],
                 pos,
                 rot,
-                arm,
-                hand,
+                arm if result.arm else np.full(7, np.nan),
+                hand if result.hand else np.full(12, np.nan),
                 stamp / 1e9,
+                dispatch_status=(int(result.arm), int(result.hand)),
                 hand_qpos=row.hand["qpos"][0],
                 arm_tracking_error=float(np.max(np.abs(arm - row.arm["qpos"][0]))),
             )
-            interrupted = _wait_replay(shared, keyboard, epoch, stamp / 1e9 + 1 / trajectory.fps)
+            if dispatch_error is not None:
+                status = ReplayStatus.REJECTED if dispatch_error.revoked else ReplayStatus.FAULT
+                reason = f"{dispatch_error}; arm={result.arm.name}, hand={result.hand.name}, arm_code={result.arm_code}"
+                if not dispatch_error.revoked:
+                    shared.error_state.value = True
+                break
+            interrupted = _wait_replay(
+                shared, keyboard, epoch, stamp / 1e9 + 1 / trajectory.fps, robot
+            )
             if interrupted is not None:
                 status, reason = interrupted.status, interrupted.reason
                 break
+    except Exception as exc:
+        status, reason = ReplayStatus.FAULT, str(exc)
+        shared.error_state.value = True
     finally:
         revoke_motion(shared)
-    return ReplayOutcome(status, capture.to_dict(), reason)
+        try:
+            robot.stop()
+        except Exception as exc:
+            status, reason = ReplayStatus.FAULT, f"{reason}; stop failed: {exc}"
+    data = capture.to_dict()
+    data["termination_reason"] = np.asarray(reason or status.value)
+    return ReplayOutcome(status, data, reason)

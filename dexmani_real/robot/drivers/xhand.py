@@ -1,10 +1,10 @@
-"""Worker-local XHand driver with one SDK call per runtime read or send.
+"""XHand driver with one SDK call per runtime read or send.
 
 Reads accept known sensor/CRC statuses only with complete, finite 12-DoF joint
 payloads. Aggregate (``calc_force``) and dense (``raw_force``) tactile validity
 are independent: an RS485 distributed-force drop leaves aggregate contact
 force usable. Send CRC responses leave delivery unconfirmed without stopping
-the worker; other SDK errors are rejected.
+the caller; other SDK errors are rejected.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from enum import Enum
 from typing import Any, Callable
 
 import numpy as np
-from xhand_controller import xhand_control as xhc  # type: ignore[import-untyped]
 
 from dexmani_real.config.hardware import HandParams
 from dexmani_real.robot.model import (
@@ -156,7 +155,7 @@ class XHandState:
 
 
 class XHand:
-    """Worker-local XHand SDK controller."""
+    """XHand SDK controller owned by the session I/O thread."""
 
     def __init__(self, config: HandParams):
         config.validate()
@@ -184,6 +183,9 @@ class XHand:
 
     def connect(self) -> None:
         """Open the configured device and seed its command buffer from live feedback."""
+        from xhand_controller import xhand_control
+
+        self._sdk = xhand_control
         if self.connected_flag:
             return
 
@@ -217,7 +219,7 @@ class XHand:
         last_error: XHandError | None = None
 
         for attempt in range(1, retries + 1):
-            self._control = xhc.XHandControl()
+            self._control = self._sdk.XHandControl()
             if device_name is None:
                 devices, _ = self._captured_sdk_call(
                     "discovery",
@@ -233,9 +235,14 @@ class XHand:
                 device_name = devices[0]
 
             if self.cfg.comm_type == "serial":
-                open_call = lambda: self._control.open_serial(device_name, self.cfg.baudrate)
+
+                def open_call():
+                    return self._control.open_serial(device_name, self.cfg.baudrate)
             else:
-                open_call = lambda: self._control.open_ethercat(device_name)
+
+                def open_call():
+                    return self._control.open_ethercat(device_name)
+
             error, output = self._captured_sdk_call(
                 f"open attempt {attempt}/{retries}",
                 open_call,
@@ -578,7 +585,7 @@ class XHand:
         return XHandSendStatus.ACCEPTED
 
     def _make_command(self, qpos: np.ndarray) -> Any:
-        command = xhc.HandCommand_t()
+        command = self._sdk.HandCommand_t()
         for index in range(HAND_DOF):
             joint = command.finger_command[index]
             joint.id = index

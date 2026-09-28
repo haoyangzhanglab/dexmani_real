@@ -30,7 +30,7 @@ def propose_cartesian_jog_pose(
     position_lower: np.ndarray,
     position_upper: np.ndarray,
 ) -> tuple[Pose, np.ndarray, bool]:
-    """Project a jog proposal without advancing the published target reference."""
+    """Project a jog proposal without advancing the dispatched target reference."""
     desired_position = command_pose.p + dx
     position = np.clip(desired_position, position_lower, position_upper)
     rotating = bool(np.any(drpy != 0.0))

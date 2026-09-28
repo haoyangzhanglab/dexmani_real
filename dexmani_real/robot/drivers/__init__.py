@@ -1,3 +1,3 @@
-"""Hardware driver implementations owned by robot workers."""
+"""Hardware driver implementations owned by the local robot I/O thread."""
 
 __all__: list[str] = []

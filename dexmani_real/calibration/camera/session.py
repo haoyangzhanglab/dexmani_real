@@ -23,6 +23,7 @@ from dexmani_real.calibration.camera.motion import (
     HomeKeyOutcome,
     finish_calibration_motion,
     handle_calibration_home_key,
+    read_arm_state_dict,
     read_initial_arm,
     run_calibration_motion_tick,
     set_calibration_fault,
@@ -44,17 +45,16 @@ from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.channels import (
     RuntimeChannels,
     RuntimeChannelsConfig,
-    read_arm_state_dict,
 )
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import make_online_ik_config
-from dexmani_real.robot.arm_worker import run_arm_worker
+from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.observation import read_camera_frame, sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
-from dexmani_real.runtime.processes import shutdown_processes_verified
+from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.safety import RunEndReason, SafetyState, require_transition, revoke_motion
-from dexmani_real.runtime.supervisor import wait_subsystem_ready
+from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
@@ -131,11 +131,11 @@ def _build_planner(
 
 
 def _read_stationary_calibration_arm_state(
-    shared: RuntimeChannels,
     runtime: ExperimentConfig,
+    robot,
 ) -> tuple[dict[str, Any] | None, str]:
     """Read fresh arm feedback using the homing stationary bound."""
-    arm_state = read_arm_state_dict(shared)
+    arm_state = read_arm_state_dict(robot)
     if arm_state is None:
         return None, "arm state unavailable"
     if not sample_is_fresh(arm_state["timestamp_ns"], runtime.arm.feedback_max_age_s):
@@ -316,7 +316,7 @@ class CameraCalibrationSession:
         runtime,
         planner,
         workspace,
-        arm_process,
+        robot,
         camera_process,
         calibration_config,
         aruco_config,
@@ -325,7 +325,7 @@ class CameraCalibrationSession:
         self.runtime = runtime
         self.planner = planner
         self.workspace = workspace
-        self.arm_process = arm_process
+        self.robot = robot
         self.camera_process = camera_process
         self.calibration_config = calibration_config
         self.aruco_config = aruco_config
@@ -337,9 +337,7 @@ class CameraCalibrationSession:
             return "a worker set the sticky error latch"
         if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
             return "safety state is FAULT"
-        if not self.arm_process.is_alive():
-            return "arm worker exited"
-        arm = read_arm_state_dict(self.shared)
+        arm = read_arm_state_dict(self.robot)
         if arm is None or not sample_is_fresh(
             arm["timestamp_ns"], self.runtime.arm.feedback_max_age_s
         ):
@@ -350,7 +348,7 @@ class CameraCalibrationSession:
         """Append one marker/arm observation only when the arm stayed stationary."""
         print(f"\n  [{len(self.state.samples) + 1}] capturing ArUco pose...", end=" ", flush=True)
         arm_before, feedback_issue = _read_stationary_calibration_arm_state(
-            self.shared, self.runtime
+            self.runtime, self.robot
         )
         if arm_before is None:
             print(f"FAILED — before capture: {feedback_issue}, skipped")
@@ -370,9 +368,7 @@ class CameraCalibrationSession:
             print(f"FAILED — {exc}, skipped")
             return
 
-        arm_after, feedback_issue = _read_stationary_calibration_arm_state(
-            self.shared, self.runtime
-        )
+        arm_after, feedback_issue = _read_stationary_calibration_arm_state(self.runtime, self.robot)
         if arm_after is None:
             print(f"FAILED — after capture: {feedback_issue}, skipped")
             return
@@ -447,6 +443,9 @@ class CameraCalibrationSession:
                         "— press ENTER to recompute"
                     )
             elif event == "enter":
+                revoke_motion(self.shared)
+                self.robot.stop()
+                self.state.command_qpos = self.state.command_pose = None
                 transform = _solve_and_save_calibration(
                     self.state.samples,
                     self.planner,
@@ -459,13 +458,18 @@ class CameraCalibrationSession:
             event = self.keys.pop_event()
 
     def run(self) -> int:
-        initial_state = read_initial_arm(self.shared, self.runtime)
+        initial_state = read_initial_arm(self.runtime, self.robot)
         if initial_state is None:
             set_calibration_fault(self.shared, "initial arm feedback is unavailable or unhealthy")
             return 1
 
+        def request_quit():
+            revoke_motion(self.shared)
+            self.shared.quit_requested.value = True
+
         self.keys = KeyboardInput(
             suppress_echo=True,
+            quit_callback=request_quit,
             capture_commands=False,
             capture_raw_events=True,
             repeat_estop_callback=True,
@@ -493,6 +497,10 @@ class CameraCalibrationSession:
                 f"fy={self.intrinsics[1, 1]:.1f} ({_CAMERA_WIDTH}x{_CAMERA_HEIGHT})"
             )
             self.keys.start()
+            check_services = self.robot.check_services
+            self.robot.check_services = lambda: (
+                (check_services is None or check_services()) and self.keys.healthy
+            )
             keys_started = True
             cv2.namedWindow(_WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
             window_created = True
@@ -505,6 +513,12 @@ class CameraCalibrationSession:
             set_calibration_fault(self.shared, f"calibration session failed: {exc}")
             return 1
         finally:
+            revoke_motion(self.shared)
+            try:
+                self.robot.stop()
+            except Exception:
+                self.shared.error_state.value = True
+                logger.exception("calibration stop failed")
             if keys_started:
                 try:
                     self.keys.stop()
@@ -524,7 +538,9 @@ class CameraCalibrationSession:
             cv2.aruco.DetectorParameters(),
         )
         self.rate = LoopRate(
-            float(self.runtime.keyboard_teleop.control_hz), label="camera_calibration"
+            float(self.runtime.keyboard_teleop.control_hz),
+            label="camera_calibration",
+            busy_wait=False,
         )
 
         print(
@@ -557,11 +573,11 @@ class CameraCalibrationSession:
                 revoke_motion(self.shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
                 return 1
 
-            if self.keys.is_pressed("q"):
+            if self.shared.quit_requested.value or self.keys.is_pressed("q"):
                 return finish_calibration_motion(
-                    self.shared, calibration_saved=self.state.calibration_saved
+                    self.shared, robot=self.robot, calibration_saved=self.state.calibration_saved
                 )
-            self.state.current_qpos = read_arm_state_dict(self.shared)["qpos"]
+            self.state.current_qpos = read_arm_state_dict(self.robot)["qpos"]
 
             home_outcome = handle_calibration_home_key(
                 self.shared,
@@ -570,6 +586,7 @@ class CameraCalibrationSession:
                 self.keys,
                 self.rate,
                 self.state,
+                self.robot,
             )
             if home_outcome is HomeKeyOutcome.FAULT:
                 return 1
@@ -584,6 +601,7 @@ class CameraCalibrationSession:
                 self.keys,
                 self.state,
                 self.calibration_config,
+                self.robot,
             )
         return 0
 
@@ -604,6 +622,10 @@ def run_camera_calibration(
     """
     if hand_geometry not in {"absent", "secured-home"}:
         raise ValueError("hand_geometry must be 'absent' or 'secured-home'")
+    if runtime.policy.hand_enabled:
+        raise ValueError(
+            "camera calibration requires explicit hand_enabled=false and secured/absent hand"
+        )
     calib_cfg = calibration_config or CalibrationConfig()
     aruco_cfg = aruco_config or ArucoConfig()
     planner, workspace = _build_planner(runtime)
@@ -624,83 +646,26 @@ def run_camera_calibration(
         config=RuntimeChannelsConfig.from_runtime(runtime),
         mp_context=ctx,
     )
-    processes: list[Any] = []
+    supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
+    robot = DexManiRobot(shared, runtime, check_services=supervisor.check)
     exit_code = 1
     try:
-        processes = [
-            ctx.Process(name="arm", target=run_arm_worker, args=(shared, runtime.arm)),
-            ctx.Process(
-                name="camera",
-                target=run_camera_worker,
-                args=(shared, runtime.camera),
-            ),
-        ]
-        for process in processes:
-            if process.name not in runtime.safety.readiness_timeouts_s:
-                raise ValueError(f"active process {process.name!r} requires a readiness timeout")
-        for process in processes:
-            process.start()
-        arm_process = processes[0]
-        for process in processes:
-            if not wait_subsystem_ready(
-                shared, process, runtime.safety.readiness_timeouts_s[process.name]
-            ):
-                raise RuntimeError(f"{process.name} startup failed")
-
-        initial_state = read_initial_arm(shared, runtime)
-        if initial_state is None:
-            set_calibration_fault(shared, "initial arm feedback is unavailable or unhealthy")
-            return 1
-
+        robot.connect()
+        camera = ctx.Process(name="camera", target=run_camera_worker, args=(shared, runtime.camera))
+        supervisor.start([camera])
         require_transition(shared, SafetyState.ARMED)
-        print(f"  arm worker ready (Mode 6, {runtime.arm.loop_hz}Hz)")
-
+        print("  local arm connected (Mode 6)")
         exit_code = CameraCalibrationSession(
-            shared,
-            runtime,
-            planner,
-            workspace,
-            arm_process,
-            processes[1],
-            calib_cfg,
-            aruco_cfg,
+            shared, runtime, planner, workspace, robot, camera, calib_cfg, aruco_cfg
         ).run()
+    except Exception:
+        shared.error_state.value = True
+        logger.exception("camera calibration session failed")
     finally:
-        started = [p for p in processes if p.pid is not None]
-        if started:
-            try:
-                clean_exit = exit_code == 0
-                workers_clean = shutdown_processes_verified(
-                    shared,
-                    started,
-                    graceful_timeout_s=float(runtime.safety.shutdown_timeout_s),
-                )
-                shutdown_clean = (
-                    workers_clean
-                    and not bool(shared.error_state.value)
-                    and not bool(shared.estop_request.value)
-                    and int(shared.safety_state.value) == int(SafetyState.DISARMED)
-                )
-                if clean_exit and not shutdown_clean:
-                    logger.error(
-                        "verified shutdown invalidated the clean control exit: %s",
-                        workers_clean,
-                    )
-                    exit_code = 1
-            except RuntimeError:
-                logger.critical(
-                    "child process remains alive; leaving RuntimeChannels linked",
-                    exc_info=True,
-                )
-                exit_code = 1
-        else:
-            try:
-                if not shared.close():
-                    logger.error("RuntimeChannels cleanup was incomplete")
-                    exit_code = 1
-            except Exception:
-                logger.error("RuntimeChannels cleanup failed", exc_info=True)
-                exit_code = 1
-
+        revoke_motion(shared)
+        if not shutdown_local_runtime(
+            robot, supervisor, timeout_s=runtime.safety.shutdown_timeout_s
+        ):
+            exit_code = 1
     print(f"  calibration session exit code: {exit_code}")
     return exit_code

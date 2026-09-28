@@ -118,6 +118,12 @@ python examples/run_policy.py <experiment_dir> --checkpoint best
 `n_obs_steps - 1 + N <= horizon`，不会改写训练配置或 checkpoint。
 实际长度和覆盖参数会保存在 `run_config.yaml`。
 
+Policy、VR teleop、keyboard、replay 和 camera calibration 的正常动作统一由本地薄组合 Robot 调用现有 xArm / XHand 驱动。模型推理、设备读写及 HOME 在同一应用线程串行执行；传感器进程和录制 writer 保留。Policy 每轮读取观测、按需同步推理、发送一个目标，并只等待剩余周期预算。
+
+新 Raw 标识 `synchronous_direct_sdk_v1`：观测对应本轮控制输入，目标对应实际尝试的 SDK 调用，metadata 分别保留 arm/hand 的接受、CRC 不确定、拒绝或未知结果；这些结果不表示物理到达。Teleop 技术无效 capture 仍整段不发布，失败 rollout 保留可保存的事实。
+
+单线程在推理或 SDK 阻塞期间不能并发调用物理停止，也不再提供独立于推理的 Python 触觉采样。现场需另行确认停止覆盖、阻塞容忍、反馈/触觉需求与实际工作预算。`execute=False` 仍可能连接并读取设备。
+
 策略 rollout 使用当前真实实验环境的有效标定与硬件状态。离线测试、仿真结果或 checkpoint 可加载均不等价于真机安全验证。
 
 ## Main Entry Points

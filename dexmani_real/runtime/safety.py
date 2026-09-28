@@ -1,4 +1,4 @@
-"""Four motion states and a run epoch shared by controllers and SDK workers."""
+"""Four motion states and a run epoch shared by the control owner, input callbacks and sensors."""
 
 import time
 from enum import IntEnum
@@ -14,7 +14,7 @@ class SafetyState(IntEnum):
 
 
 class StopRequest(IntEnum):
-    """Operator stop request carried from Main to the control owner."""
+    """Operator stop request consumed by the local policy runner."""
 
     NONE = 0
     OPERATOR = 1

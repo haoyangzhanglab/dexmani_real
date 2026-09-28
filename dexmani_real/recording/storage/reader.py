@@ -144,6 +144,7 @@ class EpisodeReader:
             _text_attr(attrs, "task_label")
             _text_attr(attrs, "collection_source")
             self._validate_present_fields()
+            self._validate_dispatch()
         except BaseException:
             self.close()
             raise
@@ -216,6 +217,30 @@ class EpisodeReader:
             raise RawDataError("Raw RGB file is empty")
         if any(k in self.meta for k in ("handbase_position_eef_m", "handbase_quat_eef_wxyz")):
             _validate_hand_mount_metadata(self.meta)
+
+    def _validate_dispatch(self):
+        # Historical Raw has no SDK evidence. Never infer acceptance for it.
+        if "execution_path" not in self.meta:
+            return
+        if self.meta["execution_path"] != "synchronous_direct_sdk_v1":
+            raise RawDataError("unsupported execution_path")
+        if "dispatch_status" not in self.meta:
+            raise RawDataError("direct dispatch metadata missing status")
+        statuses = np.asarray(self.meta["dispatch_status"])
+        if (
+            statuses.shape != (self.num_frames, 2)
+            or statuses.dtype != np.uint8
+            or np.any(statuses > 4)
+        ):
+            raise RawDataError("invalid direct dispatch status array")
+        for side, name in enumerate(("action_arm_joint_target", "action_hand_joint_target")):
+            self.require_fields(name)
+            values = np.asarray(self[name])
+            called = statuses[:, side] != 0
+            if not np.isfinite(values[called]).all() or not np.isnan(values[~called]).all():
+                raise RawDataError("dispatch status and attempted target disagree")
+        if self.meta["collection_source"] == "teleop" and not np.isin(statuses, (1, 2)).all():
+            raise RawDataError("technical-invalid teleop direct dispatch")
 
     def _decoder(self):
         self.require_fields("rgb")

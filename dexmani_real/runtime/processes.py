@@ -10,7 +10,6 @@ from dexmani_real.runtime.safety import RunEndReason, SafetyState, _revoke_motio
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-_PHYSICAL_PROCESS_NAMES = frozenset({"arm", "hand"})
 
 
 @dataclass(frozen=True)
@@ -24,20 +23,13 @@ def _finalize_shutdown_state(
     shared: Any,
     exits: tuple[_ProcessExit, ...],
 ) -> None:
-    """Latch physical failures, or disarm after verified terminal worker stop."""
+    """Latch local/child failures; DISARMED describes software authority only."""
     error_latched = bool(shared.error_state.value)
     estop_requested = bool(shared.estop_request.value)
     safety_state = int(shared.safety_state.value)
-    physical_worker_failed = any(
-        (item.exitcode != 0 or item.escalation != "graceful")
-        and item.name in _PHYSICAL_PROCESS_NAMES
-        for item in exits
-    )
+    child_failed = any(item.exitcode != 0 or item.escalation != "graceful" for item in exits)
     faulted = (
-        error_latched
-        or estop_requested
-        or safety_state == int(SafetyState.FAULT)
-        or physical_worker_failed
+        error_latched or estop_requested or safety_state == int(SafetyState.FAULT) or child_failed
     )
 
     if faulted:
@@ -67,7 +59,7 @@ def stop_processes_verified(
     terminate_timeout_s: float = 1.0,
     kill_timeout_s: float = 1.0,
 ) -> tuple[_ProcessExit, ...]:
-    """Stop every worker without closing IPC that another local thread may use."""
+    """Confirm all sensor children exited before their shared resources can be released."""
     procs = list(processes)
     # Fence before any blocking join; record the software end if still RUNNING.
     with shared.motion_lock:
@@ -124,7 +116,7 @@ def shutdown_processes_verified(
     terminate_timeout_s: float = 1.0,
     kill_timeout_s: float = 1.0,
 ) -> bool:
-    """Stop workers, close verified IPC, and finalize physical safety."""
+    """Stop sensors, close verified IPC, and finalize software safety state."""
     frozen_exits = stop_processes_verified(
         shared,
         processes,
@@ -134,8 +126,38 @@ def shutdown_processes_verified(
     )
 
     shared_closed = _close_runtime_channels(shared)
+    if not shared_closed:
+        shared.error_state.value = True
     _finalize_shutdown_state(shared, frozen_exits)
     logger.debug("verified process shutdown: %s", frozen_exits)
     return shared_closed and all(
         item.exitcode == 0 and item.escalation == "graceful" for item in frozen_exits
+    )
+
+
+def shutdown_local_runtime(robot, supervisor, *, model=None, keyboard=None, timeout_s=5.0):
+    """Stop local devices before closing resources and verified sensor IPC release."""
+    shared = supervisor.shared
+    clean = True
+    for close in (
+        robot.close if robot._owner is not None else None,
+        model.close if model is not None else None,
+        keyboard.stop if keyboard is not None else None,
+    ):
+        if close is None:
+            continue
+        try:
+            close()
+        except Exception:
+            clean = False
+            shared.error_state.value = True
+            logger.exception("local runtime cleanup failed")
+    try:
+        sensors_clean = supervisor.shutdown(graceful_timeout_s=timeout_s)
+    except Exception:
+        shared.error_state.value = True
+        logger.exception("sensor shutdown failed; live resources remain linked")
+        sensors_clean = False
+    return (
+        clean and sensors_clean and not shared.error_state.value and not shared.estop_request.value
     )

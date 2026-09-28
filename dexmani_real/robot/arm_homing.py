@@ -2,12 +2,10 @@
 
 import time
 from dataclasses import dataclass
-from queue import Empty, Full
 
 import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.ipc.channels import read_arm_state
 from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
 from dexmani_real.planning.kinematics.ik import make_online_ik_config
 from dexmani_real.planning.paths import (
@@ -16,7 +14,7 @@ from dexmani_real.planning.paths import (
     compute_joint_home_path,
 )
 from dexmani_real.robot.hand_homing import home_hand
-from dexmani_real.robot.home import HomeResult, wait_home_result
+from dexmani_real.robot.home import HomeResult
 from dexmani_real.robot.model import XARM7_XHAND_COLLISION_URDF_PATH, XARM7_XHAND_SRDF_PATH
 from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.runtime.safety import SafetyState, command_may_cross_sdk, revoke_motion
@@ -24,7 +22,6 @@ from dexmani_real.runtime.safety import SafetyState, command_may_cross_sdk, revo
 
 @dataclass(frozen=True)
 class ArmHomeConfig:
-    request_queue_timeout_s: float
     prehome_timeout_s: float
     state_max_age_s: float
     max_speed_rad_s: float
@@ -37,7 +34,6 @@ class ArmHomeConfig:
     def from_runtime(cls, runtime):
         h = runtime.arm.homing
         return cls(
-            h.request_queue_timeout_s,
             h.convergence_timeout_s,
             h.state_max_age_s,
             h.max_speed_rad_per_s,
@@ -79,6 +75,7 @@ def execute_arm_home(
     shared,
     home_qpos,
     *,
+    robot,
     planner,
     config,
     estop_requested=None,
@@ -93,11 +90,6 @@ def execute_arm_home(
         return HomeResult(False, "home requires ARMED")
     revoke_motion(shared)
     epoch = int(shared.run_id.value)
-    while True:
-        try:
-            shared.arm_home_result_q.get_nowait()
-        except Empty:
-            break
     boundary_ns = time.monotonic_ns()
 
     def aborted():
@@ -113,7 +105,8 @@ def execute_arm_home(
     while time.monotonic() < deadline:
         if aborted():
             return HomeResult(False, "home interrupted")
-        state = read_arm_state(shared)
+        local = robot.read_state()
+        state = local.arm
         feedback_issue = "fresh stationary arm state unavailable"
         if (
             state is not None
@@ -123,8 +116,7 @@ def execute_arm_home(
         ):
             if hand_state_max_age_s is None:
                 break
-            latest_hand = shared.hand_state_ring.read_latest()
-            hand_state = latest_hand[0] if latest_hand is not None else None
+            hand_state = local.hand
             if (
                 hand_state is not None
                 and int(hand_state["timestamp_ns"][0]) > boundary_ns
@@ -146,32 +138,44 @@ def execute_arm_home(
         return HomeResult(False, "home interrupted during planning")
     if progress:
         progress(f"arm home: {len(waypoints)} planned milestones")
-    try:
-        shared.arm_home_q.put_nowait(
-            (
-                waypoints,
-                target,
-                epoch,
-                time.monotonic_ns() + int(config.request_queue_timeout_s * 1e9),
-            )
-        )
-    except Full:
-        return HomeResult(False, "arm home queue full")
+    # Bound total HOME duration using path travel and per-milestone settling allowances.
     travel = (
         float(np.max(np.abs(np.diff(waypoints, axis=0)), axis=1).sum()) if len(waypoints) > 1 else 0
     )
-    timeout = max(
+    deadline = time.monotonic() + max(
         10.0, 2 * travel / config.max_speed_rad_s + len(waypoints) * config.target_timeout_s + 7
     )
-    return wait_home_result(shared, shared.arm_home_result_q, epoch, timeout, aborted)
+    failure = None
+    try:
+        ok = robot.home_arm(
+            waypoints, target, epoch, lambda: aborted() or time.monotonic() >= deadline
+        )
+        return HomeResult(ok, "" if ok else "home interrupted")
+    except BaseException as exc:
+        failure = exc
+        from dexmani_real.robot.drivers.xarm7 import HomeAborted
+
+        if not isinstance(exc, HomeAborted):
+            shared.error_state.value = True
+            raise
+        return HomeResult(False, str(exc))
+    finally:
+        try:
+            robot.stop()
+        except Exception:
+            if failure is None:
+                raise
+            from dexmani_real.utils.log import get_logger
+
+            get_logger(__name__).exception("HOME cleanup also failed")
 
 
 def build_policy_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
     """Construct the shared return-home planner for teleop, policy and replay.
 
     Online Cartesian IK checks robot endpoint self-collision. Return-home
-    additionally needs path/workspace/table/static-box checks, so the Main
-    process builds its own planner.
+    additionally needs path/workspace/table/static-box checks, so HOME uses
+    a planner configured with the current environment.
     """
     policy = runtime.policy
     workspace = policy.workspace.as_array()
@@ -189,28 +193,43 @@ def build_policy_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
     )
 
 
-def home_policy_robot(shared, runtime, planner, *, abort_requested):
+def home_policy_robot(shared, runtime, planner, *, robot, abort_requested):
     if int(shared.safety_state.value) != int(SafetyState.ARMED):
         return False
-    hand_result = home_hand(shared, runtime, abort_requested=abort_requested)
-    if not hand_result.ok:
-        print(f"Hand home failed: {hand_result.reason}", flush=True)
-        return False
-    # Hand-disabled mode assumes the hand is absent or secured at home.
-    if not runtime.policy.hand_enabled:
-        planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
-    result = execute_arm_home(
-        shared,
-        runtime.arm.home_qpos,
-        planner=planner,
-        config=ArmHomeConfig.from_runtime(runtime),
-        cancel_requested=abort_requested,
-        estop_requested=lambda: bool(shared.estop_request.value),
-        progress=print,
-        hand_state_max_age_s=(
-            runtime.hand.feedback_max_age_s if runtime.policy.hand_enabled else None
-        ),
-    )
-    if not result.ok:
-        print(f"Home failed: {result.reason}", flush=True)
-    return result.ok
+    failure = None
+    try:
+        hand_result = home_hand(shared, runtime, robot=robot, abort_requested=abort_requested)
+        if not hand_result.ok:
+            print(f"Hand home failed: {hand_result.reason}", flush=True)
+            return False
+        # Hand-disabled mode assumes the hand is absent or secured at home.
+        if not runtime.policy.hand_enabled:
+            planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
+        result = execute_arm_home(
+            shared,
+            runtime.arm.home_qpos,
+            robot=robot,
+            planner=planner,
+            config=ArmHomeConfig.from_runtime(runtime),
+            cancel_requested=abort_requested,
+            estop_requested=lambda: bool(shared.estop_request.value),
+            progress=print,
+            hand_state_max_age_s=(
+                runtime.hand.feedback_max_age_s if runtime.policy.hand_enabled else None
+            ),
+        )
+        if not result.ok:
+            print(f"Home failed: {result.reason}", flush=True)
+        return result.ok
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        try:
+            robot.stop()
+        except Exception:
+            if failure is None:
+                raise
+            from dexmani_real.utils.log import get_logger
+
+            get_logger(__name__).exception("combined HOME cleanup also failed")

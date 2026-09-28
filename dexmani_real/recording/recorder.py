@@ -394,6 +394,8 @@ class AsyncEpisodeRecorder:
     def _write_episode(self, metadata):
         video = data = None
         rows = []
+        dispatch_results = []
+        last_selected = last_dispatch_detail = None
         staging = self._temp_dir
         self._handles_released = False
 
@@ -401,6 +403,12 @@ class AsyncEpisodeRecorder:
             for name, value in metadata.items():
                 meta.attrs[name] = value
             meta.attrs["control_hz"] = self.control_hz
+            meta.attrs["execution_path"] = "synchronous_direct_sdk_v1"
+            meta.attrs["observation_action_pairing"] = "control_tick_input_and_attempted_targets"
+            meta.attrs["robot_timestamp_source"] = "host_read_completion"
+            meta.attrs["dispatch_status_codes"] = (
+                "0:not_called,1:accepted,2:crc_unconfirmed,3:rejected,4:unknown"
+            )
 
         def flush_rows():
             if rows:
@@ -453,7 +461,10 @@ class AsyncEpisodeRecorder:
                         "action_hand_joint_target",
                     )
                 ):
-                    raise ValueError("teleop requires finite states and published targets")
+                    raise ValueError("teleop requires finite states and dispatched targets")
+                dispatch_results.append(frame.dispatch)
+                last_selected = frame.selected
+                last_dispatch_detail = frame.dispatch_detail
                 video.write_frame(frame.camera_rgb)
                 data.append_depth(frame.camera_depth)
                 rows.append(frame.data)
@@ -467,6 +478,17 @@ class AsyncEpisodeRecorder:
                     meta.attrs["format"] = RAW_FORMAT
                     meta.attrs["num_frames"] = self._written_frames
                     meta.attrs["termination_reason"] = self._reason
+                    meta.attrs["dispatch_status"] = np.asarray(
+                        dispatch_results, dtype=np.uint8
+                    ).reshape(-1, 2)
+                    if last_dispatch_detail is not None:
+                        meta.attrs["final_dispatch_result"] = json.dumps(
+                            last_dispatch_detail, allow_nan=False
+                        )
+                    if last_selected is not None:
+                        meta.attrs["final_selected_targets"] = json.dumps(
+                            last_selected, allow_nan=False
+                        )
 
                 data.update_meta(final_meta)
             video.close()

@@ -131,7 +131,6 @@ class KeyboardInput:
         # A daemon listener can outlive bounded shutdown.  Its callbacks must
         # not reach a session after this owner has stopped it.
         self._callbacks_active: bool = False
-        self._commands_quiesced: bool = False
         self._debounce_s = float(debounce_s)
         self._startup_timeout_s = float(startup_timeout_s)
         self._estop_callback = estop_callback
@@ -153,7 +152,7 @@ class KeyboardInput:
         Optional time debounce filters rapid presses; the default uses key edges only.
         """
         with self._lock:
-            if not self._callbacks_active or self._commands_quiesced:
+            if not self._callbacks_active:
                 return False
             if signal in self._pressed_signals:
                 return False
@@ -191,7 +190,7 @@ class KeyboardInput:
     def _dispatch_immediate_callback(self, signal: OperatorCommand) -> bool:
         """Complete the immediate effect before the command becomes pollable."""
         with self._lock:
-            if not self._callbacks_active or self._commands_quiesced:
+            if not self._callbacks_active:
                 return False
             callback = (
                 self._stop_callback
@@ -248,7 +247,7 @@ class KeyboardInput:
                 if name in _EVENT_ONLY_KEYS:
                     if self._capture_raw_events:
                         with self._lock:
-                            if self._callbacks_active and not self._commands_quiesced:
+                            if self._callbacks_active:
                                 self._events.append(name)
                     return
                 with self._lock:
@@ -260,13 +259,16 @@ class KeyboardInput:
                     return
                 signal = _KEY_MAP.get(name)
                 if (
-                    self._capture_commands
+                    (
+                        self._capture_commands
+                        or (signal is OperatorCommand.QUIT and self._quit_callback is not None)
+                    )
                     and signal is not None
                     and self._accept_control_press(signal, time.perf_counter())
                 ):
                     if self._dispatch_immediate_callback(signal):
                         with self._lock:
-                            if self._callbacks_active and not self._commands_quiesced:
+                            if self._capture_commands and self._callbacks_active:
                                 self._buffer.append(signal)
             except Exception:
                 logger.warning("keyboard press callback failed", exc_info=True)
@@ -322,7 +324,6 @@ class KeyboardInput:
         self._estop_latched.clear()
         self._listener_failure_reported = False
         with self._lock:
-            self._commands_quiesced = False
             self._buffer.clear()
             self._events.clear()
             self._keys.clear()
@@ -493,28 +494,7 @@ class KeyboardInput:
         with self._lock:
             return self._events.popleft() if self._events else None
 
-    def quiesce(self) -> None:
-        """Detach session callbacks and stop command/raw-event admission.
-
-        A callback already in flight may finish, but cannot requeue its command.
-        Held-key tracking and the local ESC latch remain active until stop().
-        """
+    def drain_signal(self, target: OperatorCommand) -> None:
+        """Remove stale commands after blocking operations, preserving other requests."""
         with self._lock:
-            self._commands_quiesced = True
-            self._estop_callback = None
-            self._stop_callback = None
-            self._quit_callback = None
-            self._buffer.clear()
-            self._events.clear()
-
-    def drain_signal(self, target: OperatorCommand | None) -> int:
-        """Remove target commands, preserve others, and return the removal count.
-
-        None is a no-op returning 0. Use after blocking operations to clear repeats.
-        """
-        if target is None:
-            return 0
-        with self._lock:
-            old_len = len(self._buffer)
             self._buffer = deque(s for s in self._buffer if s != target)
-            return old_len - len(self._buffer)

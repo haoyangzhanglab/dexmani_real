@@ -1,1 +1,1 @@
-"""Worker-owned xArm7 and XHand control."""
+"""Local xArm7/XHand ownership, action realization and homing."""
