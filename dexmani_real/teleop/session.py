@@ -13,7 +13,7 @@ from dexmani_real.robot.model import (
 )
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.processes import shutdown_local_runtime
-from dexmani_real.runtime.safety import SafetyState, require_transition
+from dexmani_real.runtime.safety import RunEndReason, SafetyState, require_transition
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.vr_worker import run_vr_worker
@@ -106,7 +106,7 @@ def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, allow_no_hand
     finally:
         from dexmani_real.runtime.safety import revoke_motion
 
-        revoke_motion(shared)
+        revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
         shutdown_clean = shutdown_local_runtime(
             robot, supervisor, timeout_s=runtime.safety.shutdown_timeout_s
         )

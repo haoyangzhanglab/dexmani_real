@@ -330,14 +330,13 @@ class CameraCalibrationSession:
         self.calibration_config = calibration_config
         self.aruco_config = aruco_config
 
-    def _runtime_issue(self):
+    def _runtime_issue(self, arm):
         if self.shared.estop_request.value:
             return "e-stop is requested"
         if self.shared.error_state.value:
-            return "a worker set the sticky error latch"
+            return "runtime error latch is set"
         if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
             return "safety state is FAULT"
-        arm = read_arm_state_dict(self.robot)
         if arm is None or not sample_is_fresh(
             arm["timestamp_ns"], self.runtime.arm.feedback_max_age_s
         ):
@@ -464,7 +463,7 @@ class CameraCalibrationSession:
             return 1
 
         def request_quit():
-            revoke_motion(self.shared)
+            revoke_motion(self.shared, reason=RunEndReason.QUIT)
             self.shared.quit_requested.value = True
 
         self.keys = KeyboardInput(
@@ -506,14 +505,18 @@ class CameraCalibrationSession:
             window_created = True
             return self._run_control_loop(initial_state)
         except KeyboardInterrupt:
-            set_calibration_fault(self.shared, "KeyboardInterrupt")
+            set_calibration_fault(self.shared, "KeyboardInterrupt", estop=True)
             return 130
         except Exception as exc:
             logger.error("calibration session failed", exc_info=True)
-            set_calibration_fault(self.shared, f"calibration session failed: {exc}")
+            set_calibration_fault(
+                self.shared,
+                f"calibration session failed: {exc}",
+                run_end_reason=RunEndReason.POLICY_FAILURE,
+            )
             return 1
         finally:
-            revoke_motion(self.shared)
+            revoke_motion(self.shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
             try:
                 self.robot.stop()
             except Exception:
@@ -563,21 +566,22 @@ class CameraCalibrationSession:
             if not self.keys.healthy:
                 set_calibration_fault(self.shared, "keyboard listener exited", estop=True)
                 return 1
-            issue = self._runtime_issue()
+            arm_state = read_arm_state_dict(self.robot)
+            issue = self._runtime_issue(arm_state)
             if issue is not None:
                 set_calibration_fault(self.shared, issue)
                 return 1
 
             if not self.camera_process.is_alive():
                 logger.error("camera worker exited: %s", self.camera_process.exitcode)
-                revoke_motion(self.shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
+                set_calibration_fault(self.shared, "camera worker exited")
                 return 1
 
             if self.shared.quit_requested.value or self.keys.is_pressed("q"):
                 return finish_calibration_motion(
                     self.shared, robot=self.robot, calibration_saved=self.state.calibration_saved
                 )
-            self.state.current_qpos = read_arm_state_dict(self.robot)["qpos"]
+            self.state.current_qpos = arm_state["qpos"]
 
             home_outcome = handle_calibration_home_key(
                 self.shared,
@@ -658,11 +662,14 @@ def run_camera_calibration(
         exit_code = CameraCalibrationSession(
             shared, runtime, planner, workspace, robot, camera, calib_cfg, aruco_cfg
         ).run()
+    except KeyboardInterrupt:
+        shared.estop_request.value = True
+        exit_code = 130
     except Exception:
         shared.error_state.value = True
         logger.exception("camera calibration session failed")
     finally:
-        revoke_motion(shared)
+        revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
         if not shutdown_local_runtime(
             robot, supervisor, timeout_s=runtime.safety.shutdown_timeout_s
         ):

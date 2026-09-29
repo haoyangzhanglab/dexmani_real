@@ -6,6 +6,7 @@ import numpy as np
 
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.home import HomeResult
+from dexmani_real.robot.robot import DispatchError
 from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.runtime.safety import (
     SafetyState,
@@ -14,6 +15,9 @@ from dexmani_real.runtime.safety import (
     revoke_motion_if_run_id,
 )
 from dexmani_real.utils.limits import validate_hand_command_bounds
+from dexmani_real.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 _HOME_CONSECUTIVE_SAMPLES = 3
 
@@ -34,20 +38,31 @@ def home_hand(shared, runtime, *, robot, abort_requested=None):
     revoke_motion(shared)
     epoch = int(shared.run_id.value)
     if not command_may_cross_sdk(shared, run_id=epoch, required_safety_state=SafetyState.ARMED):
-        return HomeResult(False, "hand home requires ARMED authority")
+        return HomeResult(False, "hand home requires ARMED authority", interrupted=True)
     if abort_requested is not None and abort_requested():
-        return HomeResult(False, "home aborted")
+        return HomeResult(False, "home interrupted", interrupted=True)
     deadline = time.monotonic_ns() + int(cfg.home_timeout_s * 1e9)
-    robot.send_hand_home(RobotCommand(epoch, hand_qpos=target))
+    try:
+        robot.send_hand_home(RobotCommand(epoch, hand_qpos=target))
+    except DispatchError as exc:
+        if not exc.revoked:
+            raise
+        logger.info("hand HOME interrupted: dispatch=%s", exc.result)
+        revoke_motion_if_run_id(shared, epoch)
+        robot.stop()
+        return HomeResult(False, "home interrupted", interrupted=True)
 
     # Only feedback newer than the submission result can establish arrival.
     last_sample_ns = time.monotonic_ns()
     consecutive = 0
     tolerance_rad = np.deg2rad(cfg.home_tolerance_deg)
+    interrupted = False
     while time.monotonic_ns() < deadline:
         if abort_requested is not None and abort_requested():
+            interrupted = True
             break
         if not command_may_cross_sdk(shared, run_id=epoch, required_safety_state=SafetyState.ARMED):
+            interrupted = True
             break
         local = robot.read_state()
         if local.hand is not None:
@@ -73,8 +88,13 @@ def home_hand(shared, runtime, *, robot, abort_requested=None):
                         )
                     ):
                         return HomeResult(True)
+                    interrupted = time.monotonic_ns() < deadline
                     break
         time.sleep(0.01)
     revoke_motion_if_run_id(shared, epoch)
     robot.stop()
-    return HomeResult(False, "hand home convergence aborted, interrupted or timed out")
+    return HomeResult(
+        False,
+        "home interrupted" if interrupted else "hand home convergence timed out",
+        interrupted=interrupted,
+    )

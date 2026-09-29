@@ -200,17 +200,14 @@ class XArm7:
         self.enter_mode6()
 
     def stop(self) -> None:
-        """Best-effort State-4 stop; fire-and-forget by design.
+        """Request State 4 and check SDK acceptance, without physical confirmation.
 
         Deliberately no confirmation polling: the firmware is the final
         backstop, and cleanup must never block on proving State 4.
         """
         if self._api is None:
             return
-        try:
-            self._api.set_state(4)
-        except Exception:
-            logger.warning("xarm7: set_state(4) failed during stop", exc_info=True)
+        _check_sdk_return_code(self._api.set_state(4), "stop set_state(4)")
 
     def close(self) -> None:
         """Best-effort disconnect."""
@@ -412,14 +409,9 @@ class XArm7:
         _restore_mode6_and_settle(final_qpos)
 
     def emergency_stop(self) -> None:
-        """Best-effort emergency stop (requests State 4 without cutting power)."""
-        try:
+        """Request the SDK emergency stop; its None return is not physical confirmation."""
+        if self._api is not None:
             self._api.emergency_stop()
-        except Exception:
-            logger.warning(
-                "xarm7: emergency_stop call failed; cleanup will enforce state 4",
-                exc_info=True,
-            )
 
     def enter_mode0(self) -> None:
         """Enter Mode 0 (MoveJoint) and wait for a movable state; raise on failure."""

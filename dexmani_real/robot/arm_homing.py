@@ -17,7 +17,12 @@ from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.robot.home import HomeResult
 from dexmani_real.robot.model import XARM7_XHAND_COLLISION_URDF_PATH, XARM7_XHAND_SRDF_PATH
 from dexmani_real.runtime.observation import sample_is_fresh
-from dexmani_real.runtime.safety import SafetyState, command_may_cross_sdk, revoke_motion
+from dexmani_real.runtime.safety import (
+    RunEndReason,
+    SafetyState,
+    command_may_cross_sdk,
+    revoke_motion,
+)
 
 
 @dataclass(frozen=True)
@@ -104,7 +109,7 @@ def execute_arm_home(
     feedback_issue = "fresh stationary arm state unavailable"
     while time.monotonic() < deadline:
         if aborted():
-            return HomeResult(False, "home interrupted")
+            return HomeResult(False, "home interrupted", interrupted=True)
         local = robot.read_state()
         state = local.arm
         feedback_issue = "fresh stationary arm state unavailable"
@@ -135,7 +140,7 @@ def execute_arm_home(
     except Exception as exc:
         return HomeResult(False, f"home planning failed: {exc}")
     if aborted():
-        return HomeResult(False, "home interrupted during planning")
+        return HomeResult(False, "home interrupted during planning", interrupted=True)
     if progress:
         progress(f"arm home: {len(waypoints)} planned milestones")
     # Bound total HOME duration using path travel and per-milestone settling allowances.
@@ -150,15 +155,30 @@ def execute_arm_home(
         ok = robot.home_arm(
             waypoints, target, epoch, lambda: aborted() or time.monotonic() >= deadline
         )
-        return HomeResult(ok, "" if ok else "home interrupted")
+        interrupted = not ok and time.monotonic() < deadline
+        return HomeResult(
+            ok,
+            "" if ok else "home interrupted" if interrupted else "arm home timed out",
+            interrupted=interrupted,
+        )
     except BaseException as exc:
         failure = exc
         from dexmani_real.robot.drivers.xarm7 import HomeAborted
 
+        if isinstance(exc, KeyboardInterrupt):
+            shared.estop_request.value = True
+            raise
+        if not isinstance(exc, Exception):
+            raise
         if not isinstance(exc, HomeAborted):
             shared.error_state.value = True
+            revoke_motion(shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
             raise
-        return HomeResult(False, str(exc))
+        interrupted = time.monotonic() < deadline
+        failure = None  # HomeAborted is handled; a cleanup failure must still propagate.
+        return HomeResult(
+            False, str(exc) if interrupted else "arm home timed out", interrupted=interrupted
+        )
     finally:
         try:
             robot.stop()
@@ -223,10 +243,14 @@ def home_policy_robot(shared, runtime, planner, *, robot, abort_requested):
         return result.ok
     except BaseException as exc:
         failure = exc
+        if isinstance(exc, KeyboardInterrupt):
+            shared.estop_request.value = True
         raise
     finally:
         try:
-            robot.stop()
+            # execute_arm_home owns its completed stop; retry only unresolved motion.
+            if robot._motion_active or robot._hand_stop_pending:
+                robot.stop()
         except Exception:
             if failure is None:
                 raise

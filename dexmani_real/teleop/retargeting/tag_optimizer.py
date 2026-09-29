@@ -285,9 +285,9 @@ class HandOptimizer:
                     "HandOptimizer: _obj_s2 called without %s reference — skipping anchor", label
                 )
                 continue
-            g, l = PinGrad.compute_smoothness_gradient(qpos, ref, weight)
-            total_loss += l
-            total_grad += g
+            g_smooth, loss_smooth = PinGrad.compute_smoothness_gradient(qpos, ref, weight)
+            total_loss += loss_smooth
+            total_grad += g_smooth
 
         g_prior, loss_prior = self._compute_prior_gradient(qpos)
         total_loss += loss_prior

@@ -6,7 +6,13 @@ import time
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from dexmani_real.runtime.safety import RunEndReason, SafetyState, _revoke_motion_locked, transition
+from dexmani_real.runtime.safety import (
+    RunEndReason,
+    SafetyState,
+    _revoke_motion_locked,
+    revoke_motion,
+    transition,
+)
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -33,7 +39,12 @@ def _finalize_shutdown_state(
     )
 
     if faulted:
-        shared.error_state.value = True
+        if (
+            error_latched
+            or child_failed
+            or (safety_state == int(SafetyState.FAULT) and not estop_requested)
+        ):
+            shared.error_state.value = True
         transition(shared, SafetyState.FAULT)
         return
 
@@ -138,6 +149,7 @@ def shutdown_processes_verified(
 def shutdown_local_runtime(robot, supervisor, *, model=None, keyboard=None, timeout_s=5.0):
     """Stop local devices before closing resources and verified sensor IPC release."""
     shared = supervisor.shared
+    revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
     clean = True
     for close in (
         robot.close if robot._owner is not None else None,

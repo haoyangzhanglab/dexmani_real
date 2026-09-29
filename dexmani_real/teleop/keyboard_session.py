@@ -11,14 +11,24 @@ from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_co
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.hand_homing import home_hand
-from dexmani_real.robot.robot import DexManiRobot
+from dexmani_real.robot.robot import DexManiRobot, DispatchError
 from dexmani_real.runtime.observation import read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_local_runtime
-from dexmani_real.runtime.safety import SafetyState, begin_motion, require_transition, revoke_motion
+from dexmani_real.runtime.safety import (
+    RunEndReason,
+    SafetyState,
+    begin_motion,
+    require_transition,
+    revoke_motion,
+    revoke_motion_if_run_id,
+)
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.teleop.jog import compute_cartesian_jog_delta, propose_cartesian_jog_pose
+from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
+
+logger = get_logger(__name__)
 
 
 def run_keyboard_experiment(runtime, *, no_hand):
@@ -34,7 +44,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
     robot = DexManiRobot(shared, runtime, check_services=supervisor.check)
 
     def request_quit():
-        revoke_motion(shared)
+        revoke_motion(shared, reason=RunEndReason.QUIT)
         shared.quit_requested.value = True
 
     keys = KeyboardInput(
@@ -63,13 +73,17 @@ def run_keyboard_experiment(runtime, *, no_hand):
         robot.connect()
         require_transition(shared, SafetyState.ARMED)
         home_result = home_hand(shared, runtime, robot=robot)
-        if not home_result.ok:
+        if home_result.interrupted:
+            clean = True
+            shared.quit_requested.value = True
+        elif not home_result.ok:
             raise RuntimeError(f"hand home failed: {home_result.reason}")
-        keys.start()
+        else:
+            keys.start()
         robot.check_services = lambda: supervisor.check() and keys.healthy
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         rate = LoopRate(cfg.control_hz, label="keyboard_teleop", busy_wait=False)
-        while shared.is_running.value and supervisor.check():
+        while shared.is_running.value and not shared.quit_requested.value and supervisor.check():
             rate.wait()
             if shared.estop_request.value or shared.error_state.value or not keys.healthy:
                 break
@@ -146,14 +160,33 @@ def run_keyboard_experiment(runtime, *, no_hand):
                         break
                     epoch = int(shared.run_id.value)
             target = result.qpos
-            robot.send_action(RobotCommand(epoch, target))
+            try:
+                robot.send_action(RobotCommand(epoch, target))
+            except DispatchError as exc:
+                if not exc.revoked:
+                    raise
+                logger.info("keyboard motion interrupted: dispatch=%s", exc.result)
+                revoke_motion_if_run_id(shared, epoch)
+                robot.stop()
+                command_qpos = command_pose = None
+                continue
             command_pose = proposed_pose
             command_qpos = target.copy()
-    except BaseException:
+        clean = clean or bool(shared.quit_requested.value)
+    except KeyboardInterrupt:
+        shared.estop_request.value = True
+        raise
+    except Exception as exc:
         shared.error_state.value = True
+        revoke_motion(
+            shared,
+            reason=RunEndReason.HARDWARE_FAULT
+            if isinstance(exc, DispatchError)
+            else RunEndReason.POLICY_FAILURE,
+        )
         raise
     finally:
-        revoke_motion(shared)
+        revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
         shutdown_clean = shutdown_local_runtime(
             robot, supervisor, keyboard=keys, timeout_s=runtime.safety.shutdown_timeout_s
         )

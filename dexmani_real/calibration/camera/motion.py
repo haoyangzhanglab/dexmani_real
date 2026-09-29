@@ -16,9 +16,16 @@ from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.robot.arm_homing import ArmHomeConfig, execute_arm_home
 from dexmani_real.robot.commands import RobotCommand
+from dexmani_real.robot.robot import DispatchError
 from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
-from dexmani_real.runtime.safety import SafetyState, begin_motion, revoke_motion
+from dexmani_real.runtime.safety import (
+    RunEndReason,
+    SafetyState,
+    begin_motion,
+    revoke_motion,
+    revoke_motion_if_run_id,
+)
 from dexmani_real.teleop.jog import (
     any_jog_key_held,
     compute_cartesian_jog_delta,
@@ -53,12 +60,19 @@ def read_initial_arm(runtime: ExperimentConfig, robot) -> dict[str, Any] | None:
     return None
 
 
-def set_calibration_fault(shared: RuntimeChannels, reason: str, *, estop: bool = False) -> None:
+def set_calibration_fault(
+    shared: RuntimeChannels,
+    reason: str,
+    *,
+    estop: bool = False,
+    run_end_reason=RunEndReason.HARDWARE_FAULT,
+) -> None:
     logger.error("Calibration fault: %s", reason)
     if estop:
         shared.estop_request.value = True
-    shared.error_state.value = True
-    revoke_motion(shared, SafetyState.FAULT)
+    else:
+        shared.error_state.value = True
+    revoke_motion(shared, SafetyState.FAULT, reason=run_end_reason)
 
 
 @dataclass
@@ -92,7 +106,7 @@ class HomeKeyOutcome(str, Enum):
 
 
 def finish_calibration_motion(shared, *, robot, calibration_saved):
-    revoke_motion(shared)
+    revoke_motion(shared, reason=RunEndReason.QUIT)
     robot.stop()
     return 0 if calibration_saved else 2
 
@@ -258,7 +272,17 @@ def run_calibration_motion_tick(
                 return
             epoch = int(shared.run_id.value)
     q_cmd = ik_result.qpos
-    robot.send_action(RobotCommand(epoch, q_cmd))
+    try:
+        robot.send_action(RobotCommand(epoch, q_cmd))
+    except DispatchError as exc:
+        if not exc.revoked:
+            revoke_motion(shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
+            raise
+        logger.info("calibration motion interrupted: dispatch=%s", exc.result)
+        revoke_motion_if_run_id(shared, epoch)
+        robot.stop()
+        state.command_qpos = state.command_pose = None
+        return
     state.command_pose = proposed_pose
     state.command_qpos = q_cmd.copy()
 

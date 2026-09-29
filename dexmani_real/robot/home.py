@@ -7,3 +7,4 @@ from dataclasses import dataclass
 class HomeResult:
     ok: bool
     reason: str = ""
+    interrupted: bool = False

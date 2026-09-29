@@ -7,6 +7,7 @@ from dexmani_real.runtime.processes import (
     shutdown_processes_verified,
 )
 from dexmani_real.runtime.safety import (
+    RunEndReason,
     SafetyState,
     _revoke_motion_locked,
 )
@@ -69,7 +70,9 @@ class RuntimeSupervisor:
         with self.shared.motion_lock:
             self.shared.is_running.value = False
             self.shared.error_state.value = True
-            _revoke_motion_locked(self.shared, SafetyState.FAULT)
+            _revoke_motion_locked(
+                self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT
+            )
         return False
 
     def shutdown(self, *, graceful_timeout_s=5.0) -> bool:

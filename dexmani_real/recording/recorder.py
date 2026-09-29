@@ -314,16 +314,21 @@ class AsyncEpisodeRecorder:
             self._store_error(exc)
             # A thread stuck in native I/O retains its staging and handles. Never
             # release them from another thread or accept another episode.
-            if self._thread is not None and self._thread.ident is not None:
-                self._thread.join(timeout=RECORDER_STOP_TIMEOUT_S)
-            else:
-                self._thread = None
-                if self._temp_dir is not None:
-                    try:
-                        shutil.rmtree(self._temp_dir)
-                        self._temp_dir = None
-                    except Exception:
-                        logger.error("Recording staging cleanup failed", exc_info=True)
+            try:
+                if self._thread is not None and self._thread.ident is not None:
+                    self._thread.join(timeout=RECORDER_STOP_TIMEOUT_S)
+                else:
+                    self._thread = None
+                    if self._temp_dir is not None:
+                        try:
+                            shutil.rmtree(self._temp_dir)
+                            self._temp_dir = None
+                        except Exception:
+                            logger.error("Recording staging cleanup failed", exc_info=True)
+            except Exception:
+                logger.exception("Recording START cleanup also failed")
+            if not isinstance(exc, Exception):
+                raise
             raise RecordingError(f"recording START failed: {exc}") from exc
 
     def add_frame(self, frame, *, step_timestamp_ns):

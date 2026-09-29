@@ -15,7 +15,7 @@ from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.processes import shutdown_local_runtime
-from dexmani_real.runtime.safety import SafetyState, require_transition, revoke_motion
+from dexmani_real.runtime.safety import RunEndReason, SafetyState, require_transition, revoke_motion
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.utils.log import get_logger
 
@@ -49,7 +49,7 @@ def replay_episode(trajectory, runtime, config):
     robot = DexManiRobot(shared, runtime, check_services=supervisor.check)
 
     def request_quit():
-        revoke_motion(shared)
+        revoke_motion(shared, reason=RunEndReason.QUIT)
         shared.quit_requested.value = True
 
     keyboard = KeyboardInput(
@@ -82,7 +82,12 @@ def replay_episode(trajectory, runtime, config):
             )
         else:
             outcome = ReplayOutcome(
-                ReplayStatus.REJECTED, reason=f"startup hand home failed: {home_result.reason}"
+                ReplayStatus.ESTOP
+                if shared.estop_request.value
+                else ReplayStatus.USER_QUIT
+                if home_result.interrupted and shared.quit_requested.value
+                else ReplayStatus.REJECTED,
+                reason=f"startup hand home incomplete: {home_result.reason}",
             )
         if outcome.successful:
             print("H: planned return_home; Q: exit", flush=True)
@@ -114,22 +119,29 @@ def replay_episode(trajectory, runtime, config):
                         )
                         break
                     print("Return-home completed. H: planned return_home; Q: exit", flush=True)
-    except (Exception, KeyboardInterrupt) as exc:
+    except KeyboardInterrupt:
+        shared.estop_request.value = True
+        outcome = ReplayOutcome(ReplayStatus.ESTOP, outcome.replay_data, "KeyboardInterrupt")
+    except Exception as exc:
         shared.error_state.value = True
         logger.exception("replay session failed")
         outcome = ReplayOutcome(
             ReplayStatus.FAULT, outcome.replay_data, f"{type(exc).__name__}: {exc}"
         )
     finally:
-        revoke_motion(shared)
+        revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
         shutdown_clean = shutdown_local_runtime(
             robot, supervisor, keyboard=keyboard, timeout_s=runtime.safety.shutdown_timeout_s
         )
-    if shared.error_state.value or shared.estop_request.value or not shutdown_clean:
+    if shared.error_state.value or (not shutdown_clean and not shared.estop_request.value):
         outcome = ReplayOutcome(
             ReplayStatus.FAULT,
             outcome.replay_data,
             f"{outcome.reason}; hardware/shutdown failure".lstrip("; "),
+        )
+    elif shared.estop_request.value:
+        outcome = ReplayOutcome(
+            ReplayStatus.ESTOP, outcome.replay_data, outcome.reason or "operator emergency stop"
         )
     evaluate_replay(
         trajectory,

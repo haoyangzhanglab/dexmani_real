@@ -9,7 +9,7 @@ from dexmani_real.recording.frame import build_episode_frame
 from dexmani_real.robot.action import ActionIntent
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.robot import DispatchError
-from dexmani_real.runtime.safety import revoke_motion
+from dexmani_real.runtime.safety import RunEndReason, revoke_motion_if_run_id
 from dexmani_real.teleop.control.action_proposal import compute_target_eef_pose
 from dexmani_real.teleop.control.hand_retargeting import (
     HandRetargetObservationCache,
@@ -99,22 +99,34 @@ def execute_control_step(controller, shared, robot, row, recorder=None):
     if target is not None:
         try:
             result = robot.send_action(target)
-        except DispatchError:
+        except DispatchError as exc:
+            result = exc.result
             if recorder is not None:
-                recorder.mark_discard("dispatch_rejected")
-            revoke_motion(shared)
+                recorder.mark_discard("motion_revoked" if exc.revoked else "dispatch_rejected")
+            revoke_motion_if_run_id(
+                shared,
+                epoch,
+                reason=RunEndReason.EXECUTOR_BOUNDARY
+                if exc.revoked
+                else RunEndReason.HARDWARE_FAULT,
+            )
             try:
                 robot.stop()
             except Exception:
                 from dexmani_real.utils.log import get_logger
 
                 get_logger(__name__).exception("stop after teleop dispatch failure also failed")
+                if exc.revoked:
+                    raise
+            if exc.revoked:
+                return False, result, True
             raise
     stamp = result.timestamp_ns if result is not None else 0
     if int(shared.run_id.value) != epoch:
         if recorder is not None:
             recorder.mark_discard("dispatch_rejected")
-        return control_ok
+        robot.stop()
+        return False, result, True
     if result is not None:
         controller.previous_arm_command = target.arm_qpos.copy()
         controller.smoothed_eef_position = intent[:3].copy()
@@ -124,4 +136,4 @@ def execute_control_step(controller, shared, robot, row, recorder=None):
             recorder.mark_discard("control_failure")
         if recorder.accepting_frames:
             recorder.add_frame(build_episode_frame(row, target, result), step_timestamp_ns=stamp)
-    return control_ok
+    return control_ok, result, False

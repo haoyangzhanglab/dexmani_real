@@ -11,7 +11,12 @@ from dexmani_real.ipc.schema import ARM_STATE_DTYPE, HAND_STATE_DTYPE
 from dexmani_real.robot.command_validation import check_arm_target, check_hand_target
 from dexmani_real.robot.model import XARM7_HARD_LOWER, XARM7_HARD_UPPER
 from dexmani_real.runtime.observation import sample_is_fresh
-from dexmani_real.runtime.safety import SafetyState, command_may_cross_sdk
+from dexmani_real.runtime.safety import (
+    RunEndReason,
+    SafetyState,
+    command_may_cross_sdk,
+    revoke_motion,
+)
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -81,6 +86,8 @@ class DexManiRobot:
     def check(self):
         self._check_owner()
         if self.check_services is not None and not self.check_services():
+            self.shared.error_state.value = True
+            revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
             raise RuntimeError("required runtime service unavailable")
 
     def connect(self):
@@ -116,8 +123,11 @@ class DexManiRobot:
                 if time.monotonic() >= deadline:
                     raise RuntimeError("initial hand feedback unavailable")
                 time.sleep(0.01)
-        except BaseException:
-            self.shared.error_state.value = True
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                self.shared.estop_request.value = True
+            elif isinstance(exc, Exception):
+                self.shared.error_state.value = True
             try:
                 self.close()
             except Exception:
@@ -143,8 +153,8 @@ class DexManiRobot:
                 self._hand_failure_started = now
             if now - self._hand_failure_started >= self.runtime.hand.state_read_failure_timeout_s:
                 raise RuntimeError("hand joint feedback timed out")
-            # Cached feedback retains its read-completion time; consumers apply freshness.
-            return self._last_hand
+            # Cached feedback is only for stop/hold, never a current control observation.
+            return None
         self._hand_failure_started = None
         if not self.hand.is_connected:
             raise RuntimeError("XHand disconnected")
@@ -177,11 +187,16 @@ class DexManiRobot:
         self.check()
         if not self._connected:
             raise RuntimeError("robot is not connected")
-        q, v, effort = self.arm.read()
-        if self.arm.error_code:
-            raise RuntimeError(f"arm controller error: {self.arm.error_code}")
-        arm = self.arm_feedback(q, v, effort)
-        hand = self._read_hand()
+        try:
+            q, v, effort = self.arm.read()
+            if self.arm.error_code:
+                raise RuntimeError(f"arm controller error: {self.arm.error_code}")
+            arm = self.arm_feedback(q, v, effort)
+            hand = self._read_hand()
+        except Exception:
+            self.shared.error_state.value = True
+            revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
+            raise
         self.check()
         return RobotState(arm, hand)
 
@@ -250,14 +265,14 @@ class DexManiRobot:
                     raw_status = self.hand.send_action(target)
                     status = DispatchStatus[raw_status.name]
                     result = replace(result, hand=status, hand_status=raw_status)
-                if status == DispatchStatus.REJECTED:
+                if status in (DispatchStatus.REJECTED, DispatchStatus.UNKNOWN):
                     raise DispatchError(f"{name} SDK rejected target", result)
             if not self._authorized(command, state):
                 raise DispatchError(
                     "motion authority revoked during dispatch", result, revoked=True
                 )
             return replace(result, timestamp_ns=time.monotonic_ns())
-        except BaseException as exc:
+        except Exception as exc:
             result = replace(result, timestamp_ns=time.monotonic_ns())
             raise DispatchError(str(exc), result, revoked=getattr(exc, "revoked", False)) from exc
 
@@ -293,9 +308,13 @@ class DexManiRobot:
         return check_abort() is None
 
     def _stop_hand(self):
-        if self.hand is None or not self.hand.is_connected:
-            self._hand_stop_pending = False
+        if self.hand is None:
+            if self._hand_stop_pending:
+                raise RuntimeError("XHand stop unresolved after disconnect")
             return
+        self._hand_stop_pending = True
+        if not self.hand.is_connected:
+            raise RuntimeError("XHand disconnected before stop")
         frame = self._last_hand
         if frame is not None and sample_is_fresh(
             frame["timestamp_ns"][0], self.runtime.hand.feedback_max_age_s
@@ -307,12 +326,17 @@ class DexManiRobot:
         if status.name == "REJECTED":
             raise RuntimeError("XHand stop rejected")
         if self._hand_stop_pending:
-            logger.warning("XHand stop remains CRC-unconfirmed")
+            raise RuntimeError(f"XHand stop remains unconfirmed: {status.name}")
 
     def stop(self):
         self._check_owner()
         errors = []
+        # A failed/interrupted stop must not advertise a clean software stop.
+        unresolved_motion = self._motion_active
+        if self.arm is not None or self.hand is not None:
+            self._motion_active = True
         if self.arm is not None:
+            self._arm_stopped = False
             try:
                 if self.shared.estop_request.value:
                     self.arm.emergency_stop()
@@ -325,10 +349,14 @@ class DexManiRobot:
             self._stop_hand()
         except Exception as exc:
             errors.append(exc)
-        self._motion_active = False
+        if self.arm is None and self.hand is None and unresolved_motion:
+            errors.append(RuntimeError("motion remains unresolved after disconnect"))
         if errors:
+            self._motion_active = True
             self.shared.error_state.value = True
+            revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
             raise RuntimeError(f"robot stop failures: {errors}") from errors[0]
+        self._motion_active = False
 
     def service_idle(self):
         self._check_owner()
@@ -359,6 +387,7 @@ class DexManiRobot:
             if device is not None:
                 try:
                     if name == "hand" and device.is_connected:
+                        self._hand_stop_pending = True
                         status = device.set_passive()
                         self._hand_stop_pending = status.name != "ACCEPTED"
                         if self._hand_stop_pending:
@@ -373,5 +402,6 @@ class DexManiRobot:
                     setattr(self, name, None)
         self._connected = False
         if errors:
+            self._motion_active = True
             self.shared.error_state.value = True
             raise RuntimeError(f"robot close failures: {errors}") from errors[0]

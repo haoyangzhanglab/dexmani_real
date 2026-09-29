@@ -112,14 +112,17 @@ class PolicyRunner:
             and int(self.shared.safety_state.value) == int(SafetyState.RUNNING)
         )
 
-    def _finish_episode(self, reason, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY):
+    def _finish_episode(
+        self, reason, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY, stop_motion=True
+    ):
         if self.run_id is None:
             return
         revoke_motion_if_run_id(self.shared, self.run_id, reason=run_end_reason)
         self.shared.physical_home_completed.value = False
         stop_error = None
         try:
-            self.robot.stop()
+            if stop_motion:
+                self.robot.stop()
         except Exception as exc:
             stop_error = exc
             logger.exception("episode stop failed")
@@ -187,6 +190,7 @@ class PolicyRunner:
                 return None
             preparation_epoch = int(self.shared.run_id.value)
         committed = False
+        failure = None
         try:
             if self._start_observation() is None:
                 return None
@@ -227,11 +231,20 @@ class PolicyRunner:
             self.previous_arm = None
             self.next_step_ns = 0
             return initial
+        except BaseException as exc:
+            failure = exc
+            if isinstance(exc, KeyboardInterrupt):
+                self.shared.estop_request.value = True
+            raise
         finally:
             if not committed:
                 try:
                     if self.recorder is not None and self.recorder.is_recording:
                         self.recorder.discard_episode(reason="start_cancelled")
+                except Exception:
+                    if failure is None:
+                        raise
+                    logger.exception("cancelled START recording cleanup also failed")
                 finally:
                     with self.shared.motion_lock:
                         self.shared.start_request.value = False
@@ -354,15 +367,24 @@ class PolicyRunner:
         command = RobotCommand(self.run_id, prepared_arm, prepared_hand)
         result = None
         dispatch_error = None
+        stop_error = None
         if self.execute:
             try:
                 result = self.robot.send_action(command)
             except DispatchError as exc:
                 result, dispatch_error = exc.result, exc
-                revoke_motion_if_run_id(self.shared, self.run_id)
+                run_end_reason = (
+                    RunEndReason.HARDWARE_FAULT
+                    if not exc.revoked
+                    else RunEndReason.TIMEOUT
+                    if not self._within_budget()
+                    else RunEndReason.EXECUTOR_BOUNDARY
+                )
+                revoke_motion_if_run_id(self.shared, self.run_id, reason=run_end_reason)
                 try:
                     self.robot.stop()
-                except Exception:
+                except Exception as stop_exc:
+                    stop_error = stop_exc
                     logger.exception("stop after dispatch failure also failed")
         if result is not None and result.continued and dispatch_error is None:
             self.previous_arm = prepared_arm
@@ -376,23 +398,32 @@ class PolicyRunner:
         if dispatch_error is not None:
             try:
                 reason = (
-                    "timeout"
+                    "dispatch_failure"
+                    if not dispatch_error.revoked
+                    else "timeout"
                     if not self._within_budget()
                     else "motion_revoked"
-                    if dispatch_error.revoked
-                    else "dispatch_failure"
                 )
-                self._finish_episode(reason)
+                self._finish_episode(
+                    f"{reason}:stop_failure" if stop_error is not None else reason,
+                    run_end_reason=run_end_reason,
+                    stop_motion=False,
+                )
             except Exception:
                 logger.exception("dispatch failure finalization also failed")
-                raise dispatch_error
+                if not dispatch_error.revoked:
+                    raise dispatch_error
+                raise
             if not dispatch_error.revoked:
                 raise dispatch_error
+            if stop_error is not None:
+                raise stop_error
         elif not self._within_budget():
             self._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
 
     def run(self):
         failure = None
+        failure_reason = RunEndReason.RUNTIME_SHUTDOWN
         try:
             while self.shared.is_running.value and not self.shared.quit_requested.value:
                 if self.poll_operator is not None:
@@ -407,8 +438,18 @@ class PolicyRunner:
                     time.sleep(0.005)
                 elif remaining > 0:
                     time.sleep(min(0.005, remaining))
+        except KeyboardInterrupt:
+            self.shared.estop_request.value = True
+            raise
         except Exception as exc:
             failure = exc
+            failure_reason = (
+                RunEndReason.RECORDING_FAILURE
+                if isinstance(exc, RecordingError)
+                else RunEndReason.HARDWARE_FAULT
+                if isinstance(exc, DispatchError)
+                else RunEndReason.POLICY_FAILURE
+            )
             self.shared.error_state.value = True
             self.shared.is_running.value = False
         finally:
@@ -416,17 +457,9 @@ class PolicyRunner:
                 revoke_motion_if_run_id(
                     self.shared,
                     self.run_id,
-                    reason=RunEndReason.POLICY_FAILURE
-                    if failure
-                    else RunEndReason.RUNTIME_SHUTDOWN,
+                    reason=failure_reason,
                 )
             self.robot.before_send = None
-            try:
-                self.robot.stop()
-            except Exception as exc:
-                if failure is None:
-                    failure = exc
-                logger.exception("policy stop failed")
             try:
                 reason = RunEndReason(int(self.shared.run_ended_reason.value))
                 normal_stop = (
@@ -439,14 +472,10 @@ class PolicyRunner:
                 self._finish_episode(
                     reason.name.lower()
                     if normal_stop or reason in (RunEndReason.ESTOP, RunEndReason.HARDWARE_FAULT)
-                    else "policy_failure"
+                    else failure_reason.name.lower()
                     if failure is not None
                     else "shutdown",
-                    run_end_reason=RunEndReason.RECORDING_FAILURE
-                    if isinstance(failure, RecordingError)
-                    else RunEndReason.POLICY_FAILURE
-                    if failure is not None
-                    else RunEndReason.RUNTIME_SHUTDOWN,
+                    run_end_reason=failure_reason,
                 )
                 if self.recorder is not None:
                     if self.recorder.is_recording:
@@ -456,6 +485,14 @@ class PolicyRunner:
                     failure = exc
                 logger.exception("policy recording cleanup failed")
             finally:
+                # Retry unresolved stops, including motion outside a policy episode.
+                try:
+                    if self.robot._motion_active or self.robot._hand_stop_pending:
+                        self.robot.stop()
+                except Exception as exc:
+                    if failure is None:
+                        failure = exc
+                    logger.exception("policy stop failed")
                 if self.recorder is not None:
                     try:
                         self.recorder.close()

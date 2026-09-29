@@ -10,15 +10,11 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.utils.log import get_logger
-
-logger = get_logger(__name__)
-
-
 from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
+from dexmani_real.utils.log import get_logger
 
 from .collision import CollisionModel
 from .kinematics.arm_fk import XArm7Kinematics
@@ -26,6 +22,8 @@ from .kinematics.ik import IKResult, OnlineIKConfig, OnlineIKSolver
 from .kinematics.ik_geometry import IKGeometry
 from .kinematics.pose import Pose, ensure_qpos
 from .paths import WORKSPACE_BOUNDS_TOLERANCE_M, PathResult, interpolate_waypoints
+
+logger = get_logger(__name__)
 
 __all__ = [
     "XArm7MotionPlanner",
