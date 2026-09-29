@@ -471,6 +471,10 @@ class KeyboardInput:
         if not healthy:
             with self._lock:
                 self._keys.clear()
+            if self._running:
+                # Health checks also run at SDK fences, before the next poll.
+                # Losing emergency-stop input must apply the workflow fail-safe.
+                self._latch_emergency_stop()
         return healthy
 
     @property

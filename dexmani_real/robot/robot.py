@@ -21,6 +21,11 @@ from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+# Stop retries belong to the synchronous I/O owner, outside normal motion pacing.
+_HAND_STOP_RETRY_INTERVAL_S = 0.01
+_HAND_STOP_RETRY_TIMEOUT_S = 0.25
+_HAND_STOP_MAX_ATTEMPTS = 26
+
 
 class DispatchStatus(IntEnum):
     NOT_CALLED = 0
@@ -86,8 +91,7 @@ class DexManiRobot:
     def check(self):
         self._check_owner()
         if self.check_services is not None and not self.check_services():
-            self.shared.error_state.value = True
-            revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
+            # The service owner applies its own fail-safe and records the cause.
             raise RuntimeError("required runtime service unavailable")
 
     def connect(self):
@@ -216,7 +220,7 @@ class DexManiRobot:
         self._check_owner()
         result = DispatchResult()
         if self._hand_stop_pending:
-            raise DispatchError("previous XHand stop remains unconfirmed", result)
+            raise DispatchError("previous XHand stop remains unconfirmed", result, revoked=True)
         # All present targets are checked before either SDK sees a target.
         for name in ("arm", "hand"):
             target = getattr(command, f"{name}_qpos")
@@ -286,6 +290,10 @@ class DexManiRobot:
 
     def home_arm(self, waypoints, target, run_id, abort_check):
         self._check_owner()
+        if self._hand_stop_pending:
+            raise DispatchError(
+                "previous XHand stop remains unconfirmed", DispatchResult(), revoked=True
+            )
 
         def check_abort():
             self.check()
@@ -307,7 +315,7 @@ class DexManiRobot:
         self._arm_stopped = False
         return check_abort() is None
 
-    def _stop_hand(self):
+    def _stop_hand(self, *, passive=False):
         if self.hand is None:
             if self._hand_stop_pending:
                 raise RuntimeError("XHand stop unresolved after disconnect")
@@ -315,18 +323,32 @@ class DexManiRobot:
         self._hand_stop_pending = True
         if not self.hand.is_connected:
             raise RuntimeError("XHand disconnected before stop")
-        frame = self._last_hand
-        if frame is not None and sample_is_fresh(
-            frame["timestamp_ns"][0], self.runtime.hand.feedback_max_age_s
-        ):
-            status = self.hand.hold_current(frame["qpos"][0])
-        else:
-            status = self.hand.set_passive()
-        self._hand_stop_pending = status.name != "ACCEPTED"
-        if status.name == "REJECTED":
-            raise RuntimeError("XHand stop rejected")
-        if self._hand_stop_pending:
-            raise RuntimeError(f"XHand stop remains unconfirmed: {status.name}")
+        deadline = time.monotonic() + _HAND_STOP_RETRY_TIMEOUT_S
+        for attempt in range(_HAND_STOP_MAX_ATTEMPTS):
+            frame = self._last_hand
+            if (
+                not passive
+                and frame is not None
+                and sample_is_fresh(frame["timestamp_ns"][0], self.runtime.hand.feedback_max_age_s)
+            ):
+                status = self.hand.hold_current(frame["qpos"][0])
+            else:
+                status = self.hand.set_passive()
+            if status.name == "ACCEPTED":
+                self._hand_stop_pending = False
+                return
+            if status.name == "REJECTED":
+                raise RuntimeError("XHand stop rejected")
+            if status.name != "CRC_UNCONFIRMED":
+                raise RuntimeError(f"unexpected XHand stop status: {status.name}")
+            # CRC is delivery uncertainty, not rejection. Keep the motion fence
+            # until confirmation; only budget exhaustion fails closed. Interrupts
+            # propagate through SDK calls/sleep without clearing pending.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or attempt + 1 == _HAND_STOP_MAX_ATTEMPTS:
+                break
+            time.sleep(min(_HAND_STOP_RETRY_INTERVAL_S, remaining))
+        raise RuntimeError("XHand stop confirmation timed out: CRC_UNCONFIRMED")
 
     def stop(self):
         self._check_owner()
@@ -387,11 +409,7 @@ class DexManiRobot:
             if device is not None:
                 try:
                     if name == "hand" and device.is_connected:
-                        self._hand_stop_pending = True
-                        status = device.set_passive()
-                        self._hand_stop_pending = status.name != "ACCEPTED"
-                        if self._hand_stop_pending:
-                            errors.append(RuntimeError(f"XHand cleanup passive: {status.value}"))
+                        self._stop_hand(passive=True)
                 except Exception as exc:
                     errors.append(exc)
                 finally:
