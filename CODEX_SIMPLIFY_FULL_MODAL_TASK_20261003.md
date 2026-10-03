@@ -3,15 +3,19 @@
 日期：2026-10-03  
 仓库：`haoyangzhanglab/dexmani_real`，分支：`main`  
 方案核查基线：`b7fc4549931314af404082251a2331ffe5ed4ce8`  
-状态：完成方案审查，可按本文开展实现；这不表示实现已通过测试或真机验证。
+状态：完成二次审查，可按本文开展实现；这不表示实现已通过测试或真机验证。
 
 本文是用户最终要求的独立任务书，完整承载实施要求，不依赖聊天记录、外部报告或此前临时脚本。它替代前几轮方案中相冲突的实现建议。上面的 SHA 只是证据基线，不是要求 checkout/reset 的目标。
+
+二次审查只收紧执行边界：补齐驱动到导出的实际修改链；保留有作用的 replay 小幅准备；区分时间抖动与缺测；明确相机缺标定处理。没有扩大到新架构或新的传感器能力。
 
 ## 0. 执行要求与范围
 
 目标是个人 PhD 灵巧操作实验：简洁、高效、正确、好用，重点是全模态数据采集/导出与同步真机策略推理。直接修真实错误，删除无效机制；不要借本次整改建设平台。
 
 开始时阅读当前 `AGENTS.md`、本文、相关入口与调用链，检查 `git status` 和实际 HEAD。保护用户已有修改；若相关问题已修复，核对后保留，不重复实现。按本文完成代码、必要配置、文档和定向离线验证，不停留在再次输出方案，也不要只做第一阶段后结束。
+
+本文规定目标行为；具体实现以当前调用链的最小必要改动为准。若发现某个预定删除对象仍有实际消费者或独立作用，保留该作用并说明证据，不为了逐字执行清理清单而损失功能。
 
 本任务针对当前仓库。模型架构、通用训练 Dataset 与算法实验继续属于 `dexmani_policy`；需要核对相邻仓库接口时只读检查，并明确外部消费者是否仍需适配，不假称训练端已经兼容。
 
@@ -76,6 +80,8 @@
 
 采集保存全部物理输入；点云、末端和指尖等可重建几何放在离线公共导出计算。在线模型真正需要某几何输入时，继续使用已有在线计算路径。不得为了保存全模态强制在线多跑全部 FK/点云，也不得只保存当前模型使用的子集。
 
+这里的全模态指当前接入的机器人、RGB-D 和触觉观测及表中派生字段，不等于新增传感器、保存所有 SDK 原始包或实现任意模型架构。保持字段语义，不为本次需求扩展人体追踪数据集或原生高频独立流系统。
+
 ### 2.2 参数来源已由用户确定
 
 | 项目 | 最终规则 |
@@ -109,6 +115,8 @@
 - 默认完整采集必须启用全部已接入模态。启动或运行时某通道持续缺失要清楚显示，不能悄悄运行一整段全空触觉并宣称完整数据。沿用已有可用性/失联判断，补简单计数或摘要，不增加多套超时门限与质量等级。
 - 相机没有可用帧时停止本段、保住前缀，不新增默认补黑帧流程。相机仍在正常输出但控制频率更高时，可以重用原帧并保留原帧号/源时间；分别检测 RGB 和 depth 的持续停帧。
 
+解耦必须覆盖实际 producer，不能只修改 `DexManiRobot`：`drivers/xarm7.py::_decode_joint_states` 当前先把 effort 与 qpos/qvel 一起做 finite 准入；`drivers/xhand.py::_parse_joints` 当前会因 current 非有限而拒绝整个关节包。对 SDK 返回正常、关节位置可用而辅助数值缺失的情形，在这些边界保留可用反馈与缺失值，再传到 Robot/录制/导出；SDK 错误码、关节包结构错误与实际控制器故障不能被放行。`qvel` 在 `arm_homing.py` 和驱动 HOME 收敛中有真实消费者，不能一并当成无用辅助量删除其到位判断。
+
 ### 3.3 时间只保存已取得且有用的信息
 
 新增/传递普通逐行数组：控制观测时间、实际 arm/hand 读取完成时间、相机源时间、RGB/depth 帧号、下发完成时间。字段名沿现有风格选择，写清主机 monotonic/接收/读取/完成语义；无下发用明确缺失状态。已有源时间直接传递，不为本任务给每次 SDK 调用加 read_start/read_end。
@@ -121,6 +129,8 @@
 - rollout 行表示控制观测与尝试动作，不等于每条动作都重新做了一次 query。写清这一点即可；本轮不建 query 输入快照/关联表。确实需要定位 chunk 时，最多复用/增加普通 chunk 索引，不作为读取资格。
 - 同步 predict 阻塞期间不会凭空产生真实机器人采样；数据必须反映该时间缺口，不承诺原生最高频率的全量传感器记录。
 
+新增时间/状态字段需要贯通 `EpisodeFrame`、实际 row producer、writer 的键集合/数组创建/追加、reader 和 exporter。当前 writer 使用精确字段集合；不能只在 frame 中添 key 就认为已经落盘。只扩展现有小表/数组，不新增 schema 管理器。
+
 ### 3.4 公共导出始终全模态
 
 保留 `canonical_array_specs`、必要 shape/dtype 表和普通 `ProcessingConfig`。删除其无关的身份/来源准入，不因文件名叫 contracts 就拆文件重写。
@@ -128,18 +138,22 @@
 把“全 Raw 浮点预扫描 → 转换 → 完整 Zarr 再读回”缩成一次实际分块转换/写入：
 
 1. 输出全部 13 字段，不加入基于某模型 `observation_fields` 的导出裁剪。
-2. 触觉/current/effort 等浮点缺失保留 NaN；FK 只算关节有效行，再放回原行序；空点云或缺所需相机标定时保留该派生字段的 NaN 和清楚原因。不要删行后把时间缺口拼成连续轨迹。
+2. 触觉/current/effort 等浮点缺失保留 NaN；FK 只算关节有效行，再放回原行序；空点云或缺重建点云所需的内/外参时保留该派生字段的 NaN 和清楚原因。不要删行后把时间缺口拼成连续轨迹。
 3. 不强制新增 13 套 bool 数组。普通浮点 finite/现有状态足以判断时直接使用；实际缺失原因在现有 export report 中简短记录即可，不再增加质量报告子系统。
-4. RGB-D 缺文件、无法解码、基本行数损坏不靠伪造图像“补全”。明确指出受影响文件；reader 仍允许访问其可读数值部分。对已知缺测做局部分支，未知算法或 I/O 错误保留 traceback，不能 broad catch 后全部改 NaN。
+4. RGB-D 缺文件、无法解码、基本行数损坏不靠伪造图像“补全”。明确指出受影响文件；reader 仍允许访问其可读数值部分。已知不可导出的 episode 复用现有报告/显式排除方式；转换中失败则报告并保留 Raw/staging，不新增自动裁前缀、跨文件修复或自动重试。对已知缺测做局部分支，未知算法或 I/O 错误保留 traceback，不能 broad catch 后全部改 NaN。
 5. 保留写入列长度、shape/dtype、episode_ends 和实际计数；删除 `_validate_staging` 的默认全缓存读回与自家 FK rot6d 的逐块重复正交认证。Raw 正常关闭后也不自动再过一遍完整 reader/视频资格扫描。
 6. 同一密集 Zarr 的 H/W、类型、depth scale 等必须确实可由其元数据解释；保留这些实际兼容约束。不同分辨率/scale/名义 dt 的输入默认分开导出，不加多种合并策略，也不静默 resize、换单位或伪装同一 dt。真实逐行时间仍随导出保留。
 7. task/source 是普通标签，不能仅因 `unknown` 或来源 `rollout` 禁止导出。不要把一个全局 task 标签错误覆盖到不同任务；本轮默认按任务目录组织缓存，混合任务另行显式组织，不建设任务身份系统。
+
+相机参数的边界明确如下：Raw 采集不以已有有效外参为前置条件，`snapshot_recording_metadata` 应保存能取得的真实相机信息并说明缺项，不编造 identity 外参。读 RGB-D 像素不先要求外参；完整公共导出仍需可解码图像、明确形状和可解释深度的 scale，仅点云所需内/外参缺失时让点云无效，不连带拒绝关节、图像和触觉。若连深度 scale 都未知，不借“全模态”填一个假值；明确报告该数据尚不能作为完整可解释的 RGB-D 公共导出。
 
 保存完整 RGB-D 与关节来源，点云裁剪/去桌面/固定 N 只是可重建结果。Raw 不做面向特定网络的 resize、归一化或删通道。当前深度已对齐、RGB 可能编码，不能宣传为相机所有原生字节都无损保存。
 
 ### 3.5 下游使用要正确，但不扩建训练框架
 
 提供一个短的离线读取/说明示例：同一份公共导出，RGB 策略与触觉策略分别按所需字段选择有效行/窗口；动作标签结合 dispatch；不跨 episode/时间缺口拼接，不对所有模态求共同有效交集。归一化统计也只基于该策略采用的有效数据。
+
+时间不均匀或一次慢推理本身不等于损坏，不能另加通用 `gap > 2dt` 删除规则。这里不拼接的缺口指已知缺失的所需样本或显式裁剪断点；固定频率模型如何根据真实时间选样/重采样，由它既有的训练约定决定。公共导出不插值、不为满足某模型的 dt 自动删行。
 
 NaN 可保存在数据中，不代表所有旧训练 loader 可以直接消费。核对部署桥与已知消费者的真实假设；必要外部适配明确列出。此仓库不新增通用 Dataset、窗口筛选服务或训练 pipeline，不通过填零来“兼容”不支持缺测的模型。
 
@@ -152,6 +166,7 @@ NaN 可保存在数据中，不代表所有旧训练 loader 可以直接消费�
 - 修慢推理后过期 deadline 造成 chunk 前两条现成动作挤压。以实际发送节拍安排后续动作，不补发落后的时间槽；不要为每个 action 建 deadline 对象。
 - `n_action_steps=1` 时推理耗时计入发送间隔；长推理之后不再平白强加一个完整 cooldown。验证时同时覆盖单动作和多动作 chunk，不能只修一边。
 - 不改变模型已定义的动作切片、horizon、归一化、动作顺序或 RNG 行为；不按墙钟跳过预测前缀。
+- 同样保留该模型依赖的输入数值处理与特征顺序，包括已保存的点数/点云表示、图像处理和 fingertip 顺序。桌面/安装使用当前物理配置，不意味着把模型输入 recipe 随意换成当前默认值；沿用已有桥接字段即可，不新增 ABI 或指纹匹配。
 - history 只在 episode 开始/重置时清空，不因超过 `2dt` 就 clear 并复制当前帧。启动先收集真实 N 帧；若已知训练明确采用启动 padding，按该约定使用，不能在运行中以重复帧伪造真实历史。
 - 真实历史可能不等间隔，记录并说明；删除 history gate 不能被描述为已经解决所有时间对齐问题。
 - predict 后继续沿现有逻辑检查停止/撤销/运行预算及必要当前反馈。新读取的关节反馈不改写模型已经使用的旧视觉输入，不伪装成新 history 行。
@@ -179,7 +194,7 @@ NaN 可保存在数据中，不代表所有旧训练 loader 可以直接消费�
 - task 标签普通处理，相对路径正常 resolve；删除身份许可证式限制，保留真实覆盖/删除路径保护。
 - 删除已证实被当前逐关节限制支配的 IK gate；不能仅凭默认阈值就声称所有自定义配置永远冗余。保留有独立作用的条件，不再造自动“支配关系证明器”。
 
-replay 起点流程采用最简单且明确的方案：保留实际起点检查，要求操作者手工准备到起点；删除不会得到执行机会或造成误解的隐式 warm-up。不得通过交换两行代码就自动执行大幅手部准备动作，不新增 prepare_start 状态机。
+replay 保留当前起点检查和已由选项启用的 warm-up，不因为“大偏差先被拒绝”就删除它在允许范围内的对齐作用。大幅重新定位仍由操作者准备，不把 gate 移到运动之后。核对真正的准备终点：当前起点 gate 比较首帧实测 hand_qpos，而 warm-up 目标是首条 action_hand_joint，两者不可混称。若二者有差异，对实际准备目标复用现有小幅起点范围/限位判断，不能以“靠近首帧观测”推断“准备动作也很小”。不新增 prepare_start 状态机或放宽现有范围。
 
 ## 6. 数学、算法与实际错误
 
@@ -241,12 +256,12 @@ git diff --check
 | 验证组 | 必须观察到的行为 |
 | --- | --- |
 | 停止与数据 | fake arm 调用期间撤销后 hand 不再下发；晚帧/正常停止保留前缀；模拟发布错误后原 staging 仍在；显式 discard 才删除 |
-| 全模态 | 小型完整样本导出 13 字段；聚合/稠密触觉分别无效时不互相污染，坏触觉不删 RGB/关节；SDK 拒绝的尝试目标不能当成功执行 |
-| 时间与缺帧 | 原源时间/帧号写入并透传；RGB 冻结且 depth 推进仍被持续停帧检测识别；缺相机帧不生成伪造的有效黑图；旧无时间数据不假称实测 |
+| 全模态 | 从仿真的原始 SDK payload 走真实驱动解码 → Robot → frame → writer/reader → export，覆盖有效关节 + 无效 effort/current；小样本导出 13 字段，双触觉独立有效；SDK 拒绝目标不能当成功执行。不能只绕过驱动注入高层假状态 |
+| 时间与缺帧 | 原源时间/帧号确实经过 writer/reader/export，不只是内存里存在；正常抖动不触发新整段拒绝；RGB 冻结且 depth 推进仍被检测，缺帧不伪造有效黑图，旧无时间数据不假称实测 |
 | 同步推理 | 假时钟覆盖慢 predict、多动作 chunk 和单动作模式；无旧 deadline 追赶、无多余整 dt cooldown；真实多帧历史不被复制成同一帧 |
 | 数学 | 跨 π 连续、±179.5° 旋转聚合不变零；等大残差 RMS 非零；新 heading 样本计数、palm 退化、TAG 相等门限、允许周期等价轴均有反例 |
 | 真实消费者 | 同一导出按 RGB/触觉所需字段构造不同有效样本集合；不跨 episode/缺口；不把 NaN 交给不支持它的模型；全字段 finite 不再是公共数据准入 |
-| 参数与工具 | 不含历史安装/桌面/触觉参数仍按当前配置导出；触觉不重复扣偏置；无旧 plane 能解析首次标定分支；无 rerun 可 info；非整数 fps 正确 |
+| 参数与工具 | 不含历史安装/桌面/触觉参数仍按当前配置导出；触觉不重复扣偏置；缺外参仍可保存/读取物理观测但点云不伪装有效；无旧 plane 能解析首次标定分支；无 rerun 可 info；非整数 fps 正确 |
 | 生命周期 | 一个 close 抛错仍调用其余 close，最终可见失败；纯 import/配置解析不创建硬件连接；全无有效数据的指标不是零误差 |
 
 若缺可选依赖，完成不受影响的工作并精确说明未运行项，不能把 mocked 检查说成真实 SDK/硬件测试。对很小的配置/文档搬移不单独堆测试。上面列的是实施后的验收行为，不是此前已通过的测试成绩。
@@ -281,10 +296,10 @@ git diff --check
 | #22 | 历史 Raw 导出默认套用当前桌面平面（原部分成立；本轮接受该选择） | 按用户明确选择接受当前桌面/安装/触觉参数；取消历史快照/版本绑定要求。 | [examples/export_policy_zarr.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/examples/export_policy_zarr.py#L129-L138) |
 | #23 | replay 的角度、无有效帧和延迟指标需要分开修正（部分成立） | 无数据返回未定义；活动关节单独报告 lag；绝对角/几何误差说明清楚即可。 | [dexmani_real/replay/evaluation.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/replay/evaluation.py#L27-L60) |
 | #24 | retarget 技术异常被吞成普通控制失败（成立） | 保留原始异常栈；普通无解用现有返回值，不建异常分类体系。 | [dexmani_real/teleop/control/controller.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/teleop/control/controller.py#L55-L90) |
-| #25 | 未使用的辅助模态与控制/导出耦合（部分成立） | 全模态采集/导出；辅助缺测与关节可控性分开，沿用 NaN/状态，不加全字段 validity 框架。 | [dexmani_real/robot/robot.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/robot/robot.py#L141-L205) |
+| #25 | 未使用的辅助模态与控制/导出耦合（部分成立） | 从驱动解码到 Robot/存储/导出贯通辅助缺测解耦，保留关节与真实硬件错误边界；沿用 NaN/状态。 | [dexmani_real/robot/robot.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/robot/robot.py#L141-L205) |
 | #26 | 未启用后端、固定全模态 Raw 也参与准入（设计取舍） | 保留全模态字段及真实 shape/单位约束；删未用后端准入与全模态全有效资格规则。 | [dexmani_real/config/experiment.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/config/experiment.py#L129-L155) |
 | #27 | physical_home_completed 是历史令牌而非当前姿态证明（设计取舍） | 删 HOME 历史凭证，保留手动 HOME。 | [dexmani_real/runtime/safety.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/runtime/safety.py#L129-L151) |
-| #28 | replay 手部接近检查先于手部预备动作（部分成立） | 采用手工准备 + 当前起点检查，删除隐式 warm-up；不自动放行大幅准备运动。 | [dexmani_real/replay/replayer.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/replay/replayer.py#L144-L180) |
+| #28 | replay 手部接近检查先于手部预备动作（部分成立） | 保留当前起点检查与有作用的可选 warm-up，核对首帧状态和首动作目标差异；大幅定位手工完成。 | [dexmani_real/replay/replayer.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/replay/replayer.py#L144-L180) |
 | #29 | HOME 的 RRT 搜索与最终验证不在同一碰撞模型中（部分成立） | 本轮保留现有 HOME 规划/路径验证；不新增路点替代方案，不把搜索低效误称无碰撞检查。 | [dexmani_real/planning/planner.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/planning/planner.py#L96-L177) |
 | #30 | workspace 裁剪只约束 EEF 意图，不保证最终 FK 在界内（能力边界） | 说明 target bounds 的真实作用；不扩成全轨迹安全认证。 | [dexmani_real/robot/action.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/robot/action.py#L104-L117) |
 | #31 | SDK close 错误被吞后上层仍报告 clean（成立） | close 尽力处理所有资源并报告异常，不再包装成“已证明 clean”。 | [dexmani_real/robot/drivers/xarm7.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/robot/drivers/xarm7.py#L212-L219) |
