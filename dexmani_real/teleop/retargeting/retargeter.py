@@ -125,17 +125,6 @@ def validate_landmarks(keypoint_3d_array: np.ndarray) -> tuple[bool, str]:
         return False, f"shape {points.shape} != (21, 3)"
     if not np.all(np.isfinite(points)):
         return False, "contains NaN/Inf"
-    index_basis = points[5] - points[0]
-    pinky_basis = points[17] - points[0]
-    index_length = float(np.linalg.norm(index_basis))
-    pinky_length = float(np.linalg.norm(pinky_basis))
-    if index_length < 0.01 or pinky_length < 0.01:
-        return False, "wrist-to-index/pinky MCP baseline is shorter than 1 cm"
-    palm_sine = float(
-        np.linalg.norm(np.cross(index_basis, pinky_basis)) / (index_length * pinky_length)
-    )
-    if palm_sine < 0.1:
-        return False, "palm basis is collinear"
     shortest_bone = min(
         float(np.linalg.norm(points[child] - points[parent])) for parent, child in _CONTIGUOUS_BONES
     )
@@ -161,6 +150,13 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
     eps = 1e-8
     points = keypoint_3d_array[[0, 5, 9], :].copy()
 
+    first, second = points[1] - points[0], points[2] - points[0]
+    lengths = np.linalg.norm(first), np.linalg.norm(second)
+    if (
+        min(lengths) < 0.01
+        or np.linalg.norm(np.cross(first, second)) < 0.1 * lengths[0] * lengths[1]
+    ):
+        raise ValueError("wrist/index/middle palm triangle is degenerate")
     x_vector = points[0] - points[2]  # middle MCP → wrist
     points_centered = points - np.mean(points, axis=0, keepdims=True)
 

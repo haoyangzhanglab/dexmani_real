@@ -70,11 +70,12 @@ class PolicyRunner:
             if recording_config is not None
             else None
         )
-        self.history = ObservationHistory(policy_info.n_obs_steps, policy_info.control_dt_s)
+        self.history = ObservationHistory(policy_info.n_obs_steps)
         self.action_queue = deque()
         self.run_id = None
         self.started_ns = 0
         self.next_step_ns = 0
+        self.last_dispatch_start_ns = 0
         self.previous_arm = None
         self.completed = 0
         self.realizer = ActionRealizer.for_mode(runtime, policy_info.action_mode)
@@ -82,7 +83,7 @@ class PolicyRunner:
         requires_rgb = "rgb" in fields
         self.requires_cloud = "point_cloud" in fields
         self.requires_camera_payload = requires_rgb or self.recorder is not None
-        self.requires_rgb_cloud_identity = requires_rgb and self.requires_cloud
+        self.requires_rgb_cloud_identity = self.requires_camera_payload and self.requires_cloud
 
     def _read_observation(self):
         return read_observation(
@@ -118,7 +119,6 @@ class PolicyRunner:
         if self.run_id is None:
             return
         revoke_motion_if_run_id(self.shared, self.run_id, reason=run_end_reason)
-        self.shared.physical_home_completed.value = False
         stop_error = None
         try:
             if stop_motion:
@@ -149,30 +149,14 @@ class PolicyRunner:
             logger.warning("policy B rejected: required observation unavailable")
             return None
         if self.execute and (
-            not self.shared.physical_home_completed.value
-            or np.max(np.abs(row.arm["qpos"][0] - self.runtime.arm.home_qpos))
+            np.max(np.abs(row.arm["qpos"][0] - self.runtime.arm.home_qpos))
             > self.runtime.arm.homing.convergence_rad
             or np.max(np.abs(row.hand["qpos"][0] - np.deg2rad(self.runtime.hand.home_qpos_deg)))
             > np.deg2rad(self.runtime.hand.home_tolerance_deg)
         ):
-            logger.warning("policy B requires completed HOME and current arm + hand home pose")
+            logger.warning("policy B requires current arm + hand home pose")
             return None
-        try:
-            observation = build_policy_observation(
-                (row,) * self.policy_info.n_obs_steps,
-                self.policy_info,
-                fingertip_runtime=self.fingertip_runtime,
-            )
-        except Exception:
-            # No motion or recording has begun; a fresh B may retry failed derivation.
-            logger.warning(
-                "policy B rejected: initial observation construction failed", exc_info=True
-            )
-            return None
-        if observation is None:
-            logger.warning("policy B rejected: required policy modality unavailable")
-            return None
-        return row, observation
+        return row
 
     def _begin_episode(self):
         with self.shared.motion_lock:
@@ -217,19 +201,18 @@ class PolicyRunner:
                     if preparation_epoch == int(self.shared.run_id.value)
                     and not self.shared.quit_requested.value
                     and not self.shared.stop_request.value
-                    and (not self.execute or self.shared.physical_home_completed.value)
                     else None
                 )
             if epoch is None:
                 return None
             self.run_id, self.started_ns = epoch
             committed = True
-            self.shared.physical_home_completed.value = False
             self.history.clear()
-            self.history.append(initial[0])
+            self.history.append(initial)
             self.action_queue.clear()
             self.previous_arm = None
             self.next_step_ns = 0
+            self.last_dispatch_start_ns = 0
             return initial
         except BaseException as exc:
             failure = exc
@@ -240,7 +223,7 @@ class PolicyRunner:
             if not committed:
                 try:
                     if self.recorder is not None and self.recorder.is_recording:
-                        self.recorder.discard_episode(reason="start_cancelled")
+                        self.recorder.save_episode(reason="start_cancelled")
                 except Exception:
                     if failure is None:
                         raise
@@ -279,7 +262,7 @@ class PolicyRunner:
         # Observation, synchronous inference and dispatch share this tick's budget.
         tick_start_ns = now
         self.next_step_ns = tick_start_ns + int(self.policy_info.control_dt_s * 1e9)
-        row = initial[0] if initial is not None else self._read_observation()
+        row = initial if initial is not None else self._read_observation()
         policy_row = row
         if row is None:
             self._finish_episode("required_observation_stale")
@@ -288,14 +271,13 @@ class PolicyRunner:
             self.history.append(row)
         execution_state = policy_row
         if not self.action_queue:
-            observation = (
-                initial[1]
-                if initial is not None
-                else build_policy_observation(
-                    self.history.padded(),
-                    self.policy_info,
-                    fingertip_runtime=self.fingertip_runtime,
-                )
+            rows = self.history.ready_rows()
+            if not rows:
+                if self.recorder is not None:
+                    self.recorder.add_frame(build_episode_frame(row))
+                return
+            observation = build_policy_observation(
+                rows, self.policy_info, fingertip_runtime=self.fingertip_runtime
             )
             if observation is None:
                 self._finish_episode("required_tactile_unavailable")
@@ -356,10 +338,7 @@ class PolicyRunner:
             if kind == IKFailureKind.INVALID_OUTPUT:
                 raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
             if self.recorder:
-                self.recorder.add_frame(
-                    build_episode_frame(policy_row),
-                    step_timestamp_ns=time.monotonic_ns(),
-                )
+                self.recorder.add_frame(build_episode_frame(policy_row))
             return
         prepared_arm = arm
         if self.recorder is not None:
@@ -368,6 +347,21 @@ class PolicyRunner:
         result = None
         dispatch_error = None
         stop_error = None
+        # A fast query after a slow query must still respect the previous send.
+        # Inference itself counts toward this interval (including one-action chunks).
+        earliest = self.last_dispatch_start_ns + int(self.policy_info.control_dt_s * 1e9)
+        while self.last_dispatch_start_ns and time.monotonic_ns() < earliest:
+            if self.poll_operator is not None:
+                self.poll_operator()
+            if not self._has_motion_authority() or self.shared.quit_requested.value:
+                self._finish_episode("motion_revoked")
+                return
+            if not self._within_budget():
+                self._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
+                return
+            time.sleep(min(0.005, max(0, earliest - time.monotonic_ns()) / 1e9))
+        dispatch_start_ns = time.monotonic_ns()
+        self.last_dispatch_start_ns = dispatch_start_ns
         if self.execute:
             try:
                 result = self.robot.send_action(command)
@@ -386,15 +380,16 @@ class PolicyRunner:
                 except Exception as stop_exc:
                     stop_error = stop_exc
                     logger.exception("stop after dispatch failure also failed")
+        if self.action_queue:
+            self.next_step_ns = dispatch_start_ns + int(self.policy_info.control_dt_s * 1e9)
+        else:
+            self.next_step_ns = 0  # Next synchronous query contributes to the send interval.
         if result is not None and result.continued and dispatch_error is None:
             self.previous_arm = prepared_arm
         elif not self.execute:
             self.previous_arm = prepared_arm
         if self.recorder:
-            self.recorder.add_frame(
-                build_episode_frame(policy_row, command, result),
-                step_timestamp_ns=result.timestamp_ns if result else time.monotonic_ns(),
-            )
+            self.recorder.add_frame(build_episode_frame(policy_row, command, result))
         if dispatch_error is not None:
             try:
                 reason = (

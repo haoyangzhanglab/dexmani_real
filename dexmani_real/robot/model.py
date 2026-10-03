@@ -108,3 +108,7 @@ XARM7_HARD_UPPER = (
     3.14159265359,
     6.28318530718,
 )
+
+# The xArm7 model's full-turn revolute axes admit 2*pi-equivalent poses within
+# their physical limits. Operational limits may narrow these intervals.
+XARM7_EQUIVALENT_JOINT_MASK = (True, False, True, False, True, False, True)

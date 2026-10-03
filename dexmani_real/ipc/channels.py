@@ -95,9 +95,6 @@ class RuntimeChannels:
     estop_request: Any  # sticky emergency-stop request
     quit_requested: Any  # operator or episode budget requests session exit
     start_request: Any  # operator -> local policy runner: B
-    # Operator -> local policy runner: true only after the I/O owner completed the
-    # authorized hand-home + collision-checked arm-home sequence.
-    physical_home_completed: Any
     # Operator -> local policy runner: S request.
     stop_request: Any
 
@@ -185,7 +182,6 @@ class RuntimeChannels:
         storage.estop_request = ctx.Value("b", False)
         storage.quit_requested = ctx.Value("b", False)
         storage.start_request = ctx.Value("b", False)
-        storage.physical_home_completed = ctx.Value("b", False)
         storage.stop_request = ctx.Value("b", False)
 
         storage.safety_state = ctx.Value("i", DISARMED_SAFETY_STATE_WIRE_VALUE)

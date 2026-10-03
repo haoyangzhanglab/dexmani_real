@@ -1,4 +1,4 @@
-"""Strict teleop admission into a rebuildable, one-task canonical cache."""
+"""Full-modal conversion into a rebuildable, one-task canonical cache."""
 
 from __future__ import annotations
 
@@ -18,13 +18,13 @@ from dexmani_real.dataset.contracts import (
     canonical_array_specs,
     validate_task_identity,
 )
-from dexmani_real.dataset.pointcloud import load_raw_episode_camera_model
 from dexmani_real.dataset.processing import (
     discover_episode_dirs,
     iter_canonical_blocks,
-    validate_canonical_teleop_episode,
+    validate_export_episode,
 )
 from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
+from dexmani_real.recording.storage.schema import ROW_INFO_SPECS
 from dexmani_real.utils.atomic_io import target_is_occupied
 
 logger = logging.getLogger(__name__)
@@ -100,7 +100,7 @@ def export_raw_to_zarr(
                 except FileNotFoundError as exc:
                     raise RawDataError(f"missing required file: {name}") from exc
             with EpisodeReader(episode) as reader:
-                validate_canonical_teleop_episode(reader)
+                validate_export_episode(reader)
         except RawDataError as exc:
             rejected[episode.name] = str(exc)
             logger.warning("Rejected %s: %s", episode.name, exc)
@@ -111,6 +111,7 @@ def export_raw_to_zarr(
     staging = root = data = None
     first_attrs = first_tails = None
     ends, offset = [], 0
+    episode_notes = {}
     try:
         for index, episode in enumerate(accepted):
             if progress_callback:
@@ -122,9 +123,11 @@ def export_raw_to_zarr(
                     raise ValueError(
                         f"{episode.name}: task_name={task!r}, expected {config.expected_task_name!r}"
                     )
-                camera = load_raw_episode_camera_model(reader).geometry.color
                 specs = canonical_array_specs(
-                    frames, processing.pointcloud.num_points, camera.height, camera.width
+                    frames,
+                    processing.pointcloud.num_points,
+                    int(reader.meta["camera_color_height"]),
+                    int(reader.meta["camera_color_width"]),
                 )
                 tails = {key: (shape[1:], dtype) for key, (shape, dtype) in specs.items()}
                 attrs = dict(
@@ -162,6 +165,20 @@ def export_raw_to_zarr(
                     root = zarr.open_group(str(staging), mode="w")
                     root.attrs.update(attrs)
                     data = root.create_group("data")
+                    row_info = root.create_group("row_info")
+                    for name, spec in ROW_INFO_SPECS.items():
+                        row_info.create_dataset(
+                            name,
+                            shape=(0, *spec.tail_shape),
+                            chunks=(chunk, *spec.tail_shape),
+                            dtype=spec.dtype,
+                        )
+                    root.attrs["time_semantics"] = (
+                        "host monotonic ns; 0 unknown/not called; camera queue return; robot read completion"
+                    )
+                    root.attrs["row_semantics"] = (
+                        "control observation and attempted target, not per-action query input"
+                    )
                     compressor = zarr.get_codec({"id": "zstd", "level": config.compression_level})
                     for key, (tail, dtype) in tails.items():
                         data.create_dataset(
@@ -173,8 +190,15 @@ def export_raw_to_zarr(
                         )
                 for key, (tail, _) in tails.items():
                     data[key].resize((offset + frames, *tail))
+                for name, spec in ROW_INFO_SPECS.items():
+                    row_info[name].resize((offset + frames, *spec.tail_shape))
+                notes = episode_notes[episode.name] = {}
+                if "observation_timestamp_ns" not in reader.fields:
+                    notes["timestamps"] = "unknown; dt is nominal only"
                 count = 0
-                for block in iter_canonical_blocks(reader, processing, chunk_frames=chunk):
+                for block in iter_canonical_blocks(
+                    reader, processing, chunk_frames=chunk, notes=notes
+                ):
                     rows = len(block["joint_state"])
                     if set(block) != set(specs):
                         raise ValueError("incomplete canonical modalities")
@@ -183,6 +207,10 @@ def export_raw_to_zarr(
                         if values.shape != (rows, *tail) or values.dtype != dtype:
                             raise ValueError(f"{key}: transformed shape/dtype mismatch")
                         data[key][offset + count : offset + count + rows] = values
+                    for name in ROW_INFO_SPECS:
+                        row_info[name][offset + count : offset + count + rows] = (
+                            reader.read_row_info(name, count, count + rows)
+                        )
                     count += rows
                 if count != frames:
                     raise ValueError("transformed row count differs from Raw")
@@ -204,11 +232,11 @@ def export_raw_to_zarr(
             rejected_episodes=rejected,
             excluded_episodes=sorted(excluded),
             processing=processing.to_dict(),
+            episode_notes=episode_notes,
         )
         (staging / "export_report.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
-        _validate_staging(staging, first_tails, ends, config.chunk_frames)
         if target_is_occupied(target):
             _require_replaceable_cache(target, overwrite)
             shutil.rmtree(target)
@@ -221,10 +249,7 @@ def export_raw_to_zarr(
         raise ValueError(f"{episode.name}: canonical export failed: {exc}") from exc
     finally:
         if staging is not None:
-            try:
-                shutil.rmtree(staging)
-            except OSError:
-                logger.warning("Could not remove export staging %s", staging, exc_info=True)
+            logger.warning("Export staging retained for inspection: %s", staging)
 
 
 def _require_replaceable_cache(target, overwrite):
@@ -234,18 +259,3 @@ def _require_replaceable_cache(target, overwrite):
         raise ValueError("overwrite requires an existing canonical cache directory")
     if zarr.open_group(str(target), mode="r").attrs.get("format") != CANONICAL_FORMAT:
         raise ValueError("overwrite is only allowed for a canonical cache")
-
-
-def _validate_staging(path, tails, ends, chunk_frames):
-    """Read the complete staged cache before removing an explicitly replaced cache."""
-    root = zarr.open_group(str(path), mode="r")
-    if not np.array_equal(root["meta/episode_ends"][:], ends):
-        raise ValueError("staged episode boundaries differ from Raw")
-    for key, (tail, dtype) in tails.items():
-        array = root[f"data/{key}"]
-        if array.shape != (ends[-1], *tail) or array.dtype != dtype:
-            raise ValueError(f"{key}: staged shape/dtype mismatch")
-        for start in range(0, ends[-1], chunk_frames):
-            values = array[start : start + chunk_frames]
-            if np.issubdtype(dtype, np.floating) and not np.isfinite(values).all():
-                raise ValueError(f"{key}: staged nonfinite values")

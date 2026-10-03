@@ -81,6 +81,7 @@ class DexManiRobot:
         self._last_hand = None
         self._hand_failure_started = None
         self._previous_errors = None
+        self._tactile_availability = {}
         self._idle_next_ns = 0
         self.before_send = None
 
@@ -139,8 +140,10 @@ class DexManiRobot:
             raise
 
     def arm_feedback(self, qpos, qvel, effort):
-        if any(np.shape(x) != (7,) or not np.isfinite(x).all() for x in (qpos, qvel, effort)):
+        if any(np.shape(x) != (7,) or not np.isfinite(x).all() for x in (qpos, qvel)):
             raise RuntimeError("unusable arm feedback")
+        if np.shape(effort) != (7,):
+            raise RuntimeError("invalid arm effort shape")
         frame = np.zeros(1, dtype=ARM_STATE_DTYPE)
         frame["qpos"], frame["qvel"], frame["effort"] = qpos, qvel, effort
         frame["timestamp_ns"] = time.monotonic_ns()
@@ -162,10 +165,10 @@ class DexManiRobot:
         self._hand_failure_started = None
         if not self.hand.is_connected:
             raise RuntimeError("XHand disconnected")
-        if any(
-            np.shape(x) != (12,) or not np.isfinite(x).all() for x in (state.qpos, state.current_ma)
-        ):
-            raise RuntimeError("unusable hand joint/current feedback")
+        if np.shape(state.qpos) != (12,) or not np.isfinite(state.qpos).all():
+            raise RuntimeError("unusable hand joint feedback")
+        if np.shape(state.current_ma) != (12,):
+            raise RuntimeError("invalid hand current shape")
         errors = tuple(
             tuple(getattr(state, name))
             for name in ("commboard_err", "jointboard_err", "tipboard_err")
@@ -180,6 +183,9 @@ class DexManiRobot:
             valid = bool(self.hand.tactile_calibrated and getattr(state, f"tactile_{name}_valid"))
             if valid and (np.shape(value) != shape or not np.isfinite(value).all()):
                 raise RuntimeError(f"unusable valid {name} tactile feedback")
+            if self._tactile_availability.get(name) != valid:
+                logger.log(20 if valid else 30, "XHand %s tactile available=%s", name, valid)
+                self._tactile_availability[name] = valid
             frame[f"tactile_{name}_valid"] = valid
             frame[f"tactile_{name}"] = value if valid else np.nan
         frame["timestamp_ns"] = time.monotonic_ns()

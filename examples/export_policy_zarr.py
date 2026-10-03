@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -46,8 +47,8 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Alternative Zarr cache output path for this task "
-            "(default: datasets/<task_name>.zarr). The task identity always "
-            "comes from the input directory. Existing caches require --overwrite, "
+            "(default: datasets/<task_name>.zarr). The default cache name "
+            "comes from the input directory; task labels come from Raw. Existing caches require --overwrite, "
             "and the resolved target (symlinks followed) must not fall "
             "inside the protected sources: episodes/, episodes_processed/, "
             "rollouts/, the input root, or an existing .zarr store."
@@ -159,12 +160,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
+        args.input_root = args.input_root.expanduser().resolve()
         default_output_path, task_name = _resolve_task_paths(args.input_root)
         output_path = _resolve_output_path(args.output, default_output_path, args.input_root)
         config = CanonicalExportConfig(
             chunk_frames=args.chunk_frames,
             compression_level=args.compression_level,
-            expected_task_name=task_name,
         )
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
@@ -204,6 +205,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ValueError,
         yaml.YAMLError,
     ) as exc:
+        traceback.print_exc()
         print(f"Export failed: {exc}", file=sys.stderr)
         return 1
     finally:

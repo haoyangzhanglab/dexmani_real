@@ -36,6 +36,20 @@ DATASET_SPECS = {
 }
 
 
+# Host monotonic ns; zero means unknown/not called (including historical Raw).
+ROW_INFO_SPECS = {
+    "observation_timestamp_ns": _spec(np.int64),
+    "arm_read_timestamp_ns": _spec(np.int64),
+    "hand_read_timestamp_ns": _spec(np.int64),
+    "camera_timestamp_ns": _spec(np.int64),
+    "color_frame_number": _spec(np.int64),
+    "depth_frame_number": _spec(np.int64),
+    "dispatch_timestamp_ns": _spec(np.int64),
+    "dispatch_status": _spec(np.uint8, (2,)),
+}
+DATASET_SPECS.update(ROW_INFO_SPECS)
+
+
 def validate_data_layout(shapes, dtypes, *, frame_count: int) -> tuple[str, ...]:
     """Check required raw arrays, row counts, shapes, and dtypes."""
     errors = []

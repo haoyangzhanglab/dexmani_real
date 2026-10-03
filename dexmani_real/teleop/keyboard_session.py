@@ -10,7 +10,6 @@ from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_config
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.robot.commands import RobotCommand
-from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.robot.robot import DexManiRobot, DispatchError
 from dexmani_real.runtime.observation import read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput
@@ -32,6 +31,12 @@ logger = get_logger(__name__)
 
 
 def run_keyboard_experiment(runtime, *, no_hand):
+    cfg = runtime.keyboard_teleop
+    cfg.validate()
+    if 2 * cfg.workspace_command_margin_m >= float(
+        np.diff(runtime.policy.workspace.as_array(), axis=1).min()
+    ):
+        raise ValueError("keyboard workspace command margin leaves no interior workspace")
     if not runtime.policy.hand_enabled and not no_hand:
         raise ValueError("hand-disabled operation requires --no-hand")
     ctx = mp.get_context("spawn")
@@ -72,14 +77,9 @@ def run_keyboard_experiment(runtime, *, no_hand):
             planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
         robot.connect()
         require_transition(shared, SafetyState.ARMED)
-        home_result = home_hand(shared, runtime, robot=robot)
-        if home_result.interrupted:
-            clean = True
-            shared.quit_requested.value = True
-        elif not home_result.ok:
-            raise RuntimeError(f"hand home failed: {home_result.reason}")
-        else:
-            keys.start()
+        keys.start()
+        if not keys.healthy:
+            raise RuntimeError("keyboard stop listener unavailable")
         robot.check_services = lambda: supervisor.check() and keys.healthy
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         rate = LoopRate(cfg.control_hz, label="keyboard_teleop", busy_wait=False)

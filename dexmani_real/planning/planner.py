@@ -29,10 +29,6 @@ __all__ = [
     "XArm7MotionPlanner",
 ]
 
-_PATH_SCORE_JOINT_LENGTH_WEIGHT = 1.0
-_PATH_SCORE_WAYPOINT_DELTA_WEIGHT = 2.0
-_PATH_SCORE_EEF_EFFICIENCY_WEIGHT = 3.0
-
 
 @dataclass(kw_only=True)
 class XArm7PlannerConfig:
@@ -55,7 +51,7 @@ class MotionPlanningConfig:
     max_waypoint_delta_deg: float = 15.0
     max_pose_error_pos_m: float = 0.005
     max_pose_error_rot_rad: float = 0.05
-    rrt_range_options: tuple[float, ...] = (0.05, 0.12)
+    rrt_range: float = 0.12
     simplify_path: bool = True
     check_self_collision: bool = True
 
@@ -143,7 +139,9 @@ class XArm7MotionPlanner:
             logger.debug("URDF joint limits match ArmParams (ok)")
 
         dof = int(joint_limits.shape[0])
-        equivalent_joint_mask = (joint_limits[:, 1] - joint_limits[:, 0]) > 2 * np.pi
+        from dexmani_real.robot.model import XARM7_EQUIVALENT_JOINT_MASK
+
+        equivalent_joint_mask = np.asarray(XARM7_EQUIVALENT_JOINT_MASK, dtype=bool)
 
         base_pose_world = config.base_pose_world.copy()
 
@@ -238,7 +236,7 @@ class XArm7MotionPlanner:
         target_qpos = self.ik_geometry.canonicalize_qpos(target_qpos, current_qpos)
         target_pose_world = self.kin.compute_eef_pose_world(target_qpos)
         profile = self.planning_profile
-        rrt_range = max(profile.rrt_range_options) if profile.rrt_range_options else 0.12
+        rrt_range = profile.rrt_range
         result = self.mplib_planner.plan_qpos(
             goal_qposes=[target_qpos],
             current_qpos=current_qpos,
@@ -415,11 +413,6 @@ class XArm7MotionPlanner:
 
             if failure is None:
                 # All checks passed.
-                report["path_score"] = float(
-                    _PATH_SCORE_JOINT_LENGTH_WEIGHT * report.get("joint_path_length", 0.0)
-                    + _PATH_SCORE_WAYPOINT_DELTA_WEIGHT * report.get("max_waypoint_delta_rad", 0.0)
-                    + _PATH_SCORE_EEF_EFFICIENCY_WEIGHT * (1.0 - report.get("eef_efficiency", 1.0))
-                )
                 if attempt_label == "unsmoothed":
                     logger.debug(
                         "validate_path: smoothed path failed (%s), unsmoothed fallback passed "
@@ -554,26 +547,14 @@ class XArm7MotionPlanner:
     ) -> dict[str, Any]:
         diff = np.diff(path, axis=0) if len(path) > 1 else np.zeros((0, self.dof), dtype=np.float64)
         max_step = float(np.max(np.abs(diff))) if len(diff) > 0 else 0.0
-        path_length = float(np.sum(np.linalg.norm(diff, axis=1))) if len(diff) > 0 else 0.0
         terminal_pos_error, terminal_rot_error = self.kin.compute_world_pose_error(
             target_eef_pose_world, path[-1]
         )
 
-        eef_efficiency = 1.0
-        if len(path) >= 3:
-            eef_positions = np.array(
-                [self.kin.compute_eef_pose_world(q).p for q in path], dtype=np.float64
-            )
-            eef_deltas = np.diff(eef_positions, axis=0)
-            eef_path_len = float(np.sum(np.linalg.norm(eef_deltas, axis=1)))
-            eef_straight = float(np.linalg.norm(eef_positions[-1] - eef_positions[0]))
-            if eef_path_len > 1e-8:
-                eef_efficiency = eef_straight / eef_path_len
         limits = self.ik_geometry.resolve_planning_limits(profile, current_qpos)
         outside, violation = self.ik_geometry.path_limit_violation(path, limits)
         report = {
             "num_waypoints": int(len(path)),
-            "joint_path_length": path_length,
             "max_waypoint_delta_rad": max_step,
             "max_waypoint_delta_deg": float(np.rad2deg(max_step)),
             "start_qpos_error_rad": float(
@@ -582,7 +563,6 @@ class XArm7MotionPlanner:
             "terminal_pos_error_m": terminal_pos_error,
             "terminal_rot_error_rad": terminal_rot_error,
             "limit_violation": bool(np.any(outside)),
-            "eef_efficiency": eef_efficiency,
         }
         if np.any(outside):
             waypoint_indices, joint_indices = np.where(outside)

@@ -15,14 +15,13 @@ from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.hardware import CameraParams
 from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
 from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT
-from dexmani_real.recording.storage.video import VideoDecoder, VideoEncoder
+from dexmani_real.recording.storage.video import VideoEncoder
 from dexmani_real.sensor.camera.geometry import RGBDGeometry, validate_aligned_depth_distortion
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 from dexmani_real.utils.geometry import validate_rigid_transform, validate_unit_quaternion_wxyz
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-HARD_MAX_RECORD_FRAMES = 10_000
 RECORDER_START_TIMEOUT_S = 10.0
 RECORDER_STOP_TIMEOUT_S = 60.0
 _COLLECTION_SOURCES = frozenset({"teleop", "policy_rollout"})
@@ -43,14 +42,20 @@ def snapshot_recording_metadata(shared, runtime, *, collection_source):
     if not serial.strip():
         raise ValueError("recording START requires a nonempty camera serial")
     geometry = RGBDGeometry.from_dict(json.loads(shared.camera_geometry.value.decode("utf-8")))
-    calibration = CameraExtrinsics()
-    name = calibration.resolve_name_by_serial(serial)
-    if calibration.to_meta_dict(name, expected_serial=serial)["camera_type"] != "eye_to_hand":
-        raise ValueError("Raw recording requires eye-to-hand camera calibration")
+    transform = None
+    try:
+        calibration = CameraExtrinsics()
+        name = calibration.resolve_name_by_serial(serial)
+        if calibration.to_meta_dict(name, expected_serial=serial)["camera_type"] == "eye_to_hand":
+            transform = calibration.get_extrinsics(name)
+        else:
+            logger.warning("Recording without static eye-to-hand extrinsics")
+    except (FileNotFoundError, KeyError, ValueError) as exc:
+        logger.warning("Recording without camera extrinsics: %s", exc)
     return dict(
         collection_source=collection_source,
         camera_geometry=geometry,
-        camera_T_xarm_base_from_color=calibration.get_extrinsics(name),
+        camera_T_xarm_base_from_color=transform,
         depth_scale=float(shared.camera_depth_scale.value),
         handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
         handbase_quat_eef_wxyz=runtime.hand.T_eef_handbase_quat_wxyz,
@@ -101,17 +106,13 @@ class AsyncEpisodeRecorder:
     def __init__(
         self,
         data_dir,
-        max_frames=HARD_MAX_RECORD_FRAMES,
         control_hz=16.0,
         rgb_shape=None,
         video_config=None,
     ):
         if not np.isfinite(control_hz) or control_hz <= 0:
             raise ValueError("recording control_hz must be finite and positive")
-        if type(max_frames) is not int or not 0 < max_frames <= HARD_MAX_RECORD_FRAMES:
-            raise ValueError(f"max_frames must be in [1, {HARD_MAX_RECORD_FRAMES}]")
         self.data_dir = Path(data_dir)
-        self.max_frames = max_frames
         self.control_hz = float(control_hz)
         self._rgb_shape = tuple(rgb_shape or CameraParams().rgb_shape)
         if len(self._rgb_shape) != 3 or self._rgb_shape[2] != 3 or min(self._rgb_shape) <= 0:
@@ -131,10 +132,6 @@ class AsyncEpisodeRecorder:
         self._frame_count = 0
         self._written_frames = 0
         self._saved = False
-        self._collection_source = None
-        self._discard_reason = None
-        self._last_step_ns = None
-        self._max_gap_ns = 2e9 / self.control_hz
 
     @property
     def is_recording(self):
@@ -151,25 +148,11 @@ class AsyncEpisodeRecorder:
 
     @property
     def resources_released(self):
-        return (
-            (self._thread is None or not self._thread.is_alive())
-            and self._handles_released
-            and self._temp_dir is None
-        )
+        return (self._thread is None or not self._thread.is_alive()) and self._handles_released
 
     @property
     def accepting_frames(self):
-        return self._recording and self._discard_reason is None
-
-    @property
-    def discard_reason(self):
-        """First technical failure invalidating the current teleop capture."""
-        return self._discard_reason
-
-    def mark_discard(self, reason):
-        """Latch a teleop capture as discard-only without closing live resources."""
-        if self._recording and self._collection_source == "teleop" and self._discard_reason is None:
-            self._discard_reason = reason
+        return self._recording and self._error is None
 
     def _store_error(self, error):
         if self._error is None:
@@ -217,9 +200,12 @@ class AsyncEpisodeRecorder:
             raise ValueError("depth_scale must be numeric") from exc
         if not np.isfinite(depth_scale_value) or depth_scale_value <= 0.0:
             raise ValueError("depth_scale must be finite and positive")
-        transform = validate_rigid_transform(
-            camera_T_xarm_base_from_color,
-            label="camera_T_xarm_base_from_color",
+        transform = (
+            None
+            if camera_T_xarm_base_from_color is None
+            else validate_rigid_transform(
+                camera_T_xarm_base_from_color, label="camera_T_xarm_base_from_color"
+            )
         )
         handbase_position, handbase_quaternion = _validate_hand_mount(
             handbase_position_eef_m,
@@ -236,7 +222,11 @@ class AsyncEpisodeRecorder:
             "camera_color_distortion_coeffs": np.asarray(
                 color.distortion_coeffs, dtype=np.float64
             ).copy(),
-            "camera_T_xarm_base_from_color": transform.reshape(-1).copy(),
+            **(
+                {"camera_T_xarm_base_from_color": transform.reshape(-1).copy()}
+                if transform is not None
+                else {"camera_extrinsics_missing": True}
+            ),
             "depth_scale": depth_scale_value,
             "handbase_position_eef_m": handbase_position,
             "handbase_quat_eef_wxyz": handbase_quaternion,
@@ -298,9 +288,6 @@ class AsyncEpisodeRecorder:
             self._abort = self._save = self._saved = False
             self._reason = ""
             self._frame_count = self._written_frames = 0
-            self._collection_source = collection_source
-            self._discard_reason = None
-            self._last_step_ns = None
             self._thread = threading.Thread(
                 target=self._write_episode, args=(metadata,), name="episode-writer", daemon=False
             )
@@ -319,35 +306,17 @@ class AsyncEpisodeRecorder:
                     self._thread.join(timeout=RECORDER_STOP_TIMEOUT_S)
                 else:
                     self._thread = None
-                    if self._temp_dir is not None:
-                        try:
-                            shutil.rmtree(self._temp_dir)
-                            self._temp_dir = None
-                        except Exception:
-                            logger.error("Recording staging cleanup failed", exc_info=True)
             except Exception:
                 logger.exception("Recording START cleanup also failed")
             if not isinstance(exc, Exception):
                 raise
             raise RecordingError(f"recording START failed: {exc}") from exc
 
-    def add_frame(self, frame, *, step_timestamp_ns):
-        """Submit references only; discard-only captures remain cheap no-ops."""
+    def add_frame(self, frame):
+        """Submit owned references to the bounded writer queue."""
         self.check_error()
         if not self.accepting_frames:
             return
-        if self._frame_count >= self.max_frames:
-            error = RecordingError(f"recording exceeded hard frame limit {self.max_frames}")
-            self._store_error(error)
-            raise error
-        if self._collection_source == "teleop":
-            if step_timestamp_ns <= 0 or (
-                self._last_step_ns is not None
-                and not 0 < step_timestamp_ns - self._last_step_ns <= self._max_gap_ns
-            ):
-                self.mark_discard("cadence_discontinuity")
-                return
-            self._last_step_ns = step_timestamp_ns
         try:
             self._queue.put_nowait(frame)
         except Full as exc:
@@ -363,8 +332,8 @@ class AsyncEpisodeRecorder:
         self._finish(save=False, reason=reason)
 
     def close(self):
-        """Discard an unfinished capture; callers must already have revoked motion."""
-        self._finish(save=False, reason="close")
+        """Save an unfinished prefix; callers must already have revoked motion."""
+        self._finish(save=True, reason="close")
 
     def _finish(self, *, save, reason):
         self._recording = False
@@ -372,8 +341,8 @@ class AsyncEpisodeRecorder:
         if thread is None:
             self.check_error()
             return None
-        self._save = save and self._error is None and self._discard_reason is None
-        self._reason = self._discard_reason or reason
+        self._save = save and self._error is None
+        self._reason = reason
         deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
         if thread.is_alive() and not self._abort:
             while thread.is_alive():
@@ -399,7 +368,7 @@ class AsyncEpisodeRecorder:
     def _write_episode(self, metadata):
         video = data = None
         rows = []
-        dispatch_results = []
+        missing_tactile = {"hand_contact": 0, "hand_tactile_force": 0}
         last_selected = last_dispatch_detail = None
         staging = self._temp_dir
         self._handles_released = False
@@ -410,7 +379,9 @@ class AsyncEpisodeRecorder:
             meta.attrs["control_hz"] = self.control_hz
             meta.attrs["execution_path"] = "synchronous_direct_sdk_v1"
             meta.attrs["observation_action_pairing"] = "control_tick_input_and_attempted_targets"
-            meta.attrs["robot_timestamp_source"] = "host_read_completion"
+            meta.attrs["robot_timestamp_source"] = "host_monotonic_read_completion"
+            meta.attrs["camera_timestamp_source"] = "host_monotonic_camera_queue_return"
+            meta.attrs["time_missing_value"] = 0
             meta.attrs["dispatch_status_codes"] = (
                 "0:not_called,1:accepted,2:crc_unconfirmed,3:rejected,4:unknown"
             )
@@ -457,17 +428,8 @@ class AsyncEpisodeRecorder:
                     raise ValueError("recording requires RGB-D for every row")
                 if frame.camera_rgb.shape != self._rgb_shape or frame.camera_rgb.dtype != np.uint8:
                     raise ValueError("RGB shape or dtype mismatch")
-                if self._collection_source == "teleop" and not all(
-                    np.isfinite(frame.data[key]).all()
-                    for key in (
-                        "arm_qpos",
-                        "hand_qpos",
-                        "action_arm_joint_target",
-                        "action_hand_joint_target",
-                    )
-                ):
-                    raise ValueError("teleop requires finite states and dispatched targets")
-                dispatch_results.append(frame.dispatch)
+                for name in missing_tactile:
+                    missing_tactile[name] += int(not np.isfinite(frame.data[name]).all())
                 last_selected = frame.selected
                 last_dispatch_detail = frame.dispatch_detail
                 video.write_frame(frame.camera_rgb)
@@ -483,9 +445,15 @@ class AsyncEpisodeRecorder:
                     meta.attrs["format"] = RAW_FORMAT
                     meta.attrs["num_frames"] = self._written_frames
                     meta.attrs["termination_reason"] = self._reason
-                    meta.attrs["dispatch_status"] = np.asarray(
-                        dispatch_results, dtype=np.uint8
-                    ).reshape(-1, 2)
+                    for name, count in missing_tactile.items():
+                        meta.attrs[f"{name}_missing_rows"] = count
+                        if count:
+                            logger.warning(
+                                "Recording %s missing: %d/%d rows",
+                                name,
+                                count,
+                                self._written_frames,
+                            )
                     if last_dispatch_detail is not None:
                         meta.attrs["final_dispatch_result"] = json.dumps(
                             last_dispatch_detail, allow_nan=False
@@ -506,7 +474,6 @@ class AsyncEpisodeRecorder:
                     or data.depth_frames != self._written_frames
                 ):
                     raise RuntimeError("recording accepted/written/camera row count mismatch")
-                self._validate_temp_episode(staging, self._written_frames)
                 atomic_publish(staging, self._episode_dir, cancelled=lambda: self._abort)
                 self._saved = True
                 logger.info(
@@ -524,6 +491,7 @@ class AsyncEpisodeRecorder:
                 )
         except BaseException as exc:
             self._store_error(exc)
+            logger.exception("Recording failed; staging retained: %s", staging)
         finally:
             # Report failure before cleanup, which may itself block on storage.
             self._ready.set()
@@ -537,7 +505,7 @@ class AsyncEpisodeRecorder:
                         self._store_error(exc)
                         logger.error("Recording resource close failed", exc_info=True)
             self._handles_released = released
-            if released:
+            if released and self._error is None:
                 try:
                     if staging.exists():
                         shutil.rmtree(staging)
@@ -551,15 +519,3 @@ class AsyncEpisodeRecorder:
                     self._queue.get_nowait()
                 except Empty:
                     break
-
-    @staticmethod
-    def _validate_temp_episode(temp_dir, expected_frames):
-        from dexmani_real.recording.storage.reader import EpisodeReader
-
-        with EpisodeReader(temp_dir) as reader:
-            reader.require_fields(*DATASET_SPECS, "rgb", "depth")
-            if reader.num_frames != expected_frames:
-                raise RuntimeError("data.h5 frame count metadata mismatch")
-        with VideoDecoder(temp_dir / "rgb.mp4") as decoder:
-            if decoder.frame_count != expected_frames:
-                raise RuntimeError("RGB video frame count mismatch")

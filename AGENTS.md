@@ -75,18 +75,18 @@ Raw 是实验 evidence。Raw immutability 从 capture 成功发布为 Raw 后开
 - demonstration 和 rollout 都保留真实实验边界；
 - processed data 从 Raw 派生，训练筛选不回写 Raw。
 
-尚未发布的 Teleop capture 仍处于 acquisition / Raw-publication admission 阶段。
-control failure、publication failure 或 cadence contract failure 可以使整个 capture invalid。
-当前项目将 technical-invalid unpublished Teleop capture 整体 discard，不发布为 Raw；
-这是 acquisition / Raw-publication admission policy，不是修改或删除已发布 Raw。
-此规则不改变 rollout failure semantics，也不意味着所有失败实验都应 discard。
+停止、晚帧、控制失败和 technical-invalid capture 保留已采前缀及结束原因；
+仅操作者显式重录/丢弃才删除当前 capture。writer/编码/发布失败保留 staging，
+不能将损坏文件报告为成功 Raw；已发布 Raw 仍不可变。
+采集保留全部已接入物理模态，公共导出保留全部 13 字段，下游按模型所需字段筛选。
+辅助缺测保留 NaN/有效性与 dispatch，不冒充有效零值，不作为整段自动删除依据。
 
 ### Processed Data
 
 Canonical / processed dataset 是可重建训练缓存。
 
 - processing 必须明确、可追溯；
-- 对训练所需数值保持严格有效性检查；
+- 在实际模型输入处检查其所需数值；公共导出允许辅助缺测；
 - 不静默补模态、删坏帧、插值或改变时间语义，除非这是明确研究设计；
 - 处理逻辑实质变化时优先从 Raw 重新导出；
 - 不默认维护旧缓存 migration / compatibility。
@@ -101,6 +101,9 @@ camera extrinsics、desk plane、hand mount、VR alignment 等是**当前实验�
 - 不将一次历史标定值硬编码为长期契约；
 - 不用历史标定数值判断新的实验是否“兼容”；
 - 训练 artifact 只保存真正与训练 numerical representation 相关的信息；
+- 桌面、安装/运动学使用代码当前配置，不要求采集快照或历史一致性准入；
+- 触觉导出直接使用采集保存值，不重复扣偏置；
+- 相机保留数据对应的内外参和 depth scale，缺外参不阻止保存物理观测；
 - 真机运行使用当前实验环境的有效标定。
 
 ## Architecture
@@ -177,7 +180,7 @@ real robot
 - `README.md`：项目定位、workflow、quick start、主要入口。
 - `AGENTS.md`：代码代理的长期工作规则。
 - `CLAUDE.md`：Claude 的精简入口，不重复整份 AGENTS。
-- 临时 task / migration / acceptance notes 不作为长期根目录文档。
+- 临时 task / migration / acceptance notes 不作为长期根目录文档；用户明确指定的本次根目录任务书保留。
 
 README 不维护容易过时的类清单、字段级 runtime contract、状态机细节或历史重构说明。
 

@@ -137,22 +137,22 @@ def validate_config(cfg: ExperimentConfig) -> None:
         cfg.policy.ema,
         cfg.policy.vr_mapping,
         cfg.policy.workspace,
-        cfg.keyboard_teleop,
         cfg.vr,
         cfg.safety,
         cfg.camera,
-        cfg.tag_retargeting,
-        cfg.dexpilot_retargeting,
         cfg.environment,
         cfg.environment.table,
         *cfg.environment.static_boxes,
     ):
         section.validate()
+    if cfg.policy.hand_enabled:
+        (
+            cfg.tag_retargeting
+            if cfg.policy.hand_retargeting_type == "tag"
+            else cfg.dexpilot_retargeting
+        ).validate()
     # PointCloudConfig owns its external persisted-policy validation in its
     # constructor, shared with raw-to-policy conversion.
-    widths = np.diff(cfg.policy.workspace.as_array(), axis=1)
-    if 2 * cfg.keyboard_teleop.workspace_command_margin_m >= float(widths.min()):
-        raise ValueError("keyboard workspace command margin leaves no interior workspace")
 
 
 def resolve_table_plane_path(table: TableCollisionConfig) -> Path:

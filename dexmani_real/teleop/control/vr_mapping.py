@@ -22,17 +22,6 @@ def _finite_vector(value: np.ndarray, shape: tuple[int, ...], name: str) -> np.n
     return array.copy()
 
 
-def _clip_signed_axis_angle(
-    rot: np.ndarray, max_abs_angle_rad: float
-) -> tuple[np.ndarray, float, bool]:
-    """Clamp a rotation's signed axis-angle magnitude symmetrically."""
-    axis, angle = mat2axangle(rot)
-    if abs(angle) <= max_abs_angle_rad:
-        return rot, float(angle), False
-    clipped_angle = float(np.copysign(max_abs_angle_rad, angle))
-    return axangle2mat(axis, clipped_angle, is_normalized=True), float(angle), True
-
-
 class VRWristMapper:
     """Reset-relative wrist mapper using one fixed VR-to-robot calibration."""
 
@@ -42,14 +31,11 @@ class VRWristMapper:
         rot_scale: float = 1.0,
         vr_to_robot_rot: np.ndarray | None = None,
         base_to_world_rot: np.ndarray | None = None,
-        max_delta_rot_rad: float = 1.0,
     ) -> None:
         if not np.isfinite(pos_scale):
             raise ValueError("pos_scale must be finite")
         if not np.isfinite(rot_scale) or rot_scale < 0:
             raise ValueError("rot_scale must be finite and >= 0")
-        if not np.isfinite(max_delta_rot_rad) or max_delta_rot_rad <= 0:
-            raise ValueError("max_delta_rot_rad must be finite and > 0")
         self.pos_scale = pos_scale
         self.rot_scale = rot_scale
         self.vr_to_robot_rot = (
@@ -62,10 +48,10 @@ class VRWristMapper:
             if base_to_world_rot is None
             else validate_rotation_matrix(base_to_world_rot, name="base_to_world_rot")
         )
-        self.max_delta_rot_rad = max_delta_rot_rad
 
         self.wrist_pos0: np.ndarray | None = None
-        self.wrist_rot0: np.ndarray | None = None
+        self.previous_wrist_rot: np.ndarray | None = None
+        self.scaled_delta_rot: np.ndarray | None = None
         self.eef_pos0: np.ndarray | None = None
         self.eef_rot0: np.ndarray | None = None
         self.last_quat_wxyz: np.ndarray | None = None
@@ -91,7 +77,8 @@ class VRWristMapper:
             )
             return
         self.wrist_pos0 = next_wrist_pos0
-        self.wrist_rot0 = next_wrist_rot0
+        self.previous_wrist_rot = next_wrist_rot0
+        self.scaled_delta_rot = np.eye(3)
         self.eef_pos0 = next_eef_pos0
         self.eef_rot0 = next_eef_rot0
         # Seed the quaternion in WORLD coordinates for continuity checks.
@@ -118,9 +105,11 @@ class VRWristMapper:
         # Rotate the base-frame delta into world coordinates before adding it.
         delta_pos_world = self.base_to_world_rot @ delta_pos_base
 
-        delta_rot_vr = wrist_rot @ self.wrist_rot0.T  # type: ignore[union-attr]  # is_ready() gate above implies reset() ran (wrist_rot0 set)
-        delta_rot_vr = self.scale_rot(delta_rot_vr)
-        delta_rot_vr = self._clip_total_delta_rot(delta_rot_vr)
+        # Scale local SO(3) increments, avoiding the total-angle branch at pi.
+        increment = wrist_rot @ self.previous_wrist_rot.T
+        self.scaled_delta_rot = self.scale_rot(increment) @ self.scaled_delta_rot
+        self.previous_wrist_rot = wrist_rot
+        delta_rot_vr = self.scaled_delta_rot
         # Re-express the VR rotation delta in robot-base axes.
         delta_rot_base = self.vr_to_robot_rot @ delta_rot_vr @ self.vr_to_robot_rot.T
         delta_rot_world = self.base_to_world_rot @ delta_rot_base @ self.base_to_world_rot.T
@@ -138,7 +127,7 @@ class VRWristMapper:
             logger.warning("VRWristMapper.map: non-finite mapped pose — no target")
             return None
 
-        # Commit temporal state only after input and output validation succeeds.
+        # Retain the quaternion sign for the next target.
         self.last_quat_wxyz = target_quat_wxyz.copy()
 
         return {
@@ -148,7 +137,8 @@ class VRWristMapper:
 
     def clear(self) -> None:
         self.wrist_pos0 = None
-        self.wrist_rot0 = None
+        self.previous_wrist_rot = None
+        self.scaled_delta_rot = None
         self.eef_pos0 = None
         self.eef_rot0 = None
         self.last_quat_wxyz = None
@@ -158,7 +148,8 @@ class VRWristMapper:
             value is not None
             for value in (
                 self.wrist_pos0,
-                self.wrist_rot0,
+                self.previous_wrist_rot,
+                self.scaled_delta_rot,
                 self.eef_pos0,
                 self.eef_rot0,
             )
@@ -169,22 +160,3 @@ class VRWristMapper:
             return rot
         axis, angle = mat2axangle(rot)
         return axangle2mat(axis, self.rot_scale * angle, is_normalized=True)
-
-    def _clip_total_delta_rot(self, delta_rot: np.ndarray) -> np.ndarray:
-        """Clamp total-from-reset rotation delta to prevent VR tracking glitches.
-
-        Catches accumulated drift from the reset pose before it reaches IK.
-        Note: this is NOT per-frame — it clips the total rotation since reset().
-        """
-        clipped, angle, was_clamped = _clip_signed_axis_angle(delta_rot, self.max_delta_rot_rad)
-        if was_clamped:
-            logger.warning(
-                "Total-from-reset rotation clamped: %.1f° -> %.1f° "
-                "(max_delta_rot_rad=%.1f°).  EEF orientation will not track "
-                "wrist beyond this limit.  Press B to re-calibrate at new pose.",
-                np.rad2deg(angle),
-                np.rad2deg(np.copysign(self.max_delta_rot_rad, angle)),
-                np.rad2deg(self.max_delta_rot_rad),
-            )
-            return clipped
-        return delta_rot

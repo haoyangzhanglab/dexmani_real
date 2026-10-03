@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from dexmani_real.robot.model import ARM_JOINT_SHAPE
+from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_EQUIVALENT_JOINT_MASK
 
 if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner
@@ -134,8 +134,10 @@ def wrap_nearest_equivalent(
     reference: np.ndarray,
     joint_limit_lower: tuple[float, ...],
     joint_limit_upper: tuple[float, ...],
+    *,
+    equivalent_mask=XARM7_EQUIVALENT_JOINT_MASK,
 ) -> np.ndarray:
-    """Shift joints with range > 2*pi to the nearest limit-valid equivalent.
+    """Shift physically equivalent axes to the nearest limit-valid representation.
 
     Uses integer multiples of 2*pi; other joints stay unchanged. Positions,
     reference and limits must be matching finite 1-D arrays in radians.
@@ -156,8 +158,9 @@ def wrap_nearest_equivalent(
         raise ValueError("qpos, reference, and joint limits must be finite")
     if np.any(lo > hi):
         raise ValueError("joint lower limits must not exceed upper limits")
-    joint_range = hi - lo
-    is_equiv = joint_range > 2.0 * np.pi
+    is_equiv = np.asarray(equivalent_mask, dtype=bool)
+    if is_equiv.shape != result.shape:
+        raise ValueError("equivalent mask must match joint shape")
 
     if not np.any(is_equiv):
         return result

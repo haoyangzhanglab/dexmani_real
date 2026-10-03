@@ -56,6 +56,16 @@ def load_trajectory(episode_path):
         ]
         if len(arm) == 0 or not all(np.isfinite(v).all() for v in (arm, hand, aq, hq)):
             raise ValueError("replay requires nonempty finite targets and robot states")
+        # Preserve the former reader check at the physical-motion consumer. Old
+        # recordings without dispatch evidence remain nominal target trajectories.
+        if (
+            "execution_path" in meta
+            or "dispatch_status" in reader.fields
+            or "dispatch_status" in meta
+        ):
+            statuses = reader.read_row_info("dispatch_status", 0, reader.num_frames)
+            if not np.isin(statuses, (1, 2)).all():
+                raise ValueError("physical replay requires continued dispatch for both devices")
         return TrajectoryData(
             path,
             len(arm),

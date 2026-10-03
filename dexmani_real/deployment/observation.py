@@ -44,10 +44,12 @@ def build_policy_observation(rows, policy_info, *, fingertip_runtime=None):
     ):
         if name in requested and not all(bool(row.hand[field][0]) for row in rows):
             return None
-    joint = np.stack([np.concatenate((r.arm["qpos"][0], r.hand["qpos"][0])) for r in rows]).astype(
-        np.float32
-    )
-    arrays = {"joint_state": joint}
+    arrays = {}
+    if requested & {"joint_state", "eef_pose", "fingertip_points"}:
+        joint = np.stack(
+            [np.concatenate((r.arm["qpos"][0], r.hand["qpos"][0])) for r in rows]
+        ).astype(np.float32)
+        arrays["joint_state"] = joint
     for name, field in (("contact_force", "tactile_aggregate"), ("tactile_force", "tactile_dense")):
         if name in requested:
             arrays[name] = np.stack([r.hand[field][0] for r in rows]).astype(np.float32)

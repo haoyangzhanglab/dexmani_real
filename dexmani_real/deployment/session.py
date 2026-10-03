@@ -8,7 +8,6 @@ from dexmani_real.deployment.config import (
     validate_max_running_s,
     validate_num_episodes,
     validate_policy_runtime_compatibility,
-    validate_recording_budget,
 )
 from dexmani_real.deployment.observation import build_fingertip_runtime
 from dexmani_real.deployment.operator import PolicyOperator
@@ -45,13 +44,11 @@ def run_policy_deployment(
     cloud_recipe = validate_policy_runtime_compatibility(info, runtime)
     max_running_s = validate_max_running_s(max_running_s)
     num_episodes = validate_num_episodes(num_episodes)
-    if recording_config is not None and (not execute or max_running_s is None):
-        raise ValueError("recorded evaluation requires execute and a finite run budget")
-    if recording_config is not None:
-        validate_recording_budget(info, max_running_s)
+    if recording_config is not None and not execute:
+        raise ValueError("recorded evaluation requires execute")
     fields = set(info.observation_fields)
     cloud = "point_cloud" in fields
-    # Cloud production needs a camera worker; pointcloud-only rows need no source-frame lookup.
+    # Cloud production needs a camera worker; recording also retains its source RGB-D.
     camera = cloud or "rgb" in fields or recording_config is not None
     points = cloud_recipe.num_points if cloud else runtime.pointcloud.num_points
     camera_calibration = CameraExtrinsics() if cloud else None

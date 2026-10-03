@@ -70,15 +70,12 @@ class TeleopController:
         )
         hand = None
         if cfg.policy.hand_enabled:
-            try:
-                proposal = compute_hand_command(
-                    self.hand_retargeter, row.vr, self.hand_observation_cache
-                )
-                if proposal is None:
-                    return None, False, intent
-                hand = proposal
-            except (ValueError, RuntimeError):
+            proposal = compute_hand_command(
+                self.hand_retargeter, row.vr, self.hand_observation_cache
+            )
+            if proposal is None:
                 return None, False, intent
+            hand = proposal
         realized = self.realizer.realize(
             ActionIntent("eef", intent, hand), row.arm["qpos"][0], self.previous_arm_command
         )
@@ -101,8 +98,6 @@ def execute_control_step(controller, shared, robot, row, recorder=None):
             result = robot.send_action(target)
         except DispatchError as exc:
             result = exc.result
-            if recorder is not None:
-                recorder.mark_discard("motion_revoked" if exc.revoked else "dispatch_rejected")
             revoke_motion_if_run_id(
                 shared,
                 epoch,
@@ -118,22 +113,24 @@ def execute_control_step(controller, shared, robot, row, recorder=None):
                 get_logger(__name__).exception("stop after teleop dispatch failure also failed")
                 if exc.revoked:
                     raise
+            finally:
+                if recorder is not None:
+                    recorder.add_frame(build_episode_frame(row, target, result))
             if exc.revoked:
                 return False, result, True
             raise
-    stamp = result.timestamp_ns if result is not None else 0
     if int(shared.run_id.value) != epoch:
-        if recorder is not None:
-            recorder.mark_discard("dispatch_rejected")
-        robot.stop()
+        try:
+            robot.stop()
+        finally:
+            if recorder is not None:
+                recorder.add_frame(build_episode_frame(row, target, result))
         return False, result, True
     if result is not None:
         controller.previous_arm_command = target.arm_qpos.copy()
         controller.smoothed_eef_position = intent[:3].copy()
         controller.smoothed_eef_quaternion = rot6d_to_quat_wxyz(intent[3:])
     if recorder is not None:
-        if not control_ok or result is None:
-            recorder.mark_discard("control_failure")
         if recorder.accepting_frames:
-            recorder.add_frame(build_episode_frame(row, target, result), step_timestamp_ns=stamp)
+            recorder.add_frame(build_episode_frame(row, target, result))
     return control_ok, result, False

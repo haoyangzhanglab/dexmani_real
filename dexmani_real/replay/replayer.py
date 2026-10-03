@@ -158,16 +158,27 @@ def replay_targets(shared, runtime, trajectory, keyboard, *, robot, hand_start_d
                 runtime.arm.joint_limit_lower,
                 runtime.arm.joint_limit_upper,
             )
-            for measured, recorded in (
+            start_pairs = [
                 (row.arm["qpos"][0], start_arm),
                 (row.hand["qpos"][0], trajectory.hand_qpos[0]),
-            ):
+            ]
+            if hand_start_duration_s > 0:
+                start_pairs.append((row.hand["qpos"][0], trajectory.action_hand_joint[0]))
+            for measured, recorded in start_pairs:
                 if np.max(np.abs(measured - recorded)) > np.deg2rad(10):
                     status, reason = (
                         ReplayStatus.REJECTED,
                         "start posture differs by more than 10 degrees",
                     )
                     break
+        if status == ReplayStatus.COMPLETED and hand_start_duration_s > 0:
+            target = trajectory.action_hand_joint[0]
+            if (
+                not np.isfinite(target).all()
+                or np.any(target < runtime.hand.qpos_min_rad)
+                or np.any(target > runtime.hand.qpos_max_rad)
+            ):
+                status, reason = ReplayStatus.REJECTED, "hand preparation target violates limits"
         if status == ReplayStatus.COMPLETED and not begin_motion(shared):
             status, reason = ReplayStatus.REJECTED, "motion authority unavailable"
         epoch = int(shared.run_id.value)
@@ -183,6 +194,7 @@ def replay_targets(shared, runtime, trajectory, keyboard, *, robot, hand_start_d
                 if interrupted is not None:
                     status, reason = interrupted.status, interrupted.reason
                     break
+                tick_start = time.monotonic()
                 row = read_observation(shared, runtime, robot)
                 if row is None:
                     status, reason = ReplayStatus.REJECTED, "robot feedback stale"
@@ -227,7 +239,7 @@ def replay_targets(shared, runtime, trajectory, keyboard, *, robot, hand_start_d
                 if dispatch_error is not None:
                     raise dispatch_error
                 interrupted = _wait_replay(
-                    shared, keyboard, epoch, stamp / 1e9 + 1 / trajectory.fps, robot
+                    shared, keyboard, epoch, tick_start + 1 / trajectory.fps, robot
                 )
                 if interrupted is not None:
                     status, reason = interrupted.status, interrupted.reason
@@ -258,6 +270,7 @@ def replay_targets(shared, runtime, trajectory, keyboard, *, robot, hand_start_d
         shared.estop_request.value = True
         raise
     except Exception as exc:
+        logger.exception("replay failed")
         status, reason = ReplayStatus.FAULT, str(exc)
         run_end_reason = RunEndReason.POLICY_FAILURE
         shared.error_state.value = True

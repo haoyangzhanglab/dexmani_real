@@ -56,8 +56,8 @@ class CalibrationConfig:
     """Session tuning parameters for interactive camera calibration."""
 
     min_samples: int = 10
-    max_consistency_std_mm: float = 5.0
-    max_consistency_rot_std_deg: float = 3.0
+    max_consistency_rms_mm: float = 5.0
+    max_consistency_rot_rms_deg: float = 3.0
     delta_pos_m: float = 0.008
     delta_rpy_rad: float = 0.03
     status_interval_frames: int = 50
@@ -66,8 +66,8 @@ class CalibrationConfig:
         if not isinstance(self.min_samples, int) or self.min_samples < 3:
             raise ValueError("min_samples must be at least 3")
         positive_fields = (
-            "max_consistency_std_mm",
-            "max_consistency_rot_std_deg",
+            "max_consistency_rms_mm",
+            "max_consistency_rot_rms_deg",
             "delta_pos_m",
             "delta_rpy_rad",
         )
@@ -267,7 +267,7 @@ def calibrate_and_select(
     rvec_marker2camera: list[np.ndarray],
     tvec_marker2camera: list[np.ndarray],
 ) -> tuple[np.ndarray, str, np.ndarray, np.ndarray, list[tuple[str, float]]]:
-    """Run all five hand-eye methods; return the best by position std.
+    """Run all five hand-eye methods; return the best by position residual RMS.
 
     Returns:
         (T_best, method_name, errors_mm, errors_deg, method_table).
@@ -291,13 +291,13 @@ def calibrate_and_select(
                 rvec_marker2camera,
                 tvec_marker2camera,
             )
-            std_mm = float(errors_mm.std())
+            rms_mm = float(np.sqrt(np.mean(errors_mm**2)))
         except Exception:
             table.append((name, float("nan")))
             continue
-        table.append((name, std_mm))
-        if best is None or std_mm < best[0]:
-            best = (std_mm, name, T, errors_mm, errors_deg)
+        table.append((name, rms_mm))
+        if best is None or rms_mm < best[0]:
+            best = (rms_mm, name, T, errors_mm, errors_deg)
 
     if best is None:
         raise RuntimeError("all hand-eye methods failed")

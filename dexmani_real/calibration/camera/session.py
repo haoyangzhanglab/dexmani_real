@@ -77,7 +77,7 @@ def _detect_aruco_stable(
     max_frame_age_s: float,
     n_frames: int = 5,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """Capture N frames and return median ArUco pose for noise reduction."""
+    """Capture N frames and return SO(3) mean rotation and median translation for noise reduction."""
     rvecs_all: list[np.ndarray] = []
     tvecs_all: list[np.ndarray] = []
     last_stamp = 0
@@ -109,7 +109,9 @@ def _detect_aruco_stable(
 
     if len(rvecs_all) < max(1, n_frames // 2):
         return None
-    return np.median(rvecs_all, axis=0), np.median(tvecs_all, axis=0)
+    return Rotation.from_rotvec(np.asarray(rvecs_all)).mean().as_rotvec(), np.median(
+        tvecs_all, axis=0
+    )
 
 
 def _build_planner(
@@ -185,7 +187,7 @@ def _calibration_capture_metadata(
     def _summary(values: np.ndarray) -> dict[str, float]:
         return {
             "mean": float(values.mean()),
-            "std": float(values.std()),
+            "rms": float(np.sqrt(np.mean(values**2))),
             "max": float(values.max()),
         }
 
@@ -238,8 +240,8 @@ def _solve_and_save_calibration(
         dtype=np.float64,
     )
     T_world_camera = T_world_base @ T_base_camera
-    position_std_mm = float(errors_mm.std())
-    rotation_std_deg = float(errors_deg.std())
+    position_rms_mm = float(np.sqrt(np.mean(errors_mm**2)))
+    rotation_rms_deg = float(np.sqrt(np.mean(errors_deg**2)))
     samples.set_residuals(errors_mm)
 
     print("  method consistency (mm, lower is better):")
@@ -250,11 +252,11 @@ def _solve_and_save_calibration(
     print(f"  quality ({method}, T_ee_marker consistency):")
     print(
         f"    position mean={errors_mm.mean():.1f}mm "
-        f"max={errors_mm.max():.1f}mm std={position_std_mm:.1f}mm"
+        f"max={errors_mm.max():.1f}mm rms={position_rms_mm:.1f}mm"
     )
     print(
         f"    rotation mean={errors_deg.mean():.2f}° "
-        f"max={errors_deg.max():.2f}° std={rotation_std_deg:.2f}°"
+        f"max={errors_deg.max():.2f}° rms={rotation_rms_deg:.2f}°"
     )
     worst_index = int(np.argmax(errors_mm))
     print("  per-frame residuals (mm, larger = more suspicious):")
@@ -268,13 +270,13 @@ def _solve_and_save_calibration(
     print(f"  T_world_camera position: {np.round(T_world_camera[:3, 3], 4)}m")
 
     rejection_reasons: list[str] = []
-    if position_std_mm > config.max_consistency_std_mm:
+    if position_rms_mm > config.max_consistency_rms_mm:
         rejection_reasons.append(
-            f"pos std={position_std_mm:.1f}mm > {config.max_consistency_std_mm:.1f}mm"
+            f"pos rms={position_rms_mm:.1f}mm > {config.max_consistency_rms_mm:.1f}mm"
         )
-    if rotation_std_deg > config.max_consistency_rot_std_deg:
+    if rotation_rms_deg > config.max_consistency_rot_rms_deg:
         rejection_reasons.append(
-            f"rot std={rotation_std_deg:.2f}° > {config.max_consistency_rot_std_deg:.1f}°"
+            f"rot rms={rotation_rms_deg:.2f}° > {config.max_consistency_rot_rms_deg:.1f}°"
         )
     if rejection_reasons:
         print(
@@ -302,7 +304,7 @@ def _solve_and_save_calibration(
         print(f"FAILED — {exc}, skipped")
         return None
     print(
-        f"  ACCEPTED ({method}, pos std={position_std_mm:.1f}mm, rot std={rotation_std_deg:.2f}°)"
+        f"  ACCEPTED ({method}, pos rms={position_rms_mm:.1f}mm, rot rms={rotation_rms_deg:.2f}°)"
     )
     return T_world_camera
 

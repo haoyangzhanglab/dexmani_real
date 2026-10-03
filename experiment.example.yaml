@@ -1,0 +1,27 @@
+# 复制为 experiment.yaml；核对当前物理安装/标定，再运行真机入口。
+arm:
+  ip: "192.168.1.233"
+hand:
+  comm_type: serial
+  device_name: /dev/ttyUSB0
+  device_id: 0
+camera:
+  serial: null  # 填现场 RealSense 序列号；null 使用驱动默认选择
+vr:
+  port: 8000
+policy:
+  hand_enabled: true
+  recording_enabled: true
+  hand_retargeting_type: tag
+  max_record_duration_s: 60.0
+  episodes_dir: episodes
+teleop:
+  control_hz: 16.0
+tag_retargeting:
+  prior_weight: 0.0
+dexpilot_retargeting:
+  prior_weight: 0.0
+environment:
+  table:
+    enabled: true
+    plane_path: dexmani_real/calibration/state/table_plane.json

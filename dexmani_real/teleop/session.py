@@ -3,9 +3,8 @@
 import multiprocessing as mp
 import os
 
-from dexmani_real.calibration import CAMERAS_PATH, VR_TRANSFORM_PATH
+from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
-from dexmani_real.recording.recorder import HARD_MAX_RECORD_FRAMES
 from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_RIGHT_URDF_PATH,
@@ -43,7 +42,6 @@ def _validate_recording_resources() -> None:
         XARM7_XHAND_COLLISION_URDF_PATH,
         XARM7_XHAND_RIGHT_URDF_PATH,
         XARM7_XHAND_SRDF_PATH,
-        CAMERAS_PATH,
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
@@ -54,16 +52,6 @@ def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, allow_no_hand
     task_name = validate_task_dir_name(task_name)
     if not runtime.policy.hand_enabled and (runtime.policy.recording_enabled or not allow_no_hand):
         raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")
-    if runtime.policy.recording_enabled:
-        requested_rows = round(runtime.policy.max_record_duration_s * runtime.teleop.control_hz)
-        if not 0 < requested_rows < HARD_MAX_RECORD_FRAMES:
-            raise ValueError(
-                f"teleop recording requests {requested_rows} rows; require 0 < rows < "
-                f"hard limit {HARD_MAX_RECORD_FRAMES} "
-                f"(max_record_duration_s={runtime.policy.max_record_duration_s}, "
-                f"control_hz={runtime.teleop.control_hz}). Configure a positive, shorter "
-                "episode budget instead of increasing the recorder hard guard."
-            )
     load_vr_transform(VR_TRANSFORM_PATH)
     if runtime.policy.recording_enabled:
         _validate_recording_resources()

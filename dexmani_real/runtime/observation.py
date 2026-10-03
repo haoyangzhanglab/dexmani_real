@@ -134,23 +134,14 @@ def read_observation(
 
 
 class ObservationHistory:
-    def __init__(self, n_obs_steps, control_dt_s):
+    def __init__(self, n_obs_steps):
         self.rows = deque(maxlen=n_obs_steps)
-        self.max_gap_ns = int(2 * control_dt_s * 1e9)
 
     def clear(self):
         self.rows.clear()
 
     def append(self, row):
-        if (
-            self.rows
-            and row.observation_timestamp_ns - self.rows[-1].observation_timestamp_ns
-            > self.max_gap_ns
-        ):
-            self.clear()
         self.rows.append(row)
 
-    def padded(self):
-        if not self.rows:
-            return ()
-        return (self.rows[0],) * (self.rows.maxlen - len(self.rows)) + tuple(self.rows)
+    def ready_rows(self):
+        return tuple(self.rows) if len(self.rows) == self.rows.maxlen else ()

@@ -29,10 +29,6 @@ class EpisodeDataWriter:
         self.depth_shape = depth_shape
         self.depth_frames = 0
 
-    @property
-    def datasets(self) -> Mapping[str, h5py.Dataset]:
-        return self._datasets
-
     def open(self) -> h5py.File:
         if self._file is None:
             self._file = h5py.File(self.path, "w")
@@ -66,15 +62,15 @@ class EpisodeDataWriter:
         """Append exactly this batch of newly emitted rows."""
         if not data:
             raise RuntimeError("episode row batch is empty")
-        canonical_values = next(
+        row_values = next(
             (values for name, values in data.items() if name in DATASET_SPECS),
             None,
         )
-        if canonical_values is None:
-            raise RuntimeError("episode row batch has no canonical data array")
-        count = len(canonical_values)
-        # Validate every canonical array before opening or resizing HDF5, so a
-        # malformed producer batch cannot leave a partial row in the transaction.
+        if row_values is None:
+            raise RuntimeError("episode row batch has no Raw data array")
+        count = len(row_values)
+        # Validate every Raw array before opening or resizing HDF5, so a
+        # malformed producer batch cannot leave a partially resized batch.
         errors = validate_data_layout(
             {name: values.shape for name, values in data.items()},
             {name: values.dtype for name, values in data.items()},

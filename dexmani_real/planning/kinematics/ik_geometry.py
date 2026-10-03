@@ -79,6 +79,7 @@ class IKGeometry:
             reference_qpos,
             tuple(np.asarray(limits)[:, 0]),
             tuple(np.asarray(limits)[:, 1]),
+            equivalent_mask=self.equivalent_joint_mask,
         )
 
     def canonicalize_path_to_planning_limits(

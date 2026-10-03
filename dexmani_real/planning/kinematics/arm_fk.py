@@ -13,7 +13,6 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_XHAND_COLLISION_URDF_PATH
-from dexmani_real.utils.geometry import validate_rotation_matrix
 
 from .pose import Pose, compose_pose, compute_pose_error, invert_pose, quat_wxyz_to_rotmat
 
@@ -66,10 +65,6 @@ class ArmFK:
             or not np.all(np.isfinite(R))
         ):
             raise RuntimeError("ArmFK produced a malformed or non-finite pose")
-        try:
-            R = validate_rotation_matrix(R, name="ArmFK rotation")
-        except ValueError as exc:
-            raise RuntimeError(f"ArmFK produced an invalid rotation: {exc}") from exc
         eef_rot6d = np.concatenate([R[:, 0], R[:, 1]]).astype(np.float64)
         return eef_pos, eef_rot6d
 

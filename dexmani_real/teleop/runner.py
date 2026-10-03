@@ -84,9 +84,7 @@ class TeleopRunner:
         self.next_tick = 0.0
         self.control_dt = 1 / self.runtime.teleop.control_hz
         self.failures = 0
-        self.max_rows = round(
-            self.runtime.policy.max_record_duration_s * self.runtime.teleop.control_hz
-        )
+        self.capture_started_s = 0.0
 
         self.home_planner = None
 
@@ -108,9 +106,9 @@ class TeleopRunner:
         if self.recorder is None or not self.recorder.is_recording:
             self.pending_termination_reason = None
             return
-        reason = self.recorder.discard_reason or self.pending_termination_reason or reason
+        reason = self.pending_termination_reason or reason
         published = None
-        if save and self.recorder.discard_reason is None:
+        if save:
             published = self.recorder.save_episode(reason=reason)
         else:
             self.recorder.discard_episode(reason=reason)
@@ -118,15 +116,14 @@ class TeleopRunner:
         if announce:
             self.audio.play("save" if published is not None else "discard")
 
-    def _invalidate_capture(self, reason, *, stop_motion=True):
+    def _stop_capture(self, reason, *, stop_motion=True):
         self._pause_control(
             reason, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY, stop_motion=stop_motion
         )
         logger.warning("Teleop paused: %s", reason)
         self.audio.play("emergency")
         if self.recorder is not None and self.recorder.is_recording:
-            self.recorder.mark_discard(reason)
-            self._finish_capture(False, reason, announce=False)
+            self._finish_capture(True, reason, announce=False)
 
     def _poll_blocking_commands(self, commands=()):
         self.robot.check()
@@ -171,6 +168,7 @@ class TeleopRunner:
                     self.shared, self.runtime, collection_source="teleop"
                 ),
             )
+        self.capture_started_s = time.monotonic()
         self.pending_termination_reason = None
         # Disk finalization/START may block. Never anchor to observations from
         # before that boundary or append across the operator's wall-clock pause.
@@ -260,7 +258,7 @@ class TeleopRunner:
                 # that result announcement when fresh observations arrive.
                 self.audio.queue(event)
                 return True
-            self._invalidate_capture("resume_unavailable" if self.active else "begin_unavailable")
+            self._stop_capture("resume_unavailable" if self.active else "begin_unavailable")
         return False
 
     def _execute_control_step(self, row):
@@ -269,25 +267,24 @@ class TeleopRunner:
         )
         if interrupted:
             logger.info("teleop interrupted: dispatch=%s", result)
-            self._invalidate_capture("motion_revoked", stop_motion=False)
+            self._stop_capture("motion_revoked", stop_motion=False)
             return
-        if self.recorder is not None and self.recorder.discard_reason is not None:
-            self._invalidate_capture(self.recorder.discard_reason)
+        if self.recorder is not None and not control_ok:
+            self._stop_capture("control_failure")
             return
-        if self.recorder is not None and self.recorder.frame_count >= self.max_rows:
+        if (
+            self.recorder is not None
+            and time.monotonic() - self.capture_started_s
+            >= self.runtime.policy.max_record_duration_s
+        ):
             self._pause_control("max_record_duration", run_end_reason=RunEndReason.TIMEOUT)
             self._finish_capture(True, "max_record_duration")
             return
-        self.next_tick += self.control_dt
-        finished = time.monotonic()
-        if self.next_tick <= finished:
-            # Do not burst through missed ticks after a slow control step.
-            # The recorder still checks actual dispatch cadence.
-            self.next_tick = finished + self.control_dt
+
         if self.recorder is None:
             self.failures = self.failures + 1 if not control_ok else 0
             if self.failures >= _DEBUG_FAILURE_LIMIT:
-                self._invalidate_capture("control_failure")
+                self._stop_capture("control_failure")
 
     def _wait_for_vr(self) -> bool:
         deadline = time.monotonic() + self.runtime.safety.readiness_timeouts_s["vr"]
@@ -333,7 +330,6 @@ class TeleopRunner:
             pos_scale=mapping.pos_scale,
             rot_scale=mapping.rot_scale,
             vr_to_robot_rot=calibration.transform,
-            max_delta_rot_rad=mapping.max_delta_rot_rad,
             base_to_world_rot=np.eye(3),
         )
         self.controller = TeleopController(
@@ -364,7 +360,7 @@ class TeleopRunner:
                 if not self.keyboard.healthy:
                     self.shared.estop_request.value = True
                 if self.shared.estop_request.value or self.shared.error_state.value:
-                    self._invalidate_capture(
+                    self._stop_capture(
                         "estop" if self.shared.estop_request.value else "runtime_failure"
                     )
                     break
@@ -405,6 +401,16 @@ class TeleopRunner:
                     continue
                 if not self.paused and time.monotonic() < self.next_tick:
                     continue
+                if (
+                    self.recorder is not None
+                    and self.recorder.is_recording
+                    and time.monotonic() - self.capture_started_s
+                    >= self.runtime.policy.max_record_duration_s
+                ):
+                    self._pause_control("max_record_duration", run_end_reason=RunEndReason.TIMEOUT)
+                    self._finish_capture(True, "max_record_duration")
+                    continue
+                self.next_tick = time.monotonic() + self.control_dt
                 row = read_observation(
                     self.shared,
                     self.runtime,
@@ -425,9 +431,9 @@ class TeleopRunner:
                             camera["timestamp_ns"], self.runtime.camera.max_frame_age_s
                         ):
                             revoke_motion(self.shared, reason=RunEndReason.HARDWARE_FAULT)
-                            self._invalidate_capture("camera_unavailable")
+                            self._stop_capture("camera_unavailable")
                             raise RuntimeError("required recording camera unavailable")
-                    self._invalidate_capture("observation_unavailable")
+                    self._stop_capture("observation_unavailable")
                     continue
                 if self.paused:
                     self._try_resume(row)
@@ -469,8 +475,7 @@ class TeleopRunner:
             try:
                 if self.recorder is not None:
                     if self.recorder.is_recording:
-                        self.recorder.mark_discard("interrupted")
-                        self._finish_capture(False, "interrupted", announce=False)
+                        self._finish_capture(True, "interrupted", announce=False)
             except Exception as exc:
                 if failure is None:
                     failure = exc

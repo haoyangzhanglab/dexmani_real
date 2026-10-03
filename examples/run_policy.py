@@ -182,13 +182,11 @@ def main(argv: list[str] | None = None) -> int:
             RolloutRecordingConfig,
             validate_num_episodes,
             validate_policy_runtime_compatibility,
-            validate_recording_budget,
         )
 
         runtime = resolve_experiment_config(yaml_path=args.config)
         validate_policy_runtime_compatibility(info, runtime)
         validate_num_episodes(args.num_episodes)
-        validate_recording_budget(info, args.max_running_s)
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
         _safe_selector_parts(selector)
     except Exception as exc:

@@ -13,11 +13,11 @@ from dexmani_real.config.pointcloud import PointCloudConfig
 
 
 def validate_task_identity(value: str) -> str:
-    """Validate the shared policy task identity, not a path component."""
+    """Validate an ordinary task label, not a path component."""
     if not isinstance(value, str):
         raise TypeError("task_name must be a string")
-    if not value or value == "unknown" or value != value.strip():
-        raise ValueError("task_name must be non-empty, trimmed, and not 'unknown'")
+    if not value.strip():
+        raise ValueError("task_name must be non-empty")
     if any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise ValueError("task_name must not contain control characters")
     return value
@@ -27,13 +27,15 @@ def validate_task_identity(value: str) -> str:
 class ProcessingConfig:
     """Point-cloud, fingertip and table transforms; output is always multimodal.
 
-    Every included episode retains joint targets, RGB-D, geometry, contact,
-    arm velocity/effort, hand current and derived geometry.
+    Every included episode retains all physical and derived fields; missing
+    floating-point measurements remain NaN in their original rows.
     """
 
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
     fingertip_link_names: tuple[str, ...] = HandParams.fingertip_link_names
+    handbase_position_eef_m: tuple[float, ...] = HandParams.T_eef_handbase_pos_xyz
+    handbase_quat_eef_wxyz: tuple[float, ...] = HandParams.T_eef_handbase_quat_wxyz
 
     @classmethod
     def from_runtime(cls, runtime: object, **overrides: Any) -> "ProcessingConfig":
@@ -42,6 +44,8 @@ class ProcessingConfig:
             "pointcloud": getattr(runtime, "pointcloud"),
             "table_plane_abcd": None,
             "fingertip_link_names": tuple(hand_config.fingertip_link_names),
+            "handbase_position_eef_m": tuple(hand_config.T_eef_handbase_pos_xyz),
+            "handbase_quat_eef_wxyz": tuple(hand_config.T_eef_handbase_quat_wxyz),
         }
         unknown = set(overrides) - {item.name for item in dataclasses.fields(cls)}
         if unknown:

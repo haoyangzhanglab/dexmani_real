@@ -34,17 +34,17 @@ class ReplayMetrics:
     replayed_frames: int = 0
     matching_frames: int = 0
 
-    arm_joint_mae_deg: np.ndarray = field(default_factory=lambda: np.zeros(ARM_JOINT_SHAPE))
-    arm_joint_rmse_deg: np.ndarray = field(default_factory=lambda: np.zeros(ARM_JOINT_SHAPE))
-    arm_joint_mae_overall_deg: float = 0.0
-    arm_joint_rmse_overall_deg: float = 0.0
+    arm_joint_mae_deg: np.ndarray = field(default_factory=lambda: np.full(ARM_JOINT_SHAPE, np.nan))
+    arm_joint_rmse_deg: np.ndarray = field(default_factory=lambda: np.full(ARM_JOINT_SHAPE, np.nan))
+    arm_joint_mae_overall_deg: float = float("nan")
+    arm_joint_rmse_overall_deg: float = float("nan")
 
-    eef_pos_error_mean_mm: float = 0.0
-    eef_pos_error_max_mm: float = 0.0
-    eef_pos_error_rmse_mm: float = 0.0
+    eef_pos_error_mean_mm: float = float("nan")
+    eef_pos_error_max_mm: float = float("nan")
+    eef_pos_error_rmse_mm: float = float("nan")
 
-    eef_rot_error_mean_deg: float = 0.0
-    eef_rot_error_max_deg: float = 0.0
+    eef_rot_error_mean_deg: float = float("nan")
+    eef_rot_error_max_deg: float = float("nan")
 
     eef_pos_error_per_frame_mm: np.ndarray | None = None
     eef_rot_error_per_frame_deg: np.ndarray | None = None
@@ -52,12 +52,18 @@ class ReplayMetrics:
     hand_joint_mae_overall_deg: float | None = None
     hand_joint_rmse_overall_deg: float | None = None
 
-    tracking_lag_frames: int = 0
-    tracking_lag_seconds: float = 0.0
+    tracking_lag_frames: int | None = None
+    tracking_lag_seconds: float = float("nan")
 
-    arm_tracking_error_mean_deg: float = 0.0
-    arm_tracking_error_p95_deg: float = 0.0
-    arm_tracking_error_max_deg: float = 0.0
+    arm_tracking_error_mean_deg: float = float("nan")
+    arm_tracking_error_p95_deg: float = float("nan")
+    arm_tracking_error_max_deg: float = float("nan")
+
+    valid_arm_frames: int = 0
+    valid_eef_position_frames: int = 0
+    valid_eef_rotation_frames: int = 0
+    valid_hand_frames: int = 0
+    tracking_lag_per_joint_frames: dict[int, int] = field(default_factory=dict)
 
 
 def _geodesic_distance_deg(rotation_a: np.ndarray, rotation_b: np.ndarray) -> float:
@@ -104,6 +110,7 @@ def compute_metrics(
     orig_q = original_arm_qpos[:frame_count]
     rep_q = replay_arm_qpos[:frame_count]
     valid = np.all(np.isfinite(orig_q), axis=1) & np.all(np.isfinite(rep_q), axis=1)
+    metrics.valid_arm_frames = int(valid.sum())
     if valid.sum() > 0:
         diff = np.abs(orig_q[valid] - rep_q[valid])
         metrics.arm_joint_mae_deg = np.rad2deg(np.mean(diff, axis=0))
@@ -117,6 +124,7 @@ def compute_metrics(
         valid_ee = np.all(np.isfinite(orig_ee_pos), axis=1) & np.all(
             np.isfinite(rep_ee_pos), axis=1
         )
+        metrics.valid_eef_position_frames = int(valid_ee.sum())
         if valid_ee.sum() > 0:
             pos_err = np.linalg.norm(orig_ee_pos[valid_ee] - rep_ee_pos[valid_ee], axis=1)
             metrics.eef_pos_error_per_frame_mm = pos_err * 1000.0
@@ -143,6 +151,7 @@ def compute_metrics(
                     rot_errs.append(np.nan)
             rot_errs_arr = np.array(rot_errs)
             finite = np.isfinite(rot_errs_arr)
+            metrics.valid_eef_rotation_frames = int(finite.sum())
             if finite.sum() > 0:
                 metrics.eef_rot_error_per_frame_deg = rot_errs_arr
                 metrics.eef_rot_error_mean_deg = float(np.mean(rot_errs_arr[finite]))
@@ -154,6 +163,7 @@ def compute_metrics(
             orig_h = original_hand_qpos[:hand_frame_count]
             rep_h = replay_hand_qpos[:hand_frame_count]
             valid_h = np.all(np.isfinite(orig_h), axis=1) & np.all(np.isfinite(rep_h), axis=1)
+            metrics.valid_hand_frames = int(valid_h.sum())
             if valid_h.sum() > 0:
                 diff_h = np.abs(orig_h[valid_h] - rep_h[valid_h])
                 metrics.hand_joint_mae_overall_deg = float(np.rad2deg(np.mean(diff_h)))
@@ -163,7 +173,13 @@ def compute_metrics(
         max_lag = max(int(np.ceil(fps * _TRACKING_LAG_WINDOW_S)), _MIN_TRACKING_LAG_FRAMES)
         joint_lags: list[int] = []
         for joint_index in range(ARM_JOINT_SHAPE[0]):
-            best_lag = 0
+            original_finite = orig_q[np.isfinite(orig_q[:, joint_index]), joint_index]
+            replay_finite = rep_q[np.isfinite(rep_q[:, joint_index]), joint_index]
+            if min(len(original_finite), len(replay_finite)) < _MIN_TRACKING_OVERLAP_FRAMES:
+                continue
+            if min(np.ptp(original_finite), np.ptp(replay_finite)) < np.deg2rad(1):
+                continue  # A stationary axis cannot identify temporal lag.
+            best_lag = None
             best_key = (float("inf"), float("inf"), 0)
             for lag in range(-max_lag, max_lag + 1):
                 if lag < 0:
@@ -183,10 +199,13 @@ def compute_metrics(
                 if candidate_key < best_key:
                     best_key = candidate_key
                     best_lag = lag
-            joint_lags.append(best_lag)
-        peak_lag = int(np.median(joint_lags))
-        metrics.tracking_lag_frames = peak_lag
-        metrics.tracking_lag_seconds = float(peak_lag) / fps
+            if best_lag is not None:
+                joint_lags.append(best_lag)
+                metrics.tracking_lag_per_joint_frames[joint_index] = best_lag
+        if joint_lags:
+            peak_lag = int(np.median(joint_lags))
+            metrics.tracking_lag_frames = peak_lag
+            metrics.tracking_lag_seconds = float(peak_lag) / fps
 
     if arm_tracking_error is not None:
         finite_tracking_error = arm_tracking_error[np.isfinite(arm_tracking_error)]
@@ -205,7 +224,11 @@ def report_consistency(metrics: ReplayMetrics) -> None:
     print("\n" + "=" * 60)
     print("Consistency Evaluation")
     print("=" * 60)
-    print(f"  Frames: {metrics.replayed_frames} replayed / {metrics.original_frames} original")
+    print(
+        f"  Frames: {metrics.replayed_frames} replayed / {metrics.original_frames} original; valid arm={metrics.valid_arm_frames}"
+    )
+    print("  Joint errors use absolute SDK angles; EEF errors use geometric pose equivalence.")
+    print(f"  Active-axis lag (frames): {metrics.tracking_lag_per_joint_frames}")
     print(
         f"  Arm joint MAE:  {np.round(metrics.arm_joint_mae_deg, 2)} deg  "
         f"(overall: {metrics.arm_joint_mae_overall_deg:.3f} deg)"
@@ -331,6 +354,12 @@ def save_results(
         "original_frames": metrics.original_frames,
         "replayed_frames": metrics.replayed_frames,
         "matching_frames": metrics.matching_frames,
+        "valid_frames": {
+            "arm": metrics.valid_arm_frames,
+            "hand": metrics.valid_hand_frames,
+            "eef_position": metrics.valid_eef_position_frames,
+            "eef_rotation": metrics.valid_eef_rotation_frames,
+        },
         "arm_joint": {
             "mae_per_joint_deg": np.round(metrics.arm_joint_mae_deg, 4).tolist(),
             "rmse_per_joint_deg": np.round(metrics.arm_joint_rmse_deg, 4).tolist(),
@@ -347,6 +376,7 @@ def save_results(
             "max_error_deg": round(metrics.eef_rot_error_max_deg, 2),
         },
         "tracking_lag": {
+            "per_active_joint_frames": metrics.tracking_lag_per_joint_frames,
             "peak_lag_frames": metrics.tracking_lag_frames,
             "peak_lag_seconds": round(metrics.tracking_lag_seconds, 3),
         },
@@ -366,7 +396,16 @@ def save_results(
             "rmse_overall_deg": round(metrics.hand_joint_rmse_overall_deg, 4),
         }
 
-    metrics_path = atomic_json_dump(metrics_dict, output_path / "metrics.json", ensure_ascii=False)
+    def json_defined(value):
+        if isinstance(value, dict):
+            return {k: json_defined(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [json_defined(v) for v in value]
+        return None if isinstance(value, float) and not np.isfinite(value) else value
+
+    metrics_path = atomic_json_dump(
+        json_defined(metrics_dict), output_path / "metrics.json", ensure_ascii=False
+    )
     print(f"\nMetrics saved: {metrics_path}")
 
     save_replay_data(replay_data, output_dir)

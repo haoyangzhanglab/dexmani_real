@@ -2,7 +2,7 @@
 
 Each camera entry stores serial, type and pose (XYZ meters, WXYZ quaternion),
 converted to a 4x4 transform at load time. Recorder START resolves the connected
-serial and requires eye-to-hand calibration. Raw stores the static base-from-color
+serial and saves available eye-to-hand calibration. Raw stores the static base-from-color
 transform and aligned color-grid intrinsics supplied by the live camera.
 The calibration file's calibration_capture section is diagnostic provenance.
 

@@ -36,7 +36,6 @@ _WXYZ_TO_XYZW = np.array([1, 2, 3, 0], dtype=np.intp)
 _XYZW_TO_WXYZ = np.array([3, 0, 1, 2], dtype=np.intp)
 _ROT6D_MIN_BASIS_NORM = 1e-4
 _ROT6D_MIN_ORTHOGONAL_RATIO = 1e-4
-_ROT6D_CANONICAL_TOLERANCE = 1e-5
 
 __all__ = [
     "compose_pose",
@@ -46,7 +45,6 @@ __all__ = [
     "quat_multiply",
     "quat_wxyz_to_rot6d",
     "quat_wxyz_to_rotmat",
-    "validate_canonical_rot6d",
     "validate_rot6d_geometry",
     "rot6d_to_quat_wxyz",
     "rot6d_to_rotmat",
@@ -173,27 +171,6 @@ def validate_rot6d_geometry(
         or np.any(orthogonal_norm / np.maximum(second_norm, min_basis_norm) < min_orthogonal_ratio)
     ):
         raise ValueError(f"{label} contains a zero or near-collinear basis")
-    return values
-
-
-def validate_canonical_rot6d(
-    rot6d: np.ndarray,
-    *,
-    label: str = "rot6d",
-    tolerance: float = _ROT6D_CANONICAL_TOLERANCE,
-) -> np.ndarray:
-    """Validate canonical unit, orthogonal rotation-6D labels."""
-    values = validate_rot6d_geometry(rot6d, label=label)
-    if not np.isfinite(tolerance) or tolerance <= 0.0:
-        raise ValueError("rot6d canonical tolerance must be finite and positive")
-    first = values[:, :3]
-    second = values[:, 3:]
-    if (
-        not np.allclose(np.linalg.norm(first, axis=1), 1.0, rtol=0.0, atol=tolerance)
-        or not np.allclose(np.linalg.norm(second, axis=1), 1.0, rtol=0.0, atol=tolerance)
-        or not np.allclose(np.sum(first * second, axis=1), 0.0, rtol=0.0, atol=tolerance)
-    ):
-        raise ValueError(f"{label} must use canonical unit orthogonal columns")
     return values
 
 

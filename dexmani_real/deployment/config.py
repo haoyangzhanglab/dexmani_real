@@ -67,8 +67,6 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
         raise ValueError(
             f"Real has no live producer for requested modalities: {sorted(unsupported)}"
         )
-    if "joint_state" not in names:
-        raise ValueError("Real deployment requires the joint_state observation")
     if info.action_mode not in {"joint", "eef"}:
         raise ValueError(f"unsupported Real action mode: {info.action_mode!r}")
     if "fingertip_points" in names:
@@ -86,17 +84,6 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
             raise ValueError("Live point_cloud requires saved numerical parameters")
         return PointCloudConfig.from_dict(recipe)
     return None
-
-
-def validate_recording_budget(info, max_running_s):
-    from dexmani_real.recording.recorder import HARD_MAX_RECORD_FRAMES
-
-    duration = validate_max_running_s(max_running_s)
-    if duration is None:
-        raise ValueError("Recorded evaluation requires a finite duration")
-    rows = math.ceil(duration / info.control_dt_s)
-    if rows >= HARD_MAX_RECORD_FRAMES:
-        raise ValueError(f"Recording requests {rows} rows; require rows < {HARD_MAX_RECORD_FRAMES}")
 
 
 @dataclass(frozen=True)
@@ -134,8 +121,6 @@ class RolloutRecordingConfig:
         if not isinstance(self.data_dir, str) or not self.data_dir.strip():
             raise ValueError("rollout data_dir must be a non-empty path")
         raw_data_dir = Path(self.data_dir)
-        if not raw_data_dir.is_absolute():
-            raise ValueError("rollout data_dir must be absolute")
         resolved_data_dir = raw_data_dir.resolve(strict=False)
         if resolved_data_dir == resolved_data_dir.parent:
             raise ValueError("rollout data_dir must not be a filesystem root")

@@ -30,14 +30,12 @@ class VRMappingParams:
 
     pos_scale: float = 1.0
     rot_scale: float = 1.0
-    max_delta_rot_rad: float = 3.0  # total-from-reset rotation cap
     stale_threshold_s: float = 0.5
 
     def validate(self) -> None:
         values = (
             self.pos_scale,
             self.rot_scale,
-            self.max_delta_rot_rad,
             self.stale_threshold_s,
         )
         if not all(np.isfinite(value) and value > 0 for value in values):
@@ -165,7 +163,7 @@ class TAGRetargetingParams:
     pinch_skip_threshold: float = 0.01
     reg_stage1_weight: float = 1.0
     reg_last_weight: float = 0.8
-    prior_weight: float = 0.01
+    prior_weight: float = 0.0
     # Weight for the optional human-flexion prior in both NLopt stages.
 
     def validate(self) -> None:
@@ -204,8 +202,8 @@ class TAGRetargetingParams:
             raise ValueError("TAG prior_weight must be finite and non-negative")
         if self.maxeval_s1 <= 0 or self.maxeval_s2 <= 0:
             raise ValueError("TAG optimizer maxeval values must be positive")
-        if self.pinch_full_dist_m > self.pinch_start_dist_m:
-            raise ValueError("TAG pinch_full_dist_m must not exceed pinch_start_dist_m")
+        if self.pinch_full_dist_m >= self.pinch_start_dist_m:
+            raise ValueError("TAG pinch_full_dist_m must be less than pinch_start_dist_m")
         if not (0.0 <= self.pinch_ema_alpha <= 1.0) or not (
             0.0 <= self.pinch_skip_threshold <= 1.0
         ):
@@ -226,7 +224,7 @@ class DexPilotRetargetingParams:
     # Enter/exit thresholds for the projected grasp regime.
     project_dist_m: float = 0.03
     escape_dist_m: float = 0.05
-    prior_weight: float = 0.05
+    prior_weight: float = 0.0
     # Weight for the optional human-flexion prior.
 
     def validate(self) -> None:

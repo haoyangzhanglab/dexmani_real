@@ -15,8 +15,6 @@ from pathlib import Path
 os.environ.setdefault("RUST_LOG", "error")
 
 import numpy as np
-import rerun as rr
-import rerun.blueprint as rrb
 
 from dexmani_real.config.environment import TableCollisionConfig
 from dexmani_real.config.experiment import resolve_table_plane
@@ -85,6 +83,12 @@ def print_episode_info(h5_path: str) -> None:
         keys = sorted(f.fields - {"rgb"})
         print(f"Episode:    {h5_path}")
         print(f"Control/depth rows: {reader.num_frames}")
+        print(
+            "Time:",
+            "host monotonic timestamps"
+            if "observation_timestamp_ns" in reader.fields
+            else "unknown (dt is nominal only)",
+        )
         print()
 
         print("Meta:")
@@ -117,6 +121,10 @@ class EpisodeVisualizer:
         pointcloud_config: PointCloudConfig | None = None,
         table_plane_abcd: tuple[float, float, float, float] | None = None,
     ):
+        global rr, rrb
+        import rerun as rr
+        import rerun.blueprint as rrb
+
         self._h5_path = Path(h5_path)
         self._reader = EpisodeReader(h5_path)
         try:
@@ -132,30 +140,35 @@ class EpisodeVisualizer:
                 "action_arm_joint_target",
                 "action_hand_joint_target",
             )
-            self._reader.require_metadata("handbase_position_eef_m", "handbase_quat_eef_wxyz")
             self._h5f = self._reader
             self._logical_dt_s = self._reader.dt
 
-            self._rgb_cache = self._reader.read_camera_all("rgb")
-            self._depth_cache = self._reader.read_camera_all("depth")
-            logger.info("Pre-decoded %d RGB-D frames", self._rgb_cache.shape[0])
-
+            self._T = self._resolve_frame_count(max_frames)
+            self._rgb_frames = iter(self._reader.iter_camera_frames("rgb"))
+            self._rgb = None
+            self._rgb_index = -1
             meta = self._reader.meta
             self._camera_model = load_raw_episode_camera_model(self._reader)
             self._camera_K = self._camera_model.geometry.color.matrix()
             self._depth_meter = 1.0 / self._camera_model.depth_scale_m
-            self._T_xarm_base_from_color = load_raw_episode_base_from_color(self._reader)
+            self._T_xarm_base_from_color = (
+                load_raw_episode_base_from_color(self._reader)
+                if "camera_T_xarm_base_from_color" in meta
+                else None
+            )
+            if self._T_xarm_base_from_color is None:
+                logger.warning("No camera extrinsics: displaying pixels without point cloud")
             self._handbase_position_eef_m = np.asarray(
-                meta["handbase_position_eef_m"], dtype=np.float64
+                HandParams.T_eef_handbase_pos_xyz, dtype=np.float64
             )
             self._handbase_quat_eef_wxyz = np.asarray(
-                meta["handbase_quat_eef_wxyz"], dtype=np.float64
+                HandParams.T_eef_handbase_quat_wxyz, dtype=np.float64
             )
             self._pointcloud_deriver: RawEpisodePointCloudDeriver | None = None
             self._empty_pointcloud_frames = 0
             self._pointcloud_processing_ns = 0
             self._pointcloud_processed_frames = 0
-            if point_cloud:
+            if point_cloud and self._T_xarm_base_from_color is not None:
                 if pointcloud_config is None:
                     raise ValueError("point-cloud visualization requires resolved config")
                 self._pointcloud_deriver = RawEpisodePointCloudDeriver(
@@ -171,7 +184,6 @@ class EpisodeVisualizer:
                     "enabled" if table_plane_abcd is not None else "disabled",
                 )
 
-            self._T = self._resolve_frame_count(max_frames)
             logger.info("Frames=%d", self._T)
 
             self._state = self._preload_state()
@@ -197,9 +209,6 @@ class EpisodeVisualizer:
         raw = self._reader.num_frames
         if raw <= 0:
             raise ValueError("episode /meta num_frames must be positive")
-        camera_counts = [self._rgb_cache.shape[0], self._depth_cache.shape[0]]
-        if any(count != raw for count in camera_counts):
-            raise ValueError(f"camera frame counts {camera_counts} do not match grid length {raw}")
         if max_frames is not None:
             return min(raw, max_frames)
         return raw
@@ -265,7 +274,7 @@ class EpisodeVisualizer:
                     for i in range(arr.shape[1]):
                         rr.log(f"{base}/{i}", rr.SeriesLine(name=f"{i}"), static=True)
 
-        h, w = self._rgb_cache.shape[1:3]
+        h, w = self._camera_model.geometry.color.height, self._camera_model.geometry.color.width
         rr.log(
             "camera/color",
             rr.Pinhole(
@@ -277,14 +286,15 @@ class EpisodeVisualizer:
             static=True,
         )
         logger.info("Camera pinhole logged (%dx%d)", w, h)
-        rr.log(
-            "camera/color",
-            rr.Transform3D(
-                translation=self._T_xarm_base_from_color[:3, 3],
-                mat3x3=self._T_xarm_base_from_color[:3, :3],
-            ),
-            static=True,
-        )
+        if self._T_xarm_base_from_color is not None:
+            rr.log(
+                "camera/color",
+                rr.Transform3D(
+                    translation=self._T_xarm_base_from_color[:3, 3],
+                    mat3x3=self._T_xarm_base_from_color[:3, :3],
+                ),
+                static=True,
+            )
 
         for key, labels in _FORCE_SERIES.items():
             for i, label in enumerate(labels):
@@ -292,7 +302,12 @@ class EpisodeVisualizer:
 
     def log_step(self, step_idx: int) -> None:
         rr.set_time_sequence("step", step_idx)
-        rr.set_time_seconds("time", step_idx * self._logical_dt_s)
+        stamp = self._reader.read_row_info("observation_timestamp_ns", step_idx, step_idx + 1)[0]
+        first = self._reader.read_row_info("observation_timestamp_ns", 0, 1)[0]
+        rr.set_time_seconds(
+            "time" if stamp and first else "nominal_time",
+            (stamp - first) / 1e9 if stamp and first else step_idx * self._logical_dt_s,
+        )
         self._log_camera(step_idx)
         self._log_pointcloud(step_idx)
         self._log_fingertips(step_idx)
@@ -300,11 +315,17 @@ class EpisodeVisualizer:
         self._log_time_series(step_idx)
 
     def _log_camera(self, step_idx: int) -> None:
-        rr.log("camera/color/rgb", rr.Image(self._rgb_cache[step_idx]))
+        if step_idx != self._rgb_index + 1:
+            raise ValueError("viewer reads frames sequentially")
+        self._rgb = next(self._rgb_frames, None)
+        if self._rgb is None:
+            raise ValueError(f"RGB missing at frame {step_idx}")
+        self._rgb_index = step_idx
+        rr.log("camera/color/rgb", rr.Image(self._rgb))
         rr.log(
             "depth/image",
             rr.DepthImage(
-                self._depth_cache[step_idx],
+                self._reader.read_camera_frame("depth", step_idx),
                 meter=self._depth_meter,
                 depth_range=(0, 10000),  # Clamp outliers to stabilize the colormap.
             ),
@@ -314,7 +335,7 @@ class EpisodeVisualizer:
         if self._pointcloud_deriver is None:
             return
         started_ns = time.perf_counter_ns()
-        cloud = self._pointcloud_deriver.derive(step_idx, self._rgb_cache[step_idx])
+        cloud = self._pointcloud_deriver.derive(step_idx, self._rgb)
         self._pointcloud_processing_ns += time.perf_counter_ns() - started_ns
         self._pointcloud_processed_frames += 1
         if cloud is None:

@@ -1,9 +1,9 @@
 """XHand driver with one SDK call per runtime read or send.
 
 Reads accept known sensor/CRC statuses only with complete, finite 12-DoF joint
-payloads. Aggregate (``calc_force``) and dense (``raw_force``) tactile validity
-are independent: an RS485 distributed-force drop leaves aggregate contact
-force usable. Send CRC responses leave delivery unconfirmed without stopping
+positions; missing auxiliary current remains NaN. Aggregate (``calc_force``)
+and dense (``raw_force``) tactile validity are independent: an RS485
+distributed-force drop leaves aggregate contact force usable. Send CRC responses leave delivery unconfirmed without stopping
 the caller; other SDK errors are rejected.
 """
 
@@ -338,40 +338,44 @@ class XHand:
     def disconnect(self) -> None:
         """Release the SDK handle; repeated calls are no-ops."""
         connected_ethercat = self.connected_flag and self.cfg.comm_type == "ethercat"
-        if self._control is not None:
-            if connected_ethercat:
-                self._request_ethercat_init()
-            self._close_control()
-            if connected_ethercat:
-                time.sleep(_POST_EC_DISCONNECT_S)
-        self.connected_flag = False
+        errors = []
+        try:
+            if self._control is not None:
+                if connected_ethercat:
+                    try:
+                        self._request_ethercat_init()
+                    except Exception as exc:
+                        errors.append(exc)
+                try:
+                    self._close_control()
+                except Exception as exc:
+                    errors.append(exc)
+                if connected_ethercat:
+                    time.sleep(_POST_EC_DISCONNECT_S)
+        finally:
+            self.connected_flag = False
+        if errors:
+            raise RuntimeError(f"XHand disconnect failed: {errors}") from errors[0]
 
     def _request_ethercat_init(self) -> None:
         if self.cfg.ethercat_slave_position < 0:
             logger.warning("XHand EtherCAT slave position unknown; skipping explicit INIT request")
             return
-        try:
-            error, _ = self._control.set_firmware_state(
-                self.cfg.device_id,
-                self.cfg.ethercat_slave_position,
-                _EC_STATE_INIT,
-                500_000,
-            )
-            if _error_ok(error):
-                time.sleep(0.2)
-            else:
-                logger.debug("XHand EtherCAT INIT request failed: code=%s", _error_code(error))
-        except Exception:
-            logger.debug("XHand EtherCAT INIT request unavailable", exc_info=True)
+        error, _ = self._control.set_firmware_state(
+            self.cfg.device_id,
+            self.cfg.ethercat_slave_position,
+            _EC_STATE_INIT,
+            500_000,
+        )
+        if not _error_ok(error):
+            raise XHandError("ethercat INIT", _error_code(error), "INIT request failed")
+        time.sleep(0.2)
 
     def _close_control(self) -> None:
         control, self._control = self._control, None
         if control is None:
             return
-        try:
-            control.close_device()
-        except Exception:
-            logger.warning("XHand control did not close cleanly", exc_info=True)
+        control.close_device()
 
     def calibrate_tactile(self) -> bool:
         """Estimate a software no-contact bias without gating joint control.
@@ -636,8 +640,7 @@ class XHand:
             raise ValueError(f"{len(seen)}/{HAND_DOF} joints reported")
         if not np.all(np.isfinite(qpos)):
             raise ValueError("non-finite joint position feedback")
-        if not np.all(np.isfinite(current)):
-            raise ValueError("non-finite joint current feedback")
+        current[~np.isfinite(current)] = np.nan
         return qpos, current, errors
 
     def _sensor_data(self, state: Any) -> list[Any]:

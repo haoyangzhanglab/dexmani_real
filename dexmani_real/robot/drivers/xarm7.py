@@ -21,7 +21,8 @@ from typing import Any, Callable
 import numpy as np
 
 from dexmani_real.config.hardware import ArmParams
-from dexmani_real.robot.model import ARM_JOINT_SHAPE
+from dexmani_real.robot.command_validation import check_arm_target
+from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_HARD_LOWER, XARM7_HARD_UPPER
 from dexmani_real.utils.log import (
     capture_native_stdout,
     extract_native_diagnostics,
@@ -122,10 +123,11 @@ def _decode_joint_states(code: Any, states: Any) -> tuple[np.ndarray, np.ndarray
     qpos = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
     qvel = np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
     tau = np.asarray(states[2], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
-    if any(v.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(v)) for v in (qpos, qvel, tau)):
-        raise RuntimeError(
-            "get_joint_states returned invalid qpos/qvel/tau shape or non-finite values"
-        )
+    if any(v.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(v)) for v in (qpos, qvel)):
+        raise RuntimeError("get_joint_states returned invalid qpos/qvel shape or non-finite values")
+    if tau.shape != ARM_JOINT_SHAPE:
+        raise RuntimeError("get_joint_states returned invalid effort shape")
+    tau[~np.isfinite(tau)] = np.nan
     return qpos, qvel, tau
 
 
@@ -210,16 +212,17 @@ class XArm7:
         _check_sdk_return_code(self._api.set_state(4), "stop set_state(4)")
 
     def close(self) -> None:
-        """Best-effort disconnect."""
+        """Disconnect and propagate SDK errors to the runtime cleanup owner."""
         if self._api is None:
             return
-        try:
-            self._api.disconnect()
-        except Exception:
-            logger.warning("xarm7: disconnect failed during cleanup", exc_info=True)
+        self._api.disconnect()
+        self._api = None
 
     def read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Read joint positions/velocities/efforts [rad, rad/s, SDK-native effort]; raise on any failure."""
+        """Read qpos [rad], qvel [rad/s] and SDK-native effort.
+
+        Invalid auxiliary effort remains NaN; SDK and qpos/qvel errors raise.
+        """
         code, states = self._api.get_joint_states(is_radian=True, num=3)
         return _decode_joint_states(code, states)
 
@@ -229,6 +232,13 @@ class XArm7:
         Returns the SDK return code (0 = accepted); the caller owns the
         non-zero escalation.
         """
+        issue = check_arm_target(
+            qpos,
+            joint_limit_lower_rad=np.asarray(XARM7_HARD_LOWER),
+            joint_limit_upper_rad=np.asarray(XARM7_HARD_UPPER),
+        )
+        if issue:
+            raise ValueError(f"unsafe arm target: {issue}")
         return int(
             self._api.set_servo_angle(
                 angle=qpos,

@@ -1,1 +1,1 @@
-"""Whole-episode validation and canonical training-cache export from raw recordings."""
+"""Full-modal numerical processing and canonical cache export from Raw recordings."""

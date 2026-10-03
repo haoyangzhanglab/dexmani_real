@@ -652,7 +652,10 @@ def main(argv: list[str] | None = None) -> int:
     cfg = PointCloudDiagnosticConfig()
 
     # Resolve and validate file-backed policy before connecting to hardware.
-    runtime = resolve_experiment_config()
+    calibrate_table = input("\nRun table calibration? [y/N] ").strip().lower() in {"y", "yes"}
+    runtime = resolve_experiment_config(
+        cli_overrides={"environment.table.enabled": False} if calibrate_table else None
+    )
     pcd_config = runtime.pointcloud
 
     camera = _connect_camera(cfg)
@@ -667,10 +670,6 @@ def main(argv: list[str] | None = None) -> int:
         geometry = camera.get_geometry().aligned_depth_to_color()
         T_xarm_base_from_color = _load_extrinsics(camera_info)
 
-        calibrate_table = input("\nRun table calibration? [y/N] ").strip().lower() in {
-            "y",
-            "yes",
-        }
         if calibrate_table:
             # Use the new fit immediately, even without saving it.
             table_plane_abcd = _calibrate_table(

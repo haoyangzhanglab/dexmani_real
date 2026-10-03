@@ -37,7 +37,7 @@ def propose_cartesian_jog_pose(
     changed = rotating or not np.array_equal(position, command_pose.p)
     quaternion = command_pose.q.copy()
     if rotating:
-        delta_quaternion = Rotation.from_euler("xyz", drpy).as_quat(scalar_first=True)
+        delta_quaternion = Rotation.from_euler("xyz", drpy).as_quat()[[3, 0, 1, 2]]
         quaternion = quat_multiply(delta_quaternion, quaternion)
     return Pose(p=position, q=quaternion), desired_position, changed
 

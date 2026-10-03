@@ -12,7 +12,6 @@ class EpisodeFrame:
     data: dict
     camera_rgb: np.ndarray
     camera_depth: np.ndarray
-    dispatch: tuple[int, int] = (0, 0)
     selected: dict | None = None
     dispatch_detail: dict | None = None
 
@@ -32,6 +31,14 @@ def build_episode_frame(
     contact_valid = hand is not None and bool(hand["tactile_aggregate_valid"])
     dense_valid = hand is not None and bool(hand["tactile_dense_valid"])
     values = {
+        "observation_timestamp_ns": row.observation_timestamp_ns,
+        "arm_read_timestamp_ns": arm["timestamp_ns"],
+        "hand_read_timestamp_ns": hand["timestamp_ns"] if hand is not None else 0,
+        "camera_timestamp_ns": camera["timestamp_ns"],
+        "color_frame_number": camera["color_frame_number"],
+        "depth_frame_number": camera["depth_frame_number"],
+        "dispatch_timestamp_ns": result.timestamp_ns if result is not None else 0,
+        "dispatch_status": (int(result.arm), int(result.hand)) if result is not None else (0, 0),
         "arm_qpos": arm["qpos"],
         "arm_qvel": arm["qvel"],
         "arm_effort": arm["effort"],
@@ -70,7 +77,6 @@ def build_episode_frame(
         data,
         camera["rgb"],
         camera["depth"],
-        (int(result.arm), int(result.hand)) if result is not None else (0, 0),
         {
             name: (None if getattr(command, name) is None else getattr(command, name).tolist())
             for name in ("arm_qpos", "hand_qpos")

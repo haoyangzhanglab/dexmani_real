@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Usage: python examples/replay_episode.py episodes/<task_name>/<episode_dir>
 
-Physically replays current raw-schema targets on xArm7/XHand and writes evaluation results.
+Replays teleop Raw joint targets at nominal cadence and writes evaluation results.
 """
 
 from __future__ import annotations
@@ -70,8 +70,8 @@ Controls:
         "episode",
         type=str,
         help=(
-            "Published current raw-schema episode directory (episodes/<task_name>/episode_*) "
-            "with recorded float64 high-level targets."
+            "Published teleop Raw episode directory (episodes/<task_name>/episode_*) "
+            "with finite attempted joint targets and usable dispatch evidence when present."
         ),
     )
     parser.add_argument(
@@ -89,7 +89,7 @@ Controls:
         default=0.5,
         help=(
             "Seconds to ramp XHand to the first target before replay (default: 0.5). "
-            "Rounded up to replay periods; 0 disables preparation for strict replay."
+            "Only small start differences are allowed; 0 disables preparation."
         ),
     )
     parser.add_argument(
@@ -140,8 +140,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Trajectory: {trajectory.episode_path}")
     print(
-        f"  Frames: {trajectory.num_frames}  FPS: {trajectory.fps:.1f}  "
-        f"Duration: {trajectory.num_frames / trajectory.fps:.1f}s"
+        f"  Frames: {trajectory.num_frames}  Nominal FPS: {trajectory.fps:.1f}  "
+        f"Nominal duration: {trajectory.num_frames / trajectory.fps:.1f}s"
     )
     print(f"  Task: {trajectory.task_label or '(none)'}")
     print(f"  Acc: {selection.acceleration_deg_s2:.0f}°/s²")

@@ -126,7 +126,7 @@ def require_transition(shared, new_state):
         raise RuntimeError(f"safety transition to {new_state.name} rejected")
 
 
-def request_policy_start(shared, *, require_physical_home):
+def request_policy_start(shared):
     with shared.motion_lock:
         if (
             int(shared.safety_state.value) != int(SafetyState.ARMED)
@@ -134,7 +134,6 @@ def request_policy_start(shared, *, require_physical_home):
             or shared.error_state.value
             or shared.estop_request.value
             or shared.stop_request.value
-            or (require_physical_home and not shared.physical_home_completed.value)
         ):
             return False
         shared.start_request.value = True
@@ -144,7 +143,6 @@ def request_policy_start(shared, *, require_physical_home):
 def request_policy_stop(shared, *, reason=RunEndReason.OPERATOR):
     with shared.motion_lock:
         shared.start_request.value = False
-        shared.physical_home_completed.value = False
         shared.stop_request.value = int(StopRequest.OPERATOR)
         if int(shared.safety_state.value) in (int(SafetyState.ARMED), int(SafetyState.RUNNING)):
             return _revoke_motion_locked(shared, reason=reason)

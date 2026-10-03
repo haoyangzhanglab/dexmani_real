@@ -1,9 +1,4 @@
-"""Capability-based reader for the current Raw format.
-
-Known present fields are validated; additive unknown fields do not invalidate an
-otherwise usable episode. Legacy Raw is unsupported by the normal
-runtime/export/replay path.
-"""
+"""Read Raw metadata at open and validate numerical layout only when requested."""
 
 from __future__ import annotations
 
@@ -15,8 +10,6 @@ import numpy as np
 
 from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT
 from dexmani_real.recording.storage.video import VideoDecoder
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics, validate_aligned_depth_distortion
-from dexmani_real.utils.geometry import validate_rigid_transform, validate_unit_quaternion_wxyz
 
 
 class RawDataError(ValueError):
@@ -61,73 +54,12 @@ def _positive_float_attr(attrs: h5py.AttributeManager, name: str) -> float:
     return result
 
 
-def _flat_float_attr(attrs: h5py.AttributeManager, name: str, size: int) -> np.ndarray:
-    if name not in attrs:
-        raise RawDataError(f"episode metadata is missing {name}")
-    try:
-        value = np.asarray(attrs[name], dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise RawDataError(f"episode metadata {name} must be numeric") from exc
-    if value.shape != (size,) or not np.all(np.isfinite(value)):
-        raise RawDataError(f"episode metadata {name} must have shape ({size},) and finite values")
-    return value
-
-
-def _validate_camera_transform(value, *, label):
-    try:
-        validate_rigid_transform(value.reshape(4, 4), label=label)
-    except ValueError as exc:
-        raise RawDataError(f"episode metadata {label}: {exc}") from exc
-
-
-def _validate_color_camera_metadata(attrs: h5py.AttributeManager) -> None:
-    if _text_attr(attrs, "camera_payload_mode") != "depth_to_color_aligned_rgbd":
-        raise RawDataError("episode camera payload must be depth_to_color_aligned_rgbd")
-    width = _positive_int_attr(attrs, "camera_color_width")
-    height = _positive_int_attr(attrs, "camera_color_height")
-    matrix = _flat_float_attr(attrs, "camera_color_intrinsics", 9).reshape(3, 3)
-    coefficients = _flat_float_attr(attrs, "camera_color_distortion_coeffs", 5)
-    try:
-        intrinsics = CameraIntrinsics(
-            width=width,
-            height=height,
-            fx=float(matrix[0, 0]),
-            fy=float(matrix[1, 1]),
-            ppx=float(matrix[0, 2]),
-            ppy=float(matrix[1, 2]),
-            distortion_model=_text_attr(attrs, "camera_color_distortion_model"),
-            distortion_coeffs=tuple(float(value) for value in coefficients),
-        )
-    except ValueError as exc:
-        raise RawDataError(f"invalid camera intrinsics: {exc}") from exc
-    validate_aligned_depth_distortion(intrinsics.distortion_model)
-    if not np.allclose(matrix, intrinsics.matrix(), atol=1e-9, rtol=0.0):
-        raise RawDataError(
-            "episode metadata camera_color_intrinsics is not a canonical pinhole matrix"
-        )
-    _validate_camera_transform(
-        _flat_float_attr(attrs, "camera_T_xarm_base_from_color", 16),
-        label="camera_T_xarm_base_from_color",
-    )
-    _positive_float_attr(attrs, "depth_scale")
-
-
-def _validate_hand_mount_metadata(attrs: h5py.AttributeManager) -> None:
-    _flat_float_attr(attrs, "handbase_position_eef_m", 3)
-    quaternion = _flat_float_attr(attrs, "handbase_quat_eef_wxyz", 4)
-    try:
-        validate_unit_quaternion_wxyz(quaternion, name="handbase_quat_eef_wxyz")
-    except ValueError as exc:
-        raise RawDataError(f"episode metadata: {exc}") from exc
-
-
 class EpisodeReader:
     """Read current immutable Raw evidence without deciding training eligibility."""
 
     def __init__(self, episode_path: str | Path) -> None:
         self._path = Path(episode_path)
         self._data = self._rgb_decoder = None
-        self._cache = {}
         if not self._path.is_dir():
             raise ValueError(f"episode must be a directory: {self._path}")
         self._rgb_path = self._path / "rgb.mp4"
@@ -143,8 +75,6 @@ class EpisodeReader:
             self._control_hz = _positive_float_attr(attrs, "control_hz")
             _text_attr(attrs, "task_label")
             _text_attr(attrs, "collection_source")
-            self._validate_present_fields()
-            self._validate_dispatch()
         except BaseException:
             self.close()
             raise
@@ -173,7 +103,12 @@ class EpisodeReader:
             )
 
     def __getitem__(self, name):
-        return self._data[name]
+        array = self._data[name]
+        if name in DATASET_SPECS:
+            spec = DATASET_SPECS[name]
+            if array.shape != (self.num_frames, *spec.tail_shape) or array.dtype != spec.dtype:
+                raise RawDataError(f"Raw {name}: incompatible shape/dtype")
+        return array
 
     @property
     def num_frames(self) -> int:
@@ -187,60 +122,21 @@ class EpisodeReader:
     def dt(self) -> float:
         return 1.0 / self._control_hz
 
-    def _validate_present_fields(self):
-        for name, spec in DATASET_SPECS.items():
-            if name in self._data:
-                array = self._data[name]
-                if (
-                    not isinstance(array, h5py.Dataset)
-                    or array.shape != (self.num_frames, *spec.tail_shape)
-                    or array.dtype != spec.dtype
-                ):
-                    raise RawDataError(f"Raw {name}: incompatible shape/dtype")
-        fields = self.fields
-        if fields & {"rgb", "depth"} or any(k.startswith("camera_") for k in self.meta):
-            _validate_color_camera_metadata(self.meta)
-        if "depth" in self._data:
-            depth = self._data["depth"]
-            expected = (
-                self.num_frames,
-                int(self.meta["camera_color_height"]),
-                int(self.meta["camera_color_width"]),
-            )
-            if (
-                not isinstance(depth, h5py.Dataset)
-                or depth.shape != expected
-                or depth.dtype != np.uint16
-            ):
-                raise RawDataError(f"Raw depth must be uint16 with shape {expected}")
-        if "rgb" in fields and self._rgb_path.stat().st_size == 0:
-            raise RawDataError("Raw RGB file is empty")
-        if any(k in self.meta for k in ("handbase_position_eef_m", "handbase_quat_eef_wxyz")):
-            _validate_hand_mount_metadata(self.meta)
+    def read_row_info(self, name, start, end):
+        """Old Raw has unknown time/status; never infer measured time or success."""
+        from dexmani_real.recording.storage.schema import ROW_INFO_SPECS
 
-    def _validate_dispatch(self):
-        # Historical Raw has no SDK evidence. Never infer acceptance for it.
-        if "execution_path" not in self.meta:
-            return
-        if self.meta["execution_path"] != "synchronous_direct_sdk_v1":
-            raise RawDataError("unsupported execution_path")
-        if "dispatch_status" not in self.meta:
-            raise RawDataError("direct dispatch metadata missing status")
-        statuses = np.asarray(self.meta["dispatch_status"])
-        if (
-            statuses.shape != (self.num_frames, 2)
-            or statuses.dtype != np.uint8
-            or np.any(statuses > 4)
-        ):
-            raise RawDataError("invalid direct dispatch status array")
-        for side, name in enumerate(("action_arm_joint_target", "action_hand_joint_target")):
-            self.require_fields(name)
-            values = np.asarray(self[name])
-            called = statuses[:, side] != 0
-            if not np.isfinite(values[called]).all() or not np.isnan(values[~called]).all():
-                raise RawDataError("dispatch status and attempted target disagree")
-        if self.meta["collection_source"] == "teleop" and not np.isin(statuses, (1, 2)).all():
-            raise RawDataError("technical-invalid teleop direct dispatch")
+        if name in self.fields:
+            return np.asarray(self[name][start:end])
+        if name == "dispatch_status" and name in self.meta:
+            statuses = np.asarray(self.meta[name], dtype=np.uint8)
+            if statuses.shape != (self.num_frames, 2):
+                raise RawDataError("invalid historical dispatch status shape")
+            return statuses[start:end]
+        spec = ROW_INFO_SPECS[name]
+        return np.full(
+            (end - start, *spec.tail_shape), 4 if name == "dispatch_status" else 0, dtype=spec.dtype
+        )
 
     def _decoder(self):
         self.require_fields("rgb")
@@ -252,27 +148,24 @@ class EpisodeReader:
         self.require_fields(key)
         return self._decoder().read_frame(index) if key == "rgb" else np.asarray(self[key][index])
 
-    def read_camera_all(self, key: str) -> np.ndarray:
-        self.require_fields(key)
-        if key not in self._cache:
-            data = self._decoder().read_all() if key == "rgb" else np.asarray(self[key][:])
-            if len(data) != self.num_frames:
-                raise RawDataError(f"{key} length differs from num_frames")
-            self._cache[key] = data
-        return self._cache[key]
-
     def iter_camera_frames(self, key: str) -> Iterator[np.ndarray]:
         if key != "rgb":
             raise ValueError("iter_camera_frames supports only MP4-backed RGB")
         yield from self._decoder().iter_frames()
 
     def close(self) -> None:
-        self._cache.clear()
+        errors = []
         for name in ("_rgb_decoder", "_data"):
             resource = getattr(self, name)
             if resource is not None:
-                resource.close()
-                setattr(self, name, None)
+                try:
+                    resource.close()
+                except Exception as exc:
+                    errors.append(exc)
+                else:
+                    setattr(self, name, None)
+        if errors:
+            raise RuntimeError(f"Raw reader close failures: {errors}") from errors[0]
 
     def __enter__(self):
         return self

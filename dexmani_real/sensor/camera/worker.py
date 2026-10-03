@@ -58,19 +58,23 @@ def run_camera_worker(shared, config: CameraParams) -> None:
         shared.camera_serial.value = str(cam.active_serial or "").encode()
         shared.camera_geometry.value = json.dumps(cam.get_geometry().to_dict()).encode()
         last_frame = None
-        last_good_s = time.monotonic()
+        last_good_s = [time.monotonic(), time.monotonic()]
         while shared.is_running.value:
             try:
                 frame = cam.read(timeout_ms=300, compute_depth=False)
             except (RuntimeError, OSError):
-                if time.monotonic() - last_good_s >= cfg.source_stall_timeout_s:
+                if time.monotonic() - min(last_good_s) >= cfg.source_stall_timeout_s:
                     raise
                 time.sleep(0.01)
                 continue
             identity = (frame.depth_frame_number, frame.color_frame_number)
+            now = time.monotonic()
+            for channel, name in enumerate(("depth", "RGB")):
+                if last_frame is None or identity[channel] != last_frame[channel]:
+                    last_good_s[channel] = now
+                elif now - last_good_s[channel] >= cfg.source_stall_timeout_s:
+                    raise RuntimeError(f"RealSense stopped producing new {name}")
             if identity == last_frame:
-                if time.monotonic() - last_good_s >= cfg.source_stall_timeout_s:
-                    raise RuntimeError("RealSense stopped producing new RGB-D")
                 continue
             if frame.rgb is None or frame.depth_aligned_to_color_raw is None:
                 raise RuntimeError("RealSense did not produce aligned RGB-D")
@@ -83,7 +87,7 @@ def run_camera_worker(shared, config: CameraParams) -> None:
                     color_frame_number=frame.color_frame_number or 0,
                 )
             )
-            last_frame, last_good_s = identity, time.monotonic()
+            last_frame = identity
             shared.camera_ready.set()
     except Exception:
         logger.exception("camera worker failed")

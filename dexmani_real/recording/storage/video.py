@@ -9,13 +9,15 @@ Encode::
 Decode::
 
     with VideoDecoder(path) as dec:
-        all_frames = dec.read_all()
+        for frame in dec.iter_frames():
+            process(frame)
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -129,7 +131,9 @@ class VideoEncoder:
             self._container = av.open(str(self._path), "w", format="mp4")
             # add_stream returns a VideoStream at runtime for video codecs;
             # PyAV stubs are incomplete so use Any for _stream.
-            self._stream = self._container.add_stream(self._cfg.codec, rate=int(self._fps))
+            self._stream = self._container.add_stream(
+                self._cfg.codec, rate=Fraction(str(self._fps)).limit_denominator(1_000_000)
+            )
             self._stream.width = self._width
             self._stream.height = self._height
             self._stream.pix_fmt = self._cfg.pixel_format
@@ -167,11 +171,7 @@ class VideoEncoder:
 
 
 class VideoDecoder:
-    """Decode MP4 frames to NumPy arrays, in bulk or by index.
-
-    Indexed reads decode forward from a keyframe; prefer read_all() for
-    interactive scrubbing to avoid repeated seeks.
-    """
+    """Stream RGB frames or decode one frame by index without a full-video cache."""
 
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
@@ -187,13 +187,6 @@ class VideoDecoder:
         if not self._opened:
             self._open()
         return self._frame_count
-
-    def read_all(self) -> np.ndarray:
-        """Decode all frames and return as a ``(T, H, W, 3)`` uint8 array."""
-        frames = list(self.iter_frames())
-        if not frames:
-            raise ValueError(f"No frames decoded from {self._path}")
-        return np.stack(frames, axis=0)
 
     def iter_frames(self) -> Iterator[np.ndarray]:
         """Yield decoded RGB frames sequentially without retaining the video.
@@ -213,7 +206,7 @@ class VideoDecoder:
                     yield frame.to_ndarray(format="rgb24")
 
     def read_frame(self, index: int) -> np.ndarray:
-        """Decode from the nearest keyframe to index; prefer read_all() for repeated access."""
+        """Decode one indexed frame; use iter_frames() for sequential access."""
         if not self._opened:
             self._open()
         if self._container is None:

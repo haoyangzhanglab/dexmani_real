@@ -44,7 +44,7 @@ class PolicyOperator:
         )
 
     def _request_stop(self) -> None:
-        """Fence live motion when S/STOP arrives while the I/O owner is blocked by H."""
+        """Fence motion even while the I/O owner is blocked in HOME, inference or SDK I/O."""
         if not request_policy_stop(self.shared):
             self.shared.error_state.value = True
 
@@ -61,9 +61,8 @@ class PolicyOperator:
         self._handle_command_batch(self.keyboard.poll(timeout=0))
 
     def _handle_command_batch(self, signals) -> None:
-        # A physical B must be a fresh, post-home confirmation.  H blocks
-        # the I/O owner while the arm moves, so begin events from the same
-        # drained batch must not survive a successful home sequence.
+        # H blocks the I/O owner. Ignore B from the same batch so HOME cannot
+        # trigger policy execution without a subsequent operator request.
         discard_begin_in_batch = False
         # Lifecycle-changing signals suppress Home and Begin in the same batch.
         # C/D (PAUSE/DISCARD) belong to teleop and are true no-ops here, so
@@ -76,13 +75,9 @@ class PolicyOperator:
                 if stop_in_batch:
                     logger.warning("operator: ignored B received in the same batch as S/Q")
                     continue
-                if discard_begin_in_batch or not request_policy_start(
-                    self.shared,
-                    require_physical_home=self.planner is not None,
-                ):
+                if discard_begin_in_batch or not request_policy_start(self.shared):
                     logger.warning(
-                        "operator: ignored B until a completed physical home "
-                        "sequence is followed by a fresh B"
+                        "operator: ignored B while stopped or HOME is handling this batch"
                     )
                     continue
             elif signal is OperatorCommand.STOP:
@@ -115,7 +110,6 @@ class PolicyOperator:
             home_allowed = not self.shared.quit_requested.value and int(
                 self.shared.safety_state.value
             ) == int(SafetyState.ARMED)
-            self.shared.physical_home_completed.value = False
             if home_allowed:
                 # H follows any older inactive S but cannot erase an
                 # S arriving after this atomic preparation.
@@ -132,7 +126,7 @@ class PolicyOperator:
             abort_requested=self._home_abort_requested,
         )
         with self.shared.motion_lock:
-            authorized = bool(
+            completed_without_stop = bool(
                 completed
                 and self.shared.is_running.value
                 and not self.shared.quit_requested.value
@@ -141,16 +135,10 @@ class PolicyOperator:
                 and int(self.shared.stop_request.value) == int(StopRequest.NONE)
                 and int(self.shared.safety_state.value) == int(SafetyState.ARMED)
             )
-            # Stop/start requests share this lock, so a completed H
-            # cannot resurrect authorization after a newer S.
-            self.shared.physical_home_completed.value = authorized
-        if authorized:
+        if completed_without_stop:
             logger.info("operator: physical home sequence completed; press B to start")
         else:
-            logger.warning(
-                "operator: physical home sequence did not authorize; "
-                "B remains disabled for the next episode"
-            )
+            logger.warning("operator: HOME incomplete or interrupted; check current pose before B")
         # HOME blocks while hand/arm homing completes. Drop stale
         # H and B events, but preserve S/Q/ESC so an operator can
         # still stop, quit, or e-stop immediately afterwards.

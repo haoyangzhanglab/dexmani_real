@@ -25,9 +25,6 @@ class ActionIntent:
 class ActionRealization:
     arm_qpos: np.ndarray | None
     hand_qpos: np.ndarray | None
-    workspace_clip_m: float = 0.0
-    arm_clip_rad: float = 0.0
-    hand_clip_rad: float = 0.0
     ik_result: IKResult | None = None
     # Accepted Cartesian target feeds Teleop's explicit EMA only after dispatch.
     eef_pose: np.ndarray | None = None
@@ -77,12 +74,10 @@ class ActionRealizer:
             if intent.hand is not None:
                 raise ValueError("hand-disabled action realization must not include a hand intent")
         hand = None
-        hand_clip = 0.0
         if intent.hand is not None:
             hand = project_hand_command(
                 intent.hand, qpos_min_rad=cfg.hand.qpos_min_rad, qpos_max_rad=cfg.hand.qpos_max_rad
             )
-            hand_clip = float(np.max(np.abs(hand - intent.hand)))
         if intent.mode == "joint":
             target = project_arm_command(
                 arm,
@@ -90,15 +85,7 @@ class ActionRealizer:
                 joint_lower_rad=cfg.arm.joint_limit_lower,
                 joint_upper_rad=cfg.arm.joint_limit_upper,
             )
-            change = target - arm
-            periodic = (
-                np.asarray(cfg.arm.joint_limit_upper) - np.asarray(cfg.arm.joint_limit_lower)
-                >= 2 * np.pi
-            )
-            change[periodic] = (change[periodic] + np.pi) % (2 * np.pi) - np.pi
-            return ActionRealization(
-                target, hand, arm_clip_rad=float(np.max(np.abs(change))), hand_clip_rad=hand_clip
-            )
+            return ActionRealization(target, hand)
         if self.planner is None:
             raise ValueError("EEF realization requires an online IK planner")
         workspace = cfg.policy.workspace.as_array()
@@ -110,8 +97,6 @@ class ActionRealizer:
         return ActionRealization(
             result.qpos if result.success else None,
             hand,
-            workspace_clip_m=float(np.max(np.abs(position - arm[:3]))),
-            hand_clip_rad=hand_clip,
             ik_result=result,
             eef_pose=np.concatenate((position, arm[3:])),
         )

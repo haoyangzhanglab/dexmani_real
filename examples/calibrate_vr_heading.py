@@ -80,14 +80,18 @@ def _circular_mean(
         raise ValueError("VR forward samples have no stable mean heading")
     mean_0 /= mean_0_norm
 
-    # Outlier rejection: |sin(Δθ)| ≈ angular distance from mean.
-    dists = np.abs(np.cross(fwd_unit, mean_0))
-    threshold = outlier_sigma * float(np.std(dists))
+    angles = np.arctan2(fwd_unit[:, 1], fwd_unit[:, 0])
+    center = np.arctan2(mean_0[1], mean_0[0])
+    delta = np.angle(np.exp(1j * (angles - center)))
+    dists = np.abs(delta)
+    threshold = max(1e-12, outlier_sigma * float(np.sqrt(np.mean(delta**2))))
     inlier = dists <= threshold
     n_out = int(np.sum(~inlier))
     if n_out > 0:
         print(f"  INFO: rejected {n_out} outlier frames (> {outlier_sigma}σ)")
 
+    if not inlier.any():
+        raise ValueError("no VR heading inliers")
     fwd_inlier = fwd_unit[inlier]
     mean_fwd = np.mean(fwd_inlier, axis=0)
     mean_fwd_norm = float(np.linalg.norm(mean_fwd))
@@ -276,6 +280,14 @@ def main(argv: list[str] | None = None) -> int:
 
             data, _ts, _seq = result
 
+            # Ring publication follows the hand; cached head data has its own source identity.
+            _seq = (
+                int(data["head_recv_ts_ns"][0])
+                if args.ref == "head"
+                else int(data["sequence_id"][0])
+            )
+            if args.ref == "head" and _seq <= 0:
+                continue
             # Ignore duplicate sequence numbers in the quality estimate.
             if prev_seq is not None and _seq == prev_seq:
                 stale_count += 1
