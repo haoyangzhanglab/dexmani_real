@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 class CanonicalExportConfig:
     chunk_frames: int = 100
     compression_level: int = 3
-    expected_task_name: str | None = None
 
     def __post_init__(self):
         if (
@@ -49,8 +48,6 @@ class CanonicalExportConfig:
             or not 0 <= self.compression_level <= 9
         ):
             raise ValueError("compression_level must be an integer in [0, 9]")
-        if self.expected_task_name is not None:
-            validate_task_identity(self.expected_task_name)
 
 
 def export_raw_to_zarr(
@@ -119,10 +116,6 @@ def export_raw_to_zarr(
             with EpisodeReader(episode) as reader:
                 frames = reader.num_frames
                 task = validate_task_identity(reader.meta["task_label"])
-                if config.expected_task_name is not None and task != config.expected_task_name:
-                    raise ValueError(
-                        f"{episode.name}: task_name={task!r}, expected {config.expected_task_name!r}"
-                    )
                 specs = canonical_array_specs(
                     frames,
                     processing.pointcloud.num_points,

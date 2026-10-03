@@ -16,7 +16,7 @@ from pathlib import Path
 import yaml
 from tqdm import tqdm
 
-from dexmani_real.config.experiment import resolve_experiment_config, resolve_table_plane
+from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
 from dexmani_real.dataset.contracts import ProcessingConfig, validate_task_identity
 from dexmani_real.dataset.export import (
     CanonicalExportConfig,
@@ -75,7 +75,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Rebuild and validate staging before replacing an existing canonical cache.",
+        help="Complete conversion in staging before replacing an existing canonical cache.",
     )
     parser.add_argument("--chunk-frames", type=int, default=100)
     parser.add_argument("--compression-level", type=int, default=3)
@@ -110,7 +110,7 @@ def _resolve_output_path(
     return candidate.expanduser()
 
 
-def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
+def _default_output_path(input_root: Path) -> Path:
     task_name = (
         input_root.parent.name
         if (input_root / "data.h5").exists() or input_root.name.startswith("episode_")
@@ -124,15 +124,12 @@ def _resolve_task_paths(input_root: Path) -> tuple[Path, str]:
         raise ValueError(
             "input_root must name one valid task directory, e.g. episodes/pick_place_toy"
         ) from exc
-    return Path("datasets") / f"{task_name}.zarr", task_name
+    return Path("datasets") / f"{task_name}.zarr"
 
 
 def _load_processing_config(path: Path | None) -> ProcessingConfig:
-    """Snapshot the resolved table plane once for processing and export provenance."""
-    runtime = resolve_experiment_config(
-        yaml_path=path,
-        cli_overrides={"environment.table.enabled": False},
-    )
+    """Load processing values; read the current table plane only for table removal."""
+    runtime = load_experiment_config(yaml_path=path)
     plane = (
         resolve_table_plane(runtime.environment.table) if runtime.pointcloud.remove_table else None
     )
@@ -161,7 +158,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         args.input_root = args.input_root.expanduser().resolve()
-        default_output_path, task_name = _resolve_task_paths(args.input_root)
+        default_output_path = _default_output_path(args.input_root)
         output_path = _resolve_output_path(args.output, default_output_path, args.input_root)
         config = CanonicalExportConfig(
             chunk_frames=args.chunk_frames,

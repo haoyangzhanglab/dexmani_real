@@ -39,9 +39,7 @@ class VRMappingParams:
             self.stale_threshold_s,
         )
         if not all(np.isfinite(value) and value > 0 for value in values):
-            raise ValueError(
-                "VR mapping scales, delta, and stale threshold must be finite and positive"
-            )
+            raise ValueError("VR mapping scales and stale threshold must be finite and positive")
 
 
 @dataclass(frozen=True)

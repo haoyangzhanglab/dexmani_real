@@ -31,7 +31,7 @@ from dexmani_real.config.pointcloud import PointCloudConfig
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    """Runtime values validated together at the configuration loading boundary."""
+    """Experiment values loaded together and validated at their usage boundaries."""
 
     arm: ArmParams = field(default_factory=ArmParams)
     hand: HandParams = field(default_factory=HandParams)
@@ -127,7 +127,7 @@ def _overlay(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str,
 
 
 def validate_config(cfg: ExperimentConfig) -> None:
-    """Validate numerical and cross-section invariants once before startup."""
+    """Validate shared runtime values; teleop validates its selected hand backend."""
     for section in (
         cfg.arm,
         cfg.arm.homing,
@@ -145,14 +145,8 @@ def validate_config(cfg: ExperimentConfig) -> None:
         *cfg.environment.static_boxes,
     ):
         section.validate()
-    if cfg.policy.hand_enabled:
-        (
-            cfg.tag_retargeting
-            if cfg.policy.hand_retargeting_type == "tag"
-            else cfg.dexpilot_retargeting
-        ).validate()
-    # PointCloudConfig owns its external persisted-policy validation in its
-    # constructor, shared with raw-to-policy conversion.
+    # Point-cloud numerical checks run in PointCloudConfig's constructor,
+    # including when only loading values for offline processing.
 
 
 def resolve_table_plane_path(table: TableCollisionConfig) -> Path:
@@ -183,13 +177,13 @@ def resolve_table_plane(table: TableCollisionConfig) -> tuple[float, float, floa
     return resolved.plane_abcd
 
 
-def resolve_experiment_config(
+def load_experiment_config(
     *,
     yaml_path: str | Path | None = None,
     data: Mapping[str, Any] | None = None,
     cli_overrides: Mapping[str, Any] | None = None,
 ) -> ExperimentConfig:
-    """Load YAML/data plus CLI overrides over a fresh experiment configuration."""
+    """Merge YAML/data and CLI over defaults without runtime checks or table-file I/O."""
     if yaml_path is not None and data is not None:
         raise ValueError("provide at most one of yaml_path or data")
     loaded = data if data is not None else {}
@@ -204,7 +198,17 @@ def resolve_experiment_config(
     if not isinstance(loaded, Mapping):
         raise TypeError("experiment config root must be a mapping")
     cfg = ExperimentConfig()
-    cfg = _patch(cfg, _overlay(loaded, _expand_dotted(cli_overrides)))
+    return _patch(cfg, _overlay(loaded, _expand_dotted(cli_overrides)))
+
+
+def resolve_experiment_config(
+    *,
+    yaml_path: str | Path | None = None,
+    data: Mapping[str, Any] | None = None,
+    cli_overrides: Mapping[str, Any] | None = None,
+) -> ExperimentConfig:
+    """Load runtime configuration, resolve its table and validate startup values."""
+    cfg = load_experiment_config(yaml_path=yaml_path, data=data, cli_overrides=cli_overrides)
     table = cfg.environment.table
     if table.enabled:
         table = dataclasses.replace(table, plane_abcd=resolve_table_plane(table))

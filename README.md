@@ -69,6 +69,8 @@ python examples/collect_teleop.py --print-config
 python examples/collect_teleop.py --config experiment.yaml --print-config
 ```
 
+配置优先级为 CLI > YAML > 默认值；未知字段和配置结构错误会报错。`--print-config` 解析当前运行配置及启用的桌面标定，但不启动设备。TAG/DexPilot 参数仅在启用手部遥操作时、创建进程或连接设备前校验所选后端，因此打印配置不代表该后端已通过启动检查。
+
 ### 2. 标定
 
 ```bash
@@ -104,6 +106,8 @@ python examples/read_policy_windows.py datasets/<task>.zarr --horizon 2
 ```
 
 `--info` 只查看元数据和数值概要；交互 viewer 需要 Rerun，按所选帧数顺序读取 RGB-D。公共导出始终生成全模态缓存，窗口示例再按策略所需字段选样。处理逻辑变化后，从 Raw 重新导出。
+
+离线导出复用相同的 YAML 加载和覆盖规则，只检查实际处理所需参数；未使用的 TAG/DexPilot 或遥操作数值参数不会阻挡导出。仅在 `pointcloud.remove_table: true` 时读取当前桌面平面；设为 `false` 时无需桌面标定文件，也无需修改 `environment.table.enabled`。
 
 ### 5. 训练策略
 
@@ -175,6 +179,7 @@ Raw 保存真实实验中实际发生的观测与控制证据。
 - 写盘、编码或发布失败保留 staging 并报错，不报告为成功 Raw。
 
 Raw 保存全量已接入物理模态，公共导出再重建末端、指尖与点云。动作是最终尝试的关节目标；未调用的设备目标为 NaN，dispatch 区分未调用、SDK 接受、CRC 不确定、拒绝和未知，均不证明物理到达。
+SDK 调用抛出异常不能证明设备拒绝或未收到命令，对应 dispatch 保留为 UNKNOWN；已采前缀及本次尝试目标随异常终止保存。
 
 逐行时间记录主机 monotonic 观测、机器人读取完成、相机队列返回及下发完成时间，并保留 RGB/depth 源帧号。时间 0 表示未知或未下发；旧 Raw 不伪造实测时间。latest-sample 不保证跨模态严格同步，重复源帧可以是正常采样结果。
 

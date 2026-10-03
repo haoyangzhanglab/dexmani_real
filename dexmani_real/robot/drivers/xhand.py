@@ -4,7 +4,8 @@ Reads accept known sensor/CRC statuses only with complete, finite 12-DoF joint
 positions; missing auxiliary current remains NaN. Aggregate (``calc_force``)
 and dense (``raw_force``) tactile validity are independent: an RS485
 distributed-force drop leaves aggregate contact force usable. Send CRC responses leave delivery unconfirmed without stopping
-the caller; other SDK errors are rejected.
+the caller; other non-accepted SDK codes are rejected. SDK exceptions propagate
+because they cannot establish whether the command reached the device.
 """
 
 from __future__ import annotations
@@ -564,11 +565,7 @@ class XHand:
         return self._send_command()
 
     def _send_command(self) -> XHandSendStatus:
-        try:
-            error = self._control.send_command(self.cfg.device_id, self._command)
-        except Exception:
-            logger.warning("XHand send_command raised", exc_info=True)
-            return XHandSendStatus.REJECTED
+        error = self._control.send_command(self.cfg.device_id, self._command)
 
         code = _error_code(error)
         if code == _COMMUNICATION_CRC_ERROR_CODE:

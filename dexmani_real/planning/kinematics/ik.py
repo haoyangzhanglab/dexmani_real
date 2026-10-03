@@ -106,19 +106,13 @@ class _Candidate:
 class OnlineIKSolver:
     """Exact CLIK candidates, measured-state representation and published-target continuity."""
 
-    _ELBOW_FLIP_NEG_THRESH_RAD = np.deg2rad(-5.0)
-    _ELBOW_FLIP_POS_THRESH_RAD = np.deg2rad(15.0)
-    _ELBOW_FLIP_MIN_DELTA_RAD = np.deg2rad(40.0)
-
     def __init__(
         self,
         kin: XArm7Kinematics,
         ik_geometry: IKGeometry,
         online_ik_profile: OnlineIKConfig,
-        elbow_joint_index: int = 3,
     ) -> None:
         self.kin, self.ik_geometry, self.profile = kin, ik_geometry, online_ik_profile
-        self._elbow_joint_index = elbow_joint_index
         self._rng = np.random.default_rng(online_ik_profile.random_seed)
         self._failure_start: float | None = None
         self._failure_warned = False
@@ -400,12 +394,6 @@ class OnlineIKSolver:
         if np.any(np.abs(delta_prev) > self._jump_limit):
             attempt["result"] = "jump"
             return None
-        if self._has_elbow_flip(q, previous):
-            attempt["result"] = "elbow_flip"
-            return None
-        if np.linalg.norm(delta_prev) > np.deg2rad(120):
-            attempt["result"] = "branch_jump_l2"
-            return None
         report["funnel"]["continuity_valid"] += 1
         delta = self.ik_geometry.compute_qpos_delta(q, current)
         distance = float(np.max(np.abs(delta)))
@@ -524,11 +512,3 @@ class OnlineIKSolver:
                 seeds.append(seed)
         seeds.sort(key=lambda q: self.ik_geometry.joint_limit_penalty(q, self.operational_limits))
         return list(zip(("null_preferred", "null_opposite"), seeds))
-
-    def _has_elbow_flip(self, candidate_qpos, previous_qpos_cmd):
-        prev = float(previous_qpos_cmd[self._elbow_joint_index])
-        cand = float(candidate_qpos[self._elbow_joint_index])
-        crosses = (
-            prev < self._ELBOW_FLIP_NEG_THRESH_RAD and cand > self._ELBOW_FLIP_POS_THRESH_RAD
-        ) or (cand < self._ELBOW_FLIP_NEG_THRESH_RAD and prev > self._ELBOW_FLIP_POS_THRESH_RAD)
-        return crosses and abs(cand - prev) > self._ELBOW_FLIP_MIN_DELTA_RAD

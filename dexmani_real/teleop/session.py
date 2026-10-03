@@ -52,6 +52,12 @@ def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, allow_no_hand
     task_name = validate_task_dir_name(task_name)
     if not runtime.policy.hand_enabled and (runtime.policy.recording_enabled or not allow_no_hand):
         raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")
+    if runtime.policy.hand_enabled:
+        (
+            runtime.tag_retargeting
+            if runtime.policy.hand_retargeting_type == "tag"
+            else runtime.dexpilot_retargeting
+        ).validate()
     load_vr_transform(VR_TRANSFORM_PATH)
     if runtime.policy.recording_enabled:
         _validate_recording_resources()

@@ -168,7 +168,6 @@ class XArm7MotionPlanner:
             self.kin,
             self.ik_geometry,
             self.online_ik_profile,
-            elbow_joint_index=self._elbow_joint_index,
         )
 
         self.dof = dof
@@ -572,7 +571,7 @@ class XArm7MotionPlanner:
             report["limit_violation_qpos_deg"] = np.rad2deg(path[waypoint_indices[0]].copy())
         return report
 
-    # Detect elbow branch flips using the shared -5°/15° band and path span.
+    # Detect elbow branch flips using the -5°/15° band and path span.
     _ELBOW_NEG_BAND_RAD: float = np.deg2rad(-5.0)
     _ELBOW_POS_BAND_RAD: float = np.deg2rad(15.0)
     _ELBOW_MIN_SPAN_RAD: float = np.deg2rad(45.0)
