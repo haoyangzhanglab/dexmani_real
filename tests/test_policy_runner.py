@@ -9,6 +9,8 @@ from dexmani_real.deployment.config import ExecutionConfig
 from dexmani_real.deployment.inference import ModelResult
 from dexmani_real.deployment.observation import decision_is_fresh, policy_sources
 from dexmani_real.deployment.runner import PolicyRunner
+from dexmani_real.planning.kinematics.ik import IKFailureKind, IKResult
+from dexmani_real.robot.action import ActionRealization
 from dexmani_real.robot.robot import DispatchResult, DispatchStatus
 from dexmani_real.runtime.observation import ObservationRow
 from dexmani_real.runtime.safety import RunEndReason, SafetyState, request_policy_stop
@@ -20,6 +22,7 @@ class Worker:
         self.future = None
         self.submissions = []
         self.reclaimed = []
+        self.closed = False
 
     def submit(self, op, *args, **kwargs):
         assert self.future is None
@@ -39,7 +42,7 @@ class Worker:
         return self.op, result
 
     def close(self):
-        pass
+        self.closed = True
 
 
 class Robot:
@@ -52,6 +55,9 @@ class Robot:
         self.result = DispatchResult(DispatchStatus.ACCEPTED, DispatchStatus.ACCEPTED)
 
     def check(self):
+        pass
+
+    def service_idle(self):
         pass
 
     def send_action(self, command):
@@ -343,7 +349,16 @@ def test_prepare_is_transactional_and_frozen_dynamic_rejection(make_runner):
     def realize(intent, current, previous):
         calls.append(previous)
         if len(calls) == 2:
-            return NS(arm_qpos=None, ik_result=NS(reason="unreachable"))
+            return ActionRealization(
+                None,
+                None,
+                ik_result=IKResult(
+                    success=False,
+                    qpos=None,
+                    reason="unreachable",
+                    failure_kind=IKFailureKind.NO_SOLUTION_FOUND,
+                ),
+            )
         return original(intent, current, previous)
 
     r.realizer.realize = realize
@@ -478,3 +493,196 @@ def test_slow_observation_read_breaks_history_even_without_full_slot_skip(make_r
     assert not r.model.submissions
     r.tick(2)
     assert len(r.model.submissions) == 1
+
+
+@pytest.mark.parametrize("mode", ["async", "rtc"])
+@pytest.mark.parametrize("first_reason", [None, RunEndReason.OPERATOR, RunEndReason.QUIT])
+def test_eef_prefix_technical_failure_ends_run_without_partial_publication(
+    make_runner, mode, first_reason
+):
+    r = make_runner(mode=mode)
+    b = bootstrap(r)
+    plan = r.plan
+    actions = np.pad(plan.actions, ((0, 0), (0, 2)))
+    original_actions = actions.copy()
+    plan.actions = actions
+    r.policy_info.action_mode = "eef"
+    previous = r.previous_arm.copy()
+    saved = []
+    r.recorder = NS(
+        check_error=lambda: None,
+        save_episode=lambda **kwargs: saved.append(kwargs),
+        close=lambda: None,
+    )
+    calls = []
+
+    def unexpected_record(*args):
+        raise AssertionError("technical IK failure continued execution")
+
+    r._record = unexpected_record
+
+    def realize(intent, current, prior):
+        np.testing.assert_array_equal(r.previous_arm, previous)
+        calls.append(prior.copy())
+        if len(calls) == 2:
+            if first_reason is not None:
+                request_policy_stop(r.shared, reason=first_reason)
+            return ActionRealization(
+                None,
+                None,
+                ik_result=IKResult(
+                    success=False,
+                    qpos=None,
+                    reason="nonfinite solver output",
+                    failure_kind=IKFailureKind.INVALID_OUTPUT,
+                ),
+            )
+        return ActionRealization(np.full(7, 0.01), np.zeros(12))
+
+    r.realizer.realize = realize
+    r.clock.now = 1_000_000_000 + int((b + 1) * 1e8)
+    with pytest.raises(RuntimeError, match="online IK technical failure: nonfinite solver output"):
+        r.run()
+    assert r.run_id is None and r.completed == 1
+    assert r.robot.stops == 1 and len(r.robot.sent) == 1
+    assert [op for op, _, _ in r.model.submissions] == ["predict"]
+    assert r.model.future is None and r.model.closed
+    assert not plan.frozen and r.query is None and r.plan is None
+    np.testing.assert_array_equal(plan.actions, original_actions)
+    np.testing.assert_array_equal(calls[0], previous)
+    assert r.previous_arm is None
+    reason = first_reason or RunEndReason.POLICY_FAILURE
+    assert saved == [{"reason": reason.name.lower()}]
+    end = [e for e in r.recorder.policy_trace["events"] if e["event"] == "end"]
+    assert len(end) == 1 and end[0]["reason"] == reason.name.lower()
+    assert "nonfinite solver output" in end[0]["detail"]
+
+
+@pytest.mark.parametrize("mode", ["async", "rtc"])
+@pytest.mark.parametrize(
+    "failure_kind", [IKFailureKind.NO_SOLUTION_FOUND, IKFailureKind.NO_VALID_CANDIDATE]
+)
+def test_eef_prefix_no_solution_retains_wait_and_bootstrap(make_runner, mode, failure_kind):
+    r = make_runner(mode=mode)
+    b = bootstrap(r)
+    plan = r.plan
+    plan.actions = np.pad(plan.actions, ((0, 0), (0, 2)))
+    r.policy_info.action_mode = "eef"
+    previous = r.previous_arm.copy()
+    r.realizer.realize = lambda *args: ActionRealization(
+        None,
+        None,
+        ik_result=IKResult(
+            success=False, qpos=None, reason="unreachable", failure_kind=failure_kind
+        ),
+    )
+    r.tick(b + 1)
+    deadline = r.wait_started_ns
+    assert r.run_id is not None and r.completed == 0 and r.robot.stops == 0
+    assert r.plan is None and r.query is None and not plan.frozen
+    assert len(r.model.submissions) == 1
+    np.testing.assert_array_equal(r.previous_arm, previous)
+    r.tick(b + 2)
+    assert [op for op, _, _ in r.model.submissions] == ["predict", "predict"]
+    assert r.query.handoff_slot is None and r.wait_started_ns == deadline
+
+
+@pytest.fixture
+def idle_runner(make_runner):
+    r = make_runner(mode="sync", execute=False)
+    r._finish_episode("test setup")
+    r.runtime.camera = NS(height=16, width=16)
+    r._start_observation = r._read_observation
+    r.recorder = NS(
+        execution_path="worker_grid_sync_v1", check_error=lambda: None, close=lambda: None
+    )
+    return r
+
+
+@pytest.mark.parametrize(
+    "mode,age,wait,durations,message",
+    [
+        ("async", 10.0, 1.0, (0.01, 2.0), "max_wait_s"),
+        ("rtc", 10.0, 1.0, (0.01, 2.0), "max_wait_s"),
+        ("sync", 10.0, 1.0, (1.0,), "max_wait_s"),
+        ("async", 10.0, 1.0, (0.2,), "prefetch budget"),
+        ("rtc", 10.0, 1.0, (0.2,), "prefetch budget"),
+        ("sync", 0.5, 1.0, (0.3,), "max_decision_age_s"),
+        ("sync", 0.5, 1.0, (0.31,), "max_decision_age_s"),
+    ],
+)
+def test_mode_warmup_budget_failure_blocks_start_and_preserves_official_config(
+    idle_runner, mode, age, wait, durations, message
+):
+    r = idle_runner
+    old = r.execution
+    config = ExecutionConfig(mode, age, wait, 0.03, 2, 2.0)
+    r.set_execution_mode(config)
+    assert r.execution is old and r.recorder.execution_path == "worker_grid_sync_v1"
+    assert r.pending_execution is config
+    r.shared.start_request.value = True
+    r.step()
+    assert r.preparing_epoch is None and r.model.op == "configure_execution"
+    r.model.complete(durations)
+    with pytest.raises(ValueError, match=message):
+        r.run()
+    assert r.execution is old and r.recorder.execution_path == "worker_grid_sync_v1"
+    assert r.run_id is None and r.preparing_epoch is None
+    assert r.shared.error_state.value and not r.shared.is_running.value
+    assert [op for op, _, _ in r.model.submissions] == ["configure_execution"]
+    assert r.model.future is None and r.model.closed
+    assert r.pending_execution is config
+    with pytest.raises(RuntimeError):
+        r.set_execution_mode(config)
+    assert [op for op, _, _ in r.model.submissions] == ["configure_execution"]
+
+
+def test_mode_worker_failure_blocks_start_and_preserves_official_config(idle_runner):
+    r = idle_runner
+    old = r.execution
+    r.set_execution_mode(ExecutionConfig("rtc", 10.0, 1.0, 0.03, 2, 2.0))
+    r.shared.start_request.value = True
+    r.model.complete(error=RuntimeError("warmup failed"))
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        r.run()
+    assert r.execution is old and r.recorder.execution_path == "worker_grid_sync_v1"
+    assert r.run_id is None and r.preparing_epoch is None and r.model.closed
+    assert [op for op, _, _ in r.model.submissions] == ["configure_execution"]
+
+
+@pytest.mark.parametrize("mode", ["sync", "async", "rtc"])
+def test_legal_mode_warmup_commits_before_reset_and_start(idle_runner, mode, monkeypatch):
+    r = idle_runner
+    old = r.execution
+    config = ExecutionConfig(mode, 10.0, 1.0, 0.03, 2, 2.0)
+    r.reset_ready = True
+    r.set_execution_mode(config)
+    op, _, kwargs = r.model.submissions[-1]
+    assert op == "configure_execution" and kwargs["warmup"]
+    assert kwargs["rtc_delay"] == (2 if mode == "rtc" else 0)
+    r.shared.start_request.value = True
+    r.step()
+    assert r.execution is old and r.recorder.execution_path == "worker_grid_sync_v1"
+    assert not r.reset_ready
+    assert r.preparing_epoch is None and len(r.model.submissions) == 1
+    r.model.complete((0.01, 0.19))
+    r.step()
+    assert r.execution is config and r.recorder.execution_path == f"worker_grid_{mode}_v1"
+    assert r.pending_execution is None
+    assert [op for op, _, _ in r.model.submissions] == ["configure_execution", "reset_episode"]
+    assert r.run_id is None and r.preparing_epoch is not None
+    r.recording_config = NS(task_label="synthetic")
+    r.recorder.start_episode = lambda **kwargs: True
+    r.recorder.is_recording = False
+    r.recorder.add_frame = lambda frame: None
+    monkeypatch.setattr(
+        "dexmani_real.deployment.runner.snapshot_recording_metadata", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(
+        "dexmani_real.deployment.runner.build_episode_frame", lambda row, *args: row
+    )
+    r.model.complete()
+    r.step()
+    assert r.run_id is not None
+    assert r.events[0]["event"] == "begin" and r.events[0]["mode"] == mode
+    assert [op for op, _, _ in r.model.submissions] == ["configure_execution", "reset_episode"]

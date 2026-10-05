@@ -166,3 +166,20 @@ class ExecutionConfig:
             if isinstance(beta, bool) or beta is None or not math.isfinite(beta) or beta < 0:
                 raise ValueError("rtc_guidance_cap requires an explicit finite nonnegative value")
         return self
+
+
+def validate_warmup_budget(durations, execution_config, info):
+    """Apply the same measured model-path budgets before startup or a mode change."""
+    maximum = max(durations)
+    if maximum >= execution_config.max_wait_s:
+        raise ValueError("Measured inference already exceeds max_wait_s; bootstrap cannot fit")
+    if execution_config.execution_mode == "sync":
+        if (
+            maximum + (info.n_action_steps - 1) * info.control_dt_s
+            >= execution_config.max_decision_age_s
+        ):
+            raise ValueError("Measured inference plus A slots exceeds max_decision_age_s")
+    elif maximum >= execution_config.prefetch_steps * info.control_dt_s:
+        raise ValueError(
+            "Measured model path exceeds configured prefetch budget; no automatic budget relaxation"
+        )

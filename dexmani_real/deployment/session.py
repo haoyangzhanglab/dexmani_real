@@ -8,6 +8,7 @@ from dexmani_real.deployment.config import (
     validate_max_running_s,
     validate_num_episodes,
     validate_policy_runtime_compatibility,
+    validate_warmup_budget,
 )
 from dexmani_real.deployment.observation import build_fingertip_runtime
 from dexmani_real.deployment.operator import PolicyOperator
@@ -109,14 +110,7 @@ def run_policy_deployment(
         if completion[1].error is not None:
             raise completion[1].error
         durations = completion[1].value
-        if max(durations) >= execution_config.max_wait_s:
-            raise ValueError("Measured inference already exceeds max_wait_s; bootstrap cannot fit")
-        if (
-            execution_config.execution_mode == "sync"
-            and max(durations) + (info.n_action_steps - 1) * info.control_dt_s
-            >= execution_config.max_decision_age_s
-        ):
-            raise ValueError("Measured inference plus A slots exceeds max_decision_age_s")
+        validate_warmup_budget(durations, execution_config, info)
         logger.info("Model warmup durations (not realtime bounds): %s", durations)
         if execution_config.execution_mode != "sync":
             import math
@@ -126,10 +120,6 @@ def run_policy_deployment(
                 "Model-only prefetch suggestion d=%d; measure owner prefix/input overhead separately",
                 suggested,
             )
-            if max(durations) >= execution_config.prefetch_steps * info.control_dt_s:
-                raise ValueError(
-                    "Measured model path exceeds configured prefetch budget; no automatic budget relaxation"
-                )
         fingertip = build_fingertip_runtime(info, runtime)
         robot.connect()
         sensors = []

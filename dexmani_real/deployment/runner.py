@@ -9,6 +9,7 @@ from dexmani_real.deployment.action import (
     physical_action_dim,
     policy_action_intent,
 )
+from dexmani_real.deployment.config import validate_warmup_budget
 from dexmani_real.deployment.observation import (
     build_policy_observation,
     decision_is_fresh,
@@ -62,6 +63,7 @@ class PolicyRunner:
         self.policy_info = policy_info
         self.model = model_runtime
         self.execution = execution_config.validate(policy_info)
+        self.pending_execution = None
         self.fingertip_runtime = fingertip_runtime
         self.execute = execute
         self.max_running_s = max_running_s
@@ -228,10 +230,12 @@ class PolicyRunner:
             self.run_id is not None
             or self.preparing_epoch is not None
             or self.model.future is not None
+            or self.pending_execution is not None
         ):
             raise RuntimeError("Mode changes require an idle owner and a reclaimed model Future")
         execution_config.validate(self.policy_info)
-        self.execution = execution_config
+        self.pending_execution = execution_config
+        self.reset_ready = False
         self.plan = self.query = None
         self.model.submit(
             "configure_execution",
@@ -239,11 +243,14 @@ class PolicyRunner:
             execution_config.rtc_guidance_cap,
             warmup=True,
             rgb_hw=(self.runtime.camera.height, self.runtime.camera.width),
+            rtc_delay=execution_config.prefetch_steps
+            if execution_config.execution_mode == "rtc"
+            else 0,
         )
-        if self.recorder is not None:
-            self.recorder.execution_path = f"worker_grid_{execution_config.execution_mode}_v1"
 
     def _begin_episode(self):
+        if self.pending_execution is not None:
+            return
         if self.preparing_epoch is None:
             with self.shared.motion_lock:
                 if not self.shared.start_request.value or self.model.future is not None:
@@ -324,6 +331,18 @@ class PolicyRunner:
         if item is None:
             return
         operation, result = item
+        if operation == "configure_execution":
+            if result.error is not None:
+                raise result.error
+            config = self.pending_execution
+            if config is None:
+                raise RuntimeError("Mode configuration result has no pending execution config")
+            validate_warmup_budget(result.value, config, self.policy_info)
+            self.execution = config
+            if self.recorder is not None:
+                self.recorder.execution_path = f"worker_grid_{config.execution_mode}_v1"
+            self.pending_execution = None
+            return
         if operation == "reset_episode":
             if result.error is not None:
                 raise result.error
@@ -447,6 +466,8 @@ class PolicyRunner:
                 previous,
             )
             if decoded.arm_qpos is None:
+                if decoded.ik_result.failure_kind == IKFailureKind.INVALID_OUTPUT:
+                    raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
                 self._event("prefix_rejected", slot=slot, detail=decoded.ik_result.reason)
                 return None, None
             command = RobotCommand(self.run_id, decoded.arm_qpos, decoded.hand_qpos)
