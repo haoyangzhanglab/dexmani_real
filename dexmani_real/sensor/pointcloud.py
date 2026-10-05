@@ -19,10 +19,6 @@ from scipy.sparse.csgraph import connected_components  # type: ignore[import-unt
 from scipy.spatial import cKDTree  # type: ignore[import-untyped]
 
 from dexmani_real.config.pointcloud import (
-    POINT_CLOUD_COLOR_SOURCE,
-    POINT_CLOUD_POLICY_ID,
-    POINT_CLOUD_SAMPLING,
-    POINT_CLOUD_TRANSFORM,
     PointCloudConfig,
 )
 from dexmani_real.sensor.camera.geometry import (
@@ -35,10 +31,6 @@ from dexmani_real.utils.geometry import validate_rigid_transform
 _KERNEL_3X3 = np.ones((3, 3), dtype=np.uint8)
 
 __all__ = [
-    "POINT_CLOUD_COLOR_SOURCE",
-    "POINT_CLOUD_POLICY_ID",
-    "POINT_CLOUD_SAMPLING",
-    "POINT_CLOUD_TRANSFORM",
     "PointCloudConfig",
     "build_raw_point_cloud",
     "build_point_cloud",

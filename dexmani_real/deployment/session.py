@@ -39,8 +39,13 @@ def run_policy_deployment(
     max_running_s=None,
     num_episodes=1,
     recording_config=None,
+    execution_config=None,
 ):
+    from dexmani_real.deployment.config import ExecutionConfig
+    from dexmani_real.deployment.inference import InferenceWorker
+
     info = policy_config.info
+    execution_config = (execution_config or ExecutionConfig()).validate(info)
     cloud_recipe = validate_policy_runtime_compatibility(info, runtime)
     max_running_s = validate_max_running_s(max_running_s)
     num_episodes = validate_num_episodes(num_episodes)
@@ -75,11 +80,57 @@ def run_policy_deployment(
     try:
         from dexmani_policy.deployment import load_policy
 
-        model = load_policy(
-            policy_config.config, info, device=policy_config.device, seed=policy_config.seed
+        def load():
+            loaded = load_policy(
+                policy_config.config, info, device=policy_config.device, seed=policy_config.seed
+            )
+            try:
+                loaded.configure_execution(
+                    execution_config.execution_mode, execution_config.rtc_guidance_cap
+                )
+                return loaded
+            except BaseException:
+                loaded.close()
+                raise
+
+        model = InferenceWorker(load)
+        model.submit(
+            "load",
+            samples=5,
+            rgb_hw=(runtime.camera.height, runtime.camera.width),
+            rtc_delay=execution_config.prefetch_steps
+            if execution_config.execution_mode == "rtc"
+            else 0,
         )
+        import time
+
+        while (completion := model.poll()) is None:
+            time.sleep(0.005)
+        if completion[1].error is not None:
+            raise completion[1].error
+        durations = completion[1].value
+        if max(durations) >= execution_config.max_wait_s:
+            raise ValueError("Measured inference already exceeds max_wait_s; bootstrap cannot fit")
+        if (
+            execution_config.execution_mode == "sync"
+            and max(durations) + (info.n_action_steps - 1) * info.control_dt_s
+            >= execution_config.max_decision_age_s
+        ):
+            raise ValueError("Measured inference plus A slots exceeds max_decision_age_s")
+        logger.info("Model warmup durations (not realtime bounds): %s", durations)
+        if execution_config.execution_mode != "sync":
+            import math
+
+            suggested = math.ceil(max(durations) / info.control_dt_s) + 1
+            logger.info(
+                "Model-only prefetch suggestion d=%d; measure owner prefix/input overhead separately",
+                suggested,
+            )
+            if max(durations) >= execution_config.prefetch_steps * info.control_dt_s:
+                raise ValueError(
+                    "Measured model path exceeds configured prefetch budget; no automatic budget relaxation"
+                )
         fingertip = build_fingertip_runtime(info, runtime)
-        model.warmup(samples=5, rgb_hw=(runtime.camera.height, runtime.camera.width))
         robot.connect()
         sensors = []
         if camera:
@@ -112,6 +163,7 @@ def run_policy_deployment(
             robot=robot,
             poll_operator=operator.poll,
             model_runtime=model,
+            execution_config=execution_config,
             fingertip_runtime=fingertip,
             execute=execute,
             max_running_s=max_running_s,
@@ -136,4 +188,8 @@ def run_policy_deployment(
             keyboard=operator.keyboard if operator else None,
             timeout_s=runtime.safety.shutdown_timeout_s,
         )
+    if model is not None and not model.closed:
+        logger.warning("Model cleanup remains pending; Python/CUDA exit is not bounded")
+    if model is not None and model.close_error is not None:
+        shutdown_clean = False
     return int(not clean or failure is not None or not shutdown_clean)

@@ -100,3 +100,28 @@ class ActionRealizer:
             ik_result=result,
             eef_pose=np.concatenate((position, arm[3:])),
         )
+
+    def control_from_command(self, command, mode):
+        if mode == "joint":
+            return np.concatenate((command.arm_qpos, command.hand_qpos))
+        from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
+
+        pose = compute_eef_pose_history_xarm_base(command.arm_qpos[None])[0]
+        return np.concatenate((pose, command.hand_qpos))
+
+    def frozen_is_valid(self, command, current, previous, mode):
+        previous = current if previous is None else previous
+        if mode == "eef":
+            return (
+                self.planner.online_ik_solver.dynamic_rejection(command.arm_qpos, current, previous)
+                is None
+            )
+        # Projection is allowed at preparation only. A changed equivalent branch
+        # invalidates the reservation instead of silently changing its condition.
+        projected = project_arm_command(
+            command.arm_qpos,
+            current,
+            joint_lower_rad=self.runtime.arm.joint_limit_lower,
+            joint_upper_rad=self.runtime.arm.joint_limit_upper,
+        )
+        return np.array_equal(projected, command.arm_qpos)

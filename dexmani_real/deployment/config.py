@@ -129,3 +129,40 @@ class RolloutRecordingConfig:
         if self.task_label != self.task_label.strip():
             raise ValueError("rollout task_label must not have surrounding whitespace")
         object.__setattr__(self, "data_dir", str(resolved_data_dir))
+
+
+@dataclass(frozen=True)
+class ExecutionConfig:
+    execution_mode: str = "sync"
+    max_decision_age_s: float | None = None
+    max_wait_s: float | None = None
+    max_tick_lateness_s: float | None = None
+    prefetch_steps: int | None = None
+    rtc_guidance_cap: float | None = None
+
+    def validate(self, info):
+        if self.execution_mode not in {"sync", "async", "rtc"}:
+            raise ValueError("execution_mode must be sync, async or rtc")
+        for name in ("max_decision_age_s", "max_wait_s", "max_tick_lateness_s"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or value is None or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} requires an explicit finite positive experimental budget")
+        if self.max_tick_lateness_s >= info.control_dt_s:
+            raise ValueError("max_tick_lateness_s must be smaller than control_dt_s")
+        p = info.horizon - info.n_obs_steps + 1
+        a = info.n_action_steps
+        if not 1 <= a <= p:
+            raise ValueError("sync requires 1 <= A <= P=H-N+1")
+        if self.execution_mode != "sync":
+            d = self.prefetch_steps
+            if type(d) is not int or not 1 <= d <= a or a + d > p:
+                raise ValueError(f"async/rtc require 1 <= d <= A and A+d <= P; A={a}, P={p}, d={d}")
+            if self.max_decision_age_s <= (a + d - 1) * info.control_dt_s:
+                raise ValueError("decision age budget cannot cover the asynchronous A+d slots")
+        elif self.max_decision_age_s <= (a - 1) * info.control_dt_s:
+            raise ValueError("decision age budget cannot cover the synchronous A slots")
+        if self.execution_mode == "rtc":
+            beta = self.rtc_guidance_cap
+            if isinstance(beta, bool) or beta is None or not math.isfinite(beta) or beta < 0:
+                raise ValueError("rtc_guidance_cap requires an explicit finite nonnegative value")
+        return self

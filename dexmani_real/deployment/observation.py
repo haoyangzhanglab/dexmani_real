@@ -90,7 +90,37 @@ def build_policy_observation(rows, policy_info, *, fingertip_runtime=None):
     result = {}
     for name in policy_info.observation_fields:
         values = np.ascontiguousarray(arrays[name])
-        if not np.isfinite(values).all():
+        if values.dtype != np.uint8 and not np.isfinite(values).all():
             raise ValueError(f"Nonfinite policy observation {name}")
         result[name] = values
     return result
+
+
+def policy_sources(row, fields):
+    """Host read/queue-return times of each requested latest-slot input dependency."""
+    arm = int(row.arm["timestamp_ns"][0])
+    hand = int(row.hand["timestamp_ns"][0])
+    sources = {}
+    for name in fields:
+        if name in {"joint_state", "fingertip_points"}:
+            times = (arm, hand)
+        elif name == "eef_pose":
+            times = (arm,)
+        elif name in {"contact_force", "tactile_force"}:
+            times = (hand,)
+        elif name == "point_cloud":
+            times = (row.pointcloud_timestamp_ns,)
+        elif name == "rgb":
+            times = (int(row.camera["timestamp_ns"]),)
+        else:
+            raise ValueError(f"No source clock for {name}")
+        sources[name] = times
+    return sources
+
+
+def decision_is_fresh(sources, now_ns, max_age_s):
+    return bool(sources) and all(
+        0 < timestamp <= now_ns and now_ns - timestamp <= int(max_age_s * 1e9)
+        for times in sources.values()
+        for timestamp in times
+    )

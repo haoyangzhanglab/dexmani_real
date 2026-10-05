@@ -369,6 +369,23 @@ class OnlineIKSolver:
             raise ValueError("CLIK reported convergence without a joint vector")
         return self._prepare_candidate(raw, attempt, target, current, previous, pool, report)
 
+    def dynamic_rejection(self, q, current, previous):
+        """Recheck a frozen solution against new feedback without changing its branch."""
+        q, current, previous = (self._finite_q(value) for value in (q, current, previous))
+        lo, hi = self.operational_limits.T
+        if np.any(q < lo) or np.any(q > hi):
+            return "operational_limits"
+        delta_prev = self.ik_geometry.compute_qpos_delta(q, previous)
+        if np.any(np.abs(delta_prev) > self._jump_limit):
+            return "jump"
+        delta = self.ik_geometry.compute_qpos_delta(q, current)
+        distance = float(np.max(np.abs(delta)))
+        if np.max(np.abs(q - current)) - distance > np.deg2rad(90):
+            return "band_switch"
+        if distance > np.deg2rad(150):
+            return "hw_dist"
+        return None
+
     def _prepare_candidate(self, raw, attempt, target, current, previous, pool, report):
         # Mechanical equivalence survives narrowing the operational interval below 2*pi.
         q = raw.copy()
@@ -390,19 +407,16 @@ class OnlineIKSolver:
         if any(np.max(np.abs(q - c.qpos)) < 1e-4 for c in pool):
             attempt["result"] = "duplicate"
             return None
-        delta_prev = self.ik_geometry.compute_qpos_delta(q, previous)
-        if np.any(np.abs(delta_prev) > self._jump_limit):
-            attempt["result"] = "jump"
+        rejection = self.dynamic_rejection(q, current, previous)
+        if rejection is not None:
+            if rejection in {"band_switch", "hw_dist"}:
+                report["funnel"]["continuity_valid"] += 1
+            attempt["result"] = rejection
             return None
-        report["funnel"]["continuity_valid"] += 1
+        delta_prev = self.ik_geometry.compute_qpos_delta(q, previous)
         delta = self.ik_geometry.compute_qpos_delta(q, current)
         distance = float(np.max(np.abs(delta)))
-        if np.max(np.abs(q - current)) - distance > np.deg2rad(90):
-            attempt["result"] = "band_switch"
-            return None
-        if distance > np.deg2rad(150):
-            attempt["result"] = "hw_dist"
-            return None
+        report["funnel"]["continuity_valid"] += 1
         report["funnel"]["hardware_valid"] += 1
         pos_err, rot_err = compute_pose_error(target, self.kin.compute_eef_pose_world(q))
         if not np.isfinite((pos_err, rot_err)).all():

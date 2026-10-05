@@ -14,8 +14,9 @@ def physical_action_dim(action_mode):
 
 
 def policy_action_intent(action, action_mode):
+    """Split one row of an admitted policy future into a physical intent."""
     action = np.asarray(action, dtype=np.float64)
-    if action.shape != (physical_action_dim(action_mode),) or not np.isfinite(action).all():
-        raise ValueError("physical action must have the expected shape and finite values")
+    if action.shape != (physical_action_dim(action_mode),):
+        raise ValueError("physical action must have the expected shape")
     split = 7 if action_mode == "joint" else 9
-    return ActionIntent(action_mode, action[:split].copy(), action[split:].copy())
+    return ActionIntent(action_mode, action[:split], action[split:])

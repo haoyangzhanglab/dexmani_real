@@ -9,6 +9,7 @@ needs separate confirmation and affects perception and collision geometry on the
 from __future__ import annotations
 
 import argparse
+import hashlib
 import shutil
 import tempfile
 import time
@@ -36,10 +37,6 @@ from dexmani_real.sensor.camera.realsense import (
     RealSenseCameraConfig,
 )
 from dexmani_real.sensor.pointcloud import (
-    POINT_CLOUD_COLOR_SOURCE,
-    POINT_CLOUD_POLICY_ID,
-    POINT_CLOUD_SAMPLING,
-    POINT_CLOUD_TRANSFORM,
     aligned_depth_points_in_base,
     build_point_cloud,
     build_raw_point_cloud,
@@ -289,10 +286,9 @@ def _save_diagnostic_snapshot(
         "table_plane_abcd": table_plane_json,
         "table_plane_source": table_plane_source,
         "pointcloud_config": pointcloud_config.to_dict(),
-        "point_cloud_policy_id": POINT_CLOUD_POLICY_ID,
-        "point_cloud_color_source": POINT_CLOUD_COLOR_SOURCE,
-        "point_cloud_sampling": POINT_CLOUD_SAMPLING,
-        "point_cloud_transform": POINT_CLOUD_TRANSFORM,
+        "pointcloud_source_sha256": hashlib.sha256(
+            (Path(__file__).resolve().parents[1] / "dexmani_real/sensor/pointcloud.py").read_bytes()
+        ).hexdigest(),
         "point_cloud_frame": "xarm_base",
         "point_cloud_columns": ["x_m", "y_m", "z_m", "r", "g", "b"],
         "raw_point_cloud_semantics": "all_finite_nonzero_aligned_depth_pixels",

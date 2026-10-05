@@ -126,7 +126,9 @@ Checkpoint
 ### 6. 真机评估
 
 ```bash
-python examples/run_policy.py <policy/task/experiment> --config experiment.yaml --checkpoint best
+python examples/run_policy.py <policy/task/experiment> --config experiment.yaml --checkpoint best \
+  --max-decision-age "$MAX_DECISION_AGE_S" --max-wait "$MAX_WAIT_S" \
+  --max-tick-lateness "$MAX_TICK_LATENESS_S"
 ```
 
 H 执行 HOME，B 请求开始，S 停止，Q 退出；开始前检查当前 arm/hand HOME 姿态，不依赖历史 HOME 令牌。默认每段运行预算 60 秒，可用 `--max-duration` 修改。
@@ -135,13 +137,14 @@ H 执行 HOME，B 请求开始，S 停止，Q 退出；开始前检查当前 arm
 `n_obs_steps - 1 + N <= horizon`，不会改写训练配置或 checkpoint。
 实际长度和覆盖参数会保存在 `run_config.yaml`。
 
-Policy、VR teleop、keyboard、replay 和 camera calibration 的正常动作统一由本地薄组合 Robot 调用现有 xArm / XHand 驱动。模型推理、设备读写及 HOME 在同一应用线程串行执行；传感器进程和录制 writer 保留。Policy 每轮读取观测、按需同步推理、发送一个目标，并只等待剩余周期预算。
+三个预算变量需由实验者显式指定（秒），其中槽位迟到容限必须小于保存的 dt；它们不等于 episode 总时长，也不由论文或 warmup 推断为硬件安全值。
 
-历史仅使用最近 N 个真实观测，启动先采满，慢推理期间没有新控制观测；不复制当前帧掩盖时间缺口。
+默认 `--execution-mode sync`。异步基线增加 `--execution-mode async --prefetch-steps "$D"`；RTC 增加 `--execution-mode rtc --prefetch-steps "$D" --rtc-guidance-cap "$BETA"`。模型加载与 warmup 在设备连接前完成，RTC 仅支持已适配的连续动作 DDIM 路径。参数约束、支持范围、调度与离线验证见 [Policy 执行说明](docs/policy_execution.md)。
+
 录制行是控制观测与尝试目标，并非每条 action 都有一次模型 query。rollout 录制独立保存完整 RGB-D/触觉，公共点云由保存行的 RGB-D 重建。
 工作空间 bounds 只裁剪 EEF 意图；它不证明最终 FK 或整条轨迹都在界内。
 
-单线程在推理或 SDK 阻塞期间不能并发调用物理停止，也不提供独立于推理的 Python 触觉采样。现场需另行确认停止覆盖、阻塞容忍、反馈/触觉需求与实际工作预算。`execute=False` 仍可能连接并读取设备。
+模型在独立 worker 中推理，设备 owner 等待结果时继续采样并处理停止。设备 SDK、GIL 或 CUDA 阻塞仍可能影响响应，线程不保证物理停止或有界退出；现场需验证停止覆盖、反馈需求和工作预算。`execute=False` 仍会连接并读取设备，仅表示不下发策略目标。
 
 策略 rollout 使用当前真实实验环境的有效标定与硬件状态。离线测试、仿真结果或 checkpoint 可加载均不等价于真机安全验证。
 
@@ -207,7 +210,7 @@ RGB 保持 RGB 顺序和采集分辨率，depth 为对齐彩色的 uint16 配 de
 Zarr 的 `row_info` 保留 Raw 的逐行时间、源帧号和 dispatch，`meta/episode_ends` 保留 episode 边界；`dt` 仅为名义周期。缺可解码 RGB-D 或有效 depth scale 时不能完整导出，数值字段仍可单独读取。
 
 [离线窗口示例](examples/read_policy_windows.py) 对 RGB 与触觉策略分别选所需字段和连续原行号窗口，使用 dispatch，不跨 episode 或缺失所需样本的行；不把时间抖动当缺测。
-相邻 `dexmani_policy` 的现有 SequenceSampler 和 normalization 仍按完整 buffer 取样/统计，尚未处理此处的 NaN、dispatch 与真实时间；使用新缺测数据训练前必须适配，不能直接喂给旧 loader。固定频率模型的时间选样仍由训练约定决定。
+相邻 `dexmani_policy` 按实际输入、完整监督和两设备 ACCEPTED dispatch 筛选训练窗口，仅用有效训练窗口引用的去重源行拟合统计。验证复用训练统计，checkpoint 使用其保存统计；详见 [数据与追踪](docs/policy_execution.md#数据与追踪)。
 
 ## Repository Layout
 

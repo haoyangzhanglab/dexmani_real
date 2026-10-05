@@ -109,6 +109,7 @@ class AsyncEpisodeRecorder:
         control_hz=16.0,
         rgb_shape=None,
         video_config=None,
+        execution_path="synchronous_direct_sdk_v1",
     ):
         if not np.isfinite(control_hz) or control_hz <= 0:
             raise ValueError("recording control_hz must be finite and positive")
@@ -118,6 +119,8 @@ class AsyncEpisodeRecorder:
         if len(self._rgb_shape) != 3 or self._rgb_shape[2] != 3 or min(self._rgb_shape) <= 0:
             raise ValueError("recording rgb_shape must be positive HWC with 3 channels")
         self._video_config = video_config
+        self.execution_path = execution_path
+        self.policy_trace = None
         self._thread = None
         self._queue = Queue(maxsize=16)
         self._ready = threading.Event()
@@ -186,13 +189,12 @@ class AsyncEpisodeRecorder:
         color = camera_geometry.color
         validate_aligned_depth_distortion(color.distortion_model)
         expected_rgb_shape = (color.height, color.width, 3)
-        expected_depth_shape = (color.height, color.width)
-        if self._rgb_shape != expected_rgb_shape or self._rgb_shape[:2] != expected_depth_shape:
+        if self._rgb_shape != expected_rgb_shape:
             raise ValueError(
                 "aligned RGB-D geometry must match recording shape: "
                 f"expected rgb={self._rgb_shape}, "
                 f"depth={self._rgb_shape[:2]}; "
-                f"got rgb={expected_rgb_shape}, depth={expected_depth_shape}"
+                f"got rgb={expected_rgb_shape}, depth={expected_rgb_shape[:2]}"
             )
         try:
             depth_scale_value = float(depth_scale)
@@ -287,6 +289,7 @@ class AsyncEpisodeRecorder:
             self._ready.clear()
             self._abort = self._save = self._saved = False
             self._reason = ""
+            self.policy_trace = None
             self._frame_count = self._written_frames = 0
             self._thread = threading.Thread(
                 target=self._write_episode, args=(metadata,), name="episode-writer", daemon=False
@@ -377,7 +380,7 @@ class AsyncEpisodeRecorder:
             for name, value in metadata.items():
                 meta.attrs[name] = value
             meta.attrs["control_hz"] = self.control_hz
-            meta.attrs["execution_path"] = "synchronous_direct_sdk_v1"
+            meta.attrs["execution_path"] = self.execution_path
             meta.attrs["observation_action_pairing"] = "control_tick_input_and_attempted_targets"
             meta.attrs["robot_timestamp_source"] = "host_monotonic_read_completion"
             meta.attrs["camera_timestamp_source"] = "host_monotonic_camera_queue_return"
@@ -445,6 +448,10 @@ class AsyncEpisodeRecorder:
                     meta.attrs["format"] = RAW_FORMAT
                     meta.attrs["num_frames"] = self._written_frames
                     meta.attrs["termination_reason"] = self._reason
+                    if self.policy_trace is not None:
+                        meta.create_dataset(
+                            "policy_trace", data=json.dumps(self.policy_trace, allow_nan=False)
+                        )
                     for name, count in missing_tactile.items():
                         meta.attrs[f"{name}_missing_rows"] = count
                         if count:

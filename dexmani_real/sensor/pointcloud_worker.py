@@ -23,10 +23,6 @@ from dexmani_real.ipc.schema import (
 )
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.sensor.pointcloud import (
-    POINT_CLOUD_COLOR_SOURCE,
-    POINT_CLOUD_POLICY_ID,
-    POINT_CLOUD_SAMPLING,
-    POINT_CLOUD_TRANSFORM,
     build_point_cloud,
 )
 from dexmani_real.utils.geometry import validate_rigid_transform
@@ -153,12 +149,7 @@ def run_pointcloud_worker(shared: "RuntimeChannels", config: PointCloudWorkerCon
         return
     geometry, depth_scale_m, base_from_color = static_inputs
     logger.debug(
-        "pointcloud policy: id=%s color_source=%s sampling=%s "
-        "transform=%s config=%s table_plane_abcd=%s",
-        POINT_CLOUD_POLICY_ID,
-        POINT_CLOUD_COLOR_SOURCE,
-        POINT_CLOUD_SAMPLING,
-        POINT_CLOUD_TRANSFORM,
+        "pointcloud config=%s table_plane_abcd=%s",
         json.dumps(cfg.pointcloud.to_dict(), sort_keys=True, separators=(",", ":")),
         json.dumps(cfg.table_plane_abcd, separators=(",", ":")),
     )

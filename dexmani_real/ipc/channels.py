@@ -87,6 +87,7 @@ class RuntimeChannels:
 
     run_id: Any  # advancing the epoch invalidates pending motion commands
     # Latest software RUNNING termination; written under motion_lock.
+    run_ended_id: Any
     run_ended_reason: Any
 
     is_running: Any  # session lifetime, shared with sensors
@@ -176,6 +177,7 @@ class RuntimeChannels:
 
         storage.run_id = ctx.Value("Q", 1)
         storage.run_ended_reason = ctx.Value("i", 0)
+        storage.run_ended_id = ctx.Value("Q", 0)
 
         storage.is_running = ctx.Value("b", True, lock=False)
         storage.error_state = ctx.Value("b", False)

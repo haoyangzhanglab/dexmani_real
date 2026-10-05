@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Usage: python examples/run_policy.py POLICY/TASK/EXPERIMENT [--config YAML] [--checkpoint best|latest|FILE]
+"""Usage: python examples/run_policy.py POLICY/TASK/EXPERIMENT
+       --max-decision-age SEC --max-wait SEC --max-tick-lateness SEC
+       [--config YAML] [--checkpoint best|latest|FILE]
        [--weights ema|raw] [--inference-steps N] [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]
 真机评估：H 回零 → 布置场景 → B 开始 → S 停止；保存 rollout 与 run_config.yaml，任务成功由离线评估判定。"""
 
@@ -87,6 +89,12 @@ def _parser() -> argparse.ArgumentParser:
         help="cooperative duration budget from RUNNING admission (default: 60 seconds)",
     )
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--execution-mode", choices=("sync", "async", "rtc"), default="sync")
+    parser.add_argument("--max-decision-age", type=_positive_running_seconds, required=True)
+    parser.add_argument("--max-wait", type=_positive_running_seconds, required=True)
+    parser.add_argument("--max-tick-lateness", type=_positive_running_seconds, required=True)
+    parser.add_argument("--prefetch-steps", type=_positive_int)
+    parser.add_argument("--rtc-guidance-cap", type=float)
     return parser
 
 
@@ -133,12 +141,24 @@ def _write_run_config(session_dir, *, args, runtime, info):
     compact_info["experiment_dir"] = str(info.experiment_dir)
     compact_info["checkpoint_path"] = str(info.checkpoint_path)
     payload = {
-        "execution_path": "synchronous_direct_sdk_v1",
+        "execution_path": f"worker_grid_{args.execution_mode}_v1",
         "observation_action_pairing": "control_tick_input_and_attempted_targets",
         "experiment": args.experiment,
         "checkpoint": args.checkpoint,
         "policy": compact_info,
+        "future_steps": info.horizon - info.n_obs_steps + 1,
         "runtime": config_as_dict(runtime),
+        "execution": {
+            key: getattr(args, key)
+            for key in (
+                "execution_mode",
+                "max_decision_age",
+                "max_wait",
+                "max_tick_lateness",
+                "prefetch_steps",
+                "rtc_guidance_cap",
+            )
+        },
         "seed": args.seed,
         "device": args.device,
         "num_episodes": args.num_episodes,
@@ -178,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from dexmani_real.config.experiment import resolve_experiment_config
         from dexmani_real.deployment.config import (
+            ExecutionConfig,
             PolicyRuntimeConfig,
             RolloutRecordingConfig,
             validate_num_episodes,
@@ -187,6 +208,14 @@ def main(argv: list[str] | None = None) -> int:
         runtime = resolve_experiment_config(yaml_path=args.config)
         validate_policy_runtime_compatibility(info, runtime)
         validate_num_episodes(args.num_episodes)
+        execution = ExecutionConfig(
+            args.execution_mode,
+            args.max_decision_age,
+            args.max_wait,
+            args.max_tick_lateness,
+            args.prefetch_steps,
+            args.rtc_guidance_cap,
+        ).validate(info)
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
         _safe_selector_parts(selector)
     except Exception as exc:
@@ -219,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
             max_running_s=args.max_running_s,
             num_episodes=args.num_episodes,
             recording_config=recording_config,
+            execution_config=execution,
         )
     except Exception as exc:
         print(f"[LIFECYCLE] lifecycle failed: {exc}", file=sys.stderr)

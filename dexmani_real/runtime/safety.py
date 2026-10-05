@@ -89,6 +89,7 @@ def _revoke_motion_locked(
             reason = RunEndReason.ESTOP
         elif new_state == SafetyState.FAULT and reason == RunEndReason.EXECUTOR_BOUNDARY:
             reason = RunEndReason.HARDWARE_FAULT
+        shared.run_ended_id.value = int(shared.run_id.value)
         shared.run_ended_reason.value = int(reason)
     shared.run_id.value += 1
     shared.safety_state.value = int(new_state)
