@@ -375,13 +375,11 @@ class OnlineIKSolver:
         lo, hi = self.operational_limits.T
         if np.any(q < lo) or np.any(q > hi):
             return "operational_limits"
-        delta_prev = self.ik_geometry.compute_qpos_delta(q, previous)
+        delta_prev = q - previous
         if np.any(np.abs(delta_prev) > self._jump_limit):
             return "jump"
-        delta = self.ik_geometry.compute_qpos_delta(q, current)
+        delta = q - current
         distance = float(np.max(np.abs(delta)))
-        if np.max(np.abs(q - current)) - distance > np.deg2rad(90):
-            return "band_switch"
         if distance > np.deg2rad(150):
             return "hw_dist"
         return None
@@ -409,7 +407,7 @@ class OnlineIKSolver:
             return None
         rejection = self.dynamic_rejection(q, current, previous)
         if rejection is not None:
-            if rejection in {"band_switch", "hw_dist"}:
+            if rejection == "hw_dist":
                 report["funnel"]["continuity_valid"] += 1
             attempt["result"] = rejection
             return None

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from concurrent.futures import CancelledError
 from pathlib import Path
 
 
@@ -29,7 +30,7 @@ def atomic_publish(src: str | Path, dst: str | Path, *, cancelled=None) -> Path:
 
 
 def atomic_json_dump(
-    obj: object, path: str | Path, *, indent: int = 2, ensure_ascii: bool = True
+    obj: object, path: str | Path, *, indent: int = 2, ensure_ascii: bool = True, cancelled=None
 ) -> Path:
     """Atomically replace calibration/config JSON, allowing an existing target.
 
@@ -43,6 +44,10 @@ def atomic_json_dump(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(obj, stream, indent=indent, ensure_ascii=ensure_ascii)
+        # Passing this last check admits the irreversible replace; later
+        # cancellation cannot promise rollback of a successfully published file.
+        if cancelled is not None and cancelled():
+            raise CancelledError("JSON publication cancelled")
         os.replace(temp_name, target)
     except BaseException:
         try:

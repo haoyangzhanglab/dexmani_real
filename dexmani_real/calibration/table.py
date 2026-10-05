@@ -170,6 +170,8 @@ def fit_table_plane(
     inlier = residual <= distance_threshold_m
     inlier_residual = residual[inlier]
     inlier_count = int(inlier_residual.size)
+    if inlier_count < min_inlier_points or inlier_count / evaluated.shape[0] < min_inlier_ratio:
+        raise ValueError("final table plane has insufficient support")
     tilt_deg = float(np.degrees(np.arccos(np.clip(normal[2], -1.0, 1.0))))
     if tilt_deg > max_tilt_deg:
         raise ValueError("refined table plane exceeds maximum tilt")

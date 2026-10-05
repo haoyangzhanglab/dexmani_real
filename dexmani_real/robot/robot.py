@@ -59,6 +59,14 @@ class DispatchError(RuntimeError):
         self.revoked = revoked
 
 
+class DispatchInterrupted(KeyboardInterrupt):
+    """Cancellation evidence local to one attempted dispatch."""
+
+    def __init__(self, result):
+        super().__init__("dispatch interrupted")
+        self.result = result
+
+
 @dataclass(frozen=True)
 class RobotState:
     arm: np.ndarray
@@ -83,7 +91,6 @@ class DexManiRobot:
         self._previous_errors = None
         self._tactile_availability = {}
         self._idle_next_ns = 0
-        self.before_send = None
 
     def _check_owner(self):
         if self._owner != threading.get_ident():
@@ -180,7 +187,7 @@ class DexManiRobot:
         frame["qpos"], frame["current"] = state.qpos, state.current_ma
         for name, shape in (("aggregate", (5, 3)), ("dense", (5, 120, 3))):
             value = getattr(state, f"tactile_{name}")
-            valid = bool(self.hand.tactile_calibrated and getattr(state, f"tactile_{name}_valid"))
+            valid = bool(getattr(state, f"tactile_{name}_valid"))
             if valid and (np.shape(value) != shape or not np.isfinite(value).all()):
                 raise RuntimeError(f"unusable valid {name} tactile feedback")
             if self._tactile_availability.get(name) != valid:
@@ -212,8 +219,6 @@ class DexManiRobot:
 
     def _authorized(self, command, state):
         self.check()
-        if self.before_send is not None and not self.before_send():
-            return False
         return (
             not self.shared.quit_requested.value
             and not self.shared.stop_request.value
@@ -222,47 +227,53 @@ class DexManiRobot:
             )
         )
 
-    def _send(self, command, state):
+    def _send(self, command, state, *, valid_until_ns):
         self._check_owner()
         result = DispatchResult()
-        if self._hand_stop_pending:
-            raise DispatchError("previous XHand stop remains unconfirmed", result, revoked=True)
-        # All present targets are checked before either SDK sees a target.
-        for name in ("arm", "hand"):
-            target = getattr(command, f"{name}_qpos")
-            if target is None:
-                continue
-            device = getattr(self, name)
-            if not self._connected or device is None or not device.is_connected:
-                raise DispatchError(f"{name} device unavailable", result)
-            issue = (
-                check_arm_target(
-                    target,
-                    joint_limit_lower_rad=np.asarray(XARM7_HARD_LOWER),
-                    joint_limit_upper_rad=np.asarray(XARM7_HARD_UPPER),
-                )
-                if name == "arm"
-                else check_hand_target(
-                    target,
-                    mechanical_lower_rad=np.asarray(self.runtime.hand.mechanical_qpos_min_rad),
-                    mechanical_upper_rad=np.asarray(self.runtime.hand.mechanical_qpos_max_rad),
-                )
-            )
-            if issue:
-                raise DispatchError(f"unsafe {name} target: {issue}", result)
         try:
+            if self._hand_stop_pending:
+                raise DispatchError("previous XHand stop remains unconfirmed", result, revoked=True)
+            # All present targets are checked before either SDK sees a target.
+            for name in ("arm", "hand"):
+                target = getattr(command, f"{name}_qpos")
+                if target is None:
+                    continue
+                device = getattr(self, name)
+                if not self._connected or device is None or not device.is_connected:
+                    raise DispatchError(f"{name} device unavailable", result)
+                issue = (
+                    check_arm_target(
+                        target,
+                        joint_limit_lower_rad=np.asarray(XARM7_HARD_LOWER),
+                        joint_limit_upper_rad=np.asarray(XARM7_HARD_UPPER),
+                    )
+                    if name == "arm"
+                    else check_hand_target(
+                        target,
+                        mechanical_lower_rad=np.asarray(self.runtime.hand.mechanical_qpos_min_rad),
+                        mechanical_upper_rad=np.asarray(self.runtime.hand.mechanical_qpos_max_rad),
+                    )
+                )
+                if issue:
+                    raise DispatchError(f"unsafe {name} target: {issue}", result)
             for name in ("arm", "hand"):
                 target = getattr(command, f"{name}_qpos")
                 if target is None:
                     continue
                 if not self._authorized(command, state):
                     raise DispatchError("motion authority revoked", result, revoked=True)
+                if time.monotonic_ns() >= valid_until_ns:
+                    raise DispatchError("dispatch deadline expired", result, revoked=True)
                 if name == "arm" and self._arm_stopped:
                     self.arm.enter_mode6()
                     self._arm_stopped = False
                     if not self._authorized(command, state):
                         raise DispatchError(
                             "motion authority revoked after mode restoration", result, revoked=True
+                        )
+                    if time.monotonic_ns() >= valid_until_ns:
+                        raise DispatchError(
+                            "dispatch deadline expired after mode restoration", result, revoked=True
                         )
                 # From here, an exception cannot prove that nothing reached the device.
                 result = replace(result, **{name: DispatchStatus.UNKNOWN})
@@ -282,17 +293,19 @@ class DexManiRobot:
                     "motion authority revoked during dispatch", result, revoked=True
                 )
             return replace(result, timestamp_ns=time.monotonic_ns())
+        except KeyboardInterrupt as exc:
+            raise DispatchInterrupted(replace(result, timestamp_ns=time.monotonic_ns())) from exc
         except Exception as exc:
             result = replace(result, timestamp_ns=time.monotonic_ns())
             raise DispatchError(str(exc), result, revoked=getattr(exc, "revoked", False)) from exc
 
-    def send_action(self, command):
-        return self._send(command, SafetyState.RUNNING)
+    def send_action(self, command, *, valid_until_ns):
+        return self._send(command, SafetyState.RUNNING, valid_until_ns=valid_until_ns)
 
-    def send_hand_home(self, command):
+    def send_hand_home(self, command, *, valid_until_ns):
         if command.arm_qpos is not None:
             raise ValueError("hand HOME cannot carry an arm streaming target")
-        return self._send(command, SafetyState.ARMED)
+        return self._send(command, SafetyState.ARMED, valid_until_ns=valid_until_ns)
 
     def home_arm(self, waypoints, target, run_id, abort_check):
         self._check_owner()

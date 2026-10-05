@@ -44,70 +44,6 @@ _CONTIGUOUS_BONES = tuple(
     for parent, child in zip(chain, chain[1:])
 )
 
-_FINGER_CHAINS = (
-    (0, 1, 2, 3, 4),
-    (0, 5, 6, 7, 8),
-    (0, 9, 10, 11, 12),
-    (0, 13, 14, 15, 16),
-    (0, 17, 18, 19, 20),
-)
-
-# Human flexion feature index → SDK joint index; unmapped joints are excluded.
-_HUMAN_FLEXION_JOINT_PAIRS = (
-    (0, 0),
-    (1, 2),  # thumb CMC→bend, MCP+IP→rota2
-    (2, 4),
-    (3, 5),  # index MCP→j1, PIP+DIP→j2
-    (4, 6),
-    (5, 7),  # middle
-    (6, 8),
-    (7, 9),  # ring
-    (8, 10),
-    (9, 11),  # pinky
-)
-_SDK_FLEXION_MASK = np.zeros(12, dtype=np.float64)
-for _feature_index, _sdk_index in _HUMAN_FLEXION_JOINT_PAIRS:
-    _SDK_FLEXION_MASK[_sdk_index] = 1.0
-
-
-def _human_flexion_rad(landmarks: np.ndarray) -> np.ndarray:
-    """Human flexion reference (10,) from one (21, 3) landmark frame.
-
-    Rotation-invariant per-finger angles: thumb CMC + MCP+IP, then per finger
-    (index/mid/ring/pinky) MCP + PIP+DIP — the same feature order as
-    ``_HUMAN_FLEXION_JOINT_PAIRS``.
-    """
-    pts = np.asarray(landmarks, dtype=np.float64)
-    if pts.shape != (21, 3):
-        raise ValueError(f"landmarks must have shape (21, 3), got {pts.shape}")
-    flex = np.empty(10, dtype=np.float64)
-    for finger_index, chain in enumerate(_FINGER_CHAINS):
-        bones = [pts[chain[index + 1]] - pts[chain[index]] for index in range(4)]
-        ang = np.empty(3, dtype=np.float64)
-        for joint_index, (first, second) in enumerate(zip(bones, bones[1:])):
-            denominator = np.linalg.norm(first) * np.linalg.norm(second)
-            if denominator <= 1e-12:
-                raise ValueError("landmarks contain a degenerate hand bone")
-            ang[joint_index] = np.arccos(np.clip(np.sum(first * second) / denominator, -1.0, 1.0))
-        if finger_index == 0:
-            flex[0] = ang[0]
-            flex[1] = ang[1] + ang[2]
-        else:
-            base = 2 * finger_index
-            flex[base] = ang[0]
-            flex[base + 1] = ang[1] + ang[2]
-    return flex
-
-
-def _human_flexion_sdk_reference(landmarks: np.ndarray) -> np.ndarray:
-    """(12,) SDK-order prior reference: human flexion at the 10 flexion joints, 0 elsewhere."""
-    flex = _human_flexion_rad(landmarks)
-    reference = np.zeros(12, dtype=np.float64)
-    for feature_index, sdk_index in _HUMAN_FLEXION_JOINT_PAIRS:
-        reference[sdk_index] = flex[feature_index]
-    return reference
-
-
 # Right-hand operator→MANO rotation; Unity→FLU conversion occurs in the VR receiver.
 _OPERATOR2MANO_RIGHT = np.array(
     [
@@ -242,9 +178,7 @@ class DexPilotHandRetargeter:
         self._dexpilot_config = dexpilot_config
         self._pinky_scale = float(dexpilot_config.pinky_scale)
         self._pinky_palm_scale = float(dexpilot_config.pinky_palm_scale)
-        self.last_debug: dict[str, float | str] = {}
-
-        # Keep the public output in the schema-owned SDK order.
+        # Keep the public output in the canonical SDK order.
         self.sdk_joint_names = XHAND_SDK_JOINT_NAMES
 
         self.load_retargeter()
@@ -263,31 +197,23 @@ class DexPilotHandRetargeter:
             yaml_config = yaml.load(f, Loader=yaml.FullLoader)
         cfg = yaml_config["retargeting"]
 
-        # Require the YAML list without allowing it to redefine schema qpos order.
+        # The YAML cannot redefine the SDK qpos order.
         configured_joint_names = tuple(cfg.get("target_joint_names", ()))
         if configured_joint_names != XHAND_SDK_JOINT_NAMES:
             raise ValueError(
                 "DexPilot target_joint_names must exactly match the canonical XHand SDK joint order"
             )
 
-        if self._dexpilot_config is not None:
-            cfg.update(
-                scaling_factor=float(self._dexpilot_config.scaling_factor),
-                low_pass_alpha=float(self._dexpilot_config.low_pass_alpha),
-                project_dist=float(self._dexpilot_config.project_dist_m),
-                escape_dist=float(self._dexpilot_config.escape_dist_m),
-            )
-
-        self._prior_weight = (
-            float(self._dexpilot_config.prior_weight) if self._dexpilot_config is not None else 0.0
+        cfg.update(
+            scaling_factor=float(self._dexpilot_config.scaling_factor),
+            low_pass_alpha=float(self._dexpilot_config.low_pass_alpha),
+            project_dist=float(self._dexpilot_config.project_dist_m),
+            escape_dist=float(self._dexpilot_config.escape_dist_m),
         )
-        prior_mask = _SDK_FLEXION_MASK  # target order == SDK order
 
         RetargetingConfig.set_default_urdf_dir(str(ASSET_DIR / "robots"))
         self.retargeter = build_dexpilot_retargeting(
             RetargetingConfig.from_dict(cfg),
-            prior_weight=self._prior_weight,
-            prior_mask=prior_mask,
         )
 
         self.indices = self.retargeter.optimizer.target_link_human_indices
@@ -297,16 +223,6 @@ class DexPilotHandRetargeter:
             [retargeter_joint_names.index(name) for name in self.sdk_joint_names]
         ).astype(int)
         self.inverse_retargeted_joint_order = np.argsort(self.retargeted_joint_order)
-
-    @property
-    def low_pass_alpha(self) -> float:
-        """Current LPFilter alpha (1.0 passes through; 0.0 freezes)."""
-        return float(self.retargeter.filter.alpha)
-
-    @low_pass_alpha.setter
-    def low_pass_alpha(self, value: float) -> None:
-        """Tune the LPFilter smoothing strength at runtime."""
-        self.retargeter.filter.alpha = float(value)
 
     def _build_ref_value(self, hand_joint_pos: np.ndarray) -> np.ndarray:
         """Build reference value from hand landmarks for retargeting.
@@ -347,13 +263,7 @@ class DexPilotHandRetargeter:
             logger.warning("Coordinate transform failed — no target produced")
             return None
 
-        start_time = time.time()
-
-        # Use the unscaled landmarks for the human-flexion prior.
-        if self._prior_weight > 0:
-            self.retargeter.optimizer.set_prior_reference(
-                _human_flexion_sdk_reference(mano_landmarks)
-            )
+        start_time = time.perf_counter() if self.debug_adapters else 0.0
 
         ref_value = self._build_ref_value(mano_landmarks)
         try:
@@ -371,11 +281,10 @@ class DexPilotHandRetargeter:
         qpos_arr = qpos_arr[self.retargeted_joint_order]
 
         if self.debug_adapters:
-            self.last_debug = {
-                "retarget_ms": 1000 * (time.time() - start_time),
-                "adaptives": "pinky_chain_scaling",
-            }
-            logger.info("retarget_debug: %s", self.last_debug)
+            logger.info(
+                "DexPilotHandRetargeter: retarget %.2f ms",
+                1000 * (time.perf_counter() - start_time),
+            )
 
         return qpos_arr
 
@@ -419,6 +328,7 @@ class TAGHandRetargeter:
         urdf_path: str,
         debug: bool = False,
     ) -> None:
+        import pinocchio as pin
         from scipy.spatial.transform import Rotation
 
         from dexmani_real.teleop.retargeting.pin_grad import validate_fingertip_frame_names
@@ -426,7 +336,7 @@ class TAGHandRetargeter:
 
         resolved_urdf_path = str(urdf_path)
         resolved_tip_names = validate_fingertip_frame_names(fingertip_link_names)
-        model = pin_loading(resolved_urdf_path)
+        model = pin.buildModelFromUrdf(resolved_urdf_path, pin.JointModelFreeFlyer())
         joint_lo = model.lowerPositionLimit[7:].copy()
         joint_hi = model.upperPositionLimit[7:].copy()
 
@@ -458,8 +368,6 @@ class TAGHandRetargeter:
             pinch_skip_threshold=tag_config.pinch_skip_threshold,
             reg_stage1_weight=tag_config.reg_stage1_weight,
             reg_last_weight=tag_config.reg_last_weight,
-            prior_weight=tag_config.prior_weight,
-            prior_mask=_SDK_FLEXION_MASK[self._mapping_sdk_to_model],
         )
 
         self._R_mano_to_urdf: np.ndarray = Rotation.from_euler(
@@ -467,7 +375,6 @@ class TAGHandRetargeter:
         ).as_matrix()
         self._pinky_scale = float(tag_config.pinky_scale)
         self._pinky_palm_scale = float(tag_config.pinky_palm_scale)
-        self._prior_weight = float(tag_config.prior_weight)
 
         self.debug = bool(debug)
 
@@ -487,7 +394,9 @@ class TAGHandRetargeter:
             return None
         valid, reason = validate_landmarks(landmarks)
         if not valid:
-            logger.warning("TAGHandRetargeter: landmarks rejected (%s) — holding position", reason)
+            logger.warning(
+                "TAGHandRetargeter: landmarks rejected (%s) — no target produced", reason
+            )
             return None
 
         t0 = time.perf_counter() if self.debug else 0.0
@@ -496,13 +405,8 @@ class TAGHandRetargeter:
             wrist_rot = _estimate_palm_frame(landmarks)
             mano = landmarks @ wrist_rot @ _OPERATOR2MANO_RIGHT
         except (ValueError, np.linalg.LinAlgError):
-            logger.warning("TAGHandRetargeter: coordinate transform failed — holding position")
+            logger.warning("TAGHandRetargeter: coordinate transform failed — no target produced")
             return None
-
-        # Use the unscaled landmarks for the human-flexion prior.
-        q_prior_model = None
-        if self._prior_weight > 0:
-            q_prior_model = _human_flexion_sdk_reference(mano)[self._mapping_sdk_to_model]
 
         mano = adaptive_retargeting_xhand(
             mano,
@@ -514,9 +418,7 @@ class TAGHandRetargeter:
         tips -= mano[0]  # center at wrist
         tips_urdf = tips @ self._R_mano_to_urdf.T  # (5, 3) in URDF frame
 
-        qpos_model = self._optimizer.solve(
-            tips_urdf, q_prior=q_prior_model
-        )  # (12,) in Pinocchio model order
+        qpos_model = self._optimizer.solve(tips_urdf)  # (12,) in Pinocchio model order
 
         if qpos_model is None:
             return None
@@ -541,10 +443,3 @@ class TAGHandRetargeter:
             self._optimizer.reset(qpos_model)
         else:
             self._optimizer.reset(None)
-
-
-def pin_loading(urdf_path: str):
-    """Load a free-flyer URDF, importing Pinocchio only when constructing the backend."""
-    import pinocchio as pin
-
-    return pin.buildModelFromUrdf(urdf_path, pin.JointModelFreeFlyer())

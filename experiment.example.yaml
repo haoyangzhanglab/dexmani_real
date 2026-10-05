@@ -17,10 +17,6 @@ policy:
   episodes_dir: episodes
 teleop:
   control_hz: 16.0
-tag_retargeting:
-  prior_weight: 0.0
-dexpilot_retargeting:
-  prior_weight: 0.0
 environment:
   table:
     enabled: true

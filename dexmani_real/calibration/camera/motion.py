@@ -81,6 +81,7 @@ class CalibrationLoopState:
 
     samples: CalibrationSamples
     current_qpos: np.ndarray
+    feedback_timestamp_ns: int
     command_qpos: np.ndarray | None = None
     command_pose: Pose | None = None
     calibration_saved: bool = False
@@ -96,6 +97,7 @@ class CalibrationLoopState:
         return cls(
             samples=CalibrationSamples(),
             current_qpos=current_qpos,
+            feedback_timestamp_ns=int(arm_state["timestamp_ns"]),
         )
 
 
@@ -155,6 +157,7 @@ def handle_calibration_home_key(
         return HomeKeyOutcome.FAULT
 
     state.current_qpos = np.asarray(refreshed["qpos"], dtype=np.float64)
+    state.feedback_timestamp_ns = int(refreshed["timestamp_ns"])
     if not home_result.ok:
         print("  WARNING: return-home request was not executed")
     state.blocked_until_release = False
@@ -273,7 +276,12 @@ def run_calibration_motion_tick(
             epoch = int(shared.run_id.value)
     q_cmd = ik_result.qpos
     try:
-        robot.send_action(RobotCommand(epoch, q_cmd))
+        robot.send_action(
+            RobotCommand(epoch, q_cmd),
+            valid_until_ns=state.feedback_timestamp_ns
+            + int(runtime.arm.feedback_max_age_s * 1e9)
+            + 1,
+        )
     except DispatchError as exc:
         if not exc.revoked:
             revoke_motion(shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)

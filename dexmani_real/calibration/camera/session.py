@@ -10,6 +10,7 @@ import json
 import multiprocessing as mp
 import os
 import time
+from concurrent.futures import CancelledError
 from datetime import datetime, timezone
 from typing import Any
 
@@ -56,6 +57,7 @@ from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.safety import RunEndReason, SafetyState, require_transition, revoke_motion
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.sensor.camera.worker import run_camera_worker
+from dexmani_real.teleop.config import validate_keyboard_workspace
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
 
@@ -76,6 +78,7 @@ def _detect_aruco_stable(
     target_id: int | None,
     max_frame_age_s: float,
     n_frames: int = 5,
+    cancel_requested=lambda: False,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Capture N frames and return SO(3) mean rotation and median translation for noise reduction."""
     rvecs_all: list[np.ndarray] = []
@@ -84,6 +87,8 @@ def _detect_aruco_stable(
     for _ in range(n_frames):
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
+            if cancel_requested():
+                raise CancelledError("calibration capture cancelled")
             frame = read_camera_frame(shared)
             if (
                 frame
@@ -95,6 +100,8 @@ def _detect_aruco_stable(
         else:
             raise RuntimeError("fresh calibration image unavailable")
         last_stamp = frame["timestamp_ns"]
+        if cancel_requested():
+            raise CancelledError("calibration capture cancelled")
         image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
         result = detect_aruco_pose(
             image,
@@ -103,6 +110,8 @@ def _detect_aruco_stable(
             marker_size_m=marker_size_m,
             target_id=target_id,
         )
+        if cancel_requested():
+            raise CancelledError("calibration capture cancelled")
         if result is not None:
             rvecs_all.append(result[0])
             tvecs_all.append(result[1])
@@ -205,16 +214,15 @@ def _calibration_capture_metadata(
     }
 
 
-def _solve_and_save_calibration(
+def _solve_calibration(
     samples: CalibrationSamples,
     planner: XArm7MotionPlanner,
-    camera_serial: str,
     config: CalibrationConfig,
     *,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
-) -> np.ndarray | None:
-    """Solve calibration and save results that pass the quality checks."""
+):
+    """Compute a qualified candidate; the session owns publication."""
     sample_count = len(samples)
     if sample_count < config.min_samples:
         print(
@@ -223,8 +231,18 @@ def _solve_and_save_calibration(
         return None
     print(f"\n  computing hand-eye calibration ({sample_count} samples, 5 methods)...")
     try:
-        T_base_camera, method, errors_mm, errors_deg, method_table = calibrate_and_select(
-            *samples.solver_inputs()
+        (
+            T_base_camera,
+            method,
+            errors_mm,
+            errors_deg,
+            method_table,
+            position_rms_mm,
+            rotation_rms_deg,
+        ) = calibrate_and_select(
+            *samples.solver_inputs(),
+            max_position_rms_mm=config.max_consistency_rms_mm,
+            max_rotation_rms_deg=config.max_consistency_rot_rms_deg,
         )
     except Exception as exc:
         logger.warning("solve failed", exc_info=True)
@@ -240,8 +258,6 @@ def _solve_and_save_calibration(
         dtype=np.float64,
     )
     T_world_camera = T_world_base @ T_base_camera
-    position_rms_mm = float(np.sqrt(np.mean(errors_mm**2)))
-    rotation_rms_deg = float(np.sqrt(np.mean(errors_deg**2)))
     samples.set_residuals(errors_mm)
 
     print("  method consistency (mm, lower is better):")
@@ -269,44 +285,14 @@ def _solve_and_save_calibration(
         print(f"    #{index + 1:2d} {residual_mm:6.1f} {bar}{flag}")
     print(f"  T_world_camera position: {np.round(T_world_camera[:3, 3], 4)}m")
 
-    rejection_reasons: list[str] = []
-    if position_rms_mm > config.max_consistency_rms_mm:
-        rejection_reasons.append(
-            f"pos rms={position_rms_mm:.1f}mm > {config.max_consistency_rms_mm:.1f}mm"
-        )
-    if rotation_rms_deg > config.max_consistency_rot_rms_deg:
-        rejection_reasons.append(
-            f"rot rms={rotation_rms_deg:.2f}° > {config.max_consistency_rot_rms_deg:.1f}°"
-        )
-    if rejection_reasons:
-        print(
-            f"  REJECTED (quality gate: {'; '.join(rejection_reasons)}) "
-            "— increase rotation variety and retry"
-        )
-        return None
-
-    try:
-        save_camera_calibration(
-            T_world_camera,
-            camera_serial,
-            CAMERAS_PATH,
-            calibration_capture=_calibration_capture_metadata(
-                intrinsics=intrinsics,
-                distortion=distortion,
-                method=method,
-                sample_count=sample_count,
-                position_errors_mm=errors_mm,
-                rotation_errors_deg=errors_deg,
-            ),
-        )
-    except Exception as exc:
-        logger.warning("save failed", exc_info=True)
-        print(f"FAILED — {exc}, skipped")
-        return None
-    print(
-        f"  ACCEPTED ({method}, pos rms={position_rms_mm:.1f}mm, rot rms={rotation_rms_deg:.2f}°)"
+    return T_world_camera, _calibration_capture_metadata(
+        intrinsics=intrinsics,
+        distortion=distortion,
+        method=method,
+        sample_count=sample_count,
+        position_errors_mm=errors_mm,
+        rotation_errors_deg=errors_deg,
     )
-    return T_world_camera
 
 
 class CameraCalibrationSession:
@@ -345,8 +331,22 @@ class CameraCalibrationSession:
             return "arm feedback stale"
         return None
 
+    def _cancel_requested(self):
+        return bool(
+            self.shared.quit_requested.value
+            or self.shared.estop_request.value
+            or self.shared.error_state.value
+            or not self.shared.is_running.value
+            or not self.keys.healthy
+            or self.keys.is_pressed("q")
+            or self.keys.is_pressed("esc")
+            or not self.camera_process.is_alive()
+        )
+
     def _capture_sample(self):
         """Append one marker/arm observation only when the arm stayed stationary."""
+        if self._cancel_requested():
+            return
         print(f"\n  [{len(self.state.samples) + 1}] capturing ArUco pose...", end=" ", flush=True)
         arm_before, feedback_issue = _read_stationary_calibration_arm_state(
             self.runtime, self.robot
@@ -363,13 +363,21 @@ class CameraCalibrationSession:
                 target_id=self.aruco_config.target_id,
                 max_frame_age_s=self.runtime.camera.max_frame_age_s,
                 n_frames=self.aruco_config.capture_frames,
+                cancel_requested=self._cancel_requested,
             )
+        except CancelledError:
+            print("CANCELLED")
+            return
         except Exception as exc:
             logger.warning("capture failed", exc_info=True)
             print(f"FAILED — {exc}, skipped")
             return
 
+        if self._cancel_requested():
+            return
         arm_after, feedback_issue = _read_stationary_calibration_arm_state(self.runtime, self.robot)
+        if self._cancel_requested():
+            return
         if arm_after is None:
             print(f"FAILED — after capture: {feedback_issue}, skipped")
             return
@@ -390,6 +398,8 @@ class CameraCalibrationSession:
         marker_rvec, marker_tvec = aruco_pose
         eef_pos_base_m, eef_rot6d_base = make_arm_fk().compute(arm_after_qpos)
         eef_rpy_base_rad = eef_rpy_from_rot6d(eef_rot6d_base)
+        if self._cancel_requested():
+            return
         self.state.samples.append(
             eef_pos_base_m,
             eef_rpy_base_rad,
@@ -425,6 +435,9 @@ class CameraCalibrationSession:
         """Drain edge-triggered capture, undo, reject, and solve events."""
         event = self.keys.pop_event()
         while event is not None:
+            if self._cancel_requested():
+                return
+            self.robot.check()
             if event == "space":
                 self._capture_sample()
             elif event == "backspace":
@@ -447,15 +460,33 @@ class CameraCalibrationSession:
                 revoke_motion(self.shared)
                 self.robot.stop()
                 self.state.command_qpos = self.state.command_pose = None
-                transform = _solve_and_save_calibration(
+                epoch = int(self.shared.run_id.value)
+
+                def cancelled():
+                    return self._cancel_requested() or int(self.shared.run_id.value) != epoch
+
+                candidate = _solve_calibration(
                     self.state.samples,
                     self.planner,
-                    self.serial,
                     self.calibration_config,
                     intrinsics=self.intrinsics,
                     distortion=self.distortion,
                 )
-                self.state.calibration_saved = transform is not None
+                if candidate is not None and not cancelled():
+                    transform, metadata = candidate
+                    try:
+                        save_camera_calibration(
+                            transform,
+                            self.serial,
+                            CAMERAS_PATH,
+                            calibration_capture=metadata,
+                            cancelled=cancelled,
+                        )
+                    except CancelledError:
+                        print("  calibration publication cancelled")
+                    else:
+                        self.state.calibration_saved = True
+                        print("  calibration saved")
             event = self.keys.pop_event()
 
     def run(self) -> int:
@@ -559,8 +590,6 @@ class CameraCalibrationSession:
         while self.shared.is_running.value:
             self.rate.wait()
             self.state.frame += 1
-            self._show_preview()
-            self._handle_sample_events()
 
             if self.keys.is_pressed("esc"):
                 set_calibration_fault(self.shared, "operator e-stop", estop=True)
@@ -583,7 +612,12 @@ class CameraCalibrationSession:
                 return finish_calibration_motion(
                     self.shared, robot=self.robot, calibration_saved=self.state.calibration_saved
                 )
+            self._show_preview()
+            self._handle_sample_events()
+            if self._cancel_requested():
+                continue
             self.state.current_qpos = arm_state["qpos"]
+            self.state.feedback_timestamp_ns = int(arm_state["timestamp_ns"])
 
             home_outcome = handle_calibration_home_key(
                 self.shared,
@@ -632,6 +666,7 @@ def run_camera_calibration(
         raise ValueError(
             "camera calibration requires explicit hand_enabled=false and secured/absent hand"
         )
+    validate_keyboard_workspace(runtime)
     calib_cfg = calibration_config or CalibrationConfig()
     aruco_cfg = aruco_config or ArucoConfig()
     planner, workspace = _build_planner(runtime)

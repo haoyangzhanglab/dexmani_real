@@ -11,7 +11,7 @@ from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_co
 from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.robot import DexManiRobot, DispatchError
-from dexmani_real.runtime.observation import read_observation
+from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.safety import (
@@ -23,6 +23,7 @@ from dexmani_real.runtime.safety import (
     revoke_motion_if_run_id,
 )
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
+from dexmani_real.teleop.config import validate_keyboard_workspace
 from dexmani_real.teleop.jog import compute_cartesian_jog_delta, propose_cartesian_jog_pose
 from dexmani_real.utils.log import get_logger
 from dexmani_real.utils.rate import LoopRate
@@ -32,11 +33,7 @@ logger = get_logger(__name__)
 
 def run_keyboard_experiment(runtime, *, no_hand):
     cfg = runtime.keyboard_teleop
-    cfg.validate()
-    if 2 * cfg.workspace_command_margin_m >= float(
-        np.diff(runtime.policy.workspace.as_array(), axis=1).min()
-    ):
-        raise ValueError("keyboard workspace command margin leaves no interior workspace")
+    validate_keyboard_workspace(runtime)
     if not runtime.policy.hand_enabled and not no_hand:
         raise ValueError("hand-disabled operation requires --no-hand")
     ctx = mp.get_context("spawn")
@@ -161,7 +158,9 @@ def run_keyboard_experiment(runtime, *, no_hand):
                     epoch = int(shared.run_id.value)
             target = result.qpos
             try:
-                robot.send_action(RobotCommand(epoch, target))
+                robot.send_action(
+                    RobotCommand(epoch, target), valid_until_ns=feedback_deadline_ns(row, runtime)
+                )
             except DispatchError as exc:
                 if not exc.revoked:
                     raise

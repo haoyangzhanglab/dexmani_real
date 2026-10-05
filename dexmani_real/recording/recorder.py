@@ -11,14 +11,13 @@ from queue import Empty, Full, Queue
 
 import numpy as np
 
-from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.hardware import CameraParams
 from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
 from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT
 from dexmani_real.recording.storage.video import VideoEncoder
 from dexmani_real.sensor.camera.geometry import RGBDGeometry, validate_aligned_depth_distortion
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
-from dexmani_real.utils.geometry import validate_rigid_transform, validate_unit_quaternion_wxyz
+from dexmani_real.utils.geometry import validate_rigid_transform
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -36,22 +35,27 @@ class RecordingBackpressureError(RecordingError):
     """The bounded sink cannot sustain the experiment's control rate."""
 
 
-def snapshot_recording_metadata(shared, runtime, *, collection_source):
-    """Resolve physical calibration at START, never during frame submission."""
+def snapshot_recording_metadata(shared, runtime, *, collection_source, camera_calibration):
+    """Select the connected serial from the session snapshot, without file I/O."""
     serial = shared.camera_serial.value.rstrip(b"\x00").decode("utf-8")
     if not serial.strip():
         raise ValueError("recording START requires a nonempty camera serial")
     geometry = RGBDGeometry.from_dict(json.loads(shared.camera_geometry.value.decode("utf-8")))
     transform = None
-    try:
-        calibration = CameraExtrinsics()
-        name = calibration.resolve_name_by_serial(serial)
-        if calibration.to_meta_dict(name, expected_serial=serial)["camera_type"] == "eye_to_hand":
-            transform = calibration.get_extrinsics(name)
-        else:
-            logger.warning("Recording without static eye-to-hand extrinsics")
-    except (FileNotFoundError, KeyError, ValueError) as exc:
-        logger.warning("Recording without camera extrinsics: %s", exc)
+    if camera_calibration is None:
+        logger.warning("Recording without camera extrinsics: session has no calibration")
+    else:
+        try:
+            name = camera_calibration.resolve_name_by_serial(serial)
+            if (
+                camera_calibration.to_meta_dict(name, expected_serial=serial)["camera_type"]
+                == "eye_to_hand"
+            ):
+                transform = camera_calibration.get_extrinsics(name)
+            else:
+                logger.warning("Recording without static eye-to-hand extrinsics")
+        except (KeyError, ValueError) as exc:
+            logger.warning("Recording without camera extrinsics: %s", exc)
     return dict(
         collection_source=collection_source,
         camera_geometry=geometry,
@@ -76,23 +80,6 @@ def _validate_explicit_episode_name(episode_name: str) -> None:
             "episode_name must be a plain non-empty directory name without "
             f"path separators: {episode_name!r}"
         )
-
-
-def _validate_hand_mount(
-    handbase_position_eef_m: object,
-    handbase_quat_eef_wxyz: object,
-) -> tuple[np.ndarray, np.ndarray]:
-    try:
-        position = np.asarray(handbase_position_eef_m, dtype=np.float64)
-        quaternion = np.asarray(handbase_quat_eef_wxyz, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("hand mount must be numeric") from exc
-    if position.shape != (3,) or not np.all(np.isfinite(position)):
-        raise ValueError("handbase_position_eef_m must have shape (3,) and finite values")
-    if quaternion.shape != (4,) or not np.all(np.isfinite(quaternion)):
-        raise ValueError("handbase_quat_eef_wxyz must have shape (4,) and finite values")
-    validate_unit_quaternion_wxyz(quaternion, name="handbase_quat_eef_wxyz")
-    return position.copy(), quaternion.copy()
 
 
 class AsyncEpisodeRecorder:
@@ -209,10 +196,9 @@ class AsyncEpisodeRecorder:
                 camera_T_xarm_base_from_color, label="camera_T_xarm_base_from_color"
             )
         )
-        handbase_position, handbase_quaternion = _validate_hand_mount(
-            handbase_position_eef_m,
-            handbase_quat_eef_wxyz,
-        )
+        # Diagnostic provenance only; current runtime owns mount geometry.
+        handbase_position = np.array(handbase_position_eef_m, dtype=np.float64, copy=True)
+        handbase_quaternion = np.array(handbase_quat_eef_wxyz, dtype=np.float64, copy=True)
         return {
             "task_label": task_label,
             "collection_source": collection_source,
@@ -383,7 +369,7 @@ class AsyncEpisodeRecorder:
             meta.attrs["execution_path"] = self.execution_path
             meta.attrs["observation_action_pairing"] = "control_tick_input_and_attempted_targets"
             meta.attrs["robot_timestamp_source"] = "host_monotonic_read_completion"
-            meta.attrs["camera_timestamp_source"] = "host_monotonic_camera_queue_return"
+            meta.attrs["camera_timestamp_source"] = "host_monotonic_oldest_rgb_depth_advance"
             meta.attrs["time_missing_value"] = 0
             meta.attrs["dispatch_status_codes"] = (
                 "0:not_called,1:accepted,2:crc_unconfirmed,3:rejected,4:unknown"

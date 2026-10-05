@@ -24,8 +24,12 @@ from dexmani_real.recording.recorder import (
 )
 from dexmani_real.robot.action import ActionRealizer
 from dexmani_real.robot.commands import RobotCommand
-from dexmani_real.robot.robot import DispatchError, DispatchStatus
-from dexmani_real.runtime.observation import ObservationHistory, read_observation, sample_is_fresh
+from dexmani_real.robot.robot import DispatchError, DispatchInterrupted, DispatchStatus
+from dexmani_real.runtime.observation import (
+    ObservationHistory,
+    feedback_deadline_ns,
+    read_observation,
+)
 from dexmani_real.runtime.safety import (
     RunEndReason,
     SafetyState,
@@ -54,11 +58,11 @@ class PolicyRunner:
         max_running_s,
         num_episodes=1,
         recording_config=None,
+        camera_calibration=None,
     ):
         self.shared = shared
         self.robot = robot
         self.poll_operator = poll_operator
-        self.robot.before_send = self._dispatch_allowed
         self.runtime = runtime
         self.policy_info = policy_info
         self.model = model_runtime
@@ -69,6 +73,7 @@ class PolicyRunner:
         self.max_running_s = max_running_s
         self.num_episodes = num_episodes
         self.recording_config = recording_config
+        self.camera_calibration = camera_calibration
         self.recorder = (
             AsyncEpisodeRecorder(
                 recording_config.data_dir,
@@ -87,7 +92,6 @@ class PolicyRunner:
         self.preparing_epoch = None
         self.reset_ready = False
         self.events = []
-        self.dispatch_row = None
         self.last_slot = -1
         self.dt_ns = int(policy_info.control_dt_s * 1e9)
         self.run_id = None
@@ -120,32 +124,21 @@ class PolicyRunner:
             or time.monotonic_ns() - self.started_ns < int(self.max_running_s * 1e9)
         )
 
-    def _dispatch_allowed(self):
-        if not self._within_budget():
-            return False
-        if self.run_id is None:
-            return True
-        now = time.monotonic_ns()
-        row = self.dispatch_row
-        return (
-            self.plan is not None
-            and row is not None
-            and decision_is_fresh(self.plan.sources, now, self.execution.max_decision_age_s)
-            and sample_is_fresh(
-                row.arm["timestamp_ns"][0], self.runtime.arm.feedback_max_age_s, now
-            )
-            and sample_is_fresh(
-                row.hand["timestamp_ns"][0], self.runtime.hand.feedback_max_age_s, now
-            )
-            and now
-            <= self.started_ns
-            + self.last_slot * self.dt_ns
-            + int(self.execution.max_tick_lateness_s * 1e9)
-            and (
-                self.wait_started_ns is None
-                or now - self.wait_started_ns < int(self.execution.max_wait_s * 1e9)
-            )
+    def _dispatch_deadline_ns(self, row, slot):
+        deadlines = [
+            feedback_deadline_ns(row, self.runtime),
+            self.started_ns + slot * self.dt_ns + int(self.execution.max_tick_lateness_s * 1e9) + 1,
+        ]
+        deadlines.extend(
+            stamp + int(self.execution.max_decision_age_s * 1e9) + 1
+            for times in self.plan.sources.values()
+            for stamp in times
         )
+        if self.max_running_s is not None:
+            deadlines.append(self.started_ns + int(self.max_running_s * 1e9))
+        if self.wait_started_ns is not None:
+            deadlines.append(self.wait_started_ns + int(self.execution.max_wait_s * 1e9))
+        return min(deadlines)
 
     def _has_motion_authority(self):
         return (
@@ -290,7 +283,10 @@ class PolicyRunner:
                     task_label=cfg.task_label,
                     episode_name=f"episode_{self.completed + 1:03d}",
                     **snapshot_recording_metadata(
-                        self.shared, self.runtime, collection_source="policy_rollout"
+                        self.shared,
+                        self.runtime,
+                        collection_source="policy_rollout",
+                        camera_calibration=self.camera_calibration,
                     ),
                 ):
                     raise RecordingError("policy recorder refused START")
@@ -522,17 +518,18 @@ class PolicyRunner:
             self._invalidate("dispatch_slot_or_decision_age")
             self._record(row)
             return
-        self.dispatch_row = row
-        if not self._dispatch_allowed():
+        valid_until_ns = self._dispatch_deadline_ns(row, slot)
+        if time.monotonic_ns() >= valid_until_ns:
             self._invalidate("dispatch_feedback_or_budget")
             self._record(row)
             return
         result, failure = None, None
         if self.execute:
             try:
-                result = self.robot.send_action(command)
-            except DispatchError as exc:
+                result = self.robot.send_action(command, valid_until_ns=valid_until_ns)
+            except (DispatchError, DispatchInterrupted) as exc:
                 result, failure = exc.result, exc
+        cancelled = isinstance(failure, DispatchInterrupted)
         accepted = (
             result is not None
             and result.arm == DispatchStatus.ACCEPTED
@@ -547,39 +544,55 @@ class PolicyRunner:
             hand=int(result.hand) if result else 0,
             logical_consume=not self.execute,
         )
-        if failure is not None or (
+        failed = failure is not None or (
             self.execute and self.execution.execution_mode != "sync" and not accepted
-        ):
-            # Revoke/stop before the recorder may block; retain the attempted row.
-            reason = (
-                (
-                    RunEndReason.TIMEOUT
-                    if not self._within_budget()
-                    else RunEndReason.EXECUTOR_BOUNDARY
+        )
+        stop_error = None
+        try:
+            if failed:
+                if cancelled:
+                    self.shared.estop_request.value = True
+                reason = (
+                    RunEndReason.ESTOP
+                    if cancelled
+                    else (
+                        RunEndReason.TIMEOUT
+                        if not self._within_budget()
+                        else RunEndReason.EXECUTOR_BOUNDARY
+                    )
+                    if failure is not None and failure.revoked
+                    else RunEndReason.HARDWARE_FAULT
                 )
-                if failure is not None and failure.revoked
-                else RunEndReason.HARDWARE_FAULT
-            )
-            revoke_motion_if_run_id(self.shared, self.run_id, reason=reason)
-            stop_error = None
+                revoke_motion_if_run_id(self.shared, self.run_id, reason=reason)
+                try:
+                    self.robot.stop()
+                except Exception as exc:
+                    stop_error = exc
+                    self._event("stop_failure", detail=str(exc))
+                    if failure is not None:
+                        logger.exception("stop after dispatch also failed")
+            elif not self.execute or (result is not None and result.continued):
+                self.previous_arm = command.arm_qpos
+                self.wait_started_ns = None
+        finally:
             try:
-                self.robot.stop()
+                self._record(row, command, result)
             except Exception as exc:
-                stop_error = exc
-                self._event("stop_failure", detail=str(exc))
-            self._record(row, command, result)
+                if failure is not None:
+                    logger.exception("recording after dispatch also failed")
+                    raise failure from exc
+                raise
+        if failed:
             self._finish_episode(
-                "dispatch_unconfirmed_or_failed", run_end_reason=reason, stop_motion=False
+                "dispatch_cancelled" if cancelled else "dispatch_unconfirmed_or_failed",
+                run_end_reason=reason,
+                stop_motion=False,
             )
+            if cancelled or (failure is not None and not failure.revoked):
+                raise failure
             if stop_error is not None:
                 raise stop_error
-            if failure is not None and not failure.revoked:
-                raise failure
             return
-        if not self.execute or (result is not None and result.continued):
-            self.previous_arm = command.arm_qpos
-            self.wait_started_ns = None
-        self._record(row, command, result)
         if slot + 1 == plan.segment_end and self.execution.execution_mode == "sync":
             self.plan = None
 
@@ -616,6 +629,7 @@ class PolicyRunner:
         self.last_slot = slot
         self.next_step_ns = self.started_ns + (slot + 1) * self.dt_ns
         row = self._read_observation()
+        self._poll_model()
         if (
             missed
             or time.monotonic_ns() - (self.next_step_ns - self.dt_ns)
@@ -736,7 +750,6 @@ class PolicyRunner:
             except Exception as exc:
                 failure = failure or exc
                 logger.exception("episode cleanup failed")
-            self.robot.before_send = None
             try:
                 if self.robot._motion_active or self.robot._hand_stop_pending:
                     self.robot.stop()

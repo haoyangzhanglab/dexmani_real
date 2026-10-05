@@ -201,13 +201,11 @@ def main(argv: list[str] | None = None) -> int:
             ExecutionConfig,
             PolicyRuntimeConfig,
             RolloutRecordingConfig,
-            validate_num_episodes,
             validate_policy_runtime_compatibility,
         )
 
         runtime = resolve_experiment_config(yaml_path=args.config)
         validate_policy_runtime_compatibility(info, runtime)
-        validate_num_episodes(args.num_episodes)
         execution = ExecutionConfig(
             args.execution_mode,
             args.max_decision_age,

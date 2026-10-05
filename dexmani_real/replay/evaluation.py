@@ -37,7 +37,7 @@ class ReplayMetrics:
     arm_joint_mae_deg: np.ndarray = field(default_factory=lambda: np.full(ARM_JOINT_SHAPE, np.nan))
     arm_joint_rmse_deg: np.ndarray = field(default_factory=lambda: np.full(ARM_JOINT_SHAPE, np.nan))
     arm_joint_mae_overall_deg: float = float("nan")
-    arm_joint_rmse_overall_deg: float = float("nan")
+    arm_mean_joint_rmse_deg: float = float("nan")
 
     eef_pos_error_mean_mm: float = float("nan")
     eef_pos_error_max_mm: float = float("nan")
@@ -50,7 +50,7 @@ class ReplayMetrics:
     eef_rot_error_per_frame_deg: np.ndarray | None = None
 
     hand_joint_mae_overall_deg: float | None = None
-    hand_joint_rmse_overall_deg: float | None = None
+    hand_pooled_rmse_deg: float | None = None
 
     tracking_lag_frames: int | None = None
     tracking_lag_seconds: float = float("nan")
@@ -116,7 +116,7 @@ def compute_metrics(
         metrics.arm_joint_mae_deg = np.rad2deg(np.mean(diff, axis=0))
         metrics.arm_joint_rmse_deg = np.rad2deg(np.sqrt(np.mean(diff**2, axis=0)))
         metrics.arm_joint_mae_overall_deg = float(np.mean(metrics.arm_joint_mae_deg))
-        metrics.arm_joint_rmse_overall_deg = float(np.mean(metrics.arm_joint_rmse_deg))
+        metrics.arm_mean_joint_rmse_deg = float(np.mean(metrics.arm_joint_rmse_deg))
 
     if original_arm_ee is not None and original_arm_ee.shape[0] >= frame_count:
         orig_ee_pos = original_arm_ee[:frame_count, :3]
@@ -167,7 +167,7 @@ def compute_metrics(
             if valid_h.sum() > 0:
                 diff_h = np.abs(orig_h[valid_h] - rep_h[valid_h])
                 metrics.hand_joint_mae_overall_deg = float(np.rad2deg(np.mean(diff_h)))
-                metrics.hand_joint_rmse_overall_deg = float(np.rad2deg(np.sqrt(np.mean(diff_h**2))))
+                metrics.hand_pooled_rmse_deg = float(np.rad2deg(np.sqrt(np.mean(diff_h**2))))
 
     if frame_count >= _MIN_TRACKING_SEQUENCE_FRAMES:
         max_lag = max(int(np.ceil(fps * _TRACKING_LAG_WINDOW_S)), _MIN_TRACKING_LAG_FRAMES)
@@ -235,7 +235,7 @@ def report_consistency(metrics: ReplayMetrics) -> None:
     )
     print(
         f"  Arm joint RMSE: {np.round(metrics.arm_joint_rmse_deg, 2)} deg  "
-        f"(overall: {metrics.arm_joint_rmse_overall_deg:.3f} deg)"
+        f"(mean_joint_rmse: {metrics.arm_mean_joint_rmse_deg:.3f} deg)"
     )
     if metrics.eef_pos_error_per_frame_mm is not None:
         print(
@@ -364,7 +364,7 @@ def save_results(
             "mae_per_joint_deg": np.round(metrics.arm_joint_mae_deg, 4).tolist(),
             "rmse_per_joint_deg": np.round(metrics.arm_joint_rmse_deg, 4).tolist(),
             "mae_overall_deg": round(metrics.arm_joint_mae_overall_deg, 4),
-            "rmse_overall_deg": round(metrics.arm_joint_rmse_overall_deg, 4),
+            "mean_joint_rmse_deg": round(metrics.arm_mean_joint_rmse_deg, 4),
         },
         "eef_position": {
             "mean_error_mm": round(metrics.eef_pos_error_mean_mm, 2),
@@ -387,13 +387,10 @@ def save_results(
             "p95_deg": round(metrics.arm_tracking_error_p95_deg, 2),
             "max_deg": round(metrics.arm_tracking_error_max_deg, 2),
         }
-    if (
-        metrics.hand_joint_mae_overall_deg is not None
-        and metrics.hand_joint_rmse_overall_deg is not None
-    ):
+    if metrics.hand_joint_mae_overall_deg is not None and metrics.hand_pooled_rmse_deg is not None:
         metrics_dict["hand_joint"] = {
             "mae_overall_deg": round(metrics.hand_joint_mae_overall_deg, 4),
-            "rmse_overall_deg": round(metrics.hand_joint_rmse_overall_deg, 4),
+            "pooled_rmse_deg": round(metrics.hand_pooled_rmse_deg, 4),
         }
 
     def json_defined(value):

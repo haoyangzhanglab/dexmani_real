@@ -33,9 +33,6 @@ class HandOptimizer:
     max(pinch_factors) < pinch_skip_threshold. reg_stage1_weight and
     reg_last_weight anchor Stage 2 to Stage 1 and the previous frame.
 
-    Both stages apply prior_weight toward q_prior. Zero disables the prior;
-    otherwise prior_mask is required: (dof,) zeros/ones selecting the 10 flexion
-    joints, excluding unmapped joints such as thumb_rota1 and index_bend.
     """
 
     def __init__(
@@ -60,8 +57,6 @@ class HandOptimizer:
         pinch_skip_threshold: float = 0.01,
         reg_stage1_weight: float = 1.0,
         reg_last_weight: float = 0.8,
-        prior_weight: float = 0.0,
-        prior_mask: np.ndarray | None = None,
     ) -> None:
         self.pin_grad = PinGrad(urdf_path, fingertip_frame_names)
         self.dof: int = self.pin_grad.dof
@@ -126,49 +121,25 @@ class HandOptimizer:
         self.reg_s1_weight = reg_stage1_weight
         self.reg_last_weight = reg_last_weight
 
-        self.prior_weight = float(prior_weight)
-        if not np.isfinite(self.prior_weight) or self.prior_weight < 0:
-            raise ValueError("prior_weight must be finite and non-negative")
-        if prior_mask is not None:
-            prior_mask = np.asarray(prior_mask, dtype=np.float64)
-            if prior_mask.shape != (self.dof,):
-                raise ValueError(f"prior_mask must have shape ({self.dof},)")
-            if not np.all(np.isfinite(prior_mask)):
-                raise ValueError("prior_mask must be finite")
-        self.prior_mask = prior_mask
-
         self._default_qpos = (self.joint_limits_lower + self.joint_limits_upper) / 2.0
         self.last_qpos: np.ndarray = self._default_qpos.copy()
         self.qpos_stage1: np.ndarray | None = None
         self.pinch_factors: np.ndarray = np.zeros(self.finger_num, dtype=np.float64)
         self._current_target: np.ndarray | None = None  # (finger_num, 3) scaled targets
-        self._current_q_prior: np.ndarray | None = None  # (dof,) per-frame human flexion reference
         self._stage1_warn = ThrottledWarner(interval_s=5.0, logger=logger)
         self._stage2_warn = ThrottledWarner(interval_s=5.0, logger=logger)
         self._bounds_warn = ThrottledWarner(interval_s=5.0, logger=logger)
 
-    def solve(
-        self, fingertip_positions: np.ndarray, q_prior: np.ndarray | None = None
-    ) -> np.ndarray | None:
+    def solve(self, fingertip_positions: np.ndarray) -> np.ndarray | None:
         """Solve wrist-centered fingertips (finger_num, 3) in the URDF frame.
 
-        q_prior is an optional (dof,) human-flexion reference in Pinocchio order,
-        used when prior_weight > 0. Returns (dof,) angles in that order, or None
-        on Stage 1 failure; the caller must record failure without a new target.
+        Returns model-order angles, or None on Stage 1 failure.
         """
         fingertip_positions = np.asarray(fingertip_positions, dtype=np.float64)
         if fingertip_positions.shape != (self.finger_num, 3):
             raise ValueError(f"fingertip_positions must have shape ({self.finger_num}, 3)")
         if not np.all(np.isfinite(fingertip_positions)):
             raise ValueError("fingertip_positions must be finite")
-
-        if q_prior is not None:
-            q_prior = np.asarray(q_prior, dtype=np.float64)
-            if q_prior.shape != (self.dof,):
-                raise ValueError(f"q_prior must have shape ({self.dof},)")
-            if not np.all(np.isfinite(q_prior)):
-                raise ValueError("q_prior must be finite")
-        self._current_q_prior = q_prior
 
         self._current_target = fingertip_positions * self.finger_scale[:, np.newaxis]
 
@@ -243,16 +214,8 @@ class HandOptimizer:
             self._bounds_warn("HandOptimizer: projected %s into NLopt bounds", label)
         return bounded
 
-    def _compute_prior_gradient(self, qpos: np.ndarray) -> tuple[np.ndarray, float]:
-        """Human-flexion prior gradient/loss (zeros when disabled)."""
-        if self._current_q_prior is None or self.prior_mask is None or self.prior_weight <= 0:
-            return np.zeros(self.dof, dtype=np.float64), 0.0
-        diff = qpos - self._current_q_prior
-        w = self.prior_weight * self.prior_mask
-        return 2.0 * w * diff, float(np.sum(w * diff * diff))
-
     def _obj_s1(self, qpos: np.ndarray, grad: np.ndarray) -> float:
-        """Stage 1 objective: position error + temporal smoothness + natural-hand prior."""
+        """Stage 1 objective: position error + temporal smoothness."""
         self.qpos_floating[7:] = qpos
         # _current_target is set by solve() before any NLopt callback fires;
         # mypy sees np.ndarray|None but runtime is always np.ndarray here.
@@ -263,10 +226,9 @@ class HandOptimizer:
         g_smooth, loss_smooth = PinGrad.compute_smoothness_gradient(
             qpos, self.last_qpos, self._smooth_weight
         )
-        g_prior, loss_prior = self._compute_prior_gradient(qpos)
         if grad.size > 0:
-            grad[:] = g_pos + g_smooth + g_prior
-        return float(loss_pos + loss_smooth + loss_prior)
+            grad[:] = g_pos + g_smooth
+        return float(loss_pos + loss_smooth)
 
     def _obj_s2(self, qpos: np.ndarray, grad: np.ndarray) -> float:
         """Stage 2 objective: pinch refinement with regularization."""
@@ -288,10 +250,6 @@ class HandOptimizer:
             g_smooth, loss_smooth = PinGrad.compute_smoothness_gradient(qpos, ref, weight)
             total_loss += loss_smooth
             total_grad += g_smooth
-
-        g_prior, loss_prior = self._compute_prior_gradient(qpos)
-        total_loss += loss_prior
-        total_grad += g_prior
 
         thumb_fid = self.pin_grad.tip_frame_ids[0]
         J_thumb_v = pin.getFrameJacobian(

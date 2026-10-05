@@ -3,7 +3,10 @@
 import multiprocessing as mp
 import os
 
-from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
+from dexmani_real.calibration.camera.extrinsics import (
+    CameraExtrinsics,
+    load_optional_camera_extrinsics,
+)
 from dexmani_real.deployment.config import (
     validate_max_running_s,
     validate_num_episodes,
@@ -57,7 +60,13 @@ def run_policy_deployment(
     # Cloud production needs a camera worker; recording also retains its source RGB-D.
     camera = cloud or "rgb" in fields or recording_config is not None
     points = cloud_recipe.num_points if cloud else runtime.pointcloud.num_points
-    camera_calibration = CameraExtrinsics() if cloud else None
+    camera_calibration = (
+        CameraExtrinsics()
+        if cloud
+        else load_optional_camera_extrinsics()
+        if recording_config is not None
+        else None
+    )
     pointcloud_config = (
         PointCloudWorkerConfig.from_runtime(
             runtime,
@@ -159,6 +168,7 @@ def run_policy_deployment(
             max_running_s=max_running_s,
             num_episodes=num_episodes,
             recording_config=recording_config,
+            camera_calibration=camera_calibration,
         )
         runner.run()
         clean = bool(shared.quit_requested.value)

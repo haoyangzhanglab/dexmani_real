@@ -162,6 +162,7 @@ class VideoEncoder:
         if self._cfg.pixel_format != "rgb24":
             av_frame = av_frame.reformat(format=self._cfg.pixel_format)
         av_frame.pts = self._frame_count
+        av_frame.time_base = 1 / Fraction(str(self._fps)).limit_denominator(1_000_000)
 
         # encode() returns packets; mux writes them to the container.
         for packet in self._stream.encode(av_frame):
@@ -178,7 +179,9 @@ class VideoDecoder:
         self._container: av.container.InputContainer | None = None
         self._stream: Any = None  # av.video.VideoStream — PyAV stubs are incomplete
         self._frame_count: int = 0
-        self._fps_val: float = 0.0
+        self._rate = None
+        self._origin_time = None
+        self._origin_time_base = None
         self._opened = False
 
     @property
@@ -214,21 +217,28 @@ class VideoDecoder:
         if index < 0 or index >= self._frame_count:
             raise IndexError(f"Frame index {index} out of range [0, {self._frame_count})")
 
-        # Seek to the target timestamp (best-effort — lands on preceding keyframe).
-        time_base = self._stream.time_base  # Fraction (PyAV stubs: Fraction | None)
-        if time_base is None:
-            time_base = self._stream.average_rate  # fallback
-            if time_base is None:
-                raise RuntimeError(f"Cannot determine time base for {self._path}")
-        pts = int(index * time_base.denominator / (self._fps_val * time_base.numerator))
-        self._container.seek(pts, stream=self._stream)
-
-        for packet in self._container.demux(self._stream):
-            for frame in packet.decode():
-                if isinstance(frame, av.VideoFrame) and frame.pts is not None:
-                    t = frame.pts * time_base.numerator / time_base.denominator * self._fps_val
-                    if t >= index:
-                        return frame.to_ndarray(format="rgb24")
+        time_base = self._stream.time_base
+        target_time = self._origin_time + Fraction(index, 1) / self._rate
+        pts = target_time // time_base
+        self._container.seek(pts, stream=self._stream, backward=True, any_frame=False)
+        previous = None
+        for frame in self._container.decode(self._stream):
+            if frame.pts is None or frame.time_base is None:
+                raise ValueError("CFR frame is missing its presentation timestamp")
+            ordinal = (frame.pts * frame.time_base - self._origin_time) * self._rate
+            # Each PTS (including origin) may have half a time-base tick of
+            # quantization error. Ambiguous adjacent identities are unsupported.
+            tolerance = (frame.time_base + self._origin_time_base) * self._rate / 2
+            nearest = round(ordinal)
+            if tolerance >= Fraction(1, 2) or abs(ordinal - nearest) > tolerance:
+                raise ValueError("presentation timestamp cannot identify a unique CFR frame")
+            if previous is not None and nearest <= previous:
+                raise ValueError("duplicate or unordered CFR presentation timestamp")
+            previous = nearest
+            if nearest == index:
+                return frame.to_ndarray(format="rgb24")
+            if nearest > index:
+                raise ValueError(f"CFR decode skipped requested frame {index}")
         raise RuntimeError(f"Failed to decode frame {index} from {self._path}")
 
     def close(self) -> None:
@@ -253,5 +263,12 @@ class VideoDecoder:
         avg_rate = self._stream.average_rate
         if avg_rate is None:
             raise ValueError(f"No average frame rate in {self._path}")
-        self._fps_val = float(avg_rate)
+        self._rate = Fraction(avg_rate)
+        if self._rate <= 0 or self._stream.time_base is None:
+            raise ValueError("CFR video requires a positive rate and a time base")
+        first = next(self._container.decode(self._stream), None)
+        if first is None or first.pts is None or first.time_base is None:
+            raise ValueError("CFR video requires a first presentation timestamp")
+        self._origin_time = first.pts * first.time_base
+        self._origin_time_base = first.time_base
         self._opened = True

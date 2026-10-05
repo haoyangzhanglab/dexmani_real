@@ -19,3 +19,17 @@ class TeleopConfig:
     def __post_init__(self) -> None:
         if not self.hand_urdf_path:
             raise ValueError("hand_urdf_path must be non-empty")
+
+
+def validate_keyboard_workspace(runtime):
+    """Validate the selected jog configuration before any device connects."""
+    import numpy as np
+
+    cfg = runtime.keyboard_teleop
+    cfg.validate()
+    workspace = runtime.policy.workspace.as_array()
+    if not np.isfinite(workspace).all() or np.any(
+        workspace[:, 0] + cfg.workspace_command_margin_m
+        >= workspace[:, 1] - cfg.workspace_command_margin_m
+    ):
+        raise ValueError("keyboard workspace command margin leaves no interior workspace")

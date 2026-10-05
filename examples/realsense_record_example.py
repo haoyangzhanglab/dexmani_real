@@ -418,7 +418,7 @@ def _run_rgbd_test(
     production: PointCloudConfig,
     table_plane_abcd: tuple[float, float, float, float] | None,
     calibration: CameraExtrinsics,
-) -> None:
+) -> str:
     print("\n-- 2. RGB-D live capture + point cloud --")
     print(
         "   q/Esc=quit  p=pcd  s=raw/processed  f=freeze "
@@ -431,6 +431,7 @@ def _run_rgbd_test(
     previous_frame_start = None
     frame_count = 0
     total_dropped = 0
+    outcome = "completed"
 
     geometry = camera.get_geometry().aligned_depth_to_color()
     depth_scale_m = camera.get_depth_scale()
@@ -450,8 +451,9 @@ def _run_rgbd_test(
         t0 = time.perf_counter()
         try:
             frame = camera.read(timeout_ms=5000)
-        except RuntimeError as e:
+        except (RuntimeError, OSError) as e:
             print(f"  read() failed: {e}")
+            outcome = "read_failed"
             break
         read_ms = (time.perf_counter() - t0) * 1000.0
         frame_count += 1
@@ -548,12 +550,14 @@ def _run_rgbd_test(
                 print("  Point cloud window closed")
 
         if not _handle_keyboard(cv2.waitKey(1) & 0xFF, state, viewer, camera, production):
+            outcome = "user_exit"
             break
 
     viewer.close()
     cv2.destroyAllWindows()
 
     print(f"Captured {frame_count} frames; point-cloud failures: {total_dropped}")
+    return outcome
 
 
 def main() -> int:
@@ -612,7 +616,7 @@ def main() -> int:
         )
 
     try:
-        _run_rgbd_test(
+        outcome = _run_rgbd_test(
             camera,
             test_cfg,
             production=production,
@@ -630,9 +634,9 @@ def main() -> int:
         print("disconnect OK")
 
     print("\n" + "=" * 60)
-    print("Test complete")
+    print("Test failed" if outcome == "read_failed" else "Test complete")
     print("=" * 60)
-    return 0
+    return 1 if outcome == "read_failed" else 0
 
 
 if __name__ == "__main__":

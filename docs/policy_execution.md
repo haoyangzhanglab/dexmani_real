@@ -26,11 +26,13 @@ async/rtc 在 b+A-d 预取，在 b+A 交接；此后每 A 槽重复。query 槽 
 
 WAIT 从需要动作却没有计划时计时，历史不足、旧 Future 回收、bootstrap、无效重试都不能刷新 deadline；首次成功发送或明确非下发模式的逻辑 consume 才清除。交接失败后不能继续旧 tail，也不能在忙碌 worker 后排入新 observation。漏槽清空连续历史，不补造采样、不追赶连发。相机低帧率重复源帧只在现有 freshness 条件内有效。
 
-query 保存最新观察槽位每个实际输入依赖的 host monotonic 源时间；FK 继承关节读取时间，cloud 继承 camera 队列返回时间，录制专用相机不加入策略年龄条件。结果完成或新反馈不刷新旧 query。结果准入、发送前及逐设备 SDK 前检查预算，当前反馈 freshness 独立保留。这些时间不是设备真实采集时间。
+query 保存最新观察槽位每个实际输入依赖的 host monotonic 源时间；FK 继承关节读取时间，cloud 继承 RGB-D 两通道中最旧的推进接收时间，录制专用相机不加入策略年龄条件。结果完成或新反馈不刷新旧 query。结果准入、发送前及逐设备 SDK 前检查预算，当前反馈 freshness 独立保留。这些时间不是设备真实采集时间。
 
 async/rtc 的前 d 步都冻结实际 joint19 目标：Joint 路径先投影，EEF 路径先事务性完成 IK。只有 RTC 生成模型前缀条件；EEF 使用公共 FK 将冻结目标转换为 EEF21，其余 tail 作为软先验。准备不推进 previous accepted。冻结目标在最新反馈下重新检查表示分支、距离、previous accepted jump 等条件，失败不重新 IK 后沿用旧条件。async/rtc 要求两设备明确 ACCEPTED；CRC_UNCONFIRMED、UNKNOWN 或部分失败终止承诺，不重发。
 
 WAIT 表示没有新策略目标，设备仍可能追踪上一个目标。停止顺序为撤权/失效、设备 stop、录制和模型资源回收；不能撤销已进入 SDK 的调用，也不证明物理停稳。模型任务不会被 Future.cancel 强行打断。close 若仍等待模型完成，会明确记录 pending；Python 进程可能仍等待非 daemon worker。
+
+发送截止使用本机 monotonic 时钟，在每个目标 SDK 调用前判断；进入 SDK 后的迟返回保留实际确认结果。Ctrl+C 保留本次派发状态与已采前缀，软件取消不能撤回已进入 SDK 的调用。
 
 程序接口的 `execute=False` 仍会连接并读取机器人与所需传感器，仅表示不下发策略目标，也不支持录制评估。其逻辑 consume 可以推进计划，但 dispatch 保持 NOT_CALLED；不能用于证明实际执行。CLI `examples/run_policy.py` 固定使用实际执行。离线测试使用 fake robot/观测，不启动 live session。
 
@@ -42,6 +44,8 @@ WAIT 表示没有新策略目标，设备仍可能追踪上一个目标。停止
 
 Policy 主 Dataset 按实际使用的输入与监督检查窗口有限性，Real canonical 额外要求两设备 ACCEPTED dispatch。观察检查前 N 源行，监督检查完整 H；保持原 padding、episode 边界、loss 权重和时间语义。normalizer 仅拟合有效训练窗口引用的去重源行，验证使用训练统计。checkpoint 部署及恢复读取保存的统计，不重拟合；数据配方变化不能作为旧配方的精确续训，历史复现使用原源码版本。数学和数据筛选细节见相邻 `dexmani_policy` 仓库的 `docs/rtc.md`。
 
+Replay 报告中的 arm `mean_joint_rmse_deg` 是逐关节 RMSE 的平均，hand `pooled_rmse_deg` 是所有帧和关节平方误差的共同均值开方，两者口径不同；历史结果不改写。
+
 ## 离线检查与真实评测
 
 ```bash
@@ -52,6 +56,6 @@ ruff check dexmani_real examples
 git diff --check
 ```
 
-相邻 Policy 的定向测试是 `tests/test_policy_windows.py` 和 `tests/test_policy_rtc.py`，配套运行已有 training/resume/evaluation 回归测试和 `smoke_test.py --config-only`。测试覆盖生产调度、实际 DDIM、实际 backbone input VJP、公共 FK/IK 动态检查，以及临时目录中的实际 Raw writer；fake device 不等于真机集成。
+相邻 Policy 的定向测试包括 `tests/test_policy_windows.py`、`tests/test_streaming_dataset.py` 和 `tests/test_policy_rtc.py`，配套运行已有 training/resume/evaluation 回归测试和 `smoke_test.py --config-only`。测试覆盖生产调度、实际 DDIM、实际 backbone input VJP、公共 FK/IK 动态检查，以及临时目录中的实际 Raw writer；fake device 不等于真机集成。
 
 后续实验先对照相同权重的旧/新 sync（尤其 N>1），再在相同观察协议、A、NFE、seed 和预算下对照新 sync/async/rtc；async 与 rtc 固定相同 d。记录成功率、任务时间、decision age、handoff miss、owner tick、前缀准备时间及接缝变化。新 sync 在推理期间继续采样，是明确的评测观察时间协议变化，不是历史同步行为的等价重构。GPU/真实权重时延、闭环收益、物理安全须单独验证。

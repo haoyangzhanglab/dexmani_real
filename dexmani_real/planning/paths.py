@@ -304,11 +304,15 @@ def _check_home_path_candidate(
     negative_is_initial_prefix = all(
         sample[0] == index for index, sample in enumerate(negative_samples)
     )
-    monotonic_escape = all(
-        current[1] >= previous[1] - 5e-4
-        for previous, current in zip(table_samples[:-1], table_samples[1:])
-        if previous[1] < 0.0
-    )
+    best_clearance_so_far = table_samples[0][1]
+    monotonic_escape = True
+    for sample in table_samples[1:]:
+        if best_clearance_so_far >= 0:
+            break
+        if sample[1] < best_clearance_so_far - 5e-4:
+            monotonic_escape = False
+            break
+        best_clearance_so_far = max(best_clearance_so_far, sample[1])
     reaches_clearance = table_samples[-1][1] >= 0.0
     is_soft_escape = (
         allow_table_soft_escape

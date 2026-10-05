@@ -266,13 +266,16 @@ def calibrate_and_select(
     rpy_ee2base: list[np.ndarray],
     rvec_marker2camera: list[np.ndarray],
     tvec_marker2camera: list[np.ndarray],
-) -> tuple[np.ndarray, str, np.ndarray, np.ndarray, list[tuple[str, float]]]:
-    """Run all five hand-eye methods; return the best by position residual RMS.
+    *,
+    max_position_rms_mm: float,
+    max_rotation_rms_deg: float,
+):
+    """Choose the minimum position RMS among candidates passing both limits.
 
     Returns:
-        (T_best, method_name, errors_mm, errors_deg, method_table).
+        (T_best, method_name, errors_mm, errors_deg, method_table, position_rms, rotation_rms).
     """
-    best: tuple[float, str, np.ndarray, np.ndarray, np.ndarray] | None = None
+    best = None
     table: list[tuple[str, float]] = []
 
     for name, m in _HAND_EYE_METHODS.items():
@@ -291,18 +294,32 @@ def calibrate_and_select(
                 rvec_marker2camera,
                 tvec_marker2camera,
             )
+            if (
+                T.shape != (4, 4)
+                or not np.isfinite(T).all()
+                or errors_mm.shape != (len(tvec_ee2base),)
+                or errors_deg.shape != errors_mm.shape
+                or not np.isfinite(errors_mm).all()
+                or not np.isfinite(errors_deg).all()
+            ):
+                raise ValueError("invalid hand-eye candidate")
             rms_mm = float(np.sqrt(np.mean(errors_mm**2)))
+            rms_deg = float(np.sqrt(np.mean(errors_deg**2)))
+            if not np.isfinite(rms_mm) or not np.isfinite(rms_deg):
+                raise ValueError("nonfinite hand-eye quality score")
         except Exception:
             table.append((name, float("nan")))
             continue
         table.append((name, rms_mm))
-        if best is None or rms_mm < best[0]:
-            best = (rms_mm, name, T, errors_mm, errors_deg)
+        if rms_mm > max_position_rms_mm or rms_deg > max_rotation_rms_deg:
+            continue
+        if best is None or (rms_mm, rms_deg) < best[:2]:
+            best = (rms_mm, rms_deg, name, T, errors_mm, errors_deg)
 
     if best is None:
-        raise RuntimeError("all hand-eye methods failed")
-    _, name_best, T_best, errors_mm_best, errors_deg_best = best
-    return T_best, name_best, errors_mm_best, errors_deg_best, table
+        raise RuntimeError("no hand-eye candidate passed both quality limits")
+    rms_mm, rms_deg, name_best, T_best, errors_mm_best, errors_deg_best = best
+    return T_best, name_best, errors_mm_best, errors_deg_best, table, rms_mm, rms_deg
 
 
 @dataclass
@@ -406,6 +423,7 @@ def save_camera_calibration(
     json_path: Path,
     *,
     calibration_capture: Mapping[str, object] | None = None,
+    cancelled=None,
 ) -> None:
     """Write calibration result to cameras.json, preserving other entries."""
     T_world_camera = validate_rigid_transform(T_world_camera, label="T_world_camera")
@@ -457,5 +475,5 @@ def save_camera_calibration(
         json.dumps(existing, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ValueError("camera calibration payload must contain finite JSON values") from exc
-    atomic_json_dump(existing, json_path, ensure_ascii=False)
+    atomic_json_dump(existing, json_path, ensure_ascii=False, cancelled=cancelled)
     print(f"  calibration written → {json_path} (camera: {cam_name})")

@@ -167,7 +167,8 @@ def export_raw_to_zarr(
                             dtype=spec.dtype,
                         )
                     root.attrs["time_semantics"] = (
-                        "host monotonic ns; 0 unknown/not called; camera queue return; robot read completion"
+                        "host monotonic ns; 0 unknown/not called; camera times preserved from Raw "
+                        "(see Raw camera_timestamp_source); robot read completion"
                     )
                     root.attrs["row_semantics"] = (
                         "control observation and attempted target, not per-action query input"

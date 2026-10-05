@@ -1,4 +1,4 @@
-"""RealSense owner; publish usable aligned RGB-D and host acquisition times."""
+"""RealSense owner; publish aligned RGB-D with the oldest channel advance time."""
 
 import json
 import time
@@ -58,21 +58,25 @@ def run_camera_worker(shared, config: CameraParams) -> None:
         shared.camera_serial.value = str(cam.active_serial or "").encode()
         shared.camera_geometry.value = json.dumps(cam.get_geometry().to_dict()).encode()
         last_frame = None
-        last_good_s = [time.monotonic(), time.monotonic()]
+        last_advance_ns = [time.monotonic_ns(), time.monotonic_ns()]
         while shared.is_running.value:
             try:
                 frame = cam.read(timeout_ms=300, compute_depth=False)
             except (RuntimeError, OSError):
-                if time.monotonic() - min(last_good_s) >= cfg.source_stall_timeout_s:
+                if time.monotonic_ns() - min(last_advance_ns) >= int(
+                    cfg.source_stall_timeout_s * 1e9
+                ):
                     raise
                 time.sleep(0.01)
                 continue
             identity = (frame.depth_frame_number, frame.color_frame_number)
-            now = time.monotonic()
+            now = time.monotonic_ns()
             for channel, name in enumerate(("depth", "RGB")):
+                if identity[channel] is None or identity[channel] < 0:
+                    raise RuntimeError(f"RealSense missing {name} frame identity")
                 if last_frame is None or identity[channel] != last_frame[channel]:
-                    last_good_s[channel] = now
-                elif now - last_good_s[channel] >= cfg.source_stall_timeout_s:
+                    last_advance_ns[channel] = int(frame.timestamp_ns)
+                elif now - last_advance_ns[channel] >= int(cfg.source_stall_timeout_s * 1e9):
                     raise RuntimeError(f"RealSense stopped producing new {name}")
             if identity == last_frame:
                 continue
@@ -82,9 +86,9 @@ def run_camera_worker(shared, config: CameraParams) -> None:
                 *pack_camera_frame(
                     frame.rgb,
                     frame.depth_aligned_to_color_raw,
-                    timestamp_ns=frame.timestamp_ns,
+                    timestamp_ns=min(last_advance_ns),
                     depth_frame_number=frame.depth_frame_number,
-                    color_frame_number=frame.color_frame_number or 0,
+                    color_frame_number=frame.color_frame_number,
                 )
             )
             last_frame = identity

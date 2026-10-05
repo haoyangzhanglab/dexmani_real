@@ -178,10 +178,6 @@ class XHand:
     def is_connected(self) -> bool:
         return self.connected_flag
 
-    @property
-    def tactile_calibrated(self) -> bool:
-        return self._tactile_bias_aggregate is not None and self._tactile_bias_dense is not None
-
     def connect(self) -> None:
         """Open the configured device and seed its command buffer from live feedback."""
         from xhand_controller import xhand_control
@@ -378,89 +374,68 @@ class XHand:
             return
         control.close_device()
 
-    def calibrate_tactile(self) -> bool:
-        """Estimate a software no-contact bias without gating joint control.
+    def calibrate_tactile(self) -> tuple[bool, bool]:
+        """Validate local no-contact candidates before making either bias usable."""
+        self._tactile_bias_aggregate = self._tactile_bias_dense = None
+        candidates = self._capture_tactile_bias()
+        verified = self._verify_tactile_bias(*candidates)
+        for name, candidate, ok in zip(("aggregate", "dense"), candidates, verified):
+            if ok:
+                setattr(self, f"_tactile_bias_{name}", candidate)
+            logger.log(20 if ok else 30, "XHand %s tactile calibrated=%s", name, ok)
+        return (self._tactile_bias_aggregate is not None, self._tactile_bias_dense is not None)
 
-        This assumes the operator started the hand with fingertips free and
-        unloaded; uncalibrated absolute force cannot prove no-contact.  A
-        candidate bias is captured, published, then independently verified.
-        A failed verification clears both biases so a half-calibrated state is
-        never left behind.
-        """
-        self._tactile_bias_aggregate = None
-        self._tactile_bias_dense = None
-        bias_aggregate, bias_dense = self._capture_tactile_bias()
-        # Publish both candidate biases together, then verify from fresh reads.
-        self._tactile_bias_aggregate = bias_aggregate
-        self._tactile_bias_dense = bias_dense
-        if not self._verify_tactile_bias():
-            logger.error("Tactile calibration failed post-bias verification; biases cleared")
-            self._tactile_bias_aggregate = None
-            self._tactile_bias_dense = None
-            return False
-        logger.info(
-            "XHand tactile software bias calibrated from %d no-contact samples",
-            _TACTILE_BIAS_SAMPLE_COUNT,
-        )
-        return self.tactile_calibrated
-
-    def _capture_tactile_bias(self) -> tuple[np.ndarray, np.ndarray]:
-        """Collect candidate ``(bias_aggregate, bias_dense)`` without declaring success.
-
-        Every capture read must report both aggregate and dense payloads as
-        valid and finite; a failure raises rather than returning a partial
-        candidate.
-        """
-        samples: list[XHandState] = []
+    def _capture_tactile_bias(self):
+        samples = ([], [])
         for _ in range(_TACTILE_BIAS_SAMPLE_COUNT):
-            # Space live RS485 reads so startup calibration does not burst the bus.
             time.sleep(_TACTILE_BIAS_SAMPLE_INTERVAL_S)
-            state = self.get_state()
+            state = self._read_state(apply_bias=False)
             if state is None:
                 raise XHandError(
-                    "calibrate_tactile",
-                    -1,
-                    "joint state unavailable during bias capture",
+                    "calibrate_tactile", -1, "joint state unavailable during bias capture"
                 )
-            if not state.tactile_aggregate_valid or not state.tactile_dense_valid:
-                raise XHandError(
-                    "calibrate_tactile",
-                    -1,
-                    "incomplete tactile data during bias capture",
-                )
-            samples.append(state)
-        bias_aggregate = np.mean(np.stack([sample.tactile_aggregate for sample in samples]), axis=0)
-        bias_dense = np.mean(np.stack([sample.tactile_dense for sample in samples]), axis=0)
-        return bias_aggregate, bias_dense
+            for name, channel in zip(("aggregate", "dense"), samples):
+                if getattr(state, f"tactile_{name}_valid"):
+                    channel.append(getattr(state, f"tactile_{name}"))
+        return tuple(
+            np.mean(np.stack(channel), axis=0)
+            if len(channel) == _TACTILE_BIAS_SAMPLE_COUNT
+            else None
+            for channel in samples
+        )
 
-    def _verify_tactile_bias(self) -> bool:
-        """Independently verify the published bias from three fresh reads.
-
-        Aggregate no-contact residual must stay within the small SDK-native
-        residual threshold.  Dense payloads are checked structurally (valid and
-        finite) but never against a hard per-taxel magnitude threshold.
-        """
-        aggregate_peak = 0.0
+    def _verify_tactile_bias(self, aggregate, dense):
+        ok = [aggregate is not None, dense is not None]
         for _ in range(_TACTILE_VERIFY_SAMPLE_COUNT):
             time.sleep(_TACTILE_BIAS_SAMPLE_INTERVAL_S)
-            state = self.get_state()
-            if state is None or not state.tactile_aggregate_valid or not state.tactile_dense_valid:
-                logger.warning("tactile post-bias verification frame invalid")
-                return False
-            aggregate_peak = max(
-                aggregate_peak,
-                float(np.max(np.linalg.norm(state.tactile_aggregate, axis=1))),
-            )
-            dense_magnitudes = np.abs(state.tactile_dense)
-            logger.debug(
-                "tactile verify: dense abs_max=%.3g p99=%.3g",
-                float(np.max(dense_magnitudes)),
-                float(np.percentile(dense_magnitudes, 99)),
-            )
-        return aggregate_peak <= _TACTILE_CALIBRATION_RESIDUAL_THRESHOLD
+            state = self._read_state(apply_bias=False)
+            if state is None:
+                raise XHandError(
+                    "calibrate_tactile", -1, "joint state unavailable during bias verification"
+                )
+            for index, (name, candidate) in enumerate(
+                zip(("aggregate", "dense"), (aggregate, dense))
+            ):
+                if not ok[index]:
+                    continue
+                if not getattr(state, f"tactile_{name}_valid"):
+                    ok[index] = False
+                    continue
+                residual = getattr(state, f"tactile_{name}") - candidate
+                ok[index] = bool(np.isfinite(residual).all())
+                if name == "aggregate":
+                    ok[index] = (
+                        ok[index]
+                        and float(np.max(np.linalg.norm(residual, axis=1)))
+                        <= _TACTILE_CALIBRATION_RESIDUAL_THRESHOLD
+                    )
+        return tuple(ok)
 
     def get_state(self) -> XHandState | None:
         """Read one fresh state, returning ``None`` for runtime SDK failures."""
+        return self._read_state(apply_bias=True)
+
+    def _read_state(self, *, apply_bias):
         if self._control is None or not self.connected_flag:
             raise RuntimeError("XHand is not connected")
         try:
@@ -491,8 +466,8 @@ class XHand:
             logger.warning("XHand joint payload invalid", exc_info=True)
             return None
 
-        tactile_dense = np.zeros(HAND_TACTILE_FORCE_SHAPE, dtype=np.float64)
-        tactile_aggregate = np.zeros(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
+        tactile_dense = np.full(HAND_TACTILE_FORCE_SHAPE, np.nan, dtype=np.float64)
+        tactile_aggregate = np.full(HAND_TACTILE_SUM_SHAPE, np.nan, dtype=np.float64)
         aggregate_valid, dense_valid = _tactile_validity(code, comm_type=self.cfg.comm_type)
         if aggregate_valid:
             try:
@@ -500,11 +475,11 @@ class XHand:
             except (AttributeError, TypeError, ValueError, OverflowError):
                 logger.warning("XHand tactile aggregate payload invalid", exc_info=True)
                 aggregate_valid = False
-                tactile_aggregate.fill(0.0)
+                tactile_aggregate.fill(np.nan)
             else:
                 # Bias subtraction runs only after a successful parse so an
                 # internal bias fault is not mislabeled as a malformed read.
-                if self._tactile_bias_aggregate is not None:
+                if apply_bias and self._tactile_bias_aggregate is not None:
                     tactile_aggregate = tactile_aggregate - self._tactile_bias_aggregate
         if dense_valid:
             try:
@@ -512,10 +487,17 @@ class XHand:
             except (AttributeError, TypeError, ValueError, OverflowError):
                 logger.warning("XHand tactile dense payload invalid", exc_info=True)
                 dense_valid = False
-                tactile_dense.fill(0.0)
+                tactile_dense.fill(np.nan)
             else:
-                if self._tactile_bias_dense is not None:
+                if apply_bias and self._tactile_bias_dense is not None:
                     tactile_dense = tactile_dense - self._tactile_bias_dense
+        if apply_bias:
+            aggregate_valid = aggregate_valid and self._tactile_bias_aggregate is not None
+            dense_valid = dense_valid and self._tactile_bias_dense is not None
+        if not aggregate_valid:
+            tactile_aggregate.fill(np.nan)
+        if not dense_valid:
+            tactile_dense.fill(np.nan)
         return XHandState(
             qpos=qpos,
             current_ma=current,

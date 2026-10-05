@@ -199,3 +199,14 @@ class CameraExtrinsics:
     def __repr__(self) -> str:
         cameras = ", ".join(f"{n} ({e.type}, {e.serial})" for n, e in self._entries.items())
         return f"CameraExtrinsics({cameras})"
+
+
+def load_optional_camera_extrinsics():
+    """Resolve once per recording session; missing extrinsics do not block Raw."""
+    from dexmani_real.utils.log import get_logger
+
+    try:
+        return CameraExtrinsics()
+    except (FileNotFoundError, KeyError, ValueError) as exc:
+        get_logger(__name__).warning("Recording without camera extrinsics: %s", exc)
+        return None

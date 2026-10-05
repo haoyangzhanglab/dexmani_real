@@ -80,7 +80,7 @@ python examples/pointcloud_process_example.py --help
 ```
 
 相机外参、桌面平面、hand mount、VR alignment 等属于**当前实验现场状态**。更换相机、桌面、机器人安装或实验布局后，应重新标定或确认，而不是沿用历史数值作为固定契约。首次桌面标定在 pointcloud 示例中选择 table calibration，不要求旧 plane 文件。
-物理录制允许缺相机外参，但点云需要数据对应的有效内外参和 depth scale。
+物理录制允许缺相机外参，但点云需要数据对应的有效内外参和 depth scale。同一会话的点云与录制共用启动时加载的外参，文件修改在下次会话生效。
 
 ### 3. 采集示教
 
@@ -91,7 +91,7 @@ python examples/collect_teleop.py \
 ```
 
 启动会在停止监听建立后执行手部 HOME。H 为整机 HOME，B 开始，C 暂停/恢复；恢复时保存上一段并开始新 episode。S 停止保存，D 丢弃当前 capture，Q 进入退出确认、再次 Q 保存退出（尚未开始且无 capture 时直接退出），ESC 急停。键盘 jog 入口仅在 R 时 HOME。
-录制启用全部已接入物理模态，触觉持续不可用会在日志和 episode 摘要中显示。相机无可用帧或任一路持续停帧时停止并保留前缀，不补黑图。
+录制启用全部已接入物理模态，aggregate/dense 触觉独立校准和判断可用性，缺测保留 NaN；触觉持续不可用会在日志和 episode 摘要中显示。相机无可用帧或任一路持续停帧时停止并保留前缀，不补黑图。
 
 Raw episode 是实验 source of truth。已发布 Raw 不做原地修补；暂停、失败、缺测和终止原因等实验事实应被保留。
 
@@ -182,9 +182,9 @@ Raw 保存真实实验中实际发生的观测与控制证据。
 - 写盘、编码或发布失败保留 staging 并报错，不报告为成功 Raw。
 
 Raw 保存全量已接入物理模态，公共导出再重建末端、指尖与点云。动作是最终尝试的关节目标；未调用的设备目标为 NaN，dispatch 区分未调用、SDK 接受、CRC 不确定、拒绝和未知，均不证明物理到达。
-SDK 调用抛出异常不能证明设备拒绝或未收到命令，对应 dispatch 保留为 UNKNOWN；已采前缀及本次尝试目标随异常终止保存。
+SDK 调用抛出异常或被 Ctrl+C 中断不能证明设备拒绝或未收到命令，对应 dispatch 保留为 UNKNOWN；已经确认的 ACCEPTED 不回退，已采前缀及本次尝试目标随终止保存。
 
-逐行时间记录主机 monotonic 观测、机器人读取完成、相机队列返回及下发完成时间，并保留 RGB/depth 源帧号。时间 0 表示未知或未下发；旧 Raw 不伪造实测时间。latest-sample 不保证跨模态严格同步，重复源帧可以是正常采样结果。
+逐行时间记录主机 monotonic 观测、机器人读取完成及下发完成时间，并保留 RGB/depth 源帧号。新 Raw 的相机时间取 RGB/depth 两通道各自最近推进接收时间的较早者，停帧不会被另一通道的新接收刷新；旧 Raw 按其 metadata 解释。时间 0 表示未知或未下发；旧 Raw 不伪造实测时间。latest-sample 不保证跨模态严格同步，重复源帧可以是正常采样结果。
 
 ### Canonical Zarr
 
@@ -210,7 +210,7 @@ RGB 保持 RGB 顺序和采集分辨率，depth 为对齐彩色的 uint16 配 de
 Zarr 的 `row_info` 保留 Raw 的逐行时间、源帧号和 dispatch，`meta/episode_ends` 保留 episode 边界；`dt` 仅为名义周期。缺可解码 RGB-D 或有效 depth scale 时不能完整导出，数值字段仍可单独读取。
 
 [离线窗口示例](examples/read_policy_windows.py) 对 RGB 与触觉策略分别选所需字段和连续原行号窗口，使用 dispatch，不跨 episode 或缺失所需样本的行；不把时间抖动当缺测。
-相邻 `dexmani_policy` 按实际输入、完整监督和两设备 ACCEPTED dispatch 筛选训练窗口，仅用有效训练窗口引用的去重源行拟合统计。验证复用训练统计，checkpoint 使用其保存统计；详见 [数据与追踪](docs/policy_execution.md#数据与追踪)。
+相邻 `dexmani_policy` 按实际输入、完整监督和两设备 ACCEPTED dispatch 筛选训练窗口，仅用有效训练窗口引用的去重源行拟合统计。窗口按实际记录行索引取样（recorded_rows），不假设等间隔或自动插值。所选字段按需读取，资格与 normalizer 统计分块处理。验证复用训练统计，checkpoint 使用其保存统计；详见 [数据与追踪](docs/policy_execution.md#数据与追踪)。
 
 ## Repository Layout
 

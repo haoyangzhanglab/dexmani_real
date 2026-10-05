@@ -51,10 +51,13 @@ def _build_hand_retargeter(config: TeleopConfig):
 class TeleopRunner:
     """Own operator, recording and control state for one local teleop session."""
 
-    def __init__(self, shared, config: TeleopConfig, robot, *, start_vr=None):
+    def __init__(
+        self, shared, config: TeleopConfig, robot, *, start_vr=None, camera_calibration=None
+    ):
         self.shared = shared
         self.robot = robot
         self.start_vr = start_vr
+        self.camera_calibration = camera_calibration
         self.config = config
         self.runtime = config.runtime
         self.recorder = (
@@ -81,6 +84,7 @@ class TeleopRunner:
         self.resume_after_ns = 0
         self.quit_pending = False
         self.pending_termination_reason = None
+        self.control_run_id = None
         self.next_tick = 0.0
         self.control_dt = 1 / self.runtime.teleop.control_hz
         self.failures = 0
@@ -88,25 +92,30 @@ class TeleopRunner:
 
         self.home_planner = None
 
+    def _end_reason(self, fallback):
+        with self.shared.motion_lock:
+            if (
+                self.control_run_id is not None
+                and int(self.shared.run_ended_id.value) == self.control_run_id
+            ):
+                return RunEndReason(int(self.shared.run_ended_reason.value)).name.lower()
+        return fallback
+
     def _pause_control(self, reason, *, run_end_reason=RunEndReason.OPERATOR, stop_motion=True):
         revoke_motion(self.shared, reason=run_end_reason)
+        if self.pending_termination_reason is None:
+            self.pending_termination_reason = self._end_reason(reason)
         if stop_motion:
             self.robot.stop()
         if self.controller is not None:
             self.controller.clear_reference()
-        if (
-            self.recorder is not None
-            and self.recorder.is_recording
-            and self.pending_termination_reason is None
-        ):
-            self.pending_termination_reason = reason
         self.paused, self.resume_requested = True, False
 
     def _finish_capture(self, save, reason, *, announce=True) -> None:
         if self.recorder is None or not self.recorder.is_recording:
             self.pending_termination_reason = None
             return
-        reason = self.pending_termination_reason or reason
+        reason = self._end_reason(self.pending_termination_reason or reason)
         published = None
         if save:
             published = self.recorder.save_episode(reason=reason)
@@ -161,11 +170,15 @@ class TeleopRunner:
         if row is None:
             print("Start requires fresh robot, VR and recording resources", flush=True)
             return
+        self.control_run_id = None
         if self.recorder is not None:
             self.recorder.start_episode(
                 task_label=self.config.task_label,
                 **snapshot_recording_metadata(
-                    self.shared, self.runtime, collection_source="teleop"
+                    self.shared,
+                    self.runtime,
+                    collection_source="teleop",
+                    camera_calibration=self.camera_calibration,
                 ),
             )
         self.capture_started_s = time.monotonic()
@@ -248,6 +261,8 @@ class TeleopRunner:
                     and epoch == int(self.shared.run_id.value)
                     and begin_motion(self.shared)
                 )
+                if authorized:
+                    self.control_run_id = int(self.shared.run_id.value)
             if authorized:
                 event = "resume" if self.active else "begin"
                 self.active = True
@@ -441,6 +456,7 @@ class TeleopRunner:
                 self._execute_control_step(row)
         except KeyboardInterrupt:
             self.shared.estop_request.value = True
+            revoke_motion(self.shared, reason=RunEndReason.ESTOP)
             raise
         except Exception as exc:
             failure = exc

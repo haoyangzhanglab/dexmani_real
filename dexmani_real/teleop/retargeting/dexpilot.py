@@ -1,18 +1,13 @@
-"""DexPilot retargeting with a masked quadratic human-flexion prior.
+"""DexPilot construction preserving technical-error propagation and mimic joints.
 
-Adapted from dex-retargeting's ``DexPilotOptimizer`` and ``RetargetingConfig.build``.
-The prior ``γ·Σ mask·(x − q_ref)²`` enters both the scalar objective and gradient
-so SLSQP's line search sees it. The per-frame human reference ``q_ref`` is set
-before retargeting and masked to the 10 flexion joints, resolving ambiguous
-MCP/PIP and thumb bend/rotation distributions toward the operator's hand shape.
-A zero prior weight disables the prior; solver errors propagate.
+The upstream optimizer catches RuntimeError and returns the previous target;
+this device-facing boundary must propagate that failure to the I/O owner.
 """
 
 from __future__ import annotations
 
 import os
 import tempfile
-from typing import Any
 
 import numpy as np
 from dex_retargeting import yourdfpy as urdf
@@ -29,51 +24,8 @@ from dexmani_real.utils.log import get_logger
 logger = get_logger(__name__)
 
 
-class PriorDexPilotOptimizer(DexPilotOptimizer):
-    """DexPilotOptimizer plus a masked quadratic human-flexion prior.
-
-    ``x`` is the NLopt optimization variable in target-joint order (== SDK order
-    for the XHand).  ``prior_mask`` and the per-frame ``q_prior`` reference must
-    have the same length/order.
-    """
-
-    def __init__(
-        self,
-        *args: Any,
-        prior_weight: float = 0.0,
-        prior_mask: np.ndarray | None = None,
-        **kwargs: Any,
-    ):
-        super().__init__(*args, **kwargs)
-        self.prior_weight = float(prior_weight)
-        if prior_mask is None:
-            self.prior_mask = None
-        else:
-            self.prior_mask = np.asarray(prior_mask, dtype=np.float64)
-        self._prior_reference: np.ndarray | None = None  # per-frame (target-order)
-
-    def set_prior_reference(self, q_prior: np.ndarray) -> None:
-        """Set the current frame's human-flexion reference (target/SDK order)."""
-        self._prior_reference = np.asarray(q_prior, dtype=np.float64)
-
-    def get_objective_function(
-        self, target_vector: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray
-    ):
-        base = super().get_objective_function(target_vector, fixed_qpos, last_qpos)
-        ref = self._prior_reference
-        if ref is None or self.prior_mask is None or self.prior_weight <= 0:
-            return base
-        weighted_mask = self.prior_weight * self.prior_mask
-
-        def objective(x: np.ndarray, grad: np.ndarray) -> float:
-            result = base(x, grad)
-            diff = x - ref
-            # Add the prior to both value and gradient for SLSQP line search.
-            if grad.size > 0:
-                grad += 2.0 * weighted_mask * diff
-            return result + float(np.sum(weighted_mask * diff * diff))
-
-        return objective
+class StrictDexPilotOptimizer(DexPilotOptimizer):
+    """Propagate solver failures rather than substituting a previous target."""
 
     def retarget(
         self,
@@ -99,11 +51,8 @@ class PriorDexPilotOptimizer(DexPilotOptimizer):
 
 def build_dexpilot_retargeting(
     config: RetargetingConfig,
-    *,
-    prior_weight: float,
-    prior_mask: np.ndarray | None,
 ) -> SeqRetargeting:
-    """Build a DexPilot sequence retargeter with the human-flexion prior.
+    """Build a DexPilot sequence retargeter that propagates solver failures.
 
     ``config`` must come from ``RetargetingConfig.from_dict`` or its YAML loader.
     """
@@ -128,7 +77,7 @@ def build_dexpilot_retargeting(
             else robot.dof_joint_names
         )
 
-    optimizer = PriorDexPilotOptimizer(
+    optimizer = StrictDexPilotOptimizer(
         robot,
         joint_names,
         finger_tip_link_names=config.finger_tip_link_names,
@@ -137,8 +86,6 @@ def build_dexpilot_retargeting(
         scaling=config.scaling_factor,
         project_dist=config.project_dist,
         escape_dist=config.escape_dist,
-        prior_weight=prior_weight,
-        prior_mask=prior_mask,
     )
 
     if 0 <= config.low_pass_alpha <= 1:
@@ -159,7 +106,7 @@ def build_dexpilot_retargeting(
             offsets=offsets,
         )
         optimizer.set_kinematic_adaptor(adaptor)
-        logger.info("DexPilot mimic joint adaptor enabled (prior path)")
+        logger.info("DexPilot mimic joint adaptor enabled")
 
     retargeting = SeqRetargeting(
         optimizer,

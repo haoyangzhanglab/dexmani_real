@@ -14,6 +14,24 @@ def sample_is_fresh(timestamp_ns, max_age_s, now_ns=None):
     return 0 < int(timestamp_ns) <= now and now - int(timestamp_ns) <= int(max_age_s * 1e9)
 
 
+def feedback_deadline_ns(row, runtime, *, include_vr=False):
+    """Exclusive send deadline of the feedback actually used to prepare a target.
+
+    Sampling owns rejection of missing/future timestamps; expiration during
+    preparation is enforced again immediately before each target SDK call.
+    """
+    deadlines = [int(row.arm["timestamp_ns"][0]) + int(runtime.arm.feedback_max_age_s * 1e9) + 1]
+    if row.hand is not None:
+        deadlines.append(
+            int(row.hand["timestamp_ns"][0]) + int(runtime.hand.feedback_max_age_s * 1e9) + 1
+        )
+    if include_vr:
+        deadlines.append(
+            int(row.vr["recv_ts_ns"]) + int(runtime.policy.vr_mapping.stale_threshold_s * 1e9) + 1
+        )
+    return min(deadlines)
+
+
 def read_vr_frame(shared):
     result = shared.vr_ring.read_latest()
     if result is None:

@@ -97,7 +97,7 @@ def build_policy_observation(rows, policy_info, *, fingertip_runtime=None):
 
 
 def policy_sources(row, fields):
-    """Host read/queue-return times of each requested latest-slot input dependency."""
+    """Latest-slot host source times; RGB-D/cloud use the oldest channel advance."""
     arm = int(row.arm["timestamp_ns"][0])
     hand = int(row.hand["timestamp_ns"][0])
     sources = {}

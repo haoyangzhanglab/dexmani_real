@@ -6,7 +6,7 @@ import numpy as np
 
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.home import HomeResult
-from dexmani_real.robot.robot import DispatchError
+from dexmani_real.robot.robot import DispatchError, DispatchInterrupted
 from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.runtime.safety import (
     SafetyState,
@@ -43,7 +43,10 @@ def home_hand(shared, runtime, *, robot, abort_requested=None):
         return HomeResult(False, "home interrupted", interrupted=True)
     deadline = time.monotonic_ns() + int(cfg.home_timeout_s * 1e9)
     try:
-        robot.send_hand_home(RobotCommand(epoch, hand_qpos=target))
+        robot.send_hand_home(RobotCommand(epoch, hand_qpos=target), valid_until_ns=deadline)
+    except DispatchInterrupted as exc:
+        logger.warning("hand HOME cancelled: dispatch=%s", exc.result)
+        raise
     except DispatchError as exc:
         if not exc.revoked:
             raise

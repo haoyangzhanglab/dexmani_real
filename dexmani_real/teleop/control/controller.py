@@ -8,7 +8,8 @@ from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d, rot6d_to_q
 from dexmani_real.recording.frame import build_episode_frame
 from dexmani_real.robot.action import ActionIntent
 from dexmani_real.robot.commands import RobotCommand
-from dexmani_real.robot.robot import DispatchError
+from dexmani_real.robot.robot import DispatchError, DispatchInterrupted
+from dexmani_real.runtime.observation import feedback_deadline_ns
 from dexmani_real.runtime.safety import RunEndReason, revoke_motion_if_run_id
 from dexmani_real.teleop.control.action_proposal import compute_target_eef_pose
 from dexmani_real.teleop.control.hand_retargeting import (
@@ -16,6 +17,9 @@ from dexmani_real.teleop.control.hand_retargeting import (
     compute_hand_command,
     reset_hand_retargeter,
 )
+from dexmani_real.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 class TeleopController:
@@ -92,45 +96,52 @@ def execute_control_step(controller, shared, robot, row, recorder=None):
     target, control_ok, intent = controller.compute_command(row, epoch)
     if recorder is not None:
         recorder.check_error()
-    result = None
-    if target is not None:
-        try:
-            result = robot.send_action(target)
-        except DispatchError as exc:
-            result = exc.result
-            revoke_motion_if_run_id(
-                shared,
-                epoch,
-                reason=RunEndReason.EXECUTOR_BOUNDARY
-                if exc.revoked
-                else RunEndReason.HARDWARE_FAULT,
-            )
+    result = failure = stop_error = None
+    interrupted = False
+    try:
+        if target is not None:
+            try:
+                result = robot.send_action(
+                    target,
+                    valid_until_ns=feedback_deadline_ns(row, controller.runtime, include_vr=True),
+                )
+            except (DispatchError, DispatchInterrupted) as exc:
+                result, failure = exc.result, exc
+                cancelled = isinstance(exc, DispatchInterrupted)
+                if cancelled:
+                    shared.estop_request.value = True
+                revoke_motion_if_run_id(
+                    shared,
+                    epoch,
+                    reason=RunEndReason.ESTOP
+                    if cancelled
+                    else RunEndReason.EXECUTOR_BOUNDARY
+                    if exc.revoked
+                    else RunEndReason.HARDWARE_FAULT,
+                )
+        interrupted = failure is not None or int(shared.run_id.value) != epoch
+        if interrupted:
             try:
                 robot.stop()
-            except Exception:
-                from dexmani_real.utils.log import get_logger
-
-                get_logger(__name__).exception("stop after teleop dispatch failure also failed")
-                if exc.revoked:
-                    raise
-            finally:
-                if recorder is not None:
-                    recorder.add_frame(build_episode_frame(row, target, result))
-            if exc.revoked:
-                return False, result, True
-            raise
-    if int(shared.run_id.value) != epoch:
-        try:
-            robot.stop()
-        finally:
-            if recorder is not None:
+            except Exception as exc:
+                stop_error = exc
+                if failure is not None:
+                    logger.exception("stop after dispatch also failed")
+        elif result is not None:
+            controller.previous_arm_command = target.arm_qpos.copy()
+            controller.smoothed_eef_position = intent[:3].copy()
+            controller.smoothed_eef_quaternion = rot6d_to_quat_wxyz(intent[3:])
+    finally:
+        if recorder is not None and (interrupted or recorder.accepting_frames):
+            try:
                 recorder.add_frame(build_episode_frame(row, target, result))
-        return False, result, True
-    if result is not None:
-        controller.previous_arm_command = target.arm_qpos.copy()
-        controller.smoothed_eef_position = intent[:3].copy()
-        controller.smoothed_eef_quaternion = rot6d_to_quat_wxyz(intent[3:])
-    if recorder is not None:
-        if recorder.accepting_frames:
-            recorder.add_frame(build_episode_frame(row, target, result))
-    return control_ok, result, False
+            except Exception as exc:
+                if failure is not None:
+                    logger.exception("recording after dispatch also failed")
+                    raise failure from exc
+                raise
+    if isinstance(failure, DispatchInterrupted) or (failure is not None and not failure.revoked):
+        raise failure
+    if stop_error is not None:
+        raise stop_error
+    return control_ok and not interrupted, result, interrupted

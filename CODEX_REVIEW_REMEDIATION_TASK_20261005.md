@@ -3,7 +3,7 @@
 日期：2026-10-05（Asia/Shanghai）  
 主仓库：`haoyangzhanglab/dexmani_real`  
 协同仓库：`haoyangzhanglab/dexmani_policy`  
-状态：**本任务书经过方案级全量复核，可实施；代码、原生依赖、性能与真机验收尚未完成。**
+状态：**必做软件整改与所列离线验证已完成；逐项结果、合成性能证据、DEFERRED 与未验证项目见文末执行记录。真机未验收。**
 
 本文是独立任务书，不依赖聊天、PDF、临时反例脚本或其他机器上的文件。本任务范围内，本文取代前几轮方案中与之冲突的实施建议。不要重新执行旧根目录任务书的全部事项，不修改 `AGENTS.md` 的长期原则来迎合一次性方案。
 
@@ -444,3 +444,125 @@ deterministic 分支使用 fixed_indices，不创建 Manager，不读取 epoch p
 | O16 | 随 D8 实施 | D8：公开 backend 构造一次元数据检查。 |
 
 附录用于防止遗漏与反复整改；最终优先级与执行要求以上文为准。已证实修复、接受的能力边界和明确 DEFERRED 项均应如实记录，不为追求“全部勾选”改动实验语义。
+
+## 执行记录（2026-10-06）
+
+本节记录本次实施结果，不替代上文验收边界。`FIXED` 表示代码整改与所列离线检查完成，**不表示真机验收通过**。
+
+### 工作树与交付
+
+- Real：`main`，HEAD `ebaf789583c7841a24e6d055a1fd7ef32a2ddb09`；相对实现基线 `660aa20f52eee7bbbfa387d692f0715aca17502f` 仅新增本任务书。
+- Policy：`main`，HEAD `7120084f874aa4404de0957993af8d7a1de89c01`；相对实现基线 `650f1e3cfc63c64678b5bb69e7258b548800d053` 仅新增旧审查任务书，未重做旧任务。
+- 两个 origin 均为 `haoyangzhanglab` 对应仓库。实施前工作树无未提交修改；没有 checkout/reset、commit/push、修改权限配置或 site-packages。
+- 交付为两个现有工作树的未提交修改及新增测试。没有连接设备、执行运动/HOME/采集/回放/rollout/真实标定，没有启动完整训练/DDP，没有改写已有 Raw、checkpoint 或实验产物。测试仅使用 fake I/O、临时文件及合成数据。
+
+### 必做问题逐项结果
+
+| ID | 状态 | 实现与离线证据 |
+| --- | --- | --- |
+| R3-1 | FIXED | `send_action`/`send_hand_home` 必填排他截止；全部生产调用点迁移；准备、mode restoration、两 SDK 间越期与撤权、最后 SDK 迟返回测试。已知 ACCEPTED 不回退。 |
+| R3-2 | FIXED | 读 Observation 后、handoff 前非阻塞 poll；异步预取 Future 在读反馈 +5 ms 完成的正例与既有过期/失效反例。 |
+| B2 | FIXED | RGB/depth 各自推进时刻的最小值作为来源时刻，复用该时刻判定 stall；fake worker 覆盖单路/双路冻结及正常推进。cloud 保留来源时间/sequence。 |
+| N1 | FIXED | `DispatchInterrupted` 携带当前结果；Teleop/Policy/Replay 撤权、stop 后单次记录 attempted row；SDK 前/arm 内/hand 内中断与附加 stop failure 回归。 |
+| N2 | FIXED | Replay 把 Ctrl+C 转为 ESTOP outcome，finally stop 后交出 prefix；arm/hand/wait 三种中断的真实 dispatch 数量回归。原 session 的评估/保存与 CLI 非零退出顺序保留。 |
+| N3（Teleop） | FIXED | 匹配当前 run_id 的首因；开始时在 motion_lock 内保存 run_id，新 capture 清除旧 run 关联；S/Q 与 stop failure 共存仍保留首因。 |
+| B3 | FIXED | aggregate/dense bias 独立；包括 SDK 1501019 在内的 aggregate-only、dense-only、both/neither 测试，独立缺测保留 NaN。 |
+| B4 | FIXED | 候选局部捕获、fresh raw verification 后逐路提交；验证异常、重校准中断与 aggregate 残差超限不泄露候选、不吞 dense。 |
+| R3-3 | FIXED | jump/hw_dist 使用选支后的绝对坐标差；212° 反例拒绝，周期排序保留；删除被 150° 绝对界支配的 band_switch。 |
+| R4-2 | FIXED | 软逃离对比全程最佳 clearance，防止逐步累计向内滑移；负值仅允许起始前缀且必须离开软区。受控路径正反例及原生合成平面路径检查。 |
+| R4-1 | FIXED | 取消优先于队列事件，等待/检测/反馈读取/FK/求解后的取消检查；atomic replace 前最后取消准入，临时文件清理，不持 motion_lock 写文件。 |
+| R4-3 | FIXED | keyboard/calibration 入口连接前验证所选 jog 配置及 workspace 内缩余量，非法配置测试不触达连接。实际配置为 idle_interval_frames，验证其正整数约束。 |
+| B5 | FIXED | 先按位置与旋转 RMS 双门限筛选，再按位置/旋转 RMS 稳定选择；非有限候选拒绝。A=(1 mm,10°)、B=(2 mm,1°) 选择 B。 |
+| N4 | FIXED | final refit mask 再检查数量/比例；受控 refit 临界反例拒绝。 |
+| B6 | FIXED | PyAV 有理 rate/time_base、首帧 origin 与唯一 CFR ordinal；实际编解码覆盖整数/分数 fps、第 123 帧、GOP/B-frame、非零 origin、逆序/重复请求。 |
+| R4-4 | FIXED | diagnostic 明确完成/用户退出/读取失败；fake read failure 非零退出且 disconnect，成功消息不再掩盖失败。 |
+| RMSE 口径 | FIXED | arm `mean_joint_rmse`、hand `pooled_rmse` 同步输出与新 JSON；只改命名，不重算旧结果；单轴误差测试。 |
+| D8 全链路 | FIXED | Policy Reader→角色窗口→唯一训练源行 chunk→build_normalizer→Welford/mixed normalizer 单遍消费；spawn/fork/persistent worker、float32 溢出、空块/常量/gaussian/aux EE、生命周期探针与合成性能证据。 |
+| D9 prior | FIXED | 删除配置、human-flexion 映射、prior reference/mask/gradient、prior 专用 DexPilot objective 包装；旧配置显式报错；原生 prior=0 对照见下。 |
+
+没有因外部依赖而留下 `BLOCKED` 的必做软件项。真机、代表性数据吞吐和下列条件优化仍未验证。
+
+### O01–O16、已修路径与条件项
+
+| 项目 | 状态 | 处置理由 |
+| --- | --- | --- |
+| O01 | FIXED | 去除 Dataset 全量高维加载及 normalizer list/全 action concatenate；每进程每字段仅保留一个受 chunk 行数/16 MiB 预算约束的解码块。独立 VQ 工具配套迁移到 open/read，保留其显式低维数组算法。 |
+| O02 | FIXED | Teleop 小型首因 helper 复用 run latch，不建通用 finalizer。 |
+| O03 | FIXED | 删除 CLI num_episodes 的同边界重复检查；保留连接前、独立 Runner/driver、输出与动态年龄等不同责任的检查。 |
+| O04 | ALREADY_FIXED | Robot 双目标 preflight 与公开 driver 硬限位检查分属不同边界，保留，无 trusted bypass。 |
+| O05 | FIXED | session 一次解析既有 CameraExtrinsics，pointcloud/recorder 共用；START 仅选实际 serial；文件变化/无外参录制回归。 |
+| O06 | DEFERRED | 没有实际静态几何/历史 FK 热点占比证据；不新增缓存框架。 |
+| O07 | DEFERRED | 原生梯度已验证，但没有 fixed-base 替代后的收敛与 p95 对照，不重写 TAG。 |
+| O08 | DEFERRED | 已修软逃离；缺分项 profile 与固件实际轨迹证据，不改 HOME 搜索/整形/执行机制。 |
+| O09 | FIXED | mount metadata 消费仅作诊断，recorder START 复制当前已校验值，删除额外几何准入；公开 Raw writer 布局/数值及 camera 几何边界保留。 |
+| O10 | ALREADY_FIXED | camera_ring 已使用 SeqlockSlot/seqlock_is_complete/seqlock_to_logical，不再抽取 IPC。 |
+| O11 | ALREADY_FIXED | 旧描述性 ID/uint8 finite 扫描未重新引入；query、SDK、跨线程 owned copy 保留。 |
+| O12 | ALREADY_FIXED | 单模型 worker、一个 Future 与 sync/async/RTC 已存在；仅 D1 修复交接时机。 |
+| O13 | DEFERRED | 无 radius graph profile 及薄/小物体保留率、空云率、几何误差/任务质量对照；不移动 cap 或改过滤拓扑。 |
+| O14 | DEFERRED | 无 GPU scheduler/scalar 同步成本证据；不增加 schedule cache。 |
+| O15 | FIXED | deterministic 不创建 Manager/访问 epoch proxy；随机分支 epoch 同步保留。 |
+| O16 | FIXED | 公开 Reader 构造一次校验 meta/shape/dispatch；fork 按 PID 重开、pickle 不携带句柄或解码缓存。 |
+| X1 / Policy N3 | ALREADY_FIXED | 角色窗口、唯一统计行、strict resume、首因 latch 既有行为保留；相关回归通过。 |
+| B1 / #17 | DEFERRED | 缺实物 adapter 与同名 frame 的测量真值；未改 -15/-5 mm，也未生成 URDF。 |
+| R3-4 | DEFERRED | 无 fixed-grid 新实验需求与实际时间分布证据；仅文档/日志注明 recorded_rows，不增加持久化 recipe 键、不插值或改资格。 |
+
+保留 StrictDexPilotOptimizer 的 `retarget` 异常外抛：上游会把 RuntimeError 转为旧目标，删除这层会破坏现有技术失败语义。TAG 位置目标、pinch、时序项、EMA、joint order、mimic 均保留。删除 before_send/dispatch_row/_dispatch_allowed 后，owner 仍负责 episode、WAIT 和计划失效；Robot 仅在副作用边界消费截止与授权。
+
+### 实际验证与边界
+
+环境未升级：Real 使用 `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`，Policy 使用 `/home/zhanghaoyang/miniconda3/envs/policy/bin/python`（均 Python 3.10.20）。原生依赖包括 NumPy 1.26.4、torch 2.4.1、Zarr 2.18.3、PyAV 17.1.0、Pinocchio 2.7.0、MPlib 0.2.1、dex_retargeting 0.4.6。Ruff 0.16.8 来自 Real 环境。下文 `R`/`P`/`RUFF` 分别表示上述两个 Python 与 Real 环境 Ruff 的绝对路径，命令在相应仓库运行。
+
+| 层次 | 实际命令 | 结果 |
+| --- | --- | --- |
+| Real 纯逻辑 + 原生离线 | `$R -m pytest -q tests` | PASS，118 passed；无硬件 I/O。最后增加非有限 RMS 拒绝后再次跑 `tests/test_review_remediation.py`：54 passed。 |
+| Real 语法 | `$R -m compileall -q dexmani_real examples tests` | PASS。 |
+| Real 静态 | `$RUFF format --check dexmani_real examples tests`；`$RUFF check dexmani_real examples tests`；`git diff --check` | PASS；125 文件格式通过。 |
+| Policy 纯逻辑 + 原生离线 | `$P -m pytest -q tests --ignore=tests/test_infra_cuda.py -o cache_dir=/tmp/dexmani_policy_pytest_cache` | PASS，81 passed、28 subtests passed；1 条既有 historical data_identity 未验证 warning。路径测试仅在临时目录写虚构 checkpoint；不读写实验。 |
+| Policy 最后脚本迁移后 | `$P -m pytest -q tests/test_infra_codebook.py tests/test_streaming_dataset.py -o cache_dir=/tmp/dexmani_policy_pytest_cache` | PASS，21 passed、20 subtests passed。 |
+| Policy 配置 | `$P -m dexmani_policy.smoke_test --config-only dp3` | PASS，6 个 Hydra targets；未执行完整 smoke、训练或推理。 |
+| Policy 独立工具入口 | `$P -m scripts.training.train_vq_hand --help`；`$P -m scripts.training.measure_vq_usage --help` | PASS；仅 argparse/import。 |
+| Policy 语法 | `PYTHONPYCACHEPREFIX=/tmp/dexmani_policy_compile_cache $P -m compileall -q dexmani_policy scripts tests` | PASS。 |
+| Policy 修改文件静态 | 对 `git diff --name-only` 与 `git ls-files --others --exclude-standard` 的 11 个 `.py` 执行 `$RUFF format --check --no-cache ...` 与 `$RUFF check --no-cache ...`；`git diff --check` | PASS。 |
+| Policy 全量静态基线 | `$RUFF check --no-cache --output-format=json dexmani_policy tests`；`$RUFF format --check --no-cache dexmani_policy tests` | NOT PASS：76 个未修改文件共 385 条既有报告，63 个未修改文件需格式化；修改文件报告为 0。未批量改无关文件或降低规则。 |
+| 原生 prior=0 对照 | `PYTHONPATH=. MPLCONFIGDIR=/tmp/dexmani_mpl $R /tmp/dexmani_retarget_equivalence.py` | PASS。临时脚本用 `git show 660aa20:<path>` 加载旧 TAG/DexPilot，在当前原生环境对照 objective/gradient/solve；TAG 数值差分最大绝对误差 `3.5315350643827514e-10`。持久回归保留于 `test_review_remediation.py`。 |
+
+早期测试失败已处理：Policy 旧 `replay_buffer.root` 消费、删除 import 后失效的测试 mock 路径已迁移；沙箱阻止的临时目录测试以获准权限重跑。新增 PolicyRunner 测试最初使用了错误的事件名，已按生产 `end` 事件修正；未改变生产状态或放宽断言。原生路径探针初次缺 hand qpos 被正确拒绝，补显式手姿后通过。只有上述实际成功命令标为 PASS。
+
+原生离线范围：真实 PyAV 编解码；Pinocchio/MPlib FK/IK 与合成桌面路径；TAG 梯度及 DexPilot prior=0 等价；torch normalizer/RTC；Zarr 单进程、spawn/fork 与 persistent_workers。取消、传感器冻结和 SDK 状态使用 fake I/O；它们证明软件分支，不能证明固件响应或真实停机时延。
+
+### D8 合成性能证据
+
+相同 seed `20261005`；512/4096 行，episode 128 行，point_cloud 为 `(1024,6)` float32，物理 chunk 32 行，action_ee 21 维、joint_state 19 维；N_obs=2/H=8，batch=16，测量预热后的 16 batches。startup 包括 Dataset 与 normalizer，不含 worker 启动。基线从 Policy SHA `650f1e3` 用 git archive 提取源码到 `/tmp/dexmani_policy_baseline_20261005`，没有切换工作树。生成和测量脚本为 Policy `tests/benchmark_dataset_streaming.py`；w0 测量使用其临时副本，w2 最后测量使用仓库脚本并补充 worker VmHWM。
+
+| 行数 / workers | 实现 | startup s | 父进程 peak RSS MiB | 相对导入后 RSS 增量 MiB | 最大单 worker peak MiB | samples/s | 父进程 rchar bytes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 / 0 | 基线 | 1.123 | 669.82 | 123.42 | — | 135744 | 15522267 |
+| 512 / 0 | 修改后 | 1.042 | 655.52 | 108.75 | — | 19439 | 43279588 |
+| 4096 / 0 | 基线 | 1.164 | 835.36 | 288.88 | — | 138565 | 98874099 |
+| 4096 / 0 | 修改后 | 1.140 | 656.22 | 109.33 | — | 19494 | 209983235 |
+| 512 / 2 | 基线 | 1.024 | 682.49 | 136.63 | 564.11 | 41444 | 124979650 |
+| 512 / 2 | 修改后 | 1.022 | 654.96 | 108.91 | 548.34 | 19148 | 140657230 |
+| 4096 / 2 | 基线 | 1.175 | 936.42 | 390.22 | 648.84 | 41015 | 385989074 |
+| 4096 / 2 | 修改后 | 1.152 | 656.04 | 109.20 | 556.41 | 16042 | 304706386 |
+
+实跑生成命令：`PYTHONPATH=. $P tests/benchmark_dataset_streaming.py /tmp/dexmani_bench_small_20261005.zarr --prepare 512`，大集用 `large` 和 `4096`；目录为本任务新建。实跑测量对上述两个目录分别设置 `PYTHONPATH=/tmp/dexmani_policy_baseline_20261005` 或当前 Policy 源码根，运行脚本的 `--workers 0`/`--workers 2`。脚本使用 `mode=w-`，重复生成不会覆盖已有目录。
+
+有限性扫描仍读取训练所需全体字段。首次朴素懒读约 2.9k samples/s；检查重复打开 Array 和重解码相邻窗口后，采用每字段单块有界复用，w0 提至约 19.5k。8 倍数据量下新实现父进程 RSS 近似稳定，允许的 O(rows) 资格 mask/索引仍存在。两种数据量的 action scale 校验和分别为 `11.036111831665039`、`10.071537017822266`，基线与修改后相同；完整统计等价由 limits/gaussian/mixed/aux 的容差测试确认，未宣称归约 bit-exact。
+
+这是一轮短合成、顺序访问测量，不是代表性训练吞吐或 p95；旧全内存路径仍明显更快。所有进程报告的父进程物理 `read_bytes=0`（页缓存），rchar 包含库加载/IPC，未测 worker I/O，RSS 包含 torch 等导入基础成本。**只据此报告有界内存收益，不宣称端到端加速。** 真实数据、随机打乱、存储冷缓存与长周期 worker 行为性能为 NOT VERIFIED。
+
+### 未验证项目
+
+- 真机全部 NOT VERIFIED：SDK 阻塞/模式恢复/撤权实际时延、两设备实际运动与停止确认、键盘 Ctrl+C 与固件交互、HOME 实际连续轨迹、真实 RGB-D stall、XHand 通道和无接触假设、相机/桌面/安装实际标定精度。
+- 不提供硬实时保证；已进入 SDK 的调用无法软件撤回，ACCEPTED 仅表示接收确认。atomic replace 最后准入后发生的取消不回滚已经批准的发布。
+- 未运行 CUDA/DDP 测试、完整 smoke/训练、代表性实验评测或数据性能测试。条件项缺少的事实见前表；未用历史 calibration 值作为新准入条件。
+
+### 后续代码与文档清理（2026-10-06）
+
+按用户后续要求，在上述整改基础上删除确认无人使用的 DexPilot 运行期滤波 accessor、持久 debug 字典、单调用 Pinocchio 加载 wrapper、不可达的可选配置分支；保留原滤波配置、数值算法与技术异常外抛。相机帧号已验证后不再保留 `or 0`，recorder 的无外参路径改为显式分支，删除不再执行文件 I/O 的路径上失效的 FileNotFoundError 捕获。TAG 无效输入日志改为“no target produced”，不再暗示主动保持运动。
+
+Policy 删除 Reader 未使用的 logger/items、VQ 旧 episode_ends 兼容探测、Base/RGB/PC Dataset 写死实验路径的调试 main，以及 RGB/PC Dataset 仅转发参数的构造器。Hydra 使用的 RGBDataset/PCDataset 类和默认模态保留。
+
+更新 README、执行/RTC/架构文档、导出时间说明和 normalizer 精度注释；明确新 Raw 的 RGB-D 最旧通道推进时刻与旧 Raw metadata 的解释边界。修正 VQ 脚本及 DQ-RISE YAML 中“全量统计自动匹配 Policy”的旧描述：VQ 仍按其原配方用全手部数据，Policy 用有效训练窗口的唯一 train 源行，兼容性校验保留；没有为文档一致而改统计范围。YAML 解析前后值完全一致。
+
+清理后实跑：Real `pytest -q tests` 为 118 PASS；Policy 非 CUDA/DDP 全量为 81 PASS、28 subtests PASS（原 historical data_identity warning 保留）；原生 TAG/DexPilot 对照 PASS；新增清理的 RGB/PC 继承构造器与默认模态用临时合成 Zarr 检查 PASS，`smoke_test --config-only dp dp3` PASS。两仓库 compile、Real 全量 Ruff、Policy 全部修改 Python 文件 Ruff、diff 检查 PASS。没有新增设备操作、训练、环境变更或 commit/push。

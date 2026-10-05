@@ -11,8 +11,8 @@ from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.replay.capture import ReplayRecorder
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.projection import project_arm_command, project_hand_command
-from dexmani_real.robot.robot import DispatchError
-from dexmani_real.runtime.observation import read_observation
+from dexmani_real.robot.robot import DispatchError, DispatchInterrupted
+from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
 from dexmani_real.runtime.operator_input import OperatorCommand
 from dexmani_real.runtime.safety import RunEndReason, begin_motion, revoke_motion
 from dexmani_real.utils.log import get_logger
@@ -115,7 +115,10 @@ def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s,
             hand = (
                 hand_target if step == steps else hand_start + weight * (hand_target - hand_start)
             )
-            stamp = robot.send_action(RobotCommand(epoch, arm_hold, hand)).timestamp_ns
+            stamp = robot.send_action(
+                RobotCommand(epoch, arm_hold, hand),
+                valid_until_ns=feedback_deadline_ns(row, runtime),
+            ).timestamp_ns
             if step == steps:
                 final_stamp = stamp
                 last_sample = stamp
@@ -210,32 +213,50 @@ def replay_targets(shared, runtime, trajectory, keyboard, *, robot, hand_start_d
                     qpos_min_rad=runtime.hand.qpos_min_rad,
                     qpos_max_rad=runtime.hand.qpos_max_rad,
                 )
+                pos, rot = fk.compute(row.arm["qpos"][0])
                 dispatch_error = None
                 try:
-                    result = robot.send_action(RobotCommand(epoch, arm, hand))
-                except DispatchError as exc:
+                    result = robot.send_action(
+                        RobotCommand(epoch, arm, hand),
+                        valid_until_ns=feedback_deadline_ns(row, runtime),
+                    )
+                except (DispatchError, DispatchInterrupted) as exc:
                     result, dispatch_error = exc.result, exc
-                    # Fence before recording; finally owns the immediate stop on exit.
+                    cancelled = isinstance(exc, DispatchInterrupted)
+                    if cancelled:
+                        shared.estop_request.value = True
                     revoke_motion(
                         shared,
-                        reason=RunEndReason.EXECUTOR_BOUNDARY
+                        reason=RunEndReason.ESTOP
+                        if cancelled
+                        else RunEndReason.EXECUTOR_BOUNDARY
                         if exc.revoked
                         else RunEndReason.HARDWARE_FAULT,
                     )
+                    try:
+                        robot.stop()
+                    except Exception:
+                        logger.exception("replay stop after dispatch failed")
+                        shared.error_state.value = True
                 stamp = result.timestamp_ns or time.monotonic_ns()
-                pos, rot = fk.compute(row.arm["qpos"][0])
-                capture.record(
-                    index,
-                    row.arm["qpos"][0],
-                    pos,
-                    rot,
-                    arm if result.arm else np.full(7, np.nan),
-                    hand if result.hand else np.full(12, np.nan),
-                    stamp / 1e9,
-                    dispatch_status=(int(result.arm), int(result.hand)),
-                    hand_qpos=row.hand["qpos"][0],
-                    arm_tracking_error=float(np.max(np.abs(arm - row.arm["qpos"][0]))),
-                )
+                try:
+                    capture.record(
+                        index,
+                        row.arm["qpos"][0],
+                        pos,
+                        rot,
+                        arm if result.arm else np.full(7, np.nan),
+                        hand if result.hand else np.full(12, np.nan),
+                        stamp / 1e9,
+                        dispatch_status=(int(result.arm), int(result.hand)),
+                        hand_qpos=row.hand["qpos"][0],
+                        arm_tracking_error=float(np.max(np.abs(arm - row.arm["qpos"][0]))),
+                    )
+                except Exception as exc:
+                    if dispatch_error is not None:
+                        logger.exception("replay recording after dispatch failed")
+                        raise dispatch_error from exc
+                    raise
                 if dispatch_error is not None:
                     raise dispatch_error
                 interrupted = _wait_replay(
@@ -266,9 +287,12 @@ def replay_targets(shared, runtime, trajectory, keyboard, *, robot, hand_start_d
         run_end_reason = (
             RunEndReason.HARDWARE_FAULT if not exc.revoked else RunEndReason.EXECUTOR_BOUNDARY
         )
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         shared.estop_request.value = True
-        raise
+        status, reason = ReplayStatus.ESTOP, "KeyboardInterrupt"
+        if isinstance(exc, DispatchInterrupted):
+            reason += f"; dispatch={exc.result}"
+        run_end_reason = RunEndReason.ESTOP
     except Exception as exc:
         logger.exception("replay failed")
         status, reason = ReplayStatus.FAULT, str(exc)

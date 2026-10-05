@@ -122,7 +122,11 @@ class KeyboardTeleopParams:
             raise ValueError("workspace_command_margin_m must be non-negative")
         if self.ik_max_pose_error_pos_m <= 0 or self.ik_max_pose_error_rot_rad <= 0:
             raise ValueError("keyboard IK pose-error limits must be > 0")
-        if self.idle_interval_frames <= 0:
+        if (
+            isinstance(self.idle_interval_frames, bool)
+            or not isinstance(self.idle_interval_frames, int)
+            or self.idle_interval_frames <= 0
+        ):
             raise ValueError("keyboard idle interval must be > 0")
 
 
@@ -161,8 +165,6 @@ class TAGRetargetingParams:
     pinch_skip_threshold: float = 0.01
     reg_stage1_weight: float = 1.0
     reg_last_weight: float = 0.8
-    prior_weight: float = 0.0
-    # Weight for the optional human-flexion prior in both NLopt stages.
 
     def validate(self) -> None:
         robot = np.asarray(self.robot_finger_lengths, dtype=np.float64)
@@ -196,8 +198,6 @@ class TAGRetargetingParams:
             )
         if not np.isfinite(self.smooth_weight) or self.smooth_weight < 0:
             raise ValueError("TAG smooth_weight must be finite and non-negative")
-        if not np.isfinite(self.prior_weight) or self.prior_weight < 0:
-            raise ValueError("TAG prior_weight must be finite and non-negative")
         if self.maxeval_s1 <= 0 or self.maxeval_s2 <= 0:
             raise ValueError("TAG optimizer maxeval values must be positive")
         if self.pinch_full_dist_m >= self.pinch_start_dist_m:
@@ -222,8 +222,6 @@ class DexPilotRetargetingParams:
     # Enter/exit thresholds for the projected grasp regime.
     project_dist_m: float = 0.03
     escape_dist_m: float = 0.05
-    prior_weight: float = 0.0
-    # Weight for the optional human-flexion prior.
 
     def validate(self) -> None:
         numeric = (
@@ -233,7 +231,6 @@ class DexPilotRetargetingParams:
             self.low_pass_alpha,
             self.project_dist_m,
             self.escape_dist_m,
-            self.prior_weight,
         )
         if not all(np.isfinite(value) for value in numeric):
             raise ValueError("DexPilot retargeting parameters must be finite")
@@ -245,8 +242,6 @@ class DexPilotRetargetingParams:
             raise ValueError("DexPilot low_pass_alpha must be in [0, 1]")
         if self.project_dist_m <= 0 or self.escape_dist_m < self.project_dist_m:
             raise ValueError("DexPilot distances must satisfy 0 < project_dist_m <= escape_dist_m")
-        if self.prior_weight < 0:
-            raise ValueError("DexPilot prior_weight must be non-negative")
 
 
 @dataclass(frozen=True)

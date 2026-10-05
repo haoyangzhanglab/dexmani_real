@@ -4,6 +4,7 @@ import multiprocessing as mp
 import os
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
+from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extrinsics
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
@@ -61,6 +62,9 @@ def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, allow_no_hand
     load_vr_transform(VR_TRANSFORM_PATH)
     if runtime.policy.recording_enabled:
         _validate_recording_resources()
+    camera_calibration = (
+        load_optional_camera_extrinsics() if runtime.policy.recording_enabled else None
+    )
     ctx = mp.get_context("spawn")
     shared = RuntimeChannels.create(
         prefix=f"dexmani_collect_{os.getpid()}",
@@ -85,6 +89,7 @@ def run_teleop_experiment(runtime, *, task_name=DEFAULT_TASK_NAME, allow_no_hand
             shared,
             TeleopConfig(runtime, task_label=task_name),
             robot,
+            camera_calibration=camera_calibration,
             start_vr=lambda: supervisor.start(
                 [ctx.Process(name="vr", target=run_vr_worker, args=(shared, runtime.vr))],
                 wait_ready=False,

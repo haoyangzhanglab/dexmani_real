@@ -11,7 +11,7 @@ from dexmani_real.deployment.observation import decision_is_fresh, policy_source
 from dexmani_real.deployment.runner import PolicyRunner
 from dexmani_real.planning.kinematics.ik import IKFailureKind, IKResult
 from dexmani_real.robot.action import ActionRealization
-from dexmani_real.robot.robot import DispatchResult, DispatchStatus
+from dexmani_real.robot.robot import DispatchInterrupted, DispatchResult, DispatchStatus
 from dexmani_real.runtime.observation import ObservationRow
 from dexmani_real.runtime.safety import RunEndReason, SafetyState, request_policy_stop
 
@@ -60,8 +60,10 @@ class Robot:
     def service_idle(self):
         pass
 
-    def send_action(self, command):
-        assert self.before_send()
+    def send_action(self, command, *, valid_until_ns):
+        import time
+
+        assert time.monotonic_ns() < valid_until_ns
         self.sent.append(command)
         return self.result
 
@@ -313,6 +315,38 @@ def test_unknown_dispatch_ends_reservation(make_runner):
     r.robot.result = DispatchResult(DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED)
     bootstrap(r)
     assert r.run_id is None and r.completed == 1 and r.plan is None
+
+
+@pytest.mark.parametrize("statuses", [(0, 0), (4, 0), (1, 4)])
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_dispatch_cancel_preserves_row_and_first_reason(make_runner, statuses, stop_fails):
+    r = make_runner()
+    order = []
+    result = DispatchResult(*(DispatchStatus(value) for value in statuses))
+
+    def send(command, *, valid_until_ns):
+        raise DispatchInterrupted(result)
+
+    def stop():
+        order.append("stop")
+        if stop_fails:
+            raise RuntimeError("stop failed")
+
+    def record(row, command=None, dispatch=None):
+        if command is not None:
+            order.append(dispatch)
+
+    r.robot.send_action = send
+    r.robot.stop = stop
+    r._record = record
+    with pytest.raises(DispatchInterrupted) as caught:
+        bootstrap(r)
+    assert caught.value.result is result
+    assert order == ["stop", result]
+    assert r.completed == 1 and r.run_id is None
+    assert r.shared.run_ended_reason.value == RunEndReason.ESTOP
+    ends = [event for event in r.events if event["event"] == "end"]
+    assert len(ends) == 1 and ends[0]["reason"] == "estop"
 
 
 def test_each_actual_modality_source_and_fk_dependency():
@@ -686,3 +720,22 @@ def test_legal_mode_warmup_commits_before_reset_and_start(idle_runner, mode, mon
     assert r.run_id is not None
     assert r.events[0]["event"] == "begin" and r.events[0]["mode"] == mode
     assert [op for op, _, _ in r.model.submissions] == ["configure_execution", "reset_episode"]
+
+
+def test_future_finishes_while_reading_observation(make_runner):
+    r = make_runner(mode="async", n=1)
+    b = bootstrap(r)
+    r.tick(b + 1)  # prefetch for b+3
+    r.tick(b + 2)
+    count = len(r.robot.sent)
+    read = r._read_observation
+
+    def read_and_complete():
+        r.clock.now += 5_000_000
+        r.model.complete(future(r, 0.5))
+        return read()
+
+    r._read_observation = read_and_complete
+    r.tick(b + 3)
+    assert len(r.robot.sent) == count + 1
+    assert not any(e.get("reason") == "handoff_miss" for e in r.events)
