@@ -3,7 +3,7 @@
 日期：2026-10-05（Asia/Shanghai）  
 主仓库：`haoyangzhanglab/dexmani_real`  
 协同仓库：`haoyangzhanglab/dexmani_policy`  
-状态：**D1–D10 历史验收记录保留；2026-10-06 追加 F1–F4 剩余问题消缺与验证，当前结果以文末本轮执行记录为准。真机未验收。**
+状态：**D1–D10、F1–F4 历史记录保留；2026-10-06 追加 P2 recorder 异常收尾与 P3 全批次 loss 检查修复，当前结果以文末本轮执行记录为准。真机未验收。**
 
 本文是独立任务书，不依赖聊天、PDF、临时反例脚本或其他机器上的文件。本任务范围内，本文取代前几轮方案中与之冲突的实施建议。不要重新执行旧根目录任务书的全部事项，不修改 `AGENTS.md` 的长期原则来迎合一次性方案。
 
@@ -577,7 +577,7 @@ Policy 删除 Reader 未使用的 logger/items、VQ 旧 episode_ends 兼容探�
 | 项目 | 状态 | 成因、最小修改与证据 |
 | --- | --- | --- |
 | F1 | FIXED（软件） | Policy owner 原成功路径在 SDK 迟返回后清空 WAIT，且旧 `_within_budget` 只覆盖 episode。统一 owner 总预算 deadline，在派发返回后、推进状态前检查 episode/适用 WAIT；超时撤权、stop、单次记录真实 DispatchResult、完成 episode。输入/反馈/slot 截止继续只约束新 SDK 准入。WAIT 到期拒绝也归 TIMEOUT。当前 run 首因 latch 优先，取消异常不被最终 writer 失败掩盖。 |
-| F2 | FIXED（软件证据链） | Teleop 保留 per-capture `termination_details`，控制派发 stop、operator pause stop、segment/shutdown stop 与清理实际异常沿现有 finish 接口传入 writer；内容只有阶段/类型/说明。writer 发 STOP 前序列化稳定快照，final_meta 一次写出；新 capture 清空、正常结束不造错误。Policy 沿用 policy_trace；Replay 补回派发后 stop 失败的 outcome 详情。已发布后的 close/shutdown 仅在日志与会话异常表达。 |
+| F2 | FIXED（软件证据链） | Teleop 保留 per-capture `termination_details`，控制派发 stop、operator pause stop、segment/shutdown stop 与清理实际异常沿现有 finish 接口传入 writer；内容只有阶段/类型/说明。当时由 owner 在发 STOP 前序列化快照，writer 在 final_meta 一次写出（该准备顺序的异常收尾缺口已由后文 P2 修复）；新 capture 清空、正常结束不造错误。Policy 沿用 policy_trace；Replay 补回派发后 stop 失败的 outcome 详情。已发布后的 close/shutdown 仅在日志与会话异常表达。 |
 | F3 | FIXED（原生软件回归） | 旧独立 VQ 统计范围本就不同。新增 `--policy-config` / 重复 `--policy-override`；实际 Dataset 负责 split、观测 finite、action finite、dispatch、H/N 和唯一源行。只调用现有 build_normalizer 拟合 action，再按 joint=7+12 / EEF=9+12 提取 scale/offset 与输入统计。验证使用训练参数，不构造 Agent 或要求已有 codebook；aux 布局明确拒绝。独立 `--config` 配方保持不变，DQRISE 容差保持 rtol=1e-5、atol=1e-6。 |
 | F4 | FIXED（完成测量判断，保留既有读取实现） | 先从 Policy 当前 HEAD 导出 `/tmp/dexmani_policy_f4_baseline`，保存原 streaming 基线；旧 eager 对照使用原 `650f1e3` 导出源码。试验并复测批内 chunk 合并；实际数据+GPU 未显示供给瓶颈，因此撤回 33 行生产试验代码，最终 Dataset/sampler 无 diff。不新增 cache、全量 payload、预取配置或存储迁移。 |
 | 原 D1–D9 已过路径 | ALREADY_FIXED | 继续运行适用现有回归；保留 deadline 准入、DispatchInterrupted、双触觉独立性、绝对坐标/软逃离、标定取消/门限、视频帧身份、streaming normalizer 与 strict resume；本轮不重写这些机制。 |
@@ -681,7 +681,7 @@ PYTHONPATH="$SOURCE" "$P" tests/benchmark_dataset_streaming.py \
 | 最大单 worker peak RSS MiB | 574.24 | 582.56 |
 | GPU peak allocated MiB | 3350.98 | 3350.60 |
 
-所有 loss 有限。约 1.1% 的总吞吐差异随 GPU 计算耗时变化，未见可归因于数据饥饿的 GPU 步间间隔；CPU 等待本身也很小。本工作负载的原实现已经供给充分，故按任务要求撤回生产优化，避免只为纯 RAM/microbenchmark 数字增加机制。三次均是短程、未 compile、无 optimizer/EMA 的工作负载；没有独占 GPU/控制时钟频率，不把该结论扩展到完整训练、更快模型、其他 worker 数或其他数据。数据读前经过资格/统计扫描，未测冷缓存。
+【P3 验收更正】原记录“所有 loss 有限”超出了当时检查范围：历史 `finite_loss` 只检查末批，不能证明预热和此前测量批次均有限；撤销该全批次断言，保留原始测量记录，不追认历史验证。约 1.1% 的总吞吐差异随 GPU 计算耗时变化，未见可归因于数据饥饿的 GPU 步间间隔；CPU 等待本身也很小。本工作负载未显示数据供给瓶颈，因此继续保留撤回生产优化的决定；本轮未重新测量 GPU 性能。三次均是短程、未 compile、无 optimizer/EMA 的工作负载；没有独占 GPU/控制时钟频率，不把该结论扩展到完整训练、更快模型、其他 worker 数或其他数据。数据读前经过资格/统计扫描，未测冷缓存。
 
 实际命令（用获准 GPU 权限运行；SOURCE 分别为原 streaming 与上述试验源码，各三次）：
 
@@ -754,3 +754,70 @@ Policy：VQ 准备入口/使用率工具与命令文档、现有 normalizer 手�
 - `$P tests/benchmark_dataset_streaming.py /tmp/dexmani_bench_large_20261005.zarr --order random --batch-size 16 --workers 2 --batches 2`：PASS，仅 CPU 多 worker 路径 smoke；返回 32 个样本和有效 chunk 计数/计时，不据此更新性能结论。
 
 两仓库 HEAD 不变，未 commit/push；未运行任何真机操作或新的 GPU 工作负载。前述性能结论、DEFERRED 清单与未验证边界不变。
+
+## 2026-10-06：P2 / P3 最新验收消缺
+
+### 基线与状态
+
+开始时两仓库均在 `main`、工作树干净。Real HEAD 为 `979482e871ef4366d1be188d9ab397fb32b7c015`，Policy HEAD 为 `d93eff2a4622f57ff9c84e4ba19dd1243685fc43`；origin 分别为 `https://github.com/haoyangzhanglab/dexmani_real.git` 和 `https://github.com/haoyangzhanglab/dexmani_policy.git`。两仓库仅根目录 AGENTS 适用，祖先目录无额外规则。未 reset/checkout、升级环境或修改实验数据，本轮不 commit/push。
+
+| 项目 | 状态 | 结论 |
+| --- | --- | --- |
+| P2 recorder 序列化异常收尾 | FIXED（原生离线） | owner 一次深拷贝独立快照，writer 排空帧并 flush 行数据后在 final_meta 编码 JSON；准备或编码失败锁存原始原因、保留 staging、禁止发布，writer 自己关闭资源。 |
+| P3 全批次 loss 有限性 | FIXED（受控软件回归） | 包含 3 个预热批次与全部测量批次；循环只追加 detached 标量，测量计时结束后统一检查。没有新增逐批主机同步。 |
+| F1 总预算、首因与单次末行 | ALREADY_FIXED | 原实现未改，现有 Policy runner/取消回归随 Real 全套通过。 |
+| F2 正常结束详情与原生写盘 | ALREADY_FIXED（原已覆盖路径） | 首因/附加 stop 故障、正常保存、旧 Raw 可读与快照独立性继续通过；新发现的序列化异常分支由 P2 单列修复，不把此前覆盖称为完整异常验收。 |
+| F3 / F4 生产机制 | 保留 | DQ-RISE、Dataset、sampler、normalizer、模型和训练配方均无修改。F4 历史全批次 loss 断言按上文更正，本轮不追认或重跑旧性能数据。 |
+
+### P2 成因、最小修改与证据
+
+原 `_finish` 在通知 STOP 和 join 之前执行 `json.dumps(..., allow_nan=False)`。`numpy.float32` 或 NaN 导致异常直接逃逸；未锁存 recording error、writer 仍等帧，后续 `close()` 又重复失败。
+
+现在 owner 使用一次 `deepcopy((details, policy_trace))` 固定最终元数据，保留单 producer / 单 writer。JSON 仍严格使用 `allow_nan=False`，由 writer 在排空 FIFO、flush 已缓冲行后的 final_meta 中执行。使用既有 `_recording` 区分首次结束与重复 close，不增加 finalizer 或另一套生命周期状态；重复 close 不再复制/编码调用方对象。
+
+快照准备失败复用 `_store_error`，仅在该分支延迟 abort，让有效排队行继续写出；finally 始终负责通知 STOP 和按原 60 s 总等待预算 join。writer 写入可保留的帧数与 termination_reason 后检查已锁存错误，再走现有异常/资源清理路径。普通异常以 RecordingError 报告，`__cause__` 保留原异常；快照中的 KeyboardInterrupt 在必要清理后原样抛出，后续 close 报告已锁存错误。没有从 owner 强行关闭 writer 的 HDF5/PyAV 资源。
+
+先新增 6 个失败案例并在未修复源码上运行，结果 6 failed：trace/details 分别含 float32 或 NaN、快照准备 RuntimeError、准备期间 KeyboardInterrupt。float32 配方通过现有 ExecutionConfig.validate 后进入 asdict trace，未修改预算准入或过滤元数据来规避反例。修复后全部通过。
+
+每个异常测试都让原生 VideoEncoder 首帧写入等待，另有两帧位于 FIFO，STOP 后放行。验收实际 staging 内容：HDF5 时间行 `[0,1,2]`、dispatch `[[1,1],[1,1],[2,2]]`、depth 像素 `[1,2,3]`，PyAV 解码出 3 帧；不是仅检查目录存在。确认 Raw 未发布、线程退出、资源 close 全部发生在 writer 线程；连续两次 close 每次低于 1 s 并保留同一原始原因。正常保存与原有 STOP 提交时调用方对象变化的快照测试继续通过，termination_reason、termination_details、policy_trace 均保留。
+
+核对 Teleop `_finish_capture` / `run` finally 和 Policy `_finish_episode` / `run` finally：继续使用现有 recorder 完成与 close 接口，无需改 owner 的首因、停止或末行记录机制。
+
+### P3 成因、最小修改与证据
+
+原循环每次覆盖 `loss`，输出的 finite_loss 只检查末批。现在循环追加 `loss.detach()`，在最终 CUDA 同步和 elapsed 取值之后，执行一次 `torch.isfinite(torch.stack(losses)).all()`。输出字段仍为 bool，False 明确表示本次至少一批 loss 非有限；统计包含预热和测量批次。保存的都是 detached 标量，不保留计算图；吞吐、batch wait、CUDA events 和 GPU 步间间隔的计时边界不变。
+
+新增测试直接调用生产 `measure_gpu_data_wait`，使用原生 CPU Torch 标量及 backward，替换模型构造、数据 loader 与 CUDA 操作。修复前 6 failed：预热 NaN、测量中间 NaN/正负 Inf 后末批有限均误报 True，原检查对象还是带图末批标量。修复后 6 passed，包含全部有限正例。测试检查收集的 6 个标量均无 grad/grad_fn、汇总发生在计时边界之后、同步调用仍仅为预热结束与测量结束两次；若出现逐批 `.item()`、`.cpu()` 或布尔主机转换则失败。
+
+这是原生 CPU 张量 + 受控替身的软件循环验证，不能称为 CUDA 集成或重叠实测。没有重新运行完整模型、训练或大型性能对照。历史性能表保留，但历史“所有 loss 有限”明确更正为仅末批检查。
+
+### 本轮实际验证
+
+使用已有环境：`R=/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`，`P=/home/zhanghaoyang/miniconda3/envs/policy/bin/python`，`RUFF=/home/zhanghaoyang/miniconda3/envs/real_robot/bin/ruff`。
+
+| 分类 | 实际命令 | 结果 |
+| --- | --- | --- |
+| P2 修复前回归 | `$R -m pytest -q tests/test_policy_recording.py -k final_metadata_failure --tb=short` | 预期失败：6 failed、7 deselected；测试 finally 清理旧实现遗留 writer，未留下活线程。 |
+| P3 修复前回归 | `$P -m pytest -q tests/test_benchmark_dataset_streaming.py -o cache_dir=/tmp/dexmani_policy_pytest_cache --tb=short` | 预期失败：6 failed。 |
+| recorder / owner 定向 | `$R -m pytest -q tests/test_policy_recording.py tests/test_policy_runner.py tests/test_review_remediation.py --tb=short` | PASS：143 passed，2.25 s。 |
+| Real 完整离线回归 | `$R -m pytest -q tests --tb=short` | PASS：147 passed，4.25 s；含原生 HDF5/PyAV，机器人/传感器/时钟相关分支为 fake。 |
+| P3 受控软件回归 | 同上 P3 命令 | PASS：6 passed，1.35 s。 |
+| Real 静态/语法 | `$RUFF check --no-cache dexmani_real examples tests`；`$RUFF format --check --no-cache dexmani_real examples tests`；`$R -m compileall -q dexmani_real examples tests` | PASS；125 文件格式检查通过。 |
+| Policy 修改文件静态/语法 | 对 `tests/benchmark_dataset_streaming.py tests/test_benchmark_dataset_streaming.py` 执行 `$RUFF check --no-cache`、`$RUFF format --check --no-cache` 和 `PYTHONPYCACHEPREFIX=/tmp/dexmani_policy_compile_cache $P -m compileall -q` | PASS。 |
+| Diff | 两仓库 `git diff --check` | PASS。 |
+
+### 交付与剩余边界
+
+Real 修改：`dexmani_real/recording/recorder.py`、`tests/test_policy_recording.py`、本任务书。Policy 修改：`tests/benchmark_dataset_streaming.py`、新增 `tests/test_benchmark_dataset_streaming.py`。当前 HEAD 仍为上述验收基线；可审查 diff 在工作树，补丁导出为 `/tmp/dexmani_real_P2_P3.patch` 与 `/tmp/dexmani_policy_P2_P3.patch`。
+
+本轮两个缺陷均无依赖阻断，已覆盖的序列化异常不会再遗留本可退出的 writer、丢弃排队有效前缀或成功发布 Raw；全批次 finite_loss 不再由末批掩盖。原生 I/O 真正阻塞时仍只提供有界等待和错误报告，不能强制终止线程；此时资源与 staging 继续由 writer 持有。磁盘/编码器自身进一步失败时仍不承诺完整保存所有数据。
+
+本轮未实测 CUDA 重叠、GPU 性能或完整 Policy 训练/DDP，也未执行真机、传感器、运动或标定操作。历史 B1、R3-4、O06、O07、O08、O13、O14 仍 DEFERRED，所缺证据与真机未验证清单沿用前文；没有为本轮改动放宽 JSON、数值校验或研究语义。
+
+### P2 / P3 后续清理
+
+精简 recorder 快照准备处重复嵌套的 try，保留异常锁存与 finally 收尾；模块说明明确只有帧提交采用非阻塞队列，START/完成边界仍可能等待。`docs/policy_execution.md` 补充 owner 快照、writer 编码、失败 close 与阻塞 I/O 的实际责任边界。F2 历史记录校正 STOP 的发送者并指向 P2 修订，没有删除历史证据。
+
+Policy benchmark 函数文档明确 finite_loss 覆盖全部预热和测量批次，汇总检查位于计时之后；测试的 `timed_out` 更名为 `timing_finished`，避免将“测量结束”误读为“超时”。未删除有用途的取消清理、错误锁存或回归替身，未改变数值与测量语义。
+
+清理后沿用上表命令复验：Real 全套 **147 passed，4.27 s**；Policy benchmark 定向 **6 passed，1.34 s**；Real 全量及 Policy 两个修改 Python 文件的 Ruff/format/compileall 和两仓库 diff 检查均 PASS。HEAD 不变，未 commit/push，未新增硬件或 CUDA 验证。Real 当前修改范围新增上述执行文档；两份 P2/P3 补丁已随工作树刷新。

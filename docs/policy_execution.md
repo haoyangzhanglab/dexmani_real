@@ -42,7 +42,9 @@ WAIT 表示没有新策略目标，设备仍可能追踪上一个目标。停止
 
 原始 attempted targets、measured state、dispatch 和辅助 NaN 保留。rollout 的 execution_path 为 `worker_grid_<mode>_v1`。`run_config.yaml` 保存两仓库 SHA、checkpoint/weights/seed/NFE、模式、模型长度和实验预算；每个 Raw 的 `data.h5/meta/policy_trace` 保存紧凑 JSON query/交接/dispatch/失效/结束事件，停止失败也沿用该 trace。
 
-第一终止主因通过 run_ended_id 与 run_id 关联，`termination_reason` 表达首因。Teleop 使用可选 `data.h5/meta/termination_details` 保存结束阶段、异常类型和错误说明；附加 stop 故障不能覆盖 OPERATOR/QUIT，正常结束不写错误详情。trace 和详情都在交给 writer 完成前冻结为快照。writer/发布失败保留 staging，并报告会话失败；发布后的资源回收故障通过会话结果与日志表达，不回写已发布 Raw。
+第一终止主因通过 run_ended_id 与 run_id 关联，`termination_reason` 表达首因。Teleop 使用可选 `data.h5/meta/termination_details` 保存结束阶段、异常类型和错误说明；附加 stop 故障不能覆盖 OPERATOR/QUIT，正常结束不写错误详情。
+
+owner 在提交 STOP 前深拷贝 trace 和结束详情，writer 排空有效帧后在最终元数据阶段执行严格 JSON 编码。快照或编码失败会锁存错误、保留 staging，并由 writer 关闭资源；重复 close 报告已锁存错误，不重新准备元数据。真正阻塞的原生 I/O 仍可能超过等待预算，owner 不跨线程强关句柄。发布后的资源回收故障通过会话结果与日志表达，不回写已发布 Raw。
 
 Policy 主 Dataset 按实际使用的输入与监督检查窗口有限性，Real canonical 额外要求两设备 ACCEPTED dispatch。观察检查前 N 源行，监督检查完整 H；保持原 padding、episode 边界、loss 权重和时间语义。normalizer 仅拟合有效训练窗口引用的去重源行，验证使用训练统计。checkpoint 部署及恢复读取保存的统计，不重拟合；数据配方变化不能作为旧配方的精确续训，历史复现使用原源码版本。数学和数据筛选细节见相邻 `dexmani_policy` 仓库的 `docs/rtc.md`。
 

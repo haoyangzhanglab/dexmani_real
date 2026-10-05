@@ -1,4 +1,4 @@
-"""Non-blocking local recording; one writer thread owns each Raw episode."""
+"""Local recording with bounded frame submission and one writer per Raw episode."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import shutil
 import threading
 import time
+from copy import deepcopy
 from pathlib import Path
 from queue import Empty, Full, Queue
 
@@ -144,10 +145,11 @@ class AsyncEpisodeRecorder:
     def accepting_frames(self):
         return self._recording and self._error is None
 
-    def _store_error(self, error):
+    def _store_error(self, error, *, abort=True):
         if self._error is None:
             self._error = error
-        self._abort = True
+        if abort:
+            self._abort = True
 
     def check_error(self):
         if self._error is not None:
@@ -276,7 +278,7 @@ class AsyncEpisodeRecorder:
             self._abort = self._save = self._saved = False
             self._reason = ""
             self.policy_trace = None
-            self._policy_trace_json = self._termination_details_json = None
+            self._final_metadata = (None, None)
             self._frame_count = self._written_frames = 0
             self._thread = threading.Thread(
                 target=self._write_episode, args=(metadata,), name="episode-writer", daemon=False
@@ -326,36 +328,47 @@ class AsyncEpisodeRecorder:
         self._finish(save=True, reason="close")
 
     def _finish(self, *, save, reason, details=None):
+        was_recording = self._recording
         self._recording = False
         thread = self._thread
         if thread is None:
             self.check_error()
             return None
-        self._save = save and self._error is None
-        self._reason = reason
-        # Freeze owner state before publishing STOP to the writer thread.
-        self._termination_details_json = json.dumps(details, allow_nan=False) if details else None
-        self._policy_trace_json = (
-            json.dumps(self.policy_trace, allow_nan=False)
-            if self.policy_trace is not None
-            else None
-        )
         deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
-        if thread.is_alive() and not self._abort:
-            while thread.is_alive():
-                try:
-                    self._queue.put_nowait(_STOP)
-                    break
-                except Full:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    thread.join(timeout=min(0.01, remaining))
-        thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        if thread.is_alive():
-            self._store_error(
-                TimeoutError("recording finalization timed out; staging remains owned")
-            )
+        try:
+            if was_recording and self._error is None:
+                self._save = save
+                self._reason = reason
+                # Detach owner state before STOP; encoding belongs to the writer.
+                self._final_metadata = deepcopy((details, self.policy_trace))
+        except BaseException as exc:
+            self._save = False
+            # Metadata failure must still drain queued, valid source rows.
+            self._store_error(exc, abort=False)
+            if not isinstance(exc, Exception):
+                raise
+        finally:
+            try:
+                if thread.is_alive() and not self._abort:
+                    while thread.is_alive():
+                        try:
+                            self._queue.put_nowait(_STOP)
+                            break
+                        except Full:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            thread.join(timeout=min(0.01, remaining))
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            except BaseException as exc:
+                self._store_error(exc)
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+                if not isinstance(exc, Exception):
+                    raise
+            if thread.is_alive():
+                self._store_error(
+                    TimeoutError("recording finalization timed out; staging remains owned")
+                )
         self.check_error()
         if not self.resources_released:
             raise RecordingError("recording retained unreleased resources")
@@ -437,16 +450,20 @@ class AsyncEpisodeRecorder:
                     flush_rows()
             if not self._abort:
                 flush_rows()
+                details, policy_trace = self._final_metadata
 
                 def final_meta(meta):
                     meta.attrs["format"] = RAW_FORMAT
                     meta.attrs["num_frames"] = self._written_frames
                     meta.attrs["termination_reason"] = self._reason
-                    if self._policy_trace_json is not None:
-                        meta.create_dataset("policy_trace", data=self._policy_trace_json)
-                    if self._termination_details_json is not None:
+                    self.check_error()
+                    if policy_trace is not None:
                         meta.create_dataset(
-                            "termination_details", data=self._termination_details_json
+                            "policy_trace", data=json.dumps(policy_trace, allow_nan=False)
+                        )
+                    if details:
+                        meta.create_dataset(
+                            "termination_details", data=json.dumps(details, allow_nan=False)
                         )
                     for name, count in missing_tactile.items():
                         meta.attrs[f"{name}_missing_rows"] = count

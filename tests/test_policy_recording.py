@@ -1,4 +1,8 @@
 import json
+import threading
+import time
+from dataclasses import asdict
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -198,5 +202,122 @@ def test_writer_receives_frozen_termination_and_policy_trace(tmp_path, monkeypat
     monkeypatch.setattr(recorder._queue, "put_nowait", submit)
     saved = recorder.save_episode(reason="operator", details=details)
     with h5py.File(saved / "data.h5") as raw:
+        assert raw["meta"].attrs["termination_reason"] == "operator"
         assert json.loads(raw["meta/termination_details"][()])[0]["message"] == "STOP_TIMEOUT"
         assert len(json.loads(raw["meta/policy_trace"][()])["events"]) == 1
+
+
+@pytest.mark.parametrize(
+    "failure", ["trace_type", "trace_nan", "details_type", "details_nan", "copy", "interrupt"]
+)
+def test_final_metadata_failure_drains_native_writer(tmp_path, monkeypatch, failure):
+    import av
+
+    from dexmani_real.deployment.config import ExecutionConfig
+    from dexmani_real.recording import recorder as module
+
+    entered, release = threading.Event(), threading.Event()
+    write_frame = module.VideoEncoder.write_frame
+    close_threads = []
+
+    def track_close(close):
+        def wrapped(resource):
+            close_threads.append(threading.get_ident())
+            return close(resource)
+
+        return wrapped
+
+    for resource in (module.VideoEncoder, module.EpisodeDataWriter):
+        monkeypatch.setattr(resource, "close", track_close(resource.close))
+
+    def blocked_write(video, frame):
+        entered.set()
+        assert release.wait(3), "test did not release writer"
+        return write_frame(video, frame)
+
+    monkeypatch.setattr(module.VideoEncoder, "write_frame", blocked_write)
+    recorder = start_recording(tmp_path)
+    copies = []
+    error = (
+        KeyboardInterrupt("snapshot cancelled")
+        if failure == "interrupt"
+        else RuntimeError("snapshot failed")
+    )
+
+    class Uncopyable:
+        def __deepcopy__(self, memo):
+            copies.append(1)
+            raise error
+
+    try:
+        assert entered.wait(3)
+        for i in (1, 2):
+            data = {
+                name: np.full(spec.tail_shape, i, dtype=spec.dtype)
+                for name, spec in DATASET_SPECS.items()
+            }
+            recorder.add_frame(
+                EpisodeFrame(
+                    data, np.zeros((16, 16, 3), np.uint8), np.full((16, 16), i + 1, np.uint16)
+                )
+            )
+        assert recorder._queue.qsize() == 2
+        config = ExecutionConfig(
+            max_wait_s=np.float32(0.205), max_decision_age_s=1.0, max_tick_lateness_s=0.03
+        ).validate(SimpleNamespace(control_dt_s=0.1, horizon=3, n_obs_steps=1, n_action_steps=1))
+        details = [dict(stage="pause_stop", exception_type="TimeoutError", message="STOP_TIMEOUT")]
+        trace = {"events": []}
+        if failure == "trace_type":
+            trace["config"] = asdict(config)
+        elif failure == "trace_nan":
+            trace["events"].append({"time": float("nan")})
+        elif failure.startswith("details_"):
+            details[0]["message"] = np.float32(1) if failure == "details_type" else float("nan")
+        else:
+            trace["uncopyable"] = Uncopyable()
+        recorder.policy_trace = trace
+        put = recorder._queue.put_nowait
+
+        def submit(item):
+            result = put(item)
+            if item is module._STOP:
+                release.set()
+            return result
+
+        monkeypatch.setattr(recorder._queue, "put_nowait", submit)
+        expected = KeyboardInterrupt if failure == "interrupt" else module.RecordingError
+        with pytest.raises(expected) as raised:
+            recorder.save_episode(reason="operator", details=details)
+        cause = raised.value if failure == "interrupt" else raised.value.__cause__
+        if failure in ("copy", "interrupt"):
+            assert cause is error
+            assert copies == [1]
+        else:
+            assert isinstance(cause, TypeError if failure.endswith("type") else ValueError)
+        assert not recorder._thread.is_alive()
+        assert recorder.resources_released
+        assert close_threads and set(close_threads) == {recorder._thread.ident}
+        assert not recorder.episode_path.exists()
+        assert recorder._temp_dir.is_dir()
+        with h5py.File(recorder._temp_dir / "data.h5") as raw:
+            assert raw["meta"].attrs["termination_reason"] == "operator"
+            np.testing.assert_array_equal(raw["observation_timestamp_ns"][:], [0, 1, 2])
+            np.testing.assert_array_equal(raw["dispatch_status"][:], [[1, 1], [1, 1], [2, 2]])
+            np.testing.assert_array_equal(raw["depth"][:, 0, 0], [1, 2, 3])
+        with av.open(str(recorder._temp_dir / "rgb.mp4")) as video:
+            assert len(list(video.decode(video=0))) == 3
+        for _ in range(2):
+            start = time.monotonic()
+            with pytest.raises(module.RecordingError) as closed:
+                recorder.close()
+            assert closed.value.__cause__ is cause
+            assert time.monotonic() - start < 1
+        assert copies == ([1] if failure in ("copy", "interrupt") else [])
+        assert recorder._reason == "operator"
+    finally:
+        # Keep the deliberately failing baseline regression from leaking a writer.
+        release.set()
+        if recorder._thread is not None and recorder._thread.is_alive():
+            recorder._store_error(RuntimeError("test cleanup"))
+            recorder._thread.join(timeout=3)
+        assert recorder.resources_released
