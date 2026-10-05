@@ -276,6 +276,7 @@ class AsyncEpisodeRecorder:
             self._abort = self._save = self._saved = False
             self._reason = ""
             self.policy_trace = None
+            self._policy_trace_json = self._termination_details_json = None
             self._frame_count = self._written_frames = 0
             self._thread = threading.Thread(
                 target=self._write_episode, args=(metadata,), name="episode-writer", daemon=False
@@ -314,8 +315,8 @@ class AsyncEpisodeRecorder:
             raise error from exc
         self._frame_count += 1
 
-    def save_episode(self, reason="manual"):
-        return self._finish(save=True, reason=reason)
+    def save_episode(self, reason="manual", *, details=None):
+        return self._finish(save=True, reason=reason, details=details)
 
     def discard_episode(self, reason="discard"):
         self._finish(save=False, reason=reason)
@@ -324,7 +325,7 @@ class AsyncEpisodeRecorder:
         """Save an unfinished prefix; callers must already have revoked motion."""
         self._finish(save=True, reason="close")
 
-    def _finish(self, *, save, reason):
+    def _finish(self, *, save, reason, details=None):
         self._recording = False
         thread = self._thread
         if thread is None:
@@ -332,6 +333,13 @@ class AsyncEpisodeRecorder:
             return None
         self._save = save and self._error is None
         self._reason = reason
+        # Freeze owner state before publishing STOP to the writer thread.
+        self._termination_details_json = json.dumps(details, allow_nan=False) if details else None
+        self._policy_trace_json = (
+            json.dumps(self.policy_trace, allow_nan=False)
+            if self.policy_trace is not None
+            else None
+        )
         deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
         if thread.is_alive() and not self._abort:
             while thread.is_alive():
@@ -434,9 +442,11 @@ class AsyncEpisodeRecorder:
                     meta.attrs["format"] = RAW_FORMAT
                     meta.attrs["num_frames"] = self._written_frames
                     meta.attrs["termination_reason"] = self._reason
-                    if self.policy_trace is not None:
+                    if self._policy_trace_json is not None:
+                        meta.create_dataset("policy_trace", data=self._policy_trace_json)
+                    if self._termination_details_json is not None:
                         meta.create_dataset(
-                            "policy_trace", data=json.dumps(self.policy_trace, allow_nan=False)
+                            "termination_details", data=self._termination_details_json
                         )
                     for name, count in missing_tactile.items():
                         meta.attrs[f"{name}_missing_rows"] = count

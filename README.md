@@ -91,6 +91,7 @@ python examples/collect_teleop.py \
 ```
 
 启动会在停止监听建立后执行手部 HOME。H 为整机 HOME，B 开始，C 暂停/恢复；恢复时保存上一段并开始新 episode。S 停止保存，D 丢弃当前 capture，Q 进入退出确认、再次 Q 保存退出（尚未开始且无 capture 时直接退出），ESC 急停。键盘 jog 入口仅在 R 时 HOME。
+操作者结束原因和随后发生的停止故障分别留证；写盘或发布失败保留 staging 并报告会话失败，已发布 Raw 不回写。
 录制启用全部已接入物理模态，aggregate/dense 触觉独立校准和判断可用性，缺测保留 NaN；触觉持续不可用会在日志和 episode 摘要中显示。相机无可用帧或任一路持续停帧时停止并保留前缀，不补黑图。
 
 Raw episode 是实验 source of truth。已发布 Raw 不做原地修补；暂停、失败、缺测和终止原因等实验事实应被保留。

@@ -442,19 +442,34 @@ def test_calibration_cancelled_queue_never_solves(monkeypatch):
     instance._handle_sample_events()
 
 
-def test_teleop_cancel_records_once_before_propagation(monkeypatch):
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_teleop_cancel_records_once_before_propagation(monkeypatch, stop_fails):
     from dexmani_real.teleop.control import controller
 
     robot, clock, command = fake_robot(monkeypatch)
     clock.interrupt = "hand"
     recorded, stops = [], []
-    robot.stop = lambda: stops.append(True)
+    details = []
+
+    def stop():
+        stops.append(True)
+        if stop_fails:
+            raise TimeoutError("STOP_TIMEOUT")
+
+    robot.stop = stop
     ctl = NS(runtime=robot.runtime, compute_command=lambda *a: (command, True, np.zeros(9)))
     row = NS(arm={"timestamp_ns": [100]}, hand={"timestamp_ns": [100]}, vr={"recv_ts_ns": 100})
     recorder = NS(check_error=lambda: None, accepting_frames=True, add_frame=recorded.append)
     monkeypatch.setattr(controller, "build_episode_frame", lambda row, cmd, res: res)
     with pytest.raises(DispatchInterrupted):
-        controller.execute_control_step(ctl, robot.shared, robot, row, recorder)
+        controller.execute_control_step(
+            ctl, robot.shared, robot, row, recorder, termination_details=details
+        )
+    assert details == (
+        [dict(stage="dispatch_stop", exception_type="TimeoutError", message="STOP_TIMEOUT")]
+        if stop_fails
+        else []
+    )
     assert len(recorded) == len(stops) == 1
     assert (recorded[0].arm, recorded[0].hand) == (1, 4)
     assert robot.shared.run_ended_reason.value == RunEndReason.ESTOP
@@ -475,13 +490,21 @@ def test_teleop_first_reason_matches_run(cause):
 
 
 @pytest.mark.parametrize("where", ["arm", "hand", "wait"])
-def test_replay_cancel_returns_actual_prefix(monkeypatch, where):
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_replay_cancel_returns_actual_prefix(monkeypatch, where, stop_fails):
     from dexmani_real.replay import replayer
 
     robot, clock, command = fake_robot(monkeypatch)
     robot.shared.safety_state.value = int(SafetyState.ARMED)
     # begin_motion increments the epoch; the real robot owner uses that epoch.
-    robot.stop = lambda: None
+    stops = []
+
+    def stop():
+        stops.append(True)
+        if stop_fails and len(stops) == 1:
+            raise TimeoutError("STOP_TIMEOUT")
+
+    robot.stop = stop
     row = NS(
         arm={"qpos": np.array([command.arm_qpos]), "timestamp_ns": [100]},
         hand={"qpos": np.array([command.hand_qpos]), "timestamp_ns": [100]},
@@ -515,7 +538,11 @@ def test_replay_cancel_returns_actual_prefix(monkeypatch, where):
     outcome = replayer.replay_targets(
         robot.shared, robot.runtime, trajectory, None, robot=robot, hand_start_duration_s=0
     )
-    assert outcome.status == replayer.ReplayStatus.ESTOP
+    assert outcome.status == (
+        replayer.ReplayStatus.FAULT if stop_fails else replayer.ReplayStatus.ESTOP
+    )
+    if stop_fails:
+        assert "STOP_TIMEOUT" in outcome.reason
     assert len(outcome.replay_data["dispatch_status"]) == 1
     expected = {"arm": [4, 0], "hand": [1, 4], "wait": [1, 1]}[where]
     np.testing.assert_array_equal(outcome.replay_data["dispatch_status"][0], expected)
@@ -744,13 +771,21 @@ def test_teleop_stop_failure_retains_first_reason(cause):
     runner.shared = shared_state()
     runner.control_run_id = 1
     runner.pending_termination_reason = None
+    runner.termination_details = []
     runner.robot = NS(stop=lambda: (_ for _ in ()).throw(RuntimeError("stop failed")))
     with pytest.raises(RuntimeError, match="stop failed"):
         runner._pause_control("motion_revoked", run_end_reason=cause)
     saved = []
     runner.recorder = NS(is_recording=True, save_episode=lambda **kw: saved.append(kw))
     runner._finish_capture(True, "cleanup_failure", announce=False)
-    assert saved == [{"reason": cause.name.lower()}]
+    assert saved == [
+        {
+            "reason": cause.name.lower(),
+            "details": [
+                {"stage": "pause_stop", "exception_type": "RuntimeError", "message": "stop failed"}
+            ],
+        }
+    ]
 
 
 def test_tag_native_gradient_without_prior():

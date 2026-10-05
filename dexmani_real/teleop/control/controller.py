@@ -91,7 +91,9 @@ class TeleopController:
         return RobotCommand(run_id, realized.arm_qpos, realized.hand_qpos), True, realized.eef_pose
 
 
-def execute_control_step(controller, shared, robot, row, recorder=None):
+def execute_control_step(
+    controller, shared, robot, row, recorder=None, *, termination_details=None
+):
     epoch = int(shared.run_id.value)
     target, control_ok, intent = controller.compute_command(row, epoch)
     if recorder is not None:
@@ -125,6 +127,14 @@ def execute_control_step(controller, shared, robot, row, recorder=None):
                 robot.stop()
             except Exception as exc:
                 stop_error = exc
+                if termination_details is not None:
+                    termination_details.append(
+                        dict(
+                            stage="dispatch_stop",
+                            exception_type=type(exc).__name__,
+                            message=str(exc),
+                        )
+                    )
                 if failure is not None:
                     logger.exception("stop after dispatch also failed")
         elif result is not None:

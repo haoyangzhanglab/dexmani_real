@@ -3,7 +3,7 @@
 日期：2026-10-05（Asia/Shanghai）  
 主仓库：`haoyangzhanglab/dexmani_real`  
 协同仓库：`haoyangzhanglab/dexmani_policy`  
-状态：**必做软件整改与所列离线验证已完成；逐项结果、合成性能证据、DEFERRED 与未验证项目见文末执行记录。真机未验收。**
+状态：**D1–D10 历史验收记录保留；2026-10-06 追加 F1–F4 剩余问题消缺与验证，当前结果以文末本轮执行记录为准。真机未验收。**
 
 本文是独立任务书，不依赖聊天、PDF、临时反例脚本或其他机器上的文件。本任务范围内，本文取代前几轮方案中与之冲突的实施建议。不要重新执行旧根目录任务书的全部事项，不修改 `AGENTS.md` 的长期原则来迎合一次性方案。
 
@@ -566,3 +566,191 @@ Policy 删除 Reader 未使用的 logger/items、VQ 旧 episode_ends 兼容探�
 更新 README、执行/RTC/架构文档、导出时间说明和 normalizer 精度注释；明确新 Raw 的 RGB-D 最旧通道推进时刻与旧 Raw metadata 的解释边界。修正 VQ 脚本及 DQ-RISE YAML 中“全量统计自动匹配 Policy”的旧描述：VQ 仍按其原配方用全手部数据，Policy 用有效训练窗口的唯一 train 源行，兼容性校验保留；没有为文档一致而改统计范围。YAML 解析前后值完全一致。
 
 清理后实跑：Real `pytest -q tests` 为 118 PASS；Policy 非 CUDA/DDP 全量为 81 PASS、28 subtests PASS（原 historical data_identity warning 保留）；原生 TAG/DexPilot 对照 PASS；新增清理的 RGB/PC 继承构造器与默认模态用临时合成 Zarr 检查 PASS，`smoke_test --config-only dp dp3` PASS。两仓库 compile、Real 全量 Ruff、Policy 全部修改 Python 文件 Ruff、diff 检查 PASS。没有新增设备操作、训练、环境变更或 commit/push。
+
+
+## 2026-10-06：F1–F4 剩余验收问题消缺
+
+本轮开始时两个工作树均为 `main`、干净；Real HEAD `c55e9e88e27a6e907248b23cd0ee038cae6040e3`，Policy HEAD `c66ca759f2382ea82bab8eba84cdd7b779a32469`，origin 分别为 `https://github.com/haoyangzhanglab/dexmani_real.git` 与 `https://github.com/haoyangzhanglab/dexmani_policy.git`。根目录 AGENTS 是各仓库唯一适用规则文件，祖先目录无额外规则。HEAD 恰好等于本轮给定基线；没有 reset、checkout、环境升级、commit 或 push。此前 D1–D10 不重新实施，先前记录按历史事实保留。
+
+### 当前状态与修改责任
+
+| 项目 | 状态 | 成因、最小修改与证据 |
+| --- | --- | --- |
+| F1 | FIXED（软件） | Policy owner 原成功路径在 SDK 迟返回后清空 WAIT，且旧 `_within_budget` 只覆盖 episode。统一 owner 总预算 deadline，在派发返回后、推进状态前检查 episode/适用 WAIT；超时撤权、stop、单次记录真实 DispatchResult、完成 episode。输入/反馈/slot 截止继续只约束新 SDK 准入。WAIT 到期拒绝也归 TIMEOUT。当前 run 首因 latch 优先，取消异常不被最终 writer 失败掩盖。 |
+| F2 | FIXED（软件证据链） | Teleop 保留 per-capture `termination_details`，控制派发 stop、operator pause stop、segment/shutdown stop 与清理实际异常沿现有 finish 接口传入 writer；内容只有阶段/类型/说明。writer 发 STOP 前序列化稳定快照，final_meta 一次写出；新 capture 清空、正常结束不造错误。Policy 沿用 policy_trace；Replay 补回派发后 stop 失败的 outcome 详情。已发布后的 close/shutdown 仅在日志与会话异常表达。 |
+| F3 | FIXED（原生软件回归） | 旧独立 VQ 统计范围本就不同。新增 `--policy-config` / 重复 `--policy-override`；实际 Dataset 负责 split、观测 finite、action finite、dispatch、H/N 和唯一源行。只调用现有 build_normalizer 拟合 action，再按 joint=7+12 / EEF=9+12 提取 scale/offset 与输入统计。验证使用训练参数，不构造 Agent 或要求已有 codebook；aux 布局明确拒绝。独立 `--config` 配方保持不变，DQRISE 容差保持 rtol=1e-5、atol=1e-6。 |
+| F4 | FIXED（完成测量判断，保留既有读取实现） | 先从 Policy 当前 HEAD 导出 `/tmp/dexmani_policy_f4_baseline`，保存原 streaming 基线；旧 eager 对照使用原 `650f1e3` 导出源码。试验并复测批内 chunk 合并；实际数据+GPU 未显示供给瓶颈，因此撤回 33 行生产试验代码，最终 Dataset/sampler 无 diff。不新增 cache、全量 payload、预取配置或存储迁移。 |
+| 原 D1–D9 已过路径 | ALREADY_FIXED | 继续运行适用现有回归；保留 deadline 准入、DispatchInterrupted、双触觉独立性、绝对坐标/软逃离、标定取消/门限、视频帧身份、streaming normalizer 与 strict resume；本轮不重写这些机制。 |
+
+F1 先新增定向回归：205 ms WAIT / 200 ms 调用 / 240 ms 返回时，WAIT 和 episode 两种迟返回各失败一次，预算内两例通过；修复后新增案例全部通过。包含生产 DexManiRobot + fake SDK 的 arm 迟返回导致 hand NOT_CALLED、最后 hand 迟返回仍 ACCEPTED，300 ms 不再发送；已锁存 operator / ESTOP 与超时并存；stop、enqueue、finalization 失败均不重试末行，dispatch/end 事件各一次。故障 writer 不能保证成功发布，明确保留会话失败。
+
+F2 先把现有首因测试扩展到结束详情，operator/quit 两例均在修改前失败。随后覆盖 Teleop.run 的 S/Q 异常 finally 与原生 PyAV/HDF5 writer、正常停止无详情、SDK 中断后 stop 再失败、每次实际停止调用仅记录一次异常、下一 capture 无旧详情、原 EpisodeReader 可读无新字段的 Raw。模拟 final_meta 写盘失败时 Raw 不发布，staging 中已写派发行保留且仅一行；close 继续报告失败。Replay 测试覆盖首个 stop 失败而最终 stop 成功时仍保留错误说明。
+
+F3 新入口缺失的五个定向案例先失败，实施后通过。4 个 episode × 6 行、各 action 维等于源行号、H=3/N=1、val_ratio=.25/seed=42：实际 splitter 的验证集为第 0 个 episode，训练源行 6–23，旧 scale=2/23、新 scale=2/17；offset 同样与目标 Policy 一致。观测缺测与 dispatch 不合格触发真实窗口淘汰；常量维、limits/gaussian/action:auto、joint/EEF、只拟合 action、独立 VQ seed 不重划 split 均覆盖。使用随机初始化微型 VQ 的临时 checkpoint，经真实保存/加载、PCA 码本导出、实际 DQRISEAgent 初始化与严格兼容检查；主动改错 affine 参数会拒绝。没有训练真实模型或修改旧 checkpoint。使用率工具对新 artifact 使用保存的有效源行与原训练统计；历史 artifact 保留全量行行为。
+
+删除/保留取舍：删除重复 WAIT 时间判断，保留设备准入与 owner 总预算两个不同责任；结束详情只是 capture 内列表，未引入通用 finalizer；Policy/Replay 复用现有 trace/outcome。批量读取试验曾验证原索引顺序、所有权与增强 RNG 等价；因实际供给已充分而撤回，最终保持既有单样本消费路径。低维 VQ hand 数组显式保留，观测只做资格扫描，不额外拟合高维统计；strict affine、resume 和研究时间配方均未放宽。
+
+### DQ-RISE 可执行工作流
+
+在 Policy 根目录、现有 policy 环境执行下列命令；这些是用户后续训练命令，本轮只执行合成回归，没有启动它们对应的真实训练。
+
+```bash
+python -m scripts.training.train_vq_hand \
+  --policy-config dexmani_policy/configs/dqrise.yaml \
+  --policy-override task_name=pick_apple_messy \
+  --output_dir experiments/vq_hand/pick_apple_messy
+python -m scripts.training.extract_vq_codebook \
+  --checkpoint experiments/vq_hand/pick_apple_messy/vqvae_hand_best.pt \
+  --output robot_data/sorted_hand_poses_pick_apple_messy.npz
+python -m scripts.training.measure_vq_usage \
+  --checkpoint experiments/vq_hand/pick_apple_messy/vqvae_hand_best.pt \
+  --zarr robot_data/pick_apple_messy.zarr \
+  --codebook robot_data/sorted_hand_poses_pick_apple_messy.npz
+bash scripts/training/train.sh dqrise task_name=pick_apple_messy
+```
+
+变更数据路径、seed、split、H/N 或其他窗口条件时，VQ 的 `--policy-override` 与 Policy 训练覆盖保持一致。需要验证 split 的使用率时添加 `--split validation`。未提供 `--policy-config` 的旧独立工具不会自动改用新配方。
+
+
+### F4 性能对照、实际 data wait 与撤回优化的依据
+
+合成对照交错运行 before / trial_batched / eager，各 3 个独立进程，共 54 次；原始 JSON 中 after 指已撤回的批量读取试验，不是最终交付代码。读取同一个之前生成的临时合成 Zarr：4096 行、32 个 128 行 episode，point_cloud=(1024,6) float32、action_ee=21、joint_state=19；物理 chunk=32，压缩设置沿现有 benchmark。H=8/N_obs=2、无 padding/增强、val_ratio=0，共 3872 个有效窗口。随机序使用 Torch seed=42 的无放回 permutation；完整索引 SHA256 为 `0112cf5c2b54e2e804346c9ee41443f02420d91816fd39120b2f071a7c8e6153`，三版本完全一致。normalizer action scale sum 均为 `10.071537017822266`。
+
+batch=16 排除首批后测 128 批/2048 样本；batch=128 排除首批后读完剩余 3744 样本。workers=0 或 2；后者使用 spawn、persistent_workers、默认 prefetch_factor=2。Torch 主进程单线程；startup 单独包含 Dataset 资格扫描和 normalizer，first_batch 单独包含 worker 启动。batch wait 为连续消费 iterator 时的调用等待，不是 GPU 训练中的 data wait。
+
+| 顺序 / batch / workers | 原 streaming samples/s | 试验批量读取 samples/s | 旧 eager samples/s | 对原 streaming 变化 |
+| --- | ---: | ---: | ---: | ---: |
+| random / 16 / 0 | 4556 | 4538 | 158486 | -0.4% |
+| random / 16 / 2 | 7459 | 7184 | 44563 | -3.7% |
+| sequential / 16 / 0 | 20092 | 44453 | 170594 | +121.2% |
+| sequential / 16 / 2 | 18231 | 29983 | 45268 | +64.5% |
+| random / 128 / 0 | 4518 | 6597 | 161791 | +46.0% |
+| random / 128 / 2 | 8489 | 12435 | 129786 | +46.5% |
+
+以上为 3 次中位数。batch=128 是当前 DQ-RISE 配置的 batch 大小，本合成 H/窗口/无增强仍不是完整实际训练配方。统计出的批内物理 chunk 重复比例：随机 batch16=5.4%、顺序 batch16=90.9%、随机 batch128=38.4%。据此曾试验 sampler/base Dataset 的批内合并读取，共 33 行生产逻辑增量；按字段逐 chunk 读取后恢复原样本序，返回独立数组，增强/crop 沿原样本顺序消费随机数。没有增加缓存大小、重排 sampler、调整 worker/预取参数或改写存储。
+
+随机 batch16 收益不足，workers2 有 3.7% 回退；不声称普遍加速。后续实际数据+GPU 检查没有证明 data wait 瓶颈，故这些纯 DataLoader 数字不足以保留生产复杂度：最终撤回该试验，未加入按测试阈值切换路径的机制。旧 eager 纯 RAM 吞吐仍更高；不恢复全量高维常驻。
+
+| 顺序 / batch / workers | 原 streaming batch wait p50/p95/p99 ms | 试验批量读取 p50/p95/p99 ms |
+| --- | --- | --- |
+| random / 16 / 0 | 3.498/3.759/3.925 | 3.544/3.897/4.042 |
+| random / 16 / 2 | 2.117/4.305/5.093 | 2.160/4.776/5.366 |
+| sequential / 16 / 0 | 0.647/1.269/1.298 | 0.453/0.496/0.538 |
+| sequential / 16 / 2 | 0.750/2.135/2.534 | 0.471/1.209/1.765 |
+| random / 128 / 0 | 28.253/29.078/29.294 | 19.179/21.233/21.524 |
+| random / 128 / 2 | 5.836/29.579/30.393 | 3.834/21.361/22.938 |
+
+随机 batch128 的启动、RSS 与读取成本（3 次中位数）：
+
+| workers / 版本 | startup s | first batch s | 父 peak RSS MiB | 最大单 worker peak RSS MiB | chunk 处理次数 / 时间 s | 稳态读取 rchar MiB |
+| --- | ---: | ---: | ---: | ---: | --- | ---: |
+| 0 / before | 1.151 | 0.031 | 674.66 | 0.00 | 11983 / 0.323 | 2703.4 |
+| 0 / after | 1.146 | 0.023 | 680.41 | 0.00 | 7432 / 0.195 | 1713.1 |
+| 0 / eager | 1.190 | 0.002 | 835.42 | 0.00 | 0 / 0.000 | 0.0 |
+| 2 / before | 1.154 | 2.178 | 655.88 | 567.70 | 11550 / 0.332 | 2604.7 |
+| 2 / after | 1.154 | 2.184 | 655.64 | 572.07 | 7031 / 0.193 | 1655.2 |
+| 2 / eager | 1.171 | 2.285 | 937.91 | 657.50 | 0 / 0.000 | 0.0 |
+
+RSS 包含 Python/Torch 导入基础开销；批量中间数组只随当前 batch/字段增长，本轮随机 batch128 w0 peak 增加约 5.75 MiB、最大单 worker 增加约 4.37 MiB。chunk 处理计时包围真实 Zarr `_process_chunk`，包括原生解压及选择拷贝，不冒充纯 codec 时间；多 worker 时间为各进程累加，prefetch 会使计数边界包含在途批次。rchar 为 w0 主进程或 w2 worker 求和，含 I/O 系统调用与 IPC，不能全部视为压缩文件 payload；父计数在 shutdown/waitpid 前读取，避免混入回收 worker 的累计 I/O。全部父/worker 物理 read_bytes=0，因此只有页缓存条件下的数据；没有声称冷缓存性能。
+
+原始 54 组指标保留在 `/tmp/f4_final_results.json`；撤回前试验源码保留于 `/tmp/dexmani_policy_f4_trial`；可复现入口为 Policy `tests/benchmark_dataset_streaming.py`。本轮实际命令由 `/tmp/run_f4_final.py` 顺序调用下列组合（每组 3 次，版本交错）：
+
+```bash
+# SOURCE 分别取 /tmp/dexmani_policy_f4_baseline、/tmp/dexmani_policy_f4_trial、
+# /tmp/dexmani_policy_baseline_20261005（旧 eager 650f1e3）。
+PYTHONPATH="$SOURCE" "$P" tests/benchmark_dataset_streaming.py \
+  /tmp/dexmani_bench_large_20261005.zarr --order random --batch-size 128 --workers 2
+# 另测 random/16/0、random/16/2、sequential/16/0、sequential/16/2、random/128/0。
+```
+
+进一步核查发现，默认沙箱的 `nvidia-smi` 返回驱动不可访问，但获准的只读检查实际检测到 RTX 4090（24 GiB，约 22.3 GiB 空闲）。没有据默认沙箱错误断言主机缺少 GPU。现有 Torch 2.4.1+CUDA 12.4 / PyTorch3D 0.7.8 的微型 CUDA FPS 实跑通过；未升级环境。
+
+于是继续以已有 `robot_data/pick_apple_messy.zarr` 只读数据和实际 `dp3.yaml` 运行短程 data-wait 对照：共 21293 行/125 episode，Dataset 依 seed42 取最多 80 个训练 episode，12994 个有效窗口；H=16/N=2、pad_before=1/pad_after=7、joint action=19，保留配置中的全部增强。batch128、workers8、pin_memory、spawn、persistent_workers、prefetch_factor2；保留 BF16 autocast。数据存储的 point_cloud chunk100、Zstd level3，完整随机索引 SHA256=`578e3c3803dddd7f513b7ab6957e1184170d62fe3919be69c7c5eb772b41a132`，action scale sum=`54.4488639831543`，两版本相同。
+
+每进程 3 批预热、40 批测量，共 3 次配对重复。实际 DP3 模型随机初始化后只执行 H2D、compute_loss、backward，逐批清空梯度；不调用完整 Trainer、optimizer.step、EMA、torch.compile、DDP、评估或模型保存。未读取 checkpoint，也未改写数据。主循环不逐步同步 CUDA，只在预热末尾和测量末尾同步，以保留真实 CPU/GPU 重叠；CUDA events 单独测 H2D+forward/backward 和相邻 GPU 步间间隔。
+
+| 实际数据短程 GPU 工作负载（3 次中位数） | 原 streaming | 试验批量读取（已撤回） |
+| --- | ---: | ---: |
+| samples/s | 3976.3 | 4020.3 |
+| batch wait p50/p95/p99 ms | 0.228/0.333/0.387 | 0.220/0.309/0.332 |
+| H2D+forward/backward 平均 ms | 32.156 | 31.808 |
+| GPU 步间 p50/p95/p99 ms | 0.002/0.002/0.002 | 0.002/0.002/0.002 |
+| Dataset+normalizer 启动 s | 1.869 | 1.881 |
+| worker+GPU 三批预热 s | 8.978 | 8.937 |
+| 父 peak RSS MiB | 1634.49 | 1634.53 |
+| 最大单 worker peak RSS MiB | 574.24 | 582.56 |
+| GPU peak allocated MiB | 3350.98 | 3350.60 |
+
+所有 loss 有限。约 1.1% 的总吞吐差异随 GPU 计算耗时变化，未见可归因于数据饥饿的 GPU 步间间隔；CPU 等待本身也很小。本工作负载的原实现已经供给充分，故按任务要求撤回生产优化，避免只为纯 RAM/microbenchmark 数字增加机制。三次均是短程、未 compile、无 optimizer/EMA 的工作负载；没有独占 GPU/控制时钟频率，不把该结论扩展到完整训练、更快模型、其他 worker 数或其他数据。数据读前经过资格/统计扫描，未测冷缓存。
+
+实际命令（用获准 GPU 权限运行；SOURCE 分别为原 streaming 与上述试验源码，各三次）：
+
+```bash
+PYTHONPATH="$SOURCE" "$P" tests/benchmark_dataset_streaming.py \
+  robot_data/pick_apple_messy.zarr --gpu-config dexmani_policy/configs/dp3.yaml \
+  --order random --batch-size 128 --workers 8 --batches 40
+```
+
+原始 GPU 配对指标保留于 `/tmp/f4_gpu_results.json`，运行驱动为 `/tmp/run_gpu_pairs.py`。上述实际 data-wait 探针、合成 benchmark 和参数入口保留在现有 benchmark 文件；批量读取及其专用测试在撤回前已归档，最终交付没有该生产改动。
+
+### 本轮实际验证命令与结果
+
+`R`、`P`、`RUFF` 延用前文现有环境绝对路径，没有安装/升级依赖。F1/F2 使用 fake clock/SDK/键盘，调用真实 owner/control/recorder；F3/F4 使用原生 NumPy/Torch/Zarr、临时 checkpoint，Raw writer 使用原生 PyAV/HDF5。没有 AST 提取或替身函数冒充集成。
+
+| 层次 | 实际命令 / 范围 | 最终结果 |
+| --- | --- | --- |
+| Real 软件分支与原生离线 | `$R -m pytest -q tests` | PASS：141 passed，4.20 s。包括新增预算/结束详情与已有几何、标定、视频回归；全部硬件 I/O 为 fake。 |
+| Policy 软件与原生离线 | `$P -m pytest -q tests --ignore=tests/test_infra_cuda.py -o cache_dir=/tmp/dexmani_policy_pytest_cache` | PASS：92 passed、28 subtests passed，18.73 s（最终撤回后）；1 条已有 historical data_identity warning 保留。 |
+| 撤回前的原生 streaming 批量语义试验 | `$P -m pytest -q tests/test_streaming_dataset.py -o cache_dir=/tmp/dexmani_policy_pytest_cache` | PASS：19 passed；含 joint/EEF/aux、重复/逆序/padding、RGB dtype/crop、numpy+Torch RNG、所有权、spawn/fork/持久 worker。专用于撤回实现的 4 个用例也一并移出最终 diff，归档于 trial 源码。 |
+| Real 静态与语法 | `$R -m compileall -q dexmani_real examples tests`；`$RUFF check dexmani_real examples tests`；`$RUFF format --check dexmani_real examples tests`；`git diff --check` | PASS；125 文件格式检查通过。 |
+| Policy 修改文件静态 | 下列 6 个 Python 文件执行 `$RUFF check --no-cache ...`、`$RUFF format --check --no-cache ...`；`git diff --check` | PASS；没有调整 lint 规则或批量清理未改文件的既有债务。 |
+| Policy 语法 | `PYTHONPYCACHEPREFIX=/tmp/dexmani_policy_compile_cache $P -m compileall -q dexmani_policy scripts tests` | PASS。 |
+| 性能 | 上述 54 个合成对照进程，以及 6 个实际数据 GPU 短程对照进程 | PASS（完成测量与比较）；不等同于完整训练或真机通过。 |
+
+Policy 静态检查文件完整列表：`scripts/training/train_vq_hand.py`、`scripts/training/measure_vq_usage.py`、`dexmani_policy/agents/normalization.py`、`dexmani_policy/agents/core/dqrise.py`、`tests/test_policy_vq_alignment.py`、`tests/benchmark_dataset_streaming.py`。
+
+### 条件项、未验证与阻断
+
+| 项目 | 状态 | 缺少的实施证据 |
+| --- | --- | --- |
+| B1 mount -15/-5 mm | DEFERRED | 实物 adapter 与同名 frame 的测量真值；本轮不改数值。 |
+| R3-4 fixed-grid | DEFERRED | 明确实验需求和真实时间分布；继续 recorded_rows，不新增 recipe 标签破坏 resume。 |
+| O06 静态几何/历史 FK | DEFERRED | 实际热点占比；Dataset 解码 profile 不能替代 FK profile。 |
+| O07 TAG fixed-base | DEFERRED | 替代方案的 FK/frame、解析梯度、收敛与 p95 对照；已有原生梯度验证不等于替代方案验证。 |
+| O08 HOME | DEFERRED | 搜索/整形/执行分项 profile 及固件实际轨迹；完整路径检验保留。 |
+| O13 radius graph | DEFERRED | 性能、薄/小物体保留率、空云率、几何误差；不提前 cap 改拓扑。 |
+| O14 RTC scheduler cache | DEFERRED | 实际重复配置或 GPU scalar 同步成本；保持算法、步系数与梯度。 |
+
+本轮 F1/F2 终止与可持久化证据链、F3 新流程软件缺口已消除，没有依赖阻断的必做软件项。F4 已按实际短程 GPU 工作负载证据保留原读取实现；无为了清单而保留的无依据优化。
+
+真机全部 NOT VERIFIED：停止确认、SDK 阻塞/模式恢复/撤权时延、真实传感器冻结、HOME 实际轨迹、触觉无接触假设与物理通道行为、相机/桌面/安装标定精度。未运行完整 CUDA/DDP 套件、完整训练、真实机器人任务评测或冷缓存性能；已经完成的微型 CUDA 后端与既有数据短程 GPU data-wait 单独计为 PASS，不能替代这些未验证项；不把软件通过作为安全证明。writer/发布失败仍可能只能保留 staging 与会话异常，不承诺故障 writer 能记录其全部失败。已发布 Raw 不回写。
+
+### 两仓库交付范围
+
+Real：Policy owner 总预算和派发收尾；Teleop 控制/runner 的结束详情；recorder 快照与可选 final_meta；Replay outcome；对应 3 个回归文件、README、执行文档和本任务书。
+
+Policy：VQ 准备入口/使用率工具与命令文档、现有 normalizer 手动字段的输入统计转交、DQRISE 错误指引；现有 benchmark 的随机采样、等待分布、RSS/I/O/chunk 成本与 GPU data-wait 入口；Dataset/sampler 批量读取试验已撤回，无最终 diff。`tests/test_policy_vq_alignment.py` 为本轮新增文件。未修改 Real/Policy 分工，不修改 site-packages 或既有实验数据。
+
+可审查内容保留在两个当前工作树；包含新增测试的补丁分别导出到 `/tmp/dexmani_real_F1_F4.patch`、`/tmp/dexmani_policy_F1_F4.patch`。HEAD 保持开头两 SHA，无 commit/push。
+
+补丁验证：两份补丁均在各自 HEAD 的 `/tmp` archive 副本中执行 `git apply --check`，结果 PASS；没有应用到用户工作树。两个工作树各 11 个修改/新增文件，Policy 补丁包含未跟踪的新回归文件。
+
+### 后续清理记录（2026-10-06）
+
+本次仅清理已确认的冗余与过时描述，保留上述 F1–F4 实现、历史验收记录和条件项证据要求：
+
+- Policy VQ 入口把已解析的目标配置直接交给训练函数，删除第二次 Hydra 配置解析；数据准备和 CLI 参数使用同一份配置。调整已有 CLI 回归以检查传入的配置，独立 VQ 命令用法不变。
+- 使用率工具仅在加载外部码本的分支创建空 `CodebookManager`，删除提取分支中随即被覆盖的分配。
+- benchmark 的函数与局部变量改用 chunk processing 命名；修正仅支持合成数据、无 GPU 工作负载的过时说明。计时范围和输出指标不变，不把选择拷贝成本称为纯解压。
+- Real 执行文档分别说明 SDK 调用资格与 owner 总预算终止，合并重复的首因/附加故障说明。Policy README 精简统计细节，服务器文档使用当前模块入口，删除迁移过程式描述。
+
+保留旧独立 VQ 的全量 hand 统计配方及 shell 入口，因为它仍是明确支持的研究复现路径；保留严格 affine 校验、异常证据和任务书历史，它们不是废弃机制。没有新增 Dataset 缓存或批量读取优化，没有改变动作、筛选、归一化或增强语义。
+
+清理后的实际检查：
+
+- `$R -m pytest -q tests`：PASS，141 passed，4.24 s。
+- `$P -m pytest -q tests --ignore=tests/test_infra_cuda.py -o cache_dir=/tmp/dexmani_policy_pytest_cache`：PASS，92 passed、28 subtests passed，18.73 s；1 条已有 historical data_identity warning。
+- Real `ruff check`、`ruff format --check`（125 文件），Policy 上述 6 个修改 Python 文件的同项检查，以及两仓库 `compileall`：PASS。Ruff 均使用 `--no-cache`，Policy 编译缓存仍位于 `/tmp`；检查范围同前表。
+- `$P tests/benchmark_dataset_streaming.py /tmp/dexmani_bench_large_20261005.zarr --order random --batch-size 16 --workers 2 --batches 2`：PASS，仅 CPU 多 worker 路径 smoke；返回 32 个样本和有效 chunk 计数/计时，不据此更新性能结论。
+
+两仓库 HEAD 不变，未 commit/push；未运行任何真机操作或新的 GPU 工作负载。前述性能结论、DEFERRED 清单与未验证边界不变。

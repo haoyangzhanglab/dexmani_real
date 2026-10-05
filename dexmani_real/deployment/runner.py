@@ -117,12 +117,18 @@ class PolicyRunner:
             require_rgb_cloud_identity=self.requires_rgb_cloud_identity,
         )
 
+    def _budget_deadline_ns(self):
+        deadlines = []
+        if self.run_id is not None:
+            if self.max_running_s is not None:
+                deadlines.append(self.started_ns + int(self.max_running_s * 1e9))
+            if self.wait_started_ns is not None:
+                deadlines.append(self.wait_started_ns + int(self.execution.max_wait_s * 1e9))
+        return min(deadlines) if deadlines else None
+
     def _within_budget(self):
-        return (
-            self.run_id is None
-            or self.max_running_s is None
-            or time.monotonic_ns() - self.started_ns < int(self.max_running_s * 1e9)
-        )
+        deadline = self._budget_deadline_ns()
+        return deadline is None or time.monotonic_ns() < deadline
 
     def _dispatch_deadline_ns(self, row, slot):
         deadlines = [
@@ -134,10 +140,9 @@ class PolicyRunner:
             for times in self.plan.sources.values()
             for stamp in times
         )
-        if self.max_running_s is not None:
-            deadlines.append(self.started_ns + int(self.max_running_s * 1e9))
-        if self.wait_started_ns is not None:
-            deadlines.append(self.wait_started_ns + int(self.execution.max_wait_s * 1e9))
+        budget_deadline = self._budget_deadline_ns()
+        if budget_deadline is not None:
+            deadlines.append(budget_deadline)
         return min(deadlines)
 
     def _has_motion_authority(self):
@@ -191,7 +196,14 @@ class PolicyRunner:
                 self.robot.stop()
         except Exception as exc:
             error = exc
-            self.events.append(dict(event="stop_failure", run_id=epoch, detail=str(exc)))
+            self.events.append(
+                dict(
+                    event="stop_failure",
+                    run_id=epoch,
+                    exception_type=type(exc).__name__,
+                    detail=str(exc),
+                )
+            )
         try:
             if self.recorder is not None:
                 self.recorder.policy_trace = {"execute": self.execute, "events": self.events}
@@ -520,8 +532,11 @@ class PolicyRunner:
             return
         valid_until_ns = self._dispatch_deadline_ns(row, slot)
         if time.monotonic_ns() >= valid_until_ns:
-            self._invalidate("dispatch_feedback_or_budget")
             self._record(row)
+            if not self._within_budget():
+                self._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
+            else:
+                self._invalidate("dispatch_feedback_or_budget")
             return
         result, failure = None, None
         if self.execute:
@@ -529,6 +544,9 @@ class PolicyRunner:
                 result = self.robot.send_action(command, valid_until_ns=valid_until_ns)
             except (DispatchError, DispatchInterrupted) as exc:
                 result, failure = exc.result, exc
+        # Admission deadlines only govern entry into each SDK. Total owner budgets
+        # also govern completion; an accepted late return remains ACCEPTED evidence.
+        timed_out = not self._within_budget()
         cancelled = isinstance(failure, DispatchInterrupted)
         accepted = (
             result is not None
@@ -544,10 +562,12 @@ class PolicyRunner:
             hand=int(result.hand) if result else 0,
             logical_consume=not self.execute,
         )
-        failed = failure is not None or (
-            self.execute and self.execution.execution_mode != "sync" and not accepted
+        failed = (
+            timed_out
+            or failure is not None
+            or (self.execute and self.execution.execution_mode != "sync" and not accepted)
         )
-        stop_error = None
+        stop_error = record_error = None
         try:
             if failed:
                 if cancelled:
@@ -555,11 +575,9 @@ class PolicyRunner:
                 reason = (
                     RunEndReason.ESTOP
                     if cancelled
-                    else (
-                        RunEndReason.TIMEOUT
-                        if not self._within_budget()
-                        else RunEndReason.EXECUTOR_BOUNDARY
-                    )
+                    else RunEndReason.TIMEOUT
+                    if timed_out
+                    else RunEndReason.EXECUTOR_BOUNDARY
                     if failure is not None and failure.revoked
                     else RunEndReason.HARDWARE_FAULT
                 )
@@ -568,7 +586,7 @@ class PolicyRunner:
                     self.robot.stop()
                 except Exception as exc:
                     stop_error = exc
-                    self._event("stop_failure", detail=str(exc))
+                    self._event("stop_failure", exception_type=type(exc).__name__, detail=str(exc))
                     if failure is not None:
                         logger.exception("stop after dispatch also failed")
             elif not self.execute or (result is not None and result.continued):
@@ -578,21 +596,34 @@ class PolicyRunner:
             try:
                 self._record(row, command, result)
             except Exception as exc:
-                if failure is not None:
-                    logger.exception("recording after dispatch also failed")
-                    raise failure from exc
-                raise
+                record_error = exc
+                self._event("recording_failure", exception_type=type(exc).__name__, detail=str(exc))
+                logger.exception("recording after dispatch failed")
         if failed:
-            self._finish_episode(
-                "dispatch_cancelled" if cancelled else "dispatch_unconfirmed_or_failed",
-                run_end_reason=reason,
-                stop_motion=False,
+            error = (
+                failure
+                if cancelled or (failure is not None and not failure.revoked)
+                else stop_error or record_error
             )
-            if cancelled or (failure is not None and not failure.revoked):
-                raise failure
-            if stop_error is not None:
-                raise stop_error
+            try:
+                self._finish_episode(
+                    "dispatch_cancelled"
+                    if cancelled
+                    else "dispatch_return_timeout"
+                    if timed_out
+                    else "dispatch_unconfirmed_or_failed",
+                    run_end_reason=reason,
+                    stop_motion=False,
+                )
+            except Exception as exc:
+                if error is not None:
+                    raise error from exc
+                raise
+            if error is not None:
+                raise error
             return
+        if record_error is not None:
+            raise record_error
         if slot + 1 == plan.segment_end and self.execution.execution_mode == "sync":
             self.plan = None
 
@@ -615,11 +646,6 @@ class PolicyRunner:
         now = time.monotonic_ns()
         if not self._within_budget():
             self._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
-            return
-        if self.wait_started_ns is not None and now - self.wait_started_ns >= int(
-            self.execution.max_wait_s * 1e9
-        ):
-            self._finish_episode("wait_timeout", run_end_reason=RunEndReason.TIMEOUT)
             return
         if now < self.next_step_ns:
             return
@@ -755,12 +781,18 @@ class PolicyRunner:
                     self.robot.stop()
             except Exception as exc:
                 failure = failure or exc
+                logger.exception("policy shutdown stop failed after episode finalization")
             if self.recorder is not None:
                 try:
                     self.recorder.close()
                 except Exception as exc:
                     failure = failure or exc
-            self.model.close()
+                    logger.exception("policy recorder close failed after episode finalization")
+            try:
+                self.model.close()
+            except Exception as exc:
+                failure = failure or exc
+                logger.exception("policy model worker close failed")
         if failure is not None:
             raise failure
 

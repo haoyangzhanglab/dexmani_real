@@ -84,6 +84,7 @@ class TeleopRunner:
         self.resume_after_ns = 0
         self.quit_pending = False
         self.pending_termination_reason = None
+        self.termination_details = []
         self.control_run_id = None
         self.next_tick = 0.0
         self.control_dt = 1 / self.runtime.teleop.control_hz
@@ -101,12 +102,21 @@ class TeleopRunner:
                 return RunEndReason(int(self.shared.run_ended_reason.value)).name.lower()
         return fallback
 
+    def _stop_motion(self, stage):
+        try:
+            self.robot.stop()
+        except Exception as exc:
+            self.termination_details.append(
+                dict(stage=stage, exception_type=type(exc).__name__, message=str(exc))
+            )
+            raise
+
     def _pause_control(self, reason, *, run_end_reason=RunEndReason.OPERATOR, stop_motion=True):
         revoke_motion(self.shared, reason=run_end_reason)
         if self.pending_termination_reason is None:
             self.pending_termination_reason = self._end_reason(reason)
         if stop_motion:
-            self.robot.stop()
+            self._stop_motion("pause_stop")
         if self.controller is not None:
             self.controller.clear_reference()
         self.paused, self.resume_requested = True, False
@@ -118,10 +128,11 @@ class TeleopRunner:
         reason = self._end_reason(self.pending_termination_reason or reason)
         published = None
         if save:
-            published = self.recorder.save_episode(reason=reason)
+            published = self.recorder.save_episode(reason=reason, details=self.termination_details)
         else:
             self.recorder.discard_episode(reason=reason)
         self.pending_termination_reason = None
+        self.termination_details = []
         if announce:
             self.audio.play("save" if published is not None else "discard")
 
@@ -155,7 +166,7 @@ class TeleopRunner:
         if self.resume_requested:
             return
         revoke_motion(self.shared)
-        self.robot.stop()
+        self._stop_motion("segment_stop")
         self.paused = True
         if self.recorder is not None and self.recorder.is_recording:
             self._finish_capture(True, "pause")
@@ -183,6 +194,7 @@ class TeleopRunner:
             )
         self.capture_started_s = time.monotonic()
         self.pending_termination_reason = None
+        self.termination_details = []
         # Disk finalization/START may block. Never anchor to observations from
         # before that boundary or append across the operator's wall-clock pause.
         self.resume_after_ns = time.monotonic_ns()
@@ -278,7 +290,12 @@ class TeleopRunner:
 
     def _execute_control_step(self, row):
         control_ok, result, interrupted = execute_control_step(
-            self.controller, self.shared, self.robot, row, self.recorder
+            self.controller,
+            self.shared,
+            self.robot,
+            row,
+            self.recorder,
+            termination_details=self.termination_details,
         )
         if interrupted:
             logger.info("teleop interrupted: dispatch=%s", result)
@@ -476,7 +493,7 @@ class TeleopRunner:
             revoke_motion(self.shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
             try:
                 if self.robot._motion_active or self.robot._hand_stop_pending:
-                    self.robot.stop()
+                    self._stop_motion("shutdown_stop")
             except Exception as exc:
                 if failure is None:
                     failure = exc
@@ -487,6 +504,13 @@ class TeleopRunner:
             except Exception as exc:
                 if failure is None:
                     failure = exc
+                self.termination_details.append(
+                    dict(
+                        stage="reference_cleanup",
+                        exception_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                )
                 logger.exception("teleop reference cleanup failed")
             try:
                 if self.recorder is not None:

@@ -739,3 +739,154 @@ def test_future_finishes_while_reading_observation(make_runner):
     r.tick(b + 3)
     assert len(r.robot.sent) == count + 1
     assert not any(e.get("reason") == "handoff_miss" for e in r.events)
+
+
+@pytest.mark.parametrize("budget", ["wait", "episode"])
+@pytest.mark.parametrize("late", [False, True])
+def test_dispatch_return_checks_total_budget(make_runner, budget, late):
+    r = make_runner(wait=0.205 if budget == "wait" else 1.0)
+    if budget == "episode":
+        r.max_running_s = 0.205
+    rows = []
+    r._record = lambda row, command=None, result=None: rows.append((command, result))
+    send = r.robot.send_action
+
+    def delayed(command, **kwargs):
+        result = send(command, **kwargs)
+        r.clock.now += 40_000_000 if late else 4_000_000
+        return result
+
+    r.robot.send_action = delayed
+    bootstrap(r)
+    assert len([entry for entry in rows if entry[0] is not None]) == 1
+    assert rows[-1][1] == r.robot.result
+    if late:
+        assert r.run_id is None
+        assert r.shared.run_ended_reason.value == int(RunEndReason.TIMEOUT)
+        assert r.robot.stops == 1
+        r.tick(3)
+        assert len(r.robot.sent) == 1
+    else:
+        assert r.run_id == 1
+        assert r.wait_started_ns is None
+        assert not r.robot.stops
+
+
+@pytest.mark.parametrize("cause", [RunEndReason.OPERATOR, RunEndReason.ESTOP])
+def test_late_return_preserves_already_latched_cause(make_runner, cause):
+    from dexmani_real.runtime.safety import revoke_motion_if_run_id
+
+    r = make_runner(wait=0.205)
+
+    def send(command, **kwargs):
+        r.robot.sent.append(command)
+        revoke_motion_if_run_id(r.shared, r.run_id, reason=cause)
+        r.clock.now += 40_000_000
+        if cause == RunEndReason.ESTOP:
+            raise DispatchInterrupted(r.robot.result)
+        return r.robot.result
+
+    r.robot.send_action = send
+    if cause == RunEndReason.ESTOP:
+        with pytest.raises(DispatchInterrupted):
+            bootstrap(r)
+    else:
+        bootstrap(r)
+    assert r.shared.run_ended_reason.value == int(cause)
+    assert r.completed == 1
+
+
+@pytest.mark.parametrize("stop_fails,record_fails", [(True, False), (False, True), (True, True)])
+def test_late_return_cleanup_records_once(make_runner, stop_fails, record_fails):
+    r = make_runner(wait=0.205)
+    rows, saved = [], []
+
+    def send(command, **kwargs):
+        r.robot.sent.append(command)
+        r.clock.now += 40_000_000
+        return r.robot.result
+
+    def stop():
+        r.robot.stops += 1
+        if stop_fails:
+            raise TimeoutError("STOP_TIMEOUT")
+
+    def record(row, command=None, result=None):
+        if command is not None:
+            rows.append(result)
+            if record_fails:
+                raise OSError("writer failed")
+
+    r.robot.send_action = send
+    r.robot.stop = stop
+    r._record = record
+    r.recorder = NS(check_error=lambda: None, save_episode=lambda **kw: saved.append(kw))
+    with pytest.raises((TimeoutError, OSError)):
+        bootstrap(r)
+    assert rows == [r.robot.result]
+    assert saved == [dict(reason="timeout")]
+    assert r.completed == 1 and r.run_id is None
+    assert len([e for e in r.events if e["event"] == "dispatch"]) == 1
+
+
+@pytest.mark.parametrize("late_device,expected", [("arm", (1, 0)), ("hand", (1, 1))])
+def test_wait_deadline_between_real_sdk_calls(make_runner, monkeypatch, late_device, expected):
+    from test_review_remediation import fake_robot
+
+    robot, clock, _ = fake_robot(monkeypatch)
+    r = make_runner(wait=0.205)
+    robot.shared = r.shared
+    calls = []
+
+    def call(name):
+        calls.append(name)
+        if name == late_device:
+            r.clock.now += 40_000_000
+        return 0 if name == "arm" else DispatchStatus.ACCEPTED
+
+    robot.arm.servo = lambda q: call("arm")
+    robot.hand.send_action = lambda q: call("hand")
+    r.robot.send_action = robot.send_action
+    rows = []
+    r._record = lambda row, command=None, result=None: (
+        rows.append(result) if command is not None else None
+    )
+    bootstrap(r)
+    assert len(rows) == 1
+    assert (rows[0].arm, rows[0].hand) == expected
+    assert calls == (["arm"] if late_device == "arm" else ["arm", "hand"])
+    assert r.shared.run_ended_reason.value == int(RunEndReason.TIMEOUT)
+    assert r.completed == 1 and r.run_id is None
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_late_return_writer_finalization_failure_keeps_dispatch_and_end(make_runner, cancelled):
+    from dexmani_real.recording.recorder import RecordingError
+
+    r = make_runner(wait=0.205)
+    rows = []
+    r._record = lambda row, command=None, result=None: (
+        rows.append(result) if command is not None else None
+    )
+
+    def send(command, **kwargs):
+        r.clock.now += 40_000_000
+        if cancelled:
+            raise DispatchInterrupted(r.robot.result)
+        return r.robot.result
+
+    def save(**kwargs):
+        raise RecordingError("publish failed; staging retained")
+
+    r.robot.send_action = send
+    r.recorder = NS(check_error=lambda: None, save_episode=save)
+    with pytest.raises(DispatchInterrupted if cancelled else RecordingError):
+        bootstrap(r)
+    assert rows == [r.robot.result]
+    events = r.recorder.policy_trace["events"]
+    assert len([e for e in events if e["event"] == "dispatch"]) == 1
+    assert len([e for e in events if e["event"] == "end"]) == 1
+    assert r.completed == 1 and r.run_id is None
+    assert r.shared.run_ended_reason.value == (
+        RunEndReason.ESTOP if cancelled else RunEndReason.TIMEOUT
+    )
