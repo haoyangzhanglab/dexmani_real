@@ -1,11 +1,12 @@
 """Pinocchio self and static-environment collision checks for xArm7 + XHand.
 
 Both models share xarm7_xhand.srdf: arm-arm and arm-hand checks, with
-hand self-collision disabled.
+hand self-collision disabled. Collision checks use nominal URDF geometry;
+the physical hand mount compensation belongs only to real-pose FK.
 
 Usage::
 
-    cm = CollisionModel(hand_mount=(position_m, quaternion_wxyz))
+    cm = CollisionModel()
     cm.check_self_collision(qpos)          # bool
     cm.check_self_collision_details(qpos)  # CollisionInfo
 """
@@ -30,15 +31,9 @@ from dexmani_real.robot.model import (
     XHAND_URDF_JOINT_NAMES,
 )
 from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
-from dexmani_real.utils.log import ThrottledWarner, get_logger
+from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-_collision_detail_warn = ThrottledWarner(interval_s=60.0)
-
-_COLLISION_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)  # 7-DOF (hand fixed)
-_FULL_URDF = str(XARM7_XHAND_RIGHT_URDF_PATH)  # 19-DOF (7 arm + 12 hand)
-_COLLISION_SRDF = str(XARM7_XHAND_SRDF_PATH)  # unified SRDF (single source)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,17 +95,13 @@ class CollisionModel:
 
     hand_dof=False uses the 7-DOF collision URDF with a fixed hand;
     hand_dof=True uses the full URDF with qpos = [arm(7), hand(12)].
-    urdf_path/srdf_path override the models; package_dir resolves meshes.
+    Both use the repository's original URDF, meshes and shared SRDF.
     """
 
     def __init__(
         self,
         hand_dof: bool = False,
         *,
-        hand_mount,
-        urdf_path: str | None = None,
-        srdf_path: str | None = None,
-        package_dir: str | None = None,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
     ) -> None:
@@ -119,14 +110,12 @@ class CollisionModel:
         self._pin = pin
         self._hand_dof = hand_dof
 
-        pkg = package_dir or str(XHAND_MODEL_DIR)
-        _urdf = urdf_path or (_FULL_URDF if hand_dof else _COLLISION_URDF)
-        _srdf = srdf_path or _COLLISION_SRDF
+        urdf_path = str(
+            XARM7_XHAND_RIGHT_URDF_PATH if hand_dof else XARM7_XHAND_COLLISION_URDF_PATH
+        )
+        package_dirs = [str(XHAND_MODEL_DIR)]
 
-        from .kinematics.urdf import urdf_with_hand_mount
-
-        xml = urdf_with_hand_mount(_urdf, *hand_mount)
-        self._model = pin.buildModelFromXML(xml)
+        self._model = pin.buildModelFromUrdf(urdf_path)
         if hand_dof:
             active = sorted(
                 (
@@ -142,19 +131,17 @@ class CollisionModel:
                 raise ValueError("collision model active q order must be xArm7 + XHand URDF joints")
         self._data = self._model.createData()
 
-        self._collision_model = pin.buildGeomFromUrdfString(
-            self._model, xml, pin.GeometryType.COLLISION, package_dirs=[pkg]
+        self._collision_model = pin.buildGeomFromUrdf(
+            self._model, urdf_path, pin.GeometryType.COLLISION, package_dirs=package_dirs
         )
 
-        # Add all pairs, then apply SRDF exclusions.
+        # Include geometries sharing a parent joint; only SRDF excludes pairs.
         import itertools
 
         n = self._collision_model.ngeoms
         for i, j in itertools.combinations(range(n), 2):
             self._collision_model.addCollisionPair(pin.CollisionPair(i, j))
-        pin.removeCollisionPairs(self._model, self._collision_model, _srdf)
-
-        # SRDF disables hand-hand pairs; arm↔hand pairs remain active.
+        pin.removeCollisionPairs(self._model, self._collision_model, str(XARM7_XHAND_SRDF_PATH))
 
         self._collision_data = self._collision_model.createData()
 
@@ -169,8 +156,8 @@ class CollisionModel:
         if len(box_names) != len(set(box_names)):
             raise ValueError("static collision box names must be unique")
         if normalized_boxes or self._table is not None:
-            self._environment_collision_model = pin.buildGeomFromUrdfString(
-                self._model, xml, pin.GeometryType.COLLISION, package_dirs=[pkg]
+            self._environment_collision_model = pin.buildGeomFromUrdf(
+                self._model, urdf_path, pin.GeometryType.COLLISION, package_dirs=package_dirs
             )
             self._robot_environment_geom_count = int(self._environment_collision_model.ngeoms)
             from hppfcl.hppfcl import Box
@@ -226,9 +213,6 @@ class CollisionModel:
             if self._environment_collision_model is not None
             else None
         )
-        self._static_boxes = normalized_boxes
-        self._environment_obstacle_count = len(normalized_boxes) + int(self._table is not None)
-
         self._nq: int = self._model.nq
         logger.debug(
             "CollisionModel ready: %d DOF%s, %d geometries, %d self pairs, "
@@ -237,7 +221,7 @@ class CollisionModel:
             " (7 arm + 12 hand)" if hand_dof else "",
             self._collision_model.ngeoms,
             len(self._collision_model.collisionPairs),
-            len(self._static_boxes),
+            len(normalized_boxes),
             "calibrated" if self._table is not None else "disabled",
             len(self._environment_collision_model.collisionPairs)
             if self._environment_collision_model is not None
@@ -258,7 +242,7 @@ class CollisionModel:
 
     @classmethod
     def _normalize_static_box(cls, box: Any) -> dict[str, Any]:
-        """Validate and copy a dataclass, frozen config node, or mapping box."""
+        """Validate and copy a dataclass or mapping box."""
         raw_name = cls._box_value(box, "name")
         if not isinstance(raw_name, str):
             raise TypeError("static collision box name must be a string")
@@ -404,7 +388,7 @@ class CollisionModel:
         return self._pin_update(qpos, stop_at_first=True)
 
     def minimum_hand_frame_z(self, arm_qpos: np.ndarray) -> float:
-        """Return the lowest XHand link-frame origin in robot-base coordinates.
+        """Return the lowest nominal XHand link-frame origin in robot-base coordinates.
 
         Uses set_hand_qpos in 19-DOF mode, or the fixed hand in 7-DOF mode.
         Callers must add a mesh-extent margin: frame origins are not surface points.
@@ -430,31 +414,21 @@ class CollisionModel:
         has_any = self._pin_update(qpos, stop_at_first=False)
         if not has_any:
             return CollisionInfo.no_collision()
-        # Some hpp-fcl builds cannot convert collisionResults through pybind11;
-        # keep collision detection authoritative even if pair details are absent.
-        try:
-            results = self._collision_data.collisionResults
-            pairs: list[CollisionPair] = []
-            for i in range(len(results)):
-                cr = results[i]
-                if cr.isCollision():
-                    cp = self._collision_model.collisionPairs[i]
-                    pairs.append(
-                        CollisionPair(
-                            link_name1=self._get_geom_link_name(cp.first),
-                            link_name2=self._get_geom_link_name(cp.second),
-                            object_name1=self._collision_model.geometryObjects[cp.first].name,
-                            object_name2=self._collision_model.geometryObjects[cp.second].name,
-                            collision_type="pinocchio",
-                        )
-                    )
-        except TypeError:
-            # A binding failure hides pair details, not the model's collision result.
-            _collision_detail_warn(
-                "collisionResults type conversion failed — collision detected "
-                "but pair details unavailable (hpp-fcl build limitation)"
+        pairs: list[CollisionPair] = []
+        for pair_index, pair in enumerate(self._collision_model.collisionPairs):
+            if not self._pin.computeCollision(
+                self._collision_model, self._collision_data, pair_index
+            ):
+                continue
+            pairs.append(
+                CollisionPair(
+                    link_name1=self._get_geom_link_name(pair.first),
+                    link_name2=self._get_geom_link_name(pair.second),
+                    object_name1=self._collision_model.geometryObjects[pair.first].name,
+                    object_name2=self._collision_model.geometryObjects[pair.second].name,
+                    collision_type="pinocchio",
+                )
             )
-            return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
         if not pairs:
             # Missing diagnostic pairs must not override the model's collision result.
             return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
@@ -464,7 +438,7 @@ class CollisionModel:
 
     @property
     def has_static_environment(self) -> bool:
-        return self._environment_obstacle_count > 0
+        return self._environment_collision_model is not None
 
     @property
     def has_table(self) -> bool:
@@ -499,7 +473,7 @@ class CollisionModel:
         return minimum_m
 
     def check_environment_collision(self, qpos: np.ndarray) -> bool:
-        """Return whether robot geometry touches any configured static box."""
+        """Return whether nominal robot geometry touches a configured box or table."""
         if not self.has_static_environment:
             self._to_full_qpos(qpos)  # preserve finite/shape validation
             return False
@@ -604,8 +578,3 @@ class CollisionModel:
         if parent_frame < len(self._model.frames):
             return self._model.frames[parent_frame].name
         return geom.name
-
-    @property
-    def hand_dof(self) -> bool:
-        """Whether this model includes active hand joints (19-DOF vs 7-DOF)."""
-        return self._hand_dof

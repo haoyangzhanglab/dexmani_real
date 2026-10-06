@@ -64,7 +64,6 @@ def run_keyboard_experiment(runtime, *, no_hand):
     clean = False
     try:
         planner = XArm7MotionPlanner.create_default(
-            hand_mount=(runtime.hand.T_eef_handbase_pos_xyz, runtime.hand.T_eef_handbase_quat_wxyz),
             online_ik_profile=make_online_ik_config(
                 runtime,
                 max_pose_error_pos_m=cfg.ik_max_pose_error_pos_m,

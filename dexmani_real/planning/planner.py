@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -32,8 +31,6 @@ __all__ = [
 
 @dataclass(kw_only=True)
 class XArm7PlannerConfig:
-    urdf_path: str
-    srdf_path: str
     eef_link_name: str = "custom_eef_link"
     base_pose_world: Pose = field(default_factory=Pose.identity)
     use_convex: bool = False
@@ -60,7 +57,8 @@ class XArm7MotionPlanner:
     """Online IK and collision-checked home planning.
 
     ``kin`` owns FK/Jacobians, ``ik_geometry`` owns joint/IK geometry, and
-    ``collision_model`` owns the 19-DOF collision model.
+    ``collision_model`` owns the 19-DOF collision model. Planning and collision
+    validation use nominal URDF geometry, independent of real-pose compensation.
     """
 
     def __init__(
@@ -70,7 +68,6 @@ class XArm7MotionPlanner:
         online_ik_profile: OnlineIKConfig | None = None,
         hand_dof: bool = True,
         *,
-        hand_mount,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
     ) -> None:
@@ -93,31 +90,20 @@ class XArm7MotionPlanner:
 
         joint_vel_limits = np.deg2rad(np.asarray(config.joint_vel_limits_deg, dtype=np.float64))
         joint_acc_limits = joint_vel_limits * float(config.joint_acc_scale)
-        if not os.path.exists(config.srdf_path):
+        if not XARM7_XHAND_SRDF_PATH.is_file():
             raise FileNotFoundError(
-                f"planner SRDF does not exist: {config.srdf_path}; "
-                "generate model assets explicitly before starting the runtime"
+                f"planner SRDF does not exist: {XARM7_XHAND_SRDF_PATH}; "
+                "restore repository model assets before starting the runtime"
             )
 
-        from pathlib import Path
-        from tempfile import TemporaryDirectory
-
-        from .kinematics.urdf import urdf_with_hand_mount
-
-        # MPLib 0.2.1 loads model and meshes in its constructor; no later file reads.
-        with TemporaryDirectory(prefix="dexmani-mount-") as directory:
-            temporary_urdf = Path(directory) / "robot.urdf"
-            temporary_urdf.write_text(
-                urdf_with_hand_mount(config.urdf_path, *hand_mount, mesh_directory=directory)
-            )
-            self.mplib_planner = self.mplib.Planner(
-                urdf=str(temporary_urdf),
-                srdf=str(config.srdf_path),
-                move_group=config.eef_link_name,
-                use_convex=config.use_convex,
-                joint_vel_limits=joint_vel_limits.tolist(),
-                joint_acc_limits=joint_acc_limits.tolist(),
-            )
+        self.mplib_planner = self.mplib.Planner(
+            urdf=str(XARM7_XHAND_COLLISION_URDF_PATH),
+            srdf=str(XARM7_XHAND_SRDF_PATH),
+            move_group=config.eef_link_name,
+            use_convex=config.use_convex,
+            joint_vel_limits=joint_vel_limits.tolist(),
+            joint_acc_limits=joint_acc_limits.tolist(),
+        )
         self.pinocchio_model = self.mplib_planner.pinocchio_model
 
         link_names = list(self.pinocchio_model.get_link_names())
@@ -171,7 +157,6 @@ class XArm7MotionPlanner:
         # Pinocchio checks online IK endpoints and planned home paths.
         self.collision_model = CollisionModel(
             hand_dof=hand_dof,
-            hand_mount=hand_mount,
             static_boxes=static_boxes,
             table=table,
         )
@@ -192,20 +177,14 @@ class XArm7MotionPlanner:
     def create_default(
         cls,
         *,
-        hand_mount,
         planning_profile: MotionPlanningConfig | None = None,
         online_ik_profile: OnlineIKConfig | None = None,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
     ) -> "XArm7MotionPlanner":
         """Build online IK and home planning with canonical assets and an identity base pose."""
-        cfg = XArm7PlannerConfig(
-            urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
-            srdf_path=str(XARM7_XHAND_SRDF_PATH),
-        )
         return cls(
-            cfg,
-            hand_mount=hand_mount,
+            XArm7PlannerConfig(),
             planning_profile=planning_profile,
             online_ik_profile=online_ik_profile,
             static_boxes=static_boxes,

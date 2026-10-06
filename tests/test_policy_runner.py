@@ -74,7 +74,7 @@ class Robot:
 def make_runner(monkeypatch):
     factory = ActionRealizer.for_mode
     # Scheduling oracles use a collision-free synthetic scene; native admission
-    # and mount propagation are covered separately with actual model assets.
+    # and real-pose compensation are covered separately with actual model assets.
     monkeypatch.setattr(
         ActionRealizer,
         "for_mode",
@@ -484,11 +484,7 @@ def test_eef_runner_prefix_uses_real_fk_and_same_joint_command(make_runner):
     from dexmani_real.robot.action import ActionRealizer
 
     r = make_runner(mode="rtc", n=1)
-    from dataclasses import replace
-
     cfg = ExperimentConfig()
-    # Explicit nominal test asset, not the current physical mount.
-    cfg = replace(cfg, hand=replace(cfg.hand, T_eef_handbase_pos_xyz=(-0.005, 0, 0)))
     q = np.asarray(cfg.arm.home_qpos)
     hand = np.deg2rad(cfg.hand.home_qpos_deg)
     r.runtime = cfg

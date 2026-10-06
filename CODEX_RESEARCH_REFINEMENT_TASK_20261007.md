@@ -43,7 +43,7 @@ SHA 只定位证据，**不是 reset/checkout 目标**。检查当前 HEAD 与�
 
 明确裁决：
 
-1. 旧文档“暂不生成运行期 URDF”在 T01 有一个限定例外：只把当前 mount 送进现有模型，不发展生成框架。
+1. T01 区分真实位姿补偿与标称碰撞几何：碰撞/规划直接读取原始资产，不生成运行期 URDF。撤销此前要求所有模型统一使用真机 mount 的方案。
 2. 独立公开入口与连接前验证继续保留；T08 不要求 `validate` 在全仓只出现一次。
 3. 删除无需求的模式 setter 后，不再维护其“切换后重验”路径；初始化 warmup/预算与三模式算法保留。
 4. 先单独完成新路径导出/revision，再重构 export。旧风格建议的“不要同时改 overwrite”是拆分 diff 的要求，不是保留 overwrite 的理由。
@@ -57,7 +57,7 @@ SHA 只定位证据，**不是 reset/checkout 目标**。检查当前 HEAD 与�
 4. `RobotCommand` owned/不可变；RTC prefix 必须对应同一份 frozen physical command，拒绝时失效，不重新求解/投影成另一条命令。
 5. Raw 发布后不可变；保留失败前缀、真实终止主因、缺测 NaN、selected target 和部分 dispatch；仅显式 discard 删除当前 capture。writer/编码/发布失败保留 staging。
 6. 公共导出仍为全部 13 字段；模型只检查实际使用的 N 步观察、H 步动作与 dispatch 资格。禁止辅助缺测自动删整段、补零、黑图、静默插值或内部坏行压紧后重拼窗口。
-7. 当前 mount/桌面/运动学按当前配置；相机用数据对应的内外参/depth scale；触觉不二次扣 bias。不引入历史 calibration ABI。
+7. 真实位姿 FK 与桌面使用当前配置；碰撞/规划使用原始标称资产。相机用数据对应的内外参/depth scale；触觉不二次扣 bias。不引入历史 calibration ABI。
 8. 保留训练集唯一源行统计、val 复用 train normalizer、checkpoint 保存的表示/normalizer、dt/N/H/A 和 RTC 适用条件；不以 tensor shape 代替数值语义。
 9. 不顺手改模型、控制频率、动作表示、smoothing、fallback、自动恢复或研究超参数。在线端点自碰撞检查不是连续轨迹/环境避碰证明；Raw replay 不等于在线 ActionRealizer 路径。
 10. 动态事实在实际副作用边界复核；静态资源在按需构造/首次使用时核查；纯派生统计离线完成。不新增每 checkpoint 全量数据哈希或全传感器统一 strict gate。
@@ -66,7 +66,7 @@ SHA 只定位证据，**不是 reset/checkout 目标**。检查当前 HEAD 与�
 
 | 顺序 | 工作包 | 覆盖 | 处理要求 |
 | --- | --- | --- | --- |
-| 1 | T01 当前几何单源 | U01 | P0；先做，实物参数另行确认 |
+| 1 | T01 安装补偿与标称碰撞几何分离 | U01 | P0；真实 FK 保留 -15 mm，碰撞/规划保留原始 URDF -5 mm |
 | 2 | T02 共享目标准入 | U02、U16 | P0 主项；依赖 T01 的正确几何；手部谓词小改用独立 diff |
 | 3 | T03 标定有效性 | U03、U04 | P1；与 T01/T02 可独立修改 |
 | 4 | T04 attempt/session 结果 | U05 | P1；先定义结果生命周期，再改相关控制结构 |
@@ -80,30 +80,25 @@ SHA 只定位证据，**不是 reset/checkout 目标**。检查当前 HEAD 与�
 
 每包结束更新简短状态：`DONE / ALREADY_FIXED / RETAINED / BLOCKED`，验证另列 `PASS / FAIL / NOT_VERIFIED`；未复现问题标 `NOT_REPRODUCED`。`RETAINED` 必须给当前证据和理由，不能用于跳过明确缺陷。不要为每个 helper 建一个独立项目或测试框架。文中的 helper 名称是推荐实现，行为边界与验收才是硬要求；当前源码存在更短且等价的组织方式时可采用，并说明取舍，不机械增加函数或类。
 
-## 3. T01：当前 mount 进入所有真实几何模型
+## 3. T01：真实位姿补偿与标称碰撞几何分离
 
-### 3.1 已确认事实与选定方案
+### 3.1 已确认背景与用途边界（2026-10-07 修正）
 
-当前 `config/hardware.py::HandParams` 的平移为 `(-0.015,0,0)m`，完整机器人 URDF 的 mount 为 `(-0.005,0,0)m`；两组姿态×五个指尖的原生 FK 差约 10 mm。这证明模型分歧，**不证明哪个数值符合实物**。
+用户确认真机打印转接件比原始 URDF 对应转接件薄 10 mm。真实手基座/指尖 FK 继续使用 `runtime.hand.T_eef_handbase_pos_xyz=(-0.015,0,0)m` 与 `T_eef_handbase_quat_wxyz`，表示 `custom_eef_link -> right_hand_link`、m、wxyz；recording、feature FK 和 export 的当前配置传递保持。
 
-唯一配置来源继续使用 `runtime.hand.T_eef_handbase_pos_xyz` 和 `T_eef_handbase_quat_wxyz`，表示 `custom_eef_link -> right_hand_link`、m、wxyz。保留当前配置值作为现行输入；不擅自把 -5 或 -15 mm 宣称为量测真值。代码一致性和离线验证可以完成，重新启用相关真机运行前需要操作者确认实际尺寸/方向。
+项目约定碰撞与规划使用原始 URDF 的标称几何（mount `(-0.005,0,0)m`）。Pinocchio 完整手/固定手模型、自碰撞/环境 geometry，以及 MPLib 规划与 Pinocchio 后验检查直接加载原始 URDF、网格和 SRDF，不注入真机安装补偿。两种用途的安装平移不同是有意约定，不能要求其手基座或五指 frame 一致。
 
-选定实现是一个小型纯 URDF XML helper，例如 `planning/kinematics/urdf.py::urdf_with_hand_mount`：
+此前只改 mount、保留原厚度 `flange.STL` 的方案混淆了用途，导致默认 HOME 的 flange/thumb 假碰撞。撤销 URDF XML 改写 helper、临时规划 URDF 及 `CollisionModel`、`XArm7MotionPlanner/create_default` 的 `hand_mount` 参数传递；覆盖 action、HOME、相机标定和 keyboard teleop 构造入口。DexPilot 重定向的临时模型仍有独立用途，保留。
 
-1. 读取已有 URDF 模板，仅定位唯一 `right_hand_mount_joint`；确认 fixed 类型、parent/child，覆写 origin xyz/rpy。缺少/重复 joint 报错。
-2. 保留关节名、active q 顺序、limits、SRDF 和其他几何。把相对 mesh 路径相对原模板目录解析，不能相对临时目录解析。
-3. Pinocchio model/geometry 消费同一份解析后 XML。当前核查的 Pinocchio 2.7 有 `buildModelFromXML`、`buildGeomFromUrdfString`；实施时确认实际安装 API，不能偷偷升级依赖。
-4. MPLib 的 filename API 使用限定作用域临时 URDF；确认构造后是否还读取文件，临时资源生命周期覆盖所有真实读取。不要持久化生成资产、建磁盘缓存，或把临时路径写入数据身份。
-5. 同时覆盖 full 19-DOF collision 模型和 fixed-hand 7-DOF MPLib 模型，以及 self/environment geometry。**只改 Frame.placement 不合格**，因为 fixed joint 折叠后子 joint 与 collision placements 也受影响。
-
-明确传参进入 `CollisionModel`、`XArm7MotionPlanner/create_default`；搜索并更新所有真实构造者，至少包括 `robot/action.py::for_mode`、`robot/arm_homing.py::build_policy_home_planner`、`calibration/camera/session.py::_build_planner`、`teleop/keyboard_session.py`。feature FK/export 继续消费相同 runtime 来源。生产路径不静默退回 URDF nominal mount；模型测试若使用 nominal asset，须显式说明。
+不改变 `custom_eef_link`、机械臂 FK/IK、动作坐标系、关节顺序、实际手姿更新、关节限制、跳变门槛、碰撞拦截和执行授权。不修改 URDF/SRDF/网格、HOME、阈值或碰撞白名单，不新增模式开关。
 
 ### 3.2 验收
 
-- 两组以上非零 arm/hand 姿态，feature fingertip 与 full model 的五指 frame 对齐；旋转文本精度统一后，位置容差可用 `1e-6 m`。
-- 用两个不同的非零平移/旋转 mount，验证参数确实到达 self/environment 和 MPLib 的手基座几何；不能只验证默认配置。
-- SDK→URDF 顺序不变、mesh 可加载、临时文件不泄漏；不要把旧错误几何的碰撞 pair 数量冻结为 oracle。
-- 实物 mount 与真机碰撞/停止验证明确 `NOT_VERIFIED`。
+- 相同 arm/hand 关节状态下，运行时自碰撞/环境碰撞及全部 mesh placements 与直接加载原始 URDF 的参考一致，覆盖完整手模型和固定手模型。
+- 默认 HOME 无上述假自碰撞；使用原始模型独立确认的碰撞反例检查 joint/frozen 拒绝和规划后验拦截。撤销“默认 HOME 必须因安装补偿被拒绝”的验收要求。
+- 默认 -15 mm 及两个不同的非零平移/旋转补偿只影响真实手基座/指尖 FK；验证 deployment observation 与 dataset processing 传递，碰撞/规划模型保持原始几何。
+- 回归控制、MPLib 规划、FK/IK、HOME 合成桌面检查，并确认模型资产无差异。
+- 仅离线验证；实际几何、连续轨迹、环境避碰及停止行为仍为 `NOT_VERIFIED`，不能用离线通过证明真机安全。
 
 ## 4. T02：共享已实现目标准入，保持各执行路径语义
 
@@ -135,8 +130,8 @@ U16 同包但独立小改：`XHand._validate_action` 复用 `check_hand_target` 
    -0.4494161931238594]
   ```
 
-  先用修正后的原生模型确认碰撞，再断言被碰撞 gate 拒绝；避免仅因 jump 先拒就误称测到了碰撞判据。旧反例含 base-link6/base-link7 碰撞，不依赖手 mount 分歧。
-- 覆盖 π 跨支绝对差、joint 无 IKResult 的拒绝、frozen 手姿切换、非法目标不进 SDK。在 T01 修正后的同一几何与状态下，原先接受且通过新增 gate 的 joint/eef/frozen 命令保持数值；新增 gate 拒绝旧路径曾放行的目标是预期行为变更，分别验收，不要求新旧接受集合相同。
+  先直接加载原始 URDF 确认碰撞，再断言被碰撞 gate 拒绝；避免仅因 jump 先拒就误称测到了碰撞判据。旧反例含 base-link6/base-link7 碰撞，不依赖手 mount 分歧。
+- 覆盖 π 跨支绝对差、joint 无 IKResult 的拒绝、frozen 手姿切换、非法目标不进 SDK。在 T01 指定的标称几何与相同关节状态下，原先接受且通过新增 gate 的 joint/eef/frozen 命令保持数值；新增 gate 拒绝旧路径曾放行的目标是预期行为变更，分别验收，不要求新旧接受集合相同。
 - 非法 hand 不得先发送 arm；直接 driver 和停止路径仍拒非法目标；partial dispatch、late ACCEPTED、deadline/epoch 既有 oracle 不变。
 
 ## 5. T03：标定激励检查与 PnP 失败处理
@@ -342,7 +337,7 @@ T06 已能输出缺测统计后，可删 writer 仅用于末尾 missing_tactile 
 
 | 目标 | 可复用的当前测试（相对 tests/） | 需要补充的真实风险 |
 | --- | --- | --- |
-| T01/T02 | `test_policy_eef.py`：native FK/IK、frozen FK；`test_review_remediation.py::test_absolute_hw_distance` | 两 mount 多姿态传播；joint/碰撞拒绝分开；frozen 手姿和无 IKResult 拒绝 |
+| T01/T02 | `test_policy_eef.py`：native FK/IK、frozen FK；`test_review_remediation.py::test_absolute_hw_distance` | 标称 full/fixed 碰撞参考对照；真实 FK 补偿传播与模型独立；joint/碰撞拒绝分开；frozen 手姿和无 IKResult 拒绝 |
 | T02/T09 | `test_policy_runner.py::test_fixed_handoff_and_prefix`、`test_old_future_blocks_new_episode_reset`、`test_future_finishes_while_reading_observation`、`test_slow_observation_read_breaks_history_even_without_full_slot_skip` | 新原因贯通；改结构不改 slot、WAIT、prefix |
 | SDK/异常 | `test_review_remediation.py::test_dispatch_deadline_at_last_boundary`、`test_last_sdk_late_return_keeps_accepted`；`test_policy_runner.py::test_wait_deadline_between_real_sdk_calls`、`test_late_return_cleanup_records_once` | 非法 hand 不先发 arm；保持 partial dispatch、首异常和恰好一次记录 |
 | T03 | `test_review_remediation.py::test_handeye_selects_qualified_candidate`、`test_calibration_cancel_after_solve_does_not_publish` | 退化/充分激励、坐标不变性、PnP False/None；旧 mock 需提供有意义的非退化输入，不能绕新 gate |
@@ -402,7 +397,7 @@ Policy 使用其自己的既有定向/config-only 检查；先核实当前入口
 
 | 项 | 最终状态 | 落点、证据与边界 |
 | --- | --- | --- |
-| U01 | DONE / PASS；实物 NOT_VERIFIED | `planning/kinematics/urdf.py` 将当前 mount 传入 Pinocchio model/self/environment geometry 和临时 MPLib URDF；所有生产构造者显式传参。RR `test_current_mount_reaches_native_geometry`：两个非零平移/旋转、两组非零姿态、五指 FK 1e-6 m 对齐，临时文件删除后仍可 FK；坏拓扑拒绝。 |
+| U01 | 原方案验收撤销；修正 DONE / 离线 PASS | 删除 mount 注入与临时 URDF；碰撞/规划直接加载原始标称资产，真实 FK 保留 -15 mm。用途边界与原始资产参考回归位于 `tests/test_collision_geometry.py`，见第 19 节。 |
 | U02 | DONE / PASS | `robot/action.py`、`kinematics/ik.py` 共享绝对目标差/限位准入；joint 只创建 CollisionModel，EEF 保留候选选择与其配置阈值，frozen 使用该命令手姿。RR jump/独立碰撞/自定义 EEF jump，RV absolute_hw_distance，PR 无 IKResult 拒绝与 frozen/RTC 回归。 |
 | U03 | DONE / PASS；阈值实测 NOT_VERIFIED | `camera/solver.py` 两轴相对旋转激励，配置与 summary metadata 显式保留。RR 重复/平移/同轴/小幅拒绝及两轴已知解、坐标旋转/轴符号不变；RV RMS 与取消不发布。 |
 | U04 | DONE / PASS；overlay ALREADY_FIXED | 检测路径拒绝 PnP False/None/非有限/错误形状；RR `test_pnp_failure_is_missing` 含正常解。原 `solver.py` preview 已按 ok 绘制，不重复改写。 |
@@ -419,7 +414,7 @@ Policy 使用其自己的既有定向/config-only 检查；先核实当前入口
 | U15 | DONE / PASS | `EpisodeReader` 生命周期缓存字段集合和按需校验后的 Dataset 引用；close 失效。RR 坏布局/关闭与原生分块导出；不跨文件或预读所有数组。 |
 | U16 | DONE / PASS | XHand driver 复用 `check_hand_target`；Robot 双侧预检和各 SDK 前动态复核保留。RR 非法手目标在 arm SDK 前拒绝，RV/PR partial/late/deadline 回归。 |
 | U17 | DONE / PASS | `CameraIntrinsics.from_dict` 保留序列语法，数值归 __post_init__；RGBD 去重复转换。RR 字符串 distortion 拒绝，合法 roundtrip 保持。 |
-| U18 | DONE / PASS | `CollisionModel` 无 table/boxes 时不构造第二套环境 geometry；有环境沿用同份修正 XML。RR 有/无环境及原生 HOME 合成桌面检查。 |
+| U18 | DONE / PASS | `CollisionModel` 无 table/boxes 时不构造第二套环境 geometry；有环境直接加载同份原始 URDF。RR 有/无环境及原生 HOME 合成桌面检查。 |
 | U19 | DONE / PASS | 移除 writer 的 missing_tactile 状态与重复全数组扫描；统计由 U08 提供。WR/导出仍保存真实 NaN、配对和 dispatch；未宣称实测加速。 |
 | U20 | DONE / PASS | Query/Plan 置前并明确类型/槽位；提取 handoff/prefetch/command_for_slot，执行 owner 保留发送和失败收尾顺序。PR sync/async/RTC、两次 poll、漏槽、WAIT、prefix、部分发送 oracle 通过。 |
 | U21 | DONE / PASS | Teleop `compute_target→ActionRealization`、`commit_dispatched_target`，执行层建 RobotCommand；控制 tick/收尾提取。提交仍按未 interrupted 且 result 非空，RV/WR 取消、一次记录、首异常与 stop 失败通过。 |
@@ -453,7 +448,7 @@ Policy 使用其自己的既有定向/config-only 检查；先核实当前入口
 
 验证平台 Linux x86_64；既有环境 NumPy 1.26.4、SciPy 1.15.3、Pinocchio 2.7.0、MPLib 0.2.1、Zarr 2.18.3、PyAV 17.1.0。早期迭代中的格式/测试失败已修复并复跑；没有把未运行、deselected 或历史探针计作本次 PASS。
 
-**实物与资产边界**：当前配置 mount `(-0.015,0,0)m` 进入完整模型后，当前 HOME 姿态报 `flange_link_0/right_hand_thumb_bend_link_0` 自碰撞。代码拒绝此配置下的该目标；没有修改 mount、HOME、SRDF 或阈值迎合测试。接受路径的原生回归明确使用 nominal 合成 mount，不能用其通过证明实物可运行。重新启用前须量测/确认实际 mount 方向尺寸与碰撞接触关系；实际 geometry、连续路径/环境避碰、停止延迟、传感器时间差和 GPU/owner 联合时序均 **NOT_VERIFIED**。
+**实物与资产边界（修正）**：撤销此前把默认 HOME 的 flange/thumb 自碰撞视为正确拒绝的结论。该结果来自将 -15 mm 真实安装补偿与原厚度 flange 网格混用；碰撞/规划现按约定使用原始 -5 mm 标称模型。真实位姿仍用 -15 mm。实际 geometry、连续路径/环境避碰、停止延迟、传感器时间差和 GPU/owner 联合时序均 **NOT_VERIFIED**。
 
 真实 trial 清单与论文 group_unit、缺测/gap 对真实样本规模的影响、旧 Raw/checkpoint 的依赖覆盖均 **NOT_VERIFIED**。条件决策后续需要：Raw 路径/布局/字段与论文使用关系、canonical revision/有序 episode id/已确认 trial_id/group_unit、checkpoint 对应 resolved cfg/data_recipe/data_identity 及是否要求 exact resume。U34 需要原失败 PyAV 版本、输入/编码参数和错误输出。没有代码级权限或依赖阻断；上述条件只阻断真实资产结论或真机验收，不影响本次已完成的离线实施。
 
@@ -483,15 +478,40 @@ RUFF=/home/zhanghaoyang/miniconda3/envs/real_robot/bin/ruff
 | --- | --- |
 | 修复前 `$REAL_PY -m pytest -q -p no:cacheprovider tests/test_policy_runner.py -k query_evidence_preserves_floating_output --tb=short` | **6 failed、2 passed、78 deselected，0.34 s**；六个失败均为拒绝后 NPZ 无 query，明确复现遗漏。 |
 | 修复后 `$REAL_PY -m pytest -q -p no:cacheprovider tests/test_policy_runner.py tests/test_policy_recording.py` | **99 passed，2.09 s**。 |
-| `$REAL_PY -m pytest -q -p no:cacheprovider tests` | **198 passed，13.18 s，无 skip**；包括此前审查中受 pyrealsense2 和 Policy 导入阻断的测试，以及当前 mount 的原生碰撞拒绝回归。 |
+| `$REAL_PY -m pytest -q -p no:cacheprovider tests` | **198 passed，13.18 s，无 skip**；包括此前审查中受 pyrealsense2 和 Policy 导入阻断的测试，以及当时的 mount 碰撞拒绝回归（该验收结论现撤销，见第 19 节）。 |
 | `$POLICY_PY -m pytest -q -p no:cacheprovider tests/test_research_split.py tests/test_policy_windows.py tests/test_infra_resume.py -k 'research_split or policy_windows or rng_device_and_revision'` | **26 passed、5 deselected，3.26 s**；未选中项不计通过。 |
 | `$POLICY_PY dexmani_policy/smoke_test.py --config-only dp dp3 dqrise r3d multitask_dit` | **5 个配置全部 PASS**；未启动训练。 |
 | `$REAL_PY -m py_compile dexmani_real/deployment/runner.py tests/test_policy_runner.py` | PASS。 |
 | `$RUFF format --check dexmani_real/deployment/runner.py tests/test_policy_runner.py`；`$RUFF check dexmani_real/deployment/runner.py tests/test_policy_runner.py` | 两项 PASS。 |
 | 两仓库 `git diff --check` | PASS。 |
 
-**HOME：模型拒绝复验 PASS；实物 NOT_VERIFIED。** 离线 Python 探针使用默认 `ExperimentConfig`、joint `ActionRealizer` 和 Pinocchio，未创建设备连接。当前 mount 平移 `(-0.015,0,0)m`、四元数 wxyz `(0.707107,0,0.707107,0)`、手部 HOME（SDK 顺序，度）`(30,55.33,10,0.17,1.08,5,1.25,5,1.33,5,1.33,5)` 产生 `self_collision`。最初通过 `collisionResults` 枚举碰撞对的探针因现有 hpp-fcl 绑定类型转换限制而断言失败；随后用同一原生模型已更新的 geometry，通过 `pin.computeCollision(model, data, pair_index)` 逐对核对，确认唯一命中 `flange_link_0/right_hand_thumb_bend_link_0`。未修改既有诊断降级行为或环境来消除限制。
+**HOME：旧拒绝验收撤销。** 此前探针在被改写的 URDF 中检出的 `flange_link_0/right_hand_thumb_bend_link_0` 碰撞，不能作为原始标称模型或实物碰撞证据。其根因是注入真实安装补偿却保留原厚度 flange 网格。现恢复直接加载原始模型，验收改为默认 HOME 无此假碰撞，且独立碰撞反例仍被拦截；本次验证见第 19 节。
 
-关闭实物阻断需要操作者提供并确认：① `custom_eef_link` 到 `right_hand_link` 的实际安装变换（坐标方向、平移单位和旋转约定）；② 实际手部 HOME 姿态及关节顺序；③ 上述碰撞对的几何与实际接触/间隙关系。现有证据不能判定实物确有碰撞，也不能归责于 mount、mesh 或 SRDF。保留拒绝与原回归，未改 mount、HOME、mesh、SRDF 或阈值；nominal mount 的合成通过不能替代验收。真机安全、真实 Raw/checkpoint 和论文资产恢复仍未验证；本轮无代码权限/依赖阻断，未连接设备、执行 HOME/replay/rollout/采集/真实标定，未训练、DDP 或修改既有实验产物。
+用户已明确 10 mm 差异的物理背景和两类用途，撤销旧“保留 HOME 拒绝与原回归”的要求。-15 mm 继续用于真实手基座/指尖，碰撞/规划使用原始 -5 mm 标称资产；不修改 HOME、mesh、SRDF 或阈值。真机安全、真实 Raw/checkpoint 和论文资产恢复仍未验证；不连接设备、执行 HOME/replay/rollout/采集/真实标定或修改既有实验产物。
 
-收尾后相关清理：CollisionModel 直接复用 `robot.model` 的手部维数/SDK→URDF 索引，删除重复私有别名；replay 删除旧 `h5 = reader` 别名和迁移过程注释。修正碰撞注释中的实物暗示，README 与执行文档明确 NPZ 保留被拒绝预测、严格 JSON、保存失败与当前模式比较方法。保留仍有用途的旧 Raw 缺测/dispatch 读取、旧配置恢复及已复现绑定限制下的碰撞诊断降级；Policy 无改动。清理后再次执行上表 Real 全量离线 pytest 命令：**198 passed，12.83 s，无 skip**；对 `runner.py`、`planning/collision.py`、`replay/trajectory.py`、`tests/test_policy_runner.py` 执行 py_compile、Ruff check/format --check 均 PASS，两仓库 diff 检查 PASS。未新增测试框架、改变控制/数据语义或执行硬件命令。
+收尾后相关清理：CollisionModel 直接复用 `robot.model` 的手部维数/SDK→URDF 索引，删除重复私有别名；replay 删除旧 `h5 = reader` 别名和迁移过程注释。修正碰撞注释中的实物暗示，README 与执行文档明确 NPZ 保留被拒绝预测、严格 JSON、保存失败与当前模式比较方法。旧 Raw 缺测/dispatch 读取和旧配置恢复仍有用途；碰撞详情现统一使用原生逐对查询，见第 19 节。Policy 无改动。清理后再次执行上表 Real 全量离线 pytest 命令：**198 passed，12.83 s，无 skip**；对 `runner.py`、`planning/collision.py`、`replay/trajectory.py`、`tests/test_policy_runner.py` 执行 py_compile、Ruff check/format --check 均 PASS，两仓库 diff 检查 PASS。未新增测试框架、改变控制/数据语义或执行硬件命令。
+
+## 19. 安装补偿与碰撞用途修正（2026-10-07）
+
+**DONE / 离线 PASS；真机 NOT_VERIFIED。** Pinocchio model/self/environment 和 MPLib 直接读取原始 URDF、网格、SRDF；碰撞/规划入口不再接收真实安装补偿，不保留 URDF 改写或规划临时文件逻辑。真实手基座/指尖 FK 保留当前 -15 mm 配置及 recording、deployment、processing 传递；DexPilot 的独立临时模型逻辑保留。未改模型资产、HOME、关节顺序、阈值、白名单或执行授权机制。
+
+`tests/test_collision_geometry.py` 用直接读取原始资产的独立参考验证 full/fixed 模型：默认 HOME、已知碰撞反例与两组非零 arm/hand 姿态，自碰撞/环境碰撞及全部 mesh placements 一致，包含远处障碍和手旁接触障碍；逐对详情与命中对数量也与参考一致。参考使用既有“全部几何对再应用 SRDF”的规则；不以 Pinocchio `addAllCollisionPairs` 对同一 parent joint 的额外排除改变现有碰撞对。
+
+默认配置和两组不同平移/旋转补偿验证真实指尖 observation/processing 的数值及参数传递；默认真实手基座相对标称模型沿 EEF X 轴偏移 -10 mm，碰撞/规划手基座保持标称位姿，`custom_eef_link` 保持原始定义。默认 HOME 的 joint/frozen/EEF/FK-IK 回归通过；原始模型碰撞反例仍被 joint/frozen 与规划后验检查拒绝。实际调用 MPLib 规划 HOME 附近路径并按现有终点误差限值验收，不改变其采样或阈值。
+
+后续清理：碰撞模型与规划配置移除仓库无调用者的 URDF/SRDF/mesh 路径覆盖参数、路径别名及冗余状态；固定手/完整手选择保留。自碰撞详情改用环境碰撞已使用的原生 `computeCollision` 逐对查询，删除 `collisionResults` 类型转换兼容分支及专用限频警告；碰撞布尔结果保持权威，详情异常不会变成放行。删除与原始资产反例回归重复的旧碰撞测试片段，保留 jump、手姿更新及 HOME 准入测试。
+
+使用既有 `real_robot` 环境，未安装或升级依赖。以下为修复与清理完成后的最终验证，历史章节测试计数不作为本次结果：
+
+| 实际命令（仓库根目录） | 结果 |
+| --- | --- |
+| `PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/tmp/dexmani-mount-cleanup-mpl /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m pytest -q -p no:cacheprovider tests --tb=short` | **203 passed，22.84 s，无 skip**；包含原生 Pinocchio/MPLib、FK/IK、控制与授权、合成桌面路径及离线数据回归。 |
+| `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m compileall -q dexmani_real examples` | PASS。 |
+| `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/ruff format --check dexmani_real examples tests` | PASS，131 个文件。 |
+| `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/ruff check dexmani_real examples tests` | PASS。 |
+| `git diff --check` | PASS。 |
+| `git diff --exit-code HEAD -- assets/robots`；`git status --short -- assets/robots` | 无差异、无新增资产。 |
+
+另以纯离线探针构造 `build_policy_home_planner(ExperimentConfig())` 和 `calibration.camera.session._build_planner(ExperimentConfig())`：核对 MPLib 原始资产路径、设置手部 HOME 关节后检查默认 HOME 无自碰撞，两个入口均 PASS。仅构造模型，未启动 session 或设备。
+
+真实设备连接、实际 HOME/规划执行、连续轨迹安全、真实环境避碰和停止行为未验证；离线通过不是真机安全证明。未修改实验数据、提交或推送。

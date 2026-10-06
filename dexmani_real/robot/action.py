@@ -51,10 +51,6 @@ class ActionRealizer:
             raise ValueError("action mode must be joint or eef")
         planner = (
             XArm7MotionPlanner.create_default(
-                hand_mount=(
-                    runtime.hand.T_eef_handbase_pos_xyz,
-                    runtime.hand.T_eef_handbase_quat_wxyz,
-                ),
                 online_ik_profile=make_online_ik_config(runtime),
             )
             if mode == "eef"
@@ -64,13 +60,7 @@ class ActionRealizer:
         if mode == "joint":
             from dexmani_real.planning.collision import CollisionModel
 
-            collision = CollisionModel(
-                hand_dof=True,
-                hand_mount=(
-                    runtime.hand.T_eef_handbase_pos_xyz,
-                    runtime.hand.T_eef_handbase_quat_wxyz,
-                ),
-            )
+            collision = CollisionModel(hand_dof=True)
         return cls(runtime, planner, collision)
 
     def _joint_rejection(self, target, hand, current, previous):

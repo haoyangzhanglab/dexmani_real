@@ -283,7 +283,7 @@ deterministic 分支使用 fixed_indices，不创建 Manager，不读取 epoch p
 
 | 项目 | 当前决定 | 进入实施的必要证据 |
 | --- | --- | --- |
-| B1 / #17，10 mm mount 差异 | 本次不修改 -15/-5 mm，不生成临时 URDF，不建立模型配置框架。 | 实物 adapter 与同名 frame 定义/测量确认；然后让当前 mount 真值一致供 FK 与碰撞消费。具体最小机制依据届时模型加载 API 选择。 |
+| B1 / #17，10 mm mount 差异 | 本次不修改 -15/-5 mm，不生成临时 URDF，不建立模型配置框架。 | 转接件薄 10 mm 的用途已明确：真实手基座/指尖使用 -15 mm，碰撞/规划使用原始 -5 mm 标称资产。当前实现与验证见任务书 T01、第 19 节。 |
 | R3-4，fixed-grid recipe | 本次只明示 recorded_rows，不自动改变资格。 | 当前模型确需固定采样间隔；报告实际节拍、源年龄和 observation→dispatch 延迟；为新实验定义容限与未知时间处理，再重算最终训练统计。 |
 | O06，静态几何/历史 FK | 已有只读实例中可无额外抽象地预计算不变值；历史 FK 缓存先测。 | 热点占比实际可见；缓存随本行 history 生命周期释放，不能按 ndarray hash 建全局缓存或绕过独立 public 函数的参数检查。 |
 | O07，TAG fixed-base | 本次不强制重写。 | Pinocchio frame/order/FK、解析梯度与数值差分一致，再测收敛和 p95；只读 Model 可复用，可变 Data 不共享。 |
@@ -713,7 +713,7 @@ Policy 静态检查文件完整列表：`scripts/training/train_vq_hand.py`、`s
 
 | 项目 | 状态 | 缺少的实施证据 |
 | --- | --- | --- |
-| B1 mount -15/-5 mm | DEFERRED | 实物 adapter 与同名 frame 的测量真值；本轮不改数值。 |
+| B1 mount -15/-5 mm | DONE / 离线 PASS；真机未验证 | 保留真实 FK -15 mm 与标称碰撞/规划 -5 mm，实施与验证见当前任务书 T01、第 19 节。 |
 | R3-4 fixed-grid | DEFERRED | 明确实验需求和真实时间分布；继续 recorded_rows，不新增 recipe 标签破坏 resume。 |
 | O06 静态几何/历史 FK | DEFERRED | 实际热点占比；Dataset 解码 profile 不能替代 FK profile。 |
 | O07 TAG fixed-base | DEFERRED | 替代方案的 FK/frame、解析梯度、收敛与 p95 对照；已有原生梯度验证不等于替代方案验证。 |

@@ -7,11 +7,7 @@ from dexmani_real.robot.commands import RobotCommand
 
 
 def test_eef_condition_is_public_fk_of_frozen_joint():
-    from dataclasses import replace
-
     cfg = ExperimentConfig()
-    # Explicit nominal synthetic mount; current-mount rejection has its own oracle.
-    cfg = replace(cfg, hand=replace(cfg.hand, T_eef_handbase_pos_xyz=(-0.005, 0, 0)))
     q = np.array(cfg.arm.home_qpos)
     hand = np.deg2rad(cfg.hand.home_qpos_deg)
     command = RobotCommand(1, q, hand)
@@ -22,11 +18,7 @@ def test_eef_condition_is_public_fk_of_frozen_joint():
 
 
 def test_real_ik_dynamic_checks_without_resolving():
-    from dataclasses import replace
-
     cfg = ExperimentConfig()
-    # Explicit nominal synthetic mount; current-mount rejection has its own oracle.
-    cfg = replace(cfg, hand=replace(cfg.hand, T_eef_handbase_pos_xyz=(-0.005, 0, 0)))
     realizer = ActionRealizer.for_mode(cfg, "eef")
     solver = realizer.planner.online_ik_solver
     q = np.array(cfg.arm.home_qpos)
@@ -46,13 +38,9 @@ def test_real_ik_dynamic_checks_without_resolving():
 
 
 def test_native_fk_ik_and_synthetic_table_path():
-    from dataclasses import replace
-
     from dexmani_real.planning.paths import _check_home_path_candidate
 
     cfg = ExperimentConfig()
-    # Explicit nominal synthetic mount; current-mount rejection has its own oracle.
-    cfg = replace(cfg, hand=replace(cfg.hand, T_eef_handbase_pos_xyz=(-0.005, 0, 0)))
     planner = ActionRealizer.for_mode(cfg, "eef").planner
     planner.set_hand_qpos(np.deg2rad(cfg.hand.home_qpos_deg))
     q = np.array(cfg.arm.home_qpos)

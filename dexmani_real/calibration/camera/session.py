@@ -129,7 +129,6 @@ def _build_planner(
 ) -> tuple[XArm7MotionPlanner, np.ndarray]:
     workspace = runtime.policy.workspace.as_array()
     planner = XArm7MotionPlanner.create_default(
-        hand_mount=(runtime.hand.T_eef_handbase_pos_xyz, runtime.hand.T_eef_handbase_quat_wxyz),
         online_ik_profile=make_online_ik_config(
             runtime,
             max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),

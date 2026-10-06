@@ -15,7 +15,6 @@ from dexmani_real.planning.paths import (
 )
 from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.robot.home import HomeResult
-from dexmani_real.robot.model import XARM7_XHAND_COLLISION_URDF_PATH, XARM7_XHAND_SRDF_PATH
 from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.runtime.safety import (
     RunEndReason,
@@ -201,14 +200,11 @@ def build_policy_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
     workspace = policy.workspace.as_array()
     return XArm7MotionPlanner(
         XArm7PlannerConfig(
-            urdf_path=str(XARM7_XHAND_COLLISION_URDF_PATH),
-            srdf_path=str(XARM7_XHAND_SRDF_PATH),
             base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
             workspace_bounds=workspace,
         ),
         online_ik_profile=make_online_ik_config(runtime),
         hand_dof=True,
-        hand_mount=(runtime.hand.T_eef_handbase_pos_xyz, runtime.hand.T_eef_handbase_quat_wxyz),
         static_boxes=tuple(runtime.environment.static_boxes),
         table=runtime.environment.table,
     )

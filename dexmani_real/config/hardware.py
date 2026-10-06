@@ -262,6 +262,7 @@ class HandParams:
 
     fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
     # Real adapter is 10 mm thinner than nominal CAD/URDF (-0.005 m mount).
+    # Real hand-base/fingertip FK only; collision/planning keep nominal URDF geometry.
     T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
     T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = (
         0.707107,

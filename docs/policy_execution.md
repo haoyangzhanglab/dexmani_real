@@ -34,6 +34,8 @@ async/rtc 的前 d 步都冻结实际 joint19 目标：Joint 路径先投影，E
 
 joint 与 EEF 共享绝对关节目标差、operational limits 和 feedback 距离规则。joint 在投影后检查端点自碰撞；EEF 保留 collision-aware 候选选择。frozen 再检查原命令，碰撞查询使用该命令的手姿；禁用手控制时使用配置的手部 HOME 姿态。这些检查不证明连续轨迹或环境避碰，Raw replay 和 HOME 各自保留其独立准入规则。
 
+自碰撞、环境碰撞、MPLib 搜索与规划后验检查使用仓库原始 URDF/SRDF/网格的标称几何。MPLib 搜索使用固定手模型，后验检查使用更新了实际手姿的完整手模型。真实手基座/指尖 FK 单独消费当前安装补偿：打印转接件薄 10 mm，默认 `custom_eef_link -> right_hand_link` 平移为 `(-0.015,0,0)m`；标称模型保留 `(-0.005,0,0)m`。该补偿不改变机械臂 EEF 定义、动作坐标系或碰撞资产。
+
 WAIT 表示没有新策略目标，设备仍可能追踪上一个目标。停止顺序为撤权/失效、设备 stop、录制和模型资源回收；不能撤销已进入 SDK 的调用，也不证明物理停稳。模型任务不会被 Future.cancel 强行打断。close 若仍等待模型完成，会明确记录 pending；Python 进程可能仍等待非 daemon worker。
 
 发送截止使用本机 monotonic 时钟，在每个目标 SDK 调用前判断；进入 SDK 后的迟返回保留实际确认结果。Ctrl+C 保留本次派发状态与已采前缀，软件取消不能撤回已进入 SDK 的调用。

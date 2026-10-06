@@ -42,7 +42,7 @@
 2. 不默认建立“相机缺帧 → 黑帧占位 → 继续运动”的路径。完整采集需要 RGB-D；没有可用相机观测或检测到持续停帧时停止本段并保存已采前缀。正常重复取到同一帧不等于故障，保留其源时间/帧号。
 3. 不为混合任意分辨率、depth scale、名义采样率新增通用合并协议。保留现有密集数组布局；确实不能用同一布局和单位解释的数据分开导出。真实逐行时间仍必须保存。
 4. 本轮不以新增 HOME 路点或另一种规划器替换现有规划。保留实际路径验证与碰撞检查，只删已确认无消费者/被支配的逻辑；搜索与验证模型的进一步统一列为有需求再做。
-5. 历史桌面参数跟随当前代码不再列为待修 bug；安装参数的 10 mm 差异未经实物确认，不得为“数值统一”擅自改动几何。
+5. 历史桌面参数跟随当前代码不再列为待修 bug；安装补偿与碰撞模型的用途按当前任务书 T01：真实手基座/指尖 FK 使用 -15 mm，碰撞/规划使用原始 -5 mm 标称几何。
 
 ### 1.3 参考项目的使用方式
 
@@ -93,7 +93,7 @@
 
 不新增参数指纹、版本绑定、注册表或多级 fallback。已有桌面/安装/触觉副本不必清理，但不再是权威来源或准入条件。保留一次实际计算所需的有效参数检查；“使用当前配置”不表示零分母、坏矩阵或不存在的 link 可以照算。
 
-不要为了去掉历史 metadata 依赖顺便更改安装数值。`config/hardware.py` 与 collision URDF 的 −15/−5 mm 差异涉及真实 adapter 说明，缺少现场证据时保留数值并报告待确认项。
+用户已确认打印转接件比原始模型薄 10 mm。`config/hardware.py` 的 −15 mm 用于真实位姿 FK；collision URDF 的 −5 mm 用于标称碰撞/规划。两者数值保留，不改写 URDF 或网格，也不依赖历史 Raw 安装 metadata。
 
 ## 3. 数据采集、保存与导出整改
 
@@ -288,7 +288,7 @@ git diff --check
 | #14 | 标定用残差模长的标准差选优和放行（成立） | 用实际残差 RMS 等量修正评分；不新增校准等级/证书机制。 | [dexmani_real/calibration/camera/solver.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/calibration/camera/solver.py#L216-L305) |
 | #15 | ArUco 稳定检测对 rotvec 作分量中位数（成立） | 旋转均值/medoid 用 SO(3)；直接修数学。 | [dexmani_real/calibration/camera/session.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/calibration/camera/session.py#L70-L112) |
 | #16 | VR heading 校验把同一旧头部帧反复计为新样本（成立） | 只累计新的 head 帧，修圆统计边界；不造多级质量 gate。 | [examples/calibrate_vr_heading.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/examples/calibrate_vr_heading.py#L61-L142) |
-| #17 | 观测手部安装变换与碰撞 URDF 相差 10 mm（部分成立） | 当前安装配置为准；10 mm 装配真值待现场确认，不能在本轮盲改几何。 | [dexmani_real/config/hardware.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/config/hardware.py#L264-L272) |
+| #17 | 真实位姿安装补偿与标称碰撞几何相差 10 mm（用途已明确） | 打印转接件薄 10 mm；真实 FK 保留 -15 mm，碰撞/规划直接使用原始 -5 mm 资产。修正与离线验证见当前任务书 T01。 | [dexmani_real/config/hardware.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/config/hardware.py#L264-L272) |
 | #18 | 缩窄工作关节区间改变等价角选择（成立） | 在物理语义明确允许周期等价的轴修正选角；未知/有圈数约束的轴不猜。 | [dexmani_real/planning/paths.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/planning/paths.py#L132-L178) |
 | #19 | 手掌有效性三角形与估计器使用的三角形不一致（成立） | 在实际 palm frame 计算处检查退化，删检查另一三角形的冗余入口。 | [dexmani_real/teleop/retargeting/retargeter.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/teleop/retargeting/retargeter.py#L121-L195) |
 | #20 | human flexion prior 把侧向张指算成屈曲（成立） | 先禁用有错误的 flexion prior 做消融；不另加“纠偏”机制。 | [dexmani_real/teleop/retargeting/retargeter.py](https://github.com/haoyangzhanglab/dexmani_real/blob/b7fc4549931314af404082251a2331ffe5ed4ce8/dexmani_real/teleop/retargeting/retargeter.py#L73-L108) |

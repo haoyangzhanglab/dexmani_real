@@ -15,79 +15,8 @@ from dexmani_real.robot.action import ActionIntent, ActionRealizer
 from dexmani_real.robot.commands import RobotCommand
 
 
-def nominal_runtime():
-    cfg = ExperimentConfig()
-    return replace(cfg, hand=replace(cfg.hand, T_eef_handbase_pos_xyz=(-0.005, 0, 0)))
-
-
-@pytest.mark.parametrize(
-    "xyz,rpy", [((0.02, -0.03, 0.04), (0.3, -0.4, 0.5)), ((-0.03, 0.02, -0.01), (-0.2, 0.6, -0.4))]
-)
-def test_current_mount_reaches_native_geometry(xyz, rpy):
-    import pinocchio as pin
-
-    from dexmani_real.planning.collision import CollisionModel
-    from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
-    from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
-    from dexmani_real.planning.kinematics.hand_fk import HandKinematics
-    from dexmani_real.planning.planner import XArm7MotionPlanner
-    from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES, XHAND_RIGHT_URDF_PATH
-
-    quat = np.roll(Rotation.from_euler("xyz", rpy).as_quat(), 1)
-    mount = (xyz, quat)
-    box = dict(
-        name="distant", center_xyz_m=(10, 10, 10), size_xyz_m=(1, 1, 1), quat_wxyz=(1, 0, 0, 0)
-    )
-    cm = CollisionModel(hand_dof=True, hand_mount=mount, static_boxes=(box,))
-    planner = XArm7MotionPlanner.create_default(hand_mount=mount)
-    assert not Path(planner.mplib_planner.urdf).exists()
-    hand_fk = HandKinematics(str(XHAND_RIGHT_URDF_PATH))
-    for q, hand in (
-        (np.array([0.1, -0.2, 0.3, 0.4, -0.5, 0.6, -0.7]), np.linspace(0.01, 0.3, 12)),
-        (np.array([-0.3, 0.4, -0.2, 0.5, 0.6, -0.4, 0.2]), np.linspace(0.2, 0.5, 12)),
-    ):
-        expected = compute_fingertip_history_xarm_base(
-            q[None],
-            hand[None],
-            hand_fk=hand_fk,
-            arm_fk=make_arm_fk(),
-            handbase_position_eef_m=np.array(xyz),
-            handbase_quat_eef_wxyz=quat,
-        )[0]
-        cm.set_hand_qpos(hand)
-        cm.check_self_collision(q)
-        cm.check_environment_collision(q)
-        pin.updateFramePlacements(cm._model, cm._data)
-        actual = [
-            cm._data.oMf[cm._model.getFrameId(name)].translation
-            for name in XHAND_FINGERTIP_LINK_NAMES
-        ]
-        np.testing.assert_allclose(actual, expected, atol=1e-6, rtol=0)
-        # Self and environment geometries must follow the same current model.
-        for i in range(cm._robot_environment_geom_count):
-            np.testing.assert_allclose(
-                cm._collision_data.oMg[i].homogeneous,
-                cm._environment_collision_data.oMg[i].homogeneous,
-                atol=1e-12,
-            )
-        mp = planner.pinocchio_model
-        mp.compute_forward_kinematics(q)
-        hand_pose = mp.get_link_pose(mp.get_link_names().index("right_hand_link"))
-        expected_base = cm._data.oMf[cm._model.getFrameId("right_hand_link")]
-        np.testing.assert_allclose(hand_pose.p, expected_base.translation, atol=1e-6)
-        np.testing.assert_allclose(
-            Rotation.from_quat(np.roll(hand_pose.q, -1)).as_matrix(),
-            expected_base.rotation,
-            atol=1e-6,
-        )
-    empty = CollisionModel(hand_dof=True, hand_mount=mount)
-    empty.set_hand_qpos(hand)
-    assert not empty.check_environment_collision(q)
-    assert empty._environment_collision_model is None
-
-
 def test_joint_and_frozen_admission_use_actual_command():
-    cfg = nominal_runtime()
+    cfg = ExperimentConfig()
     realizer = ActionRealizer.for_mode(cfg, "joint")
     q, hand = np.array(cfg.arm.home_qpos), np.deg2rad(cfg.hand.home_qpos_deg)
     target = q.copy()
@@ -98,21 +27,6 @@ def test_joint_and_frozen_admission_use_actual_command():
         and rejected.ik_result is None
         and rejected.rejection_reason == "jump"
     )
-    collision = np.array(
-        [
-            1.1665669814126147,
-            0.1618457586440516,
-            -1.0397002598715375,
-            0.01076161029776243,
-            -3.6491049933037516,
-            0.10155226046858923,
-            -0.4494161931238594,
-        ]
-    )
-    # Keep current/previous identical: the collision gate, not jump, must reject.
-    current_model = ActionRealizer.for_mode(ExperimentConfig(), "joint")
-    realized = current_model.realize(ActionIntent("joint", collision, hand), collision, collision)
-    assert realized.rejection_reason == "self_collision"
     accepted = realizer.realize(ActionIntent("joint", q, hand), q, q)
     np.testing.assert_allclose(accepted.arm_qpos, q, atol=1e-15)
     seen = []
@@ -124,20 +38,21 @@ def test_joint_and_frozen_admission_use_actual_command():
         np.testing.assert_array_equal(seen[-1], h)
 
 
-def test_current_mount_home_is_rejected_without_changing_configuration():
+def test_default_home_is_admitted_with_real_pose_compensation():
     cfg = ExperimentConfig()
     q, hand = np.array(cfg.arm.home_qpos), np.deg2rad(cfg.hand.home_qpos_deg)
     r = ActionRealizer.for_mode(cfg, "joint")
-    assert r.realize(ActionIntent("joint", q, hand), q, q).rejection_reason == "self_collision"
+    result = r.realize(ActionIntent("joint", q, hand), q, q)
+    assert result.rejection_reason is None
+    np.testing.assert_array_equal(result.arm_qpos, q)
 
 
 def test_frozen_eef_preserves_configured_solver_admission():
     from dexmani_real.planning.kinematics.ik import make_online_ik_config
     from dexmani_real.planning.planner import XArm7MotionPlanner
 
-    cfg = nominal_runtime()
+    cfg = ExperimentConfig()
     planner = XArm7MotionPlanner.create_default(
-        hand_mount=(cfg.hand.T_eef_handbase_pos_xyz, cfg.hand.T_eef_handbase_quat_wxyz),
         online_ik_profile=replace(make_online_ik_config(cfg), max_ik_jump_deg=(1.0,) * 7),
     )
     realizer = ActionRealizer(cfg, planner)
@@ -572,16 +487,6 @@ def test_invalid_hand_is_rejected_before_any_arm_sdk(monkeypatch):
     with pytest.raises(DispatchError):
         robot.send_action(invalid, valid_until_ns=10000)
     assert clock.calls == []
-
-
-def test_urdf_missing_or_wrong_mount_rejected(tmp_path):
-    from dexmani_real.planning.kinematics.urdf import urdf_with_hand_mount
-
-    for body in ("", '<joint name="right_hand_mount_joint" type="fixed"/>'):
-        path = tmp_path / "bad.urdf"
-        path.write_text('<robot name="test">' + body + "</robot>")
-        with pytest.raises(ValueError):
-            urdf_with_hand_mount(path, (0, 0, 0), (1, 0, 0, 0))
 
 
 @pytest.mark.parametrize(

@@ -206,7 +206,7 @@ class AsyncEpisodeRecorder:
                 camera_T_xarm_base_from_color, label="camera_T_xarm_base_from_color"
             )
         )
-        # Diagnostic provenance only; current runtime owns mount geometry.
+        # Diagnostic provenance only; current runtime supplies the physical FK mount.
         handbase_position = np.array(handbase_position_eef_m, dtype=np.float64, copy=True)
         handbase_quaternion = np.array(handbase_quat_eef_wxyz, dtype=np.float64, copy=True)
         return {
