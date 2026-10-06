@@ -46,8 +46,6 @@ def compute_fingertip_points_xarm_base(
         raise ValueError(f"hand_qpos must be finite {HAND_JOINT_SHAPE}")
     if mount_p.shape != (3,) or not np.all(np.isfinite(mount_p)):
         raise ValueError("hand mount position must be finite shape (3,)")
-    if not hand_fk.is_ready():
-        raise RuntimeError("hand fingertip FK is not ready")
     if (eef_position_xarm_base_m is None) != (eef_rot6d_xarm_base is None):
         raise ValueError("EEF position and rot6d must be provided together")
     if eef_position_xarm_base_m is None:

@@ -29,6 +29,7 @@ class PolicyOperator:
         robot,
         execute: bool,
     ):
+        self.home_results = []
         self.shared = shared
         self.robot = robot
         self.runtime = runtime
@@ -118,13 +119,19 @@ class PolicyOperator:
         if not home_allowed:
             logger.warning("operator: ignored H unless safety is ARMED")
             return False
-        completed = home_policy_robot(
-            self.shared,
-            self.runtime,
-            self.planner,
-            robot=self.robot,
-            abort_requested=self._home_abort_requested,
-        )
+        home_result = {"outcome": "incomplete"}
+        self.home_results.append(home_result)
+        try:
+            completed = home_policy_robot(
+                self.shared,
+                self.runtime,
+                self.planner,
+                robot=self.robot,
+                abort_requested=self._home_abort_requested,
+            )
+        except BaseException as exc:
+            home_result.update(outcome="fault", reason=f"{type(exc).__name__}: {exc}")
+            raise
         with self.shared.motion_lock:
             completed_without_stop = bool(
                 completed
@@ -135,6 +142,18 @@ class PolicyOperator:
                 and int(self.shared.stop_request.value) == int(StopRequest.NONE)
                 and int(self.shared.safety_state.value) == int(SafetyState.ARMED)
             )
+        interrupted = bool(
+            self.shared.quit_requested.value
+            or self.shared.estop_request.value
+            or self.shared.stop_request.value
+        )
+        home_result.update(
+            outcome="completed"
+            if completed_without_stop
+            else "interrupted"
+            if interrupted
+            else "failed"
+        )
         if completed_without_stop:
             logger.info("operator: physical home sequence completed; press B to start")
         else:

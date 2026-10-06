@@ -138,6 +138,14 @@ class AsyncEpisodeRecorder:
         return self._episode_dir
 
     @property
+    def staging_path(self):
+        return self._temp_dir
+
+    @property
+    def written_frames(self):
+        return self._written_frames
+
+    @property
     def resources_released(self):
         return (self._thread is None or not self._thread.is_alive()) and self._handles_released
 
@@ -237,6 +245,9 @@ class AsyncEpisodeRecorder:
         self.check_error()
         if self._recording or not self.resources_released:
             raise RecordingError("previous recording still owns resources")
+        # A new START owns its own evidence even if metadata or mkdir fails.
+        self._temp_dir = self._episode_dir = None
+        self._frame_count = self._written_frames = 0
         try:
             metadata = self._snapshot_start_metadata(
                 task_label=task_label,
@@ -279,7 +290,6 @@ class AsyncEpisodeRecorder:
             self._reason = ""
             self.policy_trace = None
             self._final_metadata = (None, None)
-            self._frame_count = self._written_frames = 0
             self._thread = threading.Thread(
                 target=self._write_episode, args=(metadata,), name="episode-writer", daemon=False
             )
@@ -375,35 +385,45 @@ class AsyncEpisodeRecorder:
         self._thread = None
         return self._episode_dir if self._saved else None
 
+    def _initial_metadata(self, meta, metadata):
+        for name, value in metadata.items():
+            meta.attrs[name] = value
+        meta.attrs["control_hz"] = self.control_hz
+        meta.attrs["execution_path"] = self.execution_path
+        meta.attrs["observation_action_pairing"] = "control_tick_input_and_attempted_targets"
+        meta.attrs["robot_timestamp_source"] = "host_monotonic_read_completion"
+        meta.attrs["camera_timestamp_source"] = "host_monotonic_oldest_rgb_depth_advance"
+        meta.attrs["time_missing_value"] = 0
+        meta.attrs["dispatch_status_codes"] = (
+            "0:not_called,1:accepted,2:crc_unconfirmed,3:rejected,4:unknown"
+        )
+
+    def _final_metadata_into(
+        self, meta, details, policy_trace, last_selected, last_dispatch_detail
+    ):
+        meta.attrs["format"] = RAW_FORMAT
+        meta.attrs["num_frames"] = self._written_frames
+        meta.attrs["termination_reason"] = self._reason
+        self.check_error()
+        if policy_trace is not None:
+            meta.create_dataset("policy_trace", data=json.dumps(policy_trace, allow_nan=False))
+        if details:
+            meta.create_dataset("termination_details", data=json.dumps(details, allow_nan=False))
+        if last_dispatch_detail is not None:
+            meta.attrs["final_dispatch_result"] = json.dumps(last_dispatch_detail, allow_nan=False)
+        if last_selected is not None:
+            meta.attrs["final_selected_targets"] = json.dumps(last_selected, allow_nan=False)
+
     def _write_episode(self, metadata):
         video = data = None
         rows = []
-        missing_tactile = {"hand_contact": 0, "hand_tactile_force": 0}
         last_selected = last_dispatch_detail = None
         staging = self._temp_dir
         self._handles_released = False
 
-        def initial_meta(meta):
-            for name, value in metadata.items():
-                meta.attrs[name] = value
-            meta.attrs["control_hz"] = self.control_hz
-            meta.attrs["execution_path"] = self.execution_path
-            meta.attrs["observation_action_pairing"] = "control_tick_input_and_attempted_targets"
-            meta.attrs["robot_timestamp_source"] = "host_monotonic_read_completion"
-            meta.attrs["camera_timestamp_source"] = "host_monotonic_oldest_rgb_depth_advance"
-            meta.attrs["time_missing_value"] = 0
-            meta.attrs["dispatch_status_codes"] = (
-                "0:not_called,1:accepted,2:crc_unconfirmed,3:rejected,4:unknown"
-            )
-
         def flush_rows():
             if rows:
-                data.append(
-                    {
-                        name: np.asarray([row[name] for row in rows], dtype=spec.dtype)
-                        for name, spec in DATASET_SPECS.items()
-                    }
-                )
+                data.append(rows_to_arrays(rows))
                 rows.clear()
 
         try:
@@ -411,7 +431,7 @@ class AsyncEpisodeRecorder:
             # retain an owner that can close it on this same thread.
             data = EpisodeDataWriter(
                 staging / "data.h5",
-                write_initial_meta=initial_meta,
+                write_initial_meta=lambda meta: self._initial_metadata(meta, metadata),
                 depth_shape=self._rgb_shape[:2],
             )
             data.open()
@@ -438,8 +458,6 @@ class AsyncEpisodeRecorder:
                     raise ValueError("recording requires RGB-D for every row")
                 if frame.camera_rgb.shape != self._rgb_shape or frame.camera_rgb.dtype != np.uint8:
                     raise ValueError("RGB shape or dtype mismatch")
-                for name in missing_tactile:
-                    missing_tactile[name] += int(not np.isfinite(frame.data[name]).all())
                 last_selected = frame.selected
                 last_dispatch_detail = frame.dispatch_detail
                 video.write_frame(frame.camera_rgb)
@@ -452,38 +470,11 @@ class AsyncEpisodeRecorder:
                 flush_rows()
                 details, policy_trace = self._final_metadata
 
-                def final_meta(meta):
-                    meta.attrs["format"] = RAW_FORMAT
-                    meta.attrs["num_frames"] = self._written_frames
-                    meta.attrs["termination_reason"] = self._reason
-                    self.check_error()
-                    if policy_trace is not None:
-                        meta.create_dataset(
-                            "policy_trace", data=json.dumps(policy_trace, allow_nan=False)
-                        )
-                    if details:
-                        meta.create_dataset(
-                            "termination_details", data=json.dumps(details, allow_nan=False)
-                        )
-                    for name, count in missing_tactile.items():
-                        meta.attrs[f"{name}_missing_rows"] = count
-                        if count:
-                            logger.warning(
-                                "Recording %s missing: %d/%d rows",
-                                name,
-                                count,
-                                self._written_frames,
-                            )
-                    if last_dispatch_detail is not None:
-                        meta.attrs["final_dispatch_result"] = json.dumps(
-                            last_dispatch_detail, allow_nan=False
-                        )
-                    if last_selected is not None:
-                        meta.attrs["final_selected_targets"] = json.dumps(
-                            last_selected, allow_nan=False
-                        )
-
-                data.update_meta(final_meta)
+                data.update_meta(
+                    lambda meta: self._final_metadata_into(
+                        meta, details, policy_trace, last_selected, last_dispatch_detail
+                    )
+                )
             video.close()
             data.close()
             self._handles_released = True
@@ -539,3 +530,10 @@ class AsyncEpisodeRecorder:
                     self._queue.get_nowait()
                 except Empty:
                     break
+
+
+def rows_to_arrays(rows):
+    return {
+        name: np.asarray([row[name] for row in rows], dtype=spec.dtype)
+        for name, spec in DATASET_SPECS.items()
+    }

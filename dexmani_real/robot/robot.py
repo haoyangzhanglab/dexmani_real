@@ -74,6 +74,11 @@ class RobotState:
 
 
 class DexManiRobot:
+    @property
+    def stop_required(self):
+        """Software cleanup requirement, not evidence of physical standstill."""
+        return self._motion_active or self._hand_stop_pending
+
     def __init__(
         self, shared, runtime, *, arm_factory=None, hand_factory=None, check_services=None
     ):

@@ -56,11 +56,11 @@ class TeleopController:
             reset_hand_retargeter(self.hand_retargeter, row.hand["qpos"][0])
         return self.arm_mapper.is_ready()
 
-    def compute_command(self, row, run_id):
+    def compute_target(self, row):
         cfg = self.runtime
         mapped = self.arm_mapper.map(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
         if mapped is None:
-            return None, False, None
+            return None
         target = compute_target_eef_pose(
             mapped["pos"],
             mapped["quat_wxyz"],
@@ -78,24 +78,33 @@ class TeleopController:
                 self.hand_retargeter, row.vr, self.hand_observation_cache
             )
             if proposal is None:
-                return None, False, intent
+                return None
             hand = proposal
         realized = self.realizer.realize(
             ActionIntent("eef", intent, hand), row.arm["qpos"][0], self.previous_arm_command
         )
         solution = realized.ik_result
-        if solution.failure_kind == IKFailureKind.INVALID_OUTPUT:
+        if solution is not None and solution.failure_kind == IKFailureKind.INVALID_OUTPUT:
             raise RuntimeError(f"online IK technical failure: {solution.reason}")
-        if not solution.success:
-            return None, False, intent
-        return RobotCommand(run_id, realized.arm_qpos, realized.hand_qpos), True, realized.eef_pose
+        return realized
+
+    def commit_dispatched_target(self, realization):
+        self.previous_arm_command = realization.arm_qpos.copy()
+        self.smoothed_eef_position = realization.eef_pose[:3].copy()
+        self.smoothed_eef_quaternion = rot6d_to_quat_wxyz(realization.eef_pose[3:])
 
 
 def execute_control_step(
     controller, shared, robot, row, recorder=None, *, termination_details=None
 ):
     epoch = int(shared.run_id.value)
-    target, control_ok, intent = controller.compute_command(row, epoch)
+    realization = controller.compute_target(row)
+    control_ok = realization is not None and realization.arm_qpos is not None
+    target = (
+        RobotCommand(epoch, realization.arm_qpos, realization.hand_qpos) if control_ok else None
+    )
+    if realization is not None and realization.rejection_reason:
+        logger.debug("teleop target rejected: %s", realization.rejection_reason)
     if recorder is not None:
         recorder.check_error()
     result = failure = stop_error = None
@@ -138,9 +147,7 @@ def execute_control_step(
                 if failure is not None:
                     logger.exception("stop after dispatch also failed")
         elif result is not None:
-            controller.previous_arm_command = target.arm_qpos.copy()
-            controller.smoothed_eef_position = intent[:3].copy()
-            controller.smoothed_eef_quaternion = rot6d_to_quat_wxyz(intent[3:])
+            controller.commit_dispatched_target(realization)
     finally:
         if recorder is not None and (interrupted or recorder.accepting_frames):
             try:

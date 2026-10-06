@@ -80,6 +80,7 @@ python examples/pointcloud_process_example.py --help
 ```
 
 相机外参、桌面平面、hand mount、VR alignment 等属于**当前实验现场状态**。更换相机、桌面、机器人安装或实验布局后，应重新标定或确认，而不是沿用历史数值作为固定契约。首次桌面标定在 pointcloud 示例中选择 table calibration，不要求旧 plane 文件。
+手部 FK、自碰撞/环境模型与运动规划使用同一份当前 mount 配置；模型一致不代表配置已符合实物，运行前仍需确认安装尺寸与方向。
 物理录制允许缺相机外参，但点云需要数据对应的有效内外参和 depth scale。同一会话的点云与录制共用启动时加载的外参，文件修改在下次会话生效。
 
 ### 3. 采集示教
@@ -92,7 +93,7 @@ python examples/collect_teleop.py \
 
 启动会在停止监听建立后执行手部 HOME。H 为整机 HOME，B 开始，C 暂停/恢复；恢复时保存上一段并开始新 episode。S 停止保存，D 丢弃当前 capture，Q 进入退出确认、再次 Q 保存退出（尚未开始且无 capture 时直接退出），ESC 急停。键盘 jog 入口仅在 R 时 HOME。
 操作者结束原因和随后发生的停止故障分别留证；写盘或发布失败保留 staging 并报告会话失败，已发布 Raw 不回写。
-录制启用全部已接入物理模态，aggregate/dense 触觉独立校准和判断可用性，缺测保留 NaN；触觉持续不可用会在日志和 episode 摘要中显示。相机无可用帧或任一路持续停帧时停止并保留前缀，不补黑图。
+录制启用全部已接入物理模态，aggregate/dense 触觉独立校准和判断可用性，缺测保留 NaN；驱动报告不可用状态，离线导出的 `export_report.json` 汇总缺测情况。相机无可用帧或任一路持续停帧时停止并保留前缀，不补黑图。
 
 Raw episode 是实验 source of truth。已发布 Raw 不做原地修补；暂停、失败、缺测和终止原因等实验事实应被保留。
 
@@ -200,7 +201,10 @@ Canonical 数据是面向策略训练的派生缓存。
 
 Canonical 不是新的实验事实，也不承担长期格式兼容。
 
-一个 store 当前只组织一个 task；`dt` 必须一致，属于训练/部署数值语义。`depth_scale` 在 store 内保持一致以解释存储深度，不作为 Policy 兼容元数据。导出默认拒绝已有路径；`examples/export_policy_zarr.py --overwrite` 会先完成分块转换，再替换已有 canonical cache；失败保留新 staging，始终不修改 Raw。
+一个 store 当前只组织一个 task；`dt` 必须一致，属于训练/部署数值语义。`depth_scale` 在 store 内保持一致以解释存储深度，不作为 Policy 兼容元数据。导出只接受未占用的新路径；分块转换完成后发布带唯一 `data_revision` 的 canonical cache。重新导出使用新路径和新身份，精确续训保留原缓存；失败保留 staging，始终不修改 Raw。
+
+记录式 policy evaluation 和 replay 在 Raw 外保存 `session_result.json` 与 `attempts/`，区分实际运行、Raw 发布和 session 关闭结果。Policy 的 query 数组保存为每 attempt 的 NPZ；可用 `python examples/summarize_policy_trace.py <attempt.json>` 离线查看模型、观测、实现和发送阶段的时间摘要。无输出目录的直接 policy API 不产生持久化结果。
+
 H/W、depth scale、名义 dt 不同的数据分开导出，不静默 resize 或插值。
 
 13 字段包括 joint_state、arm_qvel、arm_effort、hand_current、action、action_ee、contact_force、tactile_force、fingertip_points、eef_pose、rgb、depth、point_cloud。

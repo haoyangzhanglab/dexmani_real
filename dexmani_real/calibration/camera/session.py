@@ -36,6 +36,7 @@ from dexmani_real.calibration.camera.solver import (
     CalibrationConfig,
     CalibrationSamples,
     calibrate_and_select,
+    check_hand_eye_excitation,
     detect_aruco_pose,
     draw_calibration_overlay,
     eef_rpy_from_rot6d,
@@ -128,6 +129,7 @@ def _build_planner(
 ) -> tuple[XArm7MotionPlanner, np.ndarray]:
     workspace = runtime.policy.workspace.as_array()
     planner = XArm7MotionPlanner.create_default(
+        hand_mount=(runtime.hand.T_eef_handbase_pos_xyz, runtime.hand.T_eef_handbase_quat_wxyz),
         online_ik_profile=make_online_ik_config(
             runtime,
             max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
@@ -243,6 +245,8 @@ def _solve_calibration(
             *samples.solver_inputs(),
             max_position_rms_mm=config.max_consistency_rms_mm,
             max_rotation_rms_deg=config.max_consistency_rot_rms_deg,
+            min_relative_rotation_deg=config.min_relative_rotation_deg,
+            min_axis_separation_deg=config.min_axis_separation_deg,
         )
     except Exception as exc:
         logger.warning("solve failed", exc_info=True)
@@ -285,7 +289,7 @@ def _solve_calibration(
         print(f"    #{index + 1:2d} {residual_mm:6.1f} {bar}{flag}")
     print(f"  T_world_camera position: {np.round(T_world_camera[:3, 3], 4)}m")
 
-    return T_world_camera, _calibration_capture_metadata(
+    metadata = _calibration_capture_metadata(
         intrinsics=intrinsics,
         distortion=distortion,
         method=method,
@@ -293,6 +297,12 @@ def _solve_calibration(
         position_errors_mm=errors_mm,
         rotation_errors_deg=errors_deg,
     )
+    metadata["excitation"] = check_hand_eye_excitation(
+        samples.rpy_ee2base,
+        min_relative_rotation_deg=config.min_relative_rotation_deg,
+        min_axis_separation_deg=config.min_axis_separation_deg,
+    )
+    return T_world_camera, metadata
 
 
 class CameraCalibrationSession:

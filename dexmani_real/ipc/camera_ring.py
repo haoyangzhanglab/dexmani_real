@@ -38,7 +38,7 @@ class CameraRingBuffer:
       - Depth-to-color aligned Z16 bytes
 
     Layout of shared memory:
-        [0:8)     write_idx  (uint64, atomic)
+        [0:8)     write_idx  (uint64; ordering assumptions follow ring.py)
         [8:16)    sequence   (uint64)
         [16:24)   max_rgb_bytes (uint64, max RGB bytes per frame)
         [24:32)   max_depth_bytes (uint64, max depth bytes per frame)

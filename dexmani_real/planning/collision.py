@@ -6,7 +6,7 @@ disabled.
 
 Usage::
 
-    cm = CollisionModel()
+    cm = CollisionModel(hand_mount=(position_m, quaternion_wxyz))
     cm.check_self_collision(qpos)          # bool
     cm.check_self_collision_details(qpos)  # CollisionInfo
 """
@@ -112,6 +112,8 @@ class CollisionModel:
     def __init__(
         self,
         hand_dof: bool = False,
+        *,
+        hand_mount,
         urdf_path: str | None = None,
         srdf_path: str | None = None,
         package_dir: str | None = None,
@@ -127,7 +129,10 @@ class CollisionModel:
         _urdf = urdf_path or (_FULL_URDF if hand_dof else _COLLISION_URDF)
         _srdf = srdf_path or _COLLISION_SRDF
 
-        self._model = pin.buildModelFromUrdf(_urdf)
+        from .kinematics.urdf import urdf_with_hand_mount
+
+        xml = urdf_with_hand_mount(_urdf, *hand_mount)
+        self._model = pin.buildModelFromXML(xml)
         if hand_dof:
             active = sorted(
                 (
@@ -143,8 +148,8 @@ class CollisionModel:
                 raise ValueError("collision model active q order must be xArm7 + XHand URDF joints")
         self._data = self._model.createData()
 
-        self._collision_model = pin.buildGeomFromUrdf(
-            self._model, _urdf, pin.GeometryType.COLLISION, package_dirs=[pkg]
+        self._collision_model = pin.buildGeomFromUrdfString(
+            self._model, xml, pin.GeometryType.COLLISION, package_dirs=[pkg]
         )
 
         # Add all pairs, then apply SRDF exclusions.
@@ -160,10 +165,8 @@ class CollisionModel:
         self._collision_data = self._collision_model.createData()
 
         # Environment checks use a separate robot↔static-obstacle geometry model.
-        self._environment_collision_model = pin.buildGeomFromUrdf(
-            self._model, _urdf, pin.GeometryType.COLLISION, package_dirs=[pkg]
-        )
-        self._robot_environment_geom_count = int(self._environment_collision_model.ngeoms)
+        self._environment_collision_model = None
+        self._robot_environment_geom_count = 0
         self._environment_names: dict[int, str] = {}
         self._table_pair_indices: tuple[int, ...] = ()
         self._table = self._normalize_table(table)
@@ -172,6 +175,10 @@ class CollisionModel:
         if len(box_names) != len(set(box_names)):
             raise ValueError("static collision box names must be unique")
         if normalized_boxes or self._table is not None:
+            self._environment_collision_model = pin.buildGeomFromUrdfString(
+                self._model, xml, pin.GeometryType.COLLISION, package_dirs=[pkg]
+            )
+            self._robot_environment_geom_count = int(self._environment_collision_model.ngeoms)
             from hppfcl.hppfcl import Box
 
             for box in normalized_boxes:
@@ -220,7 +227,11 @@ class CollisionModel:
                         len(self._environment_collision_model.collisionPairs) - 1
                     )
                 self._table_pair_indices = tuple(table_pair_indices)
-        self._environment_collision_data = self._environment_collision_model.createData()
+        self._environment_collision_data = (
+            self._environment_collision_model.createData()
+            if self._environment_collision_model is not None
+            else None
+        )
         self._static_boxes = normalized_boxes
         self._environment_obstacle_count = len(normalized_boxes) + int(self._table is not None)
 
@@ -234,7 +245,9 @@ class CollisionModel:
             len(self._collision_model.collisionPairs),
             len(self._static_boxes),
             "calibrated" if self._table is not None else "disabled",
-            len(self._environment_collision_model.collisionPairs),
+            len(self._environment_collision_model.collisionPairs)
+            if self._environment_collision_model is not None
+            else 0,
         )
 
         self._expected_qpos_shape: tuple[int, ...] = (self._nq,)

@@ -1,16 +1,29 @@
 """Project real control-row history into the requested Policy observation mapping."""
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
-from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base, make_arm_fk
+from dexmani_real.config.hardware import HandParams
+from dexmani_real.planning.kinematics.arm_fk import (
+    ArmFK,
+    compute_eef_pose_history_xarm_base,
+    make_arm_fk,
+)
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
 
-def build_fingertip_runtime(policy_info: Any, runtime: Any):
+@dataclass(frozen=True)
+class ObservationKinematics:
+    arm_fk: ArmFK
+    hand_fk: HandKinematics | None = None
+    mount: HandParams | None = None
+
+
+def build_observation_kinematics(policy_info: Any, runtime: Any):
     """Construct the local FK resources only when the observation requests them.
 
     ``eef_pose`` needs just the cached canonical ``ArmFK``; the hand FK and
@@ -22,17 +35,15 @@ def build_fingertip_runtime(policy_info: Any, runtime: Any):
     if not needs_hand_fk and "eef_pose" not in requested:
         return None
     if not needs_hand_fk:
-        return make_arm_fk(), None, None
+        return ObservationKinematics(make_arm_fk())
     hand_fk = HandKinematics(
         str(XHAND_RIGHT_URDF_PATH),
         list(policy_info.fingertip_link_names),
     )
-    if not hand_fk.is_ready():
-        raise RuntimeError("fingertip FK startup failed")
-    return make_arm_fk(), hand_fk, runtime.hand
+    return ObservationKinematics(make_arm_fk(), hand_fk, runtime.hand)
 
 
-def build_policy_observation(rows, policy_info, *, fingertip_runtime=None):
+def build_policy_observation(rows, policy_info, *, kinematics=None):
     if not rows:
         return None
     requested = set(policy_info.observation_fields)
@@ -74,7 +85,7 @@ def build_policy_observation(rows, policy_info, *, fingertip_runtime=None):
             raise ValueError("rgb history must have stackable raw image shapes")
         arrays["rgb"] = np.stack(images)
     if requested & {"eef_pose", "fingertip_points"}:
-        arm_fk, hand_fk, cfg = fingertip_runtime
+        arm_fk, hand_fk, cfg = kinematics.arm_fk, kinematics.hand_fk, kinematics.mount
         poses = compute_eef_pose_history_xarm_base(joint[:, :7], arm_fk=arm_fk)
         arrays["eef_pose"] = poses.astype(np.float32)
         if "fingertip_points" in requested:

@@ -104,7 +104,7 @@ def _table_clearance_m(
 ) -> tuple[float, float, str]:
     """Return ``(clearance, raw_measurement, source)`` for one arm pose."""
     collision_model = planner.collision_model
-    if bool(getattr(collision_model, "has_table", False)):
+    if collision_model.has_table:
         distance_m = float(collision_model.minimum_table_distance(arm_qpos))
         clearance_m = distance_m - float(collision_model.table_soft_clearance_m)
         return clearance_m, distance_m, "calibrated_mesh_distance"

@@ -95,8 +95,6 @@ def iter_canonical_blocks(
         )
     height, width = int(reader.meta["camera_color_height"]), int(reader.meta["camera_color_width"])
     hand_fk = HandKinematics(str(XHAND_RIGHT_URDF_PATH), list(config.fingertip_link_names))
-    if not hand_fk.is_ready():
-        raise RuntimeError("canonical fingertip FK startup failed")
     images = iter(reader.iter_camera_frames("rgb"))
     for start in range(0, reader.num_frames, chunk_frames):
         end = min(reader.num_frames, start + chunk_frames)
@@ -105,25 +103,7 @@ def iter_canonical_blocks(
         hand = np.asarray(reader["hand_qpos"][start:end], dtype=np.float64)
         arm_action = np.asarray(reader["action_arm_joint_target"][start:end], dtype=np.float64)
         hand_action = np.asarray(reader["action_hand_joint_target"][start:end], dtype=np.float64)
-        poses, action_poses = np.full((count, 9), np.nan), np.full((count, 9), np.nan)
-        arm_valid, action_valid = np.isfinite(arm).all(axis=1), np.isfinite(arm_action).all(axis=1)
-        if arm_valid.any():
-            poses[arm_valid] = compute_eef_pose_history_xarm_base(arm[arm_valid])
-        if action_valid.any():
-            action_poses[action_valid] = compute_eef_pose_history_xarm_base(
-                arm_action[action_valid]
-            )
-        tips = np.full((count, 5, 3), np.nan)
-        tips_valid = arm_valid & np.isfinite(hand).all(axis=1)
-        if tips_valid.any():
-            tips[tips_valid] = compute_fingertip_history_xarm_base(
-                arm[tips_valid],
-                hand[tips_valid],
-                hand_fk=hand_fk,
-                handbase_position_eef_m=np.asarray(config.handbase_position_eef_m),
-                handbase_quat_eef_wxyz=np.asarray(config.handbase_quat_eef_wxyz),
-                eef_pose_history=poses[tips_valid],
-            )
+        poses, action_poses, tips = _kinematic_arrays(arm, hand, arm_action, hand_fk, config)
         block = {
             "joint_state": np.concatenate((arm, hand), axis=1).astype(np.float32),
             "action": np.concatenate((arm_action, hand_action), axis=1).astype(np.float32),
@@ -140,7 +120,7 @@ def iter_canonical_blocks(
             image = next(images, None)
             if image is None or image.shape != (height, width, 3) or image.dtype != np.uint8:
                 raise RawDataError(
-                    f"{reader._path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
+                    f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
                 )
             cloud = pointcloud_deriver.derive(index, image) if pointcloud_deriver else None
             if cloud is None:
@@ -149,15 +129,39 @@ def iter_canonical_blocks(
             depth.append(np.asarray(reader["depth"][index], dtype=np.uint16))
             clouds.append(cloud)
         block.update(rgb=np.stack(rgb), depth=np.stack(depth), point_cloud=np.stack(clouds))
-        for name, values in block.items():
-            if np.issubdtype(values.dtype, np.floating):
-                invalid = ~np.isfinite(values)
-                values[invalid] = np.nan
-                if invalid.any():
-                    key = name + "_missing_rows"
-                    notes[key] = notes.get(key, 0) + int(
-                        invalid.reshape(count, -1).any(axis=1).sum()
-                    )
+        _preserve_missing(block, notes, count)
         yield block
     if next(images, None) is not None:
-        raise RawDataError(f"{reader._path / 'rgb.mp4'}: RGB contains extra frames")
+        raise RawDataError(f"{reader.path / 'rgb.mp4'}: RGB contains extra frames")
+
+
+def _kinematic_arrays(arm, hand, arm_action, hand_fk, config):
+    count = len(arm)
+    poses, action_poses = np.full((count, 9), np.nan), np.full((count, 9), np.nan)
+    arm_valid, action_valid = np.isfinite(arm).all(axis=1), np.isfinite(arm_action).all(axis=1)
+    if arm_valid.any():
+        poses[arm_valid] = compute_eef_pose_history_xarm_base(arm[arm_valid])
+    if action_valid.any():
+        action_poses[action_valid] = compute_eef_pose_history_xarm_base(arm_action[action_valid])
+    tips = np.full((count, 5, 3), np.nan)
+    tips_valid = arm_valid & np.isfinite(hand).all(axis=1)
+    if tips_valid.any():
+        tips[tips_valid] = compute_fingertip_history_xarm_base(
+            arm[tips_valid],
+            hand[tips_valid],
+            hand_fk=hand_fk,
+            handbase_position_eef_m=np.asarray(config.handbase_position_eef_m),
+            handbase_quat_eef_wxyz=np.asarray(config.handbase_quat_eef_wxyz),
+            eef_pose_history=poses[tips_valid],
+        )
+    return poses, action_poses, tips
+
+
+def _preserve_missing(block, notes, count):
+    for name, values in block.items():
+        if np.issubdtype(values.dtype, np.floating):
+            invalid = ~np.isfinite(values)
+            values[invalid] = np.nan
+            if invalid.any():
+                key = name + "_missing_rows"
+                notes[key] = notes.get(key, 0) + int(invalid.reshape(count, -1).any(axis=1).sum())

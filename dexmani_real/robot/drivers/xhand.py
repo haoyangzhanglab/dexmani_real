@@ -585,12 +585,15 @@ class XHand:
         return command
 
     def _validate_action(self, qpos: np.ndarray) -> None:
-        if qpos.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(qpos)):
-            raise ValueError("XHand.send_action requires twelve finite joint targets")
-        lower = np.asarray(self.cfg.mechanical_qpos_min_rad, dtype=np.float64)
-        upper = np.asarray(self.cfg.mechanical_qpos_max_rad, dtype=np.float64)
-        if np.any(qpos < lower - 1e-12) or np.any(qpos > upper + 1e-12):
-            raise ValueError("XHand.send_action target violates mechanical joint limits")
+        from dexmani_real.robot.command_validation import check_hand_target
+
+        reason = check_hand_target(
+            qpos,
+            mechanical_lower_rad=np.asarray(self.cfg.mechanical_qpos_min_rad),
+            mechanical_upper_rad=np.asarray(self.cfg.mechanical_qpos_max_rad),
+        )
+        if reason is not None:
+            raise ValueError(f"XHand.send_action: {reason}")
 
     @staticmethod
     def _parse_joints(

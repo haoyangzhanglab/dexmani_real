@@ -169,7 +169,7 @@ class ExecutionConfig:
 
 
 def validate_warmup_budget(durations, execution_config, info):
-    """Apply the same measured model-path budgets before startup or a mode change."""
+    """Apply the same measured model-path budgets before session startup."""
     maximum = max(durations)
     if maximum >= execution_config.max_wait_s:
         raise ValueError("Measured inference already exceeds max_wait_s; bootstrap cannot fit")

@@ -3,7 +3,7 @@
 日期：2026-10-04（Asia/Shanghai）  
 主仓库：`haoyangzhanglab/dexmani_real`  
 协同仓库：`haoyangzhanglab/dexmani_policy`  
-状态：最终设计审查通过，可开展实施；**不代表实现、GPU 推理或真机验证已经通过**。
+状态：历史设计与实施证据保留，不作为当前待办清单；当前接口见 `docs/policy_execution.md`，后续实施结果见 `CODEX_RESEARCH_REFINEMENT_TASK_20261007.md` 第 17 节。**历史设计通过不代表 GPU 推理或真机验收。**
 
 本文独立承载实施要求，不依赖聊天记录或临时审查脚本。本任务范围内，以本文取代前几轮存在冲突的建议；不修改 `AGENTS.md` 的长期规则，也不将旧根目录整改文档全部重新执行。
 

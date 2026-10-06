@@ -9,7 +9,12 @@ from typing import Literal
 import numpy as np
 
 from dexmani_real.planning import Pose, XArm7MotionPlanner
-from dexmani_real.planning.kinematics.ik import IKResult, make_online_ik_config
+from dexmani_real.planning.kinematics.ik import (
+    DEFAULT_JUMP_DEG,
+    IKResult,
+    joint_target_rejection,
+    make_online_ik_config,
+)
 from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.robot.projection import project_arm_command, project_hand_command
 
@@ -26,14 +31,17 @@ class ActionRealization:
     arm_qpos: np.ndarray | None
     hand_qpos: np.ndarray | None
     ik_result: IKResult | None = None
+    rejection_reason: str | None = None
     # Accepted Cartesian target feeds Teleop's explicit EMA only after dispatch.
     eef_pose: np.ndarray | None = None
 
 
 class ActionRealizer:
-    def __init__(self, runtime, planner=None):
+    def __init__(self, runtime, planner=None, collision_model=None):
         self.runtime = runtime
         self.planner = planner
+        self.collision_model = collision_model if planner is None else planner.collision_model
+        self.rejection_reason = None
         if planner is not None and not runtime.policy.hand_enabled:
             planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
 
@@ -42,11 +50,50 @@ class ActionRealizer:
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
         planner = (
-            XArm7MotionPlanner.create_default(online_ik_profile=make_online_ik_config(runtime))
+            XArm7MotionPlanner.create_default(
+                hand_mount=(
+                    runtime.hand.T_eef_handbase_pos_xyz,
+                    runtime.hand.T_eef_handbase_quat_wxyz,
+                ),
+                online_ik_profile=make_online_ik_config(runtime),
+            )
             if mode == "eef"
             else None
         )
-        return cls(runtime, planner)
+        collision = None
+        if mode == "joint":
+            from dexmani_real.planning.collision import CollisionModel
+
+            collision = CollisionModel(
+                hand_dof=True,
+                hand_mount=(
+                    runtime.hand.T_eef_handbase_pos_xyz,
+                    runtime.hand.T_eef_handbase_quat_wxyz,
+                ),
+            )
+        return cls(runtime, planner, collision)
+
+    def _joint_rejection(self, target, hand, current, previous):
+        cfg = self.runtime
+        reason = (
+            self.planner.online_ik_solver.dynamic_rejection(target, current, previous)
+            if self.planner is not None
+            else joint_target_rejection(
+                target,
+                current,
+                previous,
+                np.column_stack((cfg.arm.joint_limit_lower, cfg.arm.joint_limit_upper)),
+                np.deg2rad(DEFAULT_JUMP_DEG),
+            )
+        )
+        if reason is not None:
+            return reason
+        if self.collision_model is None:
+            raise RuntimeError("online admission requires a collision model")
+        self.collision_model.set_hand_qpos(
+            hand if hand is not None else np.deg2rad(cfg.hand.home_qpos_deg)
+        )
+        return "self_collision" if self.collision_model.check_self_collision(target) else None
 
     def reset_episode(self):
         if self.planner is not None:
@@ -85,19 +132,22 @@ class ActionRealizer:
                 joint_lower_rad=cfg.arm.joint_limit_lower,
                 joint_upper_rad=cfg.arm.joint_limit_upper,
             )
-            return ActionRealization(target, hand)
+            reason = self._joint_rejection(target, hand, current, previous)
+            return ActionRealization(
+                target if reason is None else None, hand, rejection_reason=reason
+            )
         if self.planner is None:
             raise ValueError("EEF realization requires an online IK planner")
         workspace = cfg.policy.workspace.as_array()
         position = np.clip(arm[:3], workspace[:, 0], workspace[:, 1])
         pose = Pose(p=position, q=rot6d_to_quat_wxyz(arm[3:]))
-        if hand is not None:
-            self.planner.set_hand_qpos(hand)
+        self.planner.set_hand_qpos(hand if hand is not None else np.deg2rad(cfg.hand.home_qpos_deg))
         result = self.planner.solve_online_ik(pose, current, previous)
         return ActionRealization(
             result.qpos if result.success else None,
             hand,
             ik_result=result,
+            rejection_reason=None if result.success else result.reason,
             eef_pose=np.concatenate((position, arm[3:])),
         )
 
@@ -111,17 +161,21 @@ class ActionRealizer:
 
     def frozen_is_valid(self, command, current, previous, mode):
         previous = current if previous is None else previous
-        if mode == "eef":
-            return (
-                self.planner.online_ik_solver.dynamic_rejection(command.arm_qpos, current, previous)
-                is None
-            )
         # Projection is allowed at preparation only. A changed equivalent branch
         # invalidates the reservation instead of silently changing its condition.
-        projected = project_arm_command(
-            command.arm_qpos,
-            current,
-            joint_lower_rad=self.runtime.arm.joint_limit_lower,
-            joint_upper_rad=self.runtime.arm.joint_limit_upper,
+        projected = (
+            command.arm_qpos
+            if mode == "eef"
+            else project_arm_command(
+                command.arm_qpos,
+                current,
+                joint_lower_rad=self.runtime.arm.joint_limit_lower,
+                joint_upper_rad=self.runtime.arm.joint_limit_upper,
+            )
         )
-        return np.array_equal(projected, command.arm_qpos)
+        self.rejection_reason = (
+            "projection_changed"
+            if not np.array_equal(projected, command.arm_qpos)
+            else self._joint_rejection(command.arm_qpos, command.hand_qpos, current, previous)
+        )
+        return self.rejection_reason is None

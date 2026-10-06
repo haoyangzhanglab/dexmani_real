@@ -64,11 +64,12 @@ def run_keyboard_experiment(runtime, *, no_hand):
     clean = False
     try:
         planner = XArm7MotionPlanner.create_default(
+            hand_mount=(runtime.hand.T_eef_handbase_pos_xyz, runtime.hand.T_eef_handbase_quat_wxyz),
             online_ik_profile=make_online_ik_config(
                 runtime,
                 max_pose_error_pos_m=cfg.ik_max_pose_error_pos_m,
                 max_pose_error_rot_rad=cfg.ik_max_pose_error_rot_rad,
-            )
+            ),
         )
         if not runtime.policy.hand_enabled:
             planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))

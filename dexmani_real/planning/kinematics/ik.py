@@ -25,6 +25,24 @@ _NUMERIC_EPS = 1e-12
 _MODEL_LIMIT_TOL_RAD = 1e-5
 
 
+DEFAULT_JUMP_DEG = (30, 30, 30, 35, 40, 40, 40)
+
+
+def joint_target_rejection(q, current, previous, limits, jump_limit):
+    """Absolute hardware target differences, never periodic shortest angles."""
+    q, current, previous = (np.asarray(v, dtype=np.float64) for v in (q, current, previous))
+    if any(v.shape != (7,) or not np.isfinite(v).all() for v in (q, current, previous)):
+        return "invalid_target"
+    lo, hi = np.asarray(limits).T
+    if np.any(q < lo) or np.any(q > hi):
+        return "operational_limits"
+    if np.any(np.abs(q - previous) > jump_limit):
+        return "jump"
+    if np.max(np.abs(q - current)) > np.deg2rad(150):
+        return "hw_dist"
+    return None
+
+
 @dataclass(kw_only=True)
 class IKResult:
     success: bool
@@ -44,7 +62,7 @@ class IKFailureKind(str, Enum):
 class OnlineIKConfig:
     """Bounded online search; all joint radii are maximum component displacements."""
 
-    max_ik_jump_deg: tuple[float, ...] = (30, 30, 30, 35, 40, 40, 40)
+    max_ik_jump_deg: tuple[float, ...] = DEFAULT_JUMP_DEG
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
     fast_accept_max_delta_deg: float = 8.0
@@ -371,18 +389,9 @@ class OnlineIKSolver:
 
     def dynamic_rejection(self, q, current, previous):
         """Recheck a frozen solution against new feedback without changing its branch."""
-        q, current, previous = (self._finite_q(value) for value in (q, current, previous))
-        lo, hi = self.operational_limits.T
-        if np.any(q < lo) or np.any(q > hi):
-            return "operational_limits"
-        delta_prev = q - previous
-        if np.any(np.abs(delta_prev) > self._jump_limit):
-            return "jump"
-        delta = q - current
-        distance = float(np.max(np.abs(delta)))
-        if distance > np.deg2rad(150):
-            return "hw_dist"
-        return None
+        return joint_target_rejection(
+            q, current, previous, self.operational_limits, self._jump_limit
+        )
 
     def _prepare_candidate(self, raw, attempt, target, current, previous, pool, report):
         # Mechanical equivalence survives narrowing the operational interval below 2*pi.

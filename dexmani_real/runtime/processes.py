@@ -152,7 +152,7 @@ def shutdown_local_runtime(robot, supervisor, *, model=None, keyboard=None, time
     revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
     clean = True
     for close in (
-        robot.close if robot._owner is not None else None,
+        robot.close if robot is not None and robot._owner is not None else None,
         model.close if model is not None else None,
         keyboard.stop if keyboard is not None else None,
     ):

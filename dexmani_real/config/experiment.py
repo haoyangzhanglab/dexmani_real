@@ -13,9 +13,9 @@ import numpy as np
 import yaml
 
 from dexmani_real.config.control import (
+    ControlParams,
     DexPilotRetargetingParams,
     KeyboardTeleopParams,
-    PolicyParams,
     SafetyParams,
     TAGRetargetingParams,
     TeleopTimingParams,
@@ -35,7 +35,7 @@ class ExperimentConfig:
 
     arm: ArmParams = field(default_factory=ArmParams)
     hand: HandParams = field(default_factory=HandParams)
-    policy: PolicyParams = field(default_factory=PolicyParams)
+    policy: ControlParams = field(default_factory=ControlParams)
     teleop: TeleopTimingParams = field(default_factory=TeleopTimingParams)
     keyboard_teleop: KeyboardTeleopParams = field(default_factory=KeyboardTeleopParams)
     vr: VRParams = field(default_factory=VRParams)

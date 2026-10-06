@@ -69,6 +69,8 @@ class XArm7MotionPlanner:
         planning_profile: MotionPlanningConfig | None = None,
         online_ik_profile: OnlineIKConfig | None = None,
         hand_dof: bool = True,
+        *,
+        hand_mount,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
     ) -> None:
@@ -97,14 +99,25 @@ class XArm7MotionPlanner:
                 "generate model assets explicitly before starting the runtime"
             )
 
-        self.mplib_planner = self.mplib.Planner(
-            urdf=str(config.urdf_path),
-            srdf=str(config.srdf_path),
-            move_group=config.eef_link_name,
-            use_convex=config.use_convex,
-            joint_vel_limits=joint_vel_limits.tolist(),
-            joint_acc_limits=joint_acc_limits.tolist(),
-        )
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from .kinematics.urdf import urdf_with_hand_mount
+
+        # MPLib 0.2.1 loads model and meshes in its constructor; no later file reads.
+        with TemporaryDirectory(prefix="dexmani-mount-") as directory:
+            temporary_urdf = Path(directory) / "robot.urdf"
+            temporary_urdf.write_text(
+                urdf_with_hand_mount(config.urdf_path, *hand_mount, mesh_directory=directory)
+            )
+            self.mplib_planner = self.mplib.Planner(
+                urdf=str(temporary_urdf),
+                srdf=str(config.srdf_path),
+                move_group=config.eef_link_name,
+                use_convex=config.use_convex,
+                joint_vel_limits=joint_vel_limits.tolist(),
+                joint_acc_limits=joint_acc_limits.tolist(),
+            )
         self.pinocchio_model = self.mplib_planner.pinocchio_model
 
         link_names = list(self.pinocchio_model.get_link_names())
@@ -158,6 +171,7 @@ class XArm7MotionPlanner:
         # Pinocchio checks online IK endpoints and planned home paths.
         self.collision_model = CollisionModel(
             hand_dof=hand_dof,
+            hand_mount=hand_mount,
             static_boxes=static_boxes,
             table=table,
         )
@@ -177,6 +191,8 @@ class XArm7MotionPlanner:
     @classmethod
     def create_default(
         cls,
+        *,
+        hand_mount,
         planning_profile: MotionPlanningConfig | None = None,
         online_ik_profile: OnlineIKConfig | None = None,
         static_boxes: Iterable[Any] = (),
@@ -189,6 +205,7 @@ class XArm7MotionPlanner:
         )
         return cls(
             cfg,
+            hand_mount=hand_mount,
             planning_profile=planning_profile,
             online_ik_profile=online_ik_profile,
             static_boxes=static_boxes,
@@ -397,19 +414,33 @@ class XArm7MotionPlanner:
                 candidate, target_eef_pose_world, current_qpos, profile
             )
             failure = None
-            for check in (
-                self._check_limit_violation,
-                self._check_elbow_consistency,
-                self._check_start_distance,
-                self._check_waypoint_delta,
-                self._check_terminal_pose,
-                self._check_workspace,
-                self._check_self_collision,
+            if report.get("limit_violation"):
+                failure = self._make_failure("Path violates planning limits.", source, report)
+            if failure is None:
+                failure = self._check_elbow_consistency(candidate, report, source, profile)
+            if (
+                failure is None
+                and report["start_qpos_error_rad"]
+                > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12
             ):
-                failure = check(candidate, report, source, profile)
-                if failure is not None:
-                    break
-
+                failure = self._make_failure(
+                    "Path start is too far from current_qpos.", source, report
+                )
+            if (
+                failure is None
+                and report["max_waypoint_delta_rad"]
+                > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12
+            ):
+                failure = self._make_failure("Path waypoint delta too large.", source, report)
+            if failure is None and (
+                report["terminal_pos_error_m"] > profile.max_pose_error_pos_m
+                or report["terminal_rot_error_rad"] > profile.max_pose_error_rot_rad
+            ):
+                failure = self._make_failure("Terminal pose error too large.", source, report)
+            if failure is None:
+                failure = self._check_workspace(candidate, report, source, profile)
+            if failure is None:
+                failure = self._check_self_collision(candidate, report, source, profile)
             if failure is None:
                 # All checks passed.
                 if attempt_label == "unsmoothed":
@@ -435,39 +466,12 @@ class XArm7MotionPlanner:
             success=False, qpos_path=None, source=source, reason=reason, report=report
         )
 
-    def _check_limit_violation(self, _path, report, source, _profile):
-        """Fail if the planner report flags a joint limit violation."""
-        if report.get("limit_violation"):
-            return self._make_failure("Path violates planning limits.", source, report)
-        return None
-
     def _check_elbow_consistency(self, path, report, source, _profile):
         """Fail if the path contains an elbow branch flip (J4 crossing ±360° bands)."""
         has_flip, flip_info = self.check_elbow_consistency(path)
         if has_flip:
             report.update(flip_info)
             return self._make_failure("Elbow branch flip detected.", source, report)
-        return None
-
-    def _check_start_distance(self, _path, report, source, profile):
-        """Fail if the path start is too far from current joint positions."""
-        if report["start_qpos_error_rad"] > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12:
-            return self._make_failure("Path start is too far from current_qpos.", source, report)
-        return None
-
-    def _check_waypoint_delta(self, _path, report, source, profile):
-        """Fail if any consecutive waypoint step exceeds the delta limit."""
-        if report["max_waypoint_delta_rad"] > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12:
-            return self._make_failure("Path waypoint delta too large.", source, report)
-        return None
-
-    def _check_terminal_pose(self, _path, report, source, profile):
-        """Fail if the final waypoint EEF pose error exceeds thresholds."""
-        if (
-            report["terminal_pos_error_m"] > profile.max_pose_error_pos_m
-            or report["terminal_rot_error_rad"] > profile.max_pose_error_rot_rad
-        ):
-            return self._make_failure("Terminal pose error too large.", source, report)
         return None
 
     def _check_workspace(self, path, report, source, _profile):

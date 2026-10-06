@@ -26,6 +26,7 @@ class InferenceWorker:
         self._closing = False
         self.closed = False
         self.close_error = None
+        self.query_context = None
 
     def _call(self, operation, args, kwargs):
         start = time.monotonic_ns()
@@ -58,6 +59,7 @@ class InferenceWorker:
         if self._closing:
             return
         self._closing = True
+        retired_context = self.query_context
 
         def closed(future):
             try:
@@ -73,6 +75,13 @@ class InferenceWorker:
         def recovered(future):
             if future is not None:
                 result = future.result()
+                logger.info(
+                    "retired model result after shutdown: context=%s started_ns=%s completed_ns=%s error=%s",
+                    retired_context,
+                    result.started_ns,
+                    result.completed_ns,
+                    result.error,
+                )
                 if result.error is not None:
                     logger.error("retired model task failed during shutdown: %s", result.error)
             if self._model is None:

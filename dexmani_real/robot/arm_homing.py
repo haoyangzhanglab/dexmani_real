@@ -208,6 +208,7 @@ def build_policy_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
         ),
         online_ik_profile=make_online_ik_config(runtime),
         hand_dof=True,
+        hand_mount=(runtime.hand.T_eef_handbase_pos_xyz, runtime.hand.T_eef_handbase_quat_wxyz),
         static_boxes=tuple(runtime.environment.static_boxes),
         table=runtime.environment.table,
     )
@@ -249,7 +250,7 @@ def home_policy_robot(shared, runtime, planner, *, robot, abort_requested):
     finally:
         try:
             # execute_arm_home owns its completed stop; retry only unresolved motion.
-            if robot._motion_active or robot._hand_stop_pending:
+            if robot.stop_required:
                 robot.stop()
         except Exception:
             if failure is None:

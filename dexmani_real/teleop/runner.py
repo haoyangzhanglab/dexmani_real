@@ -376,6 +376,101 @@ class TeleopRunner:
         print("准备进入遥操作", flush=True)
         return True
 
+    def _run_control_tick(self):
+        if (
+            self.recorder is not None
+            and self.recorder.is_recording
+            and time.monotonic() - self.capture_started_s
+            >= self.runtime.policy.max_record_duration_s
+        ):
+            self._pause_control("max_record_duration", run_end_reason=RunEndReason.TIMEOUT)
+            self._finish_capture(True, "max_record_duration")
+            return
+        self.next_tick = time.monotonic() + self.control_dt
+        row = read_observation(
+            self.shared,
+            self.runtime,
+            self.robot,
+            require_hand=self.runtime.policy.hand_enabled,
+            require_camera=self.recorder is not None,
+            require_vr=True,
+        )
+        if row is None:
+            if self.recorder is not None:
+                from dexmani_real.runtime.observation import (
+                    read_camera_frame,
+                    sample_is_fresh,
+                )
+
+                camera = read_camera_frame(self.shared)
+                if camera is None or not sample_is_fresh(
+                    camera["timestamp_ns"], self.runtime.camera.max_frame_age_s
+                ):
+                    revoke_motion(self.shared, reason=RunEndReason.HARDWARE_FAULT)
+                    self._stop_capture("camera_unavailable")
+                    raise RuntimeError("required recording camera unavailable")
+            self._stop_capture("observation_unavailable")
+            return
+        if self.paused:
+            self._try_resume(row)
+            return
+        self._execute_control_step(row)
+
+    def _shutdown_capture_and_inputs(self, failure):
+        revoke_motion(self.shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
+        try:
+            if self.robot.stop_required:
+                self._stop_motion("shutdown_stop")
+        except Exception as exc:
+            if failure is None:
+                failure = exc
+            logger.exception("teleop stop failed")
+        try:
+            if self.controller is not None:
+                self.controller.clear_reference()
+        except Exception as exc:
+            if failure is None:
+                failure = exc
+            self.termination_details.append(
+                dict(
+                    stage="reference_cleanup",
+                    exception_type=type(exc).__name__,
+                    message=str(exc),
+                )
+            )
+            logger.exception("teleop reference cleanup failed")
+        try:
+            if self.recorder is not None:
+                if self.recorder.is_recording:
+                    self._finish_capture(True, "interrupted", announce=False)
+        except Exception as exc:
+            if failure is None:
+                failure = exc
+            logger.exception("teleop recording cleanup failed")
+        finally:
+            if self.recorder is not None:
+                try:
+                    self.recorder.close()
+                except Exception as exc:
+                    if failure is None:
+                        failure = exc
+                    logger.exception("teleop recorder close failed")
+        try:
+            # Motion is revoked and recording is finalized. Let the exit
+            # or emergency cue finish before close() cancels the player.
+            if not self.audio.wait_until_idle(timeout_s=_END_AUDIO_GRACE_S):
+                logger.warning("Final audio did not finish within %.1fs", _END_AUDIO_GRACE_S)
+        except Exception:
+            logger.warning("Final audio unavailable", exc_info=True)
+        for close in (self.keyboard.stop, self.audio.close):
+            try:
+                close()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+                logger.exception("teleop resource cleanup failed")
+        return failure
+
     def run(self) -> None:
         failure = None
         try:
@@ -433,44 +528,7 @@ class TeleopRunner:
                     continue
                 if not self.paused and time.monotonic() < self.next_tick:
                     continue
-                if (
-                    self.recorder is not None
-                    and self.recorder.is_recording
-                    and time.monotonic() - self.capture_started_s
-                    >= self.runtime.policy.max_record_duration_s
-                ):
-                    self._pause_control("max_record_duration", run_end_reason=RunEndReason.TIMEOUT)
-                    self._finish_capture(True, "max_record_duration")
-                    continue
-                self.next_tick = time.monotonic() + self.control_dt
-                row = read_observation(
-                    self.shared,
-                    self.runtime,
-                    self.robot,
-                    require_hand=self.runtime.policy.hand_enabled,
-                    require_camera=self.recorder is not None,
-                    require_vr=True,
-                )
-                if row is None:
-                    if self.recorder is not None:
-                        from dexmani_real.runtime.observation import (
-                            read_camera_frame,
-                            sample_is_fresh,
-                        )
-
-                        camera = read_camera_frame(self.shared)
-                        if camera is None or not sample_is_fresh(
-                            camera["timestamp_ns"], self.runtime.camera.max_frame_age_s
-                        ):
-                            revoke_motion(self.shared, reason=RunEndReason.HARDWARE_FAULT)
-                            self._stop_capture("camera_unavailable")
-                            raise RuntimeError("required recording camera unavailable")
-                    self._stop_capture("observation_unavailable")
-                    continue
-                if self.paused:
-                    self._try_resume(row)
-                    continue
-                self._execute_control_step(row)
+                self._run_control_tick()
         except KeyboardInterrupt:
             self.shared.estop_request.value = True
             revoke_motion(self.shared, reason=RunEndReason.ESTOP)
@@ -490,57 +548,6 @@ class TeleopRunner:
             logger.exception("teleop failed")
             self.audio.play("emergency")
         finally:
-            revoke_motion(self.shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
-            try:
-                if self.robot._motion_active or self.robot._hand_stop_pending:
-                    self._stop_motion("shutdown_stop")
-            except Exception as exc:
-                if failure is None:
-                    failure = exc
-                logger.exception("teleop stop failed")
-            try:
-                if self.controller is not None:
-                    self.controller.clear_reference()
-            except Exception as exc:
-                if failure is None:
-                    failure = exc
-                self.termination_details.append(
-                    dict(
-                        stage="reference_cleanup",
-                        exception_type=type(exc).__name__,
-                        message=str(exc),
-                    )
-                )
-                logger.exception("teleop reference cleanup failed")
-            try:
-                if self.recorder is not None:
-                    if self.recorder.is_recording:
-                        self._finish_capture(True, "interrupted", announce=False)
-            except Exception as exc:
-                if failure is None:
-                    failure = exc
-                logger.exception("teleop recording cleanup failed")
-            finally:
-                if self.recorder is not None:
-                    try:
-                        self.recorder.close()
-                    except Exception as exc:
-                        if failure is None:
-                            failure = exc
-                        logger.exception("teleop recorder close failed")
-            try:
-                # Motion is revoked and recording is finalized. Let the exit
-                # or emergency cue finish before close() cancels the player.
-                if not self.audio.wait_until_idle(timeout_s=_END_AUDIO_GRACE_S):
-                    logger.warning("Final audio did not finish within %.1fs", _END_AUDIO_GRACE_S)
-            except Exception:
-                logger.warning("Final audio unavailable", exc_info=True)
-            for close in (self.keyboard.stop, self.audio.close):
-                try:
-                    close()
-                except Exception as exc:
-                    if failure is None:
-                        failure = exc
-                    logger.exception("teleop resource cleanup failed")
+            failure = self._shutdown_capture_and_inputs(failure)
         if failure is not None:
             raise failure

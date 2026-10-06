@@ -37,8 +37,8 @@ def _parser() -> argparse.ArgumentParser:
         metavar="episodes/<task_name>",
         help=(
             "One raw task or episode directory. Exports to "
-            "datasets/<task_name>.zarr by default (see --output); existing "
-            "output paths require --overwrite."
+            "datasets/<task_name>.zarr by default (see --output). "
+            "The destination must not already exist."
         ),
     )
     parser.add_argument(
@@ -48,8 +48,8 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "Alternative Zarr cache output path for this task "
             "(default: datasets/<task_name>.zarr). The default cache name "
-            "comes from the input directory; task labels come from Raw. Existing caches require --overwrite, "
-            "and the resolved target (symlinks followed) must not fall "
+            "comes from the input directory; task labels come from Raw. "
+            "The destination must be new and must not be a symlink. Its resolved path must not fall "
             "inside the protected sources: episodes/, episodes_processed/, "
             "rollouts/, the input root, or an existing .zarr store."
         ),
@@ -72,17 +72,12 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
     )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Complete conversion in staging before replacing an existing canonical cache.",
-    )
     parser.add_argument("--chunk-frames", type=int, default=100)
     parser.add_argument("--compression-level", type=int, default=3)
     return parser
 
 
-# Protect repository-relative raw, legacy processed and rollout data.
+# Keep export destinations outside experiment data directories.
 _PROTECTED_SOURCE_ROOTS = ("episodes", "episodes_processed", "rollouts")
 
 
@@ -168,7 +163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
     progress = _ExportProgress()
     report: dict
-    if target_is_occupied(output_path) and not args.overwrite:
+    if target_is_occupied(output_path):
         print(
             f"error: refusing to overwrite existing output: {output_path}",
             file=sys.stderr,
@@ -187,7 +182,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             config,
             processing=processing,
             exclude=tuple(args.exclude),
-            overwrite=args.overwrite,
             progress_callback=progress.update,
         )
     except (FileExistsError, FileNotFoundError, NotADirectoryError) as exc:

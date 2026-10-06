@@ -201,11 +201,9 @@ def main(argv: list[str] | None = None) -> int:
             ExecutionConfig,
             PolicyRuntimeConfig,
             RolloutRecordingConfig,
-            validate_policy_runtime_compatibility,
         )
 
         runtime = resolve_experiment_config(yaml_path=args.config)
-        validate_policy_runtime_compatibility(info, runtime)
         execution = ExecutionConfig(
             args.execution_mode,
             args.max_decision_age,
@@ -213,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
             args.max_tick_lateness,
             args.prefetch_steps,
             args.rtc_guidance_cap,
-        ).validate(info)
+        )
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
         _safe_selector_parts(selector)
     except Exception as exc:

@@ -10,7 +10,7 @@ from dexmani_real.deployment.inference import ModelResult
 from dexmani_real.deployment.observation import decision_is_fresh, policy_sources
 from dexmani_real.deployment.runner import PolicyRunner
 from dexmani_real.planning.kinematics.ik import IKFailureKind, IKResult
-from dexmani_real.robot.action import ActionRealization
+from dexmani_real.robot.action import ActionRealization, ActionRealizer
 from dexmani_real.robot.robot import DispatchInterrupted, DispatchResult, DispatchStatus
 from dexmani_real.runtime.observation import ObservationRow
 from dexmani_real.runtime.safety import RunEndReason, SafetyState, request_policy_stop
@@ -46,8 +46,7 @@ class Worker:
 
 
 class Robot:
-    _motion_active = False
-    _hand_stop_pending = False
+    stop_required = False
 
     def __init__(self):
         self.sent = []
@@ -73,6 +72,24 @@ class Robot:
 
 @pytest.fixture
 def make_runner(monkeypatch):
+    factory = ActionRealizer.for_mode
+    # Scheduling oracles use a collision-free synthetic scene; native admission
+    # and mount propagation are covered separately with actual model assets.
+    monkeypatch.setattr(
+        ActionRealizer,
+        "for_mode",
+        lambda runtime, mode: (
+            ActionRealizer(
+                runtime,
+                collision_model=NS(
+                    set_hand_qpos=lambda q: None, check_self_collision=lambda q: False
+                ),
+            )
+            if mode == "joint"
+            else factory(runtime, mode)
+        ),
+    )
+
     def make(mode="async", a=3, d=2, n=2, h=8, execute=True, wait=1.0):
         clock = NS(now=1_000_000_000)
         monkeypatch.setattr("time.monotonic_ns", lambda: clock.now)
@@ -135,13 +152,14 @@ def make_runner(monkeypatch):
             robot=robot,
             model_runtime=worker,
             execution_config=ExecutionConfig(mode, 10.0, wait, 0.03, d, 2.0),
-            fingertip_runtime=None,
+            kinematics=None,
             execute=execute,
             max_running_s=100.0,
             num_episodes=10,
         )
         runner._read_observation = row
         runner.run_id = 1
+        runner.recording_started = True  # The fixture starts inside a synthetic active run.
         runner.started_ns = clock.now
         runner.next_step_ns = clock.now
         runner.wait_started_ns = clock.now
@@ -404,8 +422,10 @@ def test_prepare_is_transactional_and_frozen_dynamic_rejection(make_runner):
     r = make_runner(mode="rtc")
     b = bootstrap(r)
     r.realizer.frozen_is_valid = lambda *args: False
+    r.realizer.rejection_reason = "self_collision"
     r.tick(b + 1)
     assert r.plan is None and len(r.robot.sent) == 1 and not r.query.valid
+    assert any(e["event"] == "invalidate" and e["reason"] == "self_collision" for e in r.events)
 
 
 def test_epoch_latch_cannot_be_replaced_by_later_revocation(make_runner):
@@ -464,7 +484,11 @@ def test_eef_runner_prefix_uses_real_fk_and_same_joint_command(make_runner):
     from dexmani_real.robot.action import ActionRealizer
 
     r = make_runner(mode="rtc", n=1)
+    from dataclasses import replace
+
     cfg = ExperimentConfig()
+    # Explicit nominal test asset, not the current physical mount.
+    cfg = replace(cfg, hand=replace(cfg.hand, T_eef_handbase_pos_xyz=(-0.005, 0, 0)))
     q = np.asarray(cfg.arm.home_qpos)
     hand = np.deg2rad(cfg.hand.home_qpos_deg)
     r.runtime = cfg
@@ -493,22 +517,8 @@ def test_eef_runner_prefix_uses_real_fk_and_same_joint_command(make_runner):
     np.testing.assert_array_equal(r.previous_arm, q)
     r.plan.frozen.update(commands)
     r.last_slot = 0
-    r._send(row, 0)
+    r._execute_slot(row, 0)
     assert r.robot.sent[0] is commands[0]
-
-
-def test_mode_change_requires_idle_and_serial_configuration(make_runner):
-    r = make_runner()
-    config = ExecutionConfig("rtc", 10.0, 1.0, 0.03, 2, 2.0)
-    with pytest.raises(RuntimeError):
-        r.set_execution_mode(config)
-    r._finish_episode("test")
-    r.runtime.camera = NS(height=16, width=16)
-    r.set_execution_mode(config)
-    assert r.model.submissions[-1][0] == "configure_execution"
-    assert r.model.submissions[-1][2]["warmup"]
-    with pytest.raises(RuntimeError):
-        r.set_execution_mode(config)
 
 
 def test_slow_observation_read_breaks_history_even_without_full_slot_skip(make_runner):
@@ -619,107 +629,6 @@ def test_eef_prefix_no_solution_retains_wait_and_bootstrap(make_runner, mode, fa
     r.tick(b + 2)
     assert [op for op, _, _ in r.model.submissions] == ["predict", "predict"]
     assert r.query.handoff_slot is None and r.wait_started_ns == deadline
-
-
-@pytest.fixture
-def idle_runner(make_runner):
-    r = make_runner(mode="sync", execute=False)
-    r._finish_episode("test setup")
-    r.runtime.camera = NS(height=16, width=16)
-    r._start_observation = r._read_observation
-    r.recorder = NS(
-        execution_path="worker_grid_sync_v1", check_error=lambda: None, close=lambda: None
-    )
-    return r
-
-
-@pytest.mark.parametrize(
-    "mode,age,wait,durations,message",
-    [
-        ("async", 10.0, 1.0, (0.01, 2.0), "max_wait_s"),
-        ("rtc", 10.0, 1.0, (0.01, 2.0), "max_wait_s"),
-        ("sync", 10.0, 1.0, (1.0,), "max_wait_s"),
-        ("async", 10.0, 1.0, (0.2,), "prefetch budget"),
-        ("rtc", 10.0, 1.0, (0.2,), "prefetch budget"),
-        ("sync", 0.5, 1.0, (0.3,), "max_decision_age_s"),
-        ("sync", 0.5, 1.0, (0.31,), "max_decision_age_s"),
-    ],
-)
-def test_mode_warmup_budget_failure_blocks_start_and_preserves_official_config(
-    idle_runner, mode, age, wait, durations, message
-):
-    r = idle_runner
-    old = r.execution
-    config = ExecutionConfig(mode, age, wait, 0.03, 2, 2.0)
-    r.set_execution_mode(config)
-    assert r.execution is old and r.recorder.execution_path == "worker_grid_sync_v1"
-    assert r.pending_execution is config
-    r.shared.start_request.value = True
-    r.step()
-    assert r.preparing_epoch is None and r.model.op == "configure_execution"
-    r.model.complete(durations)
-    with pytest.raises(ValueError, match=message):
-        r.run()
-    assert r.execution is old and r.recorder.execution_path == "worker_grid_sync_v1"
-    assert r.run_id is None and r.preparing_epoch is None
-    assert r.shared.error_state.value and not r.shared.is_running.value
-    assert [op for op, _, _ in r.model.submissions] == ["configure_execution"]
-    assert r.model.future is None and r.model.closed
-    assert r.pending_execution is config
-    with pytest.raises(RuntimeError):
-        r.set_execution_mode(config)
-    assert [op for op, _, _ in r.model.submissions] == ["configure_execution"]
-
-
-def test_mode_worker_failure_blocks_start_and_preserves_official_config(idle_runner):
-    r = idle_runner
-    old = r.execution
-    r.set_execution_mode(ExecutionConfig("rtc", 10.0, 1.0, 0.03, 2, 2.0))
-    r.shared.start_request.value = True
-    r.model.complete(error=RuntimeError("warmup failed"))
-    with pytest.raises(RuntimeError, match="warmup failed"):
-        r.run()
-    assert r.execution is old and r.recorder.execution_path == "worker_grid_sync_v1"
-    assert r.run_id is None and r.preparing_epoch is None and r.model.closed
-    assert [op for op, _, _ in r.model.submissions] == ["configure_execution"]
-
-
-@pytest.mark.parametrize("mode", ["sync", "async", "rtc"])
-def test_legal_mode_warmup_commits_before_reset_and_start(idle_runner, mode, monkeypatch):
-    r = idle_runner
-    old = r.execution
-    config = ExecutionConfig(mode, 10.0, 1.0, 0.03, 2, 2.0)
-    r.reset_ready = True
-    r.set_execution_mode(config)
-    op, _, kwargs = r.model.submissions[-1]
-    assert op == "configure_execution" and kwargs["warmup"]
-    assert kwargs["rtc_delay"] == (2 if mode == "rtc" else 0)
-    r.shared.start_request.value = True
-    r.step()
-    assert r.execution is old and r.recorder.execution_path == "worker_grid_sync_v1"
-    assert not r.reset_ready
-    assert r.preparing_epoch is None and len(r.model.submissions) == 1
-    r.model.complete((0.01, 0.19))
-    r.step()
-    assert r.execution is config and r.recorder.execution_path == f"worker_grid_{mode}_v1"
-    assert r.pending_execution is None
-    assert [op for op, _, _ in r.model.submissions] == ["configure_execution", "reset_episode"]
-    assert r.run_id is None and r.preparing_epoch is not None
-    r.recording_config = NS(task_label="synthetic")
-    r.recorder.start_episode = lambda **kwargs: True
-    r.recorder.is_recording = False
-    r.recorder.add_frame = lambda frame: None
-    monkeypatch.setattr(
-        "dexmani_real.deployment.runner.snapshot_recording_metadata", lambda *args, **kwargs: {}
-    )
-    monkeypatch.setattr(
-        "dexmani_real.deployment.runner.build_episode_frame", lambda row, *args: row
-    )
-    r.model.complete()
-    r.step()
-    assert r.run_id is not None
-    assert r.events[0]["event"] == "begin" and r.events[0]["mode"] == mode
-    assert [op for op, _, _ in r.model.submissions] == ["configure_execution", "reset_episode"]
 
 
 def test_future_finishes_while_reading_observation(make_runner):
@@ -890,3 +799,183 @@ def test_late_return_writer_finalization_failure_keeps_dispatch_and_end(make_run
     assert r.shared.run_ended_reason.value == (
         RunEndReason.ESTOP if cancelled else RunEndReason.TIMEOUT
     )
+
+
+@pytest.mark.parametrize(
+    "stop_fails,writer_fails", [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_attempt_finalization_orders_stop_before_sidecar(
+    make_runner, tmp_path, monkeypatch, stop_fails, writer_fails
+):
+    import json
+
+    from dexmani_real.recording.results import SessionResults
+
+    r = make_runner()
+    r.results = SessionResults(tmp_path, "policy")
+    attempt = r.results.prepare(recording=True)
+    r.results.entered(r.run_id)
+    order = []
+
+    def stop():
+        assert r.run_id is None
+        order.append("stop")
+        if stop_fails:
+            raise RuntimeError("stop failed")
+
+    def save(**kw):
+        order.append("raw")
+        if writer_fails:
+            raise RuntimeError("writer failed")
+
+    r.robot.stop = stop
+    r.recorder = NS(save_episode=save, written_frames=0, staging_path=tmp_path / "staging")
+    native = np.savez
+
+    def sidecar(*a, **kw):
+        assert order == ["stop", "raw"]
+        order.append("sidecar")
+        native(*a, **kw)
+
+    monkeypatch.setattr(np, "savez", sidecar)
+    r.query_arrays = {"query_1": np.ones((2, 19), dtype=np.float16)}
+    if stop_fails or writer_fails:
+        with pytest.raises(RuntimeError, match="stop failed" if stop_fails else "writer failed"):
+            r._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
+    else:
+        r._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
+    result = json.loads((tmp_path / "attempts" / f"{attempt}.json").read_text())
+    assert result["entered_running"] and result["row_count"] == 0
+    assert result["recording_status"] == ("failed" if writer_fails else "empty")
+    assert result["termination_reason"] == "timeout"
+    assert len(result["finalization_errors"]) == int(stop_fails) + int(writer_fails)
+    with np.load(result["query_sidecar"]) as arrays:
+        assert arrays["query_1"].dtype == np.float16
+    r._finish_episode("again")
+    assert order == ["stop", "raw", "sidecar"]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_start_result_io_precedes_final_fresh_observation(
+    make_runner, tmp_path, monkeypatch, cancel
+):
+    import json
+
+    from dexmani_real.recording.results import SessionResults
+
+    r = make_runner()
+    r.run_id = None
+    r.shared.safety_state.value = int(SafetyState.ARMED)
+    r.shared.start_request.value = True
+    r.results = SessionResults(tmp_path, "policy")
+    reads = []
+
+    def observe():
+        reads.append(r.clock.now)
+        if len(reads) == 2:
+            assert r.results.attempt["entered_running"] is None
+            assert r.clock.now > reads[0]
+        return r._read_observation()
+
+    r._start_observation = observe
+    r._begin_episode()
+    attempt = r.results.attempt["attempt_id"]
+    r.model.complete()
+    r._poll_model()
+    r.clock.now += 1_000_000_000
+    if cancel:
+        r.shared.quit_requested.value = True
+    r._begin_episode()
+    if cancel:
+        assert r.completed == 0 and r.run_id is None
+        result = json.loads((tmp_path / "attempts" / f"{attempt}.json").read_text())
+        assert (
+            result["entered_running"] is False and result["termination_reason"] == "start_cancelled"
+        )
+    else:
+        assert len(reads) == 2 and r.run_id is not None
+        assert r.results.attempt["entered_running"] is True
+        r._finish_episode("operator")
+
+
+def test_start_result_failure_never_grants_motion(make_runner, tmp_path, monkeypatch):
+    import dexmani_real.recording.results as records
+
+    r = make_runner()
+    r.run_id = None
+    r.shared.safety_state.value = int(SafetyState.ARMED)
+    r.shared.start_request.value = True
+    r.results = records.SessionResults(tmp_path, "policy")
+    r._start_observation = r._read_observation
+    monkeypatch.setattr(
+        records, "atomic_json_dump", lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full"))
+    )
+    with pytest.raises(OSError):
+        r._begin_episode()
+    assert r.run_id is None and r.shared.safety_state.value == int(SafetyState.ARMED)
+    assert r.model.future is None
+
+
+def test_joint_rejection_without_ik_result_remains_wait(make_runner):
+    r = make_runner(mode="sync")
+    bootstrap(r)
+    r.realizer.realize = lambda *a: ActionRealization(None, np.zeros(12), rejection_reason="jump")
+    before = len(r.robot.sent)
+    r.tick(r.last_slot + 1)
+    assert len(r.robot.sent) == before and r.run_id is not None and r.plan is None
+    assert any(e["event"] == "invalidate" and e["reason"] == "jump" for e in r.events)
+
+
+@pytest.mark.parametrize("cancel_at", ["reset", "metadata", "recorder_start"])
+def test_cancelled_attempt_never_reuses_previous_raw_evidence(
+    make_runner, tmp_path, monkeypatch, cancel_at
+):
+    import json
+
+    from test_policy_recording import start_recording
+
+    from dexmani_real.recording.recorder import RecordingError
+    from dexmani_real.recording.results import SessionResults
+
+    r = make_runner()
+    r.recorder = start_recording(tmp_path / "raw")
+    previous = r.recorder.save_episode(reason="operator")
+    previous_data = (previous / "data.h5").read_bytes()
+    assert r.recorder.written_frames == 1
+    r.recording_config = NS(task_label="synthetic")
+    r.run_id = None
+    r.completed = 1
+    r.shared.safety_state.value = int(SafetyState.ARMED)
+    r.shared.start_request.value = True
+    r.results = SessionResults(tmp_path / "results", "policy")
+    r._start_observation = r._read_observation
+    r._begin_episode()
+    attempt = r.results.attempt["attempt_id"]
+    r.model.complete()
+    r._poll_model()
+    if cancel_at == "reset":
+        r.shared.quit_requested.value = True
+        r._begin_episode()
+    else:
+
+        def metadata(*args, **kwargs):
+            if cancel_at == "metadata":
+                raise ValueError("missing metadata")
+            return dict(
+                collection_source="policy_rollout",
+                camera_geometry=None,  # Invalid before any new staging is created.
+                camera_T_xarm_base_from_color=None,
+                depth_scale=0.001,
+                handbase_position_eef_m=np.zeros(3),
+                handbase_quat_eef_wxyz=np.array([1.0, 0, 0, 0]),
+            )
+
+        monkeypatch.setattr("dexmani_real.deployment.runner.snapshot_recording_metadata", metadata)
+        with pytest.raises(ValueError if cancel_at == "metadata" else RecordingError):
+            r._begin_episode()
+    record = json.loads((tmp_path / "results" / "attempts" / f"{attempt}.json").read_text())
+    assert record["entered_running"] is False and record["row_count"] == 0
+    assert record["raw_path"] is None and record["staging_path"] is None
+    assert record["termination_reason"] == "start_cancelled"
+    assert r.completed == 1 and r.run_id is None
+    assert (previous / "data.h5").read_bytes() == previous_data

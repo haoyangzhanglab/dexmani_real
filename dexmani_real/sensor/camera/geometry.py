@@ -102,19 +102,7 @@ class CameraIntrinsics:
         coefficients = value["distortion_coeffs"]
         if not isinstance(coefficients, (list, tuple)):
             raise TypeError("distortion_coeffs must be an array")
-        return cls(
-            width=_positive_int(value["width"], name="width"),
-            height=_positive_int(value["height"], name="height"),
-            fx=float(value["fx"]),
-            fy=float(value["fy"]),
-            ppx=float(value["ppx"]),
-            ppy=float(value["ppy"]),
-            distortion_model=str(value["distortion_model"]),
-            distortion_coeffs=cast(
-                tuple[float, float, float, float, float],
-                tuple(float(item) for item in coefficients),
-            ),
-        )
+        return cls(**value)
 
     def matrix(self, *, dtype: np.typing.DTypeLike = np.float64) -> np.ndarray:
         """Return the 3x3 pinhole intrinsic matrix."""
@@ -175,5 +163,5 @@ class RGBDGeometry:
         return cls(
             depth=CameraIntrinsics.from_dict(depth),
             color=CameraIntrinsics.from_dict(color),
-            T_color_from_depth=np.asarray(value["T_color_from_depth"], dtype=np.float64),
+            T_color_from_depth=value["T_color_from_depth"],
         )

@@ -262,13 +262,18 @@ def test_handeye_selects_qualified_candidate(monkeypatch):
         solver,
         "_compute_closed_loop_errors",
         lambda t, *args: (
-            (np.array([1.0, 1.0]), np.array([10.0, 10.0]))
+            (np.array([1.0, 1.0, 1.0]), np.array([10.0, 10.0, 10.0]))
             if t[0, 3] == 0
-            else (np.array([2.0, 2.0]), np.array([1.0, 1.0]))
+            else (np.array([2.0, 2.0, 2.0]), np.array([1.0, 1.0, 1.0]))
         ),
     )
     result = solver.calibrate_and_select(
-        *([[0, 0]] * 4), max_position_rms_mm=5, max_rotation_rms_deg=3
+        np.zeros((3, 3)),
+        np.array([[0, 0, 0], [0.3, 0, 0], [0, 0.4, 0]]),
+        np.zeros((3, 3)),
+        np.zeros((3, 3)),
+        max_position_rms_mm=5,
+        max_rotation_rms_deg=3,
     )
     assert result[1] == "B"
 
@@ -457,7 +462,15 @@ def test_teleop_cancel_records_once_before_propagation(monkeypatch, stop_fails):
             raise TimeoutError("STOP_TIMEOUT")
 
     robot.stop = stop
-    ctl = NS(runtime=robot.runtime, compute_command=lambda *a: (command, True, np.zeros(9)))
+    from dexmani_real.robot.action import ActionRealization
+
+    ctl = NS(
+        runtime=robot.runtime,
+        compute_target=lambda *a: ActionRealization(
+            command.arm_qpos, command.hand_qpos, eef_pose=np.zeros(9)
+        ),
+        commit_dispatched_target=lambda target: None,
+    )
     row = NS(arm={"timestamp_ns": [100]}, hand={"timestamp_ns": [100]}, vr={"recv_ts_ns": 100})
     recorder = NS(check_error=lambda: None, accepting_frames=True, add_frame=recorded.append)
     monkeypatch.setattr(controller, "build_episode_frame", lambda row, cmd, res: res)

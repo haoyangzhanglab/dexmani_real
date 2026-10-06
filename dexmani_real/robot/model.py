@@ -21,15 +21,6 @@ XHAND_FINGERTIP_LINK_NAMES: tuple[str, ...] = (
     "right_hand_ring_tip",
     "right_hand_pinky_tip",
 )
-if (
-    len(HAND_FINGER_NAMES) != HAND_FINGER_COUNT
-    or HAND_FINGER_COUNT != 5
-    or len(XHAND_TACTILE_SENSOR_FINGER_IDS) != HAND_FINGER_COUNT
-    or len(set(XHAND_TACTILE_SENSOR_FINGER_IDS)) != HAND_FINGER_COUNT
-    or set(XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID.values()) != set(range(HAND_FINGER_COUNT))
-    or len(XHAND_FINGERTIP_LINK_NAMES) != HAND_FINGER_COUNT
-):
-    raise RuntimeError("XHand finger and tactile sensor orders must match five fingers")
 TACTILE_POINTS_PER_FINGER = 120
 TACTILE_AXIS_COUNT = 3
 
@@ -58,8 +49,6 @@ XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
     "right_hand_pinky_joint1",
     "right_hand_pinky_joint2",
 )
-if len(XHAND_SDK_JOINT_NAMES) != HAND_DOF or len(set(XHAND_SDK_JOINT_NAMES)) != HAND_DOF:
-    raise RuntimeError("XHand SDK joint names must be unique and match HAND_DOF")
 
 XHAND_MODEL_DIR = ASSET_DIR / "robots" / "xhand"
 # Arm planning model with the hand geometry fixed in its open/home posture.

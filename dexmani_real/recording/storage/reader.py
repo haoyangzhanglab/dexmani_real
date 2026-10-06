@@ -60,6 +60,8 @@ class EpisodeReader:
     def __init__(self, episode_path: str | Path) -> None:
         self._path = Path(episode_path)
         self._data = self._rgb_decoder = None
+        self._fields = None
+        self._datasets = {}
         if not self._path.is_dir():
             raise ValueError(f"episode must be a directory: {self._path}")
         self._rgb_path = self._path / "rgb.mp4"
@@ -85,10 +87,18 @@ class EpisodeReader:
 
     @property
     def fields(self) -> frozenset[str]:
-        names = {key for key, value in self._data.items() if isinstance(value, h5py.Dataset)}
-        if self._rgb_path.is_file():
-            names.add("rgb")
-        return frozenset(names)
+        if self._data is None:
+            raise RuntimeError("Raw reader is closed")
+        if self._fields is None:
+            names = {key for key, value in self._data.items() if isinstance(value, h5py.Dataset)}
+            if self._rgb_path.is_file():
+                names.add("rgb")
+            self._fields = frozenset(names)
+        return self._fields
+
+    @property
+    def path(self):
+        return self._path
 
     def require_fields(self, *names: str) -> None:
         missing = set(names) - self.fields
@@ -103,11 +113,16 @@ class EpisodeReader:
             )
 
     def __getitem__(self, name):
+        if self._data is None:
+            raise RuntimeError("Raw reader is closed")
+        if name in self._datasets:
+            return self._datasets[name]
         array = self._data[name]
         if name in DATASET_SPECS:
             spec = DATASET_SPECS[name]
             if array.shape != (self.num_frames, *spec.tail_shape) or array.dtype != spec.dtype:
                 raise RawDataError(f"Raw {name}: incompatible shape/dtype")
+        self._datasets[name] = array
         return array
 
     @property
@@ -154,6 +169,8 @@ class EpisodeReader:
         yield from self._decoder().iter_frames()
 
     def close(self) -> None:
+        self._datasets.clear()
+        self._fields = None
         errors = []
         for name in ("_rgb_decoder", "_data"):
             resource = getattr(self, name)

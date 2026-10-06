@@ -164,6 +164,7 @@ def test_teleop_run_finally_saves_stop_failure(tmp_path, operator, reason):
         stop=stop,
         check=lambda: None,
         check_services=None,
+        stop_required=False,
         _motion_active=False,
         _hand_stop_pending=False,
     )

@@ -38,20 +38,14 @@ class ProcessingConfig:
     handbase_quat_eef_wxyz: tuple[float, ...] = HandParams.T_eef_handbase_quat_wxyz
 
     @classmethod
-    def from_runtime(cls, runtime: object, **overrides: Any) -> "ProcessingConfig":
-        hand_config = getattr(runtime, "hand")
-        values = {
-            "pointcloud": getattr(runtime, "pointcloud"),
-            "table_plane_abcd": None,
-            "fingertip_link_names": tuple(hand_config.fingertip_link_names),
-            "handbase_position_eef_m": tuple(hand_config.T_eef_handbase_pos_xyz),
-            "handbase_quat_eef_wxyz": tuple(hand_config.T_eef_handbase_quat_wxyz),
-        }
-        unknown = set(overrides) - {item.name for item in dataclasses.fields(cls)}
-        if unknown:
-            raise TypeError(f"unknown ProcessingConfig override(s): {sorted(unknown)}")
-        values.update(overrides)
-        return cls(**values)
+    def from_runtime(cls, runtime, *, table_plane_abcd=None):
+        return cls(
+            pointcloud=runtime.pointcloud,
+            table_plane_abcd=table_plane_abcd,
+            fingertip_link_names=tuple(runtime.hand.fingertip_link_names),
+            handbase_position_eef_m=tuple(runtime.hand.T_eef_handbase_pos_xyz),
+            handbase_quat_eef_wxyz=tuple(runtime.hand.T_eef_handbase_quat_wxyz),
+        )
 
     def __post_init__(self) -> None:
         if not isinstance(self.pointcloud, PointCloudConfig):

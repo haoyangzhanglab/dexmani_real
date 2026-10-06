@@ -6,7 +6,7 @@
 
 协同仓库：`haoyangzhanglab/dexmani_policy`
 
-状态：**方案经第二轮实施审校通过，等待执行；本文修订不表示下述代码整改已经完成。**
+状态：**方案经第二轮实施审校通过；实施与纯离线验证已完成，逐项结果及未验证范围见第 17 节。真机未验收。**
 
 本轮收紧了旧 resume 兼容、replay 输出初始化、manifest 身份与内容留存、导出异常阶段，以及控制等价验收边界；不新增工作包或运行框架。
 
@@ -31,7 +31,7 @@ SHA 只定位证据，**不是 reset/checkout 目标**。检查当前 HEAD 与�
 
 ### 0.2 权限与验证范围
 
-- 当前交付仅为任务书的编写与审校。后续执行本文时，允许代码/文档与无硬件离线验证；默认交付 diff，不自动 commit/push 实现。
+- 实施允许代码/文档与无硬件离线验证；默认交付 diff，不自动 commit/push 实现。
 - 不连接或驱动 xArm、XHand、RealSense、VR、HTS；不执行 HOME、replay、rollout、实时采集或真实标定写入。`execute=False` 不天然意味着没有连接副作用。
 - 允许临时目录的合成 Raw、虚拟标定、fake clock/model/SDK 和原生离线 FK/碰撞。无硬件授权时，真机结果一律 `NOT_VERIFIED`。
 - 不运行完整训练/DDP/长时间评测，不升级实际实验环境来凑测试，不修改已发布 Raw、checkpoint、既有实验或无关缓存。
@@ -392,3 +392,69 @@ Policy 使用其自己的既有定向/config-only 检查；先核实当前入口
 
 最终用中文分别交付两仓库的修改摘要、删除与保留机制、U01–U34 逐项状态及证据、实际执行的验证命令和结果、阻断与真机/资产未验证范围。简短进度表可追加在原任务书末尾，不另建一组长期报告。
 ```
+
+
+## 17. 本次实施结果（2026-10-07）
+
+已按 T01–T11 完成全部不受阻的代码项与条件决策，交付未提交 diff；证据 SHA 保留。实施前读取两仓库 AGENTS 与完整本文；本地已有第二轮标记，无需用远端文件替换。两个工作树开始时均干净，结束 HEAD 未变：Real `553daa60e571def4eea49cb2e94d23608752badf`，Policy `72dd34295ba101e8fe19b85e457edde50092002b`。未 reset/checkout、commit、push、升级环境或访问真实设备/实验资产。
+
+下表 `DONE` 表示代码实施完成；`PASS` 仅指本次纯离线证据。简称 RR 为 Real `tests/test_research_refinement.py`，PR 为 `tests/test_policy_runner.py`，WR 为 `tests/test_policy_recording.py`，RV 为 `tests/test_review_remediation.py`，PS 为 Policy `tests/test_research_split.py`。低风险命名/去重使用调用图与静态检查，不为常量和 helper 复制实现测试。
+
+| 项 | 最终状态 | 落点、证据与边界 |
+| --- | --- | --- |
+| U01 | DONE / PASS；实物 NOT_VERIFIED | `planning/kinematics/urdf.py` 将当前 mount 传入 Pinocchio model/self/environment geometry 和临时 MPLib URDF；所有生产构造者显式传参。RR `test_current_mount_reaches_native_geometry`：两个非零平移/旋转、两组非零姿态、五指 FK 1e-6 m 对齐，临时文件删除后仍可 FK；坏拓扑拒绝。 |
+| U02 | DONE / PASS | `robot/action.py`、`kinematics/ik.py` 共享绝对目标差/限位准入；joint 只创建 CollisionModel，EEF 保留候选选择与其配置阈值，frozen 使用该命令手姿。RR jump/独立碰撞/自定义 EEF jump，RV absolute_hw_distance，PR 无 IKResult 拒绝与 frozen/RTC 回归。 |
+| U03 | DONE / PASS；阈值实测 NOT_VERIFIED | `camera/solver.py` 两轴相对旋转激励，配置与 summary metadata 显式保留。RR 重复/平移/同轴/小幅拒绝及两轴已知解、坐标旋转/轴符号不变；RV RMS 与取消不发布。 |
+| U04 | DONE / PASS；overlay ALREADY_FIXED | 检测路径拒绝 PnP False/None/非有限/错误形状；RR `test_pnp_failure_is_missing` 含正常解。原 `solver.py` preview 已按 ok 绘制，不重复改写。 |
+| U05 | DONE / PASS | `recording/results.py`、policy/replay session 与 runner：连接前初始化、RUNNING 前 incomplete、最终新观测后 grant；撤权→stop→Raw finalize→NPZ→attempt JSON；session 在 shutdown/evaluation 后收尾。RR/PR/WR 覆盖取消、零帧、写入/stop/构造/HOME/shutdown/evaluation 故障、首异常、不覆盖 Raw；新 START 失败不沿用上次计数/路径。原 recorder START 后重读观测为 ALREADY_FIXED，保留并扩展验证。 |
+| U06 | DONE / PASS；消费者传递 ALREADY_FIXED | `dataset/export.py` 只接受新路径，移除 overwrite；原子发布 revision、UTC、代码 SHA/dirty、完整处理/导出配置与有序 episode ids/ends。RR 两次 UUID、dangling symlink、13 字段/NaN/row_info、失败 staging，以及 Policy revision 拒绝恢复；既有 attrs→dataset→cfg/checkpoint→resume 无需重写。 |
+| U07 | DONE / PASS；真实分组 NOT_VERIFIED | Policy `datasets/split.py`、`base_dataset.py` 一次读取已知 revision 的完整清单；独立 train/val/exclusion mask、trial 不跨侧、实际子集/窗口/holdout、完整规范化内容及 hash 进入 data_recipe。PS 与旧窗口/resume 定向检查通过；默认 YAML、旧 cfg.dataset/data_recipe 未加 null 键。 |
+| U08 | DONE / PASS；实测时钟 NOT_VERIFIED | `dataset/quality.py` 同一分块流统计 Δt/gap/frame number/source age/spread/dispatch，复用缺测 notes；跨 chunk 延续、episode 重置。RR `test_quality_chunk_boundaries_and_clock_domains`；device camera 不混减 host，RGB-depth 曝光差/触觉同步为 null，数组不筛行。 |
+| U09 | DONE / PASS | runner query/run/attempt 归因、窗口来源、worker/owner 时间、future index、selected/dispatch；每次安全有效形状的已完成 future 保留原 dtype 一份。PR stop→Raw→sidecar、float16、旧 Future 不污染新 run；退休查询记 session 诊断，不等待它推迟 stop、不回写 Raw。 |
+| U10 | DONE / PASS；真实延迟 NOT_VERIFIED | `deployment/timing.py` 与 `examples/summarize_policy_trace.py` 汇总真实阶段样本与失效原因；RR 缺阶段 count=0、分位数 null。不拼接嵌套/并行分位数、不自动调 d/频率。 |
+| U11 | DONE / PASS | 删除运行中/试次间模式 setter、pending_execution 与专属分支；保留初始配置及 sync/async/RTC。初始加载/配置/warmup/预算失败清理迁入 RR；worker 串行生命周期与关闭测试通过。 |
+| U12 | DONE / PASS | `HandKinematics` 构造期 fail-fast，移除 _ready/is_ready、二次 import 与静态故障 NaN fallback；调用者同步。原生 FK 与按需构造测试通过，真实测量缺失 NaN 保留。 |
+| U13 | DONE / PASS | `ProcessingConfig.from_runtime(runtime, *, table_plane_abcd=None)` 显式构造，删除反射/任意 overrides；全部生产调用者核查，原生导出覆盖。 |
+| U14 | DONE / PASS | 删除 `examples/run_policy.py` 同链重复静态校验；session 连接前 preflight 与独立 Runner 校验保留，初始失败不连接的测试通过。 |
+| U15 | DONE / PASS | `EpisodeReader` 生命周期缓存字段集合和按需校验后的 Dataset 引用；close 失效。RR 坏布局/关闭与原生分块导出；不跨文件或预读所有数组。 |
+| U16 | DONE / PASS | XHand driver 复用 `check_hand_target`；Robot 双侧预检和各 SDK 前动态复核保留。RR 非法手目标在 arm SDK 前拒绝，RV/PR partial/late/deadline 回归。 |
+| U17 | DONE / PASS | `CameraIntrinsics.from_dict` 保留序列语法，数值归 __post_init__；RGBD 去重复转换。RR 字符串 distortion 拒绝，合法 roundtrip 保持。 |
+| U18 | DONE / PASS | `CollisionModel` 无 table/boxes 时不构造第二套环境 geometry；有环境沿用同份修正 XML。RR 有/无环境及原生 HOME 合成桌面检查。 |
+| U19 | DONE / PASS | 移除 writer 的 missing_tactile 状态与重复全数组扫描；统计由 U08 提供。WR/导出仍保存真实 NaN、配对和 dispatch；未宣称实测加速。 |
+| U20 | DONE / PASS | Query/Plan 置前并明确类型/槽位；提取 handoff/prefetch/command_for_slot，执行 owner 保留发送和失败收尾顺序。PR sync/async/RTC、两次 poll、漏槽、WAIT、prefix、部分发送 oracle 通过。 |
+| U21 | DONE / PASS | Teleop `compute_target→ActionRealization`、`commit_dispatched_target`，执行层建 RobotCommand；控制 tick/收尾提取。提交仍按未 interrupted 且 result 非空，RV/WR 取消、一次记录、首异常与 stop 失败通过。 |
+| U22 | DONE / PASS | recorder 提取初始/最终 metadata 和 rows_to_arrays；唯一 FIFO writer 和 open/drain/flush/metadata/close/publish 顺序保留。WR 原生失败 staging、metadata 失败排空与冻结 metadata 测试通过。 |
+| U23 | DONE / PASS；追加失败中止 ALREADY_FIXED | export 提取 select/create/append，processing 提取纯运动学和缺测；原有转换/追加错误中止行为保留。RR 注入第二块 RawDataError：整个导出失败、无正式缓存、保留 staging；13 字段不变。 |
+| U24 | DONE / PASS；按需 EEF 行为 ALREADY_FIXED | `ObservationKinematics` 与 `build_observation_kinematics` 替换 tuple/旧名；RR EEF-only 仅 arm FK，joint/rgb/cloud 无 FK，指尖才构造 hand FK；依赖选择不扩张。 |
+| U25 | DONE / PASS | `replay/evaluation.py::tracking_lags` 纯函数；已有清晰 EEF 指标块保留。RR ±lag/NaN/静止轴和 RV 两种 RMSE 定义通过；tie-break 与有效重叠保持。 |
+| U26 | DONE / PASS | 公共只读 `robot.stop_required`、`reader.path` 替换实际重复私有访问；不加整套 getter。stop_required 仅表示软件停止需求，既有 stop/资源收尾测试通过。 |
+| U27 | DONE / PASS | session 抽加载/配置和 warmup，外层先取得 worker owner；RR 六种初始错误路径关闭模型且不 connect；配置失败清理异常不覆盖主因。 |
+| U28 | DONE / PASS；TeleopConfig RETAINED | Python `PolicyParams→ControlParams`，保留 YAML policy 外部键、无旧 alias；全调用图/compile/Ruff 通过。TeleopConfig 已明确当前职责，额外改名无收益。 |
+| U29 | DONE / PASS | 移除固定关节/常量数量及唯一性导入自检；值和映射保持，实际 URDF active order/frame 校验仍在。原生模型检查通过。 |
+| U30 | DONE / PASS | HOME 简单 report 判据按原序内联；复杂几何 helper 与 RRT/final candidate 两次不同阶段检查保留。RR guard 顺序、RV soft escape、原生合成桌面路径测试通过。 |
+| U31 | RETAINED；真实资产 NOT_VERIFIED | 保留 reader/replay 的 legacy dispatch、零时间和 UNKNOWN fallback。缺已确认论文资产依赖清单，不删除历史证据路径；未扫描私有目录或改写 Raw。 |
+| U32 | RETAINED / 合成恢复 PASS；真实 checkpoint NOT_VERIFIED | 保留 unknown revision 警告、clip_sample 与 LoRA dtype 历史默认；U06/U07 不弱化已知 revision/strict resume。缺需 exact resume 的真实 checkpoint 清单。 |
+| U33 | RETAINED；跨平台内存序 NOT_VERIFIED | 保留现有 seqlock；ring/camera_ring 文档明确当前 Linux x86_64、NumPy uint64 未提供 acquire/release 保证。无 torn-read 反例或新平台要求，不引入 atomics/锁框架，不声称可移植证明。 |
+| U34 | NOT_REPRODUCED；原反例 NOT_VERIFIED | 现有 PyAV 17.1.0 的三个 CFR 参数用例、显式 encoder clock、原生 Raw writer/export 本次重新通过；不降级/重写，不声称所有 av>=10 兼容。 |
+
+删除的机制包括 overwrite、模式 setter/pending 状态、静态 FK NaN 回退、重复校验/扫描、常量自检、无障碍物时的冗余 geometry 与短小 HOME 判据 wrapper。保留一个硬件 owner、一个串行 worker、一个 FIFO writer；没有新增后台服务、registry、迁移或全量数据哈希系统。Policy 保留现有 sampler/normalizer/resume 与 eval.seed_manifest；没有改变实验默认超参数。
+
+本次最终有效验证命令与结果（在对应仓库执行；不以任务书里的旧探针当作实施证据）：
+
+| 命令 | 实际结果 |
+| --- | --- |
+| `MPLCONFIGDIR=/tmp/dexmani-refinement-mpl /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m pytest -q tests` | 后续清理复跑 **183 passed，13.51 s**，无 skip；包含原生 Pinocchio/MPLib、临时 Raw/Zarr/PyAV 与 fake 时钟/SDK。 |
+| `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m compileall -q dexmani_real examples` | PASS。 |
+| Real `ruff check` 和 `ruff format --check`，参数为 `git diff --name-only` 与 `git ls-files --others --exclude-standard` 中全部 48 个 `.py` 文件 | 后续清理复跑 PASS。使用既有 real_robot/bin/ruff，不格式化无关文件。 |
+| `PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/tmp/dexmani-refinement-mpl /home/zhanghaoyang/miniconda3/envs/policy/bin/python -m pytest -q -p no:cacheprovider tests/test_research_split.py tests/test_policy_windows.py tests/test_infra_resume.py -k 'research_split or policy_windows or rng_device_and_revision'` | 后续清理复跑 **26 passed，5 deselected，3.36 s**；未选的 5 项不计为通过，不运行训练/DDP。 |
+| `PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/tmp/dexmani-refinement-mpl /home/zhanghaoyang/miniconda3/envs/policy/bin/python dexmani_policy/smoke_test.py --config-only dp dp3 dqrise r3d multitask_dit` | 五个配置全部 PASS；仅配置解析，不加载真实数据/执行 GPU 训练。 |
+| Policy `ruff check --no-cache` 与 `ruff format --no-cache --check dexmani_policy/datasets/base_dataset.py dexmani_policy/datasets/split.py tests/test_research_split.py`（check 使用同三文件） | PASS；使用既有 real_robot/bin/ruff 和 Policy 自身规则。只读 cache 权限由 --no-cache 处理，未升级环境。 |
+| 两仓库 `git diff --check` | PASS。 |
+
+验证平台 Linux x86_64；既有环境 NumPy 1.26.4、SciPy 1.15.3、Pinocchio 2.7.0、MPLib 0.2.1、Zarr 2.18.3、PyAV 17.1.0。早期迭代中的格式/测试失败已修复并复跑；没有把未运行、deselected 或历史探针计作本次 PASS。
+
+**实物与资产边界**：当前配置 mount `(-0.015,0,0)m` 进入完整模型后，当前 HOME 姿态报 `flange_link_0/right_hand_thumb_bend_link_0` 自碰撞。代码拒绝此配置下的该目标；没有修改 mount、HOME、SRDF 或阈值迎合测试。接受路径的原生回归明确使用 nominal 合成 mount，不能用其通过证明实物可运行。重新启用前须量测/确认实际 mount 方向尺寸与碰撞接触关系；实际 geometry、连续路径/环境避碰、停止延迟、传感器时间差和 GPU/owner 联合时序均 **NOT_VERIFIED**。
+
+真实 trial 清单与论文 group_unit、缺测/gap 对真实样本规模的影响、旧 Raw/checkpoint 的依赖覆盖均 **NOT_VERIFIED**。条件决策后续需要：Raw 路径/布局/字段与论文使用关系、canonical revision/有序 episode id/已确认 trial_id/group_unit、checkpoint 对应 resolved cfg/data_recipe/data_identity 及是否要求 exact resume。U34 需要原失败 PyAV 版本、输入/编码参数和错误输出。没有代码级权限或依赖阻断；上述条件只阻断真实资产结论或真机验收，不影响本次已完成的离线实施。
+
+后续清理：删除旧 ActionRealizer/CollisionModel 属性探测、future 的重复转换与有限性检查、手 FK 的指尖名称副本和重复复制、manifest 规范化中的不变字段重复赋值；测试替身同步当前接口。修正执行文档中已删除的模式 setter、README 的 writer 缺测摘要描述、导出 help 和任务书待实施状态；Policy 清单细节移入 `docs/rtc.md`，README 训练段只保留入口。U31/U32 恢复用途、既有数据目录保护及有效控制算法继续保留，未扩大到真实资产迁移。

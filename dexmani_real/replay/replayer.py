@@ -144,12 +144,16 @@ def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s,
         deadline = time.monotonic() + 0.01
 
 
-def replay_targets(shared, runtime, trajectory, keyboard, *, robot, hand_start_duration_s):
+def replay_targets(
+    shared, runtime, trajectory, keyboard, *, robot, hand_start_duration_s, results=None
+):
     stop_details = []
     capture = ReplayRecorder(trajectory.num_frames)
     status, reason = ReplayStatus.COMPLETED, ""
     run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
     try:
+        if results is not None:
+            results.prepare(recording=False)
         fk = make_arm_fk()
         row = read_observation(shared, runtime, robot)
         if row is None:
@@ -186,6 +190,8 @@ def replay_targets(shared, runtime, trajectory, keyboard, *, robot, hand_start_d
         if status == ReplayStatus.COMPLETED and not begin_motion(shared):
             status, reason = ReplayStatus.REJECTED, "motion authority unavailable"
         epoch = int(shared.run_id.value)
+        if results is not None and status == ReplayStatus.COMPLETED:
+            results.entered(epoch)
         if status == ReplayStatus.COMPLETED and hand_start_duration_s > 0:
             interrupted = _warm_up_hand(
                 shared, runtime, trajectory, keyboard, epoch, row, hand_start_duration_s, robot

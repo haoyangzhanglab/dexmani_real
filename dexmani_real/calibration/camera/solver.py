@@ -56,6 +56,8 @@ class CalibrationConfig:
     """Session tuning parameters for interactive camera calibration."""
 
     min_samples: int = 10
+    min_relative_rotation_deg: float = 5.0
+    min_axis_separation_deg: float = 15.0
     max_consistency_rms_mm: float = 5.0
     max_consistency_rot_rms_deg: float = 3.0
     delta_pos_m: float = 0.008
@@ -66,6 +68,8 @@ class CalibrationConfig:
         if not isinstance(self.min_samples, int) or self.min_samples < 3:
             raise ValueError("min_samples must be at least 3")
         positive_fields = (
+            "min_relative_rotation_deg",
+            "min_axis_separation_deg",
             "max_consistency_rms_mm",
             "max_consistency_rot_rms_deg",
             "delta_pos_m",
@@ -75,6 +79,8 @@ class CalibrationConfig:
             value = float(getattr(self, field_name))
             if not np.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{field_name} must be finite and positive")
+        if self.min_relative_rotation_deg > 180 or self.min_axis_separation_deg > 90:
+            raise ValueError("excitation thresholds exceed rotation/axis angle ranges")
         if not isinstance(self.status_interval_frames, int) or self.status_interval_frames < 1:
             raise ValueError("status_interval_frames must be at least 1")
 
@@ -111,10 +117,15 @@ def detect_aruco_pose(
     )
 
     for c in corners:
-        _, rv, tv = cv2.solvePnP(
+        ok, rv, tv = cv2.solvePnP(
             marker_points, c, intrinsics, distortion, flags=cv2.SOLVEPNP_IPPE_SQUARE
         )
-        return rv.flatten().astype(np.float64), tv.flatten().astype(np.float64)
+        if not ok or rv is None or tv is None:
+            return None
+        rv, tv = np.asarray(rv, dtype=np.float64), np.asarray(tv, dtype=np.float64)
+        if rv.size != 3 or tv.size != 3 or not np.isfinite(rv).all() or not np.isfinite(tv).all():
+            return None
+        return rv.reshape(3), tv.reshape(3)
 
     return None
 
@@ -261,6 +272,42 @@ def _compute_closed_loop_errors(
     return residuals_mm, residuals_deg
 
 
+def check_hand_eye_excitation(
+    rpy_ee2base, *, min_relative_rotation_deg=5.0, min_axis_separation_deg=15.0
+):
+    """Require observable two-axis rotation; do not impose three-axis rank."""
+    poses = np.asarray(rpy_ee2base, dtype=np.float64)
+    if poses.ndim != 2 or poses.shape[1:] != (3,) or len(poses) < 3 or not np.isfinite(poses).all():
+        raise ValueError("hand-eye requires at least three finite poses")
+    if not 0 < min_relative_rotation_deg <= 180 or not 0 < min_axis_separation_deg <= 90:
+        raise ValueError("invalid hand-eye excitation thresholds")
+    rotations = Rotation.from_euler("xyz", poses).as_matrix()
+    axes, angles = [], []
+    for i in range(len(rotations)):
+        for j in range(i + 1, len(rotations)):
+            vector = Rotation.from_matrix(rotations[j] @ rotations[i].T).as_rotvec()
+            angle = np.linalg.norm(vector)
+            if np.degrees(angle) >= min_relative_rotation_deg:
+                axes.append(vector / angle)
+                angles.append(float(np.degrees(angle)))
+    separations = [
+        float(np.degrees(np.arccos(np.clip(abs(a @ b), 0, 1))))
+        for i, a in enumerate(axes)
+        for b in axes[i + 1 :]
+    ]
+    if not separations or max(separations) < min_axis_separation_deg:
+        raise ValueError("insufficient hand-eye excitation; add rotation about another direction")
+    return dict(
+        sample_count=len(poses),
+        valid_relative_motion_count=len(axes),
+        relative_rotation_min_deg=min(angles),
+        relative_rotation_max_deg=max(angles),
+        axis_separation_max_deg=max(separations),
+        min_relative_rotation_deg=min_relative_rotation_deg,
+        min_axis_separation_deg=min_axis_separation_deg,
+    )
+
+
 def calibrate_and_select(
     tvec_ee2base: list[np.ndarray],
     rpy_ee2base: list[np.ndarray],
@@ -269,12 +316,19 @@ def calibrate_and_select(
     *,
     max_position_rms_mm: float,
     max_rotation_rms_deg: float,
+    min_relative_rotation_deg: float = 5.0,
+    min_axis_separation_deg: float = 15.0,
 ):
     """Choose the minimum position RMS among candidates passing both limits.
 
     Returns:
         (T_best, method_name, errors_mm, errors_deg, method_table, position_rms, rotation_rms).
     """
+    check_hand_eye_excitation(
+        rpy_ee2base,
+        min_relative_rotation_deg=min_relative_rotation_deg,
+        min_axis_separation_deg=min_axis_separation_deg,
+    )
     best = None
     table: list[tuple[str, float]] = []
 

@@ -16,7 +16,7 @@ sync/async 保留原模型支持范围；rtc 当前接入连续动作 BaseAgent 
 
 加载与 warmup 在连接设备前完成。warmup 包含输入预处理、选定采样路径（RTC guidance 启用时含 VJP）和 CPU 返回；它报告模型路径的时间，并为 async/rtc 给出建议 d，不自动修改配置。实测耗时达到 WAIT 或预取预算时拒绝启动；sync 还检查推理耗时加后续 A-1 槽能否落在决策年龄预算内。真实前缀准备和采样开销另由 owner 事件测量，合成 warmup 不能证明总时延上界。运行中准备超过当前槽的迟到容限使预约失效，EEF 的 d 步 IK 也必须在这一预算内完成，不自动分槽。
 
-运行中拒绝切换模式。`PolicyRunner.set_execution_mode(ExecutionConfig(...))` 仅可在 episode 间、无待回收 Future 时调用；串行配置/warmup 后，下次开始仍需 reset。CLI 一个 session 使用一个模式。
+一个 session 固定使用启动时选择的模式；切换 sync/async/rtc 需关闭当前 session 后重新启动。每次接纳开始请求仍由串行 worker 执行 episode reset。
 
 ## 调度与停止
 
@@ -32,6 +32,8 @@ query 保存最新观察槽位每个实际输入依赖的 host monotonic 源时�
 
 async/rtc 的前 d 步都冻结实际 joint19 目标：Joint 路径先投影，EEF 路径先事务性完成 IK。只有 RTC 生成模型前缀条件；EEF 使用公共 FK 将冻结目标转换为 EEF21，其余 tail 作为软先验。准备不推进 previous accepted。冻结目标在最新反馈下重新检查表示分支、距离、previous accepted jump 等条件，失败不重新 IK 后沿用旧条件。async/rtc 要求两设备明确 ACCEPTED；CRC_UNCONFIRMED、UNKNOWN 或部分失败终止承诺，不重发。
 
+joint 与 EEF 共享绝对关节目标差、operational limits 和 feedback 距离规则。joint 在投影后检查端点自碰撞；EEF 保留 collision-aware 候选选择。frozen 再检查原命令，碰撞查询使用该命令的手姿；禁用手控制时使用配置的手部 HOME 姿态。这些检查不证明连续轨迹或环境避碰，Raw replay 和 HOME 各自保留其独立准入规则。
+
 WAIT 表示没有新策略目标，设备仍可能追踪上一个目标。停止顺序为撤权/失效、设备 stop、录制和模型资源回收；不能撤销已进入 SDK 的调用，也不证明物理停稳。模型任务不会被 Future.cancel 强行打断。close 若仍等待模型完成，会明确记录 pending；Python 进程可能仍等待非 daemon worker。
 
 发送截止使用本机 monotonic 时钟，在每个目标 SDK 调用前判断；进入 SDK 后的迟返回保留实际确认结果。Ctrl+C 保留本次派发状态与已采前缀，软件取消不能撤回已进入 SDK 的调用。
@@ -40,7 +42,13 @@ WAIT 表示没有新策略目标，设备仍可能追踪上一个目标。停止
 
 ## 数据与追踪
 
-原始 attempted targets、measured state、dispatch 和辅助 NaN 保留。rollout 的 execution_path 为 `worker_grid_<mode>_v1`。`run_config.yaml` 保存两仓库 SHA、checkpoint/weights/seed/NFE、模式、模型长度和实验预算；每个 Raw 的 `data.h5/meta/policy_trace` 保存紧凑 JSON query/交接/dispatch/失效/结束事件，停止失败也沿用该 trace。
+原始 attempted targets、measured state、dispatch 和辅助 NaN 保留。rollout 的 execution_path 为 `worker_grid_<mode>_v1`。`run_config.yaml` 保存两仓库 SHA、checkpoint/weights/seed/NFE、模式、模型长度和实验预算；每个 Raw 的 `data.h5/meta/policy_trace` 保存 query/交接/dispatch/失效/结束事件，停止失败也沿用该 trace。
+
+记录式 policy evaluation 在 Raw 外保存 `session_result.json`、`attempts/<id>.json` 和 query NPZ。开始请求通过前置检查后、授予 RUNNING 前写 incomplete，阻塞 I/O 完成后重新检查起始观测再授权；取消的 prepared attempt 不消耗运行次数。崩溃留下的 incomplete/entered_running=null 表示未知。无 recording_config 的直接 policy API 不产生持久化结果。
+
+收尾顺序为撤权、尝试 stop、recorder finalize、query sidecar、attempt 终态；只有 recorder 返回实际发布路径才标记 Raw published。query trace 关联原始 future、窗口来源、selected target 和逐设备 dispatch。晚返回的旧 Future 仅进入 session 诊断，不归入新尝试或回写 Raw，也不为等待它推迟 stop。session 结果在资源关闭尝试后写入，HOME/关闭故障与轨迹结果分别留证。
+
+`python examples/summarize_policy_trace.py <attempt.json>` 离线汇总模型、观测、前缀准备、目标实现、发送和 owner tick 时间。缺失阶段的分位数为 null；嵌套或并行阶段的分位数不相加为总延迟。
 
 第一终止主因通过 run_ended_id 与 run_id 关联，`termination_reason` 表达首因。Teleop 使用可选 `data.h5/meta/termination_details` 保存结束阶段、异常类型和错误说明；附加 stop 故障不能覆盖 OPERATOR/QUIT，正常结束不写错误详情。
 
@@ -49,6 +57,8 @@ owner 在提交 STOP 前深拷贝 trace 和结束详情，writer 排空有效帧
 Policy 主 Dataset 按实际使用的输入与监督检查窗口有限性，Real canonical 额外要求两设备 ACCEPTED dispatch。观察检查前 N 源行，监督检查完整 H；保持原 padding、episode 边界、loss 权重和时间语义。normalizer 仅拟合有效训练窗口引用的去重源行，验证使用训练统计。checkpoint 部署及恢复读取保存的统计，不重拟合；数据配方变化不能作为旧配方的精确续训，历史复现使用原源码版本。数学和数据筛选细节见相邻 `dexmani_policy` 仓库的 `docs/rtc.md`。
 
 Replay 报告中的 arm `mean_joint_rmse_deg` 是逐关节 RMSE 的平均，hand `pooled_rmse_deg` 是所有帧和关节平方误差的共同均值开方，两者口径不同；历史结果不改写。
+
+Replay 在输出目录 missing-or-empty 检查与轨迹 preflight 后初始化结果记录；trajectory_status/reason 描述轨迹阶段，session outcome/reason 还包含返航、关闭及评估产物写入结果。轨迹完成与最终 session 故障可以同时成立。
 
 ## 离线检查与真实评测
 

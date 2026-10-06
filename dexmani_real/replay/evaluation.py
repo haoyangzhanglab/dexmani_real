@@ -169,43 +169,11 @@ def compute_metrics(
                 metrics.hand_joint_mae_overall_deg = float(np.rad2deg(np.mean(diff_h)))
                 metrics.hand_pooled_rmse_deg = float(np.rad2deg(np.sqrt(np.mean(diff_h**2))))
 
-    if frame_count >= _MIN_TRACKING_SEQUENCE_FRAMES:
-        max_lag = max(int(np.ceil(fps * _TRACKING_LAG_WINDOW_S)), _MIN_TRACKING_LAG_FRAMES)
-        joint_lags: list[int] = []
-        for joint_index in range(ARM_JOINT_SHAPE[0]):
-            original_finite = orig_q[np.isfinite(orig_q[:, joint_index]), joint_index]
-            replay_finite = rep_q[np.isfinite(rep_q[:, joint_index]), joint_index]
-            if min(len(original_finite), len(replay_finite)) < _MIN_TRACKING_OVERLAP_FRAMES:
-                continue
-            if min(np.ptp(original_finite), np.ptp(replay_finite)) < np.deg2rad(1):
-                continue  # A stationary axis cannot identify temporal lag.
-            best_lag = None
-            best_key = (float("inf"), float("inf"), 0)
-            for lag in range(-max_lag, max_lag + 1):
-                if lag < 0:
-                    original = orig_q[-lag:, joint_index]
-                    replayed = rep_q[:lag, joint_index]
-                elif lag > 0:
-                    original = orig_q[:-lag, joint_index]
-                    replayed = rep_q[lag:, joint_index]
-                else:
-                    original = orig_q[:, joint_index]
-                    replayed = rep_q[:, joint_index]
-                finite = np.isfinite(original) & np.isfinite(replayed)
-                if int(np.count_nonzero(finite)) < _MIN_TRACKING_OVERLAP_FRAMES:
-                    continue
-                rmse = float(np.sqrt(np.mean((original[finite] - replayed[finite]) ** 2)))
-                candidate_key = (rmse, abs(lag), lag)
-                if candidate_key < best_key:
-                    best_key = candidate_key
-                    best_lag = lag
-            if best_lag is not None:
-                joint_lags.append(best_lag)
-                metrics.tracking_lag_per_joint_frames[joint_index] = best_lag
-        if joint_lags:
-            peak_lag = int(np.median(joint_lags))
-            metrics.tracking_lag_frames = peak_lag
-            metrics.tracking_lag_seconds = float(peak_lag) / fps
+    metrics.tracking_lag_per_joint_frames = tracking_lags(orig_q, rep_q, fps)
+    if metrics.tracking_lag_per_joint_frames:
+        peak_lag = int(np.median(list(metrics.tracking_lag_per_joint_frames.values())))
+        metrics.tracking_lag_frames = peak_lag
+        metrics.tracking_lag_seconds = float(peak_lag) / fps
 
     if arm_tracking_error is not None:
         finite_tracking_error = arm_tracking_error[np.isfinite(arm_tracking_error)]
@@ -406,3 +374,41 @@ def save_results(
     print(f"\nMetrics saved: {metrics_path}")
 
     save_replay_data(replay_data, output_dir)
+
+
+def tracking_lags(orig_q, rep_q, fps):
+    """Positive lag means replay is later; stationary axes are unidentifiable."""
+    frame_count = len(orig_q)
+    lags = {}
+    if frame_count >= _MIN_TRACKING_SEQUENCE_FRAMES:
+        max_lag = max(int(np.ceil(fps * _TRACKING_LAG_WINDOW_S)), _MIN_TRACKING_LAG_FRAMES)
+        for joint_index in range(ARM_JOINT_SHAPE[0]):
+            original_finite = orig_q[np.isfinite(orig_q[:, joint_index]), joint_index]
+            replay_finite = rep_q[np.isfinite(rep_q[:, joint_index]), joint_index]
+            if min(len(original_finite), len(replay_finite)) < _MIN_TRACKING_OVERLAP_FRAMES:
+                continue
+            if min(np.ptp(original_finite), np.ptp(replay_finite)) < np.deg2rad(1):
+                continue  # A stationary axis cannot identify temporal lag.
+            best_lag = None
+            best_key = (float("inf"), float("inf"), 0)
+            for lag in range(-max_lag, max_lag + 1):
+                if lag < 0:
+                    original = orig_q[-lag:, joint_index]
+                    replayed = rep_q[:lag, joint_index]
+                elif lag > 0:
+                    original = orig_q[:-lag, joint_index]
+                    replayed = rep_q[lag:, joint_index]
+                else:
+                    original = orig_q[:, joint_index]
+                    replayed = rep_q[:, joint_index]
+                finite = np.isfinite(original) & np.isfinite(replayed)
+                if int(np.count_nonzero(finite)) < _MIN_TRACKING_OVERLAP_FRAMES:
+                    continue
+                rmse = float(np.sqrt(np.mean((original[finite] - replayed[finite]) ** 2)))
+                candidate_key = (rmse, abs(lag), lag)
+                if candidate_key < best_key:
+                    best_key = candidate_key
+                    best_lag = lag
+            if best_lag is not None:
+                lags[joint_index] = best_lag
+    return lags

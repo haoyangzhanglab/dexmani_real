@@ -116,7 +116,7 @@ class SharedMemoryRingBuffer:
     """Shared-memory ring with odd/even markers for consistent reads.
 
     Layout of the shared memory block:
-        [0:8)     write_idx  (uint64, atomic — only producer writes, consumer reads)
+        [0:8)     write_idx  (uint64 — only producer writes, consumer reads)
         [8:16)    sequence   (uint64, monotonic counter)
         [16:24)   slot_size  (uint64, bytes per slot)
         [24:32)   maxlen     (uint64, number of slots)
@@ -126,9 +126,10 @@ class SharedMemoryRingBuffer:
 
     The write_idx always points to the most recently written slot index
     (0..maxlen-1). The consumer reads write_idx to find the latest frame.
-    Because only one serialized writer updates write_idx, this is safe on
-    x86_64 without CAS. Callers with multiple writer processes must hold their
-    own cross-process write lock.
+    Used on Linux x86_64 with one serialized writer. NumPy uint64 access
+    does not specify acquire/release memory ordering; this is not a portable
+    lock-free guarantee. Multiple writer processes must hold their own
+    cross-process write lock.
 
     Latest readers may skip overwritten frames; consumers check freshness.
     """
