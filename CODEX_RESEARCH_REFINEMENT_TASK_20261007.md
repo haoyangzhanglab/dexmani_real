@@ -6,7 +6,9 @@
 
 协同仓库：`haoyangzhanglab/dexmani_policy`
 
-状态：**方案已审校，等待执行；本文新增不表示下述代码整改已经完成。**
+状态：**方案经第二轮实施审校通过，等待执行；本文修订不表示下述代码整改已经完成。**
+
+本轮收紧了旧 resume 兼容、replay 输出初始化、manifest 身份与内容留存、导出异常阶段，以及控制等价验收边界；不新增工作包或运行框架。
 
 ## 0. 给执行代理的指令
 
@@ -29,7 +31,7 @@ SHA 只定位证据，**不是 reset/checkout 目标**。检查当前 HEAD 与�
 
 ### 0.2 权限与验证范围
 
-- 当前交付仅新增任务书。后续执行本文时，允许代码/文档与无硬件离线验证；默认交付 diff，不自动 commit/push 实现。
+- 当前交付仅为任务书的编写与审校。后续执行本文时，允许代码/文档与无硬件离线验证；默认交付 diff，不自动 commit/push 实现。
 - 不连接或驱动 xArm、XHand、RealSense、VR、HTS；不执行 HOME、replay、rollout、实时采集或真实标定写入。`execute=False` 不天然意味着没有连接副作用。
 - 允许临时目录的合成 Raw、虚拟标定、fake clock/model/SDK 和原生离线 FK/碰撞。无硬件授权时，真机结果一律 `NOT_VERIFIED`。
 - 不运行完整训练/DDP/长时间评测，不升级实际实验环境来凑测试，不修改已发布 Raw、checkpoint、既有实验或无关缓存。
@@ -65,18 +67,18 @@ SHA 只定位证据，**不是 reset/checkout 目标**。检查当前 HEAD 与�
 | 顺序 | 工作包 | 覆盖 | 处理要求 |
 | --- | --- | --- | --- |
 | 1 | T01 当前几何单源 | U01 | P0；先做，实物参数另行确认 |
-| 2 | T02 共享目标准入 | U02、U16 | P0 主项；依赖 T01 的正确几何；手部谓词小改分开提交 |
+| 2 | T02 共享目标准入 | U02、U16 | P0 主项；依赖 T01 的正确几何；手部谓词小改用独立 diff |
 | 3 | T03 标定有效性 | U03、U04 | P1；与 T01/T02 可独立修改 |
 | 4 | T04 attempt/session 结果 | U05 | P1；先定义结果生命周期，再改相关控制结构 |
 | 5 | T05 新路径与缓存身份 | U06 | P1；先于 export 结构重构 |
-| 6 | T06 trial split 与时间 QA | U07、U08 | P1；代码可做，真实资产影响规模待核查 |
+| 6 | T06 trial split 与时间 QA | U07、U08 | P1；manifest 消费依赖 T05 身份/顺序；真实资产影响规模待核查 |
 | 7 | T07 最小归因与时序摘要 | U09、U10、U19 | P2；依赖 T04/T06，不先做并发优化 |
 | 8 | T08 删除机制与静态去重 | U11–U15、U17、U18 | P2；公开边界和当前行为保持 |
 | 9 | T09 控制回路可读性 | U20、U21 | P2；在 T02/T04/U11 后做等价重构 |
 | 10 | T10 数据、资源、指标与命名 | U22–U30 | P2/P3；小步分批，低收益项允许有依据保留 |
 | 11 | T11 条件决策 | U31–U34 | 明确保留/触发条件；不得强造 bug 或为勾选而改代码 |
 
-每包结束更新简短状态：`DONE / ALREADY_FIXED / RETAINED / BLOCKED`，验证另列 `PASS / FAIL / NOT_VERIFIED`；未复现问题标 `NOT_REPRODUCED`。`RETAINED` 必须给当前证据和理由，不能用于跳过明确缺陷。不要为每个 helper 建一个独立项目或测试框架。
+每包结束更新简短状态：`DONE / ALREADY_FIXED / RETAINED / BLOCKED`，验证另列 `PASS / FAIL / NOT_VERIFIED`；未复现问题标 `NOT_REPRODUCED`。`RETAINED` 必须给当前证据和理由，不能用于跳过明确缺陷。不要为每个 helper 建一个独立项目或测试框架。文中的 helper 名称是推荐实现，行为边界与验收才是硬要求；当前源码存在更短且等价的组织方式时可采用，并说明取舍，不机械增加函数或类。
 
 ## 3. T01：当前 mount 进入所有真实几何模型
 
@@ -114,7 +116,7 @@ SHA 只定位证据，**不是 reset/checkout 目标**。检查当前 HEAD 与�
 - **joint**：按当前规则投影一次，然后检查实际目标的 finite/shape、operational limits、绝对 `q-previous_command`、绝对 `q-measured_current` 和端点 self-collision。不能用周期最短角距离替代绝对硬件目标差。
 - **EEF**：保持求解、候选评分、pose residual 和 collision-aware 选择。抽取公共判据，不改变候选顺序；同一状态下已经完成的昂贵碰撞检查不重复整轮执行。
 - **frozen**：执行时检查原命令，不重求 IK、不投影/换支；joint 原有“当前投影若会换支则 reservation 失效”仍保留。碰撞复检必须使用**该 command 的 hand_qpos**，不能使用预制前缀最后一条留下的手姿。
-- joint 只构造准入需要的 `CollisionModel`，不为了共用检查构造整套 CLIK/MPLib/RRT；EEF 复用现有 planner 几何。hand-disabled 时保留现有固定手姿假设，不另造缺测替代值。
+- joint 只构造准入需要的 `CollisionModel`，不为了共用检查构造整套 CLIK/MPLib/RRT；EEF 复用现有 planner 几何。hand-disabled 沿用 ActionRealizer 的 `np.deg2rad(runtime.hand.home_qpos_deg)` 固定手姿。每次 collision query 的手姿来自该次目标/命令或这一明确假设，不能依赖上次 `set_hand_qpos` 遗留的状态，也不能把 full-model 的配置手姿与 7-DOF asset 的固定手姿混为一谈。
 - `ActionRealization` 复用现有类型，增加通用 `rejection_reason`；`ik_result` 仍可空。修改 `_prepare_prefix/_send` 等调用者，不能在 joint 正常拒绝后直接解引用 `ik_result.failure_kind`；只有实际 IK 技术失败按既有规则升级，普通拒绝保留原 invalidate/WAIT/结束语义和原因，不自动发送上一条目标。
 - frozen 被拒时按现有规则失效旧 plan/reservation；previous command 仍在原 dispatch 提交条件下推进，不在“已准备”时推进。
 
@@ -134,7 +136,7 @@ U16 同包但独立小改：`XHand._validate_action` 复用 `check_hand_target` 
   ```
 
   先用修正后的原生模型确认碰撞，再断言被碰撞 gate 拒绝；避免仅因 jump 先拒就误称测到了碰撞判据。旧反例含 base-link6/base-link7 碰撞，不依赖手 mount 分歧。
-- 覆盖 π 跨支绝对差、joint 无 IKResult 的拒绝、frozen 手姿切换、合法 joint/eef/frozen 数值不变、非法目标不进 SDK。
+- 覆盖 π 跨支绝对差、joint 无 IKResult 的拒绝、frozen 手姿切换、非法目标不进 SDK。在 T01 修正后的同一几何与状态下，原先接受且通过新增 gate 的 joint/eef/frozen 命令保持数值；新增 gate 拒绝旧路径曾放行的目标是预期行为变更，分别验收，不要求新旧接受集合相同。
 - 非法 hand 不得先发送 arm；直接 driver 和停止路径仍拒非法目标；partial dispatch、late ACCEPTED、deadline/epoch 既有 oracle 不变。
 
 ## 5. T03：标定激励检查与 PnP 失败处理
@@ -167,19 +169,19 @@ U16 同包但独立小改：`XHand._validate_action` 复用 `check_hand_target` 
 
 ### 6.2 生命周期
 
-1. session 开始记录在连接设备前写入；无法写出就不启动实验。
+1. session 开始记录在连接设备前写入；无法写出就不启动实验。Replay 由 session 先完成现有 output missing-or-empty 检查与轨迹 preflight，再初始化记录，不能在 CLI 提前写文件导致自身目录被拒；不放宽非空输出保护，也不覆盖已有实验。
 2. 经前置检查接纳的 start 请求获得 attempt_id。授予 RUNNING **之前**写 `state=incomplete`，`run_id=null`、`entered_running=null`。JSON 与 recorder START 等阻塞 I/O 必须位于最后一次起始 observation/home pose 检查之前；它们完成后再读取新 row、复核 freshness/pose/epoch，最后 grant RUNNING，不能使用磁盘阻塞前的旧观测授予权限。授予后只更新内存，终结时补写；不在活动 tick 或 motion_lock 内写 JSON。普通被拒按键不自动计入 rollout 次数。
 3. start 随后取消/失败，正常收尾可写 `entered_running=false`；进程崩溃留下 incomplete 时是否运行过是 **unknown**，不能由 null 推断未运行。
 4. 结束顺序保持：撤权 → 尝试 stop → 处理 recorder finalize → 保存可用 query sidecar → 写 attempt 终态。stop/保存各自异常都保留，首个控制主因不被清理异常覆盖。每个 attempt 幂等结束一次。
 5. 只有 `save_episode()` 返回实际路径才写 published；零帧写 empty；writer 未完成写 pending/failed 和已知 staging。不能抢 writer 的句柄，也不能猜 Raw 成功。
-6. session 终态在 shutdown 与评估产物写入尝试后保存；return-home、shutdown、evaluation-save 失败要进入 session 结果。Replay trajectory 已完成但 session 故障时，两者同时为真，不能相互覆盖。
+6. session 终态在 shutdown 与评估产物写入尝试后保存；return-home、shutdown、evaluation-save 失败要进入 session 结果。记录初始化后，资源构造或评估写入异常也必须经过最终记录尝试；外层仅清理实际已取得的资源，不让新增记录制造生命周期缺口。Replay trajectory 已完成但 session 故障时，两者同时为真，不能相互覆盖。
 7. 复用现有 close→replace 的原子 JSON 可见性。终态写入失败必须向调用者/CLI 报告、保留 incomplete、阻止继续新 attempt；不能宣称保证断电或永久存储故障后仍有完整记录，不为此扩建持久化协议。
 
 `num_episodes` 保持现有“已进入 RUNNING 的运行结束次数”上限；prepared/start_cancelled 记录保留，但未授予 RUNNING 时不消耗该上限。不能把所有 attempt JSON 终态都加计数，也不能改成只计成功 Raw 而自动无限补跑。含混的 `completed` 可局部改为 `runs_finished`，分析区分接纳、实际运行、结束、Raw 发布和任务标签。CLI 已区分 USER_QUIT 与完整 replay；继续保留。
 
 适用入口至少覆盖记录式 policy evaluation 与 replay；直接公开 API 无输出目录时要明确不产持久化结果，不用假路径。CLI 已有 session_dir，优先透传而非新增配置体系。新记录自身错误不能遮住原异常。
 
-验收：正常、零帧 timeout、start_cancelled、operator quit、writer/stop/return-home/shutdown/evaluation-write 失败；start 写入失败不授予权限；final 写入失败保留 incomplete 并报错。每次有唯一 id，Raw 可空，轨迹完成与最终 FAULT 均能查到。无需模拟所有操作系统灾难场景。
+验收：正常、零帧 timeout、start_cancelled、operator quit、writer/stop/return-home/shutdown/evaluation-write 失败；start 写入失败不授予权限；final 写入失败保留 incomplete 并报错。Replay 空目录可正常初始化记录、已有非空目录仍拒绝；记录初始化后的构造异常能得到最终结果尝试。每次有唯一 id，Raw 可空，轨迹完成与最终 FAULT 均能查到。无需模拟所有操作系统灾难场景。
 
 ## 7. T05：新路径导出与最小缓存身份
 
@@ -196,7 +198,7 @@ U16 同包但独立小改：`XHand._validate_action` 复用 `check_hand_target` 
 1. 删除 `export_raw_to_zarr` 的 overwrite、CLI `--overwrite`、`_require_replaceable_cache` 与删除旧 target 的分支；同步真实调用者/帮助，不保留死 alias。
 2. 拒绝占用 target，包括 symlink；保留 source/target 包含、嵌套 Zarr 和路径保护。
 3. 同父目录 staging 完成全体转换、计数、metadata/report 后，用既有 `atomic_publish` 发布。失败保留 staging，旧缓存与 Raw 不动。沿用单导出 owner 假设，不声称现有实现具有跨进程 race-free no-replace 保证，也不新增多写者协调服务。
-4. 扩展现有 export_report：revision、创建 UTC、有序 episode id/来源/行数/ends、accepted/excluded/rejected、完整 resolved processing、源码 SHA/dirty 状态。代码信息未知就写 unknown；相对 episode id 的解析不得依赖目录枚举随机顺序。
+4. 扩展现有 export_report：revision、创建 UTC、有序 episode id/来源/行数/ends、accepted/excluded/rejected、完整 resolved processing、源码 SHA/dirty 状态。代码信息未知就写 unknown；相对 episode id 的解析不得依赖目录枚举随机顺序。用同一份成功转换 episode 的有序列表写 root attrs 的 `episode_ids` 和 report，与 `meta/episode_ends` 一一对应；导出前 rejected/excluded Raw 不进入此列表。不新增字符串数组或元数据服务。
 5. 尽量不改 Policy 既有 attrs→ReplayBuffer→dataset→checkpoint→`validate_data_identity` 路径，只补端到端覆盖和确实缺少的连接。已知 revision 改变/丢失拒绝 exact resume；旧 unknown 保持警告。基于权重启动新实验走新实验路径，不降低 resume 标准。
 
 验收：两次导出身份不同、attrs/report 一致；占用目标和 dangling symlink 被拒；中途失败无正式新缓存；已知 revision 改变拒绝续训；13 字段、NaN mask、row_info、episode 顺序不因身份改动而变。结构重构留到 T10。
@@ -209,15 +211,19 @@ U16 同包但独立小改：`XHand._validate_action` 复用 `check_hand_target` 
 
 选择小型、显式的 `split_manifest.json`：含 `data_revision`、按导出顺序的 episode_ids、每 episode 的已确认 trial_id、明确 train/val ids、显式 exclusions、划分 seed/group_unit。来源是经确认的 trial 清单；不从 pause、HOME、相邻目录或新 episode 名推断物理重置。标注放外部清单，不回写已发布 Raw。
 
-Real 提供有序 episode id/ends。Policy 在现有 Dataset 参数增加可选 `dataset.split_manifest`，透传到 BaseDataset 并构造现有 mask；不复制 Dataset/sampler。manifest 是划分权威，有 manifest 时不再用 val_ratio 重抽；如保留 max_train_episodes，仍仅缩小 train，并记录最终子集。生成候选可使用已依赖的 `GroupShuffleSplit`，真正训练消费固定清单。
+Real 按 T05 提供有序 episode id/ends；Policy 直接消费现有 ReplayBuffer 的 attrs 与 meta，仅启用 manifest 时要求 `episode_ids` 存在、唯一、数量与 ends 对齐且顺序与清单相同，不为旧路径新增 gate，也不回读 export_report。Policy 在现有 Dataset 参数增加可选 `dataset.split_manifest`，透传到 BaseDataset 并构造现有 mask；不复制 Dataset/sampler。manifest 是划分权威，有 manifest 时不再用 val_ratio 重抽；如保留 max_train_episodes，仍仅缩小 train，并记录最终子集。生成候选可使用已依赖的 `GroupShuffleSplit`，真正训练消费固定清单。
 
-拒绝 revision/episode 顺序不匹配、未知/重复/遗漏 ids、train/val 重叠，以及同 trial 跨两侧；排除必须显式。train、val、excluded 三侧互斥且完整覆盖当前 canonical episodes；train_mask 和 val_mask 各自从清单构造，**不能沿用 train_mask = ~val_mask**，否则排除项会混入训练。记录实际 train/val/trial 数及有效窗口数。全部数据仅训练时也明确该实验无 holdout，不制造虚假的验证集。
+拒绝 revision/episode 顺序不匹配、未知/重复/遗漏 ids、train/val 重叠，以及同 trial 跨两侧；排除必须显式。manifest exclusions 只表示已进入 canonical、但本实验不使用的 episode，与导出前排除 Raw 的清单分开。train、val、excluded 三侧互斥且完整覆盖当前 canonical episodes；train_mask 和 val_mask 各自从清单构造，**不能沿用 train_mask = ~val_mask**，否则排除项会混入训练。记录实际 train/val/trial 数及有效窗口数。全部数据仅训练时也明确该实验无 holdout，不制造虚假的验证集。
 
-对**启用了新 manifest 的实验**，把规范化 manifest 的内容摘要（小文件 SHA-256）和实际 train/val mask/子集信息写入既有 `data_recipe`；复用 strict resume 的比较，防止同缓存、同路径清单内容变化却悄悄换 split。没有 manifest 的旧路径保持现有配置与 recipe 结构，不能仅为标签注入新键使历史 resume 无谓失败。切换分组协议属于新实验，不给旧合同补假默认。
+对**启用了新 manifest 的实验**，要求清单与缓存均有非空、已知且相等的 `data_revision`；两边 None/unknown 不算匹配。旧 unknown 缓存继续原有无 manifest 路径，或从 Raw 导出到新的带 revision 缓存后启用，不回填虚构身份。
+
+从本次实际读取并验证的同一份规范化 manifest 构造 mask 与小文件 SHA-256 摘要，将摘要和实际 train/val mask/子集信息写入既有 `data_recipe`，复用 strict resume 比较。完整规范化内容也在训练启动时保存一次到该实验产物，或纳入既有 config/data_recipe，保留 trial/exclusion 审计信息；不能只有可变外部路径与 hash。复用现有配置/产物 owner，不另建存储服务，不重复读取可能已变化的源文件，也不扩大 source snapshot 的全仓 JSON 白名单。
+
+没有 manifest 的旧路径保持现有 `cfg.dataset` 和 `data_recipe` 合同结构。`build_resume_contract` 会比较两者：**不要向旧默认 YAML 或合同无条件加入 `split_manifest: null` 等新键**，仅保持 recipe 不变并不够。可选 Python 参数可以存在；新实验显式配置即可。切换分组协议属于新实验，不给旧合同补假默认。
 
 最新 Policy `eval.seed_manifest` 是仿真 selection/tie_break/test 的 task/seed 协议，**与此训练 episode/trial manifest 分开**；不修改该评测协议。
 
-验收：合成同 trial 的两个 episode 永不跨侧；固定输入可重现，清单错误被拒；strict resume 检出新分组实验的 split 变化。没有真实 trial 资产时，代码与合成验收完成，实际泄漏核查和论文 group_unit 标 `NOT_VERIFIED`，不阻塞其他工作。
+验收：合成同 trial 的两个 episode 永不跨侧；固定输入可重现，清单错误与 unknown revision 被拒；strict resume 检出新分组实验的 split 变化，未启用 manifest 的旧配置/合同仍可恢复；保存的清单内容、摘要和实际 mask 一致。没有真实 trial 资产时，代码与合成验收完成，实际泄漏核查和论文 group_unit 标 `NOT_VERIFIED`，不阻塞其他工作。
 
 ### 8.2 U08：质量摘要只报告，不改变 recorded_rows
 
@@ -234,7 +240,7 @@ N/H、模态与 dispatch 配方的窗口数量仍由 Policy 当前 sampler 计�
 
 默认保持 recorded_rows：不删行、不补帧、不插值。若论文随后选择 gap 过滤，另立显式 data_recipe 变更并记录样本数量变化，不能夹在本次等价重构里。
 
-验收：跨 chunk 不漏 Δt、不跨 episode，known/unknown/nonmonotonic/repeated 合成数据计数正确；导出数组及训练当前资格不变。无需为 QA 扫描另建一个全数据缓存；分位数统计只保留必要的标量样本，图像/触觉大数组仍分块处理。
+验收：跨 chunk 不漏 Δt、不跨 episode，known/unknown/nonmonotonic/repeated 合成数据计数正确；导出数组及训练当前资格不变。直接复用 `iter_canonical_blocks` 已有 `episode_notes` 缺测行计数，必要新增统计在同一分块读取中完成，不为 QA 再读回 canonical 做第二遍全模态 finite 扫描。无需另建全数据缓存；分位数统计只保留必要的标量样本，图像/触觉大数组仍分块处理。
 
 ## 9. T07：最小 query 归因、联合时序与派生统计
 
@@ -297,7 +303,7 @@ T06 已能输出缺测统计后，可删 writer 仅用于末尾 missing_tactile 
 | 项 | 目标函数/类与选定重构 | 不变量与足够验收 |
 | --- | --- | --- |
 | U22 | `AsyncEpisodeRecorder._write_episode` 抽初始/最终 metadata 与 rows_to_arrays helper | writer 保持唯一文件/队列 owner；可清理 owner 先于 open；open→consume→flush→metadata→close→计数→publish。metadata 失败仍排空可保存队列、失败留 staging；复用原生小 episode 和失败用例 |
-| U23 | `export_raw_to_zarr` 抽 select/create store/append episode；`iter_canonical_blocks` 抽纯运动学数组计算和明确的缺测处理 | T05 行为先落实。顶层保留路径/跨 episode 一致性/report/publish，generator 保留 I/O/视频顺序消费/yield。仅已知 RawDataError 可拒绝跳过，其他转换/I/O 错误终止；13字段/NaN/ends/row_info 不变；不建 CanonicalExporter 框架 |
+| U23 | `export_raw_to_zarr` 抽 select/create store/append episode；`iter_canonical_blocks` 抽纯运动学数组计算和明确的缺测处理 | T05 行为先落实。顶层保留路径/跨 episode 一致性/report/publish，generator 保留 I/O/视频顺序消费/yield。仅在写 staging 前的候选预检阶段，已知 RawDataError 可记为 rejected 并跳过；进入转换/追加后任何错误均中止本次导出并保留 staging，包括视频中途缺帧/多帧产生的 RawDataError，不能跳过半写 episode；13字段/NaN/ends/row_info 不变；不建 CanonicalExporter 框架 |
 | U24 | `build_fingertip_runtime` 改 `build_observation_kinematics`，用小 `ObservationKinematics` 表达 arm_fk、hand_fk、mount | EEF-only 不创建 hand FK，joint/rgb/cloud 无该依赖时不创建 FK；T01 几何数值修复独立；类型不承担验证/调度职责 |
 | U25 | `compute_metrics` 抽 lag、必要 EEF 指标纯函数；保留 ReplayMetrics | 保留 RMSE 定义差别、有效重叠/静止轴/NaN mask、lag 正负号及 `(rmse, abs(lag), lag)` tie-break；不换相关系数/自动对齐或加指标 registry |
 | U26 | 增加确实重复使用的小型 `robot.stop_required`、`reader.path` 等只读接口；ObservationRow 常用 qpos/timestamp 属性按真实重复点添加 | 无隐式 I/O、无整帧复制；stop_required 表示软件停止需求，不宣称物理静止/安全；不包装所有私有字段 |
@@ -370,10 +376,19 @@ Policy 使用其自己的既有定向/config-only 检查；先核实当前入口
 可直接给 Codex CLI 的提示词：
 
 ```text
-请阅读 AGENTS.md 和 CODEX_RESEARCH_REFINEMENT_TASK_20261007.md，
-按任务书执行尚有效的整改，先核对当前源码，再按依赖顺序持续推进。
-只做授权的代码、文档与纯离线验证；不要连接设备或启动训练。
-保留已有修改，常规实现选择自行决定。条件项按证据作出保留/处理决定，
-不要为了勾选完成而删除必要机制。分别交付 Real/Policy diff、逐项状态、
-实际验证结果和真机/资产未验证范围；默认不自动提交或推送实现改动。
+请在 haoyangzhanglab/dexmani_real 中执行根目录 CODEX_RESEARCH_REFINEMENT_TASK_20261007.md 的第二轮审校版，完成其中仍然有效的整改。必要的训练侧修改同步到 haoyangzhanglab/dexmani_policy。目标是让项目适合 RAL 论文实验：正确、安全、简洁、高效、可追溯、容易理解。
+
+先读取两仓库适用的 AGENTS.md 和完整任务书，检查当前 HEAD、工作区已有修改及相关实现。任务书的 SHA 只用于定位证据，不是 reset/checkout 目标。保留用户已有修改；已经修复的条目以代码或测试证据标记 ALREADY_FIXED。若当前文件缺少“第二轮实施审校通过”标记，从 Real 的 GitHub main 读取最新版并核对差异，不覆盖用户本地改动。
+
+按 T01–T11 的依赖顺序持续执行，覆盖 U01–U34。先修正确性与数据生命周期，再删除多余机制，最后做等价重构。不要停在计划、再次审查或仅完成 P0；常规实现选择自行决定，完成所有不受阻的独立项。条件项按证据选择保留或处理，U34 未复现时如实记录。遇到权限、依赖、真实资产或实物参数阻断，只暂停相关部分并说明所需条件。
+
+严格遵守任务书的控制、Raw、时间、缺测、normalizer、resume 和资源所有权不变量。尤其落实 replay 输出预检后再初始化记录、撤权并尝试 stop 后再写 sidecar、新 manifest 的已知 revision 与完整内容留存、旧 cfg.dataset/data_recipe 的恢复兼容，以及导出追加开始后出错即整体中止并保留 staging。结构重构以行为修复后的版本为基线，不把新增合理拒绝误判为等价性失败。
+
+优先删除无用路径、复用现有类型和成熟社区机制；不增加通用框架、重复校验层、后台服务或迁移系统。helper 名称可按当前代码合理调整，行为和验收要求必须满足。不要为完成清单强行拆函数、删历史兼容或改变实验超参数。
+
+本次授权修改代码、必要文档和执行纯离线验证。不得连接或驱动设备、执行 HOME/replay/rollout/采集/真实标定，不运行完整训练、DDP 或长时间评测，不修改已发布 Raw、checkpoint 或既有实验，不升级实际实验环境来凑测试。默认保留可审查 diff，不自动 commit、push 或合并实现改动。
+
+按实际风险运行定向测试与低成本检查；测试验证输入输出、时序、数据和失败证据，不镜像私有实现。缺依赖或真机条件时明确 NOT_VERIFIED，不把未运行、skip 或旧审查探针当作本次通过。完成足够验证后停止扩张范围。
+
+最终用中文分别交付两仓库的修改摘要、删除与保留机制、U01–U34 逐项状态及证据、实际执行的验证命令和结果、阻断与真机/资产未验证范围。简短进度表可追加在原任务书末尾，不另建一组长期报告。
 ```
