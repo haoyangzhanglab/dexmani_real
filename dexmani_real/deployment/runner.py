@@ -437,7 +437,8 @@ class PolicyRunner:
                 self.policy_info.horizon - self.policy_info.n_obs_steps + 1,
                 physical_action_dim(self.policy_info.action_mode),
             )
-            valid_future = future.shape == expected and future.dtype.kind == "f" and finite
+            archivable_future = future.shape == expected and future.dtype.kind == "f"
+            valid_future = archivable_future and finite
             self._event(
                 "query_result",
                 run_id=query.run_id,
@@ -446,7 +447,13 @@ class PolicyRunner:
                 dtype=str(future.dtype),
                 finite=finite,
             )
-            if valid_future and self.results is not None and query.run_id == self.run_id:
+            if (
+                archivable_future
+                and self.results is not None
+                and self.results.attempt is not None
+                and query.run_id == self.run_id
+            ):
+                # Rejected NaN/Inf remain evidence in NPZ, never executable targets or JSON.
                 self.query_arrays[f"query_{query.query_id}"] = future.copy()
         if not query.valid or query.run_id != self.run_id or not self._has_motion_authority():
             logger.info(

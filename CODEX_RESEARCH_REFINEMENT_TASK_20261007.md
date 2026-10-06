@@ -6,7 +6,7 @@
 
 协同仓库：`haoyangzhanglab/dexmani_policy`
 
-状态：**方案经第二轮实施审校通过；实施与纯离线验证已完成，逐项结果及未验证范围见第 17 节。真机未验收。**
+状态：**方案经第二轮实施审校通过；实施与纯离线验证已完成，逐项结果见第 17 节，U09 补充修复与验收收尾见第 18 节。真机未验收。**
 
 本轮收紧了旧 resume 兼容、replay 输出初始化、manifest 身份与内容留存、导出异常阶段，以及控制等价验收边界；不新增工作包或运行框架。
 
@@ -458,3 +458,40 @@ Policy 使用其自己的既有定向/config-only 检查；先核实当前入口
 真实 trial 清单与论文 group_unit、缺测/gap 对真实样本规模的影响、旧 Raw/checkpoint 的依赖覆盖均 **NOT_VERIFIED**。条件决策后续需要：Raw 路径/布局/字段与论文使用关系、canonical revision/有序 episode id/已确认 trial_id/group_unit、checkpoint 对应 resolved cfg/data_recipe/data_identity 及是否要求 exact resume。U34 需要原失败 PyAV 版本、输入/编码参数和错误输出。没有代码级权限或依赖阻断；上述条件只阻断真实资产结论或真机验收，不影响本次已完成的离线实施。
 
 后续清理：删除旧 ActionRealizer/CollisionModel 属性探测、future 的重复转换与有限性检查、手 FK 的指尖名称副本和重复复制、manifest 规范化中的不变字段重复赋值；测试替身同步当前接口。修正执行文档中已删除的模式 setter、README 的 writer 缺测摘要描述、导出 help 和任务书待实施状态；Policy 清单细节移入 `docs/rtc.md`，README 训练段只保留入口。U31/U32 恢复用途、既有数据目录保护及有效控制算法继续保留，未扩大到真实资产迁移。
+
+## 18. 验收收尾（2026-10-07）
+
+本轮重新读取两仓库 AGENTS 和完整任务书。工作区开始时均干净，HEAD 与本轮 fact-check 基线一致：Real `3eae2fac25b5a538851546916be1a08e0792e416`、Policy `7a27b35e48123c04a5ad04a071b9283cf652e80d`；未 reset/checkout、commit 或 push。
+
+**U09：FIXED / 离线 PASS。** 本轮反例补充了第 17 节未覆盖的非有限预测：修复前 float16/float64 × NaN/+Inf/−Inf 六种输出均正确拒绝且无 SDK 下发，但 NPZ 缺失 query。`runner.py::_poll_model` 现将可归档与可执行条件分开：当前未终结 attempt 的正确形状浮点输出先保留 owned copy（原 dtype、全部数值），执行仍要求有限。未改变 freshness、授权、失效或异常优先级，也未增加序列化框架、worker 或 I/O 时机。原有撤权→尝试 stop→recorder finalize→query sidecar→attempt 终态顺序保留；非有限值只进入 NPZ，trace 仍可严格 JSON 序列化。
+
+复用 `tests/test_policy_runner.py` fixture，新增产物回归通过 `np.load(..., allow_pickle=False)` 检查 query、dtype、(7,19) 形状、[1,3] 异常位置、Inf 符号和其余有限值，并在 stop 时改变 producer 数组证明快照独立。另覆盖普通浮点执行、晚返回旧 Future 不污染新 attempt/不改旧产物、不等待旧 Future 才 stop、错误形状/整数/object 只留元信息；既有收尾测试补充 sidecar 失败与 stop/writer/sidecar 同时失败，首个异常和 termination reason 保持。
+
+**Policy：ALREADY_FIXED / 指定离线复验 PASS，无代码改动。** 当前 `datasets/split.py`、`base_dataset.py`、resume 及本轮测试确认独立 train/val mask、exclusions、已知 revision、有序 episode ids、完整规范化清单和 SHA-256 留存；无 manifest 时旧 `cfg.dataset`/`data_recipe` 不增加新键，已有恢复契约保持。没有修改 normalizer、实验超参数或历史兼容分支。
+
+使用既有解释器，两个环境都实际导入 Torch 2.4.1+cu124、TorchVision 0.19.1+cu124、OmegaConf 2.3.1、Hydra 1.3.5、Pinocchio 2.7.0、PyAV 17.1.0、Zarr 2.18.3。通过模块 `__file__` 断言 runner、BaseDataset、resume 来自本次两个工作树。pyrealsense2 原生扩展可导入且 `__version__=2.54.2`；最初 metadata 探针的 `PackageNotFoundError` 仅表示缺 distribution 元数据，随后单独核对原生模块路径/类型，非缺依赖。未安装或升级环境。
+
+下列简称展开为本轮实际使用的绝对路径；测试在对应仓库执行，均设置 `PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/tmp/dexmani-acceptance-mpl`：
+
+```bash
+REAL_PY=/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python
+POLICY_PY=/home/zhanghaoyang/miniconda3/envs/policy/bin/python
+RUFF=/home/zhanghaoyang/miniconda3/envs/real_robot/bin/ruff
+```
+
+| 本轮实际命令 | 结果 |
+| --- | --- |
+| 修复前 `$REAL_PY -m pytest -q -p no:cacheprovider tests/test_policy_runner.py -k query_evidence_preserves_floating_output --tb=short` | **6 failed、2 passed、78 deselected，0.34 s**；六个失败均为拒绝后 NPZ 无 query，明确复现遗漏。 |
+| 修复后 `$REAL_PY -m pytest -q -p no:cacheprovider tests/test_policy_runner.py tests/test_policy_recording.py` | **99 passed，2.09 s**。 |
+| `$REAL_PY -m pytest -q -p no:cacheprovider tests` | **198 passed，13.18 s，无 skip**；包括此前审查中受 pyrealsense2 和 Policy 导入阻断的测试，以及当前 mount 的原生碰撞拒绝回归。 |
+| `$POLICY_PY -m pytest -q -p no:cacheprovider tests/test_research_split.py tests/test_policy_windows.py tests/test_infra_resume.py -k 'research_split or policy_windows or rng_device_and_revision'` | **26 passed、5 deselected，3.26 s**；未选中项不计通过。 |
+| `$POLICY_PY dexmani_policy/smoke_test.py --config-only dp dp3 dqrise r3d multitask_dit` | **5 个配置全部 PASS**；未启动训练。 |
+| `$REAL_PY -m py_compile dexmani_real/deployment/runner.py tests/test_policy_runner.py` | PASS。 |
+| `$RUFF format --check dexmani_real/deployment/runner.py tests/test_policy_runner.py`；`$RUFF check dexmani_real/deployment/runner.py tests/test_policy_runner.py` | 两项 PASS。 |
+| 两仓库 `git diff --check` | PASS。 |
+
+**HOME：模型拒绝复验 PASS；实物 NOT_VERIFIED。** 离线 Python 探针使用默认 `ExperimentConfig`、joint `ActionRealizer` 和 Pinocchio，未创建设备连接。当前 mount 平移 `(-0.015,0,0)m`、四元数 wxyz `(0.707107,0,0.707107,0)`、手部 HOME（SDK 顺序，度）`(30,55.33,10,0.17,1.08,5,1.25,5,1.33,5,1.33,5)` 产生 `self_collision`。最初通过 `collisionResults` 枚举碰撞对的探针因现有 hpp-fcl 绑定类型转换限制而断言失败；随后用同一原生模型已更新的 geometry，通过 `pin.computeCollision(model, data, pair_index)` 逐对核对，确认唯一命中 `flange_link_0/right_hand_thumb_bend_link_0`。未修改既有诊断降级行为或环境来消除限制。
+
+关闭实物阻断需要操作者提供并确认：① `custom_eef_link` 到 `right_hand_link` 的实际安装变换（坐标方向、平移单位和旋转约定）；② 实际手部 HOME 姿态及关节顺序；③ 上述碰撞对的几何与实际接触/间隙关系。现有证据不能判定实物确有碰撞，也不能归责于 mount、mesh 或 SRDF。保留拒绝与原回归，未改 mount、HOME、mesh、SRDF 或阈值；nominal mount 的合成通过不能替代验收。真机安全、真实 Raw/checkpoint 和论文资产恢复仍未验证；本轮无代码权限/依赖阻断，未连接设备、执行 HOME/replay/rollout/采集/真实标定，未训练、DDP 或修改既有实验产物。
+
+收尾后相关清理：CollisionModel 直接复用 `robot.model` 的手部维数/SDK→URDF 索引，删除重复私有别名；replay 删除旧 `h5 = reader` 别名和迁移过程注释。修正碰撞注释中的实物暗示，README 与执行文档明确 NPZ 保留被拒绝预测、严格 JSON、保存失败与当前模式比较方法。保留仍有用途的旧 Raw 缺测/dispatch 读取、旧配置恢复及已复现绑定限制下的碰撞诊断降级；Policy 无改动。清理后再次执行上表 Real 全量离线 pytest 命令：**198 passed，12.83 s，无 skip**；对 `runner.py`、`planning/collision.py`、`replay/trajectory.py`、`tests/test_policy_runner.py` 执行 py_compile、Ruff check/format --check 均 PASS，两仓库 diff 检查 PASS。未新增测试框架、改变控制/数据语义或执行硬件命令。

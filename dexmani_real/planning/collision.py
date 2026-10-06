@@ -1,8 +1,7 @@
 """Pinocchio self and static-environment collision checks for xArm7 + XHand.
 
-Uses T-Rex's pin.computeCollisions() pattern. Both models share
-xarm7_xhand.srdf: arm-arm and arm-hand checks, with hand self-collision
-disabled.
+Both models share xarm7_xhand.srdf: arm-arm and arm-hand checks, with
+hand self-collision disabled.
 
 Usage::
 
@@ -40,11 +39,6 @@ _collision_detail_warn = ThrottledWarner(interval_s=60.0)
 _COLLISION_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)  # 7-DOF (hand fixed)
 _FULL_URDF = str(XARM7_XHAND_RIGHT_URDF_PATH)  # 19-DOF (7 arm + 12 hand)
 _COLLISION_SRDF = str(XARM7_XHAND_SRDF_PATH)  # unified SRDF (single source)
-
-_HAND_DOF_COUNT = HAND_DOF
-
-# Hand order mapping is defined in robot.model and shared with kinematics.
-_HAND_USER_TO_URDF = HAND_SDK_TO_URDF_IDX
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,14 +351,12 @@ class CollisionModel:
         Raises ValueError for wrong shape or non-finite values.
         """
         hand_qpos = np.asarray(hand_qpos, dtype=np.float64)
-        if hand_qpos.shape != (_HAND_DOF_COUNT,):
-            raise ValueError(
-                f"Expected hand_qpos shape ({_HAND_DOF_COUNT},), got {hand_qpos.shape}"
-            )
+        if hand_qpos.shape != (HAND_DOF,):
+            raise ValueError(f"Expected hand_qpos shape ({HAND_DOF},), got {hand_qpos.shape}")
         if not np.all(np.isfinite(hand_qpos)):
             raise ValueError("hand_qpos contains NaN or Inf — FK would silently fail")
-        # Reorder user→URDF: _hand_user_to_urdf[i] = which user index maps to URDF slot i
-        self._hand_qpos = hand_qpos[list(_HAND_USER_TO_URDF)]
+        # Gather SDK joint values in the order required by the URDF model.
+        self._hand_qpos = hand_qpos[list(HAND_SDK_TO_URDF_IDX)]
 
     def _to_full_qpos(self, qpos: np.ndarray) -> np.ndarray:
         """Normalize qpos for internal use, auto-expanding arm→full in hand_dof mode.
@@ -457,15 +449,14 @@ class CollisionModel:
                         )
                     )
         except TypeError:
-            # pybind11 type conversion failure — the collision is real but we
-            # can't enumerate which pair(s) triggered it.
+            # A binding failure hides pair details, not the model's collision result.
             _collision_detail_warn(
                 "collisionResults type conversion failed — collision detected "
                 "but pair details unavailable (hpp-fcl build limitation)"
             )
             return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
         if not pairs:
-            # Pair enumeration is diagnostic-only; never turn a real collision into a pass.
+            # Missing diagnostic pairs must not override the model's collision result.
             return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
         return CollisionInfo(
             in_collision=True, collision_pairs=tuple(pairs), num_contacts=len(pairs)

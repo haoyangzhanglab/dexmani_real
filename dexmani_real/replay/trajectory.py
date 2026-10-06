@@ -35,7 +35,6 @@ def resolve_episode_path(raw_path: str) -> tuple[str, str]:
 def load_trajectory(episode_path):
     path, _ = resolve_episode_path(episode_path)
     with EpisodeReader(path) as reader:
-        h5 = reader
         meta = reader.meta
         collection_source = meta["collection_source"]
         if isinstance(collection_source, bytes):
@@ -46,7 +45,7 @@ def load_trajectory(episode_path):
             "action_arm_joint_target", "action_hand_joint_target", "arm_qpos", "hand_qpos"
         )
         arm, hand, aq, hq = [
-            h5[k][:]
+            reader[k][:]
             for k in (
                 "action_arm_joint_target",
                 "action_hand_joint_target",
@@ -56,8 +55,8 @@ def load_trajectory(episode_path):
         ]
         if len(arm) == 0 or not all(np.isfinite(v).all() for v in (arm, hand, aq, hq)):
             raise ValueError("replay requires nonempty finite targets and robot states")
-        # Preserve the former reader check at the physical-motion consumer. Old
-        # recordings without dispatch evidence remain nominal target trajectories.
+        # Recorded dispatch must show continued targets on both devices. Recordings
+        # without dispatch evidence remain nominal target trajectories.
         if (
             "execution_path" in meta
             or "dispatch_status" in reader.fields

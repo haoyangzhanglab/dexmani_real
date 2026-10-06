@@ -46,7 +46,11 @@ WAIT 表示没有新策略目标，设备仍可能追踪上一个目标。停止
 
 记录式 policy evaluation 在 Raw 外保存 `session_result.json`、`attempts/<id>.json` 和 query NPZ。开始请求通过前置检查后、授予 RUNNING 前写 incomplete，阻塞 I/O 完成后重新检查起始观测再授权；取消的 prepared attempt 不消耗运行次数。崩溃留下的 incomplete/entered_running=null 表示未知。无 recording_config 的直接 policy API 不产生持久化结果。
 
-收尾顺序为撤权、尝试 stop、recorder finalize、query sidecar、attempt 终态；只有 recorder 返回实际发布路径才标记 Raw published。query trace 关联原始 future、窗口来源、selected target 和逐设备 dispatch。晚返回的旧 Future 仅进入 session 诊断，不归入新尝试或回写 Raw，也不为等待它推迟 stop。session 结果在资源关闭尝试后写入，HOME/关闭故障与轨迹结果分别留证。
+收尾顺序为撤权、尝试 stop、recorder finalize、query sidecar、attempt 终态；只有 recorder 返回实际发布路径才标记 Raw published。query trace 关联窗口来源、selected target 和逐设备 dispatch；预测数组保存在 NPZ。
+
+当前未终结 attempt 的预测，只要形状为 joint 的 `(P,19)` 或 EEF 的 `(P,21)` 且 dtype 为浮点，就保存独立快照，保留原 dtype 和全部数值，包括被拒绝的 NaN/±Inf。可归档不代表可执行：执行仍要求有限值及既有 freshness、授权和调度准入。形状或类型错误只保留诊断元信息，不序列化任意对象；非有限数组不写入严格 JSON trace。读取 NPZ 使用 `np.load(path, allow_pickle=False)`。
+
+晚返回的旧 Future 仅进入 session 诊断，不归入新尝试或回写 Raw，也不为等待它推迟 stop。sidecar 保存失败记入 attempt/session 的 artifact errors，保留首个终止原因，并向调用者报告收尾失败。session 结果在资源关闭尝试后写入，HOME/关闭故障与轨迹结果分别留证。
 
 `python examples/summarize_policy_trace.py <attempt.json>` 离线汇总模型、观测、前缀准备、目标实现、发送和 owner tick 时间。缺失阶段的分位数为 null；嵌套或并行阶段的分位数不相加为总延迟。
 
@@ -70,6 +74,6 @@ ruff check dexmani_real examples
 git diff --check
 ```
 
-相邻 Policy 的定向测试包括 `tests/test_policy_windows.py`、`tests/test_streaming_dataset.py` 和 `tests/test_policy_rtc.py`，配套运行已有 training/resume/evaluation 回归测试和 `smoke_test.py --config-only`。测试覆盖生产调度、实际 DDIM、实际 backbone input VJP、公共 FK/IK 动态检查，以及临时目录中的实际 Raw writer；fake device 不等于真机集成。
+相邻 Policy 的定向测试包括 `tests/test_research_split.py`、`tests/test_policy_windows.py`、`tests/test_streaming_dataset.py` 和 `tests/test_policy_rtc.py`，配套运行已有 training/resume/evaluation 回归测试和 `smoke_test.py --config-only`。测试覆盖生产调度、实际 DDIM、实际 backbone input VJP、公共 FK/IK 动态检查，以及临时目录中的实际 Raw writer；fake device 不等于真机集成。
 
-后续实验先对照相同权重的旧/新 sync（尤其 N>1），再在相同观察协议、A、NFE、seed 和预算下对照新 sync/async/rtc；async 与 rtc 固定相同 d。记录成功率、任务时间、decision age、handoff miss、owner tick、前缀准备时间及接缝变化。新 sync 在推理期间继续采样，是明确的评测观察时间协议变化，不是历史同步行为的等价重构。GPU/真实权重时延、闭环收益、物理安全须单独验证。
+对照 sync/async/rtc 时固定权重、观察协议、A、NFE、seed 和预算，async 与 rtc 固定相同 d。记录成功率、任务时间、decision age、handoff miss、owner tick、前缀准备时间及接缝变化。当前 sync 在推理期间继续采样；比较历史同步结果时，应固定其源码版本并标注观察时间协议差异。GPU/真实权重时延、闭环收益、物理安全须单独验证。

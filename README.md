@@ -203,7 +203,7 @@ Canonical 不是新的实验事实，也不承担长期格式兼容。
 
 一个 store 当前只组织一个 task；`dt` 必须一致，属于训练/部署数值语义。`depth_scale` 在 store 内保持一致以解释存储深度，不作为 Policy 兼容元数据。导出只接受未占用的新路径；分块转换完成后发布带唯一 `data_revision` 的 canonical cache。重新导出使用新路径和新身份，精确续训保留原缓存；失败保留 staging，始终不修改 Raw。
 
-记录式 policy evaluation 和 replay 在 Raw 外保存 `session_result.json` 与 `attempts/`，区分实际运行、Raw 发布和 session 关闭结果。Policy 的 query 数组保存为每 attempt 的 NPZ；可用 `python examples/summarize_policy_trace.py <attempt.json>` 离线查看模型、观测、实现和发送阶段的时间摘要。无输出目录的直接 policy API 不产生持久化结果。
+记录式 policy evaluation 和 replay 在 Raw 外保存 `session_result.json` 与 `attempts/`，区分实际运行、Raw 发布和 session 关闭结果。Policy 的 query NPZ 保留可归档预测，包括被拒绝的非有限浮点输出；归档条件与执行准入见 [Policy 执行说明](docs/policy_execution.md#数据与追踪)。可用 `python examples/summarize_policy_trace.py <attempt.json>` 离线查看模型、观测、目标实现和发送阶段的时间摘要。无输出目录的直接 policy API 不产生持久化结果。
 
 H/W、depth scale、名义 dt 不同的数据分开导出，不静默 resize 或插值。
 

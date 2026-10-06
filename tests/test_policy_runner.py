@@ -802,10 +802,18 @@ def test_late_return_writer_finalization_failure_keeps_dispatch_and_end(make_run
 
 
 @pytest.mark.parametrize(
-    "stop_fails,writer_fails", [(False, False), (True, False), (False, True), (True, True)]
+    "stop_fails,writer_fails,sidecar_fails",
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (True, True, False),
+        (False, False, True),
+        (True, True, True),
+    ],
 )
 def test_attempt_finalization_orders_stop_before_sidecar(
-    make_runner, tmp_path, monkeypatch, stop_fails, writer_fails
+    make_runner, tmp_path, monkeypatch, stop_fails, writer_fails, sidecar_fails
 ):
     import json
 
@@ -835,12 +843,17 @@ def test_attempt_finalization_orders_stop_before_sidecar(
     def sidecar(*a, **kw):
         assert order == ["stop", "raw"]
         order.append("sidecar")
+        if sidecar_fails:
+            raise OSError("sidecar failed")
         native(*a, **kw)
 
     monkeypatch.setattr(np, "savez", sidecar)
     r.query_arrays = {"query_1": np.ones((2, 19), dtype=np.float16)}
-    if stop_fails or writer_fails:
-        with pytest.raises(RuntimeError, match="stop failed" if stop_fails else "writer failed"):
+    if stop_fails or writer_fails or sidecar_fails:
+        message = (
+            "stop failed" if stop_fails else "writer failed" if writer_fails else "sidecar failed"
+        )
+        with pytest.raises((RuntimeError, OSError), match=message):
             r._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
     else:
         r._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
@@ -848,11 +861,138 @@ def test_attempt_finalization_orders_stop_before_sidecar(
     assert result["entered_running"] and result["row_count"] == 0
     assert result["recording_status"] == ("failed" if writer_fails else "empty")
     assert result["termination_reason"] == "timeout"
-    assert len(result["finalization_errors"]) == int(stop_fails) + int(writer_fails)
-    with np.load(result["query_sidecar"]) as arrays:
-        assert arrays["query_1"].dtype == np.float16
+    assert len(result["finalization_errors"]) == sum((stop_fails, writer_fails, sidecar_fails))
+    assert r.results.session["artifact_errors"] == result["finalization_errors"]
+    if sidecar_fails:
+        assert result["query_sidecar"] is None
+        assert result["finalization_errors"][-1]["stage"] == "query_sidecar"
+    else:
+        with np.load(result["query_sidecar"], allow_pickle=False) as arrays:
+            assert arrays["query_1"].dtype == np.float16
     r._finish_episode("again")
     assert order == ["stop", "raw", "sidecar"]
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float64])
+@pytest.mark.parametrize(
+    "value", [np.nan, np.inf, -np.inf, 0.04], ids=["nan", "posinf", "neginf", "finite"]
+)
+def test_query_evidence_preserves_floating_output(make_runner, tmp_path, dtype, value):
+    import json
+
+    from dexmani_real.recording.results import SessionResults
+
+    r = make_runner(mode="sync")
+    r.results = SessionResults(tmp_path, "policy")
+    attempt = r.results.prepare(recording=False)
+    r.results.entered(r.run_id)
+    r.tick(0)
+    r.tick(1)
+    prediction = future(r).astype(dtype)
+    prediction[1, 3] = value
+    expected = prediction.copy()
+    query_key = f"query_{r.query_id}"
+    stop = r.robot.stop
+
+    def stop_and_release_prediction():
+        assert r.run_id is None and r.shared.safety_state.value != int(SafetyState.RUNNING)
+        # A producer-owned buffer can change after receipt; the archive owns its copy.
+        prediction.fill(-12)
+        stop()
+
+    r.robot.stop = stop_and_release_prediction
+    r.model.complete(prediction)
+    if np.isfinite(value):
+        r.step()
+        assert not r.robot.sent
+        r.tick(2)
+        assert len(r.robot.sent) == 1
+        np.testing.assert_array_equal(r.robot.sent[0].arm_qpos, expected[0, :7])
+        np.testing.assert_array_equal(r.robot.sent[0].hand_qpos, expected[0, 7:])
+        r._finish_episode("operator", run_end_reason=RunEndReason.OPERATOR)
+    else:
+        with pytest.raises(ValueError, match="finite floating point"):
+            r.run()
+        assert not r.robot.sent
+    record = json.loads((tmp_path / "attempts" / f"{attempt}.json").read_text())
+    assert record["termination_reason"] == ("operator" if np.isfinite(value) else "policy_failure")
+    assert record["finalization_errors"] == []
+    json.dumps(record, allow_nan=False)
+    with np.load(record["query_sidecar"], allow_pickle=False) as arrays:
+        assert arrays.files == [query_key]
+        archived = arrays[query_key]
+        assert archived.dtype == dtype and archived.shape == (7, 19)
+        np.testing.assert_array_equal(archived, expected)
+        assert np.signbit(archived[1, 3]) == np.signbit(expected[1, 3])
+    assert r.robot.stops == 1
+
+
+@pytest.mark.parametrize("value", [np.inf, 0.02], ids=["nonfinite", "finite"])
+def test_retired_query_evidence_stays_out_of_next_attempt(make_runner, tmp_path, value):
+    import json
+    from pathlib import Path
+
+    from dexmani_real.recording.results import SessionResults
+
+    r = make_runner(execute=False)
+    r.results = SessionResults(tmp_path, "policy")
+    first = r.results.prepare(recording=False)
+    r.results.entered(r.run_id)
+    r.tick(0)
+    r.tick(1)
+    r._finish_episode("operator", run_end_reason=RunEndReason.OPERATOR)
+    assert r.robot.stops == 1 and not r.model.future.done()
+    first_path = tmp_path / "attempts" / f"{first}.json"
+    first_bytes = first_path.read_bytes()
+    first_sidecar = Path(json.loads(first_bytes)["query_sidecar"])
+    sidecar_bytes = first_sidecar.read_bytes()
+    r.shared.start_request.value = True
+    r._start_observation = r._read_observation
+    r.step()
+    assert r.results.attempt is None  # Pending old Future still prevents a new reset.
+    prediction = future(r)
+    prediction[1, 3] = value
+    r.model.complete(prediction)
+    r.step()
+    second = r.results.attempt["attempt_id"]
+    r.model.complete()  # New episode reset.
+    r.step()
+    r._finish_episode("operator", run_end_reason=RunEndReason.OPERATOR)
+    assert first_path.read_bytes() == first_bytes and first_sidecar.read_bytes() == sidecar_bytes
+    record = json.loads((tmp_path / "attempts" / f"{second}.json").read_text())
+    with np.load(record["query_sidecar"], allow_pickle=False) as arrays:
+        assert arrays.files == []
+    assert r.results.session["retired_queries"][0]["run_id"] != record["run_id"]
+    assert not r.robot.sent
+
+
+@pytest.mark.parametrize("kind", ["shape", "integer", "object"])
+def test_query_evidence_rejects_unsupported_arrays(make_runner, tmp_path, kind):
+    import json
+
+    from dexmani_real.recording.results import SessionResults
+
+    r = make_runner(mode="sync")
+    r.results = SessionResults(tmp_path, "policy")
+    attempt = r.results.prepare(recording=False)
+    r.results.entered(r.run_id)
+    r.tick(0)
+    r.tick(1)
+    prediction = (
+        np.zeros((7, 18))
+        if kind == "shape"
+        else np.zeros((7, 19), dtype=np.int64 if kind == "integer" else object)
+    )
+    r.model.complete(prediction)
+    with pytest.raises(ValueError, match="finite floating point"):
+        r.run()
+    assert not r.robot.sent
+    record = json.loads((tmp_path / "attempts" / f"{attempt}.json").read_text())
+    diagnostic = next(e for e in record["trace"] if e["event"] == "query_result")
+    assert diagnostic["shape"] == list(prediction.shape)
+    assert diagnostic["dtype"] == str(prediction.dtype)
+    with np.load(record["query_sidecar"], allow_pickle=False) as arrays:
+        assert arrays.files == []
 
 
 @pytest.mark.parametrize("cancel", [False, True])
