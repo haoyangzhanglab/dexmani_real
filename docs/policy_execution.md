@@ -10,7 +10,7 @@
 
 async/rtc 还要求 `execution.prefetch_steps` 或 CLI `--prefetch-steps d`，满足 1≤d≤A、A+d≤P。rtc 要求 `execution.rtc_guidance_cap` 或 CLI `--rtc-guidance-cap beta`，beta 有限且非负；beta=0 对应原采样分支。sync 的动作窗口要求为 1≤A≤P。
 
-当前相邻 Policy `1c6981d` 的 warmup 仅在 beta>0 时生成 prefix，因此 beta=0、d>0 会在连接设备前报 `No prefix requires delay_steps=0`。该组合尚未可用，需在 Policy 修复 prefix 条件为正 delay 或正 guidance，并验证 reset/RNG 行为；Real 不自动更改 beta、delay 或模式。
+当前核对的相邻 Policy `0084e3d` 的 warmup 仅在 beta>0 时生成 prefix，因此 beta=0、d>0 会在连接设备前报 `No prefix requires delay_steps=0`。该组合尚未可用；Real 不自动更改 beta、delay 或模式。
 
 决策年龄预算还须大于 sync 的 `(A-1)dt` 或 async/rtc 的 `(A+d-1)dt`；这些只是动作段可容纳的必要条件，实际 query 来源年龄仍逐次检查。
 
@@ -18,7 +18,7 @@ sync/async 保留原模型支持范围；rtc 当前接入连续动作 BaseAgent 
 
 加载与 warmup 在连接设备前完成。warmup 包含输入预处理、选定采样路径（RTC guidance 启用时含 VJP）和 CPU 返回；它报告模型路径的时间，并为 async/rtc 给出建议 d，不自动修改配置。实测耗时达到 WAIT 或预取预算时拒绝启动；sync 还检查推理耗时加后续 A-1 槽能否落在决策年龄预算内。真实前缀准备和采样开销另由 owner 事件测量，合成 warmup 不能证明总时延上界。运行中准备超过当前槽的迟到容限使预约失效，EEF 的 d 步 IK 也必须在这一预算内完成，不自动分槽。
 
-连接不采集触觉 bias。T 表示操作者确认当前无接触，仅在空闲、无 capture/reset/pending inference 时执行；S/Q/ESC 取消，且不追加运动。触觉缺失继续为 NaN，要求触觉的模型会在实际输入检查拒绝，关节模型不以辅助触觉为启动门。
+连接不采集触觉 bias。T 表示操作者确认当前无接触，仅在 ARMED、空闲且无录制、模型复位或待完成推理时执行；S/Q/ESC 可取消，且不追加运动。HOME 一旦进入处理，即使返回未完成，也会忽略同批后续 B/T，并丢弃执行期间排队的 H/B/T；结束后需重新发起请求。未执行的 HOME 不额外屏蔽 T；TARE 后同批 H/B 不执行。S/Q/ESC 的即时停止与取消不受队列清理影响。触觉缺失继续为 NaN，要求触觉的模型会在实际输入检查拒绝，关节模型不以辅助触觉为启动门。
 
 一个 session 固定使用启动时选择的模式；切换 sync/async/rtc 需关闭当前 session 后重新启动。每次接纳开始请求仍由串行 worker 执行 episode reset。
 
@@ -80,6 +80,6 @@ ruff check dexmani_real examples tests
 git diff --check
 ```
 
-Real 测试覆盖生产调度、公共 FK/IK、源帧缓存、IPC、归零取消和临时目录中的真实 Raw writer。跨仓 RTC 桥接使用相邻 Policy 的 `tests/test_policy_rtc.py`，其中包含 DDIM 和 backbone input VJP 检查；上文 beta=0、正 delay 的 warmup 回归仍需补齐。训练、恢复和 Dataset 的完整验证按 Policy 仓库说明执行。fake device 不等于真机集成；小型离线数据贯通命令见 [复现入口](reproduction.md)。
+Real 测试覆盖生产调度、公共 FK/IK、源帧缓存、IPC、HOME/TARE 批次隔离、即时取消、配置可空字段和临时目录中的真实 Raw writer。跨仓 RTC 桥接使用相邻 Policy 的 `tests/test_policy_rtc.py`，其中包含 DDIM 和 backbone input VJP 检查；现有参数化用例未覆盖 beta=0、正 delay 的 warmup 缺陷。训练、恢复和 Dataset 的完整验证按 Policy 仓库说明执行。fake device 不等于真机集成；小型离线数据贯通命令见 [复现入口](reproduction.md)。
 
 对照 sync/async/rtc 时固定权重、观察协议、A、NFE、seed 和预算，async 与 rtc 固定相同 d。记录成功率、任务时间、decision age、handoff miss、owner tick、前缀准备时间及接缝变化。当前 sync 在推理期间继续采样；比较历史同步结果时，应固定其源码版本并标注观察时间协议差异。GPU/真实权重时延、闭环收益、物理安全须单独验证。

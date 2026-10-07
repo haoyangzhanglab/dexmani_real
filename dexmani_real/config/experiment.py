@@ -125,7 +125,7 @@ def _patch(current: Any, changes: Any, path: str = "") -> Any:
             raise TypeError(f"config {path!r} must be numeric")
         return float(changes)
     elif isinstance(current, str):
-        if changes is None and path == "environment.table.plane_path":
+        if changes is None and path in {"environment.table.plane_path", "hand.device_name"}:
             return None
         if not isinstance(changes, str):
             raise TypeError(f"config {path!r} must be a string")

@@ -11,7 +11,7 @@ from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.robot.drivers.xhand import XHand
 from dexmani_real.robot.robot import DexManiRobot, RobotState
 from dexmani_real.runtime.operator_input import OperatorCommand
-from dexmani_real.runtime.safety import SafetyState
+from dexmani_real.runtime.safety import SafetyState, StopRequest
 
 
 def test_connect_only_reads_joints_no_tare():
@@ -131,7 +131,6 @@ def test_policy_preparation_rejects_tare_and_does_not_begin_same_batch():
 
 def test_policy_tare_preserves_stop_received_during_admission():
     from dexmani_real.deployment.operator import PolicyOperator
-    from dexmani_real.runtime.safety import StopRequest
 
     shared = shared_state()
     shared.safety_state.value = int(SafetyState.ARMED)
@@ -156,10 +155,138 @@ def test_policy_tare_preserves_stop_received_during_admission():
     assert shared.stop_request.value == int(StopRequest.OPERATOR)
 
 
+@pytest.fixture
+def policy_keyboard(monkeypatch):
+    from dexmani_real.deployment import operator as module
+
+    shared = shared_state()
+    shared.safety_state.value = int(SafetyState.ARMED)
+    shared.start_request = NS(value=False)
+    calls = []
+    effects = NS(home_completed=True, during_home=lambda: None, during_tare=lambda: None)
+
+    def home(*args, abort_requested, **kwargs):
+        calls.append("home")
+        effects.during_home()
+        effects.home_cancelled = abort_requested()
+        return effects.home_completed and not effects.home_cancelled
+
+    def tare(*, cancel_requested):
+        calls.append("tare")
+        effects.during_tare()
+        if cancel_requested():
+            raise CancelledError()
+        return True, True
+
+    monkeypatch.setattr(module, "home_robot", home)
+    operator = module.PolicyOperator(
+        shared,
+        ExperimentConfig(),
+        NS(),
+        robot=NS(tare_tactile=tare, check=lambda: None),
+        execute=True,
+        idle_for_tare=lambda: not shared.start_request.value,
+    )
+    # Use real callbacks, queue and ESC latch without starting a pynput listener.
+    keyboard = operator.keyboard
+    keyboard._callbacks_active = keyboard._running = True
+    keyboard._listener = NS(is_alive=lambda: True)
+    on_press, on_release = keyboard._callbacks(NS(Key=NS(esc="esc")))
+
+    def press(*keys):
+        for name in keys:
+            key = "esc" if name == "esc" else NS(char=name)
+            on_press(key)
+            on_release(key)
+
+    return NS(operator=operator, shared=shared, calls=calls, effects=effects, press=press)
+
+
+@pytest.mark.parametrize("completed", [True, False])
+def test_policy_home_discards_same_batch_tare_but_accepts_new_tare(policy_keyboard, completed):
+    case = policy_keyboard
+    case.effects.home_completed = completed
+    case.press("h", "t")
+    case.operator.poll()
+    assert case.calls == ["home"]
+    assert case.operator.home_results == [{"outcome": "completed" if completed else "failed"}]
+    assert not case.shared.start_request.value
+    case.press("t")
+    case.operator.poll()
+    assert case.calls == ["home", "tare"]
+    assert case.shared.run_id.value == 1
+
+
+def test_policy_home_discards_tare_queued_during_home(policy_keyboard):
+    case = policy_keyboard
+    case.effects.during_home = lambda: case.press("t")
+    case.press("h")
+    case.operator.poll()
+    case.operator.poll()
+    assert case.calls == ["home"]
+
+
+@pytest.mark.parametrize("keys,expected", [(("h", "b"), ["home"]), (("t", "h"), ["tare"])])
+def test_policy_preparation_does_not_chain_home_or_begin(policy_keyboard, keys, expected):
+    case = policy_keyboard
+    case.press(*keys)
+    case.operator.poll()
+    assert case.calls == expected
+    assert not case.shared.start_request.value
+    assert case.shared.run_id.value == 1
+
+
+def test_policy_disabled_home_does_not_discard_tare(policy_keyboard):
+    case = policy_keyboard
+    case.operator.planner = None
+    case.press("h", "t")
+    case.operator.poll()
+    assert case.calls == ["tare"]
+    assert case.operator.home_results == []
+
+
+@pytest.mark.parametrize("key", ["s", "q", "esc"])
+def test_policy_stop_in_same_batch_prevents_preparation_and_begin(policy_keyboard, key):
+    case = policy_keyboard
+    case.press("h", "t", "b", key)
+    assert case.shared.estop_request.value if key == "esc" else case.shared.stop_request.value
+    case.operator.poll()
+    assert case.calls == []
+    assert not case.shared.start_request.value
+    assert case.shared.quit_requested.value == (key == "q")
+    assert case.operator.keyboard.estop_latched == (key == "esc")
+    assert case.shared.run_id.value == (1 if key == "esc" else 2)
+
+
+@pytest.mark.parametrize("key", ["s", "q", "esc"])
+@pytest.mark.parametrize("preparation", ["home", "tare"])
+def test_policy_stop_during_preparation_cancels_and_survives_drain(
+    policy_keyboard, key, preparation
+):
+    case = policy_keyboard
+    setattr(case.effects, f"during_{preparation}", lambda: case.press("t", key, "b"))
+    case.press("h" if preparation == "home" else "t", "t", "b")
+    case.operator.poll()
+    assert case.calls == [preparation]
+    if preparation == "home":
+        assert case.effects.home_cancelled
+        assert case.operator.home_results == [{"outcome": "interrupted"}]
+    assert not case.shared.start_request.value
+    assert case.shared.stop_request.value == (0 if key == "esc" else int(StopRequest.OPERATOR))
+    assert case.shared.quit_requested.value == (key == "q")
+    assert case.shared.estop_request.value == (key == "esc")
+    assert case.operator.keyboard.estop_latched == (key == "esc")
+    assert case.shared.run_id.value == (1 if key == "esc" else 2)
+    expected = {
+        "s": OperatorCommand.STOP,
+        "q": OperatorCommand.QUIT,
+        "esc": OperatorCommand.EMERGENCY_STOP,
+    }
+    assert case.operator.keyboard.poll(timeout=0) == [expected[key]]
+
+
 def test_owner_tare_stops_before_sampling_and_passes_cancellation():
     import threading
-
-    from dexmani_real.runtime.safety import StopRequest
 
     shared = shared_state()
     shared.safety_state.value = int(SafetyState.ARMED)

@@ -3,7 +3,7 @@ arm:
   ip: "192.168.1.233"
 hand:
   comm_type: serial
-  device_name: /dev/ttyUSB0
+  device_name: /dev/ttyUSB0  # null 在连接时枚举并选择首个设备
   device_id: 0
 camera:
   serial: null  # 填现场 RealSense 序列号；null 使用驱动默认选择

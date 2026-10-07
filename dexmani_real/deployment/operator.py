@@ -1,4 +1,4 @@
-"""Policy keyboard ownership and HOME/start/stop authorization ordering."""
+"""Policy keyboard ownership and HOME/TARE/start/stop authorization ordering."""
 
 from concurrent.futures import CancelledError
 
@@ -66,12 +66,10 @@ class PolicyOperator:
         self._handle_command_batch(self.keyboard.poll(timeout=0))
 
     def _handle_command_batch(self, signals) -> None:
-        # H blocks the I/O owner. Ignore B from the same batch so HOME cannot
-        # trigger policy execution without a subsequent operator request.
-        discard_begin_in_batch = False
-        # Lifecycle-changing signals suppress Home and Begin in the same batch.
-        # C/D (PAUSE/DISCARD) belong to teleop and are true no-ops here, so
-        # they must not fence H; ESC is fenced by the estop latch/callback.
+        # H blocks the I/O owner. B/T in that batch require a fresh request
+        # after HOME, including when HOME returns incomplete.
+        discard_begin_or_tare_in_batch = False
+        # S/Q suppress H/B/T throughout the batch; ESC uses the latch/callback.
         stop_in_batch = any(
             signal in {OperatorCommand.STOP, OperatorCommand.QUIT} for signal in signals
         )
@@ -80,14 +78,14 @@ class PolicyOperator:
                 if stop_in_batch:
                     logger.warning("operator: ignored B received in the same batch as S/Q")
                     continue
-                if discard_begin_in_batch or not request_policy_start(self.shared):
+                if discard_begin_or_tare_in_batch or not request_policy_start(self.shared):
                     logger.warning(
-                        "operator: ignored B while stopped or HOME is handling this batch"
+                        "operator: ignored B while stopped or after preparation in this batch"
                     )
                     continue
             elif signal is OperatorCommand.STOP:
                 # The keyboard completed the motion fence before enqueueing.
-                # STOP still suppresses HOME/BEGIN in this batch, but must
+                # STOP still suppresses HOME/BEGIN/TARE in this batch, but must
                 # not revoke again after the policy runner clears the stop request.
                 continue
             elif signal is OperatorCommand.PAUSE:
@@ -95,7 +93,10 @@ class PolicyOperator:
             elif signal is OperatorCommand.DISCARD:
                 logger.warning("operator: D is not used in policy deployment; ignored")
             elif signal is OperatorCommand.TARE:
-                discard_begin_in_batch = True
+                if discard_begin_or_tare_in_batch:
+                    logger.warning("operator: ignored T after preparation in the same batch")
+                    continue
+                discard_begin_or_tare_in_batch = True
                 if stop_in_batch or self.idle_for_tare is None or not self.idle_for_tare():
                     logger.warning(
                         "T ignored: tactile tare requires idle, no capture/reset/pending inference"
@@ -124,7 +125,7 @@ class PolicyOperator:
                     logger.warning("operator: ignored H received in the same batch as S/Q")
                     continue
                 if self._run_home():
-                    discard_begin_in_batch = True
+                    discard_begin_or_tare_in_batch = True
             elif signal is OperatorCommand.QUIT:
                 # Listener stays available through final recording cleanup.
                 continue
@@ -185,7 +186,7 @@ class PolicyOperator:
         else:
             logger.warning("operator: HOME incomplete or interrupted; check current pose before B")
         # HOME blocks while hand/arm homing completes. Drop stale
-        # H and B events, but preserve S/Q/ESC so an operator can
+        # H/B/T events, but preserve S/Q/ESC so an operator can
         # still stop, quit, or e-stop immediately afterwards.
         self.keyboard.drain_signal(OperatorCommand.TARE)
         self.keyboard.drain_signal(OperatorCommand.HOME)

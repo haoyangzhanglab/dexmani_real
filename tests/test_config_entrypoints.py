@@ -9,6 +9,7 @@ from types import SimpleNamespace as NS
 
 import numpy as np
 import pytest
+import yaml
 
 from dexmani_real.config.experiment import (
     ExperimentConfig,
@@ -84,6 +85,48 @@ def test_execution_precedence_zero_and_required_budgets():
     assert cfg.execution.max_wait_s == 1
     with pytest.raises(ValueError, match="explicit"):
         ExperimentConfig().execution.validate(info)
+
+
+@pytest.fixture(params=["data", "yaml"])
+def config_loader(request, tmp_path):
+    def load(data, **kwargs):
+        if request.param == "data":
+            return load_experiment_config(data=data, **kwargs)
+        path = tmp_path / "experiment.yaml"
+        path.write_text(yaml.safe_dump(data))
+        return load_experiment_config(yaml_path=path, **kwargs)
+
+    return load
+
+
+@pytest.mark.parametrize("device_name", [None, "configured_device"])
+def test_hand_device_name_accepts_null_or_string(config_loader, device_name):
+    cfg = config_loader({"hand": {"device_name": device_name}})
+    assert cfg.hand.device_name == device_name
+    cfg.hand.validate()
+
+
+@pytest.mark.parametrize("device_name", [7, 1.5, True, [], {}])
+def test_hand_device_name_rejects_other_types(config_loader, device_name):
+    with pytest.raises(TypeError, match="hand.device_name"):
+        config_loader({"hand": {"device_name": device_name}})
+
+
+def test_nullable_strings_remain_explicit_and_unknown_fields_fail(config_loader):
+    cfg = config_loader({"environment": {"table": {"plane_path": None}}})
+    assert cfg.environment.table.plane_path is None
+    with pytest.raises(TypeError, match="arm.ip"):
+        config_loader({"arm": {"ip": None}})
+    with pytest.raises(TypeError, match="unknown config fields"):
+        config_loader({"hand": {"device_nam": None}})
+
+
+def test_cli_none_keeps_configured_hand_device_name(config_loader):
+    cfg = config_loader(
+        {"hand": {"device_name": "configured_device"}},
+        cli_overrides={"hand.device_name": None},
+    )
+    assert cfg.hand.device_name == "configured_device"
 
 
 @pytest.mark.parametrize(
