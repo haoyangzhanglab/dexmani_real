@@ -1,16 +1,7 @@
 """Shared-memory ring buffer with latest-sample reads.
 
-Readers take owned copies from multiprocessing.shared_memory.
-Each ring has one serialized writer at a time and may have multiple readers.
-Odd/even markers prevent readers from accepting a slot while its payload is
-being overwritten.
-
-Usage:
-    buf = SharedMemoryRingBuffer("vr_frames", VR_FRAME_DTYPE, maxlen=3, create=True)
-    buf.write(vr_frame_array)
-
-    buf = SharedMemoryRingBuffer("vr_frames", VR_FRAME_DTYPE, maxlen=3, create=False)
-    latest = buf.read_latest()  # (data copy, timestamp_ns, logical sequence) or None
+One serialized writer publishes with odd/even markers; readers take owned copies.
+See SharedMemoryRingBuffer for platform and memory-ordering limits.
 """
 
 from __future__ import annotations
@@ -47,20 +38,10 @@ def seqlock_to_logical(marker: int) -> int:
 class SeqlockSlot:
     """Odd/even seqlock for a single slot's ``[timestamp_ns, sequence]`` prefix.
 
-    Every slot in both ``SharedMemoryRingBuffer`` and ``CameraRingBuffer`` is
-    laid out as ``[timestamp_ns: u8, sequence: u8, <payload>]``.  A producer
-    marks the slot writer-active (odd) with a *zero* placeholder timestamp via
-    :meth:`begin_write`, copies the payload, stamps the true commit time via
-    :meth:`stamp_timestamp`, and finally calls :meth:`end_write` (even marker),
-    so a reader can never observe a half-written frame as complete and the
-    timestamp reflects the commit time rather than the start of the payload
-    copy.  Readers sample :attr:`marker`
-    before and after reading the payload and accept the frame only when
-    :meth:`verify` confirms both samples agree on a complete (nonzero, even)
-    marker.
-
-    Instances are cheap, non-owning views over a slot's first 16 bytes and may
-    be created per access without concern.
+    Non-owning view of the first 16 bytes, shared by sensor and camera rings.
+    Writers mark odd with timestamp 0, copy the payload, stamp commit time,
+    then publish even. Readers accept matching nonzero even markers sampled
+    before and after copying; timestamps describe commit, not copy start.
     """
 
     def __init__(self, buf: Any, slot_base: int) -> None:
@@ -97,18 +78,12 @@ class SeqlockSlot:
         self._ts_seq[0] = np.uint64(now_ns)
 
     def verify(self, marker_before: int) -> bool:
-        """Return True when the marker is unchanged and complete after the payload read.
-
-        ``marker_before`` is the marker sampled before reading the payload; the
-        marker is re-sampled now.  A torn read (marker changed mid-read) or a
-        writer-active (odd) slot fails the check.
-        """
+        """Accept an unchanged, complete marker after copying the payload."""
         return marker_before == self.marker and seqlock_is_complete(marker_before)
 
 
 logger = get_logger(__name__)
 
-# Torn-read warning throttle: at most one warning per 5 s per buffer.
 TORN_WARN_INTERVAL_NS = 5 * 1_000_000_000
 
 
@@ -124,8 +99,7 @@ class SharedMemoryRingBuffer:
         [64:)     N slots, each of size slot_size
                     Each slot: [timestamp_ns: uint64, seq: uint64, data: ...]
 
-    The write_idx always points to the most recently written slot index
-    (0..maxlen-1). The consumer reads write_idx to find the latest frame.
+    write_idx identifies the latest published slot.
     Used on Linux x86_64 with one serialized writer. NumPy uint64 access
     does not specify acquire/release memory ordering; this is not a portable
     lock-free guarantee. Multiple writer processes must hold their own
@@ -147,20 +121,11 @@ class SharedMemoryRingBuffer:
         maxlen: int = 3,
         create: bool = True,
     ) -> None:
-        """Initialize or attach to a named shared memory ring buffer.
-
-        Args:
-            name: Unique name for the shared memory block (e.g. "vr_frames").
-            dtype: Numpy dtype for each slot's data payload.
-            maxlen: Number of slots in the ring buffer.
-            create: If True, create the shared memory block; if False, attach
-                    to an existing one.
-        """
+        """Create a named ring of maxlen dtype payloads, or attach when create=False."""
         self.name = name
         self.dtype = np.dtype(dtype)
         self.maxlen = maxlen
 
-        # Slot layout: timestamp_ns (u8) + sequence (u8) + data
         self._slot_dtype = np.dtype(
             [("timestamp_ns", "<u8"), ("sequence", "<u8"), ("data", self.dtype)]
         )
@@ -203,12 +168,9 @@ class SharedMemoryRingBuffer:
         )
 
     def write(self, data: np.ndarray) -> int:
-        """Write one frame into the ring buffer (producer-side).
+        """Publish a (1,) array matching self.dtype and return its sequence number.
 
-        Overwrites the oldest slot. Returns the new sequence number.
-
-        Args:
-            data: A one-element structured array matching ``self.dtype`` exactly.
+        Overwrites the oldest slot.
         """
         if not isinstance(data, np.ndarray) or data.shape != (1,) or data.dtype != self.dtype:
             raise ValueError(

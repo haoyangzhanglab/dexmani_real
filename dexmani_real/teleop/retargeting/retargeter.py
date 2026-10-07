@@ -131,11 +131,9 @@ def adaptive_retargeting_xhand(
         raise ValueError("landmarks must be a finite (21, 3) array")
     raw = landmarks.copy()
 
-    # Scale the wrist→MCP baseline independently.
     if palm_scale != 1.0:
         landmarks[_PINKY_MCP] = landmarks[0] + (raw[_PINKY_MCP] - landmarks[0]) * palm_scale
 
-    # Apply uniform scaling along MCP→PIP→DIP→TIP.
     mcp_to_pip = raw[_PINKY_PIP] - raw[_PINKY_MCP]
     landmarks[_PINKY_PIP] = landmarks[_PINKY_MCP] + mcp_to_pip * scale
 

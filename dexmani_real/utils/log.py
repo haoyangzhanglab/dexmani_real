@@ -26,8 +26,7 @@ _FORMATTER = logging.Formatter(
     datefmt="%H:%M:%S",
 )
 
-# Shared file handler (created once per process). None if disabled or creation
-# failed — logging then falls back to stdout only.
+# One file handler per process; creation failure leaves stdout logging active.
 _file_handler: logging.FileHandler | None = None
 _file_handler_init = False
 
@@ -69,7 +68,6 @@ def get_logger(name: str) -> logging.Logger:
     return logger
 
 
-# ThrottledWarner uses the project logger format for consistent diagnostics.
 _logger = get_logger(__name__)
 
 
@@ -96,10 +94,8 @@ def _flush_process_stdout() -> None:
 def capture_native_stdout() -> Iterator[CapturedProcessOutput]:
     """Capture Python/C/C++ stdout for one bounded vendor-SDK operation.
 
-    The redirection is process-wide, so callers must use it only during device
-    initialization, never inside a live control loop.  The captured text is
-    made available after the context exits so successful SDK chatter can be
-    discarded while a failed operation can still replay its diagnostics.
+    Redirection is process-wide: use only during initialization, never in a
+    live control loop. Captured text becomes available after context exit.
     """
     captured = CapturedProcessOutput()
     try:

@@ -3,12 +3,6 @@
 Both models share xarm7_xhand.srdf: arm-arm and arm-hand checks, with
 hand self-collision disabled. Collision checks use nominal URDF geometry;
 the physical hand mount compensation belongs only to real-pose FK.
-
-Usage::
-
-    cm = CollisionModel()
-    cm.check_self_collision(qpos)          # bool
-    cm.check_self_collision_details(qpos)  # CollisionInfo
 """
 
 from __future__ import annotations
@@ -230,8 +224,7 @@ class CollisionModel:
 
         self._expected_qpos_shape: tuple[int, ...] = (self._nq,)
 
-        # Hand qpos buffer (used in hand_dof mode to auto-expand 7→19 DOF).
-        # None = not yet set by caller; set_hand_qpos() assigns a real array.
+        # Arm-only inputs require caller-supplied hand angles in 19-DOF mode.
         self._hand_qpos: np.ndarray | None = None
 
     @staticmethod
@@ -329,10 +322,7 @@ class CollisionModel:
         """Set finite (12,) hand angles in radians before each arm collision check.
 
         In hand_dof mode, 7-DOF arm inputs expand using this hand configuration.
-        Input SDK order is [thumb_bend, thumb_rota1, thumb_rota2, index_bend,
-        index_j1, index_j2, mid_j1, mid_j2, ring_j1, ring_j2, pinky_j1, pinky_j2];
-        it is remapped to URDF order [index, mid, pinky, ring, thumb].
-        Raises ValueError for wrong shape or non-finite values.
+        SDK-to-URDF joint ordering is defined in robot.model.
         """
         hand_qpos = np.asarray(hand_qpos, dtype=np.float64)
         if hand_qpos.shape != (HAND_DOF,):
@@ -381,10 +371,7 @@ class CollisionModel:
         )
 
     def check_self_collision(self, qpos: np.ndarray) -> bool:
-        """Check if qpos is in self-collision (fast bool, single point).
-
-        Uses ``stop_at_first_collision=True`` for early exit.
-        """
+        """Check one configuration, stopping at the first self-collision."""
         return self._pin_update(qpos, stop_at_first=True)
 
     def minimum_hand_frame_z(self, arm_qpos: np.ndarray) -> float:

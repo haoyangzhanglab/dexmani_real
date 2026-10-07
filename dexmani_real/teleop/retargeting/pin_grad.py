@@ -41,12 +41,7 @@ def validate_fingertip_frame_names(
 
 
 class PinGrad:
-    """Pinocchio-based analytical gradient engine for hand FK optimization.
-
-    Wraps Pinocchio FK + Jacobian to compute position gradients
-    for the hand retargeting optimizer.  Uses JointModelFreeFlyer
-    so the generalized coordinate vector includes a floating base.
-    """
+    """Hand FK gradients using Pinocchio with a FreeFlyer base."""
 
     def __init__(self, urdf_path: str, fingertip_frame_names: list[str]) -> None:
         """Load the XHand URDF and resolve the five fingertip frame names."""
@@ -63,11 +58,7 @@ class PinGrad:
         self.tip_frame_ids = [int(self.model.getFrameId(name)) for name in names]
 
     def update_kinematics(self, qpos_floating: np.ndarray) -> None:
-        """Run FK, update frame placements, and compute joint Jacobians.
-
-        Args:
-            qpos_floating: (7 + dof,) generalized coordinates with FreeFlyer base.
-        """
+        """Update FK and Jacobians from (7 + dof,) coordinates with a FreeFlyer base."""
         pin.forwardKinematics(self.model, self.data, qpos_floating)
         pin.updateFramePlacements(self.model, self.data)
         pin.computeJointJacobians(self.model, self.data, qpos_floating)
@@ -104,10 +95,6 @@ class PinGrad:
     def compute_smoothness_gradient(
         q: np.ndarray, q_last: np.ndarray, weight: float
     ) -> tuple[np.ndarray, float]:
-        """Gradient of temporal smoothness penalty:  weight * ||q - q_last||².
-
-        Returns:
-            (grad: (dof,), loss: float)
-        """
+        """Return ((dof,) gradient, scalar loss) for weight * ||q - q_last||²."""
         diff = q - q_last
         return 2.0 * weight * diff, float(weight * np.sum(diff * diff))

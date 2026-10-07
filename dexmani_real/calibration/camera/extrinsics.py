@@ -5,12 +5,6 @@ converted to a 4x4 transform at load time. Recorder START resolves the connected
 serial and saves available eye-to-hand calibration. Raw stores the static base-from-color
 transform and aligned color-grid intrinsics supplied by the live camera.
 The calibration file's calibration_capture section is diagnostic provenance.
-
-Usage::
-
-    calib = CameraExtrinsics()
-    cam = calib.resolve_name_by_serial(connected_serial)
-    T_base_camera = calib.get_extrinsics(cam)  # eye-in-hand also needs T_base_eef
 """
 
 from __future__ import annotations
@@ -145,12 +139,7 @@ class CameraExtrinsics:
         return matches[0]
 
     def verify_serial(self, cam_name: str, actual_serial: str) -> None:
-        """Assert entry ``cam_name`` belongs to the connected camera.
-
-        Raises:
-            ValueError: if the entry's serial differs from ``actual_serial``
-                (i.e. the named calibration is for a different physical camera).
-        """
+        """Raise ValueError if the named calibration belongs to another camera serial."""
         entry = self._entries[cam_name]
         if entry.serial != actual_serial:
             raise ValueError(

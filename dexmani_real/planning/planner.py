@@ -290,8 +290,6 @@ class XArm7MotionPlanner:
         path_result.report.update(mplib_status=status)
         return path_result
 
-    # Path validation — each returns None on pass, PathResult on failure.
-
     def shortcut_smooth_path(
         self, path: np.ndarray, current_qpos: np.ndarray, profile: MotionPlanningConfig
     ) -> np.ndarray:
@@ -358,15 +356,9 @@ class XArm7MotionPlanner:
         source: str,
         profile: MotionPlanningConfig,
     ) -> PathResult:
-        """Validate a planned path through a chain of independent checks.
+        """Validate a smoothed path, retrying the original if smoothing fails checks.
 
-        Each check returns None on pass or a failure PathResult.  Checks are
-        ordered by cost (cheapest first) to fail fast.
-
-        If the shortcut-smoothed path fails validation, the original unsmoothed
-        path is retried as a fallback.  Shortcut smoothing can create waypoint
-        gaps larger than max_waypoint_delta_deg when the arm is far from the
-        target (e.g. return-to-home from a stretched pose).
+        Shortcuts can exceed max_waypoint_delta_deg, especially far from home.
         """
         try:
             path = self.ik_geometry.snap_path_to_nearest_equivalent(path, current_qpos)
@@ -379,7 +371,6 @@ class XArm7MotionPlanner:
             logger.warning("validate_path preprocessing failed: %s", error, exc_info=True)
             return PathResult(success=False, qpos_path=None, source=source, reason=str(error))
 
-        # Try smoothed path first; fall back to unsmoothed on failure.
         smoothed_failure_reason: str | None = None
         for attempt_label, candidate in (
             ("smoothed", path),
@@ -421,7 +412,6 @@ class XArm7MotionPlanner:
             if failure is None:
                 failure = self._check_self_collision(candidate, report, source, profile)
             if failure is None:
-                # All checks passed.
                 if attempt_label == "unsmoothed":
                     logger.debug(
                         "validate_path: smoothed path failed (%s), unsmoothed fallback passed "
@@ -436,8 +426,6 @@ class XArm7MotionPlanner:
                 smoothed_failure_reason = failure.reason
 
         return failure  # type: ignore[return-value]  # both attempts failed
-
-    # Path validators — each returns None on pass, PathResult on failure.
 
     @staticmethod
     def _make_failure(reason: str, source: str, report: dict) -> PathResult:

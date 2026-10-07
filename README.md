@@ -173,4 +173,4 @@ Real 侧负责真实硬件生命周期、现场标定和运动安全；Policy �
 
 ## Development
 
-离线检查命令和环境要求见 [复现入口](docs/reproduction.md)。长期协作约束见 [AGENTS.md](AGENTS.md)，Claude 阅读入口见 [CLAUDE.md](CLAUDE.md)。历史任务书保留供查阅，当前行为以源码、配置和 CLI 为准。
+离线检查命令和环境要求见 [复现入口](docs/reproduction.md)。长期协作约束见 [AGENTS.md](AGENTS.md)，Claude 阅读入口见 [CLAUDE.md](CLAUDE.md)。当前行为以源码、配置和 CLI 为准。

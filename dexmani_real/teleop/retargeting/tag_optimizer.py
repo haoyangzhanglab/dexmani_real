@@ -197,12 +197,7 @@ class HandOptimizer:
         return q_s2
 
     def reset(self, qpos: np.ndarray | None = None) -> None:
-        """Reset temporal state for a clean episode start.
-
-        Args:
-            qpos: Optional (dof,) joint angles to warm-start from
-                  (in Pinocchio model order).
-        """
+        """Reset temporal state, optionally warm-starting from (dof,) model-order angles."""
         if qpos is not None and np.asarray(qpos).shape == (self.dof,) and np.all(np.isfinite(qpos)):
             qpos_array = np.asarray(qpos, dtype=np.float64)
             bounded = self._bounded_qpos(qpos_array, "reset warm start", warn_on_clip=False)
@@ -227,8 +222,7 @@ class HandOptimizer:
     def _obj_s1(self, qpos: np.ndarray, grad: np.ndarray) -> float:
         """Stage 1 objective: position error + temporal smoothness."""
         self.qpos_floating[7:] = qpos
-        # _current_target is set by solve() before any NLopt callback fires;
-        # mypy sees np.ndarray|None but runtime is always np.ndarray here.
+        # solve() sets _current_target before NLopt callbacks.
         g_pos, loss_pos = self.pin_grad.compute_position_gradient(
             self.qpos_floating,
             self._current_target,  # type: ignore[arg-type]

@@ -159,8 +159,6 @@ class RGBDFrame:
 class RealSenseCamera:
     def __init__(self, config: RealSenseCameraConfig = RealSenseCameraConfig()) -> None:
         self.config = config
-        # Device discovery, option access, and streaming must share one context.
-        # This avoids competing device handles and intermittent power-state errors.
         self.context = None
         self.active_serial: str | None = config.serial
         self.active_is_l515 = False
@@ -175,11 +173,7 @@ class RealSenseCamera:
         self.frame_id = 0
 
     def connect(self) -> bool:
-        """Open RealSense pipeline. Returns True on success.
-
-        Explicit lifecycle method. Idempotent: calling on an already-connected
-        camera returns True.
-        """
+        """Open the pipeline; return True on success or if already connected."""
         if self.pipeline is not None:
             return True
 
@@ -223,12 +217,7 @@ class RealSenseCamera:
         return True
 
     def _apply_depth_config(self) -> None:
-        """Apply depth settings via set_option at pipeline post-start.
-
-        Device-type dispatch: L515 gets the calibrated preset (visual_preset,
-        laser, gain, confidence, noise, min_distance); D400 gets emitter
-        enabled and High Accuracy preset.
-        """
+        """Apply L515 or D400 depth settings after pipeline start."""
         if self.profile is None:
             return
 
@@ -320,12 +309,8 @@ class RealSenseCamera:
     def _apply_color_config(self) -> None:
         """Apply color sensor options after pipeline start.
 
-        The default ``auto_exposure_priority=0.0`` (OFF) keeps the color sensor
-        at the requested fps instead of letting Auto Exposure extend exposure —
-        which drops the RGB stream to ~16.7 Hz in a dark scene. Auto Exposure
-        stays ON; priority OFF only caps exposure at the frame period and
-        compensates with gain. Set the config field to ``None`` to leave the
-        device default untouched.
+        Priority 0 caps auto exposure at the frame period to preserve FPS;
+        it does not disable auto exposure. None leaves the device default.
         """
         priority = self.config.auto_exposure_priority
         if priority is None:
@@ -409,12 +394,8 @@ class RealSenseCamera:
     def _start_pipeline(self, rs_config: rs.config) -> None:
         """Create and start a fresh pipeline.
 
-        Uses its own internal context (rs.pipeline() without argument) — sharing
-        the discovery context via rs.pipeline(self.context) causes "Couldn't
-        resolve requests" on L515 when the context still holds device handles
-        from the earlier query_devices() calls. A librealsense-owned queue
-        decouples device delivery from host-side alignment/copying without an
-        additional Python thread or a second SDK owner.
+        A separate context avoids L515 resolve errors from discovery handles.
+        The SDK queue decouples delivery from alignment/copying with one SDK owner.
         """
         self.pipeline = rs.pipeline()
         rs_config.resolve(rs.pipeline_wrapper(self.pipeline))
@@ -459,11 +440,7 @@ class RealSenseCamera:
                 time.sleep(1.0)
 
     def disconnect(self) -> None:
-        """Close RealSense pipeline.
-
-        Explicit lifecycle method. Idempotent: calling on an already-disconnected
-        camera is a no-op.
-        """
+        """Close the pipeline; repeated calls are safe."""
         if self.pipeline is None:
             return
         try:

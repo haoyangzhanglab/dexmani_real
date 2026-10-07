@@ -134,7 +134,6 @@ class XArm7Kinematics:
         return compose_pose(self.base_pose_world, pose_base)
 
     def compute_eef_pose_base(self, qpos: np.ndarray) -> Pose:
-        # Entry points validate qpos and the base pose; this path stays allocation-light.
         if not np.all(np.isfinite(qpos)):
             raise ValueError("compute_eef_pose_base: qpos contains NaN or Inf")
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
@@ -148,7 +147,6 @@ class XArm7Kinematics:
     def compute_eef_pose_world(self, qpos: np.ndarray) -> Pose:
         pose_base = self.compute_eef_pose_base(qpos)
         pose_world = self.base_to_world_pose(pose_base)
-        # Keep a NaN guard for model corruption or numerical anomalies.
         if not np.all(np.isfinite(pose_world.p)) or not np.all(np.isfinite(pose_world.q)):
             return Pose(p=np.full(3, np.nan), q=np.full(4, np.nan))
         return pose_world

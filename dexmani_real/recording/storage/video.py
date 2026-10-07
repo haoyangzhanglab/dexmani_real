@@ -1,17 +1,4 @@
-"""Encode and decode H.264 MP4 sidecars for HDF5 episodes.
-
-Encode::
-
-    with VideoEncoder(path, fps=16.0, width=640, height=480) as enc:
-        for frame in camera_frames:
-            enc.write_frame(frame)
-
-Decode::
-
-    with VideoDecoder(path) as dec:
-        for frame in dec.iter_frames():
-            process(frame)
-"""
+"""Encode and decode H.264 MP4 sidecars for HDF5 episodes."""
 
 from __future__ import annotations
 
@@ -80,12 +67,7 @@ class VideoEncoder:
         return self._frame_count
 
     def write_frame(self, frame: np.ndarray) -> None:
-        """Encode and mux one RGB frame.
-
-        Frame shape must be ``(height, width, 3)`` with dtype ``uint8``.
-        The caller is responsible for feeding frames in display order;
-        repeated camera samples are encoded efficiently by H.264.
-        """
+        """Encode one uint8 RGB (height, width, 3) frame in caller-supplied display order."""
         if self._closed:
             raise RuntimeError("VideoEncoder is closed")
         if frame.ndim != 3 or frame.shape[2] != 3:
@@ -111,10 +93,7 @@ class VideoEncoder:
         self._frame_count += 1
 
     def close(self) -> None:
-        """Flush the encoder and finalise the MP4 container.
-
-        Idempotent — safe to call multiple times.
-        """
+        """Flush and finalize the MP4 container; repeated calls are safe."""
         if self._closed:
             return
         if self._container is None:
@@ -149,8 +128,6 @@ class VideoEncoder:
             raise RuntimeError("VideoEncoder is closed")
         if self._container is None:
             self._container = av.open(str(self._path), "w", format="mp4")
-            # add_stream returns a VideoStream at runtime for video codecs;
-            # PyAV stubs are incomplete so use Any for _stream.
             self._stream = self._container.add_stream(
                 self._cfg.codec, rate=Fraction(str(self._fps)).limit_denominator(1_000_000)
             )
@@ -187,11 +164,7 @@ class VideoDecoder:
         return self._frame_count
 
     def iter_frames(self) -> Iterator[np.ndarray]:
-        """Yield decoded RGB frames sequentially without retaining the video.
-
-        The iterator rewinds the stream before decoding, so offline transforms
-        can consume every frame without retaining the full recording in memory.
-        """
+        """Rewind and yield RGB frames sequentially without caching the video."""
         if not self._opened:
             self._open()
         if self._container is None:
