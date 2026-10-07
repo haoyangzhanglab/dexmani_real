@@ -128,13 +128,13 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
         trajectory = load_trajectory(args.episode)
-    except (FileNotFoundError, OSError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         print(f"Error loading episode: {exc}")
         return 1
 
     try:
         selection = _resolve_replay_runtime(args)
-    except (FileNotFoundError, OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
         print(f"Error resolving replay config: {exc}")
         return 1
 

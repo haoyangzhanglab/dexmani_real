@@ -35,7 +35,6 @@ def main(argv: list[str] | None = None) -> int:
         KeyError,
         OSError,
         TypeError,
-        UnicodeError,
         ValueError,
         yaml.YAMLError,
     ) as exc:

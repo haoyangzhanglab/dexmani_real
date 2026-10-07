@@ -23,6 +23,9 @@ dependencies = [
 interactive = ["pynput>=1.7"]
 dev = ["pytest", "ruff"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.setuptools]
 include-package-data = true
 

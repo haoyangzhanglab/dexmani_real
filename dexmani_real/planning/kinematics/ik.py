@@ -70,9 +70,6 @@ class OnlineIKConfig:
     operational_joint_upper_rad: tuple[float, ...] | None = None
     redundancy_seed_step_deg: float = 5.0
     joint_limit_search_margin_deg: float = 15.0
-    enable_random_fallback: bool = False
-    random_fallback_step_deg: float = 5.0
-    random_seed: int | None = 42
     previous_command_distance_weight: float = 0.25
     joint_limit_penalty_weight: float = 0.01
     pose_accuracy_weight: float = 0.1
@@ -87,7 +84,6 @@ def make_online_ik_config(
     *,
     max_pose_error_pos_m: float | None = None,
     max_pose_error_rot_rad: float | None = None,
-    enable_random_fallback: bool = False,
 ) -> OnlineIKConfig:
     return OnlineIKConfig(
         max_pose_error_pos_m=(
@@ -102,7 +98,6 @@ def make_online_ik_config(
         ),
         operational_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
         operational_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
-        enable_random_fallback=enable_random_fallback,
     )
 
 
@@ -131,7 +126,6 @@ class OnlineIKSolver:
         online_ik_profile: OnlineIKConfig,
     ) -> None:
         self.kin, self.ik_geometry, self.profile = kin, ik_geometry, online_ik_profile
-        self._rng = np.random.default_rng(online_ik_profile.random_seed)
         self._failure_start: float | None = None
         self._failure_warned = False
         model = np.asarray(ik_geometry.joint_limits, dtype=np.float64)
@@ -170,7 +164,6 @@ class OnlineIKSolver:
             online_ik_profile.max_pose_error_pos_m,
             online_ik_profile.max_pose_error_rot_rad,
             online_ik_profile.redundancy_seed_step_deg,
-            online_ik_profile.random_fallback_step_deg,
         )
         nonnegative = (
             online_ik_profile.fast_accept_max_delta_deg,
@@ -192,8 +185,7 @@ class OnlineIKSolver:
             raise ValueError("online IK tolerances, radii and weights must be finite and valid")
 
     def reset_episode(self):
-        """Repeat fallback seeds independently of earlier episode failures."""
-        self._rng = np.random.default_rng(self.profile.random_seed)
+        """Reset the per-episode failure warning window."""
         self._failure_start = None
         self._failure_warned = False
 
@@ -347,18 +339,6 @@ class OnlineIKSolver:
             if selected is not None:
                 return selected, "null" if selected.attempt["seed"].startswith("null_") else "base"
 
-        if self.profile.enable_random_fallback:
-            reference = anchor.qpos if anchor is not None else previous
-            radius = np.deg2rad(self.profile.random_fallback_step_deg)
-            lower = np.maximum(self.operational_limits[:, 0], reference - radius)
-            upper = np.minimum(self.operational_limits[:, 1], reference + radius)
-            if np.all(lower <= upper):
-                seed = self._rng.uniform(lower, upper)
-                candidate = self._try_clik(
-                    "random", seed, target_base, target, current, previous, pool, report
-                )
-                if candidate is not None and self._collision_free(candidate, report):
-                    return candidate, "random"
         return None, "failed"
 
     def _try_clik(self, name, seed, target_base, target, current, previous, pool, report):

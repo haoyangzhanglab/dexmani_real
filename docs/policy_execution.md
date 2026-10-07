@@ -4,7 +4,7 @@
 
 ## 使用与支持范围
 
-入口为 `examples/run_policy.py`。模式从 YAML `execution.execution_mode` 读取，默认 sync，CLI `--execution-mode` 可覆盖；async 使用原采样器，rtc 使用前缀条件化 DDIM。三者使用相同的实际控制采样网格。模型观察步数 N、完整 horizon H、执行长度 A 和 dt 来自保存配置；可用 `--n-action-steps` 覆盖 A，P=H-N+1。
+入口为 `examples/run_policy.py`。模式从 YAML `execution.execution_mode` 读取，默认 sync，CLI `--execution-mode` 可覆盖；async 使用原采样器，rtc 使用前缀条件化 DDIM。三者使用相同的实际控制采样网格。模型观察步数 N、完整 horizon H、执行长度 A 和 dt 来自保存配置；可用 `--n-action-steps` 覆盖 A，要求 N−1+A≤H，P=H-N+1；覆盖不改写训练配置或 checkpoint，录制时将实际长度、覆盖值和本次桌面平面快照保存到 `run_config.yaml`。
 
 必须由实验者通过 YAML `execution.max_decision_age_s/max_wait_s/max_tick_lateness_s` 或对应 CLI `--max-decision-age/--max-wait/--max-tick-lateness` 指定预算（秒），decision age/WAIT 为有限正数，tick lateness 为有限非负数；优先级 CLI > YAML > 默认，默认预算为空。前者限制 query 各实际输入源的年龄，第二项限制无可执行计划的等待，第三项定义单槽允许的 owner 迟到量且必须小于 dt。它们与 episode 的 `--max-duration` 是不同预算，没有预设硬件安全值。
 
@@ -20,9 +20,13 @@ sync/async 保留原模型支持范围；rtc 当前接入连续动作 BaseAgent 
 
 连接不采集触觉 bias。T 表示操作者确认当前无接触，仅在 ARMED、空闲且无录制、模型复位或待完成推理时执行；S/Q/ESC 可取消，且不追加运动。HOME 准入要求会话仍运行、ARMED，且无停止、退出、故障或 estop 请求。待处理 S 由设备 owner 的停止/空闲路径消费，HOME 不清除它；停止处理完成后需重新按 H。
 
+手部 HOME 的下发超时、前次停止未确认属于技术失败，撤权并尝试停止后继续向调用者抛出；不归为用户取消。遥操作启动的 HOME 收敛超时也必须报错，随后到达的 Q 不覆盖该失败。
+
 HOME 一旦进入处理，即使返回未完成，也会忽略同批后续 H/B/T，并丢弃执行期间排队的 H/B/T；结束后需重新发起请求。未获准的 HOME 不额外屏蔽 T；因非空闲被拒绝的 T 不算已执行 HOME。TARE 执行后同批 H/B 不执行。S/Q/ESC 的即时停止与取消不受队列清理影响。触觉缺失继续为 NaN；实际观测构建只对策略必需的不可用触觉字段输出节流警告，说明字段及历史缺测事实，不据此推断是否未归零。关节模型不以辅助触觉为启动门。
 
 一个 session 固定使用启动时选择的模式；切换 sync/async/rtc 需关闭当前 session 后重新启动。每次接纳开始请求仍由串行 worker 执行 episode reset。
+
+遥操作 VR 的新鲜度与下发截止使用 wrist、landmarks 各自接收时间的较早者；HTS 组帧时间取较新者，不能证明两个分量都在更新。任一分量停更不会被另一分量刷新，恢复控制也要求两个分量均晚于恢复边界。head 保留独立接收时间，缺失为 NaN。VR worker 在读取超时或断线后检查退出请求，退出时关闭接收器并清除 readiness；IPC 写入及接口错误向进程监督器传播，不当作坏帧忽略。
 
 当前 MultiTask/text-conditioned 真机入口不支持任务选择与 child 数值配方恢复，连接前明确拒绝；这不限制 Policy 多任务训练或仿真。Dataset 声明必须与实际模型消费字段相等，存储的辅助字段不自动成为传感器门槛。保存点云配方必须完整，用户部分 YAML 仍可覆盖默认值。
 
@@ -36,7 +40,9 @@ HOME 一旦进入处理，即使返回未完成，也会忽略同批后续 H/B/T
 
 在线检查不承诺连续轨迹或环境避碰；存在 environment 配置不表示在线自动应用 HOME 的保护。允许接触规则、标称资产和现场 mount 保持当前配置。
 
-停止后的 Mode 6 恢复仍由设备 owner 在原路径执行。本轮没有足够固件证据证明提前恢复不会复活旧目标，因此不移动恢复位置；fake SDK 只能验证调用顺序。EEF prefix 的 d 次 IK 仍在同一槽内事务性完成，未测得其真机耗时；不引入线程池、跨槽补发或取消冻结复查。
+在线 IK 使用当前关节状态、上一发布目标及 Jacobian 零空间候选搜索。候选须通过位姿误差、关节限位、连续性和端点碰撞检查；无可用候选时明确失败。
+
+停止后的 Mode 6 恢复由设备 owner 在派发路径执行；提前恢复是否会复活旧目标缺少固件验证，fake SDK 只能验证调用顺序。EEF prefix 的 d 次 IK 在同一槽内事务性完成，其真机耗时需现场测量。
 
 ## 调度与停止
 
@@ -68,9 +74,11 @@ WAIT 表示没有新策略目标，设备仍可能追踪上一个目标。停止
 
 ## 数据与追踪
 
-Raw 保存 attempted targets、measured state、dispatch、辅助 NaN 和结束详情。rollout 的 execution_path 为 `worker_grid_<mode>_v1`。`run_config.yaml` 保存两仓库 SHA、checkpoint/weights/seed/NFE、模式、模型长度、实际解析的 runtime 和实验预算。完整 trace 保存在 `attempts/<id>.json`，记录 query/交接/dispatch/失效/结束事件及停止失败，Raw 不另存 trace 副本。历史 Raw 保持原样。
+Raw 的字段、单位、时间与缺测语义见 [数据说明](data.md)。录制行对应控制观测与尝试目标，并非每个 action 都有模型 query；rollout 独立录制完整 RGB-D/触觉，公共点云从保存行重建。rollout 的 execution_path 为 `worker_grid_<mode>_v1`。`run_config.yaml` 保存两仓库 SHA、checkpoint/weights/seed/NFE、模式、模型长度、实际解析的 runtime 和实验预算。完整 trace 保存在 `attempts/<id>.json`，记录 query/交接/dispatch/失效/结束事件及停止失败，Raw 不另存 trace 副本。历史 Raw 保持原样。
 
 记录式 policy evaluation 在 Raw 外保存 `session_result.json`、`attempts/<id>.json` 和 query NPZ。开始请求通过前置检查后、授予 RUNNING 前写 incomplete，阻塞 I/O 完成后重新检查起始观测再授权；取消的 prepared attempt 不消耗运行次数。崩溃留下的 incomplete/entered_running=null 表示未知。CLI `--no-record` 与无 recording_config 的直接 API 使用同一执行器，不创建 recorder、Raw、session/attempt、query NPZ 或 run_config。模型需要 RGB/cloud 时仍启用来源；仅关节输入且不录制时不启动相机。默认录制仍要求 Raw RGB-D。`--no-record` 是实际执行，不是离线模式。
+
+Policy/replay 首次创建 `session_result.json` 时原子地拒绝覆盖已有结果；同一会话的后续状态更新仍使用原子替换。
 
 收尾顺序为撤权、尝试 stop、recorder finalize、query sidecar、attempt 终态；只有 recorder 返回实际发布路径才标记 Raw published。query trace 关联窗口来源、selected target 和逐设备 dispatch；预测数组保存在 NPZ。`record_submitted` 只在队列接收成功后记录零起始 `raw_row_index` 与 slot，二者不可互换；`row_count` 是 writer 完成的行数，只有 published Raw 才是已发布行。零行、未下发 target、partial/unknown/CRC 和发布失败证据继续保留。直接构造 runner 时需显式传入 realizer；录制时 recorder/config/results 必须归属同一目录。
 
@@ -91,6 +99,8 @@ Policy 主 Dataset 按实际使用的输入与监督检查窗口有限性，Real
 Replay 报告中的 arm `mean_joint_rmse_deg` 是逐关节 RMSE 的平均，hand `pooled_rmse_deg` 是所有帧和关节平方误差的共同均值开方，两者口径不同；历史结果不改写。
 
 Replay 在输出目录 missing-or-empty 检查与轨迹 preflight 后初始化结果记录；trajectory_status/reason 描述轨迹阶段，session outcome/reason 还包含返航、关闭及评估产物写入结果。轨迹完成与最终 session 故障可以同时成立。
+
+Replay 的下发异常只有在 cause 为 `authority_revoked`、当前 run 的首因是 QUIT 且没有独立故障时才归为正常退出。稍后到达的 Q 不掩盖下发超时、停止未确认或 capture 失败；capture/stop 错误保留在结束说明中，返回已成功记录的前缀并报告失败。
 
 ## 离线检查与真实评测
 

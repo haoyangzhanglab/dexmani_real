@@ -331,13 +331,6 @@ class TeleopRunner:
             if home_result.interrupted:
                 self.shared.quit_requested.value = True
                 return False
-            if (
-                self.shared.quit_requested.value
-                and self.shared.is_running.value
-                and not self.shared.estop_request.value
-                and not self.shared.error_state.value
-            ):
-                return False
             raise RuntimeError(f"startup hand home failed: {home_result.reason}")
         if self._poll_blocking_commands():
             return False

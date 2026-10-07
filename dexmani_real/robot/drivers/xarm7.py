@@ -1,14 +1,9 @@
-"""Thin xArm7 hardware driver — the only xArm SDK surface in the codebase.
+"""xArm SDK boundary: live feedback, target limits and controller return codes.
 
-One class (:class:`XArm7`) wraps connect / read / servo / home / stop / close.
-Error handling is fail-fast: no retry counters, no last-known fallbacks, no
-stop confirmation — the firmware is the final backstop.
-
-Normal streaming uses Mode 6. :meth:`XArm7.home` executes collision-validated
-point-to-point milestones in Mode 0, restores Mode 6 itself, and verifies
-post-restoration position/velocity stability before returning success. It
-raises on failure (a plain :class:`RuntimeError`) or on a runtime interruption
-(:class:`HomeAborted`, so the caller can stop without latching a fault).
+Streaming uses Mode 6; HOME executes prevalidated milestones in Mode 0,
+restores Mode 6 and checks position/velocity stability. HomeAborted lets the
+owner distinguish cancellation from failure. The owner handles motion authority
+and stopping; an accepted SDK stop does not prove physical standstill.
 """
 
 from __future__ import annotations
@@ -94,9 +89,9 @@ def _wait_controller_ready(
     while time.monotonic() < deadline:
         last = read_live_state_and_error(arm_api)
         if (
-            bool(getattr(arm_api, "connected", True))
+            bool(arm_api.connected)
             and last.error_code == 0
-            and int(getattr(arm_api, "mode", 6)) == expected_mode
+            and int(arm_api.mode) == expected_mode
             and int(last.state) in (0, 1, 2)
         ):
             return last.state
@@ -142,12 +137,7 @@ def _estimate_segment_timeout_s(start: np.ndarray, target: np.ndarray, cfg: ArmP
 
 
 class HomeAborted(RuntimeError):
-    """A HOME was interrupted by a runtime signal (e-stop/shutdown/state change).
-
-    Raised from :meth:`XArm7.home` when ``abort_check`` reports a reason.  The
-    caller treats it as a clean interruption (best-effort stop, no sticky
-    fault), unlike a plain :class:`RuntimeError` from a hardware/SDK failure.
-    """
+    """HOME abort_check ended motion; the owner classifies the cause and stops."""
 
 
 class XArm7:
@@ -439,11 +429,11 @@ class XArm7:
 
     @property
     def axis(self) -> int:
-        return int(getattr(self._api, "axis", 0) or 0)
+        return int(self._api.axis)
 
     @property
     def error_code(self) -> int:
-        return int(getattr(self._api, "error_code", 0) or 0)
+        return int(self._api.error_code)
 
     def _wait_for_axis_report(self) -> None:
         """Wait for the report thread's axis count and validate it."""

@@ -621,18 +621,17 @@ class XHand:
             for name in ("commboard_err", "jointboard_err", "tipboard_err")
         }
         seen: set[int] = set()
-        for joint in getattr(state, "finger_state", []):
-            index = int(getattr(joint, "id", -1))
+        for joint in state.finger_state:
+            index = int(joint.id)
             if index < 0 or index >= HAND_DOF or index in seen:
                 raise ValueError(f"invalid or duplicate joint id {index}")
             seen.add(index)
-            qpos[index] = float(getattr(joint, "position", np.nan))
+            qpos[index] = float(joint.position)
             current[index] = float(getattr(joint, "torque", np.nan))
-            errors["commboard_err"][index] = int(getattr(joint, "commboard_err", 0))
-            errors["jointboard_err"][index] = int(
-                getattr(joint, "jonitboard_err", getattr(joint, "jointboard_err", 0))
-            )
-            errors["tipboard_err"][index] = int(getattr(joint, "tipboard_err", 0))
+            errors["commboard_err"][index] = int(joint.commboard_err)
+            # The vendor SDK spells this field jonitboard_err.
+            errors["jointboard_err"][index] = int(joint.jonitboard_err)
+            errors["tipboard_err"][index] = int(joint.tipboard_err)
         if len(seen) != HAND_DOF:
             raise ValueError(f"{len(seen)}/{HAND_DOF} joints reported")
         if not np.all(np.isfinite(qpos)):
@@ -654,7 +653,7 @@ class XHand:
         force_aggregate = np.empty(HAND_TACTILE_SUM_SHAPE, dtype=np.float64)
         for sensor_index, sensor in enumerate(sensors):
             force_aggregate[sensor_index] = _force_xyz(
-                getattr(sensor, "calc_force", None),
+                sensor.calc_force,
                 f"sensor_data[{sensor_index}].calc_force",
             )
         return force_aggregate

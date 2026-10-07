@@ -1,9 +1,4 @@
-"""Canonical point-cloud processing policy.
-
-This module contains configuration only.  Keeping it outside the sensor
-implementation lets realtime, offline, and diagnostic entry points resolve the
-same immutable policy without importing camera or geometry dependencies.
-"""
+"""Shared point-cloud recipe without camera or geometry backend imports."""
 
 from __future__ import annotations
 
@@ -24,16 +19,10 @@ class PointCloudConfig:
     edge_jump_m: float = 0.030
     edge_surface_band_m: float = 0.008
     depth_support_min_neighbors: int = 2
-    # Only at a depth discontinuity, require a denser same-surface 3x3
-    # neighborhood. One- or two-pixel structures at an unresolved edge are
-    # intentionally treated as unreliable depth rather than preserved noise.
+    # At unresolved depth edges, reject thin structures lacking same-surface support.
     edge_support_min_neighbors: int = 5
-    # Pixels at or below the core height are unambiguously table. Components
-    # above the core are preserved down to that height only when connected to
-    # a sufficiently large 8-connected patch above the object-seed height.
-    # Scattered high noise pixels cannot preserve a low table residual island.
-    # Keep seeds above the broad 7--13 mm depth residuals seen on distant table
-    # surfaces, while retaining the lower core threshold for connected object bases.
+    # Preserve low object bases only when connected to a coherent high seed patch.
+    # Seeds sit above observed 7--13 mm table residuals; isolated spikes do not qualify.
     table_core_height_m: float = 0.007
     table_object_seed_height_m: float = 0.016
     table_object_seed_min_pixels: int = 4
@@ -48,15 +37,11 @@ class PointCloudConfig:
     voxel_size_m: float = 0.005
     outlier_radius_m: float = 0.012
     outlier_min_neighbors: int = 6
-    # Radius-neighbor pairs define both local density and connected islands.
-    # Ten removes dense 7--9 point fragments that can satisfy the six-neighbor
-    # rule, while remaining conservative for small resolved object surfaces.
+    # Reject 7--9 point islands that can pass the six-neighbor density threshold.
     outlier_min_component_points: int = 10
     # Persisted checkpoint key: caps sampling candidates AFTER density/component filtering.
     outlier_candidate_multiplier: int = 8
-    # Select one fine-voxel representative per coarse 3x3x3 cell before the
-    # final deterministic fill. At the default 5 mm voxel size this stratifies sampling
-    # over 15 mm cells without the runtime cost of farthest-point sampling.
+    # Stratify over 15 mm cells at the default voxel size, then fill deterministically.
     sampling_coarse_voxel_stride: int = 3
 
     def __post_init__(self) -> None:

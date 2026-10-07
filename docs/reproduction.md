@@ -2,9 +2,15 @@
 
 本仓负责真实机器人工作流和 Raw → canonical 导出；[dexmani_policy](https://github.com/haoyangzhanglab/dexmani_policy) 负责 Dataset、训练与推理。两仓采用源码 checkout + editable 安装。保留本仓 `assets/`，不把 wheel 安装视为受支持的资产分发方式。
 
+Raw、Canonical 和预测 sidecar 的不可覆盖发布使用 Linux/libc `renameat2(RENAME_NOREPLACE)`，将目标占用检查与重命名合为一次原子操作。环境或文件系统不支持时发布报错并保留 staging，不退回可能覆盖已有产物的普通 rename。
+
 2026-10-07 本地核实环境为 Linux x86_64、Python 3.10.20，NumPy 1.26.4、SciPy 1.15.3、PyAV 17.1.0、h5py 3.16.0、Zarr 2.18.3、OpenCV 4.9.0.80、Pinocchio（`pin`）2.7.0、NLopt 2.7.1、mplib 0.2.1。开发检查使用 pytest 9.1.1、Ruff 0.16.8；Policy CPU 定向测试使用 PyTorch 2.4.1+cu124。这是一次核实的环境记录，不是跨版本兼容承诺，也不要求升级已有实验机。
 
 基础和 dev 依赖见 `pyproject.toml`；桌面键盘另选 `interactive`。完整几何导出需要 Pinocchio，选定 retargeting 需要 NLopt，碰撞/规划需要 mplib；厂商 SDK 依实验机实际安装，不加入通用 pip 依赖。纯 `--help` 和声明配置无需这些后端。缺 PyAV 无法创建/解码 Raw 视频；缺 Pinocchio 无法完成全 13 字段导出；缺 Policy 不影响下面三个 Real 数据入口，但不能验收 Policy Dataset/推理桥接。
+
+驱动使用当前 SDK 的明确字段：xArm 要求 `connected`、`mode`、`axis`、`error_code`；XHand 关节板状态读取厂商原名 `jonitboard_err`，内部统一为 `jointboard_err`。缺少必需字段不会补成已连接、正确模式或无错误；辅助电流缺测仍保留 NaN。
+
+VR 离线回归使用本机 `hand_tracking_sdk 1.1.0` 的公开 transport、parser 和 assembler 接口，以 fake transport 替换网络读写；未安装 SDK 时该组测试跳过。worker 自行检查每次读取超时后的退出请求，因为 SDK 的高层迭代器在内部持续重试超时。源端时间戳和序号越出 uint64 范围时拒绝该帧，不截断或回绕。默认 pytest 仅发现本仓 `tests/`，不扫描实验归档的源码快照。
 
 在 Real 根目录、已配置的 Python 环境中运行：
 

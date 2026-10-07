@@ -83,6 +83,7 @@ HAND_STATE_DTYPE = np.dtype(
 )
 
 # A ring publication is driven by a right-hand frame; ``head_*`` fields cache the latest HeadFrame.
+# recv_ts_ns is the older wrist/landmarks receive time, used for control freshness.
 VR_FRAME_DTYPE = np.dtype(
     [
         ("wrist_pos", "<f8", (3,)),

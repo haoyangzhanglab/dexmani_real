@@ -269,7 +269,7 @@ def _table_keep_mask(
     *,
     intrinsics: CameraIntrinsics,
     T_xarm_base_from_color: np.ndarray,
-    table_plane_abcd: tuple[float, float, float, float] | None,
+    table_plane_abcd: tuple[float, float, float, float],
     table_core_height_m: float,
     table_object_seed_height_m: float,
     table_object_seed_min_pixels: int,
@@ -277,17 +277,7 @@ def _table_keep_mask(
     """Keep non-table valid pixels before allocating 3-D point arrays."""
     if depth_m.shape != (intrinsics.height, intrinsics.width) or valid.shape != depth_m.shape:
         raise ValueError("depth and valid mask must match depth intrinsics")
-    if not np.isfinite(table_core_height_m) or not np.isfinite(table_object_seed_height_m):
-        raise ValueError("table crop heights must be finite")
-    if table_core_height_m < 0.0 or table_object_seed_height_m <= table_core_height_m:
-        raise ValueError("table crop heights must satisfy 0 <= core < object seed")
-    if table_object_seed_min_pixels < 1:
-        raise ValueError("table_object_seed_min_pixels must be positive")
-    if table_plane_abcd is None:
-        return valid.copy()
     plane = np.asarray(table_plane_abcd, dtype=np.float64)
-    if plane.shape != (4,) or not np.all(np.isfinite(plane)):
-        raise ValueError("table_plane_abcd must contain four finite values")
     norm = np.linalg.norm(plane[:3])
     if norm <= 0.0 or plane[2] / norm <= 0.0:
         raise ValueError("table plane must have an upward non-zero normal")
@@ -344,13 +334,6 @@ def _voxel_means(
         raise ValueError("points_base must have shape [N,3]")
     if colors.shape != points_base.shape:
         raise ValueError("colors must have shape [N,3] matching points_base")
-    if points_base.shape[0] == 0:
-        empty_points = np.empty((0, 3), dtype=np.float32)
-        return (
-            empty_points.copy(),
-            empty_points.copy(),
-            np.empty((0, 3), dtype=np.int64),
-        )
     keys = np.floor(points_base / np.float32(voxel_size_m)).astype(np.int64)
     # Mean aggregation is independent of depth-image traversal order and avoids
     # first-pixel bias. Bounded workspace keys use a fast collision-free int64.
@@ -369,26 +352,20 @@ def _voxel_means(
     )
 
 
-def _radius_component_keep_masks(
+def _radius_component_keep_mask(
     points_base: np.ndarray,
     *,
     radius_m: float,
     min_neighbors: int,
     min_component_points: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     """Use one radius graph for connected-island and local-density filtering."""
     if points_base.ndim != 2 or points_base.shape[1] != 3:
         raise ValueError("points_base must have shape [N,3]")
     count = points_base.shape[0]
-    if count == 0:
-        empty = np.empty(0, dtype=bool)
-        return empty, empty.copy()
     if min_neighbors == 0 and min_component_points <= 1:
-        keep = np.ones(count, dtype=bool)
-        return keep, keep.copy()
+        return np.ones(count, dtype=bool)
 
-    # One undirected radius graph provides exact neighbor counts and physical
-    # connected components.
     pairs = cKDTree(
         points_base,
         compact_nodes=False,
@@ -409,8 +386,7 @@ def _radius_component_keep_masks(
     )
     _component_count, labels = connected_components(graph, directed=False, return_labels=True)
     component_sizes = np.bincount(labels, minlength=count)
-    component_keep = density_keep & (component_sizes[labels] >= min_component_points)
-    return density_keep, component_keep
+    return density_keep & (component_sizes[labels] >= min_component_points)
 
 
 def _spatial_hash(voxel_keys: np.ndarray) -> np.ndarray:
@@ -601,21 +577,13 @@ def build_point_cloud(
         colors = colors[workspace_keep]
 
     points_base, colors, voxel_keys = _voxel_means(points_base, colors, config.voxel_size_m)
-    voxel_count = points_base.shape[0]
-    if voxel_count == 0:
-        return None
-
-    density_keep, inlier = _radius_component_keep_masks(
+    inlier = _radius_component_keep_mask(
         points_base,
         radius_m=config.outlier_radius_m,
         min_neighbors=config.outlier_min_neighbors,
         min_component_points=config.outlier_min_component_points,
     )
-    density_count = int(np.count_nonzero(density_keep))
-    if density_count == 0:
-        return None
-    inlier_count = int(np.count_nonzero(inlier))
-    if inlier_count == 0:
+    if not np.any(inlier):
         return None
     points_base = points_base[inlier]
     colors = colors[inlier]
@@ -628,10 +596,9 @@ def build_point_cloud(
     voxel_keys = voxel_keys[candidate_indices]
 
     cloud = np.column_stack((points_base, colors)).astype(np.float32)
-    result = _fixed_size_sample(
+    return _fixed_size_sample(
         cloud,
         voxel_keys,
         config.num_points,
         config.sampling_coarse_voxel_stride,
     )
-    return result

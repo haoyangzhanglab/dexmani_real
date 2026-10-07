@@ -192,7 +192,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         OSError,
         RuntimeError,
         TypeError,
-        UnicodeError,
         ValueError,
         yaml.YAMLError,
     ) as exc:

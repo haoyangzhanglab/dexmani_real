@@ -147,7 +147,8 @@ def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s,
 def replay_targets(
     shared, runtime, trajectory, keyboard, *, robot, hand_start_duration_s, results=None
 ):
-    stop_details = []
+    failure_details = []
+    epoch = None
     capture = ReplayRecorder(trajectory.num_frames)
     status, reason = ReplayStatus.COMPLETED, ""
     run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
@@ -243,7 +244,7 @@ def replay_targets(
                     try:
                         robot.stop()
                     except Exception as exc:
-                        stop_details.append(f"dispatch stop failed: {type(exc).__name__}: {exc}")
+                        failure_details.append(f"dispatch stop failed: {type(exc).__name__}: {exc}")
                         logger.exception("replay stop after dispatch failed")
                         shared.error_state.value = True
                 stamp = result.timestamp_ns or time.monotonic_ns()
@@ -261,6 +262,8 @@ def replay_targets(
                         arm_tracking_error=float(np.max(np.abs(arm - row.arm["qpos"][0]))),
                     )
                 except Exception as exc:
+                    shared.error_state.value = True
+                    failure_details.append(f"capture failed: {type(exc).__name__}: {exc}")
                     if dispatch_error is not None:
                         logger.exception("replay recording after dispatch failed")
                         raise dispatch_error from exc
@@ -279,14 +282,20 @@ def replay_targets(
             f"{exc}; arm={result.arm.name}, hand={result.hand.name}, arm_code={result.arm_code}"
         )
         if exc.revoked:
+            # A later Q cannot turn a deadline/stop failure into a clean cancellation.
+            with shared.motion_lock:
+                operator_revocation = (
+                    exc.cause == "authority_revoked"
+                    and int(shared.run_ended_id.value) == epoch
+                    and int(shared.run_ended_reason.value) == int(RunEndReason.QUIT)
+                )
             status = (
                 ReplayStatus.ESTOP
                 if shared.estop_request.value
                 else ReplayStatus.FAULT
                 if shared.error_state.value
                 else ReplayStatus.USER_QUIT
-                if shared.quit_requested.value
-                or int(shared.run_ended_reason.value) == int(RunEndReason.QUIT)
+                if operator_revocation
                 else ReplayStatus.REJECTED
             )
         else:
@@ -318,8 +327,8 @@ def replay_targets(
             shared.error_state.value = True
             logger.exception("replay stop failed")
             status, reason = ReplayStatus.FAULT, f"{reason or status.value}; stop failed: {exc}"
-    if stop_details:
-        reason = "; ".join([reason or status.value, *stop_details])
+    if failure_details:
+        reason = "; ".join([reason or status.value, *failure_details])
         status = ReplayStatus.FAULT
     data = capture.to_dict()
     data["termination_reason"] = np.asarray(reason or status.value)

@@ -58,21 +58,16 @@ class LoopRate:
         Small overruns preserve the absolute schedule. Missing a full period
         re-anchors the next deadline to avoid catch-up bursts. This poll schedule
         does not define the recorder's or policy's logical time grid.
-
-        Hybrid strategy:
-          1. Compute remaining time to the deadline
-          2. If > 2ms: time.sleep(remaining - 1ms)
-          3. Spin or sleep for the final window according to busy_wait
         """
         now = self._clock()
         remaining = self._next_deadline - now
 
         if remaining > 0:
-            if remaining > 0.002:  # > 2ms: sleep for bulk
+            if remaining > 0.002:
                 self._sleep(remaining - 0.001)
             if self._busy_wait:
                 while self._clock() < self._next_deadline:
-                    pass  # spin
+                    pass
             else:
                 final_remaining = self._next_deadline - self._clock()
                 if final_remaining > 0.0:

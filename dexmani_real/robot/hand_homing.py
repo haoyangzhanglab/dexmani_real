@@ -50,9 +50,11 @@ def home_hand(shared, runtime, *, robot, abort_requested=None):
     except DispatchError as exc:
         if not exc.revoked:
             raise
-        logger.info("hand HOME interrupted: dispatch=%s", exc.result)
+        logger.info("hand HOME dispatch stopped: %s; dispatch=%s", exc, exc.result)
         revoke_motion_if_run_id(shared, epoch)
         robot.stop()
+        if exc.cause != "authority_revoked":
+            raise
         return HomeResult(False, "home interrupted", interrupted=True)
 
     # Only feedback newer than the submission result can establish arrival.

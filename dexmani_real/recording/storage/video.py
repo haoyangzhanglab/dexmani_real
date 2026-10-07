@@ -88,7 +88,27 @@ class VideoEncoder:
         """
         if self._closed:
             raise RuntimeError("VideoEncoder is closed")
-        self._write_frame_impl(frame)
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(f"Expected (H, W, 3) uint8 RGB frame, got shape {frame.shape}")
+        if frame.shape[0] != self._height or frame.shape[1] != self._width:
+            raise ValueError(
+                f"Frame shape {(frame.shape[0], frame.shape[1])} does not match "
+                f"encoder size ({self._height}, {self._width})"
+            )
+
+        self.open()
+
+        # Convert RGB to the encoder pixel format; PyAV performs RGB→YUV.
+        av_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+        if self._cfg.pixel_format != "rgb24":
+            av_frame = av_frame.reformat(format=self._cfg.pixel_format)
+        av_frame.pts = self._frame_count
+        av_frame.time_base = 1 / Fraction(str(self._fps)).limit_denominator(1_000_000)
+
+        for packet in self._stream.encode(av_frame):
+            self._container.mux(packet)
+
+        self._frame_count += 1
 
     def close(self) -> None:
         """Flush the encoder and finalise the MP4 container.
@@ -144,31 +164,6 @@ class VideoEncoder:
 
             self._stream.codec_context.open()
             self._container.start_encoding()
-
-    def _write_frame_impl(self, frame: np.ndarray) -> None:
-        # Validate shape so we fail early with a clear message.
-        if frame.ndim != 3 or frame.shape[2] != 3:
-            raise ValueError(f"Expected (H, W, 3) uint8 RGB frame, got shape {frame.shape}")
-        if frame.shape[0] != self._height or frame.shape[1] != self._width:
-            raise ValueError(
-                f"Frame shape {(frame.shape[0], frame.shape[1])} does not match "
-                f"encoder size ({self._height}, {self._width})"
-            )
-
-        self.open()
-
-        # Convert RGB to the encoder pixel format; PyAV performs RGB→YUV.
-        av_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
-        if self._cfg.pixel_format != "rgb24":
-            av_frame = av_frame.reformat(format=self._cfg.pixel_format)
-        av_frame.pts = self._frame_count
-        av_frame.time_base = 1 / Fraction(str(self._fps)).limit_denominator(1_000_000)
-
-        # encode() returns packets; mux writes them to the container.
-        for packet in self._stream.encode(av_frame):
-            self._container.mux(packet)
-
-        self._frame_count += 1
 
 
 class VideoDecoder:
@@ -257,18 +252,24 @@ class VideoDecoder:
     def _open(self) -> None:
         if self._opened:
             return
-        self._container = av.open(str(self._path), "r")
-        self._stream = self._container.streams.video[0]
-        self._frame_count = int(self._stream.frames) if self._stream.frames > 0 else 0
-        avg_rate = self._stream.average_rate
-        if avg_rate is None:
-            raise ValueError(f"No average frame rate in {self._path}")
-        self._rate = Fraction(avg_rate)
-        if self._rate <= 0 or self._stream.time_base is None:
-            raise ValueError("CFR video requires a positive rate and a time base")
-        first = next(self._container.decode(self._stream), None)
-        if first is None or first.pts is None or first.time_base is None:
-            raise ValueError("CFR video requires a first presentation timestamp")
-        self._origin_time = first.pts * first.time_base
-        self._origin_time_base = first.time_base
-        self._opened = True
+        if self._container is not None:
+            self.close()
+        try:
+            self._container = av.open(str(self._path), "r")
+            self._stream = self._container.streams.video[0]
+            self._frame_count = int(self._stream.frames) if self._stream.frames > 0 else 0
+            avg_rate = self._stream.average_rate
+            if avg_rate is None:
+                raise ValueError(f"No average frame rate in {self._path}")
+            self._rate = Fraction(avg_rate)
+            if self._rate <= 0 or self._stream.time_base is None:
+                raise ValueError("CFR video requires a positive rate and a time base")
+            first = next(self._container.decode(self._stream), None)
+            if first is None or first.pts is None or first.time_base is None:
+                raise ValueError("CFR video requires a first presentation timestamp")
+            self._origin_time = first.pts * first.time_base
+            self._origin_time_base = first.time_base
+            self._opened = True
+        except BaseException:
+            self.close()
+            raise

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.utils.atomic_io import atomic_json_dump, target_is_occupied
+from dexmani_real.utils.atomic_io import atomic_json_dump
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -27,10 +27,6 @@ class SessionResults:
 
     def __init__(self, directory, kind):
         self.directory = Path(directory)
-        if target_is_occupied(self.directory / "session_result.json"):
-            raise FileExistsError(
-                "session result already exists; choose a new experiment directory"
-            )
         self.failed = False
         self.session = dict(
             session_id=uuid.uuid4().hex,
@@ -46,7 +42,7 @@ class SessionResults:
             retired_queries=[],
         )
         self.attempt = None
-        atomic_json_dump(self.session, self.directory / "session_result.json")
+        atomic_json_dump(self.session, self.directory / "session_result.json", overwrite=False)
 
     def prepare(self, *, recording):
         if self.failed or self.attempt is not None:

@@ -144,10 +144,13 @@ class EpisodeReader:
         if name in self.fields:
             return np.asarray(self[name][start:end])
         if name == "dispatch_status" and name in self.meta:
-            statuses = np.asarray(self.meta[name], dtype=np.uint8)
+            statuses = np.asarray(self.meta[name])
             if statuses.shape != (self.num_frames, 2):
                 raise RawDataError("invalid historical dispatch status shape")
-            return statuses[start:end]
+            # Narrowing first can turn malformed evidence (257 or 1.5) into ACCEPTED.
+            if statuses.dtype.kind not in "iuf" or not np.isin(statuses, range(5)).all():
+                raise RawDataError("invalid historical dispatch status values")
+            return statuses[start:end].astype(np.uint8)
         spec = ROW_INFO_SPECS[name]
         return np.full(
             (end - start, *spec.tail_shape), 4 if name == "dispatch_status" else 0, dtype=spec.dtype
