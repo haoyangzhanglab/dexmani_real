@@ -385,6 +385,102 @@ G1–G8 是八组验收，不是八套新框架，也不是必须为每个 helpe
 
 r2 发布时，F01–F20 未因文档审校发生代码整改，G1–G8 尚未执行，真机全部 `NOT_VERIFIED`。实施后追加 F 编号、实施状态、位置、定向验证、限制的简表；不复制完整日志，不将范围说明或保留项标为已实现。
 
+
+### 2026-10-07 实施结果
+
+实施基线：Real `8a7383b252b018f18a62d1cce82a63b7bf124ec7`，Policy `52d1d2a77b76a254b1a2498b059d160e6e527590`；开始时两工作树干净，任务书与 r2 发布文件一致。交付为两仓库配对工作树 diff，HEAD 未变。下表 R/P 分别指 Real/Policy；实施状态与验证状态分开。
+
+| ID | 实施状态 | 代码/文档证据 | 定向验证与限制 |
+| --- | --- | --- | --- |
+| F01 | DONE | P `datasets/base_dataset.py:restored_time_filter_kwargs`、`ReplayBuffer.observation_timestamps`、`SequenceSampler.filter_valid`、`build_dataset_and_normalizer`；VQ usage 恢复 | G1 PASS：新默认/null/旧缺键、H=1、padding、倒退/未知时间、统计源行、strict-resume、VQ；真实数据影响比例 NOT_VERIFIED |
+| F02 | DONE | P `utils/validation.py:validate_observation_fields`；训练构建与 `LoadedPolicy.__init__` | G2 PASS：实际训练构建、已加载模型声明、缺失/额外输入；复用 encoder 声明 |
+| F03 | DONE | R `ExecutionConfig.validate`、`validate_warmup_budget` | G5 PASS：r2 整数网格、370ms、215/231ms、包含/排他端点及实际 Runner 相位 |
+| F04 | DONE | R `PolicyRunner._budget_limit/_finish_budget/_execute_slot/step`、`run_policy_deployment` | G3 PASS：真实 Runner/Session，未确认 dispatch、WAIT/duration/同刻、SDK 迟返回、stop 错误、首因/退出码，录制与无录制 |
+| F05 | DONE | P `LoadedPolicy.predict`；复用 R `_poll_model` 既有浮点归档与有限性准入 | G4 PASS：真实 bridge→worker→Runner→Session→Raw/NPZ；NaN/±Inf 不下发，坏结构不序列化 |
+| F06 | DONE | R `validate_policy_runtime_compatibility` 按 dataclass 字段检查保存 cloud 配方 | G2 PASS：完整快照通过、缺键拒绝、用户部分 YAML 仍可覆盖 |
+| F07 | DONE | P `LoadedPolicy.warmup`；R `_warmup_policy` 成对消费 bootstrap/steady | G5 PASS：独立初始化、正 RTC 两路径、beta=0 复用、全部输出有限性、reset/首个推理不变 |
+| F08 | SCOPE_DOCUMENTED | P `inspect_policy`、`LoadedPolicy.__init__`、`MultiTaskAgent.consumed_observation_fields`；两仓 RTC/部署说明 | G2 PASS：真机任务选择/child 配方未接通，明确拒绝；多任务训练/仿真不禁止 |
+| F09 | RETAINED_CONDITIONAL | 保留 R `DexManiRobot._send` 中 Mode 6 恢复、`XArm7.enter_mode6` | 未取得足够固件语义证据，不移动恢复；fake SDK 不证明不会复活旧目标；真机 NOT_VERIFIED |
+| F10 | RETAINED_CONDITIONAL | 保留 R `_prepare_prefix` 的串行事务性 IK 与 frozen 复查 | 无可用实际 prefix 性能证据；未增加并行/跨槽机制；峰值与真机 NOT_VERIFIED |
+| F11 | DONE | R `examples/run_policy.py:_parser/main`，复用 session 可选 recording_config | G6 PASS：默认录制、no-record 无目录/Raw/NPZ/配置回调；仅关节无录制不启动相机 |
+| F12 | DONE | R `run_policy_deployment` 合并 runtime.execution/pointcloud；`docs/policy_execution.md` | G6 PASS：活动 runtime、cloud worker、实际 run_config 一致；声明打印轻量路径保留 |
+| F13 | DONE | R `control_dt_ns`，session 先验证 dt 再预算/格式化 | G5 PASS：缺失、非正、bool、NaN、不能表示为正 ns 的 dt 给字段错误 |
+| F14 | SCOPE_DOCUMENTED | R `docs/policy_execution.md` joint/EEF/HOME 保护范围表 | G7 源码核对完成；未增加在线环境避碰或改变限位/允许接触；真机 NOT_VERIFIED |
+| F15 | DONE | R CLI 删除与 session 同链 execution 静态重复验证；公开 Runner 保留 | G8 PASS：配置/公开入口回归，动态授权、freshness、deadline、frozen 检查保留 |
+| F16 | DONE | P `rtc.validate_scheduler/predict_rtc` 每次采样一次 timesteps 初始化；桥接删固定 normalizer 类型冗余 | G5/G8 PASS：CPU DDIM/VJP/normalizer 回归；GPU NOT_VERIFIED |
+| F17 | RETAINED | P `agents/loader.py` best 审计未变 | G8 PASS：`test_infra_evaluation.py` best 绑定与选择审计 |
+| F18 | DONE | P `inspect_policy` 按需读取 eval 默认值 | G2 PASS：显式 checkpoint/weights/NFE 无 eval 可检查；缺默认值仍拒绝 |
+| F19 | DONE | P `list_experiments` 发现 config.yaml + checkpoints/*.pt | G2 PASS：仅非 latest checkpoint 的实验可发现；不加载权重 |
+| F20 | RETAINED | P `LoadedPolicy.predict` 保留 CPU float64 完整 future | G4/G8 PASS：数值、切片及跨仓 NPZ dtype；未改归档 ABI |
+
+实际执行的主要最终验证命令（分别在对应仓库根目录；日志重定向不影响命令语义）：
+
+```bash
+# Real：PASS，292 passed
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m pytest -q --tb=short tests/test_policy_runner.py tests/test_policy_inference.py tests/test_policy_recording.py tests/test_config_entrypoints.py tests/test_research_refinement.py tests/test_review_remediation.py
+
+# Policy：PASS，233 passed，46 subtests passed；24 条历史身份未验证提示来自合成 fixture
+/home/zhanghaoyang/miniconda3/envs/policy/bin/python -m pytest -q --tb=short -o cache_dir=/tmp/dexmani-policy-pytest-cache tests/test_policy_windows.py tests/test_policy_rtc.py tests/test_research_split.py tests/test_policy_vq_alignment.py tests/test_infra_evaluation.py tests/test_infra_launch.py tests/test_infra_resume.py tests/test_review_remediation.py
+
+# Real：以下全部 PASS
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m compileall -q dexmani_real examples tests
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/ruff format --check dexmani_real examples tests
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/ruff check dexmani_real examples tests
+
+# Policy：本次主要生产模块的定向静态检查 PASS
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/ruff check --no-cache --select E4,E7,E9,F,I dexmani_policy/datasets/base_dataset.py dexmani_policy/datasets/replay_buffer.py dexmani_policy/datasets/sampler.py dexmani_policy/deployment/runtime.py dexmani_policy/training/build_utils.py dexmani_policy/utils/validation.py dexmani_policy/agents/action_decoders/rtc.py dexmani_policy/agents/core/multi_task.py
+
+# 两仓各执行：PASS
+git diff --check
+```
+
+另执行：Policy 15 个修改 Python 文件的 `ast.parse` 语法检查 PASS；默认 Ruff 对修改文件的全规则检查仍为 FAIL（当前 56 项、HEAD 同文件基线 57 项；按 diff 新增行定位，无新增行告警），未作无关风格整改。初轮测试因旧合同断言/缺时间和声明的旧 fixture 失败，按 r2 更新并新增反例后通过；Policy 入口测试初次 8 项因只读沙箱无法创建临时 Hydra 配置失败，核对离线副作用并授权重跑后通过；新增训练 fixture 的 action identity 被现有准入拒绝，改为实际拟合 normalizer 后最终整组通过。没有降低生产断言或安全门槛。
+
+G3/G4 核心证据为 R `tests/test_policy_runner.py:test_native_bridge_worker_runner_session_result` 的 18 个录制/无录制用例，保留真实 `LoadedPolicy`、`InferenceWorker`、Runner、Session、Raw writer、严格 JSON 与 NPZ 归档；只替换设备、传感器生命周期与时钟。G5 另有真实 Runner 的 370ms 合法槽内相位和整网格 bootstrap 反例。G6 实际调用 `_write_run_config` 比对活动 runtime/worker/快照。
+
+未连接或驱动设备，未运行 HOME/rollout/replay/实时采集或标定写入；真机、真实 checkpoint/GPU 时延、真实数据筛选比例均 NOT_VERIFIED。没有改动既有 Raw、checkpoint、normalizer、保存实验配置或历史报告，没有升级环境、下载权重、完整训练、commit 或 push。条件项不作为已实现能力；两仓配对 diff 应一并使用，无运行时兼容协商。
+
+后续清理（同日）：删除 P `LoadedPolicy.configure_execution` 仅测试使用的内嵌 warmup 参数和分支，测试改为与 worker 一致的先配置、后独立预热，并断言配置阶段不推理。修正训练日志中“不规则间隔全部保留”的过时描述、预热 prefix 注释及输出测试名称；两仓 README 和 RTC/部署说明同步时间筛选、无录制产物范围及唯一预热入口。保留 r2 要求的旧 recipe 恢复、动态安全检查、best 审计和 float64。定向验证：Policy 使用上列 Policy Python 执行 `-m pytest -q --tb=short -o cache_dir=/tmp/dexmani-policy-pytest-cache tests/test_policy_rtc.py`，PASS（53 passed）；Real 使用上列 Real Python 执行 `-m pytest -q --tb=short tests/test_policy_runner.py -k native_bridge_worker_runner_session_result`，PASS（18 passed，110 deselected）。Policy 本次 3 个 Python 文件 `ast.parse`、runtime/build_utils 的 `ruff check --no-cache --select E4,E7,E9,F,I` 及两仓 `git diff --check` 均 PASS。首次编辑命令因 PATH 无 `python` 未执行，改用已有环境绝对路径后成功；未安装环境或执行硬件验证。
+
+### 2026-10-07 F04/P1 结果传播补充验收
+
+**校正此前 F04/G3 结论：** 上述首次实施的 G3 PASS 只覆盖当时的 fixture，不能据此认定 F04 全部关闭。该 fixture 替换了 `send_action`，漏掉真实 `_send()` 将槽截止与撤权共同标为 `revoked=True` 的分支。复现为 arm SDK 耗时 40ms、槽预算 30ms、WAIT 充足：arm ACCEPTED、hand NOT_CALLED，Runner 停止并归档后未传播异常，Session 返回 0；SDK 返回时 duration 又到期也会掩盖更早的槽失败。本次保留前述历史记录，以本节结果补足并校正 F04/G3 验收范围。
+
+本次开始时两仓已有上一轮未提交整改，全部保留；HEAD 仍为 Real `8a7383b252b018f18a62d1cce82a63b7bf124ec7`、Policy `52d1d2a77b76a254b1a2498b059d160e6e527590`。本次新增修改仅在 Real 的 `robot/robot.py`、`deployment/runner.py`、两个既有测试文件、本任务书及 `docs/policy_execution.md`，Policy 未追加源码变更。
+
+| ID / 验收 | 实施状态 | 本次证据 | 验证状态与限制 |
+| --- | --- | --- | --- |
+| F04/P1、G3 截止传播 | DONE | `DispatchError.cause` 在真实边界区分 `authority_revoked/deadline_expired/stop_unconfirmed`，包装保留 dispatch、revoked 与异常链；Runner 保存预算来源/截止、动作截止和最终 `valid_until_ns`，截止失败停止归档后传播 | PASS：async/rtc × 录制/无录制；首次 SDK 前、模式恢复后、两设备之间截止；槽早于 duration、反馈/decision-age 截止、duration 与动作截止同刻的保守失败 |
+| F04/G3 正常结束与独立错误 | DONE | 正常取消需要当前 run 的 OPERATOR/QUIT 首因及明确撤权，状态仅可为 ACCEPTED/NOT_CALLED；duration 必须实际约束本次调用；WAIT 及 WAIT/duration 同刻仍传播 TimeoutError | PASS：正常取消、duration 部分下发；CRC/REJECTED/UNKNOWN、停止未确认、设备异常不被取消/duration 吞掉；ESTOP 非零；sync CRC 和完整 ACCEPTED 迟返回保持原行为 |
+| G3 证据及收尾 | DONE | 复用 dispatch trace、attempt/Raw/session，撤权→stop→录制归档→传播；首因、附加 stop/recording/shutdown 错误分别保存 | PASS：真实 `_send()`、LoadedPolicy bridge、串行 worker、Runner、Session、Raw writer、JSON/NPZ；故障后无下一动作/episode，单次结束计数与发布，录制/无录制退出一致；退役 query 隔离回归通过 |
+| F09/F10 | RETAINED_CONDITIONAL | Mode 6 恢复位置及串行事务性 EEF prefix IK 保持原路径 | NOT_VERIFIED：无固件/真机安全证据，无实际 prefix 峰值数据；未移动恢复或增加并行机制 |
+| GPU / 真实数据影响 | RETAINED_CONDITIONAL | 本次仅 CPU 合成数据和 fake SDK 离线验证 | NOT_VERIFIED：真实 checkpoint/GPU 时延、实际数据筛选比例和物理效果 |
+
+先补反例、后改生产实现：修复前定向槽反例 **8 failed**；扩展的完整跨仓 fixture 当时 **24 failed、88 passed**，失败包含槽/首次 SDK/模式恢复截止、稍后 duration、CRC 与撤权、停止未确认与撤权。修复后最终 fixture 扩展到 **116 个** async/rtc × 录制/无录制用例，包含 CRC、stop、录制与 shutdown 同时失败的反例。另补取消首因的 run_id 归属、无明确 cause 的保守失败、反馈/decision-age 截止、sync CRC 和设备异常 cause/链检查。新增 cleanup 单测初轮有两项在 dispatch 前就触发模拟录制故障，改为仅在提交 command 行时注入，未修改生产准入或降低断言。
+
+以下均为本轮实际重新执行，不继承此前 PASS：
+
+```bash
+# Real，PASS：411 passed
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m pytest -q --tb=short tests/test_policy_runner.py tests/test_policy_inference.py tests/test_policy_recording.py tests/test_config_entrypoints.py tests/test_research_refinement.py tests/test_review_remediation.py
+
+# Policy，PASS：233 passed、46 subtests passed；24 条提示来自合成 fixture 的历史身份未验证
+/home/zhanghaoyang/miniconda3/envs/policy/bin/python -B -m pytest -q --tb=short -o cache_dir=/tmp/dexmani-policy-pytest-cache tests/test_policy_windows.py tests/test_policy_rtc.py tests/test_research_split.py tests/test_policy_vq_alignment.py tests/test_infra_evaluation.py tests/test_infra_launch.py tests/test_infra_resume.py tests/test_review_remediation.py
+
+# Real：语法、格式、lint 均 PASS，覆盖 dexmani_real/examples/tests
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m compileall -q dexmani_real examples tests
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/ruff format --check dexmani_real examples tests
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/ruff check dexmani_real examples tests
+
+# Policy：15 个已有修改 Python 文件 ast.parse PASS；以下定向 Ruff PASS
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/ruff check --no-cache --select E4,E7,E9,F,I dexmani_policy/datasets/base_dataset.py dexmani_policy/datasets/replay_buffer.py dexmani_policy/datasets/sampler.py dexmani_policy/deployment/runtime.py dexmani_policy/training/build_utils.py dexmani_policy/utils/validation.py dexmani_policy/agents/action_decoders/rtc.py dexmani_policy/agents/core/multi_task.py
+
+# 两仓各执行：PASS
+git diff --check
+```
+
+Policy 全规则 Ruff 未在本轮重跑，不将上节已有 FAIL 改写为 PASS。Policy 入口测试获准创建并清理仓内临时配置，远程命令由测试替身执行；未训练、连接设备或升级环境。未修改已发布 Raw、checkpoint 或历史实验配置；未执行 HOME、replay、真机 rollout 或实时采集。本次交付仍为工作树 diff，未 commit/push，未改变控制频率、调度、截止端点、安全准入或动作表示。
+
 ## 附录 C：r2 最终审校记录
 
 本修订澄清了旧 recipe 缺键与新实验显式 null、H=1/未知时间及 padding、首因与真实后续故障、配置声明与加载后核对、启动下界与槽内相位/端点、生效 execution/cloud 快照、fake SDK 的证据上限。移除旧预取 hard gate 与“仅按必要条件拒绝”的矛盾，并减少重复验收要求。

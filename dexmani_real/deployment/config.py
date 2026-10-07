@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -59,9 +59,7 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
     """Check physical capability before allocating IPC or connecting devices."""
     if not runtime.policy.hand_enabled:
         raise ValueError("Dexterous policy deployment requires hand_enabled=true")
-    dt = info.control_dt_s
-    if isinstance(dt, bool) or not isinstance(dt, (int, float)) or not math.isfinite(dt) or dt <= 0:
-        raise ValueError("Real deployment requires saved real_runtime with positive control_dt_s")
+    control_dt_ns(info)
     names = set(info.observation_fields)
     unsupported = names - _SUPPORTED_OBSERVATION_FIELDS
     if unsupported:
@@ -85,8 +83,27 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
         recipe = info.pointcloud_config
         if not isinstance(recipe, dict):
             raise ValueError("Live point_cloud requires saved numerical parameters")
+        missing = {field.name for field in fields(PointCloudConfig)} - recipe.keys()
+        if missing:
+            raise ValueError(f"Saved pointcloud recipe missing fields: {sorted(missing)}")
         return PointCloudConfig.from_dict(recipe)
     return None
+
+
+def control_dt_ns(info):
+    dt = info.control_dt_s
+    if (
+        isinstance(dt, bool)
+        or not isinstance(dt, (int, float))
+        or not math.isfinite(dt)
+        or dt <= 0
+        or not math.isfinite(dt * 1e9)
+        or int(dt * 1e9) <= 0
+    ):
+        raise ValueError(
+            "Real deployment requires saved real_runtime.dt with positive control_dt_s"
+        )
+    return int(dt * 1e9)
 
 
 @dataclass(frozen=True)
@@ -143,14 +160,29 @@ class ExecutionConfig:
     prefetch_steps: int | None = None
     rtc_guidance_cap: float | None = None
 
-    def validate(self, info):
+    def validate(self, info, *, max_running_s=None):
+        dt = control_dt_ns(info)
+        max_running_s = validate_max_running_s(max_running_s)
+        for name in ("n_obs_steps", "horizon", "n_action_steps"):
+            value = getattr(info, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if info.n_obs_steps > info.horizon:
+            raise ValueError("n_obs_steps must not exceed horizon")
         if self.execution_mode not in {"sync", "async", "rtc"}:
             raise ValueError("execution_mode must be sync, async or rtc")
         for name in ("max_decision_age_s", "max_wait_s", "max_tick_lateness_s"):
             value = getattr(self, name)
-            if isinstance(value, bool) or value is None or not math.isfinite(value) or value <= 0:
+            if (
+                isinstance(value, bool)
+                or value is None
+                or not math.isfinite(value)
+                or value < 0
+                or (value == 0 and name != "max_tick_lateness_s")
+            ):
                 raise ValueError(f"{name} requires an explicit finite positive experimental budget")
-        if self.max_tick_lateness_s >= info.control_dt_s:
+        lateness = int(self.max_tick_lateness_s * 1e9)
+        if lateness >= dt:
             raise ValueError("max_tick_lateness_s must be smaller than control_dt_s")
         p = info.horizon - info.n_obs_steps + 1
         a = info.n_action_steps
@@ -160,29 +192,48 @@ class ExecutionConfig:
             d = self.prefetch_steps
             if type(d) is not int or not 1 <= d <= a or a + d > p:
                 raise ValueError(f"async/rtc require 1 <= d <= A and A+d <= P; A={a}, P={p}, d={d}")
-            if self.max_decision_age_s <= (a + d - 1) * info.control_dt_s:
-                raise ValueError("decision age budget cannot cover the asynchronous A+d slots")
-        elif self.max_decision_age_s <= (a - 1) * info.control_dt_s:
-            raise ValueError("decision age budget cannot cover the synchronous A slots")
         if self.execution_mode == "rtc":
             beta = self.rtc_guidance_cap
             if isinstance(beta, bool) or beta is None or not math.isfinite(beta) or beta < 0:
                 raise ValueError("rtc_guidance_cap requires an explicit finite nonnegative value")
+        _validate_wait_lower_bound(info.n_obs_steps * dt, self, max_running_s, "Static")
+        age = a * dt - lateness
+        if self.execution_mode != "sync":
+            age = max(age, (a + self.prefetch_steps - 1) * dt - lateness)
+        if int(self.max_decision_age_s * 1e9) < age:
+            raise ValueError("Static grid lower bound exceeds max_decision_age_s")
         return self
 
 
-def validate_warmup_budget(durations, execution_config, info):
-    """Apply the same measured model-path budgets before session startup."""
-    maximum = max(durations)
-    if maximum >= execution_config.max_wait_s:
-        raise ValueError("Measured inference already exceeds max_wait_s; bootstrap cannot fit")
-    if execution_config.execution_mode == "sync":
-        if (
-            maximum + (info.n_action_steps - 1) * info.control_dt_s
-            >= execution_config.max_decision_age_s
-        ):
-            raise ValueError("Measured inference plus A slots exceeds max_decision_age_s")
-    elif maximum >= execution_config.prefetch_steps * info.control_dt_s:
-        raise ValueError(
-            "Measured model path exceeds configured prefetch budget; no automatic budget relaxation"
+def _validate_wait_lower_bound(bound, execution, max_running_s, source):
+    if int(execution.max_wait_s * 1e9) <= bound:
+        raise ValueError(f"{source} first-action grid lower bound reaches max_wait_s")
+    if max_running_s is not None and int(max_running_s * 1e9) <= bound:
+        raise ValueError(f"{source} first-action grid lower bound reaches max_running_s")
+
+
+def validate_warmup_budget(durations, execution_config, info, *, max_running_s=None):
+    """Necessary grid bounds only; measured samples are not realtime guarantees."""
+    dt = control_dt_ns(info)
+    lateness = int(execution_config.max_tick_lateness_s * 1e9)
+    age = int(execution_config.max_decision_age_s * 1e9)
+    for path in ("bootstrap", "steady"):
+        samples = durations[path]
+        if not samples or any(not math.isfinite(i) or i < 0 for i in samples):
+            raise ValueError(f"Invalid {path} warmup durations")
+    for sample in durations["bootstrap"]:
+        inference = int(sample * 1e9)
+        k = inference // dt + 1
+        _validate_wait_lower_bound(
+            (info.n_obs_steps - 1 + k) * dt, execution_config, max_running_s, "Measured sample"
         )
+        if max(inference, k * dt - lateness) + (info.n_action_steps - 1) * dt > age:
+            raise ValueError("Measured bootstrap sample cannot fit max_decision_age_s")
+    if execution_config.execution_mode != "sync":
+        d = execution_config.prefetch_steps
+        for sample in durations["steady"]:
+            inference = int(sample * 1e9)
+            if inference > d * dt + lateness:
+                raise ValueError("Measured steady sample cannot fit handoff deadline")
+            if max(inference, (info.n_action_steps + d - 1) * dt - lateness) > age:
+                raise ValueError("Measured steady sample cannot fit max_decision_age_s")

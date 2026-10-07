@@ -314,3 +314,213 @@ def test_direct_realizer_rejects_invalid_used_limits_and_workspace():
     bad = replace(cfg, policy=replace(cfg.policy, workspace=replace(cfg.policy.workspace, x_min=1)))
     with pytest.raises(ValueError, match="workspace"):
         ActionRealizer(bad, planner=NS())
+
+
+@pytest.mark.parametrize("dt", [None, 0, True, float("nan"), 1e-12])
+def test_dt_checked_before_execution_arithmetic(dt):
+    from dexmani_real.deployment.config import ExecutionConfig
+
+    info = NS(control_dt_s=dt, horizon=4, n_obs_steps=1, n_action_steps=1)
+    with pytest.raises(ValueError, match="real_runtime.dt"):
+        ExecutionConfig("sync", 1.0, 1.0, 0.03).validate(info)
+
+
+def test_r2_grid_lower_bounds_and_measured_endpoints():
+    from examples.run_policy import _parser
+
+    assert (
+        _parser().parse_args(["policy/task/run", "--max-tick-lateness", "0"]).max_tick_lateness == 0
+    )
+    from dexmani_real.deployment.config import ExecutionConfig, validate_warmup_budget
+
+    info = NS(control_dt_s=0.1, horizon=8, n_obs_steps=1, n_action_steps=1)
+    with pytest.raises(ValueError, match="Static grid"):
+        ExecutionConfig("sync", 0.05, 1.0, 0.03).validate(info)
+    info.n_obs_steps = 4
+    with pytest.raises(ValueError, match="max_wait"):
+        ExecutionConfig("sync", 1.0, 0.2, 0.03).validate(info)
+    with pytest.raises(ValueError, match="max_running"):
+        ExecutionConfig("sync", 1.0, 1.0, 0.03).validate(info, max_running_s=0.4)
+    info.n_obs_steps, info.n_action_steps = 1, 3
+    execution = ExecutionConfig("async", 0.37, 1.0, 0.03, 2)
+    execution.validate(info)  # Inclusive age endpoint, not the obsolete 400 ms gate.
+    for sample in (0.2, 0.215, 0.23):
+        validate_warmup_budget({"bootstrap": (0.01,), "steady": (sample,)}, execution, info)
+    with pytest.raises(ValueError, match="handoff"):
+        validate_warmup_budget({"bootstrap": (0.01,), "steady": (0.231,)}, execution, info)
+    with pytest.raises(ValueError, match="Static grid"):
+        replace(execution, max_decision_age_s=0.369).validate(info)
+    info.n_action_steps = 1
+    execution = ExecutionConfig("sync", 0.17, 1.0, 0.03)
+    replace(execution, max_tick_lateness_s=0).validate(info)
+    validate_warmup_budget({"bootstrap": (0.1,), "steady": (0.1,)}, execution, info)
+    # Exactly on-grid completion still anchors to the following slot (200 ms).
+    with pytest.raises(ValueError, match="max_wait"):
+        validate_warmup_budget(
+            {"bootstrap": (0.1,), "steady": (0.1,)}, replace(execution, max_wait_s=0.2), info
+        )
+    with pytest.raises(ValueError, match="max_decision_age"):
+        validate_warmup_budget(
+            {"bootstrap": (0.1,), "steady": (0.1,)},
+            replace(execution, max_decision_age_s=0.169),
+            info,
+        )
+
+
+def test_saved_cloud_complete_but_user_yaml_partial():
+    from dexmani_real.deployment.config import validate_policy_runtime_compatibility
+
+    runtime = load_experiment_config(data={"pointcloud": {"num_points": 64}})
+    assert runtime.pointcloud.num_points == 64
+    info = NS(
+        control_dt_s=0.1,
+        observation_fields=("joint_state", "point_cloud"),
+        action_mode="joint",
+        pointcloud_config=runtime.pointcloud.to_dict(),
+    )
+    assert validate_policy_runtime_compatibility(info, runtime) == runtime.pointcloud
+    del info.pointcloud_config["voxel_size_m"]
+    with pytest.raises(ValueError, match="Saved pointcloud recipe missing.*voxel_size_m"):
+        validate_policy_runtime_compatibility(info, runtime)
+
+
+@pytest.mark.parametrize("recording", [True, False])
+def test_cli_recording_choice_uses_same_session(tmp_path, monkeypatch, recording):
+    import dexmani_policy.deployment as policy
+
+    from dexmani_real.deployment import session
+    from examples import run_policy
+
+    directory = tmp_path / "policy" / "task" / "run"
+    directory.mkdir(parents=True)
+    info = NS(
+        policy_name="policy",
+        task_name="task",
+        experiment_dir=directory,
+        checkpoint_path=directory / "epoch.pt",
+        weights="raw",
+        inference_steps=1,
+        observation_fields=("joint_state",),
+        n_action_steps=1,
+    )
+    monkeypatch.setattr(policy, "resolve_experiment", lambda _: directory)
+    monkeypatch.setattr(policy, "load_experiment_config", lambda _: {"agent": {}})
+    monkeypatch.setattr(policy, "inspect_policy", lambda *a, **kw: info)
+    seen = []
+
+    def run(runtime, config, execute, **kwargs):
+        assert execute and config.info is info
+        seen.append(kwargs)
+        return 1  # CLI must return the session technical failure unchanged.
+
+    monkeypatch.setattr(session, "run_policy_deployment", run)
+    output = tmp_path / "output"
+    args = ["policy/task/run", "--output", str(output)] + ([] if recording else ["--no-record"])
+    assert run_policy.main(args) == 1 and len(seen) == 1
+    assert (seen[0]["recording_config"] is not None) == recording
+    assert (seen[0]["save_run_config"] is not None) == recording
+    assert output.exists() == recording
+
+
+def test_session_active_cloud_execution_and_saved_snapshot(tmp_path, monkeypatch):
+    from dexmani_policy.deployment.runtime import PolicyInfo
+    from test_review_remediation import shared_state
+
+    from dexmani_real.deployment import session
+    from dexmani_real.deployment.config import ExecutionConfig, RolloutRecordingConfig
+    from examples.run_policy import _write_run_config
+
+    recipe = PointCloudConfig(num_points=32, remove_table=False)
+    execution = ExecutionConfig("async", 2.0, 1.0, 0.03, 1)
+    runtime = ExperimentConfig()
+    info = PolicyInfo(
+        tmp_path,
+        tmp_path / "explicit.pt",
+        "policy",
+        "task",
+        ("joint_state", "point_cloud"),
+        1,
+        1,
+        3,
+        "joint",
+        0.1,
+        recipe.to_dict(),
+        None,
+        "raw",
+        1,
+    )
+    shared = shared_state()
+    seen = {}
+    native_cloud = session.PointCloudWorkerConfig
+
+    def cloud(**kwargs):
+        result = native_cloud(**kwargs)
+        seen["cloud"] = result
+        return result
+
+    monkeypatch.setattr(session, "PointCloudWorkerConfig", cloud)
+    calibration = tmp_path / "camera.json"
+    calibration.write_text(
+        json.dumps(
+            {
+                "camera": {
+                    "serial": "synthetic",
+                    "type": "eye_to_hand",
+                    "pose": {"position": [0, 0, 0], "orientation": [1, 0, 0, 0]},
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(session.RuntimeChannels, "create", lambda **kw: shared)
+    monkeypatch.setattr(session, "RuntimeSupervisor", lambda *a: NS(check=lambda: True))
+
+    def offline_connect():
+        raise RuntimeError("offline connection boundary")
+
+    monkeypatch.setattr(session, "DexManiRobot", lambda *a, **kw: NS(connect=offline_connect))
+    monkeypatch.setattr(
+        session,
+        "_warmup_policy",
+        lambda model, active, info, effective, **kw: seen.update(
+            runtime=active, execution=effective
+        ),
+    )
+    monkeypatch.setattr(session, "build_home_planner", lambda *a: None)
+    monkeypatch.setattr(session.ActionRealizer, "for_mode", lambda *a: None)
+
+    def shutdown(*a, model, **kw):
+        model.close()
+        return True
+
+    monkeypatch.setattr(session, "shutdown_local_runtime", shutdown)
+    args = NS(
+        experiment="policy/task/run",
+        checkpoint="explicit.pt",
+        seed=0,
+        device="cpu",
+        num_episodes=1,
+        max_running_s=1.0,
+        n_action_steps=1,
+    )
+
+    def save(active, effective):
+        assert active.execution is effective is execution
+        assert active.pointcloud is seen["cloud"].pointcloud
+        _write_run_config(tmp_path, args=args, runtime=active, info=info, execution=effective)
+
+    assert (
+        session.run_policy_deployment(
+            runtime,
+            NS(info=info),
+            True,
+            execution_config=execution,
+            recording_config=RolloutRecordingConfig(str(tmp_path), "task"),
+            camera_calibration_path=calibration,
+            save_run_config=save,
+        )
+        == 1
+    )
+    saved = yaml.safe_load((tmp_path / "run_config.yaml").read_text())
+    assert saved["runtime"]["execution"] == saved["execution"] == config_as_dict(execution)
+    assert saved["runtime"]["pointcloud"] == config_as_dict(recipe)
+    assert runtime.execution != execution and runtime.pointcloud != recipe

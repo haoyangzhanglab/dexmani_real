@@ -118,6 +118,25 @@ def test_dispatch_deadline_at_last_boundary(monkeypatch, stage, expected_calls, 
         robot.send_action(command, valid_until_ns=200)
     assert clock.calls == expected_calls
     assert (caught.value.result.arm, caught.value.result.hand) == expected_status
+    expected_cause = "authority_revoked" if stage == "revoke" else "deadline_expired"
+    assert caught.value.cause == expected_cause and caught.value.revoked
+    assert isinstance(caught.value.__cause__, DispatchError)
+    assert caught.value.__cause__.cause == expected_cause
+    assert caught.value.result.timestamp_ns == clock.now
+
+
+@pytest.mark.parametrize("operation", ["send", "home"])
+def test_pending_stop_has_explicit_boundary_cause(monkeypatch, operation):
+    robot, clock, command = fake_robot(monkeypatch)
+    robot._hand_stop_pending = True
+    with pytest.raises(DispatchError) as caught:
+        if operation == "send":
+            robot.send_action(command, valid_until_ns=200)
+        else:
+            robot.home_arm([], command.arm_qpos, command.run_id, lambda: False)
+    assert caught.value.cause == "stop_unconfirmed" and caught.value.revoked
+    assert (caught.value.result.arm, caught.value.result.hand) == (0, 0)
+    assert clock.calls == []
 
 
 def test_last_sdk_late_return_keeps_accepted(monkeypatch):

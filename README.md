@@ -141,7 +141,9 @@ H 执行 HOME，空闲且确认手部无接触后 T 归零触觉，B 请求开�
 
 可用 `--n-action-steps N` 覆盖本次部署的执行段长度；必须满足
 `n_obs_steps - 1 + N <= horizon`，不会改写训练配置或 checkpoint。
-实际长度、覆盖参数和会话真正使用的桌面平面快照会保存在 `run_config.yaml`。
+默认录制时，实际长度、覆盖参数和会话真正使用的桌面平面快照会保存在 `run_config.yaml`。
+
+`--no-record` 使用同一执行器，但不创建录制目录、Raw、query/attempt、session 结果或配置快照。所需传感器由模型实际输入决定；仅关节输入且不录制时不启动相机。此选项仍会连接设备并执行动作。
 
 三个预算可保存到同一 YAML 的 `execution` 小节，或由 CLI 显式指定（秒）；未指定的 CLI 不覆盖 YAML，显式 beta=0 保留。缺预算仍拒绝启动，其中槽位迟到容限必须小于保存的 dt；它们不等于 episode 总时长，也不由论文或 warmup 推断为硬件安全值。
 

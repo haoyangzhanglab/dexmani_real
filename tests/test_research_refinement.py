@@ -189,7 +189,10 @@ def test_export_identity_full_modal_and_failure_staging(tmp_path, monkeypatch):
 
     identities = []
     for name, report in zip(("a.zarr", "b.zarr"), reports):
-        dataset = BaseDataset(str(tmp_path / name), horizon=1)
+        with pytest.raises(ValueError, match="Zero valid"):
+            BaseDataset(str(tmp_path / name), horizon=1)
+        # This synthetic Raw has unknown time; explicit unfiltered is a recorded research choice.
+        dataset = BaseDataset(str(tmp_path / name), horizon=1, max_time_gap_ratio=None)
         identities.append(capture_data_identity(dataset))
         assert identities[-1] == {"revision": report["data_revision"]}
         assert len(dataset) == 1
@@ -320,8 +323,8 @@ def test_timing_missing_stages_are_unknown():
     "mode,durations,worker_error,age",
     [
         ("sync", (2.0,), None, 10.0),
-        ("async", (0.2,), None, 10.0),
-        ("rtc", (0.2,), None, 10.0),
+        ("async", (0.231,), None, 10.0),
+        ("rtc", (0.231,), None, 10.0),
         ("sync", (), RuntimeError("load failed"), 10.0),
         ("sync", (0.3,), None, 0.5),
         ("sync", (0.31,), None, 0.5),
@@ -358,7 +361,9 @@ def test_initial_warmup_failure_closes_owned_worker_before_connect(
             events.append("warmup")
 
         def poll(self):
-            return "load", ModelResult(durations, worker_error, 0, 1)
+            return "load", ModelResult(
+                {"bootstrap": durations, "steady": durations}, worker_error, 0, 1
+            )
 
         def close(self):
             self.closed = True

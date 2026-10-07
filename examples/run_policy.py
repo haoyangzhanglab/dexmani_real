@@ -4,7 +4,7 @@
        [--weights ema|raw] [--inference-steps N] [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]
 执行模式与预算从 YAML execution 读取，也可由 CLI 覆盖；缺必需预算拒绝启动。
 真机评估：H 回零，空闲无接触时 T 归零触觉，B 开始，S 停止。
-保存 rollout 与 run_config.yaml，任务成功由离线评估判定。"""
+默认保存 rollout 与 run_config.yaml；--no-record 关闭录制，任务成功由离线评估判定。"""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def _positive_running_seconds(raw: str) -> float:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run one persistent recorded policy-evaluation session"
+        description="Run one policy-evaluation session with optional recording"
     )
     parser.add_argument("experiment", metavar="EXPERIMENT")
     parser.add_argument(
@@ -93,7 +93,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--execution-mode", choices=("sync", "async", "rtc"), default=None)
     parser.add_argument("--max-decision-age", type=_positive_running_seconds, default=None)
     parser.add_argument("--max-wait", type=_positive_running_seconds, default=None)
-    parser.add_argument("--max-tick-lateness", type=_positive_running_seconds, default=None)
+    parser.add_argument("--max-tick-lateness", type=float, default=None)
     parser.add_argument("--prefetch-steps", type=_positive_int)
     parser.add_argument("--rtc-guidance-cap", type=float)
     parser.add_argument(
@@ -105,6 +105,9 @@ def _parser() -> argparse.ArgumentParser:
         "--output", type=Path, default=None, help="Session root (default: checkout/rollouts)"
     )
     parser.add_argument("--camera-calibration", type=Path, default=None)
+    parser.add_argument(
+        "--no-record", action="store_true", help="Execute without recording artifacts"
+    )
     return parser
 
 
@@ -219,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
             RolloutRecordingConfig,
         )
 
-        execution = runtime.execution.validate(info)
+        execution = runtime.execution
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
         _safe_selector_parts(selector)
     except Exception as exc:
@@ -227,10 +230,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        root = args.output or Path(__file__).resolve().parents[1] / "rollouts"
-        session_dir = _session_directory(root, selector)
         policy_config = PolicyRuntimeConfig(saved_config, info, args.device, args.seed)
-        recording_config = RolloutRecordingConfig(str(session_dir), info.task_name)
+        session_dir = None
+        recording_config = None
+        if not args.no_record:
+            root = args.output or Path(__file__).resolve().parents[1] / "rollouts"
+            session_dir = _session_directory(root, selector)
+            recording_config = RolloutRecordingConfig(str(session_dir), info.task_name)
+        elif args.output is not None:
+            print("--no-record: --output is unused; no recording artifacts will be created")
     except Exception as exc:
         print(f"[SESSION] session setup failed: {exc}", file=sys.stderr)
         return 1
@@ -238,9 +246,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Experiment: {info.experiment_dir}")
     print(f"Checkpoint: {info.checkpoint_path.name} ({info.weights}); steps={info.inference_steps}")
     print(f"Observations: {', '.join(info.observation_fields)}")
-    print(f"Action: {info.action_mode}; {1 / info.control_dt_s:g} Hz; chunk={info.n_action_steps}")
+    print(
+        f"Action steps source: {'CLI override' if args.n_action_steps is not None else 'saved Policy'}"
+    )
     print(f"Episodes: {args.num_episodes}; cooperative budget={args.max_running_s:g} s")
-    print(f"Session: {session_dir}", flush=True)
+    print(f"Session: {session_dir}" if session_dir else "Recording: disabled", flush=True)
     try:
         from dexmani_real.deployment.session import run_policy_deployment
 
@@ -253,13 +263,17 @@ def main(argv: list[str] | None = None) -> int:
             recording_config=recording_config,
             execution_config=execution,
             camera_calibration_path=args.camera_calibration,
-            save_run_config=lambda resolved, effective: _write_run_config(
-                session_dir,
-                args=args,
-                runtime=resolved,
-                info=info,
-                execution=effective,
-            ),
+            save_run_config=(
+                lambda resolved, effective: _write_run_config(
+                    session_dir,
+                    args=args,
+                    runtime=resolved,
+                    info=info,
+                    execution=effective,
+                )
+            )
+            if recording_config is not None
+            else None,
         )
     except Exception as exc:
         print(f"[LIFECYCLE] lifecycle failed: {exc}", file=sys.stderr)

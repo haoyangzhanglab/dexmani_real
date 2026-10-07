@@ -109,7 +109,7 @@ class PolicyRunner:
         self.runtime = runtime
         self.policy_info = policy_info
         self.model = model_runtime
-        self.execution = execution_config.validate(policy_info)
+        self.execution = execution_config.validate(policy_info, max_running_s=max_running_s)
         self.kinematics = kinematics
         self.execute = execute
         self.max_running_s = max_running_s
@@ -152,18 +152,29 @@ class PolicyRunner:
             require_rgb_cloud_identity=self.requires_rgb_cloud_identity,
         )
 
-    def _budget_deadline_ns(self):
+    def _budget_limit(self):
         deadlines = []
         if self.run_id is not None:
             if self.max_running_s is not None:
-                deadlines.append(self.started_ns + int(self.max_running_s * 1e9))
+                deadlines.append((self.started_ns + int(self.max_running_s * 1e9), "duration"))
             if self.wait_started_ns is not None:
-                deadlines.append(self.wait_started_ns + int(self.execution.max_wait_s * 1e9))
-        return min(deadlines) if deadlines else None
+                deadlines.append(
+                    (self.wait_started_ns + int(self.execution.max_wait_s * 1e9), "wait")
+                )
+        # WAIT wins a tie: no action was supplied before its strict deadline.
+        return min(deadlines, key=lambda item: (item[0], item[1] != "wait")) if deadlines else None
+
+    def _expired_budget(self):
+        limit = self._budget_limit()
+        return limit if limit is not None and time.monotonic_ns() >= limit[0] else None
 
     def _within_budget(self):
-        deadline = self._budget_deadline_ns()
-        return deadline is None or time.monotonic_ns() < deadline
+        return self._expired_budget() is None
+
+    def _finish_budget(self, limit):
+        self._finish_episode(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
+        if limit[1] == "wait":
+            raise TimeoutError("Policy WAIT budget exhausted without successful consumption")
 
     def _dispatch_deadline_ns(self, row, slot):
         deadlines = [
@@ -175,9 +186,6 @@ class PolicyRunner:
             for times in self.plan.sources.values()
             for stamp in times
         )
-        budget_deadline = self._budget_deadline_ns()
-        if budget_deadline is not None:
-            deadlines.append(budget_deadline)
         return min(deadlines)
 
     def _has_motion_authority(self):
@@ -225,7 +233,12 @@ class PolicyRunner:
             self.wait_started_ns = time.monotonic_ns()
 
     def _finish_episode(
-        self, detail, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY, stop_motion=True
+        self,
+        detail,
+        *,
+        run_end_reason=RunEndReason.EXECUTOR_BOUNDARY,
+        stop_motion=True,
+        errors=None,
     ):
         if self.run_id is None:
             return
@@ -244,7 +257,7 @@ class PolicyRunner:
         self.run_id = None
         self.completed += 1
         self.shared.stop_request.value = int(StopRequest.NONE)
-        errors, failure = [], None
+        errors, failure = list(errors or ()), None
         try:
             if stop_motion:
                 self.robot.stop()
@@ -655,8 +668,8 @@ class PolicyRunner:
         if not self._has_motion_authority() or self.shared.quit_requested.value:
             self._finish_episode("before_dispatch_revoked")
             return
-        if not self._within_budget():
-            self._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
+        if (expired := self._expired_budget()) is not None:
+            self._finish_budget(expired)
             return
         if now > self.started_ns + slot * self.dt_ns + int(
             self.execution.max_tick_lateness_s * 1e9
@@ -664,11 +677,15 @@ class PolicyRunner:
             self._invalidate("dispatch_slot_or_decision_age")
             self._record(row)
             return
-        valid_until_ns = self._dispatch_deadline_ns(row, slot)
+        budget_limit = self._budget_limit()
+        action_deadline_ns = self._dispatch_deadline_ns(row, slot)
+        valid_until_ns = (
+            min(action_deadline_ns, budget_limit[0]) if budget_limit else action_deadline_ns
+        )
         if time.monotonic_ns() >= valid_until_ns:
             self._record(row)
-            if not self._within_budget():
-                self._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
+            if (expired := self._expired_budget()) is not None:
+                self._finish_budget(expired)
             else:
                 self._invalidate("dispatch_feedback_or_budget")
             return
@@ -681,8 +698,34 @@ class PolicyRunner:
                 result, failure = exc.result, exc
         # Admission deadlines only govern entry into each SDK. Total owner budgets
         # also govern completion; an accepted late return remains ACCEPTED evidence.
-        timed_out = not self._within_budget()
+        expired = (
+            budget_limit
+            if budget_limit is not None and time.monotonic_ns() >= budget_limit[0]
+            else None
+        )
+        timed_out = expired is not None
         cancelled = isinstance(failure, DispatchInterrupted)
+        cause = failure.cause if isinstance(failure, DispatchError) else None
+        # A total budget explains a refusal only when it constrained this call.
+        # A coincident action deadline remains an independent technical failure.
+        budget_rejection = (
+            cause == "deadline_expired"
+            and expired is not None
+            and budget_limit[0] < action_deadline_ns
+        )
+        with self.shared.motion_lock:
+            operator_revocation = (
+                cause == "authority_revoked"
+                and int(self.shared.run_ended_id.value) == self.run_id
+                and int(self.shared.run_ended_reason.value)
+                in (int(RunEndReason.OPERATOR), int(RunEndReason.QUIT))
+                and not self.shared.estop_request.value
+                and not self.shared.error_state.value
+            )
+        clean_partial = result is not None and all(
+            status in (DispatchStatus.ACCEPTED, DispatchStatus.NOT_CALLED)
+            for status in (result.arm, result.hand)
+        )
         accepted = (
             result is not None
             and result.arm == DispatchStatus.ACCEPTED
@@ -698,6 +741,13 @@ class PolicyRunner:
             arm=int(result.arm) if result else 0,
             hand=int(result.hand) if result else 0,
             logical_consume=not self.execute,
+            cause=cause,
+            exception_type=type(failure).__name__ if failure is not None else None,
+            detail=str(failure) if failure is not None else None,
+            action_deadline_ns=action_deadline_ns,
+            budget_source=budget_limit[1] if budget_limit else None,
+            budget_deadline_ns=budget_limit[0] if budget_limit else None,
+            valid_until_ns=valid_until_ns,
         )
         failed = (
             timed_out
@@ -713,7 +763,7 @@ class PolicyRunner:
                     RunEndReason.ESTOP
                     if cancelled
                     else RunEndReason.TIMEOUT
-                    if timed_out
+                    if timed_out and (failure is None or budget_rejection)
                     else RunEndReason.EXECUTOR_BOUNDARY
                     if failure is not None and failure.revoked
                     else RunEndReason.HARDWARE_FAULT
@@ -737,20 +787,33 @@ class PolicyRunner:
                 self._event("recording_failure", exception_type=type(exc).__name__, detail=str(exc))
                 logger.exception("recording after dispatch failed")
         if failed:
-            error = (
-                failure
-                if cancelled or (failure is not None and not failure.revoked)
-                else stop_error or record_error
-            )
+            normal_boundary = clean_partial and (operator_revocation or budget_rejection)
+            error = failure if failure is not None and not normal_boundary else None
+            if error is None and expired is not None and expired[1] == "wait":
+                error = TimeoutError("Policy WAIT budget exhausted during dispatch")
+            if (
+                error is None
+                and not normal_boundary
+                and self.execute
+                and self.execution.execution_mode != "sync"
+                and not accepted
+            ):
+                error = DispatchError("Strict chunk dispatch was not confirmed", result)
+            error = error or stop_error or record_error
             try:
                 self._finish_episode(
                     "dispatch_cancelled"
                     if cancelled
-                    else "dispatch_return_timeout"
-                    if timed_out
+                    else f"dispatch_return_{expired[1]}_timeout"
+                    if timed_out and (failure is None or budget_rejection)
                     else "dispatch_unconfirmed_or_failed",
                     run_end_reason=reason,
                     stop_motion=False,
+                    errors=[
+                        error_detail(stage, exc)
+                        for stage, exc in (("stop", stop_error), ("recording", record_error))
+                        if exc is not None
+                    ],
                 )
             except Exception as exc:
                 if error is not None:
@@ -829,13 +892,14 @@ class PolicyRunner:
             if self.run_id is None:
                 return
         now = time.monotonic_ns()
-        if not self._within_budget():
-            self._finish_episode("timeout", run_end_reason=RunEndReason.TIMEOUT)
+        if (expired := self._expired_budget()) is not None:
+            self._finish_budget(expired)
             return
         if now < self.next_step_ns:
             return
         slot = (now - self.started_ns) // self.dt_ns
         self._active_tick = (self.run_id, slot, self.started_ns + slot * self.dt_ns, now)
+        tick_failed = False
         try:
             missed = slot != self.last_slot + 1
             self.last_slot = slot
@@ -875,8 +939,18 @@ class PolicyRunner:
                         self._execute_slot(row, slot)
                 else:
                     self._record(row)
+        except BaseException:
+            tick_failed = True
+            raise
         finally:
-            self._end_current_tick()
+            try:
+                # Observation/prefix construction and recording may cross a total
+                # deadline without reaching dispatch. Classify before another
+                # operator poll, but never replace an exception already in flight.
+                if not tick_failed and (expired := self._expired_budget()) is not None:
+                    self._finish_budget(expired)
+            finally:
+                self._end_current_tick()
 
     def run(self):
         failure = None

@@ -2,6 +2,7 @@
 
 import multiprocessing as mp
 import os
+from dataclasses import replace
 
 from dexmani_real.calibration.camera.extrinsics import (
     CameraExtrinsics,
@@ -58,7 +59,7 @@ def _load_configured_policy(policy_config, execution_config):
         raise
 
 
-def _warmup_policy(model, runtime, info, execution_config):
+def _warmup_policy(model, runtime, info, execution_config, *, max_running_s=None):
     model.submit(
         "load",
         samples=5,
@@ -74,12 +75,12 @@ def _warmup_policy(model, runtime, info, execution_config):
     if completion[1].error is not None:
         raise completion[1].error
     durations = completion[1].value
-    validate_warmup_budget(durations, execution_config, info)
+    validate_warmup_budget(durations, execution_config, info, max_running_s=max_running_s)
     logger.info("Model warmup durations (not realtime bounds): %s", durations)
     if execution_config.execution_mode != "sync":
         import math
 
-        suggested = math.ceil(max(durations) / info.control_dt_s) + 1
+        suggested = math.ceil(max(durations["steady"]) / info.control_dt_s) + 1
         logger.info(
             "Model-only prefetch suggestion d=%d; measure owner prefix/input overhead separately",
             suggested,
@@ -103,11 +104,16 @@ def run_policy_deployment(
     from dexmani_real.deployment.inference import InferenceWorker
 
     info = policy_config.info
-    execution_config = (execution_config or runtime.execution).validate(info)
     cloud_recipe = validate_policy_runtime_compatibility(info, runtime)
-    validate_robot_config(runtime)
-    runtime = resolve_runtime_table(runtime, pointcloud=cloud_recipe)
     max_running_s = validate_max_running_s(max_running_s)
+    execution_config = (execution_config or runtime.execution).validate(
+        info, max_running_s=max_running_s
+    )
+    validate_robot_config(runtime)
+    runtime = replace(runtime, execution=execution_config)
+    if cloud_recipe is not None:
+        runtime = replace(runtime, pointcloud=cloud_recipe)
+    runtime = resolve_runtime_table(runtime, pointcloud=cloud_recipe)
     num_episodes = validate_num_episodes(num_episodes)
     if recording_config is not None and not execute:
         raise ValueError("recorded evaluation requires execute")
@@ -154,11 +160,25 @@ def run_policy_deployment(
         supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
         robot = DexManiRobot(shared, runtime, check_services=supervisor.check)
         model = InferenceWorker(lambda: _load_configured_policy(policy_config, execution_config))
-        _warmup_policy(model, runtime, info, execution_config)
+        _warmup_policy(model, runtime, info, execution_config, max_running_s=max_running_s)
+        logger.info(
+            "Validated policy: inputs=%s action=%s dt=%s N/H/A=%s/%s/%s mode=%s d=%s beta=%s recording=%s; "
+            "cadence/cloud recipe from saved Policy, physical configuration from Real",
+            info.observation_fields,
+            info.action_mode,
+            info.control_dt_s,
+            info.n_obs_steps,
+            info.horizon,
+            info.n_action_steps,
+            execution_config.execution_mode,
+            execution_config.prefetch_steps,
+            execution_config.rtc_guidance_cap,
+            recording_config is not None,
+        )
         kinematics = build_observation_kinematics(info, runtime)
         realizer = ActionRealizer.for_mode(runtime, info.action_mode)
         home_planner = build_home_planner(runtime) if execute else None
-        if save_run_config is not None:
+        if save_run_config is not None and recording_config is not None:
             save_run_config(runtime, execution_config)
         recorder = (
             AsyncEpisodeRecorder(
@@ -222,7 +242,11 @@ def run_policy_deployment(
             results=results,
         )
         runner.run()
-        clean = bool(shared.quit_requested.value)
+        clean = bool(
+            shared.quit_requested.value
+            and not shared.estop_request.value
+            and not shared.error_state.value
+        )
     except KeyboardInterrupt as exc:
         if shared is not None:
             shared.estop_request.value = True

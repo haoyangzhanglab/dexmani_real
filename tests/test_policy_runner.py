@@ -11,7 +11,12 @@ from dexmani_real.deployment.observation import decision_is_fresh, policy_source
 from dexmani_real.deployment.runner import PolicyRunner
 from dexmani_real.planning.kinematics.ik import IKFailureKind, IKResult
 from dexmani_real.robot.action import ActionRealization, ActionRealizer
-from dexmani_real.robot.robot import DispatchInterrupted, DispatchResult, DispatchStatus
+from dexmani_real.robot.robot import (
+    DispatchError,
+    DispatchInterrupted,
+    DispatchResult,
+    DispatchStatus,
+)
 from dexmani_real.runtime.observation import ObservationRow
 from dexmani_real.runtime.safety import RunEndReason, SafetyState, request_policy_stop
 
@@ -251,7 +256,8 @@ def test_wait_timeout_not_reset_by_invalid_results(make_runner):
     r.step()
     r.tick(2)
     r.tick(3)
-    r.tick(4)
+    with pytest.raises(TimeoutError, match="WAIT"):
+        r.tick(4)
     assert r.completed == 1 and r.run_id is None
     assert r.shared.run_ended_reason.value == RunEndReason.TIMEOUT
 
@@ -320,7 +326,9 @@ def test_end_reason_once(make_runner, reason, where):
 def test_unknown_dispatch_ends_reservation(make_runner):
     r = make_runner()
     r.robot.result = DispatchResult(DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED)
-    bootstrap(r)
+    with pytest.raises(DispatchError, match="not confirmed") as failure:
+        bootstrap(r)
+    assert failure.value.result == r.robot.result
     assert r.run_id is None and r.completed == 1 and r.plan is None
 
 
@@ -461,8 +469,10 @@ def test_decision_age_not_refreshed_by_new_feedback(make_runner):
 def test_missing_history_does_not_refresh_wait(make_runner):
     r = make_runner(wait=0.25)
     r._read_observation = lambda: None
-    for i in range(4):
+    for i in range(3):
         r.tick(i)
+    with pytest.raises(TimeoutError, match="WAIT"):
+        r.tick(3)
     assert r.completed == 1 and r.shared.run_ended_reason.value == RunEndReason.TIMEOUT
 
 
@@ -651,7 +661,11 @@ def test_dispatch_return_checks_total_budget(make_runner, budget, late):
         return result
 
     r.robot.send_action = delayed
-    bootstrap(r)
+    if late and budget == "wait":
+        with pytest.raises(TimeoutError, match="WAIT"):
+            bootstrap(r)
+    else:
+        bootstrap(r)
     assert len([entry for entry in rows if entry[0] is not None]) == 1
     assert rows[-1][1] == r.robot.result
     if late:
@@ -685,7 +699,8 @@ def test_late_return_preserves_already_latched_cause(make_runner, cause):
         with pytest.raises(DispatchInterrupted):
             bootstrap(r)
     else:
-        bootstrap(r)
+        with pytest.raises(TimeoutError, match="WAIT"):
+            bootstrap(r)
     assert r.shared.run_ended_reason.value == int(cause)
     assert r.completed == 1
 
@@ -718,7 +733,10 @@ def test_late_return_cleanup_records_once(make_runner, stop_fails, record_fails)
     with pytest.raises((TimeoutError, OSError)):
         bootstrap(r)
     assert rows == [r.robot.result]
-    assert saved == [dict(reason="timeout", details=[])]
+    assert len(saved) == 1 and saved[0]["reason"] == "timeout"
+    assert {e["stage"] for e in saved[0]["details"]} == ({"stop"} if stop_fails else set()) | (
+        {"recording"} if record_fails else set()
+    )
     assert r.completed == 1 and r.run_id is None
     assert len([e for e in r.events if e["event"] == "dispatch"]) == 1
 
@@ -745,12 +763,92 @@ def test_wait_deadline_between_real_sdk_calls(make_runner, monkeypatch, late_dev
     r._record = lambda row, command=None, result=None: (
         rows.append(result) if command is not None else None
     )
-    bootstrap(r)
+    with pytest.raises(TimeoutError, match="WAIT"):
+        bootstrap(r)
     assert len(rows) == 1
     assert (rows[0].arm, rows[0].hand) == expected
     assert calls == (["arm"] if late_device == "arm" else ["arm", "hand"])
     assert r.shared.run_ended_reason.value == int(RunEndReason.TIMEOUT)
     assert r.completed == 1 and r.run_id is None
+
+
+@pytest.mark.parametrize("mode", ["async", "rtc"])
+@pytest.mark.parametrize("limit", ["feedback", "decision", "duration_tie"])
+def test_native_dispatch_uses_original_action_deadline(make_runner, monkeypatch, mode, limit):
+    from dataclasses import replace
+
+    from test_review_remediation import fake_robot
+
+    robot, _, _ = fake_robot(monkeypatch)
+    r = make_runner(mode=mode, n=1)
+    robot.shared = r.shared
+    if limit == "feedback":
+        r.runtime.arm.feedback_max_age_s = 0.005
+    elif limit == "decision":
+        r.execution = replace(r.execution, max_decision_age_s=0.105)
+    else:
+        # Slot endpoint is inclusive, hence the extra ns in the SDK deadline.
+        r.max_running_s = 0.130000001
+
+    def arm(q):
+        r.clock.now += 40_000_000
+        return 0
+
+    robot.arm.servo = arm
+    r.robot.send_action = robot.send_action
+    with pytest.raises(DispatchError) as caught:
+        bootstrap(r)
+    assert caught.value.cause == "deadline_expired"
+    assert (caught.value.result.arm, caught.value.result.hand) == (1, 0)
+    event = next(e for e in r.events if e["event"] == "dispatch")
+    assert event["valid_until_ns"] == r.started_ns + (
+        130_000_001 if limit == "duration_tie" else 105_000_001
+    )
+    assert event["cause"] == "deadline_expired"
+    assert r.completed == 1 and r.robot.stops == 1
+
+
+@pytest.mark.parametrize("reason", [RunEndReason.OPERATOR, RunEndReason.QUIT])
+@pytest.mark.parametrize("evidence", ["current", "stale", "unexplained", "crc", "stop", "record"])
+def test_cancellation_requires_current_cause_and_clean_evidence(make_runner, reason, evidence):
+    r = make_runner()
+    result = DispatchResult(DispatchStatus.ACCEPTED, DispatchStatus.NOT_CALLED)
+    if evidence == "crc":
+        result = DispatchResult(DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED)
+
+    def send(command, **kwargs):
+        request_policy_stop(r.shared, reason=reason)
+        if evidence == "stale":
+            r.shared.run_ended_id.value -= 1
+        raise DispatchError(
+            "boundary",
+            result,
+            revoked=True,
+            cause=None if evidence == "unexplained" else "authority_revoked",
+        )
+
+    def fail(*args, **kwargs):
+        raise OSError("cleanup failed")
+
+    r.robot.send_action = send
+    if evidence == "stop":
+        r.robot.stop = fail
+    elif evidence == "record":
+        r._record = lambda row, command=None, result=None: fail() if command is not None else None
+    if evidence == "current":
+        bootstrap(r)
+    else:
+        with pytest.raises(OSError if evidence in {"stop", "record"} else DispatchError):
+            bootstrap(r)
+    assert r.completed == 1 and r.run_id is None
+
+
+def test_sync_crc_tolerance_is_unchanged(make_runner):
+    r = make_runner(mode="sync")
+    r.robot.result = DispatchResult(DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED)
+    bootstrap(r)
+    assert r.run_id == 1 and r.completed == 0 and r.wait_started_ns is None
+    assert not r.robot.stops
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
@@ -774,8 +872,9 @@ def test_late_return_writer_finalization_failure_keeps_dispatch_and_end(make_run
 
     r.robot.send_action = send
     r.recorder = NS(check_error=lambda: None, save_episode=save)
-    with pytest.raises(DispatchInterrupted if cancelled else RecordingError):
+    with pytest.raises(DispatchInterrupted if cancelled else TimeoutError) as failure:
         bootstrap(r)
+    assert isinstance(failure.value.__cause__, RecordingError)
     assert rows == [r.robot.result]
     events = r.events
     assert len([e for e in events if e["event"] == "dispatch"]) == 1
@@ -1310,6 +1409,9 @@ def test_owner_tick_saved_once_with_consistent_interval(timed_owner, case, durat
             match="Nonfinite" if case == "build_error" else f"{case.split('_')[0]} primary",
         ):
             r.run()
+    elif case in {"partial", "unconfirmed"}:
+        with pytest.raises(DispatchError, match="not confirmed"):
+            r.step()
     elif case in {"stop_error", "archive_error", "cancelled"}:
         with pytest.raises(DispatchInterrupted if case == "cancelled" else (RuntimeError, OSError)):
             r.step()
@@ -1426,3 +1528,463 @@ def test_required_tactile_diagnostic_is_local_and_throttled(
     assert r._submit([row, row], 0)
     assert not any(record.levelname == "WARNING" for record in caplog.records)
     assert set(r.model.submissions[-1][1][0]) == {"joint_state"}
+
+
+@pytest.mark.parametrize("mode", ["async", "rtc"])
+@pytest.mark.parametrize("recording", [True, False])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "crc",
+        "nan",
+        "inf",
+        "-inf",
+        "structure",
+        "wait",
+        "duration",
+        "tie",
+        "stop_error",
+        "slot",
+        "before_sdk",
+        "mode_restore",
+        "slot_before_duration",
+        "duration_partial",
+        "wait_partial",
+        "tie_partial",
+        "operator",
+        "quit",
+        "crc_operator",
+        "crc_duration",
+        "crc_cleanup",
+        "pending_stop_operator",
+        "record_operator",
+        "close_operator",
+        "rejected_operator",
+        "unknown_operator",
+        "estop",
+        "device_operator",
+        "accepted_late",
+    ],
+)
+def test_native_bridge_worker_runner_session_result(tmp_path, monkeypatch, recording, case, mode):
+    """Only hardware boundaries are replaced; bridge, worker, owner and archives are real."""
+    import json
+    import time
+    from pathlib import Path
+
+    import torch
+    from dexmani_policy.deployment.runtime import LoadedPolicy
+    from test_review_remediation import shared_state
+
+    from dexmani_real.config.experiment import ExperimentConfig
+    from dexmani_real.deployment import session
+    from dexmani_real.deployment.config import RolloutRecordingConfig
+    from dexmani_real.ipc.schema import ARM_STATE_DTYPE, HAND_STATE_DTYPE
+    from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
+
+    runtime = ExperimentConfig()
+    shared = shared_state()
+    shared.safety_state.value = int(SafetyState.DISARMED)
+    shared.start_request = NS(value=False)
+    clock = NS(now=1_000_000_000)
+    monkeypatch.setattr(time, "monotonic_ns", lambda: clock.now)
+    home = np.r_[runtime.arm.home_qpos, np.deg2rad(runtime.hand.home_qpos_deg)]
+    state = NS(
+        connected=False, frames=[], worker=None, runner=None, polls=0, starts=[], model_threads=[]
+    )
+    info = NS(
+        n_obs_steps=1,
+        n_action_steps=1,
+        horizon=3,
+        control_dt_s=0.1,
+        observation_fields=("joint_state",),
+        action_mode="joint",
+        inference_steps=1,
+    )
+
+    class Agent(torch.nn.Module):
+        consumed_observation_fields = ("joint_state",)
+
+        def predict_action(self, obs, **kwargs):
+            import threading
+
+            state.model_threads.append(threading.get_ident())
+            output = torch.tensor(home, dtype=torch.float64).repeat(1, 3, 1)
+            if state.connected:
+                if case in {"nan", "inf", "-inf"}:
+                    output[0, 0, 0] = float(case)
+                elif case == "structure":
+                    return {"pred_action": [object()]}
+            return {"pred_action": output}
+
+    def factory(*args):
+        return LoadedPolicy(Agent(), {"dataset": {}}, info, device="cpu", seed=7)
+
+    import threading
+
+    from dexmani_real.robot.robot import DexManiRobot
+
+    robot = DexManiRobot(shared, runtime)
+    robot.sent, robot.stops = [], 0
+    sdk_calls = []
+
+    def connect():
+        state.connected = robot._connected = True
+        robot._owner = threading.get_ident()
+
+    robot.connect = connect
+    robot.service_idle = lambda: None
+    native_send = robot.send_action
+    normal = case in {"duration", "duration_partial", "operator", "quit", "accepted_late"}
+
+    def cancel():
+        reason = RunEndReason.QUIT if case == "quit" else RunEndReason.OPERATOR
+        if case == "estop":
+            reason = RunEndReason.ESTOP
+            shared.estop_request.value = True
+        request_policy_stop(shared, reason=reason)
+
+    def arm(q):
+        sdk_calls.append("arm")
+        if case in {
+            "slot",
+            "slot_before_duration",
+            "duration_partial",
+            "wait_partial",
+            "tie_partial",
+        }:
+            clock.now += 40_000_000
+        if case in {
+            "operator",
+            "quit",
+            "stop_error",
+            "record_operator",
+            "close_operator",
+            "estop",
+            "device_operator",
+        }:
+            cancel()
+        if case == "device_operator":
+            raise OSError("actual SDK failure")
+        return 0
+
+    def hand(q):
+        sdk_calls.append("hand")
+        if case in {"wait", "duration", "tie", "crc_duration", "accepted_late"}:
+            clock.now += 40_000_000
+        if case in {"crc_operator", "rejected_operator", "unknown_operator", "crc_cleanup"}:
+            cancel()
+        return (
+            DispatchStatus.CRC_UNCONFIRMED
+            if case in {"crc", "crc_operator", "crc_duration", "crc_cleanup"}
+            else DispatchStatus.REJECTED
+            if case == "rejected_operator"
+            else DispatchStatus.UNKNOWN
+            if case == "unknown_operator"
+            else DispatchStatus.ACCEPTED
+        )
+
+    def restore():
+        sdk_calls.append("mode")
+        clock.now += 40_000_000
+
+    robot.arm = NS(is_connected=True, servo=arm, enter_mode6=restore)
+    robot.hand = NS(is_connected=True, send_action=hand)
+
+    def dispatch(command, **kwargs):
+        robot.sent.append(command)
+        if case == "before_sdk":
+            clock.now += 40_000_000
+        if case == "mode_restore":
+            robot._arm_stopped = True
+        if case == "pending_stop_operator":
+            robot._hand_stop_pending = True
+            cancel()
+        return native_send(command, **kwargs)
+
+    robot.send_action = dispatch
+
+    def stop():
+        robot.stops += 1
+        if case in {"stop_error", "crc_cleanup"}:
+            raise OSError("actual stop failure")
+        robot._motion_active = robot._hand_stop_pending = False
+
+    robot.stop = stop
+
+    def read(self):
+        arm, hand = np.zeros(1, ARM_STATE_DTYPE), np.zeros(1, HAND_STATE_DTYPE)
+        arm["timestamp_ns"] = hand["timestamp_ns"] = clock.now
+        arm["qpos"], hand["qpos"] = home[:7], home[7:]
+        camera = dict(
+            timestamp_ns=clock.now,
+            color_frame_number=1,
+            depth_frame_number=1,
+            rgb=np.zeros((16, 16, 3), "u1"),
+            depth=np.ones((16, 16), "u2"),
+        )
+        return ObservationRow(arm, hand, camera if recording else None, None, None, clock.now)
+
+    native_runner = session.PolicyRunner
+
+    def runner(*args, **kwargs):
+        owner = native_runner(*args, **kwargs)
+        state.worker, state.runner = kwargs["model_runtime"], owner
+        if case in {"record_operator", "crc_cleanup"}:
+            record = owner._record
+
+            def fail_record(row, command=None, result=None):
+                record(row, command, result)
+                if command is not None:
+                    raise OSError("actual recording failure")
+
+            owner._record = fail_record
+        return owner
+
+    class Operator:
+        home_results = []
+        keyboard = NS(start=lambda: None, healthy=True)
+
+        def __init__(self, *a, **kw):
+            pass
+
+        def poll(self):
+            state.polls += 1
+            assert state.polls < 2000, "session failed to terminate"
+            if state.runner.completed:
+                shared.quit_requested.value = True
+            if state.polls == 1:
+                shared.start_request.value = True
+            if state.worker.future is not None:
+                state.worker.future.result(timeout=5)
+            if case == "accepted_late" and robot.sent:
+                request_policy_stop(shared, reason=RunEndReason.QUIT)
+                shared.quit_requested.value = True
+            clock.now += 1_000_000
+
+    def shutdown(robot, supervisor, *, model, **kwargs):
+        model.close()
+        deadline = time.perf_counter() + 5
+        while not model.closed:
+            assert time.perf_counter() < deadline
+            time.sleep(0.001)
+        if case in {"close_operator", "crc_cleanup"}:
+            raise OSError("actual close failure")
+        return model.close_error is None
+
+    intrinsic = CameraIntrinsics(16, 16, 10.0, 10.0, 8.0, 8.0, "none", (0.0,) * 5)
+    geometry = RGBDGeometry(intrinsic, intrinsic, np.eye(4))
+    monkeypatch.setattr(
+        "dexmani_real.deployment.runner.snapshot_recording_metadata",
+        lambda *a, **k: dict(
+            collection_source="policy_rollout",
+            camera_geometry=geometry,
+            camera_T_xarm_base_from_color=None,
+            depth_scale=0.001,
+            handbase_position_eef_m=np.zeros(3),
+            handbase_quat_eef_wxyz=np.array([1.0, 0, 0, 0]),
+        ),
+    )
+    from dataclasses import replace
+
+    runtime = replace(runtime, camera=replace(runtime.camera, width=16, height=16))
+    monkeypatch.setattr(session.RuntimeChannels, "create", lambda **kw: shared)
+    monkeypatch.setattr(
+        session,
+        "RuntimeSupervisor",
+        lambda *a: NS(check=lambda: True, start=lambda sensors: state.starts.extend(sensors)),
+    )
+    monkeypatch.setattr(session, "DexManiRobot", lambda *a, **kw: robot)
+    monkeypatch.setattr(session, "_load_configured_policy", factory)
+    monkeypatch.setattr(session, "build_home_planner", lambda *a: object())
+    monkeypatch.setattr(session, "PolicyOperator", Operator)
+    monkeypatch.setattr(session, "PolicyRunner", runner)
+    monkeypatch.setattr(PolicyRunner, "_read_observation", read)
+    monkeypatch.setattr(session, "shutdown_local_runtime", shutdown)
+    monkeypatch.setattr(
+        session.ActionRealizer,
+        "for_mode",
+        lambda *a: ActionRealizer(
+            runtime,
+            collision_model=NS(set_hand_qpos=lambda q: None, check_self_collision=lambda q: False),
+        ),
+    )
+    # No Process.start is called; sensor lifecycle is the device boundary substitute.
+    output = tmp_path / "session"
+    budget = (
+        0.105
+        if case in {"duration", "tie", "duration_partial", "tie_partial", "crc_duration"}
+        else 0.135
+        if case == "slot_before_duration"
+        else 0.5
+    )
+    wait = 0.105 if case in {"wait", "tie", "wait_partial", "tie_partial"} else 1.0
+    execution = ExecutionConfig(mode, 1.0, wait, 0.03, 1, 0.0)
+    code = session.run_policy_deployment(
+        runtime,
+        NS(info=info),
+        True,
+        execution_config=execution,
+        max_running_s=budget,
+        num_episodes=1 if normal else 3,
+        recording_config=RolloutRecordingConfig(str(output), "synthetic") if recording else None,
+        save_run_config=lambda *a: state.frames.append("config"),
+    )
+    assert code == (0 if normal else 1)
+    assert state.runner.completed == 1 and state.runner.run_id is None
+    assert len(set(state.model_threads)) == 1
+    assert len(robot.sent) == (0 if case in {"nan", "inf", "-inf", "structure"} else 1)
+    assert len(state.starts) == int(recording)
+    assert state.frames == (["config"] if recording else [])
+    if not recording:
+        assert not output.exists()
+        return
+    result = json.loads((output / "session_result.json").read_text())
+    assert result["outcome"] == ("finished" if normal else "fault")
+    attempts = list((output / "attempts").glob("*.json"))
+    assert len(attempts) == 1
+    attempt = json.loads(attempts[0].read_text())
+    json.dumps(attempt, allow_nan=False)
+    assert len([e for e in attempt["trace"] if e["event"] == "end"]) == 1
+    if case in {"nan", "inf", "-inf"}:
+        with np.load(attempt["query_sidecar"], allow_pickle=False) as arrays:
+            assert len(arrays.files) == 1
+            value = arrays[arrays.files[0]]
+            assert value.dtype == np.float64 and value.shape == (3, 19)
+            assert np.isnan(value[0, 0]) if case == "nan" else value[0, 0] == float(case)
+    elif case == "structure":
+        with np.load(attempt["query_sidecar"], allow_pickle=False) as arrays:
+            assert arrays.files == []
+    else:
+        dispatches = [e for e in attempt["trace"] if e["event"] == "dispatch"]
+        expected = (
+            (0, 0)
+            if case in {"before_sdk", "mode_restore", "pending_stop_operator"}
+            else (4, 0)
+            if case == "device_operator"
+            else (1, 0)
+            if "hand" not in sdk_calls
+            else (1, 2)
+            if case in {"crc", "crc_operator", "crc_duration", "crc_cleanup"}
+            else (1, 3)
+            if case == "rejected_operator"
+            else (1, 4)
+            if case == "unknown_operator"
+            else (1, 1)
+        )
+        assert len(dispatches) == 1
+        assert (dispatches[0]["arm"], dispatches[0]["hand"]) == expected
+        if case == "pending_stop_operator":
+            assert dispatches[0]["cause"] == "stop_unconfirmed"
+        if case == "device_operator":
+            assert dispatches[0]["cause"] is None
+        if case in {
+            "slot",
+            "before_sdk",
+            "mode_restore",
+            "slot_before_duration",
+            "duration_partial",
+            "wait_partial",
+            "tie_partial",
+        }:
+            event = dispatches[0]
+            assert event["cause"] == "deadline_expired"
+            assert event["valid_until_ns"] == min(
+                event["action_deadline_ns"], event["budget_deadline_ns"]
+            )
+            assert event["start_ns"] + event["duration_ns"] >= event["valid_until_ns"]
+            if case == "slot_before_duration":
+                assert event["action_deadline_ns"] < event["budget_deadline_ns"]
+                assert attempt["termination_reason"] == "executor_boundary"
+        import h5py
+
+        with h5py.File(Path(attempt["raw_path"]) / "data.h5") as raw:
+            evidence = raw["dispatch_status"][:]
+            np.testing.assert_array_equal(
+                evidence[np.any(evidence != 0, axis=1)],
+                [expected] if any(expected) else np.empty((0, 2)),
+            )
+    if case in {"wait", "tie", "duration", "wait_partial", "tie_partial", "duration_partial"}:
+        assert attempt["termination_reason"] == "timeout"
+        assert ("duration" if case.startswith("duration") else "wait") in attempt[
+            "termination_details"
+        ]
+    if "operator" in case or case in {"stop_error", "quit", "estop", "crc_cleanup"}:
+        assert attempt["termination_reason"] == (case if case in {"quit", "estop"} else "operator")
+    if case in {"stop_error", "record_operator"}:
+        assert attempt["finalization_errors"][0]["stage"] == (
+            "stop" if case == "stop_error" else "recording"
+        )
+    if case == "crc_cleanup":
+        assert [e["stage"] for e in attempt["finalization_errors"]] == ["stop", "recording"]
+        assert {e["stage"] for e in result["artifact_errors"]} == {"stop", "recording", "shutdown"}
+        assert "motion authority revoked" in result["reason"]
+    assert attempt["recording_status"] == "published"
+    assert Path(attempt["raw_path"]).is_dir()
+
+
+def test_r2_legal_query_phase_inclusive_age_and_bootstrap_grid(make_runner):
+    r = make_runner(n=1)
+    r.execution = ExecutionConfig("async", 0.37, 1.0, 0.03, 2).validate(r.policy_info)
+    r.tick(0, extra=30_000_000)
+    r.clock.now += 10_000_000
+    r.model.complete(future(r))
+    r.step()
+    r.tick(1)
+    r.tick(2, extra=30_000_000)
+    r.clock.now += 10_000_000
+    r.model.complete(future(r, 0.05))
+    r.step()
+    for slot in range(3, 7):
+        r.tick(slot)
+    assert len(r.robot.sent) == 6
+    np.testing.assert_allclose(r.robot.sent[-1].arm_qpos, 0.09)
+    assert r.plan.sources["joint_state"][0] == r.started_ns + 230_000_000
+    # 600 - 230 = 370 ms: the freshness endpoint is inclusive.
+    assert r.clock.now - r.plan.sources["joint_state"][0] == 370_000_000
+
+    other = make_runner(n=1, mode="sync")
+    other.tick(0)
+    other.clock.now += 100_000_000
+    other.model.complete(future(other))
+    other.step()
+    assert other.query.handoff_slot == 2 and not other.robot.sent
+    other.tick(2)
+    assert len(other.robot.sent) == 1
+
+
+@pytest.mark.parametrize("stage", ["observation", "build", "record"])
+def test_wait_expiry_during_tick_finishes_before_next_operator_poll(
+    make_runner, monkeypatch, stage
+):
+    from dexmani_real.deployment import runner as module
+
+    r = make_runner(n=1, mode="sync", wait=0.15)
+    if stage == "observation":
+        read = r._read_observation
+
+        def slow_read():
+            r.clock.now += 160_000_000
+            return read()
+
+        r._read_observation = slow_read
+    elif stage == "build":
+        build = module.build_policy_observation
+
+        def slow_build(*args, **kwargs):
+            r.clock.now += 160_000_000
+            return build(*args, **kwargs)
+
+        monkeypatch.setattr(module, "build_policy_observation", slow_build)
+    else:
+
+        def slow_record(*args):
+            r.clock.now += 160_000_000
+
+        r._record = slow_record
+    with pytest.raises(TimeoutError, match="WAIT"):
+        r.tick(0)
+    assert r.run_id is None and r.completed == 1
+    assert r.shared.run_ended_reason.value == RunEndReason.TIMEOUT
+    assert not r.robot.sent
+    assert len([e for e in r.events if e["event"] == "end"]) == 1

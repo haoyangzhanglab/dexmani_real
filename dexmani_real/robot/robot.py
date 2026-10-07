@@ -53,10 +53,11 @@ class DispatchResult:
 
 
 class DispatchError(RuntimeError):
-    def __init__(self, message, result, *, revoked=False):
+    def __init__(self, message, result, *, revoked=False, cause=None):
         super().__init__(message)
         self.result = result
         self.revoked = revoked
+        self.cause = cause
 
 
 class DispatchInterrupted(KeyboardInterrupt):
@@ -260,7 +261,12 @@ class DexManiRobot:
         result = DispatchResult()
         try:
             if self._hand_stop_pending:
-                raise DispatchError("previous XHand stop remains unconfirmed", result, revoked=True)
+                raise DispatchError(
+                    "previous XHand stop remains unconfirmed",
+                    result,
+                    revoked=True,
+                    cause="stop_unconfirmed",
+                )
             # All present targets are checked before either SDK sees a target.
             for name in ("arm", "hand"):
                 target = getattr(command, f"{name}_qpos")
@@ -289,19 +295,29 @@ class DexManiRobot:
                 if target is None:
                     continue
                 if not self._authorized(command, state):
-                    raise DispatchError("motion authority revoked", result, revoked=True)
+                    raise DispatchError(
+                        "motion authority revoked", result, revoked=True, cause="authority_revoked"
+                    )
                 if time.monotonic_ns() >= valid_until_ns:
-                    raise DispatchError("dispatch deadline expired", result, revoked=True)
+                    raise DispatchError(
+                        "dispatch deadline expired", result, revoked=True, cause="deadline_expired"
+                    )
                 if name == "arm" and self._arm_stopped:
                     self.arm.enter_mode6()
                     self._arm_stopped = False
                     if not self._authorized(command, state):
                         raise DispatchError(
-                            "motion authority revoked after mode restoration", result, revoked=True
+                            "motion authority revoked after mode restoration",
+                            result,
+                            revoked=True,
+                            cause="authority_revoked",
                         )
                     if time.monotonic_ns() >= valid_until_ns:
                         raise DispatchError(
-                            "dispatch deadline expired after mode restoration", result, revoked=True
+                            "dispatch deadline expired after mode restoration",
+                            result,
+                            revoked=True,
+                            cause="deadline_expired",
                         )
                 # From here, an exception cannot prove that nothing reached the device.
                 result = replace(result, **{name: DispatchStatus.UNKNOWN})
@@ -318,14 +334,22 @@ class DexManiRobot:
                     raise DispatchError(f"{name} SDK rejected target", result)
             if not self._authorized(command, state):
                 raise DispatchError(
-                    "motion authority revoked during dispatch", result, revoked=True
+                    "motion authority revoked during dispatch",
+                    result,
+                    revoked=True,
+                    cause="authority_revoked",
                 )
             return replace(result, timestamp_ns=time.monotonic_ns())
         except KeyboardInterrupt as exc:
             raise DispatchInterrupted(replace(result, timestamp_ns=time.monotonic_ns())) from exc
         except Exception as exc:
             result = replace(result, timestamp_ns=time.monotonic_ns())
-            raise DispatchError(str(exc), result, revoked=getattr(exc, "revoked", False)) from exc
+            raise DispatchError(
+                str(exc),
+                result,
+                revoked=getattr(exc, "revoked", False),
+                cause=getattr(exc, "cause", None),
+            ) from exc
 
     def send_action(self, command, *, valid_until_ns):
         return self._send(command, SafetyState.RUNNING, valid_until_ns=valid_until_ns)
@@ -339,7 +363,10 @@ class DexManiRobot:
         self._check_owner()
         if self._hand_stop_pending:
             raise DispatchError(
-                "previous XHand stop remains unconfirmed", DispatchResult(), revoked=True
+                "previous XHand stop remains unconfirmed",
+                DispatchResult(),
+                revoked=True,
+                cause="stop_unconfirmed",
             )
 
         def check_abort():

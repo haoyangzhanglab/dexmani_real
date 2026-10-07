@@ -6,17 +6,17 @@
 
 入口为 `examples/run_policy.py`。模式从 YAML `execution.execution_mode` 读取，默认 sync，CLI `--execution-mode` 可覆盖；async 使用原采样器，rtc 使用前缀条件化 DDIM。三者使用相同的实际控制采样网格。模型观察步数 N、完整 horizon H、执行长度 A 和 dt 来自保存配置；可用 `--n-action-steps` 覆盖 A，P=H-N+1。
 
-必须由实验者通过 YAML `execution.max_decision_age_s/max_wait_s/max_tick_lateness_s` 或对应 CLI `--max-decision-age/--max-wait/--max-tick-lateness` 指定预算（秒），均为有限正数；优先级 CLI > YAML > 默认，默认预算为空。前者限制 query 各实际输入源的年龄，第二项限制无可执行计划的等待，第三项定义单槽允许的 owner 迟到量且必须小于 dt。它们与 episode 的 `--max-duration` 是不同预算，没有预设硬件安全值。
+必须由实验者通过 YAML `execution.max_decision_age_s/max_wait_s/max_tick_lateness_s` 或对应 CLI `--max-decision-age/--max-wait/--max-tick-lateness` 指定预算（秒），decision age/WAIT 为有限正数，tick lateness 为有限非负数；优先级 CLI > YAML > 默认，默认预算为空。前者限制 query 各实际输入源的年龄，第二项限制无可执行计划的等待，第三项定义单槽允许的 owner 迟到量且必须小于 dt。它们与 episode 的 `--max-duration` 是不同预算，没有预设硬件安全值。
 
 async/rtc 还要求 `execution.prefetch_steps` 或 CLI `--prefetch-steps d`，满足 1≤d≤A、A+d≤P。rtc 要求 `execution.rtc_guidance_cap` 或 CLI `--rtc-guidance-cap beta`，beta 有限且非负；beta=0 对应原采样分支。sync 的动作窗口要求为 1≤A≤P。
 
-当前核对的相邻 Policy `52d1d2a` 在 beta=0 时不构造 warmup prefix，并将本次 warmup 的 delay 改为 0。它未预热请求的正 delay 路径，不能据此确认 RTC 预热覆盖；正 guidance、零 delay 的软前缀路径仍保留。Real 继续传入配置的 delay，不自动更改 beta、delay 或模式。
+worker 先加载并配置模型，再独立调用 `warmup()`，分别报告 bootstrap 普通路径与 steady 路径。每条不同路径先初始化一次，再测量；正 guidance RTC 使用一次生成的有限 prefix 和配置 delay，sync/async/beta=0 复用普通测量。预热前后 reset，额外预热不改变相同 seed 的首次真实推理。
 
-决策年龄预算还须大于 sync 的 `(A-1)dt` 或 async/rtc 的 `(A+d-1)dt`；这些只是动作段可容纳的必要条件，实际 query 来源年龄仍逐次检查。
+启动检查与运行时使用相同整数纳秒网格：令 Δ=dt_ns、L=迟到预算，首次动作等待至少 NΔ，WAIT 与有限运行时长必须严格大于它；bootstrap 段末年龄至少 AΔ−L，async/RTC 稳态段末至少 (A+d−1)Δ−L。年龄预算等于下界允许通过，实际 query 来源年龄仍逐次检查。
 
 sync/async 保留原模型支持范围；rtc 当前接入连续动作 BaseAgent + DDIM（DP/DP3/R3D 路径），支持 joint19、joint+aux EE 和 EEF21。SAT、DQRise、flow 等其他路径会明确拒绝 RTC。启动前 worker 会使用实际加载模型测试选定推理路径；支持 input VJP、保存的 affine action normalizer、diffusers 0.27.2、eta=0 是 RTC 前提。Gaussian action normalization 与 clip_sample=True 的既有拒绝规则仍保留。
 
-加载与 warmup 在连接设备前完成。warmup 包含输入预处理、选定采样路径（RTC guidance 启用时含 VJP）和 CPU 返回；它报告模型路径的时间，并为 async/rtc 给出建议 d，不自动修改配置。实测耗时达到 WAIT 或预取预算时拒绝启动；sync 还检查推理耗时加后续 A-1 槽能否落在决策年龄预算内。真实前缀准备和采样开销另由 owner 事件测量，合成 warmup 不能证明总时延上界。运行中准备超过当前槽的迟到容限使预约失效，EEF 的 d 步 IK 也必须在这一预算内完成，不自动分槽。
+加载与 warmup 在连接设备前完成。warmup 包含输入预处理、选定采样路径（RTC guidance 启用时含 VJP）和 CPU 返回；它报告模型路径的时间，并为 async/rtc 给出建议 d，不自动修改配置。对普通测量 I，k=floor(I/Δ)+1，首次等待下界为 (N−1+k)Δ，bootstrap 段末年龄下界为 max(I,kΔ−L)+(A−1)Δ。steady 样本 I>dΔ+L 才因无法赶上 handoff 截止而拒绝；I<dΔ 只是余量建议。静态不可能、当前样本不可容纳和建议余量不足分别报告，不自动改变 d、L 或模式。真实前缀准备和采样开销另由 owner 事件测量，合成 warmup 不能证明总时延上界。运行中准备超过当前槽的迟到容限使预约失效，EEF 的 d 步 IK 也必须在这一预算内完成，不自动分槽。
 
 连接不采集触觉 bias。T 表示操作者确认当前无接触，仅在 ARMED、空闲且无录制、模型复位或待完成推理时执行；S/Q/ESC 可取消，且不追加运动。HOME 准入要求会话仍运行、ARMED，且无停止、退出、故障或 estop 请求。待处理 S 由设备 owner 的停止/空闲路径消费，HOME 不清除它；停止处理完成后需重新按 H。
 
@@ -24,13 +24,31 @@ HOME 一旦进入处理，即使返回未完成，也会忽略同批后续 H/B/T
 
 一个 session 固定使用启动时选择的模式；切换 sync/async/rtc 需关闭当前 session 后重新启动。每次接纳开始请求仍由串行 worker 执行 episode reset。
 
+当前 MultiTask/text-conditioned 真机入口不支持任务选择与 child 数值配方恢复，连接前明确拒绝；这不限制 Policy 多任务训练或仿真。Dataset 声明必须与实际模型消费字段相等，存储的辅助字段不自动成为传感器门槛。保存点云配方必须完整，用户部分 YAML 仍可覆盖默认值。
+
+`--print-config` 仅打印声明 Real 配置，不加载模型、标定或设备。活动 runtime 在 session 中合并 execution 覆盖及保存 cloud 配方，再构造 worker 和保存 run_config。`policy.recording_enabled/max_record_duration_s` 属于 teleop，部署由 `--no-record/--max-duration` 控制；`policy.ema` 不是模型 EMA 权重选择，也不自动启用策略平滑；`teleop.control_hz` 不覆盖模型 dt。sync 的 d/beta 不参与执行。
+
+| 路径 | 当前保护范围 |
+| --- | --- |
+| joint 在线 | operational joint limits、相邻命令 jump、当前反馈距离、机器人端点自碰撞；不经过 IK |
+| EEF 在线 | workspace 裁剪、候选 IK 的限位/jump/反馈距离与端点自碰撞；冻结目标仍按最新反馈复查 |
+| HOME | 当前环境下的路径、workspace、桌面及静态障碍物检查，随后执行与收敛检查 |
+
+在线检查不承诺连续轨迹或环境避碰；存在 environment 配置不表示在线自动应用 HOME 的保护。允许接触规则、标称资产和现场 mount 保持当前配置。
+
+停止后的 Mode 6 恢复仍由设备 owner 在原路径执行。本轮没有足够固件证据证明提前恢复不会复活旧目标，因此不移动恢复位置；fake SDK 只能验证调用顺序。EEF prefix 的 d 次 IK 仍在同一槽内事务性完成，未测得其真机耗时；不引入线程池、跨槽补发或取消冻结复查。
+
 ## 调度与停止
 
 首次无计划查询使用原采样器，结果准入后在下一个正常槽 b 将 future[0] 重锚定，保留原 query 来源时间。推理期间未执行的动作头不会被裁掉。
 
 async/rtc 在 b+A-d 预取，在 b+A 交接；此后每 A 槽重复。query 槽 q 冻结 q…q+d-1 的目标，交接从结果索引 d 开始。提前完成也等待预约，迟到、owner 漏槽或过期结果均失效。槽内顺序是实际观测与授权检查、结果回收/接管、冻结与提交、实际发送。不会先发送再错误标记前缀起点。
 
-WAIT 从需要动作却没有计划时计时，历史不足、旧 Future 回收、bootstrap、无效重试都不能刷新 deadline。派发返回后，owner 先检查 episode 和仍适用的 WAIT 总预算；只有预算内成功发送或明确非下发模式的逻辑 consume 才清除 WAIT。总预算超时则按 TIMEOUT 撤权、尽力 stop、记录一次真实派发结果后结束，不能再发送下一动作；已锁存的当前 run 首因仍优先。
+WAIT 从需要动作却没有计划时计时，历史不足、旧 Future 回收、bootstrap、无效重试都不能刷新 deadline。派发返回后，owner 先检查 episode 和仍适用的 WAIT 总预算；只有预算内成功发送或明确非下发模式的逻辑 consume 才清除 WAIT。总预算超时则按 TIMEOUT 撤权、尽力 stop、记录一次真实派发结果后结束，不能再发送下一动作；已锁存的当前 run 首因仍优先。更早的 WAIT/duration 截止决定到期来源，同刻按 WAIT 技术失败处理；正常 duration 到期可正常退出。严格分块未确认下发与 WAIT 技术失败在归档后向 session/CLI 传播非零结果，不自动开始下一 episode。实际 stop、录制及关闭错误也会令 session fault，不能被首因锁存吞掉。
+
+下发异常用 `DispatchError.cause` 区分实际授权撤销（`authority_revoked`）、SDK 前或模式恢复后的截止拒绝（`deadline_expired`）和前次停止未确认（`stop_unconfirmed`）；其他设备异常为 null。`revoked` 保持原语义，不能单独据此判定正常取消。只有明确撤权、首因属于当前 run 的 OPERATOR/QUIT、实际 dispatch 仅含 ACCEPTED/NOT_CALLED 且没有独立技术错误，才允许正常结束。ESTOP、CRC/REJECTED/UNKNOWN、停止未确认、设备和收尾错误仍传播失败；sync 无异常时原有 CRC 容忍保持不变。
+
+owner 保存本次下发前的总预算来源及截止、动作准入截止和最终 `valid_until_ns`。async/rtc 因槽、反馈或 decision-age 截止拒绝时，先撤权、stop、记录真实部分结果并归档，再向 Session/CLI 传播 `DispatchError`。返回时 duration 已过期不能掩盖更早的动作截止；只有 duration 严格早于动作截止并实际约束本次调用、且无独立故障时才正常结束。WAIT 与 duration 同刻仍为 WAIT 技术失败。完整 ACCEPTED 的迟返回不追溯改写派发状态；总预算仍按原规则检查。dispatch trace 保存上述截止证据、异常类型和 cause，首因与附加清理错误分别保留，不增加第二套结果状态。
 
 交接失败后不能继续旧 tail，也不能在忙碌 worker 后排入新 observation。漏槽清空连续历史，不补造采样、不追赶连发。相机低帧率重复源帧只在现有 freshness 条件内有效。
 
@@ -52,7 +70,7 @@ WAIT 表示没有新策略目标，设备仍可能追踪上一个目标。停止
 
 Raw 保存 attempted targets、measured state、dispatch、辅助 NaN 和结束详情。rollout 的 execution_path 为 `worker_grid_<mode>_v1`。`run_config.yaml` 保存两仓库 SHA、checkpoint/weights/seed/NFE、模式、模型长度、实际解析的 runtime 和实验预算。完整 trace 保存在 `attempts/<id>.json`，记录 query/交接/dispatch/失效/结束事件及停止失败，Raw 不另存 trace 副本。历史 Raw 保持原样。
 
-记录式 policy evaluation 在 Raw 外保存 `session_result.json`、`attempts/<id>.json` 和 query NPZ。开始请求通过前置检查后、授予 RUNNING 前写 incomplete，阻塞 I/O 完成后重新检查起始观测再授权；取消的 prepared attempt 不消耗运行次数。崩溃留下的 incomplete/entered_running=null 表示未知。无 recording_config 的直接 policy API 不产生持久化结果。
+记录式 policy evaluation 在 Raw 外保存 `session_result.json`、`attempts/<id>.json` 和 query NPZ。开始请求通过前置检查后、授予 RUNNING 前写 incomplete，阻塞 I/O 完成后重新检查起始观测再授权；取消的 prepared attempt 不消耗运行次数。崩溃留下的 incomplete/entered_running=null 表示未知。CLI `--no-record` 与无 recording_config 的直接 API 使用同一执行器，不创建 recorder、Raw、session/attempt、query NPZ 或 run_config。模型需要 RGB/cloud 时仍启用来源；仅关节输入且不录制时不启动相机。默认录制仍要求 Raw RGB-D。`--no-record` 是实际执行，不是离线模式。
 
 收尾顺序为撤权、尝试 stop、recorder finalize、query sidecar、attempt 终态；只有 recorder 返回实际发布路径才标记 Raw published。query trace 关联窗口来源、selected target 和逐设备 dispatch；预测数组保存在 NPZ。`record_submitted` 只在队列接收成功后记录零起始 `raw_row_index` 与 slot，二者不可互换；`row_count` 是 writer 完成的行数，只有 published Raw 才是已发布行。零行、未下发 target、partial/unknown/CRC 和发布失败证据继续保留。直接构造 runner 时需显式传入 realizer；录制时 recorder/config/results 必须归属同一目录。
 
@@ -68,7 +86,7 @@ Raw 保存 attempted targets、measured state、dispatch、辅助 NaN 和结束�
 
 owner 在归档前冻结 trace；recorder 向 writer 队列提交结束消息前深拷贝结束详情，writer 排空有效帧后对 Raw 结束详情执行严格 JSON 编码。快照或编码失败会锁存错误、保留 staging，并由 writer 关闭资源；重复 close 报告已锁存错误，不重新准备元数据。真正阻塞的原生 I/O 仍可能超过等待预算，owner 不跨线程强关句柄。发布后的资源回收故障通过会话结果与日志表达，不回写已发布 Raw。
 
-Policy 主 Dataset 按实际使用的输入与监督检查窗口有限性，Real canonical 额外要求两设备 ACCEPTED dispatch。观察检查前 N 源行，监督检查完整 H；保持原 padding、episode 边界、loss 权重和时间语义。normalizer 仅拟合有效训练窗口引用的去重源行，验证使用训练统计。checkpoint 部署及恢复读取保存的统计，不重拟合；数据配方变化不能作为旧配方的精确续训，历史复现使用原源码版本。数学和数据筛选细节见相邻 `dexmani_policy` 仓库的 `docs/rtc.md`。
+Policy 主 Dataset 按实际使用的输入与监督检查窗口有限性，Real canonical 额外要求两设备 ACCEPTED dispatch。观察检查前 N 源行，监督检查完整 H；保持原 padding、episode 边界、loss 权重和时间语义。normalizer 仅拟合有效训练窗口引用的去重源行，验证使用训练统计。checkpoint 部署及恢复读取保存的统计，不重拟合；数据配方变化不能作为旧配方的精确续训，历史复现使用原源码版本。新 Real 训练还默认以 `dataset.max_time_gap_ratio=1.5` 筛选时间连续窗口；显式 null 记录 unfiltered。未知或非正时间即使在 H=1 中也不合格；padding 重复同一源行不产生零间隔。规则与统计写入 data_recipe；恢复先解析保存规则，已知旧缺键保持旧无筛选样本与表示，不回写历史产物。数学和数据筛选细节见相邻 `dexmani_policy` 仓库的 `docs/rtc.md`。
 
 Replay 报告中的 arm `mean_joint_rmse_deg` 是逐关节 RMSE 的平均，hand `pooled_rmse_deg` 是所有帧和关节平方误差的共同均值开方，两者口径不同；历史结果不改写。
 
@@ -84,6 +102,6 @@ ruff check dexmani_real examples tests
 git diff --check
 ```
 
-Real 测试覆盖生产调度、公共 FK/IK、源帧缓存、IPC、HOME/TARE 批次隔离、即时取消、配置可空字段和临时目录中的真实 Raw writer，并检查终止 tick 在实际保存的 attempt 中的归属和计时。跨仓 RTC 桥接使用相邻 Policy 的 `tests/test_policy_rtc.py`，其中包含 DDIM 和 backbone input VJP 检查；其零 guidance warmup 用例目前断言无前缀路径，不能作为正 delay 前缀路径的验收。训练、恢复和 Dataset 的完整验证按 Policy 仓库说明执行。fake device 不等于真机集成；小型离线数据贯通命令见 [复现入口](reproduction.md)。
+Real 测试覆盖生产调度、公共 FK/IK、源帧缓存、IPC、HOME/TARE 批次隔离、即时取消、配置可空字段和临时目录中的真实 Raw writer，并检查终止 tick 在实际保存的 attempt 中的归属和计时。跨仓 RTC 桥接使用相邻 Policy 的 `tests/test_policy_rtc.py`，其中包含 DDIM、backbone input VJP、bootstrap/steady 预热及 reset 检查。Real 的 `test_native_bridge_worker_runner_session_result` 保留实际 LoadedPolicy、串行 worker、Runner、Session 和归档，仅替换硬件边界。训练、恢复和 Dataset 的完整验证按 Policy 仓库说明执行。fake device 不等于真机集成；小型离线数据贯通命令见 [复现入口](reproduction.md)。
 
 对照 sync/async/rtc 时固定权重、观察协议、A、NFE、seed 和预算，async 与 rtc 固定相同 d。记录成功率、任务时间、decision age、handoff miss、owner tick、前缀准备时间及接缝变化。当前 sync 在推理期间继续采样；比较历史同步结果时，应固定其源码版本并标注观察时间协议差异。GPU/真实权重时延、闭环收益、物理安全须单独验证。
