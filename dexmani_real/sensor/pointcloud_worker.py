@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
-from dexmani_real.config.experiment import resolve_table_plane
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.ipc.schema import (
     make_pointcloud_frame_dtype,
@@ -29,7 +28,6 @@ from dexmani_real.utils.geometry import validate_rigid_transform
 from dexmani_real.utils.log import get_logger
 
 if TYPE_CHECKING:
-    from dexmani_real.config.experiment import ExperimentConfig
     from dexmani_real.ipc.channels import RuntimeChannels
 
 logger = get_logger(__name__)
@@ -41,7 +39,7 @@ _IDLE_POLL_S = 0.001
 class PointCloudWorkerConfig:
     """Resolved processing policy for the realtime worker.
 
-    Each cloud keeps its camera sequence and acquisition time. Consumers
+    Each cloud keeps its camera sequence and host source timestamp. Consumers
     check cloud freshness; only joint RGB/cloud consumers retrieve the matching
     RGB-D sample. Published clouds are otherwise self-contained.
     """
@@ -53,6 +51,7 @@ class PointCloudWorkerConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.pointcloud, PointCloudConfig):
             raise TypeError("pointcloud must be a PointCloudConfig")
+        self.pointcloud.validate()
         if not isinstance(self.camera_calibration, CameraExtrinsics):
             raise TypeError("camera_calibration must be a preloaded CameraExtrinsics snapshot")
         if not self.pointcloud.remove_table:
@@ -68,33 +67,11 @@ class PointCloudWorkerConfig:
                 raise ValueError("table_plane_abcd normal must point upward")
             object.__setattr__(self, "table_plane_abcd", plane)
 
-    @classmethod
-    def from_runtime(
-        cls,
-        runtime: "ExperimentConfig",
-        *,
-        pointcloud: PointCloudConfig,
-        camera_calibration: CameraExtrinsics,
-    ) -> "PointCloudWorkerConfig":
-        table = runtime.environment.table
-        return cls(
-            pointcloud=pointcloud,
-            camera_calibration=camera_calibration,
-            table_plane_abcd=resolve_table_plane(table) if pointcloud.remove_table else None,
-        )
-
-
-def _shared_text(value: object) -> str:
-    payload = getattr(value, "value", b"")
-    if isinstance(payload, bytes):
-        return payload.split(b"\x00", 1)[0].decode("utf-8")
-    return str(payload).split("\x00", 1)[0]
-
 
 def _resolve_base_from_color(
     shared: "RuntimeChannels", calibration: CameraExtrinsics
 ) -> np.ndarray:
-    serial = _shared_text(shared.camera_serial).strip()
+    serial = shared.camera_serial.value.decode("utf-8").strip()
     if not serial:
         raise RuntimeError("camera did not publish a serial for point-cloud calibration")
     camera_name = calibration.resolve_name_by_serial(serial)
@@ -119,7 +96,7 @@ def _load_static_inputs(
         if not shared.camera_ready.is_set():
             time.sleep(_IDLE_POLL_S)
             continue
-        geometry_text = _shared_text(shared.camera_geometry).strip()
+        geometry_text = shared.camera_geometry.value.decode("utf-8").strip()
         depth_scale_m = float(shared.camera_depth_scale.value)
         if not geometry_text or not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
             time.sleep(_IDLE_POLL_S)
@@ -139,6 +116,8 @@ def run_pointcloud_worker(shared: "RuntimeChannels", config: PointCloudWorkerCon
     """Consume only the newest camera sequence and publish fixed ``[N,6]`` clouds."""
     if not isinstance(config, PointCloudWorkerConfig):
         raise TypeError("run_pointcloud_worker requires a PointCloudWorkerConfig")
+    if shared.camera_ring is None or shared.pointcloud_ring is None:
+        raise ValueError("cloud worker requires camera and pointcloud rings")
     cfg = config
     expected_dtype = make_pointcloud_frame_dtype(cfg.pointcloud.num_points)
     if shared.pointcloud_ring.dtype != expected_dtype:

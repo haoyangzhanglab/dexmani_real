@@ -1,8 +1,6 @@
 import json
 import threading
 import time
-from dataclasses import asdict
-from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -41,12 +39,8 @@ def start_recording(tmp_path):
     return recorder
 
 
-def test_actual_raw_writer_preserves_mode_trace_and_missing_auxiliary(tmp_path):
+def test_actual_raw_writer_preserves_mode_and_missing_auxiliary(tmp_path):
     recorder = start_recording(tmp_path)
-    recorder.policy_trace = {
-        "execute": True,
-        "events": [{"event": "end", "reason": "operator", "detail": "after_predict"}],
-    }
     saved = recorder.save_episode(reason="operator")
     recorder.close()
     from dexmani_real.recording.storage.reader import EpisodeReader
@@ -58,7 +52,7 @@ def test_actual_raw_writer_preserves_mode_trace_and_missing_auxiliary(tmp_path):
         meta = raw["meta"]
         assert meta.attrs["execution_path"] == "worker_grid_rtc_v1"
         assert meta.attrs["termination_reason"] == "operator"
-        assert json.loads(meta["policy_trace"][()])["events"][0]["detail"] == "after_predict"
+        assert "policy_trace" not in meta
     with h5py.File(saved / "data.h5") as raw:
         assert np.isnan(raw["hand_contact"][:]).all()
         np.testing.assert_array_equal(raw["dispatch_status"][:], [[1, 1]])
@@ -78,7 +72,7 @@ def test_teleop_operator_stop_evidence_saved_by_native_writer(tmp_path, stop_fai
     runner.control_run_id = 1
     runner.pending_termination_reason = None
     runner.termination_details = []
-    runner.controller = None
+    runner.controller = NS(clear_reference=lambda: None)
     runner.recorder = start_recording(tmp_path)
 
     def stop():
@@ -151,7 +145,7 @@ def test_teleop_run_finally_saves_stop_failure(tmp_path, operator, reason):
     runner.control_run_id = 1
     runner.pending_termination_reason = None
     runner.termination_details = []
-    runner.controller = None
+    runner.controller = NS(clear_reference=lambda: None)
     runner.recorder = start_recording(tmp_path)
     runner.active, runner.paused, runner.quit_pending = True, False, False
     runner.next_tick = 0
@@ -184,20 +178,17 @@ def test_teleop_run_finally_saves_stop_failure(tmp_path, operator, reason):
         assert len(raw["dispatch_status"]) == 1
 
 
-def test_writer_receives_frozen_termination_and_policy_trace(tmp_path, monkeypatch):
+def test_writer_receives_frozen_termination(tmp_path, monkeypatch):
     from dexmani_real.recording import recorder as module
 
     recorder = start_recording(tmp_path)
     details = [dict(stage="pause_stop", exception_type="TimeoutError", message="STOP_TIMEOUT")]
-    trace = {"events": [{"event": "end", "reason": "operator"}]}
-    recorder.policy_trace = trace
     put = recorder._queue.put_nowait
 
     def submit(item):
         if item is module._STOP:
             # Simulate caller-owned state changing before the writer consumes STOP.
             details[0]["message"] = "mutated"
-            trace["events"].clear()
         return put(item)
 
     monkeypatch.setattr(recorder._queue, "put_nowait", submit)
@@ -205,16 +196,13 @@ def test_writer_receives_frozen_termination_and_policy_trace(tmp_path, monkeypat
     with h5py.File(saved / "data.h5") as raw:
         assert raw["meta"].attrs["termination_reason"] == "operator"
         assert json.loads(raw["meta/termination_details"][()])[0]["message"] == "STOP_TIMEOUT"
-        assert len(json.loads(raw["meta/policy_trace"][()])["events"]) == 1
+        assert "policy_trace" not in raw["meta"]
 
 
-@pytest.mark.parametrize(
-    "failure", ["trace_type", "trace_nan", "details_type", "details_nan", "copy", "interrupt"]
-)
+@pytest.mark.parametrize("failure", ["details_type", "details_nan", "copy", "interrupt"])
 def test_final_metadata_failure_drains_native_writer(tmp_path, monkeypatch, failure):
     import av
 
-    from dexmani_real.deployment.config import ExecutionConfig
     from dexmani_real.recording import recorder as module
 
     entered, release = threading.Event(), threading.Event()
@@ -263,20 +251,11 @@ def test_final_metadata_failure_drains_native_writer(tmp_path, monkeypatch, fail
                 )
             )
         assert recorder._queue.qsize() == 2
-        config = ExecutionConfig(
-            max_wait_s=np.float32(0.205), max_decision_age_s=1.0, max_tick_lateness_s=0.03
-        ).validate(SimpleNamespace(control_dt_s=0.1, horizon=3, n_obs_steps=1, n_action_steps=1))
         details = [dict(stage="pause_stop", exception_type="TimeoutError", message="STOP_TIMEOUT")]
-        trace = {"events": []}
-        if failure == "trace_type":
-            trace["config"] = asdict(config)
-        elif failure == "trace_nan":
-            trace["events"].append({"time": float("nan")})
-        elif failure.startswith("details_"):
+        if failure.startswith("details_"):
             details[0]["message"] = np.float32(1) if failure == "details_type" else float("nan")
         else:
-            trace["uncopyable"] = Uncopyable()
-        recorder.policy_trace = trace
+            details.append(Uncopyable())
         put = recorder._queue.put_nowait
 
         def submit(item):
@@ -316,9 +295,87 @@ def test_final_metadata_failure_drains_native_writer(tmp_path, monkeypatch, fail
         assert copies == ([1] if failure in ("copy", "interrupt") else [])
         assert recorder._reason == "operator"
     finally:
-        # Keep the deliberately failing baseline regression from leaking a writer.
+        # Release the writer even if an assertion fails.
         release.set()
         if recorder._thread is not None and recorder._thread.is_alive():
             recorder._store_error(RuntimeError("test cleanup"))
             recorder._thread.join(timeout=3)
         assert recorder.resources_released
+
+
+def test_trace_only_in_attempt_and_submission_indices(tmp_path):
+    from dexmani_real.recording.results import SessionResults, finalize_policy_attempt
+
+    recorder = start_recording(tmp_path)
+    # Slot numbers intentionally differ from submitted Raw row indices.
+    results = SessionResults(tmp_path, "policy")
+    attempt = results.prepare(recording=True)
+    results.entered(8)
+    trace = [
+        dict(event="record_submitted", slot=17, raw_row_index=0),
+        dict(event="dispatch", slot=17, arm=1, hand=4),
+    ]
+    finalize_policy_attempt(
+        results,
+        recorder,
+        recording_started=True,
+        reason="operator",
+        detail="stopped",
+        events=trace,
+        query_arrays={"query_1": np.full((3, 19), np.nan)},
+    )
+    saved = json.loads((tmp_path / "attempts" / f"{attempt}.json").read_text())
+    trace.clear()
+    assert saved["recording_status"] == "published" and saved["row_count"] == 1
+    assert saved["trace"][0]["raw_row_index"] == 0 and saved["trace"][0]["slot"] == 17
+    with h5py.File(saved["raw_path"] + "/data.h5") as raw:
+        assert "policy_trace" not in raw["meta"]
+    with np.load(saved["query_sidecar"], allow_pickle=False) as arrays:
+        assert np.isnan(arrays["query_1"]).all()
+
+
+def test_sidecar_json_failure_preserves_published_raw(tmp_path, monkeypatch):
+    from dexmani_real.recording.results import SessionResults, finalize_policy_attempt
+
+    recorder = start_recording(tmp_path)
+    results = SessionResults(tmp_path, "policy")
+    attempt = results.prepare(recording=True)
+
+    def fail(*a, **kw):
+        raise OSError("attempt JSON failed")
+
+    monkeypatch.setattr(results, "finish_attempt", fail)
+    with pytest.raises(OSError, match="attempt JSON failed"):
+        finalize_policy_attempt(
+            results,
+            recorder,
+            recording_started=True,
+            reason="operator",
+            detail="first reason",
+            events=[],
+            query_arrays={},
+        )
+    assert recorder.episode_path.exists() and recorder.written_frames == 1
+    incomplete = json.loads((tmp_path / "attempts" / f"{attempt}.json").read_text())
+    assert incomplete["state"] == "incomplete"
+    assert (tmp_path / "attempts" / f"{attempt}.npz").exists()
+
+
+def test_direct_runner_rejects_recording_without_attempt_owner(tmp_path):
+    from dexmani_real.deployment.runner import PolicyRunner
+
+    recorder = AsyncEpisodeRecorder(tmp_path)
+    with pytest.raises(ValueError, match="requires recorder, recording_config and results"):
+        PolicyRunner(
+            None,
+            None,
+            None,
+            robot=None,
+            realizer=None,
+            recorder=recorder,
+            model_runtime=None,
+            execution_config=None,
+            kinematics=None,
+            execute=True,
+            max_running_s=None,
+        )

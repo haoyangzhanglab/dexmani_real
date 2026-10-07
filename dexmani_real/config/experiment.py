@@ -27,12 +27,14 @@ from dexmani_real.config.environment import (
 )
 from dexmani_real.config.hardware import ArmParams, CameraParams, HandParams, VRParams
 from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.deployment.config import ExecutionConfig
 
 
 @dataclass(frozen=True)
 class ExperimentConfig:
     """Experiment values loaded together and validated at their usage boundaries."""
 
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     arm: ArmParams = field(default_factory=ArmParams)
     hand: HandParams = field(default_factory=HandParams)
     policy: ControlParams = field(default_factory=ControlParams)
@@ -95,7 +97,38 @@ def _patch(current: Any, changes: Any, path: str = "") -> Any:
     if isinstance(current, tuple):
         if not isinstance(changes, (tuple, list)):
             raise TypeError(f"config {path!r} must be an array")
-        return tuple(changes)
+        if not current:
+            return tuple(changes)
+        return tuple(
+            _patch(current[min(i, len(current) - 1)], value, f"{path}[{i}]")
+            for i, value in enumerate(changes)
+        )
+    if current is None:
+        if path in {"execution.prefetch_steps", "camera.l515_confidence_threshold"}:
+            if changes is not None and (type(changes) is not int):
+                raise TypeError(f"config {path!r} must be an integer or null")
+        elif path.startswith("execution."):
+            if changes is not None and (
+                isinstance(changes, bool) or not isinstance(changes, (int, float))
+            ):
+                raise TypeError(f"config {path!r} must be numeric or null")
+        elif changes is not None and not isinstance(changes, str):
+            raise TypeError(f"config {path!r} must be a string or null")
+        return changes
+    if isinstance(current, bool):
+        return changes
+    if isinstance(current, int):
+        if type(changes) is not int:
+            raise TypeError(f"config {path!r} must be an integer")
+    elif isinstance(current, (float, np.floating)):
+        if isinstance(changes, bool) or not isinstance(changes, (int, float)):
+            raise TypeError(f"config {path!r} must be numeric")
+        return float(changes)
+    elif isinstance(current, str):
+        if changes is None and path == "environment.table.plane_path":
+            return None
+        if not isinstance(changes, str):
+            raise TypeError(f"config {path!r} must be a string")
     return changes
 
 
@@ -126,27 +159,21 @@ def _overlay(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str,
     return result
 
 
-def validate_config(cfg: ExperimentConfig) -> None:
-    """Validate shared runtime values; teleop validates its selected hand backend."""
-    for section in (
-        cfg.arm,
-        cfg.arm.homing,
-        cfg.hand,
-        cfg.policy,
-        cfg.teleop,
-        cfg.policy.ema,
-        cfg.policy.vr_mapping,
-        cfg.policy.workspace,
-        cfg.vr,
-        cfg.safety,
-        cfg.camera,
-        cfg.environment,
-        cfg.environment.table,
-        *cfg.environment.static_boxes,
-    ):
+def validate_robot_config(cfg: ExperimentConfig) -> None:
+    """Values used by every robot owner, including HOME and hand-disabled geometry."""
+    for section in (cfg.arm, cfg.arm.homing, cfg.hand, cfg.safety):
         section.validate()
-    # Point-cloud numerical checks run in PointCloudConfig's constructor,
-    # including when only loading values for offline processing.
+
+
+def resolve_runtime_table(cfg: ExperimentConfig, *, pointcloud=None) -> ExperimentConfig:
+    """One session snapshot for HOME and the effective (possibly saved) cloud recipe."""
+    table = cfg.environment.table
+    if table.enabled or (pointcloud is not None and pointcloud.remove_table):
+        table = dataclasses.replace(table, plane_abcd=resolve_table_plane(table))
+        cfg = dataclasses.replace(
+            cfg, environment=dataclasses.replace(cfg.environment, table=table)
+        )
+    return cfg
 
 
 def resolve_table_plane_path(table: TableCollisionConfig) -> Path:
@@ -199,21 +226,3 @@ def load_experiment_config(
         raise TypeError("experiment config root must be a mapping")
     cfg = ExperimentConfig()
     return _patch(cfg, _overlay(loaded, _expand_dotted(cli_overrides)))
-
-
-def resolve_experiment_config(
-    *,
-    yaml_path: str | Path | None = None,
-    data: Mapping[str, Any] | None = None,
-    cli_overrides: Mapping[str, Any] | None = None,
-) -> ExperimentConfig:
-    """Load runtime configuration, resolve its table and validate startup values."""
-    cfg = load_experiment_config(yaml_path=yaml_path, data=data, cli_overrides=cli_overrides)
-    table = cfg.environment.table
-    if table.enabled:
-        table = dataclasses.replace(table, plane_abcd=resolve_table_plane(table))
-        cfg = dataclasses.replace(
-            cfg, environment=dataclasses.replace(cfg.environment, table=table)
-        )
-    validate_config(cfg)
-    return cfg

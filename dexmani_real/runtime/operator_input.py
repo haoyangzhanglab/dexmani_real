@@ -32,6 +32,7 @@ class OperatorCommand(Enum):
     STOP = "STOP"
     DISCARD = "DISCARD"
     HOME = "HOME"
+    TARE = "TARE"
     EMERGENCY_STOP = "EMERGENCY_STOP"
     QUIT = "QUIT"
 
@@ -42,6 +43,7 @@ _KEY_MAP: dict[str, OperatorCommand] = {
     "s": OperatorCommand.STOP,
     "d": OperatorCommand.DISCARD,
     "h": OperatorCommand.HOME,
+    "t": OperatorCommand.TARE,
     "q": OperatorCommand.QUIT,
 }
 

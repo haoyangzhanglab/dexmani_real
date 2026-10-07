@@ -1,5 +1,7 @@
 """Current-row teleop mapping, absolute target dispatch and raw recording."""
 
+from typing import NamedTuple
+
 import numpy as np
 
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
@@ -94,6 +96,12 @@ class TeleopController:
         self.smoothed_eef_quaternion = rot6d_to_quat_wxyz(realization.eef_pose[3:])
 
 
+class ControlStepResult(NamedTuple):
+    target_dispatched: bool
+    dispatch: object
+    interrupted: bool
+
+
 def execute_control_step(
     controller, shared, robot, row, recorder=None, *, termination_details=None
 ):
@@ -161,4 +169,4 @@ def execute_control_step(
         raise failure
     if stop_error is not None:
         raise stop_error
-    return control_ok and not interrupted, result, interrupted
+    return ControlStepResult(control_ok and not interrupted, result, interrupted)

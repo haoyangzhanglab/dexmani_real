@@ -72,24 +72,6 @@ class Robot:
 
 @pytest.fixture
 def make_runner(monkeypatch):
-    factory = ActionRealizer.for_mode
-    # Scheduling oracles use a collision-free synthetic scene; native admission
-    # and real-pose compensation are covered separately with actual model assets.
-    monkeypatch.setattr(
-        ActionRealizer,
-        "for_mode",
-        lambda runtime, mode: (
-            ActionRealizer(
-                runtime,
-                collision_model=NS(
-                    set_hand_qpos=lambda q: None, check_self_collision=lambda q: False
-                ),
-            )
-            if mode == "joint"
-            else factory(runtime, mode)
-        ),
-    )
-
     def make(mode="async", a=3, d=2, n=2, h=8, execute=True, wait=1.0):
         clock = NS(now=1_000_000_000)
         monkeypatch.setattr("time.monotonic_ns", lambda: clock.now)
@@ -150,6 +132,13 @@ def make_runner(monkeypatch):
             runtime,
             info,
             robot=robot,
+            realizer=ActionRealizer(
+                runtime,
+                collision_model=NS(
+                    set_hand_qpos=lambda q: None,
+                    check_self_collision=lambda q: False,
+                ),
+            ),
             model_runtime=worker,
             execution_config=ExecutionConfig(mode, 10.0, wait, 0.03, d, 2.0),
             kinematics=None,
@@ -592,8 +581,8 @@ def test_eef_prefix_technical_failure_ends_run_without_partial_publication(
     np.testing.assert_array_equal(calls[0], previous)
     assert r.previous_arm is None
     reason = first_reason or RunEndReason.POLICY_FAILURE
-    assert saved == [{"reason": reason.name.lower()}]
-    end = [e for e in r.recorder.policy_trace["events"] if e["event"] == "end"]
+    assert saved == [{"reason": reason.name.lower(), "details": []}]
+    end = [e for e in r.events if e["event"] == "end"]
     assert len(end) == 1 and end[0]["reason"] == reason.name.lower()
     assert "nonfinite solver output" in end[0]["detail"]
 
@@ -729,7 +718,7 @@ def test_late_return_cleanup_records_once(make_runner, stop_fails, record_fails)
     with pytest.raises((TimeoutError, OSError)):
         bootstrap(r)
     assert rows == [r.robot.result]
-    assert saved == [dict(reason="timeout")]
+    assert saved == [dict(reason="timeout", details=[])]
     assert r.completed == 1 and r.run_id is None
     assert len([e for e in r.events if e["event"] == "dispatch"]) == 1
 
@@ -788,7 +777,7 @@ def test_late_return_writer_finalization_failure_keeps_dispatch_and_end(make_run
     with pytest.raises(DispatchInterrupted if cancelled else RecordingError):
         bootstrap(r)
     assert rows == [r.robot.result]
-    events = r.recorder.policy_trace["events"]
+    events = r.events
     assert len([e for e in events if e["event"] == "dispatch"]) == 1
     assert len([e for e in events if e["event"] == "end"]) == 1
     assert r.completed == 1 and r.run_id is None
@@ -1115,3 +1104,34 @@ def test_cancelled_attempt_never_reuses_previous_raw_evidence(
     assert record["termination_reason"] == "start_cancelled"
     assert r.completed == 1 and r.run_id is None
     assert (previous / "data.h5").read_bytes() == previous_data
+
+
+def test_record_event_maps_queue_row_not_slot(make_runner):
+    r = make_runner()
+    r.last_slot = 17
+    r.recorder = NS(add_frame=lambda frame: 0)
+    row = r._read_observation()
+    from dexmani_real.ipc.schema import ARM_STATE_DTYPE, HAND_STATE_DTYPE
+    from dexmani_real.runtime.observation import ObservationRow
+
+    arm, hand = np.zeros(1, dtype=ARM_STATE_DTYPE), np.zeros(1, dtype=HAND_STATE_DTYPE)
+    row = ObservationRow(
+        arm,
+        hand,
+        dict(
+            timestamp_ns=1,
+            color_frame_number=1,
+            depth_frame_number=1,
+            rgb=np.zeros((4, 4, 3), np.uint8),
+            depth=np.ones((4, 4), np.uint16),
+        ),
+        None,
+        None,
+        1,
+    )
+    r._record(row)
+    assert r.events[-1]["raw_row_index"] == 0 and r.events[-1]["slot"] == 17
+    r.recorder.add_frame = lambda frame: None
+    count = len(r.events)
+    r._record(row)
+    assert len(r.events) == count

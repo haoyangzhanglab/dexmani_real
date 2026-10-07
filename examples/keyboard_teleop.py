@@ -11,8 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from dexmani_real.config.experiment import resolve_experiment_config
-from dexmani_real.teleop.keyboard_session import run_keyboard_experiment
+from dexmani_real.config.experiment import load_experiment_config
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -24,8 +23,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", type=Path, default=None, help="Validated experiment YAML")
     args = parser.parse_args(argv)
+
+    from dexmani_real.teleop.keyboard_session import run_keyboard_experiment
+
     try:
-        runtime = resolve_experiment_config(
+        runtime = load_experiment_config(
             yaml_path=args.config,
             cli_overrides={"policy.hand_enabled": False if args.no_hand else None},
         )

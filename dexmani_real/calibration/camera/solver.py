@@ -290,22 +290,22 @@ def check_hand_eye_excitation(
             if np.degrees(angle) >= min_relative_rotation_deg:
                 axes.append(vector / angle)
                 angles.append(float(np.degrees(angle)))
-    separations = [
-        float(np.degrees(np.arccos(np.clip(abs(a @ b), 0, 1))))
-        for i, a in enumerate(axes)
-        for b in axes[i + 1 :]
-    ]
-    if not separations or max(separations) < min_axis_separation_deg:
-        raise ValueError("insufficient hand-eye excitation; add rotation about another direction")
-    return dict(
-        sample_count=len(poses),
-        valid_relative_motion_count=len(axes),
-        relative_rotation_min_deg=min(angles),
-        relative_rotation_max_deg=max(angles),
-        axis_separation_max_deg=max(separations),
-        min_relative_rotation_deg=min_relative_rotation_deg,
-        min_axis_separation_deg=min_axis_separation_deg,
-    )
+    # Keep the original existential test. A fixed first-axis comparison misses
+    # valid pairs; stream all pairs and stop at the first qualifying witness.
+    for i, axis in enumerate(axes):
+        for other in axes[i + 1 :]:
+            separation = float(np.degrees(np.arccos(np.clip(abs(axis @ other), 0, 1))))
+            if separation >= min_axis_separation_deg:
+                return dict(
+                    sample_count=len(poses),
+                    valid_relative_motion_count=len(axes),
+                    relative_rotation_min_deg=min(angles),
+                    relative_rotation_max_deg=max(angles),
+                    axis_separation_witness_deg=separation,
+                    min_relative_rotation_deg=min_relative_rotation_deg,
+                    min_axis_separation_deg=min_axis_separation_deg,
+                )
+    raise ValueError("insufficient hand-eye excitation; add rotation about another direction")
 
 
 def calibrate_and_select(

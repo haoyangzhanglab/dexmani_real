@@ -19,23 +19,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import pyrealsense2 as rs
 from scipy.spatial.transform import Rotation as R
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.calibration.table import fit_table_plane, publish_table_plane
 from dexmani_real.config.experiment import (
-    resolve_experiment_config,
+    load_experiment_config,
     resolve_table_plane,
     resolve_table_plane_path,
 )
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
-from dexmani_real.sensor.camera.realsense import (
-    L515DepthConfig,
-    RealSenseCamera,
-    RealSenseCameraConfig,
-)
 from dexmani_real.sensor.pointcloud import (
     aligned_depth_points_in_base,
     build_point_cloud,
@@ -63,19 +57,19 @@ class PointCloudDiagnosticConfig:
     vis_depth_max_m: float = 2.5
 
 
-_SENSOR_OPTIONS: list[tuple[str, rs.option]] = [
-    ("visual_preset", rs.option.visual_preset),
-    ("laser_power", rs.option.laser_power),
-    ("receiver_gain", rs.option.receiver_gain),
-    ("confidence_threshold", rs.option.confidence_threshold),
-    ("noise_filtering", rs.option.noise_filtering),
-    ("digital_gain", rs.option.digital_gain),
-    ("depth_offset", rs.option.depth_offset),
-    ("min_distance", rs.option.min_distance),
-    ("post_processing_sharpening", rs.option.post_processing_sharpening),
-    ("pre_processing_sharpening", rs.option.pre_processing_sharpening),
-    ("noise_estimation", rs.option.noise_estimation),
-]
+_SENSOR_OPTION_NAMES = (
+    "visual_preset",
+    "laser_power",
+    "receiver_gain",
+    "confidence_threshold",
+    "noise_filtering",
+    "digital_gain",
+    "depth_offset",
+    "min_distance",
+    "post_processing_sharpening",
+    "pre_processing_sharpening",
+    "noise_estimation",
+)
 
 
 def _jet_colormap(values: np.ndarray) -> np.ndarray:
@@ -185,6 +179,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "processed clouds, and reconstruction metadata below this directory"
         ),
     )
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--camera-calibration", type=Path)
     return parser.parse_args(argv)
 
 
@@ -352,7 +348,8 @@ def _print_device_info(camera: RealSenseCamera) -> dict:
     print(f"  Depth scale:    {camera.get_depth_scale():.6f} (raw_uint16 x scale = meters)")
 
     print("\n  --- Sensor read-back ---")
-    for name, opt in _SENSOR_OPTIONS:
+    for name in _SENSOR_OPTION_NAMES:
+        opt = getattr(rs.option, name)
         try:
             print(f"  {name}: {depth_sensor.get_option(opt)}")
         except RuntimeError:
@@ -385,10 +382,9 @@ def _capture_frame(
     return rgb, depth_raw, depth_m
 
 
-def _load_extrinsics(camera_info: dict) -> np.ndarray:
+def _load_extrinsics(camera_info: dict, calib: CameraExtrinsics) -> np.ndarray:
     """Load T_xarm_base_from_color for aligned depth-to-color samples."""
     print("\nLoading extrinsics from cameras.json...")
-    calib = CameraExtrinsics()
     cam_name = calib.resolve_name_by_serial(str(camera_info.get("serial", "")))
     base_from_color = np.asarray(calib.get_extrinsics(cam_name), dtype=np.float64)
 
@@ -642,6 +638,15 @@ def _visualize_result(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    global rs, RealSenseCamera, RealSenseCameraConfig, L515DepthConfig
+    import pyrealsense2 as rs
+
+    from dexmani_real.sensor.camera.realsense import (
+        L515DepthConfig,
+        RealSenseCamera,
+        RealSenseCameraConfig,
+    )
+
     save_dir = None if args.save_dir is None else args.save_dir.expanduser().resolve()
     if save_dir is not None and save_dir.exists() and not save_dir.is_dir():
         raise NotADirectoryError(f"snapshot output root is not a directory: {save_dir}")
@@ -649,10 +654,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # Resolve and validate file-backed policy before connecting to hardware.
     calibrate_table = input("\nRun table calibration? [y/N] ").strip().lower() in {"y", "yes"}
-    runtime = resolve_experiment_config(
-        cli_overrides={"environment.table.enabled": False} if calibrate_table else None
-    )
+    runtime = load_experiment_config(yaml_path=args.config)
     pcd_config = runtime.pointcloud
+    pcd_config.validate()
+    calibration = CameraExtrinsics(args.camera_calibration)
+    table_plane_abcd = (
+        resolve_table_plane(runtime.environment.table)
+        if pcd_config.remove_table and not calibrate_table
+        else None
+    )
 
     camera = _connect_camera(cfg)
 
@@ -664,7 +674,7 @@ def main(argv: list[str] | None = None) -> int:
         _show_rgbd_panels(rgb, depth_m, cfg)
 
         geometry = camera.get_geometry().aligned_depth_to_color()
-        T_xarm_base_from_color = _load_extrinsics(camera_info)
+        T_xarm_base_from_color = _load_extrinsics(camera_info, calibration)
 
         if calibrate_table:
             # Use the new fit immediately, even without saving it.
@@ -678,7 +688,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             table_plane_source = "calibrated_this_run"
         elif pcd_config.remove_table:
-            table_plane_abcd = resolve_table_plane(runtime.environment.table)
             table_plane_source = "resolved_runtime"
             print(
                 "  Table calibration skipped; using resolved table_plane.json: "

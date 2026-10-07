@@ -21,14 +21,13 @@ def pack_camera_frame(rgb, depth_raw, *, timestamp_ns, depth_frame_number, color
     header["timestamp_ns"] = timestamp_ns
     header["depth_frame_number"] = depth_frame_number
     header["color_frame_number"] = color_frame_number
-    header["rgb_size"], header["depth_size"] = rgb.nbytes, depth_raw.nbytes
-    header["rgb_shape_h"], header["rgb_shape_w"], header["rgb_shape_c"] = rgb.shape
-    header["depth_shape_h"], header["depth_shape_w"] = depth_raw.shape
     return header, rgb, depth_raw
 
 
 def run_camera_worker(shared, config: CameraParams) -> None:
     config.validate()
+    if shared.camera_ring is None:
+        raise ValueError("camera worker requires an allocated camera ring")
     from dexmani_real.sensor.camera.realsense import (
         L515DepthConfig,
         RealSenseCamera,

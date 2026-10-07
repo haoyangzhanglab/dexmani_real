@@ -50,6 +50,7 @@ class ProcessingConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.pointcloud, PointCloudConfig):
             raise TypeError("pointcloud must be a PointCloudConfig")
+        self.pointcloud.validate()
         if (
             len(self.fingertip_link_names) != 5
             or len(set(self.fingertip_link_names)) != 5

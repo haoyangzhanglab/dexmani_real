@@ -10,11 +10,21 @@ Stage 2 (SLSQP): pinch refinement — conditional on finger-to-thumb proximity.
 
 from __future__ import annotations
 
+import time
+from typing import Any
+
 import nlopt
 import numpy as np
 import pinocchio as pin
 
+from dexmani_real.robot.model import HAND_JOINT_SHAPE, XHAND_SDK_JOINT_NAMES
 from dexmani_real.teleop.retargeting.pin_grad import PinGrad
+from dexmani_real.teleop.retargeting.retargeter import (
+    _OPERATOR2MANO_RIGHT,
+    _estimate_palm_frame,
+    adaptive_retargeting_xhand,
+    validate_landmarks,
+)
 from dexmani_real.utils.log import ThrottledWarner, get_logger
 
 logger = get_logger(__name__)
@@ -279,3 +289,141 @@ class HandOptimizer:
         if grad.size > 0:
             grad[:] = total_grad
         return float(total_loss)
+
+
+_FINGERTIP_INDICES = np.array([4, 8, 12, 16, 20], dtype=np.intp)
+
+
+class TAGHandRetargeter:
+    """Retarget VR to XHand with TAG's two-stage NLopt optimizer.
+
+    Pipeline: (21, 3) operator landmarks -> palm/MANO frame -> pinky scaling
+    -> tips [4, 8, 12, 16, 20] minus wrist[0] -> R_mano_to_urdf -> solve
+    -> remap model joints to (12,) SDK order.
+
+    Uses right-hand geometry and shares retarget()/reset() with
+    DexPilotHandRetargeter. debug enables per-frame timing logs.
+    """
+
+    def __init__(
+        self,
+        fingertip_link_names: tuple[str, ...],
+        tag_config: Any,
+        urdf_path: str,
+        debug: bool = False,
+    ) -> None:
+        import pinocchio as pin
+        from scipy.spatial.transform import Rotation
+
+        from dexmani_real.teleop.retargeting.pin_grad import validate_fingertip_frame_names
+
+        tag_config.validate()
+        resolved_urdf_path = str(urdf_path)
+        resolved_tip_names = validate_fingertip_frame_names(fingertip_link_names)
+        model = pin.buildModelFromUrdf(resolved_urdf_path, pin.JointModelFreeFlyer())
+        joint_lo = model.lowerPositionLimit[7:].copy()
+        joint_hi = model.upperPositionLimit[7:].copy()
+
+        # Pinocchio and SDK use different joint orders.
+        model_names = list(model.names[2:])  # skip "universe" and "root_joint"
+        self.sdk_joint_names = XHAND_SDK_JOINT_NAMES
+        self._mapping_model_to_sdk = np.array(
+            [model_names.index(name) for name in self.sdk_joint_names], dtype=np.intp
+        )
+        self._mapping_sdk_to_model = np.argsort(self._mapping_model_to_sdk)
+
+        self._optimizer = HandOptimizer(
+            urdf_path=resolved_urdf_path,
+            fingertip_frame_names=list(resolved_tip_names),
+            joint_limits_lower=joint_lo,
+            joint_limits_upper=joint_hi,
+            finger_lengths_robot=np.array(tag_config.robot_finger_lengths, dtype=np.float64),
+            finger_lengths_human=np.array(tag_config.human_finger_lengths, dtype=np.float64),
+            finger_scale_boost=tag_config.finger_scale_boost,
+            smooth_weight=tag_config.smooth_weight,
+            ftol_abs_s1=tag_config.ftol_abs_s1,
+            maxeval_s1=tag_config.maxeval_s1,
+            ftol_abs_s2=tag_config.ftol_abs_s2,
+            maxeval_s2=tag_config.maxeval_s2,
+            pinch_base_weight=tag_config.pinch_base_weight,
+            pinch_start_dist_m=tag_config.pinch_start_dist_m,
+            pinch_full_dist_m=tag_config.pinch_full_dist_m,
+            pinch_ema_alpha=tag_config.pinch_ema_alpha,
+            pinch_skip_threshold=tag_config.pinch_skip_threshold,
+            reg_stage1_weight=tag_config.reg_stage1_weight,
+            reg_last_weight=tag_config.reg_last_weight,
+        )
+
+        self._R_mano_to_urdf: np.ndarray = Rotation.from_euler(
+            "xyz", tag_config.mano_to_urdf_euler
+        ).as_matrix()
+        self._pinky_scale = float(tag_config.pinky_scale)
+        self._pinky_palm_scale = float(tag_config.pinky_palm_scale)
+
+        self.debug = bool(debug)
+
+        logger.info(
+            "TAGHandRetargeter ready (urdf=%s, mano→urdf=%s)",
+            resolved_urdf_path,
+            tag_config.mano_to_urdf_euler,
+        )
+
+    def retarget(self, landmarks: np.ndarray | None) -> np.ndarray | None:
+        """Retarget VR landmarks (operator-frame, 21×3) to XHand joint qpos (12,).
+
+        Expected invalid input or Stage 1 roundoff returns ``None``. Unexpected
+        optimizer errors propagate to the session owner.
+        """
+        if landmarks is None:
+            return None
+        valid, reason = validate_landmarks(landmarks)
+        if not valid:
+            logger.warning(
+                "TAGHandRetargeter: landmarks rejected (%s) — no target produced", reason
+            )
+            return None
+
+        t0 = time.perf_counter() if self.debug else 0.0
+
+        try:
+            wrist_rot = _estimate_palm_frame(landmarks)
+            mano = landmarks @ wrist_rot @ _OPERATOR2MANO_RIGHT
+        except (ValueError, np.linalg.LinAlgError):
+            logger.warning("TAGHandRetargeter: coordinate transform failed — no target produced")
+            return None
+
+        mano = adaptive_retargeting_xhand(
+            mano,
+            scale=self._pinky_scale,
+            palm_scale=self._pinky_palm_scale,
+        )
+
+        tips = mano[_FINGERTIP_INDICES].copy()  # (5, 3) in MANO frame
+        tips -= mano[0]  # center at wrist
+        tips_urdf = tips @ self._R_mano_to_urdf.T  # (5, 3) in URDF frame
+
+        qpos_model = self._optimizer.solve(tips_urdf)  # (12,) in Pinocchio model order
+
+        if qpos_model is None:
+            return None
+
+        qpos_sdk = qpos_model[self._mapping_model_to_sdk]
+
+        if self.debug:
+            dt_ms = 1000.0 * (time.perf_counter() - t0)
+            logger.info("TAGHandRetargeter: retarget %.2f ms", dt_ms)
+
+        return qpos_sdk
+
+    def reset(self, initial_qpos: np.ndarray | None = None) -> None:
+        """Reset optimizer state and optional SDK-order warm start."""
+        if (
+            initial_qpos is not None
+            and initial_qpos.shape == HAND_JOINT_SHAPE
+            and np.all(np.isfinite(initial_qpos))
+        ):
+            # SDK order → model order for optimizer warm-start
+            qpos_model = initial_qpos[self._mapping_sdk_to_model]
+            self._optimizer.reset(qpos_model)
+        else:
+            self._optimizer.reset(None)

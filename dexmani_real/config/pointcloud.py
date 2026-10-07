@@ -15,7 +15,7 @@ import numpy as np
 
 @dataclass(frozen=True)
 class PointCloudConfig:
-    """Validated depth-to-color aligned RGB-D point-cloud policy."""
+    """Depth-to-color recipe; numerical limits are checked by its consumers."""
 
     remove_table: bool = True
     num_points: int = 1024
@@ -52,6 +52,7 @@ class PointCloudConfig:
     # Ten removes dense 7--9 point fragments that can satisfy the six-neighbor
     # rule, while remaining conservative for small resolved object surfaces.
     outlier_min_component_points: int = 10
+    # Persisted checkpoint key: caps sampling candidates AFTER density/component filtering.
     outlier_candidate_multiplier: int = 8
     # Select one fine-voxel representative per coarse 3x3x3 cell before the
     # final deterministic fill. At the default 5 mm voxel size this stratifies sampling
@@ -61,26 +62,22 @@ class PointCloudConfig:
     def __post_init__(self) -> None:
         if type(self.remove_table) is not bool:
             raise TypeError("remove_table must be bool")
-        if (
-            isinstance(self.num_points, bool)
-            or not isinstance(self.num_points, (int, np.integer))
-            or self.num_points <= 0
-        ):
-            raise ValueError("num_points must be a positive integer")
+        if isinstance(self.num_points, bool) or not isinstance(self.num_points, (int, np.integer)):
+            raise ValueError("num_points must be an integer")
         object.__setattr__(self, "num_points", int(self.num_points))
         integer_fields = (
-            ("depth_support_min_neighbors", self.depth_support_min_neighbors, 0),
-            ("edge_support_min_neighbors", self.edge_support_min_neighbors, 0),
-            ("table_object_seed_min_pixels", self.table_object_seed_min_pixels, 1),
-            ("outlier_min_neighbors", self.outlier_min_neighbors, 0),
-            ("outlier_min_component_points", self.outlier_min_component_points, 1),
-            ("outlier_candidate_multiplier", self.outlier_candidate_multiplier, 1),
-            ("sampling_coarse_voxel_stride", self.sampling_coarse_voxel_stride, 1),
+            "depth_support_min_neighbors",
+            "edge_support_min_neighbors",
+            "table_object_seed_min_pixels",
+            "outlier_min_neighbors",
+            "outlier_min_component_points",
+            "outlier_candidate_multiplier",
+            "sampling_coarse_voxel_stride",
         )
-        for name, value, minimum in integer_fields:
-            if isinstance(value, bool) or int(value) != value or int(value) < minimum:
-                relation = "positive" if minimum == 1 else "non-negative"
-                raise ValueError(f"{name} must be a {relation} integer")
+        for name in integer_fields:
+            value = getattr(self, name)
+            if isinstance(value, bool) or int(value) != value:
+                raise ValueError(f"{name} must be an integer")
             object.__setattr__(self, name, int(value))
 
         float_fields = (
@@ -100,7 +97,30 @@ class PointCloudConfig:
             raise ValueError("workspace must contain six xyz lower/upper bounds")
         object.__setattr__(self, "workspace", workspace)
 
-        values = tuple(getattr(self, name) for name in float_fields) + workspace
+    def validate(self) -> None:
+        for name, minimum in (
+            ("num_points", 1),
+            ("depth_support_min_neighbors", 0),
+            ("edge_support_min_neighbors", 0),
+            ("table_object_seed_min_pixels", 1),
+            ("outlier_min_neighbors", 0),
+            ("outlier_min_component_points", 1),
+            ("outlier_candidate_multiplier", 1),
+            ("sampling_coarse_voxel_stride", 1),
+        ):
+            if getattr(self, name) < minimum:
+                raise ValueError(f"{name} must be >= {minimum}")
+        values = (
+            self.depth_min_m,
+            self.depth_max_m,
+            self.edge_jump_m,
+            self.edge_surface_band_m,
+            self.table_core_height_m,
+            self.table_object_seed_height_m,
+            self.voxel_size_m,
+            self.outlier_radius_m,
+            *self.workspace,
+        )
         if not all(np.isfinite(value) for value in values):
             raise ValueError("point-cloud configuration values must be finite")
         if not 0.0 < self.depth_min_m < self.depth_max_m:
@@ -129,7 +149,9 @@ class PointCloudConfig:
         unknown = set(value) - {f.name for f in fields(cls)}
         if unknown:
             raise ValueError(f"Unknown pointcloud config fields: {sorted(unknown)}")
-        return cls(**value)
+        config = cls(**value)
+        config.validate()
+        return config
 
     def to_dict(self) -> dict[str, Any]:
         """Return the stable persisted processing-policy representation."""

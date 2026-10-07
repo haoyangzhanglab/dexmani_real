@@ -38,7 +38,7 @@ class RecordingBackpressureError(RecordingError):
 
 def snapshot_recording_metadata(shared, runtime, *, collection_source, camera_calibration):
     """Select the connected serial from the session snapshot, without file I/O."""
-    serial = shared.camera_serial.value.rstrip(b"\x00").decode("utf-8")
+    serial = shared.camera_serial.value.decode("utf-8")
     if not serial.strip():
         raise ValueError("recording START requires a nonempty camera serial")
     geometry = RGBDGeometry.from_dict(json.loads(shared.camera_geometry.value.decode("utf-8")))
@@ -108,7 +108,6 @@ class AsyncEpisodeRecorder:
             raise ValueError("recording rgb_shape must be positive HWC with 3 channels")
         self._video_config = video_config
         self.execution_path = execution_path
-        self.policy_trace = None
         self._thread = None
         self._queue = Queue(maxsize=16)
         self._ready = threading.Event()
@@ -288,8 +287,7 @@ class AsyncEpisodeRecorder:
             self._ready.clear()
             self._abort = self._save = self._saved = False
             self._reason = ""
-            self.policy_trace = None
-            self._final_metadata = (None, None)
+            self._final_metadata = None
             self._thread = threading.Thread(
                 target=self._write_episode, args=(metadata,), name="episode-writer", daemon=False
             )
@@ -326,6 +324,7 @@ class AsyncEpisodeRecorder:
             self._store_error(error)
             raise error from exc
         self._frame_count += 1
+        return self._frame_count - 1
 
     def save_episode(self, reason="manual", *, details=None):
         return self._finish(save=True, reason=reason, details=details)
@@ -350,7 +349,7 @@ class AsyncEpisodeRecorder:
                 self._save = save
                 self._reason = reason
                 # Detach owner state before STOP; encoding belongs to the writer.
-                self._final_metadata = deepcopy((details, self.policy_trace))
+                self._final_metadata = deepcopy(details)
         except BaseException as exc:
             self._save = False
             # Metadata failure must still drain queued, valid source rows.
@@ -398,15 +397,11 @@ class AsyncEpisodeRecorder:
             "0:not_called,1:accepted,2:crc_unconfirmed,3:rejected,4:unknown"
         )
 
-    def _final_metadata_into(
-        self, meta, details, policy_trace, last_selected, last_dispatch_detail
-    ):
+    def _final_metadata_into(self, meta, details, last_selected, last_dispatch_detail):
         meta.attrs["format"] = RAW_FORMAT
         meta.attrs["num_frames"] = self._written_frames
         meta.attrs["termination_reason"] = self._reason
         self.check_error()
-        if policy_trace is not None:
-            meta.create_dataset("policy_trace", data=json.dumps(policy_trace, allow_nan=False))
         if details:
             meta.create_dataset("termination_details", data=json.dumps(details, allow_nan=False))
         if last_dispatch_detail is not None:
@@ -468,11 +463,11 @@ class AsyncEpisodeRecorder:
                     flush_rows()
             if not self._abort:
                 flush_rows()
-                details, policy_trace = self._final_metadata
+                details = self._final_metadata
 
                 data.update_meta(
                     lambda meta: self._final_metadata_into(
-                        meta, details, policy_trace, last_selected, last_dispatch_detail
+                        meta, details, last_selected, last_dispatch_detail
                     )
                 )
             video.close()

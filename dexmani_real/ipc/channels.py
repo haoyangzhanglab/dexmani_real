@@ -27,6 +27,10 @@ DISARMED_SAFETY_STATE_WIRE_VALUE = 0
 class RuntimeChannelsConfig:
     """Sensor ring capacities and camera resolution defaults."""
 
+    camera: bool = False
+    vr: bool = False
+    pointcloud: bool = False
+
     camera_ring_maxlen: int = CameraParams.ring_maxlen
     vr_ring_maxlen: int = 8
     pointcloud_num_points: int = 1024
@@ -36,14 +40,20 @@ class RuntimeChannelsConfig:
     camera_depth_shape: tuple[int, int] = field(default_factory=lambda: CameraParams().depth_shape)
 
     def __post_init__(self) -> None:
-        capacities = (
-            self.camera_ring_maxlen,
-            self.vr_ring_maxlen,
-            self.pointcloud_ring_maxlen,
+        if self.pointcloud and not self.camera:
+            raise ValueError("pointcloud requires camera storage")
+        capacities = tuple(
+            value
+            for enabled, value in (
+                (self.camera, self.camera_ring_maxlen),
+                (self.vr, self.vr_ring_maxlen),
+                (self.pointcloud, self.pointcloud_ring_maxlen),
+            )
+            if enabled
         )
         if any(int(value) <= 0 for value in capacities):
             raise ValueError("RuntimeChannels ring capacities must be positive")
-        if (
+        if self.pointcloud and (
             isinstance(self.pointcloud_num_points, bool)
             or not isinstance(self.pointcloud_num_points, (int, np.integer))
             or self.pointcloud_num_points <= 0
@@ -56,9 +66,15 @@ class RuntimeChannelsConfig:
         runtime: object,
         *,
         pointcloud_num_points: int | None = None,
+        camera: bool = False,
+        vr: bool = False,
+        pointcloud: bool = False,
     ) -> "RuntimeChannelsConfig":
-        cam = getattr(runtime, "camera")
+        cam = runtime.camera
         return cls(
+            camera=camera,
+            vr=vr,
+            pointcloud=pointcloud,
             camera_ring_maxlen=int(cam.ring_maxlen),
             camera_rgb_shape=(int(cam.height), int(cam.width), 3),
             camera_depth_shape=(int(cam.height), int(cam.width)),
@@ -81,9 +97,9 @@ _RING_RESOURCE_NAMES = (
 class RuntimeChannels:
     """Runtime channels created in Main before spawning child processes."""
 
-    camera_ring: CameraRingBuffer  # camera -> local observation consumers
-    vr_ring: SharedMemoryRingBuffer  # VR -> local teleop/calibration
-    pointcloud_ring: SharedMemoryRingBuffer  # pointcloud worker -> local policy
+    camera_ring: CameraRingBuffer | None  # camera -> local observation consumers
+    vr_ring: SharedMemoryRingBuffer | None  # VR -> local teleop/calibration
+    pointcloud_ring: SharedMemoryRingBuffer | None  # pointcloud worker -> local policy
 
     run_id: Any  # advancing the epoch invalidates pending motion commands
     # Latest software RUNNING termination; written under motion_lock.
@@ -155,24 +171,36 @@ class RuntimeChannels:
         cfg: RuntimeChannelsConfig,
         ctx: Any,
     ) -> None:
-        storage.camera_ring = CameraRingBuffer(
-            name=f"{prefix}_camera",
-            rgb_shape=cfg.camera_rgb_shape,
-            depth_shape=cfg.camera_depth_shape,
-            maxlen=cfg.camera_ring_maxlen,
-            create=True,
+        storage.camera_ring = (
+            CameraRingBuffer(
+                name=f"{prefix}_camera",
+                rgb_shape=cfg.camera_rgb_shape,
+                depth_shape=cfg.camera_depth_shape,
+                maxlen=cfg.camera_ring_maxlen,
+                create=True,
+            )
+            if cfg.camera
+            else None
         )
-        storage.vr_ring = SharedMemoryRingBuffer(
-            f"{prefix}_vr",
-            dtype=VR_FRAME_DTYPE,
-            maxlen=cfg.vr_ring_maxlen,
-            create=True,
+        storage.vr_ring = (
+            SharedMemoryRingBuffer(
+                f"{prefix}_vr",
+                dtype=VR_FRAME_DTYPE,
+                maxlen=cfg.vr_ring_maxlen,
+                create=True,
+            )
+            if cfg.vr
+            else None
         )
-        storage.pointcloud_ring = SharedMemoryRingBuffer(
-            f"{prefix}_pointcloud",
-            dtype=make_pointcloud_frame_dtype(cfg.pointcloud_num_points),
-            maxlen=cfg.pointcloud_ring_maxlen,
-            create=True,
+        storage.pointcloud_ring = (
+            SharedMemoryRingBuffer(
+                f"{prefix}_pointcloud",
+                dtype=make_pointcloud_frame_dtype(cfg.pointcloud_num_points),
+                maxlen=cfg.pointcloud_ring_maxlen,
+                create=True,
+            )
+            if cfg.pointcloud
+            else None
         )
 
         storage.run_id = ctx.Value("Q", 1)

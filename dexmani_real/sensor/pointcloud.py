@@ -504,6 +504,7 @@ def aligned_depth_points_in_base(
     """Return aligned supported points in xArm-base for table calibration."""
     if not isinstance(config, PointCloudConfig):
         raise TypeError("config must be a PointCloudConfig")
+    config.validate()
     depth_m, valid = _depth_valid_mask(depth_raw, depth_scale_m=depth_scale_m, config=config)
     trusted = _reject_flying_depth(depth_m, valid, config)
     if not np.any(trusted):
@@ -554,6 +555,7 @@ def build_point_cloud(
     """Build aligned depth/color ``float32[num_points,6]`` in xArm-base frame."""
     if not isinstance(config, PointCloudConfig):
         raise TypeError("config must be a PointCloudConfig")
+    config.validate()
     if config.remove_table:
         if table_plane_abcd is None:
             raise ValueError("remove_table=True requires a current calibrated table plane")
@@ -618,9 +620,9 @@ def build_point_cloud(
     points_base = points_base[inlier]
     colors = colors[inlier]
     voxel_keys = voxel_keys[inlier]
-    candidate_indices = _spatial_candidate_indices(
-        voxel_keys, config.num_points * config.outlier_candidate_multiplier
-    )
+    # This limits final sampling work, not the earlier radius/component search.
+    sampling_candidate_limit = config.num_points * config.outlier_candidate_multiplier
+    candidate_indices = _spatial_candidate_indices(voxel_keys, sampling_candidate_limit)
     points_base = points_base[candidate_indices]
     colors = colors[candidate_indices]
     voxel_keys = voxel_keys[candidate_indices]

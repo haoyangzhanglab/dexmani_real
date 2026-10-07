@@ -1,29 +1,23 @@
 """Operator-supervised teleop with one current observation per real control step."""
 
 import time
+from concurrent.futures import CancelledError
 from pathlib import Path
 
-import numpy as np
-
-from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.recording.recorder import (
     AsyncEpisodeRecorder,
     RecordingError,
     snapshot_recording_metadata,
 )
-from dexmani_real.robot.action import ActionRealizer
-from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
+from dexmani_real.robot.arm_homing import home_robot
 from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.robot.robot import DispatchError
 from dexmani_real.runtime.observation import read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
-from dexmani_real.runtime.safety import RunEndReason, begin_motion, revoke_motion
+from dexmani_real.runtime.safety import RunEndReason, SafetyState, begin_motion, revoke_motion
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.config import TeleopConfig
-from dexmani_real.teleop.control.controller import TeleopController, execute_control_step
-from dexmani_real.teleop.control.vr_mapping import VRWristMapper
-from dexmani_real.teleop.retargeting.retargeter import DexPilotHandRetargeter, TAGHandRetargeter
-from dexmani_real.teleop.vr_transform import load_vr_transform
+from dexmani_real.teleop.control.controller import execute_control_step
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -31,28 +25,19 @@ _DEBUG_FAILURE_LIMIT = 10
 _END_AUDIO_GRACE_S = 3.0
 
 
-def _build_hand_retargeter(config: TeleopConfig):
-    """Build the configured hand retargeter without owning runtime state."""
-    if not config.runtime.policy.hand_enabled:
-        return None
-    if config.runtime.policy.hand_retargeting_type == "tag":
-        return TAGHandRetargeter(
-            fingertip_link_names=config.runtime.hand.fingertip_link_names,
-            tag_config=config.runtime.tag_retargeting,
-            urdf_path=config.hand_urdf_path,
-        )
-    return DexPilotHandRetargeter(
-        hand_type="right",
-        retargeting_type=config.runtime.policy.hand_retargeting_type,
-        dexpilot_config=config.runtime.dexpilot_retargeting,
-    )
-
-
 class TeleopRunner:
     """Own operator, recording and control state for one local teleop session."""
 
     def __init__(
-        self, shared, config: TeleopConfig, robot, *, start_vr=None, camera_calibration=None
+        self,
+        shared,
+        config: TeleopConfig,
+        robot,
+        *,
+        controller,
+        home_planner,
+        start_vr,
+        camera_calibration=None,
     ):
         self.shared = shared
         self.robot = robot
@@ -77,7 +62,7 @@ class TeleopRunner:
             quit_callback=lambda: revoke_motion(shared, reason=RunEndReason.QUIT),
         )
         self.audio = AudioFeedback()
-        self.controller = None
+        self.controller = controller
         self.active = False
         self.paused = False
         self.resume_requested = False
@@ -91,7 +76,7 @@ class TeleopRunner:
         self.failures = 0
         self.capture_started_s = 0.0
 
-        self.home_planner = None
+        self.home_planner = home_planner
 
     def _end_reason(self, fallback):
         with self.shared.motion_lock:
@@ -117,8 +102,7 @@ class TeleopRunner:
             self.pending_termination_reason = self._end_reason(reason)
         if stop_motion:
             self._stop_motion("pause_stop")
-        if self.controller is not None:
-            self.controller.clear_reference()
+        self.controller.clear_reference()
         self.paused, self.resume_requested = True, False
 
     def _finish_capture(self, save, reason, *, announce=True) -> None:
@@ -228,12 +212,29 @@ class TeleopRunner:
             reason = cmd.value.lower()
             self._pause_control(reason)
             self._finish_capture(cmd is OperatorCommand.STOP, reason)
+        elif cmd is OperatorCommand.TARE:
+            if (
+                self.resume_requested
+                or (self.active and not self.paused)
+                or (self.recorder is not None and self.recorder.is_recording)
+                or int(self.shared.safety_state.value) != int(SafetyState.ARMED)
+            ):
+                logger.warning("T ignored: tactile tare requires idle, no capture or preparation")
+                return False
+            try:
+                result = self.robot.tare_tactile(cancel_requested=self._poll_blocking_commands)
+                logger.info("Explicit tactile baseline aggregate/dense: %s", result)
+            except CancelledError:
+                logger.info("Tactile tare cancelled; no new baseline published")
+            finally:
+                self.keyboard.drain_signal(OperatorCommand.TARE)
+                self.keyboard.drain_signal(OperatorCommand.BEGIN)
+            return True
         elif cmd is OperatorCommand.HOME:
             self._pause_control("home")
             if not self._poll_blocking_commands(home_commands):
                 self.audio.play("home")
-                self.home_planner = self.home_planner or build_policy_home_planner(self.runtime)
-                if home_policy_robot(
+                if home_robot(
                     self.shared,
                     self.runtime,
                     self.home_planner,
@@ -289,7 +290,7 @@ class TeleopRunner:
         return False
 
     def _execute_control_step(self, row):
-        control_ok, result, interrupted = execute_control_step(
+        step = execute_control_step(
             self.controller,
             self.shared,
             self.robot,
@@ -297,11 +298,11 @@ class TeleopRunner:
             self.recorder,
             termination_details=self.termination_details,
         )
-        if interrupted:
-            logger.info("teleop interrupted: dispatch=%s", result)
+        if step.interrupted:
+            logger.info("teleop interrupted: dispatch=%s", step.dispatch)
             self._stop_capture("motion_revoked", stop_motion=False)
             return
-        if self.recorder is not None and not control_ok:
+        if self.recorder is not None and not step.target_dispatched:
             self._stop_capture("control_failure")
             return
         if (
@@ -314,7 +315,7 @@ class TeleopRunner:
             return
 
         if self.recorder is None:
-            self.failures = self.failures + 1 if not control_ok else 0
+            self.failures = self.failures + 1 if not step.target_dispatched else 0
             if self.failures >= _DEBUG_FAILURE_LIMIT:
                 self._stop_capture("control_failure")
 
@@ -333,8 +334,7 @@ class TeleopRunner:
                 raise RuntimeError("VR failed to become ready before the startup timeout")
 
     def _initialize(self) -> bool:
-        # Sensor readiness follows XHand connection and the tactile calibration
-        # attempt; reset before the slower IK/retargeting initialization.
+        # Keyboard callbacks are active before the startup hand HOME.
         home_result = home_hand(
             self.shared,
             self.runtime,
@@ -355,25 +355,10 @@ class TeleopRunner:
             raise RuntimeError(f"startup hand home failed: {home_result.reason}")
         if self._poll_blocking_commands():
             return False
-        realizer = ActionRealizer.for_mode(self.runtime, "eef")
-        calibration = load_vr_transform(VR_TRANSFORM_PATH)
-        mapping = self.runtime.policy.vr_mapping
-        mapper = VRWristMapper(
-            pos_scale=mapping.pos_scale,
-            rot_scale=mapping.rot_scale,
-            vr_to_robot_rot=calibration.transform,
-            base_to_world_rot=np.eye(3),
-        )
-        self.controller = TeleopController(
-            realizer, mapper, self.runtime, _build_hand_retargeter(self.config)
-        )
-        if self._poll_blocking_commands():
-            return False
-        if self.start_vr is not None:
-            self.start_vr()
+        self.start_vr()
         if not self._wait_for_vr():
             return False
-        print("准备进入遥操作", flush=True)
+        print("准备进入遥操作；空闲且确认手部无接触后按 T 归零触觉，S/Q/ESC 可取消。", flush=True)
         return True
 
     def _run_control_tick(self):
@@ -426,8 +411,7 @@ class TeleopRunner:
                 failure = exc
             logger.exception("teleop stop failed")
         try:
-            if self.controller is not None:
-                self.controller.clear_reference()
+            self.controller.clear_reference()
         except Exception as exc:
             if failure is None:
                 failure = exc
@@ -508,7 +492,8 @@ class TeleopRunner:
                     commands = [
                         c
                         for c in commands
-                        if c not in (OperatorCommand.HOME, OperatorCommand.BEGIN)
+                        if c
+                        not in (OperatorCommand.HOME, OperatorCommand.BEGIN, OperatorCommand.TARE)
                     ]
                 for index, cmd in enumerate(commands):
                     if self._handle_operator_command(

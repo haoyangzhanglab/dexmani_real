@@ -11,7 +11,7 @@ from dexmani_real.recording.results import SessionResults, error_detail
 from dexmani_real.replay.evaluation import evaluate_replay
 from dexmani_real.replay.replayer import ReplayOutcome, ReplayStatus, replay_targets
 from dexmani_real.replay.trajectory import verify_replay_preflight
-from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
+from dexmani_real.robot.arm_homing import build_home_planner, home_robot
 from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
@@ -36,6 +36,10 @@ class EpisodeReplayConfig:
 
 
 def replay_episode(trajectory, runtime, config):
+    from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
+
+    validate_robot_config(runtime)
+    runtime = resolve_runtime_table(runtime)
     target = Path(config.output_dir)
     if target.exists() and (not target.is_dir() or any(target.iterdir())):
         raise ValueError("replay output must be missing or empty")
@@ -63,6 +67,10 @@ def replay_episode(trajectory, runtime, config):
             quit_callback=request_quit,
             estop_callback=lambda: setattr(shared.estop_request, "value", True),
         )
+        from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+
+        make_arm_fk()
+        home_planner = build_home_planner(runtime)
         robot.connect()
         require_transition(shared, SafetyState.ARMED)
         keyboard.start()
@@ -118,10 +126,10 @@ def replay_episode(trajectory, runtime, config):
                 if OperatorCommand.QUIT in signals:
                     break
                 if OperatorCommand.HOME in signals:
-                    ok = home_policy_robot(
+                    ok = home_robot(
                         shared,
                         runtime,
-                        build_policy_home_planner(runtime),
+                        home_planner,
                         robot=robot,
                         abort_requested=lambda: (
                             bool(shared.estop_request.value or shared.quit_requested.value)

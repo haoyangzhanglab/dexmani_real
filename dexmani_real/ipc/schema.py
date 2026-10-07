@@ -106,13 +106,6 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
         ("timestamp_ns", "<u8"),
         ("depth_frame_number", "<u8"),
         ("color_frame_number", "<u8"),
-        ("rgb_size", "<u8"),
-        ("depth_size", "<u8"),
-        ("rgb_shape_h", "<u4"),
-        ("rgb_shape_w", "<u4"),
-        ("rgb_shape_c", "<u4"),
-        ("depth_shape_h", "<u4"),
-        ("depth_shape_w", "<u4"),
     ],
     align=True,
 )

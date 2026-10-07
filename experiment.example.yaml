@@ -21,3 +21,13 @@ environment:
   table:
     enabled: true
     plane_path: dexmani_real/calibration/state/table_plane.json
+
+# Deployment execution budgets: set from the actual experiment; null refuses startup.
+# CLI values override these only when explicitly supplied. N/H/A/dt remain Policy-owned.
+execution:
+  execution_mode: sync
+  max_decision_age_s: null
+  max_wait_s: null
+  max_tick_lateness_s: null
+  prefetch_steps: null
+  rtc_guidance_cap: null

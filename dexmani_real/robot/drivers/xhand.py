@@ -70,9 +70,8 @@ _TACTILE_VERIFY_SAMPLE_COUNT = 3
 _TACTILE_BIAS_SAMPLE_INTERVAL_S = 0.02
 _PASSIVE_MODE = 0
 _POSITION_MODE = 3
-# Post-bias no-contact residual bound for calibration verification, in XHand
-# SDK-native unknown units.
-_TACTILE_CALIBRATION_RESIDUAL_THRESHOLD = 2.0
+# Baseline repeatability bound in SDK-native units; it cannot certify no contact.
+_TACTILE_BASELINE_RESIDUAL_THRESHOLD = 2.0
 _CONNECTION_HINT = {
     "ethercat": "Check XHand power, EtherCAT cable/link, SDK permissions, and stale slave state",
     "serial": "Check XHand power, USB cable, and serial-device permissions",
@@ -123,7 +122,7 @@ def _tactile_validity(code: int | None, *, comm_type: str) -> tuple[bool, bool]:
 
 
 class XHandError(RuntimeError):
-    """A fail-fast startup or tactile-calibration XHand operation error."""
+    """A fail-fast startup or tactile-baseline preparation error."""
 
     def __init__(self, operation: str, code: int, message: str) -> None:
         self.operation = str(operation)
@@ -374,26 +373,39 @@ class XHand:
             return
         control.close_device()
 
-    def calibrate_tactile(self) -> tuple[bool, bool]:
-        """Validate local no-contact candidates before making either bias usable."""
+    def tare_tactile(self, *, cancel_requested=lambda: False) -> tuple[bool, bool]:
+        """Publish verified baselines after the operator confirms no contact.
+
+        Stable contact also yields zero residual; this does not certify no contact.
+        SDK reads may block; cancellation is checked on both sides of each read.
+        """
         self._tactile_bias_aggregate = self._tactile_bias_dense = None
-        candidates = self._capture_tactile_bias()
-        verified = self._verify_tactile_bias(*candidates)
+        candidates = self._capture_tactile_bias(cancel_requested=cancel_requested)
+        verified = self._verify_tactile_bias(*candidates, cancel_requested=cancel_requested)
+        self._check_tare_cancel(cancel_requested)
         for name, candidate, ok in zip(("aggregate", "dense"), candidates, verified):
             if ok:
                 setattr(self, f"_tactile_bias_{name}", candidate)
-            logger.log(20 if ok else 30, "XHand %s tactile calibrated=%s", name, ok)
+            logger.log(20 if ok else 30, "XHand %s tactile baseline verified=%s", name, ok)
         return (self._tactile_bias_aggregate is not None, self._tactile_bias_dense is not None)
 
-    def _capture_tactile_bias(self):
+    @staticmethod
+    def _check_tare_cancel(cancel_requested):
+        if cancel_requested():
+            from concurrent.futures import CancelledError
+
+            raise CancelledError("tactile tare cancelled")
+
+    def _capture_tactile_bias(self, *, cancel_requested):
         samples = ([], [])
         for _ in range(_TACTILE_BIAS_SAMPLE_COUNT):
+            self._check_tare_cancel(cancel_requested)
             time.sleep(_TACTILE_BIAS_SAMPLE_INTERVAL_S)
+            self._check_tare_cancel(cancel_requested)
             state = self._read_state(apply_bias=False)
+            self._check_tare_cancel(cancel_requested)
             if state is None:
-                raise XHandError(
-                    "calibrate_tactile", -1, "joint state unavailable during bias capture"
-                )
+                raise XHandError("tare_tactile", -1, "joint state unavailable during bias capture")
             for name, channel in zip(("aggregate", "dense"), samples):
                 if getattr(state, f"tactile_{name}_valid"):
                     channel.append(getattr(state, f"tactile_{name}"))
@@ -404,14 +416,17 @@ class XHand:
             for channel in samples
         )
 
-    def _verify_tactile_bias(self, aggregate, dense):
+    def _verify_tactile_bias(self, aggregate, dense, *, cancel_requested):
         ok = [aggregate is not None, dense is not None]
         for _ in range(_TACTILE_VERIFY_SAMPLE_COUNT):
+            self._check_tare_cancel(cancel_requested)
             time.sleep(_TACTILE_BIAS_SAMPLE_INTERVAL_S)
+            self._check_tare_cancel(cancel_requested)
             state = self._read_state(apply_bias=False)
+            self._check_tare_cancel(cancel_requested)
             if state is None:
                 raise XHandError(
-                    "calibrate_tactile", -1, "joint state unavailable during bias verification"
+                    "tare_tactile", -1, "joint state unavailable during bias verification"
                 )
             for index, (name, candidate) in enumerate(
                 zip(("aggregate", "dense"), (aggregate, dense))
@@ -427,7 +442,7 @@ class XHand:
                     ok[index] = (
                         ok[index]
                         and float(np.max(np.linalg.norm(residual, axis=1)))
-                        <= _TACTILE_CALIBRATION_RESIDUAL_THRESHOLD
+                        <= _TACTILE_BASELINE_RESIDUAL_THRESHOLD
                     )
         return tuple(ok)
 

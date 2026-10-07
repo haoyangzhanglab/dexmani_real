@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Usage: python examples/run_policy.py POLICY/TASK/EXPERIMENT
-       --max-decision-age SEC --max-wait SEC --max-tick-lateness SEC
        [--config YAML] [--checkpoint best|latest|FILE]
        [--weights ema|raw] [--inference-steps N] [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]
-真机评估：H 回零 → 布置场景 → B 开始 → S 停止；保存 rollout 与 run_config.yaml，任务成功由离线评估判定。"""
+执行模式与预算从 YAML execution 读取，也可由 CLI 覆盖；缺必需预算拒绝启动。
+真机评估：H 回零，空闲无接触时 T 归零触觉，B 开始，S 停止。
+保存 rollout 与 run_config.yaml，任务成功由离线评估判定。"""
 
 from __future__ import annotations
 
@@ -89,12 +90,21 @@ def _parser() -> argparse.ArgumentParser:
         help="cooperative duration budget from RUNNING admission (default: 60 seconds)",
     )
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--execution-mode", choices=("sync", "async", "rtc"), default="sync")
-    parser.add_argument("--max-decision-age", type=_positive_running_seconds, required=True)
-    parser.add_argument("--max-wait", type=_positive_running_seconds, required=True)
-    parser.add_argument("--max-tick-lateness", type=_positive_running_seconds, required=True)
+    parser.add_argument("--execution-mode", choices=("sync", "async", "rtc"), default=None)
+    parser.add_argument("--max-decision-age", type=_positive_running_seconds, default=None)
+    parser.add_argument("--max-wait", type=_positive_running_seconds, default=None)
+    parser.add_argument("--max-tick-lateness", type=_positive_running_seconds, default=None)
     parser.add_argument("--prefetch-steps", type=_positive_int)
     parser.add_argument("--rtc-guidance-cap", type=float)
+    parser.add_argument(
+        "--print-config",
+        action="store_true",
+        help="Print declared Real config without loading Policy or calibration",
+    )
+    parser.add_argument(
+        "--output", type=Path, default=None, help="Session root (default: checkout/rollouts)"
+    )
+    parser.add_argument("--camera-calibration", type=Path, default=None)
     return parser
 
 
@@ -123,7 +133,7 @@ def _session_directory(root: Path, selector: str) -> Path:
     return candidate
 
 
-def _write_run_config(session_dir, *, args, runtime, info):
+def _write_run_config(session_dir, *, args, runtime, info, execution):
     import dexmani_policy
     import yaml
 
@@ -141,24 +151,14 @@ def _write_run_config(session_dir, *, args, runtime, info):
     compact_info["experiment_dir"] = str(info.experiment_dir)
     compact_info["checkpoint_path"] = str(info.checkpoint_path)
     payload = {
-        "execution_path": f"worker_grid_{args.execution_mode}_v1",
+        "execution_path": f"worker_grid_{execution.execution_mode}_v1",
         "observation_action_pairing": "control_tick_input_and_attempted_targets",
         "experiment": args.experiment,
         "checkpoint": args.checkpoint,
         "policy": compact_info,
         "future_steps": info.horizon - info.n_obs_steps + 1,
         "runtime": config_as_dict(runtime),
-        "execution": {
-            key: getattr(args, key)
-            for key in (
-                "execution_mode",
-                "max_decision_age",
-                "max_wait",
-                "max_tick_lateness",
-                "prefetch_steps",
-                "rtc_guidance_cap",
-            )
-        },
+        "execution": config_as_dict(execution),
         "seed": args.seed,
         "device": args.device,
         "num_episodes": args.num_episodes,
@@ -172,6 +172,24 @@ def _write_run_config(session_dir, *, args, runtime, info):
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    from dexmani_real.config.experiment import config_as_dict, load_experiment_config
+
+    runtime = load_experiment_config(
+        yaml_path=args.config,
+        cli_overrides={
+            "execution.execution_mode": args.execution_mode,
+            "execution.max_decision_age_s": args.max_decision_age,
+            "execution.max_wait_s": args.max_wait,
+            "execution.max_tick_lateness_s": args.max_tick_lateness,
+            "execution.prefetch_steps": args.prefetch_steps,
+            "execution.rtc_guidance_cap": args.rtc_guidance_cap,
+        },
+    )
+    if args.print_config:
+        import yaml
+
+        print(yaml.safe_dump(config_as_dict(runtime), sort_keys=False))
+        return 0
 
     try:
         from dexmani_policy.deployment import (
@@ -196,36 +214,25 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        from dexmani_real.config.experiment import resolve_experiment_config
         from dexmani_real.deployment.config import (
-            ExecutionConfig,
             PolicyRuntimeConfig,
             RolloutRecordingConfig,
         )
 
-        runtime = resolve_experiment_config(yaml_path=args.config)
-        execution = ExecutionConfig(
-            args.execution_mode,
-            args.max_decision_age,
-            args.max_wait,
-            args.max_tick_lateness,
-            args.prefetch_steps,
-            args.rtc_guidance_cap,
-        )
+        execution = runtime.execution.validate(info)
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
         _safe_selector_parts(selector)
     except Exception as exc:
-        print(f"[COMPAT] preflight failed: {exc}", file=sys.stderr)
+        print(f"[PREFLIGHT] preflight failed: {exc}", file=sys.stderr)
         return 1
 
     try:
-        root = Path(__file__).resolve().parents[1] / "rollouts"
+        root = args.output or Path(__file__).resolve().parents[1] / "rollouts"
         session_dir = _session_directory(root, selector)
-        _write_run_config(session_dir, args=args, runtime=runtime, info=info)
         policy_config = PolicyRuntimeConfig(saved_config, info, args.device, args.seed)
         recording_config = RolloutRecordingConfig(str(session_dir), info.task_name)
     except Exception as exc:
-        print(f"[COMPAT] session setup failed: {exc}", file=sys.stderr)
+        print(f"[SESSION] session setup failed: {exc}", file=sys.stderr)
         return 1
 
     print(f"Experiment: {info.experiment_dir}")
@@ -245,6 +252,14 @@ def main(argv: list[str] | None = None) -> int:
             num_episodes=args.num_episodes,
             recording_config=recording_config,
             execution_config=execution,
+            camera_calibration_path=args.camera_calibration,
+            save_run_config=lambda resolved, effective: _write_run_config(
+                session_dir,
+                args=args,
+                runtime=resolved,
+                info=info,
+                execution=effective,
+            ),
         )
     except Exception as exc:
         print(f"[LIFECYCLE] lifecycle failed: {exc}", file=sys.stderr)

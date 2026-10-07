@@ -2,10 +2,16 @@
 
 import time
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
 from dexmani_real.utils.atomic_io import atomic_json_dump, target_is_occupied
+from dexmani_real.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 def utc_now():
@@ -116,3 +122,55 @@ class SessionResults:
         )
         atomic_json_dump(result, self.directory / "session_result.json")
         self.session = result
+
+
+def finalize_policy_attempt(
+    results, recorder, *, recording_started, reason, detail, events, query_arrays, errors=None
+):
+    # Caller has revoked authority and attempted stop before any artifact I/O.
+    events = deepcopy(events)
+    errors = [] if errors is None else errors
+    failure, saved = None, None
+    status = "empty" if recorder is not None else "not_requested"
+    recorder = recorder if recording_started else None
+    if recorder is not None:
+        try:
+            saved = recorder.save_episode(reason=reason, details=errors)
+            status = "published" if saved is not None else "empty"
+        except Exception as exc:
+            failure = exc
+            status = "failed"
+            errors.append(error_detail("recorder_finalize", exc))
+    if results is not None and results.attempt is not None:
+        sidecar = None
+        try:
+            from dexmani_real.utils.atomic_io import atomic_publish
+
+            directory = results.directory / "attempts"
+            sidecar = directory / (results.attempt["attempt_id"] + ".npz")
+            temporary = sidecar.with_suffix(".tmp.npz")
+            np.savez(temporary, **query_arrays)
+            atomic_publish(temporary, sidecar)
+        except Exception as exc:
+            failure = failure or exc
+            errors.append(error_detail("query_sidecar", exc))
+            sidecar = None
+        try:
+            results.finish_attempt(
+                reason,
+                details=detail,
+                errors=errors,
+                recording_status=status,
+                raw_path=str(saved) if saved is not None else None,
+                staging_path=str(recorder.staging_path)
+                if recorder is not None and recorder.staging_path is not None and saved is None
+                else None,
+                row_count=recorder.written_frames if recorder is not None else 0,
+                query_sidecar=str(sidecar) if sidecar else None,
+                trace=events,
+            )
+        except Exception as exc:
+            failure = failure or exc
+            logger.exception("attempt result publication failed")
+    if failure is not None:
+        raise failure

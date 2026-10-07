@@ -2,11 +2,12 @@
 """Usage: python examples/xhand_diagnostics.py
 
 Reads live XHand identity, joints and tactile health in a crash-isolated SDK worker.
-No motion commands or offline --help mode; use supervised teleop/home for motion.
+No motion commands; --help is offline. Use supervised teleop/home for motion.
 """
 
 from __future__ import annotations
 
+import argparse
 import math
 import os
 import signal
@@ -345,7 +346,10 @@ def _run_isolated_hardware_session() -> int:
 
 
 if __name__ == "__main__":
-    if _HARDWARE_WORKER_ARG in sys.argv[1:]:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(_HARDWARE_WORKER_ARG, action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args._xhand_hardware_worker:
         _disable_worker_core_dump()
         raise SystemExit(_run_hardware_session())
     raise SystemExit(_run_isolated_hardware_session())

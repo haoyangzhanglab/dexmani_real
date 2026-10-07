@@ -46,21 +46,24 @@ Real-Robot Rollout
 
 ## Installation
 
-要求 Python >= 3.10。
+支持源码 checkout + editable 安装（Python >= 3.10）；assets 按 checkout 路径读取，不宣称 wheel/PyPI 支持。
 
 ```bash
-python -m pip install -e .
+python -m pip install -e ".[dev]"
+# 桌面交互入口另需：python -m pip install -e ".[interactive]"
 ```
 
 真实实验机还需要安装对应硬件 SDK、几何 / 点云依赖以及策略推理环境。沿用实验机现有环境，不在实验过程中自动升级。
 离线几何导出需要 Pinocchio，点云诊断视图需要 Open3D（公共点云导出使用 NumPy/SciPy/OpenCV）；retargeting 需要 NLopt/选定后端。
 交互入口使用 pynput 全局键盘监听，需要桌面显示环境；`--info` 不需要 Rerun。
 
+基础依赖、交互依赖和开发检查依赖在 `pyproject.toml` 中分开；几何、算法及厂商 SDK 使用实验环境中已核实的安装，详见 [离线复现入口](docs/reproduction.md)。该页包含不接硬件的小型 synthetic Raw → export → window 路径和未发布资源边界。
+
 ## Quick Start
 
 ### 1. 检查配置
 
-支持 `--config` 的实验入口可先在不启动硬件的情况下检查 resolved config：
+支持 `--config` 的实验入口可先在不启动硬件的情况下检查声明配置：
 
 ```bash
 cp experiment.example.yaml experiment.yaml
@@ -69,7 +72,7 @@ python examples/collect_teleop.py --print-config
 python examples/collect_teleop.py --config experiment.yaml --print-config
 ```
 
-配置优先级为 CLI > YAML > 默认值；未知字段和配置结构错误会报错。`--print-config` 解析当前运行配置及启用的桌面标定，但不启动设备。TAG/DexPilot 参数仅在启用手部遥操作时、创建进程或连接设备前校验所选后端，因此打印配置不代表该后端已通过启动检查。
+配置优先级为 CLI > YAML > 默认值；未知字段和配置结构错误会报错。`--print-config` 只显示声明值，不读取现场标定或导入设备/优化器/显示后端。TAG/DexPilot 参数仅在启用手部遥操作时、创建进程或连接设备前校验所选后端，因此打印配置不代表该后端已通过启动检查。
 
 ### 2. 标定
 
@@ -81,7 +84,8 @@ python examples/pointcloud_process_example.py --help
 
 相机外参、桌面平面、hand mount、VR alignment 等属于**当前实验现场状态**。更换相机、桌面、机器人安装或实验布局后，应重新标定或确认，而不是沿用历史数值作为固定契约。首次桌面标定在 pointcloud 示例中选择 table calibration，不要求旧 plane 文件。
 真机打印转接件比原始模型薄 10 mm，真实手基座/指尖 FK 使用当前安装补偿（默认 -0.015 m）。自碰撞、环境碰撞和运动规划按项目约定直接使用原始 URDF/SRDF/网格的标称几何（-0.005 m），不注入该补偿；离线模型检查不能替代真机验证。
-物理录制允许缺相机外参，但点云需要数据对应的有效内外参和 depth scale。同一会话的点云与录制共用启动时加载的外参，文件修改在下次会话生效。
+物理录制允许缺相机外参，但点云需要数据对应的有效内外参和 depth scale。同一会话的点云与录制共用启动时加载的外参，HOME/有效点云 recipe 共用一次读取的桌面平面，VR alignment 同样是会话快照。文件修改在下次会话生效。
+路径可显式选择：采集 `--vr-transform` / `--camera-calibration`，policy `--camera-calibration` / `--output`，相机/VR 标定 `--output`；桌面沿用 YAML `environment.table.plane_path`（相对 checkout），示教输出沿用 `policy.episodes_dir`。默认仍是既有 checkout 路径，不自动移动历史标定或数据。
 
 ### 3. 采集示教
 
@@ -91,7 +95,7 @@ python examples/collect_teleop.py \
     --task-name <task>
 ```
 
-启动会在停止监听建立后执行手部 HOME。H 为整机 HOME，B 开始，C 暂停/恢复；恢复时保存上一段并开始新 episode。S 停止保存，D 丢弃当前 capture，Q 进入退出确认、再次 Q 保存退出（尚未开始且无 capture 时直接退出），ESC 急停。键盘 jog 入口仅在 R 时 HOME。
+启动会在停止监听建立后执行手部 HOME。触觉需在空闲、无 capture 且操作者确认手部无接触后按 **T** 采集并核验基线，S/Q/ESC 可取消。T 只做基线准备，SDK 阻塞期间取消仍需等待返回；未归零或失败的通道保留 NaN，不阻断关节任务。H 为整机 HOME，B 开始，C 暂停/恢复；恢复时保存上一段并开始新 episode。S 停止保存，D 丢弃当前 capture，Q 进入退出确认、再次 Q 保存退出（尚未开始且无 capture 时直接退出），ESC 急停。键盘 jog 入口仅在 R 时 HOME。
 操作者结束原因和随后发生的停止故障分别留证；写盘或发布失败保留 staging 并报告会话失败，已发布 Raw 不回写。
 录制启用全部已接入物理模态，aggregate/dense 触觉独立校准和判断可用性，缺测保留 NaN；驱动报告不可用状态，离线导出的 `export_report.json` 汇总缺测情况。相机无可用帧或任一路持续停帧时停止并保留前缀，不补黑图。
 
@@ -133,15 +137,15 @@ python examples/run_policy.py <policy/task/experiment> --config experiment.yaml 
   --max-tick-lateness "$MAX_TICK_LATENESS_S"
 ```
 
-H 执行 HOME，B 请求开始，S 停止，Q 退出；开始前检查当前 arm/hand HOME 姿态，不依赖历史 HOME 令牌。默认每段运行预算 60 秒，可用 `--max-duration` 修改。
+H 执行 HOME，空闲且确认手部无接触后 T 归零触觉，B 请求开始，S 停止，Q 退出；开始前检查当前 arm/hand HOME 姿态。默认每段运行预算 60 秒，可用 `--max-duration` 修改。
 
 可用 `--n-action-steps N` 覆盖本次部署的执行段长度；必须满足
 `n_obs_steps - 1 + N <= horizon`，不会改写训练配置或 checkpoint。
-实际长度和覆盖参数会保存在 `run_config.yaml`。
+实际长度、覆盖参数和会话真正使用的桌面平面快照会保存在 `run_config.yaml`。
 
-三个预算变量需由实验者显式指定（秒），其中槽位迟到容限必须小于保存的 dt；它们不等于 episode 总时长，也不由论文或 warmup 推断为硬件安全值。
+三个预算可保存到同一 YAML 的 `execution` 小节，或由 CLI 显式指定（秒）；未指定的 CLI 不覆盖 YAML，显式 beta=0 保留。缺预算仍拒绝启动，其中槽位迟到容限必须小于保存的 dt；它们不等于 episode 总时长，也不由论文或 warmup 推断为硬件安全值。
 
-默认 `--execution-mode sync`。异步基线增加 `--execution-mode async --prefetch-steps "$D"`；RTC 增加 `--execution-mode rtc --prefetch-steps "$D" --rtc-guidance-cap "$BETA"`。模型加载与 warmup 在设备连接前完成，RTC 仅支持已适配的连续动作 DDIM 路径。参数约束、支持范围、调度与离线验证见 [Policy 执行说明](docs/policy_execution.md)。
+模式由 `execution.execution_mode` 指定，默认 sync。CLI 可覆盖为 `--execution-mode async --prefetch-steps "$D"`，或 `--execution-mode rtc --prefetch-steps "$D" --rtc-guidance-cap "$BETA"`；prefetch 和 guidance 也可写入 YAML。模型加载与 warmup 在设备连接前完成，RTC 仅支持已适配的连续动作 DDIM 路径。参数约束、当前 warmup 限制、调度与离线验证见 [Policy 执行说明](docs/policy_execution.md)。
 
 录制行是控制观测与尝试目标，并非每条 action 都有一次模型 query。rollout 录制独立保存完整 RGB-D/触觉，公共点云由保存行的 RGB-D 重建。
 工作空间 bounds 只裁剪 EEF 意图；它不证明最终 FK 或整条轨迹都在界内。

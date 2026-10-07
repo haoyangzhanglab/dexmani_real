@@ -1,9 +1,11 @@
 """Policy keyboard ownership and HOME/start/stop authorization ordering."""
 
+from concurrent.futures import CancelledError
+
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.channels import RuntimeChannels
 from dexmani_real.planning import XArm7MotionPlanner
-from dexmani_real.robot.arm_homing import home_policy_robot
+from dexmani_real.robot.arm_homing import home_robot
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.safety import (
     RunEndReason,
@@ -28,7 +30,9 @@ class PolicyOperator:
         *,
         robot,
         execute: bool,
+        idle_for_tare=None,
     ):
+        self.idle_for_tare = idle_for_tare
         self.home_results = []
         self.shared = shared
         self.robot = robot
@@ -90,6 +94,28 @@ class PolicyOperator:
                 logger.warning("operator: C is not used in policy deployment; ignored")
             elif signal is OperatorCommand.DISCARD:
                 logger.warning("operator: D is not used in policy deployment; ignored")
+            elif signal is OperatorCommand.TARE:
+                discard_begin_in_batch = True
+                if stop_in_batch or self.idle_for_tare is None or not self.idle_for_tare():
+                    logger.warning(
+                        "T ignored: tactile tare requires idle, no capture/reset/pending inference"
+                    )
+                    continue
+                if int(self.shared.safety_state.value) != int(SafetyState.ARMED):
+                    continue
+                try:
+                    result = self.robot.tare_tactile(cancel_requested=self._home_abort_requested)
+                    logger.info("Explicit tactile baseline aggregate/dense: %s", result)
+                except CancelledError:
+                    logger.info("Tactile tare cancelled; no new baseline published")
+                finally:
+                    for command in (
+                        OperatorCommand.TARE,
+                        OperatorCommand.HOME,
+                        OperatorCommand.BEGIN,
+                    ):
+                        self.keyboard.drain_signal(command)
+                return
             elif signal is OperatorCommand.HOME:
                 if self.planner is None:
                     logger.warning("operator: H is disabled in policy deployment")
@@ -122,7 +148,7 @@ class PolicyOperator:
         home_result = {"outcome": "incomplete"}
         self.home_results.append(home_result)
         try:
-            completed = home_policy_robot(
+            completed = home_robot(
                 self.shared,
                 self.runtime,
                 self.planner,
@@ -161,6 +187,7 @@ class PolicyOperator:
         # HOME blocks while hand/arm homing completes. Drop stale
         # H and B events, but preserve S/Q/ESC so an operator can
         # still stop, quit, or e-stop immediately afterwards.
+        self.keyboard.drain_signal(OperatorCommand.TARE)
         self.keyboard.drain_signal(OperatorCommand.HOME)
         self.keyboard.drain_signal(OperatorCommand.BEGIN)
         return True

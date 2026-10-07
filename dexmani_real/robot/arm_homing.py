@@ -189,13 +189,20 @@ def execute_arm_home(
             get_logger(__name__).exception("HOME cleanup also failed")
 
 
-def build_policy_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
+def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
     """Construct the shared return-home planner for teleop, policy and replay.
 
     Online Cartesian IK checks robot endpoint self-collision. Return-home
     additionally needs path/workspace/table/static-box checks, so HOME uses
     a planner configured with the current environment.
     """
+    runtime.arm.homing.validate()
+    runtime.policy.workspace.validate()
+    runtime.environment.validate()
+    for box in runtime.environment.static_boxes:
+        box.validate()
+    if runtime.environment.table.enabled:
+        runtime.environment.table.validate()
     policy = runtime.policy
     workspace = policy.workspace.as_array()
     return XArm7MotionPlanner(
@@ -210,7 +217,7 @@ def build_policy_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
     )
 
 
-def home_policy_robot(shared, runtime, planner, *, robot, abort_requested):
+def home_robot(shared, runtime, planner, *, robot, abort_requested):
     if int(shared.safety_state.value) != int(SafetyState.ARMED):
         return False
     failure = None

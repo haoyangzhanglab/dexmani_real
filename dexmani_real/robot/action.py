@@ -38,6 +38,21 @@ class ActionRealization:
 
 class ActionRealizer:
     def __init__(self, runtime, planner=None, collision_model=None):
+        for name, lower, upper, size in (
+            ("arm", runtime.arm.joint_limit_lower, runtime.arm.joint_limit_upper, 7),
+            ("hand", runtime.hand.qpos_min_rad, runtime.hand.qpos_max_rad, 12),
+        ):
+            lower, upper = np.asarray(lower), np.asarray(upper)
+            if (
+                lower.shape != (size,)
+                or upper.shape != (size,)
+                or not np.isfinite(lower).all()
+                or not np.isfinite(upper).all()
+                or np.any(lower >= upper)
+            ):
+                raise ValueError(f"{name} action limits must be finite ordered ({size},) vectors")
+        if planner is not None:
+            runtime.policy.workspace.validate()
         self.runtime = runtime
         self.planner = planner
         self.collision_model = collision_model if planner is None else planner.collision_model
@@ -47,8 +62,12 @@ class ActionRealizer:
 
     @classmethod
     def for_mode(cls, runtime, mode):
+        runtime.arm.validate()
+        runtime.hand.validate()
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
+        if mode == "eef":
+            runtime.policy.workspace.validate()
         planner = (
             XArm7MotionPlanner.create_default(
                 online_ik_profile=make_online_ik_config(runtime),

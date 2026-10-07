@@ -82,6 +82,9 @@ class DexManiRobot:
     def __init__(
         self, shared, runtime, *, arm_factory=None, hand_factory=None, check_services=None
     ):
+        from dexmani_real.config.experiment import validate_robot_config
+
+        validate_robot_config(runtime)
         self.shared, self.runtime = shared, runtime
         self._arm_factory, self._hand_factory = arm_factory, hand_factory
         self.check_services = check_services
@@ -126,10 +129,6 @@ class DexManiRobot:
                     self._hand_factory = XHand
                 self.hand = self._hand_factory(self.runtime.hand)
                 self.hand.connect()
-                try:
-                    self.hand.calibrate_tactile()
-                except Exception:
-                    logger.warning("hand tactile calibration failed", exc_info=True)
             self._connected = True
             deadline = time.monotonic() + self.runtime.hand.state_read_failure_timeout_s
             while True:
@@ -150,6 +149,30 @@ class DexManiRobot:
             except Exception:
                 logger.exception("partial robot connection cleanup failed")
             raise
+
+    def tare_tactile(self, *, cancel_requested):
+        """Explicit idle-owner preparation; never HOME or move fingers for tare."""
+        self.check()
+        if int(self.shared.safety_state.value) != int(SafetyState.ARMED):
+            raise RuntimeError("tactile tare requires idle ARMED state")
+        if self.hand is None:
+            return False, False
+        revoke_motion(self.shared)
+        self.stop()
+
+        def cancelled():
+            self.check()
+            return bool(
+                cancel_requested()
+                or not self.shared.is_running.value
+                or self.shared.stop_request.value
+                or self.shared.estop_request.value
+                or self.shared.error_state.value
+                or self.shared.quit_requested.value
+            )
+
+        self._last_hand = None
+        return self.hand.tare_tactile(cancel_requested=cancelled)
 
     def arm_feedback(self, qpos, qvel, effort):
         if any(np.shape(x) != (7,) or not np.isfinite(x).all() for x in (qpos, qvel)):

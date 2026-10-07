@@ -14,9 +14,7 @@ from pathlib import Path
 
 import yaml
 
-from dexmani_real.calibration.camera.session import run_camera_calibration
-from dexmani_real.calibration.camera.solver import ARUCO_DICT_NAME, ArucoConfig
-from dexmani_real.config.experiment import resolve_experiment_config
+from dexmani_real.config.experiment import load_experiment_config
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,7 +40,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="experiment YAML; --serial takes precedence",
     )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Camera calibration JSON (default: checkout calibration/state/cameras.json)",
+    )
     args = parser.parse_args(argv)
+
+    from dexmani_real.calibration import CAMERAS_PATH
+    from dexmani_real.calibration.camera.session import run_camera_calibration
+    from dexmani_real.calibration.camera.solver import ARUCO_DICT_NAME, ArucoConfig
+
     aruco = ArucoConfig()
 
     print("=" * 60)
@@ -54,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 60)
 
     try:
-        runtime = resolve_experiment_config(
+        runtime = load_experiment_config(
             yaml_path=args.config,
             cli_overrides={"camera.serial": args.serial, "policy.hand_enabled": False},
         )
@@ -73,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime,
         hand_geometry=args.hand_geometry,
         aruco_config=aruco,
+        output_path=args.output or CAMERAS_PATH,
     )
 
 

@@ -10,9 +10,10 @@ import math
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from dexmani_real.config.pointcloud import PointCloudConfig
+if TYPE_CHECKING:
+    from dexmani_real.config.pointcloud import PointCloudConfig
 
 _SUPPORTED_OBSERVATION_FIELDS = frozenset(
     {
@@ -79,6 +80,8 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
         ):
             raise ValueError("Live fingertip_points requires five distinct non-empty link names")
     if "point_cloud" in names:
+        from dexmani_real.config.pointcloud import PointCloudConfig
+
         recipe = info.pointcloud_config
         if not isinstance(recipe, dict):
             raise ValueError("Live point_cloud requires saved numerical parameters")

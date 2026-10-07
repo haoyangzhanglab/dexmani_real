@@ -92,8 +92,8 @@ class TableCollisionConfig:
 
     ``plane_abcd`` uses the robot-base/world convention ``ax+by+cz+d=0``.
     Runtime resolution refreshes enabled collision geometry from ``plane_path``.
-    Perception reads that file separately when its effective point-cloud config
-    requires table removal, regardless of collision-table enablement.
+    Session assembly also resolves it when the effective point-cloud recipe
+    requires table removal, sharing one snapshot regardless of collision enablement.
     Fine teleoperation deliberately does not use this geometry to reject
     robot-table contact.
     """

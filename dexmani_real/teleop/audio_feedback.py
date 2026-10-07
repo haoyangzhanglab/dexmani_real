@@ -1,7 +1,8 @@
 """Play assets/audio/*.wav prompts without blocking the control loop.
 
-A daemon thread uses aplay/paplay; play() cancels the current prompt.
-Missing players or files produce a warning and skip playback.
+A daemon thread uses one player selected at construction; play() preempts queued
+prompts. Missing players or playback failures disable audio for the session.
+Unknown events and missing files are logged and skipped.
 """
 
 from __future__ import annotations
@@ -36,13 +37,11 @@ _EVENT_MAP: dict[str, str] = {
     "calibrated": "轴向已标定.wav",
 }
 
-_PLAYER_FALLBACK_MAX_RUNTIME_S = 0.25
 _STDERR_LOG_LIMIT = 512
 
 
 @dataclass(frozen=True)
 class _AudioRequest:
-    event: str
     path: str
     generation: int
 
@@ -65,18 +64,10 @@ class AudioFeedback:
         self._pending: list[_AudioRequest] = []
         self._generation = 0
         self._closed = False
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            daemon=True,
-            name="audio-feedback",
-        )
-        self._worker.start()
-
-    def _ensure_worker_locked(self) -> None:
-        """Restart an unexpectedly terminated worker while holding the condition."""
-        if self._worker.is_alive() or self._closed:
-            return
-        logger.warning("Audio worker was not alive; restarting")
+        self._player = next((name for name in ("aplay", "paplay") if shutil.which(name)), None)
+        self._disabled = self._player is None
+        if self._disabled:
+            logger.warning("No audio player; audio disabled")
         self._worker = threading.Thread(
             target=self._worker_loop,
             daemon=True,
@@ -109,14 +100,13 @@ class AudioFeedback:
 
         # An immediate cue supersedes queued prompts; the worker checks generation.
         with self._condition:
-            if self._closed:
-                logger.warning("Audio event ignored after close: %s", event)
+            if self._closed or self._disabled:
+                logger.warning("Audio event ignored: player closed or disabled (%s)", event)
                 return
             self._generation += 1
             self._pending.clear()
             self._terminate_current_locked()
-            self._pending.append(_AudioRequest(event, path, self._generation))
-            self._ensure_worker_locked()
+            self._pending.append(_AudioRequest(path, self._generation))
             logger.debug("Audio queued: event=%s mode=play", event)
             self._condition.notify_all()
 
@@ -133,11 +123,10 @@ class AudioFeedback:
             return
 
         with self._condition:
-            if self._closed:
-                logger.warning("Audio event ignored after close: %s", event)
+            if self._closed or self._disabled:
+                logger.warning("Audio event ignored: player closed or disabled (%s)", event)
                 return
-            self._pending.append(_AudioRequest(event, path, self._generation))
-            self._ensure_worker_locked()
+            self._pending.append(_AudioRequest(path, self._generation))
             logger.debug("Audio queued: event=%s mode=queue", event)
             self._condition.notify_all()
 
@@ -188,21 +177,19 @@ class AudioFeedback:
         """Serialize prompts; ``play`` generation changes preempt safely."""
         while True:
             with self._condition:
-                while not self._pending and not self._closed:
+                while not self._pending and not self._closed and not self._disabled:
                     self._condition.wait()
-                if self._closed:
+                if self._closed or self._disabled:
                     return
                 request = self._pending.pop(0)
                 self._active_request = request
             try:
                 self._play_one(request)
             except Exception:
-                # Keep the permanent worker alive after an unexpected player failure.
-                logger.warning(
-                    "Audio worker recovered from unexpected failure: event=%s",
-                    request.event,
-                    exc_info=True,
-                )
+                logger.warning("Audio failed; disabling playback", exc_info=True)
+                with self._condition:
+                    self._disabled = True
+                    self._pending.clear()
             finally:
                 with self._condition:
                     if self._active_request is request:
@@ -210,83 +197,41 @@ class AudioFeedback:
                     self._condition.notify_all()
 
     def _play_one(self, request: _AudioRequest) -> None:
-        players = _find_players()
-        if not players:
-            logger.warning("Audio failed: event=%s reason=no-player", request.event)
-            return
-
-        for player_index, player in enumerate(players):
+        with self._condition:
+            if request.generation != self._generation or self._closed:
+                return
+        player = self._player
+        cmd = [player, "-q", request.path] if player == "aplay" else [player, request.path]
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             with self._condition:
-                if request.generation != self._generation or self._closed:
-                    logger.debug("Audio cancelled before start: event=%s", request.event)
-                    return
-            cmd = [player, "-q", request.path] if player == "aplay" else [player, request.path]
-            proc: subprocess.Popen | None = None
-            started_s = time.monotonic()
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                )
-                with self._condition:
-                    if request.generation != self._generation or self._closed:
-                        proc.kill()
-                        proc.communicate()
-                        logger.debug("Audio cancelled during start: event=%s", request.event)
-                        return
-                    self._current_proc = proc
-                logger.debug(
-                    "Audio started: event=%s player=%s pid=%s",
-                    request.event,
-                    player,
-                    getattr(proc, "pid", "?"),
-                )
-                _stdout, stderr = proc.communicate()
-                runtime_s = time.monotonic() - started_s
-                returncode = int(proc.returncode or 0)
-            except Exception:
-                logger.warning(
-                    "Audio launch/playback failed: event=%s player=%s",
-                    request.event,
-                    player,
-                    exc_info=True,
-                )
-                runtime_s = time.monotonic() - started_s
-                returncode = -1
-                stderr = b""
-            finally:
-                with self._condition:
-                    if proc is not None and self._current_proc is proc:
-                        self._current_proc = None
-                    self._condition.notify_all()
-
-            with self._condition:
+                self._current_proc = proc
                 cancelled = request.generation != self._generation or self._closed
             if cancelled:
-                logger.debug("Audio cancelled: event=%s", request.event)
-                return
-            if returncode == 0:
-                logger.debug("Audio completed: event=%s", request.event)
-                return
-
-            stderr_text = _stderr_text(stderr)
-            logger.warning(
-                "Audio failed: event=%s player=%s returncode=%d runtime=%.3fs stderr=%s",
-                request.event,
-                player,
-                returncode,
-                runtime_s,
-                stderr_text or "<empty>",
-            )
-            has_fallback = player_index + 1 < len(players)
-            if not has_fallback or runtime_s > _PLAYER_FALLBACK_MAX_RUNTIME_S:
-                return
-            logger.info(
-                "Audio retrying with fallback: event=%s next_player=%s",
-                request.event,
-                players[player_index + 1],
-            )
+                proc.kill()
+            # Never wait for a child while holding the submission lock.
+            _, stderr = proc.communicate()
+            with self._condition:
+                cancelled = request.generation != self._generation or self._closed
+            if not cancelled and proc.returncode:
+                raise RuntimeError(f"{player} exited {proc.returncode}: {_stderr_text(stderr)}")
+        except BaseException:
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    logger.warning("Audio cleanup kill failed", exc_info=True)
+                try:
+                    proc.communicate()
+                except Exception:
+                    logger.warning("Audio cleanup reap failed", exc_info=True)
+            raise
+        finally:
+            with self._condition:
+                if self._current_proc is proc:
+                    self._current_proc = None
+                self._condition.notify_all()
 
 
 def _stderr_text(stderr: bytes | str | None) -> str:
@@ -294,8 +239,3 @@ def _stderr_text(stderr: bytes | str | None) -> str:
         return ""
     text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr)
     return " ".join(text.strip().split())[:_STDERR_LOG_LIMIT]
-
-
-def _find_players() -> list[str]:
-    """Return available system players in fallback order."""
-    return [name for name in ("aplay", "paplay") if shutil.which(name)]

@@ -2,6 +2,7 @@
 
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -17,12 +18,10 @@ from dexmani_real.deployment.observation import (
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.recording.frame import build_episode_frame
 from dexmani_real.recording.recorder import (
-    AsyncEpisodeRecorder,
     RecordingError,
     snapshot_recording_metadata,
 )
-from dexmani_real.recording.results import error_detail
-from dexmani_real.robot.action import ActionRealizer
+from dexmani_real.recording.results import error_detail, finalize_policy_attempt
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.robot import DispatchError, DispatchInterrupted, DispatchStatus
 from dexmani_real.runtime.observation import (
@@ -76,6 +75,8 @@ class PolicyRunner:
         policy_info,
         *,
         robot,
+        realizer,
+        recorder=None,
         poll_operator=None,
         model_runtime,
         execution_config,
@@ -87,6 +88,19 @@ class PolicyRunner:
         camera_calibration=None,
         results=None,
     ):
+        if recorder is not None:
+            if results is None or recording_config is None:
+                raise ValueError("policy recording requires recorder, recording_config and results")
+            if not (
+                recorder.data_dir.resolve()
+                == results.directory.resolve()
+                == Path(recording_config.data_dir).resolve()
+            ):
+                raise ValueError(
+                    "recorder, recording_config and results must share one session directory"
+                )
+        elif recording_config is not None:
+            raise ValueError("recording_config requires an assembled recorder")
         self.results = results
         self.query_arrays = {}
         self.shared = shared
@@ -102,16 +116,7 @@ class PolicyRunner:
         self.num_episodes = num_episodes
         self.recording_config = recording_config
         self.camera_calibration = camera_calibration
-        self.recorder = (
-            AsyncEpisodeRecorder(
-                recording_config.data_dir,
-                control_hz=1.0 / policy_info.control_dt_s,
-                rgb_shape=(runtime.camera.height, runtime.camera.width, 3),
-                execution_path=f"worker_grid_{self.execution.execution_mode}_v1",
-            )
-            if recording_config is not None
-            else None
-        )
+        self.recorder = recorder
         self.history = ObservationHistory(policy_info.n_obs_steps)
         self.recording_started = False
         self.plan = None
@@ -128,7 +133,7 @@ class PolicyRunner:
         self.next_step_ns = 0
         self.previous_arm = None
         self.completed = 0
-        self.realizer = ActionRealizer.for_mode(runtime, policy_info.action_mode)
+        self.realizer = realizer
         fields = set(self.policy_info.observation_fields)
         requires_rgb = "rgb" in fields
         self.requires_cloud = "point_cloud" in fields
@@ -239,55 +244,20 @@ class PolicyRunner:
             raise failure
 
     def _finalize_attempt(self, reason, detail, errors=None):
-        # Caller has revoked authority and attempted stop before any artifact I/O.
-        errors = [] if errors is None else errors
-        failure, saved = None, None
-        status = "empty" if self.recorder is not None else "not_requested"
-        recorder = self.recorder if self.recording_started else None
-        if recorder is not None:
-            try:
-                recorder.policy_trace = {"execute": self.execute, "events": self.events}
-                saved = recorder.save_episode(reason=reason)
-                status = "published" if saved is not None else "empty"
-            except Exception as exc:
-                failure = exc
-                status = "failed"
-                errors.append(error_detail("recorder_finalize", exc))
-        if self.results is not None and self.results.attempt is not None:
-            sidecar = None
-            try:
-                from dexmani_real.utils.atomic_io import atomic_publish
-
-                directory = self.results.directory / "attempts"
-                sidecar = directory / (self.results.attempt["attempt_id"] + ".npz")
-                temporary = sidecar.with_suffix(".tmp.npz")
-                np.savez(temporary, **self.query_arrays)
-                atomic_publish(temporary, sidecar)
-            except Exception as exc:
-                failure = failure or exc
-                errors.append(error_detail("query_sidecar", exc))
-                sidecar = None
-            try:
-                self.results.finish_attempt(
-                    reason,
-                    details=detail,
-                    errors=errors,
-                    recording_status=status,
-                    raw_path=str(saved) if saved is not None else None,
-                    staging_path=str(recorder.staging_path)
-                    if recorder is not None and recorder.staging_path is not None and saved is None
-                    else None,
-                    row_count=recorder.written_frames if recorder is not None else 0,
-                    query_sidecar=str(sidecar) if sidecar else None,
-                    trace=self.events,
-                )
-            except Exception as exc:
-                failure = failure or exc
-                logger.exception("attempt result publication failed")
-        self.query_arrays = {}
-        self.recording_started = False
-        if failure is not None:
-            raise failure
+        try:
+            finalize_policy_attempt(
+                self.results,
+                self.recorder,
+                recording_started=self.recording_started,
+                reason=reason,
+                detail=detail,
+                events=self.events,
+                query_arrays=self.query_arrays,
+                errors=errors,
+            )
+        finally:
+            self.query_arrays = {}
+            self.recording_started = False
 
     def _start_observation(self):
         row = self._read_observation()
@@ -600,7 +570,9 @@ class PolicyRunner:
 
     def _record(self, row, command=None, result=None):
         if self.recorder is not None and row is not None:
-            self.recorder.add_frame(build_episode_frame(row, command, result))
+            index = self.recorder.add_frame(build_episode_frame(row, command, result))
+            if index is not None:
+                self._event("record_submitted", slot=self.last_slot, raw_row_index=index)
 
     def _command_for_slot(self, row, slot):
         plan = self.plan
@@ -928,6 +900,14 @@ class PolicyRunner:
                 failure = failure or exc
                 logger.exception("episode cleanup failed")
             try:
+                if self.robot.stop_required:
+                    self.robot.stop()
+            except Exception as exc:
+                failure = failure or exc
+                logger.exception(
+                    "policy shutdown stop failed before remaining artifact finalization"
+                )
+            try:
                 if (
                     self.results is not None
                     and self.results.attempt is not None
@@ -938,12 +918,6 @@ class PolicyRunner:
                     )
             except Exception as exc:
                 failure = failure or exc
-            try:
-                if self.robot.stop_required:
-                    self.robot.stop()
-            except Exception as exc:
-                failure = failure or exc
-                logger.exception("policy shutdown stop failed after episode finalization")
             if self.recorder is not None:
                 try:
                     self.recorder.close()

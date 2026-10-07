@@ -1,4 +1,4 @@
-"""Offline counterexamples for the second research refinement; no devices."""
+"""Offline geometry, timing and artifact-lifecycle regressions; no devices."""
 
 import json
 from dataclasses import replace
@@ -126,7 +126,9 @@ def test_two_axis_handeye_recovers_transform_and_is_coordinate_invariant():
     ).as_euler("xyz")
     other = check_hand_eye_excitation(transformed)
     assert other["valid_relative_motion_count"] == summary["valid_relative_motion_count"]
-    assert other["axis_separation_max_deg"] == pytest.approx(summary["axis_separation_max_deg"])
+    assert other["axis_separation_witness_deg"] == pytest.approx(
+        summary["axis_separation_witness_deg"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -444,8 +446,8 @@ def test_replay_completed_trajectory_survives_session_fault(tmp_path, monkeypatc
         return session.ReplayOutcome(session.ReplayStatus.COMPLETED, data)
 
     monkeypatch.setattr(session, "replay_targets", replay)
-    monkeypatch.setattr(session, "build_policy_home_planner", lambda *a: None)
-    monkeypatch.setattr(session, "home_policy_robot", lambda *a, **kw: False)
+    monkeypatch.setattr(session, "build_home_planner", lambda *a: None)
+    monkeypatch.setattr(session, "home_robot", lambda *a, **kw: False)
     monkeypatch.setattr(session, "shutdown_local_runtime", lambda *a, **kw: fault != "shutdown")
 
     def evaluate(*a, **kw):
@@ -553,7 +555,7 @@ def test_policy_home_failure_is_retained_in_memory_without_active_io(monkeypatch
     shared.safety_state.value = int(SafetyState.ARMED)
     shared.start_request = NS(value=False)
     monkeypatch.setattr(operator, "KeyboardInput", lambda **kw: NS(drain_signal=lambda *a: None))
-    monkeypatch.setattr(operator, "home_policy_robot", lambda *a, **kw: False)
+    monkeypatch.setattr(operator, "home_robot", lambda *a, **kw: False)
     owner = operator.PolicyOperator(shared, ExperimentConfig(), NS(), robot=NS(), execute=True)
     assert owner._run_home()
     assert owner.home_results == [{"outcome": "failed"}]

@@ -11,10 +11,9 @@ import math
 
 import yaml
 
-from dexmani_real.config.experiment import config_as_dict, resolve_experiment_config
-from dexmani_real.teleop.session import (
+from dexmani_real.config.experiment import config_as_dict, load_experiment_config
+from dexmani_real.teleop.config import (
     DEFAULT_TASK_NAME,
-    run_teleop_experiment,
     validate_task_dir_name,
 )
 from dexmani_real.utils.log import get_logger
@@ -75,10 +74,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--print-config", action="store_true", help="Print all config values and exit"
     )
+    parser.add_argument("--vr-transform", default=None, help="Explicit VR alignment JSON")
+    parser.add_argument(
+        "--camera-calibration", default=None, help="Explicit camera extrinsics JSON"
+    )
     args = parser.parse_args(argv)
 
     try:
-        runtime = resolve_experiment_config(
+        runtime = load_experiment_config(
             yaml_path=args.config,
             cli_overrides={
                 "arm.max_joint_acceleration_deg_per_s2": args.acc,
@@ -106,10 +109,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("policy.hand_enabled=false requires explicit --no-hand confirmation")
 
     try:
+        from dexmani_real.calibration import VR_TRANSFORM_PATH
+        from dexmani_real.teleop.session import run_teleop_experiment
+
         return run_teleop_experiment(
             runtime,
             task_name=args.task_name,
             allow_no_hand=args.no_hand,
+            vr_transform_path=args.vr_transform or VR_TRANSFORM_PATH,
+            camera_calibration_path=args.camera_calibration,
         )
     except Exception:
         logger.error(

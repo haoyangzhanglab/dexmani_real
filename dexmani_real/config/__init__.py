@@ -8,7 +8,6 @@ from dexmani_real.config.environment import (
 from dexmani_real.config.experiment import (
     ExperimentConfig,
     load_experiment_config,
-    resolve_experiment_config,
 )
 from dexmani_real.config.pointcloud import PointCloudConfig
 
@@ -19,5 +18,4 @@ __all__ = [
     "StaticCollisionBox",
     "TableCollisionConfig",
     "load_experiment_config",
-    "resolve_experiment_config",
 ]

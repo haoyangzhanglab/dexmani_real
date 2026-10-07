@@ -7,6 +7,7 @@ from dexmani_real.calibration.camera.extrinsics import (
     CameraExtrinsics,
     load_optional_camera_extrinsics,
 )
+from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
 from dexmani_real.deployment.config import (
     validate_max_running_s,
     validate_num_episodes,
@@ -17,8 +18,10 @@ from dexmani_real.deployment.observation import build_observation_kinematics
 from dexmani_real.deployment.operator import PolicyOperator
 from dexmani_real.deployment.runner import PolicyRunner
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
+from dexmani_real.recording.recorder import AsyncEpisodeRecorder
 from dexmani_real.recording.results import SessionResults, error_detail
-from dexmani_real.robot.arm_homing import build_policy_home_planner
+from dexmani_real.robot.action import ActionRealizer
+from dexmani_real.robot.arm_homing import build_home_planner
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.safety import (
@@ -93,14 +96,17 @@ def run_policy_deployment(
     num_episodes=1,
     recording_config=None,
     execution_config=None,
+    camera_calibration_path=None,
+    save_run_config=None,
 ):
     """Run one session; without recording_config there are no persistent result artifacts."""
-    from dexmani_real.deployment.config import ExecutionConfig
     from dexmani_real.deployment.inference import InferenceWorker
 
     info = policy_config.info
-    execution_config = (execution_config or ExecutionConfig()).validate(info)
+    execution_config = (execution_config or runtime.execution).validate(info)
     cloud_recipe = validate_policy_runtime_compatibility(info, runtime)
+    validate_robot_config(runtime)
+    runtime = resolve_runtime_table(runtime, pointcloud=cloud_recipe)
     max_running_s = validate_max_running_s(max_running_s)
     num_episodes = validate_num_episodes(num_episodes)
     if recording_config is not None and not execute:
@@ -118,19 +124,21 @@ def run_policy_deployment(
         cloud = "point_cloud" in fields
         # Cloud production needs a camera worker; recording also retains its source RGB-D.
         camera = cloud or "rgb" in fields or recording_config is not None
+        if camera:
+            runtime.camera.validate()
         points = cloud_recipe.num_points if cloud else runtime.pointcloud.num_points
         camera_calibration = (
-            CameraExtrinsics()
+            CameraExtrinsics(camera_calibration_path)
             if cloud
-            else load_optional_camera_extrinsics()
+            else load_optional_camera_extrinsics(camera_calibration_path)
             if recording_config is not None
             else None
         )
         pointcloud_config = (
-            PointCloudWorkerConfig.from_runtime(
-                runtime,
+            PointCloudWorkerConfig(
                 pointcloud=cloud_recipe,
                 camera_calibration=camera_calibration,
+                table_plane_abcd=runtime.environment.table.plane_abcd,
             )
             if cloud
             else None
@@ -139,13 +147,29 @@ def run_policy_deployment(
         shared = RuntimeChannels.create(
             prefix=prefix or f"dexmani_policy_{os.getpid()}",
             mp_context=ctx,
-            config=RuntimeChannelsConfig.from_runtime(runtime, pointcloud_num_points=points),
+            config=RuntimeChannelsConfig.from_runtime(
+                runtime, pointcloud_num_points=points, camera=camera, pointcloud=cloud
+            ),
         )
         supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
         robot = DexManiRobot(shared, runtime, check_services=supervisor.check)
         model = InferenceWorker(lambda: _load_configured_policy(policy_config, execution_config))
         _warmup_policy(model, runtime, info, execution_config)
         kinematics = build_observation_kinematics(info, runtime)
+        realizer = ActionRealizer.for_mode(runtime, info.action_mode)
+        home_planner = build_home_planner(runtime) if execute else None
+        if save_run_config is not None:
+            save_run_config(runtime, execution_config)
+        recorder = (
+            AsyncEpisodeRecorder(
+                recording_config.data_dir,
+                control_hz=1.0 / info.control_dt_s,
+                rgb_shape=(runtime.camera.height, runtime.camera.width, 3),
+                execution_path=f"worker_grid_{execution_config.execution_mode}_v1",
+            )
+            if recording_config is not None
+            else None
+        )
         robot.connect()
         sensors = []
         if camera:
@@ -165,17 +189,27 @@ def run_policy_deployment(
         operator = PolicyOperator(
             shared,
             runtime,
-            build_policy_home_planner(runtime) if execute else None,
+            home_planner,
             robot=robot,
             execute=execute,
+            idle_for_tare=lambda: (
+                runner.run_id is None
+                and runner.preparing_epoch is None
+                and not shared.start_request.value
+                and model.future is None
+                and (recorder is None or not recorder.is_recording)
+            ),
         )
         operator.keyboard.start()
+        print("空闲且确认手部无接触后按 T 归零触觉；S/Q/ESC 可取消。", flush=True)
         robot.check_services = lambda: supervisor.check() and operator.keyboard.healthy
         runner = PolicyRunner(
             shared,
             runtime,
             info,
             robot=robot,
+            realizer=realizer,
+            recorder=recorder,
             poll_operator=operator.poll,
             model_runtime=model,
             execution_config=execution_config,

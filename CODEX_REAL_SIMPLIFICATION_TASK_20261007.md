@@ -290,4 +290,16 @@ git diff --check
 
 ## 13. 本地执行状态（由执行者简短更新）
 
-设计已定稿，实施尚未执行。执行后仅追加各工作包状态、实际验证与未完成原因，不将条件议题改标为已验证，不再生成第二份长期任务书。
+2026-10-07 本地实施（起始 Real HEAD `b6ea4e1`，开始时工作区干净）：
+
+- F01：已修复的几何分离保留；原资产碰撞测试 8 passed，未修改资产或恢复安装补偿注入。
+- P1：完成轻量帮助/声明配置、按用途验证、桌面/相机/VR 会话快照、连接前构造、execution YAML/CLI 优先级及显式路径。删除全局 validate/旧 resolve wrapper 和误导的 HOME helper 名称；直接 API 仍验证实际用途。
+- P2/F33：阻塞于相邻 Policy 不在允许写入范围，未写入该仓。现有 RTC 定向测试 28 passed，但真实 LoadedPolicy/DDIM 的 beta=0、delay=3 回归仍报 `No prefix requires delay_steps=0`。下一入口为 `dexmani_policy/deployment/runtime.py:282` 的 warmup prefix 条件及对应参数化测试，需同时保留正 guidance/零 delay。Real 不加替代推理或 fallback。收尾时相邻仓由外部工作推进至 `1c6981d`，已只读复核相同缺陷。
+- P3：完成 session 注入、现有 recording/results 归档与 attempt 单份 trace；Raw 保留失败/部分 dispatch/结束详情，新增成功提交的 Raw 行索引，保留 NPZ 必需性和归档失败。
+- P4：完成初始化固定相机布局、独立 attach/spawn、按 workflow 分配 rings、部分分配回收；保留源时间/序号/owned copy 和 seqlock 限制。
+- P5：完成显式空闲 T 归零、分步取消及停止请求保留，connect 不再自动 tare；未新增运动。手眼轴对流式存在性检查，诊断改为 witness。
+- P6：完成纯几何/方法 adapter 分离、单音频播放器且失败禁用、IK residual 命名；方法数值/reset 未改，点云持久化键和过滤位置保留。
+- P7：完成源码 editable/dev/interactive 依赖说明、`docs/reproduction.md` 和薄 synthetic 入口；真实 writer → reader/CLI info → 全 13 字段导出 → 原行号窗口及 Policy Dataset 贯通。样本仅新建于临时路径；未发布真实数据/模型，未新增 CI，许可证/资产权利/引用待作者确认。
+- 实际离线验证：Python 3.10.20 的 `real_robot` 环境；`python -m pytest -q tests` 264 passed；随后新增 TAG/DexPilot 原生输出/reset、源帧成功/失败缓存、纯几何导入测试 `tests/test_hand_retargeting.py` 5 passed。compileall、Ruff check/format、git diff --check 通过。Policy 使用 `PYTHONDONTWRITEBYTECODE=1`、`-p no:cacheprovider` 只读运行，28 passed；F33 另行复现失败，不计已修复。CLI synthetic 8 行、13 字段，horizon=4 得 RGB 5 窗口、触觉 0 窗口。
+- 保留/条件未实施：F15–F20、F23、F25、F27–F32、F34、F36–F44 等的数据、算法、CRC、WAIT/stop 与实验准入边界保持；无真实图像/时序/trial 分析、点云/IK/HOME 消融或自动迁移。没有连接硬件、运行真实权重/GPU、正式训练或真机验证。最终改动限定本任务源码/配置/测试/文档；旧任务书、数据、标定和模型资产未改写。
+- 后续清理：删除 teleop 旧初始化判空/重复资产预检、音频无用字段、相机共享文本兼容兜底及重复导入；调用者改用命名结果，触觉注释准确描述基线重复性，文档同步 YAML 参数与 F33 现有限制。新增真实共享元数据消费回归后，完整离线测试 270 passed；compileall、Ruff check/format、diff 空白检查通过。历史 Raw 读取与实际算法 fallback 保留。

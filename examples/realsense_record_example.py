@@ -8,6 +8,7 @@ Exposure priority allows longer exposure at lower FPS; auto exposure stays on.
 
 from __future__ import annotations
 
+import argparse
 import time
 from collections import deque
 from collections.abc import Callable
@@ -16,13 +17,11 @@ from typing import Any
 
 import cv2
 import numpy as np
-import pyrealsense2 as rs
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
-from dexmani_real.config.experiment import resolve_experiment_config, resolve_table_plane
+from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
-from dexmani_real.sensor.camera.realsense import RealSenseCamera, RealSenseCameraConfig
 from dexmani_real.sensor.pointcloud import build_point_cloud, build_raw_point_cloud
 
 _WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
@@ -560,15 +559,25 @@ def _run_rgbd_test(
     return outcome
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config")
+    parser.add_argument("--camera-calibration")
+    args = parser.parse_args(argv)
+    global rs, RealSenseCamera, RealSenseCameraConfig
+    import pyrealsense2 as rs
+
+    from dexmani_real.sensor.camera.realsense import RealSenseCamera, RealSenseCameraConfig
+
     test_cfg = RealSenseDiagnosticConfig()
 
     # Validate policy and calibration files before enumerating or opening a camera.
-    runtime = resolve_experiment_config()
+    runtime = load_experiment_config(yaml_path=args.config)
     production = runtime.pointcloud
+    production.validate()
     table = runtime.environment.table
     table_plane_abcd = resolve_table_plane(table) if production.remove_table else None
-    calibration = CameraExtrinsics()
+    calibration = CameraExtrinsics(args.camera_calibration)
 
     print("=" * 60)
     print("RealSense Test -- RGB-D Live Capture + Real-time Point Cloud")

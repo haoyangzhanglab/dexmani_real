@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from dexmani_real.robot.model import HAND_JOINT_SHAPE
-from dexmani_real.teleop.retargeting.retargeter import (
-    DexPilotHandRetargeter,
-    TAGHandRetargeter,
-)
+
+if TYPE_CHECKING:
+    from dexmani_real.teleop.retargeting.dexpilot import DexPilotHandRetargeter
+    from dexmani_real.teleop.retargeting.tag_optimizer import TAGHandRetargeter
+
 from dexmani_real.utils.log import ThrottledWarner
 
 _retarget_fail_warn = ThrottledWarner()

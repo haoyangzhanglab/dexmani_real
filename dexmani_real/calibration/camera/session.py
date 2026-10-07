@@ -317,6 +317,7 @@ class CameraCalibrationSession:
         camera_process,
         calibration_config,
         aruco_config,
+        output_path=CAMERAS_PATH,
     ):
         self.shared = shared
         self.runtime = runtime
@@ -326,6 +327,7 @@ class CameraCalibrationSession:
         self.camera_process = camera_process
         self.calibration_config = calibration_config
         self.aruco_config = aruco_config
+        self.output_path = output_path
 
     def _runtime_issue(self, arm):
         if self.shared.estop_request.value:
@@ -487,7 +489,7 @@ class CameraCalibrationSession:
                         save_camera_calibration(
                             transform,
                             self.serial,
-                            CAMERAS_PATH,
+                            self.output_path,
                             calibration_capture=metadata,
                             cancelled=cancelled,
                         )
@@ -661,6 +663,7 @@ def run_camera_calibration(
     hand_geometry: str,
     calibration_config: CalibrationConfig | None = None,
     aruco_config: ArucoConfig | None = None,
+    output_path=CAMERAS_PATH,
 ) -> int:
     """Run interactive camera calibration with bounded cleanup.
 
@@ -675,7 +678,12 @@ def run_camera_calibration(
         raise ValueError(
             "camera calibration requires explicit hand_enabled=false and secured/absent hand"
         )
+    from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
+
+    validate_robot_config(runtime)
+    runtime = resolve_runtime_table(runtime)
     validate_keyboard_workspace(runtime)
+    runtime.camera.validate()
     calib_cfg = calibration_config or CalibrationConfig()
     aruco_cfg = aruco_config or ArucoConfig()
     planner, workspace = _build_planner(runtime)
@@ -693,7 +701,7 @@ def run_camera_calibration(
     ctx = mp.get_context("spawn")
     shared = RuntimeChannels.create(
         prefix=f"dexmani_calib_{os.getpid()}",
-        config=RuntimeChannelsConfig.from_runtime(runtime),
+        config=RuntimeChannelsConfig.from_runtime(runtime, camera=True),
         mp_context=ctx,
     )
     supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
@@ -706,7 +714,7 @@ def run_camera_calibration(
         require_transition(shared, SafetyState.ARMED)
         print("  local arm connected (Mode 6)")
         exit_code = CameraCalibrationSession(
-            shared, runtime, planner, workspace, robot, camera, calib_cfg, aruco_cfg
+            shared, runtime, planner, workspace, robot, camera, calib_cfg, aruco_cfg, output_path
         ).run()
     except KeyboardInterrupt:
         shared.estop_request.value = True

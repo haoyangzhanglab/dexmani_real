@@ -16,9 +16,12 @@ dependencies = [
     "av>=10",
     "opencv-python>=4.8",
     "transforms3d>=0.4",
-    "pynput>=1.7",
     "tqdm",
 ]
+
+[project.optional-dependencies]
+interactive = ["pynput>=1.7"]
+dev = ["pytest", "ruff"]
 
 [tool.setuptools]
 include-package-data = true

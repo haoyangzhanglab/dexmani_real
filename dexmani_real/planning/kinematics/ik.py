@@ -233,8 +233,8 @@ class OnlineIKSolver:
                     seed=selected.attempt["seed"],
                     mode=mode,
                     best_score=selected.score,
-                    cmd_tracking_error_pos_m=selected.pos_err_m,
-                    cmd_tracking_error_rot_rad=selected.rot_err_rad,
+                    ik_residual_pos_m=selected.pos_err_m,
+                    ik_residual_rot_rad=selected.rot_err_rad,
                     qpos_distance_to_current=selected.distance_current,
                     max_qpos_cmd_delta_deg=float(np.rad2deg(selected.max_physical_delta)),
                 )

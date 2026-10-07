@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-from dexmani_real.config.experiment import ExperimentConfig, resolve_experiment_config
+from dexmani_real.config.experiment import ExperimentConfig, load_experiment_config
 from dexmani_real.replay.replayer import ReplayStatus
 from dexmani_real.replay.session import (
     DEFAULT_OUTPUT_DIR,
@@ -108,7 +108,7 @@ Controls:
 
 
 def _resolve_replay_runtime(args: argparse.Namespace) -> ReplayRuntimeSelection:
-    runtime = resolve_experiment_config(
+    runtime = load_experiment_config(
         yaml_path=args.config,
         cli_overrides={
             "arm.max_joint_acceleration_deg_per_s2": args.acc,

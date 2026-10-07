@@ -1,4 +1,4 @@
-"""Offline regression cases from the 2026-10-05 review; all device I/O is fake."""
+"""Offline device-fault, data-integrity and calibration regressions; device I/O is fake."""
 
 import json
 import threading
@@ -153,7 +153,7 @@ def test_tactile_independent_candidates(monkeypatch, available):
         tactile_dense_valid=available[1],
     )
     hand._read_state = lambda **kw: raw
-    assert hand.calibrate_tactile() == available
+    assert hand.tare_tactile() == available
     assert (
         hand._tactile_bias_aggregate is not None,
         hand._tactile_bias_dense is not None,
@@ -168,15 +168,15 @@ def test_tactile_verify_never_exposes_candidate(monkeypatch, error):
     hand = XHand(ExperimentConfig().hand)
     hand._tactile_bias_aggregate = np.ones((5, 3))
     hand._tactile_bias_dense = np.ones((5, 120, 3))
-    hand._capture_tactile_bias = lambda: (np.zeros((5, 3)), np.zeros((5, 120, 3)))
+    hand._capture_tactile_bias = lambda **kwargs: (np.zeros((5, 3)), np.zeros((5, 120, 3)))
 
-    def verify(*args):
+    def verify(*args, **kwargs):
         assert hand._tactile_bias_aggregate is hand._tactile_bias_dense is None
         raise error()
 
     hand._verify_tactile_bias = verify
     with pytest.raises(error):
-        hand.calibrate_tactile()
+        hand.tare_tactile()
     assert hand._tactile_bias_aggregate is hand._tactile_bias_dense is None
 
 
@@ -580,7 +580,7 @@ def test_tactile_bad_aggregate_does_not_drop_dense(monkeypatch):
         )
 
     hand._read_state = read
-    assert hand.calibrate_tactile() == (False, True)
+    assert hand.tare_tactile() == (False, True)
 
 
 def test_tactile_actual_get_state_has_independent_usable_flags(monkeypatch):
@@ -634,17 +634,18 @@ def test_diagnostic_failure_is_nonzero_and_disconnects(monkeypatch, capsys):
         def read(self, **kwargs):
             raise RuntimeError("injected read failure")
 
-    monkeypatch.setattr(diag, "RealSenseCamera", Camera)
+    monkeypatch.setattr("dexmani_real.sensor.camera.realsense.RealSenseCamera", Camera)
     monkeypatch.setattr(diag, "_list_cameras", lambda: [True])
     monkeypatch.setattr(diag, "_test_lifecycle", lambda cfg: True)
     monkeypatch.setattr(diag, "_get_ae_priority", lambda _: None)
-    monkeypatch.setattr(diag, "CameraExtrinsics", lambda: None)
+    monkeypatch.setattr(diag, "CameraExtrinsics", lambda path=None: None)
     monkeypatch.setattr(diag, "_compute_base_from_color", lambda *args: np.eye(4))
     monkeypatch.setattr(
         diag,
-        "resolve_experiment_config",
-        lambda: NS(
+        "load_experiment_config",
+        lambda **kw: NS(
             pointcloud=NS(
+                validate=lambda: None,
                 remove_table=False,
                 num_points=10,
                 depth_min_m=0.1,
@@ -657,18 +658,18 @@ def test_diagnostic_failure_is_nonzero_and_disconnects(monkeypatch, capsys):
     )
     monkeypatch.setattr(diag, "NonBlockingPCDViewer", lambda **kw: NS(close=lambda: None))
     monkeypatch.setattr(diag.cv2, "destroyAllWindows", lambda: None)
-    assert diag.main() == 1
+    assert diag.main([]) == 1
     assert closed == [True]
     assert "Test complete" not in capsys.readouterr().out
 
 
-def test_legacy_prior_config_is_rejected(tmp_path):
-    from dexmani_real.config.experiment import resolve_experiment_config
+def test_unknown_retargeting_config_field_is_rejected(tmp_path):
+    from dexmani_real.config.experiment import load_experiment_config
 
     path = tmp_path / "old.yaml"
     path.write_text("tag_retargeting:\n  prior_weight: 0.0\n")
     with pytest.raises(TypeError, match="prior_weight"):
-        resolve_experiment_config(yaml_path=str(path))
+        load_experiment_config(yaml_path=str(path))
 
 
 def test_session_camera_snapshot_survives_file_change(tmp_path, monkeypatch):
@@ -803,7 +804,7 @@ def test_teleop_stop_failure_retains_first_reason(cause):
 
 def test_tag_native_gradient_without_prior():
     from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
-    from dexmani_real.teleop.retargeting.retargeter import TAGHandRetargeter
+    from dexmani_real.teleop.retargeting.tag_optimizer import TAGHandRetargeter
 
     cfg = ExperimentConfig()
     optimizer = TAGHandRetargeter(

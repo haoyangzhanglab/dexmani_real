@@ -13,6 +13,7 @@ import multiprocessing as mp
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 
@@ -206,6 +207,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="write the transform even when quality grade is 'poor'",
     )
+    parser.add_argument(
+        "--output", type=Path, default=VR_TRANSFORM_PATH, help="VR alignment JSON destination"
+    )
     args = parser.parse_args(argv)
 
     if not math.isfinite(args.duration) or args.duration <= 0:
@@ -226,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     vr_config.validate()
     ctx = mp.get_context("spawn")
     shared = RuntimeChannels.create(
-        prefix="dexmani_vr_calib", config=RuntimeChannelsConfig(), mp_context=ctx
+        prefix="dexmani_vr_calib", config=RuntimeChannelsConfig(vr=True), mp_context=ctx
     )
     processes = [
         ctx.Process(name="vr", target=run_vr_worker, args=(shared, vr_config), daemon=True)
@@ -380,8 +384,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    atomic_json_dump(config, VR_TRANSFORM_PATH)
-    print(f"\nSaved to: {VR_TRANSFORM_PATH}")
+    atomic_json_dump(config, args.output)
+    print(f"\nSaved to: {args.output}")
 
     _play_completion_audio()
     return 0

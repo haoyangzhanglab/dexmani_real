@@ -28,6 +28,8 @@ def run_vr_worker(shared, config: VRParams) -> None:
     """VR process entry point — writes directly to RuntimeChannels.vr_ring."""
 
     config.validate()
+    if shared.vr_ring is None:
+        raise ValueError("VR worker requires an allocated VR ring")
     cfg = config
 
     from dexmani_real.ipc.schema import VR_FRAME_DTYPE

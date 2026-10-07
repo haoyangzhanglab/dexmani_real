@@ -8,7 +8,7 @@ import numpy as np
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_config
-from dexmani_real.robot.arm_homing import build_policy_home_planner, home_policy_robot
+from dexmani_real.robot.arm_homing import build_home_planner, home_robot
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.robot import DexManiRobot, DispatchError
 from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
@@ -32,6 +32,10 @@ logger = get_logger(__name__)
 
 
 def run_keyboard_experiment(runtime, *, no_hand):
+    from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
+
+    validate_robot_config(runtime)
+    runtime = resolve_runtime_table(runtime)
     cfg = runtime.keyboard_teleop
     validate_keyboard_workspace(runtime)
     if not runtime.policy.hand_enabled and not no_hand:
@@ -72,6 +76,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
         )
         if not runtime.policy.hand_enabled:
             planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
+        home_planner = build_home_planner(runtime)
         robot.connect()
         require_transition(shared, SafetyState.ARMED)
         keys.start()
@@ -93,10 +98,10 @@ def run_keyboard_experiment(runtime, *, no_hand):
                 command_pose = None
                 revoke_motion(shared)
                 robot.stop()
-                home_policy_robot(
+                home_robot(
                     shared,
                     runtime,
-                    build_policy_home_planner(runtime),
+                    home_planner,
                     robot=robot,
                     abort_requested=lambda: (
                         bool(shared.estop_request.value or shared.quit_requested.value)
