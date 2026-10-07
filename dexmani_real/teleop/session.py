@@ -2,6 +2,7 @@
 
 import multiprocessing as mp
 import os
+from pathlib import Path
 
 import numpy as np
 
@@ -9,6 +10,7 @@ from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extrinsics
 from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
 from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
+from dexmani_real.recording.recorder import AsyncEpisodeRecorder
 from dexmani_real.robot.action import ActionRealizer
 from dexmani_real.robot.arm_homing import build_home_planner
 from dexmani_real.robot.robot import DexManiRobot
@@ -97,6 +99,15 @@ def run_teleop_experiment(
             robot,
             controller=controller,
             home_planner=home_planner,
+            recorder=AsyncEpisodeRecorder(
+                Path(__file__).resolve().parents[2]
+                / runtime.policy.episodes_dir
+                / config.task_label,
+                control_hz=runtime.teleop.control_hz,
+                rgb_shape=(runtime.camera.height, runtime.camera.width, 3),
+            )
+            if runtime.policy.recording_enabled
+            else None,
             camera_calibration=camera_calibration,
             start_vr=lambda: supervisor.start(
                 [ctx.Process(name="vr", target=run_vr_worker, args=(shared, runtime.vr))],

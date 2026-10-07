@@ -14,6 +14,9 @@ from dexmani_real.planning.kinematics.arm_fk import (
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
+from dexmani_real.utils.log import ThrottledWarner, get_logger
+
+_warn_unavailable = ThrottledWarner(logger=get_logger(__name__))
 
 
 @dataclass(frozen=True)
@@ -44,16 +47,32 @@ def build_observation_kinematics(policy_info: Any, runtime: Any):
 
 
 def build_policy_observation(rows, policy_info, *, kinematics=None):
-    if not rows:
-        return None
     requested = set(policy_info.observation_fields)
+    tactile_fields = requested & {"contact_force", "tactile_force"}
+    if not rows:
+        if tactile_fields:
+            _warn_unavailable(
+                "policy observation rejected: required %s history unavailable (no observation rows)",
+                ", ".join(sorted(tactile_fields)),
+            )
+        return None
     if any(row.hand is None for row in rows):
+        if tactile_fields:
+            _warn_unavailable(
+                "policy observation rejected: required %s unavailable (missing hand history)",
+                ", ".join(sorted(tactile_fields)),
+            )
         return None
     for name, field in (
         ("contact_force", "tactile_aggregate_valid"),
         ("tactile_force", "tactile_dense_valid"),
     ):
         if name in requested and not all(bool(row.hand[field][0]) for row in rows):
+            _warn_unavailable(
+                "policy observation rejected: required %s unavailable in history (%d rows)",
+                name,
+                len(rows),
+            )
             return None
     arrays = {}
     if requested & {"joint_state", "eef_pose", "fingertip_points"}:

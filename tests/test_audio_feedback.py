@@ -48,7 +48,11 @@ def test_audio_order_and_disable_on_failure(monkeypatch, failure):
         expected = 1 if failure else 3
         assert len(calls) == expected
         if failure:
+            monkeypatch.setattr(
+                audio.os.path, "isfile", lambda _: pytest.fail("disabled file lookup")
+            )
             player.play("begin")
+            player.queue("home")
             assert player.wait_until_idle(1)
             assert len(calls) == 1 and player._disabled
         if failure == "communicate":
@@ -61,6 +65,44 @@ def test_audio_order_and_disable_on_failure(monkeypatch, failure):
         player.close()
         player.close()
     assert not player._worker.is_alive()
+
+
+@pytest.mark.parametrize("state", ["no_player", "closed"])
+def test_audio_inactive_skips_files_and_repeated_warnings(monkeypatch, caplog, state):
+    monkeypatch.setattr(audio.shutil, "which", lambda name: None if state == "no_player" else name)
+    monkeypatch.setattr(audio.os.path, "isfile", lambda _: pytest.fail("inactive file lookup"))
+    monkeypatch.setattr(audio.subprocess, "Popen", lambda *a, **kw: pytest.fail("inactive launch"))
+    player = audio.AudioFeedback()
+    if state == "no_player":
+        assert "No audio player" in caplog.text
+    else:
+        player.close()
+    caplog.clear()
+    try:
+        for _ in range(3):
+            player.play("begin")
+            player.queue("unknown")
+        assert not caplog.records
+    finally:
+        player.close()
+
+
+@pytest.mark.parametrize("operation", ["play", "queue"])
+def test_close_during_path_lookup_prevents_enqueue(monkeypatch, operation):
+    monkeypatch.setattr(audio.shutil, "which", lambda name: name)
+    monkeypatch.setattr(audio.subprocess, "Popen", lambda *a, **kw: pytest.fail("closed launch"))
+    player = audio.AudioFeedback()
+
+    def lookup(_):
+        player.close()
+        return True
+
+    monkeypatch.setattr(audio.os.path, "isfile", lookup)
+    try:
+        getattr(player, operation)("begin")
+        assert player._closed and not player._pending
+    finally:
+        player.close()
 
 
 def test_audio_preemption_during_launch_reaps_outside_lock(monkeypatch):

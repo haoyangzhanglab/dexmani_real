@@ -2,13 +2,8 @@
 
 import time
 from concurrent.futures import CancelledError
-from pathlib import Path
 
-from dexmani_real.recording.recorder import (
-    AsyncEpisodeRecorder,
-    RecordingError,
-    snapshot_recording_metadata,
-)
+from dexmani_real.recording.recorder import RecordingError, snapshot_recording_metadata
 from dexmani_real.robot.arm_homing import home_robot
 from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.robot.robot import DispatchError
@@ -26,7 +21,7 @@ _END_AUDIO_GRACE_S = 3.0
 
 
 class TeleopRunner:
-    """Own operator, recording and control state for one local teleop session."""
+    """Own teleop control and capture lifecycle with the session's optional recorder."""
 
     def __init__(
         self,
@@ -37,6 +32,7 @@ class TeleopRunner:
         controller,
         home_planner,
         start_vr,
+        recorder,
         camera_calibration=None,
     ):
         self.shared = shared
@@ -45,17 +41,7 @@ class TeleopRunner:
         self.camera_calibration = camera_calibration
         self.config = config
         self.runtime = config.runtime
-        self.recorder = (
-            AsyncEpisodeRecorder(
-                Path(__file__).resolve().parents[2]
-                / self.runtime.policy.episodes_dir
-                / config.task_label,
-                control_hz=self.runtime.teleop.control_hz,
-                rgb_shape=(self.runtime.camera.height, self.runtime.camera.width, 3),
-            )
-            if self.runtime.policy.recording_enabled
-            else None
-        )
+        self.recorder = recorder
         self.keyboard = KeyboardInput(
             estop_callback=lambda: setattr(shared.estop_request, "value", True),
             stop_callback=lambda: revoke_motion(shared, reason=RunEndReason.OPERATOR),

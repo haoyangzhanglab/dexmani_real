@@ -137,7 +137,7 @@ python examples/run_policy.py <policy/task/experiment> --config experiment.yaml 
   --max-tick-lateness "$MAX_TICK_LATENESS_S"
 ```
 
-H 执行 HOME，空闲且确认手部无接触后 T 归零触觉，B 请求开始，S 停止，Q 退出，ESC 急停。HOME 结束后需重新按 T 或 B；触觉归零可用 S/Q/ESC 取消。开始前检查当前 arm/hand HOME 姿态。默认每段运行预算 60 秒，可用 `--max-duration` 修改。
+H 执行 HOME，空闲且确认手部无接触后 T 归零触觉，B 请求开始，S 停止，Q 退出，ESC 急停。HOME 结束后若要再次 HOME、归零或开始，需重新按 H/T/B；停止尚在处理时 H 被拒绝，完成后需重新发起。触觉归零可用 S/Q/ESC 取消。开始前检查当前 arm/hand HOME 姿态。默认每段运行预算 60 秒，可用 `--max-duration` 修改。
 
 可用 `--n-action-steps N` 覆盖本次部署的执行段长度；必须满足
 `n_obs_steps - 1 + N <= horizon`，不会改写训练配置或 checkpoint。

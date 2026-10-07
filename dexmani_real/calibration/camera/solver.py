@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from itertools import combinations
 from pathlib import Path
 
 import cv2
@@ -290,21 +291,19 @@ def check_hand_eye_excitation(
             if np.degrees(angle) >= min_relative_rotation_deg:
                 axes.append(vector / angle)
                 angles.append(float(np.degrees(angle)))
-    # Keep the original existential test. A fixed first-axis comparison misses
-    # valid pairs; stream all pairs and stop at the first qualifying witness.
-    for i, axis in enumerate(axes):
-        for other in axes[i + 1 :]:
-            separation = float(np.degrees(np.arccos(np.clip(abs(axis @ other), 0, 1))))
-            if separation >= min_axis_separation_deg:
-                return dict(
-                    sample_count=len(poses),
-                    valid_relative_motion_count=len(axes),
-                    relative_rotation_min_deg=min(angles),
-                    relative_rotation_max_deg=max(angles),
-                    axis_separation_witness_deg=separation,
-                    min_relative_rotation_deg=min_relative_rotation_deg,
-                    min_axis_separation_deg=min_axis_separation_deg,
-                )
+    # Any qualifying axis pair is sufficient; opposite axes describe the same direction.
+    for axis, other in combinations(axes, 2):
+        separation = float(np.degrees(np.arccos(np.clip(abs(axis @ other), 0, 1))))
+        if separation >= min_axis_separation_deg:
+            return dict(
+                sample_count=len(poses),
+                valid_relative_motion_count=len(axes),
+                relative_rotation_min_deg=min(angles),
+                relative_rotation_max_deg=max(angles),
+                axis_separation_witness_deg=separation,
+                min_relative_rotation_deg=min_relative_rotation_deg,
+                min_axis_separation_deg=min_axis_separation_deg,
+            )
     raise ValueError("insufficient hand-eye excitation; add rotation about another direction")
 
 

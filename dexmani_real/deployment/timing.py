@@ -1,4 +1,9 @@
-"""Offline summaries of actual owner/model trace intervals."""
+"""Offline summaries of actual owner/model trace intervals.
+
+owner_tick includes recording submission and any stop inside the tick, excluding
+artifact finalization. slot_lateness measures tick start against its planned start.
+Nested stage durations are not additive.
+"""
 
 from collections import Counter
 

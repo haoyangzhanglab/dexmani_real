@@ -1135,3 +1135,294 @@ def test_record_event_maps_queue_row_not_slot(make_runner):
     count = len(r.events)
     r._record(row)
     assert len(r.events) == count
+
+
+@pytest.fixture
+def timed_owner(make_runner, tmp_path, monkeypatch):
+    from dexmani_real.deployment.runner import Plan
+    from dexmani_real.ipc.schema import ARM_STATE_DTYPE, HAND_STATE_DTYPE
+    from dexmani_real.recording.results import SessionResults
+
+    r = make_runner(n=1)
+    effects = NS(
+        read_error=False,
+        missing=False,
+        record_error=False,
+        stop_error=False,
+        archive_error=False,
+        send_delay_ns=0,
+        cancelled=False,
+        nonfinite_joint=False,
+        frames=[],
+    )
+    r.results = SessionResults(tmp_path, "policy")
+    attempt = r.results.prepare(recording=True)
+    r.results.entered(r.run_id)
+    native_savez = np.savez
+    native_write = r.results._write_attempt
+
+    def sidecar(*args, **kwargs):
+        r.clock.now += 50_000_000
+        return native_savez(*args, **kwargs)
+
+    def write_attempt(attempt):
+        r.clock.now += 70_000_000
+        return native_write(attempt)
+
+    monkeypatch.setattr(np, "savez", sidecar)
+    monkeypatch.setattr(r.results, "_write_attempt", write_attempt)
+    r.plan = Plan(future(r), 0, 3, 1, {"arm": (r.clock.now,), "hand": (r.clock.now,)}, {})
+
+    def read():
+        r.clock.now += 10_000_000
+        if effects.read_error:
+            raise RuntimeError("read primary")
+        if effects.missing:
+            return None
+        arm, hand = np.zeros(1, dtype=ARM_STATE_DTYPE), np.zeros(1, dtype=HAND_STATE_DTYPE)
+        arm["timestamp_ns"] = hand["timestamp_ns"] = r.clock.now
+        if effects.nonfinite_joint:
+            arm["qpos"] = np.nan
+        return ObservationRow(
+            arm,
+            hand,
+            dict(
+                timestamp_ns=r.clock.now,
+                color_frame_number=1,
+                depth_frame_number=1,
+                rgb=np.zeros((4, 4, 3), np.uint8),
+                depth=np.ones((4, 4), np.uint16),
+            ),
+            None,
+            None,
+            r.clock.now,
+        )
+
+    def add(frame):
+        r.clock.now += 4_000_000
+        if effects.record_error:
+            raise RuntimeError("record primary")
+        effects.frames.append(frame)
+        return len(effects.frames) - 1
+
+    def save(**kwargs):
+        assert r.robot.stops == 1
+        assert len([e for e in r.events if e["event"] == "owner_tick"]) == 1
+        r.clock.now += 100_000_000
+        if effects.archive_error:
+            raise OSError("archive secondary")
+
+    def stop():
+        assert not r._has_motion_authority()
+        if r._active_tick is not None:
+            assert not any(e["event"] == "owner_tick" for e in r.events)
+        r.robot.stops += 1
+        r.clock.now += 2_000_000
+        if effects.stop_error:
+            raise RuntimeError("stop secondary")
+
+    native_send = r.robot.send_action
+
+    def send(command, **kwargs):
+        result = native_send(command, **kwargs)
+        r.clock.now += effects.send_delay_ns
+        if effects.cancelled:
+            raise DispatchInterrupted(result)
+        return result
+
+    r._read_observation = read
+    r.robot.send_action = send
+    r.robot.stop = stop
+    r.recorder = NS(
+        add_frame=add,
+        save_episode=save,
+        check_error=lambda: None,
+        close=lambda: None,
+        written_frames=0,
+        staging_path=None,
+    )
+    r.clock.now += 5_000_000
+    return r, effects, tmp_path / "attempts" / f"{attempt}.json"
+
+
+@pytest.mark.parametrize(
+    "case,duration_ms,rows",
+    [
+        ("normal", 14, 1),
+        ("wait", 14, 1),
+        ("missing", 10, 0),
+        ("missed", 14, 1),
+        ("read_error", 10, 0),
+        ("realize_error", 10, 0),
+        ("record_error", 14, 0),
+        ("build_error", 10, 0),
+        ("before_dispatch", 12, 0),
+        ("partial", 16, 1),
+        ("timeout", 26, 1),
+        ("unconfirmed", 16, 1),
+        ("cancelled", 16, 1),
+        ("stop_error", 16, 1),
+        ("archive_error", 16, 1),
+    ],
+)
+def test_owner_tick_saved_once_with_consistent_interval(timed_owner, case, duration_ms, rows):
+    import json
+
+    from dexmani_real.deployment.timing import summarize_trace
+
+    r, effects, path = timed_owner
+    if case == "wait":
+        r.plan = None
+    elif case == "missed":
+        r.last_slot = 0
+        r.next_step_ns = r.started_ns + r.dt_ns
+        r.clock.now += 2 * r.dt_ns
+    elif case == "realize_error":
+
+        def fail(_):
+            raise RuntimeError("realize primary")
+
+        r.realizer.collision_model.check_self_collision = fail
+    elif case == "build_error":
+        r.plan = None
+        effects.nonfinite_joint = True
+    elif case == "before_dispatch":
+
+        def quit_during_realization(_):
+            r.shared.quit_requested.value = True
+            return False
+
+        r.realizer.collision_model.check_self_collision = quit_during_realization
+    elif hasattr(effects, case):
+        setattr(effects, case, True)
+    if case == "timeout":
+        r.max_running_s = 0.020
+        effects.send_delay_ns = 10_000_000
+    if case in {"unconfirmed", "stop_error", "archive_error"}:
+        r.robot.result = DispatchResult(DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED)
+    elif case == "partial":
+        r.robot.result = DispatchResult(DispatchStatus.ACCEPTED, DispatchStatus.NOT_CALLED)
+    if case in {"read_error", "realize_error", "record_error", "build_error"}:
+        # Cleanup failures must not replace the primary tick exception.
+        effects.stop_error = effects.archive_error = True
+        with pytest.raises(
+            ValueError if case == "build_error" else RuntimeError,
+            match="Nonfinite" if case == "build_error" else f"{case.split('_')[0]} primary",
+        ):
+            r.run()
+    elif case in {"stop_error", "archive_error", "cancelled"}:
+        with pytest.raises(DispatchInterrupted if case == "cancelled" else (RuntimeError, OSError)):
+            r.step()
+    else:
+        r.step()
+    if r.run_id is not None:
+        r._finish_episode("test_end")
+    saved = json.loads(path.read_text())
+    ticks = [e for e in saved["trace"] if e["event"] == "owner_tick"]
+    assert len(ticks) == 1
+    tick = ticks[0]
+    assert tick["run_id"] == saved["run_id"] == 1
+    assert tick["slot"] == (2 if case == "missed" else 0)
+    assert tick["scheduled_ns"] == r.started_ns + tick["slot"] * r.dt_ns
+    assert tick["started_ns"] == tick["scheduled_ns"] + 5_000_000
+    assert tick["lateness_ns"] == 5_000_000
+    assert tick["duration_ns"] == duration_ms * 1_000_000
+    assert [e for e in r.events if e["event"] == "owner_tick"] == ticks
+    assert len(effects.frames) == rows
+    assert len([e for e in saved["trace"] if e["event"] == "record_submitted"]) == rows
+    summary = summarize_trace(saved["trace"])["seconds"]
+    assert summary["owner_tick"]["p50"] == pytest.approx(duration_ms / 1000)
+    assert summary["slot_lateness"]["p50"] == pytest.approx(0.005)
+    if case in {"timeout", "unconfirmed", "cancelled", "stop_error", "archive_error", "partial"}:
+        dispatch = [e for e in saved["trace"] if e["event"] == "dispatch"]
+        assert len(dispatch) == 1 and dispatch[0]["arm"] == int(DispatchStatus.ACCEPTED)
+        assert dispatch[0]["hand"] == int(r.robot.result.hand)
+
+
+def test_idle_and_not_due_do_not_create_ticks(make_runner):
+    r = make_runner()
+    r.next_step_ns = r.clock.now + r.dt_ns
+    r.step()
+    r.run_id = None
+    r.step()
+    assert not any(e["event"] == "owner_tick" for e in r.events)
+
+
+def test_tick_trace_failure_does_not_replace_read_error(timed_owner, caplog):
+    r, effects, _ = timed_owner
+
+    class BrokenTickTrace(list):
+        def append(self, event):
+            if event["event"] == "owner_tick":
+                raise RuntimeError("telemetry secondary")
+            super().append(event)
+
+    r.events = BrokenTickTrace()
+    effects.read_error = True
+    with pytest.raises(RuntimeError, match="read primary"):
+        r.run()
+    assert r.robot.stops == 1 and r._active_tick is None
+    assert "owner tick trace failed" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "field,validity,payload",
+    [
+        ("contact_force", "tactile_aggregate_valid", "tactile_aggregate"),
+        ("tactile_force", "tactile_dense_valid", "tactile_dense"),
+    ],
+)
+def test_required_tactile_diagnostic_is_local_and_throttled(
+    timed_owner, monkeypatch, caplog, field, validity, payload
+):
+    from dataclasses import replace
+
+    from dexmani_real.deployment import observation
+    from dexmani_real.utils.log import ThrottledWarner, get_logger
+
+    r, _, _ = timed_owner
+    r.clock.now = r.started_ns = r.wait_started_ns = 10_000_000_000
+    monkeypatch.setattr(
+        observation,
+        "_warn_unavailable",
+        ThrottledWarner(logger=get_logger(observation.__name__)),
+    )
+    row = r._read_observation()
+    row.hand["tactile_aggregate"] = np.nan
+    row.hand["tactile_dense"] = np.nan
+    r.policy_info.observation_fields = ("joint_state", field)
+    r.policy_info.n_obs_steps = 2
+    for _ in range(4):
+        assert not r._submit([row, row], 0)
+    assert r.model.future is None and not r.events
+    warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1 and field in warnings[0] and "history" in warnings[0]
+    assert "tare" not in warnings[0].lower()
+    r.clock.now += 5_000_000_000
+    assert not r._submit([row, row], 0)
+    assert len([record for record in caplog.records if record.levelname == "WARNING"]) == 2
+
+    caplog.clear()
+    row.hand[validity] = True
+    row.hand[payload] = 1.0
+    result = observation.build_policy_observation([row, row], r.policy_info)
+    assert set(result) == {"joint_state", field}
+    np.testing.assert_array_equal(result[field], np.ones_like(result[field]))
+    assert not caplog.records
+    row.hand[payload] = np.nan
+    with pytest.raises(ValueError, match=f"Nonfinite policy observation {field}"):
+        observation.build_policy_observation([row, row], r.policy_info)
+
+    for rows, message in (([], "no observation rows"), ([replace(row, hand=None)], "hand history")):
+        r.clock.now += 5_000_000_000
+        caplog.clear()
+        assert observation.build_policy_observation(rows, r.policy_info) is None
+        assert field in caplog.text and message in caplog.text
+
+    caplog.clear()
+    r.policy_info.observation_fields = ("joint_state",)
+    row.hand[validity] = False
+    r.clock.now = r.started_ns = int(row.arm["timestamp_ns"][0])
+    assert r._submit([row, row], 0)
+    assert not any(record.levelname == "WARNING" for record in caplog.records)
+    assert set(r.model.submissions[-1][1][0]) == {"joint_state"}

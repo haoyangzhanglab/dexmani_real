@@ -126,6 +126,7 @@ class PolicyRunner:
         self.preparing_epoch = None
         self.reset_ready = False
         self.events = []
+        self._active_tick = None
         self.last_slot = -1
         self.dt_ns = int(policy_info.control_dt_s * 1e9)
         self.run_id = None
@@ -194,6 +195,25 @@ class PolicyRunner:
             {"event": name, "time_ns": time.monotonic_ns(), "run_id": self.run_id, **details}
         )
 
+    def _end_current_tick(self):
+        tick, self._active_tick = self._active_tick, None
+        if tick is None:
+            return
+        epoch, slot, scheduled_ns, started_ns = tick
+        try:
+            self._event(
+                "owner_tick",
+                run_id=epoch,
+                slot=slot,
+                scheduled_ns=scheduled_ns,
+                started_ns=started_ns,
+                duration_ns=time.monotonic_ns() - started_ns,
+                lateness_ns=started_ns - scheduled_ns,
+            )
+        except Exception:
+            # Telemetry must not replace a control failure or prevent cleanup.
+            logger.exception("owner tick trace failed")
+
     def _invalidate(self, reason):
         self.plan = None
         if self.query is not None:
@@ -244,6 +264,8 @@ class PolicyRunner:
             raise failure
 
     def _finalize_attempt(self, reason, detail, errors=None):
+        # Nested termination closes the tick after stop/record, before the snapshot.
+        self._end_current_tick()
         try:
             finalize_policy_attempt(
                 self.results,
@@ -812,58 +834,49 @@ class PolicyRunner:
             return
         if now < self.next_step_ns:
             return
-        tick_start = now
         slot = (now - self.started_ns) // self.dt_ns
-        missed = slot != self.last_slot + 1
-        self.last_slot = slot
-        self.next_step_ns = self.started_ns + (slot + 1) * self.dt_ns
-        observation_start = time.monotonic_ns()
-        row = self._read_observation()
-        self._event(
-            "observation_read", slot=slot, duration_ns=time.monotonic_ns() - observation_start
-        )
-        self._poll_model()
-        if (
-            missed
-            or time.monotonic_ns() - (self.next_step_ns - self.dt_ns)
-            > int(self.execution.max_tick_lateness_s * 1e9)
-            or row is None
-        ):
-            self.history.clear()
-            self._invalidate("missed_slot_or_observation")
+        self._active_tick = (self.run_id, slot, self.started_ns + slot * self.dt_ns, now)
+        try:
+            missed = slot != self.last_slot + 1
+            self.last_slot = slot
+            self.next_step_ns = self.started_ns + (slot + 1) * self.dt_ns
+            observation_start = time.monotonic_ns()
+            row = self._read_observation()
             self._event(
-                "owner_tick",
-                slot=slot,
-                duration_ns=time.monotonic_ns() - tick_start,
-                lateness_ns=time.monotonic_ns() - (self.started_ns + slot * self.dt_ns),
+                "observation_read", slot=slot, duration_ns=time.monotonic_ns() - observation_start
             )
-            self._record(row)
-            return
-        self.history.append(row)
-        rows = self.history.ready_rows()
-        self._handoff(slot)
-        if self.plan is None:
-            if self.wait_started_ns is None:
-                self.wait_started_ns = now
-            if rows and self.query is None and self.model.future is None:
-                self._submit(rows, slot)
-            self._record(row)
-        else:
-            self._prefetch(row, rows, slot)
-            if self.plan is not None:
-                if slot >= self.plan.segment_end:
-                    self._invalidate("segment_exhausted")
-                    self._record(row)
-                else:
-                    self._execute_slot(row, slot)
-            else:
+            self._poll_model()
+            if (
+                missed
+                or time.monotonic_ns() - (self.next_step_ns - self.dt_ns)
+                > int(self.execution.max_tick_lateness_s * 1e9)
+                or row is None
+            ):
+                self.history.clear()
+                self._invalidate("missed_slot_or_observation")
                 self._record(row)
-        self._event(
-            "owner_tick",
-            slot=slot,
-            duration_ns=time.monotonic_ns() - tick_start,
-            lateness_ns=tick_start - (self.started_ns + slot * self.dt_ns),
-        )
+                return
+            self.history.append(row)
+            rows = self.history.ready_rows()
+            self._handoff(slot)
+            if self.plan is None:
+                if self.wait_started_ns is None:
+                    self.wait_started_ns = now
+                if rows and self.query is None and self.model.future is None:
+                    self._submit(rows, slot)
+                self._record(row)
+            else:
+                self._prefetch(row, rows, slot)
+                if self.plan is not None:
+                    if slot >= self.plan.segment_end:
+                        self._invalidate("segment_exhausted")
+                        self._record(row)
+                    else:
+                        self._execute_slot(row, slot)
+                else:
+                    self._record(row)
+        finally:
+            self._end_current_tick()
 
     def run(self):
         failure = None

@@ -127,7 +127,8 @@ class SessionResults:
 def finalize_policy_attempt(
     results, recorder, *, recording_started, reason, detail, events, query_arrays, errors=None
 ):
-    # Caller has revoked authority and attempted stop before any artifact I/O.
+    # Caller has revoked authority, attempted stop and closed any active tick.
+    # Snapshot before artifact I/O; finalized Raw is never patched with later events.
     events = deepcopy(events)
     errors = [] if errors is None else errors
     failure, saved = None, None

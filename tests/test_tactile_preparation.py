@@ -5,6 +5,7 @@ from types import SimpleNamespace as NS
 
 import numpy as np
 import pytest
+from test_policy_runner import make_runner as make_runner
 from test_review_remediation import shared_state
 
 from dexmani_real.config.experiment import ExperimentConfig
@@ -217,9 +218,10 @@ def test_policy_home_discards_same_batch_tare_but_accepts_new_tare(policy_keyboa
     assert case.shared.run_id.value == 1
 
 
-def test_policy_home_discards_tare_queued_during_home(policy_keyboard):
+@pytest.mark.parametrize("key", ["h", "b", "t"])
+def test_policy_home_discards_preparation_queued_during_home(policy_keyboard, key):
     case = policy_keyboard
-    case.effects.during_home = lambda: case.press("t")
+    case.effects.during_home = lambda: case.press(key)
     case.press("h")
     case.operator.poll()
     case.operator.poll()
@@ -243,6 +245,82 @@ def test_policy_disabled_home_does_not_discard_tare(policy_keyboard):
     case.operator.poll()
     assert case.calls == ["tare"]
     assert case.operator.home_results == []
+
+
+@pytest.mark.parametrize("completed,stop", [(True, False), (False, False), (False, True)])
+def test_policy_home_runs_once_per_batch(policy_keyboard, completed, stop):
+    case = policy_keyboard
+    case.effects.home_completed = completed
+    if stop:
+        case.effects.during_home = lambda: case.press("s")
+    case.press("h", "h", "t", "b")
+    case.operator.poll()
+    assert case.calls == ["home"]
+    assert len(case.operator.home_results) == 1
+    assert case.shared.stop_request.value == int(StopRequest.OPERATOR if stop else StopRequest.NONE)
+    assert not case.shared.start_request.value
+
+
+def test_policy_home_preserves_stop_after_batch_taken(policy_keyboard, monkeypatch):
+    case = policy_keyboard
+    poll = case.operator.keyboard.poll
+
+    def take_then_stop(**kwargs):
+        signals = poll(**kwargs)
+        case.press("s")
+        return signals
+
+    monkeypatch.setattr(case.operator.keyboard, "poll", take_then_stop)
+    case.press("h")
+    case.operator.poll()
+    assert case.calls == []
+    assert case.shared.stop_request.value == int(StopRequest.OPERATOR)
+    assert case.shared.run_id.value == 2
+
+
+def test_policy_home_stop_home_batch_is_rejected(policy_keyboard):
+    case = policy_keyboard
+    case.press("h", "s", "h")
+    case.operator.poll()
+    assert case.calls == []
+    assert case.shared.stop_request.value == int(StopRequest.OPERATOR)
+
+
+@pytest.mark.parametrize("flag", ["is_running", "error_state", "estop_request", "quit_requested"])
+def test_policy_home_checks_runtime_flags_at_admission(policy_keyboard, flag):
+    case = policy_keyboard
+    getattr(case.shared, flag).value = flag != "is_running"
+    case.press("h")
+    case.operator.poll()
+    assert case.calls == []
+
+
+def test_rejected_tare_does_not_count_as_executed_home(policy_keyboard):
+    case = policy_keyboard
+    case.operator.idle_for_tare = lambda: False
+    case.press("t", "h")
+    case.operator.poll()
+    assert case.calls == ["home"]
+
+
+@pytest.mark.parametrize("key", ["h", "t", "b"])
+def test_new_request_after_owner_consumes_stop(policy_keyboard, make_runner, key):
+    case = policy_keyboard
+    runner = make_runner()
+    runner.shared = case.shared
+    case.shared.safety_state.value = int(SafetyState.RUNNING)
+    case.press("s")
+    case.operator.poll()
+    case.press("h")
+    case.operator.poll()
+    assert case.calls == []  # The owner has not consumed S yet.
+    runner.step()
+    assert runner.robot.stops == 1
+    assert case.shared.stop_request.value == int(StopRequest.NONE)
+    case.press(key)
+    case.operator.poll()
+    assert case.calls == {"h": ["home"], "t": ["tare"], "b": []}[key]
+    assert case.shared.start_request.value == (key == "b")
 
 
 @pytest.mark.parametrize("key", ["s", "q", "esc"])

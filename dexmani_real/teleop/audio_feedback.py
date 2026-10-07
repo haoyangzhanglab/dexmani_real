@@ -2,7 +2,8 @@
 
 A daemon thread uses one player selected at construction; play() preempts queued
 prompts. Missing players or playback failures disable audio for the session.
-Unknown events and missing files are logged and skipped.
+Disabled or closed sessions ignore prompts without resolving files. While enabled,
+unknown events and missing files are logged and skipped.
 """
 
 from __future__ import annotations
@@ -92,8 +93,10 @@ class AudioFeedback:
 
         If a previous prompt is still playing it is cancelled first.
         Any pending queued events are also cleared.
-        Unknown events and missing audio files are logged and skipped.
         """
+        with self._condition:
+            if self._closed or self._disabled:
+                return
         path = self._event_path(event)
         if path is None:
             return
@@ -101,7 +104,6 @@ class AudioFeedback:
         # An immediate cue supersedes queued prompts; the worker checks generation.
         with self._condition:
             if self._closed or self._disabled:
-                logger.warning("Audio event ignored: player closed or disabled (%s)", event)
                 return
             self._generation += 1
             self._pending.clear()
@@ -118,13 +120,15 @@ class AudioFeedback:
             audio.play("calibrated")
             audio.queue("begin")
         """
+        with self._condition:
+            if self._closed or self._disabled:
+                return
         path = self._event_path(event)
         if path is None:
             return
 
         with self._condition:
             if self._closed or self._disabled:
-                logger.warning("Audio event ignored: player closed or disabled (%s)", event)
                 return
             self._pending.append(_AudioRequest(path, self._generation))
             logger.debug("Audio queued: event=%s mode=queue", event)

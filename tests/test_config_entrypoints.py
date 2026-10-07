@@ -129,6 +129,66 @@ def test_cli_none_keeps_configured_hand_device_name(config_loader):
     assert cfg.hand.device_name == "configured_device"
 
 
+@pytest.mark.parametrize("recording", [False, True])
+def test_teleop_session_injects_recorder_without_starting_io(tmp_path, monkeypatch, recording):
+    from test_review_remediation import shared_state
+
+    from dexmani_real.recording.recorder import AsyncEpisodeRecorder
+    from dexmani_real.teleop import runner as runner_module
+    from dexmani_real.teleop import session
+
+    runtime = load_experiment_config(
+        data={
+            "policy": {"episodes_dir": str(tmp_path / "captures"), "recording_enabled": recording},
+            "environment": {"table": {"plane_path": None}},
+        }
+    )
+    shared = shared_state()
+    seen = []
+    monkeypatch.setattr(session, "load_vr_transform", lambda _: NS(transform=np.eye(3)))
+    monkeypatch.setattr(session, "load_optional_camera_extrinsics", lambda _: None)
+    monkeypatch.setattr(session.ActionRealizer, "for_mode", lambda *a: NS())
+    monkeypatch.setattr(session, "_build_hand_retargeter", lambda _: None)
+    monkeypatch.setattr(session, "build_home_planner", lambda _: None)
+    monkeypatch.setattr(session.RuntimeChannels, "create", lambda **kw: shared)
+    monkeypatch.setattr(session, "RuntimeSupervisor", lambda *a: NS(check=lambda: True))
+    monkeypatch.setattr(session, "shutdown_local_runtime", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        runner_module,
+        "AudioFeedback",
+        lambda: NS(wait_until_idle=lambda **kw: True, close=lambda: None),
+    )
+
+    def refuse_connection():
+        raise RuntimeError("offline boundary")
+
+    monkeypatch.setattr(
+        session, "DexManiRobot", lambda *a, **kw: NS(connect=refuse_connection, stop_required=False)
+    )
+    native_runner = session.TeleopRunner
+
+    def construct(*args, **kwargs):
+        assert "recorder" in kwargs
+        recorder = kwargs["recorder"]
+        if recording:
+            assert isinstance(recorder, AsyncEpisodeRecorder)
+            assert recorder.data_dir == tmp_path / "captures" / "assembly"
+            assert recorder.control_hz == runtime.teleop.control_hz
+            assert recorder._rgb_shape == (runtime.camera.height, runtime.camera.width, 3)
+            assert recorder._thread is None and not recorder.is_recording
+        else:
+            assert recorder is None
+        owner = native_runner(*args, **kwargs)
+        assert owner.recorder is recorder
+        seen.append(owner)
+        return owner
+
+    monkeypatch.setattr(session, "TeleopRunner", construct)
+    assert session.run_teleop_experiment(runtime, task_name="assembly") == 1
+    assert len(seen) == 1
+    assert not (tmp_path / "captures").exists()
+
+
 @pytest.mark.parametrize(
     "data",
     [

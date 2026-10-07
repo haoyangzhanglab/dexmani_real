@@ -66,9 +66,10 @@ class PolicyOperator:
         self._handle_command_batch(self.keyboard.poll(timeout=0))
 
     def _handle_command_batch(self, signals) -> None:
-        # H blocks the I/O owner. B/T in that batch require a fresh request
+        # H blocks the I/O owner. H/B/T in that batch require a fresh request
         # after HOME, including when HOME returns incomplete.
         discard_begin_or_tare_in_batch = False
+        home_handled_in_batch = False
         # S/Q suppress H/B/T throughout the batch; ESC uses the latch/callback.
         stop_in_batch = any(
             signal in {OperatorCommand.STOP, OperatorCommand.QUIT} for signal in signals
@@ -118,6 +119,8 @@ class PolicyOperator:
                         self.keyboard.drain_signal(command)
                 return
             elif signal is OperatorCommand.HOME:
+                if home_handled_in_batch:
+                    continue
                 if self.planner is None:
                     logger.warning("operator: H is disabled in policy deployment")
                     continue
@@ -125,6 +128,7 @@ class PolicyOperator:
                     logger.warning("operator: ignored H received in the same batch as S/Q")
                     continue
                 if self._run_home():
+                    home_handled_in_batch = True
                     discard_begin_or_tare_in_batch = True
             elif signal is OperatorCommand.QUIT:
                 # Listener stays available through final recording cleanup.
@@ -135,16 +139,19 @@ class PolicyOperator:
 
     def _run_home(self) -> bool:
         with self.shared.motion_lock:
-            home_allowed = not self.shared.quit_requested.value and int(
-                self.shared.safety_state.value
-            ) == int(SafetyState.ARMED)
+            home_allowed = (
+                self.shared.is_running.value
+                and not self.shared.quit_requested.value
+                and not self.shared.error_state.value
+                and not self.shared.estop_request.value
+                and int(self.shared.stop_request.value) == int(StopRequest.NONE)
+                and int(self.shared.safety_state.value) == int(SafetyState.ARMED)
+            )
             if home_allowed:
-                # H follows any older inactive S but cannot erase an
-                # S arriving after this atomic preparation.
+                # Only the owner consumes S; HOME never clears a newer stop.
                 self.shared.start_request.value = False
-                self.shared.stop_request.value = int(StopRequest.NONE)
         if not home_allowed:
-            logger.warning("operator: ignored H unless safety is ARMED")
+            logger.warning("operator: ignored H unless ARMED without shutdown, fault or stop")
             return False
         home_result = {"outcome": "incomplete"}
         self.home_results.append(home_result)
