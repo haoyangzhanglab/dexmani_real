@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Usage: python examples/realsense_record_example.py
+"""Usage: python examples/realsense_record_example.py [--config YAML]
 
 Live RealSense RGB-D/Open3D diagnostic; restores auto-exposure priority on exit.
 Keys: q/Esc quit, p cloud, s raw/processed, f freeze, r reset, c config, d colormap, a exposure.
@@ -12,7 +12,7 @@ import argparse
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import cv2
@@ -27,13 +27,7 @@ from dexmani_real.sensor.pointcloud import build_point_cloud, build_raw_point_cl
 _WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
 
 
-@dataclass(frozen=True)
-class RealSenseDiagnosticConfig:
-    fps: int = 30
-    depth_resolution: tuple[int, int] = (640, 480)
-    color_resolution: tuple[int, int] = (640, 480)
-    warmup_frames: int = 10
-    fps_window: int = 100
+_FPS_WINDOW = 100
 
 
 @dataclass
@@ -185,46 +179,34 @@ def _list_cameras() -> list[dict[str, str]]:
     return cameras
 
 
-def _test_lifecycle(test_cfg: RealSenseDiagnosticConfig) -> bool:
+def _test_lifecycle(config: RealSenseCameraConfig) -> bool:
     print("\n-- 1. connect/disconnect lifecycle --")
-
-    config = RealSenseCameraConfig(
-        depth_resolution=test_cfg.depth_resolution,
-        color_resolution=test_cfg.color_resolution,
-        fps=test_cfg.fps,
-        warmup_frames=test_cfg.warmup_frames,
-    )
     camera = RealSenseCamera(config)
+    try:
+        for attempt in range(3):
+            ok = camera.connect()
+            print(f"  connect() -> {ok}" + (f" (attempt {attempt + 1}/3)" if attempt else ""))
+            if ok:
+                break
+            time.sleep(1.0)
+        else:
+            print("  FAIL: connect failed after 3 retries")
+            return False
 
-    # Connect with retry (L515 USB state can be flaky).
-    ok = False
-    for attempt in range(3):
-        ok = camera.connect()
-        print(f"  connect() -> {ok}" + (f" (attempt {attempt + 1}/3)" if attempt > 0 else ""))
-        if ok:
-            break
-        time.sleep(1.0)
-    if not ok:
-        print("  FAIL: connect failed after 3 retries")
-        return False
-
-    print(f"  connect() idempotent -> {camera.connect()}")
-
-    geometry = camera.get_geometry()
-    K = geometry.depth.matrix()
-    print(f"  K =\n{K}")
-    print(f"  depth_scale = {camera.get_depth_scale()}")
-    depth_intrinsics = geometry.depth
-    print(
-        f"  depth intrinsics = {depth_intrinsics.width}x{depth_intrinsics.height}  "
-        f"fx={depth_intrinsics.fx:.1f} fy={depth_intrinsics.fy:.1f} "
-        f"cx={depth_intrinsics.ppx:.1f} cy={depth_intrinsics.ppy:.1f}"
-    )
-    print(f"  color intrinsics = {geometry.color.width}x{geometry.color.height}")
-
+        print(f"  connect() idempotent -> {camera.connect()}")
+        geometry = camera.get_geometry()
+        print(f"  K =\n{geometry.depth.matrix()}")
+        print(f"  depth_scale = {camera.get_depth_scale()}")
+        depth = geometry.depth
+        print(
+            f"  depth intrinsics = {depth.width}x{depth.height}  "
+            f"fx={depth.fx:.1f} fy={depth.fy:.1f} cx={depth.ppx:.1f} cy={depth.ppy:.1f}"
+        )
+        print(f"  color intrinsics = {geometry.color.width}x{geometry.color.height}")
+    finally:
+        camera.disconnect()
+        print("  disconnect() -> OK")
     camera.disconnect()
-    print("  disconnect() -> OK")
-    camera.disconnect()  # idempotent
     print("  disconnect() idempotent -> OK")
     print("  Lifecycle test passed")
     return True
@@ -290,12 +272,17 @@ def _handle_keyboard(
     viewer: NonBlockingPCDViewer,
     camera: RealSenseCamera,
     production: PointCloudConfig,
+    *,
+    allow_exposure_changes: bool,
 ) -> bool:
     if key in (ord("q"), 27):
         return False
 
     if key == ord("a"):
-        _toggle_ae_priority(camera)
+        if allow_exposure_changes:
+            _toggle_ae_priority(camera)
+        else:
+            print("  Exposure changes disabled: original priority could not be read")
         return True
 
     action = _build_key_actions(state, viewer, production).get(key)
@@ -332,7 +319,7 @@ def _reset_state(
 ) -> None:
     state.reset()
     viewer.close()
-    print("  Config reset to defaults")
+    print("  Display state reset")
 
 
 def _print_state(state: PointCloudDisplayState, production: PointCloudConfig) -> None:
@@ -355,39 +342,24 @@ def _compute_base_from_color(serial: str | None, calibration: CameraExtrinsics) 
     if not serial:
         raise RuntimeError("connected camera did not publish a serial")
     camera_name = calibration.resolve_name_by_serial(serial)
-    base_from_color = calibration.get_extrinsics(camera_name)
-    return base_from_color
-
-
-def _find_color_sensor(camera: RealSenseCamera) -> Any:
-    if camera.profile is None:
-        raise RuntimeError("camera pipeline profile is unavailable")
-    device = camera.profile.get_device()
-    for sensor in device.query_sensors():
-        for profile in sensor.get_stream_profiles():
-            try:
-                if profile.stream_type() == rs.stream.color:
-                    return sensor
-            except RuntimeError:
-                continue
-    raise RuntimeError("no color sensor with a color stream profile found")
+    return calibration.get_extrinsics(camera_name)
 
 
 def _get_ae_priority(camera: RealSenseCamera) -> float | None:
-    """Read auto_exposure_priority (0=OFF, 1=ON); None if unsupported."""
+    """Read auto_exposure_priority (0=OFF, 1=ON); None if unsupported or unreadable."""
     try:
-        sensor = _find_color_sensor(camera)
+        sensor = camera.get_color_sensor()
         option = rs.option.auto_exposure_priority
         if sensor.supports(option):
             return float(sensor.get_option(option))
-    except RuntimeError:
+    except (RuntimeError, OSError):
         pass
     return None
 
 
 def _set_ae_priority(camera: RealSenseCamera, value: float) -> float | None:
     """Set auto_exposure_priority and return the readback; None if unsupported."""
-    sensor = _find_color_sensor(camera)
+    sensor = camera.get_color_sensor()
     option = rs.option.auto_exposure_priority
     if not sensor.supports(option):
         return None
@@ -396,7 +368,7 @@ def _set_ae_priority(camera: RealSenseCamera, value: float) -> float | None:
 
 
 def _toggle_ae_priority(camera: RealSenseCamera) -> None:
-    """Toggle auto_exposure_priority; OFF keeps the color stream near 30 Hz."""
+    """Toggle auto_exposure_priority; OFF caps exposure at the requested frame period."""
     current = _get_ae_priority(camera)
     if current is None:
         print("  auto_exposure_priority: not supported/readable on this color sensor")
@@ -406,17 +378,17 @@ def _toggle_ae_priority(camera: RealSenseCamera) -> None:
     if readback is None:
         print("  auto_exposure_priority: set failed (unsupported)")
         return
-    label = "OFF (keep ~30 Hz)" if target == 0.0 else "ON (may reduce FPS)"
+    label = "OFF (cap exposure at frame period)" if target == 0.0 else "ON (may reduce FPS)"
     print(f"  auto_exposure_priority: {current:g} -> {readback:g}  [{label}]")
 
 
 def _run_rgbd_test(
     camera: RealSenseCamera,
-    test_cfg: RealSenseDiagnosticConfig,
     *,
     production: PointCloudConfig,
     table_plane_abcd: tuple[float, float, float, float] | None,
     calibration: CameraExtrinsics,
+    allow_exposure_changes: bool,
 ) -> str:
     print("\n-- 2. RGB-D live capture + point cloud --")
     print(
@@ -426,137 +398,148 @@ def _run_rgbd_test(
 
     state = PointCloudDisplayState()
     viewer = NonBlockingPCDViewer(point_size=3.0)
-    frame_intervals: deque[float] = deque(maxlen=test_cfg.fps_window)
+    frame_intervals: deque[float] = deque(maxlen=_FPS_WINDOW)
     previous_frame_start = None
     frame_count = 0
     total_dropped = 0
-    outcome = "completed"
 
-    geometry = camera.get_geometry().aligned_depth_to_color()
-    depth_scale_m = camera.get_depth_scale()
-    base_from_color = _compute_base_from_color(camera.active_serial, calibration)
-    print(
-        f"  Start: num_points={production.num_points}  "
-        f"depth=[{production.depth_min_m}, {production.depth_max_m}]  "
-        f"voxel={production.voxel_size_m}  workspace={production.workspace}"
-    )
+    try:
+        geometry = camera.get_geometry().aligned_depth_to_color()
+        depth_scale_m = camera.get_depth_scale()
+        base_from_color = _compute_base_from_color(camera.active_serial, calibration)
+        print(
+            f"  Start: num_points={production.num_points}  "
+            f"depth=[{production.depth_min_m}, {production.depth_max_m}]  "
+            f"voxel={production.voxel_size_m}  workspace={production.workspace}"
+        )
 
-    while True:
-        loop_start = time.perf_counter()
-        if previous_frame_start is not None:
-            frame_intervals.append(loop_start - previous_frame_start)
-        previous_frame_start = loop_start
+        while True:
+            loop_start = time.perf_counter()
+            if previous_frame_start is not None:
+                frame_intervals.append(loop_start - previous_frame_start)
+            previous_frame_start = loop_start
 
-        t0 = time.perf_counter()
-        try:
-            frame = camera.read(timeout_ms=5000)
-        except (RuntimeError, OSError) as e:
-            print(f"  read() failed: {e}")
-            outcome = "read_failed"
-            break
-        read_ms = (time.perf_counter() - t0) * 1000.0
-        frame_count += 1
-        frame_rgb = frame.rgb
-        aligned_depth_raw = frame.depth_aligned_to_color_raw
-        aligned_depth_m = frame.depth_aligned_to_color
-        if frame_rgb is None or aligned_depth_raw is None or aligned_depth_m is None:
-            print("  aligned RGB-D frame unavailable; stopping diagnostic")
-            break
-        if (
-            frame_rgb.shape[:2] != aligned_depth_raw.shape
-            or aligned_depth_raw.shape != aligned_depth_m.shape
-        ):
-            print("  aligned RGB-D dimensions do not match; stopping diagnostic")
-            break
-
-        pcd_ms = 0.0
-        point_count = 0
-        pcd_array = None
-        if state.show:
             t0 = time.perf_counter()
             try:
-                if state.frozen and state.cached_cloud is not None:
-                    pcd_array = state.cached_cloud
-                elif state.cloud_mode == "raw":
-                    pcd_array = build_raw_point_cloud(
-                        depth_raw=aligned_depth_raw,
-                        color=frame_rgb,
-                        depth_scale_m=depth_scale_m,
-                        geometry=geometry,
-                        T_xarm_base_from_color=base_from_color,
-                    )
-                    state.cached_cloud = pcd_array
-                else:
-                    pcd_array = build_point_cloud(
-                        depth_raw=aligned_depth_raw,
-                        color=frame_rgb,
-                        depth_scale_m=depth_scale_m,
-                        geometry=geometry,
-                        T_xarm_base_from_color=base_from_color,
-                        table_plane_abcd=table_plane_abcd,
-                        config=production,
-                    )
-                    state.cached_cloud = pcd_array
-                point_count = pcd_array.shape[0] if pcd_array is not None else 0
-            except (ValueError, RuntimeError) as e:
-                total_dropped += 1
-                if total_dropped <= 3:
-                    print(f"  PCD generation failed (frame {frame_count}): {e}")
-            pcd_ms = (time.perf_counter() - t0) * 1000.0
+                frame = camera.read(timeout_ms=5000)
+            except (RuntimeError, OSError) as e:
+                print(f"  read() failed: {e}")
+                outcome = "read_failed"
+                break
+            read_ms = (time.perf_counter() - t0) * 1000.0
+            frame_count += 1
+            frame_rgb = frame.rgb
+            aligned_depth_raw = frame.depth_aligned_to_color_raw
+            aligned_depth_m = frame.depth_aligned_to_color
+            if frame_rgb is None or aligned_depth_raw is None or aligned_depth_m is None:
+                print("  aligned RGB-D frame unavailable; stopping diagnostic")
+                outcome = "read_failed"
+                break
+            if (
+                frame_rgb.shape[:2] != aligned_depth_raw.shape
+                or aligned_depth_raw.shape != aligned_depth_m.shape
+            ):
+                print("  aligned RGB-D dimensions do not match; stopping diagnostic")
+                outcome = "read_failed"
+                break
 
-        if state.colormap == "jet":
-            depth_vis = _make_jet_depth_vis(
+            pcd_ms = 0.0
+            point_count = 0
+            pcd_array = None
+            if state.show:
+                t0 = time.perf_counter()
+                try:
+                    if state.frozen and state.cached_cloud is not None:
+                        pcd_array = state.cached_cloud
+                    elif state.cloud_mode == "raw":
+                        pcd_array = build_raw_point_cloud(
+                            depth_raw=aligned_depth_raw,
+                            color=frame_rgb,
+                            depth_scale_m=depth_scale_m,
+                            geometry=geometry,
+                            T_xarm_base_from_color=base_from_color,
+                        )
+                        state.cached_cloud = pcd_array
+                    else:
+                        pcd_array = build_point_cloud(
+                            depth_raw=aligned_depth_raw,
+                            color=frame_rgb,
+                            depth_scale_m=depth_scale_m,
+                            geometry=geometry,
+                            T_xarm_base_from_color=base_from_color,
+                            table_plane_abcd=table_plane_abcd,
+                            config=production,
+                        )
+                        state.cached_cloud = pcd_array
+                    point_count = pcd_array.shape[0] if pcd_array is not None else 0
+                except (ValueError, RuntimeError) as e:
+                    total_dropped += 1
+                    if total_dropped <= 3:
+                        print(f"  PCD generation failed (frame {frame_count}): {e}")
+                pcd_ms = (time.perf_counter() - t0) * 1000.0
+
+            if state.colormap == "jet":
+                depth_vis = _make_jet_depth_vis(
+                    aligned_depth_m,
+                    production.depth_min_m,
+                    production.depth_max_m,
+                )
+            else:
+                depth_vis = _make_gray_depth_vis(
+                    aligned_depth_m,
+                    production.depth_min_m,
+                    production.depth_max_m,
+                )
+
+            valid_ratio = _depth_valid_ratio(
                 aligned_depth_m,
                 production.depth_min_m,
                 production.depth_max_m,
             )
-        else:
-            depth_vis = _make_gray_depth_vis(
-                aligned_depth_m,
-                production.depth_min_m,
-                production.depth_max_m,
+
+            color_bgr = np.ascontiguousarray(frame_rgb[..., ::-1])
+            panel = np.concatenate([color_bgr, depth_vis], axis=1)
+
+            fps = len(frame_intervals) / sum(frame_intervals) if frame_intervals else 0.0
+            lines = _build_hud_lines(
+                frame_count,
+                fps,
+                read_ms,
+                pcd_ms,
+                valid_ratio,
+                point_count,
+                state,
+                total_dropped,
+                geometry,
+                production,
             )
+            _overlay_text(panel, lines)
+            cv2.imshow(_WINDOW_NAME, panel)
 
-        valid_ratio = _depth_valid_ratio(
-            aligned_depth_m,
-            production.depth_min_m,
-            production.depth_max_m,
-        )
+            if state.show and pcd_array is not None and pcd_array.shape[0] > 0:
+                if not viewer.update(pcd_array):
+                    state.show = False
+                    viewer.close()
+                    print("  Point cloud window closed")
 
-        color_bgr = np.ascontiguousarray(frame_rgb[..., ::-1])
-        panel = np.concatenate([color_bgr, depth_vis], axis=1)
+            if not _handle_keyboard(
+                cv2.waitKey(1) & 0xFF,
+                state,
+                viewer,
+                camera,
+                production,
+                allow_exposure_changes=allow_exposure_changes,
+            ):
+                outcome = "user_exit"
+                break
 
-        fps = len(frame_intervals) / sum(frame_intervals) if frame_intervals else 0.0
-        lines = _build_hud_lines(
-            frame_count,
-            fps,
-            read_ms,
-            pcd_ms,
-            valid_ratio,
-            point_count,
-            state,
-            total_dropped,
-            geometry,
-            production,
-        )
-        _overlay_text(panel, lines)
-        cv2.imshow(_WINDOW_NAME, panel)
-
-        if state.show and pcd_array is not None and pcd_array.shape[0] > 0:
-            if not viewer.update(pcd_array):
-                state.show = False
-                viewer.close()
-                print("  Point cloud window closed")
-
-        if not _handle_keyboard(cv2.waitKey(1) & 0xFF, state, viewer, camera, production):
-            outcome = "user_exit"
-            break
-
-    viewer.close()
-    cv2.destroyAllWindows()
-
-    print(f"Captured {frame_count} frames; point-cloud failures: {total_dropped}")
-    return outcome
+        print(f"Captured {frame_count} frames; point-cloud failures: {total_dropped}")
+        return outcome
+    finally:
+        try:
+            viewer.close()
+        finally:
+            cv2.destroyAllWindows()
 
 
 def main(argv=None) -> int:
@@ -569,15 +552,17 @@ def main(argv=None) -> int:
 
     from dexmani_real.sensor.camera.realsense import RealSenseCamera, RealSenseCameraConfig
 
-    test_cfg = RealSenseDiagnosticConfig()
-
-    # Validate policy and calibration files before enumerating or opening a camera.
+    # Resolve experiment settings before enumerating or opening a camera.
     runtime = load_experiment_config(yaml_path=args.config)
     production = runtime.pointcloud
     production.validate()
     table = runtime.environment.table
     table_plane_abcd = resolve_table_plane(table) if production.remove_table else None
     calibration = CameraExtrinsics(args.camera_calibration)
+    # Both connections leave exposure priority untouched until it is snapshotted.
+    config = replace(
+        RealSenseCameraConfig.from_camera_params(runtime.camera), auto_exposure_priority=None
+    )
 
     print("=" * 60)
     print("RealSense Test -- RGB-D Live Capture + Real-time Point Cloud")
@@ -590,62 +575,64 @@ def main(argv=None) -> int:
     if not cameras:
         return 1
 
-    if not _test_lifecycle(test_cfg):
+    if not _test_lifecycle(config):
         print("Lifecycle test failed, exiting.")
         return 1
 
-    config = RealSenseCameraConfig(
-        depth_resolution=test_cfg.depth_resolution,
-        color_resolution=test_cfg.color_resolution,
-        fps=test_cfg.fps,
-        warmup_frames=test_cfg.warmup_frames,
-    )
     camera = RealSenseCamera(config)
-    connect_ok = False
-    for attempt in range(3):
-        connect_ok = camera.connect()
-        if connect_ok:
-            break
-        if attempt < 2:
-            delay = 1.0 * (attempt + 1)
-            print(f"  Connection failed, retrying in {delay:.0f}s...")
-            time.sleep(delay)
-    if not connect_ok:
-        print("Camera connection failed (3 retries).")
-        return 1
-    print(f"Connected: {camera.get_device_info()}")
-
-    # Restore the initial exposure priority on exit, including after keyboard changes.
-    original_priority = _get_ae_priority(camera)
-    if original_priority is not None:
-        state_name = "OFF" if original_priority < 0.5 else "ON"
-        print(
-            f"  auto_exposure_priority (initial): {original_priority:g} [{state_name}] "
-            "-- press 'a' to toggle"
-        )
-
+    original_priority = None
+    restore_failed = False
+    outcome = "read_failed"
     try:
+        for attempt in range(3):
+            if camera.connect():
+                break
+            if attempt < 2:
+                delay = 1.0 * (attempt + 1)
+                print(f"  Connection failed, retrying in {delay:.0f}s...")
+                time.sleep(delay)
+        else:
+            print("Camera connection failed (3 retries).")
+            return 1
+        print(f"Connected: {camera.get_device_info()}")
+        original_priority = _get_ae_priority(camera)
+        if original_priority is not None:
+            print(f"  auto_exposure_priority (original): {original_priority:g}")
+            if original_priority != 0.0:
+                applied = _set_ae_priority(camera, 0.0)
+                if applied is None or not np.isclose(applied, 0.0):
+                    raise RuntimeError("could not apply diagnostic exposure priority")
+        else:
+            print("  auto_exposure_priority unavailable; leaving it unchanged")
         outcome = _run_rgbd_test(
             camera,
-            test_cfg,
             production=production,
             table_plane_abcd=table_plane_abcd,
             calibration=calibration,
+            allow_exposure_changes=original_priority is not None,
         )
+    except (RuntimeError, OSError) as exc:
+        print(f"Diagnostic failed: {exc}")
     finally:
-        if original_priority is not None:
-            try:
-                restored = _set_ae_priority(camera, original_priority)
-                print(f"  [restore] auto_exposure_priority -> {restored:g}")
-            except (RuntimeError, OSError) as exc:
-                print(f"  [restore] auto_exposure_priority FAILED: {exc}")
-        camera.disconnect()
-        print("disconnect OK")
+        try:
+            if original_priority is not None:
+                try:
+                    restored = _set_ae_priority(camera, original_priority)
+                    if restored is None or not np.isclose(restored, original_priority):
+                        raise RuntimeError(f"exposure priority readback mismatch: {restored}")
+                    print(f"  [restore] auto_exposure_priority -> {restored:g}")
+                except (RuntimeError, OSError) as exc:
+                    restore_failed = True
+                    print(f"  [restore] auto_exposure_priority FAILED: {exc}")
+        finally:
+            camera.disconnect()
+            print("disconnect OK")
 
+    failed = outcome == "read_failed" or restore_failed
     print("\n" + "=" * 60)
-    print("Test failed" if outcome == "read_failed" else "Test complete")
+    print("Test failed" if failed else "Test complete")
     print("=" * 60)
-    return 1 if outcome == "read_failed" else 0
+    return int(failed)
 
 
 if __name__ == "__main__":

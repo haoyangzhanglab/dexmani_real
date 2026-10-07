@@ -42,7 +42,11 @@ def load_trajectory(episode_path):
         if collection_source != "teleop":
             raise ValueError("physical replay requires a teleop episode")
         reader.require_fields(
-            "action_arm_joint_target", "action_hand_joint_target", "arm_qpos", "hand_qpos"
+            "action_arm_joint_target",
+            "action_hand_joint_target",
+            "arm_qpos",
+            "hand_qpos",
+            "dispatch_status",
         )
         arm, hand, aq, hq = [
             reader[k][:]
@@ -55,16 +59,9 @@ def load_trajectory(episode_path):
         ]
         if len(arm) == 0 or not all(np.isfinite(v).all() for v in (arm, hand, aq, hq)):
             raise ValueError("replay requires nonempty finite targets and robot states")
-        # Recorded dispatch must show continued targets on both devices. Recordings
-        # without dispatch evidence remain nominal target trajectories.
-        if (
-            "execution_path" in meta
-            or "dispatch_status" in reader.fields
-            or "dispatch_status" in meta
-        ):
-            statuses = reader.read_row_info("dispatch_status", 0, reader.num_frames)
-            if not np.isin(statuses, (1, 2)).all():
-                raise ValueError("physical replay requires continued dispatch for both devices")
+        # Both devices must have continued dispatch, independently of optional metadata.
+        if not np.isin(reader["dispatch_status"][:], (1, 2)).all():
+            raise ValueError("physical replay requires continued dispatch for both devices")
         return TrajectoryData(
             path,
             len(arm),

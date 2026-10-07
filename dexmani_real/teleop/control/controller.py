@@ -127,6 +127,25 @@ def execute_control_step(
             except (DispatchError, DispatchInterrupted) as exc:
                 result, failure = exc.result, exc
                 cancelled = isinstance(exc, DispatchInterrupted)
+                cause = getattr(exc, "cause", None)
+                with shared.motion_lock:
+                    operator_cancelled = (
+                        cause == "authority_revoked"
+                        and int(shared.run_ended_id.value) == epoch
+                        and int(shared.run_ended_reason.value)
+                        in (RunEndReason.OPERATOR, RunEndReason.QUIT)
+                    )
+                if not operator_cancelled:
+                    logger.warning("teleop dispatch failed (%s): %s", cause, exc)
+                    if termination_details is not None:
+                        termination_details.append(
+                            dict(
+                                stage="dispatch",
+                                exception_type=type(exc).__name__,
+                                message=str(exc),
+                                cause=cause,
+                            )
+                        )
                 if cancelled:
                     shared.estop_request.value = True
                 revoke_motion_if_run_id(
@@ -165,7 +184,10 @@ def execute_control_step(
                     logger.exception("recording after dispatch also failed")
                     raise failure from exc
                 raise
-    if isinstance(failure, DispatchInterrupted) or (failure is not None and not failure.revoked):
+    if isinstance(failure, DispatchInterrupted) or (
+        failure is not None
+        and (not failure.revoked or failure.cause not in {"authority_revoked", "deadline_expired"})
+    ):
         raise failure
     if stop_error is not None:
         raise stop_error

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Usage: python examples/visualize_episode.py EPISODE [--info] [--max-frames N]
+"""Usage: python examples/visualize_episode.py EPISODE [--config YAML] [--info] [--max-frames N]
 
 Offline raw-episode Rerun viewer with production point clouds; --info prints a summary.
 """
@@ -16,8 +16,7 @@ os.environ.setdefault("RUST_LOG", "error")
 
 import numpy as np
 
-from dexmani_real.config.environment import TableCollisionConfig
-from dexmani_real.config.experiment import resolve_table_plane
+from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
 from dexmani_real.config.hardware import HandParams
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.dataset.pointcloud import (
@@ -77,36 +76,35 @@ def _fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None
     return row
 
 
-def print_episode_info(h5_path: str) -> None:
-    with EpisodeReader(h5_path) as reader:
-        f = reader
-        keys = sorted(f.fields - {"rgb"})
-        print(f"Episode:    {h5_path}")
+def print_episode_info(episode_path: str) -> None:
+    with EpisodeReader(episode_path) as reader:
+        keys = sorted(reader.fields - {"rgb"})
+        print(f"Episode:    {episode_path}")
         print(f"Control/depth rows: {reader.num_frames}")
         print(
             "Time:",
             "host monotonic timestamps"
             if "observation_timestamp_ns" in reader.fields
-            else "unknown (dt is nominal only)",
+            else "missing observation_timestamp_ns dataset",
         )
         print()
 
         print("Meta:")
-        for attr in sorted(f.meta.keys()):
-            print(f"  {attr}: {f.meta[attr]}")
+        for attr in sorted(reader.meta.keys()):
+            print(f"  {attr}: {reader.meta[attr]}")
         print()
 
         print(f"Datasets ({len(keys)}):")
         for key in keys:
-            ds = f[key]
+            ds = reader[key]
             print(f"  {key:<28s} shape={str(ds.shape):<22s} dtype={str(ds.dtype):<10s}")
 
         print()
         if reader.num_frames:
             for key in ("arm_qpos", "hand_qpos"):
-                if key not in f.fields:
+                if key not in reader.fields:
                     continue
-                q = f[key][:]
+                q = reader[key][:]
                 low = np.array2string(q.min(axis=0), precision=3, suppress_small=True)
                 high = np.array2string(q.max(axis=0), precision=3, suppress_small=True)
                 print(f"{key} range: {low} .. {high}")
@@ -115,7 +113,10 @@ def print_episode_info(h5_path: str) -> None:
 class EpisodeVisualizer:
     def __init__(
         self,
-        h5_path: str,
+        episode_path: str,
+        *,
+        handbase_position_eef_m: tuple[float, float, float],
+        handbase_quat_eef_wxyz: tuple[float, float, float, float],
         max_frames: int | None = None,
         point_cloud: bool = True,
         pointcloud_config: PointCloudConfig | None = None,
@@ -125,8 +126,8 @@ class EpisodeVisualizer:
         import rerun as rr
         import rerun.blueprint as rrb
 
-        self._h5_path = Path(h5_path)
-        self._reader = EpisodeReader(h5_path)
+        episode_name = Path(episode_path).stem
+        self._reader = EpisodeReader(episode_path)
         try:
             self._reader.require_fields(
                 "rgb",
@@ -139,8 +140,8 @@ class EpisodeVisualizer:
                 "hand_contact",
                 "action_arm_joint_target",
                 "action_hand_joint_target",
+                "observation_timestamp_ns",
             )
-            self._h5f = self._reader
             self._logical_dt_s = self._reader.dt
 
             self._T = self._resolve_frame_count(max_frames)
@@ -158,12 +159,8 @@ class EpisodeVisualizer:
             )
             if self._T_xarm_base_from_color is None:
                 logger.warning("No camera extrinsics: displaying pixels without point cloud")
-            self._handbase_position_eef_m = np.asarray(
-                HandParams.T_eef_handbase_pos_xyz, dtype=np.float64
-            )
-            self._handbase_quat_eef_wxyz = np.asarray(
-                HandParams.T_eef_handbase_quat_wxyz, dtype=np.float64
-            )
+            self._handbase_position_eef_m = np.asarray(handbase_position_eef_m, dtype=np.float64)
+            self._handbase_quat_eef_wxyz = np.asarray(handbase_quat_eef_wxyz, dtype=np.float64)
             self._pointcloud_deriver: RawEpisodePointCloudDeriver | None = None
             self._empty_pointcloud_frames = 0
             self._pointcloud_processing_ns = 0
@@ -189,8 +186,8 @@ class EpisodeVisualizer:
             self._state = self._preload_state()
 
             self._blueprint = self._build_blueprint()
-            app_id = f"DexMani - {self._h5_path.stem}"
-            rec_id = f"{self._h5_path.stem}-{time.time_ns()}"
+            app_id = f"DexMani - {episode_name}"
+            rec_id = f"{episode_name}-{time.time_ns()}"
             rr.init(
                 app_id,
                 recording_id=rec_id,
@@ -214,7 +211,9 @@ class EpisodeVisualizer:
         return raw
 
     def _preload_state(self) -> dict[str, np.ndarray]:
-        state = {key: self._h5f[key][: self._T] for keys in _SERIES_GROUPS.values() for key in keys}
+        state = {
+            key: self._reader[key][: self._T] for keys in _SERIES_GROUPS.values() for key in keys
+        }
 
         arm = state["arm_qpos"]
         hand = state["hand_qpos"]
@@ -237,7 +236,7 @@ class EpisodeVisualizer:
                 eef_pose_history=state["arm_ee"][hand_valid],
             )
 
-        contact = self._h5f["hand_contact"][: self._T]
+        contact = self._reader["hand_contact"][: self._T]
         state["hand_contact_mag"] = np.linalg.norm(contact, axis=2)
         state["hand_force_thumb"] = contact[:, 0, :]
         state["hand_force_index"] = contact[:, 1, :]
@@ -302,8 +301,8 @@ class EpisodeVisualizer:
 
     def log_step(self, step_idx: int) -> None:
         rr.set_time_sequence("step", step_idx)
-        stamp = self._reader.read_row_info("observation_timestamp_ns", step_idx, step_idx + 1)[0]
-        first = self._reader.read_row_info("observation_timestamp_ns", 0, 1)[0]
+        timestamps = self._reader["observation_timestamp_ns"]
+        stamp, first = int(timestamps[step_idx]), int(timestamps[0])
         rr.set_time_seconds(
             "time" if stamp and first else "nominal_time",
             (stamp - first) / 1e9 if stamp and first else step_idx * self._logical_dt_s,
@@ -415,10 +414,9 @@ class EpisodeVisualizer:
         return self._pointcloud_processing_ns / self._pointcloud_processed_frames / 1e6
 
     def close(self) -> None:
-        if hasattr(self, "_reader") and self._reader is not None:
+        if self._reader is not None:
             self._reader.close()
             self._reader = None  # type: ignore[assignment]
-            self._h5f = None  # type: ignore[assignment]
         try:
             rr.disconnect()
         except Exception:
@@ -439,6 +437,9 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=None,
         help="Limit number of state frames to load.",
+    )
+    parser.add_argument(
+        "--config", type=Path, help="Current experiment YAML for cloud and hand geometry"
     )
     parser.add_argument(
         "--info",
@@ -462,28 +463,34 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--max-frames must be a positive integer")
     if args.point_cloud is False and args.pointcloud_num_points is not None:
         parser.error("--pointcloud-num-points requires --point-cloud")
-    h5_path = Path(args.episode).expanduser().resolve()
-    if not h5_path.is_dir():
-        logger.error("Episode not found: %s", h5_path)
+    episode_path = Path(args.episode).expanduser().resolve()
+    if not episode_path.is_dir():
+        logger.error("Episode not found: %s", episode_path)
         return 1
 
     if args.info:
-        print_episode_info(str(h5_path))
+        print_episode_info(str(episode_path))
         return 0
 
+    runtime = load_experiment_config(yaml_path=args.config)
+    runtime.hand.validate()
     pointcloud_config = None
     table_plane_abcd = None
     if args.point_cloud:
         # Viewing assumes the table setup still matches the current calibration;
         # camera geometry continues to come from the recorded Raw metadata.
-        pointcloud_config = PointCloudConfig()
-        table_plane_abcd = resolve_table_plane(TableCollisionConfig())
-        logger.info("Using current calibrated table plane: %s", table_plane_abcd)
+        pointcloud_config = runtime.pointcloud
         if args.pointcloud_num_points is not None:
             pointcloud_config = replace(pointcloud_config, num_points=args.pointcloud_num_points)
+        pointcloud_config.validate()
+        if pointcloud_config.remove_table:
+            table_plane_abcd = resolve_table_plane(runtime.environment.table)
+            logger.info("Using current calibrated table plane: %s", table_plane_abcd)
 
     viz = EpisodeVisualizer(
-        str(h5_path),
+        str(episode_path),
+        handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
+        handbase_quat_eef_wxyz=runtime.hand.T_eef_handbase_quat_wxyz,
         max_frames=args.max_frames,
         point_cloud=args.point_cloud,
         pointcloud_config=pointcloud_config,

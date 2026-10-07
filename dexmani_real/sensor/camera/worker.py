@@ -25,31 +25,14 @@ def pack_camera_frame(rgb, depth_raw, *, timestamp_ns, depth_frame_number, color
 
 
 def run_camera_worker(shared, config: CameraParams) -> None:
-    config.validate()
     if shared.camera_ring is None:
         raise ValueError("camera worker requires an allocated camera ring")
     from dexmani_real.sensor.camera.realsense import (
-        L515DepthConfig,
         RealSenseCamera,
         RealSenseCameraConfig,
     )
 
-    cfg = config
-    cam = RealSenseCamera(
-        RealSenseCameraConfig(
-            camera_name="realsense",
-            serial=cfg.serial,
-            depth_resolution=(cfg.width, cfg.height),
-            color_resolution=(cfg.width, cfg.height),
-            fps=cfg.fps,
-            warmup_frames=cfg.warmup_frames,
-            frame_queue_capacity=cfg.frame_queue_capacity,
-            l515_depth_config=L515DepthConfig(
-                visual_preset=cfg.l515_visual_preset,
-                confidence_threshold=cfg.l515_confidence_threshold,
-            ),
-        )
-    )
+    cam = RealSenseCamera(RealSenseCameraConfig.from_camera_params(config))
     try:
         if not cam.connect():
             raise RuntimeError("RealSense connect failed")
@@ -63,7 +46,7 @@ def run_camera_worker(shared, config: CameraParams) -> None:
                 frame = cam.read(timeout_ms=300, compute_depth=False)
             except (RuntimeError, OSError):
                 if time.monotonic_ns() - min(last_advance_ns) >= int(
-                    cfg.source_stall_timeout_s * 1e9
+                    config.source_stall_timeout_s * 1e9
                 ):
                     raise
                 time.sleep(0.01)
@@ -75,7 +58,7 @@ def run_camera_worker(shared, config: CameraParams) -> None:
                     raise RuntimeError(f"RealSense missing {name} frame identity")
                 if last_frame is None or identity[channel] != last_frame[channel]:
                     last_advance_ns[channel] = int(frame.timestamp_ns)
-                elif now - last_advance_ns[channel] >= int(cfg.source_stall_timeout_s * 1e9):
+                elif now - last_advance_ns[channel] >= int(config.source_stall_timeout_s * 1e9):
                     raise RuntimeError(f"RealSense stopped producing new {name}")
             if identity == last_frame:
                 continue

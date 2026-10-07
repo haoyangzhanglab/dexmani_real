@@ -274,8 +274,6 @@ def _append_episode(reader, processing, data, row_info, tails, offset, frames, c
     for name, spec in ROW_INFO_SPECS.items():
         row_info[name].resize((offset + frames, *spec.tail_shape))
     notes = {}
-    if "observation_timestamp_ns" not in reader.fields:
-        notes["timestamps"] = "unknown; dt is nominal only"
     quality = EpisodeQuality(reader.dt, reader.meta.get("camera_timestamp_source", "unknown"))
     count = 0
     for block in iter_canonical_blocks(reader, processing, chunk_frames=chunk, notes=notes):
@@ -288,7 +286,7 @@ def _append_episode(reader, processing, data, row_info, tails, offset, frames, c
                 raise ValueError(f"{key}: transformed shape/dtype mismatch")
             data[key][offset + count : offset + count + rows] = values
         info_block = {
-            name: reader.read_row_info(name, count, count + rows) for name in ROW_INFO_SPECS
+            name: np.asarray(reader[name][count : count + rows]) for name in ROW_INFO_SPECS
         }
         for name, values in info_block.items():
             row_info[name][offset + count : offset + count + rows] = values

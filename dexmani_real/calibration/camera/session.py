@@ -65,9 +65,6 @@ from dexmani_real.utils.rate import LoopRate
 logger = get_logger(__name__)
 
 _WINDOW_NAME = "ArUco Calibration"
-_CAMERA_WIDTH = 640
-_CAMERA_HEIGHT = 480
-_CAMERA_FPS = 30
 
 
 def _detect_aruco_stable(
@@ -166,6 +163,9 @@ def _read_stationary_calibration_arm_state(
 
 def _calibration_capture_metadata(
     *,
+    width: int,
+    height: int,
+    requested_fps: int,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
     method: str,
@@ -202,9 +202,9 @@ def _calibration_capture_metadata(
         }
 
     return {
-        "width": _CAMERA_WIDTH,
-        "height": _CAMERA_HEIGHT,
-        "fps": _CAMERA_FPS,
+        "width": width,
+        "height": height,
+        "requested_fps": requested_fps,
         "intrinsics": intrinsic_matrix.tolist(),
         "distortion": distortion_values.tolist(),
         "method": method,
@@ -220,6 +220,9 @@ def _solve_calibration(
     planner: XArm7MotionPlanner,
     config: CalibrationConfig,
     *,
+    width: int,
+    height: int,
+    requested_fps: int,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
 ):
@@ -289,6 +292,9 @@ def _solve_calibration(
     print(f"  T_world_camera position: {np.round(T_world_camera[:3, 3], 4)}m")
 
     metadata = _calibration_capture_metadata(
+        width=width,
+        height=height,
+        requested_fps=requested_fps,
         intrinsics=intrinsics,
         distortion=distortion,
         method=method,
@@ -480,6 +486,9 @@ class CameraCalibrationSession:
                     self.state.samples,
                     self.planner,
                     self.calibration_config,
+                    width=self.camera_width,
+                    height=self.camera_height,
+                    requested_fps=self.runtime.camera.fps,
                     intrinsics=self.intrinsics,
                     distortion=self.distortion,
                 )
@@ -525,6 +534,7 @@ class CameraCalibrationSession:
         try:
             self.serial = self.shared.camera_serial.value.decode()
             geometry = json.loads(self.shared.camera_geometry.value.decode())["color"]
+            self.camera_width, self.camera_height = geometry["width"], geometry["height"]
             self.intrinsics = np.array(
                 [
                     [geometry["fx"], 0, geometry["ppx"]],
@@ -537,7 +547,7 @@ class CameraCalibrationSession:
             print(f"  Camera serial: {self.serial}")
             print(
                 f"  Intrinsics: fx={self.intrinsics[0, 0]:.1f} "
-                f"fy={self.intrinsics[1, 1]:.1f} ({_CAMERA_WIDTH}x{_CAMERA_HEIGHT})"
+                f"fy={self.intrinsics[1, 1]:.1f} ({self.camera_width}x{self.camera_height})"
             )
             self.keys.start()
             check_services = self.robot.check_services

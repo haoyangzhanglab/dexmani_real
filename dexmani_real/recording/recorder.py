@@ -321,7 +321,8 @@ class AsyncEpisodeRecorder:
             self._queue.put_nowait(frame)
         except Full as exc:
             error = RecordingBackpressureError("recording queue full (capacity=16)")
-            self._store_error(error)
+            # The sink is still usable: stop submissions, then drain accepted rows.
+            self._store_error(error, abort=False)
             raise error from exc
         self._frame_count += 1
         return self._frame_count - 1
@@ -345,8 +346,8 @@ class AsyncEpisodeRecorder:
             return None
         deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
         try:
-            if was_recording and self._error is None:
-                self._save = save
+            if was_recording:
+                self._save = save and self._error is None
                 self._reason = reason
                 # Detach owner state before STOP; encoding belongs to the writer.
                 self._final_metadata = deepcopy(details)
@@ -401,7 +402,14 @@ class AsyncEpisodeRecorder:
         meta.attrs["format"] = RAW_FORMAT
         meta.attrs["num_frames"] = self._written_frames
         meta.attrs["termination_reason"] = self._reason
-        self.check_error()
+        if self._error is not None:
+            details = list(details or []) + [
+                dict(
+                    stage="recording",
+                    exception_type=type(self._error).__name__,
+                    message=str(self._error),
+                )
+            ]
         if details:
             meta.create_dataset("termination_details", data=json.dumps(details, allow_nan=False))
         if last_dispatch_detail is not None:
@@ -473,7 +481,7 @@ class AsyncEpisodeRecorder:
             video.close()
             data.close()
             self._handles_released = True
-            if self._save and not self._abort and self._written_frames:
+            if self._save and self._error is None and not self._abort and self._written_frames:
                 if (
                     self._written_frames != self._frame_count
                     or video.frame_count != self._written_frames
@@ -487,6 +495,13 @@ class AsyncEpisodeRecorder:
                     self._episode_dir,
                     self._written_frames,
                     self._reason,
+                )
+            elif self._error is not None:
+                logger.error(
+                    "Recording staging retained: %s frames=%d reason=%s",
+                    staging,
+                    self._written_frames,
+                    self._reason or "recording_failure",
                 )
             else:
                 logger.info(

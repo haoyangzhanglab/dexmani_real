@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Usage: python examples/pointcloud_process_example.py [--save-dir DIR]
+"""Usage: python examples/pointcloud_process_example.py [--config YAML] [--save-dir DIR]
 
 Live RealSense/OpenCV/Open3D diagnostic; --save-dir saves RGB-D, clouds and reconstruction metadata.
 Table fitting needs confirmation; the fit is used immediately. Publishing table_plane.json
@@ -28,6 +28,7 @@ from dexmani_real.config.experiment import (
     resolve_table_plane,
     resolve_table_plane_path,
 )
+from dexmani_real.config.hardware import CameraParams
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.sensor.pointcloud import (
@@ -44,10 +45,6 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class PointCloudDiagnosticConfig:
-    rgb_resolution: tuple[int, int] = (640, 480)
-    depth_resolution: tuple[int, int] = (640, 480)
-    fps: int = 30
-    warmup_frames: int = 10
     table_calibration_frames: int = 5
 
     show_rgbd_panels: bool = True
@@ -306,22 +303,16 @@ def _save_diagnostic_snapshot(
         raise
 
 
-def _connect_camera(cfg: PointCloudDiagnosticConfig) -> RealSenseCamera:
+def _connect_camera(cfg: CameraParams) -> RealSenseCamera:
     """Connect and warm up; exclude this one-time cost from per-frame timings."""
-    camera = RealSenseCamera(
-        RealSenseCameraConfig(
-            depth_resolution=cfg.depth_resolution,
-            color_resolution=cfg.rgb_resolution,
-            fps=cfg.fps,
-            enable_color=True,
-            enable_global_time=True,
-            warmup_frames=cfg.warmup_frames,
-            l515_depth_config=L515DepthConfig(),
-        )
-    )
+    camera = RealSenseCamera(RealSenseCameraConfig.from_camera_params(cfg))
     print("Connecting to RealSense...")
-    if not camera.connect():
-        raise RuntimeError("Failed to connect to RealSense.")
+    try:
+        if not camera.connect():
+            raise RuntimeError("Failed to connect to RealSense.")
+    except BaseException:
+        camera.disconnect()
+        raise
     return camera
 
 
@@ -638,11 +629,10 @@ def _visualize_result(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    global rs, RealSenseCamera, RealSenseCameraConfig, L515DepthConfig
+    global rs, RealSenseCamera, RealSenseCameraConfig
     import pyrealsense2 as rs
 
     from dexmani_real.sensor.camera.realsense import (
-        L515DepthConfig,
         RealSenseCamera,
         RealSenseCameraConfig,
     )
@@ -652,7 +642,7 @@ def main(argv: list[str] | None = None) -> int:
         raise NotADirectoryError(f"snapshot output root is not a directory: {save_dir}")
     cfg = PointCloudDiagnosticConfig()
 
-    # Resolve and validate file-backed policy before connecting to hardware.
+    # Resolve experiment settings before connecting to hardware.
     calibrate_table = input("\nRun table calibration? [y/N] ").strip().lower() in {"y", "yes"}
     runtime = load_experiment_config(yaml_path=args.config)
     pcd_config = runtime.pointcloud
@@ -664,7 +654,7 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
 
-    camera = _connect_camera(cfg)
+    camera = _connect_camera(runtime.camera)
 
     try:
         camera_info = _print_device_info(camera)

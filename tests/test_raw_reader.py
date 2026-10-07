@@ -1,4 +1,4 @@
-"""Historical dispatch must survive loading without lossy coercion."""
+"""Current Raw arrays are read directly; missing evidence is never synthesized."""
 
 import h5py
 import numpy as np
@@ -8,7 +8,7 @@ from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
 from dexmani_real.recording.storage.schema import RAW_FORMAT
 
 
-def synthetic_raw(tmp_path, statuses=None, *, current=None):
+def synthetic_raw(tmp_path, *, dispatch=None, metadata_dispatch=None):
     path = tmp_path / "episode_synthetic"
     path.mkdir()
     with h5py.File(path / "data.h5", "w") as data:
@@ -20,10 +20,10 @@ def synthetic_raw(tmp_path, statuses=None, *, current=None):
             task_label="synthetic",
             collection_source="teleop",
         )
-        if statuses is not None:
-            data["meta"].attrs["dispatch_status"] = statuses
-        if current is not None:
-            data.create_dataset("dispatch_status", data=current)
+        if metadata_dispatch is not None:
+            data["meta"].attrs["dispatch_status"] = metadata_dispatch
+        if dispatch is not None:
+            data.create_dataset("dispatch_status", data=dispatch)
         for name, size in (
             ("arm_qpos", 7),
             ("hand_qpos", 12),
@@ -34,49 +34,76 @@ def synthetic_raw(tmp_path, statuses=None, *, current=None):
     return path
 
 
-@pytest.mark.parametrize("dtype", [np.int8, np.int64, np.uint64, np.float64])
-def test_historical_dispatch_preserves_numeric_codes_and_slice(tmp_path, dtype):
-    expected = np.array([[0, 1], [2, 4]], dtype=dtype)
-    path = synthetic_raw(tmp_path, expected)
+def test_current_dispatch_preserves_values_and_slice(tmp_path):
+    expected = np.array([[0, 1], [2, 4]], dtype=np.uint8)
+    path = synthetic_raw(tmp_path, dispatch=expected)
     with EpisodeReader(path) as reader:
-        actual = reader.read_row_info("dispatch_status", 0, 2)
-        assert actual.dtype == np.uint8
-        np.testing.assert_array_equal(actual, expected)
-        np.testing.assert_array_equal(reader.read_row_info("dispatch_status", 1, 2), expected[1:])
+        assert reader["dispatch_status"].dtype == np.uint8
+        np.testing.assert_array_equal(reader["dispatch_status"][:], expected)
+        np.testing.assert_array_equal(reader["dispatch_status"][1:2], expected[1:])
 
 
-@pytest.mark.parametrize("value", [257, 258, -255, 1.5, np.nan, np.inf, True, b"1"])
-def test_malformed_historical_dispatch_is_rejected_without_modifying_raw(tmp_path, value):
-    path = synthetic_raw(tmp_path, np.full((2, 2), value))
+@pytest.mark.parametrize("dtype", [np.int8, np.int64, np.float64, np.bool_])
+def test_dispatch_dtype_is_not_coerced(tmp_path, dtype):
+    path = synthetic_raw(tmp_path, dispatch=np.ones((2, 2), dtype=dtype))
     before = (path / "data.h5").read_bytes()
     with EpisodeReader(path) as reader:
-        with pytest.raises(RawDataError, match="historical dispatch status values"):
-            reader.read_row_info("dispatch_status", 0, 2)
+        with pytest.raises(RawDataError, match="dispatch_status: incompatible shape/dtype"):
+            reader["dispatch_status"]
     assert (path / "data.h5").read_bytes() == before
 
 
-def test_malformed_historical_dispatch_cannot_admit_replay(tmp_path, monkeypatch):
+@pytest.mark.parametrize("metadata_dispatch", [None, np.ones((2, 2), dtype=np.uint8)])
+def test_replay_requires_dispatch_dataset_before_fk(tmp_path, monkeypatch, metadata_dispatch):
     from dexmani_real.replay import trajectory
 
-    path = synthetic_raw(tmp_path, np.full((2, 2), 257))
+    path = synthetic_raw(tmp_path, metadata_dispatch=metadata_dispatch)
+    before = (path / "data.h5").read_bytes()
     monkeypatch.setattr(
         trajectory,
         "compute_eef_pose_history_xarm_base",
-        lambda *a: pytest.fail("invalid dispatch reached replay FK"),
+        lambda *a: pytest.fail("missing dispatch reached replay FK"),
     )
-    with pytest.raises(RawDataError):
+    with pytest.raises(RawDataError, match="dispatch_status"):
         trajectory.load_trajectory(path)
+    assert (path / "data.h5").read_bytes() == before
 
 
-def test_current_dispatch_takes_precedence_over_historical_metadata(tmp_path):
-    current = np.array([[1, 2], [3, 4]], dtype=np.uint8)
-    path = synthetic_raw(tmp_path, np.full((2, 2), 257), current=current)
-    with EpisodeReader(path) as reader:
-        np.testing.assert_array_equal(reader.read_row_info("dispatch_status", 0, 2), current)
+@pytest.mark.parametrize("status", [0, 1, 2, 3, 4, 255])
+def test_replay_checks_current_dispatch_without_execution_path(tmp_path, monkeypatch, status):
+    from dexmani_real.replay import trajectory
+
+    path = synthetic_raw(tmp_path, dispatch=np.full((2, 2), status, dtype=np.uint8))
+    monkeypatch.setattr(
+        trajectory, "compute_eef_pose_history_xarm_base", lambda q: np.zeros((len(q), 9))
+    )
+    if status in (1, 2):
+        assert trajectory.load_trajectory(path).num_frames == 2
+    else:
+        with pytest.raises(ValueError, match="continued dispatch"):
+            trajectory.load_trajectory(path)
 
 
-def test_missing_historical_evidence_stays_unknown(tmp_path):
+def test_missing_time_is_not_filled(tmp_path):
     path = synthetic_raw(tmp_path)
     with EpisodeReader(path) as reader:
-        np.testing.assert_array_equal(reader.read_row_info("dispatch_status", 0, 2), [[4, 4]] * 2)
-        np.testing.assert_array_equal(reader.read_row_info("camera_timestamp_ns", 0, 2), [0, 0])
+        with pytest.raises(RawDataError, match="camera_timestamp_ns"):
+            reader.require_fields("camera_timestamp_ns")
+        with pytest.raises(KeyError):
+            reader["camera_timestamp_ns"]
+
+
+def test_export_rejects_missing_row_evidence(tmp_path):
+    from test_policy_recording import start_recording
+
+    from dexmani_real.dataset.processing import validate_export_episode
+
+    recorder = start_recording(tmp_path)
+    path = recorder.save_episode(reason="synthetic_fixture")
+    with h5py.File(path / "data.h5", "r+") as data:
+        del data["camera_timestamp_ns"]
+    before = (path / "data.h5").read_bytes()
+    with EpisodeReader(path) as reader:
+        with pytest.raises(RawDataError, match="camera_timestamp_ns"):
+            validate_export_episode(reader)
+    assert (path / "data.h5").read_bytes() == before

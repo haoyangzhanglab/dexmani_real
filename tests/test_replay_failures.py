@@ -127,3 +127,45 @@ def test_capture_failure_during_quit_remains_fault_with_saved_prefix(replay_case
     assert "capture conversion failed" in outcome.reason
     assert len(sends) == 2 and stops
     np.testing.assert_array_equal(outcome.replay_data["dispatch_status"], [[1, 1]])
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    [None, "compute_metrics", "report_consistency", "atomic_json_dump", "save_replay_data"],
+)
+def test_replay_measurements_survive_derived_report_failures(tmp_path, monkeypatch, failure_stage):
+    from dexmani_real.replay import evaluation
+    from dexmani_real.replay.trajectory import TrajectoryData
+
+    q, h = np.zeros((1, 7)), np.zeros((1, 12))
+    ee = np.array([[0, 0, 0, 1, 0, 0, 0, 1, 0]], dtype=float)
+    trajectory = TrajectoryData("synthetic", 1, 16.0, "test", q, h, q, h, ee)
+    data = dict(arm_qpos=q, hand_qpos=h, eef_pos=ee[:, :3], eef_rot6d=ee[:, 3:])
+    if failure_stage is not None:
+
+        def fail(*args, **kwargs):
+            raise OSError("injected failure")
+
+        monkeypatch.setattr(evaluation, failure_stage, fail)
+        if failure_stage == "save_replay_data":
+            monkeypatch.setattr(
+                evaluation,
+                "compute_metrics",
+                lambda **kw: pytest.fail("metrics before saved measurements"),
+            )
+        with pytest.raises(OSError, match="injected failure"):
+            evaluation.evaluate_replay(
+                trajectory, data, evaluate_consistency=True, output_dir=str(tmp_path)
+            )
+    else:
+        evaluation.evaluate_replay(
+            trajectory, data, evaluate_consistency=True, output_dir=str(tmp_path)
+        )
+    assert (tmp_path / "metrics.json").exists() == (failure_stage is None)
+    if failure_stage == "save_replay_data":
+        assert not (tmp_path / "replay_data.npz").exists()
+    else:
+        with np.load(tmp_path / "replay_data.npz") as saved:
+            assert set(saved.files) == set(data)
+            for name, values in data.items():
+                np.testing.assert_array_equal(saved[name], values)

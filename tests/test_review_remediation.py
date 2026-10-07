@@ -497,7 +497,13 @@ def test_teleop_cancel_records_once_before_propagation(monkeypatch, stop_fails):
         controller.execute_control_step(
             ctl, robot.shared, robot, row, recorder, termination_details=details
         )
-    assert details == (
+    assert details[0] == dict(
+        stage="dispatch",
+        exception_type="DispatchInterrupted",
+        message="dispatch interrupted",
+        cause=None,
+    )
+    assert details[1:] == (
         [dict(stage="dispatch_stop", exception_type="TimeoutError", message="STOP_TIMEOUT")]
         if stop_fails
         else []
@@ -663,6 +669,7 @@ def test_diagnostic_failure_is_nonzero_and_disconnects(monkeypatch, capsys):
         diag,
         "load_experiment_config",
         lambda **kw: NS(
+            camera=ExperimentConfig().camera,
             pointcloud=NS(
                 validate=lambda: None,
                 remove_table=False,
@@ -739,6 +746,8 @@ def test_calibration_cancel_after_solve_does_not_publish(monkeypatch):
     instance.planner = None
     instance.serial = "fake"
     instance.calibration_config = None
+    instance.runtime = ExperimentConfig()
+    instance.camera_width, instance.camera_height = 848, 480
     instance.intrinsics = np.eye(3)
     instance.distortion = np.zeros(5)
 

@@ -247,37 +247,30 @@ def evaluate_replay(
     if replay_data["arm_qpos"].shape[0] == 0:
         print("\nSkipping metrics: no valid reference or replay data available")
         return
+    # Physical measurements must survive failures in any derived report.
+    save_replay_data(replay_data, output_dir)
     if not evaluate_consistency:
-        print("\nSkipping consistency metrics; saving captured replay data.")
-        save_replay_data(replay_data, output_dir)
+        print("\nSkipping consistency metrics; captured replay data saved.")
         return
 
     print("\nComputing consistency metrics...")
-    try:
-        metrics = compute_metrics(
-            original_arm_qpos=trajectory.arm_qpos,
-            replay_arm_qpos=replay_data["arm_qpos"],
-            original_arm_ee=trajectory.arm_ee,
-            replay_arm_ee_pos=replay_data["eef_pos"],
-            replay_arm_ee_rot6d=replay_data["eef_rot6d"],
-            fps=trajectory.fps,
-            original_hand_qpos=trajectory.hand_qpos,
-            replay_hand_qpos=replay_data.get("hand_qpos"),
-            episode_path=trajectory.episode_path,
-            task_label=trajectory.task_label,
-            speed_factor=1.0,
-            arm_tracking_error=replay_data.get("arm_tracking_error"),
-        )
-    except Exception:
-        logger.error(
-            "replay consistency evaluation failed; saving raw replay data",
-            exc_info=True,
-        )
-        save_replay_data(replay_data, output_dir)
-        raise
+    metrics = compute_metrics(
+        original_arm_qpos=trajectory.arm_qpos,
+        replay_arm_qpos=replay_data["arm_qpos"],
+        original_arm_ee=trajectory.arm_ee,
+        replay_arm_ee_pos=replay_data["eef_pos"],
+        replay_arm_ee_rot6d=replay_data["eef_rot6d"],
+        fps=trajectory.fps,
+        original_hand_qpos=trajectory.hand_qpos,
+        replay_hand_qpos=replay_data.get("hand_qpos"),
+        episode_path=trajectory.episode_path,
+        task_label=trajectory.task_label,
+        speed_factor=1.0,
+        arm_tracking_error=replay_data.get("arm_tracking_error"),
+    )
 
     report_consistency(metrics)
-    save_results(metrics, replay_data, output_dir, hand_start_duration_s=hand_start_duration_s)
+    _save_metrics(metrics, output_dir, hand_start_duration_s=hand_start_duration_s)
 
 
 def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str) -> Path:
@@ -294,19 +287,13 @@ def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str) -> Pat
     return npz_path
 
 
-def save_results(
+def _save_metrics(
     metrics: ReplayMetrics,
-    replay_data: dict[str, np.ndarray],
     output_dir: str,
     *,
     hand_start_duration_s: float = 0.0,
 ) -> None:
-    """Save replay data and consistency metrics to output directory.
-
-    Produces:
-        <output_dir>/metrics.json   — human-readable scalar metrics
-        <output_dir>/replay_data.npz — full time-series arrays
-    """
+    """Save derived metrics after the captured measurements have been persisted."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -372,8 +359,6 @@ def save_results(
         json_defined(metrics_dict), output_path / "metrics.json", ensure_ascii=False
     )
     print(f"\nMetrics saved: {metrics_path}")
-
-    save_replay_data(replay_data, output_dir)
 
 
 def tracking_lags(orig_q, rep_q, fps):

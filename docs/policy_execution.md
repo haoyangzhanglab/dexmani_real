@@ -92,13 +92,19 @@ Policy/replay 首次创建 `session_result.json` 时原子地拒绝覆盖已有�
 
 第一终止主因通过 run_ended_id 与 run_id 关联，`termination_reason` 表达首因。Teleop 使用可选 `data.h5/meta/termination_details` 保存结束阶段、异常类型和错误说明；附加 stop 故障不能覆盖 OPERATOR/QUIT，正常结束不写错误详情。
 
+Teleop 下发截止过期后停止、保存前缀并暂停，操作者可检查后重新开始；dispatch 技术异常的详情另存 `cause`，不覆盖首因。前次停止未确认、设备错误或停止失败仍向 session 传播。无录制模式也在日志保留具体下发原因。
+
 owner 在归档前冻结 trace；recorder 向 writer 队列提交结束消息前深拷贝结束详情，writer 排空有效帧后对 Raw 结束详情执行严格 JSON 编码。快照或编码失败会锁存错误、保留 staging，并由 writer 关闭资源；重复 close 报告已锁存错误，不重新准备元数据。真正阻塞的原生 I/O 仍可能超过等待预算，owner 不跨线程强关句柄。发布后的资源回收故障通过会话结果与日志表达，不回写已发布 Raw。
 
-Policy 主 Dataset 按实际使用的输入与监督检查窗口有限性，Real canonical 额外要求两设备 ACCEPTED dispatch。观察检查前 N 源行，监督检查完整 H；保持原 padding、episode 边界、loss 权重和时间语义。normalizer 仅拟合有效训练窗口引用的去重源行，验证使用训练统计。checkpoint 部署及恢复读取保存的统计，不重拟合；数据配方变化不能作为旧配方的精确续训，历史复现使用原源码版本。新 Real 训练还默认以 `dataset.max_time_gap_ratio=1.5` 筛选时间连续窗口；显式 null 记录 unfiltered。未知或非正时间即使在 H=1 中也不合格；padding 重复同一源行不产生零间隔。规则与统计写入 data_recipe；恢复先解析保存规则，已知旧缺键保持旧无筛选样本与表示，不回写历史产物。数学和数据筛选细节见相邻 `dexmani_policy` 仓库的 `docs/rtc.md`。
+Policy 主 Dataset 按实际使用的输入与监督检查窗口有限性，Real canonical 额外要求两设备 ACCEPTED dispatch。观察检查前 N 源行，监督检查完整 H；保持原 padding、episode 边界、loss 权重和时间语义。normalizer 仅拟合有效训练窗口引用的去重源行，验证使用训练统计。checkpoint 部署及恢复读取保存的统计，不重拟合；数据配方变化不能作为旧配方的精确续训，历史复现使用原源码版本。新 Real 训练还默认以 `dataset.max_time_gap_ratio=1.5` 筛选时间连续窗口；显式 null 记录 unfiltered。未知或非正时间即使在 H=1 中也不合格；padding 重复同一源行不产生零间隔。规则与统计写入 data_recipe，恢复时使用保存规则。数学和数据筛选细节见相邻 `dexmani_policy` 仓库的 `docs/rtc.md`。
 
 Replay 报告中的 arm `mean_joint_rmse_deg` 是逐关节 RMSE 的平均，hand `pooled_rmse_deg` 是所有帧和关节平方误差的共同均值开方，两者口径不同；历史结果不改写。
 
 Replay 在输出目录 missing-or-empty 检查与轨迹 preflight 后初始化结果记录；trajectory_status/reason 描述轨迹阶段，session outcome/reason 还包含返航、关闭及评估产物写入结果。轨迹完成与最终 session 故障可以同时成立。
+
+物理 Replay 要求逐行 `dispatch_status` 数据集，每行两设备均为 ACCEPTED 或 CRC_UNCONFIRMED；缺失该数据集不能作为名义目标轨迹放行。该条件不代表设备实际到达目标。
+
+Replay 先保存本次采集的 `replay_data.npz`，再计算、展示和保存指标。派生报告失败仍使 session 报错，但已保存的测量保留。
 
 Replay 的下发异常只有在 cause 为 `authority_revoked`、当前 run 的首因是 QUIT 且没有独立故障时才归为正常退出。稍后到达的 Q 不掩盖下发超时、停止未确认或 capture 失败；capture/stop 错误保留在结束说明中，返回已成功记录的前缀并报告失败。
 

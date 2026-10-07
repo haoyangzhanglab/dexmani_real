@@ -379,3 +379,151 @@ def test_direct_runner_rejects_recording_without_attempt_owner(tmp_path):
             execute=True,
             max_running_s=None,
         )
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_backpressure_drains_accepted_prefix_unless_writer_times_out(
+    tmp_path, monkeypatch, timeout
+):
+    import av
+
+    from dexmani_real.recording import recorder as module
+
+    entered, release = threading.Event(), threading.Event()
+    write_frame = module.VideoEncoder.write_frame
+
+    def blocked_write(video, frame):
+        entered.set()
+        assert release.wait(5), "writer was not released"
+        return write_frame(video, frame)
+
+    monkeypatch.setattr(module.VideoEncoder, "write_frame", blocked_write)
+    if timeout:
+        monkeypatch.setattr(module, "RECORDER_STOP_TIMEOUT_S", 0.02)
+    recorder = start_recording(tmp_path)
+    try:
+        assert entered.wait(3)
+        for i in range(1, 17):
+            data = {
+                name: np.full(spec.tail_shape, i, dtype=spec.dtype)
+                for name, spec in DATASET_SPECS.items()
+            }
+            frame = EpisodeFrame(
+                data, np.full((16, 16, 3), i, np.uint8), np.full((16, 16), i + 1, np.uint16)
+            )
+            recorder.add_frame(frame)
+        with pytest.raises(module.RecordingBackpressureError):
+            recorder.add_frame(frame)
+        assert recorder.frame_count == 17 and not recorder.accepting_frames
+        if not timeout:
+            release.set()
+        with pytest.raises(module.RecordingError) as failure:
+            recorder.save_episode(reason="recording_failure")
+        assert isinstance(failure.value.__cause__, module.RecordingBackpressureError)
+        assert not recorder.episode_path.exists() and recorder.staging_path.is_dir()
+        if timeout:
+            assert recorder._abort and not recorder.resources_released
+        else:
+            assert recorder.resources_released and recorder.written_frames == 17
+            with h5py.File(recorder.staging_path / "data.h5") as raw:
+                np.testing.assert_array_equal(raw["observation_timestamp_ns"][:], np.arange(17))
+                np.testing.assert_array_equal(raw["depth"][:, 0, 0], np.arange(1, 18))
+                assert raw["meta"].attrs["num_frames"] == 17
+                assert (
+                    json.loads(raw["meta/termination_details"][()])[0]["exception_type"]
+                    == "RecordingBackpressureError"
+                )
+                assert all(len(raw[name]) == 17 for name in DATASET_SPECS)
+            with av.open(str(recorder.staging_path / "rgb.mp4")) as video:
+                assert len(list(video.decode(video=0))) == 17
+            with pytest.raises(module.RecordingError):
+                recorder.close()
+    finally:
+        release.set()
+        recorder._thread.join(timeout=3)
+        assert recorder.resources_released
+
+
+@pytest.mark.parametrize(
+    "fault", ["deadline_expired", "stop_unconfirmed", "device", "stop", "operator", "quit"]
+)
+def test_teleop_dispatch_details_reach_native_raw(tmp_path, monkeypatch, fault):
+    from types import SimpleNamespace as NS
+
+    from test_review_remediation import fake_robot
+
+    from dexmani_real.ipc.schema import ARM_STATE_DTYPE, HAND_STATE_DTYPE
+    from dexmani_real.robot.action import ActionRealization
+    from dexmani_real.runtime.observation import ObservationRow
+    from dexmani_real.runtime.safety import RunEndReason, revoke_motion
+    from dexmani_real.teleop.runner import TeleopRunner
+
+    robot, clock, command = fake_robot(monkeypatch)
+    robot.arm.stop = lambda: None
+    robot.hand.set_passive = lambda: NS(name="ACCEPTED")
+    if fault in {"deadline_expired", "stop"}:
+        clock.arm_delay = 200_000_000
+    if fault == "stop_unconfirmed":
+        robot._hand_stop_pending = True
+    if fault == "device":
+        robot.arm.servo = lambda target: 5
+    if fault == "stop":
+        robot.hand.set_passive = lambda: NS(name="REJECTED")
+    if fault in {"operator", "quit"}:
+
+        def cancel(target):
+            revoke_motion(robot.shared, reason=RunEndReason[fault.upper()])
+            return 0
+
+        robot.arm.servo = cancel
+    arm, hand = np.zeros(1, ARM_STATE_DTYPE), np.zeros(1, HAND_STATE_DTYPE)
+    arm["timestamp_ns"] = hand["timestamp_ns"] = 100
+    arm["qpos"], hand["qpos"] = command.arm_qpos, command.hand_qpos
+    row = ObservationRow(
+        arm,
+        hand,
+        dict(
+            rgb=np.zeros((16, 16, 3), np.uint8),
+            depth=np.ones((16, 16), np.uint16),
+            timestamp_ns=100,
+            color_frame_number=1,
+            depth_frame_number=1,
+        ),
+        {"recv_ts_ns": 100},
+        None,
+        100,
+    )
+    runner = TeleopRunner.__new__(TeleopRunner)
+    runner.robot, runner.shared, runner.control_run_id = robot, robot.shared, 1
+    runner.pending_termination_reason, runner.termination_details = None, []
+    runner.controller = NS(
+        runtime=robot.runtime,
+        clear_reference=lambda: None,
+        compute_target=lambda row: ActionRealization(
+            command.arm_qpos, command.hand_qpos, eef_pose=np.zeros(9)
+        ),
+    )
+    runner.recorder = start_recording(tmp_path)
+    runner.audio = NS(play=lambda *a: None)
+    if fault in {"deadline_expired", "operator", "quit"}:
+        runner._execute_control_step(row)
+        assert runner.paused and not runner.shared.error_state.value
+    else:
+        with pytest.raises(RuntimeError):
+            runner._execute_control_step(row)
+        runner._finish_capture(True, "failure", announce=False)
+    with h5py.File(runner.recorder.episode_path / "data.h5") as raw:
+        if fault in {"operator", "quit"}:
+            assert raw["meta"].attrs["termination_reason"] == fault
+            assert "termination_details" not in raw["meta"]
+            np.testing.assert_array_equal(raw["dispatch_status"][-1], [1, 0])
+            return
+        details = json.loads(raw["meta/termination_details"][()])
+        cause = "deadline_expired" if fault == "stop" else None if fault == "device" else fault
+        assert details[0]["stage"] == "dispatch" and details[0]["cause"] == cause
+        if fault == "stop":
+            assert details[1]["stage"] == "dispatch_stop" and robot.shared.error_state.value
+        if fault == "deadline_expired":
+            assert raw["meta"].attrs["termination_reason"] == "executor_boundary"
+            np.testing.assert_array_equal(raw["dispatch_status"][-1], [1, 0])
+            assert np.isnan(raw["action_hand_joint_target"][-1]).all()

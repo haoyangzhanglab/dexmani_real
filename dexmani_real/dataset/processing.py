@@ -18,7 +18,7 @@ from dexmani_real.planning.kinematics.arm_fk import (
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
-from dexmani_real.recording.storage.schema import DATASET_SPECS, ROW_INFO_SPECS
+from dexmani_real.recording.storage.schema import DATASET_SPECS
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
 
@@ -27,7 +27,7 @@ def validate_export_episode(reader: EpisodeReader) -> int:
     frames = reader.num_frames
     if frames <= 0:
         raise RawDataError("episode contains no rows")
-    reader.require_fields(*(DATASET_SPECS.keys() - ROW_INFO_SPECS.keys()), "rgb", "depth")
+    reader.require_fields(*DATASET_SPECS, "rgb", "depth")
     reader.require_metadata("camera_color_height", "camera_color_width", "depth_scale")
     scale = float(reader.meta["depth_scale"])
     if not np.isfinite(scale) or scale <= 0:
@@ -39,7 +39,7 @@ def validate_export_episode(reader: EpisodeReader) -> int:
     )
     if reader["depth"].shape != expected or reader["depth"].dtype != np.uint16:
         raise RawDataError(f"depth must be uint16 {expected}")
-    for name in DATASET_SPECS.keys() & reader.fields:
+    for name in DATASET_SPECS:
         reader[name]  # Validate only small array descriptors, not all row values.
     return frames
 

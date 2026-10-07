@@ -36,7 +36,7 @@ DATASET_SPECS = {
 }
 
 
-# Host monotonic ns; zero means unknown/not called (including historical Raw).
+# Host monotonic ns; zero means unknown/not called.
 ROW_INFO_SPECS = {
     "observation_timestamp_ns": _spec(np.int64),
     "arm_read_timestamp_ns": _spec(np.int64),

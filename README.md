@@ -27,7 +27,7 @@ python -m pip install -e ".[dev]"
 
 ### 1. 检查配置
 
-支持 `--config` 的实验入口可先在不启动硬件的情况下检查声明配置：
+采集与部署入口提供 `--print-config`，可在不启动硬件的情况下检查声明配置：
 
 ```bash
 cp experiment.example.yaml experiment.yaml
@@ -51,6 +51,8 @@ python examples/pointcloud_process_example.py --help
 录制允许缺相机外参，重建点云需要对应的内外参和 depth scale。相机、桌面与 VR 标定在会话启动时读取；文件修改在下次会话生效。
 路径可显式选择：采集 `--vr-transform` / `--camera-calibration`，policy `--camera-calibration` / `--output`，相机/VR 标定 `--output`；桌面沿用 YAML `environment.table.plane_path`（相对 checkout），示教输出沿用 `policy.episodes_dir`。默认仍是既有 checkout 路径，不自动移动历史标定或数据。
 
+两个相机诊断入口通过 `--config` 使用实验相机参数。RealSense 实时诊断退出时恢复可读取的原曝光优先级；图像读取、对齐或曝光恢复失败返回非零。
+
 ### 3. 采集示教
 
 ```bash
@@ -69,13 +71,17 @@ Raw episode 是实验 source of truth。已发布 Raw 不做原地修补；暂�
 
 ```bash
 python examples/visualize_episode.py <episode> --info
-python examples/visualize_episode.py <episode> --max-frames 100
+python examples/visualize_episode.py <episode> --config <experiment.yaml> --max-frames 100
 
 python examples/export_policy_zarr.py episodes/<task> --config experiment.yaml
 python examples/read_policy_windows.py datasets/<task>.zarr --horizon 2
 ```
 
 `--info` 只查看元数据和数值概要；交互 viewer 需要 Rerun，按所选帧数顺序读取 RGB-D。公共导出始终生成全模态缓存，窗口示例再按策略所需字段选样。处理逻辑变化后，从 Raw 重新导出。
+
+Viewer 的 `--config` 指定当前实验的点云、桌面及手部安装参数，省略时使用默认配置；相机几何仍来自对应 Raw。
+
+数据入口按当前 Raw 布局读取；缺失必要字段会明确报错，不自动补齐旧格式。旧实验数据保留原样，使用对应源码版本复现。
 
 离线导出复用相同的 YAML 加载和覆盖规则，只检查实际处理所需参数；未使用的 TAG/DexPilot 或遥操作数值参数不会阻挡导出。仅在 `pointcloud.remove_table: true` 时读取当前桌面平面；设为 `false` 时无需桌面标定文件，也无需修改 `environment.table.enabled`。
 

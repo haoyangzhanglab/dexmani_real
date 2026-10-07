@@ -16,6 +16,7 @@ __all__ = [
 import numpy as np
 import pyrealsense2 as rs
 
+from dexmani_real.config.hardware import CameraParams
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
 from dexmani_real.utils.log import get_logger
 
@@ -73,9 +74,26 @@ class RealSenseCameraConfig:
     frame_queue_capacity: int = 2
     l515_depth_config: L515DepthConfig | None = field(default_factory=L515DepthConfig)
     # 0.0 = OFF (default): keep the requested fps instead of letting Auto
-    # Exposure extend exposure and drop RGB to ~16.7 Hz in a dark scene.
+    # Exposure extend exposure and reduce RGB FPS in a dark scene.
     # None leaves the device default unchanged.
     auto_exposure_priority: float | None = 0.0
+
+    @classmethod
+    def from_camera_params(cls, params: CameraParams) -> RealSenseCameraConfig:
+        """Translate the experiment's camera settings without opening a device."""
+        params.validate()
+        return cls(
+            serial=params.serial,
+            depth_resolution=(params.width, params.height),
+            color_resolution=(params.width, params.height),
+            fps=params.fps,
+            warmup_frames=params.warmup_frames,
+            frame_queue_capacity=params.frame_queue_capacity,
+            l515_depth_config=L515DepthConfig(
+                visual_preset=params.l515_visual_preset,
+                confidence_threshold=params.l515_confidence_threshold,
+            ),
+        )
 
     def __post_init__(self) -> None:
         if not isinstance(self.camera_name, str) or not self.camera_name.strip():
@@ -292,7 +310,8 @@ class RealSenseCamera:
                 snapshot[name] = None
         return snapshot
 
-    def _find_color_sensor(self) -> Any:
+    def get_color_sensor(self) -> Any:
+        """Return the active RGB sensor for driver setup and diagnostics."""
         """Return the color sensor from the live pipeline profile."""
         if self.profile is None:
             raise RuntimeError("RealSense profile is unavailable for color settings")
@@ -316,7 +335,7 @@ class RealSenseCamera:
         if priority is None:
             return
         try:
-            sensor = self._find_color_sensor()
+            sensor = self.get_color_sensor()
         except RuntimeError as exc:
             logger.warning(
                 "color sensor unavailable; auto_exposure_priority not applied: %s",
