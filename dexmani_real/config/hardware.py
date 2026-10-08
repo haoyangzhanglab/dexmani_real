@@ -105,7 +105,7 @@ class ArmParams:
     max_joint_velocity_deg_per_s: float = 135.0  # 75% of the 180 deg/s SDK command limit
     # ~14.14 rad/s²; ~71% of the 20 rad/s² SDK limit.
     max_joint_acceleration_deg_per_s2: float = 810.0
-    feedback_max_age_s: float = 4 / 30  # unchanged host feedback freshness budget
+    feedback_max_age_s: float = 4 / 30  # host-side feedback freshness budget
 
     ip: str = "192.168.1.111"
 
@@ -254,7 +254,7 @@ class HandParams:
         300,
     )
 
-    feedback_max_age_s: float = 4 / 30  # unchanged host feedback freshness budget
+    feedback_max_age_s: float = 4 / 30  # host-side feedback freshness budget
     state_read_failure_timeout_s: float = 1.0
 
     home_timeout_s: float = 2.0

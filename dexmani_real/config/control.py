@@ -55,9 +55,7 @@ class TeleopTimingParams:
 
 @dataclass(frozen=True)
 class ControlParams:
-    """Shared teleop/deployment control settings, exposed under YAML policy."""
-
-    """Shared experiment/control settings; learned policy timing is saved-Policy-config-owned."""
+    """Shared Real control settings; deployment cadence comes from saved Policy."""
 
     ema: EMAParams = field(default_factory=EMAParams)
 

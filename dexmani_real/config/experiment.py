@@ -1,4 +1,4 @@
-"""Load independent runtime dataclasses with CLI > YAML > defaults precedence."""
+"""Load package defaults with explicit experiment and CLI overrides."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def config_as_dict(value: Any) -> Any:
 
 
 def _patch(current: Any, changes: Any, path: str = "") -> Any:
-    """Apply external fields to concrete defaults; no annotation reconstruction."""
+    """Apply overrides, rejecting unknown fields and invalid value types."""
     if dataclasses.is_dataclass(current) or isinstance(current, Mapping):
         if not isinstance(changes, Mapping):
             raise TypeError(f"config {path!r} must be an object")
@@ -92,8 +92,10 @@ def _patch(current: Any, changes: Any, path: str = "") -> Any:
         return tuple(
             _patch(StaticCollisionBox(), box, f"{path}[{i}]") for i, box in enumerate(changes)
         )
-    if isinstance(current, bool) and not isinstance(changes, bool):
-        raise TypeError(f"config {path!r} must be a boolean")
+    if isinstance(current, bool):
+        if not isinstance(changes, bool):
+            raise TypeError(f"config {path!r} must be a boolean")
+        return changes
     if isinstance(current, tuple):
         if not isinstance(changes, (tuple, list)):
             raise TypeError(f"config {path!r} must be an array")
@@ -107,15 +109,13 @@ def _patch(current: Any, changes: Any, path: str = "") -> Any:
         if path in {"execution.prefetch_steps", "camera.l515_confidence_threshold"}:
             if changes is not None and (type(changes) is not int):
                 raise TypeError(f"config {path!r} must be an integer or null")
-        elif path.startswith("execution."):
+        elif path == "execution.rtc_guidance_cap":
             if changes is not None and (
                 isinstance(changes, bool) or not isinstance(changes, (int, float))
             ):
                 raise TypeError(f"config {path!r} must be numeric or null")
         elif changes is not None and not isinstance(changes, str):
             raise TypeError(f"config {path!r} must be a string or null")
-        return changes
-    if isinstance(current, bool):
         return changes
     if isinstance(current, int):
         if type(changes) is not int:
@@ -210,7 +210,10 @@ def load_experiment_config(
     data: Mapping[str, Any] | None = None,
     cli_overrides: Mapping[str, Any] | None = None,
 ) -> ExperimentConfig:
-    """Merge YAML/data and CLI over defaults without runtime checks or table-file I/O."""
+    """Merge CLI > YAML/data > package defaults without hardware or calibration I/O.
+
+    Loading checks field names and value types; consumers validate runtime values.
+    """
     if yaml_path is not None and data is not None:
         raise ValueError("provide at most one of yaml_path or data")
     loaded = data if data is not None else {}

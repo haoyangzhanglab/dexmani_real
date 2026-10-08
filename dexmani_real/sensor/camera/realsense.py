@@ -312,7 +312,6 @@ class RealSenseCamera:
 
     def get_color_sensor(self) -> Any:
         """Return the active RGB sensor for driver setup and diagnostics."""
-        """Return the color sensor from the live pipeline profile."""
         if self.profile is None:
             raise RuntimeError("RealSense profile is unavailable for color settings")
         device = self.profile.get_device()

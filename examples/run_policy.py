@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Usage: python examples/run_policy.py POLICY/TASK/EXPERIMENT
        [--config YAML] [--checkpoint best|latest|FILE]
-       [--weights ema|raw] [--inference-steps N] [--seed S] [--num-episodes N] [--max-duration SEC] [--device D]
-执行模式与预算从 YAML execution 读取，也可由 CLI 覆盖；缺必需预算拒绝启动。
+       python examples/run_policy.py --print-config [--config YAML]
+执行模式与预算使用包内默认值，可通过 YAML execution 覆盖。
 真机评估：H 回零，空闲无接触时 T 归零触觉，B 开始，S 停止。
 默认保存 rollout 与 run_config.yaml；--no-record 关闭录制，任务成功由离线评估判定。"""
 
@@ -51,27 +51,18 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run one policy-evaluation session with optional recording"
     )
-    parser.add_argument("experiment", metavar="EXPERIMENT")
     parser.add_argument(
-        "--config", help="Real hardware/runtime YAML; Policy uses experiment/config.yaml"
+        "experiment",
+        metavar="EXPERIMENT",
+        nargs="?",
+        help="Saved Policy selector policy/task/experiment; required unless --print-config",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Optional Real hardware/execution YAML; Policy uses experiment/config.yaml",
     )
     parser.add_argument("--checkpoint", default="best", help="best, latest, or checkpoint filename")
-    parser.add_argument("--weights", choices=("ema", "raw"), default=None)
-    parser.add_argument(
-        "--inference-steps",
-        type=_positive_int,
-        default=None,
-        help="override saved inference steps",
-    )
-    parser.add_argument(
-        "--n-action-steps",
-        type=_positive_int,
-        default=None,
-        help="override deployment chunk length without changing the training snapshot",
-    )
-    parser.add_argument(
-        "--seed", type=_nonnegative_int, default=0, help="fixed inference seed reset each episode"
-    )
     parser.add_argument(
         "--num-episodes",
         dest="num_episodes",
@@ -89,13 +80,6 @@ def _parser() -> argparse.ArgumentParser:
         default=60.0,
         help="cooperative duration budget from RUNNING admission (default: 60 seconds)",
     )
-    parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--execution-mode", choices=("sync", "async", "rtc"), default=None)
-    parser.add_argument("--max-decision-age", type=_positive_running_seconds, default=None)
-    parser.add_argument("--max-wait", type=_positive_running_seconds, default=None)
-    parser.add_argument("--max-tick-lateness", type=float, default=None)
-    parser.add_argument("--prefetch-steps", type=_positive_int)
-    parser.add_argument("--rtc-guidance-cap", type=float)
     parser.add_argument(
         "--print-config",
         action="store_true",
@@ -108,6 +92,24 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-record", action="store_true", help="Execute without recording artifacts"
     )
+    research = parser.add_argument_group("Policy research overrides")
+    research.add_argument("--weights", choices=("ema", "raw"), default=None)
+    research.add_argument(
+        "--inference-steps",
+        type=_positive_int,
+        default=None,
+        help="override saved inference steps",
+    )
+    research.add_argument(
+        "--n-action-steps",
+        type=_positive_int,
+        default=None,
+        help="override deployment chunk length without changing the training snapshot",
+    )
+    research.add_argument(
+        "--seed", type=_nonnegative_int, default=0, help="fixed inference seed reset each episode"
+    )
+    research.add_argument("--device", default="cuda:0")
     return parser
 
 
@@ -174,24 +176,26 @@ def _write_run_config(session_dir, *, args, runtime, info, execution):
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if not args.print_config:
+        if args.experiment is None:
+            parser.error("EXPERIMENT is required unless --print-config is used")
+        try:
+            _safe_selector_parts(args.experiment)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    import yaml
+
     from dexmani_real.config.experiment import config_as_dict, load_experiment_config
 
-    runtime = load_experiment_config(
-        yaml_path=args.config,
-        cli_overrides={
-            "execution.execution_mode": args.execution_mode,
-            "execution.max_decision_age_s": args.max_decision_age,
-            "execution.max_wait_s": args.max_wait,
-            "execution.max_tick_lateness_s": args.max_tick_lateness,
-            "execution.prefetch_steps": args.prefetch_steps,
-            "execution.rtc_guidance_cap": args.rtc_guidance_cap,
-        },
-    )
+    try:
+        runtime = load_experiment_config(yaml_path=args.config)
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        parser.error(f"invalid experiment config: {exc}")
     if args.print_config:
-        import yaml
-
-        print(yaml.safe_dump(config_as_dict(runtime), sort_keys=False))
+        print(yaml.safe_dump(config_as_dict(runtime), allow_unicode=True, sort_keys=False), end="")
         return 0
 
     try:
@@ -222,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
             RolloutRecordingConfig,
         )
 
-        execution = runtime.execution
+        execution = runtime.execution.validate(info, max_running_s=args.max_running_s)
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
         _safe_selector_parts(selector)
     except Exception as exc:

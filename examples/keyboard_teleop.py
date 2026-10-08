@@ -21,7 +21,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not connect XHand; it must be absent or secured at configured home",
     )
-    parser.add_argument("--config", type=Path, default=None, help="Validated experiment YAML")
+    parser.add_argument("--config", type=Path, default=None, help="Optional experiment YAML overrides")
     args = parser.parse_args(argv)
 
     from dexmani_real.teleop.keyboard_session import run_keyboard_experiment
@@ -32,7 +32,6 @@ def main(argv: list[str] | None = None) -> int:
             cli_overrides={"policy.hand_enabled": False if args.no_hand else None},
         )
     except (
-        KeyError,
         OSError,
         TypeError,
         ValueError,

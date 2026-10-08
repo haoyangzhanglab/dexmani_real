@@ -439,7 +439,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Limit number of state frames to load.",
     )
     parser.add_argument(
-        "--config", type=Path, help="Current experiment YAML for cloud and hand geometry"
+        "--config", type=Path, help="Optional experiment YAML for current cloud and hand geometry"
     )
     parser.add_argument(
         "--info",

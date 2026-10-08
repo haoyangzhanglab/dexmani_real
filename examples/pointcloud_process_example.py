@@ -176,7 +176,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "processed clouds, and reconstruction metadata below this directory"
         ),
     )
-    parser.add_argument("--config", type=Path)
+    parser.add_argument("--config", type=Path, help="Optional experiment YAML overrides")
     parser.add_argument("--camera-calibration", type=Path)
     return parser.parse_args(argv)
 

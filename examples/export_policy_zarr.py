@@ -58,7 +58,7 @@ def _parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help="Optional processing YAML; defaults to project settings and current table calibration.",
+        help="Optional experiment YAML overrides for offline processing",
     )
     parser.add_argument(
         "--exclude",

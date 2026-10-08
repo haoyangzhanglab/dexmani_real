@@ -30,13 +30,17 @@ python -m pip install -e .
 采集与部署入口提供 `--print-config`，可在不启动硬件的情况下检查声明配置：
 
 ```bash
-cp experiment.example.yaml experiment.yaml
-# 编辑 IP、XHand 串口和相机序列号，再核对当前标定。
 python examples/collect_teleop.py --print-config
-python examples/collect_teleop.py --config experiment.yaml --print-config
+python examples/run_policy.py --print-config
+
+# 需要现场覆盖时，导出配置并编辑 IP、串口、相机序列号或执行参数。
+python examples/collect_teleop.py --print-config > local.yaml
+python examples/collect_teleop.py --config local.yaml --print-config
 ```
 
-配置优先级为 CLI > YAML > 默认值；未知字段和配置结构错误会报错。`--print-config` 不读取现场标定或加载设备、优化器、显示后端，也不代表运行时启动检查已通过。
+默认值统一由包内配置提供，`--config` 是可选 YAML 覆盖，只需写入待调整的字段；保留的 CLI 操作开关优先于 YAML。机械臂速度、加速度通过 YAML `arm` 配置，部署模式和预算通过 `execution` 配置。
+
+配置加载检查字段名和数值类型，运行入口再检查所需参数、现场标定与策略执行条件。`--print-config` 只打印声明配置，不读取现场标定或加载设备、Policy、优化器、显示后端；它不代表运行时启动检查已通过。
 
 ### 2. 标定
 
@@ -49,17 +53,17 @@ python examples/pointcloud_process_example.py --help
 相机外参、桌面平面、hand mount、VR alignment 等属于**当前实验现场状态**。更换相机、桌面、机器人安装或实验布局后，应重新标定或确认，而不是沿用历史数值作为固定契约。首次桌面标定在 pointcloud 示例中选择 table calibration，不要求旧 plane 文件。
 手基座/指尖 FK 使用当前安装补偿，碰撞与规划使用标称资产几何。
 录制允许缺相机外参，重建点云需要对应的内外参和 depth scale。相机、桌面与 VR 标定在会话启动时读取；文件修改在下次会话生效。
-路径可显式选择：采集 `--vr-transform` / `--camera-calibration`，policy `--camera-calibration` / `--output`，相机/VR 标定 `--output`；桌面沿用 YAML `environment.table.plane_path`（相对 checkout），示教输出沿用 `policy.episodes_dir`。默认仍是既有 checkout 路径，不自动移动历史标定或数据。
+路径可显式选择：采集 `--vr-transform` / `--camera-calibration`，policy `--camera-calibration` / `--output`，相机/VR 标定 `--output`；桌面使用配置的 `environment.table.plane_path`（相对 checkout），示教输出沿用 `policy.episodes_dir`。默认仍是既有 checkout 路径，不自动移动历史标定或数据。
 
 两个相机诊断入口通过 `--config` 使用实验相机参数。RealSense 实时诊断退出时恢复可读取的原曝光优先级；图像读取、对齐或曝光恢复失败返回非零。
 
 ### 3. 采集示教
 
 ```bash
-python examples/collect_teleop.py \
-    --config experiment.yaml \
-    --task-name <task>
+python examples/collect_teleop.py <task>
 ```
+
+任务是位置参数，省略时沿用 `test`，同时用于录制元数据和 `episodes/<task>/` 目录。
 
 启动会在停止监听建立后执行手部 HOME。触觉需在空闲、无 capture 且操作者确认手部无接触后按 **T** 采集并核验基线，S/Q/ESC 可取消。T 只做基线准备，SDK 阻塞期间取消仍需等待返回；未归零或失败的通道保留 NaN，不阻断关节任务。H 为整机 HOME，B 开始，C 暂停/恢复；恢复时保存上一段并开始新 episode。S 停止保存，D 丢弃当前 capture，Q 进入退出确认、再次 Q 保存退出（尚未开始且无 capture 时直接退出），ESC 急停。键盘 jog 入口仅在 R 时 HOME。
 操作者结束原因和随后发生的停止故障分别留证；写盘或发布失败保留 staging 并报告会话失败，已发布 Raw 不回写。
@@ -71,9 +75,9 @@ Raw episode 是实验 source of truth。已发布 Raw 不做原地修补；暂�
 
 ```bash
 python examples/visualize_episode.py <episode> --info
-python examples/visualize_episode.py <episode> --config <experiment.yaml> --max-frames 100
+python examples/visualize_episode.py <episode> --max-frames 100
 
-python examples/export_policy_zarr.py episodes/<task> --config experiment.yaml
+python examples/export_policy_zarr.py episodes/<task>
 python examples/read_policy_windows.py datasets/<task>.zarr --horizon 2
 ```
 
@@ -92,14 +96,14 @@ Viewer 的 `--config` 指定当前实验的点云、桌面及手部安装参数�
 ### 6. 真机评估
 
 ```bash
-python examples/run_policy.py <policy/task/experiment> --config experiment.yaml --checkpoint best \
-  --max-decision-age "$MAX_DECISION_AGE_S" --max-wait "$MAX_WAIT_S" \
-  --max-tick-lateness "$MAX_TICK_LATENESS_S"
+python examples/run_policy.py <policy/task/experiment>
 ```
 
 H 执行 HOME，空闲且确认手部无接触后 T 归零触觉，B 请求开始，S 停止，Q 退出，ESC 急停。HOME 结束后若要再次 HOME、归零或开始，需重新按 H/T/B；停止尚在处理时 H 被拒绝，完成后需重新发起。触觉归零可用 S/Q/ESC 取消。开始前检查当前 arm/hand HOME 姿态。默认每段运行预算 60 秒，可用 `--max-duration` 修改。
 
-三个执行预算必须由实验者通过 CLI 或 YAML `execution` 指定，不由 warmup 推断为硬件安全值。执行模式默认为 sync；模型加载与 warmup 在连接设备前完成。
+执行模式默认为 sync，预算使用包内针对当前 16 Hz、8 步 chunk 实验的起始值；更换策略节拍、执行长度或现场条件后需核对。通过可选 YAML `execution` 覆盖执行设置；async/RTC 必须指定预取步数，RTC 还需指定 guidance cap。启动检查保存的 Policy 节拍及 warmup 耗时，warmup 不自动放宽预算。模型加载与 warmup 在连接设备前完成，离线检查不能证明现场安全。
+
+checkpoint 默认选择 `best`；策略对比参数在 `--help` 的 Policy research overrides 中列出。启用录制时，会话的 `run_config.yaml` 保存实际配置、checkpoint、策略覆盖值和源码版本。
 
 `--no-record` 仍连接设备并执行动作，仅关闭录制；程序接口的 `execute=False` 仍连接并读取设备。它们都不是离线验证入口。
 

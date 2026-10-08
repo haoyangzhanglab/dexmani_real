@@ -38,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
         "--config",
         type=Path,
         default=None,
-        help="experiment YAML; --serial takes precedence",
+        help="Optional experiment YAML overrides; --serial takes precedence",
     )
     parser.add_argument(
         "--output",
@@ -68,7 +68,6 @@ def main(argv: list[str] | None = None) -> int:
             cli_overrides={"camera.serial": args.serial, "policy.hand_enabled": False},
         )
     except (
-        KeyError,
         OSError,
         TypeError,
         ValueError,

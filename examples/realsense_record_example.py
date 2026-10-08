@@ -544,7 +544,7 @@ def _run_rgbd_test(
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config")
+    parser.add_argument("--config", help="Optional experiment YAML overrides")
     parser.add_argument("--camera-calibration")
     args = parser.parse_args(argv)
     global rs, RealSenseCamera, RealSenseCameraConfig

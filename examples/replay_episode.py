@@ -8,39 +8,14 @@ from __future__ import annotations
 
 import argparse
 import math
-from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
-from dexmani_real.config.experiment import ExperimentConfig, load_experiment_config
-from dexmani_real.replay.replayer import ReplayStatus
-from dexmani_real.replay.session import (
-    DEFAULT_OUTPUT_DIR,
-    EpisodeReplayConfig,
-    replay_episode,
-)
-from dexmani_real.replay.trajectory import (
-    load_trajectory,
-    resolve_episode_path,
-)
+from dexmani_real.config.experiment import load_experiment_config
 from dexmani_real.utils.log import get_logger
 
 logger = get_logger(__name__)
-
-
-@dataclass(frozen=True)
-class ReplayRuntimeSelection:
-    runtime: ExperimentConfig
-    acceleration_deg_s2: float
-    joint_speed_deg_s: float
-
-
-def _positive_float(value: str) -> float:
-    result = float(value)
-    if not math.isfinite(result) or result <= 0:
-        raise argparse.ArgumentTypeError(f"must be finite and > 0, got {value}")
-    return result
 
 
 def _nonnegative_float(value: str) -> float:
@@ -57,7 +32,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         epilog="""
 Examples:
   python examples/replay_episode.py episodes/<task_name>/<episode_dir>
-  python examples/replay_episode.py episodes/<task_name>/<episode_dir> --acc 810 --speed 120
+  python examples/replay_episode.py episodes/<task_name>/<episode_dir> --config local.yaml
   python examples/replay_episode.py episodes/<task_name>/<episode_dir> --output replay_results/my_replay/
 
 Controls:
@@ -75,7 +50,7 @@ Controls:
         ),
     )
     parser.add_argument(
-        "--config", type=str, default=None, help="Validated experiment YAML overrides."
+        "--config", type=str, default=None, help="Optional experiment YAML overrides"
     )
     parser.add_argument(
         "--output",
@@ -92,40 +67,20 @@ Controls:
             "Only small start differences are allowed; 0 disables preparation."
         ),
     )
-    parser.add_argument(
-        "--acc",
-        type=_positive_float,
-        default=None,
-        help="Joint max acceleration (°/s²); overrides YAML/defaults.",
-    )
-    parser.add_argument(
-        "--speed",
-        type=_positive_float,
-        default=None,
-        help="Joint max speed (°/s); overrides YAML/defaults.",
-    )
     return parser.parse_args(argv)
-
-
-def _resolve_replay_runtime(args: argparse.Namespace) -> ReplayRuntimeSelection:
-    runtime = load_experiment_config(
-        yaml_path=args.config,
-        cli_overrides={
-            "arm.max_joint_acceleration_deg_per_s2": args.acc,
-            "arm.max_joint_velocity_deg_per_s": args.speed,
-        },
-    )
-    if not bool(runtime.policy.hand_enabled):
-        raise ValueError("physical replay requires policy.hand_enabled=true")
-    return ReplayRuntimeSelection(
-        runtime=runtime,
-        acceleration_deg_s2=float(runtime.arm.max_joint_acceleration_deg_per_s2),
-        joint_speed_deg_s=float(runtime.arm.max_joint_velocity_deg_per_s),
-    )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+
+    from dexmani_real.replay.replayer import ReplayStatus
+    from dexmani_real.replay.session import (
+        DEFAULT_OUTPUT_DIR,
+        EpisodeReplayConfig,
+        replay_episode,
+    )
+    from dexmani_real.replay.trajectory import load_trajectory, resolve_episode_path
+
     try:
         trajectory = load_trajectory(args.episode)
     except (OSError, ValueError) as exc:
@@ -133,7 +88,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        selection = _resolve_replay_runtime(args)
+        runtime = load_experiment_config(yaml_path=args.config)
+        if not runtime.policy.hand_enabled:
+            raise ValueError("physical replay requires policy.hand_enabled=true")
     except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
         print(f"Error resolving replay config: {exc}")
         return 1
@@ -144,8 +101,8 @@ def main(argv: list[str] | None = None) -> int:
         f"Nominal duration: {trajectory.num_frames / trajectory.fps:.1f}s"
     )
     print(f"  Task: {trajectory.task_label or '(none)'}")
-    print(f"  Acc: {selection.acceleration_deg_s2:.0f}°/s²")
-    print(f"  Joint speed: {selection.joint_speed_deg_s:.0f}°/s")
+    print(f"  Acc: {runtime.arm.max_joint_acceleration_deg_per_s2:.0f}°/s²")
+    print(f"  Joint speed: {runtime.arm.max_joint_velocity_deg_per_s:.0f}°/s")
 
     if args.output is None:
         episode_name = resolve_episode_path(args.episode)[1]
@@ -157,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         outcome = replay_episode(
             trajectory,
-            selection.runtime,
+            runtime,
             EpisodeReplayConfig(
                 output_dir=output_dir,
                 evaluate_consistency=True,

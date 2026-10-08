@@ -153,10 +153,14 @@ class RolloutRecordingConfig:
 
 @dataclass(frozen=True)
 class ExecutionConfig:
+    """Admission and wait budgets checked against saved Policy timing."""
+
     execution_mode: str = "sync"
-    max_decision_age_s: float | None = None
-    max_wait_s: float | None = None
-    max_tick_lateness_s: float | None = None
+    # Starting budgets for the current 16 Hz, eight-action experiment;
+    # SDK admission deadlines do not guarantee physical stop response times.
+    max_decision_age_s: float = 1.0
+    max_wait_s: float = 2.0
+    max_tick_lateness_s: float = 0.03
     prefetch_steps: int | None = None
     rtc_guidance_cap: float | None = None
 
@@ -180,7 +184,8 @@ class ExecutionConfig:
                 or value < 0
                 or (value == 0 and name != "max_tick_lateness_s")
             ):
-                raise ValueError(f"{name} requires an explicit finite positive experimental budget")
+                bound = "nonnegative" if name == "max_tick_lateness_s" else "positive"
+                raise ValueError(f"{name} must be a finite {bound} experimental budget")
         lateness = int(self.max_tick_lateness_s * 1e9)
         if lateness >= dt:
             raise ValueError("max_tick_lateness_s must be smaller than control_dt_s")
