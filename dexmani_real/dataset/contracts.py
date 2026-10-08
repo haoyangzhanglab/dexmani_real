@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,8 +26,8 @@ def validate_task_identity(value: str) -> str:
 class ProcessingConfig:
     """Point-cloud, fingertip and table transforms; output is always multimodal.
 
-    Every included episode retains all physical and derived fields; missing
-    floating-point measurements remain NaN in their original rows.
+    Included episodes must retain complete physical and derived modalities
+    with finite floating-point values at every row.
     """
 
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
@@ -68,11 +67,6 @@ class ProcessingConfig:
             if len(plane) != 4 or not np.all(np.isfinite(plane)) or plane[2] <= 0:
                 raise ValueError("table_plane_abcd must be finite with upward normal")
             object.__setattr__(self, "table_plane_abcd", plane)
-
-    def to_dict(self) -> dict[str, Any]:
-        values = dataclasses.asdict(self)
-        values["pointcloud"] = self.pointcloud.to_dict()
-        return values
 
 
 _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {

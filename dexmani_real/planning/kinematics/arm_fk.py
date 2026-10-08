@@ -1,9 +1,4 @@
-"""xArm7 kinematics via Pinocchio — FK, Jacobian, pose transforms.
-
-Two FK classes:
-  - ``ArmFK`` — standalone Pinocchio FK (no MPlib dependency).
-  - ``XArm7Kinematics`` — full kinematics with MPlib integration for planning.
-"""
+"""URDF-consistent xArm7 FK, Jacobians and pose transforms."""
 
 from __future__ import annotations
 
@@ -17,10 +12,6 @@ from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_XHAND_COLLISION_URDF
 from .pose import Pose, compose_pose, compute_pose_error, invert_pose, quat_wxyz_to_rotmat
 
 _ARM_FK_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)
-
-# Persisted EEF identity shared by raw-to-policy conversion and deployment.
-EEF_POSE_FRAME = "xarm_base"
-EEF_POSE_COMPONENTS = "position_m(3)+rot6d(6)"
 
 
 @lru_cache(maxsize=1)
@@ -76,9 +67,9 @@ def compute_eef_pose_history_xarm_base(
 ) -> np.ndarray:
     """Return finite float64 ``[T,9]`` xArm-base position+rot6d poses from aligned qpos.
 
-    Compute FK once per timestep and reuse its rot6d; callers cast to float32
-    for storage or model input. Derive each pose from aligned measured qpos,
-    never from the xArm firmware Cartesian pose.
+    Compute FK once per row and reuse its rot6d; callers cast to float32 for
+    storage or model input. Rows may be measured qpos or commanded targets;
+    both use the URDF EEF definition.
     """
     qpos_history = np.asarray(arm_qpos, dtype=np.float64)
     if qpos_history.ndim != 2 or qpos_history.shape[1] != ARM_JOINT_SHAPE[0]:

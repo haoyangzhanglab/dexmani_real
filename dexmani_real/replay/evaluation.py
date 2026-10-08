@@ -1,4 +1,4 @@
-"""Replay capture buffers, consistency metrics, and result persistence."""
+"""Replay consistency metrics and result persistence."""
 
 from __future__ import annotations
 
@@ -30,7 +30,6 @@ class ReplayMetrics:
 
     episode_path: str = ""
     task_label: str = ""
-    speed_factor: float = 1.0
     original_frames: int = 0
     replayed_frames: int = 0
     matching_frames: int = 0
@@ -46,9 +45,6 @@ class ReplayMetrics:
 
     eef_rot_error_mean_deg: float = float("nan")
     eef_rot_error_max_deg: float = float("nan")
-
-    eef_pos_error_per_frame_mm: np.ndarray | None = None
-    eef_rot_error_per_frame_deg: np.ndarray | None = None
 
     hand_joint_mae_overall_deg: float | None = None
     hand_pooled_rmse_deg: float | None = None
@@ -85,7 +81,6 @@ def compute_metrics(
     replay_hand_qpos: np.ndarray | None = None,
     episode_path: str = "",
     task_label: str = "",
-    speed_factor: float = 1.0,
     arm_tracking_error: np.ndarray | None = None,
 ) -> ReplayMetrics:
     """Compare matching frame indices from the recorded and replayed streams."""
@@ -98,7 +93,6 @@ def compute_metrics(
     metrics = ReplayMetrics(
         episode_path=episode_path,
         task_label=task_label,
-        speed_factor=speed_factor,
         original_frames=original_frames,
         replayed_frames=replayed_frames,
         matching_frames=frame_count,
@@ -128,7 +122,6 @@ def compute_metrics(
         metrics.valid_eef_position_frames = int(valid_ee.sum())
         if valid_ee.sum() > 0:
             pos_err = np.linalg.norm(orig_ee_pos[valid_ee] - rep_ee_pos[valid_ee], axis=1)
-            metrics.eef_pos_error_per_frame_mm = pos_err * 1000.0
             metrics.eef_pos_error_mean_mm = float(np.mean(pos_err) * 1000.0)
             metrics.eef_pos_error_max_mm = float(np.max(pos_err) * 1000.0)
             metrics.eef_pos_error_rmse_mm = float(np.sqrt(np.mean(pos_err**2)) * 1000.0)
@@ -154,7 +147,6 @@ def compute_metrics(
             finite = np.isfinite(rot_errs_arr)
             metrics.valid_eef_rotation_frames = int(finite.sum())
             if finite.sum() > 0:
-                metrics.eef_rot_error_per_frame_deg = rot_errs_arr
                 metrics.eef_rot_error_mean_deg = float(np.mean(rot_errs_arr[finite]))
                 metrics.eef_rot_error_max_deg = float(np.max(rot_errs_arr[finite]))
 
@@ -206,13 +198,13 @@ def report_consistency(metrics: ReplayMetrics) -> None:
         f"  Arm joint RMSE: {np.round(metrics.arm_joint_rmse_deg, 2)} deg  "
         f"(mean_joint_rmse: {metrics.arm_mean_joint_rmse_deg:.3f} deg)"
     )
-    if metrics.eef_pos_error_per_frame_mm is not None:
+    if metrics.valid_eef_position_frames > 0:
         print(
             f"  EEF pos error:  mean={metrics.eef_pos_error_mean_mm:.1f}mm  "
             f"max={metrics.eef_pos_error_max_mm:.1f}mm  "
             f"rmse={metrics.eef_pos_error_rmse_mm:.1f}mm"
         )
-    if metrics.eef_rot_error_per_frame_deg is not None:
+    if metrics.valid_eef_rotation_frames > 0:
         print(
             f"  EEF rot error:  mean={metrics.eef_rot_error_mean_deg:.2f}°  "
             f"max={metrics.eef_rot_error_max_deg:.2f}°"
@@ -266,7 +258,6 @@ def evaluate_replay(
         replay_hand_qpos=replay_data.get("hand_qpos"),
         episode_path=trajectory.episode_path,
         task_label=trajectory.task_label,
-        speed_factor=1.0,
         arm_tracking_error=replay_data.get("arm_tracking_error"),
     )
 
@@ -306,7 +297,6 @@ def _save_metrics(
         },
         "episode_path": metrics.episode_path,
         "task_label": metrics.task_label,
-        "speed_factor": metrics.speed_factor,
         "original_frames": metrics.original_frames,
         "replayed_frames": metrics.replayed_frames,
         "matching_frames": metrics.matching_frames,

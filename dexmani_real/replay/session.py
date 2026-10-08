@@ -9,7 +9,7 @@ from pathlib import Path
 
 from dexmani_real.ipc.channels import SensorChannelsConfig
 from dexmani_real.runtime.state import RuntimeState
-from dexmani_real.recording.results import SessionResults, error_detail
+from dexmani_real.utils.episode_results import EpisodeResults, error_detail
 from dexmani_real.replay.evaluation import evaluate_replay
 from dexmani_real.replay.replayer import ReplayOutcome, ReplayStatus, replay_targets
 from dexmani_real.replay.trajectory import verify_replay_preflight
@@ -48,7 +48,7 @@ def replay_episode(trajectory, runtime, config):
     if target.exists() and (not target.is_dir() or any(target.iterdir())):
         raise ValueError("replay output must be missing or empty")
     verify_replay_preflight(trajectory, runtime)
-    results = SessionResults(target, "replay")
+    results = EpisodeResults(target, "replay")
     shared = supervisor = robot = keyboard = None
     trajectory_outcome = None
     shutdown_clean = False
@@ -108,11 +108,11 @@ def replay_episode(trajectory, runtime, config):
                 reason=f"startup hand home incomplete: {home_result.reason}",
             )
         trajectory_outcome = outcome
-        if results.attempt is not None:
-            results.finish_attempt(
+        if results.current is not None:
+            results.finish_episode(
                 outcome.status.value,
                 details=outcome.reason,
-                row_count=len(outcome.replay_data["arm_qpos"])
+                replay_rows=len(outcome.replay_data["arm_qpos"])
                 if outcome.replay_data is not None
                 else 0,
             )
@@ -171,7 +171,7 @@ def replay_episode(trajectory, runtime, config):
             elif shared is not None:
                 shutdown_clean = bool(shared.sensors.close())
         except Exception as exc:
-            results.session["artifact_errors"].append(error_detail("shutdown", exc))
+            results.session["errors"].append(error_detail("shutdown", exc))
         if shared is not None:
             if shared.error_state or (not shutdown_clean and not shared.estop_request):
                 outcome = ReplayOutcome(
@@ -186,8 +186,8 @@ def replay_episode(trajectory, runtime, config):
                     outcome.reason or "operator emergency stop",
                 )
         try:
-            if results.attempt is not None and not results.failed:
-                results.finish_attempt(outcome.status.value, details=outcome.reason)
+            if results.current is not None:
+                results.finish_episode(outcome.status.value, details=outcome.reason)
             evaluate_replay(
                 trajectory,
                 outcome.replay_data,
@@ -196,7 +196,7 @@ def replay_episode(trajectory, runtime, config):
                 hand_start_duration_s=config.hand_start_duration_s,
             )
         except Exception as exc:
-            results.session["artifact_errors"].append(error_detail("evaluation_save", exc))
+            results.session["errors"].append(error_detail("evaluation_save", exc))
             outcome = ReplayOutcome(
                 ReplayStatus.FAULT, outcome.replay_data, f"{outcome.reason}; {exc}".lstrip("; ")
             )

@@ -127,12 +127,7 @@ def validate_num_episodes(num_episodes: Any) -> int:
 
 @dataclass(frozen=True)
 class RolloutRecordingConfig:
-    """Recording inputs for a physical rollout, with an absolute session data_dir.
-
-    The CLI validates paths before the session starts. Episode counts and budgets
-    belong to lifecycle configuration. Runtime records technical stop reasons;
-    task success is judged offline from raw episodes.
-    """
+    """Output directory and task label for optional Raw rollout recording."""
 
     data_dir: str
     task_label: str
@@ -156,8 +151,8 @@ class ExecutionConfig:
     """Admission and wait budgets checked against saved Policy timing."""
 
     execution_mode: str = "sync"
-    # Starting budgets for the current 16 Hz, eight-action experiment;
-    # SDK admission deadlines do not guarantee physical stop response times.
+    # Recheck these admission budgets against Policy cadence and measured costs;
+    # they do not bound the physical stop response time.
     max_decision_age_s: float = 1.0
     max_wait_s: float = 2.0
     max_tick_lateness_s: float = 0.03

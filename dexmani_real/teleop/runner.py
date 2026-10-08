@@ -158,7 +158,6 @@ class TeleopRunner:
                 task_label=self.task_label,
                 **snapshot_recording_metadata(
                     self.shared,
-                    self.runtime,
                     collection_source="teleop",
                     camera_calibration=self.camera_calibration,
                 ),

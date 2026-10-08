@@ -19,12 +19,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class VideoEncoderConfig:
-    """Real-time H.264 settings: libx264 + yuv444p preserves full chroma.
-
-    RGB/YUV conversion is automatic; libx264rgb may display incorrect colors
-    in players. crf ranges from 0 (lossless) to 51 (worst), default 18;
-    ultrafast favors encoding speed. rgb24 requires libx264rgb.
-    """
+    """H.264 settings that preserve full chroma and favor encoding speed."""
 
     codec: str = "libx264"
     crf: int = 18
@@ -49,9 +44,9 @@ class VideoEncoder:
     ) -> None:
         self._path = Path(path)
         self._cfg = config or VideoEncoderConfig()
-        self._fps = fps
         self._width = width
         self._height = height
+        self._rate = Fraction(str(fps)).limit_denominator(1_000_000)
 
         self._container: av.container.OutputContainer | None = None
         self._stream: Any = None  # av.video.VideoStream — PyAV stubs incomplete
@@ -59,12 +54,7 @@ class VideoEncoder:
         self._closed = False
 
     @property
-    def path(self) -> Path:
-        return self._path
-
-    @property
     def frame_count(self) -> int:
-        """Number of frames written so far."""
         return self._frame_count
 
     def write_frame(self, frame: np.ndarray) -> None:
@@ -81,12 +71,11 @@ class VideoEncoder:
 
         self.open()
 
-        # Convert RGB to the encoder pixel format; PyAV performs RGB→YUV.
         av_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
         if self._cfg.pixel_format != "rgb24":
             av_frame = av_frame.reformat(format=self._cfg.pixel_format)
         av_frame.pts = self._frame_count
-        av_frame.time_base = 1 / Fraction(str(self._fps)).limit_denominator(1_000_000)
+        av_frame.time_base = 1 / self._rate
 
         for packet in self._stream.encode(av_frame):
             self._container.mux(packet)
@@ -105,8 +94,7 @@ class VideoEncoder:
                 for packet in self._stream.encode(None):
                     self._container.mux(packet)
         finally:
-            # Even a codec flush error must release its file. If close itself
-            # fails, keep the handle visible for writer-thread cleanup retry.
+            # Attempt file closure even after codec failure; retain a failed close's handle.
             self._stream = None
             self._container.close()
             self._container = None
@@ -117,12 +105,6 @@ class VideoEncoder:
             self._frame_count,
         )
 
-    def __enter__(self) -> "VideoEncoder":
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        self.close()
-
     def open(self) -> None:
         """Open and initialize the encoder on its sole owning thread."""
         if self._closed:
@@ -130,7 +112,7 @@ class VideoEncoder:
         if self._container is None:
             self._container = av.open(str(self._path), "w", format="mp4")
             self._stream = self._container.add_stream(
-                self._cfg.codec, rate=Fraction(str(self._fps)).limit_denominator(1_000_000)
+                self._cfg.codec, rate=self._rate
             )
             self._stream.width = self._width
             self._stream.height = self._height
@@ -139,7 +121,8 @@ class VideoEncoder:
                 "crf": str(self._cfg.crf),
                 "preset": self._cfg.preset,
             }
-
+            # A single camera encoder must not consume every CPU core alongside control/inference.
+            self._stream.codec_context.thread_count = 1
             self._stream.codec_context.open()
             self._container.start_encoding()
 
@@ -156,13 +139,6 @@ class VideoDecoder:
         self._origin_time = None
         self._origin_time_base = None
         self._opened = False
-
-    @property
-    def frame_count(self) -> int:
-        """Total frame count in the video (cached on first open)."""
-        if not self._opened:
-            self._open()
-        return self._frame_count
 
     def iter_frames(self) -> Iterator[np.ndarray]:
         """Rewind and yield RGB frames sequentially without caching the video."""
@@ -216,12 +192,6 @@ class VideoDecoder:
             self._container = None
             self._stream = None
             self._opened = False
-
-    def __enter__(self) -> "VideoDecoder":
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        self.close()
 
     def _open(self) -> None:
         if self._opened:

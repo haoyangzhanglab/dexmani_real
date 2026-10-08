@@ -56,7 +56,6 @@ class ActionRealizer:
         self.runtime = runtime
         self.planner = planner
         self.collision_model = collision_model if planner is None else planner.collision_model
-        self.rejection_reason = None
         if planner is not None and not runtime.policy.hand_enabled:
             planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
 
@@ -182,9 +181,6 @@ class ActionRealizer:
                 joint_upper_rad=self.runtime.arm.joint_limit_upper,
             )
         )
-        self.rejection_reason = (
-            "projection_changed"
-            if not np.array_equal(projected, command.arm_qpos)
-            else self._joint_rejection(command.arm_qpos, command.hand_qpos, current, previous)
-        )
-        return self.rejection_reason is None
+        if not np.array_equal(projected, command.arm_qpos):
+            return False
+        return self._joint_rejection(command.arm_qpos, command.hand_qpos, current, previous) is None

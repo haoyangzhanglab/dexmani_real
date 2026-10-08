@@ -155,7 +155,7 @@ def replay_targets(
     run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
     try:
         if results is not None:
-            results.prepare(recording=False)
+            results.begin_episode()
         fk = make_arm_fk()
         row = read_observation(shared, runtime, robot)
         if row is None:

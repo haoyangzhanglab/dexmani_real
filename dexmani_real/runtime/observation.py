@@ -55,8 +55,6 @@ def read_camera_frame(shared, sequence=None):
         "depth": frame["depth"],
         "ring_sequence": sequence,
         "timestamp_ns": int(header["timestamp_ns"]),
-        "depth_frame_number": int(header["depth_frame_number"]),
-        "color_frame_number": int(header["color_frame_number"]),
     }
 
 
@@ -77,7 +75,6 @@ class ObservationRow:
     point_cloud: np.ndarray | None
     observation_timestamp_ns: int
     pointcloud_timestamp_ns: int = 0
-    pointcloud_camera_sequence: int = 0
 
 
 def read_observation(
@@ -143,5 +140,4 @@ def read_observation(
         _freeze(cloud["point_cloud"]) if cloud is not None else None,
         now,
         int(cloud["timestamp_ns"]) if cloud is not None else 0,
-        int(cloud["source_camera_sequence"]) if cloud is not None else 0,
     )

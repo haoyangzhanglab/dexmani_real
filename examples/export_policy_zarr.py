@@ -32,7 +32,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Transform Raw Real episodes to a canonical multimodal Zarr."
+        description="Export complete Raw episodes to a canonical multimodal Zarr; reject incomplete episodes as a whole."
     )
     parser.add_argument(
         "input_root",
@@ -41,7 +41,7 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "One raw task or episode directory. Exports to "
             "datasets/<task_name>.zarr by default (see --output). "
-            "The destination must not already exist."
+            "All modalities must be complete and finite. The destination must not already exist."
         ),
     )
     parser.add_argument(
@@ -53,8 +53,7 @@ def _parser() -> argparse.ArgumentParser:
             "(default: datasets/<task_name>.zarr). The default cache name "
             "comes from the input directory; task labels come from Raw. "
             "The destination must be new and must not be a symlink. Its resolved path must not fall "
-            "inside the protected sources: episodes/, episodes_processed/, "
-            "rollouts/, the input root, or an existing .zarr store."
+            "inside episodes/, rollouts/, the input root, or an existing .zarr store."
         ),
     )
     parser.add_argument(
@@ -81,7 +80,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 # Keep export destinations outside experiment data directories.
-_PROTECTED_SOURCE_ROOTS = ("episodes", "episodes_processed", "rollouts")
+_PROTECTED_SOURCE_ROOTS = ("episodes", "rollouts")
 
 
 def _resolve_output_path(
@@ -165,7 +164,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     progress = _ExportProgress()
-    report: dict
     if target_is_occupied(output_path):
         print(
             f"error: refusing to overwrite existing output: {output_path}",
@@ -182,7 +180,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         from dexmani_real.utils.log import configure_logging
 
         configure_logging()
-        report = export_raw_to_zarr(
+        result = export_raw_to_zarr(
             args.input_root,
             output_path,
             config,
@@ -207,15 +205,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         progress.close()
     print(
-        f"Exported {report['episode_count']} episode(s), {report['total_frames']} frames.",
+        f"Exported {result['episode_count']} episode(s), {result['total_frames']} frames.",
         file=sys.stderr,
     )
     print(
-        f"Automatically rejected {len(report['rejected_episodes'])} episode(s).",
+        f"Automatically rejected {len(result['rejected_episodes'])} episode(s).",
         file=sys.stderr,
     )
     print(
-        f"Explicitly excluded {len(report['excluded_episodes'])} episode(s).",
+        f"Explicitly excluded {len(result['excluded_episodes'])} episode(s).",
         file=sys.stderr,
     )
     return 0

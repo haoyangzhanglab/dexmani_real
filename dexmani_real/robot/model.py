@@ -9,7 +9,6 @@ XARM7_JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 8))
 ARM_DOF = 7
 HAND_DOF = 12
 HAND_FINGER_COUNT = 5
-HAND_FINGER_NAMES: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
 XHAND_TACTILE_SENSOR_FINGER_IDS: tuple[int, ...] = (2, 5, 7, 9, 11)
 XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID = {
     finger_id: index for index, finger_id in enumerate(XHAND_TACTILE_SENSOR_FINGER_IDS)

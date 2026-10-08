@@ -87,9 +87,7 @@ def print_episode_info(episode_path: str) -> None:
         print(f"Control/depth rows: {reader.num_frames}")
         print(
             "Time:",
-            "host monotonic timestamps"
-            if "observation_timestamp_ns" in reader.fields
-            else "missing observation_timestamp_ns dataset",
+            f"relative seconds ({reader.meta.get('timestamp_source', 'unspecified')})",
         )
         print()
 
@@ -144,9 +142,8 @@ class EpisodeVisualizer:
                 "hand_contact",
                 "action_arm_joint_target",
                 "action_hand_joint_target",
-                "observation_timestamp_ns",
+                "timestamp",
             )
-            self._logical_dt_s = self._reader.dt
 
             self._T = self._resolve_frame_count(max_frames)
             self._rgb_frames = iter(self._reader.iter_camera_frames("rgb"))
@@ -305,11 +302,9 @@ class EpisodeVisualizer:
 
     def log_step(self, step_idx: int) -> None:
         rr.set_time_sequence("step", step_idx)
-        timestamps = self._reader["observation_timestamp_ns"]
-        stamp, first = int(timestamps[step_idx]), int(timestamps[0])
         rr.set_time_seconds(
-            "time" if stamp and first else "nominal_time",
-            (stamp - first) / 1e9 if stamp and first else step_idx * self._logical_dt_s,
+            "nominal_time" if self._reader.meta.get("timestamp_source") == "nominal_fps" else "time",
+            float(self._reader["timestamp"][step_idx]),
         )
         self._log_camera(step_idx)
         self._log_pointcloud(step_idx)

@@ -60,7 +60,7 @@ python examples/collect_teleop.py <task> --config local.yaml
 | Q | 退出确认，再次 Q 保存退出；空闲且无 capture 时直接退出 |
 | ESC | 急停 |
 
-S/Q/ESC 可取消触觉归零；SDK 调用期间的取消需等待调用返回。触觉缺测保留 NaN，不阻断关节任务。键盘 jog 入口仅在 R 时执行 HOME。
+S/Q/ESC 可取消触觉归零；SDK 调用期间的取消需等待调用返回。触觉缺测保留 NaN，不阻断关节任务；含缺测的 episode 在导出时整段拒绝。键盘 jog 入口仅在 R 时执行 HOME。
 
 ### 查看与导出
 
@@ -72,7 +72,9 @@ python examples/export_policy_zarr.py episodes/<task> --config local.yaml
 
 `--info` 查看元数据与数值概要，无需 Rerun；交互 viewer 顺序读取所选 RGB-D 帧。查看和导出使用当前点云、桌面与手部安装配置，相机几何来自对应 Raw。仅当 `pointcloud.remove_table: true` 时读取桌面平面。
 
-公共导出保留全部 **13 字段**、NaN、dispatch 与 episode 边界，下游按模型所需字段筛选。处理逻辑变化后，从 Raw 导出到新路径。
+公共导出要求每段全部 **13 字段**完整，每行浮点数值均有限；缺字段、NaN/Inf、RGB-D 行数不符、相机几何缺失或点云无法重建时，整段拒绝并在日志中记录原因。完整性检查覆盖全部模态，不随模型所需字段而放宽。Raw 原样保留，导出不删单帧、不插值、不填补缺测。下游按模型所需字段加载。
+
+默认输出为 `datasets/<task>.zarr`，目标必须不存在，可用 `--output` 指定新路径。Zarr 使用 Diffusion Policy 的 `data/*` 和 `meta/episode_ends` 结构，根属性仅保存数值处理、数据身份与 episode 名称。处理逻辑变化后从 Raw 重新导出。文件读写故障或处理逻辑异常会中止导出，已创建的 staging 保留供排查后重建。
 
 ### 策略部署
 
@@ -84,16 +86,25 @@ H 执行 HOME，T 在空闲且无接触时归零触觉，B 开始，S 停止，Q
 
 策略提供保存的模态、节拍和点云数值配方，Real 配置提供当前设备与现场状态。执行模式通过 `execution` 配置，支持 sync、async 和 RTC；async/RTC 需指定预取步数，RTC 还需指定 guidance cap。模型加载与 warmup 在设备连接前完成，执行预算需按当前策略和现场条件核对。
 
-checkpoint 默认 `best`；策略覆盖参数见 `--help`。录制会话的 `run_config.yaml` 保存实际配置、checkpoint、覆盖值与源码版本。`--output` 指定部署输出位置。
+checkpoint 默认 `best`；策略覆盖参数见 `--help`。保存产物时，`run_config.yaml` 记录实际配置、checkpoint、覆盖值、输出开关与源码版本。`--output` 指定部署输出位置。
 
-`--no-record` 仍连接设备并执行动作；程序接口的 `execute=False` 仍连接并读取设备。两者均不能用于离线验证。
+Raw 与评估摘要可独立关闭：`--no-record` 关闭 Raw，`--no-results` 关闭摘要，两者同时使用时不创建会话产物。评估摘要保存在 `session_result.json`，包含结束原因、时长、故障和推理、发送、跳过节拍的统计。启用摘要时，在连接设备前写入初始未完成状态；运行期间只更新内存，撤销运动后保存每段结果，资源清理后更新会话结果。
+
+这些开关仍连接设备并执行动作；程序接口的 `execute=False` 仍连接并读取设备，均不能用于离线验证。
+
+### 轨迹回放
+
+```bash
+python examples/replay_episode.py episodes/<task>/<episode> --config local.yaml --output replay_results/<run>
+```
+
+按 Raw 的标称节拍逐行回放关节目标，要求 teleop 数据、非空有限的目标与关节状态、双设备持续发送状态，并检查目标是否满足当前限位。历史发送状态的来源标记不作为回放准入条件。输出目录须新建或为空，保存 `session_result.json`、已采集的 `replay_data.npz` 与可计算的一致性指标 `metrics.json`。Q 保存前缀并退出，ESC 急停；完成后可按 H 执行规划回 HOME。
 
 ## 其他入口
 
 | 用途 | 入口 |
 |---|---|
 | 键盘 jog / HOME | `examples/keyboard_teleop.py` |
-| 真实轨迹 replay | `examples/replay_episode.py` |
 | XHand 动作与反馈示例 | `examples/xhand_control_example.py` |
 | RGB-D 诊断 | `examples/realsense_record_example.py` |
 | 点云诊断与桌面标定 | `examples/pointcloud_process_example.py` |
@@ -104,7 +115,11 @@ XHand 示例按 HOME → fist → palm → V → OK → HOME 顺序执行动作�
 
 **Raw 是实验 evidence，发布后不可变。** 采集保留接入的 RGB-D、关节与触觉观测。停止、晚帧、控制失败和缺测保留已采前缀及结束原因，仅操作者显式丢弃才删除当前 capture。写盘、编码或发布失败保留 staging 并报告失败；相机停帧不补黑图，触觉按 Raw 保存值导出。
 
-Canonical 是可由 Raw 重建的训练缓存。源数据缺必要字段时明确报错；历史实验使用对应源码版本复现。相机数据保留对应几何和 depth scale，训练筛选不回写 Raw。
+每个 Raw episode 只使用 `data.h5` 与 `rgb.mp4`，HDF5 保存物理观测、尝试发送的目标、相对秒时间与发送状态，以及采集和相机元数据。历史数据中的时间和发送状态假设保留在元数据中。
+
+录制端非阻塞提交当前控制行，后台线程完成编码和写盘；启动和结束时先撤销运动，再等待文件准备或发布。录制队列满或写入失败会明确报错并保留 staging，不静默丢帧。
+
+Canonical 是可由 Raw 重建的训练缓存。训练侧只加载模型所需 observation/action，并检查这些字段的数值；训练筛选不回写 Raw。
 
 真机运行前确认机械限位、安装、标定与工作空间，保持操作者在场并可急停。设备 SDK 或 CUDA 阻塞会影响停止响应；离线检查不能证明现场安全。代码代理未经明确授权不得连接设备、执行运动、实时采集或标定写入。
 

@@ -22,7 +22,7 @@ from dexmani_real.deployment.runner import PolicyRunner
 from dexmani_real.ipc.channels import SensorChannelsConfig
 from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.recording.recorder import AsyncEpisodeRecorder
-from dexmani_real.recording.results import SessionResults, error_detail
+from dexmani_real.utils.episode_results import EpisodeResults, error_detail
 from dexmani_real.robot.action import ActionRealizer
 from dexmani_real.robot.arm_homing import build_home_planner
 from dexmani_real.robot.robot import DexManiRobot
@@ -99,10 +99,11 @@ def run_policy_deployment(
     max_running_s=None,
     num_episodes=1,
     recording_config=None,
+    results_dir=None,
     camera_calibration_path=None,
     save_run_config=None,
 ):
-    """Run one session; without recording_config there are no persistent result artifacts."""
+    """Run a session with independently optional Raw recording and evaluation summaries."""
     configure_logging()
     from dexmani_real.deployment.inference import InferenceWorker
 
@@ -116,10 +117,10 @@ def run_policy_deployment(
     runtime = resolve_runtime_table(runtime, pointcloud=cloud_recipe)
     num_episodes = validate_num_episodes(num_episodes)
     if recording_config is not None and not execute:
-        raise ValueError("recorded evaluation requires execute")
+        raise ValueError("Raw recording requires execute=True")
     results = (
-        SessionResults(recording_config.data_dir, "policy")
-        if recording_config is not None
+        EpisodeResults(results_dir, "policy")
+        if results_dir is not None
         else None
     )
     shared = supervisor = robot = model = operator = None
@@ -177,14 +178,13 @@ def run_policy_deployment(
         kinematics = build_observation_kinematics(info, runtime)
         realizer = ActionRealizer.for_mode(runtime, info.action_mode)
         home_planner = build_home_planner(runtime) if execute else None
-        if save_run_config is not None and recording_config is not None:
+        if save_run_config is not None:
             save_run_config(runtime, execution_config)
         recorder = (
             AsyncEpisodeRecorder(
                 recording_config.data_dir,
                 control_hz=1.0 / info.control_dt_s,
                 rgb_shape=(runtime.camera.height, runtime.camera.width, 3),
-                execution_path=f"worker_grid_{execution_config.execution_mode}_v1",
             )
             if recording_config is not None
             else None
@@ -273,7 +273,7 @@ def run_policy_deployment(
         except Exception as exc:
             failure = failure or exc
             if results is not None:
-                results.session["artifact_errors"].append(error_detail("shutdown", exc))
+                results.session["errors"].append(error_detail("shutdown", exc))
         finally:
             home_results = operator.home_results if operator is not None else []
             home_fault = any(item["outcome"] in ("failed", "fault") for item in home_results)

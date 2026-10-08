@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import subprocess
 import tempfile
 import uuid
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 
+import h5py
 import numpy as np
 import zarr
 
@@ -25,9 +23,7 @@ from dexmani_real.dataset.processing import (
     iter_canonical_blocks,
     validate_export_episode,
 )
-from dexmani_real.dataset.quality import EpisodeQuality
 from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
-from dexmani_real.recording.storage.schema import ROW_INFO_SPECS
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 logger = logging.getLogger(__name__)
@@ -62,10 +58,10 @@ def export_raw_to_zarr(
     exclude: tuple[str, ...] = (),
     progress_callback=None,
 ) -> dict:
-    """Reject incomplete Raw episodes before writing; publish accepted episodes in full.
+    """Reject incomplete episodes as a whole; publish all 13 modalities for accepted rows.
 
-    Only known Raw defects found during candidate preflight can be skipped.
-    Any conversion or append failure aborts the export and retains staging.
+    Raw defects and unavailable derived modalities reject the entire episode.
+    Unexpected conversion or write failures abort the export and retain staging.
     Raw evidence is never edited.
     """
     config = config or CanonicalExportConfig()
@@ -85,10 +81,8 @@ def export_raw_to_zarr(
     staging = root = data = None
     first_attrs = first_tails = None
     ends, offset = [], 0
-    episode_notes, quality_summary = {}, {}
     revision = uuid.uuid4().hex
-    created_utc = datetime.now(timezone.utc).isoformat()
-    converted = []
+    episode_ids = []
     try:
         for index, episode in enumerate(accepted):
             if progress_callback:
@@ -131,79 +125,52 @@ def export_raw_to_zarr(
                 chunk = min(config.chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes))
                 if root is None:
                     first_attrs, first_tails = attrs, tails
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    staging = Path(
-                        tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
-                    )
-                    root, data, row_info = _create_store(
+                    if staging is None:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        staging = Path(
+                            tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
+                        )
+                    root, data = _create_store(
                         staging, attrs, revision, tails, chunk, config
                     )
-                count, notes, quality = _append_episode(
-                    reader, processing, data, row_info, tails, offset, frames, chunk, specs
-                )
-                episode_notes[episode.name] = notes
+                try:
+                    count = _append_episode(
+                        reader, processing, data, tails, offset, frames, chunk
+                    )
+                except RawDataError as exc:
+                    for key, (tail, _) in tails.items():
+                        data[key].resize((offset, *tail))
+                    rejected[episode.name] = str(exc)
+                    logger.warning("Rejected %s: %s", episode.name, exc)
+                    if offset == 0:
+                        root = data = first_attrs = first_tails = None
+                    continue
                 offset += count
                 ends.append(offset)
-                episode_id = (
+                episode_ids.append(
                     episode.name if episode == source else episode.relative_to(source).as_posix()
                 )
-                converted.append(
-                    dict(episode_id=episode_id, source=str(episode), rows=count, end=offset)
-                )
-                quality_summary[episode_id] = quality.report(
-                    notes,
-                    count,
-                    [key for key, (_, dtype) in tails.items() if np.issubdtype(dtype, np.floating)],
-                )
+        if not ends:
+            raise ValueError("all selected episodes were rejected; no Zarr written")
         root.create_group("meta").create_dataset(
             "episode_ends", data=np.asarray(ends, dtype=np.int64)
         )
-        root.attrs["episode_ids"] = [ep["episode_id"] for ep in converted]
-        report = dict(
-            export_config=asdict(config),
-            data_revision=revision,
-            created_utc=created_utc,
-            episodes=converted,
-            episode_ids=[ep["episode_id"] for ep in converted],
-            source_code=_source_code(),
-            quality_summary=quality_summary,
-            input_root=str(source),
-            output_path=str(target),
-            task_name=first_attrs["task_name"],
-            dt=first_attrs["dt"],
-            episode_count=len(ends),
-            total_frames=offset,
-            episode_ends=ends,
-            dataset_keys=sorted(first_tails),
-            accepted_episodes=[episode.name for episode in accepted],
-            rejected_episodes=rejected,
-            excluded_episodes=sorted(excluded),
-            processing=processing.to_dict(),
-            episode_notes=episode_notes,
-        )
-        (staging / "export_report.json").write_text(
-            json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
+        root.attrs["episode_ids"] = episode_ids
         atomic_publish(staging, target)
         staging = None
         if progress_callback:
             progress_callback(len(accepted), len(accepted))
-        return report
+        return dict(
+            episode_count=len(ends),
+            total_frames=offset,
+            rejected_episodes=rejected,
+            excluded_episodes=sorted(excluded),
+        )
     except (ValueError, RuntimeError, OSError, KeyError) as exc:
         raise ValueError(f"{episode.name}: canonical export failed: {exc}") from exc
     finally:
         if staging is not None:
             logger.warning("Export staging retained for inspection: %s", staging)
-
-
-def _source_code():
-    repo = Path(__file__).resolve().parents[2]
-    try:
-        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
-        dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True))
-        return dict(sha=sha, dirty=dirty)
-    except (OSError, subprocess.CalledProcessError):
-        return dict(sha="unknown", dirty=None)
 
 
 def _select_episodes(source, exclude):
@@ -225,9 +192,11 @@ def _select_episodes(source, exclude):
                     (episode / name).stat()
                 except FileNotFoundError as exc:
                     raise RawDataError(f"missing required file: {name}") from exc
+            if not h5py.is_hdf5(episode / "data.h5"):
+                raise RawDataError("data.h5 is not an HDF5 file")
             with EpisodeReader(episode) as reader:
                 validate_export_episode(reader)
-        except RawDataError as exc:
+        except ValueError as exc:
             rejected[episode.name] = str(exc)
             logger.warning("Rejected %s: %s", episode.name, exc)
         else:
@@ -241,21 +210,6 @@ def _create_store(staging, attrs, revision, tails, chunk, config):
     root = zarr.open_group(str(staging), mode="w")
     root.attrs.update(dict(attrs, data_revision=revision))
     data = root.create_group("data")
-    row_info = root.create_group("row_info")
-    for name, spec in ROW_INFO_SPECS.items():
-        row_info.create_dataset(
-            name,
-            shape=(0, *spec.tail_shape),
-            chunks=(chunk, *spec.tail_shape),
-            dtype=spec.dtype,
-        )
-    root.attrs["time_semantics"] = (
-        "host monotonic ns; 0 unknown/not called; camera times preserved from Raw "
-        "(see Raw camera_timestamp_source); robot read completion"
-    )
-    root.attrs["row_semantics"] = (
-        "control observation and attempted target, not per-action query input"
-    )
     compressor = zarr.get_codec({"id": "zstd", "level": config.compression_level})
     for key, (tail, dtype) in tails.items():
         data.create_dataset(
@@ -265,33 +219,28 @@ def _create_store(staging, attrs, revision, tails, chunk, config):
             dtype=dtype,
             compressor=compressor,
         )
-    return root, data, row_info
+    return root, data
 
 
-def _append_episode(reader, processing, data, row_info, tails, offset, frames, chunk, specs):
+def _append_episode(reader, processing, data, tails, offset, frames, chunk):
     for key, (tail, _) in tails.items():
         data[key].resize((offset + frames, *tail))
-    for name, spec in ROW_INFO_SPECS.items():
-        row_info[name].resize((offset + frames, *spec.tail_shape))
-    notes = {}
-    quality = EpisodeQuality(reader.dt, reader.meta.get("camera_timestamp_source", "unknown"))
     count = 0
-    for block in iter_canonical_blocks(reader, processing, chunk_frames=chunk, notes=notes):
+    for block in iter_canonical_blocks(reader, processing, chunk_frames=chunk):
         rows = len(block["joint_state"])
-        if set(block) != set(specs):
+        if block.keys() != tails.keys():
             raise ValueError("incomplete canonical modalities")
         for key, values in block.items():
             tail, dtype = tails[key]
             if values.shape != (rows, *tail) or values.dtype != dtype:
                 raise ValueError(f"{key}: transformed shape/dtype mismatch")
+            if np.issubdtype(dtype, np.floating):
+                valid = np.isfinite(values).reshape(rows, -1).all(axis=1)
+                if not valid.all():
+                    row = count + int(np.flatnonzero(~valid)[0])
+                    raise RawDataError(f"canonical {key}: nonfinite values at row {row}")
             data[key][offset + count : offset + count + rows] = values
-        info_block = {
-            name: np.asarray(reader[name][count : count + rows]) for name in ROW_INFO_SPECS
-        }
-        for name, values in info_block.items():
-            row_info[name][offset + count : offset + count + rows] = values
-        quality.update(info_block)
         count += rows
     if count != frames:
         raise ValueError("transformed row count differs from Raw")
-    return count, notes, quality
+    return count

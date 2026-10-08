@@ -50,7 +50,7 @@ Controls:
         type=str,
         help=(
             "Published teleop Raw episode directory (episodes/<task_name>/episode_*) "
-            "with finite attempted joint targets and usable dispatch evidence when present."
+            "with finite joint targets and continued dispatch status for both devices."
         ),
     )
     parser.add_argument(

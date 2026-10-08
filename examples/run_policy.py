@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""加载已训练策略，在 xArm7/XHand 上执行并录制真机评估。
+"""加载已训练策略执行真机评估，独立选择 Raw 录制与评估摘要。
 
 python examples/run_policy.py policy/task/experiment
 python examples/run_policy.py policy/task/experiment --config local.yaml --checkpoint latest
 python examples/run_policy.py --print-config
 
-参数：--config 覆盖现场配置，--checkpoint 选择权重；--no-record 仅关闭录制，--print-config 不连接设备。
+参数：--no-record 关闭 Raw，--no-results 关闭评估摘要；--print-config 不连接设备。
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def _positive_running_seconds(raw: str) -> float:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run one policy-evaluation session with optional recording"
+        description="Run one policy-evaluation session with independently optional Raw recording and evaluation summary"
     )
     parser.add_argument(
         "experiment",
@@ -92,7 +92,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--camera-calibration", type=Path, default=None)
     parser.add_argument(
-        "--no-record", action="store_true", help="Execute without recording artifacts"
+        "--no-record", action="store_true", help="Disable Raw recording independently of --no-results"
+    )
+    parser.add_argument(
+        "--no-results", action="store_true", help="Disable evaluation summary independently of --no-record"
     )
     research = parser.add_argument_group("Policy research overrides")
     research.add_argument("--weights", choices=("ema", "raw"), default=None)
@@ -158,8 +161,6 @@ def _write_run_config(session_dir, *, args, runtime, info, execution):
     compact_info["experiment_dir"] = str(info.experiment_dir)
     compact_info["checkpoint_path"] = str(info.checkpoint_path)
     payload = {
-        "execution_path": f"worker_grid_{execution.execution_mode}_v1",
-        "observation_action_pairing": "control_tick_input_and_attempted_targets",
         "experiment": args.experiment,
         "checkpoint": args.checkpoint,
         "policy": compact_info,
@@ -170,6 +171,8 @@ def _write_run_config(session_dir, *, args, runtime, info, execution):
         "device": args.device,
         "num_episodes": args.num_episodes,
         "max_duration_s": args.max_running_s,
+        "record_raw": not args.no_record,
+        "record_results": not args.no_results,
         "n_action_steps_override": args.n_action_steps,
         "dexmani_real_head": head(Path(__file__).resolve().parents[1]),
         "dexmani_policy_head": head(Path(dexmani_policy.__file__).resolve().parents[1]),
@@ -228,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
             RolloutRecordingConfig,
         )
 
-        execution = runtime.execution.validate(info, max_running_s=args.max_running_s)
+        runtime.execution.validate(info, max_running_s=args.max_running_s)
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
         _safe_selector_parts(selector)
     except Exception as exc:
@@ -239,12 +242,13 @@ def main(argv: list[str] | None = None) -> int:
         policy_config = PolicyRuntimeConfig(saved_config, info, args.device, args.seed)
         session_dir = None
         recording_config = None
-        if not args.no_record:
+        if not (args.no_record and args.no_results):
             root = args.output or Path(__file__).resolve().parents[1] / "rollouts"
             session_dir = _session_directory(root, selector)
-            recording_config = RolloutRecordingConfig(str(session_dir), info.task_name)
+            if not args.no_record:
+                recording_config = RolloutRecordingConfig(str(session_dir), info.task_name)
         elif args.output is not None:
-            print("--no-record: --output is unused; no recording artifacts will be created")
+            print("--no-record --no-results: --output is unused; no session artifacts will be created")
     except Exception as exc:
         print(f"[SESSION] session setup failed: {exc}", file=sys.stderr)
         return 1
@@ -256,7 +260,7 @@ def main(argv: list[str] | None = None) -> int:
         f"Action steps source: {'CLI override' if args.n_action_steps is not None else 'saved Policy'}"
     )
     print(f"Episodes: {args.num_episodes}; cooperative budget={args.max_running_s:g} s")
-    print(f"Session: {session_dir}" if session_dir else "Recording: disabled", flush=True)
+    print(f"Session: {session_dir}" if session_dir else "Session artifacts: disabled", flush=True)
     try:
         from dexmani_real.deployment.session import run_policy_deployment
 
@@ -267,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
             max_running_s=args.max_running_s,
             num_episodes=args.num_episodes,
             recording_config=recording_config,
+            results_dir=session_dir if not args.no_results else None,
             camera_calibration_path=args.camera_calibration,
             save_run_config=(
                 lambda resolved, effective: _write_run_config(
@@ -277,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
                     execution=effective,
                 )
             )
-            if recording_config is not None
+            if session_dir is not None
             else None,
         )
     except Exception as exc:

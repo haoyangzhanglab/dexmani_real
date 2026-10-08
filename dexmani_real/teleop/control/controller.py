@@ -9,7 +9,6 @@ import numpy as np
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
-from dexmani_real.recording.frame import build_episode_frame
 from dexmani_real.robot.action import ActionIntent
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.robot import DispatchError, DispatchInterrupted
@@ -180,7 +179,7 @@ def execute_control_step(
     finally:
         if recorder is not None and (interrupted or recorder.accepting_frames):
             try:
-                recorder.add_frame(build_episode_frame(row, target, result))
+                recorder.add_frame(row, target, result)
             except Exception as exc:
                 if failure is not None:
                     logger.exception("recording after dispatch also failed")

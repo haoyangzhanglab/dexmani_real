@@ -393,7 +393,7 @@ class XArm7MotionPlanner:
             if report.get("limit_violation"):
                 failure = self._make_failure("Path violates planning limits.", source, report)
             if failure is None:
-                failure = self._check_elbow_consistency(candidate, report, source, profile)
+                failure = self._check_elbow_consistency(candidate, report, source)
             if (
                 failure is None
                 and report["start_qpos_error_rad"]
@@ -414,7 +414,7 @@ class XArm7MotionPlanner:
             ):
                 failure = self._make_failure("Terminal pose error too large.", source, report)
             if failure is None:
-                failure = self._check_workspace(candidate, report, source, profile)
+                failure = self._check_workspace(candidate, report, source)
             if failure is None:
                 failure = self._check_self_collision(candidate, report, source, profile)
             if failure is None:
@@ -439,7 +439,7 @@ class XArm7MotionPlanner:
             success=False, qpos_path=None, source=source, reason=reason, report=report
         )
 
-    def _check_elbow_consistency(self, path, report, source, _profile):
+    def _check_elbow_consistency(self, path, report, source):
         """Fail if the path contains an elbow branch flip (J4 crossing ±360° bands)."""
         has_flip, flip_info = self.check_elbow_consistency(path)
         if has_flip:
@@ -447,7 +447,7 @@ class XArm7MotionPlanner:
             return self._make_failure("Elbow branch flip detected.", source, report)
         return None
 
-    def _check_workspace(self, path, report, source, _profile):
+    def _check_workspace(self, path, report, source):
         """Fail if any returned waypoint leaves configured world-frame bounds."""
         if self.workspace_bounds is None:
             return None

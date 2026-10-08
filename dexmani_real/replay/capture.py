@@ -67,8 +67,7 @@ class ReplayRecorder:
     def to_dict(self) -> dict[str, np.ndarray]:
         """Return copies of the populated prefix without pickle-only values."""
         count = self._count
-        result = {
-            "execution_path": np.asarray("synchronous_direct_sdk_v1"),
+        return {
             "dispatch_status": self.dispatch_status[:count].copy(),
             "arm_qpos": self.arm_qpos[:count].copy(),
             "hand_qpos": self.hand_qpos[:count].copy(),
@@ -80,4 +79,3 @@ class ReplayRecorder:
             "arm_tracking_error": self.arm_tracking_error[:count].copy(),
             "timestamp": self.timestamps[:count].copy(),
         }
-        return result

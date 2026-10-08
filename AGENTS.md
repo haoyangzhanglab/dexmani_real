@@ -78,15 +78,15 @@ Raw 是实验 evidence。Raw immutability 从 capture 成功发布为 Raw 后开
 停止、晚帧、控制失败和 technical-invalid capture 保留已采前缀及结束原因；
 仅操作者显式重录/丢弃才删除当前 capture。writer/编码/发布失败保留 staging，
 不能将损坏文件报告为成功 Raw；已发布 Raw 仍不可变。
-采集保留全部已接入物理模态，公共导出保留全部 13 字段，下游按模型所需字段筛选。
-辅助缺测保留 NaN/有效性与 dispatch，不冒充有效零值，不作为整段自动删除依据。
+采集保留全部已接入物理模态，公共导出保留全部 13 字段，下游按模型所需字段加载。
+辅助缺测在 Raw 中保留 NaN/有效性与 dispatch，不冒充有效零值。导出拒绝不完整 episode，不删除或改写对应 Raw。
 
 ### Processed Data
 
 Canonical / processed dataset 是可重建训练缓存。
 
 - processing 必须明确、可追溯；
-- 在实际模型输入处检查其所需数值；公共导出允许辅助缺测；
+- 公共导出要求每段全部 13 字段完整且浮点数值有限，不完整 episode 整段拒绝并记录原因，原 Raw 保留；实际模型输入仍检查其所需数值；
 - 不静默补模态、删坏帧、插值或改变时间语义，除非这是明确研究设计；
 - 处理逻辑实质变化时优先从 Raw 重新导出；
 - 不默认维护旧缓存 migration / compatibility。

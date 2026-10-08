@@ -33,36 +33,22 @@ DATASET_SPECS = {
     "hand_tactile_force": _spec(np.float32, (5, 120, 3)),
     "action_arm_joint_target": _spec(np.float64, (7,)),
     "action_hand_joint_target": _spec(np.float64, (12,)),
-}
-
-
-# Host monotonic ns; zero means unknown/not called.
-ROW_INFO_SPECS = {
-    "observation_timestamp_ns": _spec(np.int64),
-    "arm_read_timestamp_ns": _spec(np.int64),
-    "hand_read_timestamp_ns": _spec(np.int64),
-    "camera_timestamp_ns": _spec(np.int64),
-    "color_frame_number": _spec(np.int64),
-    "depth_frame_number": _spec(np.int64),
-    "dispatch_timestamp_ns": _spec(np.int64),
+    # Seconds relative to the first observation; dispatch columns are arm, hand.
+    "timestamp": _spec(np.float64),
     "dispatch_status": _spec(np.uint8, (2,)),
 }
-DATASET_SPECS.update(ROW_INFO_SPECS)
 
 
-def validate_data_layout(shapes, dtypes, *, frame_count: int) -> tuple[str, ...]:
-    """Check required raw arrays, row counts, shapes, and dtypes."""
+def validate_capture_rows(timestamp, dispatch_status) -> tuple[str, ...]:
+    """Validate the episode clock and dispatch statuses, independently of observations."""
     errors = []
-    if frame_count < 0:
-        errors.append("num_frames must be non-negative")
-    for name, spec in DATASET_SPECS.items():
-        if name not in shapes:
-            errors.append(f"missing required data.h5 dataset: {name}")
-            continue
-        if tuple(shapes[name]) != (frame_count,) + spec.tail_shape:
-            errors.append(f"wrong shape for {name}: {shapes[name]}")
-        if name not in dtypes or np.dtype(dtypes[name]) != spec.dtype:
-            errors.append(f"wrong dtype for {name}: expected {spec.dtype}")
-    for name in set(shapes) - DATASET_SPECS.keys():
-        errors.append(f"unexpected data.h5 dataset: {name}")
+    if len(timestamp):
+        if not np.isfinite(timestamp).all() or np.any(timestamp < 0):
+            errors.append("timestamp must contain finite nonnegative relative seconds")
+        if timestamp[0] != 0:
+            errors.append("timestamp must start at zero")
+        if np.any(np.diff(timestamp) <= 0):
+            errors.append("timestamp must be strictly increasing within an episode")
+    if np.any(dispatch_status > 4):
+        errors.append("dispatch_status must contain status codes 0 through 4")
     return tuple(errors)
