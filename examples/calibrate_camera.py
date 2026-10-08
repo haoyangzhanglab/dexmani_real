@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Usage: python examples/calibrate_camera.py --hand-geometry {absent,secured-home}
+"""移动 xArm7 并采集 RealSense 图像标定相机外参，通过质量检查后保存。
 
-Moves xArm7; ENTER solves calibration and saves cameras.json only if quality checks pass.
-Use absent only without XHand; secured-home requires a hand fixed at home.
-Both use the fixed-home collision envelope.
+python examples/calibrate_camera.py --hand-geometry secured-home
+python examples/calibrate_camera.py --hand-geometry absent --config local.yaml --output cameras.json
+
+参数：--hand-geometry 声明手未安装（absent）或已固定在 HOME（secured-home）；--output 指定标定文件。
 """
 
 from __future__ import annotations

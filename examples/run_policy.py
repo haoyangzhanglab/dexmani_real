@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Usage: python examples/run_policy.py POLICY/TASK/EXPERIMENT
-       [--config YAML] [--checkpoint best|latest|FILE]
-       python examples/run_policy.py --print-config [--config YAML]
-执行模式与预算使用包内默认值，可通过 YAML execution 覆盖。
-真机评估：H 回零，空闲无接触时 T 归零触觉，B 开始，S 停止。
-默认保存 rollout 与 run_config.yaml；--no-record 关闭录制，任务成功由离线评估判定。"""
+"""加载已训练策略，在 xArm7/XHand 上执行并录制真机评估。
+
+python examples/run_policy.py policy/task/experiment
+python examples/run_policy.py policy/task/experiment --config local.yaml --checkpoint latest
+python examples/run_policy.py --print-config
+
+参数：--config 覆盖现场配置，--checkpoint 选择权重；--no-record 仅关闭录制，--print-config 不连接设备。
+"""
 
 from __future__ import annotations
 

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Usage: python examples/visualize_episode.py EPISODE [--config YAML] [--info] [--max-frames N]
+"""离线查看 Raw episode 的观测与点云，或输出数据概要。
 
-Offline raw-episode Rerun viewer with production point clouds; --info prints a summary.
+python examples/visualize_episode.py episodes/test/episode_001 --info
+python examples/visualize_episode.py episodes/test/episode_001 --max-frames 100 --config local.yaml
+
+参数：--info 仅打印概要，--max-frames 限制帧数，--config 指定当前点云与手部几何配置。
 """
 
 from __future__ import annotations

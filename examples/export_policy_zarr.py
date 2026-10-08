@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Usage: python examples/export_policy_zarr.py episodes/<task_name>
+"""离线将完整 Raw episode 导出为可重建的全模态 Canonical Zarr 缓存。
 
-Exports complete Raw episodes to a rebuildable canonical Zarr cache.
+python examples/export_policy_zarr.py episodes/test
+python examples/export_policy_zarr.py episodes/test --config local.yaml --output datasets/test_new.zarr
+
+参数：--output 指定新缓存路径，--config 覆盖处理配置，--exclude 排除指定 episode。
 """
 
 from __future__ import annotations

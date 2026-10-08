@@ -78,10 +78,9 @@ python examples/visualize_episode.py <episode> --info
 python examples/visualize_episode.py <episode> --max-frames 100
 
 python examples/export_policy_zarr.py episodes/<task>
-python examples/read_policy_windows.py datasets/<task>.zarr --horizon 2
 ```
 
-`--info` 只查看元数据和数值概要；交互 viewer 需要 Rerun，按所选帧数顺序读取 RGB-D。公共导出始终生成全模态缓存，窗口示例再按策略所需字段选样。处理逻辑变化后，从 Raw 重新导出。
+`--info` 只查看元数据和数值概要；交互 viewer 需要 Rerun，按所选帧数顺序读取 RGB-D。公共导出始终生成全模态缓存，下游在 `dexmani_policy` 中按模型所需字段筛选样本。处理逻辑变化后，从 Raw 重新导出。
 
 Viewer 的 `--config` 指定当前实验的点云、桌面及手部安装参数，省略时使用默认配置；相机几何仍来自对应 Raw。
 
@@ -119,12 +118,14 @@ checkpoint 默认选择 `best`；策略对比参数在 `--help` 的 Policy resea
 | VR heading calibration | `examples/calibrate_vr_heading.py` |
 | Raw episode inspection | `examples/visualize_episode.py` |
 | Raw → Zarr export | `examples/export_policy_zarr.py` |
-| Offline policy-window example | `examples/read_policy_windows.py` |
 | Physical replay | `examples/replay_episode.py` |
 | Policy rollout | `examples/run_policy.py` |
-| XHand diagnostics | `examples/xhand_diagnostics.py` |
+| XHand action example | `examples/xhand_control_example.py` |
 | RGB-D diagnostics | `examples/realsense_record_example.py` |
 | Point-cloud diagnostics | `examples/pointcloud_process_example.py` |
+
+`python examples/xhand_control_example.py` 连接 XHand1 后，顺序发送 HOME → fist → palm → V → OK → HOME，每个动作实测到位后停留 1 秒；失败或 Ctrl+C 中断时停止序列并请求停止。HOME/palm、增益和电流限制使用当前 `hand` 配置，支持 `--config`、`--comm serial|ethercat`、`--device` 和 `--hand-id`。
+`--read-only` 只连接并读取一次；`--help` 和 `--print-config` 均不连接设备。
 
 具体参数与当前行为以各入口的 CLI、resolved configuration 和源码为准。
 

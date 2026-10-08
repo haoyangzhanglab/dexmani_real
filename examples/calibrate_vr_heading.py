@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Usage: python examples/calibrate_vr_heading.py
+"""采集实时 VR 数据标定朝向，通过质量检查后保存对齐变换。
 
-Uses live VR samples to save dexmani_real/calibration/state/vr_transform.json
-after quality checks; no robot connection.
+python examples/calibrate_vr_heading.py
+python examples/calibrate_vr_heading.py --ref wrist --duration 5 --output vr_transform.json
+
+参数：--ref 选择 head/wrist 参考，--duration 为采样秒数，--output 指定变换文件。
 """
 
 from __future__ import annotations

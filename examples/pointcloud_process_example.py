@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Usage: python examples/pointcloud_process_example.py [--config YAML] [--save-dir DIR]
+"""连接 RealSense 查看点云处理效果，支持桌面平面标定及确认后发布。
 
-Live RealSense/OpenCV/Open3D diagnostic; --save-dir saves RGB-D, clouds and reconstruction metadata.
-Table fitting needs confirmation; the fit is used immediately. Publishing table_plane.json
-needs separate confirmation and affects perception and collision geometry on the next run.
+python examples/pointcloud_process_example.py
+python examples/pointcloud_process_example.py --config local.yaml --save-dir snapshots
+
+参数：--config 覆盖处理配置，--save-dir 保存 RGB-D、点云及重建元数据。
 """
 
 from __future__ import annotations

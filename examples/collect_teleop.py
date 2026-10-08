@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Usage: python examples/collect_teleop.py [TASK] [--config YAML]
+"""通过 VR 控制 xArm7/XHand，并将示教录制为 Raw episode。
 
-Controls xArm7/XHand via VR and records raw episodes unless disabled.
+python examples/collect_teleop.py test
+python examples/collect_teleop.py test --config local.yaml
+python examples/collect_teleop.py --print-config
+
+参数：TASK 指定任务和录制目录；--config 覆盖配置，--print-config 仅打印配置、不连接设备。
 """
 
 from __future__ import annotations

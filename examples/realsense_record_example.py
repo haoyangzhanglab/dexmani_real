@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Usage: python examples/realsense_record_example.py [--config YAML]
+"""实时查看 RealSense RGB-D/点云，退出时恢复原曝光优先级。
 
-Live RealSense RGB-D/Open3D diagnostic; restores auto-exposure priority on exit.
-Keys: q/Esc quit, p cloud, s raw/processed, f freeze, r reset, c config, d colormap, a exposure.
-Exposure priority allows longer exposure at lower FPS; auto exposure stays on.
+python examples/realsense_record_example.py
+python examples/realsense_record_example.py --config local.yaml --camera-calibration cameras.json
+
+参数：--config 覆盖相机与处理配置，--camera-calibration 指定点云重建所用相机外参。
 """
 
 from __future__ import annotations
