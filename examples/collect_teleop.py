@@ -10,6 +10,7 @@ python examples/collect_teleop.py --print-config
 
 from __future__ import annotations
 
+import logging
 import argparse
 
 import yaml
@@ -19,9 +20,9 @@ from dexmani_real.teleop.config import (
     DEFAULT_TASK_NAME,
     validate_task_dir_name,
 )
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger("dexmani_real.cli.collect_teleop")
 
 
 def _task_name_arg(value: str) -> str:

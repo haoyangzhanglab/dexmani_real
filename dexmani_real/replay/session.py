@@ -1,12 +1,14 @@
 """Own local robot I/O, replay scheduling, return-home and replay evaluation."""
 
+import logging
 import math
 import multiprocessing as mp
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
+from dexmani_real.ipc.channels import SensorChannelsConfig
+from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.recording.results import SessionResults, error_detail
 from dexmani_real.replay.evaluation import evaluate_replay
 from dexmani_real.replay.replayer import ReplayOutcome, ReplayStatus, replay_targets
@@ -18,10 +20,11 @@ from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.safety import RunEndReason, SafetyState, require_transition, revoke_motion
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.log import configure_logging
+
 
 DEFAULT_OUTPUT_DIR = "replay_results"
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,7 @@ class EpisodeReplayConfig:
 
 
 def replay_episode(trajectory, runtime, config):
+    configure_logging()
     from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
 
     validate_robot_config(runtime)
@@ -51,9 +55,9 @@ def replay_episode(trajectory, runtime, config):
     outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="startup failed")
     try:
         ctx = mp.get_context("spawn")
-        shared = RuntimeChannels.create(
+        shared = RuntimeState.create(
             prefix=f"replay_{os.getpid()}",
-            config=RuntimeChannelsConfig.from_runtime(runtime),
+            config=SensorChannelsConfig.from_runtime(runtime),
             mp_context=ctx,
         )
         supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
@@ -61,11 +65,11 @@ def replay_episode(trajectory, runtime, config):
 
         def request_quit():
             revoke_motion(shared, reason=RunEndReason.QUIT)
-            shared.quit_requested.value = True
+            shared.quit_requested = True
 
         keyboard = KeyboardInput(
             quit_callback=request_quit,
-            estop_callback=lambda: setattr(shared.estop_request, "value", True),
+            estop_callback=lambda: setattr(shared, "estop_request", True),
         )
         from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 
@@ -80,7 +84,7 @@ def replay_episode(trajectory, runtime, config):
             runtime,
             robot=robot,
             abort_requested=lambda: (
-                bool(shared.estop_request.value or shared.quit_requested.value)
+                bool(shared.estop_request or shared.quit_requested)
                 or not keyboard.healthy
             ),
         )
@@ -97,9 +101,9 @@ def replay_episode(trajectory, runtime, config):
         else:
             outcome = ReplayOutcome(
                 ReplayStatus.ESTOP
-                if shared.estop_request.value
+                if shared.estop_request
                 else ReplayStatus.USER_QUIT
-                if home_result.interrupted and shared.quit_requested.value
+                if home_result.interrupted and shared.quit_requested
                 else ReplayStatus.REJECTED,
                 reason=f"startup hand home incomplete: {home_result.reason}",
             )
@@ -115,12 +119,12 @@ def replay_episode(trajectory, runtime, config):
         if outcome.successful:
             print("H: planned return_home; Q: exit", flush=True)
             while (
-                shared.is_running.value and not shared.quit_requested.value and supervisor.check()
+                shared.sensors.is_running.value and not shared.quit_requested and supervisor.check()
             ):
                 robot.service_idle()
                 if not keyboard.healthy:
-                    shared.estop_request.value = True
-                if shared.error_state.value or shared.estop_request.value:
+                    shared.estop_request = True
+                if shared.error_state or shared.estop_request:
                     break
                 signals = keyboard.poll(timeout=0.1)
                 if OperatorCommand.QUIT in signals:
@@ -132,7 +136,7 @@ def replay_episode(trajectory, runtime, config):
                         home_planner,
                         robot=robot,
                         abort_requested=lambda: (
-                            bool(shared.estop_request.value or shared.quit_requested.value)
+                            bool(shared.estop_request or shared.quit_requested)
                             or not keyboard.healthy
                         ),
                     )
@@ -144,11 +148,11 @@ def replay_episode(trajectory, runtime, config):
                     print("Return-home completed. H: planned return_home; Q: exit", flush=True)
     except KeyboardInterrupt:
         if shared is not None:
-            shared.estop_request.value = True
+            shared.estop_request = True
         outcome = ReplayOutcome(ReplayStatus.ESTOP, outcome.replay_data, "KeyboardInterrupt")
     except Exception as exc:
         if shared is not None:
-            shared.error_state.value = True
+            shared.error_state = True
         logger.exception("replay session failed")
         outcome = ReplayOutcome(
             ReplayStatus.FAULT, outcome.replay_data, f"{type(exc).__name__}: {exc}"
@@ -165,17 +169,17 @@ def replay_episode(trajectory, runtime, config):
                     timeout_s=runtime.safety.shutdown_timeout_s,
                 )
             elif shared is not None:
-                shutdown_clean = bool(shared.close())
+                shutdown_clean = bool(shared.sensors.close())
         except Exception as exc:
             results.session["artifact_errors"].append(error_detail("shutdown", exc))
         if shared is not None:
-            if shared.error_state.value or (not shutdown_clean and not shared.estop_request.value):
+            if shared.error_state or (not shutdown_clean and not shared.estop_request):
                 outcome = ReplayOutcome(
                     ReplayStatus.FAULT,
                     outcome.replay_data,
                     f"{outcome.reason}; hardware/shutdown failure".lstrip("; "),
                 )
-            elif shared.estop_request.value:
+            elif shared.estop_request:
                 outcome = ReplayOutcome(
                     ReplayStatus.ESTOP,
                     outcome.replay_data,

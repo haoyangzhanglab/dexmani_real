@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -11,7 +12,7 @@ import numpy as np
 
 from dexmani_real.calibration.camera.solver import CalibrationConfig, CalibrationSamples
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.ipc.channels import RuntimeChannels
+from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.planning import Pose, XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.robot.arm_homing import ArmHomeConfig, execute_arm_home
@@ -31,10 +32,10 @@ from dexmani_real.teleop.jog import (
     compute_cartesian_jog_delta,
     propose_cartesian_jog_pose,
 )
-from dexmani_real.utils.log import get_logger
+
 from dexmani_real.utils.rate import LoopRate
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _INITIAL_STATE_POLL_S = 0.05
 _IK_WARNING_INTERVAL_S = 1.0
@@ -61,7 +62,7 @@ def read_initial_arm(runtime: ExperimentConfig, robot) -> dict[str, Any] | None:
 
 
 def set_calibration_fault(
-    shared: RuntimeChannels,
+    shared: RuntimeState,
     reason: str,
     *,
     estop: bool = False,
@@ -69,9 +70,9 @@ def set_calibration_fault(
 ) -> None:
     logger.error("Calibration fault: %s", reason)
     if estop:
-        shared.estop_request.value = True
+        shared.estop_request = True
     else:
-        shared.error_state.value = True
+        shared.error_state = True
     revoke_motion(shared, SafetyState.FAULT, reason=run_end_reason)
 
 
@@ -114,7 +115,7 @@ def finish_calibration_motion(shared, *, robot, calibration_saved):
 
 
 def handle_calibration_home_key(
-    shared: RuntimeChannels,
+    shared: RuntimeState,
     runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
     keys: KeyboardInput,
@@ -133,7 +134,7 @@ def handle_calibration_home_key(
     state.command_qpos = None
     state.command_pose = None
 
-    if int(shared.safety_state.value) == int(SafetyState.RUNNING):
+    if int(shared.safety_state) == int(SafetyState.RUNNING):
         if not revoke_motion(shared, SafetyState.ARMED):
             set_calibration_fault(shared, "failed to stop calibration motion before home")
             return HomeKeyOutcome.FAULT
@@ -145,10 +146,10 @@ def handle_calibration_home_key(
         planner=planner,
         config=ArmHomeConfig.from_runtime(runtime),
         estop_requested=lambda: keys.is_pressed("esc") or not keys.healthy,
-        cancel_requested=lambda: bool(shared.quit_requested.value),
+        cancel_requested=lambda: bool(shared.quit_requested),
         progress=lambda message: print(f"  {message}", flush=True),
     )
-    if shared.estop_request.value:
+    if shared.estop_request:
         set_calibration_fault(shared, "operator e-stop during homing")
         return HomeKeyOutcome.FAULT
     refreshed = read_initial_arm(runtime, robot)
@@ -186,7 +187,7 @@ def _log_workspace_clipping(
 
 
 def run_calibration_motion_tick(
-    shared: RuntimeChannels,
+    shared: RuntimeState,
     runtime: ExperimentConfig,
     planner: XArm7MotionPlanner,
     workspace: np.ndarray,
@@ -196,11 +197,11 @@ def run_calibration_motion_tick(
     robot,
 ) -> None:
     """Propose a jog target and commit it only after successful dispatch."""
-    safety_state = int(shared.safety_state.value)
+    safety_state = int(shared.safety_state)
     if (
-        shared.error_state.value
-        or shared.estop_request.value
-        or not shared.is_running.value
+        shared.error_state
+        or shared.estop_request
+        or not shared.sensors.is_running.value
         or safety_state not in (int(SafetyState.ARMED), int(SafetyState.RUNNING))
     ):
         state.command_qpos = None
@@ -225,7 +226,7 @@ def run_calibration_motion_tick(
             )
         return
 
-    epoch = int(shared.run_id.value)
+    epoch = int(shared.run_id)
     baseline_qpos = state.command_qpos
     baseline_pose = state.command_pose
     if baseline_qpos is None:
@@ -264,7 +265,7 @@ def run_calibration_motion_tick(
     if safety_state == int(SafetyState.ARMED):
         with shared.motion_lock:
             # A revoke during IK must also fence the first jog proposal.
-            if int(shared.run_id.value) != epoch:
+            if int(shared.run_id) != epoch:
                 state.command_qpos = None
                 state.command_pose = None
                 return
@@ -273,7 +274,7 @@ def run_calibration_motion_tick(
                 state.command_pose = None
                 set_calibration_fault(shared, "failed to enter calibration motion")
                 return
-            epoch = int(shared.run_id.value)
+            epoch = int(shared.run_id)
     q_cmd = ik_result.qpos
     try:
         robot.send_action(

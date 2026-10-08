@@ -6,7 +6,7 @@ __all__ = [
     "CapturedProcessOutput",
     "capture_native_stdout",
     "extract_native_diagnostics",
-    "get_logger",
+    "configure_logging",
     "ThrottledWarner",
 ]
 
@@ -54,21 +54,23 @@ def _get_file_handler() -> logging.FileHandler | None:
     return _file_handler
 
 
-def get_logger(name: str) -> logging.Logger:
-    logger = logging.getLogger(name)
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(_FORMATTER)
-        handler.setLevel(logging.INFO)
-        logger.addHandler(handler)
-        file_handler = _get_file_handler()
-        if file_handler is not None:
-            logger.addHandler(file_handler)
+def configure_logging() -> None:
+    """Configure application handlers once per process, only at an explicit entry."""
+    logger = logging.getLogger("dexmani_real")
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_FORMATTER)
+    handler.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    file_handler = _get_file_handler()
+    if file_handler is not None:
+        logger.addHandler(file_handler)
     logger.setLevel(logging.DEBUG)
-    return logger
+    logger.propagate = False
 
 
-_logger = get_logger(__name__)
+_logger = logging.getLogger(__name__)
 
 
 @dataclass

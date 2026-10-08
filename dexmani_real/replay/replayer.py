@@ -1,5 +1,6 @@
 """Dispatch every raw target once at nominal dt, with current feedback."""
 
+import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -15,9 +16,9 @@ from dexmani_real.robot.robot import DispatchError, DispatchInterrupted
 from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
 from dexmani_real.runtime.operator_input import OperatorCommand
 from dexmani_real.runtime.safety import RunEndReason, begin_motion, revoke_motion
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 class ReplayStatus(str, Enum):
@@ -49,15 +50,15 @@ def _wait_replay(shared, keyboard, epoch, deadline, robot):
         robot.check()
         signals = keyboard.poll(timeout=0)
         if not keyboard.healthy:
-            shared.estop_request.value = True
-        if shared.estop_request.value:
+            shared.estop_request = True
+        if shared.estop_request:
             return ReplayOutcome(ReplayStatus.ESTOP, reason="operator emergency stop")
-        if shared.error_state.value:
+        if shared.error_state:
             return ReplayOutcome(ReplayStatus.FAULT, reason="runtime failure")
-        if shared.quit_requested.value or OperatorCommand.QUIT in signals:
+        if shared.quit_requested or OperatorCommand.QUIT in signals:
             return ReplayOutcome(ReplayStatus.USER_QUIT, reason="operator quit")
-        if not shared.is_running.value or int(shared.run_id.value) != epoch:
-            cause = RunEndReason(int(shared.run_ended_reason.value))
+        if not shared.sensors.is_running.value or int(shared.run_id) != epoch:
+            cause = RunEndReason(int(shared.run_ended_reason))
             if cause == RunEndReason.QUIT:
                 return ReplayOutcome(ReplayStatus.USER_QUIT, reason="operator quit")
             return ReplayOutcome(
@@ -190,7 +191,7 @@ def replay_targets(
                 status, reason = ReplayStatus.REJECTED, "hand preparation target violates limits"
         if status == ReplayStatus.COMPLETED and not begin_motion(shared):
             status, reason = ReplayStatus.REJECTED, "motion authority unavailable"
-        epoch = int(shared.run_id.value)
+        epoch = int(shared.run_id)
         if results is not None and status == ReplayStatus.COMPLETED:
             results.entered(epoch)
         if status == ReplayStatus.COMPLETED and hand_start_duration_s > 0:
@@ -232,7 +233,7 @@ def replay_targets(
                     result, dispatch_error = exc.result, exc
                     cancelled = isinstance(exc, DispatchInterrupted)
                     if cancelled:
-                        shared.estop_request.value = True
+                        shared.estop_request = True
                     revoke_motion(
                         shared,
                         reason=RunEndReason.ESTOP
@@ -246,7 +247,7 @@ def replay_targets(
                     except Exception as exc:
                         failure_details.append(f"dispatch stop failed: {type(exc).__name__}: {exc}")
                         logger.exception("replay stop after dispatch failed")
-                        shared.error_state.value = True
+                        shared.error_state = True
                 stamp = result.timestamp_ns or time.monotonic_ns()
                 try:
                     capture.record(
@@ -262,7 +263,7 @@ def replay_targets(
                         arm_tracking_error=float(np.max(np.abs(arm - row.arm["qpos"][0]))),
                     )
                 except Exception as exc:
-                    shared.error_state.value = True
+                    shared.error_state = True
                     failure_details.append(f"capture failed: {type(exc).__name__}: {exc}")
                     if dispatch_error is not None:
                         logger.exception("replay recording after dispatch failed")
@@ -286,26 +287,26 @@ def replay_targets(
             with shared.motion_lock:
                 operator_revocation = (
                     exc.cause == "authority_revoked"
-                    and int(shared.run_ended_id.value) == epoch
-                    and int(shared.run_ended_reason.value) == int(RunEndReason.QUIT)
+                    and int(shared.run_ended_id) == epoch
+                    and int(shared.run_ended_reason) == int(RunEndReason.QUIT)
                 )
             status = (
                 ReplayStatus.ESTOP
-                if shared.estop_request.value
+                if shared.estop_request
                 else ReplayStatus.FAULT
-                if shared.error_state.value
+                if shared.error_state
                 else ReplayStatus.USER_QUIT
                 if operator_revocation
                 else ReplayStatus.REJECTED
             )
         else:
             status = ReplayStatus.FAULT
-            shared.error_state.value = True
+            shared.error_state = True
         run_end_reason = (
             RunEndReason.HARDWARE_FAULT if not exc.revoked else RunEndReason.EXECUTOR_BOUNDARY
         )
     except KeyboardInterrupt as exc:
-        shared.estop_request.value = True
+        shared.estop_request = True
         status, reason = ReplayStatus.ESTOP, "KeyboardInterrupt"
         if isinstance(exc, DispatchInterrupted):
             reason += f"; dispatch={exc.result}"
@@ -314,7 +315,7 @@ def replay_targets(
         logger.exception("replay failed")
         status, reason = ReplayStatus.FAULT, str(exc)
         run_end_reason = RunEndReason.POLICY_FAILURE
-        shared.error_state.value = True
+        shared.error_state = True
     finally:
         if status == ReplayStatus.USER_QUIT:
             run_end_reason = RunEndReason.QUIT
@@ -324,7 +325,7 @@ def replay_targets(
         try:
             robot.stop()
         except Exception as exc:
-            shared.error_state.value = True
+            shared.error_state = True
             logger.exception("replay stop failed")
             status, reason = ReplayStatus.FAULT, f"{reason or status.value}; stop failed: {exc}"
     if failure_details:

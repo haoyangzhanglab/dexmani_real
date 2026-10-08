@@ -9,6 +9,7 @@ python examples/pointcloud_process_example.py --config local.yaml --save-dir sna
 
 from __future__ import annotations
 
+
 import argparse
 import hashlib
 import shutil
@@ -39,6 +40,7 @@ from dexmani_real.sensor.pointcloud import (
 )
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
 from dexmani_real.utils.geometry import validate_rigid_transform
+from dexmani_real.utils.log import configure_logging
 
 if TYPE_CHECKING:
     import open3d as o3d
@@ -306,7 +308,8 @@ def _save_diagnostic_snapshot(
 
 def _connect_camera(cfg: CameraParams) -> RealSenseCamera:
     """Connect and warm up; exclude this one-time cost from per-frame timings."""
-    camera = RealSenseCamera(RealSenseCameraConfig.from_camera_params(cfg))
+    configure_logging()
+    camera = RealSenseCamera(cfg)
     print("Connecting to RealSense...")
     try:
         if not camera.connect():
@@ -360,11 +363,11 @@ def _capture_frame(
         raise RuntimeError("RGB frame unavailable.")
 
     rgb = np.ascontiguousarray(frame.rgb)
-    if frame.depth_aligned_to_color_raw is None or frame.depth_aligned_to_color is None:
+    if frame.depth_aligned_to_color_raw is None:
         raise RuntimeError("depth_to_color alignment is unavailable")
     depth_raw = np.ascontiguousarray(frame.depth_aligned_to_color_raw)
-    depth_m = np.ascontiguousarray(frame.depth_aligned_to_color, dtype=np.float32)
-    if rgb.shape[:2] != depth_raw.shape or depth_raw.shape != depth_m.shape:
+    depth_m = frame.depth_aligned_to_color_raw.astype(np.float32) * float(frame.depth_scale)
+    if rgb.shape[:2] != depth_raw.shape:
         raise RuntimeError("aligned RGB and depth frame dimensions do not match")
 
     print(f"  RGB:     shape={rgb.shape}, dtype={rgb.dtype}")
@@ -630,12 +633,11 @@ def _visualize_result(
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    global rs, RealSenseCamera, RealSenseCameraConfig
+    global rs, RealSenseCamera
     import pyrealsense2 as rs
 
     from dexmani_real.sensor.camera.realsense import (
         RealSenseCamera,
-        RealSenseCameraConfig,
     )
 
     save_dir = None if args.save_dir is None else args.save_dir.expanduser().resolve()

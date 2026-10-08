@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from collections.abc import Iterator
 from dataclasses import dataclass
 from fractions import Fraction
@@ -11,9 +13,8 @@ from typing import Any
 import av
 import numpy as np
 
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 @dataclass

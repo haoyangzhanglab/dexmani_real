@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import warnings
+import logging
+
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -13,7 +14,6 @@ from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
 )
-from dexmani_real.utils.log import get_logger
 
 from .collision import CollisionModel
 from .kinematics.arm_fk import XArm7Kinematics
@@ -22,7 +22,7 @@ from .kinematics.ik_geometry import IKGeometry
 from .kinematics.pose import Pose, ensure_qpos
 from .paths import WORKSPACE_BOUNDS_TOLERANCE_M, PathResult, interpolate_waypoints
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "XArm7MotionPlanner",
@@ -76,7 +76,6 @@ class XArm7MotionPlanner:
         self.mplib = mplib
         self.config = config
         self.planning_profile = planning_profile or MotionPlanningConfig()
-        self.online_ik_profile = online_ik_profile or OnlineIKConfig()
         self.workspace_bounds = None
         if config.workspace_bounds is not None:
             bounds = np.asarray(config.workspace_bounds, dtype=np.float64)
@@ -163,10 +162,10 @@ class XArm7MotionPlanner:
         self.ik_geometry = IKGeometry(self.kin, collision_model=self.collision_model)
         self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
 
-        self.online_ik_solver = OnlineIKSolver(
-            self.kin,
-            self.ik_geometry,
-            self.online_ik_profile,
+        self.online_ik_solver = (
+            OnlineIKSolver(self.kin, self.ik_geometry, online_ik_profile)
+            if online_ik_profile is not None
+            else None
         )
 
         self.dof = dof
@@ -199,11 +198,15 @@ class XArm7MotionPlanner:
         self.kin.set_base_pose(base_pose_world)
 
     def reset_episode(self):
+        if self.online_ik_solver is None:
+            raise RuntimeError("this planner has no online IK solver")
         self.online_ik_solver.reset_episode()
 
     def solve_online_ik(
         self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
     ) -> IKResult:
+        if self.online_ik_solver is None:
+            raise RuntimeError("this planner has no online IK solver")
         return self.online_ik_solver.solve(target_eef_pose_world, current_qpos, previous_qpos_cmd)
 
     def plan_joint_qpos_path(
@@ -241,7 +244,7 @@ class XArm7MotionPlanner:
             simplify=profile.simplify_path,
             verbose=False,
         )
-        path_result = self.result_from_mplib(
+        path_result = self._result_from_mplib(
             result,
             target_pose_world,
             current_qpos,
@@ -252,7 +255,7 @@ class XArm7MotionPlanner:
         path_result.report["planning_time_s"] = float(planning_time_s)
         return path_result
 
-    def result_from_mplib(
+    def _result_from_mplib(
         self,
         result: dict[str, Any],
         target_eef_pose_world: Pose,
@@ -280,10 +283,13 @@ class XArm7MotionPlanner:
 
         path = np.asarray(result.get("position", []), dtype=np.float64)
         if len(path) == 0:
-            warnings.warn(
-                f"MPlib {source} returned success but empty position; falling back to current_qpos."
+            return PathResult(
+                success=False,
+                qpos_path=None,
+                source=source,
+                reason="MPlib returned success with an empty joint path",
+                report={"mplib_status": status},
             )
-            path = current_qpos.reshape(1, -1)
         path_result = self.validate_path(
             path, target_eef_pose_world, current_qpos, source=source, profile=profile
         )

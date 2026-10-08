@@ -1,5 +1,6 @@
 """RealSense owner; publish aligned RGB-D with the oldest channel advance time."""
 
+import logging
 import json
 import time
 
@@ -7,9 +8,10 @@ import numpy as np
 
 from dexmani_real.config.hardware import CameraParams
 from dexmani_real.ipc.schema import CAMERA_FRAME_HEADER_DTYPE
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.log import configure_logging
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 def pack_camera_frame(rgb, depth_raw, *, timestamp_ns, depth_frame_number, color_frame_number):
@@ -25,14 +27,14 @@ def pack_camera_frame(rgb, depth_raw, *, timestamp_ns, depth_frame_number, color
 
 
 def run_camera_worker(shared, config: CameraParams) -> None:
+    configure_logging()
     if shared.camera_ring is None:
         raise ValueError("camera worker requires an allocated camera ring")
     from dexmani_real.sensor.camera.realsense import (
         RealSenseCamera,
-        RealSenseCameraConfig,
     )
 
-    cam = RealSenseCamera(RealSenseCameraConfig.from_camera_params(config))
+    cam = RealSenseCamera(config)
     try:
         if not cam.connect():
             raise RuntimeError("RealSense connect failed")
@@ -43,7 +45,7 @@ def run_camera_worker(shared, config: CameraParams) -> None:
         last_advance_ns = [time.monotonic_ns(), time.monotonic_ns()]
         while shared.is_running.value:
             try:
-                frame = cam.read(timeout_ms=300, compute_depth=False)
+                frame = cam.read(timeout_ms=300)
             except (RuntimeError, OSError):
                 if time.monotonic_ns() - min(last_advance_ns) >= int(
                     config.source_stall_timeout_s * 1e9
@@ -64,15 +66,14 @@ def run_camera_worker(shared, config: CameraParams) -> None:
                 continue
             if frame.rgb is None or frame.depth_aligned_to_color_raw is None:
                 raise RuntimeError("RealSense did not produce aligned RGB-D")
-            shared.camera_ring.write(
-                *pack_camera_frame(
-                    frame.rgb,
-                    frame.depth_aligned_to_color_raw,
-                    timestamp_ns=min(last_advance_ns),
-                    depth_frame_number=frame.depth_frame_number,
-                    color_frame_number=frame.color_frame_number,
-                )
+            header, rgb, depth = pack_camera_frame(
+                frame.rgb,
+                frame.depth_aligned_to_color_raw,
+                timestamp_ns=min(last_advance_ns),
+                depth_frame_number=frame.depth_frame_number,
+                color_frame_number=frame.color_frame_number,
             )
+            shared.camera_ring.write_fields(header=header[0], rgb=rgb, depth=depth)
             last_frame = identity
             shared.camera_ready.set()
     except Exception:

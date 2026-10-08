@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -9,7 +10,6 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from dexmani_real.utils.log import get_logger
 
 from .pose import Pose, compute_pose_error
 
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from .arm_fk import XArm7Kinematics
     from .ik_geometry import IKGeometry
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Relative rank diagnosis is a search guard, never an execution constraint.
 _SVD_RANK_RTOL = 1e-4

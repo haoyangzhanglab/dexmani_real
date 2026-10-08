@@ -9,11 +9,12 @@ python examples/realsense_record_example.py --config local.yaml --camera-calibra
 
 from __future__ import annotations
 
+
 import argparse
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import cv2
@@ -24,6 +25,7 @@ from dexmani_real.config.experiment import load_experiment_config, resolve_table
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.sensor.pointcloud import build_point_cloud, build_raw_point_cloud
+from dexmani_real.utils.log import configure_logging
 
 _WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
 
@@ -180,9 +182,10 @@ def _list_cameras() -> list[dict[str, str]]:
     return cameras
 
 
-def _test_lifecycle(config: RealSenseCameraConfig) -> bool:
+def _test_lifecycle(config: CameraParams) -> bool:
+    configure_logging()
     print("\n-- 1. connect/disconnect lifecycle --")
-    camera = RealSenseCamera(config)
+    camera = RealSenseCamera(config, auto_exposure_priority=None)
     try:
         for attempt in range(3):
             ok = camera.connect()
@@ -431,15 +434,12 @@ def _run_rgbd_test(
             frame_count += 1
             frame_rgb = frame.rgb
             aligned_depth_raw = frame.depth_aligned_to_color_raw
-            aligned_depth_m = frame.depth_aligned_to_color
-            if frame_rgb is None or aligned_depth_raw is None or aligned_depth_m is None:
+            if frame_rgb is None or aligned_depth_raw is None:
                 print("  aligned RGB-D frame unavailable; stopping diagnostic")
                 outcome = "read_failed"
                 break
-            if (
-                frame_rgb.shape[:2] != aligned_depth_raw.shape
-                or aligned_depth_raw.shape != aligned_depth_m.shape
-            ):
+            aligned_depth_m = aligned_depth_raw.astype(np.float32) * float(frame.depth_scale)
+            if frame_rgb.shape[:2] != aligned_depth_raw.shape:
                 print("  aligned RGB-D dimensions do not match; stopping diagnostic")
                 outcome = "read_failed"
                 break
@@ -548,10 +548,11 @@ def main(argv=None) -> int:
     parser.add_argument("--config", help="Optional experiment YAML overrides")
     parser.add_argument("--camera-calibration")
     args = parser.parse_args(argv)
-    global rs, RealSenseCamera, RealSenseCameraConfig
+    global rs, RealSenseCamera, CameraParams
     import pyrealsense2 as rs
 
-    from dexmani_real.sensor.camera.realsense import RealSenseCamera, RealSenseCameraConfig
+    from dexmani_real.sensor.camera.realsense import RealSenseCamera
+    from dexmani_real.config.hardware import CameraParams
 
     # Resolve experiment settings before enumerating or opening a camera.
     runtime = load_experiment_config(yaml_path=args.config)
@@ -561,9 +562,7 @@ def main(argv=None) -> int:
     table_plane_abcd = resolve_table_plane(table) if production.remove_table else None
     calibration = CameraExtrinsics(args.camera_calibration)
     # Both connections leave exposure priority untouched until it is snapshotted.
-    config = replace(
-        RealSenseCameraConfig.from_camera_params(runtime.camera), auto_exposure_priority=None
-    )
+    config = runtime.camera
 
     print("=" * 60)
     print("RealSense Test -- RGB-D Live Capture + Real-time Point Cloud")
@@ -580,7 +579,7 @@ def main(argv=None) -> int:
         print("Lifecycle test failed, exiting.")
         return 1
 
-    camera = RealSenseCamera(config)
+    camera = RealSenseCamera(config, auto_exposure_priority=None)
     original_priority = None
     restore_failed = False
     outcome = "read_failed"

@@ -7,6 +7,7 @@ methods and saves accepted results to ``dexmani_real/calibration/state/cameras.j
 from __future__ import annotations
 
 import json
+import logging
 import multiprocessing as mp
 import os
 import time
@@ -44,10 +45,7 @@ from dexmani_real.calibration.camera.solver import (
     save_camera_calibration,
 )
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.ipc.channels import (
-    RuntimeChannels,
-    RuntimeChannelsConfig,
-)
+from dexmani_real.ipc.channels import SensorChannelsConfig
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import make_online_ik_config
@@ -56,19 +54,20 @@ from dexmani_real.runtime.observation import read_camera_frame, sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.safety import RunEndReason, SafetyState, require_transition, revoke_motion
+from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.teleop.config import validate_keyboard_workspace
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.rate import LoopRate
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _WINDOW_NAME = "ArUco Calibration"
 
 
 def _detect_aruco_stable(
-    shared: RuntimeChannels,
+    shared: RuntimeState,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
     *,
@@ -336,11 +335,11 @@ class CameraCalibrationSession:
         self.output_path = output_path
 
     def _runtime_issue(self, arm):
-        if self.shared.estop_request.value:
+        if self.shared.estop_request:
             return "e-stop is requested"
-        if self.shared.error_state.value:
+        if self.shared.error_state:
             return "runtime error latch is set"
-        if int(self.shared.safety_state.value) == int(SafetyState.FAULT):
+        if int(self.shared.safety_state) == int(SafetyState.FAULT):
             return "safety state is FAULT"
         if arm is None or not sample_is_fresh(
             arm["timestamp_ns"], self.runtime.arm.feedback_max_age_s
@@ -350,10 +349,10 @@ class CameraCalibrationSession:
 
     def _cancel_requested(self):
         return bool(
-            self.shared.quit_requested.value
-            or self.shared.estop_request.value
-            or self.shared.error_state.value
-            or not self.shared.is_running.value
+            self.shared.quit_requested
+            or self.shared.estop_request
+            or self.shared.error_state
+            or not self.shared.sensors.is_running.value
             or not self.keys.healthy
             or self.keys.is_pressed("q")
             or self.keys.is_pressed("esc")
@@ -477,10 +476,10 @@ class CameraCalibrationSession:
                 revoke_motion(self.shared)
                 self.robot.stop()
                 self.state.command_qpos = self.state.command_pose = None
-                epoch = int(self.shared.run_id.value)
+                epoch = int(self.shared.run_id)
 
                 def cancelled():
-                    return self._cancel_requested() or int(self.shared.run_id.value) != epoch
+                    return self._cancel_requested() or int(self.shared.run_id) != epoch
 
                 candidate = _solve_calibration(
                     self.state.samples,
@@ -517,7 +516,7 @@ class CameraCalibrationSession:
 
         def request_quit():
             revoke_motion(self.shared, reason=RunEndReason.QUIT)
-            self.shared.quit_requested.value = True
+            self.shared.quit_requested = True
 
         self.keys = KeyboardInput(
             suppress_echo=True,
@@ -532,8 +531,8 @@ class CameraCalibrationSession:
         keys_started = False
         window_created = False
         try:
-            self.serial = self.shared.camera_serial.value.decode()
-            geometry = json.loads(self.shared.camera_geometry.value.decode())["color"]
+            self.serial = self.shared.sensors.camera_serial.value.decode()
+            geometry = json.loads(self.shared.sensors.camera_geometry.value.decode())["color"]
             self.camera_width, self.camera_height = geometry["width"], geometry["height"]
             self.intrinsics = np.array(
                 [
@@ -574,7 +573,7 @@ class CameraCalibrationSession:
             try:
                 self.robot.stop()
             except Exception:
-                self.shared.error_state.value = True
+                self.shared.error_state = True
                 logger.exception("calibration stop failed")
             if keys_started:
                 try:
@@ -608,7 +607,7 @@ class CameraCalibrationSession:
         print(f"  Preview window: {_WINDOW_NAME} (green=detected, red=not found)")
 
         self.display_image: np.ndarray | None = None
-        while self.shared.is_running.value:
+        while self.shared.sensors.is_running.value:
             self.rate.wait()
             self.state.frame += 1
 
@@ -629,7 +628,7 @@ class CameraCalibrationSession:
                 set_calibration_fault(self.shared, "camera worker exited")
                 return 1
 
-            if self.shared.quit_requested.value or self.keys.is_pressed("q"):
+            if self.shared.quit_requested or self.keys.is_pressed("q"):
                 return finish_calibration_motion(
                     self.shared, robot=self.robot, calibration_saved=self.state.calibration_saved
                 )
@@ -682,6 +681,7 @@ def run_camera_calibration(
     IK endpoint and return-home checks use the fixed-home XHand envelope for both
     values, so ``absent`` retains conservative hand geometry.
     """
+    configure_logging()
     if hand_geometry not in {"absent", "secured-home"}:
         raise ValueError("hand_geometry must be 'absent' or 'secured-home'")
     if runtime.policy.hand_enabled:
@@ -709,9 +709,9 @@ def run_camera_calibration(
         )
 
     ctx = mp.get_context("spawn")
-    shared = RuntimeChannels.create(
+    shared = RuntimeState.create(
         prefix=f"dexmani_calib_{os.getpid()}",
-        config=RuntimeChannelsConfig.from_runtime(runtime, camera=True),
+        config=SensorChannelsConfig.from_runtime(runtime, camera=True),
         mp_context=ctx,
     )
     supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
@@ -719,7 +719,9 @@ def run_camera_calibration(
     exit_code = 1
     try:
         robot.connect()
-        camera = ctx.Process(name="camera", target=run_camera_worker, args=(shared, runtime.camera))
+        camera = ctx.Process(
+            name="camera", target=run_camera_worker, args=(shared.sensors, runtime.camera)
+        )
         supervisor.start([camera])
         require_transition(shared, SafetyState.ARMED)
         print("  local arm connected (Mode 6)")
@@ -727,10 +729,10 @@ def run_camera_calibration(
             shared, runtime, planner, workspace, robot, camera, calib_cfg, aruco_cfg, output_path
         ).run()
     except KeyboardInterrupt:
-        shared.estop_request.value = True
+        shared.estop_request = True
         exit_code = 130
     except Exception:
-        shared.error_state.value = True
+        shared.error_state = True
         logger.exception("camera calibration session failed")
     finally:
         revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)

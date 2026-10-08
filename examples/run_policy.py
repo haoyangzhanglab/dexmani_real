@@ -267,7 +267,6 @@ def main(argv: list[str] | None = None) -> int:
             max_running_s=args.max_running_s,
             num_episodes=args.num_episodes,
             recording_config=recording_config,
-            execution_config=execution,
             camera_calibration_path=args.camera_calibration,
             save_run_config=(
                 lambda resolved, effective: _write_run_config(

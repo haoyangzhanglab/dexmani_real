@@ -1,5 +1,6 @@
 """Planned return-home with full path/environment collision checks."""
 
+import logging
 import time
 from dataclasses import dataclass
 
@@ -7,7 +8,6 @@ import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.planning import Pose, XArm7MotionPlanner, XArm7PlannerConfig
-from dexmani_real.planning.kinematics.ik import make_online_ik_config
 from dexmani_real.planning.paths import (
     HomePathStatus,
     compute_band_alignment_path,
@@ -90,15 +90,15 @@ def execute_arm_home(
     target = np.asarray(home_qpos, dtype=np.float64)
     if target.shape != (7,) or not np.isfinite(target).all():
         return HomeResult(False, "home target must be finite (7,)")
-    if int(shared.safety_state.value) != int(SafetyState.ARMED):
+    if int(shared.safety_state) != int(SafetyState.ARMED):
         return HomeResult(False, "home requires ARMED")
     revoke_motion(shared)
-    epoch = int(shared.run_id.value)
+    epoch = int(shared.run_id)
     boundary_ns = time.monotonic_ns()
 
     def aborted():
         if estop_requested is not None and estop_requested():
-            shared.estop_request.value = True
+            shared.estop_request = True
         return (cancel_requested is not None and cancel_requested()) or not command_may_cross_sdk(
             shared, run_id=epoch, required_safety_state=SafetyState.ARMED
         )
@@ -165,12 +165,12 @@ def execute_arm_home(
         from dexmani_real.robot.drivers.xarm7 import HomeAborted
 
         if isinstance(exc, KeyboardInterrupt):
-            shared.estop_request.value = True
+            shared.estop_request = True
             raise
         if not isinstance(exc, Exception):
             raise
         if not isinstance(exc, HomeAborted):
-            shared.error_state.value = True
+            shared.error_state = True
             revoke_motion(shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
             raise
         interrupted = time.monotonic() < deadline
@@ -184,9 +184,8 @@ def execute_arm_home(
         except Exception:
             if failure is None:
                 raise
-            from dexmani_real.utils.log import get_logger
 
-            get_logger(__name__).exception("HOME cleanup also failed")
+            logging.getLogger(__name__).exception("HOME cleanup also failed")
 
 
 def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
@@ -210,7 +209,6 @@ def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
             base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
             workspace_bounds=workspace,
         ),
-        online_ik_profile=make_online_ik_config(runtime),
         hand_dof=True,
         static_boxes=tuple(runtime.environment.static_boxes),
         table=runtime.environment.table,
@@ -218,7 +216,7 @@ def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
 
 
 def home_robot(shared, runtime, planner, *, robot, abort_requested):
-    if int(shared.safety_state.value) != int(SafetyState.ARMED):
+    if int(shared.safety_state) != int(SafetyState.ARMED):
         return False
     failure = None
     try:
@@ -236,7 +234,7 @@ def home_robot(shared, runtime, planner, *, robot, abort_requested):
             planner=planner,
             config=ArmHomeConfig.from_runtime(runtime),
             cancel_requested=abort_requested,
-            estop_requested=lambda: bool(shared.estop_request.value),
+            estop_requested=lambda: bool(shared.estop_request),
             progress=print,
             hand_state_max_age_s=(
                 runtime.hand.feedback_max_age_s if runtime.policy.hand_enabled else None
@@ -248,7 +246,7 @@ def home_robot(shared, runtime, planner, *, robot, abort_requested):
     except BaseException as exc:
         failure = exc
         if isinstance(exc, KeyboardInterrupt):
-            shared.estop_request.value = True
+            shared.estop_request = True
         raise
     finally:
         try:
@@ -258,6 +256,5 @@ def home_robot(shared, runtime, planner, *, robot, abort_requested):
         except Exception:
             if failure is None:
                 raise
-            from dexmani_real.utils.log import get_logger
 
-            get_logger(__name__).exception("combined HOME cleanup also failed")
+            logging.getLogger(__name__).exception("combined HOME cleanup also failed")

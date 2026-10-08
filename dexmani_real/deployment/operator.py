@@ -1,9 +1,11 @@
 """Policy keyboard ownership and HOME/TARE/start/stop authorization ordering."""
 
+import logging
+
 from concurrent.futures import CancelledError
 
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.ipc.channels import RuntimeChannels
+from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.robot.arm_homing import home_robot
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
@@ -14,9 +16,9 @@ from dexmani_real.runtime.safety import (
     request_policy_start,
     request_policy_stop,
 )
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 class PolicyOperator:
@@ -24,7 +26,7 @@ class PolicyOperator:
 
     def __init__(
         self,
-        shared: RuntimeChannels,
+        shared: RuntimeState,
         runtime: ExperimentConfig,
         planner: XArm7MotionPlanner | None,
         *,
@@ -43,7 +45,7 @@ class PolicyOperator:
         if execute != (planner is not None):
             raise ValueError("execute must match physical home availability")
         self.keyboard = KeyboardInput(
-            estop_callback=lambda: setattr(shared.estop_request, "value", True),
+            estop_callback=lambda: setattr(shared, "estop_request", True),
             stop_callback=self._request_stop,
             quit_callback=self._request_quit,
         )
@@ -51,17 +53,17 @@ class PolicyOperator:
     def _request_stop(self) -> None:
         """Fence motion even while the I/O owner is blocked in HOME, inference or SDK I/O."""
         if not request_policy_stop(self.shared):
-            self.shared.error_state.value = True
+            self.shared.error_state = True
 
     def _request_quit(self) -> None:
         """Apply Q's motion fence before asking the supervisor to shut down."""
         if not request_policy_stop(self.shared, reason=RunEndReason.QUIT):
-            self.shared.error_state.value = True
-        self.shared.quit_requested.value = True
+            self.shared.error_state = True
+        self.shared.quit_requested = True
 
     def poll(self) -> None:
         if self.keyboard.estop_latched or not self.keyboard.healthy:
-            self.shared.estop_request.value = True
+            self.shared.estop_request = True
             return
         self._handle_command_batch(self.keyboard.poll(timeout=0))
 
@@ -103,7 +105,7 @@ class PolicyOperator:
                         "T ignored: tactile tare requires idle, no capture/reset/pending inference"
                     )
                     continue
-                if int(self.shared.safety_state.value) != int(SafetyState.ARMED):
+                if int(self.shared.safety_state) != int(SafetyState.ARMED):
                     continue
                 try:
                     result = self.robot.tare_tactile(cancel_requested=self._home_abort_requested)
@@ -134,22 +136,22 @@ class PolicyOperator:
                 # Listener stays available through final recording cleanup.
                 continue
             elif signal is OperatorCommand.EMERGENCY_STOP:
-                self.shared.estop_request.value = True
+                self.shared.estop_request = True
                 return
 
     def _run_home(self) -> bool:
         with self.shared.motion_lock:
             home_allowed = (
-                self.shared.is_running.value
-                and not self.shared.quit_requested.value
-                and not self.shared.error_state.value
-                and not self.shared.estop_request.value
-                and int(self.shared.stop_request.value) == int(StopRequest.NONE)
-                and int(self.shared.safety_state.value) == int(SafetyState.ARMED)
+                self.shared.sensors.is_running.value
+                and not self.shared.quit_requested
+                and not self.shared.error_state
+                and not self.shared.estop_request
+                and int(self.shared.stop_request) == int(StopRequest.NONE)
+                and int(self.shared.safety_state) == int(SafetyState.ARMED)
             )
             if home_allowed:
                 # Only the owner consumes S; HOME never clears a newer stop.
-                self.shared.start_request.value = False
+                self.shared.start_request = False
         if not home_allowed:
             logger.warning("operator: ignored H unless ARMED without shutdown, fault or stop")
             return False
@@ -169,17 +171,17 @@ class PolicyOperator:
         with self.shared.motion_lock:
             completed_without_stop = bool(
                 completed
-                and self.shared.is_running.value
-                and not self.shared.quit_requested.value
-                and not self.shared.error_state.value
-                and not self.shared.estop_request.value
-                and int(self.shared.stop_request.value) == int(StopRequest.NONE)
-                and int(self.shared.safety_state.value) == int(SafetyState.ARMED)
+                and self.shared.sensors.is_running.value
+                and not self.shared.quit_requested
+                and not self.shared.error_state
+                and not self.shared.estop_request
+                and int(self.shared.stop_request) == int(StopRequest.NONE)
+                and int(self.shared.safety_state) == int(SafetyState.ARMED)
             )
         interrupted = bool(
-            self.shared.quit_requested.value
-            or self.shared.estop_request.value
-            or self.shared.stop_request.value
+            self.shared.quit_requested
+            or self.shared.estop_request
+            or self.shared.stop_request
         )
         home_result.update(
             outcome="completed"
@@ -203,9 +205,9 @@ class PolicyOperator:
     def _home_abort_requested(self) -> bool:
         self.robot.check()
         return bool(
-            not self.shared.is_running.value
-            or self.shared.quit_requested.value
-            or self.shared.error_state.value
-            or self.shared.estop_request.value
-            or int(self.shared.stop_request.value) != int(StopRequest.NONE)
+            not self.shared.sensors.is_running.value
+            or self.shared.quit_requested
+            or self.shared.error_state
+            or self.shared.estop_request
+            or int(self.shared.stop_request) != int(StopRequest.NONE)
         )

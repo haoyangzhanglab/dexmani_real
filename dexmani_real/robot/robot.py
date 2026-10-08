@@ -1,11 +1,13 @@
 """Single application-thread owner of the existing arm and optional hand drivers."""
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, replace
-from enum import IntEnum
 
 import numpy as np
+
+from dexmani_real.robot.commands import DispatchStatus
 
 from dexmani_real.ipc.schema import ARM_STATE_DTYPE, HAND_STATE_DTYPE
 from dexmani_real.robot.command_validation import check_arm_target, check_hand_target
@@ -17,22 +19,14 @@ from dexmani_real.runtime.safety import (
     command_may_cross_sdk,
     revoke_motion,
 )
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 # Stop retries belong to the synchronous I/O owner, outside normal motion pacing.
 _HAND_STOP_RETRY_INTERVAL_S = 0.01
 _HAND_STOP_RETRY_TIMEOUT_S = 0.25
 _HAND_STOP_MAX_ATTEMPTS = 26
-
-
-class DispatchStatus(IntEnum):
-    NOT_CALLED = 0
-    ACCEPTED = 1
-    CRC_UNCONFIRMED = 2
-    REJECTED = 3
-    UNKNOWN = 4
 
 
 @dataclass(frozen=True)
@@ -142,9 +136,9 @@ class DexManiRobot:
                 time.sleep(0.01)
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
-                self.shared.estop_request.value = True
+                self.shared.estop_request = True
             elif isinstance(exc, Exception):
-                self.shared.error_state.value = True
+                self.shared.error_state = True
             try:
                 self.close()
             except Exception:
@@ -154,7 +148,7 @@ class DexManiRobot:
     def tare_tactile(self, *, cancel_requested):
         """Explicit idle-owner preparation; never HOME or move fingers for tare."""
         self.check()
-        if int(self.shared.safety_state.value) != int(SafetyState.ARMED):
+        if int(self.shared.safety_state) != int(SafetyState.ARMED):
             raise RuntimeError("tactile tare requires idle ARMED state")
         if self.hand is None:
             return False, False
@@ -165,11 +159,11 @@ class DexManiRobot:
             self.check()
             return bool(
                 cancel_requested()
-                or not self.shared.is_running.value
-                or self.shared.stop_request.value
-                or self.shared.estop_request.value
-                or self.shared.error_state.value
-                or self.shared.quit_requested.value
+                or not self.shared.sensors.is_running.value
+                or self.shared.stop_request
+                or self.shared.estop_request
+                or self.shared.error_state
+                or self.shared.quit_requested
             )
 
         self._last_hand = None
@@ -240,7 +234,7 @@ class DexManiRobot:
             arm = self.arm_feedback(q, v, effort)
             hand = self._read_hand()
         except Exception:
-            self.shared.error_state.value = True
+            self.shared.error_state = True
             revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
             raise
         self.check()
@@ -249,8 +243,8 @@ class DexManiRobot:
     def _authorized(self, command, state):
         self.check()
         return (
-            not self.shared.quit_requested.value
-            and not self.shared.stop_request.value
+            not self.shared.quit_requested
+            and not self.shared.stop_request
             and command_may_cross_sdk(
                 self.shared, run_id=command.run_id, required_safety_state=state
             )
@@ -434,7 +428,7 @@ class DexManiRobot:
         if self.arm is not None:
             self._arm_stopped = False
             try:
-                if self.shared.estop_request.value:
+                if self.shared.estop_request:
                     self.arm.emergency_stop()
                 else:
                     self.arm.stop()
@@ -449,7 +443,7 @@ class DexManiRobot:
             errors.append(RuntimeError("motion remains unresolved after disconnect"))
         if errors:
             self._motion_active = True
-            self.shared.error_state.value = True
+            self.shared.error_state = True
             revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
             raise RuntimeError(f"robot stop failures: {errors}") from errors[0]
         self._motion_active = False
@@ -458,10 +452,10 @@ class DexManiRobot:
         self._check_owner()
         self.check()
         if self._motion_active and (
-            self.shared.estop_request.value
-            or self.shared.error_state.value
-            or self.shared.quit_requested.value
-            or int(self.shared.safety_state.value) != int(SafetyState.RUNNING)
+            self.shared.estop_request
+            or self.shared.error_state
+            or self.shared.quit_requested
+            or int(self.shared.safety_state) != int(SafetyState.RUNNING)
         ):
             self.stop()
         now = time.monotonic_ns()
@@ -495,5 +489,5 @@ class DexManiRobot:
         self._connected = False
         if errors:
             self._motion_active = True
-            self.shared.error_state.value = True
+            self.shared.error_state = True
             raise RuntimeError(f"robot close failures: {errors}") from errors[0]

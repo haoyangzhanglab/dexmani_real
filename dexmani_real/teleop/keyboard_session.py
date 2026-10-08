@@ -1,11 +1,13 @@
 """Keyboard Cartesian jogging with persistent command targets."""
 
+import logging
 import multiprocessing as mp
 import os
 
 import numpy as np
 
-from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
+from dexmani_real.ipc.channels import SensorChannelsConfig
+from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_config
 from dexmani_real.robot.arm_homing import build_home_planner, home_robot
@@ -25,13 +27,15 @@ from dexmani_real.runtime.safety import (
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.teleop.config import validate_keyboard_workspace
 from dexmani_real.teleop.jog import compute_cartesian_jog_delta, propose_cartesian_jog_pose
-from dexmani_real.utils.log import get_logger
-from dexmani_real.utils.rate import LoopRate
 
-logger = get_logger(__name__)
+from dexmani_real.utils.rate import LoopRate
+from dexmani_real.utils.log import configure_logging
+
+logger = logging.getLogger(__name__)
 
 
 def run_keyboard_experiment(runtime, *, no_hand):
+    configure_logging()
     from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
 
     validate_robot_config(runtime)
@@ -41,9 +45,9 @@ def run_keyboard_experiment(runtime, *, no_hand):
     if not runtime.policy.hand_enabled and not no_hand:
         raise ValueError("hand-disabled operation requires --no-hand")
     ctx = mp.get_context("spawn")
-    shared = RuntimeChannels.create(
+    shared = RuntimeState.create(
         prefix=f"keyboard_{os.getpid()}",
-        config=RuntimeChannelsConfig.from_runtime(runtime),
+        config=SensorChannelsConfig.from_runtime(runtime),
         mp_context=ctx,
     )
     supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
@@ -51,13 +55,13 @@ def run_keyboard_experiment(runtime, *, no_hand):
 
     def request_quit():
         revoke_motion(shared, reason=RunEndReason.QUIT)
-        shared.quit_requested.value = True
+        shared.quit_requested = True
 
     keys = KeyboardInput(
         suppress_echo=True,
         quit_callback=request_quit,
         capture_commands=False,
-        estop_callback=lambda: setattr(shared.estop_request, "value", True),
+        estop_callback=lambda: setattr(shared, "estop_request", True),
     )
     cfg = runtime.keyboard_teleop
     workspace = runtime.policy.workspace.as_array()
@@ -85,11 +89,11 @@ def run_keyboard_experiment(runtime, *, no_hand):
         robot.check_services = lambda: supervisor.check() and keys.healthy
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         rate = LoopRate(cfg.control_hz, label="keyboard_teleop", busy_wait=False)
-        while shared.is_running.value and not shared.quit_requested.value and supervisor.check():
+        while shared.sensors.is_running.value and not shared.quit_requested and supervisor.check():
             rate.wait()
-            if shared.estop_request.value or shared.error_state.value or not keys.healthy:
+            if shared.estop_request or shared.error_state or not keys.healthy:
                 break
-            if shared.quit_requested.value or keys.is_pressed("q"):
+            if shared.quit_requested or keys.is_pressed("q"):
                 clean = True
                 break
             pressed = keys.is_pressed("r")
@@ -104,7 +108,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
                     home_planner,
                     robot=robot,
                     abort_requested=lambda: (
-                        bool(shared.estop_request.value or shared.quit_requested.value)
+                        bool(shared.estop_request or shared.quit_requested)
                         or not keys.healthy
                     ),
                 )
@@ -114,7 +118,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
             if row is None:
                 command_qpos = None
                 command_pose = None
-                if int(shared.safety_state.value) == int(SafetyState.RUNNING):
+                if int(shared.safety_state) == int(SafetyState.RUNNING):
                     revoke_motion(shared)
                     robot.stop()
                 continue
@@ -123,8 +127,8 @@ def run_keyboard_experiment(runtime, *, no_hand):
             if not moving or pressed:
                 # Idle keeps Mode-6 authority and its last dispatched endpoint alive.
                 continue
-            safety_state = int(shared.safety_state.value)
-            epoch = int(shared.run_id.value)
+            safety_state = int(shared.safety_state)
+            epoch = int(shared.run_id)
             measured_qpos = row.arm["qpos"][0]
             baseline_qpos = command_qpos
             baseline_pose = command_pose
@@ -154,13 +158,13 @@ def run_keyboard_experiment(runtime, *, no_hand):
             if safety_state == int(SafetyState.ARMED):
                 with shared.motion_lock:
                     # A revoke during IK must also fence the first jog proposal.
-                    if int(shared.run_id.value) != epoch:
+                    if int(shared.run_id) != epoch:
                         command_qpos = None
                         command_pose = None
                         continue
                     if not begin_motion(shared):
                         break
-                    epoch = int(shared.run_id.value)
+                    epoch = int(shared.run_id)
             target = result.qpos
             try:
                 robot.send_action(
@@ -176,12 +180,12 @@ def run_keyboard_experiment(runtime, *, no_hand):
                 continue
             command_pose = proposed_pose
             command_qpos = target.copy()
-        clean = clean or bool(shared.quit_requested.value)
+        clean = clean or bool(shared.quit_requested)
     except KeyboardInterrupt:
-        shared.estop_request.value = True
+        shared.estop_request = True
         raise
     except Exception as exc:
-        shared.error_state.value = True
+        shared.error_state = True
         revoke_motion(
             shared,
             reason=RunEndReason.HARDWARE_FAULT
@@ -195,5 +199,5 @@ def run_keyboard_experiment(runtime, *, no_hand):
             robot, supervisor, keyboard=keys, timeout_s=runtime.safety.shutdown_timeout_s
         )
     return int(
-        not clean or not shutdown_clean or shared.error_state.value or shared.estop_request.value
+        not clean or not shutdown_clean or shared.error_state or shared.estop_request
     )

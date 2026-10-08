@@ -1,7 +1,6 @@
 """One current copied observation per control step; local rows own temporal history."""
 
 import time
-from collections import deque
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
@@ -33,7 +32,7 @@ def feedback_deadline_ns(row, runtime, *, include_vr=False):
 
 
 def read_vr_frame(shared):
-    result = shared.vr_ring.read_latest()
+    result = shared.sensors.vr_ring.read_latest()
     if result is None:
         return None
     record = result[0][0]
@@ -44,23 +43,20 @@ def read_vr_frame(shared):
 
 
 def read_camera_frame(shared, sequence=None):
-    if sequence is None:
-        result = shared.camera_ring.read_latest()
-        if result is None:
-            return None
-        header, rgb, depth, sequence = result
-    else:
-        result = shared.camera_ring.read_sequence(sequence)
-        if result is None:
-            return None
-        header, rgb, depth = result["header"], result["rgb"], result["depth"]
+    ring = shared.sensors.camera_ring
+    result = ring.read_latest_uncached() if sequence is None else ring.read_sequence(sequence)
+    if result is None:
+        return None
+    data, _publication_ns, sequence = result
+    frame = data[0]
+    header = frame["header"]
     return {
-        "rgb": rgb,
-        "depth": depth,
+        "rgb": frame["rgb"],
+        "depth": frame["depth"],
         "ring_sequence": sequence,
-        "timestamp_ns": int(header["timestamp_ns"][0]),
-        "depth_frame_number": int(header["depth_frame_number"][0]),
-        "color_frame_number": int(header["color_frame_number"][0]),
+        "timestamp_ns": int(header["timestamp_ns"]),
+        "depth_frame_number": int(header["depth_frame_number"]),
+        "color_frame_number": int(header["color_frame_number"]),
     }
 
 
@@ -99,7 +95,7 @@ def read_observation(
     if state is None:
         return None
     arm, hand = state.arm, state.hand if require_hand else None
-    cloud_result = shared.pointcloud_ring.read_latest() if require_pointcloud else None
+    cloud_result = shared.sensors.pointcloud_ring.read_latest() if require_pointcloud else None
     if (
         arm is None
         or (require_hand and hand is None)
@@ -149,17 +145,3 @@ def read_observation(
         int(cloud["timestamp_ns"]) if cloud is not None else 0,
         int(cloud["source_camera_sequence"]) if cloud is not None else 0,
     )
-
-
-class ObservationHistory:
-    def __init__(self, n_obs_steps):
-        self.rows = deque(maxlen=n_obs_steps)
-
-    def clear(self):
-        self.rows.clear()
-
-    def append(self, row):
-        self.rows.append(row)
-
-    def ready_rows(self):
-        return tuple(self.rows) if len(self.rows) == self.rows.maxlen else ()

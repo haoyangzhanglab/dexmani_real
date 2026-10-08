@@ -400,10 +400,12 @@ class CameraParams:
         return (self.height, self.width)
 
     def validate(self) -> None:
-        if self.width <= 0 or self.height <= 0 or not np.isfinite(self.fps) or self.fps <= 0:
-            raise ValueError("camera width, height, and fps must be > 0")
-        if self.warmup_frames < 0:
-            raise ValueError("camera warmup_frames must be >= 0")
+        for name in ("width", "height", "fps", "frame_queue_capacity", "ring_maxlen"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"camera {name} must be a positive integer")
+        if type(self.warmup_frames) is not int or self.warmup_frames < 0:
+            raise ValueError("camera warmup_frames must be a nonnegative integer")
         if (
             not np.isfinite(self.source_stall_timeout_s)
             or self.source_stall_timeout_s <= self.max_frame_age_s
@@ -423,7 +425,7 @@ class CameraParams:
             or not 0 <= self.l515_confidence_threshold <= 3
         ):
             raise ValueError("camera l515_confidence_threshold must be in [0, 3] or null")
-        if self.frame_queue_capacity <= 0 or self.ring_maxlen <= 0:
-            raise ValueError("camera ring and writer capacities must be > 0")
-        if self.serial is not None and not self.serial:
-            raise ValueError("camera serial must be non-empty when configured")
+        if self.serial is not None and (
+            not isinstance(self.serial, str) or not self.serial.strip()
+        ):
+            raise ValueError("camera serial must be a non-empty string or None")

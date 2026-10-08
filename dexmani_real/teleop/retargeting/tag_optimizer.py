@@ -10,6 +10,7 @@ Stage 2 (SLSQP): pinch refinement — conditional on finger-to-thumb proximity.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
@@ -25,9 +26,9 @@ from dexmani_real.teleop.retargeting.retargeter import (
     adaptive_retargeting_xhand,
     validate_landmarks,
 )
-from dexmani_real.utils.log import ThrottledWarner, get_logger
+from dexmani_real.utils.log import ThrottledWarner
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class HandOptimizer:
@@ -320,9 +321,8 @@ class TAGHandRetargeter:
 
         # Pinocchio and SDK use different joint orders.
         model_names = list(model.names[2:])  # skip "universe" and "root_joint"
-        self.sdk_joint_names = XHAND_SDK_JOINT_NAMES
         self._mapping_model_to_sdk = np.array(
-            [model_names.index(name) for name in self.sdk_joint_names], dtype=np.intp
+            [model_names.index(name) for name in XHAND_SDK_JOINT_NAMES], dtype=np.intp
         )
         self._mapping_sdk_to_model = np.argsort(self._mapping_model_to_sdk)
 

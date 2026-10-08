@@ -1,5 +1,6 @@
 """Operator-supervised teleop with one current observation per real control step."""
 
+import logging
 import time
 from concurrent.futures import CancelledError
 
@@ -11,11 +12,10 @@ from dexmani_real.runtime.observation import read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.safety import RunEndReason, SafetyState, begin_motion, revoke_motion
 from dexmani_real.teleop.audio_feedback import AudioFeedback
-from dexmani_real.teleop.config import TeleopConfig
 from dexmani_real.teleop.control.controller import execute_control_step
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 _DEBUG_FAILURE_LIMIT = 10
 _END_AUDIO_GRACE_S = 3.0
 
@@ -26,9 +26,10 @@ class TeleopRunner:
     def __init__(
         self,
         shared,
-        config: TeleopConfig,
+        runtime,
         robot,
         *,
+        task_label,
         controller,
         home_planner,
         start_vr,
@@ -39,11 +40,11 @@ class TeleopRunner:
         self.robot = robot
         self.start_vr = start_vr
         self.camera_calibration = camera_calibration
-        self.config = config
-        self.runtime = config.runtime
+        self.task_label = task_label
+        self.runtime = runtime
         self.recorder = recorder
         self.keyboard = KeyboardInput(
-            estop_callback=lambda: setattr(shared.estop_request, "value", True),
+            estop_callback=lambda: setattr(shared, "estop_request", True),
             stop_callback=lambda: revoke_motion(shared, reason=RunEndReason.OPERATOR),
             quit_callback=lambda: revoke_motion(shared, reason=RunEndReason.QUIT),
         )
@@ -68,9 +69,9 @@ class TeleopRunner:
         with self.shared.motion_lock:
             if (
                 self.control_run_id is not None
-                and int(self.shared.run_ended_id.value) == self.control_run_id
+                and int(self.shared.run_ended_id) == self.control_run_id
             ):
-                return RunEndReason(int(self.shared.run_ended_reason.value)).name.lower()
+                return RunEndReason(int(self.shared.run_ended_reason)).name.lower()
         return fallback
 
     def _stop_motion(self, stage):
@@ -126,10 +127,10 @@ class TeleopRunner:
                 aborted = True
         return bool(
             aborted
-            or self.shared.estop_request.value
-            or self.shared.error_state.value
-            or self.shared.quit_requested.value
-            or not self.shared.is_running.value
+            or self.shared.estop_request
+            or self.shared.error_state
+            or self.shared.quit_requested
+            or not self.shared.sensors.is_running.value
         )
 
     def _start_segment(self):
@@ -154,7 +155,7 @@ class TeleopRunner:
         self.control_run_id = None
         if self.recorder is not None:
             self.recorder.start_episode(
-                task_label=self.config.task_label,
+                task_label=self.task_label,
                 **snapshot_recording_metadata(
                     self.shared,
                     self.runtime,
@@ -172,15 +173,15 @@ class TeleopRunner:
 
     def _handle_operator_command(self, cmd, *, home_commands=()) -> bool:
         if cmd is OperatorCommand.EMERGENCY_STOP:
-            self.shared.estop_request.value = True
+            self.shared.estop_request = True
             revoke_motion(self.shared, reason=RunEndReason.ESTOP)
             self.audio.play("emergency")
             return True
         if (
-            self.shared.estop_request.value
-            or self.shared.error_state.value
-            or self.shared.quit_requested.value
-            or not self.shared.is_running.value
+            self.shared.estop_request
+            or self.shared.error_state
+            or self.shared.quit_requested
+            or not self.shared.sensors.is_running.value
         ):
             return True
         if cmd is OperatorCommand.QUIT:
@@ -190,7 +191,7 @@ class TeleopRunner:
                 if has_capture:
                     self._finish_capture(True, "quit", announce=False)
                 self.audio.play("end")
-                self.shared.quit_requested.value = True
+                self.shared.quit_requested = True
                 return True
             self.quit_pending = True
             self.audio.play("quit")
@@ -203,7 +204,7 @@ class TeleopRunner:
                 self.resume_requested
                 or (self.active and not self.paused)
                 or (self.recorder is not None and self.recorder.is_recording)
-                or int(self.shared.safety_state.value) != int(SafetyState.ARMED)
+                or int(self.shared.safety_state) != int(SafetyState.ARMED)
             ):
                 logger.warning("T ignored: tactile tare requires idle, no capture or preparation")
                 return False
@@ -252,16 +253,16 @@ class TeleopRunner:
                 else row.observation_timestamp_ns,
             )
         ):
-            epoch = int(self.shared.run_id.value)
+            epoch = int(self.shared.run_id)
             prepared = self.controller.reset_reference(row)
             with self.shared.motion_lock:
                 authorized = (
                     prepared
-                    and epoch == int(self.shared.run_id.value)
+                    and epoch == int(self.shared.run_id)
                     and begin_motion(self.shared)
                 )
                 if authorized:
-                    self.control_run_id = int(self.shared.run_id.value)
+                    self.control_run_id = int(self.shared.run_id)
             if authorized:
                 event = "resume" if self.active else "begin"
                 self.active = True
@@ -309,11 +310,11 @@ class TeleopRunner:
         deadline = time.monotonic() + self.runtime.safety.readiness_timeouts_s["vr"]
         while True:
             if not self.keyboard.healthy:
-                self.shared.estop_request.value = True
+                self.shared.estop_request = True
             if self._poll_blocking_commands():
                 return False
             self.robot.service_idle()
-            if self.shared.vr_ready.wait(timeout=0.05):
+            if self.shared.sensors.vr_ready.wait(timeout=0.05):
                 # Consume startup keystrokes before accepting a new B after readiness.
                 return not self._poll_blocking_commands()
             if time.monotonic() >= deadline:
@@ -329,7 +330,7 @@ class TeleopRunner:
         )
         if not home_result.ok:
             if home_result.interrupted:
-                self.shared.quit_requested.value = True
+                self.shared.quit_requested = True
                 return False
             raise RuntimeError(f"startup hand home failed: {home_result.reason}")
         if self._poll_blocking_commands():
@@ -443,15 +444,15 @@ class TeleopRunner:
                 (check_services is None or check_services()) and self.keyboard.healthy
             )
             ready = self._initialize()
-            while ready and self.shared.is_running.value and not self.shared.quit_requested.value:
+            while ready and self.shared.sensors.is_running.value and not self.shared.quit_requested:
                 self.robot.check()
                 if not self.active or self.paused:
                     self.robot.service_idle()
                 if not self.keyboard.healthy:
-                    self.shared.estop_request.value = True
-                if self.shared.estop_request.value or self.shared.error_state.value:
+                    self.shared.estop_request = True
+                if self.shared.estop_request or self.shared.error_state:
                     self._stop_capture(
-                        "estop" if self.shared.estop_request.value else "runtime_failure"
+                        "estop" if self.shared.estop_request else "runtime_failure"
                     )
                     break
                 if self.recorder is not None:
@@ -481,12 +482,12 @@ class TeleopRunner:
                     ):
                         break
                 if (
-                    self.shared.estop_request.value
-                    or self.shared.error_state.value
-                    or not self.shared.is_running.value
+                    self.shared.estop_request
+                    or self.shared.error_state
+                    or not self.shared.sensors.is_running.value
                 ):
                     break
-                if self.shared.quit_requested.value or (
+                if self.shared.quit_requested or (
                     not self.resume_requested and (not self.active or self.paused)
                 ):
                     continue
@@ -494,13 +495,13 @@ class TeleopRunner:
                     continue
                 self._run_control_tick()
         except KeyboardInterrupt:
-            self.shared.estop_request.value = True
+            self.shared.estop_request = True
             revoke_motion(self.shared, reason=RunEndReason.ESTOP)
             raise
         except Exception as exc:
             failure = exc
-            self.shared.error_state.value = True
-            self.shared.is_running.value = False
+            self.shared.error_state = True
+            self.shared.sensors.is_running.value = False
             revoke_motion(
                 self.shared,
                 reason=RunEndReason.RECORDING_FAILURE

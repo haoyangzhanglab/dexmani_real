@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, cast
 
 __all__ = [
     "RealSenseCamera",
-    "RealSenseCameraConfig",
     "RGBDFrame",
-    "L515DepthConfig",
 ]
 
 import numpy as np
@@ -18,9 +17,9 @@ import pyrealsense2 as rs
 
 from dexmani_real.config.hardware import CameraParams
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 _L515_OPTION_NAMES = (
@@ -35,148 +34,37 @@ _L515_OPTION_NAMES = (
 
 
 @dataclass(frozen=True)
-class L515DepthConfig:
-    """Evidence-bounded L515 settings applied after pipeline start.
-
-    The selected factory preset owns laser, gain, noise, sharpening, zero-order,
-    and invalidation behavior. Confidence is the only optional production
-    override and remains preset-owned when ``None``.
-    """
-
-    visual_preset: int = 5  # L500 Short Range preset.
-    confidence_threshold: int | None = None
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.visual_preset, int)
-            or isinstance(self.visual_preset, bool)
-            or not 0 <= self.visual_preset <= 5
-        ):
-            raise ValueError("L515 visual_preset must be an integer in [0, 5]")
-        if self.confidence_threshold is not None and (
-            not isinstance(self.confidence_threshold, int)
-            or isinstance(self.confidence_threshold, bool)
-            or not 0 <= self.confidence_threshold <= 3
-        ):
-            raise ValueError("L515 confidence_threshold must be in [0, 3] or None")
-
-
-@dataclass(frozen=True)
-class RealSenseCameraConfig:
-    camera_name: str = "realsense"
-    serial: str | None = None
-    depth_resolution: tuple[int, int] = (640, 480)
-    color_resolution: tuple[int, int] = (640, 480)
-    fps: int = 30
-    enable_color: bool = True
-    enable_global_time: bool = True
-    warmup_frames: int = 10
-    frame_queue_capacity: int = 2
-    l515_depth_config: L515DepthConfig | None = field(default_factory=L515DepthConfig)
-    # 0.0 = OFF (default): keep the requested fps instead of letting Auto
-    # Exposure extend exposure and reduce RGB FPS in a dark scene.
-    # None leaves the device default unchanged.
-    auto_exposure_priority: float | None = 0.0
-
-    @classmethod
-    def from_camera_params(cls, params: CameraParams) -> RealSenseCameraConfig:
-        """Translate the experiment's camera settings without opening a device."""
-        params.validate()
-        return cls(
-            serial=params.serial,
-            depth_resolution=(params.width, params.height),
-            color_resolution=(params.width, params.height),
-            fps=params.fps,
-            warmup_frames=params.warmup_frames,
-            frame_queue_capacity=params.frame_queue_capacity,
-            l515_depth_config=L515DepthConfig(
-                visual_preset=params.l515_visual_preset,
-                confidence_threshold=params.l515_confidence_threshold,
-            ),
-        )
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.camera_name, str) or not self.camera_name.strip():
-            raise ValueError("camera_name must be a non-empty string")
-        if self.serial is not None and (
-            not isinstance(self.serial, str) or not self.serial.strip()
-        ):
-            raise ValueError("serial must be a non-empty string or None")
-        for name in ("depth_resolution", "color_resolution"):
-            resolution = getattr(self, name)
-            if (
-                not isinstance(resolution, tuple)
-                or len(resolution) != 2
-                or any(
-                    isinstance(value, bool) or not isinstance(value, int) or value <= 0
-                    for value in resolution
-                )
-            ):
-                raise ValueError(f"{name} must contain two positive integers")
-        if isinstance(self.fps, bool) or not isinstance(self.fps, int) or self.fps <= 0:
-            raise ValueError("fps must be a positive integer")
-        if (
-            isinstance(self.warmup_frames, bool)
-            or not isinstance(self.warmup_frames, int)
-            or self.warmup_frames < 0
-        ):
-            raise ValueError("warmup_frames must be a non-negative integer")
-        if (
-            isinstance(self.frame_queue_capacity, bool)
-            or not isinstance(self.frame_queue_capacity, int)
-            or self.frame_queue_capacity <= 0
-        ):
-            raise ValueError("frame_queue_capacity must be a positive integer")
-        if not isinstance(self.enable_color, bool) or not isinstance(self.enable_global_time, bool):
-            raise TypeError("enable_color and enable_global_time must be boolean")
-        if self.enable_color and self.depth_resolution != self.color_resolution:
-            raise ValueError(
-                "depth_resolution and color_resolution must match when "
-                "depth_to_color alignment is enabled"
-            )
-        if self.l515_depth_config is not None and not isinstance(
-            self.l515_depth_config, L515DepthConfig
-        ):
-            raise TypeError("l515_depth_config must be L515DepthConfig or None")
-        if self.auto_exposure_priority is not None and (
-            isinstance(self.auto_exposure_priority, bool)
-            or not isinstance(self.auto_exposure_priority, (int, float))
-            or not np.isfinite(self.auto_exposure_priority)
-            or not 0.0 <= self.auto_exposure_priority <= 1.0
-        ):
-            raise ValueError("auto_exposure_priority must be None or a finite value in [0, 1]")
-
-
-@dataclass(frozen=True)
 class RGBDFrame:
-    rgb: np.ndarray | None
+    rgb: np.ndarray
     # Native depth is retained for measurement provenance. Production point
     # clouds use the aligned payload with ``geometry.aligned_depth_to_color``.
-    depth: np.ndarray
     depth_raw: np.ndarray
     # ``rs.align(depth -> color)`` samples are deprojected with color intrinsics
     # and transformed from the color-camera frame.
-    depth_aligned_to_color: np.ndarray | None
     depth_aligned_to_color_raw: np.ndarray | None
-    alignment_elapsed_ns: int
-    host_time: float
-    wait_return_monotonic_ns: int
     depth_frame_number: int
-    color_frame_number: int | None
+    color_frame_number: int
     depth_device_timestamp_s: float
-    color_device_timestamp_s: float | None
+    color_device_timestamp_s: float
     depth_timestamp_domain: int
-    color_timestamp_domain: int | None
+    color_timestamp_domain: int
     timestamp_ns: int
-    frame_id: int
     depth_scale: float
-    camera_name: str
     serial: str | None
 
 
 class RealSenseCamera:
-    def __init__(self, config: RealSenseCameraConfig = RealSenseCameraConfig()) -> None:
+    def __init__(self, config: CameraParams, *, auto_exposure_priority: float | None = 0.0) -> None:
+        config.validate()
+        if auto_exposure_priority is not None and (
+            isinstance(auto_exposure_priority, bool)
+            or not isinstance(auto_exposure_priority, (int, float))
+            or not np.isfinite(auto_exposure_priority)
+            or not 0.0 <= auto_exposure_priority <= 1.0
+        ):
+            raise ValueError("auto_exposure_priority must be None or a finite value in [0, 1]")
         self.config = config
+        self.auto_exposure_priority = auto_exposure_priority
         self.context = None
         self.active_serial: str | None = config.serial
         self.active_is_l515 = False
@@ -188,7 +76,6 @@ class RealSenseCamera:
         self.depth_scale: float | None = None
         self.geometry: RGBDGeometry | None = None
         self._depth_to_color_aligner: rs.align | None = None
-        self.frame_id = 0
 
     def connect(self) -> bool:
         """Open the pipeline; return True on success or if already connected."""
@@ -246,49 +133,47 @@ class RealSenseCamera:
 
     def _apply_l515_depth_config(self) -> None:
         """Apply one factory preset and an optional confidence override."""
-        cfg = self.config.l515_depth_config
-        if cfg is None:
-            return
+        cfg = self.config
 
         if self.profile is None:
             raise RuntimeError("RealSense profile is unavailable for L515 settings")
         sensor = self.profile.get_device().first_depth_sensor()
         if not sensor.supports(rs.option.visual_preset):
             raise RuntimeError("connected L515 does not expose visual_preset")
-        sensor.set_option(rs.option.visual_preset, float(cfg.visual_preset))
+        sensor.set_option(rs.option.visual_preset, float(cfg.l515_visual_preset))
         time.sleep(0.5)
         base_readbacks = self._read_l515_option_snapshot(sensor)
         base_preset = base_readbacks["visual_preset"]
-        if base_preset is None or not np.isclose(base_preset, float(cfg.visual_preset), atol=1e-6):
+        if base_preset is None or not np.isclose(base_preset, float(cfg.l515_visual_preset), atol=1e-6):
             raise RuntimeError(
                 "L515 visual preset readback mismatch: "
-                f"requested={cfg.visual_preset}, actual={base_preset}"
+                f"requested={cfg.l515_visual_preset}, actual={base_preset}"
             )
 
-        if cfg.confidence_threshold is not None:
+        if cfg.l515_confidence_threshold is not None:
             if not sensor.supports(rs.option.confidence_threshold):
                 raise RuntimeError(
                     "configured L515 confidence override is unsupported by this device"
                 )
             sensor.set_option(
                 rs.option.confidence_threshold,
-                float(cfg.confidence_threshold),
+                float(cfg.l515_confidence_threshold),
             )
 
         final_readbacks = self._read_l515_option_snapshot(sensor)
         final_confidence = final_readbacks["confidence_threshold"]
-        if cfg.confidence_threshold is not None and (
+        if cfg.l515_confidence_threshold is not None and (
             final_confidence is None
-            or not np.isclose(final_confidence, float(cfg.confidence_threshold), atol=1e-6)
+            or not np.isclose(final_confidence, float(cfg.l515_confidence_threshold), atol=1e-6)
         ):
             raise RuntimeError(
                 "L515 confidence readback mismatch: "
-                f"requested={cfg.confidence_threshold}, actual={final_confidence}"
+                f"requested={cfg.l515_confidence_threshold}, actual={final_confidence}"
             )
         option_snapshot = {
-            "base_visual_preset": int(cfg.visual_preset),
+            "base_visual_preset": int(cfg.l515_visual_preset),
             "base_readbacks": base_readbacks,
-            "confidence_override": cfg.confidence_threshold,
+            "confidence_override": cfg.l515_confidence_threshold,
             "final_readbacks": final_readbacks,
         }
         logger.debug("L515 depth option snapshot: %s", option_snapshot)
@@ -330,7 +215,7 @@ class RealSenseCamera:
         Priority 0 caps auto exposure at the frame period to preserve FPS;
         it does not disable auto exposure. None leaves the device default.
         """
-        priority = self.config.auto_exposure_priority
+        priority = self.auto_exposure_priority
         if priority is None:
             return
         try:
@@ -373,10 +258,7 @@ class RealSenseCamera:
         self.set_global_time()
         self.depth_scale = float(self.profile.get_device().first_depth_sensor().get_depth_scale())
         self.update_geometry_from_profile()
-        self._depth_to_color_aligner = (
-            rs.align(rs.stream.color) if self.config.enable_color else None
-        )
-        self.frame_id = 0
+        self._depth_to_color_aligner = rs.align(rs.stream.color)
 
     def _apply_d400_depth_config(self) -> None:
         """Apply D400 depth settings after pipeline start.
@@ -434,7 +316,7 @@ class RealSenseCamera:
             try:
                 for _ in range(warmup_frames):
                     # Initialize alignment and image copies before live publication.
-                    self.read(timeout_ms=5000, compute_depth=False)
+                    self.read(timeout_ms=5000)
                 return
             except RuntimeError:
                 if attempt >= max_restarts:
@@ -474,26 +356,24 @@ class RealSenseCamera:
             self._depth_to_color_aligner = None
 
     def create_rs_config(self) -> rs.config:
-        depth_width, depth_height = self.config.depth_resolution
-        color_width, color_height = self.config.color_resolution
+        width, height = self.config.width, self.config.height
 
         rs_config = rs.config()
         rs_config.enable_device(self.active_serial)
         rs_config.enable_stream(
-            rs.stream.depth, depth_width, depth_height, rs.format.z16, self.config.fps
+            rs.stream.depth, width, height, rs.format.z16, self.config.fps
         )
-        if self.config.enable_color:
-            rs_config.enable_stream(
-                rs.stream.color,
-                color_width,
-                color_height,
-                rs.format.bgr8,
-                self.config.fps,
-            )
+        rs_config.enable_stream(
+            rs.stream.color,
+            width,
+            height,
+            rs.format.bgr8,
+            self.config.fps,
+        )
         return rs_config
 
     def set_global_time(self) -> None:
-        if not self.config.enable_global_time or self.profile is None:
+        if self.profile is None:
             return
         for sensor in self.profile.get_device().query_sensors():
             try:
@@ -547,9 +427,6 @@ class RealSenseCamera:
         """Read immutable native stream calibration from the active profile."""
         if self.profile is None:
             raise RuntimeError("RealSense is not connected.")
-        if not self.config.enable_color:
-            self.geometry = None
-            return
         depth_profile = self.profile.get_stream(rs.stream.depth).as_video_stream_profile()
         color_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
         self.geometry = RGBDGeometry(
@@ -560,7 +437,7 @@ class RealSenseCamera:
             ),
         )
 
-    def read(self, timeout_ms: int = 5000, *, compute_depth: bool = True) -> RGBDFrame:
+    def read(self, timeout_ms: int = 5000) -> RGBDFrame:
         if self.pipeline is None or self.frame_queue is None:
             raise RuntimeError("RealSense is not connected. Call connect() first.")
         if self.depth_scale is None:
@@ -575,21 +452,17 @@ class RealSenseCamera:
         frames = queued_frame.as_frameset()
         if not frames:
             raise RuntimeError("RealSense frame queue returned a non-frameset frame.")
-        host_time = time.time()
         depth_frame = frames.get_depth_frame()
-        color_frame = frames.get_color_frame() if self.config.enable_color else None
+        color_frame = frames.get_color_frame()
         if not depth_frame:
             raise RuntimeError("Failed to get depth frame.")
-        if self.config.enable_color and not color_frame:
+        if not color_frame:
             raise RuntimeError("Failed to get color frame.")
 
         aligned_depth_raw: np.ndarray | None = None
-        alignment_elapsed_ns = 0
         if self._depth_to_color_aligner is not None:
-            alignment_start_ns = time.monotonic_ns()
             aligned_frames = self._depth_to_color_aligner.process(frames)
             aligned_depth_frame = aligned_frames.get_depth_frame()
-            alignment_elapsed_ns = time.monotonic_ns() - alignment_start_ns
             if not aligned_depth_frame:
                 raise RuntimeError("Failed to align depth to the color stream.")
             aligned_depth_raw = np.array(
@@ -599,51 +472,31 @@ class RealSenseCamera:
         # ``ascontiguousarray`` may return an SDK-backed view. Use ``array``
         # with copy=True because the frame becomes invalid after this method.
         depth_raw = np.array(depth_frame.get_data(), dtype=np.uint16, copy=True, order="C")
-        if compute_depth:
-            depth: np.ndarray = depth_raw.astype(np.float32) * float(self.depth_scale)
-            depth_aligned_to_color = (
-                None
-                if aligned_depth_raw is None
-                else aligned_depth_raw.astype(np.float32) * float(self.depth_scale)
-            )
-        else:
-            depth = depth_raw  # shared-memory path keeps raw depth
-            depth_aligned_to_color = aligned_depth_raw
 
-        rgb = None
-        if color_frame is not None:
-            bgr = np.array(color_frame.get_data(), dtype=np.uint8, copy=True, order="C")
-            rgb = np.ascontiguousarray(bgr[..., ::-1].copy())
+        # The frame keeps the SDK buffer alive until this owned RGB copy completes.
+        bgr = np.asarray(color_frame.get_data(), dtype=np.uint8)
+        rgb = np.array(bgr[..., ::-1], dtype=np.uint8, copy=True, order="C")
 
         # Preserve the device-provided frame number.  Unlike a local counter,
         # this exposes device/pipeline stalls and dropped frames end-to-end.
-        self.frame_id = int(depth_frame.get_frame_number())
+        depth_frame_number = int(depth_frame.get_frame_number())
         depth_timestamp_s = float(depth_frame.get_timestamp()) * 1e-3
         depth_timestamp_domain = int(depth_frame.get_frame_timestamp_domain())
-        color_timestamp_s = float(color_frame.get_timestamp()) * 1e-3 if color_frame else None
-        color_timestamp_domain = (
-            int(color_frame.get_frame_timestamp_domain()) if color_frame else None
-        )
-        color_frame_number = int(color_frame.get_frame_number()) if color_frame else None
+        color_timestamp_s = float(color_frame.get_timestamp()) * 1e-3
+        color_timestamp_domain = int(color_frame.get_frame_timestamp_domain())
+        color_frame_number = int(color_frame.get_frame_number())
         frame = RGBDFrame(
             rgb=rgb,
-            depth=depth,
             depth_raw=depth_raw,
-            depth_aligned_to_color=depth_aligned_to_color,
             depth_aligned_to_color_raw=aligned_depth_raw,
-            alignment_elapsed_ns=alignment_elapsed_ns,
-            host_time=host_time,
-            wait_return_monotonic_ns=wait_return_monotonic_ns,
-            depth_frame_number=self.frame_id,
+            depth_frame_number=depth_frame_number,
             color_frame_number=color_frame_number,
             depth_device_timestamp_s=depth_timestamp_s,
             color_device_timestamp_s=color_timestamp_s,
             depth_timestamp_domain=depth_timestamp_domain,
             color_timestamp_domain=color_timestamp_domain,
             timestamp_ns=wait_return_monotonic_ns,
-            frame_id=self.frame_id,
             depth_scale=float(self.depth_scale),
-            camera_name=self.config.camera_name,
             serial=self.active_serial,
         )
 

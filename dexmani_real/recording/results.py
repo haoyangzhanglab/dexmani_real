@@ -1,5 +1,6 @@
 """Small owner-thread result records outside immutable Raw episodes."""
 
+import logging
 import time
 import uuid
 from copy import deepcopy
@@ -9,9 +10,9 @@ from pathlib import Path
 import numpy as np
 
 from dexmani_real.utils.atomic_io import atomic_json_dump
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now():

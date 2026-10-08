@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 from dataclasses import dataclass, field
 from typing import Any
@@ -9,22 +10,19 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.hardware import CameraParams
-from dexmani_real.ipc.camera_ring import CameraRingBuffer
 from dexmani_real.ipc.ring import SharedMemoryRingBuffer
 from dexmani_real.ipc.schema import (
     VR_FRAME_DTYPE,
+    make_camera_frame_dtype,
     make_pointcloud_frame_dtype,
 )
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
 
-# Wire value of runtime.safety.SafetyState.DISARMED.
-DISARMED_SAFETY_STATE_WIRE_VALUE = 0
+logger = logging.getLogger(__name__)
 
 
 @dataclass
-class RuntimeChannelsConfig:
+class SensorChannelsConfig:
     """Sensor ring capacities and camera resolution defaults."""
 
     camera: bool = False
@@ -51,38 +49,33 @@ class RuntimeChannelsConfig:
             )
             if enabled
         )
-        if any(int(value) <= 0 for value in capacities):
-            raise ValueError("RuntimeChannels ring capacities must be positive")
+        if any(type(value) is not int or value <= 0 for value in capacities):
+            raise ValueError("sensor ring capacities must be positive integers")
         if self.pointcloud and (
             isinstance(self.pointcloud_num_points, bool)
             or not isinstance(self.pointcloud_num_points, (int, np.integer))
             or self.pointcloud_num_points <= 0
         ):
-            raise ValueError("RuntimeChannels pointcloud_num_points must be a positive integer")
+            raise ValueError("SensorChannels pointcloud_num_points must be a positive integer")
 
     @classmethod
     def from_runtime(
         cls,
         runtime: object,
         *,
-        pointcloud_num_points: int | None = None,
         camera: bool = False,
         vr: bool = False,
         pointcloud: bool = False,
-    ) -> "RuntimeChannelsConfig":
+    ) -> "SensorChannelsConfig":
         cam = runtime.camera
         return cls(
             camera=camera,
             vr=vr,
             pointcloud=pointcloud,
-            camera_ring_maxlen=int(cam.ring_maxlen),
-            camera_rgb_shape=(int(cam.height), int(cam.width), 3),
-            camera_depth_shape=(int(cam.height), int(cam.width)),
-            pointcloud_num_points=(
-                runtime.pointcloud.num_points
-                if pointcloud_num_points is None
-                else pointcloud_num_points
-            ),
+            camera_ring_maxlen=cam.ring_maxlen,
+            camera_rgb_shape=cam.rgb_shape,
+            camera_depth_shape=cam.depth_shape,
+            pointcloud_num_points=runtime.pointcloud.num_points,
         )
 
 
@@ -94,30 +87,14 @@ _RING_RESOURCE_NAMES = (
 
 
 @dataclass
-class RuntimeChannels:
-    """Runtime channels created in Main before spawning child processes."""
+class SensorChannels:
+    """Main-owned sensor IPC; workers attach without unlinking."""
 
-    camera_ring: CameraRingBuffer | None  # camera -> local observation consumers
+    camera_ring: SharedMemoryRingBuffer | None  # camera -> local observation consumers
     vr_ring: SharedMemoryRingBuffer | None  # VR -> local teleop/calibration
     pointcloud_ring: SharedMemoryRingBuffer | None  # pointcloud worker -> local policy
 
-    run_id: Any  # advancing the epoch invalidates pending motion commands
-    # Latest software RUNNING termination; written under motion_lock.
-    run_ended_id: Any
-    run_ended_reason: Any
-
-    is_running: Any  # session lifetime, shared with sensors
-    # Sticky runtime/safety fault: supervision takes the FAULT shutdown path.
-    error_state: Any
-    estop_request: Any  # sticky emergency-stop request
-    quit_requested: Any  # operator or episode budget requests session exit
-    start_request: Any  # operator -> local policy runner: B
-    # Operator -> local policy runner: S request.
-    stop_request: Any
-
-    safety_state: Any  # SafetyState enum (0-3), guarded by motion_lock
-    # Serializes motion permissions; never held across hardware SDK calls.
-    motion_lock: Any
+    is_running: Any  # session lifetime, shared with sensor workers
 
     vr_ready: Any
     camera_ready: Any
@@ -133,14 +110,11 @@ class RuntimeChannels:
         cls,
         prefix: str = "dexmani",
         *,
-        config: RuntimeChannelsConfig | None = None,
+        config: SensorChannelsConfig | None = None,
         mp_context: Any | None = None,
-    ) -> "RuntimeChannels":
-        """Create sensor rings, flags, and events.
-
-        Call once from Main before spawning child processes.
-        """
-        cfg = config or RuntimeChannelsConfig()
+    ) -> "SensorChannels":
+        """Allocate before spawn, rolling back partially allocated rings on failure."""
+        cfg = config or SensorChannelsConfig()
         ctx = mp_context or mp.get_context("spawn")
 
         storage = cls.__new__(cls)
@@ -151,31 +125,30 @@ class RuntimeChannels:
             try:
                 cleanup_succeeded = storage.close()
             except BaseException:
-                logger.critical("RuntimeChannels allocation rollback raised", exc_info=True)
+                logger.critical("SensorChannels allocation rollback raised", exc_info=True)
                 raise RuntimeError(
-                    "RuntimeChannels allocation failed and rollback raised"
+                    "SensorChannels allocation failed and rollback raised"
                 ) from allocation_error
             if not cleanup_succeeded:
                 raise RuntimeError(
-                    "RuntimeChannels allocation failed and rollback was incomplete"
+                    "SensorChannels allocation failed and rollback was incomplete"
                 ) from allocation_error
             raise
 
-        logger.debug("RuntimeChannels created (prefix=%s)", prefix)
+        logger.debug("SensorChannels created (prefix=%s)", prefix)
         return storage
 
     @staticmethod
     def _allocate_resources(
-        storage: "RuntimeChannels",
+        storage: "SensorChannels",
         prefix: str,
-        cfg: RuntimeChannelsConfig,
+        cfg: SensorChannelsConfig,
         ctx: Any,
     ) -> None:
         storage.camera_ring = (
-            CameraRingBuffer(
+            SharedMemoryRingBuffer(
                 name=f"{prefix}_camera",
-                rgb_shape=cfg.camera_rgb_shape,
-                depth_shape=cfg.camera_depth_shape,
+                dtype=make_camera_frame_dtype(cfg.camera_rgb_shape, cfg.camera_depth_shape),
                 maxlen=cfg.camera_ring_maxlen,
                 create=True,
             )
@@ -203,19 +176,7 @@ class RuntimeChannels:
             else None
         )
 
-        storage.run_id = ctx.Value("Q", 1)
-        storage.run_ended_reason = ctx.Value("i", 0)
-        storage.run_ended_id = ctx.Value("Q", 0)
-
         storage.is_running = ctx.Value("b", True, lock=False)
-        storage.error_state = ctx.Value("b", False)
-        storage.estop_request = ctx.Value("b", False)
-        storage.quit_requested = ctx.Value("b", False)
-        storage.start_request = ctx.Value("b", False)
-        storage.stop_request = ctx.Value("b", False)
-
-        storage.safety_state = ctx.Value("i", DISARMED_SAFETY_STATE_WIRE_VALUE)
-        storage.motion_lock = ctx.RLock()
 
         storage.vr_ready = ctx.Event()
         storage.camera_ready = ctx.Event()
@@ -226,30 +187,22 @@ class RuntimeChannels:
         storage.camera_geometry = ctx.Array("c", b"\x00" * 2048, lock=False)
 
     def close(self) -> bool:
-        """Close and unlink shared memory, attempting every resource even after failures.
-
-        An already-unlinked segment raises ``FileNotFoundError``; close calls are
-        idempotent, so cleanup can be retried. Return whether every resource was
-        closed and unlinked successfully.
-        """
-        if bool(getattr(self, "_closed", False)):
+        """Close/unlink every allocated ring; ignore missing segments and report failures."""
+        if self._closed:
             return True
 
         errors: list[str] = []
 
-        def _attempt(operation: str, callback: Any, *, missing_ok: bool = False) -> bool:
+        def _attempt(operation: str, callback: Any, *, missing_ok: bool = False) -> None:
             try:
                 callback()
             except FileNotFoundError:
                 if not missing_ok:
                     errors.append(operation)
-                    logger.warning("RuntimeChannels close: %s failed", operation, exc_info=True)
-                    return False
+                    logger.warning("SensorChannels close: %s failed", operation, exc_info=True)
             except Exception:
                 errors.append(operation)
-                logger.warning("RuntimeChannels close: %s failed", operation, exc_info=True)
-                return False
-            return True
+                logger.warning("SensorChannels close: %s failed", operation, exc_info=True)
 
         for ring_name in _RING_RESOURCE_NAMES:
             ring = getattr(self, ring_name, None)
@@ -260,7 +213,7 @@ class RuntimeChannels:
 
         self._closed = not errors
         if self._closed:
-            logger.debug("RuntimeChannels closed cleanly")
+            logger.debug("SensorChannels closed cleanly")
         else:
-            logger.error("RuntimeChannels close incomplete: %s", ", ".join(errors))
+            logger.error("SensorChannels close incomplete: %s", ", ".join(errors))
         return self._closed

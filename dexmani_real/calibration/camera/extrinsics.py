@@ -9,6 +9,8 @@ The calibration file's calibration_capture section is diagnostic provenance.
 
 from __future__ import annotations
 
+import logging
+
 __all__ = ["CameraExtrinsics", "CameraExtrinsicsEntry"]
 
 import json
@@ -192,10 +194,9 @@ class CameraExtrinsics:
 
 def load_optional_camera_extrinsics(path=None):
     """Resolve once per recording session; missing extrinsics do not block Raw."""
-    from dexmani_real.utils.log import get_logger
 
     try:
         return CameraExtrinsics(path)
     except (FileNotFoundError, KeyError, ValueError) as exc:
-        get_logger(__name__).warning("Recording without camera extrinsics: %s", exc)
+        logging.getLogger(__name__).warning("Recording without camera extrinsics: %s", exc)
         return None

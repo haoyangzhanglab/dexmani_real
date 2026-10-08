@@ -1,11 +1,11 @@
-"""Four motion states and a run epoch shared by the control owner, input callbacks and sensors."""
+"""Main-process motion authority shared by the I/O owner and operator callbacks."""
 
 import time
 from enum import IntEnum
 
 
 class SafetyState(IntEnum):
-    """Values stored in ``RuntimeChannels.safety_state``."""
+    """Values stored in ``RuntimeState.safety_state``."""
 
     DISARMED = 0
     ARMED = 1
@@ -37,17 +37,17 @@ class RunEndReason(IntEnum):
 
 def _begin_motion_locked(shared):
     if (
-        int(shared.safety_state.value) != int(SafetyState.ARMED)
-        or not shared.is_running.value
-        or shared.error_state.value
-        or shared.estop_request.value
+        int(shared.safety_state) != int(SafetyState.ARMED)
+        or not shared.sensors.is_running.value
+        or shared.error_state
+        or shared.estop_request
     ):
         return None
-    shared.run_id.value += 1
+    shared.run_id += 1
     started = time.monotonic_ns()
-    shared.run_ended_reason.value = int(RunEndReason.NONE)
-    shared.safety_state.value = int(SafetyState.RUNNING)
-    return int(shared.run_id.value), started
+    shared.run_ended_reason = int(RunEndReason.NONE)
+    shared.safety_state = int(SafetyState.RUNNING)
+    return int(shared.run_id), started
 
 
 def begin_motion(shared):
@@ -58,11 +58,11 @@ def begin_motion(shared):
 def _command_may_cross_sdk_locked(shared, *, run_id, required_safety_state=SafetyState.RUNNING):
     """Check motion authority while the caller holds motion_lock."""
     return (
-        shared.is_running.value
-        and not shared.error_state.value
-        and not shared.estop_request.value
-        and int(shared.run_id.value) == run_id
-        and int(shared.safety_state.value) == int(required_safety_state)
+        shared.sensors.is_running.value
+        and not shared.error_state
+        and not shared.estop_request
+        and int(shared.run_id) == run_id
+        and int(shared.safety_state) == int(required_safety_state)
         and required_safety_state in (SafetyState.ARMED, SafetyState.RUNNING)
     )
 
@@ -81,18 +81,18 @@ def _revoke_motion_locked(
     """Revoke the current epoch while the caller holds motion_lock."""
     if new_state not in (SafetyState.ARMED, SafetyState.DISARMED, SafetyState.FAULT):
         raise ValueError("revocation must leave streaming mode")
-    current = SafetyState(int(shared.safety_state.value))
+    current = SafetyState(int(shared.safety_state))
     if current == SafetyState.FAULT and new_state == SafetyState.ARMED:
         return False
     if current == SafetyState.RUNNING:
-        if shared.estop_request.value:
+        if shared.estop_request:
             reason = RunEndReason.ESTOP
         elif new_state == SafetyState.FAULT and reason == RunEndReason.EXECUTOR_BOUNDARY:
             reason = RunEndReason.HARDWARE_FAULT
-        shared.run_ended_id.value = int(shared.run_id.value)
-        shared.run_ended_reason.value = int(reason)
-    shared.run_id.value += 1
-    shared.safety_state.value = int(new_state)
+        shared.run_ended_id = int(shared.run_id)
+        shared.run_ended_reason = int(reason)
+    shared.run_id += 1
+    shared.safety_state = int(new_state)
     return True
 
 
@@ -109,7 +109,7 @@ def revoke_motion_if_run_id(
     reason=RunEndReason.EXECUTOR_BOUNDARY,
 ):
     with shared.motion_lock:
-        if int(shared.run_id.value) != expected_run_id:
+        if int(shared.run_id) != expected_run_id:
             return False
         return _revoke_motion_locked(shared, new_state, reason=reason)
 
@@ -130,21 +130,21 @@ def require_transition(shared, new_state):
 def request_policy_start(shared):
     with shared.motion_lock:
         if (
-            int(shared.safety_state.value) != int(SafetyState.ARMED)
-            or not shared.is_running.value
-            or shared.error_state.value
-            or shared.estop_request.value
-            or shared.stop_request.value
+            int(shared.safety_state) != int(SafetyState.ARMED)
+            or not shared.sensors.is_running.value
+            or shared.error_state
+            or shared.estop_request
+            or shared.stop_request
         ):
             return False
-        shared.start_request.value = True
+        shared.start_request = True
         return True
 
 
 def request_policy_stop(shared, *, reason=RunEndReason.OPERATOR):
     with shared.motion_lock:
-        shared.start_request.value = False
-        shared.stop_request.value = int(StopRequest.OPERATOR)
-        if int(shared.safety_state.value) in (int(SafetyState.ARMED), int(SafetyState.RUNNING)):
+        shared.start_request = False
+        shared.stop_request = int(StopRequest.OPERATOR)
+        if int(shared.safety_state) in (int(SafetyState.ARMED), int(SafetyState.RUNNING)):
             return _revoke_motion_locked(shared, reason=reason)
         return True

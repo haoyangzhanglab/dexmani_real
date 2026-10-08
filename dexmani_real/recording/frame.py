@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.recording.storage.schema import DATASET_SPECS
+from dexmani_real.robot.commands import DispatchStatus
 
 
 @dataclass(frozen=True)
@@ -53,7 +54,7 @@ def build_episode_frame(
             if command is not None
             and command.arm_qpos is not None
             and result is not None
-            and result.arm != 0
+            and result.arm != DispatchStatus.NOT_CALLED
             else np.full(7, np.nan)
         ),
         "action_hand_joint_target": (
@@ -61,7 +62,7 @@ def build_episode_frame(
             if command is not None
             and command.hand_qpos is not None
             and result is not None
-            and result.hand != 0
+            and result.hand != DispatchStatus.NOT_CALLED
             else np.full(12, np.nan)
         ),
     }

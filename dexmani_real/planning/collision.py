@@ -7,6 +7,8 @@ the physical hand mount compensation belongs only to real-pose FK.
 
 from __future__ import annotations
 
+import logging
+
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -25,9 +27,9 @@ from dexmani_real.robot.model import (
     XHAND_URDF_JOINT_NAMES,
 )
 from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)

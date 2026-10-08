@@ -1,8 +1,9 @@
 """Device owner on one control grid, with one serial model worker in all modes."""
 
+import logging
 import time
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from collections import deque
 
 import numpy as np
 
@@ -22,10 +23,9 @@ from dexmani_real.recording.recorder import (
     snapshot_recording_metadata,
 )
 from dexmani_real.recording.results import error_detail, finalize_policy_attempt
-from dexmani_real.robot.commands import RobotCommand
-from dexmani_real.robot.robot import DispatchError, DispatchInterrupted, DispatchStatus
+from dexmani_real.robot.commands import DispatchStatus, RobotCommand
+from dexmani_real.robot.robot import DispatchError, DispatchInterrupted
 from dexmani_real.runtime.observation import (
-    ObservationHistory,
     feedback_deadline_ns,
     read_observation,
 )
@@ -36,9 +36,9 @@ from dexmani_real.runtime.safety import (
     _begin_motion_locked,
     revoke_motion_if_run_id,
 )
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -79,28 +79,16 @@ class PolicyRunner:
         recorder=None,
         poll_operator=None,
         model_runtime,
-        execution_config,
         kinematics,
         execute,
         max_running_s,
         num_episodes=1,
-        recording_config=None,
+        task_label=None,
         camera_calibration=None,
         results=None,
     ):
-        if recorder is not None:
-            if results is None or recording_config is None:
-                raise ValueError("policy recording requires recorder, recording_config and results")
-            if not (
-                recorder.data_dir.resolve()
-                == results.directory.resolve()
-                == Path(recording_config.data_dir).resolve()
-            ):
-                raise ValueError(
-                    "recorder, recording_config and results must share one session directory"
-                )
-        elif recording_config is not None:
-            raise ValueError("recording_config requires an assembled recorder")
+        if (recorder is None) != (results is None):
+            raise ValueError("policy recording requires recorder and results together")
         self.results = results
         self.query_arrays = {}
         self.shared = shared
@@ -109,15 +97,15 @@ class PolicyRunner:
         self.runtime = runtime
         self.policy_info = policy_info
         self.model = model_runtime
-        self.execution = execution_config.validate(policy_info, max_running_s=max_running_s)
+        self.execution = runtime.execution
         self.kinematics = kinematics
         self.execute = execute
         self.max_running_s = max_running_s
         self.num_episodes = num_episodes
-        self.recording_config = recording_config
+        self.task_label = task_label
         self.camera_calibration = camera_calibration
         self.recorder = recorder
-        self.history = ObservationHistory(policy_info.n_obs_steps)
+        self.history = deque(maxlen=policy_info.n_obs_steps)
         self.recording_started = False
         self.plan = None
         self.query = None
@@ -191,11 +179,11 @@ class PolicyRunner:
     def _has_motion_authority(self):
         return (
             self.run_id is not None
-            and self.shared.is_running.value
-            and not self.shared.error_state.value
-            and not self.shared.estop_request.value
-            and int(self.shared.run_id.value) == self.run_id
-            and int(self.shared.safety_state.value) == int(SafetyState.RUNNING)
+            and self.shared.sensors.is_running.value
+            and not self.shared.error_state
+            and not self.shared.estop_request
+            and int(self.shared.run_id) == self.run_id
+            and int(self.shared.safety_state) == int(SafetyState.RUNNING)
         )
 
     def _event(self, name, **details):
@@ -246,8 +234,8 @@ class PolicyRunner:
         revoke_motion_if_run_id(self.shared, epoch, reason=run_end_reason)
         with self.shared.motion_lock:
             reason = (
-                RunEndReason(int(self.shared.run_ended_reason.value))
-                if int(self.shared.run_ended_id.value) == epoch
+                RunEndReason(int(self.shared.run_ended_reason))
+                if int(self.shared.run_ended_id) == epoch
                 else run_end_reason
             )
         self._invalidate(detail)
@@ -256,7 +244,7 @@ class PolicyRunner:
         self.previous_arm = None
         self.run_id = None
         self.completed += 1
-        self.shared.stop_request.value = int(StopRequest.NONE)
+        self.shared.stop_request = int(StopRequest.NONE)
         errors, failure = list(errors or ()), None
         try:
             if stop_motion:
@@ -272,7 +260,7 @@ class PolicyRunner:
         finally:
             logger.info("policy episode %d ended: %s (%s)", self.completed, reason.name, detail)
             if self.completed >= self.num_episodes:
-                self.shared.quit_requested.value = True
+                self.shared.quit_requested = True
         if failure is not None:
             raise failure
 
@@ -312,19 +300,19 @@ class PolicyRunner:
     def _begin_episode(self):
         if self.preparing_epoch is None:
             with self.shared.motion_lock:
-                if not self.shared.start_request.value or self.model.future is not None:
+                if not self.shared.start_request or self.model.future is not None:
                     return
-                self.shared.start_request.value = False
+                self.shared.start_request = False
                 if (
-                    self.shared.stop_request.value
-                    or self.shared.quit_requested.value
-                    or not self.shared.is_running.value
-                    or self.shared.error_state.value
-                    or self.shared.estop_request.value
-                    or int(self.shared.safety_state.value) != int(SafetyState.ARMED)
+                    self.shared.stop_request
+                    or self.shared.quit_requested
+                    or not self.shared.sensors.is_running.value
+                    or self.shared.error_state
+                    or self.shared.estop_request
+                    or int(self.shared.safety_state) != int(SafetyState.ARMED)
                 ):
                     return
-                epoch = int(self.shared.run_id.value)
+                epoch = int(self.shared.run_id)
             if self._start_observation() is None:
                 return
             self.recording_started = False
@@ -340,9 +328,9 @@ class PolicyRunner:
             return
         epoch, self.preparing_epoch = self.preparing_epoch, None
         if (
-            epoch != int(self.shared.run_id.value)
-            or self.shared.quit_requested.value
-            or self.shared.stop_request.value
+            epoch != int(self.shared.run_id)
+            or self.shared.quit_requested
+            or self.shared.stop_request
         ):
             self._finalize_attempt("start_cancelled", "cancelled during model reset")
             return
@@ -351,7 +339,6 @@ class PolicyRunner:
         try:
             self.realizer.reset_episode()
             if self.recorder is not None:
-                cfg = self.recording_config
                 metadata = snapshot_recording_metadata(
                     self.shared,
                     self.runtime,
@@ -360,7 +347,7 @@ class PolicyRunner:
                 )
                 self.recording_started = True
                 if not self.recorder.start_episode(
-                    task_label=cfg.task_label,
+                    task_label=self.task_label,
                     episode_name=f"episode_{self.completed + 1:03d}",
                     **metadata,
                 ):
@@ -371,9 +358,9 @@ class PolicyRunner:
             with self.shared.motion_lock:
                 admitted = (
                     _begin_motion_locked(self.shared)
-                    if epoch == int(self.shared.run_id.value)
-                    and not self.shared.quit_requested.value
-                    and not self.shared.stop_request.value
+                    if epoch == int(self.shared.run_id)
+                    and not self.shared.quit_requested
+                    and not self.shared.stop_request
                     else None
                 )
             if admitted is None:
@@ -665,7 +652,7 @@ class PolicyRunner:
             self._record(row)
             return
         now = time.monotonic_ns()
-        if not self._has_motion_authority() or self.shared.quit_requested.value:
+        if not self._has_motion_authority() or self.shared.quit_requested:
             self._finish_episode("before_dispatch_revoked")
             return
         if (expired := self._expired_budget()) is not None:
@@ -716,11 +703,11 @@ class PolicyRunner:
         with self.shared.motion_lock:
             operator_revocation = (
                 cause == "authority_revoked"
-                and int(self.shared.run_ended_id.value) == self.run_id
-                and int(self.shared.run_ended_reason.value)
+                and int(self.shared.run_ended_id) == self.run_id
+                and int(self.shared.run_ended_reason)
                 in (int(RunEndReason.OPERATOR), int(RunEndReason.QUIT))
-                and not self.shared.estop_request.value
-                and not self.shared.error_state.value
+                and not self.shared.estop_request
+                and not self.shared.error_state
             )
         clean_partial = result is not None and all(
             status in (DispatchStatus.ACCEPTED, DispatchStatus.NOT_CALLED)
@@ -758,7 +745,7 @@ class PolicyRunner:
         try:
             if failed:
                 if cancelled:
-                    self.shared.estop_request.value = True
+                    self.shared.estop_request = True
                 reason = (
                     RunEndReason.ESTOP
                     if cancelled
@@ -878,7 +865,7 @@ class PolicyRunner:
     def step(self):
         self.robot.check()
         if self.run_id is not None and (
-            not self._has_motion_authority() or self.shared.quit_requested.value
+            not self._has_motion_authority() or self.shared.quit_requested
         ):
             self._finish_episode("owner_authority_revoked")
         self._poll_model()
@@ -886,8 +873,8 @@ class PolicyRunner:
             self.recorder.check_error()
         if self.run_id is None:
             if self.preparing_epoch is None:
-                self.shared.stop_request.value = int(StopRequest.NONE)
-            if self.preparing_epoch is not None or self.shared.start_request.value:
+                self.shared.stop_request = int(StopRequest.NONE)
+            if self.preparing_epoch is not None or self.shared.start_request:
                 self._begin_episode()
             if self.run_id is None:
                 return
@@ -921,7 +908,7 @@ class PolicyRunner:
                 self._record(row)
                 return
             self.history.append(row)
-            rows = self.history.ready_rows()
+            rows = tuple(self.history) if len(self.history) == self.history.maxlen else ()
             self._handoff(slot)
             if self.plan is None:
                 if self.wait_started_ns is None:
@@ -955,22 +942,22 @@ class PolicyRunner:
     def run(self):
         failure = None
         try:
-            while self.shared.is_running.value and not self.shared.quit_requested.value:
+            while self.shared.sensors.is_running.value and not self.shared.quit_requested:
                 if self.poll_operator is not None:
                     self.poll_operator()
-                if self.shared.estop_request.value or self.shared.error_state.value:
+                if self.shared.estop_request or self.shared.error_state:
                     break
                 if self.run_id is None and self.preparing_epoch is None:
                     self.robot.service_idle()
                 self.step()
                 time.sleep(0.001 if self.run_id is not None else 0.005)
         except KeyboardInterrupt as exc:
-            self.shared.estop_request.value = True
+            self.shared.estop_request = True
             failure = exc
         except Exception as exc:
             failure = exc
-            self.shared.error_state.value = True
-            self.shared.is_running.value = False
+            self.shared.error_state = True
+            self.shared.sensors.is_running.value = False
         finally:
             reason = (
                 RunEndReason.RECORDING_FAILURE

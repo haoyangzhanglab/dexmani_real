@@ -9,6 +9,7 @@ python examples/replay_episode.py episodes/test/episode_001 --config local.yaml 
 
 from __future__ import annotations
 
+import logging
 import argparse
 import math
 from pathlib import Path
@@ -16,9 +17,9 @@ from pathlib import Path
 import yaml
 
 from dexmani_real.config.experiment import load_experiment_config
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger("dexmani_real.cli.replay_episode")
 
 
 def _nonnegative_float(value: str) -> float:

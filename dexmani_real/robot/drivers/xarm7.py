@@ -21,10 +21,9 @@ from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_HARD_LOWER, XARM7_HA
 from dexmani_real.utils.log import (
     capture_native_stdout,
     extract_native_diagnostics,
-    get_logger,
 )
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 # Vendor ``ControllerErrorCodeMap`` titles plus a recovery action — a startup

@@ -6,23 +6,13 @@ See SharedMemoryRingBuffer for platform and memory-ordering limits.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import time
 from multiprocessing import shared_memory
 from typing import Any
 
 import numpy as np
-
-from dexmani_real.utils.log import get_logger
-
-
-def _seqlock_odd(seq: int) -> int:
-    """Encode logical *seq* as the odd (write-in-progress) marker: ``2*seq - 1``."""
-    return 2 * seq - 1
-
-
-def _seqlock_even(seq: int) -> int:
-    """Encode logical *seq* as the even (frame-complete) marker: ``2*seq``."""
-    return 2 * seq
 
 
 def seqlock_is_complete(marker: int) -> bool:
@@ -38,7 +28,7 @@ def seqlock_to_logical(marker: int) -> int:
 class SeqlockSlot:
     """Odd/even seqlock for a single slot's ``[timestamp_ns, sequence]`` prefix.
 
-    Non-owning view of the first 16 bytes, shared by sensor and camera rings.
+    Non-owning view of the first 16 bytes of a ring slot.
     Writers mark odd with timestamp 0, copy the payload, stamp commit time,
     then publish even. Readers accept matching nonzero even markers sampled
     before and after copying; timestamps describe commit, not copy start.
@@ -59,22 +49,17 @@ class SeqlockSlot:
     def timestamp_ns(self) -> int:
         return int(self._ts_seq[0])
 
-    def begin_write(self, seq: int, now_ns: int) -> None:
-        """Mark writer-active (odd), then store *now_ns* as the timestamp.
-
-        Deferred-commit writers pass ``0`` here and stamp the real commit time
-        later via :meth:`stamp_timestamp`; the timestamp must not be trusted
-        until :meth:`end_write` publishes the even marker.
-        """
-        self._ts_seq[1] = np.uint64(_seqlock_odd(seq))
-        self._ts_seq[0] = np.uint64(now_ns)
+    def begin_write(self, seq: int) -> None:
+        """Mark writer-active before copying; publication time remains unknown."""
+        self._ts_seq[1] = np.uint64(2 * seq - 1)
+        self._ts_seq[0] = np.uint64(0)
 
     def end_write(self, seq: int) -> None:
         """Mark the slot complete (even)."""
-        self._ts_seq[1] = np.uint64(_seqlock_even(seq))
+        self._ts_seq[1] = np.uint64(2 * seq)
 
     def stamp_timestamp(self, now_ns: int) -> None:
-        """Stamp the timestamp after the payload commit (deferred-commit writes)."""
+        """Set publication time after the payload copy, before publishing even."""
         self._ts_seq[0] = np.uint64(now_ns)
 
     def verify(self, marker_before: int) -> bool:
@@ -82,185 +67,151 @@ class SeqlockSlot:
         return marker_before == self.marker and seqlock_is_complete(marker_before)
 
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 TORN_WARN_INTERVAL_NS = 5 * 1_000_000_000
 
 
 class SharedMemoryRingBuffer:
-    """Shared-memory ring with odd/even markers for consistent reads.
+    """Fixed-session storage with one serialized writer and owned sample copies.
 
-    Layout of the shared memory block:
-        [0:8)     write_idx  (uint64 — only producer writes, consumer reads)
-        [8:16)    sequence   (uint64, monotonic counter)
-        [16:24)   slot_size  (uint64, bytes per slot)
-        [24:32)   maxlen     (uint64, number of slots)
-        [32:64)   padding (32 bytes to cache-line-align the data region)
-        [64:)     N slots, each of size slot_size
-                    Each slot: [timestamp_ns: uint64, seq: uint64, data: ...]
-
-    write_idx identifies the latest published slot.
-    Used on Linux x86_64 with one serialized writer. NumPy uint64 access
-    does not specify acquire/release memory ordering; this is not a portable
-    lock-free guarantee. Multiple writer processes must hold their own
-    cross-process write lock.
-
-    Latest readers may skip overwritten frames; consumers check freshness.
+    Used on Linux x86_64. NumPy uint64 stores do not specify acquire/release
+    ordering; this is not a portable lock-free guarantee. Only the creator
+    unlinks, after all readers/writers have exited.
     """
 
-    _OFF_WRITE_IDX = 0
-    _OFF_SEQUENCE = 8
-    _OFF_SLOT_SIZE = 16
-    _OFF_MAXLEN = 24
-    _HEADER_SIZE = 64  # cache-line aligned start of data region
+    _HEADER_SIZE = 64
 
-    def __init__(
-        self,
-        name: str,
-        dtype: np.dtype,
-        maxlen: int = 3,
-        create: bool = True,
-    ) -> None:
-        """Create a named ring of maxlen dtype payloads, or attach when create=False."""
-        self.name = name
-        self.dtype = np.dtype(dtype)
-        self.maxlen = maxlen
-
+    def __init__(self, name: str, dtype: np.dtype, maxlen: int = 3, create: bool = True):
+        if type(maxlen) is not int or maxlen <= 0:
+            raise ValueError("ring capacity must be a positive integer")
+        self.name, self.dtype, self.maxlen = name, np.dtype(dtype), maxlen
+        if self.dtype.hasobject:
+            raise ValueError("shared-memory payload must not contain Python objects")
         self._slot_dtype = np.dtype(
-            [("timestamp_ns", "<u8"), ("sequence", "<u8"), ("data", self.dtype)]
+            [("timestamp_ns", "<u8"), ("sequence", "<u8"), ("data", self.dtype)],
+            align=True,
         )
         self._slot_size = self._slot_dtype.itemsize
-
         self._total_size = self._HEADER_SIZE + maxlen * self._slot_size
-
-        if create:
-            self._shm = shared_memory.SharedMemory(name=name, create=True, size=self._total_size)
-        else:
-            self._shm = shared_memory.SharedMemory(name=name)
-
-        self._header: np.ndarray[Any, np.dtype[np.uint8]] = np.ndarray(
-            (self._HEADER_SIZE,), dtype=np.uint8, buffer=self._shm.buf, offset=0
+        # Equal byte counts can still describe different pixel shapes or field layouts.
+        dtype_digest = hashlib.sha256(repr(self.dtype.descr).encode("utf-8")).digest()
+        layout = (self._slot_size, maxlen, *np.frombuffer(dtype_digest, dtype="<u8"))
+        self._shm = shared_memory.SharedMemory(
+            name=name, create=create, size=self._total_size if create else 0
         )
-
-        self._data_buf: np.ndarray[Any, np.dtype[Any]] = np.ndarray(
-            (maxlen,),
-            dtype=self._slot_dtype,
-            buffer=self._shm.buf,
-            offset=self._HEADER_SIZE,
-        )
-
-        if create:
-            self._init_header()
-
-        self._write_seq: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
-            (1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_SEQUENCE
-        )
-        self._last_good: tuple[np.ndarray, int, int] | None = None
+        try:
+            if self._shm.size != self._total_size:
+                raise ValueError("shared memory size differs from the supplied ring layout")
+            self._header = np.ndarray((8,), dtype=np.uint64, buffer=self._shm.buf)
+            if create:
+                self._header[:] = (0, 0, *layout)
+            elif tuple(self._header[2:]) != layout:
+                raise ValueError("attached ring payload dtype, slot size or capacity differs")
+            self._data_buf = np.ndarray(
+                (maxlen,), dtype=self._slot_dtype, buffer=self._shm.buf, offset=self._HEADER_SIZE
+            )
+        except BaseException:
+            self._shm.close()
+            if create:
+                self._shm.unlink()
+            raise
+        self._last_good = None
         self._last_torn_warn_ns = 0
 
-        logger.debug(
-            "SharedMemoryRingBuffer(name=%s, slot_size=%d, maxlen=%d, total=%d, create=%s)",
-            name,
-            self._slot_size,
-            maxlen,
-            self._total_size,
-            create,
-        )
-
     def write(self, data: np.ndarray) -> int:
-        """Publish a (1,) array matching self.dtype and return its sequence number.
-
-        Overwrites the oldest slot.
-        """
         if not isinstance(data, np.ndarray) or data.shape != (1,) or data.dtype != self.dtype:
-            raise ValueError(
-                f"ring {self.name!r} requires ndarray shape=(1,) dtype={self.dtype}; "
-                f"got shape={getattr(data, 'shape', None)} "
-                f"dtype={getattr(data, 'dtype', None)}"
-            )
-        seq = int(self._write_seq[0]) + 1
+            raise ValueError(f"ring {self.name!r} requires ndarray (1,) dtype={self.dtype}")
+        return self._publish(data)
 
-        idx = seq % self.maxlen
+    def write_fields(self, **fields) -> int:
+        """Copy existing arrays directly into a slot, without a full-frame staging copy."""
+        if self.dtype.names is None or set(fields) != set(self.dtype.names):
+            raise ValueError("ring fields do not match the payload dtype")
+        values = {}
+        for name, value in fields.items():
+            field_dtype = self.dtype.fields[name][0]
+            dtype, shape = field_dtype.subdtype or (field_dtype, ())
+            array = np.asarray(value)
+            if array.dtype != dtype or array.shape != shape or not array.flags.c_contiguous:
+                raise ValueError(f"ring field {name!r} must be contiguous {dtype} {shape}")
+            values[name] = array
+        return self._publish(values)
 
-        # Mark the slot incomplete before writing; readers accept matching even markers.
-        slot = self._data_buf[idx]
-        seqlock = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + idx * self._slot_size)
-        seqlock.begin_write(seq, 0)
-        slot["data"] = data
+    def _publish(self, values) -> int:
+        sequence = int(self._header[1]) + 1
+        index = sequence % self.maxlen
+        seqlock = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + index * self._slot_size)
+        seqlock.begin_write(sequence)
+        if isinstance(values, np.ndarray):
+            self._data_buf[index]["data"] = values[0]
+        else:
+            for name, value in values.items():
+                self._data_buf[index]["data"][name] = value
         seqlock.stamp_timestamp(time.monotonic_ns())
-        seqlock.end_write(seq)
+        seqlock.end_write(sequence)
+        self._header[1] = np.uint64(sequence)
+        self._header[0] = np.uint64(index)
+        return sequence
 
-        self._write_seq[0] = np.uint64(seq)
-
-        self._write_idx_view()[0] = np.uint64(idx)
-
-        return seq
+    def _copy_slot(self, index: int, expected: int | None = None):
+        if not 0 <= index < self.maxlen:
+            return None
+        seqlock = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + index * self._slot_size)
+        marker = seqlock.marker
+        if not seqlock_is_complete(marker):
+            return None
+        sequence = seqlock_to_logical(marker)
+        if expected is not None and sequence != expected:
+            return None
+        stamp = seqlock.timestamp_ns
+        data = self._data_buf[index]["data"].copy().reshape(1)
+        return (data, stamp, sequence) if seqlock.verify(marker) else None
 
     def read_latest(self) -> tuple[np.ndarray, int, int] | None:
-        """Return a verified ``(data, timestamp_ns, logical_sequence)`` frame."""
-        for _attempt in range(2):
-            idx = int(self._write_idx_view()[0])
-            slot = self._data_buf[idx]
-            seqlock = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + idx * self._slot_size)
-            marker1 = seqlock.marker
-            if marker1 == 0 and idx == 0 and int(self._write_seq[0]) == 0:
+        """Try twice, returning the last verified sample on a persistent torn read."""
+        for _ in range(2):
+            index = int(self._header[0])
+            if index == 0 and int(self._header[1]) == 0:
                 return None
-            timestamp_ns = seqlock.timestamp_ns
-            data = slot["data"].copy().reshape(1)
-            if seqlock.verify(marker1):
-                self._last_good = (data, timestamp_ns, seqlock_to_logical(marker1))
-                return self._last_good
+            sample = self._copy_slot(index)
+            if sample is not None:
+                self._last_good = sample
+                return sample
         self._warn_torn_read()
         return self._last_good
 
+    def read_latest_uncached(self) -> tuple[np.ndarray, int, int] | None:
+        """Copy the latest sample once; return None when incomplete or overwritten."""
+        return self._copy_slot(int(self._header[0]))
+
+    @property
+    def latest_sequence(self) -> int:
+        index = int(self._header[0])
+        if not 0 <= index < self.maxlen:
+            return 0
+        marker = SeqlockSlot(self._shm.buf, self._HEADER_SIZE + index * self._slot_size).marker
+        return seqlock_to_logical(marker) if seqlock_is_complete(marker) else 0
+
+    def read_sequence(self, sequence: int) -> tuple[np.ndarray, int, int] | None:
+        if sequence <= 0:
+            return None
+        return self._copy_slot(sequence % self.maxlen, expected=sequence)
+
     def close(self) -> None:
-        """Close the shared memory file descriptor (does NOT destroy)."""
         self._shm.close()
 
     def unlink(self) -> None:
-        """Destroy the shared memory block (only call from creator process)."""
         self._shm.unlink()
 
-    def __getstate__(self) -> dict[str, Any]:
-        """Serialize by identity so ``spawn`` children attach to the block.
-
-        ``SharedMemory`` memoryviews and NumPy views themselves are not a safe
-        pickle transport.  Reconstructing them from the named block also keeps
-        parent and child resource ownership explicit.
-        """
-        # Preserve the dtype object during spawn reconstruction to retain alignment.
+    def __getstate__(self):
         return {"name": self.name, "dtype": self.dtype, "maxlen": self.maxlen}
 
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        type(self).__init__(
-            self,
-            state["name"],
-            np.dtype(state["dtype"]),
-            maxlen=int(state["maxlen"]),
-            create=False,
-        )
+    def __setstate__(self, state):
+        self.__init__(state["name"], state["dtype"], maxlen=state["maxlen"], create=False)
 
-    def _init_header(self) -> None:
-        """Initialize the header region with zeros."""
-        self._header[:] = 0
-        np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_SLOT_SIZE)[0] = (
-            np.uint64(self._slot_size)
-        )
-        np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_MAXLEN)[0] = (
-            np.uint64(self.maxlen)
-        )
-
-    def _write_idx_view(self) -> np.ndarray:
-        """Return a writeable view of the write_idx as a uint64 array of length 1."""
-        return np.ndarray((1,), dtype=np.uint64, buffer=self._shm.buf, offset=self._OFF_WRITE_IDX)
-
-    def _warn_torn_read(self) -> None:
-        now_ns = time.monotonic_ns()
-        if now_ns - self._last_torn_warn_ns < TORN_WARN_INTERVAL_NS:
-            return
-        self._last_torn_warn_ns = now_ns
-        logger.warning(
-            "Shared-memory ring %s had a persistent torn read; returning %s",
-            self.name,
-            "last-good frame" if self._last_good is not None else "None",
-        )
+    def _warn_torn_read(self):
+        now = time.monotonic_ns()
+        if now - self._last_torn_warn_ns >= TORN_WARN_INTERVAL_NS:
+            self._last_torn_warn_ns = now
+            logger.warning("ring %s torn read; returning last-good sample or None", self.name)

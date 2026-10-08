@@ -1,8 +1,17 @@
 """Owned absolute targets for direct SDK dispatch."""
 
 from dataclasses import dataclass
+from enum import IntEnum
 
 import numpy as np
+
+
+class DispatchStatus(IntEnum):
+    NOT_CALLED = 0
+    ACCEPTED = 1
+    CRC_UNCONFIRMED = 2
+    REJECTED = 3
+    UNKNOWN = 4
 
 
 @dataclass(frozen=True)

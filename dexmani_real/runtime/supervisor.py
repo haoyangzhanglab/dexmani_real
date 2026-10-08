@@ -1,5 +1,6 @@
 """Process readiness and liveness; observation freshness belongs to control steps."""
 
+import logging
 import math
 import time
 
@@ -11,23 +12,23 @@ from dexmani_real.runtime.safety import (
     SafetyState,
     _revoke_motion_locked,
 )
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 def wait_subsystem_ready(shared, process, timeout_s, *, check=None):
     if not math.isfinite(timeout_s) or timeout_s <= 0:
         raise ValueError(f"{process.name}: readiness timeout must be finite and positive")
-    event = getattr(shared, f"{process.name}_ready")
+    event = getattr(shared.sensors, f"{process.name}_ready")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if (
             (check is not None and not check())
             or not process.is_alive()
-            or shared.error_state.value
-            or shared.estop_request.value
-            or not shared.is_running.value
+            or shared.error_state
+            or shared.estop_request
+            or not shared.sensors.is_running.value
         ):
             return False
         if event.wait(timeout=0.05):
@@ -62,14 +63,14 @@ class RuntimeSupervisor:
     def check(self) -> bool:
         dead = [process for process in self.started_processes if not process.is_alive()]
         for process in dead:
-            getattr(self.shared, f"{process.name}_ready").clear()
+            getattr(self.shared.sensors, f"{process.name}_ready").clear()
         if not dead:
             return True
         for process in dead:
             logger.error("required worker %s exited: %s", process.name, process.exitcode)
         with self.shared.motion_lock:
-            self.shared.is_running.value = False
-            self.shared.error_state.value = True
+            self.shared.sensors.is_running.value = False
+            self.shared.error_state = True
             _revoke_motion_locked(
                 self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT
             )

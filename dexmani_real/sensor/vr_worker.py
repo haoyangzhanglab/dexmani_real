@@ -1,5 +1,6 @@
 """HTS receiver with cancellable reads and right-hand observation publication."""
 
+import logging
 import time
 from contextlib import closing
 
@@ -9,9 +10,10 @@ from dexmani_real.config.hardware import VRParams
 from dexmani_real.ipc.schema import VR_FRAME_DTYPE
 from dexmani_real.planning.kinematics.pose import xyzw_to_wxyz
 from dexmani_real.utils.geometry import normalize_quat_wxyz
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.log import configure_logging
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 def _finite_vector(value, shape, name):
@@ -90,6 +92,7 @@ def _iter_events(shared, config):
 
 
 def run_vr_worker(shared, config: VRParams) -> None:
+    configure_logging()
     config.validate()
     if shared.vr_ring is None:
         raise ValueError("VR worker requires an allocated VR ring")

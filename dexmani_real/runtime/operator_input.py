@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
@@ -13,9 +14,8 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # stop() disables callbacks, but Linux/XRecord may remain blocked; avoid long waits.
 _LISTENER_STOP_TIMEOUT_S = 0.25
@@ -109,7 +109,6 @@ class KeyboardInput:
 
     def __init__(
         self,
-        debounce_s: float = 0.0,
         *,
         estop_callback: Callable[[], None] | None = None,
         stop_callback: Callable[[], None] | None = None,
@@ -120,8 +119,6 @@ class KeyboardInput:
         capture_raw_events: bool = False,
         repeat_estop_callback: bool = False,
     ) -> None:
-        if not np.isfinite(debounce_s) or debounce_s < 0.0:
-            raise ValueError("debounce_s must be finite and non-negative")
         if not np.isfinite(startup_timeout_s) or startup_timeout_s <= 0.0:
             raise ValueError("startup_timeout_s must be finite and positive")
         self._buffer: deque[OperatorCommand] = deque()
@@ -133,7 +130,6 @@ class KeyboardInput:
         # A daemon listener can outlive bounded shutdown.  Its callbacks must
         # not reach a session after this owner has stopped it.
         self._callbacks_active: bool = False
-        self._debounce_s = float(debounce_s)
         self._startup_timeout_s = float(startup_timeout_s)
         self._estop_callback = estop_callback
         self._stop_callback = stop_callback
@@ -144,14 +140,13 @@ class KeyboardInput:
         self._repeat_estop_callback = bool(repeat_estop_callback)
         self._estop_latched = threading.Event()
         self._listener_failure_reported = False
-        self._last_signal_time: dict[OperatorCommand, float] = {}
         self._pressed_signals: set[OperatorCommand] = set()
         self._saved_termios: list | None = None
 
-    def _accept_control_press(self, signal: OperatorCommand, now_s: float) -> bool:
+    def _accept_control_press(self, signal: OperatorCommand) -> bool:
         """Emit once per key-down/release cycle, ignoring OS auto-repeat.
 
-        Optional time debounce filters rapid presses; the default uses key edges only.
+        Commands use physical key edges, independent of the control-loop cadence.
         """
         with self._lock:
             if not self._callbacks_active:
@@ -159,10 +154,6 @@ class KeyboardInput:
             if signal in self._pressed_signals:
                 return False
             self._pressed_signals.add(signal)
-            last = self._last_signal_time.get(signal, float("-inf"))
-            if now_s - last < self._debounce_s:
-                return False
-            self._last_signal_time[signal] = now_s
             return True
 
     def _release_control(self, signal: OperatorCommand) -> None:
@@ -266,7 +257,7 @@ class KeyboardInput:
                         or (signal is OperatorCommand.QUIT and self._quit_callback is not None)
                     )
                     and signal is not None
-                    and self._accept_control_press(signal, time.perf_counter())
+                    and self._accept_control_press(signal)
                 ):
                     if self._dispatch_immediate_callback(signal):
                         with self._lock:
@@ -329,7 +320,6 @@ class KeyboardInput:
             self._buffer.clear()
             self._events.clear()
             self._keys.clear()
-            self._last_signal_time.clear()
             self._pressed_signals.clear()
             self._callbacks_active = True
         on_press, on_release = self._callbacks(keyboard)
@@ -408,7 +398,6 @@ class KeyboardInput:
                 self._events.clear()
                 self._keys.clear()
                 self._pressed_signals.clear()
-            self._last_signal_time.clear()
             self._estop_latched.clear()
             if self._suppress_echo:
                 self._restore_terminal_echo()

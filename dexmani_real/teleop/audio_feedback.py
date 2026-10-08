@@ -8,6 +8,8 @@ unknown events and missing files are logged and skipped.
 
 from __future__ import annotations
 
+import logging
+
 __all__ = ["AudioFeedback"]
 
 import os
@@ -18,9 +20,9 @@ import time
 from dataclasses import dataclass
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 _AUDIO_DIR = str(ASSET_DIR / "audio")
 

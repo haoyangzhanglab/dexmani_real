@@ -179,6 +179,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 processing,
                 pointcloud=replace(processing.pointcloud, num_points=args.pointcloud_num_points),
             )
+        from dexmani_real.utils.log import configure_logging
+
+        configure_logging()
         report = export_raw_to_zarr(
             args.input_root,
             output_path,

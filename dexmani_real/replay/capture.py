@@ -64,10 +64,6 @@ class ReplayRecorder:
         self.hand_cmd[idx] = hand_cmd
         self._count = idx + 1
 
-    @property
-    def count(self) -> int:
-        return self._count
-
     def to_dict(self) -> dict[str, np.ndarray]:
         """Return copies of the populated prefix without pickle-only values."""
         count = self._count

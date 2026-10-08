@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import json
 import shutil
 import threading
@@ -12,6 +13,8 @@ from queue import Empty, Full, Queue
 
 import numpy as np
 
+from dexmani_real.robot.commands import DispatchStatus
+
 from dexmani_real.config.hardware import CameraParams
 from dexmani_real.recording.storage.hdf5_writer import EpisodeDataWriter
 from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT
@@ -19,9 +22,9 @@ from dexmani_real.recording.storage.video import VideoEncoder
 from dexmani_real.sensor.camera.geometry import RGBDGeometry, validate_aligned_depth_distortion
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 from dexmani_real.utils.geometry import validate_rigid_transform
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 RECORDER_START_TIMEOUT_S = 10.0
 RECORDER_STOP_TIMEOUT_S = 60.0
 _COLLECTION_SOURCES = frozenset({"teleop", "policy_rollout"})
@@ -38,10 +41,10 @@ class RecordingBackpressureError(RecordingError):
 
 def snapshot_recording_metadata(shared, runtime, *, collection_source, camera_calibration):
     """Select the connected serial from the session snapshot, without file I/O."""
-    serial = shared.camera_serial.value.decode("utf-8")
+    serial = shared.sensors.camera_serial.value.decode("utf-8")
     if not serial.strip():
         raise ValueError("recording START requires a nonempty camera serial")
-    geometry = RGBDGeometry.from_dict(json.loads(shared.camera_geometry.value.decode("utf-8")))
+    geometry = RGBDGeometry.from_dict(json.loads(shared.sensors.camera_geometry.value.decode("utf-8")))
     transform = None
     if camera_calibration is None:
         logger.warning("Recording without camera extrinsics: session has no calibration")
@@ -61,7 +64,7 @@ def snapshot_recording_metadata(shared, runtime, *, collection_source, camera_ca
         collection_source=collection_source,
         camera_geometry=geometry,
         camera_T_xarm_base_from_color=transform,
-        depth_scale=float(shared.camera_depth_scale.value),
+        depth_scale=float(shared.sensors.camera_depth_scale.value),
         handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
         handbase_quat_eef_wxyz=runtime.hand.T_eef_handbase_quat_wxyz,
     )
@@ -394,8 +397,8 @@ class AsyncEpisodeRecorder:
         meta.attrs["robot_timestamp_source"] = "host_monotonic_read_completion"
         meta.attrs["camera_timestamp_source"] = "host_monotonic_oldest_rgb_depth_advance"
         meta.attrs["time_missing_value"] = 0
-        meta.attrs["dispatch_status_codes"] = (
-            "0:not_called,1:accepted,2:crc_unconfirmed,3:rejected,4:unknown"
+        meta.attrs["dispatch_status_codes"] = ",".join(
+            f"{int(status)}:{status.name.lower()}" for status in DispatchStatus
         )
 
     def _final_metadata_into(self, meta, details, last_selected, last_dispatch_detail):

@@ -7,6 +7,7 @@ for that sequence, and publishes a fixed ``float32[N,6]`` xArm-base payload.
 
 from __future__ import annotations
 
+import logging
 import json
 import time
 from dataclasses import dataclass
@@ -25,12 +26,13 @@ from dexmani_real.sensor.pointcloud import (
     build_point_cloud,
 )
 from dexmani_real.utils.geometry import validate_rigid_transform
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.log import configure_logging
+
 
 if TYPE_CHECKING:
-    from dexmani_real.ipc.channels import RuntimeChannels
+    from dexmani_real.ipc.channels import SensorChannels
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _IDLE_POLL_S = 0.001
 
@@ -69,7 +71,7 @@ class PointCloudWorkerConfig:
 
 
 def _resolve_base_from_color(
-    shared: "RuntimeChannels", calibration: CameraExtrinsics
+    shared: "SensorChannels", calibration: CameraExtrinsics
 ) -> np.ndarray:
     serial = shared.camera_serial.value.decode("utf-8").strip()
     if not serial:
@@ -88,7 +90,7 @@ def _resolve_base_from_color(
 
 
 def _load_static_inputs(
-    shared: "RuntimeChannels",
+    shared: "SensorChannels",
     calibration: CameraExtrinsics,
 ) -> tuple[RGBDGeometry, float, np.ndarray] | None:
     """Wait for camera-owned geometry and resolve the verified static transform."""
@@ -112,8 +114,9 @@ def _load_static_inputs(
     return None
 
 
-def run_pointcloud_worker(shared: "RuntimeChannels", config: PointCloudWorkerConfig) -> None:
+def run_pointcloud_worker(shared: "SensorChannels", config: PointCloudWorkerConfig) -> None:
     """Consume only the newest camera sequence and publish fixed ``[N,6]`` clouds."""
+    configure_logging()
     if not isinstance(config, PointCloudWorkerConfig):
         raise TypeError("run_pointcloud_worker requires a PointCloudWorkerConfig")
     if shared.camera_ring is None or shared.pointcloud_ring is None:
@@ -142,11 +145,13 @@ def run_pointcloud_worker(shared: "RuntimeChannels", config: PointCloudWorkerCon
             if latest_sequence <= last_camera_sequence:
                 time.sleep(_IDLE_POLL_S)
                 continue
-            result = shared.camera_ring.read_latest()
+            result = shared.camera_ring.read_latest_uncached()
             if result is None:
                 time.sleep(_IDLE_POLL_S)
                 continue
-            header, color, depth_raw, camera_sequence = result
+            data, _publication_ns, camera_sequence = result
+            header = data["header"]
+            color, depth_raw = data["rgb"][0], data["depth"][0]
             if camera_sequence <= last_camera_sequence:
                 continue
             last_camera_sequence = camera_sequence

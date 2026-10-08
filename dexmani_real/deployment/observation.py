@@ -1,5 +1,7 @@
 """Project real control-row history into the requested Policy observation mapping."""
 
+import logging
+
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,9 +16,9 @@ from dexmani_real.planning.kinematics.arm_fk import (
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
-from dexmani_real.utils.log import ThrottledWarner, get_logger
+from dexmani_real.utils.log import ThrottledWarner
 
-_warn_unavailable = ThrottledWarner(logger=get_logger(__name__))
+_warn_unavailable = ThrottledWarner(logger=logging.getLogger(__name__))
 
 
 @dataclass(frozen=True)

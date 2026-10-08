@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 __all__ = ["VRWristMapper"]
 
 import numpy as np
@@ -9,9 +11,9 @@ from transforms3d.axangles import axangle2mat, mat2axangle
 from transforms3d.quaternions import mat2quat, quat2mat
 
 from dexmani_real.utils.geometry import normalize_quat_wxyz, validate_rotation_matrix
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 def _finite_vector(value: np.ndarray, shape: tuple[int, ...], name: str) -> np.ndarray:
@@ -23,14 +25,13 @@ def _finite_vector(value: np.ndarray, shape: tuple[int, ...], name: str) -> np.n
 
 
 class VRWristMapper:
-    """Reset-relative wrist mapper using one fixed VR-to-robot calibration."""
+    """Reset-relative wrist mapper in xarm_base, using one VR calibration."""
 
     def __init__(
         self,
         pos_scale: float = 1.0,
         rot_scale: float = 1.0,
         vr_to_robot_rot: np.ndarray | None = None,
-        base_to_world_rot: np.ndarray | None = None,
     ) -> None:
         if not np.isfinite(pos_scale):
             raise ValueError("pos_scale must be finite")
@@ -42,11 +43,6 @@ class VRWristMapper:
             np.eye(3)
             if vr_to_robot_rot is None
             else validate_rotation_matrix(vr_to_robot_rot, name="vr_to_robot_rot")
-        )
-        self.base_to_world_rot = (
-            np.eye(3)
-            if base_to_world_rot is None
-            else validate_rotation_matrix(base_to_world_rot, name="base_to_world_rot")
         )
 
         self.wrist_pos0: np.ndarray | None = None
@@ -81,9 +77,7 @@ class VRWristMapper:
         self.scaled_delta_rot = np.eye(3)
         self.eef_pos0 = next_eef_pos0
         self.eef_rot0 = next_eef_rot0
-        # Seed the quaternion in WORLD coordinates for continuity checks.
-        _eef_rot0_world = self.base_to_world_rot @ self.eef_rot0
-        self.last_quat_wxyz = mat2quat(_eef_rot0_world)
+        self.last_quat_wxyz = mat2quat(self.eef_rot0)
 
     def map(
         self,
@@ -102,8 +96,6 @@ class VRWristMapper:
 
         delta_pos_vr = current_wrist_pos - self.wrist_pos0
         delta_pos_base = self.pos_scale * (self.vr_to_robot_rot @ delta_pos_vr)
-        # Rotate the base-frame delta into world coordinates before adding it.
-        delta_pos_world = self.base_to_world_rot @ delta_pos_base
 
         # Scale local SO(3) increments, avoiding the total-angle branch at pi.
         increment = wrist_rot @ self.previous_wrist_rot.T
@@ -112,14 +104,8 @@ class VRWristMapper:
         delta_rot_vr = self.scaled_delta_rot
         # Re-express the VR rotation delta in robot-base axes.
         delta_rot_base = self.vr_to_robot_rot @ delta_rot_vr @ self.vr_to_robot_rot.T
-        delta_rot_world = self.base_to_world_rot @ delta_rot_base @ self.base_to_world_rot.T
-
-        # Convert the EEF reference to world coordinates before combining terms.
-        eef_pos0_world = self.base_to_world_rot @ self.eef_pos0  # type: ignore[operator]  # is_ready() gate
-        eef_rot0_world = self.base_to_world_rot @ self.eef_rot0  # type: ignore[operator]  # is_ready() gate
-
-        target_pos = eef_pos0_world + delta_pos_world
-        target_rot = delta_rot_world @ eef_rot0_world
+        target_pos = self.eef_pos0 + delta_pos_base
+        target_rot = delta_rot_base @ self.eef_rot0
         target_quat_wxyz = normalize_quat_wxyz(mat2quat(target_rot))
         if self.last_quat_wxyz is not None and np.dot(target_quat_wxyz, self.last_quat_wxyz) < 0:
             target_quat_wxyz = -target_quat_wxyz

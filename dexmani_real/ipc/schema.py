@@ -112,6 +112,21 @@ CAMERA_FRAME_HEADER_DTYPE = np.dtype(
 )
 
 
+def make_camera_frame_dtype(rgb_shape, depth_shape):
+    """Aligned RGB/Z16 payload; dtype owns pixel and slot alignment."""
+    if (
+        len(rgb_shape) != 3 or rgb_shape[2] != 3 or len(depth_shape) != 2
+        or tuple(rgb_shape[:2]) != tuple(depth_shape)
+        or any(type(v) is not int or v <= 0 for v in (*rgb_shape, *depth_shape))
+    ):
+        raise ValueError("camera requires positive aligned RGB HWC / Z16 HW shapes")
+    return np.dtype([
+        ("header", CAMERA_FRAME_HEADER_DTYPE),
+        ("rgb", "u1", tuple(rgb_shape)),
+        ("depth", "<u2", tuple(depth_shape)),
+    ], align=True)
+
+
 __all__ = [
     "ARM_STATE_DTYPE",
     "CAMERA_FRAME_HEADER_DTYPE",
@@ -119,5 +134,6 @@ __all__ = [
     "POINT_CLOUD_FEATURE_DIM",
     "VR_FRAME_DTYPE",
     "make_pointcloud_frame_dtype",
+    "make_camera_frame_dtype",
     "validate_point_cloud_array",
 ]

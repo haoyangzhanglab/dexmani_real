@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,9 +13,9 @@ from dexmani_real.planning.kinematics.pose import rot6d_to_rotmat
 from dexmani_real.replay.trajectory import TrajectoryData
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
 from dexmani_real.utils.atomic_io import atomic_json_dump
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 _TRACKING_LAG_WINDOW_S = 0.4
 _MIN_TRACKING_LAG_FRAMES = 6

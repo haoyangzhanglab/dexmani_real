@@ -1,5 +1,7 @@
 """Current-row teleop mapping, absolute target dispatch and raw recording."""
 
+import logging
+
 from typing import NamedTuple
 
 import numpy as np
@@ -19,9 +21,9 @@ from dexmani_real.teleop.control.hand_retargeting import (
     compute_hand_command,
     reset_hand_retargeter,
 )
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 class TeleopController:
@@ -66,13 +68,13 @@ class TeleopController:
         target = compute_target_eef_pose(
             mapped["pos"],
             mapped["quat_wxyz"],
-            previous_position_world_m=self.smoothed_eef_position,
-            previous_quat_world_wxyz=self.smoothed_eef_quaternion,
+            previous_position_xarm_base_m=self.smoothed_eef_position,
+            previous_quat_xarm_base_wxyz=self.smoothed_eef_quaternion,
             ema_alpha_position=cfg.policy.ema.alpha_pos,
             ema_alpha_rotation=cfg.policy.ema.alpha_rot,
         )
         intent = np.concatenate(
-            (target.position_world_m, quat_wxyz_to_rot6d(target.quat_world_wxyz))
+            (target.position_xarm_base_m, quat_wxyz_to_rot6d(target.quat_xarm_base_wxyz))
         )
         hand = None
         if cfg.policy.hand_enabled:
@@ -105,7 +107,7 @@ class ControlStepResult(NamedTuple):
 def execute_control_step(
     controller, shared, robot, row, recorder=None, *, termination_details=None
 ):
-    epoch = int(shared.run_id.value)
+    epoch = int(shared.run_id)
     realization = controller.compute_target(row)
     control_ok = realization is not None and realization.arm_qpos is not None
     target = (
@@ -131,8 +133,8 @@ def execute_control_step(
                 with shared.motion_lock:
                     operator_cancelled = (
                         cause == "authority_revoked"
-                        and int(shared.run_ended_id.value) == epoch
-                        and int(shared.run_ended_reason.value)
+                        and int(shared.run_ended_id) == epoch
+                        and int(shared.run_ended_reason)
                         in (RunEndReason.OPERATOR, RunEndReason.QUIT)
                     )
                 if not operator_cancelled:
@@ -147,7 +149,7 @@ def execute_control_step(
                             )
                         )
                 if cancelled:
-                    shared.estop_request.value = True
+                    shared.estop_request = True
                 revoke_motion_if_run_id(
                     shared,
                     epoch,
@@ -157,7 +159,7 @@ def execute_control_step(
                     if exc.revoked
                     else RunEndReason.HARDWARE_FAULT,
                 )
-        interrupted = failure is not None or int(shared.run_id.value) != epoch
+        interrupted = failure is not None or int(shared.run_id) != epoch
         if interrupted:
             try:
                 robot.stop()

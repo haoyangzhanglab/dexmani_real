@@ -1,5 +1,6 @@
 """Dedicated XHand home with measured convergence under ARMED authority."""
 
+import logging
 import time
 
 import numpy as np
@@ -15,9 +16,9 @@ from dexmani_real.runtime.safety import (
     revoke_motion_if_run_id,
 )
 from dexmani_real.utils.limits import validate_hand_command_bounds
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 _HOME_CONSECUTIVE_SAMPLES = 3
 
@@ -33,10 +34,10 @@ def home_hand(shared, runtime, *, robot, abort_requested=None):
         np.asarray(cfg.mechanical_qpos_min_rad),
         np.asarray(cfg.mechanical_qpos_max_rad),
     )
-    if int(shared.safety_state.value) != int(SafetyState.ARMED):
+    if int(shared.safety_state) != int(SafetyState.ARMED):
         return HomeResult(False, "hand home requires ARMED")
     revoke_motion(shared)
-    epoch = int(shared.run_id.value)
+    epoch = int(shared.run_id)
     if not command_may_cross_sdk(shared, run_id=epoch, required_safety_state=SafetyState.ARMED):
         return HomeResult(False, "hand home requires ARMED authority", interrupted=True)
     if abort_requested is not None and abort_requested():

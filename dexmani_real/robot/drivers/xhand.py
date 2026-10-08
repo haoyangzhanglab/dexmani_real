@@ -10,6 +10,7 @@ because they cannot establish whether the command reached the device.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -29,10 +30,9 @@ from dexmani_real.robot.model import (
 from dexmani_real.utils.log import (
     capture_native_stdout,
     extract_native_diagnostics,
-    get_logger,
 )
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _SDK_PROTOCOL = {"ethercat": "EtherCAT", "serial": "RS485"}
 _OPEN_RETRIES = {"ethercat": 2, "serial": 3}

@@ -1,5 +1,6 @@
 """Own the local policy/robot, sensor processes and operator lifecycle."""
 
+import logging
 import multiprocessing as mp
 import os
 from dataclasses import replace
@@ -18,7 +19,8 @@ from dexmani_real.deployment.config import (
 from dexmani_real.deployment.observation import build_observation_kinematics
 from dexmani_real.deployment.operator import PolicyOperator
 from dexmani_real.deployment.runner import PolicyRunner
-from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
+from dexmani_real.ipc.channels import SensorChannelsConfig
+from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.recording.recorder import AsyncEpisodeRecorder
 from dexmani_real.recording.results import SessionResults, error_detail
 from dexmani_real.robot.action import ActionRealizer
@@ -34,9 +36,10 @@ from dexmani_real.runtime.safety import (
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.pointcloud_worker import PointCloudWorkerConfig, run_pointcloud_worker
-from dexmani_real.utils.log import get_logger
+from dexmani_real.utils.log import configure_logging
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 def _load_configured_policy(policy_config, execution_config):
@@ -96,21 +99,18 @@ def run_policy_deployment(
     max_running_s=None,
     num_episodes=1,
     recording_config=None,
-    execution_config=None,
     camera_calibration_path=None,
     save_run_config=None,
 ):
     """Run one session; without recording_config there are no persistent result artifacts."""
+    configure_logging()
     from dexmani_real.deployment.inference import InferenceWorker
 
     info = policy_config.info
     cloud_recipe = validate_policy_runtime_compatibility(info, runtime)
     max_running_s = validate_max_running_s(max_running_s)
-    execution_config = (execution_config or runtime.execution).validate(
-        info, max_running_s=max_running_s
-    )
+    execution_config = runtime.execution.validate(info, max_running_s=max_running_s)
     validate_robot_config(runtime)
-    runtime = replace(runtime, execution=execution_config)
     if cloud_recipe is not None:
         runtime = replace(runtime, pointcloud=cloud_recipe)
     runtime = resolve_runtime_table(runtime, pointcloud=cloud_recipe)
@@ -132,7 +132,6 @@ def run_policy_deployment(
         camera = cloud or "rgb" in fields or recording_config is not None
         if camera:
             runtime.camera.validate()
-        points = cloud_recipe.num_points if cloud else runtime.pointcloud.num_points
         camera_calibration = (
             CameraExtrinsics(camera_calibration_path)
             if cloud
@@ -150,11 +149,11 @@ def run_policy_deployment(
             else None
         )
         ctx = mp.get_context("spawn")
-        shared = RuntimeChannels.create(
+        shared = RuntimeState.create(
             prefix=prefix or f"dexmani_policy_{os.getpid()}",
             mp_context=ctx,
-            config=RuntimeChannelsConfig.from_runtime(
-                runtime, pointcloud_num_points=points, camera=camera, pointcloud=cloud
+            config=SensorChannelsConfig.from_runtime(
+                runtime, camera=camera, pointcloud=cloud
             ),
         )
         supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
@@ -194,14 +193,16 @@ def run_policy_deployment(
         sensors = []
         if camera:
             sensors.append(
-                ctx.Process(name="camera", target=run_camera_worker, args=(shared, runtime.camera))
+                ctx.Process(
+                    name="camera", target=run_camera_worker, args=(shared.sensors, runtime.camera)
+                )
             )
         if cloud:
             sensors.append(
                 ctx.Process(
                     name="pointcloud",
                     target=run_pointcloud_worker,
-                    args=(shared, pointcloud_config),
+                    args=(shared.sensors, pointcloud_config),
                 )
             )
         supervisor.start(sensors)
@@ -215,7 +216,7 @@ def run_policy_deployment(
             idle_for_tare=lambda: (
                 runner.run_id is None
                 and runner.preparing_epoch is None
-                and not shared.start_request.value
+                and not shared.start_request
                 and model.future is None
                 and (recorder is None or not recorder.is_recording)
             ),
@@ -232,29 +233,28 @@ def run_policy_deployment(
             recorder=recorder,
             poll_operator=operator.poll,
             model_runtime=model,
-            execution_config=execution_config,
             kinematics=kinematics,
             execute=execute,
             max_running_s=max_running_s,
             num_episodes=num_episodes,
-            recording_config=recording_config,
+            task_label=recording_config.task_label if recording_config is not None else None,
             camera_calibration=camera_calibration,
             results=results,
         )
         runner.run()
         clean = bool(
-            shared.quit_requested.value
-            and not shared.estop_request.value
-            and not shared.error_state.value
+            shared.quit_requested
+            and not shared.estop_request
+            and not shared.error_state
         )
     except KeyboardInterrupt as exc:
         if shared is not None:
-            shared.estop_request.value = True
+            shared.estop_request = True
         failure = exc
     except Exception as exc:
         failure = exc
         if shared is not None:
-            shared.error_state.value = True
+            shared.error_state = True
         logger.exception("policy session failed")
     finally:
         try:
@@ -269,7 +269,7 @@ def run_policy_deployment(
                     timeout_s=runtime.safety.shutdown_timeout_s,
                 )
             elif shared is not None:
-                shutdown_clean = bool(shared.close())
+                shutdown_clean = bool(shared.sensors.close())
         except Exception as exc:
             failure = failure or exc
             if results is not None:

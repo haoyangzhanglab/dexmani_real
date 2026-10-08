@@ -21,7 +21,8 @@ import numpy as np
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.config.hardware import VRParams
-from dexmani_real.ipc.channels import RuntimeChannels, RuntimeChannelsConfig
+from dexmani_real.ipc.channels import SensorChannelsConfig
+from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz
 from dexmani_real.runtime.processes import shutdown_processes_verified
 from dexmani_real.runtime.supervisor import wait_subsystem_ready
@@ -129,11 +130,11 @@ def _quality_measurements(
     }
 
 
-def _wait_for_vr_tracking(shared: RuntimeChannels, timeout_s: float) -> bool:
+def _wait_for_vr_tracking(shared: RuntimeState, timeout_s: float) -> bool:
     deadline = time.monotonic() + timeout_s
     last_print = 0.0
     while time.monotonic() < deadline:
-        result = shared.vr_ring.read_latest()
+        result = shared.sensors.vr_ring.read_latest()
         if result is not None:
             data, _ts, _seq = result
             hp = np.asarray(data["head_pos"][0], dtype=np.float64)
@@ -149,10 +150,10 @@ def _wait_for_vr_tracking(shared: RuntimeChannels, timeout_s: float) -> bool:
     return False
 
 
-def _shutdown_vr_receiver(shared: RuntimeChannels, vr_proc: mp.Process) -> bool:
+def _shutdown_vr_receiver(shared: RuntimeState, vr_proc: mp.Process) -> bool:
     if vr_proc.pid is None:
-        shared.is_running.value = False
-        return shared.close()
+        shared.sensors.is_running.value = False
+        return shared.sensors.close()
     try:
         shutdown_clean = shutdown_processes_verified(
             shared,
@@ -230,12 +231,15 @@ def main(argv: list[str] | None = None) -> int:
 
     vr_config = VRParams(port=args.port)
     vr_config.validate()
+    from dexmani_real.utils.log import configure_logging
+
+    configure_logging()
     ctx = mp.get_context("spawn")
-    shared = RuntimeChannels.create(
-        prefix="dexmani_vr_calib", config=RuntimeChannelsConfig(vr=True), mp_context=ctx
+    shared = RuntimeState.create(
+        prefix="dexmani_vr_calib", config=SensorChannelsConfig(vr=True), mp_context=ctx
     )
     processes = [
-        ctx.Process(name="vr", target=run_vr_worker, args=(shared, vr_config), daemon=True)
+        ctx.Process(name="vr", target=run_vr_worker, args=(shared.sensors, vr_config), daemon=True)
     ]
     vr_proc = processes[0]
     forwards: list[np.ndarray] = []
@@ -279,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"  Collecting {args.duration}s (hold still)...")
         while time.monotonic() < deadline:
-            result = shared.vr_ring.read_latest()
+            result = shared.sensors.vr_ring.read_latest()
             if result is None:
                 time.sleep(_POLL_INTERVAL_S)
                 continue

@@ -10,12 +10,12 @@ FreeFlyer convention:
 
 from __future__ import annotations
 
+import logging
 import numpy as np
 import pinocchio as pin
 
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _FINGERTIP_ORDER = ("thumb", "index", "mid", "ring", "pinky")
 

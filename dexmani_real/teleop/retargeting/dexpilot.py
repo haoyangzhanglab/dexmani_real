@@ -6,9 +6,9 @@ this device-facing boundary must propagate that failure to the I/O owner.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
-import time
 from typing import Any
 
 import nlopt
@@ -30,9 +30,9 @@ from dexmani_real.teleop.retargeting.retargeter import (
     adaptive_retargeting_xhand,
     validate_landmarks,
 )
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 class StrictDexPilotOptimizer(DexPilotOptimizer):
@@ -131,32 +131,13 @@ class DexPilotHandRetargeter:
     def __init__(
         self,
         dexpilot_config: Any,
-        fixed_joint_values: np.ndarray | None = None,
-        hand_type: str = "right",
-        retargeting_type: str = "dexpilot",
-        debug_adapters: bool = False,
     ):
         dexpilot_config.validate()
-        self.hand_type = hand_type
-        self.retargeting_type = retargeting_type
-        self.fixed_joint_values = (
-            np.array([]) if fixed_joint_values is None else np.array(fixed_joint_values)
-        )
-        self.debug_adapters = bool(debug_adapters)
-        self._dexpilot_config = dexpilot_config
         self._pinky_scale = float(dexpilot_config.pinky_scale)
         self._pinky_palm_scale = float(dexpilot_config.pinky_palm_scale)
-        # Keep the public output in the canonical SDK order.
-        self.sdk_joint_names = XHAND_SDK_JOINT_NAMES
-
-        self.load_retargeter()
-
-    def load_retargeter(self):
         import yaml
 
-        config_path = (
-            ASSET_DIR / "retargeting" / f"xhand_{self.hand_type}_{self.retargeting_type}.yml"
-        )
+        config_path = ASSET_DIR / "retargeting" / "xhand_right_dexpilot.yml"
 
         with open(str(config_path), "r") as f:
             yaml_config = yaml.load(f, Loader=yaml.FullLoader)
@@ -170,10 +151,10 @@ class DexPilotHandRetargeter:
             )
 
         cfg.update(
-            scaling_factor=float(self._dexpilot_config.scaling_factor),
-            low_pass_alpha=float(self._dexpilot_config.low_pass_alpha),
-            project_dist=float(self._dexpilot_config.project_dist_m),
-            escape_dist=float(self._dexpilot_config.escape_dist_m),
+            scaling_factor=float(dexpilot_config.scaling_factor),
+            low_pass_alpha=float(dexpilot_config.low_pass_alpha),
+            project_dist=float(dexpilot_config.project_dist_m),
+            escape_dist=float(dexpilot_config.escape_dist_m),
         )
 
         RetargetingConfig.set_default_urdf_dir(str(ASSET_DIR / "robots"))
@@ -185,7 +166,7 @@ class DexPilotHandRetargeter:
 
         retargeter_joint_names = self.retargeter.optimizer.robot.dof_joint_names
         self.retargeted_joint_order = np.array(
-            [retargeter_joint_names.index(name) for name in self.sdk_joint_names]
+            [retargeter_joint_names.index(name) for name in XHAND_SDK_JOINT_NAMES]
         ).astype(int)
         self.inverse_retargeted_joint_order = np.argsort(self.retargeted_joint_order)
 
@@ -228,11 +209,9 @@ class DexPilotHandRetargeter:
             logger.warning("Coordinate transform failed — no target produced")
             return None
 
-        start_time = time.perf_counter() if self.debug_adapters else 0.0
-
         ref_value = self._build_ref_value(mano_landmarks)
         try:
-            qpos = self.retargeter.retarget(ref_value, fixed_qpos=self.fixed_joint_values)
+            qpos = self.retargeter.retarget(ref_value, fixed_qpos=np.array([]))
         except nlopt.RoundoffLimited:
             logger.warning("Retargeting roundoff limit reached — no target produced")
             return None
@@ -244,12 +223,6 @@ class DexPilotHandRetargeter:
         qpos_arr = np.asarray(qpos, dtype=float)
 
         qpos_arr = qpos_arr[self.retargeted_joint_order]
-
-        if self.debug_adapters:
-            logger.info(
-                "DexPilotHandRetargeter: retarget %.2f ms",
-                1000 * (time.perf_counter() - start_time),
-            )
 
         return qpos_arr
 

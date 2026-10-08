@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from typing import Callable
 
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class LoopRate:

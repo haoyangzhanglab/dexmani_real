@@ -16,10 +16,10 @@ from dexmani_real.utils.geometry import normalize_quat_wxyz
 
 @dataclass(frozen=True)
 class EefTargetProposal:
-    """One world-frame EEF target after explicit smoothing."""
+    """One xarm_base EEF target after explicit smoothing."""
 
-    position_world_m: np.ndarray
-    quat_world_wxyz: np.ndarray
+    position_xarm_base_m: np.ndarray
+    quat_xarm_base_wxyz: np.ndarray
 
 
 def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
@@ -89,30 +89,30 @@ def _finite_vector(value: np.ndarray, shape: tuple[int, ...], name: str) -> np.n
 
 
 def compute_target_eef_pose(
-    mapped_position_world_m: np.ndarray,
-    mapped_quat_world_wxyz: np.ndarray,
+    mapped_position_xarm_base_m: np.ndarray,
+    mapped_quat_xarm_base_wxyz: np.ndarray,
     *,
-    previous_position_world_m: np.ndarray | None,
-    previous_quat_world_wxyz: np.ndarray | None,
+    previous_position_xarm_base_m: np.ndarray | None,
+    previous_quat_xarm_base_wxyz: np.ndarray | None,
     ema_alpha_position: float,
     ema_alpha_rotation: float,
 ) -> EefTargetProposal:
-    """Smooth one mapped world-frame EEF target."""
-    raw_position_world_m = _finite_vector(mapped_position_world_m, (3,), "mapped_position_world_m")
-    raw_quat_world_wxyz = normalize_quat_wxyz(mapped_quat_world_wxyz)
-    position_world_m = raw_position_world_m.copy()
-    quat_world_wxyz = raw_quat_world_wxyz.copy()
-    if previous_position_world_m is not None and previous_quat_world_wxyz is not None:
-        position_world_m, quat_world_wxyz = ema_smooth_pose(
-            position_world_m,
-            quat_world_wxyz,
-            previous_position_world_m,
-            previous_quat_world_wxyz,
+    """Smooth one mapped xarm_base EEF target."""
+    position_xarm_base_m = _finite_vector(
+        mapped_position_xarm_base_m, (3,), "mapped_position_xarm_base_m"
+    )
+    quat_xarm_base_wxyz = normalize_quat_wxyz(mapped_quat_xarm_base_wxyz)
+    if previous_position_xarm_base_m is not None and previous_quat_xarm_base_wxyz is not None:
+        position_xarm_base_m, quat_xarm_base_wxyz = ema_smooth_pose(
+            position_xarm_base_m,
+            quat_xarm_base_wxyz,
+            previous_position_xarm_base_m,
+            previous_quat_xarm_base_wxyz,
             ema_alpha_position,
             ema_alpha_rotation,
         )
 
     return EefTargetProposal(
-        position_world_m=position_world_m,
-        quat_world_wxyz=quat_world_wxyz,
+        position_xarm_base_m=position_xarm_base_m,
+        quat_xarm_base_wxyz=quat_xarm_base_wxyz,
     )

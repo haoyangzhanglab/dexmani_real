@@ -33,6 +33,7 @@ from dexmani_real.robot.model import (
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
 )
 from dexmani_real.utils.limits import validate_hand_command_bounds
+from dexmani_real.utils.log import configure_logging
 
 _RS485_COMBINED_FORCE_ERROR_CODE = 1_501_018
 _RS485_DISTRIBUTED_FORCE_ERROR_CODE = 1_501_019
@@ -351,6 +352,7 @@ def _serial_port_problem(serial_port: str) -> str | None:
 def _run_hardware_session(config: HandParams, *, finger_id: int, read_only: bool) -> int:
     # Validate every endpoint before connecting, including narrowed experiment limits.
     actions = [] if read_only else _action_sequence(config)
+    configure_logging()
     interrupted_signal = None
     cleaning_up = False
 

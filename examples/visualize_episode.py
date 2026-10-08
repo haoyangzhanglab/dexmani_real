@@ -9,6 +9,7 @@ python examples/visualize_episode.py episodes/test/episode_001 --max-frames 100 
 
 from __future__ import annotations
 
+import logging
 import argparse
 import os
 import time
@@ -33,9 +34,9 @@ from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording import EpisodeReader
 from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE, XHAND_RIGHT_URDF_PATH
-from dexmani_real.utils.log import get_logger
 
-logger = get_logger(__name__)
+
+logger = logging.getLogger("dexmani_real.cli.visualize_episode")
 
 
 _SERIES_GROUPS = {
@@ -477,6 +478,9 @@ def main(argv: list[str] | None = None) -> int:
 
     runtime = load_experiment_config(yaml_path=args.config)
     runtime.hand.validate()
+    from dexmani_real.utils.log import configure_logging
+
+    configure_logging()
     pointcloud_config = None
     table_plane_abcd = None
     if args.point_cloud:
