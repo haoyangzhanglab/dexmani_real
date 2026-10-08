@@ -21,10 +21,6 @@ dependencies = [
 
 [project.optional-dependencies]
 interactive = ["pynput>=1.7"]
-dev = ["pytest", "ruff"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
 
 [tool.setuptools]
 include-package-data = true
@@ -32,15 +28,8 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dexmani_real*"]
-exclude = ["tests*", "examples*", "assets*", "docs*"]
+exclude = ["examples*", "assets*"]
 namespaces = false
 
 [tool.setuptools.package-data]
 "dexmani_real.calibration" = ["state/*.json"]
-
-[tool.ruff]
-line-length = 100
-target-version = "py310"
-
-[tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "I"]

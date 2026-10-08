@@ -13,7 +13,7 @@ DexMani Real 是面向个人 PhD 研究的真实机器人代码库，当前围�
 支持源码 checkout + editable 安装（Python >= 3.10）；assets 按 checkout 路径读取，不宣称 wheel/PyPI 支持。
 
 ```bash
-python -m pip install -e ".[dev]"
+python -m pip install -e .
 # 桌面交互入口另需：python -m pip install -e ".[interactive]"
 ```
 
@@ -21,7 +21,7 @@ python -m pip install -e ".[dev]"
 离线几何导出需要 Pinocchio，点云诊断视图需要 Open3D（公共点云导出使用 NumPy/SciPy/OpenCV）；retargeting 需要 NLopt/选定后端。
 交互入口使用 pynput 全局键盘监听，需要桌面显示环境；`--info` 不需要 Rerun。
 
-基础依赖、交互依赖和开发检查依赖在 `pyproject.toml` 中分开；几何、算法及厂商 SDK 使用实验环境中已核实的安装，详见 [离线复现入口](docs/reproduction.md)。该页包含不接硬件的小型 synthetic Raw → export → window 路径和未发布资源边界。
+基础依赖与交互依赖在 `pyproject.toml` 中分开；几何、算法及厂商 SDK 使用实验环境中已核实的安装。
 
 ## Quick Start
 
@@ -47,7 +47,7 @@ python examples/pointcloud_process_example.py --help
 ```
 
 相机外参、桌面平面、hand mount、VR alignment 等属于**当前实验现场状态**。更换相机、桌面、机器人安装或实验布局后，应重新标定或确认，而不是沿用历史数值作为固定契约。首次桌面标定在 pointcloud 示例中选择 table calibration，不要求旧 plane 文件。
-手基座/指尖 FK 使用当前安装补偿，碰撞与规划使用标称资产几何；两者的区别见 [执行保护范围](docs/policy_execution.md#使用与支持范围)。
+手基座/指尖 FK 使用当前安装补偿，碰撞与规划使用标称资产几何。
 录制允许缺相机外参，重建点云需要对应的内外参和 depth scale。相机、桌面与 VR 标定在会话启动时读取；文件修改在下次会话生效。
 路径可显式选择：采集 `--vr-transform` / `--camera-calibration`，policy `--camera-calibration` / `--output`，相机/VR 标定 `--output`；桌面沿用 YAML `environment.table.plane_path`（相对 checkout），示教输出沿用 `policy.episodes_dir`。默认仍是既有 checkout 路径，不自动移动历史标定或数据。
 
@@ -87,7 +87,7 @@ Viewer 的 `--config` 指定当前实验的点云、桌面及手部安装参数�
 
 ### 5. 训练策略
 
-策略模型、Dataset、训练与 checkpoint 由 [dexmani_policy](https://github.com/haoyangzhanglab/dexmani_policy) 管理。本仓提供可重建的 Canonical 数据，字段、单位与窗口规则见 [数据说明](docs/data.md)。
+策略模型、Dataset、训练与 checkpoint 由 [dexmani_policy](https://github.com/haoyangzhanglab/dexmani_policy) 管理。本仓提供可重建的 Canonical 数据。
 
 ### 6. 真机评估
 
@@ -99,7 +99,7 @@ python examples/run_policy.py <policy/task/experiment> --config experiment.yaml 
 
 H 执行 HOME，空闲且确认手部无接触后 T 归零触觉，B 请求开始，S 停止，Q 退出，ESC 急停。HOME 结束后若要再次 HOME、归零或开始，需重新按 H/T/B；停止尚在处理时 H 被拒绝，完成后需重新发起。触觉归零可用 S/Q/ESC 取消。开始前检查当前 arm/hand HOME 姿态。默认每段运行预算 60 秒，可用 `--max-duration` 修改。
 
-三个执行预算必须由实验者通过 CLI 或 YAML `execution` 指定，不由 warmup 推断为硬件安全值。模式默认 sync；async/rtc 的预取、guidance、动作段长度覆盖和调度规则见 [Policy 执行说明](docs/policy_execution.md)。模型加载与 warmup 在连接设备前完成。
+三个执行预算必须由实验者通过 CLI 或 YAML `execution` 指定，不由 warmup 推断为硬件安全值。执行模式默认为 sync；模型加载与 warmup 在连接设备前完成。
 
 `--no-record` 仍连接设备并执行动作，仅关闭录制；程序接口的 `execute=False` 仍连接并读取设备。它们都不是离线验证入口。
 
@@ -129,8 +129,6 @@ H 执行 HOME，空闲且确认手部无接触后 T 归零触觉，B 请求开�
 Raw 保存真实观测、尝试目标与结束原因，发布后不可变。停止和失败保留已采前缀，仅操作者显式丢弃才删除当前 capture；写盘或发布失败保留 staging 并报错。
 
 Canonical 是从 Raw 重建的训练缓存，公共导出保留全部 13 字段、缺测与 episode 边界，下游按模型所需字段筛选。重新导出使用新路径，不覆盖 Raw 或旧缓存。
-
-字段、单位、时间语义、dispatch 与导出限制见 [数据说明](docs/data.md)；policy trace 与评估结果见 [数据与追踪](docs/policy_execution.md#数据与追踪)。
 
 ## Repository Layout
 
@@ -179,4 +177,4 @@ Real 侧负责真实硬件生命周期、现场标定和运动安全；Policy �
 
 ## Development
 
-离线检查命令和环境要求见 [复现入口](docs/reproduction.md)。长期协作约束见 [AGENTS.md](AGENTS.md)，Claude 阅读入口见 [CLAUDE.md](CLAUDE.md)。当前行为以源码、配置和 CLI 为准。
+离线检查命令与长期协作约束见 [AGENTS.md](AGENTS.md)，Claude 阅读入口见 [CLAUDE.md](CLAUDE.md)。当前行为以源码、配置和 CLI 为准。

@@ -190,10 +190,10 @@ README 不维护容易过时的类清单、字段级 runtime contract、状态�
 
 ```bash
 python -m compileall -q dexmani_real examples
-ruff format --check dexmani_real examples
-ruff check dexmani_real examples
 git diff --check
 ```
+
+本仓库不使用 Ruff 或 pytest。不要运行或重新引入这两个工具，也不要生成 `.ruff_cache/` 或 `.pytest_cache/`。
 
 根据改动补充 focused pure-logic checks，例如 geometry、FK / IK、config、dataset processing 或 observation construction。
 
