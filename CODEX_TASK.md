@@ -4,6 +4,8 @@
 
 设计基线：`main@40aa2b2dd8cdabaf09ea530832682e73206bd526`（`1009 temp`）。2026-10-09 复核主分支、源码、四个参考项目及前轮 fact-check 后形成。执行时先检查 HEAD 和相关 diff；已经修复的项目只验证，不重复改写。遵守 [AGENTS.md](AGENTS.md)，保留无关修改。
 
+最终审查：2026-10-09，复核任务书初稿 `5cfd242`；业务源码基线未变化。本文的验收以行为正确、改动最小为准，不以特定类名、枚举、提交数量或代码行数为准。先完成五个确定 bug，再落实已选实验契约，最后评估可选精简。
+
 ## 1. 目标与最终选择
 
 交付一条个人 PhD 可以读懂、调试和复现实验的链路：遥操作采集 → Raw → canonical 训练数据 → Policy → 真实机器人执行与评估。优先修正科学语义和控制边界，再删除没有当前研究价值的复杂度。
@@ -86,7 +88,7 @@ D01（异常 WAIT）、D02（tare 取消）、D03（训练标签）、D04（dens
 
 优先级 P1。修复 B01/B03，并落实 S01。主要修改 [teleop/runner.py](dexmani_real/teleop/runner.py)；只在必要时调整 [operator_input.py](dexmani_real/runtime/operator_input.py)。
 
-用一个本地小枚举表达 IDLE / PREPARING / RUNNING / PAUSED，替代可矛盾的 `active/paused/resume_requested` 组合。保留必要的 `quit_pending`、准备完成后的新鲜时间边界和运动 run_id；不引入状态机库，不把录制器状态复制成第二套布尔状态。明确转换应集中在少量方法里。
+下面四态是行为划分，不要求为了修 bug 重写整个 runner。先用少量集中转换方法消除 `active/paused/resume_requested` 的矛盾组合；如果本地小枚举能减少总状态与分支，再替换旧标志，禁止枚举和旧布尔量两套状态同时维护。保留必要的 `quit_pending`、准备完成后的新鲜时间边界和运动 run_id；不引入状态机库，不复制录制器状态。
 
 | 当前状态/事件 | 目标行为 |
 |---|---|
@@ -105,9 +107,11 @@ D01（异常 WAIT）、D02（tare 取消）、D03（训练标签）、D04（dens
 
 同一批键盘事件中，终止事件必须压过所有可能重新授予运动的事件，包括 C 的恢复。覆盖 S→C、C→S、S→B、Q→C、D→B 等排列；Q→C 的取消确认只允许来自**后续新输入批次**。S 与 D 同批优先保存，避免混合按键造成丢弃；ESC 不被普通结束原因覆盖。无需为了这个规则重写键盘监听架构。
 
+还须处理 poll 与准备期间的异步撤权：轮询命令前记住许可代次，开始准备时在 motion lock 内核验并绑定准备代次；自身必要的 revoke 可更新该代次，S/Q/ESC 等外部撤权必须使准备失效。保存、读状态、建立 reference 等阻塞边界之后，只有同一准备代次仍有效才可 begin。不能在 `_try_resume` 临时读取已经被 STOP 更新后的新 run_id，并把它误当成原 B/C 的许可。复用现有 run_id/锁即可，无需重做键盘事件协议。
+
 不含 recorder 的调试会话同样清理本地状态。所有保存/编码可能阻塞的工作，必须发生在撤权和停止请求之后。停止失败不能把界面标为可重新开始的正常 IDLE，而应走原有故障退出。准备期失败、writer 失败、STOP 与 SDK 返回交错时，保留第一结束原因及附加清理错误。
 
-验收：用真实 runner 方法配假 clock/robot/recorder 注入事件，证明终止批次中 `begin_motion` 次数为 0；S/D 后新 B 可开始；暂停期间无新行；恢复后的行属于新 episode；IDLE 的 Q 不需二次确认。显式检查 ESC 仍锁存、旧 run_id 始终不可下发。
+验收：用真实 runner 方法配假 clock/robot/recorder 注入事件，证明终止批次中 `begin_motion` 次数为 0；额外覆盖 poll 返回后、保存中、reference 建立前后的 STOP 回调，不能重新授权。S/D 后新 B 可开始；暂停期间无新行；恢复后的行属于新 episode；IDLE 的 Q 不需二次确认。显式检查 ESC 仍锁存、旧 run_id 始终不可下发。
 
 ## 6. 实施包 B：采集时间与训练标签正确性
 
@@ -116,7 +120,7 @@ D01（异常 WAIT）、D02（tare 取消）、D03（训练标签）、D04（dens
 ### 6.1 一个显式节拍，不做时间修复
 
 1. 控制时间使用整数 monotonic ns。首个实际控制采样作为本段 `t0`，以后目标采样时刻为 `t0 + k * dt_ns`；准备、HOME、暂停不占训练 tick。删除用每次 `now + dt` 推迟整条时间轴的调度。
-2. 当前任务采用单一初始准入预算 `epsilon = dt / 4`（16 Hz 时为 15.625 ms）。这是**本次设计选择**，不是既有测量结论、硬实时保证或最优噪声阈值。将规则放在一个小的纯函数/常量定义处，采集与导出共享；本轮不增加分模式宽松阈值或兼容开关。部署已有决策预算不因此被改成这个值。
+2. 当前任务采用单一初始准入预算 `epsilon = dt / 4`（16 Hz 时为 15.625 ms）。这是**本次设计选择**，不是既有测量结论、硬实时保证或最优噪声阈值。将规则放在一个无硬件/存储重依赖的小纯函数或常量定义处，采集与导出共享；本轮不增加分模式宽松阈值或兼容开关。后续实测调参仍须满足 `0 <= epsilon < dt/2`，不能靠放宽到一整拍掩盖漏拍。部署已有决策预算不因此被改成这个值。
 3. 取样前检查漏拍；取样后检查本次 `ObservationRow.observation_timestamp_ns`，不能只在阻塞的 `robot.read_state()` 之前检查。正常采样应在该拍 `[due, due + epsilon]` 内。
 4. 采样抖动预算与动作计算预算分开：控制计算和下发可使用本拍剩余时间。将下一拍起点 `t0 + (k + 1) * dt_ns` 作为该动作的 exclusive deadline，与已有 feedback deadline 取最小值，传给当前 SDK 前置检查。不要把整个 IK/SDK 链路挤进采样用的 `dt/4`；也不得仅因反馈尚未过期就在下一拍发送上一拍目标。第一拍同样受下一拍起点约束。
 5. 晚于预算或漏拍时，结束本轮、撤权、stop、保存前缀与原因；不赶帧、不重标 t0、不连续补发。已实际获得的异常行/下发结果按原值保留；未下发不能填上一次动作。尚未获得完整行则记终止原因和已知时间，不伪造 ObservationRow。
@@ -157,29 +161,36 @@ Raw rollout 的 bootstrap/WAIT 行继续保留无动作证据。公共导出按�
 
 ### C. 异常终止，正常等待；顺便缩小决策元数据
 
-优先级 P1（行为选择 D01），其后做局部优化 S04。主要修改 [deployment/runner.py](dexmani_real/deployment/runner.py) 和 [deployment/observation.py](dexmani_real/deployment/observation.py)。
+优先级 P1（行为选择 D01）；S04 是全部必修项之后单独评估的可选局部优化。主要修改 [deployment/runner.py](dexmani_real/deployment/runner.py) 和 [deployment/observation.py](dexmani_real/deployment/observation.py)。
 
 当前 `_invalidate()` 同时承担正常换 chunk、异常观测、过期结果和自动重新查询。将这些调用点按实际原因分清；允许用两个短的局部方法表达“清当前计划进入正常等待”和“结束本轮”，不要增加 WAIT 原因策略框架。
 
 | 条件 | 行为 |
 |---|---|
-| bootstrap 正在收集真实历史/计算；sync 正常 chunk 间隙；async 在尚未到达 handoff 前等结果 | 必要观测保持健康且 tick 按期时，允许现有预算内 WAIT。持续轮询停止输入；不重复下发旧目标 |
+| bootstrap 正在收集真实历史/计算；sync 正常 chunk 间隙，且没有可执行计划 | 必要观测保持健康且 tick 按期时，允许现有预算内 WAIT。持续轮询停止输入；不重复下发旧目标 |
+| async/RTC 的下一次推理尚未完成，但当前计划有效且 handoff 未到 | 继续按 slot 消费当前计划，包括已冻结且重新校验通过的前缀；这不是无动作 WAIT，不得仅因 future pending 就暂停或启动 WAIT 超时 |
 | 必要观测缺失或过期；错过控制 slot / handoff；decision 到期；动作实现被拒而无可执行目标 | 立即结束本轮：撤权、stop、清历史/计划，保存真实行与结束原因；禁止同一 run_id 自动恢复 |
 | WAIT 超时 | 结束本轮并记录 timeout；重复 invalidate/提交新 query 不得重置超时起点来延长预算 |
 | 操作者 S/Q/ESC、硬件/模型/录制故障 | 保留现有原因分类与清理优先级；停止动作先于输出 finalization |
 
 正常 WAIT 中不发送新目标，也不承诺硬件已经静止；Mode 6 中上一已接受目标可能继续执行。不得把每次正常推理间隙都变成紧急 stop 或额外 HOME，也不新增保持目标控制器。
 
+“必要观测”按当前控制反馈、模型声明输入和已开启录制所需相机来判定。未被模型使用的辅助触觉缺测仍保留 NaN，不要为了 D01 把所有可选通道都变成停机条件。公共导出继续执行全 13 字段准入，两者职责不同。
+
+终止顺序必须明确：先撤权并尝试 stop，再在 recorder 仍接收时最多追加一次已有真实末行/dispatch，最后 finalize；没有行则仅记原因，不造数据。writer/stop 失败仍尝试适当的后续清理并保留 staging/错误，不能先 finalize 再 `_record(row)`。`_poll_model`、`_handoff`、`_prefetch`、动作实现等辅助函数若已结束本轮，调用者必须立即退出本拍，不能继续使用缓存的 plan、追加历史、查询或下发。用简单返回值/当前 run_id 检查表达，不新增异常控制流框架。
+
+具体终止原因必须进入 Raw 的既有 `termination_details`，不能只写 evaluation JSON。基线 `_finalize_outputs` 给 recorder 的 `details` 目前只有 errors；落实 D01 时要让 observation/decision/slot 超期等具体原因在 `--no-results` 下也可追溯。沿用第一结束原因，附加细节不能覆盖操作员停止或真实硬件故障；无需新增一套错误码注册表。
+
 异常之后，已有 in-flight future 只允许被回收，其结果不能下发。清除遗留 start request；新的 B 必须来自异常边界后的输入，并满足既有 HOME/新鲜度/模型空闲检查。若已达到 `num_episodes` 或会话退出条件则退出；不擅自增加自动 HOME 或后台重启。
 
-在行为正确后，将 Query/Plan 反复携带的 `sources: dict[str, tuple[int,...]]` 收敛为 `decision_valid_until_ns`：
+S04 仅在完整修复与验收后、能够净减少状态/遍历且保持诊断时实施；否则保留来源字典并报告原因，不阻塞完成。若实施，将 Query/Plan 反复携带的 `sources: dict[str, tuple[int,...]]` 收敛为 `decision_valid_until_ns`：
 
 - 只对当前实现已有的最新历史行 source clocks 做等价替换，不偷偷把整个历史窗口都纳入新年龄条件。
 - 构造 Query 时必须验证每个所需源时间 `0 < stamp <= now`，来源集合非空，且当前尚未过期；先验证，再求最小值。单取最小值会掩盖未来时间戳，属于错误简化。
 - 当前全部源共用 `max_decision_age_s`，故截止时间等于 `min(stamp + age_ns + 1)`。交接、消费与每端发送统一采用 exclusive deadline；与当前反馈、slot、总预算继续取最小值。
 - `query_id`、`run_id`、query slot、handoff slot 与 bootstrap 标记保留。需要的诊断在 query 建立处记录，不让大字典穿过所有执行层；不建立额外遥测系统。
 
-验收采用 fake clock + 可控 future，覆盖 sync/async/RTC 与 N=1/2：正常 bootstrap/换段不调用 stop；异常观测、过期决策、missed slot/handoff 会撤权和 stop；随后观测恢复也不自动重启；旧 future 不能跨 run_id 消费；新 B 仍必须满足现有起点约束。deadline 边界、未来/零时间戳、空来源与旧实现做等价对照。真实模型/GPU 与真机结果另行报告，不能由这些离线检查推断。
+验收采用 fake clock + 可控 future，覆盖 sync/async/RTC 与 N=1/2：正常 bootstrap/换段不调用 stop；有效旧计划在预取期间连续消费；异常观测、过期决策、missed slot/handoff 会撤权和 stop；随后观测恢复也不自动重启；旧 future 不能跨 run_id 消费；新 B 仍必须满足现有起点约束。覆盖辅助函数结束本轮后的立即返回、末行恰好一次、无 evaluation 输出时 Raw 仍有具体原因。若实施 S04，再对 deadline 边界、未来/零时间戳、空来源做等价对照。真实模型/GPU 与真机结果另行报告，不能由这些离线检查推断。
 
 ### D. 修复关闭和 HOME 结果，保留资源所有权边界
 
@@ -189,11 +200,13 @@ Raw rollout 的 bootstrap/WAIT 行继续保留无动作证据。公共导出按�
 
 关闭幂等；模型的 load/predict/reset/close 仍在同一个 owner worker 串行执行。活动任务与关闭任务若需分别保留 future，用两个明确字段即可，不建立任务调度层。未成功建模时安全空操作；warmup 失败但已建模时仍清理。close 失败可观察；既有推理错误不得被 cleanup 覆盖。设备撤权/停止不等待 CUDA 完成。
 
+`closed=True` 仅在 cleanup 实际完成后设置；请求已入队不等于关闭完成。保留 session 对 pending/close_error 的现有保守报告，不为让退出码变绿而提前标完成，也不为了得到绿色结果新增无限等待或 CUDA 强杀机制。
+
 验收必须包含真实 Python 子进程退出：假模型 predict 尚未完成时请求 close，主线程立即结束，退出后检查 close 标记恰好一次且无“interpreter shutdown 后 submit”错误。补充仍在 load、factory/warmup/predict 抛错、重复 close、close 自身抛错。不能用 sleep 等 predict 先结束作为唯一通过证据；不承诺不可取消 CUDA 的有界进程退出时间。
 
 **HOME 结果**：直接复用 [robot/home.py](dexmani_real/robot/home.py) 中 `HomeResult`，让 [arm_homing.py](dexmani_real/robot/arm_homing.py) 的 `home_robot` 返回完整结果。更新 teleop runner、[keyboard_session.py](dexmani_real/teleop/keyboard_session.py)、[deployment/operator.py](dexmani_real/deployment/operator.py)、[replay/session.py](dexmani_real/replay/session.py) 全部调用者，显式检查 `.ok/.interrupted/.reason`；不增加 bool 兼容包装或依靠 dataclass 默认 truthiness。
 
-正常 Q/S 取消表示 interrupted；ESC 仍是急停；超时、无路径、硬件/清理错误仍失败。回放已经 completed 后取消 return-home，不改写已完成轨迹结果；会话记录 HOME 被取消及退出原因。真实 HOME/stop/close 失败也不能因轨迹已完成而掩盖。保留必要的 hand→arm 顺序、finally、未完成运动的停止重试。
+各入口已经支持的普通 Q/S 取消表示 interrupted；本项不扩展其他入口的快捷键协议。ESC 仍是急停；超时、无路径、硬件/清理错误仍失败。回放已经 completed 后 Q 取消 return-home，不改写已完成轨迹结果；会话记录 HOME 被取消及退出原因。真实 HOME/stop/close 失败也不能因轨迹已完成而掩盖。保留必要的 hand→arm 顺序、finally、未完成运动的停止重试。
 
 验收覆盖 hand 与 arm 各自取消、正常完成、拒绝进入 HOME、超时、真实异常和 stop 清理失败；完整复现 completed replay → H → Q，应保留已完成轨迹、正常取消 HOME 与准确的会话状态。
 
@@ -202,7 +215,7 @@ Raw rollout 的 bootstrap/WAIT 行继续保留无动作证据。公共导出按�
 优先级 P2，落实 D02/D04。修改 [robot/drivers/xhand.py](dexmani_real/robot/drivers/xhand.py) 及两处操作提示。
 
 - 在局部变量中采集候选、检查候选；移除函数一进入就清空已发布基线的操作。
-- CancelledError 在提交前离开，不替换已有基线；原来没有基线就仍无基线。取消检查继续放在每次可能阻塞的 SDK 读取前后和提交前。
+- CancelledError 在提交前离开，不替换已有基线；原来没有基线就仍无基线。取消检查继续放在每次可能阻塞的 SDK 读取前后和提交前。最后一次取消检查通过即进入短小的发布步骤，期间不再调用取消回调/SDK；此后到达的取消不追溯回滚已发布结果，不承诺抢占式 SDK 取消。
 - 正常完成后按通道提交：通过的候选成为新基线，失败通道设为 None 并明确报告；不能保留旧值却声称本次归零通过。
 - 非取消的技术异常不伪装成功：失效基线并报告错误。重连/实验设置变化不借本规则恢复跨会话旧基线。无需新建快照、回滚日志或校准 registry。
 - aggregate 保留当前残差判据；dense 目前仅证明所需载荷与残差有限。调整方法/日志/提示中的 `verified` 含义，明确二者不是同样的稳定性证明，且稳定接触也可能得到零残差。操作员仍须确认无接触。
@@ -212,14 +225,14 @@ Raw rollout 的 bootstrap/WAIT 行继续保留无动作证据。公共导出按�
 
 ## 8. 删除与简化：风险收益决定范围
 
-删除项不能与必修 bug 捆绑成“必须全删”。本轮确定做 S01–S04；其余按下表决定，不以文件数或总代码行数作为成功标准。
+删除项不能与必修 bug 捆绑成“必须全删”。S01–S03 随 bug 局部修复；S04 为最后评估的可选项；其余按下表决定，不以文件数或总代码行数作为成功标准。
 
 | ID / 候选 | 收益 | 风险 | 本轮决定与删除条件 |
 |---|---|---|---|
-| S01 本地状态集中 | 高：消除矛盾组合与重复结束分支 | 中：按键/录制边界变化 | 随 A 实施；先固定事件表 |
+| S01 本地状态集中 | 高：消除矛盾组合与重复结束分支 | 中：按键/录制边界变化 | 随 A 实施；先固定事件表，允许集中 helper，不强制枚举重写 |
 | S02 回调内再排 close | 中高：关闭时序更直接 | 低中：future/错误回收 | 随 D 删除二次调度；模型 owner 不变 |
 | S03 HomeResult → bool | 中：少包装且保留原因 | 中：漏改调用者会把失败对象视为真 | 随 D 删除压缩层，搜索全部调用点 |
-| S04 Query/Plan sources 字典传播 | 中：一个截止时间代替重复遍历 | 中：漏验未来时间、改变历史年龄或 off-by-one | 随 C 后半段实施，等价检查先行 |
+| S04 Query/Plan sources 字典传播 | 中：一个截止时间代替重复遍历 | 中：漏验未来时间、改变历史年龄或 off-by-one | 全部必修项完成后再评估；有净收益且等价检查通过才实施，否则保留并说明 |
 | S05 eye_in_hand 配置/变换分支 | 低中：缩小相机支持面 | 中：离线通用转换可能仍有人使用 | 本轮保留；确认论文与外部入口只支持固定相机后成套删除，不能仅凭 pointcloud worker 拒绝该模式就判死代码 |
 | S06 async/RTC | 高：减少预取、handoff、冻结前缀逻辑 | 高：删除真实研究能力、改变延迟/动作语义 | 本轮保留；只有论文、配置、评估都不使用且 sync 满足任务时，才能成套删除入口、参数、分支；不拆成插件框架 |
 | S07 DexPilot 后端 | 高：去掉专用 adapter/依赖 | 中高：失去可达 retargeting 对照 | 本轮保留；TAG 被明确确认为唯一研究后端，且依赖无其他使用者时删除；共享几何不能顺手删 |
@@ -237,19 +250,22 @@ Raw rollout 的 bootstrap/WAIT 行继续保留无动作证据。公共导出按�
 
 ## 9. 执行顺序、验证与完成条件
 
-### 9.1 建议提交划分
+### 9.1 执行顺序与审阅边界
 
 | 顺序 | 提交内容 | 完成证据 |
 |---|---|---|
 | 1 | A：停止批次与本地状态，B01/B03 | 事件表正反例、跨准备/保存边界的旧 run_id 拒绝 |
 | 2 | B：采集网格与导出时间准入，B02 | 时间反例、慢读/慢 IK、无追赶与真实状态保留 |
-| 3 | B：ACCEPTED 标签准入与 rollout 说明，D03/D05 | 全部 dispatch 状态矩阵、Raw 不变、正常失败任务样本 |
-| 4 | C：异常结束与正常 WAIT，D01；随后 S04 | 模式/历史长度矩阵、无自动恢复、deadline 等价 |
-| 5 | D：模型关闭，B04 | 未结束 load/predict 的进程退出探针与幂等关闭 |
-| 6 | D：HomeResult 贯通，B05 | 全部调用者 + replay HOME 取消/真故障区分 |
+| 3 | D：模型关闭，B04 | 未结束 load/predict 的进程退出探针与幂等关闭 |
+| 4 | D：HomeResult 贯通，B05 | 全部调用者 + replay HOME 取消/真故障区分 |
+| 5 | B：ACCEPTED 标签准入与 rollout 说明，D03/D05 | 全部 dispatch 状态矩阵、Raw 不变、正常失败任务样本 |
+| 6 | C：异常结束与正常 WAIT，D01 | 模式/历史长度矩阵、预取期继续执行、无自动恢复、末行与原因保留 |
 | 7 | E：tare 发布与准确语义，D02/D04 | 取消/部分通道/异常检查；README 操作提示同步 |
+| 8 | 可选 S04、最终清理与自审 | 有净收益才改；否则说明保留；整体验收与 diff 检查 |
 
-这些是审阅边界，不要求同时推进或大规模重构。B04/B05 可提前独立完成；不能因可选裁剪或等待真机统计而把五个确定 bug 留下。
+前四项完成五个确定 bug；后续再落实实验契约与可选精简。紧密耦合的时间/标签准入可一次处理以减少重复修改，但不能让 C/S04 等较大改动拖住 B04/B05。上表不是必须创建八个 git commit 的指令；默认交付经过验证的本地 diff，是否提交/推送服从用户当次明确指令。
+
+开始时一次性检查 `git status`、HEAD、AGENTS 与本文版本，并列出短计划后直接实施。优先复用本文的固定版本证据，只核查变化的调用链，不重新开展全仓库/四个参考项目的综述。用 `rg` 定位、批量读取独立文件，每个问题只跑能区分修复前后的必要检查。缺少真机、checkpoint 或可选依赖时完成其余可离线工作，最后集中报告限制；不要按阶段反复要求确认，也不要只交付另一份计划。
 
 ### 9.2 离线检查
 
@@ -288,7 +304,7 @@ git diff --check
 
 - [ ] B01–B05 均有修复、失败反例与通过对照，不以文档解释代替修复。
 - [ ] D01–D05 按本任务的明确选择实施；停止、数据筛选与 tare 的行为变化已说明。
-- [ ] S01–S04 完成且没有放宽运动许可/新鲜度；其余候选有“保留/有证据后删除”的准确结论。
+- [ ] S01–S03 随 bug 完成；S04 有实施及等价证据，或有保留理由。其余候选按风险收益保留，没有放宽运动许可/新鲜度。
 - [ ] Raw 无修改、无静默丢帧/补值；训练 action、时间与失败证据边界一致。
 - [ ] 所有 HOME 调用者显式消费结果，模型 close 在请求时就已排队。
 - [ ] README 只更新操作者需要的工作流、准入和限制；不复制本任务书成为第二份架构规格。
