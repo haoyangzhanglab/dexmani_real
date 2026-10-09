@@ -25,6 +25,7 @@ from dexmani_real.dataset.processing import (
 )
 from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
+from dexmani_real.utils.control_clock import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,12 @@ def export_raw_to_zarr(
                     format=CANONICAL_FORMAT,
                     task_name=task,
                     dt=reader.dt,
+                    timing_admission=dict(
+                        rule="adjacent_interval_and_cumulative_grid",
+                        period_ns=sampling_clock_ns(reader.control_hz)[0],
+                        tolerance_ns=sampling_clock_ns(reader.control_hz)[1],
+                    ),
+                    action_semantics="absolute_target_accepted_by_both_sdks",
                     depth_scale_m_per_unit=float(reader.meta["depth_scale"]),
                     pointcloud_config=processing.pointcloud.to_dict(),
                     fingertip_link_names=list(processing.fingertip_link_names),

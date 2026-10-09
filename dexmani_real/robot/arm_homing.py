@@ -215,15 +215,14 @@ def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
     )
 
 
-def home_robot(shared, runtime, planner, *, robot, abort_requested):
+def home_robot(shared, runtime, planner, *, robot, abort_requested) -> HomeResult:
     if int(shared.safety_state) != int(SafetyState.ARMED):
-        return False
+        return HomeResult(False, "home requires ARMED")
     failure = None
     try:
         hand_result = home_hand(shared, runtime, robot=robot, abort_requested=abort_requested)
         if not hand_result.ok:
-            print(f"Hand home failed: {hand_result.reason}", flush=True)
-            return False
+            return hand_result
         # Hand-disabled mode assumes the hand is absent or secured at home.
         if not runtime.policy.hand_enabled:
             planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
@@ -240,9 +239,7 @@ def home_robot(shared, runtime, planner, *, robot, abort_requested):
                 runtime.hand.feedback_max_age_s if runtime.policy.hand_enabled else None
             ),
         )
-        if not result.ok:
-            print(f"Home failed: {result.reason}", flush=True)
-        return result.ok
+        return result
     except BaseException as exc:
         failure = exc
         if isinstance(exc, KeyboardInterrupt):

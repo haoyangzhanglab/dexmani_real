@@ -102,7 +102,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
                 command_pose = None
                 revoke_motion(shared)
                 robot.stop()
-                home_robot(
+                home_result = home_robot(
                     shared,
                     runtime,
                     home_planner,
@@ -112,7 +112,13 @@ def run_keyboard_experiment(runtime, *, no_hand):
                         or not keys.healthy
                     ),
                 )
+                if not home_result.ok:
+                    if not home_result.interrupted:
+                        raise RuntimeError(f"HOME failed: {home_result.reason}")
+                    logger.info("HOME cancelled: %s", home_result.reason)
                 rate.reset()
+                home_down = pressed
+                continue
             home_down = pressed
             row = read_observation(shared, runtime, robot, require_hand=runtime.policy.hand_enabled)
             if row is None:

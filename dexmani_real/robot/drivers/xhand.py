@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import CancelledError
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
@@ -374,26 +375,33 @@ class XHand:
         control.close_device()
 
     def tare_tactile(self, *, cancel_requested=lambda: False) -> tuple[bool, bool]:
-        """Publish verified baselines after the operator confirms no contact.
+        """Publish per-channel candidates after the operator confirms no contact.
 
-        Stable contact also yields zero residual; this does not certify no contact.
+        Aggregate checks residual magnitude; dense only checks finite payload/residual.
+        Neither certifies no contact; stable contact can also yield zero residual.
         SDK reads may block; cancellation is checked on both sides of each read.
         """
-        self._tactile_bias_aggregate = self._tactile_bias_dense = None
-        candidates = self._capture_tactile_bias(cancel_requested=cancel_requested)
-        verified = self._verify_tactile_bias(*candidates, cancel_requested=cancel_requested)
-        self._check_tare_cancel(cancel_requested)
-        for name, candidate, ok in zip(("aggregate", "dense"), candidates, verified):
-            if ok:
-                setattr(self, f"_tactile_bias_{name}", candidate)
-            logger.log(20 if ok else 30, "XHand %s tactile baseline verified=%s", name, ok)
+        try:
+            candidates = self._capture_tactile_bias(cancel_requested=cancel_requested)
+            usable = self._check_tactile_candidates(*candidates, cancel_requested=cancel_requested)
+            self._check_tare_cancel(cancel_requested)
+        except CancelledError:
+            raise  # No candidate has been published; retain the current session's baseline.
+        except Exception:
+            self._tactile_bias_aggregate = self._tactile_bias_dense = None
+            logger.exception("XHand tare failed; both baselines invalidated")
+            raise
+        # No SDK/cancellation callback between the last check and this short publication.
+        self._tactile_bias_aggregate = candidates[0] if usable[0] else None
+        self._tactile_bias_dense = candidates[1] if usable[1] else None
+        logger.log(20 if usable[0] else 30, "XHand aggregate residual check passed=%s", usable[0])
+        logger.log(20 if usable[1] else 30,
+                   "XHand dense payload/residual finite=%s; stability/no-contact not verified", usable[1])
         return (self._tactile_bias_aggregate is not None, self._tactile_bias_dense is not None)
 
     @staticmethod
     def _check_tare_cancel(cancel_requested):
         if cancel_requested():
-            from concurrent.futures import CancelledError
-
             raise CancelledError("tactile tare cancelled")
 
     def _capture_tactile_bias(self, *, cancel_requested):
@@ -416,7 +424,7 @@ class XHand:
             for channel in samples
         )
 
-    def _verify_tactile_bias(self, aggregate, dense, *, cancel_requested):
+    def _check_tactile_candidates(self, aggregate, dense, *, cancel_requested):
         ok = [aggregate is not None, dense is not None]
         for _ in range(_TACTILE_VERIFY_SAMPLE_COUNT):
             self._check_tare_cancel(cancel_requested)

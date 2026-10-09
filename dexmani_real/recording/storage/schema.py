@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from dexmani_real.utils.control_clock import sampling_clock_ns
+
 RAW_FORMAT = "dexmani.raw"
 
 
@@ -52,3 +54,31 @@ def validate_capture_rows(timestamp, dispatch_status) -> tuple[str, ...]:
     if np.any(dispatch_status > 4):
         errors.append("dispatch_status must contain status codes 0 through 4")
     return tuple(errors)
+
+
+def validate_training_rows(timestamp, dispatch_status, control_hz) -> tuple[str, ...]:
+    """Whole-episode admission only; failed evidence remains readable as Raw."""
+    errors = validate_capture_rows(timestamp, dispatch_status)
+    if errors:
+        return errors
+    dt_ns, epsilon_ns = sampling_clock_ns(control_hz)
+    # Raw seconds originate from integer ns; round only representation error.
+    stamps = np.rint(np.asarray(timestamp) * 1e9)
+    intervals = np.diff(stamps)
+    deviations = stamps - np.arange(len(stamps)) * dt_ns
+    bad_interval = np.flatnonzero(np.abs(intervals - dt_ns) > epsilon_ns)
+    bad_grid = np.flatnonzero(np.abs(deviations) > epsilon_ns)
+    bad_rows = [int(bad_interval[0]) + 1] if len(bad_interval) else []
+    if len(bad_grid):
+        bad_rows.append(int(bad_grid[0]))
+    if bad_rows:
+        row = min(bad_rows)
+        return (f"timing row {row}: interval_ns={intervals[row - 1]:.0f}, "
+                f"nominal_ns={dt_ns}, grid_deviation_ns={deviations[row]:.0f}, "
+                f"tolerance_ns={epsilon_ns}",)
+    bad_dispatch = np.flatnonzero(np.any(np.asarray(dispatch_status) != 1, axis=1))
+    if len(bad_dispatch):
+        row = int(bad_dispatch[0])
+        return (f"dispatch row {row}: arm/hand={list(dispatch_status[row])}; "
+                "training requires [1, 1] (SDK ACCEPTED)",)
+    return ()

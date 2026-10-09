@@ -130,7 +130,7 @@ def replay_episode(trajectory, runtime, config):
                 if OperatorCommand.QUIT in signals:
                     break
                 if OperatorCommand.HOME in signals:
-                    ok = home_robot(
+                    home_result = home_robot(
                         shared,
                         runtime,
                         home_planner,
@@ -140,9 +140,18 @@ def replay_episode(trajectory, runtime, config):
                             or not keyboard.healthy
                         ),
                     )
-                    if not ok:
+                    results.session.setdefault("home_results", []).append(dict(
+                        ok=home_result.ok, interrupted=home_result.interrupted,
+                        reason=home_result.reason,
+                    ))
+                    if not home_result.ok:
                         outcome = ReplayOutcome(
-                            ReplayStatus.FAULT, outcome.replay_data, "return_home failed"
+                            ReplayStatus.USER_QUIT
+                            if home_result.interrupted and shared.quit_requested
+                            else ReplayStatus.ESTOP
+                            if shared.estop_request
+                            else ReplayStatus.FAULT,
+                            outcome.replay_data, f"return_home incomplete: {home_result.reason}",
                         )
                         break
                     print("Return-home completed. H: planned return_home; Q: exit", flush=True)

@@ -180,7 +180,7 @@ real robot
 - `README.md`：项目定位、workflow、quick start、主要入口。
 - `AGENTS.md`：代码代理的长期工作规则。
 - `CLAUDE.md`：Claude 的精简入口，不重复整份 AGENTS。
-- 临时 task / migration / acceptance notes 不作为长期根目录文档；用户明确指定的本次根目录任务书保留。
+- 临时 task / migration / acceptance notes 不作为长期根目录文档。
 
 README 不维护容易过时的类清单、字段级 runtime contract、状态机细节或历史重构说明。
 

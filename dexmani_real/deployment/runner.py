@@ -14,6 +14,7 @@ from dexmani_real.deployment.action import (
 from dexmani_real.deployment.observation import (
     build_policy_observation,
     decision_is_fresh,
+    policy_observation_issue,
     policy_sources,
 )
 from dexmani_real.planning.kinematics.ik import IKFailureKind
@@ -49,7 +50,6 @@ class Query:
     slot: int
     sources: dict[str, tuple[int, ...]]
     handoff_slot: int | None
-    valid: bool = True
     result: np.ndarray | None = None
     bootstrap: bool = False
 
@@ -76,6 +76,7 @@ class PolicyRunner:
         realizer,
         recorder=None,
         poll_operator=None,
+        discard_pending_start=None,
         model_runtime,
         kinematics,
         execute,
@@ -89,6 +90,7 @@ class PolicyRunner:
         self.shared = shared
         self.robot = robot
         self.poll_operator = poll_operator
+        self.discard_pending_start = discard_pending_start
         self.runtime = runtime
         self.policy_info = policy_info
         self.model = model_runtime
@@ -149,13 +151,10 @@ class PolicyRunner:
         limit = self._budget_limit()
         return limit if limit is not None and time.monotonic_ns() >= limit[0] else None
 
-    def _within_budget(self):
-        return self._expired_budget() is None
-
-    def _finish_budget(self, limit):
-        self._finish_episode(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
-        if limit[1] == "wait":
-            raise TimeoutError("Policy WAIT budget exhausted without successful consumption")
+    def _finish_budget(self, limit, *, row=None):
+        self._finish_episode(
+            f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT, row=row
+        )
 
     def _dispatch_deadline_ns(self, row, slot):
         deadlines = [
@@ -179,47 +178,50 @@ class PolicyRunner:
             and int(self.shared.safety_state) == int(SafetyState.RUNNING)
         )
 
-    def _invalidate(self):
-        self.plan = None
-        if self.query is not None:
-            self.query.valid = False
-            if self.model.future is None:
-                self.query = None
-        if self.run_id is not None and self.wait_started_ns is None:
-            self.wait_started_ns = time.monotonic_ns()
-
     def _finish_episode(
         self,
         detail,
         *,
         run_end_reason=RunEndReason.EXECUTOR_BOUNDARY,
-        stop_motion=True,
         errors=None,
+        row=None,
+        command=None,
+        dispatch=None,
     ):
         if self.run_id is None:
             return
         epoch = self.run_id
         duration_s = (time.monotonic_ns() - self.started_ns) / 1e9
         revoke_motion_if_run_id(self.shared, epoch, reason=run_end_reason)
+        if self.discard_pending_start is not None:
+            self.discard_pending_start()
         with self.shared.motion_lock:
+            self.shared.start_request = False
+            self.shared.stop_request = int(StopRequest.NONE)
             reason = (
                 RunEndReason(int(self.shared.run_ended_reason))
                 if int(self.shared.run_ended_id) == epoch
                 else run_end_reason
             )
-        self._invalidate()
+        self.plan = None
+        if self.model.future is None:
+            self.query = None
         self.history.clear()
         self.previous_arm = None
         self.run_id = None
+        self.wait_started_ns = None
         self.completed += 1
-        self.shared.stop_request = int(StopRequest.NONE)
         errors, failure = list(errors or ()), None
         try:
-            if stop_motion:
-                self.robot.stop()
+            self.robot.stop()
         except Exception as exc:
             failure = exc
             errors.append(error_detail("stop", exc))
+        try:
+            self._record(row, command, dispatch)
+        except Exception as exc:
+            failure = failure or exc
+            errors.append(error_detail("recording", exc))
         try:
             self._finalize_outputs(reason.name.lower(), detail, errors, duration_s=duration_s)
         except Exception as exc:
@@ -238,7 +240,9 @@ class PolicyRunner:
             if self.recorder is not None and self.recording_started:
                 saved, status = None, "empty"
                 try:
-                    saved = self.recorder.save_episode(reason=reason, details=errors)
+                    saved = self.recorder.save_episode(
+                        reason=reason, details=[dict(stage="termination", reason=detail), *errors]
+                    )
                     status = "published" if saved is not None else "empty"
                 except BaseException as exc:
                     failure, status = exc, "failed"
@@ -277,9 +281,11 @@ class PolicyRunner:
     def _begin_episode(self):
         if self.preparing_epoch is None:
             with self.shared.motion_lock:
-                if not self.shared.start_request or self.model.future is not None:
+                if not self.shared.start_request:
                     return
                 self.shared.start_request = False
+                if self.model.future is not None:
+                    return
                 if (
                     self.shared.stop_request
                     or self.shared.quit_requested
@@ -363,7 +369,7 @@ class PolicyRunner:
                         raise
                     logger.exception("start finalization also failed")
 
-    def _poll_model(self):
+    def _poll_model(self, row=None):
         item = self.model.poll()
         if item is None:
             return
@@ -382,16 +388,7 @@ class PolicyRunner:
             raise RuntimeError("Model result has no owned query")
         if self.results is not None and query.run_id == self.run_id:
             self.results.record_inference(result.completed_ns - result.started_ns)
-        if result.error is None:
-            future = np.asarray(result.value)
-            finite = bool(np.isfinite(future).all()) if future.dtype.kind in "fiubc" else None
-            expected = (
-                self.policy_info.horizon - self.policy_info.n_obs_steps + 1,
-                physical_action_dim(self.policy_info.action_mode),
-            )
-            shaped_future = future.shape == expected and future.dtype.kind == "f"
-            valid_future = shaped_future and finite
-        if not query.valid or query.run_id != self.run_id or not self._has_motion_authority():
+        if query.run_id != self.run_id or not self._has_motion_authority():
             logger.info(
                 "retired query %s from run %s reclaimed; error=%s",
                 query.query_id,
@@ -402,9 +399,17 @@ class PolicyRunner:
             return
         if result.error is not None:
             raise result.error
+        future = np.asarray(result.value)
+        expected = (
+            self.policy_info.horizon - self.policy_info.n_obs_steps + 1,
+            physical_action_dim(self.policy_info.action_mode),
+        )
+        valid_future = (
+            future.shape == expected and future.dtype.kind == "f" and np.isfinite(future).all()
+        )
         now = time.monotonic_ns()
         if not decision_is_fresh(query.sources, now, self.execution.max_decision_age_s):
-            self._invalidate()
+            self._finish_episode("query_decision_expired", row=row)
             return
         if not valid_future:
             raise ValueError(f"Policy future requires finite floating point {expected}")
@@ -417,18 +422,31 @@ class PolicyRunner:
     def _submit(self, rows, slot, *, prefix=None, commands=None):
         observation = build_policy_observation(rows, self.policy_info, kinematics=self.kinematics)
         if observation is None:
-            return False
+            self._finish_episode("policy_observation_unavailable", row=rows[-1])
+            return
         now = time.monotonic_ns()
-        if not self._has_motion_authority() or not self._within_budget():
-            return False
+        authorized = self._has_motion_authority()
+        expired = self._expired_budget()
+        if not authorized or expired is not None:
+            if expired is not None:
+                self._finish_budget(expired, row=rows[-1])
+            else:
+                self._finish_episode("query_authority_revoked", row=rows[-1])
+            return
         if now > self.started_ns + slot * self.dt_ns + int(
             self.execution.max_tick_lateness_s * 1e9
         ):
-            self._invalidate()
-            return False
+            self._finish_episode("query_missed_slot", row=rows[-1])
+            return
         sources = policy_sources(rows[-1], self.policy_info.observation_fields)
         if not decision_is_fresh(sources, now, self.execution.max_decision_age_s):
-            return False
+            self._finish_episode("query_sources_invalid_or_expired", row=rows[-1])
+            return
+        if prefix is not None and not decision_is_fresh(
+            self.plan.sources, now, self.execution.max_decision_age_s
+        ):
+            self._finish_episode("prefix_decision_expired", row=rows[-1])
+            return
         self.query_id += 1
         delay = self.execution.prefetch_steps if prefix is not None else 0
         self.query = Query(
@@ -447,7 +465,6 @@ class PolicyRunner:
         self.model.submit("predict", observation, **kwargs)
         if commands is not None:
             self.plan.frozen.update(commands)
-        return True
 
     def _prepare_prefix(self, row, slot):
         start = slot - self.plan.anchor_slot
@@ -460,14 +477,16 @@ class PolicyRunner:
         for i in range(self.execution.prefetch_steps):
             if self.poll_operator is not None:
                 self.poll_operator()
-            if (
-                not self._has_motion_authority()
-                or not self._within_budget()
-                or time.monotonic_ns()
-                > self.started_ns
-                + slot * self.dt_ns
-                + int(self.execution.max_tick_lateness_s * 1e9)
+            if not self._has_motion_authority():
+                self._finish_episode("prefix_authority_revoked", row=row)
+                return None, None
+            if (expired := self._expired_budget()) is not None:
+                self._finish_budget(expired, row=row)
+                return None, None
+            if time.monotonic_ns() > (
+                self.started_ns + slot * self.dt_ns + int(self.execution.max_tick_lateness_s * 1e9)
             ):
+                self._finish_episode("prefix_missed_slot", row=row)
                 return None, None
             decoded = self.realizer.realize(
                 policy_action_intent(prefix[i], self.policy_info.action_mode),
@@ -480,6 +499,7 @@ class PolicyRunner:
                     and decoded.ik_result.failure_kind == IKFailureKind.INVALID_OUTPUT
                 ):
                     raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
+                self._finish_episode(f"prefix_action_rejected: {decoded.rejection_reason}", row=row)
                 return None, None
             command = RobotCommand(self.run_id, decoded.arm_qpos, decoded.hand_qpos)
             commands[slot + i] = command
@@ -492,7 +512,18 @@ class PolicyRunner:
 
     def _record(self, row, command=None, result=None):
         if self.recorder is not None and row is not None:
-            self.recorder.add_frame(row, command, result)
+            try:
+                self.recorder.add_frame(row, command, result)
+            except Exception as exc:
+                # Never retry a row whose writer submission failed.
+                try:
+                    self._finish_episode(
+                        "recording_failed", run_end_reason=RunEndReason.RECORDING_FAILURE,
+                        errors=[error_detail("recording", exc)],
+                    )
+                except Exception as cleanup_error:
+                    raise exc from cleanup_error
+                raise
 
     def _command_for_slot(self, row, slot):
         plan = self.plan
@@ -501,7 +532,7 @@ class PolicyRunner:
             if not self.realizer.frozen_is_valid(
                 command, row.arm["qpos"][0], self.previous_arm, self.policy_info.action_mode
             ):
-                self._invalidate()
+                self._finish_episode("frozen_target_rejected", row=row)
                 return
         else:
             decoded = self.realizer.realize(
@@ -517,7 +548,7 @@ class PolicyRunner:
                     and decoded.ik_result.failure_kind == IKFailureKind.INVALID_OUTPUT
                 ):
                     raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
-                self._invalidate()
+                self._finish_episode(f"action_rejected: {decoded.rejection_reason}", row=row)
                 return
             command = RobotCommand(self.run_id, decoded.arm_qpos, decoded.hand_qpos)
         return command
@@ -525,33 +556,28 @@ class PolicyRunner:
     def _execute_slot(self, row, slot):
         plan = self.plan
         command = self._command_for_slot(row, slot)
-        if command is None:
-            self._record(row)
+        if self.run_id is None or command is None:
             return
         now = time.monotonic_ns()
         if not self._has_motion_authority() or self.shared.quit_requested:
-            self._finish_episode("before_dispatch_revoked")
+            self._finish_episode("before_dispatch_revoked", row=row)
             return
         if (expired := self._expired_budget()) is not None:
-            self._finish_budget(expired)
+            self._finish_budget(expired, row=row)
             return
         if now > self.started_ns + slot * self.dt_ns + int(
             self.execution.max_tick_lateness_s * 1e9
-        ) or not decision_is_fresh(plan.sources, now, self.execution.max_decision_age_s):
-            self._invalidate()
-            self._record(row)
+        ):
+            self._finish_episode("action_missed_slot", row=row)
+            return
+        if not decision_is_fresh(plan.sources, now, self.execution.max_decision_age_s):
+            self._finish_episode("plan_decision_expired", row=row)
             return
         budget_limit = self._budget_limit()
         action_deadline_ns = self._dispatch_deadline_ns(row, slot)
-        valid_until_ns = (
-            min(action_deadline_ns, budget_limit[0]) if budget_limit else action_deadline_ns
-        )
+        valid_until_ns = min(action_deadline_ns, budget_limit[0]) if budget_limit else action_deadline_ns
         if time.monotonic_ns() >= valid_until_ns:
-            self._record(row)
-            if (expired := self._expired_budget()) is not None:
-                self._finish_budget(expired)
-            else:
-                self._invalidate()
+            self._finish_episode("dispatch_deadline_expired", row=row)
             return
         result, failure = None, None
         if self.execute:
@@ -563,122 +589,66 @@ class PolicyRunner:
                 and result is not None
                 and (result.arm != DispatchStatus.NOT_CALLED or result.hand != DispatchStatus.NOT_CALLED)):
             self.results.current["metrics"]["dispatch_count"] += 1
-        # Admission deadlines only govern entry into each SDK. Total owner budgets
-        # also govern completion; an accepted late return remains ACCEPTED evidence.
-        expired = (
-            budget_limit
-            if budget_limit is not None and time.monotonic_ns() >= budget_limit[0]
-            else None
-        )
-        timed_out = expired is not None
+        now = time.monotonic_ns()
+        expired = budget_limit if budget_limit is not None and now >= budget_limit[0] else None
+        late = now >= action_deadline_ns
         cancelled = isinstance(failure, DispatchInterrupted)
         cause = failure.cause if isinstance(failure, DispatchError) else None
-        # A total budget explains a refusal only when it constrained this call.
-        # A coincident action deadline remains an independent technical failure.
-        budget_rejection = (
-            cause == "deadline_expired"
-            and expired is not None
-            and budget_limit[0] < action_deadline_ns
-        )
-        with self.shared.motion_lock:
-            operator_revocation = (
-                cause == "authority_revoked"
-                and int(self.shared.run_ended_id) == self.run_id
-                and int(self.shared.run_ended_reason)
-                in (int(RunEndReason.OPERATOR), int(RunEndReason.QUIT))
-                and not self.shared.estop_request
-                and not self.shared.error_state
-            )
+        accepted = result is not None and result.arm == result.hand == DispatchStatus.ACCEPTED
+        unconfirmed = self.execute and self.execution.execution_mode != "sync" and not accepted
         clean_partial = result is not None and all(
             status in (DispatchStatus.ACCEPTED, DispatchStatus.NOT_CALLED)
             for status in (result.arm, result.hand)
         )
-        accepted = (
-            result is not None
-            and result.arm == DispatchStatus.ACCEPTED
-            and result.hand == DispatchStatus.ACCEPTED
-        )
-        failed = (
-            timed_out
-            or failure is not None
-            or (self.execute and self.execution.execution_mode != "sync" and not accepted)
-        )
-        stop_error = record_error = None
-        try:
-            if failed:
-                if cancelled:
-                    self.shared.estop_request = True
-                reason = (
-                    RunEndReason.ESTOP
-                    if cancelled
-                    else RunEndReason.TIMEOUT
-                    if timed_out and (failure is None or budget_rejection)
-                    else RunEndReason.EXECUTOR_BOUNDARY
-                    if failure is not None and failure.revoked
-                    else RunEndReason.HARDWARE_FAULT
-                )
-                revoke_motion_if_run_id(self.shared, self.run_id, reason=reason)
-                try:
-                    self.robot.stop()
-                except Exception as exc:
-                    stop_error = exc
-                    if failure is not None:
-                        logger.exception("stop after dispatch also failed")
-            elif not self.execute or (result is not None and result.continued):
-                self.previous_arm = command.arm_qpos
-                self.wait_started_ns = None
-        finally:
-            try:
-                self._record(row, command, result)
-            except Exception as exc:
-                record_error = exc
-                logger.exception("recording after dispatch failed")
-        if failed:
-            normal_boundary = clean_partial and (operator_revocation or budget_rejection)
-            error = failure if failure is not None and not normal_boundary else None
-            if error is None and expired is not None and expired[1] == "wait":
-                error = TimeoutError("Policy WAIT budget exhausted during dispatch")
-            if (
-                error is None
-                and not normal_boundary
-                and self.execute
-                and self.execution.execution_mode != "sync"
-                and not accepted
-            ):
-                error = DispatchError("Strict chunk dispatch was not confirmed", result)
-            error = error or stop_error or record_error
+        if unconfirmed and failure is None:
+            failure = DispatchError("Strict chunk dispatch was not confirmed", result)
+        if (failure is not None or expired is not None or late
+                or not self._has_motion_authority() or self.shared.quit_requested):
+            if cancelled:
+                self.shared.estop_request = True
+            hardware_failure = not cancelled and failure is not None and (
+                not failure.revoked
+                or cause not in {"authority_revoked", "deadline_expired"}
+                or not clean_partial
+            )
+            budget_timeout = expired is not None and budget_limit[0] < action_deadline_ns
+            reason = (
+                RunEndReason.ESTOP if cancelled else
+                RunEndReason.HARDWARE_FAULT if hardware_failure else
+                RunEndReason.TIMEOUT if budget_timeout else
+                RunEndReason.EXECUTOR_BOUNDARY
+            )
+            detail = (
+                "dispatch_cancelled" if cancelled else
+                f"dispatch_failed: {cause or str(failure)}" if failure is not None else
+                f"dispatch_return_{expired[1]}_timeout" if budget_timeout else
+                "dispatch_return_deadline_expired" if late else "dispatch_authority_revoked"
+            )
+            errors = [error_detail("dispatch", failure)] if failure is not None else []
             try:
                 self._finish_episode(
-                    "dispatch_cancelled"
-                    if cancelled
-                    else f"dispatch_return_{expired[1]}_timeout"
-                    if timed_out and (failure is None or budget_rejection)
-                    else "dispatch_unconfirmed_or_failed",
-                    run_end_reason=reason,
-                    stop_motion=False,
-                    errors=[
-                        error_detail(stage, exc)
-                        for stage, exc in (("stop", stop_error), ("recording", record_error))
-                        if exc is not None
-                    ],
+                    detail, run_end_reason=reason, errors=errors,
+                    row=row, command=command, dispatch=result,
                 )
             except Exception as exc:
-                if error is not None:
-                    raise error from exc
+                if hardware_failure or cancelled:
+                    raise failure from exc
                 raise
-            if error is not None:
-                raise error
+            if hardware_failure or cancelled:
+                raise failure
             return
-        if record_error is not None:
-            raise record_error
+        if not self.execute or (result is not None and result.continued):
+            self.previous_arm = command.arm_qpos
+            self.wait_started_ns = None
+        self._record(row, command, result)
         if slot + 1 == plan.segment_end and self.execution.execution_mode == "sync":
             self.plan = None
 
-    def _handoff(self, slot):
+    def _handoff(self, slot, row):
         query = self.query
         if (
             query is not None
-            and query.valid
+            and query.run_id == self.run_id
             and query.handoff_slot is not None
             and slot >= query.handoff_slot
         ):
@@ -691,7 +661,7 @@ class PolicyRunner:
                     query.sources, time.monotonic_ns(), self.execution.max_decision_age_s
                 )
             ):
-                self._invalidate()
+                self._finish_episode("missed_or_invalid_handoff", row=row)
             else:
                 anchor = slot if query.bootstrap else query.slot
                 self.plan = Plan(
@@ -709,11 +679,12 @@ class PolicyRunner:
             and slot == self.plan.segment_end - self.execution.prefetch_steps
         ):
             if not rows or self.query is not None or self.model.future is not None:
-                self._invalidate()
+                self._finish_episode("prefetch_unavailable", row=row)
             else:
                 prefix, commands = self._prepare_prefix(row, slot)
-                if prefix is None or not self._submit(rows, slot, prefix=prefix, commands=commands):
-                    self._invalidate()
+                if self.run_id is None:
+                    return
+                self._submit(rows, slot, prefix=prefix, commands=commands)
 
     def step(self):
         self.robot.check()
@@ -721,7 +692,11 @@ class PolicyRunner:
             not self._has_motion_authority() or self.shared.quit_requested
         ):
             self._finish_episode("owner_authority_revoked")
+            return
+        epoch = self.run_id
         self._poll_model()
+        if epoch is not None and self.run_id != epoch:
+            return
         if self.recorder is not None:
             self.recorder.check_error()
         if self.run_id is None:
@@ -731,58 +706,83 @@ class PolicyRunner:
                 self._begin_episode()
             if self.run_id is None:
                 return
-        now = time.monotonic_ns()
         if (expired := self._expired_budget()) is not None:
             self._finish_budget(expired)
             return
+        now = time.monotonic_ns()
         if now < self.next_step_ns:
             return
         slot = (now - self.started_ns) // self.dt_ns
-        tick_failed = False
-        try:
-            missed = slot != self.last_slot + 1
+        if slot != self.last_slot + 1:
             if self.results is not None and self.results.current is not None:
                 self.results.current["metrics"]["skipped_slots"] += max(0, slot - self.last_slot - 1)
-            self.last_slot = slot
-            self.next_step_ns = self.started_ns + (slot + 1) * self.dt_ns
+            self._finish_episode(f"missed_slot: expected={self.last_slot + 1}, actual={slot}")
+            return
+        self.last_slot = slot
+        self.next_step_ns = self.started_ns + (slot + 1) * self.dt_ns
+        row = None
+        try:
             row = self._read_observation()
-            self._poll_model()
-            if (
-                missed
-                or time.monotonic_ns() - (self.next_step_ns - self.dt_ns)
-                > int(self.execution.max_tick_lateness_s * 1e9)
-                or row is None
+            self._poll_model(row)
+            if self.run_id is None:
+                return
+            if not self._has_motion_authority() or self.shared.quit_requested:
+                self._finish_episode("observation_authority_revoked", row=row)
+                return
+            if time.monotonic_ns() - (self.next_step_ns - self.dt_ns) > int(
+                self.execution.max_tick_lateness_s * 1e9
             ):
-                self.history.clear()
-                self._invalidate()
-                self._record(row)
+                self._finish_episode("observation_missed_slot", row=row)
+                return
+            issue = policy_observation_issue(row, self.policy_info.observation_fields)
+            if issue is not None:
+                self._finish_episode(issue, row=row)
                 return
             self.history.append(row)
             rows = tuple(self.history) if len(self.history) == self.history.maxlen else ()
-            self._handoff(slot)
+            self._handoff(slot, row)
+            if self.run_id is None:
+                return
             if self.plan is None:
                 if self.wait_started_ns is None:
                     self.wait_started_ns = now
                 if rows and self.query is None and self.model.future is None:
                     self._submit(rows, slot)
+                    if self.run_id is None:
+                        return
                 self._record(row)
             else:
+                if not decision_is_fresh(
+                    self.plan.sources, time.monotonic_ns(), self.execution.max_decision_age_s
+                ):
+                    self._finish_episode("plan_decision_expired", row=row)
+                    return
                 self._prefetch(row, rows, slot)
-                if self.plan is not None:
-                    if slot >= self.plan.segment_end:
-                        self._invalidate()
-                        self._record(row)
-                    else:
-                        self._execute_slot(row, slot)
-                else:
-                    self._record(row)
-        except BaseException:
-            tick_failed = True
-            raise
-        finally:
-            # Input/prefix construction may cross the total deadline without dispatch.
-            if not tick_failed and (expired := self._expired_budget()) is not None:
+                if self.run_id is None:
+                    return
+                if slot >= self.plan.segment_end:
+                    self._finish_episode("plan_exhausted_without_handoff", row=row)
+                    return
+                # Pending prefetch never suspends a still-valid current plan.
+                self._execute_slot(row, slot)
+            if (expired := self._expired_budget()) is not None:
                 self._finish_budget(expired)
+        except BaseException as exc:
+            # Helpers that finished already cleared run_id; this cannot append twice.
+            if isinstance(exc, KeyboardInterrupt):
+                self.shared.estop_request = True
+            try:
+                self._finish_episode(
+                    f"control_failed: {type(exc).__name__}: {exc}", row=row,
+                    run_end_reason=RunEndReason.ESTOP if isinstance(exc, KeyboardInterrupt)
+                    else RunEndReason.RECORDING_FAILURE if isinstance(exc, RecordingError)
+                    else RunEndReason.HARDWARE_FAULT if isinstance(exc, DispatchError)
+                    else RunEndReason.POLICY_FAILURE,
+                    errors=[error_detail("control", exc)],
+                )
+            except Exception:
+                logger.exception("control failure cleanup also failed")
+            raise
 
     def run(self):
         failure = None

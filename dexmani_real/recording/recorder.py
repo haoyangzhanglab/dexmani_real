@@ -23,6 +23,7 @@ from dexmani_real.robot.commands import DispatchStatus
 from dexmani_real.sensor.camera.geometry import RGBDGeometry, validate_aligned_depth_distortion
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 from dexmani_real.utils.geometry import validate_rigid_transform
+from dexmani_real.utils.control_clock import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
 RECORDER_START_TIMEOUT_S = 10.0
@@ -219,6 +220,10 @@ class AsyncEpisodeRecorder:
         return {
             "task_label": task_label,
             "collection_source": collection_source,
+            **(dict(
+                sampling_period_ns=sampling_clock_ns(self.control_hz)[0],
+                sampling_tolerance_ns=sampling_clock_ns(self.control_hz)[1],
+            ) if collection_source == "teleop" else {}),
             "camera_payload_mode": "depth_to_color_aligned_rgbd",
             "camera_color_width": color.width,
             "camera_color_height": color.height,

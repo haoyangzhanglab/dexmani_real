@@ -26,6 +26,7 @@ class InferenceWorker:
         self._closing = False
         self.closed = False
         self.close_error = None
+        self.close_future = None
         self.query_context = None
 
     def _call(self, operation, args, kwargs):
@@ -35,7 +36,7 @@ class InferenceWorker:
             if operation == "load":
                 self._model = self._factory()
                 value = self._model.warmup(**kwargs)
-            else:
+            elif operation != "close" or self._model is not None:
                 value = getattr(self._model, operation)(*args, **kwargs)
         except BaseException as exc:
             error = exc
@@ -68,32 +69,21 @@ class InferenceWorker:
                     self.close_error = result.error
                     logger.error("model close failed: %s", result.error)
             finally:
-                self.future = None
                 self.closed = True
-                self._executor.shutdown(wait=False)
 
         def recovered(future):
-            if future is not None:
-                result = future.result()
-                logger.info(
-                    "retired model result after shutdown: context=%s started_ns=%s completed_ns=%s error=%s",
-                    retired_context,
-                    result.started_ns,
-                    result.completed_ns,
-                    result.error,
-                )
-                if result.error is not None:
-                    logger.error("retired model task failed during shutdown: %s", result.error)
-            if self._model is None:
-                self.future = None
-                self.closed = True
-                self._executor.shutdown(wait=False)
-            else:
-                self.operation = "close"
-                self.future = self._executor.submit(self._call, "close", (), {})
-                self.future.add_done_callback(closed)
+            result = future.result()
+            logger.info(
+                "retired model result after shutdown: context=%s started_ns=%s completed_ns=%s error=%s",
+                retired_context, result.started_ns, result.completed_ns, result.error,
+            )
+            if result.error is not None:
+                logger.error("retired model task failed during shutdown: %s", result.error)
 
-        if self.future is None:
-            recovered(None)
-        else:
+        # Enqueue while the interpreter still accepts work, even during load/predict.
+        # The same owner checks model existence only when cleanup reaches the queue head.
+        self.close_future = self._executor.submit(self._call, "close", (), {})
+        self.close_future.add_done_callback(closed)
+        if self.future is not None:
             self.future.add_done_callback(recovered)
+        self._executor.shutdown(wait=False, cancel_futures=False)

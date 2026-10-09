@@ -67,6 +67,9 @@ class PolicyOperator:
             return
         self._handle_command_batch(self.keyboard.poll(timeout=0))
 
+    def discard_pending_start(self):
+        self.keyboard.drain_signal(OperatorCommand.BEGIN)
+
     def _handle_command_batch(self, signals) -> None:
         # H blocks the I/O owner. H/B/T in that batch require a fresh request
         # after HOME, including when HOME returns incomplete.
@@ -158,7 +161,7 @@ class PolicyOperator:
         home_result = {"outcome": "incomplete"}
         self.home_results.append(home_result)
         try:
-            completed = home_robot(
+            result = home_robot(
                 self.shared,
                 self.runtime,
                 self.planner,
@@ -170,7 +173,7 @@ class PolicyOperator:
             raise
         with self.shared.motion_lock:
             completed_without_stop = bool(
-                completed
+                result.ok
                 and self.shared.sensors.is_running.value
                 and not self.shared.quit_requested
                 and not self.shared.error_state
@@ -179,16 +182,18 @@ class PolicyOperator:
                 and int(self.shared.safety_state) == int(SafetyState.ARMED)
             )
         interrupted = bool(
-            self.shared.quit_requested
-            or self.shared.estop_request
-            or self.shared.stop_request
+            result.interrupted
+            or (result.ok and (
+                self.shared.quit_requested or self.shared.estop_request or self.shared.stop_request
+            ))
         )
         home_result.update(
             outcome="completed"
             if completed_without_stop
             else "interrupted"
             if interrupted
-            else "failed"
+            else "failed",
+            reason=result.reason,
         )
         if completed_without_stop:
             logger.info("operator: physical home sequence completed; press B to start")

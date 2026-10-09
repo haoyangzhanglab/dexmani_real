@@ -1,11 +1,13 @@
 """Current-row teleop mapping, absolute target dispatch and raw recording."""
 
 import logging
+import time
 
 from typing import NamedTuple
 
 import numpy as np
 
+from dexmani_real.recording.recorder import RecordingError
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
@@ -35,7 +37,6 @@ class TeleopController:
         self.hand_retargeter = hand_retargeter
         self.arm_fk = make_arm_fk()
         self.hand_observation_cache = HandRetargetObservationCache()
-        self.previous_arm_command = None
         self.clear_reference()
 
     def clear_reference(self):
@@ -104,61 +105,64 @@ class ControlStepResult(NamedTuple):
 
 
 def execute_control_step(
-    controller, shared, robot, row, recorder=None, *, termination_details=None
+    controller, shared, robot, row, recorder=None, *, action_deadline_ns, termination_details=None
 ):
     epoch = int(shared.run_id)
-    realization = controller.compute_target(row)
-    control_ok = realization is not None and realization.arm_qpos is not None
-    target = (
-        RobotCommand(epoch, realization.arm_qpos, realization.hand_qpos) if control_ok else None
-    )
-    if realization is not None and realization.rejection_reason:
-        logger.debug("teleop target rejected: %s", realization.rejection_reason)
-    if recorder is not None:
-        recorder.check_error()
-    result = failure = stop_error = None
-    interrupted = False
+    realization = target = result = failure = stop_error = None
+    control_ok = interrupted = False
     try:
-        if target is not None:
-            try:
+        try:
+            realization = controller.compute_target(row)
+            control_ok = realization is not None and realization.arm_qpos is not None
+            if control_ok:
+                target = RobotCommand(epoch, realization.arm_qpos, realization.hand_qpos)
+            if recorder is not None:
+                recorder.check_error()
+            if target is not None:
                 result = robot.send_action(
                     target,
-                    valid_until_ns=feedback_deadline_ns(row, controller.runtime, include_vr=True),
+                    valid_until_ns=min(
+                        action_deadline_ns,
+                        feedback_deadline_ns(row, controller.runtime, include_vr=True),
+                    ),
                 )
-            except (DispatchError, DispatchInterrupted) as exc:
-                result, failure = exc.result, exc
-                cancelled = isinstance(exc, DispatchInterrupted)
-                cause = getattr(exc, "cause", None)
-                with shared.motion_lock:
-                    operator_cancelled = (
-                        cause == "authority_revoked"
-                        and int(shared.run_ended_id) == epoch
-                        and int(shared.run_ended_reason)
-                        in (RunEndReason.OPERATOR, RunEndReason.QUIT)
-                    )
-                if not operator_cancelled:
-                    logger.warning("teleop dispatch failed (%s): %s", cause, exc)
-                    if termination_details is not None:
-                        termination_details.append(
-                            dict(
-                                stage="dispatch",
-                                exception_type=type(exc).__name__,
-                                message=str(exc),
-                                cause=cause,
-                            )
-                        )
-                if cancelled:
-                    shared.estop_request = True
-                revoke_motion_if_run_id(
-                    shared,
-                    epoch,
-                    reason=RunEndReason.ESTOP
-                    if cancelled
-                    else RunEndReason.EXECUTOR_BOUNDARY
-                    if exc.revoked
-                    else RunEndReason.HARDWARE_FAULT,
-                )
-        interrupted = failure is not None or int(shared.run_id) != epoch
+        except BaseException as exc:
+            failure = exc
+            if isinstance(exc, (DispatchError, DispatchInterrupted)):
+                result = exc.result
+            cancelled = isinstance(exc, KeyboardInterrupt)
+            cause = getattr(exc, "cause", None)
+            if termination_details is not None:
+                termination_details.append(dict(
+                    stage="control", exception_type=type(exc).__name__, message=str(exc), cause=cause,
+                ))
+            if cancelled:
+                shared.estop_request = True
+            revoke_motion_if_run_id(
+                shared, epoch,
+                reason=RunEndReason.ESTOP if cancelled else
+                RunEndReason.RECORDING_FAILURE if isinstance(exc, RecordingError) else
+                RunEndReason.EXECUTOR_BOUNDARY if getattr(exc, "revoked", False) else
+                RunEndReason.HARDWARE_FAULT if isinstance(exc, DispatchError) else
+                RunEndReason.POLICY_FAILURE,
+            )
+        if not control_ok and recorder is not None:
+            if termination_details is not None:
+                termination_details.append(dict(
+                    stage="control", reason="target_unavailable",
+                    rejection=getattr(realization, "rejection_reason", None),
+                ))
+            revoke_motion_if_run_id(shared, epoch, reason=RunEndReason.EXECUTOR_BOUNDARY)
+        expired = time.monotonic_ns() >= action_deadline_ns
+        if expired:
+            if termination_details is not None:
+                termination_details.append(dict(
+                    stage="dispatch", reason="action_deadline_expired",
+                    deadline_ns=action_deadline_ns, returned_ns=time.monotonic_ns(),
+                ))
+            # A blocking SDK may have accepted a target; retain its actual status.
+            revoke_motion_if_run_id(shared, epoch, reason=RunEndReason.EXECUTOR_BOUNDARY)
+        interrupted = expired or failure is not None or int(shared.run_id) != epoch
         if interrupted:
             try:
                 robot.stop()
@@ -185,9 +189,9 @@ def execute_control_step(
                     logger.exception("recording after dispatch also failed")
                     raise failure from exc
                 raise
-    if isinstance(failure, DispatchInterrupted) or (
-        failure is not None
-        and (not failure.revoked or failure.cause not in {"authority_revoked", "deadline_expired"})
+    if failure is not None and not (
+        isinstance(failure, DispatchError) and failure.revoked
+        and failure.cause in {"authority_revoked", "deadline_expired"}
     ):
         raise failure
     if stop_error is not None:

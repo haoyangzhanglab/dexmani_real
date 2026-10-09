@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
 
 import numpy as np
 
@@ -18,7 +19,7 @@ from dexmani_real.planning.kinematics.arm_fk import (
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
-from dexmani_real.recording.storage.schema import DATASET_SPECS, validate_capture_rows
+from dexmani_real.recording.storage.schema import DATASET_SPECS, validate_training_rows
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
 
@@ -43,6 +44,13 @@ def validate_export_episode(reader: EpisodeReader) -> int:
     )
     if reader["depth"].shape != expected or reader["depth"].dtype != np.uint16:
         raise RawDataError(f"depth must be uint16 {expected}")
+    errors = validate_training_rows(
+        reader["timestamp"][:], reader["dispatch_status"][:], reader.control_hz
+    )
+    if errors:
+        raise RawDataError("; ".join(errors))
+    if frames == 1:
+        logging.getLogger(__name__).warning("%s: single row, no sampling interval to verify", reader.path)
     for name, spec in DATASET_SPECS.items():
         array = reader[name]
         if np.issubdtype(spec.dtype, np.floating):
@@ -52,9 +60,6 @@ def validate_export_episode(reader: EpisodeReader) -> int:
                 if not valid.all():
                     row = start + int(np.flatnonzero(~valid)[0])
                     raise RawDataError(f"Raw {name}: nonfinite values at row {row}")
-    errors = validate_capture_rows(reader["timestamp"][:], reader["dispatch_status"][:])
-    if errors:
-        raise RawDataError("; ".join(errors))
     try:
         load_raw_episode_camera_model(reader)
         load_raw_episode_base_from_color(reader)

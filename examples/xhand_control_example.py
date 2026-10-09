@@ -62,8 +62,7 @@ _STOP_RETRY_TIMEOUT_S = 0.25
 _STOP_RETRY_COUNT = 26
 _ACTION_DWELL_S = 1.0
 
-# XHand1 poses from the historical example. HOME/palm come from
-# the current experiment configuration, rather than an old calibration/pose.
+# XHand1 example targets in degrees; HOME/palm use the current configuration.
 _PRESET_QPOS_DEG = {
     "fist": (
         11.85, 74.58, 40, -3.08, 106.02, 109.5,

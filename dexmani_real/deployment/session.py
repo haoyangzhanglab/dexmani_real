@@ -222,7 +222,8 @@ def run_policy_deployment(
             ),
         )
         operator.keyboard.start()
-        print("空闲且确认手部无接触后按 T 归零触觉；S/Q/ESC 可取消。", flush=True)
+        print("空闲且确认手部无接触后按 T 归零触觉；S/Q/ESC 可取消。"
+              "dense 仅检查载荷/残差有限，不验证稳定性或无接触。", flush=True)
         robot.check_services = lambda: supervisor.check() and operator.keyboard.healthy
         runner = PolicyRunner(
             shared,
@@ -232,6 +233,7 @@ def run_policy_deployment(
             realizer=realizer,
             recorder=recorder,
             poll_operator=operator.poll,
+            discard_pending_start=operator.discard_pending_start,
             model_runtime=model,
             kinematics=kinematics,
             execute=execute,

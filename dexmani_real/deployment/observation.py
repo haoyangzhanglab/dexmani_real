@@ -1,7 +1,5 @@
 """Project real control-row history into the requested Policy observation mapping."""
 
-import logging
-
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,9 +14,6 @@ from dexmani_real.planning.kinematics.arm_fk import (
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
-from dexmani_real.utils.log import ThrottledWarner
-
-_warn_unavailable = ThrottledWarner(logger=logging.getLogger(__name__))
 
 
 @dataclass(frozen=True)
@@ -48,33 +43,41 @@ def build_observation_kinematics(policy_info: Any, runtime: Any):
     return ObservationKinematics(make_arm_fk(), hand_fk, runtime.hand)
 
 
+def policy_observation_issue(row, fields):
+    """Check each real row, including bootstrap and slots using an existing plan."""
+    if row is None or row.hand is None:
+        return "required_observation_unavailable"
+    if not np.isfinite(row.arm["qpos"]).all() or not np.isfinite(row.hand["qpos"]).all():
+        return "control_feedback_nonfinite"
+    for name in fields:
+        if name in {"contact_force", "tactile_force"}:
+            channel = "aggregate" if name == "contact_force" else "dense"
+            if not bool(row.hand[f"tactile_{channel}_valid"][0]):
+                return f"required_{name}_unavailable"
+            if not np.isfinite(row.hand[f"tactile_{channel}"]).all():
+                return f"required_{name}_nonfinite"
+        elif name == "point_cloud":
+            if row.point_cloud is None or not np.isfinite(row.point_cloud).all():
+                return "required_point_cloud_unavailable_or_nonfinite"
+        elif name == "rgb":
+            if row.camera is None:
+                return "required_rgb_unavailable"
+            image = row.camera["rgb"]
+            if (not isinstance(image, np.ndarray) or image.dtype != np.uint8
+                    or image.ndim != 3 or image.shape[2] != 3 or min(image.shape[:2]) <= 0):
+                return "required_rgb_invalid"
+    return None
+
+
 def build_policy_observation(rows, policy_info, *, kinematics=None):
     requested = set(policy_info.observation_fields)
-    tactile_fields = requested & {"contact_force", "tactile_force"}
-    if not rows:
-        if tactile_fields:
-            _warn_unavailable(
-                "policy observation rejected: required %s history unavailable (no observation rows)",
-                ", ".join(sorted(tactile_fields)),
-            )
-        return None
-    if any(row.hand is None for row in rows):
-        if tactile_fields:
-            _warn_unavailable(
-                "policy observation rejected: required %s unavailable (missing hand history)",
-                ", ".join(sorted(tactile_fields)),
-            )
+    if not rows or any(row.hand is None for row in rows):
         return None
     for name, field in (
         ("contact_force", "tactile_aggregate_valid"),
         ("tactile_force", "tactile_dense_valid"),
     ):
         if name in requested and not all(bool(row.hand[field][0]) for row in rows):
-            _warn_unavailable(
-                "policy observation rejected: required %s unavailable in history (%d rows)",
-                name,
-                len(rows),
-            )
             return None
     arrays = {}
     if requested & {"joint_state", "eef_pose", "fingertip_points"}:
@@ -129,7 +132,7 @@ def build_policy_observation(rows, policy_info, *, kinematics=None):
 
 
 def policy_sources(row, fields):
-    """Latest-slot host source times; RGB-D/cloud use the oldest channel advance."""
+    """Host source times for each requested field in the latest control row."""
     arm = int(row.arm["timestamp_ns"][0])
     hand = int(row.hand["timestamp_ns"][0])
     sources = {}
