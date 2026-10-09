@@ -3,6 +3,7 @@
 import logging
 import multiprocessing as mp
 import os
+import time
 from dataclasses import replace
 
 from dexmani_real.calibration.camera.extrinsics import (
@@ -71,8 +72,6 @@ def _warmup_policy(model, runtime, info, execution_config, *, max_running_s=None
         if execution_config.execution_mode == "rtc"
         else 0,
     )
-    import time
-
     while (completion := model.poll()) is None:
         time.sleep(0.005)
     if completion[1].error is not None:
@@ -123,8 +122,9 @@ def run_policy_deployment(
         if results_dir is not None
         else None
     )
-    shared = supervisor = robot = model = operator = None
+    shared = supervisor = robot = model = operator = recorder = None
     failure = None
+    model_close = dict(status="completed", reason="model_not_created")
     clean = shutdown_clean = home_fault = False
     try:
         fields = set(info.observation_fields)
@@ -162,21 +162,21 @@ def run_policy_deployment(
         model = InferenceWorker(lambda: _load_configured_policy(policy_config, execution_config))
         _warmup_policy(model, runtime, info, execution_config, max_running_s=max_running_s)
         logger.info(
-            "Validated policy: inputs=%s action=%s dt=%s N/H/A=%s/%s/%s mode=%s d=%s beta=%s recording=%s; "
+            "Validated policy: inputs=%s action=%s dt=%s N/H/A_exec=%s/%s/%s mode=%s d=%s beta=%s recording=%s; "
             "cadence/cloud recipe from saved Policy, physical configuration from Real",
             info.observation_fields,
             info.action_mode,
             info.control_dt_s,
             info.n_obs_steps,
             info.horizon,
-            info.n_action_steps,
+            execution_config.action_steps,
             execution_config.execution_mode,
             execution_config.prefetch_steps,
             execution_config.rtc_guidance_cap,
             recording_config is not None,
         )
         kinematics = build_observation_kinematics(info, runtime)
-        realizer = ActionRealizer.for_mode(runtime, info.action_mode)
+        realizer = ActionRealizer.for_mode(runtime, info.action_mode, deployment=True)
         home_planner = build_home_planner(runtime) if execute else None
         if save_run_config is not None:
             save_run_config(runtime, execution_config)
@@ -259,28 +259,52 @@ def run_policy_deployment(
             shared.error_state = True
         logger.exception("policy session failed")
     finally:
-        try:
-            if shared is not None:
+        # One session budget; other resource cleanup consumes its remaining time.
+        # Native calls/threads can still prevent process exit beyond this budget.
+        shutdown_deadline = time.monotonic() + runtime.safety.shutdown_timeout_s
+        cleanup_errors = []
+        if shared is not None:
+            try:
                 revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
+            except Exception as exc:
+                cleanup_errors.append(error_detail("revoke_motion", exc))
+        if robot is not None and robot.stop_required:
+            try:
+                robot.stop()
+            except Exception as exc:
+                cleanup_errors.append(error_detail("stop", exc))
+        if model is not None:
+            try:
+                model.close()
+            except Exception as exc:
+                cleanup_errors.append(error_detail("model_close_submit", exc))
+        try:
+            if recorder is not None:
+                try:
+                    recorder.close()
+                except Exception as exc:
+                    cleanup_errors.append(error_detail("recorder_close", exc))
             if supervisor is not None:
                 shutdown_clean = shutdown_local_runtime(
-                    robot,
-                    supervisor,
-                    model=model,
+                    robot, supervisor,
                     keyboard=operator.keyboard if operator else None,
-                    timeout_s=runtime.safety.shutdown_timeout_s,
+                    timeout_s=max(0.0, shutdown_deadline - time.monotonic()),
                 )
             elif shared is not None:
                 shutdown_clean = bool(shared.sensors.close())
+            else:
+                shutdown_clean = True
         except Exception as exc:
-            failure = failure or exc
-            if results is not None:
-                results.session["errors"].append(error_detail("shutdown", exc))
+            cleanup_errors.append(error_detail("shutdown", exc))
         finally:
+            if model is not None:
+                model_close = model.close_result(shutdown_deadline - time.monotonic())
+            shutdown_clean = (shutdown_clean and not cleanup_errors
+                              and model_close["status"] == "completed")
+            if results is not None:
+                results.session["errors"].extend(cleanup_errors)
             home_results = operator.home_results if operator is not None else []
             home_fault = any(item["outcome"] in ("failed", "fault") for item in home_results)
-            if model is not None and (model.close_error is not None or not model.closed):
-                shutdown_clean = False
             if results is not None:
                 try:
                     results.finish_session(
@@ -291,17 +315,18 @@ def run_policy_deployment(
                         if failure
                         else "return_home_failed"
                         if home_fault
-                        else "shutdown_failed_or_pending"
+                        else f"model_close_{model_close['status']}"
+                        if model_close["status"] != "completed"
+                        else "shutdown_failed"
                         if not shutdown_clean
                         else None,
                         shutdown_clean=shutdown_clean,
+                        model_close=model_close,
                         home_results=home_results,
                     )
                 except Exception as exc:
                     failure = failure or exc
                     logger.exception("session result publication failed")
-    if model is not None and not model.closed:
+    if model_close["status"] == "pending":
         logger.warning("Model cleanup remains pending; Python/CUDA exit is not bounded")
-    if model is not None and model.close_error is not None:
-        shutdown_clean = False
     return int(not clean or failure is not None or not shutdown_clean or home_fault)

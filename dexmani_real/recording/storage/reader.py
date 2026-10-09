@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 
+import json
+
 import h5py
 import numpy as np
 
-from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT
+from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT, TIMING_ROW_DTYPE
 from dexmani_real.recording.storage.video import VideoDecoder
 
 
@@ -124,6 +126,55 @@ class EpisodeReader:
                 raise RawDataError(f"Raw {name}: incompatible shape/dtype")
         self._datasets[name] = array
         return array
+
+    def read_timing(self):
+        """Optional evidence; old Raw keeps its core path without invented clocks."""
+        if "timing" not in self._data:
+            return dict(available=False, reason="timing_evidence_unavailable")
+        group = self._data["timing"]
+        rows = group["rows"]
+        if rows.shape != (self.num_frames,) or rows.dtype != TIMING_ROW_DTYPE:
+            raise RawDataError("timing rows must align with core rows and match timing dtype")
+        queries = [json.loads(value) for value in group["queries"].asstr()[:]]
+        keys = [(item["run_id"], item["query_id"]) for item in queries]
+        if len(set(keys)) != len(keys):
+            raise RawDataError("duplicate timing query identity")
+        values = rows[:]
+        for row in values:
+            if row["query_id"] >= 0 and (int(row["run_id"]), int(row["query_id"])) not in keys:
+                raise RawDataError("action timing references an absent query")
+        return dict(available=True, rows=values, queries=queries,
+                    termination=json.loads(group["termination"].asstr()[()])
+                    if "termination" in group else None)
+
+    def timing_diagnostics(self):
+        """Host ages/deltas in seconds, with NaN/None for unavailable evidence.
+
+        These measurements define no cross-modality admission threshold.
+        """
+        evidence = self.read_timing()
+        if not evidence["available"]:
+            return evidence
+        rows = evidence["rows"]
+        def delta(end, start):
+            valid = (rows[end] > 0) & (rows[start] > 0)
+            result = np.full(len(rows), np.nan)
+            result[valid] = (rows[end][valid] - rows[start][valid]) / 1e9
+            return result
+        def inference(query):
+            start, end = query.get("started_ns"), query.get("completed_ns")
+            return None if start is None or end is None else (end - start) / 1e9
+        return dict(
+            available=True,
+            observation_age_s={name: delta("observation_ns", f"{name}_ns")
+                               for name in ("arm", "hand", "camera", "pointcloud")},
+            modality_delta_s={"arm_hand": delta("arm_ns", "hand_ns"),
+                              "arm_camera": delta("arm_ns", "camera_ns"),
+                              "camera_pointcloud": delta("camera_ns", "pointcloud_ns")},
+            submit_duration_s=delta("submit_completed_ns", "submit_started_ns"),
+            inference_duration_s={(q["run_id"], q["query_id"]): inference(q)
+                                  for q in evidence["queries"]},
+        )
 
     @property
     def num_frames(self) -> int:

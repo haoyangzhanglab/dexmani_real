@@ -2,7 +2,7 @@
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import deque
 
 import numpy as np
@@ -27,6 +27,7 @@ from dexmani_real.robot.commands import DispatchStatus, RobotCommand
 from dexmani_real.robot.robot import DispatchError, DispatchInterrupted
 from dexmani_real.runtime.observation import (
     feedback_deadline_ns,
+    observation_timing,
     read_observation,
 )
 from dexmani_real.runtime.safety import (
@@ -52,6 +53,8 @@ class Query:
     handoff_slot: int | None
     result: np.ndarray | None = None
     bootstrap: bool = False
+    completed_ns: int | None = None
+    evidence: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -63,6 +66,7 @@ class Plan:
     segment_end: int
     sources: dict[str, tuple[int, ...]]
     frozen: dict[int, RobotCommand]
+    query_id: int = -1
 
 
 class PolicyRunner:
@@ -107,6 +111,10 @@ class PolicyRunner:
         self.plan = None
         self.query = None
         self.query_id = 0
+        self.slot_timing = {}
+        self.termination_timing = None
+        self.preparation_issue = None
+        self.observation_read_issues = []
         self.wait_started_ns = None
         self.preparing_epoch = None
         self.reset_ready = False
@@ -125,10 +133,12 @@ class PolicyRunner:
         self.requires_rgb_cloud_identity = self.requires_camera_payload and self.requires_cloud
 
     def _read_observation(self):
+        self.observation_read_issues.clear()
         return read_observation(
             self.shared,
             self.runtime,
             self.robot,
+            issues=self.observation_read_issues,
             require_hand=True,
             require_camera=self.requires_camera_payload,
             require_pointcloud=self.requires_cloud,
@@ -191,7 +201,15 @@ class PolicyRunner:
         if self.run_id is None:
             return
         epoch = self.run_id
-        duration_s = (time.monotonic_ns() - self.started_ns) / 1e9
+        ended_ns = time.monotonic_ns()
+        duration_s = (ended_ns - self.started_ns) / 1e9
+        self.termination_timing = dict(
+            run_id=epoch, started_ns=self.started_ns, slot=self.last_slot,
+            ended_ns=ended_ns, reason=detail,
+            query=dict(self.query.evidence) if self.query is not None else None,
+            action_query_id=self.slot_timing.get("query_id"),
+            prediction_index=self.slot_timing.get("prediction_index"),
+        )
         revoke_motion_if_run_id(self.shared, epoch, reason=run_end_reason)
         if self.discard_pending_start is not None:
             self.discard_pending_start()
@@ -241,7 +259,8 @@ class PolicyRunner:
                 saved, status = None, "empty"
                 try:
                     saved = self.recorder.save_episode(
-                        reason=reason, details=[dict(stage="termination", reason=detail), *errors]
+                        reason=reason, details=[dict(stage="termination", reason=detail), *errors],
+                        timing=self.termination_timing,
                     )
                     status = "published" if saved is not None else "empty"
                 except BaseException as exc:
@@ -263,10 +282,20 @@ class PolicyRunner:
         finally:
             self.recording_started = False
 
+    def _observation_issue(self, row):
+        if row is None and self.observation_read_issues:
+            issue = self.observation_read_issues[0]
+            if (self.recorder is not None and "rgb" not in self.policy_info.observation_fields
+                    and issue.startswith("camera_")):
+                return f"recording_source_{issue}"
+            return f"policy_input_{issue}"
+        return policy_observation_issue(row, self.policy_info.observation_fields)
+
     def _start_observation(self):
         row = self._read_observation()
-        if row is None:
-            logger.warning("policy B rejected: required observation unavailable")
+        self.preparation_issue = self._observation_issue(row)
+        if self.preparation_issue is not None:
+            logger.warning("policy B rejected: %s", self.preparation_issue)
             return None
         if self.execute and (
             np.max(np.abs(row.arm["qpos"][0] - self.runtime.arm.home_qpos))
@@ -274,6 +303,7 @@ class PolicyRunner:
             or np.max(np.abs(row.hand["qpos"][0] - np.deg2rad(self.runtime.hand.home_qpos_deg)))
             > np.deg2rad(self.runtime.hand.home_tolerance_deg)
         ):
+            self.preparation_issue = "start_requires_home_pose"
             logger.warning("policy B requires current arm + hand home pose")
             return None
         return row
@@ -297,8 +327,12 @@ class PolicyRunner:
                     return
                 epoch = int(self.shared.run_id)
             if self._start_observation() is None:
+                if self.results is not None:
+                    self.results.begin_episode()
+                    self._finalize_outputs("preparation_failed", self.preparation_issue)
                 return
             self.recording_started = False
+            self.termination_timing = None
             if self.results is not None:
                 self.results.begin_episode()
             self.preparing_epoch = epoch
@@ -352,6 +386,7 @@ class PolicyRunner:
             self.plan = self.query = None
             self.previous_arm = None
             self.last_slot = -1
+            self.slot_timing = {}
             self.next_step_ns = self.started_ns
             self.wait_started_ns = self.started_ns
         except BaseException as exc:
@@ -361,8 +396,8 @@ class PolicyRunner:
             if not committed:
                 try:
                     self._finalize_outputs(
-                        "start_cancelled",
-                        str(start_failure) if start_failure else "final admission declined",
+                        "preparation_failed" if self.preparation_issue else "start_cancelled",
+                        str(start_failure) if start_failure else self.preparation_issue or "final admission declined",
                     )
                 except Exception:
                     if start_failure is None:
@@ -386,6 +421,13 @@ class PolicyRunner:
         query = self.query
         if query is None:
             raise RuntimeError("Model result has no owned query")
+        if query.run_id == self.run_id:
+            query.evidence.update(
+                started_ns=result.started_ns, completed_ns=result.completed_ns,
+                status="failed" if result.error is not None else "completed",
+                error=str(result.error) if result.error is not None else None,
+            )
+            self._record_query(query)
         if self.results is not None and query.run_id == self.run_id:
             self.results.record_inference(result.completed_ns - result.started_ns)
         if query.run_id != self.run_id or not self._has_motion_authority():
@@ -413,13 +455,16 @@ class PolicyRunner:
             return
         if not valid_future:
             raise ValueError(f"Policy future requires finite floating point {expected}")
+        query.completed_ns = result.completed_ns
         query.result = future
         if query.handoff_slot is None:
             # Bootstrap was not executed during inference; preserve its entire head.
             query.handoff_slot = max(self.last_slot + 1, (now - self.started_ns) // self.dt_ns + 1)
             query.bootstrap = True
+            query.evidence.update(handoff_slot=int(query.handoff_slot), bootstrap=True)
+            self._record_query(query)
 
-    def _submit(self, rows, slot, *, prefix=None, commands=None):
+    def _submit(self, rows, slot, *, handoff_slot=None, prefix=None, commands=None):
         observation = build_policy_observation(rows, self.policy_info, kinematics=self.kinematics)
         if observation is None:
             self._finish_episode("policy_observation_unavailable", row=rows[-1])
@@ -448,30 +493,38 @@ class PolicyRunner:
             self._finish_episode("prefix_decision_expired", row=rows[-1])
             return
         self.query_id += 1
-        delay = self.execution.prefetch_steps if prefix is not None else 0
         self.query = Query(
-            self.query_id, self.run_id, slot, sources, slot + delay if prefix is not None else None
+            self.query_id, self.run_id, slot, sources, handoff_slot
         )
         # build_policy_observation stacks owned arrays; the worker only reads them.
         kwargs = (
-            dict(rtc_prefix=prefix, delay_steps=delay)
-            if prefix is not None and self.execution.execution_mode == "rtc"
+            dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot)
+            if prefix is not None
             else {}
         )
         self.model.query_context = dict(
             run_id=self.run_id,
             query_id=self.query_id,
         )
+        self.query.evidence = dict(
+            query_id=self.query_id, run_id=self.run_id, slot=int(slot),
+            handoff_slot=self.query.handoff_slot,
+            deadline_ns=(self.started_ns + self.query.handoff_slot * self.dt_ns)
+            if self.query.handoff_slot is not None else None,
+            submitted_ns=time.monotonic_ns(), started_ns=None, completed_ns=None,
+            status="submitted", bootstrap=self.query.handoff_slot is None,
+            observations=[dict(observation_timing(row), policy_sources=policy_sources(
+                row, self.policy_info.observation_fields)) for row in rows],
+        )
         self.model.submit("predict", observation, **kwargs)
+        self._record_query(self.query)
         if commands is not None:
             self.plan.frozen.update(commands)
 
     def _prepare_prefix(self, row, slot):
+        """Reserve RTC commands and express the same physical targets as guidance."""
         start = slot - self.plan.anchor_slot
-        prefix = self.plan.actions[start:]
-        rtc = self.execution.execution_mode == "rtc"
-        if rtc:
-            prefix = prefix.copy()
+        prefix = self.plan.actions[start:].copy()
         commands = {}
         previous = self.previous_arm
         for i in range(self.execution.prefetch_steps):
@@ -504,16 +557,19 @@ class PolicyRunner:
             command = RobotCommand(self.run_id, decoded.arm_qpos, decoded.hand_qpos)
             commands[slot + i] = command
             previous = command.arm_qpos
-            if rtc:
-                prefix[i] = self.realizer.control_from_command(
-                    command, self.policy_info.action_mode
-                )
+            prefix[i] = self.realizer.control_from_command(
+                command, self.policy_info.action_mode
+            )
         return prefix, commands
+
+    def _record_query(self, query):
+        if self.recorder is not None and self.recording_started:
+            self.recorder.record_query(query.evidence)
 
     def _record(self, row, command=None, result=None):
         if self.recorder is not None and row is not None:
             try:
-                self.recorder.add_frame(row, command, result)
+                self.recorder.add_frame(row, command, result, timing=self.slot_timing)
             except Exception as exc:
                 # Never retry a row whose writer submission failed.
                 try:
@@ -529,10 +585,11 @@ class PolicyRunner:
         plan = self.plan
         command = plan.frozen.get(slot)
         if command is not None:
-            if not self.realizer.frozen_is_valid(
+            rejection = self.realizer.frozen_rejection(
                 command, row.arm["qpos"][0], self.previous_arm, self.policy_info.action_mode
-            ):
-                self._finish_episode("frozen_target_rejected", row=row)
+            )
+            if rejection is not None:
+                self._finish_episode(f"frozen_target_rejected: {rejection}", row=row)
                 return
         else:
             decoded = self.realizer.realize(
@@ -555,6 +612,7 @@ class PolicyRunner:
 
     def _execute_slot(self, row, slot):
         plan = self.plan
+        self.slot_timing.update(query_id=plan.query_id, prediction_index=slot - plan.anchor_slot)
         command = self._command_for_slot(row, slot)
         if self.run_id is None or command is None:
             return
@@ -582,9 +640,12 @@ class PolicyRunner:
         result, failure = None, None
         if self.execute:
             try:
+                self.slot_timing["submit_started_ns"] = time.monotonic_ns()
                 result = self.robot.send_action(command, valid_until_ns=valid_until_ns)
             except (DispatchError, DispatchInterrupted) as exc:
                 result, failure = exc.result, exc
+            finally:
+                self.slot_timing["submit_completed_ns"] = time.monotonic_ns()
         if (self.results is not None and self.results.current is not None
                 and result is not None
                 and (result.arm != DispatchStatus.NOT_CALLED or result.hand != DispatchStatus.NOT_CALLED)):
@@ -652,24 +713,31 @@ class PolicyRunner:
             and query.handoff_slot is not None
             and slot >= query.handoff_slot
         ):
-            if (
-                slot != query.handoff_slot
-                or query.result is None
-                or time.monotonic_ns()
-                > self.next_step_ns - self.dt_ns + int(self.execution.max_tick_lateness_s * 1e9)
-                or not decision_is_fresh(
-                    query.sources, time.monotonic_ns(), self.execution.max_decision_age_s
-                )
-            ):
-                self._finish_episode("missed_or_invalid_handoff", row=row)
+            now = time.monotonic_ns()
+            nominal_ns = self.started_ns + query.handoff_slot * self.dt_ns
+            issue = (
+                "handoff_authority_revoked" if not self._has_motion_authority() else
+                "handoff_slot_missed" if slot != query.handoff_slot else
+                "handoff_result_not_ready" if query.result is None else
+                "handoff_model_deadline_exceeded"
+                if not query.bootstrap and (query.completed_ns is None or query.completed_ns > nominal_ns) else
+                "handoff_owner_late" if now > nominal_ns + int(self.execution.max_tick_lateness_s * 1e9) else
+                self._observation_issue(row) or
+                ("handoff_decision_expired" if not decision_is_fresh(
+                    query.sources, now, self.execution.max_decision_age_s
+                ) else None)
+            )
+            if issue is not None:
+                self._finish_episode(issue, row=row)
             else:
                 anchor = slot if query.bootstrap else query.slot
                 self.plan = Plan(
                     actions=query.result,
                     anchor_slot=anchor,
-                    segment_end=slot + self.policy_info.n_action_steps,
+                    segment_end=slot + self.execution.action_steps,
                     sources=query.sources,
                     frozen={},
+                    query_id=query.query_id,
                 )
                 self.query = None
 
@@ -681,10 +749,13 @@ class PolicyRunner:
             if not rows or self.query is not None or self.model.future is not None:
                 self._finish_episode("prefetch_unavailable", row=row)
             else:
-                prefix, commands = self._prepare_prefix(row, slot)
-                if self.run_id is None:
-                    return
-                self._submit(rows, slot, prefix=prefix, commands=commands)
+                prefix = commands = None
+                if self.execution.execution_mode == "rtc":
+                    prefix, commands = self._prepare_prefix(row, slot)
+                    if self.run_id is None:
+                        return
+                self._submit(rows, slot, handoff_slot=self.plan.segment_end,
+                             prefix=prefix, commands=commands)
 
     def step(self):
         self.robot.check()
@@ -718,6 +789,7 @@ class PolicyRunner:
                 self.results.current["metrics"]["skipped_slots"] += max(0, slot - self.last_slot - 1)
             self._finish_episode(f"missed_slot: expected={self.last_slot + 1}, actual={slot}")
             return
+        self.slot_timing = dict(run_id=self.run_id, slot=int(slot), control_ns=now)
         self.last_slot = slot
         self.next_step_ns = self.started_ns + (slot + 1) * self.dt_ns
         row = None
@@ -734,7 +806,7 @@ class PolicyRunner:
             ):
                 self._finish_episode("observation_missed_slot", row=row)
                 return
-            issue = policy_observation_issue(row, self.policy_info.observation_fields)
+            issue = self._observation_issue(row)
             if issue is not None:
                 self._finish_episode(issue, row=row)
                 return
@@ -833,16 +905,5 @@ class PolicyRunner:
                     )
             except Exception as exc:
                 failure = failure or exc
-            if self.recorder is not None:
-                try:
-                    self.recorder.close()
-                except Exception as exc:
-                    failure = failure or exc
-                    logger.exception("policy recorder close failed after episode finalization")
-            try:
-                self.model.close()
-            except Exception as exc:
-                failure = failure or exc
-                logger.exception("policy model worker close failed")
         if failure is not None:
             raise failure

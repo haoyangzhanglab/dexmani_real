@@ -1,4 +1,13 @@
-"""Strict current-writer fields; each published field keeps its meaning."""
+"""Strict core fields and optional host-monotonic timing evidence in data.h5.
+
+``timing/rows`` aligns with core observation rows. ``timing/queries`` stores one
+JSON record per (run_id, query_id), including the query's observation history
+sources and inference start/completion. ``timing/termination`` is a separate
+JSON boundary record, including a pending query and its deadline when present.
+Missing row values are -1; unavailable query times are null. Completion after
+Raw publication never rewrites these records. Host clocks describe neither
+camera exposure nor achieved robot motion.
+"""
 
 from dataclasses import dataclass
 
@@ -82,3 +91,14 @@ def validate_training_rows(timestamp, dispatch_status, control_hz) -> tuple[str,
         return (f"dispatch row {row}: arm/hand={list(dispatch_status[row])}; "
                 "training requires [1, 1] (SDK ACCEPTED)",)
     return ()
+
+
+# Optional evidence, independent of core Raw fields. Signed -1 means unavailable.
+# Rows align with core observation rows; queries/termination have separate lengths.
+# slot is the visited owner slot; query/index identify its candidate target, even
+# if rejected. dispatch_status alone indicates which SDK calls actually occurred.
+TIMING_ROW_DTYPE = np.dtype([(name, "<i8") for name in (
+    "observation_ns", "control_ns", "arm_ns", "hand_ns", "camera_ns", "pointcloud_ns",
+    "camera_sequence", "pointcloud_camera_sequence", "run_id", "slot", "query_id",
+    "prediction_index", "submit_started_ns", "submit_completed_ns",
+)])

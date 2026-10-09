@@ -358,6 +358,12 @@ class CollisionModel:
             )
         return qpos
 
+    def within_joint_limits(self, qpos: np.ndarray) -> bool:
+        """Check nominal model limits, including hand joints in URDF ordering."""
+        full = self._to_full_qpos(qpos)
+        return bool(np.all(full >= self._model.lowerPositionLimit)
+                    and np.all(full <= self._model.upperPositionLimit))
+
     def _pin_update(self, qpos: np.ndarray, stop_at_first: bool = True) -> bool:
         """Compute self-collisions for a validated full configuration."""
         qpos = self._to_full_qpos(qpos)

@@ -142,14 +142,13 @@ def shutdown_processes_verified(
     )
 
 
-def shutdown_local_runtime(robot, supervisor, *, model=None, keyboard=None, timeout_s=5.0):
+def shutdown_local_runtime(robot, supervisor, *, keyboard=None, timeout_s=5.0):
     """Stop local devices before closing resources and verified sensor IPC release."""
     shared = supervisor.shared
     revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
     clean = True
     for close in (
         robot.close if robot is not None and robot._owner is not None else None,
-        model.close if model is not None else None,
         keyboard.stop if keyboard is not None else None,
     ):
         if close is None:

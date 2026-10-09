@@ -75,6 +75,8 @@ class ObservationRow:
     point_cloud: np.ndarray | None
     observation_timestamp_ns: int
     pointcloud_timestamp_ns: int = 0
+    pointcloud_camera_sequence: int = -1
+    control_timestamp_ns: int = -1
 
 
 def read_observation(
@@ -87,10 +89,17 @@ def read_observation(
     require_vr=False,
     require_pointcloud=False,
     require_rgb_cloud_identity=False,
+    issues=None,
 ):
+    def unavailable(reason):
+        if issues is not None:
+            issues.append(reason)
+        return None
+
+    control_ns = time.monotonic_ns()
     state = robot.read_state()
     if state is None:
-        return None
+        return unavailable("feedback_unavailable")
     arm, hand = state.arm, state.hand if require_hand else None
     cloud_result = shared.sensors.pointcloud_ring.read_latest() if require_pointcloud else None
     if (
@@ -98,7 +107,7 @@ def read_observation(
         or (require_hand and hand is None)
         or (require_pointcloud and cloud_result is None)
     ):
-        return None
+        return unavailable("feedback_or_pointcloud_unavailable")
     cloud = cloud_result[0][0] if cloud_result else None
     if require_rgb_cloud_identity:
         camera = (
@@ -109,29 +118,29 @@ def read_observation(
     else:
         camera = read_camera_frame(shared) if require_camera else None
     vr = read_vr_frame(shared) if require_vr else None
-    if ((require_camera or require_rgb_cloud_identity) and camera is None) or (
-        require_vr and vr is None
-    ):
-        return None
+    if (require_camera or require_rgb_cloud_identity) and camera is None:
+        return unavailable("camera_source_unavailable_or_unmatched")
+    if require_vr and vr is None:
+        return unavailable("vr_unavailable")
     now = time.monotonic_ns()
     if not sample_is_fresh(arm["timestamp_ns"][0], runtime.arm.feedback_max_age_s, now):
-        return None
+        return unavailable("arm_feedback_stale")
     if hand is not None and not sample_is_fresh(
         hand["timestamp_ns"][0], runtime.hand.feedback_max_age_s, now
     ):
-        return None
+        return unavailable("hand_feedback_stale")
     if camera is not None and not sample_is_fresh(
         camera["timestamp_ns"], runtime.camera.max_frame_age_s, now
     ):
-        return None
+        return unavailable("camera_source_stale")
     if cloud is not None and not sample_is_fresh(
         cloud["timestamp_ns"], runtime.camera.max_frame_age_s, now
     ):
-        return None
+        return unavailable("pointcloud_stale")
     if vr is not None and not sample_is_fresh(
         vr["recv_ts_ns"], runtime.policy.vr_mapping.stale_threshold_s, now
     ):
-        return None
+        return unavailable("vr_stale")
     return ObservationRow(
         _freeze(arm),
         _freeze(hand),
@@ -140,4 +149,20 @@ def read_observation(
         _freeze(cloud["point_cloud"]) if cloud is not None else None,
         now,
         int(cloud["timestamp_ns"]) if cloud is not None else 0,
+        int(cloud["source_camera_sequence"]) if cloud is not None else -1,
+        control_ns,
+    )
+
+
+def observation_timing(row):
+    """Copied host source clocks; neither exposure nor achieved robot motion time."""
+    return dict(
+        observation_ns=int(row.observation_timestamp_ns),
+        control_ns=int(row.control_timestamp_ns),
+        arm_ns=int(row.arm["timestamp_ns"][0]),
+        hand_ns=int(row.hand["timestamp_ns"][0]) if row.hand is not None else -1,
+        camera_ns=int(row.camera["timestamp_ns"]) if row.camera is not None else -1,
+        pointcloud_ns=int(row.pointcloud_timestamp_ns) if row.pointcloud_timestamp_ns > 0 else -1,
+        camera_sequence=int(row.camera["ring_sequence"]) if row.camera is not None else -1,
+        pointcloud_camera_sequence=int(row.pointcloud_camera_sequence),
     )

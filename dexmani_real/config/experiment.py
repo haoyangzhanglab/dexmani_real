@@ -106,6 +106,8 @@ def _patch(current: Any, changes: Any, path: str = "") -> Any:
             for i, value in enumerate(changes)
         )
     if current is None:
+        if path == "execution.action_steps" and changes is not None:
+            raise ValueError("execution.action_steps is derived; use --n-action-steps or the saved Policy default")
         if path in {"execution.prefetch_steps", "camera.l515_confidence_threshold"}:
             if changes is not None and (type(changes) is not int):
                 raise TypeError(f"config {path!r} must be an integer or null")

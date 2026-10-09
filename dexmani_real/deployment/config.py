@@ -7,8 +7,7 @@ Current Real config owns physical capability; this module imports neither Policy
 from __future__ import annotations
 
 import math
-from copy import deepcopy
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -28,19 +27,12 @@ _SUPPORTED_OBSERVATION_FIELDS = frozenset(
 )
 
 
-def with_action_steps(config: dict, n_action_steps: int | None) -> dict:
-    """Override only deployment chunk length, preserving the training snapshot."""
-    result = deepcopy(config)
-    if n_action_steps is None:
-        return result
-    if type(n_action_steps) is not int or n_action_steps < 1:
-        raise ValueError("n_action_steps must be a positive integer")
-    agent = result["agent"]
-    if agent["n_obs_steps"] - 1 + n_action_steps > agent["horizon"]:
-        raise ValueError("n_obs_steps - 1 + n_action_steps must not exceed horizon")
-    agent["n_action_steps"] = n_action_steps
-    result["n_action_steps"] = n_action_steps
-    return result
+def resolve_execution_config(execution, info, n_action_steps=None):
+    """Resolve A_exec once at the Real entry; never rewrite saved model config."""
+    value = info.n_action_steps if n_action_steps is None else n_action_steps
+    if type(value) is not int or value < 1:
+        raise ValueError("A_exec must be a positive integer")
+    return replace(execution, action_steps=value)
 
 
 def validate_max_running_s(max_running_s: float | None) -> float | None:
@@ -108,7 +100,7 @@ def control_dt_ns(info):
 
 @dataclass(frozen=True)
 class PolicyRuntimeConfig:
-    """Local model loading arguments; config includes explicit deployment overrides."""
+    """Local model loading arguments; config retains saved model semantics."""
 
     config: dict
     info: Any
@@ -150,6 +142,8 @@ class RolloutRecordingConfig:
 class ExecutionConfig:
     """Admission and wait budgets checked against saved Policy timing."""
 
+    # Effective A_exec, resolved from CLI or saved default at the Real entry.
+    action_steps: int | None = None
     execution_mode: str = "sync"
     # Recheck these admission budgets against Policy cadence and measured costs;
     # they do not bound the physical stop response time.
@@ -185,13 +179,15 @@ class ExecutionConfig:
         if lateness >= dt:
             raise ValueError("max_tick_lateness_s must be smaller than control_dt_s")
         p = info.horizon - info.n_obs_steps + 1
-        a = info.n_action_steps
+        a = self.action_steps
+        if type(a) is not int:
+            raise ValueError("Resolve effective A_exec at the deployment entry before validation")
         if not 1 <= a <= p:
-            raise ValueError("sync requires 1 <= A <= P=H-N+1")
+            raise ValueError("execution requires 1 <= A_exec <= P=H-N+1")
         if self.execution_mode != "sync":
             d = self.prefetch_steps
             if type(d) is not int or not 1 <= d <= a or a + d > p:
-                raise ValueError(f"async/rtc require 1 <= d <= A and A+d <= P; A={a}, P={p}, d={d}")
+                raise ValueError(f"async/rtc require 1 <= d <= A_exec and A_exec+d <= P; A_exec={a}, P={p}, d={d}")
         if self.execution_mode == "rtc":
             beta = self.rtc_guidance_cap
             if isinstance(beta, bool) or beta is None or not math.isfinite(beta) or beta < 0:
@@ -213,7 +209,9 @@ def _validate_wait_lower_bound(bound, execution, max_running_s, source):
 
 
 def validate_warmup_budget(durations, execution_config, info, *, max_running_s=None):
-    """Necessary grid bounds only; measured samples are not realtime guarantees."""
+    """Model-only necessary bounds; input/prefix preparation and margin also need
+    time inside the nominal d*dt window. Owner lateness never extends it.
+    """
     dt = control_dt_ns(info)
     lateness = int(execution_config.max_tick_lateness_s * 1e9)
     age = int(execution_config.max_decision_age_s * 1e9)
@@ -227,13 +225,13 @@ def validate_warmup_budget(durations, execution_config, info, *, max_running_s=N
         _validate_wait_lower_bound(
             (info.n_obs_steps - 1 + k) * dt, execution_config, max_running_s, "Measured sample"
         )
-        if max(inference, k * dt - lateness) + (info.n_action_steps - 1) * dt > age:
+        if max(inference, k * dt - lateness) + (execution_config.action_steps - 1) * dt > age:
             raise ValueError("Measured bootstrap sample cannot fit max_decision_age_s")
     if execution_config.execution_mode != "sync":
         d = execution_config.prefetch_steps
         for sample in durations["steady"]:
             inference = int(sample * 1e9)
-            if inference > d * dt + lateness:
-                raise ValueError("Measured steady sample cannot fit handoff deadline")
-            if max(inference, (info.n_action_steps + d - 1) * dt - lateness) > age:
+            if inference >= d * dt:
+                raise ValueError("Model-only sample leaves no time for input/prefix preparation and handoff margin")
+            if max(inference, (execution_config.action_steps + d - 1) * dt - lateness) > age:
                 raise ValueError("Measured steady sample cannot fit max_decision_age_s")

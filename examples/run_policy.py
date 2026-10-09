@@ -97,19 +97,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-results", action="store_true", help="Disable evaluation summary independently of --no-record"
     )
-    research = parser.add_argument_group("Policy research overrides")
+    execution = parser.add_argument_group("Real execution")
+    execution.add_argument(
+        "--n-action-steps",
+        type=_positive_int,
+        default=None,
+        help="A_exec: actions per segment (default: saved Policy n_action_steps)",
+    )
+    research = parser.add_argument_group("Policy inference")
     research.add_argument("--weights", choices=("ema", "raw"), default=None)
     research.add_argument(
         "--inference-steps",
         type=_positive_int,
         default=None,
         help="override saved inference steps",
-    )
-    research.add_argument(
-        "--n-action-steps",
-        type=_positive_int,
-        default=None,
-        help="override deployment chunk length without changing the training snapshot",
     )
     research.add_argument(
         "--seed", type=_nonnegative_int, default=0, help="fixed inference seed reset each episode"
@@ -211,9 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         experiment = resolve_experiment(args.experiment)
-        from dexmani_real.deployment.config import with_action_steps
-
-        saved_config = with_action_steps(load_experiment_config(experiment), args.n_action_steps)
+        saved_config = load_experiment_config(experiment)
         info = inspect_policy(
             experiment,
             config=saved_config,
@@ -229,8 +228,14 @@ def main(argv: list[str] | None = None) -> int:
         from dexmani_real.deployment.config import (
             PolicyRuntimeConfig,
             RolloutRecordingConfig,
+            resolve_execution_config,
         )
 
+        from dataclasses import replace
+
+        runtime = replace(runtime, execution=resolve_execution_config(
+            runtime.execution, info, args.n_action_steps
+        ))
         runtime.execution.validate(info, max_running_s=args.max_running_s)
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
         _safe_selector_parts(selector)
@@ -257,7 +262,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Checkpoint: {info.checkpoint_path.name} ({info.weights}); steps={info.inference_steps}")
     print(f"Observations: {', '.join(info.observation_fields)}")
     print(
-        f"Action steps source: {'CLI override' if args.n_action_steps is not None else 'saved Policy'}"
+        f"A_exec: {runtime.execution.action_steps}; "
+        f"source: {'CLI' if args.n_action_steps is not None else 'saved Policy default'}"
     )
     print(f"Episodes: {args.num_episodes}; cooperative budget={args.max_running_s:g} s")
     print(f"Session: {session_dir}" if session_dir else "Session artifacts: disabled", flush=True)
