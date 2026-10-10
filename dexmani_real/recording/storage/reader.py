@@ -10,7 +10,9 @@ import json
 import h5py
 import numpy as np
 
-from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT, TIMING_ROW_DTYPE
+from dexmani_real.recording.storage.schema import (
+    DATASET_SPECS, RAW_FORMAT, TIMING_REQUIRED_FIELDS, TIMING_ROW_DTYPE,
+)
 from dexmani_real.recording.storage.video import VideoDecoder
 
 
@@ -133,7 +135,14 @@ class EpisodeReader:
             return dict(available=False, reason="timing_evidence_unavailable")
         group = self._data["timing"]
         rows = group["rows"]
-        if rows.shape != (self.num_frames,) or rows.dtype != TIMING_ROW_DTYPE:
+        names = rows.dtype.names or ()
+        if (
+            rows.shape != (self.num_frames,)
+            or not set(TIMING_REQUIRED_FIELDS).issubset(names)
+            or any(name not in TIMING_ROW_DTYPE.fields
+                   or rows.dtype.fields[name][0] != TIMING_ROW_DTYPE.fields[name][0]
+                   for name in names)
+        ):
             raise RawDataError("timing rows must align with core rows and match timing dtype")
         queries = [json.loads(value) for value in group["queries"].asstr()[:]]
         keys = [(item["run_id"], item["query_id"]) for item in queries]
@@ -143,7 +152,7 @@ class EpisodeReader:
         for row in values:
             if row["query_id"] >= 0 and (int(row["run_id"]), int(row["query_id"])) not in keys:
                 raise RawDataError("action timing references an absent query")
-        return dict(available=True, rows=values, queries=queries,
+        return dict(available=True, rows=values, queries=queries, metadata=dict(group.attrs),
                     termination=json.loads(group["termination"].asstr()[()])
                     if "termination" in group else None)
 
@@ -157,20 +166,43 @@ class EpisodeReader:
             return evidence
         rows = evidence["rows"]
         def delta(end, start):
-            valid = (rows[end] > 0) & (rows[start] > 0)
             result = np.full(len(rows), np.nan)
+            if end not in rows.dtype.names or start not in rows.dtype.names:
+                return result
+            valid = (rows[end] > 0) & (rows[start] > 0)
             result[valid] = (rows[end][valid] - rows[start][valid]) / 1e9
             return result
         def inference(query):
             start, end = query.get("started_ns"), query.get("completed_ns")
             return None if start is None or end is None else (end - start) / 1e9
+        source_to_receive = delta("camera_received_ns", "camera_ns")
+        # A hardware-only receive-time origin cannot measure pre-receive latency.
+        for name in ("camera_depth_timestamp_domain", "camera_color_timestamp_domain"):
+            if name not in rows.dtype.names:
+                source_to_receive[:] = np.nan
+            else:
+                source_to_receive[~np.isin(rows[name], (1, 2))] = np.nan
         return dict(
             available=True,
+            metadata=evidence["metadata"],
             observation_age_s={name: delta("observation_ns", f"{name}_ns")
                                for name in ("arm", "hand", "camera", "pointcloud")},
             modality_delta_s={"arm_hand": delta("arm_ns", "hand_ns"),
                               "arm_camera": delta("arm_ns", "camera_ns"),
                               "camera_pointcloud": delta("camera_ns", "pointcloud_ns")},
+            camera_pipeline_s={
+                "source_to_receive": source_to_receive,
+                "receive_to_publish": delta("camera_published_ns", "camera_received_ns"),
+            },
+            pointcloud_pipeline_s={
+                "camera_receive_to_publish": delta(
+                    "pointcloud_camera_published_ns", "pointcloud_camera_received_ns"),
+                "camera_publish_to_processing": delta(
+                    "pointcloud_started_ns", "pointcloud_camera_published_ns"),
+                # Includes validation and the ring copy/commit, not just build_point_cloud.
+                "processing_to_publish": delta("pointcloud_published_ns", "pointcloud_started_ns"),
+                "publish_to_observation": delta("observation_ns", "pointcloud_published_ns"),
+            },
             submit_duration_s=delta("submit_completed_ns", "submit_started_ns"),
             inference_duration_s={(q["run_id"], q["query_id"]): inference(q)
                                   for q in evidence["queries"]},

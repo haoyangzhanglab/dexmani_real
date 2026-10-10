@@ -6,6 +6,7 @@ python examples/xhand_control_example.py --config local.yaml --read-only
 python examples/xhand_control_example.py --print-config
 
 参数：--config 指定手部配置；--read-only 仍连接设备但不发动作，--print-config 不连接设备。
+动作反馈遇到 RS485 CRC 时，在反馈时限内最多重读两次；不重发动作或使用 CRC 帧确认到位。
 """
 
 from __future__ import annotations
@@ -255,10 +256,59 @@ class XHandControlExample(XHand):
                 print(f"  sensor payload malformed: {exc}")
         return True
 
-    def _read_action_positions(self) -> tuple[np.ndarray, float]:
-        started = time.monotonic()
-        error, state = self._control.read_state(self.cfg.device_id, True)
-        code = int(error.error_code)
+    def _read_action_positions(
+        self, *, retry_crc: bool = False, action_deadline: float | None = None
+    ) -> tuple[np.ndarray, float, int]:
+        """Return trusted joints, read start time, and discarded CRC count.
+
+        Stop uses a single read even during cancellation. Motion reads may retry
+        within the freshness/action deadline, without sending another command.
+        """
+        feedback_started = time.monotonic()
+        feedback_deadline = feedback_started + self.cfg.feedback_max_age_s
+        deadline_reason = "feedback freshness"
+        if action_deadline is not None and action_deadline < feedback_deadline:
+            feedback_deadline = action_deadline
+            deadline_reason = "action"
+        retries = 0
+        while True:
+            if retry_crc:
+                self.check_cancelled()
+            started = time.monotonic()
+            if started >= feedback_deadline:
+                raise RuntimeError(
+                    f"action feedback exceeded {deadline_reason} deadline before live state read"
+                )
+            error, state = self._control.read_state(self.cfg.device_id, True)
+            if retry_crc:
+                self.check_cancelled()
+            code = int(error.error_code)
+            finished = time.monotonic()
+            if finished >= feedback_deadline:
+                raise RuntimeError(
+                    f"action feedback exceeded {deadline_reason} deadline "
+                    f"(read={finished - started:.3f}s, "
+                    f"feedback_window={finished - feedback_started:.3f}s, "
+                    f"budget={feedback_deadline - feedback_started:.3f}s, "
+                    f"error_code={code})"
+                )
+            if not (
+                retry_crc
+                and self.cfg.comm_type == "serial"
+                and code == _RS485_CRC_ERROR_CODE
+                and retries < _RS485_READ_CRC_RETRY_COUNT
+            ):
+                break
+            retries += 1
+            print(
+                f"  action feedback: CRC ERROR (error_code={code}); discarding frame, "
+                f"retrying live state request ({retries}/{_RS485_READ_CRC_RETRY_COUNT})"
+            )
+            # The diagnostic's 80 ms backoff can exhaust the motion freshness
+            # budget; use the normal feedback poll interval for motion reads.
+            remaining = feedback_deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(_FEEDBACK_POLL_INTERVAL_S, remaining))
         # CRC-degraded frames remain inspectable but cannot authorize movement
         # or establish convergence in this diagnostic.
         if state is None or code not in READ_USABLE_CODES or code == _RS485_CRC_ERROR_CODE:
@@ -266,14 +316,14 @@ class XHandControlExample(XHand):
         qpos, _, boards = self._parse_joints(state)
         if np.any(boards["commboard_err"]) or np.any(boards["jointboard_err"]):
             raise RuntimeError("action feedback reports a communication/joint board fault")
-        if time.monotonic() - started > self.cfg.feedback_max_age_s:
-            raise RuntimeError("action feedback exceeded the configured freshness budget")
-        return qpos, started
+        if time.monotonic() >= feedback_deadline:
+            raise RuntimeError(f"action feedback exceeded {deadline_reason} deadline during parsing")
+        return qpos, started, retries
 
     def execute_action(self, qpos_rad) -> None:
         target = _validate_target(qpos_rad, self.cfg)
         self.check_cancelled()
-        self._read_action_positions()
+        self._read_action_positions(retry_crc=True)
         self.check_cancelled()
         deadline = time.monotonic() + self.cfg.home_timeout_s
         self._motion_pending = True  # SDK exceptions do not establish non-delivery.
@@ -285,10 +335,17 @@ class XHandControlExample(XHand):
         consecutive = 0
         while time.monotonic() < deadline:
             self.check_cancelled()
-            measured, _ = self._read_action_positions()
+            # Each live read has its own freshness window. The previous read
+            # and send latency do not determine the age of this new sample.
+            measured, _, crc_retries = self._read_action_positions(
+                retry_crc=True,
+                action_deadline=deadline,
+            )
             self.check_cancelled()
             if time.monotonic() >= deadline:
                 break
+            if crc_retries:
+                consecutive = 0
             error_rad = float(np.max(np.abs(measured - target)))
             consecutive = consecutive + 1 if error_rad <= tolerance_rad else 0
             if consecutive >= _CONVERGENCE_SAMPLES:
@@ -301,7 +358,7 @@ class XHandControlExample(XHand):
         if not self._motion_pending:
             return
         try:
-            measured, read_started = self._read_action_positions()
+            measured, read_started, _ = self._read_action_positions()
         except Exception as exc:
             print(f"  Stop feedback unavailable ({exc}); requesting vendor passive mode")
             measured, read_started = None, 0.0

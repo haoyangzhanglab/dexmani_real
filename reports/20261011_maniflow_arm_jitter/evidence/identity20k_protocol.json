@@ -1,0 +1,30 @@
+{
+  "baseline": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_12-30-49-604382_8483dce6_1010",
+  "experiment": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010",
+  "variable": {
+    "normalization.point_cloud": [
+      "limits",
+      "identity"
+    ]
+  },
+  "budget": {
+    "actual_optimizer_updates": 20000,
+    "preserved_scheduler_plan_steps": 100000,
+    "reason": "Compare against the original 20k checkpoint without changing its learning-rate schedule."
+  },
+  "training_seed": 1010,
+  "fresh_training": true,
+  "NFE": 4,
+  "EMA": true,
+  "evaluation_seeds": [
+    0,
+    1,
+    2
+  ],
+  "rollouts": [
+    "215914",
+    "220104"
+  ],
+  "scope": "offline recorded observation inference only; no hardware connection",
+  "policy_git_commit": "63061890d6614371dab22d2f80107206d97b6649"
+}

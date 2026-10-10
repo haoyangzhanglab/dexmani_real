@@ -1,0 +1,113 @@
+{
+  "training_updates": 20000,
+  "comparison": "Original limits 20k vs fresh identity 20k; same 100k learning-rate schedule prefix, seed 1010, data and architecture.",
+  "evaluation": "EMA; NFE4; paired seeds 0,1,2; all 107 recorded queries per session. Steady statistics use the 70 full executed chunks after 20 seconds.",
+  "metric_caution": "J4 absolute head-tail difference measures net within-chunk motion, not closed-loop shaking amplitude. Adjacent-chunk differences use fixed recorded observations, not a new policy-induced trajectory.",
+  "sessions": {
+    "215914": {
+      "limits_20k": {
+        "mean_signed_J4_retreat_deg": 4.7230329513549805,
+        "mean_abs_J4_head_tail_difference_deg": 4.7230329513549805,
+        "mean_offline_adjacent_chunk_jump_max_deg": 6.252708911895752,
+        "p95_offline_adjacent_chunk_jump_max_deg": 11.00487561225891,
+        "positive_mean_J4_retreat_windows": 70,
+        "window_count": 70,
+        "mean_head_to_observed_arm_max_deg": 4.463649272918701,
+        "mean_noise_2mm_arm_prediction_change_MAE_deg": 0.2512410581111908
+      },
+      "identity_20k": {
+        "mean_signed_J4_retreat_deg": 0.6398445963859558,
+        "mean_abs_J4_head_tail_difference_deg": 1.3024907112121582,
+        "mean_offline_adjacent_chunk_jump_max_deg": 3.6870157718658447,
+        "p95_offline_adjacent_chunk_jump_max_deg": 8.606953477859488,
+        "positive_mean_J4_retreat_windows": 38,
+        "window_count": 70,
+        "mean_head_to_observed_arm_max_deg": 3.77362322807312,
+        "mean_noise_2mm_arm_prediction_change_MAE_deg": 0.23662607371807098
+      },
+      "reduction_percent": {
+        "mean_abs_J4_head_tail_difference_deg": 72.42257835955836,
+        "mean_offline_adjacent_chunk_jump_max_deg": 41.03330534304399
+      }
+    },
+    "220104": {
+      "limits_20k": {
+        "mean_signed_J4_retreat_deg": 5.844386100769043,
+        "mean_abs_J4_head_tail_difference_deg": 5.844386100769043,
+        "mean_offline_adjacent_chunk_jump_max_deg": 5.850837230682373,
+        "p95_offline_adjacent_chunk_jump_max_deg": 6.9688996315002445,
+        "positive_mean_J4_retreat_windows": 70,
+        "window_count": 70,
+        "mean_head_to_observed_arm_max_deg": 2.985487937927246,
+        "mean_noise_2mm_arm_prediction_change_MAE_deg": 0.2087879627943039
+      },
+      "identity_20k": {
+        "mean_signed_J4_retreat_deg": 2.411876916885376,
+        "mean_abs_J4_head_tail_difference_deg": 2.411876916885376,
+        "mean_offline_adjacent_chunk_jump_max_deg": 2.8841629028320312,
+        "p95_offline_adjacent_chunk_jump_max_deg": 3.8336097359657284,
+        "positive_mean_J4_retreat_windows": 70,
+        "window_count": 70,
+        "mean_head_to_observed_arm_max_deg": 4.281738758087158,
+        "mean_noise_2mm_arm_prediction_change_MAE_deg": 0.2194608896970749
+      },
+      "reduction_percent": {
+        "mean_abs_J4_head_tail_difference_deg": 58.731732036526374,
+        "mean_offline_adjacent_chunk_jump_max_deg": 50.705124939945456
+      }
+    }
+  },
+  "supervised_checks": {
+    "limits_20k": {
+      "training_windows": {
+        "windows": 24,
+        "arm_MAE_deg": 0.5590766072273254,
+        "window_arm_MAE_deg": {
+          "mean": 0.5590766072273254,
+          "median": 0.5520725250244141,
+          "p95": 0.7459518551826477,
+          "max": 0.764957070350647
+        }
+      },
+      "excluded_old_camera": {
+        "windows": 8,
+        "arm_MAE_deg": 5.689613342285156,
+        "window_arm_MAE_deg": {
+          "mean": 5.689613342285156,
+          "median": 6.003607273101807,
+          "p95": 8.835428118705748,
+          "max": 9.60973072052002
+        }
+      }
+    },
+    "identity_20k": {
+      "training_windows": {
+        "windows": 24,
+        "arm_MAE_deg": 0.5715232491493225,
+        "window_arm_MAE_deg": {
+          "mean": 0.5715232491493225,
+          "median": 0.575882077217102,
+          "p95": 0.7556172132492065,
+          "max": 0.7918702960014343
+        }
+      },
+      "excluded_old_camera": {
+        "windows": 8,
+        "arm_MAE_deg": 5.251648902893066,
+        "window_arm_MAE_deg": {
+          "mean": 5.251648426055908,
+          "median": 5.210697174072266,
+          "p95": 8.724561738967894,
+          "max": 9.122453689575195
+        }
+      }
+    }
+  },
+  "interpretation": [
+    "This 20k identity run improves offline chunk continuity on both recorded observation streams.",
+    "The 220104 stream retains positive J4 retreat in all 70 steady windows; cancellation in signed means is avoided by also reporting absolute differences.",
+    "There is no consistent reduction in 2mm coordinate-noise sensitivity. Improved continuity alone does not establish the proposed noise-amplification mechanism.",
+    "Training-window arm MAE is approximately unchanged; no task-success or real-robot stability claim is made.",
+    "Inputs use reconstructed clouds with compressed RGB. No hardware was connected and no real deployment was performed."
+  ]
+}

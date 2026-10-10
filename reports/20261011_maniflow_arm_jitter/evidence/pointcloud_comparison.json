@@ -1,0 +1,231 @@
+{
+  "scope": "Read-only comparison; original xarm_base coordinates in meters; no registration, source edits, hardware connection, or Raw/training/checkpoint mutation.",
+  "sources": {
+    "training": "/home/zhanghaoyang/Desktop/dexmani_policy/robot_data/pick_place_toy.zarr",
+    "revision": "07ddf7f066fb463bbb554bd5ffa3b073",
+    "rollout_sessions": [
+      "session_20261010_215914",
+      "session_20261010_220104"
+    ],
+    "rollout_reconstruction": "Recorded depth + RGB video; original colors before compression are unavailable."
+  },
+  "comparison_selection": {
+    "home": "Training first rows for all 60 episodes; primary examples rows 0 and 919; rollout row 0.",
+    "steady": "Rollout row 487 (~30.44 s), nearest full joint-state training rows 5834 (215914) and 10795 (220104); nearest arm-state rows 9335 and 82.",
+    "closest_initial_scene": "Among the first frames of 60 training episodes, row 919 minimizes symmetric mean nearest-neighbor distance in x > .2 m, z < .14 m. This is not a full-dataset nearest-neighbor claim."
+  },
+  "home_coverage": {
+    "train_z_max_m_range": [
+      0.44749847054481506,
+      0.45111942291259766
+    ],
+    "train_z_above_035_count_min_median_max": [
+      84.0,
+      118.0,
+      154.0
+    ],
+    "rollout_z_max_m": [
+      0.3514567017555237,
+      0.3510203957557678
+    ],
+    "rollout_z_above_035_counts": [
+      3,
+      2
+    ]
+  },
+  "projection": {
+    "all": {
+      "point_count": 1024,
+      "outside_current_camera_count": 214,
+      "outside_percent": 20.8984375,
+      "above_image_count": 214
+    },
+    "z_above_0_18": {
+      "point_count": 615,
+      "outside_current_camera_count": 214,
+      "outside_percent": 34.796747967479675,
+      "above_image_count": 214
+    },
+    "z_above_0_35": {
+      "point_count": 131,
+      "outside_current_camera_count": 130,
+      "outside_percent": 99.23664122137404,
+      "above_image_count": 130
+    }
+  },
+  "object_point_counts_fps512": {
+    "train_layout_220104": {
+      "basket": {
+        "input_count": 209,
+        "fps_count": 107,
+        "center_xyz_m": [
+          0.5597601532936096,
+          -0.12938416004180908,
+          0.041714441031217575
+        ],
+        "mean_rgb": [
+          0.8969770073890686,
+          0.93770831823349,
+          0.8986393213272095
+        ]
+      },
+      "toy": {
+        "input_count": 127,
+        "fps_count": 63,
+        "center_xyz_m": [
+          0.6836288571357727,
+          0.21099016070365906,
+          0.037618402391672134
+        ],
+        "mean_rgb": [
+          0.3804156184196472,
+          0.5057764649391174,
+          0.48115724325180054
+        ]
+      }
+    },
+    "train_full_215914": {
+      "basket": {
+        "input_count": 182,
+        "fps_count": 93,
+        "center_xyz_m": [
+          0.5229011178016663,
+          0.26707154512405396,
+          0.04484400898218155
+        ],
+        "mean_rgb": [
+          0.9047247171401978,
+          0.9363989233970642,
+          0.8802074193954468
+        ]
+      },
+      "toy": {
+        "input_count": 91,
+        "fps_count": 46,
+        "center_xyz_m": [
+          0.6717168092727661,
+          -0.11505546420812607,
+          0.037253487855196
+        ],
+        "mean_rgb": [
+          0.4889768660068512,
+          0.5508464574813843,
+          0.507458508014679
+        ]
+      }
+    },
+    "train_full_220104": {
+      "basket": {
+        "input_count": 106,
+        "fps_count": 62,
+        "center_xyz_m": [
+          0.5300335884094238,
+          0.2840813994407654,
+          0.04583493620157242
+        ],
+        "mean_rgb": [
+          0.9330752491950989,
+          0.9503690600395203,
+          0.9014042615890503
+        ]
+      },
+      "toy": {
+        "input_count": 105,
+        "fps_count": 48,
+        "center_xyz_m": [
+          0.7357217073440552,
+          -0.24363957345485687,
+          0.030927687883377075
+        ],
+        "mean_rgb": [
+          0.34228697419166565,
+          0.3952522575855255,
+          0.3488592207431793
+        ]
+      }
+    },
+    "rollout_steady_215914": {
+      "basket": {
+        "input_count": 175,
+        "fps_count": 100,
+        "center_xyz_m": [
+          0.5856698751449585,
+          -0.15860547125339508,
+          0.03656391799449921
+        ],
+        "mean_rgb": [
+          0.7788566946983337,
+          0.798972487449646,
+          0.7219380736351013
+        ]
+      },
+      "toy": {
+        "input_count": 116,
+        "fps_count": 55,
+        "center_xyz_m": [
+          0.6110321283340454,
+          0.15940842032432556,
+          0.035721346735954285
+        ],
+        "mean_rgb": [
+          0.3458438217639923,
+          0.4158204197883606,
+          0.39622142910957336
+        ]
+      }
+    },
+    "rollout_steady_220104": {
+      "basket": {
+        "input_count": 179,
+        "fps_count": 91,
+        "center_xyz_m": [
+          0.5866304039955139,
+          -0.15569868683815002,
+          0.03579088672995567
+        ],
+        "mean_rgb": [
+          0.7493026256561279,
+          0.7598233222961426,
+          0.687531054019928
+        ]
+      },
+      "toy": {
+        "input_count": 103,
+        "fps_count": 51,
+        "center_xyz_m": [
+          0.6107759475708008,
+          0.15940436720848083,
+          0.03523867949843407
+        ],
+        "mean_rgb": [
+          0.33907827734947205,
+          0.41243648529052734,
+          0.395194947719574
+        ]
+      }
+    }
+  },
+  "object_count_method": "Approximate spatial connected components, radius 35 mm in x > .2 m, z < .14 m; labels checked against RGB/cloud appearance. Not hand-labelled semantic segmentation.",
+  "camera_crop_sensitivity": {
+    "model": "80pct EMA, NFE4, CPU, seed0",
+    "windows": 7,
+    "train_arm_MAE_deg_original_mean": 0.224220837865557,
+    "train_arm_MAE_deg_crop_mean": 1.057991393974849,
+    "explicit_FPS_baseline_max_difference_deg": 0.0,
+    "J4_drift_direction_preserved_in_all_windows": true,
+    "scope": "Remove old cloud points falling outside current camera frame, then select 512 points with the saved normalization and eval FPS. It does not simulate newly visible surfaces, occlusion, or changed colors."
+  },
+  "conclusion": "Changed visible robot geometry is confirmed. Both target objects survive preprocessing and encoder sampling. Camera-frustum cropping increases prediction error in the targeted probe, but does not alone reproduce J4 direction reversal; it is not established as the sole cause of rollout oscillation.",
+  "artifacts": [
+    "pointcloud_comparison.html",
+    "home_comparison.png",
+    "steady_comparison.png",
+    "field_of_view_difference.png"
+  ],
+  "scripts": [
+    "explore_clouds.py",
+    "measure_distribution.py",
+    "encoder_input_check.py",
+    "render_comparisons.py"
+  ]
+}

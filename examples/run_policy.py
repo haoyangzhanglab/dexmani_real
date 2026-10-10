@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
-"""加载已训练策略执行真机评估，独立选择 Raw 录制与评估摘要。
+"""真机策略评估。
 
-python examples/run_policy.py policy/task/experiment
-python examples/run_policy.py policy/task/experiment --config local.yaml --checkpoint latest
-python examples/run_policy.py --print-config
+用法（EXPERIMENT 为 policy/task/experiment，不带 experiments/ 前缀）：
+    python examples/run_policy.py policy/task/experiment
+    python examples/run_policy.py policy/task/experiment --checkpoint 80pct --inference-steps 4
+    python examples/run_policy.py policy/task/experiment --config local.yaml --n-action-steps 8
+    python examples/run_policy.py --print-config
 
-参数：--no-record 关闭 Raw，--no-results 关闭评估摘要；--print-config 不连接设备。
+常用参数：
+    --checkpoint 默认 latest；也支持已有百分比 milestone、best 或文件名。
+    --inference-steps 设置 NFE，--weights 选择 ema/raw；默认使用实验保存的评估设置。
+    --n-action-steps 设置每段执行步数，默认使用策略的 n_action_steps。
+    --no-record / --no-results 分别关闭 Raw / 评估摘要；--output 指定输出目录。
+
+执行模式通过 --config YAML 设置，默认 sync；异步示例：
+    execution:
+      execution_mode: async
+      prefetch_steps: 2
+
+RTC 使用 execution_mode: rtc，并显式设置 prefetch_steps 和 rtc_guidance_cap。
+当前 RTC 仅支持连续动作 BaseAgent DDIM 策略；ManiFlow 支持 sync/async。
+普通运行会连接设备，关闭输出不是离线模式；--print-config 不连接设备。
+其他参数见 --help。
 """
 
 from __future__ import annotations
@@ -62,9 +78,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=Path,
-        help="Optional Real hardware/execution YAML; Policy uses experiment/config.yaml",
+        help=(
+            "Optional Real hardware/execution YAML (execution_mode, prefetch_steps, "
+            "rtc_guidance_cap under execution); Policy uses experiment/config.yaml"
+        ),
     )
-    parser.add_argument("--checkpoint", default="best", help="best, latest, or checkpoint filename")
+    parser.add_argument(
+        "--checkpoint",
+        default="latest",
+        help="latest (default), best, milestone percentage (e.g. 80pct), or checkpoint filename",
+    )
     parser.add_argument(
         "--num-episodes",
         dest="num_episodes",
@@ -110,7 +133,7 @@ def _parser() -> argparse.ArgumentParser:
         "--inference-steps",
         type=_positive_int,
         default=None,
-        help="override saved inference steps",
+        help="override saved inference step count (NFE)",
     )
     research.add_argument(
         "--seed", type=_nonnegative_int, default=0, help="fixed inference seed reset each episode"
@@ -213,10 +236,15 @@ def main(argv: list[str] | None = None) -> int:
 
         experiment = resolve_experiment(args.experiment)
         saved_config = load_experiment_config(experiment)
+        checkpoint = args.checkpoint
+        if checkpoint.endswith("pct"):
+            from dexmani_policy.evaluation.protocol import resolve_checkpoint_path
+
+            checkpoint, _ = resolve_checkpoint_path(experiment, checkpoint)
         info = inspect_policy(
             experiment,
             config=saved_config,
-            checkpoint=args.checkpoint,
+            checkpoint=checkpoint,
             weights=args.weights,
             inference_steps=args.inference_steps,
         )

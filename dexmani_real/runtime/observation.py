@@ -47,14 +47,15 @@ def read_camera_frame(shared, sequence=None):
     result = ring.read_latest_uncached() if sequence is None else ring.read_sequence(sequence)
     if result is None:
         return None
-    data, _publication_ns, sequence = result
+    data, publication_ns, sequence = result
     frame = data[0]
     header = frame["header"]
     return {
         "rgb": frame["rgb"],
         "depth": frame["depth"],
         "ring_sequence": sequence,
-        "timestamp_ns": int(header["timestamp_ns"]),
+        "published_ns": publication_ns,
+        **{name: int(header[name]) for name in header.dtype.names},
     }
 
 
@@ -77,6 +78,10 @@ class ObservationRow:
     pointcloud_timestamp_ns: int = 0
     pointcloud_camera_sequence: int = -1
     control_timestamp_ns: int = -1
+    pointcloud_camera_received_ns: int = -1
+    pointcloud_camera_published_ns: int = -1
+    pointcloud_started_ns: int = -1
+    pointcloud_published_ns: int = -1
 
 
 def read_observation(
@@ -151,11 +156,15 @@ def read_observation(
         int(cloud["timestamp_ns"]) if cloud is not None else 0,
         int(cloud["source_camera_sequence"]) if cloud is not None else -1,
         control_ns,
+        int(cloud["camera_received_ns"]) if cloud is not None else -1,
+        int(cloud["camera_published_ns"]) if cloud is not None else -1,
+        int(cloud["processing_started_ns"]) if cloud is not None else -1,
+        int(cloud_result[1]) if cloud_result is not None else -1,
     )
 
 
 def observation_timing(row):
-    """Copied host source clocks; neither exposure nor achieved robot motion time."""
+    """Source and pipeline clocks; SDK times retain their explicitly recorded domains."""
     return dict(
         observation_ns=int(row.observation_timestamp_ns),
         control_ns=int(row.control_timestamp_ns),
@@ -165,4 +174,12 @@ def observation_timing(row):
         pointcloud_ns=int(row.pointcloud_timestamp_ns) if row.pointcloud_timestamp_ns > 0 else -1,
         camera_sequence=int(row.camera["ring_sequence"]) if row.camera is not None else -1,
         pointcloud_camera_sequence=int(row.pointcloud_camera_sequence),
+        **{f"camera_{name}": int(row.camera[name]) if row.camera is not None else -1
+           for name in ("received_ns", "published_ns", "depth_sdk_ns", "color_sdk_ns",
+                        "depth_timestamp_domain", "color_timestamp_domain",
+                        "depth_frame_number", "color_frame_number")},
+        pointcloud_camera_received_ns=int(row.pointcloud_camera_received_ns),
+        pointcloud_camera_published_ns=int(row.pointcloud_camera_published_ns),
+        pointcloud_started_ns=int(row.pointcloud_started_ns),
+        pointcloud_published_ns=int(row.pointcloud_published_ns),
     )

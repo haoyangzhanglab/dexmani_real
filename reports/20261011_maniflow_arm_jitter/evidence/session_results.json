@@ -1,0 +1,146 @@
+{
+  "214503": {
+    "kind": "policy",
+    "started_utc": "2026-10-10T13:45:03.491612+00:00",
+    "ended_utc": "2026-10-10T13:45:33.168949+00:00",
+    "outcome": "finished",
+    "reason": null,
+    "shutdown_clean": true,
+    "episodes": [
+      {
+        "index": 1,
+        "started": true,
+        "run_id": 6,
+        "started_utc": "2026-10-10T13:45:27.313847+00:00",
+        "duration_s": 0.1558085,
+        "termination_reason": "executor_boundary",
+        "termination_details": "dispatch_failed: deadline_expired",
+        "errors": [
+          {
+            "stage": "dispatch",
+            "exception_type": "DispatchError",
+            "message": "dispatch deadline expired after mode restoration"
+          }
+        ],
+        "raw": {
+          "status": "published",
+          "path": "/home/zhanghaoyang/Desktop/dexmani_real/rollouts/maniflow/pick_place_toy/2026-10-10_12-30-49-604382_8483dce6_1010/session_20261010_214503/episode_001",
+          "staging_path": null,
+          "row_count": 3
+        },
+        "metrics": {
+          "inference_count": 1,
+          "inference_mean_s": 0.029293765,
+          "inference_max_s": 0.029293765,
+          "skipped_slots": 0,
+          "dispatch_count": 0
+        }
+      }
+    ],
+    "errors": [],
+    "model_close": {
+      "status": "completed",
+      "reason": null,
+      "started_ns": 2263120738742286,
+      "completed_ns": 2263120883745504
+    },
+    "home_results": [
+      {
+        "outcome": "completed",
+        "reason": ""
+      }
+    ]
+  },
+  "215914": {
+    "kind": "policy",
+    "started_utc": "2026-10-10T13:59:14.341760+00:00",
+    "ended_utc": "2026-10-10T14:00:42.423820+00:00",
+    "outcome": "finished",
+    "reason": null,
+    "shutdown_clean": true,
+    "episodes": [
+      {
+        "index": 1,
+        "started": true,
+        "run_id": 6,
+        "started_utc": "2026-10-10T13:59:38.507662+00:00",
+        "duration_s": 60.000552811,
+        "termination_reason": "timeout",
+        "termination_details": "duration_timeout",
+        "errors": [],
+        "raw": {
+          "status": "published",
+          "path": "/home/zhanghaoyang/Desktop/dexmani_real/rollouts/maniflow/pick_place_toy/2026-10-10_12-30-49-604382_8483dce6_1010/session_20261010_215914/episode_001",
+          "staging_path": null,
+          "row_count": 960
+        },
+        "metrics": {
+          "inference_count": 107,
+          "inference_mean_s": 0.020165915822429905,
+          "inference_max_s": 0.034102579,
+          "skipped_slots": 0,
+          "dispatch_count": 852
+        }
+      }
+    ],
+    "errors": [],
+    "model_close": {
+      "status": "completed",
+      "reason": null,
+      "started_ns": 2264031872094118,
+      "completed_ns": 2264033033338665
+    },
+    "home_results": [
+      {
+        "outcome": "completed",
+        "reason": ""
+      }
+    ]
+  },
+  "220104": {
+    "kind": "policy",
+    "started_utc": "2026-10-10T14:01:04.926144+00:00",
+    "ended_utc": "2026-10-10T14:02:33.470936+00:00",
+    "outcome": "finished",
+    "reason": null,
+    "shutdown_clean": true,
+    "episodes": [
+      {
+        "index": 1,
+        "started": true,
+        "run_id": 6,
+        "started_utc": "2026-10-10T14:01:29.657800+00:00",
+        "duration_s": 59.804527593,
+        "termination_reason": "operator",
+        "termination_details": "owner_authority_revoked",
+        "errors": [],
+        "raw": {
+          "status": "published",
+          "path": "/home/zhanghaoyang/Desktop/dexmani_real/rollouts/maniflow/pick_place_toy/2026-10-10_12-30-49-604382_8483dce6_1010/session_20261010_220104/episode_001",
+          "staging_path": null,
+          "row_count": 957
+        },
+        "metrics": {
+          "inference_count": 107,
+          "inference_mean_s": 0.019958344065420557,
+          "inference_max_s": 0.035523465,
+          "skipped_slots": 0,
+          "dispatch_count": 849
+        }
+      }
+    ],
+    "errors": [],
+    "model_close": {
+      "status": "completed",
+      "reason": null,
+      "started_ns": 2264142866783810,
+      "completed_ns": 2264144036405377
+    },
+    "home_results": [
+      {
+        "outcome": "completed",
+        "reason": ""
+      }
+    ]
+  }
+}

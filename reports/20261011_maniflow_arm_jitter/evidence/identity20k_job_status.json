@@ -1,0 +1,39 @@
+{
+  "experiment": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010",
+  "baseline": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_12-30-49-604382_8483dce6_1010",
+  "started_at": "2026-10-10T15:35:46.699999+00:00",
+  "controller_pid": 2133721,
+  "training_budget_updates": 20000,
+  "scheduler_plan_steps": 100000,
+  "phase": "complete",
+  "updated_at": "2026-10-10T16:34:03.603572+00:00",
+  "train_command": [
+    "/home/zhanghaoyang/miniconda3/envs/policy/bin/python",
+    "-u",
+    "/home/zhanghaoyang/Desktop/dexmani_policy/dexmani_policy/train.py",
+    "--config-path",
+    "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010",
+    "--config-name",
+    "train_identity_20k",
+    "hydra.run.dir=/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010/hydra",
+    "hydra.job.chdir=false"
+  ],
+  "training_pid": 2133722,
+  "evaluation_command": [
+    "/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python",
+    "-u",
+    "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010/offline_eval/scripts/evaluate.py",
+    "--experiment",
+    "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010",
+    "--baseline",
+    "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_12-30-49-604382_8483dce6_1010",
+    "--inputs",
+    "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010/offline_eval/inputs",
+    "--output",
+    "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010/offline_eval/results"
+  ],
+  "checkpoint": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010/checkpoints/epoch=0188-step=00020000-milestone=20pct.pt",
+  "evaluation_pid": 2203562,
+  "completed_updates": 20000,
+  "results": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010/offline_eval/results/summary.json"
+}

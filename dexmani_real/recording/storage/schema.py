@@ -1,12 +1,16 @@
-"""Strict core fields and optional host-monotonic timing evidence in data.h5.
+"""Strict core fields and optional source/pipeline timing evidence in data.h5.
 
 ``timing/rows`` aligns with core observation rows. ``timing/queries`` stores one
 JSON record per (run_id, query_id), including the query's observation history
 sources and inference start/completion. ``timing/termination`` is a separate
 JSON boundary record, including a pending query and its deadline when present.
 Missing row values are -1; unavailable query times are null. Completion after
-Raw publication never rewrites these records. Host clocks describe neither
-camera exposure nor achieved robot motion.
+Raw publication never rewrites these records. Source/pipeline clocks use host
+monotonic ns. Camera SDK timestamps separately retain their per-channel domains
+(0=hardware, 1=system, 2=global); global/system source times are mapped to monotonic,
+hardware-only sources use first host receive time. These are not guaranteed
+exposure-midpoint or achieved-motion clocks. Missing timing columns in older Raw
+remain unavailable, without rewriting or filling historical evidence.
 """
 
 from dataclasses import dataclass
@@ -97,8 +101,15 @@ def validate_training_rows(timestamp, dispatch_status, control_hz) -> tuple[str,
 # Rows align with core observation rows; queries/termination have separate lengths.
 # slot is the visited owner slot; query/index identify its candidate target, even
 # if rejected. dispatch_status alone indicates which SDK calls actually occurred.
-TIMING_ROW_DTYPE = np.dtype([(name, "<i8") for name in (
+TIMING_REQUIRED_FIELDS = (
     "observation_ns", "control_ns", "arm_ns", "hand_ns", "camera_ns", "pointcloud_ns",
     "camera_sequence", "pointcloud_camera_sequence", "run_id", "slot", "query_id",
     "prediction_index", "submit_started_ns", "submit_completed_ns",
+)
+TIMING_ROW_DTYPE = np.dtype([(name, "<i8") for name in TIMING_REQUIRED_FIELDS + (
+    "camera_received_ns", "camera_published_ns", "camera_depth_sdk_ns", "camera_color_sdk_ns",
+    "camera_depth_timestamp_domain", "camera_color_timestamp_domain",
+    "camera_depth_frame_number", "camera_color_frame_number",
+    "pointcloud_camera_received_ns", "pointcloud_camera_published_ns",
+    "pointcloud_started_ns", "pointcloud_published_ns",
 )])

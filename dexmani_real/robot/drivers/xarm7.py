@@ -78,6 +78,7 @@ def _wait_controller_ready(
     *,
     expected_mode: int,
     timeout_s: float,
+    check_abort: Callable[[], None] | None = None,
 ) -> int:
     """Bounded wait for error==0, a movable state, and a settled mode.
 
@@ -86,7 +87,11 @@ def _wait_controller_ready(
     deadline = time.monotonic() + timeout_s
     last: LiveStateError | None = None
     while time.monotonic() < deadline:
+        if check_abort is not None:
+            check_abort()
         last = read_live_state_and_error(arm_api)
+        if check_abort is not None:
+            check_abort()
         if (
             bool(arm_api.connected)
             and last.error_code == 0
@@ -95,6 +100,8 @@ def _wait_controller_ready(
         ):
             return last.state
         time.sleep(0.03)
+    if check_abort is not None:
+        check_abort()
     raise RuntimeError(
         f"controller postcondition failed: expected mode={expected_mode} "
         f"error=0 movable-state, got state={last.state if last else None} "
@@ -102,11 +109,15 @@ def _wait_controller_ready(
     )
 
 
-def _enter_mode(arm_api: Any, mode: int) -> None:
+def _enter_mode(arm_api: Any, mode: int, *, check_abort: Callable[[], None] | None = None) -> None:
     """Enter a controller mode and wait for a movable state; raise on failure."""
+    if check_abort is not None:
+        check_abort()
     _check_sdk_return_code(arm_api.set_mode(mode), f"set_mode({mode})")
+    if check_abort is not None:
+        check_abort()
     _check_sdk_return_code(arm_api.set_state(0), f"set_state(0) after Mode {mode}")
-    _wait_controller_ready(arm_api, expected_mode=mode, timeout_s=1.0)
+    _wait_controller_ready(arm_api, expected_mode=mode, timeout_s=1.0, check_abort=check_abort)
 
 
 def _decode_joint_states(code: Any, states: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -416,9 +427,9 @@ class XArm7:
         """Enter Mode 0 (MoveJoint) and wait for a movable state; raise on failure."""
         _enter_mode(self._api, 0)
 
-    def enter_mode6(self) -> None:
+    def enter_mode6(self, *, check_abort: Callable[[], None] | None = None) -> None:
         """Enter servo Mode 6 and wait for a movable state; raise on failure."""
-        _enter_mode(self._api, 6)
+        _enter_mode(self._api, 6, check_abort=check_abort)
 
     def read_live_error_code(self) -> int:
         """Synchronous live error code; raise on failure (never the cached value)."""

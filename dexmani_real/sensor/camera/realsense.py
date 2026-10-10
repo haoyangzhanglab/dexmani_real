@@ -48,9 +48,29 @@ class RGBDFrame:
     color_device_timestamp_s: float
     depth_timestamp_domain: int
     color_timestamp_domain: int
+    depth_source_ns: int
+    color_source_ns: int
+    # Host queue-return time, before alignment/copying; distinct from source time.
     timestamp_ns: int
     depth_scale: float
     serial: str | None
+
+
+def _source_timestamp_ns(timestamp_s, domain, *, received_ns, realtime_ns):
+    """Map SDK global/system time to host monotonic; 0 rejects an invalid clock.
+
+    Hardware-only timestamps have no known host offset, so retain the explicit
+    receive-time origin for that domain. Never estimate an offset from arrivals:
+    that would hide camera/USB queue latency. Domain and SDK time travel with RGB-D.
+    """
+    if not np.isfinite(timestamp_s) or timestamp_s <= 0:
+        return 0
+    if domain == int(rs.timestamp_domain.hardware_clock):
+        return received_ns
+    if domain not in (int(rs.timestamp_domain.global_time), int(rs.timestamp_domain.system_time)):
+        return 0
+    source_ns = received_ns + round(timestamp_s * 1e9) - realtime_ns
+    return source_ns if 0 < source_ns <= received_ns else 0
 
 
 class RealSenseCamera:
@@ -449,6 +469,9 @@ class RealSenseCamera:
         # Timestamp immediately after the queue wait returns, before frameset
         # recovery or any array ownership copies.
         wait_return_monotonic_ns = time.monotonic_ns()
+        # Sample monotonic first: scheduling between these calls can only make
+        # the mapped source older. SDK global_time is in OS realtime, not monotonic.
+        wait_return_realtime_ns = time.time_ns()
         frames = queued_frame.as_frameset()
         if not frames:
             raise RuntimeError("RealSense frame queue returned a non-frameset frame.")
@@ -495,6 +518,14 @@ class RealSenseCamera:
             color_device_timestamp_s=color_timestamp_s,
             depth_timestamp_domain=depth_timestamp_domain,
             color_timestamp_domain=color_timestamp_domain,
+            depth_source_ns=_source_timestamp_ns(
+                depth_timestamp_s, depth_timestamp_domain,
+                received_ns=wait_return_monotonic_ns, realtime_ns=wait_return_realtime_ns,
+            ),
+            color_source_ns=_source_timestamp_ns(
+                color_timestamp_s, color_timestamp_domain,
+                received_ns=wait_return_monotonic_ns, realtime_ns=wait_return_realtime_ns,
+            ),
             timestamp_ns=wait_return_monotonic_ns,
             depth_scale=float(self.depth_scale),
             serial=self.active_serial,

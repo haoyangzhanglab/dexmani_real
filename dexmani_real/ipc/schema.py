@@ -30,6 +30,9 @@ def make_pointcloud_frame_dtype(num_points: int) -> np.dtype:
         [
             ("source_camera_sequence", "<u8"),
             ("timestamp_ns", "<u8"),
+            ("camera_received_ns", "<u8"),
+            ("camera_published_ns", "<u8"),
+            ("processing_started_ns", "<u8"),
             ("point_cloud", "<f4", (count, POINT_CLOUD_FEATURE_DIM)),
         ],
         align=True,
@@ -104,9 +107,17 @@ VR_FRAME_DTYPE = np.dtype(
 
 CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     [
+        # Oldest RGB/depth source in host monotonic time; never cloud completion.
         ("timestamp_ns", "<u8"),
+        ("received_ns", "<u8"),
         ("depth_frame_number", "<u8"),
         ("color_frame_number", "<u8"),
+        # SDK timestamps retain their per-channel domains (0=hardware, 1=system,
+        # 2=global). Global/system clocks are mapped to monotonic by the driver.
+        ("depth_sdk_ns", "<i8"),
+        ("color_sdk_ns", "<i8"),
+        ("depth_timestamp_domain", "<i4"),
+        ("color_timestamp_domain", "<i4"),
     ],
     align=True,
 )

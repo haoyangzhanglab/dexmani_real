@@ -86,7 +86,7 @@ python examples/export_policy_zarr.py episodes/<task> --config local.yaml
 python examples/run_policy.py <policy/task/experiment> --config local.yaml
 ```
 
-H 执行 HOME，T 在空闲且无接触时归零触觉，B 开始，S 停止，Q 退出，ESC 急停。开始及 reset 后重新采样，复用运行时策略输入检查并核对 arm/hand HOME 姿态；准备失败保留具体原因，不进入 RUNNING 或消耗运行段数。启用 Raw 时仍要求可匹配且新鲜的 RGB-D 来源，单独报告录制来源失败。默认每段运行预算 60 秒，可用 `--max-duration` 修改。
+H 执行 HOME，T 在空闲且无接触时归零触觉，B 开始，S 停止，Q 退出，ESC 急停。开始及 reset 后重新采样，复用运行时策略输入检查并核对 arm/hand HOME 姿态；启动容差默认机械臂 0.5°、手部 5°，机械臂 HOME 运动的收敛容差仍为 0.15°。准备失败保留具体原因，不进入 RUNNING 或消耗运行段数。启用 Raw 时仍要求可匹配且新鲜的 RGB-D 来源，单独报告录制来源失败。默认每段运行预算 60 秒，可用 `--max-duration` 修改。
 
 策略负责保存的 horizon、观测历史、模态、normalizer、控制时间步和点云生产 recipe；encoder 内部采样点数可以不同于生产点数。Real 负责当前设备、现场状态和执行参数。入口一次性解析 `A_exec`：优先 `--n-action-steps`，否则读取策略保存的默认值，结果记为 `execution.action_steps`（由入口生成，不能在 YAML 指定），不覆盖模型配置。模型仍输出扣除观测历史偏移后的完整 `P = horizon - n_obs_steps + 1` 步未来动作；sync 要求 `A_exec <= P`，async/RTC 要求 `1 <= d <= A_exec` 且 `A_exec + d <= P`。
 
@@ -96,15 +96,15 @@ H 执行 HOME，T 在空闲且无接触时归零触觉，B 开始，S 停止，Q
 
 健康的 bootstrap／sync 换段允许预算内 WAIT，不重复下发旧目标，也不保证上一已接受目标已经停止。async/RTC 预取期间继续执行当前有效计划。必要观测失效、计划过期、错过时隙/交接或 WAIT 超时会撤权、尝试停止并结束本轮；观测恢复后不自动续跑，新 B 仍须满足 HOME、新鲜度和模型空闲检查。论文评估应记录执行模式、预算与终止规则。
 
-checkpoint 默认 `best`；模型推理参数与 Real 执行参数见 `--help`。保存产物时，`run_config.yaml` 记录实际配置、checkpoint、覆盖值、输出开关与源码版本。`--output` 指定部署输出位置。
+checkpoint 默认 `latest`；可用 `--checkpoint 80pct` 选择已保存的 80% milestone，也支持 `best` 或 checkpoint 文件名。百分比必须对应已有 checkpoint；`best` 需要实验中的 `best_ckpt.json`。模型推理参数与 Real 执行参数见 `--help`。保存产物时，`run_config.yaml` 记录实际配置、checkpoint、覆盖值、输出开关与源码版本。`--output` 指定部署输出位置。
 
 Raw 与评估摘要可独立关闭：`--no-record` 关闭 Raw，`--no-results` 关闭摘要，两者同时使用时不创建会话产物。评估摘要保存在 `session_result.json`，包含结束原因、时长、故障和推理、发送、跳过节拍的统计。启用摘要时，在连接设备前写入初始未完成状态；运行期间只更新内存，撤销运动后保存每段结果，资源清理后更新会话结果。session 统一提交幂等模型关闭，并在其他资源释放后用剩余关闭预算等待同一个 Future；`model_close.status` 区分 completed、failed、pending，超预算表示关闭未完成，不等同关闭异常。清理失败或最终仍 pending 都返回非零退出状态，episode 原始结束原因独立保留。有限等待不保证 Python 线程或 CUDA 卡住时进程也能按时退出。
 
 Rollout Raw 默认用于评估 evidence，保留 bootstrap/WAIT 的无动作行与具体终止原因（关闭摘要时也保留）。公共导出按同一时间、完整性与 ACCEPTED 规则判定，通常会拒绝这些含无动作行的 episode；未来用于再训练需另行定义派生片段和时间映射，不能填动作或裁行来通过当前导出。
 
-`data.h5/timing` 保存可选的控制时序与来源证据，关联观测、query、候选动作、命令提交和终止原因。观测行与 query/终止记录分开存储，支持计算观测年龄、模态时间差、推理与提交耗时；具体布局与缺失标识见 [Raw schema](dexmani_real/recording/storage/schema.py)，读取接口见 [EpisodeReader](dexmani_real/recording/storage/reader.py)。时间使用本机 monotonic 时钟，不代表相机曝光或机器人到位，实际 SDK 调用以 dispatch status 为准。历史 Raw 无需迁移，缺少 timing 时明确报告证据不可用，核心读取仍可用。
+`data.h5/timing` 保存可选的控制时序与来源证据，关联观测、query、候选动作、命令提交和终止原因，也记录相机取帧、发布及点云处理、发布时刻，便于分解延迟。相机 SDK 的 global/system 时间映射到本机 monotonic；只有 hardware clock 时保留主机接收时间，并记录原始 SDK 时间与时钟域。点云继承 RGB-D 较旧通道的来源时间，计算完成不会刷新其年龄；这些时间不保证代表曝光中点或机器人到位。具体布局与缺失标识见 [Raw schema](dexmani_real/recording/storage/schema.py)，读取与延迟诊断见 [EpisodeReader](dexmani_real/recording/storage/reader.py)，实际 SDK 调用以 dispatch status 为准。历史 Raw 保持原样，未记录的时序证据明确标为不可用。
 
-部署 joint、EEF 的最终关节目标及 RTC 冻结目标统一检查机械/关节限位、跳变、FK 最终 EEF 工作空间、自碰撞，以及当前配置启用的桌面与 static boxes，保留 allowed-contact 配置。EEF 仍先投影再 IK；拒绝就终止本轮并记录原因，不重规划或恢复。启用环境但标定文件缺失会报错，使用当前现场配置；HOME 另做路径检查。这些是最终目标检查，不证明真实连续运动轨迹安全；新增耗时计入 owner 预算，仍需现场验收。
+部署 joint、EEF 的最终关节目标及 RTC 冻结目标统一检查机械/关节限位、跳变、FK 最终 EEF 工作空间、自碰撞及当前配置的 static boxes。最终 FK 工作空间检查默认允许各边界超出 5 mm，可通过 `execution.eef_workspace_margin_m` 调整，设为 0 恢复严格边界；EEF 原始目标投影与 HOME 路径仍使用原始工作空间。Policy 动作不做桌面碰撞检测，允许贴桌/接触操作，由操作员监督并准备硬件急停；H 执行 HOME 时仍按当前配置检查桌面和路径，点云去桌仍使用当前桌面标定。EEF 仍先投影再 IK；拒绝就终止本轮并记录原因，不重规划或恢复。这些是最终目标检查，不证明真实连续运动轨迹安全；检查耗时计入 owner 预算，仍需现场验收。
 
 `--no-record`、`--no-results` 只控制产物保存，部署仍连接设备并执行动作；程序接口的 `execute=False` 仍连接并读取设备，均不能用于离线验证。
 

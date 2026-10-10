@@ -94,8 +94,8 @@ class TableCollisionConfig:
     Runtime resolution refreshes enabled collision geometry from ``plane_path``.
     Session assembly also resolves it when the effective point-cloud recipe
     requires table removal, sharing one snapshot regardless of collision enablement.
-    Fine teleoperation deliberately does not use this geometry to reject
-    robot-table contact.
+    Fine teleoperation and policy evaluation do not use this geometry to reject
+    robot-table contact. Return-home planning retains table checks.
     """
 
     enabled: bool = True

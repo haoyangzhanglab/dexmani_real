@@ -1,0 +1,64 @@
+{
+  "config_valid": true,
+  "dataset_revision": "07ddf7f066fb463bbb554bd5ffa3b073",
+  "valid_windows": 13571,
+  "normalizer_fields": [
+    "joint_state",
+    "action"
+  ],
+  "raw_cloud_identity_exact": true,
+  "source_data_recipe_match": true,
+  "source_runtime_recipe_match": true,
+  "same_agent_optimizer_loader_and_schedule": true,
+  "rollout_inputs": {
+    "rollouts": {
+      "215914": {
+        "episode": "/home/zhanghaoyang/Desktop/dexmani_real/rollouts/maniflow/pick_place_toy/2026-10-10_12-30-49-604382_8483dce6_1010/session_20261010_215914/episode_001",
+        "query_count": 107,
+        "reconstructed_frames": 214,
+        "full_steady_queries": 70
+      },
+      "220104": {
+        "episode": "/home/zhanghaoyang/Desktop/dexmani_real/rollouts/maniflow/pick_place_toy/2026-10-10_12-30-49-604382_8483dce6_1010/session_20261010_220104/episode_001",
+        "query_count": 107,
+        "reconstructed_frames": 214,
+        "full_steady_queries": 70
+      }
+    },
+    "limitations": [
+      "Point clouds reconstructed from Raw depth and compressed RGB video; not saved original online tensors.",
+      "Rollout actions are failed-policy outputs, not expert ground truth."
+    ],
+    "training_windows": {
+      "count": 24,
+      "rows": [
+        51,
+        128,
+        204,
+        1937,
+        2025,
+        2112,
+        3919,
+        3972,
+        4025,
+        6082,
+        6163,
+        6244,
+        7923,
+        7989,
+        8055,
+        9996,
+        10059,
+        10122,
+        11931,
+        11997,
+        12063,
+        13773,
+        13849,
+        13924
+      ],
+      "dataset_revision": "07ddf7f066fb463bbb554bd5ffa3b073"
+    },
+    "excluded_old_camera": "8 valid model-input/action windows from a demo excluded due to tactile invalidity; a diagnostic, not a formal task holdout."
+  }
+}

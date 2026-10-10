@@ -71,17 +71,15 @@ class ActionRealizer:
             raise ValueError("action mode must be joint or eef")
         if mode == "eef":
             runtime.policy.workspace.validate()
-        # The session has resolved current table calibration before construction.
-        # Teleop keeps its existing endpoint admission without this environment.
+        # Policy evaluation allows near-table/contact manipulation under operator
+        # supervision. Its target checks use static boxes only; HOME owns table
+        # path checks through its separate planner.
         environment = {}
         if deployment:
             runtime.environment.validate()
-            if runtime.environment.table.enabled:
-                runtime.environment.table.validate()
             for box in runtime.environment.static_boxes:
                 box.validate()
-            environment = dict(static_boxes=runtime.environment.static_boxes,
-                               table=runtime.environment.table)
+            environment = dict(static_boxes=runtime.environment.static_boxes)
         planner = (
             XArm7MotionPlanner.create_default(
                 online_ik_profile=make_online_ik_config(runtime),
@@ -127,7 +125,8 @@ class ActionRealizer:
                 return "model_joint_limits"
             position, _ = self.target_fk.compute(target)
             bounds = cfg.policy.workspace.as_array()
-            if np.any(position < bounds[:, 0]) or np.any(position > bounds[:, 1]):
+            margin = cfg.execution.eef_workspace_margin_m
+            if np.any(position < bounds[:, 0] - margin) or np.any(position > bounds[:, 1] + margin):
                 return "final_eef_workspace"
         if self.collision_model.check_self_collision(target):
             return "self_collision"

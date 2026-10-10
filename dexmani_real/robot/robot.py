@@ -240,15 +240,46 @@ class DexManiRobot:
         self.check()
         return RobotState(arm, hand)
 
-    def _authorized(self, command, state):
+    def _authorized(self, run_id, state):
         self.check()
         return (
             not self.shared.quit_requested
             and not self.shared.stop_request
             and command_may_cross_sdk(
-                self.shared, run_id=command.run_id, required_safety_state=state
+                self.shared, run_id=run_id, required_safety_state=state
             )
         )
+
+    def prepare_streaming(self, run_id, *, state=SafetyState.ARMED, valid_until_ns=None):
+        """Restore Mode 6 under the owner's epoch; the caller owns stop on failure."""
+        self._check_owner()
+        if self._hand_stop_pending:
+            raise DispatchError(
+                "previous XHand stop remains unconfirmed", DispatchResult(),
+                revoked=True, cause="stop_unconfirmed",
+            )
+        if not self._connected or self.arm is None or not self.arm.is_connected:
+            raise DispatchError("arm device unavailable", DispatchResult())
+
+        def check_abort():
+            if not self._authorized(run_id, state):
+                raise DispatchError(
+                    "motion authority revoked during streaming preparation", DispatchResult(),
+                    revoked=True, cause="authority_revoked",
+                )
+            if valid_until_ns is not None and time.monotonic_ns() >= valid_until_ns:
+                raise DispatchError(
+                    "dispatch deadline expired during mode restoration", DispatchResult(),
+                    revoked=True, cause="deadline_expired",
+                )
+
+        check_abort()
+        if self._arm_stopped:
+            # Mode restoration changes controller state even without a target.
+            self._motion_active = True
+            self.arm.enter_mode6(check_abort=check_abort)
+            check_abort()
+            self._arm_stopped = False
 
     def _send(self, command, state, *, valid_until_ns):
         self._check_owner()
@@ -288,7 +319,7 @@ class DexManiRobot:
                 target = getattr(command, f"{name}_qpos")
                 if target is None:
                     continue
-                if not self._authorized(command, state):
+                if not self._authorized(command.run_id, state):
                     raise DispatchError(
                         "motion authority revoked", result, revoked=True, cause="authority_revoked"
                     )
@@ -297,22 +328,7 @@ class DexManiRobot:
                         "dispatch deadline expired", result, revoked=True, cause="deadline_expired"
                     )
                 if name == "arm" and self._arm_stopped:
-                    self.arm.enter_mode6()
-                    self._arm_stopped = False
-                    if not self._authorized(command, state):
-                        raise DispatchError(
-                            "motion authority revoked after mode restoration",
-                            result,
-                            revoked=True,
-                            cause="authority_revoked",
-                        )
-                    if time.monotonic_ns() >= valid_until_ns:
-                        raise DispatchError(
-                            "dispatch deadline expired after mode restoration",
-                            result,
-                            revoked=True,
-                            cause="deadline_expired",
-                        )
+                    self.prepare_streaming(command.run_id, state=state, valid_until_ns=valid_until_ns)
                 # From here, an exception cannot prove that nothing reached the device.
                 result = replace(result, **{name: DispatchStatus.UNKNOWN})
                 self._motion_active = True
@@ -326,7 +342,7 @@ class DexManiRobot:
                     result = replace(result, hand=status, hand_status=raw_status)
                 if status in (DispatchStatus.REJECTED, DispatchStatus.UNKNOWN):
                     raise DispatchError(f"{name} SDK rejected target", result)
-            if not self._authorized(command, state):
+            if not self._authorized(command.run_id, state):
                 raise DispatchError(
                     "motion authority revoked during dispatch",
                     result,

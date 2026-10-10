@@ -397,6 +397,11 @@ class AsyncEpisodeRecorder:
                 }
                 timing = data.create_group("timing")
                 timing.attrs.update(clock="host_monotonic_ns", missing_value=-1)
+                timing.attrs.update(
+                    camera_timestamp_source="sdk_global_or_system_mapped_to_monotonic; "
+                                            "hardware_clock_uses_first_host_receive",
+                    camera_sdk_clock="per_channel_timestamp_domain: 0=hardware, 1=system, 2=global",
+                )
                 row_times = timing.create_dataset("rows", shape=(0,), maxshape=(None,), dtype=TIMING_ROW_DTYPE)
                 queries = timing.create_dataset("queries", shape=(0,), maxshape=(None,), dtype=h5py.string_dtype())
                 datasets["depth"] = data.create_dataset(

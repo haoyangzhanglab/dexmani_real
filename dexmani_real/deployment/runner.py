@@ -299,7 +299,7 @@ class PolicyRunner:
             return None
         if self.execute and (
             np.max(np.abs(row.arm["qpos"][0] - self.runtime.arm.home_qpos))
-            > self.runtime.arm.homing.convergence_rad
+            > np.deg2rad(self.execution.start_arm_home_tolerance_deg)
             or np.max(np.abs(row.hand["qpos"][0] - np.deg2rad(self.runtime.hand.home_qpos_deg)))
             > np.deg2rad(self.runtime.hand.home_tolerance_deg)
         ):
@@ -368,6 +368,11 @@ class PolicyRunner:
             # Recorder startup can block; use a new row before granting motion.
             if self._start_observation() is None:
                 return
+            if self.execute:
+                self.robot.prepare_streaming(epoch)
+                # Mode restoration is startup work, outside the policy clock.
+                if self._start_observation() is None:
+                    return
             with self.shared.motion_lock:
                 admitted = (
                     _begin_motion_locked(self.shared)
@@ -379,9 +384,9 @@ class PolicyRunner:
             if admitted is None:
                 return
             self.run_id, self.started_ns = admitted
+            committed = True
             if self.results is not None:
                 self.results.entered(self.run_id)
-            committed = True
             self.history.clear()
             self.plan = self.query = None
             self.previous_arm = None
@@ -391,18 +396,38 @@ class PolicyRunner:
             self.wait_started_ns = self.started_ns
         except BaseException as exc:
             start_failure = exc
+            if isinstance(exc, KeyboardInterrupt):
+                self.shared.estop_request = True
+            if isinstance(exc, DispatchError) and exc.revoked and exc.cause == "authority_revoked":
+                return
             raise
         finally:
             if not committed:
+                cancelled = isinstance(start_failure, KeyboardInterrupt) or (
+                    isinstance(start_failure, DispatchError)
+                    and start_failure.revoked and start_failure.cause == "authority_revoked"
+                )
+                errors = [error_detail("preparation", start_failure)] if start_failure else []
                 try:
-                    self._finalize_outputs(
-                        "preparation_failed" if self.preparation_issue else "start_cancelled",
-                        str(start_failure) if start_failure else self.preparation_issue or "final admission declined",
-                    )
-                except Exception:
-                    if start_failure is None:
-                        raise
-                    logger.exception("start finalization also failed")
+                    if self.execute and self.robot.stop_required:
+                        self.robot.stop()
+                except BaseException as exc:
+                    errors.append(error_detail("preparation_stop", exc))
+                    start_failure, cancelled = exc, False
+                    raise
+                finally:
+                    try:
+                        self._finalize_outputs(
+                            "preparation_failed"
+                            if self.preparation_issue or (start_failure and not cancelled)
+                            else "start_cancelled",
+                            str(start_failure) if start_failure else self.preparation_issue or "final admission declined",
+                            errors=errors,
+                        )
+                    except Exception:
+                        if start_failure is None or cancelled:
+                            raise
+                        logger.exception("start finalization also failed")
 
     def _poll_model(self, row=None):
         item = self.model.poll()

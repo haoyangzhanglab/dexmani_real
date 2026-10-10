@@ -140,11 +140,15 @@ class RolloutRecordingConfig:
 
 @dataclass(frozen=True)
 class ExecutionConfig:
-    """Admission and wait budgets checked against saved Policy timing."""
+    """Policy startup admission and execution budgets."""
 
     # Effective A_exec, resolved from CLI or saved default at the Real entry.
     action_steps: int | None = None
     execution_mode: str = "sync"
+    # Policy may start near HOME without relaxing the physical HOME convergence.
+    start_arm_home_tolerance_deg: float = 0.5
+    # Per-face allowance for the final FK target; nominal command bounds stay fixed.
+    eef_workspace_margin_m: float = 0.005
     # Recheck these admission budgets against Policy cadence and measured costs;
     # they do not bound the physical stop response time.
     max_decision_age_s: float = 1.0
@@ -164,6 +168,22 @@ class ExecutionConfig:
             raise ValueError("n_obs_steps must not exceed horizon")
         if self.execution_mode not in {"sync", "async", "rtc"}:
             raise ValueError("execution_mode must be sync, async or rtc")
+        tolerance = self.start_arm_home_tolerance_deg
+        if (
+            isinstance(tolerance, bool)
+            or not isinstance(tolerance, (int, float))
+            or not math.isfinite(tolerance)
+            or tolerance <= 0
+        ):
+            raise ValueError("start_arm_home_tolerance_deg must be finite and positive")
+        margin = self.eef_workspace_margin_m
+        if (
+            isinstance(margin, bool)
+            or not isinstance(margin, (int, float))
+            or not math.isfinite(margin)
+            or margin < 0
+        ):
+            raise ValueError("eef_workspace_margin_m must be finite and nonnegative")
         for name in ("max_decision_age_s", "max_wait_s", "max_tick_lateness_s"):
             value = getattr(self, name)
             if (

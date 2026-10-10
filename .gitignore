@@ -22,3 +22,5 @@ __pycache__/
 /.claude/settings.local.json
 **/.DS_Store
 dexmani_real/calibration/state/*.json.bak.*
+
+/experiments

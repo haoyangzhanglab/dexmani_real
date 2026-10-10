@@ -1,0 +1,56 @@
+{
+  "215914": {
+    "rows": 960,
+    "accepted_dispatch_rows": 852,
+    "unaccepted_called_rows": 0,
+    "boundary_max_joint_jump_deg_p50_p95_max": [
+      3.30373005813661,
+      5.703976353242274,
+      6.438259255059079
+    ],
+    "within_max_joint_jump_deg_p50_p95_max": [
+      0.8485707496513366,
+      1.7391232570361566,
+      3.279747556413403
+    ],
+    "dispatch_gap_counts": {
+      "1": 745,
+      "2": 106
+    },
+    "nominal_replanning_period_s": 0.5625,
+    "measured_J4_velocity_peak_hz_after_20s": 1.7750000000000001,
+    "band_1_65_to_1_9_fraction_above_0_5Hz": 0.5254970962320042,
+    "full_chunks_after_20s": 70,
+    "entry_vs_drift_negative_cosine_chunks": 65,
+    "entry_vs_drift_cosine_median": -0.8925773528846186,
+    "J4_retreat_deg_mean_after_20s": 2.5164898700348965,
+    "RGBD_and_cloud_sequence_equal_all_rows": true
+  },
+  "220104": {
+    "rows": 957,
+    "accepted_dispatch_rows": 849,
+    "unaccepted_called_rows": 0,
+    "boundary_max_joint_jump_deg_p50_p95_max": [
+      4.725807886731822,
+      5.675626799318489,
+      6.468025219461995
+    ],
+    "within_max_joint_jump_deg_p50_p95_max": [
+      0.9656924856611881,
+      1.8652678863830066,
+      3.3161388043112305
+    ],
+    "dispatch_gap_counts": {
+      "1": 742,
+      "2": 106
+    },
+    "nominal_replanning_period_s": 0.5625,
+    "measured_J4_velocity_peak_hz_after_20s": 1.783359497645212,
+    "band_1_65_to_1_9_fraction_above_0_5Hz": 0.5781816454002394,
+    "full_chunks_after_20s": 70,
+    "entry_vs_drift_negative_cosine_chunks": 70,
+    "entry_vs_drift_cosine_median": -0.9765846245817624,
+    "J4_retreat_deg_mean_after_20s": 4.751172184511188,
+    "RGBD_and_cloud_sequence_equal_all_rows": true
+  }
+}

@@ -1,0 +1,113 @@
+{
+  "archived_at_utc": "2026-10-10T16:53:51.302652+00:00",
+  "scope": "Copied existing offline evidence and figures for the report; source Raw, dataset and checkpoints unchanged. Historical scope/limitations describe each original analysis stage.",
+  "files": [
+    {
+      "path": "evidence/rollout_findings.json",
+      "source": "/tmp/rollout_jitter_analysis/findings.json",
+      "sha256": "1ab5950f4fb8390c4fe39728c0cfb9675f7d6dc35018bfa205b4db57b63d6cd9",
+      "bytes": 4668
+    },
+    {
+      "path": "evidence/raw_rollout_metrics.json",
+      "source": "/tmp/rollout_jitter_analysis/raw_rollout_metrics.json",
+      "sha256": "1104f5fe624be47b515610f1eaf70f260a7f9d7159a83374d185fa015a13e25c",
+      "bytes": 1704
+    },
+    {
+      "path": "evidence/offline_nfe_comparison.json",
+      "source": "/tmp/rollout_jitter_analysis/offline_nfe_comparison.json",
+      "sha256": "f507b34a9571feae5d940c6cbfe844efb627434cb1655aa6d26f4a0e37d528ea",
+      "bytes": 27685
+    },
+    {
+      "path": "evidence/pointcloud_comparison.json",
+      "source": "/tmp/rollout_jitter_analysis/pointcloud_comparison/comparison_summary.json",
+      "sha256": "e78fa46f874dbcaf45e3bb337db58b807f287eaf3d76c901371e2ae0ae257d3e",
+      "bytes": 6747
+    },
+    {
+      "path": "evidence/observation_probes.json",
+      "source": "/tmp/rollout_jitter_analysis/observation_probes.json",
+      "sha256": "59ab8e4b1d1c583958c99dddecec4a6d302277061317062a86e70428054a9eaa",
+      "bytes": 265413
+    },
+    {
+      "path": "evidence/latency_summary.json",
+      "source": "/tmp/rollout_jitter_analysis/latency_analysis/summary.json",
+      "sha256": "07e6c5f264d9d033cf759905b3f06b27a566a65063cc630b2463849154e6b5e4",
+      "bytes": 15357
+    },
+    {
+      "path": "evidence/normalization_before_retraining.json",
+      "source": "/tmp/rollout_jitter_analysis/normalization_analysis/summary.json",
+      "sha256": "202986f9d82e8498c7fdbe157f449d7d066c30f5fa8d3c5eb9c3c8e7d2002d54",
+      "bytes": 15383
+    },
+    {
+      "path": "evidence/timestamp_checks.log",
+      "source": "/tmp/pointcloud_timestamp_checks/results.log",
+      "sha256": "dc316b35bde6d2411c8560c0f12fe363f16e71c7f22875d86aa08ab4172c7f65",
+      "bytes": 1664
+    },
+    {
+      "path": "evidence/identity20k_assessment.json",
+      "source": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010/offline_eval/results/assessment.json",
+      "sha256": "7b89cb9a4c35acb6c46ec4c1f16a394f9250450952b6688a71fbf439c166971d",
+      "bytes": 4966
+    },
+    {
+      "path": "evidence/identity20k_protocol.json",
+      "source": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010/protocol.json",
+      "sha256": "dc6d1f02d53f5404274283c1c756ea4d8e18d557da0ea33b6eddb0b68e934e8b",
+      "bytes": 908
+    },
+    {
+      "path": "evidence/identity20k_preflight.json",
+      "source": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010/preflight.json",
+      "sha256": "14e431994ad31c79323e315e3e24098c66d8d3fafcef721a080c8d1b8fd4d215",
+      "bytes": 1828
+    },
+    {
+      "path": "evidence/identity20k_job_status.json",
+      "source": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010/job_status.json",
+      "sha256": "960ca0ae279b93a15985295b438eec7b454ea7ce4f8fc697948fc0af5f6e2b42",
+      "bytes": 2402
+    },
+    {
+      "path": "figures/arm_jitter.png",
+      "source": "/tmp/rollout_jitter_analysis/arm_jitter.png",
+      "sha256": "11029cca5b5bfecedf18c2c8b45789856f3a4f1e27bd777d5678118e585f69d3",
+      "bytes": 255163
+    },
+    {
+      "path": "figures/home_comparison.png",
+      "source": "/tmp/rollout_jitter_analysis/pointcloud_comparison/home_comparison.png",
+      "sha256": "3ede62fca1d8e497602b1bd5250b84fe16ef1d27f52cc3e8dfa71258e395b94a",
+      "bytes": 490425
+    },
+    {
+      "path": "figures/latency_summary.png",
+      "source": "/tmp/rollout_jitter_analysis/latency_analysis/latency_summary.png",
+      "sha256": "d224f12a493a8155e043cb2e7cb434b9a31f547b5b13539c273c824d33c08532",
+      "bytes": 642791
+    },
+    {
+      "path": "figures/identity20k_comparison.png",
+      "source": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-10_23-30-00_pc_identity_20k_seed1010/offline_eval/results/rollout_comparison.png",
+      "sha256": "4eff94317a14c8593ea450c750c279b9c552cf413c7b732259e84343b551d248",
+      "bytes": 322294
+    },
+    {
+      "path": "evidence/session_results.json",
+      "sources": [
+        "/home/zhanghaoyang/Desktop/dexmani_real/rollouts/maniflow/pick_place_toy/2026-10-10_12-30-49-604382_8483dce6_1010/session_20261010_214503/session_result.json",
+        "/home/zhanghaoyang/Desktop/dexmani_real/rollouts/maniflow/pick_place_toy/2026-10-10_12-30-49-604382_8483dce6_1010/session_20261010_215914/session_result.json",
+        "/home/zhanghaoyang/Desktop/dexmani_real/rollouts/maniflow/pick_place_toy/2026-10-10_12-30-49-604382_8483dce6_1010/session_20261010_220104/session_result.json"
+      ],
+      "transformation": "Collected unchanged per-session JSON objects under session suffix keys.",
+      "sha256": "bb9698bbe284e5b9987ca73d3bf068217bf50f1e20c663f37116520ea82aca7e",
+      "bytes": 4176
+    }
+  ]
+}

@@ -41,7 +41,7 @@ _IDLE_POLL_S = 0.001
 class PointCloudWorkerConfig:
     """Resolved processing policy for the realtime worker.
 
-    Each cloud keeps its camera sequence and host source timestamp. Consumers
+    Each cloud keeps its camera sequence, source timestamp and processing clocks. Consumers
     check cloud freshness; only joint RGB/cloud consumers retrieve the matching
     RGB-D sample. Published clouds are otherwise self-contained.
     """
@@ -149,13 +149,14 @@ def run_pointcloud_worker(shared: "SensorChannels", config: PointCloudWorkerConf
             if result is None:
                 time.sleep(_IDLE_POLL_S)
                 continue
-            data, _publication_ns, camera_sequence = result
+            data, camera_published_ns, camera_sequence = result
             header = data["header"]
             color, depth_raw = data["rgb"][0], data["depth"][0]
             if camera_sequence <= last_camera_sequence:
                 continue
             last_camera_sequence = camera_sequence
 
+            processing_started_ns = time.monotonic_ns()
             cloud = build_point_cloud(
                 depth_raw=depth_raw,
                 color=color,
@@ -177,6 +178,9 @@ def run_pointcloud_worker(shared: "SensorChannels", config: PointCloudWorkerConf
             camera_header = header[0]
             record["source_camera_sequence"][0] = np.uint64(camera_sequence)
             record["timestamp_ns"][0] = camera_header["timestamp_ns"]
+            record["camera_received_ns"][0] = camera_header["received_ns"]
+            record["camera_published_ns"][0] = camera_published_ns
+            record["processing_started_ns"][0] = processing_started_ns
             record["point_cloud"][0] = cloud
             shared.pointcloud_ring.write(record)
             if not ready:
