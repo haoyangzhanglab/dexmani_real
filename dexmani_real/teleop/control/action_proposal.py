@@ -1,7 +1,7 @@
 """Compute Cartesian teleoperation intent without side effects.
 
 TeleopController supplies the mapped pose and previous accepted target.
-Target dispatch and recording belong to execute_control_step.
+Target dispatch and recording belong to TeleopRunner.
 """
 
 from __future__ import annotations

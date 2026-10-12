@@ -1,0 +1,61 @@
+{
+  "session_20261012_135345": [
+    {
+      "row": 0,
+      "depth_nonzero_fraction": 0.8997591145833334,
+      "cloud_shape": [
+        1024,
+        6
+      ],
+      "unique_xyz": 1024
+    },
+    {
+      "row": 150,
+      "depth_nonzero_fraction": 0.897646484375,
+      "cloud_shape": [
+        1024,
+        6
+      ],
+      "unique_xyz": 1024
+    },
+    {
+      "row": 175,
+      "depth_nonzero_fraction": 0.8985872395833333,
+      "cloud_shape": [
+        1024,
+        6
+      ],
+      "unique_xyz": 1024
+    }
+  ],
+  "session_20261012_135924": [
+    {
+      "row": 0,
+      "depth_nonzero_fraction": 0.923349609375,
+      "cloud_shape": [
+        1024,
+        6
+      ],
+      "unique_xyz": 1024
+    },
+    {
+      "row": 120,
+      "depth_nonzero_fraction": 0.9178255208333334,
+      "cloud_shape": [
+        1024,
+        6
+      ],
+      "unique_xyz": 1024
+    },
+    {
+      "row": 150,
+      "depth_nonzero_fraction": 0.9148177083333333,
+      "cloud_shape": [
+        1024,
+        6
+      ],
+      "unique_xyz": 1024
+    }
+  ],
+  "note": "Offline reconstruction uses Raw calibration and resolved current-run recipe. MP4 color is lossy; this is a geometry spot check, not a bitwise replay of online inputs."
+}

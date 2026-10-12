@@ -52,10 +52,8 @@ def policy_observation_issue(row, fields):
     for name in fields:
         if name in {"contact_force", "tactile_force"}:
             channel = "aggregate" if name == "contact_force" else "dense"
-            if not bool(row.hand[f"tactile_{channel}_valid"][0]):
-                return f"required_{name}_unavailable"
             if not np.isfinite(row.hand[f"tactile_{channel}"]).all():
-                return f"required_{name}_nonfinite"
+                return f"required_{name}_unavailable"
         elif name == "point_cloud":
             if row.point_cloud is None or not np.isfinite(row.point_cloud).all():
                 return "required_point_cloud_unavailable_or_nonfinite"
@@ -73,12 +71,6 @@ def build_policy_observation(rows, policy_info, *, kinematics=None):
     requested = set(policy_info.observation_fields)
     if not rows or any(row.hand is None for row in rows):
         return None
-    for name, field in (
-        ("contact_force", "tactile_aggregate_valid"),
-        ("tactile_force", "tactile_dense_valid"),
-    ):
-        if name in requested and not all(bool(row.hand[field][0]) for row in rows):
-            return None
     arrays = {}
     if requested & {"joint_state", "eef_pose", "fingertip_points"}:
         joint = np.stack(
@@ -126,6 +118,8 @@ def build_policy_observation(rows, policy_info, *, kinematics=None):
     for name in policy_info.observation_fields:
         values = np.ascontiguousarray(arrays[name])
         if values.dtype != np.uint8 and not np.isfinite(values).all():
+            if name in {"contact_force", "tactile_force"}:
+                return None
             raise ValueError(f"Nonfinite policy observation {name}")
         result[name] = values
     return result

@@ -1,0 +1,221 @@
+{
+  "cases": {
+    "sync_A1": {
+      "first_send_ms": 124.5,
+      "action_indices": [
+        100,
+        200,
+        300
+      ],
+      "fresh_row": true
+    },
+    "sync_A4": {
+      "first_send_ms": 124.5,
+      "action_indices": [
+        100,
+        101,
+        102,
+        103,
+        200,
+        201,
+        202,
+        203,
+        300,
+        301,
+        302,
+        303
+      ],
+      "fresh_row": true
+    },
+    "sync_A8": {
+      "first_send_ms": 124.5,
+      "action_indices": [
+        100,
+        101,
+        102,
+        103,
+        104,
+        105,
+        106,
+        107,
+        200,
+        201,
+        202,
+        203,
+        204,
+        205,
+        206,
+        207,
+        300,
+        301,
+        302,
+        303,
+        304,
+        305,
+        306,
+        307
+      ],
+      "fresh_row": true
+    },
+    "slow_sync": {
+      "inference_ms": 150,
+      "head_preserved": true
+    },
+    "async_A1_d1": {
+      "action_indices": [
+        100,
+        201,
+        301
+      ],
+      "interval_ms": 62.5
+    },
+    "async_A4_d1": {
+      "action_indices": [
+        100,
+        101,
+        102,
+        103,
+        201,
+        202,
+        203,
+        204,
+        301,
+        302,
+        303,
+        304
+      ],
+      "interval_ms": 62.5
+    },
+    "async_A8_d2": {
+      "action_indices": [
+        100,
+        101,
+        102,
+        103,
+        104,
+        105,
+        106,
+        107,
+        202,
+        203,
+        204,
+        205,
+        206,
+        207,
+        208,
+        209,
+        302,
+        303,
+        304,
+        305,
+        306,
+        307,
+        308,
+        309
+      ],
+      "interval_ms": 62.5
+    },
+    "rtc_A1_d1": {
+      "action_indices": [
+        100,
+        201,
+        301
+      ],
+      "interval_ms": 62.5
+    },
+    "rtc_A4_d1": {
+      "action_indices": [
+        100,
+        101,
+        102,
+        103,
+        201,
+        202,
+        203,
+        204,
+        301,
+        302,
+        303,
+        304
+      ],
+      "interval_ms": 62.5
+    },
+    "rtc_A8_d2": {
+      "action_indices": [
+        100,
+        101,
+        102,
+        103,
+        104,
+        105,
+        106,
+        107,
+        202,
+        203,
+        204,
+        205,
+        206,
+        207,
+        208,
+        209,
+        302,
+        303,
+        304,
+        305,
+        306,
+        307,
+        308,
+        309
+      ],
+      "interval_ms": 62.5
+    },
+    "ready_after_nominal_tick": {
+      "complete_past_tick_ms": 5,
+      "consumed_past_tick_ms": 12,
+      "interval_ms": 62.5
+    },
+    "slow_read": {
+      "read_ms": 70,
+      "slot_ms": 62.5,
+      "sends": 0,
+      "reason": "dispatch_deadline_expired"
+    },
+    "handoff_not_ready": {
+      "sends": 4,
+      "reason": "handoff_result_not_ready"
+    },
+    "missed_slot": {
+      "sends": 0,
+      "reason": "missed_slot: expected=0, actual=1"
+    },
+    "revoked": {
+      "sends": 0,
+      "reason": "owner_authority_revoked"
+    },
+    "expired": {
+      "sends": 0,
+      "reason": "dispatch_deadline_expired"
+    },
+    "retired_result": "discarded without sending",
+    "wait_budget": "wait_timeout",
+    "horizon_alignment": "A+d>P remains rejected",
+    "XHand_reads": "CRC / comm / joint failures rejected; partial tactile and thumb mapping preserved",
+    "XHand_send": "overcurrent preserved as 1501035; UNKNOWN delivery; CRC remains unconfirmed",
+    "reset_complete": "sdk_completed (5/5)",
+    "reset_cancel": "cancelled (2/5)",
+    "reset_error": "failed (0/5), sensor=0x11, code=1",
+    "reset_metadata": "T key and driver -> recording metadata matched; no writer or device",
+    "policy_sdk_error": "one stop; one row attempt; partial result and original failure preserved",
+    "policy_revoked_partial": "one stop; one row attempt; partial result and original failure preserved",
+    "policy_interrupt": "one stop; one row attempt; partial result and original failure preserved",
+    "policy_writer_error": "one stop; one row attempt; partial result and original failure preserved",
+    "policy_sdk_and_writer_error": "one stop; one row attempt; partial result and original failure preserved",
+    "hardware": "no hardware SDK loaded; only in-memory fake calls"
+  },
+  "source_sha256": {
+    "dexmani_real/deployment/runner.py": "8128c5ffb8bb20eed14db0ae9224e0fcc1f23bd8a2c11be931926b3724990778",
+    "dexmani_real/deployment/config.py": "f4400efadab5cc7c2bca4860a0f1aac2ee5f267c33670d81e6b5a1490d876586",
+    "dexmani_real/deployment/session.py": "f8be97f73ebbfa6503c9c48bdc2475989c7e309a952abc40ac00ccd90cde9012",
+    "dexmani_real/robot/drivers/xhand.py": "68e96b51815a316ee02a2982251b14baecf0729e244231b9b9da2c576fdf7010"
+  }
+}

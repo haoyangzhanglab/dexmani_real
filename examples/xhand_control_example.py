@@ -6,13 +6,12 @@ python examples/xhand_control_example.py --config local.yaml --read-only
 python examples/xhand_control_example.py --print-config
 
 参数：--config 指定手部配置；--read-only 仍连接设备但不发动作，--print-config 不连接设备。
-动作反馈遇到 RS485 CRC 时，在反馈时限内最多重读两次；不重发动作或使用 CRC 帧确认到位。
+读写与正式运行共用驱动；普通发送遇到 CRC 后继续读取关节反馈，不额外重发动作。
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import signal
 import stat
@@ -21,14 +20,14 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import yaml
 
 from dexmani_real.config.experiment import config_as_dict, load_experiment_config
 from dexmani_real.config.hardware import HandParams
-from dexmani_real.robot.drivers.xhand import READ_USABLE_CODES, XHand, XHandSendStatus
+from dexmani_real.robot.commands import DispatchStatus
+from dexmani_real.robot.drivers.xhand import XHand
 from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
@@ -36,31 +35,9 @@ from dexmani_real.robot.model import (
 from dexmani_real.utils.limits import validate_hand_command_bounds
 from dexmani_real.utils.log import configure_logging
 
-_RS485_COMBINED_FORCE_ERROR_CODE = 1_501_018
-_RS485_DISTRIBUTED_FORCE_ERROR_CODE = 1_501_019
-_RS485_TEMPERATURE_ERROR_CODE = 1_501_020
-_RS485_TACTILE_STATUS_CODES = frozenset(
-    {
-        _RS485_COMBINED_FORCE_ERROR_CODE,
-        _RS485_DISTRIBUTED_FORCE_ERROR_CODE,
-        _RS485_TEMPERATURE_ERROR_CODE,
-    }
-)
-_RS485_TACTILE_STATUS_DETAIL = {
-    _RS485_COMBINED_FORCE_ERROR_CODE: (
-        "combined force unavailable; force frame invalidated conservatively"
-    ),
-    _RS485_DISTRIBUTED_FORCE_ERROR_CODE: "distributed force unavailable; combined force retained",
-    _RS485_TEMPERATURE_ERROR_CODE: "temperature unavailable; force fields retained",
-}
-_RS485_CRC_ERROR_CODE = 1_501_070
-_RS485_READ_CRC_RETRY_COUNT = 2
-_RS485_CRC_RETRY_BACKOFF_S = 0.08
 _HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
 _FEEDBACK_POLL_INTERVAL_S = 0.01
 _CONVERGENCE_SAMPLES = 3
-_STOP_RETRY_TIMEOUT_S = 0.25
-_STOP_RETRY_COUNT = 26
 _ACTION_DWELL_S = 1.0
 
 # XHand1 example targets in degrees; HOME/palm use the current configuration.
@@ -100,7 +77,7 @@ def _action_sequence(config: HandParams) -> list[tuple[str, np.ndarray]]:
 
 
 class XHandControlExample(XHand):
-    """Raw SDK inspection alongside the existing driver's action/stop primitives."""
+    """Inspect and exercise the same read/send/stop path used by the runtime."""
 
     def __init__(self, config: HandParams, *, cancel_requested=lambda: False) -> None:
         super().__init__(config)
@@ -143,209 +120,68 @@ class XHandControlExample(XHand):
 
         print(f"  hand_type:     {self.device_identity['hand_type']}")
 
-    def _read_state_response(self, force_update: bool, *, label: str) -> tuple[Any, Any]:
-        """Read state and retry only an RS485 CRC on a live transaction."""
-        self.check_cancelled()
-        error_struct, state = self._control.read_state(self.cfg.device_id, force_update)
-        self.check_cancelled()
-        code = int(error_struct.error_code)
-        if self.cfg.comm_type == "serial" and force_update:
-            for retry_index in range(1, _RS485_READ_CRC_RETRY_COUNT + 1):
-                if code != _RS485_CRC_ERROR_CODE:
-                    break
-                print(
-                    f"  {label}: CRC ERROR; retrying the live state request "
-                    f"({retry_index}/{_RS485_READ_CRC_RETRY_COUNT}) after "
-                    f"{_RS485_CRC_RETRY_BACKOFF_S:.2f}s"
-                )
-                time.sleep(_RS485_CRC_RETRY_BACKOFF_S)
-                self.check_cancelled()
-                error_struct, state = self._control.read_state(self.cfg.device_id, force_update)
-                self.check_cancelled()
-                code = int(error_struct.error_code)
-        return error_struct, state
-
-    def read_state(self, finger_id: int = 2, force_update: bool = True) -> bool:
+    def read_state(self, finger_id: int = 2) -> bool:
         self._header(f"Read state (finger {finger_id})")
-        error_struct, state = self._read_state_response(force_update, label="read_state")
-        code = int(error_struct.error_code)
+        self.check_cancelled()
+        state = self.get_state()
+        self.check_cancelled()
         if state is None:
-            print(
-                "  read_state error: SDK returned no state "
-                f"(error_code={code} msg={error_struct.error_message})"
-            )
+            print("  Joint feedback unavailable")
             return False
-        tactile_status = self.cfg.comm_type == "serial" and code in _RS485_TACTILE_STATUS_CODES
-        crc_status = code == _RS485_CRC_ERROR_CODE
-        if code not in READ_USABLE_CODES:
-            print(f"  read_state error: {error_struct.error_message} (error_code={code})")
-            return False
-        try:
-            qpos, current, _ = self._parse_joints(state)
-        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
-            print(f"  Joint payload unusable: {exc} (error_code={code})")
-            return False
-        print("  joint positions (deg, SDK ids 0..11):", np.rad2deg(qpos).round(3).tolist())
-        print("  joint currents (mA; NaN means unavailable):", current.tolist())
-        combined_force_valid = code == 0 or (
-            self.cfg.comm_type == "serial"
-            and code
-            in {
-                _RS485_DISTRIBUTED_FORCE_ERROR_CODE,
-                _RS485_TEMPERATURE_ERROR_CODE,
-            }
-        )
-        distributed_force_valid = code == 0 or (
-            self.cfg.comm_type == "serial" and code == _RS485_TEMPERATURE_ERROR_CODE
-        )
-        temperature_valid = code == 0 or (
-            self.cfg.comm_type == "serial"
-            and code in {_RS485_COMBINED_FORCE_ERROR_CODE, _RS485_DISTRIBUTED_FORCE_ERROR_CODE}
-        )
-        if crc_status:
-            print("  read_state: JOINTS USABLE; CRC UNCONFIRMED; SENSOR UNAVAILABLE; continuing")
-        elif tactile_status:
-            print(
-                "  read_state: JOINTS OK; SENSOR PARTIALLY DEGRADED  "
-                f"(error_code={code} msg={error_struct.error_message}; "
-                f"{_RS485_TACTILE_STATUS_DETAIL[code]})"
-            )
-
-        f = next(joint for joint in state.finger_state if int(joint.id) == finger_id)
-        print(f"  id={f.id}  temp={f.temperature}  temp&0xFF={f.temperature & 0xFF}")
+        print("  joint positions (deg, SDK ids 0..11):", np.rad2deg(state.qpos).round(3).tolist())
+        print("  joint currents (mA; NaN means unavailable):", state.current_ma.tolist())
         print(
-            f"  comm_err={f.commboard_err}  joint_err={f.jonitboard_err}  tip_err={f.tipboard_err}"
+            f"  comm_err={state.commboard_err[finger_id]}  "
+            f"joint_err={state.jointboard_err[finger_id]}  tip_err={state.tipboard_err[finger_id]}"
         )
-
-        if f.id in XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID:
-            try:
-                sensor = state.sensor_data[XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID[f.id]]
-                if combined_force_valid:
-                    calc = sensor.calc_force
-                    print(
-                        f"  calc_pressure:       fx={calc.fx:.3f} fy={calc.fy:.3f} fz={calc.fz:.3f}"
-                    )
-                else:
-                    print("  calc_pressure:       unavailable")
-                if distributed_force_valid:
-                    raw_force = list(sensor.raw_force)
-                    raw_values = [
-                        float(value)
-                        for force in raw_force
-                        for value in (force.fx, force.fy, force.fz)
-                    ]
-                    raw_finite = all(math.isfinite(value) for value in raw_values)
-                    raw_abs_max = max((abs(value) for value in raw_values), default=0.0)
-                    print(
-                        "  raw_pressure:        "
-                        f"points={len(raw_force)} finite={raw_finite} max_abs={raw_abs_max:.3f}"
-                    )
-                else:
-                    print("  raw_pressure:        unavailable")
-                if temperature_valid:
-                    print(f"  sensor_temperature: {sensor.calc_temperature}")
-                else:
-                    print("  sensor_temperature: unavailable")
-            except (
-                AttributeError,
-                IndexError,
-                TypeError,
-                ValueError,
-                OverflowError,
-            ) as exc:
-                print(f"  sensor payload malformed: {exc}")
+        if finger_id in XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID:
+            index = XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID[finger_id]
+            force = state.tactile_aggregate[index]
+            print("  calc_pressure:", force.tolist() if np.isfinite(force).all() else "unavailable")
+            dense = state.tactile_dense[index]
+            if np.isfinite(dense).all():
+                print(f"  raw_pressure: points={len(dense)} max_abs={np.abs(dense).max():.3f}")
+            else:
+                print("  raw_pressure: unavailable")
         return True
 
     def _read_action_positions(
-        self, *, retry_crc: bool = False, action_deadline: float | None = None
-    ) -> tuple[np.ndarray, float, int]:
-        """Return trusted joints, read start time, and discarded CRC count.
-
-        Stop uses a single read even during cancellation. Motion reads may retry
-        within the freshness/action deadline, without sending another command.
-        """
-        feedback_started = time.monotonic()
-        feedback_deadline = feedback_started + self.cfg.feedback_max_age_s
-        deadline_reason = "feedback freshness"
-        if action_deadline is not None and action_deadline < feedback_deadline:
-            feedback_deadline = action_deadline
-            deadline_reason = "action"
-        retries = 0
-        while True:
-            if retry_crc:
-                self.check_cancelled()
-            started = time.monotonic()
-            if started >= feedback_deadline:
-                raise RuntimeError(
-                    f"action feedback exceeded {deadline_reason} deadline before live state read"
-                )
-            error, state = self._control.read_state(self.cfg.device_id, True)
-            if retry_crc:
-                self.check_cancelled()
-            code = int(error.error_code)
-            finished = time.monotonic()
-            if finished >= feedback_deadline:
-                raise RuntimeError(
-                    f"action feedback exceeded {deadline_reason} deadline "
-                    f"(read={finished - started:.3f}s, "
-                    f"feedback_window={finished - feedback_started:.3f}s, "
-                    f"budget={feedback_deadline - feedback_started:.3f}s, "
-                    f"error_code={code})"
-                )
-            if not (
-                retry_crc
-                and self.cfg.comm_type == "serial"
-                and code == _RS485_CRC_ERROR_CODE
-                and retries < _RS485_READ_CRC_RETRY_COUNT
-            ):
-                break
-            retries += 1
-            print(
-                f"  action feedback: CRC ERROR (error_code={code}); discarding frame, "
-                f"retrying live state request ({retries}/{_RS485_READ_CRC_RETRY_COUNT})"
-            )
-            # The diagnostic's 80 ms backoff can exhaust the motion freshness
-            # budget; use the normal feedback poll interval for motion reads.
-            remaining = feedback_deadline - time.monotonic()
-            if remaining > 0:
-                time.sleep(min(_FEEDBACK_POLL_INTERVAL_S, remaining))
-        # CRC-degraded frames remain inspectable but cannot authorize movement
-        # or establish convergence in this diagnostic.
-        if state is None or code not in READ_USABLE_CODES or code == _RS485_CRC_ERROR_CODE:
-            raise RuntimeError(f"unconfirmed action feedback (error_code={code})")
-        qpos, _, boards = self._parse_joints(state)
-        if np.any(boards["commboard_err"]) or np.any(boards["jointboard_err"]):
-            raise RuntimeError("action feedback reports a communication/joint board fault")
-        if time.monotonic() >= feedback_deadline:
-            raise RuntimeError(f"action feedback exceeded {deadline_reason} deadline during parsing")
-        return qpos, started, retries
+        self, *, action_deadline_ns: int | None = None
+    ) -> np.ndarray:
+        """One driver read bounded by feedback freshness and the action deadline."""
+        self.check_cancelled()
+        started_ns = time.monotonic_ns()
+        deadline_ns = started_ns + int(self.cfg.feedback_max_age_s * 1e9)
+        if action_deadline_ns is not None:
+            deadline_ns = min(deadline_ns, action_deadline_ns)
+        if time.monotonic_ns() >= deadline_ns:
+            raise RuntimeError("action feedback deadline expired before read")
+        state = self.get_state()
+        self.check_cancelled()
+        if time.monotonic_ns() >= deadline_ns:
+            raise RuntimeError("action feedback deadline expired during read")
+        if state is None:
+            raise RuntimeError("action joint feedback unavailable")
+        return state.qpos
 
     def execute_action(self, qpos_rad) -> None:
         target = _validate_target(qpos_rad, self.cfg)
+        self._read_action_positions()
         self.check_cancelled()
-        self._read_action_positions(retry_crc=True)
-        self.check_cancelled()
-        deadline = time.monotonic() + self.cfg.home_timeout_s
+        deadline_ns = time.monotonic_ns() + int(self.cfg.home_timeout_s * 1e9)
         self._motion_pending = True  # SDK exceptions do not establish non-delivery.
         status = self.send_action(target)
-        print(f"  send_action: {status.value}")
-        if status is not XHandSendStatus.ACCEPTED:
-            raise RuntimeError(f"action {status.value}; no motion command will be replayed")
+        print(f"  send_action: {status.name}")
+        if status not in (DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED):
+            raise RuntimeError(f"action rejected: {status.name}")
         tolerance_rad = np.deg2rad(self.cfg.home_tolerance_deg)
         consecutive = 0
-        while time.monotonic() < deadline:
-            self.check_cancelled()
+        while time.monotonic_ns() < deadline_ns:
             # Each live read has its own freshness window. The previous read
             # and send latency do not determine the age of this new sample.
-            measured, _, crc_retries = self._read_action_positions(
-                retry_crc=True,
-                action_deadline=deadline,
-            )
-            self.check_cancelled()
-            if time.monotonic() >= deadline:
+            measured = self._read_action_positions(action_deadline_ns=deadline_ns)
+            if time.monotonic_ns() >= deadline_ns:
                 break
-            if crc_retries:
-                consecutive = 0
             error_rad = float(np.max(np.abs(measured - target)))
             consecutive = consecutive + 1 if error_rad <= tolerance_rad else 0
             if consecutive >= _CONVERGENCE_SAMPLES:
@@ -357,36 +193,17 @@ class XHandControlExample(XHand):
     def stop_action(self) -> None:
         if not self._motion_pending:
             return
+        started_ns = time.monotonic_ns()
         try:
-            measured, read_started, _ = self._read_action_positions()
+            # Cleanup must still read/stop after the operator has cancelled.
+            state = self.get_state()
+            measured = None if state is None else state.qpos
         except Exception as exc:
             print(f"  Stop feedback unavailable ({exc}); requesting vendor passive mode")
-            measured, read_started = None, 0.0
-        deadline = time.monotonic() + _STOP_RETRY_TIMEOUT_S
-        for _ in range(_STOP_RETRY_COUNT):
-            # Match the runtime stop boundary: hold fresh measured joints;
-            # without trusted feedback, use vendor passive mode instead.
-            if (
-                measured is not None
-                and time.monotonic() - read_started <= self.cfg.feedback_max_age_s
-            ):
-                status = self.hold_current(measured)
-                stop_mode = "hold measured joints"
-            else:
-                status = self.set_passive()
-                stop_mode = "passive (motor effort disabled)"
-            if status is XHandSendStatus.ACCEPTED:
-                self._motion_pending = False
-                print(f"  Stop command accepted by SDK: {stop_mode}")
-                return
-            if status is XHandSendStatus.REJECTED:
-                raise RuntimeError("XHand stop command rejected")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            # Only stop commands may be retried; CRC never replays the action.
-            time.sleep(min(_FEEDBACK_POLL_INTERVAL_S, remaining))
-        raise RuntimeError("XHand stop remains CRC-unconfirmed")
+            measured, started_ns = None, 0
+        self.stop(measured, timestamp_ns=started_ns)
+        self._motion_pending = False
+        print("  Stop command accepted by SDK")
 
 
 def _serial_port_problem(serial_port: str) -> str | None:

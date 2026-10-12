@@ -234,7 +234,7 @@ def home_robot(shared, runtime, planner, *, robot, abort_requested) -> HomeResul
             config=ArmHomeConfig.from_runtime(runtime),
             cancel_requested=abort_requested,
             estop_requested=lambda: bool(shared.estop_request),
-            progress=print,
+            progress=logging.getLogger(__name__).debug,
             hand_state_max_age_s=(
                 runtime.hand.feedback_max_age_s if runtime.policy.hand_enabled else None
             ),

@@ -89,7 +89,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
         robot.check_services = lambda: supervisor.check() and keys.healthy
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         rate = LoopRate(cfg.control_hz, label="keyboard_teleop", busy_wait=False)
-        while shared.sensors.is_running.value and not shared.quit_requested and supervisor.check():
+        while shared.sensors.is_running.value and not shared.quit_requested:
             rate.wait()
             if shared.estop_request or shared.error_state or not keys.healthy:
                 break
@@ -120,21 +120,30 @@ def run_keyboard_experiment(runtime, *, no_hand):
                 home_down = pressed
                 continue
             home_down = pressed
+            dx, drpy = compute_cartesian_jog_delta(keys, cfg.delta_pos_m, cfg.delta_rpy_rad)
+            moving = np.any(dx) or np.any(drpy)
+            safety_state = int(shared.safety_state)
+            epoch = int(shared.run_id)
+            if moving and not pressed and safety_state == int(SafetyState.ARMED):
+                try:
+                    robot.prepare_streaming(epoch)
+                except DispatchError as exc:
+                    if not exc.revoked:
+                        raise
+                    robot.stop()
+                    command_qpos = command_pose = None
+                    continue
             row = read_observation(shared, runtime, robot, require_hand=runtime.policy.hand_enabled)
             if row is None:
                 command_qpos = None
                 command_pose = None
-                if int(shared.safety_state) == int(SafetyState.RUNNING):
+                if robot.stop_required:
                     revoke_motion(shared)
                     robot.stop()
                 continue
-            dx, drpy = compute_cartesian_jog_delta(keys, cfg.delta_pos_m, cfg.delta_rpy_rad)
-            moving = np.any(dx) or np.any(drpy)
             if not moving or pressed:
                 # Idle keeps Mode-6 authority and its last dispatched endpoint alive.
                 continue
-            safety_state = int(shared.safety_state)
-            epoch = int(shared.run_id)
             measured_qpos = row.arm["qpos"][0]
             baseline_qpos = command_qpos
             baseline_pose = command_pose

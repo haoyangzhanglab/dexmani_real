@@ -49,8 +49,8 @@ class _QueryTiming:
     values: dict
 
 
-def snapshot_recording_metadata(shared, *, collection_source, camera_calibration):
-    """Select the connected serial from the session snapshot, without file I/O."""
+def snapshot_recording_metadata(shared, *, collection_source, camera_calibration, hand):
+    """Snapshot camera geometry and the last hardware tare without device reads."""
     serial = shared.sensors.camera_serial.value.decode("utf-8")
     if not serial.strip():
         raise ValueError("recording START requires a nonempty camera serial")
@@ -75,6 +75,7 @@ def snapshot_recording_metadata(shared, *, collection_source, camera_calibration
         camera_geometry=geometry,
         camera_T_xarm_base_from_color=transform,
         depth_scale=float(shared.sensors.camera_depth_scale.value),
+        tactile_reset_metadata=hand.get_tactile_reset_metadata() if hand is not None else {},
     )
 
 
@@ -86,8 +87,6 @@ def _raw_row(row, command, result, timestamp):
     )
     if camera is None:
         raise ValueError("recording requires RGB-D from the current observation")
-    contact_valid = hand is not None and bool(hand["tactile_aggregate_valid"])
-    dense_valid = hand is not None and bool(hand["tactile_dense_valid"])
     values = {
         "timestamp": timestamp,
         "dispatch_status": (int(result.arm), int(result.hand)) if result is not None else (0, 0),
@@ -96,9 +95,9 @@ def _raw_row(row, command, result, timestamp):
         "arm_effort": arm["effort"],
         "hand_qpos": hand["qpos"] if hand is not None else np.full(12, np.nan),
         "hand_current": hand["current"] if hand is not None else np.full(12, np.nan),
-        "hand_contact": hand["tactile_aggregate"] if contact_valid else np.full((5, 3), np.nan),
+        "hand_contact": hand["tactile_aggregate"] if hand is not None else np.full((5, 3), np.nan),
         "hand_tactile_force": hand["tactile_dense"]
-        if dense_valid
+        if hand is not None
         else np.full((5, 120, 3), np.nan),
         "action_arm_joint_target": (
             command.arm_qpos
@@ -117,11 +116,6 @@ def _raw_row(row, command, result, timestamp):
             else np.full(12, np.nan)
         ),
     }
-    # Runtime flags may fail independently of joint telemetry. Never label a
-    # nonfinite payload usable, or serialize an invalid payload as finite zeros.
-    for name, valid in (("hand_contact", contact_valid), ("hand_tactile_force", dense_valid)):
-        if valid and not np.isfinite(values[name]).all():
-            raise ValueError(f"runtime tactile validity disagrees with {name} payload")
     if any(status not in range(5) for status in values["dispatch_status"]):
         raise ValueError("dispatch_status must contain status codes 0 through 4")
     data = {}
@@ -164,10 +158,6 @@ class AsyncEpisodeRecorder:
         return self._recording
 
     @property
-    def accepting_frames(self):
-        return self._recording and self._error is None
-
-    @property
     def staging_path(self):
         return self._temp_dir
 
@@ -191,6 +181,7 @@ class AsyncEpisodeRecorder:
         camera_geometry: RGBDGeometry,
         camera_T_xarm_base_from_color: object,
         depth_scale: float,
+        tactile_reset_metadata: dict[str, object],
     ) -> dict[str, object]:
         if not isinstance(task_label, str) or not task_label.strip():
             raise ValueError("task_label must be a non-empty string")
@@ -245,11 +236,12 @@ class AsyncEpisodeRecorder:
                 else {}
             ),
             "depth_scale": depth_scale_value,
+            **tactile_reset_metadata,
         }
 
     def start_episode(
         self, *, task_label, collection_source, camera_geometry,
-        camera_T_xarm_base_from_color, depth_scale, episode_name=None,
+        camera_T_xarm_base_from_color, depth_scale, tactile_reset_metadata, episode_name=None,
     ):
         self.check_error()
         if self._recording or (self._thread is not None and self._thread.is_alive()):
@@ -262,6 +254,7 @@ class AsyncEpisodeRecorder:
                 camera_geometry=camera_geometry,
                 camera_T_xarm_base_from_color=camera_T_xarm_base_from_color,
                 depth_scale=depth_scale,
+                tactile_reset_metadata=tactile_reset_metadata,
             )
             if episode_name is not None and (
                 type(episode_name) is not str or not episode_name
@@ -398,9 +391,7 @@ class AsyncEpisodeRecorder:
                 timing = data.create_group("timing")
                 timing.attrs.update(clock="host_monotonic_ns", missing_value=-1)
                 timing.attrs.update(
-                    camera_timestamp_source="sdk_global_or_system_mapped_to_monotonic; "
-                                            "hardware_clock_uses_first_host_receive",
-                    camera_sdk_clock="per_channel_timestamp_domain: 0=hardware, 1=system, 2=global",
+                    camera_timestamp_source="oldest_channel_first_host_receive_monotonic",
                 )
                 row_times = timing.create_dataset("rows", shape=(0,), maxshape=(None,), dtype=TIMING_ROW_DTYPE)
                 queries = timing.create_dataset("queries", shape=(0,), maxshape=(None,), dtype=h5py.string_dtype())
@@ -497,8 +488,9 @@ class AsyncEpisodeRecorder:
                 if finish is not None and finish.save and (self._written_frames or query_indices or finish.timing is not None):
                     atomic_publish(staging, destination, cancelled=self._cancelled.is_set)
                     self._published_path = destination
-                    logger.info("Episode saved: %s frames=%d reason=%s", destination,
-                                self._written_frames, finish.reason)
+                    logger.info("Raw 已保存：%s（%d 帧）。", destination.name, self._written_frames)
+                    logger.debug("Episode saved: %s frames=%d reason=%s", destination,
+                                 self._written_frames, finish.reason)
                 else:
                     shutil.rmtree(staging)
                 self._temp_dir = None

@@ -1,4 +1,4 @@
-"""xArm SDK boundary: live feedback, target limits and controller return codes.
+"""xArm SDK boundary: live feedback and controller return codes.
 
 Streaming uses Mode 6; HOME executes prevalidated milestones in Mode 0,
 restores Mode 6 and checks position/velocity stability. HomeAborted lets the
@@ -16,8 +16,7 @@ from typing import Any, Callable
 import numpy as np
 
 from dexmani_real.config.hardware import ArmParams
-from dexmani_real.robot.command_validation import check_arm_target
-from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_HARD_LOWER, XARM7_HARD_UPPER
+from dexmani_real.robot.model import ARM_JOINT_SHAPE
 from dexmani_real.utils.log import (
     capture_native_stdout,
     extract_native_diagnostics,
@@ -229,16 +228,9 @@ class XArm7:
     def servo(self, qpos: np.ndarray) -> int:
         """Send one Mode-6 servo endpoint [rad].
 
-        Returns the SDK return code (0 = accepted); the caller owns the
-        non-zero escalation.
+        The Robot owner checks both device targets before dispatch. Return the
+        SDK code (0 = accepted), without waiting for physical arrival.
         """
-        issue = check_arm_target(
-            qpos,
-            joint_limit_lower_rad=np.asarray(XARM7_HARD_LOWER),
-            joint_limit_upper_rad=np.asarray(XARM7_HARD_UPPER),
-        )
-        if issue:
-            raise ValueError(f"unsafe arm target: {issue}")
         return int(
             self._api.set_servo_angle(
                 angle=qpos,

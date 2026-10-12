@@ -1,0 +1,34 @@
+{
+  "kind": "xhand_tactile_diagnostic",
+  "motion_commands_sent": 0,
+  "hardware_reset_sent": false,
+  "not_a_training_raw_episode": true,
+  "identity": {
+    "backend": "hardware",
+    "hand_type": "R",
+    "sdk_version": "1.4.2",
+    "serial_number": "012R320220251128022"
+  },
+  "tare_updated": [
+    true,
+    true
+  ],
+  "missing_reads": [],
+  "reads": 100,
+  "tactile_aggregate": {
+    "nonfinite": 0,
+    "absmax": 0.0
+  },
+  "tactile_dense": {
+    "nonfinite": 0,
+    "absmax": 0.0
+  },
+  "qpos": {
+    "nonfinite": 0,
+    "absmax": 0.9977171421051025
+  },
+  "bias_absmax": [
+    0.0,
+    0.0
+  ]
+}

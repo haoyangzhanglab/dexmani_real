@@ -1,0 +1,72 @@
+{
+  "cases": {
+    "teleop_jitter_0ms_recording_False": "sent; actual timestamps retained",
+    "teleop_jitter_5ms_recording_False": "sent; actual timestamps retained",
+    "teleop_jitter_16ms_recording_False": "sent; actual timestamps retained",
+    "teleop_jitter_0ms_recording_True": "sent; actual timestamps retained",
+    "teleop_jitter_5ms_recording_True": "sent; actual timestamps retained",
+    "teleop_jitter_16ms_recording_True": "sent; actual timestamps retained",
+    "missed_slot_recording_False": "stopped; no target sent",
+    "missed_slot_recording_True": "stopped; no target sent",
+    "read_overrun_recording_False": "stopped; no target sent",
+    "read_overrun_recording_True": "stopped; no target sent",
+    "invalid_target_recording_False": "stopped; no target sent",
+    "invalid_target_recording_True": "stopped; no target sent",
+    "stop_between_devices": {
+      "arm": "ACCEPTED",
+      "hand": "NOT_CALLED",
+      "stop_before_record": true
+    },
+    "deadline_between_devices": {
+      "arm": "ACCEPTED",
+      "hand": "NOT_CALLED",
+      "stop_before_record": true
+    },
+    "arm_rejected": {
+      "arm": "REJECTED",
+      "hand": "NOT_CALLED",
+      "stop_before_record": true
+    },
+    "hand_exception": {
+      "arm": "ACCEPTED",
+      "hand": "UNKNOWN",
+      "stop_before_record": true
+    },
+    "hand_interrupt": {
+      "arm": "ACCEPTED",
+      "hand": "UNKNOWN",
+      "stop_before_record": true
+    },
+    "late_hand_return": {
+      "arm": "ACCEPTED",
+      "hand": "ACCEPTED",
+      "stop_before_record": true
+    },
+    "bad_hand": "neither SDK called; no implicit mode switch",
+    "bad_arm": "neither SDK called; no implicit mode switch",
+    "not_prepared": "neither SDK called; no implicit mode switch",
+    "stop_unconfirmed": "neither SDK called; no implicit mode switch",
+    "prepare_cancel_False": "prepared",
+    "prepare_cancel_True": "revocation preserved",
+    "teleop_start_lifecycle": "mode prepared once; fresh read; no idle re-stop before first send",
+    "replay_start_cancel_False": "completed",
+    "replay_start_cancel_True": "rejected",
+    "calibration_start_cancel_False": "IK uses post-mode feedback",
+    "calibration_start_cancel_True": "no send",
+    "failed_stop": "fault retained; capture attempted once; no normal idle reported",
+    "arm_driver": "one set_servo_angle(wait=False); no post-send read"
+  },
+  "hardware": "fake I/O only; no SDK loaded",
+  "source_sha256": {
+    "robot/robot.py": "191fac65ba99def7c5f27b7156a138322141b669b2b965ac0e8b94a71e2904d9",
+    "robot/drivers/xarm7.py": "71a337fd420f8556aefde8d470263e41686164c6a2a88bf8faaa4d321f42d640",
+    "robot/action.py": "28abc80beeb8e6ab31e26ff18bf870654cd4aa77fa18b07e4180153fb4e07f64",
+    "robot/projection.py": "6b422ceb5fe2cf3ad745b1170a04532fcb64c06fc79583398ed2ed48c49f1237",
+    "teleop/control/controller.py": "d364611b346ea50fefab7f2ad9a932fcf3daabb0870d36559a3f050be090ea70",
+    "teleop/runner.py": "1b00126066905b04260971c1e7548c44ec688058282578f4c1da84a72d4b2cd1",
+    "teleop/keyboard_session.py": "0b050a67987366de7dd77be5071c178ec1909cc1b8cda0fe7eaf4e6144e459d7",
+    "deployment/runner.py": "8128c5ffb8bb20eed14db0ae9224e0fcc1f23bd8a2c11be931926b3724990778",
+    "replay/replayer.py": "32fc6082ca3d187a56406abecf6c11bee64ac7cf5b80d768b5f8e187c1ab0959",
+    "calibration/camera/motion.py": "e12ef7e9a2ebcb8519670e94b5a413c9e5bc0716de7a26f976f17f6faf0e4668"
+  }
+}

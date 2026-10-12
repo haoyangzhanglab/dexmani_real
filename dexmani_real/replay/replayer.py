@@ -149,7 +149,7 @@ def replay_targets(
     shared, runtime, trajectory, keyboard, *, robot, hand_start_duration_s, results=None
 ):
     failure_details = []
-    epoch = None
+    epoch = int(shared.run_id)
     capture = ReplayRecorder(trajectory.num_frames)
     status, reason = ReplayStatus.COMPLETED, ""
     run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
@@ -157,6 +157,7 @@ def replay_targets(
         if results is not None:
             results.begin_episode()
         fk = make_arm_fk()
+        robot.prepare_streaming(epoch)
         row = read_observation(shared, runtime, robot)
         if row is None:
             status, reason = ReplayStatus.REJECTED, "fresh robot feedback unavailable"
@@ -189,9 +190,12 @@ def replay_targets(
                 or np.any(target > runtime.hand.qpos_max_rad)
             ):
                 status, reason = ReplayStatus.REJECTED, "hand preparation target violates limits"
-        if status == ReplayStatus.COMPLETED and not begin_motion(shared):
-            status, reason = ReplayStatus.REJECTED, "motion authority unavailable"
-        epoch = int(shared.run_id)
+        if status == ReplayStatus.COMPLETED:
+            with shared.motion_lock:
+                if int(shared.run_id) != epoch or not begin_motion(shared):
+                    status, reason = ReplayStatus.REJECTED, "motion authority unavailable"
+                else:
+                    epoch = int(shared.run_id)
         if results is not None and status == ReplayStatus.COMPLETED:
             results.entered(epoch)
         if status == ReplayStatus.COMPLETED and hand_start_duration_s > 0:

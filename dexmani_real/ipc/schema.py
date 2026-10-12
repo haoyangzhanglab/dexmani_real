@@ -78,9 +78,7 @@ HAND_STATE_DTYPE = np.dtype(
         ("qpos", "<f8", HAND_JOINT_SHAPE),
         ("current", "<f8", HAND_JOINT_SHAPE),
         ("tactile_aggregate", "<f4", HAND_TACTILE_SUM_SHAPE),
-        ("tactile_aggregate_valid", "u1"),
         ("tactile_dense", "<f4", HAND_TACTILE_FORCE_SHAPE),
-        ("tactile_dense_valid", "u1"),
         ("timestamp_ns", "<u8"),
     ]
 )
@@ -107,17 +105,11 @@ VR_FRAME_DTYPE = np.dtype(
 
 CAMERA_FRAME_HEADER_DTYPE = np.dtype(
     [
-        # Oldest RGB/depth source in host monotonic time; never cloud completion.
+        # Oldest channel's first host receive time; repeated frames retain it.
         ("timestamp_ns", "<u8"),
         ("received_ns", "<u8"),
         ("depth_frame_number", "<u8"),
         ("color_frame_number", "<u8"),
-        # SDK timestamps retain their per-channel domains (0=hardware, 1=system,
-        # 2=global). Global/system clocks are mapped to monotonic by the driver.
-        ("depth_sdk_ns", "<i8"),
-        ("color_sdk_ns", "<i8"),
-        ("depth_timestamp_domain", "<i4"),
-        ("color_timestamp_domain", "<i4"),
     ],
     align=True,
 )

@@ -15,7 +15,6 @@ from dexmani_real.deployment.config import (
     validate_max_running_s,
     validate_num_episodes,
     validate_policy_runtime_compatibility,
-    validate_warmup_budget,
 )
 from dexmani_real.deployment.observation import build_observation_kinematics
 from dexmani_real.deployment.operator import PolicyOperator
@@ -63,7 +62,7 @@ def _load_configured_policy(policy_config, execution_config):
         raise
 
 
-def _warmup_policy(model, runtime, info, execution_config, *, max_running_s=None):
+def _warmup_policy(model, runtime, execution_config):
     model.submit(
         "load",
         samples=5,
@@ -76,17 +75,7 @@ def _warmup_policy(model, runtime, info, execution_config, *, max_running_s=None
         time.sleep(0.005)
     if completion[1].error is not None:
         raise completion[1].error
-    durations = completion[1].value
-    validate_warmup_budget(durations, execution_config, info, max_running_s=max_running_s)
-    logger.info("Model warmup durations (not realtime bounds): %s", durations)
-    if execution_config.execution_mode != "sync":
-        import math
-
-        suggested = math.ceil(max(durations["steady"]) / info.control_dt_s) + 1
-        logger.info(
-            "Model-only prefetch suggestion d=%d; measure owner prefix/input overhead separately",
-            suggested,
-        )
+    logger.debug("Model warmup durations: %s", completion[1].value)
 
 
 def run_policy_deployment(
@@ -96,7 +85,7 @@ def run_policy_deployment(
     *,
     prefix=None,
     max_running_s=None,
-    num_episodes=1,
+    num_episodes=20,
     recording_config=None,
     results_dir=None,
     camera_calibration_path=None,
@@ -109,7 +98,7 @@ def run_policy_deployment(
     info = policy_config.info
     cloud_recipe = validate_policy_runtime_compatibility(info, runtime)
     max_running_s = validate_max_running_s(max_running_s)
-    execution_config = runtime.execution.validate(info, max_running_s=max_running_s)
+    execution_config = runtime.execution.validate(info)
     validate_robot_config(runtime)
     if cloud_recipe is not None:
         runtime = replace(runtime, pointcloud=cloud_recipe)
@@ -160,8 +149,8 @@ def run_policy_deployment(
         supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
         robot = DexManiRobot(shared, runtime, check_services=supervisor.check)
         model = InferenceWorker(lambda: _load_configured_policy(policy_config, execution_config))
-        _warmup_policy(model, runtime, info, execution_config, max_running_s=max_running_s)
-        logger.info(
+        _warmup_policy(model, runtime, execution_config)
+        logger.debug(
             "Validated policy: inputs=%s action=%s dt=%s N/H/A_exec=%s/%s/%s mode=%s d=%s beta=%s recording=%s; "
             "cadence/cloud recipe from saved Policy, physical configuration from Real",
             info.observation_fields,
@@ -213,7 +202,7 @@ def run_policy_deployment(
             home_planner,
             robot=robot,
             execute=execute,
-            idle_for_tare=lambda: (
+            idle_for_tactile_reset=lambda: (
                 runner.run_id is None
                 and runner.preparing_epoch is None
                 and not shared.start_request
@@ -222,8 +211,6 @@ def run_policy_deployment(
             ),
         )
         operator.keyboard.start()
-        print("空闲且确认手部无接触后按 T 归零触觉；S/Q/ESC 可取消。"
-              "dense 仅检查载荷/残差有限，不验证稳定性或无接触。", flush=True)
         robot.check_services = lambda: supervisor.check() and operator.keyboard.healthy
         runner = PolicyRunner(
             shared,
@@ -242,6 +229,12 @@ def run_policy_deployment(
             task_label=recording_config.task_label if recording_config is not None else None,
             camera_calibration=camera_calibration,
             results=results,
+        )
+        start_hint = "H 回初始位 → B 开始" if execute else "B 开始推理"
+        print(
+            f"就绪（无需回车）：{start_hint} | S 结束本轮 | Q 退出 | Esc 急停 | "
+            "T 请求复位触觉（空闲且无接触）。",
+            flush=True,
         )
         runner.run()
         clean = bool(

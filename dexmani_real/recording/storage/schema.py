@@ -6,17 +6,17 @@ sources and inference start/completion. ``timing/termination`` is a separate
 JSON boundary record, including a pending query and its deadline when present.
 Missing row values are -1; unavailable query times are null. Completion after
 Raw publication never rewrites these records. Source/pipeline clocks use host
-monotonic ns. Camera SDK timestamps separately retain their per-channel domains
-(0=hardware, 1=system, 2=global); global/system source times are mapped to monotonic,
-hardware-only sources use first host receive time. These are not guaranteed
-exposure-midpoint or achieved-motion clocks. Missing timing columns in older Raw
-remain unavailable, without rewriting or filling historical evidence.
+monotonic ns. Camera and point-cloud age starts at the oldest channel's first
+host receive time, before alignment/copying. It excludes camera/USB/SDK latency
+before receipt. Missing timing columns remain unavailable, without rewriting or
+filling historical evidence.
 """
 
 from dataclasses import dataclass
 
 import numpy as np
 
+from dexmani_real.robot.commands import DispatchStatus
 from dexmani_real.utils.control_clock import sampling_clock_ns
 
 RAW_FORMAT = "dexmani.raw"
@@ -40,12 +40,11 @@ DATASET_SPECS = {
     "arm_effort": _spec(np.float64, (7,)),
     "hand_qpos": _spec(np.float64, (12,)),
     "hand_current": _spec(np.float64, (12,)),
-    # XHand SDK-native, bias-corrected aggregate tactile values. Invalid
-    # aggregate samples are represented by NaN.
+    # XHand SDK-native tactile values; T only requests a sensor reset.
+    # Unusable reads remain NaN independently per channel.
     "hand_contact": _spec(np.float32, (5, 3)),
-    # XHand SDK-native, bias-corrected dense tactile values. Invalid dense
-    # samples are represented by NaN independently of aggregate tactile state.
     "hand_tactile_force": _spec(np.float32, (5, 120, 3)),
+    # Attempted absolute targets; dispatch preserves the outcome, not arrival.
     "action_arm_joint_target": _spec(np.float64, (7,)),
     "action_hand_joint_target": _spec(np.float64, (12,)),
     # Seconds relative to the first observation; dispatch columns are arm, hand.
@@ -89,11 +88,15 @@ def validate_training_rows(timestamp, dispatch_status, control_hz) -> tuple[str,
         return (f"timing row {row}: interval_ns={intervals[row - 1]:.0f}, "
                 f"nominal_ns={dt_ns}, grid_deviation_ns={deviations[row]:.0f}, "
                 f"tolerance_ns={epsilon_ns}",)
-    bad_dispatch = np.flatnonzero(np.any(np.asarray(dispatch_status) != 1, axis=1))
+    dispatch = np.asarray(dispatch_status)
+    bad_dispatch = np.flatnonzero(
+        (dispatch[:, 0] != DispatchStatus.ACCEPTED)
+        | ~np.isin(dispatch[:, 1], (DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED))
+    )
     if len(bad_dispatch):
         row = int(bad_dispatch[0])
         return (f"dispatch row {row}: arm/hand={list(dispatch_status[row])}; "
-                "training requires [1, 1] (SDK ACCEPTED)",)
+                "training requires arm ACCEPTED (1), hand ACCEPTED or CRC_UNCONFIRMED (1 or 2)",)
     return ()
 
 
@@ -107,8 +110,7 @@ TIMING_REQUIRED_FIELDS = (
     "prediction_index", "submit_started_ns", "submit_completed_ns",
 )
 TIMING_ROW_DTYPE = np.dtype([(name, "<i8") for name in TIMING_REQUIRED_FIELDS + (
-    "camera_received_ns", "camera_published_ns", "camera_depth_sdk_ns", "camera_color_sdk_ns",
-    "camera_depth_timestamp_domain", "camera_color_timestamp_domain",
+    "camera_received_ns", "camera_published_ns",
     "camera_depth_frame_number", "camera_color_frame_number",
     "pointcloud_camera_received_ns", "pointcloud_camera_published_ns",
     "pointcloud_started_ns", "pointcloud_published_ns",

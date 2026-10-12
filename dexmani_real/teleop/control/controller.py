@@ -1,30 +1,18 @@
-"""Current-row teleop mapping, absolute target dispatch and raw recording."""
+"""Current-row teleop mapping and commit of dispatched absolute targets."""
 
-import logging
-import time
-
-from typing import NamedTuple
 
 import numpy as np
 
-from dexmani_real.recording.recorder import RecordingError
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
 from dexmani_real.robot.action import ActionIntent
-from dexmani_real.robot.commands import RobotCommand
-from dexmani_real.robot.robot import DispatchError, DispatchInterrupted
-from dexmani_real.runtime.observation import feedback_deadline_ns
-from dexmani_real.runtime.safety import RunEndReason, revoke_motion_if_run_id
 from dexmani_real.teleop.control.action_proposal import compute_target_eef_pose
 from dexmani_real.teleop.control.hand_retargeting import (
     HandRetargetObservationCache,
     compute_hand_command,
     reset_hand_retargeter,
 )
-
-
-logger = logging.getLogger(__name__)
 
 
 class TeleopController:
@@ -96,104 +84,3 @@ class TeleopController:
         self.previous_arm_command = realization.arm_qpos.copy()
         self.smoothed_eef_position = realization.eef_pose[:3].copy()
         self.smoothed_eef_quaternion = rot6d_to_quat_wxyz(realization.eef_pose[3:])
-
-
-class ControlStepResult(NamedTuple):
-    target_dispatched: bool
-    dispatch: object
-    interrupted: bool
-
-
-def execute_control_step(
-    controller, shared, robot, row, recorder=None, *, action_deadline_ns, termination_details=None
-):
-    epoch = int(shared.run_id)
-    realization = target = result = failure = stop_error = None
-    control_ok = interrupted = False
-    try:
-        try:
-            realization = controller.compute_target(row)
-            control_ok = realization is not None and realization.arm_qpos is not None
-            if control_ok:
-                target = RobotCommand(epoch, realization.arm_qpos, realization.hand_qpos)
-            if recorder is not None:
-                recorder.check_error()
-            if target is not None:
-                result = robot.send_action(
-                    target,
-                    valid_until_ns=min(
-                        action_deadline_ns,
-                        feedback_deadline_ns(row, controller.runtime, include_vr=True),
-                    ),
-                )
-        except BaseException as exc:
-            failure = exc
-            if isinstance(exc, (DispatchError, DispatchInterrupted)):
-                result = exc.result
-            cancelled = isinstance(exc, KeyboardInterrupt)
-            cause = getattr(exc, "cause", None)
-            if termination_details is not None:
-                termination_details.append(dict(
-                    stage="control", exception_type=type(exc).__name__, message=str(exc), cause=cause,
-                ))
-            if cancelled:
-                shared.estop_request = True
-            revoke_motion_if_run_id(
-                shared, epoch,
-                reason=RunEndReason.ESTOP if cancelled else
-                RunEndReason.RECORDING_FAILURE if isinstance(exc, RecordingError) else
-                RunEndReason.EXECUTOR_BOUNDARY if getattr(exc, "revoked", False) else
-                RunEndReason.HARDWARE_FAULT if isinstance(exc, DispatchError) else
-                RunEndReason.POLICY_FAILURE,
-            )
-        if not control_ok and recorder is not None:
-            if termination_details is not None:
-                termination_details.append(dict(
-                    stage="control", reason="target_unavailable",
-                    rejection=getattr(realization, "rejection_reason", None),
-                ))
-            revoke_motion_if_run_id(shared, epoch, reason=RunEndReason.EXECUTOR_BOUNDARY)
-        expired = time.monotonic_ns() >= action_deadline_ns
-        if expired:
-            if termination_details is not None:
-                termination_details.append(dict(
-                    stage="dispatch", reason="action_deadline_expired",
-                    deadline_ns=action_deadline_ns, returned_ns=time.monotonic_ns(),
-                ))
-            # A blocking SDK may have accepted a target; retain its actual status.
-            revoke_motion_if_run_id(shared, epoch, reason=RunEndReason.EXECUTOR_BOUNDARY)
-        interrupted = expired or failure is not None or int(shared.run_id) != epoch
-        if interrupted:
-            try:
-                robot.stop()
-            except Exception as exc:
-                stop_error = exc
-                if termination_details is not None:
-                    termination_details.append(
-                        dict(
-                            stage="dispatch_stop",
-                            exception_type=type(exc).__name__,
-                            message=str(exc),
-                        )
-                    )
-                if failure is not None:
-                    logger.exception("stop after dispatch also failed")
-        elif result is not None:
-            controller.commit_dispatched_target(realization)
-    finally:
-        if recorder is not None and (interrupted or recorder.accepting_frames):
-            try:
-                recorder.add_frame(row, target, result)
-            except Exception as exc:
-                if failure is not None:
-                    logger.exception("recording after dispatch also failed")
-                    raise failure from exc
-                raise
-    if failure is not None and not (
-        isinstance(failure, DispatchError) and failure.revoked
-        and failure.cause in {"authority_revoked", "deadline_expired"}
-    ):
-        raise failure
-    if stop_error is not None:
-        raise stop_error
-    return ControlStepResult(control_ok and not interrupted, result, interrupted)

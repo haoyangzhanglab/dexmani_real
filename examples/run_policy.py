@@ -11,6 +11,7 @@
     --checkpoint 默认 latest；也支持已有百分比 milestone、best 或文件名。
     --inference-steps 设置 NFE，--weights 选择 ema/raw；默认使用实验保存的评估设置。
     --n-action-steps 设置每段执行步数，默认使用策略的 n_action_steps。
+    默认最多评估 20 轮，每轮按 B 开始、S 结束；Q 提前退出，--num-episodes N 修改轮数。
     --no-record / --no-results 分别关闭 Raw / 评估摘要；--output 指定输出目录。
 
 执行模式通过 --config YAML 设置，默认 sync；异步示例：
@@ -92,10 +93,10 @@ def _parser() -> argparse.ArgumentParser:
         "--num-episodes",
         dest="num_episodes",
         type=_positive_int,
-        default=1,
+        default=20,
         help=(
-            "episodes to run; each truly begun episode counts once at its end, "
-            "independently of whether its recording saved"
+            "exit after N episodes (default: 20); press B for each episode or Q to exit early; "
+            "each truly begun episode counts once at its end, regardless of recording"
         ),
     )
     parser.add_argument(
@@ -103,7 +104,7 @@ def _parser() -> argparse.ArgumentParser:
         dest="max_running_s",
         type=_positive_running_seconds,
         default=60.0,
-        help="cooperative duration budget from RUNNING admission (default: 60 seconds)",
+        help="per-episode cooperative duration budget from RUNNING admission (default: 60 seconds)",
     )
     parser.add_argument(
         "--print-config",
@@ -264,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime = replace(runtime, execution=resolve_execution_config(
             runtime.execution, info, args.n_action_steps
         ))
-        runtime.execution.validate(info, max_running_s=args.max_running_s)
+        runtime.execution.validate(info)
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
         _safe_selector_parts(selector)
     except Exception as exc:
@@ -286,15 +287,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[SESSION] session setup failed: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Experiment: {info.experiment_dir}")
-    print(f"Checkpoint: {info.checkpoint_path.name} ({info.weights}); steps={info.inference_steps}")
-    print(f"Observations: {', '.join(info.observation_fields)}")
+    print(f"策略：{args.experiment}")
     print(
-        f"A_exec: {runtime.execution.action_steps}; "
-        f"source: {'CLI' if args.n_action_steps is not None else 'saved Policy default'}"
+        f"执行：{info.checkpoint_path.name} ({info.weights}) | NFE={info.inference_steps} | "
+        f"A_exec={runtime.execution.action_steps} | {runtime.execution.execution_mode} | "
+        f"{1.0 / info.control_dt_s:g} Hz"
     )
-    print(f"Episodes: {args.num_episodes}; cooperative budget={args.max_running_s:g} s")
-    print(f"Session: {session_dir}" if session_dir else "Session artifacts: disabled", flush=True)
+    print(f"评估：{args.num_episodes} 轮后退出 | 每轮预算 {args.max_running_s:g} s | 输入：{', '.join(info.observation_fields)}")
+    print(f"输出：{session_dir}" if session_dir else "输出：Raw 和评估摘要均关闭")
+    print("正在初始化模型和设备…", flush=True)
     try:
         from dexmani_real.deployment.session import run_policy_deployment
 

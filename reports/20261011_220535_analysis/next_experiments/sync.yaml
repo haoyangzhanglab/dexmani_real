@@ -1,0 +1,6 @@
+# Overlay on current package defaults. If a current custom hardware YAML is used,
+# merge this execution section into a copy of that YAML before the experiment.
+# A_exec is selected by --n-action-steps, not by a YAML action_steps field.
+execution:
+  execution_mode: sync
+  prefetch_steps: null

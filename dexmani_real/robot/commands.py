@@ -7,6 +7,8 @@ import numpy as np
 
 
 class DispatchStatus(IntEnum):
+    """Shared SDK outcome and Raw codes; CRC permits the next normal target."""
+
     NOT_CALLED = 0
     ACCEPTED = 1
     CRC_UNCONFIRMED = 2

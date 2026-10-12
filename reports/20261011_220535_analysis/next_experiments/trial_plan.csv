@@ -1,0 +1,9 @@
+trial_id,pair_id,condition,layout_id,seed,raw_path,outcome,note
+S01_1,S01,S0,P1,0,rollouts/maniflow/pick_place_toy/2026-10-11_02-00-52-803763_1cbdb2c1_1011/session_20261012_135345/episode_001,failure,现场确认失败；视频显示推转玩具后空抓并移向容器；22.1 s 手动停止，无 runtime error。
+S01_2,S01,S1,P1_approx,0,rollouts/maniflow/pick_place_toy/2026-10-11_02-00-52-803763_1cbdb2c1_1011/session_20261012_135924/episode_001,failure,视频显示推物后空抓；16.4 s 手动停止；仅近似复位，位置/朝向及光照存在差异；现场确认无额外异常。
+S02_1,S02,S1,P2,0,,,deferred_after_scheduler_mechanism_confirmed; prioritize async A4
+S02_2,S02,S0,P2,0,,,deferred_after_scheduler_mechanism_confirmed; prioritize async A4
+S03_1,S03,S0,P3,0,,,deferred_after_scheduler_mechanism_confirmed; prioritize async A4
+S03_2,S03,S1,P3,0,,,deferred_after_scheduler_mechanism_confirmed; prioritize async A4
+A01_1,A01,async_d1_A4,P1_approx,0,rollouts/maniflow/pick_place_toy/2026-10-11_02-00-52-803763_1cbdb2c1_1011/session_20261012_140158/episode_001,failure,现场确认：夹到玩具边缘，未形成稳定抓取，移动后掉落；14.9 s 手动停止；近似复位、日照变化；HOME 触觉告警，capture 数值有限。
+A01_2,,async_d1_A4,P2,0,rollouts/maniflow/pick_place_toy/2026-10-11_02-00-52-803763_1cbdb2c1_1011/session_20261012_140823/episode_001,failure,现场确认：抓住并搬运到容器附近，张手时放偏；19.0 s 手动停止；初始布局明显不同，不能视为同布局重复。另有 140632 准备 session 只归位后退出、无 episode，保留 session_result。

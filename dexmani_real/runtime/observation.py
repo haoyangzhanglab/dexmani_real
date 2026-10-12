@@ -164,7 +164,7 @@ def read_observation(
 
 
 def observation_timing(row):
-    """Source and pipeline clocks; SDK times retain their explicitly recorded domains."""
+    """Host observation and pipeline clocks in monotonic nanoseconds."""
     return dict(
         observation_ns=int(row.observation_timestamp_ns),
         control_ns=int(row.control_timestamp_ns),
@@ -175,8 +175,7 @@ def observation_timing(row):
         camera_sequence=int(row.camera["ring_sequence"]) if row.camera is not None else -1,
         pointcloud_camera_sequence=int(row.pointcloud_camera_sequence),
         **{f"camera_{name}": int(row.camera[name]) if row.camera is not None else -1
-           for name in ("received_ns", "published_ns", "depth_sdk_ns", "color_sdk_ns",
-                        "depth_timestamp_domain", "color_timestamp_domain",
+           for name in ("received_ns", "published_ns",
                         "depth_frame_number", "color_frame_number")},
         pointcloud_camera_received_ns=int(row.pointcloud_camera_received_ns),
         pointcloud_camera_published_ns=int(row.pointcloud_camera_published_ns),

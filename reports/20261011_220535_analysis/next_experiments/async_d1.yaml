@@ -1,0 +1,5 @@
+# Static configuration only; validation does not authorize or validate motion.
+# Keep policy dt=0.0625 s. Choose A_exec with --n-action-steps.
+execution:
+  execution_mode: async
+  prefetch_steps: 1

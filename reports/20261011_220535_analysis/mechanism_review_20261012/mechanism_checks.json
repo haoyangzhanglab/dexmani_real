@@ -1,0 +1,59 @@
+{
+  "scheduler": {
+    "source_sha256": "e91100b27b6b8d91b662c5d13834b06c53e041f9a4162ec500c61d0ad6fd8eae",
+    "early_cutoff": {
+      "nominal_ms": 625,
+      "ready_ms": 630,
+      "consumed_ms": 637,
+      "slot_end_ms": 687.5,
+      "outcome": "handoff_model_deadline_exceeded"
+    },
+    "slow_read": {
+      "slot_start_ms": 625,
+      "slot_end_ms": 687.5,
+      "observation_block_ms": 70,
+      "sends": [
+        {
+          "send_ms": 695.0,
+          "valid_until_ms": 758.533334,
+          "current_logical_slot": 10
+        }
+      ],
+      "outcome": "previous slot's command sent after slot end"
+    },
+    "caveat": "Fake I/O exercises the actual step, handoff, execute and deadline method bodies. Other collaborators are explicit stubs. No late send of this kind was found in the four recorded trials."
+  },
+  "xhand_sdk": {
+    "library": "/usr/lib/libxhand_control.so",
+    "sha256": "c0bf9ef3c3c6c3ec342dab4313e0dd447e48ba7f871e4f3a6e922a222b0d46e6",
+    "method": "Static ELF reads and disassembly, no SDK invocation",
+    "sdk_1501035": {
+      "message": "Current exceeds the set threshold, triggering overcurrent warning (exceeding 500ms) ",
+      "string_address": "0x99e88",
+      "mapping_instruction": "0x2be23"
+    },
+    "sdk_1501070": {
+      "message": "Communication data CRC error",
+      "string_address": "0x9a5f3",
+      "mapping_instruction": "0x2bb02"
+    },
+    "hardware_307": {
+      "custom_code": 1501070,
+      "table_pair_address": "0x9af38"
+    },
+    "read_state": "force_update calls the request method, then copies internal HandState storage. Complete finite values are not in themselves proof of fresh per-board samples.",
+    "crc_limit": "The existing CRC sample is frame 0, with several board 307 values. It has no previous captured frame to establish whether joints are cached. Do not claim all CRC joint data are stale, or always fresh.",
+    "reset_evidence": {
+      "library": "/usr/lib/libxhand_control.so",
+      "sha256": "c0bf9ef3c3c6c3ec342dab4313e0dd447e48ba7f871e4f3a6e922a222b0d46e6",
+      "analysis": "offline ELF/disassembly only; no hardware connection or execution",
+      "reset_sensor_sends_command": "0x12 (instruction at 0x5da30; package_and_write call at 0x5da41)",
+      "serial_parser_command_dispatch_table": "0x9c900",
+      "serial_parser_reset_command_target": "0x58c08",
+      "unknown_command_print_block": "0x58c08; std::cout insertion referencing string at 0x9b69c",
+      "after_print": "jump to 0x58aa0, record received command, then return",
+      "parser_entry_error_code_clear": "0x589bc writes zero to field at this+0x34d8",
+      "caveat": "No packet capture; does not prove each previously observed message was an 0x12 response or measure hardware zero correction."
+    }
+  }
+}

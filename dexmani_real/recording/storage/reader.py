@@ -11,7 +11,7 @@ import h5py
 import numpy as np
 
 from dexmani_real.recording.storage.schema import (
-    DATASET_SPECS, RAW_FORMAT, TIMING_REQUIRED_FIELDS, TIMING_ROW_DTYPE,
+    DATASET_SPECS, RAW_FORMAT, TIMING_REQUIRED_FIELDS,
 )
 from dexmani_real.recording.storage.video import VideoDecoder
 
@@ -139,11 +139,9 @@ class EpisodeReader:
         if (
             rows.shape != (self.num_frames,)
             or not set(TIMING_REQUIRED_FIELDS).issubset(names)
-            or any(name not in TIMING_ROW_DTYPE.fields
-                   or rows.dtype.fields[name][0] != TIMING_ROW_DTYPE.fields[name][0]
-                   for name in names)
+            or any(rows.dtype.fields[name][0] != np.dtype("<i8") for name in names)
         ):
-            raise RawDataError("timing rows must align with core rows and match timing dtype")
+            raise RawDataError("timing rows must align with core rows and contain signed int64 columns")
         queries = [json.loads(value) for value in group["queries"].asstr()[:]]
         keys = [(item["run_id"], item["query_id"]) for item in queries]
         if len(set(keys)) != len(keys):
@@ -175,13 +173,6 @@ class EpisodeReader:
         def inference(query):
             start, end = query.get("started_ns"), query.get("completed_ns")
             return None if start is None or end is None else (end - start) / 1e9
-        source_to_receive = delta("camera_received_ns", "camera_ns")
-        # A hardware-only receive-time origin cannot measure pre-receive latency.
-        for name in ("camera_depth_timestamp_domain", "camera_color_timestamp_domain"):
-            if name not in rows.dtype.names:
-                source_to_receive[:] = np.nan
-            else:
-                source_to_receive[~np.isin(rows[name], (1, 2))] = np.nan
         return dict(
             available=True,
             metadata=evidence["metadata"],
@@ -191,7 +182,6 @@ class EpisodeReader:
                               "arm_camera": delta("arm_ns", "camera_ns"),
                               "camera_pointcloud": delta("camera_ns", "pointcloud_ns")},
             camera_pipeline_s={
-                "source_to_receive": source_to_receive,
                 "receive_to_publish": delta("camera_published_ns", "camera_received_ns"),
             },
             pointcloud_pipeline_s={

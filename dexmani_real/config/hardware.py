@@ -112,7 +112,7 @@ class ArmParams:
     table_z_surface_m: float = 0.022
     hand_safety_margin_m: float = 0.05
 
-    collision_sensitivity: int = 1
+    collision_sensitivity: int = 0  # 0 disables xArm controller collision detection.
 
     tcp_load_mass_kg: float = 1.1
     tcp_load_cog_mm: tuple[float, float, float] = (16.3, 7.9, 109.5)
@@ -239,7 +239,8 @@ class HandParams:
     ki: int = 0
     kd: int = 0
 
-    tor_max_ma: tuple[int, ...] = (
+    # Mode 3 SDK output scale: 0–400, with 400 = 100% output (not mA).
+    tor_max: tuple[int, ...] = (
         360,
         300,
         300,
@@ -325,10 +326,10 @@ class HandParams:
             raise ValueError("hand kp must contain twelve positive integer gains")
         if self.ki < 0 or self.kd < 0:
             raise ValueError("hand ki/kd must be non-negative")
-        if len(self.tor_max_ma) != 12 or any(
-            not isinstance(value, int) or value <= 0 for value in self.tor_max_ma
+        if len(self.tor_max) != 12 or any(
+            type(value) is not int or not 0 <= value <= 400 for value in self.tor_max
         ):
-            raise ValueError("hand tor_max_ma must contain twelve positive integer mA limits")
+            raise ValueError("hand tor_max must contain twelve integers in [0, 400] (Mode 3 output scale)")
         if not np.isfinite(self.feedback_max_age_s) or self.feedback_max_age_s <= 0:
             raise ValueError("hand feedback_max_age_s must be finite and positive")
         if (

@@ -108,10 +108,12 @@ class PolicyRuntimeConfig:
     seed: int
 
 
-def validate_num_episodes(num_episodes: Any) -> int:
-    """Validate the run-owner episode budget (episodes to run, not saves)."""
+def validate_num_episodes(num_episodes: Any) -> int | None:
+    """None waits for operator exit; a limit counts begun episodes, not saves."""
+    if num_episodes is None:
+        return None
     if isinstance(num_episodes, bool) or type(num_episodes) is not int:
-        raise TypeError("num_episodes must be a positive integer")
+        raise TypeError("num_episodes must be a positive integer or None")
     if num_episodes < 1:
         raise ValueError("num_episodes must be a positive integer")
     return int(num_episodes)
@@ -140,7 +142,7 @@ class RolloutRecordingConfig:
 
 @dataclass(frozen=True)
 class ExecutionConfig:
-    """Policy startup admission and execution budgets."""
+    """Policy action horizon and runtime execution budgets."""
 
     # Effective A_exec, resolved from CLI or saved default at the Real entry.
     action_steps: int | None = None
@@ -149,17 +151,14 @@ class ExecutionConfig:
     start_arm_home_tolerance_deg: float = 0.5
     # Per-face allowance for the final FK target; nominal command bounds stay fixed.
     eef_workspace_margin_m: float = 0.005
-    # Recheck these admission budgets against Policy cadence and measured costs;
-    # they do not bound the physical stop response time.
+    # Runtime age/wait budgets do not bound the physical stop response time.
     max_decision_age_s: float = 1.0
     max_wait_s: float = 2.0
-    max_tick_lateness_s: float = 0.03
     prefetch_steps: int | None = None
     rtc_guidance_cap: float | None = None
 
-    def validate(self, info, *, max_running_s=None):
-        dt = control_dt_ns(info)
-        max_running_s = validate_max_running_s(max_running_s)
+    def validate(self, info):
+        control_dt_ns(info)
         for name in ("n_obs_steps", "horizon", "n_action_steps"):
             value = getattr(info, name)
             if type(value) is not int or value < 1:
@@ -184,20 +183,15 @@ class ExecutionConfig:
             or margin < 0
         ):
             raise ValueError("eef_workspace_margin_m must be finite and nonnegative")
-        for name in ("max_decision_age_s", "max_wait_s", "max_tick_lateness_s"):
+        for name in ("max_decision_age_s", "max_wait_s"):
             value = getattr(self, name)
             if (
                 isinstance(value, bool)
                 or value is None
                 or not math.isfinite(value)
-                or value < 0
-                or (value == 0 and name != "max_tick_lateness_s")
+                or value <= 0
             ):
-                bound = "nonnegative" if name == "max_tick_lateness_s" else "positive"
-                raise ValueError(f"{name} must be a finite {bound} experimental budget")
-        lateness = int(self.max_tick_lateness_s * 1e9)
-        if lateness >= dt:
-            raise ValueError("max_tick_lateness_s must be smaller than control_dt_s")
+                raise ValueError(f"{name} must be a finite positive experimental budget")
         p = info.horizon - info.n_obs_steps + 1
         a = self.action_steps
         if type(a) is not int:
@@ -212,46 +206,4 @@ class ExecutionConfig:
             beta = self.rtc_guidance_cap
             if isinstance(beta, bool) or beta is None or not math.isfinite(beta) or beta < 0:
                 raise ValueError("rtc_guidance_cap requires an explicit finite nonnegative value")
-        _validate_wait_lower_bound(info.n_obs_steps * dt, self, max_running_s, "Static")
-        age = a * dt - lateness
-        if self.execution_mode != "sync":
-            age = max(age, (a + self.prefetch_steps - 1) * dt - lateness)
-        if int(self.max_decision_age_s * 1e9) < age:
-            raise ValueError("Static grid lower bound exceeds max_decision_age_s")
         return self
-
-
-def _validate_wait_lower_bound(bound, execution, max_running_s, source):
-    if int(execution.max_wait_s * 1e9) <= bound:
-        raise ValueError(f"{source} first-action grid lower bound reaches max_wait_s")
-    if max_running_s is not None and int(max_running_s * 1e9) <= bound:
-        raise ValueError(f"{source} first-action grid lower bound reaches max_running_s")
-
-
-def validate_warmup_budget(durations, execution_config, info, *, max_running_s=None):
-    """Model-only necessary bounds; input/prefix preparation and margin also need
-    time inside the nominal d*dt window. Owner lateness never extends it.
-    """
-    dt = control_dt_ns(info)
-    lateness = int(execution_config.max_tick_lateness_s * 1e9)
-    age = int(execution_config.max_decision_age_s * 1e9)
-    for path in ("bootstrap", "steady"):
-        samples = durations[path]
-        if not samples or any(not math.isfinite(i) or i < 0 for i in samples):
-            raise ValueError(f"Invalid {path} warmup durations")
-    for sample in durations["bootstrap"]:
-        inference = int(sample * 1e9)
-        k = inference // dt + 1
-        _validate_wait_lower_bound(
-            (info.n_obs_steps - 1 + k) * dt, execution_config, max_running_s, "Measured sample"
-        )
-        if max(inference, k * dt - lateness) + (execution_config.action_steps - 1) * dt > age:
-            raise ValueError("Measured bootstrap sample cannot fit max_decision_age_s")
-    if execution_config.execution_mode != "sync":
-        d = execution_config.prefetch_steps
-        for sample in durations["steady"]:
-            inference = int(sample * 1e9)
-            if inference >= d * dt:
-                raise ValueError("Model-only sample leaves no time for input/prefix preparation and handoff margin")
-            if max(inference, (execution_config.action_steps + d - 1) * dt - lateness) > age:
-                raise ValueError("Measured steady sample cannot fit max_decision_age_s")

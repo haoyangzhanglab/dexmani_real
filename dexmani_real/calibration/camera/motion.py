@@ -227,6 +227,19 @@ def run_calibration_motion_tick(
         return
 
     epoch = int(shared.run_id)
+    if safety_state == int(SafetyState.ARMED):
+        try:
+            robot.prepare_streaming(epoch)
+        except DispatchError as exc:
+            if not exc.revoked:
+                raise
+            robot.stop()
+            state.command_qpos = state.command_pose = None
+            return
+        # Mode preparation may block; IK must use feedback read afterwards.
+        refreshed = read_arm_state_dict(robot)
+        state.current_qpos = refreshed["qpos"]
+        state.feedback_timestamp_ns = int(refreshed["timestamp_ns"])
     baseline_qpos = state.command_qpos
     baseline_pose = state.command_pose
     if baseline_qpos is None:

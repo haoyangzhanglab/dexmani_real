@@ -1,0 +1,280 @@
+{
+  "session": "/home/zhanghaoyang/Desktop/dexmani_real/rollouts/maniflow/pick_place_toy/2026-10-11_02-00-52-803763_1cbdb2c1_1011/session_20261012_140158",
+  "episode": "episode_001",
+  "session_result": {
+    "index": 1,
+    "started": true,
+    "run_id": 5,
+    "started_utc": "2026-10-12T06:04:26.374891+00:00",
+    "duration_s": 14.926090068,
+    "termination_reason": "operator",
+    "termination_details": "owner_authority_revoked",
+    "errors": [],
+    "raw": {
+      "status": "published",
+      "path": "/home/zhanghaoyang/Desktop/dexmani_real/rollouts/maniflow/pick_place_toy/2026-10-11_02-00-52-803763_1cbdb2c1_1011/session_20261012_140158/episode_001",
+      "staging_path": null,
+      "row_count": 239
+    },
+    "metrics": {
+      "inference_count": 60,
+      "inference_mean_s": 0.03879232714999999,
+      "inference_max_s": 0.041408205,
+      "skipped_slots": 0,
+      "dispatch_count": 237
+    }
+  },
+  "rows": 239,
+  "dispatch_counts": {
+    "[0 0]": 2,
+    "[1 1]": 237
+  },
+  "gaps_ms": {
+    "within_chunk": {
+      "min": 59.288767,
+      "median": 62.615482,
+      "p95": 65.1809798,
+      "max": 65.871519,
+      "count": 177
+    },
+    "between_chunks": {
+      "min": 59.171381,
+      "median": 62.056373,
+      "p95": 63.8221362,
+      "max": 64.627607,
+      "count": 59
+    }
+  },
+  "gaps_over_90ms": 0,
+  "sdk_arm_and_hand_ms": {
+    "min": 9.8656,
+    "median": 10.991957,
+    "p95": 11.3912572,
+    "max": 13.180782,
+    "count": 237
+  },
+  "inference_ms": {
+    "min": 29.782269,
+    "median": 38.9111365,
+    "p95": 40.61422355,
+    "max": 41.408205,
+    "count": 60
+  },
+  "latest_policy_source_age_ms": {
+    "min": 82.268069,
+    "median": 167.559607,
+    "p95": 290.5317412,
+    "max": 292.803255,
+    "count": 237
+  },
+  "block_last_source_age_ms": {
+    "min": 270.2609,
+    "median": 286.63449049999997,
+    "p95": 291.699504,
+    "max": 292.803255,
+    "count": 58
+  },
+  "nonfinite": {
+    "action_arm_joint_target": 14,
+    "action_hand_joint_target": 24,
+    "arm_effort": 0,
+    "arm_qpos": 0,
+    "arm_qvel": 0,
+    "dispatch_status": 0,
+    "hand_contact": 0,
+    "hand_current": 0,
+    "hand_qpos": 0,
+    "hand_tactile_force": 0,
+    "timestamp": 0
+  },
+  "hand_current_abs_peak_mA_by_sdk_index": [
+    364.0,
+    196.0,
+    217.0,
+    531.0,
+    220.0,
+    410.0,
+    317.0,
+    331.0,
+    212.0,
+    336.0,
+    183.0,
+    241.0
+  ],
+  "tracking": {
+    "arm": {
+      "previous_completed_target_error_abs_deg": [
+        {
+          "min": 0.0031009058831870107,
+          "median": 0.31684511179919306,
+          "p95": 1.3191306561038414,
+          "max": 1.9262008577423366,
+          "count": 236
+        },
+        {
+          "min": 0.016105586062890254,
+          "median": 0.7421935415361469,
+          "p95": 3.39916316876732,
+          "max": 8.493024336661747,
+          "count": 236
+        },
+        {
+          "min": 8.025472274653112e-05,
+          "median": 0.27761101110275854,
+          "p95": 2.1109177743166305,
+          "max": 3.633263740422982,
+          "count": 236
+        },
+        {
+          "min": 0.00630084950933707,
+          "median": 0.8425567680871406,
+          "p95": 3.7304435652122168,
+          "max": 9.660025335608246,
+          "count": 236
+        },
+        {
+          "min": 0.015053736930696004,
+          "median": 0.8205857570744968,
+          "p95": 3.7052171152864233,
+          "max": 5.826369928074342,
+          "count": 236
+        },
+        {
+          "min": 0.0005054339985832712,
+          "median": 0.5660690029377307,
+          "p95": 3.2223159107773505,
+          "max": 8.393790225757925,
+          "count": 236
+        },
+        {
+          "min": 0.0004968962621187956,
+          "median": 0.49203466153326003,
+          "p95": 1.9302582302331621,
+          "max": 2.716791839076728,
+          "count": 236
+        }
+      ],
+      "target_jump_deg": {
+        "within_chunk": {
+          "min": 0.0006283774036432987,
+          "median": 0.3310251181246713,
+          "p95": 1.2876959057319652,
+          "max": 3.506100025507635,
+          "count": 1239
+        },
+        "between_chunks": {
+          "min": 0.0002834528505566425,
+          "median": 0.5499600017802564,
+          "p95": 2.601580464289047,
+          "max": 7.419214438750899,
+          "count": 413
+        }
+      }
+    },
+    "hand": {
+      "previous_completed_target_error_abs_deg": [
+        {
+          "min": 0.001953434102624385,
+          "median": 1.0136222709446905,
+          "p95": 2.9367089893123293,
+          "max": 7.588063545222781,
+          "count": 236
+        },
+        {
+          "min": 0.009012434609829256,
+          "median": 0.9885588917853312,
+          "p95": 2.377172208542067,
+          "max": 4.942126807935296,
+          "count": 236
+        },
+        {
+          "min": 0.0005071415458708373,
+          "median": 0.7115921596203751,
+          "p95": 1.9396482195576263,
+          "max": 3.876583146467457,
+          "count": 236
+        },
+        {
+          "min": 0.005662440265352231,
+          "median": 1.799109286700088,
+          "p95": 3.1563052807394976,
+          "max": 5.715766647131891,
+          "count": 236
+        },
+        {
+          "min": 0.031389841878086244,
+          "median": 0.9635091730043079,
+          "p95": 2.025111815321047,
+          "max": 3.7573587794102963,
+          "count": 236
+        },
+        {
+          "min": 0.0011269812130549894,
+          "median": 2.088227885893854,
+          "p95": 4.431510403321607,
+          "max": 9.514967485562803,
+          "count": 236
+        },
+        {
+          "min": 0.013318868881524892,
+          "median": 1.3516124744754827,
+          "p95": 3.747373896617381,
+          "max": 5.171184031940847,
+          "count": 236
+        },
+        {
+          "min": 0.003251170044926255,
+          "median": 0.9250022740110673,
+          "p95": 4.117928734563506,
+          "max": 12.342454066083814,
+          "count": 236
+        },
+        {
+          "min": 0.000391882103629726,
+          "median": 0.6460961950086559,
+          "p95": 1.488633753188756,
+          "max": 3.361422958508415,
+          "count": 236
+        },
+        {
+          "min": 0.0014001887798542612,
+          "median": 0.5841741268801428,
+          "p95": 3.6901428877882037,
+          "max": 10.044588891542059,
+          "count": 236
+        },
+        {
+          "min": 0.0019858775011805108,
+          "median": 0.6142816007415597,
+          "p95": 1.8185020080227527,
+          "max": 3.406785659881052,
+          "count": 236
+        },
+        {
+          "min": 0.0012567548072865975,
+          "median": 0.6059897510891616,
+          "p95": 2.3493835839038706,
+          "max": 7.936577362717266,
+          "count": 236
+        }
+      ],
+      "target_jump_deg": {
+        "within_chunk": {
+          "min": 0.0,
+          "median": 0.24556579122947042,
+          "p95": 2.5361178822268924,
+          "max": 12.118087474490771,
+          "count": 2124
+        },
+        "between_chunks": {
+          "min": 0.0,
+          "median": 0.3832141666859137,
+          "p95": 3.226164893129381,
+          "max": 13.760684790629018,
+          "count": 708
+        }
+      }
+    }
+  },
+  "method_note": "Tracking compares source-timestamped measurements against the preceding completed combined arm/hand dispatch; this is not identified firmware latency. NaN targets on not-called rows are preserved."
+}

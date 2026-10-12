@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>session_20261011_220535 离线数据排查</title>
+<style>
+body{max-width:1180px;margin:36px auto;padding:0 24px;font:16px/1.8 system-ui,sans-serif;color:#182332;background:#f9fbfd}
+p{margin:20px 0} .lead{font-size:22px;font-weight:650} .muted{color:#566476;font-size:14px}
+table{width:100%;border-collapse:collapse;background:white;margin:20px 0}td,th{padding:12px;border:1px solid #d8e0e8;text-align:left;vertical-align:top}
+th{background:#eaf0f6}a{color:#1458a0}img{max-width:100%;height:auto;background:white}code{overflow-wrap:anywhere;font-size:14px}
+details{margin:18px 0;padding:14px;background:white;border:1px solid #d8e0e8;border-radius:8px}summary{cursor:pointer;font-weight:600}
+.finding{border-left:4px solid #cf852b;padding:4px 18px;background:#fff9ef}.ok{border-left:4px solid #39866a;padding:4px 18px;background:#f0f9f4}
+@media(max-width:700px){body{padding:0 12px}table{font-size:13px}td,th{padding:7px}}
+</style>
+<p class="lead">存在抓取失败、动作块切换不连续及手部高电流现象；未发现 Raw 文件损坏或观测字段缺失。</p>
+<p><a href="causes.html">逐项成因分析：调度、动作拼接、臂跟随、手部接触与失败后继续执行</a>。已根据厂商文档修正电流口径：撤回将 <code>tor_max_ma=300</code> 与 300 mA 直接比较的倍率结论。</p>
+<p class="muted">对象：<code>rollouts/maniflow/pick_place_toy/2026-10-11_02-00-52-803763_1cbdb2c1_1011/session_20261011_220535</code><br>
+配置：60pct / epoch 0566 / step 60000，EMA，4 步推理；joint 动作，16 Hz，sync，每次执行 8 步；模型输入为 joint_state + point_cloud。<br>
+分析范围：3 段、865 行；所有 HDF5 数值、865 帧 RGB 解码、深度与点云重建；视频按关键帧人工判读。下文时间均相对每段第一条 Raw 观测，row 从 0 开始。</p>
+
+<table>
+<tr><th>Episode</th><th>Raw 时长 / 行数</th><th>下发 / 未下发</th><th>视频判断</th><th>重点时段</th></tr>
+<tr><td>001</td><td>24.749 s / 397</td><td>352 / 45</td><td>约 15 s 抓起，约 20 s 放入篮子，结束时玩具留在篮内。</td><td>13.88–17.62 s 高电流；15–16.4 s 抬升、转移时跟随滞后。</td></tr>
+<tr><td>002</td><td>13.314 s / 214</td><td>189 / 25</td><td>约 6.5–7 s 玩具在桌上被推转，约 8 s 空合手；随后空手抬起、移动，玩具留在桌上。</td><td>8.000 s 手目标跳变；8.125 s 电流尖峰；9 s 后仍有食指电流与触觉。</td></tr>
+<tr><td>003</td><td>15.812 s / 254</td><td>224 / 30</td><td>约 8.4–9.5 s 抓取未保持，9.75 s 已明显空手；随后向篮子方向移动，玩具留在桌上。</td><td>8.438–8.876 s 电流尖峰；9.126 s 臂目标跳变；10 s 后仍有食指电流与触觉。</td></tr>
+</table>
+<p>这是本次 3 段视频的人工任务判断，不是 Raw 自带的 success 标签，也不足以估计模型总体成功率。三段均记为 <code>operator / owner_authority_revoked</code>，session 正常结束且 shutdown_clean=true；这只说明退出过程，不能替代任务成功判断。</p>
+
+<div class="finding">
+<p><strong>优先复核手部的高电流与未到位现象。</strong>SDK 10（<code>right_hand_pinky_joint1</code>）峰值分别为 −1606、−694、−979 mA。厂商手册确认反馈 <code>finger_state.torque</code> 单位为 mA，但位置模式输出上限为 0–400 的比例值，不能把配置名 <code>tor_max_ma</code> 当作 mA 的依据。原报告的 5.35、2.31、3.26 倍比较已撤回。第一段 row 226–234 的 SDK 10 连续 9 个样本绝对值超过手册所述 1200 mA 参考值，首末样本相距 0.502 s；固件实际阈值和保护状态未留存，不能据此直接认定保护失效。</p>
+</div>
+<table>
+<tr><th>Episode</th><th>电流峰值</th><th>位置</th><th>闭合过程中的同组证据</th></tr>
+<tr><td>001</td><td>−1606 mA</td><td>14.437 s，row 231，SDK 10</td><td>SDK 11 小指第二关节相对此前已下发目标最大差 38.13°，同在 row 231；小指触觉同时增加。任一关节 |current| &gt; 600 的连续记录为 row 222–282。</td></tr>
+<tr><td>002</td><td>−694 mA</td><td>8.125 s，row 130，SDK 10</td><td>小指此前已下发目标差最大 15.37°，row 129；手目标最大跳变发生于此前 row 128。</td></tr>
+<tr><td>003</td><td>−979 mA</td><td>8.812 s，row 141，SDK 10</td><td>小指此前已下发目标差最大 30.39°，同在 row 141；小指触觉峰值集中在闭合附近。</td></tr>
+</table>
+<p>还有持续现象：第 2 段 9 s 后空手时，食指侧摆关节 SDK 3（URDF 名称含 <code>index_bend</code>）的电流中位数为 −480 mA；第 3 段 10 s 后为 −472.5 mA。第 3 段 SDK 3 有 31 次目标落在 −9.969° 下限附近，结束时测量 −6.850°，最近目标 −9.590°。第 1 段释放后 21 s 起，SDK 3 电流中位数仍为 +393 mA，而各指触觉已回零。</p>
+<p>这些记录支持“闭合时明显受阻/滞后、部分姿态持续施力，需要排查”。第 2、3 段空手后拇指/食指仍有随时间变化的非零触觉，可能涉及手指自接触、姿态负载或零位/机械响应问题；不能仅据此认定传感器坏了，也不能把非零触觉当作持物成功。第 1 段成功抓取时峰值反而最大，因此高电流不是两段失败的充分解释。</p>
+<p class="muted">语义限制：已核对本机厂商手册、Python SDK 与 ROS2 文档，详见成因报告。文档未必与采集时固件完全对应。当前驱动把 1501035 也归入 ACCEPTED；board error 仅写 warning，没有随 Raw 保留完整码。因此不能由 errors=[] 或 ACCEPTED 推出“没有硬件告警”，也不能由峰值直接认定保护失效。对应源码：<a href="../../dexmani_real/robot/drivers/xhand.py">xhand.py:56、630、666</a>，<a href="../../dexmani_real/robot/robot.py">robot.py:194–212</a>。</p>
+
+<div class="finding">
+<p><strong>sync 模式存在稳定的发令空档，动作块边界伴随更大的目标修正。</strong>观测一直按 16 Hz 连续采样；下发模式为启动 row 0/1 不发送，之后每 8 次发送空出 1 个 slot。3 段分别有 43、23、27 个超过 100 ms 的相邻下发间隔，均对应动作块切换。块内约 62.5 ms，切换约 125 ms，持续段有效下发频率约 14.25–14.27 Hz。</p>
+</div>
+<table>
+<tr><th>Episode</th><th>臂块内 / 块间跳变中位数</th><th>臂最大相邻目标跳变</th><th>手最大相邻目标跳变</th></tr>
+<tr><td>001</td><td>1.04° / 3.05°</td><td>6.527°，J2，15.313 s，row 245</td><td>23.903°，SDK 7 中指第二关节，14.188 s，row 227</td></tr>
+<tr><td>002</td><td>0.83° / 2.75°</td><td>5.724°，J5，9.689 s，row 155</td><td>18.358°，SDK 0 拇指弯曲，8.000 s，row 128</td></tr>
+<tr><td>003</td><td>0.96° / 2.92°</td><td>8.873°，J4，9.126 s，row 146</td><td>16.634°，SDK 9 无名指第二关节，8.562 s，row 137</td></tr>
+</table>
+<p>表中六个最大值都发生在块切换处。块间时间是块内约两倍，不能只比较角度就判为超速；按实际下发间隔归一后，臂块间修正速度中位数约 21.8–24.3°/s，块内约 13.3–16.5°/s。数据支持“节奏不均、块边界修正偏大”，这是停顿/抖动的候选来源，尚不能单独归因于模型噪声或 SDK 故障。</p>
+<p>源码路径与数据相符：<a href="../../dexmani_real/deployment/runner.py">runner.py:733</a> 在第 8 步后清空 plan；<code>step()</code> 的 841–847 行下一拍提交推理并只记录观测，待后续 handoff 才发送。96 次完成推理耗时约 26.3–37.9 ms，没有超时或 missed_slot；因此这里的周期空档符合当前同步执行逻辑。</p>
+<p>每块首动作使用的最新输入源已约 79–111 ms，末动作约 516–549 ms；若计入两帧历史中较老的一帧，最老源最大约 612 ms。它们未超过当前 1 s 决策准入阈值，但意味着后半块仍在执行较早观测产生的预测。模型只消费 joint_state/point_cloud，当前 rollout 的触觉与电流没有直接进入策略输入；两段失败后没有及时恢复抓取的现象应单独评估。</p>
+<p>机械臂也存在跟随滞后：第 1 段 16.125 s 的 J5，相对在该反馈前已经返回的最近一次 SDK 目标差 17.44°。同一行新目标与观测差的最大值是 20.61°，但新目标是在观测之后才发送，不能将该数直接当成执行误差。分析脚本已按 submit_completed_ns 与各模态反馈时间对齐。</p>
+
+<div class="ok">
+<p><strong>本次检查未发现文件、基本时间轴或物理观测完整性异常。</strong>RGB 实际解码帧数与 HDF5 一致；所有物理观测字段有限；全部 765 次下发的两个 target 都有限且 dispatch=(1,1)。没有重复/倒退的 observation/source 时间戳，没有 camera/pointcloud 来源 sequence 错配。</p>
+</div>
+<table>
+<tr><th>检查</th><th>结果及边界</th></tr>
+<tr><td>采样时钟</td><td>相邻观测 60.12–64.73 ms；相对 16 Hz 网格最大绝对偏差 1.731 ms；没有丢失控制 slot。</td></tr>
+<tr><td>观测年龄</td><td>arm 约 10–12.3 ms；hand &lt; 0.67 ms；camera/pointcloud 约 14.8–50.7 ms。均为 host 时钟口径，不能涵盖设备内部缓存或主机收到前的传输延迟。</td></tr>
+<tr><td>RGB / depth</td><td>865 帧全部可读；640×480；无全零深度帧、无相邻完全相同深度帧。每帧非零深度占比约 98.10%–98.70%，不等价于每个点都几何准确。</td></tr>
+<tr><td>点云</td><td>按 run_config、Raw 内外参及当前处理代码重建全部 865 帧；每帧 1024 个有限、互异的 xyz，没有空点云。RGB 经 MP4 有损编码，Raw 未保存在线 tensor，故不是在线输入逐位复现或标定准确性证明。</td></tr>
+<tr><td>关节与工作空间</td><td>采样测量/下发目标未越配置机械关节范围；当前 URDF 的离线 EEF FK 未越本次配置的 workspace（含 5 mm margin）。记录到的臂最大 |qvel| 为 103.02、68.72、64.24°/s；这些离散检查不能证明连续路径、指尖或碰撞安全。</td></tr>
+<tr><td>触觉</td><td>aggregate、dense 均无 NaN。第 1 段五指有响应且释放后回零；第 2 段中指/无名指全程为零，第 3 段无名指全程为零，这与各指是否接触有关，单独不能证明掉线。保留 SDK 原值；metadata 为 sdk_native、zero not_requested，未扣偏置。</td></tr>
+<tr><td>终止与 query</td><td>三段都是操作者结束；第 3 段最后一个 query 97 在停止时仍为 submitted，未下发。故 HDF5 有 29 条 query，但 session inference_count=28；这是终止边界证据，没有伪造完成状态。</td></tr>
+</table>
+
+<p><strong>这三段目前都不能直接进入公共训练导出。</strong>合计 100 行 target 全 NaN，恰好对应 dispatch=(0,0) 的启动/推理等待行，没有在已发送动作中发现 NaN。它们是合法的“当时未调用 SDK”Raw 证据；当前 <code>validate_export_episode()</code> 会在 row 0 按 dispatch 规则拒绝整段，之后也不满足所有 action 有限的要求。分析实际调用了该只读检查，三段都得到相同拒绝原因。不能通过补前值、删除等待行或改写 Raw 来使其通过，那会改变动作与时间语义。参见 <a href="../../dexmani_real/recording/recorder.py">recorder.py:93–117</a>、<a href="../../dexmani_real/dataset/processing.py">processing.py:49–67</a>。</p>
+
+<p><strong>后续排查重点：</strong>电流口径已修正。补充离线检查支持第 2、3 段空手后存在拇指/食指自接触，并发现第一段快速转移阶段约 240 ms 的轨迹相位差；证据和解释边界见<a href="causes.html">逐项成因报告</a>。食指张手时的稳态偏差、采集时固件保护状态及失败恢复能力仍需分别核实。本次没有更改控制、执行硬件诊断或加入平滑、补偿及自动恢复。</p>
+
+<details open><summary>第 1 段：任务完成，但有明显闭合电流与转移滞后</summary>
+<p><a href="episode_001_overview.jpg">全过程关键帧</a> · <a href="episode_001_grasp.jpg">抓取窗口</a> · <a href="episode_001_signals.png">全段信号</a> · <a href="episode_001_hand.png">手部细节</a> · <a href="episode_001_cloud.png">重建点云</a></p>
+<img loading="lazy" src="episode_001_overview.jpg" alt="第一段关键帧：抓起玩具并放进篮子">
+</details>
+<details open><summary>第 2 段：玩具被推转，随后空合手</summary>
+<p><a href="episode_002_overview.jpg">全过程关键帧</a> · <a href="episode_002_grasp.jpg">抓取窗口</a> · <a href="episode_002_signals.png">全段信号</a> · <a href="episode_002_hand.png">手部细节</a> · <a href="episode_002_cloud.png">重建点云</a></p>
+<img loading="lazy" src="episode_002_grasp.jpg" alt="第二段 6.5 到 9.25 秒关键帧：玩具留在桌上，手空合后抬起">
+</details>
+<details open><summary>第 3 段：抓取未保持，空手继续移动</summary>
+<p><a href="episode_003_overview.jpg">全过程关键帧</a> · <a href="episode_003_grasp.jpg">抓取窗口</a> · <a href="episode_003_signals.png">全段信号</a> · <a href="episode_003_hand.png">手部细节</a> · <a href="episode_003_cloud.png">重建点云</a></p>
+<img loading="lazy" src="episode_003_grasp.jpg" alt="第三段 8.25 到 11 秒关键帧：抓取后玩具留在桌上">
+<img loading="lazy" src="episode_003_hand.png" alt="第三段食指与小指目标、反馈、电流和触觉">
+</details>
+
+<p><strong>复核与复现：</strong><a href="metrics.json">完整逐段统计、异常 row、原始文件 SHA-256</a>；<a href="analyze.py">分析脚本</a>。在仓库根目录执行 <code>/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python reports/20261011_220535_analysis/analyze.py</code> 可重新生成统计及图像；视频行为描述为人工判断。未连接设备、未执行回放、未改写 Raw、运行代码或标定。</p>
+<p class="muted">源码解释基于当前工作区；run_config 记录了 git HEAD，但工作区存在既有未提交修改，不能凭 HEAD 复原采集时的完整代码。metrics.json 保存了本次分析所用关键源码的哈希。未做新的真机验证。</p>
+</html>

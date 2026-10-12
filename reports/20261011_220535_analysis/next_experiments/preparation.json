@@ -1,0 +1,151 @@
+{
+  "plan_date": "2026-10-12",
+  "production_code_modified": true,
+  "device_connected": true,
+  "model_loaded_or_inference_run": true,
+  "original_session": "/home/zhanghaoyang/Desktop/dexmani_real/rollouts/maniflow/pick_place_toy/2026-10-11_02-00-52-803763_1cbdb2c1_1011/session_20261011_220535",
+  "original_run_config_sha256": "dc77ecaf642ef5430e55c54eb4158a6be0d2f91e1a02540aca99b5339c40ab94",
+  "policy": {
+    "experiment": "maniflow/pick_place_toy/2026-10-11_02-00-52-803763_1cbdb2c1_1011",
+    "checkpoint_path": "/home/zhanghaoyang/Desktop/dexmani_policy/experiments/maniflow/pick_place_toy/2026-10-11_02-00-52-803763_1cbdb2c1_1011/checkpoints/epoch=0566-step=00060000-milestone=60pct.pt",
+    "checkpoint_size_bytes": 2884440011,
+    "checkpoint_sha256": "742fc81bbc1dd2006a4f183ce1fc65f4a33357365e9eaf1a235390199a04a5e2",
+    "weights": "ema",
+    "inference_steps": 4,
+    "N": 2,
+    "H": 16,
+    "P": 15,
+    "dt_s": 0.0625,
+    "action_mode": "joint",
+    "observation_fields": [
+      "joint_state",
+      "point_cloud"
+    ],
+    "checkpoint_note": "Pins the current checkpoint bytes; does not retrospectively prove capture-time bytes where no hash was saved."
+  },
+  "static_execution_config_checks": [
+    {
+      "config": "sync.yaml",
+      "action_steps": 8,
+      "execution_mode": "sync",
+      "prefetch_steps": null,
+      "policy_dt_s": 0.0625,
+      "future_steps": 15,
+      "static_validation": "passed",
+      "model_warmup": "completed_in_hardware_session",
+      "hardware_validation": "executed; see live result, task failed"
+    },
+    {
+      "config": "async_d1.yaml",
+      "action_steps": 8,
+      "execution_mode": "async",
+      "prefetch_steps": 1,
+      "policy_dt_s": 0.0625,
+      "future_steps": 15,
+      "static_validation": "passed",
+      "model_warmup": "completed_in_hardware_session",
+      "hardware_validation": "executed; see live result, task failed"
+    },
+    {
+      "config": "async_d1.yaml",
+      "action_steps": 4,
+      "execution_mode": "async",
+      "prefetch_steps": 1,
+      "policy_dt_s": 0.0625,
+      "future_steps": 15,
+      "static_validation": "passed",
+      "model_warmup": "completed_in_hardware_session",
+      "hardware_validation": "executed; see live result, task failed"
+    },
+    {
+      "config": "async_d1.yaml",
+      "action_steps": 2,
+      "execution_mode": "async",
+      "prefetch_steps": 1,
+      "policy_dt_s": 0.0625,
+      "future_steps": 15,
+      "static_validation": "passed",
+      "model_warmup": "not_run",
+      "hardware_validation": "not_run"
+    }
+  ],
+  "source_hashes": {
+    "AGENTS.md": "a4fae025b6b8937198012b0ee52c52b1bd578a8800c30d09ca89b0c16ab22b64",
+    "dexmani_real/deployment/config.py": "9fae608077044f87fb6697dac09aa9acfd271859512696a8ec87b6e1f06984a6",
+    "dexmani_real/deployment/runner.py": "e91100b27b6b8d91b662c5d13834b06c53e041f9a4162ec500c61d0ad6fd8eae",
+    "dexmani_real/deployment/inference.py": "44b6d1ac3468f5c1b72ab58e18b3d2d9076210088fc5efd2c0dd44d13c01bb0c",
+    "dexmani_real/deployment/observation.py": "25e6f2838248e23cc32c6276a7afc4cdf5790aad872f14f94f93f1ff34e54f9b",
+    "dexmani_real/robot/action.py": "0145760ab00a4c4a57c1c07464bcc0265b41b23b688cfcd54a5979b91112bcb5",
+    "dexmani_real/robot/drivers/xarm7.py": "b61ca3f5e5fb273d4044a61c8b741f28dcd38122fd06c69f24512dd57d7a698a",
+    "dexmani_real/robot/drivers/xhand.py": "efb1b2ceb0546026a6c095ccbd4ec7932f141e63c60c62c3e138d5d3991cc839",
+    "dexmani_real/robot/robot.py": "c62b2f4ac75ae20044f93b20d3ada57c93a6806624804c57887cb7daa663e13b",
+    "dexmani_real/robot/command_validation.py": "4aff528db0f1bdd97b5bb1c9e94ed9336998f11c30594b7cc70867ae29109178",
+    "dexmani_real/runtime/safety.py": "84a02de34d2f31463daea486a599feed25cabd6322eede4564377a8ea8a0e2b8",
+    "dexmani_real/runtime/observation.py": "c4e3957cd00ff75855a2a7bec6437cebec7901a51a1ff9b221c6380b2528f59f",
+    "dexmani_real/recording/storage/schema.py": "c056832b8f5d53ae3c1eb47ff5f6d1d27e7399cc15e413c43d19a7f708ec1335",
+    "dexmani_real/dataset/processing.py": "b0b0c915ec02101e5eb1bb1f7e1fd9c322df534f183c3617554eb3f918cc41b1",
+    "dexmani_real/config/hardware.py": "7052bb0c941675237af3091f8cb0ab4d3d3e8b9aedc699a5a48cf5392fe4093d",
+    "dexmani_real/sensor/camera/realsense.py": "afa19dc58409813dfe16349f8da6dedaf82654e8965a4961095bbbe37c4fa514",
+    "dexmani_real/sensor/camera/worker.py": "be2ee8d5c26743545df96845ead0d4e653841d421448d2dcc42b48cbdc253483",
+    "dexmani_real/config/experiment.py": "c80805a0479b95a65dec1184ce9678b942c332989ee8cc4db89378ca7e750904",
+    "examples/run_policy.py": "94e96a7a3b40cb4f0edc8f47088b361e762785d0c93603b94b6edf69bb31db12",
+    "dexmani_real/deployment/operator.py": "eeeb97fcde2092a34aa45f789ba64c0927504eaa13d842b84e2396faca59c01c"
+  },
+  "git_head": "35cf34f1e834cc5e49e14342ebb302f6afe76542",
+  "status": "four_hardware_trials_completed_task_performance_unresolved",
+  "purpose": "Minimal existing-config pilot; no new diagnostic, validation or exception-handling subsystem.",
+  "first_round": {
+    "scheduler_task_attempts": 6,
+    "scheduler_paired_blocks": 3,
+    "layouts": [
+      "P1",
+      "P2",
+      "P3"
+    ],
+    "policy_seeds": [
+      0
+    ],
+    "conditions": {
+      "S0": "sync A8 Mode 6",
+      "S1": "async d1 A8 Mode 6"
+    }
+  },
+  "conditional_work": {
+    "A8_vs_A4_attempts": 6,
+    "A2": "not_scheduled",
+    "controller_comparison": "only if a relevant tracking problem remains; no fixed batch",
+    "formal_evaluation": "sample size to be designed only when required"
+  },
+  "checks_note": "Static config checks were completed previously, not rerun for this plan-only revision.",
+  "not_completed_in_planning_turn": [
+    "all hardware experiments",
+    "new model predictions"
+  ],
+  "file_sha256": {
+    "plan.html": "9395dfd85f45f057c95c81b482df0b57b3857a91a8378da931b6e6c102d176cd",
+    "sync.yaml": "1fbfa3eb7689008437d8ac964bd3b072bcb64c2b35592ddc74e0b08bcc49112b",
+    "async_d1.yaml": "d251c445d08527120619e46125765a6b91b0759f1861425993befa8e262cf0d7",
+    "trial_plan.csv": "a42202cfd68d2a411fbc1cb765bd20f6ac2188217e4fa0d89262a276c535452a"
+  },
+  "completed_work": [
+    "tor_max naming/range correction",
+    "removed unsupported grasp-contact code comment"
+  ],
+  "offline_validation": [
+    "defaults/range/types/length",
+    "config load/serialization",
+    "compileall",
+    "git diff --check"
+  ],
+  "live_experiments": {
+    "summary": "live_results/summary.html",
+    "completed_task_attempts": 4,
+    "task_successes": 0,
+    "normal_operator_stops": 4,
+    "empty_preparation_session": "session_20261012_140632",
+    "remaining_original_sync_async_trials": "deferred after deterministic scheduling mechanism was confirmed",
+    "recommended_baseline": "Mode 6 + async d1 + A4; same model, EMA, NFE=4, seed=0 and hand parameters",
+    "limitation": "Approximate resets, changed fourth layout and changing direct sunlight; no controlled success-rate comparison. Mode 1 not tested."
+  },
+  "not_completed_in_planning_turn_note": "Historical field above refers to the earlier planning turn; actual trials are in live_experiments."
+}

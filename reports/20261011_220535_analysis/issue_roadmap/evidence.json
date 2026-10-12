@@ -1,0 +1,46 @@
+{
+  "status": "four_hardware_trials_completed_task_performance_unresolved",
+  "basis": "User requests simplicity without unnecessary diagnostics, validation or exception-handling mechanisms.",
+  "issue_count": 16,
+  "production_code_modified": true,
+  "hardware_connected": true,
+  "hardware_sessions_closed_cleanly": true,
+  "completed_task_attempts": 4,
+  "task_successes": 0,
+  "empty_preparation_sessions": 1,
+  "new_robotics_checks_run": true,
+  "prior_evidence": "offline_checks.json",
+  "active_experiment_table": "../next_experiments/trial_plan.csv",
+  "completed_work": [
+    "tor_max naming/range correction",
+    "removed unsupported grasp-contact code comment",
+    "sync A8 / async A8 hardware comparison",
+    "two async A4 attempts",
+    "Raw timing, video, sparse cloud and release tracking analysis",
+    "finger 2 read-only check after HOME warning"
+  ],
+  "offline_validation": [
+    "defaults/range/types/length",
+    "config load/serialization",
+    "compileall",
+    "git diff --check"
+  ],
+  "immediate_work": [
+    "async d1 A4 Mode 6 baseline",
+    "policy/data analysis of observed grasp and release failures"
+  ],
+  "conditional_work": [
+    "local async deadline correction if observed",
+    "short arm mode comparison only if needed",
+    "policy/data work"
+  ],
+  "withdrawn": [
+    "new diagnostic stream and Raw fields",
+    "export rejection JSON",
+    "new fault-classification and blanket unknown-code stop rule",
+    "permanent device timing and controller telemetry",
+    "full fault-injection matrix as prerequisite",
+    "fixed 96-prediction and 18-trajectory batches",
+    "precommitted 80/100-task schedule"
+  ]
+}

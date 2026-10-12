@@ -1,4 +1,4 @@
-"""Policy keyboard ownership and HOME/TARE/start/stop authorization ordering."""
+"""Policy keyboard ownership and HOME/reset/start/stop authorization ordering."""
 
 import logging
 
@@ -32,9 +32,9 @@ class PolicyOperator:
         *,
         robot,
         execute: bool,
-        idle_for_tare=None,
+        idle_for_tactile_reset=None,
     ):
-        self.idle_for_tare = idle_for_tare
+        self.idle_for_tactile_reset = idle_for_tactile_reset
         self.home_results = []
         self.shared = shared
         self.robot = robot
@@ -73,7 +73,7 @@ class PolicyOperator:
     def _handle_command_batch(self, signals) -> None:
         # H blocks the I/O owner. H/B/T in that batch require a fresh request
         # after HOME, including when HOME returns incomplete.
-        discard_begin_or_tare_in_batch = False
+        discard_preparation_in_batch = False
         home_handled_in_batch = False
         # S/Q suppress H/B/T throughout the batch; ESC uses the latch/callback.
         stop_in_batch = any(
@@ -84,40 +84,40 @@ class PolicyOperator:
                 if stop_in_batch:
                     logger.warning("operator: ignored B received in the same batch as S/Q")
                     continue
-                if discard_begin_or_tare_in_batch or not request_policy_start(self.shared):
+                if discard_preparation_in_batch or not request_policy_start(self.shared):
                     logger.warning(
                         "operator: ignored B while stopped or after preparation in this batch"
                     )
                     continue
             elif signal is OperatorCommand.STOP:
                 # The keyboard completed the motion fence before enqueueing.
-                # STOP still suppresses HOME/BEGIN/TARE in this batch, but must
+                # STOP still suppresses HOME/BEGIN/RESET_TACTILE in this batch, but must
                 # not revoke again after the policy runner clears the stop request.
                 continue
             elif signal is OperatorCommand.PAUSE:
                 logger.warning("operator: C is not used in policy deployment; ignored")
             elif signal is OperatorCommand.DISCARD:
                 logger.warning("operator: D is not used in policy deployment; ignored")
-            elif signal is OperatorCommand.TARE:
-                if discard_begin_or_tare_in_batch:
+            elif signal is OperatorCommand.RESET_TACTILE:
+                if discard_preparation_in_batch:
                     logger.warning("operator: ignored T after preparation in the same batch")
                     continue
-                discard_begin_or_tare_in_batch = True
-                if stop_in_batch or self.idle_for_tare is None or not self.idle_for_tare():
+                discard_preparation_in_batch = True
+                if stop_in_batch or self.idle_for_tactile_reset is None or not self.idle_for_tactile_reset():
                     logger.warning(
-                        "T ignored: tactile tare requires idle, no capture/reset/pending inference"
+                        "T ignored: tactile reset requires idle, no capture/reset/pending inference"
                     )
                     continue
                 if int(self.shared.safety_state) != int(SafetyState.ARMED):
                     continue
                 try:
-                    result = self.robot.tare_tactile(cancel_requested=self._home_abort_requested)
-                    logger.info("Explicit tactile baseline aggregate/dense: %s", result)
-                except CancelledError:
-                    logger.info("Tactile tare cancelled; no new baseline published")
+                    logger.info("正在请求触觉传感器复位，请保持手部无接触；S/Q/Esc 可中断后续请求。")
+                    self.robot.reset_tactile_sensors(cancel_requested=self._home_abort_requested)
+                except CancelledError as exc:
+                    logger.info("%s", exc)
                 finally:
                     for command in (
-                        OperatorCommand.TARE,
+                        OperatorCommand.RESET_TACTILE,
                         OperatorCommand.HOME,
                         OperatorCommand.BEGIN,
                     ):
@@ -134,7 +134,7 @@ class PolicyOperator:
                     continue
                 if self._run_home():
                     home_handled_in_batch = True
-                    discard_begin_or_tare_in_batch = True
+                    discard_preparation_in_batch = True
             elif signal is OperatorCommand.QUIT:
                 # Listener stays available through final recording cleanup.
                 continue
@@ -161,6 +161,7 @@ class PolicyOperator:
         home_result = {"outcome": "incomplete"}
         self.home_results.append(home_result)
         try:
+            logger.info("正在回初始位…")
             result = home_robot(
                 self.shared,
                 self.runtime,
@@ -196,13 +197,13 @@ class PolicyOperator:
             reason=result.reason,
         )
         if completed_without_stop:
-            logger.info("operator: physical home sequence completed; press B to start")
+            logger.info("已回初始位，按 B 开始。")
         else:
-            logger.warning("operator: HOME incomplete or interrupted; check current pose before B")
+            logger.warning("回初始位未完成，请检查当前姿态：%s", result.reason)
         # HOME blocks while hand/arm homing completes. Drop stale
         # H/B/T events, but preserve S/Q/ESC so an operator can
         # still stop, quit, or e-stop immediately afterwards.
-        self.keyboard.drain_signal(OperatorCommand.TARE)
+        self.keyboard.drain_signal(OperatorCommand.RESET_TACTILE)
         self.keyboard.drain_signal(OperatorCommand.HOME)
         self.keyboard.drain_signal(OperatorCommand.BEGIN)
         return True

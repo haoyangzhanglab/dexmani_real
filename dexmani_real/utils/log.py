@@ -25,6 +25,9 @@ _FORMATTER = logging.Formatter(
     "[%(asctime)s] [%(levelname)-7s] [%(name)s] %(message)s",
     datefmt="%H:%M:%S",
 )
+_CONSOLE_FORMATTER = logging.Formatter(
+    "[%(asctime)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S"
+)
 
 # One file handler per process; creation failure leaves stdout logging active.
 _file_handler: logging.FileHandler | None = None
@@ -60,7 +63,7 @@ def configure_logging() -> None:
     if logger.handlers:
         return
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(_FORMATTER)
+    handler.setFormatter(_CONSOLE_FORMATTER)
     handler.setLevel(logging.INFO)
     logger.addHandler(handler)
     file_handler = _get_file_handler()

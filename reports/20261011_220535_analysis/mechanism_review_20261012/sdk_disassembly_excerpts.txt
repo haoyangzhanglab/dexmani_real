@@ -1,0 +1,100 @@
+
+# Instructions 0x2bb02..0x2bb0d
+   2bb02:	c7 84 24 f8 3a 00 00 	movl   $0x16e78e,0x3af8(%rsp)
+   2bb09:	8e e7 16 00 
+   2bb0d:	e8 1e fd ff ff       	call   2b830 <std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::basic_string(char const*, std::allocator<char> const&) [clone .isra.0]>
+
+# Instructions 0x2be1c..0x2be2e
+   2be1c:	48 8d 35 65 e0 06 00 	lea    0x6e065(%rip),%rsi        # 99e88 <crc16tab+0x5a8>
+   2be23:	c7 84 24 08 3f 00 00 	movl   $0x16e76b,0x3f08(%rsp)
+   2be2a:	6b e7 16 00 
+   2be2e:	e8 fd f9 ff ff       	call   2b830 <std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::basic_string(char const*, std::allocator<char> const&) [clone .isra.0]>
+
+# Instructions 0x56fb0..0x57024
+   56fb0:	4b 8d 04 64          	lea    (%r12,%r12,2),%rax
+   56fb4:	48 8d 14 c3          	lea    (%rbx,%rax,8),%rdx
+   56fb8:	f3 0f 10 8a 72 21 00 	movss  0x2172(%rdx),%xmm1
+   56fbf:	00 
+   56fc0:	48 8d 82 70 21 00 00 	lea    0x2170(%rdx),%rax
+   56fc7:	0f b6 92 71 21 00 00 	movzbl 0x2171(%rdx),%edx
+   56fce:	f3 0f 11 4d 01       	movss  %xmm1,0x1(%rbp)
+   56fd3:	88 55 00             	mov    %dl,0x0(%rbp)
+   56fd6:	0f b7 50 06          	movzwl 0x6(%rax),%edx
+   56fda:	66 89 55 05          	mov    %dx,0x5(%rbp)
+   56fde:	0f b7 50 08          	movzwl 0x8(%rax),%edx
+   56fe2:	66 89 55 07          	mov    %dx,0x7(%rbp)
+   56fe6:	0f b7 50 0a          	movzwl 0xa(%rax),%edx
+   56fea:	66 89 55 09          	mov    %dx,0x9(%rbp)
+   56fee:	0f b7 70 0c          	movzwl 0xc(%rax),%esi
+   56ff2:	66 89 75 0b          	mov    %si,0xb(%rbp)
+   56ff6:	66 85 f6             	test   %si,%si
+   56ff9:	0f 84 49 ff ff ff    	je     56f48 <serial_communication::SerialCommunication::update_hand_state()+0x48>
+   56fff:	48 8b 7c 24 08       	mov    0x8(%rsp),%rdi
+   57004:	4c 8d 74 24 38       	lea    0x38(%rsp),%r14
+   57009:	e8 42 d3 fc ff       	call   24350 <xhand_control::ErrorManager::get_error_info(int)@plt>
+   5700e:	8b 44 24 20          	mov    0x20(%rsp),%eax
+   57012:	48 8b 54 24 28       	mov    0x28(%rsp),%rdx
+   57017:	48 8b bb e0 34 00 00 	mov    0x34e0(%rbx),%rdi
+   5701e:	89 83 d8 34 00 00    	mov    %eax,0x34d8(%rbx)
+   57024:	4c 39 f2             	cmp    %r14,%rdx
+
+# Instructions 0x5d04a..0x5d0c2
+   5d04a:	0f b6 83 b0 32 00 00 	movzbl 0x32b0(%rbx),%eax
+   5d051:	84 c0                	test   %al,%al
+   5d053:	0f 85 27 01 00 00    	jne    5d180 <serial_communication::SerialCommunication::read_state(unsigned char, std::shared_ptr<xhand_control::ErrorStruct>, bool)+0x2c0>
+   5d059:	48 8d 6b 28          	lea    0x28(%rbx),%rbp
+   5d05d:	4d 85 f6             	test   %r14,%r14
+   5d060:	74 10                	je     5d072 <serial_communication::SerialCommunication::read_state(unsigned char, std::shared_ptr<xhand_control::ErrorStruct>, bool)+0x1b2>
+   5d062:	48 89 ef             	mov    %rbp,%rdi
+   5d065:	e8 46 6d fc ff       	call   23db0 <pthread_mutex_lock@plt>
+   5d06a:	85 c0                	test   %eax,%eax
+   5d06c:	0f 85 0f 07 00 00    	jne    5d781 <serial_communication::SerialCommunication::read_state(unsigned char, std::shared_ptr<xhand_control::ErrorStruct>, bool)+0x8c1>
+   5d072:	48 8b 83 10 2a 00 00 	mov    0x2a10(%rbx),%rax
+   5d079:	49 8d 7c 24 08       	lea    0x8(%r12),%rdi
+   5d07e:	4c 89 e1             	mov    %r12,%rcx
+   5d081:	48 8d b3 10 2a 00 00 	lea    0x2a10(%rbx),%rsi
+   5d088:	48 83 e7 f8          	and    $0xfffffffffffffff8,%rdi
+   5d08c:	48 29 f9             	sub    %rdi,%rcx
+   5d08f:	49 89 04 24          	mov    %rax,(%r12)
+   5d093:	48 8b 83 a8 32 00 00 	mov    0x32a8(%rbx),%rax
+   5d09a:	48 29 ce             	sub    %rcx,%rsi
+   5d09d:	81 c1 a0 08 00 00    	add    $0x8a0,%ecx
+   5d0a3:	49 89 84 24 98 08 00 	mov    %rax,0x898(%r12)
+   5d0aa:	00 
+   5d0ab:	c1 e9 03             	shr    $0x3,%ecx
+   5d0ae:	f3 48 a5             	rep movsq %ds:(%rsi),%es:(%rdi)
+   5d0b1:	4d 85 f6             	test   %r14,%r14
+   5d0b4:	0f 84 df fe ff ff    	je     5cf99 <serial_communication::SerialCommunication::read_state(unsigned char, std::shared_ptr<xhand_control::ErrorStruct>, bool)+0xd9>
+   5d0ba:	48 89 ef             	mov    %rbp,%rdi
+   5d0bd:	e8 ce 5f fc ff       	call   23090 <pthread_mutex_unlock@plt>
+   5d0c2:	e9 d2 fe ff ff       	jmp    5cf99 <serial_communication::SerialCommunication::read_state(unsigned char, std::shared_ptr<xhand_control::ErrorStruct>, bool)+0xd9>
+
+# Instructions 0x5d0fe..0x5d171
+   5d0fe:	48 8d 93 80 35 00 00 	lea    0x3580(%rbx),%rdx
+   5d105:	4c 89 f9             	mov    %r15,%rcx
+   5d108:	89 ee                	mov    %ebp,%esi
+   5d10a:	48 89 df             	mov    %rbx,%rdi
+   5d10d:	41 ff d0             	call   *%r8
+   5d110:	48 8b 6c 24 28       	mov    0x28(%rsp),%rbp
+   5d115:	4c 8b 35 2c ae 05 00 	mov    0x5ae2c(%rip),%r14        # b7f48 <__pthread_key_create@GLIBC_2.2.5>
+   5d11c:	48 85 ed             	test   %rbp,%rbp
+   5d11f:	0f 84 25 ff ff ff    	je     5d04a <serial_communication::SerialCommunication::read_state(unsigned char, std::shared_ptr<xhand_control::ErrorStruct>, bool)+0x18a>
+   5d125:	4d 85 f6             	test   %r14,%r14
+   5d128:	0f 84 42 03 00 00    	je     5d470 <serial_communication::SerialCommunication::read_state(unsigned char, std::shared_ptr<xhand_control::ErrorStruct>, bool)+0x5b0>
+   5d12e:	b8 ff ff ff ff       	mov    $0xffffffff,%eax
+   5d133:	f0 0f c1 45 08       	lock xadd %eax,0x8(%rbp)
+   5d138:	83 f8 01             	cmp    $0x1,%eax
+   5d13b:	0f 85 09 ff ff ff    	jne    5d04a <serial_communication::SerialCommunication::read_state(unsigned char, std::shared_ptr<xhand_control::ErrorStruct>, bool)+0x18a>
+   5d141:	48 8b 45 00          	mov    0x0(%rbp),%rax
+   5d145:	48 89 ef             	mov    %rbp,%rdi
+   5d148:	ff 50 10             	call   *0x10(%rax)
+   5d14b:	4d 85 f6             	test   %r14,%r14
+   5d14e:	0f 84 9c 05 00 00    	je     5d6f0 <serial_communication::SerialCommunication::read_state(unsigned char, std::shared_ptr<xhand_control::ErrorStruct>, bool)+0x830>
+   5d154:	b8 ff ff ff ff       	mov    $0xffffffff,%eax
+   5d159:	f0 0f c1 45 0c       	lock xadd %eax,0xc(%rbp)
+   5d15e:	83 f8 01             	cmp    $0x1,%eax
+   5d161:	0f 85 e3 fe ff ff    	jne    5d04a <serial_communication::SerialCommunication::read_state(unsigned char, std::shared_ptr<xhand_control::ErrorStruct>, bool)+0x18a>
+   5d167:	48 8b 45 00          	mov    0x0(%rbp),%rax
+   5d16b:	48 89 ef             	mov    %rbp,%rdi
+   5d16e:	ff 50 18             	call   *0x18(%rax)
+   5d171:	e9 d4 fe ff ff       	jmp    5d04a <serial_communication::SerialCommunication::read_state(unsigned char, std::shared_ptr<xhand_control::ErrorStruct>, bool)+0x18a>

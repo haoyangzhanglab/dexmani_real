@@ -44,33 +44,10 @@ class RGBDFrame:
     depth_aligned_to_color_raw: np.ndarray | None
     depth_frame_number: int
     color_frame_number: int
-    depth_device_timestamp_s: float
-    color_device_timestamp_s: float
-    depth_timestamp_domain: int
-    color_timestamp_domain: int
-    depth_source_ns: int
-    color_source_ns: int
-    # Host queue-return time, before alignment/copying; distinct from source time.
+    # Host monotonic queue-return time, before alignment/copying.
     timestamp_ns: int
     depth_scale: float
     serial: str | None
-
-
-def _source_timestamp_ns(timestamp_s, domain, *, received_ns, realtime_ns):
-    """Map SDK global/system time to host monotonic; 0 rejects an invalid clock.
-
-    Hardware-only timestamps have no known host offset, so retain the explicit
-    receive-time origin for that domain. Never estimate an offset from arrivals:
-    that would hide camera/USB queue latency. Domain and SDK time travel with RGB-D.
-    """
-    if not np.isfinite(timestamp_s) or timestamp_s <= 0:
-        return 0
-    if domain == int(rs.timestamp_domain.hardware_clock):
-        return received_ns
-    if domain not in (int(rs.timestamp_domain.global_time), int(rs.timestamp_domain.system_time)):
-        return 0
-    source_ns = received_ns + round(timestamp_s * 1e9) - realtime_ns
-    return source_ns if 0 < source_ns <= received_ns else 0
 
 
 class RealSenseCamera:
@@ -275,7 +252,6 @@ class RealSenseCamera:
         self._apply_depth_config()
         self._apply_color_config()
 
-        self.set_global_time()
         self.depth_scale = float(self.profile.get_device().first_depth_sensor().get_depth_scale())
         self.update_geometry_from_profile()
         self._depth_to_color_aligner = rs.align(rs.stream.color)
@@ -392,16 +368,6 @@ class RealSenseCamera:
         )
         return rs_config
 
-    def set_global_time(self) -> None:
-        if self.profile is None:
-            return
-        for sensor in self.profile.get_device().query_sensors():
-            try:
-                if sensor.supports(rs.option.global_time_enabled):
-                    sensor.set_option(rs.option.global_time_enabled, 1)
-            except RuntimeError:
-                logger.warning("RealSense global-time option could not be enabled", exc_info=True)
-
     @staticmethod
     def is_l515_device(device: rs.device) -> bool:
         name = RealSenseCamera.get_device_info_value(device, rs.camera_info.name).upper()
@@ -469,9 +435,6 @@ class RealSenseCamera:
         # Timestamp immediately after the queue wait returns, before frameset
         # recovery or any array ownership copies.
         wait_return_monotonic_ns = time.monotonic_ns()
-        # Sample monotonic first: scheduling between these calls can only make
-        # the mapped source older. SDK global_time is in OS realtime, not monotonic.
-        wait_return_realtime_ns = time.time_ns()
         frames = queued_frame.as_frameset()
         if not frames:
             raise RuntimeError("RealSense frame queue returned a non-frameset frame.")
@@ -503,10 +466,6 @@ class RealSenseCamera:
         # Preserve the device-provided frame number.  Unlike a local counter,
         # this exposes device/pipeline stalls and dropped frames end-to-end.
         depth_frame_number = int(depth_frame.get_frame_number())
-        depth_timestamp_s = float(depth_frame.get_timestamp()) * 1e-3
-        depth_timestamp_domain = int(depth_frame.get_frame_timestamp_domain())
-        color_timestamp_s = float(color_frame.get_timestamp()) * 1e-3
-        color_timestamp_domain = int(color_frame.get_frame_timestamp_domain())
         color_frame_number = int(color_frame.get_frame_number())
         frame = RGBDFrame(
             rgb=rgb,
@@ -514,18 +473,6 @@ class RealSenseCamera:
             depth_aligned_to_color_raw=aligned_depth_raw,
             depth_frame_number=depth_frame_number,
             color_frame_number=color_frame_number,
-            depth_device_timestamp_s=depth_timestamp_s,
-            color_device_timestamp_s=color_timestamp_s,
-            depth_timestamp_domain=depth_timestamp_domain,
-            color_timestamp_domain=color_timestamp_domain,
-            depth_source_ns=_source_timestamp_ns(
-                depth_timestamp_s, depth_timestamp_domain,
-                received_ns=wait_return_monotonic_ns, realtime_ns=wait_return_realtime_ns,
-            ),
-            color_source_ns=_source_timestamp_ns(
-                color_timestamp_s, color_timestamp_domain,
-                received_ns=wait_return_monotonic_ns, realtime_ns=wait_return_realtime_ns,
-            ),
             timestamp_ns=wait_return_monotonic_ns,
             depth_scale=float(self.depth_scale),
             serial=self.active_serial,

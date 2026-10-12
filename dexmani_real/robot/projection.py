@@ -6,11 +6,9 @@ from dexmani_real.planning.paths import wrap_nearest_equivalent
 
 
 def project_arm_command(target_arm_qpos, reference_arm_qpos, *, joint_lower_rad, joint_upper_rad):
-    target = np.asarray(target_arm_qpos, dtype=np.float64)
-    reference = np.asarray(reference_arm_qpos, dtype=np.float64)
-    if any(x.shape != (7,) or not np.isfinite(x).all() for x in (target, reference)):
-        raise ValueError("arm preparation requires finite (7,) target and reference")
-    equivalent = wrap_nearest_equivalent(target, reference, joint_lower_rad, joint_upper_rad)
+    equivalent = wrap_nearest_equivalent(
+        target_arm_qpos, reference_arm_qpos, joint_lower_rad, joint_upper_rad
+    )
     return np.clip(equivalent, joint_lower_rad, joint_upper_rad)
 
 

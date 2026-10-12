@@ -41,9 +41,9 @@ _IDLE_POLL_S = 0.001
 class PointCloudWorkerConfig:
     """Resolved processing policy for the realtime worker.
 
-    Each cloud keeps its camera sequence, source timestamp and processing clocks. Consumers
-    check cloud freshness; only joint RGB/cloud consumers retrieve the matching
-    RGB-D sample. Published clouds are otherwise self-contained.
+    Each cloud inherits its camera sequence and oldest channel's host receive time.
+    Consumers check cloud freshness; only joint RGB/cloud consumers retrieve the
+    matching RGB-D sample. Published clouds are otherwise self-contained.
     """
 
     pointcloud: PointCloudConfig
@@ -186,13 +186,13 @@ def run_pointcloud_worker(shared: "SensorChannels", config: PointCloudWorkerConf
             if not ready:
                 shared.pointcloud_ready.set()
                 ready = True
-                logger.info(
+                logger.debug(
                     "run_pointcloud_worker: ready (shape=(%d,6), frame=xarm_base)",
                     cfg.pointcloud.num_points,
                 )
     finally:
         shared.pointcloud_ready.clear()
-        logger.info("run_pointcloud_worker: exited")
+        logger.debug("run_pointcloud_worker: exited")
 
 
 __all__ = ["PointCloudWorkerConfig", "run_pointcloud_worker"]

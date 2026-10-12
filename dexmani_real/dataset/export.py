@@ -107,7 +107,7 @@ def export_raw_to_zarr(
                         period_ns=sampling_clock_ns(reader.control_hz)[0],
                         tolerance_ns=sampling_clock_ns(reader.control_hz)[1],
                     ),
-                    action_semantics="absolute_target_accepted_by_both_sdks",
+                    action_semantics="absolute_target_submitted_to_both_sdks",
                     depth_scale_m_per_unit=float(reader.meta["depth_scale"]),
                     pointcloud_config=processing.pointcloud.to_dict(),
                     fingertip_link_names=list(processing.fingertip_link_names),

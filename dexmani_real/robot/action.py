@@ -113,24 +113,23 @@ class ActionRealizer:
         if self.collision_model is None:
             raise RuntimeError("online admission requires a collision model")
         physical_hand = hand if hand is not None else np.deg2rad(cfg.hand.home_qpos_deg)
-        if self.target_fk is not None:
-            physical_hand = np.asarray(physical_hand)
-            if physical_hand.shape != (12,) or not np.isfinite(physical_hand).all():
-                return "invalid_hand_target"
-            if np.any(physical_hand < cfg.hand.qpos_min_rad) or np.any(physical_hand > cfg.hand.qpos_max_rad):
-                return "hand_operational_limits"
         self.collision_model.set_hand_qpos(physical_hand)
-        if self.target_fk is not None:
-            if not self.collision_model.within_joint_limits(target):
-                return "model_joint_limits"
-            position, _ = self.target_fk.compute(target)
-            bounds = cfg.policy.workspace.as_array()
-            margin = cfg.execution.eef_workspace_margin_m
-            if np.any(position < bounds[:, 0] - margin) or np.any(position > bounds[:, 1] + margin):
-                return "final_eef_workspace"
         if self.collision_model.check_self_collision(target):
             return "self_collision"
-        if self.target_fk is not None and self.collision_model.check_environment_collision(target):
+        return self._final_target_rejection(target)
+
+    def _final_target_rejection(self, target):
+        """Deployment geometry not covered by online IK's candidate admission."""
+        if self.target_fk is None:
+            return None
+        if not self.collision_model.within_joint_limits(target):
+            return "model_joint_limits"
+        position, _ = self.target_fk.compute(target)
+        bounds = self.runtime.policy.workspace.as_array()
+        margin = self.runtime.execution.eef_workspace_margin_m
+        if np.any(position < bounds[:, 0] - margin) or np.any(position > bounds[:, 1] + margin):
+            return "final_eef_workspace"
+        if self.collision_model.check_environment_collision(target):
             details = self.collision_model.check_environment_collision_details(target)
             contacts = ", ".join(f"{p.link_name1}/{p.link_name2}" for p in details.collision_pairs)
             return f"environment_collision: {contacts or 'contact_details_unavailable'}"
@@ -185,8 +184,7 @@ class ActionRealizer:
         self.planner.set_hand_qpos(hand if hand is not None else np.deg2rad(cfg.hand.home_qpos_deg))
         result = self.planner.solve_online_ik(pose, current, previous)
         reason = result.reason if not result.success else (
-            self._joint_rejection(result.qpos, hand, current, previous)
-            if self.target_fk is not None else None
+            self._final_target_rejection(result.qpos)
         )
         return ActionRealization(
             result.qpos if reason is None else None,

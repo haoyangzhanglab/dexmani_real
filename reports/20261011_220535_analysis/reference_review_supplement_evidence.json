@@ -1,0 +1,359 @@
+{
+  "review_date": "2026-10-12",
+  "scope": "Read-only source and paper review; no hardware, inference, training or production code edits.",
+  "previous_review": "reference_review_evidence.json",
+  "references": {
+    "PF-DAG": {
+      "commit": "b877129754267c3d9c564abcb19960bcf215e12f",
+      "remote_head_verified": true,
+      "repository": "https://github.com/XiaohanLei/PF-DAG",
+      "local_path": "/home/zhanghaoyang/Desktop/Reference/PF-DAG",
+      "commit_time": "2026-02-25T18:04:29+08:00",
+      "tracked_sources_unmodified": true,
+      "sources": {
+        "README.md": {
+          "sha256": "1e64909b50d07544ea0243faffff41f9a4dd6c441dcd351894b8fc4384fc37ee",
+          "url": "https://github.com/XiaohanLei/PF-DAG/blob/b877129754267c3d9c564abcb19960bcf215e12f/README.md"
+        },
+        "pf_dag_policy/policy/pf_dag_policy.py": {
+          "sha256": "287e04a7829f4580edb301b86a9d97689c779e2b520e4b7ada5974df641f02a2",
+          "url": "https://github.com/XiaohanLei/PF-DAG/blob/b877129754267c3d9c564abcb19960bcf215e12f/pf_dag_policy/policy/pf_dag_policy.py"
+        },
+        "pf_dag_policy/model/vqvae/vqvae_enc_dec.py": {
+          "sha256": "2a63a8f12d353c1cb23ff54063b34a9eda41fe23b612ae45022413e72b6effcc",
+          "url": "https://github.com/XiaohanLei/PF-DAG/blob/b877129754267c3d9c564abcb19960bcf215e12f/pf_dag_policy/model/vqvae/vqvae_enc_dec.py"
+        },
+        "pf_dag_policy/model/vqvae/vqvae_enc_dec_a.py": {
+          "sha256": "26ff079fd2cf35ac7d921eb07de13a359a834b0c99de45ecadb4ace411550a9a",
+          "url": "https://github.com/XiaohanLei/PF-DAG/blob/b877129754267c3d9c564abcb19960bcf215e12f/pf_dag_policy/model/vqvae/vqvae_enc_dec_a.py"
+        },
+        "pf_dag/agents/policy_agent.py": {
+          "sha256": "4b7d6042c868aa4c87f188671140b4bb5baad95678081cee64708c49dfad64c3",
+          "url": "https://github.com/XiaohanLei/PF-DAG/blob/b877129754267c3d9c564abcb19960bcf215e12f/pf_dag/agents/policy_agent.py"
+        },
+        "pf_dag/robots/xarm_robot_wo_gripper.py": {
+          "sha256": "658ae270d23781ccfb256684fc590f4c6cda3ec8d0f259b2b23315edd7aa7525",
+          "url": "https://github.com/XiaohanLei/PF-DAG/blob/b877129754267c3d9c564abcb19960bcf215e12f/pf_dag/robots/xarm_robot_wo_gripper.py"
+        },
+        "pf_dag/robots/xhand_robot.py": {
+          "sha256": "b0b25603acf38e46f727b43453a9e8f6f5e9b061f122f4a0057dc50fa3ca8363",
+          "url": "https://github.com/XiaohanLei/PF-DAG/blob/b877129754267c3d9c564abcb19960bcf215e12f/pf_dag/robots/xhand_robot.py"
+        },
+        "scripts/run_env_xhand.py": {
+          "sha256": "8bfd702432c0180685056dd7e7ec5dd58174c61334dbe68652140dba6e086bb6",
+          "url": "https://github.com/XiaohanLei/PF-DAG/blob/b877129754267c3d9c564abcb19960bcf215e12f/scripts/run_env_xhand.py"
+        }
+      }
+    },
+    "DexUMI": {
+      "commit": "acddb8f8a89a8f0186868bbec44306eb7808114a",
+      "remote_head_verified": true,
+      "repository": "https://github.com/real-stanford/DexUMI",
+      "local_path": "/home/zhanghaoyang/Desktop/Reference/DexUMI",
+      "commit_time": "2026-04-18T16:04:12-07:00",
+      "tracked_sources_unmodified": true,
+      "sources": {
+        "README.md": {
+          "sha256": "f7b5576094e356ab6bf4254106fc2fd61bfb90ad03d9de2cc1804310a657102d",
+          "url": "https://github.com/real-stanford/DexUMI/blob/acddb8f8a89a8f0186868bbec44306eb7808114a/README.md"
+        },
+        "real_script/eval_policy/eval_xhand.py": {
+          "sha256": "169791626c789144c0f3f7d907ab3a734be430f1baa3d6ff10f41703550ea4c5",
+          "url": "https://github.com/real-stanford/DexUMI/blob/acddb8f8a89a8f0186868bbec44306eb7808114a/real_script/eval_policy/eval_xhand.py"
+        },
+        "real_script/open_server.py": {
+          "sha256": "c67487ddd1470e3accdc6b44dc7e49e767b5b16222ff3a9b3faf1046a29246a8",
+          "url": "https://github.com/real-stanford/DexUMI/blob/acddb8f8a89a8f0186868bbec44306eb7808114a/real_script/open_server.py"
+        },
+        "dexumi/real_env/real_policy.py": {
+          "sha256": "e02f2728ac6394eb38badc5be761c2e478c76a782e8f7840aadeadb6a78df70f",
+          "url": "https://github.com/real-stanford/DexUMI/blob/acddb8f8a89a8f0186868bbec44306eb7808114a/dexumi/real_env/real_policy.py"
+        },
+        "dexumi/real_env/common/ur5.py": {
+          "sha256": "b79123fdbb315bb7fafe38fc0da442fce8a9bf71f2c521c303541f37b1a5dc52",
+          "url": "https://github.com/real-stanford/DexUMI/blob/acddb8f8a89a8f0186868bbec44306eb7808114a/dexumi/real_env/common/ur5.py"
+        },
+        "dexumi/real_env/common/dexhand.py": {
+          "sha256": "ff71106fbcd3dc0f21791dc4fc3e54476860054d758112353ca9c39288e5b741",
+          "url": "https://github.com/real-stanford/DexUMI/blob/acddb8f8a89a8f0186868bbec44306eb7808114a/dexumi/real_env/common/dexhand.py"
+        },
+        "dexumi/hand_sdk/xhand/hand_api_cls.py": {
+          "sha256": "1f8628e33b3b159e5b1b05bcffe214f01bbee7d4dcd398d8f899346efd80e2a0",
+          "url": "https://github.com/real-stanford/DexUMI/blob/acddb8f8a89a8f0186868bbec44306eb7808114a/dexumi/hand_sdk/xhand/hand_api_cls.py"
+        },
+        "config/diffusion_policy/train_diffusion_policy.yaml": {
+          "sha256": "9ea9bce9042a147c55e59b8c22a9b7aa2b300720b0deb5d395fce4ca7209386b",
+          "url": "https://github.com/real-stanford/DexUMI/blob/acddb8f8a89a8f0186868bbec44306eb7808114a/config/diffusion_policy/train_diffusion_policy.yaml"
+        }
+      }
+    },
+    "RIO": {
+      "commit": "7c60b69065d0c226be55cf91770e0b5c34964bc3",
+      "remote_head_verified": true,
+      "repository": "https://github.com/robot-i-o/rio",
+      "local_path": "/tmp/dexmani_rio_review",
+      "commit_time": "2026-09-21T13:08:01-04:00",
+      "tracked_sources_unmodified": true,
+      "sources": {
+        "README.md": {
+          "sha256": "8e16a594bd0beece50be316ad3356900c131bc69e51799263c88bc57b7b68964",
+          "url": "https://github.com/robot-i-o/rio/blob/7c60b69065d0c226be55cf91770e0b5c34964bc3/README.md"
+        },
+        "pyproject.toml": {
+          "sha256": "1f9a0aa64f50f23e3c2847e1519d23d9c3e442773a2eba89dbff8e144c0530e9",
+          "url": "https://github.com/robot-i-o/rio/blob/7c60b69065d0c226be55cf91770e0b5c34964bc3/pyproject.toml"
+        },
+        "examples/policy_inference.py": {
+          "sha256": "f0cfabc201457330bbb1962201b550b8da0da3e1eea27268d77468f01299304c",
+          "url": "https://github.com/robot-i-o/rio/blob/7c60b69065d0c226be55cf91770e0b5c34964bc3/examples/policy_inference.py"
+        },
+        "rio/policies/policy_interface.py": {
+          "sha256": "0974d3c067e5f66356bc587abdd2988df592dd23f58ff0dfb8cf146b05a5c99f",
+          "url": "https://github.com/robot-i-o/rio/blob/7c60b69065d0c226be55cf91770e0b5c34964bc3/rio/policies/policy_interface.py"
+        },
+        "rio/embodiments/single_arm.py": {
+          "sha256": "246d1cb7faf56022d2bd041c30f098c6c2bf57591fe0aaaf6b1dc976c8fe0c5a",
+          "url": "https://github.com/robot-i-o/rio/blob/7c60b69065d0c226be55cf91770e0b5c34964bc3/rio/embodiments/single_arm.py"
+        },
+        "rio/envs/env.py": {
+          "sha256": "673c37ca5cac08e554aae98c9f6fc3980fae3b8b4897ba0c9f7ebef161f940ac",
+          "url": "https://github.com/robot-i-o/rio/blob/7c60b69065d0c226be55cf91770e0b5c34964bc3/rio/envs/env.py"
+        },
+        "rio/data/recorder.py": {
+          "sha256": "23738f4e115c808d5085306ca1841a623eb7c9ad8f1c4e0d0e547d3df457778f",
+          "url": "https://github.com/robot-i-o/rio/blob/7c60b69065d0c226be55cf91770e0b5c34964bc3/rio/data/recorder.py"
+        },
+        "rio/data/_formatter.py": {
+          "sha256": "daa24b34610233356de2883f4fa351d3afe0ee205b95893d0e1aaecd27d2ea59",
+          "url": "https://github.com/robot-i-o/rio/blob/7c60b69065d0c226be55cf91770e0b5c34964bc3/rio/data/_formatter.py"
+        },
+        "rio/schema.py": {
+          "sha256": "f19a38aee50013ab7b1494bee14c96ed2b1c02e119cc9f523209478e4964962f",
+          "url": "https://github.com/robot-i-o/rio/blob/7c60b69065d0c226be55cf91770e0b5c34964bc3/rio/schema.py"
+        },
+        "examples/cfg/xarm_eef.py": {
+          "sha256": "0146ab39722b2db588ee235b3db975b0d07885834e1962c67e1ecd120627acc5",
+          "url": "https://github.com/robot-i-o/rio/blob/7c60b69065d0c226be55cf91770e0b5c34964bc3/examples/cfg/xarm_eef.py"
+        },
+        "docs/workflow/deploy.md": {
+          "sha256": "fee2cd52d72269a2857a3f5a5c6966f8f843df864937bc7abc3333ead9a65270",
+          "url": "https://github.com/robot-i-o/rio/blob/7c60b69065d0c226be55cf91770e0b5c34964bc3/docs/workflow/deploy.md"
+        }
+      }
+    },
+    "RIO hardware dependency": {
+      "commit": "8417c378ff138f99422a65ed1041f8bd04e04558",
+      "remote_head_verified": true,
+      "repository": "https://github.com/robot-i-o/rio-hw",
+      "local_path": "/tmp/dexmani_rio_hw_review",
+      "commit_time": "2026-09-22T15:12:27-04:00",
+      "tracked_sources_unmodified": true,
+      "sources": {
+        "rio_hw/robots/xarm_arm.py": {
+          "sha256": "96d1a891afe1356e9688f072837afe3842dbe6183dfc6a4e9a54a57566c1ee7b",
+          "url": "https://github.com/robot-i-o/rio-hw/blob/8417c378ff138f99422a65ed1041f8bd04e04558/rio_hw/robots/xarm_arm.py"
+        },
+        "rio_hw/interpolators.py": {
+          "sha256": "072baa264b24608f0831563364d8dc2e8163175d31a7208b2c418f23be759d14",
+          "url": "https://github.com/robot-i-o/rio-hw/blob/8417c378ff138f99422a65ed1041f8bd04e04558/rio_hw/interpolators.py"
+        }
+      },
+      "note": "RIO declares rio_hw at floating main. This review separately pins the observed rio-hw HEAD; it is not a historical lockfile claim."
+    },
+    "lerobot_robot_ufactory": {
+      "commit": "5fe6fb150bfa71ad3ca8a0b780c89ff8d4033a82",
+      "remote_head_verified": true,
+      "repository": "https://github.com/xArm-Developer/lerobot_robot_ufactory",
+      "local_path": "/tmp/dexmani_ufactory_review",
+      "commit_time": "2026-09-01T16:54:46+08:00",
+      "tracked_sources_unmodified": true,
+      "sources": {
+        "README_ZH.md": {
+          "sha256": "0e9cdb9c8bc54f428d0d89b61bc2ed5d5f83828e538535dd70f44d4d767de515",
+          "url": "https://github.com/xArm-Developer/lerobot_robot_ufactory/blob/5fe6fb150bfa71ad3ca8a0b780c89ff8d4033a82/README_ZH.md"
+        },
+        "src/lerobot_robot_ufactory/robots/uf_robot/uf_robot.py": {
+          "sha256": "5f292ff2f230f95eb13cf4efa1cdb4bfbad163fa16960c1dd5fed2979687fed4",
+          "url": "https://github.com/xArm-Developer/lerobot_robot_ufactory/blob/5fe6fb150bfa71ad3ca8a0b780c89ff8d4033a82/src/lerobot_robot_ufactory/robots/uf_robot/uf_robot.py"
+        },
+        "src/lerobot_robot_ufactory/robots/uf_robot/uf_robot_config.py": {
+          "sha256": "6434b705554de7163248042592c435defd3a1d7ffc087cb90b2f59e7670f39b9",
+          "url": "https://github.com/xArm-Developer/lerobot_robot_ufactory/blob/5fe6fb150bfa71ad3ca8a0b780c89ff8d4033a82/src/lerobot_robot_ufactory/robots/uf_robot/uf_robot_config.py"
+        },
+        "src/lerobot_robot_ufactory/scripts/uf_lerobot_eval.py": {
+          "sha256": "0ab612e2a510b12827fcf03029ebc2d376078fd128a1e68b2a5cb433f51a8770",
+          "url": "https://github.com/xArm-Developer/lerobot_robot_ufactory/blob/5fe6fb150bfa71ad3ca8a0b780c89ff8d4033a82/src/lerobot_robot_ufactory/scripts/uf_lerobot_eval.py"
+        }
+      },
+      "local_reference_older_commit": "e2632889b30b392d28a2131e525571db00e76a25",
+      "note": "Reviewed a separate /tmp checkout at current remote HEAD; existing Reference checkout unchanged."
+    }
+  },
+  "papers": {
+    "PF-DAG": {
+      "url": "https://xiaohanlei.github.io/projects/PF-DAG/resources/ICLR2026/pf-dag.pdf",
+      "downloaded_pdf_sha256": "918728e12db767e25f294a88e46dc16147f68aee04d0b78d97358e923104613f",
+      "visually_checked_printed_pages": [
+        7,
+        9
+      ],
+      "notes": "Paper claims and released code are assessed separately."
+    },
+    "DexUMI": {
+      "url": "https://arxiv.org/html/2505.21864v2",
+      "deployment_guide": "https://dex-umi.github.io/tutorial/deployment.html"
+    },
+    "RIO": {
+      "url": "https://arxiv.org/html/2605.11564v1",
+      "note": "Reported latency benchmark uses its specific policy, hardware, and compared LeRobot setup; not a measurement of this session or all LeRobot versions."
+    }
+  },
+  "current_real_sources": {
+    "AGENTS.md": "a4fae025b6b8937198012b0ee52c52b1bd578a8800c30d09ca89b0c16ab22b64",
+    "dexmani_real/deployment/config.py": "9fae608077044f87fb6697dac09aa9acfd271859512696a8ec87b6e1f06984a6",
+    "dexmani_real/deployment/runner.py": "e91100b27b6b8d91b662c5d13834b06c53e041f9a4162ec500c61d0ad6fd8eae",
+    "dexmani_real/deployment/inference.py": "44b6d1ac3468f5c1b72ab58e18b3d2d9076210088fc5efd2c0dd44d13c01bb0c",
+    "dexmani_real/deployment/observation.py": "25e6f2838248e23cc32c6276a7afc4cdf5790aad872f14f94f93f1ff34e54f9b",
+    "dexmani_real/robot/action.py": "0145760ab00a4c4a57c1c07464bcc0265b41b23b688cfcd54a5979b91112bcb5",
+    "dexmani_real/robot/drivers/xarm7.py": "b61ca3f5e5fb273d4044a61c8b741f28dcd38122fd06c69f24512dd57d7a698a",
+    "dexmani_real/robot/drivers/xhand.py": "61271fd1f03cdc4da407c579075654f1d2b6fc6399a7af98fa21b08fa9204ab8",
+    "dexmani_real/robot/robot.py": "c62b2f4ac75ae20044f93b20d3ada57c93a6806624804c57887cb7daa663e13b",
+    "dexmani_real/robot/command_validation.py": "4aff528db0f1bdd97b5bb1c9e94ed9336998f11c30594b7cc70867ae29109178",
+    "dexmani_real/runtime/safety.py": "84a02de34d2f31463daea486a599feed25cabd6322eede4564377a8ea8a0e2b8",
+    "dexmani_real/runtime/observation.py": "c4e3957cd00ff75855a2a7bec6437cebec7901a51a1ff9b221c6380b2528f59f",
+    "dexmani_real/recording/storage/schema.py": "c056832b8f5d53ae3c1eb47ff5f6d1d27e7399cc15e413c43d19a7f708ec1335",
+    "dexmani_real/dataset/processing.py": "b0b0c915ec02101e5eb1bb1f7e1fd9c322df534f183c3617554eb3f918cc41b1",
+    "dexmani_real/config/hardware.py": "a43c4a93bb3629f7bd8a0ca5020f60cd28333705cfc0b074d9c2be4e18377628",
+    "dexmani_real/sensor/camera/realsense.py": "afa19dc58409813dfe16349f8da6dedaf82654e8965a4961095bbbe37c4fa514",
+    "dexmani_real/sensor/camera/worker.py": "be2ee8d5c26743545df96845ead0d4e653841d421448d2dcc42b48cbdc253483"
+  },
+  "sources_changed_since_previous_review": [],
+  "current_policy_sources": {
+    "dexmani_policy/deployment/runtime.py": "e2f98dd0a112102e8271eed31130e04dfd2a0ad605d1ab5764fcaca3f94cb993",
+    "dexmani_policy/agents/action_decoders/consistency_flow.py": "455bb8e6b1454289313a2bef65ae9a35c96902b48346645fb28b132e48c53ef2",
+    "dexmani_policy/configs/maniflow.yaml": "63a49e0dccb06c33ce606fa2dd0c3c526e274efdbd71ae282963d9f27aae9b1d",
+    "dexmani_policy/configs/interaction_flow.yaml": "7bdf7aec95a2d5f6af508c3d35e78aa301594a1e5ac3598d3c240b5c14f69f4d",
+    "docs/interaction_representation.md": "4f2b1a7a699875194a32db040f554cbd3c6865b9ace22e77242f81b74713a224"
+  },
+  "policy_sources_changed_since_previous_review": [],
+  "session_path": "/home/zhanghaoyang/Desktop/dexmani_real/rollouts/maniflow/pick_place_toy/2026-10-11_02-00-52-803763_1cbdb2c1_1011/session_20261011_220535",
+  "raw_source_verification": {
+    "episode_001/data.h5": {
+      "sha256": "17bfe8e4d975118fd79a1a06c4826d952ab1e05e33adac1f19d9784abc4d87e9",
+      "matches_previous": true
+    },
+    "episode_001/rgb.mp4": {
+      "sha256": "f40f90eb7aebcf3448a05825de6c6a9f560f8ea7b320d8199929ac91a13c1db5",
+      "matches_previous": true
+    },
+    "episode_002/data.h5": {
+      "sha256": "f734e8b9896506c619cd4605911f3c6224adf0d7d4f8b8507c723f369c1b42c5",
+      "matches_previous": true
+    },
+    "episode_002/rgb.mp4": {
+      "sha256": "025a1d2bdc8d80d905ae2e5a3a78cee289d9fc80f988b696034d8dc191f0cad4",
+      "matches_previous": true
+    },
+    "episode_003/data.h5": {
+      "sha256": "ec0d4461a6b00c834b86545da1ee018b463ec9be4cf8774b62da0c655bed358c",
+      "matches_previous": true
+    },
+    "episode_003/rgb.mp4": {
+      "sha256": "94bb39a39b5afad584bc33090dce123e25c05e8276c432d196a0aaba07ad47be",
+      "matches_previous": true
+    },
+    "run_config.yaml": {
+      "sha256": "dc77ecaf642ef5430e55c54eb4158a6be0d2f91e1a02540aca99b5339c40ab94",
+      "matches_previous": true
+    },
+    "session_result.json": {
+      "sha256": "4f1ea323dbf4e2ebeefa6e973326ac0c94060680f699106cef7b7feb03f034c0",
+      "matches_previous": true
+    }
+  },
+  "session_facts_reused": {
+    "observation_rows": 865,
+    "accepted_dispatch_rows": 765,
+    "not_called_rows": 100,
+    "episodes": 3,
+    "control_dt_ms": 62.5,
+    "action_steps": 8,
+    "sync_chunk_boundary_dispatch_gap_ms": 125,
+    "inference_duration_ms_approx": [
+      26,
+      38
+    ],
+    "post_observation_to_sdk_start_ms": {
+      "episode_001": {
+        "min": 0.176399,
+        "median": 0.3453835,
+        "p95": 0.44094995000000003,
+        "max": 1.513329,
+        "count": 352
+      },
+      "episode_002": {
+        "min": 0.294278,
+        "median": 0.340144,
+        "p95": 0.410864,
+        "max": 1.837273,
+        "count": 189
+      },
+      "episode_003": {
+        "min": 0.201265,
+        "median": 0.337569,
+        "p95": 0.4045426,
+        "max": 1.868612,
+        "count": 224
+      }
+    },
+    "note": "Derived by preceding offline scripts; supplementary review did not rerun model predictions. See metrics.json and causal_metrics.json for full arrays and per-episode evidence."
+  },
+  "findings": [
+    {
+      "id": "unit",
+      "classification": "confirmed_interface_semantic_error",
+      "judgment": "Mode 3 tor_max is not a current limit in mA; retain previous vendor-grounded correction. Other projects using raw values 380/400 are corroboration of usage, not unit authority."
+    },
+    {
+      "id": "sync_gap",
+      "classification": "confirmed_scheduling_behavior",
+      "judgment": "Fixed extra waiting slots, not expensive validation, explain 125 ms boundary dispatch gaps."
+    },
+    {
+      "id": "mode6",
+      "classification": "not_proven_error",
+      "judgment": "Official UFACTORY plugin uses Mode 6 for steady joint commands. Mode 1 systems also provide independent servo loops and target processing; compare complete control paths."
+    },
+    {
+      "id": "latency",
+      "classification": "measurement_limitation",
+      "judgment": "Current camera timestamps are host queue-return timestamps. Software freshness does not establish capture-time alignment or physical tracking delay. DexUMI calibration values must not be copied."
+    },
+    {
+      "id": "chunk_consistency",
+      "classification": "policy_execution_coupling",
+      "judgment": "PF-DAG provides an algorithmic hypothesis for mode switching; no saved same-observation resampling evidence proves it caused this session. Shorter chunks trade reactivity against more frequent boundary transitions."
+    },
+    {
+      "id": "contact",
+      "classification": "task_failure_and_possible_physical_contact",
+      "judgment": "Empty-hand continuation is task performance under current execution conditions; tactile signal can also reflect finger self-contact. Do not replace evaluation with a default grasp/retry controller."
+    },
+    {
+      "id": "engineering",
+      "classification": "simplification_opportunity",
+      "judgment": "Keep one I/O owner and one serial inference worker. Ordinary async need not inherit all RTC constraints. Keep run_id, SDK authorization and Raw evidence."
+    },
+    {
+      "id": "raw",
+      "classification": "valid_raw_vs_training_admission",
+      "judgment": "Waiting-action NaNs truthfully indicate no SDK call; full 13-field export is current research contract, not evidence of corruption."
+    }
+  ],
+  "limitations": [
+    "No live hardware validation",
+    "No controlled success-rate comparison",
+    "Three episodes cannot identify the contribution of each cause",
+    "PF-DAG public PFDAGPolicy path reconstructs VQ actions; complete paper MeanFlow path was not found in inspected tracked policy sources"
+  ]
+}
