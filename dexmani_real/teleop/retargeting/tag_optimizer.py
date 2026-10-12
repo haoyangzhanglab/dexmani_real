@@ -1,11 +1,5 @@
-"""TAG two-stage NLopt hand retargeting optimizer.
-
-Ported from TAG/Retargeting/Hand_Retargeting/New_method/opt_xhand.py.
-Adapted for DexMani: all parameters constructor-injected, no glove FK dependency,
-FreeFlyer base fixed at identity (frame alignment via external rotation).
-
-Stage 1 (L-BFGS): global fingertip position matching + temporal smoothness.
-Stage 2 (SLSQP): pinch refinement — conditional on finger-to-thumb proximity.
+"""TAG optimizer ported from TAG/Retargeting/Hand_Retargeting/New_method/opt_xhand.py.
+Fixed-identity FreeFlyer: L-BFGS fits fingertips with temporal smoothing; SLSQP refines near-thumb pinches.
 """
 
 from __future__ import annotations
@@ -32,18 +26,9 @@ logger = logging.getLogger(__name__)
 
 
 class HandOptimizer:
-    """Minimize fingertip squared error with analytic Pinocchio gradients.
-
-    Joint limits are (dof,) radians; finger lengths are (finger_num,) meters,
-    scaled by robot/human * finger_scale_boost. ftol_abs_s* and maxeval_s*
-    set each stage's NLopt tolerance and evaluation budget.
-
-    Stage 1 adds temporal smoothness. Stage 2 adds thumb-to-finger attraction
-    with pinch_base_weight and a start/full distance ramp in meters.
-    pinch_ema_alpha spans frozen (0) to instant (1); Stage 2 is skipped when
-    max(pinch_factors) < pinch_skip_threshold. reg_stage1_weight and
-    reg_last_weight anchor Stage 2 to Stage 1 and the previous frame.
-
+    """Fit fingertips with analytic gradients; joint limits use radians and finger lengths use meters.
+    Scale lengths by robot/human × finger_scale_boost; stage-specific tolerances/budgets configure NLopt.
+    Stage 2 applies the distance-ramped pinch attraction, EMA/skip threshold, and Stage-1/previous-frame anchors.
     """
 
     def __init__(
@@ -104,10 +89,10 @@ class HandOptimizer:
                 "finger lengths and scale boost must be finite, positive five-finger values"
             )
         ratio = robot_lengths / human_lengths
-        self.finger_scale: np.ndarray = ratio * finger_scale_boost  # (finger_num,)
+        self.finger_scale: np.ndarray = ratio * finger_scale_boost
 
         self.qpos_floating = np.zeros(3 + 4 + self.dof, dtype=np.float64)
-        self.qpos_floating[6] = 1.0  # w=1 → identity quaternion (x, y, z, w)
+        self.qpos_floating[6] = 1.0  # FreeFlyer q uses xyzw; index 6 is identity w.
 
         self.opt_s1 = nlopt.opt(nlopt.LD_LBFGS, self.dof)
         self.opt_s1.set_lower_bounds(self.joint_limits_lower.tolist())
@@ -136,16 +121,13 @@ class HandOptimizer:
         self.last_qpos: np.ndarray = self._default_qpos.copy()
         self.qpos_stage1: np.ndarray | None = None
         self.pinch_factors: np.ndarray = np.zeros(self.finger_num, dtype=np.float64)
-        self._current_target: np.ndarray | None = None  # (finger_num, 3) scaled targets
+        self._current_target: np.ndarray | None = None
         self._stage1_warn = ThrottledWarner(interval_s=5.0, logger=logger)
         self._stage2_warn = ThrottledWarner(interval_s=5.0, logger=logger)
         self._bounds_warn = ThrottledWarner(interval_s=5.0, logger=logger)
 
     def solve(self, fingertip_positions: np.ndarray) -> np.ndarray | None:
-        """Solve wrist-centered fingertips (finger_num, 3) in the URDF frame.
-
-        Returns model-order angles, or None on Stage 1 failure.
-        """
+        """Solve wrist-relative URDF-frame tips (finger_num,3); return model-order qpos or None on Stage-1 roundoff."""
         fingertip_positions = np.asarray(fingertip_positions, dtype=np.float64)
         if fingertip_positions.shape != (self.finger_num, 3):
             raise ValueError(f"fingertip_positions must have shape ({self.finger_num}, 3)")
@@ -166,8 +148,8 @@ class HandOptimizer:
             return None
         q_s1 = self._bounded_qpos(q_s1, "Stage 1 result")
 
-        vecs = fingertip_positions[1:] - fingertip_positions[0]  # (finger_num-1, 3)
-        dists = np.linalg.norm(vecs, axis=1)  # (finger_num-1,)
+        vecs = fingertip_positions[1:] - fingertip_positions[0]
+        dists = np.linalg.norm(vecs, axis=1)
         target_factors = np.clip(
             (self.pinch_start_dist - dists) / (self.pinch_start_dist - self.pinch_full_dist),
             0.0,
@@ -290,15 +272,7 @@ _FINGERTIP_INDICES = np.array([4, 8, 12, 16, 20], dtype=np.intp)
 
 
 class TAGHandRetargeter:
-    """Retarget VR to XHand with TAG's two-stage NLopt optimizer.
-
-    Pipeline: (21, 3) operator landmarks -> palm/MANO frame -> pinky scaling
-    -> tips [4, 8, 12, 16, 20] minus wrist[0] -> R_mano_to_urdf -> solve
-    -> remap model joints to (12,) SDK order.
-
-    Uses right-hand geometry and shares retarget()/reset() with
-    DexPilotHandRetargeter. debug enables per-frame timing logs.
-    """
+    """Map right-hand operator landmarks through wrist-relative MANO tips to TAG, then SDK-order qpos."""
 
     def __init__(
         self,
@@ -319,8 +293,7 @@ class TAGHandRetargeter:
         joint_lo = model.lowerPositionLimit[7:].copy()
         joint_hi = model.upperPositionLimit[7:].copy()
 
-        # Pinocchio and SDK use different joint orders.
-        model_names = list(model.names[2:])  # skip "universe" and "root_joint"
+        model_names = list(model.names[2:])  # skip universe and FreeFlyer root
         self._mapping_model_to_sdk = np.array(
             [model_names.index(name) for name in XHAND_SDK_JOINT_NAMES], dtype=np.intp
         )
@@ -363,11 +336,7 @@ class TAGHandRetargeter:
         )
 
     def retarget(self, landmarks: np.ndarray | None) -> np.ndarray | None:
-        """Retarget VR landmarks (operator-frame, 21×3) to XHand joint qpos (12,).
-
-        Expected invalid input or Stage 1 roundoff returns ``None``. Unexpected
-        optimizer errors propagate to the session owner.
-        """
+        """Map operator-frame (21,3) landmarks to (12,) SDK qpos; invalid/roundoff returns None, technical errors raise."""
         if landmarks is None:
             return None
         valid, reason = validate_landmarks(landmarks)
@@ -392,11 +361,11 @@ class TAGHandRetargeter:
             palm_scale=self._pinky_palm_scale,
         )
 
-        tips = mano[_FINGERTIP_INDICES].copy()  # (5, 3) in MANO frame
-        tips -= mano[0]  # center at wrist
-        tips_urdf = tips @ self._R_mano_to_urdf.T  # (5, 3) in URDF frame
+        tips = mano[_FINGERTIP_INDICES].copy()
+        tips -= mano[0]  # MANO wrist
+        tips_urdf = tips @ self._R_mano_to_urdf.T
 
-        qpos_model = self._optimizer.solve(tips_urdf)  # (12,) in Pinocchio model order
+        qpos_model = self._optimizer.solve(tips_urdf)
 
         if qpos_model is None:
             return None
@@ -416,7 +385,6 @@ class TAGHandRetargeter:
             and initial_qpos.shape == HAND_JOINT_SHAPE
             and np.all(np.isfinite(initial_qpos))
         ):
-            # SDK order → model order for optimizer warm-start
             qpos_model = initial_qpos[self._mapping_sdk_to_model]
             self._optimizer.reset(qpos_model)
         else:

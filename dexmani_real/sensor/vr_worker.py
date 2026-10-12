@@ -31,7 +31,6 @@ def _uint64(value):
 
 def _iter_events(shared, config):
     from hand_tracking_sdk import (
-        HandFilter,
         HandFrameAssembler,
         ParseError,
         TCPClientConfig,
@@ -46,7 +45,7 @@ def _iter_events(shared, config):
         parse_line,
     )
 
-    mode, hand_filter = TransportMode(config.transport), HandFilter(config.hand_side)
+    mode = TransportMode(config.transport)
     if mode == TransportMode.UDP:
         receiver = UDPLineReceiver(UDPReceiverConfig(config.host, config.port, timeout_s=1.0))
     elif mode == TransportMode.TCP_SERVER:
@@ -57,13 +56,13 @@ def _iter_events(shared, config):
         receiver = TCPClientLineReceiver(
             TCPClientConfig(config.host, config.port, connect_timeout_s=1.0, read_timeout_s=1.0)
         )
+    # Filter hands at publication so heading calibration still receives head packets.
     assembler = HandFrameAssembler(include_wall_time=True, include_head_frames=True)
     if not shared.is_running.value:
         return
     with receiver:
         logger.info("VR receiver opened: %s port=%d", mode.value, config.port)
-        # SDK iter_events()/iter_lines() swallow timeouts internally; use recv_line()
-        # so an idle or disconnected stream cannot hide the shared shutdown request.
+        # recv_line exposes timeouts so an idle/disconnected stream cannot hide shutdown.
         while shared.is_running.value:
             try:
                 line = receiver.recv_line()
@@ -72,7 +71,6 @@ def _iter_events(shared, config):
             except TransportDisconnectedError:
                 if mode == TransportMode.TCP_CLIENT:
                     receiver.close()
-                    # Preserve the SDK's existing reconnect delay and failure propagation.
                     if shared.is_running.value:
                         time.sleep(0.25)
                     if shared.is_running.value:
@@ -83,8 +81,6 @@ def _iter_events(shared, config):
             try:
                 packet = parse_line(line)
             except ParseError:
-                continue
-            if hand_filter != HandFilter.BOTH and packet.side.value.lower() != hand_filter.value:
                 continue
             event = assembler.push_packet(packet)
             if event is not None:
@@ -106,7 +102,7 @@ def run_vr_worker(shared, config: VRParams) -> None:
 
     head_pos = np.full(3, np.nan)
     head_quat_wxyz = np.full(4, np.nan)
-    head_sequence_id = head_recv_ts_ns = 0
+    head_recv_ts_ns = 0
     try:
         with closing(_iter_events(shared, config)) as events:
             for event in events:
@@ -127,14 +123,14 @@ def run_vr_worker(shared, config: VRParams) -> None:
                             ),
                             name="head_quat_wxyz",
                         )
-                        sequence, stamp = _uint64(event.sequence_id), _uint64(event.recv_ts_ns)
+                        stamp = _uint64(event.recv_ts_ns)
                         if stamp == 0:
                             raise ValueError("head receive timestamp must be positive")
                     except ValueError:
                         logger.warning("Invalid VR head pose rejected", exc_info=True)
                         continue
                     head_pos, head_quat_wxyz = position, rotation
-                    head_sequence_id, head_recv_ts_ns = sequence, stamp
+                    head_recv_ts_ns = stamp
                     continue
                 if not isinstance(event, HandFrame) or event.side != HandSide.RIGHT:
                     continue
@@ -160,17 +156,12 @@ def run_vr_worker(shared, config: VRParams) -> None:
                     frame["landmarks"][0] = landmarks
                     frame["head_pos"][0] = head_pos
                     frame["head_quat_wxyz"][0] = head_quat_wxyz
-                    frame["head_sequence_id"][0] = head_sequence_id
                     frame["head_recv_ts_ns"][0] = head_recv_ts_ns
-                    # HTS emits when either component advances; its recv_ts_ns is
-                    # the newer timestamp and cannot establish freshness of both.
+                    # Either HTS component can advance; the older receive time establishes freshness of both.
                     frame["recv_ts_ns"][0] = min(
                         _uint64(event.wrist_recv_ts_ns), _uint64(event.landmarks_recv_ts_ns)
                     )
-                    frame["source_ts_ns"][0] = _uint64(event.source_ts_ns or 0)
                     frame["sequence_id"][0] = _uint64(event.sequence_id)
-                    frame["source_frame_seq"][0] = _uint64(event.source_frame_seq or 0)
-                    frame["side"][0] = 0
                 except ValueError:
                     logger.warning("Invalid VR hand frame rejected", exc_info=True)
                     continue

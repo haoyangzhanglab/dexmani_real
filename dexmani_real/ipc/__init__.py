@@ -1,1 +1,0 @@
-"""Cross-process IPC package."""

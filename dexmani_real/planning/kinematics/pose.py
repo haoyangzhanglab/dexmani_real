@@ -91,7 +91,6 @@ def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
 
 
 def _quat_conjugate(q: np.ndarray) -> np.ndarray:
-    """Conjugate of a wxyz quaternion."""
     return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float64)
 
 
@@ -133,14 +132,7 @@ def validate_rot6d_geometry(
     min_basis_norm: float = _ROT6D_MIN_BASIS_NORM,
     min_orthogonal_ratio: float = _ROT6D_MIN_ORTHOGONAL_RATIO,
 ) -> np.ndarray:
-    """Validate a finite, non-degenerate rotation-6D geometry payload.
-
-    Model outputs may use arbitrary non-zero scale for the two basis columns;
-    only their direction and separation are required here.  The canonical
-    label validator below additionally requires unit, mutually orthogonal
-    columns.  A batch with shape ``(N, 6)`` is returned for both single-row
-    and batched inputs.
-    """
+    """Validate finite, nondegenerate 6D bases of arbitrary scale; return (N,6) for single or batched input."""
     values = np.asarray(rot6d, dtype=np.float64)
     if values.ndim == 1:
         if values.shape != (6,):
@@ -175,11 +167,7 @@ def validate_rot6d_geometry(
 
 
 def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
-    """6D rotation → WXYZ quaternion via Gram-Schmidt orthonormalization.
-
-    ``r6`` is ``[c1x,c1y,c1z,c2x,c2y,c2z]``.  Non-finite and near-degenerate
-    inputs are rejected; no missing basis axis is invented implicitly.
-    """
+    """Gram-Schmidt [c1x,c1y,c1z,c2x,c2y,c2z] to WXYZ; reject nonfinite or near-collinear bases."""
     r6 = validate_rot6d_geometry(r6, label="rot6d")[0]
     c1 = r6[:3].copy()
     c2 = r6[3:].copy()
@@ -193,9 +181,6 @@ def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
     u3 = np.cross(u1, u2)
     R = np.column_stack([u1, u2, u3])
 
-    if np.linalg.det(R) < 0.0:
-        R[:, 2] = -u3
-
     quat_xyzw = Rotation.from_matrix(R).as_quat()
     return xyzw_to_wxyz(quat_xyzw)
 
@@ -208,10 +193,7 @@ def quat_wxyz_to_rot6d(q_wxyz: np.ndarray) -> np.ndarray:
 
 
 def quat_wxyz_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
-    """WXYZ quaternion → 3×3 rotation matrix.
-
-    Uses scipy.spatial.transform.Rotation for numerical stability.
-    """
+    """Convert WXYZ to a (3,3) rotation matrix."""
     quat_xyzw = wxyz_to_xyzw(normalize_quat_wxyz(q_wxyz))
     return Rotation.from_quat(quat_xyzw).as_matrix()
 
@@ -222,10 +204,6 @@ def rot6d_to_rotmat(r6: np.ndarray) -> np.ndarray:
 
 
 def forward_from_quat_wxyz(q_wxyz: np.ndarray) -> np.ndarray:
-    """FLU +X forward direction from a WXYZ quaternion.
-
-    Applies the quaternion rotation to the canonical forward vector [1, 0, 0],
-    returning the resulting direction in world coordinates.
-    """
+    """Return the rotated FLU +X forward vector for a WXYZ quaternion."""
     quat_xyzw = wxyz_to_xyzw(normalize_quat_wxyz(q_wxyz))
     return Rotation.from_quat(quat_xyzw).apply(np.array([1.0, 0.0, 0.0]))

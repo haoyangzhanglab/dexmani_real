@@ -1,9 +1,5 @@
-"""Play assets/audio/*.wav prompts without blocking the control loop.
-
-A daemon thread uses one player selected at construction; play() preempts queued
-prompts. Missing players or playback failures disable audio for the session.
-Disabled or closed sessions ignore prompts without resolving files. While enabled,
-unknown events and missing files are logged and skipped.
+"""Play WAV prompts off the control thread; play() preempts queued prompts.
+Unavailable players/failures disable audio; enabled sessions log and skip invalid events/files.
 """
 
 from __future__ import annotations
@@ -50,14 +46,7 @@ class _AudioRequest:
 
 
 class AudioFeedback:
-    """Non-blocking voice prompt player.
-
-    Usage::
-
-        audio = AudioFeedback()
-        audio.play("begin")   # starts playing, returns immediately
-        audio.play("save")    # cancels "begin", starts "save"
-    """
+    """Nonblocking voice player with preemptive play() and sequential queue()."""
 
     def __init__(self, audio_dir: str | None = None) -> None:
         self._audio_dir = audio_dir or _AUDIO_DIR
@@ -79,7 +68,6 @@ class AudioFeedback:
         self._worker.start()
 
     def _event_path(self, event: str) -> str | None:
-        """Resolve an audio event to an existing WAV path, logging failures."""
         filename = _EVENT_MAP.get(event)
         if filename is None:
             logger.warning("Unknown audio event: %s", event)
@@ -91,11 +79,7 @@ class AudioFeedback:
         return path
 
     def play(self, event: str) -> None:
-        """Play the voice prompt for *event* (non-blocking).
-
-        If a previous prompt is still playing it is cancelled first.
-        Any pending queued events are also cleared.
-        """
+        """Preempt current/pending prompts with this event without blocking control."""
         with self._condition:
             if self._closed or self._disabled:
                 return
@@ -115,13 +99,7 @@ class AudioFeedback:
             self._condition.notify_all()
 
     def queue(self, event: str) -> None:
-        """Append a prompt after pending playback, or start immediately if idle.
-
-        Usage::
-
-            audio.play("calibrated")
-            audio.queue("begin")
-        """
+        """Append after pending playback, starting immediately if idle."""
         with self._condition:
             if self._closed or self._disabled:
                 return
@@ -137,7 +115,6 @@ class AudioFeedback:
             self._condition.notify_all()
 
     def wait_until_idle(self, timeout_s: float | None = None) -> bool:
-        """Wait until the active and pending prompts finish."""
         if timeout_s is not None and timeout_s < 0:
             raise ValueError("audio idle timeout must be non-negative")
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
@@ -153,7 +130,6 @@ class AudioFeedback:
             return True
 
     def close(self, timeout_s: float = 1.0) -> None:
-        """Cancel playback and stop the daemon worker."""
         if timeout_s < 0:
             raise ValueError("audio close timeout must be non-negative")
         with self._condition:

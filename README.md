@@ -84,6 +84,7 @@ python examples/export_policy_zarr.py episodes/<task> --config local.yaml
 
 ```bash
 python examples/run_policy.py <policy/task/experiment> --config local.yaml
+python examples/run_policy.py <policy/task/experiment> --execution-mode async --prefetch-steps 1 --n-action-steps 4
 ```
 
 默认最多评估 20 轮，Q 提前退出会话，ESC 急停。H 回初始位、B 开始本轮、S 结束本轮；结束后保存结果并等待，整理场景后再次按 H、B 进行下一轮。T 在空闲且无接触时请求复位触觉传感器。可用 `--num-episodes N` 修改运行轮数上限，达到上限后退出；默认每轮运行预算 60 秒，可用 `--max-duration` 修改。
@@ -92,7 +93,7 @@ python examples/run_policy.py <policy/task/experiment> --config local.yaml
 
 策略负责保存的 horizon、观测历史、模态、normalizer、控制时间步和点云生产 recipe；encoder 内部采样点数可以不同于生产点数。Real 负责当前设备、现场状态和执行参数。入口一次性解析 `A_exec`：优先 `--n-action-steps`，否则读取策略保存的默认值，结果记为 `execution.action_steps`（由入口生成，不能在 YAML 指定），不覆盖模型配置。模型仍输出扣除观测历史偏移后的完整 `P = horizon - n_obs_steps + 1` 步未来动作；sync 要求 `A_exec <= P`，async/RTC 要求 `1 <= d <= A_exec` 且 `A_exec + d <= P`。
 
-`execution.execution_mode` 支持 sync、async、rtc，预取模式必须指定 `prefetch_steps=d`。sync 与普通 async 在执行时根据当前反馈实现动作；async 在交接前 `d` 步查询，不提前冻结物理命令。RTC 保留前 `d` 步命令预实现与冻结，以对应物理 prefix 做 guidance，执行冻结命令前重新检查；`rtc_guidance_cap=0` 保留冻结、关闭 guidance，可与正值比较。
+执行模式通过 `--execution-mode sync|async|rtc` 设置，CLI 优先于 YAML 的 `execution` 字段；async/RTC 使用 `--prefetch-steps d`，RTC 还需显式设置 `--rtc-guidance-cap`。当前 RTC 仅支持连续动作 BaseAgent DDIM 策略，ManiFlow 支持 sync/async。sync 与普通 async 在执行时根据当前反馈实现动作；async 在交接前 `d` 步查询，不提前冻结物理命令。RTC 保留前 `d` 步命令预实现与冻结，以对应物理 prefix 做 guidance，执行冻结命令前重新检查；`--rtc-guidance-cap 0` 保留冻结、关闭 guidance，可与正值比较。
 
 sync 在推理完成后读取新反馈并开始执行，段内按策略时间步发送；段间包含真实推理等待，不再额外等到下一网格点。async/RTC 保持固定节拍，交接时读取反馈后消费已就绪的预测，并保持动作索引与前缀对齐；命令仍须在当前拍截止前完成下发。模型加载与 warmup 在设备连接前完成，warmup 用于初始化，不据此推算启动准入；运行时直接检查实际反馈、决策年龄和等待预算。
 

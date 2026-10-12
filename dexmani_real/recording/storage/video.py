@@ -28,11 +28,7 @@ class VideoEncoderConfig:
 
 
 class VideoEncoder:
-    """Write MP4 frames sequentially on the episode writer thread.
-
-    open() initializes the codec before START readiness; standalone callers may
-    still open on first write. close() finalizes the MP4 for playback.
-    """
+    """Writer-thread MP4 encoder; open before START readiness or on first write, close to finalize."""
 
     def __init__(
         self,
@@ -49,7 +45,7 @@ class VideoEncoder:
         self._rate = Fraction(str(fps)).limit_denominator(1_000_000)
 
         self._container: av.container.OutputContainer | None = None
-        self._stream: Any = None  # av.video.VideoStream — PyAV stubs incomplete
+        self._stream: Any = None
         self._frame_count: int = 0
         self._closed = False
 
@@ -121,7 +117,7 @@ class VideoEncoder:
                 "crf": str(self._cfg.crf),
                 "preset": self._cfg.preset,
             }
-            # A single camera encoder must not consume every CPU core alongside control/inference.
+            # Reserve CPU capacity for control and inference.
             self._stream.codec_context.thread_count = 1
             self._stream.codec_context.open()
             self._container.start_encoding()
@@ -133,7 +129,7 @@ class VideoDecoder:
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
         self._container: av.container.InputContainer | None = None
-        self._stream: Any = None  # av.video.VideoStream — PyAV stubs are incomplete
+        self._stream: Any = None
         self._frame_count: int = 0
         self._rate = None
         self._origin_time = None
@@ -149,7 +145,6 @@ class VideoDecoder:
         self._container.seek(0)
         for packet in self._container.demux(self._stream):
             for frame in packet.decode():
-                # Decode only VideoFrame values; PyAV stubs include subtitle types.
                 if isinstance(frame, av.VideoFrame):
                     yield frame.to_ndarray(format="rgb24")
 
@@ -171,8 +166,7 @@ class VideoDecoder:
             if frame.pts is None or frame.time_base is None:
                 raise ValueError("CFR frame is missing its presentation timestamp")
             ordinal = (frame.pts * frame.time_base - self._origin_time) * self._rate
-            # Each PTS (including origin) may have half a time-base tick of
-            # quantization error. Ambiguous adjacent identities are unsupported.
+            # Both PTS values carry half-tick quantization error; reject ambiguous frame identities.
             tolerance = (frame.time_base + self._origin_time_base) * self._rate / 2
             nearest = round(ordinal)
             if tolerance >= Fraction(1, 2) or abs(ordinal - nearest) > tolerance:

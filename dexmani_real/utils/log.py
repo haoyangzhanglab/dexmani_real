@@ -1,5 +1,3 @@
-"""Central logging."""
-
 from __future__ import annotations
 
 __all__ = [
@@ -29,16 +27,14 @@ _CONSOLE_FORMATTER = logging.Formatter(
     "[%(asctime)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S"
 )
 
-# One file handler per process; creation failure leaves stdout logging active.
+# One handler per process; creation failure leaves console logging active.
 _file_handler: logging.FileHandler | None = None
 _file_handler_init = False
 
 
 def _get_file_handler() -> logging.FileHandler | None:
-    """Create (once) a shared file handler for on-disk session logs.
-
-    Directory from $DEXMANI_LOG_DIR (default ~/.dexmani/logs/), file name is
-    date/PID-stamped. Fail-safe: any error → return None (stdout unaffected).
+    """Create one date/PID session log under DEXMANI_LOG_DIR (default ~/.dexmani/logs).
+    Creation failure returns None and preserves console logging.
     """
     global _file_handler, _file_handler_init
     if _file_handler_init:
@@ -53,7 +49,7 @@ def _get_file_handler() -> logging.FileHandler | None:
         handler.setLevel(logging.DEBUG)
         _file_handler = handler
     except OSError:
-        _file_handler = None  # read-only FS etc. — keep stdout only
+        _file_handler = None
     return _file_handler
 
 
@@ -78,8 +74,6 @@ _logger = logging.getLogger(__name__)
 
 @dataclass
 class CapturedProcessOutput:
-    """Text emitted to process stdout inside ``capture_native_stdout``."""
-
     text: str = ""
 
 
@@ -97,11 +91,7 @@ def _flush_process_stdout() -> None:
 
 @contextmanager
 def capture_native_stdout() -> Iterator[CapturedProcessOutput]:
-    """Capture Python/C/C++ stdout for one bounded vendor-SDK operation.
-
-    Redirection is process-wide: use only during initialization, never in a
-    live control loop. Captured text becomes available after context exit.
-    """
+    """Capture process-wide Python/C/C++ stdout during initialization only; text is available after exit."""
     captured = CapturedProcessOutput()
     try:
         stdout_fd = sys.stdout.fileno()
@@ -158,11 +148,7 @@ def extract_native_diagnostics(text: str, *, ignore: tuple[str, ...] = ()) -> tu
 
 
 class ThrottledWarner:
-    """Callable that forwards to ``logger.warning`` at most once per *interval_s*.
-
-    Used in hot-path loops to avoid log spam from per-tick conditions
-    (torn reads, stale state, producer mismatch).  Default interval: 5.0 s.
-    """
+    """Throttle logger.warning calls to one per interval_s (default 5 seconds)."""
 
     def __init__(self, interval_s: float = 5.0, logger: logging.Logger | None = None) -> None:
         self._interval_ns = int(interval_s * 1e9)

@@ -92,8 +92,7 @@ def _stop_listener_bounded(listener: Any, *, label: str) -> bool:
         logger.warning("%s listener shutdown raised", label, exc_info=True)
         return False
     if alive:
-        # pynput may remain blocked after stop(); terminal restoration is the
-        # user-visible shutdown boundary.
+        # Restore the terminal even if pynput's daemon remains blocked after stop().
         logger.debug(
             "%s listener backend did not confirm exit within %.1fs; "
             "terminal input will still be restored and flushed",
@@ -125,10 +124,9 @@ class KeyboardInput:
         self._events: deque[str] = deque()
         self._keys: set[str] = set()
         self._lock = threading.Lock()
-        self._listener: Any = None  # pynput.keyboard.Listener
+        self._listener: Any = None
         self._running: bool = False
-        # A daemon listener can outlive bounded shutdown.  Its callbacks must
-        # not reach a session after this owner has stopped it.
+        # A daemon can outlive shutdown; disable its callbacks before releasing the session.
         self._callbacks_active: bool = False
         self._startup_timeout_s = float(startup_timeout_s)
         self._estop_callback = estop_callback
@@ -144,10 +142,7 @@ class KeyboardInput:
         self._saved_termios: list | None = None
 
     def _accept_control_press(self, signal: OperatorCommand) -> bool:
-        """Emit once per key-down/release cycle, ignoring OS auto-repeat.
-
-        Commands use physical key edges, independent of the control-loop cadence.
-        """
+        """Emit one command per physical press/release, independent of OS repeat and control cadence."""
         with self._lock:
             if not self._callbacks_active:
                 return False
@@ -157,7 +152,6 @@ class KeyboardInput:
             return True
 
     def _release_control(self, signal: OperatorCommand) -> None:
-        """Mark the matching physical key as released."""
         with self._lock:
             if not self._callbacks_active:
                 return
@@ -286,10 +280,7 @@ class KeyboardInput:
         return on_press, on_release
 
     def start(self) -> None:
-        """Start the global pynput keyboard listener in a daemon thread.
-
-        Idempotent: calling on an already-started handler is a no-op.
-        """
+        """Start the daemon keyboard listener once."""
         if self._running:
             return
         if self._listener is not None:
@@ -380,11 +371,7 @@ class KeyboardInput:
         self._running = True
 
     def stop(self) -> None:
-        """Stop the pynput listener.
-
-        Idempotent: calling on an already-stopped handler is a no-op.
-        Safe to call from finally blocks.
-        """
+        """Stop the listener idempotently for bounded cleanup."""
         listener = self._listener
         with self._lock:
             self._callbacks_active = False
@@ -403,11 +390,9 @@ class KeyboardInput:
                 self._restore_terminal_echo()
 
     def _suppress_terminal_echo(self) -> None:
-        """Disable terminal ECHO (delegates to module-level helper)."""
         self._saved_termios = _suppress_terminal_echo()
 
     def _restore_terminal_echo(self) -> None:
-        """Restore terminal attributes (delegates to module-level helper)."""
         _restore_terminal_echo(self._saved_termios)
         self._saved_termios = None
 
@@ -419,10 +404,7 @@ class KeyboardInput:
         self.stop()
 
     def poll(self, timeout: float = 0.05) -> list[OperatorCommand]:
-        """Drain pending commands, waiting up to timeout seconds if empty.
-
-        Use timeout=0 for non-blocking polling; the returned list may be empty.
-        """
+        """Drain commands, waiting at most timeout seconds; zero is nonblocking and may return an empty list."""
         if not np.isfinite(timeout) or timeout < 0.0:
             raise ValueError("timeout must be finite and non-negative")
         if self._running and not self.healthy:
@@ -463,8 +445,7 @@ class KeyboardInput:
             with self._lock:
                 self._keys.clear()
             if self._running:
-                # Health checks also run at SDK fences, before the next poll.
-                # Losing emergency-stop input must apply the workflow fail-safe.
+                # SDK fences also check keyboard health; losing emergency-stop input must fail safe.
                 self._latch_emergency_stop()
         return healthy
 
@@ -480,12 +461,10 @@ class KeyboardInput:
             return key in self._keys
 
     def pressed_keys(self) -> tuple[str, ...]:
-        """Return a stable snapshot of currently held keys."""
         with self._lock:
             return tuple(sorted(self._keys))
 
     def pop_event(self) -> str | None:
-        """Pop one repeatable raw event, or ``None`` when no event is pending."""
         with self._lock:
             return self._events.popleft() if self._events else None
 

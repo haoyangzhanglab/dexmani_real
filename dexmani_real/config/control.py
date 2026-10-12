@@ -12,8 +12,6 @@ from dexmani_real.config.environment import WorkspaceBounds
 
 @dataclass(frozen=True)
 class EMAParams:
-    """Cartesian-space EMA smoothing parameters."""
-
     alpha_pos: float = 0.5
     alpha_rot: float = 0.5
 
@@ -26,8 +24,6 @@ class EMAParams:
 
 @dataclass(frozen=True)
 class VRMappingParams:
-    """VR wrist → EEF mapping parameters."""
-
     pos_scale: float = 1.0
     rot_scale: float = 1.0
     stale_threshold_s: float = 0.5
@@ -44,8 +40,6 @@ class VRMappingParams:
 
 @dataclass(frozen=True)
 class TeleopTimingParams:
-    """VR control and recording cadence."""
-
     control_hz: float = 16.0
 
     def validate(self) -> None:
@@ -91,8 +85,6 @@ class ControlParams:
 
 @dataclass(frozen=True)
 class KeyboardTeleopParams:
-    """Keyboard teleoperation parameters — single source of truth."""
-
     control_hz: float = 30.0
     delta_pos_m: float = 0.008
     delta_rpy_rad: float = 0.03
@@ -135,22 +127,21 @@ class TAGRetargetingParams:
     """TAG two-stage NLopt hand retargeting parameters (``retargeting_type="tag"``)."""
 
     robot_finger_lengths: tuple[float, ...] = (0.161, 0.208, 0.206, 0.204, 0.145)
-    # XHand finger lengths (thumb through pinky, meters).
+    # Thumb→pinky lengths in meters.
 
     human_finger_lengths: tuple[float, ...] = (0.13, 0.18, 0.19, 0.18, 0.145)
-    # Human finger lengths (thumb through pinky, meters).
 
     finger_scale_boost: float = 1.0
-    # Multiplier on the robot/human length ratio.
+    # Multiplies the robot/human length ratio.
 
     pinky_scale: float = 1.3
-    # Scale the pinky MCP→TIP chain before TAG optimization.
+    # Pinky MCP→TIP scale before TAG optimization.
 
     pinky_palm_scale: float = 1.25
-    # Scale the pinky wrist→MCP baseline before TAG optimization.
+    # Pinky wrist→MCP scale before TAG optimization.
 
     mano_to_urdf_euler: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    # Frame alignment rotation.
+    # MANO→URDF extrinsic XYZ Euler angles, radians.
 
     smooth_weight: float = 0.003
     ftol_abs_s1: float = 1e-4
@@ -210,13 +201,11 @@ class TAGRetargetingParams:
 
 @dataclass(frozen=True)
 class DexPilotRetargetingParams:
-    """Runtime parameters for the DexPilot backend."""
-
-    # Human-to-robot size compensation.
+    # Human-to-robot length scale.
     scaling_factor: float = 1.15
-    # Pinky-chain scale applied before scaling_factor.
+    # Pinky-chain scale before scaling_factor.
     pinky_scale: float = 1.15
-    # Pinky wrist→MCP baseline scale, applied before scaling_factor.
+    # Pinky wrist→MCP scale before scaling_factor.
     pinky_palm_scale: float = 1.0
     low_pass_alpha: float = 0.6
     # Enter/exit thresholds for the projected grasp regime.
@@ -246,8 +235,6 @@ class DexPilotRetargetingParams:
 
 @dataclass(frozen=True)
 class SafetyParams:
-    """Process startup/shutdown parameters — single source of truth."""
-
     readiness_timeouts_s: Mapping[str, float] = field(
         default_factory=lambda: {
             "camera": 15.0,

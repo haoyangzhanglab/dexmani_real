@@ -1,8 +1,4 @@
-"""Interactive ArUco eye-to-hand calibration with xArm7 and a fixed RealSense camera.
-
-Estimates T_world_camera from an end-effector marker using five OpenCV hand-eye
-methods and saves accepted results to ``dexmani_real/calibration/state/cameras.json``.
-"""
+"""Interactive ArUco eye-to-hand calibration; publish accepted transforms to cameras.json."""
 
 from __future__ import annotations
 
@@ -674,12 +670,8 @@ def run_camera_calibration(
     aruco_config: ArucoConfig | None = None,
     output_path=CAMERAS_PATH,
 ) -> int:
-    """Run interactive camera calibration with bounded cleanup.
-
-    ``hand_geometry`` is an operator physical-state assertion: ``absent`` means no
-    XHand is mounted; ``secured-home`` means it is physically fixed at home.
-    IK endpoint and return-home checks use the fixed-home XHand envelope for both
-    values, so ``absent`` retains conservative hand geometry.
+    """Run calibration with bounded cleanup and an operator-declared hand geometry.
+    Both absent and secured-home use the conservative fixed-home XHand collision envelope.
     """
     configure_logging()
     if hand_geometry not in {"absent", "secured-home"}:

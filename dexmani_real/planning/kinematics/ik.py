@@ -185,7 +185,6 @@ class OnlineIKSolver:
             raise ValueError("online IK tolerances, radii and weights must be finite and valid")
 
     def reset_episode(self):
-        """Reset the per-episode failure warning window."""
         self._failure_start = None
         self._failure_warned = False
 
@@ -323,8 +322,7 @@ class OnlineIKSolver:
             viable = [c for c in pool if c.collision_free is not False]
             weight = self.profile.singularity_margin_weight
             for candidate in viable:
-                # Dexterity lies in [0, 1], so it cannot reverse a base-score gap
-                # larger than its weight, even if cheaper candidates later collide.
+                # Dexterity ∈ [0,1], so its weight bounds the base-score gap it can reverse.
                 if weight <= 0 or not any(
                     other is not candidate
                     and abs(other.base_score - candidate.base_score) <= weight

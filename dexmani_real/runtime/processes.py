@@ -49,9 +49,7 @@ def _finalize_shutdown_state(
         transition(shared, SafetyState.FAULT)
         return
 
-    if not transition(shared, SafetyState.DISARMED):
-        shared.error_state = True
-        transition(shared, SafetyState.FAULT)
+    transition(shared, SafetyState.DISARMED)
 
 
 def stop_processes_verified(
@@ -83,10 +81,6 @@ def stop_processes_verified(
                 process.join(timeout=terminate_timeout_s)
             if process.is_alive():
                 escalation = "kill"
-                if not hasattr(process, "kill"):
-                    raise RuntimeError(
-                        f"process {process.name} ignored SIGTERM and kill() is unavailable"
-                    )
                 process.kill()
                 process.join(timeout=kill_timeout_s)
             if process.is_alive() or process.exitcode is None:

@@ -152,7 +152,6 @@ def run_teleop_experiment(
 
 
 def _build_hand_retargeter(runtime):
-    """Build the configured hand retargeter without owning runtime state."""
     if not runtime.policy.hand_enabled:
         return None
     if runtime.policy.hand_retargeting_type == "tag":

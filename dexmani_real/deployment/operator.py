@@ -71,8 +71,7 @@ class PolicyOperator:
         self.keyboard.drain_signal(OperatorCommand.BEGIN)
 
     def _handle_command_batch(self, signals) -> None:
-        # H blocks the I/O owner. H/B/T in that batch require a fresh request
-        # after HOME, including when HOME returns incomplete.
+        # HOME blocks; H/B/T from the same batch need a fresh request afterwards.
         discard_preparation_in_batch = False
         home_handled_in_batch = False
         # S/Q suppress H/B/T throughout the batch; ESC uses the latch/callback.
@@ -90,9 +89,7 @@ class PolicyOperator:
                     )
                     continue
             elif signal is OperatorCommand.STOP:
-                # The keyboard completed the motion fence before enqueueing.
-                # STOP still suppresses HOME/BEGIN/RESET_TACTILE in this batch, but must
-                # not revoke again after the policy runner clears the stop request.
+                # Keyboard callbacks already revoked motion; a second revoke could cross a cleared stop request.
                 continue
             elif signal is OperatorCommand.PAUSE:
                 logger.warning("operator: C is not used in policy deployment; ignored")
@@ -200,9 +197,7 @@ class PolicyOperator:
             logger.info("已回初始位，按 B 开始。")
         else:
             logger.warning("回初始位未完成，请检查当前姿态：%s", result.reason)
-        # HOME blocks while hand/arm homing completes. Drop stale
-        # H/B/T events, but preserve S/Q/ESC so an operator can
-        # still stop, quit, or e-stop immediately afterwards.
+        # Discard stale H/B/T after blocking HOME; preserve S/Q/ESC.
         self.keyboard.drain_signal(OperatorCommand.RESET_TACTILE)
         self.keyboard.drain_signal(OperatorCommand.HOME)
         self.keyboard.drain_signal(OperatorCommand.BEGIN)

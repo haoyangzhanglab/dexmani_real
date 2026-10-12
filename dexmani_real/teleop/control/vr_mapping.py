@@ -1,5 +1,3 @@
-"""Map VR wrist motion to target EEF pose."""
-
 from __future__ import annotations
 
 import logging
@@ -102,7 +100,6 @@ class VRWristMapper:
         self.scaled_delta_rot = self.scale_rot(increment) @ self.scaled_delta_rot
         self.previous_wrist_rot = wrist_rot
         delta_rot_vr = self.scaled_delta_rot
-        # Re-express the VR rotation delta in robot-base axes.
         delta_rot_base = self.vr_to_robot_rot @ delta_rot_vr @ self.vr_to_robot_rot.T
         target_pos = self.eef_pos0 + delta_pos_base
         target_rot = delta_rot_base @ self.eef_rot0
@@ -113,7 +110,6 @@ class VRWristMapper:
             logger.warning("VRWristMapper.map: non-finite mapped pose — no target")
             return None
 
-        # Retain the quaternion sign for the next target.
         self.last_quat_wxyz = target_quat_wxyz.copy()
 
         return {

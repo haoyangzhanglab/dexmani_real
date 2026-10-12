@@ -23,8 +23,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SensorChannelsConfig:
-    """Sensor ring capacities and camera resolution defaults."""
-
     camera: bool = False
     vr: bool = False
     pointcloud: bool = False
@@ -90,19 +88,19 @@ _RING_RESOURCE_NAMES = (
 class SensorChannels:
     """Main-owned sensor IPC; workers attach without unlinking."""
 
-    camera_ring: SharedMemoryRingBuffer | None  # camera -> local observation consumers
-    vr_ring: SharedMemoryRingBuffer | None  # VR -> local teleop/calibration
-    pointcloud_ring: SharedMemoryRingBuffer | None  # pointcloud worker -> local policy
+    camera_ring: SharedMemoryRingBuffer | None
+    vr_ring: SharedMemoryRingBuffer | None
+    pointcloud_ring: SharedMemoryRingBuffer | None
 
-    is_running: Any  # session lifetime, shared with sensor workers
+    is_running: Any  # sensor-session lifetime, shared with workers
 
     vr_ready: Any
     camera_ready: Any
     pointcloud_ready: Any
 
     camera_depth_scale: Any  # metres per raw depth unit, reported by the camera
-    camera_serial: Any  # serial number string
-    camera_geometry: Any  # static native RGB-D geometry JSON
+    camera_serial: Any
+    camera_geometry: Any  # static native RGB-D calibration JSON
     _closed: bool = field(init=False, repr=False, default=False)
 
     @classmethod

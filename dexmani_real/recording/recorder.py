@@ -129,10 +129,8 @@ def _raw_row(row, command, result, timestamp):
 
 
 class AsyncEpisodeRecorder:
-    """Owned immutable rows cross one FIFO; all encoding and file I/O stay in its writer.
-
-    START and finalization may wait. Callers must revoke motion before those
-    boundaries, and must stop required recording after check_error() fails.
+    """One writer owns FIFO snapshots, encoding and file I/O.
+    Revoke motion before blocking START/finalization; required recording stops on check_error() failure.
     """
 
     def __init__(self, data_dir, control_hz=16.0, rgb_shape=None, video_config=None):
@@ -410,8 +408,7 @@ class AsyncEpisodeRecorder:
                     if not rows:
                         return
                     arrays = {name: np.stack([row[name] for row in rows]) for name in datasets}
-                    # Once an append begins, a failing batch is staging evidence;
-                    # retrying it could duplicate a partially written batch.
+                    # Failed appends retain staging; retries could duplicate a partially written batch.
                     rows.clear()
                     end = self._written_frames + len(arrays["timestamp"])
                     for name, values in arrays.items():

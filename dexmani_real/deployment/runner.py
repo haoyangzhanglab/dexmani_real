@@ -1,7 +1,5 @@
-"""One device owner and one model worker; async uses a fixed control grid.
-
-Sync resumes when a prediction is ready, then paces that block at the policy dt.
-Observation timestamps retain the actual pauses between synchronous blocks.
+"""Device owner/model worker: async follows a fixed grid; sync waits, then paces each block at policy dt.
+Observation timestamps retain physical pauses between synchronous blocks.
 """
 
 import logging
@@ -397,7 +395,7 @@ class PolicyRunner:
                 return
             if self.execute:
                 self.robot.prepare_streaming(epoch)
-                # Mode restoration is startup work, outside the policy clock.
+                # Mode restoration precedes the policy clock.
                 if self._start_observation() is None:
                     return
             with self.shared.motion_lock:
@@ -532,7 +530,7 @@ class PolicyRunner:
         self.query = Query(
             self.query_id, self.run_id, slot, sources, handoff_slot
         )
-        # build_policy_observation stacks owned arrays; the worker only reads them.
+        # The model worker reads owned observation arrays.
         kwargs = (
             dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot)
             if prefix is not None
@@ -545,7 +543,7 @@ class PolicyRunner:
         self.query.evidence = dict(
             query_id=self.query_id, run_id=self.run_id, slot=int(slot),
             handoff_slot=self.query.handoff_slot,
-            # End of the handoff slot's send window, not a model-completion cutoff.
+            # Send-window end of the handoff slot; inference may finish later.
             deadline_ns=(self.started_ns + (self.query.handoff_slot + 1) * self.dt_ns)
             if self.query.handoff_slot is not None else None,
             submitted_ns=time.monotonic_ns(), started_ns=None, completed_ns=None,
@@ -827,7 +825,6 @@ class PolicyRunner:
             if (expired := self._expired_budget()) is not None:
                 self._finish_budget(expired)
         except BaseException as exc:
-            # Helpers that finished already cleared run_id; this cannot append twice.
             if isinstance(exc, KeyboardInterrupt):
                 self.shared.estop_request = True
             try:

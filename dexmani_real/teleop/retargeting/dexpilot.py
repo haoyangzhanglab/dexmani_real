@@ -1,8 +1,4 @@
-"""DexPilot construction preserving technical-error propagation and mimic joints.
-
-The upstream optimizer catches RuntimeError and returns the previous target;
-this device-facing boundary must propagate that failure to the I/O owner.
-"""
+"""DexPilot propagates technical solver failures instead of the upstream previous-target fallback."""
 
 from __future__ import annotations
 
@@ -63,10 +59,7 @@ class StrictDexPilotOptimizer(DexPilotOptimizer):
 def build_dexpilot_retargeting(
     config: RetargetingConfig,
 ) -> SeqRetargeting:
-    """Build a DexPilot sequence retargeter that propagates solver failures.
-
-    ``config`` must come from ``RetargetingConfig.from_dict`` or its YAML loader.
-    """
+    """Build strict DexPilot from a RetargetingConfig.from_dict/YAML configuration."""
     robot_urdf = urdf.URDF.load(
         config.urdf_path,
         add_dummy_free_joints=config.add_dummy_free_joint,
@@ -143,7 +136,6 @@ class DexPilotHandRetargeter:
             yaml_config = yaml.load(f, Loader=yaml.FullLoader)
         cfg = yaml_config["retargeting"]
 
-        # The YAML cannot redefine the SDK qpos order.
         configured_joint_names = tuple(cfg.get("target_joint_names", ()))
         if configured_joint_names != XHAND_SDK_JOINT_NAMES:
             raise ValueError(
@@ -171,11 +163,7 @@ class DexPilotHandRetargeter:
         self.inverse_retargeted_joint_order = np.argsort(self.retargeted_joint_order)
 
     def _build_ref_value(self, hand_joint_pos: np.ndarray) -> np.ndarray:
-        """Build reference value from hand landmarks for retargeting.
-
-        Applies adaptive_retargeting_xhand (pinky chain scaling) before
-        computing origin→task difference vectors.
-        """
+        """Apply pinky segment/baseline scales before forming origin→task vectors."""
         scaled_landmarks = adaptive_retargeting_xhand(
             hand_joint_pos,
             scale=self._pinky_scale,
@@ -189,11 +177,8 @@ class DexPilotHandRetargeter:
         return ref_value
 
     def retarget(self, landmarks: np.ndarray | None) -> np.ndarray | None:
-        """Retarget raw VR landmarks (operator-frame, 21x3) to XHand joint qpos.
-
-        Handles coordinate transform (operator → MANO), input validation,
-        and NLP optimization. Expected invalid input or solver roundoff returns
-        ``None``; unexpected optimizer errors propagate to the session owner.
+        """Map operator-frame (21,3) landmarks to SDK qpos.
+        Invalid geometry/roundoff returns None; unexpected optimizer errors propagate to the owner.
         """
         if landmarks is None:
             return None
@@ -229,11 +214,9 @@ class DexPilotHandRetargeter:
     def reset(self, initial_qpos: np.ndarray | None = None) -> None:
         """Reset optimizer, filter, projection state, and optional warm start."""
         self.retargeter.reset()
-        if self.retargeter.filter is not None:
-            self.retargeter.filter.reset()
+        self.retargeter.filter.reset()
         self.retargeter.optimizer.projected[:] = False
 
-        # Seed the optimizer with the current hardware pose when available.
         if initial_qpos is not None and initial_qpos.shape == HAND_JOINT_SHAPE:
             qpos = np.asarray(initial_qpos, dtype=np.float32)
             if np.all(np.isfinite(qpos)):

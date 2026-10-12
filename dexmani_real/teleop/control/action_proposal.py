@@ -1,8 +1,4 @@
-"""Compute Cartesian teleoperation intent without side effects.
-
-TeleopController supplies the mapped pose and previous accepted target.
-Target dispatch and recording belong to TeleopRunner.
-"""
+"""Pure Cartesian intent from mapped pose and accepted targets; the runner owns dispatch/recording."""
 
 from __future__ import annotations
 
@@ -43,12 +39,8 @@ def ema_smooth_pose(
     alpha_pos: float,
     alpha_rot: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Smooth an EEF target before IK with independent position/rotation EMA.
-
-    Positions are (3,) meters; quaternions are (4,) WXYZ. Rotation scales the
-    shortest relative rotation vector from the previous smoothed orientation.
-    Each alpha must be in [0, 1]; 1 disables smoothing for that component.
-    Returns float64 (position, quaternion) arrays.
+    """Return float64 EMA position (3,) meters and WXYZ quaternion (4,) before IK.
+    Use shortest relative rotations; each alpha is in [0,1], with 1 bypassing that component's smoothing.
     """
     if not (0 <= alpha_pos <= 1 and 0 <= alpha_rot <= 1):
         raise ValueError("EMA alpha must be in [0, 1]")

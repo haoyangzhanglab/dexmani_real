@@ -22,8 +22,6 @@ logger = logging.getLogger(__name__)
 
 
 class ReplayStatus(str, Enum):
-    """Terminal state of one replay attempt."""
-
     COMPLETED = "completed"
     USER_QUIT = "user_quit"
     REJECTED = "rejected"

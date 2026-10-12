@@ -21,19 +21,9 @@ class WorkspaceBounds:
     z_max: float = 0.50
 
     def validate(self) -> None:
-        bounds = np.asarray(self.as_tuple(), dtype=np.float64)
+        bounds = self.as_array()
         if not np.all(np.isfinite(bounds)) or np.any(bounds[:, 0] >= bounds[:, 1]):
             raise ValueError("workspace bounds must be finite and ordered")
-
-    def as_tuple(
-        self,
-    ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
-        """Workspace bounds as ((x_min,x_max), (y_min,y_max), (z_min,z_max))."""
-        return (
-            (self.x_min, self.x_max),
-            (self.y_min, self.y_max),
-            (self.z_min, self.z_max),
-        )
 
     def as_array(self) -> "np.ndarray":
         """Workspace bounds as (3,2) np.ndarray — returns a mutable copy."""
@@ -49,11 +39,7 @@ class WorkspaceBounds:
 
 @dataclass(frozen=True)
 class StaticCollisionBox:
-    """One oriented static obstacle in the xArm base frame.
-
-    ``size_xyz_m`` contains full side lengths (not half extents) and
-    ``quat_wxyz`` rotates the box-local axes into the base frame.
-    """
+    """Static box in xArm base: full side lengths and box-local→base WXYZ rotation."""
 
     name: str = "obstacle"
     center_xyz_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -88,14 +74,9 @@ class StaticCollisionBox:
 
 @dataclass(frozen=True)
 class TableCollisionConfig:
-    """Calibrated table represented as a finite box below an upward plane.
-
-    ``plane_abcd`` uses the robot-base/world convention ``ax+by+cz+d=0``.
-    Runtime resolution refreshes enabled collision geometry from ``plane_path``.
-    Session assembly also resolves it when the effective point-cloud recipe
-    requires table removal, sharing one snapshot regardless of collision enablement.
-    Fine teleoperation and policy evaluation do not use this geometry to reject
-    robot-table contact. Return-home planning retains table checks.
+    """Finite collision box below an upward base-frame plane ax+by+cz+d=0.
+    Resolve plane_path for collision or cloud table removal into one session snapshot.
+    HOME checks table clearance; online manipulation permits operator-supervised table contact.
     """
 
     enabled: bool = True
@@ -135,8 +116,6 @@ class TableCollisionConfig:
 
 @dataclass(frozen=True)
 class EnvironmentConfig:
-    """Calibrated table plus optional static robot-environment geometry."""
-
     table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
     static_boxes: tuple[StaticCollisionBox, ...] = ()
 

@@ -1,8 +1,4 @@
-"""Validate XHand limits: rated ⊇ mechanical ⊇ command envelopes.
-
-Runtime settings may narrow the rated hard limits; command bounds must
-remain within the mechanical model bounds.
-"""
+"""XHand bounds must satisfy rated ⊇ mechanical ⊇ command; runtime may narrow rated limits."""
 
 from __future__ import annotations
 
@@ -21,12 +17,7 @@ def validate_hand_limit_nesting(
     *,
     label: str = "hand",
 ) -> None:
-    """Validate ``rated ⊇ mechanical ⊇ command`` for the 12-DoF hand.
-
-    Raises ``ValueError`` on any shape, finiteness, ordering, or nesting
-    violation.  ``label`` prefixes the error message so callers retain their
-    subsystem identity in diagnostics.
-    """
+    """Validate finite ordered 12-DOF rated ⊇ mechanical ⊇ command bounds; label identifies diagnostic errors."""
     bounds = {
         "command_lower": np.asarray(command_lower, dtype=np.float64),
         "command_upper": np.asarray(command_upper, dtype=np.float64),

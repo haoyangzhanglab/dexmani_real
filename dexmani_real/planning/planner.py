@@ -54,19 +54,13 @@ class MotionPlanningConfig:
 
 
 class XArm7MotionPlanner:
-    """Online IK and collision-checked home planning.
-
-    ``kin`` owns FK/Jacobians, ``ik_geometry`` owns joint/IK geometry, and
-    ``collision_model`` owns the 19-DOF collision model. Planning and collision
-    validation use nominal URDF geometry, independent of real-pose compensation.
-    """
+    """Online IK/HOME planning with a 19-DOF collision model and nominal URDF geometry."""
 
     def __init__(
         self,
         config: XArm7PlannerConfig,
         planning_profile: MotionPlanningConfig | None = None,
         online_ik_profile: OnlineIKConfig | None = None,
-        hand_dof: bool = True,
         *,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
@@ -115,8 +109,7 @@ class XArm7MotionPlanner:
         self._elbow_joint_index = list(self.pinocchio_model.get_joint_names()).index("joint4")
         joint_limits = np.asarray(self.mplib_planner.joint_limits, dtype=np.float64)
 
-        # Diagnose drift between canonical Python hardware limits and the URDF.
-        # Kinematic authority remains the URDF/MPlib model.
+        # Diagnose hardware-limit drift; URDF/MPlib remains the kinematic authority.
         from dexmani_real.config.hardware import ArmParams
 
         _cfg_lower = np.asarray(ArmParams.joint_limit_lower, dtype=np.float64)
@@ -153,9 +146,7 @@ class XArm7MotionPlanner:
             base_pose_world=base_pose_world,
             mplib=self.mplib,
         )
-        # Pinocchio checks online IK endpoints and planned home paths.
         self.collision_model = CollisionModel(
-            hand_dof=hand_dof,
             static_boxes=static_boxes,
             table=table,
         )
@@ -191,7 +182,6 @@ class XArm7MotionPlanner:
         )
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
-        """Set hand geometry for online IK endpoints or planned return-home."""
         self.collision_model.set_hand_qpos(hand_qpos)
 
     def set_base_pose(self, base_pose_world: Pose) -> None:
@@ -216,15 +206,8 @@ class XArm7MotionPlanner:
         *,
         planning_time_s: float = 0.5,
     ) -> PathResult:
-        """Plan to an exact joint target with MPlib and validate the result.
-
-        Return-home first tries inexpensive, densely validated joint-space
-        segments.  This method is its bounded RRT fallback for poses where
-        those straight-line heuristics are blocked.  The normal planner
-        validation pipeline still checks limits, waypoint spacing, terminal
-        FK error, workspace bounds, and the active 19-DOF collision model.
-        Table clearance remains a caller-owned check because it is not part of
-        MPlib's environment model.
+        """Bounded MPlib RRT fallback for HOME when dense straight segments fail.
+        Validate limits, spacing, FK, workspace and 19-DOF collisions; callers retain table-clearance checks.
         """
         current_qpos = ensure_qpos(current_qpos, self.dof, "current_qpos")
         target_qpos = ensure_qpos(target_qpos, self.dof, "target_qpos")
@@ -326,13 +309,7 @@ class XArm7MotionPlanner:
         limits: np.ndarray,
         profile: MotionPlanningConfig,
     ) -> bool:
-        """Check if the direct prev→nxt shortcut segment is collision-free.
-
-        Checks three points along the segment (¼, ½, ¾) for self-collision
-        and environment collision.  Joint limits are only checked at the
-        midpoint (limit bounds are convex, so midpoint-outside implies the
-        segment is problematic).
-        """
+        """Check shortcut self/environment collision at ¼, ½, ¾ and joint limits at the midpoint."""
         mid = 0.5 * (prev + nxt)
         outside, _ = self.ik_geometry.limit_violation(mid, limits)
         if np.any(outside):
@@ -362,10 +339,7 @@ class XArm7MotionPlanner:
         source: str,
         profile: MotionPlanningConfig,
     ) -> PathResult:
-        """Validate a smoothed path, retrying the original if smoothing fails checks.
-
-        Shortcuts can exceed max_waypoint_delta_deg, especially far from home.
-        """
+        """Validate the smoothed path; retry the original if smoothing breaks safety/waypoint checks."""
         try:
             path = self.ik_geometry.snap_path_to_nearest_equivalent(path, current_qpos)
             path = self.ik_geometry.canonicalize_path_to_planning_limits(
@@ -383,7 +357,6 @@ class XArm7MotionPlanner:
             ("unsmoothed", path_before_smooth),
         ):
             if attempt_label == "unsmoothed" and len(candidate) == len(path):
-                # Shortcut smoothing didn't change the path — no point retrying
                 break
 
             report = self.compute_path_metrics(
@@ -431,7 +404,7 @@ class XArm7MotionPlanner:
             if attempt_label == "smoothed":
                 smoothed_failure_reason = failure.reason
 
-        return failure  # type: ignore[return-value]  # both attempts failed
+        return failure  # type: ignore[return-value]
 
     @staticmethod
     def _make_failure(reason: str, source: str, report: dict) -> PathResult:
@@ -440,7 +413,7 @@ class XArm7MotionPlanner:
         )
 
     def _check_elbow_consistency(self, path, report, source):
-        """Fail if the path contains an elbow branch flip (J4 crossing ±360° bands)."""
+        """Reject elbow paths crossing the -5°/15° band with a span over 45°."""
         has_flip, flip_info = self.check_elbow_consistency(path)
         if has_flip:
             report.update(flip_info)
@@ -528,7 +501,7 @@ class XArm7MotionPlanner:
         )
 
         limits = self.ik_geometry.resolve_planning_limits(profile, current_qpos)
-        outside, violation = self.ik_geometry.path_limit_violation(path, limits)
+        outside, violation = self.ik_geometry.limit_violation(path, limits)
         report = {
             "num_waypoints": int(len(path)),
             "max_waypoint_delta_rad": max_step,
@@ -548,7 +521,6 @@ class XArm7MotionPlanner:
             report["limit_violation_qpos_deg"] = np.rad2deg(path[waypoint_indices[0]].copy())
         return report
 
-    # Detect elbow branch flips using the -5°/15° band and path span.
     _ELBOW_NEG_BAND_RAD: float = np.deg2rad(-5.0)
     _ELBOW_POS_BAND_RAD: float = np.deg2rad(15.0)
     _ELBOW_MIN_SPAN_RAD: float = np.deg2rad(45.0)

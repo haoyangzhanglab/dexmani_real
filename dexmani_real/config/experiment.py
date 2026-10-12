@@ -212,10 +212,7 @@ def load_experiment_config(
     data: Mapping[str, Any] | None = None,
     cli_overrides: Mapping[str, Any] | None = None,
 ) -> ExperimentConfig:
-    """Merge CLI > YAML/data > package defaults without hardware or calibration I/O.
-
-    Loading checks field names and value types; consumers validate runtime values.
-    """
+    """Merge CLI > YAML/data > defaults without hardware/calibration I/O; consumers validate runtime values."""
     if yaml_path is not None and data is not None:
         raise ValueError("provide at most one of yaml_path or data")
     loaded = data if data is not None else {}

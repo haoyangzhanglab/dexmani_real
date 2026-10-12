@@ -1,8 +1,4 @@
-"""Compute fingertip positions in hand_base from XHand SDK joint positions.
-
-SDK order is thumb/index/mid/ring/pinky; the model's active q order is
-index/mid/pinky/ring/thumb. The shared mapping is verified at construction.
-"""
+"""Hand-base fingertip FK maps SDK thumb/index/mid/ring/pinky joints to the URDF's active order."""
 
 from __future__ import annotations
 
@@ -16,16 +12,11 @@ from dexmani_real.robot.model import (
     XHAND_URDF_JOINT_NAMES,
 )
 
-# Remap from XHand SDK qpos order to Pinocchio model order.
-# Defined in robot.model (single source of truth shared with collision.py).
 _SDK_TO_URDF_IDX = np.array(HAND_SDK_TO_URDF_IDX, dtype=np.intp)
 
 
 class HandKinematics:
-    """Compute fingertip positions in the hand base frame.
-
-    Maps 12 SDK joint positions to five fingertip links using Pinocchio.
-    """
+    """Map 12 SDK joint angles to five hand-base fingertip positions with Pinocchio."""
 
     def __init__(
         self,
@@ -64,7 +55,7 @@ class HandKinematics:
     def compute_tip_positions_in_handbase(self, hand_qpos: np.ndarray) -> np.ndarray:
         """Returns (5, 3) fingertip positions in hand_base frame."""
         q = np.asarray(hand_qpos, dtype=np.float64).reshape(HAND_JOINT_SHAPE)
-        q_urdf = q[_SDK_TO_URDF_IDX]  # remap SDK order → URDF order
+        q_urdf = q[_SDK_TO_URDF_IDX]
         self._pin.forwardKinematics(self._model, self._data, q_urdf)
         self._pin.updateFramePlacements(self._model, self._data)
 

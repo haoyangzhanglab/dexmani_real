@@ -152,8 +152,7 @@ class TeleopRunner:
     def _poll_blocking_commands(self, commands=()):
         self.robot.check()
         aborted = False
-        # Other keys are consumed, including the tail of the poll that contained H.
-        # Q revokes HOME authority before any blocking capture finalization.
+        # Consume the batch tail; Q revokes HOME before blocking capture finalization.
         for cmd in (*commands, *self.keyboard.poll(timeout=0)):
             if cmd in (OperatorCommand.EMERGENCY_STOP, OperatorCommand.QUIT,
                        OperatorCommand.STOP, OperatorCommand.DISCARD):
@@ -228,8 +227,7 @@ class TeleopRunner:
                 raise
             self._stop_capture("preparation_revoked")
             return
-        # Disk finalization/START may block. Never anchor to observations from
-        # before that boundary or append across the operator's wall-clock pause.
+        # Blocking finalization/START requires a fresh anchor; rows must not span an operator pause.
         self.resume_after_ns = time.monotonic_ns()
         if not self._preparation_valid():
             self._stop_capture("preparation_revoked")
@@ -361,8 +359,7 @@ class TeleopRunner:
                 self.tick_origin_ns = None
                 self.tick_index = 0
                 self.next_tick_ns = 0
-                # C may have just saved the previous segment; do not cut off
-                # that result announcement when fresh observations arrive.
+                # Let the saved-segment announcement finish when fresh observations resume.
                 self.audio.queue(event)
                 return True
             self._stop_capture("resume_unavailable" if self.active else "begin_unavailable")
@@ -567,8 +564,7 @@ class TeleopRunner:
                         failure = exc
                     logger.exception("teleop recorder close failed")
         try:
-            # Motion is revoked and recording is finalized. Let the exit
-            # or emergency cue finish before close() cancels the player.
+            # After revoke/finalization, let the exit or emergency cue finish before closing audio.
             if not self.audio.wait_until_idle(timeout_s=_END_AUDIO_GRACE_S):
                 logger.warning("Final audio did not finish within %.1fs", _END_AUDIO_GRACE_S)
         except Exception:

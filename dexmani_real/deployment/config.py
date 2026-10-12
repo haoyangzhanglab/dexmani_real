@@ -1,8 +1,4 @@
-"""Validate policy requirements against current physical and numerical configuration.
-
-Saved Policy config supplies modalities, cadence and the numerical cloud recipe.
-Current Real config owns physical capability; this module imports neither Policy nor Torch.
-"""
+"""Validate saved Policy numerical requirements against current Real capability without model imports."""
 
 from __future__ import annotations
 

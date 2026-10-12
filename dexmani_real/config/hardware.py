@@ -53,12 +53,12 @@ _XHAND_RATED_QPOS_MAX_RAD: tuple[float, ...] = (
 class HomingParams:
     """Firmware-planned execution parameters for validated home milestones."""
 
-    convergence_rad: float = 0.002618  # final canonical-home tolerance
-    step_interval_s: float = 0.04  # controller-state polling interval
+    convergence_rad: float = 0.002618
+    step_interval_s: float = 0.04
     max_speed_deg_s: float = (
-        30.0  # conservative Mode 0 joint speed; hardware validation required before tuning
+        30.0  # Conservative Mode-0 speed; tuning needs hardware validation.
     )
-    # Bounded settling allowance for HOME milestones and Mode-6 restoration.
+    # Settling budget for HOME milestones and Mode-6 restoration.
     target_timeout_s: float = 0.5
     velocity_convergence_rad_s: float = 0.03
     dwell_s: float = 0.30
@@ -87,8 +87,6 @@ class HomingParams:
 
 @dataclass(frozen=True)
 class ArmParams:
-    """xArm7 hardware parameters — single source of truth."""
-
     home_qpos: tuple[float, ...] = (
         0.0,
         0.041888,
@@ -155,8 +153,7 @@ class ArmParams:
             raise ValueError(
                 f"collision_sensitivity={self.collision_sensitivity} out of range [0, 5]"
             )
-        # Mode 6 firmware clamps speed to [0.0001, π] rad/s and acceleration to
-        # [0.01, 20] rad/s²; validate in radians before sending.
+        # Mode 6 clamps speed to [0.0001, π] rad/s and acceleration to [0.01, 20] rad/s².
         _max_speed_rad = self.max_joint_velocity_rad_per_s
         _max_acc_rad = self.max_joint_acceleration_rad_per_s2
         if not (np.isfinite(_max_speed_rad) and 0.0001 <= _max_speed_rad <= np.pi):
@@ -178,8 +175,6 @@ class ArmParams:
 
 @dataclass(frozen=True)
 class HandParams:
-    """XHand hardware parameters — single source of truth."""
-
     ethercat_slave_position: int = -1
 
     comm_type: str = "serial"
@@ -262,8 +257,7 @@ class HandParams:
     home_tolerance_deg: float = 5.0
 
     fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
-    # Real adapter is 10 mm thinner than nominal CAD/URDF (-0.005 m mount).
-    # Real hand-base/fingertip FK only; collision/planning keep nominal URDF geometry.
+    # Real-pose FK uses a 10 mm thinner mount (-0.015 m); planning keeps the nominal -0.005 m URDF.
     T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
     T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = (
         0.707107,
@@ -356,35 +350,30 @@ class HandParams:
 
 @dataclass(frozen=True)
 class VRParams:
-    """VR receiver (HTS) parameters."""
+    """HTS transport for right-hand observations and cached head tracking."""
 
     transport: str = "tcp_server"
     host: str = "0.0.0.0"
     port: int = 8000
-    hand_side: str = "both"  # "both" needed for HeadFrame
 
     def validate(self) -> None:
-        if not self.transport or not self.host or not self.hand_side:
-            raise ValueError("VR transport, host, and hand_side must be non-empty")
+        if not self.transport or not self.host:
+            raise ValueError("VR transport and host must be non-empty")
         if not (1 <= self.port <= 65535):
             raise ValueError("VR port must be in [1, 65535]")
 
 
 @dataclass(frozen=True)
 class CameraParams:
-    """Camera / RealSense parameters."""
-
     serial: str | None = None
     width: int = 640
     height: int = 480
     fps: int = 30
     warmup_frames: int = 10
-    # Missing frames beyond this interval fail the camera workflow.
     source_stall_timeout_s: float = 2.0
     l515_visual_preset: int = 5
     l515_confidence_threshold: int | None = None
-    # Librealsense-owned frameset queue. Keep only a small scheduling cushion:
-    # control freshness is more important than retaining historical frames.
+    # Keep the SDK queue small to favor fresh feedback over frame retention.
     frame_queue_capacity: int = 2
     ring_maxlen: int = 5
 

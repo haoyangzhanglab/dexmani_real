@@ -1,9 +1,4 @@
-"""Pure landmark geometry shared by TAG and DexPilot adapters.
-
-One landmark-space adaptation compensates the human-robot kinematic mismatch:
-``adaptive_retargeting_xhand`` scales the pinky chain (MCP→PIP→DIP→TIP) by a
-constant per-backend ``pinky_scale`` (plus an optional palm-baseline offset).
-"""
+"""Shared TAG/DexPilot landmark geometry with pinky-chain and wrist→MCP size compensation."""
 
 from __future__ import annotations
 
@@ -58,13 +53,7 @@ def validate_landmarks(keypoint_3d_array: np.ndarray) -> tuple[bool, str]:
 
 
 def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
-    """Estimate a palm coordinate frame (3×3 rotation matrix) from 21 hand landmarks.
-
-    Uses wrist + index MCP + middle MCP to fit a palm plane via SVD, then
-    constructs a right-handed orthonormal frame with x pointing from middle
-    MCP to wrist. The caller must first run ``validate_landmarks()``.
-
-    """
+    """Fit validated wrist/index/middle MCP points by SVD; return a right-handed palm frame with X toward wrist."""
     keypoint_3d_array = np.asarray(keypoint_3d_array, dtype=np.float64)
     if keypoint_3d_array.shape != (21, 3):
         raise ValueError(
@@ -121,11 +110,7 @@ def adaptive_retargeting_xhand(
     scale: float,
     palm_scale: float,
 ) -> np.ndarray:
-    """Return a copy of (21, 3) MANO landmarks with the pinky chain scaled.
-
-    scale multiplies MCP-to-TIP segments; palm_scale multiplies wrist-to-MCP
-    (1 leaves the baseline unchanged).
-    """
+    """Copy (21,3) MANO landmarks; scale MCP→TIP segments and wrist→MCP baseline separately."""
     landmarks = np.asarray(landmarks, dtype=np.float64).copy()
     if landmarks.shape != (21, 3) or not np.all(np.isfinite(landmarks)):
         raise ValueError("landmarks must be a finite (21, 3) array")

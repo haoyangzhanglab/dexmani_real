@@ -1,7 +1,4 @@
-"""Reconstruct xArm-base point clouds from raw RGB-D and camera metadata.
-
-The caller closes the supplied ``EpisodeReader``.
-"""
+"""Reconstruct xArm-base clouds from Raw RGB-D metadata; the caller owns EpisodeReader closure."""
 
 from __future__ import annotations
 

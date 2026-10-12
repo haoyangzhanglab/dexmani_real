@@ -1,9 +1,5 @@
-"""xArm SDK boundary: live feedback and controller return codes.
-
-Streaming uses Mode 6; HOME executes prevalidated milestones in Mode 0,
-restores Mode 6 and checks position/velocity stability. HomeAborted lets the
-owner distinguish cancellation from failure. The owner handles motion authority
-and stopping; an accepted SDK stop does not prove physical standstill.
+"""xArm SDK boundary: Mode-6 streaming and prevalidated Mode-0 HOME with Mode-6 restoration.
+The owner handles authorization/stopping; SDK stop acceptance is not physical standstill.
 """
 
 from __future__ import annotations
@@ -25,8 +21,7 @@ from dexmani_real.utils.log import (
 logger = logging.getLogger(__name__)
 
 
-# Vendor ``ControllerErrorCodeMap`` titles plus a recovery action — a startup
-# controller error is never cleared implicitly.
+# Vendor error titles and recovery actions; startup errors are never cleared implicitly.
 _CONTROLLER_ERROR_HELP: dict[int, str] = {
     1: "Emergency Stop button pressed — release the E-stop button, then re-enable the robot",
     2: "Emergency IO of the control box triggered — ground the two EI pins, then re-enable the robot",
@@ -50,13 +45,11 @@ class LiveStateError:
 
 
 def _check_sdk_return_code(code: Any, operation: str) -> None:
-    """Raise when an SDK call reports a non-zero return code."""
     if not isinstance(code, (int, np.integer)) or int(code) != 0:
         raise RuntimeError(f"{operation} failed with SDK code {code!r}")
 
 
 def describe_controller_error(code: int) -> str:
-    """Return a human-readable description for a controller error code."""
     code = int(code)
     if 11 <= code <= 17:
         return f"servo motor {code - 10} error"
@@ -79,10 +72,7 @@ def _wait_controller_ready(
     timeout_s: float,
     check_abort: Callable[[], None] | None = None,
 ) -> int:
-    """Bounded wait for error==0, a movable state, and a settled mode.
-
-    Mode and connection status come from the SDK report thread.
-    """
+    """Wait for SDK-reported mode/connection readiness, error==0 and a movable state within the budget."""
     deadline = time.monotonic() + timeout_s
     last: LiveStateError | None = None
     while time.monotonic() < deadline:
@@ -150,14 +140,9 @@ class HomeAborted(RuntimeError):
 
 
 class XArm7:
-    """xArm7 driver — the single owner of the controller connection.
-
-    Streaming uses Mode 6. HOME executes validated milestones in Mode 0,
-    then restores Mode 6 and verifies position/velocity stability before
-    returning. After a State-4 stop on epoch revocation, the local owner re-enters
-    Mode 6 before the next authorized streaming command.
-    Failures raise: the local session handler latches the sticky
-    error, and cleanup does a best-effort stop.
+    """Single controller owner for Mode-6 streaming and validated Mode-0 HOME.
+    HOME restores Mode 6 and verifies position/velocity dwell; revocation recovery needs fresh authorization.
+    Failures propagate to the session owner for fault latching and best-effort stopping.
     """
 
     def __init__(self, cfg: ArmParams) -> None:
@@ -170,12 +155,7 @@ class XArm7:
         return self._api is not None and bool(self._api.connected)
 
     def connect(self) -> None:
-        """One-shot initialization ending in servo Mode 6.
-
-        Sequence: XArmAPI → axis-count check → controller error check →
-        motion_enable → Mode 0 → collision/TCP/acceleration configuration →
-        Mode 6 → state 0.
-        """
+        """Initialize the connection once, validate/configure the controller, and finish in servo Mode 6."""
         sdk_connect_output = None
         try:
             with capture_native_stdout() as sdk_connect_output:
@@ -201,11 +181,7 @@ class XArm7:
         self.enter_mode6()
 
     def stop(self) -> None:
-        """Request State 4 and check SDK acceptance, without physical confirmation.
-
-        Deliberately no confirmation polling: the firmware is the final
-        backstop, and cleanup must never block on proving State 4.
-        """
+        """Request State 4 without confirmation polling; checked SDK acceptance is not physical standstill."""
         if self._api is None:
             return
         _check_sdk_return_code(self._api.set_state(4), "stop set_state(4)")
@@ -218,19 +194,12 @@ class XArm7:
         self._api = None
 
     def read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Read qpos [rad], qvel [rad/s] and SDK-native effort.
-
-        Invalid auxiliary effort remains NaN; SDK and qpos/qvel errors raise.
-        """
+        """Read radians, rad/s and SDK-native effort; auxiliary effort may be NaN, joint/SDK failures raise."""
         code, states = self._api.get_joint_states(is_radian=True, num=3)
         return _decode_joint_states(code, states)
 
     def servo(self, qpos: np.ndarray) -> int:
-        """Send one Mode-6 servo endpoint [rad].
-
-        The Robot owner checks both device targets before dispatch. Return the
-        SDK code (0 = accepted), without waiting for physical arrival.
-        """
+        """Send one Mode-6 radian endpoint; return SDK acceptance without waiting for arrival."""
         return int(
             self._api.set_servo_angle(
                 angle=qpos,
@@ -251,13 +220,8 @@ class XArm7:
         ) = None,
         abort_check: Callable[[], str | None] | None = None,
     ) -> None:
-        """Drive a collision-validated waypoint path to ``final_qpos`` [rad].
-
-        Blocks the caller: the controller runs each Mode-0 point-to-point move
-        (the path was already densely collision-checked by the planner).  The
-        method restores Mode 6 and verifies position/velocity convergence for
-        the configured dwell before returning success. Any failure or
-        interruption raises, and the caller's fail-fast handler owns recovery.
+        """Execute the prevalidated path in Mode 0, restore Mode 6, then verify final position/velocity dwell.
+        Blocks and raises on failure/interruption; the session owner handles stopping and recovery.
         """
         waypoints = np.asarray(waypoints, dtype=np.float64)
         final_qpos = np.asarray(final_qpos, dtype=np.float64)
@@ -438,7 +402,6 @@ class XArm7:
         return int(self._api.error_code)
 
     def _wait_for_axis_report(self) -> None:
-        """Wait for the report thread's axis count and validate it."""
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
             if self.axis > 0:
@@ -449,7 +412,7 @@ class XArm7:
 
     def _check_controller_error(self) -> None:
         """Refuse to proceed on a pre-existing controller error; warn is diagnostic."""
-        live = read_live_state_and_error(self._api)  # raises on SDK failure
+        live = read_live_state_and_error(self._api)
         if live.error_code != 0:
             raise RuntimeError(
                 f"startup controller error C{live.error_code} (warn={live.warn_code}, "

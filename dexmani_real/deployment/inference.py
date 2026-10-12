@@ -37,8 +37,7 @@ class InferenceWorker:
                 value = getattr(self._model, operation)(*args, **kwargs)
         except BaseException as exc:
             error = exc
-        # LoadedPolicy.predict returns an owned CPU NumPy future, after blocking
-        # device-to-host transfer. Completion includes that consumable result.
+        # Completion includes the blocking transfer to an owned CPU NumPy prediction.
         return ModelResult(value, error, start, time.monotonic_ns())
 
     def submit(self, operation, *args, **kwargs):
@@ -69,8 +68,7 @@ class InferenceWorker:
             if result.error is not None:
                 logger.error("retired model task failed during shutdown: %s", result.error)
 
-        # Enqueue while the interpreter still accepts work, even during load/predict.
-        # The same owner checks model existence only when cleanup reaches the queue head.
+        # Queue cleanup behind load/predict while the executor still accepts work.
         self.close_future = self._executor.submit(self._call, "close", (), {})
         if self.future is not None:
             self.future.add_done_callback(recovered)
@@ -78,10 +76,7 @@ class InferenceWorker:
         return self.close_future
 
     def close_result(self, timeout_s=0.0):
-        """Observe the sole close Future; a timeout is pending, not a close exception.
-
-        This bounds only our wait, not Python thread/CUDA process exit.
-        """
+        """Wait for the sole close Future; timeout means pending and does not bound thread/CUDA process exit."""
         if self.close_future is None:
             return dict(status="pending", reason="close_not_requested")
         try:

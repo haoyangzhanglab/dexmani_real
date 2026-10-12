@@ -35,11 +35,7 @@ def compute_hand_command(
     vr_frame: dict | None,
     observation_cache: HandRetargetObservationCache,
 ) -> np.ndarray | None:
-    """Compute at most one hand solve per VR ring observation.
-
-    Failure returns None. Cache both outcomes so repeated input does not
-    advance the stateful solver or retry a failed solve.
-    """
+    """Cache one success/None per VR ring sample so repeated reads do not advance or retry the solver."""
     if retargeter is None or vr_frame is None:
         return None
 
@@ -80,11 +76,6 @@ def reset_hand_retargeter(
     retargeter: TAGHandRetargeter | DexPilotHandRetargeter | None,
     hand_qpos: np.ndarray | None = None,
 ) -> None:
-    """Reset hand retargeter state for a clean teleop start.
-
-    Seeds the selected backend's warm start from measured hand joints when available.
-    The teleop owner must clear its observation cache before retargeting resumes
-    with this reset backend.
-    """
+    """Reset with an optional measured SDK warm start; the owner clears the observation cache before reuse."""
     if retargeter is not None:
         retargeter.reset(initial_qpos=hand_qpos)

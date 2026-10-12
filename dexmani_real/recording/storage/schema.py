@@ -1,15 +1,7 @@
-"""Strict core fields and optional source/pipeline timing evidence in data.h5.
-
-``timing/rows`` aligns with core observation rows. ``timing/queries`` stores one
-JSON record per (run_id, query_id), including the query's observation history
-sources and inference start/completion. ``timing/termination`` is a separate
-JSON boundary record, including a pending query and its deadline when present.
-Missing row values are -1; unavailable query times are null. Completion after
-Raw publication never rewrites these records. Source/pipeline clocks use host
-monotonic ns. Camera and point-cloud age starts at the oldest channel's first
-host receive time, before alignment/copying. It excludes camera/USB/SDK latency
-before receipt. Missing timing columns remain unavailable, without rewriting or
-filling historical evidence.
+"""Raw core data and optional host-monotonic timing evidence in data.h5.
+Rows align with observations; queries key by (run_id,query_id), and termination is separate.
+Unavailable row/query times are -1/null; published Raw is never rewritten.
+RGB-D/cloud age starts at the oldest channel's first host receive, excluding pre-receive SDK latency.
 """
 
 from dataclasses import dataclass
@@ -35,13 +27,11 @@ def _spec(dtype, tail_shape=()):
 DATASET_SPECS = {
     "arm_qpos": _spec(np.float64, (7,)),
     "arm_qvel": _spec(np.float64, (7,)),
-    # xArm SDK ``get_joint_states(num=3)`` effort telemetry. The SDK does not
-    # establish an SI torque unit, so its native numeric semantics are preserved.
+    # xArm get_joint_states(num=3) effort keeps SDK-native units; SI torque is not established.
     "arm_effort": _spec(np.float64, (7,)),
     "hand_qpos": _spec(np.float64, (12,)),
     "hand_current": _spec(np.float64, (12,)),
-    # XHand SDK-native tactile values; T only requests a sensor reset.
-    # Unusable reads remain NaN independently per channel.
+    # SDK-native tactile values; invalid channels stay NaN and T only requests a sensor reset.
     "hand_contact": _spec(np.float32, (5, 3)),
     "hand_tactile_force": _spec(np.float32, (5, 120, 3)),
     # Attempted absolute targets; dispatch preserves the outcome, not arrival.
@@ -100,10 +90,9 @@ def validate_training_rows(timestamp, dispatch_status, control_hz) -> tuple[str,
     return ()
 
 
-# Optional evidence, independent of core Raw fields. Signed -1 means unavailable.
-# Rows align with core observation rows; queries/termination have separate lengths.
-# slot is the visited owner slot; query/index identify its candidate target, even
-# if rejected. dispatch_status alone indicates which SDK calls actually occurred.
+# Optional timing evidence; -1 means unavailable. Rows align with core observations.
+# Queries/termination are separate; visited candidates need not have crossed the SDK boundary.
+# dispatch_status alone records actual SDK dispatch outcomes.
 TIMING_REQUIRED_FIELDS = (
     "observation_ns", "control_ns", "arm_ns", "hand_ns", "camera_ns", "pointcloud_ns",
     "camera_sequence", "pointcloud_camera_sequence", "run_id", "slot", "query_id",

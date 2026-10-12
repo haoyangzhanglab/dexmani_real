@@ -104,12 +104,7 @@ def fit_table_plane(
     max_tilt_deg: float = 20.0,
     random_seed: int = 0,
 ) -> TablePlaneFit:
-    """Fit the dominant near-horizontal plane with deterministic RANSAC.
-
-    The tilt constraint prevents a large wall from being accepted as the
-    shared table calibration. The final model is refined twice by orthogonal
-    least squares over its inliers.
-    """
+    """Fit/refine the dominant near-horizontal plane with deterministic RANSAC; reject wall-like tilt."""
     points = np.asarray(points_base, dtype=np.float64)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("points_base must have shape [N,3]")

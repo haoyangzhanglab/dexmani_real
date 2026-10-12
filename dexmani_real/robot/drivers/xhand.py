@@ -1,13 +1,6 @@
-"""XHand driver with one SDK call per runtime read or send.
-
-Reads accept known sensor statuses only with complete, finite 12-DoF joint
-positions; missing auxiliary current remains NaN. Aggregate (``calc_force``)
-and dense (``raw_force``) tactile validity are independent: an RS485
-distributed-force drop leaves aggregate contact force usable. Explicit idle
-reset requests address the five fingertip sensors; reads retain SDK-native values.
-Send CRC responses leave delivery unconfirmed without stopping the caller;
-other non-accepted SDK codes raise with their original code. Exceptions propagate because
-they cannot establish whether the command reached the device.
+"""Single-call XHand reads/sends; joint state must be finite and missing auxiliary data stays NaN.
+Tactile channels keep SDK-native values and independent validity; resets are explicit idle requests.
+CRC leaves delivery unconfirmed; other rejected codes raise, preserving command-delivery uncertainty.
 """
 
 from __future__ import annotations
@@ -89,15 +82,8 @@ def _error_ok(error: Any) -> bool:
 
 
 def _tactile_validity(code: int | None, *, comm_type: str) -> tuple[bool, bool]:
-    """Return ``(aggregate_allowed, dense_allowed)`` for SDK or tip-board status.
-
-    Serial/RS485 exposes partial tactile statuses: a distributed-force drop
-    (``1501019``) leaves aggregate ``calc_force`` valid while dense
-    ``raw_force`` is unavailable, and a temperature drop (``1501020``) keeps
-    both force fields. Tip-board codes 200/201/202 are the hardware counterparts.
-    EtherCAT is not known to share those partial
-    semantics, so any nonzero status fails tactile closed there while joints
-    stay usable per the caller.
+    """Return (aggregate_allowed,dense_allowed) for SDK/tip-board status.
+    RS485 1501019/201 drops dense only; 1501020/202 keeps both. EtherCAT rejects all nonzero tactile status.
     """
     if comm_type == "ethercat":
         return (code == 0, code == 0)
@@ -109,7 +95,7 @@ def _tactile_validity(code: int | None, *, comm_type: str) -> tuple[bool, bool]:
         return (True, False)
     if code in (_TEMPERATURE_UNAVAILABLE_CODE, 202):
         return (True, True)
-    return (False, False)  # CRC and any other nonzero status
+    return (False, False)
 
 
 class XHandError(RuntimeError):
@@ -136,8 +122,6 @@ class XHandState:
 
 
 class XHand:
-    """XHand SDK controller owned by the session I/O thread."""
-
     def __init__(self, config: HandParams):
         config.validate()
         self.cfg = config
@@ -355,11 +339,7 @@ class XHand:
         control.close_device()
 
     def reset_tactile_sensors(self, *, cancel_requested=lambda: False) -> bool:
-        """Request each fingertip reset once while idle and unloaded.
-
-        Cancellation stops the next call. SDK completion does not establish
-        whether this firmware reset the sensor or zeroed its residual.
-        """
+        """Request one reset per unloaded fingertip while idle; cancellation fences later calls, firmware effect is unproven."""
         if self._control is None or not self.connected_flag:
             raise RuntimeError("XHand is not connected")
         result = {
@@ -508,7 +488,6 @@ class XHand:
         )
 
     def set_passive(self) -> DispatchStatus:
-        """Put every XHand joint into vendor passive mode."""
         if self._control is None or self._command is None or not self.connected_flag:
             raise RuntimeError("XHand command path is not initialized")
         for index in range(HAND_DOF):
@@ -516,10 +495,8 @@ class XHand:
         return self._send_command()
 
     def stop(self, qpos: np.ndarray | None = None, *, timestamp_ns: int = 0) -> None:
-        """Hold fresh measured joints, otherwise request passive mode.
-
-        Only stopping retries CRC: there is no next normal target to supersede
-        the previous motion. SDK acceptance does not prove physical standstill.
+        """Hold fresh measured joints or request passive mode; only stopping retries CRC.
+        SDK acceptance does not prove physical standstill.
         """
         if not self.is_connected:
             raise RuntimeError("XHand disconnected before stop")
@@ -553,8 +530,7 @@ class XHand:
             )
             return DispatchStatus.CRC_UNCONFIRMED
         if code not in SEND_ACCEPTED_CODES:
-            # In particular, 1501035 is an overcurrent warning, not normal contact.
-            # The owner retains UNKNOWN delivery and the SDK error in termination.
+            # 1501035 is overcurrent, not contact; termination retains UNKNOWN delivery and the SDK error.
             raise XHandError("send", code, getattr(error, "error_message", ""))
         return DispatchStatus.ACCEPTED
 

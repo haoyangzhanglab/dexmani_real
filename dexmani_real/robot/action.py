@@ -1,7 +1,4 @@
-"""Source-neutral online intent to physical target realization.
-
-Motion epochs and SDK authority remain downstream of these operational transforms.
-"""
+"""Realize source-neutral targets; motion epochs and SDK authorization stay downstream."""
 
 from dataclasses import dataclass
 from typing import Literal
@@ -71,9 +68,7 @@ class ActionRealizer:
             raise ValueError("action mode must be joint or eef")
         if mode == "eef":
             runtime.policy.workspace.validate()
-        # Policy evaluation allows near-table/contact manipulation under operator
-        # supervision. Its target checks use static boxes only; HOME owns table
-        # path checks through its separate planner.
+        # Online manipulation permits table contact; HOME checks table paths with a separate planner.
         environment = {}
         if deployment:
             runtime.environment.validate()
@@ -92,7 +87,7 @@ class ActionRealizer:
         if mode == "joint":
             from dexmani_real.planning.collision import CollisionModel
 
-            collision = CollisionModel(hand_dof=True, **environment)
+            collision = CollisionModel(**environment)
         return cls(runtime, planner, collision, check_final_target=deployment)
 
     def _joint_rejection(self, target, hand, current, previous):
@@ -204,8 +199,7 @@ class ActionRealizer:
 
     def frozen_rejection(self, command, current, previous, mode):
         previous = current if previous is None else previous
-        # Projection is allowed at preparation only. A changed equivalent branch
-        # invalidates the reservation instead of silently changing its condition.
+        # Reprojection after preparation would change the reserved equivalent branch.
         projected = (
             command.arm_qpos
             if mode == "eef"

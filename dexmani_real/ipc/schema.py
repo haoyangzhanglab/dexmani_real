@@ -13,7 +13,6 @@ from dexmani_real.robot.model import (
     HAND_TACTILE_SUM_SHAPE,
 )
 
-# Realtime point-cloud transport is fixed-size per deployment.
 POINT_CLOUD_FEATURE_DIM = 6
 
 
@@ -83,8 +82,7 @@ HAND_STATE_DTYPE = np.dtype(
     ]
 )
 
-# A ring publication is driven by a right-hand frame; ``head_*`` fields cache the latest HeadFrame.
-# recv_ts_ns is the older wrist/landmarks receive time, used for control freshness.
+# Right-hand publications cache head pose; recv_ts_ns is the older wrist/landmarks receive time.
 VR_FRAME_DTYPE = np.dtype(
     [
         ("wrist_pos", "<f8", (3,)),
@@ -93,11 +91,7 @@ VR_FRAME_DTYPE = np.dtype(
         ("head_pos", "<f8", (3,)),
         ("head_quat_wxyz", "<f8", (4,)),
         ("recv_ts_ns", "<u8"),
-        ("source_ts_ns", "<u8"),
         ("sequence_id", "<u8"),
-        ("source_frame_seq", "<u8"),
-        ("side", "<i4"),
-        ("head_sequence_id", "<u8"),
         ("head_recv_ts_ns", "<u8"),
     ],
     align=True,

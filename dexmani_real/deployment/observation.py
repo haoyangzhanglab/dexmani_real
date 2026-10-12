@@ -24,12 +24,7 @@ class ObservationKinematics:
 
 
 def build_observation_kinematics(policy_info: Any, runtime: Any):
-    """Construct the local FK resources only when the observation requests them.
-
-    ``eef_pose`` needs just the cached canonical ``ArmFK``; the hand FK and
-    mount config are built only for ``fingertip_points``.  Both derive from
-    the aligned arm qpos history, never from a second realtime EEF source.
-    """
+    """Build only requested FK resources; EEF and fingertips share aligned qpos history and canonical ArmFK."""
     requested = set(policy_info.observation_fields)
     needs_hand_fk = "fingertip_points" in requested
     if not needs_hand_fk and "eef_pose" not in requested:

@@ -1,5 +1,1 @@
-"""XHand retargeting backend modules.
-
-Import concrete backends from their explicit modules so importing this package
-does not load Pinocchio or other backend dependencies.
-"""
+"""Import concrete backends explicitly to avoid loading Pinocchio/backend dependencies with this package."""

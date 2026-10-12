@@ -1,11 +1,4 @@
-"""Load eye-to-hand or eye-in-hand extrinsics from cameras.json.
-
-Each camera entry stores serial, type and pose (XYZ meters, WXYZ quaternion),
-converted to a 4x4 transform at load time. Recorder START resolves the connected
-serial and saves available eye-to-hand calibration. Raw stores the static base-from-color
-transform and aligned color-grid intrinsics supplied by the live camera.
-The calibration file's calibration_capture section is diagnostic provenance.
-"""
+"""Load cameras.json poses (XYZ meters, WXYZ) as validated transforms for runtime lookup."""
 
 from __future__ import annotations
 
@@ -48,9 +41,9 @@ def _pose_to_matrix(position: list[float], orientation: list[float]) -> np.ndarr
 @dataclass(frozen=True)
 class CameraExtrinsicsEntry:
     serial: str
-    type: str  # "eye_to_hand" | "eye_in_hand"
-    T_world_camera: np.ndarray | None = None  # (4,4) eye-to-hand, camera in WORLD frame
-    T_eef_camera: np.ndarray | None = None  # (4,4) eye-in-hand
+    type: str
+    T_world_camera: np.ndarray | None = None
+    T_eef_camera: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.serial, str) or not self.serial.strip():
@@ -126,10 +119,7 @@ class CameraExtrinsics:
             self._entries[cam_name] = entry
 
     def resolve_name_by_serial(self, serial: str) -> str:
-        """Select calibration by the connected camera's serial, not a fixed name.
-
-        Raises KeyError if zero or multiple entries match.
-        """
+        """Resolve exactly one calibration by connected serial; otherwise raise KeyError."""
         matches = [n for n, e in self._entries.items() if e.serial == serial]
         if not matches:
             known = {n: e.serial for n, e in self._entries.items()}
@@ -151,16 +141,12 @@ class CameraExtrinsics:
             )
 
     def get_extrinsics(self, cam_name: str, T_base_eef: np.ndarray | None = None) -> np.ndarray:
-        """Return the camera extrinsic (4,4).
-
-        For eye_to_hand: returns the static T_world_camera from calibration;
-            DexMani calibrates this world frame to xArm base.
-        For eye_in_hand: computes T_base_eef @ T_eef_camera (in the frame of the
-            passed eef pose), requires T_base_eef.
+        """Return the (4,4) camera pose in xArm base for eye-to-hand calibration.
+        Eye-in-hand uses the supplied T_base_eef @ T_eef_camera in the caller's base frame.
         """
         entry = self._entries[cam_name]
         if entry.type == "eye_to_hand":
-            return entry.T_world_camera.copy()  # type: ignore[union-attr]  # __post_init__ guarantees non-None for eye_to_hand
+            return entry.T_world_camera.copy()  # type: ignore[union-attr]
         if T_base_eef is None:
             raise ValueError(
                 f"Camera '{cam_name}' is eye_in_hand; T_base_eef (4,4 FK matrix) is required"
@@ -168,11 +154,8 @@ class CameraExtrinsics:
         return T_base_eef @ entry.T_eef_camera
 
     def to_meta_dict(self, cam_name: str, expected_serial: str | None = None) -> dict:
-        """Return calibration identity and pose for runtime calibration lookup.
-
-        The transform is camera_T_world_camera (eye-to-hand) or camera_T_eef_camera
-        (eye-in-hand). This dictionary is not the Raw metadata contract.
-        Raises ValueError if the entry does not match a supplied expected_serial.
+        """Return calibration identity and the flattened camera_T_world_camera or camera_T_eef_camera.
+        Reject expected_serial mismatches; this lookup payload is separate from Raw metadata.
         """
         if expected_serial is not None:
             self.verify_serial(cam_name, expected_serial)
@@ -182,9 +165,9 @@ class CameraExtrinsics:
             "camera_type": entry.type,
         }
         if entry.type == "eye_to_hand":
-            meta["camera_T_world_camera"] = entry.T_world_camera.flatten().tolist()  # type: ignore[union-attr]  # __post_init__ guarantees non-None for eye_to_hand
+            meta["camera_T_world_camera"] = entry.T_world_camera.flatten().tolist()  # type: ignore[union-attr]
         else:
-            meta["camera_T_eef_camera"] = entry.T_eef_camera.flatten().tolist()  # type: ignore[union-attr]  # __post_init__ guarantees non-None for eye_in_hand
+            meta["camera_T_eef_camera"] = entry.T_eef_camera.flatten().tolist()  # type: ignore[union-attr]
         return meta
 
     def __repr__(self) -> str:

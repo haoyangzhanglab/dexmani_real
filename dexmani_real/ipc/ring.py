@@ -1,8 +1,4 @@
-"""Shared-memory ring buffer with latest-sample reads.
-
-One serialized writer publishes with odd/even markers; readers take owned copies.
-See SharedMemoryRingBuffer for platform and memory-ordering limits.
-"""
+"""Single-writer shared-memory ring with odd/even publication markers and owned reader copies."""
 
 from __future__ import annotations
 
@@ -26,16 +22,11 @@ def seqlock_to_logical(marker: int) -> int:
 
 
 class SeqlockSlot:
-    """Odd/even seqlock for a single slot's ``[timestamp_ns, sequence]`` prefix.
-
-    Non-owning view of the first 16 bytes of a ring slot.
-    Writers mark odd with timestamp 0, copy the payload, stamp commit time,
-    then publish even. Readers accept matching nonzero even markers sampled
-    before and after copying; timestamps describe commit, not copy start.
+    """Non-owning [timestamp_ns, sequence] prefix with odd/even publication markers.
+    Copy between odd/even stores; stamp commit time before even, and verify the marker after reading.
     """
 
     def __init__(self, buf: Any, slot_base: int) -> None:
-        """Bind to the ``[timestamp_ns, sequence]`` prefix at *slot_base* of *buf*."""
         self._ts_seq: np.ndarray[Any, np.dtype[np.uint64]] = np.ndarray(
             (2,), dtype=np.uint64, buffer=buf, offset=slot_base
         )
@@ -55,7 +46,6 @@ class SeqlockSlot:
         self._ts_seq[0] = np.uint64(0)
 
     def end_write(self, seq: int) -> None:
-        """Mark the slot complete (even)."""
         self._ts_seq[1] = np.uint64(2 * seq)
 
     def stamp_timestamp(self, now_ns: int) -> None:
@@ -73,11 +63,8 @@ TORN_WARN_INTERVAL_NS = 5 * 1_000_000_000
 
 
 class SharedMemoryRingBuffer:
-    """Fixed-session storage with one serialized writer and owned sample copies.
-
-    Used on Linux x86_64. NumPy uint64 stores do not specify acquire/release
-    ordering; this is not a portable lock-free guarantee. Only the creator
-    unlinks, after all readers/writers have exited.
+    """Single-writer session storage for Linux x86_64; readers receive owned copies.
+    NumPy stores provide no portable acquire/release guarantee; only the creator unlinks after users exit.
     """
 
     _HEADER_SIZE = 64

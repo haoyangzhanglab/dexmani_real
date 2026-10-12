@@ -12,11 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class LoopRate:
-    """Rate limiter that preserves an absolute schedule without catch-up bursts.
-
-    Actuator loops may need the final busy-wait precision window. Service loops
-    can disable it to avoid competing for CPU time.
-    """
+    """Absolute scheduling without catch-up bursts; disable the final spin when CPU sharing matters."""
 
     def __init__(
         self,
@@ -53,12 +49,7 @@ class LoopRate:
         self._missed_slot_count = 0
 
     def wait(self) -> None:
-        """Sleep until the next absolute cycle deadline with precision.
-
-        Small overruns preserve the absolute schedule. Missing a full period
-        re-anchors the next deadline to avoid catch-up bursts. This poll schedule
-        does not define the recorder's or policy's logical time grid.
-        """
+        """Keep the grid on small overruns, re-anchor after a missed period; this polling clock does not define data time."""
         now = self._clock()
         remaining = self._next_deadline - now
 
@@ -102,12 +93,7 @@ class LoopRate:
                     self._next_deadline += self.period
 
     def reset(self) -> None:
-        """Reset the deadline and overdue throttle to the current time.
-
-        Call after a long blocking operation (e.g. return-to-home) so the
-        next wait() does not see a stale deadline and log a spurious
-        over-budget warning.
-        """
+        """Re-anchor deadline/warning state after blocking work such as HOME."""
         now = self._clock()
         self._next_deadline = now + self.period
         self._overdue_throttle = 0

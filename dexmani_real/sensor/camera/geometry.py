@@ -105,7 +105,6 @@ class CameraIntrinsics:
         return cls(**value)
 
     def matrix(self, *, dtype: np.typing.DTypeLike = np.float64) -> np.ndarray:
-        """Return the 3x3 pinhole intrinsic matrix."""
         return np.array(
             [[self.fx, 0.0, self.ppx], [0.0, self.fy, self.ppy], [0.0, 0.0, 1.0]],
             dtype=dtype,
@@ -133,13 +132,7 @@ class RGBDGeometry:
         }
 
     def aligned_depth_to_color(self) -> "RGBDGeometry":
-        """Return geometry for ``rs.align(depth -> color)`` depth samples.
-
-        Librealsense writes the source Z16 measurement onto the color image
-        grid. Therefore its depth samples live in the color-camera coordinate
-        system: color intrinsics are used for deprojection and no depth-to-color
-        extrinsic is applied afterwards.
-        """
+        """Return color-grid intrinsics with identity depth-to-color extrinsics for aligned depth deprojection."""
         return RGBDGeometry(
             depth=self.color,
             color=self.color,

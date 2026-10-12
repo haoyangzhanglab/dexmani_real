@@ -69,11 +69,8 @@ def validate_export_episode(reader: EpisodeReader) -> int:
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
-    """Return absolute paths for one episode or a task's episode_* directories.
-
-    Task discovery includes corrupt episode_* directories so downstream checks
-    reject them explicitly; it does not filter by data.h5 existence.
-    A root containing data.h5 is treated as a single episode.
+    """Return absolute episode paths; a data.h5 root is one episode.
+    Task discovery includes corrupt episode_* directories for explicit downstream rejection.
     """
     root = Path(input_root).resolve()
     if not root.is_dir():

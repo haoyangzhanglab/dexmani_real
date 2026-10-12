@@ -37,8 +37,6 @@ def eef_rpy_from_rot6d(rot6d: np.ndarray) -> np.ndarray:
 
 @dataclass(frozen=True)
 class ArucoConfig:
-    """ArUco marker detection parameters."""
-
     marker_size_m: float = 0.0982
     target_id: int | None = 1
     capture_frames: int = 5
@@ -54,8 +52,6 @@ class ArucoConfig:
 
 @dataclass(frozen=True)
 class CalibrationConfig:
-    """Session tuning parameters for interactive camera calibration."""
-
     min_samples: int = 10
     min_relative_rotation_deg: float = 5.0
     min_axis_separation_deg: float = 15.0
@@ -149,11 +145,7 @@ def draw_calibration_overlay(
     marker_corners: np.ndarray,
     marker_size_m: float,
 ) -> tuple[np.ndarray, bool]:
-    """Draw ArUco detection boxes, axes, and status text on the color image.
-
-    Returns:
-        (annotated_bgr, detected) — detected is True when the target marker is visible.
-    """
+    """Return (annotated_bgr, detected) with ArUco boxes, axes and status."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = detector.detectMarkers(gray)
     detected = False
@@ -197,12 +189,7 @@ def _calibrate_eye_to_hand(
     tvec_marker2camera: list[np.ndarray],
     method: int = cv2.CALIB_HAND_EYE_PARK,
 ) -> np.ndarray:
-    """Solve eye-to-hand transform, returning T_base_camera (4x4).
-
-    cv2.calibrateHandEye expects eye-in-hand inputs (gripper2base +
-    target2cam).  For eye-to-hand we invert the robot poses so the return
-    value is T_cam2base == T_base_camera.
-    """
+    """Invert robot poses for eye-to-hand cv2.calibrateHandEye, returning T_base_camera (4,4)."""
     rmat_ee2base = [
         Rotation.from_euler("xyz", rpy, degrees=False).as_matrix() for rpy in rpy_ee2base
     ]
@@ -232,14 +219,7 @@ def _compute_closed_loop_errors(
     rvec_marker2camera: list[np.ndarray],
     tvec_marker2camera: list[np.ndarray],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute per-sample T_ee_marker consistency residuals.
-
-    T_ee_marker must be identical across all samples (the marker is rigidly
-    attached to the end-effector).  Any scatter indicates calibration error.
-
-    Returns:
-        (residuals_mm, residuals_deg) as (N,) arrays.
-    """
+    """Return (N,) marker-to-EEF consistency residuals in mm and degrees; the marker is rigidly mounted."""
     positions: list[np.ndarray] = []
     rotations: list[np.ndarray] = []
 
@@ -318,11 +298,7 @@ def calibrate_and_select(
     min_relative_rotation_deg: float = 5.0,
     min_axis_separation_deg: float = 15.0,
 ):
-    """Choose the minimum position RMS among candidates passing both limits.
-
-    Returns:
-        (T_best, method_name, errors_mm, errors_deg, method_table, position_rms, rotation_rms).
-    """
+    """Return the lowest-position-RMS candidate passing both limits, with transform, method and residuals."""
     check_hand_eye_excitation(
         rpy_ee2base,
         min_relative_rotation_deg=min_relative_rotation_deg,

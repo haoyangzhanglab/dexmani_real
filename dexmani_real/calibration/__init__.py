@@ -1,5 +1,3 @@
-"""Offline calibration math and explicit calibration workflows."""
-
 from pathlib import Path
 
 CALIBRATION_STATE_DIR = Path(__file__).resolve().parent / "state"

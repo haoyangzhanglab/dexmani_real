@@ -36,11 +36,9 @@ _L515_OPTION_NAMES = (
 @dataclass(frozen=True)
 class RGBDFrame:
     rgb: np.ndarray
-    # Native depth is retained for measurement provenance. Production point
-    # clouds use the aligned payload with ``geometry.aligned_depth_to_color``.
+    # Native depth preserves measurement provenance.
     depth_raw: np.ndarray
-    # ``rs.align(depth -> color)`` samples are deprojected with color intrinsics
-    # and transformed from the color-camera frame.
+    # Aligned depth uses color-grid intrinsics and the color-camera frame.
     depth_aligned_to_color_raw: np.ndarray | None
     depth_frame_number: int
     color_frame_number: int
@@ -75,19 +73,13 @@ class RealSenseCamera:
         self._depth_to_color_aligner: rs.align | None = None
 
     def connect(self) -> bool:
-        """Open the pipeline; return True on success or if already connected."""
         if self.pipeline is not None:
             return True
 
         return self._open_pipeline()
 
     def _open_pipeline(self) -> bool:
-        """Discover device, start + warm up the pipeline.
-
-        Returns True on success. On any failure the pipeline is torn down (via
-        disconnect) so a started-but-unusable pipeline is never left holding the
-        device — otherwise the next open would hit "Device or resource busy".
-        """
+        """Open/warm the device; tear down failures so an unusable pipeline cannot retain the device."""
         self.context = rs.context()
         try:
             self.active_serial = self.config.serial or self._find_default_serial_in_context()
@@ -119,7 +111,6 @@ class RealSenseCamera:
         return True
 
     def _apply_depth_config(self) -> None:
-        """Apply L515 or D400 depth settings after pipeline start."""
         if self.profile is None:
             return
 
@@ -193,7 +184,6 @@ class RealSenseCamera:
         return snapshot
 
     def get_color_sensor(self) -> Any:
-        """Return the active RGB sensor for driver setup and diagnostics."""
         if self.profile is None:
             raise RuntimeError("RealSense profile is unavailable for color settings")
         device = self.profile.get_device()
@@ -207,11 +197,7 @@ class RealSenseCamera:
         raise RuntimeError("no color sensor with a color stream profile found")
 
     def _apply_color_config(self) -> None:
-        """Apply color sensor options after pipeline start.
-
-        Priority 0 caps auto exposure at the frame period to preserve FPS;
-        it does not disable auto exposure. None leaves the device default.
-        """
+        """Apply color options; priority 0 limits exposure to the frame period and None preserves defaults."""
         priority = self.auto_exposure_priority
         if priority is None:
             return
@@ -257,12 +243,7 @@ class RealSenseCamera:
         self._depth_to_color_aligner = rs.align(rs.stream.color)
 
     def _apply_d400_depth_config(self) -> None:
-        """Apply D400 depth settings after pipeline start.
-
-        D400 (D415/D435/D455): enable the IR emitter (stereo dot projector)
-        for robust depth on textureless surfaces, and set the High Accuracy
-        visual preset when available.
-        """
+        """Enable the D400 IR emitter and available High Accuracy preset for textureless depth."""
         if self.profile is None:
             return
         try:
@@ -288,18 +269,13 @@ class RealSenseCamera:
             logger.info("D400 depth config applied: %s", [o.name for o, _ in options])
 
     def _start_pipeline(self, rs_config: rs.config) -> None:
-        """Create and start a fresh pipeline.
-
-        A separate context avoids L515 resolve errors from discovery handles.
-        The SDK queue decouples delivery from alignment/copying with one SDK owner.
-        """
+        """Use a fresh SDK context for L515 discovery isolation and queue frames before alignment/copying."""
         self.pipeline = rs.pipeline()
         rs_config.resolve(rs.pipeline_wrapper(self.pipeline))
         self.frame_queue = rs.frame_queue(int(self.config.frame_queue_capacity))
         self.profile = self.pipeline.start(rs_config, self.frame_queue)
 
     def _warmup_pipeline(self) -> None:
-        """Warm up frame processing for ``warmup_frames``, restarting if necessary."""
         if self.pipeline is None or self.frame_queue is None:
             raise RuntimeError("Pipeline is unavailable during warmup.")
 
@@ -336,7 +312,6 @@ class RealSenseCamera:
                 time.sleep(1.0)
 
     def disconnect(self) -> None:
-        """Close the pipeline; repeated calls are safe."""
         if self.pipeline is None:
             return
         try:
@@ -429,11 +404,8 @@ class RealSenseCamera:
         if self.depth_scale is None:
             raise RuntimeError("RealSense depth_scale is unavailable.")
 
-        # Capture native frames for provenance, then construct the aligned
-        # depth-to-color payload used by geometry-sensitive point-cloud work.
         queued_frame = self.frame_queue.wait_for_frame(timeout_ms)
-        # Timestamp immediately after the queue wait returns, before frameset
-        # recovery or any array ownership copies.
+        # Timestamp queue return before frameset recovery, alignment, or owned copies.
         wait_return_monotonic_ns = time.monotonic_ns()
         frames = queued_frame.as_frameset()
         if not frames:
@@ -455,16 +427,13 @@ class RealSenseCamera:
                 aligned_depth_frame.get_data(), dtype=np.uint16, copy=True, order="C"
             )
 
-        # ``ascontiguousarray`` may return an SDK-backed view. Use ``array``
-        # with copy=True because the frame becomes invalid after this method.
+        # Force owned copies: ascontiguousarray may retain SDK buffers that expire on return.
         depth_raw = np.array(depth_frame.get_data(), dtype=np.uint16, copy=True, order="C")
 
-        # The frame keeps the SDK buffer alive until this owned RGB copy completes.
         bgr = np.asarray(color_frame.get_data(), dtype=np.uint8)
         rgb = np.array(bgr[..., ::-1], dtype=np.uint8, copy=True, order="C")
 
-        # Preserve the device-provided frame number.  Unlike a local counter,
-        # this exposes device/pipeline stalls and dropped frames end-to-end.
+        # Device frame numbers expose stalls/drops that a local counter would hide.
         depth_frame_number = int(depth_frame.get_frame_number())
         color_frame_number = int(color_frame.get_frame_number())
         frame = RGBDFrame(

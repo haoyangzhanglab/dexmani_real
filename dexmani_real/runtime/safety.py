@@ -5,8 +5,6 @@ from enum import IntEnum
 
 
 class SafetyState(IntEnum):
-    """Values stored in ``RuntimeState.safety_state``."""
-
     DISARMED = 0
     ARMED = 1
     RUNNING = 2

@@ -1,8 +1,4 @@
-"""Pure joint paths and typed collision-checked home-path results.
-
-``HomePathResult`` makes already-home, safe-to-command, and unsafe outcomes
-explicit so callers cannot confuse an empty path with a rejected motion.
-"""
+"""Typed home-path outcomes distinguish already-home, commandable and rejected motion."""
 
 from __future__ import annotations
 
@@ -19,8 +15,7 @@ if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner
 
 
-# Proximal (shoulder/elbow) vs distal (wrist) joint mask for two-stage homing.
-# J1-J4 move first (arm repositioning), then J5-J7 (wrist orientation).
+# HOME repositions J1–J4 before orienting the wrist with J5–J7.
 _PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=bool)
 
 # Allow a small outward tolerance for nonlinear FK interpolation at workspace edges.
@@ -37,8 +32,6 @@ class PathResult:
 
 
 class HomePathStatus(str, Enum):
-    """Explicit outcome of collision-checked home-path planning."""
-
     ALREADY_HOME = "already_home"
     SAFE = "safe"
     UNSAFE = "unsafe"
@@ -46,8 +39,6 @@ class HomePathStatus(str, Enum):
 
 @dataclass(frozen=True)
 class HomeCollisionPair:
-    """Links involved in one rejected home-path collision sample."""
-
     link1: str
     link2: str
     kind: str = ""
@@ -114,10 +105,7 @@ def _table_clearance_m(
 
 
 def interpolate_waypoints(path: np.ndarray, max_step: float) -> np.ndarray:
-    """Densify (W, J) waypoints so each joint step is <= max_step radians.
-
-    Returns a float64 (D, J) path.
-    """
+    """Densify (W,J) waypoints into float64 (D,J) with per-joint steps ≤ max_step radians."""
     if len(path) <= 1:
         return path.astype(np.float64)
     dense = [path[0]]
@@ -137,12 +125,7 @@ def wrap_nearest_equivalent(
     *,
     equivalent_mask=XARM7_EQUIVALENT_JOINT_MASK,
 ) -> np.ndarray:
-    """Shift physically equivalent axes to the nearest limit-valid representation.
-
-    Uses integer multiples of 2*pi; other joints stay unchanged. Positions,
-    reference and limits must be matching finite 1-D arrays in radians.
-    Returns a float64 copy with the same shape.
-    """
+    """Return a float64 copy with equivalent axes shifted by 2π to the nearest limit-valid radian values."""
     result = np.asarray(qpos, dtype=np.float64).copy()
     lo = np.asarray(joint_limit_lower, dtype=np.float64)
     hi = np.asarray(joint_limit_upper, dtype=np.float64)
@@ -364,12 +347,11 @@ def compute_joint_home_path(
 ) -> HomePathResult:
     """Return a typed, collision-checked path from current to home joints."""
     if use_canonical_target:
-        # Canonical home uses raw absolute deltas; equivalent joints may rotate a full band.
+        # Canonical HOME uses absolute deltas; wrapping would hide equivalent-joint band mismatches.
         target = np.asarray(home_qpos, dtype=np.float64)
-        # Use raw delta for the already-home check; wrapped deltas hide band mismatches.
         delta = float(np.max(np.abs(target - qpos)))
     else:
-        target = planner.ik_geometry.nearest_equivalent_qpos(home_qpos, qpos)
+        target = planner.ik_geometry.canonicalize_qpos(home_qpos, qpos)
         delta = float(np.max(np.abs(planner.ik_geometry.compute_qpos_delta(target, qpos))))
     if delta < np.deg2rad(0.15):
         return HomePathResult(HomePathStatus.ALREADY_HOME, _empty_home_path())

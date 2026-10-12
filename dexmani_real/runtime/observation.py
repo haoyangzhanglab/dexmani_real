@@ -14,11 +14,7 @@ def sample_is_fresh(timestamp_ns, max_age_s, now_ns=None):
 
 
 def feedback_deadline_ns(row, runtime, *, include_vr=False):
-    """Exclusive send deadline of the feedback actually used to prepare a target.
-
-    Sampling owns rejection of missing/future timestamps; expiration during
-    preparation is enforced again immediately before each target SDK call.
-    """
+    """Exclusive deadline for feedback used to prepare a target; recheck expiry at each SDK send boundary."""
     deadlines = [int(row.arm["timestamp_ns"][0]) + int(runtime.arm.feedback_max_age_s * 1e9) + 1]
     if row.hand is not None:
         deadlines.append(

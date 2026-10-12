@@ -118,7 +118,7 @@ def run_policy_deployment(
     try:
         fields = set(info.observation_fields)
         cloud = "point_cloud" in fields
-        # Cloud production needs a camera worker; recording also retains its source RGB-D.
+        # Cloud production and RGB-D recording share the camera worker.
         camera = cloud or "rgb" in fields or recording_config is not None
         if camera:
             runtime.camera.validate()
@@ -252,8 +252,7 @@ def run_policy_deployment(
             shared.error_state = True
         logger.exception("policy session failed")
     finally:
-        # One session budget; other resource cleanup consumes its remaining time.
-        # Native calls/threads can still prevent process exit beyond this budget.
+        # Cleanup shares one budget; native calls/threads can still outlive it.
         shutdown_deadline = time.monotonic() + runtime.safety.shutdown_timeout_s
         cleanup_errors = []
         if shared is not None:

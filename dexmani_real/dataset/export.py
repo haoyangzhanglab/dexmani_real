@@ -59,11 +59,8 @@ def export_raw_to_zarr(
     exclude: tuple[str, ...] = (),
     progress_callback=None,
 ) -> dict:
-    """Reject incomplete episodes as a whole; publish all 13 modalities for accepted rows.
-
-    Raw defects and unavailable derived modalities reject the entire episode.
-    Unexpected conversion or write failures abort the export and retain staging.
-    Raw evidence is never edited.
+    """Export all 13 modalities; reject incomplete episodes without changing Raw.
+    Unexpected conversion/write failures abort publication and retain staging.
     """
     config = config or CanonicalExportConfig()
     if not isinstance(processing, ProcessingConfig):
@@ -112,8 +109,7 @@ def export_raw_to_zarr(
                     pointcloud_config=processing.pointcloud.to_dict(),
                     fingertip_link_names=list(processing.fingertip_link_names),
                 )
-                # Task is store organization; dt is a training/deployment numerical fact.
-                # Depth scale describes this cache's stored depth, not the Policy ABI.
+                # Task/depth scale describe this cache; dt defines training/deployment timing.
                 if first_attrs is not None:
                     if task != first_attrs["task_name"] or not np.isclose(
                         reader.dt, first_attrs["dt"], rtol=0, atol=1e-12

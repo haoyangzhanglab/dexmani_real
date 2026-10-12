@@ -24,11 +24,7 @@ def validate_task_identity(value: str) -> str:
 
 @dataclass(frozen=True)
 class ProcessingConfig:
-    """Point-cloud, fingertip and table transforms; output is always multimodal.
-
-    Included episodes must retain complete physical and derived modalities
-    with finite floating-point values at every row.
-    """
+    """Full-modal processing requires complete physical/derived modalities and finite floats on every row."""
 
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None

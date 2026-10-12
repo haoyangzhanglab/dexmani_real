@@ -1,11 +1,5 @@
-"""Pinocchio analytical gradient engine for hand kinematics optimization.
-
-Ported from TAG/Retargeting/Hand_Retargeting/utils/pin_grad.py.
-
-FreeFlyer convention:
-  q = [tx, ty, tz, qx, qy, qz, qw | joint_0 ... joint_N-1]
-      0   1   2   3   4   5   6  | 7 ...
-  Jacobian[:, 6:] strips the 6 floating-base velocity DOFs.
+"""Pinocchio gradients ported from TAG/Retargeting/Hand_Retargeting/utils/pin_grad.py.
+FreeFlyer q=[XYZ(3),xyzw(4),joints]; Jacobian[:,6:] omits its six velocity DOFs.
 """
 
 from __future__ import annotations
@@ -44,14 +38,12 @@ class PinGrad:
     """Hand FK gradients using Pinocchio with a FreeFlyer base."""
 
     def __init__(self, urdf_path: str, fingertip_frame_names: list[str]) -> None:
-        """Load the XHand URDF and resolve the five fingertip frame names."""
         names = validate_fingertip_frame_names(fingertip_frame_names)
         self.model = pin.buildModelFromUrdf(urdf_path, pin.JointModelFreeFlyer())
         self.data = self.model.createData()
-        self.dof: int = self.model.nv - 6  # 12 for XHand
+        self.dof: int = self.model.nv - 6
 
-        # The optimizer always receives five targets in semantic finger order;
-        # silently shortening this list shifts target-to-frame associations.
+        # All five semantic fingers are required; a shortened list would shift target/frame associations.
         missing = [name for name in names if not self.model.existFrame(name)]
         if missing:
             raise ValueError(f"fingertip frames not found in URDF {urdf_path!r}: {missing}")
@@ -66,11 +58,7 @@ class PinGrad:
     def compute_position_gradient(
         self, qpos_floating: np.ndarray, target_pos: np.ndarray
     ) -> tuple[np.ndarray, float]:
-        """Return joint-only (gradient, loss) for sum_i ||FK_tip_i(q) - target_i||².
-
-        qpos_floating is (19,) [freeflyer(7) | joints(12)]; target_pos is (N, 3)
-        in the URDF frame. The gradient has shape (dof,).
-        """
+        """Return joint-only ∇loss for Σ||FK_tip(q)-target||²; q=[FreeFlyer(7),joints(12)], targets use URDF axes."""
         self.update_kinematics(qpos_floating)
 
         grad = np.zeros(self.dof, dtype=np.float64)
@@ -83,7 +71,7 @@ class PinGrad:
             J_full = pin.getFrameJacobian(
                 self.model, self.data, fid, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
             )
-            J_v = J_full[:3, 6:]  # strip FreeFlyer columns, keep joint DOFs
+            J_v = J_full[:3, 6:]  # Skip the six FreeFlyer velocity columns.
             p_tip = self.data.oMf[fid].translation
             diff = p_tip - target_pos[i]
             loss += float(np.sum(diff * diff))

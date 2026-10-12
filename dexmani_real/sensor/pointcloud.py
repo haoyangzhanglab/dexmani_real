@@ -1,8 +1,4 @@
-"""Pure depth-to-color aligned RGB-D to xArm-base point-cloud construction.
-
-The module owns only deterministic numerical geometry.  It does not import a
-camera SDK, Open3D, shared memory, calibration files, or recording code.
-"""
+"""Deterministic aligned RGB-D→xArm-base geometry without SDK, device, calibration-file or IPC ownership."""
 
 from __future__ import annotations
 
@@ -142,9 +138,7 @@ def _reject_flying_depth(
         config.edge_support_min_neighbors,
         config.depth_support_min_neighbors,
     )
-    # Erode only the unreliable one-pixel layer at a depth discontinuity.
-    # Resolved objects keep their non-discontinuity interiors; one- and
-    # two-pixel structures at an edge are intentionally treated as unreliable.
+    # Keep resolved interiors; reject unreliable one-/two-pixel structures at depth edges.
     return (
         trusted
         & (support_count >= required_support)
@@ -164,8 +158,7 @@ def _undistorted_depth_coordinates(
     if intrinsics.distortion_model in {"distortion.none", "none"}:
         x, y = xd, yd
     else:
-        # Invert the Brown-Conrady projection with the same fixed-point scheme
-        # used by librealsense for deprojection.
+        # Invert Brown-Conrady using librealsense's fixed-point deprojection scheme.
         k1, k2, p1, p2, k3 = (np.float32(value) for value in intrinsics.distortion_coeffs)
         x, y = xd.copy(), yd.copy()
         for _ in range(10):
@@ -238,8 +231,7 @@ def _table_height_hysteresis_keep_mask(
     if rows.shape != columns.shape or rows.shape != signed_height_m.shape:
         raise ValueError("rows, columns, and signed heights must have equal shape")
 
-    # Scattered depth spikes must not jointly preserve a broad table residual.
-    # Require a coherent high patch before retaining its connected low surfaces.
+    # Coherent high patches preserve low surfaces; scattered spikes must not retain table residuals.
     seed_image = np.zeros(valid.shape, dtype=bool)
     object_seeds = signed_height_m >= object_seed_height_m
     seed_image[rows[object_seeds], columns[object_seeds]] = True
@@ -283,9 +275,7 @@ def _table_keep_mask(
         raise ValueError("table plane must have an upward non-zero normal")
     plane /= norm
 
-    # Transform the plane into the aligned color-camera frame. Cached rays make
-    # ``z * dot(plane_normal, ray) + offset`` equivalent to evaluating the
-    # plane after deprojection, without allocating table points in 3-D.
+    # Evaluate the base-frame table plane on color-camera rays before allocating 3-D points.
     plane_color = validate_rigid_transform(T_xarm_base_from_color).T @ plane
     rows, columns = np.nonzero(valid)
     plane_normal_color = tuple(float(value) for value in plane_color[:3])
@@ -335,8 +325,7 @@ def _voxel_means(
     if colors.shape != points_base.shape:
         raise ValueError("colors must have shape [N,3] matching points_base")
     keys = np.floor(points_base / np.float32(voxel_size_m)).astype(np.int64)
-    # Mean aggregation is independent of depth-image traversal order and avoids
-    # first-pixel bias. Bounded workspace keys use a fast collision-free int64.
+    # Voxel means avoid first-pixel bias; bounded grid keys fit collision-free int64 packing.
     packed_keys = _packed_grid_keys(keys)
     _, first_indices, inverse = np.unique(packed_keys, return_index=True, return_inverse=True)
     counts = np.bincount(inverse).astype(np.float64)
@@ -497,12 +486,7 @@ def build_raw_point_cloud(
     geometry: RGBDGeometry,
     T_xarm_base_from_color: np.ndarray,
 ) -> np.ndarray | None:
-    """Build the diagnostic full aligned cloud without production filtering.
-
-    Every finite non-zero depth-to-color sample is retained. RGB is read from
-    the matching color pixel, with the aligned geometry's identity transform.
-    This function is intentionally not used by recording or policy workers.
-    """
+    """Return all finite nonzero aligned depth/color points for diagnosis, without production filtering."""
     _validate_color(color, geometry)
     if depth_raw.ndim != 2 or depth_raw.dtype != np.uint16:
         raise ValueError("depth_raw must be a uint16 [H,W] frame")

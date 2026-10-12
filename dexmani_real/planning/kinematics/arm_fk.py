@@ -21,11 +21,7 @@ def make_arm_fk() -> "ArmFK":
 
 
 class ArmFK:
-    """Standalone Pinocchio FK — URDF-consistent, no MPlib dependency.
-
-    Used instead of xArm SDK get_position_aa() because the firmware EEF frame
-    differs from the URDF definition.
-    """
+    """Pinocchio FK in the URDF EEF frame, which differs from the xArm firmware EEF frame."""
 
     def __init__(self, urdf_path: str, eef_frame_name: str = "custom_eef_link") -> None:
         import pinocchio
@@ -47,7 +43,7 @@ class ArmFK:
         pinocchio.updateFramePlacements(self._model, self._data)
         pose = self._data.oMf[self._eef_frame_id]
 
-        R = np.asarray(pose.rotation, dtype=np.float64)  # 3×3
+        R = np.asarray(pose.rotation, dtype=np.float64)
         eef_pos = np.asarray(pose.translation, dtype=np.float64).copy()
         if (
             eef_pos.shape != (3,)
@@ -65,12 +61,7 @@ def compute_eef_pose_history_xarm_base(
     *,
     arm_fk: "ArmFK | None" = None,
 ) -> np.ndarray:
-    """Return finite float64 ``[T,9]`` xArm-base position+rot6d poses from aligned qpos.
-
-    Compute FK once per row and reuse its rot6d; callers cast to float32 for
-    storage or model input. Rows may be measured qpos or commanded targets;
-    both use the URDF EEF definition.
-    """
+    """Return finite float64 [T,9] base-frame XYZ+rot6d from measured/commanded qpos using one URDF FK per row."""
     qpos_history = np.asarray(arm_qpos, dtype=np.float64)
     if qpos_history.ndim != 2 or qpos_history.shape[1] != ARM_JOINT_SHAPE[0]:
         raise ValueError(
@@ -137,10 +128,7 @@ class XArm7Kinematics:
 
     def compute_eef_pose_world(self, qpos: np.ndarray) -> Pose:
         pose_base = self.compute_eef_pose_base(qpos)
-        pose_world = self.base_to_world_pose(pose_base)
-        if not np.all(np.isfinite(pose_world.p)) or not np.all(np.isfinite(pose_world.q)):
-            return Pose(p=np.full(3, np.nan), q=np.full(4, np.nan))
-        return pose_world
+        return self.base_to_world_pose(pose_base)
 
     def compute_eef_jacobian_world(self, qpos: np.ndarray) -> np.ndarray:
         """Return [EEF linear velocity; angular velocity] in world axes."""
@@ -156,8 +144,7 @@ class XArm7Kinematics:
             raise RuntimeError(f"Expected a (6, >= {self.dof}) Jacobian, got {jacobian.shape}")
         jacobian = jacobian[:, : self.dof]
         position = np.asarray(self.pinocchio_model.get_link_pose(self.eef_link_id).p)
-        # Pinocchio WORLD spatial twists refer to the base origin. Shift their
-        # linear component to the EEF origin before conditioning the two blocks.
+        # Shift Pinocchio WORLD linear velocity from the base origin to the EEF before rotating axes.
         linear = jacobian[:3] + np.cross(jacobian[3:].T, position).T
         rotation = quat_wxyz_to_rotmat(self.base_pose_world.q)
         return np.vstack((rotation @ linear, rotation @ jacobian[3:]))

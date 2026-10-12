@@ -31,11 +31,7 @@ def compute_fingertip_points_xarm_base(
     eef_position_xarm_base_m: np.ndarray | None = None,
     eef_rot6d_xarm_base: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Return fingertips in xArm base, preserving SDK finger order.
-
-    Callers that already computed the EEF pose may provide both EEF fields to
-    avoid a duplicate arm FK. Otherwise the pose is derived from ``arm_qpos``.
-    """
+    """Return SDK-finger-order tips in xArm base; optional EEF fields reuse an existing arm FK result."""
     arm = np.asarray(arm_qpos, dtype=np.float64)
     hand = np.asarray(hand_qpos, dtype=np.float64)
     mount_p = np.asarray(handbase_position_eef_m, dtype=np.float64)
@@ -81,14 +77,7 @@ def compute_fingertip_history_xarm_base(
     arm_fk: Any | None = None,
     eef_pose_history: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Recompute aligned fingertip history ``[T,5,3]`` float32 in xArm base.
-
-    When ``eef_pose_history`` (finite ``[T,9]`` position+rot6d from
-    ``compute_eef_pose_history_xarm_base``) is provided, no Arm FK runs: the
-    caller's one-per-timestep FK result is reused, keeping ``eef_pose`` and
-    ``fingertip_points`` on the identical derivation.  Otherwise ``arm_fk`` is
-    required and drives exactly one FK per timestep internally.
-    """
+    """Return aligned float32 [T,5,3] base-frame tips, reusing eef_pose_history or computing one Arm FK per row."""
     arm = np.asarray(arm_qpos, dtype=np.float64)
     hand = np.asarray(hand_qpos, dtype=np.float64)
     if (

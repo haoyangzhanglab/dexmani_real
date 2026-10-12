@@ -181,7 +181,6 @@ def compute_metrics(
 
 
 def report_consistency(metrics: ReplayMetrics) -> None:
-    """Print a human-readable replay-vs-original consistency summary."""
     print("\n" + "=" * 60)
     print("Consistency Evaluation")
     print("=" * 60)
@@ -233,7 +232,6 @@ def evaluate_replay(
     output_dir: str,
     hand_start_duration_s: float = 0.0,
 ) -> None:
-    """Evaluate and persist samples captured by one physical replay."""
     if replay_data is None:
         print("\nNo replay data collected (replay interrupted before any frames captured).")
         return
@@ -270,8 +268,7 @@ def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str) -> Pat
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     npz_path = output_path / "replay_data.npz"
-    # Write to a sibling temp file that already ends in ".npz" (numpy appends
-    # ".npz" to any name that does not), then atomically move it into place.
+    # NumPy appends .npz; match the temporary suffix before atomic publication.
     tmp_path = npz_path.with_suffix(".tmp.npz")
     np.savez_compressed(tmp_path, **replay_data)
     os.replace(tmp_path, npz_path)
@@ -285,7 +282,6 @@ def _save_metrics(
     *,
     hand_start_duration_s: float = 0.0,
 ) -> None:
-    """Save derived metrics after the captured measurements have been persisted."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 

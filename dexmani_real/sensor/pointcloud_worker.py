@@ -1,9 +1,4 @@
-"""Latest-only depth-to-color RGB-D to realtime point-cloud worker.
-
-The worker owns no camera SDK object and never queues camera payloads. It
-observes the newest committed camera-ring sequence, builds at most one cloud
-for that sequence, and publishes a fixed ``float32[N,6]`` xArm-base payload.
-"""
+"""Build at most one float32 [N,6] base-frame cloud per newest camera sequence; no camera SDK or frame queue."""
 
 from __future__ import annotations
 
@@ -39,11 +34,8 @@ _IDLE_POLL_S = 0.001
 
 @dataclass(frozen=True)
 class PointCloudWorkerConfig:
-    """Resolved processing policy for the realtime worker.
-
-    Each cloud inherits its camera sequence and oldest channel's host receive time.
-    Consumers check cloud freshness; only joint RGB/cloud consumers retrieve the
-    matching RGB-D sample. Published clouds are otherwise self-contained.
+    """Resolved worker recipe; clouds inherit camera sequence and oldest channel receive time.
+    RGB/cloud consumers retrieve matching RGB-D; other cloud consumers only check freshness.
     """
 
     pointcloud: PointCloudConfig
@@ -108,8 +100,7 @@ def _load_static_inputs(
             raise TypeError("camera geometry shared metadata must encode an object")
         geometry = RGBDGeometry.from_dict(geometry_payload)
         base_from_color = _resolve_base_from_color(shared, calibration)
-        # The camera ring carries depth aligned onto the color pixel grid.
-        # Its deprojection frame is therefore the color-camera frame.
+        # The aligned color pixel grid requires color-camera deprojection.
         return geometry.aligned_depth_to_color(), depth_scale_m, base_from_color
     return None
 

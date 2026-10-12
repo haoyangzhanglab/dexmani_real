@@ -28,8 +28,7 @@ def atomic_publish(src: str | Path, dst: str | Path, *, cancelled=None) -> Path:
         raise FileExistsError(f"refusing to overwrite existing artifact: {target}")
     if cancelled is not None and cancelled():
         raise RuntimeError("artifact publication cancelled")
-    # Linux RENAME_NOREPLACE checks occupancy and renames in one operation.
-    # A preflight exists() check cannot protect immutable artifacts from races.
+    # RENAME_NOREPLACE atomically checks occupancy; exists() cannot prevent publication races.
     if sys.platform != "linux":
         raise OSError(errno.ENOSYS, "atomic publication requires Linux renameat2")
     source_bytes, target_bytes = os.fsencode(source), os.fsencode(target)
@@ -65,8 +64,7 @@ def atomic_json_dump(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(obj, stream, indent=indent, ensure_ascii=ensure_ascii)
-        # Passing this last check admits the irreversible replace; later
-        # cancellation cannot promise rollback of a successfully published file.
+        # Cancellation after this check cannot promise rollback of a published replacement.
         if cancelled is not None and cancelled():
             raise CancelledError("JSON publication cancelled")
         if overwrite:

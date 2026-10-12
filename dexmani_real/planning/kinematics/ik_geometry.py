@@ -17,12 +17,7 @@ from .pose import ensure_qpos
 
 
 class IKGeometry:
-    """Joint canonicalization and collision queries shared by online IK and home.
-
-    References:
-      - LeFranX weighted_ik.cpp
-      - dimos collision_step_size
-    """
+    """Joint canonicalization/collision helpers using LeFranX distance ranking and dimos segment stepping."""
 
     def __init__(
         self, kinematics: XArm7Kinematics, collision_model: CollisionModel | None = None
@@ -60,9 +55,6 @@ class IKGeometry:
                 self.joint_limits[mask, 1], reference_qpos[mask] + 3.0 * np.pi
             )
         return limits
-
-    def nearest_equivalent_qpos(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
-        return self.canonicalize_qpos(qpos, reference_qpos)
 
     def canonicalize_qpos(
         self,
@@ -102,9 +94,9 @@ class IKGeometry:
             raise ValueError(f"path must have shape (N, {self.dof}), got {path.shape}.")
         if len(path) == 0:
             return path
-        path[0] = self.nearest_equivalent_qpos(path[0], reference_qpos)
+        path[0] = self.canonicalize_qpos(path[0], reference_qpos)
         for index in range(1, len(path)):
-            path[index] = self.nearest_equivalent_qpos(path[index], path[index - 1])
+            path[index] = self.canonicalize_qpos(path[index], path[index - 1])
         return path
 
     def compute_qpos_delta(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
@@ -118,21 +110,12 @@ class IKGeometry:
     def limit_violation(
         self, qpos: np.ndarray, limits: np.ndarray, limit_tol: float = 1e-5
     ) -> tuple[np.ndarray, np.ndarray]:
+        """Return per-joint violations for one qpos or a path in radians."""
         below = qpos < limits[:, 0] - limit_tol
         above = qpos > limits[:, 1] + limit_tol
         outside = below | above
         lower = np.maximum(limits[:, 0] - qpos, 0.0)
         upper = np.maximum(qpos - limits[:, 1], 0.0)
-        return outside, np.maximum(lower, upper)
-
-    def path_limit_violation(
-        self, path: np.ndarray, limits: np.ndarray, limit_tol: float = 1e-5
-    ) -> tuple[np.ndarray, np.ndarray]:
-        below = path < limits[None, :, 0] - limit_tol
-        above = path > limits[None, :, 1] + limit_tol
-        outside = below | above
-        lower = np.maximum(limits[None, :, 0] - path, 0.0)
-        upper = np.maximum(path - limits[None, :, 1], 0.0)
         return outside, np.maximum(lower, upper)
 
     def _require_collision_model(self) -> None:
@@ -219,11 +202,8 @@ class IKGeometry:
         weights: tuple[float, ...] | np.ndarray,
         delta: np.ndarray | None = None,
     ) -> float:
-        """Rank IK candidates by sqrt(sum_j w_j * (delta_j / range_j)²).
-
-        Uses hardware ranges and wrapped equivalent-angle deltas; larger weights
-        penalize motion more. Optional delta reuses compute_qpos_delta output.
-        Reference: LeFranX weighted_ik.cpp:62-69 (current_distance).
+        """Rank by sqrt(sum_j w_j*(wrapped_delta_j/hardware_range_j)²); optional delta avoids recomputation.
+        Reference: LeFranX weighted_ik.cpp:62–69.
         """
         qpos = ensure_qpos(qpos, self.dof, "qpos")
         reference_qpos = ensure_qpos(reference_qpos, self.dof, "reference_qpos")

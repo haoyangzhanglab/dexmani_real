@@ -5,6 +5,7 @@
     python examples/run_policy.py policy/task/experiment
     python examples/run_policy.py policy/task/experiment --checkpoint 80pct --inference-steps 4
     python examples/run_policy.py policy/task/experiment --config local.yaml --n-action-steps 8
+    python examples/run_policy.py policy/task/experiment --execution-mode async --prefetch-steps 1
     python examples/run_policy.py --print-config
 
 常用参数：
@@ -14,12 +15,8 @@
     默认最多评估 20 轮，每轮按 B 开始、S 结束；Q 提前退出，--num-episodes N 修改轮数。
     --no-record / --no-results 分别关闭 Raw / 评估摘要；--output 指定输出目录。
 
-执行模式通过 --config YAML 设置，默认 sync；异步示例：
-    execution:
-      execution_mode: async
-      prefetch_steps: 2
-
-RTC 使用 execution_mode: rtc，并显式设置 prefetch_steps 和 rtc_guidance_cap。
+执行模式默认 sync；CLI 执行参数优先于 --config YAML。
+RTC 使用 --execution-mode rtc，并显式设置 --prefetch-steps 和 --rtc-guidance-cap。
 当前 RTC 仅支持连续动作 BaseAgent DDIM 策略；ManiFlow 支持 sync/async。
 普通运行会连接设备，关闭输出不是离线模式；--print-config 不连接设备。
 其他参数见 --help。
@@ -56,6 +53,16 @@ def _nonnegative_int(raw: str) -> int:
     return value
 
 
+def _nonnegative_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number") from exc
+    if not math.isfinite(value) or value < 0.0:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number")
+    return value
+
+
 def _positive_running_seconds(raw: str) -> float:
     try:
         value = float(raw)
@@ -80,8 +87,8 @@ def _parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         help=(
-            "Optional Real hardware/execution YAML (execution_mode, prefetch_steps, "
-            "rtc_guidance_cap under execution); Policy uses experiment/config.yaml"
+            "Optional Real hardware/execution YAML; execution CLI options take precedence. "
+            "Policy uses experiment/config.yaml"
         ),
     )
     parser.add_argument(
@@ -122,6 +129,24 @@ def _parser() -> argparse.ArgumentParser:
         "--no-results", action="store_true", help="Disable evaluation summary independently of --no-record"
     )
     execution = parser.add_argument_group("Real execution")
+    execution.add_argument(
+        "--execution-mode",
+        choices=("sync", "async", "rtc"),
+        default=None,
+        help="Override execution mode (default: YAML or sync)",
+    )
+    execution.add_argument(
+        "--prefetch-steps",
+        type=_positive_int,
+        default=None,
+        help="Override prefetch delay d for async/RTC; requires 1 <= d <= A_exec and A_exec+d <= P",
+    )
+    execution.add_argument(
+        "--rtc-guidance-cap",
+        type=_nonnegative_float,
+        default=None,
+        help="Override finite nonnegative RTC guidance cap; 0 retains prefix freezing without guidance",
+    )
     execution.add_argument(
         "--n-action-steps",
         type=_positive_int,
@@ -221,7 +246,14 @@ def main(argv: list[str] | None = None) -> int:
     from dexmani_real.config.experiment import config_as_dict, load_experiment_config
 
     try:
-        runtime = load_experiment_config(yaml_path=args.config)
+        runtime = load_experiment_config(
+            yaml_path=args.config,
+            cli_overrides={
+                "execution.execution_mode": args.execution_mode,
+                "execution.prefetch_steps": args.prefetch_steps,
+                "execution.rtc_guidance_cap": args.rtc_guidance_cap,
+            },
+        )
     except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
         parser.error(f"invalid experiment config: {exc}")
     if args.print_config:

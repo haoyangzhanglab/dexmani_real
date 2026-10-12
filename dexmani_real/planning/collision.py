@@ -1,8 +1,5 @@
-"""Pinocchio self and static-environment collision checks for xArm7 + XHand.
-
-Both models share xarm7_xhand.srdf: arm-arm and arm-hand checks, with
-hand self-collision disabled. Collision checks use nominal URDF geometry;
-the physical hand mount compensation belongs only to real-pose FK.
+"""Nominal-URDF collision checks for xArm7 + XHand; xarm7_xhand.srdf excludes hand self-collision.
+Physical mount compensation belongs to real-pose FK, not collision geometry.
 """
 
 from __future__ import annotations
@@ -20,7 +17,6 @@ from dexmani_real.robot.model import (
     HAND_DOF,
     HAND_SDK_TO_URDF_IDX,
     XARM7_JOINT_NAMES,
-    XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_RIGHT_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
     XHAND_MODEL_DIR,
@@ -54,8 +50,6 @@ class CollisionPair:
 
 @dataclass
 class CollisionInfo:
-    """Structured collision diagnostic result."""
-
     in_collision: bool
     collision_pairs: tuple[CollisionPair, ...] = ()
     num_contacts: int = 0
@@ -87,16 +81,10 @@ CollisionInfo._NO_COLLISION = CollisionInfo(in_collision=False)
 
 
 class CollisionModel:
-    """Robot and static-environment collision model with fixed or active hand joints.
-
-    hand_dof=False uses the 7-DOF collision URDF with a fixed hand;
-    hand_dof=True uses the full URDF with qpos = [arm(7), hand(12)].
-    Both use the repository's original URDF, meshes and shared SRDF.
-    """
+    """19-DOF URDF-order collision model; arm-only queries expand with the supplied SDK-order hand pose."""
 
     def __init__(
         self,
-        hand_dof: bool = False,
         *,
         static_boxes: Iterable[Any] = (),
         table: Any | None = None,
@@ -104,27 +92,22 @@ class CollisionModel:
         import pinocchio as pin
 
         self._pin = pin
-        self._hand_dof = hand_dof
-
-        urdf_path = str(
-            XARM7_XHAND_RIGHT_URDF_PATH if hand_dof else XARM7_XHAND_COLLISION_URDF_PATH
-        )
+        urdf_path = str(XARM7_XHAND_RIGHT_URDF_PATH)
         package_dirs = [str(XHAND_MODEL_DIR)]
 
         self._model = pin.buildModelFromUrdf(urdf_path)
-        if hand_dof:
-            active = sorted(
-                (
-                    (joint.idx_q, self._model.names[i])
-                    for i, joint in enumerate(self._model.joints)
-                    if i != 0 and joint.nq > 0
-                ),
-            )
-            if self._model.nq != 19 or tuple(name for _, name in active) != (
-                *XARM7_JOINT_NAMES,
-                *XHAND_URDF_JOINT_NAMES,
-            ):
-                raise ValueError("collision model active q order must be xArm7 + XHand URDF joints")
+        active = sorted(
+            (
+                (joint.idx_q, self._model.names[i])
+                for i, joint in enumerate(self._model.joints)
+                if i != 0 and joint.nq > 0
+            ),
+        )
+        if self._model.nq != 19 or tuple(name for _, name in active) != (
+            *XARM7_JOINT_NAMES,
+            *XHAND_URDF_JOINT_NAMES,
+        ):
+            raise ValueError("collision model active q order must be xArm7 + XHand URDF joints")
         self._data = self._model.createData()
 
         self._collision_model = pin.buildGeomFromUrdf(
@@ -141,7 +124,6 @@ class CollisionModel:
 
         self._collision_data = self._collision_model.createData()
 
-        # Environment checks use a separate robot↔static-obstacle geometry model.
         self._environment_collision_model = None
         self._robot_environment_geom_count = 0
         self._environment_names: dict[int, str] = {}
@@ -211,10 +193,9 @@ class CollisionModel:
         )
         self._nq: int = self._model.nq
         logger.debug(
-            "CollisionModel ready: %d DOF%s, %d geometries, %d self pairs, "
+            "CollisionModel ready: %d DOF (7 arm + 12 hand), %d geometries, %d self pairs, "
             "%d static boxes, table=%s, %d environment pairs",
             self._nq,
-            " (7 arm + 12 hand)" if hand_dof else "",
             self._collision_model.ngeoms,
             len(self._collision_model.collisionPairs),
             len(normalized_boxes),
@@ -226,7 +207,7 @@ class CollisionModel:
 
         self._expected_qpos_shape: tuple[int, ...] = (self._nq,)
 
-        # Arm-only inputs require caller-supplied hand angles in 19-DOF mode.
+        # Arm-only queries require an explicit hand posture.
         self._hand_qpos: np.ndarray | None = None
 
     @staticmethod
@@ -263,7 +244,6 @@ class CollisionModel:
 
     @classmethod
     def _normalize_table(cls, table: Any | None) -> dict[str, Any] | None:
-        """Validate and normalize a calibrated table configuration."""
         if table is None or not bool(cls._box_value(table, "enabled")):
             return None
         plane = np.asarray(cls._box_value(table, "plane_abcd"), dtype=np.float64)
@@ -279,10 +259,9 @@ class CollisionModel:
         if normal_norm <= 1e-9:
             raise ValueError("table plane normal must be non-zero")
         normal = plane[:3] / normal_norm
-        d_normalized = float(plane[3] / normal_norm)
         if normal[2] <= 0.0:
-            normal = -normal
-            d_normalized = -d_normalized
+            raise ValueError("table plane normal must point upward")
+        d_normalized = float(plane[3] / normal_norm)
         if np.any(size_xy <= 0.0) or not np.isfinite(thickness_m) or thickness_m <= 0.0:
             raise ValueError("table size and thickness must be finite and positive")
         if not np.isfinite(soft_clearance_m) or soft_clearance_m < 0.0:
@@ -321,30 +300,20 @@ class CollisionModel:
         )
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
-        """Set finite (12,) hand angles in radians before each arm collision check.
-
-        In hand_dof mode, 7-DOF arm inputs expand using this hand configuration.
-        SDK-to-URDF joint ordering is defined in robot.model.
-        """
+        """Set finite SDK-order (12,) hand angles in radians for arm-only collision queries."""
         hand_qpos = np.asarray(hand_qpos, dtype=np.float64)
         if hand_qpos.shape != (HAND_DOF,):
             raise ValueError(f"Expected hand_qpos shape ({HAND_DOF},), got {hand_qpos.shape}")
         if not np.all(np.isfinite(hand_qpos)):
             raise ValueError("hand_qpos contains NaN or Inf — FK would silently fail")
-        # Gather SDK joint values in the order required by the URDF model.
         self._hand_qpos = hand_qpos[list(HAND_SDK_TO_URDF_IDX)]
 
     def _to_full_qpos(self, qpos: np.ndarray) -> np.ndarray:
-        """Normalize qpos for internal use, auto-expanding arm→full in hand_dof mode.
-
-        - 7-DOF model: always expects ``(7,)``.
-        - 19-DOF model: accepts ``(7,)`` (auto-expands with ``_hand_qpos``) or
-          ``(19,)`` (uses as-is).
-        """
+        """Expand arm (7,) using the saved hand pose, or accept full URDF (19,)."""
         qpos = np.asarray(qpos, dtype=np.float64)
         if not np.all(np.isfinite(qpos)):
             raise ValueError("qpos contains NaN or Inf — collision FK requires finite values")
-        if self._hand_dof and qpos.shape == ARM_JOINT_SHAPE:
+        if qpos.shape == ARM_JOINT_SHAPE:
             if self._hand_qpos is None:
                 raise RuntimeError(
                     "hand_qpos is required for 19-DOF collision checks; "
@@ -383,11 +352,7 @@ class CollisionModel:
         return self._pin_update(qpos, stop_at_first=True)
 
     def minimum_hand_frame_z(self, arm_qpos: np.ndarray) -> float:
-        """Return the lowest nominal XHand link-frame origin in robot-base coordinates.
-
-        Uses set_hand_qpos in 19-DOF mode, or the fixed hand in 7-DOF mode.
-        Callers must add a mesh-extent margin: frame origins are not surface points.
-        """
+        """Return the lowest nominal hand-link origin in base; use the saved posture and add a mesh-extent margin."""
         qpos = self._to_full_qpos(arm_qpos)
         self._pin.forwardKinematics(self._model, self._data, qpos)
         self._pin.updateFramePlacements(self._model, self._data)
@@ -401,11 +366,7 @@ class CollisionModel:
         return min(z_values)
 
     def check_self_collision_details(self, qpos: np.ndarray) -> "CollisionInfo":
-        """Check self-collision and return structured ``CollisionInfo``.
-
-        Only allocates on collision; returns cached ``CollisionInfo.no_collision()``
-        on the common (no-collision) path.
-        """
+        """Return CollisionInfo, reusing the cached no-collision result when clear."""
         has_any = self._pin_update(qpos, stop_at_first=False)
         if not has_any:
             return CollisionInfo.no_collision()
@@ -470,7 +431,7 @@ class CollisionModel:
     def check_environment_collision(self, qpos: np.ndarray) -> bool:
         """Return whether nominal robot geometry touches a configured box or table."""
         if not self.has_static_environment:
-            self._to_full_qpos(qpos)  # preserve finite/shape validation
+            self._to_full_qpos(qpos)  # validate even without obstacles
             return False
         full_qpos = self._to_full_qpos(qpos)
         return bool(
@@ -560,7 +521,6 @@ class CollisionModel:
         return True
 
     def _get_geom_link_name(self, geom_id: int) -> str:
-        """Get the link name for a geometry object index."""
         geom = self._collision_model.geometryObjects[geom_id]
         parent_frame = geom.parentFrame
         if parent_frame < len(self._model.frames):

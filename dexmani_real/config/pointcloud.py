@@ -19,10 +19,9 @@ class PointCloudConfig:
     edge_jump_m: float = 0.030
     edge_surface_band_m: float = 0.008
     depth_support_min_neighbors: int = 2
-    # At unresolved depth edges, reject thin structures lacking same-surface support.
+    # Reject unsupported thin structures at unresolved depth edges.
     edge_support_min_neighbors: int = 5
-    # Preserve low object bases only when connected to a coherent high seed patch.
-    # Seeds sit above observed 7--13 mm table residuals; isolated spikes do not qualify.
+    # Retain low surfaces only with coherent seeds above the observed 7–13 mm table residual.
     table_core_height_m: float = 0.007
     table_object_seed_height_m: float = 0.016
     table_object_seed_min_pixels: int = 4
@@ -39,7 +38,7 @@ class PointCloudConfig:
     outlier_min_neighbors: int = 6
     # Reject 7--9 point islands that can pass the six-neighbor density threshold.
     outlier_min_component_points: int = 10
-    # Persisted checkpoint key: caps sampling candidates AFTER density/component filtering.
+    # Persisted key: bounds sampling candidates after density/component filtering.
     outlier_candidate_multiplier: int = 8
     # Stratify over 15 mm cells at the default voxel size, then fill deterministically.
     sampling_coarse_voxel_stride: int = 3

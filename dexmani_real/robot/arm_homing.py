@@ -64,7 +64,7 @@ def _home_path(current, target, planner, config):
     start = (
         wrapped.waypoints[-1]
         if len(wrapped.waypoints)
-        else planner.ik_geometry.nearest_equivalent_qpos(target, current)
+        else planner.ik_geometry.canonicalize_qpos(target, current)
     )
     alignment = compute_band_alignment_path(start, target, planner, **options)
     if alignment.status is HomePathStatus.UNSAFE:
@@ -142,7 +142,6 @@ def execute_arm_home(
         return HomeResult(False, "home interrupted during planning", interrupted=True)
     if progress:
         progress(f"arm home: {len(waypoints)} planned milestones")
-    # Bound total HOME duration using path travel and per-milestone settling allowances.
     travel = (
         float(np.max(np.abs(np.diff(waypoints, axis=0)), axis=1).sum()) if len(waypoints) > 1 else 0
     )
@@ -189,12 +188,7 @@ def execute_arm_home(
 
 
 def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
-    """Construct the shared return-home planner for teleop, policy and replay.
-
-    Online Cartesian IK checks robot endpoint self-collision. Return-home
-    additionally needs path/workspace/table/static-box checks, so HOME uses
-    a planner configured with the current environment.
-    """
+    """Build HOME planning with current workspace/table/static geometry beyond online IK endpoint checks."""
     runtime.arm.homing.validate()
     runtime.policy.workspace.validate()
     runtime.environment.validate()
@@ -209,7 +203,6 @@ def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
             base_pose_world=Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0])),
             workspace_bounds=workspace,
         ),
-        hand_dof=True,
         static_boxes=tuple(runtime.environment.static_boxes),
         table=runtime.environment.table,
     )

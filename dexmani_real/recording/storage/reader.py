@@ -155,10 +155,7 @@ class EpisodeReader:
                     if "termination" in group else None)
 
     def timing_diagnostics(self):
-        """Host ages/deltas in seconds, with NaN/None for unavailable evidence.
-
-        These measurements define no cross-modality admission threshold.
-        """
+        """Return host ages/deltas in seconds (NaN/None if missing), without cross-modality admission thresholds."""
         evidence = self.read_timing()
         if not evidence["available"]:
             return evidence
