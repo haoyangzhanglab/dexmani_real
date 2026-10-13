@@ -20,7 +20,6 @@ from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.sensor.pointcloud import (
     build_point_cloud,
 )
-from dexmani_real.utils.geometry import validate_rigid_transform
 from dexmani_real.utils.log import configure_logging
 
 
@@ -69,16 +68,14 @@ def _resolve_base_from_color(
     if not serial:
         raise RuntimeError("camera did not publish a serial for point-cloud calibration")
     camera_name = calibration.resolve_name_by_serial(serial)
-    metadata = calibration.to_meta_dict(camera_name, expected_serial=serial)
-    if metadata.get("camera_type") != "eye_to_hand":
+    entry = calibration.get_entry(camera_name, expected_serial=serial)
+    if entry.type != "eye_to_hand":
         raise ValueError(
             "realtime point-cloud worker currently requires an eye_to_hand camera; "
             "eye_in_hand needs a separately synchronized arm-pose contract"
         )
-    return validate_rigid_transform(
-        calibration.get_extrinsics(camera_name),
-        label="T_xarm_base_from_color",
-    )
+    assert entry.T_world_camera is not None
+    return entry.T_world_camera.copy()
 
 
 def _load_static_inputs(

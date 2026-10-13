@@ -41,6 +41,8 @@ python examples/pointcloud_process_example.py --help
 
 采集允许缺相机外参；点云重建需要对应相机的内外参与 depth scale。标定在会话启动时读取。采集可指定 `--vr-transform` / `--camera-calibration`，部署可指定 `--camera-calibration`，相机和 VR 标定可指定 `--output`；桌面平面路径由 `environment.table.plane_path` 配置。
 
+相机预览的 `MARKER OK` 表示当前预览帧检测成功；保存标定样本还需通过独立的多帧采样、静止和有效性检查。
+
 ### 采集
 
 ```bash
@@ -76,7 +78,7 @@ python examples/visualize_episode.py <episode> --max-frames 100 --config local.y
 python examples/export_policy_zarr.py episodes/<task> --config local.yaml
 ```
 
-`--info` 查看元数据与数值概要，无需 Rerun；交互 viewer 顺序读取所选 RGB-D 帧。查看和导出使用当前点云、桌面与手部安装配置，相机几何来自对应 Raw。仅当 `pointcloud.remove_table: true` 时读取桌面平面。
+`--info` 查看元数据与数值概要，无需 Rerun；交互 viewer 顺序读取所选 RGB-D 帧。查看和导出使用当前点云、桌面与手部安装配置，相机几何来自对应 Raw。仅当 `pointcloud.remove_table: true` 时读取桌面平面。viewer 的点云耗时只统计已读取 RGB-D 的派生计算，不含读取和显示，不能与包含读取耗时的旧日志直接比较。
 
 公共导出要求每段全部 **13 字段**完整，每行浮点数值均有限；缺字段、NaN/Inf、RGB-D 行数不符、相机几何缺失或点云无法重建时，整段拒绝并在日志中记录原因。完整性检查覆盖全部模态，不随模型所需字段而放宽，hand current / arm effort 的辅助 NaN 也会导致整段拒绝。Raw 原样保留，导出不删单帧、不插值、不填补缺测；触觉直接使用采集保存值，不再次保持或修补。下游按模型所需字段加载。
 
@@ -115,7 +117,7 @@ Raw 与评估摘要可独立关闭：`--no-record` 关闭 Raw，`--no-results` �
 
 Rollout Raw 默认用于评估 evidence，保留 bootstrap/WAIT 的无动作行与具体终止原因（关闭摘要时也保留）。公共导出按同一时间、完整性与动作提交规则判定，通常会拒绝这些含无动作行的 episode；未来用于再训练需另行定义派生片段和时间映射，不能填动作或裁行来通过当前导出。
 
-`data.h5/timing` 保存可选的控制时序与来源证据，关联观测、query、命令提交和终止原因，并记录相机与点云的主机处理时刻。相机和点云的年龄从 RGB-D 较旧通道的新帧首次到达主机时起算，重复帧和点云计算完成都不会刷新其年龄；该时间不包含接收前的相机、USB 或 SDK 内部延迟。具体布局见 [Raw schema](dexmani_real/recording/storage/schema.py)，读取与延迟诊断见 [EpisodeReader](dexmani_real/recording/storage/reader.py)，实际 SDK 调用以 dispatch status 为准。历史 Raw 保持原样，未记录的时序证据明确标为不可用。
+启用 Raw 时，`data.h5/timing` 保存控制时序与来源证据，关联观测、query、命令提交和终止原因，并记录相机与点云的主机处理时刻。相机和点云的年龄从 RGB-D 较旧通道的新帧首次到达主机时起算，重复帧和点云计算完成都不会刷新其年龄；该时间不包含接收前的相机、USB 或 SDK 内部延迟。具体布局见 [Raw schema](dexmani_real/recording/storage/schema.py)，读取与延迟诊断见 [EpisodeReader](dexmani_real/recording/storage/reader.py)，实际 SDK 调用以 dispatch status 为准。历史 Raw 保持原样，未记录的时序证据明确标为不可用。
 
 部署 joint、EEF 的最终关节目标及 RTC 冻结目标统一检查机械/关节限位、跳变、FK 最终 EEF 工作空间、自碰撞及当前配置的 static boxes。最终 FK 工作空间检查默认允许各边界超出 5 mm，可通过 `execution.eef_workspace_margin_m` 调整，设为 0 恢复严格边界；EEF 原始目标投影与 HOME 路径仍使用原始工作空间。Policy 动作不做桌面碰撞检测，允许贴桌/接触操作，由操作员监督并准备硬件急停；H 执行 HOME 时仍按当前配置检查桌面和路径，点云去桌仍使用当前桌面标定。EEF 仍先投影再 IK；拒绝就终止本轮并记录原因，不重规划或恢复。这些是最终目标检查，不证明真实连续运动轨迹安全，仍需现场验收。
 
@@ -128,6 +130,8 @@ python examples/replay_episode.py episodes/<task>/<episode> --config local.yaml 
 ```
 
 按 Raw 的标称节拍逐行回放关节目标，要求 teleop 数据、非空有限的目标与关节状态、双设备持续发送状态，并检查目标是否满足当前限位。输出目录须新建或为空，保存 `session_result.json`、已采集的 `replay_data.npz` 与可计算的一致性指标 `metrics.json`。Q 保存前缀并退出，ESC 急停；完成后可按 H 执行规划回 HOME。
+
+会话结束阶段，先保存已采集的实测关节、目标、发送状态和时间，再离线生成 EEF 位姿并原子更新 `replay_data.npz`。EEF 派生或其 NPZ 更新失败时，第一次保存的物理捕获仍保留，EEF 字段维持 NaN；指标写盘失败不影响已保存的 EEF。错误记录到 `session_result.json`，没有捕获行时不生成 `replay_data.npz`。输入 Raw 始终保持原样。
 
 ## 其他入口
 
@@ -144,7 +148,7 @@ XHand 示例按 HOME → fist → palm → V → OK → HOME 顺序执行动作�
 
 **Raw 是实验 evidence，发布后不可变。** 采集保留接入的 RGB-D、关节与触觉观测。停止、晚帧、控制失败和缺测保留已采前缀及结束原因，仅操作者显式丢弃才删除当前 capture。写盘、编码或发布失败保留 staging 并报告失败；相机停帧不补黑图，触觉按 Raw 保存值导出。
 
-每个 Raw episode 只使用 `data.h5` 与 `rgb.mp4`，HDF5 保存物理观测、尝试发送的目标、相对秒时间与发送状态，以及采集和相机元数据。
+每个 Raw episode 只使用 `data.h5` 与 `rgb.mp4`，HDF5 保存物理观测、尝试发送的目标、相对秒时间与发送状态，以及采集和相机元数据。保存的 depth 与 RGB 像素网格对齐，查看和点云重建复用同帧深度。
 
 录制端非阻塞提交当前控制行，后台线程完成编码和写盘；启动和结束时先撤销运动，再等待文件准备或发布。录制队列满或写入失败会明确报错并保留 staging，不静默丢帧。
 

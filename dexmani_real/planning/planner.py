@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.config.environment import StaticCollisionBox, TableCollisionConfig
 from dexmani_real.robot.model import (
     XARM7_XHAND_COLLISION_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
@@ -62,8 +63,8 @@ class XArm7MotionPlanner:
         planning_profile: MotionPlanningConfig | None = None,
         online_ik_profile: OnlineIKConfig | None = None,
         *,
-        static_boxes: Iterable[Any] = (),
-        table: Any | None = None,
+        static_boxes: Iterable[StaticCollisionBox] = (),
+        table: TableCollisionConfig | None = None,
     ) -> None:
         import mplib
 
@@ -169,8 +170,8 @@ class XArm7MotionPlanner:
         *,
         planning_profile: MotionPlanningConfig | None = None,
         online_ik_profile: OnlineIKConfig | None = None,
-        static_boxes: Iterable[Any] = (),
-        table: Any | None = None,
+        static_boxes: Iterable[StaticCollisionBox] = (),
+        table: TableCollisionConfig | None = None,
     ) -> "XArm7MotionPlanner":
         """Build online IK and home planning with canonical assets and an identity base pose."""
         return cls(
@@ -470,17 +471,17 @@ class XArm7MotionPlanner:
             return self._make_failure("Path collision check failed closed.", source, report)
         report.update(collision_report)
         if collision_report.get("path_collision"):
-            collision_dict = collision_report.get("collision")
+            collision = collision_report.get("collision")
             reason = "Path contains a collision."
-            if isinstance(collision_dict, dict) and collision_dict.get("in_collision"):
-                num = collision_dict.get("num_contacts", 0)
-                pairs = collision_dict.get("collision_pairs", [])
-                link_names = ", ".join(f"{p['link1']}↔{p['link2']}" for p in pairs[:5])
+            if collision:
+                num = collision.num_contacts
+                pairs = collision.collision_pairs
+                link_names = ", ".join(f"{p.link_name1}↔{p.link_name2}" for p in pairs[:5])
                 if len(pairs) > 5:
                     link_names += f" ... +{len(pairs) - 5} more"
                 collision_kind = (
                     "environment collision"
-                    if any(pair.get("type") == "environment" for pair in pairs)
+                    if any(pair.collision_type == "environment" for pair in pairs)
                     else "self-collision"
                 )
                 reason = f"Path contains {collision_kind} ({num} contact(s): {link_names})."

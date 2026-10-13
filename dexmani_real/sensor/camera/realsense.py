@@ -1,4 +1,4 @@
-"""RealSense D400/L515 driver with native and depth-to-color RGB-D payloads."""
+"""RealSense D400/L515 driver with aligned RGB-D and native stream geometry."""
 
 from __future__ import annotations
 
@@ -36,8 +36,6 @@ _L515_OPTION_NAMES = (
 @dataclass(frozen=True)
 class RGBDFrame:
     rgb: np.ndarray
-    # Native depth preserves measurement provenance.
-    depth_raw: np.ndarray
     # Aligned depth uses color-grid intrinsics and the color-camera frame.
     depth_aligned_to_color_raw: np.ndarray | None
     depth_frame_number: int
@@ -427,9 +425,7 @@ class RealSenseCamera:
                 aligned_depth_frame.get_data(), dtype=np.uint16, copy=True, order="C"
             )
 
-        # Force owned copies: ascontiguousarray may retain SDK buffers that expire on return.
-        depth_raw = np.array(depth_frame.get_data(), dtype=np.uint16, copy=True, order="C")
-
+        # Force an owned copy: ascontiguousarray may retain SDK buffers that expire on return.
         bgr = np.asarray(color_frame.get_data(), dtype=np.uint8)
         rgb = np.array(bgr[..., ::-1], dtype=np.uint8, copy=True, order="C")
 
@@ -438,7 +434,6 @@ class RealSenseCamera:
         color_frame_number = int(color_frame.get_frame_number())
         frame = RGBDFrame(
             rgb=rgb,
-            depth_raw=depth_raw,
             depth_aligned_to_color_raw=aligned_depth_raw,
             depth_frame_number=depth_frame_number,
             color_frame_number=color_frame_number,

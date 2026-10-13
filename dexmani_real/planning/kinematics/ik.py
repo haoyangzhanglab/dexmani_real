@@ -373,16 +373,8 @@ class OnlineIKSolver:
 
     def _prepare_candidate(self, raw, attempt, target, current, previous, pool, report):
         # Mechanical equivalence survives narrowing the operational interval below 2*pi.
-        q = raw.copy()
-        mask = self.ik_geometry.equivalent_joint_mask
+        q = self.ik_geometry.canonicalize_qpos(raw, current, self.operational_limits)
         lo, hi = self.operational_limits.T
-        period = 2 * np.pi
-        k_min, k_max = (
-            np.ceil((lo[mask] - q[mask]) / period),
-            np.floor((hi[mask] - q[mask]) / period),
-        )
-        k = np.minimum(np.maximum(np.rint((current[mask] - q[mask]) / period), k_min), k_max)
-        q[mask] = np.where(k_min <= k_max, q[mask] + period * k, q[mask])
         if not np.isfinite(q).all():
             raise ValueError("canonical IK output is non-finite")
         if np.any(q < lo) or np.any(q > hi):

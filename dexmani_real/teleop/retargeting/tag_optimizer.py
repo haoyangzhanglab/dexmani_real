@@ -29,13 +29,13 @@ class HandOptimizer:
     """Fit fingertips with analytic gradients; joint limits use radians and finger lengths use meters.
     Scale lengths by robot/human × finger_scale_boost; stage-specific tolerances/budgets configure NLopt.
     Stage 2 applies the distance-ramped pinch attraction, EMA/skip threshold, and Stage-1/previous-frame anchors.
+    The injected PinGrad and its mutable Data belong to this optimizer.
     """
 
     def __init__(
         self,
         *,
-        urdf_path: str,
-        fingertip_frame_names: list[str],
+        pin_grad: PinGrad,
         joint_limits_lower: np.ndarray,
         joint_limits_upper: np.ndarray,
         finger_lengths_robot: np.ndarray,
@@ -54,7 +54,7 @@ class HandOptimizer:
         reg_stage1_weight: float = 1.0,
         reg_last_weight: float = 0.8,
     ) -> None:
-        self.pin_grad = PinGrad(urdf_path, fingertip_frame_names)
+        self.pin_grad = pin_grad
         self.dof: int = self.pin_grad.dof
         self.finger_num: int = len(self.pin_grad.tip_frame_ids)
         if self.finger_num != 5:
@@ -281,15 +281,12 @@ class TAGHandRetargeter:
         urdf_path: str,
         debug: bool = False,
     ) -> None:
-        import pinocchio as pin
         from scipy.spatial.transform import Rotation
-
-        from dexmani_real.teleop.retargeting.pin_grad import validate_fingertip_frame_names
 
         tag_config.validate()
         resolved_urdf_path = str(urdf_path)
-        resolved_tip_names = validate_fingertip_frame_names(fingertip_link_names)
-        model = pin.buildModelFromUrdf(resolved_urdf_path, pin.JointModelFreeFlyer())
+        pin_grad = PinGrad(resolved_urdf_path, list(fingertip_link_names))
+        model = pin_grad.model
         joint_lo = model.lowerPositionLimit[7:].copy()
         joint_hi = model.upperPositionLimit[7:].copy()
 
@@ -300,8 +297,7 @@ class TAGHandRetargeter:
         self._mapping_sdk_to_model = np.argsort(self._mapping_model_to_sdk)
 
         self._optimizer = HandOptimizer(
-            urdf_path=resolved_urdf_path,
-            fingertip_frame_names=list(resolved_tip_names),
+            pin_grad=pin_grad,
             joint_limits_lower=joint_lo,
             joint_limits_upper=joint_hi,
             finger_lengths_robot=np.array(tag_config.robot_finger_lengths, dtype=np.float64),

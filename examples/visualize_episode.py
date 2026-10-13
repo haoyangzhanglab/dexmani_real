@@ -170,7 +170,6 @@ class EpisodeVisualizer:
                 if pointcloud_config is None:
                     raise ValueError("point-cloud visualization requires resolved config")
                 self._pointcloud_deriver = RawEpisodePointCloudDeriver(
-                    reader=self._reader,
                     camera=self._camera_model,
                     T_xarm_base_from_color=self._T_xarm_base_from_color,
                     pointcloud=pointcloud_config,
@@ -306,34 +305,36 @@ class EpisodeVisualizer:
             "nominal_time" if self._reader.meta.get("timestamp_source") == "nominal_fps" else "time",
             float(self._reader["timestamp"][step_idx]),
         )
-        self._log_camera(step_idx)
-        self._log_pointcloud(step_idx)
+        depth = self._log_camera(step_idx)
+        self._log_pointcloud(step_idx, depth)
         self._log_fingertips(step_idx)
         self._log_eef(step_idx)
         self._log_time_series(step_idx)
 
-    def _log_camera(self, step_idx: int) -> None:
+    def _log_camera(self, step_idx: int) -> np.ndarray:
         if step_idx != self._rgb_index + 1:
             raise ValueError("viewer reads frames sequentially")
         self._rgb = next(self._rgb_frames, None)
         if self._rgb is None:
             raise ValueError(f"RGB missing at frame {step_idx}")
         self._rgb_index = step_idx
+        depth = np.asarray(self._reader["depth"][step_idx])
         rr.log("camera/color/rgb", rr.Image(self._rgb))
         rr.log(
             "depth/image",
             rr.DepthImage(
-                self._reader.read_camera_frame("depth", step_idx),
+                depth,
                 meter=self._depth_meter,
                 depth_range=(0, 10000),  # Clamp outliers to stabilize the colormap.
             ),
         )
+        return depth
 
-    def _log_pointcloud(self, step_idx: int) -> None:
+    def _log_pointcloud(self, step_idx: int, depth: np.ndarray) -> None:
         if self._pointcloud_deriver is None:
             return
         started_ns = time.perf_counter_ns()
-        cloud = self._pointcloud_deriver.derive(step_idx, self._rgb)
+        cloud = self._pointcloud_deriver.derive(depth, self._rgb)
         self._pointcloud_processing_ns += time.perf_counter_ns() - started_ns
         self._pointcloud_processed_frames += 1
         if cloud is None:
@@ -408,6 +409,7 @@ class EpisodeVisualizer:
 
     @property
     def mean_pointcloud_processing_ms(self) -> float | None:
+        """Mean cloud derivation time, excluding depth reads and viewer logging."""
         if self._pointcloud_processed_frames == 0:
             return None
         return self._pointcloud_processing_ns / self._pointcloud_processed_frames / 1e6
@@ -507,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         mean_pointcloud_ms = viz.mean_pointcloud_processing_ms
         if mean_pointcloud_ms is not None:
             logger.info(
-                "Point-cloud processing average: %.2f ms/frame",
+                "Point-cloud derivation average (excluding RGB-D I/O and rendering): %.2f ms/frame",
                 mean_pointcloud_ms,
             )
         if viz.empty_pointcloud_frames:

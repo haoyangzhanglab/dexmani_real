@@ -143,7 +143,11 @@ class IKGeometry:
         path: np.ndarray,
         collision_step_size: float = 0.02,
     ) -> dict[str, Any]:
-        """Check a path densely against self and configured static geometry."""
+        """Check a path densely against self and configured static geometry.
+
+        CollisionInfo stays in memory for diagnostics; missing details must not
+        override a true path_collision result from the segment check.
+        """
         self._require_collision_model()
         path = np.asarray(path, dtype=np.float64)
         if path.ndim != 2 or path.shape[1] != self.dof:
@@ -160,7 +164,7 @@ class IKGeometry:
                 "collision_waypoint_index": 0,
                 "collision_waypoint_count": len(path),
                 "collision_step_size": collision_step_size,
-                "collision": first.to_dict(),
+                "collision": first,
             }
         for index in range(len(path) - 1):
             if self._cm.check_combined_segment_collision_free(  # type: ignore[union-attr]
@@ -177,7 +181,7 @@ class IKGeometry:
                 "collision_waypoint_index": index,
                 "collision_waypoint_count": len(path),
                 "collision_step_size": collision_step_size,
-                "collision": info.to_dict() if info else None,
+                "collision": info,
             }
         return {"path_collision": False, "path_self_collision": False}
 

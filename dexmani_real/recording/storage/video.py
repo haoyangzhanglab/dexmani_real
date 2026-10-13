@@ -124,16 +124,12 @@ class VideoEncoder:
 
 
 class VideoDecoder:
-    """Stream RGB frames or decode one frame by index without a full-video cache."""
+    """Stream RGB frames sequentially without a full-video cache."""
 
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
         self._container: av.container.InputContainer | None = None
         self._stream: Any = None
-        self._frame_count: int = 0
-        self._rate = None
-        self._origin_time = None
-        self._origin_time_base = None
         self._opened = False
 
     def iter_frames(self) -> Iterator[np.ndarray]:
@@ -147,38 +143,6 @@ class VideoDecoder:
             for frame in packet.decode():
                 if isinstance(frame, av.VideoFrame):
                     yield frame.to_ndarray(format="rgb24")
-
-    def read_frame(self, index: int) -> np.ndarray:
-        """Decode one indexed frame; use iter_frames() for sequential access."""
-        if not self._opened:
-            self._open()
-        if self._container is None:
-            raise RuntimeError("VideoDecoder: container is None after _open()")
-        if index < 0 or index >= self._frame_count:
-            raise IndexError(f"Frame index {index} out of range [0, {self._frame_count})")
-
-        time_base = self._stream.time_base
-        target_time = self._origin_time + Fraction(index, 1) / self._rate
-        pts = target_time // time_base
-        self._container.seek(pts, stream=self._stream, backward=True, any_frame=False)
-        previous = None
-        for frame in self._container.decode(self._stream):
-            if frame.pts is None or frame.time_base is None:
-                raise ValueError("CFR frame is missing its presentation timestamp")
-            ordinal = (frame.pts * frame.time_base - self._origin_time) * self._rate
-            # Both PTS values carry half-tick quantization error; reject ambiguous frame identities.
-            tolerance = (frame.time_base + self._origin_time_base) * self._rate / 2
-            nearest = round(ordinal)
-            if tolerance >= Fraction(1, 2) or abs(ordinal - nearest) > tolerance:
-                raise ValueError("presentation timestamp cannot identify a unique CFR frame")
-            if previous is not None and nearest <= previous:
-                raise ValueError("duplicate or unordered CFR presentation timestamp")
-            previous = nearest
-            if nearest == index:
-                return frame.to_ndarray(format="rgb24")
-            if nearest > index:
-                raise ValueError(f"CFR decode skipped requested frame {index}")
-        raise RuntimeError(f"Failed to decode frame {index} from {self._path}")
 
     def close(self) -> None:
         if self._container is not None:
@@ -195,18 +159,15 @@ class VideoDecoder:
         try:
             self._container = av.open(str(self._path), "r")
             self._stream = self._container.streams.video[0]
-            self._frame_count = int(self._stream.frames) if self._stream.frames > 0 else 0
             avg_rate = self._stream.average_rate
             if avg_rate is None:
                 raise ValueError(f"No average frame rate in {self._path}")
-            self._rate = Fraction(avg_rate)
-            if self._rate <= 0 or self._stream.time_base is None:
+            # Keep the same metadata admission for sequential episode readers.
+            if Fraction(avg_rate) <= 0 or self._stream.time_base is None:
                 raise ValueError("CFR video requires a positive rate and a time base")
             first = next(self._container.decode(self._stream), None)
             if first is None or first.pts is None or first.time_base is None:
                 raise ValueError("CFR video requires a first presentation timestamp")
-            self._origin_time = first.pts * first.time_base
-            self._origin_time_base = first.time_base
             self._opened = True
         except BaseException:
             self.close()

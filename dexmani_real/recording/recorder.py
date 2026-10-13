@@ -61,11 +61,9 @@ def snapshot_recording_metadata(shared, *, collection_source, camera_calibration
     else:
         try:
             name = camera_calibration.resolve_name_by_serial(serial)
-            if (
-                camera_calibration.to_meta_dict(name, expected_serial=serial)["camera_type"]
-                == "eye_to_hand"
-            ):
-                transform = camera_calibration.get_extrinsics(name)
+            entry = camera_calibration.get_entry(name, expected_serial=serial)
+            if entry.type == "eye_to_hand":
+                transform = entry.T_world_camera.copy()
             else:
                 logger.warning("Recording without static eye-to-hand extrinsics")
         except (KeyError, ValueError) as exc:
@@ -310,12 +308,12 @@ class AsyncEpisodeRecorder:
         self._submitted_frames += 1
 
     def record_query(self, values):
-        """Submit query evidence on the same FIFO; no owner-side file I/O."""
+        """Queue a top-level snapshot; callers must leave nested observations unchanged."""
         self.check_error()
         if not self._recording:
             return
         try:
-            self._queue.put_nowait(_QueryTiming(deepcopy(values)))
+            self._queue.put_nowait(_QueryTiming(dict(values)))
         except Full as exc:
             error = RecordingError("recording queue full while submitting query evidence")
             self._store_error(error)

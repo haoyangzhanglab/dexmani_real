@@ -213,10 +213,6 @@ class EpisodeReader:
             self._rgb_decoder = VideoDecoder(self._rgb_path)
         return self._rgb_decoder
 
-    def read_camera_frame(self, key: str, index: int) -> np.ndarray:
-        self.require_fields(key)
-        return self._decoder().read_frame(index) if key == "rgb" else np.asarray(self[key][index])
-
     def iter_camera_frames(self, key: str) -> Iterator[np.ndarray]:
         if key != "rgb":
             raise ValueError("iter_camera_frames supports only MP4-backed RGB")

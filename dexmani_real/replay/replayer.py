@@ -7,7 +7,6 @@ from enum import Enum
 
 import numpy as np
 
-from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.replay.capture import ReplayRecorder
 from dexmani_real.robot.commands import RobotCommand
@@ -155,7 +154,6 @@ def replay_targets(
     try:
         if results is not None:
             results.begin_episode()
-        fk = make_arm_fk()
         robot.prepare_streaming(epoch)
         row = read_observation(shared, runtime, robot)
         if row is None:
@@ -225,7 +223,6 @@ def replay_targets(
                     qpos_min_rad=runtime.hand.qpos_min_rad,
                     qpos_max_rad=runtime.hand.qpos_max_rad,
                 )
-                pos, rot = fk.compute(row.arm["qpos"][0])
                 dispatch_error = None
                 try:
                     result = robot.send_action(
@@ -256,8 +253,6 @@ def replay_targets(
                     capture.record(
                         index,
                         row.arm["qpos"][0],
-                        pos,
-                        rot,
                         arm if result.arm else np.full(7, np.nan),
                         hand if result.hand else np.full(12, np.nan),
                         stamp / 1e9,

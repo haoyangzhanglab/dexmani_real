@@ -206,13 +206,14 @@ class PolicyRunner:
         epoch = self.run_id
         ended_ns = time.monotonic_ns()
         duration_s = (ended_ns - self.started_ns) / 1e9
-        self.termination_timing = dict(
-            run_id=epoch, started_ns=self.started_ns, slot=self.last_slot,
-            ended_ns=ended_ns, reason=detail,
-            query=dict(self.query.evidence) if self.query is not None else None,
-            action_query_id=self.slot_timing.get("query_id"),
-            prediction_index=self.slot_timing.get("prediction_index"),
-        )
+        if self.recorder is not None:
+            self.termination_timing = dict(
+                run_id=epoch, started_ns=self.started_ns, slot=self.last_slot,
+                ended_ns=ended_ns, reason=detail,
+                query=dict(self.query.evidence) if self.query is not None else None,
+                action_query_id=self.slot_timing.get("query_id"),
+                prediction_index=self.slot_timing.get("prediction_index"),
+            )
         revoke_motion_if_run_id(self.shared, epoch, reason=run_end_reason)
         if self.discard_pending_start is not None:
             self.discard_pending_start()
@@ -501,7 +502,7 @@ class PolicyRunner:
         query = self.query
         if query is None:
             raise RuntimeError("Model result has no owned query")
-        if query.run_id == self.run_id:
+        if self.recorder is not None and query.run_id == self.run_id:
             query.evidence.update(
                 started_ns=result.started_ns, completed_ns=result.completed_ns,
                 status="failed" if result.error is not None else "completed",
@@ -570,17 +571,18 @@ class PolicyRunner:
             run_id=self.run_id,
             query_id=self.query_id,
         )
-        self.query.evidence = dict(
-            query_id=self.query_id, run_id=self.run_id, slot=int(slot),
-            handoff_slot=self.query.handoff_slot,
-            # Send-window end of the handoff slot; inference may finish later.
-            deadline_ns=(self.started_ns + (self.query.handoff_slot + 1) * self.dt_ns)
-            if self.query.handoff_slot is not None else None,
-            submitted_ns=time.monotonic_ns(), started_ns=None, completed_ns=None,
-            status="submitted", bootstrap=self.query.handoff_slot is None,
-            observations=[dict(observation_timing(row), policy_sources=policy_sources(
-                row, self.policy_info.observation_fields)) for row in rows],
-        )
+        if self.recorder is not None:
+            self.query.evidence = dict(
+                query_id=self.query_id, run_id=self.run_id, slot=int(slot),
+                handoff_slot=self.query.handoff_slot,
+                # Send-window end of the handoff slot; inference may finish later.
+                deadline_ns=(self.started_ns + (self.query.handoff_slot + 1) * self.dt_ns)
+                if self.query.handoff_slot is not None else None,
+                submitted_ns=time.monotonic_ns(), started_ns=None, completed_ns=None,
+                status="submitted", bootstrap=self.query.handoff_slot is None,
+                observations=[dict(observation_timing(row), policy_sources=policy_sources(
+                    row, self.policy_info.observation_fields)) for row in rows],
+            )
         self.model.submit("predict", observation, **kwargs)
         self._record_query(self.query)
         if commands is not None:
@@ -743,8 +745,9 @@ class PolicyRunner:
             # No prediction was executed while waiting; retain its whole head.
             query.handoff_slot = slot
             query.bootstrap = True
-            query.evidence.update(handoff_slot=int(slot), bootstrap=True)
-            self._record_query(query)
+            if self.recorder is not None:
+                query.evidence.update(handoff_slot=int(slot), bootstrap=True)
+                self._record_query(query)
         if (
             query.handoff_slot is not None
             and slot >= query.handoff_slot

@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
@@ -113,12 +114,6 @@ def _show_rgbd_panels(
 ) -> None:
     if not cfg.show_rgbd_panels:
         return
-    try:
-        import cv2
-    except ImportError:
-        print("  RGBD visualization skipped: OpenCV unavailable.")
-        return
-
     # cv2.imshow expects BGR; convert from RGB.
     bgr = np.ascontiguousarray(rgb[..., ::-1])
     panels: list[tuple[str, np.ndarray]] = [

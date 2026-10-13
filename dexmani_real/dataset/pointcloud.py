@@ -1,4 +1,4 @@
-"""Reconstruct xArm-base clouds from Raw RGB-D metadata; the caller owns EpisodeReader closure."""
+"""Reconstruct xArm-base clouds from Raw RGB-D arrays and camera metadata."""
 
 from __future__ import annotations
 
@@ -78,19 +78,17 @@ def load_raw_episode_base_from_color(reader: EpisodeReader) -> np.ndarray:
 
 @dataclass(frozen=True)
 class RawEpisodePointCloudDeriver:
-    """Reconstruct point clouds from an open raw episode reader."""
+    """Reconstruct point clouds with one raw episode's camera geometry."""
 
-    reader: EpisodeReader
     camera: RawEpisodeCameraModel
     T_xarm_base_from_color: np.ndarray
     pointcloud: PointCloudConfig
     table_plane_abcd: tuple[float, float, float, float] | None
 
-    def derive(self, source_index: int, rgb: np.ndarray) -> np.ndarray | None:
-        """Derive one ``float32[N,6]`` xArm-base cloud from a raw grid row."""
-        depth_raw = np.asarray(self.reader["depth"][source_index], dtype=np.uint16)
+    def derive(self, depth: np.ndarray, rgb: np.ndarray) -> np.ndarray | None:
+        """Derive ``float32[N,6]`` from same-row aligned depth/RGB arrays without modifying them."""
         return build_point_cloud(
-            depth_raw=depth_raw,
+            depth_raw=np.asarray(depth, dtype=np.uint16),
             color=np.asarray(rgb, dtype=np.uint8),
             depth_scale_m=self.camera.depth_scale_m,
             geometry=self.camera.geometry,

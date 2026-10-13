@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
-from dexmani_real.planning.kinematics.pose import rot6d_to_rotmat
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 
@@ -16,9 +14,6 @@ class ReplayRecorder:
         self.capacity = capacity
         self._count = 0
         self.arm_qpos = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
-        self.eef_pos = np.full((capacity, 3), np.nan, dtype=np.float64)
-        self.eef_quat_wxyz = np.full((capacity, 4), np.nan, dtype=np.float64)
-        self.eef_rot6d = np.full((capacity, 6), np.nan, dtype=np.float64)
         self.arm_cmd = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
         self.arm_tracking_error = np.full(capacity, np.nan, dtype=np.float64)
         self.timestamps = np.full(capacity, np.nan, dtype=np.float64)
@@ -30,8 +25,6 @@ class ReplayRecorder:
         self,
         idx: int,
         arm_qpos: np.ndarray,
-        eef_pos: np.ndarray,
-        eef_rot6d: np.ndarray,
         arm_cmd: np.ndarray,
         hand_cmd: np.ndarray,
         ts: float,
@@ -47,15 +40,6 @@ class ReplayRecorder:
             return
         self.dispatch_status[idx] = dispatch_status
         self.arm_qpos[idx] = arm_qpos
-        self.eef_pos[idx] = eef_pos
-        self.eef_rot6d[idx] = eef_rot6d
-        try:
-            quat_xyzw = Rotation.from_matrix(rot6d_to_rotmat(eef_rot6d)).as_quat()
-            self.eef_quat_wxyz[idx] = np.array(
-                [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
-            )
-        except ValueError:
-            self.eef_quat_wxyz[idx] = np.full(4, np.nan)
         self.arm_cmd[idx] = arm_cmd
         self.timestamps[idx] = ts
         if arm_tracking_error is not None:
@@ -65,16 +49,17 @@ class ReplayRecorder:
         self._count = idx + 1
 
     def to_dict(self) -> dict[str, np.ndarray]:
-        """Return copies of the populated prefix without pickle-only values."""
+        """Copy the physical prefix with NaN EEF fields pending offline derivation."""
         count = self._count
         return {
             "dispatch_status": self.dispatch_status[:count].copy(),
             "arm_qpos": self.arm_qpos[:count].copy(),
             "hand_qpos": self.hand_qpos[:count].copy(),
             "hand_cmd": self.hand_cmd[:count].copy(),
-            "eef_pos": self.eef_pos[:count].copy(),
-            "eef_quat_wxyz": self.eef_quat_wxyz[:count].copy(),
-            "eef_rot6d": self.eef_rot6d[:count].copy(),
+            # Preserve output fields before any fallible offline pose derivation.
+            "eef_pos": np.full((count, 3), np.nan, dtype=np.float64),
+            "eef_quat_wxyz": np.full((count, 4), np.nan, dtype=np.float64),
+            "eef_rot6d": np.full((count, 6), np.nan, dtype=np.float64),
             "arm_cmd": self.arm_cmd[:count].copy(),
             "arm_tracking_error": self.arm_tracking_error[:count].copy(),
             "timestamp": self.timestamps[:count].copy(),

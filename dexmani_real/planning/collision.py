@@ -6,12 +6,13 @@ from __future__ import annotations
 
 import logging
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import numpy as np
 
+from dexmani_real.config.environment import StaticCollisionBox, TableCollisionConfig
 from dexmani_real.robot.model import (
     ARM_JOINT_SHAPE,
     HAND_DOF,
@@ -22,7 +23,6 @@ from dexmani_real.robot.model import (
     XHAND_MODEL_DIR,
     XHAND_URDF_JOINT_NAMES,
 )
-from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
 
 
 logger = logging.getLogger(__name__)
@@ -37,15 +37,6 @@ class CollisionPair:
     object_name1: str
     object_name2: str
     collision_type: str
-
-    def to_dict(self) -> dict[str, str]:
-        return {
-            "link1": self.link_name1,
-            "link2": self.link_name2,
-            "obj1": self.object_name1,
-            "obj2": self.object_name2,
-            "type": self.collision_type,
-        }
 
 
 @dataclass
@@ -64,18 +55,6 @@ class CollisionInfo:
     def __bool__(self) -> bool:
         return self.in_collision
 
-    def to_dict(self) -> dict[str, Any]:
-        if not self.in_collision:
-            return {"in_collision": False}
-        result: dict[str, Any] = {
-            "in_collision": True,
-            "num_contacts": self.num_contacts,
-            "collision_pairs": [pair.to_dict() for pair in self.collision_pairs],
-        }
-        if self.sample_qpos_rad is not None:
-            result["sample_qpos_rad"] = list(self.sample_qpos_rad)
-        return result
-
 
 CollisionInfo._NO_COLLISION = CollisionInfo(in_collision=False)
 
@@ -86,8 +65,8 @@ class CollisionModel:
     def __init__(
         self,
         *,
-        static_boxes: Iterable[Any] = (),
-        table: Any | None = None,
+        static_boxes: Iterable[StaticCollisionBox] = (),
+        table: TableCollisionConfig | None = None,
     ) -> None:
         import pinocchio as pin
 
@@ -211,46 +190,25 @@ class CollisionModel:
         self._hand_qpos: np.ndarray | None = None
 
     @staticmethod
-    def _box_value(box: Any, name: str) -> Any:
-        if isinstance(box, Mapping):
-            return box[name]
-        return getattr(box, name)
-
-    @classmethod
-    def _normalize_static_box(cls, box: Any) -> dict[str, Any]:
-        """Validate and copy a dataclass or mapping box."""
-        raw_name = cls._box_value(box, "name")
-        if not isinstance(raw_name, str):
-            raise TypeError("static collision box name must be a string")
-        name = raw_name
-        center = np.asarray(cls._box_value(box, "center_xyz_m"), dtype=np.float64)
-        size = np.asarray(cls._box_value(box, "size_xyz_m"), dtype=np.float64)
-        quat = np.asarray(cls._box_value(box, "quat_wxyz"), dtype=np.float64)
-        if not name.strip() or name != name.strip() or name == "table":
-            raise ValueError(
-                "static collision box name must be non-empty and must not use reserved name 'table'"
-            )
-        if center.shape != (3,) or size.shape != (3,) or quat.shape != (4,):
-            raise ValueError("static collision box center/size/quaternion shapes are invalid")
-        if not np.all(np.isfinite(np.concatenate((center, size, quat)))) or np.any(size <= 0.0):
-            raise ValueError("static collision box values must be finite and sizes positive")
-        validate_unit_quaternion_wxyz(quat, name="static collision box quaternion")
+    def _normalize_static_box(box: StaticCollisionBox) -> dict[str, Any]:
+        """Validate at the model boundary and own the geometric arrays."""
+        box.validate()
         return {
-            "name": name,
-            "center_xyz_m": center.copy(),
-            "size_xyz_m": size.copy(),
-            "quat_wxyz": quat.copy(),
+            "name": box.name,
+            "center_xyz_m": np.array(box.center_xyz_m, dtype=np.float64, copy=True),
+            "size_xyz_m": np.array(box.size_xyz_m, dtype=np.float64, copy=True),
+            "quat_wxyz": np.array(box.quat_wxyz, dtype=np.float64, copy=True),
         }
 
-    @classmethod
-    def _normalize_table(cls, table: Any | None) -> dict[str, Any] | None:
-        if table is None or not bool(cls._box_value(table, "enabled")):
+    @staticmethod
+    def _normalize_table(table: TableCollisionConfig | None) -> dict[str, Any] | None:
+        if table is None or not table.enabled:
             return None
-        plane = np.asarray(cls._box_value(table, "plane_abcd"), dtype=np.float64)
-        size_xy = np.asarray(cls._box_value(table, "size_xy_m"), dtype=np.float64)
-        thickness_m = float(cls._box_value(table, "thickness_m"))
-        soft_clearance_m = float(cls._box_value(table, "soft_clearance_m"))
-        allowed = tuple(str(name) for name in cls._box_value(table, "allowed_contact_links"))
+        plane = np.asarray(table.plane_abcd, dtype=np.float64)
+        size_xy = np.asarray(table.size_xy_m, dtype=np.float64)
+        thickness_m = float(table.thickness_m)
+        soft_clearance_m = float(table.soft_clearance_m)
+        allowed = tuple(str(name) for name in table.allowed_contact_links)
         if plane.shape != (4,) or size_xy.shape != (2,):
             raise ValueError("table plane_abcd and size_xy_m shapes are invalid")
         if not np.all(np.isfinite(np.concatenate((plane, size_xy)))):

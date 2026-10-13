@@ -153,22 +153,13 @@ class CameraExtrinsics:
             )
         return T_base_eef @ entry.T_eef_camera
 
-    def to_meta_dict(self, cam_name: str, expected_serial: str | None = None) -> dict:
-        """Return calibration identity and the flattened camera_T_world_camera or camera_T_eef_camera.
-        Reject expected_serial mismatches; this lookup payload is separate from Raw metadata.
-        """
+    def get_entry(
+        self, cam_name: str, expected_serial: str | None = None
+    ) -> CameraExtrinsicsEntry:
+        """Return the shared validated entry with its owned, read-only transforms."""
         if expected_serial is not None:
             self.verify_serial(cam_name, expected_serial)
-        entry = self._entries[cam_name]
-        meta = {
-            "camera_serial": entry.serial,
-            "camera_type": entry.type,
-        }
-        if entry.type == "eye_to_hand":
-            meta["camera_T_world_camera"] = entry.T_world_camera.flatten().tolist()  # type: ignore[union-attr]
-        else:
-            meta["camera_T_eef_camera"] = entry.T_eef_camera.flatten().tolist()  # type: ignore[union-attr]
-        return meta
+        return self._entries[cam_name]
 
     def __repr__(self) -> str:
         cameras = ", ".join(f"{n} ({e.type}, {e.serial})" for n, e in self._entries.items())

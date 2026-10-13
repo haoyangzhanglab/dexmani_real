@@ -101,7 +101,6 @@ def iter_canonical_blocks(
 ):
     """Convert a prevalidated episode without repairing or resampling rows."""
     pointcloud_deriver = RawEpisodePointCloudDeriver(
-        reader=reader,
         camera=load_raw_episode_camera_model(reader),
         T_xarm_base_from_color=load_raw_episode_base_from_color(reader),
         pointcloud=config.pointcloud,
@@ -142,11 +141,12 @@ def iter_canonical_blocks(
                 raise RawDataError(
                     f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
                 )
-            cloud = pointcloud_deriver.derive(index, image)
+            depth_frame = np.asarray(reader["depth"][index], dtype=np.uint16)
+            cloud = pointcloud_deriver.derive(depth_frame, image)
             if cloud is None:
                 raise RawDataError(f"point_cloud unavailable at row {index}")
             rgb.append(image)
-            depth.append(np.asarray(reader["depth"][index], dtype=np.uint16))
+            depth.append(depth_frame)
             clouds.append(cloud)
         block.update(rgb=np.stack(rgb), depth=np.stack(depth), point_cloud=np.stack(clouds))
         yield block

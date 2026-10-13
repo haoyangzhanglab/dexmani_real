@@ -1,4 +1,4 @@
-"""Replay consistency metrics and result persistence."""
+"""Offline replay pose derivation, consistency metrics and result persistence."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
+from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.pose import rot6d_to_rotmat
 from dexmani_real.replay.trajectory import TrajectoryData
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
@@ -239,6 +241,26 @@ def evaluate_replay(
         print("\nSkipping metrics: no valid reference or replay data available")
         return
     # Physical measurements must survive failures in any derived report.
+    save_replay_data(replay_data, output_dir)
+    try:
+        fk = make_arm_fk()
+        count = len(replay_data["arm_qpos"])
+        eef_pos = np.empty((count, 3), dtype=np.float64)
+        eef_rot6d = np.empty((count, 6), dtype=np.float64)
+        eef_quat_wxyz = np.full((count, 4), np.nan, dtype=np.float64)
+        for index, qpos in enumerate(replay_data["arm_qpos"]):
+            eef_pos[index], eef_rot6d[index] = fk.compute(qpos)
+            try:
+                quat_xyzw = Rotation.from_matrix(rot6d_to_rotmat(eef_rot6d[index])).as_quat()
+                eef_quat_wxyz[index] = quat_xyzw[[3, 0, 1, 2]]
+            except ValueError:
+                pass
+    except Exception as exc:
+        raise RuntimeError(
+            f"replay EEF derivation failed after physical capture was saved: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    replay_data.update(eef_pos=eef_pos, eef_rot6d=eef_rot6d, eef_quat_wxyz=eef_quat_wxyz)
     save_replay_data(replay_data, output_dir)
     if not evaluate_consistency:
         print("\nSkipping consistency metrics; captured replay data saved.")

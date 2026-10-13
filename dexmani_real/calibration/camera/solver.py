@@ -82,6 +82,16 @@ class CalibrationConfig:
             raise ValueError("status_interval_frames must be at least 1")
 
 
+def _marker_poses(corners, ids, marker_points, intrinsics, distortion, *, target_id):
+    if ids is None:
+        return
+    for corner, marker_id in zip(corners, ids.flatten()):
+        if target_id is None or marker_id == target_id:
+            yield cv2.solvePnP(
+                marker_points, corner, intrinsics, distortion, flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
+
+
 def detect_aruco_pose(
     color_image: np.ndarray,
     intrinsics: np.ndarray,
@@ -98,25 +108,10 @@ def detect_aruco_pose(
     detector = cv2.aruco.ArucoDetector(dictionary, params)
     corners, ids, _ = detector.detectMarkers(gray)
 
-    if ids is None or len(ids) == 0:
-        return None
-
-    if target_id is not None:
-        mask = ids.flatten() == target_id
-        if not mask.any():
-            return None
-        corners = [c for c, m in zip(corners, mask) if m]
-
-    half = marker_size_m / 2.0
-    marker_points = np.array(
-        [[-half, half, 0], [half, half, 0], [half, -half, 0], [-half, -half, 0]],
-        dtype=np.float32,
-    )
-
-    for c in corners:
-        ok, rv, tv = cv2.solvePnP(
-            marker_points, c, intrinsics, distortion, flags=cv2.SOLVEPNP_IPPE_SQUARE
-        )
+    for ok, rv, tv in _marker_poses(
+        corners, ids, marker_corners_3d(marker_size_m), intrinsics, distortion,
+        target_id=target_id,
+    ):
         if not ok or rv is None or tv is None:
             return None
         rv, tv = np.asarray(rv, dtype=np.float64), np.asarray(tv, dtype=np.float64)
@@ -128,7 +123,7 @@ def detect_aruco_pose(
 
 
 def marker_corners_3d(marker_size_m: float) -> np.ndarray:
-    """Marker corners in marker-local frame for drawFrameAxes."""
+    """Marker-local corners in meters, ordered for SOLVEPNP_IPPE_SQUARE."""
     s = marker_size_m / 2.0
     return np.array([[-s, s, 0], [s, s, 0], [s, -s, 0], [-s, -s, 0]], dtype=np.float32)
 
@@ -151,16 +146,9 @@ def draw_calibration_overlay(
     detected = False
     if ids is not None and len(ids) > 0:
         cv2.aruco.drawDetectedMarkers(image, corners, ids)
-        for c, mid in zip(corners, ids.flatten()):
-            if target_id is not None and mid != target_id:
-                continue
-            ok, rv, tv = cv2.solvePnP(
-                marker_corners,
-                c,
-                intrinsics,
-                distortion,
-                flags=cv2.SOLVEPNP_IPPE_SQUARE,
-            )
+        for ok, rv, tv in _marker_poses(
+            corners, ids, marker_corners, intrinsics, distortion, target_id=target_id,
+        ):
             if ok:
                 cv2.drawFrameAxes(image, intrinsics, distortion, rv, tv, marker_size_m * 0.5)
                 detected = True

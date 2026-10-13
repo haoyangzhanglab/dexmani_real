@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -10,6 +9,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_EQUIVALENT_JOINT_MASK
+
+from .collision import CollisionInfo
 
 if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner
@@ -38,13 +39,6 @@ class HomePathStatus(str, Enum):
 
 
 @dataclass(frozen=True)
-class HomeCollisionPair:
-    link1: str
-    link2: str
-    kind: str = ""
-
-
-@dataclass(frozen=True)
 class HomePathCandidate:
     """Bounded diagnostic for one densely validated path candidate."""
 
@@ -54,7 +48,7 @@ class HomePathCandidate:
     sample_count: int = 0
     detail: str = ""
     collision_waypoint_index: int | None = None
-    collision_pairs: tuple[HomeCollisionPair, ...] = ()
+    collision: CollisionInfo | None = None
     workspace_segment_index: int | None = None
     table_waypoint_index: int | None = None
     table_check_source: str = ""
@@ -168,26 +162,6 @@ def _empty_home_path() -> np.ndarray:
     return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
 
 
-def _collision_pairs(collision: object) -> tuple[HomeCollisionPair, ...]:
-    """Normalize planner collision payloads at their untyped boundary."""
-    if not isinstance(collision, Mapping):
-        return ()
-    raw_pairs = collision.get("collision_pairs", ())
-    if not isinstance(raw_pairs, (list, tuple)):
-        return ()
-    pairs: list[HomeCollisionPair] = []
-    for raw_pair in raw_pairs:
-        if isinstance(raw_pair, Mapping):
-            pairs.append(
-                HomeCollisionPair(
-                    link1=str(raw_pair.get("link1", "?")),
-                    link2=str(raw_pair.get("link2", "?")),
-                    kind=str(raw_pair.get("type", "")),
-                )
-            )
-    return tuple(pairs)
-
-
 def _check_home_path_candidate(
     path: np.ndarray,
     candidate_name: str,
@@ -211,10 +185,12 @@ def _check_home_path_candidate(
                 detail=str(exc),
             )
         if collision_result["path_collision"]:
-            pairs = _collision_pairs(collision_result.get("collision"))
+            collision = collision_result.get("collision")
             reason = (
                 "environment_collision"
-                if any(pair.kind == "environment" for pair in pairs)
+                if collision is not None and any(
+                    pair.collision_type == "environment" for pair in collision.collision_pairs
+                )
                 else "self_collision"
             )
             return HomePathCandidate(
@@ -223,7 +199,7 @@ def _check_home_path_candidate(
                 reason=reason,
                 sample_count=sample_count,
                 collision_waypoint_index=collision_result.get("collision_waypoint_index"),
-                collision_pairs=pairs,
+                collision=collision,
             )
 
     try:
