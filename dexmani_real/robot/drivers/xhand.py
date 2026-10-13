@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 _SDK_PROTOCOL = {"ethercat": "EtherCAT", "serial": "RS485"}
 _OPEN_RETRIES = {"ethercat": 2, "serial": 3}
 _OPEN_RETRY_DELAY_S = 2.0
-_INITIAL_STATE_READ_ATTEMPTS = 3
 _INITIAL_STATE_READ_INTERVAL_S = 0.02
 _COMMUNICATION_CRC_ERROR_CODE = 1_501_070
 _COMBINED_FORCE_UNAVAILABLE_CODE = 1_501_018
@@ -132,8 +131,8 @@ class XHand:
     def is_connected(self) -> bool:
         return self.connected_flag
 
-    def connect(self) -> None:
-        """Open the configured device and seed its command buffer from live feedback."""
+    def connect(self, *, cancel_requested=lambda: False) -> int | None:
+        """Open and seed live feedback; return the deadline shared with tactile acquisition."""
         from xhand_controller import xhand_control
 
         self._sdk = xhand_control
@@ -155,7 +154,10 @@ class XHand:
                     f"configured device_id={self.cfg.device_id} not found in {hand_ids}",
                 )
             self._read_identity()
-            self._seed_command_history()
+            return self._seed_command_history(cancel_requested=cancel_requested)
+        except CancelledError:
+            self.disconnect()
+            raise
         except XHandError:
             logger.error("XHand initialization failed", exc_info=True)
             self.disconnect()
@@ -277,15 +279,22 @@ class XHand:
             self.cfg.device_id,
         )
 
-    def _seed_command_history(self) -> None:
-        for attempt in range(_INITIAL_STATE_READ_ATTEMPTS):
+    def _seed_command_history(self, *, cancel_requested=lambda: False) -> int:
+        deadline_ns = time.monotonic_ns() + int(self.cfg.initial_state_timeout_s * 1e9)
+        while time.monotonic_ns() < deadline_ns:
+            if cancel_requested():
+                raise CancelledError("XHand initial joint feedback acquisition cancelled")
             sample = self.get_state()
+            if cancel_requested():
+                raise CancelledError("XHand initial joint feedback acquisition cancelled")
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            if remaining_ns <= 0:
+                break
             if sample is not None:
                 self._command = self._make_command(sample.qpos)
-                return
-            if attempt + 1 < _INITIAL_STATE_READ_ATTEMPTS:
-                time.sleep(_INITIAL_STATE_READ_INTERVAL_S)
-        raise XHandError("connect", -1, "initial XHand state is unavailable or invalid")
+                return deadline_ns
+            time.sleep(min(_INITIAL_STATE_READ_INTERVAL_S, remaining_ns / 1e9))
+        raise XHandError("connect", -1, "initial XHand joint feedback timed out")
 
     def disconnect(self) -> None:
         """Release the SDK handle; repeated calls are no-ops."""

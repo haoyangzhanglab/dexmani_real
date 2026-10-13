@@ -98,6 +98,8 @@ def read_observation(
     require_pointcloud=False,
     require_rgb_cloud_identity=False,
     issues=None,
+    wait_for_hand=False,
+    cancel_requested=None,
 ):
     def unavailable(reason):
         if issues is not None:
@@ -105,7 +107,10 @@ def read_observation(
         return None
 
     control_ns = time.monotonic_ns()
-    state = robot.read_state()
+    state = (
+        robot.read_initial_state(cancel_requested=cancel_requested)
+        if wait_for_hand else robot.read_state()
+    )
     arm, hand = state.arm, state.hand if require_hand else None
     cloud_result = shared.sensors.pointcloud_ring.read_latest() if require_pointcloud else None
     if (

@@ -4,6 +4,7 @@ Observation timestamps retain physical pauses between synchronous blocks.
 
 import logging
 import time
+from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 from collections import deque
 
@@ -133,7 +134,7 @@ class PolicyRunner:
         self.requires_camera_payload = requires_rgb or self.recorder is not None
         self.requires_rgb_cloud_identity = self.requires_camera_payload and self.requires_cloud
 
-    def _read_observation(self):
+    def _read_observation(self, *, wait_for_hand=False):
         self.observation_read_issues.clear()
         return read_observation(
             self.shared,
@@ -144,6 +145,8 @@ class PolicyRunner:
             require_camera=self.requires_camera_payload,
             require_pointcloud=self.requires_cloud,
             require_rgb_cloud_identity=self.requires_rgb_cloud_identity,
+            wait_for_hand=wait_for_hand,
+            cancel_requested=lambda: not self._preparation_valid(),
         )
 
     def _budget_limit(self):
@@ -314,8 +317,20 @@ class PolicyRunner:
             return f"policy_input_{issue}"
         return policy_observation_issue(row, self.policy_info.observation_fields)
 
-    def _start_observation(self):
-        row = self._read_observation()
+    def _preparation_valid(self):
+        return (
+            self.preparing_epoch is not None
+            and self.preparing_epoch == int(self.shared.run_id)
+            and not self.shared.quit_requested
+            and not self.shared.stop_request
+            and not self.shared.estop_request
+            and not self.shared.error_state
+            and self.shared.sensors.is_running.value
+            and int(self.shared.safety_state) == int(SafetyState.ARMED)
+        )
+
+    def _start_observation(self, *, wait_for_hand=False):
+        row = self._read_observation(wait_for_hand=wait_for_hand)
         self.preparation_issue = self._observation_issue(row)
         if self.preparation_issue is not None:
             logger.warning("本轮未开始：%s", self.preparation_issue)
@@ -349,31 +364,45 @@ class PolicyRunner:
                 ):
                     return
                 epoch = int(self.shared.run_id)
-            self.robot.reset_hand_feedback()
-            if self._start_observation() is None:
-                if self.results is not None:
-                    self.results.begin_episode()
-                    self._finalize_outputs("preparation_failed", self.preparation_issue)
-                return
             self.recording_started = False
             self.termination_timing = None
-            if self.results is not None:
-                self.results.begin_episode()
-            logger.info("第 %d 轮：准备开始…", self.completed + 1)
+            self.preparation_issue = None
             self.preparing_epoch = epoch
             self.reset_ready = False
+            if self.results is not None:
+                self.results.begin_episode()
+            try:
+                self.robot.reset_hand_feedback()
+                row = self._start_observation(wait_for_hand=True)
+                if not self._preparation_valid():
+                    raise CancelledError("cancelled during initial feedback acquisition")
+            except BaseException as exc:
+                # Finalize this preparation once; only explicit cancellation is consumed.
+                self.preparing_epoch = None
+                cancelled = isinstance(exc, (CancelledError, KeyboardInterrupt))
+                if isinstance(exc, KeyboardInterrupt):
+                    self.shared.estop_request = True
+                self._finalize_outputs(
+                    "start_cancelled" if cancelled else "preparation_failed",
+                    str(exc), errors=[] if cancelled else [error_detail("preparation", exc)],
+                )
+                if isinstance(exc, CancelledError):
+                    return
+                raise
+            if row is None:
+                self.preparing_epoch = None
+                self._finalize_outputs("preparation_failed", self.preparation_issue)
+                return
+            logger.info("第 %d 轮：准备开始…", self.completed + 1)
             self.model.submit("reset_episode")
             return
         if not self.reset_ready:
             return
-        epoch, self.preparing_epoch = self.preparing_epoch, None
-        if (
-            epoch != int(self.shared.run_id)
-            or self.shared.quit_requested
-            or self.shared.stop_request
-        ):
+        if not self._preparation_valid():
+            self.preparing_epoch = None
             self._finalize_outputs("start_cancelled", "cancelled during model reset")
             return
+        epoch, self.preparing_epoch = self.preparing_epoch, None
         committed = False
         start_failure = None
         try:

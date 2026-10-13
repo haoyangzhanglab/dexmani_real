@@ -173,6 +173,7 @@ class TeleopRunner:
             and not self.shared.estop_request
             and not self.shared.error_state
             and not self.shared.quit_requested
+            and not self.shared.stop_request
             and self.shared.sensors.is_running.value
             and int(self.shared.safety_state) == int(SafetyState.ARMED)
         )
@@ -195,14 +196,24 @@ class TeleopRunner:
             self._stop_capture("preparation_revoked")
             return
         self.robot.reset_hand_feedback()
-        row = read_observation(
-            self.shared,
-            self.runtime,
-            self.robot,
-            require_hand=self.runtime.policy.hand_enabled,
-            require_camera=self.recorder is not None,
-            require_vr=True,
-        )
+        try:
+            row = read_observation(
+                self.shared,
+                self.runtime,
+                self.robot,
+                require_hand=self.runtime.policy.hand_enabled,
+                require_camera=self.recorder is not None,
+                require_vr=True,
+                wait_for_hand=True,
+                cancel_requested=lambda: (
+                    self._poll_blocking_commands() or not self._preparation_valid()
+                ),
+            )
+        except CancelledError:
+            # S/Q may already have finalized preparation in _poll_blocking_commands.
+            if self.resume_requested:
+                self._stop_capture("preparation_revoked")
+            return
         if row is None or not self._preparation_valid():
             print("Start requires fresh robot, VR and recording resources", flush=True)
             self._stop_capture("preparation_unavailable")

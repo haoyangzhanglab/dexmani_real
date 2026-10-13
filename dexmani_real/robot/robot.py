@@ -3,6 +3,7 @@
 import logging
 import threading
 import time
+from concurrent.futures import CancelledError
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -110,6 +111,12 @@ class DexManiRobot:
         if self._owner is not None:
             raise RuntimeError("robot connection is single-use")
         self._owner = threading.get_ident()
+        epoch = int(self.shared.run_id)
+
+        def cancelled():
+            self.check()
+            return self._initial_state_cancelled(epoch)
+
         try:
             if self._arm_factory is None:
                 from dexmani_real.robot.drivers.xarm7 import XArm7
@@ -118,21 +125,18 @@ class DexManiRobot:
             self.arm = self._arm_factory(self.runtime.arm)
             self.arm.connect()
             self.check()
+            deadline_ns = None
             if self.runtime.policy.hand_enabled:
                 if self._hand_factory is None:
                     from dexmani_real.robot.drivers.xhand import XHand
 
                     self._hand_factory = XHand
                 self.hand = self._hand_factory(self.runtime.hand)
-                self.hand.connect()
+                deadline_ns = self.hand.connect(cancel_requested=cancelled)
             self._connected = True
-            self.reset_hand_feedback()
-            while True:
-                self.check()
-                state = self.read_state()
-                if self.hand is None or state.hand is not None:
-                    break
-                time.sleep(0.01)
+            # Joint command seeding and complete tactile acquisition share one budget.
+            self.reset_hand_feedback(deadline_ns=deadline_ns)
+            self.read_initial_state(cancel_requested=cancelled)
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
                 self.shared.estop_request = True
@@ -152,26 +156,26 @@ class DexManiRobot:
         if self.hand is None:
             return False
         revoke_motion(self.shared)
+        epoch = int(self.shared.run_id)
         self.stop()
 
         def cancelled():
             self.check()
             return bool(
                 cancel_requested()
-                or not self.shared.sensors.is_running.value
-                or self.shared.stop_request
-                or self.shared.estop_request
-                or self.shared.error_state
-                or self.shared.quit_requested
+                or self._initial_state_cancelled(epoch)
             )
 
         try:
-            return self.hand.reset_tactile_sensors(cancel_requested=cancelled)
+            reset = self.hand.reset_tactile_sensors(cancel_requested=cancelled)
         finally:
             # Even a partial/cancelled reset invalidates the previous tactile baseline.
             self.reset_hand_feedback()
+        if reset:
+            self.read_initial_state(cancel_requested=cancelled)
+        return reset
 
-    def reset_hand_feedback(self):
+    def reset_hand_feedback(self, *, deadline_ns=None):
         """Reacquire a session's initial values without connecting, resetting or moving hardware."""
         self._check_owner()
         if int(self.shared.safety_state) == int(SafetyState.RUNNING):
@@ -188,6 +192,7 @@ class DexManiRobot:
         self._hand_read_crc = False
         self._hand_initializing_until_ns = (
             time.monotonic_ns() + int(self.runtime.hand.initial_state_timeout_s * 1e9)
+            if deadline_ns is None else deadline_ns
         )
 
     def arm_feedback(self, qpos, qvel, effort):
@@ -269,10 +274,15 @@ class DexManiRobot:
                         f"{self.runtime.hand.feedback_max_age_s:.3f}s"
                     )
                     break
-        if issue is not None:
-            if (self._hand_initializing_until_ns is not None
-                    and now_ns < self._hand_initializing_until_ns):
+        if self._hand_initializing_until_ns is not None:
+            if now_ns >= self._hand_initializing_until_ns:
+                raise RuntimeError(
+                    f"XHand initial feedback timed out after {self.runtime.hand.initial_state_timeout_s:.3f}s: "
+                    f"{issue or 'sample completed after deadline'}"
+                )
+            if issue is not None:
                 return None
+        if issue is not None:
             raise RuntimeError(issue)
         self._hand_initializing_until_ns = None
         return frame
@@ -293,6 +303,38 @@ class DexManiRobot:
             revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
             raise
         return RobotState(arm, hand)
+
+    def _initial_state_cancelled(self, epoch):
+        return bool(
+            epoch != int(self.shared.run_id)
+            or self.shared.stop_request
+            or self.shared.estop_request
+            or self.shared.error_state
+            or self.shared.quit_requested
+            or not self.shared.sensors.is_running.value
+        )
+
+    def read_initial_state(self, *, cancel_requested=None):
+        """Wait only for XHand's bounded initial cache, without resetting its deadline."""
+        epoch = int(self.shared.run_id)
+
+        def check_cancelled():
+            if (
+                (cancel_requested is not None and cancel_requested())
+                or self._initial_state_cancelled(epoch)
+            ):
+                raise CancelledError("XHand initial feedback acquisition cancelled")
+
+        while True:
+            check_cancelled()
+            state = self.read_state()
+            check_cancelled()
+            if self.hand is None or state.hand is not None:
+                return state
+            # Only _checked_hand_feedback can withhold a connected hand within this budget.
+            remaining_ns = self._hand_initializing_until_ns - time.monotonic_ns()
+            if remaining_ns > 0:
+                time.sleep(min(0.01, remaining_ns / 1e9))
 
     def _authorized(self, run_id, state):
         return (

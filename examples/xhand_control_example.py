@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import time
+from concurrent.futures import CancelledError
 from dataclasses import replace
 from pathlib import Path
 
@@ -88,14 +89,15 @@ class XHandControlExample(XHand):
         if self._cancel_requested():
             raise InterruptedError("XHand action sequence interrupted")
 
-    def connect(self) -> None:
+    def connect(self) -> int | None:
         if self.cfg.comm_type == "serial" and self.cfg.device_name is not None:
             problem = _serial_port_problem(self.cfg.device_name)
             if problem is not None:
                 raise RuntimeError(problem)
         self.check_cancelled()
-        super().connect()
+        deadline_ns = super().connect(cancel_requested=self._cancel_requested)
         self.check_cancelled()
+        return deadline_ns
 
     @staticmethod
     def _header(title: str) -> None:
@@ -253,7 +255,7 @@ def _run_hardware_session(config: HandParams, *, finger_id: int, read_only: bool
             print(f"\n  -> {name} (degrees): {np.rad2deg(target).round(3).tolist()}")
             hand.execute_action(target)
             time.sleep(_ACTION_DWELL_S)
-    except InterruptedError:
+    except (InterruptedError, CancelledError):
         print("\nSequence interrupted; stopping any attempted action before closing")
     except Exception as exc:
         print(f"\nXHand example failed: {exc}", file=sys.stderr)
