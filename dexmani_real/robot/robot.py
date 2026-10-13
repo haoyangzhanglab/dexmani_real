@@ -274,14 +274,14 @@ class DexManiRobot:
                         f"{self.runtime.hand.feedback_max_age_s:.3f}s"
                     )
                     break
-        if self._hand_initializing_until_ns is not None:
+        # Idle feedback may recover after a cancelled wait; the deadline only bounds missing values.
+        if issue is not None and self._hand_initializing_until_ns is not None:
             if now_ns >= self._hand_initializing_until_ns:
                 raise RuntimeError(
                     f"XHand initial feedback timed out after {self.runtime.hand.initial_state_timeout_s:.3f}s: "
-                    f"{issue or 'sample completed after deadline'}"
+                    f"{issue}"
                 )
-            if issue is not None:
-                return None
+            return None
         if issue is not None:
             raise RuntimeError(issue)
         self._hand_initializing_until_ns = None
@@ -316,7 +316,10 @@ class DexManiRobot:
 
     def read_initial_state(self, *, cancel_requested=None):
         """Wait only for XHand's bounded initial cache, without resetting its deadline."""
+        self._check_owner()
         epoch = int(self.shared.run_id)
+        # A valid read clears the shared initialization field, not this attempt's deadline.
+        deadline_ns = self._hand_initializing_until_ns if self.hand is not None else None
 
         def check_cancelled():
             if (
@@ -325,14 +328,25 @@ class DexManiRobot:
             ):
                 raise CancelledError("XHand initial feedback acquisition cancelled")
 
+        def check_deadline():
+            if deadline_ns is not None and time.monotonic_ns() >= deadline_ns:
+                # This timeout is outside read_state's exception fence; apply the same fault boundary.
+                self.shared.error_state = True
+                revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
+                raise RuntimeError(
+                    f"XHand initial feedback timed out after {self.runtime.hand.initial_state_timeout_s:.3f}s"
+                )
+
         while True:
             check_cancelled()
+            check_deadline()
             state = self.read_state()
             check_cancelled()
+            check_deadline()
             if self.hand is None or state.hand is not None:
                 return state
             # Only _checked_hand_feedback can withhold a connected hand within this budget.
-            remaining_ns = self._hand_initializing_until_ns - time.monotonic_ns()
+            remaining_ns = deadline_ns - time.monotonic_ns()
             if remaining_ns > 0:
                 time.sleep(min(0.01, remaining_ns / 1e9))
 
