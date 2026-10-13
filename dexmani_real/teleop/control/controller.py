@@ -1,11 +1,8 @@
 """Current-row teleop mapping and commit of dispatched absolute targets."""
 
-
-import numpy as np
-
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import IKFailureKind
-from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rot6d, rot6d_to_quat_wxyz
+from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.robot.action import ActionIntent
 from dexmani_real.teleop.control.action_proposal import compute_target_eef_pose
 from dexmani_real.teleop.control.hand_retargeting import (
@@ -61,9 +58,6 @@ class TeleopController:
             ema_alpha_position=cfg.policy.ema.alpha_pos,
             ema_alpha_rotation=cfg.policy.ema.alpha_rot,
         )
-        intent = np.concatenate(
-            (target.position_xarm_base_m, quat_wxyz_to_rot6d(target.quat_xarm_base_wxyz))
-        )
         hand = None
         if cfg.policy.hand_enabled:
             proposal = compute_hand_command(
@@ -73,7 +67,7 @@ class TeleopController:
                 return None
             hand = proposal
         realized = self.realizer.realize(
-            ActionIntent("eef", intent, hand), row.arm["qpos"][0], self.previous_arm_command
+            ActionIntent("eef", target, hand), row.arm["qpos"][0], self.previous_arm_command
         )
         solution = realized.ik_result
         if solution is not None and solution.failure_kind == IKFailureKind.INVALID_OUTPUT:
@@ -82,5 +76,5 @@ class TeleopController:
 
     def commit_dispatched_target(self, realization):
         self.previous_arm_command = realization.arm_qpos.copy()
-        self.smoothed_eef_position = realization.eef_pose[:3].copy()
-        self.smoothed_eef_quaternion = rot6d_to_quat_wxyz(realization.eef_pose[3:])
+        self.smoothed_eef_position = realization.eef_pose.p.copy()
+        self.smoothed_eef_quaternion = realization.eef_pose.q.copy()

@@ -85,7 +85,6 @@ class PolicyRunner:
         discard_pending_start=None,
         model_runtime,
         kinematics,
-        execute,
         max_running_s,
         num_episodes=20,
         task_label=None,
@@ -102,7 +101,6 @@ class PolicyRunner:
         self.model = model_runtime
         self.execution = runtime.execution
         self.kinematics = kinematics
-        self.execute = execute
         self.max_running_s = max_running_s
         self.num_episodes = num_episodes
         self.task_label = task_label
@@ -182,7 +180,7 @@ class PolicyRunner:
     def _has_motion_authority(self):
         return (
             self.run_id is not None
-            and self.shared.sensors.is_running.value
+            and self.shared.running
             and not self.shared.error_state
             and not self.shared.estop_request
             and not self.shared.quit_requested
@@ -270,13 +268,12 @@ class PolicyRunner:
             reason in (RunEndReason.OPERATOR, RunEndReason.TIMEOUT, RunEndReason.EXECUTOR_BOUNDARY)
             and not self.shared.error_state
             and not self.shared.estop_request
-            and self.shared.sensors.is_running.value
+            and self.shared.running
         ):
             if limit_reached:
                 print(f"已达到 {self.num_episodes} 轮上限，正在退出。", flush=True)
             elif not self.shared.quit_requested:
-                start_hint = "H 回初始位 → B 开始" if self.execute else "B 开始"
-                print(f"等待下一轮：整理场景后 {start_hint}；Q 退出。", flush=True)
+                print("等待下一轮：整理场景后 H 回初始位 → B 开始；Q 退出。", flush=True)
 
     def _finalize_outputs(self, reason, detail, errors=None, *, duration_s=0.0):
         errors = list(errors or ())
@@ -326,7 +323,7 @@ class PolicyRunner:
             and not self.shared.stop_request
             and not self.shared.estop_request
             and not self.shared.error_state
-            and self.shared.sensors.is_running.value
+            and self.shared.running
             and int(self.shared.safety_state) == int(SafetyState.ARMED)
         )
 
@@ -336,7 +333,7 @@ class PolicyRunner:
         if self.preparation_issue is not None:
             logger.warning("本轮未开始：%s", self.preparation_issue)
             return None
-        if self.execute and (
+        if (
             np.max(np.abs(row.arm["qpos"][0] - self.runtime.arm.home_qpos))
             > np.deg2rad(self.execution.start_arm_home_tolerance_deg)
             or np.max(np.abs(row.hand["qpos"][0] - np.deg2rad(self.runtime.hand.home_qpos_deg)))
@@ -358,7 +355,7 @@ class PolicyRunner:
                 if (
                     self.shared.stop_request
                     or self.shared.quit_requested
-                    or not self.shared.sensors.is_running.value
+                    or not self.shared.running
                     or self.shared.error_state
                     or self.shared.estop_request
                     or int(self.shared.safety_state) != int(SafetyState.ARMED)
@@ -424,11 +421,10 @@ class PolicyRunner:
             # Recorder startup can block; use a new row before granting motion.
             if self._start_observation() is None:
                 return
-            if self.execute:
-                self.robot.prepare_streaming(epoch)
-                # Mode restoration precedes the policy clock.
-                if self._start_observation() is None:
-                    return
+            self.robot.prepare_streaming(epoch)
+            # Mode restoration precedes the policy clock.
+            if self._start_observation() is None:
+                return
             with self.shared.motion_lock:
                 admitted = (
                     _begin_motion_locked(self.shared)
@@ -465,7 +461,7 @@ class PolicyRunner:
                 )
                 errors = [error_detail("preparation", start_failure)] if start_failure else []
                 try:
-                    if self.execute and self.robot.stop_required:
+                    if self.robot.stop_required:
                         self.robot.stop()
                 except BaseException as exc:
                     errors.append(error_detail("preparation_stop", exc))
@@ -536,9 +532,6 @@ class PolicyRunner:
 
     def _submit(self, rows, slot, *, handoff_slot=None, prefix=None, commands=None):
         observation = build_policy_observation(rows, self.policy_info, kinematics=self.kinematics)
-        if observation is None:
-            self._finish_episode("policy_observation_unavailable", row=rows[-1])
-            return
         now = time.monotonic_ns()
         authorized = self._has_motion_authority()
         expired = self._expired_budget()
@@ -679,17 +672,15 @@ class PolicyRunner:
         if time.monotonic_ns() >= valid_until_ns:
             self._finish_episode("dispatch_deadline_expired", row=row)
             return
-        result, failure = None, None
-        if self.execute:
-            try:
-                self.slot_timing["submit_started_ns"] = time.monotonic_ns()
-                result = self.robot.send_action(command, valid_until_ns=valid_until_ns)
-            except (DispatchError, DispatchInterrupted) as exc:
-                result, failure = exc.result, exc
-            finally:
-                self.slot_timing["submit_completed_ns"] = time.monotonic_ns()
+        failure = None
+        try:
+            self.slot_timing["submit_started_ns"] = time.monotonic_ns()
+            result = self.robot.send_action(command, valid_until_ns=valid_until_ns)
+        except (DispatchError, DispatchInterrupted) as exc:
+            result, failure = exc.result, exc
+        finally:
+            self.slot_timing["submit_completed_ns"] = time.monotonic_ns()
         if (self.results is not None and self.results.current is not None
-                and result is not None
                 and (result.arm != DispatchStatus.NOT_CALLED or result.hand != DispatchStatus.NOT_CALLED)):
             self.results.current["metrics"]["dispatch_count"] += 1
         now = time.monotonic_ns()
@@ -879,7 +870,7 @@ class PolicyRunner:
     def run(self):
         failure = None
         try:
-            while self.shared.sensors.is_running.value and not self.shared.quit_requested:
+            while self.shared.running and not self.shared.quit_requested:
                 if self.poll_operator is not None:
                     self.poll_operator()
                 if self.shared.estop_request or self.shared.error_state:
@@ -894,7 +885,7 @@ class PolicyRunner:
         except Exception as exc:
             failure = exc
             self.shared.error_state = True
-            self.shared.sensors.is_running.value = False
+            self.shared.end_session()
         finally:
             reason = (
                 RunEndReason.RECORDING_FAILURE

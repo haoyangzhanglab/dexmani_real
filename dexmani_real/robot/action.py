@@ -12,14 +12,15 @@ from dexmani_real.planning.kinematics.ik import (
     joint_target_rejection,
     make_online_ik_config,
 )
-from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.robot.projection import project_arm_command, project_hand_command
 
 
 @dataclass(frozen=True)
 class ActionIntent:
+    """Absolute joint targets or an xArm-base EEF pose in meters with WXYZ rotation."""
+
     mode: Literal["joint", "eef"]
-    arm: np.ndarray
+    arm: np.ndarray | Pose
     hand: np.ndarray | None
 
 
@@ -29,27 +30,12 @@ class ActionRealization:
     hand_qpos: np.ndarray | None
     ik_result: IKResult | None = None
     rejection_reason: str | None = None
-    # Accepted Cartesian target feeds Teleop's explicit EMA only after dispatch.
-    eef_pose: np.ndarray | None = None
+    # Projected Cartesian target; Teleop commits its EMA only after dispatch.
+    eef_pose: Pose | None = None
 
 
 class ActionRealizer:
     def __init__(self, runtime, planner=None, collision_model=None, *, check_final_target=False):
-        for name, lower, upper, size in (
-            ("arm", runtime.arm.joint_limit_lower, runtime.arm.joint_limit_upper, 7),
-            ("hand", runtime.hand.qpos_min_rad, runtime.hand.qpos_max_rad, 12),
-        ):
-            lower, upper = np.asarray(lower), np.asarray(upper)
-            if (
-                lower.shape != (size,)
-                or upper.shape != (size,)
-                or not np.isfinite(lower).all()
-                or not np.isfinite(upper).all()
-                or np.any(lower >= upper)
-            ):
-                raise ValueError(f"{name} action limits must be finite ordered ({size},) vectors")
-        if planner is not None or check_final_target:
-            runtime.policy.workspace.validate()
         self.target_fk = None
         if check_final_target:
             from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
@@ -62,18 +48,15 @@ class ActionRealizer:
 
     @classmethod
     def for_mode(cls, runtime, mode, *, deployment=False):
-        runtime.arm.validate()
-        runtime.hand.validate()
+        """Build geometry after the workflow validates the resolved robot configuration."""
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
-        if mode == "eef":
+        if mode == "eef" or deployment:
             runtime.policy.workspace.validate()
         # Online manipulation permits table contact; HOME checks table paths with a separate planner.
         environment = {}
         if deployment:
             runtime.environment.validate()
-            for box in runtime.environment.static_boxes:
-                box.validate()
             environment = dict(static_boxes=runtime.environment.static_boxes)
         planner = (
             XArm7MotionPlanner.create_default(
@@ -137,15 +120,18 @@ class ActionRealizer:
     def realize(self, intent, current_arm_qpos, previous_arm_command_qpos=None):
         if intent.mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
-        arm = np.asarray(intent.arm, dtype=np.float64)
+        if intent.mode == "joint":
+            arm = np.asarray(intent.arm, dtype=np.float64)
+            if arm.shape != (7,) or not np.isfinite(arm).all():
+                raise ValueError("joint intent must be a finite (7,) vector")
+        elif not isinstance(intent.arm, Pose):
+            raise TypeError("EEF intent must be an xArm-base Pose")
         current = np.asarray(current_arm_qpos, dtype=np.float64)
         previous = (
             current
             if previous_arm_command_qpos is None
             else np.asarray(previous_arm_command_qpos, dtype=np.float64)
         )
-        if arm.shape != ((7,) if intent.mode == "joint" else (9,)) or not np.isfinite(arm).all():
-            raise ValueError("arm intent must have the expected shape and finite values")
         if any(q.shape != (7,) or not np.isfinite(q).all() for q in (current, previous)):
             raise ValueError("current and previous arm state must be finite (7,) vectors")
         cfg = self.runtime
@@ -173,9 +159,10 @@ class ActionRealizer:
             )
         if self.planner is None:
             raise ValueError("EEF realization requires an online IK planner")
+        # Project an owned pose so the source target and teleop EMA reference stay unchanged.
+        pose = intent.arm.copy()
         workspace = cfg.policy.workspace.as_array()
-        position = np.clip(arm[:3], workspace[:, 0], workspace[:, 1])
-        pose = Pose(p=position, q=rot6d_to_quat_wxyz(arm[3:]))
+        pose.p = np.clip(pose.p, workspace[:, 0], workspace[:, 1])
         self.planner.set_hand_qpos(hand if hand is not None else np.deg2rad(cfg.hand.home_qpos_deg))
         result = self.planner.solve_online_ik(pose, current, previous)
         reason = result.reason if not result.success else (
@@ -186,7 +173,7 @@ class ActionRealizer:
             hand,
             ik_result=result,
             rejection_reason=reason,
-            eef_pose=np.concatenate((position, arm[3:])),
+            eef_pose=pose,
         )
 
     def control_from_command(self, command, mode):

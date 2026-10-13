@@ -163,7 +163,7 @@ class TeleopRunner:
             or self.shared.estop_request
             or self.shared.error_state
             or self.shared.quit_requested
-            or not self.shared.sensors.is_running.value
+            or not self.shared.running
         )
 
     def _preparation_valid(self):
@@ -174,7 +174,7 @@ class TeleopRunner:
             and not self.shared.error_state
             and not self.shared.quit_requested
             and not self.shared.stop_request
-            and self.shared.sensors.is_running.value
+            and self.shared.running
             and int(self.shared.safety_state) == int(SafetyState.ARMED)
         )
 
@@ -254,7 +254,7 @@ class TeleopRunner:
             self.shared.estop_request
             or self.shared.error_state
             or self.shared.quit_requested
-            or not self.shared.sensors.is_running.value
+            or not self.shared.running
         ):
             return True
         if cmd is OperatorCommand.QUIT:
@@ -417,7 +417,7 @@ class TeleopRunner:
             elif (
                 int(self.shared.run_id) != epoch or self.shared.estop_request
                 or self.shared.error_state or self.shared.quit_requested
-                or self.shared.stop_request or not self.shared.sensors.is_running.value
+                or self.shared.stop_request or not self.shared.running
             ):
                 reason = "motion_revoked"
         if reason is not None:
@@ -494,6 +494,7 @@ class TeleopRunner:
                 ))
                 self._stop_capture("missed_tick")
                 return
+        issues = []
         row = read_observation(
             self.shared,
             self.runtime,
@@ -501,21 +502,16 @@ class TeleopRunner:
             require_hand=self.runtime.policy.hand_enabled,
             require_camera=self.recorder is not None,
             require_vr=True,
+            issues=issues,
         )
         if row is None:
-            if self.recorder is not None:
-                from dexmani_real.runtime.observation import (
-                    read_camera_frame,
-                    sample_is_fresh,
-                )
-
-                camera = read_camera_frame(self.shared)
-                if camera is None or not sample_is_fresh(
-                    camera["timestamp_ns"], self.runtime.camera.max_frame_age_s
-                ):
-                    revoke_motion(self.shared, reason=RunEndReason.HARDWARE_FAULT)
-                    self._stop_capture("camera_unavailable")
-                    raise RuntimeError("required recording camera unavailable")
+            if self.recorder is not None and any(
+                issue in {"camera_source_unavailable_or_unmatched", "camera_source_stale"}
+                for issue in issues
+            ):
+                revoke_motion(self.shared, reason=RunEndReason.HARDWARE_FAULT)
+                self._stop_capture("camera_unavailable")
+                raise RuntimeError("required recording camera unavailable")
             self._stop_capture("observation_unavailable")
             return
         if self.paused:
@@ -599,7 +595,7 @@ class TeleopRunner:
                 (check_services is None or check_services()) and self.keyboard.healthy
             )
             ready = self._initialize()
-            while ready and self.shared.sensors.is_running.value and not self.shared.quit_requested:
+            while ready and self.shared.running and not self.shared.quit_requested:
                 if not self.resume_requested and (not self.active or self.paused):
                     self.robot.service_idle()
                 if not self.keyboard.healthy:
@@ -620,7 +616,7 @@ class TeleopRunner:
                 if (
                     self.shared.estop_request
                     or self.shared.error_state
-                    or not self.shared.sensors.is_running.value
+                    or not self.shared.running
                 ):
                     break
                 if self.shared.quit_requested or (
@@ -637,7 +633,7 @@ class TeleopRunner:
         except Exception as exc:
             failure = exc
             self.shared.error_state = True
-            self.shared.sensors.is_running.value = False
+            self.shared.end_session()
             revoke_motion(
                 self.shared,
                 reason=RunEndReason.RECORDING_FAILURE

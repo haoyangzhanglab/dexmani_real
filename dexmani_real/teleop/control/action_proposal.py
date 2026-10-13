@@ -2,20 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 
-from dexmani_real.planning.kinematics.pose import quat_multiply
+from dexmani_real.planning.kinematics.pose import Pose, quat_multiply
 from dexmani_real.utils.geometry import normalize_quat_wxyz
-
-
-@dataclass(frozen=True)
-class EefTargetProposal:
-    """One xarm_base EEF target after explicit smoothing."""
-
-    position_xarm_base_m: np.ndarray
-    quat_xarm_base_wxyz: np.ndarray
 
 
 def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
@@ -88,7 +78,7 @@ def compute_target_eef_pose(
     previous_quat_xarm_base_wxyz: np.ndarray | None,
     ema_alpha_position: float,
     ema_alpha_rotation: float,
-) -> EefTargetProposal:
+) -> Pose:
     """Smooth one mapped xarm_base EEF target."""
     position_xarm_base_m = _finite_vector(
         mapped_position_xarm_base_m, (3,), "mapped_position_xarm_base_m"
@@ -104,7 +94,4 @@ def compute_target_eef_pose(
             ema_alpha_rotation,
         )
 
-    return EefTargetProposal(
-        position_xarm_base_m=position_xarm_base_m,
-        quat_xarm_base_wxyz=quat_xarm_base_wxyz,
-    )
+    return Pose(p=position_xarm_base_m, q=quat_xarm_base_wxyz)

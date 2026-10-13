@@ -215,12 +215,11 @@ class XArm7:
         waypoints: np.ndarray,
         final_qpos: np.ndarray,
         *,
-        feedback_callback: (
-            Callable[[np.ndarray, np.ndarray, np.ndarray, np.ndarray], None] | None
-        ) = None,
+        service_callback: Callable[[], None] | None = None,
         abort_check: Callable[[], str | None] | None = None,
     ) -> None:
         """Execute the prevalidated path in Mode 0, restore Mode 6, then verify final position/velocity dwell.
+        The service callback maintains other devices; arm convergence is checked here.
         Blocks and raises on failure/interruption; the session owner handles stopping and recovery.
         """
         waypoints = np.asarray(waypoints, dtype=np.float64)
@@ -254,21 +253,21 @@ class XArm7:
                 and float(np.max(np.abs(v))) <= self.cfg.homing.velocity_convergence_rad_s
             )
 
-        def _publish(target: np.ndarray, q: np.ndarray, v: np.ndarray, t: np.ndarray) -> None:
-            if feedback_callback is not None:
-                feedback_callback(q.copy(), v.copy(), t.copy(), target.copy())
+        def _service() -> None:
+            if service_callback is not None:
+                service_callback()
 
         def _dwell(target: np.ndarray) -> None:
             stable_since = time.monotonic()
             while time.monotonic() - stable_since < self.cfg.homing.dwell_s:
                 _raise_abort()
                 time.sleep(min(self.cfg.homing.step_interval_s, self.cfg.homing.dwell_s))
-                q, v, t = self.read()
+                q, v, _ = self.read()
                 if self.read_live_error_code() != 0:
                     raise RuntimeError("controller error during home dwell")
                 if not _converged(target, q, v, self.cfg.homing.convergence_rad):
                     raise RuntimeError("home dwell interrupted by position/velocity")
-                _publish(target, q, v, t)
+                _service()
 
         def _restore_mode6_and_settle(target: np.ndarray) -> None:
             # HOME includes stability after the firmware mode-switch transient.
@@ -285,10 +284,10 @@ class XArm7:
             max_error = max_velocity = float("inf")
             while time.monotonic() < deadline:
                 _raise_abort()
-                q, v, t = self.read()
+                q, v, _ = self.read()
                 if self.read_live_error_code() != 0:
                     raise RuntimeError("controller error during post-Mode6 home settle")
-                _publish(target, q, v, t)
+                _service()
                 max_error = float(np.max(np.abs(q - target)))
                 max_velocity = float(np.max(np.abs(v)))
                 now = time.monotonic()
@@ -348,10 +347,10 @@ class XArm7:
             q = current
             while time.monotonic() < deadline:
                 _raise_abort()
-                q, v, t = self.read()
+                q, v, _ = self.read()
                 if self.read_live_error_code() != 0:
                     raise RuntimeError(f"controller error at home milestone {index}")
-                _publish(target, q, v, t)
+                _service()
                 if _converged(target, q, v, milestone_tol):
                     if stable_since is None:
                         stable_since = time.monotonic()

@@ -54,7 +54,7 @@ def _wait_replay(shared, keyboard, epoch, deadline, robot):
             return ReplayOutcome(ReplayStatus.FAULT, reason="runtime failure")
         if shared.quit_requested or OperatorCommand.QUIT in signals:
             return ReplayOutcome(ReplayStatus.USER_QUIT, reason="operator quit")
-        if not shared.sensors.is_running.value or int(shared.run_id) != epoch:
+        if not shared.running or int(shared.run_id) != epoch:
             cause = RunEndReason(int(shared.run_ended_reason))
             if cause == RunEndReason.QUIT:
                 return ReplayOutcome(ReplayStatus.USER_QUIT, reason="operator quit")

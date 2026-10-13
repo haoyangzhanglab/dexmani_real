@@ -2,12 +2,9 @@
 
 import logging
 import math
-import multiprocessing as mp
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from dexmani_real.ipc.channels import SensorChannelsConfig
 from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.utils.episode_results import EpisodeResults, error_detail
 from dexmani_real.replay.evaluation import evaluate_replay
@@ -19,7 +16,6 @@ from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.safety import RunEndReason, SafetyState, require_transition, revoke_motion
-from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.utils.log import configure_logging
 
 
@@ -49,19 +45,13 @@ def replay_episode(trajectory, runtime, config):
         raise ValueError("replay output must be missing or empty")
     verify_replay_preflight(trajectory, runtime)
     results = EpisodeResults(target, "replay")
-    shared = supervisor = robot = keyboard = None
+    shared = robot = keyboard = None
     trajectory_outcome = None
     shutdown_clean = False
     outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="startup failed")
     try:
-        ctx = mp.get_context("spawn")
-        shared = RuntimeState.create(
-            prefix=f"replay_{os.getpid()}",
-            config=SensorChannelsConfig.from_runtime(runtime),
-            mp_context=ctx,
-        )
-        supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
-        robot = DexManiRobot(shared, runtime, check_services=supervisor.check)
+        shared = RuntimeState()
+        robot = DexManiRobot(shared, runtime)
 
         def request_quit():
             revoke_motion(shared, reason=RunEndReason.QUIT)
@@ -78,7 +68,7 @@ def replay_episode(trajectory, runtime, config):
         robot.connect()
         require_transition(shared, SafetyState.ARMED)
         keyboard.start()
-        robot.check_services = lambda: supervisor.check() and keyboard.healthy
+        robot.check_services = lambda: keyboard.healthy
         home_result = home_hand(
             shared,
             runtime,
@@ -119,7 +109,7 @@ def replay_episode(trajectory, runtime, config):
         if outcome.successful:
             print("H: planned return_home; Q: exit", flush=True)
             while (
-                shared.sensors.is_running.value and not shared.quit_requested and supervisor.check()
+                shared.running and not shared.quit_requested
             ):
                 robot.service_idle()
                 if not keyboard.healthy:
@@ -170,15 +160,11 @@ def replay_episode(trajectory, runtime, config):
         try:
             if shared is not None:
                 revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
-            if supervisor is not None:
                 shutdown_clean = shutdown_local_runtime(
                     robot,
-                    supervisor,
+                    shared=shared,
                     keyboard=keyboard,
-                    timeout_s=runtime.safety.shutdown_timeout_s,
                 )
-            elif shared is not None:
-                shutdown_clean = bool(shared.sensors.close())
         except Exception as exc:
             results.session["errors"].append(error_detail("shutdown", exc))
         if shared is not None:

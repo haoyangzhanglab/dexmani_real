@@ -68,13 +68,7 @@ def _resolve_base_from_color(
     if not serial:
         raise RuntimeError("camera did not publish a serial for point-cloud calibration")
     camera_name = calibration.resolve_name_by_serial(serial)
-    entry = calibration.get_entry(camera_name, expected_serial=serial)
-    if entry.type != "eye_to_hand":
-        raise ValueError(
-            "realtime point-cloud worker currently requires an eye_to_hand camera; "
-            "eye_in_hand needs a separately synchronized arm-pose contract"
-        )
-    assert entry.T_world_camera is not None
+    entry = calibration.get_entry(camera_name)
     return entry.T_world_camera.copy()
 
 

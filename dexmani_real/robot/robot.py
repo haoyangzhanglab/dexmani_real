@@ -76,9 +76,6 @@ class DexManiRobot:
     def __init__(
         self, shared, runtime, *, arm_factory=None, hand_factory=None, check_services=None
     ):
-        from dexmani_real.config.experiment import validate_robot_config
-
-        validate_robot_config(runtime)
         self.shared, self.runtime = shared, runtime
         self._arm_factory, self._hand_factory = arm_factory, hand_factory
         self.check_services = check_services
@@ -195,17 +192,6 @@ class DexManiRobot:
             if deadline_ns is None else deadline_ns
         )
 
-    def arm_feedback(self, qpos, qvel, effort):
-        if any(np.shape(x) != (7,) or not np.isfinite(x).all() for x in (qpos, qvel)):
-            raise RuntimeError("unusable arm feedback")
-        if np.shape(effort) != (7,):
-            raise RuntimeError("invalid arm effort shape")
-        frame = np.zeros(1, dtype=ARM_STATE_DTYPE)
-        frame["qpos"], frame["qvel"], frame["effort"] = qpos, qvel, effort
-        frame["timestamp_ns"] = time.monotonic_ns()
-        frame.flags.writeable = False
-        return frame
-
     def _read_hand(self):
         if self.hand is None:
             return None
@@ -222,10 +208,6 @@ class DexManiRobot:
         if self._hand_read_crc:
             logger.info("XHand trustworthy reads recovered")
         self._hand_read_crc = False
-        if np.shape(state.qpos) != (12,) or not np.isfinite(state.qpos).all():
-            raise RuntimeError("unusable hand joint feedback")
-        if np.shape(state.current_ma) != (12,):
-            raise RuntimeError("invalid hand current shape")
         errors = tuple(
             tuple(getattr(state, name))
             for name in ("commboard_err", "jointboard_err", "tipboard_err")
@@ -296,7 +278,11 @@ class DexManiRobot:
             q, v, effort = self.arm.read()
             if self.arm.error_code:
                 raise RuntimeError(f"arm controller error: {self.arm.error_code}")
-            arm = self.arm_feedback(q, v, effort)
+            # Own a read-only snapshot of feedback validated at the SDK boundary.
+            arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+            arm["qpos"], arm["qvel"], arm["effort"] = q, v, effort
+            arm["timestamp_ns"] = time.monotonic_ns()
+            arm.flags.writeable = False
             hand = self._read_hand()
         except Exception:
             self.shared.error_state = True
@@ -311,7 +297,7 @@ class DexManiRobot:
             or self.shared.estop_request
             or self.shared.error_state
             or self.shared.quit_requested
-            or not self.shared.sensors.is_running.value
+            or not self.shared.running
         )
 
     def read_initial_state(self, *, cancel_requested=None):
@@ -515,15 +501,14 @@ class DexManiRobot:
                 return "home authority revoked"
             return None
 
-        def feedback(q, v, effort, _target):
-            self.arm_feedback(q, v, effort)
+        def service():
             self._read_hand()
             self.check()
 
         if check_abort():
             return False
         self._motion_active = True
-        self.arm.home(waypoints, target, abort_check=check_abort, feedback_callback=feedback)
+        self.arm.home(waypoints, target, abort_check=check_abort, service_callback=service)
         self._arm_stopped = False
         return check_abort() is None
 

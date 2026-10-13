@@ -81,7 +81,6 @@ def _warmup_policy(model, runtime, execution_config):
 def run_policy_deployment(
     runtime,
     policy_config,
-    execute,
     *,
     prefix=None,
     max_running_s=None,
@@ -104,8 +103,12 @@ def run_policy_deployment(
         runtime = replace(runtime, pointcloud=cloud_recipe)
     runtime = resolve_runtime_table(runtime, pointcloud=cloud_recipe)
     num_episodes = validate_num_episodes(num_episodes)
-    if recording_config is not None and not execute:
-        raise ValueError("Raw recording requires execute=True")
+    print(
+        f"执行：{info.checkpoint_path.name} ({info.weights}) | NFE={info.inference_steps} | "
+        f"A_exec={execution_config.action_steps} | {execution_config.execution_mode} | "
+        f"{1.0 / info.control_dt_s:g} Hz"
+    )
+    print("正在初始化模型和设备…", flush=True)
     results = (
         EpisodeResults(results_dir, "policy")
         if results_dir is not None
@@ -146,8 +149,13 @@ def run_policy_deployment(
                 runtime, camera=camera, pointcloud=cloud
             ),
         )
-        supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
-        robot = DexManiRobot(shared, runtime, check_services=supervisor.check)
+        supervisor = (
+            RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
+            if shared.sensors is not None else None
+        )
+        robot = DexManiRobot(
+            shared, runtime, check_services=supervisor.check if supervisor else None
+        )
         model = InferenceWorker(lambda: _load_configured_policy(policy_config, execution_config))
         _warmup_policy(model, runtime, execution_config)
         logger.debug(
@@ -166,7 +174,7 @@ def run_policy_deployment(
         )
         kinematics = build_observation_kinematics(info, runtime)
         realizer = ActionRealizer.for_mode(runtime, info.action_mode, deployment=True)
-        home_planner = build_home_planner(runtime) if execute else None
+        home_planner = build_home_planner(runtime)
         if save_run_config is not None:
             save_run_config(runtime, execution_config)
         recorder = (
@@ -194,14 +202,14 @@ def run_policy_deployment(
                     args=(shared.sensors, pointcloud_config),
                 )
             )
-        supervisor.start(sensors)
+        if supervisor is not None:
+            supervisor.start(sensors)
         require_transition(shared, SafetyState.ARMED)
         operator = PolicyOperator(
             shared,
             runtime,
             home_planner,
             robot=robot,
-            execute=execute,
             idle_for_tactile_reset=lambda: (
                 runner.run_id is None
                 and runner.preparing_epoch is None
@@ -211,7 +219,9 @@ def run_policy_deployment(
             ),
         )
         operator.keyboard.start()
-        robot.check_services = lambda: supervisor.check() and operator.keyboard.healthy
+        robot.check_services = lambda: (
+            (supervisor is None or supervisor.check()) and operator.keyboard.healthy
+        )
         runner = PolicyRunner(
             shared,
             runtime,
@@ -223,16 +233,14 @@ def run_policy_deployment(
             discard_pending_start=operator.discard_pending_start,
             model_runtime=model,
             kinematics=kinematics,
-            execute=execute,
             max_running_s=max_running_s,
             num_episodes=num_episodes,
             task_label=recording_config.task_label if recording_config is not None else None,
             camera_calibration=camera_calibration,
             results=results,
         )
-        start_hint = "H 回初始位 → B 开始" if execute else "B 开始推理"
         print(
-            f"就绪（无需回车）：{start_hint} | S 结束本轮 | Q 退出 | Esc 急停 | "
+            "就绪（无需回车）：H 回初始位 → B 开始 | S 结束本轮 | Q 退出 | Esc 急停 | "
             "T 请求复位触觉（空闲且无接触）。",
             flush=True,
         )
@@ -276,14 +284,13 @@ def run_policy_deployment(
                     recorder.close()
                 except Exception as exc:
                     cleanup_errors.append(error_detail("recorder_close", exc))
-            if supervisor is not None:
+            if shared is not None:
                 shutdown_clean = shutdown_local_runtime(
                     robot, supervisor,
+                    shared=shared,
                     keyboard=operator.keyboard if operator else None,
                     timeout_s=max(0.0, shutdown_deadline - time.monotonic()),
                 )
-            elif shared is not None:
-                shutdown_clean = bool(shared.sensors.close())
             else:
                 shutdown_clean = True
         except Exception as exc:

@@ -140,8 +140,6 @@ def _read_stationary_calibration_arm_state(
 ) -> tuple[dict[str, Any] | None, str]:
     """Read fresh arm feedback using the homing stationary bound."""
     arm_state = read_arm_state_dict(robot)
-    if arm_state is None:
-        return None, "arm state unavailable"
     if not sample_is_fresh(arm_state["timestamp_ns"], runtime.arm.feedback_max_age_s):
         return None, "arm feedback stale"
     max_velocity_rad_s = float(np.max(np.abs(np.asarray(arm_state["qvel"]))))
@@ -337,7 +335,7 @@ class CameraCalibrationSession:
             return "runtime error latch is set"
         if int(self.shared.safety_state) == int(SafetyState.FAULT):
             return "safety state is FAULT"
-        if arm is None or not sample_is_fresh(
+        if not sample_is_fresh(
             arm["timestamp_ns"], self.runtime.arm.feedback_max_age_s
         ):
             return "arm feedback stale"
@@ -348,7 +346,7 @@ class CameraCalibrationSession:
             self.shared.quit_requested
             or self.shared.estop_request
             or self.shared.error_state
-            or not self.shared.sensors.is_running.value
+            or not self.shared.running
             or not self.keys.healthy
             or self.keys.is_pressed("q")
             or self.keys.is_pressed("esc")
@@ -603,7 +601,7 @@ class CameraCalibrationSession:
         print(f"  Preview window: {_WINDOW_NAME} (green=detected, red=not found)")
 
         self.display_image: np.ndarray | None = None
-        while self.shared.sensors.is_running.value:
+        while self.shared.running:
             self.rate.wait()
             self.state.frame += 1
 

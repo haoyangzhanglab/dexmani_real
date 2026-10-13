@@ -39,7 +39,7 @@ python examples/pointcloud_process_example.py --help
 
 相机外参、桌面平面、手部安装与 VR alignment 属于当前实验现场状态；物理设置变化后重新标定或确认。首次桌面标定在 pointcloud 示例中选择 table calibration。指尖 FK 使用当前手部安装补偿，碰撞与规划使用标称资产几何。
 
-采集允许缺相机外参；点云重建需要对应相机的内外参与 depth scale。标定在会话启动时读取。采集可指定 `--vr-transform` / `--camera-calibration`，部署可指定 `--camera-calibration`，相机和 VR 标定可指定 `--output`；桌面平面路径由 `environment.table.plane_path` 配置。
+当前相机链路使用固定安装（eye-to-hand）外参，按相机 serial 绑定。采集允许缺相机外参；点云重建需要对应相机的内外参与 depth scale。标定在会话启动时读取。采集可指定 `--vr-transform` / `--camera-calibration`，部署可指定 `--camera-calibration`，相机和 VR 标定可指定 `--output`；桌面平面路径由 `environment.table.plane_path` 配置。
 
 相机预览的 `MARKER OK` 表示当前预览帧检测成功；保存标定样本还需通过独立的多帧采样、静止和有效性检查。
 
@@ -78,7 +78,7 @@ python examples/visualize_episode.py <episode> --max-frames 100 --config local.y
 python examples/export_policy_zarr.py episodes/<task> --config local.yaml
 ```
 
-`--info` 查看元数据与数值概要，无需 Rerun；交互 viewer 顺序读取所选 RGB-D 帧。查看和导出使用当前点云、桌面与手部安装配置，相机几何来自对应 Raw。仅当 `pointcloud.remove_table: true` 时读取桌面平面。viewer 的点云耗时只统计已读取 RGB-D 的派生计算，不含读取和显示，不能与包含读取耗时的旧日志直接比较。
+`--info` 查看元数据与数值概要，无需 Rerun；交互 viewer 顺序读取所选 RGB-D 帧。查看和导出使用当前点云、桌面与手部安装配置，相机几何来自对应 Raw。仅当 `pointcloud.remove_table: true` 时读取桌面平面。viewer 的点云耗时只统计已读取 RGB-D 的派生计算，不含读取和显示。
 
 公共导出要求每段全部 **13 字段**完整，每行浮点数值均有限；缺字段、NaN/Inf、RGB-D 行数不符、相机几何缺失或点云无法重建时，整段拒绝并在日志中记录原因。完整性检查覆盖全部模态，不随模型所需字段而放宽，hand current / arm effort 的辅助 NaN 也会导致整段拒绝。Raw 原样保留，导出不删单帧、不插值、不填补缺测；触觉直接使用采集保存值，不再次保持或修补。下游按模型所需字段加载。
 
@@ -113,7 +113,9 @@ sync 在推理完成后读取新反馈并开始执行，段内按策略时间步
 
 checkpoint 默认 `latest`；可用 `--checkpoint 80pct` 选择已保存的 80% milestone，也支持 `best` 或 checkpoint 文件名。百分比必须对应已有 checkpoint；`best` 需要实验中的 `best_ckpt.json`。模型推理参数与 Real 执行参数见 `--help`。保存产物时，`run_config.yaml` 记录实际配置、checkpoint、覆盖值、输出开关与源码版本。`--output` 指定部署输出位置。
 
-Raw 与评估摘要可独立关闭：`--no-record` 关闭 Raw，`--no-results` 关闭摘要，两者同时使用时不创建会话产物。评估摘要保存在 `session_result.json`，包含结束原因、时长、故障和推理、发送、跳过节拍的统计。启用摘要时，在连接设备前写入初始未完成状态；运行期间只更新内存，撤销运动后保存每段结果，资源清理后更新会话结果。session 统一提交幂等模型关闭，并在其他资源释放后用剩余关闭预算等待同一个 Future；`model_close.status` 区分 completed、failed、pending，超预算表示关闭未完成，不等同关闭异常。清理失败或最终仍 pending 都返回非零退出状态，episode 原始结束原因独立保留。有限等待不保证 Python 线程或 CUDA 卡住时进程也能按时退出。
+Raw 与评估摘要可独立关闭：`--no-record` 关闭 Raw，`--no-results` 关闭摘要，两者同时使用时不创建会话产物。仅使用机器人状态且关闭 Raw 时不启动相机；RGB、点云输入或 Raw 录制按需启动对应传感器。
+
+评估摘要保存在 `session_result.json`，包含结束原因、时长、故障和推理、发送、跳过节拍的统计。启用摘要时，连接设备前写入初始未完成状态，撤销运动后保存每段结果，资源清理后更新会话结果。清理失败或模型关闭超时返回非零退出状态，episode 原始结束原因独立保留。模型关闭超时表示尚未完成；Python 线程或 CUDA 阻塞仍可能延迟进程退出。
 
 Rollout Raw 默认用于评估 evidence，保留 bootstrap/WAIT 的无动作行与具体终止原因（关闭摘要时也保留）。公共导出按同一时间、完整性与动作提交规则判定，通常会拒绝这些含无动作行的 episode；未来用于再训练需另行定义派生片段和时间映射，不能填动作或裁行来通过当前导出。
 
@@ -121,7 +123,7 @@ Rollout Raw 默认用于评估 evidence，保留 bootstrap/WAIT 的无动作行�
 
 部署 joint、EEF 的最终关节目标及 RTC 冻结目标统一检查机械/关节限位、跳变、FK 最终 EEF 工作空间、自碰撞及当前配置的 static boxes。最终 FK 工作空间检查默认允许各边界超出 5 mm，可通过 `execution.eef_workspace_margin_m` 调整，设为 0 恢复严格边界；EEF 原始目标投影与 HOME 路径仍使用原始工作空间。Policy 动作不做桌面碰撞检测，允许贴桌/接触操作，由操作员监督并准备硬件急停；H 执行 HOME 时仍按当前配置检查桌面和路径，点云去桌仍使用当前桌面标定。EEF 仍先投影再 IK；拒绝就终止本轮并记录原因，不重规划或恢复。这些是最终目标检查，不证明真实连续运动轨迹安全，仍需现场验收。
 
-`--no-record`、`--no-results` 只控制产物保存，部署仍连接设备并执行动作；程序接口的 `execute=False` 仍连接并读取设备，均不能用于离线验证。
+`--no-record`、`--no-results` 只控制产物保存，部署仍连接设备并执行动作，不能用于离线验证。
 
 ### 轨迹回放
 
@@ -129,7 +131,7 @@ Rollout Raw 默认用于评估 evidence，保留 bootstrap/WAIT 的无动作行�
 python examples/replay_episode.py episodes/<task>/<episode> --config local.yaml --output replay_results/<run>
 ```
 
-按 Raw 的标称节拍逐行回放关节目标，要求 teleop 数据、非空有限的目标与关节状态、双设备持续发送状态，并检查目标是否满足当前限位。输出目录须新建或为空，保存 `session_result.json`、已采集的 `replay_data.npz` 与可计算的一致性指标 `metrics.json`。Q 保存前缀并退出，ESC 急停；完成后可按 H 执行规划回 HOME。
+按 Raw 的标称节拍逐行回放关节目标，要求 teleop 数据、非空有限的目标与关节状态、双设备持续发送状态，并检查目标是否满足当前限位。回放连接机械臂与手，不启动相机或 VR。输出目录须新建或为空，保存 `session_result.json`、已采集的 `replay_data.npz` 与可计算的一致性指标 `metrics.json`。Q 保存前缀并退出，ESC 急停；完成后可按 H 执行规划回 HOME。
 
 会话结束阶段，先保存已采集的实测关节、目标、发送状态和时间，再离线生成 EEF 位姿并原子更新 `replay_data.npz`。EEF 派生或其 NPZ 更新失败时，第一次保存的物理捕获仍保留，EEF 字段维持 NaN；指标写盘失败不影响已保存的 EEF。错误记录到 `session_result.json`，没有捕获行时不生成 `replay_data.npz`。输入 Raw 始终保持原样。
 
@@ -142,13 +144,13 @@ python examples/replay_episode.py episodes/<task>/<episode> --config local.yaml 
 | RGB-D 诊断 | `examples/realsense_record_example.py` |
 | 点云诊断与桌面标定 | `examples/pointcloud_process_example.py` |
 
-XHand 示例按 HOME → fist → palm → V → OK → HOME 顺序执行动作，实测到位后各停留 1 秒；`--read-only` 仍连接设备并读取反馈。相机诊断使用 `--config`；RealSense 诊断退出时恢复可读取的原曝光优先级。具体操作与参数见各入口 `--help`。
+键盘 jog 不启动相机或 VR。XHand 示例按 HOME → fist → palm → V → OK → HOME 顺序执行动作，实测到位后各停留 1 秒；`--read-only` 仍连接设备并读取反馈。相机诊断使用 `--config`；RealSense 诊断退出时恢复可读取的原曝光优先级。具体操作与参数见各入口 `--help`。
 
 ## 数据与安全
 
 **Raw 是实验 evidence，发布后不可变。** 采集保留接入的 RGB-D、关节与触觉观测。停止、晚帧、控制失败和缺测保留已采前缀及结束原因，仅操作者显式丢弃才删除当前 capture。写盘、编码或发布失败保留 staging 并报告失败；相机停帧不补黑图，触觉按 Raw 保存值导出。
 
-每个 Raw episode 只使用 `data.h5` 与 `rgb.mp4`，HDF5 保存物理观测、尝试发送的目标、相对秒时间与发送状态，以及采集和相机元数据。保存的 depth 与 RGB 像素网格对齐，查看和点云重建复用同帧深度。
+每个 Raw episode 只使用 `data.h5` 与 `rgb.mp4`，HDF5 保存物理观测、尝试发送的目标、相对秒时间与发送状态，以及采集和相机元数据。RGB 按解码顺序与 HDF5 控制行对齐，实际采样时间以 HDF5 `timestamp` 为准；视频按标称帧率编码。保存的 depth 与 RGB 像素网格对齐，查看和点云重建复用同帧深度。
 
 录制端非阻塞提交当前控制行，后台线程完成编码和写盘；启动和结束时先撤销运动，再等待文件准备或发布。录制队列满或写入失败会明确报错并保留 staging，不静默丢帧。
 

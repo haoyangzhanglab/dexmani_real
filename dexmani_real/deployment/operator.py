@@ -28,10 +28,9 @@ class PolicyOperator:
         self,
         shared: RuntimeState,
         runtime: ExperimentConfig,
-        planner: XArm7MotionPlanner | None,
+        planner: XArm7MotionPlanner,
         *,
         robot,
-        execute: bool,
         idle_for_tactile_reset=None,
     ):
         self.idle_for_tactile_reset = idle_for_tactile_reset
@@ -40,10 +39,6 @@ class PolicyOperator:
         self.robot = robot
         self.runtime = runtime
         self.planner = planner
-        if not isinstance(execute, bool):
-            raise TypeError("execute must be a boolean")
-        if execute != (planner is not None):
-            raise ValueError("execute must match physical home availability")
         self.keyboard = KeyboardInput(
             estop_callback=lambda: setattr(shared, "estop_request", True),
             stop_callback=self._request_stop,
@@ -56,7 +51,7 @@ class PolicyOperator:
             self.shared.error_state = True
 
     def _request_quit(self) -> None:
-        """Apply Q's motion fence before asking the supervisor to shut down."""
+        """Apply Q's motion fence before requesting session shutdown."""
         if not request_policy_stop(self.shared, reason=RunEndReason.QUIT):
             self.shared.error_state = True
         self.shared.quit_requested = True
@@ -123,9 +118,6 @@ class PolicyOperator:
             elif signal is OperatorCommand.HOME:
                 if home_handled_in_batch:
                     continue
-                if self.planner is None:
-                    logger.warning("operator: H is disabled in policy deployment")
-                    continue
                 if stop_in_batch:
                     logger.warning("operator: ignored H received in the same batch as S/Q")
                     continue
@@ -142,7 +134,7 @@ class PolicyOperator:
     def _run_home(self) -> bool:
         with self.shared.motion_lock:
             home_allowed = (
-                self.shared.sensors.is_running.value
+                self.shared.running
                 and not self.shared.quit_requested
                 and not self.shared.error_state
                 and not self.shared.estop_request
@@ -172,7 +164,7 @@ class PolicyOperator:
         with self.shared.motion_lock:
             completed_without_stop = bool(
                 result.ok
-                and self.shared.sensors.is_running.value
+                and self.shared.running
                 and not self.shared.quit_requested
                 and not self.shared.error_state
                 and not self.shared.estop_request
@@ -206,7 +198,7 @@ class PolicyOperator:
     def _home_abort_requested(self) -> bool:
         self.robot.check()
         return bool(
-            not self.shared.sensors.is_running.value
+            not self.shared.running
             or self.shared.quit_requested
             or self.shared.error_state
             or self.shared.estop_request

@@ -9,7 +9,8 @@ from dexmani_real.runtime.safety import RunEndReason, SafetyState, StopRequest
 
 @dataclass
 class RuntimeState:
-    sensors: SensorChannels
+    sensors: SensorChannels | None = None
+    running: bool = True
     run_id: int = 1
     run_ended_id: int = 0
     run_ended_reason: RunEndReason = RunEndReason.NONE
@@ -22,9 +23,18 @@ class RuntimeState:
     # Never held across an SDK call; keyboard callbacks revoke from another thread.
     motion_lock: object = field(default_factory=RLock, repr=False)
 
+    def end_session(self) -> None:
+        """End local authority and notify sensor workers when this session has any."""
+        with self.motion_lock:
+            self.running = False
+            if self.sensors is not None:
+                self.sensors.is_running.value = False
+
     @classmethod
     def create(
         cls, prefix: str = "dexmani", *,
         config: SensorChannelsConfig | None = None, mp_context=None,
     ) -> "RuntimeState":
+        if config is None or not (config.camera or config.vr or config.pointcloud):
+            return cls()
         return cls(SensorChannels.create(prefix, config=config, mp_context=mp_context))

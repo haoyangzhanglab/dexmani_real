@@ -101,11 +101,7 @@ def read_observation(
     wait_for_hand=False,
     cancel_requested=None,
 ):
-    def unavailable(reason):
-        if issues is not None:
-            issues.append(reason)
-        return None
-
+    unavailable = []
     control_ns = time.monotonic_ns()
     state = (
         robot.read_initial_state(cancel_requested=cancel_requested)
@@ -117,7 +113,7 @@ def read_observation(
         (require_hand and hand is None)
         or (require_pointcloud and cloud_result is None)
     ):
-        return unavailable("feedback_or_pointcloud_unavailable")
+        unavailable.append("feedback_or_pointcloud_unavailable")
     cloud = cloud_result[0][0] if cloud_result else None
     if require_rgb_cloud_identity:
         camera = (
@@ -129,28 +125,32 @@ def read_observation(
         camera = read_camera_frame(shared) if require_camera else None
     vr = read_vr_frame(shared) if require_vr else None
     if (require_camera or require_rgb_cloud_identity) and camera is None:
-        return unavailable("camera_source_unavailable_or_unmatched")
+        unavailable.append("camera_source_unavailable_or_unmatched")
     if require_vr and vr is None:
-        return unavailable("vr_unavailable")
+        unavailable.append("vr_unavailable")
     now = time.monotonic_ns()
     if not sample_is_fresh(arm["timestamp_ns"][0], runtime.arm.feedback_max_age_s, now):
-        return unavailable("arm_feedback_stale")
+        unavailable.append("arm_feedback_stale")
     if hand is not None:
         hand_ns = hand_feedback_time_ns(hand)
         if not 0 < hand_ns <= now < hand_ns + int(runtime.hand.feedback_max_age_s * 1e9):
-            return unavailable("hand_feedback_stale")
+            unavailable.append("hand_feedback_stale")
     if camera is not None and not sample_is_fresh(
         camera["timestamp_ns"], runtime.camera.max_frame_age_s, now
     ):
-        return unavailable("camera_source_stale")
+        unavailable.append("camera_source_stale")
     if cloud is not None and not sample_is_fresh(
         cloud["timestamp_ns"], runtime.camera.max_frame_age_s, now
     ):
-        return unavailable("pointcloud_stale")
+        unavailable.append("pointcloud_stale")
     if vr is not None and not sample_is_fresh(
         vr["recv_ts_ns"], runtime.policy.vr_mapping.stale_threshold_s, now
     ):
-        return unavailable("vr_stale")
+        unavailable.append("vr_stale")
+    if unavailable:
+        if issues is not None:
+            issues.extend(unavailable)
+        return None
     return ObservationRow(
         _freeze(arm),
         _freeze(hand),

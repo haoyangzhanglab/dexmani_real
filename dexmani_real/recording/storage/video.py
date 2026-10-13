@@ -124,20 +124,16 @@ class VideoEncoder:
 
 
 class VideoDecoder:
-    """Stream RGB frames sequentially without a full-video cache."""
+    """Decode RGB by ordinal for HDF5 row alignment; video PTS is not the Raw sampling clock."""
 
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
         self._container: av.container.InputContainer | None = None
         self._stream: Any = None
-        self._opened = False
 
     def iter_frames(self) -> Iterator[np.ndarray]:
         """Rewind and yield RGB frames sequentially without caching the video."""
-        if not self._opened:
-            self._open()
-        if self._container is None:
-            raise RuntimeError("VideoDecoder: container is None after _open()")
+        self._open()
         self._container.seek(0)
         for packet in self._container.demux(self._stream):
             for frame in packet.decode():
@@ -149,26 +145,15 @@ class VideoDecoder:
             self._container.close()
             self._container = None
             self._stream = None
-            self._opened = False
 
     def _open(self) -> None:
-        if self._opened:
+        if self._stream is not None:
             return
         if self._container is not None:
             self.close()
         try:
             self._container = av.open(str(self._path), "r")
             self._stream = self._container.streams.video[0]
-            avg_rate = self._stream.average_rate
-            if avg_rate is None:
-                raise ValueError(f"No average frame rate in {self._path}")
-            # Keep the same metadata admission for sequential episode readers.
-            if Fraction(avg_rate) <= 0 or self._stream.time_base is None:
-                raise ValueError("CFR video requires a positive rate and a time base")
-            first = next(self._container.decode(self._stream), None)
-            if first is None or first.pts is None or first.time_base is None:
-                raise ValueError("CFR video requires a first presentation timestamp")
-            self._opened = True
         except BaseException:
             self.close()
             raise

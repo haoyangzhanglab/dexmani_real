@@ -23,8 +23,10 @@ from dexmani_real.recording.storage.schema import DATASET_SPECS, validate_traini
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 
 
-def validate_export_episode(reader: EpisodeReader) -> int:
-    """Require complete physical modalities and camera geometry for the whole episode."""
+def validate_export_episode(
+    reader: EpisodeReader, config: ProcessingConfig
+) -> RawEpisodePointCloudDeriver:
+    """Check metadata/layout/timing and prepare static camera geometry once per episode."""
     frames = reader.num_frames
     if frames <= 0:
         raise RawDataError("episode contains no rows")
@@ -51,21 +53,19 @@ def validate_export_episode(reader: EpisodeReader) -> int:
         raise RawDataError("; ".join(errors))
     if frames == 1:
         logging.getLogger(__name__).warning("%s: single row, no sampling interval to verify", reader.path)
-    for name, spec in DATASET_SPECS.items():
-        array = reader[name]
-        if np.issubdtype(spec.dtype, np.floating):
-            for start in range(0, frames, 256):
-                values = array[start:start + 256]
-                valid = np.isfinite(values).reshape(len(values), -1).all(axis=1)
-                if not valid.all():
-                    row = start + int(np.flatnonzero(~valid)[0])
-                    raise RawDataError(f"Raw {name}: nonfinite values at row {row}")
+    for name in DATASET_SPECS:
+        reader[name]  # EpisodeReader validates shape/dtype without reading the array.
     try:
-        load_raw_episode_camera_model(reader)
-        load_raw_episode_base_from_color(reader)
+        camera = load_raw_episode_camera_model(reader)
+        base_from_color = load_raw_episode_base_from_color(reader)
     except (ValueError, TypeError, KeyError) as exc:
         raise RawDataError(f"invalid camera geometry: {exc}") from exc
-    return frames
+    return RawEpisodePointCloudDeriver(
+        camera=camera,
+        T_xarm_base_from_color=base_from_color,
+        pointcloud=config.pointcloud,
+        table_plane_abcd=config.table_plane_abcd,
+    )
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
@@ -91,30 +91,33 @@ def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
 
 def _iter_rgb_frames(reader):
     try:
-        yield from reader.iter_camera_frames("rgb")
+        yield from reader.iter_rgb_frames()
     except (ValueError, IndexError, EOFError) as exc:
         raise RawDataError(f"{reader.path / 'rgb.mp4'}: invalid RGB video: {exc}") from exc
 
 
 def iter_canonical_blocks(
-    reader: EpisodeReader, config: ProcessingConfig, *, chunk_frames: int
+    reader: EpisodeReader, config: ProcessingConfig, *,
+    pointcloud_deriver: RawEpisodePointCloudDeriver, chunk_frames: int,
 ):
-    """Convert a prevalidated episode without repairing or resampling rows."""
-    pointcloud_deriver = RawEpisodePointCloudDeriver(
-        camera=load_raw_episode_camera_model(reader),
-        T_xarm_base_from_color=load_raw_episode_base_from_color(reader),
-        pointcloud=config.pointcloud,
-        table_plane_abcd=config.table_plane_abcd,
-    )
+    """Check and convert each Raw block without repairing or resampling rows."""
     height, width = int(reader.meta["camera_color_height"]), int(reader.meta["camera_color_width"])
     hand_fk = HandKinematics(str(XHAND_RIGHT_URDF_PATH), list(config.fingertip_link_names))
     images = _iter_rgb_frames(reader)
     for start in range(0, reader.num_frames, chunk_frames):
         end = min(reader.num_frames, start + chunk_frames)
-        arm = np.asarray(reader["arm_qpos"][start:end], dtype=np.float64)
-        hand = np.asarray(reader["hand_qpos"][start:end], dtype=np.float64)
-        arm_action = np.asarray(reader["action_arm_joint_target"][start:end], dtype=np.float64)
-        hand_action = np.asarray(reader["action_hand_joint_target"][start:end], dtype=np.float64)
+        raw = {
+            name: reader[name][start:end]
+            for name in DATASET_SPECS if name not in ("timestamp", "dispatch_status")
+        }
+        for name, values in raw.items():
+            if np.issubdtype(values.dtype, np.floating):
+                valid = np.isfinite(values).reshape(len(values), -1).all(axis=1)
+                if not valid.all():
+                    row = start + int(np.flatnonzero(~valid)[0])
+                    raise RawDataError(f"Raw {name}: nonfinite values at row {row}")
+        arm, hand = raw["arm_qpos"], raw["hand_qpos"]
+        arm_action, hand_action = raw["action_arm_joint_target"], raw["action_hand_joint_target"]
         poses = compute_eef_pose_history_xarm_base(arm)
         action_poses = compute_eef_pose_history_xarm_base(arm_action)
         tips = compute_fingertip_history_xarm_base(
@@ -129,11 +132,11 @@ def iter_canonical_blocks(
             "action_ee": np.concatenate((action_poses, hand_action), axis=1).astype(np.float32),
             "eef_pose": poses.astype(np.float32),
             "fingertip_points": tips.astype(np.float32),
-            "contact_force": np.asarray(reader["hand_contact"][start:end], dtype=np.float32),
-            "tactile_force": np.asarray(reader["hand_tactile_force"][start:end], dtype=np.float32),
+            "contact_force": raw["hand_contact"],
+            "tactile_force": raw["hand_tactile_force"],
         }
         for name in ("arm_qvel", "arm_effort", "hand_current"):
-            block[name] = np.asarray(reader[name][start:end], dtype=np.float32)
+            block[name] = raw[name].astype(np.float32)
         rgb, depth, clouds = [], [], []
         for index in range(start, end):
             image = next(images, None)

@@ -42,18 +42,17 @@ _IK_WARNING_INTERVAL_S = 1.0
 _BOUNDARY_WARN_INTERVAL_S = 2.0
 
 
-def read_arm_state_dict(robot):
+def read_arm_state_dict(robot) -> dict[str, Any]:
+    """Project the required arm snapshot; SDK failures propagate from read_state."""
     state = robot.read_state().arm
-    return (
-        {name: state[name][0].copy() for name in state.dtype.names} if state is not None else None
-    )
+    return {name: state[name][0].copy() for name in state.dtype.names}
 
 
 def read_initial_arm(runtime: ExperimentConfig, robot) -> dict[str, Any] | None:
     deadline_s = time.monotonic() + float(runtime.arm.homing.convergence_timeout_s)
     while time.monotonic() < deadline_s:
         state = read_arm_state_dict(robot)
-        if state is not None and sample_is_fresh(
+        if sample_is_fresh(
             state["timestamp_ns"], runtime.arm.feedback_max_age_s
         ):
             return state
@@ -201,7 +200,7 @@ def run_calibration_motion_tick(
     if (
         shared.error_state
         or shared.estop_request
-        or not shared.sensors.is_running.value
+        or not shared.running
         or safety_state not in (int(SafetyState.ARMED), int(SafetyState.RUNNING))
     ):
         state.command_qpos = None

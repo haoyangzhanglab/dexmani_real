@@ -207,16 +207,12 @@ class EpisodeReader:
     def dt(self) -> float:
         return 1.0 / self._control_hz
 
-    def _decoder(self):
+    def iter_rgb_frames(self) -> Iterator[np.ndarray]:
+        """Decode RGB in HDF5 row order; sampling times come from Raw ``timestamp``."""
         self.require_fields("rgb")
         if self._rgb_decoder is None:
             self._rgb_decoder = VideoDecoder(self._rgb_path)
-        return self._rgb_decoder
-
-    def iter_camera_frames(self, key: str) -> Iterator[np.ndarray]:
-        if key != "rgb":
-            raise ValueError("iter_camera_frames supports only MP4-backed RGB")
-        yield from self._decoder().iter_frames()
+        yield from self._rgb_decoder.iter_frames()
 
     def close(self) -> None:
         self._datasets.clear()

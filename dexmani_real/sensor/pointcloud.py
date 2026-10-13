@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import cv2
 import numpy as np
@@ -14,20 +14,18 @@ from scipy.sparse import coo_matrix  # type: ignore[import-untyped]
 from scipy.sparse.csgraph import connected_components  # type: ignore[import-untyped]
 from scipy.spatial import cKDTree  # type: ignore[import-untyped]
 
-from dexmani_real.config.pointcloud import (
-    PointCloudConfig,
-)
 from dexmani_real.sensor.camera.geometry import (
     CameraIntrinsics,
     RGBDGeometry,
     validate_aligned_depth_distortion,
 )
-from dexmani_real.utils.geometry import validate_rigid_transform
+
+if TYPE_CHECKING:
+    from dexmani_real.config.pointcloud import PointCloudConfig
 
 _KERNEL_3X3 = np.ones((3, 3), dtype=np.uint8)
 
 __all__ = [
-    "PointCloudConfig",
     "build_raw_point_cloud",
     "build_point_cloud",
     "aligned_depth_points_in_base",
@@ -209,10 +207,9 @@ def _deproject_depth(
 
 
 def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
-    matrix = validate_rigid_transform(transform)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("points must have shape [N,3]")
-    return (points @ matrix[:3, :3].T + matrix[:3, 3]).astype(np.float32)
+    return (points @ transform[:3, :3].T + transform[:3, 3]).astype(np.float32)
 
 
 def _table_height_hysteresis_keep_mask(
@@ -271,12 +268,10 @@ def _table_keep_mask(
         raise ValueError("depth and valid mask must match depth intrinsics")
     plane = np.asarray(table_plane_abcd, dtype=np.float64)
     norm = np.linalg.norm(plane[:3])
-    if norm <= 0.0 or plane[2] / norm <= 0.0:
-        raise ValueError("table plane must have an upward non-zero normal")
     plane /= norm
 
     # Evaluate the base-frame table plane on color-camera rays before allocating 3-D points.
-    plane_color = validate_rigid_transform(T_xarm_base_from_color).T @ plane
+    plane_color = T_xarm_base_from_color.T @ plane
     rows, columns = np.nonzero(valid)
     plane_normal_color = tuple(float(value) for value in plane_color[:3])
     ray_plane_factors = _ray_plane_factors(intrinsics, plane_normal_color)
@@ -466,10 +461,7 @@ def aligned_depth_points_in_base(
     T_xarm_base_from_color: np.ndarray,
     config: PointCloudConfig,
 ) -> np.ndarray:
-    """Return aligned supported points in xArm-base for table calibration."""
-    if not isinstance(config, PointCloudConfig):
-        raise TypeError("config must be a PointCloudConfig")
-    config.validate()
+    """Return table-calibration points using configuration/extrinsics validated at setup."""
     depth_m, valid = _depth_valid_mask(depth_raw, depth_scale_m=depth_scale_m, config=config)
     trusted = _reject_flying_depth(depth_m, valid, config)
     if not np.any(trusted):
@@ -486,7 +478,7 @@ def build_raw_point_cloud(
     geometry: RGBDGeometry,
     T_xarm_base_from_color: np.ndarray,
 ) -> np.ndarray | None:
-    """Return all finite nonzero aligned depth/color points for diagnosis, without production filtering."""
+    """Return diagnostic points using extrinsics validated when loading calibration."""
     _validate_color(color, geometry)
     if depth_raw.ndim != 2 or depth_raw.dtype != np.uint16:
         raise ValueError("depth_raw must be a uint16 [H,W] frame")
@@ -512,16 +504,10 @@ def build_point_cloud(
     table_plane_abcd: tuple[float, float, float, float] | None,
     config: PointCloudConfig,
 ) -> np.ndarray | None:
-    """Build aligned depth/color ``float32[num_points,6]`` in xArm-base frame."""
-    if not isinstance(config, PointCloudConfig):
-        raise TypeError("config must be a PointCloudConfig")
-    config.validate()
+    """Build ``float32[num_points,6]`` with static inputs validated at session/episode setup."""
     if config.remove_table:
         if table_plane_abcd is None:
             raise ValueError("remove_table=True requires a current calibrated table plane")
-        plane = np.asarray(table_plane_abcd, dtype=np.float64)
-        if plane.shape != (4,) or not np.isfinite(plane).all() or plane[2] <= 0:
-            raise ValueError("table plane must be finite with an upward normal")
     else:
         table_plane_abcd = None
     _validate_color(color, geometry)

@@ -85,6 +85,26 @@ class RawEpisodePointCloudDeriver:
     pointcloud: PointCloudConfig
     table_plane_abcd: tuple[float, float, float, float] | None
 
+    def __post_init__(self) -> None:
+        self.pointcloud.validate()
+        transform = validate_rigid_transform(
+            self.T_xarm_base_from_color, label="T_xarm_base_from_color"
+        )
+        transform.setflags(write=False)
+        object.__setattr__(self, "T_xarm_base_from_color", transform)
+        if not self.pointcloud.remove_table:
+            object.__setattr__(self, "table_plane_abcd", None)
+        elif self.table_plane_abcd is None:
+            raise ValueError("remove_table=True requires an explicit table_plane_abcd")
+        else:
+            plane = tuple(float(value) for value in self.table_plane_abcd)
+            if len(plane) != 4 or not np.isfinite(plane).all() or plane[2] <= 0:
+                raise ValueError("table plane must be finite with an upward normal")
+            norm = np.linalg.norm(plane[:3])
+            if norm <= 0.0 or plane[2] / norm <= 0.0:
+                raise ValueError("table plane must have an upward non-zero normal")
+            object.__setattr__(self, "table_plane_abcd", plane)
+
     def derive(self, depth: np.ndarray, rgb: np.ndarray) -> np.ndarray | None:
         """Derive ``float32[N,6]`` from same-row aligned depth/RGB arrays without modifying them."""
         return build_point_cloud(

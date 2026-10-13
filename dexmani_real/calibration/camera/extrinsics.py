@@ -41,34 +41,20 @@ def _pose_to_matrix(position: list[float], orientation: list[float]) -> np.ndarr
 @dataclass(frozen=True)
 class CameraExtrinsicsEntry:
     serial: str
-    type: str
-    T_world_camera: np.ndarray | None = None
-    T_eef_camera: np.ndarray | None = None
+    T_world_camera: np.ndarray
 
     def __post_init__(self) -> None:
         if not isinstance(self.serial, str) or not self.serial.strip():
             raise ValueError("camera serial must be a non-empty string")
-        if self.type not in ("eye_to_hand", "eye_in_hand"):
-            raise ValueError(
-                f"camera_type must be 'eye_to_hand' or 'eye_in_hand', got '{self.type}'"
-            )
-        if self.type == "eye_to_hand" and self.T_world_camera is None:
-            raise ValueError("eye_to_hand camera requires T_world_camera")
-        if self.type == "eye_in_hand" and self.T_eef_camera is None:
-            raise ValueError("eye_in_hand camera requires T_eef_camera")
-        for name in ("T_world_camera", "T_eef_camera"):
-            transform = getattr(self, name)
-            if transform is None:
-                continue
-            owned = validate_rigid_transform(transform, label=name)
-            owned.setflags(write=False)
-            object.__setattr__(self, name, owned)
+        owned = validate_rigid_transform(self.T_world_camera, label="T_world_camera")
+        owned.setflags(write=False)
+        object.__setattr__(self, "T_world_camera", owned)
 
     def __reduce__(self) -> tuple[object, tuple[object, ...]]:
         """Re-run validation and restore read-only arrays after process spawn."""
         return (
             type(self),
-            (self.serial, self.type, self.T_world_camera, self.T_eef_camera),
+            (self.serial, self.T_world_camera),
         )
 
 
@@ -101,16 +87,13 @@ class CameraExtrinsics:
                 raise ValueError(
                     f"camera calibration entry {cam_name!r} requires pose.position and pose.orientation"
                 )
+            if cam["type"] != "eye_to_hand":
+                raise ValueError(f"camera calibration entry {cam_name!r} must be eye_to_hand")
             T = _pose_to_matrix(pose["position"], pose["orientation"])
-            camera_type = cam["type"]
-            T_world_camera = T if camera_type == "eye_to_hand" else None
-            T_eef_camera = T if camera_type == "eye_in_hand" else None
 
             entry = CameraExtrinsicsEntry(
                 serial=cam["serial"],
-                type=camera_type,
-                T_world_camera=T_world_camera,
-                T_eef_camera=T_eef_camera,
+                T_world_camera=T,
             )
             if any(existing.serial == entry.serial for existing in self._entries.values()):
                 raise ValueError(
@@ -119,50 +102,25 @@ class CameraExtrinsics:
             self._entries[cam_name] = entry
 
     def resolve_name_by_serial(self, serial: str) -> str:
-        """Resolve exactly one calibration by connected serial; otherwise raise KeyError."""
-        matches = [n for n, e in self._entries.items() if e.serial == serial]
-        if not matches:
-            known = {n: e.serial for n, e in self._entries.items()}
-            raise KeyError(
-                f"No camera in {self.calib_path.name} has serial '{serial}'. Known: {known}"
-            )
-        if len(matches) > 1:
-            raise KeyError(f"Multiple cameras share serial '{serial}': {matches}")
-        return matches[0]
+        """Bind a connected device to a calibration; serials are unique at load."""
+        for name, entry in self._entries.items():
+            if entry.serial == serial:
+                return name
+        known = {name: entry.serial for name, entry in self._entries.items()}
+        raise KeyError(
+            f"No camera in {self.calib_path.name} has serial '{serial}'. Known: {known}"
+        )
 
-    def verify_serial(self, cam_name: str, actual_serial: str) -> None:
-        """Raise ValueError if the named calibration belongs to another camera serial."""
-        entry = self._entries[cam_name]
-        if entry.serial != actual_serial:
-            raise ValueError(
-                f"Camera calibration mismatch: entry '{cam_name}' is for serial "
-                f"'{entry.serial}', but the connected camera is '{actual_serial}'. "
-                f"Fix cameras.json or select by serial (resolve_name_by_serial)."
-            )
+    def get_extrinsics(self, cam_name: str) -> np.ndarray:
+        """Return a copy of the fixed (4,4) camera pose in xArm base."""
+        return self._entries[cam_name].T_world_camera.copy()
 
-    def get_extrinsics(self, cam_name: str, T_base_eef: np.ndarray | None = None) -> np.ndarray:
-        """Return the (4,4) camera pose in xArm base for eye-to-hand calibration.
-        Eye-in-hand uses the supplied T_base_eef @ T_eef_camera in the caller's base frame.
-        """
-        entry = self._entries[cam_name]
-        if entry.type == "eye_to_hand":
-            return entry.T_world_camera.copy()  # type: ignore[union-attr]
-        if T_base_eef is None:
-            raise ValueError(
-                f"Camera '{cam_name}' is eye_in_hand; T_base_eef (4,4 FK matrix) is required"
-            )
-        return T_base_eef @ entry.T_eef_camera
-
-    def get_entry(
-        self, cam_name: str, expected_serial: str | None = None
-    ) -> CameraExtrinsicsEntry:
-        """Return the shared validated entry with its owned, read-only transforms."""
-        if expected_serial is not None:
-            self.verify_serial(cam_name, expected_serial)
+    def get_entry(self, cam_name: str) -> CameraExtrinsicsEntry:
+        """Return a named fixed calibration with its owned, read-only transform."""
         return self._entries[cam_name]
 
     def __repr__(self) -> str:
-        cameras = ", ".join(f"{n} ({e.type}, {e.serial})" for n, e in self._entries.items())
+        cameras = ", ".join(f"{n} ({e.serial})" for n, e in self._entries.items())
         return f"CameraExtrinsics({cameras})"
 
 

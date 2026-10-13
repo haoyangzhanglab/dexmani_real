@@ -63,9 +63,8 @@ def policy_observation_issue(row, fields):
 
 
 def build_policy_observation(rows, policy_info, *, kinematics=None):
+    """Stack frozen rows already admitted by policy_observation_issue; validate new numerical transforms."""
     requested = set(policy_info.observation_fields)
-    if not rows or any(row.hand is None for row in rows):
-        return None
     arrays = {}
     if requested & {"joint_state", "eef_pose", "fingertip_points"}:
         joint = np.stack(
@@ -74,27 +73,11 @@ def build_policy_observation(rows, policy_info, *, kinematics=None):
         arrays["joint_state"] = joint
     for name, field in (("contact_force", "tactile_aggregate"), ("tactile_force", "tactile_dense")):
         if name in requested:
-            arrays[name] = np.stack([r.hand[field][0] for r in rows]).astype(np.float32)
+            arrays[name] = np.stack([r.hand[field][0] for r in rows])
     if "point_cloud" in requested:
-        if any(r.point_cloud is None for r in rows):
-            return None
         arrays["point_cloud"] = np.stack([r.point_cloud for r in rows])
     if "rgb" in requested:
-        if any(r.camera is None for r in rows):
-            return None
-        images = [r.camera["rgb"] for r in rows]
-        if any(
-            not isinstance(image, np.ndarray)
-            or image.dtype != np.uint8
-            or image.ndim != 3
-            or image.shape[2] != 3
-            or min(image.shape[:2]) <= 0
-            for image in images
-        ):
-            raise ValueError("rgb must be raw uint8 HWC with three channels")
-        if any(image.shape != images[0].shape for image in images):
-            raise ValueError("rgb history must have stackable raw image shapes")
-        arrays["rgb"] = np.stack(images)
+        arrays["rgb"] = np.stack([r.camera["rgb"] for r in rows])
     if requested & {"eef_pose", "fingertip_points"}:
         arm_fk, hand_fk, cfg = kinematics.arm_fk, kinematics.hand_fk, kinematics.mount
         poses = compute_eef_pose_history_xarm_base(joint[:, :7], arm_fk=arm_fk)
@@ -112,9 +95,7 @@ def build_policy_observation(rows, policy_info, *, kinematics=None):
     result = {}
     for name in policy_info.observation_fields:
         values = np.ascontiguousarray(arrays[name])
-        if values.dtype != np.uint8 and not np.isfinite(values).all():
-            if name in {"contact_force", "tactile_force"}:
-                return None
+        if name in {"joint_state", "eef_pose", "fingertip_points"} and not np.isfinite(values).all():
             raise ValueError(f"Nonfinite policy observation {name}")
         result[name] = values
     return result

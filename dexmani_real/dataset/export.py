@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import tempfile
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,19 +76,39 @@ def export_raw_to_zarr(
         raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {target}")
     if any(p.suffix == ".zarr" and p.exists() for p in target.parents):
         raise ValueError("output must not be inside an existing Zarr store")
-    accepted, rejected, excluded = _select_episodes(source, exclude)
+    selected, excluded = _select_episodes(source, exclude)
+    rejected = {}
     staging = root = data = None
     first_attrs = first_tails = None
     ends, offset = [], 0
     revision = uuid.uuid4().hex
     episode_ids = []
     try:
-        for index, episode in enumerate(accepted):
+        for index, episode in enumerate(selected):
             if progress_callback:
-                progress_callback(index, len(accepted))
-            with EpisodeReader(episode) as reader:
+                progress_callback(index, len(selected))
+            with ExitStack() as resources:
+                try:
+                    for name in ("data.h5", "rgb.mp4"):
+                        try:
+                            (episode / name).stat()
+                        except FileNotFoundError as exc:
+                            raise RawDataError(f"missing required file: {name}") from exc
+                    if not h5py.is_hdf5(episode / "data.h5"):
+                        raise RawDataError("data.h5 is not an HDF5 file")
+                    reader = resources.enter_context(EpisodeReader(episode))
+                    pointcloud_deriver = validate_export_episode(reader, processing)
+                except ValueError as exc:
+                    rejected[episode.name] = str(exc)
+                    logger.warning("Rejected %s: %s", episode.name, exc)
+                    continue
                 frames = reader.num_frames
-                task = validate_task_identity(reader.meta["task_label"])
+                task = reader.meta["task_label"]
+                incompatibility = None
+                try:
+                    task = validate_task_identity(task)
+                except (TypeError, ValueError) as exc:
+                    incompatibility = f"{episode.name}: {exc}"
                 specs = canonical_array_specs(
                     frames,
                     processing.pointcloud.num_points,
@@ -110,39 +131,47 @@ def export_raw_to_zarr(
                     fingertip_link_names=list(processing.fingertip_link_names),
                 )
                 # Task/depth scale describe this cache; dt defines training/deployment timing.
-                if first_attrs is not None:
+                if first_attrs is not None and incompatibility is None:
                     if task != first_attrs["task_name"] or not np.isclose(
                         reader.dt, first_attrs["dt"], rtol=0, atol=1e-12
                     ):
-                        raise ValueError(
+                        incompatibility = (
                             f"{episode.name}: one canonical store requires uniform task and dt"
                         )
-                    if attrs["depth_scale_m_per_unit"] != first_attrs["depth_scale_m_per_unit"]:
-                        raise ValueError(f"{episode.name}: depth_scale_m_per_unit must be uniform")
-                    for key in specs:
-                        if tails[key] != first_tails[key]:
-                            raise ValueError(f"{episode.name}: incompatible {key} shape or dtype")
+                    elif attrs["depth_scale_m_per_unit"] != first_attrs["depth_scale_m_per_unit"]:
+                        incompatibility = f"{episode.name}: depth_scale_m_per_unit must be uniform"
+                    else:
+                        for key in specs:
+                            if tails[key] != first_tails[key]:
+                                incompatibility = f"{episode.name}: incompatible {key} shape or dtype"
+                                break
                 row_bytes = sum(
                     int(np.prod(tail)) * dtype.itemsize for tail, dtype in tails.values()
                 )
                 chunk = min(config.chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes))
-                if root is None:
-                    first_attrs, first_tails = attrs, tails
-                    if staging is None:
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        staging = Path(
-                            tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
-                        )
-                    root, data = _create_store(
-                        staging, attrs, revision, tails, chunk, config
-                    )
                 try:
-                    count = _append_episode(
-                        reader, processing, data, tails, offset, frames, chunk
+                    blocks = iter_canonical_blocks(
+                        reader, processing, pointcloud_deriver=pointcloud_deriver, chunk_frames=chunk
                     )
+                    if incompatibility is not None:
+                        # Invalid evidence is rejected even when its metadata differs from the cache.
+                        _consume_episode(blocks, None, tails, offset, frames)
+                        raise ValueError(incompatibility)
+                    if root is None:
+                        first_attrs, first_tails = attrs, tails
+                        if staging is None:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            staging = Path(
+                                tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
+                            )
+                        root, data = _create_store(
+                            staging, attrs, revision, tails, chunk, config
+                        )
+                    count = _consume_episode(blocks, data, tails, offset, frames)
                 except RawDataError as exc:
-                    for key, (tail, _) in tails.items():
-                        data[key].resize((offset, *tail))
+                    if incompatibility is None:
+                        for key, (tail, _) in tails.items():
+                            data[key].resize((offset, *tail))
                     rejected[episode.name] = str(exc)
                     logger.warning("Rejected %s: %s", episode.name, exc)
                     if offset == 0:
@@ -162,7 +191,7 @@ def export_raw_to_zarr(
         atomic_publish(staging, target)
         staging = None
         if progress_callback:
-            progress_callback(len(accepted), len(accepted))
+            progress_callback(len(selected), len(selected))
         return dict(
             episode_count=len(ends),
             total_frames=offset,
@@ -187,26 +216,7 @@ def _select_episodes(source, exclude):
     selected = [ep for ep in episodes if ep.name not in excluded]
     if not selected:
         raise ValueError("export has no selected episodes")
-    accepted, rejected = [], {}
-    for episode in selected:
-        try:
-            for name in ("data.h5", "rgb.mp4"):
-                try:
-                    (episode / name).stat()
-                except FileNotFoundError as exc:
-                    raise RawDataError(f"missing required file: {name}") from exc
-            if not h5py.is_hdf5(episode / "data.h5"):
-                raise RawDataError("data.h5 is not an HDF5 file")
-            with EpisodeReader(episode) as reader:
-                validate_export_episode(reader)
-        except ValueError as exc:
-            rejected[episode.name] = str(exc)
-            logger.warning("Rejected %s: %s", episode.name, exc)
-        else:
-            accepted.append(episode)
-    if not accepted:
-        raise ValueError(f"all {len(selected)} selected episodes were rejected; no Zarr written")
-    return accepted, rejected, excluded
+    return selected, excluded
 
 
 def _create_store(staging, attrs, revision, tails, chunk, config):
@@ -225,11 +235,13 @@ def _create_store(staging, attrs, revision, tails, chunk, config):
     return root, data
 
 
-def _append_episode(reader, processing, data, tails, offset, frames, chunk):
-    for key, (tail, _) in tails.items():
-        data[key].resize((offset + frames, *tail))
+def _consume_episode(blocks, data, tails, offset, frames):
+    """Check every converted row; append only when metadata fits the destination."""
+    if data is not None:
+        for key, (tail, _) in tails.items():
+            data[key].resize((offset + frames, *tail))
     count = 0
-    for block in iter_canonical_blocks(reader, processing, chunk_frames=chunk):
+    for block in blocks:
         rows = len(block["joint_state"])
         if block.keys() != tails.keys():
             raise ValueError("incomplete canonical modalities")
@@ -242,7 +254,8 @@ def _append_episode(reader, processing, data, tails, offset, frames, chunk):
                 if not valid.all():
                     row = count + int(np.flatnonzero(~valid)[0])
                     raise RawDataError(f"canonical {key}: nonfinite values at row {row}")
-            data[key][offset + count : offset + count + rows] = values
+            if data is not None:
+                data[key][offset + count : offset + count + rows] = values
         count += rows
     if count != frames:
         raise ValueError("transformed row count differs from Raw")

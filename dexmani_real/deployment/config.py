@@ -47,7 +47,6 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
     """Check physical capability before allocating IPC or connecting devices."""
     if not runtime.policy.hand_enabled:
         raise ValueError("Dexterous policy deployment requires hand_enabled=true")
-    control_dt_ns(info)
     names = set(info.observation_fields)
     unsupported = names - _SUPPORTED_OBSERVATION_FIELDS
     if unsupported:

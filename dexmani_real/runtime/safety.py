@@ -36,7 +36,7 @@ class RunEndReason(IntEnum):
 def _begin_motion_locked(shared):
     if (
         int(shared.safety_state) != int(SafetyState.ARMED)
-        or not shared.sensors.is_running.value
+        or not shared.running
         or shared.error_state
         or shared.estop_request
     ):
@@ -56,7 +56,7 @@ def begin_motion(shared):
 def _command_may_cross_sdk_locked(shared, *, run_id, required_safety_state=SafetyState.RUNNING):
     """Check motion authority while the caller holds motion_lock."""
     return (
-        shared.sensors.is_running.value
+        shared.running
         and not shared.error_state
         and not shared.estop_request
         and int(shared.run_id) == run_id
@@ -129,7 +129,7 @@ def request_policy_start(shared):
     with shared.motion_lock:
         if (
             int(shared.safety_state) != int(SafetyState.ARMED)
-            or not shared.sensors.is_running.value
+            or not shared.running
             or shared.error_state
             or shared.estop_request
             or shared.stop_request

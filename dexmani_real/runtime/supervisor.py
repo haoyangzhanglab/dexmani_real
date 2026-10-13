@@ -28,7 +28,7 @@ def wait_subsystem_ready(shared, process, timeout_s, *, check=None):
             or not process.is_alive()
             or shared.error_state
             or shared.estop_request
-            or not shared.sensors.is_running.value
+            or not shared.running
         ):
             return False
         if event.wait(timeout=0.05):
@@ -69,7 +69,7 @@ class RuntimeSupervisor:
         for process in dead:
             logger.error("required worker %s exited: %s", process.name, process.exitcode)
         with self.shared.motion_lock:
-            self.shared.sensors.is_running.value = False
+            self.shared.end_session()
             self.shared.error_state = True
             _revoke_motion_locked(
                 self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT

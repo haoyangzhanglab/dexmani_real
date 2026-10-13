@@ -152,7 +152,7 @@ def _wait_for_vr_tracking(shared: RuntimeState, timeout_s: float) -> bool:
 
 def _shutdown_vr_receiver(shared: RuntimeState, vr_proc: mp.Process) -> bool:
     if vr_proc.pid is None:
-        shared.sensors.is_running.value = False
+        shared.end_session()
         return shared.sensors.close()
     try:
         shutdown_clean = shutdown_processes_verified(
@@ -238,13 +238,11 @@ def main(argv: list[str] | None = None) -> int:
     shared = RuntimeState.create(
         prefix="dexmani_vr_calib", config=SensorChannelsConfig(vr=True), mp_context=ctx
     )
-    processes = [
-        ctx.Process(name="vr", target=run_vr_worker, args=(shared.sensors, vr_config), daemon=True)
-    ]
-    vr_proc = processes[0]
+    vr_proc = ctx.Process(
+        name="vr", target=run_vr_worker, args=(shared.sensors, vr_config), daemon=True
+    )
     forwards: list[np.ndarray] = []
     stale_count = 0
-    shutdown_clean = False
     try:
         vr_proc.start()
         print(

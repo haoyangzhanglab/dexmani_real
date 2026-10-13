@@ -61,11 +61,8 @@ def snapshot_recording_metadata(shared, *, collection_source, camera_calibration
     else:
         try:
             name = camera_calibration.resolve_name_by_serial(serial)
-            entry = camera_calibration.get_entry(name, expected_serial=serial)
-            if entry.type == "eye_to_hand":
-                transform = entry.T_world_camera.copy()
-            else:
-                logger.warning("Recording without static eye-to-hand extrinsics")
+            entry = camera_calibration.get_entry(name)
+            transform = entry.T_world_camera.copy()
         except (KeyError, ValueError) as exc:
             logger.warning("Recording without camera extrinsics: %s", exc)
     return dict(

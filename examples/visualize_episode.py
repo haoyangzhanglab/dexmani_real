@@ -146,7 +146,7 @@ class EpisodeVisualizer:
             )
 
             self._T = self._resolve_frame_count(max_frames)
-            self._rgb_frames = iter(self._reader.iter_camera_frames("rgb"))
+            self._rgb_frames = iter(self._reader.iter_rgb_frames())
             self._rgb = None
             self._rgb_index = -1
             meta = self._reader.meta

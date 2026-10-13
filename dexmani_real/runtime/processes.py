@@ -64,7 +64,7 @@ def stop_processes_verified(
     procs = list(processes)
     # Fence before any blocking join; record the software end if still RUNNING.
     with shared.motion_lock:
-        shared.sensors.is_running.value = False
+        shared.end_session()
         if int(shared.safety_state) == int(SafetyState.RUNNING):
             _revoke_motion_locked(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
     exits: list[_ProcessExit] = []
@@ -136,9 +136,9 @@ def shutdown_processes_verified(
     )
 
 
-def shutdown_local_runtime(robot, supervisor, *, keyboard=None, timeout_s=5.0):
-    """Stop local devices before closing resources and verified sensor IPC release."""
-    shared = supervisor.shared
+def shutdown_local_runtime(robot, supervisor=None, *, shared=None, keyboard=None, timeout_s=5.0):
+    """Close local devices; timeout_s bounds the sensor supervisor's graceful join."""
+    shared = supervisor.shared if supervisor is not None else shared
     revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
     clean = True
     for close in (
@@ -153,12 +153,24 @@ def shutdown_local_runtime(robot, supervisor, *, keyboard=None, timeout_s=5.0):
             clean = False
             shared.error_state = True
             logger.exception("local runtime cleanup failed")
-    try:
-        sensors_clean = supervisor.shutdown(graceful_timeout_s=timeout_s)
-    except Exception:
-        shared.error_state = True
-        logger.exception("sensor shutdown failed; live resources remain linked")
-        sensors_clean = False
+    if supervisor is None:
+        shared.end_session()
+        try:
+            sensors_clean = shared.sensors is None or bool(shared.sensors.close())
+        except Exception:
+            shared.error_state = True
+            logger.exception("sensor channel cleanup failed")
+            sensors_clean = False
+        if not sensors_clean:
+            shared.error_state = True
+        _finalize_shutdown_state(shared, ())
+    else:
+        try:
+            sensors_clean = supervisor.shutdown(graceful_timeout_s=timeout_s)
+        except Exception:
+            shared.error_state = True
+            logger.exception("sensor shutdown failed; live resources remain linked")
+            sensors_clean = False
     return (
         clean and sensors_clean and not shared.error_state and not shared.estop_request
     )

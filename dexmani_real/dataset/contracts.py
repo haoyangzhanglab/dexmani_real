@@ -62,6 +62,9 @@ class ProcessingConfig:
             plane = tuple(float(v) for v in self.table_plane_abcd)
             if len(plane) != 4 or not np.all(np.isfinite(plane)) or plane[2] <= 0:
                 raise ValueError("table_plane_abcd must be finite with upward normal")
+            norm = np.linalg.norm(plane[:3])
+            if norm <= 0.0 or plane[2] / norm <= 0.0:
+                raise ValueError("table_plane_abcd must have an upward non-zero normal")
             object.__setattr__(self, "table_plane_abcd", plane)
 
 

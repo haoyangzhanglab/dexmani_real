@@ -298,7 +298,6 @@ def main(argv: list[str] | None = None) -> int:
         runtime = replace(runtime, execution=resolve_execution_config(
             runtime.execution, info, args.n_action_steps
         ))
-        runtime.execution.validate(info)
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
         _safe_selector_parts(selector)
     except Exception as exc:
@@ -321,21 +320,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"策略：{args.experiment}")
-    print(
-        f"执行：{info.checkpoint_path.name} ({info.weights}) | NFE={info.inference_steps} | "
-        f"A_exec={runtime.execution.action_steps} | {runtime.execution.execution_mode} | "
-        f"{1.0 / info.control_dt_s:g} Hz"
-    )
     print(f"评估：{args.num_episodes} 轮后退出 | 每轮预算 {args.max_running_s:g} s | 输入：{', '.join(info.observation_fields)}")
     print(f"输出：{session_dir}" if session_dir else "输出：Raw 和评估摘要均关闭")
-    print("正在初始化模型和设备…", flush=True)
     try:
         from dexmani_real.deployment.session import run_policy_deployment
 
         return run_policy_deployment(
             runtime,
             policy_config,
-            True,
             max_running_s=args.max_running_s,
             num_episodes=args.num_episodes,
             recording_config=recording_config,
