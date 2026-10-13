@@ -31,7 +31,7 @@ DATASET_SPECS = {
     "arm_effort": _spec(np.float64, (7,)),
     "hand_qpos": _spec(np.float64, (12,)),
     "hand_current": _spec(np.float64, (12,)),
-    # SDK-native tactile values; invalid channels stay NaN and T only requests a sensor reset.
+    # Consumed tactile observation: SDK units, bounded previous-valid vector hold (see metadata).
     "hand_contact": _spec(np.float32, (5, 3)),
     "hand_tactile_force": _spec(np.float32, (5, 120, 3)),
     # Attempted absolute targets; dispatch preserves the outcome, not arrival.

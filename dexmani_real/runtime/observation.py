@@ -1,4 +1,4 @@
-"""One current copied observation per control step; local rows own temporal history."""
+"""One immutable observation per control step, retaining each source's host clock."""
 
 import time
 from dataclasses import dataclass
@@ -18,13 +18,20 @@ def feedback_deadline_ns(row, runtime, *, include_vr=False):
     deadlines = [int(row.arm["timestamp_ns"][0]) + int(runtime.arm.feedback_max_age_s * 1e9) + 1]
     if row.hand is not None:
         deadlines.append(
-            int(row.hand["timestamp_ns"][0]) + int(runtime.hand.feedback_max_age_s * 1e9) + 1
+            hand_feedback_time_ns(row.hand) + int(runtime.hand.feedback_max_age_s * 1e9)
         )
     if include_vr:
         deadlines.append(
             int(row.vr["recv_ts_ns"]) + int(runtime.policy.vr_mapping.stale_threshold_s * 1e9) + 1
         )
     return min(deadlines)
+
+
+def hand_feedback_time_ns(hand):
+    """Oldest required hand source, without conflating tactile age with joint time."""
+    return min(int(hand[name][0]) for name in (
+        "timestamp_ns", "tactile_aggregate_timestamp_ns", "tactile_dense_timestamp_ns",
+    ))
 
 
 def read_vr_frame(shared):
@@ -99,13 +106,10 @@ def read_observation(
 
     control_ns = time.monotonic_ns()
     state = robot.read_state()
-    if state is None:
-        return unavailable("feedback_unavailable")
     arm, hand = state.arm, state.hand if require_hand else None
     cloud_result = shared.sensors.pointcloud_ring.read_latest() if require_pointcloud else None
     if (
-        arm is None
-        or (require_hand and hand is None)
+        (require_hand and hand is None)
         or (require_pointcloud and cloud_result is None)
     ):
         return unavailable("feedback_or_pointcloud_unavailable")
@@ -126,10 +130,10 @@ def read_observation(
     now = time.monotonic_ns()
     if not sample_is_fresh(arm["timestamp_ns"][0], runtime.arm.feedback_max_age_s, now):
         return unavailable("arm_feedback_stale")
-    if hand is not None and not sample_is_fresh(
-        hand["timestamp_ns"][0], runtime.hand.feedback_max_age_s, now
-    ):
-        return unavailable("hand_feedback_stale")
+    if hand is not None:
+        hand_ns = hand_feedback_time_ns(hand)
+        if not 0 < hand_ns <= now < hand_ns + int(runtime.hand.feedback_max_age_s * 1e9):
+            return unavailable("hand_feedback_stale")
     if camera is not None and not sample_is_fresh(
         camera["timestamp_ns"], runtime.camera.max_frame_age_s, now
     ):

@@ -194,6 +194,7 @@ class TeleopRunner:
         if not self._preparation_valid():
             self._stop_capture("preparation_revoked")
             return
+        self.robot.reset_hand_feedback()
         row = read_observation(
             self.shared,
             self.runtime,

@@ -1,6 +1,6 @@
-"""Single-call XHand reads/sends; joint state must be finite and missing auxiliary data stays NaN.
-Tactile channels keep SDK-native values and independent validity; resets are explicit idle requests.
-CRC leaves delivery unconfirmed; other rejected codes raise, preserving command-delivery uncertainty.
+"""Single-call XHand reads/sends with strict joint validation and SDK status gating.
+Tactile payloads retain local NaN/Inf for bounded repair by the robot I/O owner.
+CRC reads return None; CRC sends retain unconfirmed delivery. Other rejected codes raise.
 """
 
 from __future__ import annotations
@@ -38,15 +38,8 @@ _COMMUNICATION_CRC_ERROR_CODE = 1_501_070
 _COMBINED_FORCE_UNAVAILABLE_CODE = 1_501_018
 _DISTRIBUTED_FORCE_UNAVAILABLE_CODE = 1_501_019
 _TEMPERATURE_UNAVAILABLE_CODE = 1_501_020
-READ_USABLE_CODES = frozenset(
-    {
-        0,
-        _COMBINED_FORCE_UNAVAILABLE_CODE,
-        _DISTRIBUTED_FORCE_UNAVAILABLE_CODE,
-        _TEMPERATURE_UNAVAILABLE_CODE,
-    }
-)
-SEND_ACCEPTED_CODES = frozenset(
+# These codes permit joint reads and target sends; tactile trust is checked separately.
+_NONFATAL_SDK_CODES = frozenset(
     {
         0,
         _COMBINED_FORCE_UNAVAILABLE_CODE,
@@ -70,9 +63,7 @@ _CONNECTION_HINT = {
 }
 
 
-def _error_code(error: Any) -> int | None:
-    if error is None:
-        return None
+def _error_code(error: Any) -> int:
     code = getattr(error, "error_code", -1)
     return -1 if code is None else int(code)
 
@@ -81,7 +72,7 @@ def _error_ok(error: Any) -> bool:
     return _error_code(error) == 0
 
 
-def _tactile_validity(code: int | None, *, comm_type: str) -> tuple[bool, bool]:
+def _tactile_validity(code: int, *, comm_type: str) -> tuple[bool, bool]:
     """Return (aggregate_allowed,dense_allowed) for SDK/tip-board status.
     RS485 1501019/201 drops dense only; 1501020/202 keeps both. EtherCAT rejects all nonzero tactile status.
     """
@@ -110,7 +101,7 @@ class XHandError(RuntimeError):
 
 @dataclass
 class XHandState:
-    """One SDK read; unavailable tactile channels contain NaN."""
+    """One trustworthy joint read; tactile may contain NaN/Inf or status-masked NaN."""
 
     qpos: np.ndarray
     current_ma: np.ndarray
@@ -222,7 +213,7 @@ class XHand:
             code = _error_code(error)
             last_error = XHandError(
                 "connect",
-                -1 if code is None else code,
+                code,
                 str(getattr(error, "error_message", "empty error object")),
             )
             self._close_control()
@@ -384,63 +375,53 @@ class XHand:
     def get_tactile_reset_metadata(self) -> dict[str, object]:
         """Snapshot this connection's last explicit reset request without reads."""
         return {
-            "hand_tactile_processing": "sdk_native",
             "hand_tactile_reset_result": "not_requested",
             **self._tactile_reset_metadata,
         }
 
     def get_state(self) -> XHandState | None:
-        """Read one fresh SDK state; unavailable tactile channels remain NaN."""
+        """One SDK read: only CRC returns None; other untrusted joint feedback raises.
+
+        Tactile status masks untrusted channels before the robot owner's bounded hold.
+        """
         if self._control is None or not self.connected_flag:
             raise RuntimeError("XHand is not connected")
-        try:
-            error, raw_state = self._control.read_state(self.cfg.device_id, True)
-        except Exception:
-            logger.warning("XHand read_state raised", exc_info=True)
-            return None
-
+        error, raw_state = self._control.read_state(self.cfg.device_id, True)
         code = _error_code(error)
+        if code == _COMMUNICATION_CRC_ERROR_CODE:
+            # Never inspect a CRC payload, even when it looks finite and well formed.
+            return None
+        if code not in _NONFATAL_SDK_CODES:
+            raise XHandError(
+                "read", code, getattr(error, "error_message", "")
+            )
         if raw_state is None:
-            logger.warning(
-                "XHand read returned no state: code=%s msg=%s",
-                code,
-                getattr(error, "error_message", ""),
-            )
-            return None
-        if code not in READ_USABLE_CODES:
-            logger.warning(
-                "XHand read failed: code=%s msg=%s",
-                code,
-                getattr(error, "error_message", ""),
-            )
-            return None
+            raise XHandError("read", code, "missing state payload")
 
         try:
             qpos, current, board_errors = self._parse_joints(raw_state)
-        except (AttributeError, TypeError, ValueError, OverflowError):
-            logger.warning("XHand joint payload invalid", exc_info=True)
-            return None
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            raise XHandError("read", code, f"invalid joint payload: {exc}") from exc
 
         # The SDK's aggregate return code can hide another board's error.
         if any(np.any(board_errors[name]) for name in ("commboard_err", "jointboard_err")):
-            logger.warning("XHand joint/communication board feedback invalid: %s", board_errors)
-            return None
+            raise XHandError("read", code, f"joint/communication board fault: {board_errors}")
 
         tactile_dense = np.full(HAND_TACTILE_FORCE_SHAPE, np.nan, dtype=np.float64)
         tactile_aggregate = np.full(HAND_TACTILE_SUM_SHAPE, np.nan, dtype=np.float64)
         aggregate_allowed, dense_allowed = _tactile_validity(code, comm_type=self.cfg.comm_type)
         if not aggregate_allowed or not dense_allowed:
-            logger.warning("XHand tactile read incomplete: code=%s", code)
+            logger.debug("XHand tactile read incomplete: code=%s", code)
         if aggregate_allowed:
             try:
                 tactile_aggregate = self._parse_tactile_aggregate(raw_state)
             except (AttributeError, TypeError, ValueError, OverflowError):
-                logger.warning("XHand tactile aggregate payload invalid", exc_info=True)
+                logger.debug("XHand tactile aggregate payload invalid", exc_info=True)
         if dense_allowed:
             try:
                 tactile_dense = self._parse_tactile_dense(raw_state)
             except (AttributeError, TypeError, ValueError, OverflowError):
-                logger.warning("XHand tactile dense payload invalid", exc_info=True)
+                logger.debug("XHand tactile dense payload invalid", exc_info=True)
         for sensor_index, finger_id in enumerate(XHAND_TACTILE_SENSOR_FINGER_IDS):
             aggregate_allowed, dense_allowed = _tactile_validity(
                 int(board_errors["tipboard_err"][finger_id]), comm_type=self.cfg.comm_type
@@ -505,13 +486,17 @@ class XHand:
             now_ns = time.monotonic_ns()
             fresh = (
                 0 < int(timestamp_ns) <= now_ns
-                and now_ns - int(timestamp_ns) <= int(self.cfg.feedback_max_age_s * 1e9)
+                and now_ns - int(timestamp_ns) < int(self.cfg.feedback_max_age_s * 1e9)
             )
             status = self.hold_current(qpos) if qpos is not None and fresh else self.set_passive()
             if status == DispatchStatus.ACCEPTED:
+                if attempt:
+                    logger.info("XHand stop SDK response recovered after %d attempts", attempt + 1)
                 return
             if status != DispatchStatus.CRC_UNCONFIRMED:
                 raise RuntimeError(f"XHand stop rejected: {status.name}")
+            if attempt == 0:
+                logger.warning("XHand stop CRC; retrying within the stop deadline")
             remaining = deadline - time.monotonic()
             if remaining <= 0 or attempt + 1 == _STOP_MAX_ATTEMPTS:
                 break
@@ -523,13 +508,8 @@ class XHand:
 
         code = _error_code(error)
         if code == _COMMUNICATION_CRC_ERROR_CODE:
-            logger.warning(
-                "XHand send CRC warning: code=%s msg=%s; delivery unconfirmed",
-                code,
-                getattr(error, "error_message", ""),
-            )
             return DispatchStatus.CRC_UNCONFIRMED
-        if code not in SEND_ACCEPTED_CODES:
+        if code not in _NONFATAL_SDK_CODES:
             # 1501035 is overcurrent, not contact; termination retains UNKNOWN delivery and the SDK error.
             raise XHandError("send", code, getattr(error, "error_message", ""))
         return DispatchStatus.ACCEPTED
@@ -599,8 +579,8 @@ class XHand:
              for sensor in state.sensor_data],
             dtype=np.float64,
         )
-        if force_aggregate.shape != HAND_TACTILE_SUM_SHAPE or not np.isfinite(force_aggregate).all():
-            raise ValueError("aggregate tactile must be finite [5,3]")
+        if force_aggregate.shape != HAND_TACTILE_SUM_SHAPE:
+            raise ValueError("aggregate tactile must have shape [5,3]")
         return force_aggregate
 
     @staticmethod
@@ -611,6 +591,6 @@ class XHand:
              for sensor in state.sensor_data],
             dtype=np.float64,
         )
-        if tactile_dense.shape != HAND_TACTILE_FORCE_SHAPE or not np.isfinite(tactile_dense).all():
-            raise ValueError("dense tactile must be finite [5,120,3]")
+        if tactile_dense.shape != HAND_TACTILE_FORCE_SHAPE:
+            raise ValueError("dense tactile must have shape [5,120,3]")
         return tactile_dense

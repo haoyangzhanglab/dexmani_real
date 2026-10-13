@@ -50,7 +50,7 @@ class _QueryTiming:
 
 
 def snapshot_recording_metadata(shared, *, collection_source, camera_calibration, hand):
-    """Snapshot camera geometry and the last hardware tare without device reads."""
+    """Snapshot geometry, tactile hold semantics and the last reset request without I/O."""
     serial = shared.sensors.camera_serial.value.decode("utf-8")
     if not serial.strip():
         raise ValueError("recording START requires a nonempty camera serial")
@@ -75,7 +75,11 @@ def snapshot_recording_metadata(shared, *, collection_source, camera_calibration
         camera_geometry=geometry,
         camera_T_xarm_base_from_color=transform,
         depth_scale=float(shared.sensors.camera_depth_scale.value),
-        tactile_reset_metadata=hand.get_tactile_reset_metadata() if hand is not None else {},
+        tactile_reset_metadata={
+            **hand.get_tactile_reset_metadata(),
+            "hand_tactile_processing": "sdk_native_bounded_previous_valid_vector_hold",
+            "hand_tactile_hold_max_age_s": float(hand.cfg.feedback_max_age_s),
+        } if hand is not None else {},
     )
 
 

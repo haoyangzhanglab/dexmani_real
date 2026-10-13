@@ -121,6 +121,7 @@ def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s,
             if step == steps:
                 final_stamp = stamp
                 last_sample = stamp
+                robot.end_hand_send_interval()
             step += 1
             deadline = stamp / 1e9 + period
             continue

@@ -131,7 +131,8 @@ def policy_sources(row, fields):
         elif name == "eef_pose":
             times = (arm,)
         elif name in {"contact_force", "tactile_force"}:
-            times = (hand,)
+            channel = "aggregate" if name == "contact_force" else "dense"
+            times = (int(row.hand[f"tactile_{channel}_timestamp_ns"][0]),)
         elif name == "point_cloud":
             times = (row.pointcloud_timestamp_ns,)
         elif name == "rgb":

@@ -349,6 +349,7 @@ class PolicyRunner:
                 ):
                     return
                 epoch = int(self.shared.run_id)
+            self.robot.reset_hand_feedback()
             if self._start_observation() is None:
                 if self.results is not None:
                     self.results.begin_episode()
@@ -806,6 +807,7 @@ class PolicyRunner:
             if self.run_id is None:
                 return
             if self.plan is None:
+                self.robot.end_hand_send_interval()
                 if self.wait_started_ns is None:
                     self.wait_started_ns = now
                 if rows and self.query is None and self.model.future is None:

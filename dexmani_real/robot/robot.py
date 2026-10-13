@@ -23,20 +23,25 @@ from dexmani_real.runtime.safety import (
 logger = logging.getLogger(__name__)
 
 
+def _update_tactile_cache(raw, values, valid_ns, now_ns):
+    """Hold whole three-axis vectors; only finite new vectors advance their clocks."""
+    # Validate in the observation dtype too: finite float64 may overflow float32.
+    with np.errstate(over="ignore", invalid="ignore"):
+        raw = np.asarray(raw, dtype=values.dtype)
+    if raw.shape != values.shape:
+        raise RuntimeError(f"invalid tactile shape: {raw.shape}, expected {values.shape}")
+    valid = np.isfinite(raw).all(axis=-1)
+    np.copyto(values, raw, where=valid[..., None])
+    np.copyto(valid_ns, now_ns, where=valid)
+    return not valid.all()
+
+
 @dataclass(frozen=True)
 class DispatchResult:
     arm: DispatchStatus = DispatchStatus.NOT_CALLED
     hand: DispatchStatus = DispatchStatus.NOT_CALLED
     arm_code: int | None = None
     timestamp_ns: int = 0  # host dispatch completion, never arrival
-
-    @property
-    def continued(self):
-        return (
-            self.arm not in (DispatchStatus.REJECTED, DispatchStatus.UNKNOWN)
-            and self.hand not in (DispatchStatus.REJECTED, DispatchStatus.UNKNOWN)
-            and (self.arm != DispatchStatus.NOT_CALLED or self.hand != DispatchStatus.NOT_CALLED)
-        )
 
 
 class DispatchError(RuntimeError):
@@ -83,7 +88,11 @@ class DexManiRobot:
         self._motion_active = False
         self._hand_stop_pending = False
         self._last_hand = None
-        self._hand_failure_started = None
+        self._tactile_cache = {}
+        self._tactile_held = set()
+        self._hand_read_crc = False
+        self._hand_initializing_until_ns = None
+        self._hand_send_failure_started_ns = None
         self._previous_errors = None
         self._idle_next_ns = 0
 
@@ -117,14 +126,12 @@ class DexManiRobot:
                 self.hand = self._hand_factory(self.runtime.hand)
                 self.hand.connect()
             self._connected = True
-            deadline = time.monotonic() + self.runtime.hand.state_read_failure_timeout_s
+            self.reset_hand_feedback()
             while True:
                 self.check()
                 state = self.read_state()
                 if self.hand is None or state.hand is not None:
                     break
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("initial hand feedback unavailable")
                 time.sleep(0.01)
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
@@ -158,8 +165,30 @@ class DexManiRobot:
                 or self.shared.quit_requested
             )
 
+        try:
+            return self.hand.reset_tactile_sensors(cancel_requested=cancelled)
+        finally:
+            # Even a partial/cancelled reset invalidates the previous tactile baseline.
+            self.reset_hand_feedback()
+
+    def reset_hand_feedback(self):
+        """Reacquire a session's initial values without connecting, resetting or moving hardware."""
+        self._check_owner()
+        if int(self.shared.safety_state) == int(SafetyState.RUNNING):
+            raise RuntimeError("cannot clear hand feedback during motion")
         self._last_hand = None
-        return self.hand.reset_tactile_sensors(cancel_requested=cancelled)
+        self._tactile_cache = {
+            name: (
+                np.full(HAND_STATE_DTYPE[f"tactile_{name}"].shape, np.nan, dtype=np.float32),
+                np.zeros(HAND_STATE_DTYPE[f"tactile_{name}"].shape[:-1], dtype=np.int64),
+            )
+            for name in ("aggregate", "dense")
+        }
+        self._tactile_held.clear()
+        self._hand_read_crc = False
+        self._hand_initializing_until_ns = (
+            time.monotonic_ns() + int(self.runtime.hand.initial_state_timeout_s * 1e9)
+        )
 
     def arm_feedback(self, qpos, qvel, effort):
         if any(np.shape(x) != (7,) or not np.isfinite(x).all() for x in (qpos, qvel)):
@@ -175,18 +204,19 @@ class DexManiRobot:
     def _read_hand(self):
         if self.hand is None:
             return None
-        state = self.hand.get_state()
-        if state is None:
-            now = time.monotonic()
-            if self._hand_failure_started is None:
-                self._hand_failure_started = now
-            if now - self._hand_failure_started >= self.runtime.hand.state_read_failure_timeout_s:
-                raise RuntimeError("hand joint feedback timed out")
-            # Cached feedback is only for stop/hold, never a current control observation.
-            return None
-        self._hand_failure_started = None
         if not self.hand.is_connected:
             raise RuntimeError("XHand disconnected")
+        state = self.hand.get_state()
+        now_ns = time.monotonic_ns()
+        if state is None:
+            if not self._hand_read_crc:
+                logger.warning("XHand read CRC; holding previous feedback within age budget")
+            self._hand_read_crc = True
+            # Do not feed cached values back into the update function: no clock advances.
+            return self._checked_hand_feedback(now_ns)
+        if self._hand_read_crc:
+            logger.info("XHand trustworthy reads recovered")
+        self._hand_read_crc = False
         if np.shape(state.qpos) != (12,) or not np.isfinite(state.qpos).all():
             raise RuntimeError("unusable hand joint feedback")
         if np.shape(state.current_ma) != (12,):
@@ -207,11 +237,44 @@ class DexManiRobot:
         self._previous_errors = errors
         frame = np.zeros(1, dtype=HAND_STATE_DTYPE)
         frame["qpos"], frame["current"] = state.qpos, state.current_ma
-        frame["tactile_aggregate"] = state.tactile_aggregate
-        frame["tactile_dense"] = state.tactile_dense
-        frame["timestamp_ns"] = time.monotonic_ns()
+        for name, (values, valid_ns) in self._tactile_cache.items():
+            held = _update_tactile_cache(getattr(state, f"tactile_{name}"), values, valid_ns, now_ns)
+            if held and name not in self._tactile_held:
+                logger.warning("XHand tactile %s incomplete; holding previous finite vectors", name)
+                self._tactile_held.add(name)
+            elif not held and name in self._tactile_held:
+                logger.info("XHand tactile %s recovered", name)
+                self._tactile_held.remove(name)
+            # Assignment copies into an independent snapshot for recording/model workers.
+            frame[f"tactile_{name}"] = values
+            frame[f"tactile_{name}_timestamp_ns"] = valid_ns.min()
+        frame["timestamp_ns"] = now_ns
         frame.flags.writeable = False
         self._last_hand = frame
+        return self._checked_hand_feedback(now_ns)
+
+    def _checked_hand_feedback(self, now_ns):
+        frame = self._last_hand
+        max_age_ns = int(self.runtime.hand.feedback_max_age_s * 1e9)
+        issue = "hand joint feedback has no valid initial value"
+        if frame is not None:
+            issue = None
+            for name in (
+                "timestamp_ns", "tactile_aggregate_timestamp_ns", "tactile_dense_timestamp_ns",
+            ):
+                stamp = int(frame[name][0])
+                if stamp <= 0 or now_ns - stamp >= max_age_ns:
+                    issue = (
+                        f"hand {name}: no valid initial value or feedback age reached "
+                        f"{self.runtime.hand.feedback_max_age_s:.3f}s"
+                    )
+                    break
+        if issue is not None:
+            if (self._hand_initializing_until_ns is not None
+                    and now_ns < self._hand_initializing_until_ns):
+                return None
+            raise RuntimeError(issue)
+        self._hand_initializing_until_ns = None
         return frame
 
     def read_state(self):
@@ -260,6 +323,7 @@ class DexManiRobot:
                 )
 
         check_abort()
+        self.end_hand_send_interval()
         if self._arm_stopped:
             # Mode restoration changes controller state even without a target.
             self._motion_active = True
@@ -325,6 +389,7 @@ class DexManiRobot:
                 else:
                     status = self.hand.send_action(target)
                     result = replace(result, hand=status)
+                    self._check_hand_send(status)
                 if status in (DispatchStatus.REJECTED, DispatchStatus.UNKNOWN):
                     raise DispatchError(f"{name} SDK rejected target", result)
             if not self._authorized(command.run_id, state):
@@ -344,12 +409,36 @@ class DexManiRobot:
                 raise
             raise DispatchError(str(exc), result) from exc
 
+    def _check_hand_send(self, status):
+        """Bound consecutive ordinary-send CRCs without retries or readback."""
+        now_ns = time.monotonic_ns()
+        budget_ns = int(self.runtime.hand.feedback_max_age_s * 1e9)
+        if status == DispatchStatus.CRC_UNCONFIRMED:
+            if self._hand_send_failure_started_ns is None:
+                self._hand_send_failure_started_ns = now_ns
+                logger.warning("XHand send CRC; delivery unconfirmed, continuing with next target")
+            if now_ns - self._hand_send_failure_started_ns >= budget_ns:
+                self.shared.error_state = True
+                revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
+                raise RuntimeError("XHand continuous send CRC timed out; delivery remains unconfirmed")
+        elif status == DispatchStatus.ACCEPTED:
+            if self._hand_send_failure_started_ns is not None:
+                logger.info("XHand send responses recovered")
+            self._hand_send_failure_started_ns = None
+
+    def end_hand_send_interval(self):
+        """An explicit idle/WAIT is not part of a continuous ordinary-send failure."""
+        self._check_owner()
+        self._hand_send_failure_started_ns = None
+
     def send_action(self, command, *, valid_until_ns):
         return self._send(command, SafetyState.RUNNING, valid_until_ns=valid_until_ns)
 
     def send_hand_home(self, command, *, valid_until_ns):
         if command.arm_qpos is not None:
             raise ValueError("hand HOME cannot carry an arm streaming target")
+        # HOME submits once, then its caller checks measured convergence separately.
+        self.end_hand_send_interval()
         return self._send(command, SafetyState.ARMED, valid_until_ns=valid_until_ns)
 
     def home_arm(self, waypoints, target, run_id, abort_check):
@@ -397,7 +486,8 @@ class DexManiRobot:
         self._hand_stop_pending = False
 
     def stop(self):
-        self._check_owner()
+        # Stop has its own bounded retries; a later experiment starts a new send interval.
+        self.end_hand_send_interval()
         errors = []
         # A failed/interrupted stop must not advertise a clean software stop.
         unresolved_motion = self._motion_active
@@ -427,7 +517,7 @@ class DexManiRobot:
         self._motion_active = False
 
     def service_idle(self):
-        self._check_owner()
+        self.end_hand_send_interval()
         if self._motion_active and (
             self.shared.estop_request
             or self.shared.error_state

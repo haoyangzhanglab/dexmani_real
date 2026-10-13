@@ -14,6 +14,7 @@
     --n-action-steps 设置每段执行步数，默认使用策略的 n_action_steps。
     默认最多评估 20 轮，每轮按 B 开始、S 结束；Q 提前退出，--num-episodes N 修改轮数。
     --no-record / --no-results 分别关闭 Raw / 评估摘要；--output 指定输出目录。
+    prefetch_steps = d 表示：在当前动作段距离交接还剩 d 个控制步时，提前启动下一次策略推理，让推理与当前动作的执行重叠。
 
 执行模式默认 sync；CLI 执行参数优先于 --config YAML。
 RTC 使用 --execution-mode rtc，并显式设置 --prefetch-steps 和 --rtc-guidance-cap。

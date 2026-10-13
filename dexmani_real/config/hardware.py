@@ -250,8 +250,9 @@ class HandParams:
         300,
     )
 
-    feedback_max_age_s: float = 4 / 30  # host-side feedback freshness budget
-    state_read_failure_timeout_s: float = 1.0
+    # Runtime joint/tactile age and continuous ordinary-send CRC budget, monotonic time.
+    feedback_max_age_s: float = 4 / 30
+    initial_state_timeout_s: float = 1.0  # Only acquisition after connect/session start/reset.
 
     home_timeout_s: float = 2.0
     home_tolerance_deg: float = 5.0
@@ -327,10 +328,10 @@ class HandParams:
         if not np.isfinite(self.feedback_max_age_s) or self.feedback_max_age_s <= 0:
             raise ValueError("hand feedback_max_age_s must be finite and positive")
         if (
-            not np.isfinite(self.state_read_failure_timeout_s)
-            or self.state_read_failure_timeout_s <= 0
+            not np.isfinite(self.initial_state_timeout_s)
+            or self.initial_state_timeout_s <= 0
         ):
-            raise ValueError("hand state_read_failure_timeout_s must be finite and positive")
+            raise ValueError("hand initial_state_timeout_s must be finite and positive")
         if not np.isfinite(self.home_timeout_s) or self.home_timeout_s <= 0:
             raise ValueError("hand home_timeout_s must be finite and positive")
         if not np.isfinite(self.home_tolerance_deg) or self.home_tolerance_deg <= 0:

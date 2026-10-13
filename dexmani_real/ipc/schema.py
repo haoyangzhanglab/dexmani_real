@@ -78,6 +78,10 @@ HAND_STATE_DTYPE = np.dtype(
         ("current", "<f8", HAND_JOINT_SHAPE),
         ("tactile_aggregate", "<f4", HAND_TACTILE_SUM_SHAPE),
         ("tactile_dense", "<f4", HAND_TACTILE_FORCE_SHAPE),
+        # Oldest valid vector in each modality; taxel clocks stay inside the I/O owner.
+        ("tactile_aggregate_timestamp_ns", "<u8"),
+        ("tactile_dense_timestamp_ns", "<u8"),
+        # Last trustworthy joint read, independent of held tactile values.
         ("timestamp_ns", "<u8"),
     ]
 )
