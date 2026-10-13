@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -48,7 +48,6 @@ class IKResult:
     success: bool
     qpos: np.ndarray | None
     reason: str = ""
-    report: dict[str, Any] = field(default_factory=dict)
     failure_kind: IKFailureKind | None = None
 
 
@@ -104,11 +103,10 @@ def make_online_ik_config(
 @dataclass
 class _Candidate:
     qpos: np.ndarray
-    attempt: dict[str, Any]
+    source: str
     pos_err_m: float
     rot_err_rad: float
     max_physical_delta: float
-    distance_current: float
     base_score: float
     near_limit: bool
     collision_free: bool | None = None
@@ -191,25 +189,6 @@ class OnlineIKSolver:
     def solve(
         self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
     ) -> IKResult:
-        start = time.perf_counter()
-        report: dict[str, Any] = {
-            "attempts": [],
-            "clik_calls": 0,
-            "collision_checks": 0,
-            "jacobian_calls": 0,
-            "funnel": dict.fromkeys(
-                (
-                    "attempted",
-                    "clik_converged",
-                    "operational_limits_valid",
-                    "continuity_valid",
-                    "hardware_valid",
-                    "pose_valid",
-                    "collision_free",
-                ),
-                0,
-            ),
-        }
         try:
             current = self._finite_q(current_qpos)
             previous = self._finite_q(previous_qpos_cmd)
@@ -218,34 +197,22 @@ class OnlineIKSolver:
                 or not np.isfinite(target_eef_pose_world.q).all()
             ):
                 raise ValueError("non-finite target pose")
-            selected, mode = self._search(target_eef_pose_world, current, previous, report)
+            selected, converged, rejection = self._search(target_eef_pose_world, current, previous)
             if selected is not None:
-                report.update(
-                    seed=selected.attempt["seed"],
-                    mode=mode,
-                    best_score=selected.score,
-                    ik_residual_pos_m=selected.pos_err_m,
-                    ik_residual_rot_rad=selected.rot_err_rad,
-                    qpos_distance_to_current=selected.distance_current,
-                    max_qpos_cmd_delta_deg=float(np.rad2deg(selected.max_physical_delta)),
-                )
-                if selected.singularity_margin is not None:
-                    report["singularity_margin"] = selected.singularity_margin
-                result = IKResult(success=True, qpos=selected.qpos, report=report)
+                result = IKResult(success=True, qpos=selected.qpos)
             else:
                 kind = (
                     IKFailureKind.NO_VALID_CANDIDATE
-                    if report["funnel"]["clik_converged"]
+                    if converged
                     else IKFailureKind.NO_SOLUTION_FOUND
                 )
                 reason = (
-                    "no_valid_candidate: "
-                    + ", ".join(dict.fromkeys(a["result"] for a in report["attempts"]))
-                    if kind == IKFailureKind.NO_VALID_CANDIDATE
+                    f"no_valid_candidate: {rejection}"
+                    if converged
                     else "solver_no_convergence"
                 )
                 result = IKResult(
-                    success=False, qpos=None, reason=reason, failure_kind=kind, report=report
+                    success=False, qpos=None, reason=reason, failure_kind=kind
                 )
         except (
             ValueError,
@@ -255,15 +222,12 @@ class OnlineIKSolver:
             np.linalg.LinAlgError,
         ) as exc:
             # Model/numerical contract failures must not masquerade as local solver rejection.
-            report["invalid_output"] = str(exc)
             result = IKResult(
                 success=False,
                 qpos=None,
                 reason=str(exc),
                 failure_kind=IKFailureKind.INVALID_OUTPUT,
-                report=report,
             )
-        report["ik_timing_ms"] = (time.perf_counter() - start) * 1000.0
         if result.success:
             self._failure_start, self._failure_warned = None, False
         elif self._failure_start is None:
@@ -284,38 +248,53 @@ class OnlineIKSolver:
             raise ValueError("IK joint vectors must be finite shape (7,)")
         return q
 
-    def _search(self, target, current, previous, report):
+    def _search(self, target, current, previous):
         target_base = self.kin.to_mplib_pose(self.kin.world_to_base_pose(target))
         pool: list[_Candidate] = []
-        for name, seed in (("prev_cmd", previous), ("current_qpos", current)):
-            candidate = self._try_clik(
-                name, seed, target_base, target, current, previous, pool, report
+        tried_seeds = []
+        converged = False
+        rejection = "solver_no_convergence"
+
+        def try_seed(name, seed):
+            nonlocal converged, rejection
+            # Exact equality only; even a nearby distinct seed can reach another IK branch.
+            if any(np.array_equal(seed, tried) for tried in tried_seeds):
+                return None
+            tried_seeds.append(seed.copy())
+            candidate, issue = self._try_clik(
+                name, seed, target_base, target, current, previous, pool
             )
+            if issue != "solver_no_convergence":
+                converged = True
+                if issue:
+                    rejection = issue
+            return candidate
+
+        for name, seed in (("prev_cmd", previous), ("current_qpos", current)):
+            candidate = try_seed(name, seed)
             if candidate is None:
                 continue
             pool.append(candidate)
             if (
-                name == "prev_cmd"
+                candidate.source == "prev_cmd"
                 and not candidate.near_limit
                 and candidate.max_physical_delta
                 <= np.deg2rad(self.profile.fast_accept_max_delta_deg)
                 and candidate.pos_err_m <= 0.5 * self.profile.max_pose_error_pos_m
                 and candidate.rot_err_rad <= 0.5 * self.profile.max_pose_error_rot_rad
-                and self._collision_free(candidate, report)
+                and self._collision_free(candidate)
             ):
-                return candidate, "fast"
+                return candidate, converged, ""
 
-        base = self._select_collision_free(sorted(pool, key=lambda c: c.base_score), report)
+        base = self._select_collision_free(sorted(pool, key=lambda c: c.base_score))
         if base is not None and not base.near_limit:
-            return base, "base"
+            return base, converged, ""
         anchor = min(pool, key=lambda c: c.base_score) if pool else None
         if anchor is not None:
-            direction = self._scaled_jacobian_svd(anchor, report)
+            direction = self._scaled_jacobian_svd(anchor)
             if direction is not None:
                 for name, seed in self._make_null_seeds(anchor.qpos, direction):
-                    candidate = self._try_clik(
-                        name, seed, target_base, target, current, previous, pool, report
-                    )
+                    candidate = try_seed(name, seed)
                     if candidate is not None:
                         pool.append(candidate)
             # Known collisions can anchor search, but cannot participate in final selection.
@@ -330,40 +309,29 @@ class OnlineIKSolver:
                 ):
                     continue
                 if candidate.singularity_margin is None:
-                    self._scaled_jacobian_svd(candidate, report)
+                    self._scaled_jacobian_svd(candidate)
                 candidate.score = candidate.base_score - weight * candidate.singularity_margin
-                candidate.attempt["score"] = candidate.score
-            selected = self._select_collision_free(sorted(viable, key=lambda c: c.score), report)
+            selected = self._select_collision_free(sorted(viable, key=lambda c: c.score))
             if selected is not None:
-                return selected, "null" if selected.attempt["seed"].startswith("null_") else "base"
+                return selected, converged, ""
 
-        return None, "failed"
+        return None, converged, "self_collision" if pool else rejection
 
-    def _try_clik(self, name, seed, target_base, target, current, previous, pool, report):
-        attempt = {"seed": name, "result": "invalid_output", "solve_ms": 0.0}
-        report["attempts"].append(attempt)
-        report["clik_calls"] += 1
-        report["funnel"]["attempted"] += 1
+    def _try_clik(self, name, seed, target_base, target, current, previous, pool):
         model = self.ik_geometry.mp_planner
-        start = time.perf_counter()
-        try:
-            raw, converged, _ = model.pinocchio_model.compute_IK_CLIK(
-                model.link_name_2_idx[model.move_group],
-                target_base,
-                seed.copy(),
-                [],
-            )
-        finally:
-            attempt["solve_ms"] = (time.perf_counter() - start) * 1000.0
+        raw, converged, _ = model.pinocchio_model.compute_IK_CLIK(
+            model.link_name_2_idx[model.move_group],
+            target_base,
+            seed.copy(),
+            [],
+        )
         if raw is not None:
             raw = self._finite_q(raw)
         if not converged:
-            attempt["result"] = "solver_no_convergence"
-            return None
-        report["funnel"]["clik_converged"] += 1
+            return None, "solver_no_convergence"
         if raw is None:
             raise ValueError("CLIK reported convergence without a joint vector")
-        return self._prepare_candidate(raw, attempt, target, current, previous, pool, report)
+        return self._prepare_candidate(raw, name, target, current, previous, pool)
 
     def dynamic_rejection(self, q, current, previous):
         """Recheck a frozen solution against new feedback without changing its branch."""
@@ -371,39 +339,28 @@ class OnlineIKSolver:
             q, current, previous, self.operational_limits, self._jump_limit
         )
 
-    def _prepare_candidate(self, raw, attempt, target, current, previous, pool, report):
+    def _prepare_candidate(self, raw, source, target, current, previous, pool):
         # Mechanical equivalence survives narrowing the operational interval below 2*pi.
         q = self.ik_geometry.canonicalize_qpos(raw, current, self.operational_limits)
         lo, hi = self.operational_limits.T
         if not np.isfinite(q).all():
             raise ValueError("canonical IK output is non-finite")
         if np.any(q < lo) or np.any(q > hi):
-            attempt["result"] = "operational_limits"
-            return None
-        report["funnel"]["operational_limits_valid"] += 1
+            return None, "operational_limits"
         if any(np.max(np.abs(q - c.qpos)) < 1e-4 for c in pool):
-            attempt["result"] = "duplicate"
-            return None
+            return None, "duplicate"
         rejection = self.dynamic_rejection(q, current, previous)
         if rejection is not None:
-            if rejection == "hw_dist":
-                report["funnel"]["continuity_valid"] += 1
-            attempt["result"] = rejection
-            return None
+            return None, rejection
         delta_prev = self.ik_geometry.compute_qpos_delta(q, previous)
         delta = self.ik_geometry.compute_qpos_delta(q, current)
         distance = float(np.max(np.abs(delta)))
-        report["funnel"]["continuity_valid"] += 1
-        report["funnel"]["hardware_valid"] += 1
         pos_err, rot_err = compute_pose_error(target, self.kin.compute_eef_pose_world(q))
         if not np.isfinite((pos_err, rot_err)).all():
             raise ValueError("IK FK/pose error is non-finite")
-        attempt.update(pos_err_m=pos_err, rot_err_rad=rot_err)
         p = self.profile
         if pos_err > p.max_pose_error_pos_m or rot_err > p.max_pose_error_rot_rad:
-            attempt["result"] = "pose_error"
-            return None
-        report["funnel"]["pose_valid"] += 1
+            return None, "pose_error"
         score = (
             self.ik_geometry.weighted_joint_distance(q, current, self._weights, delta=delta)
             + p.previous_command_distance_weight
@@ -420,35 +377,29 @@ class OnlineIKSolver:
         )
         if not np.isfinite(score):
             raise ValueError("IK candidate score is non-finite")
-        attempt.update(result="pose_valid", score=score)
         return _Candidate(
             q,
-            attempt,
+            source,
             pos_err,
             rot_err,
             distance,
-            float(np.linalg.norm(delta)),
             score,
             bool(np.min(np.minimum(q - lo, hi - q)) < np.deg2rad(p.joint_limit_search_margin_deg)),
             score=score,
-        )
+        ), ""
 
-    def _collision_free(self, candidate, report):
+    def _collision_free(self, candidate):
         if candidate.collision_free is None:
-            report["collision_checks"] += 1
             candidate.collision_free = not self.ik_geometry.has_self_collision(candidate.qpos)
-            candidate.attempt["result"] = "ok" if candidate.collision_free else "self_collision"
-            report["funnel"]["collision_free"] += int(candidate.collision_free)
         return candidate.collision_free
 
-    def _select_collision_free(self, candidates, report):
+    def _select_collision_free(self, candidates):
         for candidate in candidates:
-            if self._collision_free(candidate, report):
+            if self._collision_free(candidate):
                 return candidate
         return None
 
-    def _scaled_jacobian_svd(self, candidate, report):
-        report["jacobian_calls"] += 1
+    def _scaled_jacobian_svd(self, candidate):
         jacobian = self.kin.compute_eef_jacobian_world(candidate.qpos)
         if jacobian.shape != (6, 7) or not np.isfinite(jacobian).all():
             raise ValueError("IK Jacobian must be finite shape (6, 7)")
@@ -457,9 +408,6 @@ class OnlineIKSolver:
             raise ValueError("IK Jacobian block norms are non-finite")
         if np.any(norms <= _NUMERIC_EPS):
             candidate.singularity_margin = 0.0
-            candidate.attempt.update(
-                effective_rank=0, singularity_margin=0.0, jacobian_diagnostic="degenerate_block"
-            )
             return None
         conditioned = jacobian / np.repeat(norms, 3)[:, None]
         _, sigma, vh = np.linalg.svd(conditioned, full_matrices=True)
@@ -467,11 +415,6 @@ class OnlineIKSolver:
             raise ValueError("conditioned Jacobian SVD is non-finite")
         rank = int(np.count_nonzero(sigma > _SVD_RANK_RTOL * sigma[0]))
         candidate.singularity_margin = float(sigma[-1] / max(sigma[0], _NUMERIC_EPS))
-        candidate.attempt.update(
-            effective_rank=rank,
-            singular_values=sigma.tolist(),
-            singularity_margin=candidate.singularity_margin,
-        )
         return vh[-1] if rank == 6 else None
 
     def _make_null_seeds(self, anchor, direction):
@@ -499,7 +442,7 @@ class OnlineIKSolver:
                 seed > self.operational_limits[:, 1]
             ):
                 continue
-            if not any(np.allclose(seed, old, atol=1e-8, rtol=0) for old in seeds):
+            if not any(np.array_equal(seed, old) for old in seeds):
                 seeds.append(seed)
         seeds.sort(key=lambda q: self.ik_geometry.joint_limit_penalty(q, self.operational_limits))
         return list(zip(("null_preferred", "null_opposite"), seeds))

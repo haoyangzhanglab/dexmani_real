@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cordvip-geometry"
+version = "0.1.0"
+description = "Object asset preparation, RGB-D point clouds and optional pose-tracking workflows"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+mesh = ["trimesh>=4.0"]
+vision = ["opencv-python>=4.8"]
+cloud = ["open3d>=0.18", "trimesh>=4.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

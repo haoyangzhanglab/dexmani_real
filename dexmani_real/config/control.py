@@ -31,11 +31,12 @@ class VRMappingParams:
     def validate(self) -> None:
         values = (
             self.pos_scale,
-            self.rot_scale,
             self.stale_threshold_s,
         )
         if not all(np.isfinite(value) and value > 0 for value in values):
-            raise ValueError("VR mapping scales and stale threshold must be finite and positive")
+            raise ValueError("VR position scale and stale threshold must be finite and positive")
+        if not np.isfinite(self.rot_scale) or self.rot_scale != 1.0:
+            raise ValueError("only rot_scale=1.0 is supported by reset-relative rotation mapping")
 
 
 @dataclass(frozen=True)

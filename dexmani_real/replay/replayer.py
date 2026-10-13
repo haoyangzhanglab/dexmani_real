@@ -11,10 +11,11 @@ from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.replay.capture import ReplayRecorder
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.projection import project_arm_command, project_hand_command
-from dexmani_real.robot.robot import DispatchError, DispatchInterrupted
+from dexmani_real.robot.robot import DispatchError, DispatchInterrupted, DispatchResult
 from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
 from dexmani_real.runtime.operator_input import OperatorCommand
 from dexmani_real.runtime.safety import RunEndReason, begin_motion, revoke_motion
+from dexmani_real.utils.control_clock import sampling_clock_ns
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ class ReplayOutcome:
         return self.status in (ReplayStatus.COMPLETED, ReplayStatus.USER_QUIT)
 
 
-def _wait_replay(shared, keyboard, epoch, deadline, robot):
+def _wait_replay(shared, keyboard, epoch, deadline_ns, robot):
     """Keep operator input and lifecycle checks active during bounded waits."""
     while True:
         robot.check()
@@ -61,10 +62,10 @@ def _wait_replay(shared, keyboard, epoch, deadline, robot):
             return ReplayOutcome(
                 ReplayStatus.REJECTED, reason=f"motion interrupted: {cause.name.lower()}"
             )
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        remaining_ns = deadline_ns - time.monotonic_ns()
+        if remaining_ns <= 0:
             return None
-        time.sleep(min(0.005, remaining))
+        time.sleep(min(0.005, remaining_ns / 1e9))
 
 
 def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s, robot):
@@ -86,20 +87,20 @@ def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s,
         qpos_max_rad=runtime.hand.qpos_max_rad,
     )
     steps = max(1, int(np.ceil(duration_s * trajectory.fps)))
-    period = 1 / trajectory.fps
+    period_ns, _ = sampling_clock_ns(trajectory.fps)
     print(
-        f"XHand start: {steps * period:g}s ramp to first target, then wait for arrival. "
+        f"XHand start: {steps * period_ns / 1e9:g}s ramp to first target, then wait for arrival. "
         "Preparation is outside replay rows; initial hand state differs from Raw. "
         "Q: stop; ESC: emergency stop",
         flush=True,
     )
     step = 0
-    deadline = 0.0
+    deadline_ns = 0
     final_stamp = None
     last_sample = 0
     consecutive = 0
     while True:
-        interrupted = _wait_replay(shared, keyboard, epoch, deadline, robot)
+        interrupted = _wait_replay(shared, keyboard, epoch, deadline_ns, robot)
         if interrupted is not None:
             return interrupted
         row = read_observation(shared, runtime, robot)
@@ -122,10 +123,10 @@ def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s,
                 last_sample = stamp
                 robot.end_hand_send_interval()
             step += 1
-            deadline = stamp / 1e9 + period
+            deadline_ns = stamp + period_ns
             continue
 
-        if time.monotonic() >= final_stamp / 1e9 + runtime.hand.home_timeout_s:
+        if time.monotonic_ns() >= final_stamp + int(runtime.hand.home_timeout_s * 1e9):
             return ReplayOutcome(ReplayStatus.REJECTED, reason="hand start convergence timed out")
         sample = int(row.hand["timestamp_ns"][0])
         if sample > last_sample:
@@ -140,7 +141,7 @@ def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s,
             if consecutive >= 3:
                 print("XHand start ready; replaying recorded targets.", flush=True)
                 return None
-        deadline = time.monotonic() + 0.01
+        deadline_ns = time.monotonic_ns() + 10_000_000
 
 
 def replay_targets(
@@ -149,6 +150,7 @@ def replay_targets(
     failure_details = []
     epoch = int(shared.run_id)
     capture = ReplayRecorder(trajectory.num_frames)
+    period_ns, _ = sampling_clock_ns(trajectory.fps)
     status, reason = ReplayStatus.COMPLETED, ""
     run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
     try:
@@ -202,12 +204,19 @@ def replay_targets(
             if interrupted is not None:
                 status, reason = interrupted.status, interrupted.reason
         if status == ReplayStatus.COMPLETED:
+            origin_ns = time.monotonic_ns()
             for index in range(trajectory.num_frames):
-                interrupted = _wait_replay(shared, keyboard, epoch, 0.0, robot)
+                slot_start_ns = origin_ns + index * period_ns
+                slot_deadline_ns = slot_start_ns + period_ns
+                interrupted = _wait_replay(shared, keyboard, epoch, slot_start_ns, robot)
                 if interrupted is not None:
                     status, reason = interrupted.status, interrupted.reason
                     break
-                tick_start = time.monotonic()
+                if time.monotonic_ns() >= slot_deadline_ns:
+                    raise DispatchError(
+                        f"replay slot {index} missed before observation", DispatchResult(),
+                        revoked=True, cause="deadline_expired",
+                    )
                 row = read_observation(shared, runtime, robot)
                 if row is None:
                     status, reason = ReplayStatus.REJECTED, "robot feedback stale"
@@ -224,11 +233,26 @@ def replay_targets(
                     qpos_max_rad=runtime.hand.qpos_max_rad,
                 )
                 dispatch_error = None
+                submit_started_ns = submit_completed_ns = -1
+                valid_until_ns = min(slot_deadline_ns, feedback_deadline_ns(row, runtime))
                 try:
-                    result = robot.send_action(
-                        RobotCommand(epoch, arm, hand),
-                        valid_until_ns=feedback_deadline_ns(row, runtime),
-                    )
+                    command = RobotCommand(epoch, arm, hand)
+                    if time.monotonic_ns() >= valid_until_ns:
+                        raise DispatchError(
+                            f"replay slot {index} expired before submission", DispatchResult(),
+                            revoked=True, cause="deadline_expired",
+                        )
+                    submit_started_ns = time.monotonic_ns()
+                    try:
+                        result = robot.send_action(command, valid_until_ns=valid_until_ns)
+                    finally:
+                        submit_completed_ns = time.monotonic_ns()
+                    # A blocking SDK call can outlive the last pre-send check, including the final row.
+                    if submit_completed_ns >= valid_until_ns:
+                        raise DispatchError(
+                            f"replay slot {index} dispatch returned after deadline", result,
+                            revoked=True, cause="deadline_expired",
+                        )
                 except (DispatchError, DispatchInterrupted) as exc:
                     result, dispatch_error = exc.result, exc
                     cancelled = isinstance(exc, DispatchInterrupted)
@@ -248,17 +272,18 @@ def replay_targets(
                         failure_details.append(f"dispatch stop failed: {type(exc).__name__}: {exc}")
                         logger.exception("replay stop after dispatch failed")
                         shared.error_state = True
-                stamp = result.timestamp_ns or time.monotonic_ns()
                 try:
                     capture.record(
                         index,
                         row.arm["qpos"][0],
                         arm if result.arm else np.full(7, np.nan),
                         hand if result.hand else np.full(12, np.nan),
-                        stamp / 1e9,
                         dispatch_status=(int(result.arm), int(result.hand)),
                         hand_qpos=row.hand["qpos"][0],
-                        arm_tracking_error=float(np.max(np.abs(arm - row.arm["qpos"][0]))),
+                        arm_observation_ns=int(row.arm["timestamp_ns"][0]),
+                        hand_observation_ns=int(row.hand["timestamp_ns"][0]),
+                        submit_started_ns=submit_started_ns,
+                        submit_completed_ns=submit_completed_ns,
                     )
                 except Exception as exc:
                     shared.error_state = True
@@ -270,7 +295,7 @@ def replay_targets(
                 if dispatch_error is not None:
                     raise dispatch_error
                 interrupted = _wait_replay(
-                    shared, keyboard, epoch, tick_start + 1 / trajectory.fps, robot
+                    shared, keyboard, epoch, slot_deadline_ns, robot
                 )
                 if interrupted is not None:
                     status, reason = interrupted.status, interrupted.reason

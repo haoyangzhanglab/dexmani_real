@@ -19,11 +19,11 @@ from dexmani_real.utils.atomic_io import atomic_json_dump
 
 logger = logging.getLogger(__name__)
 
-_TRACKING_LAG_WINDOW_S = 0.4
-_MIN_TRACKING_LAG_FRAMES = 6
-_MIN_TRACKING_OVERLAP_FRAMES = 10
-_MIN_TRACKING_SEQUENCE_FRAMES = 20
-_TRACKING_ERROR_PERCENTILE = 95.0
+_ALIGNMENT_WINDOW_S = 0.4
+_MIN_ALIGNMENT_OFFSET_FRAMES = 6
+_MIN_ALIGNMENT_OVERLAP_FRAMES = 10
+_MIN_ALIGNMENT_SEQUENCE_FRAMES = 20
+_TARGET_GAP_PERCENTILE = 95.0
 
 
 @dataclass
@@ -51,18 +51,17 @@ class ReplayMetrics:
     hand_joint_mae_overall_deg: float | None = None
     hand_pooled_rmse_deg: float | None = None
 
-    tracking_lag_frames: int | None = None
-    tracking_lag_seconds: float = float("nan")
+    trajectory_alignment_offset_frames: int | None = None
 
-    arm_tracking_error_mean_deg: float = float("nan")
-    arm_tracking_error_p95_deg: float = float("nan")
-    arm_tracking_error_max_deg: float = float("nan")
+    arm_pre_submit_target_gap_mean_deg: float = float("nan")
+    arm_pre_submit_target_gap_p95_deg: float = float("nan")
+    arm_pre_submit_target_gap_max_deg: float = float("nan")
 
     valid_arm_frames: int = 0
     valid_eef_position_frames: int = 0
     valid_eef_rotation_frames: int = 0
     valid_hand_frames: int = 0
-    tracking_lag_per_joint_frames: dict[int, int] = field(default_factory=dict)
+    trajectory_alignment_per_joint_frames: dict[int, int] = field(default_factory=dict)
 
 
 def _geodesic_distance_deg(rotation_a: np.ndarray, rotation_b: np.ndarray) -> float:
@@ -83,9 +82,13 @@ def compute_metrics(
     replay_hand_qpos: np.ndarray | None = None,
     episode_path: str = "",
     task_label: str = "",
-    arm_tracking_error: np.ndarray | None = None,
+    replay_arm_cmd: np.ndarray | None = None,
 ) -> ReplayMetrics:
-    """Compare matching frame indices from the recorded and replayed streams."""
+    """Compare runs by frame index; submitted targets use their consumed pre-submit feedback.
+
+    Neither cross-run alignment nor the same-row target gap estimates hardware response delay.
+    replay_arm_cmd retains NaN for rows where the arm SDK was not called.
+    """
     if not np.isfinite(fps) or fps <= 0:
         raise ValueError("fps must be finite and positive")
     original_frames = original_arm_qpos.shape[0]
@@ -164,33 +167,37 @@ def compute_metrics(
                 metrics.hand_joint_mae_overall_deg = float(np.rad2deg(np.mean(diff_h)))
                 metrics.hand_pooled_rmse_deg = float(np.rad2deg(np.sqrt(np.mean(diff_h**2))))
 
-    metrics.tracking_lag_per_joint_frames = tracking_lags(orig_q, rep_q, fps)
-    if metrics.tracking_lag_per_joint_frames:
-        peak_lag = int(np.median(list(metrics.tracking_lag_per_joint_frames.values())))
-        metrics.tracking_lag_frames = peak_lag
-        metrics.tracking_lag_seconds = float(peak_lag) / fps
+    metrics.trajectory_alignment_per_joint_frames = trajectory_alignment_offsets(orig_q, rep_q, fps)
+    if metrics.trajectory_alignment_per_joint_frames:
+        metrics.trajectory_alignment_offset_frames = int(
+            np.median(list(metrics.trajectory_alignment_per_joint_frames.values()))
+        )
 
-    if arm_tracking_error is not None:
-        finite_tracking_error = arm_tracking_error[np.isfinite(arm_tracking_error)]
-        if finite_tracking_error.size:
-            metrics.arm_tracking_error_mean_deg = float(np.rad2deg(np.mean(finite_tracking_error)))
-            metrics.arm_tracking_error_p95_deg = float(
-                np.rad2deg(np.percentile(finite_tracking_error, _TRACKING_ERROR_PERCENTILE))
+    if replay_arm_cmd is not None:
+        count = min(len(replay_arm_cmd), replayed_frames)
+        commands, measured = replay_arm_cmd[:count], replay_arm_qpos[:count]
+        valid_gap = np.isfinite(commands).all(axis=1) & np.isfinite(measured).all(axis=1)
+        if valid_gap.any():
+            gaps = np.max(np.abs(commands[valid_gap] - measured[valid_gap]), axis=1)
+            metrics.arm_pre_submit_target_gap_mean_deg = float(np.rad2deg(np.mean(gaps)))
+            metrics.arm_pre_submit_target_gap_p95_deg = float(
+                np.rad2deg(np.percentile(gaps, _TARGET_GAP_PERCENTILE))
             )
-            metrics.arm_tracking_error_max_deg = float(np.rad2deg(np.max(finite_tracking_error)))
+            metrics.arm_pre_submit_target_gap_max_deg = float(np.rad2deg(np.max(gaps)))
 
     return metrics
 
 
 def report_consistency(metrics: ReplayMetrics) -> None:
     print("\n" + "=" * 60)
-    print("Consistency Evaluation")
+    print("Cross-run Consistency by Frame Index")
     print("=" * 60)
     print(
         f"  Frames: {metrics.replayed_frames} replayed / {metrics.original_frames} original; valid arm={metrics.valid_arm_frames}"
     )
     print("  Joint errors use absolute SDK angles; EEF errors use geometric pose equivalence.")
-    print(f"  Active-axis lag (frames): {metrics.tracking_lag_per_joint_frames}")
+    print("  Frame alignment compares separate runs; it does not measure hardware response delay.")
+    print(f"  Active-axis alignment offsets (frames): {metrics.trajectory_alignment_per_joint_frames}")
     print(
         f"  Arm joint MAE:  {np.round(metrics.arm_joint_mae_deg, 2)} deg  "
         f"(overall: {metrics.arm_joint_mae_overall_deg:.3f} deg)"
@@ -213,15 +220,14 @@ def report_consistency(metrics: ReplayMetrics) -> None:
     if metrics.hand_joint_mae_overall_deg is not None:
         print(f"  Hand joint MAE: {metrics.hand_joint_mae_overall_deg:.3f} deg")
     print(
-        f"  Tracking lag:  {metrics.tracking_lag_frames} frames "
-        f"({metrics.tracking_lag_seconds:.3f}s)"
+        f"  Median trajectory alignment offset: {metrics.trajectory_alignment_offset_frames} frames"
     )
-    if metrics.arm_tracking_error_mean_deg > 0:
+    if np.isfinite(metrics.arm_pre_submit_target_gap_mean_deg):
         print(
-            "  Replay tracking error (cmd vs actual): "
-            f"mean={metrics.arm_tracking_error_mean_deg:.2f}°  "
-            f"p95={metrics.arm_tracking_error_p95_deg:.2f}°  "
-            f"max={metrics.arm_tracking_error_max_deg:.2f}°"
+            "  Arm submitted target vs consumed pre-submit feedback (max joint gap per row): "
+            f"mean={metrics.arm_pre_submit_target_gap_mean_deg:.2f}°  "
+            f"p95={metrics.arm_pre_submit_target_gap_p95_deg:.2f}°  "
+            f"max={metrics.arm_pre_submit_target_gap_max_deg:.2f}°"
         )
     print("=" * 60)
 
@@ -278,7 +284,7 @@ def evaluate_replay(
         replay_hand_qpos=replay_data.get("hand_qpos"),
         episode_path=trajectory.episode_path,
         task_label=trajectory.task_label,
-        arm_tracking_error=replay_data.get("arm_tracking_error"),
+        replay_arm_cmd=replay_data["arm_cmd"],
     )
 
     report_consistency(metrics)
@@ -339,17 +345,16 @@ def _save_metrics(
             "mean_error_deg": round(metrics.eef_rot_error_mean_deg, 2),
             "max_error_deg": round(metrics.eef_rot_error_max_deg, 2),
         },
-        "tracking_lag": {
-            "per_active_joint_frames": metrics.tracking_lag_per_joint_frames,
-            "peak_lag_frames": metrics.tracking_lag_frames,
-            "peak_lag_seconds": round(metrics.tracking_lag_seconds, 3),
+        "trajectory_alignment": {
+            "per_active_joint_offset_frames": metrics.trajectory_alignment_per_joint_frames,
+            "median_offset_frames": metrics.trajectory_alignment_offset_frames,
         },
     }
-    if metrics.arm_tracking_error_mean_deg > 0:
-        metrics_dict["tracking_error"] = {
-            "mean_deg": round(metrics.arm_tracking_error_mean_deg, 2),
-            "p95_deg": round(metrics.arm_tracking_error_p95_deg, 2),
-            "max_deg": round(metrics.arm_tracking_error_max_deg, 2),
+    if np.isfinite(metrics.arm_pre_submit_target_gap_mean_deg):
+        metrics_dict["pre_submit_arm_target_gap"] = {
+            "mean_deg": round(metrics.arm_pre_submit_target_gap_mean_deg, 2),
+            "p95_deg": round(metrics.arm_pre_submit_target_gap_p95_deg, 2),
+            "max_deg": round(metrics.arm_pre_submit_target_gap_max_deg, 2),
         }
     if metrics.hand_joint_mae_overall_deg is not None and metrics.hand_pooled_rmse_deg is not None:
         metrics_dict["hand_joint"] = {
@@ -370,16 +375,20 @@ def _save_metrics(
     print(f"\nMetrics saved: {metrics_path}")
 
 
-def tracking_lags(orig_q, rep_q, fps):
-    """Positive lag means replay is later; stationary axes are unidentifiable."""
+def trajectory_alignment_offsets(orig_q, rep_q, fps):
+    """RMSE alignment across runs; positive offset matches higher replay indices.
+
+    fps only defines the nominal search window. Offsets are not command-to-feedback delays;
+    stationary axes cannot identify an alignment.
+    """
     frame_count = len(orig_q)
     lags = {}
-    if frame_count >= _MIN_TRACKING_SEQUENCE_FRAMES:
-        max_lag = max(int(np.ceil(fps * _TRACKING_LAG_WINDOW_S)), _MIN_TRACKING_LAG_FRAMES)
+    if frame_count >= _MIN_ALIGNMENT_SEQUENCE_FRAMES:
+        max_lag = max(int(np.ceil(fps * _ALIGNMENT_WINDOW_S)), _MIN_ALIGNMENT_OFFSET_FRAMES)
         for joint_index in range(ARM_JOINT_SHAPE[0]):
             original_finite = orig_q[np.isfinite(orig_q[:, joint_index]), joint_index]
             replay_finite = rep_q[np.isfinite(rep_q[:, joint_index]), joint_index]
-            if min(len(original_finite), len(replay_finite)) < _MIN_TRACKING_OVERLAP_FRAMES:
+            if min(len(original_finite), len(replay_finite)) < _MIN_ALIGNMENT_OVERLAP_FRAMES:
                 continue
             if min(np.ptp(original_finite), np.ptp(replay_finite)) < np.deg2rad(1):
                 continue  # A stationary axis cannot identify temporal lag.
@@ -396,7 +405,7 @@ def tracking_lags(orig_q, rep_q, fps):
                     original = orig_q[:, joint_index]
                     replayed = rep_q[:, joint_index]
                 finite = np.isfinite(original) & np.isfinite(replayed)
-                if int(np.count_nonzero(finite)) < _MIN_TRACKING_OVERLAP_FRAMES:
+                if int(np.count_nonzero(finite)) < _MIN_ALIGNMENT_OVERLAP_FRAMES:
                     continue
                 rmse = float(np.sqrt(np.mean((original[finite] - replayed[finite]) ** 2)))
                 candidate_key = (rmse, abs(lag), lag)

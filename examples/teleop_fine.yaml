@@ -1,0 +1,11 @@
+# Explicit fine-motion experiment; keep the default Mode 6 control rate.
+# A given robot displacement needs 2.5x the hand travel of pos_scale=1.
+teleop:
+  control_hz: 16.0
+policy:
+  vr_mapping:
+    pos_scale: 0.4
+    rot_scale: 1.0
+  ema:
+    alpha_pos: 0.7
+    alpha_rot: 0.5

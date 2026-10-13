@@ -33,17 +33,30 @@ class TeleopController:
 
     def reset_reference(self, row):
         self.clear_reference()
-        self.previous_arm_command = row.arm["qpos"][0].copy()
-        pos, rot = self.arm_fk.compute(self.previous_arm_command)
-        self.arm_mapper.reset(
-            wrist_pos=row.vr["wrist_pos"],
-            wrist_quat_wxyz=row.vr["wrist_quat_wxyz"],
-            eef_pos=pos,
-            eef_quat_wxyz=rot6d_to_quat_wxyz(rot),
-        )
-        if row.hand is not None:
-            reset_hand_retargeter(self.hand_retargeter, row.hand["qpos"][0])
-        return self.arm_mapper.is_ready()
+        prepared = False
+        try:
+            arm_qpos = row.arm["qpos"][0].copy()
+            pos, rot = self.arm_fk.compute(arm_qpos)
+            quat = rot6d_to_quat_wxyz(rot)
+            self.arm_mapper.reset(
+                wrist_pos=row.vr["wrist_pos"],
+                wrist_quat_wxyz=row.vr["wrist_quat_wxyz"],
+                eef_pos=pos,
+                eef_quat_wxyz=quat,
+            )
+            if not self.arm_mapper.is_ready():
+                return False
+            if row.hand is not None:
+                reset_hand_retargeter(self.hand_retargeter, row.hand["qpos"][0])
+            # The first EMA step starts at the same measured FK pose as the VR anchor.
+            self.previous_arm_command = arm_qpos
+            self.smoothed_eef_position = pos.copy()
+            self.smoothed_eef_quaternion = quat.copy()
+            prepared = True
+            return True
+        finally:
+            if not prepared:
+                self.clear_reference()
 
     def compute_target(self, row):
         cfg = self.runtime

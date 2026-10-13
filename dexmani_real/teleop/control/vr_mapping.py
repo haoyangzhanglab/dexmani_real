@@ -5,7 +5,6 @@ import logging
 __all__ = ["VRWristMapper"]
 
 import numpy as np
-from transforms3d.axangles import axangle2mat, mat2axangle
 from transforms3d.quaternions import mat2quat, quat2mat
 
 from dexmani_real.utils.geometry import normalize_quat_wxyz, validate_rotation_matrix
@@ -33,10 +32,9 @@ class VRWristMapper:
     ) -> None:
         if not np.isfinite(pos_scale):
             raise ValueError("pos_scale must be finite")
-        if not np.isfinite(rot_scale) or rot_scale < 0:
-            raise ValueError("rot_scale must be finite and >= 0")
+        if not np.isfinite(rot_scale) or rot_scale != 1.0:
+            raise ValueError("only rot_scale=1.0 is supported by reset-relative rotation mapping")
         self.pos_scale = pos_scale
-        self.rot_scale = rot_scale
         self.vr_to_robot_rot = (
             np.eye(3)
             if vr_to_robot_rot is None
@@ -44,8 +42,7 @@ class VRWristMapper:
         )
 
         self.wrist_pos0: np.ndarray | None = None
-        self.previous_wrist_rot: np.ndarray | None = None
-        self.scaled_delta_rot: np.ndarray | None = None
+        self.wrist_rot0: np.ndarray | None = None
         self.eef_pos0: np.ndarray | None = None
         self.eef_rot0: np.ndarray | None = None
         self.last_quat_wxyz: np.ndarray | None = None
@@ -71,8 +68,7 @@ class VRWristMapper:
             )
             return
         self.wrist_pos0 = next_wrist_pos0
-        self.previous_wrist_rot = next_wrist_rot0
-        self.scaled_delta_rot = np.eye(3)
+        self.wrist_rot0 = next_wrist_rot0
         self.eef_pos0 = next_eef_pos0
         self.eef_rot0 = next_eef_rot0
         self.last_quat_wxyz = mat2quat(self.eef_rot0)
@@ -95,11 +91,8 @@ class VRWristMapper:
         delta_pos_vr = current_wrist_pos - self.wrist_pos0
         delta_pos_base = self.pos_scale * (self.vr_to_robot_rot @ delta_pos_vr)
 
-        # Scale local SO(3) increments, avoiding the total-angle branch at pi.
-        increment = wrist_rot @ self.previous_wrist_rot.T
-        self.scaled_delta_rot = self.scale_rot(increment) @ self.scaled_delta_rot
-        self.previous_wrist_rot = wrist_rot
-        delta_rot_vr = self.scaled_delta_rot
+        # C maps VR axes into xarm_base; conjugation expresses the anchored rotation there.
+        delta_rot_vr = wrist_rot @ self.wrist_rot0.T
         delta_rot_base = self.vr_to_robot_rot @ delta_rot_vr @ self.vr_to_robot_rot.T
         target_pos = self.eef_pos0 + delta_pos_base
         target_rot = delta_rot_base @ self.eef_rot0
@@ -119,8 +112,7 @@ class VRWristMapper:
 
     def clear(self) -> None:
         self.wrist_pos0 = None
-        self.previous_wrist_rot = None
-        self.scaled_delta_rot = None
+        self.wrist_rot0 = None
         self.eef_pos0 = None
         self.eef_rot0 = None
         self.last_quat_wxyz = None
@@ -130,15 +122,8 @@ class VRWristMapper:
             value is not None
             for value in (
                 self.wrist_pos0,
-                self.previous_wrist_rot,
-                self.scaled_delta_rot,
+                self.wrist_rot0,
                 self.eef_pos0,
                 self.eef_rot0,
             )
         )
-
-    def scale_rot(self, rot: np.ndarray) -> np.ndarray:
-        if self.rot_scale == 1.0:
-            return rot
-        axis, angle = mat2axangle(rot)
-        return axangle2mat(axis, self.rot_scale * angle, is_normalized=True)
