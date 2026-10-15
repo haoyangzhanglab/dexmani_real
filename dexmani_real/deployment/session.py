@@ -16,7 +16,7 @@ from dexmani_real.deployment.config import (
     validate_num_episodes,
     validate_policy_runtime_compatibility,
 )
-from dexmani_real.deployment.observation import build_observation_kinematics
+from dexmani_real.deployment.observation import build_observation_camera, build_observation_kinematics
 from dexmani_real.deployment.operator import PolicyOperator
 from dexmani_real.deployment.runner import PolicyRunner
 from dexmani_real.ipc.channels import SensorChannelsConfig
@@ -121,13 +121,15 @@ def run_policy_deployment(
     try:
         fields = set(info.observation_fields)
         cloud = "point_cloud" in fields
-        # Cloud production and RGB-D recording share the camera worker.
-        camera = cloud or "rgb" in fields or recording_config is not None
+        # Parameters, cloud production and RGB-D recording share the camera worker.
+        camera = bool(
+            fields & {"point_cloud", "rgb", "camera_intrinsic", "camera_extrinsic"}
+        ) or recording_config is not None
         if camera:
             runtime.camera.validate()
         camera_calibration = (
             CameraExtrinsics(camera_calibration_path)
-            if cloud
+            if cloud or "camera_extrinsic" in fields
             else load_optional_camera_extrinsics(camera_calibration_path)
             if recording_config is not None
             else None
@@ -204,6 +206,9 @@ def run_policy_deployment(
             )
         if supervisor is not None:
             supervisor.start(sensors)
+        camera_parameters = build_observation_camera(
+            shared.sensors, runtime.camera, fields, camera_calibration,
+        )
         require_transition(shared, SafetyState.ARMED)
         operator = PolicyOperator(
             shared,
@@ -237,6 +242,7 @@ def run_policy_deployment(
             num_episodes=num_episodes,
             task_label=recording_config.task_label if recording_config is not None else None,
             camera_calibration=camera_calibration,
+            camera_parameters=camera_parameters,
             results=results,
         )
         print(

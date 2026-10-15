@@ -91,11 +91,13 @@ python examples/export_policy_zarr.py episodes/<task> --config local.yaml
 
 `--info` 查看元数据与数值概要，无需 Rerun；交互 viewer 顺序读取所选 RGB-D 帧。查看和导出使用当前点云、桌面与手部安装配置，相机几何来自对应 Raw。仅当 `pointcloud.remove_table: true` 时读取桌面平面。viewer 的点云耗时只统计已读取 RGB-D 的派生计算，不含读取和显示。
 
-公共导出要求每段全部 **13 字段**完整，每行浮点数值均有限；缺字段、NaN/Inf、RGB-D 行数不符、相机几何缺失或点云无法重建时，整段拒绝并在日志中记录原因。完整性检查覆盖全部模态，不随模型所需字段而放宽，hand current / arm effort 的辅助 NaN 也会导致整段拒绝。Raw 原样保留，导出不删单帧、不插值、不填补缺测；触觉直接使用采集保存值，不再次保持或修补。下游按模型所需字段加载。
+公共导出要求每段全部 **15 字段**完整，每行浮点数值均有限；缺字段、NaN/Inf、RGB-D 行数不符、相机几何缺失或点云无法重建时，整段拒绝并在日志中记录原因。完整性检查覆盖全部模态，不随模型所需字段而放宽，hand current / arm effort 的辅助 NaN 也会导致整段拒绝。Raw 原样保留，导出不删单帧、不插值、不填补缺测；触觉直接使用采集保存值，不再次保持或修补。下游按模型所需字段加载。
 
 训练准入同时检查逐拍间隔与累计时间偏离，容差为 `dt/4`；单行会明确提示无间隔可检验。此容差用于导出筛选，不作为遥操作停机条件；Raw 保留实际时间，正常结束的采集也可能因时序超差被拒绝导出。训练 action 表示本拍向双设备 SDK 提交的绝对目标，不代表物理到位。机械臂须返回 ACCEPTED；XHand 允许 ACCEPTED 或 CRC 未确认，Raw 保留真实发送状态。未发送、明确拒绝或调用异常仍整段拒绝。任务失败本身不排除技术有效数据。
 
 默认输出为 `datasets/<task>.zarr`，目标必须不存在，可用 `--output` 指定新路径。Zarr 使用 Diffusion Policy 的 `data/*` 和 `meta/episode_ends` 结构，根属性仅保存数值处理、数据身份与 episode 名称。处理逻辑变化后从 Raw 重新导出。文件读写故障或处理逻辑异常会中止导出，已创建的 staging 保留供排查后重建。
+
+Canonical 与部署统一使用 `fingertip_xyz`、`finger_tactile_force`、`taxel_tactile_force`，并提供 `camera_intrinsic` / `camera_extrinsic`。相机参数采用 Sim 的 float32、C-order K / [R|t] 布局，Real 外参方向为 `xarm_base` → color optical RDF（右、下、前）；Real Base 与 Sim World 的数值坐标不必相同。K/E 不包含完整畸变模型，Raw 保留 distortion model、coefficients 和 depth scale，图像与点云处理方式不变。字段 shape 与物理语义见 [Canonical 契约](dexmani_real/dataset/contracts.py)。旧 Canonical Zarr 须从 Raw 重新导出，不提供旧名别名或自动迁移。
 
 ### 策略部署
 
@@ -124,7 +126,7 @@ sync 在推理完成后读取新反馈并开始执行，段内按策略时间步
 
 checkpoint 默认 `latest`；可用 `--checkpoint 80pct` 选择已保存的 80% milestone，也支持 `best` 或 checkpoint 文件名。百分比必须对应已有 checkpoint；`best` 需要实验中的 `best_ckpt.json`。模型推理参数与 Real 执行参数见 `--help`。保存产物时，`run_config.yaml` 记录实际配置、checkpoint、覆盖值、输出开关与源码版本。`--output` 指定部署输出位置。
 
-Raw 与评估摘要可独立关闭：`--no-record` 关闭 Raw，`--no-results` 关闭摘要，两者同时使用时不创建会话产物。仅使用机器人状态且关闭 Raw 时不启动相机；RGB、点云输入或 Raw 录制按需启动对应传感器。
+Raw 与评估摘要可独立关闭：`--no-record` 关闭 Raw，`--no-results` 关闭摘要，两者同时使用时不创建会话产物。仅使用机器人状态且关闭 Raw 时不启动相机；RGB、点云、相机参数输入或 Raw 录制按需启动对应传感器。部署仅提供策略请求的字段；K/E 使用当前相机会话的 active color intrinsics 和 serial 对应的外参，一次计算后按观测历史展开，仍检查相机帧的新鲜度。仅请求相机参数不会启动点云 worker；请求外参时缺少有效标定会明确失败。
 
 评估摘要保存在 `session_result.json`，包含结束原因、时长、故障和推理、发送、跳过节拍的统计。启用摘要时，连接设备前写入初始未完成状态，撤销运动后保存每段结果，资源清理后更新会话结果。清理失败或模型关闭超时返回非零退出状态，episode 原始结束原因独立保留。模型关闭超时表示尚未完成；Python 线程或 CUDA 阻塞仍可能延迟进程退出。
 

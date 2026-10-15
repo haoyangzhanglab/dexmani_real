@@ -1,4 +1,23 @@
-"""Canonical multimodal representations and their numerical recipes."""
+"""Canonical multimodal representations and their numerical recipes.
+
+Public float32 fields (leading T in Zarr, N for Policy observation history):
+  fingertip_xyz: (5,3), FK fingertip link positions in xarm_base, meters.
+  finger_tactile_force: (5,3), XHand SDK aggregate XYZ readings in SDK units.
+  taxel_tactile_force: (5,120,3), XHand SDK taxel XYZ readings in SDK units.
+Finger order is thumb/index/middle/ring/pinky; taxel/axis order is unchanged.
+Tactile values are consumed Raw readings, including acquisition's bounded hold;
+export applies no bias, normalization, sum or mean. Real aggregate tactile and
+Sim contact force share an interface, not an identical physical measurement.
+
+camera_intrinsic: (9,), color RGB pinhole K=[[fx,0,cx],[0,fy,cy],[0,0,1]].
+camera_extrinsic: (12,), inv(T_xarm_base_from_color)[:3,:4], i.e. [R|t].
+Both flatten in C-order. p_color = R @ p_base + t, with optical RDF axes
+(right/down/forward). Real's reference is xarm_base, not Sim's numerical World.
+K/E do not encode distortion: Raw retains the color distortion model,
+coefficients and depth_scale; RGB-D and point-cloud distortion handling stay intact.
+Each episode uses its own Raw camera geometry; deployment uses the active session.
+All 15 arrays share one time axis. Rebuild older canonical caches from Raw.
+"""
 
 from __future__ import annotations
 
@@ -75,10 +94,12 @@ _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "hand_current": ((12,), np.dtype(np.float32)),
     "action": ((19,), np.dtype(np.float32)),
     "action_ee": ((21,), np.dtype(np.float32)),
-    "contact_force": ((5, 3), np.dtype(np.float32)),
-    "tactile_force": ((5, 120, 3), np.dtype(np.float32)),
-    "fingertip_points": ((5, 3), np.dtype(np.float32)),
+    "finger_tactile_force": ((5, 3), np.dtype(np.float32)),
+    "taxel_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
+    "fingertip_xyz": ((5, 3), np.dtype(np.float32)),
     "eef_pose": ((9,), np.dtype(np.float32)),
+    "camera_intrinsic": ((9,), np.dtype(np.float32)),
+    "camera_extrinsic": ((12,), np.dtype(np.float32)),
 }
 
 

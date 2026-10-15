@@ -15,10 +15,12 @@ _SUPPORTED_OBSERVATION_FIELDS = frozenset(
         "joint_state",
         "point_cloud",
         "rgb",
-        "contact_force",
-        "fingertip_points",
+        "finger_tactile_force",
+        "fingertip_xyz",
         "eef_pose",
-        "tactile_force",
+        "taxel_tactile_force",
+        "camera_intrinsic",
+        "camera_extrinsic",
     }
 )
 
@@ -55,7 +57,7 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
         )
     if info.action_mode not in {"joint", "eef"}:
         raise ValueError(f"unsupported Real action mode: {info.action_mode!r}")
-    if "fingertip_points" in names:
+    if "fingertip_xyz" in names:
         links = info.fingertip_link_names
         if (
             not isinstance(links, (list, tuple))
@@ -63,7 +65,7 @@ def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloud
             or any(not isinstance(link, str) or not link.strip() for link in links)
             or len(set(links)) != 5
         ):
-            raise ValueError("Live fingertip_points requires five distinct non-empty link names")
+            raise ValueError("Live fingertip_xyz requires five distinct non-empty link names")
     if "point_cloud" in names:
         from dexmani_real.config.pointcloud import PointCloudConfig
 

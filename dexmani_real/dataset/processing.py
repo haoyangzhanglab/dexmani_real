@@ -21,6 +21,7 @@ from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
 from dexmani_real.recording.storage.schema import DATASET_SPECS, validate_training_rows
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
+from dexmani_real.sensor.camera.geometry import camera_parameters_cv
 
 
 def validate_export_episode(
@@ -36,9 +37,6 @@ def validate_export_episode(
         "camera_color_intrinsics", "camera_color_distortion_model",
         "camera_color_distortion_coeffs", "camera_T_xarm_base_from_color",
     )
-    scale = float(reader.meta["depth_scale"])
-    if not np.isfinite(scale) or scale <= 0:
-        raise RawDataError("RGB-D export requires a known positive depth_scale")
     expected = (
         frames,
         int(reader.meta["camera_color_height"]),
@@ -102,6 +100,12 @@ def iter_canonical_blocks(
 ):
     """Check and convert each Raw block without repairing or resampling rows."""
     height, width = int(reader.meta["camera_color_height"]), int(reader.meta["camera_color_width"])
+    try:
+        camera_parameters = camera_parameters_cv(
+            pointcloud_deriver.camera.geometry.color, pointcloud_deriver.T_xarm_base_from_color,
+        )
+    except ValueError as exc:
+        raise RawDataError(f"invalid camera parameters: {exc}") from exc
     hand_fk = HandKinematics(str(XHAND_RIGHT_URDF_PATH), list(config.fingertip_link_names))
     images = _iter_rgb_frames(reader)
     for start in range(0, reader.num_frames, chunk_frames):
@@ -131,12 +135,14 @@ def iter_canonical_blocks(
             "action": np.concatenate((arm_action, hand_action), axis=1).astype(np.float32),
             "action_ee": np.concatenate((action_poses, hand_action), axis=1).astype(np.float32),
             "eef_pose": poses.astype(np.float32),
-            "fingertip_points": tips.astype(np.float32),
-            "contact_force": raw["hand_contact"],
-            "tactile_force": raw["hand_tactile_force"],
+            "fingertip_xyz": tips.astype(np.float32),
+            "finger_tactile_force": raw["hand_contact"],
+            "taxel_tactile_force": raw["hand_tactile_force"],
         }
         for name in ("arm_qvel", "arm_effort", "hand_current"):
             block[name] = raw[name].astype(np.float32)
+        for name, values in camera_parameters.items():
+            block[name] = np.broadcast_to(values, (end - start, values.size))
         rgb, depth, clouds = [], [], []
         for index in range(start, end):
             image = next(images, None)

@@ -89,6 +89,7 @@ class PolicyRunner:
         num_episodes=20,
         task_label=None,
         camera_calibration=None,
+        camera_parameters=None,
         results=None,
     ):
         self.results = results
@@ -105,6 +106,7 @@ class PolicyRunner:
         self.num_episodes = num_episodes
         self.task_label = task_label
         self.camera_calibration = camera_calibration
+        self.camera_parameters = camera_parameters
         self.recorder = recorder
         self.history = deque(maxlen=policy_info.n_obs_steps)
         self.recording_started = False
@@ -129,8 +131,12 @@ class PolicyRunner:
         fields = set(self.policy_info.observation_fields)
         requires_rgb = "rgb" in fields
         self.requires_cloud = "point_cloud" in fields
-        self.requires_camera_payload = requires_rgb or self.recorder is not None
-        self.requires_rgb_cloud_identity = self.requires_camera_payload and self.requires_cloud
+        self.requires_camera_payload = bool(
+            fields & {"rgb", "camera_intrinsic", "camera_extrinsic"}
+        ) or self.recorder is not None
+        self.requires_rgb_cloud_identity = (
+            requires_rgb or self.recorder is not None
+        ) and self.requires_cloud
 
     def _read_observation(self, *, wait_for_hand=False):
         self.observation_read_issues.clear()
@@ -309,8 +315,9 @@ class PolicyRunner:
     def _observation_issue(self, row):
         if row is None and self.observation_read_issues:
             issue = self.observation_read_issues[0]
-            if (self.recorder is not None and "rgb" not in self.policy_info.observation_fields
-                    and issue.startswith("camera_")):
+            if (self.recorder is not None and issue.startswith("camera_")
+                    and not (set(self.policy_info.observation_fields)
+                             & {"rgb", "camera_intrinsic", "camera_extrinsic"})):
                 return f"recording_source_{issue}"
             return f"policy_input_{issue}"
         return policy_observation_issue(row, self.policy_info.observation_fields)
@@ -531,7 +538,10 @@ class PolicyRunner:
         query.result = future
 
     def _submit(self, rows, slot, *, handoff_slot=None, prefix=None, commands=None):
-        observation = build_policy_observation(rows, self.policy_info, kinematics=self.kinematics)
+        observation = build_policy_observation(
+            rows, self.policy_info, kinematics=self.kinematics,
+            camera_parameters=self.camera_parameters,
+        )
         now = time.monotonic_ns()
         authorized = self._has_motion_authority()
         expired = self._expired_budget()

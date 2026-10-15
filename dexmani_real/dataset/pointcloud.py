@@ -28,10 +28,8 @@ class RawEpisodeCameraModel:
 
 def _color_intrinsics_from_meta(meta: Any) -> CameraIntrinsics:
     matrix = np.asarray(meta["camera_color_intrinsics"], dtype=np.float64).reshape(3, 3)
-    if not np.allclose(matrix[2], (0.0, 0.0, 1.0), rtol=0.0, atol=1e-9):
-        raise ValueError("camera_color_intrinsics must be a canonical pinhole matrix")
     coefficients = tuple(float(value) for value in meta["camera_color_distortion_coeffs"])
-    return CameraIntrinsics(
+    color = CameraIntrinsics(
         width=int(meta["camera_color_width"]),
         height=int(meta["camera_color_height"]),
         fx=float(matrix[0, 0]),
@@ -41,6 +39,10 @@ def _color_intrinsics_from_meta(meta: Any) -> CameraIntrinsics:
         distortion_model=str(meta["camera_color_distortion_model"]),
         distortion_coeffs=cast(tuple[float, float, float, float, float], coefficients),
     )
+    # Do not silently discard skew, invalid off-diagonal entries or a malformed last row.
+    if not np.allclose(matrix, color.matrix(), rtol=0.0, atol=1e-9):
+        raise ValueError("camera_color_intrinsics must be a canonical pinhole matrix")
+    return color
 
 
 def load_raw_episode_camera_model(reader: EpisodeReader) -> RawEpisodeCameraModel:
@@ -71,7 +73,6 @@ def load_raw_episode_base_from_color(reader: EpisodeReader) -> np.ndarray:
         np.asarray(meta["camera_T_xarm_base_from_color"]).reshape(4, 4),
         label="camera_T_xarm_base_from_color",
     )
-    transform = transform.copy()
     transform.setflags(write=False)
     return transform
 

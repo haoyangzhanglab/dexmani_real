@@ -60,7 +60,7 @@ def export_raw_to_zarr(
     exclude: tuple[str, ...] = (),
     progress_callback=None,
 ) -> dict:
-    """Export all 13 modalities; reject incomplete episodes without changing Raw.
+    """Export all 15 modalities; reject incomplete episodes without changing Raw.
     Unexpected conversion/write failures abort publication and retain staging.
     """
     config = config or CanonicalExportConfig()

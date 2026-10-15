@@ -9,7 +9,9 @@ import numpy as np
 
 from dexmani_real.utils.geometry import validate_rigid_transform
 
-__all__ = ["CameraIntrinsics", "RGBDGeometry", "validate_aligned_depth_distortion"]
+__all__ = [
+    "CameraIntrinsics", "RGBDGeometry", "camera_parameters_cv", "validate_aligned_depth_distortion",
+]
 
 
 def validate_aligned_depth_distortion(model: str) -> None:
@@ -109,6 +111,33 @@ class CameraIntrinsics:
             [[self.fx, 0.0, self.ppx], [0.0, self.fy, self.ppy], [0.0, 0.0, 1.0]],
             dtype=dtype,
         )
+
+
+def camera_parameters_cv(
+    color: CameraIntrinsics, T_xarm_base_from_color: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Return float32 C-order K(9) and, when supplied, base-to-color [R|t](12).
+
+    RealSense color and OpenCV calibration both use optical RDF (right/down/forward).
+    No OpenGL axis conversion or image undistortion is involved; K omits distortion.
+    Omitting the transform produces only K, never a default external calibration.
+    """
+    matrices = {"camera_intrinsic": color.matrix()}
+    if T_xarm_base_from_color is not None:
+        base_from_color = validate_rigid_transform(
+            T_xarm_base_from_color, label="T_xarm_base_from_color"
+        )
+        matrices["camera_extrinsic"] = np.linalg.inv(base_from_color)[:3, :4]
+    result = {}
+    for name, matrix in matrices.items():
+        if not np.isfinite(matrix).all() or np.any(np.abs(matrix) > np.finfo(np.float32).max):
+            raise ValueError(f"{name} must be finite and representable as float32")
+        values = matrix.astype(np.float32).reshape(-1)
+        if name == "camera_intrinsic" and (values[0] <= 0 or values[4] <= 0):
+            raise ValueError("camera_intrinsic fx/fy must remain positive in float32")
+        values.setflags(write=False)
+        result[name] = values
+    return result
 
 
 @dataclass(frozen=True)
