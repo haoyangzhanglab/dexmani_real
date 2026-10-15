@@ -132,6 +132,8 @@ def parse_args(argv=None, *, workspace=None):
     parser.add_argument("--offline-input", action="store_true", help="只检查离线输入所需依赖，不要求 RealSense SDK")
     parser.add_argument("--headless", action="store_true", help="不要求图形会话；仍检查 FoundationPose 使用的 Open3D")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出全部检查项目")
+    from ..sam2_config import add_sam_arguments
+    add_sam_arguments(parser, workspace)
     return parser.parse_args(argv)
 
 
@@ -139,6 +141,9 @@ def main(argv=None, *, workspace=None) -> int:
     args = parse_args(argv, workspace=workspace)
     report = check_tracking_environment(args.foundationpose_root,
                                         need_camera=not args.offline_input, need_gui=not args.headless)
+    from ..sam2_config import check_sam_environment
+    report["checks"].extend(check_sam_environment(args))
+    report["ok"] = all(item["ok"] for item in report["checks"])
     print_tracking_report(report, as_json=args.json)
     return 0 if report["ok"] else 1
 

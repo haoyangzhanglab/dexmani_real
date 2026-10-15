@@ -1,211 +1,200 @@
-"""Local Grounding DINO + SAM 2.1 image segmentation for an example subprocess.
+"""One persistent Grounded-SAM2 process with cancellable, frame-matched replies."""
 
-Importing this module loads neither model nor device. Model files must already
-exist locally; downloading and choosing among detections belong to the caller.
-"""
-
-from contextlib import nullcontext
-import gc
-import hashlib
+import os
 from pathlib import Path
-import sys
-import zipfile
+import signal
+import subprocess
+import threading
+import time
+import uuid
 
 import numpy as np
 
-
-def _file(path):
-    path = Path(path).expanduser().resolve()
-    if not path.is_file() or path.stat().st_size == 0:
-        raise FileNotFoundError(f"Missing or empty local model file: {path}")
-    pending = [path.with_name(path.name + suffix) for suffix in (".aria2", ".part", ".incomplete")]
-    if any(marker.exists() for marker in pending):
-        raise ValueError(f"Local model download is unfinished: {path}")
-    return path
+from ._segmentation_ipc import receive, send
 
 
-def _sha256(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+class GroundedSAM2Segmenter:
+    """Synchronous owner-thread API; one request in flight and no frame queue.
 
-
-def normalize_prompt(prompt):
-    """Grounding DINO expects lowercase, period-separated object descriptions."""
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError("Object prompt must be nonempty text")
-    prompt = prompt.strip().lower()
-    if not prompt.rstrip(". "):
-        raise ValueError("Object prompt must contain an object description")
-    return prompt if prompt.endswith(".") else prompt + "."
-
-
-class GroundedSegmenter:
-    """Detect all text-matching candidates and return their full-resolution masks.
-
-    SAM and Grounding DINO scores are model outputs, not tracking confidence or
-    proof of mask correctness. The caller must explicitly select a candidate.
-    Use in a fresh example process because SAM initializes Hydra globally.
+    Construction is cheap. ``start`` loads the child model on the inference owner.
+    ``cancel`` may be called by the GUI: it revokes the session and terminates only
+    its process group, including any child processes. It never interrupts a
+    FoundationPose CUDA call in the parent.
     """
 
-    def __init__(self, dino_weights, sam_root, sam_checkpoint,
-                 sam_config="configs/sam2.1/sam2.1_hiera_l.yaml", device="cuda"):
-        self._processor = self._detector = self._predictor = None
-        self._closed = False
+    def __init__(self, sam_python, sam_root, checkpoint, *, sam_config, dino_weights, log_path):
+        self.python = Path(sam_python).expanduser().absolute()
+        self.root = Path(sam_root).expanduser().resolve()
+        self.checkpoint = Path(checkpoint).expanduser().resolve()
+        self.log_path = Path(log_path)
+        self.config = sam_config
         self.dino_weights = Path(dino_weights).expanduser().resolve()
-        self.sam_root = Path(sam_root).expanduser().resolve()
-        self.sam_checkpoint = _file(sam_checkpoint)
-        if not zipfile.is_zipfile(self.sam_checkpoint):
-            raise ValueError(f"SAM 2.1 checkpoint is incomplete or not a PyTorch ZIP archive: {self.sam_checkpoint}")
-        self.sam_config = str(sam_config)
-        config_path = (self.sam_root / "sam2" / self.sam_config).resolve()
-        if Path(self.sam_config).is_absolute() or not config_path.is_relative_to(self.sam_root / "sam2"):
-            raise ValueError("SAM config must be relative to the checkout's sam2 package")
-        _file(config_path)
-        _file(self.sam_root / "sam2" / "build_sam.py")
-        _file(self.dino_weights / "config.json")
-        dino_checkpoints = sorted(self.dino_weights.glob("*.safetensors"))
-        if not dino_checkpoints:
-            raise FileNotFoundError(f"Local safetensors Grounding DINO weights missing: {self.dino_weights}")
-        for checkpoint in dino_checkpoints:
-            _file(checkpoint)
+        self.provenance = None
+        self.last_metrics = {}
+        self._process = self._log = None
+        self._session = uuid.uuid4().hex
+        self._counter = 0
+        self._ids = None
+        self._shape = None
+        self._cancelled = threading.Event()
+        self._lifecycle = threading.Lock()
+        self._request = threading.Lock()
 
-        import torch
-        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
-
-        self.device = torch.device(device)
-        if self.device.type not in ("cpu", "cuda"):
-            raise ValueError("Only explicit cpu or cuda devices are supported")
-        if self.device.type == "cuda":
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA unavailable; CPU mode must be requested explicitly")
-            if self.device.index is not None and self.device.index >= torch.cuda.device_count():
-                raise ValueError(f"CUDA device does not exist: {self.device}")
-
-        loaded = sys.modules.get("sam2")
-        if loaded is not None:
-            source = getattr(loaded, "__file__", None)
-            if source is None or not Path(source).resolve().is_relative_to(self.sam_root):
-                raise RuntimeError("A different sam2 package is loaded; use a fresh subprocess")
-        previous_path = sys.path.copy()
+    def start(self):
+        with self._lifecycle:
+            if self._cancelled.is_set():
+                raise RuntimeError('SAM2 session was cancelled')
+            if self._process is not None:
+                return self
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log = self.log_path.open('xb')
+            env = os.environ.copy()
+            env.pop('PYTHONHOME', None)
+            env['PYTHONPATH'] = os.pathsep.join((str(Path(__file__).parents[1]), str(self.root)))
+            env['PYTHONNOUSERSITE'] = '1'
+            command = [str(self.python), '-u', '-m', 'cordvip_geometry.segmentation_worker',
+                       '--sam-root', str(self.root), '--checkpoint', str(self.checkpoint),
+                       '--sam-config', self.config, '--dino-weights', str(self.dino_weights)]
+            try:
+                self._process = subprocess.Popen(
+                    command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log,
+                    env=env, start_new_session=True)
+            except BaseException:
+                self._log.close()
+                self._log = None
+                raise
         try:
-            sys.path.insert(0, str(self.sam_root))
-            from sam2.build_sam import build_sam2
-            from sam2.sam2_image_predictor import SAM2ImagePredictor
-
-            self._processor = AutoProcessor.from_pretrained(
-                str(self.dino_weights), local_files_only=True, trust_remote_code=False,
-            )
-            self._detector = AutoModelForZeroShotObjectDetection.from_pretrained(
-                str(self.dino_weights), local_files_only=True,
-                trust_remote_code=False, use_safetensors=True, disable_custom_kernels=True,
-            ).to(self.device).eval()
-            self._predictor = SAM2ImagePredictor(build_sam2(
-                self.sam_config, str(self.sam_checkpoint), device=str(self.device),
-            ))
+            reply, _ = self._call('load')
+            self.provenance = reply['provenance']
         except BaseException:
             self.close()
             raise
+        return self
+
+    def _call(self, operation, arrays=None, *, frame_key=None, **parameters):
+        if not self._request.acquire(blocking=False):
+            raise RuntimeError('SAM2 allows exactly one in-flight request')
+        try:
+            if self._cancelled.is_set() or self._process is None:
+                raise RuntimeError('SAM2 session is not running')
+            self._counter += 1
+            identity = dict(session=self._session, request=self._counter, frame_key=frame_key)
+            started = time.monotonic_ns()
+            send(self._process.stdin, dict(**identity, operation=operation, **parameters), arrays)
+            reply, result = receive(self._process.stdout)
+            if self._cancelled.is_set() or any(reply.get(k) != v for k, v in identity.items()):
+                raise RuntimeError('Rejected cancelled or mismatched SAM2 reply')
+            if reply.get('error'):
+                raise RuntimeError(f"SAM2 {operation}: {reply['error']}; log: {self.log_path}")
+            self.last_metrics = reply['metrics']
+            self.last_metrics['round_trip_ms'] = (time.monotonic_ns() - started) / 1e6
+            self.last_metrics['ipc_and_dispatch_ms'] = max(
+                0., self.last_metrics['round_trip_ms'] - self.last_metrics['compute_ms'])
+            return reply, result
+        except (EOFError, BrokenPipeError) as error:
+            self.cancel()
+            raise RuntimeError(f'SAM2 worker stopped; log: {self.log_path}') from error
+        except Exception:
+            self.cancel()
+            raise
         finally:
-            sys.path[:] = previous_path
+            self._request.release()
 
-        self.provenance = {
-            "method": "Grounding DINO + SAM 2.1",
-            "dino_weights": str(self.dino_weights),
-            "dino_weights_sha256": {path.name: _sha256(path) for path in dino_checkpoints},
-            "dino_configuration_sha256": {
-                path.name: _sha256(path) for path in sorted(self.dino_weights.glob("*.json"))
-            },
-            "sam_root": str(self.sam_root),
-            "sam_config": self.sam_config,
-            "sam_config_sha256": _sha256(config_path),
-            "sam_checkpoint": str(self.sam_checkpoint),
-            "sam_checkpoint_sha256": _sha256(self.sam_checkpoint),
-            "device": str(self.device),
-            "dino_disable_custom_kernels": True,
-        }
-
-    def predict(self, rgb, prompt, box_threshold=0.3, text_threshold=0.25):
-        """Return score-sorted dicts: box_xyxy, mask, score, mask_score, label.
-
-        Boxes are pixel coordinates in the original RGB image. Masks are bool
-        arrays [H,W]; score/mask_score/label are ordinary Python values. No
-        detection returns [] rather than a made-up whole-image foreground.
-        """
-        if self._closed:
-            raise RuntimeError("Segmenter has been closed")
+    @staticmethod
+    def _rgb(rgb):
         rgb = np.asarray(rgb)
         if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3 or min(rgb.shape[:2]) < 2:
-            raise ValueError("RGB must be a uint8 [H,W,3] array with nonempty dimensions")
-        prompt = normalize_prompt(prompt)
-        for value in (box_threshold, text_threshold):
-            if not np.isfinite(value) or not 0 <= value <= 1:
-                raise ValueError("Detection thresholds must lie in [0,1]")
+            raise ValueError('SAM2 expects RGB uint8 [H,W,3]')
+        return rgb
 
-        import torch
-        from PIL import Image
+    def predict(self, rgb, text, *, box_threshold=.3, text_threshold=.25, frame_key=None):
+        if self._ids is not None:
+            raise RuntimeError('Text detection is only allowed before fixed-ID tracking starts')
+        rgb = self._rgb(rgb)
+        if (not isinstance(text, str) or not text.strip()
+                or any(not 0 < x < 1 for x in (box_threshold, text_threshold))):
+            raise ValueError('Provide a nonempty prompt and detection thresholds in (0,1)')
+        reply, arrays = self._call('predict', {'rgb': rgb}, text=text.strip(),
+                                  box_threshold=box_threshold, text_threshold=text_threshold, frame_key=frame_key)
+        try:
+            masks, labels = arrays['masks'], reply['labels']
+            count = len(masks)
+            if (masks.dtype != np.bool_ or masks.shape != (count, *rgb.shape[:2])
+                    or arrays['boxes'].shape != (count, 4) or arrays['scores'].shape != (count,)
+                    or arrays['mask_scores'].shape != (count,) or len(labels) != count
+                    or any(not isinstance(label, str) for label in labels)
+                    or any(not np.isfinite(arrays[k]).all() for k in ('boxes', 'scores', 'mask_scores'))):
+                raise RuntimeError('Grounded-SAM2 returned invalid candidates')
+            self.provenance.update(reply['provenance'])
+            return [dict(mask=mask, box_xyxy=arrays['boxes'][i], score=float(arrays['scores'][i]),
+                         mask_score=float(arrays['mask_scores'][i]), label=labels[i])
+                    for i, mask in enumerate(masks)]
+        except Exception:
+            self.cancel()
+            raise
 
-        inputs = self._processor(
-            images=Image.fromarray(rgb), text=prompt, return_tensors="pt",
-        ).to(self.device)
-        with torch.inference_mode():
-            outputs = self._detector(**inputs)
-            result = self._processor.post_process_grounded_object_detection(
-                outputs, inputs.input_ids, box_threshold=box_threshold,
-                text_threshold=text_threshold, target_sizes=[rgb.shape[:2]],
-            )[0]
-        boxes = result["boxes"].detach().float().cpu().numpy()
-        detection_scores = result["scores"].detach().float().cpu().numpy()
-        labels = result["labels"]
-        if len(boxes) == 0:
-            return []
-        if boxes.shape != (len(detection_scores), 4) or len(labels) != len(boxes):
-            raise RuntimeError("Grounding DINO returned inconsistent detections")
-        if not np.isfinite(boxes).all() or not np.isfinite(detection_scores).all():
-            raise RuntimeError("Grounding DINO returned nonfinite boxes/scores")
-        boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, rgb.shape[1])
-        boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, rgb.shape[0])
-        valid = np.flatnonzero((boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1]))
-        if len(valid) == 0:
-            return []
-        boxes = boxes[valid]
-        autocast = (torch.autocast("cuda", dtype=torch.bfloat16)
-                    if self.device.type == "cuda" else nullcontext())
-        with torch.inference_mode(), autocast:
-            self._predictor.set_image(np.ascontiguousarray(rgb))
-            masks, mask_scores, _ = self._predictor.predict(
-                point_coords=None, point_labels=None, box=boxes, multimask_output=False,
-            )
-        masks = np.asarray(masks)
-        if masks.ndim == 4 and masks.shape[1] == 1:
-            masks = masks[:, 0]
-        mask_scores = np.asarray(mask_scores).reshape(-1)
-        if masks.shape != (len(boxes), *rgb.shape[:2]) or mask_scores.shape != (len(boxes),):
-            raise RuntimeError("SAM returned an unexpected mask shape")
-        if not np.isfinite(mask_scores).all():
-            raise RuntimeError("SAM returned nonfinite mask scores")
-        candidates = []
-        for index, source in enumerate(valid):
-            mask = masks[index].astype(bool)
-            if not mask.any():
-                continue
-            candidates.append({
-                "box_xyxy": boxes[index].astype(np.float32, copy=True),
-                "mask": mask,
-                "score": float(detection_scores[source]),
-                "mask_score": float(mask_scores[index]),
-                "label": str(labels[source]),
-            })
-        return sorted(candidates, key=lambda candidate: candidate["score"], reverse=True)
+    def initialize(self, rgb, masks, *, frame_key=None):
+        rgb = self._rgb(rgb)
+        if self._ids is not None:
+            raise RuntimeError('Create a new SAM2 session for explicit reinitialization')
+        if not isinstance(masks, dict) or not masks:
+            raise ValueError('Provide nonempty fixed named masks for the scene')
+        for name, mask in masks.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError('Object IDs must be nonempty strings')
+            mask = np.asarray(mask)
+            if mask.dtype != np.bool_ or mask.shape != rgb.shape[:2] or not mask.any():
+                raise ValueError(f'Initial mask {name} must be nonempty bool [H,W]')
+        ids = list(masks)
+        reply, arrays = self._call('initialize', {'rgb': rgb, 'masks': np.stack(list(masks.values()))},
+                                   ids=ids, frame_key=frame_key)
+        self._ids, self._shape = ids, rgb.shape[:2]
+        return self._masks(reply, arrays)
+
+    def _masks(self, reply, arrays):
+        try:
+            masks = arrays['masks']
+            if (reply['ids'] != self._ids or masks.dtype != np.bool_
+                    or masks.shape != (len(self._ids), *self._shape) or np.any(masks.sum(axis=0) > 1)):
+                raise RuntimeError('SAM2 returned invalid masks or changed fixed identities')
+            return dict(zip(self._ids, masks))
+        except Exception:
+            self.cancel()
+            raise
+
+    def track(self, rgb, *, frame_key=None):
+        rgb = self._rgb(rgb)
+        if self._ids is None or rgb.shape[:2] != self._shape:
+            raise ValueError('Initialize first; frame shape must remain fixed')
+        reply, arrays = self._call('track', {'rgb': rgb}, frame_key=frame_key)
+        return self._masks(reply, arrays)
+
+    def cancel(self):
+        self._cancelled.set()
+        with self._lifecycle:
+            if self._process is not None:
+                self._signal_group(signal.SIGTERM)
+
+    def _signal_group(self, sig):
+        # The worker owns a separate session. Never signal the caller or unrelated processes.
+        try:
+            os.killpg(self._process.pid, sig)
+        except ProcessLookupError:
+            pass
 
     def close(self):
-        """Release model references. A subprocess exit also releases CUDA state."""
-        self._predictor = self._detector = self._processor = None
-        self._closed = True
-        gc.collect()
-        torch = sys.modules.get("torch")
-        if torch is not None and getattr(self, "device", None) is not None and self.device.type == "cuda":
-            with torch.cuda.device(self.device):
-                torch.cuda.empty_cache()
+        self.cancel()
+        with self._lifecycle:
+            if self._process is not None:
+                try:
+                    self._process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self._signal_group(signal.SIGKILL)
+                    self._process.wait(timeout=2)
+                self._signal_group(signal.SIGKILL)
+                self._process.stdin.close()
+                self._process.stdout.close()
+                self._process = None
+            if self._log is not None:
+                self._log.close()
+                self._log = None

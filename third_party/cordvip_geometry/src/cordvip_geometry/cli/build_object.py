@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""单图建模：Grounded-SAM-2 选物体、Hunyuan3D-2.1 生成 mesh 与点云、显式定尺度。
+"""单图建模：Grounded-SAM2 选物体、Hunyuan3D-2.1 生成 mesh 与点云、显式定尺度。
 
 这里只读取照片或已保存的 RGB-D，不连接任何设备。segment / select /
 generate 可分别运行；build 使用子进程依次执行，阶段结束即释放 GPU。
@@ -37,28 +37,9 @@ def _load_rgb(args):
             rgb = np.asarray(ImageOps.exif_transpose(image).convert("RGB")).copy()
         info.update(input_type="image", exif_orientation="applied_to_saved_rgb")
     else:
-        from ..rgbd import Frame
+        from ..rgbd import load_frame
 
-        with np.load(path, allow_pickle=False) as saved:
-            required = ("rgb", "depth_m", "K", "distortion_model", "distortion_coeffs", "source_id", "timestamp_ns", "clock")
-            missing = sorted(set(required) - set(saved.files))
-            if missing:
-                raise ValueError(f"RGB-D NPZ 缺少字段：{missing}；不推断单位或内参")
-            text = {}
-            for name in ("distortion_model", "source_id", "clock"):
-                value = saved[name]
-                if value.shape != () or value.dtype.kind != "U":
-                    raise ValueError(f"{name} 必须是标量 Unicode 字符串")
-                text[name] = str(value.item())
-            timestamp = saved["timestamp_ns"]
-            if timestamp.shape != () or timestamp.dtype.kind not in {"i", "u"}:
-                raise ValueError("timestamp_ns 必须是标量整数")
-            coefficients = saved["distortion_coeffs"]
-            if coefficients.shape != (5,) or coefficients.dtype.kind not in {"f", "i", "u"}:
-                raise ValueError("distortion_coeffs 必须包含五个数值")
-            frame = Frame(rgb=saved["rgb"], depth_m=saved["depth_m"], K=saved["K"],
-                          distortion_coeffs=tuple(float(value) for value in coefficients),
-                          timestamp_ns=int(timestamp.item()), **text)
+        frame = load_frame(path)
         rgb = frame.rgb
         info.update(input_type="saved_rgbd", source_id=frame.source_id,
                     timestamp_ns=frame.timestamp_ns, clock=frame.clock,
@@ -78,7 +59,7 @@ def _overlay(rgb, candidate, index):
     image = Image.fromarray(canvas)
     draw = ImageDraw.Draw(image)
     draw.rectangle(tuple(float(x) for x in candidate["box_xyxy"]), outline=(255, 180, 0), width=2)
-    caption = f"#{index} {candidate['label']}  detection={candidate['score']:.3f}  mask={candidate['mask_score']:.3f}"
+    caption = f"#{index} {candidate['label']}  detection={candidate['score']:.3f}"
     draw.rectangle((0, 0, image.width, 22), fill=(20, 20, 20))
     draw.text((5, 4), caption, fill=(255, 255, 255))
     return image
@@ -101,7 +82,7 @@ def _save_candidates(output, rgb, candidates):
     for index, candidate in enumerate(candidates):
         thumb = _overlay(rgb, candidate, index).resize((width, height))
         sheet.paste(thumb, ((index % columns) * width, (index // columns) * height))
-        print(f"候选 {index}: {candidate['label']}，检测分数 {candidate['score']:.3f}，mask 分数 {candidate['mask_score']:.3f}", flush=True)
+        print(f"候选 {index}: {candidate['label']}，检测分数 {candidate['score']:.3f}", flush=True)
     sheet.save(output / "candidates.jpg", quality=95)
 
 
@@ -117,7 +98,7 @@ def _choose(rgb, candidates, instance, *, headless):
     import numpy as np
 
     index = 0 if instance is None else instance
-    title = "Grounded-SAM-2: n/p candidate; Enter confirm; Esc cancel"
+    title = "Grounded-SAM2: n/p candidate; Enter confirm; Esc cancel"
     cv2.namedWindow(title, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(title, min(rgb.shape[1], 1280), min(rgb.shape[0], 850))
     try:
@@ -152,7 +133,8 @@ def _save_selection(output, rgb, candidates, index, provenance):
     _write_json(output / "selection.json", {
         **provenance, "selected_instance": index, "selection": "explicit_headless_instance" if provenance.get("headless") else "gui_confirmed",
         "label": candidate["label"], "box_xyxy": candidate["box_xyxy"].tolist(),
-        "detection_score": candidate["score"], "mask_score": candidate["mask_score"],
+        "detection_score": candidate["score"], "score_kind": "grounding_dino",
+        "mask_score": candidate["mask_score"], "mask_score_kind": "sam2_predicted_iou",
         "rgb_sha256": _sha256(output / "rgb.png"),
         "mask_sha256": _sha256(output / "mask.png"),
         "foreground_sha256": _sha256(output / "foreground_rgba.png"),
@@ -174,21 +156,24 @@ def _segment(args):
     Image.fromarray(rgb).save(output / "rgb.png")
     source_name = "source_rgbd.npz" if args.rgbd is not None else f"source{source.suffix.lower()}"
     shutil.copyfile(source, output / source_name)
-    provenance.update(method="Grounding DINO + SAM 2.1", prompt=args.text,
-                      dino_weights=str(args.dino_weights.expanduser().resolve()), sam_root=str(args.sam_root.expanduser().resolve()),
-                      sam_checkpoint=str(args.sam_checkpoint.expanduser().resolve()), sam_config=args.sam_config,
+    provenance.update(method="Grounded-SAM2 text segmentation", prompt=args.text,
+                      sam_root=str(args.sam_root.expanduser().resolve()),
+                      sam_python=str(args.sam_python.expanduser().absolute()),
+                      sam_checkpoint=str(args.sam_checkpoint.expanduser().resolve()),
+                      sam_config=args.sam_config, dino_weights=str(args.dino_weights.expanduser().resolve()),
                       box_threshold=args.box_threshold, text_threshold=args.text_threshold,
-                      device=args.device, headless=args.headless,
-                      saved_source=source_name, candidate_order="descending_detection_score; zero_based")
+                      device='cuda:0', headless=args.headless,
+                      saved_source=source_name, candidate_order="descending_grounding_dino_score; zero_based")
     _write_json(output / "segmentation_request.json", provenance)
-    from ..segmentation import GroundedSegmenter
-
-    segmenter = GroundedSegmenter(dino_weights=args.dino_weights, sam_root=args.sam_root,
-                                 sam_checkpoint=args.sam_checkpoint, sam_config=args.sam_config, device=args.device)
+    from ..segmentation import GroundedSAM2Segmenter
+    segmenter = GroundedSAM2Segmenter(args.sam_python, args.sam_root, args.sam_checkpoint,
+                                     sam_config=args.sam_config, dino_weights=args.dino_weights,
+                                     log_path=output / 'sam2_worker.log')
     try:
+        segmenter.start()
         candidates = segmenter.predict(rgb, args.text, box_threshold=args.box_threshold,
                                        text_threshold=args.text_threshold)
-        provenance.update(model=segmenter.provenance)
+        provenance.update(model=segmenter.provenance, performance=segmenter.last_metrics)
     finally:
         segmenter.close()
     if not candidates:
@@ -219,7 +204,8 @@ def _select(args):
         rgb = np.asarray(image.convert("RGB")).copy()
     with np.load(_existing_file(source / "candidates.npz"), allow_pickle=False) as saved:
         candidates = [dict(mask=mask, box_xyxy=saved["boxes"][i], score=float(saved["scores"][i]),
-                           mask_score=float(saved["mask_scores"][i]), label=str(saved["labels"][i]))
+                           mask_score=float(saved["mask_scores"][i]),
+                           label=str(saved["labels"][i]))
                       for i, mask in enumerate(saved["masks"])]
     if not candidates or any(c["mask"].dtype != np.bool_ or c["mask"].shape != rgb.shape[:2] for c in candidates):
         raise ValueError("保存的候选 mask 与 RGB 不一致")
@@ -307,18 +293,12 @@ def _generate(args):
 
 
 def _add_segment_arguments(parser, *, workspace):
-    models = workspace / "reports" / "cordvip_models"
-    source_root = workspace / "third_party"
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--image", type=Path, help="物体照片；按 EXIF 纠正朝向")
     source.add_argument("--rgbd", type=Path, help="单帧已保存的规范 RGB-D NPZ；不连接相机")
     parser.add_argument("--text", required=True, help="英文物体描述，例如 'red mug.'")
-    parser.add_argument("--dino-weights", type=Path, default=models / "grounding-dino-base")
-    parser.add_argument("--sam-root", type=Path, default=source_root / "Grounded-SAM-2")
-    parser.add_argument("--sam-checkpoint", type=Path, default=models / "sam2.1_hiera_large.pt")
-    parser.add_argument("--sam-config", default="configs/sam2.1/sam2.1_hiera_l.yaml")
-    parser.add_argument("--box-threshold", type=float, default=0.3)
-    parser.add_argument("--text-threshold", type=float, default=0.25)
+    from ..sam2_config import add_sam_arguments
+    add_sam_arguments(parser, workspace)
     parser.add_argument("--instance", type=int, help="零起始候选索引；headless 必须显式选择")
     parser.add_argument("--headless", action="store_true", help="不创建窗口；必须提供 --instance")
 
@@ -347,10 +327,11 @@ def _build(args):
         raise ValueError("headless 必须显式提供 --instance N")
     output = _output_path(args.output_dir, workspace=args.workspace)
     output.mkdir(parents=True)
-    command_prefix = [sys.executable, "-m", "cordvip_geometry.cli.build_object"]
+    command_prefix = [sys.executable, "-m", "cordvip_geometry", "object"]
     workspace_prefix = f"cd {shlex.quote(str(args.workspace))} && "
     segment_command = [*command_prefix, "segment", "--output-dir", str(output / "segmentation")]
-    for name in ("image", "rgbd", "text", "dino_weights", "sam_root", "sam_checkpoint", "sam_config", "box_threshold", "text_threshold", "instance", "device"):
+    for name in ("image", "rgbd", "text", "sam_python", "sam_root", "sam_checkpoint", "sam_config",
+                 "dino_weights", "box_threshold", "text_threshold", "instance"):
         value = getattr(args, name)
         if value is not None:
             if isinstance(value, Path):
@@ -370,7 +351,7 @@ def _build(args):
         print(workspace_prefix + shlex.join(command), flush=True)
         subprocess.run(command, check=True, env=module_environment(), cwd=args.workspace)
     mesh = output / "generation" / "mesh_unscaled.obj"
-    prepare_command = [sys.executable, "-m", "cordvip_geometry.cli.prepare_object", "prepare", "--mesh", str(mesh), "--output-dir", str(output / "asset"), "--num-points", str(args.num_points), "--seed", str(args.seed)]
+    prepare_command = [sys.executable, "-m", "cordvip_geometry", "prepare", "--mesh", str(mesh), "--output-dir", str(output / "asset"), "--num-points", str(args.num_points), "--seed", str(args.seed)]
     if args.scale_to_meters is not None:
         prepare_command.extend(["--scale-to-meters", str(args.scale_to_meters)])
     elif args.size_axis is not None:
@@ -383,18 +364,9 @@ def _build(args):
     if args.preview:
         prepare_command.append("--preview")
     subprocess.run(prepare_command, check=True, env=module_environment(), cwd=args.workspace)
-    live = [sys.executable, "-m", "cordvip_geometry.cli.live_object_tracking", "--asset", str(output / "asset"), "--object-prompt", args.text]
+    live = [sys.executable, "-m", "cordvip_geometry", "track", "--asset", str(output / "asset"), "--object-prompt", args.text]
     print("资产已准备。以下命令会连接 RealSense，确认相机可用后手动运行：", flush=True)
     print(workspace_prefix + shlex.join(live), flush=True)
-
-
-def _add_build_arguments(parser, *, workspace):
-    _add_segment_arguments(parser, workspace=workspace)
-    _add_generate_arguments(parser, workspace=workspace)
-    parser.add_argument("--scale-to-meters", type=_positive_float)
-    parser.add_argument("--size-axis", choices=("x", "y", "z"))
-    parser.add_argument("--size-meters", type=_positive_float)
-    parser.set_defaults(run=_build)
 
 
 def build_parser(*, workspace=None):
@@ -402,7 +374,7 @@ def build_parser(*, workspace=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.set_defaults(workspace=workspace)
     commands = parser.add_subparsers(dest="command", required=True)
-    segment = commands.add_parser("segment", help="Grounded-SAM-2 分割并确认物体")
+    segment = commands.add_parser("segment", help="Grounded-SAM2 分割并确认物体")
     _add_segment_arguments(segment, workspace=workspace)
     segment.add_argument("--list-only", action="store_true", help="只保存候选和预览图，后续用 select 选择；不创建窗口")
     segment.set_defaults(run=_segment)
@@ -416,45 +388,36 @@ def build_parser(*, workspace=None):
     _add_generate_arguments(generate, workspace=workspace)
     generate.set_defaults(run=_generate)
     build = commands.add_parser("build", help="按分割、生成、可选米制资产准备串行执行")
-    _add_build_arguments(build, workspace=workspace)
+    _add_segment_arguments(build, workspace=workspace)
+    _add_generate_arguments(build, workspace=workspace)
+    build.add_argument("--scale-to-meters", type=_positive_float)
+    build.add_argument("--size-axis", choices=("x", "y", "z"))
+    build.add_argument("--size-meters", type=_positive_float)
+    build.set_defaults(run=_build)
     preview = commands.add_parser("preview", help="单独查看 mesh，无需加载任何模型")
     preview.add_argument("--mesh", type=Path, required=True)
     preview.add_argument("--units", choices=("unscaled", "m"), default="unscaled", help="显示标签；不进行缩放")
     preview.set_defaults(run=lambda args: _preview_mesh(_existing_file(args.mesh), units=args.units))
     for command in (segment, select, generate, build):
         command.add_argument("--output-dir", type=Path, required=True, help="reports/ 下尚不存在的目录，拒绝覆盖")
-    for command in (segment, generate, build):
-        command.add_argument("--device", default="cuda:0")
+    for command in (generate, build):
+        command.add_argument("--device", default="cuda:0", help="Hunyuan 生成阶段使用的 CUDA 设备")
     return parser
 
 
-def _run(args):
+def main(argv=None, *, workspace=None):
+    args = build_parser(workspace=workspace).parse_args(argv)
     try:
         if hasattr(args, "seed") and args.seed < 0:
             raise ValueError("--seed 必须非负")
         for name in ("box_threshold", "text_threshold"):
-            if hasattr(args, name) and not 0 <= getattr(args, name) <= 1:
-                raise ValueError(f"{name} 必须在 [0, 1] 内")
+            if hasattr(args, name) and not 0 < getattr(args, name) < 1:
+                raise ValueError(f"{name} 必须在 (0, 1) 内")
         args.run(args)
     except (OSError, ValueError, ImportError, RuntimeError, KeyError, subprocess.CalledProcessError) as error:
         print(f"错误：{error}", file=sys.stderr)
         return 1
     return 0
-
-
-def main(argv=None, *, workspace=None):
-    return _run(build_parser(workspace=workspace).parse_args(argv))
-
-
-def image_main(argv=None, *, workspace=None):
-    """单图完整流程入口，与 object build 共用参数和实现。"""
-    workspace = Path(workspace or Path.cwd()).expanduser().resolve()
-    parser = argparse.ArgumentParser(description="从 RGB 图像生成 mesh 与固定表面点云；提供实测尺寸后额外生成米制追踪资产。")
-    parser.set_defaults(workspace=workspace)
-    _add_build_arguments(parser, workspace=workspace)
-    parser.add_argument("--output-dir", type=Path, required=True, help="reports/ 下尚不存在的目录，拒绝覆盖")
-    parser.add_argument("--device", default="cuda:0")
-    return _run(parser.parse_args(argv))
 
 
 if __name__ == "__main__":

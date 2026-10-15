@@ -21,7 +21,7 @@ class LiveViewer:
         import cv2
 
         self.cv2 = cv2
-        self.title = "Live object pose | camera and processed source frame"
+        self.title = "Object tracking | source RGB and scene overlay"
         self._selection_rgb = None
         self._polygon = []
         self._manual_selection = True
@@ -50,16 +50,13 @@ class LiveViewer:
                 self.observed = o3d.geometry.PointCloud()
                 self.model = o3d.geometry.PointCloud()
                 self.hand = o3d.geometry.PointCloud()
-                self.axis = o3d.geometry.LineSet()
                 self.vis.add_geometry(self.model, reset_bounding_box=False)
                 self.vis.add_geometry(self.observed, reset_bounding_box=False)
                 self.vis.add_geometry(self.hand, reset_bounding_box=False)
-                self.vis.add_geometry(self.axis, reset_bounding_box=False)
                 options = self.vis.get_render_option()
                 options.background_color = np.array([.06, .07, .08])
                 options.point_size = 3.0
-                for source, target in ((82, ord("r")), (73, ord("i")), (80, ord("p")),
-                                       (83, ord("s")), (86, ord("v")), (32, 32),
+                for source, target in ((80, ord("p")), (83, ord("s")), (86, ord("v")),
                                        (81, ord("q")), (257, 13), (256, 27),
                                        (91, ord("[")), (93, ord("]")),
                                        *((key, key) for key in range(49, 58))):
@@ -239,7 +236,7 @@ class LiveViewer:
             raise ValueError("Viewer colors must be floating RGB (N, 3) in [0, 1], aligned with points")
         return colors
 
-    def _update_3d(self, observed_points, model_points, pose, valid, hand_points=None,
+    def _update_3d(self, observed_points, model_points, valid, hand_points=None,
                    *, observed_colors=None, model_colors=None):
         observed = self._points(observed_points)
         model = self._points(model_points)
@@ -248,7 +245,7 @@ class LiveViewer:
         empty = np.empty((0, 3))
         self.observed.points = self.o3d.utility.Vector3dVector(observed if self.layer != 2 else empty)
         if observed_colors is None:
-            self.observed.paint_uniform_color([.15, .95, .30])
+            self.observed.paint_uniform_color([.15, .95, .30] if valid else [.4, .4, .4])
         else:
             colors = observed_colors if valid else np.full(observed.shape, .4)
             self.observed.colors = self.o3d.utility.Vector3dVector(colors if self.layer != 2 else empty)
@@ -263,19 +260,6 @@ class LiveViewer:
         self.hand.points = self.o3d.utility.Vector3dVector(self._points(hand_points))
         self.hand.paint_uniform_color([1., .55, .1] if valid else [.4, .4, .4])
         self.vis.update_geometry(self.hand)
-        if pose is not None:
-            pose = np.asarray(pose)
-            if pose.shape != (4, 4) or not np.isfinite(pose).all():
-                raise ValueError("Viewer pose must be a finite (4, 4) matrix")
-            local = np.array([[0, 0, 0], [.04, 0, 0], [0, .04, 0], [0, 0, .04]])
-            self.axis.points = self.o3d.utility.Vector3dVector(local @ pose[:3, :3].T + pose[:3, 3])
-            self.axis.lines = self.o3d.utility.Vector2iVector([[0, 1], [0, 2], [0, 3]])
-            self.axis.colors = self.o3d.utility.Vector3dVector(np.eye(3) if valid else np.full((3, 3), .4))
-        else:
-            self.axis.points = self.o3d.utility.Vector3dVector(empty)
-            self.axis.lines = self.o3d.utility.Vector2iVector(np.empty((0, 2), dtype=np.int32))
-            self.axis.colors = self.o3d.utility.Vector3dVector(empty)
-        self.vis.update_geometry(self.axis)
         if not self._view_initialized and (len(observed) or len(model)):
             self.vis.reset_view_point(True)
             # Match the RGB camera's +Z forward, +Y down convention on first
@@ -292,31 +276,29 @@ class LiveViewer:
         self.vis.update_renderer()
         return True
 
-    def update(self, live_rgb, result_rgb, observed_points=None, model_points=None, pose=None,
+    def update(self, source_rgb, result_rgb, observed_points=None, model_points=None,
                *, lines=(), result_valid=False, hand_points=None, observed_colors=None,
-               model_colors=None, status_text=None, help_text=None):
+               model_colors=None, status_text, help_text):
         """Draw one UI tick and return a key (255 for none); never block selection.
 
         Optional per-point RGB colors use float [0, 1] and become grey when the
-        result is invalid. Text overrides let a caller describe mesh-free or
-        multi-object results without claiming a single object pose is available.
+        result is invalid. Both panels refer to the processed source frame;
+        selection instead shows its frozen initialization image.
         """
         if self._closed:
             return ord("q")
         canvas = np.full((self._HEADER + self._HEIGHT + self._FOOTER, 2 * self._WIDTH, 3), 22, np.uint8)
-        left_label = "FROZEN INITIALIZATION FRAME" if self.selection_active else "LATEST CAMERA FRAME"
+        left_label = "FROZEN INITIALIZATION FRAME" if self.selection_active else "PROCESSED SOURCE RGB"
         self._text(canvas, left_label, (12, 22), (0, 220, 255) if self.selection_active else (235, 235, 235), .55)
-        self._text(canvas, "LAST PROCESSED SOURCE FRAME", (self._WIDTH + 12, 22), scale=.55)
+        self._text(canvas, "SCENE OVERLAY", (self._WIDTH + 12, 22), scale=.55)
         if self.selection_active:
-            selection_help = ("Left click: polygon | right click: undo | Enter: register | Esc: cancel"
+            selection_help = ("Left click: polygon | right click: undo | Enter: confirm | Esc: cancel"
                               if self._manual_selection else
                               "1-9 / [ ] / click: candidate | Enter: confirm | p: polygon | Esc: cancel")
             self._text(canvas, selection_help, (12, 43), scale=.43)
-        if status_text is None:
-            status_text = "Pose available" if result_valid else "No valid pose / retained result only"
         self._text(canvas, status_text,
                    (self._WIDTH + 12, 43), (100, 220, 100) if result_valid else (80, 170, 240), .43)
-        left_image = self._selection_rgb if self.selection_active else live_rgb
+        left_image = self._selection_rgb if self.selection_active else source_rgb
         if self.selection_active and self._candidates:
             left_image = self._candidate_image()
         self._selection_rect = self._place_image(canvas, left_image, 0) if self.selection_active else None
@@ -328,15 +310,12 @@ class LiveViewer:
         footer_y = self._HEADER + self._HEIGHT + 21
         for index, line in enumerate(list(lines)[:8]):
             self._text(canvas, line, (12, footer_y + 20 * index), max_width=2 * self._WIDTH - 24)
-        mode = ("overlay", "measured object", "model")[self.layer]
-        if help_text is None:
-            help_text = f"i/r: select/re-register | p: polygon | space: pause | v: 3D {mode} | s: save | q: quit"
         self._text(canvas, help_text,
                    (12, canvas.shape[0] - 14), (190, 200, 210))
         self._panel = canvas
         self.cv2.imshow(self.title, canvas)
         if self.vis is not None and not self._update_3d(
-            observed_points, model_points, pose, result_valid, hand_points,
+            observed_points, model_points, result_valid, hand_points,
             observed_colors=observed_colors, model_colors=model_colors,
         ):
             return ord("q")

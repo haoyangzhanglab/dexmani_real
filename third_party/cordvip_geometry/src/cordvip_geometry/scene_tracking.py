@@ -9,9 +9,9 @@ import time
 
 import numpy as np
 
-from .geometry import _float32_points, transform_points, validate_pose, validate_rgbd
-from .object_cloud import ObjectCloudProjector
-from .observation import _normals
+from .geometry import _float32_points, transform_points, validate_pose, validate_rgbd, validate_normals
+from .foundationpose import prepare_tracking_frame
+from .model_depth import ModelDepthRenderer
 from .scene_geometry import extract_scene_clouds
 
 
@@ -26,7 +26,7 @@ class SceneTracker:
     def __init__(self, segmenter, assets, *, foundationpose_root, debug_dir,
                  pixel_stride=2, depth_tolerance_m=.015, min_matched_pixels=30,
                  min_matched_fraction=.15):
-        from .foundationpose import FoundationPoseTracker
+        from .foundationpose import FoundationPosePlusTracker
 
         self.segmenter = segmenter
         self.assets = assets
@@ -34,17 +34,16 @@ class SceneTracker:
         self.depth_tolerance_m = depth_tolerance_m
         self.min_matched_pixels = min_matched_pixels
         self.min_matched_fraction = min_matched_fraction
-        self.trackers, self.projectors = {}, {}
+        self.trackers, self.renderers = {}, {}
         self._lost = {}
         self._ids = self._previous = self._shape = self._K = None
         shared = None
         for name, (mesh, points, normals) in assets.items():
-            tracker = FoundationPoseTracker(
+            tracker = FoundationPosePlusTracker(
                 foundationpose_root, mesh, Path(debug_dir) / name, shared_with=shared)
             shared = shared or tracker
             self.trackers[name] = tracker
-            self.projectors[name] = ObjectCloudProjector(
-                mesh, pixel_stride=pixel_stride, depth_tolerance_m=depth_tolerance_m)
+            self.renderers[name] = ModelDepthRenderer(mesh, pixel_stride=pixel_stride)
 
     @staticmethod
     def _sync():
@@ -70,9 +69,10 @@ class SceneTracker:
         elif not set(self.assets).issubset(initial_masks):
             raise ValueError('Every pose asset requires a named initial instance mask')
         started_ns = time.monotonic_ns()
-        masks = (self.segmenter.initialize(rgb, initial_masks) if first
-                 else self.segmenter.track(rgb))
-        self._sync()
+        frame_key = dict(source_id=frame.source_id, row_index=frame.row_index,
+                         clock=frame.clock, timestamp_ns=frame.timestamp_ns)
+        masks = (self.segmenter.initialize(rgb, initial_masks, frame_key=frame_key) if first
+                 else self.segmenter.track(rgb, frame_key=frame_key))
         segmentation_ns = time.monotonic_ns()
         if first:
             self._ids = tuple(initial_masks)
@@ -82,6 +82,7 @@ class SceneTracker:
         # Independent evidence survives pose failure or the absence of an asset.
         measured = extract_scene_clouds(rgb, depth_m, K, masks, pixel_stride=self.pixel_stride)
         poses, depths, pose_ms, reasons = {}, {}, {}, {}
+        prepared_frame = None
         for name, tracker in self.trackers.items():
             start = time.monotonic_ns()
             if name in self._lost:
@@ -93,11 +94,13 @@ class SceneTracker:
                 continue
             try:
                 mask = masks[name] & ~measured.overlap_mask
+                if not first and prepared_frame is None:
+                    prepared_frame = prepare_tracking_frame(rgb, depth_m, K)
                 poses[name] = (tracker.register(rgb, depth_m, K, mask) if first
-                               else tracker.track(rgb, depth_m, K))
+                               else tracker.track(rgb, depth_m, K, mask, prepared_frame=prepared_frame))
                 self._sync()
                 pose_ms[name] = (time.monotonic_ns() - start) / 1e6
-                depths[name] = self.projectors[name].project(rgb, depth_m, K, poses[name]).model_depth_m
+                depths[name] = self.renderers[name].render(depth_m.shape, K, poses[name])
             except Exception as error:
                 poses.pop(name, None)
                 self._lost[name] = reasons[name] = f'{type(error).__name__}: {error}'
@@ -133,12 +136,13 @@ class SceneTracker:
         return dict(frame=frame, rgb=rgb, depth_m=depth_m, K=K, objects=objects,
                     overlap_mask=clouds.overlap_mask, started_ns=started_ns,
                     completed_ns=time.monotonic_ns(), operation='initialize' if first else 'track',
-                    segmentation_ms=(segmentation_ns - started_ns) / 1e6, pose_ms=pose_ms)
+                    segmentation_ms=(segmentation_ns - started_ns) / 1e6, pose_ms=pose_ms,
+                    segmentation_metrics=dict(self.segmenter.last_metrics))
 
     def close(self):
         self.segmenter.close()
         self.trackers.clear()
-        self.projectors.clear()
+        self.renderers.clear()
 
 
 def scene_payload(result, roles, *, valid, state, max_age_ms, hand=None):
@@ -171,7 +175,7 @@ def scene_payload(result, roles, *, valid, state, max_age_ms, hand=None):
             raise ValueError('Hand and scene must refer to exactly the same source row and clock')
         T_base_camera = validate_pose(hand['T_base_camera'])
         hand_points = _float32_points(hand['points_camera'])
-        hand_normals = _normals(hand['normals_camera'], hand_points)
+        hand_normals = validate_normals(hand['normals_camera'], hand_points)
         link_ids = np.asarray(hand['link_ids'])
         joints = np.asarray(hand['joint_state'])
         if (not len(hand_points) or link_ids.shape != (len(hand_points),)

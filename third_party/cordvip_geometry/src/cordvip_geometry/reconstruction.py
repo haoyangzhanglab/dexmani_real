@@ -5,7 +5,6 @@ scale and object axes; physical calibration is a separate, explicit step.
 """
 
 import gc
-import hashlib
 import importlib.metadata
 import os
 from pathlib import Path
@@ -16,23 +15,7 @@ import zipfile
 
 import numpy as np
 
-
-def _file(path):
-    path = Path(path).expanduser().resolve()
-    if not path.is_file() or path.stat().st_size == 0:
-        raise FileNotFoundError(f"Missing or empty local file: {path}")
-    pending = [path.with_name(path.name + suffix) for suffix in (".aria2", ".part", ".incomplete")]
-    if any(marker.exists() for marker in pending):
-        raise ValueError(f"Local download is unfinished: {path}")
-    return path
-
-
-def _sha256(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+from .io import _sha256, _existing_file
 
 
 def generate_mesh(image_rgba_path, source_root, weights_dir, output_mesh_path,
@@ -49,15 +32,15 @@ def generate_mesh(image_rgba_path, source_root, weights_dir, output_mesh_path,
                                   ("num_chunks", num_chunks, 1)):
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
-    image_path = _file(image_rgba_path)
+    image_path = _existing_file(image_rgba_path)
     root = Path(source_root).expanduser().resolve()
     package_parent = root / "hy3dshape"
-    pipeline_file = _file(package_parent / "hy3dshape" / "pipelines.py")
+    pipeline_file = _existing_file(package_parent / "hy3dshape" / "pipelines.py")
     weights = Path(weights_dir).expanduser().resolve()
     if (weights / "hunyuan3d-dit-v2-1").is_dir():
         weights = weights / "hunyuan3d-dit-v2-1"
-    config_path = _file(weights / "config.yaml")
-    checkpoint_path = _file(weights / "model.fp16.ckpt")
+    config_path = _existing_file(weights / "config.yaml")
+    checkpoint_path = _existing_file(weights / "model.fp16.ckpt")
     if not zipfile.is_zipfile(checkpoint_path):
         raise ValueError(f"Hunyuan checkpoint is incomplete or not a PyTorch ZIP archive: {checkpoint_path}")
     output = Path(output_mesh_path).expanduser().resolve()

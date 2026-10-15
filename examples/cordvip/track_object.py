@@ -7,7 +7,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
-from cordvip_geometry.cli.live_object_tracking import main
+from cordvip_geometry.cli.scene_tracking import main
 
 if __name__ == "__main__":
     raise SystemExit(main(workspace=ROOT))

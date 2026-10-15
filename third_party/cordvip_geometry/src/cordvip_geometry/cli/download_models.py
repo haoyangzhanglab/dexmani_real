@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""显式下载单图示例的固定版本权重；不加载模型或连接设备。"""
+"""下载或校验分割与单图建模使用的固定版本权重；不加载模型或连接设备。"""
 
 from __future__ import annotations
 
@@ -8,27 +8,12 @@ import json
 from pathlib import Path
 
 from ..io import _sha256
+from ..sam2_config import GROUNDING_MODEL, SAM_MODELS, validate_grounding_weights
 
 
 MODELS = {
-    "grounding": {
-        "repo_id": "IDEA-Research/grounding-dino-base",
-        "revision": "12bdfa3120f3e7ec7b434d90674b3396eccf88eb",
-        "directory": "grounding-dino-base",
-        "patterns": ["*.json", "model.safetensors", "vocab.txt", "README.md", "LICENSE*"],
-        "weight": "model.safetensors",
-        "size": 933400872,
-        "sha256": "5548f844c928c4b6f411fa8cbcc2bfa8dbbba437cb1d513975519f93c2a9ed21",
-    },
-    "sam": {
-        "repo_id": "facebook/sam2.1-hiera-large",
-        "revision": "665f8e2ad61cf5f53d65644ff27c8ee525124610",
-        "directory": ".",
-        "patterns": ["sam2.1_hiera_large.pt"],
-        "weight": "sam2.1_hiera_large.pt",
-        "size": 898083611,
-        "sha256": "2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318",
-    },
+    "grounding": GROUNDING_MODEL,
+    "sam": None,  # Resolved from the explicit SAM2.1 variant below.
     "shape": {
         "repo_id": "tencent/Hunyuan3D-2.1",
         "revision": "0b94677654c57bb9a6b6845cd7b704ccf551d327",
@@ -47,6 +32,7 @@ def build_parser(*, workspace=None):
     parser.set_defaults(workspace=workspace)
     parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
     parser.add_argument("--output", type=Path, default=workspace / "reports/cordvip_models")
+    parser.add_argument("--sam-variant", choices=SAM_MODELS, default="small", help="SAM2.1 权重型号")
     parser.add_argument("--verify-only", action="store_true", help="只校验已下载权重并保存版本记录，不联网")
     return parser
 
@@ -60,16 +46,19 @@ def main(argv=None, *, workspace=None):
     output.mkdir(parents=True, exist_ok=True)
     # 固定官方 Hub revision 和 LFS SHA；每个完整模型成功后才写版本记录。
     for name in args.models:
-        spec = MODELS[name]
+        if name == 'sam':
+            model = SAM_MODELS[args.sam_variant]
+            spec = dict(**model, directory='.', patterns=[model['weight']])
+        else:
+            spec = MODELS[name]
         destination = output / spec["directory"]
         if not args.verify_only:
             from huggingface_hub import snapshot_download
-
             print(f"Downloading {spec['repo_id']} @ {spec['revision']}", flush=True)
             snapshot_download(
-                repo_id=spec["repo_id"], revision=spec["revision"],
-                allow_patterns=spec["patterns"], local_dir=destination,
-                cache_dir=output / ".hub_cache", max_workers=3,
+                repo_id=spec['repo_id'], revision=spec['revision'],
+                allow_patterns=spec['patterns'], local_dir=destination,
+                cache_dir=output / '.hub_cache', max_workers=3,
             )
         weight = destination / spec["weight"]
         if any(Path(str(weight) + suffix).exists() for suffix in (".aria2", ".part", ".incomplete")):
@@ -78,10 +67,14 @@ def main(argv=None, *, workspace=None):
             raise RuntimeError(f"权重缺失或大小不符：{weight}")
         if _sha256(weight) != spec["sha256"]:
             raise RuntimeError(f"权重 SHA256 与官方版本不符：{weight}")
+        if name == 'grounding':
+            validate_grounding_weights(destination, verify_hash=False)
         files = [str(p.relative_to(destination)) for pattern in spec["patterns"]
                  for p in destination.glob(pattern) if p.is_file()]
-        record = {**spec, "files": sorted(set(files))}
-        target = output / f"{name}_download.json"
+        record = {**spec, "files": sorted(set(files)),
+                  "download_source": "verification_only" if args.verify_only else "huggingface"}
+        record_name = f'sam2_{args.sam_variant}' if name == 'sam' else name
+        target = output / f"{record_name}_download.json"
         temporary = target.with_suffix(".tmp")
         temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
         temporary.replace(target)

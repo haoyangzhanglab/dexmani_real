@@ -10,7 +10,7 @@ conda activate real_robot
 
 ## 1. RGB 图像 → mesh 与点云
 
-Grounding DINO + SAM 2.1 分割目标，确认候选后用 Hunyuan3D-2.1 生成形状，并采样点云：
+Grounded-SAM2 分割目标，确认候选后用 Hunyuan3D-2.1 生成形状，并采样点云：
 
 ```bash
 python examples/cordvip/reconstruct_object.py \
@@ -35,7 +35,7 @@ python -m cordvip_geometry prepare \
 
 ### Toy + 篮子：连续分割、双位姿与手点云
 
-已准备的两个资产、首帧选择由一个 JSON 指定；默认用 SAM2.1 small 共享编码两物体，每个物体独立维护 FoundationPose 状态，网络权重共享。直接在窗口查看已有录像：
+已准备的两个资产、首帧选择由一个 JSON 指定；SAM2.1 small 共享编码两物体，每个物体独立维护 FoundationPose++ 2D 引导状态，网络权重共享。直接在窗口查看已有录像：
 
 ```bash
 python examples/cordvip/track_object.py \
@@ -64,11 +64,11 @@ python examples/cordvip/track_object.py \
 
 语义实测点独立于 mesh，模型支持子集与残差另外保存。单个物体 pose 失效不会抹掉另一个物体或当前语义深度点；该 pose 保持失效，重新运行并显式选择才能注册。分割仍可能覆盖手边缘或篮孔后面的桌面，几何一致性也不等于物理精度。生成模型和当前实测点不做跨帧融合。
 
-多物体默认权重为 `reports/cordvip_models/sam2.1_hiera_small.pt`；可用配套的 `--sam-checkpoint/--sam-config` 对照其他尺寸，不升级环境。GPU 运行环境沿用已安装的 `real_robot`，本机性能验收使用 `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1`。产物和验证见[多物体验收](../../reports/cordvip_multiobject/README.md)、[篮子建模](../../reports/cordvip_basket/README.md)。这些本地资产在 Git 忽略的 reports 中，不随仓库分发。
+Grounded-SAM2、FoundationPose++ 核心与 FK 使用 `real_robot`。新工作站按[安装说明](../../third_party/cordvip_geometry/docs/usage.md)准备环境，再运行 `python -m cordvip_geometry download --models grounding sam`。默认 SAM2.1 small，不编译；Grounding DINO 只负责首帧文本候选，开始跟踪后释放。已有确认 mask 不要求检测权重。large 对照须同时指定匹配的 `--sam-config/--sam-checkpoint`。当前位姿仅采用 2D guidance，没有 Kalman。本地示例资产和 Raw 不随仓库分发。
 
 ### 单物体位姿模式
 
-已有 toy 资产和首帧分割可直接复用，无需重新生成或分割。下面只读 Raw，在窗口显示物体模型点、实测目标点与同一行实测关节生成的 XHand 点：
+已有 toy 资产和首帧分割可直接复用，Grounded-SAM2 从该 mask 开始连续传播。单物体与多物体共用 SceneTracker，单物体 ID 为 object。下面只读 Raw，在窗口显示物体模型点、实测目标点与同一行实测关节生成的 XHand 点：
 
 ```bash
 python examples/cordvip/track_object.py \
@@ -81,9 +81,9 @@ python examples/cordvip/track_object.py \
 
 输出目录必须尚不存在。加 `--headless` 可无窗口运行；省略两个 `--save-*` 可减少落盘开销。离线源先停在首帧，注册通过后按指定速率供给最新帧，结束自动退出；处理不及时会跳帧，保存结果不补齐。`--initial-selection` 仅接受已人工确认且 RGB-D、内参、身份、时间与首帧完全匹配的选择，不能套用到新相机帧。
 
-`--with-hand` 当前仅支持 `--episode`；`--hand-points` 默认 1024，`--experiment-config` 可指定当前手安装配置。输出包含 robot-base 下的物体/手点、法向、link IDs 和 19 维实测关节。Toy 的历史 Raw 只有名义时间：可看交互几何，不能证明手/相机同步。**`interaction_valid` 不等于策略输入的时序已合格**，未知时间差为 NaN。
+`--with-hand` 当前仅支持 `--episode`；`--hand-points` 默认 1024，`--experiment-config` 可指定当前手安装配置。输出包含 robot-base 下的物体/手点、法向、link IDs 和 19 维实测关节。Toy 的历史 Raw 只有名义时间：可看交互几何，不能证明手/相机同步。**几何有效不等于策略输入的时序已合格**，未知时间差为 NaN。
 
-实时相机使用米制资产、RGB-D 和内参进行 FoundationPose 追踪。**以下命令会连接 RealSense，目前输出物体点云，不读取机器人关节**：
+实时相机使用米制资产、RGB-D 和内参进行 FoundationPose++ 2D 引导追踪。**以下命令会连接 RealSense，目前输出物体点云，不读取机器人关节**：
 
 ```bash
 python examples/cordvip/track_object.py \
@@ -91,10 +91,10 @@ python examples/cordvip/track_object.py \
   --serial CAMERA_SERIAL --output reports/cordvip_demo/live_run
 ```
 
-按 `i` 冻结并分割目标，选择候选后 Enter 注册，`s` 保存位姿/点云快照，`q` 退出。这里的实测点来自当前帧深度反投影，不做跨帧表面融合；当前入口需要深度，不能直接输入普通 RGB 视频。
+模型加载后冻结首帧并分割目标，选择候选后 Enter 确认，`s` 保存截图，`q` 退出。追踪窗口显示已处理源 RGB 与同帧叠加图。实测点来自当前帧深度反投影，不做跨帧表面融合；当前入口需要深度，不能直接输入普通 RGB 视频。
 
 之后接入遥操作/策略时，应复用其已有 RGB-D 与实测关节观测，调用库的内存接口；不要另开一套机器人/相机连接。手点来自固定 URDF 表面采样与 FK，物体完整点来自生成模型与追踪位姿，均不等同于实测接触。默认 1024 手点 + 1024 物体点及 XArm7 + XHand 的 19 关节是本地表示，训练适配放在 `dexmani_policy`。
 
 两个脚本均支持 `--help`；`track_object.py --check --object-prompt 'white basket.'` 只检查依赖，不连接设备。拍照、分阶段生成和回放等辅助操作使用 `python -m cordvip_geometry {capture,object,replay,...}`。
 
-新入口已用真实 FoundationPose 在窗口 / 无窗口两种模式各完成 213/213 帧 toy 手—物回放。查看[叠加视频](../../reports/cordvip_improvements/toy_gui/overlay.mp4)、[三维截图](../../reports/cordvip_improvements/viewer/row_120_3d.png)及[耗时与验收记录](../../reports/cordvip_improvements/README.md)。原始物体资产过程见[玩具结果](../../reports/cordvip_toy/README.md)。真实相机与实时手—物接口尚未验收。
+`python -m cordvip_geometry replay` 提供无模型输入预览。运行和诊断记录保存在 `reports/`；真实相机与实时手—物接口须单独验收。

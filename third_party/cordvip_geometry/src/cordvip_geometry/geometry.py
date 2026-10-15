@@ -23,6 +23,24 @@ def _float32_points(points):
     return points
 
 
+def validate_normals(value, points):
+    normals = _float32_points(value)
+    if normals.shape != points.shape or not np.allclose(
+        np.linalg.norm(normals, axis=1), 1., rtol=0, atol=1e-4
+    ):
+        raise ValueError('Normals must be unit vectors corresponding to every model point')
+    return normals
+
+
+def project_points(points, K):
+    points = np.asarray(points)
+    valid = np.isfinite(points).all(axis=1) & (points[:, 2] > 1e-5)
+    pixels = np.full((len(points), 2), np.nan)
+    projected = points[valid] @ np.asarray(K).T
+    pixels[valid] = projected[:, :2] / projected[:, 2:3]
+    return pixels, valid
+
+
 def validate_pose(pose):
     """Validate an SE(3) transform without projecting or repairing its rotation."""
     if np.iscomplexobj(pose):

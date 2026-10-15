@@ -1,48 +1,22 @@
-"""Separate visible model geometry from same-frame, depth-supported object points.
-
-This is a geometric filter, not semantic segmentation or a pose-confidence model.
-An unrelated surface within the configured depth tolerance can still pass it.
-"""
-
-from dataclasses import dataclass
+"""Render sampled model Z for comparison with independently measured scene depth."""
 
 import numpy as np
 
-from .geometry import validate_pose, validate_rgbd
+from .geometry import validate_intrinsics, validate_pose
 
 
-@dataclass
-class ObjectCloudResult:
-    """Camera-frame meters and RGB uint8, with image-aligned sampled masks.
-
-    Image arrays retain the input (H, W) shape. With pixel_stride > 1, untested
-    pixels are zero/False; they must not be interpreted as a dense segmentation.
-    Missing measured depths never become points, including on the model back side.
-    """
-
-    model_depth_m: np.ndarray
-    model_mask: np.ndarray
-    observed_mask: np.ndarray
-    observed_points_camera: np.ndarray
-    observed_colors: np.ndarray
-    diagnostics: dict
-
-
-class ObjectCloudProjector:
+class ModelDepthRenderer:
     """Cache one meter-scale mesh and intersect camera rays in its local frame.
 
-    ``project`` requires undistorted pinhole RGB-D aligned in the same camera
-    frame, with depth representing camera Z in meters (zero denotes missing).
-    The caller supplies ``T_camera_object`` for exactly that RGB-D frame.
+    ``render`` returns camera Z in metres on the global pixel-stride grid.
+    Zero marks an unsampled pixel or a ray with no positive model intersection.
+    Measured points and model agreement are computed separately in scene_geometry.
     """
 
-    def __init__(self, mesh, *, pixel_stride=2, depth_tolerance_m=0.015, nthreads=1):
+    def __init__(self, mesh, *, pixel_stride=2, nthreads=1):
         for name, value in (("pixel_stride", pixel_stride), ("nthreads", nthreads)):
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        depth_tolerance_m = float(depth_tolerance_m)
-        if not np.isfinite(depth_tolerance_m) or depth_tolerance_m <= 0:
-            raise ValueError("depth_tolerance_m must be finite and positive")
         vertices = np.asarray(mesh.vertices)
         faces = np.asarray(mesh.faces)
         if (np.iscomplexobj(vertices) or vertices.ndim != 2 or vertices.shape[1] != 3
@@ -66,7 +40,6 @@ class ObjectCloudProjector:
         import open3d as o3d
 
         self.pixel_stride = int(pixel_stride)
-        self.depth_tolerance_m = depth_tolerance_m
         self._nthreads = int(nthreads)
         self._tensor = o3d.core.Tensor
         self._scene = o3d.t.geometry.RaycastingScene(nthreads=self._nthreads)
@@ -118,19 +91,17 @@ class ObjectCloudProjector:
         upper = np.clip(upper, (0, 0), (width, height)).astype(int)
         return slice(lower[1], upper[1]), slice(lower[0], upper[0])
 
-    def project(self, rgb, depth_m, intrinsics, T_camera_object):
-        """Select measured points agreeing with the model's first visible surface.
-
-        ``depth_coverage`` is valid measured depth / projected samples;
-        ``matched_fraction`` is depth-consistent samples / projected samples.
-        The median residual covers all projected samples with measured depth,
-        including occluders and background disagreements. Undefined ratios and
-        residuals are None, not a claim of perfect agreement or zero error.
-        These diagnostics describe geometric consistency, not tracking confidence.
-        """
-        rgb, depth_m, intrinsics, _ = validate_rgbd(rgb, depth_m, intrinsics)
+    def render(self, image_shape, intrinsics, T_camera_object):
+        """Render the first positive model intersection for this frame's camera/pose."""
+        image_shape = tuple(image_shape)
+        if len(image_shape) != 2 or any(
+            isinstance(n, (bool, np.bool_)) or not isinstance(n, (int, np.integer)) or n <= 0
+            for n in image_shape
+        ):
+            raise ValueError("Image shape must contain positive integer height and width")
+        intrinsics = validate_intrinsics(intrinsics)
         pose = validate_pose(T_camera_object)
-        directions = self._camera_rays(depth_m.shape, intrinsics)
+        directions = self._camera_rays(image_shape, intrinsics)
         roi = self._ray_roi(directions, intrinsics, pose)
         roi_directions = directions[roi]
         rotation, translation = pose[:3, :3], pose[:3, 3]
@@ -147,35 +118,6 @@ class ObjectCloudProjector:
         if rays.size:
             hit[roi] = self._scene.cast_rays(self._tensor(rays), nthreads=self._nthreads)["t_hit"].numpy()
         projected = np.isfinite(hit) & (hit > 0)
-        sampled_depth = depth_m[::self.pixel_stride, ::self.pixel_stride]
-        valid = projected & (sampled_depth > 0)
-        residual = np.zeros_like(hit)
-        residual[valid] = sampled_depth[valid] - hit[valid]
-        matched = valid & (np.abs(residual) <= self.depth_tolerance_m)
-
-        model_depth = np.zeros_like(depth_m)
+        model_depth = np.zeros(image_shape, dtype=np.float32)
         model_depth[::self.pixel_stride, ::self.pixel_stride] = np.where(projected, hit, 0)
-        model_mask = model_depth > 0
-        observed_mask = np.zeros(depth_m.shape, dtype=bool)
-        observed_mask[::self.pixel_stride, ::self.pixel_stride] = matched
-        with np.errstate(over="ignore", invalid="ignore"):
-            points = (directions[matched] * sampled_depth[matched, None]).astype(np.float32)
-        if not np.isfinite(points).all():
-            raise ValueError("Observed points exceed the finite float32 range")
-        colors = rgb[::self.pixel_stride, ::self.pixel_stride][matched].copy()
-        projected_count = int(np.count_nonzero(projected))
-        valid_count = int(np.count_nonzero(valid))
-        matched_count = int(np.count_nonzero(matched))
-        diagnostics = {
-            "pixel_stride": self.pixel_stride,
-            "depth_tolerance_m": self.depth_tolerance_m,
-            "projected_pixel_count": projected_count,
-            "valid_depth_pixel_count": valid_count,
-            "matched_pixel_count": matched_count,
-            "depth_coverage": valid_count / projected_count if projected_count else None,
-            "matched_fraction": matched_count / projected_count if projected_count else None,
-            "median_abs_depth_error_m": float(np.median(np.abs(residual[valid]))) if valid_count else None,
-            "occluded_pixel_count": int(np.count_nonzero(valid & (residual < -self.depth_tolerance_m))),
-            "background_pixel_count": int(np.count_nonzero(valid & (residual > self.depth_tolerance_m))),
-        }
-        return ObjectCloudResult(model_depth, model_mask, observed_mask, points, colors, diagnostics)
+        return model_depth

@@ -16,7 +16,7 @@ Usage: conda activate real_robot
 
 Validate the existing Python 3.10 / Torch 2.4.1+cu124 base environment, fetch
 pinned official source checkouts, install incremental requirements, and build
-SAM2, nvdiffrast and FoundationPose mycpp. No model downloads or device access.
+nvdiffrast and FoundationPose mycpp. No model downloads or device access.
 Existing checkouts must match their pinned revisions and have no tracked edits.
 The workspace defaults to the current directory; --workspace must be the first option.
 Logs and environment snapshots are saved under its reports/cordvip_install/.
@@ -118,9 +118,8 @@ export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include"
 export PATH="$CONDA_PREFIX/bin:$PATH"
 export MAX_JOBS=4
 export TORCH_CUDA_ARCH_LIST=8.9
-export SAM2_BUILD_ALLOW_ERRORS=0
 python -m pip install --no-build-isolation --no-deps \
-    -e third_party/Grounded-SAM-2 -e third_party/cordvip_geometry
+    -e third_party/cordvip_geometry
 python -m pip install --no-build-isolation --no-deps third_party/nvdiffrast
 
 cordvip_pybind_dir="$(python -m pybind11 --cmakedir)"

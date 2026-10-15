@@ -1,4 +1,4 @@
-"""Two bounded workers for the standalone viewer; importing never opens hardware.
+"""Bounded source and scene workers for the standalone viewer; importing never opens hardware.
 
 The camera generator and the CUDA estimator each have exactly one owner thread.
 The GUI reads a latest-frame mailbox and submits at most one inference at a time.
@@ -14,8 +14,6 @@ import math
 import threading
 import time
 from typing import Any
-
-import numpy as np
 
 from .rgbd import Frame
 
@@ -139,135 +137,87 @@ class LatestFrameReader:
 
 
 @dataclass(frozen=True)
-class PoseStatus:
+class SceneStatus:
     ready: bool
     busy: bool
-    registered: bool
-    generation: int
     error: str | None
 
 
 @dataclass(frozen=True)
-class PoseResult:
-    generation: int
-    frame: Frame
-    rgb: np.ndarray
-    depth_m: np.ndarray
-    K: np.ndarray
+class SceneResult:
     operation: str
-    mask: np.ndarray | None
-    pose: np.ndarray | None
-    started_ns: int
-    completed_ns: int
+    frame: Frame
+    value: Any
     error: str | None
 
 
-@dataclass(frozen=True)
-class _PoseTask:
-    generation: int
-    frame: Frame
-    rgb: np.ndarray
-    depth_m: np.ndarray
-    K: np.ndarray
-    mask: np.ndarray | None
+class SceneWorker:
+    """One owner for SAM IPC, pose networks and scene state; one result mailbox.
 
-
-class PoseWorker:
-    """Load and call a single FoundationPose instance outside the GUI thread.
-
-    A supplied mask means registration; otherwise submission requires a successful
-    registration in the current generation. ``reset`` invalidates prior work without
-    racing its CUDA calls. Poll each result before submitting another frame; the
-    worker never accumulates a frame queue or silently replaces unconsumed results.
+    Input arrays are immutable after submission. Closing revokes pending results
+    immediately; parent CUDA work finishes on its owner before cleanup.
     """
 
-    def __init__(self, factory: Callable[[], Any]) -> None:
-        self._factory = factory
+    def __init__(self, segmenter, tracker_factory):
+        self.segmenter = segmenter
+        self._factory = tracker_factory
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
-        self._ready = False
-        self._running = False
-        self._generation = 0
-        self._registered_generation = None
-        self._pending = None
-        self._result = None
-        self._error = None
-        self._thread = threading.Thread(target=self._run, name="cordvip-pose", daemon=True)
+        self._ready = self._running = False
+        self._pending = self._result = self._error = None
+        self.metadata = None
+        self._thread = threading.Thread(target=self._run, name='cordvip-scene', daemon=True)
 
-    def start(self) -> PoseWorker:
+    def start(self):
         self._thread.start()
         return self
 
-    def snapshot(self) -> PoseStatus:
+    def snapshot(self):
         with self._lock:
-            return PoseStatus(
-                ready=self._ready,
-                busy=self._running or self._pending is not None,
-                registered=self._registered_generation == self._generation,
-                generation=self._generation,
-                error=self._error,
-            )
+            return SceneStatus(self._ready, self._running or self._pending is not None, self._error)
 
-    def submit(
-        self,
-        frame: Frame,
-        rgb: np.ndarray,
-        depth_m: np.ndarray,
-        K: np.ndarray,
-        *,
-        mask: np.ndarray | None = None,
-    ) -> bool:
-        """Return false while loading/busy/closed or before the prior result is polled.
-
-        The GUI retains ownership of frame/image arrays and must keep them immutable
-        after submission. The editable selection mask is copied on submission.
-        """
+    def submit(self, operation, frame, *args, **kwargs):
+        if operation not in {'predict', 'step'}:
+            raise ValueError('Scene worker accepts only predict or step')
+        if kwargs.get('initial_masks') is not None:
+            kwargs['initial_masks'] = {name: mask.copy() for name, mask in kwargs['initial_masks'].items()}
         with self._lock:
-            if (
-                self._stop.is_set() or not self._ready or self._running
-                or self._pending is not None or self._result is not None
-            ):
+            if (self._stop.is_set() or not self._ready or self._running
+                    or self._pending is not None or self._result is not None):
                 return False
-            if mask is None and self._registered_generation != self._generation:
-                raise ValueError("Register an object in this session before tracking")
-            if mask is not None:
-                self._registered_generation = None
-            self._pending = _PoseTask(
-                self._generation, frame, rgb, depth_m, K,
-                None if mask is None else np.asarray(mask).copy(),
-            )
+            self._pending = operation, frame, args, kwargs
             self._wake.set()
             return True
 
-    def poll(self) -> PoseResult | None:
+    def poll(self):
         with self._lock:
             result, self._result = self._result, None
             return result
 
-    def reset(self) -> int:
-        """Revoke the old pose now; the next accepted task must be registration."""
-        with self._lock:
-            self._generation += 1
-            self._registered_generation = None
-            self._pending = None
-            self._result = None
-            self._wake.clear()
-            return self._generation
-
-    def close(self, timeout_s: float = 1.5) -> CloseStatus:
+    def close(self, timeout_s=1.5):
         self._stop.set()
+        with self._lock:
+            self._result = self._pending = None
+        self.segmenter.cancel()
         self._wake.set()
         stopped = _join(self._thread, timeout_s)
         with self._lock:
             return CloseStatus(stopped, self._error)
 
-    def _run(self) -> None:
+    def _run(self):
         tracker = None
+        started = time.monotonic_ns()
         try:
+            self.segmenter.start()
+            sam_load_metrics = dict(self.segmenter.last_metrics)
             if self._stop.is_set():
                 return
-            tracker = self._factory()
+            tracker = self._factory(self.segmenter)
+            self.metadata = dict(segmentation=self.segmenter.provenance,
+                                 sam_load_metrics=sam_load_metrics,
+                                 pose={name: item.provenance for name, item in tracker.trackers.items()},
+                                 model_load_ms=(time.monotonic_ns()-started)/1e6)
             with self._lock:
                 self._ready = not self._stop.is_set()
             while not self._stop.is_set():
@@ -280,41 +230,34 @@ class PoseWorker:
                     self._wake.clear()
                 if task is None:
                     continue
-                operation = "register" if task.mask is not None else "track"
-                started_ns = time.monotonic_ns()
-                pose = error_text = None
+                operation, frame, args, kwargs = task
+                error_text = value = None
                 try:
-                    if task.mask is not None:
-                        pose = tracker.register(task.rgb, task.depth_m, task.K, task.mask)
+                    if operation == 'predict':
+                        frame_key = dict(source_id=frame.source_id, row_index=frame.row_index,
+                                         clock=frame.clock, timestamp_ns=frame.timestamp_ns)
+                        value = self.segmenter.predict(frame.rgb, *args, frame_key=frame_key, **kwargs)
                     else:
-                        pose = tracker.track(task.rgb, task.depth_m, task.K)
-                    # Upstream may retain/mutate its estimate on the next call.
-                    pose = np.asarray(pose).copy()
+                        value = tracker.step(frame, *args, **kwargs)
                 except Exception as error:
                     error_text = _error_text(error)
-                completed_ns = time.monotonic_ns()
                 with self._lock:
                     self._running = False
-                    if task.generation == self._generation and not self._stop.is_set():
-                        self._registered_generation = task.generation if error_text is None else None
-                        self._result = PoseResult(
-                            task.generation, task.frame, task.rgb, task.depth_m, task.K,
-                            operation, task.mask, pose, started_ns, completed_ns, error_text,
-                        )
+                    if not self._stop.is_set():
+                        self._result = SceneResult(operation, frame, value, error_text)
         except Exception as error:
             with self._lock:
-                self._error = _error_text(error)
+                if not self._stop.is_set():
+                    self._error = _error_text(error)
         finally:
-            # A future estimator cleanup, like construction/inference, stays here.
-            if tracker is not None and hasattr(tracker, "close"):
-                try:
+            try:
+                if tracker is not None:
                     tracker.close()
-                except Exception as error:
-                    with self._lock:
-                        message = "pose cleanup: " + _error_text(error)
-                        self._error = f"{self._error}; {message}" if self._error else message
+                else:
+                    self.segmenter.close()
+            except Exception as error:
+                with self._lock:
+                    self._error = _error_text(error)
             with self._lock:
-                self._ready = False
-                self._running = False
+                self._ready = self._running = False
                 self._pending = None
-                self._registered_generation = None

@@ -16,7 +16,7 @@ import shlex
 import sys
 import time
 
-from ..io import _new_output, _save_input, _sha256, _write_json
+from ..io import _new_output, _sha256, _write_json
 
 
 def parse_args(argv=None, *, workspace=None):
@@ -41,11 +41,11 @@ def parse_args(argv=None, *, workspace=None):
 
 
 def _save_frame(output, frame, *, frozen_ns, confirmed_ns, mode):
-    import numpy as np
     from PIL import Image
+    from ..rgbd import save_frame
 
     Image.fromarray(frame.rgb).save(output / "rgb.png")
-    _save_input(output / "frame.npz", frame, np)
+    save_frame(output / "frame.npz", frame)
     metadata = {
         "source_mode": mode,
         "source_id": frame.source_id,
