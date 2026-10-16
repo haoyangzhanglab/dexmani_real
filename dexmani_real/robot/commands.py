@@ -1,4 +1,4 @@
-"""Owned absolute targets for direct SDK dispatch."""
+"""Owned absolute targets for arm submission and hand SDK dispatch."""
 
 from dataclasses import dataclass
 from enum import IntEnum
@@ -7,13 +7,14 @@ import numpy as np
 
 
 class DispatchStatus(IntEnum):
-    """Shared SDK outcome and Raw codes; CRC permits the next normal target."""
+    """Dispatch facts. SUBMITTED is a host goal, ACCEPTED is an actual SDK result."""
 
     NOT_CALLED = 0
     ACCEPTED = 1
     CRC_UNCONFIRMED = 2
     REJECTED = 3
     UNKNOWN = 4
+    SUBMITTED = 5
 
 
 @dataclass(frozen=True)

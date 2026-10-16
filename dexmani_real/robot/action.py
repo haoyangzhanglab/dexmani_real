@@ -35,11 +35,9 @@ class ActionRealization:
 
 
 class ActionRealizer:
-    def __init__(self, runtime, planner=None, collision_model=None, *, check_final_target=False):
-        self.target_fk = None
-        if check_final_target:
-            from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
-            self.target_fk = make_arm_fk()
+    def __init__(self, runtime, planner=None, collision_model=None):
+        from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+        self.target_fk = make_arm_fk()
         self.runtime = runtime
         self.planner = planner
         self.collision_model = collision_model if planner is None else planner.collision_model
@@ -47,17 +45,17 @@ class ActionRealizer:
             planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
 
     @classmethod
-    def for_mode(cls, runtime, mode, *, deployment=False):
+    def for_mode(cls, runtime, mode):
         """Build geometry after the workflow validates the resolved robot configuration."""
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
-        if mode == "eef" or deployment:
-            runtime.policy.workspace.validate()
+        runtime.policy.workspace.validate()
+        margin = runtime.execution.eef_workspace_margin_m
+        if not np.isfinite(margin) or margin < 0:
+            raise ValueError("shared final EEF workspace margin must be finite and nonnegative")
         # Online manipulation permits table contact; HOME checks table paths with a separate planner.
-        environment = {}
-        if deployment:
-            runtime.environment.validate()
-            environment = dict(static_boxes=runtime.environment.static_boxes)
+        runtime.environment.validate()
+        environment = dict(static_boxes=runtime.environment.static_boxes)
         planner = (
             XArm7MotionPlanner.create_default(
                 online_ik_profile=make_online_ik_config(runtime),
@@ -71,7 +69,7 @@ class ActionRealizer:
             from dexmani_real.planning.collision import CollisionModel
 
             collision = CollisionModel(**environment)
-        return cls(runtime, planner, collision, check_final_target=deployment)
+        return cls(runtime, planner, collision)
 
     def _joint_rejection(self, target, hand, current, previous):
         cfg = self.runtime
@@ -97,9 +95,7 @@ class ActionRealizer:
         return self._final_target_rejection(target)
 
     def _final_target_rejection(self, target):
-        """Deployment geometry not covered by online IK's candidate admission."""
-        if self.target_fk is None:
-            return None
+        """Shared physical endpoint admission; this does not prove swept-path clearance."""
         if not self.collision_model.within_joint_limits(target):
             return "model_joint_limits"
         position, _ = self.target_fk.compute(target)

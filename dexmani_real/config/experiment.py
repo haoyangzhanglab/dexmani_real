@@ -167,6 +167,19 @@ def validate_robot_config(cfg: ExperimentConfig) -> None:
         section.validate()
 
 
+def validate_control_rate(cfg: ExperimentConfig, control_hz: float) -> None:
+    """Validate cadence before connecting; never silently decimate hand targets."""
+    if not np.isfinite(control_hz) or not 0 < control_hz <= cfg.arm.servo_hz:
+        raise ValueError('target frequency must be positive and no greater than arm.servo_hz')
+    if 1 / control_hz >= cfg.arm.feedback_max_age_s:
+        raise ValueError('target period must fit arm.feedback_max_age_s (coordinator health budget)')
+    if cfg.policy.hand_enabled:
+        if control_hz > 83:
+            raise ValueError('XHand targets exceed the documented 83 Hz upper bound')
+        if 1 / control_hz >= cfg.hand.feedback_max_age_s:
+            raise ValueError('target period must fit hand.feedback_max_age_s; configure both explicitly')
+
+
 def resolve_runtime_table(cfg: ExperimentConfig, *, pointcloud=None) -> ExperimentConfig:
     """One session snapshot for HOME and the effective (possibly saved) cloud recipe."""
     table = cfg.environment.table

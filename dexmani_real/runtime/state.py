@@ -1,4 +1,4 @@
-"""Main-process motion state; only SensorChannels crosses the spawn boundary."""
+"""Main-process state; sensors and a narrow xArm authority signal cross spawn."""
 
 from dataclasses import dataclass, field
 from threading import RLock
@@ -22,11 +22,15 @@ class RuntimeState:
     safety_state: SafetyState = SafetyState.DISARMED
     # Never held across an SDK call; keyboard callbacks revoke from another thread.
     motion_lock: object = field(default_factory=RLock, repr=False)
+    arm_authority: object = field(default=None, repr=False)
+    arm_emergency: object = field(default=None, repr=False)
 
     def end_session(self) -> None:
         """End local authority and notify sensor workers when this session has any."""
         with self.motion_lock:
             self.running = False
+            if self.arm_authority is not None:
+                self.arm_authority.value = 0
             if self.sensors is not None:
                 self.sensors.is_running.value = False
 

@@ -428,29 +428,24 @@ def _coarse_stratified_sample_indices(
     return np.concatenate((representatives, fill))
 
 
-def _fixed_size_sample(
-    cloud: np.ndarray,
+def _fixed_size_sample_indices(
     voxel_keys: np.ndarray,
     num_points: int,
     coarse_voxel_stride: int,
 ) -> np.ndarray:
-    if cloud.ndim != 2 or cloud.shape[1] != 6:
-        raise ValueError("cloud must have shape [N,6]")
-    count = cloud.shape[0]
+    if voxel_keys.ndim != 2 or voxel_keys.shape[1] != 3:
+        raise ValueError("voxel_keys must have shape [N,3]")
+    count = voxel_keys.shape[0]
     if count == 0:
         raise ValueError("cannot sample an empty cloud")
-    if voxel_keys.shape != (count, 3):
-        raise ValueError("voxel_keys must have shape [N,3] matching cloud")
     if count > num_points:
-        indices = _coarse_stratified_sample_indices(
+        return _coarse_stratified_sample_indices(
             voxel_keys,
             num_points,
             coarse_voxel_stride,
         )
-    else:
-        spatial_order = np.argsort(_spatial_hash(voxel_keys), kind="stable")
-        indices = spatial_order[np.arange(num_points, dtype=np.int64) % count]
-    return np.ascontiguousarray(cloud[indices], dtype=np.float32)
+    spatial_order = np.argsort(_spatial_hash(voxel_keys), kind="stable")
+    return spatial_order[np.arange(num_points, dtype=np.int64) % count]
 
 
 def aligned_depth_points_in_base(
@@ -553,22 +548,18 @@ def build_point_cloud(
         min_neighbors=config.outlier_min_neighbors,
         min_component_points=config.outlier_min_component_points,
     )
-    if not np.any(inlier):
+    retained = np.flatnonzero(inlier)
+    if retained.size == 0:
         return None
-    points_base = points_base[inlier]
-    colors = colors[inlier]
-    voxel_keys = voxel_keys[inlier]
     # This limits final sampling work, not the earlier radius/component search.
     sampling_candidate_limit = config.num_points * config.outlier_candidate_multiplier
-    candidate_indices = _spatial_candidate_indices(voxel_keys, sampling_candidate_limit)
-    points_base = points_base[candidate_indices]
-    colors = colors[candidate_indices]
-    voxel_keys = voxel_keys[candidate_indices]
-
-    cloud = np.column_stack((points_base, colors)).astype(np.float32)
-    return _fixed_size_sample(
-        cloud,
-        voxel_keys,
+    candidates = _spatial_candidate_indices(voxel_keys[retained], sampling_candidate_limit)
+    retained = retained[candidates]
+    sampled = _fixed_size_sample_indices(
+        voxel_keys[retained],
         config.num_points,
         config.sampling_coarse_voxel_stride,
     )
+    # Carry indices through selection; gather averaged XYZ/RGB only for the final cloud.
+    selected = retained[sampled]
+    return np.column_stack((points_base[selected], colors[selected]))

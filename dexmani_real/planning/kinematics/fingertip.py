@@ -6,65 +6,13 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.planning.kinematics.pose import (
-    Pose,
-    compose_pose,
-    quat_wxyz_to_rotmat,
-    rot6d_to_quat_wxyz,
-)
+from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
+from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rotmat, rot6d_to_rotmat
 from dexmani_real.robot.model import (
     ARM_JOINT_SHAPE,
     HAND_FINGERTIP_SHAPE,
     HAND_JOINT_SHAPE,
 )
-from dexmani_real.utils.geometry import normalize_quat_wxyz
-
-
-def compute_fingertip_points_xarm_base(
-    arm_qpos: np.ndarray,
-    hand_qpos: np.ndarray,
-    *,
-    arm_fk: Any | None,
-    hand_fk: Any,
-    handbase_position_eef_m: np.ndarray,
-    handbase_quat_eef_wxyz: np.ndarray,
-    eef_position_xarm_base_m: np.ndarray | None = None,
-    eef_rot6d_xarm_base: np.ndarray | None = None,
-) -> np.ndarray:
-    """Return SDK-finger-order tips in xArm base; optional EEF fields reuse an existing arm FK result."""
-    arm = np.asarray(arm_qpos, dtype=np.float64)
-    hand = np.asarray(hand_qpos, dtype=np.float64)
-    mount_p = np.asarray(handbase_position_eef_m, dtype=np.float64)
-    mount_q = normalize_quat_wxyz(handbase_quat_eef_wxyz)
-    if arm.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(arm)):
-        raise ValueError(f"arm_qpos must be finite {ARM_JOINT_SHAPE}")
-    if hand.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(hand)):
-        raise ValueError(f"hand_qpos must be finite {HAND_JOINT_SHAPE}")
-    if mount_p.shape != (3,) or not np.all(np.isfinite(mount_p)):
-        raise ValueError("hand mount position must be finite shape (3,)")
-    if (eef_position_xarm_base_m is None) != (eef_rot6d_xarm_base is None):
-        raise ValueError("EEF position and rot6d must be provided together")
-    if eef_position_xarm_base_m is None:
-        if arm_fk is None:
-            raise ValueError("arm_fk is required when the EEF pose is not provided")
-        eef_pos, eef_rot6d = arm_fk.compute(arm)
-    else:
-        eef_pos = np.asarray(eef_position_xarm_base_m, dtype=np.float64)
-        eef_rot6d = np.asarray(eef_rot6d_xarm_base, dtype=np.float64)
-        if eef_pos.shape != (3,) or not np.all(np.isfinite(eef_pos)):
-            raise ValueError("EEF position must be finite shape (3,)")
-        if eef_rot6d.shape != (6,) or not np.all(np.isfinite(eef_rot6d)):
-            raise ValueError("EEF rot6d must be finite shape (6,)")
-    eef_pose = Pose(p=np.asarray(eef_pos, dtype=np.float64), q=rot6d_to_quat_wxyz(eef_rot6d))
-    handbase_pose = compose_pose(eef_pose, Pose(p=mount_p, q=mount_q))
-    tips_hand = np.asarray(hand_fk.compute_tip_positions_in_handbase(hand), dtype=np.float64)
-    if tips_hand.shape != HAND_FINGERTIP_SHAPE or not np.all(np.isfinite(tips_hand)):
-        raise RuntimeError("hand FK produced malformed fingertip positions")
-    rotation = quat_wxyz_to_rotmat(handbase_pose.q)
-    tips = tips_hand @ rotation.T + handbase_pose.p
-    if tips.shape != HAND_FINGERTIP_SHAPE or not np.all(np.isfinite(tips)):
-        raise RuntimeError("fingertip transform produced malformed positions")
-    return tips
 
 
 def compute_fingertip_history_xarm_base(
@@ -86,32 +34,28 @@ def compute_fingertip_history_xarm_base(
         or hand.shape != (len(arm), HAND_JOINT_SHAPE[0])
     ):
         raise ValueError("aligned arm/hand qpos histories have invalid shapes")
-    poses: np.ndarray | None = None
+    if not np.isfinite(arm).all() or not np.isfinite(hand).all():
+        raise ValueError("arm/hand qpos histories must be finite")
+    mount_p = np.asarray(handbase_position_eef_m, dtype=np.float64)
+    if mount_p.shape != (3,) or not np.isfinite(mount_p).all():
+        raise ValueError("hand mount position must be finite shape (3,)")
+    mount_rotation = quat_wxyz_to_rotmat(handbase_quat_eef_wxyz)
     if eef_pose_history is not None:
         poses = np.asarray(eef_pose_history, dtype=np.float64)
         if poses.shape != (len(arm), 9) or not np.all(np.isfinite(poses)):
             raise ValueError("eef_pose_history must be finite with shape (T, 9)")
-    elif arm_fk is None:
-        raise ValueError("arm_fk is required when eef_pose_history is not provided")
-    return np.asarray(
-        [
-            compute_fingertip_points_xarm_base(
-                arm[index],
-                hand[index],
-                arm_fk=arm_fk,
-                hand_fk=hand_fk,
-                handbase_position_eef_m=handbase_position_eef_m,
-                handbase_quat_eef_wxyz=handbase_quat_eef_wxyz,
-                eef_position_xarm_base_m=None if poses is None else poses[index, :3],
-                eef_rot6d_xarm_base=None if poses is None else poses[index, 3:],
-            )
-            for index in range(len(arm))
-        ],
-        dtype=np.float32,
-    )
-
-
-__all__ = [
-    "compute_fingertip_history_xarm_base",
-    "compute_fingertip_points_xarm_base",
-]
+    else:
+        if arm_fk is None:
+            raise ValueError("arm_fk is required when eef_pose_history is not provided")
+        poses = compute_eef_pose_history_xarm_base(arm, arm_fk=arm_fk)
+    tips = np.empty((len(arm), *HAND_FINGERTIP_SHAPE), dtype=np.float32)
+    for index, pose in enumerate(poses):
+        rotation = rot6d_to_rotmat(pose[3:])
+        tips_hand = np.asarray(hand_fk.compute_tip_positions_in_handbase(hand[index]), dtype=np.float64)
+        if tips_hand.shape != HAND_FINGERTIP_SHAPE or not np.isfinite(tips_hand).all():
+            raise RuntimeError("hand FK produced malformed fingertip positions")
+        # Row vectors: hand base -> EEF -> xArm base. Keep float64 until storage.
+        tips[index] = (tips_hand @ mount_rotation.T + mount_p) @ rotation.T + pose[:3]
+    if not np.isfinite(tips).all():
+        raise RuntimeError("fingertip transform produced non-finite positions")
+    return tips

@@ -21,6 +21,7 @@ from dexmani_real.robot.robot import DispatchError
 from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.safety import (
+    request_emergency_stop,
     RunEndReason,
     SafetyState,
     begin_motion,
@@ -69,7 +70,7 @@ def set_calibration_fault(
 ) -> None:
     logger.error("Calibration fault: %s", reason)
     if estop:
-        shared.estop_request = True
+        request_emergency_stop(shared)
     else:
         shared.error_state = True
     revoke_motion(shared, SafetyState.FAULT, reason=run_end_reason)
@@ -208,13 +209,20 @@ def run_calibration_motion_tick(
         set_calibration_fault(shared, "unexpected calibration motion state")
         return
     if state.blocked_until_release:
+        if robot.stop_required:
+            revoke_motion(shared)
+            robot.stop()
+            state.command_qpos = state.command_pose = None
         if not any_jog_key_held(keys.pressed_keys()):
             state.blocked_until_release = False
         return
     dx, drpy = compute_cartesian_jog_delta(keys, calib_cfg.delta_pos_m, calib_cfg.delta_rpy_rad)
     moving = bool(np.any(dx != 0.0) or np.any(drpy != 0.0))
     if not moving:
-        # Idle lets Mode 6 finish/hold the last dispatched endpoint.
+        if robot.stop_required:
+            revoke_motion(shared)
+            robot.stop()
+            state.command_qpos = state.command_pose = None
         idle_interval = int(runtime.keyboard_teleop.idle_interval_frames)
         if state.frame % idle_interval == 0:
             measured_pose = planner.kin.compute_eef_pose_world(state.current_qpos)
@@ -227,6 +235,9 @@ def run_calibration_motion_tick(
 
     epoch = int(shared.run_id)
     if safety_state == int(SafetyState.ARMED):
+        state.command_qpos = state.command_pose = None
+        if robot.stop_required:
+            robot.stop()
         try:
             robot.prepare_streaming(epoch)
         except DispatchError as exc:
@@ -256,6 +267,7 @@ def run_calibration_motion_tick(
         state.last_boundary_warning_s,
     )
     if not changed:
+        state.blocked_until_release = True
         return
 
     ik_result = planner.solve_online_ik(
@@ -270,7 +282,7 @@ def run_calibration_motion_tick(
         if now_s - state.last_ik_warning_s >= _IK_WARNING_INTERVAL_S:
             logger.warning("IK rejected target: %s", ik_result.reason or "unknown")
             state.last_ik_warning_s = now_s
-        # Reject this proposal without stopping the last valid firmware endpoint.
+        # Rejection does not renew the previous reference's bounded input lifetime.
         state.blocked_until_release = True
         return
 
@@ -289,11 +301,13 @@ def run_calibration_motion_tick(
             epoch = int(shared.run_id)
     q_cmd = ik_result.qpos
     try:
+        robot.arm.update_health(upstream_until_ns=2**63 - 1)
         robot.send_action(
             RobotCommand(epoch, q_cmd),
             valid_until_ns=state.feedback_timestamp_ns
             + int(runtime.arm.feedback_max_age_s * 1e9)
             + 1,
+            execute_until_ns=state.feedback_timestamp_ns + int(runtime.policy.vr_mapping.stale_threshold_s * 1e9),
         )
     except DispatchError as exc:
         if not exc.revoked:

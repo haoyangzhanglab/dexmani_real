@@ -58,7 +58,7 @@ class HomingParams:
     max_speed_deg_s: float = (
         30.0  # Conservative Mode-0 speed; tuning needs hardware validation.
     )
-    # Settling budget for HOME milestones and Mode-6 restoration.
+    # Settling budget for HOME milestones and Mode-1 restoration.
     target_timeout_s: float = 0.5
     velocity_convergence_rad_s: float = 0.03
     dwell_s: float = 0.30
@@ -104,6 +104,15 @@ class ArmParams:
     # ~14.14 rad/s²; ~71% of the 20 rad/s² SDK limit.
     max_joint_acceleration_deg_per_s2: float = 810.0
     feedback_max_age_s: float = 4 / 30  # host-side feedback freshness budget
+
+    # Host reference generation; independent of teleop/control_dt_s sampling.
+    servo_hz: float = 100.0
+    feedback_hz: float = 25.0
+    servo_max_interval_s: float = 0.020
+    sdk_timeout_s: float = 0.020
+    executor_timeout_s: float = 3.0
+    tracking_error_rad: float = 0.35
+    servo_event_capacity: int = 4096
 
     ip: str = "192.168.1.111"
 
@@ -153,7 +162,19 @@ class ArmParams:
             raise ValueError(
                 f"collision_sensitivity={self.collision_sensitivity} out of range [0, 5]"
             )
-        # Mode 6 clamps speed to [0.0001, π] rad/s and acceleration to [0.01, 20] rad/s².
+        for name in (
+            "servo_hz", "feedback_hz", "servo_max_interval_s", "sdk_timeout_s",
+            "executor_timeout_s", "tracking_error_rad",
+        ):
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"arm {name} must be finite and positive")
+        if not (self.feedback_hz <= self.servo_hz and 1 / self.feedback_hz < self.feedback_max_age_s):
+            raise ValueError("feedback period must fit freshness budget and not exceed servo rate")
+        if not 1 / self.servo_hz < self.servo_max_interval_s:
+            raise ValueError("servo interval budget must exceed one servo period")
+        if type(self.servo_event_capacity) is not int or self.servo_event_capacity < 16:
+            raise ValueError("servo_event_capacity must be an integer >=16")
+        # These physical v/a limits also remain valid for firmware-planned Mode-0 HOME.
         _max_speed_rad = self.max_joint_velocity_rad_per_s
         _max_acc_rad = self.max_joint_acceleration_rad_per_s2
         if not (np.isfinite(_max_speed_rad) and 0.0001 <= _max_speed_rad <= np.pi):

@@ -34,7 +34,8 @@ DATASET_SPECS = {
     # Consumed tactile observation: SDK units, bounded previous-valid vector hold (see metadata).
     "hand_contact": _spec(np.float32, (5, 3)),
     "hand_tactile_force": _spec(np.float32, (5, 120, 3)),
-    # Attempted absolute targets; dispatch preserves the outcome, not arrival.
+    # Submitted absolute q_goal. Mode-1 SDK results live in arm_servo events;
+    # references are execution evidence, never training actions.
     "action_arm_joint_target": _spec(np.float64, (7,)),
     "action_hand_joint_target": _spec(np.float64, (12,)),
     # Seconds relative to the first observation; dispatch columns are arm, hand.
@@ -53,12 +54,13 @@ def validate_capture_rows(timestamp, dispatch_status) -> tuple[str, ...]:
             errors.append("timestamp must start at zero")
         if np.any(np.diff(timestamp) <= 0):
             errors.append("timestamp must be strictly increasing within an episode")
-    if np.any(dispatch_status > 4):
-        errors.append("dispatch_status must contain status codes 0 through 4")
+    if np.any(dispatch_status > DispatchStatus.SUBMITTED):
+        errors.append("dispatch_status must contain status codes 0 through 5")
     return tuple(errors)
 
 
-def validate_training_rows(timestamp, dispatch_status, control_hz) -> tuple[str, ...]:
+def validate_training_rows(timestamp, dispatch_status, control_hz, *,
+                           arm_dispatch=DispatchStatus.ACCEPTED) -> tuple[str, ...]:
     """Whole-episode admission only; failed evidence remains readable as Raw."""
     errors = validate_capture_rows(timestamp, dispatch_status)
     if errors:
@@ -78,21 +80,28 @@ def validate_training_rows(timestamp, dispatch_status, control_hz) -> tuple[str,
         return (f"timing row {row}: interval_ns={intervals[row - 1]:.0f}, "
                 f"nominal_ns={dt_ns}, grid_deviation_ns={deviations[row]:.0f}, "
                 f"tolerance_ns={epsilon_ns}",)
+    return validate_dispatch_rows(dispatch_status, arm_dispatch=arm_dispatch)
+
+
+def validate_dispatch_rows(dispatch_status, *, arm_dispatch=DispatchStatus.ACCEPTED) -> tuple[str, ...]:
+    """Shared dispatch admission for training and replay; servo evidence is checked separately."""
     dispatch = np.asarray(dispatch_status)
+    if dispatch.ndim != 2 or dispatch.shape[1] != 2:
+        return ("dispatch_status must have shape (N, 2)",)
     bad_dispatch = np.flatnonzero(
-        (dispatch[:, 0] != DispatchStatus.ACCEPTED)
+        (dispatch[:, 0] != arm_dispatch)
         | ~np.isin(dispatch[:, 1], (DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED))
     )
     if len(bad_dispatch):
         row = int(bad_dispatch[0])
         return (f"dispatch row {row}: arm/hand={list(dispatch_status[row])}; "
-                "training requires arm ACCEPTED (1), hand ACCEPTED or CRC_UNCONFIRMED (1 or 2)",)
+                f"requires arm {arm_dispatch.name}, hand ACCEPTED or CRC_UNCONFIRMED",)
     return ()
 
 
 # Optional timing evidence; -1 means unavailable. Rows align with core observations.
 # Queries/termination are separate; visited candidates need not have crossed the SDK boundary.
-# dispatch_status alone records actual SDK dispatch outcomes.
+# dispatch_status records host submission / hand SDK results; arm_servo records arm SDK results.
 TIMING_REQUIRED_FIELDS = (
     "observation_ns", "control_ns", "arm_ns", "hand_ns", "camera_ns", "pointcloud_ns",
     "camera_sequence", "pointcloud_camera_sequence", "run_id", "slot", "query_id",

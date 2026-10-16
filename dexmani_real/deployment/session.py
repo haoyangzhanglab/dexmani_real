@@ -10,7 +10,9 @@ from dexmani_real.calibration.camera.extrinsics import (
     CameraExtrinsics,
     load_optional_camera_extrinsics,
 )
-from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
+from dexmani_real.config.experiment import (
+    resolve_runtime_table, validate_robot_config, validate_control_rate,
+)
 from dexmani_real.deployment.config import (
     validate_max_running_s,
     validate_num_episodes,
@@ -28,6 +30,7 @@ from dexmani_real.robot.arm_homing import build_home_planner
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.safety import (
+    request_emergency_stop,
     RunEndReason,
     SafetyState,
     require_transition,
@@ -99,6 +102,7 @@ def run_policy_deployment(
     max_running_s = validate_max_running_s(max_running_s)
     execution_config = runtime.execution.validate(info)
     validate_robot_config(runtime)
+    validate_control_rate(runtime, 1.0 / info.control_dt_s)
     if cloud_recipe is not None:
         runtime = replace(runtime, pointcloud=cloud_recipe)
     runtime = resolve_runtime_table(runtime, pointcloud=cloud_recipe)
@@ -175,7 +179,7 @@ def run_policy_deployment(
             recording_config is not None,
         )
         kinematics = build_observation_kinematics(info, runtime)
-        realizer = ActionRealizer.for_mode(runtime, info.action_mode, deployment=True)
+        realizer = ActionRealizer.for_mode(runtime, info.action_mode)
         home_planner = build_home_planner(runtime)
         if save_run_config is not None:
             save_run_config(runtime, execution_config)
@@ -258,7 +262,7 @@ def run_policy_deployment(
         )
     except KeyboardInterrupt as exc:
         if shared is not None:
-            shared.estop_request = True
+            request_emergency_stop(shared)
         failure = exc
     except Exception as exc:
         failure = exc

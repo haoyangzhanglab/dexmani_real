@@ -7,7 +7,9 @@ from pathlib import Path
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extrinsics
-from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
+from dexmani_real.config.experiment import (
+    resolve_runtime_table, validate_robot_config, validate_control_rate,
+)
 from dexmani_real.ipc.channels import SensorChannelsConfig
 from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.recording.recorder import AsyncEpisodeRecorder
@@ -16,7 +18,9 @@ from dexmani_real.robot.arm_homing import build_home_planner
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.runtime.processes import shutdown_local_runtime
-from dexmani_real.runtime.safety import RunEndReason, SafetyState, require_transition
+from dexmani_real.runtime.safety import (
+    RunEndReason, SafetyState, require_transition, request_emergency_stop,
+)
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.vr_worker import run_vr_worker
@@ -42,6 +46,7 @@ def run_teleop_experiment(
     configure_logging()
     task_name = validate_task_dir_name(task_name)
     validate_robot_config(runtime)
+    validate_control_rate(runtime, runtime.teleop.control_hz)
     for section in (
         runtime.policy,
         runtime.teleop,
@@ -131,7 +136,7 @@ def run_teleop_experiment(
         runner.run()
         clean = bool(shared.quit_requested)
     except KeyboardInterrupt:
-        shared.estop_request = True
+        request_emergency_stop(shared)
     except Exception:
         shared.error_state = True
         logger.exception("teleop session failed")

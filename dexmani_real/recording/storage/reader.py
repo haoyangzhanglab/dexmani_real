@@ -143,8 +143,8 @@ class EpisodeReader:
         ):
             raise RawDataError("timing rows must align with core rows and contain signed int64 columns")
         queries = [json.loads(value) for value in group["queries"].asstr()[:]]
-        keys = [(item["run_id"], item["query_id"]) for item in queries]
-        if len(set(keys)) != len(keys):
+        keys = {(item["run_id"], item["query_id"]) for item in queries}
+        if len(keys) != len(queries):
             raise RawDataError("duplicate timing query identity")
         values = rows[:]
         for row in values:
@@ -153,6 +153,38 @@ class EpisodeReader:
         return dict(available=True, rows=values, queries=queries, metadata=dict(group.attrs),
                     termination=json.loads(group["termination"].asstr()[()])
                     if "termination" in group else None)
+
+    def validate_servo_execution(self):
+        """Mode-6 Raw retains its original admission; Mode-1 requires full evidence."""
+        mode = self.meta.get("arm_control_mode")
+        if mode is None and "arm_servo" not in self._data:
+            return  # Original Raw, never reinterpreted or migrated.
+        if mode != 1 or "arm_servo" not in self._data:
+            raise RawDataError("unknown/incomplete arm execution semantics")
+        from dexmani_real.recording.storage.servo import validate_servo_evidence
+
+        try:
+            group = self._data["arm_servo"]
+            validate_servo_evidence(
+                group["events"], group["command_ids"][:], self["dispatch_status"][:],
+                self["action_arm_joint_target"][:], complete=bool(group.attrs.get("complete", False)),
+                arm_dispatch=self.arm_dispatch_status,
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            raise RawDataError(f"Mode-1 execution evidence: {exc}") from exc
+
+    @property
+    def arm_dispatch_status(self):
+        from dexmani_real.robot.commands import DispatchStatus
+
+        if self.meta.get('arm_action_semantics') == 'q_goal_submitted':
+            if self.meta.get('arm_control_mode') != 1:
+                raise RawDataError('submitted targets require Mode-1 execution evidence')
+            return DispatchStatus.SUBMITTED
+        if (self.meta.get('arm_control_mode') == 1
+                and self.meta.get('arm_action_semantics') != 'q_goal_first_servo_point_receipt'):
+            raise RawDataError('unknown Mode-1 action semantics')
+        return DispatchStatus.ACCEPTED
 
     def timing_diagnostics(self):
         """Return host ages/deltas in seconds (NaN/None if missing), without cross-modality admission thresholds."""

@@ -45,6 +45,7 @@ def _begin_motion_locked(shared):
     started = time.monotonic_ns()
     shared.run_ended_reason = int(RunEndReason.NONE)
     shared.safety_state = int(SafetyState.RUNNING)
+    publish_arm_authority(shared)
     return int(shared.run_id), started
 
 
@@ -91,7 +92,40 @@ def _revoke_motion_locked(
         shared.run_ended_reason = int(reason)
     shared.run_id += 1
     shared.safety_state = int(new_state)
+    publish_arm_authority(shared)
     return True
+
+
+def publish_arm_authority(shared):
+    """Signed epoch: ARMED preparation < 0, RUNNING > 0, revoked = 0.
+
+    RuntimeState remains local. The child never waits for a parent callback or
+    reads the parent's sensor buffers to decide whether it may send a point.
+    """
+    signal = getattr(shared, 'arm_authority', None)
+    if signal is None:
+        return
+    with shared.motion_lock:
+        if (not shared.running or shared.error_state or shared.estop_request
+                or shared.quit_requested or shared.stop_request):
+            signal.value = 0
+        elif int(shared.safety_state) == SafetyState.RUNNING:
+            signal.value = int(shared.run_id)
+        elif int(shared.safety_state) == SafetyState.ARMED:
+            signal.value = -int(shared.run_id)
+        else:
+            signal.value = 0
+        if shared.estop_request and shared.arm_emergency is not None:
+            shared.arm_emergency.set()
+
+
+def request_emergency_stop(shared):
+    with shared.motion_lock:
+        already_requested = shared.estop_request
+        shared.estop_request = True
+        publish_arm_authority(shared)
+        if not already_requested:
+            _revoke_motion_locked(shared, reason=RunEndReason.ESTOP)
 
 
 def revoke_motion(shared, new_state=SafetyState.ARMED, *, reason=RunEndReason.EXECUTOR_BOUNDARY):

@@ -67,12 +67,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--camera-calibration", default=None, help="Explicit camera extrinsics JSON"
     )
+    parser.add_argument('--control-hz', type=float, default=None,
+                        help='Teleop/action/recording frequency; xArm servo frequency is independent')
     args = parser.parse_args(argv)
 
     try:
         runtime = load_experiment_config(
             yaml_path=args.config,
             cli_overrides={
+                'teleop.control_hz': args.control_hz,
                 "policy.hand_enabled": False if args.no_hand else None,
                 "policy.recording_enabled": False if args.no_record else None,
             },

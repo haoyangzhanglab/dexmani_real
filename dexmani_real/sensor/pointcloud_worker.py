@@ -156,15 +156,15 @@ def run_pointcloud_worker(shared: "SensorChannels", config: PointCloudWorkerConf
                 label="build_point_cloud output",
             )
 
-            record = np.zeros(1, dtype=expected_dtype)
             camera_header = header[0]
-            record["source_camera_sequence"][0] = np.uint64(camera_sequence)
-            record["timestamp_ns"][0] = camera_header["timestamp_ns"]
-            record["camera_received_ns"][0] = camera_header["received_ns"]
-            record["camera_published_ns"][0] = camera_published_ns
-            record["processing_started_ns"][0] = processing_started_ns
-            record["point_cloud"][0] = cloud
-            shared.pointcloud_ring.write(record)
+            shared.pointcloud_ring.write_fields(
+                source_camera_sequence=np.uint64(camera_sequence),
+                timestamp_ns=camera_header["timestamp_ns"],
+                camera_received_ns=camera_header["received_ns"],
+                camera_published_ns=np.uint64(camera_published_ns),
+                processing_started_ns=np.uint64(processing_started_ns),
+                point_cloud=cloud,
+            )
             if not ready:
                 shared.pointcloud_ready.set()
                 ready = True

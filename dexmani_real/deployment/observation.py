@@ -95,10 +95,12 @@ def build_policy_observation(rows, policy_info, *, kinematics=None, camera_param
     requested = set(policy_info.observation_fields)
     arrays = {}
     if requested & {"joint_state", "eef_pose", "fingertip_xyz"}:
-        joint = np.stack(
-            [np.concatenate((r.arm["qpos"][0], r.hand["qpos"][0])) for r in rows]
-        ).astype(np.float32)
-        arrays["joint_state"] = joint
+        # Keep measured precision through FK, as in the Raw -> canonical path.
+        arm = np.stack([r.arm["qpos"][0] for r in rows])
+    if requested & {"joint_state", "fingertip_xyz"}:
+        hand = np.stack([r.hand["qpos"][0] for r in rows])
+    if "joint_state" in requested:
+        arrays["joint_state"] = np.concatenate((arm, hand), axis=1).astype(np.float32)
     for name, field in (("finger_tactile_force", "tactile_aggregate"), ("taxel_tactile_force", "tactile_dense")):
         if name in requested:
             arrays[name] = np.stack([r.hand[field][0] for r in rows])
@@ -113,18 +115,19 @@ def build_policy_observation(rows, policy_info, *, kinematics=None, camera_param
         arrays[name] = np.broadcast_to(values, (len(rows), values.size)).copy()
     if requested & {"eef_pose", "fingertip_xyz"}:
         arm_fk, hand_fk, cfg = kinematics.arm_fk, kinematics.hand_fk, kinematics.mount
-        poses = compute_eef_pose_history_xarm_base(joint[:, :7], arm_fk=arm_fk)
-        arrays["eef_pose"] = poses.astype(np.float32)
+        poses = compute_eef_pose_history_xarm_base(arm, arm_fk=arm_fk)
+        if "eef_pose" in requested:
+            arrays["eef_pose"] = poses.astype(np.float32)
         if "fingertip_xyz" in requested:
             arrays["fingertip_xyz"] = compute_fingertip_history_xarm_base(
-                joint[:, :7],
-                joint[:, 7:],
+                arm,
+                hand,
                 hand_fk=hand_fk,
                 handbase_position_eef_m=np.asarray(cfg.T_eef_handbase_pos_xyz),
                 handbase_quat_eef_wxyz=np.asarray(cfg.T_eef_handbase_quat_wxyz),
                 arm_fk=arm_fk,
                 eef_pose_history=poses,
-            ).astype(np.float32)
+            )
     result = {}
     for name in policy_info.observation_fields:
         values = np.ascontiguousarray(arrays[name])

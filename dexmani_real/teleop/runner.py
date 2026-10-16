@@ -11,7 +11,9 @@ from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.robot import DispatchError, DispatchInterrupted
 from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
-from dexmani_real.runtime.safety import RunEndReason, SafetyState, begin_motion, revoke_motion
+from dexmani_real.runtime.safety import (
+    RunEndReason, SafetyState, begin_motion, revoke_motion, request_emergency_stop,
+)
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.utils.control_clock import sampling_clock_ns
 
@@ -44,7 +46,7 @@ class TeleopRunner:
         self.runtime = runtime
         self.recorder = recorder
         self.keyboard = KeyboardInput(
-            estop_callback=lambda: setattr(shared, "estop_request", True),
+            estop_callback=lambda: request_emergency_stop(shared),
             stop_callback=lambda: revoke_motion(shared, reason=RunEndReason.OPERATOR),
             quit_callback=lambda: revoke_motion(shared, reason=RunEndReason.QUIT),
         )
@@ -220,6 +222,7 @@ class TeleopRunner:
         if self.recorder is not None:
             self.recorder.start_episode(
                 task_label=self.task_label,
+                arm_executor=self.robot.arm,
                 **snapshot_recording_metadata(
                     self.shared,
                     collection_source="teleop",
@@ -244,8 +247,7 @@ class TeleopRunner:
 
     def _handle_operator_command(self, cmd, *, home_commands=(), expected_run_id=None) -> bool:
         if cmd is OperatorCommand.EMERGENCY_STOP:
-            self.shared.estop_request = True
-            revoke_motion(self.shared, reason=RunEndReason.ESTOP)
+            request_emergency_stop(self.shared)
             self.audio.play("emergency")
             return True
         if (
@@ -379,7 +381,7 @@ class TeleopRunner:
         epoch = self.control_run_id
         deadline_ns = min(deadline_ns, feedback_deadline_ns(row, self.runtime, include_vr=True))
         realization = command = dispatch = failure = None
-        timing = {}
+        timing = dict(run_id=epoch, slot=self.tick_index - 1)
         reason = None
         interrupted = False
         run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
@@ -393,7 +395,11 @@ class TeleopRunner:
                     self.recorder.check_error()
                 timing["submit_started_ns"] = time.monotonic_ns()
                 try:
-                    dispatch = self.robot.send_action(command, valid_until_ns=deadline_ns)
+                    dispatch = self.robot.send_action(
+                        command, valid_until_ns=deadline_ns,
+                        execute_until_ns=int(row.vr["recv_ts_ns"])
+                        + int(self.runtime.policy.vr_mapping.stale_threshold_s * 1e9),
+                    )
                 finally:
                     timing["submit_completed_ns"] = time.monotonic_ns()
         except BaseException as exc:
@@ -401,7 +407,7 @@ class TeleopRunner:
             if isinstance(exc, (DispatchError, DispatchInterrupted)):
                 dispatch = exc.result
             if isinstance(exc, KeyboardInterrupt):
-                self.shared.estop_request = True
+                request_emergency_stop(self.shared)
             interrupted = (
                 isinstance(exc, DispatchError) and exc.revoked
                 and exc.cause in {"authority_revoked", "deadline_expired"}
@@ -444,7 +450,7 @@ class TeleopRunner:
         deadline = time.monotonic() + self.runtime.safety.readiness_timeouts_s["vr"]
         while True:
             if not self.keyboard.healthy:
-                self.shared.estop_request = True
+                request_emergency_stop(self.shared)
             if self._poll_blocking_commands():
                 return False
             self.robot.service_idle()
@@ -599,10 +605,11 @@ class TeleopRunner:
             )
             ready = self._initialize()
             while ready and self.shared.running and not self.shared.quit_requested:
+                self.robot.arm.check_error()
                 if self.preparing_epoch is None and (not self.active or self.paused):
                     self.robot.service_idle()
                 if not self.keyboard.healthy:
-                    self.shared.estop_request = True
+                    request_emergency_stop(self.shared)
                 if self.shared.estop_request or self.shared.error_state:
                     self._stop_capture(
                         "estop" if self.shared.estop_request else "runtime_failure"
@@ -630,8 +637,7 @@ class TeleopRunner:
                     continue
                 self._run_control_tick()
         except KeyboardInterrupt:
-            self.shared.estop_request = True
-            revoke_motion(self.shared, reason=RunEndReason.ESTOP)
+            request_emergency_stop(self.shared)
             raise
         except Exception as exc:
             failure = exc

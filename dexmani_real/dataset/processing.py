@@ -45,10 +45,12 @@ def validate_export_episode(
     if reader["depth"].shape != expected or reader["depth"].dtype != np.uint16:
         raise RawDataError(f"depth must be uint16 {expected}")
     errors = validate_training_rows(
-        reader["timestamp"][:], reader["dispatch_status"][:], reader.control_hz
+        reader["timestamp"][:], reader["dispatch_status"][:], reader.control_hz,
+        arm_dispatch=reader.arm_dispatch_status,
     )
     if errors:
         raise RawDataError("; ".join(errors))
+    reader.validate_servo_execution()
     if frames == 1:
         logging.getLogger(__name__).warning("%s: single row, no sampling interval to verify", reader.path)
     for name in DATASET_SPECS:
@@ -135,7 +137,7 @@ def iter_canonical_blocks(
             "action": np.concatenate((arm_action, hand_action), axis=1).astype(np.float32),
             "action_ee": np.concatenate((action_poses, hand_action), axis=1).astype(np.float32),
             "eef_pose": poses.astype(np.float32),
-            "fingertip_xyz": tips.astype(np.float32),
+            "fingertip_xyz": tips,
             "finger_tactile_force": raw["hand_contact"],
             "taxel_tactile_force": raw["hand_tactile_force"],
         }
@@ -143,21 +145,24 @@ def iter_canonical_blocks(
             block[name] = raw[name].astype(np.float32)
         for name, values in camera_parameters.items():
             block[name] = np.broadcast_to(values, (end - start, values.size))
-        rgb, depth, clouds = [], [], []
-        for index in range(start, end):
+        # Fill final arrays directly; avoid retaining every decoded frame plus
+        # a second stacked RGB-D/cloud batch. Depth needs one HDF5 slice per block.
+        rgb = np.empty((end - start, height, width, 3), dtype=np.uint8)
+        depth = reader["depth"][start:end]
+        clouds = np.empty((end - start, config.pointcloud.num_points, 6), dtype=np.float32)
+        for offset, index in enumerate(range(start, end)):
             image = next(images, None)
             if image is None or image.shape != (height, width, 3) or image.dtype != np.uint8:
                 raise RawDataError(
                     f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
                 )
-            depth_frame = np.asarray(reader["depth"][index], dtype=np.uint16)
-            cloud = pointcloud_deriver.derive(depth_frame, image)
+            cloud = pointcloud_deriver.derive(depth[offset], image)
             if cloud is None:
                 raise RawDataError(f"point_cloud unavailable at row {index}")
-            rgb.append(image)
-            depth.append(depth_frame)
-            clouds.append(cloud)
-        block.update(rgb=np.stack(rgb), depth=np.stack(depth), point_cloud=np.stack(clouds))
+            if cloud.shape != clouds.shape[1:] or cloud.dtype != clouds.dtype:
+                raise ValueError("point_cloud: transformed shape/dtype mismatch")
+            rgb[offset], clouds[offset] = image, cloud
+        block.update(rgb=rgb, depth=depth, point_cloud=clouds)
         yield block
     if next(images, None) is not None:
         raise RawDataError(f"{reader.path / 'rgb.mp4'}: RGB contains extra frames")

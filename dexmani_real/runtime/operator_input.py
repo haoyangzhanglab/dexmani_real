@@ -3,16 +3,14 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 import threading
-import time
 from collections import deque
 from collections.abc import Callable
 from enum import Enum
 from typing import Any
-
-import numpy as np
 
 
 logger = logging.getLogger(__name__)
@@ -118,12 +116,12 @@ class KeyboardInput:
         capture_raw_events: bool = False,
         repeat_estop_callback: bool = False,
     ) -> None:
-        if not np.isfinite(startup_timeout_s) or startup_timeout_s <= 0.0:
+        if not math.isfinite(startup_timeout_s) or startup_timeout_s <= 0.0:
             raise ValueError("startup_timeout_s must be finite and positive")
         self._buffer: deque[OperatorCommand] = deque()
         self._events: deque[str] = deque()
         self._keys: set[str] = set()
-        self._lock = threading.Lock()
+        self._condition = threading.Condition(threading.Lock())
         self._listener: Any = None
         self._running: bool = False
         # A daemon can outlive shutdown; disable its callbacks before releasing the session.
@@ -138,34 +136,18 @@ class KeyboardInput:
         self._repeat_estop_callback = bool(repeat_estop_callback)
         self._estop_latched = threading.Event()
         self._listener_failure_reported = False
-        self._pressed_signals: set[OperatorCommand] = set()
         self._saved_termios: list | None = None
-
-    def _accept_control_press(self, signal: OperatorCommand) -> bool:
-        """Emit one command per physical press/release, independent of OS repeat and control cadence."""
-        with self._lock:
-            if not self._callbacks_active:
-                return False
-            if signal in self._pressed_signals:
-                return False
-            self._pressed_signals.add(signal)
-            return True
-
-    def _release_control(self, signal: OperatorCommand) -> None:
-        with self._lock:
-            if not self._callbacks_active:
-                return
-            self._pressed_signals.discard(signal)
 
     def _latch_emergency_stop(self) -> None:
         callback: Callable[[], None] | None = None
-        with self._lock:
+        with self._condition:
             if not self._callbacks_active:
                 return
             already_latched = self._estop_latched.is_set()
             if not already_latched:
                 self._estop_latched.set()
                 self._buffer.append(OperatorCommand.EMERGENCY_STOP)
+                self._condition.notify()
             if not already_latched or self._repeat_estop_callback:
                 callback = self._estop_callback
         if callback is not None:
@@ -176,7 +158,7 @@ class KeyboardInput:
 
     def _dispatch_immediate_callback(self, signal: OperatorCommand) -> bool:
         """Complete the immediate effect before the command becomes pollable."""
-        with self._lock:
+        with self._condition:
             if not self._callbacks_active:
                 return False
             callback = (
@@ -225,21 +207,18 @@ class KeyboardInput:
 
         def on_press(key: object) -> None:
             try:
-                with self._lock:
-                    if not self._callbacks_active:
-                        return
                 name = key_name(key)
                 if name is None:
                     return
-                if name in _EVENT_ONLY_KEYS:
-                    if self._capture_raw_events:
-                        with self._lock:
-                            if self._callbacks_active:
-                                self._events.append(name)
-                    return
-                with self._lock:
+                with self._condition:
                     if not self._callbacks_active:
                         return
+                    if name in _EVENT_ONLY_KEYS:
+                        if self._capture_raw_events:
+                            self._events.append(name)
+                        return
+                    # Held keys also deduplicate command edges across OS repeat.
+                    first_press = name not in self._keys
                     self._keys.add(name)
                 if name == "esc":
                     self._latch_emergency_stop()
@@ -251,29 +230,22 @@ class KeyboardInput:
                         or (signal is OperatorCommand.QUIT and self._quit_callback is not None)
                     )
                     and signal is not None
-                    and self._accept_control_press(signal)
+                    and first_press
                 ):
                     if self._dispatch_immediate_callback(signal):
-                        with self._lock:
+                        with self._condition:
                             if self._capture_commands and self._callbacks_active:
                                 self._buffer.append(signal)
+                                self._condition.notify()
             except Exception:
                 logger.warning("keyboard press callback failed", exc_info=True)
 
         def on_release(key: object) -> None:
             try:
-                with self._lock:
-                    if not self._callbacks_active:
-                        return
                 name = key_name(key)
-                if name is None:
-                    return
-                if name not in _EVENT_ONLY_KEYS:
-                    with self._lock:
+                with self._condition:
+                    if self._callbacks_active:
                         self._keys.discard(name)
-                signal = _KEY_MAP.get(name)
-                if signal is not None:
-                    self._release_control(signal)
             except Exception:
                 logger.warning("keyboard release callback failed", exc_info=True)
 
@@ -304,14 +276,13 @@ class KeyboardInput:
             ) from None
 
         if self._suppress_echo:
-            self._suppress_terminal_echo()
+            self._saved_termios = _suppress_terminal_echo()
         self._estop_latched.clear()
         self._listener_failure_reported = False
-        with self._lock:
+        with self._condition:
             self._buffer.clear()
             self._events.clear()
             self._keys.clear()
-            self._pressed_signals.clear()
             self._callbacks_active = True
         on_press, on_release = self._callbacks(keyboard)
 
@@ -348,7 +319,7 @@ class KeyboardInput:
             if not self._listener.is_alive():
                 raise RuntimeError("keyboard listener exited during startup")
         except Exception:
-            with self._lock:
+            with self._condition:
                 self._callbacks_active = False
             listener = self._listener
             try:
@@ -373,24 +344,21 @@ class KeyboardInput:
     def stop(self) -> None:
         """Stop the listener idempotently for bounded cleanup."""
         listener = self._listener
-        with self._lock:
+        with self._condition:
             self._callbacks_active = False
-        self._running = False
+            self._running = False
+            self._buffer.clear()
+            self._condition.notify_all()
         try:
             if _stop_listener_bounded(listener, label="keyboard"):
                 self._listener = None
         finally:
-            with self._lock:
-                self._buffer.clear()
+            with self._condition:
                 self._events.clear()
                 self._keys.clear()
-                self._pressed_signals.clear()
             self._estop_latched.clear()
             if self._suppress_echo:
                 self._restore_terminal_echo()
-
-    def _suppress_terminal_echo(self) -> None:
-        self._saved_termios = _suppress_terminal_echo()
 
     def _restore_terminal_echo(self) -> None:
         _restore_terminal_echo(self._saved_termios)
@@ -405,32 +373,19 @@ class KeyboardInput:
 
     def poll(self, timeout: float = 0.05) -> list[OperatorCommand]:
         """Drain commands, waiting at most timeout seconds; zero is nonblocking and may return an empty list."""
-        if not np.isfinite(timeout) or timeout < 0.0:
+        if not math.isfinite(timeout) or timeout < 0.0:
             raise ValueError("timeout must be finite and non-negative")
         if self._running and not self.healthy:
             if not self._listener_failure_reported:
                 logger.error("keyboard listener exited; latching emergency stop")
                 self._listener_failure_reported = True
-            self._latch_emergency_stop()
 
-        with self._lock:
-            if self._buffer:
-                signals = list(self._buffer)
-                self._buffer.clear()
-                return signals
-
-        if timeout > 0:
-            deadline = time.perf_counter() + timeout
-            while time.perf_counter() < deadline:
-                with self._lock:
-                    if self._buffer:
-                        signals = list(self._buffer)
-                        self._buffer.clear()
-                        return signals
-                remaining = deadline - time.perf_counter()
-                if remaining > 0:
-                    time.sleep(min(0.005, remaining))
-        return []
+        with self._condition:
+            if timeout > 0:
+                self._condition.wait_for(lambda: self._buffer or not self._running, timeout)
+            signals = list(self._buffer)
+            self._buffer.clear()
+            return signals
 
     @property
     def healthy(self) -> bool:
@@ -442,7 +397,7 @@ class KeyboardInput:
             logger.error("keyboard listener health check failed", exc_info=True)
             healthy = False
         if not healthy:
-            with self._lock:
+            with self._condition:
                 self._keys.clear()
             if self._running:
                 # SDK fences also check keyboard health; losing emergency-stop input must fail safe.
@@ -457,18 +412,18 @@ class KeyboardInput:
         """Return whether a key is currently held, with sticky ESC semantics."""
         if key == "esc" and self._estop_latched.is_set():
             return True
-        with self._lock:
+        with self._condition:
             return key in self._keys
 
     def pressed_keys(self) -> tuple[str, ...]:
-        with self._lock:
+        with self._condition:
             return tuple(sorted(self._keys))
 
     def pop_event(self) -> str | None:
-        with self._lock:
+        with self._condition:
             return self._events.popleft() if self._events else None
 
     def drain_signal(self, target: OperatorCommand) -> None:
         """Remove stale commands after blocking operations, preserving other requests."""
-        with self._lock:
+        with self._condition:
             self._buffer = deque(s for s in self._buffer if s != target)

@@ -14,7 +14,9 @@ from dexmani_real.robot.projection import project_arm_command, project_hand_comm
 from dexmani_real.robot.robot import DispatchError, DispatchInterrupted, DispatchResult
 from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
 from dexmani_real.runtime.operator_input import OperatorCommand
-from dexmani_real.runtime.safety import RunEndReason, begin_motion, revoke_motion
+from dexmani_real.runtime.safety import (
+    RunEndReason, begin_motion, revoke_motion, request_emergency_stop,
+)
 from dexmani_real.utils.control_clock import sampling_clock_ns
 
 
@@ -48,7 +50,7 @@ def _wait_replay(shared, keyboard, epoch, deadline_ns, robot):
         robot.check()
         signals = keyboard.poll(timeout=0)
         if not keyboard.healthy:
-            shared.estop_request = True
+            request_emergency_stop(shared)
         if shared.estop_request:
             return ReplayOutcome(ReplayStatus.ESTOP, reason="operator emergency stop")
         if shared.error_state:
@@ -117,6 +119,7 @@ def _warm_up_hand(shared, runtime, trajectory, keyboard, epoch, row, duration_s,
             stamp = robot.send_action(
                 RobotCommand(epoch, arm_hold, hand),
                 valid_until_ns=feedback_deadline_ns(row, runtime),
+                execute_until_ns=row.observation_timestamp_ns + int(runtime.hand.home_timeout_s * 1e9),
             ).timestamp_ns
             if step == steps:
                 final_stamp = stamp
@@ -244,7 +247,10 @@ def replay_targets(
                         )
                     submit_started_ns = time.monotonic_ns()
                     try:
-                        result = robot.send_action(command, valid_until_ns=valid_until_ns)
+                        result = robot.send_action(
+                            command, valid_until_ns=valid_until_ns,
+                            execute_until_ns=row.observation_timestamp_ns + int(runtime.execution.max_decision_age_s * 1e9),
+                        )
                     finally:
                         submit_completed_ns = time.monotonic_ns()
                     # A blocking SDK call can outlive the last pre-send check, including the final row.
@@ -257,7 +263,7 @@ def replay_targets(
                     result, dispatch_error = exc.result, exc
                     cancelled = isinstance(exc, DispatchInterrupted)
                     if cancelled:
-                        shared.estop_request = True
+                        request_emergency_stop(shared)
                     revoke_motion(
                         shared,
                         reason=RunEndReason.ESTOP
@@ -303,7 +309,7 @@ def replay_targets(
     except DispatchError as exc:
         result = exc.result
         reason = (
-            f"{exc}; arm={result.arm.name}, hand={result.hand.name}, arm_code={result.arm_code}"
+            f"{exc}; arm={result.arm.name}, hand={result.hand.name}, command_id={result.command_id}"
         )
         if exc.revoked:
             # A later Q cannot turn a deadline/stop failure into a clean cancellation.
@@ -329,7 +335,7 @@ def replay_targets(
             RunEndReason.HARDWARE_FAULT if not exc.revoked else RunEndReason.EXECUTOR_BOUNDARY
         )
     except KeyboardInterrupt as exc:
-        shared.estop_request = True
+        request_emergency_stop(shared)
         status, reason = ReplayStatus.ESTOP, "KeyboardInterrupt"
         if isinstance(exc, DispatchInterrupted):
             reason += f"; dispatch={exc.result}"

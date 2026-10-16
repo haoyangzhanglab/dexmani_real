@@ -49,7 +49,9 @@ from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.observation import read_camera_frame, sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_local_runtime
-from dexmani_real.runtime.safety import RunEndReason, SafetyState, require_transition, revoke_motion
+from dexmani_real.runtime.safety import (
+    RunEndReason, SafetyState, require_transition, revoke_motion, request_emergency_stop,
+)
 from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.runtime.supervisor import RuntimeSupervisor
 from dexmani_real.sensor.camera.worker import run_camera_worker
@@ -714,12 +716,12 @@ def run_camera_calibration(
         )
         supervisor.start([camera])
         require_transition(shared, SafetyState.ARMED)
-        print("  local arm connected (Mode 6)")
+        print("  local arm connected (owner process; Mode 1 prepared on jog)")
         exit_code = CameraCalibrationSession(
             shared, runtime, planner, workspace, robot, camera, calib_cfg, aruco_cfg, output_path
         ).run()
     except KeyboardInterrupt:
-        shared.estop_request = True
+        request_emergency_stop(shared)
         exit_code = 130
     except Exception:
         shared.error_state = True

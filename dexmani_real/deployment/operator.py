@@ -10,6 +10,7 @@ from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.robot.arm_homing import home_robot
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.safety import (
+    request_emergency_stop,
     RunEndReason,
     SafetyState,
     StopRequest,
@@ -40,7 +41,7 @@ class PolicyOperator:
         self.runtime = runtime
         self.planner = planner
         self.keyboard = KeyboardInput(
-            estop_callback=lambda: setattr(shared, "estop_request", True),
+            estop_callback=lambda: request_emergency_stop(shared),
             stop_callback=self._request_stop,
             quit_callback=self._request_quit,
         )
@@ -58,7 +59,7 @@ class PolicyOperator:
 
     def poll(self) -> None:
         if self.keyboard.estop_latched or not self.keyboard.healthy:
-            self.shared.estop_request = True
+            request_emergency_stop(self.shared)
             return
         self._handle_command_batch(self.keyboard.poll(timeout=0))
 
@@ -128,7 +129,7 @@ class PolicyOperator:
                 # Listener stays available through final recording cleanup.
                 continue
             elif signal is OperatorCommand.EMERGENCY_STOP:
-                self.shared.estop_request = True
+                request_emergency_stop(self.shared)
                 return
 
     def _run_home(self) -> bool:

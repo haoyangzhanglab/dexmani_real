@@ -12,7 +12,7 @@ from dexmani_real.config.environment import WorkspaceBounds
 
 @dataclass(frozen=True)
 class EMAParams:
-    alpha_pos: float = 0.5
+    alpha_pos: float = 0.7
     alpha_rot: float = 0.5
 
     def validate(self) -> None:
@@ -24,7 +24,7 @@ class EMAParams:
 
 @dataclass(frozen=True)
 class VRMappingParams:
-    pos_scale: float = 1.0
+    pos_scale: float = 0.4
     rot_scale: float = 1.0
     stale_threshold_s: float = 0.5
 

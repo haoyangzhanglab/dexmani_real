@@ -146,7 +146,7 @@ class ExecutionConfig:
     execution_mode: str = "sync"
     # Policy may start near HOME without relaxing the physical HOME convergence.
     start_arm_home_tolerance_deg: float = 0.5
-    # Per-face allowance for the final FK target; nominal command bounds stay fixed.
+    # Shared teleop/deployment final-FK allowance; nominal command bounds stay fixed.
     eef_workspace_margin_m: float = 0.005
     # Runtime age/wait budgets do not bound the physical stop response time.
     max_decision_age_s: float = 1.0

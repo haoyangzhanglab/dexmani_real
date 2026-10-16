@@ -17,6 +17,7 @@ from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.robot.home import HomeResult
 from dexmani_real.runtime.observation import sample_is_fresh
 from dexmani_real.runtime.safety import (
+    request_emergency_stop,
     RunEndReason,
     SafetyState,
     command_may_cross_sdk,
@@ -98,7 +99,7 @@ def execute_arm_home(
 
     def aborted():
         if estop_requested is not None and estop_requested():
-            shared.estop_request = True
+            request_emergency_stop(shared)
         return (cancel_requested is not None and cancel_requested()) or not command_may_cross_sdk(
             shared, run_id=epoch, required_safety_state=SafetyState.ARMED
         )
@@ -164,7 +165,7 @@ def execute_arm_home(
         from dexmani_real.robot.drivers.xarm7 import HomeAborted
 
         if isinstance(exc, KeyboardInterrupt):
-            shared.estop_request = True
+            request_emergency_stop(shared)
             raise
         if not isinstance(exc, Exception):
             raise
@@ -236,7 +237,7 @@ def home_robot(shared, runtime, planner, *, robot, abort_requested) -> HomeResul
     except BaseException as exc:
         failure = exc
         if isinstance(exc, KeyboardInterrupt):
-            shared.estop_request = True
+            request_emergency_stop(shared)
         raise
     finally:
         try:

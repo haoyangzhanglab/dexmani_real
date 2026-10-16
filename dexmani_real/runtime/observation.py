@@ -151,7 +151,7 @@ def read_observation(
         if issues is not None:
             issues.extend(unavailable)
         return None
-    return ObservationRow(
+    row = ObservationRow(
         _freeze(arm),
         _freeze(hand),
         _freeze(camera),
@@ -166,6 +166,9 @@ def read_observation(
         int(cloud["processing_started_ns"]) if cloud is not None else -1,
         int(cloud_result[1]) if cloud_result is not None else -1,
     )
+
+    robot.update_observation_health(row)
+    return row
 
 
 def observation_timing(row):

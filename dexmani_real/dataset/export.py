@@ -83,6 +83,7 @@ def export_raw_to_zarr(
     ends, offset = [], 0
     revision = uuid.uuid4().hex
     episode_ids = []
+    episode_arm_execution = []
     try:
         for index, episode in enumerate(selected):
             if progress_callback:
@@ -125,7 +126,7 @@ def export_raw_to_zarr(
                         period_ns=sampling_clock_ns(reader.control_hz)[0],
                         tolerance_ns=sampling_clock_ns(reader.control_hz)[1],
                     ),
-                    action_semantics="absolute_target_submitted_to_both_sdks",
+                    action_semantics="absolute_joint_goal_not_next_step_arrival",
                     depth_scale_m_per_unit=float(reader.meta["depth_scale"]),
                     pointcloud_config=processing.pointcloud.to_dict(),
                     fingertip_link_names=list(processing.fingertip_link_names),
@@ -182,12 +183,18 @@ def export_raw_to_zarr(
                 episode_ids.append(
                     episode.name if episode == source else episode.relative_to(source).as_posix()
                 )
+                episode_arm_execution.append(
+                    "mode1_submitted_with_servo_evidence" if reader.meta.get("arm_action_semantics") == "q_goal_submitted"
+                    else "mode1_first_point_with_servo_evidence" if reader.meta.get("arm_control_mode") == 1
+                    else "mode6_direct_target_receipt"
+                )
         if not ends:
             raise ValueError("all selected episodes were rejected; no Zarr written")
         root.create_group("meta").create_dataset(
             "episode_ends", data=np.asarray(ends, dtype=np.int64)
         )
         root.attrs["episode_ids"] = episode_ids
+        root.attrs["episode_arm_execution"] = episode_arm_execution
         atomic_publish(staging, target)
         staging = None
         if progress_callback:

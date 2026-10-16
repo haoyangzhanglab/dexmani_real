@@ -7,6 +7,8 @@ def validate_keyboard_workspace(runtime):
 
     cfg = runtime.keyboard_teleop
     cfg.validate()
+    from dexmani_real.config.experiment import validate_control_rate
+    validate_control_rate(runtime, cfg.control_hz)
     workspace = runtime.policy.workspace.as_array()
     if not np.isfinite(workspace).all() or np.any(
         workspace[:, 0] + cfg.workspace_command_margin_m

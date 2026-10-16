@@ -15,7 +15,9 @@ from dexmani_real.robot.hand_homing import home_hand
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.processes import shutdown_local_runtime
-from dexmani_real.runtime.safety import RunEndReason, SafetyState, require_transition, revoke_motion
+from dexmani_real.runtime.safety import (
+    RunEndReason, SafetyState, require_transition, revoke_motion, request_emergency_stop,
+)
 from dexmani_real.utils.log import configure_logging
 
 
@@ -36,9 +38,12 @@ class EpisodeReplayConfig:
 
 def replay_episode(trajectory, runtime, config):
     configure_logging()
-    from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
+    from dexmani_real.config.experiment import (
+        resolve_runtime_table, validate_robot_config, validate_control_rate,
+    )
 
     validate_robot_config(runtime)
+    validate_control_rate(runtime, trajectory.fps)
     runtime = resolve_runtime_table(runtime)
     target = Path(config.output_dir)
     if target.exists() and (not target.is_dir() or any(target.iterdir())):
@@ -59,7 +64,7 @@ def replay_episode(trajectory, runtime, config):
 
         keyboard = KeyboardInput(
             quit_callback=request_quit,
-            estop_callback=lambda: setattr(shared, "estop_request", True),
+            estop_callback=lambda: request_emergency_stop(shared),
         )
         from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 
@@ -113,7 +118,7 @@ def replay_episode(trajectory, runtime, config):
             ):
                 robot.service_idle()
                 if not keyboard.healthy:
-                    shared.estop_request = True
+                    request_emergency_stop(shared)
                 if shared.error_state or shared.estop_request:
                     break
                 signals = keyboard.poll(timeout=0.1)
@@ -147,7 +152,7 @@ def replay_episode(trajectory, runtime, config):
                     print("Return-home completed. H: planned return_home; Q: exit", flush=True)
     except KeyboardInterrupt:
         if shared is not None:
-            shared.estop_request = True
+            request_emergency_stop(shared)
         outcome = ReplayOutcome(ReplayStatus.ESTOP, outcome.replay_data, "KeyboardInterrupt")
     except Exception as exc:
         if shared is not None:

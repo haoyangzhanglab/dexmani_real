@@ -1,4 +1,4 @@
-"""xArm SDK boundary: Mode-6 streaming and prevalidated Mode-0 HOME with Mode-6 restoration.
+"""xArm SDK boundary: Mode-1 streaming and prevalidated Mode-0 HOME with Mode-1 restoration.
 The owner handles authorization/stopping; SDK stop acceptance is not physical standstill.
 """
 
@@ -140,8 +140,8 @@ class HomeAborted(RuntimeError):
 
 
 class XArm7:
-    """Single controller owner for Mode-6 streaming and validated Mode-0 HOME.
-    HOME restores Mode 6 and verifies position/velocity dwell; revocation recovery needs fresh authorization.
+    """Single controller owner for Mode-1 streaming and validated Mode-0 HOME.
+    HOME restores Mode 1 and verifies position/velocity dwell; revocation recovery needs fresh authorization.
     Failures propagate to the session owner for fault latching and best-effort stopping.
     """
 
@@ -155,7 +155,7 @@ class XArm7:
         return self._api is not None and bool(self._api.connected)
 
     def connect(self) -> None:
-        """Initialize the connection once, validate/configure the controller, and finish in servo Mode 6."""
+        """Connect and inspect; enabling/mode changes belong to explicit initialize/prepare."""
         sdk_connect_output = None
         try:
             with capture_native_stdout() as sdk_connect_output:
@@ -173,12 +173,19 @@ class XArm7:
         if sdk_diagnostics:
             logger.warning("xArm SDK initialization diagnostics:\n%s", "\n".join(sdk_diagnostics))
 
+        self._api.set_timeout(self.cfg.sdk_timeout_s)
         self._wait_for_axis_report()
         self._check_controller_error()
+
+    def initialize(self, *, check_abort):
+        """Explicit startup only, after the owner confirmed fresh measured standstill."""
+        check_abort()
+        self._check_controller_error()
+        check_abort()
         _check_sdk_return_code(self._api.motion_enable(True), "startup motion_enable")
-        self.enter_mode0()
+        self.enter_mode0(check_abort=check_abort)
+        check_abort()
         self._apply_config()
-        self.enter_mode6()
 
     def stop(self) -> None:
         """Request State 4 without confirmation polling; checked SDK acceptance is not physical standstill."""
@@ -199,27 +206,26 @@ class XArm7:
         return _decode_joint_states(code, states)
 
     def servo(self, qpos: np.ndarray) -> int:
-        """Send one Mode-6 radian endpoint; return SDK acceptance without waiting for arrival."""
-        return int(
-            self._api.set_servo_angle(
-                angle=qpos,
-                is_radian=True,
-                speed=self.cfg.max_joint_velocity_rad_per_s,
-                mvacc=self.cfg.max_joint_acceleration_rad_per_s2,
-                wait=False,
-            )
-        )
+        """One Mode-1 reference; speed/acceleration arguments do not plan this path."""
+        return self._api.set_servo_angle_j(angles=qpos.tolist(), is_radian=True)
+
+    def read_status(self):
+        return read_live_state_and_error(self._api)
+
+    @property
+    def mode(self):
+        """SDK report cache, not a timestamped joint observation or synchronous query."""
+        return int(self._api.mode)
 
     def home(
         self,
         waypoints: np.ndarray,
         final_qpos: np.ndarray,
         *,
-        service_callback: Callable[[], None] | None = None,
         abort_check: Callable[[], str | None] | None = None,
     ) -> None:
-        """Execute the prevalidated path in Mode 0, restore Mode 6, then verify final position/velocity dwell.
-        The service callback maintains other devices; arm convergence is checked here.
+        """Execute the prevalidated path in Mode 0, restore Mode 1, then verify final position/velocity dwell.
+        Other devices are serviced by the coordinating thread, never by this driver.
         Blocks and raises on failure/interruption; the session owner handles stopping and recovery.
         """
         waypoints = np.asarray(waypoints, dtype=np.float64)
@@ -253,10 +259,6 @@ class XArm7:
                 and float(np.max(np.abs(v))) <= self.cfg.homing.velocity_convergence_rad_s
             )
 
-        def _service() -> None:
-            if service_callback is not None:
-                service_callback()
-
         def _dwell(target: np.ndarray) -> None:
             stable_since = time.monotonic()
             while time.monotonic() - stable_since < self.cfg.homing.dwell_s:
@@ -267,12 +269,11 @@ class XArm7:
                     raise RuntimeError("controller error during home dwell")
                 if not _converged(target, q, v, self.cfg.homing.convergence_rad):
                     raise RuntimeError("home dwell interrupted by position/velocity")
-                _service()
 
-        def _restore_mode6_and_settle(target: np.ndarray) -> None:
+        def _restore_mode1_and_settle(target: np.ndarray) -> None:
             # HOME includes stability after the firmware mode-switch transient.
             _raise_abort()
-            self.enter_mode6()
+            self.enter_mode1(check_abort=_raise_abort)
             # One polling interval lets the final dwell verification sample be scheduled.
             deadline = (
                 time.monotonic()
@@ -286,8 +287,7 @@ class XArm7:
                 _raise_abort()
                 q, v, _ = self.read()
                 if self.read_live_error_code() != 0:
-                    raise RuntimeError("controller error during post-Mode6 home settle")
-                _service()
+                    raise RuntimeError("controller error during post-Mode1 home settle")
                 max_error = float(np.max(np.abs(q - target)))
                 max_velocity = float(np.max(np.abs(v)))
                 now = time.monotonic()
@@ -300,7 +300,7 @@ class XArm7:
                     stable_since = None
                 time.sleep(self.cfg.homing.step_interval_s)
             raise RuntimeError(
-                "post-Mode6 home settle timeout "
+                "post-Mode1 home settle timeout "
                 f"(max joint position error={max_error:.6f}rad, "
                 f"max joint velocity={max_velocity:.6f}rad/s)"
             )
@@ -312,7 +312,7 @@ class XArm7:
             if not _converged(final_qpos, qpos, qvel, self.cfg.homing.convergence_rad):
                 raise RuntimeError("empty home path while away from canonical home")
             _dwell(final_qpos)
-            _restore_mode6_and_settle(final_qpos)
+            _restore_mode1_and_settle(final_qpos)
             return
 
         if float(np.max(np.abs(qpos - waypoints[0]))) > self.cfg.homing.convergence_rad:
@@ -321,10 +321,10 @@ class XArm7:
         targets = waypoints[1:]
         if len(targets) == 0:
             _dwell(final_qpos)
-            _restore_mode6_and_settle(final_qpos)
+            _restore_mode1_and_settle(final_qpos)
             return
 
-        self.enter_mode0()
+        self.enter_mode0(check_abort=_raise_abort)
         milestone_tol = min(self.cfg.homing.convergence_rad, np.deg2rad(0.5))
         current = qpos
         for index, target in enumerate(targets, start=1):
@@ -350,7 +350,6 @@ class XArm7:
                 q, v, _ = self.read()
                 if self.read_live_error_code() != 0:
                     raise RuntimeError(f"controller error at home milestone {index}")
-                _service()
                 if _converged(target, q, v, milestone_tol):
                     if stable_since is None:
                         stable_since = time.monotonic()
@@ -371,20 +370,20 @@ class XArm7:
         final_error = float(np.max(np.abs(current - final_qpos)))
         if final_error > self.cfg.homing.convergence_rad:
             raise RuntimeError(f"home final error {np.rad2deg(final_error):.2f}deg")
-        _restore_mode6_and_settle(final_qpos)
+        _restore_mode1_and_settle(final_qpos)
 
     def emergency_stop(self) -> None:
         """Request the SDK emergency stop; its None return is not physical confirmation."""
         if self._api is not None:
             self._api.emergency_stop()
 
-    def enter_mode0(self) -> None:
+    def enter_mode0(self, *, check_abort=None) -> None:
         """Enter Mode 0 (MoveJoint) and wait for a movable state; raise on failure."""
-        _enter_mode(self._api, 0)
+        _enter_mode(self._api, 0, check_abort=check_abort)
 
-    def enter_mode6(self, *, check_abort: Callable[[], None] | None = None) -> None:
-        """Enter servo Mode 6 and wait for a movable state; raise on failure."""
-        _enter_mode(self._api, 6, check_abort=check_abort)
+    def enter_mode1(self, *, check_abort: Callable[[], None] | None = None) -> None:
+        """Enter servo Mode 1 and wait for a movable state; raise on failure."""
+        _enter_mode(self._api, 1, check_abort=check_abort)
 
     def read_live_error_code(self) -> int:
         """Synchronous live error code; raise on failure (never the cached value)."""
@@ -395,10 +394,6 @@ class XArm7:
     @property
     def axis(self) -> int:
         return int(self._api.axis)
-
-    @property
-    def error_code(self) -> int:
-        return int(self._api.error_code)
 
     def _wait_for_axis_report(self) -> None:
         deadline = time.monotonic() + 3.0
@@ -422,7 +417,7 @@ class XArm7:
             logger.warning("xarm7: startup controller warn=%d (diagnostic only)", live.warn_code)
 
     def _apply_config(self) -> None:
-        """Apply collision sensitivity, TCP load, and the Mode 6 joint acc cap."""
+        """Preserve collision/load configuration and the firmware Mode-0 HOME acc cap."""
         _check_sdk_return_code(
             self._api.set_collision_sensitivity(self.cfg.collision_sensitivity),
             "set_collision_sensitivity",

@@ -34,6 +34,7 @@ from dexmani_real.runtime.observation import (
     read_observation,
 )
 from dexmani_real.runtime.safety import (
+    request_emergency_stop,
     RunEndReason,
     SafetyState,
     StopRequest,
@@ -173,15 +174,6 @@ class PolicyRunner:
         self._finish_episode(
             f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT, row=row
         )
-
-    def _dispatch_deadline_ns(self, row):
-        deadlines = [self.next_step_ns, feedback_deadline_ns(row, self.runtime)]
-        deadlines.extend(
-            stamp + int(self.execution.max_decision_age_s * 1e9) + 1
-            for times in self.plan.sources.values()
-            for stamp in times
-        )
-        return min(deadlines)
 
     def _has_motion_authority(self):
         return (
@@ -386,7 +378,7 @@ class PolicyRunner:
                 self.preparing_epoch = None
                 cancelled = isinstance(exc, (CancelledError, KeyboardInterrupt))
                 if isinstance(exc, KeyboardInterrupt):
-                    self.shared.estop_request = True
+                    request_emergency_stop(self.shared)
                 self._finalize_outputs(
                     "start_cancelled" if cancelled else "preparation_failed",
                     str(exc), errors=[] if cancelled else [error_detail("preparation", exc)],
@@ -422,6 +414,7 @@ class PolicyRunner:
                 self.recording_started = True
                 self.recorder.start_episode(
                     task_label=self.task_label,
+                    arm_executor=self.robot.arm,
                     episode_name=f"episode_{self.completed + 1:03d}",
                     **metadata,
                 )
@@ -456,7 +449,7 @@ class PolicyRunner:
         except BaseException as exc:
             start_failure = exc
             if isinstance(exc, KeyboardInterrupt):
-                self.shared.estop_request = True
+                request_emergency_stop(self.shared)
             if isinstance(exc, DispatchError) and exc.revoked and exc.cause == "authority_revoked":
                 return
             raise
@@ -677,7 +670,13 @@ class PolicyRunner:
             self._finish_budget(expired, row=row)
             return
         budget_limit = self._budget_limit()
-        action_deadline_ns = self._dispatch_deadline_ns(row)
+        decision_deadline_ns = min(
+            stamp + int(self.execution.max_decision_age_s * 1e9) + 1
+            for times in plan.sources.values() for stamp in times
+        )
+        action_deadline_ns = min(
+            self.next_step_ns, feedback_deadline_ns(row, self.runtime), decision_deadline_ns,
+        )
         valid_until_ns = min(action_deadline_ns, budget_limit[0]) if budget_limit else action_deadline_ns
         if time.monotonic_ns() >= valid_until_ns:
             self._finish_episode("dispatch_deadline_expired", row=row)
@@ -685,7 +684,11 @@ class PolicyRunner:
         failure = None
         try:
             self.slot_timing["submit_started_ns"] = time.monotonic_ns()
-            result = self.robot.send_action(command, valid_until_ns=valid_until_ns)
+            execute_until_ns = decision_deadline_ns
+            if self.max_running_s is not None:
+                execute_until_ns = min(execute_until_ns, self.started_ns + int(self.max_running_s * 1e9))
+            result = self.robot.send_action(command, valid_until_ns=valid_until_ns,
+                                            execute_until_ns=execute_until_ns)
         except (DispatchError, DispatchInterrupted) as exc:
             result, failure = exc.result, exc
         finally:
@@ -701,7 +704,7 @@ class PolicyRunner:
         if (failure is not None or expired is not None or late
                 or not self._has_motion_authority()):
             if cancelled:
-                self.shared.estop_request = True
+                request_emergency_stop(self.shared)
             hardware_failure = not cancelled and failure is not None and (
                 not failure.revoked
                 or cause not in {"authority_revoked", "deadline_expired"}
@@ -843,6 +846,7 @@ class PolicyRunner:
                 self.robot.end_hand_send_interval()
                 if self.wait_started_ns is None:
                     self.wait_started_ns = now
+                    self.robot.arm.limit_execution_until(now + int(self.execution.max_wait_s * 1e9))
                 if rows and self.query is None and self.model.future is None:
                     self._submit(rows, slot)
                     if self.run_id is None:
@@ -861,7 +865,7 @@ class PolicyRunner:
                 self._finish_budget(expired)
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
-                self.shared.estop_request = True
+                request_emergency_stop(self.shared)
             try:
                 self._finish_episode(
                     f"control_failed: {type(exc).__name__}: {exc}",
@@ -881,6 +885,7 @@ class PolicyRunner:
         failure = None
         try:
             while self.shared.running and not self.shared.quit_requested:
+                self.robot.arm.check_error()
                 if self.poll_operator is not None:
                     self.poll_operator()
                 if self.shared.estop_request or self.shared.error_state:
@@ -890,7 +895,7 @@ class PolicyRunner:
                 self.step()
                 time.sleep(0.001 if self.run_id is not None else 0.005)
         except KeyboardInterrupt as exc:
-            self.shared.estop_request = True
+            request_emergency_stop(self.shared)
             failure = exc
         except Exception as exc:
             failure = exc

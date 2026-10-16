@@ -7,7 +7,7 @@ import numpy as np
 
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.recording.storage.reader import EpisodeReader
-from dexmani_real.robot.commands import DispatchStatus
+from dexmani_real.recording.storage.schema import validate_dispatch_rows
 
 
 @dataclass
@@ -60,11 +60,10 @@ def load_trajectory(episode_path):
         ]
         if len(arm) == 0 or not all(np.isfinite(v).all() for v in (arm, hand, aq, hq)):
             raise ValueError("replay requires nonempty finite targets and robot states")
-        if not np.isin(
-            reader["dispatch_status"][:],
-            (DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED),
-        ).all():
-            raise ValueError("physical replay requires continued dispatch for both devices")
+        errors = validate_dispatch_rows(reader['dispatch_status'][:], arm_dispatch=reader.arm_dispatch_status)
+        if errors:
+            raise ValueError("; ".join(errors))
+        reader.validate_servo_execution()
         return TrajectoryData(
             path,
             len(arm),

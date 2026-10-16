@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
 from typing import Any, Iterable
 
 from dexmani_real.runtime.safety import (
@@ -19,55 +18,22 @@ from dexmani_real.runtime.safety import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class _ProcessExit:
-    name: str
-    exitcode: int | None
-    escalation: str
-
-
-def _finalize_shutdown_state(
-    shared: Any,
-    exits: tuple[_ProcessExit, ...],
-) -> None:
-    """Latch local/child failures; DISARMED describes software authority only."""
-    error_latched = bool(shared.error_state)
-    estop_requested = bool(shared.estop_request)
-    safety_state = int(shared.safety_state)
-    child_failed = any(item.exitcode != 0 or item.escalation != "graceful" for item in exits)
-    faulted = (
-        error_latched or estop_requested or safety_state == int(SafetyState.FAULT) or child_failed
-    )
-
-    if faulted:
-        if (
-            error_latched
-            or child_failed
-            or (safety_state == int(SafetyState.FAULT) and not estop_requested)
-        ):
-            shared.error_state = True
-        transition(shared, SafetyState.FAULT)
-        return
-
-    transition(shared, SafetyState.DISARMED)
-
-
-def stop_processes_verified(
+def shutdown_processes_verified(
     shared: Any,
     processes: Iterable[Any],
     *,
     graceful_timeout_s: float = 5.0,
     terminate_timeout_s: float = 1.0,
     kill_timeout_s: float = 1.0,
-) -> tuple[_ProcessExit, ...]:
-    """Confirm all sensor children exited before their shared resources can be released."""
+) -> bool:
+    """Revoke, join, then close channels; return whether cleanup was graceful and complete."""
     procs = list(processes)
     # Fence before any blocking join; record the software end if still RUNNING.
     with shared.motion_lock:
         shared.end_session()
         if int(shared.safety_state) == int(SafetyState.RUNNING):
             _revoke_motion_locked(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
-    exits: list[_ProcessExit] = []
+    clean = True
     try:
         deadline = time.monotonic() + graceful_timeout_s
         for process in procs:
@@ -88,59 +54,41 @@ def stop_processes_verified(
                 raise RuntimeError(
                     f"process {process.name} could not be confirmed stopped; sensor channels remain open"
                 )
-            exits.append(_ProcessExit(process.name, process.exitcode, escalation))
+            if process.exitcode != 0 or escalation != "graceful":
+                clean = False
+                logger.warning(
+                    "worker %s stopped: exitcode=%s escalation=%s",
+                    process.name, process.exitcode, escalation,
+                )
 
     except Exception:
         shared.error_state = True
         transition(shared, SafetyState.FAULT)
         raise
 
-    frozen_exits = tuple(exits)
-    log_stop = (
-        logger.warning
-        if any(item.exitcode != 0 or item.escalation != "graceful" for item in frozen_exits)
-        else logger.debug
-    )
-    log_stop("verified process stop: %s", frozen_exits)
-    return frozen_exits
-
-
-def shutdown_processes_verified(
-    shared: Any,
-    processes: Iterable[Any],
-    *,
-    graceful_timeout_s: float = 5.0,
-    terminate_timeout_s: float = 1.0,
-    kill_timeout_s: float = 1.0,
-) -> bool:
-    """Stop sensors, close verified IPC, and finalize software safety state."""
-    frozen_exits = stop_processes_verified(
-        shared,
-        processes,
-        graceful_timeout_s=graceful_timeout_s,
-        terminate_timeout_s=terminate_timeout_s,
-        kill_timeout_s=kill_timeout_s,
-    )
-
     try:
-        shared_closed = bool(shared.sensors.close())
+        if shared.sensors is not None and not shared.sensors.close():
+            clean = False
     except Exception:
         logger.error("sensor channel cleanup raised", exc_info=True)
-        shared_closed = False
-    if not shared_closed:
+        clean = False
+    if not clean:
         shared.error_state = True
-    _finalize_shutdown_state(shared, frozen_exits)
-    logger.debug("verified process shutdown: %s", frozen_exits)
-    return shared_closed and all(
-        item.exitcode == 0 and item.escalation == "graceful" for item in frozen_exits
-    )
+    # DISARMED describes software authority only, never physical stopping.
+    with shared.motion_lock:
+        faulted = (
+            shared.error_state or shared.estop_request or shared.safety_state == SafetyState.FAULT
+        )
+        if faulted and not shared.estop_request:
+            shared.error_state = True
+        transition(shared, SafetyState.FAULT if faulted else SafetyState.DISARMED)
+    return clean
 
 
 def shutdown_local_runtime(robot, supervisor=None, *, shared=None, keyboard=None, timeout_s=5.0):
     """Close local devices; timeout_s bounds the sensor supervisor's graceful join."""
     shared = supervisor.shared if supervisor is not None else shared
     revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
-    clean = True
     for close in (
         robot.close if robot is not None and robot._owner is not None else None,
         keyboard.stop if keyboard is not None else None,
@@ -150,27 +98,15 @@ def shutdown_local_runtime(robot, supervisor=None, *, shared=None, keyboard=None
         try:
             close()
         except Exception:
-            clean = False
             shared.error_state = True
             logger.exception("local runtime cleanup failed")
-    if supervisor is None:
-        shared.end_session()
-        try:
-            sensors_clean = shared.sensors is None or bool(shared.sensors.close())
-        except Exception:
-            shared.error_state = True
-            logger.exception("sensor channel cleanup failed")
-            sensors_clean = False
-        if not sensors_clean:
-            shared.error_state = True
-        _finalize_shutdown_state(shared, ())
-    else:
-        try:
-            sensors_clean = supervisor.shutdown(graceful_timeout_s=timeout_s)
-        except Exception:
-            shared.error_state = True
-            logger.exception("sensor shutdown failed; live resources remain linked")
-            sensors_clean = False
-    return (
-        clean and sensors_clean and not shared.error_state and not shared.estop_request
-    )
+    try:
+        sensors_clean = (
+            shutdown_processes_verified(shared, (), graceful_timeout_s=timeout_s)
+            if supervisor is None else supervisor.shutdown(graceful_timeout_s=timeout_s)
+        )
+    except Exception:
+        shared.error_state = True
+        logger.exception("sensor shutdown failed; live resources remain linked")
+        sensors_clean = False
+    return sensors_clean and not shared.error_state and not shared.estop_request

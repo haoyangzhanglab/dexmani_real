@@ -14,6 +14,7 @@ from dexmani_real.runtime.observation import feedback_deadline_ns, read_observat
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.safety import (
+    request_emergency_stop,
     RunEndReason,
     SafetyState,
     begin_motion,
@@ -50,11 +51,12 @@ def run_keyboard_experiment(runtime, *, no_hand):
         suppress_echo=True,
         quit_callback=request_quit,
         capture_commands=False,
-        estop_callback=lambda: setattr(shared, "estop_request", True),
+        estop_callback=lambda: request_emergency_stop(shared),
     )
     cfg = runtime.keyboard_teleop
     workspace = runtime.policy.workspace.as_array()
     home_down = False
+    blocked_until_release = False
     # Keep the operator target independent of tracking lag and IK pose residuals.
     command_qpos = None
     command_pose = None
@@ -111,9 +113,21 @@ def run_keyboard_experiment(runtime, *, no_hand):
             home_down = pressed
             dx, drpy = compute_cartesian_jog_delta(keys, cfg.delta_pos_m, cfg.delta_rpy_rad)
             moving = np.any(dx) or np.any(drpy)
+            if not moving:
+                blocked_until_release = False
+            if not moving or pressed or blocked_until_release:
+                if robot.stop_required:
+                    revoke_motion(shared)
+                    robot.stop()
+                command_qpos = command_pose = None
+                robot.service_idle()
+                continue
             safety_state = int(shared.safety_state)
             epoch = int(shared.run_id)
             if moving and not pressed and safety_state == int(SafetyState.ARMED):
+                command_qpos = command_pose = None
+                if robot.stop_required:
+                    robot.stop()
                 try:
                     robot.prepare_streaming(epoch)
                 except DispatchError as exc:
@@ -130,9 +144,6 @@ def run_keyboard_experiment(runtime, *, no_hand):
                     revoke_motion(shared)
                     robot.stop()
                 continue
-            if not moving or pressed:
-                # Idle keeps Mode-6 authority and its last dispatched endpoint alive.
-                continue
             measured_qpos = row.arm["qpos"][0]
             baseline_qpos = command_qpos
             baseline_pose = command_pose
@@ -147,6 +158,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
                 workspace[:, 1] - cfg.workspace_command_margin_m,
             )
             if not changed:
+                blocked_until_release = True
                 continue
             if row.hand is not None:
                 planner.set_hand_qpos(row.hand["qpos"][0])
@@ -158,6 +170,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
             if result.failure_kind == IKFailureKind.INVALID_OUTPUT:
                 raise RuntimeError(f"online IK technical failure: {result.reason}")
             if not result.success:
+                blocked_until_release = True
                 continue
             if safety_state == int(SafetyState.ARMED):
                 with shared.motion_lock:
@@ -172,7 +185,8 @@ def run_keyboard_experiment(runtime, *, no_hand):
             target = result.qpos
             try:
                 robot.send_action(
-                    RobotCommand(epoch, target), valid_until_ns=feedback_deadline_ns(row, runtime)
+                    RobotCommand(epoch, target), valid_until_ns=feedback_deadline_ns(row, runtime),
+                    execute_until_ns=row.observation_timestamp_ns + int(runtime.policy.vr_mapping.stale_threshold_s * 1e9),
                 )
             except DispatchError as exc:
                 if not exc.revoked:
@@ -186,7 +200,7 @@ def run_keyboard_experiment(runtime, *, no_hand):
             command_qpos = target.copy()
         clean = clean or bool(shared.quit_requested)
     except KeyboardInterrupt:
-        shared.estop_request = True
+        request_emergency_stop(shared)
         raise
     except Exception as exc:
         shared.error_state = True
