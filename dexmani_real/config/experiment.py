@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -51,114 +52,38 @@ class ExperimentConfig:
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
 
 
-def config_as_dict(value: Any) -> Any:
-    """Convert configuration values for printing and run-configuration serialization."""
-    if dataclasses.is_dataclass(value):
-        return {f.name: config_as_dict(getattr(value, f.name)) for f in dataclasses.fields(value)}
-    if isinstance(value, Mapping):
-        return {key: config_as_dict(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [config_as_dict(item) for item in value]
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
-
-
-def _patch(current: Any, changes: Any, path: str = "") -> Any:
-    """Apply overrides, rejecting unknown fields and invalid value types."""
-    if dataclasses.is_dataclass(current) or isinstance(current, Mapping):
+def _patch(current: Any, changes: Any) -> Any:
+    """Update dataclass sections; numerical constraints belong to consumers."""
+    if dataclasses.is_dataclass(current):
         if not isinstance(changes, Mapping):
-            raise TypeError(f"config {path!r} must be an object")
-        fields = (
-            {f.name: getattr(current, f.name) for f in dataclasses.fields(current)}
-            if dataclasses.is_dataclass(current)
-            else dict(current)
-        )
-        unknown = set(changes) - fields.keys()
-        if unknown:
-            raise TypeError(f"unknown config fields in {path!r}: {sorted(unknown)}")
-        updated = {
-            name: _patch(fields[name], value, f"{path}.{name}".lstrip("."))
-            for name, value in changes.items()
-        }
-        return (
-            dataclasses.replace(current, **updated)
-            if dataclasses.is_dataclass(current)
-            else fields | updated
-        )
-    if path == "environment.static_boxes":
-        if not isinstance(changes, (tuple, list)):
-            raise TypeError("environment.static_boxes must be an array")
-        return tuple(
-            _patch(StaticCollisionBox(), box, f"{path}[{i}]") for i, box in enumerate(changes)
-        )
-    if isinstance(current, bool):
-        if not isinstance(changes, bool):
-            raise TypeError(f"config {path!r} must be a boolean")
-        return changes
+            raise TypeError(f"{type(current).__name__} overrides must be a mapping")
+        updated = dict(changes)
+        if isinstance(current, EnvironmentConfig) and "static_boxes" in updated:
+            updated["static_boxes"] = tuple(
+                _patch(StaticCollisionBox(), box) for box in updated["static_boxes"]
+            )
+        for name, value in updated.items():
+            if hasattr(current, name):
+                updated[name] = _patch(getattr(current, name), value)
+        # The dataclass constructor rejects unknown fields.
+        return dataclasses.replace(current, **updated)
     if isinstance(current, tuple):
-        if not isinstance(changes, (tuple, list)):
-            raise TypeError(f"config {path!r} must be an array")
-        if not current:
-            return tuple(changes)
-        return tuple(
-            _patch(current[min(i, len(current) - 1)], value, f"{path}[{i}]")
-            for i, value in enumerate(changes)
-        )
-    if current is None:
-        if path == "execution.action_steps" and changes is not None:
-            raise ValueError("execution.action_steps is derived; use --n-action-steps or the saved Policy default")
-        if path in {"execution.prefetch_steps", "camera.l515_confidence_threshold"}:
-            if changes is not None and (type(changes) is not int):
-                raise TypeError(f"config {path!r} must be an integer or null")
-        elif path == "execution.rtc_guidance_cap":
-            if changes is not None and (
-                isinstance(changes, bool) or not isinstance(changes, (int, float))
-            ):
-                raise TypeError(f"config {path!r} must be numeric or null")
-        elif changes is not None and not isinstance(changes, str):
-            raise TypeError(f"config {path!r} must be a string or null")
-        return changes
-    if isinstance(current, int):
-        if type(changes) is not int:
-            raise TypeError(f"config {path!r} must be an integer")
-    elif isinstance(current, (float, np.floating)):
-        if isinstance(changes, bool) or not isinstance(changes, (int, float)):
-            raise TypeError(f"config {path!r} must be numeric")
-        return float(changes)
-    elif isinstance(current, str):
-        if changes is None and path in {"environment.table.plane_path", "hand.device_name"}:
-            return None
-        if not isinstance(changes, str):
-            raise TypeError(f"config {path!r} must be a string")
+        if not isinstance(changes, (list, tuple)):
+            raise TypeError("config arrays must use YAML sequences")
+        return tuple(_patch(current[0], value) for value in changes) if current else tuple(changes)
+    if isinstance(current, bool):
+        # A quoted "false" must never enable a hardware or processing switch.
+        if type(changes) is not bool:
+            raise TypeError("config switches must use YAML true/false")
+    elif isinstance(current, (int, float)):
+        # SDKs may silently truncate integer gains; reject malformed numbers before connecting.
+        if type(changes) not in (int, float) or (
+            isinstance(current, int) and type(changes) is not int
+        ):
+            raise TypeError(f"config value must be {type(current).__name__}")
+    elif isinstance(current, str) and changes is not None and not isinstance(changes, str):
+        raise TypeError("config text values must be strings or null")
     return changes
-
-
-def _expand_dotted(overrides: Mapping[str, Any] | None) -> dict[str, Any]:
-    expanded: dict[str, Any] = {}
-    for raw_key, value in (overrides or {}).items():
-        if value is None:
-            continue
-        cursor = expanded
-        parts = str(raw_key).split(".")
-        for part in parts[:-1]:
-            cursor = cursor.setdefault(part, {})
-            if not isinstance(cursor, dict):
-                raise TypeError(f"conflicting CLI config paths at {raw_key!r}")
-        cursor[parts[-1]] = value
-    return expanded
-
-
-def _overlay(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
-    result = dict(base)
-    for name, value in overrides.items():
-        previous = result.get(name)
-        result[name] = (
-            _overlay(previous, value)
-            if isinstance(previous, Mapping) and isinstance(value, Mapping)
-            else value
-        )
-    return result
 
 
 def validate_robot_config(cfg: ExperimentConfig) -> None:
@@ -231,13 +156,24 @@ def load_experiment_config(
     loaded = data if data is not None else {}
     if yaml_path is not None:
         path = Path(yaml_path)
-        if path.suffix.lower() not in {".yaml", ".yml"}:
-            raise ValueError("experiment config path must use a .yaml or .yml suffix")
         with path.open(encoding="utf-8") as stream:
             loaded = yaml.safe_load(stream)
         if loaded is None:
             loaded = {}
     if not isinstance(loaded, Mapping):
         raise TypeError("experiment config root must be a mapping")
-    cfg = ExperimentConfig()
-    return _patch(cfg, _overlay(loaded, _expand_dotted(cli_overrides)))
+    loaded = deepcopy(dict(loaded))
+    for key, value in (cli_overrides or {}).items():
+        if value is None:
+            continue
+        *sections, name = key.split(".")
+        cursor = loaded
+        for section in sections:
+            if not isinstance(cursor.get(section), dict):
+                cursor[section] = {}
+            cursor = cursor[section]
+        cursor[name] = value
+    cfg = _patch(ExperimentConfig(), loaded)
+    if cfg.execution.action_steps is not None:
+        raise ValueError("execution.action_steps is derived; use --n-action-steps or the saved Policy default")
+    return cfg

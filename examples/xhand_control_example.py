@@ -19,13 +19,13 @@ import subprocess
 import sys
 import time
 from concurrent.futures import CancelledError
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
 import yaml
 
-from dexmani_real.config.experiment import config_as_dict, load_experiment_config
+from dexmani_real.config.experiment import load_experiment_config
 from dexmani_real.config.hardware import HandParams
 from dexmani_real.robot.commands import DispatchStatus
 from dexmani_real.robot.drivers.xhand import XHand
@@ -359,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
         parser.error(str(exc))
     if args.print_config:
-        print(yaml.safe_dump({"hand": config_as_dict(config)}, sort_keys=False), end="")
+        print(yaml.safe_dump({"hand": asdict(config)}, sort_keys=False), end="")
         return 0
     if args._xhand_hardware_worker:
         _disable_worker_core_dump()

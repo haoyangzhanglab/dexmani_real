@@ -1,4 +1,4 @@
-"""Shared arm-base fingertip geometry for recording and deployment."""
+"""Shared xArm-base fingertip geometry for offline processing and deployment."""
 
 from __future__ import annotations
 

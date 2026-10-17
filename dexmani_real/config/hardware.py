@@ -151,8 +151,6 @@ class ArmParams:
             raise ValueError("home_qpos must be within joint limits")
         if not self.ip:
             raise ValueError("arm ip must be non-empty")
-        if not np.isfinite(self.feedback_max_age_s) or self.feedback_max_age_s <= 0:
-            raise ValueError("arm feedback_max_age_s must be finite and positive")
         if not np.isfinite(self.table_z_surface_m):
             raise ValueError("table_z_surface_m must be finite")
         if not np.isfinite(self.hand_safety_margin_m) or self.hand_safety_margin_m < 0:
@@ -163,7 +161,7 @@ class ArmParams:
             )
         for name in (
             "servo_hz", "feedback_hz", "servo_max_interval_s", "sdk_timeout_s",
-            "executor_timeout_s", "tracking_error_rad",
+            "executor_timeout_s", "tracking_error_rad", "feedback_max_age_s",
         ):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"arm {name} must be finite and positive")
@@ -268,7 +266,7 @@ class HandParams:
         300,
     )
 
-    # Runtime joint/tactile age and continuous ordinary-send CRC budget, monotonic time.
+    # Maximum age of consumed joint/tactile feedback, measured with monotonic time.
     feedback_max_age_s: float = 4 / 30
     initial_state_timeout_s: float = 1.0  # Only acquisition after connect/session start/reset.
 
@@ -298,14 +296,6 @@ class HandParams:
             raise ValueError("hand device_id must be a non-negative integer")
         if not np.isfinite(self.rs485_post_open_settle_s) or self.rs485_post_open_settle_s < 0:
             raise ValueError("hand rs485_post_open_settle_s must be finite and non-negative")
-        limit_vectors = (
-            self.mechanical_qpos_min_rad,
-            self.mechanical_qpos_max_rad,
-            self.qpos_min_rad,
-            self.qpos_max_rad,
-        )
-        if len(self.home_qpos_deg) != 12 or any(len(values) != 12 for values in limit_vectors):
-            raise ValueError("hand home and joint-limit defaults must have 12 elements")
         command_lower = np.asarray(self.qpos_min_rad, dtype=np.float64)
         command_upper = np.asarray(self.qpos_max_rad, dtype=np.float64)
         validate_hand_limit_nesting(
@@ -317,20 +307,15 @@ class HandParams:
             _XHAND_RATED_QPOS_MAX_RAD,
             label="hand",
         )
-        for label, lower, upper in (
-            ("command", command_lower, command_upper),
-            (
-                "mechanical",
-                np.asarray(self.mechanical_qpos_min_rad, dtype=np.float64),
-                np.asarray(self.mechanical_qpos_max_rad, dtype=np.float64),
-            ),
+        if np.any(command_lower >= command_upper) or np.any(
+            np.asarray(self.mechanical_qpos_min_rad) >= self.mechanical_qpos_max_rad
         ):
-            if np.any(lower >= upper):
-                raise ValueError(f"hand {label} limits must have lower < upper")
+            raise ValueError("hand command and mechanical limits must have lower < upper")
         home_rad = np.deg2rad(np.asarray(self.home_qpos_deg, dtype=np.float64))
         limit_tolerance_rad = 1e-9
         if (
-            not np.all(np.isfinite(home_rad))
+            home_rad.shape != (12,)
+            or not np.all(np.isfinite(home_rad))
             or np.any(home_rad < command_lower - limit_tolerance_rad)
             or np.any(home_rad > command_upper + limit_tolerance_rad)
         ):
@@ -343,28 +328,19 @@ class HandParams:
             type(value) is not int or not 0 <= value <= 400 for value in self.tor_max
         ):
             raise ValueError("hand tor_max must contain twelve integers in [0, 400] (Mode 3 output scale)")
-        if not np.isfinite(self.feedback_max_age_s) or self.feedback_max_age_s <= 0:
-            raise ValueError("hand feedback_max_age_s must be finite and positive")
-        if (
-            not np.isfinite(self.initial_state_timeout_s)
-            or self.initial_state_timeout_s <= 0
+        for name in (
+            "feedback_max_age_s", "initial_state_timeout_s", "home_timeout_s", "home_tolerance_deg",
         ):
-            raise ValueError("hand initial_state_timeout_s must be finite and positive")
-        if not np.isfinite(self.home_timeout_s) or self.home_timeout_s <= 0:
-            raise ValueError("hand home_timeout_s must be finite and positive")
-        if not np.isfinite(self.home_tolerance_deg) or self.home_tolerance_deg <= 0:
-            raise ValueError("hand home_tolerance_deg must be finite and positive")
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"hand {name} must be finite and positive")
         if len(self.fingertip_link_names) != 5 or any(
             not name for name in self.fingertip_link_names
         ):
             raise ValueError("hand fingertip_link_names must contain five non-empty names")
-        transform = np.asarray(
-            self.T_eef_handbase_pos_xyz + self.T_eef_handbase_quat_wxyz,
-            dtype=np.float64,
-        )
-        if transform.shape != (7,) or not np.all(np.isfinite(transform)):
-            raise ValueError("hand base transform must contain seven finite values")
-        validate_unit_quaternion_wxyz(transform[3:], name="hand base quaternion")
+        position = np.asarray(self.T_eef_handbase_pos_xyz, dtype=np.float64)
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            raise ValueError("hand base position must be a finite (3,) vector")
+        validate_unit_quaternion_wxyz(self.T_eef_handbase_quat_wxyz, name="hand base quaternion")
 
 
 @dataclass(frozen=True)

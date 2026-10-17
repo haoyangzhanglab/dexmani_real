@@ -187,7 +187,7 @@ def run_policy_deployment(
                     name="camera", target=run_camera_worker, args=(shared.sensors, runtime.camera)
                 ),
                 ready=shared.sensors.camera_ready,
-                timeout_s=runtime.safety.readiness_timeouts_s["camera"],
+                timeout_s=runtime.safety.camera_ready_timeout_s,
             )
         if cloud:
             sensors.start(
@@ -197,7 +197,7 @@ def run_policy_deployment(
                     args=(shared.sensors, pointcloud_config),
                 ),
                 ready=shared.sensors.pointcloud_ready,
-                timeout_s=runtime.safety.readiness_timeouts_s["pointcloud"],
+                timeout_s=runtime.safety.pointcloud_ready_timeout_s,
             )
         camera_parameters = build_observation_camera(
             shared.sensors, runtime.camera, fields, camera_calibration,

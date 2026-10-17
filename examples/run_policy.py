@@ -30,6 +30,7 @@ import math
 import subprocess
 import sys
 import time
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -198,8 +199,6 @@ def _write_run_config(session_dir, *, args, runtime, info, execution):
     import dexmani_policy
     import yaml
 
-    from dexmani_real.config.experiment import config_as_dict
-
     def head(root):
         try:
             return subprocess.check_output(
@@ -208,7 +207,7 @@ def _write_run_config(session_dir, *, args, runtime, info, execution):
         except (OSError, subprocess.CalledProcessError):
             return None
 
-    compact_info = config_as_dict(info)
+    compact_info = asdict(info)
     compact_info["experiment_dir"] = str(info.experiment_dir)
     compact_info["checkpoint_path"] = str(info.checkpoint_path)
     payload = {
@@ -216,8 +215,8 @@ def _write_run_config(session_dir, *, args, runtime, info, execution):
         "checkpoint": args.checkpoint,
         "policy": compact_info,
         "future_steps": info.horizon - info.n_obs_steps + 1,
-        "runtime": config_as_dict(runtime),
-        "execution": config_as_dict(execution),
+        "runtime": asdict(runtime),
+        "execution": asdict(execution),
         "seed": args.seed,
         "device": args.device,
         "num_episodes": args.num_episodes,
@@ -244,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
 
     import yaml
 
-    from dexmani_real.config.experiment import config_as_dict, load_experiment_config
+    from dexmani_real.config.experiment import load_experiment_config
 
     try:
         runtime = load_experiment_config(
@@ -258,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
         parser.error(f"invalid experiment config: {exc}")
     if args.print_config:
-        print(yaml.safe_dump(config_as_dict(runtime), allow_unicode=True, sort_keys=False), end="")
+        print(yaml.safe_dump(asdict(runtime), allow_unicode=True, sort_keys=False), end="")
         return 0
 
     try:
@@ -287,15 +286,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        from dexmani_real.deployment.config import (
-            resolve_execution_config,
+        action_steps = info.n_action_steps if args.n_action_steps is None else args.n_action_steps
+        runtime = replace(
+            runtime, execution=replace(runtime.execution, action_steps=action_steps)
         )
-
-        from dataclasses import replace
-
-        runtime = replace(runtime, execution=resolve_execution_config(
-            runtime.execution, info, args.n_action_steps
-        ))
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
         _safe_selector_parts(selector)
     except Exception as exc:

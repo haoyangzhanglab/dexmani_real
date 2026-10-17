@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import logging
 import argparse
+from dataclasses import asdict
 
 import yaml
 
-from dexmani_real.config.experiment import config_as_dict, load_experiment_config
+from dexmani_real.config.experiment import load_experiment_config
 from dexmani_real.teleop.config import DEFAULT_TASK_NAME
 
 
@@ -78,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"invalid experiment config: {exc}")
     if args.print_config:
         print(
-            yaml.safe_dump(config_as_dict(runtime), allow_unicode=True, sort_keys=True),
+            yaml.safe_dump(asdict(runtime), allow_unicode=True, sort_keys=True),
             end="",
         )
         return 0

@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, fields, replace
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, fields
+from typing import Any
 
-if TYPE_CHECKING:
-    from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.config.pointcloud import PointCloudConfig
 
 _SUPPORTED_OBSERVATION_FIELDS = frozenset(
     {
@@ -22,14 +21,6 @@ _SUPPORTED_OBSERVATION_FIELDS = frozenset(
         "camera_extrinsic",
     }
 )
-
-
-def resolve_execution_config(execution, info, n_action_steps=None):
-    """Resolve A_exec once at the Real entry; never rewrite saved model config."""
-    value = info.n_action_steps if n_action_steps is None else n_action_steps
-    if type(value) is not int or value < 1:
-        raise ValueError("A_exec must be a positive integer")
-    return replace(execution, action_steps=value)
 
 
 def validate_max_running_s(max_running_s: float | None) -> float | None:
@@ -66,15 +57,15 @@ def validate_policy_inputs(info: Any, runtime: Any) -> PointCloudConfig | None:
         ):
             raise ValueError("Live fingertip_xyz requires five distinct non-empty link names")
     if "point_cloud" in names:
-        from dexmani_real.config.pointcloud import PointCloudConfig
-
         recipe = info.pointcloud_config
         if not isinstance(recipe, dict):
             raise ValueError("Live point_cloud requires saved numerical parameters")
         missing = {field.name for field in fields(PointCloudConfig)} - recipe.keys()
         if missing:
             raise ValueError(f"Saved pointcloud recipe missing fields: {sorted(missing)}")
-        return PointCloudConfig.from_dict(recipe)
+        config = PointCloudConfig(**{**recipe, "workspace": tuple(recipe["workspace"])})
+        config.validate()
+        return config
     return None
 
 

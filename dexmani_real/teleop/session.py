@@ -42,13 +42,8 @@ def run_teleop_experiment(
     task_name = validate_task_dir_name(task_name)
     validate_robot_config(runtime)
     validate_control_rate(runtime, runtime.teleop.control_hz)
-    for section in (
-        runtime.policy,
-        runtime.policy.ema,
-        runtime.policy.vr_mapping,
-        runtime.vr,
-    ):
-        section.validate()
+    runtime.policy.validate()
+    runtime.vr.validate()
     if runtime.policy.recording_enabled:
         runtime.camera.validate()
     runtime = resolve_runtime_table(runtime)
@@ -110,7 +105,7 @@ def run_teleop_experiment(
                     args=(shared.sensors, runtime.camera),
                 ),
                 ready=shared.sensors.camera_ready,
-                timeout_s=runtime.safety.readiness_timeouts_s["camera"],
+                timeout_s=runtime.safety.camera_ready_timeout_s,
             )
         shared.arm()
         runner.run()
@@ -146,8 +141,10 @@ def _build_hand_retargeter(runtime):
             tag_config=runtime.tag_retargeting,
             urdf_path=str(XHAND_RIGHT_URDF_PATH),
         )
-    from dexmani_real.teleop.retargeting.dexpilot import DexPilotHandRetargeter
+    if runtime.policy.hand_retargeting_type == "dexpilot":
+        from dexmani_real.teleop.retargeting.dexpilot import DexPilotHandRetargeter
 
-    return DexPilotHandRetargeter(
-        dexpilot_config=runtime.dexpilot_retargeting,
-    )
+        return DexPilotHandRetargeter(
+            dexpilot_config=runtime.dexpilot_retargeting,
+        )
+    raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")

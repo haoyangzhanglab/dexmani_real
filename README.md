@@ -25,6 +25,8 @@ python examples/collect_teleop.py --config local.yaml --print-config
 python examples/run_policy.py --config local.yaml --print-config
 ```
 
+YAML 使用嵌套字段，可只保留本次实验需要覆盖的部分；字段以当前 `--print-config` 输出为准，未知字段直接报错。
+
 `--help`、`--print-config` 不连接设备；打印配置也不读取现场标定或加载策略。实际运行入口检查所需配置、标定与执行条件。日志在运行入口初始化，可通过 `DEXMANI_LOG_DIR` 指定目录，默认写入 `~/.dexmani/logs/`。
 
 ## 实验工作流
@@ -87,7 +89,7 @@ python examples/visualize_episode.py <episode> --max-frames 100 --config local.y
 python examples/export_policy_zarr.py episodes/<task> --config local.yaml
 ```
 
-`--info` 查看元数据与数值概要，无需 Rerun；交互 viewer 顺序读取所选 RGB-D 帧。查看和导出使用当前点云、桌面与手部安装配置，相机几何来自对应 Raw。仅当 `pointcloud.remove_table: true` 时读取桌面平面。viewer 的点云耗时只统计已读取 RGB-D 的派生计算，不含读取和显示。
+`--info` 查看元数据与数值概要，无需 Rerun；交互 viewer 顺序读取所选 RGB-D 帧。查看和导出使用当前点云、桌面、手部安装与指尖 link 配置，相机几何来自对应 Raw。离线查看不要求手部通信、增益或 HOME 参数有效。仅当 `pointcloud.remove_table: true` 时读取桌面平面。viewer 的点云耗时只统计已读取 RGB-D 的派生计算，不含读取和显示。
 
 公共导出要求每段全部 **15 字段**完整，每行浮点数值均有限；缺字段、NaN/Inf、RGB-D 行数不符、相机几何缺失或点云无法重建时，整段拒绝并在日志中记录原因。完整性检查覆盖全部模态，不随模型所需字段而放宽，hand current / arm effort 的辅助 NaN 也会导致整段拒绝。Raw 原样保留，导出不删单帧、不插值、不填补缺测；触觉直接使用采集保存值，不再次保持或修补。下游按模型所需字段加载。
 

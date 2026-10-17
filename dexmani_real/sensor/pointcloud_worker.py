@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -67,7 +67,7 @@ def run_pointcloud_worker(shared: "SensorChannels", config: PointCloudWorkerConf
     geometry, depth_scale_m, base_from_color = static_inputs
     logger.debug(
         "pointcloud config=%s table_plane_abcd=%s",
-        json.dumps(config.pointcloud.to_dict(), sort_keys=True, separators=(",", ":")),
+        json.dumps(asdict(config.pointcloud), sort_keys=True, separators=(",", ":")),
         json.dumps(config.table_plane_abcd, separators=(",", ":")),
     )
 

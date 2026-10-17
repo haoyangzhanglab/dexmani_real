@@ -50,7 +50,6 @@ class StaticCollisionBox:
         if (
             not isinstance(self.name, str)
             or not self.name.strip()
-            or self.name != self.name.strip()
             or self.name == "table"
         ):
             raise ValueError(
@@ -58,18 +57,17 @@ class StaticCollisionBox:
             )
         center = np.asarray(self.center_xyz_m, dtype=np.float64)
         size = np.asarray(self.size_xyz_m, dtype=np.float64)
-        quat = np.asarray(self.quat_wxyz, dtype=np.float64)
-        if center.shape != (3,) or size.shape != (3,) or quat.shape != (4,):
+        if center.shape != (3,) or size.shape != (3,):
             raise ValueError(
-                "static collision box center/size/quaternion must have shapes (3,), (3,), and (4,)"
+                "static collision box center and size must both have shape (3,)"
             )
-        if not np.all(np.isfinite(np.concatenate((center, size, quat)))):
+        if not np.all(np.isfinite(np.concatenate((center, size)))):
             raise ValueError("static collision box values must be finite")
         if np.any(size <= 0.0):
             raise ValueError(
                 "static collision box size_xyz_m must contain positive full side lengths"
             )
-        validate_unit_quaternion_wxyz(quat, name="static collision box quaternion")
+        validate_unit_quaternion_wxyz(self.quat_wxyz, name="static collision box quaternion")
 
 
 @dataclass(frozen=True)
@@ -110,8 +108,6 @@ class TableCollisionConfig:
             not isinstance(name, str) or not name.strip() for name in self.allowed_contact_links
         ):
             raise TypeError("table allowed_contact_links must contain non-empty link names")
-        if len(self.allowed_contact_links) != len(set(self.allowed_contact_links)):
-            raise ValueError("table allowed_contact_links must be unique")
 
 
 @dataclass(frozen=True)

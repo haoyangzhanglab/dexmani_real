@@ -15,7 +15,7 @@ import hashlib
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -275,7 +275,7 @@ def _save_diagnostic_snapshot(
         "aligned_geometry": geometry.to_dict(),
         "table_plane_abcd": table_plane_json,
         "table_plane_source": table_plane_source,
-        "pointcloud_config": pointcloud_config.to_dict(),
+        "pointcloud_config": asdict(pointcloud_config),
         "pointcloud_source_sha256": hashlib.sha256(
             (Path(__file__).resolve().parents[1] / "dexmani_real/sensor/pointcloud.py").read_bytes()
         ).hexdigest(),

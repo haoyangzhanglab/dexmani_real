@@ -6,6 +6,7 @@ import logging
 import tempfile
 import uuid
 from contextlib import ExitStack
+from dataclasses import asdict
 from pathlib import Path
 
 import h5py
@@ -114,7 +115,7 @@ def export_raw_to_zarr(
                     ),
                     action_semantics="absolute_joint_goal_not_next_step_arrival",
                     depth_scale_m_per_unit=float(reader.meta["depth_scale"]),
-                    pointcloud_config=processing.pointcloud.to_dict(),
+                    pointcloud_config=asdict(processing.pointcloud),
                     fingertip_link_names=list(processing.fingertip_link_names),
                 )
                 # Task/depth scale describe this cache; dt defines training/deployment timing.

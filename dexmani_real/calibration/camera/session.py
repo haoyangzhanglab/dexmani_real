@@ -493,7 +493,7 @@ class CameraCalibrationSession:
             )
             self.sensors.start(
                 self.camera_process, ready=self.shared.sensors.camera_ready,
-                timeout_s=self.runtime.safety.readiness_timeouts_s["camera"],
+                timeout_s=self.runtime.safety.camera_ready_timeout_s,
             )
             self.shared.arm()
             print("  local arm connected (owner process; Mode 1 prepared on jog)")

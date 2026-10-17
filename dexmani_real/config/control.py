@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import astuple, dataclass, field
+from math import radians
 
 import numpy as np
 
@@ -15,25 +15,11 @@ class EMAParams:
     alpha_pos: float = 0.7
     alpha_rot: float = 0.5
 
-    def validate(self) -> None:
-        if not (np.isfinite(self.alpha_pos) and np.isfinite(self.alpha_rot)):
-            raise ValueError("EMA alphas must be finite")
-        if not (0.0 <= self.alpha_pos <= 1.0 and 0.0 <= self.alpha_rot <= 1.0):
-            raise ValueError("EMA alphas must be in [0, 1]")
-
 
 @dataclass(frozen=True)
 class VRMappingParams:
     pos_scale: float = 0.4
     stale_threshold_s: float = 0.5
-
-    def validate(self) -> None:
-        values = (
-            self.pos_scale,
-            self.stale_threshold_s,
-        )
-        if not all(np.isfinite(value) and value > 0 for value in values):
-            raise ValueError("VR position scale and stale threshold must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -56,25 +42,23 @@ class ControlParams:
     episodes_dir: str = "episodes"
 
     ik_max_pose_error_pos_m: float = 0.02
-    ik_max_pose_error_rot_rad: float = np.deg2rad(5.0)
+    ik_max_pose_error_rot_rad: float = radians(5.0)
 
     hand_enabled: bool = True
     hand_retargeting_type: str = "tag"
 
     def validate(self) -> None:
-        if not np.isfinite(self.max_record_duration_s) or self.max_record_duration_s <= 0:
-            raise ValueError("max_record_duration_s must be finite and positive")
-        if not self.episodes_dir:
-            raise ValueError("policy episodes_dir must be non-empty")
-        if (
-            not np.isfinite(self.ik_max_pose_error_pos_m)
-            or not np.isfinite(self.ik_max_pose_error_rot_rad)
-            or self.ik_max_pose_error_pos_m <= 0
-            or self.ik_max_pose_error_rot_rad <= 0
+        if not (0.0 <= self.ema.alpha_pos <= 1.0 and 0.0 <= self.ema.alpha_rot <= 1.0):
+            raise ValueError("EMA alphas must be in [0, 1]")
+        if not all(
+            np.isfinite(v) and v > 0
+            for v in (self.vr_mapping.pos_scale, self.vr_mapping.stale_threshold_s)
         ):
-            raise ValueError("policy online IK limits must be finite and positive")
-        if self.hand_retargeting_type not in {"tag", "dexpilot"}:
-            raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")
+            raise ValueError("VR position scale and stale threshold must be finite and positive")
+        if self.recording_enabled and (
+            not np.isfinite(self.max_record_duration_s) or self.max_record_duration_s <= 0
+        ):
+            raise ValueError("max_record_duration_s must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -84,35 +68,17 @@ class KeyboardTeleopParams:
     delta_rpy_rad: float = 0.03
     workspace_command_margin_m: float = 0.005
     ik_max_pose_error_pos_m: float = 0.002
-    ik_max_pose_error_rot_rad: float = np.deg2rad(2.0)
+    ik_max_pose_error_rot_rad: float = radians(2.0)
     idle_interval_frames: int = 150
 
     def validate(self) -> None:
-        numeric = (
-            self.control_hz,
-            self.delta_pos_m,
-            self.delta_rpy_rad,
-            self.workspace_command_margin_m,
-            self.ik_max_pose_error_pos_m,
-            self.ik_max_pose_error_rot_rad,
-        )
-        if not all(np.isfinite(value) for value in numeric):
-            raise ValueError("keyboard teleop numeric parameters must be finite")
-        if self.control_hz <= 0:
-            raise ValueError(f"control_hz={self.control_hz} must be > 0")
-        if self.delta_pos_m <= 0:
-            raise ValueError(f"delta_pos_m={self.delta_pos_m} must be > 0")
-        if self.delta_rpy_rad <= 0:
-            raise ValueError(f"delta_rpy_rad={self.delta_rpy_rad} must be > 0")
-        if self.workspace_command_margin_m < 0:
-            raise ValueError("workspace_command_margin_m must be non-negative")
-        if self.ik_max_pose_error_pos_m <= 0 or self.ik_max_pose_error_rot_rad <= 0:
-            raise ValueError("keyboard IK pose-error limits must be > 0")
-        if (
-            isinstance(self.idle_interval_frames, bool)
-            or not isinstance(self.idle_interval_frames, int)
-            or self.idle_interval_frames <= 0
-        ):
+        for name in ("control_hz", "delta_pos_m", "delta_rpy_rad"):
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"keyboard {name} must be finite and positive")
+        margin = self.workspace_command_margin_m
+        if not np.isfinite(margin) or margin < 0:
+            raise ValueError("workspace_command_margin_m must be finite and non-negative")
+        if type(self.idle_interval_frames) is not int or self.idle_interval_frames <= 0:
             raise ValueError("keyboard idle interval must be > 0")
 
 
@@ -152,45 +118,21 @@ class TAGRetargetingParams:
     reg_last_weight: float = 0.8
 
     def validate(self) -> None:
+        if not all(np.all(np.isfinite(value)) for value in astuple(self)):
+            raise ValueError("TAG parameters must be finite")
+        # Zero weights and backend stopping tolerances are experiment choices.
         robot = np.asarray(self.robot_finger_lengths, dtype=np.float64)
         human = np.asarray(self.human_finger_lengths, dtype=np.float64)
-        euler = np.asarray(self.mano_to_urdf_euler, dtype=np.float64)
-        if robot.shape != (5,) or human.shape != (5,) or euler.shape != (3,):
-            raise ValueError("TAG finger lengths/Euler alignment have invalid shape")
-        if (
-            not np.all(np.isfinite(np.concatenate((robot, human, euler))))
-            or np.any(robot <= 0)
-            or np.any(human <= 0)
-        ):
-            raise ValueError(
-                "TAG finger lengths/Euler alignment must be finite and lengths positive"
-            )
-        positive = (
-            self.finger_scale_boost,
-            self.pinky_scale,
-            self.pinky_palm_scale,
-            self.ftol_abs_s1,
-            self.ftol_abs_s2,
-            self.pinch_base_weight,
-            self.pinch_start_dist_m,
-            self.pinch_full_dist_m,
-            self.reg_stage1_weight,
-            self.reg_last_weight,
-        )
-        if not all(np.isfinite(value) and value > 0 for value in positive):
-            raise ValueError(
-                "TAG scales, tolerances, distances, and regularization weights must be positive"
-            )
-        if not np.isfinite(self.smooth_weight) or self.smooth_weight < 0:
-            raise ValueError("TAG smooth_weight must be finite and non-negative")
+        if robot.shape != (5,) or human.shape != (5,):
+            raise ValueError("TAG requires five robot and human finger lengths")
+        if np.any(robot <= 0) or np.any(human <= 0):
+            raise ValueError("TAG finger lengths must be positive")
         if self.maxeval_s1 <= 0 or self.maxeval_s2 <= 0:
             raise ValueError("TAG optimizer maxeval values must be positive")
-        if self.pinch_full_dist_m >= self.pinch_start_dist_m:
-            raise ValueError("TAG pinch_full_dist_m must be less than pinch_start_dist_m")
-        if not (0.0 <= self.pinch_ema_alpha <= 1.0) or not (
-            0.0 <= self.pinch_skip_threshold <= 1.0
-        ):
-            raise ValueError("TAG pinch EMA/skip thresholds must be in [0, 1]")
+        if not 0 <= self.pinch_full_dist_m < self.pinch_start_dist_m:
+            raise ValueError("TAG pinch distances must satisfy 0 <= full < start")
+        if not 0.0 <= self.pinch_ema_alpha <= 1.0:
+            raise ValueError("TAG pinch EMA alpha must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -207,42 +149,21 @@ class DexPilotRetargetingParams:
     escape_dist_m: float = 0.05
 
     def validate(self) -> None:
-        numeric = (
-            self.scaling_factor,
-            self.pinky_scale,
-            self.pinky_palm_scale,
-            self.low_pass_alpha,
-            self.project_dist_m,
-            self.escape_dist_m,
-        )
-        if not all(np.isfinite(value) for value in numeric):
-            raise ValueError("DexPilot retargeting parameters must be finite")
-        if self.scaling_factor <= 0 or self.pinky_scale <= 0 or self.pinky_palm_scale <= 0:
-            raise ValueError(
-                "DexPilot scaling_factor, pinky_scale, and pinky_palm_scale must be positive"
-            )
+        if not all(np.all(np.isfinite(value)) for value in astuple(self)):
+            raise ValueError("DexPilot parameters must be finite")
         if not 0.0 <= self.low_pass_alpha <= 1.0:
             raise ValueError("DexPilot low_pass_alpha must be in [0, 1]")
-        if self.project_dist_m <= 0 or self.escape_dist_m < self.project_dist_m:
+        if not 0 < self.project_dist_m <= self.escape_dist_m:
             raise ValueError("DexPilot distances must satisfy 0 < project_dist_m <= escape_dist_m")
 
 
 @dataclass(frozen=True)
 class SafetyParams:
-    readiness_timeouts_s: Mapping[str, float] = field(
-        default_factory=lambda: {
-            "camera": 15.0,
-            "pointcloud": 30.0,
-            "vr": 120.0,
-        }
-    )
+    camera_ready_timeout_s: float = 15.0
+    pointcloud_ready_timeout_s: float = 30.0
+    vr_ready_timeout_s: float = 120.0
     shutdown_timeout_s: float = 65.0
 
     def validate(self) -> None:
-        if any(
-            not name or not np.isfinite(value) or value <= 0
-            for name, value in self.readiness_timeouts_s.items()
-        ):
-            raise ValueError("readiness timeout names/values must be non-empty, finite, and > 0")
-        if not np.isfinite(self.shutdown_timeout_s) or self.shutdown_timeout_s <= 0:
-            raise ValueError("shutdown_timeout_s must be finite and positive")
+        if not all(np.isfinite(value) and value > 0 for value in astuple(self)):
+            raise ValueError("safety timeouts must be finite and positive")

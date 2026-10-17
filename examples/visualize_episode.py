@@ -21,7 +21,6 @@ os.environ.setdefault("RUST_LOG", "error")
 import numpy as np
 
 from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
-from dexmani_real.config.hardware import HandParams
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.dataset.pointcloud import (
     load_raw_episode_base_from_color,
@@ -34,6 +33,7 @@ from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE, XHAND_RIGHT_URDF_PATH
 from dexmani_real.sensor.camera.geometry import validate_aligned_depth_distortion
 from dexmani_real.sensor.pointcloud import build_point_cloud
+from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
 
 
 logger = logging.getLogger("dexmani_real.cli.visualize_episode")
@@ -119,6 +119,7 @@ class EpisodeVisualizer:
         *,
         handbase_position_eef_m: tuple[float, float, float],
         handbase_quat_eef_wxyz: tuple[float, float, float, float],
+        fingertip_link_names: tuple[str, ...],
         max_frames: int | None = None,
         point_cloud: bool = True,
         pointcloud_config: PointCloudConfig | None = None,
@@ -129,6 +130,7 @@ class EpisodeVisualizer:
         import rerun.blueprint as rrb
 
         episode_name = Path(episode_path).stem
+        self._fingertip_link_names = fingertip_link_names
         self._reader = EpisodeReader(episode_path)
         try:
             self._reader.require_fields(
@@ -161,7 +163,9 @@ class EpisodeVisualizer:
             if self._T_xarm_base_from_color is None:
                 logger.warning("No camera extrinsics: displaying pixels without point cloud")
             self._handbase_position_eef_m = np.asarray(handbase_position_eef_m, dtype=np.float64)
-            self._handbase_quat_eef_wxyz = np.asarray(handbase_quat_eef_wxyz, dtype=np.float64)
+            self._handbase_quat_eef_wxyz = validate_unit_quaternion_wxyz(
+                handbase_quat_eef_wxyz, name="hand base quaternion"
+            )
             self._pointcloud_config = None
             self._table_plane_abcd = table_plane_abcd
             self._empty_pointcloud_frames = 0
@@ -222,7 +226,7 @@ class EpisodeVisualizer:
             state["arm_ee"][arm_valid] = compute_eef_pose_history_xarm_base(arm[arm_valid])
         if np.any(hand_valid):
             hand_fk = HandKinematics(
-                str(XHAND_RIGHT_URDF_PATH), list(HandParams.fingertip_link_names)
+                str(XHAND_RIGHT_URDF_PATH), list(self._fingertip_link_names)
             )
             state["hand_fingertip"][hand_valid] = compute_fingertip_history_xarm_base(
                 arm[hand_valid],
@@ -468,7 +472,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     runtime = load_experiment_config(yaml_path=args.config)
-    runtime.hand.validate()
     from dexmani_real.utils.log import configure_logging
 
     configure_logging()
@@ -489,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         str(episode_path),
         handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
         handbase_quat_eef_wxyz=runtime.hand.T_eef_handbase_quat_wxyz,
+        fingertip_link_names=runtime.hand.fingertip_link_names,
         max_frames=args.max_frames,
         point_cloud=args.point_cloud,
         pointcloud_config=pointcloud_config,

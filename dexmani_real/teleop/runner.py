@@ -442,7 +442,7 @@ class TeleopRunner:
             self.recorder.add_frame(row, command, dispatch, timing=timing)
 
     def _wait_for_vr(self) -> bool:
-        deadline = time.monotonic() + self.runtime.safety.readiness_timeouts_s["vr"]
+        deadline = time.monotonic() + self.runtime.safety.vr_ready_timeout_s
         while True:
             if not self.keyboard.healthy:
                 self.shared.request_emergency_stop()
