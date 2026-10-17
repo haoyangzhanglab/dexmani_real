@@ -7,7 +7,6 @@ from contextlib import closing
 import numpy as np
 
 from dexmani_real.config.hardware import VRParams
-from dexmani_real.ipc.schema import VR_FRAME_DTYPE
 from dexmani_real.planning.kinematics.pose import xyzw_to_wxyz
 from dexmani_real.utils.geometry import normalize_quat_wxyz
 from dexmani_real.utils.log import configure_logging
@@ -20,7 +19,7 @@ def _finite_vector(value, shape, name):
     array = np.asarray(value, dtype=np.float64)
     if array.shape != shape or not np.all(np.isfinite(array)):
         raise ValueError(f"{name} must be a finite array with shape {shape}")
-    return array.copy()
+    return array
 
 
 def _uint64(value):
@@ -57,7 +56,7 @@ def _iter_events(shared, config):
             TCPClientConfig(config.host, config.port, connect_timeout_s=1.0, read_timeout_s=1.0)
         )
     # Filter hands at publication so heading calibration still receives head packets.
-    assembler = HandFrameAssembler(include_wall_time=True, include_head_frames=True)
+    assembler = HandFrameAssembler(include_wall_time=False, include_head_frames=True)
     if not shared.is_running.value:
         return
     with receiver:
@@ -89,9 +88,6 @@ def _iter_events(shared, config):
 
 def run_vr_worker(shared, config: VRParams) -> None:
     configure_logging()
-    config.validate()
-    if shared.vr_ring is None:
-        raise ValueError("VR worker requires an allocated VR ring")
     from hand_tracking_sdk import (
         HandFrame,
         HandSide,
@@ -150,23 +146,21 @@ def run_vr_worker(shared, config: VRParams) -> None:
                         (21, 3),
                         "landmarks",
                     )
-                    frame = np.zeros(1, dtype=VR_FRAME_DTYPE)
-                    frame["wrist_pos"][0] = wrist_pos
-                    frame["wrist_quat_wxyz"][0] = wrist_quat
-                    frame["landmarks"][0] = landmarks
-                    frame["head_pos"][0] = head_pos
-                    frame["head_quat_wxyz"][0] = head_quat_wxyz
-                    frame["head_recv_ts_ns"][0] = head_recv_ts_ns
                     # Either HTS component can advance; the older receive time establishes freshness of both.
-                    frame["recv_ts_ns"][0] = min(
+                    recv_ts_ns = min(
                         _uint64(event.wrist_recv_ts_ns), _uint64(event.landmarks_recv_ts_ns)
                     )
-                    frame["sequence_id"][0] = _uint64(event.sequence_id)
+                    sequence_id = _uint64(event.sequence_id)
                 except ValueError:
                     logger.warning("Invalid VR hand frame rejected", exc_info=True)
                     continue
                 # IPC errors are worker failures, not malformed sensor payloads.
-                shared.vr_ring.write(frame)
+                shared.vr_ring.write(
+                    wrist_pos=wrist_pos, wrist_quat_wxyz=wrist_quat, landmarks=landmarks,
+                    head_pos=head_pos, head_quat_wxyz=head_quat_wxyz,
+                    head_recv_ts_ns=np.uint64(head_recv_ts_ns),
+                    recv_ts_ns=recv_ts_ns, sequence_id=sequence_id,
+                )
                 if not shared.vr_ready.is_set():
                     shared.vr_ready.set()
                     logger.info("VR ready: first valid right-hand frame published")

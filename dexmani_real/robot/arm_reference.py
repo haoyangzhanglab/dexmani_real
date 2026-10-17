@@ -6,7 +6,7 @@ waypoints, network service, or second filter is used during a streaming interval
 
 import numpy as np
 
-from dexmani_real.robot.command_validation import check_arm_target
+from dexmani_real.robot.commands import check_arm_target
 
 
 class ArmReference:

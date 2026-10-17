@@ -21,11 +21,10 @@ import numpy as np
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.config.hardware import VRParams
-from dexmani_real.ipc.channels import SensorChannelsConfig
+from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz
-from dexmani_real.runtime.processes import shutdown_processes_verified
-from dexmani_real.runtime.supervisor import wait_subsystem_ready
+from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.sensor.vr_worker import run_vr_worker
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.vr_transform import (
@@ -33,14 +32,11 @@ from dexmani_real.teleop.vr_transform import (
     parse_vr_transform,
 )
 from dexmani_real.utils.atomic_io import atomic_json_dump
-from dexmani_real.utils.geometry import normalize_quat_wxyz
 
 _MIN_FORWARD_NORM = 1e-6
 _POLL_INTERVAL_S = 0.01
 _PRINT_INTERVAL_S = 5.0
 _JOIN_TIMEOUT_S = 5.0
-_TERMINATE_TIMEOUT_S = 1.0
-_KILL_TIMEOUT_S = 1.0
 _COUNTDOWN_DWELL_S = 1.0
 _AUDIO_IDLE_TIMEOUT_S = 5.0
 
@@ -54,12 +50,6 @@ class HeadingCalibrationConfig:
     settle_s: float = 3.0
     min_frames: int = VR_TRANSFORM_MIN_FRAMES
     outlier_sigma: float = 3.0
-
-    def __post_init__(self) -> None:
-        if self.duration_s <= 0.0:
-            raise ValueError("duration_s must be positive")
-        if self.min_frames < 5:
-            raise ValueError("min_frames must be at least 5")
 
 
 def _circular_mean(
@@ -130,17 +120,29 @@ def _quality_measurements(
     }
 
 
-def _wait_for_vr_tracking(shared: RuntimeState, timeout_s: float) -> bool:
+def _read_heading(shared: RuntimeState, reference: str):
+    result = shared.sensors.vr_ring.read_latest(use_last_good=True)
+    if result is None:
+        return None
+    frame = result[0][0]
+    # Hand publications cache head pose; only its own receive time identifies a head sample.
+    if reference == "head":
+        stamp = int(frame["head_recv_ts_ns"])
+        return (stamp, frame["head_quat_wxyz"]) if stamp > 0 else None
+    return int(frame["sequence_id"]), frame["wrist_quat_wxyz"]
+
+
+def _wait_for_vr_tracking(
+    shared: RuntimeState, sensors: SensorProcesses, reference: str, timeout_s: float,
+) -> bool:
     deadline = time.monotonic() + timeout_s
     last_print = 0.0
     while time.monotonic() < deadline:
-        result = shared.sensors.vr_ring.read_latest()
-        if result is not None:
-            data, _ts, _seq = result
-            hp = np.asarray(data["head_pos"][0], dtype=np.float64)
-            if np.any(hp != 0):
-                print("  VR tracking active\n", flush=True)
-                return True
+        if not sensors.check():
+            return False
+        if _read_heading(shared, reference) is not None:
+            print("  VR tracking active\n", flush=True)
+            return True
         now = time.monotonic()
         if now - last_print >= _PRINT_INTERVAL_S:
             elapsed = int(now - (deadline - timeout_s))
@@ -148,26 +150,6 @@ def _wait_for_vr_tracking(shared: RuntimeState, timeout_s: float) -> bool:
             last_print = now
         time.sleep(0.1)
     return False
-
-
-def _shutdown_vr_receiver(shared: RuntimeState, vr_proc: mp.Process) -> bool:
-    if vr_proc.pid is None:
-        shared.end_session()
-        return shared.sensors.close()
-    try:
-        shutdown_clean = shutdown_processes_verified(
-            shared,
-            [vr_proc],
-            graceful_timeout_s=_JOIN_TIMEOUT_S,
-            terminate_timeout_s=_TERMINATE_TIMEOUT_S,
-            kill_timeout_s=_KILL_TIMEOUT_S,
-        )
-    except RuntimeError as exc:
-        print(f"  ERROR: VR receiver shutdown could not be verified: {exc}")
-        return False
-    if not shutdown_clean:
-        print("  ERROR: VR receiver shutdown was not clean")
-    return shutdown_clean
 
 
 def _play_completion_audio() -> None:
@@ -235,31 +217,29 @@ def main(argv: list[str] | None = None) -> int:
 
     configure_logging()
     ctx = mp.get_context("spawn")
-    shared = RuntimeState.create(
-        prefix="dexmani_vr_calib", config=SensorChannelsConfig(vr=True), mp_context=ctx
-    )
+    shared = RuntimeState(SensorChannels(ctx, vr=True))
+    sensors = SensorProcesses(shared)
     vr_proc = ctx.Process(
         name="vr", target=run_vr_worker, args=(shared.sensors, vr_config), daemon=True
     )
     forwards: list[np.ndarray] = []
     stale_count = 0
     try:
-        vr_proc.start()
         print(
             "\n  Waiting for VR connection (up to 120 s) — put on Quest headset...",
             flush=True,
         )
-        if not wait_subsystem_ready(
-            shared,
-            vr_proc,
-            cfg.vr_ready_timeout_s,
-        ):
-            print("  ERROR: VR receiver startup timeout", flush=True)
+        try:
+            sensors.start(
+                vr_proc, ready=shared.sensors.vr_ready, timeout_s=cfg.vr_ready_timeout_s,
+            )
+        except RuntimeError as exc:
+            print(f"  ERROR: VR receiver startup failed: {exc}", flush=True)
             return 1
         print("  VR connected", flush=True)
 
         print("  Waiting for VR tracking data (up to 15 s)...", flush=True)
-        if not _wait_for_vr_tracking(shared, cfg.tracking_data_timeout_s):
+        if not _wait_for_vr_tracking(shared, sensors, args.ref, cfg.tracking_data_timeout_s):
             print("  ERROR: no VR tracking data received", flush=True)
             return 1
 
@@ -274,47 +254,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {i}...")
             time.sleep(_COUNTDOWN_DWELL_S)
 
-        quat_field = "wrist_quat_wxyz" if args.ref == "wrist" else "head_quat_wxyz"
         deadline = time.monotonic() + args.duration
         last_print = 0.0
         prev_seq: int | None = None
 
         print(f"  Collecting {args.duration}s (hold still)...")
         while time.monotonic() < deadline:
-            result = shared.sensors.vr_ring.read_latest()
-            if result is None:
+            if not sensors.check():
+                print("  ERROR: VR receiver exited during collection", flush=True)
+                return 1
+            sample = _read_heading(shared, args.ref)
+            if sample is None:
                 time.sleep(_POLL_INTERVAL_S)
                 continue
-
-            data, _ts, _seq = result
-
-            # Ring publication follows the hand; cached head data has its own source identity.
-            _seq = (
-                int(data["head_recv_ts_ns"][0])
-                if args.ref == "head"
-                else int(data["sequence_id"][0])
-            )
-            if args.ref == "head" and _seq <= 0:
-                continue
+            sequence, quaternion = sample
             # Ignore duplicate sequence numbers in the quality estimate.
-            if prev_seq is not None and _seq == prev_seq:
+            if sequence == prev_seq:
                 stale_count += 1
                 time.sleep(_POLL_INTERVAL_S)
                 continue
-            prev_seq = _seq
-
-            q = np.asarray(data[quat_field][0], dtype=np.float64)
-            if not np.all(np.isfinite(q)):
-                continue
-
-            # Head calibration requires a valid head position.
-            if args.ref == "head":
-                hp = np.asarray(data["head_pos"][0], dtype=np.float64)
-                if not np.any(hp != 0):
-                    continue
-
-            q = normalize_quat_wxyz(q)
-            forwards.append(forward_from_quat_wxyz(q))
+            prev_seq = sequence
+            forwards.append(forward_from_quat_wxyz(quaternion))
 
             now = time.monotonic()
             if now - last_print >= 1.0:
@@ -322,7 +282,9 @@ def main(argv: list[str] | None = None) -> int:
                 last_print = now
             time.sleep(_POLL_INTERVAL_S)
     finally:
-        shutdown_clean = _shutdown_vr_receiver(shared, vr_proc)
+        shutdown_clean = shutdown_local_runtime(
+            shared, sensors=sensors, timeout_s=_JOIN_TIMEOUT_S,
+        )
 
     if not shutdown_clean:
         print("ERROR: VR receiver cleanup failed; calibration was not published")
@@ -355,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
         "quality": {**quality, "frames": inlier_frames},
         "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
-    calibration = parse_vr_transform(config, reject_poor=False)
+    calibration = parse_vr_transform(config)
     T = calibration.transform
 
     corrected = T @ np.array([mean_fwd[0], mean_fwd[1], 0.0])

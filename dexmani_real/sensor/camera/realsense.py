@@ -22,28 +22,15 @@ from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
 logger = logging.getLogger(__name__)
 
 
-_L515_OPTION_NAMES = (
-    "visual_preset",
-    "confidence_threshold",
-    "laser_power",
-    "receiver_gain",
-    "noise_filtering",
-    "zero_order_enabled",
-    "invalidation_bypass",
-)
-
-
 @dataclass(frozen=True)
 class RGBDFrame:
     rgb: np.ndarray
     # Aligned depth uses color-grid intrinsics and the color-camera frame.
-    depth_aligned_to_color_raw: np.ndarray | None
+    depth_aligned_to_color_raw: np.ndarray
     depth_frame_number: int
     color_frame_number: int
     # Host monotonic queue-return time, before alignment/copying.
     timestamp_ns: int
-    depth_scale: float
-    serial: str | None
 
 
 class RealSenseCamera:
@@ -58,9 +45,7 @@ class RealSenseCamera:
             raise ValueError("auto_exposure_priority must be None or a finite value in [0, 1]")
         self.config = config
         self.auto_exposure_priority = auto_exposure_priority
-        self.context = None
         self.active_serial: str | None = config.serial
-        self.active_is_l515 = False
 
         self.pipeline: rs.pipeline | None = None
         self.frame_queue: rs.frame_queue | None = None
@@ -70,67 +55,61 @@ class RealSenseCamera:
         self.geometry: RGBDGeometry | None = None
         self._depth_to_color_aligner: rs.align | None = None
 
-    def connect(self) -> bool:
+    def connect(self) -> None:
+        """Start once; failures require cleanup and an explicit new connection."""
         if self.pipeline is not None:
-            return True
-
-        return self._open_pipeline()
-
-    def _open_pipeline(self) -> bool:
-        """Open/warm the device; tear down failures so an unusable pipeline cannot retain the device."""
-        self.context = rs.context()
+            raise RuntimeError("RealSense pipeline is already owned; disconnect before connecting")
         try:
-            self.active_serial = self.config.serial or self._find_default_serial_in_context()
-            device = self._find_device_by_serial_in_context(self.active_serial)
-            self.active_is_l515 = self.is_l515_device(device)
-        except (RuntimeError, OSError) as e:
-            logger.warning("connect() failed at device discovery / config: %s", e)
-            return False
+            context = rs.context()
+            devices = list(context.query_devices())
+            if not devices:
+                raise RuntimeError("No RealSense camera found.")
+            if self.config.serial is None:
+                if len(devices) != 1:
+                    raise RuntimeError("Multiple RealSense cameras found; configure an explicit serial.")
+                device = devices[0]
+                self.active_serial = self.get_device_info_value(device, rs.camera_info.serial_number)
+                if not self.active_serial:
+                    raise RuntimeError("RealSense camera does not expose a serial number.")
+            else:
+                device = next((device for device in devices if self.get_device_info_value(
+                    device, rs.camera_info.serial_number) == self.config.serial), None)
+                if device is None:
+                    raise RuntimeError(f"No RealSense camera found with serial={self.config.serial}.")
+            rs_config = self.create_rs_config()
+            # Use a separate SDK context for L515 discovery isolation.
+            self.pipeline = rs.pipeline()
+            self.frame_queue = rs.frame_queue(self.config.frame_queue_capacity)
+            self.profile = self.pipeline.start(rs_config, self.frame_queue)
+            sensor = self.profile.get_device().first_depth_sensor()
+            if self.is_l515_device(device):
+                self._apply_l515_depth_config(sensor)
+            else:
+                self._apply_d400_depth_config(sensor)
+            self._apply_color_config()
+            self.depth_scale = float(sensor.get_depth_scale())
+            self.geometry = self._read_geometry()
+            self._depth_to_color_aligner = rs.align(rs.stream.color)
+            for _ in range(self.config.warmup_frames):
+                # Initialize alignment and owned copies before live publication.
+                self.read(timeout_ms=5000)
+        except BaseException:
+            try:
+                self.disconnect()
+            except BaseException:
+                logger.exception("RealSense startup cleanup failed; pipeline remains owned")
+            raise
 
-        rs_config = self.create_rs_config()
-        try:
-            self._start_pipeline(rs_config)
-        except (RuntimeError, OSError) as e:
-            logger.warning("connect() failed at pipeline start: %s", e)
-            self.disconnect()
-            return False
-        try:
-            self._setup_pipeline_post_start()
-        except (RuntimeError, OSError) as e:
-            logger.warning("connect() failed at post-start setup: %s", e)
-            self.disconnect()
-            return False
-        try:
-            self._warmup_pipeline()
-        except (RuntimeError, OSError) as e:
-            logger.warning("connect() failed at warmup: %s", e)
-            self.disconnect()
-            return False
-        return True
-
-    def _apply_depth_config(self) -> None:
-        if self.profile is None:
-            return
-
-        if self.active_is_l515:
-            self._apply_l515_depth_config()
-        else:
-            self._apply_d400_depth_config()
-
-    def _apply_l515_depth_config(self) -> None:
+    def _apply_l515_depth_config(self, sensor) -> None:
         """Apply one factory preset and an optional confidence override."""
         cfg = self.config
 
-        if self.profile is None:
-            raise RuntimeError("RealSense profile is unavailable for L515 settings")
-        sensor = self.profile.get_device().first_depth_sensor()
         if not sensor.supports(rs.option.visual_preset):
             raise RuntimeError("connected L515 does not expose visual_preset")
         sensor.set_option(rs.option.visual_preset, float(cfg.l515_visual_preset))
         time.sleep(0.5)
-        base_readbacks = self._read_l515_option_snapshot(sensor)
-        base_preset = base_readbacks["visual_preset"]
-        if base_preset is None or not np.isclose(base_preset, float(cfg.l515_visual_preset), atol=1e-6):
+        base_preset = sensor.get_option(rs.option.visual_preset)
+        if not np.isclose(base_preset, float(cfg.l515_visual_preset), atol=1e-6):
             raise RuntimeError(
                 "L515 visual preset readback mismatch: "
                 f"requested={cfg.l515_visual_preset}, actual={base_preset}"
@@ -146,40 +125,12 @@ class RealSenseCamera:
                 float(cfg.l515_confidence_threshold),
             )
 
-        final_readbacks = self._read_l515_option_snapshot(sensor)
-        final_confidence = final_readbacks["confidence_threshold"]
-        if cfg.l515_confidence_threshold is not None and (
-            final_confidence is None
-            or not np.isclose(final_confidence, float(cfg.l515_confidence_threshold), atol=1e-6)
-        ):
-            raise RuntimeError(
-                "L515 confidence readback mismatch: "
-                f"requested={cfg.l515_confidence_threshold}, actual={final_confidence}"
-            )
-        option_snapshot = {
-            "base_visual_preset": int(cfg.l515_visual_preset),
-            "base_readbacks": base_readbacks,
-            "confidence_override": cfg.l515_confidence_threshold,
-            "final_readbacks": final_readbacks,
-        }
-        logger.debug("L515 depth option snapshot: %s", option_snapshot)
-
-    @staticmethod
-    def _read_l515_option_snapshot(sensor: Any) -> dict[str, float | None]:
-        """Read only supported, firmware-owned L515 options."""
-        snapshot: dict[str, float | None] = {}
-        for name in _L515_OPTION_NAMES:
-            option = getattr(rs.option, name, None)
-            if option is None:
-                snapshot[name] = None
-                continue
-            try:
-                snapshot[name] = (
-                    float(sensor.get_option(option)) if sensor.supports(option) else None
+            confidence = sensor.get_option(rs.option.confidence_threshold)
+            if not np.isclose(confidence, float(cfg.l515_confidence_threshold), atol=1e-6):
+                raise RuntimeError(
+                    "L515 confidence readback mismatch: "
+                    f"requested={cfg.l515_confidence_threshold}, actual={confidence}"
                 )
-            except (RuntimeError, OSError):
-                snapshot[name] = None
-        return snapshot
 
     def get_color_sensor(self) -> Any:
         if self.profile is None:
@@ -228,29 +179,8 @@ class RealSenseCamera:
         else:
             logger.debug("color auto_exposure_priority set to %s (0=OFF)", readback)
 
-    def _setup_pipeline_post_start(self) -> None:
-        """Configure active-device options and immutable native geometry."""
-        if self.profile is None:
-            raise RuntimeError("Pipeline profile is unavailable after start.")
-
-        self._apply_depth_config()
-        self._apply_color_config()
-
-        self.depth_scale = float(self.profile.get_device().first_depth_sensor().get_depth_scale())
-        self.update_geometry_from_profile()
-        self._depth_to_color_aligner = rs.align(rs.stream.color)
-
-    def _apply_d400_depth_config(self) -> None:
+    def _apply_d400_depth_config(self, sensor) -> None:
         """Enable the D400 IR emitter and available High Accuracy preset for textureless depth."""
-        if self.profile is None:
-            return
-        try:
-            sensor = self.profile.get_device().first_depth_sensor()
-        except RuntimeError:
-            return
-        if sensor is None:
-            return
-
         options: list[tuple[rs.option, float]] = []
         if sensor.supports(rs.option.emitter_enabled):
             options.append((rs.option.emitter_enabled, 1.0))
@@ -260,69 +190,20 @@ class RealSenseCamera:
         for option, value in options:
             try:
                 sensor.set_option(option, value)
+                logger.debug("D400 set_option(%s) applied: %s", option, value)
             except (RuntimeError, OSError) as error:
                 logger.warning("D400 set_option(%s) failed: %s", option, error)
 
-        if options:
-            logger.info("D400 depth config applied: %s", [o.name for o, _ in options])
-
-    def _start_pipeline(self, rs_config: rs.config) -> None:
-        """Use a fresh SDK context for L515 discovery isolation and queue frames before alignment/copying."""
-        self.pipeline = rs.pipeline()
-        rs_config.resolve(rs.pipeline_wrapper(self.pipeline))
-        self.frame_queue = rs.frame_queue(int(self.config.frame_queue_capacity))
-        self.profile = self.pipeline.start(rs_config, self.frame_queue)
-
-    def _warmup_pipeline(self) -> None:
-        if self.pipeline is None or self.frame_queue is None:
-            raise RuntimeError("Pipeline is unavailable during warmup.")
-
-        warmup_frames = max(int(self.config.warmup_frames), 0)
-        if warmup_frames == 0:
-            return
-
-        max_restarts = 3
-        for attempt in range(max_restarts + 1):
-            try:
-                for _ in range(warmup_frames):
-                    # Initialize alignment and image copies before live publication.
-                    self.read(timeout_ms=5000)
-                return
-            except RuntimeError:
-                if attempt >= max_restarts:
-                    raise
-
-                delay = 3.0 * (attempt + 1)
-                logger.warning(
-                    "L515 warmup failed; restarting pipeline after %.0f s (attempt %d/%d).",
-                    delay,
-                    attempt + 1,
-                    max_restarts,
-                )
-                try:
-                    self.pipeline.stop()
-                except RuntimeError:
-                    logger.warning("RealSense pipeline stop failed before restart", exc_info=True)
-                time.sleep(delay)
-                self._start_pipeline(self.create_rs_config())
-                # Reapply Short Range and rebuild active-profile state after every restart.
-                self._setup_pipeline_post_start()
-                time.sleep(1.0)
-
     def disconnect(self) -> None:
-        if self.pipeline is None:
-            return
-        try:
+        # A failed stop retains ownership so callers can report or retry cleanup.
+        if self.pipeline is not None:
             self.pipeline.stop()
-        except RuntimeError:
-            logger.warning("RealSense pipeline stop failed during disconnect", exc_info=True)
-        finally:
-            self.pipeline = None
-            self.frame_queue = None
-            self.profile = None
-            self.depth_scale = None
-            self.geometry = None
-            self._depth_to_color_aligner = None
+        self.pipeline = None
+        self.frame_queue = None
+        self.profile = None
+        self.depth_scale = None
+        self.geometry = None
+        self._depth_to_color_aligner = None
 
     def create_rs_config(self) -> rs.config:
         width, height = self.config.width, self.config.height
@@ -350,8 +231,6 @@ class RealSenseCamera:
     @staticmethod
     def _intrinsics_from_sdk(intrinsics: Any) -> CameraIntrinsics:
         coefficients = tuple(float(value) for value in intrinsics.coeffs)
-        if len(coefficients) != 5:
-            raise RuntimeError("RealSense intrinsics did not provide five distortion coefficients")
         return CameraIntrinsics(
             width=int(intrinsics.width),
             height=int(intrinsics.height),
@@ -365,30 +244,17 @@ class RealSenseCamera:
 
     @staticmethod
     def _transform_from_sdk_extrinsics(extrinsics: Any) -> np.ndarray:
-        """Decode SDK rotation storage and verify the chosen convention."""
-        raw_rotation = np.asarray(extrinsics.rotation, dtype=np.float64).reshape(3, 3)
-        translation = np.asarray(extrinsics.translation, dtype=np.float64)
-        points = np.vstack((np.zeros(3), np.eye(3)))
-        oracle = np.asarray(
-            [rs.rs2_transform_point_to_point(extrinsics, point.tolist()) for point in points],
-            dtype=np.float64,
-        )
-        for rotation in (raw_rotation.T, raw_rotation):
-            transformed = points @ rotation.T + translation
-            if np.allclose(transformed, oracle, rtol=0.0, atol=1e-7):
-                transform = np.eye(4, dtype=np.float64)
-                transform[:3, :3] = rotation
-                transform[:3, 3] = translation
-                return transform
-        raise RuntimeError("failed to decode RealSense extrinsic rotation convention")
+        """RealSense stores rotation column-major; translation is in meters."""
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = np.asarray(extrinsics.rotation).reshape(3, 3, order="F")
+        transform[:3, 3] = extrinsics.translation
+        return transform
 
-    def update_geometry_from_profile(self) -> None:
+    def _read_geometry(self) -> RGBDGeometry:
         """Read immutable native stream calibration from the active profile."""
-        if self.profile is None:
-            raise RuntimeError("RealSense is not connected.")
         depth_profile = self.profile.get_stream(rs.stream.depth).as_video_stream_profile()
         color_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
-        self.geometry = RGBDGeometry(
+        return RGBDGeometry(
             depth=self._intrinsics_from_sdk(depth_profile.get_intrinsics()),
             color=self._intrinsics_from_sdk(color_profile.get_intrinsics()),
             T_color_from_depth=self._transform_from_sdk_extrinsics(
@@ -397,10 +263,8 @@ class RealSenseCamera:
         )
 
     def read(self, timeout_ms: int = 5000) -> RGBDFrame:
-        if self.pipeline is None or self.frame_queue is None:
+        if self.frame_queue is None or self._depth_to_color_aligner is None:
             raise RuntimeError("RealSense is not connected. Call connect() first.")
-        if self.depth_scale is None:
-            raise RuntimeError("RealSense depth_scale is unavailable.")
 
         queued_frame = self.frame_queue.wait_for_frame(timeout_ms)
         # Timestamp queue return before frameset recovery, alignment, or owned copies.
@@ -415,15 +279,13 @@ class RealSenseCamera:
         if not color_frame:
             raise RuntimeError("Failed to get color frame.")
 
-        aligned_depth_raw: np.ndarray | None = None
-        if self._depth_to_color_aligner is not None:
-            aligned_frames = self._depth_to_color_aligner.process(frames)
-            aligned_depth_frame = aligned_frames.get_depth_frame()
-            if not aligned_depth_frame:
-                raise RuntimeError("Failed to align depth to the color stream.")
-            aligned_depth_raw = np.array(
-                aligned_depth_frame.get_data(), dtype=np.uint16, copy=True, order="C"
-            )
+        aligned_frames = self._depth_to_color_aligner.process(frames)
+        aligned_depth_frame = aligned_frames.get_depth_frame()
+        if not aligned_depth_frame:
+            raise RuntimeError("Failed to align depth to the color stream.")
+        aligned_depth_raw = np.array(
+            aligned_depth_frame.get_data(), dtype=np.uint16, copy=True, order="C"
+        )
 
         # Force an owned copy: ascontiguousarray may retain SDK buffers that expire on return.
         bgr = np.asarray(color_frame.get_data(), dtype=np.uint8)
@@ -432,22 +294,18 @@ class RealSenseCamera:
         # Device frame numbers expose stalls/drops that a local counter would hide.
         depth_frame_number = int(depth_frame.get_frame_number())
         color_frame_number = int(color_frame.get_frame_number())
-        frame = RGBDFrame(
+        return RGBDFrame(
             rgb=rgb,
             depth_aligned_to_color_raw=aligned_depth_raw,
             depth_frame_number=depth_frame_number,
             color_frame_number=color_frame_number,
             timestamp_ns=wait_return_monotonic_ns,
-            depth_scale=float(self.depth_scale),
-            serial=self.active_serial,
         )
-
-        return frame
 
     def get_geometry(self) -> RGBDGeometry:
         if self.geometry is None:
             raise RuntimeError("RealSense native RGB-D geometry is unavailable.")
-        return RGBDGeometry.from_dict(self.geometry.to_dict())
+        return self.geometry
 
     def get_depth_scale(self) -> float:
         if self.depth_scale is None:
@@ -457,19 +315,16 @@ class RealSenseCamera:
     def get_device_info(self) -> dict:
         if self.profile is None:
             raise RuntimeError("RealSense is not connected.")
-        device = self.profile.get_device()
-        info = {}
-        for name, key in [
+        return self._device_info(self.profile.get_device())
+
+    @staticmethod
+    def _device_info(device: rs.device) -> dict[str, str]:
+        return {name: RealSenseCamera.get_device_info_value(device, key) for name, key in (
             ("name", rs.camera_info.name),
             ("serial", rs.camera_info.serial_number),
             ("firmware", rs.camera_info.firmware_version),
             ("product_line", rs.camera_info.product_line),
-        ]:
-            try:
-                info[name] = device.get_info(key) if device.supports(key) else ""
-            except RuntimeError:
-                info[name] = ""
-        return info
+        )}
 
     @staticmethod
     def get_device_info_value(device: rs.device, key: rs.camera_info) -> str:
@@ -478,46 +333,7 @@ class RealSenseCamera:
         except RuntimeError:
             return ""
 
-    def _find_device_by_serial_in_context(self, serial: str) -> rs.device:
-        for device in self.context.query_devices():
-            device_serial = self.get_device_info_value(device, rs.camera_info.serial_number)
-            if device_serial == serial:
-                return device
-        raise RuntimeError(f"No RealSense camera found with serial={serial}.")
-
-    def _find_default_serial_in_context(self) -> str:
-        devices = self.context.query_devices()
-        if len(devices) == 0:
-            raise RuntimeError("No RealSense camera found.")
-        if len(devices) != 1:
-            serials = [
-                self.get_device_info_value(device, rs.camera_info.serial_number)
-                for device in devices
-            ]
-            raise RuntimeError(
-                "Multiple RealSense cameras found; configure an explicit serial "
-                f"instead of relying on discovery order (connected={serials})."
-            )
-        serial = self.get_device_info_value(devices[0], rs.camera_info.serial_number)
-        if not serial:
-            raise RuntimeError("The first RealSense camera does not expose a serial number.")
-        return serial
-
     @staticmethod
     def list_cameras() -> list[dict[str, str]]:
         context = rs.context()
-        cameras = []
-        for device in context.query_devices():
-            item = {}
-            for name, key in [
-                ("serial", rs.camera_info.serial_number),
-                ("name", rs.camera_info.name),
-                ("firmware", rs.camera_info.firmware_version),
-                ("product_line", rs.camera_info.product_line),
-            ]:
-                try:
-                    item[name] = device.get_info(key) if device.supports(key) else ""
-                except RuntimeError:
-                    item[name] = ""
-            cameras.append(item)
-        return cameras
+        return [RealSenseCamera._device_info(device) for device in context.query_devices()]

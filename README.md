@@ -41,7 +41,11 @@ python examples/pointcloud_process_example.py --help
 
 当前相机链路使用固定安装（eye-to-hand）外参，按相机 serial 绑定。采集允许缺相机外参；点云重建需要对应相机的内外参与 depth scale。标定在会话启动时读取。采集可指定 `--vr-transform` / `--camera-calibration`，部署可指定 `--camera-calibration`，相机和 VR 标定可指定 `--output`；桌面平面路径由 `environment.table.plane_path` 配置。
 
-相机预览的 `MARKER OK` 表示当前预览帧检测成功；保存标定样本还需通过独立的多帧采样、静止和有效性检查。
+VR 朝向标定按 `--ref` 等待头部或手腕观测，头部使用自身接收时间去重；缺少头部追踪不影响手腕参考标定。VR 接收进程异常退出时不发布标定结果。遥操作启动会拒绝质量为 poor（朝向标准差 ≥ 5°）的标定，需要重新采集。
+
+相机预览的 `MARKER OK` 表示当前预览帧检测成功；保存标定样本还需通过独立的多帧采样、静止和有效性检查。采样或求解结束后，键盘移动使用重新读取的机械臂反馈。
+
+相机标定的键盘移动与旋转步长使用 `keyboard_teleop.delta_pos_m` / `delta_rpy_rad`，与键盘遥操作共用配置；默认每拍 0.008 m / 0.03 rad。采样后按 ENTER 比较五种手眼求解结果，通过激励和残差检查后保存；BACKSPACE 撤销最近样本，X 删除当前评估中位置残差最大的样本，删除后需重新求解。
 
 ### 采集
 
@@ -73,7 +77,7 @@ T 对五个指尖各请求一次传感器复位，SDK 调用完成不代表已�
 
 遥操作从首个实际采样建立固定时间网格；读取、计算和下发可用本拍剩余时间。错过整拍、反馈过期或下发跨过截止时间会结束本轮并保存真实前缀，不追赶补发。无可执行目标时统一停止，录制开关不改变这一行为。同批停止/退出按键压过开始和恢复，S/D 同批优先保存。
 
-遥操作默认位置比例为 `policy.vr_mapping.pos_scale=0.4`，位置 EMA 为 `policy.ema.alpha_pos=0.7`；同等机器人位移需要约 2.5 倍手部行程。参数统一由包内配置提供，实验调整通过 `local.yaml` 覆盖。旋转仅支持 `rot_scale=1.0`，使用 reset 腕姿态锚点。
+遥操作默认位置比例为 `policy.vr_mapping.pos_scale=0.4`，位置 EMA 为 `policy.ema.alpha_pos=0.7`；同等机器人位移需要约 2.5 倍手部行程。参数统一由包内配置提供，实验调整通过 `local.yaml` 覆盖。旋转按腕姿态锚点等比例映射，不提供独立缩放配置。手部默认使用 TAG，将 `policy.hand_retargeting_type` 设为 `dexpilot` 可切换到 DexPilot；两个后端均使用当前 XHand 模型，参数分别由 `tag_retargeting` 和 `dexpilot_retargeting` 提供。
 
 ### 查看与导出
 
@@ -91,7 +95,7 @@ python examples/export_policy_zarr.py episodes/<task> --config local.yaml
 
 默认输出为 `datasets/<task>.zarr`，目标必须不存在，可用 `--output` 指定新路径。Zarr 使用 Diffusion Policy 的 `data/*` 和 `meta/episode_ends` 结构，根属性仅保存数值处理、数据身份与 episode 名称。处理逻辑变化后从 Raw 重新导出。文件读写故障或处理逻辑异常会中止导出，已创建的 staging 保留供排查后重建。
 
-导出按块处理，`--chunk-frames` 指定每批帧数上限（默认 100）；内存紧张时可调小，如 `--chunk-frames 16`。批次大小不改变数据行、采样频率或动作标签。
+导出按块处理，`--chunk-frames` 指定每批帧数上限（默认 100）；内存紧张时可调小，如 `--chunk-frames 16`。批次大小不改变数据行、采样频率或动作标签。`--pointcloud-num-points` 覆盖配置文件中的点数，按覆盖后的配置校验并导出。
 
 Canonical 与部署统一使用 `fingertip_xyz`、`finger_tactile_force`、`taxel_tactile_force`，并提供 `camera_intrinsic` / `camera_extrinsic`。两条路径均保留实测关节角精度完成 FK，再转为模型使用的 float32。相机参数采用 Sim 的 float32、C-order K / [R|t] 布局，Real 外参方向为 `xarm_base` → color optical RDF（右、下、前）；Real Base 与 Sim World 的数值坐标不必相同。K/E 不包含完整畸变模型，Raw 保留 distortion model、coefficients 和 depth scale，图像与点云处理方式不变。字段 shape 与物理语义见 [Canonical 契约](dexmani_real/dataset/contracts.py)。旧 Canonical Zarr 须从 Raw 重新导出，不提供旧名别名或自动迁移。
 
@@ -110,11 +114,11 @@ python examples/run_policy.py <policy/task/experiment> --execution-mode async --
 
 执行模式通过 `--execution-mode sync|async|rtc` 设置，CLI 优先于 YAML 的 `execution` 字段；async/RTC 使用 `--prefetch-steps d`，RTC 还需显式设置 `--rtc-guidance-cap`。当前 RTC 仅支持连续动作 BaseAgent DDIM 策略，ManiFlow 支持 sync/async。sync 与普通 async 在执行时根据当前反馈实现动作；async 在交接前 `d` 步查询，不提前冻结物理命令。RTC 保留前 `d` 步命令预实现与冻结，以对应物理 prefix 做 guidance，执行冻结命令前重新检查；`--rtc-guidance-cap 0` 保留冻结、关闭 guidance，可与正值比较。
 
-sync 在推理完成后读取新反馈并开始执行，段内按策略时间步发送；段间包含真实推理等待，不再额外等到下一网格点。async/RTC 保持固定节拍，交接时读取反馈后消费已就绪的预测，并保持动作索引与前缀对齐；命令仍须在当前拍截止前完成下发。模型加载与 warmup 在设备连接前完成，warmup 用于初始化，不据此推算启动准入；运行时直接检查实际反馈、决策年龄和等待预算。
+sync 在推理完成后读取新反馈并开始执行，段内按策略时间步发送，段间保留实际推理等待。async/RTC 保持固定节拍，交接时读取反馈后消费已就绪的预测，并保持动作索引与前缀对齐；命令仍须在当前拍截止前完成下发。策略输入与执行配置校验、模型加载与 warmup、用于动作准入和 HOME 的几何模型构建均在设备连接前完成。warmup 用于初始化，不据此推算启动准入；运行时直接检查实际反馈、决策年龄和等待预算。
 
-遥操作和策略共用 `ActionRealizer → RobotCommand → xArm 执行进程 → Ruckig → Mode 1`。专用进程唯一持有 xArm SDK，隔离主进程 XHand 原生调用对 Python 调度的影响；XHand、输入与 IK 留在原低频控制侧。`send_action` 提交机械臂目标后直接发送手部，不等待伺服 tick、机械臂 SDK 回执或到位；调用本身的返回码仍用于故障处理。开始／恢复时确认新鲜实测静止状态，HOME 保持 Mode 0 路点及实测稳定等待。输入侧 EMA/IK、策略 dt 和 sync/async/RTC 动作切片保持原语义。
+遥操作和策略共用 `ActionRealizer → RobotCommand → xArm 执行进程 → Ruckig → Mode 1`。专用进程唯一持有 xArm SDK，隔离主进程 XHand 原生调用对 Python 调度的影响；XHand、输入与 IK 留在原低频控制侧。`send_action` 提交机械臂目标后直接发送手部，不等待伺服 tick、机械臂 SDK 回执或到位；执行进程检查机械臂 SDK 返回结果并锁存故障，手部结果由当前调用返回。开始／恢复时确认新鲜实测静止状态，HOME 使用 Mode 0 路点及实测稳定等待。
 
-安装控制依赖使用 `python -m pip install -e ".[control]"`；固定采用本地 Ruckig Community 0.17.3，仅使用单目标七关节速度/加速度约束，没有 jerk 调参或云端路点。已在现有 Linux x86_64 / Python 3.10 环境核对；该版本 PyPI 仅提供源码包，新环境需要 C++/CMake 构建条件。没有升级 xArm SDK；实现核对版本为 1.18.4。接口依据：[UFACTORY Servo Mode Guide](https://docs.supportarticle.ufactory.cc/support_articles/developer/ufactory-servo-mode-guide.html)、[Ruckig 0.17.3](https://github.com/pantor/ruckig/tree/v0.17.3)。
+安装控制依赖使用 `python -m pip install -e ".[control]"`；固定采用本地 Ruckig Community 0.17.3，仅使用单目标七关节速度/加速度约束，没有 jerk 调参或云端路点。源码安装需要 C++/CMake 构建环境。接口依据：[UFACTORY Servo Mode Guide](https://docs.supportarticle.ufactory.cc/support_articles/developer/ufactory-servo-mode-guide.html)、[Ruckig 0.17.3](https://github.com/pantor/ruckig/tree/v0.17.3)。
 
 `arm` 下的执行参数独立于低频目标 dt，可通过现有 YAML 配置：
 
@@ -123,12 +127,12 @@ sync 在推理完成后读取新反馈并开始执行，段内按策略时间步
 | `servo_hz` / `feedback_hz` | 100 / 25 Hz | 参考发送 / 同步反馈查询频率 |
 | `max_joint_velocity_deg_per_s` / `max_joint_acceleration_deg_per_s2` | 135 / 810 | 转为 rad/s、rad/s² 约束 Ruckig；HOME 保留适用 SDK 参数 |
 | `servo_max_interval_s` / `sdk_timeout_s` | 0.020 / 0.020 s | 实际发送间隔及单次调用预算 / SDK GET、SET 响应超时 |
-| `executor_timeout_s` | 3 s | 停止、关闭及录制边界等待 |
-| `tracking_error_rad` / `servo_event_capacity` | 0.35 rad / 4096 | 参考跟踪偏差上限 / 录制事件缓冲容量 |
+| `executor_timeout_s` | 3 s | 初始化额外等待、停止及关闭超时 |
+| `tracking_error_rad` | 0.35 rad | 参考跟踪偏差上限 |
 
-Ruckig 从连续参考位置和速度生成轨迹，按实际 monotonic 时间采样，检查完整轨迹制动极值；调度使用绝对 tick，不追赶补发过期点。低频提交截止与持续执行期限分开：后者检查当前代次、反馈、服务以及原始 VR 输入或策略决策年龄；新反馈和 heartbeat 不续期旧决策。WAIT 可在期限内继续当前参考并保持，但实测静止仍需独立确认。停止、故障、暂停和关闭撤销旧目标，恢复必须重新准备。未录制时只维护回执、故障和时序计数。
+Ruckig 从连续参考位置和速度生成轨迹，按实际 monotonic 时间采样，检查完整轨迹制动极值；调度使用绝对 tick，不追赶补发过期点。低频提交截止与持续执行期限分开：后者检查当前代次、反馈、服务以及原始 VR 输入或策略决策年龄；新反馈和 heartbeat 不续期旧决策。WAIT 可在期限内继续当前参考并保持，但实测静止仍需独立确认。停止、故障、暂停和关闭撤销旧目标，恢复必须重新准备。执行计数、最近 SDK 调用和故障状态始终维护，不依赖录制是否开启。
 
-这些默认值是工程预算，100 Hz 不是性能结论。反馈来自独立节奏的同步关节／状态／错误查询，使用查询开始时刻作为保守主机来源时间，缓存读取不刷新它；SDK effort 保持原单位。执行进程不能打断自身阻塞的 SDK 调用，关闭超时会明确报告仍未完成。进程实现已做假 SDK 和主进程 GIL 阻塞检查，尚需完整真机负载验证发送间隔、停止响应、跟踪偏差和动作—反馈延迟。关节位置伺服不提供力控/阻抗，Ruckig 也不证明运动路径无碰撞。
+这些默认值是工程预算，100 Hz 不是性能结论。反馈来自独立节奏的同步关节／状态／错误查询，使用查询开始时刻作为保守主机来源时间，缓存读取不刷新它；SDK effort 保持原单位。执行进程不能打断自身阻塞的 SDK 调用，关闭超时会明确报告仍未完成。发送间隔、停止响应、跟踪偏差和动作—反馈延迟需在完整真机负载下验证。关节位置伺服不提供力控/阻抗，Ruckig 也不证明运动路径无碰撞。
 
 遥操作及各策略执行模式对 XHand 普通发送的偶发 CRC 均保留“提交未确认”并继续下一拍，不额外重发动作。连续发送 CRC 独立计时，正常发送响应清除异常段，成功读取不会清除；明确的空闲、停止和策略 WAIT 结束当前发送异常段。读取 CRC 仅在关节与全部触觉历史仍有效时回退，可信读取的主机时间不刷新。
 
@@ -140,13 +144,15 @@ checkpoint 默认 `latest`；可用 `--checkpoint 80pct` 选择已保存的 80% 
 
 Raw 与评估摘要可独立关闭：`--no-record` 关闭 Raw，`--no-results` 关闭摘要，两者同时使用时不创建会话产物。仅使用机器人状态且关闭 Raw 时不启动相机；RGB、点云、相机参数输入或 Raw 录制按需启动对应传感器。部署仅提供策略请求的字段；K/E 使用当前相机会话的 active color intrinsics 和 serial 对应的外参，一次计算后按观测历史展开，仍检查相机帧的新鲜度。仅请求相机参数不会启动点云 worker；请求外参时缺少有效标定会明确失败。
 
+RealSense 保留 L515 和 D400 支持，启动只尝试一次；发现、配置或预热失败时清理资源并退出，由操作者排查后重新启动。相机、VR 和实时点云按需在独立进程中运行，通过父进程创建的匿名共享缓冲区传递观测；退出时先撤销运动并关闭机器人，再等待传感器进程退出，无法确认退出会报告清理失败。
+
 评估摘要保存在 `session_result.json`，包含结束原因、时长、故障和推理、发送、跳过节拍的统计。启用摘要时，连接设备前写入初始未完成状态，撤销运动后保存每段结果，资源清理后更新会话结果。清理失败或模型关闭超时返回非零退出状态，episode 原始结束原因独立保留。模型关闭超时表示尚未完成；Python 线程或 CUDA 阻塞仍可能延迟进程退出。
 
 Rollout Raw 默认用于评估 evidence，保留 bootstrap/WAIT 的无动作行与具体终止原因（关闭摘要时也保留）。公共导出按同一时间、完整性与动作提交规则判定，通常会拒绝这些含无动作行的 episode；未来用于再训练需另行定义派生片段和时间映射，不能填动作或裁行来通过当前导出。
 
-启用 Raw 时，`data.h5/timing` 保存控制时序与来源证据，关联观测、query、命令提交和终止原因。当前机械臂低频状态 `SUBMITTED` 只表示目标提交，实际 SDK 结果保存在 `arm_servo`，与命令序号关联；手部保留自身 SDK 返回结果。整段导出同时检查两者，后续失败、未知结果或缺口均拒绝，正常目标替换不要求逐一到位。停止事件生产并收齐结果后才结束写入，无法确认完整性时保留 staging。旧 Raw 不重写，来源执行方式随派生数据保留。具体布局见 [Raw schema](dexmani_real/recording/storage/schema.py)，读取与延迟诊断见 [EpisodeReader](dexmani_real/recording/storage/reader.py)。
+启用 Raw 时，`data.h5/timing` 保存观测、query、命令序号及提交时序；`arm_execution` 保存录制开始和停止后的累计执行摘要。机械臂 `SUBMITTED` 只表示目标已提交，手部状态保留自身 SDK 返回结果。导出与 replay 共用整段校验：提交序号连续、每个目标至少有一个 SDK 接受点、所有调用已返回且接受、无取消缺口或故障；正常目标替换不要求到位。已确认的控制失败仍保存前缀和结束原因，执行或停止无法确认时保留 staging。新采集使用 `mode1_episode_summary_v1`，不再保存逐伺服点轨迹；旧 Raw 保持不变，须用对应历史代码处理。具体布局见 [Raw schema](dexmani_real/recording/storage/schema.py)，读取与延迟诊断见 [EpisodeReader](dexmani_real/recording/storage/reader.py)。
 
-部署 joint、EEF 的最终关节目标及 RTC 冻结目标统一检查机械/关节限位、跳变、FK 最终 EEF 工作空间、自碰撞及当前配置的 static boxes。最终 FK 工作空间检查默认允许各边界超出 5 mm，可通过 `execution.eef_workspace_margin_m` 调整，设为 0 恢复严格边界；EEF 原始目标投影与 HOME 路径仍使用原始工作空间。Policy 动作不做桌面碰撞检测，允许贴桌/接触操作，由操作员监督并准备硬件急停；H 执行 HOME 时仍按当前配置检查桌面和路径，点云去桌仍使用当前桌面标定。EEF 仍先投影再 IK；拒绝就终止本轮并记录原因，不重规划或恢复。这些是最终目标检查，不证明真实连续运动轨迹安全，仍需现场验收。
+部署 joint、EEF 的最终关节目标及 RTC 冻结目标统一检查机械/关节限位、跳变、FK 最终 EEF 工作空间、自碰撞及当前配置的 static boxes。最终 FK 工作空间检查默认允许各边界超出 5 mm，可通过 `execution.eef_workspace_margin_m` 调整，设为 0 恢复严格边界；EEF 目标投影与 HOME 路径使用配置的工作空间边界。Policy 动作不做桌面碰撞检测，允许贴桌/接触操作，由操作员监督并准备硬件急停；H 先让手部回 HOME，再按实测手部姿态、工作空间、桌面和静态障碍检查机械臂的整条规划路径；找不到安全路径则报告原因，不启动机械臂回位。点云去桌仍使用当前桌面标定。EEF 先投影再 IK；拒绝就终止本轮并记录原因，不重规划或恢复。这些是最终目标检查，不证明真实连续运动轨迹安全，仍需现场验收。
 
 `--no-record`、`--no-results` 只控制产物保存，部署仍连接设备并执行动作，不能用于离线验证。
 
@@ -156,11 +162,11 @@ Rollout Raw 默认用于评估 evidence，保留 bootstrap/WAIT 的无动作行�
 python examples/replay_episode.py episodes/<task>/<episode> --config local.yaml --output replay_results/<run>
 ```
 
-按 Raw 的标称节拍逐行回放关节目标，要求 teleop 数据、非空有限的目标与关节状态、双设备持续发送状态，并检查目标是否满足当前限位。回放与导出共用下发状态及 Mode 1 伺服证据检查；后者分块读取，正常目标替换无需到位。回放连接机械臂与手，不启动相机或 VR。输出目录须新建或为空，保存 `session_result.json`、已采集的 `replay_data.npz` 与可计算的一致性指标 `metrics.json`。Q 保存前缀并退出，ESC 急停；完成后可按 H 执行规划回 HOME。
+按 Raw 的标称节拍逐行回放关节目标，要求 teleop 数据、非空有限的目标与关节状态、双设备持续发送状态，并检查目标是否满足当前限位。回放与导出共用下发状态及 episode 执行摘要校验，正常目标替换无需到位。回放连接机械臂与手，不启动相机或 VR。输出目录须新建或为空，保存 `session_result.json`、已采集的 `replay_data.npz` 与可计算的一致性指标 `metrics.json`。Q 保存前缀并退出，ESC 急停；完成后可按 H 执行规划回 HOME。
 
-预备动作完成后，回放使用固定单调时钟时间槽；错过整槽或发送跨过本槽/反馈截止时间会停止并保存真实前缀，最后一帧也须满足截止时间。机械臂、手部观测分别保留消费样本的主机时间，提交开始/结束时间独立保存，SDK 接受不代表到位。评价中的轨迹帧偏移用于跨运行对齐，提交前目标—状态差使用发送前消费的反馈；两者均不表示硬件响应延迟或发送后的跟踪误差。
+回放启动先执行手部 HOME，默认再以 0.5 s 渐变到首帧手部目标；`--hand-start-duration 0` 仅跳过渐变，启动时的手部 HOME 仍会执行。预备动作完成后，回放使用固定单调时钟时间槽；错过整槽或发送跨过本槽/反馈截止时间会停止并保存真实前缀，最后一帧也须满足截止时间。机械臂、手部观测分别保留消费样本的主机时间，提交开始/结束时间独立保存；机械臂目标提交和 SDK 接受均不代表到位。评价中的轨迹帧偏移用于跨运行对齐，提交前目标—状态差使用发送前消费的反馈；两者均不表示硬件响应延迟或发送后的跟踪误差。
 
-会话结束阶段，先保存已采集的实测关节、目标、发送状态和时间，再离线生成 EEF 位姿并原子更新 `replay_data.npz`。EEF 派生或其 NPZ 更新失败时，第一次保存的物理捕获仍保留，EEF 字段维持 NaN；指标写盘失败不影响已保存的 EEF。错误记录到 `session_result.json`，没有捕获行时不生成 `replay_data.npz`。输入 Raw 始终保持原样。
+会话结束阶段，先保存实测关节、目标、命令序号、发送状态、时间和执行摘要，再离线生成 EEF 位姿并原子更新 `replay_data.npz`。摘要包含手部预备动作期间的机械臂执行，控制行只包含正式回放。EEF 派生或其 NPZ 更新失败时，第一次保存的物理捕获仍保留，EEF 字段维持 NaN；指标写盘失败不影响已保存的 EEF。错误记录到 `session_result.json`；已进入回放流程的零帧失败也保存执行摘要和终止原因，不计算一致性指标。输入 Raw 始终保持原样。
 
 ## 其他入口
 
@@ -171,15 +177,15 @@ python examples/replay_episode.py episodes/<task>/<episode> --config local.yaml 
 | RGB-D 诊断 | `examples/realsense_record_example.py` |
 | 点云诊断与桌面标定 | `examples/pointcloud_process_example.py` |
 
-键盘 jog 不启动相机或 VR。XHand 示例按 HOME → fist → palm → V → OK → HOME 顺序执行动作，实测到位后各停留 1 秒；`--read-only` 仍连接设备并读取反馈。相机诊断使用 `--config`；RealSense 诊断退出时恢复可读取的原曝光优先级。具体操作与参数见各入口 `--help`。
+键盘 jog 不启动相机或 VR。XHand 示例按 HOME → fist → palm → V → OK → HOME 顺序执行动作，实测到位后各停留 1 秒；`--read-only` 仍连接设备并读取反馈。相机诊断使用 `--config`；RealSense 诊断只建立一次相机连接，退出时恢复可读取的原曝光优先级。具体操作与参数见各入口 `--help`。
 
 ## 数据与安全
 
 **Raw 是实验 evidence，发布后不可变。** 采集保留接入的 RGB-D、关节与触觉观测。停止、晚帧、控制失败和缺测保留已采前缀及结束原因，仅操作者显式丢弃才删除当前 capture。写盘、编码或发布失败保留 staging 并报告失败；相机停帧不补黑图，触觉按 Raw 保存值导出。
 
-每个 Raw episode 只使用 `data.h5` 与 `rgb.mp4`，HDF5 保存物理观测、尝试发送的目标、相对秒时间与发送状态，以及采集和相机元数据。RGB 按解码顺序与 HDF5 控制行对齐，实际采样时间以 HDF5 `timestamp` 为准；视频按标称帧率编码。保存的 depth 与 RGB 像素网格对齐，查看和点云重建复用同帧深度。
+每个 Raw episode 只使用 `data.h5` 与 `rgb.mp4`，HDF5 保存物理观测、尝试发送的目标、相对秒时间与发送状态，以及采集和相机元数据。RGB 按解码顺序与 HDF5 控制行对齐，实际采样时间以 HDF5 `timestamp` 为准；视频按标称帧率编码。保存的 depth 与 RGB 像素网格对齐，尺寸来自当前相机会话的标定；查看和点云重建复用同帧深度。Raw 保存物理相机的畸变参数，点云算法尚不支持的畸变模型不阻止录制或 RGB-D 查看（`--no-point-cloud`），但不能通过点云重建和公共导出。
 
-录制端非阻塞提交当前控制行，后台线程完成编码和写盘；启动和结束时先撤销运动，再等待文件准备或发布。xArm 执行进程只向有界非阻塞缓冲提交事件，现有 writer 批量写盘。结束录制先确认执行器不再生产且已收齐已发调用结果，再 drain/finalize。任一队列溢出、写入失败或关闭无法确认均保留 staging，不能发布为完整 Raw。
+录制端非阻塞提交当前控制行，单个后台线程完成编码和写盘，视频编码器在 START 就绪前打开；启动和结束时先撤销运动，再等待文件准备或发布。运行时负责停止设备并传入结束摘要，录制器不操作执行器。队列溢出、写入失败或执行结束无法确认时保留 staging，不能发布为完整 Raw。
 
 Canonical 是可由 Raw 重建的训练缓存。训练侧只加载模型所需 observation/action，并检查这些字段的数值；训练筛选不回写 Raw。
 

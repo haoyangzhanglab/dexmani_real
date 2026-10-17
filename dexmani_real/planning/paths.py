@@ -1,83 +1,22 @@
-"""Typed home-path outcomes distinguish already-home, commandable and rejected motion."""
+"""Joint-space HOME candidates, dense safety checks and equivalent-angle handling."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_EQUIVALENT_JOINT_MASK
 
-from .collision import CollisionInfo
-
 if TYPE_CHECKING:
     from dexmani_real.planning.planner import XArm7MotionPlanner
 
 
-# HOME repositions J1–J4 before orienting the wrist with J5–J7.
+# The proximal-first HOME candidate moves J1–J4 before J5–J7.
 _PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=bool)
 
 # Allow a small outward tolerance for nonlinear FK interpolation at workspace edges.
 WORKSPACE_BOUNDS_TOLERANCE_M = 1e-3
-
-
-@dataclass(kw_only=True)
-class PathResult:
-    success: bool
-    qpos_path: np.ndarray | None
-    reason: str = ""
-    source: str = ""
-    report: dict[str, Any] = field(default_factory=dict)
-
-
-class HomePathStatus(str, Enum):
-    ALREADY_HOME = "already_home"
-    SAFE = "safe"
-    UNSAFE = "unsafe"
-
-
-@dataclass(frozen=True)
-class HomePathCandidate:
-    """Bounded diagnostic for one densely validated path candidate."""
-
-    name: str
-    safe: bool
-    reason: str = ""
-    sample_count: int = 0
-    detail: str = ""
-    collision_waypoint_index: int | None = None
-    collision: CollisionInfo | None = None
-    workspace_segment_index: int | None = None
-    table_waypoint_index: int | None = None
-    table_check_source: str = ""
-    table_raw_measurement_m: float | None = None
-    clearance_m: float | None = None
-    minimum_table_clearance_m: float | None = None
-    table_soft_escape: bool = False
-
-
-@dataclass(frozen=True)
-class HomePathResult:
-    """Typed home-path result; status, path, and diagnostics travel together."""
-
-    status: HomePathStatus
-    waypoints: np.ndarray
-    selected_candidate: str | None = None
-    candidates: tuple[HomePathCandidate, ...] = ()
-
-    def __post_init__(self) -> None:
-        waypoints = np.asarray(self.waypoints, dtype=np.float64)
-        if waypoints.ndim != 2 or waypoints.shape[1:] != ARM_JOINT_SHAPE:
-            raise ValueError("home-path waypoints must have shape (N, 7)")
-        if not np.all(np.isfinite(waypoints)):
-            raise ValueError("home-path waypoints must be finite")
-        if self.status is HomePathStatus.SAFE and len(waypoints) < 2:
-            raise ValueError("a safe home path must contain at least two milestones")
-        if self.status is not HomePathStatus.SAFE and len(waypoints) != 0:
-            raise ValueError("non-safe home-path results must not contain motion")
-        object.__setattr__(self, "waypoints", waypoints.copy())
 
 
 def _table_clearance_m(
@@ -114,8 +53,8 @@ def interpolate_waypoints(path: np.ndarray, max_step: float) -> np.ndarray:
 def wrap_nearest_equivalent(
     qpos: np.ndarray,
     reference: np.ndarray,
-    joint_limit_lower: tuple[float, ...],
-    joint_limit_upper: tuple[float, ...],
+    joint_limit_lower: tuple[float, ...] | np.ndarray,
+    joint_limit_upper: tuple[float, ...] | np.ndarray,
     *,
     equivalent_mask=XARM7_EQUIVALENT_JOINT_MASK,
 ) -> np.ndarray:
@@ -158,148 +97,66 @@ def wrap_nearest_equivalent(
     return result
 
 
-def _empty_home_path() -> np.ndarray:
-    return np.empty((0, *ARM_JOINT_SHAPE), dtype=np.float64)
-
-
-def _check_home_path_candidate(
+def _check_home_path(
     path: np.ndarray,
-    candidate_name: str,
     planner: "XArm7MotionPlanner",
     *,
     table_z_surface_m: float,
     hand_safety_margin_m: float,
     allow_table_soft_escape: bool,
-) -> HomePathCandidate:
-    """Validate one dense path and return its first safety rejection."""
-    sample_count = len(path)
-    if planner.planning_profile.check_self_collision:
-        try:
-            collision_result = planner.ik_geometry.check_path_combined_collisions(path)
-        except Exception as exc:
-            return HomePathCandidate(
-                candidate_name,
-                False,
-                reason="collision_check_error",
-                sample_count=sample_count,
-                detail=str(exc),
-            )
-        if collision_result["path_collision"]:
-            collision = collision_result.get("collision")
-            reason = (
-                "environment_collision"
-                if collision is not None and any(
-                    pair.collision_type == "environment" for pair in collision.collision_pairs
-                )
-                else "self_collision"
-            )
-            return HomePathCandidate(
-                candidate_name,
-                False,
-                reason=reason,
-                sample_count=sample_count,
-                collision_waypoint_index=collision_result.get("collision_waypoint_index"),
-                collision=collision,
-            )
+) -> None:
+    """Reject the first unsafe sample; table soft escape never permits mesh collision."""
+    try:
+        collision = planner.collision_model.check_path(path)
+    except Exception as exc:
+        raise ValueError(f"collision_check_error: {exc}") from exc
+    if collision is not None:
+        index, info = collision
+        raise ValueError(f"collision at segment {index}: {info}")
 
     try:
-        for segment_index, (start, end) in enumerate(zip(path[:-1], path[1:])):
-            if not planner.is_workspace_segment_safe(start, end):
-                return HomePathCandidate(
-                    candidate_name,
-                    False,
-                    reason="workspace",
-                    sample_count=sample_count,
-                    workspace_segment_index=segment_index,
-                )
+        planner.check_workspace_path(path)
     except (ValueError, RuntimeError) as exc:
-        return HomePathCandidate(
-            candidate_name,
-            False,
-            reason="workspace_check_error",
-            sample_count=sample_count,
-            detail=str(exc),
-        )
+        raise ValueError(f"workspace: {exc}") from exc
 
-    table_samples: list[tuple[int, float, float, str]] = []
-    for waypoint_index, waypoint in enumerate(path):
+    table_samples = []
+    for index, waypoint in enumerate(path):
         try:
-            clearance_m, raw_measurement_m, source = _table_clearance_m(
-                planner,
-                waypoint,
+            clearance, measurement, source = _table_clearance_m(
+                planner, waypoint,
                 table_z_surface_m=table_z_surface_m,
                 hand_safety_margin_m=hand_safety_margin_m,
             )
         except Exception as exc:
-            return HomePathCandidate(
-                candidate_name,
-                False,
-                reason="table_check_error",
-                sample_count=sample_count,
-                detail=str(exc),
-                table_waypoint_index=waypoint_index,
-            )
-        if not np.isfinite(clearance_m):
-            return HomePathCandidate(
-                candidate_name,
-                False,
-                reason="table_check_nonfinite",
-                sample_count=sample_count,
-                table_waypoint_index=waypoint_index,
-            )
-        table_samples.append((waypoint_index, clearance_m, raw_measurement_m, source))
+            raise ValueError(f"table_check_error at waypoint {index}: {exc}") from exc
+        if not np.isfinite(clearance):
+            raise ValueError(f"table_check_nonfinite at waypoint {index}")
+        table_samples.append((index, clearance, measurement, source))
 
-    minimum_clearance_m = min(sample[1] for sample in table_samples)
-    negative_samples = [sample for sample in table_samples if sample[1] < 0.0]
-    if not negative_samples:
-        return HomePathCandidate(
-            candidate_name,
-            True,
-            sample_count=sample_count,
-            minimum_table_clearance_m=minimum_clearance_m,
-        )
-
-    starts_inside_soft_zone = table_samples[0][1] < 0.0
-    negative_is_initial_prefix = all(
-        sample[0] == index for index, sample in enumerate(negative_samples)
-    )
-    best_clearance_so_far = table_samples[0][1]
+    negative = [sample for sample in table_samples if sample[1] < 0.0]
+    if not negative:
+        return
+    best_clearance = table_samples[0][1]
     monotonic_escape = True
     for sample in table_samples[1:]:
-        if best_clearance_so_far >= 0:
+        if best_clearance >= 0:
             break
-        if sample[1] < best_clearance_so_far - 5e-4:
+        if sample[1] < best_clearance - 5e-4:
             monotonic_escape = False
             break
-        best_clearance_so_far = max(best_clearance_so_far, sample[1])
-    reaches_clearance = table_samples[-1][1] >= 0.0
-    is_soft_escape = (
+        best_clearance = max(best_clearance, sample[1])
+    if (
         allow_table_soft_escape
-        and starts_inside_soft_zone
-        and negative_is_initial_prefix
+        and table_samples[0][1] < 0.0
+        and all(sample[0] == index for index, sample in enumerate(negative))
         and monotonic_escape
-        and reaches_clearance
-    )
-    if is_soft_escape:
-        return HomePathCandidate(
-            candidate_name,
-            True,
-            sample_count=sample_count,
-            minimum_table_clearance_m=minimum_clearance_m,
-            table_soft_escape=True,
-        )
-
-    bad_index, bad_clearance_m, bad_measurement_m, bad_source = negative_samples[0]
-    return HomePathCandidate(
-        candidate_name,
-        False,
-        reason="table_clearance",
-        sample_count=sample_count,
-        table_waypoint_index=bad_index,
-        table_check_source=bad_source,
-        table_raw_measurement_m=float(bad_measurement_m),
-        clearance_m=float(bad_clearance_m),
-        minimum_table_clearance_m=minimum_clearance_m,
+        and table_samples[-1][1] >= 0.0
+    ):
+        return
+    index, clearance, measurement, source = negative[0]
+    raise ValueError(
+        f"table_clearance at waypoint {index}: clearance={clearance:g} m, "
+        f"{source}={measurement:g} m"
     )
 
 
@@ -312,6 +169,13 @@ def _unique_milestones(*points: np.ndarray) -> np.ndarray:
     return np.asarray(unique, dtype=np.float64)
 
 
+def _home_joint_vector(value, name):
+    value = np.asarray(value, dtype=np.float64)
+    if value.shape != ARM_JOINT_SHAPE or not np.isfinite(value).all():
+        raise ValueError(f"{name} must be finite shape (7,)")
+    return value
+
+
 def compute_joint_home_path(
     qpos: np.ndarray,
     home_qpos: np.ndarray,
@@ -320,95 +184,62 @@ def compute_joint_home_path(
     table_z_surface_m: float,
     hand_safety_margin_m: float,
     use_canonical_target: bool = False,
-) -> HomePathResult:
-    """Return a typed, collision-checked path from current to home joints."""
+) -> np.ndarray:
+    """Return admitted milestones, an empty (0,7) path if home, or raise ValueError."""
+    qpos = _home_joint_vector(qpos, "current qpos")
+    home_qpos = _home_joint_vector(home_qpos, "home qpos")
     if use_canonical_target:
-        # Canonical HOME uses absolute deltas; wrapping would hide equivalent-joint band mismatches.
-        target = np.asarray(home_qpos, dtype=np.float64)
+        # Absolute HOME deltas preserve equivalent-joint band mismatches.
+        target = home_qpos
         delta = float(np.max(np.abs(target - qpos)))
     else:
-        target = planner.ik_geometry.canonicalize_qpos(home_qpos, qpos)
-        delta = float(np.max(np.abs(planner.ik_geometry.compute_qpos_delta(target, qpos))))
+        target = planner.kin.canonicalize_qpos(home_qpos, qpos)
+        delta = float(np.max(np.abs(planner.kin.compute_qpos_delta(target, qpos))))
     if delta < np.deg2rad(0.15):
-        return HomePathResult(HomePathStatus.ALREADY_HOME, _empty_home_path())
+        return np.empty((0, 7), dtype=np.float64)
 
-    candidates: list[HomePathCandidate] = []
+    rejections = []
 
-    def try_candidate(milestones: np.ndarray, name: str) -> HomePathResult | None:
-        samples = interpolate_waypoints(milestones, np.deg2rad(1.0))
-        candidate = _check_home_path_candidate(
-            samples,
-            name,
-            planner,
-            table_z_surface_m=table_z_surface_m,
-            hand_safety_margin_m=float(hand_safety_margin_m),
-            allow_table_soft_escape=True,
-        )
-        candidates.append(candidate)
-        if not candidate.safe:
-            return None
-        return HomePathResult(
-            HomePathStatus.SAFE,
-            milestones,
-            selected_candidate=name,
-            candidates=tuple(candidates),
-        )
+    def admitted(milestones, name):
+        try:
+            _check_home_path(
+                interpolate_waypoints(milestones, np.deg2rad(1.0)), planner,
+                table_z_surface_m=table_z_surface_m,
+                hand_safety_margin_m=hand_safety_margin_m,
+                allow_table_soft_escape=True,
+            )
+        except ValueError as exc:
+            rejections.append(f"{name}: {exc}")
+            return False
+        return True
 
-    direct_milestones = np.stack([qpos, target])
-    result = try_candidate(direct_milestones, "direct")
-    if result is not None:
-        return result
-
+    direct = np.stack([qpos, target])
+    if admitted(direct, "direct"):
+        return direct
     mid = qpos.copy()
     mid[_PROXIMAL_MASK] = target[_PROXIMAL_MASK]
-    proximal_first = _unique_milestones(qpos, mid, target)
-    result = try_candidate(proximal_first, "proximal_first")
-    if result is not None:
-        return result
-
-    distal_mid = qpos.copy()
-    distal_mid[~_PROXIMAL_MASK] = target[~_PROXIMAL_MASK]
-    distal_first = _unique_milestones(qpos, distal_mid, target)
-    result = try_candidate(distal_first, "distal_first")
-    if result is not None:
-        return result
+    proximal = _unique_milestones(qpos, mid, target)
+    if admitted(proximal, "proximal_first"):
+        return proximal
+    mid = qpos.copy()
+    mid[~_PROXIMAL_MASK] = target[~_PROXIMAL_MASK]
+    distal = _unique_milestones(qpos, mid, target)
+    if admitted(distal, "distal_first"):
+        return distal
 
     try:
-        planned = planner.plan_joint_qpos_path(target, qpos, planning_time_s=0.5)
+        milestones = planner.plan_joint_qpos_path(target, qpos)
+        if len(milestones) < 2:
+            raise ValueError("planner returned fewer than two milestones")
     except (ValueError, RuntimeError) as exc:
-        candidates.append(
-            HomePathCandidate(
-                "joint_qpos_rrt",
-                False,
-                reason="planner_error",
-                detail=str(exc),
-            )
-        )
+        rejections.append(f"joint_qpos_rrt: {exc}")
     else:
-        if planned.success and planned.qpos_path is not None and len(planned.qpos_path) >= 2:
-            rrt_milestones = np.asarray(planned.qpos_path, dtype=np.float64)
-            if float(np.max(np.abs(rrt_milestones[-1] - target))) > 1e-6:
-                rrt_milestones = np.concatenate(
-                    [rrt_milestones, target.reshape((1, *ARM_JOINT_SHAPE))], axis=0
-                )
-            result = try_candidate(rrt_milestones, "joint_qpos_rrt")
-            if result is not None:
-                return result
-        else:
-            candidates.append(
-                HomePathCandidate(
-                    "joint_qpos_rrt",
-                    False,
-                    reason="planner_failed",
-                    detail=planned.reason,
-                )
-            )
-
-    return HomePathResult(
-        HomePathStatus.UNSAFE,
-        _empty_home_path(),
-        candidates=tuple(candidates),
-    )
+        if float(np.max(np.abs(milestones[-1] - target))) > 1e-6:
+            milestones = np.concatenate([milestones, target[None]], axis=0)
+        # Appending the absolute target may introduce a new segment.
+        if admitted(milestones, "joint_qpos_rrt"):
+            return milestones
+    raise ValueError("no safe home path; " + "; ".join(rejections))
 
 
 def compute_band_alignment_path(
@@ -418,32 +249,21 @@ def compute_band_alignment_path(
     *,
     table_z_surface_m: float,
     hand_safety_margin_m: float,
-) -> HomePathResult:
-    """Return a typed safety result for equivalent-joint band alignment."""
-    equivalent_mask = planner.equivalent_joint_mask
-    raw_delta_deg = np.rad2deg(np.abs(wrapped_home - canonical_home))
-    if not np.any(raw_delta_deg[equivalent_mask] > 1.0):
-        return HomePathResult(HomePathStatus.ALREADY_HOME, _empty_home_path())
-
+) -> np.ndarray:
+    """Admit absolute equivalent-angle alignment without table soft escape."""
+    wrapped_home = _home_joint_vector(wrapped_home, "wrapped home")
+    canonical_home = _home_joint_vector(canonical_home, "canonical home")
+    delta = np.rad2deg(np.abs(wrapped_home - canonical_home))
+    if not np.any(delta[planner.kin.equivalent_joint_mask] > 1.0):
+        return np.empty((0, 7), dtype=np.float64)
     milestones = np.stack([wrapped_home, canonical_home])
-    dense_path = interpolate_waypoints(milestones, np.deg2rad(1.0))
-    candidate = _check_home_path_candidate(
-        dense_path,
-        "band_alignment",
-        planner,
-        table_z_surface_m=table_z_surface_m,
-        hand_safety_margin_m=float(hand_safety_margin_m),
-        allow_table_soft_escape=False,
-    )
-    if not candidate.safe:
-        return HomePathResult(
-            HomePathStatus.UNSAFE,
-            _empty_home_path(),
-            candidates=(candidate,),
+    try:
+        _check_home_path(
+            interpolate_waypoints(milestones, np.deg2rad(1.0)), planner,
+            table_z_surface_m=table_z_surface_m,
+            hand_safety_margin_m=hand_safety_margin_m,
+            allow_table_soft_escape=False,
         )
-    return HomePathResult(
-        HomePathStatus.SAFE,
-        milestones,
-        selected_candidate=candidate.name,
-        candidates=(candidate,),
-    )
+    except ValueError as exc:
+        raise ValueError(f"band_alignment: {exc}") from exc
+    return milestones

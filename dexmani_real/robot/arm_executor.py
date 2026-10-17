@@ -1,9 +1,8 @@
 """Parent-side xArm submission; one spawned process owns all xArm SDK calls.
 
-Only the current goal, measured snapshot, authority and recording events cross the
+Only the current goal, measured/execution status and motion authority cross the
 boundary. Ordinary submission never waits for a servo tick or SDK reply.
 """
-from dataclasses import dataclass
 from importlib.metadata import version
 import multiprocessing as mp
 import time
@@ -11,38 +10,33 @@ import time
 import numpy as np
 
 from dexmani_real.ipc.schema import ARM_STATE_DTYPE
-from dexmani_real.recording.storage.servo import SERVO_EVENT_DTYPE, ServoEvidence
-from dexmani_real.robot.command_validation import check_arm_target
-from dexmani_real.runtime.safety import (
-    SafetyState, RunEndReason, publish_arm_authority, revoke_motion,
-)
+from dexmani_real.runtime.state import SafetyState, RunEndReason
 
 _MAX_TIME = 2**63 - 1
 _GOAL_DTYPE = np.dtype([
-    ('sequence', '<i8'), ('run_id', '<i8'), ('capture_id', '<i8'),
+    ('sequence', '<i8'), ('run_id', '<i8'),
     ('submit_until_ns', '<i8'), ('execute_until_ns', '<i8'), ('q_goal', '<f8', (7,)),
 ])
-_STATUS_DTYPE = np.dtype([
-    ('frame', ARM_STATE_DTYPE), ('valid', '?'), ('state', '<i4'), ('error_code', '<i4'),
-    ('query_completed_ns', '<i8'), ('prepared_run_id', '<i8'),
-    ('point', SERVO_EVENT_DTYPE), ('stats', '<i8', (4,)),
+_CALL_DTYPE = np.dtype([
+    ('run_id', '<i8'), ('command_seq', '<i8'), ('planned_ns', '<i8'),
+    ('sampled_ns', '<i8'), ('started_ns', '<i8'), ('completed_ns', '<i8'),
+    ('status', '<i4'), ('code', '<i4'), ('q_ref', '<f8', (7,)),
 ])
-_STAT_NAMES = ('points', 'max_lateness_ns', 'max_call_ns', 'max_interval_ns')
-
-
-@dataclass(frozen=True)
-class ArmSnapshot:
-    frame: np.ndarray
-    valid: bool
-    state: int
-    error_code: int
-    query_completed_ns: int
+_COUNTERS = ('first_accepted', 'sdk_attempted', 'sdk_completed', 'sdk_accepted',
+             'cancelled_before_first')
+_STATUS_DTYPE = np.dtype([
+    ('frame', ARM_STATE_DTYPE), ('valid', '?'), ('state', '<i4'),
+    ('prepared_run_id', '<i8'), ('active_sequence', '<i8'),
+    *[(name, '<i8') for name in _COUNTERS],
+    ('point', _CALL_DTYPE), ('stats', '<i8', (3,)),
+])
+_STAT_NAMES = ('max_lateness_ns', 'max_call_ns', 'max_interval_ns')
 
 
 class _ArmChannels:
     """Fixed xArm channels created before spawn; no SDK or RuntimeState inside."""
 
-    def __init__(self, ctx, capacity):
+    def __init__(self, ctx):
         self.authority = ctx.Value('q', 0)
         self.emergency = ctx.Event()
         self.closing, self.stop, self.stopped, self.ready = (ctx.Event() for _ in range(4))
@@ -56,8 +50,6 @@ class _ArmChannels:
         self.goal_lock, self.status_lock = ctx.Lock(), ctx.Lock()
         self.goal = ctx.RawArray('b', _GOAL_DTYPE.itemsize)
         self.status = ctx.RawArray('b', _STATUS_DTYPE.itemsize)
-        self.events = ctx.Queue(maxsize=capacity)
-        self.evidence_failed = ctx.Event()
 
     def put_goal(self, goal):
         # A full slot is an explicit failure, never a silent target replacement.
@@ -67,8 +59,8 @@ class _ArmChannels:
                 raise RuntimeError('arm target slot is full')
             slot[0] = goal
 
-    def take_goal(self):
-        if not self.goal_lock.acquire(False):
+    def take_goal(self, *, block=False):
+        if not self.goal_lock.acquire(block):
             return None  # Never stall the servo on the parent holding this short lock.
         try:
             slot = np.frombuffer(self.goal, dtype=_GOAL_DTYPE, count=1)
@@ -95,13 +87,11 @@ class ArmExecutor:
         cfg.validate()
         self.cfg, self.shared, self._factory = cfg, shared, driver_factory
         self._ctx = mp.get_context('spawn')
-        self._io = _ArmChannels(self._ctx, cfg.servo_event_capacity)
+        self._io = _ArmChannels(self._ctx)
         self._pipe, self._child_pipe = self._ctx.Pipe()
         self._process = None
-        self._sequence = self._capture_id = self._operation_id = 0
+        self._sequence = self._operation_id = 0
         self._operation_unresolved = False
-        self._evidence = None
-        self._ended_evidence = None
 
     @property
     def is_connected(self):
@@ -110,15 +100,6 @@ class ArmExecutor:
     @property
     def fault(self):
         return self._io.fault.value.decode(errors='replace') or None
-
-    @property
-    def stats(self):
-        return dict(zip(_STAT_NAMES, map(int, self._io.read_status()['stats'])))
-
-    @property
-    def last_point(self):
-        """Latest SDK attempt; completed_ns=0 explicitly means an unresolved call."""
-        return self._io.read_status()['point']
 
     def connect(self):
         from ruckig import Ruckig
@@ -131,7 +112,7 @@ class ArmExecutor:
             raise RuntimeError('arm startup unauthorized')
         self.shared.arm_authority, self.shared.arm_emergency = self._io.authority, self._io.emergency
         # Explicit connect authorizes initialization only, never streaming.
-        self._io.authority.value = -int(self.shared.run_id)
+        self._io.authority.value = -self.shared.run_id
         self._process = self._ctx.Process(
             target=run_arm, args=(self.cfg, self._io, self._child_pipe, self._factory),
             name='xarm-owner', daemon=False,
@@ -143,7 +124,7 @@ class ArmExecutor:
             self._io.closing.set()
             raise TimeoutError('arm initialization unresolved; owner process may still be in SDK')
         self.check_error()
-        publish_arm_authority(self.shared)
+        self.shared.publish_arm_authority()
 
     def check_error(self):
         issue = self.fault
@@ -151,7 +132,7 @@ class ArmExecutor:
             issue = f'arm owner exited: {self._process.exitcode}'
         if issue:
             self.shared.error_state = True
-            revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
+            self.shared.revoke_motion(SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
             raise RuntimeError(f'xArm executor fault: {issue}')
 
     def snapshot(self):
@@ -162,8 +143,41 @@ class ArmExecutor:
             raise RuntimeError('arm feedback unavailable/stale')
         frame = status['frame'].copy().reshape(1)
         frame.flags.writeable = False
-        return ArmSnapshot(frame, True, int(status['state']), int(status['error_code']),
-                           int(status['query_completed_ns']))
+        return frame
+
+    def execution_snapshot(self):
+        """Detached diagnostics, also readable after a fault; no SDK calls or health checks.
+
+        Episode boundaries are sampled by the runtime owner while motion is revoked.
+        stopped acknowledges the SDK stop request, not measured physical standstill.
+        """
+        status = self._io.read_status()
+        with self._io.goal_lock:
+            pending = int(np.frombuffer(self._io.goal, dtype=_GOAL_DTYPE, count=1)['sequence'][0])
+        point = status['point']
+        return dict(
+            submitted=self._sequence,
+            **{name: int(status[name]) for name in _COUNTERS},
+            active_sequence=int(status['active_sequence']), pending_sequence=pending,
+            stopped=self._io.stopped.is_set(), connected=self.is_connected,
+            operation_unresolved=self._operation_unresolved,
+            fault=self.fault, close_error=self._io.close_error.value.decode(errors='replace') or None,
+            timing=dict(zip(_STAT_NAMES, map(int, status['stats']))),
+            last_call={name: point[name].tolist() for name in _CALL_DTYPE.names},
+        )
+
+    def execution_metadata(self, target_dt):
+        return dict(
+            mode=1, implementation='ruckig_monotonic_process', ruckig_version=version('ruckig'),
+            sdk_version=version('xarm-python-sdk'), servo_hz=self.cfg.servo_hz, target_dt=target_dt,
+            max_velocity_rad_s=self.cfg.max_joint_velocity_rad_per_s,
+            max_acceleration_rad_s2=self.cfg.max_joint_acceleration_rad_per_s2,
+            servo_max_interval_s=self.cfg.servo_max_interval_s, sdk_timeout_s=self.cfg.sdk_timeout_s,
+            clock='host_monotonic_ns', receipt='submitted; SDK acceptance counted in episode summary',
+            action='q_goal_absolute_joint_position_not_next_step_arrival',
+            feedback='synchronous_query_start_host_monotonic; effort SDK-native',
+            trajectory_time='actual_sample_ns_minus_activation_ns; no catch-up sends',
+        )
 
     def update_health(self, *, service_until_ns=None, upstream_until_ns=None, hand_until_ns=None):
         for value, destination in ((service_until_ns, self._io.service_until),
@@ -180,24 +194,19 @@ class ArmExecutor:
 
     def submit(self, command, *, submit_until_ns, execute_until_ns):
         self.check_error()
-        issue = check_arm_target(command.arm_qpos,
-                                 joint_limit_lower_rad=np.asarray(self.cfg.joint_limit_lower),
-                                 joint_limit_upper_rad=np.asarray(self.cfg.joint_limit_upper))
-        if issue:
-            raise ValueError(issue)
         if (not self.is_connected or self._io.closing.is_set() or self._io.stop.is_set()
                 or self._io.authority.value != command.run_id
                 or self._io.read_status()['prepared_run_id'] != command.run_id
                 or time.monotonic_ns() >= min(submit_until_ns, execute_until_ns)):
             raise RuntimeError('arm target unauthorized or expired')
-        self._sequence += 1
         goal = np.zeros((), dtype=_GOAL_DTYPE)
-        goal[()] = (self._sequence, command.run_id, self._capture_id if self._evidence else 0,
+        goal[()] = (self._sequence + 1, command.run_id,
                     submit_until_ns, execute_until_ns, command.arm_qpos)
         self._io.put_goal(goal)
+        self._sequence += 1
         return (int(command.run_id), self._sequence)
 
-    def _operation(self, kind, payload=None, *, service=None, abort=None, timeout_s=None):
+    def _operation(self, kind, payload, *, service, abort, timeout_s):
         if self._operation_unresolved and self._pipe.poll():
             reply_id, _ = self._pipe.recv()
             if reply_id != self._operation_id:
@@ -209,15 +218,15 @@ class ArmExecutor:
         identity = self._operation_id
         self._io.cancel_operation.clear()
         self._pipe.send((identity, kind, payload))
-        deadline = time.monotonic() + (timeout_s or self.cfg.executor_timeout_s)
+        deadline = time.monotonic() + timeout_s
         service_due, received = 0, False
         try:
             while not self._pipe.poll(0.005):
                 now = time.monotonic()
-                if service is not None and now >= service_due:
+                if now >= service_due:
                     service()  # XHand/input service remains exclusively in the parent.
                     service_due = now + self.cfg.homing.step_interval_s
-                if abort is not None and abort():
+                if abort():
                     from dexmani_real.robot.drivers.xarm7 import HomeAborted
                     raise HomeAborted(f'{kind} authority revoked')
                 if now >= deadline or not self.is_connected:
@@ -237,15 +246,15 @@ class ArmExecutor:
             self._operation_unresolved = not received
             raise
 
-    def prepare(self, epoch, *, service=None, abort=None):
+    def prepare(self, epoch, *, service, abort):
         self.check_error()
-        publish_arm_authority(self.shared)
+        self.shared.publish_arm_authority()
         self._operation('prepare', epoch, service=service, abort=abort,
                         timeout_s=self.cfg.homing.convergence_timeout_s + 2)
 
     def home(self, waypoints, target, epoch, *, service, abort):
         self.check_error()
-        publish_arm_authority(self.shared)
+        self.shared.publish_arm_authority()
         self._operation('home', (waypoints, target, epoch), service=service, abort=abort, timeout_s=3600)
 
     def request_stop(self):
@@ -254,10 +263,6 @@ class ArmExecutor:
             self._io.emergency.set()
         self._io.stopped.clear()
         self._io.stop.set()
-
-    def stop(self):
-        self.request_stop()
-        self.wait_stopped()
 
     def wait_stopped(self):
         deadline = time.monotonic() + self.cfg.executor_timeout_s
@@ -276,65 +281,16 @@ class ArmExecutor:
         if self._io.close_error.value:
             raise RuntimeError(self._io.close_error.value.decode(errors='replace'))
 
-    def begin_evidence(self, target_dt):
-        if self._evidence is not None:
-            raise RuntimeError('previous arm capture has not ended')
-        if self._ended_evidence is not None and (
-                not self._ended_evidence.closed or self._ended_evidence.error is not None):
-            raise RuntimeError('previous arm capture has not been completely drained')
-        self._capture_id += 1
-        self._io.evidence_failed.clear()
-        metadata = dict(
-            mode=1, implementation='ruckig_monotonic_process_v2', ruckig_version=version('ruckig'),
-            sdk_version=version('xarm-python-sdk'), servo_hz=self.cfg.servo_hz, target_dt=target_dt,
-            max_velocity_rad_s=self.cfg.max_joint_velocity_rad_per_s,
-            max_acceleration_rad_s2=self.cfg.max_joint_acceleration_rad_per_s2,
-            servo_max_interval_s=self.cfg.servo_max_interval_s, sdk_timeout_s=self.cfg.sdk_timeout_s,
-            clock='host_monotonic_ns', receipt='submitted_sdk_results_in_servo_events',
-            action='q_goal_absolute_joint_position_not_next_step_arrival',
-            feedback='synchronous_query_start_host_monotonic; effort SDK-native',
-            event_time='timestamp_ns=emission; planned_ns=tick; sampled_ns=reference; started/completed_ns=SDK',
-            trajectory_time='actual_sample_ns_minus_activation_ns; no catch-up sends',
-        )
-        evidence = ServoEvidence(self.cfg.servo_event_capacity, metadata,
-                                 queue=self._io.events, failure=self._io.evidence_failed)
-        self._evidence = evidence
-        try:
-            self._operation('attach', self._capture_id)
-        except BaseException as exc:
-            evidence.fail(f'capture start unresolved: {exc}')
-            raise
-        return evidence
-
-    def end_evidence(self, evidence):
-        if evidence is not self._evidence:
-            raise ValueError('arm capture identity mismatch')
-        try:
-            self._operation('detach', self._capture_id)
-            evidence.producer_done = True
-            self._ended_evidence = evidence
-            self._evidence = None
-        except BaseException as exc:
-            evidence.fail(f'capture end unresolved: {exc}; last SDK attempt={self.last_point}')
-            raise
-
     def close(self):
         self.request_stop()
         self._io.closing.set()
         if self._process is not None and self._process.pid is not None:
             self._process.join(self.cfg.executor_timeout_s)
             if self._process.is_alive():
-                if self._evidence is not None:
-                    self._evidence.fail(f'arm close unresolved; last SDK attempt={self.last_point}')
                 raise TimeoutError('arm owner process still active; stop/disconnect unresolved')
             if self._process.exitcode != 0:
                 raise RuntimeError(f'arm owner abnormal exit: {self._process.exitcode}')
-        if self._evidence is not None and not self._evidence.closed:
-            self._evidence.fail('arm closed before capture finalization')
-        if self._ended_evidence is not None and not self._ended_evidence.closed:
-            self._ended_evidence.fail('arm closed before capture events were drained')
         self._pipe.close()
         self._child_pipe.close()
-        self._io.events.close()
         if self._io.close_error.value:
             raise RuntimeError(self._io.close_error.value.decode(errors='replace'))

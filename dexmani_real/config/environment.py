@@ -118,8 +118,3 @@ class TableCollisionConfig:
 class EnvironmentConfig:
     table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
     static_boxes: tuple[StaticCollisionBox, ...] = ()
-
-    def validate(self) -> None:
-        names = [box.name for box in self.static_boxes]
-        if len(names) != len(set(names)):
-            raise ValueError("environment.static_boxes names must be unique")

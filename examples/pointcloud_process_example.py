@@ -40,7 +40,6 @@ from dexmani_real.sensor.pointcloud import (
     build_raw_point_cloud,
 )
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
-from dexmani_real.utils.geometry import validate_rigid_transform
 from dexmani_real.utils.log import configure_logging
 
 if TYPE_CHECKING:
@@ -284,7 +283,7 @@ def _save_diagnostic_snapshot(
         "point_cloud_columns": ["x_m", "y_m", "z_m", "r", "g", "b"],
         "raw_point_cloud_semantics": "all_finite_nonzero_aligned_depth_pixels",
         "processed_point_cloud_empty": processed_cloud.shape[0] == 0,
-        "camera": {key: str(camera_info.get(key, "")) for key in ("name", "serial", "firmware")},
+        "camera": {key: camera_info[key] for key in ("name", "serial", "firmware")},
         "arrays": {
             name: {"shape": list(value.shape), "dtype": str(value.dtype)}
             for name, value in arrays.items()
@@ -306,25 +305,17 @@ def _connect_camera(cfg: CameraParams) -> RealSenseCamera:
     configure_logging()
     camera = RealSenseCamera(cfg)
     print("Connecting to RealSense...")
-    try:
-        if not camera.connect():
-            raise RuntimeError("Failed to connect to RealSense.")
-    except BaseException:
-        camera.disconnect()
-        raise
+    camera.connect()
     return camera
 
 
 def _print_device_info(camera: RealSenseCamera) -> dict:
     info = camera.get_device_info()
     print("=" * 60)
-    print(f"Device:   {info.get('name', '')}")
-    print(f"Serial:   {info.get('serial', '')}")
-    print(f"Firmware: {info.get('firmware', '')}")
+    print(f"Device:   {info['name']}")
+    print(f"Serial:   {info['serial']}")
+    print(f"Firmware: {info['firmware']}")
     print("=" * 60)
-
-    if camera.profile is None:
-        raise RuntimeError("Pipeline profile unavailable.")
 
     device = camera.profile.get_device()
     depth_sensor = device.first_depth_sensor()
@@ -354,20 +345,15 @@ def _capture_frame(
     print("\nCapturing depth-to-color aligned RGBD frame...")
     frame = camera.read()
 
-    if frame.rgb is None:
-        raise RuntimeError("RGB frame unavailable.")
-
-    rgb = np.ascontiguousarray(frame.rgb)
-    if frame.depth_aligned_to_color_raw is None:
-        raise RuntimeError("depth_to_color alignment is unavailable")
-    depth_raw = np.ascontiguousarray(frame.depth_aligned_to_color_raw)
-    depth_m = frame.depth_aligned_to_color_raw.astype(np.float32) * float(frame.depth_scale)
+    rgb = frame.rgb
+    depth_raw = frame.depth_aligned_to_color_raw
+    depth_m = frame.depth_aligned_to_color_raw.astype(np.float32) * camera.get_depth_scale()
     if rgb.shape[:2] != depth_raw.shape:
         raise RuntimeError("aligned RGB and depth frame dimensions do not match")
 
     print(f"  RGB:     shape={rgb.shape}, dtype={rgb.dtype}")
     print(f"  Depth:   shape={depth_m.shape}, valid={int((depth_m > 0).sum())}/{depth_m.size}")
-    print(f"  Depth scale: {float(frame.depth_scale):.6f} m")
+    print(f"  Depth scale: {camera.get_depth_scale():.6f} m")
 
     return rgb, depth_raw, depth_m
 
@@ -375,10 +361,7 @@ def _capture_frame(
 def _load_extrinsics(camera_info: dict, calib: CameraExtrinsics) -> np.ndarray:
     """Load T_xarm_base_from_color for aligned depth-to-color samples."""
     print("\nLoading extrinsics from cameras.json...")
-    cam_name = calib.resolve_name_by_serial(str(camera_info.get("serial", "")))
-    base_from_color = np.asarray(calib.get_extrinsics(cam_name), dtype=np.float64)
-
-    base_from_color = validate_rigid_transform(base_from_color, label="camera extrinsics")
+    base_from_color = calib.for_serial(camera_info["serial"])
 
     pos = base_from_color[:3, 3]
     quat_xyzw = R.from_matrix(base_from_color[:3, :3]).as_quat()
@@ -406,9 +389,7 @@ def _calibrate_table(
     depth_frames: list[np.ndarray] = []
     for _ in range(max(1, frame_count)):
         frame = camera.read()
-        if frame.depth_aligned_to_color_raw is None:
-            raise RuntimeError("depth_to_color alignment is unavailable")
-        depth_frames.append(np.ascontiguousarray(frame.depth_aligned_to_color_raw))
+        depth_frames.append(frame.depth_aligned_to_color_raw)
 
     point_batches: list[np.ndarray] = []
     lower = np.asarray(config.workspace[:3], dtype=np.float32)
@@ -532,8 +513,6 @@ def _benchmark_production_pipeline(
     for _ in range(frame_count):
         frame_started = time.perf_counter()
         frame = camera.read()
-        if frame.rgb is None or frame.depth_aligned_to_color_raw is None:
-            raise RuntimeError("aligned RGB-D frame is unavailable")
         started = time.perf_counter()
         cloud = build_point_cloud(
             depth_raw=frame.depth_aligned_to_color_raw,

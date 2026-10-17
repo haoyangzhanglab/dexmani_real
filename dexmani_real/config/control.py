@@ -25,7 +25,6 @@ class EMAParams:
 @dataclass(frozen=True)
 class VRMappingParams:
     pos_scale: float = 0.4
-    rot_scale: float = 1.0
     stale_threshold_s: float = 0.5
 
     def validate(self) -> None:
@@ -35,17 +34,11 @@ class VRMappingParams:
         )
         if not all(np.isfinite(value) and value > 0 for value in values):
             raise ValueError("VR position scale and stale threshold must be finite and positive")
-        if not np.isfinite(self.rot_scale) or self.rot_scale != 1.0:
-            raise ValueError("only rot_scale=1.0 is supported by reset-relative rotation mapping")
 
 
 @dataclass(frozen=True)
 class TeleopTimingParams:
     control_hz: float = 16.0
-
-    def validate(self) -> None:
-        if not np.isfinite(self.control_hz) or self.control_hz <= 0:
-            raise ValueError("teleop.control_hz must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -125,7 +118,7 @@ class KeyboardTeleopParams:
 
 @dataclass(frozen=True)
 class TAGRetargetingParams:
-    """TAG two-stage NLopt hand retargeting parameters (``retargeting_type="tag"``)."""
+    """TAG two-stage NLopt hand retargeting parameters."""
 
     robot_finger_lengths: tuple[float, ...] = (0.161, 0.208, 0.206, 0.204, 0.145)
     # Thumb→pinky lengths in meters.

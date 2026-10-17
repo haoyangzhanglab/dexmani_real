@@ -12,14 +12,8 @@ import numpy as np
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.pointcloud import PointCloudConfig
-from dexmani_real.ipc.schema import (
-    make_pointcloud_frame_dtype,
-    validate_point_cloud_array,
-)
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
-from dexmani_real.sensor.pointcloud import (
-    build_point_cloud,
-)
+from dexmani_real.sensor.pointcloud import build_point_cloud
 from dexmani_real.utils.log import configure_logging
 
 
@@ -33,43 +27,13 @@ _IDLE_POLL_S = 0.001
 
 @dataclass(frozen=True)
 class PointCloudWorkerConfig:
-    """Resolved worker recipe; clouds inherit camera sequence and oldest channel receive time.
+    """Session-validated recipe; clouds inherit camera sequence and oldest channel receive time.
     RGB/cloud consumers retrieve matching RGB-D; other cloud consumers only check freshness.
     """
 
     pointcloud: PointCloudConfig
     camera_calibration: CameraExtrinsics
     table_plane_abcd: tuple[float, float, float, float] | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.pointcloud, PointCloudConfig):
-            raise TypeError("pointcloud must be a PointCloudConfig")
-        self.pointcloud.validate()
-        if not isinstance(self.camera_calibration, CameraExtrinsics):
-            raise TypeError("camera_calibration must be a preloaded CameraExtrinsics snapshot")
-        if not self.pointcloud.remove_table:
-            object.__setattr__(self, "table_plane_abcd", None)
-        elif self.table_plane_abcd is None:
-            raise ValueError("remove_table=True requires a current calibrated table plane")
-        if self.table_plane_abcd is not None:
-            plane = tuple(float(value) for value in self.table_plane_abcd)
-            if len(plane) != 4 or not np.all(np.isfinite(plane)):
-                raise ValueError("table_plane_abcd must contain four finite values")
-            norm = np.linalg.norm(plane[:3])
-            if norm <= 0.0 or plane[2] / norm <= 0.0:
-                raise ValueError("table_plane_abcd normal must point upward")
-            object.__setattr__(self, "table_plane_abcd", plane)
-
-
-def _resolve_base_from_color(
-    shared: "SensorChannels", calibration: CameraExtrinsics
-) -> np.ndarray:
-    serial = shared.camera_serial.value.decode("utf-8").strip()
-    if not serial:
-        raise RuntimeError("camera did not publish a serial for point-cloud calibration")
-    camera_name = calibration.resolve_name_by_serial(serial)
-    entry = calibration.get_entry(camera_name)
-    return entry.T_world_camera.copy()
 
 
 def _load_static_inputs(
@@ -78,19 +42,17 @@ def _load_static_inputs(
 ) -> tuple[RGBDGeometry, float, np.ndarray] | None:
     """Wait for camera-owned geometry and resolve the verified static transform."""
     while shared.is_running.value:
-        if not shared.camera_ready.is_set():
-            time.sleep(_IDLE_POLL_S)
+        if not shared.camera_ready.wait(timeout=0.05):
             continue
-        geometry_text = shared.camera_geometry.value.decode("utf-8").strip()
+        # Geometry/scale are published once, before ready; malformed values cannot recover here.
+        geometry = RGBDGeometry.from_dict(
+            json.loads(shared.camera_geometry.value.decode("utf-8"))
+        )
         depth_scale_m = float(shared.camera_depth_scale.value)
-        if not geometry_text or not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
-            time.sleep(_IDLE_POLL_S)
-            continue
-        geometry_payload = json.loads(geometry_text)
-        if not isinstance(geometry_payload, dict):
-            raise TypeError("camera geometry shared metadata must encode an object")
-        geometry = RGBDGeometry.from_dict(geometry_payload)
-        base_from_color = _resolve_base_from_color(shared, calibration)
+        if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
+            raise ValueError("camera depth scale must be finite and positive")
+        serial = shared.camera_serial.value.decode("utf-8")
+        base_from_color = calibration.for_serial(serial)
         # The aligned color pixel grid requires color-camera deprojection.
         return geometry.aligned_depth_to_color(), depth_scale_m, base_from_color
     return None
@@ -99,23 +61,14 @@ def _load_static_inputs(
 def run_pointcloud_worker(shared: "SensorChannels", config: PointCloudWorkerConfig) -> None:
     """Consume only the newest camera sequence and publish fixed ``[N,6]`` clouds."""
     configure_logging()
-    if not isinstance(config, PointCloudWorkerConfig):
-        raise TypeError("run_pointcloud_worker requires a PointCloudWorkerConfig")
-    if shared.camera_ring is None or shared.pointcloud_ring is None:
-        raise ValueError("cloud worker requires camera and pointcloud rings")
-    cfg = config
-    expected_dtype = make_pointcloud_frame_dtype(cfg.pointcloud.num_points)
-    if shared.pointcloud_ring.dtype != expected_dtype:
-        raise RuntimeError("pointcloud ring dtype does not match PointCloudWorkerConfig num_points")
-
-    static_inputs = _load_static_inputs(shared, cfg.camera_calibration)
+    static_inputs = _load_static_inputs(shared, config.camera_calibration)
     if static_inputs is None:
         return
     geometry, depth_scale_m, base_from_color = static_inputs
     logger.debug(
         "pointcloud config=%s table_plane_abcd=%s",
-        json.dumps(cfg.pointcloud.to_dict(), sort_keys=True, separators=(",", ":")),
-        json.dumps(cfg.table_plane_abcd, separators=(",", ":")),
+        json.dumps(config.pointcloud.to_dict(), sort_keys=True, separators=(",", ":")),
+        json.dumps(config.table_plane_abcd, separators=(",", ":")),
     )
 
     last_camera_sequence = 0
@@ -123,11 +76,11 @@ def run_pointcloud_worker(shared: "SensorChannels", config: PointCloudWorkerConf
 
     try:
         while shared.is_running.value:
-            latest_sequence = int(shared.camera_ring.latest_sequence)
+            latest_sequence = shared.camera_ring.latest_sequence
             if latest_sequence <= last_camera_sequence:
                 time.sleep(_IDLE_POLL_S)
                 continue
-            result = shared.camera_ring.read_latest_uncached()
+            result = shared.camera_ring.read_latest()
             if result is None:
                 time.sleep(_IDLE_POLL_S)
                 continue
@@ -145,19 +98,13 @@ def run_pointcloud_worker(shared: "SensorChannels", config: PointCloudWorkerConf
                 depth_scale_m=depth_scale_m,
                 geometry=geometry,
                 T_xarm_base_from_color=base_from_color,
-                table_plane_abcd=cfg.table_plane_abcd,
-                config=cfg.pointcloud,
+                table_plane_abcd=config.table_plane_abcd,
+                config=config.pointcloud,
             )
             if cloud is None:
                 continue
-            validate_point_cloud_array(
-                cloud,
-                num_points=cfg.pointcloud.num_points,
-                label="build_point_cloud output",
-            )
-
             camera_header = header[0]
-            shared.pointcloud_ring.write_fields(
+            shared.pointcloud_ring.write(
                 source_camera_sequence=np.uint64(camera_sequence),
                 timestamp_ns=camera_header["timestamp_ns"],
                 camera_received_ns=camera_header["received_ns"],
@@ -170,7 +117,7 @@ def run_pointcloud_worker(shared: "SensorChannels", config: PointCloudWorkerConf
                 ready = True
                 logger.debug(
                     "run_pointcloud_worker: ready (shape=(%d,6), frame=xarm_base)",
-                    cfg.pointcloud.num_points,
+                    config.pointcloud.num_points,
                 )
     finally:
         shared.pointcloud_ready.clear()

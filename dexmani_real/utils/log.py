@@ -27,34 +27,9 @@ _CONSOLE_FORMATTER = logging.Formatter(
     "[%(asctime)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S"
 )
 
-# One handler per process; creation failure leaves console logging active.
-_file_handler: logging.FileHandler | None = None
-_file_handler_init = False
-
-
-def _get_file_handler() -> logging.FileHandler | None:
-    """Create one date/PID session log under DEXMANI_LOG_DIR (default ~/.dexmani/logs).
-    Creation failure returns None and preserves console logging.
-    """
-    global _file_handler, _file_handler_init
-    if _file_handler_init:
-        return _file_handler
-    _file_handler_init = True
-    try:
-        log_dir = Path(os.environ.get("DEXMANI_LOG_DIR", str(Path.home() / ".dexmani" / "logs")))
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / (f"dexmani_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.log")
-        handler = logging.FileHandler(str(log_path), encoding="utf-8")
-        handler.setFormatter(_FORMATTER)
-        handler.setLevel(logging.DEBUG)
-        _file_handler = handler
-    except OSError:
-        _file_handler = None
-    return _file_handler
-
 
 def configure_logging() -> None:
-    """Configure application handlers once per process, only at an explicit entry."""
+    """Configure console and date/PID file logging once, only at an explicit entry."""
     logger = logging.getLogger("dexmani_real")
     if logger.handlers:
         return
@@ -62,14 +37,19 @@ def configure_logging() -> None:
     handler.setFormatter(_CONSOLE_FORMATTER)
     handler.setLevel(logging.INFO)
     logger.addHandler(handler)
-    file_handler = _get_file_handler()
-    if file_handler is not None:
-        logger.addHandler(file_handler)
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
-
-
-_logger = logging.getLogger(__name__)
+    try:
+        log_dir = Path(os.environ.get("DEXMANI_LOG_DIR", str(Path.home() / ".dexmani" / "logs")))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / (f"dexmani_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.log")
+        handler = logging.FileHandler(str(log_path), encoding="utf-8")
+        handler.setFormatter(_FORMATTER)
+        handler.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
+    except OSError:
+        # Console logging remains available when the log directory cannot be written.
+        pass
 
 
 @dataclass
@@ -114,7 +94,6 @@ def capture_native_stdout() -> Iterator[CapturedProcessOutput]:
         yield captured
         return
 
-    assert saved_fd is not None and sink is not None
     try:
         yield captured
     finally:
@@ -148,16 +127,15 @@ def extract_native_diagnostics(text: str, *, ignore: tuple[str, ...] = ()) -> tu
 
 
 class ThrottledWarner:
-    """Throttle logger.warning calls to one per interval_s (default 5 seconds)."""
+    """Throttle each solver warning to once every five seconds."""
 
-    def __init__(self, interval_s: float = 5.0, logger: logging.Logger | None = None) -> None:
-        self._interval_ns = int(interval_s * 1e9)
+    def __init__(self, *, logger: logging.Logger) -> None:
         self._last_ns = 0
-        self._logger = logger or _logger
+        self._logger = logger
 
     def __call__(self, msg: str, *args: Any, **kwargs: Any) -> None:
         now_ns = time.monotonic_ns()
-        if now_ns - self._last_ns < self._interval_ns:
+        if now_ns - self._last_ns < 5_000_000_000:
             return
         self._last_ns = now_ns
         self._logger.warning(msg, *args, **kwargs)

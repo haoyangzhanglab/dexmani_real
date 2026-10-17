@@ -9,7 +9,7 @@ import numpy as np
 
 from dexmani_real.dataset.contracts import ProcessingConfig
 from dexmani_real.dataset.pointcloud import (
-    RawEpisodePointCloudDeriver,
+    RawEpisodeCameraModel,
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
 )
@@ -21,12 +21,13 @@ from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
 from dexmani_real.recording.storage.schema import DATASET_SPECS, validate_training_rows
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
-from dexmani_real.sensor.camera.geometry import camera_parameters_cv
+from dexmani_real.sensor.camera.geometry import camera_parameters_cv, validate_aligned_depth_distortion
+from dexmani_real.sensor.pointcloud import build_point_cloud
 
 
 def validate_export_episode(
-    reader: EpisodeReader, config: ProcessingConfig
-) -> RawEpisodePointCloudDeriver:
+    reader: EpisodeReader,
+) -> tuple[RawEpisodeCameraModel, np.ndarray]:
     """Check metadata/layout/timing and prepare static camera geometry once per episode."""
     frames = reader.num_frames
     if frames <= 0:
@@ -46,26 +47,20 @@ def validate_export_episode(
         raise RawDataError(f"depth must be uint16 {expected}")
     errors = validate_training_rows(
         reader["timestamp"][:], reader["dispatch_status"][:], reader.control_hz,
-        arm_dispatch=reader.arm_dispatch_status,
     )
     if errors:
         raise RawDataError("; ".join(errors))
-    reader.validate_servo_execution()
+    reader.validate_arm_execution()
     if frames == 1:
         logging.getLogger(__name__).warning("%s: single row, no sampling interval to verify", reader.path)
     for name in DATASET_SPECS:
         reader[name]  # EpisodeReader validates shape/dtype without reading the array.
     try:
         camera = load_raw_episode_camera_model(reader)
-        base_from_color = load_raw_episode_base_from_color(reader)
+        validate_aligned_depth_distortion(camera.geometry.color.distortion_model)
+        return camera, load_raw_episode_base_from_color(reader)
     except (ValueError, TypeError, KeyError) as exc:
         raise RawDataError(f"invalid camera geometry: {exc}") from exc
-    return RawEpisodePointCloudDeriver(
-        camera=camera,
-        T_xarm_base_from_color=base_from_color,
-        pointcloud=config.pointcloud,
-        table_plane_abcd=config.table_plane_abcd,
-    )
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
@@ -98,13 +93,13 @@ def _iter_rgb_frames(reader):
 
 def iter_canonical_blocks(
     reader: EpisodeReader, config: ProcessingConfig, *,
-    pointcloud_deriver: RawEpisodePointCloudDeriver, chunk_frames: int,
+    camera: RawEpisodeCameraModel, base_from_color: np.ndarray, chunk_frames: int,
 ):
     """Check and convert each Raw block without repairing or resampling rows."""
-    height, width = int(reader.meta["camera_color_height"]), int(reader.meta["camera_color_width"])
+    height, width = camera.geometry.color.height, camera.geometry.color.width
     try:
         camera_parameters = camera_parameters_cv(
-            pointcloud_deriver.camera.geometry.color, pointcloud_deriver.T_xarm_base_from_color,
+            camera.geometry.color, base_from_color,
         )
     except ValueError as exc:
         raise RawDataError(f"invalid camera parameters: {exc}") from exc
@@ -156,11 +151,14 @@ def iter_canonical_blocks(
                 raise RawDataError(
                     f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
                 )
-            cloud = pointcloud_deriver.derive(depth[offset], image)
+            cloud = build_point_cloud(
+                depth_raw=depth[offset], color=image,
+                depth_scale_m=camera.depth_scale_m, geometry=camera.geometry,
+                T_xarm_base_from_color=base_from_color,
+                table_plane_abcd=config.table_plane_abcd, config=config.pointcloud,
+            )
             if cloud is None:
                 raise RawDataError(f"point_cloud unavailable at row {index}")
-            if cloud.shape != clouds.shape[1:] or cloud.dtype != clouds.dtype:
-                raise ValueError("point_cloud: transformed shape/dtype mismatch")
             rgb[offset], clouds[offset] = image, cloud
         block.update(rgb=rgb, depth=depth, point_cloud=clouds)
         yield block

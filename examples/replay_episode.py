@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import argparse
-import math
 from pathlib import Path
 
 import yaml
@@ -20,13 +19,6 @@ from dexmani_real.config.experiment import load_experiment_config
 
 
 logger = logging.getLogger("dexmani_real.cli.replay_episode")
-
-
-def _nonnegative_float(value: str) -> float:
-    result = float(value)
-    if not math.isfinite(result) or result < 0:
-        raise argparse.ArgumentTypeError(f"must be finite and >= 0, got {value}")
-    return result
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -64,11 +56,11 @@ Controls:
     )
     parser.add_argument(
         "--hand-start-duration",
-        type=_nonnegative_float,
+        type=float,
         default=0.5,
         help=(
             "Seconds to ramp XHand to the first target before replay (default: 0.5). "
-            "Only small start differences are allowed; 0 disables preparation."
+            "Only small start differences are allowed; 0 skips the ramp. Startup hand HOME still runs."
         ),
     )
     return parser.parse_args(argv)
@@ -80,10 +72,9 @@ def main(argv: list[str] | None = None) -> int:
     from dexmani_real.replay.replayer import ReplayStatus
     from dexmani_real.replay.session import (
         DEFAULT_OUTPUT_DIR,
-        EpisodeReplayConfig,
         replay_episode,
     )
-    from dexmani_real.replay.trajectory import load_trajectory, resolve_episode_path
+    from dexmani_real.replay.trajectory import load_trajectory
 
     try:
         trajectory = load_trajectory(args.episode)
@@ -93,8 +84,6 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         runtime = load_experiment_config(yaml_path=args.config)
-        if not runtime.policy.hand_enabled:
-            raise ValueError("physical replay requires policy.hand_enabled=true")
     except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
         print(f"Error resolving replay config: {exc}")
         return 1
@@ -109,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Joint speed: {runtime.arm.max_joint_velocity_deg_per_s:.0f}°/s")
 
     if args.output is None:
-        episode_name = resolve_episode_path(args.episode)[1]
+        episode_name = Path(trajectory.episode_path).name
         output_dir = str(Path(DEFAULT_OUTPUT_DIR) / f"{episode_name}_replay")
     else:
         output_dir = args.output
@@ -119,11 +108,8 @@ def main(argv: list[str] | None = None) -> int:
         outcome = replay_episode(
             trajectory,
             runtime,
-            EpisodeReplayConfig(
-                output_dir=output_dir,
-                evaluate_consistency=True,
-                hand_start_duration_s=args.hand_start_duration,
-            ),
+            output_dir=output_dir,
+            hand_start_duration_s=args.hand_start_duration,
         )
     except Exception as exc:
         logger.error("physical replay failed", exc_info=True)

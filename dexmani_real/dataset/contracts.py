@@ -62,8 +62,6 @@ class ProcessingConfig:
         )
 
     def __post_init__(self) -> None:
-        if not isinstance(self.pointcloud, PointCloudConfig):
-            raise TypeError("pointcloud must be a PointCloudConfig")
         self.pointcloud.validate()
         if (
             len(self.fingertip_link_names) != 5
@@ -79,7 +77,7 @@ class ProcessingConfig:
             raise ValueError("remove_table=True requires an explicit table_plane_abcd")
         if self.table_plane_abcd is not None:
             plane = tuple(float(v) for v in self.table_plane_abcd)
-            if len(plane) != 4 or not np.all(np.isfinite(plane)) or plane[2] <= 0:
+            if len(plane) != 4 or not np.all(np.isfinite(plane)):
                 raise ValueError("table_plane_abcd must be finite with upward normal")
             norm = np.linalg.norm(plane[:3])
             if norm <= 0.0 or plane[2] / norm <= 0.0:
@@ -104,21 +102,17 @@ _CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
 
 
 def canonical_array_specs(
-    length: int,
     num_points: int,
     rgb_height: int,
     rgb_width: int,
 ) -> dict[str, tuple[tuple[int, ...], np.dtype[Any]]]:
-    """Canonical array shapes and dtypes for one aligned RGB-D episode."""
-    specs = {
-        name: ((length, *tail_shape), dtype)
-        for name, (tail_shape, dtype) in _CORE_DATASET_SPECS.items()
-    }
+    """Canonical per-row shapes and dtypes for aligned RGB-D."""
+    specs = dict(_CORE_DATASET_SPECS)
     specs.update(
         {
-            "rgb": ((length, rgb_height, rgb_width, 3), np.dtype(np.uint8)),
-            "depth": ((length, rgb_height, rgb_width), np.dtype(np.uint16)),
-            "point_cloud": ((length, num_points, 6), np.dtype(np.float32)),
+            "rgb": ((rgb_height, rgb_width, 3), np.dtype(np.uint8)),
+            "depth": ((rgb_height, rgb_width), np.dtype(np.uint16)),
+            "point_cloud": ((num_points, 6), np.dtype(np.float32)),
         }
     )
     return specs

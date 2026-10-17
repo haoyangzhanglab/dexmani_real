@@ -16,15 +16,15 @@ import time
 import h5py
 import numpy as np
 
-from dexmani_real.config.hardware import CameraParams
-from dexmani_real.recording.storage.schema import DATASET_SPECS, RAW_FORMAT, TIMING_ROW_DTYPE
+from dexmani_real.recording.storage.schema import (
+    DATASET_SPECS, RAW_FORMAT, ARM_EXECUTION_FORMAT, TIMING_ROW_DTYPE,
+    validate_execution_boundary,
+)
 from dexmani_real.recording.storage.video import VideoEncoder
-from dexmani_real.recording.storage.servo import SERVO_EVENT_DTYPE
 from dexmani_real.robot.commands import DispatchStatus
 from dexmani_real.runtime.observation import observation_timing
-from dexmani_real.sensor.camera.geometry import RGBDGeometry, validate_aligned_depth_distortion
+from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
-from dexmani_real.utils.geometry import validate_rigid_transform
 from dexmani_real.utils.control_clock import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -43,6 +43,7 @@ class _Finish:
     reason: str
     details: object
     timing: object = None
+    arm_execution: object = None
 
 
 @dataclass(frozen=True)
@@ -50,8 +51,8 @@ class _QueryTiming:
     values: dict
 
 
-def snapshot_recording_metadata(shared, *, collection_source, camera_calibration, hand):
-    """Snapshot geometry, tactile hold semantics and the last reset request without I/O."""
+def snapshot_recording_metadata(shared, *, camera_calibration, hand):
+    """Build physical HDF5 attributes from the active camera and consumed tactile semantics."""
     serial = shared.sensors.camera_serial.value.decode("utf-8")
     if not serial.strip():
         raise ValueError("recording START requires a nonempty camera serial")
@@ -61,22 +62,31 @@ def snapshot_recording_metadata(shared, *, collection_source, camera_calibration
         logger.warning("Recording without camera extrinsics: session has no calibration")
     else:
         try:
-            name = camera_calibration.resolve_name_by_serial(serial)
-            entry = camera_calibration.get_entry(name)
-            transform = entry.T_world_camera.copy()
-        except (KeyError, ValueError) as exc:
+            transform = camera_calibration.for_serial(serial)
+        except KeyError as exc:
             logger.warning("Recording without camera extrinsics: %s", exc)
-    return dict(
-        collection_source=collection_source,
-        camera_geometry=geometry,
-        camera_T_xarm_base_from_color=transform,
-        depth_scale=float(shared.sensors.camera_depth_scale.value),
-        tactile_reset_metadata={
-            **hand.get_tactile_reset_metadata(),
-            "hand_tactile_processing": "sdk_native_bounded_previous_valid_vector_hold",
-            "hand_tactile_hold_max_age_s": float(hand.cfg.feedback_max_age_s),
-        } if hand is not None else {},
-    )
+    color = geometry.color
+    depth_scale = float(shared.sensors.camera_depth_scale.value)
+    if not np.isfinite(depth_scale) or depth_scale <= 0:
+        raise ValueError("depth_scale must be finite and positive")
+    metadata = {
+        "camera_payload_mode": "depth_to_color_aligned_rgbd",
+        "camera_color_width": color.width,
+        "camera_color_height": color.height,
+        "camera_color_intrinsics": color.matrix().reshape(-1),
+        "camera_color_distortion_model": color.distortion_model,
+        "camera_color_distortion_coeffs": np.asarray(color.distortion_coeffs, dtype=np.float64),
+        "depth_scale": depth_scale,
+    }
+    if transform is not None:
+        metadata["camera_T_xarm_base_from_color"] = transform.reshape(-1)
+    if hand is not None:
+        metadata.update(hand.get_tactile_reset_metadata())
+        metadata.update(
+            hand_tactile_processing="sdk_native_bounded_previous_valid_vector_hold",
+            hand_tactile_hold_max_age_s=float(hand.cfg.feedback_max_age_s),
+        )
+    return metadata
 
 
 def _raw_row(row, command, result, timestamp):
@@ -133,15 +143,11 @@ class AsyncEpisodeRecorder:
     Revoke motion before blocking START/finalization; required recording stops on check_error() failure.
     """
 
-    def __init__(self, data_dir, control_hz=16.0, rgb_shape=None, video_config=None):
+    def __init__(self, data_dir, *, control_hz):
         if not np.isfinite(control_hz) or control_hz <= 0:
             raise ValueError("recording control_hz must be finite and positive")
         self.data_dir = Path(data_dir)
         self.control_hz = float(control_hz)
-        self._rgb_shape = tuple(rgb_shape or CameraParams().rgb_shape)
-        if len(self._rgb_shape) != 3 or self._rgb_shape[2] != 3 or min(self._rgb_shape) <= 0:
-            raise ValueError("recording rgb_shape must be positive HWC with 3 channels")
-        self._video_config = video_config
         self._thread = None
         self._queue = Queue(maxsize=16)
         self._ready = threading.Event()
@@ -150,7 +156,6 @@ class AsyncEpisodeRecorder:
         self._recording = False
         self._temp_dir = self._episode_dir = self._published_path = None
         self._submitted_frames = self._written_frames = 0
-        self._arm_executor = self._servo = None
 
     @property
     def is_recording(self):
@@ -167,85 +172,14 @@ class AsyncEpisodeRecorder:
     def _store_error(self, error):
         if self._error is None:
             self._error = error
-        if self._servo is not None:
-            self._servo.fail(f"recording failure: {error}")
 
     def check_error(self):
-        if self._servo is not None and self._servo.error is not None:
-            self._store_error(RuntimeError(self._servo.error))
         if self._error is not None:
             raise RecordingError(f"Recording failed: {self._error}") from self._error
 
-    def _snapshot_start_metadata(
-        self,
-        *,
-        task_label: str,
-        collection_source: str,
-        camera_geometry: RGBDGeometry,
-        camera_T_xarm_base_from_color: object,
-        depth_scale: float,
-        tactile_reset_metadata: dict[str, object],
-    ) -> dict[str, object]:
-        if not isinstance(task_label, str) or not task_label.strip():
-            raise ValueError("task_label must be a non-empty string")
-        if not isinstance(collection_source, str) or collection_source not in _COLLECTION_SOURCES:
-            raise ValueError(
-                f"collection_source must be one of {sorted(_COLLECTION_SOURCES)}, "
-                f"got {collection_source!r}"
-            )
-        if not isinstance(camera_geometry, RGBDGeometry):
-            raise TypeError("camera_geometry must be an RGBDGeometry instance")
-        color = camera_geometry.color
-        validate_aligned_depth_distortion(color.distortion_model)
-        expected_rgb_shape = (color.height, color.width, 3)
-        if self._rgb_shape != expected_rgb_shape:
-            raise ValueError(
-                "aligned RGB-D geometry must match recording shape: "
-                f"expected rgb={self._rgb_shape}, "
-                f"depth={self._rgb_shape[:2]}; "
-                f"got rgb={expected_rgb_shape}, depth={expected_rgb_shape[:2]}"
-            )
-        try:
-            depth_scale_value = float(depth_scale)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("depth_scale must be numeric") from exc
-        if not np.isfinite(depth_scale_value) or depth_scale_value <= 0.0:
-            raise ValueError("depth_scale must be finite and positive")
-        transform = (
-            None
-            if camera_T_xarm_base_from_color is None
-            else validate_rigid_transform(
-                camera_T_xarm_base_from_color, label="camera_T_xarm_base_from_color"
-            )
-        )
-        return {
-            "task_label": task_label,
-            "collection_source": collection_source,
-            **(dict(
-                sampling_period_ns=sampling_clock_ns(self.control_hz)[0],
-                sampling_tolerance_ns=sampling_clock_ns(self.control_hz)[1],
-            ) if collection_source == "teleop" else {}),
-            "camera_payload_mode": "depth_to_color_aligned_rgbd",
-            "camera_color_width": color.width,
-            "camera_color_height": color.height,
-            "camera_color_intrinsics": color.matrix().reshape(-1).copy(),
-            "camera_color_distortion_model": color.distortion_model,
-            "camera_color_distortion_coeffs": np.asarray(
-                color.distortion_coeffs, dtype=np.float64
-            ).copy(),
-            **(
-                {"camera_T_xarm_base_from_color": transform.reshape(-1).copy()}
-                if transform is not None
-                else {}
-            ),
-            "depth_scale": depth_scale_value,
-            **tactile_reset_metadata,
-        }
-
     def start_episode(
-        self, *, task_label, collection_source, camera_geometry,
-        camera_T_xarm_base_from_color, depth_scale, tactile_reset_metadata, episode_name=None,
-        arm_executor,
+        self, *, task_label, collection_source, metadata,
+        arm_execution, arm_control_metadata, episode_name=None,
     ):
         self.check_error()
         if self._recording or (self._thread is not None and self._thread.is_alive()):
@@ -253,13 +187,16 @@ class AsyncEpisodeRecorder:
         self._temp_dir = self._episode_dir = self._published_path = None
         self._submitted_frames = self._written_frames = 0
         try:
-            metadata = self._snapshot_start_metadata(
-                task_label=task_label, collection_source=collection_source,
-                camera_geometry=camera_geometry,
-                camera_T_xarm_base_from_color=camera_T_xarm_base_from_color,
-                depth_scale=depth_scale,
-                tactile_reset_metadata=tactile_reset_metadata,
-            )
+            arm_execution, arm_control_metadata = deepcopy(arm_execution), deepcopy(arm_control_metadata)
+            validate_execution_boundary(arm_execution)
+            if not isinstance(task_label, str) or not task_label.strip():
+                raise ValueError("task_label must be a non-empty string")
+            if collection_source not in _COLLECTION_SOURCES:
+                raise ValueError(f"collection_source must be one of {sorted(_COLLECTION_SOURCES)}")
+            metadata = dict(deepcopy(metadata), task_label=task_label, collection_source=collection_source)
+            if collection_source == "teleop":
+                period, tolerance = sampling_clock_ns(self.control_hz)
+                metadata.update(sampling_period_ns=period, sampling_tolerance_ns=tolerance)
             if episode_name is not None and (
                 type(episode_name) is not str or not episode_name
                 or episode_name.startswith(".") or "/" in episode_name or "\\" in episode_name
@@ -278,13 +215,12 @@ class AsyncEpisodeRecorder:
                 suffix += 1
             staging.mkdir(exist_ok=False)
             self._temp_dir, self._episode_dir = staging, destination
-            self._arm_executor = arm_executor
-            self._servo = arm_executor.begin_evidence(1 / self.control_hz)
             self._queue = Queue(maxsize=16)
             self._ready.clear()
             self._cancelled.clear()
             self._thread = threading.Thread(
-                target=self._write_episode, args=(metadata,), name="episode-writer", daemon=False
+                target=self._write_episode, args=(metadata, arm_execution, arm_control_metadata),
+                name="episode-writer", daemon=False
             )
             self._thread.start()
             if not self._ready.wait(RECORDER_START_TIMEOUT_S):
@@ -300,51 +236,39 @@ class AsyncEpisodeRecorder:
                 raise
             raise RecordingError(f"recording START failed: {exc}") from exc
 
-    def add_frame(self, row, command=None, result=None, *, timing=None):
-        """Submit already-owned immutable snapshots without conversion or I/O."""
+    def _enqueue(self, item):
         self.check_error()
         if not self._recording:
-            return None
+            return False
         try:
-            self._queue.put_nowait((row, command, result, dict(timing or {})))
+            self._queue.put_nowait(item)
         except Full as exc:
             error = RecordingError("recording queue full (capacity=16)")
             self._store_error(error)
             raise error from exc
-        self._submitted_frames += 1
+        return True
+
+    def add_frame(self, row, command=None, result=None, *, timing=None):
+        """Submit already-owned immutable snapshots without conversion or I/O."""
+        if self._enqueue((row, command, result, dict(timing or {}))):
+            self._submitted_frames += 1
 
     def record_query(self, values):
         """Queue a top-level snapshot; callers must leave nested observations unchanged."""
-        self.check_error()
-        if not self._recording:
-            return
-        try:
-            self._queue.put_nowait(_QueryTiming(dict(values)))
-        except Full as exc:
-            error = RecordingError("recording queue full while submitting query evidence")
-            self._store_error(error)
-            raise error from exc
+        self._enqueue(_QueryTiming(dict(values)))
 
-    def save_episode(self, reason="manual", *, details=None, timing=None):
-        return self._finish(save=True, reason=reason, details=details, timing=timing)
+    def save_episode(self, reason="manual", *, arm_execution, details=None, timing=None):
+        return self._finish(save=True, reason=reason, details=details, timing=timing,
+                            arm_execution=arm_execution)
 
     def discard_episode(self, reason="discard"):
         self._finish(save=False, reason=reason)
 
     def close(self):
-        """Save the active prefix after the caller has revoked motion."""
+        """Join the writer; an active capture without an end snapshot retains staging."""
         self._finish(save=True, reason="close")
 
-    def _finish(self, *, save, reason, details=None, timing=None):
-        # The arm owner acknowledges quiescence after in-flight SDK results and END.
-        # Writer FINISH is enqueued only after the producer's boundary is closed.
-        if self._servo is not None and not self._servo.producer_done:
-            try:
-                self._arm_executor.end_evidence(self._servo)
-            except BaseException as exc:
-                self._store_error(exc)
-                if not isinstance(exc, Exception):
-                    raise
+    def _finish(self, *, save, reason, details=None, timing=None, arm_execution=None):
         was_recording, self._recording = self._recording, False
         thread = self._thread
         if thread is None:
@@ -355,7 +279,8 @@ class AsyncEpisodeRecorder:
         try:
             if was_recording and thread.is_alive() and not self._cancelled.is_set():
                 try:
-                    finish = _Finish(save, reason, deepcopy(details), deepcopy(timing))
+                    finish = _Finish(save, reason, deepcopy(details), deepcopy(timing),
+                                     deepcopy(arm_execution))
                 except BaseException as exc:
                     self._store_error(exc)
                     finish = _Finish(False, reason, None)
@@ -385,7 +310,7 @@ class AsyncEpisodeRecorder:
         self._thread = None
         return self._published_path
 
-    def _write_episode(self, metadata):
+    def _write_episode(self, metadata, arm_start, arm_control_metadata):
         staging, destination = self._temp_dir, self._episode_dir
         finish, buffered = None, 0
         query_indices = {}
@@ -404,24 +329,11 @@ class AsyncEpisodeRecorder:
                     for name, spec in DATASET_SPECS.items()
                 }
                 meta.attrs.update(arm_control_mode=1,
-                                  arm_action_semantics="q_goal_submitted")
-                servo_group = data.create_group("arm_servo")
-                servo_group.attrs.update(self._servo.metadata)
-                servo_group.attrs["complete"] = False
-                servo_events = servo_group.create_dataset(
-                    "events", shape=(0,), maxshape=(None,), dtype=SERVO_EVENT_DTYPE)
-                servo_ids = servo_group.create_dataset(
-                    "command_ids", shape=(0, 2), maxshape=(None, 2), dtype="<i8")
-                servo_ids.attrs.update(columns="run_id,command_seq", missing_value=-1)
-
-                def flush_servo():
-                    batch = self._servo.drain()
-                    if len(batch):
-                        start = len(servo_events)
-                        servo_events.resize(start + len(batch), axis=0)
-                        servo_events[start:] = batch
-                    if self._servo.error is not None:
-                        self._store_error(RuntimeError(self._servo.error))
+                                  arm_action_semantics="q_goal_submitted",
+                                  arm_execution_format=ARM_EXECUTION_FORMAT)
+                execution = data.create_group("arm_execution")
+                execution.attrs.update(arm_control_metadata)
+                execution.create_dataset("start", data=json.dumps(arm_start, allow_nan=False))
 
                 timing = data.create_group("timing")
                 timing.attrs.update(clock="host_monotonic_ns", missing_value=-1)
@@ -430,9 +342,10 @@ class AsyncEpisodeRecorder:
                 )
                 row_times = timing.create_dataset("rows", shape=(0,), maxshape=(None,), dtype=TIMING_ROW_DTYPE)
                 queries = timing.create_dataset("queries", shape=(0,), maxshape=(None,), dtype=h5py.string_dtype())
+                rgb_shape = (metadata["camera_color_height"], metadata["camera_color_width"], 3)
                 datasets["depth"] = data.create_dataset(
-                    "depth", shape=(0, *self._rgb_shape[:2]), maxshape=(None, *self._rgb_shape[:2]),
-                    chunks=(1, *self._rgb_shape[:2]), dtype=np.uint16, compression="gzip", compression_opts=1,
+                    "depth", shape=(0, *rgb_shape[:2]), maxshape=(None, *rgb_shape[:2]),
+                    chunks=(1, *rgb_shape[:2]), dtype=np.uint16, compression="gzip", compression_opts=1,
                 )
                 # Copy into writer-owned columns once. Retaining depth views would
                 # also keep each source's full RGB-D snapshot alive until flush.
@@ -440,10 +353,8 @@ class AsyncEpisodeRecorder:
                 arrays = {name: np.empty((batch_size, *dataset.shape[1:]), dtype=dataset.dtype)
                           for name, dataset in datasets.items()}
                 timing_rows = np.empty(batch_size, dtype=TIMING_ROW_DTYPE)
-                command_ids = np.empty((batch_size, 2), dtype="<i8")
-                height, width, _ = self._rgb_shape
-                video = VideoEncoder(staging / "rgb.mp4", config=self._video_config,
-                                     fps=self.control_hz, width=width, height=height)
+                height, width, _ = rgb_shape
+                video = VideoEncoder(staging / "rgb.mp4", fps=self.control_hz, width=width, height=height)
                 resources.callback(video.close)
                 video.open()
                 self._ready.set()
@@ -460,13 +371,10 @@ class AsyncEpisodeRecorder:
                         datasets[name][self._written_frames:end] = values[:count]
                     row_times.resize(end, axis=0)
                     row_times[self._written_frames:end] = timing_rows[:count]
-                    servo_ids.resize(end, axis=0)
-                    servo_ids[self._written_frames:end] = command_ids[:count]
                     self._written_frames = end
 
                 try:
                     while not self._cancelled.is_set():
-                        flush_servo()
                         try:
                             item = self._queue.get(timeout=0.05)
                         except Empty:
@@ -493,11 +401,17 @@ class AsyncEpisodeRecorder:
                         # Integer subtraction retains short intervals even for a large host clock.
                         values = _raw_row(row, command, result, (stamp - first_stamp) / 1e9)
                         rgb, depth = row.camera["rgb"], row.camera["depth"]
-                        if rgb.shape != self._rgb_shape or rgb.dtype != np.uint8:
+                        if rgb.shape != rgb_shape or rgb.dtype != np.uint8:
                             raise ValueError("RGB shape or dtype mismatch")
-                        if depth.shape != self._rgb_shape[:2] or depth.dtype != np.uint16:
+                        if depth.shape != rgb_shape[:2] or depth.dtype != np.uint16:
                             raise ValueError("depth shape or dtype mismatch")
                         evidence = dict(observation_timing(row), **execution_timing)
+                        evidence["command_seq"] = -1
+                        if result is not None and result.arm == DispatchStatus.SUBMITTED:
+                            run_id, sequence = result.command_id
+                            if evidence.get("run_id", run_id) != run_id:
+                                raise ValueError("dispatch/timing run_id mismatch")
+                            evidence.update(run_id=run_id, command_seq=sequence)
                         unknown = evidence.keys() - set(TIMING_ROW_DTYPE.names)
                         if unknown:
                             raise ValueError(f"Unknown timing row fields: {sorted(unknown)}")
@@ -505,7 +419,6 @@ class AsyncEpisodeRecorder:
                             arrays[name][buffered] = value
                         arrays["depth"][buffered] = depth
                         timing_rows[buffered] = tuple(evidence.get(name, -1) for name in TIMING_ROW_DTYPE.names)
-                        command_ids[buffered] = result.command_id if result is not None else (-1, -1)
                         video.write_frame(rgb)
                         buffered += 1
                         previous_stamp = stamp
@@ -515,23 +428,13 @@ class AsyncEpisodeRecorder:
                     # Publish the failure before cleanup, which may block on native I/O.
                     self._store_error(exc)
                 flush()
-                # multiprocessing.Queue.empty() cannot establish that a feeder has
-                # delivered FINISH. Drain the ordered boundary, with a finite wait.
-                servo_deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
-                while not self._servo.closed and self._servo.error is None:
-                    flush_servo()
-                    if time.monotonic() >= servo_deadline:
-                        self._servo.fail('servo FINISH not received; staging retained')
-                        break
-                    if not self._servo.closed:
-                        time.sleep(0.001)
-                flush_servo()
-                complete = self._servo.closed and self._servo.error is None
-                servo_group.attrs["complete"] = complete
-                if not complete:
-                    self._store_error(RuntimeError(self._servo.error or "servo stream not closed"))
-                if self._servo.error is not None:
-                    servo_group.attrs["error"] = self._servo.error
+                if finish is not None and finish.arm_execution is not None:
+                    execution.create_dataset("end", data=json.dumps(finish.arm_execution, allow_nan=False))
+                if finish is not None and finish.save:
+                    try:
+                        validate_execution_boundary(finish.arm_execution, stopped=True)
+                    except (KeyError, TypeError, ValueError) as exc:
+                        self._store_error(exc)
                 reason = finish.reason if finish is not None else "recording_failure"
                 details = list(finish.details or []) if finish is not None else []
                 if self._error is not None:
@@ -548,9 +451,9 @@ class AsyncEpisodeRecorder:
                 if self._error is None and (self._written_frames != self._submitted_frames
                                            or video.frame_count != self._written_frames):
                     raise RuntimeError("recording accepted/written/camera row count mismatch")
-            if self._error is None and not self._cancelled.is_set():
-                if finish is not None and finish.save:
-                    # A zero-row capture can still contain attempted servo calls or
+            if self._error is None and not self._cancelled.is_set() and finish is not None:
+                if finish.save:
+                    # A zero-row capture can still contain attempted SDK calls or
                     # an initialization failure. Only explicit discard deletes it.
                     atomic_publish(staging, destination, cancelled=self._cancelled.is_set)
                     self._published_path = destination

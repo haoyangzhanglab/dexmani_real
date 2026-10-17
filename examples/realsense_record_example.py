@@ -156,64 +156,19 @@ def _make_gray_depth_vis(depth: np.ndarray, min_d: float, max_d: float) -> np.nd
 
 
 def _list_cameras() -> list[dict[str, str]]:
-    for attempt in range(3):
-        try:
-            cameras = RealSenseCamera.list_cameras()
-        except RuntimeError as e:
-            if attempt < 2:
-                print(f"  Enumeration failed ({e}), retry {attempt + 2}/3...")
-                time.sleep(1.0)
-                continue
-            print(f"  Enumeration failed: {e}")
-            return []
-        break
-
+    cameras = RealSenseCamera.list_cameras()
     if not cameras:
         print("No RealSense camera detected. Check USB connection.")
         return []
     print(f"Detected {len(cameras)} camera(s):")
     for i, cam in enumerate(cameras):
         print(
-            f"  [{i}] {cam.get('name', 'unknown'):28s} "
-            f"SN={cam.get('serial', ''):16s} "
-            f"FW={cam.get('firmware', '')}  "
-            f"PL={cam.get('product_line', '')}"
+            f"  [{i}] {cam['name']:28s} "
+            f"SN={cam['serial']:16s} "
+            f"FW={cam['firmware']}  "
+            f"PL={cam['product_line']}"
         )
     return cameras
-
-
-def _test_lifecycle(config: CameraParams) -> bool:
-    configure_logging()
-    print("\n-- 1. connect/disconnect lifecycle --")
-    camera = RealSenseCamera(config, auto_exposure_priority=None)
-    try:
-        for attempt in range(3):
-            ok = camera.connect()
-            print(f"  connect() -> {ok}" + (f" (attempt {attempt + 1}/3)" if attempt else ""))
-            if ok:
-                break
-            time.sleep(1.0)
-        else:
-            print("  FAIL: connect failed after 3 retries")
-            return False
-
-        print(f"  connect() idempotent -> {camera.connect()}")
-        geometry = camera.get_geometry()
-        print(f"  K =\n{geometry.depth.matrix()}")
-        print(f"  depth_scale = {camera.get_depth_scale()}")
-        depth = geometry.depth
-        print(
-            f"  depth intrinsics = {depth.width}x{depth.height}  "
-            f"fx={depth.fx:.1f} fy={depth.fy:.1f} cx={depth.ppx:.1f} cy={depth.ppy:.1f}"
-        )
-        print(f"  color intrinsics = {geometry.color.width}x{geometry.color.height}")
-    finally:
-        camera.disconnect()
-        print("  disconnect() -> OK")
-    camera.disconnect()
-    print("  disconnect() idempotent -> OK")
-    print("  Lifecycle test passed")
-    return True
 
 
 def _build_hud_lines(
@@ -341,14 +296,6 @@ def _toggle_cmap(state: PointCloudDisplayState) -> None:
     print(f"  Colormap: {state.colormap}")
 
 
-def _compute_base_from_color(serial: str | None, calibration: CameraExtrinsics) -> np.ndarray:
-    """Return T_xarm_base_from_color for aligned depth-to-color clouds."""
-    if not serial:
-        raise RuntimeError("connected camera did not publish a serial")
-    camera_name = calibration.resolve_name_by_serial(serial)
-    return calibration.get_extrinsics(camera_name)
-
-
 def _get_ae_priority(camera: RealSenseCamera) -> float | None:
     """Read auto_exposure_priority (0=OFF, 1=ON); None if unsupported or unreadable."""
     try:
@@ -394,7 +341,7 @@ def _run_rgbd_test(
     calibration: CameraExtrinsics,
     allow_exposure_changes: bool,
 ) -> str:
-    print("\n-- 2. RGB-D live capture + point cloud --")
+    print("\n-- RGB-D live capture + point cloud --")
     print(
         "   q/Esc=quit  p=pcd  s=raw/processed  f=freeze "
         "r=reset  c=config  d=colormap  a=AE-priority"
@@ -410,7 +357,7 @@ def _run_rgbd_test(
     try:
         geometry = camera.get_geometry().aligned_depth_to_color()
         depth_scale_m = camera.get_depth_scale()
-        base_from_color = _compute_base_from_color(camera.active_serial, calibration)
+        base_from_color = calibration.for_serial(camera.active_serial)
         print(
             f"  Start: num_points={production.num_points}  "
             f"depth=[{production.depth_min_m}, {production.depth_max_m}]  "
@@ -434,11 +381,7 @@ def _run_rgbd_test(
             frame_count += 1
             frame_rgb = frame.rgb
             aligned_depth_raw = frame.depth_aligned_to_color_raw
-            if frame_rgb is None or aligned_depth_raw is None:
-                print("  aligned RGB-D frame unavailable; stopping diagnostic")
-                outcome = "read_failed"
-                break
-            aligned_depth_m = aligned_depth_raw.astype(np.float32) * float(frame.depth_scale)
+            aligned_depth_m = aligned_depth_raw.astype(np.float32) * depth_scale_m
             if frame_rgb.shape[:2] != aligned_depth_raw.shape:
                 print("  aligned RGB-D dimensions do not match; stopping diagnostic")
                 outcome = "read_failed"
@@ -548,11 +491,10 @@ def main(argv=None) -> int:
     parser.add_argument("--config", help="Optional experiment YAML overrides")
     parser.add_argument("--camera-calibration")
     args = parser.parse_args(argv)
-    global rs, RealSenseCamera, CameraParams
+    global rs, RealSenseCamera
     import pyrealsense2 as rs
 
     from dexmani_real.sensor.camera.realsense import RealSenseCamera
-    from dexmani_real.config.hardware import CameraParams
 
     # Resolve experiment settings before enumerating or opening a camera.
     runtime = load_experiment_config(yaml_path=args.config)
@@ -561,8 +503,9 @@ def main(argv=None) -> int:
     table = runtime.environment.table
     table_plane_abcd = resolve_table_plane(table) if production.remove_table else None
     calibration = CameraExtrinsics(args.camera_calibration)
-    # Both connections leave exposure priority untouched until it is snapshotted.
+    # Leave exposure priority untouched until it is snapshotted.
     config = runtime.camera
+    configure_logging()
 
     print("=" * 60)
     print("RealSense Test -- RGB-D Live Capture + Real-time Point Cloud")
@@ -575,25 +518,12 @@ def main(argv=None) -> int:
     if not cameras:
         return 1
 
-    if not _test_lifecycle(config):
-        print("Lifecycle test failed, exiting.")
-        return 1
-
     camera = RealSenseCamera(config, auto_exposure_priority=None)
     original_priority = None
     restore_failed = False
     outcome = "read_failed"
     try:
-        for attempt in range(3):
-            if camera.connect():
-                break
-            if attempt < 2:
-                delay = 1.0 * (attempt + 1)
-                print(f"  Connection failed, retrying in {delay:.0f}s...")
-                time.sleep(delay)
-        else:
-            print("Camera connection failed (3 retries).")
-            return 1
+        camera.connect()
         print(f"Connected: {camera.get_device_info()}")
         original_priority = _get_ae_priority(camera)
         if original_priority is not None:

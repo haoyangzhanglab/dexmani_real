@@ -21,37 +21,35 @@ class ReplayRecorder:
         self.submit_completed_ns = np.full(capacity, -1, dtype=np.int64)
         self.hand_qpos = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
         self.dispatch_status = np.zeros((capacity, 2), dtype=np.uint8)
+        self.command_ids = np.full((capacity, 2), -1, dtype=np.int64)
         self.hand_cmd = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
 
     def record(
         self,
         idx: int,
-        arm_qpos: np.ndarray,
-        arm_cmd: np.ndarray,
-        hand_cmd: np.ndarray,
+        row,
+        command,
+        dispatch,
         *,
-        hand_qpos: np.ndarray,
-        dispatch_status: tuple[int, int],
-        arm_observation_ns: int,
-        hand_observation_ns: int,
         submit_started_ns: int = -1,
         submit_completed_ns: int = -1,
     ) -> None:
-        """Capture one replay row, preserving rejected candidates for diagnosis."""
-        if idx < 0:
-            raise ValueError("replay frame index must be non-negative")
-        if idx >= self.capacity:
-            return
-        self.dispatch_status[idx] = dispatch_status
-        self.arm_qpos[idx] = arm_qpos
-        self.arm_cmd[idx] = arm_cmd
+        """Append one physical row; unavailable commands remain NaN with factual dispatch."""
+        if idx != self._count or idx >= self.capacity:
+            raise ValueError("replay rows must be sequential and within capacity")
+        self.dispatch_status[idx] = int(dispatch.arm), int(dispatch.hand)
+        self.command_ids[idx] = dispatch.command_id
+        self.arm_qpos[idx] = row.arm["qpos"][0]
+        if dispatch.arm:
+            self.arm_cmd[idx] = command.arm_qpos
         # Source clocks belong to the consumed samples; submission does not imply arrival.
-        self.arm_observation_ns[idx] = arm_observation_ns
-        self.hand_observation_ns[idx] = hand_observation_ns
+        self.arm_observation_ns[idx] = row.arm["timestamp_ns"][0]
+        self.hand_observation_ns[idx] = row.hand["timestamp_ns"][0]
         self.submit_started_ns[idx] = submit_started_ns
         self.submit_completed_ns[idx] = submit_completed_ns
-        self.hand_qpos[idx] = hand_qpos
-        self.hand_cmd[idx] = hand_cmd
+        self.hand_qpos[idx] = row.hand["qpos"][0]
+        if dispatch.hand:
+            self.hand_cmd[idx] = command.hand_qpos
         self._count = idx + 1
 
     def to_dict(self) -> dict[str, np.ndarray]:
@@ -59,6 +57,7 @@ class ReplayRecorder:
         count = self._count
         return {
             "dispatch_status": self.dispatch_status[:count].copy(),
+            "command_ids": self.command_ids[:count].copy(),
             "arm_qpos": self.arm_qpos[:count].copy(),
             "hand_qpos": self.hand_qpos[:count].copy(),
             "hand_cmd": self.hand_cmd[:count].copy(),

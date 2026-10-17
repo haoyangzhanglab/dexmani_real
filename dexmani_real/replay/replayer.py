@@ -1,6 +1,7 @@
 """Dispatch every raw target once at nominal dt, with current feedback."""
 
 import logging
+import json
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -9,14 +10,12 @@ import numpy as np
 
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.replay.capture import ReplayRecorder
-from dexmani_real.robot.commands import RobotCommand
-from dexmani_real.robot.projection import project_arm_command, project_hand_command
-from dexmani_real.robot.robot import DispatchError, DispatchInterrupted, DispatchResult
+from dexmani_real.recording.storage.schema import ARM_EXECUTION_FORMAT, validate_execution_boundary
+from dexmani_real.robot.action import project_arm_command, project_hand_command
+from dexmani_real.robot.commands import RobotCommand, DispatchError, DispatchInterrupted, DispatchResult
 from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
 from dexmani_real.runtime.operator_input import OperatorCommand
-from dexmani_real.runtime.safety import (
-    RunEndReason, begin_motion, revoke_motion, request_emergency_stop,
-)
+from dexmani_real.runtime.state import RunEndReason
 from dexmani_real.utils.control_clock import sampling_clock_ns
 
 
@@ -50,15 +49,15 @@ def _wait_replay(shared, keyboard, epoch, deadline_ns, robot):
         robot.check()
         signals = keyboard.poll(timeout=0)
         if not keyboard.healthy:
-            request_emergency_stop(shared)
+            shared.request_emergency_stop()
         if shared.estop_request:
             return ReplayOutcome(ReplayStatus.ESTOP, reason="operator emergency stop")
         if shared.error_state:
             return ReplayOutcome(ReplayStatus.FAULT, reason="runtime failure")
         if shared.quit_requested or OperatorCommand.QUIT in signals:
             return ReplayOutcome(ReplayStatus.USER_QUIT, reason="operator quit")
-        if not shared.running or int(shared.run_id) != epoch:
-            cause = RunEndReason(int(shared.run_ended_reason))
+        if not shared.running or shared.run_id != epoch:
+            cause = shared.run_ended_reason
             if cause == RunEndReason.QUIT:
                 return ReplayOutcome(ReplayStatus.USER_QUIT, reason="operator quit")
             return ReplayOutcome(
@@ -151,8 +150,9 @@ def replay_targets(
     shared, runtime, trajectory, keyboard, *, robot, hand_start_duration_s, results=None
 ):
     failure_details = []
-    epoch = int(shared.run_id)
+    epoch = shared.run_id
     capture = ReplayRecorder(trajectory.num_frames)
+    arm_start = robot.arm.execution_snapshot()
     period_ns, _ = sampling_clock_ns(trajectory.fps)
     status, reason = ReplayStatus.COMPLETED, ""
     run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
@@ -194,10 +194,10 @@ def replay_targets(
                 status, reason = ReplayStatus.REJECTED, "hand preparation target violates limits"
         if status == ReplayStatus.COMPLETED:
             with shared.motion_lock:
-                if int(shared.run_id) != epoch or not begin_motion(shared):
+                if shared.run_id != epoch or not shared.begin_motion():
                     status, reason = ReplayStatus.REJECTED, "motion authority unavailable"
                 else:
-                    epoch = int(shared.run_id)
+                    epoch = shared.run_id
         if results is not None and status == ReplayStatus.COMPLETED:
             results.entered(epoch)
         if status == ReplayStatus.COMPLETED and hand_start_duration_s > 0:
@@ -263,13 +263,10 @@ def replay_targets(
                     result, dispatch_error = exc.result, exc
                     cancelled = isinstance(exc, DispatchInterrupted)
                     if cancelled:
-                        request_emergency_stop(shared)
-                    revoke_motion(
-                        shared,
-                        reason=RunEndReason.ESTOP
-                        if cancelled
-                        else RunEndReason.EXECUTOR_BOUNDARY
-                        if exc.revoked
+                        shared.request_emergency_stop()
+                    shared.revoke_motion(
+                        reason=RunEndReason.ESTOP if cancelled
+                        else RunEndReason.EXECUTOR_BOUNDARY if exc.revoked
                         else RunEndReason.HARDWARE_FAULT,
                     )
                     try:
@@ -280,14 +277,7 @@ def replay_targets(
                         shared.error_state = True
                 try:
                     capture.record(
-                        index,
-                        row.arm["qpos"][0],
-                        arm if result.arm else np.full(7, np.nan),
-                        hand if result.hand else np.full(12, np.nan),
-                        dispatch_status=(int(result.arm), int(result.hand)),
-                        hand_qpos=row.hand["qpos"][0],
-                        arm_observation_ns=int(row.arm["timestamp_ns"][0]),
-                        hand_observation_ns=int(row.hand["timestamp_ns"][0]),
+                        index, row, command, result,
                         submit_started_ns=submit_started_ns,
                         submit_completed_ns=submit_completed_ns,
                     )
@@ -316,8 +306,8 @@ def replay_targets(
             with shared.motion_lock:
                 operator_revocation = (
                     exc.cause == "authority_revoked"
-                    and int(shared.run_ended_id) == epoch
-                    and int(shared.run_ended_reason) == int(RunEndReason.QUIT)
+                    and shared.run_ended_id == epoch
+                    and shared.run_ended_reason == RunEndReason.QUIT
                 )
             status = (
                 ReplayStatus.ESTOP
@@ -335,7 +325,7 @@ def replay_targets(
             RunEndReason.HARDWARE_FAULT if not exc.revoked else RunEndReason.EXECUTOR_BOUNDARY
         )
     except KeyboardInterrupt as exc:
-        request_emergency_stop(shared)
+        shared.request_emergency_stop()
         status, reason = ReplayStatus.ESTOP, "KeyboardInterrupt"
         if isinstance(exc, DispatchInterrupted):
             reason += f"; dispatch={exc.result}"
@@ -350,16 +340,35 @@ def replay_targets(
             run_end_reason = RunEndReason.QUIT
         elif status == ReplayStatus.ESTOP:
             run_end_reason = RunEndReason.ESTOP
-        revoke_motion(shared, reason=run_end_reason)
+        shared.revoke_motion(reason=run_end_reason)
         try:
             robot.stop()
         except Exception as exc:
             shared.error_state = True
             logger.exception("replay stop failed")
             status, reason = ReplayStatus.FAULT, f"{reason or status.value}; stop failed: {exc}"
+    arm_end = dict(robot.arm.execution_snapshot(), robot_stopped=not robot.stop_required)
+    try:
+        validate_execution_boundary(arm_end, stopped=True)
+        if arm_end["fault"]:
+            raise RuntimeError(arm_end["fault"])
+        if (arm_end["sdk_completed"] - arm_start["sdk_completed"]
+                != arm_end["sdk_accepted"] - arm_start["sdk_accepted"]):
+            raise RuntimeError("replay contains unaccepted arm SDK calls")
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        shared.error_state = True
+        failure_details.append(f"arm execution: {exc}")
+    if (status == ReplayStatus.COMPLETED
+            and arm_end["first_accepted"] - arm_start["first_accepted"]
+            != arm_end["submitted"] - arm_start["submitted"]):
+        status, reason = ReplayStatus.REJECTED, "replay target stopped before first SDK acceptance"
     if failure_details:
         reason = "; ".join([reason or status.value, *failure_details])
         status = ReplayStatus.FAULT
     data = capture.to_dict()
+    data["arm_execution"] = np.asarray(json.dumps(dict(
+        format=ARM_EXECUTION_FORMAT, scope="replay_including_hand_start",
+        start=arm_start, end=arm_end, control=robot.arm.execution_metadata(1 / trajectory.fps),
+    ), allow_nan=False))
     data["termination_reason"] = np.asarray(reason or status.value)
     return ReplayOutcome(status, data, reason)

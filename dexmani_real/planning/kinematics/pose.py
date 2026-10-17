@@ -43,26 +43,11 @@ __all__ = [
     "forward_from_quat_wxyz",
     "invert_pose",
     "quat_multiply",
-    "quat_wxyz_to_rot6d",
     "quat_wxyz_to_rotmat",
     "validate_rot6d_geometry",
     "rot6d_to_quat_wxyz",
     "rot6d_to_rotmat",
 ]
-
-
-def ensure_qpos(qpos: np.ndarray, dof: int, name: str) -> np.ndarray:
-    if (
-        isinstance(qpos, np.ndarray)
-        and qpos.ndim == 1
-        and qpos.shape[0] == dof
-        and qpos.dtype == np.float64
-    ):
-        return qpos
-    array = np.asarray(qpos, dtype=np.float64).reshape(-1)
-    if array.shape[0] != dof:
-        raise ValueError(f"{name} must have length {dof}, got {array.shape[0]}.")
-    return array.copy()
 
 
 def wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
@@ -183,13 +168,6 @@ def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
 
     quat_xyzw = Rotation.from_matrix(R).as_quat()
     return xyzw_to_wxyz(quat_xyzw)
-
-
-def quat_wxyz_to_rot6d(q_wxyz: np.ndarray) -> np.ndarray:
-    """WXYZ quaternion → 6D rotation (first two columns of the 3×3 rotation matrix)."""
-    quat_xyzw = wxyz_to_xyzw(normalize_quat_wxyz(q_wxyz))
-    R = Rotation.from_quat(quat_xyzw).as_matrix()
-    return np.concatenate([R[:, 0], R[:, 1]])
 
 
 def quat_wxyz_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:

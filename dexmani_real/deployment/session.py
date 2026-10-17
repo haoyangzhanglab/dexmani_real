@@ -2,9 +2,9 @@
 
 import logging
 import multiprocessing as mp
-import os
 import time
 from dataclasses import replace
+from pathlib import Path
 
 from dexmani_real.calibration.camera.extrinsics import (
     CameraExtrinsics,
@@ -16,27 +16,19 @@ from dexmani_real.config.experiment import (
 from dexmani_real.deployment.config import (
     validate_max_running_s,
     validate_num_episodes,
-    validate_policy_runtime_compatibility,
+    validate_policy_inputs,
 )
 from dexmani_real.deployment.observation import build_observation_camera, build_observation_kinematics
 from dexmani_real.deployment.operator import PolicyOperator
 from dexmani_real.deployment.runner import PolicyRunner
-from dexmani_real.ipc.channels import SensorChannelsConfig
-from dexmani_real.runtime.state import RuntimeState
+from dexmani_real.ipc.channels import SensorChannels
+from dexmani_real.runtime.state import RuntimeState, RunEndReason
 from dexmani_real.recording.recorder import AsyncEpisodeRecorder
 from dexmani_real.utils.episode_results import EpisodeResults, error_detail
 from dexmani_real.robot.action import ActionRealizer
-from dexmani_real.robot.arm_homing import build_home_planner
+from dexmani_real.robot.home import build_home_planner
 from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.processes import shutdown_local_runtime
-from dexmani_real.runtime.safety import (
-    request_emergency_stop,
-    RunEndReason,
-    SafetyState,
-    require_transition,
-    revoke_motion,
-)
-from dexmani_real.runtime.supervisor import RuntimeSupervisor
+from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.pointcloud_worker import PointCloudWorkerConfig, run_pointcloud_worker
 from dexmani_real.utils.log import configure_logging
@@ -45,12 +37,11 @@ from dexmani_real.utils.log import configure_logging
 logger = logging.getLogger(__name__)
 
 
-def _load_configured_policy(policy_config, execution_config):
-    info = policy_config.info
+def _load_configured_policy(saved_config, info, execution_config, *, device, seed):
     from dexmani_policy.deployment import load_policy
 
     loaded = load_policy(
-        policy_config.config, info, device=policy_config.device, seed=policy_config.seed
+        saved_config, info, device=device, seed=seed
     )
     try:
         loaded.configure_execution(
@@ -83,12 +74,14 @@ def _warmup_policy(model, runtime, execution_config):
 
 def run_policy_deployment(
     runtime,
-    policy_config,
+    saved_config,
+    info,
     *,
-    prefix=None,
+    device="cuda:0",
+    seed=0,
     max_running_s=None,
     num_episodes=20,
-    recording_config=None,
+    recording_dir=None,
     results_dir=None,
     camera_calibration_path=None,
     save_run_config=None,
@@ -97,8 +90,7 @@ def run_policy_deployment(
     configure_logging()
     from dexmani_real.deployment.inference import InferenceWorker
 
-    info = policy_config.info
-    cloud_recipe = validate_policy_runtime_compatibility(info, runtime)
+    cloud_recipe = validate_policy_inputs(info, runtime)
     max_running_s = validate_max_running_s(max_running_s)
     execution_config = runtime.execution.validate(info)
     validate_robot_config(runtime)
@@ -107,6 +99,8 @@ def run_policy_deployment(
         runtime = replace(runtime, pointcloud=cloud_recipe)
     runtime = resolve_runtime_table(runtime, pointcloud=cloud_recipe)
     num_episodes = validate_num_episodes(num_episodes)
+    if recording_dir is not None:
+        recording_dir = Path(recording_dir).expanduser().resolve()
     print(
         f"执行：{info.checkpoint_path.name} ({info.weights}) | NFE={info.inference_steps} | "
         f"A_exec={execution_config.action_steps} | {execution_config.execution_mode} | "
@@ -118,7 +112,7 @@ def run_policy_deployment(
         if results_dir is not None
         else None
     )
-    shared = supervisor = robot = model = operator = recorder = None
+    shared = sensors = robot = model = operator = recorder = None
     failure = None
     model_close = dict(status="completed", reason="model_not_created")
     clean = shutdown_clean = home_fault = False
@@ -128,14 +122,14 @@ def run_policy_deployment(
         # Parameters, cloud production and RGB-D recording share the camera worker.
         camera = bool(
             fields & {"point_cloud", "rgb", "camera_intrinsic", "camera_extrinsic"}
-        ) or recording_config is not None
+        ) or recording_dir is not None
         if camera:
             runtime.camera.validate()
         camera_calibration = (
             CameraExtrinsics(camera_calibration_path)
             if cloud or "camera_extrinsic" in fields
             else load_optional_camera_extrinsics(camera_calibration_path)
-            if recording_config is not None
+            if recording_dir is not None
             else None
         )
         pointcloud_config = (
@@ -148,21 +142,16 @@ def run_policy_deployment(
             else None
         )
         ctx = mp.get_context("spawn")
-        shared = RuntimeState.create(
-            prefix=prefix or f"dexmani_policy_{os.getpid()}",
-            mp_context=ctx,
-            config=SensorChannelsConfig.from_runtime(
-                runtime, camera=camera, pointcloud=cloud
-            ),
-        )
-        supervisor = (
-            RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
-            if shared.sensors is not None else None
-        )
+        shared = RuntimeState(SensorChannels(
+            ctx, camera=runtime.camera, pointcloud_num_points=runtime.pointcloud.num_points if cloud else None,
+        ) if camera else None)
+        sensors = SensorProcesses(shared) if camera else None
         robot = DexManiRobot(
-            shared, runtime, check_services=supervisor.check if supervisor else None
+            shared, runtime, check_services=sensors.check if sensors else None
         )
-        model = InferenceWorker(lambda: _load_configured_policy(policy_config, execution_config))
+        model = InferenceWorker(lambda: _load_configured_policy(
+            saved_config, info, execution_config, device=device, seed=seed,
+        ))
         _warmup_policy(model, runtime, execution_config)
         logger.debug(
             "Validated policy: inputs=%s action=%s dt=%s N/H/A_exec=%s/%s/%s mode=%s d=%s beta=%s recording=%s; "
@@ -176,7 +165,7 @@ def run_policy_deployment(
             execution_config.execution_mode,
             execution_config.prefetch_steps,
             execution_config.rtc_guidance_cap,
-            recording_config is not None,
+            recording_dir is not None,
         )
         kinematics = build_observation_kinematics(info, runtime)
         realizer = ActionRealizer.for_mode(runtime, info.action_mode)
@@ -185,51 +174,44 @@ def run_policy_deployment(
             save_run_config(runtime, execution_config)
         recorder = (
             AsyncEpisodeRecorder(
-                recording_config.data_dir,
+                recording_dir,
                 control_hz=1.0 / info.control_dt_s,
-                rgb_shape=(runtime.camera.height, runtime.camera.width, 3),
             )
-            if recording_config is not None
+            if recording_dir is not None
             else None
         )
         robot.connect()
-        sensors = []
         if camera:
-            sensors.append(
+            sensors.start(
                 ctx.Process(
                     name="camera", target=run_camera_worker, args=(shared.sensors, runtime.camera)
-                )
+                ),
+                ready=shared.sensors.camera_ready,
+                timeout_s=runtime.safety.readiness_timeouts_s["camera"],
             )
         if cloud:
-            sensors.append(
+            sensors.start(
                 ctx.Process(
                     name="pointcloud",
                     target=run_pointcloud_worker,
                     args=(shared.sensors, pointcloud_config),
-                )
+                ),
+                ready=shared.sensors.pointcloud_ready,
+                timeout_s=runtime.safety.readiness_timeouts_s["pointcloud"],
             )
-        if supervisor is not None:
-            supervisor.start(sensors)
         camera_parameters = build_observation_camera(
             shared.sensors, runtime.camera, fields, camera_calibration,
         )
-        require_transition(shared, SafetyState.ARMED)
+        shared.arm()
         operator = PolicyOperator(
             shared,
             runtime,
             home_planner,
             robot=robot,
-            idle_for_tactile_reset=lambda: (
-                runner.run_id is None
-                and runner.preparing_epoch is None
-                and not shared.start_request
-                and model.future is None
-                and (recorder is None or not recorder.is_recording)
-            ),
         )
         operator.keyboard.start()
         robot.check_services = lambda: (
-            (supervisor is None or supervisor.check()) and operator.keyboard.healthy
+            (sensors is None or sensors.check()) and operator.keyboard.healthy
         )
         runner = PolicyRunner(
             shared,
@@ -238,13 +220,11 @@ def run_policy_deployment(
             robot=robot,
             realizer=realizer,
             recorder=recorder,
-            poll_operator=operator.poll,
-            discard_pending_start=operator.discard_pending_start,
+            operator=operator,
             model_runtime=model,
             kinematics=kinematics,
             max_running_s=max_running_s,
             num_episodes=num_episodes,
-            task_label=recording_config.task_label if recording_config is not None else None,
             camera_calibration=camera_calibration,
             camera_parameters=camera_parameters,
             results=results,
@@ -262,7 +242,7 @@ def run_policy_deployment(
         )
     except KeyboardInterrupt as exc:
         if shared is not None:
-            request_emergency_stop(shared)
+            shared.request_emergency_stop()
         failure = exc
     except Exception as exc:
         failure = exc
@@ -270,12 +250,12 @@ def run_policy_deployment(
             shared.error_state = True
         logger.exception("policy session failed")
     finally:
-        # Cleanup shares one budget; native calls/threads can still outlive it.
+        # Sensor joins and model cleanup share the remaining budget; SDK/recorder calls may exceed it.
         shutdown_deadline = time.monotonic() + runtime.safety.shutdown_timeout_s
         cleanup_errors = []
         if shared is not None:
             try:
-                revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
+                shared.revoke_motion(reason=RunEndReason.RUNTIME_SHUTDOWN)
             except Exception as exc:
                 cleanup_errors.append(error_detail("revoke_motion", exc))
         if robot is not None and robot.stop_required:
@@ -296,8 +276,7 @@ def run_policy_deployment(
                     cleanup_errors.append(error_detail("recorder_close", exc))
             if shared is not None:
                 shutdown_clean = shutdown_local_runtime(
-                    robot, supervisor,
-                    shared=shared,
+                    shared, robot, sensors=sensors,
                     keyboard=operator.keyboard if operator else None,
                     timeout_s=max(0.0, shutdown_deadline - time.monotonic()),
                 )

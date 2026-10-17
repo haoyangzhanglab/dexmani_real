@@ -7,14 +7,11 @@ from typing import Any, cast
 
 import numpy as np
 
-from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.sensor.camera.geometry import (
     CameraIntrinsics,
     RGBDGeometry,
-    validate_aligned_depth_distortion,
 )
-from dexmani_real.sensor.pointcloud import build_point_cloud
 from dexmani_real.utils.geometry import validate_rigid_transform
 
 
@@ -48,10 +45,9 @@ def _color_intrinsics_from_meta(meta: Any) -> CameraIntrinsics:
 def load_raw_episode_camera_model(reader: EpisodeReader) -> RawEpisodeCameraModel:
     """Load the aligned color-grid camera model from Raw physical metadata."""
     meta = reader.meta
-    if str(meta.get("camera_payload_mode", "")) != "depth_to_color_aligned_rgbd":
+    if meta["camera_payload_mode"] != "depth_to_color_aligned_rgbd":
         raise ValueError("raw camera payload is not depth-to-color aligned RGB-D")
     color = _color_intrinsics_from_meta(meta)
-    validate_aligned_depth_distortion(color.distortion_model)
     geometry = RGBDGeometry(
         depth=color,
         color=color,
@@ -75,45 +71,3 @@ def load_raw_episode_base_from_color(reader: EpisodeReader) -> np.ndarray:
     )
     transform.setflags(write=False)
     return transform
-
-
-@dataclass(frozen=True)
-class RawEpisodePointCloudDeriver:
-    """Reconstruct point clouds with one raw episode's camera geometry."""
-
-    camera: RawEpisodeCameraModel
-    T_xarm_base_from_color: np.ndarray
-    pointcloud: PointCloudConfig
-    table_plane_abcd: tuple[float, float, float, float] | None
-
-    def __post_init__(self) -> None:
-        self.pointcloud.validate()
-        transform = validate_rigid_transform(
-            self.T_xarm_base_from_color, label="T_xarm_base_from_color"
-        )
-        transform.setflags(write=False)
-        object.__setattr__(self, "T_xarm_base_from_color", transform)
-        if not self.pointcloud.remove_table:
-            object.__setattr__(self, "table_plane_abcd", None)
-        elif self.table_plane_abcd is None:
-            raise ValueError("remove_table=True requires an explicit table_plane_abcd")
-        else:
-            plane = tuple(float(value) for value in self.table_plane_abcd)
-            if len(plane) != 4 or not np.isfinite(plane).all() or plane[2] <= 0:
-                raise ValueError("table plane must be finite with an upward normal")
-            norm = np.linalg.norm(plane[:3])
-            if norm <= 0.0 or plane[2] / norm <= 0.0:
-                raise ValueError("table plane must have an upward non-zero normal")
-            object.__setattr__(self, "table_plane_abcd", plane)
-
-    def derive(self, depth: np.ndarray, rgb: np.ndarray) -> np.ndarray | None:
-        """Derive ``float32[N,6]`` from same-row aligned depth/RGB arrays without modifying them."""
-        return build_point_cloud(
-            depth_raw=np.asarray(depth, dtype=np.uint16),
-            color=np.asarray(rgb, dtype=np.uint8),
-            depth_scale_m=self.camera.depth_scale_m,
-            geometry=self.camera.geometry,
-            T_xarm_base_from_color=self.T_xarm_base_from_color,
-            table_plane_abcd=self.table_plane_abcd,
-            config=self.pointcloud,
-        )

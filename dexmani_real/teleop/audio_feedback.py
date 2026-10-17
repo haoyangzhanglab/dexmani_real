@@ -1,4 +1,4 @@
-"""Play WAV prompts off the control thread; play() preempts queued prompts.
+"""Play WAV prompts off the control thread; play() preempts queued prompts by default.
 Unavailable players/failures disable audio; enabled sessions log and skip invalid events/files.
 """
 
@@ -46,10 +46,9 @@ class _AudioRequest:
 
 
 class AudioFeedback:
-    """Nonblocking voice player with preemptive play() and sequential queue()."""
+    """Nonblocking voice prompts; interrupt=False appends after existing playback."""
 
-    def __init__(self, audio_dir: str | None = None) -> None:
-        self._audio_dir = audio_dir or _AUDIO_DIR
+    def __init__(self) -> None:
         self._condition = threading.Condition()
         self._current_proc: subprocess.Popen | None = None
         self._active_request: _AudioRequest | None = None
@@ -72,14 +71,14 @@ class AudioFeedback:
         if filename is None:
             logger.warning("Unknown audio event: %s", event)
             return None
-        path = os.path.join(self._audio_dir, filename)
+        path = os.path.join(_AUDIO_DIR, filename)
         if not os.path.isfile(path):
             logger.warning("Audio file not found: %s", path)
             return None
         return path
 
-    def play(self, event: str) -> None:
-        """Preempt current/pending prompts with this event without blocking control."""
+    def play(self, event: str, *, interrupt: bool = True) -> None:
+        """Submit a prompt without waiting for playback or process creation."""
         with self._condition:
             if self._closed or self._disabled:
                 return
@@ -91,47 +90,25 @@ class AudioFeedback:
         with self._condition:
             if self._closed or self._disabled:
                 return
-            self._generation += 1
-            self._pending.clear()
-            self._terminate_current_locked()
+            if interrupt:
+                self._generation += 1
+                self._pending.clear()
+                self._terminate_current_locked()
             self._pending.append(_AudioRequest(path, self._generation))
-            logger.debug("Audio queued: event=%s mode=play", event)
+            logger.debug("Audio queued: event=%s interrupt=%s", event, interrupt)
             self._condition.notify_all()
 
-    def queue(self, event: str) -> None:
-        """Append after pending playback, starting immediately if idle."""
-        with self._condition:
-            if self._closed or self._disabled:
-                return
-        path = self._event_path(event)
-        if path is None:
-            return
-
-        with self._condition:
-            if self._closed or self._disabled:
-                return
-            self._pending.append(_AudioRequest(path, self._generation))
-            logger.debug("Audio queued: event=%s mode=queue", event)
-            self._condition.notify_all()
-
-    def wait_until_idle(self, timeout_s: float | None = None) -> bool:
-        if timeout_s is not None and timeout_s < 0:
-            raise ValueError("audio idle timeout must be non-negative")
-        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    def wait_until_idle(self, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
         with self._condition:
             while self._active_request is not None or self._pending:
-                if deadline is None:
-                    self._condition.wait()
-                    continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
                 self._condition.wait(timeout=remaining)
             return True
 
-    def close(self, timeout_s: float = 1.0) -> None:
-        if timeout_s < 0:
-            raise ValueError("audio close timeout must be non-negative")
+    def close(self) -> None:
         with self._condition:
             if self._closed:
                 return
@@ -140,10 +117,9 @@ class AudioFeedback:
             self._pending.clear()
             self._terminate_current_locked()
             self._condition.notify_all()
-        if self._worker is not threading.current_thread():
-            self._worker.join(timeout=timeout_s)
+        self._worker.join(timeout=1.0)
         if self._worker.is_alive():
-            logger.warning("Audio worker did not stop within %.2fs", timeout_s)
+            logger.warning("Audio worker did not stop within 1s")
 
     def _terminate_current_locked(self) -> None:
         """Request current playback termination while holding ``_condition``."""
@@ -197,7 +173,8 @@ class AudioFeedback:
             with self._condition:
                 cancelled = request.generation != self._generation or self._closed
             if not cancelled and proc.returncode:
-                raise RuntimeError(f"{player} exited {proc.returncode}: {_stderr_text(stderr)}")
+                detail = " ".join(stderr.decode("utf-8", errors="replace").split())[:_STDERR_LOG_LIMIT]
+                raise RuntimeError(f"{player} exited {proc.returncode}: {detail}")
         except BaseException:
             if proc is not None:
                 try:
@@ -214,10 +191,3 @@ class AudioFeedback:
                 if self._current_proc is proc:
                     self._current_proc = None
                 self._condition.notify_all()
-
-
-def _stderr_text(stderr: bytes | str | None) -> str:
-    if stderr is None:
-        return ""
-    text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr)
-    return " ".join(text.strip().split())[:_STDERR_LOG_LIMIT]

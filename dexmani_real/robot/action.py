@@ -12,7 +12,7 @@ from dexmani_real.planning.kinematics.ik import (
     joint_target_rejection,
     make_online_ik_config,
 )
-from dexmani_real.robot.projection import project_arm_command, project_hand_command
+from dexmani_real.planning.paths import wrap_nearest_equivalent
 
 
 @dataclass(frozen=True)
@@ -54,12 +54,10 @@ class ActionRealizer:
         if not np.isfinite(margin) or margin < 0:
             raise ValueError("shared final EEF workspace margin must be finite and nonnegative")
         # Online manipulation permits table contact; HOME checks table paths with a separate planner.
-        runtime.environment.validate()
-        environment = dict(static_boxes=runtime.environment.static_boxes)
         planner = (
-            XArm7MotionPlanner.create_default(
-                online_ik_profile=make_online_ik_config(runtime),
-                **environment,
+            XArm7MotionPlanner(
+                online_ik_config=make_online_ik_config(runtime),
+                static_boxes=runtime.environment.static_boxes,
             )
             if mode == "eef"
             else None
@@ -68,7 +66,7 @@ class ActionRealizer:
         if mode == "joint":
             from dexmani_real.planning.collision import CollisionModel
 
-            collision = CollisionModel(**environment)
+            collision = CollisionModel(static_boxes=runtime.environment.static_boxes)
         return cls(runtime, planner, collision)
 
     def _joint_rejection(self, target, hand, current, previous):
@@ -196,3 +194,17 @@ class ActionRealizer:
         if not np.array_equal(projected, command.arm_qpos):
             return "frozen_equivalent_branch_changed"
         return self._joint_rejection(command.arm_qpos, command.hand_qpos, current, previous)
+
+
+def project_arm_command(target_arm_qpos, reference_arm_qpos, *, joint_lower_rad, joint_upper_rad):
+    equivalent = wrap_nearest_equivalent(
+        target_arm_qpos, reference_arm_qpos, joint_lower_rad, joint_upper_rad
+    )
+    return np.clip(equivalent, joint_lower_rad, joint_upper_rad)
+
+
+def project_hand_command(target_hand_qpos, *, qpos_min_rad, qpos_max_rad):
+    target = np.asarray(target_hand_qpos, dtype=np.float64)
+    if target.shape != (12,) or not np.isfinite(target).all():
+        raise ValueError("hand preparation requires a finite (12,) target")
+    return np.clip(target, qpos_min_rad, qpos_max_rad)

@@ -15,7 +15,7 @@ from .pose import Pose, compute_pose_error
 
 if TYPE_CHECKING:
     from .arm_fk import XArm7Kinematics
-    from .ik_geometry import IKGeometry
+    from ..collision import CollisionModel
 
 logger = logging.getLogger(__name__)
 
@@ -120,13 +120,13 @@ class OnlineIKSolver:
     def __init__(
         self,
         kin: XArm7Kinematics,
-        ik_geometry: IKGeometry,
+        collision_model: CollisionModel,
         online_ik_profile: OnlineIKConfig,
     ) -> None:
-        self.kin, self.ik_geometry, self.profile = kin, ik_geometry, online_ik_profile
+        self.kin, self.collision_model, self.profile = kin, collision_model, online_ik_profile
         self._failure_start: float | None = None
         self._failure_warned = False
-        model = np.asarray(ik_geometry.joint_limits, dtype=np.float64)
+        model = kin.joint_limits
         if kin.dof != 7 or model.shape != (7, 2) or not np.isfinite(model).all():
             raise ValueError("online IK requires finite (7, 2) model limits")
         if np.any(model[:, 0] >= model[:, 1]):
@@ -148,15 +148,17 @@ class OnlineIKSolver:
             ):
                 raise ValueError("runtime operational limits exceed the loaded model/URDF limits")
             self.operational_limits = np.column_stack((lower, upper))
-        self._jump_limit = np.deg2rad(
-            ik_geometry.profile_array(online_ik_profile.max_ik_jump_deg, "max_ik_jump_deg")
-        )
-        self._weights = ik_geometry.profile_array(online_ik_profile.joint_weights, "joint_weights")
-        self._previous_weights = ik_geometry.profile_array(
+        self._jump_limit = np.deg2rad(self._finite_q(online_ik_profile.max_ik_jump_deg))
+        self._weights = self._finite_q(online_ik_profile.joint_weights)
+        self._previous_weights = self._finite_q(
             online_ik_profile.previous_command_joint_weights
             if online_ik_profile.previous_command_joint_weights is not None
             else online_ik_profile.joint_weights,
-            "previous_command_joint_weights",
+        )
+        self._joint_ranges = np.maximum(model[:, 1] - model[:, 0], 1e-6)
+        self._limit_center = 0.5 * (self.operational_limits[:, 0] + self.operational_limits[:, 1])
+        self._limit_radius = np.maximum(
+            0.5 * (self.operational_limits[:, 1] - self.operational_limits[:, 0]), 1e-6
         )
         positive = (
             online_ik_profile.max_pose_error_pos_m,
@@ -175,10 +177,7 @@ class OnlineIKSolver:
         if (
             any(not np.isfinite(v) or v <= 0 for v in positive)
             or any(not np.isfinite(v) or v < 0 for v in nonnegative)
-            or any(
-                not np.isfinite(a).all() or np.any(a < 0)
-                for a in (self._jump_limit, self._weights, self._previous_weights)
-            )
+            or any(np.any(a < 0) for a in (self._jump_limit, self._weights, self._previous_weights))
         ):
             raise ValueError("online IK tolerances, radii and weights must be finite and valid")
 
@@ -219,7 +218,6 @@ class OnlineIKSolver:
             RuntimeError,
             TypeError,
             FloatingPointError,
-            np.linalg.LinAlgError,
         ) as exc:
             # Model/numerical contract failures must not masquerade as local solver rejection.
             result = IKResult(
@@ -318,7 +316,7 @@ class OnlineIKSolver:
         return None, converged, "self_collision" if pool else rejection
 
     def _try_clik(self, name, seed, target_base, target, current, previous, pool):
-        model = self.ik_geometry.mp_planner
+        model = self.kin.mp_planner
         raw, converged, _ = model.pinocchio_model.compute_IK_CLIK(
             model.link_name_2_idx[model.move_group],
             target_base,
@@ -341,7 +339,7 @@ class OnlineIKSolver:
 
     def _prepare_candidate(self, raw, source, target, current, previous, pool):
         # Mechanical equivalence survives narrowing the operational interval below 2*pi.
-        q = self.ik_geometry.canonicalize_qpos(raw, current, self.operational_limits)
+        q = self.kin.canonicalize_qpos(raw, current, self.operational_limits)
         lo, hi = self.operational_limits.T
         if not np.isfinite(q).all():
             raise ValueError("canonical IK output is non-finite")
@@ -352,8 +350,8 @@ class OnlineIKSolver:
         rejection = self.dynamic_rejection(q, current, previous)
         if rejection is not None:
             return None, rejection
-        delta_prev = self.ik_geometry.compute_qpos_delta(q, previous)
-        delta = self.ik_geometry.compute_qpos_delta(q, current)
+        delta_prev = self.kin.compute_qpos_delta(q, previous)
+        delta = self.kin.compute_qpos_delta(q, current)
         distance = float(np.max(np.abs(delta)))
         pos_err, rot_err = compute_pose_error(target, self.kin.compute_eef_pose_world(q))
         if not np.isfinite((pos_err, rot_err)).all():
@@ -362,13 +360,11 @@ class OnlineIKSolver:
         if pos_err > p.max_pose_error_pos_m or rot_err > p.max_pose_error_rot_rad:
             return None, "pose_error"
         score = (
-            self.ik_geometry.weighted_joint_distance(q, current, self._weights, delta=delta)
+            self._weighted_joint_distance(delta, self._weights)
             + p.previous_command_distance_weight
-            * self.ik_geometry.weighted_joint_distance(
-                q, previous, self._previous_weights, delta=delta_prev
-            )
+            * self._weighted_joint_distance(delta_prev, self._previous_weights)
             + p.joint_limit_penalty_weight
-            * self.ik_geometry.joint_limit_penalty(q, self.operational_limits)
+            * self._joint_limit_penalty(q)
             + p.pose_accuracy_weight
             * (
                 pos_err / p.max_pose_error_pos_m
@@ -388,9 +384,16 @@ class OnlineIKSolver:
             score=score,
         ), ""
 
+    def _weighted_joint_distance(self, delta, weights):
+        """LeFranX ranking: weighted squared joint deltas normalized by model ranges."""
+        return float(np.sqrt(np.sum(weights * (delta / self._joint_ranges) ** 2)))
+
+    def _joint_limit_penalty(self, qpos):
+        return float(np.sum(((qpos - self._limit_center) / self._limit_radius) ** 2))
+
     def _collision_free(self, candidate):
         if candidate.collision_free is None:
-            candidate.collision_free = not self.ik_geometry.has_self_collision(candidate.qpos)
+            candidate.collision_free = not self.collision_model.check_self_collision(candidate.qpos)
         return candidate.collision_free
 
     def _select_collision_free(self, candidates):
@@ -444,5 +447,5 @@ class OnlineIKSolver:
                 continue
             if not any(np.array_equal(seed, old) for old in seeds):
                 seeds.append(seed)
-        seeds.sort(key=lambda q: self.ik_geometry.joint_limit_penalty(q, self.operational_limits))
+        seeds.sort(key=lambda q: self._joint_limit_penalty(q))
         return list(zip(("null_preferred", "null_opposite"), seeds))

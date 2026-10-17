@@ -35,19 +35,19 @@ def hand_feedback_time_ns(hand):
 
 
 def read_vr_frame(shared):
-    result = shared.sensors.vr_ring.read_latest()
+    result = shared.sensors.vr_ring.read_latest(use_last_good=True)
     if result is None:
         return None
     record = result[0][0]
     return {
-        **{name: record[name].copy() for name in record.dtype.names},
+        **{name: record[name] for name in record.dtype.names},
         "ring_sequence": result[2],
     }
 
 
 def read_camera_frame(shared, sequence=None):
     ring = shared.sensors.camera_ring
-    result = ring.read_latest_uncached() if sequence is None else ring.read_sequence(sequence)
+    result = ring.read_latest() if sequence is None else ring.read_sequence(sequence)
     if result is None:
         return None
     data, publication_ns, sequence = result
@@ -108,7 +108,7 @@ def read_observation(
         if wait_for_hand else robot.read_state()
     )
     arm, hand = state.arm, state.hand if require_hand else None
-    cloud_result = shared.sensors.pointcloud_ring.read_latest() if require_pointcloud else None
+    cloud_result = shared.sensors.pointcloud_ring.read_latest(use_last_good=True) if require_pointcloud else None
     if (
         (require_hand and hand is None)
         or (require_pointcloud and cloud_result is None)

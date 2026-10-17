@@ -10,7 +10,6 @@ import numpy as np
 from dexmani_real.robot.arm_executor import _MAX_TIME, _STATUS_DTYPE
 from dexmani_real.robot.arm_reference import ArmReference
 from dexmani_real.robot.commands import DispatchStatus
-from dexmani_real.recording.storage.servo import ServoEvent, ServoEvidence
 from dexmani_real.utils.control_clock import next_tick_ns
 
 
@@ -19,8 +18,9 @@ class _ArmWorker:
         self.cfg, self.io, self.pipe, self.driver = cfg, io, pipe, driver
         self.clock = clock_ns
         self.status = np.zeros((), dtype=_STATUS_DTYPE)
-        self.active = self.reference = self.evidence = None
-        self.capture_id = self.point_sequence = self.last_send_ns = 0
+        self.active = self.reference = None
+        self.first_accepted = False
+        self.last_send_ns = 0
 
     def authorized(self, run_id, *, preparing=False):
         expected = -run_id if preparing else run_id
@@ -28,21 +28,9 @@ class _ArmWorker:
                 and not self.io.closing.is_set() and not self.io.stop.is_set()
                 and not self.io.emergency.is_set())
 
-    def emit(self, kind, goal=None, **fields):
-        if self.evidence is not None:
-            if goal is not None:
-                if goal['capture_id'] != self.capture_id:
-                    return
-                fields.update(run_id=goal['run_id'], command_seq=goal['sequence'])
-            self.evidence.emit(kind, self.clock(), **fields)
-
     def fault(self, reason):
         if not self.io.fault.value:
             self.io.fault.value = str(reason).encode()[:1023]
-            try:
-                self.emit(ServoEvent.FAULT, self.active, reason=reason)
-            except Exception as exc:
-                self.evidence.fail(exc)
         self.io.authority.value = 0
         self.io.stop.set()
 
@@ -64,15 +52,14 @@ class _ArmWorker:
             # Host query start is conservative; never replace this with cache-read time.
             self.status['frame']['timestamp_ns'] = started
             self.status['valid'] = True
-            self.status['state'], self.status['error_code'] = status.state, status.error_code
-            self.status['query_completed_ns'] = completed
+            self.status['state'] = status.state
         except Exception:
             self.status['valid'] = False
             raise
         finally:
             self.io.publish(self.status)
 
-    def stationary_reference(self, check_abort):
+    def wait_stationary(self, check_abort):
         deadline = self.clock() + int(self.cfg.homing.convergence_timeout_s * 1e9)
         stable = anchor = None
         while self.clock() < deadline:
@@ -85,31 +72,31 @@ class _ArmWorker:
                     stable, anchor = None, q.copy()
                 stable = now if stable is None else stable
                 if now - stable >= int(self.cfg.homing.dwell_s * 1e9):
-                    return ArmReference(self.cfg, q, v, now)
+                    # Validate braking extrema before enabling motion. The streaming
+                    # reference is seeded from fresh feedback when its first goal arrives.
+                    ArmReference(self.cfg, q, v, now)
+                    return
             else:
                 stable = anchor = None
             self.io.stop.wait(1 / self.cfg.feedback_hz)
         raise TimeoutError('fresh measured arm standstill not confirmed')
 
-    def end_active(self, reason):
+    def end_active(self):
         if self.active is not None:
-            goal, self.active = self.active, None
-            self.emit(ServoEvent.END, goal, reason=reason)
+            if not self.first_accepted:
+                self.status['cancelled_before_first'] += 1
+            self.active = None
+            self.status['active_sequence'] = 0
 
-    def cancel_goal(self, goal, reason):
+    def cancel_goal(self, goal):
         if goal is not None:
-            self.emit(ServoEvent.CANCEL, goal, status=DispatchStatus.NOT_CALLED,
-                      q_goal=goal['q_goal'], reason=reason)
+            self.status['cancelled_before_first'] += 1
 
     def stop(self):
         self.status['prepared_run_id'] = 0
         self.reference = None
-        try:
-            self.end_active('fault' if self.io.fault.value else 'revoked')
-            self.cancel_goal(self.io.take_goal(), 'revoked_before_sdk')
-        except Exception as exc:
-            if self.evidence is not None:
-                self.evidence.fail(exc)
+        self.end_active()
+        self.cancel_goal(self.io.take_goal(block=True))
         try:
             if self.io.emergency.is_set():
                 self.driver.emergency_stop()
@@ -120,8 +107,8 @@ class _ArmWorker:
             self.fault(exc)
         finally:
             self.io.stop.clear()
-            self.io.stopped.set()  # SDK request processed; physical standstill is separate.
             self.io.publish(self.status)
+            self.io.stopped.set()  # Publish terminal counts before acknowledging the SDK stop request.
 
     def operation(self, message):
         identity, kind, payload = message
@@ -140,36 +127,19 @@ class _ArmWorker:
                 check_abort()
                 if self.active is not None:
                     raise RuntimeError('prepare/HOME requires stopped streaming')
-                self.cancel_goal(self.io.take_goal(), 'lifecycle_boundary')
+                self.cancel_goal(self.io.take_goal(block=True))
                 self.status['prepared_run_id'] = 0
                 self.io.stopped.clear()
-                self.reference = self.stationary_reference(check_abort)
+                self.wait_stationary(check_abort)
                 if kind == 'home':
-                    def abort_reason():
-                        check_abort()
-                        return None
-                    self.driver.home(payload[0], payload[1], abort_check=abort_reason)
+                    self.driver.home(payload[0], payload[1], check_abort=check_abort)
                 else:
                     self.driver.enter_mode1(check_abort=check_abort)
-                self.reference = self.stationary_reference(check_abort)
+                self.wait_stationary(check_abort)
                 check_abort()
                 self.last_send_ns = 0
                 self.io.execution_limit[:] = (_MAX_TIME, 0)
                 self.status['prepared_run_id'] = epoch + 1
-            elif kind == 'attach':
-                if self.evidence is not None or self.active is not None:
-                    raise RuntimeError('capture start requires quiescent arm')
-                self.capture_id = payload
-                self.evidence = ServoEvidence(self.cfg.servo_event_capacity, {},
-                                              queue=self.io.events, failure=self.io.evidence_failed)
-                self.emit(ServoEvent.BEGIN)
-            elif kind == 'detach':
-                if self.capture_id != payload or self.evidence is None or self.active is not None:
-                    raise RuntimeError('capture end requires revoked, quiescent arm')
-                self.cancel_goal(self.io.take_goal(), 'capture_end_before_sdk')
-                self.emit(ServoEvent.FINISH)
-                self.evidence = None
-                self.capture_id = 0
             else:
                 raise RuntimeError(f'unknown arm operation {kind}')
         except BaseException as exc:
@@ -179,8 +149,7 @@ class _ArmWorker:
                 if not isinstance(exc, HomeAborted):
                     self.fault(exc)
         # Lifecycle replies include publication; never hold this lock over SDK I/O.
-        with self.io.status_lock:
-            np.frombuffer(self.io.status, dtype=_STATUS_DTYPE, count=1)[0] = self.status
+        self.io.publish(self.status)
         self.pipe.send((identity, error))
 
     def command_issue(self, goal, now, *, first=False):
@@ -208,28 +177,30 @@ class _ArmWorker:
         if self.active is None and pending is None:
             return
         now = self.clock()
-        self.status['stats'][1] = max(self.status['stats'][1], now - planned_ns)
-        if self.evidence is not None and self.io.evidence_failed.is_set():
-            raise RuntimeError('servo evidence writer/buffer failed')
+        self.status['stats'][0] = max(self.status['stats'][0], now - planned_ns)
         goal = pending if pending is not None else self.active
         issue = self.command_issue(goal, now, first=pending is not None)
         if issue:
-            self.cancel_goal(pending, issue)
+            self.cancel_goal(pending)
             if issue != 'revoked':
                 raise RuntimeError(issue)
             self.io.stop.set()
             return
         if pending is not None:
-            if self.active is None:
-                q, v = self.status['frame']['qpos'], self.status['frame']['qvel']
-                if np.max(np.abs(v)) > self.cfg.homing.velocity_convergence_rad_s:
-                    raise RuntimeError('arm moved after standstill preparation')
-                self.reference = ArmReference(self.cfg, q, v, now)
-            self.reference.replace(pending['q_goal'], now)
-            self.end_active('superseded')
+            try:
+                if self.active is None:
+                    q, v = self.status['frame']['qpos'], self.status['frame']['qvel']
+                    if np.max(np.abs(v)) > self.cfg.homing.velocity_convergence_rad_s:
+                        raise RuntimeError('arm moved after standstill preparation')
+                    self.reference = ArmReference(self.cfg, q, v, now)
+                self.reference.replace(pending['q_goal'], now)
+            except Exception:
+                self.cancel_goal(pending)
+                raise
+            self.end_active()
             self.active = pending
-            self.emit(ServoEvent.ACTIVATE, pending, q_goal=pending['q_goal'], sampled_ns=now,
-                      submit_until_ns=pending['submit_until_ns'], execute_until_ns=pending['execute_until_ns'])
+            self.first_accepted = False
+            self.status['active_sequence'] = pending['sequence']
         q, _, _ = self.reference.sample(now)
         started = self.clock()
         issue = self.command_issue(goal, started, first=pending is not None)
@@ -244,10 +215,10 @@ class _ArmWorker:
             raise RuntimeError('tracking_error')
         point = self.status['point']
         point['run_id'], point['command_seq'] = goal['run_id'], goal['sequence']
-        point['point_seq'] = self.point_sequence + 1
         point['planned_ns'], point['sampled_ns'], point['started_ns'] = planned_ns, now, started
         point['completed_ns'], point['status'], point['code'] = 0, DispatchStatus.UNKNOWN, -999
         point['q_ref'] = q
+        self.status['sdk_attempted'] += 1
         self.io.publish(self.status)
         # Publication never authorizes a call: revocation can race the copy.
         started = self.clock()
@@ -258,6 +229,8 @@ class _ArmWorker:
         if issue is None and started - now >= int(self.cfg.servo_max_interval_s * 1e9):
             issue = 'servo dispatch stalled before SDK'
         if issue:
+            # The pre-call fence prevented this attempt from reaching the SDK.
+            self.status['sdk_attempted'] -= 1
             point['status'], point['completed_ns'] = DispatchStatus.NOT_CALLED, self.clock()
             self.io.publish(self.status)
             if issue != 'revoked':
@@ -281,15 +254,16 @@ class _ArmWorker:
             error = str(exc)
         completed = self.clock()
         self.last_send_ns = started
-        self.point_sequence += 1
-        self.status['stats'][0] += 1
-        self.status['stats'][2] = max(self.status['stats'][2], completed - started)
-        self.status['stats'][3] = max(self.status['stats'][3], interval)
+        self.status['sdk_completed'] += 1
+        if result == DispatchStatus.ACCEPTED:
+            self.status['sdk_accepted'] += 1
+            if not self.first_accepted:
+                self.first_accepted = True
+                self.status['first_accepted'] += 1
+        self.status['stats'][1] = max(self.status['stats'][1], completed - started)
+        self.status['stats'][2] = max(self.status['stats'][2], interval)
         point['completed_ns'], point['status'], point['code'] = completed, result, -999 if code is None else code
         self.io.publish(self.status)
-        self.emit(ServoEvent.POINT, goal, point_seq=self.point_sequence,
-                  planned_ns=planned_ns, sampled_ns=now, started_ns=started, completed_ns=completed,
-                  status=result, code=point['code'], q_ref=q, reason=error)
         if result != DispatchStatus.ACCEPTED:
             raise RuntimeError(error or f'servo SDK status={result.name} code={code}')
         if completed - started >= int(self.cfg.servo_max_interval_s * 1e9):
@@ -305,7 +279,7 @@ class _ArmWorker:
                 if not self.authorized(epoch, preparing=True):
                     raise RuntimeError('arm startup authority revoked')
 
-            self.stationary_reference(startup_abort)
+            self.wait_stationary(startup_abort)
             self.driver.initialize(check_abort=startup_abort)
             self.read_feedback()
             self.io.ready.set()
@@ -349,13 +323,7 @@ class _ArmWorker:
             except Exception as exc:
                 self.io.close_error.value = f'disconnect failure: {exc}'.encode()[:1023]
             self.io.connected.clear()
-            if self.evidence is not None:
-                self.evidence.fail('arm exited before capture finalization')
             self.pipe.close()
-            # If capture finalization failed, retain staging instead of deadlocking
-            # process exit on an abandoned pipe. A completed stream was drained first.
-            self.io.events.cancel_join_thread()
-            self.io.events.close()
 
 
 def run_arm(cfg, io, pipe, driver_factory=None):

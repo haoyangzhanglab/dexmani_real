@@ -24,16 +24,16 @@ from dexmani_real.config.experiment import load_experiment_config, resolve_table
 from dexmani_real.config.hardware import HandParams
 from dexmani_real.config.pointcloud import PointCloudConfig
 from dexmani_real.dataset.pointcloud import (
-    RawEpisodePointCloudDeriver,
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
 )
-from dexmani_real.ipc.schema import validate_point_cloud_array
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
-from dexmani_real.recording import EpisodeReader
+from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE, XHAND_RIGHT_URDF_PATH
+from dexmani_real.sensor.camera.geometry import validate_aligned_depth_distortion
+from dexmani_real.sensor.pointcloud import build_point_cloud
 
 
 logger = logging.getLogger("dexmani_real.cli.visualize_episode")
@@ -87,7 +87,7 @@ def print_episode_info(episode_path: str) -> None:
         print(f"Control/depth rows: {reader.num_frames}")
         print(
             "Time:",
-            f"relative seconds ({reader.meta.get('timestamp_source', 'unspecified')})",
+            f"relative seconds ({reader.meta['timestamp_source']})",
         )
         print()
 
@@ -162,19 +162,16 @@ class EpisodeVisualizer:
                 logger.warning("No camera extrinsics: displaying pixels without point cloud")
             self._handbase_position_eef_m = np.asarray(handbase_position_eef_m, dtype=np.float64)
             self._handbase_quat_eef_wxyz = np.asarray(handbase_quat_eef_wxyz, dtype=np.float64)
-            self._pointcloud_deriver: RawEpisodePointCloudDeriver | None = None
+            self._pointcloud_config = None
+            self._table_plane_abcd = table_plane_abcd
             self._empty_pointcloud_frames = 0
             self._pointcloud_processing_ns = 0
             self._pointcloud_processed_frames = 0
             if point_cloud and self._T_xarm_base_from_color is not None:
                 if pointcloud_config is None:
                     raise ValueError("point-cloud visualization requires resolved config")
-                self._pointcloud_deriver = RawEpisodePointCloudDeriver(
-                    camera=self._camera_model,
-                    T_xarm_base_from_color=self._T_xarm_base_from_color,
-                    pointcloud=pointcloud_config,
-                    table_plane_abcd=table_plane_abcd,
-                )
+                validate_aligned_depth_distortion(self._camera_model.geometry.color.distortion_model)
+                self._pointcloud_config = pointcloud_config
                 logger.info(
                     "Canonical point cloud enabled: N=%d table=%s",
                     pointcloud_config.num_points,
@@ -301,12 +298,9 @@ class EpisodeVisualizer:
 
     def log_step(self, step_idx: int) -> None:
         rr.set_time_sequence("step", step_idx)
-        rr.set_time_seconds(
-            "nominal_time" if self._reader.meta.get("timestamp_source") == "nominal_fps" else "time",
-            float(self._reader["timestamp"][step_idx]),
-        )
+        rr.set_time_seconds("time", float(self._reader["timestamp"][step_idx]))
         depth = self._log_camera(step_idx)
-        self._log_pointcloud(step_idx, depth)
+        self._log_pointcloud(depth)
         self._log_fingertips(step_idx)
         self._log_eef(step_idx)
         self._log_time_series(step_idx)
@@ -330,22 +324,22 @@ class EpisodeVisualizer:
         )
         return depth
 
-    def _log_pointcloud(self, step_idx: int, depth: np.ndarray) -> None:
-        if self._pointcloud_deriver is None:
+    def _log_pointcloud(self, depth: np.ndarray) -> None:
+        if self._pointcloud_config is None:
             return
         started_ns = time.perf_counter_ns()
-        cloud = self._pointcloud_deriver.derive(depth, self._rgb)
+        cloud = build_point_cloud(
+            depth_raw=depth, color=self._rgb,
+            depth_scale_m=self._camera_model.depth_scale_m, geometry=self._camera_model.geometry,
+            T_xarm_base_from_color=self._T_xarm_base_from_color,
+            table_plane_abcd=self._table_plane_abcd, config=self._pointcloud_config,
+        )
         self._pointcloud_processing_ns += time.perf_counter_ns() - started_ns
         self._pointcloud_processed_frames += 1
         if cloud is None:
             self._empty_pointcloud_frames += 1
             rr.log("pcd", rr.Clear(recursive=False))
             return
-        cloud = validate_point_cloud_array(
-            cloud,
-            num_points=self._pointcloud_deriver.pointcloud.num_points,
-            label=f"point_cloud[{step_idx}]",
-        )
         colors = (cloud[:, 3:] * 255.0).astype(np.uint8)
         rr.log(
             "pcd",

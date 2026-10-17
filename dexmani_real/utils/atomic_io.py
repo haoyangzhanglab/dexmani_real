@@ -51,7 +51,6 @@ def atomic_json_dump(
     obj: object,
     path: str | Path,
     *,
-    indent: int = 2,
     ensure_ascii: bool = True,
     cancelled=None,
     overwrite: bool = True,
@@ -63,7 +62,7 @@ def atomic_json_dump(
     fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.tmp-", dir=str(parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(obj, stream, indent=indent, ensure_ascii=ensure_ascii)
+            json.dump(obj, stream, indent=2, ensure_ascii=ensure_ascii)
         # Cancellation after this check cannot promise rollback of a published replacement.
         if cancelled is not None and cancelled():
             raise CancelledError("JSON publication cancelled")

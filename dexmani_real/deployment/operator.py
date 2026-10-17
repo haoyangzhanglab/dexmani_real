@@ -5,18 +5,10 @@ import logging
 from concurrent.futures import CancelledError
 
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.runtime.state import RuntimeState
+from dexmani_real.runtime.state import RuntimeState, RunEndReason, SafetyState
 from dexmani_real.planning import XArm7MotionPlanner
-from dexmani_real.robot.arm_homing import home_robot
+from dexmani_real.robot.home import home_robot
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
-from dexmani_real.runtime.safety import (
-    request_emergency_stop,
-    RunEndReason,
-    SafetyState,
-    StopRequest,
-    request_policy_start,
-    request_policy_stop,
-)
 
 
 logger = logging.getLogger(__name__)
@@ -32,41 +24,53 @@ class PolicyOperator:
         planner: XArm7MotionPlanner,
         *,
         robot,
-        idle_for_tactile_reset=None,
     ):
-        self.idle_for_tactile_reset = idle_for_tactile_reset
         self.home_results = []
         self.shared = shared
         self.robot = robot
         self.runtime = runtime
         self.planner = planner
         self.keyboard = KeyboardInput(
-            estop_callback=lambda: request_emergency_stop(shared),
+            estop_callback=shared.request_emergency_stop,
             stop_callback=self._request_stop,
             quit_callback=self._request_quit,
         )
 
-    def _request_stop(self) -> None:
+    def _request_start(self) -> bool:
+        with self.shared.motion_lock:
+            if not self.shared.command_may_cross_sdk(
+                run_id=self.shared.run_id, required_safety_state=SafetyState.ARMED,
+            ):
+                return False
+            self.shared.start_request = True
+            return True
+
+    def _request_stop(self, *, reason=RunEndReason.OPERATOR) -> None:
         """Fence motion even while the I/O owner is blocked in HOME, inference or SDK I/O."""
-        if not request_policy_stop(self.shared):
-            self.shared.error_state = True
+        with self.shared.motion_lock:
+            self.shared.start_request = False
+            self.shared.stop_request = True
+            if self.shared.safety_state in (SafetyState.ARMED, SafetyState.RUNNING):
+                self.shared.revoke_motion(reason=reason)
 
     def _request_quit(self) -> None:
         """Apply Q's motion fence before requesting session shutdown."""
-        if not request_policy_stop(self.shared, reason=RunEndReason.QUIT):
-            self.shared.error_state = True
-        self.shared.quit_requested = True
+        with self.shared.motion_lock:
+            self._request_stop(reason=RunEndReason.QUIT)
+            self.shared.quit_requested = True
 
-    def poll(self) -> None:
+    def poll(self, *, allow_tactile_reset: bool = False) -> None:
         if self.keyboard.estop_latched or not self.keyboard.healthy:
-            request_emergency_stop(self.shared)
+            self.shared.request_emergency_stop()
             return
-        self._handle_command_batch(self.keyboard.poll(timeout=0))
+        self._handle_command_batch(
+            self.keyboard.poll(timeout=0), allow_tactile_reset=allow_tactile_reset,
+        )
 
     def discard_pending_start(self):
         self.keyboard.drain_signal(OperatorCommand.BEGIN)
 
-    def _handle_command_batch(self, signals) -> None:
+    def _handle_command_batch(self, signals, *, allow_tactile_reset=False) -> None:
         # HOME blocks; H/B/T from the same batch need a fresh request afterwards.
         discard_preparation_in_batch = False
         home_handled_in_batch = False
@@ -79,7 +83,7 @@ class PolicyOperator:
                 if stop_in_batch:
                     logger.warning("operator: ignored B received in the same batch as S/Q")
                     continue
-                if discard_preparation_in_batch or not request_policy_start(self.shared):
+                if discard_preparation_in_batch or not self._request_start():
                     logger.warning(
                         "operator: ignored B while stopped or after preparation in this batch"
                     )
@@ -96,12 +100,13 @@ class PolicyOperator:
                     logger.warning("operator: ignored T after preparation in the same batch")
                     continue
                 discard_preparation_in_batch = True
-                if stop_in_batch or self.idle_for_tactile_reset is None or not self.idle_for_tactile_reset():
+                # B earlier in this batch may have created a pending start.
+                if stop_in_batch or self.shared.start_request or not allow_tactile_reset:
                     logger.warning(
                         "T ignored: tactile reset requires idle, no capture/reset/pending inference"
                     )
                     continue
-                if int(self.shared.safety_state) != int(SafetyState.ARMED):
+                if self.shared.safety_state != SafetyState.ARMED:
                     continue
                 try:
                     logger.info("正在请求触觉传感器复位，请保持手部无接触；S/Q/Esc 可中断后续请求。")
@@ -129,18 +134,13 @@ class PolicyOperator:
                 # Listener stays available through final recording cleanup.
                 continue
             elif signal is OperatorCommand.EMERGENCY_STOP:
-                request_emergency_stop(self.shared)
+                self.shared.request_emergency_stop()
                 return
 
     def _run_home(self) -> bool:
         with self.shared.motion_lock:
-            home_allowed = (
-                self.shared.running
-                and not self.shared.quit_requested
-                and not self.shared.error_state
-                and not self.shared.estop_request
-                and int(self.shared.stop_request) == int(StopRequest.NONE)
-                and int(self.shared.safety_state) == int(SafetyState.ARMED)
+            home_allowed = self.shared.command_may_cross_sdk(
+                run_id=self.shared.run_id, required_safety_state=SafetyState.ARMED,
             )
             if home_allowed:
                 # Only the owner consumes S; HOME never clears a newer stop.
@@ -163,14 +163,8 @@ class PolicyOperator:
             home_result.update(outcome="fault", reason=f"{type(exc).__name__}: {exc}")
             raise
         with self.shared.motion_lock:
-            completed_without_stop = bool(
-                result.ok
-                and self.shared.running
-                and not self.shared.quit_requested
-                and not self.shared.error_state
-                and not self.shared.estop_request
-                and int(self.shared.stop_request) == int(StopRequest.NONE)
-                and int(self.shared.safety_state) == int(SafetyState.ARMED)
+            completed_without_stop = result.ok and self.shared.command_may_cross_sdk(
+                run_id=self.shared.run_id, required_safety_state=SafetyState.ARMED,
             )
         interrupted = bool(
             result.interrupted
@@ -203,5 +197,5 @@ class PolicyOperator:
             or self.shared.quit_requested
             or self.shared.error_state
             or self.shared.estop_request
-            or int(self.shared.stop_request) != int(StopRequest.NONE)
+            or self.shared.stop_request
         )

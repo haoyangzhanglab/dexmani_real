@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import Path
@@ -14,7 +13,7 @@ from scipy.spatial.transform import Rotation
 
 from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.utils.atomic_io import atomic_json_dump
-from dexmani_real.utils.geometry import validate_rigid_transform, validate_rotation_matrix
+from dexmani_real.utils.geometry import validate_rigid_transform
 
 ARUCO_DICT = cv2.aruco.DICT_7X7_50
 ARUCO_DICT_NAME = "7x7_50"
@@ -57,8 +56,6 @@ class CalibrationConfig:
     min_axis_separation_deg: float = 15.0
     max_consistency_rms_mm: float = 5.0
     max_consistency_rot_rms_deg: float = 3.0
-    delta_pos_m: float = 0.008
-    delta_rpy_rad: float = 0.03
     status_interval_frames: int = 50
 
     def __post_init__(self) -> None:
@@ -69,8 +66,6 @@ class CalibrationConfig:
             "min_axis_separation_deg",
             "max_consistency_rms_mm",
             "max_consistency_rot_rms_deg",
-            "delta_pos_m",
-            "delta_rpy_rad",
         )
         for field_name in positive_fields:
             value = float(getattr(self, field_name))
@@ -97,19 +92,16 @@ def detect_aruco_pose(
     intrinsics: np.ndarray,
     distortion: np.ndarray,
     *,
-    marker_size_m: float,
+    detector: cv2.aruco.ArucoDetector,
+    marker_corners: np.ndarray,
     target_id: int | None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Detect ArUco marker and return (rvec, tvec) in camera frame, or None."""
     gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
-    dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
-    params = cv2.aruco.DetectorParameters()
-    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    detector = cv2.aruco.ArucoDetector(dictionary, params)
     corners, ids, _ = detector.detectMarkers(gray)
 
     for ok, rv, tv in _marker_poses(
-        corners, ids, marker_corners_3d(marker_size_m), intrinsics, distortion,
+        corners, ids, marker_corners, intrinsics, distortion,
         target_id=target_id,
     ):
         if not ok or rv is None or tv is None:
@@ -139,8 +131,8 @@ def draw_calibration_overlay(
     target_id: int | None,
     marker_corners: np.ndarray,
     marker_size_m: float,
-) -> tuple[np.ndarray, bool]:
-    """Return (annotated_bgr, detected) with ArUco boxes, axes and status."""
+) -> np.ndarray:
+    """Annotate BGR preview with ArUco boxes, axes and detection status."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = detector.detectMarkers(gray)
     detected = False
@@ -167,15 +159,16 @@ def draw_calibration_overlay(
         "ENTER=calibrate" if n_samples >= min_samples else f"SPACE=capture (need >={min_samples})"
     )
     cv2.putText(image, hint, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    return image, detected
+    return image
 
 
 def _calibrate_eye_to_hand(
-    tvec_ee2base: list[np.ndarray],
-    rpy_ee2base: list[np.ndarray],
-    rvec_marker2camera: list[np.ndarray],
-    tvec_marker2camera: list[np.ndarray],
-    method: int = cv2.CALIB_HAND_EYE_PARK,
+    tvec_ee2base: tuple[np.ndarray, ...],
+    rpy_ee2base: tuple[np.ndarray, ...],
+    rvec_marker2camera: tuple[np.ndarray, ...],
+    tvec_marker2camera: tuple[np.ndarray, ...],
+    *,
+    method: int,
 ) -> np.ndarray:
     """Invert robot poses for eye-to-hand cv2.calibrateHandEye, returning T_base_camera (4,4)."""
     rmat_ee2base = [
@@ -202,10 +195,10 @@ def _calibrate_eye_to_hand(
 
 def _compute_closed_loop_errors(
     T_base_camera: np.ndarray,
-    tvec_ee2base: list[np.ndarray],
-    rpy_ee2base: list[np.ndarray],
-    rvec_marker2camera: list[np.ndarray],
-    tvec_marker2camera: list[np.ndarray],
+    tvec_ee2base: tuple[np.ndarray, ...],
+    rpy_ee2base: tuple[np.ndarray, ...],
+    rvec_marker2camera: tuple[np.ndarray, ...],
+    tvec_marker2camera: tuple[np.ndarray, ...],
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (N,) marker-to-EEF consistency residuals in mm and degrees; the marker is rigidly mounted."""
     positions: list[np.ndarray] = []
@@ -227,9 +220,7 @@ def _compute_closed_loop_errors(
 
         T_ee_marker = np.linalg.inv(T_base_ee) @ T_base_camera @ T_camera_marker
         positions.append(T_ee_marker[:3, 3].copy())
-        R_ee_marker = T_ee_marker[:3, :3]
-        validate_rotation_matrix(R_ee_marker, name="T_ee_marker rotation")
-        rotations.append(R_ee_marker)
+        rotations.append(T_ee_marker[:3, :3])
 
     positions_arr = np.array(positions)
     mean_pos = positions_arr.mean(axis=0)
@@ -241,16 +232,11 @@ def _compute_closed_loop_errors(
     return residuals_mm, residuals_deg
 
 
-def check_hand_eye_excitation(
-    rpy_ee2base, *, min_relative_rotation_deg=5.0, min_axis_separation_deg=15.0
+def _check_hand_eye_excitation(
+    rpy_ee2base, *, min_relative_rotation_deg, min_axis_separation_deg
 ):
-    """Require observable two-axis rotation; do not impose three-axis rank."""
-    poses = np.asarray(rpy_ee2base, dtype=np.float64)
-    if poses.ndim != 2 or poses.shape[1:] != (3,) or len(poses) < 3 or not np.isfinite(poses).all():
-        raise ValueError("hand-eye requires at least three finite poses")
-    if not 0 < min_relative_rotation_deg <= 180 or not 0 < min_axis_separation_deg <= 90:
-        raise ValueError("invalid hand-eye excitation thresholds")
-    rotations = Rotation.from_euler("xyz", poses).as_matrix()
+    """Require two-axis excitation of admitted samples; do not impose three-axis rank."""
+    rotations = Rotation.from_euler("xyz", rpy_ee2base).as_matrix()
     axes, angles = [], []
     for i in range(len(rotations)):
         for j in range(i + 1, len(rotations)):
@@ -264,7 +250,7 @@ def check_hand_eye_excitation(
         separation = float(np.degrees(np.arccos(np.clip(abs(axis @ other), 0, 1))))
         if separation >= min_axis_separation_deg:
             return dict(
-                sample_count=len(poses),
+                sample_count=len(rotations),
                 valid_relative_motion_count=len(axes),
                 relative_rotation_min_deg=min(angles),
                 relative_rotation_max_deg=max(angles),
@@ -275,22 +261,27 @@ def check_hand_eye_excitation(
     raise ValueError("insufficient hand-eye excitation; add rotation about another direction")
 
 
-def calibrate_and_select(
-    tvec_ee2base: list[np.ndarray],
-    rpy_ee2base: list[np.ndarray],
-    rvec_marker2camera: list[np.ndarray],
-    tvec_marker2camera: list[np.ndarray],
-    *,
-    max_position_rms_mm: float,
-    max_rotation_rms_deg: float,
-    min_relative_rotation_deg: float = 5.0,
-    min_axis_separation_deg: float = 15.0,
-):
-    """Return the lowest-position-RMS candidate passing both limits, with transform, method and residuals."""
-    check_hand_eye_excitation(
+@dataclass(frozen=True)
+class HandEyeResult:
+    T_base_camera: np.ndarray
+    method: str
+    position_errors_mm: np.ndarray
+    rotation_errors_deg: np.ndarray
+    method_scores_mm: list[tuple[str, float]]
+    position_rms_mm: float
+    rotation_rms_deg: float
+    excitation: dict[str, float | int]
+
+
+def calibrate_and_select(samples: CalibrationSamples, config: CalibrationConfig) -> HandEyeResult:
+    """Select the lowest-position-RMS candidate passing both limits."""
+    if len(samples) < config.min_samples:
+        raise ValueError(f"need at least {config.min_samples} samples, have {len(samples)}")
+    tvec_ee2base, rpy_ee2base, rvec_marker2camera, tvec_marker2camera = zip(*samples.pairs)
+    excitation = _check_hand_eye_excitation(
         rpy_ee2base,
-        min_relative_rotation_deg=min_relative_rotation_deg,
-        min_axis_separation_deg=min_axis_separation_deg,
+        min_relative_rotation_deg=config.min_relative_rotation_deg,
+        min_axis_separation_deg=config.min_axis_separation_deg,
     )
     best = None
     table: list[tuple[str, float]] = []
@@ -304,6 +295,8 @@ def calibrate_and_select(
                 tvec_marker2camera,
                 method=m,
             )
+            # Check OpenCV's candidate once before composing it with the sample rotations.
+            T = validate_rigid_transform(T, label="hand-eye candidate")
             errors_mm, errors_deg = _compute_closed_loop_errors(
                 T,
                 tvec_ee2base,
@@ -311,127 +304,59 @@ def calibrate_and_select(
                 rvec_marker2camera,
                 tvec_marker2camera,
             )
-            if (
-                T.shape != (4, 4)
-                or not np.isfinite(T).all()
-                or errors_mm.shape != (len(tvec_ee2base),)
-                or errors_deg.shape != errors_mm.shape
-                or not np.isfinite(errors_mm).all()
-                or not np.isfinite(errors_deg).all()
-            ):
-                raise ValueError("invalid hand-eye candidate")
             rms_mm = float(np.sqrt(np.mean(errors_mm**2)))
             rms_deg = float(np.sqrt(np.mean(errors_deg**2)))
             if not np.isfinite(rms_mm) or not np.isfinite(rms_deg):
                 raise ValueError("nonfinite hand-eye quality score")
-        except Exception:
+        except (cv2.error, ValueError):
             table.append((name, float("nan")))
             continue
         table.append((name, rms_mm))
-        if rms_mm > max_position_rms_mm or rms_deg > max_rotation_rms_deg:
+        if rms_mm > config.max_consistency_rms_mm or rms_deg > config.max_consistency_rot_rms_deg:
             continue
         if best is None or (rms_mm, rms_deg) < best[:2]:
             best = (rms_mm, rms_deg, name, T, errors_mm, errors_deg)
 
     if best is None:
-        raise RuntimeError("no hand-eye candidate passed both quality limits")
+        raise ValueError("no hand-eye candidate passed both quality limits")
     rms_mm, rms_deg, name_best, T_best, errors_mm_best, errors_deg_best = best
-    return T_best, name_best, errors_mm_best, errors_deg_best, table, rms_mm, rms_deg
+    return HandEyeResult(
+        T_best, name_best, errors_mm_best, errors_deg_best, table, rms_mm, rms_deg, excitation
+    )
 
 
 @dataclass
 class CalibrationSamples:
-    """Paired calibration observations; delete preserves field alignment."""
+    """Each row owns paired EEF position/RPY and marker rotation/translation vectors."""
 
-    tvec_ee2base: list[np.ndarray] = field(default_factory=list)
-    rpy_ee2base: list[np.ndarray] = field(default_factory=list)
-    rvec_marker2cam: list[np.ndarray] = field(default_factory=list)
-    tvec_marker2cam: list[np.ndarray] = field(default_factory=list)
-    _residuals_mm: np.ndarray | None = None
+    pairs: list[np.ndarray] = field(default_factory=list)
+    residuals_mm: np.ndarray | None = None
 
     def __len__(self) -> int:
-        return len(self.tvec_ee2base)
+        return len(self.pairs)
 
-    def append(
-        self, pos_ee: np.ndarray, rpy_ee: np.ndarray, rvec: np.ndarray, tvec: np.ndarray
-    ) -> None:
-        values = {
-            "pos_ee": pos_ee,
-            "rpy_ee": rpy_ee,
-            "rvec": rvec,
-            "tvec": tvec,
-        }
-        arrays: dict[str, np.ndarray] = {}
-        for name, value in values.items():
-            array = np.asarray(value, dtype=np.float64)
-            if array.shape != (3,) or not np.all(np.isfinite(array)):
-                raise ValueError(f"{name} must be a finite array with shape (3,)")
-            arrays[name] = array.copy()
-        self.tvec_ee2base.append(arrays["pos_ee"])
-        self.rpy_ee2base.append(arrays["rpy_ee"])
-        self.rvec_marker2cam.append(arrays["rvec"])
-        self.tvec_marker2cam.append(arrays["tvec"])
-        self._residuals_mm = None
+    def append(self, pos_ee, rpy_ee, rvec, tvec) -> None:
+        pair = np.array((pos_ee, rpy_ee, rvec, tvec), dtype=np.float64)
+        if pair.shape != (4, 3) or not np.isfinite(pair).all():
+            raise ValueError("calibration sample must contain four finite 3-vectors")
+        self.pairs.append(pair)
+        self.residuals_mm = None
 
     def pop_last(self) -> bool:
-        if not self.tvec_ee2base:
+        if not self.pairs:
             return False
-        for lst in (
-            self.tvec_ee2base,
-            self.rpy_ee2base,
-            self.rvec_marker2cam,
-            self.tvec_marker2cam,
-        ):
-            lst.pop()
-        self._residuals_mm = None
+        self.pairs.pop()
+        self.residuals_mm = None
         return True
 
-    def set_residuals(self, residuals_mm: np.ndarray) -> None:
-        residuals = np.asarray(residuals_mm, dtype=np.float64)
-        if residuals.shape != (len(self),) or not np.all(np.isfinite(residuals)):
-            raise ValueError(
-                f"residuals_mm must be finite shape ({len(self)},), got {residuals.shape}"
-            )
-        self._residuals_mm = residuals.copy()
-
     def pop_worst(self) -> tuple[int, float] | None:
-        if self._residuals_mm is None or len(self) == 0:
+        if self.residuals_mm is None:
             return None
-        idx = int(np.argmax(self._residuals_mm))
-        val = float(self._residuals_mm[idx])
-        for lst in (
-            self.tvec_ee2base,
-            self.rpy_ee2base,
-            self.rvec_marker2cam,
-            self.tvec_marker2cam,
-        ):
-            lst.pop(idx)
-        self._residuals_mm = None
-        return idx, val
-
-    def solver_inputs(
-        self,
-    ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
-        return (
-            self.tvec_ee2base,
-            self.rpy_ee2base,
-            self.rvec_marker2cam,
-            self.tvec_marker2cam,
-        )
-
-
-def _finite_json_object(value: Mapping[str, object]) -> dict[str, object]:
-    """Return a JSON-compatible diagnostic object without NaN or infinity."""
-    if not isinstance(value, Mapping):
-        raise TypeError("calibration_capture must be an object")
-    try:
-        encoded = json.dumps(value, allow_nan=False)
-        decoded = json.loads(encoded)
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("calibration_capture must contain finite JSON values") from exc
-    if not isinstance(decoded, dict):
-        raise TypeError("calibration_capture must be an object")
-    return decoded
+        index = int(np.argmax(self.residuals_mm))
+        residual = float(self.residuals_mm[index])
+        self.pairs.pop(index)
+        self.residuals_mm = None
+        return index, residual
 
 
 def save_camera_calibration(
@@ -439,7 +364,7 @@ def save_camera_calibration(
     serial: str,
     json_path: Path,
     *,
-    calibration_capture: Mapping[str, object] | None = None,
+    calibration_capture: dict[str, object] | None = None,
     cancelled=None,
 ) -> None:
     """Write calibration result to cameras.json, preserving other entries."""
@@ -454,21 +379,12 @@ def save_camera_calibration(
         "serial": serial,
         "type": "eye_to_hand",
         "pose": {
-            "position": [
-                float(pos[0]),
-                float(pos[1]),
-                float(pos[2]),
-            ],
-            "orientation": [
-                float(quat_wxyz[0]),
-                float(quat_wxyz[1]),
-                float(quat_wxyz[2]),
-                float(quat_wxyz[3]),
-            ],
+            "position": pos.tolist(),
+            "orientation": quat_wxyz.tolist(),
         },
     }
     if calibration_capture is not None:
-        entry["calibration_capture"] = _finite_json_object(calibration_capture)
+        entry["calibration_capture"] = calibration_capture
 
     if json_path.exists():
         with open(json_path) as f:
@@ -476,7 +392,6 @@ def save_camera_calibration(
     else:
         existing = {}
 
-    cam_name = "camera_0"
     for name, cam_data in existing.items():
         if cam_data.get("serial") == serial:
             cam_name = name

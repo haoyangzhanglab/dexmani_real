@@ -45,7 +45,7 @@ class LiveStateError:
 
 
 def _check_sdk_return_code(code: Any, operation: str) -> None:
-    if not isinstance(code, (int, np.integer)) or int(code) != 0:
+    if isinstance(code, bool) or not isinstance(code, (int, np.integer)) or int(code) != 0:
         raise RuntimeError(f"{operation} failed with SDK code {code!r}")
 
 
@@ -70,17 +70,15 @@ def _wait_controller_ready(
     *,
     expected_mode: int,
     timeout_s: float,
-    check_abort: Callable[[], None] | None = None,
+    check_abort: Callable[[], None],
 ) -> int:
     """Wait for SDK-reported mode/connection readiness, error==0 and a movable state within the budget."""
     deadline = time.monotonic() + timeout_s
     last: LiveStateError | None = None
     while time.monotonic() < deadline:
-        if check_abort is not None:
-            check_abort()
+        check_abort()
         last = read_live_state_and_error(arm_api)
-        if check_abort is not None:
-            check_abort()
+        check_abort()
         if (
             bool(arm_api.connected)
             and last.error_code == 0
@@ -89,8 +87,7 @@ def _wait_controller_ready(
         ):
             return last.state
         time.sleep(0.03)
-    if check_abort is not None:
-        check_abort()
+    check_abort()
     raise RuntimeError(
         f"controller postcondition failed: expected mode={expected_mode} "
         f"error=0 movable-state, got state={last.state if last else None} "
@@ -98,13 +95,11 @@ def _wait_controller_ready(
     )
 
 
-def _enter_mode(arm_api: Any, mode: int, *, check_abort: Callable[[], None] | None = None) -> None:
+def _enter_mode(arm_api: Any, mode: int, *, check_abort: Callable[[], None]) -> None:
     """Enter a controller mode and wait for a movable state; raise on failure."""
-    if check_abort is not None:
-        check_abort()
+    check_abort()
     _check_sdk_return_code(arm_api.set_mode(mode), f"set_mode({mode})")
-    if check_abort is not None:
-        check_abort()
+    check_abort()
     _check_sdk_return_code(arm_api.set_state(0), f"set_state(0) after Mode {mode}")
     _wait_controller_ready(arm_api, expected_mode=mode, timeout_s=1.0, check_abort=check_abort)
 
@@ -136,7 +131,7 @@ def _estimate_segment_timeout_s(start: np.ndarray, target: np.ndarray, cfg: ArmP
 
 
 class HomeAborted(RuntimeError):
-    """HOME abort_check ended motion; the owner classifies the cause and stops."""
+    """Preparation or HOME authority was revoked; the owner handles stopping."""
 
 
 class XArm7:
@@ -222,7 +217,7 @@ class XArm7:
         waypoints: np.ndarray,
         final_qpos: np.ndarray,
         *,
-        abort_check: Callable[[], str | None] | None = None,
+        check_abort: Callable[[], None],
     ) -> None:
         """Execute the prevalidated path in Mode 0, restore Mode 1, then verify final position/velocity dwell.
         Other devices are serviced by the coordinating thread, never by this driver.
@@ -247,12 +242,6 @@ class XArm7:
         if len(waypoints) > 0 and float(np.max(np.abs(waypoints[-1] - final_qpos))) > 1e-6:
             raise ValueError("final milestone does not match canonical home")
 
-        def _raise_abort() -> None:
-            if abort_check is not None:
-                reason = abort_check()
-                if reason is not None:
-                    raise HomeAborted(reason)
-
         def _converged(target: np.ndarray, q: np.ndarray, v: np.ndarray, tol_rad: float) -> bool:
             return (
                 float(np.max(np.abs(q - target))) <= tol_rad
@@ -262,7 +251,7 @@ class XArm7:
         def _dwell(target: np.ndarray) -> None:
             stable_since = time.monotonic()
             while time.monotonic() - stable_since < self.cfg.homing.dwell_s:
-                _raise_abort()
+                check_abort()
                 time.sleep(min(self.cfg.homing.step_interval_s, self.cfg.homing.dwell_s))
                 q, v, _ = self.read()
                 if self.read_live_error_code() != 0:
@@ -272,8 +261,8 @@ class XArm7:
 
         def _restore_mode1_and_settle(target: np.ndarray) -> None:
             # HOME includes stability after the firmware mode-switch transient.
-            _raise_abort()
-            self.enter_mode1(check_abort=_raise_abort)
+            check_abort()
+            self.enter_mode1(check_abort=check_abort)
             # One polling interval lets the final dwell verification sample be scheduled.
             deadline = (
                 time.monotonic()
@@ -284,7 +273,7 @@ class XArm7:
             stable_since: float | None = None
             max_error = max_velocity = float("inf")
             while time.monotonic() < deadline:
-                _raise_abort()
+                check_abort()
                 q, v, _ = self.read()
                 if self.read_live_error_code() != 0:
                     raise RuntimeError("controller error during post-Mode1 home settle")
@@ -305,7 +294,7 @@ class XArm7:
                 f"max joint velocity={max_velocity:.6f}rad/s)"
             )
 
-        _raise_abort()
+        check_abort()
         qpos, qvel, _tau = self.read()
 
         if len(waypoints) == 0:
@@ -324,29 +313,26 @@ class XArm7:
             _restore_mode1_and_settle(final_qpos)
             return
 
-        self.enter_mode0(check_abort=_raise_abort)
+        self.enter_mode0(check_abort=check_abort)
         milestone_tol = min(self.cfg.homing.convergence_rad, np.deg2rad(0.5))
         current = qpos
         for index, target in enumerate(targets, start=1):
-            _raise_abort()
-            code = int(
-                self._api.set_servo_angle(
-                    angle=target,
-                    is_radian=True,
-                    speed=self.cfg.homing.max_speed_rad_per_s,
-                    mvacc=self.cfg.max_joint_acceleration_rad_per_s2,
-                    wait=False,
-                    radius=None,
-                )
+            check_abort()
+            code = self._api.set_servo_angle(
+                angle=target,
+                is_radian=True,
+                speed=self.cfg.homing.max_speed_rad_per_s,
+                mvacc=self.cfg.max_joint_acceleration_rad_per_s2,
+                wait=False,
+                radius=None,
             )
-            if code != 0:
-                raise RuntimeError(f"home milestone {index} rejected (SDK code={code})")
+            _check_sdk_return_code(code, f"home milestone {index}")
 
             deadline = time.monotonic() + _estimate_segment_timeout_s(current, target, self.cfg)
             stable_since: float | None = None
             q = current
             while time.monotonic() < deadline:
-                _raise_abort()
+                check_abort()
                 q, v, _ = self.read()
                 if self.read_live_error_code() != 0:
                     raise RuntimeError(f"controller error at home milestone {index}")
@@ -377,11 +363,11 @@ class XArm7:
         if self._api is not None:
             self._api.emergency_stop()
 
-    def enter_mode0(self, *, check_abort=None) -> None:
+    def enter_mode0(self, *, check_abort: Callable[[], None]) -> None:
         """Enter Mode 0 (MoveJoint) and wait for a movable state; raise on failure."""
         _enter_mode(self._api, 0, check_abort=check_abort)
 
-    def enter_mode1(self, *, check_abort: Callable[[], None] | None = None) -> None:
+    def enter_mode1(self, *, check_abort: Callable[[], None]) -> None:
         """Enter servo Mode 1 and wait for a movable state; raise on failure."""
         _enter_mode(self._api, 1, check_abort=check_abort)
 

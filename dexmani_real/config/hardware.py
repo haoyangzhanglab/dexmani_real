@@ -112,7 +112,6 @@ class ArmParams:
     sdk_timeout_s: float = 0.020
     executor_timeout_s: float = 3.0
     tracking_error_rad: float = 0.35
-    servo_event_capacity: int = 4096
 
     ip: str = "192.168.1.111"
 
@@ -172,8 +171,6 @@ class ArmParams:
             raise ValueError("feedback period must fit freshness budget and not exceed servo rate")
         if not 1 / self.servo_hz < self.servo_max_interval_s:
             raise ValueError("servo interval budget must exceed one servo period")
-        if type(self.servo_event_capacity) is not int or self.servo_event_capacity < 16:
-            raise ValueError("servo_event_capacity must be an integer >=16")
         # These physical v/a limits also remain valid for firmware-planned Mode-0 HOME.
         _max_speed_rad = self.max_joint_velocity_rad_per_s
         _max_acc_rad = self.max_joint_acceleration_rad_per_s2

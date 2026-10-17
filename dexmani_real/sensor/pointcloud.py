@@ -32,14 +32,21 @@ __all__ = [
 ]
 
 
-def _depth_valid_mask(
-    depth_raw: np.ndarray, *, depth_scale_m: float, config: PointCloudConfig
-) -> tuple[np.ndarray, np.ndarray]:
-    if depth_raw.ndim != 2 or depth_raw.dtype != np.uint16:
-        raise ValueError("depth_raw must be a uint16 [H,W] frame")
+def _depth_meters(
+    depth_raw: np.ndarray, intrinsics: CameraIntrinsics, depth_scale_m: float,
+) -> np.ndarray:
+    if depth_raw.shape != (intrinsics.height, intrinsics.width) or depth_raw.dtype != np.uint16:
+        raise ValueError("depth_raw must be uint16 [H,W] matching depth intrinsics")
     if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
         raise ValueError("depth_scale_m must be finite and positive")
-    depth_m = depth_raw.astype(np.float32) * np.float32(depth_scale_m)
+    return depth_raw.astype(np.float32) * np.float32(depth_scale_m)
+
+
+def _depth_valid_mask(
+    depth_raw: np.ndarray, *, intrinsics: CameraIntrinsics,
+    depth_scale_m: float, config: PointCloudConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    depth_m = _depth_meters(depth_raw, intrinsics, depth_scale_m)
     valid = (
         (depth_raw > 0)
         & np.isfinite(depth_m)
@@ -60,8 +67,6 @@ def _validate_color(color: np.ndarray, geometry: RGBDGeometry) -> None:
 
 def _local_3x3_count(mask: np.ndarray) -> np.ndarray:
     """Count true pixels in each clipped 3x3 neighborhood."""
-    if mask.ndim != 2 or mask.dtype != np.bool_:
-        raise ValueError("mask must be a boolean [H,W] array")
     return cv2.boxFilter(
         mask.astype(np.uint8),
         ddepth=cv2.CV_8U,
@@ -75,8 +80,6 @@ def _reject_flying_depth(
     depth_m: np.ndarray, valid: np.ndarray, config: PointCloudConfig
 ) -> np.ndarray:
     """Reject intermediate edge depths and locally unsupported measurements."""
-    if depth_m.shape != valid.shape:
-        raise ValueError("depth and valid mask shapes must match")
     if not np.any(valid):
         return valid
 
@@ -198,8 +201,6 @@ def _deproject_depth(
     intrinsics: CameraIntrinsics,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Vectorized deprojection for depth-to-color aligned depth."""
-    if depth_m.shape != (intrinsics.height, intrinsics.width) or valid.shape != depth_m.shape:
-        raise ValueError("depth frame shape does not match depth intrinsics")
     rows, columns = np.nonzero(valid)
     z = depth_m[rows, columns]
     rays = _depth_rays(intrinsics)[rows, columns]
@@ -207,8 +208,6 @@ def _deproject_depth(
 
 
 def _transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError("points must have shape [N,3]")
     return (points @ transform[:3, :3].T + transform[:3, 3]).astype(np.float32)
 
 
@@ -223,11 +222,6 @@ def _table_height_hysteresis_keep_mask(
     object_seed_min_pixels: int,
 ) -> np.ndarray:
     """Preserve low object surfaces only when connected to reliable high seeds."""
-    if valid.ndim != 2 or valid.dtype != np.bool_:
-        raise ValueError("valid must be a boolean [H,W] mask")
-    if rows.shape != columns.shape or rows.shape != signed_height_m.shape:
-        raise ValueError("rows, columns, and signed heights must have equal shape")
-
     # Coherent high patches preserve low surfaces; scattered spikes must not retain table residuals.
     seed_image = np.zeros(valid.shape, dtype=bool)
     object_seeds = signed_height_m >= object_seed_height_m
@@ -264,8 +258,6 @@ def _table_keep_mask(
     table_object_seed_min_pixels: int,
 ) -> np.ndarray:
     """Keep non-table valid pixels before allocating 3-D point arrays."""
-    if depth_m.shape != (intrinsics.height, intrinsics.width) or valid.shape != depth_m.shape:
-        raise ValueError("depth and valid mask must match depth intrinsics")
     plane = np.asarray(table_plane_abcd, dtype=np.float64)
     norm = np.linalg.norm(plane[:3])
     plane /= norm
@@ -298,8 +290,6 @@ def _workspace_keep_mask(
 
 def _packed_grid_keys(keys: np.ndarray) -> np.ndarray:
     """Pack integer XYZ rows into collision-free scalar group identifiers."""
-    if keys.ndim != 2 or keys.shape[1] != 3 or keys.shape[0] == 0:
-        raise ValueError("grid keys must have non-empty shape [N,3]")
     minimum = np.min(keys, axis=0)
     shifted = keys - minimum
     extents = np.max(shifted, axis=0) + 1
@@ -315,10 +305,6 @@ def _voxel_means(
     colors: np.ndarray,
     voxel_size_m: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if points_base.ndim != 2 or points_base.shape[1] != 3:
-        raise ValueError("points_base must have shape [N,3]")
-    if colors.shape != points_base.shape:
-        raise ValueError("colors must have shape [N,3] matching points_base")
     keys = np.floor(points_base / np.float32(voxel_size_m)).astype(np.int64)
     # Voxel means avoid first-pixel bias; bounded grid keys fit collision-free int64 packing.
     packed_keys = _packed_grid_keys(keys)
@@ -344,8 +330,6 @@ def _radius_component_keep_mask(
     min_component_points: int,
 ) -> np.ndarray:
     """Use one radius graph for connected-island and local-density filtering."""
-    if points_base.ndim != 2 or points_base.shape[1] != 3:
-        raise ValueError("points_base must have shape [N,3]")
     count = points_base.shape[0]
     if min_neighbors == 0 and min_component_points <= 1:
         return np.ones(count, dtype=bool)
@@ -403,13 +387,6 @@ def _coarse_stratified_sample_indices(
 ) -> np.ndarray:
     """Select broad spatial coverage, then fill remaining slots by fine hash."""
     count = voxel_keys.shape[0]
-    if voxel_keys.shape != (count, 3):
-        raise ValueError("voxel_keys must have shape [N,3]")
-    if num_points <= 0 or coarse_voxel_stride <= 0:
-        raise ValueError("sample count and coarse voxel stride must be positive")
-    if count < num_points:
-        raise ValueError("stratified sampling requires at least num_points candidates")
-
     fine_order = np.argsort(_spatial_hash(voxel_keys), kind="stable")
     coarse_keys = np.floor_divide(voxel_keys, coarse_voxel_stride)
     ordered_coarse_keys = coarse_keys[fine_order]
@@ -433,11 +410,7 @@ def _fixed_size_sample_indices(
     num_points: int,
     coarse_voxel_stride: int,
 ) -> np.ndarray:
-    if voxel_keys.ndim != 2 or voxel_keys.shape[1] != 3:
-        raise ValueError("voxel_keys must have shape [N,3]")
     count = voxel_keys.shape[0]
-    if count == 0:
-        raise ValueError("cannot sample an empty cloud")
     if count > num_points:
         return _coarse_stratified_sample_indices(
             voxel_keys,
@@ -457,7 +430,9 @@ def aligned_depth_points_in_base(
     config: PointCloudConfig,
 ) -> np.ndarray:
     """Return table-calibration points using configuration/extrinsics validated at setup."""
-    depth_m, valid = _depth_valid_mask(depth_raw, depth_scale_m=depth_scale_m, config=config)
+    depth_m, valid = _depth_valid_mask(
+        depth_raw, intrinsics=aligned_depth_intrinsics, depth_scale_m=depth_scale_m, config=config
+    )
     trusted = _reject_flying_depth(depth_m, valid, config)
     if not np.any(trusted):
         return np.empty((0, 3), dtype=np.float32)
@@ -475,11 +450,7 @@ def build_raw_point_cloud(
 ) -> np.ndarray | None:
     """Return diagnostic points using extrinsics validated when loading calibration."""
     _validate_color(color, geometry)
-    if depth_raw.ndim != 2 or depth_raw.dtype != np.uint16:
-        raise ValueError("depth_raw must be a uint16 [H,W] frame")
-    if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
-        raise ValueError("depth_scale_m must be finite and positive")
-    depth_m = depth_raw.astype(np.float32) * np.float32(depth_scale_m)
+    depth_m = _depth_meters(depth_raw, geometry.depth, depth_scale_m)
     valid = (depth_raw > 0) & np.isfinite(depth_m)
     if not np.any(valid):
         return None
@@ -506,7 +477,9 @@ def build_point_cloud(
     else:
         table_plane_abcd = None
     _validate_color(color, geometry)
-    depth_m, valid = _depth_valid_mask(depth_raw, depth_scale_m=depth_scale_m, config=config)
+    depth_m, valid = _depth_valid_mask(
+        depth_raw, intrinsics=geometry.depth, depth_scale_m=depth_scale_m, config=config
+    )
     trusted = _reject_flying_depth(depth_m, valid, config)
     trusted_count = int(np.count_nonzero(trusted))
     if trusted_count == 0:

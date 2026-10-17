@@ -7,13 +7,13 @@ from pathlib import Path
 
 import json
 
+import av
 import h5py
 import numpy as np
 
 from dexmani_real.recording.storage.schema import (
-    DATASET_SPECS, RAW_FORMAT, TIMING_REQUIRED_FIELDS,
+    DATASET_SPECS, RAW_FORMAT, ARM_EXECUTION_FORMAT, TIMING_ROW_DTYPE, validate_arm_execution,
 )
-from dexmani_real.recording.storage.video import VideoDecoder
 
 
 class RawDataError(ValueError):
@@ -38,19 +38,18 @@ def _text_attr(attrs: h5py.AttributeManager, name: str) -> str:
     return value
 
 
-def _positive_int_attr(attrs: h5py.AttributeManager, name: str, *, allow_zero: bool = False) -> int:
+def _nonnegative_int_attr(attrs: h5py.AttributeManager, name: str) -> int:
     value = _scalar_attr(attrs, name)
-    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+    if type(value) is not int:
         raise RawDataError(f"episode metadata {name} must be an integer")
-    result = int(value)
-    if result < 0 or (not allow_zero and result == 0):
-        raise RawDataError(f"episode metadata {name} must be positive")
-    return result
+    if value < 0:
+        raise RawDataError(f"episode metadata {name} must be nonnegative")
+    return value
 
 
 def _positive_float_attr(attrs: h5py.AttributeManager, name: str) -> float:
     value = _scalar_attr(attrs, name)
-    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+    if type(value) not in (int, float):
         raise RawDataError(f"episode metadata {name} must be numeric")
     result = float(value)
     if not np.isfinite(result) or result <= 0.0:
@@ -63,7 +62,7 @@ class EpisodeReader:
 
     def __init__(self, episode_path: str | Path) -> None:
         self._path = Path(episode_path)
-        self._data = self._rgb_decoder = None
+        self._data = self._video = None
         self._fields = None
         self._datasets = {}
         if not self._path.is_dir():
@@ -76,8 +75,17 @@ class EpisodeReader:
             attrs = self.meta
             if _text_attr(attrs, "format") != RAW_FORMAT:
                 raise ValueError(f"unsupported Raw format (expected {RAW_FORMAT!r})")
+            if attrs.get("arm_execution_format") != ARM_EXECUTION_FORMAT:
+                raise ValueError(
+                    f"unsupported arm execution format (expected {ARM_EXECUTION_FORMAT!r}); "
+                    "use the historical code version for old Raw; do not rewrite it"
+                )
+            if attrs.get("arm_control_mode") != 1 or attrs.get("arm_action_semantics") != "q_goal_submitted":
+                raise RawDataError("unknown arm control/action semantics")
+            if _text_attr(attrs, "timestamp_source") != "host_monotonic_relative":
+                raise RawDataError("Raw timestamp must use host monotonic relative seconds")
             _text_attr(attrs, "termination_reason")
-            self._num_frames = _positive_int_attr(attrs, "num_frames", allow_zero=True)
+            self._num_frames = _nonnegative_int_attr(attrs, "num_frames")
             self._control_hz = _positive_float_attr(attrs, "control_hz")
             _text_attr(attrs, "task_label")
             _text_attr(attrs, "collection_source")
@@ -130,18 +138,13 @@ class EpisodeReader:
         return array
 
     def read_timing(self):
-        """Optional evidence; old Raw keeps its core path without invented clocks."""
-        if "timing" not in self._data:
-            return dict(available=False, reason="timing_evidence_unavailable")
+        """Read host timing and submission identities without inventing missing clocks."""
+        if any(name not in self._data for name in ("timing/rows", "timing/queries")):
+            raise RawDataError("Raw is missing timing rows or queries")
         group = self._data["timing"]
         rows = group["rows"]
-        names = rows.dtype.names or ()
-        if (
-            rows.shape != (self.num_frames,)
-            or not set(TIMING_REQUIRED_FIELDS).issubset(names)
-            or any(rows.dtype.fields[name][0] != np.dtype("<i8") for name in names)
-        ):
-            raise RawDataError("timing rows must align with core rows and contain signed int64 columns")
+        if rows.shape != (self.num_frames,) or rows.dtype != TIMING_ROW_DTYPE:
+            raise RawDataError("timing rows must align with core rows and match the current timing layout")
         queries = [json.loads(value) for value in group["queries"].asstr()[:]]
         keys = {(item["run_id"], item["query_id"]) for item in queries}
         if len(keys) != len(queries):
@@ -150,52 +153,27 @@ class EpisodeReader:
         for row in values:
             if row["query_id"] >= 0 and (int(row["run_id"]), int(row["query_id"])) not in keys:
                 raise RawDataError("action timing references an absent query")
-        return dict(available=True, rows=values, queries=queries, metadata=dict(group.attrs),
+        return dict(rows=values, queries=queries, metadata=dict(group.attrs),
                     termination=json.loads(group["termination"].asstr()[()])
                     if "termination" in group else None)
 
-    def validate_servo_execution(self):
-        """Mode-6 Raw retains its original admission; Mode-1 requires full evidence."""
-        mode = self.meta.get("arm_control_mode")
-        if mode is None and "arm_servo" not in self._data:
-            return  # Original Raw, never reinterpreted or migrated.
-        if mode != 1 or "arm_servo" not in self._data:
-            raise RawDataError("unknown/incomplete arm execution semantics")
-        from dexmani_real.recording.storage.servo import validate_servo_evidence
-
+    def validate_arm_execution(self):
+        """Use the same episode admission for export and physical replay."""
         try:
-            group = self._data["arm_servo"]
-            validate_servo_evidence(
-                group["events"], group["command_ids"][:], self["dispatch_status"][:],
-                self["action_arm_joint_target"][:], complete=bool(group.attrs.get("complete", False)),
-                arm_dispatch=self.arm_dispatch_status,
+            group = self._data["arm_execution"]
+            validate_arm_execution(
+                json.loads(group["start"].asstr()[()]), json.loads(group["end"].asstr()[()]),
+                self.read_timing()["rows"], self["dispatch_status"][:],
             )
         except (KeyError, ValueError, TypeError) as exc:
             raise RawDataError(f"Mode-1 execution evidence: {exc}") from exc
 
-    @property
-    def arm_dispatch_status(self):
-        from dexmani_real.robot.commands import DispatchStatus
-
-        if self.meta.get('arm_action_semantics') == 'q_goal_submitted':
-            if self.meta.get('arm_control_mode') != 1:
-                raise RawDataError('submitted targets require Mode-1 execution evidence')
-            return DispatchStatus.SUBMITTED
-        if (self.meta.get('arm_control_mode') == 1
-                and self.meta.get('arm_action_semantics') != 'q_goal_first_servo_point_receipt'):
-            raise RawDataError('unknown Mode-1 action semantics')
-        return DispatchStatus.ACCEPTED
-
     def timing_diagnostics(self):
         """Return host ages/deltas in seconds (NaN/None if missing), without cross-modality admission thresholds."""
         evidence = self.read_timing()
-        if not evidence["available"]:
-            return evidence
         rows = evidence["rows"]
         def delta(end, start):
             result = np.full(len(rows), np.nan)
-            if end not in rows.dtype.names or start not in rows.dtype.names:
-                return result
             valid = (rows[end] > 0) & (rows[start] > 0)
             result[valid] = (rows[end][valid] - rows[start][valid]) / 1e9
             return result
@@ -203,7 +181,6 @@ class EpisodeReader:
             start, end = query.get("started_ns"), query.get("completed_ns")
             return None if start is None or end is None else (end - start) / 1e9
         return dict(
-            available=True,
             metadata=evidence["metadata"],
             observation_age_s={name: delta("observation_ns", f"{name}_ns")
                                for name in ("arm", "hand", "camera", "pointcloud")},
@@ -218,7 +195,7 @@ class EpisodeReader:
                     "pointcloud_camera_published_ns", "pointcloud_camera_received_ns"),
                 "camera_publish_to_processing": delta(
                     "pointcloud_started_ns", "pointcloud_camera_published_ns"),
-                # Includes validation and the ring copy/commit, not just build_point_cloud.
+                # Includes the ring copy/commit, not just build_point_cloud.
                 "processing_to_publish": delta("pointcloud_published_ns", "pointcloud_started_ns"),
                 "publish_to_observation": delta("observation_ns", "pointcloud_published_ns"),
             },
@@ -242,15 +219,18 @@ class EpisodeReader:
     def iter_rgb_frames(self) -> Iterator[np.ndarray]:
         """Decode RGB in HDF5 row order; sampling times come from Raw ``timestamp``."""
         self.require_fields("rgb")
-        if self._rgb_decoder is None:
-            self._rgb_decoder = VideoDecoder(self._rgb_path)
-        yield from self._rgb_decoder.iter_frames()
+        if self._video is None:
+            self._video = av.open(str(self._rgb_path), "r")
+        self._video.seek(0)
+        # The reader owns the container even if the consumer stops iteration early.
+        for frame in self._video.decode(video=0):
+            yield frame.to_ndarray(format="rgb24")
 
     def close(self) -> None:
         self._datasets.clear()
         self._fields = None
         errors = []
-        for name in ("_rgb_decoder", "_data"):
+        for name in ("_video", "_data"):
             resource = getattr(self, name)
             if resource is not None:
                 try:

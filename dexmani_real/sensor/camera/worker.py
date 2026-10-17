@@ -14,34 +14,15 @@ from dexmani_real.utils.log import configure_logging
 logger = logging.getLogger(__name__)
 
 
-def pack_camera_frame(frame, *, timestamp_ns):
-    rgb, depth_raw = frame.rgb, frame.depth_aligned_to_color_raw
-    if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
-        raise ValueError("camera RGB must be uint8 [H,W,3]")
-    if depth_raw.dtype != np.uint16 or depth_raw.shape != rgb.shape[:2]:
-        raise ValueError("aligned depth must be uint16 [H,W]")
-    header = np.zeros(1, dtype=CAMERA_FRAME_HEADER_DTYPE)
-    header["timestamp_ns"] = timestamp_ns
-    header["received_ns"] = frame.timestamp_ns
-    header["depth_frame_number"] = frame.depth_frame_number
-    header["color_frame_number"] = frame.color_frame_number
-    return header, rgb, depth_raw
-
-
 def run_camera_worker(shared, config: CameraParams) -> None:
     configure_logging()
-    if shared.camera_ring is None:
-        raise ValueError("camera worker requires an allocated camera ring")
-    from dexmani_real.sensor.camera.realsense import (
-        RealSenseCamera,
-    )
+    from dexmani_real.sensor.camera.realsense import RealSenseCamera
 
     cam = RealSenseCamera(config)
+    cam.connect()
     try:
-        if not cam.connect():
-            raise RuntimeError("RealSense connect failed")
         shared.camera_depth_scale.value = cam.get_depth_scale()
-        shared.camera_serial.value = str(cam.active_serial or "").encode()
+        shared.camera_serial.value = cam.active_serial.encode()
         shared.camera_geometry.value = json.dumps(cam.get_geometry().to_dict()).encode()
         last_frame = None
         last_advance_ns = [time.monotonic_ns(), time.monotonic_ns()]
@@ -58,7 +39,7 @@ def run_camera_worker(shared, config: CameraParams) -> None:
             identity = (frame.depth_frame_number, frame.color_frame_number)
             now = time.monotonic_ns()
             for channel, name in enumerate(("depth", "RGB")):
-                if identity[channel] is None or identity[channel] < 0:
+                if identity[channel] < 0:
                     raise RuntimeError(f"RealSense missing {name} frame identity")
                 if last_frame is not None and identity[channel] < last_frame[channel]:
                     raise RuntimeError(f"RealSense {name} frame identity moved backward")
@@ -68,12 +49,13 @@ def run_camera_worker(shared, config: CameraParams) -> None:
                     raise RuntimeError(f"RealSense stopped producing new {name}")
             if identity == last_frame:
                 continue
-            if frame.rgb is None or frame.depth_aligned_to_color_raw is None:
-                raise RuntimeError("RealSense did not produce aligned RGB-D")
-            header, rgb, depth = pack_camera_frame(
-                frame, timestamp_ns=min(last_advance_ns),
+            header = np.array(
+                (min(last_advance_ns), frame.timestamp_ns, *identity),
+                dtype=CAMERA_FRAME_HEADER_DTYPE,
             )
-            shared.camera_ring.write_fields(header=header[0], rgb=rgb, depth=depth)
+            shared.camera_ring.write(
+                header=header, rgb=frame.rgb, depth=frame.depth_aligned_to_color_raw,
+            )
             last_frame = identity
             shared.camera_ready.set()
     except Exception:

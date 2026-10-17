@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, fields, replace
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -45,7 +44,7 @@ def validate_max_running_s(max_running_s: float | None) -> float | None:
     return value
 
 
-def validate_policy_runtime_compatibility(info: Any, runtime: Any) -> PointCloudConfig | None:
+def validate_policy_inputs(info: Any, runtime: Any) -> PointCloudConfig | None:
     """Check physical capability before allocating IPC or connecting devices."""
     if not runtime.policy.hand_enabled:
         raise ValueError("Dexterous policy deployment requires hand_enabled=true")
@@ -95,46 +94,15 @@ def control_dt_ns(info):
     return int(dt * 1e9)
 
 
-@dataclass(frozen=True)
-class PolicyRuntimeConfig:
-    """Local model loading arguments; config retains saved model semantics."""
-
-    config: dict
-    info: Any
-    device: str
-    seed: int
-
-
 def validate_num_episodes(num_episodes: Any) -> int | None:
     """None waits for operator exit; a limit counts begun episodes, not saves."""
     if num_episodes is None:
         return None
-    if isinstance(num_episodes, bool) or type(num_episodes) is not int:
+    if type(num_episodes) is not int:
         raise TypeError("num_episodes must be a positive integer or None")
     if num_episodes < 1:
         raise ValueError("num_episodes must be a positive integer")
-    return int(num_episodes)
-
-
-@dataclass(frozen=True)
-class RolloutRecordingConfig:
-    """Output directory and task label for optional Raw rollout recording."""
-
-    data_dir: str
-    task_label: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.data_dir, str) or not self.data_dir.strip():
-            raise ValueError("rollout data_dir must be a non-empty path")
-        raw_data_dir = Path(self.data_dir)
-        resolved_data_dir = raw_data_dir.resolve(strict=False)
-        if resolved_data_dir == resolved_data_dir.parent:
-            raise ValueError("rollout data_dir must not be a filesystem root")
-        if not isinstance(self.task_label, str) or not self.task_label.strip():
-            raise ValueError("rollout task_label must be non-empty")
-        if self.task_label != self.task_label.strip():
-            raise ValueError("rollout task_label must not have surrounding whitespace")
-        object.__setattr__(self, "data_dir", str(resolved_data_dir))
+    return num_episodes
 
 
 @dataclass(frozen=True)

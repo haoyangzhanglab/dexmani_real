@@ -1,192 +1,76 @@
-"""xArm7 online IK, collision checks and bounded joint-space home planning."""
+"""xArm7 online IK and bounded HOME planning using the current collision scene."""
 
 from __future__ import annotations
 
 import logging
-
 from collections.abc import Iterable
-from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 
 from dexmani_real.config.environment import StaticCollisionBox, TableCollisionConfig
-from dexmani_real.robot.model import (
-    XARM7_XHAND_COLLISION_URDF_PATH,
-    XARM7_XHAND_SRDF_PATH,
-)
+from dexmani_real.robot.model import XARM7_XHAND_COLLISION_URDF_PATH, XARM7_XHAND_SRDF_PATH
 
 from .collision import CollisionModel
 from .kinematics.arm_fk import XArm7Kinematics
 from .kinematics.ik import IKResult, OnlineIKConfig, OnlineIKSolver
-from .kinematics.ik_geometry import IKGeometry
-from .kinematics.pose import Pose, ensure_qpos
-from .paths import WORKSPACE_BOUNDS_TOLERANCE_M, PathResult, interpolate_waypoints
+from .kinematics.pose import Pose
+from .paths import WORKSPACE_BOUNDS_TOLERANCE_M, interpolate_waypoints
 
 logger = logging.getLogger(__name__)
 
-__all__ = [
-    "XArm7MotionPlanner",
-]
-
-
-@dataclass(kw_only=True)
-class XArm7PlannerConfig:
-    eef_link_name: str = "custom_eef_link"
-    base_pose_world: Pose = field(default_factory=Pose.identity)
-    use_convex: bool = False
-    joint_vel_limits_deg: tuple[float, ...] = (180, 180, 180, 180, 180, 180, 180)
-    joint_acc_scale: float = 2.0
-    workspace_bounds: np.ndarray | None = None
-
-
-@dataclass(kw_only=True)
-class MotionPlanningConfig:
-    """Joint-space home fallback and dense-path validation settings."""
-
-    path_dt: float = 1 / 15
-    planning_limits_deg: tuple[tuple[float, float], ...] | None = None
-    max_waypoint_delta_deg: float = 15.0
-    max_pose_error_pos_m: float = 0.005
-    max_pose_error_rot_rad: float = 0.05
-    rrt_range: float = 0.12
-    simplify_path: bool = True
-    check_self_collision: bool = True
+_RRT_TIME_S = 0.5
+_RRT_RANGE = 0.12
+_PATH_DT = 1 / 15
+_MAX_WAYPOINT_DELTA_RAD = np.deg2rad(15.0)
+_MAX_POSE_ERROR_POS_M = 0.005
+_MAX_POSE_ERROR_ROT_RAD = 0.05
 
 
 class XArm7MotionPlanner:
-    """Online IK/HOME planning with a 19-DOF collision model and nominal URDF geometry."""
+    """Nominal-URDF arm kinematics plus the 19-DOF arm/hand collision model."""
 
     def __init__(
         self,
-        config: XArm7PlannerConfig,
-        planning_profile: MotionPlanningConfig | None = None,
-        online_ik_profile: OnlineIKConfig | None = None,
         *,
+        online_ik_config: OnlineIKConfig | None = None,
+        workspace_bounds: np.ndarray | None = None,
+        base_pose_world: Pose | None = None,
         static_boxes: Iterable[StaticCollisionBox] = (),
         table: TableCollisionConfig | None = None,
     ) -> None:
         import mplib
 
-        self.mplib = mplib
-        self.config = config
-        self.planning_profile = planning_profile or MotionPlanningConfig()
         self.workspace_bounds = None
-        if config.workspace_bounds is not None:
-            bounds = np.asarray(config.workspace_bounds, dtype=np.float64)
+        if workspace_bounds is not None:
+            bounds = np.asarray(workspace_bounds, dtype=np.float64)
             if (
                 bounds.shape != (3, 2)
-                or not np.all(np.isfinite(bounds))
+                or not np.isfinite(bounds).all()
                 or np.any(bounds[:, 0] > bounds[:, 1])
             ):
                 raise ValueError("workspace_bounds must be finite shape (3, 2) with lower <= upper")
             self.workspace_bounds = bounds.copy()
-
-        joint_vel_limits = np.deg2rad(np.asarray(config.joint_vel_limits_deg, dtype=np.float64))
-        joint_acc_limits = joint_vel_limits * float(config.joint_acc_scale)
         if not XARM7_XHAND_SRDF_PATH.is_file():
-            raise FileNotFoundError(
-                f"planner SRDF does not exist: {XARM7_XHAND_SRDF_PATH}; "
-                "restore repository model assets before starting the runtime"
-            )
-
-        self.mplib_planner = self.mplib.Planner(
+            raise FileNotFoundError(f"planner SRDF does not exist: {XARM7_XHAND_SRDF_PATH}")
+        velocity = np.deg2rad(np.full(7, 180.0))
+        model = mplib.Planner(
             urdf=str(XARM7_XHAND_COLLISION_URDF_PATH),
             srdf=str(XARM7_XHAND_SRDF_PATH),
-            move_group=config.eef_link_name,
-            use_convex=config.use_convex,
-            joint_vel_limits=joint_vel_limits.tolist(),
-            joint_acc_limits=joint_acc_limits.tolist(),
+            move_group="custom_eef_link",
+            use_convex=False,
+            joint_vel_limits=velocity.tolist(),
+            joint_acc_limits=(velocity * 2.0).tolist(),
         )
-        self.pinocchio_model = self.mplib_planner.pinocchio_model
-
-        link_names = list(self.pinocchio_model.get_link_names())
-        if config.eef_link_name not in link_names:
-            raise ValueError(
-                f"Link {config.eef_link_name!r} not found. Available links: {link_names}"
-            )
-        eef_link_id = int(link_names.index(config.eef_link_name))
-
-        self._elbow_joint_index = list(self.pinocchio_model.get_joint_names()).index("joint4")
-        joint_limits = np.asarray(self.mplib_planner.joint_limits, dtype=np.float64)
-
-        # Diagnose hardware-limit drift; URDF/MPlib remains the kinematic authority.
-        from dexmani_real.config.hardware import ArmParams
-
-        _cfg_lower = np.asarray(ArmParams.joint_limit_lower, dtype=np.float64)
-        _cfg_upper = np.asarray(ArmParams.joint_limit_upper, dtype=np.float64)
-        if not np.allclose(joint_limits[:, 0], _cfg_lower, atol=1e-3) or not np.allclose(
-            joint_limits[:, 1], _cfg_upper, atol=1e-3
-        ):
-            logger.warning(
-                "URDF model limits differ from ArmParams operational limits.\n"
-                "  URDF lower:  %s\n  defaults:    %s\n"
-                "  URDF upper:  %s\n  defaults:    %s",
-                joint_limits[:, 0],
-                _cfg_lower,
-                joint_limits[:, 1],
-                _cfg_upper,
-            )
-        else:
-            logger.debug("URDF joint limits match ArmParams (ok)")
-
-        dof = int(joint_limits.shape[0])
-        from dexmani_real.robot.model import XARM7_EQUIVALENT_JOINT_MASK
-
-        equivalent_joint_mask = np.asarray(XARM7_EQUIVALENT_JOINT_MASK, dtype=bool)
-
-        base_pose_world = config.base_pose_world.copy()
-
-        self.kin = XArm7Kinematics(
-            mp_planner=self.mplib_planner,
-            pinocchio_model=self.pinocchio_model,
-            eef_link_id=eef_link_id,
-            dof=dof,
-            joint_limits=joint_limits,
-            equivalent_joint_mask=equivalent_joint_mask,
-            base_pose_world=base_pose_world,
-            mplib=self.mplib,
-        )
-        self.collision_model = CollisionModel(
-            static_boxes=static_boxes,
-            table=table,
-        )
-        self.ik_geometry = IKGeometry(self.kin, collision_model=self.collision_model)
-        self.mplib_planner.set_base_pose(self.kin.to_mplib_pose(base_pose_world))
-
+        self.kin = XArm7Kinematics(model, Pose.identity() if base_pose_world is None else base_pose_world)
+        self._elbow_joint_index = list(self.kin.pinocchio_model.get_joint_names()).index("joint4")
+        self.collision_model = CollisionModel(static_boxes=static_boxes, table=table)
         self.online_ik_solver = (
-            OnlineIKSolver(self.kin, self.ik_geometry, online_ik_profile)
-            if online_ik_profile is not None
-            else None
-        )
-
-        self.dof = dof
-        self.joint_limits = joint_limits
-        self.equivalent_joint_mask = equivalent_joint_mask
-
-    @classmethod
-    def create_default(
-        cls,
-        *,
-        planning_profile: MotionPlanningConfig | None = None,
-        online_ik_profile: OnlineIKConfig | None = None,
-        static_boxes: Iterable[StaticCollisionBox] = (),
-        table: TableCollisionConfig | None = None,
-    ) -> "XArm7MotionPlanner":
-        """Build online IK and home planning with canonical assets and an identity base pose."""
-        return cls(
-            XArm7PlannerConfig(),
-            planning_profile=planning_profile,
-            online_ik_profile=online_ik_profile,
-            static_boxes=static_boxes,
-            table=table,
+            OnlineIKSolver(self.kin, self.collision_model, online_ik_config)
+            if online_ik_config is not None else None
         )
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
         self.collision_model.set_hand_qpos(hand_qpos)
-
-    def set_base_pose(self, base_pose_world: Pose) -> None:
-        self.kin.set_base_pose(base_pose_world)
 
     def reset_episode(self):
         if self.online_ik_solver is None:
@@ -194,351 +78,122 @@ class XArm7MotionPlanner:
         self.online_ik_solver.reset_episode()
 
     def solve_online_ik(
-        self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
+        self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray,
     ) -> IKResult:
         if self.online_ik_solver is None:
             raise RuntimeError("this planner has no online IK solver")
         return self.online_ik_solver.solve(target_eef_pose_world, current_qpos, previous_qpos_cmd)
 
-    def plan_joint_qpos_path(
-        self,
-        target_qpos: np.ndarray,
-        current_qpos: np.ndarray,
-        *,
-        planning_time_s: float = 0.5,
-    ) -> PathResult:
-        """Bounded MPlib RRT fallback for HOME when dense straight segments fail.
-        Validate limits, spacing, FK, workspace and 19-DOF collisions; callers retain table-clearance checks.
-        """
-        current_qpos = ensure_qpos(current_qpos, self.dof, "current_qpos")
-        target_qpos = ensure_qpos(target_qpos, self.dof, "target_qpos")
-        if not np.isfinite(planning_time_s) or planning_time_s <= 0.0:
-            raise ValueError("planning_time_s must be finite and > 0")
-
-        target_qpos = self.ik_geometry.canonicalize_qpos(target_qpos, current_qpos)
-        target_pose_world = self.kin.compute_eef_pose_world(target_qpos)
-        profile = self.planning_profile
-        rrt_range = profile.rrt_range
-        result = self.mplib_planner.plan_qpos(
-            goal_qposes=[target_qpos],
-            current_qpos=current_qpos,
-            time_step=profile.path_dt,
-            rrt_range=rrt_range,
-            planning_time=float(planning_time_s),
-            simplify=profile.simplify_path,
-            verbose=False,
+    def plan_joint_qpos_path(self, target_qpos: np.ndarray, current_qpos: np.ndarray) -> np.ndarray:
+        """Bounded HOME RRT fallback; reject malformed or unsafe output with ValueError."""
+        current_qpos = np.asarray(current_qpos, dtype=np.float64)
+        target_qpos = np.asarray(target_qpos, dtype=np.float64)
+        if any(q.shape != (7,) or not np.isfinite(q).all() for q in (current_qpos, target_qpos)):
+            raise ValueError("HOME planning requires finite (7,) joint vectors")
+        target_qpos = self.kin.canonicalize_qpos(target_qpos, current_qpos)
+        target_pose = self.kin.compute_eef_pose_world(target_qpos)
+        result = self.kin.mp_planner.plan_qpos(
+            goal_qposes=[target_qpos], current_qpos=current_qpos,
+            time_step=_PATH_DT, rrt_range=_RRT_RANGE, planning_time=_RRT_TIME_S,
+            simplify=True, verbose=False,
         )
-        path_result = self._result_from_mplib(
-            result,
-            target_pose_world,
-            current_qpos,
-            source="joint_qpos_rrt",
-            profile=profile,
-        )
-        path_result.report["rrt_range"] = rrt_range
-        path_result.report["planning_time_s"] = float(planning_time_s)
-        return path_result
+        if not isinstance(result, dict) or result.get("status") != "Success":
+            raise ValueError(f"MPlib HOME planning failed: {result}")
+        return self._validate_rrt_path(result.get("position", []), target_pose, current_qpos)
 
-    def _result_from_mplib(
-        self,
-        result: dict[str, Any],
-        target_eef_pose_world: Pose,
-        current_qpos: np.ndarray,
-        source: str,
-        profile: MotionPlanningConfig,
-    ) -> PathResult:
-        if not isinstance(result, dict):
-            return PathResult(
-                success=False,
-                qpos_path=None,
-                source=source,
-                reason=f"MPlib {source} failed: invalid result type",
-                report={"mplib_status": "Invalid"},
-            )
-        status = str(result.get("status", ""))
-        if not status.lower().startswith("success"):
-            return PathResult(
-                success=False,
-                qpos_path=None,
-                source=source,
-                reason=f"MPlib {source} failed: {status}",
-                report={"mplib_status": status},
-            )
+    @staticmethod
+    def _outside_limits(qpos, limits):
+        return bool(np.any(qpos < limits[:, 0] - 1e-5) or np.any(qpos > limits[:, 1] + 1e-5))
 
-        path = np.asarray(result.get("position", []), dtype=np.float64)
-        if len(path) == 0:
-            return PathResult(
-                success=False,
-                qpos_path=None,
-                source=source,
-                reason="MPlib returned success with an empty joint path",
-                report={"mplib_status": status},
-            )
-        path_result = self.validate_path(
-            path, target_eef_pose_world, current_qpos, source=source, profile=profile
-        )
-        path_result.report.update(mplib_status=status)
-        return path_result
-
-    def shortcut_smooth_path(
-        self, path: np.ndarray, current_qpos: np.ndarray, profile: MotionPlanningConfig
-    ) -> np.ndarray:
-        limits = self.ik_geometry.resolve_planning_limits(profile, current_qpos)
-        path = np.asarray(path, dtype=np.float64).copy()
-        if len(path) <= 2:
-            return path
-
+    def _shortcut_smooth_path(self, path, limits):
+        path = path.copy()
         for _ in range(3):
             changed = False
-            idx = 1
-            while idx < len(path) - 1:
-                prev = path[idx - 1]
-                nxt = path[idx + 1]
-                if self._is_shortcut_valid(prev, nxt, limits, profile):
-                    path = np.delete(path, idx, axis=0)
+            index = 1
+            while index < len(path) - 1:
+                prev, nxt = path[index - 1], path[index + 1]
+                if self._is_shortcut_valid(prev, nxt, limits):
+                    path = np.delete(path, index, axis=0)
                     changed = True
                 else:
-                    idx += 1
+                    index += 1
             if not changed:
                 break
         return path
 
-    def _is_shortcut_valid(
-        self,
-        prev: np.ndarray,
-        nxt: np.ndarray,
-        limits: np.ndarray,
-        profile: MotionPlanningConfig,
-    ) -> bool:
-        """Check shortcut self/environment collision at ¼, ½, ¾ and joint limits at the midpoint."""
+    def _is_shortcut_valid(self, prev, nxt, limits):
+        """Probe shortcuts at ¼, ½ and ¾; final admission densely checks the whole path."""
         mid = 0.5 * (prev + nxt)
-        outside, _ = self.ik_geometry.limit_violation(mid, limits)
-        if np.any(outside):
+        if self._outside_limits(mid, limits):
+            return False
+        delta = nxt - prev
+        try:
+            return not any(self.collision_model.check_collision(q) for q in (
+                prev + 0.25 * delta, mid, prev + 0.75 * delta,
+            ))
+        except Exception:
+            logger.warning("shortcut collision check failed closed", exc_info=True)
             return False
 
-        diff = nxt - prev
-        q_quarter = prev + 0.25 * diff
-        q_three_quarter = prev + 0.75 * diff
-        samples = [q_quarter, mid, q_three_quarter]
+    def _validate_rrt_path(self, path, target_pose, current_qpos):
+        path = np.asarray(path, dtype=np.float64)
+        if path.ndim != 2 or path.shape[1] != 7 or len(path) == 0 or not np.isfinite(path).all():
+            raise ValueError("MPlib HOME path must be nonempty finite shape (N, 7)")
+        path = self.kin.canonicalize_path(path, current_qpos)
+        limits = self.kin.planning_limits(current_qpos)
+        smoothed = self._shortcut_smooth_path(path, limits)
+        candidates = (smoothed, path) if len(smoothed) != len(path) else (smoothed,)
+        for candidate in candidates:
+            try:
+                self._check_rrt_candidate(candidate, target_pose, current_qpos, limits)
+            except ValueError as exc:
+                reason = str(exc)
+            else:
+                return candidate
+        raise ValueError(reason)
 
-        if profile.check_self_collision:
-            for q in samples:
-                try:
-                    in_collision = self.ik_geometry.has_collision(q)
-                except Exception:
-                    logger.warning("shortcut collision check failed closed", exc_info=True)
-                    return False
-                if in_collision:
-                    return False
-        return True
-
-    def validate_path(
-        self,
-        path: np.ndarray,
-        target_eef_pose_world: Pose,
-        current_qpos: np.ndarray,
-        source: str,
-        profile: MotionPlanningConfig,
-    ) -> PathResult:
-        """Validate the smoothed path; retry the original if smoothing breaks safety/waypoint checks."""
-        try:
-            path = self.ik_geometry.snap_path_to_nearest_equivalent(path, current_qpos)
-            path = self.ik_geometry.canonicalize_path_to_planning_limits(
-                path, current_qpos, profile
-            )
-            path_before_smooth = path.copy()
-            path = self.shortcut_smooth_path(path, current_qpos, profile)
-        except ValueError as error:
-            logger.warning("validate_path preprocessing failed: %s", error, exc_info=True)
-            return PathResult(success=False, qpos_path=None, source=source, reason=str(error))
-
-        smoothed_failure_reason: str | None = None
-        for attempt_label, candidate in (
-            ("smoothed", path),
-            ("unsmoothed", path_before_smooth),
+    def _check_rrt_candidate(self, path, target_pose, current_qpos, limits):
+        if self._outside_limits(path, limits):
+            raise ValueError("Path violates planning limits.")
+        elbow = path[:, self._elbow_joint_index]
+        if (
+            np.min(elbow) < np.deg2rad(-5.0)
+            and np.max(elbow) > np.deg2rad(15.0)
+            and np.ptp(elbow) > np.deg2rad(45.0)
         ):
-            if attempt_label == "unsmoothed" and len(candidate) == len(path):
-                break
+            raise ValueError("Elbow branch flip detected.")
+        if np.max(np.abs(self.kin.compute_qpos_delta(path[0], current_qpos))) > _MAX_WAYPOINT_DELTA_RAD + 1e-12:
+            raise ValueError("Path start is too far from current_qpos.")
+        if len(path) > 1 and np.max(np.abs(np.diff(path, axis=0))) > _MAX_WAYPOINT_DELTA_RAD + 1e-12:
+            raise ValueError("Path waypoint delta too large.")
+        pos_error, rot_error = self.kin.compute_world_pose_error(target_pose, path[-1])
+        if (
+            not np.isfinite((pos_error, rot_error)).all()
+            or pos_error > _MAX_POSE_ERROR_POS_M
+            or rot_error > _MAX_POSE_ERROR_ROT_RAD
+        ):
+            raise ValueError("Terminal pose error too large.")
+        self.check_workspace_path(path)
+        try:
+            collision = self.collision_model.check_path(path)
+        except Exception as exc:
+            raise ValueError(f"Path collision check failed closed: {exc}") from exc
+        if collision is not None:
+            index, info = collision
+            raise ValueError(f"Path collision at segment {index}: {info}")
 
-            report = self.compute_path_metrics(
-                candidate, target_eef_pose_world, current_qpos, profile
-            )
-            failure = None
-            if report.get("limit_violation"):
-                failure = self._make_failure("Path violates planning limits.", source, report)
-            if failure is None:
-                failure = self._check_elbow_consistency(candidate, report, source)
-            if (
-                failure is None
-                and report["start_qpos_error_rad"]
-                > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12
-            ):
-                failure = self._make_failure(
-                    "Path start is too far from current_qpos.", source, report
-                )
-            if (
-                failure is None
-                and report["max_waypoint_delta_rad"]
-                > np.deg2rad(profile.max_waypoint_delta_deg) + 1e-12
-            ):
-                failure = self._make_failure("Path waypoint delta too large.", source, report)
-            if failure is None and (
-                report["terminal_pos_error_m"] > profile.max_pose_error_pos_m
-                or report["terminal_rot_error_rad"] > profile.max_pose_error_rot_rad
-            ):
-                failure = self._make_failure("Terminal pose error too large.", source, report)
-            if failure is None:
-                failure = self._check_workspace(candidate, report, source)
-            if failure is None:
-                failure = self._check_self_collision(candidate, report, source, profile)
-            if failure is None:
-                if attempt_label == "unsmoothed":
-                    logger.debug(
-                        "validate_path: smoothed path failed (%s), unsmoothed fallback passed "
-                        "(%d waypoints, max_delta=%.1f°)",
-                        smoothed_failure_reason or "?",
-                        len(candidate),
-                        report.get("max_waypoint_delta_deg", 0),
-                    )
-                return PathResult(success=True, qpos_path=candidate, source=source, report=report)
-
-            if attempt_label == "smoothed":
-                smoothed_failure_reason = failure.reason
-
-        return failure  # type: ignore[return-value]
-
-    @staticmethod
-    def _make_failure(reason: str, source: str, report: dict) -> PathResult:
-        return PathResult(
-            success=False, qpos_path=None, source=source, reason=reason, report=report
-        )
-
-    def _check_elbow_consistency(self, path, report, source):
-        """Reject elbow paths crossing the -5°/15° band with a span over 45°."""
-        has_flip, flip_info = self.check_elbow_consistency(path)
-        if has_flip:
-            report.update(flip_info)
-            return self._make_failure("Elbow branch flip detected.", source, report)
-        return None
-
-    def _check_workspace(self, path, report, source):
-        """Fail if any returned waypoint leaves configured world-frame bounds."""
+    def check_workspace_path(self, path: np.ndarray) -> None:
+        """Check EEF workspace at joint intervals of at most 0.02 rad; reject failed FK."""
         if self.workspace_bounds is None:
-            return None
-        dense_path = interpolate_waypoints(path, max_step=0.02)
-        for index, qpos in enumerate(dense_path):
+            return
+        for index, qpos in enumerate(interpolate_waypoints(path, max_step=0.02)):
             try:
                 position = self.kin.compute_eef_pose_world(qpos).p
-            except (ValueError, RuntimeError):
-                position = np.full(3, np.nan)
+            except (ValueError, RuntimeError) as exc:
+                raise ValueError(f"workspace FK failed at sample {index}: {exc}") from exc
             if (
-                not np.all(np.isfinite(position))
+                not np.isfinite(position).all()
                 or np.any(position < self.workspace_bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M)
                 or np.any(position > self.workspace_bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M)
             ):
-                report["workspace_violation_index"] = index
-                report["workspace_violation_position_m"] = position.copy()
-                return self._make_failure("Path leaves configured workspace.", source, report)
-        return None
-
-    def is_workspace_segment_safe(self, start_qpos: np.ndarray, end_qpos: np.ndarray) -> bool:
-        """Check a short commanded segment against configured EEF bounds."""
-        if self.workspace_bounds is None:
-            return True
-        path = interpolate_waypoints(np.stack([start_qpos, end_qpos]), max_step=0.02)
-        for qpos in path:
-            try:
-                position = self.kin.compute_eef_pose_world(qpos).p
-            except (ValueError, RuntimeError):
-                return False
-            if not np.all(np.isfinite(position)):
-                return False
-            if np.any(
-                position < self.workspace_bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M
-            ) or np.any(position > self.workspace_bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M):
-                return False
-        return True
-
-    def _check_self_collision(self, path, report, source, profile):
-        """Fail if the dense path hits self or configured static geometry."""
-        if not profile.check_self_collision:
-            return None
-        try:
-            collision_report = self.ik_geometry.check_path_combined_collisions(path)
-        except Exception as exc:
-            logger.warning("planned-path collision check failed closed", exc_info=True)
-            report["collision_check_error"] = str(exc)
-            return self._make_failure("Path collision check failed closed.", source, report)
-        report.update(collision_report)
-        if collision_report.get("path_collision"):
-            collision = collision_report.get("collision")
-            reason = "Path contains a collision."
-            if collision:
-                num = collision.num_contacts
-                pairs = collision.collision_pairs
-                link_names = ", ".join(f"{p.link_name1}↔{p.link_name2}" for p in pairs[:5])
-                if len(pairs) > 5:
-                    link_names += f" ... +{len(pairs) - 5} more"
-                collision_kind = (
-                    "environment collision"
-                    if any(pair.collision_type == "environment" for pair in pairs)
-                    else "self-collision"
-                )
-                reason = f"Path contains {collision_kind} ({num} contact(s): {link_names})."
-            return self._make_failure(reason, source, report)
-        return None
-
-    def compute_path_metrics(
-        self,
-        path: np.ndarray,
-        target_eef_pose_world: Pose,
-        current_qpos: np.ndarray,
-        profile: MotionPlanningConfig,
-    ) -> dict[str, Any]:
-        diff = np.diff(path, axis=0) if len(path) > 1 else np.zeros((0, self.dof), dtype=np.float64)
-        max_step = float(np.max(np.abs(diff))) if len(diff) > 0 else 0.0
-        terminal_pos_error, terminal_rot_error = self.kin.compute_world_pose_error(
-            target_eef_pose_world, path[-1]
-        )
-
-        limits = self.ik_geometry.resolve_planning_limits(profile, current_qpos)
-        outside, violation = self.ik_geometry.limit_violation(path, limits)
-        report = {
-            "num_waypoints": int(len(path)),
-            "max_waypoint_delta_rad": max_step,
-            "max_waypoint_delta_deg": float(np.rad2deg(max_step)),
-            "start_qpos_error_rad": float(
-                np.max(np.abs(self.ik_geometry.compute_qpos_delta(path[0], current_qpos)))
-            ),
-            "terminal_pos_error_m": terminal_pos_error,
-            "terminal_rot_error_rad": terminal_rot_error,
-            "limit_violation": bool(np.any(outside)),
-        }
-        if np.any(outside):
-            waypoint_indices, joint_indices = np.where(outside)
-            report["limit_violation_waypoint_index"] = int(waypoint_indices[0])
-            report["limit_violation_joint_index_1based"] = int(joint_indices[0] + 1)
-            report["max_limit_violation_deg"] = float(np.rad2deg(np.max(violation[outside])))
-            report["limit_violation_qpos_deg"] = np.rad2deg(path[waypoint_indices[0]].copy())
-        return report
-
-    _ELBOW_NEG_BAND_RAD: float = np.deg2rad(-5.0)
-    _ELBOW_POS_BAND_RAD: float = np.deg2rad(15.0)
-    _ELBOW_MIN_SPAN_RAD: float = np.deg2rad(45.0)
-
-    def check_elbow_consistency(self, path: np.ndarray) -> tuple[bool, dict[str, Any]]:
-        values = path[:, self._elbow_joint_index]
-        v_min, v_max = float(np.min(values)), float(np.max(values))
-        span = v_max - v_min
-        if (
-            v_min < self._ELBOW_NEG_BAND_RAD
-            and v_max > self._ELBOW_POS_BAND_RAD
-            and span > self._ELBOW_MIN_SPAN_RAD
-        ):
-            return True, {
-                "elbow_branch_flip": True,
-                "elbow_min_deg": float(np.rad2deg(v_min)),
-                "elbow_max_deg": float(np.rad2deg(v_max)),
-                "elbow_span_deg": float(np.rad2deg(span)),
-            }
-        return False, {}
+                raise ValueError(f"Path leaves configured workspace at sample {index}: {position}")

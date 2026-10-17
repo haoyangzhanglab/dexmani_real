@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 import sys
 import threading
@@ -17,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 # stop() disables callbacks, but Linux/XRecord may remain blocked; avoid long waits.
 _LISTENER_STOP_TIMEOUT_S = 0.25
+_LISTENER_START_TIMEOUT_S = 2.0
 
 __all__ = [
     "OperatorCommand",
@@ -78,7 +78,7 @@ def _restore_terminal_echo(saved: list[Any] | None) -> None:
         logger.warning("terminal echo restoration failed", exc_info=True)
 
 
-def _stop_listener_bounded(listener: Any, *, label: str) -> bool:
+def _stop_listener_bounded(listener: Any) -> bool:
     """Request pynput shutdown without treating a slow daemon join as a fault."""
     if listener is None:
         return True
@@ -87,14 +87,13 @@ def _stop_listener_bounded(listener: Any, *, label: str) -> bool:
         listener.join(timeout=_LISTENER_STOP_TIMEOUT_S)
         alive = bool(listener.is_alive())
     except Exception:
-        logger.warning("%s listener shutdown raised", label, exc_info=True)
+        logger.warning("keyboard listener shutdown raised", exc_info=True)
         return False
     if alive:
         # Restore the terminal even if pynput's daemon remains blocked after stop().
         logger.debug(
-            "%s listener backend did not confirm exit within %.1fs; "
+            "keyboard listener backend did not confirm exit within %.1fs; "
             "terminal input will still be restored and flushed",
-            label,
             _LISTENER_STOP_TIMEOUT_S,
         )
         return False
@@ -110,14 +109,9 @@ class KeyboardInput:
         estop_callback: Callable[[], None] | None = None,
         stop_callback: Callable[[], None] | None = None,
         quit_callback: Callable[[], None] | None = None,
-        startup_timeout_s: float = 2.0,
-        suppress_echo: bool = True,
         capture_commands: bool = True,
         capture_raw_events: bool = False,
-        repeat_estop_callback: bool = False,
     ) -> None:
-        if not math.isfinite(startup_timeout_s) or startup_timeout_s <= 0.0:
-            raise ValueError("startup_timeout_s must be finite and positive")
         self._buffer: deque[OperatorCommand] = deque()
         self._events: deque[str] = deque()
         self._keys: set[str] = set()
@@ -126,14 +120,11 @@ class KeyboardInput:
         self._running: bool = False
         # A daemon can outlive shutdown; disable its callbacks before releasing the session.
         self._callbacks_active: bool = False
-        self._startup_timeout_s = float(startup_timeout_s)
         self._estop_callback = estop_callback
         self._stop_callback = stop_callback
         self._quit_callback = quit_callback
-        self._suppress_echo = bool(suppress_echo)
         self._capture_commands = bool(capture_commands)
         self._capture_raw_events = bool(capture_raw_events)
-        self._repeat_estop_callback = bool(repeat_estop_callback)
         self._estop_latched = threading.Event()
         self._listener_failure_reported = False
         self._saved_termios: list | None = None
@@ -143,13 +134,12 @@ class KeyboardInput:
         with self._condition:
             if not self._callbacks_active:
                 return
-            already_latched = self._estop_latched.is_set()
-            if not already_latched:
-                self._estop_latched.set()
-                self._buffer.append(OperatorCommand.EMERGENCY_STOP)
-                self._condition.notify()
-            if not already_latched or self._repeat_estop_callback:
-                callback = self._estop_callback
+            if self._estop_latched.is_set():
+                return
+            self._estop_latched.set()
+            self._buffer.append(OperatorCommand.EMERGENCY_STOP)
+            self._condition.notify()
+            callback = self._estop_callback
         if callback is not None:
             try:
                 callback()
@@ -275,8 +265,7 @@ class KeyboardInput:
                 "pynput is required for global keyboard capture. Install with: pip install pynput"
             ) from None
 
-        if self._suppress_echo:
-            self._saved_termios = _suppress_terminal_echo()
+        self._saved_termios = _suppress_terminal_echo()
         self._estop_latched.clear()
         self._listener_failure_reported = False
         with self._condition:
@@ -293,14 +282,12 @@ class KeyboardInput:
                 suppress=False,
             )
             self._listener.start()
+            listener = self._listener
             ready = threading.Event()
             startup_errors: list[BaseException] = []
 
             def wait_until_ready() -> None:
                 try:
-                    listener = self._listener
-                    if listener is None:
-                        raise RuntimeError("keyboard listener disappeared during startup")
                     listener.wait()
                 except BaseException as exc:
                     startup_errors.append(exc)
@@ -310,33 +297,16 @@ class KeyboardInput:
             threading.Thread(
                 target=wait_until_ready, name="keyboard-events-ready", daemon=True
             ).start()
-            if not ready.wait(timeout=self._startup_timeout_s):
+            if not ready.wait(timeout=_LISTENER_START_TIMEOUT_S):
                 raise RuntimeError(
-                    f"keyboard listener startup timed out after {self._startup_timeout_s:.1f}s"
+                    f"keyboard listener startup timed out after {_LISTENER_START_TIMEOUT_S:.1f}s"
                 )
             if startup_errors:
                 raise RuntimeError("keyboard listener failed during startup") from startup_errors[0]
             if not self._listener.is_alive():
                 raise RuntimeError("keyboard listener exited during startup")
-        except Exception:
-            with self._condition:
-                self._callbacks_active = False
-            listener = self._listener
-            try:
-                if listener is not None:
-                    listener.stop()
-                    listener.join(timeout=1.0)
-            except Exception:
-                logger.warning("keyboard listener rollback failed", exc_info=True)
-            try:
-                listener_alive = bool(listener is not None and listener.is_alive())
-            except Exception:
-                logger.warning("keyboard listener rollback health check failed", exc_info=True)
-                listener_alive = True
-            if not listener_alive:
-                self._listener = None
-            if self._suppress_echo:
-                self._restore_terminal_echo()
+        except BaseException:
+            self.stop()
             raise
 
         self._running = True
@@ -350,31 +320,18 @@ class KeyboardInput:
             self._buffer.clear()
             self._condition.notify_all()
         try:
-            if _stop_listener_bounded(listener, label="keyboard"):
+            if _stop_listener_bounded(listener):
                 self._listener = None
         finally:
             with self._condition:
                 self._events.clear()
                 self._keys.clear()
             self._estop_latched.clear()
-            if self._suppress_echo:
-                self._restore_terminal_echo()
-
-    def _restore_terminal_echo(self) -> None:
-        _restore_terminal_echo(self._saved_termios)
-        self._saved_termios = None
-
-    def __enter__(self) -> "KeyboardInput":
-        self.start()
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        self.stop()
+            _restore_terminal_echo(self._saved_termios)
+            self._saved_termios = None
 
     def poll(self, timeout: float = 0.05) -> list[OperatorCommand]:
         """Drain commands, waiting at most timeout seconds; zero is nonblocking and may return an empty list."""
-        if not math.isfinite(timeout) or timeout < 0.0:
-            raise ValueError("timeout must be finite and non-negative")
         if self._running and not self.healthy:
             if not self._listener_failure_reported:
                 logger.error("keyboard listener exited; latching emergency stop")

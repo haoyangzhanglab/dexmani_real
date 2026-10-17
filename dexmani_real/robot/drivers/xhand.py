@@ -541,7 +541,7 @@ class XHand:
         return command
 
     def _validate_action(self, qpos: np.ndarray) -> None:
-        from dexmani_real.robot.command_validation import check_hand_target
+        from dexmani_real.robot.commands import check_hand_target
 
         reason = check_hand_target(
             qpos,

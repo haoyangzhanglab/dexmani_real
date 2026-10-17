@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-__all__ = [
-    "adaptive_retargeting_xhand",
-    "validate_landmarks",
-]
-
-
+import logging
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 _PINKY_MCP = 17
 _PINKY_PIP = 18
@@ -37,9 +34,8 @@ _OPERATOR2MANO_RIGHT = np.array(
 )
 
 
-def validate_landmarks(keypoint_3d_array: np.ndarray) -> tuple[bool, str]:
+def _validate_landmarks(points: np.ndarray) -> tuple[bool, str]:
     """Apply the fail-closed geometric gate before touching temporal state."""
-    points = np.asarray(keypoint_3d_array, dtype=np.float64)
     if points.shape != (21, 3):
         return False, f"shape {points.shape} != (21, 3)"
     if not np.all(np.isfinite(points)):
@@ -54,12 +50,6 @@ def validate_landmarks(keypoint_3d_array: np.ndarray) -> tuple[bool, str]:
 
 def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
     """Fit validated wrist/index/middle MCP points by SVD; return a right-handed palm frame with X toward wrist."""
-    keypoint_3d_array = np.asarray(keypoint_3d_array, dtype=np.float64)
-    if keypoint_3d_array.shape != (21, 3):
-        raise ValueError(
-            f"keypoint_3d_array must have shape (21, 3), got {keypoint_3d_array.shape}"
-        )
-
     eps = 1e-8
     points = keypoint_3d_array[[0, 5, 9], :].copy()
 
@@ -104,17 +94,14 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
     return np.stack([x, normal, z], axis=1)
 
 
-def adaptive_retargeting_xhand(
-    landmarks: np.ndarray,
+def _scale_pinky(
+    raw: np.ndarray,
     *,
     scale: float,
     palm_scale: float,
 ) -> np.ndarray:
-    """Copy (21,3) MANO landmarks; scale MCP→TIP segments and wrist→MCP baseline separately."""
-    landmarks = np.asarray(landmarks, dtype=np.float64).copy()
-    if landmarks.shape != (21, 3) or not np.all(np.isfinite(landmarks)):
-        raise ValueError("landmarks must be a finite (21, 3) array")
-    raw = landmarks.copy()
+    """Copy validated MANO landmarks; scale MCP→TIP segments and wrist→MCP baseline separately."""
+    landmarks = raw.copy()
 
     if palm_scale != 1.0:
         landmarks[_PINKY_MCP] = landmarks[0] + (raw[_PINKY_MCP] - landmarks[0]) * palm_scale
@@ -129,3 +116,24 @@ def adaptive_retargeting_xhand(
     landmarks[_PINKY_TIP] = landmarks[_PINKY_DIP] + dip_to_tip * scale
 
     return landmarks
+
+
+def prepare_landmarks(landmarks, *, pinky_scale, pinky_palm_scale):
+    """Validate operator geometry, then return MANO landmarks with the configured pinky scaling."""
+    if landmarks is None:
+        return None
+    landmarks = np.asarray(landmarks, dtype=np.float64)
+    valid, reason = _validate_landmarks(landmarks)
+    if not valid:
+        logger.warning("VR landmarks rejected (%s) — no target produced", reason)
+        return None
+    try:
+        wrist_rot = _estimate_palm_frame(landmarks)
+        mano = landmarks @ wrist_rot @ _OPERATOR2MANO_RIGHT
+    except (ValueError, np.linalg.LinAlgError):
+        logger.warning("Coordinate transform failed — no target produced")
+        return None
+    mano = _scale_pinky(mano, scale=pinky_scale, palm_scale=pinky_palm_scale)
+    if not np.isfinite(mano).all():
+        raise ValueError("transformed hand landmarks must be finite")
+    return mano

@@ -7,7 +7,10 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_XHAND_COLLISION_URDF_PATH
+from dexmani_real.robot.model import (
+    ARM_JOINT_SHAPE, XARM7_XHAND_COLLISION_URDF_PATH, XARM7_EQUIVALENT_JOINT_MASK,
+)
+from ..paths import wrap_nearest_equivalent
 
 from .pose import Pose, compose_pose, compute_pose_error, invert_pose, quat_wxyz_to_rotmat
 
@@ -83,31 +86,16 @@ def compute_eef_pose_history_xarm_base(
 class XArm7Kinematics:
     """Full kinematics with MPlib integration — FK, Jacobian, pose transforms."""
 
-    def __init__(
-        self,
-        mp_planner: Any,
-        pinocchio_model: Any,
-        eef_link_id: int,
-        dof: int,
-        joint_limits: np.ndarray,
-        equivalent_joint_mask: np.ndarray,
-        base_pose_world: Pose,
-        mplib: Any,
-    ) -> None:
+    def __init__(self, mp_planner: Any, base_pose_world: Pose) -> None:
         self.mp_planner = mp_planner
-        self.pinocchio_model = pinocchio_model
-        self.eef_link_id = eef_link_id
-        self.dof = dof
-        self.joint_limits = joint_limits
-        self.equivalent_joint_mask = equivalent_joint_mask
+        self.pinocchio_model = mp_planner.pinocchio_model
+        self.eef_link_id = list(self.pinocchio_model.get_link_names()).index(mp_planner.move_group)
+        self.joint_limits = np.asarray(mp_planner.joint_limits, dtype=np.float64)
+        self.dof = len(self.joint_limits)
+        self.equivalent_joint_mask = np.asarray(XARM7_EQUIVALENT_JOINT_MASK, dtype=bool)
         self.base_pose_world = base_pose_world.copy()
         self.base_pose_inverse = invert_pose(self.base_pose_world)
-        self.mplib = mplib
-
-    def set_base_pose(self, base_pose_world: Pose) -> None:
-        self.base_pose_world = base_pose_world.copy()
-        self.base_pose_inverse = invert_pose(self.base_pose_world)
-        self.mp_planner.set_base_pose(self.to_mplib_pose(self.base_pose_world))
+        mp_planner.set_base_pose(self.to_mplib_pose(self.base_pose_world))
 
     def world_to_base_pose(self, pose_world: Pose) -> Pose:
         return compose_pose(self.base_pose_inverse, pose_world)
@@ -155,4 +143,47 @@ class XArm7Kinematics:
         return compute_pose_error(target_eef_pose_world, self.compute_eef_pose_world(qpos))
 
     def to_mplib_pose(self, pose: Pose) -> Any:
-        return self.mplib.Pose(p=pose.p, q=pose.q)
+        import mplib
+
+        return mplib.Pose(p=pose.p, q=pose.q)
+
+    def canonicalize_qpos(
+        self,
+        qpos: np.ndarray,
+        reference_qpos: np.ndarray,
+        limits: np.ndarray | None = None,
+    ) -> np.ndarray:
+        if limits is None:
+            limits = self.joint_limits
+        return wrap_nearest_equivalent(
+            qpos,
+            reference_qpos,
+            limits[:, 0],
+            limits[:, 1],
+            equivalent_mask=self.equivalent_joint_mask,
+        )
+
+    def planning_limits(self, reference_qpos: np.ndarray) -> np.ndarray:
+        """Bound HOME's equivalent representations around the measured joint band."""
+        limits = self.joint_limits.copy()
+        mask = self.equivalent_joint_mask
+        limits[mask, 0] = np.maximum(limits[mask, 0], reference_qpos[mask] - 3.0 * np.pi)
+        limits[mask, 1] = np.minimum(limits[mask, 1], reference_qpos[mask] + 3.0 * np.pi)
+        return limits
+
+    def canonicalize_path(self, path: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
+        """Choose continuous equivalent angles within model limits, then HOME limits."""
+        path = path.copy()
+        for limits in (self.joint_limits, self.planning_limits(reference_qpos)):
+            previous = reference_qpos
+            for index, qpos in enumerate(path):
+                path[index] = self.canonicalize_qpos(qpos, previous, limits)
+                previous = path[index]
+        return path
+
+    def compute_qpos_delta(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
+        """Signed deltas of admitted joint vectors; equivalent axes wrap to [-π, π)."""
+        delta = qpos - reference_qpos
+        mask = self.equivalent_joint_mask
+        delta[mask] = (delta[mask] + np.pi) % (2.0 * np.pi) - np.pi
+        return delta

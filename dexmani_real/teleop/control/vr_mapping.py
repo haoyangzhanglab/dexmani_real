@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import logging
 
-__all__ = ["VRWristMapper"]
-
 import numpy as np
 from transforms3d.quaternions import mat2quat, quat2mat
 
+from dexmani_real.planning.kinematics.pose import Pose, quat_multiply
 from dexmani_real.utils.geometry import normalize_quat_wxyz, validate_rotation_matrix
 
 
@@ -26,20 +25,12 @@ class VRWristMapper:
 
     def __init__(
         self,
-        pos_scale: float = 1.0,
-        rot_scale: float = 1.0,
-        vr_to_robot_rot: np.ndarray | None = None,
+        *,
+        pos_scale: float,
+        vr_to_robot_rot: np.ndarray,
     ) -> None:
-        if not np.isfinite(pos_scale):
-            raise ValueError("pos_scale must be finite")
-        if not np.isfinite(rot_scale) or rot_scale != 1.0:
-            raise ValueError("only rot_scale=1.0 is supported by reset-relative rotation mapping")
         self.pos_scale = pos_scale
-        self.vr_to_robot_rot = (
-            np.eye(3)
-            if vr_to_robot_rot is None
-            else validate_rotation_matrix(vr_to_robot_rot, name="vr_to_robot_rot")
-        )
+        self.vr_to_robot_rot = validate_rotation_matrix(vr_to_robot_rot, name="vr_to_robot_rot")
 
         self.wrist_pos0: np.ndarray | None = None
         self.wrist_rot0: np.ndarray | None = None
@@ -77,7 +68,7 @@ class VRWristMapper:
         self,
         wrist_pos: np.ndarray,
         wrist_quat_wxyz: np.ndarray,
-    ) -> dict[str, np.ndarray] | None:
+    ) -> Pose | None:
         if not self.is_ready():
             return None
 
@@ -97,18 +88,15 @@ class VRWristMapper:
         target_pos = self.eef_pos0 + delta_pos_base
         target_rot = delta_rot_base @ self.eef_rot0
         target_quat_wxyz = normalize_quat_wxyz(mat2quat(target_rot))
-        if self.last_quat_wxyz is not None and np.dot(target_quat_wxyz, self.last_quat_wxyz) < 0:
+        if np.dot(target_quat_wxyz, self.last_quat_wxyz) < 0:
             target_quat_wxyz = -target_quat_wxyz
-        if not np.all(np.isfinite(target_pos)) or not np.all(np.isfinite(target_quat_wxyz)):
+        if not np.all(np.isfinite(target_pos)):
             logger.warning("VRWristMapper.map: non-finite mapped pose — no target")
             return None
 
         self.last_quat_wxyz = target_quat_wxyz.copy()
 
-        return {
-            "pos": target_pos,
-            "quat_wxyz": target_quat_wxyz,
-        }
+        return Pose(target_pos, target_quat_wxyz)
 
     def clear(self) -> None:
         self.wrist_pos0 = None
@@ -118,12 +106,39 @@ class VRWristMapper:
         self.last_quat_wxyz = None
 
     def is_ready(self) -> bool:
-        return all(
-            value is not None
-            for value in (
-                self.wrist_pos0,
-                self.wrist_rot0,
-                self.eef_pos0,
-                self.eef_rot0,
-            )
+        return self.wrist_pos0 is not None
+
+
+def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
+    """Convert a normalized WXYZ quaternion to a shortest-arc rotation vector."""
+    sign = q if q[0] >= 0 else -q
+    w, x, y, z = np.clip(sign[0], -1.0, 1.0), sign[1], sign[2], sign[3]
+    sin_half = np.sqrt(x * x + y * y + z * z)
+    if sin_half < 1e-12:
+        return np.zeros(3, dtype=np.float64)
+    angle = 2.0 * np.arctan2(sin_half, w)
+    return angle * np.array([x, y, z], dtype=np.float64) / sin_half
+
+
+def ema_smooth_pose(target: Pose, previous: Pose, alpha_pos: float, alpha_rot: float) -> Pose:
+    """Smooth base-frame meters and shortest relative rotations with startup-validated alphas."""
+    pos = alpha_pos * target.p + (1.0 - alpha_pos) * previous.p
+    prev_quat = previous.q
+    target_quat = target.q
+    if float(np.dot(prev_quat, target_quat)) < 0.0:
+        target_quat = -target_quat
+    prev_conjugate = prev_quat * np.array([1.0, -1.0, -1.0, -1.0])
+    relative_quat = normalize_quat_wxyz(quat_multiply(prev_conjugate, target_quat), name="relative")
+    rv = alpha_rot * _quat_to_rotvec(relative_quat)
+    angle = float(np.linalg.norm(rv))
+    if angle < 1e-12:
+        quat = prev_quat.copy()
+    else:
+        axis = rv / angle
+        half = angle / 2.0
+        delta_quat = np.array(
+            [np.cos(half), axis[0] * np.sin(half), axis[1] * np.sin(half), axis[2] * np.sin(half)],
+            dtype=np.float64,
         )
+        quat = quat_multiply(prev_quat, delta_quat)
+    return Pose(pos, quat)

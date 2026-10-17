@@ -4,22 +4,17 @@ import logging
 import threading
 import time
 from concurrent.futures import CancelledError
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.robot.commands import DispatchStatus
+from dexmani_real.robot.commands import (
+    DispatchStatus, DispatchResult, DispatchError, DispatchInterrupted,
+    check_arm_target, check_hand_target,
+)
 
 from dexmani_real.ipc.schema import HAND_STATE_DTYPE
-from dexmani_real.robot.command_validation import check_arm_target, check_hand_target
-from dexmani_real.runtime.safety import (
-    request_emergency_stop,
-    RunEndReason,
-    SafetyState,
-    command_may_cross_sdk,
-    publish_arm_authority,
-    revoke_motion,
-)
+from dexmani_real.runtime.state import RunEndReason, SafetyState
 
 
 logger = logging.getLogger(__name__)
@@ -36,30 +31,6 @@ def _update_tactile_cache(raw, values, valid_ns, now_ns):
     np.copyto(values, raw, where=valid[..., None])
     np.copyto(valid_ns, now_ns, where=valid)
     return not valid.all()
-
-
-@dataclass(frozen=True)
-class DispatchResult:
-    arm: DispatchStatus = DispatchStatus.NOT_CALLED
-    hand: DispatchStatus = DispatchStatus.NOT_CALLED
-    timestamp_ns: int = 0  # host dispatch completion, never arrival
-    command_id: tuple[int, int] = (-1, -1)
-
-
-class DispatchError(RuntimeError):
-    def __init__(self, message, result, *, revoked=False, cause=None):
-        super().__init__(message)
-        self.result = result
-        self.revoked = revoked
-        self.cause = cause
-
-
-class DispatchInterrupted(KeyboardInterrupt):
-    """Cancellation evidence local to one attempted dispatch."""
-
-    def __init__(self, result):
-        super().__init__("dispatch interrupted")
-        self.result = result
 
 
 @dataclass(frozen=True)
@@ -100,7 +71,7 @@ class DexManiRobot:
 
     def check(self):
         self._check_owner()
-        publish_arm_authority(self.shared)
+        self.shared.publish_arm_authority()
         if self.check_services is not None and not self.check_services():
             # The service owner applies its own fail-safe and records the cause.
             raise RuntimeError("required runtime service unavailable")
@@ -113,7 +84,7 @@ class DexManiRobot:
         if self._owner is not None:
             raise RuntimeError("robot connection is single-use")
         self._owner = threading.get_ident()
-        epoch = int(self.shared.run_id)
+        epoch = self.shared.run_id
 
         def cancelled():
             self.check()
@@ -139,7 +110,7 @@ class DexManiRobot:
             self.read_initial_state(cancel_requested=cancelled)
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
-                request_emergency_stop(self.shared)
+                self.shared.request_emergency_stop()
             elif isinstance(exc, Exception):
                 self.shared.error_state = True
             try:
@@ -151,12 +122,12 @@ class DexManiRobot:
     def reset_tactile_sensors(self, *, cancel_requested):
         """Explicit idle-owner preparation; never HOME or move fingers for reset."""
         self.check()
-        if int(self.shared.safety_state) != int(SafetyState.ARMED):
+        if self.shared.safety_state != SafetyState.ARMED:
             raise RuntimeError("tactile reset requires idle ARMED state")
         if self.hand is None:
             return False
-        revoke_motion(self.shared)
-        epoch = int(self.shared.run_id)
+        self.shared.revoke_motion()
+        epoch = self.shared.run_id
         self.stop()
 
         def cancelled():
@@ -178,7 +149,7 @@ class DexManiRobot:
     def reset_hand_feedback(self, *, deadline_ns=None):
         """Reacquire a session's initial values without connecting, resetting or moving hardware."""
         self._check_owner()
-        if int(self.shared.safety_state) == int(SafetyState.RUNNING):
+        if self.shared.safety_state == SafetyState.RUNNING:
             raise RuntimeError("cannot clear hand feedback during motion")
         self._last_hand = None
         self._tactile_cache = {
@@ -278,7 +249,7 @@ class DexManiRobot:
         if not self._connected:
             raise RuntimeError("robot is not connected")
         try:
-            arm = self.arm.snapshot().frame
+            arm = self.arm.snapshot()
             hand = self._read_hand()
             if hand is not None:
                 from dexmani_real.runtime.observation import hand_feedback_time_ns
@@ -287,13 +258,13 @@ class DexManiRobot:
                                        int(self.runtime.hand.feedback_max_age_s * 1e9))
         except Exception:
             self.shared.error_state = True
-            revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
+            self.shared.revoke_motion(SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
             raise
         return RobotState(arm, hand)
 
     def _initial_state_cancelled(self, epoch):
         return bool(
-            epoch != int(self.shared.run_id)
+            epoch != self.shared.run_id
             or self.shared.stop_request
             or self.shared.estop_request
             or self.shared.error_state
@@ -304,7 +275,7 @@ class DexManiRobot:
     def read_initial_state(self, *, cancel_requested=None):
         """Wait only for XHand's bounded initial cache, without resetting its deadline."""
         self._check_owner()
-        epoch = int(self.shared.run_id)
+        epoch = self.shared.run_id
         # A valid read clears the shared initialization field, not this attempt's deadline.
         deadline_ns = self._hand_initializing_until_ns if self.hand is not None else None
 
@@ -319,7 +290,7 @@ class DexManiRobot:
             if deadline_ns is not None and time.monotonic_ns() >= deadline_ns:
                 # This timeout is outside read_state's exception fence; apply the same fault boundary.
                 self.shared.error_state = True
-                revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
+                self.shared.revoke_motion(SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
                 raise RuntimeError(
                     f"XHand initial feedback timed out after {self.runtime.hand.initial_state_timeout_s:.3f}s"
                 )
@@ -337,15 +308,6 @@ class DexManiRobot:
             if remaining_ns > 0:
                 time.sleep(min(0.01, remaining_ns / 1e9))
 
-    def _authorized(self, run_id, state):
-        return (
-            not self.shared.quit_requested
-            and not self.shared.stop_request
-            and command_may_cross_sdk(
-                self.shared, run_id=run_id, required_safety_state=state
-            )
-        )
-
     def prepare_streaming(self, run_id):
         """Prepare Mode 1 from measured standstill under the owner's epoch; the caller owns stop on failure."""
         self._check_owner()
@@ -359,7 +321,7 @@ class DexManiRobot:
 
         def check_abort():
             self.check()
-            if not self._authorized(run_id, SafetyState.ARMED):
+            if not self.shared.command_may_cross_sdk(run_id=run_id, required_safety_state=SafetyState.ARMED):
                 raise DispatchError(
                     "motion authority revoked during streaming preparation", DispatchResult(),
                     revoked=True, cause="authority_revoked",
@@ -371,8 +333,12 @@ class DexManiRobot:
         # Waiting services the hand and health on this thread, never on xarm-owner.
         from dexmani_real.robot.drivers.xarm7 import HomeAborted
         try:
-            self.arm.prepare(run_id, service=lambda: (self._read_hand(), self.check()),
-                             abort=lambda: not self._authorized(run_id, SafetyState.ARMED))
+            self.arm.prepare(
+                run_id, service=lambda: (self._read_hand(), self.check()),
+                abort=lambda: not self.shared.command_may_cross_sdk(
+                    run_id=run_id, required_safety_state=SafetyState.ARMED,
+                ),
+            )
         except HomeAborted as exc:
             raise DispatchError(str(exc), DispatchResult(), revoked=True,
                                 cause="authority_revoked") from exc
@@ -380,85 +346,83 @@ class DexManiRobot:
 
     def _send(self, command, state, *, valid_until_ns, execute_until_ns=None):
         self._check_owner()
-        result = DispatchResult()
+        arm_status, hand_status = DispatchStatus.NOT_CALLED, DispatchStatus.NOT_CALLED
+        command_id = (-1, -1)
+
+        def receipt():
+            return DispatchResult(arm_status, hand_status, time.monotonic_ns(), command_id)
+
+        def check_dispatch():
+            if not self.shared.command_may_cross_sdk(run_id=command.run_id, required_safety_state=state):
+                raise DispatchError("motion authority revoked", receipt(), revoked=True,
+                                    cause="authority_revoked")
+            if self.arm is not None:
+                self.arm.check_error()
+            now = time.monotonic_ns()
+            if now >= valid_until_ns or (execute_until_ns is not None and now >= execute_until_ns):
+                raise DispatchError("dispatch deadline expired", receipt(), revoked=True,
+                                    cause="deadline_expired")
+            self._motion_active = True
+
         try:
             if self._hand_stop_pending:
                 raise DispatchError(
                     "previous XHand stop remains unconfirmed",
-                    result,
+                    receipt(),
                     revoked=True,
                     cause="stop_unconfirmed",
                 )
-            # All present targets are checked before either SDK sees a target.
-            for name in ("arm", "hand"):
-                target = getattr(command, f"{name}_qpos")
-                if target is None:
-                    continue
-                device = getattr(self, name)
-                if not self._connected or device is None or not device.is_connected:
-                    raise DispatchError(f"{name} device unavailable", result)
-                issue = (
-                    check_arm_target(
-                        target,
-                        joint_limit_lower_rad=np.asarray(self.runtime.arm.joint_limit_lower),
-                        joint_limit_upper_rad=np.asarray(self.runtime.arm.joint_limit_upper),
-                    )
-                    if name == "arm"
-                    else check_hand_target(
-                        target,
-                        mechanical_lower_rad=np.asarray(self.runtime.hand.mechanical_qpos_min_rad),
-                        mechanical_upper_rad=np.asarray(self.runtime.hand.mechanical_qpos_max_rad),
-                    )
+            # Validate both targets before submitting either device's command.
+            if command.arm_qpos is not None:
+                if not self._connected or self.arm is None or not self.arm.is_connected:
+                    raise RuntimeError("arm device unavailable")
+                issue = check_arm_target(
+                    command.arm_qpos,
+                    joint_limit_lower_rad=np.asarray(self.runtime.arm.joint_limit_lower),
+                    joint_limit_upper_rad=np.asarray(self.runtime.arm.joint_limit_upper),
                 )
                 if issue:
-                    raise DispatchError(f"unsafe {name} target: {issue}", result)
-            for name in ("arm", "hand"):
-                target = getattr(command, f"{name}_qpos")
-                if target is None:
-                    continue
-                if not self._authorized(command.run_id, state):
-                    raise DispatchError(
-                        "motion authority revoked", result, revoked=True, cause="authority_revoked"
-                    )
-                if self.arm is not None:
-                    self.arm.check_error()
-                now_ns = time.monotonic_ns()
-                if (now_ns >= valid_until_ns
-                        or (execute_until_ns is not None and now_ns >= execute_until_ns)):
-                    raise DispatchError(
-                        "dispatch deadline expired", result, revoked=True, cause="deadline_expired"
-                    )
-                self._motion_active = True
-                if name == "arm":
-                    if execute_until_ns is None or execute_until_ns <= 0:
-                        raise DispatchError("arm requires an explicit input/decision execution deadline", result)
-                    command_id = self.arm.submit(command, submit_until_ns=valid_until_ns,
-                                                 execute_until_ns=execute_until_ns)
-                    status = DispatchStatus.SUBMITTED
-                    result = replace(result, arm=status, command_id=command_id)
-                else:
-                    result = replace(result, hand=DispatchStatus.UNKNOWN)
-                    status = self.hand.send_action(target)
-                    result = replace(result, hand=status)
-                    self._check_hand_send(status)
-                if status in (DispatchStatus.REJECTED, DispatchStatus.UNKNOWN):
-                    raise DispatchError(f"{name} SDK rejected target", result)
-            if not self._authorized(command.run_id, state):
+                    raise ValueError(f"unsafe arm target: {issue}")
+                if execute_until_ns is None or execute_until_ns <= 0:
+                    raise ValueError("arm requires an explicit input/decision execution deadline")
+            if command.hand_qpos is not None:
+                if not self._connected or self.hand is None or not self.hand.is_connected:
+                    raise RuntimeError("hand device unavailable")
+                issue = check_hand_target(
+                    command.hand_qpos,
+                    mechanical_lower_rad=np.asarray(self.runtime.hand.mechanical_qpos_min_rad),
+                    mechanical_upper_rad=np.asarray(self.runtime.hand.mechanical_qpos_max_rad),
+                )
+                if issue:
+                    raise ValueError(f"unsafe hand target: {issue}")
+            if command.arm_qpos is not None:
+                check_dispatch()
+                command_id = self.arm.submit(command, submit_until_ns=valid_until_ns,
+                                             execute_until_ns=execute_until_ns)
+                arm_status = DispatchStatus.SUBMITTED
+            if command.hand_qpos is not None:
+                check_dispatch()
+                hand_status = DispatchStatus.UNKNOWN
+                hand_status = self.hand.send_action(command.hand_qpos)
+                self._check_hand_send(hand_status)
+                if hand_status in (DispatchStatus.REJECTED, DispatchStatus.UNKNOWN):
+                    raise RuntimeError("hand SDK rejected target")
+            if not self.shared.command_may_cross_sdk(run_id=command.run_id, required_safety_state=state):
                 raise DispatchError(
                     "motion authority revoked during dispatch",
-                    result,
+                    receipt(),
                     revoked=True,
                     cause="authority_revoked",
                 )
-            return replace(result, timestamp_ns=time.monotonic_ns())
+            return receipt()
         except KeyboardInterrupt as exc:
             if self.arm is not None:
                 self.arm.request_stop()
-            raise DispatchInterrupted(replace(result, timestamp_ns=time.monotonic_ns())) from exc
+            raise DispatchInterrupted(receipt()) from exc
         except Exception as exc:
             if self.arm is not None and command.arm_qpos is not None:
                 self.arm.request_stop()
-            result = replace(result, timestamp_ns=time.monotonic_ns())
+            result = receipt()
             if isinstance(exc, DispatchError):
                 exc.result = result
                 raise
@@ -474,7 +438,7 @@ class DexManiRobot:
                 logger.warning("XHand send CRC; delivery unconfirmed, continuing with next target")
             if now_ns - self._hand_send_failure_started_ns >= budget_ns:
                 self.shared.error_state = True
-                revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
+                self.shared.revoke_motion(SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
                 raise RuntimeError("XHand continuous send CRC timed out; delivery remains unconfirmed")
         elif status == DispatchStatus.ACCEPTED:
             if self._hand_send_failure_started_ns is not None:
@@ -520,9 +484,7 @@ class DexManiRobot:
 
         def check_abort():
             self.check()
-            if abort_check() or not command_may_cross_sdk(
-                self.shared, run_id=run_id, required_safety_state=SafetyState.ARMED
-            ):
+            if abort_check() or not self.shared.command_may_cross_sdk(run_id=run_id, required_safety_state=SafetyState.ARMED):
                 return "home authority revoked"
             return None
 
@@ -553,8 +515,8 @@ class DexManiRobot:
     def stop(self):
         # XHand stop retains its bounded protocol retries; ordinary sends never retry.
         self.end_hand_send_interval()
-        if int(self.shared.safety_state) == int(SafetyState.RUNNING):
-            revoke_motion(self.shared)
+        if self.shared.safety_state == SafetyState.RUNNING:
+            self.shared.revoke_motion()
         errors = []
         # A failed/interrupted stop must not advertise a clean software stop.
         unresolved_motion = self._motion_active
@@ -579,7 +541,7 @@ class DexManiRobot:
         if errors:
             self._motion_active = True
             self.shared.error_state = True
-            revoke_motion(self.shared, SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
+            self.shared.revoke_motion(SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
             raise RuntimeError(f"robot stop failures: {errors}") from errors[0]
         self._motion_active = False
 
@@ -589,7 +551,7 @@ class DexManiRobot:
             self.shared.estop_request
             or self.shared.error_state
             or self.shared.quit_requested
-            or int(self.shared.safety_state) != int(SafetyState.RUNNING)
+            or self.shared.safety_state != SafetyState.RUNNING
         ):
             self.stop()
         now = time.monotonic_ns()
@@ -600,6 +562,8 @@ class DexManiRobot:
                 self._stop_hand()
 
     def close(self):
+        if self._owner is None:
+            return
         self._check_owner()
         errors = []
         try:

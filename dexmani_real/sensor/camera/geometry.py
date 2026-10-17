@@ -82,30 +82,6 @@ class CameraIntrinsics:
             "distortion_coeffs": list(self.distortion_coeffs),
         }
 
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "CameraIntrinsics":
-        required = {
-            "width",
-            "height",
-            "fx",
-            "fy",
-            "ppx",
-            "ppy",
-            "distortion_model",
-            "distortion_coeffs",
-        }
-        unknown = set(value) - required
-        missing = required - set(value)
-        if unknown or missing:
-            raise ValueError(
-                f"camera intrinsics keys mismatch: missing={sorted(missing)}, "
-                f"unknown={sorted(unknown)}"
-            )
-        coefficients = value["distortion_coeffs"]
-        if not isinstance(coefficients, (list, tuple)):
-            raise TypeError("distortion_coeffs must be an array")
-        return cls(**value)
-
     def matrix(self, *, dtype: np.typing.DTypeLike = np.float64) -> np.ndarray:
         return np.array(
             [[self.fx, 0.0, self.ppx], [0.0, self.fy, self.ppy], [0.0, 0.0, 1.0]],
@@ -170,20 +146,7 @@ class RGBDGeometry:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RGBDGeometry":
-        required = {"depth", "color", "T_color_from_depth"}
-        unknown = set(value) - required
-        missing = required - set(value)
-        if unknown or missing:
-            raise ValueError(
-                f"RGB-D geometry keys mismatch: missing={sorted(missing)}, "
-                f"unknown={sorted(unknown)}"
-            )
-        depth = value["depth"]
-        color = value["color"]
-        if not isinstance(depth, Mapping) or not isinstance(color, Mapping):
-            raise TypeError("RGB-D geometry depth/color must be objects")
-        return cls(
-            depth=CameraIntrinsics.from_dict(depth),
-            color=CameraIntrinsics.from_dict(color),
-            T_color_from_depth=value["T_color_from_depth"],
-        )
+        fields = dict(value)
+        fields["depth"] = CameraIntrinsics(**fields["depth"])
+        fields["color"] = CameraIntrinsics(**fields["color"])
+        return cls(**fields)

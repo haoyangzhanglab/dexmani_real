@@ -6,7 +6,6 @@ import logging
 import tempfile
 import uuid
 from contextlib import ExitStack
-from dataclasses import dataclass
 from pathlib import Path
 
 import h5py
@@ -31,51 +30,39 @@ from dexmani_real.utils.control_clock import sampling_clock_ns
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class CanonicalExportConfig:
-    chunk_frames: int = 100
-    compression_level: int = 3
-
-    def __post_init__(self):
-        if (
-            isinstance(self.chunk_frames, bool)
-            or not isinstance(self.chunk_frames, int)
-            or self.chunk_frames <= 0
-        ):
-            raise ValueError("chunk_frames must be a positive integer")
-        if (
-            isinstance(self.compression_level, bool)
-            or not isinstance(self.compression_level, int)
-            or not 0 <= self.compression_level <= 9
-        ):
-            raise ValueError("compression_level must be an integer in [0, 9]")
-
-
 def export_raw_to_zarr(
     input_root: str | Path,
     output_path: str | Path,
-    config: CanonicalExportConfig | None = None,
     *,
     processing: ProcessingConfig,
+    chunk_frames: int = 100,
+    compression_level: int = 3,
     exclude: tuple[str, ...] = (),
     progress_callback=None,
 ) -> dict:
     """Export all 15 modalities; reject incomplete episodes without changing Raw.
     Unexpected conversion/write failures abort publication and retain staging.
     """
-    config = config or CanonicalExportConfig()
-    if not isinstance(processing, ProcessingConfig):
-        raise TypeError("processing must be an explicit ProcessingConfig")
-    source, target = Path(input_root).resolve(), Path(output_path).expanduser().resolve()
+    if type(chunk_frames) is not int or chunk_frames <= 0:
+        raise ValueError("chunk_frames must be a positive integer")
+    if type(compression_level) is not int or not 0 <= compression_level <= 9:
+        raise ValueError("compression_level must be an integer in [0, 9]")
+    source = Path(input_root).expanduser().resolve()
+    output = Path(output_path).expanduser()
+    target = output.resolve()
     if target == source or source in target.parents or target in source.parents:
         raise ValueError("output and Raw input must not contain one another")
-    output = Path(output_path).expanduser()
     if output.is_symlink():
         raise ValueError("canonical output must not be a symlink")
     if target_is_occupied(target):
         raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {target}")
     if any(p.suffix == ".zarr" and p.exists() for p in target.parents):
         raise ValueError("output must not be inside an existing Zarr store")
+    repo_root = Path(__file__).resolve().parents[2]
+    for name in ("episodes", "rollouts"):
+        protected = (repo_root / name).resolve()
+        if target == protected or protected in target.parents:
+            raise ValueError(f"output must not be inside Raw directory: {protected}")
     selected, excluded = _select_episodes(source, exclude)
     rejected = {}
     staging = root = data = None
@@ -98,7 +85,7 @@ def export_raw_to_zarr(
                     if not h5py.is_hdf5(episode / "data.h5"):
                         raise RawDataError("data.h5 is not an HDF5 file")
                     reader = resources.enter_context(EpisodeReader(episode))
-                    pointcloud_deriver = validate_export_episode(reader, processing)
+                    camera, base_from_color = validate_export_episode(reader)
                 except ValueError as exc:
                     rejected[episode.name] = str(exc)
                     logger.warning("Rejected %s: %s", episode.name, exc)
@@ -110,21 +97,20 @@ def export_raw_to_zarr(
                     task = validate_task_identity(task)
                 except (TypeError, ValueError) as exc:
                     incompatibility = f"{episode.name}: {exc}"
-                specs = canonical_array_specs(
-                    frames,
+                tails = canonical_array_specs(
                     processing.pointcloud.num_points,
-                    int(reader.meta["camera_color_height"]),
-                    int(reader.meta["camera_color_width"]),
+                    camera.geometry.color.height,
+                    camera.geometry.color.width,
                 )
-                tails = {key: (shape[1:], dtype) for key, (shape, dtype) in specs.items()}
+                period_ns, tolerance_ns = sampling_clock_ns(reader.control_hz)
                 attrs = dict(
                     format=CANONICAL_FORMAT,
                     task_name=task,
                     dt=reader.dt,
                     timing_admission=dict(
                         rule="adjacent_interval_and_cumulative_grid",
-                        period_ns=sampling_clock_ns(reader.control_hz)[0],
-                        tolerance_ns=sampling_clock_ns(reader.control_hz)[1],
+                        period_ns=period_ns,
+                        tolerance_ns=tolerance_ns,
                     ),
                     action_semantics="absolute_joint_goal_not_next_step_arrival",
                     depth_scale_m_per_unit=float(reader.meta["depth_scale"]),
@@ -142,17 +128,18 @@ def export_raw_to_zarr(
                     elif attrs["depth_scale_m_per_unit"] != first_attrs["depth_scale_m_per_unit"]:
                         incompatibility = f"{episode.name}: depth_scale_m_per_unit must be uniform"
                     else:
-                        for key in specs:
+                        for key in tails:
                             if tails[key] != first_tails[key]:
                                 incompatibility = f"{episode.name}: incompatible {key} shape or dtype"
                                 break
                 row_bytes = sum(
                     int(np.prod(tail)) * dtype.itemsize for tail, dtype in tails.values()
                 )
-                chunk = min(config.chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes))
+                chunk = min(chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes))
                 try:
                     blocks = iter_canonical_blocks(
-                        reader, processing, pointcloud_deriver=pointcloud_deriver, chunk_frames=chunk
+                        reader, processing, camera=camera, base_from_color=base_from_color,
+                        chunk_frames=chunk
                     )
                     if incompatibility is not None:
                         # Invalid evidence is rejected even when its metadata differs from the cache.
@@ -166,7 +153,7 @@ def export_raw_to_zarr(
                                 tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
                             )
                         root, data = _create_store(
-                            staging, attrs, revision, tails, chunk, config
+                            staging, attrs, revision, tails, chunk, compression_level
                         )
                     count = _consume_episode(blocks, data, tails, offset, frames)
                 except RawDataError as exc:
@@ -183,11 +170,7 @@ def export_raw_to_zarr(
                 episode_ids.append(
                     episode.name if episode == source else episode.relative_to(source).as_posix()
                 )
-                episode_arm_execution.append(
-                    "mode1_submitted_with_servo_evidence" if reader.meta.get("arm_action_semantics") == "q_goal_submitted"
-                    else "mode1_first_point_with_servo_evidence" if reader.meta.get("arm_control_mode") == 1
-                    else "mode6_direct_target_receipt"
-                )
+                episode_arm_execution.append(reader.meta["arm_execution_format"])
         if not ends:
             raise ValueError("all selected episodes were rejected; no Zarr written")
         root.create_group("meta").create_dataset(
@@ -226,11 +209,11 @@ def _select_episodes(source, exclude):
     return selected, excluded
 
 
-def _create_store(staging, attrs, revision, tails, chunk, config):
+def _create_store(staging, attrs, revision, tails, chunk, compression_level):
     root = zarr.open_group(str(staging), mode="w")
     root.attrs.update(dict(attrs, data_revision=revision))
     data = root.create_group("data")
-    compressor = zarr.get_codec({"id": "zstd", "level": config.compression_level})
+    compressor = zarr.get_codec({"id": "zstd", "level": compression_level})
     for key, (tail, dtype) in tails.items():
         data.create_dataset(
             key,

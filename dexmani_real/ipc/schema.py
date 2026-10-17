@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 
 from dexmani_real.robot.model import (
@@ -17,7 +15,7 @@ POINT_CLOUD_FEATURE_DIM = 6
 
 
 def make_pointcloud_frame_dtype(num_points: int) -> np.dtype:
-    """Return the latest-only realtime point-cloud IPC schema."""
+    """Point-cloud payload with its source camera identity and pipeline clocks."""
     if (
         isinstance(num_points, bool)
         or not isinstance(num_points, (int, np.integer))
@@ -36,32 +34,6 @@ def make_pointcloud_frame_dtype(num_points: int) -> np.dtype:
         ],
         align=True,
     )
-
-
-def validate_point_cloud_array(
-    value: Any,
-    *,
-    num_points: int,
-    label: str = "point_cloud",
-) -> np.ndarray:
-    """Validate the canonical finite ``float32[N,6]`` xyzrgb payload."""
-    if (
-        isinstance(num_points, bool)
-        or not isinstance(num_points, (int, np.integer))
-        or num_points <= 0
-    ):
-        raise ValueError("num_points must be a positive integer")
-    array = np.asarray(value)
-    expected_shape = (int(num_points), POINT_CLOUD_FEATURE_DIM)
-    if array.shape != expected_shape or array.dtype != np.float32:
-        raise ValueError(
-            f"{label} must be float32 {expected_shape}, got shape={array.shape} dtype={array.dtype}"
-        )
-    if not np.all(np.isfinite(array)):
-        raise ValueError(f"{label} contains NaN/Inf")
-    if np.any(array[:, 3:] < 0.0) or np.any(array[:, 3:] > 1.0):
-        raise ValueError(f"{label} RGB values must be in [0,1]")
-    return array
 
 
 ARM_STATE_DTYPE = np.dtype(
@@ -136,5 +108,4 @@ __all__ = [
     "VR_FRAME_DTYPE",
     "make_pointcloud_frame_dtype",
     "make_camera_frame_dtype",
-    "validate_point_cloud_array",
 ]

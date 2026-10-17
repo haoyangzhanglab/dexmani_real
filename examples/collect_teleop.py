@@ -16,20 +16,10 @@ import argparse
 import yaml
 
 from dexmani_real.config.experiment import config_as_dict, load_experiment_config
-from dexmani_real.teleop.config import (
-    DEFAULT_TASK_NAME,
-    validate_task_dir_name,
-)
+from dexmani_real.teleop.config import DEFAULT_TASK_NAME
 
 
 logger = logging.getLogger("dexmani_real.cli.collect_teleop")
-
-
-def _task_name_arg(value: str) -> str:
-    try:
-        return validate_task_dir_name(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,7 +28,6 @@ def main(argv: list[str] | None = None) -> int:
         "task_name",
         metavar="TASK",
         nargs="?",
-        type=_task_name_arg,
         default=DEFAULT_TASK_NAME,
         help=(
             "Task name used for recording metadata and episodes/<task_name>/; "
@@ -108,10 +97,7 @@ def main(argv: list[str] | None = None) -> int:
             camera_calibration_path=args.camera_calibration,
         )
     except Exception:
-        logger.error(
-            "teleoperation startup failed before lifecycle ownership was established",
-            exc_info=True,
-        )
+        logger.error("teleoperation failed", exc_info=True)
         return 1
 
 

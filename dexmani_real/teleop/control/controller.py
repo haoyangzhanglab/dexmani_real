@@ -1,15 +1,12 @@
 """Current-row teleop mapping and commit of dispatched absolute targets."""
 
+import numpy as np
+
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import IKFailureKind
-from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
+from dexmani_real.planning.kinematics.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.robot.action import ActionIntent
-from dexmani_real.teleop.control.action_proposal import compute_target_eef_pose
-from dexmani_real.teleop.control.hand_retargeting import (
-    HandRetargetObservationCache,
-    compute_hand_command,
-    reset_hand_retargeter,
-)
+from dexmani_real.teleop.control.vr_mapping import ema_smooth_pose
 
 
 class TeleopController:
@@ -21,15 +18,15 @@ class TeleopController:
         )
         self.hand_retargeter = hand_retargeter
         self.arm_fk = make_arm_fk()
-        self.hand_observation_cache = HandRetargetObservationCache()
         self.clear_reference()
 
     def clear_reference(self):
         self.previous_arm_command = None
         self.arm_mapper.clear()
-        self.smoothed_eef_position = self.smoothed_eef_quaternion = None
-        self.hand_observation_cache.reset()
-        reset_hand_retargeter(self.hand_retargeter)
+        self.smoothed_eef_pose = None
+        self.hand_observation_id = self.hand_target = None
+        if self.hand_retargeter is not None:
+            self.hand_retargeter.reset()
 
     def reset_reference(self, row):
         self.clear_reference()
@@ -46,12 +43,11 @@ class TeleopController:
             )
             if not self.arm_mapper.is_ready():
                 return False
-            if row.hand is not None:
-                reset_hand_retargeter(self.hand_retargeter, row.hand["qpos"][0])
+            if self.hand_retargeter is not None and row.hand is not None:
+                self.hand_retargeter.reset(initial_qpos=row.hand["qpos"][0])
             # The first EMA step starts at the same measured FK pose as the VR anchor.
             self.previous_arm_command = arm_qpos
-            self.smoothed_eef_position = pos.copy()
-            self.smoothed_eef_quaternion = quat.copy()
+            self.smoothed_eef_pose = Pose(pos.copy(), quat.copy())
             prepared = True
             return True
         finally:
@@ -63,22 +59,23 @@ class TeleopController:
         mapped = self.arm_mapper.map(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
         if mapped is None:
             return None
-        target = compute_target_eef_pose(
-            mapped["pos"],
-            mapped["quat_wxyz"],
-            previous_position_xarm_base_m=self.smoothed_eef_position,
-            previous_quat_xarm_base_wxyz=self.smoothed_eef_quaternion,
-            ema_alpha_position=cfg.policy.ema.alpha_pos,
-            ema_alpha_rotation=cfg.policy.ema.alpha_rot,
+        target = ema_smooth_pose(
+            mapped, self.smoothed_eef_pose,
+            cfg.policy.ema.alpha_pos, cfg.policy.ema.alpha_rot,
         )
         hand = None
         if cfg.policy.hand_enabled:
-            proposal = compute_hand_command(
-                self.hand_retargeter, row.vr, self.hand_observation_cache
-            )
-            if proposal is None:
+            observation_id = row.vr["ring_sequence"]
+            if self.hand_observation_id != observation_id:
+                # Claim each sample before solving; a failed solve is not retried on later ticks.
+                self.hand_observation_id = observation_id
+                self.hand_target = None
+                proposal = self.hand_retargeter.retarget(row.vr["landmarks"])
+                if proposal is not None:
+                    self.hand_target = np.asarray(proposal, dtype=np.float64).copy()
+            if self.hand_target is None:
                 return None
-            hand = proposal
+            hand = self.hand_target
         realized = self.realizer.realize(
             ActionIntent("eef", target, hand), row.arm["qpos"][0], self.previous_arm_command
         )
@@ -89,5 +86,4 @@ class TeleopController:
 
     def commit_dispatched_target(self, realization):
         self.previous_arm_command = realization.arm_qpos.copy()
-        self.smoothed_eef_position = realization.eef_pose.p.copy()
-        self.smoothed_eef_quaternion = realization.eef_pose.q.copy()
+        self.smoothed_eef_pose = realization.eef_pose.copy()

@@ -1,7 +1,6 @@
 """Current raw teleop targets for nominal-rate physical replay."""
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 
@@ -23,19 +22,8 @@ class TrajectoryData:
     arm_ee: np.ndarray
 
 
-def resolve_episode_path(raw_path: str) -> tuple[str, str]:
-    """Validate and name one published episode directory."""
-    path = Path(raw_path)
-    if not path.is_dir():
-        raise ValueError(f"episode must be a published directory: {path}")
-    if not (path / "data.h5").is_file():
-        raise ValueError(f"episode directory is missing data.h5: {path}")
-    return str(path), path.name
-
-
 def load_trajectory(episode_path):
-    path, _ = resolve_episode_path(episode_path)
-    with EpisodeReader(path) as reader:
+    with EpisodeReader(episode_path) as reader:
         meta = reader.meta
         collection_source = meta["collection_source"]
         if isinstance(collection_source, bytes):
@@ -60,15 +48,15 @@ def load_trajectory(episode_path):
         ]
         if len(arm) == 0 or not all(np.isfinite(v).all() for v in (arm, hand, aq, hq)):
             raise ValueError("replay requires nonempty finite targets and robot states")
-        errors = validate_dispatch_rows(reader['dispatch_status'][:], arm_dispatch=reader.arm_dispatch_status)
+        errors = validate_dispatch_rows(reader['dispatch_status'][:])
         if errors:
             raise ValueError("; ".join(errors))
-        reader.validate_servo_execution()
+        reader.validate_arm_execution()
         return TrajectoryData(
-            path,
+            str(reader.path),
             len(arm),
             reader.control_hz,
-            str(meta.get("task_label", "")),
+            str(meta["task_label"]),
             arm,
             hand,
             aq,

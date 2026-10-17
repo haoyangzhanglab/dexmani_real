@@ -1,4 +1,4 @@
-"""Raw core data and optional host-monotonic timing evidence in data.h5.
+"""Raw core data, execution summaries and host-monotonic timing in data.h5.
 Rows align with observations; queries key by (run_id,query_id), and termination is separate.
 Unavailable row/query times are -1/null; published Raw is never rewritten.
 RGB-D/cloud age starts at the oldest channel's first host receive, excluding pre-receive SDK latency.
@@ -12,6 +12,7 @@ from dexmani_real.robot.commands import DispatchStatus
 from dexmani_real.utils.control_clock import sampling_clock_ns
 
 RAW_FORMAT = "dexmani.raw"
+ARM_EXECUTION_FORMAT = "mode1_episode_summary_v1"
 
 
 @dataclass(frozen=True)
@@ -34,8 +35,7 @@ DATASET_SPECS = {
     # Consumed tactile observation: SDK units, bounded previous-valid vector hold (see metadata).
     "hand_contact": _spec(np.float32, (5, 3)),
     "hand_tactile_force": _spec(np.float32, (5, 120, 3)),
-    # Submitted absolute q_goal. Mode-1 SDK results live in arm_servo events;
-    # references are execution evidence, never training actions.
+    # Submitted absolute q_goal, not the next step's measured arrival.
     "action_arm_joint_target": _spec(np.float64, (7,)),
     "action_hand_joint_target": _spec(np.float64, (12,)),
     # Seconds relative to the first observation; dispatch columns are arm, hand.
@@ -59,8 +59,7 @@ def validate_capture_rows(timestamp, dispatch_status) -> tuple[str, ...]:
     return tuple(errors)
 
 
-def validate_training_rows(timestamp, dispatch_status, control_hz, *,
-                           arm_dispatch=DispatchStatus.ACCEPTED) -> tuple[str, ...]:
+def validate_training_rows(timestamp, dispatch_status, control_hz) -> tuple[str, ...]:
     """Whole-episode admission only; failed evidence remains readable as Raw."""
     errors = validate_capture_rows(timestamp, dispatch_status)
     if errors:
@@ -80,34 +79,89 @@ def validate_training_rows(timestamp, dispatch_status, control_hz, *,
         return (f"timing row {row}: interval_ns={intervals[row - 1]:.0f}, "
                 f"nominal_ns={dt_ns}, grid_deviation_ns={deviations[row]:.0f}, "
                 f"tolerance_ns={epsilon_ns}",)
-    return validate_dispatch_rows(dispatch_status, arm_dispatch=arm_dispatch)
+    return validate_dispatch_rows(dispatch_status)
 
 
-def validate_dispatch_rows(dispatch_status, *, arm_dispatch=DispatchStatus.ACCEPTED) -> tuple[str, ...]:
-    """Shared dispatch admission for training and replay; servo evidence is checked separately."""
+def validate_dispatch_rows(dispatch_status) -> tuple[str, ...]:
+    """Shared dispatch admission for training and replay; execution is checked separately."""
     dispatch = np.asarray(dispatch_status)
     if dispatch.ndim != 2 or dispatch.shape[1] != 2:
         return ("dispatch_status must have shape (N, 2)",)
     bad_dispatch = np.flatnonzero(
-        (dispatch[:, 0] != arm_dispatch)
+        (dispatch[:, 0] != DispatchStatus.SUBMITTED)
         | ~np.isin(dispatch[:, 1], (DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED))
     )
     if len(bad_dispatch):
         row = int(bad_dispatch[0])
         return (f"dispatch row {row}: arm/hand={list(dispatch_status[row])}; "
-                f"requires arm {arm_dispatch.name}, hand ACCEPTED or CRC_UNCONFIRMED",)
+                "requires arm SUBMITTED, hand ACCEPTED or CRC_UNCONFIRMED",)
     return ()
 
 
-# Optional timing evidence; -1 means unavailable. Rows align with core observations.
+def validate_execution_boundary(snapshot, *, stopped=False):
+    """Only resolved execution can be published; a resolved fault remains Raw evidence."""
+    if not isinstance(snapshot, dict):
+        raise ValueError("arm execution snapshot missing")
+    for name in ("submitted", "first_accepted", "sdk_attempted", "sdk_completed",
+                 "sdk_accepted", "cancelled_before_first", "active_sequence", "pending_sequence"):
+        value = snapshot[name]
+        if type(value) is not int or value < 0:
+            raise ValueError(f"invalid arm execution counter: {name}")
+    call = snapshot["last_call"]
+    if (snapshot["active_sequence"] or snapshot["pending_sequence"]
+            or snapshot["operation_unresolved"] or snapshot["close_error"]
+            or snapshot["sdk_attempted"] != snapshot["sdk_completed"]
+            or (call["started_ns"] > 0 and call["completed_ns"] == 0)):
+        raise ValueError("arm execution/stop unresolved; retain staging")
+    if stopped:
+        if not snapshot["stopped"] or not snapshot["robot_stopped"]:
+            raise ValueError("robot stop not confirmed; retain staging")
+    elif not snapshot["connected"] or snapshot["fault"]:
+        raise ValueError("capture start requires a healthy arm owner")
+
+
+def validate_arm_execution(start, end, rows, dispatch_status):
+    """Admit a complete episode, not individual frames or servo references.
+
+    Sequences account for every submission. The worker counts first SDK acceptance
+    once per target, so accepted supersession is valid without requiring arrival.
+    """
+    validate_execution_boundary(start)
+    validate_execution_boundary(end, stopped=True)
+    if end["fault"]:
+        raise ValueError(f"arm execution fault: {end['fault']}")
+    delta = {}
+    for name in ("submitted", "first_accepted", "sdk_attempted", "sdk_completed",
+                 "sdk_accepted", "cancelled_before_first"):
+        delta[name] = end[name] - start[name]
+        if delta[name] < 0:
+            raise ValueError(f"arm execution counter regressed: {name}")
+    dispatch = np.asarray(dispatch_status)
+    if not len(rows) or dispatch.shape != (len(rows), 2):
+        raise ValueError("arm execution requires nonempty aligned control rows")
+    submitted = dispatch[:, 0] == DispatchStatus.SUBMITTED
+    sequence = rows["command_seq"]
+    if delta["submitted"] != int(submitted.sum()):
+        raise ValueError("arm submissions/control-row count does not match")
+    expected = np.arange(start["submitted"] + 1, end["submitted"] + 1, dtype=np.int64)
+    if (not np.array_equal(sequence[submitted], expected)
+            or np.any(sequence[~submitted] != -1)
+            or np.any(rows["run_id"][submitted] <= 0)):
+        raise ValueError("arm submissions/control-row sequences do not match")
+    if delta["cancelled_before_first"] or delta["first_accepted"] != delta["submitted"]:
+        raise ValueError("arm target cancelled or never accepted by SDK")
+    if not (delta["sdk_attempted"] == delta["sdk_completed"] == delta["sdk_accepted"]
+            and delta["sdk_accepted"] >= delta["first_accepted"]):
+        raise ValueError("arm SDK calls incomplete or not accepted")
+
+
+# Timing rows are required; individual unavailable times/identities use -1.
 # Queries/termination are separate; visited candidates need not have crossed the SDK boundary.
-# dispatch_status records host submission / hand SDK results; arm_servo records arm SDK results.
-TIMING_REQUIRED_FIELDS = (
+# dispatch_status records host submission / hand SDK results; arm_execution summarizes arm SDK results.
+TIMING_ROW_DTYPE = np.dtype([(name, "<i8") for name in (
     "observation_ns", "control_ns", "arm_ns", "hand_ns", "camera_ns", "pointcloud_ns",
     "camera_sequence", "pointcloud_camera_sequence", "run_id", "slot", "query_id",
-    "prediction_index", "submit_started_ns", "submit_completed_ns",
-)
-TIMING_ROW_DTYPE = np.dtype([(name, "<i8") for name in TIMING_REQUIRED_FIELDS + (
+    "prediction_index", "submit_started_ns", "submit_completed_ns", "command_seq",
     "camera_received_ns", "camera_published_ns",
     "camera_depth_frame_number", "camera_color_frame_number",
     "pointcloud_camera_received_ns", "pointcloud_camera_published_ns",

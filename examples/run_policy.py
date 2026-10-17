@@ -288,8 +288,6 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         from dexmani_real.deployment.config import (
-            PolicyRuntimeConfig,
-            RolloutRecordingConfig,
             resolve_execution_config,
         )
 
@@ -305,14 +303,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        policy_config = PolicyRuntimeConfig(saved_config, info, args.device, args.seed)
         session_dir = None
-        recording_config = None
+        recording_dir = None
         if not (args.no_record and args.no_results):
             root = args.output or Path(__file__).resolve().parents[1] / "rollouts"
             session_dir = _session_directory(root, selector)
             if not args.no_record:
-                recording_config = RolloutRecordingConfig(str(session_dir), info.task_name)
+                recording_dir = session_dir
         elif args.output is not None:
             print("--no-record --no-results: --output is unused; no session artifacts will be created")
     except Exception as exc:
@@ -327,10 +324,13 @@ def main(argv: list[str] | None = None) -> int:
 
         return run_policy_deployment(
             runtime,
-            policy_config,
+            saved_config,
+            info,
+            device=args.device,
+            seed=args.seed,
             max_running_s=args.max_running_s,
             num_episodes=args.num_episodes,
-            recording_config=recording_config,
+            recording_dir=recording_dir,
             results_dir=session_dir if not args.no_results else None,
             camera_calibration_path=args.camera_calibration,
             save_run_config=(

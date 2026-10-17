@@ -4,12 +4,9 @@ FreeFlyer q=[XYZ(3),xyzw(4),joints]; Jacobian[:,6:] omits its six velocity DOFs.
 
 from __future__ import annotations
 
-import logging
 import numpy as np
 import pinocchio as pin
 
-
-logger = logging.getLogger(__name__)
 
 _FINGERTIP_ORDER = ("thumb", "index", "mid", "ring", "pinky")
 
@@ -58,14 +55,13 @@ class PinGrad:
     def compute_position_gradient(
         self, qpos_floating: np.ndarray, target_pos: np.ndarray
     ) -> tuple[np.ndarray, float]:
-        """Return joint-only ∇loss for Σ||FK_tip(q)-target||²; q=[FreeFlyer(7),joints(12)], targets use URDF axes."""
+        """Joint-only ∇loss for Σ||FK_tip(q)-target||² with finite URDF-frame targets.
+        q=[FreeFlyer(7),joints(12)]; the base stays fixed during optimization.
+        """
         self.update_kinematics(qpos_floating)
 
         grad = np.zeros(self.dof, dtype=np.float64)
         loss = 0.0
-        if target_pos.shape != (len(self.tip_frame_ids), 3) or not np.all(np.isfinite(target_pos)):
-            raise ValueError(f"target_pos must be a finite ({len(self.tip_frame_ids)}, 3) array")
-
         for i in range(len(self.tip_frame_ids)):
             fid = self.tip_frame_ids[i]
             J_full = pin.getFrameJacobian(

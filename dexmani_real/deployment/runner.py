@@ -10,10 +10,6 @@ from collections import deque
 
 import numpy as np
 
-from dexmani_real.deployment.action import (
-    physical_action_dim,
-    policy_action_intent,
-)
 from dexmani_real.deployment.observation import (
     build_policy_observation,
     decision_is_fresh,
@@ -21,26 +17,20 @@ from dexmani_real.deployment.observation import (
     policy_sources,
 )
 from dexmani_real.planning.kinematics.ik import IKFailureKind
+from dexmani_real.planning.kinematics.pose import Pose, rot6d_to_quat_wxyz
+from dexmani_real.robot.action import ActionIntent
 from dexmani_real.recording.recorder import (
     RecordingError,
     snapshot_recording_metadata,
 )
 from dexmani_real.utils.episode_results import error_detail
-from dexmani_real.robot.commands import DispatchStatus, RobotCommand
-from dexmani_real.robot.robot import DispatchError, DispatchInterrupted
+from dexmani_real.robot.commands import DispatchStatus, RobotCommand, DispatchError, DispatchInterrupted
 from dexmani_real.runtime.observation import (
     feedback_deadline_ns,
     observation_timing,
     read_observation,
 )
-from dexmani_real.runtime.safety import (
-    request_emergency_stop,
-    RunEndReason,
-    SafetyState,
-    StopRequest,
-    _begin_motion_locked,
-    revoke_motion_if_run_id,
-)
+from dexmani_real.runtime.state import RunEndReason, SafetyState
 
 
 logger = logging.getLogger(__name__)
@@ -56,7 +46,6 @@ class Query:
     sources: dict[str, tuple[int, ...]]
     handoff_slot: int | None
     result: np.ndarray | None = None
-    bootstrap: bool = False
     evidence: dict = field(default_factory=dict)
 
 
@@ -69,7 +58,7 @@ class Plan:
     segment_end: int
     sources: dict[str, tuple[int, ...]]
     frozen: dict[int, RobotCommand]
-    query_id: int = -1
+    query_id: int
 
 
 class PolicyRunner:
@@ -82,13 +71,11 @@ class PolicyRunner:
         robot,
         realizer,
         recorder=None,
-        poll_operator=None,
-        discard_pending_start=None,
+        operator,
         model_runtime,
         kinematics,
         max_running_s,
         num_episodes=20,
-        task_label=None,
         camera_calibration=None,
         camera_parameters=None,
         results=None,
@@ -96,8 +83,7 @@ class PolicyRunner:
         self.results = results
         self.shared = shared
         self.robot = robot
-        self.poll_operator = poll_operator
-        self.discard_pending_start = discard_pending_start
+        self.operator = operator
         self.runtime = runtime
         self.policy_info = policy_info
         self.model = model_runtime
@@ -105,7 +91,6 @@ class PolicyRunner:
         self.kinematics = kinematics
         self.max_running_s = max_running_s
         self.num_episodes = num_episodes
-        self.task_label = task_label
         self.camera_calibration = camera_calibration
         self.camera_parameters = camera_parameters
         self.recorder = recorder
@@ -176,16 +161,7 @@ class PolicyRunner:
         )
 
     def _has_motion_authority(self):
-        return (
-            self.run_id is not None
-            and self.shared.running
-            and not self.shared.error_state
-            and not self.shared.estop_request
-            and not self.shared.quit_requested
-            and not self.shared.stop_request
-            and int(self.shared.run_id) == self.run_id
-            and int(self.shared.safety_state) == int(SafetyState.RUNNING)
-        )
+        return self.shared.command_may_cross_sdk(run_id=self.run_id)
 
     def _finish_episode(
         self,
@@ -210,15 +186,14 @@ class PolicyRunner:
                 action_query_id=self.slot_timing.get("query_id"),
                 prediction_index=self.slot_timing.get("prediction_index"),
             )
-        revoke_motion_if_run_id(self.shared, epoch, reason=run_end_reason)
-        if self.discard_pending_start is not None:
-            self.discard_pending_start()
+        self.shared.revoke_motion(reason=run_end_reason, expected_run_id=epoch)
+        self.operator.discard_pending_start()
         with self.shared.motion_lock:
             self.shared.start_request = False
-            self.shared.stop_request = int(StopRequest.NONE)
+            self.shared.stop_request = False
             reason = (
-                RunEndReason(int(self.shared.run_ended_reason))
-                if int(self.shared.run_ended_id) == epoch
+                self.shared.run_ended_reason
+                if self.shared.run_ended_id == epoch
                 else run_end_reason
             )
         self.plan = None
@@ -283,6 +258,8 @@ class PolicyRunner:
                     saved = self.recorder.save_episode(
                         reason=reason, details=[dict(stage="termination", reason=detail), *errors],
                         timing=self.termination_timing,
+                        arm_execution=dict(self.robot.arm.execution_snapshot(),
+                                           robot_stopped=not self.robot.stop_required),
                     )
                     status = "published" if saved is not None else "empty"
                 except BaseException as exc:
@@ -315,15 +292,8 @@ class PolicyRunner:
         return policy_observation_issue(row, self.policy_info.observation_fields)
 
     def _preparation_valid(self):
-        return (
-            self.preparing_epoch is not None
-            and self.preparing_epoch == int(self.shared.run_id)
-            and not self.shared.quit_requested
-            and not self.shared.stop_request
-            and not self.shared.estop_request
-            and not self.shared.error_state
-            and self.shared.running
-            and int(self.shared.safety_state) == int(SafetyState.ARMED)
+        return self.shared.command_may_cross_sdk(
+            run_id=self.preparing_epoch, required_safety_state=SafetyState.ARMED,
         )
 
     def _start_observation(self, *, wait_for_hand=False):
@@ -351,16 +321,11 @@ class PolicyRunner:
                 self.shared.start_request = False
                 if self.model.future is not None:
                     return
-                if (
-                    self.shared.stop_request
-                    or self.shared.quit_requested
-                    or not self.shared.running
-                    or self.shared.error_state
-                    or self.shared.estop_request
-                    or int(self.shared.safety_state) != int(SafetyState.ARMED)
+                if not self.shared.command_may_cross_sdk(
+                    run_id=self.shared.run_id, required_safety_state=SafetyState.ARMED,
                 ):
                     return
-                epoch = int(self.shared.run_id)
+                epoch = self.shared.run_id
             self.recording_started = False
             self.termination_timing = None
             self.preparation_issue = None
@@ -378,7 +343,7 @@ class PolicyRunner:
                 self.preparing_epoch = None
                 cancelled = isinstance(exc, (CancelledError, KeyboardInterrupt))
                 if isinstance(exc, KeyboardInterrupt):
-                    request_emergency_stop(self.shared)
+                    self.shared.request_emergency_stop()
                 self._finalize_outputs(
                     "start_cancelled" if cancelled else "preparation_failed",
                     str(exc), errors=[] if cancelled else [error_detail("preparation", exc)],
@@ -407,16 +372,17 @@ class PolicyRunner:
             if self.recorder is not None:
                 metadata = snapshot_recording_metadata(
                     self.shared,
-                    collection_source="policy_rollout",
                     camera_calibration=self.camera_calibration,
                     hand=self.robot.hand,
                 )
                 self.recording_started = True
                 self.recorder.start_episode(
-                    task_label=self.task_label,
-                    arm_executor=self.robot.arm,
+                    task_label=self.policy_info.task_name,
+                    arm_execution=self.robot.arm.execution_snapshot(),
+                    arm_control_metadata=self.robot.arm.execution_metadata(1 / self.recorder.control_hz),
                     episode_name=f"episode_{self.completed + 1:03d}",
-                    **metadata,
+                    collection_source="policy_rollout",
+                    metadata=metadata,
                 )
             # Recorder startup can block; use a new row before granting motion.
             if self._start_observation() is None:
@@ -427,10 +393,8 @@ class PolicyRunner:
                 return
             with self.shared.motion_lock:
                 admitted = (
-                    _begin_motion_locked(self.shared)
-                    if epoch == int(self.shared.run_id)
-                    and not self.shared.quit_requested
-                    and not self.shared.stop_request
+                    self.shared.begin_motion()
+                    if epoch == self.shared.run_id
                     else None
                 )
             if admitted is None:
@@ -449,7 +413,7 @@ class PolicyRunner:
         except BaseException as exc:
             start_failure = exc
             if isinstance(exc, KeyboardInterrupt):
-                request_emergency_stop(self.shared)
+                self.shared.request_emergency_stop()
             if isinstance(exc, DispatchError) and exc.revoked and exc.cause == "authority_revoked":
                 return
             raise
@@ -491,10 +455,6 @@ class PolicyRunner:
                 raise result.error
             self.reset_ready = True
             return
-        if operation != "predict":
-            if result.error is not None:
-                raise result.error
-            return
         query = self.query
         if query is None:
             raise RuntimeError("Model result has no owned query")
@@ -521,7 +481,7 @@ class PolicyRunner:
         future = np.asarray(result.value)
         expected = (
             self.policy_info.horizon - self.policy_info.n_obs_steps + 1,
-            physical_action_dim(self.policy_info.action_mode),
+            self.policy_info.control_action_dim,
         )
         valid_future = (
             future.shape == expected and future.dtype.kind == "f" and np.isfinite(future).all()
@@ -591,28 +551,16 @@ class PolicyRunner:
         commands = {}
         previous = self.previous_arm
         for i in range(self.execution.prefetch_steps):
-            if self.poll_operator is not None:
-                self.poll_operator()
+            self.operator.poll()
             if not self._has_motion_authority():
                 self._finish_episode("prefix_authority_revoked", row=row)
                 return None, None
             if (expired := self._expired_budget()) is not None:
                 self._finish_budget(expired, row=row)
                 return None, None
-            decoded = self.realizer.realize(
-                policy_action_intent(prefix[i], self.policy_info.action_mode),
-                row.arm["qpos"][0],
-                previous,
-            )
-            if decoded.arm_qpos is None:
-                if (
-                    decoded.ik_result is not None
-                    and decoded.ik_result.failure_kind == IKFailureKind.INVALID_OUTPUT
-                ):
-                    raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
-                self._finish_episode(f"prefix_action_rejected: {decoded.rejection_reason}", row=row)
+            command = self._realize_command(prefix[i], row, previous, context="prefix_action")
+            if command is None:
                 return None, None
-            command = RobotCommand(self.run_id, decoded.arm_qpos, decoded.hand_qpos)
             commands[slot + i] = command
             previous = command.arm_qpos
             prefix[i] = self.realizer.control_from_command(
@@ -628,6 +576,23 @@ class PolicyRunner:
         if self.recorder is not None and row is not None:
             self.recorder.add_frame(row, command, result, timing=self.slot_timing)
 
+    def _realize_command(self, action, row, previous, *, context="action"):
+        """Decode a row of the admitted physical future and apply shared target admission."""
+        action = np.asarray(action, dtype=np.float64)
+        mode = self.policy_info.action_mode
+        intent = (
+            ActionIntent(mode, action[:7], action[7:])
+            if mode == "joint"
+            else ActionIntent(mode, Pose(action[:3], rot6d_to_quat_wxyz(action[3:9])), action[9:])
+        )
+        decoded = self.realizer.realize(intent, row.arm["qpos"][0], previous)
+        if decoded.arm_qpos is None:
+            if decoded.ik_result is not None and decoded.ik_result.failure_kind == IKFailureKind.INVALID_OUTPUT:
+                raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
+            self._finish_episode(f"{context}_rejected: {decoded.rejection_reason}", row=row)
+            return None
+        return RobotCommand(self.run_id, decoded.arm_qpos, decoded.hand_qpos)
+
     def _command_for_slot(self, row, slot):
         plan = self.plan
         command = plan.frozen.get(slot)
@@ -639,22 +604,9 @@ class PolicyRunner:
                 self._finish_episode(f"frozen_target_rejected: {rejection}", row=row)
                 return
         else:
-            decoded = self.realizer.realize(
-                policy_action_intent(
-                    plan.actions[slot - plan.anchor_slot], self.policy_info.action_mode
-                ),
-                row.arm["qpos"][0],
-                self.previous_arm,
+            command = self._realize_command(
+                plan.actions[slot - plan.anchor_slot], row, self.previous_arm,
             )
-            if decoded.arm_qpos is None:
-                if (
-                    decoded.ik_result is not None
-                    and decoded.ik_result.failure_kind == IKFailureKind.INVALID_OUTPUT
-                ):
-                    raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
-                self._finish_episode(f"action_rejected: {decoded.rejection_reason}", row=row)
-                return
-            command = RobotCommand(self.run_id, decoded.arm_qpos, decoded.hand_qpos)
         return command
 
     def _execute_slot(self, row, slot):
@@ -704,7 +656,7 @@ class PolicyRunner:
         if (failure is not None or expired is not None or late
                 or not self._has_motion_authority()):
             if cancelled:
-                request_emergency_stop(self.shared)
+                self.shared.request_emergency_stop()
             hardware_failure = not cancelled and failure is not None and (
                 not failure.revoked
                 or cause not in {"authority_revoked", "deadline_expired"}
@@ -745,10 +697,10 @@ class PolicyRunner:
         query = self.query
         if query is None or query.run_id != self.run_id:
             return
+        bootstrap = query.handoff_slot is None
         if query.handoff_slot is None and query.result is not None:
             # No prediction was executed while waiting; retain its whole head.
             query.handoff_slot = slot
-            query.bootstrap = True
             if self.recorder is not None:
                 query.evidence.update(handoff_slot=int(slot), bootstrap=True)
                 self._record_query(query)
@@ -764,7 +716,7 @@ class PolicyRunner:
             if issue is not None:
                 self._finish_episode(issue, row=row)
             else:
-                anchor = slot if query.bootstrap else query.slot
+                anchor = slot if bootstrap else query.slot
                 self.plan = Plan(
                     actions=query.result,
                     anchor_slot=anchor,
@@ -800,7 +752,7 @@ class PolicyRunner:
             self.recorder.check_error()
         if self.run_id is None:
             if self.preparing_epoch is None:
-                self.shared.stop_request = int(StopRequest.NONE)
+                self.shared.stop_request = False
             if self.preparing_epoch is not None or self.shared.start_request:
                 self._begin_episode()
             if self.run_id is None:
@@ -865,7 +817,7 @@ class PolicyRunner:
                 self._finish_budget(expired)
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
-                request_emergency_stop(self.shared)
+                self.shared.request_emergency_stop()
             try:
                 self._finish_episode(
                     f"control_failed: {type(exc).__name__}: {exc}",
@@ -886,8 +838,11 @@ class PolicyRunner:
         try:
             while self.shared.running and not self.shared.quit_requested:
                 self.robot.arm.check_error()
-                if self.poll_operator is not None:
-                    self.poll_operator()
+                self.operator.poll(allow_tactile_reset=(
+                    self.run_id is None and self.preparing_epoch is None
+                    and self.model.future is None
+                    and (self.recorder is None or not self.recorder.is_recording)
+                ))
                 if self.shared.estop_request or self.shared.error_state:
                     break
                 if self.run_id is None:
@@ -895,7 +850,7 @@ class PolicyRunner:
                 self.step()
                 time.sleep(0.001 if self.run_id is not None else 0.005)
         except KeyboardInterrupt as exc:
-            request_emergency_stop(self.shared)
+            self.shared.request_emergency_stop()
             failure = exc
         except Exception as exc:
             failure = exc

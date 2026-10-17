@@ -8,7 +8,6 @@ import logging
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, ClassVar
 
 import numpy as np
 
@@ -39,24 +38,15 @@ class CollisionPair:
     collision_type: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class CollisionInfo:
     in_collision: bool
     collision_pairs: tuple[CollisionPair, ...] = ()
     num_contacts: int = 0
     sample_qpos_rad: tuple[float, ...] | None = None
 
-    _NO_COLLISION: ClassVar["CollisionInfo"]
-
-    @classmethod
-    def no_collision(cls) -> "CollisionInfo":
-        return cls._NO_COLLISION
-
     def __bool__(self) -> bool:
         return self.in_collision
-
-
-CollisionInfo._NO_COLLISION = CollisionInfo(in_collision=False)
 
 
 class CollisionModel:
@@ -104,57 +94,63 @@ class CollisionModel:
         self._collision_data = self._collision_model.createData()
 
         self._environment_collision_model = None
-        self._robot_environment_geom_count = 0
         self._environment_names: dict[int, str] = {}
         self._table_pair_indices: tuple[int, ...] = ()
-        self._table = self._normalize_table(table)
-        normalized_boxes = tuple(self._normalize_static_box(box) for box in static_boxes)
-        box_names = [str(box["name"]) for box in normalized_boxes]
+        self._table = table if table is not None and table.enabled else None
+        if self._table is not None:
+            self._table.validate()
+        boxes = tuple(static_boxes)
+        for box in boxes:
+            box.validate()
+        box_names = [box.name for box in boxes]
         if len(box_names) != len(set(box_names)):
             raise ValueError("static collision box names must be unique")
-        if normalized_boxes or self._table is not None:
+        if boxes or self._table is not None:
             self._environment_collision_model = pin.buildGeomFromUrdf(
                 self._model, urdf_path, pin.GeometryType.COLLISION, package_dirs=package_dirs
             )
-            self._robot_environment_geom_count = int(self._environment_collision_model.ngeoms)
+            robot_geom_count = int(self._environment_collision_model.ngeoms)
             from hppfcl.hppfcl import Box
 
-            for box in normalized_boxes:
+            for box in boxes:
                 placement = pin.SE3(
-                    self._quat_wxyz_to_matrix(box["quat_wxyz"]), box["center_xyz_m"]
+                    self._quat_wxyz_to_matrix(box.quat_wxyz), np.asarray(box.center_xyz_m)
                 )
                 geometry = pin.GeometryObject(
-                    f"environment::{box['name']}",
+                    f"environment::{box.name}",
                     0,
                     0,
-                    Box(*box["size_xyz_m"]),
+                    Box(*box.size_xyz_m),
                     placement,
                 )
                 obstacle_id = int(self._environment_collision_model.addGeometryObject(geometry))
-                self._environment_names[obstacle_id] = str(box["name"])
-                for robot_id in range(self._robot_environment_geom_count):
+                self._environment_names[obstacle_id] = box.name
+                for robot_id in range(robot_geom_count):
                     self._environment_collision_model.addCollisionPair(
                         pin.CollisionPair(robot_id, obstacle_id)
                     )
             if self._table is not None:
                 table_config = self._table
-                normal = table_config["normal"]
+                plane = np.asarray(table_config.plane_abcd, dtype=np.float64)
+                normal_norm = np.linalg.norm(plane[:3])
+                normal = plane[:3] / normal_norm
+                surface_origin = -(plane[3] / normal_norm) * normal
                 placement = pin.SE3(
                     self._table_rotation(normal),
-                    table_config["surface_origin"] - 0.5 * table_config["thickness_m"] * normal,
+                    surface_origin - 0.5 * table_config.thickness_m * normal,
                 )
                 geometry = pin.GeometryObject(
                     "environment::table",
                     0,
                     0,
-                    Box(*table_config["size_xyz_m"]),
+                    Box(*table_config.size_xy_m, table_config.thickness_m),
                     placement,
                 )
                 table_id = int(self._environment_collision_model.addGeometryObject(geometry))
                 self._environment_names[table_id] = "table"
                 table_pair_indices: list[int] = []
-                allowed = table_config["allowed_contact_links"]
-                for robot_id in range(self._robot_environment_geom_count):
+                allowed = table_config.allowed_contact_links
+                for robot_id in range(robot_geom_count):
                     link_name = self._get_environment_geom_link_name(robot_id)
                     if link_name in allowed:
                         continue
@@ -177,8 +173,8 @@ class CollisionModel:
             self._nq,
             self._collision_model.ngeoms,
             len(self._collision_model.collisionPairs),
-            len(normalized_boxes),
-            "calibrated" if self._table is not None else "disabled",
+            len(boxes),
+            "enabled" if self._table is not None else "disabled",
             len(self._environment_collision_model.collisionPairs)
             if self._environment_collision_model is not None
             else 0,
@@ -188,50 +184,6 @@ class CollisionModel:
 
         # Arm-only queries require an explicit hand posture.
         self._hand_qpos: np.ndarray | None = None
-
-    @staticmethod
-    def _normalize_static_box(box: StaticCollisionBox) -> dict[str, Any]:
-        """Validate at the model boundary and own the geometric arrays."""
-        box.validate()
-        return {
-            "name": box.name,
-            "center_xyz_m": np.array(box.center_xyz_m, dtype=np.float64, copy=True),
-            "size_xyz_m": np.array(box.size_xyz_m, dtype=np.float64, copy=True),
-            "quat_wxyz": np.array(box.quat_wxyz, dtype=np.float64, copy=True),
-        }
-
-    @staticmethod
-    def _normalize_table(table: TableCollisionConfig | None) -> dict[str, Any] | None:
-        if table is None or not table.enabled:
-            return None
-        plane = np.asarray(table.plane_abcd, dtype=np.float64)
-        size_xy = np.asarray(table.size_xy_m, dtype=np.float64)
-        thickness_m = float(table.thickness_m)
-        soft_clearance_m = float(table.soft_clearance_m)
-        allowed = tuple(str(name) for name in table.allowed_contact_links)
-        if plane.shape != (4,) or size_xy.shape != (2,):
-            raise ValueError("table plane_abcd and size_xy_m shapes are invalid")
-        if not np.all(np.isfinite(np.concatenate((plane, size_xy)))):
-            raise ValueError("table plane and size must be finite")
-        normal_norm = float(np.linalg.norm(plane[:3]))
-        if normal_norm <= 1e-9:
-            raise ValueError("table plane normal must be non-zero")
-        normal = plane[:3] / normal_norm
-        if normal[2] <= 0.0:
-            raise ValueError("table plane normal must point upward")
-        d_normalized = float(plane[3] / normal_norm)
-        if np.any(size_xy <= 0.0) or not np.isfinite(thickness_m) or thickness_m <= 0.0:
-            raise ValueError("table size and thickness must be finite and positive")
-        if not np.isfinite(soft_clearance_m) or soft_clearance_m < 0.0:
-            raise ValueError("table soft clearance must be finite and non-negative")
-        return {
-            "normal": normal,
-            "surface_origin": -d_normalized * normal,
-            "size_xyz_m": np.array([size_xy[0], size_xy[1], thickness_m], dtype=np.float64),
-            "thickness_m": thickness_m,
-            "soft_clearance_m": soft_clearance_m,
-            "allowed_contact_links": frozenset(allowed),
-        }
 
     @staticmethod
     def _table_rotation(normal: np.ndarray) -> np.ndarray:
@@ -324,10 +276,10 @@ class CollisionModel:
         return min(z_values)
 
     def check_self_collision_details(self, qpos: np.ndarray) -> "CollisionInfo":
-        """Return CollisionInfo, reusing the cached no-collision result when clear."""
+        """Return collision contacts; preserve a positive result even if details are unavailable."""
         has_any = self._pin_update(qpos, stop_at_first=False)
         if not has_any:
-            return CollisionInfo.no_collision()
+            return CollisionInfo(in_collision=False)
         pairs: list[CollisionPair] = []
         for pair_index, pair in enumerate(self._collision_model.collisionPairs):
             if not self._pin.computeCollision(
@@ -360,7 +312,7 @@ class CollisionModel:
 
     @property
     def table_soft_clearance_m(self) -> float:
-        return 0.0 if self._table is None else float(self._table["soft_clearance_m"])
+        return 0.0 if self._table is None else self._table.soft_clearance_m
 
     def minimum_table_distance(self, qpos: np.ndarray) -> float:
         """Return the minimum mesh-to-table distance over non-allowed links."""
@@ -407,7 +359,7 @@ class CollisionModel:
         """Return robot link, obstacle name, and sampled qpos for a scene contact."""
         full_qpos = self._to_full_qpos(qpos)
         if not self.has_static_environment:
-            return CollisionInfo.no_collision()
+            return CollisionInfo(in_collision=False)
         self._pin.forwardKinematics(self._model, self._data, full_qpos)
         self._pin.updateGeometryPlacements(
             self._model,
@@ -433,7 +385,7 @@ class CollisionModel:
                 )
             )
         if not pairs:
-            return CollisionInfo.no_collision()
+            return CollisionInfo(in_collision=False)
         return CollisionInfo(
             in_collision=True,
             collision_pairs=tuple(pairs),
@@ -450,33 +402,31 @@ class CollisionModel:
         self_info = self.check_self_collision_details(qpos)
         return self_info if self_info else self.check_environment_collision_details(qpos)
 
-    @staticmethod
-    def _validate_step_size(step_size: float) -> float:
-        step_size = float(step_size)
-        if not np.isfinite(step_size) or step_size <= 0.0:
-            raise ValueError(f"step_size must be finite and > 0, got {step_size!r}")
-        return step_size
-
-    @staticmethod
-    def _sample_count(q1: np.ndarray, q2: np.ndarray, step_size: float) -> int:
-        return max(1, int(np.ceil(float(np.max(np.abs(q2 - q1))) / step_size)))
-
-    def check_combined_segment_collision_free(
-        self,
-        q1: np.ndarray,
-        q2: np.ndarray,
-        step_size: float = 0.02,
-    ) -> bool:
-        """Densely check a joint segment against self and static geometry."""
-        step_size = self._validate_step_size(step_size)
-        q1 = self._to_full_qpos(q1)
-        q2 = self._to_full_qpos(q2)
-        diff = q2 - q1
-        count = self._sample_count(q1, q2, step_size)
-        for step in range(count + 1):
-            if self.check_collision(q1 + (step / count) * diff):
-                return False
-        return True
+    def check_path(
+        self, path: np.ndarray, step_size: float = 0.02,
+    ) -> tuple[int, CollisionInfo] | None:
+        """Return the first colliding segment/sample details; clear paths return None."""
+        path = np.asarray(path, dtype=np.float64)
+        if path.ndim != 2 or path.shape[1] != 7 or not np.isfinite(path).all():
+            raise ValueError("collision path must be finite shape (N, 7)")
+        if not np.isfinite(step_size) or step_size <= 0:
+            raise ValueError("collision step_size must be finite and positive")
+        if len(path) == 0:
+            return None
+        first = self.check_collision_details(path[0])
+        if first:
+            return 0, first
+        for index, (start, end) in enumerate(zip(path[:-1], path[1:])):
+            start, end = self._to_full_qpos(start), self._to_full_qpos(end)
+            delta = end - start
+            count = max(1, int(np.ceil(float(np.max(np.abs(delta))) / step_size)))
+            for step in range(count + 1):
+                sample = start + (step / count) * delta
+                if self.check_collision(sample):
+                    info = self.check_collision_details(sample)
+                    # A confirmed collision remains unsafe even without contact details.
+                    return index, info if info else CollisionInfo(in_collision=True)
+        return None
 
     def _get_geom_link_name(self, geom_id: int) -> str:
         geom = self._collision_model.geometryObjects[geom_id]

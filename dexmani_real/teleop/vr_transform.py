@@ -1,4 +1,4 @@
-"""Validated VR-heading calibration contract used before teleop startup."""
+"""Current VR-heading measurements and startup quality gate."""
 
 from __future__ import annotations
 
@@ -8,8 +8,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-from dexmani_real.utils.geometry import validate_rotation_matrix
 
 # R_z(-theta) maps VR FLU forward to robot base +X. Recalibrate if this convention changes.
 VR_TRANSFORM_MIN_FRAMES = 30
@@ -71,18 +69,20 @@ def _quality_from_payload(payload: Any) -> VRTransformQuality:
     )
 
 
-def load_vr_transform(path: str | Path, *, reject_poor: bool = True) -> VRTransformCalibration:
-    """Load current calibration measurements and derive the runtime transform."""
-    calibration_path = Path(path)
-    if not calibration_path.is_file():
-        raise FileNotFoundError(f"VR transform config not found: {calibration_path}")
-    with calibration_path.open(encoding="utf-8") as stream:
-        payload = json.load(stream)
-    return parse_vr_transform(payload, reject_poor=reject_poor)
+def load_vr_transform(path: str | Path) -> VRTransformCalibration:
+    """Load a heading calibration suitable for starting teleoperation."""
+    with Path(path).open(encoding="utf-8") as stream:
+        calibration = parse_vr_transform(json.load(stream))
+    if calibration.quality.grade == "poor":
+        raise ValueError(
+            f"VR calibration quality is poor (std={calibration.quality.std_deg:.2f}°); "
+            "recalibration is required"
+        )
+    return calibration
 
 
-def parse_vr_transform(payload: Any, *, reject_poor: bool = True) -> VRTransformCalibration:
-    """Validate current heading measurements and derive runtime rotation/quality."""
+def parse_vr_transform(payload: Any) -> VRTransformCalibration:
+    """Validate heading measurements and derive their rotation and measured quality."""
     if not isinstance(payload, dict):
         raise ValueError("VR calibration must be an object")
     reference = str(payload.get("ref", ""))
@@ -103,12 +103,7 @@ def parse_vr_transform(payload: Any, *, reject_poor: bool = True) -> VRTransform
         ],
         dtype=np.float64,
     )
-    transform = validate_rotation_matrix(transform, name="VR heading rotation")
     quality = _quality_from_payload(payload.get("quality"))
-    if reject_poor and quality.grade == "poor":
-        raise ValueError(
-            f"VR calibration quality is poor (std={quality.std_deg:.2f}°); recalibration is required"
-        )
     return VRTransformCalibration(
         transform=transform,
         theta_deg=theta_deg,

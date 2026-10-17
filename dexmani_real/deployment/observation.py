@@ -60,8 +60,7 @@ def build_observation_camera(sensors, camera_config, fields, calibration):
     if "camera_extrinsic" in requested:
         if calibration is None:
             raise ValueError("camera_extrinsic requires current camera calibration")
-        name = calibration.resolve_name_by_serial(serial)
-        transform = calibration.get_entry(name).T_world_camera
+        transform = calibration.for_serial(serial)
     parameters = camera_parameters_cv(color, transform)
     return {name: parameters[name] for name in requested}
 

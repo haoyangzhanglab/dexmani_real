@@ -2,7 +2,6 @@
 
 import logging
 import multiprocessing as mp
-import os
 from pathlib import Path
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
@@ -10,18 +9,14 @@ from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extr
 from dexmani_real.config.experiment import (
     resolve_runtime_table, validate_robot_config, validate_control_rate,
 )
-from dexmani_real.ipc.channels import SensorChannelsConfig
-from dexmani_real.runtime.state import RuntimeState
+from dexmani_real.ipc.channels import SensorChannels
+from dexmani_real.runtime.state import RuntimeState, RunEndReason
 from dexmani_real.recording.recorder import AsyncEpisodeRecorder
 from dexmani_real.robot.action import ActionRealizer
-from dexmani_real.robot.arm_homing import build_home_planner
+from dexmani_real.robot.home import build_home_planner
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
-from dexmani_real.runtime.processes import shutdown_local_runtime
-from dexmani_real.runtime.safety import (
-    RunEndReason, SafetyState, require_transition, request_emergency_stop,
-)
-from dexmani_real.runtime.supervisor import RuntimeSupervisor
+from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.vr_worker import run_vr_worker
 from dexmani_real.teleop.config import DEFAULT_TASK_NAME, validate_task_dir_name
@@ -49,7 +44,6 @@ def run_teleop_experiment(
     validate_control_rate(runtime, runtime.teleop.control_hz)
     for section in (
         runtime.policy,
-        runtime.teleop,
         runtime.policy.ema,
         runtime.policy.vr_mapping,
         runtime.vr,
@@ -60,19 +54,12 @@ def run_teleop_experiment(
     runtime = resolve_runtime_table(runtime)
     if not runtime.policy.hand_enabled and (runtime.policy.recording_enabled or not allow_no_hand):
         raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")
-    if runtime.policy.hand_enabled:
-        (
-            runtime.tag_retargeting
-            if runtime.policy.hand_retargeting_type == "tag"
-            else runtime.dexpilot_retargeting
-        ).validate()
     calibration = load_vr_transform(vr_transform_path)
     mapping = runtime.policy.vr_mapping
     controller = TeleopController(
         ActionRealizer.for_mode(runtime, "eef"),
         VRWristMapper(
             pos_scale=mapping.pos_scale,
-            rot_scale=mapping.rot_scale,
             vr_to_robot_rot=calibration.transform,
         ),
         runtime,
@@ -85,20 +72,15 @@ def run_teleop_experiment(
         else None
     )
     ctx = mp.get_context("spawn")
-    shared = RuntimeState.create(
-        prefix=f"dexmani_collect_{os.getpid()}",
-        config=SensorChannelsConfig.from_runtime(
-            runtime, camera=runtime.policy.recording_enabled, vr=True
-        ),
-        mp_context=ctx,
-    )
-    supervisor = robot = None
+    shared = RuntimeState(SensorChannels(
+        ctx, camera=runtime.camera if runtime.policy.recording_enabled else None, vr=True,
+    ))
+    sensors = robot = None
     clean = False
     runner = None
-    runner_started = False
     try:
-        supervisor = RuntimeSupervisor(shared, runtime.safety.readiness_timeouts_s)
-        robot = DexManiRobot(shared, runtime, check_services=supervisor.check)
+        sensors = SensorProcesses(shared)
+        robot = DexManiRobot(shared, runtime, check_services=sensors.check)
         runner = TeleopRunner(
             shared,
             runtime,
@@ -111,48 +93,45 @@ def run_teleop_experiment(
                 / runtime.policy.episodes_dir
                 / task_name,
                 control_hz=runtime.teleop.control_hz,
-                rgb_shape=(runtime.camera.height, runtime.camera.width, 3),
             )
             if runtime.policy.recording_enabled
             else None,
             camera_calibration=camera_calibration,
-            start_vr=lambda: supervisor.start(
-                [ctx.Process(name="vr", target=run_vr_worker, args=(shared.sensors, runtime.vr))],
-                wait_ready=False,
+            start_vr=lambda: sensors.start(
+                ctx.Process(name="vr", target=run_vr_worker, args=(shared.sensors, runtime.vr)),
+                ready=shared.sensors.vr_ready,
             ),
         )
         robot.connect()
         if runtime.policy.recording_enabled:
-            supervisor.start(
-                [
-                    ctx.Process(
-                        name="camera", target=run_camera_worker,
-                        args=(shared.sensors, runtime.camera),
-                    )
-                ]
+            sensors.start(
+                ctx.Process(
+                    name="camera", target=run_camera_worker,
+                    args=(shared.sensors, runtime.camera),
+                ),
+                ready=shared.sensors.camera_ready,
+                timeout_s=runtime.safety.readiness_timeouts_s["camera"],
             )
-        require_transition(shared, SafetyState.ARMED)
-        runner_started = True
+        shared.arm()
         runner.run()
         clean = bool(shared.quit_requested)
     except KeyboardInterrupt:
-        request_emergency_stop(shared)
+        shared.request_emergency_stop()
     except Exception:
         shared.error_state = True
         logger.exception("teleop session failed")
     finally:
-        from dexmani_real.runtime.safety import revoke_motion
-
-        revoke_motion(shared, reason=RunEndReason.RUNTIME_SHUTDOWN)
-        if runner is not None and not runner_started:
-            cleanup_error = runner._shutdown_capture_and_inputs(None)
-            if cleanup_error is not None:
-                shared.error_state = True
-        shutdown_clean = (
-            shutdown_local_runtime(robot, supervisor, timeout_s=runtime.safety.shutdown_timeout_s)
-            if supervisor is not None
-            else shared.sensors.close()
-        )
+        shared.revoke_motion(reason=RunEndReason.RUNTIME_SHUTDOWN)
+        try:
+            if runner is not None:
+                runner.close()
+        except Exception:
+            shared.error_state = True
+            logger.exception("teleop capture/input cleanup failed")
+        finally:
+            shutdown_clean = shutdown_local_runtime(
+                shared, robot, sensors=sensors, timeout_s=runtime.safety.shutdown_timeout_s,
+            )
     return int(not clean or not shutdown_clean)
 
 
