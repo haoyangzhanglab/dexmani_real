@@ -1,4 +1,4 @@
-"""URDF-consistent xArm7 FK, Jacobians and pose transforms."""
+"""URDF-consistent xArm7 FK and Jacobians in the arm-base frame."""
 
 from __future__ import annotations
 
@@ -14,13 +14,13 @@ from dexmani_real.robot.model import (
     XARM7_XHAND_SRDF_PATH,
 )
 from ..paths import wrap_nearest_equivalent
-from .pose import Pose, compose_pose, compute_pose_error, invert_pose, quat_wxyz_to_rotmat
+from .pose import Pose
 
 _ARM_FK_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)
 
 
-def make_arm_kinematics(base_pose_world=None):
-    """Construct the existing seven-joint MPlib numerical backend, without devices."""
+def make_arm_kinematics():
+    """Construct the seven-joint MPlib backend in xArm-base coordinates, without devices."""
     import mplib
 
     if not XARM7_XHAND_SRDF_PATH.is_file():
@@ -34,7 +34,7 @@ def make_arm_kinematics(base_pose_world=None):
         joint_vel_limits=velocity.tolist(),
         joint_acc_limits=(velocity * 2).tolist(),
     )
-    return XArm7Kinematics(model, Pose.identity() if base_pose_world is None else base_pose_world)
+    return XArm7Kinematics(model)
 
 
 @lru_cache(maxsize=1)
@@ -104,44 +104,33 @@ def compute_eef_pose_history_xarm_base(
 
 
 class XArm7Kinematics:
-    """Full kinematics with MPlib integration — FK, Jacobian, pose transforms."""
+    """Nominal-URDF FK and Jacobians in the same xArm-base frame as collision geometry."""
 
-    def __init__(self, mp_planner: Any, base_pose_world: Pose) -> None:
+    def __init__(self, mp_planner: Any) -> None:
         self.mp_planner = mp_planner
         self.pinocchio_model = mp_planner.pinocchio_model
         self.eef_link_id = list(self.pinocchio_model.get_link_names()).index(mp_planner.move_group)
         self.joint_limits = np.asarray(mp_planner.joint_limits, dtype=np.float64)
         self.dof = len(self.joint_limits)
         self.equivalent_joint_mask = np.asarray(XARM7_EQUIVALENT_JOINT_MASK, dtype=bool)
-        self.base_pose_world = base_pose_world.copy()
-        self.base_pose_inverse = invert_pose(self.base_pose_world)
-        mp_planner.set_base_pose(self.to_mplib_pose(self.base_pose_world))
-
-    def world_to_base_pose(self, pose_world: Pose) -> Pose:
-        return compose_pose(self.base_pose_inverse, pose_world)
-
-    def base_to_world_pose(self, pose_base: Pose) -> Pose:
-        return compose_pose(self.base_pose_world, pose_base)
+        mp_planner.set_base_pose(self.to_mplib_pose(Pose.identity()))
 
     def compute_eef_pose_base(self, qpos: np.ndarray) -> Pose:
+        """Return an owned nominal URDF EEF pose in xArm-base coordinates."""
         if not np.all(np.isfinite(qpos)):
             raise ValueError("compute_eef_pose_base: qpos contains NaN or Inf")
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
         self.pinocchio_model.compute_forward_kinematics(full_qpos)
         link_pose = self.pinocchio_model.get_link_pose(self.eef_link_id)
         return Pose(
-            p=np.asarray(link_pose.p, dtype=np.float64),
+            p=np.asarray(link_pose.p, dtype=np.float64).copy(),
             q=np.asarray(link_pose.q, dtype=np.float64),
         )
 
-    def compute_eef_pose_world(self, qpos: np.ndarray) -> Pose:
-        pose_base = self.compute_eef_pose_base(qpos)
-        return self.base_to_world_pose(pose_base)
-
-    def compute_eef_jacobian_world(self, qpos: np.ndarray) -> np.ndarray:
-        """Return [EEF linear velocity; angular velocity] in world axes."""
+    def compute_eef_jacobian_base(self, qpos: np.ndarray) -> np.ndarray:
+        """Return [EEF linear velocity; angular velocity] in xArm-base axes."""
         if not np.all(np.isfinite(qpos)):
-            raise ValueError("compute_eef_jacobian_world: qpos contains NaN or Inf")
+            raise ValueError("compute_eef_jacobian_base: qpos contains NaN or Inf")
         full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
         self.pinocchio_model.compute_forward_kinematics(full_qpos)
         jacobian = np.asarray(
@@ -152,15 +141,9 @@ class XArm7Kinematics:
             raise RuntimeError(f"Expected a (6, >= {self.dof}) Jacobian, got {jacobian.shape}")
         jacobian = jacobian[:, : self.dof]
         position = np.asarray(self.pinocchio_model.get_link_pose(self.eef_link_id).p)
-        # Shift Pinocchio WORLD linear velocity from the base origin to the EEF before rotating axes.
+        # Pinocchio WORLD uses the base origin; shift its linear velocity to the EEF.
         linear = jacobian[:3] + np.cross(jacobian[3:].T, position).T
-        rotation = quat_wxyz_to_rotmat(self.base_pose_world.q)
-        return np.vstack((rotation @ linear, rotation @ jacobian[3:]))
-
-    def compute_world_pose_error(
-        self, target_eef_pose_world: Pose, qpos: np.ndarray
-    ) -> tuple[float, float]:
-        return compute_pose_error(target_eef_pose_world, self.compute_eef_pose_world(qpos))
+        return np.vstack((linear, jacobian[3:]))
 
     def to_mplib_pose(self, pose: Pose) -> Any:
         import mplib

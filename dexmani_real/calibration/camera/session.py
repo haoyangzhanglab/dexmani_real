@@ -27,21 +27,20 @@ from dexmani_real.calibration.camera.solver import (
     marker_corners_3d,
     save_camera_calibration,
 )
-from dexmani_real.config.experiment import ExperimentConfig
+from dexmani_real.config.experiment import ExperimentConfig, validate_keyboard_workspace
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.admission import TargetAdmission
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import IKFailureKind, OnlineIKSolver, make_online_ik_solver
-from dexmani_real.robot.home import execute_arm_home
 from dexmani_real.robot.commands import RobotCommand, DispatchError
+from dexmani_real.robot.home import build_home_planner, execute_arm_home
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.observation import read_camera_frame, sample_is_fresh
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, SafetyState, RuntimeState
 from dexmani_real.sensor.camera.worker import run_camera_worker
-from dexmani_real.config.experiment import validate_keyboard_workspace
 from dexmani_real.teleop.jog import (
     any_jog_key_held,
     compute_cartesian_jog_delta,
@@ -53,6 +52,7 @@ from dexmani_real.utils.timing import LoopRate
 logger = logging.getLogger(__name__)
 
 _WINDOW_NAME = "ArUco Calibration"
+_IDLE_STATUS_INTERVAL_FRAMES = 150
 
 
 def detect_aruco_stable(
@@ -113,22 +113,20 @@ def detect_aruco_stable(
 
 def build_planner(
     runtime: ExperimentConfig,
-) -> tuple[XArm7MotionPlanner, OnlineIKSolver, np.ndarray]:
-    workspace = runtime.control.workspace.as_array()
-    planner = XArm7MotionPlanner(
-        workspace_bounds=workspace,
-        static_boxes=tuple(runtime.environment.static_boxes),
-        table=runtime.environment.table,
-    )
-    planner.set_hand_qpos(np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)))
+) -> tuple[XArm7MotionPlanner, OnlineIKSolver]:
+    """Share arm kinematics while keeping HOME and online collision scenes separate."""
+    planner = build_home_planner(runtime)
+    home_hand_qpos = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
+    planner.set_hand_qpos(home_hand_qpos)
     solver = make_online_ik_solver(
         runtime,
         kin=planner.kin,
-        collision_model=planner.collision_model,
         max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
         max_pose_error_rot_rad=float(runtime.keyboard_teleop.ik_max_pose_error_rot_rad),
     )
-    return planner, solver, workspace
+    # Online jog permits table contact; both scenes retain the declared fixed-home hand.
+    solver.collision_model.set_hand_qpos(home_hand_qpos)
+    return planner, solver
 
 
 def read_stationary_calibration_arm_state(
@@ -188,7 +186,6 @@ def calibration_capture_metadata(
 
 def solve_calibration(
     samples: CalibrationSamples,
-    planner: XArm7MotionPlanner,
     config: CalibrationConfig,
     *,
     width: int,
@@ -197,7 +194,7 @@ def solve_calibration(
     intrinsics: np.ndarray,
     distortion: np.ndarray,
 ):
-    """Compute a qualified candidate; the session owns publication."""
+    """Compute a qualified T_base_camera candidate; the session owns publication."""
     sample_count = len(samples)
     print(f"\n  computing hand-eye calibration ({sample_count} samples, 5 methods)...")
     try:
@@ -209,15 +206,7 @@ def solve_calibration(
 
     errors_mm, errors_deg = result.position_errors_mm, result.rotation_errors_deg
     method = result.method
-    T_world_base = np.eye(4, dtype=np.float64)
-    T_world_base[:3, :3] = Rotation.from_quat(
-        np.roll(np.asarray(planner.kin.base_pose_world.q, dtype=np.float64), -1),
-    ).as_matrix()
-    T_world_base[:3, 3] = np.asarray(
-        planner.kin.base_pose_world.p,
-        dtype=np.float64,
-    )
-    T_world_camera = T_world_base @ result.T_base_camera
+    T_base_camera = result.T_base_camera
     samples.residuals_mm = errors_mm.copy()
 
     print("  method consistency (mm, lower is better):")
@@ -243,7 +232,7 @@ def solve_calibration(
         )
         flag = "  ← worst, press X to remove" if index == worst_index else ""
         print(f"    #{index + 1:2d} {residual_mm:6.1f} {bar}{flag}")
-    print(f"  T_world_camera position: {np.round(T_world_camera[:3, 3], 4)}m")
+    print(f"  T_base_camera position: {np.round(T_base_camera[:3, 3], 4)}m")
 
     metadata = calibration_capture_metadata(
         width=width,
@@ -257,7 +246,7 @@ def solve_calibration(
         rotation_errors_deg=errors_deg,
     )
     metadata["excitation"] = result.excitation
-    return T_world_camera, metadata
+    return T_base_camera, metadata
 
 
 def log_workspace_clipping(
@@ -455,7 +444,6 @@ class CameraCalibrationSession:
 
                 candidate = solve_calibration(
                     self.samples,
-                    self.home_planner,
                     self.calibration_config,
                     width=self.camera_width,
                     height=self.camera_height,
@@ -701,9 +689,8 @@ class CameraCalibrationSession:
                 self.runtime_state.revoke_motion()
                 self.robot.stop()
                 self.command_qpos = self.command_pose = None
-            idle_interval = int(self.runtime.keyboard_teleop.idle_interval_frames)
-            if self.frame % idle_interval == 0:
-                measured_pose = self.solver.kin.compute_eef_pose_world(self.current_qpos)
+            if self.frame % _IDLE_STATUS_INTERVAL_FRAMES == 0:
+                measured_pose = self.solver.kin.compute_eef_pose_base(self.current_qpos)
                 print(
                     f"[f={self.frame}] samples={len(self.samples)} "
                     f"eef={np.round(measured_pose.p, 3)}m",
@@ -740,7 +727,7 @@ class CameraCalibrationSession:
         baseline_pose = self.command_pose
         if baseline_qpos is None:
             baseline_qpos = self.current_qpos.copy()
-            baseline_pose = self.solver.kin.compute_eef_pose_world(self.current_qpos)
+            baseline_pose = self.solver.kin.compute_eef_pose_base(self.current_qpos)
         workspace_margin_m = float(self.runtime.keyboard_teleop.workspace_command_margin_m)
         command_low = self.workspace[:, 0] + workspace_margin_m
         command_high = self.workspace[:, 1] - workspace_margin_m
@@ -824,7 +811,7 @@ class CameraCalibrationSession:
         self.command_qpos = q_cmd.copy()
 
         if self.frame % self.calibration_config.status_interval_frames == 0:
-            measured_pose = self.solver.kin.compute_eef_pose_world(self.current_qpos)
+            measured_pose = self.solver.kin.compute_eef_pose_base(self.current_qpos)
             print(
                 f"[f={self.frame}] samples={len(self.samples)} "
                 f"eef={np.round(measured_pose.p, 3)}m "
@@ -845,11 +832,11 @@ class CameraCalibrationSession:
 
         validate_robot_config(self.runtime)
         self.runtime = resolve_runtime_table(self.runtime)
-        validate_keyboard_workspace(self.runtime)
+        workspace = validate_keyboard_workspace(self.runtime)
         self.runtime.camera.validate()
         calib_cfg = self.calibration_config or CalibrationConfig()
         aruco_cfg = self.aruco_config or ArucoConfig()
-        planner, solver, workspace = build_planner(self.runtime)
+        planner, solver = build_planner(self.runtime)
         if self.hand_geometry == "absent":
             print(
                 "  XHand: absent (operator assertion); IK/home geometry conservatively "

@@ -393,20 +393,20 @@ class CalibrationSamples:
 
 
 def save_camera_calibration(
-    T_world_camera: np.ndarray,
+    T_base_camera: np.ndarray,
     serial: str,
     json_path: Path,
     *,
     calibration_capture: dict[str, object] | None = None,
     cancelled=None,
 ) -> None:
-    """Write calibration result to cameras.json, preserving other entries."""
-    T_world_camera = validate_rigid_transform(T_world_camera, label="T_world_camera")
+    """Write an xArm-base camera pose to cameras.json, preserving other entries."""
+    T_base_camera = validate_rigid_transform(T_base_camera, label="T_base_camera")
     if not serial.strip():
         raise ValueError("camera serial must be non-empty")
-    rot = Rotation.from_matrix(T_world_camera[:3, :3])
+    rot = Rotation.from_matrix(T_base_camera[:3, :3])
     quat_wxyz = rot.as_quat()[[3, 0, 1, 2]]  # scipy xyzw → wxyz
-    pos = T_world_camera[:3, 3]
+    pos = T_base_camera[:3, 3]
 
     entry = {
         "serial": serial,

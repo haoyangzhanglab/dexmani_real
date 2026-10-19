@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import CancelledError
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -372,8 +372,6 @@ def main(argv: list[str] | None = None) -> int:
                 "hand.device_id": args.hand_id,
             },
         ).hand
-        if config.comm_type == "ethercat" and config.device_name == HandParams.device_name:
-            config = replace(config, device_name=None)
         config.validate()
         if not 0 <= args.finger_id < HAND_DOF:
             raise ValueError(f"finger-id must be in 0..{HAND_DOF - 1}")

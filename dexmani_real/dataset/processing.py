@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import logging
+from pathlib import Path
 
 import numpy as np
 
@@ -34,21 +34,14 @@ def validate_export_episode(
     if frames <= 0:
         raise RawDataError("episode contains no rows")
     reader.require_fields(*DATASET_SPECS, "rgb", "depth")
-    reader.require_metadata(
-        "camera_payload_mode",
-        "camera_color_height",
-        "camera_color_width",
-        "depth_scale",
-        "camera_color_intrinsics",
-        "camera_color_distortion_model",
-        "camera_color_distortion_coeffs",
-        "camera_T_xarm_base_from_color",
-    )
-    expected = (
-        frames,
-        int(reader.meta["camera_color_height"]),
-        int(reader.meta["camera_color_width"]),
-    )
+    try:
+        camera = load_raw_episode_camera_model(reader)
+        validate_aligned_depth_distortion(camera.geometry.color.distortion_model)
+        base_from_color = load_raw_episode_base_from_color(reader)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise RawDataError(f"invalid camera geometry: {exc}") from exc
+    color = camera.geometry.color
+    expected = (frames, color.height, color.width)
     if reader["depth"].shape != expected or reader["depth"].dtype != np.uint16:
         raise RawDataError(f"depth must be uint16 {expected}")
     errors = validate_training_rows(
@@ -66,12 +59,7 @@ def validate_export_episode(
         )
     for name in DATASET_SPECS:
         reader[name]  # EpisodeReader validates shape/dtype without reading the array.
-    try:
-        camera = load_raw_episode_camera_model(reader)
-        validate_aligned_depth_distortion(camera.geometry.color.distortion_model)
-        return camera, load_raw_episode_base_from_color(reader)
-    except (ValueError, TypeError, KeyError) as exc:
-        raise RawDataError(f"invalid camera geometry: {exc}") from exc
+    return camera, base_from_color
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:

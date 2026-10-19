@@ -10,7 +10,7 @@ import numpy as np
 from dexmani_real.config.environment import StaticCollisionBox, TableCollisionConfig
 from .collision import CollisionModel
 from .kinematics.arm_fk import make_arm_kinematics
-from .kinematics.pose import Pose
+from .kinematics.pose import compute_pose_error
 from .paths import WORKSPACE_BOUNDS_TOLERANCE_M, interpolate_waypoints
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,6 @@ class XArm7MotionPlanner:
         self,
         *,
         workspace_bounds: np.ndarray | None = None,
-        base_pose_world: Pose | None = None,
         static_boxes: Iterable[StaticCollisionBox] = (),
         table: TableCollisionConfig | None = None,
     ) -> None:
@@ -44,7 +43,7 @@ class XArm7MotionPlanner:
             ):
                 raise ValueError("workspace_bounds must be finite shape (3, 2) with lower <= upper")
             self.workspace_bounds = bounds.copy()
-        self.kin = make_arm_kinematics(base_pose_world)
+        self.kin = make_arm_kinematics()
         self._elbow_joint_index = list(self.kin.pinocchio_model.get_joint_names()).index("joint4")
         self.collision_model = CollisionModel(static_boxes=static_boxes, table=table)
 
@@ -58,7 +57,7 @@ class XArm7MotionPlanner:
         if any(q.shape != (7,) or not np.isfinite(q).all() for q in (current_qpos, target_qpos)):
             raise ValueError("HOME planning requires finite (7,) joint vectors")
         target_qpos = self.kin.canonicalize_qpos(target_qpos, current_qpos)
-        target_pose = self.kin.compute_eef_pose_world(target_qpos)
+        target_pose = self.kin.compute_eef_pose_base(target_qpos)
         result = self.kin.mp_planner.plan_qpos(
             goal_qposes=[target_qpos],
             current_qpos=current_qpos,
@@ -148,7 +147,9 @@ class XArm7MotionPlanner:
             and np.max(np.abs(np.diff(path, axis=0))) > _MAX_WAYPOINT_DELTA_RAD + 1e-12
         ):
             raise ValueError("Path waypoint delta too large.")
-        pos_error, rot_error = self.kin.compute_world_pose_error(target_pose, path[-1])
+        pos_error, rot_error = compute_pose_error(
+            target_pose, self.kin.compute_eef_pose_base(path[-1])
+        )
         if (
             not np.isfinite((pos_error, rot_error)).all()
             or pos_error > _MAX_POSE_ERROR_POS_M
@@ -170,7 +171,7 @@ class XArm7MotionPlanner:
             return
         for index, qpos in enumerate(interpolate_waypoints(path, max_step=0.02)):
             try:
-                position = self.kin.compute_eef_pose_world(qpos).p
+                position = self.kin.compute_eef_pose_base(qpos).p
             except (ValueError, RuntimeError) as exc:
                 raise ValueError(f"workspace FK failed at sample {index}: {exc}") from exc
             if (

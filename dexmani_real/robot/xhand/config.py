@@ -141,8 +141,14 @@ class HandParams:
             raise ValueError("hand ethercat_slave_position must be -1 (unknown) or non-negative")
         if self.comm_type not in ("ethercat", "serial"):
             raise ValueError("hand comm_type must be 'ethercat' or 'serial'")
-        if self.device_name is not None and not isinstance(self.device_name, str):
-            raise ValueError("hand device_name must be a string or null")
+        if self.device_name is not None:
+            if not isinstance(self.device_name, str) or not self.device_name.strip():
+                raise ValueError("hand device_name must be a non-empty string or null")
+            if self.comm_type == "ethercat" and "/" in self.device_name:
+                raise ValueError(
+                    "hand device_name for EtherCAT must be an interface name, not a device path; "
+                    "set hand.device_name to the interface name or null for discovery"
+                )
         if not isinstance(self.baudrate, int) or self.baudrate <= 0:
             raise ValueError("hand baudrate must be a positive integer")
         if not isinstance(self.device_id, int) or self.device_id < 0:

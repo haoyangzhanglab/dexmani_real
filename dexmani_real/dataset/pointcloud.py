@@ -1,4 +1,4 @@
-"""Reconstruct xArm-base clouds from Raw RGB-D arrays and camera metadata."""
+"""Load saved aligned RGB-D geometry for Raw consumers."""
 
 from __future__ import annotations
 
@@ -7,7 +7,11 @@ from typing import Any, cast
 
 import numpy as np
 
-from dexmani_real.recording.storage.reader import EpisodeReader
+from dexmani_real.recording.storage.reader import (
+    EpisodeReader,
+    positive_float_attr,
+    positive_int_attr,
+)
 from dexmani_real.sensor.camera.geometry import (
     CameraIntrinsics,
     RGBDGeometry,
@@ -25,10 +29,10 @@ class RawEpisodeCameraModel:
 
 def color_intrinsics_from_meta(meta: Any) -> CameraIntrinsics:
     matrix = np.asarray(meta["camera_color_intrinsics"], dtype=np.float64).reshape(3, 3)
-    coefficients = tuple(float(value) for value in meta["camera_color_distortion_coeffs"])
+    coefficients = tuple(meta["camera_color_distortion_coeffs"])
     color = CameraIntrinsics(
-        width=int(meta["camera_color_width"]),
-        height=int(meta["camera_color_height"]),
+        width=positive_int_attr(meta, "camera_color_width"),
+        height=positive_int_attr(meta, "camera_color_height"),
         fx=float(matrix[0, 0]),
         fy=float(matrix[1, 1]),
         ppx=float(matrix[0, 2]),
@@ -53,12 +57,9 @@ def load_raw_episode_camera_model(reader: EpisodeReader) -> RawEpisodeCameraMode
         color=color,
         T_color_from_depth=np.eye(4, dtype=np.float64),
     )
-    depth_scale_m = float(meta["depth_scale"])
-    if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
-        raise ValueError("depth_scale must be finite and positive")
     return RawEpisodeCameraModel(
         geometry=geometry,
-        depth_scale_m=depth_scale_m,
+        depth_scale_m=positive_float_attr(meta, "depth_scale"),
     )
 
 

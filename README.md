@@ -48,6 +48,8 @@ python examples/collect_teleop.py --config local.yaml --print-config
 
 字段以当前输出及[配置加载入口](dexmani_real/config/experiment.py)为准，未知字段直接报错。运行前核对设备地址、serial、工作空间与现场标定；示例 YAML 仅展示覆盖方式。
 
+XHand 默认通过 `/dev/ttyUSB0` 串口连接。使用 EtherCAT 时，同时设置 `hand.comm_type: ethercat` 和 `hand.device_name` 为实际网卡接口名；显式设置 `hand.device_name: null` 才使用所选传输的设备发现，各入口均不自动改写设备名。
+
 各入口的 `--help` 不连接设备；支持 `--print-config` 的入口仅打印声明配置，不读取现场标定或加载策略，也不证明运行条件已满足。日志默认写入 `~/.dexmani/logs/`，可用 `DEXMANI_LOG_DIR` 指定位置。
 
 ## 实验工作流
@@ -57,6 +59,8 @@ python examples/collect_teleop.py --config local.yaml --print-config
 ### 1. 标定
 
 相机外参、桌面平面、手部安装与 VR alignment 属于当前实验状态；物理设置变化后重新标定或确认。相机采用固定安装的 eye-to-hand 外参，按设备 serial 绑定。
+
+规划、IK、工作空间、静态障碍和相机外参统一使用 xArm-base 坐标；相机标定直接保存相机到该基座的变换。
 
 | 标定 | 入口与要求 |
 | --- | --- |
@@ -72,7 +76,7 @@ python examples/calibrate_vr_heading.py --help
 python examples/pointcloud_process_example.py --help
 ```
 
-相机标定中的 `absent` 表示手未安装，`secured-home` 表示已物理固定在配置 HOME 手形；两者均按固定 HOME 手形做碰撞检查。相机与 VR 标定支持 `--output`；桌面文件由 `environment.table.plane_path` 指定。
+相机标定中的 `absent` 表示手未安装，`secured-home` 表示已物理固定在配置 HOME 手形；两者均按固定 HOME 手形做碰撞检查。标定在线 jog 允许桌面接触，HOME 独立检查桌面路径净空。相机与 VR 标定支持 `--output`；桌面文件由 `environment.table.plane_path` 指定。
 
 采集允许缺相机外参，点云重建需要数据对应的内外参与 depth scale。采集可通过 `--vr-transform`、`--camera-calibration` 选择标定，部署支持 `--camera-calibration`。VR 质量为 `poor` 的标定不能用于遥操作启动。
 
@@ -110,7 +114,7 @@ python examples/export_policy_zarr.py episodes/test --config local.yaml
 
 `--info` 打印数据概要，无需启动 Rerun；交互查看可用 `--no-point-cloud` 关闭点云。查看和导出使用 Raw 保存的相机几何，以及当前点云、桌面、手部安装与指尖配置。仅启用去桌时读取桌面平面。
 
-公共导出要求每段全部 **15 字段**完整、浮点数值有限，并通过时序及动作执行证据检查。缺字段、NaN/Inf、RGB-D 行数不符、相机几何缺失或空点云均整段拒绝，记录原因并保留原 Raw；任务失败本身不排除技术有效的数据。导出不删坏帧、不填补缺测、不修改 Raw。
+公共导出要求每段全部 **15 字段**完整、浮点数值有限，并通过时序及动作执行证据检查。缺字段、NaN/Inf、RGB-D 行数不符、相机几何缺失或非法、空点云均整段拒绝，记录原因并保留原 Raw；任务失败本身不排除技术有效的数据。导出不删坏帧、不填补缺测、不修改 Raw。
 
 默认输出 `datasets/test.zarr`，目标必须不存在；`--output` 指定新路径，`--exclude` 排除指定 episode，`--chunk-frames` 调整批大小，`--pointcloud-num-points` 覆盖点数。同一缓存要求 task、dt、depth scale 和数组 shape/dtype 一致；合法 metadata 冲突会在读取后续数值前中止导出。文件系统或处理异常保留 staging 供排查。
 
@@ -165,7 +169,7 @@ python examples/replay_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config
 | 点云诊断 / 桌面标定 | [pointcloud_process_example.py](examples/pointcloud_process_example.py) | 连接相机；`--save-dir` 保存本次 RGB-D、点云及重建 metadata |
 | 物体重建与跟踪 | [CORDViP 示例](examples/cordvip/README.md) | 使用独立的 `cordvip_geometry` 依赖与入口，区分离线数据和实时相机模式 |
 
-点云诊断保存与最终显示使用同一帧，后续连续帧测速仅报告耗时和有效点云数量。关闭 `pointcloud.remove_table` 时处理不使用桌面平面；拟合结果只有确认后才发布。各入口的参数与按键以 `--help` 和交互提示为准。
+点云诊断保存与最终显示使用同一帧，后续连续帧测速仅报告耗时和有效点云数量。RGB-D 诊断缺少有效相机外参或无匹配 serial 时关闭点云显示，继续 RGB/Depth 预览。关闭 `pointcloud.remove_table` 时处理不使用桌面平面；拟合结果只有确认后才发布。各入口的参数与按键以 `--help` 和交互提示为准。
 
 ## 数据与安全边界
 

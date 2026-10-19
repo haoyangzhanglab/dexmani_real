@@ -70,7 +70,6 @@ class KeyboardTeleopParams:
     workspace_command_margin_m: float = 0.005
     ik_max_pose_error_pos_m: float = 0.002
     ik_max_pose_error_rot_rad: float = radians(2.0)
-    idle_interval_frames: int = 150
 
     def validate(self) -> None:
         for name in ("control_hz", "delta_pos_m", "delta_rpy_rad"):
@@ -79,8 +78,6 @@ class KeyboardTeleopParams:
         margin = self.workspace_command_margin_m
         if not np.isfinite(margin) or margin < 0:
             raise ValueError("workspace_command_margin_m must be finite and non-negative")
-        if type(self.idle_interval_frames) is not int or self.idle_interval_frames <= 0:
-            raise ValueError("keyboard idle interval must be > 0")
 
 
 @dataclass(frozen=True)

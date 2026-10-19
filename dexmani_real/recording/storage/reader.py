@@ -59,6 +59,18 @@ def nonnegative_int_attr(attrs: h5py.AttributeManager, name: str) -> int:
     return value
 
 
+def positive_int_attr(attrs: h5py.AttributeManager, name: str) -> int:
+    """Parse a Raw dimension without coercing text/bools or truncating fractional values."""
+    value = scalar_attr(attrs, name)
+    if (
+        type(value) not in (int, float)
+        or value <= 0
+        or (type(value) is float and (not np.isfinite(value) or not value.is_integer()))
+    ):
+        raise RawDataError(f"episode metadata {name} must be a positive integer")
+    return int(value)
+
+
 def positive_float_attr(attrs: h5py.AttributeManager, name: str) -> float:
     value = scalar_attr(attrs, name)
     if type(value) not in (int, float):
@@ -131,13 +143,6 @@ class EpisodeReader:
         missing = set(names) - self.fields
         if missing:
             raise RawDataError(f"Raw {self._path.name} missing required fields: {sorted(missing)}")
-
-    def require_metadata(self, *names: str) -> None:
-        missing = set(names) - self.meta.keys()
-        if missing:
-            raise RawDataError(
-                f"Raw {self._path.name} missing required metadata: {sorted(missing)}"
-            )
 
     def __getitem__(self, name):
         if self._data is None:

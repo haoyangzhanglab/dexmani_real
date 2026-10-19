@@ -47,7 +47,7 @@ class CameraExtrinsics:
             self._transforms[serial] = pose_to_matrix(pose["position"], pose["orientation"])
 
     def for_serial(self, serial: str) -> np.ndarray:
-        """Return an owned, read-only T_world_camera, including after process spawn."""
+        """Return an owned, read-only T_base_camera, including after process spawn."""
         try:
             transform = self._transforms[serial].copy()
         except KeyError:

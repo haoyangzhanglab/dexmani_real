@@ -126,7 +126,7 @@ class CanonicalExporter:
                             tolerance_ns=tolerance_ns,
                         ),
                         action_semantics="absolute_joint_goal_not_next_step_arrival",
-                        depth_scale_m_per_unit=float(reader.meta["depth_scale"]),
+                        depth_scale_m_per_unit=camera.depth_scale_m,
                         pointcloud_config=asdict(self.processing.pointcloud),
                         fingertip_link_names=list(self.processing.fingertip_link_names),
                     )

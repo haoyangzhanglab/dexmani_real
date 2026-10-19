@@ -170,7 +170,7 @@ class KeyboardTeleopSession:
                 baseline_pose = self.command_pose
                 if baseline_qpos is None:
                     baseline_qpos = measured_qpos.copy()
-                    baseline_pose = self.solver.kin.compute_eef_pose_world(measured_qpos)
+                    baseline_pose = self.solver.kin.compute_eef_pose_base(measured_qpos)
                 proposed_pose, _, changed = propose_cartesian_jog_pose(
                     baseline_pose,
                     dx,

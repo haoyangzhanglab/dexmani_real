@@ -110,16 +110,13 @@ class IKCandidate:
     score: float = 0.0
 
 
-def make_online_ik_solver(runtime, *, kin=None, collision_model=None, **tolerances):
+def make_online_ik_solver(runtime, *, kin=None, **tolerances):
+    """Build the online collision scene, which permits table contact."""
     from .arm_fk import make_arm_kinematics
     from ..collision import CollisionModel
 
     kin = make_arm_kinematics() if kin is None else kin
-    collision_model = (
-        CollisionModel(static_boxes=runtime.environment.static_boxes)
-        if collision_model is None
-        else collision_model
-    )
+    collision_model = CollisionModel(static_boxes=runtime.environment.static_boxes)
     return OnlineIKSolver(kin, collision_model, make_online_ik_config(runtime, **tolerances))
 
 
@@ -191,17 +188,17 @@ class OnlineIKSolver:
             raise ValueError("online IK tolerances, radii and weights must be finite and valid")
 
     def solve(
-        self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
+        self, target_eef_pose_base: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
     ) -> IKResult:
         try:
             current = self.finite_q(current_qpos)
             previous = self.finite_q(previous_qpos_cmd)
             if (
-                not np.isfinite(target_eef_pose_world.p).all()
-                or not np.isfinite(target_eef_pose_world.q).all()
+                not np.isfinite(target_eef_pose_base.p).all()
+                or not np.isfinite(target_eef_pose_base.q).all()
             ):
                 raise ValueError("non-finite target pose")
-            selected, converged, rejection = self.search(target_eef_pose_world, current, previous)
+            selected, converged, rejection = self.search(target_eef_pose_base, current, previous)
             if selected is not None:
                 result = IKResult(success=True, qpos=selected.qpos)
             else:
@@ -237,7 +234,7 @@ class OnlineIKSolver:
         return q
 
     def search(self, target, current, previous):
-        target_base = self.kin.to_mplib_pose(self.kin.world_to_base_pose(target))
+        target_base = self.kin.to_mplib_pose(target)
         pool: list[IKCandidate] = []
         tried_seeds = []
         converged = False
@@ -343,7 +340,7 @@ class OnlineIKSolver:
         delta_prev = self.kin.compute_qpos_delta(q, previous)
         delta = self.kin.compute_qpos_delta(q, current)
         distance = float(np.max(np.abs(delta)))
-        pos_err, rot_err = compute_pose_error(target, self.kin.compute_eef_pose_world(q))
+        pos_err, rot_err = compute_pose_error(target, self.kin.compute_eef_pose_base(q))
         if not np.isfinite((pos_err, rot_err)).all():
             raise ValueError("IK FK/pose error is non-finite")
         p = self.profile
@@ -397,7 +394,7 @@ class OnlineIKSolver:
         return None
 
     def scaled_jacobian_svd(self, candidate):
-        jacobian = self.kin.compute_eef_jacobian_world(candidate.qpos)
+        jacobian = self.kin.compute_eef_jacobian_base(candidate.qpos)
         if jacobian.shape != (6, 7) or not np.isfinite(jacobian).all():
             raise ValueError("IK Jacobian must be finite shape (6, 7)")
         norms = np.array([np.linalg.norm(jacobian[:3]), np.linalg.norm(jacobian[3:])])

@@ -78,7 +78,7 @@ def iter_raw_episode(path: str | Path) -> Iterator[Frame]:
 def iter_live_realsense(
     *, serial: str | None = None, width: int = 640, height: int = 480, fps: int = 30
 ) -> Iterator[Frame]:
-    """Connect one camera; repeated frames retain first host receive times, excluding SDK queue latency."""
+    """Preserve first host queue-return times per channel; SDK queue latency is unmeasured."""
     from dexmani_real.sensor.camera.config import CameraParams
     from dexmani_real.sensor.camera.realsense import RealSenseCamera
 
@@ -87,36 +87,39 @@ def iter_live_realsense(
     previous_identity: tuple[int, int] | None = None
     channel_received_ns = [0, 0]
     try:
-        if not camera.connect():
-            raise RuntimeError("RealSense connection failed")
+        camera.connect()
+        depth_scale_m = np.float32(camera.get_depth_scale())
+        if not np.isfinite(depth_scale_m) or depth_scale_m <= 0:
+            raise RuntimeError("RealSense depth scale must be finite and positive")
+        active_serial = camera.active_serial
+        if not isinstance(active_serial, str) or not active_serial.strip():
+            raise RuntimeError("RealSense active serial is unavailable")
         intrinsics = camera.get_geometry().color
         K = intrinsics.matrix()
+        stall_timeout_ns = int(config.source_stall_timeout_s * 1e9)
         while True:
             raw = camera.read(timeout_ms=1000)
-            identity = (int(raw.depth_frame_number), int(raw.color_frame_number))
+            identity = (raw.depth_frame_number, raw.color_frame_number)
             for channel, number in enumerate(identity):
                 if number < 0 or (
                     previous_identity is not None and number < previous_identity[channel]
                 ):
                     raise RuntimeError("RealSense frame identity is invalid or moved backward")
                 if previous_identity is None or number != previous_identity[channel]:
-                    channel_received_ns[channel] = int(raw.timestamp_ns)
+                    channel_received_ns[channel] = raw.timestamp_ns
             oldest_received_ns = min(channel_received_ns)
-            if time.monotonic_ns() - oldest_received_ns >= int(config.source_stall_timeout_s * 1e9):
+            if time.monotonic_ns() - oldest_received_ns >= stall_timeout_ns:
                 raise RuntimeError("RealSense stopped producing new RGB or depth")
             if identity == previous_identity:
                 continue
             previous_identity = identity
-            if raw.depth_aligned_to_color_raw is None:
-                raise RuntimeError("RealSense did not return aligned RGB-D")
             yield Frame(
                 rgb=raw.rgb,
-                depth_m=raw.depth_aligned_to_color_raw.astype(np.float32)
-                * np.float32(raw.depth_scale),
+                depth_m=raw.depth_aligned_to_color_raw.astype(np.float32) * depth_scale_m,
                 K=K,
                 distortion_model=intrinsics.distortion_model,
                 distortion_coeffs=intrinsics.distortion_coeffs,
-                source_id=f"realsense:{raw.serial}:{identity[0]}:{identity[1]}",
+                source_id=f"realsense:{active_serial}:{identity[0]}:{identity[1]}",
                 timestamp_ns=oldest_received_ns,
                 clock="host_monotonic_oldest_rgbd_receive",
             )

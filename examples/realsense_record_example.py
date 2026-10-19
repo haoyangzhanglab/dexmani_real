@@ -5,6 +5,7 @@ python examples/realsense_record_example.py
 python examples/realsense_record_example.py --config local.yaml --camera-calibration cameras.json
 
 参数：--config 覆盖相机与处理配置，--camera-calibration 指定点云重建所用相机外参。
+缺少有效外参或无匹配 serial 时仅关闭点云显示，继续 RGB/Depth 预览。
 """
 
 from __future__ import annotations
@@ -12,9 +13,8 @@ from __future__ import annotations
 import argparse
 import time
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -26,9 +26,10 @@ from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud, build_raw_point_cloud
 from dexmani_real.utils.log import configure_logging
 
+if TYPE_CHECKING:
+    from dexmani_real.sensor.camera.realsense import RealSenseCamera
+
 _WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
-
-
 _FPS_WINDOW = 100
 
 
@@ -58,7 +59,6 @@ class NonBlockingPCDViewer:
         self._vis: Any | None = None
         self._pcd: Any | None = None
         self._frame: Any | None = None
-        self._created: bool = False
         self.point_size = point_size
 
     def update(self, points: np.ndarray) -> bool:
@@ -76,7 +76,7 @@ class NonBlockingPCDViewer:
         self._pcd.points = o3d.utility.Vector3dVector(points[:, :3].astype(np.float64))
         self._pcd.colors = o3d.utility.Vector3dVector(points[:, 3:].astype(np.float64))
 
-        if not self._created:
+        if self._vis is None:
             self._vis = o3d.visualization.Visualizer()
             self._vis.create_window(window_name="Point Cloud", width=800, height=600)
             self._vis.add_geometry(self._pcd)
@@ -85,14 +85,10 @@ class NonBlockingPCDViewer:
             opt = self._vis.get_render_option()
             opt.point_size = float(self.point_size)
             opt.background_color = np.array([1.0, 1.0, 1.0])
-            self._created = True
         else:
-            assert self._vis is not None
             self._vis.update_geometry(self._pcd)
 
-        assert self._vis is not None
         if not self._vis.poll_events():
-            self._created = False
             return False
         self._vis.update_renderer()
         return True
@@ -100,10 +96,9 @@ class NonBlockingPCDViewer:
     def close(self) -> None:
         if self._vis is not None:
             self._vis.destroy_window()
-            self._vis = None
-            self._pcd = None
-            self._frame = None
-            self._created = False
+        self._vis = None
+        self._pcd = None
+        self._frame = None
 
 
 def overlay_text(
@@ -124,7 +119,7 @@ def overlay_text(
 
 def make_jet_depth_vis(depth: np.ndarray, min_d: float, max_d: float) -> np.ndarray:
     """Render metric depth with near points at the hot end of the colormap."""
-    depth_f32 = depth.astype(np.float32)
+    depth_f32 = np.asarray(depth, dtype=np.float32)
     valid = np.isfinite(depth_f32) & (depth_f32 > 0.0)
     depth_clip = np.clip(depth_f32, min_d, max_d)
     depth_norm = (depth_clip - min_d) / max(max_d - min_d, 1e-6)
@@ -136,14 +131,14 @@ def make_jet_depth_vis(depth: np.ndarray, min_d: float, max_d: float) -> np.ndar
 
 def depth_valid_ratio(depth: np.ndarray, min_d: float, max_d: float) -> float:
     """Return the fraction of depth pixels inside the display band."""
-    depth_f32 = depth.astype(np.float32)
+    depth_f32 = np.asarray(depth, dtype=np.float32)
     valid = np.isfinite(depth_f32) & (depth_f32 > 0.0) & (depth_f32 >= min_d) & (depth_f32 <= max_d)
     return float(valid.mean()) if depth_f32.size else 0.0
 
 
 def make_gray_depth_vis(depth: np.ndarray, min_d: float, max_d: float) -> np.ndarray:
     """Grayscale metric depth: near=white, far=black."""
-    depth_f32 = depth.astype(np.float32)
+    depth_f32 = np.asarray(depth, dtype=np.float32)
     valid = np.isfinite(depth_f32) & (depth_f32 > 0)
     depth_clip = np.clip(depth_f32, min_d, max_d)
     depth_norm = (depth_clip - min_d) / max(max_d - min_d, 1e-6)
@@ -154,6 +149,8 @@ def make_gray_depth_vis(depth: np.ndarray, min_d: float, max_d: float) -> np.nda
 
 
 def list_cameras() -> list[dict[str, str]]:
+    from dexmani_real.sensor.camera.realsense import RealSenseCamera
+
     cameras = RealSenseCamera.list_cameras()
     if not cameras:
         print("No RealSense camera detected. Check USB connection.")
@@ -208,21 +205,6 @@ def build_hud_lines(
     return lines
 
 
-def build_key_actions(
-    state: PointCloudDisplayState,
-    viewer: NonBlockingPCDViewer,
-    production: PointCloudConfig,
-) -> dict[int, Callable[[], None]]:
-    return {
-        ord("p"): lambda: toggle_pcd(state, viewer),
-        ord("s"): lambda: toggle_cloud_mode(state),
-        ord("f"): lambda: toggle_freeze(state),
-        ord("r"): lambda: reset_state(state, viewer),
-        ord("c"): lambda: print_state(state, production),
-        ord("d"): lambda: toggle_cmap(state),
-    }
-
-
 def handle_keyboard(
     key: int,
     state: PointCloudDisplayState,
@@ -242,9 +224,19 @@ def handle_keyboard(
             print("  Exposure changes disabled: original priority could not be read")
         return True
 
-    action = build_key_actions(state, viewer, production).get(key)
-    if action:
-        action()
+    if key == ord("p"):
+        toggle_pcd(state, viewer)
+    elif key == ord("s"):
+        toggle_cloud_mode(state)
+    elif key == ord("f"):
+        toggle_freeze(state)
+    elif key == ord("r"):
+        reset_state(state, viewer)
+    elif key == ord("c"):
+        print_state(state, production)
+    elif key == ord("d"):
+        state.toggle_colormap()
+        print(f"  Colormap: {state.colormap}")
     return True
 
 
@@ -289,13 +281,10 @@ def print_state(state: PointCloudDisplayState, production: PointCloudConfig) -> 
     )
 
 
-def toggle_cmap(state: PointCloudDisplayState) -> None:
-    state.toggle_colormap()
-    print(f"  Colormap: {state.colormap}")
-
-
 def get_ae_priority(camera: RealSenseCamera) -> float | None:
     """Read auto_exposure_priority (0=OFF, 1=ON); None if unsupported or unreadable."""
+    import pyrealsense2 as rs
+
     try:
         sensor = camera.get_color_sensor()
         option = rs.option.auto_exposure_priority
@@ -308,6 +297,8 @@ def get_ae_priority(camera: RealSenseCamera) -> float | None:
 
 def set_ae_priority(camera: RealSenseCamera, value: float) -> float | None:
     """Set auto_exposure_priority and return the readback; None if unsupported."""
+    import pyrealsense2 as rs
+
     sensor = camera.get_color_sensor()
     option = rs.option.auto_exposure_priority
     if not sensor.supports(option):
@@ -338,17 +329,14 @@ class RealSenseExample:
         self.args = args
 
     def run(self) -> int:
-        global rs, RealSenseCamera
-        import pyrealsense2 as rs
-
-        from dexmani_real.sensor.camera.realsense import RealSenseCamera
-
         # Resolve experiment settings before enumerating or opening a camera.
         self.runtime = load_experiment_config(yaml_path=self.args.config)
         self.production = self.runtime.pointcloud
         self.production.validate()
         self.table = self.runtime.environment.table
         self.calibration = self.table_plane_abcd = None
+
+        from dexmani_real.sensor.camera.realsense import RealSenseCamera
 
         # Leave exposure priority untouched until it is snapshotted.
         config = self.runtime.camera
@@ -462,10 +450,13 @@ class RealSenseExample:
                                 self.state.cloud_mode,
                                 self.camera.active_serial,
                             )
-                        except (OSError, ValueError, RuntimeError) as exc:
+                        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
                             self.state.show = False
                             self.viewer.close()
-                            print(f"  PCD {self.state.cloud_mode} unavailable: {exc}")
+                            print(
+                                f"  PCD {self.state.cloud_mode} unavailable "
+                                f"for serial {self.camera.active_serial!r}: {exc}"
+                            )
                         if (
                             self.state.show
                             and self.state.frozen

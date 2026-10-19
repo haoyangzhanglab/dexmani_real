@@ -73,15 +73,14 @@ class PointCloudConfig:
             raise ValueError("edge thresholds must be non-negative with positive jump")
         if max(self.depth_support_min_neighbors, self.edge_support_min_neighbors) > 8:
             raise ValueError("depth/edge support must use at most eight neighbors")
+        for name in ("table_core_height_m", "table_object_seed_height_m"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not np.isfinite(value):
+                raise ValueError(f"{name} must be a finite number")
+        if type(self.table_object_seed_min_pixels) is not int:
+            raise ValueError("table_object_seed_min_pixels must be an integer")
         if self.remove_table:
-            for name in ("table_core_height_m", "table_object_seed_height_m"):
-                value = getattr(self, name)
-                if type(value) not in (int, float) or not np.isfinite(value):
-                    raise ValueError(f"{name} must be a finite number")
-            if (
-                type(self.table_object_seed_min_pixels) is not int
-                or self.table_object_seed_min_pixels < 1
-            ):
+            if self.table_object_seed_min_pixels < 1:
                 raise ValueError("table_object_seed_min_pixels must be an integer >= 1")
             if not 0.0 <= self.table_core_height_m < self.table_object_seed_height_m:
                 raise ValueError("table heights must satisfy 0 <= core < object_seed")
