@@ -13,7 +13,7 @@ from dexmani_real.calibration import CAMERAS_PATH
 from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
 
 
-def _pose_to_matrix(position, orientation) -> np.ndarray:
+def pose_to_matrix(position, orientation) -> np.ndarray:
     position = np.asarray(position, dtype=np.float64)
     if position.shape != (3,) or not np.all(np.isfinite(position)):
         raise ValueError("camera position must be finite XYZ meters")
@@ -33,7 +33,9 @@ class CameraExtrinsics:
         self._transforms: dict[str, np.ndarray] = {}
         for name, camera in raw.items():
             if not isinstance(camera, dict) or not isinstance(camera.get("pose"), dict):
-                raise ValueError(f"camera calibration {name!r} requires pose.position and pose.orientation")
+                raise ValueError(
+                    f"camera calibration {name!r} requires pose.position and pose.orientation"
+                )
             if camera["type"] != "eye_to_hand":
                 raise ValueError(f"camera calibration {name!r} must be eye_to_hand")
             serial = camera["serial"]
@@ -42,7 +44,7 @@ class CameraExtrinsics:
             if serial in self._transforms:
                 raise ValueError(f"camera calibration serial {serial!r} appears more than once")
             pose = camera["pose"]
-            self._transforms[serial] = _pose_to_matrix(pose["position"], pose["orientation"])
+            self._transforms[serial] = pose_to_matrix(pose["position"], pose["orientation"])
 
     def for_serial(self, serial: str) -> np.ndarray:
         """Return an owned, read-only T_world_camera, including after process spawn."""

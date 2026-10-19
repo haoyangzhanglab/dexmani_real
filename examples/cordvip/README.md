@@ -64,7 +64,7 @@ python examples/cordvip/track_object.py \
 
 语义实测点独立于 mesh，模型支持子集与残差另外保存。单个物体 pose 失效不会抹掉另一个物体或当前语义深度点；该 pose 保持失效，重新运行并显式选择才能注册。分割仍可能覆盖手边缘或篮孔后面的桌面，几何一致性也不等于物理精度。生成模型和当前实测点不做跨帧融合。
 
-Grounded-SAM2、FoundationPose++ 核心与 FK 使用 `real_robot`。新工作站按[安装说明](../../third_party/cordvip_geometry/docs/usage.md)准备环境，再运行 `python -m cordvip_geometry download --models grounding sam`。默认 SAM2.1 small，不编译；Grounding DINO 只负责首帧文本候选，开始跟踪后释放。已有确认 mask 不要求检测权重。large 对照须同时指定匹配的 `--sam-config/--sam-checkpoint`。当前位姿仅采用 2D guidance，没有 Kalman。本地示例资产和 Raw 不随仓库分发。
+`real_robot` 是示例环境名；父进程按实际能力检查依赖，SAM 子解释器须满足固定 Python/依赖版本，可通过 `--sam-python` 指定。新工作站按[安装说明](../../third_party/cordvip_geometry/docs/usage.md)准备环境，再运行 `python -m cordvip_geometry download --models grounding sam`。默认 SAM2.1 small，不编译；Grounding DINO 只负责首帧文本候选，开始跟踪后释放。已有确认 mask 不要求检测权重。large 对照须同时指定匹配的 `--sam-config/--sam-checkpoint`。当前位姿仅采用 2D guidance，没有 Kalman。本地示例资产和 Raw 不随仓库分发。
 
 ### 单物体位姿模式
 

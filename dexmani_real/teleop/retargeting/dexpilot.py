@@ -13,10 +13,12 @@ from dex_retargeting.seq_retarget import SeqRetargeting
 
 from dexmani_real.config.control import DexPilotRetargetingParams
 from dexmani_real.robot.model import (
-    HAND_JOINT_SHAPE, XHAND_FINGERTIP_LINK_NAMES, XHAND_RIGHT_URDF_PATH, XHAND_SDK_JOINT_NAMES,
+    HAND_JOINT_SHAPE,
+    XHAND_FINGERTIP_LINK_NAMES,
+    XHAND_RIGHT_URDF_PATH,
+    XHAND_SDK_JOINT_NAMES,
 )
 from dexmani_real.teleop.retargeting.retargeter import prepare_landmarks
-
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +58,8 @@ class DexPilotHandRetargeter:
         self._pinky_palm_scale = float(dexpilot_config.pinky_palm_scale)
         robot = RobotWrapper(str(XHAND_RIGHT_URDF_PATH))
         optimizer = StrictDexPilotOptimizer(
-            robot, list(XHAND_SDK_JOINT_NAMES),
+            robot,
+            list(XHAND_SDK_JOINT_NAMES),
             finger_tip_link_names=list(XHAND_FINGERTIP_LINK_NAMES),
             wrist_link_name="right_hand_link",
             scaling=dexpilot_config.scaling_factor,
@@ -64,7 +67,9 @@ class DexPilotHandRetargeter:
             escape_dist=dexpilot_config.escape_dist_m,
         )
         self.retargeter = SeqRetargeting(
-            optimizer, has_joint_limits=True, lp_filter=LPFilter(dexpilot_config.low_pass_alpha),
+            optimizer,
+            has_joint_limits=True,
+            lp_filter=LPFilter(dexpilot_config.low_pass_alpha),
         )
 
         self.indices = self.retargeter.optimizer.target_link_human_indices
@@ -76,11 +81,11 @@ class DexPilotHandRetargeter:
         self.inverse_retargeted_joint_order = np.argsort(self.retargeted_joint_order)
 
     def retarget(self, landmarks: np.ndarray | None) -> np.ndarray | None:
-        """Map operator-frame (21,3) landmarks to SDK qpos.
-        Invalid geometry/roundoff returns None; unexpected optimizer errors propagate to the owner.
-        """
+        """Map (21,3) landmarks to SDK qpos; invalid geometry/roundoff returns None, other errors propagate."""
         mano = prepare_landmarks(
-            landmarks, pinky_scale=self._pinky_scale, pinky_palm_scale=self._pinky_palm_scale,
+            landmarks,
+            pinky_scale=self._pinky_scale,
+            pinky_palm_scale=self._pinky_palm_scale,
         )
         if mano is None:
             return None

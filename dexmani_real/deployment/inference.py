@@ -14,6 +14,7 @@ class ModelResult:
     error: BaseException | None
     started_ns: int
     completed_ns: int
+    query_context: dict | None = None
 
 
 class InferenceWorker:
@@ -24,9 +25,8 @@ class InferenceWorker:
         self.future = None
         self.operation = None
         self.close_future = None
-        self.query_context = None
 
-    def _call(self, operation, args, kwargs):
+    def call(self, operation, args, kwargs, query_context=None):
         start = time.monotonic_ns()
         value, error = None, None
         try:
@@ -38,13 +38,13 @@ class InferenceWorker:
         except BaseException as exc:
             error = exc
         # Completion includes the blocking transfer to an owned CPU NumPy prediction.
-        return ModelResult(value, error, start, time.monotonic_ns())
+        return ModelResult(value, error, start, time.monotonic_ns(), query_context)
 
-    def submit(self, operation, *args, **kwargs):
+    def submit(self, operation, *args, query_context=None, **kwargs):
         if self.close_future is not None or self.future is not None:
             raise RuntimeError("Model worker already owns an unreclaimed Future or is closing")
-        self.operation = operation
-        self.future = self._executor.submit(self._call, operation, args, kwargs)
+        future = self._executor.submit(self.call, operation, args, kwargs, query_context)
+        self.operation, self.future = operation, future
 
     def poll(self):
         if self.future is None or not self.future.done():
@@ -57,19 +57,21 @@ class InferenceWorker:
         """Request serial close without waiting on running CUDA; process exit is not bounded."""
         if self.close_future is not None:
             return self.close_future
-        retired_context = self.query_context
 
         def recovered(future):
             result = future.result()
             logger.info(
                 "retired model result after shutdown: context=%s started_ns=%s completed_ns=%s error=%s",
-                retired_context, result.started_ns, result.completed_ns, result.error,
+                result.query_context,
+                result.started_ns,
+                result.completed_ns,
+                result.error,
             )
             if result.error is not None:
                 logger.error("retired model task failed during shutdown: %s", result.error)
 
         # Queue cleanup behind load/predict while the executor still accepts work.
-        self.close_future = self._executor.submit(self._call, "close", (), {})
+        self.close_future = self._executor.submit(self.call, "close", (), {})
         if self.future is not None:
             self.future.add_done_callback(recovered)
         self._executor.shutdown(wait=False, cancel_futures=False)
@@ -87,6 +89,9 @@ class InferenceWorker:
             return dict(status="failed", reason=f"{type(exc).__name__}: {exc}")
         return dict(
             status="completed" if result.error is None else "failed",
-            reason=None if result.error is None else f"{type(result.error).__name__}: {result.error}",
-            started_ns=result.started_ns, completed_ns=result.completed_ns,
+            reason=(
+                None if result.error is None else f"{type(result.error).__name__}: {result.error}"
+            ),
+            started_ns=result.started_ns,
+            completed_ns=result.completed_ns,
         )

@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 
-def _points(points):
+def validate_points(points):
     points = np.asarray(points)
     if np.iscomplexobj(points):
         raise ValueError("Point coordinates must be real")
@@ -15,20 +15,20 @@ def _points(points):
     return points
 
 
-def _float32_points(points):
+def float32_points(points):
     with np.errstate(over="ignore", invalid="ignore"):
-        points = _points(points).astype(np.float32)
+        points = validate_points(points).astype(np.float32)
     if not np.isfinite(points).all():
         raise ValueError("Point coordinates exceed the finite float32 range")
     return points
 
 
 def validate_normals(value, points):
-    normals = _float32_points(value)
+    normals = float32_points(value)
     if normals.shape != points.shape or not np.allclose(
-        np.linalg.norm(normals, axis=1), 1., rtol=0, atol=1e-4
+        np.linalg.norm(normals, axis=1), 1.0, rtol=0, atol=1e-4
     ):
-        raise ValueError('Normals must be unit vectors corresponding to every model point')
+        raise ValueError("Normals must be unit vectors corresponding to every model point")
     return normals
 
 
@@ -60,14 +60,14 @@ def validate_pose(pose):
 
 def transform_points(points, pose):
     """Apply T_destination_source to row-vector XYZ points in the source frame."""
-    points = _points(points)
+    points = validate_points(points)
     pose = validate_pose(pose)
-    return _float32_points(points @ pose[:3, :3].T + pose[:3, 3])
+    return float32_points(points @ pose[:3, :3].T + pose[:3, 3])
 
 
 def save_points(path, points):
     """Save a fixed sampling asset without overwriting an existing file."""
-    points = _float32_points(points)
+    points = float32_points(points)
     if not len(points):
         raise ValueError("A sampling asset must contain at least one point")
     with Path(path).open("xb") as stream:
@@ -75,7 +75,7 @@ def save_points(path, points):
 
 
 def load_points(path):
-    points = _float32_points(np.load(path, allow_pickle=False))
+    points = float32_points(np.load(path, allow_pickle=False))
     if not len(points):
         raise ValueError("A sampling asset must contain at least one point")
     return points
@@ -91,14 +91,14 @@ def load_metric_mesh(path, *, scale_to_meters=1.0):
     mesh = trimesh.load(str(Path(path)), process=False)
     if not isinstance(mesh, trimesh.Trimesh):
         raise ValueError("Expected one triangle mesh; export a merged mesh first")
-    vertices = _points(mesh.vertices)
+    vertices = validate_points(mesh.vertices)
     if not len(vertices) or not len(mesh.faces):
         raise ValueError("Mesh must contain vertices and triangular faces")
     if np.asarray(mesh.faces).ndim != 2 or np.asarray(mesh.faces).shape[1] != 3:
         raise ValueError("Mesh faces must be triangles")
     mesh = mesh.copy()
     mesh.apply_scale(scale_to_meters)
-    _points(mesh.vertices)
+    validate_points(mesh.vertices)
     return mesh
 
 
@@ -109,7 +109,7 @@ def mesh_scale_from_extent(mesh, axis, extent_m):
     extent_m = float(extent_m)
     if not np.isfinite(extent_m) or extent_m <= 0:
         raise ValueError("extent_m must be finite and positive")
-    vertices = _points(mesh.vertices)
+    vertices = validate_points(mesh.vertices)
     if not len(vertices):
         raise ValueError("Mesh contains no vertices")
     original_extent = np.ptp(vertices[:, axis])
@@ -122,7 +122,7 @@ def sample_mesh_surface(mesh, num_points=1024, seed=0):
     """Return fixed surface points and mesh-face normals, not KNN contact normals."""
     if not isinstance(num_points, (int, np.integer)) or num_points <= 0:
         raise ValueError("num_points must be a positive integer")
-    vertices = _points(mesh.vertices)
+    vertices = validate_points(mesh.vertices)
     faces = np.asarray(mesh.faces)
     if faces.ndim != 2 or faces.shape[1] != 3 or not np.issubdtype(faces.dtype, np.integer):
         raise ValueError("Mesh faces must be an integer (F, 3) array")
@@ -143,7 +143,7 @@ def sample_mesh_surface(mesh, num_points=1024, seed=0):
     weights = np.column_stack((1 - root_u, root_u * (1 - uv[:, 1]), root_u * uv[:, 1]))
     points = np.sum(selected * weights[:, :, None], axis=1)
     normals = crosses[indices] / twice_area[indices, None]
-    return _float32_points(points), _float32_points(normals)
+    return float32_points(points), float32_points(normals)
 
 
 def validate_intrinsics(intrinsics):
@@ -161,13 +161,19 @@ def validate_intrinsics(intrinsics):
     return intrinsics
 
 
-def _depth_and_mask(depth_m, mask):
+def depth_and_mask(depth_m, mask):
     depth_m = np.asarray(depth_m)
     if np.iscomplexobj(depth_m):
         raise ValueError("Depth must be real")
-    if (depth_m.ndim != 2 or not all(depth_m.shape)
-            or not np.isfinite(depth_m).all() or np.any(depth_m < 0)):
-        raise ValueError("Depth must be finite nonnegative (H, W), in meters; zero denotes missing depth")
+    if (
+        depth_m.ndim != 2
+        or not all(depth_m.shape)
+        or not np.isfinite(depth_m).all()
+        or np.any(depth_m < 0)
+    ):
+        raise ValueError(
+            "Depth must be finite nonnegative (H, W), in meters; zero denotes missing depth"
+        )
     with np.errstate(over="ignore", invalid="ignore"):
         depth_m = np.asarray(depth_m, dtype=np.float32)
     if not np.isfinite(depth_m).all():
@@ -181,19 +187,43 @@ def _depth_and_mask(depth_m, mask):
 
 
 def validate_rgbd(rgb, depth_m, intrinsics, mask=None):
-    depth_m, mask = _depth_and_mask(depth_m, mask)
+    depth_m, mask = depth_and_mask(depth_m, mask)
     rgb = np.asarray(rgb)
     if rgb.dtype != np.uint8 or rgb.shape != (*depth_m.shape, 3):
         raise ValueError("RGB must be uint8 (H, W, 3), aligned with depth")
     return rgb, depth_m, validate_intrinsics(intrinsics), mask
 
 
-def rectify_rgbd(rgb, depth_m, intrinsics, distortion, mask=None):
-    """Rectify aligned RGB-D with forward Brown-Conrady k1,k2,p1,p2,k3.
+class RectificationMaps:
+    """One session's last image geometry; bounded to one pair of OpenCV maps."""
 
-    The source adapter must reject other distortion models. Depth and masks use
-    nearest-neighbor sampling to avoid inventing depths across object boundaries.
-    """
+    def __init__(self):
+        self.key = self.maps = None
+
+    def get(self, shape, intrinsics, distortion):
+        import cv2
+
+        key = (
+            tuple(shape),
+            np.asarray(intrinsics, dtype=np.float64).tobytes(),
+            np.asarray(distortion, dtype=np.float64).tobytes(),
+        )
+        if key != self.key:
+            height, width = shape
+            maps = cv2.initUndistortRectifyMap(
+                intrinsics,
+                distortion,
+                None,
+                intrinsics,
+                (width, height),
+                cv2.CV_32FC1,
+            )
+            self.key, self.maps = key, maps
+        return self.maps
+
+
+def rectify_rgbd(rgb, depth_m, intrinsics, distortion, mask=None, *, maps=None):
+    """Rectify forward Brown-Conrady RGB-D; nearest-neighbor depth/mask sampling preserves boundaries."""
     rgb, depth_m, intrinsics, mask = validate_rgbd(rgb, depth_m, intrinsics, mask)
     if np.iscomplexobj(distortion):
         raise ValueError("Distortion coefficients must be real")
@@ -205,20 +235,29 @@ def rectify_rgbd(rgb, depth_m, intrinsics, distortion, mask=None):
     import cv2
 
     height, width = depth_m.shape
-    map_x, map_y = cv2.initUndistortRectifyMap(
-        intrinsics, distortion, None, intrinsics, (width, height), cv2.CV_32FC1
-    )
+    if maps is None:
+        map_x, map_y = cv2.initUndistortRectifyMap(
+            intrinsics,
+            distortion,
+            None,
+            intrinsics,
+            (width, height),
+            cv2.CV_32FC1,
+        )
+    else:
+        map_x, map_y = maps.get((height, width), intrinsics, distortion)
     rgb = cv2.remap(rgb, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
     depth_m = cv2.remap(depth_m, map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
     if mask is not None:
-        mask = cv2.remap(mask.astype(np.uint8), map_x, map_y, cv2.INTER_NEAREST,
-                         borderMode=cv2.BORDER_CONSTANT).astype(bool)
+        mask = cv2.remap(
+            mask.astype(np.uint8), map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT
+        ).astype(bool)
     return rgb, depth_m, intrinsics, mask
 
 
 def deproject_depth(depth_m, intrinsics, mask=None):
     """Return camera-frame XYZ meters, in row-major order of (depth > 0) & mask."""
-    depth_m, mask = _depth_and_mask(depth_m, mask)
+    depth_m, mask = depth_and_mask(depth_m, mask)
     intrinsics = validate_intrinsics(intrinsics)
     valid = depth_m > 0
     if mask is not None:
@@ -227,4 +266,4 @@ def deproject_depth(depth_m, intrinsics, mask=None):
     z = depth_m[v, u]
     x = (u - intrinsics[0, 2]) * z / intrinsics[0, 0]
     y = (v - intrinsics[1, 2]) * z / intrinsics[1, 1]
-    return _float32_points(np.column_stack((x, y, z)))
+    return float32_points(np.column_stack((x, y, z)))

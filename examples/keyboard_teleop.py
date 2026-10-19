@@ -25,17 +25,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not connect XHand; it must be absent or secured at configured home",
     )
-    parser.add_argument("--config", type=Path, default=None, help="Optional experiment YAML overrides")
-    parser.add_argument('--control-hz', type=float, default=None, help='Keyboard target frequency')
+    parser.add_argument(
+        "--config", type=Path, default=None, help="Optional experiment YAML overrides"
+    )
+    parser.add_argument("--control-hz", type=float, default=None, help="Keyboard target frequency")
     args = parser.parse_args(argv)
 
-    from dexmani_real.teleop.keyboard_session import run_keyboard_experiment
+    from dexmani_real.teleop.keyboard_session import KeyboardTeleopSession
 
     try:
         runtime = load_experiment_config(
             yaml_path=args.config,
-            cli_overrides={"policy.hand_enabled": False if args.no_hand else None,
-                           "keyboard_teleop.control_hz": args.control_hz},
+            cli_overrides={
+                "control.hand_enabled": False if args.no_hand else None,
+                "keyboard_teleop.control_hz": args.control_hz,
+            },
         )
     except (
         OSError,
@@ -44,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
         yaml.YAMLError,
     ) as exc:
         parser.error(f"invalid experiment config: {exc}")
-    return run_keyboard_experiment(runtime, no_hand=args.no_hand)
+    return KeyboardTeleopSession(runtime, no_hand=args.no_hand).run()
 
 
 if __name__ == "__main__":

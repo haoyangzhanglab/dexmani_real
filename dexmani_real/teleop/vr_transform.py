@@ -32,7 +32,7 @@ class VRTransformCalibration:
     quality: VRTransformQuality
 
 
-def _quality_from_payload(payload: Any) -> VRTransformQuality:
+def quality_from_payload(payload: Any) -> VRTransformQuality:
     if not isinstance(payload, dict):
         raise ValueError("VR calibration quality must be a structured object")
     try:
@@ -103,7 +103,7 @@ def parse_vr_transform(payload: Any) -> VRTransformCalibration:
         ],
         dtype=np.float64,
     )
-    quality = _quality_from_payload(payload.get("quality"))
+    quality = quality_from_payload(payload.get("quality"))
     return VRTransformCalibration(
         transform=transform,
         theta_deg=theta_deg,

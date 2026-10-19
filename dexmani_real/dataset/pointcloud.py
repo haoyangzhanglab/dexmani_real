@@ -23,7 +23,7 @@ class RawEpisodeCameraModel:
     depth_scale_m: float
 
 
-def _color_intrinsics_from_meta(meta: Any) -> CameraIntrinsics:
+def color_intrinsics_from_meta(meta: Any) -> CameraIntrinsics:
     matrix = np.asarray(meta["camera_color_intrinsics"], dtype=np.float64).reshape(3, 3)
     coefficients = tuple(float(value) for value in meta["camera_color_distortion_coeffs"])
     color = CameraIntrinsics(
@@ -47,7 +47,7 @@ def load_raw_episode_camera_model(reader: EpisodeReader) -> RawEpisodeCameraMode
     meta = reader.meta
     if meta["camera_payload_mode"] != "depth_to_color_aligned_rgbd":
         raise ValueError("raw camera payload is not depth-to-color aligned RGB-D")
-    color = _color_intrinsics_from_meta(meta)
+    color = color_intrinsics_from_meta(meta)
     geometry = RGBDGeometry(
         depth=color,
         color=color,

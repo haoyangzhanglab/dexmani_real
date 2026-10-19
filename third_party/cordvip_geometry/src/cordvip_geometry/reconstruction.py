@@ -1,8 +1,4 @@
-"""Shape-only Hunyuan3D-2.1 inference from a local, segmented RGBA image.
-
-Run generation in its own example subprocess. The returned mesh has arbitrary
-scale and object axes; physical calibration is a separate, explicit step.
-"""
+"""Isolated Hunyuan3D-2.1 shape inference; metric scale and object axes need explicit calibration."""
 
 import gc
 import importlib.metadata
@@ -15,34 +11,42 @@ import zipfile
 
 import numpy as np
 
-from .io import _sha256, _existing_file
+from .io import sha256, existing_file
 
 
-def generate_mesh(image_rgba_path, source_root, weights_dir, output_mesh_path,
-                  seed=0, steps=50, octree_resolution=384, num_chunks=8000, device="cuda"):
-    """Generate one mesh, refusing missing local weights and existing output.
-
-    ``weights_dir`` contains config.yaml and model.fp16.ckpt (the official 2.1
-    release), or the hunyuan3d-dit-v2-1 subdirectory containing those files.
-    Return JSON-serializable provenance, including input/model/output hashes.
-    No implicit rembg, geometry cleanup, recentering or metric scaling is added.
-    """
-    for name, value, minimum in (("seed", seed, 0), ("steps", steps, 1),
-                                  ("octree_resolution", octree_resolution, 16),
-                                  ("num_chunks", num_chunks, 1)):
+def generate_mesh(
+    image_rgba_path,
+    source_root,
+    weights_dir,
+    output_mesh_path,
+    seed=0,
+    steps=50,
+    octree_resolution=384,
+    num_chunks=8000,
+    device="cuda",
+):
+    """Generate from local 2.1 weights and retain provenance; no automatic cleanup or metric scaling."""
+    for name, value, minimum in (
+        ("seed", seed, 0),
+        ("steps", steps, 1),
+        ("octree_resolution", octree_resolution, 16),
+        ("num_chunks", num_chunks, 1),
+    ):
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
-    image_path = _existing_file(image_rgba_path)
+    image_path = existing_file(image_rgba_path)
     root = Path(source_root).expanduser().resolve()
     package_parent = root / "hy3dshape"
-    pipeline_file = _existing_file(package_parent / "hy3dshape" / "pipelines.py")
+    pipeline_file = existing_file(package_parent / "hy3dshape" / "pipelines.py")
     weights = Path(weights_dir).expanduser().resolve()
     if (weights / "hunyuan3d-dit-v2-1").is_dir():
         weights = weights / "hunyuan3d-dit-v2-1"
-    config_path = _existing_file(weights / "config.yaml")
-    checkpoint_path = _existing_file(weights / "model.fp16.ckpt")
+    config_path = existing_file(weights / "config.yaml")
+    checkpoint_path = existing_file(weights / "model.fp16.ckpt")
     if not zipfile.is_zipfile(checkpoint_path):
-        raise ValueError(f"Hunyuan checkpoint is incomplete or not a PyTorch ZIP archive: {checkpoint_path}")
+        raise ValueError(
+            f"Hunyuan checkpoint is incomplete or not a PyTorch ZIP archive: {checkpoint_path}"
+        )
     output = Path(output_mesh_path).expanduser().resolve()
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite generated mesh: {output}")
@@ -62,8 +66,7 @@ def generate_mesh(image_rgba_path, source_root, weights_dir, output_mesh_path,
         raise ValueError("RGBA input must contain a nonempty foreground and transparent background")
     with config_path.open(encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
-    # The official checkpoint includes the DinoV2 conditioner. Refuse a config
-    # that would ask its constructor to fetch another model behind the caller.
+    # Local DinoV2 weights must prevent the conditioner from downloading models implicitly.
     conditioner = config["conditioner"]["params"]["main_image_encoder"]["kwargs"]
     if conditioner.get("config") is None:
         raise ValueError("Hunyuan conditioner must use embedded model config, without downloads")
@@ -95,25 +98,34 @@ def generate_mesh(image_rgba_path, source_root, weights_dir, output_mesh_path,
         torch.cuda.init()
         torch.cuda.reset_peak_memory_stats(target)
         pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
-            str(checkpoint_path), str(config_path), device=str(target),
-            dtype=torch.float16, use_safetensors=False,
+            str(checkpoint_path),
+            str(config_path),
+            device=str(target),
+            dtype=torch.float16,
+            use_safetensors=False,
         )
-        # inference_mode disables gradients, but does not select the DiT's MoE
-        # inference branch or turn off training-time module behavior.
+        # inference_mode disables gradients; eval also selects the DiT MoE inference branch.
         for component in (pipeline.model, pipeline.vae, pipeline.conditioner):
             component.eval().requires_grad_(False)
         component = None
         with torch.inference_mode():
             meshes = pipeline(
-                image=image, generator=torch.Generator(device=target).manual_seed(seed),
-                num_inference_steps=steps, octree_resolution=octree_resolution,
-                num_chunks=num_chunks, output_type="trimesh",
+                image=image,
+                generator=torch.Generator(device=target).manual_seed(seed),
+                num_inference_steps=steps,
+                octree_resolution=octree_resolution,
+                num_chunks=num_chunks,
+                output_type="trimesh",
             )
         if not isinstance(meshes, list) or len(meshes) != 1 or meshes[0] is None:
             raise RuntimeError("Hunyuan did not return exactly one valid mesh")
         mesh = meshes[0]
-        if (len(mesh.vertices) < 4 or len(mesh.faces) < 4 or
-                not np.isfinite(mesh.vertices).all() or np.any(mesh.extents <= 0)):
+        if (
+            len(mesh.vertices) < 4
+            or len(mesh.faces) < 4
+            or not np.isfinite(mesh.vertices).all()
+            or np.any(mesh.extents <= 0)
+        ):
             raise RuntimeError("Hunyuan returned empty, nonfinite or degenerate geometry")
         payload = mesh.export(file_type=output.suffix[1:].lower())
         if isinstance(payload, str):
@@ -135,28 +147,34 @@ def generate_mesh(image_rgba_path, source_root, weights_dir, output_mesh_path,
                 os.environ[key] = value
         gc.collect()
         torch_module = sys.modules.get("torch")
-        if (torch_module is not None and "target" in locals() and target.type == "cuda"
-                and torch_module.cuda.is_available()
-                and (target.index is None or target.index < torch_module.cuda.device_count())):
+        if (
+            torch_module is not None
+            and "target" in locals()
+            and target.type == "cuda"
+            and torch_module.cuda.is_available()
+            and (target.index is None or target.index < torch_module.cuda.device_count())
+        ):
             with torch_module.cuda.device(target):
                 torch_module.cuda.empty_cache()
 
     revision = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     return {
         "method": "Hunyuan3D-2.1 shape-only",
         "source_root": str(root),
         "source_revision": revision.stdout.strip() if revision.returncode == 0 else None,
-        "pipeline_sha256": _sha256(pipeline_file),
+        "pipeline_sha256": sha256(pipeline_file),
         "image_rgba_path": str(image_path),
-        "image_rgba_sha256": _sha256(image_path),
+        "image_rgba_sha256": sha256(image_path),
         "weights_directory": str(weights),
-        "checkpoint_sha256": _sha256(checkpoint_path),
-        "config_sha256": _sha256(config_path),
+        "checkpoint_sha256": sha256(checkpoint_path),
+        "config_sha256": sha256(config_path),
         "mesh_path": str(output),
-        "mesh_sha256": _sha256(output),
+        "mesh_sha256": sha256(output),
         "units": "unscaled",
         "object_frame": "generator_output_without_recentering",
         "seed": seed,
@@ -173,7 +191,13 @@ def generate_mesh(image_rgba_path, source_root, weights_dir, output_mesh_path,
         "peak_allocated_bytes": peak_allocated_bytes,
         "peak_reserved_bytes": peak_reserved_bytes,
         "memory_scope": "PyTorch CUDA allocator; excludes external CUDA allocations",
-        "versions": {name: importlib.metadata.version(name) for name in (
-            "torch", "transformers", "diffusers", "trimesh",
-        )},
+        "versions": {
+            name: importlib.metadata.version(name)
+            for name in (
+                "torch",
+                "transformers",
+                "diffusers",
+                "trimesh",
+            )
+        },
     }

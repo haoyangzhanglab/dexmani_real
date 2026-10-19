@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.hardware import HandParams
+from dexmani_real.robot.xhand.config import HandParams
 from dexmani_real.planning.kinematics.arm_fk import (
     ArmFK,
     compute_eef_pose_history_xarm_base,
@@ -49,7 +49,9 @@ def build_observation_camera(sensors, camera_config, fields, calibration):
         raise ValueError("Policy camera parameters require a ready camera")
     serial = sensors.camera_serial.value.decode("utf-8").strip()
     if not serial or (camera_config.serial is not None and serial != camera_config.serial):
-        raise ValueError("Policy camera parameters require the active camera serial to match configuration")
+        raise ValueError(
+            "Policy camera parameters require the active camera serial to match configuration"
+        )
     geometry = RGBDGeometry.from_dict(json.loads(sensors.camera_geometry.value.decode("utf-8")))
     color = geometry.color
     if (color.height, color.width) != (camera_config.height, camera_config.width):
@@ -83,8 +85,13 @@ def policy_observation_issue(row, fields):
             if row.camera is None:
                 return f"required_{name}_unavailable"
             image = row.camera["rgb"]
-            if (not isinstance(image, np.ndarray) or image.dtype != np.uint8
-                    or image.ndim != 3 or image.shape[2] != 3 or min(image.shape[:2]) <= 0):
+            if (
+                not isinstance(image, np.ndarray)
+                or image.dtype != np.uint8
+                or image.ndim != 3
+                or image.shape[2] != 3
+                or min(image.shape[:2]) <= 0
+            ):
                 return f"required_{name}_invalid"
     return None
 
@@ -100,7 +107,10 @@ def build_policy_observation(rows, policy_info, *, kinematics=None, camera_param
         hand = np.stack([r.hand["qpos"][0] for r in rows])
     if "joint_state" in requested:
         arrays["joint_state"] = np.concatenate((arm, hand), axis=1).astype(np.float32)
-    for name, field in (("finger_tactile_force", "tactile_aggregate"), ("taxel_tactile_force", "tactile_dense")):
+    for name, field in (
+        ("finger_tactile_force", "tactile_aggregate"),
+        ("taxel_tactile_force", "tactile_dense"),
+    ):
         if name in requested:
             arrays[name] = np.stack([r.hand[field][0] for r in rows])
     if "point_cloud" in requested:
@@ -119,13 +129,11 @@ def build_policy_observation(rows, policy_info, *, kinematics=None, camera_param
             arrays["eef_pose"] = poses.astype(np.float32)
         if "fingertip_xyz" in requested:
             arrays["fingertip_xyz"] = compute_fingertip_history_xarm_base(
-                arm,
+                poses,
                 hand,
                 hand_fk=hand_fk,
                 handbase_position_eef_m=np.asarray(cfg.T_eef_handbase_pos_xyz),
                 handbase_quat_eef_wxyz=np.asarray(cfg.T_eef_handbase_quat_wxyz),
-                arm_fk=arm_fk,
-                eef_pose_history=poses,
             )
     result = {}
     for name in policy_info.observation_fields:

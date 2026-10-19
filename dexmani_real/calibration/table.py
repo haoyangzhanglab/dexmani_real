@@ -72,7 +72,7 @@ class TablePlaneFit:
         }
 
 
-def _normalized_upward_plane(normal: np.ndarray, offset: float) -> tuple[np.ndarray, float]:
+def normalized_upward_plane(normal: np.ndarray, offset: float) -> tuple[np.ndarray, float]:
     norm = float(np.linalg.norm(normal))
     if not np.isfinite(norm) or norm <= 1e-12:
         raise ValueError("table plane normal is degenerate")
@@ -84,13 +84,13 @@ def _normalized_upward_plane(normal: np.ndarray, offset: float) -> tuple[np.ndar
     return normalized, normalized_offset
 
 
-def _least_squares_plane(points: np.ndarray) -> tuple[np.ndarray, float]:
+def least_squares_plane(points: np.ndarray) -> tuple[np.ndarray, float]:
     center = np.mean(points, axis=0, dtype=np.float64)
     centered = points - center
     covariance = centered.T @ centered / max(1, points.shape[0])
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)
     normal = eigenvectors[:, int(np.argmin(eigenvalues))]
-    return _normalized_upward_plane(normal, -float(normal @ center))
+    return normalized_upward_plane(normal, -float(normal @ center))
 
 
 def fit_table_plane(
@@ -134,7 +134,7 @@ def fit_table_plane(
         triplet = evaluated[rng.choice(evaluated.shape[0], size=3, replace=False)]
         normal = np.cross(triplet[1] - triplet[0], triplet[2] - triplet[0])
         try:
-            normal, offset = _normalized_upward_plane(normal, -float(normal @ triplet[0]))
+            normal, offset = normalized_upward_plane(normal, -float(normal @ triplet[0]))
         except ValueError:
             continue
         if normal[2] < min_normal_z:
@@ -153,13 +153,13 @@ def fit_table_plane(
     if best_count / evaluated.shape[0] < min_inlier_ratio:
         raise ValueError("dominant horizontal plane has insufficient support")
 
-    normal, offset = _least_squares_plane(evaluated[best_mask])
+    normal, offset = least_squares_plane(evaluated[best_mask])
     for _ in range(2):
         residual = np.abs(evaluated @ normal + offset)
         inlier = residual <= distance_threshold_m
         if int(np.count_nonzero(inlier)) < min_inlier_points:
             raise ValueError("refined table plane lost required support")
-        normal, offset = _least_squares_plane(evaluated[inlier])
+        normal, offset = least_squares_plane(evaluated[inlier])
 
     residual = np.abs(evaluated @ normal + offset)
     inlier = residual <= distance_threshold_m

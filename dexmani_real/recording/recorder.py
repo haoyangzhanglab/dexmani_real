@@ -17,7 +17,10 @@ import h5py
 import numpy as np
 
 from dexmani_real.recording.storage.schema import (
-    DATASET_SPECS, RAW_FORMAT, ARM_EXECUTION_FORMAT, TIMING_ROW_DTYPE,
+    DATASET_SPECS,
+    RAW_FORMAT,
+    ARM_EXECUTION_FORMAT,
+    TIMING_ROW_DTYPE,
     validate_execution_boundary,
 )
 from dexmani_real.recording.storage.video import VideoEncoder
@@ -25,7 +28,7 @@ from dexmani_real.robot.commands import DispatchStatus
 from dexmani_real.runtime.observation import observation_timing
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
-from dexmani_real.utils.control_clock import sampling_clock_ns
+from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
 RECORDER_START_TIMEOUT_S = 10.0
@@ -38,7 +41,7 @@ class RecordingError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class _Finish:
+class CaptureFinishRequest:
     save: bool
     reason: str
     details: object
@@ -47,16 +50,18 @@ class _Finish:
 
 
 @dataclass(frozen=True)
-class _QueryTiming:
+class QueryTimingRecord:
     values: dict
 
 
-def snapshot_recording_metadata(shared, *, camera_calibration, hand):
+def snapshot_recording_metadata(runtime_state, *, camera_calibration, hand):
     """Build physical HDF5 attributes from the active camera and consumed tactile semantics."""
-    serial = shared.sensors.camera_serial.value.decode("utf-8")
+    serial = runtime_state.sensors.camera_serial.value.decode("utf-8")
     if not serial.strip():
         raise ValueError("recording START requires a nonempty camera serial")
-    geometry = RGBDGeometry.from_dict(json.loads(shared.sensors.camera_geometry.value.decode("utf-8")))
+    geometry = RGBDGeometry.from_dict(
+        json.loads(runtime_state.sensors.camera_geometry.value.decode("utf-8"))
+    )
     transform = None
     if camera_calibration is None:
         logger.warning("Recording without camera extrinsics: session has no calibration")
@@ -66,7 +71,7 @@ def snapshot_recording_metadata(shared, *, camera_calibration, hand):
         except KeyError as exc:
             logger.warning("Recording without camera extrinsics: %s", exc)
     color = geometry.color
-    depth_scale = float(shared.sensors.camera_depth_scale.value)
+    depth_scale = float(runtime_state.sensors.camera_depth_scale.value)
     if not np.isfinite(depth_scale) or depth_scale <= 0:
         raise ValueError("depth_scale must be finite and positive")
     metadata = {
@@ -89,7 +94,7 @@ def snapshot_recording_metadata(shared, *, camera_calibration, hand):
     return metadata
 
 
-def _raw_row(row, command, result, timestamp):
+def raw_row(row, command, result, timestamp):
     arm, hand, camera = (
         row.arm[0],
         None if row.hand is None else row.hand[0],
@@ -106,9 +111,9 @@ def _raw_row(row, command, result, timestamp):
         "hand_qpos": hand["qpos"] if hand is not None else np.full(12, np.nan),
         "hand_current": hand["current"] if hand is not None else np.full(12, np.nan),
         "hand_contact": hand["tactile_aggregate"] if hand is not None else np.full((5, 3), np.nan),
-        "hand_tactile_force": hand["tactile_dense"]
-        if hand is not None
-        else np.full((5, 120, 3), np.nan),
+        "hand_tactile_force": (
+            hand["tactile_dense"] if hand is not None else np.full((5, 120, 3), np.nan)
+        ),
         "action_arm_joint_target": (
             command.arm_qpos
             if command is not None
@@ -139,9 +144,7 @@ def _raw_row(row, command, result, timestamp):
 
 
 class AsyncEpisodeRecorder:
-    """One writer owns FIFO snapshots, encoding and file I/O.
-    Revoke motion before blocking START/finalization; required recording stops on check_error() failure.
-    """
+    """One FIFO writer owns snapshots and I/O; revoke motion before blocking finalization."""
 
     def __init__(self, data_dir, *, control_hz):
         if not np.isfinite(control_hz) or control_hz <= 0:
@@ -169,7 +172,7 @@ class AsyncEpisodeRecorder:
     def written_frames(self):
         return self._written_frames
 
-    def _store_error(self, error):
+    def store_error(self, error):
         if self._error is None:
             self._error = error
 
@@ -178,8 +181,14 @@ class AsyncEpisodeRecorder:
             raise RecordingError(f"Recording failed: {self._error}") from self._error
 
     def start_episode(
-        self, *, task_label, collection_source, metadata,
-        arm_execution, arm_control_metadata, episode_name=None,
+        self,
+        *,
+        task_label,
+        collection_source,
+        metadata,
+        arm_execution,
+        arm_control_metadata,
+        episode_name=None,
     ):
         self.check_error()
         if self._recording or (self._thread is not None and self._thread.is_alive()):
@@ -187,19 +196,26 @@ class AsyncEpisodeRecorder:
         self._temp_dir = self._episode_dir = self._published_path = None
         self._submitted_frames = self._written_frames = 0
         try:
-            arm_execution, arm_control_metadata = deepcopy(arm_execution), deepcopy(arm_control_metadata)
+            arm_execution, arm_control_metadata = deepcopy(arm_execution), deepcopy(
+                arm_control_metadata
+            )
             validate_execution_boundary(arm_execution)
             if not isinstance(task_label, str) or not task_label.strip():
                 raise ValueError("task_label must be a non-empty string")
             if collection_source not in _COLLECTION_SOURCES:
                 raise ValueError(f"collection_source must be one of {sorted(_COLLECTION_SOURCES)}")
-            metadata = dict(deepcopy(metadata), task_label=task_label, collection_source=collection_source)
+            metadata = dict(
+                deepcopy(metadata), task_label=task_label, collection_source=collection_source
+            )
             if collection_source == "teleop":
                 period, tolerance = sampling_clock_ns(self.control_hz)
                 metadata.update(sampling_period_ns=period, sampling_tolerance_ns=tolerance)
             if episode_name is not None and (
-                type(episode_name) is not str or not episode_name
-                or episode_name.startswith(".") or "/" in episode_name or "\\" in episode_name
+                type(episode_name) is not str
+                or not episode_name
+                or episode_name.startswith(".")
+                or "/" in episode_name
+                or "\\" in episode_name
             ):
                 raise ValueError("episode_name must be a plain non-empty directory name")
             self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -207,7 +223,10 @@ class AsyncEpisodeRecorder:
             suffix = 0
             while True:
                 candidate = name if suffix == 0 else f"{name}_{suffix}"
-                destination, staging = self.data_dir / candidate, self.data_dir / f".tmp_{candidate}"
+                destination, staging = (
+                    self.data_dir / candidate,
+                    self.data_dir / f".tmp_{candidate}",
+                )
                 if not target_is_occupied(destination) and not target_is_occupied(staging):
                     break
                 if episode_name is not None:
@@ -219,8 +238,10 @@ class AsyncEpisodeRecorder:
             self._ready.clear()
             self._cancelled.clear()
             self._thread = threading.Thread(
-                target=self._write_episode, args=(metadata, arm_execution, arm_control_metadata),
-                name="episode-writer", daemon=False
+                target=self.write_episode,
+                args=(metadata, arm_execution, arm_control_metadata),
+                name="episode-writer",
+                daemon=False,
             )
             self._thread.start()
             if not self._ready.wait(RECORDER_START_TIMEOUT_S):
@@ -228,7 +249,7 @@ class AsyncEpisodeRecorder:
             self.check_error()
             self._recording = True
         except BaseException as exc:
-            self._store_error(exc)
+            self.store_error(exc)
             self._cancelled.set()
             if self._thread is not None and self._thread.ident is not None:
                 self._thread.join(timeout=RECORDER_STOP_TIMEOUT_S)
@@ -236,7 +257,7 @@ class AsyncEpisodeRecorder:
                 raise
             raise RecordingError(f"recording START failed: {exc}") from exc
 
-    def _enqueue(self, item):
+    def enqueue(self, item):
         self.check_error()
         if not self._recording:
             return False
@@ -244,31 +265,32 @@ class AsyncEpisodeRecorder:
             self._queue.put_nowait(item)
         except Full as exc:
             error = RecordingError("recording queue full (capacity=16)")
-            self._store_error(error)
+            self.store_error(error)
             raise error from exc
         return True
 
     def add_frame(self, row, command=None, result=None, *, timing=None):
         """Submit already-owned immutable snapshots without conversion or I/O."""
-        if self._enqueue((row, command, result, dict(timing or {}))):
+        if self.enqueue((row, command, result, dict(timing or {}))):
             self._submitted_frames += 1
 
     def record_query(self, values):
         """Queue a top-level snapshot; callers must leave nested observations unchanged."""
-        self._enqueue(_QueryTiming(dict(values)))
+        self.enqueue(QueryTimingRecord(dict(values)))
 
     def save_episode(self, reason="manual", *, arm_execution, details=None, timing=None):
-        return self._finish(save=True, reason=reason, details=details, timing=timing,
-                            arm_execution=arm_execution)
+        return self.finish(
+            save=True, reason=reason, details=details, timing=timing, arm_execution=arm_execution
+        )
 
     def discard_episode(self, reason="discard"):
-        self._finish(save=False, reason=reason)
+        self.finish(save=False, reason=reason)
 
     def close(self):
         """Join the writer; an active capture without an end snapshot retains staging."""
-        self._finish(save=True, reason="close")
+        self.finish(save=True, reason="close")
 
-    def _finish(self, *, save, reason, details=None, timing=None, arm_execution=None):
+    def finish(self, *, save, reason, details=None, timing=None, arm_execution=None):
         was_recording, self._recording = self._recording, False
         thread = self._thread
         if thread is None:
@@ -279,16 +301,17 @@ class AsyncEpisodeRecorder:
         try:
             if was_recording and thread.is_alive() and not self._cancelled.is_set():
                 try:
-                    finish = _Finish(save, reason, deepcopy(details), deepcopy(timing),
-                                     deepcopy(arm_execution))
+                    finish = CaptureFinishRequest(
+                        save, reason, deepcopy(details), deepcopy(timing), deepcopy(arm_execution)
+                    )
                 except BaseException as exc:
-                    self._store_error(exc)
-                    finish = _Finish(False, reason, None)
+                    self.store_error(exc)
+                    finish = CaptureFinishRequest(False, reason, None)
                     if not isinstance(exc, Exception):
                         interrupted = exc
                 self._queue.put(finish, timeout=max(0.0, deadline - time.monotonic()))
         except BaseException as exc:
-            self._store_error(exc)
+            self.store_error(exc)
             self._cancelled.set()
             if not isinstance(exc, Exception):
                 interrupted = exc
@@ -296,13 +319,15 @@ class AsyncEpisodeRecorder:
             try:
                 thread.join(timeout=max(0.0, deadline - time.monotonic()))
             except BaseException as exc:
-                self._store_error(exc)
+                self.store_error(exc)
                 self._cancelled.set()
                 if not isinstance(exc, Exception):
                     interrupted = exc
                 thread.join(timeout=max(0.0, deadline - time.monotonic()))
             if thread.is_alive():
-                self._store_error(TimeoutError("recording finalization timed out; staging remains owned"))
+                self.store_error(
+                    TimeoutError("recording finalization timed out; staging remains owned")
+                )
                 self._cancelled.set()
         if interrupted is not None:
             raise interrupted
@@ -310,7 +335,7 @@ class AsyncEpisodeRecorder:
         self._thread = None
         return self._published_path
 
-    def _write_episode(self, metadata, arm_start, arm_control_metadata):
+    def write_episode(self, metadata, arm_start, arm_control_metadata):
         staging, destination = self._temp_dir, self._episode_dir
         finish, buffered = None, 0
         query_indices = {}
@@ -320,17 +345,25 @@ class AsyncEpisodeRecorder:
                 data = resources.enter_context(h5py.File(staging / "data.h5", "w"))
                 meta = data.create_group("meta")
                 meta.attrs.update(metadata)
-                meta.attrs.update(control_hz=self.control_hz,
-                                  timestamp_source="host_monotonic_relative",
-                                  dispatch_status_source="recorded")
+                meta.attrs.update(
+                    control_hz=self.control_hz,
+                    timestamp_source="host_monotonic_relative",
+                    dispatch_status_source="recorded",
+                )
                 datasets = {
-                    name: data.create_dataset(name, shape=(0, *spec.tail_shape),
-                                              maxshape=(None, *spec.tail_shape), dtype=spec.dtype)
+                    name: data.create_dataset(
+                        name,
+                        shape=(0, *spec.tail_shape),
+                        maxshape=(None, *spec.tail_shape),
+                        dtype=spec.dtype,
+                    )
                     for name, spec in DATASET_SPECS.items()
                 }
-                meta.attrs.update(arm_control_mode=1,
-                                  arm_action_semantics="q_goal_submitted",
-                                  arm_execution_format=ARM_EXECUTION_FORMAT)
+                meta.attrs.update(
+                    arm_control_mode=1,
+                    arm_action_semantics="q_goal_submitted",
+                    arm_execution_format=ARM_EXECUTION_FORMAT,
+                )
                 execution = data.create_group("arm_execution")
                 execution.attrs.update(arm_control_metadata)
                 execution.create_dataset("start", data=json.dumps(arm_start, allow_nan=False))
@@ -340,21 +373,33 @@ class AsyncEpisodeRecorder:
                 timing.attrs.update(
                     camera_timestamp_source="oldest_channel_first_host_receive_monotonic",
                 )
-                row_times = timing.create_dataset("rows", shape=(0,), maxshape=(None,), dtype=TIMING_ROW_DTYPE)
-                queries = timing.create_dataset("queries", shape=(0,), maxshape=(None,), dtype=h5py.string_dtype())
+                row_times = timing.create_dataset(
+                    "rows", shape=(0,), maxshape=(None,), dtype=TIMING_ROW_DTYPE
+                )
+                queries = timing.create_dataset(
+                    "queries", shape=(0,), maxshape=(None,), dtype=h5py.string_dtype()
+                )
                 rgb_shape = (metadata["camera_color_height"], metadata["camera_color_width"], 3)
                 datasets["depth"] = data.create_dataset(
-                    "depth", shape=(0, *rgb_shape[:2]), maxshape=(None, *rgb_shape[:2]),
-                    chunks=(1, *rgb_shape[:2]), dtype=np.uint16, compression="gzip", compression_opts=1,
+                    "depth",
+                    shape=(0, *rgb_shape[:2]),
+                    maxshape=(None, *rgb_shape[:2]),
+                    chunks=(1, *rgb_shape[:2]),
+                    dtype=np.uint16,
+                    compression="gzip",
+                    compression_opts=1,
                 )
-                # Copy into writer-owned columns once. Retaining depth views would
-                # also keep each source's full RGB-D snapshot alive until flush.
+                # Copy writer-owned columns once so depth views do not retain full RGB-D snapshots.
                 batch_size = 32
-                arrays = {name: np.empty((batch_size, *dataset.shape[1:]), dtype=dataset.dtype)
-                          for name, dataset in datasets.items()}
+                arrays = {
+                    name: np.empty((batch_size, *dataset.shape[1:]), dtype=dataset.dtype)
+                    for name, dataset in datasets.items()
+                }
                 timing_rows = np.empty(batch_size, dtype=TIMING_ROW_DTYPE)
                 height, width, _ = rgb_shape
-                video = VideoEncoder(staging / "rgb.mp4", fps=self.control_hz, width=width, height=height)
+                video = VideoEncoder(
+                    staging / "rgb.mp4", fps=self.control_hz, width=width, height=height
+                )
                 resources.callback(video.close)
                 video.open()
                 self._ready.set()
@@ -368,9 +413,9 @@ class AsyncEpisodeRecorder:
                     end = self._written_frames + count
                     for name, values in arrays.items():
                         datasets[name].resize(end, axis=0)
-                        datasets[name][self._written_frames:end] = values[:count]
+                        datasets[name][self._written_frames : end] = values[:count]
                     row_times.resize(end, axis=0)
-                    row_times[self._written_frames:end] = timing_rows[:count]
+                    row_times[self._written_frames : end] = timing_rows[:count]
                     self._written_frames = end
 
                 try:
@@ -379,10 +424,10 @@ class AsyncEpisodeRecorder:
                             item = self._queue.get(timeout=0.05)
                         except Empty:
                             continue
-                        if isinstance(item, _Finish):
+                        if isinstance(item, CaptureFinishRequest):
                             finish = item
                             break
-                        if isinstance(item, _QueryTiming):
+                        if isinstance(item, QueryTimingRecord):
                             values = item.values
                             key = (values["run_id"], values["query_id"])
                             index = query_indices.get(key)
@@ -395,11 +440,13 @@ class AsyncEpisodeRecorder:
                         row, command, result, execution_timing = item
                         stamp = int(row.observation_timestamp_ns)
                         if stamp <= 0 or (previous_stamp is not None and stamp <= previous_stamp):
-                            raise ValueError("recording observation timestamps must be positive and increasing")
+                            raise ValueError(
+                                "recording observation timestamps must be positive and increasing"
+                            )
                         if first_stamp is None:
                             first_stamp = stamp
                         # Integer subtraction retains short intervals even for a large host clock.
-                        values = _raw_row(row, command, result, (stamp - first_stamp) / 1e9)
+                        values = raw_row(row, command, result, (stamp - first_stamp) / 1e9)
                         rgb, depth = row.camera["rgb"], row.camera["depth"]
                         if rgb.shape != rgb_shape or rgb.dtype != np.uint8:
                             raise ValueError("RGB shape or dtype mismatch")
@@ -418,7 +465,9 @@ class AsyncEpisodeRecorder:
                         for name, value in values.items():
                             arrays[name][buffered] = value
                         arrays["depth"][buffered] = depth
-                        timing_rows[buffered] = tuple(evidence.get(name, -1) for name in TIMING_ROW_DTYPE.names)
+                        timing_rows[buffered] = tuple(
+                            evidence.get(name, -1) for name in TIMING_ROW_DTYPE.names
+                        )
                         video.write_frame(rgb)
                         buffered += 1
                         previous_stamp = stamp
@@ -426,50 +475,69 @@ class AsyncEpisodeRecorder:
                             flush()
                 except BaseException as exc:
                     # Publish the failure before cleanup, which may block on native I/O.
-                    self._store_error(exc)
+                    self.store_error(exc)
                 flush()
                 if finish is not None and finish.arm_execution is not None:
-                    execution.create_dataset("end", data=json.dumps(finish.arm_execution, allow_nan=False))
+                    execution.create_dataset(
+                        "end", data=json.dumps(finish.arm_execution, allow_nan=False)
+                    )
                 if finish is not None and finish.save:
                     try:
                         validate_execution_boundary(finish.arm_execution, stopped=True)
                     except (KeyError, TypeError, ValueError) as exc:
-                        self._store_error(exc)
+                        self.store_error(exc)
                 reason = finish.reason if finish is not None else "recording_failure"
                 details = list(finish.details or []) if finish is not None else []
                 if self._error is not None:
-                    details.append(dict(stage="recording", exception_type=type(self._error).__name__,
-                                        message=str(self._error)))
-                meta.attrs.update(format=RAW_FORMAT, num_frames=self._written_frames,
-                                  termination_reason=reason)
+                    details.append(
+                        dict(
+                            stage="recording",
+                            exception_type=type(self._error).__name__,
+                            message=str(self._error),
+                        )
+                    )
+                meta.attrs.update(
+                    format=RAW_FORMAT, num_frames=self._written_frames, termination_reason=reason
+                )
                 if finish is not None and finish.timing is not None:
-                    timing.create_dataset("termination", data=json.dumps(finish.timing, allow_nan=False))
+                    timing.create_dataset(
+                        "termination", data=json.dumps(finish.timing, allow_nan=False)
+                    )
                 if len(row_times) != self._written_frames:
                     raise RuntimeError("timing/core row count mismatch")
                 if details:
-                    meta.create_dataset("termination_details", data=json.dumps(details, allow_nan=False))
-                if self._error is None and (self._written_frames != self._submitted_frames
-                                           or video.frame_count != self._written_frames):
+                    meta.create_dataset(
+                        "termination_details", data=json.dumps(details, allow_nan=False)
+                    )
+                if self._error is None and (
+                    self._written_frames != self._submitted_frames
+                    or video.frame_count != self._written_frames
+                ):
                     raise RuntimeError("recording accepted/written/camera row count mismatch")
             if self._error is None and not self._cancelled.is_set() and finish is not None:
                 if finish.save:
-                    # A zero-row capture can still contain attempted SDK calls or
-                    # an initialization failure. Only explicit discard deletes it.
+                    # Zero-row captures retain attempted dispatch/failure evidence; only explicit discard deletes them.
                     atomic_publish(staging, destination, cancelled=self._cancelled.is_set)
                     self._published_path = destination
                     logger.info("Raw 已保存：%s（%d 帧）。", destination.name, self._written_frames)
-                    logger.debug("Episode saved: %s frames=%d reason=%s", destination,
-                                 self._written_frames, finish.reason)
+                    logger.debug(
+                        "Episode saved: %s frames=%d reason=%s",
+                        destination,
+                        self._written_frames,
+                        finish.reason,
+                    )
                 else:
                     shutil.rmtree(staging)
                 self._temp_dir = None
         except BaseException as exc:
-            self._store_error(exc)
+            self.store_error(exc)
             logger.exception("Recording failed; staging retained: %s", staging)
         finally:
             self._ready.set()
             if self._error is not None:
-                logger.error("Recording staging retained: %s frames=%d", staging, self._written_frames)
+                logger.error(
+                    "Recording staging retained: %s frames=%d", staging, self._written_frames
+                )
             while True:
                 try:
                     self._queue.get_nowait()

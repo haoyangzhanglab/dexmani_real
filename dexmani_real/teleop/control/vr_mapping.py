@@ -3,21 +3,25 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-from transforms3d.quaternions import mat2quat, quat2mat
+from scipy.spatial.transform import Rotation
 
-from dexmani_real.planning.kinematics.pose import Pose, quat_multiply
+from dexmani_real.planning.kinematics.pose import Pose, quat_multiply, quat_wxyz_to_rotmat
 from dexmani_real.utils.geometry import normalize_quat_wxyz, validate_rotation_matrix
-
 
 logger = logging.getLogger(__name__)
 
 
-def _finite_vector(value: np.ndarray, shape: tuple[int, ...], name: str) -> np.ndarray:
+def finite_vector(value: np.ndarray, shape: tuple[int, ...], name: str) -> np.ndarray:
     """Return a finite float64 copy with the exact expected shape."""
     array = np.asarray(value, dtype=np.float64)
     if array.shape != shape or not np.all(np.isfinite(array)):
         raise ValueError(f"{name} must be a finite array with shape {shape}")
     return array.copy()
+
+
+def matrix_quat_wxyz(matrix):
+    quaternion = Rotation.from_matrix(matrix).as_quat()[[3, 0, 1, 2]]
+    return quaternion if quaternion[0] >= 0 else -quaternion
 
 
 class VRWristMapper:
@@ -47,10 +51,14 @@ class VRWristMapper:
     ) -> None:
         # Validate before committing the new anchor; failed resets clear stale state.
         try:
-            next_wrist_pos0 = _finite_vector(wrist_pos, (3,), "wrist_pos")
-            next_wrist_rot0 = quat2mat(normalize_quat_wxyz(wrist_quat_wxyz, name="wrist_quat_wxyz"))
-            next_eef_pos0 = _finite_vector(eef_pos, (3,), "eef_pos")
-            next_eef_rot0 = quat2mat(normalize_quat_wxyz(eef_quat_wxyz, name="eef_quat_wxyz"))
+            next_wrist_pos0 = finite_vector(wrist_pos, (3,), "wrist_pos")
+            next_wrist_rot0 = quat_wxyz_to_rotmat(
+                normalize_quat_wxyz(wrist_quat_wxyz, name="wrist_quat_wxyz")
+            )
+            next_eef_pos0 = finite_vector(eef_pos, (3,), "eef_pos")
+            next_eef_rot0 = quat_wxyz_to_rotmat(
+                normalize_quat_wxyz(eef_quat_wxyz, name="eef_quat_wxyz")
+            )
         except (TypeError, ValueError):
             self.clear()
             logger.warning(
@@ -62,7 +70,7 @@ class VRWristMapper:
         self.wrist_rot0 = next_wrist_rot0
         self.eef_pos0 = next_eef_pos0
         self.eef_rot0 = next_eef_rot0
-        self.last_quat_wxyz = mat2quat(self.eef_rot0)
+        self.last_quat_wxyz = matrix_quat_wxyz(self.eef_rot0)
 
     def map(
         self,
@@ -73,8 +81,10 @@ class VRWristMapper:
             return None
 
         try:
-            current_wrist_pos = _finite_vector(wrist_pos, (3,), "wrist_pos")
-            wrist_rot = quat2mat(normalize_quat_wxyz(wrist_quat_wxyz, name="wrist_quat_wxyz"))
+            current_wrist_pos = finite_vector(wrist_pos, (3,), "wrist_pos")
+            wrist_rot = quat_wxyz_to_rotmat(
+                normalize_quat_wxyz(wrist_quat_wxyz, name="wrist_quat_wxyz")
+            )
         except (TypeError, ValueError):
             logger.warning("VRWristMapper.map: invalid wrist pose — no target", exc_info=True)
             return None
@@ -87,7 +97,7 @@ class VRWristMapper:
         delta_rot_base = self.vr_to_robot_rot @ delta_rot_vr @ self.vr_to_robot_rot.T
         target_pos = self.eef_pos0 + delta_pos_base
         target_rot = delta_rot_base @ self.eef_rot0
-        target_quat_wxyz = normalize_quat_wxyz(mat2quat(target_rot))
+        target_quat_wxyz = normalize_quat_wxyz(matrix_quat_wxyz(target_rot))
         if np.dot(target_quat_wxyz, self.last_quat_wxyz) < 0:
             target_quat_wxyz = -target_quat_wxyz
         if not np.all(np.isfinite(target_pos)):
@@ -109,7 +119,7 @@ class VRWristMapper:
         return self.wrist_pos0 is not None
 
 
-def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
+def quat_to_rotvec(q: np.ndarray) -> np.ndarray:
     """Convert a normalized WXYZ quaternion to a shortest-arc rotation vector."""
     sign = q if q[0] >= 0 else -q
     w, x, y, z = np.clip(sign[0], -1.0, 1.0), sign[1], sign[2], sign[3]
@@ -129,7 +139,7 @@ def ema_smooth_pose(target: Pose, previous: Pose, alpha_pos: float, alpha_rot: f
         target_quat = -target_quat
     prev_conjugate = prev_quat * np.array([1.0, -1.0, -1.0, -1.0])
     relative_quat = normalize_quat_wxyz(quat_multiply(prev_conjugate, target_quat), name="relative")
-    rv = alpha_rot * _quat_to_rotvec(relative_quat)
+    rv = alpha_rot * quat_to_rotvec(relative_quat)
     angle = float(np.linalg.norm(rv))
     if angle < 1e-12:
         quat = prev_quat.copy()

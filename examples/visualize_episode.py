@@ -21,7 +21,7 @@ os.environ.setdefault("RUST_LOG", "error")
 import numpy as np
 
 from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
-from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.dataset.pointcloud import (
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
@@ -32,9 +32,8 @@ from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE, XHAND_RIGHT_URDF_PATH
 from dexmani_real.sensor.camera.geometry import validate_aligned_depth_distortion
-from dexmani_real.sensor.pointcloud import build_point_cloud
+from dexmani_real.sensor.pointcloud.processing import build_point_cloud
 from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
-
 
 logger = logging.getLogger("dexmani_real.cli.visualize_episode")
 
@@ -66,14 +65,14 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
 _EEF_COLOR = (255, 255, 255)
 
 
-def _eef_position_or_none(eef_row: np.ndarray) -> np.ndarray | None:
+def eef_position_or_none(eef_row: np.ndarray) -> np.ndarray | None:
     row = np.asarray(eef_row, dtype=np.float64)
     if row.shape != (9,) or not np.all(np.isfinite(row)):
         return None
     return row[:3]
 
 
-def _fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None:
+def fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None:
     row = np.asarray(fingertip_row, dtype=np.float32)
     if row.ndim != 2 or row.shape != HAND_FINGERTIP_SHAPE or not np.all(np.isfinite(row)):
         return None
@@ -147,9 +146,9 @@ class EpisodeVisualizer:
                 "timestamp",
             )
 
-            self._T = self._resolve_frame_count(max_frames)
+            self._T = self.resolve_frame_count(max_frames)
             self._rgb_frames = iter(self._reader.iter_rgb_frames())
-            self._rgb = None
+            self.rgb = None
             self._rgb_index = -1
             meta = self._reader.meta
             self._camera_model = load_raw_episode_camera_model(self._reader)
@@ -174,7 +173,9 @@ class EpisodeVisualizer:
             if point_cloud and self._T_xarm_base_from_color is not None:
                 if pointcloud_config is None:
                     raise ValueError("point-cloud visualization requires resolved config")
-                validate_aligned_depth_distortion(self._camera_model.geometry.color.distortion_model)
+                validate_aligned_depth_distortion(
+                    self._camera_model.geometry.color.distortion_model
+                )
                 self._pointcloud_config = pointcloud_config
                 logger.info(
                     "Canonical point cloud enabled: N=%d table=%s",
@@ -184,9 +185,9 @@ class EpisodeVisualizer:
 
             logger.info("Frames=%d", self._T)
 
-            self._state = self._preload_state()
+            self.state = self.preload_state()
 
-            self._blueprint = self._build_blueprint()
+            self._blueprint = self.build_blueprint()
             app_id = f"DexMani - {episode_name}"
             rec_id = f"{episode_name}-{time.time_ns()}"
             rr.init(
@@ -198,12 +199,12 @@ class EpisodeVisualizer:
             rr.send_blueprint(
                 blueprint=self._blueprint
             )  # force-override any cached blueprint for this app_id
-            self._log_static()
+            self.log_static()
         except BaseException:
             self.close()
             raise
 
-    def _resolve_frame_count(self, max_frames: int | None) -> int:
+    def resolve_frame_count(self, max_frames: int | None) -> int:
         raw = self._reader.num_frames
         if raw <= 0:
             raise ValueError("episode /meta num_frames must be positive")
@@ -211,7 +212,7 @@ class EpisodeVisualizer:
             return min(raw, max_frames)
         return raw
 
-    def _preload_state(self) -> dict[str, np.ndarray]:
+    def preload_state(self) -> dict[str, np.ndarray]:
         state = {
             key: self._reader[key][: self._T] for keys in _SERIES_GROUPS.values() for key in keys
         }
@@ -225,16 +226,13 @@ class EpisodeVisualizer:
         if np.any(arm_valid):
             state["arm_ee"][arm_valid] = compute_eef_pose_history_xarm_base(arm[arm_valid])
         if np.any(hand_valid):
-            hand_fk = HandKinematics(
-                str(XHAND_RIGHT_URDF_PATH), list(self._fingertip_link_names)
-            )
+            hand_fk = HandKinematics(str(XHAND_RIGHT_URDF_PATH), list(self._fingertip_link_names))
             state["hand_fingertip"][hand_valid] = compute_fingertip_history_xarm_base(
-                arm[hand_valid],
+                state["arm_ee"][hand_valid],
                 hand[hand_valid],
                 hand_fk=hand_fk,
                 handbase_position_eef_m=self._handbase_position_eef_m,
                 handbase_quat_eef_wxyz=self._handbase_quat_eef_wxyz,
-                eef_pose_history=state["arm_ee"][hand_valid],
             )
 
         contact = self._reader["hand_contact"][: self._T]
@@ -244,7 +242,7 @@ class EpisodeVisualizer:
 
         return state
 
-    def _build_blueprint(self) -> rrb.Blueprint:
+    def build_blueprint(self) -> rrb.Blueprint:
         ts_verticals = []
         for category, keys in _SERIES_GROUPS.items():
             if category == "state":
@@ -263,10 +261,10 @@ class EpisodeVisualizer:
             )
         )
 
-    def _log_static(self) -> None:
+    def log_static(self) -> None:
         for category, keys in _SERIES_GROUPS.items():
             for key in keys:
-                arr = self._state[key]
+                arr = self.state[key]
                 base = f"{category}/{key}"
                 if arr.ndim == 1:
                     rr.log(base, rr.SeriesLine(name=key), static=True)
@@ -303,21 +301,21 @@ class EpisodeVisualizer:
     def log_step(self, step_idx: int) -> None:
         rr.set_time_sequence("step", step_idx)
         rr.set_time_seconds("time", float(self._reader["timestamp"][step_idx]))
-        depth = self._log_camera(step_idx)
-        self._log_pointcloud(depth)
-        self._log_fingertips(step_idx)
-        self._log_eef(step_idx)
-        self._log_time_series(step_idx)
+        depth = self.log_camera(step_idx)
+        self.log_pointcloud(depth)
+        self.log_fingertips(step_idx)
+        self.log_eef(step_idx)
+        self.log_time_series(step_idx)
 
-    def _log_camera(self, step_idx: int) -> np.ndarray:
+    def log_camera(self, step_idx: int) -> np.ndarray:
         if step_idx != self._rgb_index + 1:
             raise ValueError("viewer reads frames sequentially")
-        self._rgb = next(self._rgb_frames, None)
-        if self._rgb is None:
+        self.rgb = next(self._rgb_frames, None)
+        if self.rgb is None:
             raise ValueError(f"RGB missing at frame {step_idx}")
         self._rgb_index = step_idx
         depth = np.asarray(self._reader["depth"][step_idx])
-        rr.log("camera/color/rgb", rr.Image(self._rgb))
+        rr.log("camera/color/rgb", rr.Image(self.rgb))
         rr.log(
             "depth/image",
             rr.DepthImage(
@@ -328,15 +326,18 @@ class EpisodeVisualizer:
         )
         return depth
 
-    def _log_pointcloud(self, depth: np.ndarray) -> None:
+    def log_pointcloud(self, depth: np.ndarray) -> None:
         if self._pointcloud_config is None:
             return
         started_ns = time.perf_counter_ns()
         cloud = build_point_cloud(
-            depth_raw=depth, color=self._rgb,
-            depth_scale_m=self._camera_model.depth_scale_m, geometry=self._camera_model.geometry,
+            depth_raw=depth,
+            color=self.rgb,
+            depth_scale_m=self._camera_model.depth_scale_m,
+            geometry=self._camera_model.geometry,
             T_xarm_base_from_color=self._T_xarm_base_from_color,
-            table_plane_abcd=self._table_plane_abcd, config=self._pointcloud_config,
+            table_plane_abcd=self._table_plane_abcd,
+            config=self._pointcloud_config,
         )
         self._pointcloud_processing_ns += time.perf_counter_ns() - started_ns
         self._pointcloud_processed_frames += 1
@@ -350,8 +351,8 @@ class EpisodeVisualizer:
             rr.Points3D(positions=cloud[:, :3], colors=colors, radii=0.003),
         )
 
-    def _log_fingertips(self, step_idx: int) -> None:
-        fp = _fingertip_positions_or_none(self._state["hand_fingertip"][step_idx])
+    def log_fingertips(self, step_idx: int) -> None:
+        fp = fingertip_positions_or_none(self.state["hand_fingertip"][step_idx])
         if fp is None:
             # Clear stale geometry on invalid rows.
             rr.log("fingertips", rr.Clear(recursive=False))
@@ -366,8 +367,8 @@ class EpisodeVisualizer:
             ),
         )
 
-    def _log_eef(self, step_idx: int) -> None:
-        position = _eef_position_or_none(self._state["arm_ee"][step_idx])
+    def log_eef(self, step_idx: int) -> None:
+        position = eef_position_or_none(self.state["arm_ee"][step_idx])
         if position is None:
             # Clear stale geometry on invalid rows.
             rr.log("eef", rr.Clear(recursive=False))
@@ -381,10 +382,10 @@ class EpisodeVisualizer:
             ),
         )
 
-    def _log_time_series(self, step_idx: int) -> None:
+    def log_time_series(self, step_idx: int) -> None:
         for category, keys in _SERIES_GROUPS.items():
             for key in keys:
-                arr = self._state[key]
+                arr = self.state[key]
                 base = f"{category}/{key}"
                 if arr.ndim == 1:
                     rr.log(base, rr.Scalar(float(arr[step_idx])))
@@ -393,7 +394,7 @@ class EpisodeVisualizer:
                         rr.log(f"{base}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
         for key in _FORCE_SERIES:
-            arr = self._state[key]
+            arr = self.state[key]
             for i in range(arr.shape[1]):
                 rr.log(f"state/{key}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
@@ -478,8 +479,7 @@ def main(argv: list[str] | None = None) -> int:
     pointcloud_config = None
     table_plane_abcd = None
     if args.point_cloud:
-        # Viewing assumes the table setup still matches the current calibration;
-        # camera geometry continues to come from the recorded Raw metadata.
+        # Use current table calibration and the camera geometry recorded with Raw.
         pointcloud_config = runtime.pointcloud
         if args.pointcloud_num_points is not None:
             pointcloud_config = replace(pointcloud_config, num_points=args.pointcloud_num_points)

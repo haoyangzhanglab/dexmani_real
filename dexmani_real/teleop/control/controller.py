@@ -60,11 +60,13 @@ class TeleopController:
         if mapped is None:
             return None
         target = ema_smooth_pose(
-            mapped, self.smoothed_eef_pose,
-            cfg.policy.ema.alpha_pos, cfg.policy.ema.alpha_rot,
+            mapped,
+            self.smoothed_eef_pose,
+            cfg.control.ema.alpha_pos,
+            cfg.control.ema.alpha_rot,
         )
         hand = None
-        if cfg.policy.hand_enabled:
+        if cfg.control.hand_enabled:
             observation_id = row.vr["ring_sequence"]
             if self.hand_observation_id != observation_id:
                 # Claim each sample before solving; a failed solve is not retried on later ticks.

@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 
-def _positive_int(raw: str) -> int:
+def positive_int(raw: str) -> int:
     try:
         value = int(raw)
     except ValueError as exc:
@@ -45,7 +45,7 @@ def _positive_int(raw: str) -> int:
     return value
 
 
-def _nonnegative_int(raw: str) -> int:
+def nonnegative_int(raw: str) -> int:
     try:
         value = int(raw)
     except ValueError as exc:
@@ -55,7 +55,7 @@ def _nonnegative_int(raw: str) -> int:
     return value
 
 
-def _nonnegative_float(raw: str) -> float:
+def nonnegative_float(raw: str) -> float:
     try:
         value = float(raw)
     except ValueError as exc:
@@ -65,7 +65,7 @@ def _nonnegative_float(raw: str) -> float:
     return value
 
 
-def _positive_running_seconds(raw: str) -> float:
+def positive_running_seconds(raw: str) -> float:
     try:
         value = float(raw)
     except ValueError as exc:
@@ -75,7 +75,7 @@ def _positive_running_seconds(raw: str) -> float:
     return value
 
 
-def _parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run one policy-evaluation session with independently optional Raw recording and evaluation summary"
     )
@@ -83,7 +83,7 @@ def _parser() -> argparse.ArgumentParser:
         "experiment",
         metavar="EXPERIMENT",
         nargs="?",
-        help="Saved Policy selector policy/task/experiment; required unless --print-config",
+        help="Saved Policy selector or absolute experiment directory; required unless --print-config",
     )
     parser.add_argument(
         "--config",
@@ -101,7 +101,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num-episodes",
         dest="num_episodes",
-        type=_positive_int,
+        type=positive_int,
         default=20,
         help=(
             "exit after N episodes (default: 20); press B for each episode or Q to exit early; "
@@ -111,7 +111,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-duration",
         dest="max_running_s",
-        type=_positive_running_seconds,
+        type=positive_running_seconds,
         default=60.0,
         help="per-episode cooperative duration budget from RUNNING admission (default: 60 seconds)",
     )
@@ -125,10 +125,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--camera-calibration", type=Path, default=None)
     parser.add_argument(
-        "--no-record", action="store_true", help="Disable Raw recording independently of --no-results"
+        "--no-record",
+        action="store_true",
+        help="Disable Raw recording independently of --no-results",
     )
     parser.add_argument(
-        "--no-results", action="store_true", help="Disable evaluation summary independently of --no-record"
+        "--no-results",
+        action="store_true",
+        help="Disable evaluation summary independently of --no-record",
     )
     execution = parser.add_argument_group("Real execution")
     execution.add_argument(
@@ -139,19 +143,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     execution.add_argument(
         "--prefetch-steps",
-        type=_positive_int,
+        type=positive_int,
         default=None,
         help="Override prefetch delay d for async/RTC; requires 1 <= d <= A_exec and A_exec+d <= P",
     )
     execution.add_argument(
         "--rtc-guidance-cap",
-        type=_nonnegative_float,
+        type=nonnegative_float,
         default=None,
         help="Override finite nonnegative RTC guidance cap; 0 retains prefix freezing without guidance",
     )
     execution.add_argument(
         "--n-action-steps",
-        type=_positive_int,
+        type=positive_int,
         default=None,
         help="A_exec: actions per segment (default: saved Policy n_action_steps)",
     )
@@ -159,18 +163,18 @@ def _parser() -> argparse.ArgumentParser:
     research.add_argument("--weights", choices=("ema", "raw"), default=None)
     research.add_argument(
         "--inference-steps",
-        type=_positive_int,
+        type=positive_int,
         default=None,
         help="override saved inference step count (NFE)",
     )
     research.add_argument(
-        "--seed", type=_nonnegative_int, default=0, help="fixed inference seed reset each episode"
+        "--seed", type=nonnegative_int, default=0, help="fixed inference seed reset each episode"
     )
     research.add_argument("--device", default="cuda:0")
     return parser
 
 
-def _safe_selector_parts(selector: Any) -> tuple[str, str, str]:
+def safe_selector_parts(selector: Any) -> tuple[str, str, str]:
     if not isinstance(selector, str):
         raise ValueError("Policy selector must be a string")
     parts = tuple(selector.split("/"))
@@ -182,9 +186,12 @@ def _safe_selector_parts(selector: Any) -> tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
-def _session_directory(root: Path, selector: str) -> Path:
-    parts = _safe_selector_parts(selector)
+def session_directory(root: Path, selector: str) -> Path:
+    parts = safe_selector_parts(selector)
+    root = root.expanduser().resolve()
     base = root / Path(*parts)
+    if not base.resolve().is_relative_to(root):
+        raise ValueError("session output must remain inside its root")
     stamp = time.strftime("%Y%m%d_%H%M%S")
     candidate = base / f"session_{stamp}"
     dedup = 1
@@ -195,7 +202,7 @@ def _session_directory(root: Path, selector: str) -> Path:
     return candidate
 
 
-def _write_run_config(session_dir, *, args, runtime, info, execution):
+def write_run_config(session_dir, *, args, runtime, info):
     import dexmani_policy
     import yaml
 
@@ -216,7 +223,6 @@ def _write_run_config(session_dir, *, args, runtime, info, execution):
         "policy": compact_info,
         "future_steps": info.horizon - info.n_obs_steps + 1,
         "runtime": asdict(runtime),
-        "execution": asdict(execution),
         "seed": args.seed,
         "device": args.device,
         "num_episodes": args.num_episodes,
@@ -231,15 +237,11 @@ def _write_run_config(session_dir, *, args, runtime, info, execution):
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = _parser()
+    parser = build_parser()
     args = parser.parse_args(argv)
     if not args.print_config:
         if args.experiment is None:
             parser.error("EXPERIMENT is required unless --print-config is used")
-        try:
-            _safe_selector_parts(args.experiment)
-        except ValueError as exc:
-            parser.error(str(exc))
 
     import yaml
 
@@ -252,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
                 "execution.execution_mode": args.execution_mode,
                 "execution.prefetch_steps": args.prefetch_steps,
                 "execution.rtc_guidance_cap": args.rtc_guidance_cap,
+                "execution.action_steps": args.n_action_steps,
             },
         )
     except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
@@ -286,12 +289,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        action_steps = info.n_action_steps if args.n_action_steps is None else args.n_action_steps
-        runtime = replace(
-            runtime, execution=replace(runtime.execution, action_steps=action_steps)
-        )
+        action_steps = runtime.execution.action_steps
+        if action_steps is None:
+            action_steps = info.n_action_steps
+        runtime = replace(runtime, execution=replace(runtime.execution, action_steps=action_steps))
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
-        _safe_selector_parts(selector)
     except Exception as exc:
         print(f"[PREFLIGHT] preflight failed: {exc}", file=sys.stderr)
         return 1
@@ -301,22 +303,26 @@ def main(argv: list[str] | None = None) -> int:
         recording_dir = None
         if not (args.no_record and args.no_results):
             root = args.output or Path(__file__).resolve().parents[1] / "rollouts"
-            session_dir = _session_directory(root, selector)
+            session_dir = session_directory(root, selector)
             if not args.no_record:
                 recording_dir = session_dir
         elif args.output is not None:
-            print("--no-record --no-results: --output is unused; no session artifacts will be created")
+            print(
+                "--no-record --no-results: --output is unused; no session artifacts will be created"
+            )
     except Exception as exc:
         print(f"[SESSION] session setup failed: {exc}", file=sys.stderr)
         return 1
 
     print(f"策略：{args.experiment}")
-    print(f"评估：{args.num_episodes} 轮后退出 | 每轮预算 {args.max_running_s:g} s | 输入：{', '.join(info.observation_fields)}")
+    print(
+        f"评估：{args.num_episodes} 轮后退出 | 每轮预算 {args.max_running_s:g} s | 输入：{', '.join(info.observation_fields)}"
+    )
     print(f"输出：{session_dir}" if session_dir else "输出：Raw 和评估摘要均关闭")
     try:
-        from dexmani_real.deployment.session import run_policy_deployment
+        from dexmani_real.deployment.session import PolicyDeploymentSession
 
-        return run_policy_deployment(
+        return PolicyDeploymentSession(
             runtime,
             saved_config,
             info,
@@ -328,17 +334,18 @@ def main(argv: list[str] | None = None) -> int:
             results_dir=session_dir if not args.no_results else None,
             camera_calibration_path=args.camera_calibration,
             save_run_config=(
-                lambda resolved, effective: _write_run_config(
-                    session_dir,
-                    args=args,
-                    runtime=resolved,
-                    info=info,
-                    execution=effective,
+                (
+                    lambda resolved: write_run_config(
+                        session_dir,
+                        args=args,
+                        runtime=resolved,
+                        info=info,
+                    )
                 )
-            )
-            if session_dir is not None
-            else None,
-        )
+                if session_dir is not None
+                else None
+            ),
+        ).run()
     except Exception as exc:
         print(f"[LIFECYCLE] lifecycle failed: {exc}", file=sys.stderr)
         return 1

@@ -57,7 +57,7 @@ class CapturedProcessOutput:
     text: str = ""
 
 
-def _flush_process_stdout() -> None:
+def flush_process_stdout() -> None:
     """Flush Python and C stdio before changing/restoring file descriptor 1."""
     try:
         sys.stdout.flush()
@@ -84,7 +84,7 @@ def capture_native_stdout() -> Iterator[CapturedProcessOutput]:
     try:
         saved_fd = os.dup(stdout_fd)
         sink = tempfile.TemporaryFile(mode="w+b")
-        _flush_process_stdout()
+        flush_process_stdout()
         os.dup2(sink.fileno(), stdout_fd)
     except OSError:
         if sink is not None:
@@ -97,7 +97,7 @@ def capture_native_stdout() -> Iterator[CapturedProcessOutput]:
     try:
         yield captured
     finally:
-        _flush_process_stdout()
+        flush_process_stdout()
         os.dup2(saved_fd, stdout_fd)
         os.close(saved_fd)
         sink.seek(0)

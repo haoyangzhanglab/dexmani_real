@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real.planning.kinematics.pose import Pose, quat_multiply
-
-if TYPE_CHECKING:
-    from dexmani_real.runtime.operator_input import KeyboardInput
 
 CARTESIAN_JOG_KEYS = frozenset(
     {"w", "s", "a", "d", "up", "down", "left", "right", "i", "k", "j", "l"}
@@ -43,40 +39,41 @@ def propose_cartesian_jog_pose(
 
 
 def compute_cartesian_jog_delta(
-    keys: KeyboardInput,
+    pressed_keys: Iterable[str],
     delta_pos: float,
     delta_rpy: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map held keys to EEF position and rotation increments."""
+    keys = frozenset(pressed_keys)
     dx = np.zeros(3, dtype=np.float64)
-    if keys.is_pressed("w"):
+    if "w" in keys:
         dx[0] += delta_pos
-    if keys.is_pressed("s"):
+    if "s" in keys:
         dx[0] -= delta_pos
-    if keys.is_pressed("a"):
+    if "a" in keys:
         dx[1] -= delta_pos
-    if keys.is_pressed("d"):
+    if "d" in keys:
         dx[1] += delta_pos
-    if keys.is_pressed("up"):
+    if "up" in keys:
         dx[2] += delta_pos
-    if keys.is_pressed("down"):
+    if "down" in keys:
         dx[2] -= delta_pos
     dx_norm = float(np.linalg.norm(dx))
     if dx_norm > delta_pos:
         dx *= delta_pos / dx_norm
 
     drpy = np.zeros(3, dtype=np.float64)
-    if keys.is_pressed("left"):
+    if "left" in keys:
         drpy[0] += delta_rpy
-    if keys.is_pressed("right"):
+    if "right" in keys:
         drpy[0] -= delta_rpy
-    if keys.is_pressed("i"):
+    if "i" in keys:
         drpy[1] += delta_rpy
-    if keys.is_pressed("k"):
+    if "k" in keys:
         drpy[1] -= delta_rpy
-    if keys.is_pressed("j"):
+    if "j" in keys:
         drpy[2] -= delta_rpy
-    if keys.is_pressed("l"):
+    if "l" in keys:
         drpy[2] += delta_rpy
     drpy_norm = float(np.linalg.norm(drpy))
     if drpy_norm > delta_rpy:

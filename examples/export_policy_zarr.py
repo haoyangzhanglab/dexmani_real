@@ -20,10 +20,10 @@ from tqdm import tqdm
 
 from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
 from dexmani_real.dataset.contracts import ProcessingConfig
-from dexmani_real.dataset.export import export_raw_to_zarr
+from dexmani_real.dataset.export import CanonicalExporter
 
 
-def _parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Export complete Raw episodes to a canonical multimodal Zarr; reject incomplete episodes as a whole."
     )
@@ -72,7 +72,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _default_output_path(input_root: Path) -> Path:
+def default_output_path(input_root: Path) -> Path:
     task_name = (
         input_root.parent.name
         if (input_root / "data.h5").exists() or input_root.name.startswith("episode_")
@@ -83,10 +83,11 @@ def _default_output_path(input_root: Path) -> Path:
     return Path("datasets") / f"{task_name}.zarr"
 
 
-def _load_processing_config(path: Path | None, *, num_points: int | None) -> ProcessingConfig:
+def load_processing_config(path: Path | None, *, num_points: int | None) -> ProcessingConfig:
     """Load processing values; read the current table plane only for table removal."""
     runtime = load_experiment_config(
-        yaml_path=path, cli_overrides={"pointcloud.num_points": num_points},
+        yaml_path=path,
+        cli_overrides={"pointcloud.num_points": num_points},
     )
     plane = (
         resolve_table_plane(runtime.environment.table) if runtime.pointcloud.remove_table else None
@@ -95,29 +96,33 @@ def _load_processing_config(path: Path | None, *, num_points: int | None) -> Pro
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = _parser()
+    parser = build_parser()
     args = parser.parse_args(argv)
     try:
         args.input_root = args.input_root.expanduser().resolve()
-        output_path = args.output if args.output is not None else _default_output_path(args.input_root)
+        output_path = (
+            args.output if args.output is not None else default_output_path(args.input_root)
+        )
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     try:
-        processing = _load_processing_config(args.config, num_points=args.pointcloud_num_points)
+        processing = load_processing_config(args.config, num_points=args.pointcloud_num_points)
         from dexmani_real.utils.log import configure_logging
 
         configure_logging()
         with tqdm(desc="Raw to canonical Zarr", unit="episode", file=sys.stderr) as progress:
+
             def update_progress(completed, total):
                 progress.total = total
                 progress.update(completed - progress.n)
 
-            result = export_raw_to_zarr(
-                args.input_root,
-                output_path,
+            result = CanonicalExporter(
                 processing=processing,
                 chunk_frames=args.chunk_frames,
                 compression_level=args.compression_level,
+            ).export(
+                args.input_root,
+                output_path,
                 exclude=tuple(args.exclude),
                 progress_callback=update_progress,
             )

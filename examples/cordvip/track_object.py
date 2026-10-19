@@ -1,7 +1,5 @@
-"""RGB-D 视频流 → 物体位姿、逐帧实测点云与模型点云可视化。
+"""RGB-D 位姿与点云可视化；默认连接 RealSense，--rgbd-dir 使用离线源。"""
 
-读取米制资产；默认连接 RealSense，--rgbd-dir 可使用离线 RGB-D。
-"""
 from pathlib import Path
 import sys
 

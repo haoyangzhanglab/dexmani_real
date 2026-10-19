@@ -75,26 +75,26 @@ def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     )
 
 
-def _quat_conjugate(q: np.ndarray) -> np.ndarray:
+def quat_conjugate(q: np.ndarray) -> np.ndarray:
     return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float64)
 
 
-def _quat_rotate_vector(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+def quat_rotate_vector(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     """Rotate a 3D vector by a wxyz quaternion."""
     qv = np.array([0.0, v[0], v[1], v[2]], dtype=np.float64)
-    qv_rot = quat_multiply(quat_multiply(q, qv), _quat_conjugate(q))
+    qv_rot = quat_multiply(quat_multiply(q, qv), quat_conjugate(q))
     return qv_rot[1:]
 
 
 def compose_pose(parent: Pose, child: Pose) -> Pose:
-    p = parent.p + _quat_rotate_vector(parent.q, child.p)
+    p = parent.p + quat_rotate_vector(parent.q, child.p)
     q = quat_multiply(parent.q, child.q)
     return Pose(p=p, q=q)
 
 
 def invert_pose(pose: Pose) -> Pose:
-    q_inv = _quat_conjugate(pose.q)
-    p = _quat_rotate_vector(q_inv, -pose.p)
+    q_inv = quat_conjugate(pose.q)
+    p = quat_rotate_vector(q_inv, -pose.p)
     return Pose(p=p, q=q_inv)
 
 
@@ -153,6 +153,12 @@ def validate_rot6d_geometry(
 
 def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
     """Gram-Schmidt [c1x,c1y,c1z,c2x,c2y,c2z] to WXYZ; reject nonfinite or near-collinear bases."""
+    quat_xyzw = Rotation.from_matrix(rot6d_to_rotmat(r6)).as_quat()
+    return xyzw_to_wxyz(quat_xyzw)
+
+
+def rot6d_to_rotmat(r6: np.ndarray) -> np.ndarray:
+    """Gram-Schmidt rot6d columns to a right-handed rotation matrix."""
     r6 = validate_rot6d_geometry(r6, label="rot6d")[0]
     c1 = r6[:3].copy()
     c2 = r6[3:].copy()
@@ -166,19 +172,13 @@ def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
     u3 = np.cross(u1, u2)
     R = np.column_stack([u1, u2, u3])
 
-    quat_xyzw = Rotation.from_matrix(R).as_quat()
-    return xyzw_to_wxyz(quat_xyzw)
+    return R
 
 
 def quat_wxyz_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
     """Convert WXYZ to a (3,3) rotation matrix."""
     quat_xyzw = wxyz_to_xyzw(normalize_quat_wxyz(q_wxyz))
     return Rotation.from_quat(quat_xyzw).as_matrix()
-
-
-def rot6d_to_rotmat(r6: np.ndarray) -> np.ndarray:
-    """6D rotation → 3×3 rotation matrix (via WXYZ quaternion)."""
-    return quat_wxyz_to_rotmat(rot6d_to_quat_wxyz(r6))
 
 
 def forward_from_quat_wxyz(q_wxyz: np.ndarray) -> np.ndarray:

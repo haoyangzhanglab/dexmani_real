@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Any
 
-from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.sensor.pointcloud.config import PointCloudConfig, resolve_saved_pointcloud_recipe
 
 _SUPPORTED_OBSERVATION_FIELDS = frozenset(
     {
@@ -37,7 +37,7 @@ def validate_max_running_s(max_running_s: float | None) -> float | None:
 
 def validate_policy_inputs(info: Any, runtime: Any) -> PointCloudConfig | None:
     """Check physical capability before allocating IPC or connecting devices."""
-    if not runtime.policy.hand_enabled:
+    if not runtime.control.hand_enabled:
         raise ValueError("Dexterous policy deployment requires hand_enabled=true")
     names = set(info.observation_fields)
     unsupported = names - _SUPPORTED_OBSERVATION_FIELDS
@@ -57,15 +57,7 @@ def validate_policy_inputs(info: Any, runtime: Any) -> PointCloudConfig | None:
         ):
             raise ValueError("Live fingertip_xyz requires five distinct non-empty link names")
     if "point_cloud" in names:
-        recipe = info.pointcloud_config
-        if not isinstance(recipe, dict):
-            raise ValueError("Live point_cloud requires saved numerical parameters")
-        missing = {field.name for field in fields(PointCloudConfig)} - recipe.keys()
-        if missing:
-            raise ValueError(f"Saved pointcloud recipe missing fields: {sorted(missing)}")
-        config = PointCloudConfig(**{**recipe, "workspace": tuple(recipe["workspace"])})
-        config.validate()
-        return config
+        return resolve_saved_pointcloud_recipe(info.pointcloud_config)
     return None
 
 
@@ -100,22 +92,20 @@ def validate_num_episodes(num_episodes: Any) -> int | None:
 class ExecutionConfig:
     """Policy action horizon and runtime execution budgets."""
 
-    # Effective A_exec, resolved from CLI or saved default at the Real entry.
+    # Effective A_exec, resolved from CLI, YAML or saved default at the Real entry.
     action_steps: int | None = None
     execution_mode: str = "sync"
     # Policy may start near HOME without relaxing the physical HOME convergence.
     start_arm_home_tolerance_deg: float = 0.5
-    # Shared teleop/deployment final-FK allowance; nominal command bounds stay fixed.
-    eef_workspace_margin_m: float = 0.005
     # Runtime age/wait budgets do not bound the physical stop response time.
     max_decision_age_s: float = 1.0
     max_wait_s: float = 2.0
     prefetch_steps: int | None = None
     rtc_guidance_cap: float | None = None
 
-    def validate(self, info):
+    def validate(self, info) -> None:
         control_dt_ns(info)
-        for name in ("n_obs_steps", "horizon", "n_action_steps"):
+        for name in ("n_obs_steps", "horizon"):
             value = getattr(info, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -131,22 +121,9 @@ class ExecutionConfig:
             or tolerance <= 0
         ):
             raise ValueError("start_arm_home_tolerance_deg must be finite and positive")
-        margin = self.eef_workspace_margin_m
-        if (
-            isinstance(margin, bool)
-            or not isinstance(margin, (int, float))
-            or not math.isfinite(margin)
-            or margin < 0
-        ):
-            raise ValueError("eef_workspace_margin_m must be finite and nonnegative")
         for name in ("max_decision_age_s", "max_wait_s"):
             value = getattr(self, name)
-            if (
-                isinstance(value, bool)
-                or value is None
-                or not math.isfinite(value)
-                or value <= 0
-            ):
+            if isinstance(value, bool) or value is None or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be a finite positive experimental budget")
         p = info.horizon - info.n_obs_steps + 1
         a = self.action_steps
@@ -157,9 +134,10 @@ class ExecutionConfig:
         if self.execution_mode != "sync":
             d = self.prefetch_steps
             if type(d) is not int or not 1 <= d <= a or a + d > p:
-                raise ValueError(f"async/rtc require 1 <= d <= A_exec and A_exec+d <= P; A_exec={a}, P={p}, d={d}")
+                raise ValueError(
+                    f"async/rtc require 1 <= d <= A_exec and A_exec+d <= P; A_exec={a}, P={p}, d={d}"
+                )
         if self.execution_mode == "rtc":
             beta = self.rtc_guidance_cap
             if isinstance(beta, bool) or beta is None or not math.isfinite(beta) or beta < 0:
                 raise ValueError("rtc_guidance_cap requires an explicit finite nonnegative value")
-        return self

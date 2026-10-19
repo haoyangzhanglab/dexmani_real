@@ -29,8 +29,8 @@ if [[ $# -ne 0 ]]; then
 fi
 
 cd -- "$cordvip_root"
-if [[ "${CONDA_DEFAULT_ENV:-}" != "real_robot" || -z "${CONDA_PREFIX:-}" ]]; then
-    printf 'Activate conda env real_robot before running this script.\n' >&2
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+    printf 'Activate the existing compatible conda environment before running this script.\n' >&2
     exit 1
 fi
 python - <<'PY'
@@ -78,15 +78,18 @@ CONSTRAINTS
 checkout_source() {
     local cordvip_name="$1" cordvip_url="$2" cordvip_revision="$3"
     local cordvip_path="$cordvip_root/third_party/$cordvip_name"
-    if [[ ! -e "$cordvip_path" ]]; then
+    if [[ -L "$cordvip_path" ]]; then
+        printf 'Refusing to modify an existing symlink: %s\n' "$cordvip_path" >&2
+        return 1
+    elif [[ ! -e "$cordvip_path" ]]; then
         git clone --filter=blob:none --no-checkout -- "$cordvip_url" "$cordvip_path"
         if ! git -C "$cordvip_path" cat-file -e "$cordvip_revision^{commit}"; then
             git -C "$cordvip_path" fetch --depth 1 origin "$cordvip_revision"
         fi
         git -C "$cordvip_path" checkout --detach "$cordvip_revision"
     else
-        if [[ -L "$cordvip_path" || ! -d "$cordvip_path/.git" ]]; then
-            printf 'Refusing to modify an existing non-checkout or symlink: %s\n' "$cordvip_path" >&2
+        if [[ ! -d "$cordvip_path" ]] || [[ "$(git -C "$cordvip_path" rev-parse --show-toplevel 2>/dev/null || true)" != "$(cd -- "$cordvip_path" && pwd -P)" ]]; then
+            printf 'Refusing to modify an existing non-checkout: %s\n' "$cordvip_path" >&2
             return 1
         fi
         if [[ "$(git -C "$cordvip_path" rev-parse HEAD)" != "$cordvip_revision" ]]; then

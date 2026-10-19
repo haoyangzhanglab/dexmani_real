@@ -20,12 +20,12 @@ from pathlib import Path
 import numpy as np
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
-from dexmani_real.config.hardware import VRParams
+from dexmani_real.sensor.vr.config import VRParams
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
-from dexmani_real.sensor.vr_worker import run_vr_worker
+from dexmani_real.sensor.vr.worker import run_vr_worker
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.vr_transform import (
     VR_TRANSFORM_MIN_FRAMES,
@@ -52,7 +52,7 @@ class HeadingCalibrationConfig:
     outlier_sigma: float = 3.0
 
 
-def _circular_mean(
+def circular_mean(
     forwards: np.ndarray, *, outlier_sigma: float = 3.0
 ) -> tuple[float, np.ndarray, np.ndarray]:
     """Return the circular mean heading and an inlier mask."""
@@ -99,7 +99,7 @@ def _circular_mean(
     return theta, mean_fwd, full_inlier
 
 
-def _quality_measurements(
+def quality_measurements(
     forwards: np.ndarray,
     theta_mean: float,
     inlier: np.ndarray,
@@ -120,8 +120,8 @@ def _quality_measurements(
     }
 
 
-def _read_heading(shared: RuntimeState, reference: str):
-    result = shared.sensors.vr_ring.read_latest(use_last_good=True)
+def read_heading(runtime_state: RuntimeState, reference: str):
+    result = runtime_state.sensors.vr_ring.read_latest(use_last_good=True)
     if result is None:
         return None
     frame = result[0][0]
@@ -132,15 +132,18 @@ def _read_heading(shared: RuntimeState, reference: str):
     return int(frame["sequence_id"]), frame["wrist_quat_wxyz"]
 
 
-def _wait_for_vr_tracking(
-    shared: RuntimeState, sensors: SensorProcesses, reference: str, timeout_s: float,
+def wait_for_vr_tracking(
+    runtime_state: RuntimeState,
+    sensors: SensorProcesses,
+    reference: str,
+    timeout_s: float,
 ) -> bool:
     deadline = time.monotonic() + timeout_s
     last_print = 0.0
     while time.monotonic() < deadline:
         if not sensors.check():
             return False
-        if _read_heading(shared, reference) is not None:
+        if read_heading(runtime_state, reference) is not None:
             print("  VR tracking active\n", flush=True)
             return True
         now = time.monotonic()
@@ -152,7 +155,7 @@ def _wait_for_vr_tracking(
     return False
 
 
-def _play_completion_audio() -> None:
+def play_completion_audio() -> None:
     audio: AudioFeedback | None = None
     try:
         audio = AudioFeedback()
@@ -217,10 +220,10 @@ def main(argv: list[str] | None = None) -> int:
 
     configure_logging()
     ctx = mp.get_context("spawn")
-    shared = RuntimeState(SensorChannels(ctx, vr=True))
-    sensors = SensorProcesses(shared)
+    runtime_state = RuntimeState(SensorChannels(ctx, vr=True))
+    sensors = SensorProcesses(runtime_state)
     vr_proc = ctx.Process(
-        name="vr", target=run_vr_worker, args=(shared.sensors, vr_config), daemon=True
+        name="vr", target=run_vr_worker, args=(runtime_state.sensors, vr_config), daemon=True
     )
     forwards: list[np.ndarray] = []
     stale_count = 0
@@ -231,7 +234,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         try:
             sensors.start(
-                vr_proc, ready=shared.sensors.vr_ready, timeout_s=cfg.vr_ready_timeout_s,
+                vr_proc,
+                ready=runtime_state.sensors.vr_ready,
+                timeout_s=cfg.vr_ready_timeout_s,
             )
         except RuntimeError as exc:
             print(f"  ERROR: VR receiver startup failed: {exc}", flush=True)
@@ -239,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         print("  VR connected", flush=True)
 
         print("  Waiting for VR tracking data (up to 15 s)...", flush=True)
-        if not _wait_for_vr_tracking(shared, sensors, args.ref, cfg.tracking_data_timeout_s):
+        if not wait_for_vr_tracking(runtime_state, sensors, args.ref, cfg.tracking_data_timeout_s):
             print("  ERROR: no VR tracking data received", flush=True)
             return 1
 
@@ -263,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
             if not sensors.check():
                 print("  ERROR: VR receiver exited during collection", flush=True)
                 return 1
-            sample = _read_heading(shared, args.ref)
+            sample = read_heading(runtime_state, args.ref)
             if sample is None:
                 time.sleep(_POLL_INTERVAL_S)
                 continue
@@ -283,7 +288,9 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(_POLL_INTERVAL_S)
     finally:
         shutdown_clean = shutdown_local_runtime(
-            shared, sensors=sensors, timeout_s=_JOIN_TIMEOUT_S,
+            runtime_state,
+            sensors=sensors,
+            timeout_s=_JOIN_TIMEOUT_S,
         )
 
     if not shutdown_clean:
@@ -296,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
 
     forwards_arr = np.array(forwards, dtype=np.float64)
     try:
-        theta_rad, mean_fwd, inlier = _circular_mean(forwards_arr, outlier_sigma=cfg.outlier_sigma)
+        theta_rad, mean_fwd, inlier = circular_mean(forwards_arr, outlier_sigma=cfg.outlier_sigma)
     except ValueError as exc:
         print(f"ERROR: invalid heading sample: {exc}")
         return 1
@@ -305,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: only {inlier_frames} inlier frames remain (< {cfg.min_frames} required)")
         return 1
     theta_deg = float(np.rad2deg(theta_rad))
-    quality = _quality_measurements(
+    quality = quality_measurements(
         forwards_arr,
         theta_rad,
         inlier,
@@ -353,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
     atomic_json_dump(config, args.output)
     print(f"\nSaved to: {args.output}")
 
-    _play_completion_audio()
+    play_completion_audio()
     return 0
 
 

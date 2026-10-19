@@ -11,7 +11,6 @@ from collections.abc import Callable
 from enum import Enum
 from typing import Any
 
-
 logger = logging.getLogger(__name__)
 
 # stop() disables callbacks, but Linux/XRecord may remain blocked; avoid long waits.
@@ -48,7 +47,7 @@ _KEY_MAP: dict[str, OperatorCommand] = {
 _EVENT_ONLY_KEYS = frozenset({"x", "space", "enter", "backspace"})
 
 
-def _suppress_terminal_echo() -> list[Any] | None:
+def suppress_terminal_echo() -> list[Any] | None:
     """Disable terminal ECHO; returns saved termios attrs or None on failure."""
     if not sys.stdin.isatty():
         return None
@@ -65,7 +64,7 @@ def _suppress_terminal_echo() -> list[Any] | None:
         return None
 
 
-def _restore_terminal_echo(saved: list[Any] | None) -> None:
+def restore_terminal_echo(saved: list[Any] | None) -> None:
     """Restore terminal attributes and discard canonical input typed meanwhile."""
     if saved is None:
         return
@@ -78,7 +77,7 @@ def _restore_terminal_echo(saved: list[Any] | None) -> None:
         logger.warning("terminal echo restoration failed", exc_info=True)
 
 
-def _stop_listener_bounded(listener: Any) -> bool:
+def stop_listener_bounded(listener: Any) -> bool:
     """Request pynput shutdown without treating a slow daemon join as a fault."""
     if listener is None:
         return True
@@ -111,10 +110,13 @@ class KeyboardInput:
         quit_callback: Callable[[], None] | None = None,
         capture_commands: bool = True,
         capture_raw_events: bool = False,
+        jog_change_callback: Callable[[], None] | None = None,
     ) -> None:
         self._buffer: deque[OperatorCommand] = deque()
         self._events: deque[str] = deque()
         self._keys: set[str] = set()
+        self._generation = 0
+        self._jog_change_callback = jog_change_callback
         self._condition = threading.Condition(threading.Lock())
         self._listener: Any = None
         self._running: bool = False
@@ -129,7 +131,7 @@ class KeyboardInput:
         self._listener_failure_reported = False
         self._saved_termios: list | None = None
 
-    def _latch_emergency_stop(self) -> None:
+    def latch_emergency_stop(self) -> None:
         callback: Callable[[], None] | None = None
         with self._condition:
             if not self._callbacks_active:
@@ -146,7 +148,7 @@ class KeyboardInput:
             except Exception:
                 logger.error("keyboard emergency-stop callback failed", exc_info=True)
 
-    def _dispatch_immediate_callback(self, signal: OperatorCommand) -> bool:
+    def dispatch_immediate_callback(self, signal: OperatorCommand) -> bool:
         """Complete the immediate effect before the command becomes pollable."""
         with self._condition:
             if not self._callbacks_active:
@@ -154,9 +156,7 @@ class KeyboardInput:
             callback = (
                 self._stop_callback
                 if signal is OperatorCommand.STOP
-                else self._quit_callback
-                if signal is OperatorCommand.QUIT
-                else None
+                else self._quit_callback if signal is OperatorCommand.QUIT else None
             )
         if callback is None:
             return True
@@ -165,13 +165,11 @@ class KeyboardInput:
         except Exception:
             logger.error("keyboard %s callback failed", signal.value, exc_info=True)
             # Consumers must not proceed as if a failed stop/quit was applied.
-            self._latch_emergency_stop()
+            self.latch_emergency_stop()
             return False
         return True
 
-    def _callbacks(
-        self, keyboard: Any
-    ) -> tuple[Callable[[object], None], Callable[[object], None]]:
+    def callbacks(self, keyboard: Any) -> tuple[Callable[[object], None], Callable[[object], None]]:
         """Build pynput callbacks that preserve held, raw-event, and command modes."""
 
         def key_name(key: object) -> str | None:
@@ -210,8 +208,11 @@ class KeyboardInput:
                     # Held keys also deduplicate command edges across OS repeat.
                     first_press = name not in self._keys
                     self._keys.add(name)
+                    if first_press:
+                        self._generation += 1
+                self.jog_changed(name, first_press)
                 if name == "esc":
-                    self._latch_emergency_stop()
+                    self.latch_emergency_stop()
                     return
                 signal = _KEY_MAP.get(name)
                 if (
@@ -222,7 +223,7 @@ class KeyboardInput:
                     and signal is not None
                     and first_press
                 ):
-                    if self._dispatch_immediate_callback(signal):
+                    if self.dispatch_immediate_callback(signal):
                         with self._condition:
                             if self._capture_commands and self._callbacks_active:
                                 self._buffer.append(signal)
@@ -234,12 +235,23 @@ class KeyboardInput:
             try:
                 name = key_name(key)
                 with self._condition:
+                    changed = self._callbacks_active and name in self._keys
                     if self._callbacks_active:
                         self._keys.discard(name)
+                        if changed:
+                            self._generation += 1
+                self.jog_changed(name, changed)
             except Exception:
                 logger.warning("keyboard release callback failed", exc_info=True)
 
         return on_press, on_release
+
+    def jog_changed(self, name, changed):
+        if changed and self._jog_change_callback is not None:
+            from dexmani_real.teleop.jog import CARTESIAN_JOG_KEYS
+
+            if name in CARTESIAN_JOG_KEYS:
+                self._jog_change_callback()
 
     def start(self) -> None:
         """Start the daemon keyboard listener once."""
@@ -265,7 +277,7 @@ class KeyboardInput:
                 "pynput is required for global keyboard capture. Install with: pip install pynput"
             ) from None
 
-        self._saved_termios = _suppress_terminal_echo()
+        self._saved_termios = suppress_terminal_echo()
         self._estop_latched.clear()
         self._listener_failure_reported = False
         with self._condition:
@@ -273,7 +285,7 @@ class KeyboardInput:
             self._events.clear()
             self._keys.clear()
             self._callbacks_active = True
-        on_press, on_release = self._callbacks(keyboard)
+        on_press, on_release = self.callbacks(keyboard)
 
         try:
             self._listener = keyboard.Listener(
@@ -320,14 +332,14 @@ class KeyboardInput:
             self._buffer.clear()
             self._condition.notify_all()
         try:
-            if _stop_listener_bounded(listener):
+            if stop_listener_bounded(listener):
                 self._listener = None
         finally:
             with self._condition:
                 self._events.clear()
                 self._keys.clear()
             self._estop_latched.clear()
-            _restore_terminal_echo(self._saved_termios)
+            restore_terminal_echo(self._saved_termios)
             self._saved_termios = None
 
     def poll(self, timeout: float = 0.05) -> list[OperatorCommand]:
@@ -358,7 +370,7 @@ class KeyboardInput:
                 self._keys.clear()
             if self._running:
                 # SDK fences also check keyboard health; losing emergency-stop input must fail safe.
-                self._latch_emergency_stop()
+                self.latch_emergency_stop()
         return healthy
 
     @property
@@ -375,6 +387,11 @@ class KeyboardInput:
     def pressed_keys(self) -> tuple[str, ...]:
         with self._condition:
             return tuple(sorted(self._keys))
+
+    def snapshot(self) -> tuple[frozenset[str], int]:
+        """One atomic held-key proposal; release/repress never revives its generation."""
+        with self._condition:
+            return frozenset(self._keys), self._generation
 
     def pop_event(self) -> str | None:
         with self._condition:

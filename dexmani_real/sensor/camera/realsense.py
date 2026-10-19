@@ -15,9 +15,8 @@ __all__ = [
 import numpy as np
 import pyrealsense2 as rs
 
-from dexmani_real.config.hardware import CameraParams
+from dexmani_real.sensor.camera.config import CameraParams
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
-
 
 logger = logging.getLogger(__name__)
 
@@ -66,16 +65,29 @@ class RealSenseCamera:
                 raise RuntimeError("No RealSense camera found.")
             if self.config.serial is None:
                 if len(devices) != 1:
-                    raise RuntimeError("Multiple RealSense cameras found; configure an explicit serial.")
+                    raise RuntimeError(
+                        "Multiple RealSense cameras found; configure an explicit serial."
+                    )
                 device = devices[0]
-                self.active_serial = self.get_device_info_value(device, rs.camera_info.serial_number)
+                self.active_serial = self.get_device_info_value(
+                    device, rs.camera_info.serial_number
+                )
                 if not self.active_serial:
                     raise RuntimeError("RealSense camera does not expose a serial number.")
             else:
-                device = next((device for device in devices if self.get_device_info_value(
-                    device, rs.camera_info.serial_number) == self.config.serial), None)
+                device = next(
+                    (
+                        device
+                        for device in devices
+                        if self.get_device_info_value(device, rs.camera_info.serial_number)
+                        == self.config.serial
+                    ),
+                    None,
+                )
                 if device is None:
-                    raise RuntimeError(f"No RealSense camera found with serial={self.config.serial}.")
+                    raise RuntimeError(
+                        f"No RealSense camera found with serial={self.config.serial}."
+                    )
             rs_config = self.create_rs_config()
             # Use a separate SDK context for L515 discovery isolation.
             self.pipeline = rs.pipeline()
@@ -83,12 +95,12 @@ class RealSenseCamera:
             self.profile = self.pipeline.start(rs_config, self.frame_queue)
             sensor = self.profile.get_device().first_depth_sensor()
             if self.is_l515_device(device):
-                self._apply_l515_depth_config(sensor)
+                self.apply_l515_depth_config(sensor)
             else:
-                self._apply_d400_depth_config(sensor)
-            self._apply_color_config()
+                self.apply_d400_depth_config(sensor)
+            self.apply_color_config()
             self.depth_scale = float(sensor.get_depth_scale())
-            self.geometry = self._read_geometry()
+            self.geometry = self.read_geometry()
             self._depth_to_color_aligner = rs.align(rs.stream.color)
             for _ in range(self.config.warmup_frames):
                 # Initialize alignment and owned copies before live publication.
@@ -100,7 +112,7 @@ class RealSenseCamera:
                 logger.exception("RealSense startup cleanup failed; pipeline remains owned")
             raise
 
-    def _apply_l515_depth_config(self, sensor) -> None:
+    def apply_l515_depth_config(self, sensor) -> None:
         """Apply one factory preset and an optional confidence override."""
         cfg = self.config
 
@@ -145,7 +157,7 @@ class RealSenseCamera:
                     continue
         raise RuntimeError("no color sensor with a color stream profile found")
 
-    def _apply_color_config(self) -> None:
+    def apply_color_config(self) -> None:
         """Apply color options; priority 0 limits exposure to the frame period and None preserves defaults."""
         priority = self.auto_exposure_priority
         if priority is None:
@@ -179,7 +191,7 @@ class RealSenseCamera:
         else:
             logger.debug("color auto_exposure_priority set to %s (0=OFF)", readback)
 
-    def _apply_d400_depth_config(self, sensor) -> None:
+    def apply_d400_depth_config(self, sensor) -> None:
         """Enable the D400 IR emitter and available High Accuracy preset for textureless depth."""
         options: list[tuple[rs.option, float]] = []
         if sensor.supports(rs.option.emitter_enabled):
@@ -210,9 +222,7 @@ class RealSenseCamera:
 
         rs_config = rs.config()
         rs_config.enable_device(self.active_serial)
-        rs_config.enable_stream(
-            rs.stream.depth, width, height, rs.format.z16, self.config.fps
-        )
+        rs_config.enable_stream(rs.stream.depth, width, height, rs.format.z16, self.config.fps)
         rs_config.enable_stream(
             rs.stream.color,
             width,
@@ -229,7 +239,7 @@ class RealSenseCamera:
         return product_line == "L500" or "L515" in name
 
     @staticmethod
-    def _intrinsics_from_sdk(intrinsics: Any) -> CameraIntrinsics:
+    def intrinsics_from_sdk(intrinsics: Any) -> CameraIntrinsics:
         coefficients = tuple(float(value) for value in intrinsics.coeffs)
         return CameraIntrinsics(
             width=int(intrinsics.width),
@@ -243,21 +253,21 @@ class RealSenseCamera:
         )
 
     @staticmethod
-    def _transform_from_sdk_extrinsics(extrinsics: Any) -> np.ndarray:
+    def transform_from_sdk_extrinsics(extrinsics: Any) -> np.ndarray:
         """RealSense stores rotation column-major; translation is in meters."""
         transform = np.eye(4, dtype=np.float64)
         transform[:3, :3] = np.asarray(extrinsics.rotation).reshape(3, 3, order="F")
         transform[:3, 3] = extrinsics.translation
         return transform
 
-    def _read_geometry(self) -> RGBDGeometry:
+    def read_geometry(self) -> RGBDGeometry:
         """Read immutable native stream calibration from the active profile."""
         depth_profile = self.profile.get_stream(rs.stream.depth).as_video_stream_profile()
         color_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
         return RGBDGeometry(
-            depth=self._intrinsics_from_sdk(depth_profile.get_intrinsics()),
-            color=self._intrinsics_from_sdk(color_profile.get_intrinsics()),
-            T_color_from_depth=self._transform_from_sdk_extrinsics(
+            depth=self.intrinsics_from_sdk(depth_profile.get_intrinsics()),
+            color=self.intrinsics_from_sdk(color_profile.get_intrinsics()),
+            T_color_from_depth=self.transform_from_sdk_extrinsics(
                 depth_profile.get_extrinsics_to(color_profile)
             ),
         )
@@ -315,16 +325,19 @@ class RealSenseCamera:
     def get_device_info(self) -> dict:
         if self.profile is None:
             raise RuntimeError("RealSense is not connected.")
-        return self._device_info(self.profile.get_device())
+        return self.device_info(self.profile.get_device())
 
     @staticmethod
-    def _device_info(device: rs.device) -> dict[str, str]:
-        return {name: RealSenseCamera.get_device_info_value(device, key) for name, key in (
-            ("name", rs.camera_info.name),
-            ("serial", rs.camera_info.serial_number),
-            ("firmware", rs.camera_info.firmware_version),
-            ("product_line", rs.camera_info.product_line),
-        )}
+    def device_info(device: rs.device) -> dict[str, str]:
+        return {
+            name: RealSenseCamera.get_device_info_value(device, key)
+            for name, key in (
+                ("name", rs.camera_info.name),
+                ("serial", rs.camera_info.serial_number),
+                ("firmware", rs.camera_info.firmware_version),
+                ("product_line", rs.camera_info.product_line),
+            )
+        }
 
     @staticmethod
     def get_device_info_value(device: rs.device, key: rs.camera_info) -> str:
@@ -336,4 +349,4 @@ class RealSenseCamera:
     @staticmethod
     def list_cameras() -> list[dict[str, str]]:
         context = rs.context()
-        return [RealSenseCamera._device_info(device) for device in context.query_devices()]
+        return [RealSenseCamera.device_info(device) for device in context.query_devices()]

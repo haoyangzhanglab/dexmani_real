@@ -26,9 +26,9 @@ import numpy as np
 import yaml
 
 from dexmani_real.config.experiment import load_experiment_config
-from dexmani_real.config.hardware import HandParams
+from dexmani_real.robot.xhand.config import HandParams
 from dexmani_real.robot.commands import DispatchStatus
-from dexmani_real.robot.drivers.xhand import XHand
+from dexmani_real.robot.xhand.driver import XHand
 from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
@@ -44,18 +44,38 @@ _ACTION_DWELL_S = 1.0
 # XHand1 example targets in degrees; HOME/palm use the current configuration.
 _PRESET_QPOS_DEG = {
     "fist": (
-        11.85, 74.58, 40, -3.08, 106.02, 109.5,
-        109.75, 107.56, 107.66, 109.5, 109.1, 109.15,
+        11.85,
+        74.58,
+        40,
+        -3.08,
+        106.02,
+        109.5,
+        109.75,
+        107.56,
+        107.66,
+        109.5,
+        109.1,
+        109.15,
     ),
     "v": (38.32, 90, 52.08, 6.21, 2.6, 5.0, 2.1, 5.0, 109.5, 109.5, 109.5, 109.23),
     "ok": (
-        45.88, 41.54, 67.35, 2.22, 80.45, 70.82,
-        31.37, 10.39, 13.69, 16.88, 1.39, 10.55,
+        45.88,
+        41.54,
+        67.35,
+        2.22,
+        80.45,
+        70.82,
+        31.37,
+        10.39,
+        13.69,
+        16.88,
+        1.39,
+        10.55,
     ),
 }
 
 
-def _validate_target(qpos_rad, config: HandParams) -> np.ndarray:
+def validate_target(qpos_rad, config: HandParams) -> np.ndarray:
     return validate_hand_command_bounds(
         qpos_rad,
         config.qpos_min_rad,
@@ -65,7 +85,7 @@ def _validate_target(qpos_rad, config: HandParams) -> np.ndarray:
     )
 
 
-def _action_sequence(config: HandParams) -> list[tuple[str, np.ndarray]]:
+def action_sequence(config: HandParams) -> list[tuple[str, np.ndarray]]:
     actions = (
         ("HOME", config.home_qpos_deg),
         ("fist", _PRESET_QPOS_DEG["fist"]),
@@ -74,7 +94,7 @@ def _action_sequence(config: HandParams) -> list[tuple[str, np.ndarray]]:
         ("OK", _PRESET_QPOS_DEG["ok"]),
         ("HOME", config.home_qpos_deg),
     )
-    return [(name, _validate_target(np.deg2rad(values), config)) for name, values in actions]
+    return [(name, validate_target(np.deg2rad(values), config)) for name, values in actions]
 
 
 class XHandControlExample(XHand):
@@ -82,36 +102,36 @@ class XHandControlExample(XHand):
 
     def __init__(self, config: HandParams, *, cancel_requested=lambda: False) -> None:
         super().__init__(config)
-        self._cancel_requested = cancel_requested
+        self.cancel_requested = cancel_requested
         self._motion_pending = False
 
     def check_cancelled(self) -> None:
-        if self._cancel_requested():
+        if self.cancel_requested():
             raise InterruptedError("XHand action sequence interrupted")
 
     def connect(self) -> int | None:
         if self.cfg.comm_type == "serial" and self.cfg.device_name is not None:
-            problem = _serial_port_problem(self.cfg.device_name)
+            problem = serial_port_problem(self.cfg.device_name)
             if problem is not None:
                 raise RuntimeError(problem)
         self.check_cancelled()
-        deadline_ns = super().connect(cancel_requested=self._cancel_requested)
+        deadline_ns = super().connect(cancel_requested=self.cancel_requested)
         self.check_cancelled()
         return deadline_ns
 
     @staticmethod
-    def _header(title: str) -> None:
+    def header(title: str) -> None:
         print(f"\n{'=' * 60}\n  {title}\n{'=' * 60}")
 
     def read_sdk_version(self) -> None:
-        self._header("SDK versions")
+        self.header("SDK versions")
         print(f"  Software SDK: {self.device_identity['sdk_version']}")
 
         error_struct, version = self._control.read_version(self.cfg.device_id, 0)
         print(f"  Hardware SDK: {version}  (error_code={error_struct.error_code})")
 
     def read_device_info(self) -> None:
-        self._header("Device info")
+        self.header("Device info")
         error_struct, info = self._control.read_device_info(self.cfg.device_id)
         if error_struct.error_code != 0 or info is None:
             print(f"  Device info unavailable (error_code={error_struct.error_code})")
@@ -123,7 +143,7 @@ class XHandControlExample(XHand):
         print(f"  hand_type:     {self.device_identity['hand_type']}")
 
     def read_state(self, finger_id: int = 2) -> bool:
-        self._header(f"Read state (finger {finger_id})")
+        self.header(f"Read state (finger {finger_id})")
         self.check_cancelled()
         state = self.get_state()
         self.check_cancelled()
@@ -147,9 +167,7 @@ class XHandControlExample(XHand):
                 print("  raw_pressure: unavailable")
         return True
 
-    def _read_action_positions(
-        self, *, action_deadline_ns: int | None = None
-    ) -> np.ndarray:
+    def read_action_positions(self, *, action_deadline_ns: int | None = None) -> np.ndarray:
         """One driver read bounded by feedback freshness and the action deadline."""
         self.check_cancelled()
         started_ns = time.monotonic_ns()
@@ -167,8 +185,8 @@ class XHandControlExample(XHand):
         return state.qpos
 
     def execute_action(self, qpos_rad) -> None:
-        target = _validate_target(qpos_rad, self.cfg)
-        self._read_action_positions()
+        target = validate_target(qpos_rad, self.cfg)
+        self.read_action_positions()
         self.check_cancelled()
         deadline_ns = time.monotonic_ns() + int(self.cfg.home_timeout_s * 1e9)
         self._motion_pending = True  # SDK exceptions do not establish non-delivery.
@@ -179,9 +197,8 @@ class XHandControlExample(XHand):
         tolerance_rad = np.deg2rad(self.cfg.home_tolerance_deg)
         consecutive = 0
         while time.monotonic_ns() < deadline_ns:
-            # Each live read has its own freshness window. The previous read
-            # and send latency do not determine the age of this new sample.
-            measured = self._read_action_positions(action_deadline_ns=deadline_ns)
+            # Freshness belongs to each newly received sample, independently of previous read/send latency.
+            measured = self.read_action_positions(action_deadline_ns=deadline_ns)
             if time.monotonic_ns() >= deadline_ns:
                 break
             error_rad = float(np.max(np.abs(measured - target)))
@@ -208,7 +225,7 @@ class XHandControlExample(XHand):
         print("  Stop command accepted by SDK")
 
 
-def _serial_port_problem(serial_port: str) -> str | None:
+def serial_port_problem(serial_port: str) -> str | None:
     port = Path(serial_port)
     try:
         mode = port.stat().st_mode
@@ -224,9 +241,9 @@ def _serial_port_problem(serial_port: str) -> str | None:
     return None
 
 
-def _run_hardware_session(config: HandParams, *, finger_id: int, read_only: bool) -> int:
+def run_hardware_session(config: HandParams, *, finger_id: int, read_only: bool) -> int:
     # Validate every endpoint before connecting, including narrowed experiment limits.
-    actions = [] if read_only else _action_sequence(config)
+    actions = [] if read_only else action_sequence(config)
     configure_logging()
     interrupted_signal = None
     cleaning_up = False
@@ -278,7 +295,7 @@ def _run_hardware_session(config: HandParams, *, finger_id: int, read_only: bool
     return result or (128 + interrupted_signal if interrupted_signal is not None else 0)
 
 
-def _disable_worker_core_dump() -> None:
+def disable_worker_core_dump() -> None:
     try:
         import resource
 
@@ -287,7 +304,7 @@ def _disable_worker_core_dump() -> None:
         pass
 
 
-def _run_isolated_hardware_session(argv: list[str]) -> int:
+def run_isolated_hardware_session(argv: list[str]) -> int:
     command = [sys.executable, str(Path(__file__).resolve()), *argv, _HARDWARE_WORKER_ARG]
     worker = subprocess.Popen(command)
 
@@ -330,13 +347,19 @@ def _run_isolated_hardware_session(argv: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, help="Optional experiment YAML; uses its hand section")
+    parser.add_argument(
+        "--config", type=Path, help="Optional experiment YAML; uses its hand section"
+    )
     parser.add_argument("--comm", choices=("serial", "ethercat"), help="Override hand transport")
     parser.add_argument("--device", help="Serial path or EtherCAT interface name")
     parser.add_argument("--hand-id", type=int, help="Override hand device id")
-    parser.add_argument("--finger-id", type=int, default=5, help="Joint id inspected for tactile health")
+    parser.add_argument(
+        "--finger-id", type=int, default=5, help="Joint id inspected for tactile health"
+    )
     parser.add_argument("--read-only", action="store_true", help="Read diagnostics once, then exit")
-    parser.add_argument("--print-config", action="store_true", help="Print hand settings without hardware")
+    parser.add_argument(
+        "--print-config", action="store_true", help="Print hand settings without hardware"
+    )
     parser.add_argument(_HARDWARE_WORKER_ARG, action="store_true", help=argparse.SUPPRESS)
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
@@ -355,16 +378,16 @@ def main(argv: list[str] | None = None) -> int:
         if not 0 <= args.finger_id < HAND_DOF:
             raise ValueError(f"finger-id must be in 0..{HAND_DOF - 1}")
         if not args.read_only and not args.print_config:
-            _action_sequence(config)
+            action_sequence(config)
     except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
         parser.error(str(exc))
     if args.print_config:
         print(yaml.safe_dump({"hand": asdict(config)}, sort_keys=False), end="")
         return 0
     if args._xhand_hardware_worker:
-        _disable_worker_core_dump()
-        return _run_hardware_session(config, finger_id=args.finger_id, read_only=args.read_only)
-    return _run_isolated_hardware_session(argv)
+        disable_worker_core_dump()
+        return run_hardware_session(config, finger_id=args.finger_id, read_only=args.read_only)
+    return run_isolated_hardware_session(argv)
 
 
 if __name__ == "__main__":

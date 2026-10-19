@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 import time
 
-from ..io import _new_output
+from ..io import new_output
 
 
 def parse_args(argv=None, *, workspace=None):
@@ -20,21 +20,31 @@ def parse_args(argv=None, *, workspace=None):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--episode", type=Path, help="只读现有 Raw episode")
     source.add_argument("--rgbd-dir", type=Path, help="回放本示例保存的六位编号 RGB-D NPZ")
-    parser.add_argument("--headless", action="store_true", help="不创建窗口，保存最后一帧 RGB-D 预览")
+    parser.add_argument(
+        "--headless", action="store_true", help="不创建窗口，保存最后一帧 RGB-D 预览"
+    )
     parser.add_argument("--no-3d", action="store_true", help="只显示 RGB-D，不加载 Open3D viewer")
     parser.add_argument("--max-frames", type=int, default=0, help="0 表示处理全部输入")
     parser.add_argument("--output", type=Path, help="新的 reports/ 子目录；默认按时间命名")
     parser.add_argument("--save-inputs", action="store_true", help="保存实际处理的原网格 RGB-D")
-    parser.add_argument("--save-video", action="store_true", help="保存 RGB-D 预览视频，时间戳以 records.jsonl 为准")
-    parser.add_argument("--video-fps", type=float, default=10.0, help="输出视频显示帧率，不代表采样速率")
+    parser.add_argument(
+        "--save-video", action="store_true", help="保存 RGB-D 预览视频，时间戳以 records.jsonl 为准"
+    )
+    parser.add_argument(
+        "--video-fps", type=float, default=10.0, help="输出视频显示帧率，不代表采样速率"
+    )
     parser.add_argument("--display-stride", type=int, default=3, help="仅实测三维显示点的像素步长")
     args = parser.parse_args(argv)
-    if args.max_frames < 0 or args.display_stride < 1:
-        parser.error("--max-frames 必须非负，--display-stride 必须为正")
-    if not (0 < args.video_fps < 1000):
+    if args.max_frames < 0:
+        parser.error("--max-frames 必须非负")
+    if not args.headless and not args.no_3d and args.display_stride < 1:
+        parser.error("--display-stride 必须为正")
+    if args.save_video and not (0 < args.video_fps < 1000):
         parser.error("--video-fps 必须有限且位于 (0,1000)")
-    if not args.headless and sys.platform.startswith("linux") and not (
-        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    if (
+        not args.headless
+        and sys.platform.startswith("linux")
+        and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     ):
         parser.error("无显示环境；请使用 --headless")
     return args
@@ -48,18 +58,30 @@ def run(args):
     from ..integrations.dexmani import iter_raw_episode
     from ..viewer import DemoViewer, make_panel
 
-    output = _new_output(args.output, workspace=args.workspace, protected=(args.episode, args.rgbd_dir))
+    output = new_output(
+        args.output, workspace=args.workspace, protected=(args.episode, args.rgbd_dir)
+    )
     print(f"Output: {output}", flush=True)
-    config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
-    (output / "run.json").write_text(json.dumps({
-        "config": config, "coordinate_frame": "color_camera",
-        "units": "m",
-        "rgb_source": "decoded_raw_video" if args.episode else "rgbd_input",
-    }, indent=2, ensure_ascii=False))
+    config = {
+        key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
+    }
+    (output / "run.json").write_text(
+        json.dumps(
+            {
+                "config": config,
+                "coordinate_frame": "color_camera",
+                "units": "m",
+                "rgb_source": "decoded_raw_video" if args.episode else "rgbd_input",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
     if args.save_inputs:
         (output / "inputs").mkdir()
     source = viewer = writer = None
     processed = 0
+    rectification_maps = geometry.RectificationMaps()
     completion = dict(status="failed")
     try:
         if args.episode:
@@ -71,34 +93,49 @@ def run(args):
         paused = False
         with (output / "records.jsonl").open("x") as records:
             for frame in source:
-                rgb, depth_m, K, _ = rectify_frame(frame)
+                rgb, depth_m, K, _ = rectify_frame(frame, maps=rectification_maps)
                 index = processed
                 if args.save_inputs:
                     save_frame(output / "inputs" / f"{index:06d}.npz", frame)
                 started_ns = time.monotonic_ns()
                 operation = "observed"
-                display_mask = np.zeros(depth_m.shape, dtype=bool)
-                display_mask[::args.display_stride, ::args.display_stride] = True
-                observed = geometry.deproject_depth(depth_m, K, mask=display_mask)
+                observed = None
+                if viewer is not None and not args.no_3d:
+                    display_mask = np.zeros(depth_m.shape, dtype=bool)
+                    display_mask[:: args.display_stride, :: args.display_stride] = True
+                    observed = geometry.deproject_depth(depth_m, K, mask=display_mask)
                 processing_ms = (time.monotonic_ns() - started_ns) / 1e6
                 short_source = frame.source_id.rsplit("/", 1)[-1]
-                lines = [f"mode=observed frame={index} operation={operation} compute={processing_ms:.1f} ms",
-                         f"source={short_source}  clock={frame.clock}"]
+                lines = [
+                    f"mode=observed frame={index} operation={operation} compute={processing_ms:.1f} ms",
+                    f"source={short_source}  clock={frame.clock}",
+                ]
                 lines.append("Observed RGB-D only; camera frame, meters")
                 panel = make_panel(rgb, depth_m, lines=lines)
                 if not cv2.imwrite(str(output / "last_frame.png"), panel):
                     raise RuntimeError("无法保存 last_frame.png")
                 if args.save_video:
                     if writer is None:
-                        writer = cv2.VideoWriter(str(output / "overlay.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
-                                                 args.video_fps, (panel.shape[1], panel.shape[0]))
+                        writer = cv2.VideoWriter(
+                            str(output / "overlay.mp4"),
+                            cv2.VideoWriter_fourcc(*"mp4v"),
+                            args.video_fps,
+                            (panel.shape[1], panel.shape[0]),
+                        )
                         if not writer.isOpened():
                             raise RuntimeError("无法打开视频编码器")
                     writer.write(panel)
                 # Offline host clocks belong to the recording, not to this playback process.
-                record = dict(index=index, row_index=frame.row_index, source_id=frame.source_id,
-                              timestamp_ns=frame.timestamp_ns, clock=frame.clock,
-                              operation=operation, processing_ms=processing_ms, source_age_ms=None)
+                record = dict(
+                    index=index,
+                    row_index=frame.row_index,
+                    source_id=frame.source_id,
+                    timestamp_ns=frame.timestamp_ns,
+                    clock=frame.clock,
+                    operation=operation,
+                    processing_ms=processing_ms,
+                    source_age_ms=None,
+                )
                 records.write(json.dumps(record, allow_nan=False) + "\n")
                 records.flush()
                 processed += 1
@@ -120,7 +157,7 @@ def run(args):
                             viewer.screenshot(output / f"cloud_{index:06d}_{stamp}.png")
                         if not paused:
                             break
-                        time.sleep(.01)
+                        time.sleep(0.01)
                 if quit_requested or (args.max_frames and processed >= args.max_frames):
                     break
         if processed == 0:
@@ -133,9 +170,11 @@ def run(args):
     finally:
         active_exception = sys.exc_info()[0] is not None
         cleanup_errors = []
-        for name, resource, operation in (("input", source, "close"),
-                                          ("video", writer, "release"),
-                                          ("viewer", viewer, "close")):
+        for name, resource, operation in (
+            ("input", source, "close"),
+            ("video", writer, "release"),
+            ("viewer", viewer, "close"),
+        ):
             if resource is not None:
                 try:
                     getattr(resource, operation)()

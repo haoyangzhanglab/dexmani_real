@@ -25,9 +25,13 @@ from dexmani_real.config.environment import (
     EnvironmentConfig,
     StaticCollisionBox,
     TableCollisionConfig,
+    validate_table_plane,
 )
-from dexmani_real.config.hardware import ArmParams, CameraParams, HandParams, VRParams
-from dexmani_real.config.pointcloud import PointCloudConfig
+from dexmani_real.robot.xarm7.config import ArmParams
+from dexmani_real.sensor.camera.config import CameraParams
+from dexmani_real.robot.xhand.config import HandParams
+from dexmani_real.sensor.vr.config import VRParams
+from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.deployment.config import ExecutionConfig
 
 
@@ -38,7 +42,7 @@ class ExperimentConfig:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     arm: ArmParams = field(default_factory=ArmParams)
     hand: HandParams = field(default_factory=HandParams)
-    policy: ControlParams = field(default_factory=ControlParams)
+    control: ControlParams = field(default_factory=ControlParams)
     teleop: TeleopTimingParams = field(default_factory=TeleopTimingParams)
     keyboard_teleop: KeyboardTeleopParams = field(default_factory=KeyboardTeleopParams)
     vr: VRParams = field(default_factory=VRParams)
@@ -52,7 +56,7 @@ class ExperimentConfig:
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
 
 
-def _patch(current: Any, changes: Any) -> Any:
+def apply_config_overrides(current: Any, changes: Any) -> Any:
     """Update dataclass sections; numerical constraints belong to consumers."""
     if dataclasses.is_dataclass(current):
         if not isinstance(changes, Mapping):
@@ -60,17 +64,21 @@ def _patch(current: Any, changes: Any) -> Any:
         updated = dict(changes)
         if isinstance(current, EnvironmentConfig) and "static_boxes" in updated:
             updated["static_boxes"] = tuple(
-                _patch(StaticCollisionBox(), box) for box in updated["static_boxes"]
+                apply_config_overrides(StaticCollisionBox(), box) for box in updated["static_boxes"]
             )
         for name, value in updated.items():
             if hasattr(current, name):
-                updated[name] = _patch(getattr(current, name), value)
+                updated[name] = apply_config_overrides(getattr(current, name), value)
         # The dataclass constructor rejects unknown fields.
         return dataclasses.replace(current, **updated)
     if isinstance(current, tuple):
         if not isinstance(changes, (list, tuple)):
             raise TypeError("config arrays must use YAML sequences")
-        return tuple(_patch(current[0], value) for value in changes) if current else tuple(changes)
+        return (
+            tuple(apply_config_overrides(current[0], value) for value in changes)
+            if current
+            else tuple(changes)
+        )
     if isinstance(current, bool):
         # A quoted "false" must never enable a hardware or processing switch.
         if type(changes) is not bool:
@@ -88,21 +96,30 @@ def _patch(current: Any, changes: Any) -> Any:
 
 def validate_robot_config(cfg: ExperimentConfig) -> None:
     """Values used by every robot owner, including HOME and hand-disabled geometry."""
-    for section in (cfg.arm, cfg.arm.homing, cfg.hand, cfg.safety):
-        section.validate()
+    cfg.arm.validate()
+    cfg.arm.homing.validate()
+    if cfg.control.hand_enabled:
+        cfg.hand.validate()
+    else:
+        cfg.hand.validate_home_pose()
+    cfg.safety.validate()
 
 
 def validate_control_rate(cfg: ExperimentConfig, control_hz: float) -> None:
     """Validate cadence before connecting; never silently decimate hand targets."""
     if not np.isfinite(control_hz) or not 0 < control_hz <= cfg.arm.servo_hz:
-        raise ValueError('target frequency must be positive and no greater than arm.servo_hz')
+        raise ValueError("target frequency must be positive and no greater than arm.servo_hz")
     if 1 / control_hz >= cfg.arm.feedback_max_age_s:
-        raise ValueError('target period must fit arm.feedback_max_age_s (coordinator health budget)')
-    if cfg.policy.hand_enabled:
+        raise ValueError(
+            "target period must fit arm.feedback_max_age_s (coordinator health budget)"
+        )
+    if cfg.control.hand_enabled:
         if control_hz > 83:
-            raise ValueError('XHand targets exceed the documented 83 Hz upper bound')
+            raise ValueError("XHand targets exceed the documented 83 Hz upper bound")
         if 1 / control_hz >= cfg.hand.feedback_max_age_s:
-            raise ValueError('target period must fit hand.feedback_max_age_s; configure both explicitly')
+            raise ValueError(
+                "target period must fit hand.feedback_max_age_s; configure both explicitly"
+            )
 
 
 def resolve_runtime_table(cfg: ExperimentConfig, *, pointcloud=None) -> ExperimentConfig:
@@ -129,19 +146,15 @@ def resolve_table_plane_path(table: TableCollisionConfig) -> Path:
 def resolve_table_plane(table: TableCollisionConfig) -> tuple[float, float, float, float]:
     """Read the current plane file, or use inline geometry when plane_path is null."""
     if table.plane_path is None:
-        table.validate()
-        return tuple(float(value) for value in table.plane_abcd)
+        return validate_table_plane(table.plane_abcd)
     plane_path = resolve_table_plane_path(table)
     try:
         with plane_path.open(encoding="utf-8") as stream:
             plane = json.load(stream)
-        resolved = dataclasses.replace(
-            table, plane_abcd=tuple(float(plane[k]) for k in ("a", "b", "c", "d"))
-        )
-        resolved.validate()
+        resolved = validate_table_plane(tuple(float(plane[k]) for k in ("a", "b", "c", "d")))
     except (OSError, KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"failed to load calibrated table plane from {plane_path}: {exc}") from exc
-    return resolved.plane_abcd
+    return resolved
 
 
 def load_experiment_config(
@@ -173,7 +186,33 @@ def load_experiment_config(
                 cursor[section] = {}
             cursor = cursor[section]
         cursor[name] = value
-    cfg = _patch(ExperimentConfig(), loaded)
-    if cfg.execution.action_steps is not None:
-        raise ValueError("execution.action_steps is derived; use --n-action-steps or the saved Policy default")
+    cfg = apply_config_overrides(ExperimentConfig(), loaded)
     return cfg
+
+
+def validate_keyboard_workspace(runtime):
+    """Validate the selected jog configuration before any device connects."""
+    cfg = runtime.keyboard_teleop
+    cfg.validate()
+    validate_control_rate(runtime, cfg.control_hz)
+    workspace = runtime.control.workspace.as_array()
+    if np.any(
+        workspace[:, 0] + cfg.workspace_command_margin_m
+        >= workspace[:, 1] - cfg.workspace_command_margin_m
+    ):
+        raise ValueError("keyboard workspace command margin leaves no interior workspace")
+    return workspace
+
+
+DEFAULT_TASK_NAME = "test"
+
+
+def validate_task_dir_name(value: str) -> str:
+    """Validate one task name as a safe directory component."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("task_name must be a non-empty string without surrounding whitespace")
+    if value.startswith("."):
+        raise ValueError("task_name must not be a hidden or relative directory name")
+    if "/" in value or "\\" in value or any(ord(char) < 32 for char in value):
+        raise ValueError("task_name must be one safe directory component")
+    return value

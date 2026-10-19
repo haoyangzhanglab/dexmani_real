@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ _OPERATOR2MANO_RIGHT = np.array(
 )
 
 
-def _validate_landmarks(points: np.ndarray) -> tuple[bool, str]:
+def validate_landmarks(points: np.ndarray) -> tuple[bool, str]:
     """Apply the fail-closed geometric gate before touching temporal state."""
     if points.shape != (21, 3):
         return False, f"shape {points.shape} != (21, 3)"
@@ -48,30 +49,18 @@ def _validate_landmarks(points: np.ndarray) -> tuple[bool, str]:
     return True, ""
 
 
-def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
-    """Fit validated wrist/index/middle MCP points by SVD; return a right-handed palm frame with X toward wrist."""
+def estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
+    """Construct the admitted palm triangle's right-handed frame, X toward wrist."""
     eps = 1e-8
     points = keypoint_3d_array[[0, 5, 9], :].copy()
 
     first, second = points[1] - points[0], points[2] - points[0]
     lengths = np.linalg.norm(first), np.linalg.norm(second)
-    if (
-        min(lengths) < 0.01
-        or np.linalg.norm(np.cross(first, second)) < 0.1 * lengths[0] * lengths[1]
-    ):
+    normal = np.cross(first, second)
+    normal_norm = np.linalg.norm(normal)
+    if min(lengths) < 0.01 or normal_norm < 0.1 * lengths[0] * lengths[1]:
         raise ValueError("wrist/index/middle palm triangle is degenerate")
     x_vector = points[0] - points[2]  # middle MCP → wrist
-    points_centered = points - np.mean(points, axis=0, keepdims=True)
-
-    try:
-        _, _, v = np.linalg.svd(points_centered)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError("palm SVD failed") from exc
-
-    normal = v[2, :]
-    normal_norm = np.linalg.norm(normal)
-    if normal_norm < eps:
-        raise ValueError("palm normal is degenerate")
     normal = normal / normal_norm
 
     x = x_vector - np.sum(x_vector * normal) * normal
@@ -94,7 +83,7 @@ def _estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
     return np.stack([x, normal, z], axis=1)
 
 
-def _scale_pinky(
+def scale_pinky(
     raw: np.ndarray,
     *,
     scale: float,
@@ -123,17 +112,17 @@ def prepare_landmarks(landmarks, *, pinky_scale, pinky_palm_scale):
     if landmarks is None:
         return None
     landmarks = np.asarray(landmarks, dtype=np.float64)
-    valid, reason = _validate_landmarks(landmarks)
+    valid, reason = validate_landmarks(landmarks)
     if not valid:
         logger.warning("VR landmarks rejected (%s) — no target produced", reason)
         return None
     try:
-        wrist_rot = _estimate_palm_frame(landmarks)
+        wrist_rot = estimate_palm_frame(landmarks)
         mano = landmarks @ wrist_rot @ _OPERATOR2MANO_RIGHT
-    except (ValueError, np.linalg.LinAlgError):
+    except ValueError:
         logger.warning("Coordinate transform failed — no target produced")
         return None
-    mano = _scale_pinky(mano, scale=pinky_scale, palm_scale=pinky_palm_scale)
+    mano = scale_pinky(mano, scale=pinky_scale, palm_scale=pinky_palm_scale)
     if not np.isfinite(mano).all():
         raise ValueError("transformed hand landmarks must be finite")
     return mano

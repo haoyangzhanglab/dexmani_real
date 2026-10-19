@@ -1,7 +1,5 @@
-"""RGB 图像 → Grounded-SAM2 → Hunyuan3D mesh 与固定表面点云。
+"""RGB 分割与 mesh 重建；提供实测尺寸后显式生成米制追踪资产。"""
 
-提供实测尺寸后额外生成米制追踪资产；模型和工作流实现在独立库中。
-"""
 from pathlib import Path
 import sys
 

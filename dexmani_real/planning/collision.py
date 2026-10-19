@@ -1,11 +1,8 @@
-"""Nominal-URDF collision checks for xArm7 + XHand; xarm7_xhand.srdf excludes hand self-collision.
-Physical mount compensation belongs to real-pose FK, not collision geometry.
-"""
+"""Nominal-URDF collisions; real-pose mount compensation stays in FK."""
 
 from __future__ import annotations
 
 import logging
-
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -22,7 +19,6 @@ from dexmani_real.robot.model import (
     XHAND_MODEL_DIR,
     XHAND_URDF_JOINT_NAMES,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +110,7 @@ class CollisionModel:
 
             for box in boxes:
                 placement = pin.SE3(
-                    self._quat_wxyz_to_matrix(box.quat_wxyz), np.asarray(box.center_xyz_m)
+                    self.quat_wxyz_to_matrix(box.quat_wxyz), np.asarray(box.center_xyz_m)
                 )
                 geometry = pin.GeometryObject(
                     f"environment::{box.name}",
@@ -136,7 +132,7 @@ class CollisionModel:
                 normal = plane[:3] / normal_norm
                 surface_origin = -(plane[3] / normal_norm) * normal
                 placement = pin.SE3(
-                    self._table_rotation(normal),
+                    self.table_rotation(normal),
                     surface_origin - 0.5 * table_config.thickness_m * normal,
                 )
                 geometry = pin.GeometryObject(
@@ -151,7 +147,7 @@ class CollisionModel:
                 table_pair_indices: list[int] = []
                 allowed = table_config.allowed_contact_links
                 for robot_id in range(robot_geom_count):
-                    link_name = self._get_environment_geom_link_name(robot_id)
+                    link_name = self.get_environment_geom_link_name(robot_id)
                     if link_name in allowed:
                         continue
                     self._environment_collision_model.addCollisionPair(
@@ -175,9 +171,11 @@ class CollisionModel:
             len(self._collision_model.collisionPairs),
             len(boxes),
             "enabled" if self._table is not None else "disabled",
-            len(self._environment_collision_model.collisionPairs)
-            if self._environment_collision_model is not None
-            else 0,
+            (
+                len(self._environment_collision_model.collisionPairs)
+                if self._environment_collision_model is not None
+                else 0
+            ),
         )
 
         self._expected_qpos_shape: tuple[int, ...] = (self._nq,)
@@ -186,7 +184,7 @@ class CollisionModel:
         self._hand_qpos: np.ndarray | None = None
 
     @staticmethod
-    def _table_rotation(normal: np.ndarray) -> np.ndarray:
+    def table_rotation(normal: np.ndarray) -> np.ndarray:
         """Return a stable local-box orientation whose +Z axis is *normal*."""
         reference = np.array([1.0, 0.0, 0.0], dtype=np.float64)
         local_x = reference - float(np.dot(reference, normal)) * normal
@@ -198,7 +196,7 @@ class CollisionModel:
         return np.column_stack((local_x, local_y, normal))
 
     @staticmethod
-    def _quat_wxyz_to_matrix(quat_wxyz: np.ndarray) -> np.ndarray:
+    def quat_wxyz_to_matrix(quat_wxyz: np.ndarray) -> np.ndarray:
         w, x, y, z = (float(value) for value in quat_wxyz)
         return np.array(
             [
@@ -218,7 +216,7 @@ class CollisionModel:
             raise ValueError("hand_qpos contains NaN or Inf — FK would silently fail")
         self._hand_qpos = hand_qpos[list(HAND_SDK_TO_URDF_IDX)]
 
-    def _to_full_qpos(self, qpos: np.ndarray) -> np.ndarray:
+    def to_full_qpos(self, qpos: np.ndarray) -> np.ndarray:
         """Expand arm (7,) using the saved hand pose, or accept full URDF (19,)."""
         qpos = np.asarray(qpos, dtype=np.float64)
         if not np.all(np.isfinite(qpos)):
@@ -239,13 +237,15 @@ class CollisionModel:
 
     def within_joint_limits(self, qpos: np.ndarray) -> bool:
         """Check nominal model limits, including hand joints in URDF ordering."""
-        full = self._to_full_qpos(qpos)
-        return bool(np.all(full >= self._model.lowerPositionLimit)
-                    and np.all(full <= self._model.upperPositionLimit))
+        full = self.to_full_qpos(qpos)
+        return bool(
+            np.all(full >= self._model.lowerPositionLimit)
+            and np.all(full <= self._model.upperPositionLimit)
+        )
 
-    def _pin_update(self, qpos: np.ndarray, stop_at_first: bool = True) -> bool:
+    def pin_update(self, qpos: np.ndarray, stop_at_first: bool = True) -> bool:
         """Compute self-collisions for a validated full configuration."""
-        qpos = self._to_full_qpos(qpos)
+        qpos = self.to_full_qpos(qpos)
         return bool(
             self._pin.computeCollisions(
                 self._model,
@@ -259,11 +259,11 @@ class CollisionModel:
 
     def check_self_collision(self, qpos: np.ndarray) -> bool:
         """Check one configuration, stopping at the first self-collision."""
-        return self._pin_update(qpos, stop_at_first=True)
+        return self.pin_update(qpos, stop_at_first=True)
 
     def minimum_hand_frame_z(self, arm_qpos: np.ndarray) -> float:
         """Return the lowest nominal hand-link origin in base; use the saved posture and add a mesh-extent margin."""
-        qpos = self._to_full_qpos(arm_qpos)
+        qpos = self.to_full_qpos(arm_qpos)
         self._pin.forwardKinematics(self._model, self._data, qpos)
         self._pin.updateFramePlacements(self._model, self._data)
         z_values = [
@@ -277,29 +277,27 @@ class CollisionModel:
 
     def check_self_collision_details(self, qpos: np.ndarray) -> "CollisionInfo":
         """Return collision contacts; preserve a positive result even if details are unavailable."""
-        has_any = self._pin_update(qpos, stop_at_first=False)
+        has_any = self.pin_update(qpos, stop_at_first=False)
         if not has_any:
             return CollisionInfo(in_collision=False)
         pairs: list[CollisionPair] = []
-        for pair_index, pair in enumerate(self._collision_model.collisionPairs):
-            if not self._pin.computeCollision(
-                self._collision_model, self._collision_data, pair_index
-            ):
-                continue
-            pairs.append(
-                CollisionPair(
-                    link_name1=self._get_geom_link_name(pair.first),
-                    link_name2=self._get_geom_link_name(pair.second),
-                    object_name1=self._collision_model.geometryObjects[pair.first].name,
-                    object_name2=self._collision_model.geometryObjects[pair.second].name,
-                    collision_type="pinocchio",
+        try:
+            for pair_index, pair in enumerate(self._collision_model.collisionPairs):
+                if not self._collision_data.collisionResults[pair_index].isCollision():
+                    continue
+                pairs.append(
+                    CollisionPair(
+                        link_name1=self.get_geom_link_name(pair.first),
+                        link_name2=self.get_geom_link_name(pair.second),
+                        object_name1=self._collision_model.geometryObjects[pair.first].name,
+                        object_name2=self._collision_model.geometryObjects[pair.second].name,
+                        collision_type="pinocchio",
+                    )
                 )
-            )
-        if not pairs:
-            # Missing diagnostic pairs must not override the model's collision result.
-            return CollisionInfo(in_collision=True, collision_pairs=(), num_contacts=1)
+        except Exception:
+            logger.warning("self collision details unavailable", exc_info=True)
         return CollisionInfo(
-            in_collision=True, collision_pairs=tuple(pairs), num_contacts=len(pairs)
+            in_collision=True, collision_pairs=tuple(pairs), num_contacts=max(1, len(pairs))
         )
 
     @property
@@ -318,7 +316,7 @@ class CollisionModel:
         """Return the minimum mesh-to-table distance over non-allowed links."""
         if self._table is None or not self._table_pair_indices:
             raise RuntimeError("calibrated table geometry is disabled")
-        full_qpos = self._to_full_qpos(qpos)
+        full_qpos = self.to_full_qpos(qpos)
         self._pin.forwardKinematics(self._model, self._data, full_qpos)
         self._pin.updateGeometryPlacements(
             self._model,
@@ -341,9 +339,9 @@ class CollisionModel:
     def check_environment_collision(self, qpos: np.ndarray) -> bool:
         """Return whether nominal robot geometry touches a configured box or table."""
         if not self.has_static_environment:
-            self._to_full_qpos(qpos)  # validate even without obstacles
+            self.to_full_qpos(qpos)  # validate even without obstacles
             return False
-        full_qpos = self._to_full_qpos(qpos)
+        full_qpos = self.to_full_qpos(qpos)
         return bool(
             self._pin.computeCollisions(
                 self._model,
@@ -357,39 +355,44 @@ class CollisionModel:
 
     def check_environment_collision_details(self, qpos: np.ndarray) -> "CollisionInfo":
         """Return robot link, obstacle name, and sampled qpos for a scene contact."""
-        full_qpos = self._to_full_qpos(qpos)
+        full_qpos = self.to_full_qpos(qpos)
         if not self.has_static_environment:
             return CollisionInfo(in_collision=False)
-        self._pin.forwardKinematics(self._model, self._data, full_qpos)
-        self._pin.updateGeometryPlacements(
-            self._model,
-            self._data,
-            self._environment_collision_model,
-            self._environment_collision_data,
-        )
-        pairs: list[CollisionPair] = []
-        for pair_index, pair in enumerate(self._environment_collision_model.collisionPairs):
-            if not self._pin.computeCollision(
-                self._environment_collision_model, self._environment_collision_data, pair_index
-            ):
-                continue
-            robot_id = int(pair.first)
-            obstacle_id = int(pair.second)
-            pairs.append(
-                CollisionPair(
-                    link_name1=self._get_environment_geom_link_name(robot_id),
-                    link_name2=self._environment_names[obstacle_id],
-                    object_name1=self._environment_collision_model.geometryObjects[robot_id].name,
-                    object_name2=self._environment_names[obstacle_id],
-                    collision_type="environment",
-                )
+        collided = bool(
+            self._pin.computeCollisions(
+                self._model,
+                self._data,
+                self._environment_collision_model,
+                self._environment_collision_data,
+                full_qpos,
+                False,
             )
-        if not pairs:
+        )
+        if not collided:
             return CollisionInfo(in_collision=False)
+        pairs: list[CollisionPair] = []
+        try:
+            for pair_index, pair in enumerate(self._environment_collision_model.collisionPairs):
+                if not self._environment_collision_data.collisionResults[pair_index].isCollision():
+                    continue
+                robot_id, obstacle_id = int(pair.first), int(pair.second)
+                pairs.append(
+                    CollisionPair(
+                        link_name1=self.get_environment_geom_link_name(robot_id),
+                        link_name2=self._environment_names[obstacle_id],
+                        object_name1=self._environment_collision_model.geometryObjects[
+                            robot_id
+                        ].name,
+                        object_name2=self._environment_names[obstacle_id],
+                        collision_type="environment",
+                    )
+                )
+        except Exception:
+            logger.warning("environment collision details unavailable", exc_info=True)
         return CollisionInfo(
             in_collision=True,
             collision_pairs=tuple(pairs),
-            num_contacts=len(pairs),
+            num_contacts=max(1, len(pairs)),
             sample_qpos_rad=tuple(float(value) for value in full_qpos),
         )
 
@@ -403,7 +406,9 @@ class CollisionModel:
         return self_info if self_info else self.check_environment_collision_details(qpos)
 
     def check_path(
-        self, path: np.ndarray, step_size: float = 0.02,
+        self,
+        path: np.ndarray,
+        step_size: float = 0.02,
     ) -> tuple[int, CollisionInfo] | None:
         """Return the first colliding segment/sample details; clear paths return None."""
         path = np.asarray(path, dtype=np.float64)
@@ -417,25 +422,24 @@ class CollisionModel:
         if first:
             return 0, first
         for index, (start, end) in enumerate(zip(path[:-1], path[1:])):
-            start, end = self._to_full_qpos(start), self._to_full_qpos(end)
+            start, end = self.to_full_qpos(start), self.to_full_qpos(end)
             delta = end - start
             count = max(1, int(np.ceil(float(np.max(np.abs(delta))) / step_size)))
-            for step in range(count + 1):
+            for step in range(1, count + 1):
                 sample = start + (step / count) * delta
-                if self.check_collision(sample):
-                    info = self.check_collision_details(sample)
-                    # A confirmed collision remains unsafe even without contact details.
-                    return index, info if info else CollisionInfo(in_collision=True)
+                info = self.check_collision_details(sample)
+                if info:
+                    return index, info
         return None
 
-    def _get_geom_link_name(self, geom_id: int) -> str:
+    def get_geom_link_name(self, geom_id: int) -> str:
         geom = self._collision_model.geometryObjects[geom_id]
         parent_frame = geom.parentFrame
         if parent_frame < len(self._model.frames):
             return self._model.frames[parent_frame].name
         return geom.name
 
-    def _get_environment_geom_link_name(self, geom_id: int) -> str:
+    def get_environment_geom_link_name(self, geom_id: int) -> str:
         geom = self._environment_collision_model.geometryObjects[geom_id]
         parent_frame = geom.parentFrame
         if parent_frame < len(self._model.frames):

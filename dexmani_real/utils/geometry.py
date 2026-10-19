@@ -29,7 +29,7 @@ def validate_rigid_transform(value, *, label="transform"):
     return matrix.copy()
 
 
-def _quaternion(value, name):
+def quaternion(value, name):
     quat = np.asarray(value, dtype=np.float64)
     if quat.shape != (4,) or not np.isfinite(quat).all():
         raise ValueError(f"{name} must be a finite (4,) WXYZ quaternion")
@@ -40,12 +40,12 @@ def _quaternion(value, name):
 
 
 def normalize_quat_wxyz(value, *, name="quaternion"):
-    quat, norm = _quaternion(value, name)
+    quat, norm = quaternion(value, name)
     return quat / norm
 
 
 def validate_unit_quaternion_wxyz(value, *, name="quaternion"):
-    quat, norm = _quaternion(value, name)
+    quat, norm = quaternion(value, name)
     if abs(norm - 1.0) > ROTATION_ATOL:
         raise ValueError(f"{name} must be unit length within {ROTATION_ATOL}")
     return quat.copy()

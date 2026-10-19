@@ -9,6 +9,17 @@ import numpy as np
 from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
 
 
+def validate_table_plane(value, *, min_normal_norm=1e-9):
+    """Validate only the consumed upward plane; collision box dimensions are separate."""
+    plane = np.asarray(value, dtype=np.float64)
+    if plane.shape != (4,) or not np.isfinite(plane).all():
+        raise ValueError("table plane must be finite shape (4,)")
+    norm = float(np.linalg.norm(plane[:3]))
+    if norm <= min_normal_norm or plane[2] / norm <= 0:
+        raise ValueError("table plane must have an upward non-zero normal")
+    return tuple(float(x) for x in plane)
+
+
 @dataclass(frozen=True)
 class WorkspaceBounds:
     """EEF workspace bounds in arm-base frame (meters)."""
@@ -20,14 +31,9 @@ class WorkspaceBounds:
     z_min: float = 0.05
     z_max: float = 0.50
 
-    def validate(self) -> None:
-        bounds = self.as_array()
-        if not np.all(np.isfinite(bounds)) or np.any(bounds[:, 0] >= bounds[:, 1]):
-            raise ValueError("workspace bounds must be finite and ordered")
-
-    def as_array(self) -> "np.ndarray":
-        """Workspace bounds as (3,2) np.ndarray — returns a mutable copy."""
-        return np.array(
+    def as_array(self) -> np.ndarray:
+        """Return finite, strictly ordered (3,2) bounds as an owned mutable array."""
+        bounds = np.array(
             [
                 [self.x_min, self.x_max],
                 [self.y_min, self.y_max],
@@ -35,6 +41,9 @@ class WorkspaceBounds:
             ],
             dtype=np.float64,
         )
+        if not np.isfinite(bounds).all() or np.any(bounds[:, 0] >= bounds[:, 1]):
+            raise ValueError("workspace bounds must be finite and ordered")
+        return bounds
 
 
 @dataclass(frozen=True)
@@ -47,20 +56,14 @@ class StaticCollisionBox:
     quat_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
 
     def validate(self) -> None:
-        if (
-            not isinstance(self.name, str)
-            or not self.name.strip()
-            or self.name == "table"
-        ):
+        if not isinstance(self.name, str) or not self.name.strip() or self.name == "table":
             raise ValueError(
                 "static collision box name must be non-empty and must not use reserved name 'table'"
             )
         center = np.asarray(self.center_xyz_m, dtype=np.float64)
         size = np.asarray(self.size_xyz_m, dtype=np.float64)
         if center.shape != (3,) or size.shape != (3,):
-            raise ValueError(
-                "static collision box center and size must both have shape (3,)"
-            )
+            raise ValueError("static collision box center and size must both have shape (3,)")
         if not np.all(np.isfinite(np.concatenate((center, size)))):
             raise ValueError("static collision box values must be finite")
         if np.any(size <= 0.0):
@@ -72,10 +75,7 @@ class StaticCollisionBox:
 
 @dataclass(frozen=True)
 class TableCollisionConfig:
-    """Finite collision box below an upward base-frame plane ax+by+cz+d=0.
-    Resolve plane_path for collision or cloud table removal into one session snapshot.
-    HOME checks table clearance; online manipulation permits operator-supervised table contact.
-    """
+    """Base-frame plane ax+by+cz+d=0; HOME needs clearance, online control permits table contact."""
 
     enabled: bool = True
     plane_path: str | None = "dexmani_real/calibration/state/table_plane.json"
@@ -91,15 +91,10 @@ class TableCollisionConfig:
             not isinstance(self.plane_path, str) or not self.plane_path.strip()
         ):
             raise ValueError("table plane_path must be a non-empty string or null")
-        plane = np.asarray(self.plane_abcd, dtype=np.float64)
+        validate_table_plane(self.plane_abcd)
         size = np.asarray(self.size_xy_m, dtype=np.float64)
-        if plane.shape != (4,) or size.shape != (2,):
-            raise ValueError("table plane_abcd and size_xy_m must have shapes (4,) and (2,)")
-        if not np.all(np.isfinite(np.concatenate((plane, size)))):
-            raise ValueError("table plane and size must be finite")
-        normal_norm = float(np.linalg.norm(plane[:3]))
-        if normal_norm <= 1e-9 or float(plane[2] / normal_norm) <= 0.0:
-            raise ValueError("table plane must have a finite upward-pointing normal")
+        if size.shape != (2,) or not np.isfinite(size).all():
+            raise ValueError("table size_xy_m must be finite shape (2,)")
         if np.any(size <= 0.0) or not np.isfinite(self.thickness_m) or self.thickness_m <= 0.0:
             raise ValueError("table size and thickness must be finite and positive")
         if not np.isfinite(self.soft_clearance_m) or self.soft_clearance_m < 0.0:

@@ -1,4 +1,4 @@
-"""xArm7 online IK and bounded HOME planning using the current collision scene."""
+"""Bounded HOME planning; final path admission remains fail-closed."""
 
 from __future__ import annotations
 
@@ -8,11 +8,8 @@ from collections.abc import Iterable
 import numpy as np
 
 from dexmani_real.config.environment import StaticCollisionBox, TableCollisionConfig
-from dexmani_real.robot.model import XARM7_XHAND_COLLISION_URDF_PATH, XARM7_XHAND_SRDF_PATH
-
 from .collision import CollisionModel
-from .kinematics.arm_fk import XArm7Kinematics
-from .kinematics.ik import IKResult, OnlineIKConfig, OnlineIKSolver
+from .kinematics.arm_fk import make_arm_kinematics
 from .kinematics.pose import Pose
 from .paths import WORKSPACE_BOUNDS_TOLERANCE_M, interpolate_waypoints
 
@@ -32,14 +29,11 @@ class XArm7MotionPlanner:
     def __init__(
         self,
         *,
-        online_ik_config: OnlineIKConfig | None = None,
         workspace_bounds: np.ndarray | None = None,
         base_pose_world: Pose | None = None,
         static_boxes: Iterable[StaticCollisionBox] = (),
         table: TableCollisionConfig | None = None,
     ) -> None:
-        import mplib
-
         self.workspace_bounds = None
         if workspace_bounds is not None:
             bounds = np.asarray(workspace_bounds, dtype=np.float64)
@@ -50,39 +44,12 @@ class XArm7MotionPlanner:
             ):
                 raise ValueError("workspace_bounds must be finite shape (3, 2) with lower <= upper")
             self.workspace_bounds = bounds.copy()
-        if not XARM7_XHAND_SRDF_PATH.is_file():
-            raise FileNotFoundError(f"planner SRDF does not exist: {XARM7_XHAND_SRDF_PATH}")
-        velocity = np.deg2rad(np.full(7, 180.0))
-        model = mplib.Planner(
-            urdf=str(XARM7_XHAND_COLLISION_URDF_PATH),
-            srdf=str(XARM7_XHAND_SRDF_PATH),
-            move_group="custom_eef_link",
-            use_convex=False,
-            joint_vel_limits=velocity.tolist(),
-            joint_acc_limits=(velocity * 2.0).tolist(),
-        )
-        self.kin = XArm7Kinematics(model, Pose.identity() if base_pose_world is None else base_pose_world)
+        self.kin = make_arm_kinematics(base_pose_world)
         self._elbow_joint_index = list(self.kin.pinocchio_model.get_joint_names()).index("joint4")
         self.collision_model = CollisionModel(static_boxes=static_boxes, table=table)
-        self.online_ik_solver = (
-            OnlineIKSolver(self.kin, self.collision_model, online_ik_config)
-            if online_ik_config is not None else None
-        )
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
         self.collision_model.set_hand_qpos(hand_qpos)
-
-    def reset_episode(self):
-        if self.online_ik_solver is None:
-            raise RuntimeError("this planner has no online IK solver")
-        self.online_ik_solver.reset_episode()
-
-    def solve_online_ik(
-        self, target_eef_pose_world: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray,
-    ) -> IKResult:
-        if self.online_ik_solver is None:
-            raise RuntimeError("this planner has no online IK solver")
-        return self.online_ik_solver.solve(target_eef_pose_world, current_qpos, previous_qpos_cmd)
 
     def plan_joint_qpos_path(self, target_qpos: np.ndarray, current_qpos: np.ndarray) -> np.ndarray:
         """Bounded HOME RRT fallback; reject malformed or unsafe output with ValueError."""
@@ -93,26 +60,30 @@ class XArm7MotionPlanner:
         target_qpos = self.kin.canonicalize_qpos(target_qpos, current_qpos)
         target_pose = self.kin.compute_eef_pose_world(target_qpos)
         result = self.kin.mp_planner.plan_qpos(
-            goal_qposes=[target_qpos], current_qpos=current_qpos,
-            time_step=_PATH_DT, rrt_range=_RRT_RANGE, planning_time=_RRT_TIME_S,
-            simplify=True, verbose=False,
+            goal_qposes=[target_qpos],
+            current_qpos=current_qpos,
+            time_step=_PATH_DT,
+            rrt_range=_RRT_RANGE,
+            planning_time=_RRT_TIME_S,
+            simplify=True,
+            verbose=False,
         )
         if not isinstance(result, dict) or result.get("status") != "Success":
             raise ValueError(f"MPlib HOME planning failed: {result}")
-        return self._validate_rrt_path(result.get("position", []), target_pose, current_qpos)
+        return self.validate_rrt_path(result.get("position", []), target_pose, current_qpos)
 
     @staticmethod
-    def _outside_limits(qpos, limits):
+    def outside_limits(qpos, limits):
         return bool(np.any(qpos < limits[:, 0] - 1e-5) or np.any(qpos > limits[:, 1] + 1e-5))
 
-    def _shortcut_smooth_path(self, path, limits):
+    def shortcut_smooth_path(self, path, limits):
         path = path.copy()
         for _ in range(3):
             changed = False
             index = 1
             while index < len(path) - 1:
                 prev, nxt = path[index - 1], path[index + 1]
-                if self._is_shortcut_valid(prev, nxt, limits):
+                if self.is_shortcut_valid(prev, nxt, limits):
                     path = np.delete(path, index, axis=0)
                     changed = True
                 else:
@@ -121,39 +92,44 @@ class XArm7MotionPlanner:
                 break
         return path
 
-    def _is_shortcut_valid(self, prev, nxt, limits):
+    def is_shortcut_valid(self, prev, nxt, limits):
         """Probe shortcuts at ¼, ½ and ¾; final admission densely checks the whole path."""
         mid = 0.5 * (prev + nxt)
-        if self._outside_limits(mid, limits):
+        if self.outside_limits(mid, limits):
             return False
         delta = nxt - prev
         try:
-            return not any(self.collision_model.check_collision(q) for q in (
-                prev + 0.25 * delta, mid, prev + 0.75 * delta,
-            ))
+            return not any(
+                self.collision_model.check_collision(q)
+                for q in (
+                    prev + 0.25 * delta,
+                    mid,
+                    prev + 0.75 * delta,
+                )
+            )
         except Exception:
             logger.warning("shortcut collision check failed closed", exc_info=True)
             return False
 
-    def _validate_rrt_path(self, path, target_pose, current_qpos):
+    def validate_rrt_path(self, path, target_pose, current_qpos):
         path = np.asarray(path, dtype=np.float64)
         if path.ndim != 2 or path.shape[1] != 7 or len(path) == 0 or not np.isfinite(path).all():
             raise ValueError("MPlib HOME path must be nonempty finite shape (N, 7)")
         path = self.kin.canonicalize_path(path, current_qpos)
         limits = self.kin.planning_limits(current_qpos)
-        smoothed = self._shortcut_smooth_path(path, limits)
+        smoothed = self.shortcut_smooth_path(path, limits)
         candidates = (smoothed, path) if len(smoothed) != len(path) else (smoothed,)
         for candidate in candidates:
             try:
-                self._check_rrt_candidate(candidate, target_pose, current_qpos, limits)
+                self.check_rrt_candidate(candidate, target_pose, current_qpos, limits)
             except ValueError as exc:
                 reason = str(exc)
             else:
                 return candidate
         raise ValueError(reason)
 
-    def _check_rrt_candidate(self, path, target_pose, current_qpos, limits):
-        if self._outside_limits(path, limits):
+    def check_rrt_candidate(self, path, target_pose, current_qpos, limits):
+        if self.outside_limits(path, limits):
             raise ValueError("Path violates planning limits.")
         elbow = path[:, self._elbow_joint_index]
         if (
@@ -162,9 +138,15 @@ class XArm7MotionPlanner:
             and np.ptp(elbow) > np.deg2rad(45.0)
         ):
             raise ValueError("Elbow branch flip detected.")
-        if np.max(np.abs(self.kin.compute_qpos_delta(path[0], current_qpos))) > _MAX_WAYPOINT_DELTA_RAD + 1e-12:
+        if (
+            np.max(np.abs(self.kin.compute_qpos_delta(path[0], current_qpos)))
+            > _MAX_WAYPOINT_DELTA_RAD + 1e-12
+        ):
             raise ValueError("Path start is too far from current_qpos.")
-        if len(path) > 1 and np.max(np.abs(np.diff(path, axis=0))) > _MAX_WAYPOINT_DELTA_RAD + 1e-12:
+        if (
+            len(path) > 1
+            and np.max(np.abs(np.diff(path, axis=0))) > _MAX_WAYPOINT_DELTA_RAD + 1e-12
+        ):
             raise ValueError("Path waypoint delta too large.")
         pos_error, rot_error = self.kin.compute_world_pose_error(target_pose, path[-1])
         if (

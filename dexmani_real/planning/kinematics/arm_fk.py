@@ -8,13 +8,33 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.robot.model import (
-    ARM_JOINT_SHAPE, XARM7_XHAND_COLLISION_URDF_PATH, XARM7_EQUIVALENT_JOINT_MASK,
+    ARM_JOINT_SHAPE,
+    XARM7_XHAND_COLLISION_URDF_PATH,
+    XARM7_EQUIVALENT_JOINT_MASK,
+    XARM7_XHAND_SRDF_PATH,
 )
 from ..paths import wrap_nearest_equivalent
-
 from .pose import Pose, compose_pose, compute_pose_error, invert_pose, quat_wxyz_to_rotmat
 
 _ARM_FK_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)
+
+
+def make_arm_kinematics(base_pose_world=None):
+    """Construct the existing seven-joint MPlib numerical backend, without devices."""
+    import mplib
+
+    if not XARM7_XHAND_SRDF_PATH.is_file():
+        raise FileNotFoundError(XARM7_XHAND_SRDF_PATH)
+    velocity = np.deg2rad(np.full(7, 180.0))
+    model = mplib.Planner(
+        urdf=str(XARM7_XHAND_COLLISION_URDF_PATH),
+        srdf=str(XARM7_XHAND_SRDF_PATH),
+        move_group="custom_eef_link",
+        use_convex=False,
+        joint_vel_limits=velocity.tolist(),
+        joint_acc_limits=(velocity * 2).tolist(),
+    )
+    return XArm7Kinematics(model, Pose.identity() if base_pose_world is None else base_pose_world)
 
 
 @lru_cache(maxsize=1)

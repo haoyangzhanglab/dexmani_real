@@ -1,6 +1,4 @@
-"""TAG optimizer ported from TAG/Retargeting/Hand_Retargeting/New_method/opt_xhand.py.
-Fixed-identity FreeFlyer: L-BFGS fits fingertips with temporal smoothing; SLSQP refines near-thumb pinches.
-"""
+"""TAG two-stage fingertip fitting with fixed-base FreeFlyer kinematics."""
 
 from __future__ import annotations
 
@@ -20,11 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class HandOptimizer:
-    """Fit fingertips with analytic gradients; joint limits use radians and finger lengths use meters.
-    Scale lengths by robot/human × finger_scale_boost; stage-specific tolerances/budgets configure NLopt.
-    Stage 2 applies the distance-ramped pinch attraction, EMA/skip threshold, and Stage-1/previous-frame anchors.
-    The injected PinGrad and its mutable Data belong to this optimizer.
-    """
+    """Own PinGrad data for two-stage TAG fitting; joints use radians and lengths use metres."""
 
     def __init__(
         self,
@@ -62,7 +56,7 @@ class HandOptimizer:
         self.opt_s1.set_upper_bounds(self.joint_limits_upper.tolist())
         self.opt_s1.set_ftol_abs(config.ftol_abs_s1)
         self.opt_s1.set_maxeval(config.maxeval_s1)
-        self.opt_s1.set_min_objective(self._obj_s1)
+        self.opt_s1.set_min_objective(self.obj_s1)
         self._smooth_weight = config.smooth_weight
 
         self.opt_s2 = nlopt.opt(nlopt.LD_SLSQP, self.dof)
@@ -70,7 +64,7 @@ class HandOptimizer:
         self.opt_s2.set_upper_bounds(self.joint_limits_upper.tolist())
         self.opt_s2.set_ftol_abs(config.ftol_abs_s2)
         self.opt_s2.set_maxeval(config.maxeval_s2)
-        self.opt_s2.set_min_objective(self._obj_s2)
+        self.opt_s2.set_min_objective(self.obj_s2)
 
         self.pinch_base_weight = config.pinch_base_weight
         self.pinch_start_dist = config.pinch_start_dist_m
@@ -99,7 +93,7 @@ class HandOptimizer:
         if not np.all(np.isfinite(self._current_target)):
             raise ValueError("scaled fingertip positions must be finite")
 
-        warm_start = self._bounded_qpos(self.last_qpos, "Stage 1 warm start")
+        warm_start = self.bounded_qpos(self.last_qpos, "Stage 1 warm start")
         self.last_qpos = warm_start.copy()
         try:
             q_s1 = self.opt_s1.optimize(warm_start)
@@ -109,7 +103,7 @@ class HandOptimizer:
                 exc_info=True,
             )
             return None
-        q_s1 = self._bounded_qpos(q_s1, "Stage 1 result")
+        q_s1 = self.bounded_qpos(q_s1, "Stage 1 result")
 
         vecs = fingertip_positions[1:] - fingertip_positions[0]
         dists = np.linalg.norm(vecs, axis=1)
@@ -137,7 +131,7 @@ class HandOptimizer:
                 exc_info=True,
             )
             q_s2 = q_s1.copy()
-        q_s2 = self._bounded_qpos(q_s2, "Stage 2 result")
+        q_s2 = self.bounded_qpos(q_s2, "Stage 2 result")
 
         self.last_qpos = q_s2.copy()
         return q_s2
@@ -145,13 +139,13 @@ class HandOptimizer:
     def reset(self, qpos: np.ndarray | None = None) -> None:
         """Reset temporal state, optionally warm-starting from (dof,) model-order angles."""
         if qpos is not None:
-            self.last_qpos = self._bounded_qpos(qpos, "reset warm start", warn_on_clip=False)
+            self.last_qpos = self.bounded_qpos(qpos, "reset warm start", warn_on_clip=False)
         else:
             self.last_qpos = self._default_qpos.copy()
         self.pinch_factors = np.zeros(self.finger_num, dtype=np.float64)
         self.qpos_stage1 = None
 
-    def _bounded_qpos(
+    def bounded_qpos(
         self, qpos: np.ndarray, label: str, *, warn_on_clip: bool = True
     ) -> np.ndarray:
         """Validate and project one NLopt state into the configured box bounds."""
@@ -163,7 +157,7 @@ class HandOptimizer:
             self._bounds_warn("HandOptimizer: projected %s into NLopt bounds", label)
         return bounded
 
-    def _obj_s1(self, qpos: np.ndarray, grad: np.ndarray) -> float:
+    def obj_s1(self, qpos: np.ndarray, grad: np.ndarray) -> float:
         """Stage 1 objective: position error + temporal smoothness."""
         self.qpos_floating[7:] = qpos
         # solve() sets _current_target before NLopt callbacks.
@@ -178,7 +172,7 @@ class HandOptimizer:
             grad[:] = g_pos + g_smooth
         return float(loss_pos + loss_smooth)
 
-    def _obj_s2(self, qpos: np.ndarray, grad: np.ndarray) -> float:
+    def obj_s2(self, qpos: np.ndarray, grad: np.ndarray) -> float:
         """Stage 2 objective: pinch refinement with regularization."""
         self.qpos_floating[7:] = qpos
         self.pin_grad.update_kinematics(self.qpos_floating)
@@ -271,11 +265,11 @@ class TAGHandRetargeter:
         )
 
     def retarget(self, landmarks: np.ndarray | None) -> np.ndarray | None:
-        """Map operator-frame landmarks to SDK qpos; invalid geometry/Stage-1 roundoff returns None.
-        Stage-2 roundoff retains the Stage-1 result; technical errors propagate.
-        """
+        """Invalid geometry/Stage-1 roundoff returns None; Stage-2 roundoff retains Stage 1."""
         mano = prepare_landmarks(
-            landmarks, pinky_scale=self._pinky_scale, pinky_palm_scale=self._pinky_palm_scale,
+            landmarks,
+            pinky_scale=self._pinky_scale,
+            pinky_palm_scale=self._pinky_palm_scale,
         )
         if mano is None:
             return None

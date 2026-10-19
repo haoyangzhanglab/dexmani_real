@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import logging
-
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 import av
 import numpy as np
-
 
 logger = logging.getLogger(__name__)
 
@@ -73,9 +71,7 @@ class VideoEncoder:
             raise RuntimeError("VideoEncoder is closed")
         if self._container is None:
             self._container = av.open(str(self._path), "w", format="mp4")
-            self._stream = self._container.add_stream(
-                "libx264", rate=self._rate
-            )
+            self._stream = self._container.add_stream("libx264", rate=self._rate)
             self._stream.width = self._width
             self._stream.height = self._height
             self._stream.pix_fmt = "yuv444p"

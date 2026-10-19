@@ -12,14 +12,8 @@ import numpy as np
 
 @dataclass(frozen=True)
 class Frame:
-    """Aligned color-camera data; zero depth is invalid, all distances are metres.
-
-    ``source_id`` identifies the camera frame when that evidence exists. Raw
-    episodes without camera identities use an explicitly labelled row identity.
-    ``clock`` distinguishes source receive time from observation-relative time;
-    neither is a camera exposure timestamp. Repeated camera frames may appear in
-    multiple Raw rows with the same source ID and source timestamp.
-    """
+    """Aligned color-camera metres; zero depth is invalid.
+    Source ID/clock distinguish received camera frames from explicit Raw row/relative identities."""
 
     rgb: np.ndarray
     depth_m: np.ndarray
@@ -68,8 +62,14 @@ def load_frame(path: str | Path) -> Frame:
     """Read one source-grid NPZ without inferring calibration, units or timing."""
     path = Path(path).expanduser().resolve()
     required = {
-        "rgb", "depth_m", "K", "distortion_model", "distortion_coeffs",
-        "source_id", "timestamp_ns", "clock",
+        "rgb",
+        "depth_m",
+        "K",
+        "distortion_model",
+        "distortion_coeffs",
+        "source_id",
+        "timestamp_ns",
+        "clock",
     }
     with np.load(path, allow_pickle=False) as saved:
         missing = required - set(saved.files)
@@ -93,34 +93,44 @@ def load_frame(path: str | Path) -> Frame:
         if coefficients.shape != (5,) or coefficients.dtype.kind not in {"f", "i", "u"}:
             raise ValueError(f"{path.name}: distortion_coeffs must contain five numbers")
         return Frame(
-            rgb=saved["rgb"], depth_m=saved["depth_m"], K=saved["K"],
+            rgb=saved["rgb"],
+            depth_m=saved["depth_m"],
+            K=saved["K"],
             distortion_coeffs=tuple(float(value) for value in coefficients),
-            row_index=integer.get("row_index"), timestamp_ns=integer["timestamp_ns"], **text,
+            row_index=integer.get("row_index"),
+            timestamp_ns=integer["timestamp_ns"],
+            **text,
         )
 
 
 def save_frame(path, frame):
     """Save the original aligned RGB-D grid and its source identity and timing."""
-    payload = dict(rgb=frame.rgb, depth_m=frame.depth_m, K=frame.K,
-                   distortion_model=frame.distortion_model,
-                   distortion_coeffs=frame.distortion_coeffs, source_id=frame.source_id,
-                   timestamp_ns=frame.timestamp_ns, clock=frame.clock)
+    payload = dict(
+        rgb=frame.rgb,
+        depth_m=frame.depth_m,
+        K=frame.K,
+        distortion_model=frame.distortion_model,
+        distortion_coeffs=frame.distortion_coeffs,
+        source_id=frame.source_id,
+        timestamp_ns=frame.timestamp_ns,
+        clock=frame.clock,
+    )
     if frame.row_index is not None:
         payload["row_index"] = frame.row_index
     np.savez_compressed(path, **payload)
 
 
-def rectify_frame(frame, mask=None):
+def rectify_frame(frame, mask=None, *, maps=None):
     """Return aligned RGB, measured depth, K and optional mask on the pinhole grid."""
     from .geometry import rectify_rgbd
 
-    model = frame.distortion_model.removeprefix('distortion.')
+    model = frame.distortion_model.removeprefix("distortion.")
     coefficients = np.asarray(frame.distortion_coeffs)
-    if model not in {'none', 'brown_conrady'}:
-        raise ValueError(f'Unsupported distortion model: {frame.distortion_model}')
-    if model == 'none' and np.any(coefficients != 0):
-        raise ValueError('none distortion requires zero coefficients')
-    return rectify_rgbd(frame.rgb, frame.depth_m, frame.K, coefficients, mask=mask)
+    if model not in {"none", "brown_conrady"}:
+        raise ValueError(f"Unsupported distortion model: {frame.distortion_model}")
+    if model == "none" and np.any(coefficients != 0):
+        raise ValueError("none distortion requires zero coefficients")
+    return rectify_rgbd(frame.rgb, frame.depth_m, frame.K, coefficients, mask=mask, maps=maps)
 
 
 def iter_rgbd_directory(path: str | Path) -> Iterator[Frame]:

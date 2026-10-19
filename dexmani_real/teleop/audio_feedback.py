@@ -1,6 +1,4 @@
-"""Play WAV prompts off the control thread; play() preempts queued prompts by default.
-Unavailable players/failures disable audio; enabled sessions log and skip invalid events/files.
-"""
+"""Off-thread WAV prompts preempt queued audio; unavailable players disable playback."""
 
 from __future__ import annotations
 
@@ -16,7 +14,6 @@ import time
 from dataclasses import dataclass
 
 from dexmani_real import ASSET_DIR
-
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +37,7 @@ _STDERR_LOG_LIMIT = 512
 
 
 @dataclass(frozen=True)
-class _AudioRequest:
+class AudioRequest:
     path: str
     generation: int
 
@@ -51,8 +48,8 @@ class AudioFeedback:
     def __init__(self) -> None:
         self._condition = threading.Condition()
         self._current_proc: subprocess.Popen | None = None
-        self._active_request: _AudioRequest | None = None
-        self._pending: list[_AudioRequest] = []
+        self._active_request: AudioRequest | None = None
+        self._pending: list[AudioRequest] = []
         self._generation = 0
         self._closed = False
         self._player = next((name for name in ("aplay", "paplay") if shutil.which(name)), None)
@@ -60,13 +57,13 @@ class AudioFeedback:
         if self._disabled:
             logger.warning("No audio player; audio disabled")
         self._worker = threading.Thread(
-            target=self._worker_loop,
+            target=self.worker_loop,
             daemon=True,
             name="audio-feedback",
         )
         self._worker.start()
 
-    def _event_path(self, event: str) -> str | None:
+    def event_path(self, event: str) -> str | None:
         filename = _EVENT_MAP.get(event)
         if filename is None:
             logger.warning("Unknown audio event: %s", event)
@@ -82,7 +79,7 @@ class AudioFeedback:
         with self._condition:
             if self._closed or self._disabled:
                 return
-        path = self._event_path(event)
+        path = self.event_path(event)
         if path is None:
             return
 
@@ -93,8 +90,8 @@ class AudioFeedback:
             if interrupt:
                 self._generation += 1
                 self._pending.clear()
-                self._terminate_current_locked()
-            self._pending.append(_AudioRequest(path, self._generation))
+                self.terminate_current_locked()
+            self._pending.append(AudioRequest(path, self._generation))
             logger.debug("Audio queued: event=%s interrupt=%s", event, interrupt)
             self._condition.notify_all()
 
@@ -115,13 +112,13 @@ class AudioFeedback:
             self._closed = True
             self._generation += 1
             self._pending.clear()
-            self._terminate_current_locked()
+            self.terminate_current_locked()
             self._condition.notify_all()
         self._worker.join(timeout=1.0)
         if self._worker.is_alive():
             logger.warning("Audio worker did not stop within 1s")
 
-    def _terminate_current_locked(self) -> None:
+    def terminate_current_locked(self) -> None:
         """Request current playback termination while holding ``_condition``."""
         proc = self._current_proc
         if proc is None or proc.poll() is not None:
@@ -131,7 +128,7 @@ class AudioFeedback:
         except Exception:
             logger.warning("Audio cancel: process kill failed", exc_info=True)
 
-    def _worker_loop(self) -> None:
+    def worker_loop(self) -> None:
         """Serialize prompts; ``play`` generation changes preempt safely."""
         while True:
             with self._condition:
@@ -142,7 +139,7 @@ class AudioFeedback:
                 request = self._pending.pop(0)
                 self._active_request = request
             try:
-                self._play_one(request)
+                self.play_one(request)
             except Exception:
                 logger.warning("Audio failed; disabling playback", exc_info=True)
                 with self._condition:
@@ -154,7 +151,7 @@ class AudioFeedback:
                         self._active_request = None
                     self._condition.notify_all()
 
-    def _play_one(self, request: _AudioRequest) -> None:
+    def play_one(self, request: AudioRequest) -> None:
         with self._condition:
             if request.generation != self._generation or self._closed:
                 return
@@ -173,7 +170,9 @@ class AudioFeedback:
             with self._condition:
                 cancelled = request.generation != self._generation or self._closed
             if not cancelled and proc.returncode:
-                detail = " ".join(stderr.decode("utf-8", errors="replace").split())[:_STDERR_LOG_LIMIT]
+                detail = " ".join(stderr.decode("utf-8", errors="replace").split())[
+                    :_STDERR_LOG_LIMIT
+                ]
                 raise RuntimeError(f"{player} exited {proc.returncode}: {detail}")
         except BaseException:
             if proc is not None:

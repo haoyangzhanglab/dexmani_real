@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from itertools import combinations
 from pathlib import Path
 
 import cv2
@@ -77,7 +76,7 @@ class CalibrationConfig:
             raise ValueError("status_interval_frames must be at least 1")
 
 
-def _marker_poses(corners, ids, marker_points, intrinsics, distortion, *, target_id):
+def marker_poses(corners, ids, marker_points, intrinsics, distortion, *, target_id):
     if ids is None:
         return
     for corner, marker_id in zip(corners, ids.flatten()):
@@ -100,8 +99,12 @@ def detect_aruco_pose(
     gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = detector.detectMarkers(gray)
 
-    for ok, rv, tv in _marker_poses(
-        corners, ids, marker_corners, intrinsics, distortion,
+    for ok, rv, tv in marker_poses(
+        corners,
+        ids,
+        marker_corners,
+        intrinsics,
+        distortion,
         target_id=target_id,
     ):
         if not ok or rv is None or tv is None:
@@ -138,8 +141,13 @@ def draw_calibration_overlay(
     detected = False
     if ids is not None and len(ids) > 0:
         cv2.aruco.drawDetectedMarkers(image, corners, ids)
-        for ok, rv, tv in _marker_poses(
-            corners, ids, marker_corners, intrinsics, distortion, target_id=target_id,
+        for ok, rv, tv in marker_poses(
+            corners,
+            ids,
+            marker_corners,
+            intrinsics,
+            distortion,
+            target_id=target_id,
         ):
             if ok:
                 cv2.drawFrameAxes(image, intrinsics, distortion, rv, tv, marker_size_m * 0.5)
@@ -162,7 +170,7 @@ def draw_calibration_overlay(
     return image
 
 
-def _calibrate_eye_to_hand(
+def calibrate_eye_to_hand(
     tvec_ee2base: tuple[np.ndarray, ...],
     rpy_ee2base: tuple[np.ndarray, ...],
     rvec_marker2camera: tuple[np.ndarray, ...],
@@ -193,7 +201,7 @@ def _calibrate_eye_to_hand(
     return T
 
 
-def _compute_closed_loop_errors(
+def compute_closed_loop_errors(
     T_base_camera: np.ndarray,
     tvec_ee2base: tuple[np.ndarray, ...],
     rpy_ee2base: tuple[np.ndarray, ...],
@@ -232,9 +240,7 @@ def _compute_closed_loop_errors(
     return residuals_mm, residuals_deg
 
 
-def _check_hand_eye_excitation(
-    rpy_ee2base, *, min_relative_rotation_deg, min_axis_separation_deg
-):
+def check_hand_eye_excitation(rpy_ee2base, *, min_relative_rotation_deg, min_axis_separation_deg):
     """Require two-axis excitation of admitted samples; do not impose three-axis rank."""
     rotations = Rotation.from_euler("xyz", rpy_ee2base).as_matrix()
     axes, angles = [], []
@@ -246,15 +252,31 @@ def _check_hand_eye_excitation(
                 axes.append(vector / angle)
                 angles.append(float(np.degrees(angle)))
     # Any qualifying axis pair is sufficient; opposite axes describe the same direction.
-    for axis, other in combinations(axes, 2):
-        separation = float(np.degrees(np.arccos(np.clip(abs(axis @ other), 0, 1))))
-        if separation >= min_axis_separation_deg:
+    axes_array = np.asarray(axes)
+    # Lexicographic pair order preserves the original first witness. Memory is
+    # bounded by 1024 axes, while the worst-case arithmetic remains O(N^4).
+    for index, axis in enumerate(axes):
+        for start in range(index + 1, len(axes), 1024):
+            block = axes_array[start : start + 1024]
+            dots = np.abs(block @ axis)
+            separations = np.degrees(np.arccos(np.clip(dots, 0, 1)))
+            # Recheck scalar threshold endpoints to preserve the first witness despite BLAS rounding.
+            near = np.abs(dots - np.cos(np.deg2rad(min_axis_separation_deg))) <= 1e-14
+            candidates = np.flatnonzero((separations >= min_axis_separation_deg) | near)
+            witness = None
+            for offset in candidates:
+                separation = float(np.degrees(np.arccos(np.clip(abs(axis @ block[offset]), 0, 1))))
+                if separation >= min_axis_separation_deg:
+                    witness = separation
+                    break
+            if witness is None:
+                continue
             return dict(
                 sample_count=len(rotations),
                 valid_relative_motion_count=len(axes),
                 relative_rotation_min_deg=min(angles),
                 relative_rotation_max_deg=max(angles),
-                axis_separation_witness_deg=separation,
+                axis_separation_witness_deg=witness,
                 min_relative_rotation_deg=min_relative_rotation_deg,
                 min_axis_separation_deg=min_axis_separation_deg,
             )
@@ -273,56 +295,67 @@ class HandEyeResult:
     excitation: dict[str, float | int]
 
 
-def calibrate_and_select(samples: CalibrationSamples, config: CalibrationConfig) -> HandEyeResult:
-    """Select the lowest-position-RMS candidate passing both limits."""
-    if len(samples) < config.min_samples:
-        raise ValueError(f"need at least {config.min_samples} samples, have {len(samples)}")
-    tvec_ee2base, rpy_ee2base, rvec_marker2camera, tvec_marker2camera = zip(*samples.pairs)
-    excitation = _check_hand_eye_excitation(
-        rpy_ee2base,
-        min_relative_rotation_deg=config.min_relative_rotation_deg,
-        min_axis_separation_deg=config.min_axis_separation_deg,
-    )
-    best = None
-    table: list[tuple[str, float]] = []
+class HandEyeCalibrator:
+    """Select a hand-eye solution using configured excitation and quality limits."""
 
-    for name, m in _HAND_EYE_METHODS.items():
-        try:
-            T = _calibrate_eye_to_hand(
-                tvec_ee2base,
-                rpy_ee2base,
-                rvec_marker2camera,
-                tvec_marker2camera,
-                method=m,
-            )
-            # Check OpenCV's candidate once before composing it with the sample rotations.
-            T = validate_rigid_transform(T, label="hand-eye candidate")
-            errors_mm, errors_deg = _compute_closed_loop_errors(
-                T,
-                tvec_ee2base,
-                rpy_ee2base,
-                rvec_marker2camera,
-                tvec_marker2camera,
-            )
-            rms_mm = float(np.sqrt(np.mean(errors_mm**2)))
-            rms_deg = float(np.sqrt(np.mean(errors_deg**2)))
-            if not np.isfinite(rms_mm) or not np.isfinite(rms_deg):
-                raise ValueError("nonfinite hand-eye quality score")
-        except (cv2.error, ValueError):
-            table.append((name, float("nan")))
-            continue
-        table.append((name, rms_mm))
-        if rms_mm > config.max_consistency_rms_mm or rms_deg > config.max_consistency_rot_rms_deg:
-            continue
-        if best is None or (rms_mm, rms_deg) < best[:2]:
-            best = (rms_mm, rms_deg, name, T, errors_mm, errors_deg)
+    def __init__(self, config: CalibrationConfig):
+        self.config = config
 
-    if best is None:
-        raise ValueError("no hand-eye candidate passed both quality limits")
-    rms_mm, rms_deg, name_best, T_best, errors_mm_best, errors_deg_best = best
-    return HandEyeResult(
-        T_best, name_best, errors_mm_best, errors_deg_best, table, rms_mm, rms_deg, excitation
-    )
+    def solve(self, samples: CalibrationSamples) -> HandEyeResult:
+        """Select the lowest-position-RMS candidate passing both limits."""
+        if len(samples) < self.config.min_samples:
+            raise ValueError(
+                f"need at least {self.config.min_samples} samples, have {len(samples)}"
+            )
+        tvec_ee2base, rpy_ee2base, rvec_marker2camera, tvec_marker2camera = zip(*samples.pairs)
+        excitation = check_hand_eye_excitation(
+            rpy_ee2base,
+            min_relative_rotation_deg=self.config.min_relative_rotation_deg,
+            min_axis_separation_deg=self.config.min_axis_separation_deg,
+        )
+        best = None
+        table: list[tuple[str, float]] = []
+
+        for name, m in _HAND_EYE_METHODS.items():
+            try:
+                T = calibrate_eye_to_hand(
+                    tvec_ee2base,
+                    rpy_ee2base,
+                    rvec_marker2camera,
+                    tvec_marker2camera,
+                    method=m,
+                )
+                # Check OpenCV's candidate once before composing it with the sample rotations.
+                T = validate_rigid_transform(T, label="hand-eye candidate")
+                errors_mm, errors_deg = compute_closed_loop_errors(
+                    T,
+                    tvec_ee2base,
+                    rpy_ee2base,
+                    rvec_marker2camera,
+                    tvec_marker2camera,
+                )
+                rms_mm = float(np.sqrt(np.mean(errors_mm**2)))
+                rms_deg = float(np.sqrt(np.mean(errors_deg**2)))
+                if not np.isfinite(rms_mm) or not np.isfinite(rms_deg):
+                    raise ValueError("nonfinite hand-eye quality score")
+            except (cv2.error, ValueError):
+                table.append((name, float("nan")))
+                continue
+            table.append((name, rms_mm))
+            if (
+                rms_mm > self.config.max_consistency_rms_mm
+                or rms_deg > self.config.max_consistency_rot_rms_deg
+            ):
+                continue
+            if best is None or (rms_mm, rms_deg) < best[:2]:
+                best = (rms_mm, rms_deg, name, T, errors_mm, errors_deg)
+
+        if best is None:
+            raise ValueError("no hand-eye candidate passed both quality limits")
+        rms_mm, rms_deg, name_best, T_best, errors_mm_best, errors_deg_best = best
+        return HandEyeResult(
+            T_best, name_best, errors_mm_best, errors_deg_best, table, rms_mm, rms_deg, excitation
+        )
 
 
 @dataclass

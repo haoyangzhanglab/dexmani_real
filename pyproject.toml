@@ -15,7 +15,7 @@ dependencies = [
     "zarr>=2.16,<3",
     "av>=10",
     "opencv-python>=4.8",
-    "transforms3d>=0.4",
+    "fpsample==0.3.3",
     "tqdm",
 ]
 

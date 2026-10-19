@@ -1,12 +1,9 @@
-"""Pinocchio gradients ported from TAG/Retargeting/Hand_Retargeting/utils/pin_grad.py.
-FreeFlyer q=[XYZ(3),xyzw(4),joints]; Jacobian[:,6:] omits its six velocity DOFs.
-"""
+"""TAG FreeFlyer gradients: q=[XYZ(3),xyzw(4),joints]; Jacobian[:,6:] omits base velocities."""
 
 from __future__ import annotations
 
 import numpy as np
 import pinocchio as pin
-
 
 _FINGERTIP_ORDER = ("thumb", "index", "mid", "ring", "pinky")
 
@@ -48,16 +45,14 @@ class PinGrad:
 
     def update_kinematics(self, qpos_floating: np.ndarray) -> None:
         """Update FK and Jacobians from (7 + dof,) coordinates with a FreeFlyer base."""
-        pin.forwardKinematics(self.model, self.data, qpos_floating)
-        pin.updateFramePlacements(self.model, self.data)
         pin.computeJointJacobians(self.model, self.data, qpos_floating)
+        pin.updateFramePlacements(self.model, self.data)
 
     def compute_position_gradient(
         self, qpos_floating: np.ndarray, target_pos: np.ndarray
     ) -> tuple[np.ndarray, float]:
-        """Joint-only ∇loss for Σ||FK_tip(q)-target||² with finite URDF-frame targets.
-        q=[FreeFlyer(7),joints(12)]; the base stays fixed during optimization.
-        """
+        """Joint-only ∇loss for Σ||FK_tip(q)-target||² in the URDF frame.
+        The FreeFlyer base stays fixed; q=[XYZ(3),xyzw(4),joints(12)]."""
         self.update_kinematics(qpos_floating)
 
         grad = np.zeros(self.dof, dtype=np.float64)

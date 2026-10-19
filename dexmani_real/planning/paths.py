@@ -19,7 +19,7 @@ _PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=b
 WORKSPACE_BOUNDS_TOLERANCE_M = 1e-3
 
 
-def _table_clearance_m(
+def table_clearance_m(
     planner: "XArm7MotionPlanner",
     arm_qpos: np.ndarray,
     *,
@@ -97,7 +97,7 @@ def wrap_nearest_equivalent(
     return result
 
 
-def _check_home_path(
+def check_home_path(
     path: np.ndarray,
     planner: "XArm7MotionPlanner",
     *,
@@ -122,8 +122,9 @@ def _check_home_path(
     table_samples = []
     for index, waypoint in enumerate(path):
         try:
-            clearance, measurement, source = _table_clearance_m(
-                planner, waypoint,
+            clearance, measurement, source = table_clearance_m(
+                planner,
+                waypoint,
                 table_z_surface_m=table_z_surface_m,
                 hand_safety_margin_m=hand_safety_margin_m,
             )
@@ -160,7 +161,7 @@ def _check_home_path(
     )
 
 
-def _unique_milestones(*points: np.ndarray) -> np.ndarray:
+def unique_milestones(*points: np.ndarray) -> np.ndarray:
     unique = [np.asarray(points[0], dtype=np.float64)]
     for point in points[1:]:
         point = np.asarray(point, dtype=np.float64)
@@ -169,7 +170,7 @@ def _unique_milestones(*points: np.ndarray) -> np.ndarray:
     return np.asarray(unique, dtype=np.float64)
 
 
-def _home_joint_vector(value, name):
+def home_joint_vector(value, name):
     value = np.asarray(value, dtype=np.float64)
     if value.shape != ARM_JOINT_SHAPE or not np.isfinite(value).all():
         raise ValueError(f"{name} must be finite shape (7,)")
@@ -186,8 +187,8 @@ def compute_joint_home_path(
     use_canonical_target: bool = False,
 ) -> np.ndarray:
     """Return admitted milestones, an empty (0,7) path if home, or raise ValueError."""
-    qpos = _home_joint_vector(qpos, "current qpos")
-    home_qpos = _home_joint_vector(home_qpos, "home qpos")
+    qpos = home_joint_vector(qpos, "current qpos")
+    home_qpos = home_joint_vector(home_qpos, "home qpos")
     if use_canonical_target:
         # Absolute HOME deltas preserve equivalent-joint band mismatches.
         target = home_qpos
@@ -202,8 +203,9 @@ def compute_joint_home_path(
 
     def admitted(milestones, name):
         try:
-            _check_home_path(
-                interpolate_waypoints(milestones, np.deg2rad(1.0)), planner,
+            check_home_path(
+                interpolate_waypoints(milestones, np.deg2rad(1.0)),
+                planner,
                 table_z_surface_m=table_z_surface_m,
                 hand_safety_margin_m=hand_safety_margin_m,
                 allow_table_soft_escape=True,
@@ -218,12 +220,12 @@ def compute_joint_home_path(
         return direct
     mid = qpos.copy()
     mid[_PROXIMAL_MASK] = target[_PROXIMAL_MASK]
-    proximal = _unique_milestones(qpos, mid, target)
+    proximal = unique_milestones(qpos, mid, target)
     if admitted(proximal, "proximal_first"):
         return proximal
     mid = qpos.copy()
     mid[~_PROXIMAL_MASK] = target[~_PROXIMAL_MASK]
-    distal = _unique_milestones(qpos, mid, target)
+    distal = unique_milestones(qpos, mid, target)
     if admitted(distal, "distal_first"):
         return distal
 
@@ -251,15 +253,16 @@ def compute_band_alignment_path(
     hand_safety_margin_m: float,
 ) -> np.ndarray:
     """Admit absolute equivalent-angle alignment without table soft escape."""
-    wrapped_home = _home_joint_vector(wrapped_home, "wrapped home")
-    canonical_home = _home_joint_vector(canonical_home, "canonical home")
+    wrapped_home = home_joint_vector(wrapped_home, "wrapped home")
+    canonical_home = home_joint_vector(canonical_home, "canonical home")
     delta = np.rad2deg(np.abs(wrapped_home - canonical_home))
     if not np.any(delta[planner.kin.equivalent_joint_mask] > 1.0):
         return np.empty((0, 7), dtype=np.float64)
     milestones = np.stack([wrapped_home, canonical_home])
     try:
-        _check_home_path(
-            interpolate_waypoints(milestones, np.deg2rad(1.0)), planner,
+        check_home_path(
+            interpolate_waypoints(milestones, np.deg2rad(1.0)),
+            planner,
             table_z_surface_m=table_z_surface_m,
             hand_safety_margin_m=hand_safety_margin_m,
             allow_table_soft_escape=False,

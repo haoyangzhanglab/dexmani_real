@@ -1,8 +1,4 @@
-"""Narrow adapter for a separately prepared FoundationPose checkout and environment.
-
-The upstream code uses global imports and initializes CUDA. Construct this class
-only in the standalone example process, never in a robot runtime import path.
-"""
+"""FoundationPose adapter with process-local CUDA imports; construct only in the standalone owner."""
 
 import importlib
 from pathlib import Path
@@ -11,8 +7,8 @@ import subprocess
 
 import numpy as np
 
+from .io import sha256
 from .geometry import validate_pose, validate_rgbd
-from .io import _sha256
 
 
 def validate_foundationpose_root(root):
@@ -23,58 +19,55 @@ def validate_foundationpose_root(root):
         required.extend((f"weights/{run}/config.yml", f"weights/{run}/model_best.pth"))
     missing = [name for name in required if not (root / name).is_file()]
     if missing:
-        raise FileNotFoundError(f"FoundationPose source/weights missing under {root}: {', '.join(missing)}")
+        raise FileNotFoundError(
+            f"FoundationPose source/weights missing under {root}: {', '.join(missing)}"
+        )
     return root
 
 
-PLUS_REVISION = '58aa7154de23ae86d542366858fc6bcca3b747b0'
+PLUS_REVISION = "58aa7154de23ae86d542366858fc6bcca3b747b0"
 
 
 def prepare_tracking_frame(rgb, depth_m, intrinsics):
-    """Same upstream filters, once per frame; never modify measured cloud depth.
-
-    The scene owner shares these tensors only across objects in this source frame.
-    Registration retains upstream's own initialization/preprocessing path.
-    """
+    """Share upstream tracking tensors within one frame; registration keeps its own preprocessing."""
     import torch
     from Utils import erode_depth, bilateral_filter_depth, depth2xyzmap_batch
 
-    depth = torch.as_tensor(depth_m, device='cuda', dtype=torch.float)
-    depth = erode_depth(depth, radius=2, device='cuda')
-    depth = bilateral_filter_depth(depth, radius=2, device='cuda')
-    K = torch.as_tensor(intrinsics, device='cuda', dtype=torch.float)
+    depth = torch.as_tensor(depth_m, device="cuda", dtype=torch.float)
+    depth = erode_depth(depth, radius=2, device="cuda")
+    depth = bilateral_filter_depth(depth, radius=2, device="cuda")
+    K = torch.as_tensor(intrinsics, device="cuda", dtype=torch.float)
     xyz_map = depth2xyzmap_batch(depth[None], K[None], zfar=np.inf)[0]
-    return dict(rgb=torch.as_tensor(rgb, device='cuda', dtype=torch.float), depth=depth, xyz_map=xyz_map)
+    return dict(
+        rgb=torch.as_tensor(rgb, device="cuda", dtype=torch.float), depth=depth, xyz_map=xyz_map
+    )
 
 
 def guide_centered_pose(pose_camera_centered, intrinsics, mask):
-    """FoundationPose++ 2D guidance on the *centered mesh*, before refinement.
-
-    Preserve previous z and rotation. Bbox center is a 2D guide, not a measured
-    3D centroid; depth holes must never be sampled or filled to create this guide.
-    External T_camera_asset = T_camera_centered @ T_centered_asset.
-    """
+    """Guide the centered mesh from the 2-D bbox, preserving previous Z and rotation.
+    T_camera_asset = T_camera_centered @ T_centered_asset; never fill depth to infer a centroid."""
     pose = validate_pose(pose_camera_centered).copy()
     K, mask = np.asarray(intrinsics), np.asarray(mask)
     if mask.ndim != 2 or mask.dtype != np.bool_ or not mask.any():
-        raise ValueError('2D guidance requires a nonempty exclusive bool mask')
+        raise ValueError("2D guidance requires a nonempty exclusive bool mask")
     if K.shape != (3, 3) or not np.isfinite(K).all() or K[0, 0] <= 0 or K[1, 1] <= 0:
-        raise ValueError('Invalid camera intrinsics for 2D guidance')
+        raise ValueError("Invalid camera intrinsics for 2D guidance")
     z = pose[2, 3]
     if z <= 0:
-        raise ValueError('Previous centered pose must be in front of the camera')
+        raise ValueError("Previous centered pose must be in front of the camera")
     rows, cols = np.nonzero(mask)
-    center = np.array([(cols.min() + cols.max()) / 2., (rows.min() + rows.max()) / 2., 1.])
+    center = np.array([(cols.min() + cols.max()) / 2.0, (rows.min() + rows.max()) / 2.0, 1.0])
     ray = np.linalg.solve(K, center)
     if not np.isfinite(ray).all() or ray[2] <= 0:
-        raise ValueError('Invalid bbox-center camera ray')
+        raise ValueError("Invalid bbox-center camera ray")
     pose[:2, 3] = (ray * (z / ray[2]))[:2]
     return pose
 
 
 class FoundationPosePlusTracker:
-    def __init__(self, root, mesh, debug_dir, register_iterations=5, track_iterations=2,
-                 *, shared_with=None):
+    def __init__(
+        self, root, mesh, debug_dir, register_iterations=5, track_iterations=2, *, shared_with=None
+    ):
         self.root = validate_foundationpose_root(root)
         for value in (register_iterations, track_iterations):
             if not isinstance(value, int) or value <= 0:
@@ -85,34 +78,49 @@ class FoundationPosePlusTracker:
         self._intrinsics = None
         self._image_shape = None
         self._source_revision = subprocess.check_output(
-            ['git', '-C', str(self.root), 'rev-parse', 'HEAD'], text=True).strip()
-        self._weight_hashes = (shared_with._weight_hashes if shared_with is not None else {
-            str(path.relative_to(self.root)): _sha256(path)
-            for run in ('2023-10-28-18-33-37', '2024-01-11-20-02-45')
-            for path in (self.root / 'weights' / run / 'model_best.pth',
-                         self.root / 'weights' / run / 'config.yml')})
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True
+        ).strip()
+        self._weight_hashes = (
+            shared_with._weight_hashes
+            if shared_with is not None
+            else {
+                str(path.relative_to(self.root)): sha256(path)
+                for run in ("2023-10-28-18-33-37", "2024-01-11-20-02-45")
+                for path in (
+                    self.root / "weights" / run / "model_best.pth",
+                    self.root / "weights" / run / "config.yml",
+                )
+            }
+        )
 
         import torch
 
         if not torch.cuda.is_available():
-            raise RuntimeError("FoundationPose requires CUDA; input validation alone does not run tracking")
+            raise RuntimeError(
+                "FoundationPose requires CUDA; input validation alone does not run tracking"
+            )
         # Upstream uses generic module names. Refuse a mixture of different checkouts.
         for name in ("estimater", "Utils", "learning", "datareader"):
             existing = sys.modules.get(name)
             if existing is not None:
                 source = getattr(existing, "__file__", None)
                 locations = [source] if source else list(getattr(existing, "__path__", ()))
-                if not locations or any(not Path(path).resolve().is_relative_to(self.root) for path in locations):
-                    raise RuntimeError(f"Module {name!r} is already loaded outside {self.root}; use a fresh process")
+                if not locations or any(
+                    not Path(path).resolve().is_relative_to(self.root) for path in locations
+                ):
+                    raise RuntimeError(
+                        f"Module {name!r} is already loaded outside {self.root}; use a fresh process"
+                    )
         sys.path.insert(0, str(self.root))
         estimator_module = importlib.import_module("estimater")
         import nvdiffrast.torch as dr
 
-        # Scene objects run sequentially on one owner. Share immutable network
-        # weights and raster context, while retaining each object's mesh/pose.
+        # Share immutable weights/context on one owner; each object retains its own mesh and pose.
         if shared_with is not None and shared_with.root != self.root:
             raise ValueError("Shared FoundationPose weights must use the same checkout")
-        self._context = shared_with._context if shared_with is not None else dr.RasterizeCudaContext()
+        self._context = (
+            shared_with._context if shared_with is not None else dr.RasterizeCudaContext()
+        )
         # Upstream samples vertices for mesh diameter before register() seeds RNG.
         # Diameter changes crop windows and voxelization. Keep it repeatable per
         # asset, independent of object order, and restore the caller's NumPy RNG.
@@ -141,7 +149,10 @@ class FoundationPosePlusTracker:
         # An upstream early return must not preserve a previous registration.
         self._estimator.pose_last = None
         pose = self._estimator.register(
-            K=intrinsics, rgb=rgb, depth=depth_m, ob_mask=mask,
+            K=intrinsics,
+            rgb=rgb,
+            depth=depth_m,
+            ob_mask=mask,
             iteration=self.register_iterations,
         )
         if self._estimator.pose_last is None:
@@ -158,37 +169,60 @@ class FoundationPosePlusTracker:
             raise RuntimeError("Register an object before tracking")
         try:
             rgb, depth_m, intrinsics, mask = validate_rgbd(rgb, depth_m, intrinsics, mask)
-            if depth_m.shape != self._image_shape or not np.array_equal(intrinsics, self._intrinsics):
-                raise ValueError("Image shape/intrinsics changed; start a new explicit registration")
+            if depth_m.shape != self._image_shape or not np.array_equal(
+                intrinsics, self._intrinsics
+            ):
+                raise ValueError(
+                    "Image shape/intrinsics changed; start a new explicit registration"
+                )
             if mask is None or np.count_nonzero(mask & (depth_m >= 0.001)) < 4:
                 raise ValueError("Tracking requires current exclusive mask and valid depth")
             import torch
+
             previous = self._estimator.pose_last
-            guided = guide_centered_pose(previous.detach().cpu().numpy().reshape(4, 4), intrinsics, mask)
+            guided = guide_centered_pose(
+                previous.detach().cpu().numpy().reshape(4, 4), intrinsics, mask
+            )
             self._estimator.pose_last = torch.as_tensor(
-                guided, dtype=previous.dtype, device=previous.device).reshape(previous.shape)
+                guided, dtype=previous.dtype, device=previous.device
+            ).reshape(previous.shape)
             estimator = self._estimator
-            # Same refiner call as upstream track_one, with this frame's shared
-            # tensors. Only centered-mesh poses enter refinement.
+            # Refine centered-mesh poses using the upstream call and this frame's shared tensors.
             pose, _ = estimator.refiner.predict(
-                **prepared_frame, K=intrinsics, iteration=self.track_iterations,
+                **prepared_frame,
+                K=intrinsics,
+                iteration=self.track_iterations,
                 ob_in_cams=estimator.pose_last.reshape(1, 4, 4).detach().cpu().numpy(),
-                normal_map=None, mesh=estimator.mesh, mesh_tensors=estimator.mesh_tensors,
-                mesh_diameter=estimator.diameter, glctx=estimator.glctx, get_vis=False,
+                normal_map=None,
+                mesh=estimator.mesh,
+                mesh_tensors=estimator.mesh_tensors,
+                mesh_diameter=estimator.diameter,
+                glctx=estimator.glctx,
+                get_vis=False,
             )
             estimator.pose_last = pose
-            return validate_pose((pose @ estimator.get_tf_to_centered_mesh()).detach().cpu().numpy().reshape(4, 4))
+            return validate_pose(
+                (pose @ estimator.get_tf_to_centered_mesh()).detach().cpu().numpy().reshape(4, 4)
+            )
         except Exception:
             self._registered = False
             raise
 
     @property
     def provenance(self):
-        return dict(method='FoundationPose++ core: mask 2D bbox guidance + FoundationPose refinement',
-                    guidance_revision=PLUS_REVISION, kalman=False, depth_guidance='previous centered-mesh z',
-                    bbox='inclusive mask min/max midpoint', foundationpose_root=str(self.root),
-                    foundationpose_revision=self._source_revision, weight_sha256=self._weight_hashes,
-                    register_iterations=self.register_iterations, track_iterations=self.track_iterations,
-                    tracking_preprocessing='shared per source frame; upstream erosion/bilateral radius=2 and XYZ',
-                    object_initialization_numpy_seed=0, model_diameter_m=float(self._estimator.diameter),
-                    pose_frame='camera_from_original_asset; upstream centered mesh stays internal')
+        return dict(
+            method="FoundationPose++ core: mask 2D bbox guidance + FoundationPose refinement",
+            guidance_revision=PLUS_REVISION,
+            kalman=False,
+            depth_guidance="previous centered-mesh z",
+            bbox="inclusive mask min/max midpoint",
+            foundationpose_root=str(self.root),
+            foundationpose_revision=self._source_revision,
+            weight_sha256=self._weight_hashes,
+            register_iterations=self.register_iterations,
+            track_iterations=self.track_iterations,
+            tracking_preprocessing="shared per source frame; upstream erosion/bilateral radius=2 and XYZ",
+            object_initialization_numpy_seed=0,
+            model_diameter_m=float(self._estimator.diameter),
+            pose_frame="camera_from_original_asset; upstream centered mesh stays internal",
+        )

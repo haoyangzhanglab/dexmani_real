@@ -3,6 +3,7 @@
 import logging
 import time
 from concurrent.futures import CancelledError
+from enum import Enum
 
 from dexmani_real.recording.recorder import RecordingError, snapshot_recording_metadata
 from dexmani_real.robot.home import home_robot, home_hand
@@ -11,11 +12,18 @@ from dexmani_real.runtime.observation import feedback_deadline_ns, read_observat
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.state import RunEndReason, SafetyState
 from dexmani_real.teleop.audio_feedback import AudioFeedback
-from dexmani_real.utils.control_clock import sampling_clock_ns
-
+from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
 _END_AUDIO_GRACE_S = 3.0
+
+
+class TeleopPhase(str, Enum):
+    IDLE = "idle"
+    PREPARING = "preparing"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    QUIT_PENDING = "quit_pending"
 
 
 class TeleopRunner:
@@ -23,7 +31,7 @@ class TeleopRunner:
 
     def __init__(
         self,
-        shared,
+        runtime_state,
         runtime,
         robot,
         *,
@@ -34,7 +42,7 @@ class TeleopRunner:
         recorder,
         camera_calibration=None,
     ):
-        self.shared = shared
+        self.runtime_state = runtime_state
         self.robot = robot
         self.start_vr = start_vr
         self.camera_calibration = camera_calibration
@@ -42,40 +50,43 @@ class TeleopRunner:
         self.runtime = runtime
         self.recorder = recorder
         self.keyboard = KeyboardInput(
-            estop_callback=shared.request_emergency_stop,
-            stop_callback=lambda: shared.revoke_motion(reason=RunEndReason.OPERATOR),
-            quit_callback=lambda: shared.revoke_motion(reason=RunEndReason.QUIT),
+            estop_callback=runtime_state.request_emergency_stop,
+            stop_callback=runtime_state.request_stop,
+            quit_callback=lambda: runtime_state.request_stop(reason=RunEndReason.QUIT),
         )
         self.audio = AudioFeedback()
         self.controller = controller
-        self.active = False
-        self.paused = False
+        self.phase = TeleopPhase.IDLE
+        # BEGIN/RESUME context survives preparation and the quit/save choice.
+        self.resume_context = False
         self.preparing_epoch = None
         self.resume_after_ns = 0
-        self.quit_pending = False
         self.pending_termination_reason = None
         self.termination_details = []
         self.control_run_id = None
-        self.next_tick_ns = 0
         self.tick_origin_ns = None
         self.tick_index = 0
-        self.control_dt_ns, _ = sampling_clock_ns(
-            self.runtime.teleop.control_hz
-        )
+        self.control_dt_ns, _ = sampling_clock_ns(self.runtime.teleop.control_hz)
         self.capture_started_s = 0.0
 
         self.home_planner = home_planner
 
-    def _end_reason(self, fallback):
-        with self.shared.motion_lock:
+    @property
+    def next_tick_ns(self):
+        if self.tick_origin_ns is None:
+            return None
+        return self.tick_origin_ns + self.tick_index * self.control_dt_ns
+
+    def end_reason(self, fallback):
+        with self.runtime_state.motion_lock:
             if (
                 self.control_run_id is not None
-                and self.shared.run_ended_id == self.control_run_id
+                and self.runtime_state.run_ended_id == self.control_run_id
             ):
-                return self.shared.run_ended_reason.name.lower()
+                return self.runtime_state.run_ended_reason.name.lower()
         return fallback
 
-    def _stop_motion(self, stage):
+    def stop_motion(self, stage):
         try:
             self.robot.stop()
         except Exception as exc:
@@ -84,34 +95,39 @@ class TeleopRunner:
             )
             raise
 
-    def _pause_control(self, reason, *, run_end_reason=RunEndReason.OPERATOR):
-        self.shared.revoke_motion(reason=run_end_reason)
+    def pause_control(self, reason, *, run_end_reason=RunEndReason.OPERATOR):
+        self.runtime_state.revoke_motion(reason=run_end_reason)
         if self.pending_termination_reason is None:
-            self.pending_termination_reason = self._end_reason(reason)
+            self.pending_termination_reason = self.end_reason(reason)
         self.termination_details.append(dict(stage="termination", reason=reason))
-        self._stop_motion("pause_stop")
+        stopped_epoch = self.runtime_state.run_id
+        self.stop_motion("pause_stop")
+        self.runtime_state.acknowledge_stop(stopped_epoch)
         self.controller.clear_reference()
-        self.paused = True
+        self.phase = TeleopPhase.PAUSED
         self.preparing_epoch = None
 
-    def _end_segment(self, save, reason, *, announce=True):
+    def end_segment(self, save, reason, *, announce=True):
         """Called only after revocation/stop, including sessions without a recorder."""
-        self._finish_capture(save, reason, announce=announce)
-        self.active = self.paused = self.quit_pending = False
+        self.finish_capture(save, reason, announce=announce)
+        self.phase = TeleopPhase.IDLE
+        self.resume_context = False
         self.preparing_epoch = self.control_run_id = None
 
-    def _finish_capture(self, save, reason, *, announce=True) -> None:
+    def finish_capture(self, save, reason, *, announce=True) -> None:
         if self.recorder is None or not self.recorder.is_recording:
             self.pending_termination_reason = None
             self.termination_details = []
             return
-        reason = self._end_reason(self.pending_termination_reason or reason)
+        reason = self.end_reason(self.pending_termination_reason or reason)
         published = None
         if save:
             published = self.recorder.save_episode(
-                reason=reason, details=self.termination_details,
-                arm_execution=dict(self.robot.arm.execution_snapshot(),
-                                   robot_stopped=not self.robot.stop_required),
+                reason=reason,
+                details=self.termination_details,
+                arm_execution=dict(
+                    self.robot.arm.execution_snapshot(), robot_stopped=not self.robot.stop_required
+                ),
             )
         else:
             self.recorder.discard_episode(reason=reason)
@@ -120,13 +136,19 @@ class TeleopRunner:
         if announce:
             self.audio.play("save" if published is not None else "discard")
 
-    def _stop_capture(
-        self, reason, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY,
-        row=None, command=None, dispatch=None, timing=None,
+    def stop_capture(
+        self,
+        reason,
+        *,
+        run_end_reason=RunEndReason.EXECUTOR_BOUNDARY,
+        row=None,
+        command=None,
+        dispatch=None,
+        timing=None,
     ):
         failure = None
         try:
-            self._pause_control(reason, run_end_reason=run_end_reason)
+            self.pause_control(reason, run_end_reason=run_end_reason)
         except Exception as exc:
             failure = exc
         logger.warning("Teleop ended: %s", reason)
@@ -136,90 +158,101 @@ class TeleopRunner:
                 self.recorder.add_frame(row, command, dispatch, timing=timing)
         except Exception as exc:
             failure = failure or exc
-            self.termination_details.append(dict(
-                stage="recording", exception_type=type(exc).__name__, message=str(exc),
-            ))
+            self.termination_details.append(
+                dict(
+                    stage="recording",
+                    exception_type=type(exc).__name__,
+                    message=str(exc),
+                )
+            )
         try:
             if failure is None:
-                self._end_segment(True, reason, announce=False)
+                self.end_segment(True, reason, announce=False)
             else:
                 # Keep the fault visible; never advertise normal IDLE after stop failure.
-                self._finish_capture(True, reason, announce=False)
+                self.finish_capture(True, reason, announce=False)
         except Exception as exc:
             failure = failure or exc
         if failure is not None:
             raise failure
 
-    def _poll_blocking_commands(self, commands=()):
+    def poll_blocking_commands(self, commands=()):
         self.robot.check()
         aborted = False
         # Consume the batch tail; Q revokes HOME before blocking capture finalization.
         for cmd in (*commands, *self.keyboard.poll(timeout=0)):
-            if cmd in (OperatorCommand.EMERGENCY_STOP, OperatorCommand.QUIT,
-                       OperatorCommand.STOP, OperatorCommand.DISCARD):
-                self._handle_operator_command(cmd)
+            if cmd in (
+                OperatorCommand.EMERGENCY_STOP,
+                OperatorCommand.QUIT,
+                OperatorCommand.STOP,
+                OperatorCommand.DISCARD,
+            ):
+                self.handle_operator_command(cmd)
                 aborted = True
         return bool(
             aborted
-            or self.shared.estop_request
-            or self.shared.error_state
-            or self.shared.quit_requested
-            or not self.shared.running
+            or self.runtime_state.estop_request
+            or self.runtime_state.error_state
+            or self.runtime_state.quit_requested
+            or not self.runtime_state.running
         )
 
-    def _preparation_valid(self):
-        return self.shared.command_may_cross_sdk(
-            run_id=self.preparing_epoch, required_safety_state=SafetyState.ARMED,
+    def preparation_valid(self):
+        return self.runtime_state.command_may_cross_sdk(
+            run_id=self.preparing_epoch,
+            required_safety_state=SafetyState.ARMED,
         )
 
-    def _start_segment(self, expected_run_id):
+    def start_segment(self, expected_run_id):
         if self.preparing_epoch is not None:
             return
-        with self.shared.motion_lock:
+        with self.runtime_state.motion_lock:
             # Bind B/C to the generation from before poll, never to a later STOP.
-            if expected_run_id != self.shared.run_id:
+            if expected_run_id != self.runtime_state.run_id:
                 return
-            self.shared.revoke_motion()
-            self.preparing_epoch = self.shared.run_id
-        self._stop_motion("segment_stop")
-        self.paused = True
+            self.runtime_state.revoke_motion()
+            self.preparing_epoch = self.runtime_state.run_id
+        self.stop_motion("segment_stop")
+        self.phase = TeleopPhase.PREPARING
         if self.recorder is not None and self.recorder.is_recording:
-            self._finish_capture(True, "pause")
-        if not self._preparation_valid():
-            self._stop_capture("preparation_revoked")
+            self.finish_capture(True, "pause")
+        if not self.preparation_valid():
+            self.stop_capture("preparation_revoked")
             return
         self.robot.reset_hand_feedback()
         try:
             row = read_observation(
-                self.shared,
+                self.runtime_state,
                 self.runtime,
                 self.robot,
-                require_hand=self.runtime.policy.hand_enabled,
+                require_hand=self.runtime.control.hand_enabled,
                 require_camera=self.recorder is not None,
                 require_vr=True,
                 wait_for_hand=True,
                 cancel_requested=lambda: (
-                    self._poll_blocking_commands() or not self._preparation_valid()
+                    self.poll_blocking_commands() or not self.preparation_valid()
                 ),
             )
         except CancelledError:
-            # S/Q may already have finalized preparation in _poll_blocking_commands.
+            # S/Q may already have finalized preparation in poll_blocking_commands.
             if self.preparing_epoch is not None:
-                self._stop_capture("preparation_revoked")
+                self.stop_capture("preparation_revoked")
             return
-        if row is None or not self._preparation_valid():
+        if row is None or not self.preparation_valid():
             print("Start requires fresh robot, VR and recording resources", flush=True)
-            self._stop_capture("preparation_unavailable")
+            self.stop_capture("preparation_unavailable")
             return
         self.control_run_id = None
         if self.recorder is not None:
             self.recorder.start_episode(
                 task_label=self.task_label,
                 arm_execution=self.robot.arm.execution_snapshot(),
-                arm_control_metadata=self.robot.arm.execution_metadata(1 / self.recorder.control_hz),
+                arm_control_metadata=self.robot.arm.execution_metadata(
+                    1 / self.recorder.control_hz
+                ),
                 collection_source="teleop",
                 metadata=snapshot_recording_metadata(
-                    self.shared,
+                    self.runtime_state,
                     camera_calibration=self.camera_calibration,
                     hand=self.robot.hand,
                 ),
@@ -232,53 +265,54 @@ class TeleopRunner:
         except DispatchError as exc:
             if not exc.revoked:
                 raise
-            self._stop_capture("preparation_revoked")
+            self.stop_capture("preparation_revoked")
             return
         # Blocking finalization/START requires a fresh anchor; rows must not span an operator pause.
         self.resume_after_ns = time.monotonic_ns()
-        if not self._preparation_valid():
-            self._stop_capture("preparation_revoked")
+        if not self.preparation_valid():
+            self.stop_capture("preparation_revoked")
 
-    def _handle_operator_command(self, cmd, *, home_commands=(), expected_run_id=None) -> bool:
+    def handle_operator_command(self, cmd, *, home_commands=(), expected_run_id=None) -> bool:
         if cmd is OperatorCommand.EMERGENCY_STOP:
-            self.shared.request_emergency_stop()
+            self.runtime_state.request_emergency_stop()
             self.audio.play("emergency")
             return True
         if (
-            self.shared.estop_request
-            or self.shared.error_state
-            or self.shared.quit_requested
-            or not self.shared.running
+            self.runtime_state.estop_request
+            or self.runtime_state.error_state
+            or self.runtime_state.quit_requested
+            or not self.runtime_state.running
         ):
             return True
         if cmd is OperatorCommand.QUIT:
-            was_idle = not self.active and self.preparing_epoch is None and not self.quit_pending
-            self._pause_control("quit", run_end_reason=RunEndReason.QUIT)
+            was_quit_pending = self.phase is TeleopPhase.QUIT_PENDING
+            was_idle = self.phase is TeleopPhase.IDLE
+            self.pause_control("quit", run_end_reason=RunEndReason.QUIT)
             has_capture = self.recorder is not None and self.recorder.is_recording
-            if self.quit_pending or (was_idle and not has_capture):
+            if was_quit_pending or (was_idle and not has_capture):
                 if has_capture:
-                    self._end_segment(True, "quit", announce=False)
+                    self.end_segment(True, "quit", announce=False)
                 self.audio.play("end")
-                self.shared.quit_requested = True
+                self.runtime_state.request_quit()
                 return True
-            self.quit_pending = True
+            self.phase = TeleopPhase.QUIT_PENDING
             self.audio.play("quit")
         elif cmd in (OperatorCommand.STOP, OperatorCommand.DISCARD):
             reason = cmd.value.lower()
-            self._pause_control(reason)
-            self._end_segment(cmd is OperatorCommand.STOP, reason)
+            self.pause_control(reason)
+            self.end_segment(cmd is OperatorCommand.STOP, reason)
         elif cmd is OperatorCommand.RESET_TACTILE:
             if (
                 self.preparing_epoch is not None
-                or (self.active and not self.paused)
+                or self.phase is TeleopPhase.ACTIVE
                 or (self.recorder is not None and self.recorder.is_recording)
-                or self.shared.safety_state != SafetyState.ARMED
+                or self.runtime_state.safety_state != SafetyState.ARMED
             ):
                 logger.warning("T ignored: tactile reset requires idle, no capture or preparation")
                 return False
             try:
                 logger.info("正在请求触觉传感器复位，请保持手部无接触；S/Q/Esc 可中断后续请求。")
-                self.robot.reset_tactile_sensors(cancel_requested=self._poll_blocking_commands)
+                self.robot.reset_tactile_sensors(cancel_requested=self.poll_blocking_commands)
             except CancelledError as exc:
                 logger.info("%s", exc)
             finally:
@@ -286,16 +320,16 @@ class TeleopRunner:
                 self.keyboard.drain_signal(OperatorCommand.BEGIN)
             return True
         elif cmd is OperatorCommand.HOME:
-            self._pause_control("home")
-            self._end_segment(True, "home")
-            if not self._poll_blocking_commands(home_commands):
+            self.pause_control("home")
+            self.end_segment(True, "home")
+            if not self.poll_blocking_commands(home_commands):
                 self.audio.play("home")
                 result = home_robot(
-                    self.shared,
+                    self.runtime_state,
                     self.runtime,
                     self.home_planner,
                     robot=self.robot,
-                    abort_requested=self._poll_blocking_commands,
+                    abort_requested=self.poll_blocking_commands,
                 )
                 if result.ok:
                     self.audio.play("home_done", interrupt=False)
@@ -303,24 +337,31 @@ class TeleopRunner:
                     logger.info("HOME cancelled: %s", result.reason)
                 else:
                     raise RuntimeError(f"HOME failed: {result.reason}")
-            self._poll_blocking_commands()
+            self.poll_blocking_commands()
             return True
-        elif cmd is OperatorCommand.PAUSE and (self.active or self.quit_pending):
+        elif cmd is OperatorCommand.PAUSE and self.phase in (
+            TeleopPhase.ACTIVE,
+            TeleopPhase.PAUSED,
+            TeleopPhase.QUIT_PENDING,
+        ):
             if self.preparing_epoch is not None:
                 return False
-            self.quit_pending = False
-            if self.paused:
-                self._start_segment(expected_run_id)
+            if self.phase is not TeleopPhase.ACTIVE:
+                self.start_segment(expected_run_id)
             else:
-                self._pause_control("pause")
+                self.pause_control("pause")
                 self.audio.play("pause")
-        elif cmd is OperatorCommand.BEGIN and not self.active and not self.quit_pending:
-            self._start_segment(expected_run_id)
+        elif cmd is OperatorCommand.BEGIN and self.phase is TeleopPhase.IDLE:
+            self.start_segment(expected_run_id)
         return False
 
-    def _handle_commands(self, commands, expected_run_id):
-        terminal = {OperatorCommand.STOP, OperatorCommand.DISCARD,
-                    OperatorCommand.QUIT, OperatorCommand.EMERGENCY_STOP}
+    def handle_commands(self, commands, expected_run_id):
+        terminal = {
+            OperatorCommand.STOP,
+            OperatorCommand.DISCARD,
+            OperatorCommand.QUIT,
+            OperatorCommand.EMERGENCY_STOP,
+        }
         if terminal.intersection(commands):
             commands = [c for c in commands if c in terminal]
             if OperatorCommand.STOP in commands:
@@ -328,50 +369,50 @@ class TeleopRunner:
             if OperatorCommand.EMERGENCY_STOP in commands:
                 commands = [OperatorCommand.EMERGENCY_STOP]
         for index, cmd in enumerate(commands):
-            if self._handle_operator_command(
-                cmd, expected_run_id=expected_run_id,
-                home_commands=commands[index + 1:] if cmd is OperatorCommand.HOME else (),
+            if self.handle_operator_command(
+                cmd,
+                expected_run_id=expected_run_id,
+                home_commands=commands[index + 1 :] if cmd is OperatorCommand.HOME else (),
             ):
                 break
 
-    def _try_resume(self, row) -> bool:
-        if self.preparing_epoch is not None and not self._preparation_valid():
-            self._stop_capture("preparation_revoked")
+    def try_resume(self, row) -> bool:
+        if self.preparing_epoch is not None and not self.preparation_valid():
+            self.stop_capture("preparation_revoked")
             return False
         if self.preparing_epoch is not None and all(
             int(stamp) > self.resume_after_ns
             for stamp in (
                 row.arm["timestamp_ns"][0],
                 row.vr["recv_ts_ns"],
-                row.hand["timestamp_ns"][0]
-                if row.hand is not None
-                else row.observation_timestamp_ns,
+                (
+                    row.hand["timestamp_ns"][0]
+                    if row.hand is not None
+                    else row.observation_timestamp_ns
+                ),
             )
         ):
             prepared = self.controller.reset_reference(row)
-            with self.shared.motion_lock:
+            with self.runtime_state.motion_lock:
                 authorized = (
-                    prepared
-                    and self._preparation_valid()
-                    and self.shared.begin_motion()
+                    prepared and self.preparation_valid() and self.runtime_state.begin_motion()
                 )
                 if authorized:
-                    self.control_run_id = self.shared.run_id
+                    self.control_run_id = self.runtime_state.run_id
             if authorized:
-                event = "resume" if self.active else "begin"
-                self.active = True
-                self.paused = False
+                event = "resume" if self.resume_context else "begin"
+                self.resume_context = True
+                self.phase = TeleopPhase.ACTIVE
                 self.preparing_epoch = None
                 self.tick_origin_ns = None
                 self.tick_index = 0
-                self.next_tick_ns = 0
                 # Let the saved-segment announcement finish when fresh observations resume.
                 self.audio.play(event, interrupt=False)
                 return True
-            self._stop_capture("resume_unavailable" if self.active else "begin_unavailable")
+            self.stop_capture("resume_unavailable" if self.resume_context else "begin_unavailable")
         return False
 
-    def _execute_control_step(self, row, deadline_ns):
+    def execute_control_step(self, row, deadline_ns):
         epoch = self.control_run_id
         deadline_ns = min(deadline_ns, feedback_deadline_ns(row, self.runtime, include_vr=True))
         realization = command = dispatch = failure = None
@@ -391,9 +432,10 @@ class TeleopRunner:
                 timing["submit_started_ns"] = time.monotonic_ns()
                 try:
                     dispatch = self.robot.send_action(
-                        command, valid_until_ns=deadline_ns,
+                        command,
+                        valid_until_ns=deadline_ns,
                         execute_until_ns=int(row.vr["recv_ts_ns"])
-                        + int(self.runtime.policy.vr_mapping.stale_threshold_s * 1e9),
+                        + int(self.runtime.control.vr_mapping.stale_threshold_s * 1e9),
                     )
                 finally:
                     timing["submit_completed_ns"] = time.monotonic_ns()
@@ -402,33 +444,44 @@ class TeleopRunner:
             if isinstance(exc, (DispatchError, DispatchInterrupted)):
                 dispatch = exc.result
             if isinstance(exc, KeyboardInterrupt):
-                self.shared.request_emergency_stop()
+                self.runtime_state.request_emergency_stop()
             interrupted = (
-                isinstance(exc, DispatchError) and exc.revoked
+                isinstance(exc, DispatchError)
+                and exc.revoked
                 and exc.cause in {"authority_revoked", "deadline_expired"}
             )
             reason = f"control_failed: {type(exc).__name__}: {exc}"
-            run_end_reason = (
-                RunEndReason.ESTOP if isinstance(exc, KeyboardInterrupt) else
-                RunEndReason.RECORDING_FAILURE if isinstance(exc, RecordingError) else
-                RunEndReason.EXECUTOR_BOUNDARY if interrupted else
-                RunEndReason.HARDWARE_FAULT if isinstance(exc, DispatchError) else
-                RunEndReason.POLICY_FAILURE
-            )
+            if isinstance(exc, KeyboardInterrupt):
+                run_end_reason = RunEndReason.ESTOP
+            elif isinstance(exc, RecordingError):
+                run_end_reason = RunEndReason.RECORDING_FAILURE
+            elif interrupted:
+                run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
+            elif isinstance(exc, DispatchError):
+                run_end_reason = RunEndReason.HARDWARE_FAULT
+            else:
+                run_end_reason = RunEndReason.POLICY_FAILURE
         if reason is None:
             if time.monotonic_ns() >= deadline_ns:
                 reason = "dispatch_deadline_expired"
             elif (
-                self.shared.run_id != epoch or self.shared.estop_request
-                or self.shared.error_state or self.shared.quit_requested
-                or self.shared.stop_request or not self.shared.running
+                self.runtime_state.run_id != epoch
+                or self.runtime_state.estop_request
+                or self.runtime_state.error_state
+                or self.runtime_state.quit_requested
+                or self.runtime_state.stop_request
+                or not self.runtime_state.running
             ):
                 reason = "motion_revoked"
         if reason is not None:
             try:
-                self._stop_capture(
-                    reason, run_end_reason=run_end_reason,
-                    row=row, command=command, dispatch=dispatch, timing=timing,
+                self.stop_capture(
+                    reason,
+                    run_end_reason=run_end_reason,
+                    row=row,
+                    command=command,
+                    dispatch=dispatch,
+                    timing=timing,
                 )
             except Exception as exc:
                 if failure is not None and not interrupted:
@@ -441,69 +494,75 @@ class TeleopRunner:
         if self.recorder is not None:
             self.recorder.add_frame(row, command, dispatch, timing=timing)
 
-    def _wait_for_vr(self) -> bool:
+    def wait_for_vr(self) -> bool:
         deadline = time.monotonic() + self.runtime.safety.vr_ready_timeout_s
         while True:
             if not self.keyboard.healthy:
-                self.shared.request_emergency_stop()
-            if self._poll_blocking_commands():
+                self.runtime_state.request_emergency_stop()
+            if self.poll_blocking_commands():
                 return False
             self.robot.service_idle()
-            if self.shared.sensors.vr_ready.wait(timeout=0.05):
+            if self.runtime_state.sensors.vr_ready.wait(timeout=0.05):
                 # Consume startup keystrokes before accepting a new B after readiness.
-                return not self._poll_blocking_commands()
+                return not self.poll_blocking_commands()
             if time.monotonic() >= deadline:
                 raise RuntimeError("VR failed to become ready before the startup timeout")
 
-    def _initialize(self) -> bool:
+    def initialize(self) -> bool:
         # Keyboard callbacks are active before the startup hand HOME.
         home_result = home_hand(
-            self.shared,
+            self.runtime_state,
             self.runtime,
             robot=self.robot,
-            abort_requested=self._poll_blocking_commands,
+            abort_requested=self.poll_blocking_commands,
         )
         if not home_result.ok:
             if home_result.interrupted:
-                self.shared.quit_requested = True
+                self.runtime_state.request_quit()
                 return False
             raise RuntimeError(f"startup hand home failed: {home_result.reason}")
-        if self._poll_blocking_commands():
+        if self.poll_blocking_commands():
             return False
         self.start_vr()
-        if not self._wait_for_vr():
+        if not self.wait_for_vr():
             return False
-        print("准备进入遥操作；空闲且确认手部无接触后按 T 请求复位触觉，S/Q/ESC 可取消。",
-              flush=True)
+        print(
+            "准备进入遥操作；空闲且确认手部无接触后按 T 请求复位触觉，S/Q/ESC 可取消。", flush=True
+        )
         return True
 
-    def _run_control_tick(self):
+    def run_control_tick(self):
         if (
             self.recorder is not None
             and self.recorder.is_recording
             and time.monotonic() - self.capture_started_s
-            >= self.runtime.policy.max_record_duration_s
+            >= self.runtime.control.max_record_duration_s
         ):
-            self._pause_control("max_record_duration", run_end_reason=RunEndReason.TIMEOUT)
-            self._end_segment(True, "max_record_duration")
+            self.pause_control("max_record_duration", run_end_reason=RunEndReason.TIMEOUT)
+            self.end_segment(True, "max_record_duration")
             return
         now_ns = time.monotonic_ns()
-        if not self.paused and self.tick_origin_ns is not None:
+        if self.phase is TeleopPhase.ACTIVE and self.tick_origin_ns is not None:
             if now_ns < self.next_tick_ns:
                 return
             if now_ns >= self.next_tick_ns + self.control_dt_ns:
-                self.termination_details.append(dict(
-                    stage="sampling", reason="missed_tick", tick=self.tick_index,
-                    due_ns=self.next_tick_ns, observed_ns=now_ns,
-                ))
-                self._stop_capture("missed_tick")
+                self.termination_details.append(
+                    dict(
+                        stage="sampling",
+                        reason="missed_tick",
+                        tick=self.tick_index,
+                        due_ns=self.next_tick_ns,
+                        observed_ns=now_ns,
+                    )
+                )
+                self.stop_capture("missed_tick")
                 return
         issues = []
         row = read_observation(
-            self.shared,
+            self.runtime_state,
             self.runtime,
             self.robot,
-            require_hand=self.runtime.policy.hand_enabled,
+            require_hand=self.runtime.control.hand_enabled,
             require_camera=self.recorder is not None,
             require_vr=True,
             issues=issues,
@@ -513,37 +572,40 @@ class TeleopRunner:
                 issue in {"camera_source_unavailable_or_unmatched", "camera_source_stale"}
                 for issue in issues
             ):
-                self.shared.revoke_motion(reason=RunEndReason.HARDWARE_FAULT)
-                self._stop_capture("camera_unavailable")
+                self.runtime_state.revoke_motion(reason=RunEndReason.HARDWARE_FAULT)
+                self.stop_capture("camera_unavailable")
                 raise RuntimeError("required recording camera unavailable")
-            self._stop_capture("observation_unavailable")
+            self.stop_capture("observation_unavailable")
             return
-        if self.paused:
-            self._try_resume(row)
+        if self.phase is not TeleopPhase.ACTIVE:
+            self.try_resume(row)
             return
         stamp = row.observation_timestamp_ns
         if self.tick_origin_ns is None:
             self.tick_origin_ns = stamp
-            self.next_tick_ns = stamp
         if stamp >= self.next_tick_ns + self.control_dt_ns:
-            self.termination_details.append(dict(
-                stage="sampling", reason="late_observation", tick=self.tick_index,
-                due_ns=self.next_tick_ns, observed_ns=stamp,
-            ))
+            self.termination_details.append(
+                dict(
+                    stage="sampling",
+                    reason="late_observation",
+                    tick=self.tick_index,
+                    due_ns=self.next_tick_ns,
+                    observed_ns=stamp,
+                )
+            )
             # Preserve the actual late row only after authority is revoked/stopped.
-            self._stop_capture("late_observation", row=row)
+            self.stop_capture("late_observation", row=row)
             return
         self.tick_index += 1
-        self.next_tick_ns = self.tick_origin_ns + self.tick_index * self.control_dt_ns
-        self._execute_control_step(row, self.next_tick_ns)
+        self.execute_control_step(row, self.next_tick_ns)
 
     def close(self):
         """Revoke, preserve the capture, and close inputs; called once by the session owner."""
         failure = None
-        self.shared.revoke_motion(reason=RunEndReason.RUNTIME_SHUTDOWN)
+        self.runtime_state.revoke_motion(reason=RunEndReason.RUNTIME_SHUTDOWN)
         try:
             if self.robot.stop_required:
-                self._stop_motion("shutdown_stop")
+                self.stop_motion("shutdown_stop")
         except Exception as exc:
             failure = exc
             logger.exception("teleop stop failed")
@@ -561,7 +623,7 @@ class TeleopRunner:
             )
             logger.exception("teleop reference cleanup failed")
         try:
-            self._finish_capture(True, "interrupted", announce=False)
+            self.finish_capture(True, "interrupted", announce=False)
         except Exception as exc:
             if failure is None:
                 failure = exc
@@ -597,53 +659,67 @@ class TeleopRunner:
             self.robot.check_services = lambda: (
                 (check_services is None or check_services()) and self.keyboard.healthy
             )
-            ready = self._initialize()
-            while ready and self.shared.running and not self.shared.quit_requested:
+            ready = self.initialize()
+            while ready and self.runtime_state.running and not self.runtime_state.quit_requested:
                 self.robot.arm.check_error()
-                if self.preparing_epoch is None and (not self.active or self.paused):
+                if self.preparing_epoch is None and self.phase is not TeleopPhase.ACTIVE:
                     self.robot.service_idle()
                 if not self.keyboard.healthy:
-                    self.shared.request_emergency_stop()
-                if self.shared.estop_request or self.shared.error_state:
-                    self._stop_capture(
-                        "estop" if self.shared.estop_request else "runtime_failure"
+                    self.runtime_state.request_emergency_stop()
+                if self.runtime_state.estop_request or self.runtime_state.error_state:
+                    self.stop_capture(
+                        "estop" if self.runtime_state.estop_request else "runtime_failure"
                     )
                     break
                 if self.recorder is not None:
                     self.recorder.check_error()
                 timeout = 0.005
-                if self.active and not self.paused:
-                    timeout = min(timeout, max(0.0, (self.next_tick_ns - time.monotonic_ns()) / 1e9))
-                epoch = self.shared.run_id
+                if self.phase is TeleopPhase.ACTIVE:
+                    timeout = (
+                        0.0
+                        if self.next_tick_ns is None
+                        else min(timeout, max(0.0, (self.next_tick_ns - time.monotonic_ns()) / 1e9))
+                    )
+                epoch = self.runtime_state.run_id
                 commands = self.keyboard.poll(timeout=timeout)
-                self._handle_commands(commands, epoch)
+                self.handle_commands(commands, epoch)
                 if (
-                    self.shared.estop_request
-                    or self.shared.error_state
-                    or not self.shared.running
+                    self.runtime_state.estop_request
+                    or self.runtime_state.error_state
+                    or not self.runtime_state.running
                 ):
                     break
-                if self.shared.quit_requested or (
-                    self.preparing_epoch is None and (not self.active or self.paused)
+                if self.runtime_state.quit_requested or (
+                    self.preparing_epoch is None and self.phase is not TeleopPhase.ACTIVE
                 ):
                     continue
-                if not self.paused and time.monotonic_ns() < self.next_tick_ns:
+                if (
+                    self.phase is TeleopPhase.ACTIVE
+                    and self.next_tick_ns is not None
+                    and time.monotonic_ns() < self.next_tick_ns
+                ):
                     continue
-                self._run_control_tick()
+                self.run_control_tick()
         except KeyboardInterrupt:
-            self.shared.request_emergency_stop()
+            self.runtime_state.request_emergency_stop()
             raise
         except Exception as exc:
-            self.shared.error_state = True
-            self.shared.end_session()
-            self.shared.revoke_motion(
-                reason=RunEndReason.RECORDING_FAILURE if isinstance(exc, RecordingError)
-                else RunEndReason.HARDWARE_FAULT if isinstance(exc, DispatchError)
-                else RunEndReason.POLICY_FAILURE,
+            self.runtime_state.mark_error()
+            if isinstance(exc, RecordingError):
+                reason = RunEndReason.RECORDING_FAILURE
+            elif isinstance(exc, DispatchError):
+                reason = RunEndReason.HARDWARE_FAULT
+            else:
+                reason = RunEndReason.POLICY_FAILURE
+            self.runtime_state.revoke_motion(reason=reason)
+            self.runtime_state.end_session(reason=reason)
+            self.termination_details.append(
+                dict(
+                    stage="runtime",
+                    exception_type=type(exc).__name__,
+                    message=str(exc),
+                )
             )
-            self.termination_details.append(dict(
-                stage="runtime", exception_type=type(exc).__name__, message=str(exc),
-            ))
             logger.exception("teleop failed")
             self.audio.play("emergency")
             raise

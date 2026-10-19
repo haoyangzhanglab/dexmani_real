@@ -48,10 +48,11 @@ def load_trajectory(episode_path):
         ]
         if len(arm) == 0 or not all(np.isfinite(v).all() for v in (arm, hand, aq, hq)):
             raise ValueError("replay requires nonempty finite targets and robot states")
-        errors = validate_dispatch_rows(reader['dispatch_status'][:])
+        errors = validate_dispatch_rows(reader["dispatch_status"][:])
         if errors:
             raise ValueError("; ".join(errors))
-        reader.validate_arm_execution()
+        timing = reader.read_timing()
+        reader.validate_arm_execution(timing["rows"])
         return TrajectoryData(
             str(reader.path),
             len(arm),
@@ -66,7 +67,7 @@ def load_trajectory(episode_path):
 
 
 def verify_replay_preflight(trajectory, runtime):
-    if not runtime.policy.hand_enabled:
+    if not runtime.control.hand_enabled:
         raise ValueError("physical replay requires XHand")
     for values, lower, upper in (
         (trajectory.action_arm_joint, runtime.arm.joint_limit_lower, runtime.arm.joint_limit_upper),

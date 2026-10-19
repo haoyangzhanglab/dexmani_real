@@ -14,7 +14,6 @@ from dexmani_real.replay.trajectory import TrajectoryData
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
 from dexmani_real.utils.atomic_io import atomic_json_dump
 
-
 _ALIGNMENT_WINDOW_S = 0.4
 _MIN_ALIGNMENT_OFFSET_FRAMES = 6
 _MIN_ALIGNMENT_OVERLAP_FRAMES = 10
@@ -22,13 +21,15 @@ _MIN_ALIGNMENT_SEQUENCE_FRAMES = 20
 _TARGET_GAP_PERCENTILE = 95.0
 
 
-def _geodesic_distance_deg(rotation_a: np.ndarray, rotation_b: np.ndarray) -> float:
+def geodesic_distance_deg(rotation_a: np.ndarray, rotation_b: np.ndarray) -> float:
     """Geodesic angular distance between two rotation matrices in degrees."""
     cos_angle = 0.5 * (np.trace(rotation_a @ rotation_b.T) - 1.0)
     return float(np.rad2deg(np.arccos(np.clip(cos_angle, -1.0, 1.0))))
 
 
-def compute_metrics(trajectory: TrajectoryData, replay_data: dict, *, hand_start_duration_s=0.0) -> dict:
+def compute_metrics(
+    trajectory: TrajectoryData, replay_data: dict, *, hand_start_duration_s=0.0
+) -> dict:
     """Return JSON-ready cross-run errors by frame index, not hardware response delays."""
     fps = trajectory.fps
     original_frames = len(trajectory.arm_qpos)
@@ -54,7 +55,10 @@ def compute_metrics(trajectory: TrajectoryData, replay_data: dict, *, hand_start
         },
         "eef_position": {"mean_error_mm": None, "max_error_mm": None, "rmse_error_mm": None},
         "eef_orientation": {"mean_error_deg": None, "max_error_deg": None},
-        "trajectory_alignment": {"per_active_joint_offset_frames": {}, "median_offset_frames": None},
+        "trajectory_alignment": {
+            "per_active_joint_offset_frames": {},
+            "median_offset_frames": None,
+        },
     }
     if count == 0:
         return metrics
@@ -89,9 +93,12 @@ def compute_metrics(trajectory: TrajectoryData, replay_data: dict, *, hand_start
     errors = []
     for index in np.flatnonzero(valid):
         try:
-            errors.append(_geodesic_distance_deg(
-                rot6d_to_rotmat(orig_rot[index]), rot6d_to_rotmat(rep_rot[index]),
-            ))
+            errors.append(
+                geodesic_distance_deg(
+                    rot6d_to_rotmat(orig_rot[index]),
+                    rot6d_to_rotmat(rep_rot[index]),
+                )
+            )
         except ValueError:
             pass
     finite_errors = np.asarray(errors)[np.isfinite(errors)]
@@ -116,7 +123,9 @@ def compute_metrics(trajectory: TrajectoryData, replay_data: dict, *, hand_start
     offsets = trajectory_alignment_offsets(orig_q, rep_q, fps)
     metrics["trajectory_alignment"]["per_active_joint_offset_frames"] = offsets
     if offsets:
-        metrics["trajectory_alignment"]["median_offset_frames"] = int(np.median(list(offsets.values())))
+        metrics["trajectory_alignment"]["median_offset_frames"] = int(
+            np.median(list(offsets.values()))
+        )
 
     gap_count = min(len(replay_data["arm_cmd"]), replayed_frames)
     commands, measured = replay_data["arm_cmd"][:gap_count], replay_data["arm_qpos"][:gap_count]
@@ -141,21 +150,27 @@ def compute_metrics(trajectory: TrajectoryData, replay_data: dict, *, hand_start
 
 def report_consistency(metrics: dict) -> None:
     print("\nCross-run Consistency by Frame Index")
-    print(f"  Frames: {metrics['replayed_frames']} replayed / {metrics['original_frames']} original")
+    print(
+        f"  Frames: {metrics['replayed_frames']} replayed / {metrics['original_frames']} original"
+    )
     print(f"  Valid frames: {metrics['valid_frames']}")
     print("  Joint errors use absolute SDK angles; EEF errors use geometric pose equivalence.")
     print("  Frame alignment compares separate runs; it does not measure hardware response delay.")
     print("  None means unavailable, not zero error.")
     arm = metrics["arm_joint"]
     print(f"  Arm MAE (deg): {arm['mae_per_joint_deg']}; overall={arm['mae_overall_deg']}")
-    print(f"  Arm RMSE (deg): {arm['rmse_per_joint_deg']}; mean_joint_rmse={arm['mean_joint_rmse_deg']}")
+    print(
+        f"  Arm RMSE (deg): {arm['rmse_per_joint_deg']}; mean_joint_rmse={arm['mean_joint_rmse_deg']}"
+    )
     print(f"  EEF position: {metrics['eef_position']}")
     print(f"  EEF orientation: {metrics['eef_orientation']}")
     print(f"  Trajectory alignment: {metrics['trajectory_alignment']}")
     if "hand_joint" in metrics:
         print(f"  Hand: {metrics['hand_joint']}")
     if "pre_submit_arm_target_gap" in metrics:
-        print(f"  Arm submitted target vs consumed pre-submit feedback: {metrics['pre_submit_arm_target_gap']}")
+        print(
+            f"  Arm submitted target vs consumed pre-submit feedback: {metrics['pre_submit_arm_target_gap']}"
+        )
 
 
 def evaluate_replay(
@@ -213,11 +228,8 @@ def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str) -> Pat
 
 
 def trajectory_alignment_offsets(orig_q, rep_q, fps):
-    """RMSE alignment across runs; positive offset matches higher replay indices.
-
-    fps only defines the nominal search window. Offsets are not command-to-feedback delays;
-    stationary axes cannot identify an alignment.
-    """
+    """RMSE alignment: positive offset matches higher replay indices.
+    Nominal fps bounds the search; stationary axes cannot identify command-to-feedback delay."""
     frame_count = len(orig_q)
     lags = {}
     if frame_count >= _MIN_ALIGNMENT_SEQUENCE_FRAMES:

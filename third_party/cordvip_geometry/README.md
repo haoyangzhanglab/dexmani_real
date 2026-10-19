@@ -11,7 +11,7 @@ python -m cordvip_geometry download --models grounding sam
 python -m cordvip_geometry check --offline-input --headless
 ```
 
-Grounded-SAM2、FoundationPose、Hunyuan 和 FK 使用 `real_robot`（Python 3.10 / Torch 2.4.1+cu124）。源码与权重版本固定，模型从本地加载。`--help`、静态检查和普通 import 不加载模型或连接设备。
+`real_robot` 是示例环境名。SAM 子解释器按 Python 和固定依赖版本检查，父环境按实际启用的位姿、手点或显示能力检查；具体要求见[使用文档](docs/usage.md)。源码与权重版本固定，支持合法 Git worktree，SAM 文档修改不影响源码准入。模型从本地加载；`--help`、静态检查和普通 import 不加载模型或连接设备。
 
 默认 SAM2.1 small、BF16、eager。文本检测只用于首帧候选确认，进入跟踪后释放 Grounding DINO；多实例共享图像编码与位姿细化预处理。已有确认 mask 可直接开始传播。large 对照、参数及内存接口见[使用文档](docs/usage.md)。
 
@@ -21,6 +21,6 @@ Grounded-SAM2、FoundationPose、Hunyuan 和 FK 使用 `real_robot`（Python 3.1
 
 `--with-hand` 从同一 Raw 行的实测关节生成 FK 手点，使用数据对应的相机外参与当前实验安装配置。手—物表示与原始模型输入的适配、训练和 contact/proximity 标签属于 `dexmani_policy`。
 
-实时相机命令会连接 RealSense；`--with-hand` 目前只支持只读 Raw。宿主接入时应复用已有 RGB-D、实测关节和时间证据。主包 runtime、采集、13 字段导出与部署尚未接入本工具。
+实时相机命令会连接 RealSense；`--with-hand` 目前只支持只读 Raw。宿主接入时应复用已有 RGB-D、实测关节和时间证据。主包 runtime、采集、15 字段导出与部署尚未接入本工具。
 
 运行产物与模型放在 workspace 的 `reports/` 下，不写回 Raw。脚本入口显式传入 workspace，模块入口默认使用当前目录。

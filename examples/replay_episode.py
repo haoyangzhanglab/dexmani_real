@@ -17,11 +17,10 @@ import yaml
 
 from dexmani_real.config.experiment import load_experiment_config
 
-
 logger = logging.getLogger("dexmani_real.cli.replay_episode")
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Physically replay a recorded trajectory on the xArm7 and XHand.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -67,12 +66,12 @@ Controls:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv)
+    args = parse_args(argv)
 
     from dexmani_real.replay.replayer import ReplayStatus
     from dexmani_real.replay.session import (
         DEFAULT_OUTPUT_DIR,
-        replay_episode,
+        ReplaySession,
     )
     from dexmani_real.replay.trajectory import load_trajectory
 
@@ -105,12 +104,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Output: {output_dir}")
 
     try:
-        outcome = replay_episode(
+        outcome = ReplaySession(
             trajectory,
             runtime,
             output_dir=output_dir,
             hand_start_duration_s=args.hand_start_duration,
-        )
+        ).run()
     except Exception as exc:
         logger.error("physical replay failed", exc_info=True)
         print(f"\nPhysical replay failed: {exc}")

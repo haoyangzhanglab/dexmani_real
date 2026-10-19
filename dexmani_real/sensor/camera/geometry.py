@@ -10,7 +10,10 @@ import numpy as np
 from dexmani_real.utils.geometry import validate_rigid_transform
 
 __all__ = [
-    "CameraIntrinsics", "RGBDGeometry", "camera_parameters_cv", "validate_aligned_depth_distortion",
+    "CameraIntrinsics",
+    "RGBDGeometry",
+    "camera_parameters_cv",
+    "validate_aligned_depth_distortion",
 ]
 
 
@@ -20,14 +23,14 @@ def validate_aligned_depth_distortion(model: str) -> None:
         raise ValueError(f"depth deprojection has no validated path for distortion model {model!r}")
 
 
-def _finite_positive(value: float, *, name: str) -> float:
+def finite_positive(value: float, *, name: str) -> float:
     result = float(value)
     if not np.isfinite(result) or result <= 0.0:
         raise ValueError(f"{name} must be finite and positive")
     return result
 
 
-def _positive_int(value: object, *, name: str) -> int:
+def positive_int(value: object, *, name: str) -> int:
     """Validate one dimension without silently truncating a numeric value."""
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
@@ -48,10 +51,10 @@ class CameraIntrinsics:
     distortion_coeffs: tuple[float, float, float, float, float]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "width", _positive_int(self.width, name="width"))
-        object.__setattr__(self, "height", _positive_int(self.height, name="height"))
-        object.__setattr__(self, "fx", _finite_positive(self.fx, name="fx"))
-        object.__setattr__(self, "fy", _finite_positive(self.fy, name="fy"))
+        object.__setattr__(self, "width", positive_int(self.width, name="width"))
+        object.__setattr__(self, "height", positive_int(self.height, name="height"))
+        object.__setattr__(self, "fx", finite_positive(self.fx, name="fx"))
+        object.__setattr__(self, "fy", finite_positive(self.fy, name="fy"))
         for name in ("ppx", "ppy"):
             value = float(getattr(self, name))
             if not np.isfinite(value):
@@ -90,14 +93,11 @@ class CameraIntrinsics:
 
 
 def camera_parameters_cv(
-    color: CameraIntrinsics, T_xarm_base_from_color: np.ndarray | None = None,
+    color: CameraIntrinsics,
+    T_xarm_base_from_color: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
-    """Return float32 C-order K(9) and, when supplied, base-to-color [R|t](12).
-
-    RealSense color and OpenCV calibration both use optical RDF (right/down/forward).
-    No OpenGL axis conversion or image undistortion is involved; K omits distortion.
-    Omitting the transform produces only K, never a default external calibration.
-    """
+    """Float32 C-order K(9) and optional base-to-color [R|t](12), using optical RDF axes.
+    K omits distortion; a missing transform returns only K, never a default calibration."""
     matrices = {"camera_intrinsic": color.matrix()}
     if T_xarm_base_from_color is not None:
         base_from_color = validate_rigid_transform(

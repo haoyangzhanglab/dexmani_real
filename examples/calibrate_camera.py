@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from dexmani_real.calibration import CAMERAS_PATH
-    from dexmani_real.calibration.camera.session import run_camera_calibration
+    from dexmani_real.calibration.camera.session import CameraCalibrationSession
     from dexmani_real.calibration.camera.solver import ARUCO_DICT_NAME, ArucoConfig
 
     aruco = ArucoConfig()
@@ -66,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         runtime = load_experiment_config(
             yaml_path=args.config,
-            cli_overrides={"camera.serial": args.serial, "policy.hand_enabled": False},
+            cli_overrides={"camera.serial": args.serial, "control.hand_enabled": False},
         )
     except (
         OSError,
@@ -77,12 +77,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Invalid calibration config: {exc}", file=sys.stderr)
         return 2
 
-    return run_camera_calibration(
+    return CameraCalibrationSession(
         runtime,
         hand_geometry=args.hand_geometry,
         aruco_config=aruco,
         output_path=args.output or CAMERAS_PATH,
-    )
+    ).run()
 
 
 if __name__ == "__main__":

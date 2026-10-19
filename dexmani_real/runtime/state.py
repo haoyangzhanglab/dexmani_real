@@ -40,7 +40,6 @@ class RuntimeState:
     error_state: bool = False
     estop_request: bool = False
     quit_requested: bool = False
-    start_request: bool = False
     stop_request: bool = False
     safety_state: SafetyState = SafetyState.DISARMED
     # Never held across an SDK call; keyboard callbacks revoke from another thread.
@@ -48,18 +47,23 @@ class RuntimeState:
     arm_authority: object = field(default=None, repr=False)
     arm_emergency: object = field(default=None, repr=False)
 
-    def _requests_allow_motion(self):
-        return (self.running and not self.error_state and not self.estop_request
-                and not self.quit_requested and not self.stop_request)
+    def requests_allow_motion(self):
+        return (
+            self.running
+            and not self.error_state
+            and not self.estop_request
+            and not self.quit_requested
+            and not self.stop_request
+        )
 
     def arm(self) -> None:
         with self.motion_lock:
-            if not self._requests_allow_motion() or not self.revoke_motion():
+            if not self.requests_allow_motion() or not self.revoke_motion():
                 raise RuntimeError("arming rejected")
 
     def begin_motion(self) -> tuple[int, int] | None:
         with self.motion_lock:
-            if self.safety_state != SafetyState.ARMED or not self._requests_allow_motion():
+            if self.safety_state != SafetyState.ARMED or not self.requests_allow_motion():
                 return None
             self.run_id += 1
             started = time.monotonic_ns()
@@ -72,15 +76,18 @@ class RuntimeState:
         """Last software fence; the subsequent SDK call runs without this lock."""
         with self.motion_lock:
             return (
-                self._requests_allow_motion()
+                self.requests_allow_motion()
                 and self.run_id == run_id
                 and self.safety_state == required_safety_state
                 and required_safety_state in (SafetyState.ARMED, SafetyState.RUNNING)
             )
 
     def revoke_motion(
-        self, new_state=SafetyState.ARMED, *,
-        reason=RunEndReason.EXECUTOR_BOUNDARY, expected_run_id=None,
+        self,
+        new_state=SafetyState.ARMED,
+        *,
+        reason=RunEndReason.EXECUTOR_BOUNDARY,
+        expected_run_id=None,
     ) -> bool:
         with self.motion_lock:
             if new_state not in (SafetyState.ARMED, SafetyState.DISARMED, SafetyState.FAULT):
@@ -105,7 +112,7 @@ class RuntimeState:
         """Signed epoch: ARMED preparation < 0, RUNNING > 0, revoked = 0."""
         with self.motion_lock:
             if self.arm_authority is not None:
-                if not self._requests_allow_motion():
+                if not self.requests_allow_motion():
                     self.arm_authority.value = 0
                 elif self.safety_state == SafetyState.RUNNING:
                     self.arm_authority.value = self.run_id
@@ -124,6 +131,31 @@ class RuntimeState:
             if not already_requested:
                 self.revoke_motion(reason=RunEndReason.ESTOP)
 
+    def mark_error(self):
+        """Latch a session error without conflating it with a hardware FAULT."""
+        with self.motion_lock:
+            self.error_state = True
+            self.publish_arm_authority()
+
+    def request_stop(self, *, reason=RunEndReason.OPERATOR):
+        with self.motion_lock:
+            self.stop_request = True
+            if self.safety_state in (SafetyState.ARMED, SafetyState.RUNNING):
+                self.revoke_motion(reason=reason)
+            else:
+                self.publish_arm_authority()
+
+    def acknowledge_stop(self, expected_run_id):
+        """Only an owner which finished stopping may clear this generation's fence."""
+        with self.motion_lock:
+            if self.run_id == expected_run_id and self.safety_state != SafetyState.RUNNING:
+                self.stop_request = False
+
+    def request_quit(self):
+        with self.motion_lock:
+            self.quit_requested = True
+            self.request_stop(reason=RunEndReason.QUIT)
+
     def end_session(self, *, reason=RunEndReason.RUNTIME_SHUTDOWN, fault=False) -> None:
         """Fence motion and notify sensor workers before any blocking cleanup."""
         with self.motion_lock:
@@ -131,7 +163,7 @@ class RuntimeState:
             if self.sensors is not None:
                 self.sensors.is_running.value = False
             if fault:
-                self.error_state = True
+                self.mark_error()
                 self.revoke_motion(SafetyState.FAULT, reason=reason)
             elif self.safety_state == SafetyState.RUNNING:
                 self.revoke_motion(reason=reason)

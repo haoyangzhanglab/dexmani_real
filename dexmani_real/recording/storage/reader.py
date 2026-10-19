@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
-
 import json
 
 import av
@@ -12,15 +11,19 @@ import h5py
 import numpy as np
 
 from dexmani_real.recording.storage.schema import (
-    DATASET_SPECS, RAW_FORMAT, ARM_EXECUTION_FORMAT, TIMING_ROW_DTYPE, validate_arm_execution,
+    DATASET_SPECS,
+    RAW_FORMAT,
+    ARM_EXECUTION_FORMAT,
+    TIMING_ROW_DTYPE,
+    validate_arm_execution,
 )
 
 
 class RawDataError(ValueError):
-    """Missing or malformed Raw data; distinct from I/O and format incompatibility."""
+    """Malformed or unsupported Raw input; distinct from program and system errors."""
 
 
-def _scalar_attr(attrs: h5py.AttributeManager, name: str) -> object:
+def scalar_attr(attrs: h5py.AttributeManager, name: str) -> object:
     if name not in attrs:
         raise RawDataError(f"episode metadata is missing {name}")
     value = np.asarray(attrs[name])
@@ -29,17 +32,26 @@ def _scalar_attr(attrs: h5py.AttributeManager, name: str) -> object:
     return value.item()
 
 
-def _text_attr(attrs: h5py.AttributeManager, name: str) -> str:
-    value = _scalar_attr(attrs, name)
+def text_attr(attrs: h5py.AttributeManager, name: str) -> str:
+    value = scalar_attr(attrs, name)
     if isinstance(value, bytes):
-        value = value.decode("utf-8")
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RawDataError(f"episode metadata {name}: invalid UTF-8") from exc
     if not isinstance(value, str) or not value.strip():
         raise RawDataError(f"episode metadata {name} must be a non-empty string")
+    try:
+        value.encode(
+            "utf-8"
+        )  # h5py may expose malformed variable-length bytes as surrogate escapes.
+    except UnicodeEncodeError as exc:
+        raise RawDataError(f"episode metadata {name}: invalid UTF-8") from exc
     return value
 
 
-def _nonnegative_int_attr(attrs: h5py.AttributeManager, name: str) -> int:
-    value = _scalar_attr(attrs, name)
+def nonnegative_int_attr(attrs: h5py.AttributeManager, name: str) -> int:
+    value = scalar_attr(attrs, name)
     if type(value) is not int:
         raise RawDataError(f"episode metadata {name} must be an integer")
     if value < 0:
@@ -47,8 +59,8 @@ def _nonnegative_int_attr(attrs: h5py.AttributeManager, name: str) -> int:
     return value
 
 
-def _positive_float_attr(attrs: h5py.AttributeManager, name: str) -> float:
-    value = _scalar_attr(attrs, name)
+def positive_float_attr(attrs: h5py.AttributeManager, name: str) -> float:
+    value = scalar_attr(attrs, name)
     if type(value) not in (int, float):
         raise RawDataError(f"episode metadata {name} must be numeric")
     result = float(value)
@@ -73,22 +85,25 @@ class EpisodeReader:
             if "meta" not in self._data or not isinstance(self._data["meta"], h5py.Group):
                 raise RawDataError("episode is missing meta")
             attrs = self.meta
-            if _text_attr(attrs, "format") != RAW_FORMAT:
-                raise ValueError(f"unsupported Raw format (expected {RAW_FORMAT!r})")
+            if text_attr(attrs, "format") != RAW_FORMAT:
+                raise RawDataError(f"unsupported Raw format (expected {RAW_FORMAT!r})")
             if attrs.get("arm_execution_format") != ARM_EXECUTION_FORMAT:
-                raise ValueError(
+                raise RawDataError(
                     f"unsupported arm execution format (expected {ARM_EXECUTION_FORMAT!r}); "
                     "use the historical code version for old Raw; do not rewrite it"
                 )
-            if attrs.get("arm_control_mode") != 1 or attrs.get("arm_action_semantics") != "q_goal_submitted":
+            if (
+                attrs.get("arm_control_mode") != 1
+                or attrs.get("arm_action_semantics") != "q_goal_submitted"
+            ):
                 raise RawDataError("unknown arm control/action semantics")
-            if _text_attr(attrs, "timestamp_source") != "host_monotonic_relative":
+            if text_attr(attrs, "timestamp_source") != "host_monotonic_relative":
                 raise RawDataError("Raw timestamp must use host monotonic relative seconds")
-            _text_attr(attrs, "termination_reason")
-            self._num_frames = _nonnegative_int_attr(attrs, "num_frames")
-            self._control_hz = _positive_float_attr(attrs, "control_hz")
-            _text_attr(attrs, "task_label")
-            _text_attr(attrs, "collection_source")
+            text_attr(attrs, "termination_reason")
+            self._num_frames = nonnegative_int_attr(attrs, "num_frames")
+            self._control_hz = positive_float_attr(attrs, "control_hz")
+            text_attr(attrs, "task_label")
+            text_attr(attrs, "collection_source")
         except BaseException:
             self.close()
             raise
@@ -130,6 +145,8 @@ class EpisodeReader:
         if name in self._datasets:
             return self._datasets[name]
         array = self._data[name]
+        if not isinstance(array, h5py.Dataset):
+            raise RawDataError(f"Raw {name}: expected a dataset")
         if name in DATASET_SPECS:
             spec = DATASET_SPECS[name]
             if array.shape != (self.num_frames, *spec.tail_shape) or array.dtype != spec.dtype:
@@ -137,33 +154,73 @@ class EpisodeReader:
         self._datasets[name] = array
         return array
 
+    def read_timing_rows(self):
+        """Read only the compound rows needed by arm execution accounting."""
+        if "timing/rows" not in self._data:
+            raise RawDataError("Raw is missing timing rows")
+        rows = self._data["timing/rows"]
+        if (
+            not isinstance(rows, h5py.Dataset)
+            or rows.shape != (self.num_frames,)
+            or rows.dtype != TIMING_ROW_DTYPE
+        ):
+            raise RawDataError(
+                "timing rows must align with core rows and match the current timing layout"
+            )
+        return rows[:]
+
+    def read_termination(self):
+        if "timing/termination" not in self._data:
+            return None
+        value = self._data["timing/termination"]
+        if not isinstance(value, h5py.Dataset) or value.shape != ():
+            raise RawDataError("timing termination format: expected a scalar dataset")
+        try:
+            return json.loads(value.asstr()[()])
+        except (ValueError, TypeError) as exc:
+            raise RawDataError(f"timing termination format: {exc}") from exc
+
     def read_timing(self):
-        """Read host timing and submission identities without inventing missing clocks."""
-        if any(name not in self._data for name in ("timing/rows", "timing/queries")):
-            raise RawDataError("Raw is missing timing rows or queries")
+        """Full provenance admission, explicitly used by export and physical replay."""
+        values = self.read_timing_rows()
         group = self._data["timing"]
-        rows = group["rows"]
-        if rows.shape != (self.num_frames,) or rows.dtype != TIMING_ROW_DTYPE:
-            raise RawDataError("timing rows must align with core rows and match the current timing layout")
-        queries = [json.loads(value) for value in group["queries"].asstr()[:]]
-        keys = {(item["run_id"], item["query_id"]) for item in queries}
+        if "queries" not in group:
+            raise RawDataError("Raw is missing timing queries")
+        records = group["queries"]
+        if not isinstance(records, h5py.Dataset) or records.ndim != 1:
+            raise RawDataError("timing query format: expected a one-dimensional dataset")
+        try:
+            queries = [json.loads(value) for value in records.asstr()[:]]
+            keys = {(item["run_id"], item["query_id"]) for item in queries}
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RawDataError(f"timing query format: {exc}") from exc
         if len(keys) != len(queries):
             raise RawDataError("duplicate timing query identity")
-        values = rows[:]
         for row in values:
             if row["query_id"] >= 0 and (int(row["run_id"]), int(row["query_id"])) not in keys:
                 raise RawDataError("action timing references an absent query")
-        return dict(rows=values, queries=queries, metadata=dict(group.attrs),
-                    termination=json.loads(group["termination"].asstr()[()])
-                    if "termination" in group else None)
+        return dict(
+            rows=values,
+            queries=queries,
+            metadata=dict(group.attrs),
+            termination=self.read_termination(),
+        )
 
-    def validate_arm_execution(self):
+    def validate_arm_execution(self, rows=None):
         """Use the same episode admission for export and physical replay."""
         try:
             group = self._data["arm_execution"]
+            if not isinstance(group, h5py.Group):
+                raise RawDataError("arm_execution must be a group")
+            for name in ("start", "end"):
+                value = group[name]
+                if not isinstance(value, h5py.Dataset) or value.shape != ():
+                    raise RawDataError(f"{name} must be a scalar dataset")
             validate_arm_execution(
-                json.loads(group["start"].asstr()[()]), json.loads(group["end"].asstr()[()]),
-                self.read_timing()["rows"], self["dispatch_status"][:],
+                json.loads(group["start"].asstr()[()]),
+                json.loads(group["end"].asstr()[()]),
+                self.read_timing_rows() if rows is None else rows,
+                self["dispatch_status"][:],
             )
         except (KeyError, ValueError, TypeError) as exc:
             raise RawDataError(f"Mode-1 execution evidence: {exc}") from exc
@@ -172,36 +229,46 @@ class EpisodeReader:
         """Return host ages/deltas in seconds (NaN/None if missing), without cross-modality admission thresholds."""
         evidence = self.read_timing()
         rows = evidence["rows"]
+
         def delta(end, start):
             result = np.full(len(rows), np.nan)
             valid = (rows[end] > 0) & (rows[start] > 0)
             result[valid] = (rows[end][valid] - rows[start][valid]) / 1e9
             return result
+
         def inference(query):
             start, end = query.get("started_ns"), query.get("completed_ns")
             return None if start is None or end is None else (end - start) / 1e9
+
         return dict(
             metadata=evidence["metadata"],
-            observation_age_s={name: delta("observation_ns", f"{name}_ns")
-                               for name in ("arm", "hand", "camera", "pointcloud")},
-            modality_delta_s={"arm_hand": delta("arm_ns", "hand_ns"),
-                              "arm_camera": delta("arm_ns", "camera_ns"),
-                              "camera_pointcloud": delta("camera_ns", "pointcloud_ns")},
+            observation_age_s={
+                name: delta("observation_ns", f"{name}_ns")
+                for name in ("arm", "hand", "camera", "pointcloud")
+            },
+            modality_delta_s={
+                "arm_hand": delta("arm_ns", "hand_ns"),
+                "arm_camera": delta("arm_ns", "camera_ns"),
+                "camera_pointcloud": delta("camera_ns", "pointcloud_ns"),
+            },
             camera_pipeline_s={
                 "receive_to_publish": delta("camera_published_ns", "camera_received_ns"),
             },
             pointcloud_pipeline_s={
                 "camera_receive_to_publish": delta(
-                    "pointcloud_camera_published_ns", "pointcloud_camera_received_ns"),
+                    "pointcloud_camera_published_ns", "pointcloud_camera_received_ns"
+                ),
                 "camera_publish_to_processing": delta(
-                    "pointcloud_started_ns", "pointcloud_camera_published_ns"),
+                    "pointcloud_started_ns", "pointcloud_camera_published_ns"
+                ),
                 # Includes the ring copy/commit, not just build_point_cloud.
                 "processing_to_publish": delta("pointcloud_published_ns", "pointcloud_started_ns"),
                 "publish_to_observation": delta("observation_ns", "pointcloud_published_ns"),
             },
             submit_duration_s=delta("submit_completed_ns", "submit_started_ns"),
-            inference_duration_s={(q["run_id"], q["query_id"]): inference(q)
-                                  for q in evidence["queries"]},
+            inference_duration_s={
+                (q["run_id"], q["query_id"]): inference(q) for q in evidence["queries"]
+            },
         )
 
     @property
@@ -219,12 +286,15 @@ class EpisodeReader:
     def iter_rgb_frames(self) -> Iterator[np.ndarray]:
         """Decode RGB in HDF5 row order; sampling times come from Raw ``timestamp``."""
         self.require_fields("rgb")
-        if self._video is None:
-            self._video = av.open(str(self._rgb_path), "r")
-        self._video.seek(0)
-        # The reader owns the container even if the consumer stops iteration early.
-        for frame in self._video.decode(video=0):
-            yield frame.to_ndarray(format="rgb24")
+        try:
+            if self._video is None:
+                self._video = av.open(str(self._rgb_path), "r")
+            self._video.seek(0)
+            # The reader owns the container if the consumer stops iteration early.
+            for frame in self._video.decode(video=0):
+                yield frame.to_ndarray(format="rgb24")
+        except (av.error.InvalidDataError, av.error.EOFError) as exc:
+            raise RawDataError(f"{self._rgb_path}: invalid RGB video: {exc}") from exc
 
     def close(self) -> None:
         self._datasets.clear()

@@ -18,8 +18,8 @@ def make_panel(rgb, depth_m, *, lines=()):
     text_lines = ["RGB | measured depth (0--2 m)", *lines]
     for index, line in enumerate(text_lines):
         origin = (10, 22 + index * 22)
-        cv2.putText(panel, str(line), origin, cv2.FONT_HERSHEY_SIMPLEX, .48, (0, 0, 0), 3)
-        cv2.putText(panel, str(line), origin, cv2.FONT_HERSHEY_SIMPLEX, .48, (255, 255, 255), 1)
+        cv2.putText(panel, str(line), origin, cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 3)
+        cv2.putText(panel, str(line), origin, cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
     return panel
 
 
@@ -41,10 +41,10 @@ class DemoViewer:
                 cv2.destroyWindow(self.title)
                 raise RuntimeError("Open3D could not create a window; use --no-3d or --headless")
             self.observed = o3d.geometry.PointCloud()
-            self.vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=.1))
+            self.vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1))
             self.vis.add_geometry(self.observed)
             options = self.vis.get_render_option()
-            options.background_color = np.array([.08, .08, .08])
+            options.background_color = np.array([0.08, 0.08, 0.08])
             options.point_size = 3.0
 
     def update(self, panel, observed_points, *, paused=False):
@@ -52,12 +52,19 @@ class DemoViewer:
 
         if paused:
             panel = panel.copy()
-            cv2.putText(panel, "PAUSED: space continue / n next frame", (10, panel.shape[0] - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 255), 2)
+            cv2.putText(
+                panel,
+                "PAUSED: space continue / n next frame",
+                (10, panel.shape[0] - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2,
+            )
         cv2.imshow(self.title, panel)
         if self.vis is not None:
             self.observed.points = self.o3d.utility.Vector3dVector(observed_points)
-            self.observed.paint_uniform_color([.55, .55, .55])
+            self.observed.paint_uniform_color([0.55, 0.55, 0.55])
             self.vis.update_geometry(self.observed)
             if not self._has_points and len(observed_points):
                 self.vis.reset_view_point(True)
@@ -67,7 +74,7 @@ class DemoViewer:
             self.vis.update_renderer()
         if cv2.getWindowProperty(self.title, cv2.WND_PROP_VISIBLE) < 1:
             return ord("q")
-        return cv2.waitKey(1) & 0xff
+        return cv2.waitKey(1) & 0xFF
 
     def screenshot(self, path):
         if self.vis is not None:

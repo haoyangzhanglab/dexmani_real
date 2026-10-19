@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import astuple, dataclass
+from dataclasses import dataclass, fields
 
 import numpy as np
 
@@ -39,21 +39,21 @@ class PointCloudConfig:
     outlier_min_component_points: int = 10
     # Bounds final sampling work after density/component filtering.
     outlier_candidate_multiplier: int = 8
-    # Stratify over 15 mm cells at the default voxel size, then fill deterministically.
-    sampling_coarse_voxel_stride: int = 3
+    # Identify the numerical representation stored with training data.
+    sampling_method: str = "quickfps"
 
     def validate(self) -> None:
+        if self.sampling_method != "quickfps":
+            raise ValueError("point-cloud sampling_method must be 'quickfps'")
         if type(self.remove_table) is not bool:
             raise TypeError("remove_table must be bool")
         for name, minimum in (
             ("num_points", 1),
             ("depth_support_min_neighbors", 0),
             ("edge_support_min_neighbors", 0),
-            ("table_object_seed_min_pixels", 1),
             ("outlier_min_neighbors", 0),
             ("outlier_min_component_points", 1),
             ("outlier_candidate_multiplier", 1),
-            ("sampling_coarse_voxel_stride", 1),
         ):
             value = getattr(self, name)
             if type(value) is not int or value < minimum:
@@ -61,7 +61,11 @@ class PointCloudConfig:
         workspace = np.asarray(self.workspace, dtype=np.float64)
         if workspace.shape != (6,):
             raise ValueError("workspace must contain six xyz lower/upper bounds")
-        if not all(np.all(np.isfinite(value)) for value in astuple(self)):
+        numeric_values = (
+            self.depth_min_m, self.depth_max_m, self.edge_jump_m, self.edge_surface_band_m,
+            self.voxel_size_m, self.outlier_radius_m, *workspace,
+        )
+        if not np.isfinite(numeric_values).all():
             raise ValueError("point-cloud configuration values must be finite")
         if not 0.0 < self.depth_min_m < self.depth_max_m:
             raise ValueError("depth range must satisfy 0 < depth_min_m < depth_max_m")
@@ -69,11 +73,38 @@ class PointCloudConfig:
             raise ValueError("edge thresholds must be non-negative with positive jump")
         if max(self.depth_support_min_neighbors, self.edge_support_min_neighbors) > 8:
             raise ValueError("depth/edge support must use at most eight neighbors")
-        if self.table_core_height_m < 0.0:
-            raise ValueError("table_core_height_m must be non-negative")
-        if self.table_object_seed_height_m <= self.table_core_height_m:
-            raise ValueError("table_object_seed_height_m must exceed table_core_height_m")
+        if self.remove_table:
+            for name in ("table_core_height_m", "table_object_seed_height_m"):
+                value = getattr(self, name)
+                if type(value) not in (int, float) or not np.isfinite(value):
+                    raise ValueError(f"{name} must be a finite number")
+            if (
+                type(self.table_object_seed_min_pixels) is not int
+                or self.table_object_seed_min_pixels < 1
+            ):
+                raise ValueError("table_object_seed_min_pixels must be an integer >= 1")
+            if not 0.0 <= self.table_core_height_m < self.table_object_seed_height_m:
+                raise ValueError("table heights must satisfy 0 <= core < object_seed")
         if self.voxel_size_m <= 0.0 or self.outlier_radius_m <= 0.0:
             raise ValueError("voxel and outlier radii must be positive")
         if np.any(workspace[:3] >= workspace[3:]):
             raise ValueError("workspace lower bounds must be strictly below upper bounds")
+
+
+def resolve_saved_pointcloud_recipe(recipe):
+    """Only inactive table-removal values may use defaults in an artifact recipe."""
+    if not isinstance(recipe, dict):
+        raise ValueError("saved pointcloud recipe must be a mapping")
+    required = {field.name for field in fields(PointCloudConfig)}
+    if recipe.get("remove_table") is False:
+        required -= {
+            "table_core_height_m",
+            "table_object_seed_height_m",
+            "table_object_seed_min_pixels",
+        }
+    missing = required - recipe.keys()
+    if missing:
+        raise ValueError(f"Saved pointcloud recipe missing fields: {sorted(missing)}")
+    config = PointCloudConfig(**{**recipe, "workspace": tuple(recipe["workspace"])})
+    config.validate()
+    return config

@@ -36,6 +36,7 @@ class ControlParams:
     vr_mapping: VRMappingParams = field(default_factory=VRMappingParams)
 
     workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
+    eef_workspace_margin_m: float = 0.005
 
     recording_enabled: bool = True
     max_record_duration_s: float = 60.0

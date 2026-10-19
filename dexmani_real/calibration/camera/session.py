@@ -20,7 +20,7 @@ from dexmani_real.calibration.camera.solver import (
     ArucoConfig,
     CalibrationConfig,
     CalibrationSamples,
-    calibrate_and_select,
+    HandEyeCalibrator,
     detect_aruco_pose,
     draw_calibration_overlay,
     eef_rpy_from_rot6d,
@@ -30,8 +30,9 @@ from dexmani_real.calibration.camera.solver import (
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning import XArm7MotionPlanner
+from dexmani_real.planning.admission import TargetAdmission
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
-from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_config
+from dexmani_real.planning.kinematics.ik import IKFailureKind, OnlineIKSolver, make_online_ik_solver
 from dexmani_real.robot.home import execute_arm_home
 from dexmani_real.robot.commands import RobotCommand, DispatchError
 from dexmani_real.robot.robot import DexManiRobot
@@ -40,20 +41,22 @@ from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, SafetyState, RuntimeState
 from dexmani_real.sensor.camera.worker import run_camera_worker
-from dexmani_real.teleop.config import validate_keyboard_workspace
+from dexmani_real.config.experiment import validate_keyboard_workspace
 from dexmani_real.teleop.jog import (
-    any_jog_key_held, compute_cartesian_jog_delta, propose_cartesian_jog_pose,
+    any_jog_key_held,
+    compute_cartesian_jog_delta,
+    propose_cartesian_jog_pose,
 )
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.rate import LoopRate
+from dexmani_real.utils.timing import LoopRate
 
 logger = logging.getLogger(__name__)
 
 _WINDOW_NAME = "ArUco Calibration"
 
 
-def _detect_aruco_stable(
-    shared: RuntimeState,
+def detect_aruco_stable(
+    runtime_state: RuntimeState,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
     *,
@@ -73,7 +76,7 @@ def _detect_aruco_stable(
         while time.monotonic() < deadline:
             if cancel_requested():
                 raise CancelledError("calibration capture cancelled")
-            frame = read_camera_frame(shared)
+            frame = read_camera_frame(runtime_state)
             if (
                 frame
                 and frame["timestamp_ns"] > last_stamp
@@ -108,25 +111,27 @@ def _detect_aruco_stable(
     )
 
 
-def _build_planner(
+def build_planner(
     runtime: ExperimentConfig,
-) -> tuple[XArm7MotionPlanner, np.ndarray]:
-    workspace = runtime.policy.workspace.as_array()
+) -> tuple[XArm7MotionPlanner, OnlineIKSolver, np.ndarray]:
+    workspace = runtime.control.workspace.as_array()
     planner = XArm7MotionPlanner(
         workspace_bounds=workspace,
-        online_ik_config=make_online_ik_config(
-            runtime,
-            max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
-            max_pose_error_rot_rad=float(runtime.keyboard_teleop.ik_max_pose_error_rot_rad),
-        ),
         static_boxes=tuple(runtime.environment.static_boxes),
         table=runtime.environment.table,
     )
     planner.set_hand_qpos(np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64)))
-    return planner, workspace
+    solver = make_online_ik_solver(
+        runtime,
+        kin=planner.kin,
+        collision_model=planner.collision_model,
+        max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
+        max_pose_error_rot_rad=float(runtime.keyboard_teleop.ik_max_pose_error_rot_rad),
+    )
+    return planner, solver, workspace
 
 
-def _read_stationary_calibration_arm_state(
+def read_stationary_calibration_arm_state(
     runtime: ExperimentConfig,
     robot,
 ) -> tuple[np.void | None, str]:
@@ -146,7 +151,7 @@ def _read_stationary_calibration_arm_state(
     return arm_state, ""
 
 
-def _calibration_capture_metadata(
+def calibration_capture_metadata(
     *,
     width: int,
     height: int,
@@ -159,7 +164,8 @@ def _calibration_capture_metadata(
     rotation_errors_deg: np.ndarray,
 ) -> dict[str, object]:
     """Summarize solver residuals and camera geometry for publication."""
-    def _summary(values: np.ndarray) -> dict[str, float]:
+
+    def summary(values: np.ndarray) -> dict[str, float]:
         return {
             "mean": float(values.mean()),
             "rms": float(np.sqrt(np.mean(values**2))),
@@ -174,13 +180,13 @@ def _calibration_capture_metadata(
         "distortion": distortion.tolist(),
         "method": method,
         "sample_count": sample_count,
-        "position_error_mm": _summary(position_errors_mm),
-        "rotation_error_deg": _summary(rotation_errors_deg),
+        "position_error_mm": summary(position_errors_mm),
+        "rotation_error_deg": summary(rotation_errors_deg),
         "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
 
 
-def _solve_calibration(
+def solve_calibration(
     samples: CalibrationSamples,
     planner: XArm7MotionPlanner,
     config: CalibrationConfig,
@@ -195,7 +201,7 @@ def _solve_calibration(
     sample_count = len(samples)
     print(f"\n  computing hand-eye calibration ({sample_count} samples, 5 methods)...")
     try:
-        result = calibrate_and_select(samples, config)
+        result = HandEyeCalibrator(config).solve(samples)
     except (ValueError, cv2.error) as exc:
         logger.warning("solve failed", exc_info=True)
         print(f"FAILED — {exc}, skipped")
@@ -239,7 +245,7 @@ def _solve_calibration(
         print(f"    #{index + 1:2d} {residual_mm:6.1f} {bar}{flag}")
     print(f"  T_world_camera position: {np.round(T_world_camera[:3, 3], 4)}m")
 
-    metadata = _calibration_capture_metadata(
+    metadata = calibration_capture_metadata(
         width=width,
         height=height,
         requested_fps=requested_fps,
@@ -254,7 +260,7 @@ def _solve_calibration(
     return T_world_camera, metadata
 
 
-def _log_workspace_clipping(
+def log_workspace_clipping(
     desired_pos: np.ndarray,
     clipped_pos: np.ndarray,
     last_warning_s: float,
@@ -277,77 +283,67 @@ def _log_workspace_clipping(
 class CameraCalibrationSession:
     """Own calibration samples, motion authority, devices, keyboard and preview lifetime."""
 
-    def __init__(self, runtime, planner, workspace, calibration_config, aruco_config, output_path):
+    def __init__(
+        self,
+        runtime: ExperimentConfig,
+        *,
+        hand_geometry: str,
+        calibration_config: CalibrationConfig | None = None,
+        aruco_config: ArucoConfig | None = None,
+        output_path=CAMERAS_PATH,
+    ):
         self.runtime = runtime
-        self.planner = planner
-        self.workspace = workspace
+        self.hand_geometry = hand_geometry
         self.calibration_config = calibration_config
         self.aruco_config = aruco_config
         self.output_path = output_path
-        self.ctx = mp.get_context("spawn")
-        self.shared = RuntimeState(SensorChannels(self.ctx, camera=runtime.camera))
-        self.sensors = SensorProcesses(self.shared)
-        self.keys = None
-        self.window_created = False
-        self.robot = DexManiRobot(self.shared, runtime, check_services=self._check_services)
-        self.samples = CalibrationSamples()
-        self.command_qpos = self.command_pose = None
-        self.calibration_saved = False
-        self.home_key_down = False
-        self.frame = 0
-        self.last_ik_warning_s = self.last_boundary_warning_s = 0.0
-        self.blocked_until_release = False
 
-    def _check_services(self):
+    def check_services(self):
         return self.sensors.check() and (self.keys is None or self.keys.healthy)
 
-    def _fault(self, reason, *, estop=False, run_end_reason=RunEndReason.HARDWARE_FAULT):
+    def fault(self, reason, *, estop=False, run_end_reason=RunEndReason.HARDWARE_FAULT):
         logger.error("Calibration fault: %s", reason)
         if estop:
-            self.shared.request_emergency_stop()
+            self.runtime_state.request_emergency_stop()
         else:
-            self.shared.error_state = True
-        self.shared.revoke_motion(SafetyState.FAULT, reason=run_end_reason)
+            self.runtime_state.mark_error()
+        self.runtime_state.revoke_motion(SafetyState.FAULT, reason=run_end_reason)
 
-    def _runtime_issue(self, arm):
-        if self.shared.estop_request:
+    def runtime_issue(self, arm):
+        if self.runtime_state.estop_request:
             return "e-stop is requested"
-        if self.shared.error_state:
+        if self.runtime_state.error_state:
             return "runtime error latch is set"
-        if self.shared.safety_state == SafetyState.FAULT:
+        if self.runtime_state.safety_state == SafetyState.FAULT:
             return "safety state is FAULT"
-        if not sample_is_fresh(
-            arm["timestamp_ns"], self.runtime.arm.feedback_max_age_s
-        ):
+        if not sample_is_fresh(arm["timestamp_ns"], self.runtime.arm.feedback_max_age_s):
             return "arm feedback stale"
         return None
 
-    def _cancel_requested(self):
+    def cancel_requested(self):
         return bool(
-            self.shared.quit_requested
-            or self.shared.estop_request
-            or self.shared.error_state
-            or not self.shared.running
+            self.runtime_state.quit_requested
+            or self.runtime_state.estop_request
+            or self.runtime_state.error_state
+            or not self.runtime_state.running
             or not self.keys.healthy
             or self.keys.is_pressed("q")
             or self.keys.is_pressed("esc")
             or not self.camera_process.is_alive()
         )
 
-    def _capture_sample(self):
+    def capture_sample(self):
         """Append one marker/arm observation only when the arm stayed stationary."""
-        if self._cancel_requested():
+        if self.cancel_requested():
             return
         print(f"\n  [{len(self.samples) + 1}] capturing ArUco pose...", end=" ", flush=True)
-        arm_before, feedback_issue = _read_stationary_calibration_arm_state(
-            self.runtime, self.robot
-        )
+        arm_before, feedback_issue = read_stationary_calibration_arm_state(self.runtime, self.robot)
         if arm_before is None:
             print(f"FAILED — before capture: {feedback_issue}, skipped")
             return
         try:
-            aruco_pose = _detect_aruco_stable(
-                self.shared,
+            aruco_pose = detect_aruco_stable(
+                self.runtime_state,
                 self.intrinsics,
                 self.distortion,
                 detector=self.capture_detector,
@@ -355,7 +351,7 @@ class CameraCalibrationSession:
                 target_id=self.aruco_config.target_id,
                 max_frame_age_s=self.runtime.camera.max_frame_age_s,
                 n_frames=self.aruco_config.capture_frames,
-                cancel_requested=self._cancel_requested,
+                cancel_requested=self.cancel_requested,
             )
         except CancelledError:
             print("CANCELLED")
@@ -365,10 +361,10 @@ class CameraCalibrationSession:
             print(f"FAILED — {exc}, skipped")
             return
 
-        if self._cancel_requested():
+        if self.cancel_requested():
             return
-        arm_after, feedback_issue = _read_stationary_calibration_arm_state(self.runtime, self.robot)
-        if self._cancel_requested():
+        arm_after, feedback_issue = read_stationary_calibration_arm_state(self.runtime, self.robot)
+        if self.cancel_requested():
             return
         if arm_after is None:
             print(f"FAILED — after capture: {feedback_issue}, skipped")
@@ -390,7 +386,7 @@ class CameraCalibrationSession:
         marker_rvec, marker_tvec = aruco_pose
         eef_pos_base_m, eef_rot6d_base = make_arm_fk().compute(arm_after_qpos)
         eef_rpy_base_rad = eef_rpy_from_rot6d(eef_rot6d_base)
-        if self._cancel_requested():
+        if self.cancel_requested():
             return
         self.samples.append(
             eef_pos_base_m,
@@ -403,9 +399,9 @@ class CameraCalibrationSession:
             f"marker_dist={np.linalg.norm(marker_tvec):.3f}m"
         )
 
-    def _show_preview(self):
+    def show_preview(self):
         """Poll and display the newest camera preview without blocking control."""
-        frame = read_camera_frame(self.shared)
+        frame = read_camera_frame(self.runtime_state)
         if frame and sample_is_fresh(frame["timestamp_ns"], self.runtime.camera.max_frame_age_s):
             image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
             self.display_image = draw_calibration_overlay(
@@ -423,15 +419,15 @@ class CameraCalibrationSession:
             cv2.imshow(_WINDOW_NAME, self.display_image)
         cv2.waitKey(1)
 
-    def _handle_sample_events(self):
+    def handle_sample_events(self):
         """Drain edge-triggered capture, undo, reject, and solve events."""
         event = self.keys.pop_event()
         while event is not None:
-            if self._cancel_requested():
+            if self.cancel_requested():
                 return
             self.robot.check()
             if event == "space":
-                self._capture_sample()
+                self.capture_sample()
             elif event == "backspace":
                 if self.samples.pop_last():
                     print(f"  undone, {len(self.samples)} remaining")
@@ -449,17 +445,17 @@ class CameraCalibrationSession:
                         "— press ENTER to recompute"
                     )
             elif event == "enter":
-                self.shared.revoke_motion()
+                self.runtime_state.revoke_motion()
                 self.robot.stop()
                 self.command_qpos = self.command_pose = None
-                epoch = self.shared.run_id
+                epoch = self.runtime_state.run_id
 
                 def cancelled():
-                    return self._cancel_requested() or self.shared.run_id != epoch
+                    return self.cancel_requested() or self.runtime_state.run_id != epoch
 
-                candidate = _solve_calibration(
+                candidate = solve_calibration(
                     self.samples,
-                    self.planner,
+                    self.home_planner,
                     self.calibration_config,
                     width=self.camera_width,
                     height=self.camera_height,
@@ -485,32 +481,35 @@ class CameraCalibrationSession:
             event = self.keys.pop_event()
 
     def run(self) -> int:
+        self.prepare()
         exit_code = 1
         try:
             self.robot.connect()
             self.camera_process = self.ctx.Process(
-                name="camera", target=run_camera_worker, args=(self.shared.sensors, self.runtime.camera)
+                name="camera",
+                target=run_camera_worker,
+                args=(self.runtime_state.sensors, self.runtime.camera),
             )
             self.sensors.start(
-                self.camera_process, ready=self.shared.sensors.camera_ready,
+                self.camera_process,
+                ready=self.runtime_state.sensors.camera_ready,
                 timeout_s=self.runtime.safety.camera_ready_timeout_s,
             )
-            self.shared.arm()
+            self.runtime_state.arm()
             print("  local arm connected (owner process; Mode 1 prepared on jog)")
             initial_state = self.robot.read_state().arm[0]
 
-            def request_quit():
-                self.shared.revoke_motion(reason=RunEndReason.QUIT)
-                self.shared.quit_requested = True
-
             self.keys = KeyboardInput(
-                quit_callback=request_quit,
+                jog_change_callback=self.runtime_state.revoke_motion,
+                quit_callback=self.runtime_state.request_quit,
                 capture_commands=False,
                 capture_raw_events=True,
-                estop_callback=lambda: self._fault("operator e-stop callback", estop=True),
+                estop_callback=lambda: self.fault("operator e-stop callback", estop=True),
             )
-            self.serial = self.shared.sensors.camera_serial.value.decode()
-            geometry = json.loads(self.shared.sensors.camera_geometry.value.decode())["color"]
+            self.serial = self.runtime_state.sensors.camera_serial.value.decode()
+            geometry = json.loads(self.runtime_state.sensors.camera_geometry.value.decode())[
+                "color"
+            ]
             self.camera_width, self.camera_height = geometry["width"], geometry["height"]
             self.intrinsics = np.array(
                 [
@@ -529,14 +528,15 @@ class CameraCalibrationSession:
             self.keys.start()
             cv2.namedWindow(_WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
             self.window_created = True
-            exit_code = self._run_control_loop(initial_state)
+            exit_code = self.run_control_loop(initial_state)
         except KeyboardInterrupt:
-            self._fault("KeyboardInterrupt", estop=True)
+            self.fault("KeyboardInterrupt", estop=True)
             exit_code = 130
         except Exception as exc:
             logger.exception("calibration session failed")
-            self._fault(
-                f"calibration session failed: {exc}", run_end_reason=RunEndReason.POLICY_FAILURE,
+            self.fault(
+                f"calibration session failed: {exc}",
+                run_end_reason=RunEndReason.POLICY_FAILURE,
             )
         finally:
             if not self.close():
@@ -546,7 +546,10 @@ class CameraCalibrationSession:
 
     def close(self) -> bool:
         clean = shutdown_local_runtime(
-            self.shared, self.robot, sensors=self.sensors, keyboard=self.keys,
+            self.runtime_state,
+            self.robot,
+            sensors=self.sensors,
+            keyboard=self.keys,
             timeout_s=self.runtime.safety.shutdown_timeout_s,
         )
         if self.window_created:
@@ -558,7 +561,7 @@ class CameraCalibrationSession:
                 clean = False
         return clean
 
-    def _run_control_loop(self, initial_state):
+    def run_control_loop(self, initial_state):
         self.current_qpos = initial_state["qpos"]
         self.feedback_timestamp_ns = int(initial_state["timestamp_ns"])
         self.marker_corners = marker_corners_3d(self.aruco_config.marker_size_m)
@@ -569,7 +572,8 @@ class CameraCalibrationSession:
         capture_params = cv2.aruco.DetectorParameters()
         capture_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.capture_detector = cv2.aruco.ArucoDetector(
-            cv2.aruco.getPredefinedDictionary(ARUCO_DICT), capture_params,
+            cv2.aruco.getPredefinedDictionary(ARUCO_DICT),
+            capture_params,
         )
         self.rate = LoopRate(
             float(self.runtime.keyboard_teleop.control_hz),
@@ -584,46 +588,46 @@ class CameraCalibrationSession:
         print(f"  Preview window: {_WINDOW_NAME} (green=detected, red=not found)")
 
         self.display_image: np.ndarray | None = None
-        while self.shared.running:
+        while self.runtime_state.running:
             self.rate.wait()
             self.frame += 1
 
             if self.keys.is_pressed("esc"):
-                self._fault("operator e-stop", estop=True)
+                self.fault("operator e-stop", estop=True)
                 return 1
             if not self.keys.healthy:
-                self._fault("keyboard listener exited", estop=True)
+                self.fault("keyboard listener exited", estop=True)
                 return 1
             if not self.camera_process.is_alive():
                 logger.error("camera worker exited: %s", self.camera_process.exitcode)
-                self._fault("camera worker exited")
+                self.fault("camera worker exited")
                 return 1
 
-            if self.shared.quit_requested or self.keys.is_pressed("q"):
-                self.shared.revoke_motion(reason=RunEndReason.QUIT)
+            if self.runtime_state.quit_requested or self.keys.is_pressed("q"):
+                self.runtime_state.revoke_motion(reason=RunEndReason.QUIT)
                 self.robot.stop()
                 return 0 if self.calibration_saved else 2
-            self._show_preview()
-            self._handle_sample_events()
-            if self._cancel_requested():
+            self.show_preview()
+            self.handle_sample_events()
+            if self.cancel_requested():
                 continue
             # Capture/solve can block; jog must use feedback read afterwards.
             arm_state = self.robot.read_state().arm[0]
-            issue = self._runtime_issue(arm_state)
+            issue = self.runtime_issue(arm_state)
             if issue is not None:
-                self._fault(issue)
+                self.fault(issue)
                 return 1
             self.current_qpos = arm_state["qpos"]
             self.feedback_timestamp_ns = int(arm_state["timestamp_ns"])
 
-            if self._handle_home_key():
-                if self.shared.safety_state == SafetyState.FAULT:
+            if self.handle_home_key():
+                if self.runtime_state.safety_state == SafetyState.FAULT:
                     return 1
                 continue
-            self._motion_tick()
+            self.motion_tick()
         return 0
 
-    def _handle_home_key(self):
+    def handle_home_key(self):
         """Handle one return-home key edge and re-anchor the motion state."""
         home_pressed = self.keys.is_pressed("r")
         if not home_pressed:
@@ -635,23 +639,23 @@ class CameraCalibrationSession:
         self.command_qpos = None
         self.command_pose = None
 
-        if self.shared.safety_state == SafetyState.RUNNING:
-            if not self.shared.revoke_motion(SafetyState.ARMED):
-                self._fault("failed to stop calibration motion before home")
+        if self.runtime_state.safety_state == SafetyState.RUNNING:
+            if not self.runtime_state.revoke_motion(SafetyState.ARMED):
+                self.fault("failed to stop calibration motion before home")
                 return True
         self.robot.stop()
         home_result = execute_arm_home(
-            self.shared,
+            self.runtime_state,
             np.asarray(self.runtime.arm.home_qpos, dtype=np.float64),
             robot=self.robot,
-            planner=self.planner,
+            planner=self.home_planner,
             config=self.runtime.arm,
             estop_requested=lambda: self.keys.is_pressed("esc") or not self.keys.healthy,
-            cancel_requested=lambda: bool(self.shared.quit_requested),
+            cancel_requested=lambda: bool(self.runtime_state.quit_requested),
             progress=lambda message: print(f"  {message}", flush=True),
         )
-        if self.shared.estop_request:
-            self._fault("operator e-stop during homing")
+        if self.runtime_state.estop_request:
+            self.fault("operator e-stop during homing")
             return True
         refreshed = self.robot.read_state().arm[0]
 
@@ -663,40 +667,43 @@ class CameraCalibrationSession:
         self.rate.reset()
         return True
 
-    def _motion_tick(self):
+    def motion_tick(self):
         """Propose a jog target and commit it only after successful dispatch."""
-        safety_state = self.shared.safety_state
+        safety_state = self.runtime_state.safety_state
         if (
-            self.shared.error_state
-            or self.shared.estop_request
-            or not self.shared.running
+            self.runtime_state.error_state
+            or self.runtime_state.estop_request
+            or not self.runtime_state.running
             or safety_state not in (SafetyState.ARMED, SafetyState.RUNNING)
         ):
             self.command_qpos = None
             self.command_pose = None
-            self._fault("unexpected calibration motion state")
+            self.fault("unexpected calibration motion state")
             return
         if self.blocked_until_release:
             if self.robot.stop_required:
-                self.shared.revoke_motion()
+                self.runtime_state.revoke_motion()
                 self.robot.stop()
                 self.command_qpos = self.command_pose = None
             if not any_jog_key_held(self.keys.pressed_keys()):
                 self.blocked_until_release = False
             return
         keyboard = self.runtime.keyboard_teleop
+        pressed_keys, generation = self.keys.snapshot()
         dx, drpy = compute_cartesian_jog_delta(
-            self.keys, keyboard.delta_pos_m, keyboard.delta_rpy_rad,
+            pressed_keys,
+            keyboard.delta_pos_m,
+            keyboard.delta_rpy_rad,
         )
         moving = bool(np.any(dx != 0.0) or np.any(drpy != 0.0))
         if not moving:
             if self.robot.stop_required:
-                self.shared.revoke_motion()
+                self.runtime_state.revoke_motion()
                 self.robot.stop()
                 self.command_qpos = self.command_pose = None
             idle_interval = int(self.runtime.keyboard_teleop.idle_interval_frames)
             if self.frame % idle_interval == 0:
-                measured_pose = self.planner.kin.compute_eef_pose_world(self.current_qpos)
+                measured_pose = self.solver.kin.compute_eef_pose_world(self.current_qpos)
                 print(
                     f"[f={self.frame}] samples={len(self.samples)} "
                     f"eef={np.round(measured_pose.p, 3)}m",
@@ -704,7 +711,7 @@ class CameraCalibrationSession:
                 )
             return
 
-        epoch = self.shared.run_id
+        epoch = self.runtime_state.run_id
         if safety_state == SafetyState.ARMED:
             self.command_qpos = self.command_pose = None
             if self.robot.stop_required:
@@ -721,18 +728,26 @@ class CameraCalibrationSession:
             refreshed = self.robot.read_state().arm[0]
             self.current_qpos = refreshed["qpos"]
             self.feedback_timestamp_ns = int(refreshed["timestamp_ns"])
+            pressed_keys, refreshed_generation = self.keys.snapshot()
+            if refreshed_generation != generation:
+                return
+            dx, drpy = compute_cartesian_jog_delta(
+                pressed_keys,
+                keyboard.delta_pos_m,
+                keyboard.delta_rpy_rad,
+            )
         baseline_qpos = self.command_qpos
         baseline_pose = self.command_pose
         if baseline_qpos is None:
             baseline_qpos = self.current_qpos.copy()
-            baseline_pose = self.planner.kin.compute_eef_pose_world(self.current_qpos)
+            baseline_pose = self.solver.kin.compute_eef_pose_world(self.current_qpos)
         workspace_margin_m = float(self.runtime.keyboard_teleop.workspace_command_margin_m)
         command_low = self.workspace[:, 0] + workspace_margin_m
         command_high = self.workspace[:, 1] - workspace_margin_m
         proposed_pose, desired_pos, changed = propose_cartesian_jog_pose(
             baseline_pose, dx, drpy, command_low, command_high
         )
-        self.last_boundary_warning_s = _log_workspace_clipping(
+        self.last_boundary_warning_s = log_workspace_clipping(
             desired_pos,
             proposed_pose.p,
             self.last_boundary_warning_s,
@@ -741,7 +756,7 @@ class CameraCalibrationSession:
             self.blocked_until_release = True
             return
 
-        ik_result = self.planner.solve_online_ik(
+        ik_result = self.solver.solve(
             proposed_pose,
             self.current_qpos,
             baseline_qpos,
@@ -757,19 +772,32 @@ class CameraCalibrationSession:
             self.blocked_until_release = True
             return
 
+        rejection = self.admission.rejection(
+            ik_result.qpos,
+            self.current_qpos,
+            baseline_qpos,
+            collision_hand_qpos=np.deg2rad(self.runtime.hand.home_qpos_deg),
+        )
+        if rejection is not None:
+            self.blocked_until_release = True
+            logger.warning("calibration target rejected: %s", rejection)
+            return
+        if self.keys.snapshot()[1] != generation:
+            return
+
         if safety_state == SafetyState.ARMED:
-            with self.shared.motion_lock:
+            with self.runtime_state.motion_lock:
                 # A revoke during IK must also fence the first jog proposal.
-                if self.shared.run_id != epoch:
+                if self.runtime_state.run_id != epoch:
                     self.command_qpos = None
                     self.command_pose = None
                     return
-                if not self.shared.begin_motion():
+                if not self.runtime_state.begin_motion():
                     self.command_qpos = None
                     self.command_pose = None
-                    self._fault("failed to enter calibration motion")
+                    self.fault("failed to enter calibration motion")
                     return
-                epoch = self.shared.run_id
+                epoch = self.runtime_state.run_id
         q_cmd = ik_result.qpos
         try:
             self.robot.arm.update_health(upstream_until_ns=2**63 - 1)
@@ -779,14 +807,16 @@ class CameraCalibrationSession:
                 + int(self.runtime.arm.feedback_max_age_s * 1e9)
                 + 1,
                 execute_until_ns=self.feedback_timestamp_ns
-                + int(self.runtime.policy.vr_mapping.stale_threshold_s * 1e9),
+                + int(self.runtime.control.vr_mapping.stale_threshold_s * 1e9),
             )
         except DispatchError as exc:
             if not exc.revoked:
-                self.shared.revoke_motion(SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
+                self.runtime_state.revoke_motion(
+                    SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT
+                )
                 raise
             logger.info("calibration motion interrupted: dispatch=%s", exc.result)
-            self.shared.revoke_motion(expected_run_id=epoch)
+            self.runtime_state.revoke_motion(expected_run_id=epoch)
             self.robot.stop()
             self.command_qpos = self.command_pose = None
             return
@@ -794,7 +824,7 @@ class CameraCalibrationSession:
         self.command_qpos = q_cmd.copy()
 
         if self.frame % self.calibration_config.status_interval_frames == 0:
-            measured_pose = self.planner.kin.compute_eef_pose_world(self.current_qpos)
+            measured_pose = self.solver.kin.compute_eef_pose_world(self.current_qpos)
             print(
                 f"[f={self.frame}] samples={len(self.samples)} "
                 f"eef={np.round(measured_pose.p, 3)}m "
@@ -802,45 +832,54 @@ class CameraCalibrationSession:
                 flush=True,
             )
 
+    def prepare(self):
+        """Absent and secured-home declarations both retain the conservative fixed-home hand envelope."""
+        configure_logging()
+        if self.hand_geometry not in {"absent", "secured-home"}:
+            raise ValueError("hand_geometry must be 'absent' or 'secured-home'")
+        if self.runtime.control.hand_enabled:
+            raise ValueError(
+                "camera calibration requires explicit hand_enabled=false and secured/absent hand"
+            )
+        from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
 
-def run_camera_calibration(
-    runtime: ExperimentConfig,
-    *,
-    hand_geometry: str,
-    calibration_config: CalibrationConfig | None = None,
-    aruco_config: ArucoConfig | None = None,
-    output_path=CAMERAS_PATH,
-) -> int:
-    """Run calibration with bounded cleanup and an operator-declared hand geometry.
-    Both absent and secured-home use the conservative fixed-home XHand collision envelope.
-    """
-    configure_logging()
-    if hand_geometry not in {"absent", "secured-home"}:
-        raise ValueError("hand_geometry must be 'absent' or 'secured-home'")
-    if runtime.policy.hand_enabled:
-        raise ValueError(
-            "camera calibration requires explicit hand_enabled=false and secured/absent hand"
-        )
-    from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
+        validate_robot_config(self.runtime)
+        self.runtime = resolve_runtime_table(self.runtime)
+        validate_keyboard_workspace(self.runtime)
+        self.runtime.camera.validate()
+        calib_cfg = self.calibration_config or CalibrationConfig()
+        aruco_cfg = self.aruco_config or ArucoConfig()
+        planner, solver, workspace = build_planner(self.runtime)
+        if self.hand_geometry == "absent":
+            print(
+                "  XHand: absent (operator assertion); IK/home geometry conservatively "
+                "retains the fixed-home XHand envelope"
+            )
+        else:
+            print(
+                "  XHand: mounted and secured at configured home (operator assertion); "
+                "IK/home geometry uses the fixed-home XHand envelope"
+            )
 
-    validate_robot_config(runtime)
-    runtime = resolve_runtime_table(runtime)
-    validate_keyboard_workspace(runtime)
-    runtime.camera.validate()
-    calib_cfg = calibration_config or CalibrationConfig()
-    aruco_cfg = aruco_config or ArucoConfig()
-    planner, workspace = _build_planner(runtime)
-    if hand_geometry == "absent":
-        print(
-            "  XHand: absent (operator assertion); IK/home geometry conservatively "
-            "retains the fixed-home XHand envelope"
+        self.home_planner, self.solver = planner, solver
+        self.admission = TargetAdmission(
+            self.runtime, solver.collision_model, dynamic_rejection=solver.dynamic_rejection
         )
-    else:
-        print(
-            "  XHand: mounted and secured at configured home (operator assertion); "
-            "IK/home geometry uses the fixed-home XHand envelope"
+        self.workspace = workspace
+        self.calibration_config = calib_cfg
+        self.aruco_config = aruco_cfg
+        self.ctx = mp.get_context("spawn")
+        self.runtime_state = RuntimeState(SensorChannels(self.ctx, camera=self.runtime.camera))
+        self.sensors = SensorProcesses(self.runtime_state)
+        self.keys = None
+        self.window_created = False
+        self.robot = DexManiRobot(
+            self.runtime_state, self.runtime, check_services=self.check_services
         )
-
-    return CameraCalibrationSession(
-        runtime, planner, workspace, calib_cfg, aruco_cfg, output_path
-    ).run()
+        self.samples = CalibrationSamples()
+        self.command_qpos = self.command_pose = None
+        self.calibration_saved = False
+        self.home_key_down = False
+        self.frame = 0
+        self.last_ik_warning_s = self.last_boundary_warning_s = 0.0
+        self.blocked_until_release = False

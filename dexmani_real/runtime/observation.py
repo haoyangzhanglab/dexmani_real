@@ -22,20 +22,25 @@ def feedback_deadline_ns(row, runtime, *, include_vr=False):
         )
     if include_vr:
         deadlines.append(
-            int(row.vr["recv_ts_ns"]) + int(runtime.policy.vr_mapping.stale_threshold_s * 1e9) + 1
+            int(row.vr["recv_ts_ns"]) + int(runtime.control.vr_mapping.stale_threshold_s * 1e9) + 1
         )
     return min(deadlines)
 
 
 def hand_feedback_time_ns(hand):
     """Oldest required hand source, without conflating tactile age with joint time."""
-    return min(int(hand[name][0]) for name in (
-        "timestamp_ns", "tactile_aggregate_timestamp_ns", "tactile_dense_timestamp_ns",
-    ))
+    return min(
+        int(hand[name][0])
+        for name in (
+            "timestamp_ns",
+            "tactile_aggregate_timestamp_ns",
+            "tactile_dense_timestamp_ns",
+        )
+    )
 
 
-def read_vr_frame(shared):
-    result = shared.sensors.vr_ring.read_latest(use_last_good=True)
+def read_vr_frame(runtime_state):
+    result = runtime_state.sensors.vr_ring.read_latest(use_last_good=True)
     if result is None:
         return None
     record = result[0][0]
@@ -45,8 +50,8 @@ def read_vr_frame(shared):
     }
 
 
-def read_camera_frame(shared, sequence=None):
-    ring = shared.sensors.camera_ring
+def read_camera_frame(runtime_state, sequence=None):
+    ring = runtime_state.sensors.camera_ring
     result = ring.read_latest() if sequence is None else ring.read_sequence(sequence)
     if result is None:
         return None
@@ -62,11 +67,11 @@ def read_camera_frame(shared, sequence=None):
     }
 
 
-def _freeze(value):
+def freeze(value):
     if isinstance(value, np.ndarray):
         value.flags.writeable = False
     elif isinstance(value, dict):
-        value = MappingProxyType({k: _freeze(v) for k, v in value.items()})
+        value = MappingProxyType({k: freeze(v) for k, v in value.items()})
     return value
 
 
@@ -88,7 +93,7 @@ class ObservationRow:
 
 
 def read_observation(
-    shared,
+    runtime_state,
     runtime,
     robot,
     *,
@@ -105,25 +110,27 @@ def read_observation(
     control_ns = time.monotonic_ns()
     state = (
         robot.read_initial_state(cancel_requested=cancel_requested)
-        if wait_for_hand else robot.read_state()
+        if wait_for_hand
+        else robot.read_state()
     )
     arm, hand = state.arm, state.hand if require_hand else None
-    cloud_result = shared.sensors.pointcloud_ring.read_latest(use_last_good=True) if require_pointcloud else None
-    if (
-        (require_hand and hand is None)
-        or (require_pointcloud and cloud_result is None)
-    ):
+    cloud_result = (
+        runtime_state.sensors.pointcloud_ring.read_latest(use_last_good=True)
+        if require_pointcloud
+        else None
+    )
+    if (require_hand and hand is None) or (require_pointcloud and cloud_result is None):
         unavailable.append("feedback_or_pointcloud_unavailable")
     cloud = cloud_result[0][0] if cloud_result else None
     if require_rgb_cloud_identity:
         camera = (
-            read_camera_frame(shared, int(cloud["source_camera_sequence"]))
+            read_camera_frame(runtime_state, int(cloud["source_camera_sequence"]))
             if cloud is not None
             else None
         )
     else:
-        camera = read_camera_frame(shared) if require_camera else None
-    vr = read_vr_frame(shared) if require_vr else None
+        camera = read_camera_frame(runtime_state) if require_camera else None
+    vr = read_vr_frame(runtime_state) if require_vr else None
     if (require_camera or require_rgb_cloud_identity) and camera is None:
         unavailable.append("camera_source_unavailable_or_unmatched")
     if require_vr and vr is None:
@@ -144,7 +151,7 @@ def read_observation(
     ):
         unavailable.append("pointcloud_stale")
     if vr is not None and not sample_is_fresh(
-        vr["recv_ts_ns"], runtime.policy.vr_mapping.stale_threshold_s, now
+        vr["recv_ts_ns"], runtime.control.vr_mapping.stale_threshold_s, now
     ):
         unavailable.append("vr_stale")
     if unavailable:
@@ -152,19 +159,23 @@ def read_observation(
             issues.extend(unavailable)
         return None
     row = ObservationRow(
-        _freeze(arm),
-        _freeze(hand),
-        _freeze(camera),
-        _freeze(vr),
-        _freeze(cloud["point_cloud"]) if cloud is not None else None,
-        now,
-        int(cloud["timestamp_ns"]) if cloud is not None else 0,
-        int(cloud["source_camera_sequence"]) if cloud is not None else -1,
-        control_ns,
-        int(cloud["camera_received_ns"]) if cloud is not None else -1,
-        int(cloud["camera_published_ns"]) if cloud is not None else -1,
-        int(cloud["processing_started_ns"]) if cloud is not None else -1,
-        int(cloud_result[1]) if cloud_result is not None else -1,
+        arm=freeze(arm),
+        hand=freeze(hand),
+        camera=freeze(camera),
+        vr=freeze(vr),
+        point_cloud=freeze(cloud["point_cloud"]) if cloud is not None else None,
+        observation_timestamp_ns=now,
+        pointcloud_timestamp_ns=int(cloud["timestamp_ns"]) if cloud is not None else 0,
+        pointcloud_camera_sequence=(
+            int(cloud["source_camera_sequence"]) if cloud is not None else -1
+        ),
+        control_timestamp_ns=control_ns,
+        pointcloud_camera_received_ns=int(cloud["camera_received_ns"]) if cloud is not None else -1,
+        pointcloud_camera_published_ns=(
+            int(cloud["camera_published_ns"]) if cloud is not None else -1
+        ),
+        pointcloud_started_ns=int(cloud["processing_started_ns"]) if cloud is not None else -1,
+        pointcloud_published_ns=int(cloud_result[1]) if cloud_result is not None else -1,
     )
 
     robot.update_observation_health(row)
@@ -182,9 +193,10 @@ def observation_timing(row):
         pointcloud_ns=int(row.pointcloud_timestamp_ns) if row.pointcloud_timestamp_ns > 0 else -1,
         camera_sequence=int(row.camera["ring_sequence"]) if row.camera is not None else -1,
         pointcloud_camera_sequence=int(row.pointcloud_camera_sequence),
-        **{f"camera_{name}": int(row.camera[name]) if row.camera is not None else -1
-           for name in ("received_ns", "published_ns",
-                        "depth_frame_number", "color_frame_number")},
+        **{
+            f"camera_{name}": int(row.camera[name]) if row.camera is not None else -1
+            for name in ("received_ns", "published_ns", "depth_frame_number", "color_frame_number")
+        },
         pointcloud_camera_received_ns=int(row.pointcloud_camera_received_ns),
         pointcloud_camera_published_ns=int(row.pointcloud_camera_published_ns),
         pointcloud_started_ns=int(row.pointcloud_started_ns),

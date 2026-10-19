@@ -5,7 +5,6 @@ from importlib import import_module
 from pathlib import Path
 import sys
 
-
 COMMANDS = {
     "capture": ("capture_object", "冻结并保存 RGB-D；默认连接相机"),
     "object": ("build_object", "分割、单图生成和资产准备"),
@@ -20,7 +19,8 @@ COMMANDS = {
 def main(argv=None, *, workspace=None):
     parser = argparse.ArgumentParser(
         prog="python -m cordvip_geometry" if Path(sys.argv[0]).name == "__main__.py" else None,
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="\n".join(f"  {name:10} {spec[1]}" for name, spec in COMMANDS.items())
         + "\n\n使用 <command> --help 查看对应参数。",
     )
