@@ -293,12 +293,12 @@ class CameraCalibrationSession:
         return self.sensors.check() and (self.keys is None or self.keys.healthy)
 
     def fault(self, reason, *, estop=False, run_end_reason=RunEndReason.HARDWARE_FAULT):
-        logger.error("Calibration fault: %s", reason)
         if estop:
             self.runtime_state.request_emergency_stop()
         else:
             self.runtime_state.mark_error()
         self.runtime_state.revoke_motion(SafetyState.FAULT, reason=run_end_reason)
+        logger.error("Calibration fault: %s", reason)
 
     def runtime_issue(self, arm):
         if self.runtime_state.estop_request:
@@ -575,6 +575,7 @@ class CameraCalibrationSession:
             f"size={self.aruco_config.marker_size_m * 1000:.1f}mm"
         )
         print("  Controls: WASD/arrows move, ←→/I/J/K/L rotate, SPACE capture, ENTER calibrate")
+        print("  Jog key changes stop and re-prepare motion; release all jog keys after a rejected target")
         print(f"  Preview window: {_WINDOW_NAME} (green=detected, red=not found)")
 
         self.display_image: np.ndarray | None = None
@@ -765,6 +766,11 @@ class CameraCalibrationSession:
             logger.warning("calibration target rejected: %s", rejection)
             return
         q_cmd = ik_result.qpos
+        next_qpos = q_cmd.copy()
+
+        def commit_reference():
+            self.command_pose, self.command_qpos = proposed_pose, next_qpos
+
         try:
             self.robot.arm.update_health(upstream_until_ns=2**63 - 1)
             committed = submit_jog_target(
@@ -774,6 +780,7 @@ class CameraCalibrationSession:
                 + 1,
                 execute_until_ns=self.feedback_timestamp_ns
                 + int(self.runtime.control.vr_mapping.stale_threshold_s * 1e9),
+                commit_reference=commit_reference,
             )
         except DispatchError as exc:
             if not exc.revoked:
@@ -787,8 +794,6 @@ class CameraCalibrationSession:
             return
         if committed is None:
             return
-        self.command_pose = proposed_pose
-        self.command_qpos = q_cmd.copy()
 
         if self.frame % self.calibration_config.status_interval_frames == 0:
             measured_pose = self.solver.kin.compute_eef_pose_base(self.current_qpos)

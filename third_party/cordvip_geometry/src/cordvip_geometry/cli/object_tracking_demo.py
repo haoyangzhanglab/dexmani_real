@@ -80,6 +80,7 @@ def run(args):
     if args.save_inputs:
         (output / "inputs").mkdir()
     source = viewer = writer = None
+    last_preview = None
     processed = 0
     rectification_maps = geometry.RectificationMaps()
     completion = dict(status="failed")
@@ -90,6 +91,7 @@ def run(args):
             source = iter_rgbd_directory(args.rgbd_dir)
         if not args.headless:
             viewer = DemoViewer(show_3d=not args.no_3d)
+        live_panel = viewer is not None or args.save_video
         paused = False
         with (output / "records.jsonl").open("x") as records:
             for frame in source:
@@ -111,9 +113,7 @@ def run(args):
                     f"source={short_source}  clock={frame.clock}",
                 ]
                 lines.append("Observed RGB-D only; camera frame, meters")
-                panel = make_panel(rgb, depth_m, lines=lines)
-                if not cv2.imwrite(str(output / "last_frame.png"), panel):
-                    raise RuntimeError("无法保存 last_frame.png")
+                panel = make_panel(rgb, depth_m, lines=lines) if live_panel else None
                 if args.save_video:
                     if writer is None:
                         writer = cv2.VideoWriter(
@@ -139,6 +139,9 @@ def run(args):
                 records.write(json.dumps(record, allow_nan=False) + "\n")
                 records.flush()
                 processed += 1
+                # Retain one completed frame, not an input sequence. Headless runs
+                # without video defer the only panel construction until shutdown.
+                last_preview = panel if live_panel else (rgb, depth_m, lines)
                 quit_requested = False
                 if viewer is not None:
                     while True:
@@ -170,21 +173,43 @@ def run(args):
     finally:
         active_exception = sys.exc_info()[0] is not None
         cleanup_errors = []
-        for name, resource, operation in (
-            ("input", source, "close"),
-            ("video", writer, "release"),
-            ("viewer", viewer, "close"),
-        ):
-            if resource is not None:
-                try:
-                    getattr(resource, operation)()
-                except Exception as error:
-                    cleanup_errors.append(f"{name}: {type(error).__name__}: {error}")
+        preview_error = None
+        try:
+            if last_preview is not None:
+                if live_panel:
+                    panel = last_preview
+                else:
+                    rgb, depth_m, lines = last_preview
+                    panel = make_panel(rgb, depth_m, lines=lines)
+                if not cv2.imwrite(str(output / "last_frame.png"), panel):
+                    raise RuntimeError("无法保存 last_frame.png")
+        except BaseException as error:
+            preview_error = error
+            completion["status"] = "failed"
+            completion["preview_error"] = f"{type(error).__name__}: {error}"
+        finally:
+            for name, resource, operation in (
+                ("input", source, "close"),
+                ("video", writer, "release"),
+                ("viewer", viewer, "close"),
+            ):
+                if resource is not None:
+                    try:
+                        getattr(resource, operation)()
+                    except Exception as error:
+                        cleanup_errors.append(f"{name}: {type(error).__name__}: {error}")
         if cleanup_errors:
             completion["status"] = "failed"
             completion["cleanup_errors"] = cleanup_errors
         completion["processed_frames"] = processed
-        (output / "result.json").write_text(json.dumps(completion, indent=2, ensure_ascii=False))
+        try:
+            (output / "result.json").write_text(json.dumps(completion, indent=2, ensure_ascii=False))
+        except Exception as error:
+            message = f"result.json: {type(error).__name__}: {error}"
+            cleanup_errors.append(message)
+            print(message, file=sys.stderr)
+        if preview_error is not None and not active_exception:
+            raise preview_error
         if cleanup_errors and not active_exception:
             raise RuntimeError("; ".join(cleanup_errors))
     print(f"完成 {processed} 帧；模式=observed；结果：{output}", flush=True)

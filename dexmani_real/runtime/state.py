@@ -42,7 +42,7 @@ class RuntimeState:
     quit_requested: bool = False
     stop_request: bool = False
     safety_state: SafetyState = SafetyState.DISARMED
-    # Never held across an SDK call; keyboard callbacks revoke from another thread.
+    # Never held across target IPC waits or SDK calls; input callbacks use this lock.
     motion_lock: object = field(default_factory=RLock, repr=False)
     arm_authority: object = field(default=None, repr=False)
     arm_emergency: object = field(default=None, repr=False)
@@ -61,11 +61,9 @@ class RuntimeState:
             if not self.requests_allow_motion() or not self.revoke_motion():
                 raise RuntimeError("arming rejected")
 
-    def jog_input_changed(self, moving: bool) -> None:
-        """Keep a running jog epoch only while the new net intent remains nonzero."""
+    def jog_input_changed(self) -> None:
+        """Fence every changed jog proposal, including nonzero direction changes."""
         with self.motion_lock:
-            if self.safety_state == SafetyState.RUNNING and moving and self.requests_allow_motion():
-                return
             if self.safety_state in (SafetyState.ARMED, SafetyState.RUNNING):
                 self.revoke_motion()
 
@@ -132,6 +130,9 @@ class RuntimeState:
                 self.arm_emergency.set()
 
     def request_emergency_stop(self):
+        # Reach the SDK owner before any local authority bookkeeping can wait.
+        if self.arm_emergency is not None:
+            self.arm_emergency.set()
         with self.motion_lock:
             already_requested = self.estop_request
             self.estop_request = True

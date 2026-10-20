@@ -751,6 +751,9 @@ class SceneTrackingSession:
             failure = f"{type(error).__name__}: {error}"
             print(failure, flush=True)
         finally:
+            cleanup_errors = []
+            cleanup = {}
+            invalidation_method = None
             # Invalidate before resource shutdown, even after partial inference.
             try:
                 write_observation(
@@ -763,66 +766,95 @@ class SceneTrackingSession:
                         max_age_ms=self.args.max_age_ms,
                     ),
                 )
+                invalidation_method = "invalid_write"
             except Exception as error:
-                failure = f'{failure or ""}; invalidation: {error}'
-                (self.output / "latest.npz").unlink(missing_ok=True)
+                cleanup_errors.append(f"invalidation: {type(error).__name__}: {error}")
+                try:
+                    (self.output / "latest.npz").unlink(missing_ok=True)
+                    invalidation_method = "removed"
+                except Exception as error:
+                    cleanup_errors.append(f"invalidation unlink: {type(error).__name__}: {error}")
+                    cleanup_errors.append("已发布结果失效未确认 (latest.npz invalidation unconfirmed)")
             if self.viewer is not None and processed:
                 try:
                     self.viewer.screenshot(self.output / "last_frame.png")
                 except Exception as error:
-                    failure = f'{failure or ""}; screenshot: {error}'
-            for resource in (
-                self.reader,
-                self.source,
-                self.worker,
-                self.segmenter if self.worker is None else None,
-                self.viewer,
-                self.video,
+                    cleanup_errors.append(f"screenshot: {type(error).__name__}: {error}")
+            for name, resource in (
+                ("reader", self.reader),
+                ("source", self.source),
+                ("worker", self.worker),
+                ("segmenter", self.segmenter if self.worker is None else None),
+                ("viewer", self.viewer),
+                ("video", self.video),
+                ("records", self.records),
             ):
                 if resource is None:
                     continue
                 try:
-                    if resource is self.reader or resource is self.worker:
+                    if name in ("reader", "worker"):
                         status = resource.close(timeout_s=2)
+                        cleanup[name] = dict(
+                            status=(
+                                "unconfirmed"
+                                if not status.stopped
+                                else "failed" if status.error else "closed"
+                            ),
+                            stopped=status.stopped,
+                            error=status.error,
+                        )
                         if not status.stopped or status.error:
-                            raise RuntimeError(
-                                f"{type(resource).__name__} shutdown unconfirmed: {status}"
-                            )
-                    elif resource is self.video:
-                        self.video.release()
+                            cleanup_errors.append(f"cleanup {name}: {status}")
                     else:
-                        resource.close()
+                        if name == "video":
+                            resource.release()
+                        else:
+                            resource.close()
+                        cleanup[name] = dict(status="closed")
                 except Exception as error:
-                    failure = f'{failure or ""}; cleanup: {error}'
-            self.records.close()
+                    message = f"{type(error).__name__}: {error}"
+                    cleanup[name] = dict(status="failed", error=message)
+                    cleanup_errors.append(f"cleanup {name}: {message}")
             cuda_allocated = cuda_reserved = None
-            if self.assets:
-                import torch
+            try:
+                if self.assets:
+                    import torch
 
-                if torch.cuda.is_available():
-                    cuda_allocated = torch.cuda.max_memory_allocated()
-                    cuda_reserved = torch.cuda.max_memory_reserved()
-            (self.output / "result.json").write_text(
-                json.dumps(
-                    dict(
-                        status=(
-                            "failed"
-                            if failure
-                            else "completed_replay" if completed and not self.live else "stopped"
+                    if torch.cuda.is_available():
+                        cuda_allocated = torch.cuda.max_memory_allocated()
+                        cuda_reserved = torch.cuda.max_memory_reserved()
+            except Exception as error:
+                cleanup_errors.append(f"CUDA diagnostics: {type(error).__name__}: {error}")
+            failure = "; ".join(filter(None, [failure, *cleanup_errors])) or None
+            try:
+                (self.output / "result.json").write_text(
+                    json.dumps(
+                        dict(
+                            status=(
+                                "failed"
+                                if failure
+                                else "completed_replay" if completed and not self.live else "stopped"
+                            ),
+                            error=failure,
+                            cleanup_errors=cleanup_errors,
+                            cleanup=cleanup,
+                            latest_invalidation_confirmed=invalidation_method is not None,
+                            latest_invalidation_method=invalidation_method,
+                            processed_frames=processed,
+                            source_frames=source_count,
+                            first_processed_row=first_row,
+                            last_processed_row=last_row,
+                            live_camera_requested=self.live,
+                            cuda_peak_allocated_bytes=cuda_allocated,
+                            cuda_peak_reserved_bytes=cuda_reserved,
                         ),
-                        error=failure,
-                        processed_frames=processed,
-                        source_frames=source_count,
-                        first_processed_row=first_row,
-                        last_processed_row=last_row,
-                        live_camera_requested=self.live,
-                        cuda_peak_allocated_bytes=cuda_allocated,
-                        cuda_peak_reserved_bytes=cuda_reserved,
-                    ),
-                    indent=2,
-                    ensure_ascii=False,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
                 )
-            )
+            except Exception as error:
+                failure = "; ".join(filter(None, [failure, f"result.json: {type(error).__name__}: {error}"]))
+                print(f"Scene result publication failed: {failure}", file=sys.stderr, flush=True)
         return 1 if failure else 0
 
     def heartbeat(self):

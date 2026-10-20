@@ -1,8 +1,9 @@
-"""Cartesian jog proposals and their atomic parent-side arm submission."""
+"""Cartesian jog proposals, input-bound epochs and guarded command references."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import time
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -44,39 +45,71 @@ def submit_jog_target(
     *,
     valid_until_ns: int,
     execute_until_ns: int,
+    commit_reference: Callable[[], None],
 ) -> DispatchResult | None:
-    """Commit a still-current proposal; both consumers advance references only on success."""
-    def submit() -> DispatchResult | None:
+    """Bind input to an epoch, submit without input locks, then commit local references.
+
+    Every jog generation change revokes the bound epoch. A late enqueue therefore
+    cannot restore old authority, even if input changes while IPC is blocked.
+    commit_reference must only assign already constructed local command references.
+    """
+    def reserve() -> int | None:
         with runtime_state.motion_lock:
             if runtime_state.run_id != epoch or not runtime_state.requests_allow_motion():
                 return None
+            if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
+                runtime_state.revoke_motion(expected_run_id=epoch)
+                raise DispatchError(
+                    "jog proposal deadline expired", DispatchResult(),
+                    revoked=True, cause="deadline_expired",
+                )
             if runtime_state.safety_state == SafetyState.ARMED:
                 if runtime_state.begin_motion() is None:
                     return None
             elif runtime_state.safety_state != SafetyState.RUNNING:
                 return None
-            run_id = runtime_state.run_id
-            try:
-                # Arm-only send performs a short parent enqueue, without any hand/arm SDK call.
-                result = robot.send_action(
-                    RobotCommand(run_id, target),
-                    valid_until_ns=valid_until_ns,
-                    execute_until_ns=execute_until_ns,
-                )
-                if result.arm != DispatchStatus.SUBMITTED or result.hand != DispatchStatus.NOT_CALLED:
-                    raise DispatchError("incomplete arm-only dispatch", result)
-                return result
-            except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    reason = RunEndReason.ESTOP
-                elif isinstance(exc, DispatchError) and not exc.revoked:
-                    reason = RunEndReason.HARDWARE_FAULT
-                else:
-                    reason = RunEndReason.EXECUTOR_BOUNDARY
-                runtime_state.revoke_motion(reason=reason, expected_run_id=run_id)
-                raise
+            return runtime_state.run_id
 
-    return keys.commit_if_current(generation, submit)
+    run_id = keys.commit_if_current(generation, reserve)
+    if run_id is None:
+        return None
+    try:
+        result = robot.send_action(
+            RobotCommand(run_id, target),
+            valid_until_ns=valid_until_ns,
+            execute_until_ns=execute_until_ns,
+        )
+        if result.arm != DispatchStatus.SUBMITTED or result.hand != DispatchStatus.NOT_CALLED:
+            raise DispatchError("incomplete arm-only dispatch", result)
+
+        def finish() -> bool:
+            with runtime_state.motion_lock:
+                if not runtime_state.command_may_cross_sdk(run_id=run_id):
+                    return False
+                if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
+                    return False
+                commit_reference()
+                return True
+
+        if not keys.commit_if_current(generation, finish):
+            # SUBMITTED remains a fact; this only declines advancing the jog reference.
+            expired = time.monotonic_ns() >= min(valid_until_ns, execute_until_ns)
+            raise DispatchError(
+                "jog proposal expired or revoked during submission",
+                result,
+                revoked=True,
+                cause="deadline_expired" if expired else "authority_revoked",
+            )
+        return result
+    except BaseException as exc:
+        if isinstance(exc, KeyboardInterrupt):
+            reason = RunEndReason.ESTOP
+        elif isinstance(exc, DispatchError) and not exc.revoked:
+            reason = RunEndReason.HARDWARE_FAULT
+        else:
+            reason = RunEndReason.EXECUTOR_BOUNDARY
+        runtime_state.revoke_motion(reason=reason, expected_run_id=run_id)
+        raise
 
 
 def propose_cartesian_jog_pose(

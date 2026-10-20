@@ -91,6 +91,8 @@ python -m cordvip_geometry replay --episode /path/to/raw_episode \
 
 只读 RGB-D 预览的 `--headless` / `--no-3d` 不计算三维显示点，也不要求 `--display-stride` 有效；`--video-fps` 仅用于 `--save-video`。RGB-D 图像与来源记录照常保存。
 
+预览退出时将最后一个完整处理帧保存一次到 `last_frame.png`，包括 Q、帧数上限或后续处理异常退出；没有完整帧时不保存。GUI 与 `--save-video` 仍逐帧生成画面，主动截图与 `--save-inputs` 行为不变。
+
 ## 实时相机入口
 
 下面命令会连接 RealSense，须由操作者明确启动；不会读取机器人关节或发送运动命令：
@@ -149,14 +151,15 @@ finally:
 |---|---|
 | `run.json` / `models.json` | 配置、资产/标定来源、源码与权重 SHA、模型变体、加载耗时 |
 | `records.jsonl` | 实际处理行、分割/IPC/位姿耗时、GPU 内存、状态与诊断 |
-| `latest.npz` | 原子发布最近快照；结束后发布 STOPPED/ERROR 失效快照 |
+| `latest.npz` | 原子发布最近快照；退出时写失效快照，失败则尝试删除 |
+| `result.json` | 最终状态、错误、各资源清理状态与快照失效确认；发布失败会报告错误并以失败状态退出 |
 | `frames/` / `inputs/` | `--save-frames` / `--save-inputs` 可选逐帧归档 |
 | `overlay.mp4` | `--save-video` 的检查视频；播放率不代替源时间 |
 | `sam2_worker.log` | 隔离分割进程的日志 |
 
-NPZ 的 `object_ids/object_roles` 给出实例顺序；数组按 `toy__`、`basket__` 或单物体 `object__` 前缀保存。顶层 `valid` 表示此次源帧发布有效，每实例另有 `pose_valid/observed_valid`。pose 失效时该实例 pose 为 NaN、模型点为空，当前实测点仍可有效。会话失效时全部可消费几何清空。手点另含相机/base 系点和法向、link IDs、joint_state、源时间与 skew。
+NPZ 的 `object_ids/object_roles` 给出实例顺序；数组按 `toy__`、`basket__` 或单物体 `object__` 前缀保存。顶层 `valid` 表示此次源帧发布有效，每实例另有 `pose_valid/observed_valid`。pose 失效时该实例 pose 为 NaN、模型点为空，当前实测点仍可有效。成功发布的会话失效快照会清空全部可消费几何。手点另含相机/base 系点和法向、link IDs、joint_state、源时间与 skew。
 
-实时消费者须自行核对原始源时间、时钟与进程存活；`published_ns` 新不等于图像新。强制终止可能来不及更新磁盘快照。`REPLAY` 不做 live 年龄准入，也不授权机器人运动。库没有接入主包 runtime、Raw writer、15 字段导出或策略部署。
+实时消费者须自行核对原始源时间、时钟与进程存活；`published_ns` 新不等于图像新。强制终止或文件系统故障可能留下旧的 valid 快照，不能只凭其标志继续消费。`REPLAY` 不做 live 年龄准入，也不授权机器人运动。库没有接入主包 runtime、Raw writer、15 字段导出或策略部署。
 
 ## 新物体资产
 

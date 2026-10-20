@@ -1,4 +1,4 @@
-"""Parent target submission and authority; ordinary sends never wait for the SDK owner."""
+"""Parent target submission and authority; the arm worker owns all SDK calls."""
 
 from importlib.metadata import version
 import multiprocessing as mp
@@ -6,6 +6,7 @@ import time
 
 import numpy as np
 
+from dexmani_real.robot.commands import DispatchError, DispatchResult
 from dexmani_real.runtime.state import SafetyState, RunEndReason
 from dexmani_real.robot.xarm7.protocol import (
     MAX_TIME,
@@ -39,14 +40,6 @@ class ArmChannels:
         self.goal_lock, self.status_lock = ctx.Lock(), ctx.Lock()
         self.goal = ctx.RawArray("b", GOAL_DTYPE.itemsize)
         self.status = ctx.RawArray("b", STATUS_DTYPE.itemsize)
-
-    def put_goal(self, goal):
-        # A full slot is an explicit failure, never a silent target replacement.
-        with self.goal_lock:
-            slot = np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)
-            if slot["sequence"][0]:
-                raise RuntimeError("arm target slot is full")
-            slot[0] = goal
 
     def take_goal(self, *, block=False):
         if not self.goal_lock.acquire(block):
@@ -219,15 +212,9 @@ class ArmExecutor:
 
     def submit(self, command, *, submit_until_ns, execute_until_ns):
         self.check_error()
-        if (
-            not self.is_connected
-            or self._io.closing.is_set()
-            or self._io.stop.is_set()
-            or self._io.authority.value != command.run_id
-            or self._io.read_status()["prepared_run_id"] != command.run_id
-            or time.monotonic_ns() >= min(submit_until_ns, execute_until_ns)
-        ):
-            raise RuntimeError("arm target unauthorized or expired")
+        if not self.is_connected:
+            raise RuntimeError("arm device unavailable")
+        prepared_run_id = self._io.read_status()["prepared_run_id"]
         goal = np.zeros((), dtype=GOAL_DTYPE)
         goal[()] = (
             self._sequence + 1,
@@ -236,8 +223,30 @@ class ArmExecutor:
             execute_until_ns,
             command.arm_qpos,
         )
-        self._io.put_goal(goal)
-        self._sequence += 1
+        with self._io.goal_lock:
+            # Both IPC waits precede this fence. Revoked jog epochs are never reused.
+            if (
+                self._io.closing.is_set()
+                or self._io.stop.is_set()
+                or self._io.emergency.is_set()
+                or self._io.authority.value != command.run_id
+            ):
+                raise DispatchError(
+                    "arm target authority revoked", DispatchResult(),
+                    revoked=True, cause="authority_revoked",
+                )
+            if time.monotonic_ns() >= min(submit_until_ns, execute_until_ns):
+                raise DispatchError(
+                    "arm target deadline expired", DispatchResult(),
+                    revoked=True, cause="deadline_expired",
+                )
+            if prepared_run_id != command.run_id:
+                raise RuntimeError("arm target epoch was not prepared")
+            slot = np.frombuffer(self._io.goal, dtype=GOAL_DTYPE, count=1)
+            if slot["sequence"][0]:
+                raise RuntimeError("arm target slot is full")
+            slot[0] = goal
+            self._sequence += 1
         return (int(command.run_id), self._sequence)
 
     def receive_reply(self, identity):

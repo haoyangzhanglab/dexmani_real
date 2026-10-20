@@ -83,6 +83,7 @@ class KeyboardTeleopSession:
                 raise RuntimeError("keyboard stop listener unavailable")
             robot.check_services = lambda: keys.healthy
             print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
+            print("Jog key changes stop and re-prepare motion; release all jog keys after a rejected target")
             rate = LoopRate(jog_config.control_hz, label="keyboard_teleop")
 
             while runtime_state.running and not runtime_state.quit_requested:
@@ -207,12 +208,19 @@ class KeyboardTeleopSession:
                     continue
 
                 target = result.qpos
+                next_qpos = target.copy()
+
+                def commit_reference():
+                    nonlocal command_qpos, command_pose
+                    command_pose, command_qpos = proposed_pose, next_qpos
+
                 try:
-                    committed = submit_jog_target(
+                    submit_jog_target(
                         keys, generation, runtime_state, robot, target, epoch,
                         valid_until_ns=feedback_deadline_ns(row, self.runtime),
                         execute_until_ns=row.observation_timestamp_ns
                         + int(self.runtime.control.vr_mapping.stale_threshold_s * 1e9),
+                        commit_reference=commit_reference,
                     )
                 except DispatchError as exc:
                     if not exc.revoked:
@@ -221,11 +229,6 @@ class KeyboardTeleopSession:
                     robot.stop()
                     command_qpos = command_pose = None
                     continue
-
-                if committed is None:
-                    continue
-                command_pose = proposed_pose
-                command_qpos = target.copy()
 
             clean = clean or bool(runtime_state.quit_requested)
         except KeyboardInterrupt:

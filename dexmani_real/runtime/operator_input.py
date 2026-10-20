@@ -110,7 +110,7 @@ class KeyboardInput:
         quit_callback: Callable[[], None] | None = None,
         capture_commands: bool = True,
         capture_raw_events: bool = False,
-        jog_change_callback: Callable[[bool], None] | None = None,
+        jog_change_callback: Callable[[], None] | None = None,
     ) -> None:
         self._buffer: deque[OperatorCommand] = deque()
         self._events: deque[str] = deque()
@@ -139,14 +139,17 @@ class KeyboardInput:
             if self._estop_latched.is_set():
                 return
             self._estop_latched.set()
-            self._buffer.append(OperatorCommand.EMERGENCY_STOP)
-            self._condition.notify()
             callback = self._estop_callback
         if callback is not None:
             try:
                 callback()
             except Exception:
                 logger.error("keyboard emergency-stop callback failed", exc_info=True)
+        with self._condition:
+            if self._callbacks_active:
+                self._generation += 1
+                self._buffer.append(OperatorCommand.EMERGENCY_STOP)
+                self._condition.notify()
 
     def dispatch_immediate_callback(self, signal: OperatorCommand) -> bool:
         """Complete the immediate effect before the command becomes pollable."""
@@ -163,9 +166,9 @@ class KeyboardInput:
         try:
             callback()
         except Exception:
-            logger.error("keyboard %s callback failed", signal.value, exc_info=True)
             # Consumers must not proceed as if a failed stop/quit was applied.
             self.latch_emergency_stop()
+            logger.error("keyboard %s callback failed", signal.value, exc_info=True)
             return False
         return True
 
@@ -198,6 +201,10 @@ class KeyboardInput:
                 name = key_name(key)
                 if name is None:
                     return
+                if name == "esc":
+                    self.latch_emergency_stop()
+                    return
+                signal = _KEY_MAP.get(name)
                 with self._condition:
                     if not self._callbacks_active:
                         return
@@ -206,29 +213,29 @@ class KeyboardInput:
                             self._events.append(name)
                         return
                     # Held keys also deduplicate command edges across OS repeat.
-                    first_press = name not in self._keys
-                    self._keys.add(name)
-                    if first_press:
-                        self._generation += 1
-                    self.jog_changed(name, first_press)
-                if name == "esc":
-                    self.latch_emergency_stop()
-                    return
-                signal = _KEY_MAP.get(name)
+                    if name in self._keys:
+                        return
+                # Fence STOP/QUIT before exposing the edge. These callbacks only
+                # revoke authority; target IPC and SDK I/O belong to their owners.
                 if (
-                    (
+                    signal is not None
+                    and (
                         self._capture_commands
                         or (signal is OperatorCommand.QUIT and self._quit_callback is not None)
                     )
-                    and signal is not None
-                    and first_press
+                    and not self.dispatch_immediate_callback(signal)
                 ):
-                    if self.dispatch_immediate_callback(signal):
-                        with self._condition:
-                            if self._capture_commands and self._callbacks_active:
-                                self._buffer.append(signal)
-                                self._condition.notify()
+                    return
+                with self._condition:
+                    if not self._callbacks_active:
+                        return
+                    self._keys.add(name)
+                    self.jog_changed(name, True)
+                    if self._capture_commands and signal is not None:
+                        self._buffer.append(signal)
+                        self._condition.notify()
             except Exception:
+                self.latch_emergency_stop()
                 logger.warning("keyboard press callback failed", exc_info=True)
 
         def on_release(key: object) -> None:
@@ -238,22 +245,27 @@ class KeyboardInput:
                     changed = self._callbacks_active and name in self._keys
                     if self._callbacks_active:
                         self._keys.discard(name)
-                        if changed:
-                            self._generation += 1
                     self.jog_changed(name, changed)
             except Exception:
+                self.latch_emergency_stop()
                 logger.warning("keyboard release callback failed", exc_info=True)
 
         return on_press, on_release
 
     def jog_changed(self, name: str | None, changed: bool) -> None:
-        """Called under the input lock; the callback may only update motion authority."""
-        if changed and self._jog_change_callback is not None:
-            from dexmani_real.teleop.jog import CARTESIAN_JOG_KEYS, jog_motion_requested
+        """Under the input lock, publish a jog generation after fencing its old epoch."""
+        if not changed:
+            return
+        if self._jog_change_callback is None or name == "q":
+            self._generation += 1
+            return
+        from dexmani_real.teleop.jog import CARTESIAN_JOG_KEYS
 
-            # HOME is edge-triggered: releasing R must not cancel a HOME already in progress.
-            if name in CARTESIAN_JOG_KEYS or (name == "r" and name in self._keys):
-                self._jog_change_callback(jog_motion_requested(self._keys))
+        # HOME is edge-triggered: releasing R must not cancel a HOME in progress.
+        # Other keys do not change the motion proposal represented by generation.
+        if name in CARTESIAN_JOG_KEYS or (name == "r" and name in self._keys):
+            self._jog_change_callback()
+            self._generation += 1
 
     def start(self) -> None:
         """Start the daemon keyboard listener once."""
@@ -369,13 +381,13 @@ class KeyboardInput:
             logger.error("keyboard listener health check failed", exc_info=True)
             healthy = False
         if not healthy:
+            if self._running:
+                # Fence the SDK owner before publishing the cleared input generation.
+                self.latch_emergency_stop()
             with self._condition:
                 if self._keys:
                     self._keys.clear()
                     self._generation += 1
-            if self._running:
-                # SDK fences also check keyboard health; losing emergency-stop input must fail safe.
-                self.latch_emergency_stop()
         return healthy
 
     @property
@@ -394,12 +406,12 @@ class KeyboardInput:
             return tuple(sorted(self._keys))
 
     def snapshot(self) -> tuple[frozenset[str], int]:
-        """One atomic held-key proposal; release/repress never revives its generation."""
+        """Atomic held keys and jog generation; motion release/repress invalidates proposals."""
         with self._condition:
             return frozenset(self._keys), self._generation
 
-    def commit_if_current(self, generation: int, submit: Callable[[], Any]) -> Any:
-        """Serialize input changes with a short parent-only enqueue, never SDK I/O."""
+    def commit_if_current(self, generation: int, commit: Callable[[], Any]) -> Any:
+        """Guard local authority/reference updates only; never wait on target IPC or SDK I/O."""
         with self._condition:
             if (
                 not self._callbacks_active
@@ -407,8 +419,8 @@ class KeyboardInput:
                 or generation != self._generation
             ):
                 return None
-            # Lock order: input -> RuntimeState.motion_lock -> short arm IPC locks.
-            return submit()
+            # Lock order: input -> short RuntimeState updates. IPC waits run outside both.
+            return commit()
 
     def pop_event(self) -> str | None:
         with self._condition:

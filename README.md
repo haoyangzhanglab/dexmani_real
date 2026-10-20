@@ -173,9 +173,9 @@ python examples/replay_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config
 | 点云诊断 / 桌面标定 | [pointcloud_process_example.py](examples/pointcloud_process_example.py) | 连接相机；`--save-dir` 保存本次 RGB-D、点云及重建 metadata |
 | 物体重建与跟踪 | [CORDViP 示例](examples/cordvip/README.md) | 使用独立的 `cordvip_geometry` 依赖与入口，区分离线数据和实时相机模式 |
 
-点云诊断保存与最终显示使用同一帧，后续连续帧测速仅报告耗时和有效点云数量。RGB-D 诊断缺少有效相机外参或无匹配 serial 时关闭点云显示，继续 RGB/Depth 预览。关闭 `pointcloud.remove_table` 时处理不使用桌面平面；拟合结果只有确认后才发布。各入口的参数与按键以 `--help` 和交互提示为准。
+点云诊断保存与最终显示使用同一帧，后续连续帧测速仅报告耗时和有效点云数量。RGB-D 基础预览仅受相机与深度显示参数约束；启用点云时才检查对应处理配置与标定，不可用时继续 RGB/Depth 预览。关闭 `pointcloud.remove_table` 时处理不使用桌面平面；拟合结果只有确认后才发布。各入口的参数与按键以 `--help` 和交互提示为准。
 
-键盘遥操作与手眼标定的 jog 共用提交规则：连续 RUNNING 时，非零方向组合变化更新后续目标；完全抵消或释放最后一个运动键立即撤销授权。准备期间的输入变化使旧准备失效；触界、IK 或准入拒绝后必须完全释放 jog 键才能重新使能。目标入队与输入 generation 校验在同一提交点完成，停止继续通过原有 authority fence 使待执行目标失效，无法撤回已经跨过 SDK 边界的调用。该交互调整仅经离线检查，真机 **NOT VERIFIED**。
+键盘遥操作与手眼标定的 jog 在运动键组合变化时先撤销旧动作授权，再准备后续目标；方向完全抵消或释放最后一个运动键会停止 jog。触界、IK 或准入拒绝后必须释放全部 jog 键才能重新操作。
 
 ## 数据与安全边界
 
