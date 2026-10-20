@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""连接 XHand1，顺序执行 HOME → fist → palm → V → OK → HOME，到位后各停留 1 秒。
-
-python examples/xhand_control_example.py
-python examples/xhand_control_example.py --config local.yaml --read-only
-python examples/xhand_control_example.py --print-config
-
-参数：--config 指定手部配置；--read-only 仍连接设备但不发动作，--print-config 不连接设备。
-读写与正式运行共用驱动；普通发送遇到 CRC 后继续读取关节反馈，不额外重发动作。
-"""
+"""连接 XHand1，顺序执行 HOME → fist → palm → V → OK → HOME，到位后各停留 1 秒。"""
 
 from __future__ import annotations
 
@@ -33,16 +25,16 @@ from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
 )
-from dexmani_real.utils.limits import validate_hand_command_bounds
+from dexmani_real.robot.xhand.limits import validate_hand_command_bounds
 from dexmani_real.utils.log import configure_logging
 
-_HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
-_FEEDBACK_POLL_INTERVAL_S = 0.01
-_CONVERGENCE_SAMPLES = 3
-_ACTION_DWELL_S = 1.0
+HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
+FEEDBACK_POLL_INTERVAL_S = 0.01
+CONVERGENCE_SAMPLES = 3
+ACTION_DWELL_S = 1.0
 
 # XHand1 example targets in degrees; HOME/palm use the current configuration.
-_PRESET_QPOS_DEG = {
+PRESET_QPOS_DEG = {
     "fist": (
         11.85,
         74.58,
@@ -88,10 +80,10 @@ def validate_target(qpos_rad, config: HandParams) -> np.ndarray:
 def action_sequence(config: HandParams) -> list[tuple[str, np.ndarray]]:
     actions = (
         ("HOME", config.home_qpos_deg),
-        ("fist", _PRESET_QPOS_DEG["fist"]),
+        ("fist", PRESET_QPOS_DEG["fist"]),
         ("palm", config.home_qpos_deg),
-        ("V", _PRESET_QPOS_DEG["v"]),
-        ("OK", _PRESET_QPOS_DEG["ok"]),
+        ("V", PRESET_QPOS_DEG["v"]),
+        ("OK", PRESET_QPOS_DEG["ok"]),
         ("HOME", config.home_qpos_deg),
     )
     return [(name, validate_target(np.deg2rad(values), config)) for name, values in actions]
@@ -103,7 +95,7 @@ class XHandControlExample(XHand):
     def __init__(self, config: HandParams, *, cancel_requested=lambda: False) -> None:
         super().__init__(config)
         self.cancel_requested = cancel_requested
-        self._motion_pending = False
+        self.motion_pending = False
 
     def check_cancelled(self) -> None:
         if self.cancel_requested():
@@ -127,12 +119,12 @@ class XHandControlExample(XHand):
         self.header("SDK versions")
         print(f"  Software SDK: {self.device_identity['sdk_version']}")
 
-        error_struct, version = self._control.read_version(self.cfg.device_id, 0)
+        error_struct, version = self.control.read_version(self.cfg.device_id, 0)
         print(f"  Hardware SDK: {version}  (error_code={error_struct.error_code})")
 
     def read_device_info(self) -> None:
         self.header("Device info")
-        error_struct, info = self._control.read_device_info(self.cfg.device_id)
+        error_struct, info = self.control.read_device_info(self.cfg.device_id)
         if error_struct.error_code != 0 or info is None:
             print(f"  Device info unavailable (error_code={error_struct.error_code})")
             return
@@ -189,7 +181,7 @@ class XHandControlExample(XHand):
         self.read_action_positions()
         self.check_cancelled()
         deadline_ns = time.monotonic_ns() + int(self.cfg.home_timeout_s * 1e9)
-        self._motion_pending = True  # SDK exceptions do not establish non-delivery.
+        self.motion_pending = True  # SDK exceptions do not establish non-delivery.
         status = self.send_action(target)
         print(f"  send_action: {status.name}")
         if status not in (DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED):
@@ -203,14 +195,14 @@ class XHandControlExample(XHand):
                 break
             error_rad = float(np.max(np.abs(measured - target)))
             consecutive = consecutive + 1 if error_rad <= tolerance_rad else 0
-            if consecutive >= _CONVERGENCE_SAMPLES:
+            if consecutive >= CONVERGENCE_SAMPLES:
                 print(f"  Measured target reached; max error={np.rad2deg(error_rad):.3f} deg")
                 return
-            time.sleep(_FEEDBACK_POLL_INTERVAL_S)
+            time.sleep(FEEDBACK_POLL_INTERVAL_S)
         raise RuntimeError(f"action did not converge within {self.cfg.home_timeout_s:g}s")
 
     def stop_action(self) -> None:
-        if not self._motion_pending:
+        if not self.motion_pending:
             return
         started_ns = time.monotonic_ns()
         try:
@@ -221,7 +213,7 @@ class XHandControlExample(XHand):
             print(f"  Stop feedback unavailable ({exc}); requesting vendor passive mode")
             measured, started_ns = None, 0
         self.stop(measured, timestamp_ns=started_ns)
-        self._motion_pending = False
+        self.motion_pending = False
         print("  Stop command accepted by SDK")
 
 
@@ -248,7 +240,7 @@ def run_hardware_session(config: HandParams, *, finger_id: int, read_only: bool)
     interrupted_signal = None
     cleaning_up = False
 
-    def request_interrupt(signum, _frame):
+    def request_interrupt(signum, _):
         nonlocal interrupted_signal
         interrupted_signal = signum
         if not cleaning_up:
@@ -271,7 +263,7 @@ def run_hardware_session(config: HandParams, *, finger_id: int, read_only: bool)
         for name, target in actions:
             print(f"\n  -> {name} (degrees): {np.rad2deg(target).round(3).tolist()}")
             hand.execute_action(target)
-            time.sleep(_ACTION_DWELL_S)
+            time.sleep(ACTION_DWELL_S)
     except (InterruptedError, CancelledError):
         print("\nSequence interrupted; stopping any attempted action before closing")
     except Exception as exc:
@@ -305,10 +297,10 @@ def disable_worker_core_dump() -> None:
 
 
 def run_isolated_hardware_session(argv: list[str]) -> int:
-    command = [sys.executable, str(Path(__file__).resolve()), *argv, _HARDWARE_WORKER_ARG]
+    command = [sys.executable, str(Path(__file__).resolve()), *argv, HARDWARE_WORKER_ARG]
     worker = subprocess.Popen(command)
 
-    def forward_interrupt(signum, _frame):
+    def forward_interrupt(signum, _):
         try:
             worker.send_signal(signum)
         except ProcessLookupError:
@@ -360,7 +352,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--print-config", action="store_true", help="Print hand settings without hardware"
     )
-    parser.add_argument(_HARDWARE_WORKER_ARG, action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        HARDWARE_WORKER_ARG,
+        dest="xhand_hardware_worker",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
     try:
@@ -382,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.print_config:
         print(yaml.safe_dump({"hand": asdict(config)}, sort_keys=False), end="")
         return 0
-    if args._xhand_hardware_worker:
+    if args.xhand_hardware_worker:
         disable_worker_core_dump()
         return run_hardware_session(config, finger_id=args.finger_id, read_only=args.read_only)
     return run_isolated_hardware_session(argv)

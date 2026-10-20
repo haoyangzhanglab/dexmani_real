@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""通过键盘控制 xArm7/XHand，支持回零与点动。
-
-python examples/keyboard_teleop.py
-python examples/keyboard_teleop.py --config local.yaml
-python examples/keyboard_teleop.py --no-hand
-
-参数：--config 覆盖配置；--no-hand 仅连接机械臂，要求 XHand 未安装或已固定在 HOME。
-"""
+"""通过键盘控制 xArm7/XHand，支持回零与点动。"""
 
 from __future__ import annotations
 

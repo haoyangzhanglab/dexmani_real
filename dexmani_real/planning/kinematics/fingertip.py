@@ -18,8 +18,8 @@ def compute_fingertip_history_xarm_base(
     hand_qpos: np.ndarray,
     *,
     hand_fk: Any,
-    handbase_position_eef_m: np.ndarray,
-    handbase_quat_eef_wxyz: np.ndarray,
+    handbase_position_eef_m: np.ndarray | tuple[float, ...],
+    handbase_quat_eef_wxyz: np.ndarray | tuple[float, ...],
 ) -> np.ndarray:
     """Return aligned float32 [T,5,3] base-frame tips from the consumed EEF history."""
     poses = np.asarray(eef_pose_history, dtype=np.float64)

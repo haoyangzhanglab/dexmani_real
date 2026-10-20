@@ -15,7 +15,7 @@ from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
-_END_AUDIO_GRACE_S = 3.0
+END_AUDIO_GRACE_S = 3.0
 
 
 class TeleopPhase(str, Enum):
@@ -252,7 +252,7 @@ class TeleopRunner:
                 ),
                 collection_source="teleop",
                 metadata=snapshot_recording_metadata(
-                    self.runtime_state,
+                    self.runtime_state.sensors,
                     camera_calibration=self.camera_calibration,
                     hand=self.robot.hand,
                 ),
@@ -415,18 +415,18 @@ class TeleopRunner:
     def execute_control_step(self, row, deadline_ns):
         epoch = self.control_run_id
         deadline_ns = min(deadline_ns, feedback_deadline_ns(row, self.runtime, include_vr=True))
-        realization = command = dispatch = failure = None
+        action_result = command = dispatch = failure = None
         timing = dict(run_id=epoch, slot=self.tick_index - 1)
         reason = None
         interrupted = False
         run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
         try:
-            realization = self.controller.compute_target(row)
-            if realization is None or realization.arm_qpos is None:
-                detail = realization.rejection_reason if realization is not None else None
+            action_result = self.controller.compute_target(row)
+            if action_result is None or action_result.arm_qpos is None:
+                detail = action_result.rejection_reason if action_result is not None else None
                 reason = f"target_unavailable: {detail}"
             else:
-                command = RobotCommand(epoch, realization.arm_qpos, realization.hand_qpos)
+                command = RobotCommand(epoch, action_result.arm_qpos, action_result.hand_qpos)
                 if self.recorder is not None:
                     self.recorder.check_error()
                 timing["submit_started_ns"] = time.monotonic_ns()
@@ -490,7 +490,7 @@ class TeleopRunner:
             if failure is not None and not interrupted:
                 raise failure
             return
-        self.controller.commit_dispatched_target(realization)
+        self.controller.commit_dispatched_target(action_result)
         if self.recorder is not None:
             self.recorder.add_frame(row, command, dispatch, timing=timing)
 
@@ -638,8 +638,8 @@ class TeleopRunner:
                     logger.exception("teleop recorder close failed")
         try:
             # After revoke/finalization, let the exit or emergency cue finish before closing audio.
-            if not self.audio.wait_until_idle(timeout_s=_END_AUDIO_GRACE_S):
-                logger.warning("Final audio did not finish within %.1fs", _END_AUDIO_GRACE_S)
+            if not self.audio.wait_until_idle(timeout_s=END_AUDIO_GRACE_S):
+                logger.warning("Final audio did not finish within %.1fs", END_AUDIO_GRACE_S)
         except Exception:
             logger.warning("Final audio unavailable", exc_info=True)
         for close in (self.keyboard.stop, self.audio.close):

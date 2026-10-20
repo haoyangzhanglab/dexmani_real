@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""采集实时 VR 数据标定朝向，通过质量检查后保存对齐变换。
-
-python examples/calibrate_vr_heading.py
-python examples/calibrate_vr_heading.py --ref wrist --duration 5 --output vr_transform.json
-
-参数：--ref 选择 head/wrist 参考，--duration 为采样秒数，--output 指定变换文件。
-"""
+"""采集实时 VR 数据标定朝向，通过质量检查后保存对齐变换。"""
 
 from __future__ import annotations
 
@@ -33,12 +27,12 @@ from dexmani_real.teleop.vr_transform import (
 )
 from dexmani_real.utils.atomic_io import atomic_json_dump
 
-_MIN_FORWARD_NORM = 1e-6
-_POLL_INTERVAL_S = 0.01
-_PRINT_INTERVAL_S = 5.0
-_JOIN_TIMEOUT_S = 5.0
-_COUNTDOWN_DWELL_S = 1.0
-_AUDIO_IDLE_TIMEOUT_S = 5.0
+MIN_FORWARD_NORM = 1e-6
+POLL_INTERVAL_S = 0.01
+PRINT_INTERVAL_S = 5.0
+JOIN_TIMEOUT_S = 5.0
+COUNTDOWN_DWELL_S = 1.0
+AUDIO_IDLE_TIMEOUT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -58,7 +52,7 @@ def circular_mean(
     """Return the circular mean heading and an inlier mask."""
     fwd_2d = forwards[:, :2]
     norms = np.linalg.norm(fwd_2d, axis=1)
-    valid = norms >= _MIN_FORWARD_NORM
+    valid = norms >= MIN_FORWARD_NORM
     n_bad = int(np.sum(~valid))
     if n_bad:
         print(f"  WARNING: {n_bad} frames with near-vertical forward (skipped)")
@@ -70,7 +64,7 @@ def circular_mean(
 
     mean_0 = np.mean(fwd_unit, axis=0)
     mean_0_norm = float(np.linalg.norm(mean_0))
-    if mean_0_norm < _MIN_FORWARD_NORM:
+    if mean_0_norm < MIN_FORWARD_NORM:
         raise ValueError("VR forward samples have no stable mean heading")
     mean_0 /= mean_0_norm
 
@@ -89,7 +83,7 @@ def circular_mean(
     fwd_inlier = fwd_unit[inlier]
     mean_fwd = np.mean(fwd_inlier, axis=0)
     mean_fwd_norm = float(np.linalg.norm(mean_fwd))
-    if mean_fwd_norm < _MIN_FORWARD_NORM:
+    if mean_fwd_norm < MIN_FORWARD_NORM:
         raise ValueError("VR heading inliers have no stable mean direction")
     mean_fwd /= mean_fwd_norm
     theta = float(np.arctan2(mean_fwd[1], mean_fwd[0]))
@@ -107,7 +101,7 @@ def quality_measurements(
     """Measure heading scatter for runtime preflight."""
     fwd_2d = forwards[:, :2]
     norms = np.linalg.norm(fwd_2d, axis=1)
-    mask = (norms >= _MIN_FORWARD_NORM) & inlier
+    mask = (norms >= MIN_FORWARD_NORM) & inlier
     fwd_unit = fwd_2d[mask] / norms[mask, None]
     thetas = np.arctan2(fwd_unit[:, 1], fwd_unit[:, 0])
     dtheta = np.angle(np.exp(1j * (thetas - theta_mean)))
@@ -147,7 +141,7 @@ def wait_for_vr_tracking(
             print("  VR tracking active\n", flush=True)
             return True
         now = time.monotonic()
-        if now - last_print >= _PRINT_INTERVAL_S:
+        if now - last_print >= PRINT_INTERVAL_S:
             elapsed = int(now - (deadline - timeout_s))
             print(f"    waiting... ({elapsed}s elapsed)", flush=True)
             last_print = now
@@ -160,7 +154,7 @@ def play_completion_audio() -> None:
     try:
         audio = AudioFeedback()
         audio.play("calibrated")
-        if not audio.wait_until_idle(timeout_s=_AUDIO_IDLE_TIMEOUT_S):
+        if not audio.wait_until_idle(timeout_s=AUDIO_IDLE_TIMEOUT_S):
             print("  WARNING: audio feedback timed out")
     except Exception as exc:
         print(f"  WARNING: audio feedback unavailable: {exc}")
@@ -257,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
             print("  Extend your right arm, point fingers toward robot +X, hold steady...")
         for i in [3, 2, 1]:
             print(f"  {i}...")
-            time.sleep(_COUNTDOWN_DWELL_S)
+            time.sleep(COUNTDOWN_DWELL_S)
 
         deadline = time.monotonic() + args.duration
         last_print = 0.0
@@ -270,13 +264,13 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             sample = read_heading(runtime_state, args.ref)
             if sample is None:
-                time.sleep(_POLL_INTERVAL_S)
+                time.sleep(POLL_INTERVAL_S)
                 continue
             sequence, quaternion = sample
             # Ignore duplicate sequence numbers in the quality estimate.
             if sequence == prev_seq:
                 stale_count += 1
-                time.sleep(_POLL_INTERVAL_S)
+                time.sleep(POLL_INTERVAL_S)
                 continue
             prev_seq = sequence
             forwards.append(forward_from_quat_wxyz(quaternion))
@@ -285,12 +279,12 @@ def main(argv: list[str] | None = None) -> int:
             if now - last_print >= 1.0:
                 print(f"    collected {len(forwards)} frames...")
                 last_print = now
-            time.sleep(_POLL_INTERVAL_S)
+            time.sleep(POLL_INTERVAL_S)
     finally:
         shutdown_clean = shutdown_local_runtime(
             runtime_state,
             sensors=sensors,
-            timeout_s=_JOIN_TIMEOUT_S,
+            timeout_s=JOIN_TIMEOUT_S,
         )
 
     if not shutdown_clean:

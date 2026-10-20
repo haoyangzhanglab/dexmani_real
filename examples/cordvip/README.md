@@ -15,7 +15,7 @@ Grounded-SAM2 分割目标，确认候选后用 Hunyuan3D-2.1 生成形状，并
 ```bash
 python examples/cordvip/reconstruct_object.py \
   --image /path/to/object.jpg --text 'white basket.' \
-  --output-dir reports/cordvip_demo/object_build --preview
+  --output-dir outputs/cordvip_demo/object_build --preview
 ```
 
 `generation/` 保存 `mesh_unscaled.obj`、`points_unscaled.npy`、`normals.npy` 和来源记录。默认采样 1024 点，可用 `--num-points` 修改；`--preview` 显示 mesh、点云和坐标轴。单图生成结果没有真实尺度。
@@ -24,9 +24,9 @@ python examples/cordvip/reconstruct_object.py \
 
 ```bash
 python -m cordvip_geometry prepare \
-  --mesh reports/cordvip_demo/object_build/generation/mesh_unscaled.obj \
+  --mesh outputs/cordvip_demo/object_build/generation/mesh_unscaled.obj \
   --size-axis z --size-meters 0.12 \
-  --output-dir reports/cordvip_demo/object_asset --preview
+  --output-dir outputs/cordvip_demo/object_asset --preview
 ```
 
 已知尺度时也可直接为 `reconstruct_object.py` 提供 `--size-axis/--size-meters` 或 `--scale-to-meters`，生成后的米制资产放在 `asset/`。已有 mesh 可直接 `prepare`，跳过单图生成。
@@ -35,14 +35,14 @@ python -m cordvip_geometry prepare \
 
 ### Toy + 篮子：连续分割、双位姿与手点云
 
-已准备的两个资产、首帧选择由一个 JSON 指定；SAM2.1 small 共享编码两物体，每个物体独立维护 FoundationPose++ 2D 引导状态，网络权重共享。直接在窗口查看已有录像：
+两个资产和首帧选择由一个 JSON 指定；以下路径为示例，需自行准备资产、选择和场景文件。SAM2.1 small 共享编码两物体，每个物体独立维护 FoundationPose++ 2D 引导状态，网络权重共享。直接在窗口查看已有录像：
 
 ```bash
 python examples/cordvip/track_object.py \
-  --scene reports/cordvip_multiobject/toy_basket.json \
+  --scene outputs/cordvip_multiobject/toy_basket.json \
   --episode episodes/pick_place_toy/episode_20260827_165923 \
   --with-hand --replay-fps 16 \
-  --output reports/cordvip_demo/toy_basket
+  --output outputs/cordvip_demo/toy_basket
 ```
 
 `v` 切换实测/模型图层，`s` 截图，`q` 退出。Toy 为青色，篮子为紫色，FK 手为橙色。窗口显示每个物体的实测点数与位姿状态。首次初始化后，默认只处理最新帧，处理不及时会明确跳帧；离线加 `--all-frames` 则逐帧运行，不按墙钟节拍等待。加 `--headless --all-frames --save-frames --save-video` 可完整离线导出，`--max-frames N` 可限制验收长度。
@@ -52,10 +52,10 @@ python examples/cordvip/track_object.py \
 ```json
 {
   "objects": [
-    {"id": "toy", "role": "object", "asset": "reports/cordvip_toy/asset",
-     "initial_selection": "reports/cordvip_toy/first_frame_selected"},
-    {"id": "basket", "role": "reference", "asset": "reports/cordvip_basket/tracking_asset",
-     "initial_selection": "reports/cordvip_basket/first_frame_selected"}
+    {"id": "toy", "role": "object", "asset": "outputs/cordvip_toy/asset",
+     "initial_selection": "outputs/cordvip_toy/first_frame_selected"},
+    {"id": "basket", "role": "reference", "asset": "outputs/cordvip_basket/tracking_asset",
+     "initial_selection": "outputs/cordvip_basket/first_frame_selected"}
   ]
 }
 ```
@@ -73,10 +73,10 @@ python examples/cordvip/track_object.py \
 ```bash
 python examples/cordvip/track_object.py \
   --episode episodes/pick_place_toy/episode_20260827_165923 \
-  --asset reports/cordvip_toy/asset \
-  --initial-selection reports/cordvip_toy/first_frame_selected \
+  --asset outputs/cordvip_toy/asset \
+  --initial-selection outputs/cordvip_toy/first_frame_selected \
   --with-hand --replay-fps 16 --save-frames --save-video \
-  --output reports/cordvip_demo/toy_interaction
+  --output outputs/cordvip_demo/toy_interaction
 ```
 
 输出目录必须尚不存在。加 `--headless` 可无窗口运行；省略两个 `--save-*` 可减少落盘开销。离线源先停在首帧，注册通过后按指定速率供给最新帧，结束自动退出；处理不及时会跳帧，保存结果不补齐。`--initial-selection` 仅接受已人工确认且 RGB-D、内参、身份、时间与首帧完全匹配的选择，不能套用到新相机帧。
@@ -87,8 +87,8 @@ python examples/cordvip/track_object.py \
 
 ```bash
 python examples/cordvip/track_object.py \
-  --asset reports/cordvip_demo/object_asset --object-prompt 'white basket.' \
-  --serial CAMERA_SERIAL --output reports/cordvip_demo/live_run
+  --asset outputs/cordvip_demo/object_asset --object-prompt 'white basket.' \
+  --serial CAMERA_SERIAL --output outputs/cordvip_demo/live_run
 ```
 
 模型加载后冻结首帧并分割目标，选择候选后 Enter 确认，`s` 保存截图，`q` 退出。追踪窗口显示已处理源 RGB 与同帧叠加图。实测点来自当前帧深度反投影，不做跨帧表面融合；当前入口需要深度，不能直接输入普通 RGB 视频。
@@ -97,4 +97,4 @@ python examples/cordvip/track_object.py \
 
 两个脚本均支持 `--help`；`track_object.py --check --object-prompt 'white basket.'` 只检查依赖，不连接设备。拍照、分阶段生成和回放等辅助操作使用 `python -m cordvip_geometry {capture,object,replay,...}`。
 
-`python -m cordvip_geometry replay` 提供无模型输入预览。运行和诊断记录保存在 `reports/`；真实相机与实时手—物接口须单独验收。
+`python -m cordvip_geometry replay` 提供无模型输入预览。示例产物保存在 `outputs/`；真实相机与实时手—物接口须单独验收。

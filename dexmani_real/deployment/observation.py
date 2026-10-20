@@ -15,7 +15,7 @@ from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.xhand.config import HandParams
-from dexmani_real.sensor.camera.geometry import RGBDGeometry, camera_parameters_cv
+from dexmani_real.sensor.camera.geometry import CameraIntrinsics, camera_parameters_cv
 
 
 @dataclass(frozen=True)
@@ -35,7 +35,7 @@ def build_observation_kinematics(policy_info: Any, runtime: Any):
         return ObservationKinematics(make_arm_fk())
     hand_fk = HandKinematics(
         str(XHAND_RIGHT_URDF_PATH),
-        list(policy_info.fingertip_link_names),
+        policy_info.fingertip_link_names,
     )
     return ObservationKinematics(make_arm_fk(), hand_fk, runtime.hand)
 
@@ -52,8 +52,7 @@ def build_observation_camera(sensors, camera_config, fields, calibration):
         raise ValueError(
             "Policy camera parameters require the active camera serial to match configuration"
         )
-    geometry = RGBDGeometry.from_dict(json.loads(sensors.camera_geometry.value.decode("utf-8")))
-    color = geometry.color
+    color = CameraIntrinsics(**json.loads(sensors.camera_intrinsics.value.decode("utf-8")))
     if (color.height, color.width) != (camera_config.height, camera_config.width):
         raise ValueError("Policy color intrinsics do not match the configured RGB resolution")
     if sensors.camera_ring.dtype["rgb"].shape != (color.height, color.width, 3):
@@ -73,6 +72,7 @@ def policy_observation_issue(row, fields):
         return "required_observation_unavailable"
     if not np.isfinite(row.arm["qpos"]).all() or not np.isfinite(row.hand["qpos"]).all():
         return "control_feedback_nonfinite"
+    camera_checked = False
     for name in fields:
         if name in {"finger_tactile_force", "taxel_tactile_force"}:
             channel = "aggregate" if name == "finger_tactile_force" else "dense"
@@ -82,6 +82,8 @@ def policy_observation_issue(row, fields):
             if row.point_cloud is None or not np.isfinite(row.point_cloud).all():
                 return "required_point_cloud_unavailable_or_nonfinite"
         elif name in {"rgb", "camera_intrinsic", "camera_extrinsic"}:
+            if camera_checked:
+                continue
             if row.camera is None:
                 return f"required_{name}_unavailable"
             image = row.camera["rgb"]
@@ -93,6 +95,7 @@ def policy_observation_issue(row, fields):
                 or min(image.shape[:2]) <= 0
             ):
                 return f"required_{name}_invalid"
+            camera_checked = True
     return None
 
 
@@ -133,14 +136,15 @@ def build_policy_observation(rows, policy_info, *, kinematics=None, camera_param
                 poses,
                 hand,
                 hand_fk=kinematics.hand_fk,
-                handbase_position_eef_m=np.asarray(mount.T_eef_handbase_pos_xyz),
-                handbase_quat_eef_wxyz=np.asarray(mount.T_eef_handbase_quat_wxyz),
+                handbase_position_eef_m=mount.T_eef_handbase_pos_xyz,
+                handbase_quat_eef_wxyz=mount.T_eef_handbase_quat_wxyz,
             )
 
     result = {}
     for name in policy_info.observation_fields:
         values = np.ascontiguousarray(arrays[name])
-        if np.issubdtype(values.dtype, np.floating) and not np.isfinite(values).all():
+        # Immutable source rows were checked per tick; these casts can still overflow.
+        if name in {"joint_state", "eef_pose"} and not np.isfinite(values).all():
             raise ValueError(f"Nonfinite policy observation {name}")
         result[name] = values
     return result
@@ -170,9 +174,10 @@ def policy_sources(row, fields):
     return sources
 
 
-def decision_is_fresh(sources, now_ns, max_age_s):
-    return bool(sources) and all(
-        0 < timestamp <= now_ns and now_ns - timestamp <= int(max_age_s * 1e9)
-        for times in sources.values()
-        for timestamp in times
-    )
+def decision_expires_at_ns(sources, now_ns, max_age_ns):
+    """An exclusive deadline preserves age <= budget on the integer-nanosecond clock."""
+    timestamps = [stamp for times in sources.values() for stamp in times]
+    if not timestamps or any(stamp <= 0 or stamp > now_ns for stamp in timestamps):
+        return None
+    expires_at_ns = min(timestamps) + max_age_ns + 1
+    return expires_at_ns if now_ns < expires_at_ns else None

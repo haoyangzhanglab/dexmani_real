@@ -16,7 +16,7 @@ from dexmani_real.robot.model import (
 from ..paths import wrap_nearest_equivalent
 from .pose import Pose
 
-_ARM_FK_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)
+ARM_FK_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)
 
 
 def make_arm_kinematics():
@@ -40,7 +40,7 @@ def make_arm_kinematics():
 @lru_cache(maxsize=1)
 def make_arm_fk() -> "ArmFK":
     """Return cached per-process FK for deriving the URDF EEF pose from arm qpos."""
-    return ArmFK(_ARM_FK_URDF)
+    return ArmFK(ARM_FK_URDF)
 
 
 class ArmFK:
@@ -49,10 +49,10 @@ class ArmFK:
     def __init__(self, urdf_path: str, eef_frame_name: str = "custom_eef_link") -> None:
         import pinocchio
 
-        self._model = pinocchio.buildModelFromUrdf(str(urdf_path))
-        self._data = self._model.createData()
-        self._eef_frame_id = self._model.getFrameId(eef_frame_name)
-        if self._eef_frame_id >= self._model.nframes:
+        self.model = pinocchio.buildModelFromUrdf(str(urdf_path))
+        self.data = self.model.createData()
+        self.eef_frame_id = self.model.getFrameId(eef_frame_name)
+        if self.eef_frame_id >= self.model.nframes:
             raise ValueError(f"URDF is missing EEF frame {eef_frame_name!r}")
 
     def compute(self, qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -62,9 +62,9 @@ class ArmFK:
             raise ValueError(f"arm qpos must be finite with shape {ARM_JOINT_SHAPE}")
         import pinocchio
 
-        pinocchio.forwardKinematics(self._model, self._data, qpos)
-        pinocchio.updateFramePlacements(self._model, self._data)
-        pose = self._data.oMf[self._eef_frame_id]
+        pinocchio.forwardKinematics(self.model, self.data, qpos)
+        pinocchio.updateFramePlacements(self.model, self.data)
+        pose = self.data.oMf[self.eef_frame_id]
 
         R = np.asarray(pose.rotation, dtype=np.float64)
         eef_pos = np.asarray(pose.translation, dtype=np.float64).copy()
@@ -75,7 +75,7 @@ class ArmFK:
             or not np.all(np.isfinite(R))
         ):
             raise RuntimeError("ArmFK produced a malformed or non-finite pose")
-        eef_rot6d = np.concatenate([R[:, 0], R[:, 1]]).astype(np.float64)
+        eef_rot6d = np.concatenate([R[:, 0], R[:, 1]])
         return eef_pos, eef_rot6d
 
 
@@ -84,7 +84,7 @@ def compute_eef_pose_history_xarm_base(
     *,
     arm_fk: "ArmFK | None" = None,
 ) -> np.ndarray:
-    """Return finite float64 [T,9] base-frame XYZ+rot6d from measured/commanded qpos using one URDF FK per row."""
+    """Return float64 [T,9] base-frame XYZ+rot6d from measured or commanded qpos."""
     qpos_history = np.asarray(arm_qpos, dtype=np.float64)
     if qpos_history.ndim != 2 or qpos_history.shape[1] != ARM_JOINT_SHAPE[0]:
         raise ValueError(
@@ -98,8 +98,6 @@ def compute_eef_pose_history_xarm_base(
         eef_pos, eef_rot6d = fk.compute(qpos)
         poses[index, :3] = eef_pos
         poses[index, 3:] = eef_rot6d
-    if not np.all(np.isfinite(poses)):
-        raise RuntimeError("EEF pose history contains non-finite values")
     return poses
 
 

@@ -63,7 +63,7 @@ class ArmParams:
     max_joint_acceleration_deg_per_s2: float = 810.0
     feedback_max_age_s: float = 4 / 30  # host-side feedback freshness budget
 
-    # Host reference generation; independent of teleop/control_dt_s sampling.
+    # Host reference generation is independent of teleop/policy observation cadence.
     servo_hz: float = 100.0
     feedback_hz: float = 25.0
     servo_max_interval_s: float = 0.020
@@ -135,17 +135,17 @@ class ArmParams:
         if not 1 / self.servo_hz < self.servo_max_interval_s:
             raise ValueError("servo interval budget must exceed one servo period")
         # These physical v/a limits also remain valid for firmware-planned Mode-0 HOME.
-        _max_speed_rad = self.max_joint_velocity_rad_per_s
-        _max_acc_rad = self.max_joint_acceleration_rad_per_s2
-        if not (np.isfinite(_max_speed_rad) and 0.0001 <= _max_speed_rad <= np.pi):
+        max_speed_rad = self.max_joint_velocity_rad_per_s
+        max_acc_rad = self.max_joint_acceleration_rad_per_s2
+        if not (np.isfinite(max_speed_rad) and 0.0001 <= max_speed_rad <= np.pi):
             raise ValueError(
                 f"max_joint_velocity_deg_per_s={self.max_joint_velocity_deg_per_s} "
-                f"resolves to {_max_speed_rad} rad/s, outside the SDK command range [0.0001, π]"
+                f"resolves to {max_speed_rad} rad/s, outside the SDK command range [0.0001, π]"
             )
-        if not (np.isfinite(_max_acc_rad) and 0.01 <= _max_acc_rad <= 20.0):
+        if not (np.isfinite(max_acc_rad) and 0.01 <= max_acc_rad <= 20.0):
             raise ValueError(
                 f"max_joint_acceleration_deg_per_s2={self.max_joint_acceleration_deg_per_s2} "
-                f"resolves to {_max_acc_rad} rad/s², outside the SDK command range [0.01, 20]"
+                f"resolves to {max_acc_rad} rad/s², outside the SDK command range [0.01, 20]"
             )
         if not np.isfinite(self.tcp_load_mass_kg) or self.tcp_load_mass_kg <= 0:
             raise ValueError("tcp_load_mass_kg must be finite and positive")

@@ -14,8 +14,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # stop() disables callbacks, but Linux/XRecord may remain blocked; avoid long waits.
-_LISTENER_STOP_TIMEOUT_S = 0.25
-_LISTENER_START_TIMEOUT_S = 2.0
+LISTENER_STOP_TIMEOUT_S = 0.25
+LISTENER_START_TIMEOUT_S = 2.0
 
 __all__ = [
     "OperatorCommand",
@@ -34,7 +34,7 @@ class OperatorCommand(Enum):
     QUIT = "QUIT"
 
 
-_KEY_MAP: dict[str, OperatorCommand] = {
+KEY_MAP: dict[str, OperatorCommand] = {
     "b": OperatorCommand.BEGIN,
     "c": OperatorCommand.PAUSE,
     "s": OperatorCommand.STOP,
@@ -44,7 +44,7 @@ _KEY_MAP: dict[str, OperatorCommand] = {
     "q": OperatorCommand.QUIT,
 }
 
-_EVENT_ONLY_KEYS = frozenset({"x", "space", "enter", "backspace"})
+EVENT_ONLY_KEYS = frozenset({"x", "space", "enter", "backspace"})
 
 
 def suppress_terminal_echo() -> list[Any] | None:
@@ -83,7 +83,7 @@ def stop_listener_bounded(listener: Any) -> bool:
         return True
     try:
         listener.stop()
-        listener.join(timeout=_LISTENER_STOP_TIMEOUT_S)
+        listener.join(timeout=LISTENER_STOP_TIMEOUT_S)
         alive = bool(listener.is_alive())
     except Exception:
         logger.warning("keyboard listener shutdown raised", exc_info=True)
@@ -93,7 +93,7 @@ def stop_listener_bounded(listener: Any) -> bool:
         logger.debug(
             "keyboard listener backend did not confirm exit within %.1fs; "
             "terminal input will still be restored and flushed",
-            _LISTENER_STOP_TIMEOUT_S,
+            LISTENER_STOP_TIMEOUT_S,
         )
         return False
     return True
@@ -112,54 +112,54 @@ class KeyboardInput:
         capture_raw_events: bool = False,
         jog_change_callback: Callable[[], None] | None = None,
     ) -> None:
-        self._buffer: deque[OperatorCommand] = deque()
-        self._events: deque[str] = deque()
-        self._keys: set[str] = set()
-        self._generation = 0
-        self._jog_change_callback = jog_change_callback
-        self._condition = threading.Condition(threading.Lock())
-        self._listener: Any = None
-        self._running: bool = False
+        self.buffer: deque[OperatorCommand] = deque()
+        self.events: deque[str] = deque()
+        self.held_keys: set[str] = set()
+        self.generation = 0
+        self.jog_change_callback = jog_change_callback
+        self.condition = threading.Condition(threading.Lock())
+        self.listener: Any = None
+        self.running: bool = False
         # A daemon can outlive shutdown; disable its callbacks before releasing the session.
-        self._callbacks_active: bool = False
-        self._estop_callback = estop_callback
-        self._stop_callback = stop_callback
-        self._quit_callback = quit_callback
-        self._capture_commands = bool(capture_commands)
-        self._capture_raw_events = bool(capture_raw_events)
-        self._estop_latched = threading.Event()
-        self._listener_failure_reported = False
-        self._saved_termios: list | None = None
+        self.callbacks_active: bool = False
+        self.estop_callback = estop_callback
+        self.stop_callback = stop_callback
+        self.quit_callback = quit_callback
+        self.capture_commands = bool(capture_commands)
+        self.capture_raw_events = bool(capture_raw_events)
+        self.estop_event = threading.Event()
+        self.listener_failure_reported = False
+        self.saved_termios: list | None = None
 
     def latch_emergency_stop(self) -> None:
         callback: Callable[[], None] | None = None
-        with self._condition:
-            if not self._callbacks_active:
+        with self.condition:
+            if not self.callbacks_active:
                 return
-            if self._estop_latched.is_set():
+            if self.estop_event.is_set():
                 return
-            self._estop_latched.set()
-            callback = self._estop_callback
+            self.estop_event.set()
+            callback = self.estop_callback
         if callback is not None:
             try:
                 callback()
             except Exception:
                 logger.error("keyboard emergency-stop callback failed", exc_info=True)
-        with self._condition:
-            if self._callbacks_active:
-                self._generation += 1
-                self._buffer.append(OperatorCommand.EMERGENCY_STOP)
-                self._condition.notify()
+        with self.condition:
+            if self.callbacks_active:
+                self.generation += 1
+                self.buffer.append(OperatorCommand.EMERGENCY_STOP)
+                self.condition.notify()
 
     def dispatch_immediate_callback(self, signal: OperatorCommand) -> bool:
         """Complete the immediate effect before the command becomes pollable."""
-        with self._condition:
-            if not self._callbacks_active:
+        with self.condition:
+            if not self.callbacks_active:
                 return False
             callback = (
-                self._stop_callback
+                self.stop_callback
                 if signal is OperatorCommand.STOP
-                else self._quit_callback if signal is OperatorCommand.QUIT else None
+                else self.quit_callback if signal is OperatorCommand.QUIT else None
             )
         if callback is None:
             return True
@@ -204,36 +204,36 @@ class KeyboardInput:
                 if name == "esc":
                     self.latch_emergency_stop()
                     return
-                signal = _KEY_MAP.get(name)
-                with self._condition:
-                    if not self._callbacks_active:
+                signal = KEY_MAP.get(name)
+                with self.condition:
+                    if not self.callbacks_active:
                         return
-                    if name in _EVENT_ONLY_KEYS:
-                        if self._capture_raw_events:
-                            self._events.append(name)
+                    if name in EVENT_ONLY_KEYS:
+                        if self.capture_raw_events:
+                            self.events.append(name)
                         return
                     # Held keys also deduplicate command edges across OS repeat.
-                    if name in self._keys:
+                    if name in self.held_keys:
                         return
                 # Fence STOP/QUIT before exposing the edge. These callbacks only
                 # revoke authority; target IPC and SDK I/O belong to their owners.
                 if (
                     signal is not None
                     and (
-                        self._capture_commands
-                        or (signal is OperatorCommand.QUIT and self._quit_callback is not None)
+                        self.capture_commands
+                        or (signal is OperatorCommand.QUIT and self.quit_callback is not None)
                     )
                     and not self.dispatch_immediate_callback(signal)
                 ):
                     return
-                with self._condition:
-                    if not self._callbacks_active:
+                with self.condition:
+                    if not self.callbacks_active:
                         return
-                    self._keys.add(name)
+                    self.held_keys.add(name)
                     self.jog_changed(name, True)
-                    if self._capture_commands and signal is not None:
-                        self._buffer.append(signal)
-                        self._condition.notify()
+                    if self.capture_commands and signal is not None:
+                        self.buffer.append(signal)
+                        self.condition.notify()
             except Exception:
                 self.latch_emergency_stop()
                 logger.warning("keyboard press callback failed", exc_info=True)
@@ -241,10 +241,10 @@ class KeyboardInput:
         def on_release(key: object) -> None:
             try:
                 name = key_name(key)
-                with self._condition:
-                    changed = self._callbacks_active and name in self._keys
-                    if self._callbacks_active:
-                        self._keys.discard(name)
+                with self.condition:
+                    changed = self.callbacks_active and name in self.held_keys
+                    if self.callbacks_active:
+                        self.held_keys.discard(name)
                     self.jog_changed(name, changed)
             except Exception:
                 self.latch_emergency_stop()
@@ -256,22 +256,22 @@ class KeyboardInput:
         """Under the input lock, publish a jog generation after fencing its old epoch."""
         if not changed:
             return
-        if self._jog_change_callback is None or name == "q":
-            self._generation += 1
+        if self.jog_change_callback is None or name == "q":
+            self.generation += 1
             return
-        from dexmani_real.teleop.jog import CARTESIAN_JOG_KEYS
+        from dexmani_real.runtime.jog import CARTESIAN_JOG_KEYS
 
         # HOME is edge-triggered: releasing R must not cancel a HOME in progress.
         # Other keys do not change the motion proposal represented by generation.
-        if name in CARTESIAN_JOG_KEYS or (name == "r" and name in self._keys):
-            self._jog_change_callback()
-            self._generation += 1
+        if name in CARTESIAN_JOG_KEYS or (name == "r" and name in self.held_keys):
+            self.jog_change_callback()
+            self.generation += 1
 
     def start(self) -> None:
         """Start the daemon keyboard listener once."""
-        if self._running:
+        if self.running:
             return
-        if self._listener is not None:
+        if self.listener is not None:
             raise RuntimeError(
                 "keyboard listener is retained from a prior shutdown; "
                 "refusing to start a replacement"
@@ -291,25 +291,25 @@ class KeyboardInput:
                 "pynput is required for global keyboard capture. Install with: pip install pynput"
             ) from None
 
-        self._saved_termios = suppress_terminal_echo()
-        self._estop_latched.clear()
-        self._listener_failure_reported = False
-        with self._condition:
-            self._buffer.clear()
-            self._events.clear()
-            self._keys.clear()
-            self._generation += 1  # A restarted listener cannot revive old proposals.
-            self._callbacks_active = True
+        self.saved_termios = suppress_terminal_echo()
+        self.estop_event.clear()
+        self.listener_failure_reported = False
+        with self.condition:
+            self.buffer.clear()
+            self.events.clear()
+            self.held_keys.clear()
+            self.generation += 1  # A restarted listener cannot revive old proposals.
+            self.callbacks_active = True
         on_press, on_release = self.callbacks(keyboard)
 
         try:
-            self._listener = keyboard.Listener(
+            self.listener = keyboard.Listener(
                 on_press=on_press,
                 on_release=on_release,
                 suppress=False,
             )
-            self._listener.start()
-            listener = self._listener
+            self.listener.start()
+            listener = self.listener
             ready = threading.Event()
             startup_errors: list[BaseException] = []
 
@@ -324,109 +324,109 @@ class KeyboardInput:
             threading.Thread(
                 target=wait_until_ready, name="keyboard-events-ready", daemon=True
             ).start()
-            if not ready.wait(timeout=_LISTENER_START_TIMEOUT_S):
+            if not ready.wait(timeout=LISTENER_START_TIMEOUT_S):
                 raise RuntimeError(
-                    f"keyboard listener startup timed out after {_LISTENER_START_TIMEOUT_S:.1f}s"
+                    f"keyboard listener startup timed out after {LISTENER_START_TIMEOUT_S:.1f}s"
                 )
             if startup_errors:
                 raise RuntimeError("keyboard listener failed during startup") from startup_errors[0]
-            if not self._listener.is_alive():
+            if not self.listener.is_alive():
                 raise RuntimeError("keyboard listener exited during startup")
         except BaseException:
             self.stop()
             raise
 
-        self._running = True
+        self.running = True
 
     def stop(self) -> None:
         """Stop the listener idempotently for bounded cleanup."""
-        listener = self._listener
-        with self._condition:
-            self._callbacks_active = False
-            self._running = False
-            self._buffer.clear()
-            self._condition.notify_all()
+        listener = self.listener
+        with self.condition:
+            self.callbacks_active = False
+            self.running = False
+            self.buffer.clear()
+            self.condition.notify_all()
         try:
             if stop_listener_bounded(listener):
-                self._listener = None
+                self.listener = None
         finally:
-            with self._condition:
-                self._events.clear()
-                self._keys.clear()
-            self._estop_latched.clear()
-            restore_terminal_echo(self._saved_termios)
-            self._saved_termios = None
+            with self.condition:
+                self.events.clear()
+                self.held_keys.clear()
+            self.estop_event.clear()
+            restore_terminal_echo(self.saved_termios)
+            self.saved_termios = None
 
     def poll(self, timeout: float = 0.05) -> list[OperatorCommand]:
         """Drain commands, waiting at most timeout seconds; zero is nonblocking and may return an empty list."""
-        if self._running and not self.healthy:
-            if not self._listener_failure_reported:
+        if self.running and not self.healthy:
+            if not self.listener_failure_reported:
                 logger.error("keyboard listener exited; latching emergency stop")
-                self._listener_failure_reported = True
+                self.listener_failure_reported = True
 
-        with self._condition:
+        with self.condition:
             if timeout > 0:
-                self._condition.wait_for(lambda: self._buffer or not self._running, timeout)
-            signals = list(self._buffer)
-            self._buffer.clear()
+                self.condition.wait_for(lambda: self.buffer or not self.running, timeout)
+            signals = list(self.buffer)
+            self.buffer.clear()
             return signals
 
     @property
     def healthy(self) -> bool:
         """Whether the listener that owns emergency-stop input is alive."""
-        listener = self._listener
+        listener = self.listener
         try:
-            healthy = bool(self._running and listener is not None and listener.is_alive())
+            healthy = bool(self.running and listener is not None and listener.is_alive())
         except Exception:
             logger.error("keyboard listener health check failed", exc_info=True)
             healthy = False
         if not healthy:
-            if self._running:
+            if self.running:
                 # Fence the SDK owner before publishing the cleared input generation.
                 self.latch_emergency_stop()
-            with self._condition:
-                if self._keys:
-                    self._keys.clear()
-                    self._generation += 1
+            with self.condition:
+                if self.held_keys:
+                    self.held_keys.clear()
+                    self.generation += 1
         return healthy
 
     @property
     def estop_latched(self) -> bool:
-        return self._estop_latched.is_set()
+        return self.estop_event.is_set()
 
     def is_pressed(self, key: str) -> bool:
         """Return whether a key is currently held, with sticky ESC semantics."""
-        if key == "esc" and self._estop_latched.is_set():
+        if key == "esc" and self.estop_event.is_set():
             return True
-        with self._condition:
-            return key in self._keys
+        with self.condition:
+            return key in self.held_keys
 
     def pressed_keys(self) -> tuple[str, ...]:
-        with self._condition:
-            return tuple(sorted(self._keys))
+        with self.condition:
+            return tuple(sorted(self.held_keys))
 
     def snapshot(self) -> tuple[frozenset[str], int]:
         """Atomic held keys and jog generation; motion release/repress invalidates proposals."""
-        with self._condition:
-            return frozenset(self._keys), self._generation
+        with self.condition:
+            return frozenset(self.held_keys), self.generation
 
     def commit_if_current(self, generation: int, commit: Callable[[], Any]) -> Any:
         """Guard local authority/reference updates only; never wait on target IPC or SDK I/O."""
-        with self._condition:
+        with self.condition:
             if (
-                not self._callbacks_active
-                or self._estop_latched.is_set()
-                or generation != self._generation
+                not self.callbacks_active
+                or self.estop_event.is_set()
+                or generation != self.generation
             ):
                 return None
             # Lock order: input -> short RuntimeState updates. IPC waits run outside both.
             return commit()
 
     def pop_event(self) -> str | None:
-        with self._condition:
-            return self._events.popleft() if self._events else None
+        with self.condition:
+            return self.events.popleft() if self.events else None
 
     def drain_signal(self, target: OperatorCommand) -> None:
         """Remove stale commands after blocking operations, preserving other requests."""
-        with self._condition:
-            self._buffer = deque(s for s in self._buffer if s != target)
+        with self.condition:
+            self.buffer = deque(s for s in self.buffer if s != target)

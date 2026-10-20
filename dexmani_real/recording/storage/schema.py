@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.robot.commands import DispatchStatus
-from dexmani_real.utils.timing import sampling_clock_ns
 
 RAW_FORMAT = "dexmani.raw"
 ARM_EXECUTION_FORMAT = "mode1_episode_summary_v1"
@@ -53,31 +52,6 @@ def validate_capture_rows(timestamp, dispatch_status) -> tuple[str, ...]:
     if np.any(dispatch_status > DispatchStatus.SUBMITTED):
         errors.append("dispatch_status must contain status codes 0 through 5")
     return tuple(errors)
-
-
-def validate_training_rows(timestamp, dispatch_status, control_hz) -> tuple[str, ...]:
-    """Whole-episode admission only; failed evidence remains readable as Raw."""
-    errors = validate_capture_rows(timestamp, dispatch_status)
-    if errors:
-        return errors
-    dt_ns, epsilon_ns = sampling_clock_ns(control_hz)
-    # Raw seconds originate from integer ns; round only representation error.
-    stamps = np.rint(np.asarray(timestamp) * 1e9)
-    intervals = np.diff(stamps)
-    deviations = stamps - np.arange(len(stamps)) * dt_ns
-    bad_interval = np.flatnonzero(np.abs(intervals - dt_ns) > epsilon_ns)
-    bad_grid = np.flatnonzero(np.abs(deviations) > epsilon_ns)
-    bad_rows = [int(bad_interval[0]) + 1] if len(bad_interval) else []
-    if len(bad_grid):
-        bad_rows.append(int(bad_grid[0]))
-    if bad_rows:
-        row = min(bad_rows)
-        return (
-            f"timing row {row}: interval_ns={intervals[row - 1]:.0f}, "
-            f"nominal_ns={dt_ns}, grid_deviation_ns={deviations[row]:.0f}, "
-            f"tolerance_ns={epsilon_ns}",
-        )
-    return validate_dispatch_rows(dispatch_status)
 
 
 def validate_dispatch_rows(dispatch_status) -> tuple[str, ...]:
@@ -206,3 +180,87 @@ TIMING_ROW_DTYPE = np.dtype(
         )
     ]
 )
+
+
+def encode_raw_row(row, command, result, timestamp):
+    arm, hand, camera = (
+        row.arm[0],
+        None if row.hand is None else row.hand[0],
+        row.camera,
+    )
+    if camera is None:
+        raise ValueError("recording requires RGB-D from the current observation")
+    values = {
+        "timestamp": timestamp,
+        "dispatch_status": (int(result.arm), int(result.hand)) if result is not None else (0, 0),
+        "arm_qpos": arm["qpos"],
+        "arm_qvel": arm["qvel"],
+        "arm_effort": arm["effort"],
+        "hand_qpos": hand["qpos"] if hand is not None else np.full(12, np.nan),
+        "hand_current": hand["current"] if hand is not None else np.full(12, np.nan),
+        "hand_contact": hand["tactile_aggregate"] if hand is not None else np.full((5, 3), np.nan),
+        "hand_tactile_force": (
+            hand["tactile_dense"] if hand is not None else np.full((5, 120, 3), np.nan)
+        ),
+        "action_arm_joint_target": (
+            command.arm_qpos
+            if command is not None
+            and command.arm_qpos is not None
+            and result is not None
+            and result.arm != DispatchStatus.NOT_CALLED
+            else np.full(7, np.nan)
+        ),
+        "action_hand_joint_target": (
+            command.hand_qpos
+            if command is not None
+            and command.hand_qpos is not None
+            and result is not None
+            and result.hand != DispatchStatus.NOT_CALLED
+            else np.full(12, np.nan)
+        ),
+    }
+    if any(status not in range(6) for status in values["dispatch_status"]):
+        raise ValueError("dispatch_status must contain status codes 0 through 5")
+    for name, value in values.items():
+        spec = DATASET_SPECS[name]
+        array = np.asarray(value, dtype=spec.dtype)
+        if array.shape != spec.tail_shape:
+            raise ValueError(f"Raw {name}: expected {spec.tail_shape}, got {array.shape}")
+        values[name] = array
+    return values
+
+
+def observation_timing(row):
+    """Host observation and pipeline clocks in monotonic nanoseconds."""
+    return dict(
+        observation_ns=int(row.observation_timestamp_ns),
+        control_ns=int(row.control_timestamp_ns),
+        arm_ns=int(row.arm["timestamp_ns"][0]),
+        hand_ns=int(row.hand["timestamp_ns"][0]) if row.hand is not None else -1,
+        camera_ns=int(row.camera["timestamp_ns"]) if row.camera is not None else -1,
+        pointcloud_ns=int(row.pointcloud_timestamp_ns) if row.pointcloud_timestamp_ns > 0 else -1,
+        camera_sequence=int(row.camera["ring_sequence"]) if row.camera is not None else -1,
+        pointcloud_camera_sequence=int(row.pointcloud_camera_sequence),
+        **{
+            f"camera_{name}": int(row.camera[name]) if row.camera is not None else -1
+            for name in ("received_ns", "published_ns", "depth_frame_number", "color_frame_number")
+        },
+        pointcloud_camera_received_ns=int(row.pointcloud_camera_received_ns),
+        pointcloud_camera_published_ns=int(row.pointcloud_camera_published_ns),
+        pointcloud_started_ns=int(row.pointcloud_started_ns),
+        pointcloud_published_ns=int(row.pointcloud_published_ns),
+    )
+
+
+def encode_timing_row(row, result, execution_timing):
+    evidence = dict(observation_timing(row), **execution_timing)
+    evidence["command_seq"] = -1
+    if result is not None and result.arm == DispatchStatus.SUBMITTED:
+        run_id, sequence = result.command_id
+        if evidence.get("run_id", run_id) != run_id:
+            raise ValueError("dispatch/timing run_id mismatch")
+        evidence.update(run_id=run_id, command_seq=sequence)
+    unknown = evidence.keys() - set(TIMING_ROW_DTYPE.names)
+    if unknown:
+        raise ValueError(f"Unknown timing row fields: {sorted(unknown)}")
+    return tuple(evidence.get(name, -1) for name in TIMING_ROW_DTYPE.names)

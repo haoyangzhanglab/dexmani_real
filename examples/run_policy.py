@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
-"""真机策略评估。
-
-用法（EXPERIMENT 为 policy/task/experiment，不带 experiments/ 前缀）：
-    python examples/run_policy.py policy/task/experiment
-    python examples/run_policy.py policy/task/experiment --checkpoint 80pct --inference-steps 4
-    python examples/run_policy.py policy/task/experiment --config local.yaml --n-action-steps 8
-    python examples/run_policy.py policy/task/experiment --execution-mode async --prefetch-steps 1
-    python examples/run_policy.py --print-config
-
-常用参数：
-    --checkpoint 默认 latest；也支持已有百分比 milestone、best 或文件名。
-    --inference-steps 设置 NFE，--weights 选择 ema/raw；默认使用实验保存的评估设置。
-    --n-action-steps 设置每段执行步数，未指定时依次使用 YAML execution.action_steps、策略的 n_action_steps。
-    默认最多评估 20 轮，每轮按 B 开始、S 结束；Q 提前退出，--num-episodes N 修改轮数。
-    --no-record / --no-results 分别关闭 Raw / 评估摘要；--output 指定输出目录。
-    prefetch_steps = d 表示：在当前动作段距离交接还剩 d 个控制步时，提前启动下一次策略推理，让推理与当前动作的执行重叠。
-
-执行模式默认 sync；CLI 执行参数优先于 --config YAML。
-RTC 使用 --execution-mode rtc，并显式设置 --prefetch-steps 和 --rtc-guidance-cap。
-当前 RTC 仅支持连续动作 BasePolicy DDIM 策略；ManiFlow 支持 sync/async，Temporal 仅支持 sync。
-LAMP 仅支持 joint、H=Nobs=A_exec=1、sync；Real 提供历史手部下发目标，CRC_UNCONFIRMED 不代表 ACK。
-LAMP 的 sync 等待保留实际推理延迟；真机闭环尚未验证。
-执行窗口、输入能力及 LAMP/Temporal 限制在创建会话目录、加载模型和连接设备前检查。
-普通运行会连接设备，关闭输出不是离线模式；--print-config 不连接设备。
-其他参数见 --help。
-"""
+"""真机策略评估；--print-config 仅打印配置，不连接设备。"""
 
 from __future__ import annotations
 
@@ -80,7 +55,10 @@ def positive_running_seconds(raw: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run one policy-evaluation session with independently optional Raw recording and evaluation summary"
+        description=(
+            "Run one policy-evaluation session with independently optional "
+            "Raw recording and evaluation summary"
+        )
     )
     parser.add_argument(
         "experiment",
@@ -159,7 +137,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--n-action-steps",
         type=positive_int,
         default=None,
-        help="A_exec: actions per segment (default: YAML execution.action_steps or saved Policy n_action_steps)",
+        help=(
+            "A_exec: actions per segment "
+            "(default: YAML execution.action_steps or saved Policy n_action_steps)"
+        ),
     )
     research = parser.add_argument_group("Policy inference")
     research.add_argument("--weights", choices=("ema", "raw"), default=None)
@@ -216,9 +197,7 @@ def write_run_config(session_dir, *, args, runtime, info):
         except (OSError, subprocess.CalledProcessError):
             return None
 
-    compact_info = asdict(info)
-    compact_info["experiment_dir"] = str(info.experiment_dir)
-    compact_info["checkpoint_path"] = str(info.checkpoint_path)
+    compact_info = info.to_dict()
     payload = {
         "experiment": args.experiment,
         "checkpoint": args.checkpoint,
@@ -267,20 +246,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from dexmani_policy.deployment import (
             inspect_policy,
-            load_experiment_config as load_policy_config,
             resolve_experiment,
         )
 
         experiment = resolve_experiment(args.experiment)
-        saved_config = load_policy_config(experiment)
         checkpoint = args.checkpoint
         if checkpoint.endswith("pct"):
-            from dexmani_policy.evaluation.protocol import resolve_checkpoint_path
+            from dexmani_policy.evaluation.checkpoints import resolve_checkpoint_path
 
             checkpoint, _ = resolve_checkpoint_path(experiment, checkpoint)
         info = inspect_policy(
             experiment,
-            config=saved_config,
             checkpoint=checkpoint,
             weights=args.weights,
             inference_steps=args.inference_steps,
@@ -290,13 +266,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        from dexmani_real.deployment.config import validate_deployment_config
+        from dexmani_real.deployment.startup import validate_deployment_config
 
         action_steps = runtime.execution.action_steps
         if action_steps is None:
             action_steps = info.n_action_steps
         runtime = replace(runtime, execution=replace(runtime.execution, action_steps=action_steps))
-        validate_deployment_config(saved_config, info, runtime, record_raw=not args.no_record)
+        validate_deployment_config(info, runtime, record_raw=not args.no_record)
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
     except Exception as exc:
         print(f"[PREFLIGHT] preflight failed: {exc}", file=sys.stderr)
@@ -328,7 +304,6 @@ def main(argv: list[str] | None = None) -> int:
 
         return PolicyDeploymentSession(
             runtime,
-            saved_config,
             info,
             device=args.device,
             seed=args.seed,

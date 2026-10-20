@@ -9,7 +9,7 @@ from dexmani_real.config.experiment import (
     validate_keyboard_workspace,
     validate_robot_config,
 )
-from dexmani_real.planning.admission import TargetAdmission
+from dexmani_real.planning.target import TargetChecker
 from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_solver
 from dexmani_real.robot.commands import DispatchError
 from dexmani_real.robot.home import build_home_planner, home_robot
@@ -18,7 +18,7 @@ from dexmani_real.runtime.observation import feedback_deadline_ns, read_observat
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
-from dexmani_real.teleop.jog import (
+from dexmani_real.runtime.jog import (
     any_jog_key_held,
     compute_cartesian_jog_delta,
     jog_motion_requested,
@@ -70,7 +70,7 @@ class KeyboardTeleopSession:
             )
             if not self.runtime.control.hand_enabled:
                 solver.collision_model.set_hand_qpos(np.deg2rad(self.runtime.hand.home_qpos_deg))
-            admission = TargetAdmission(
+            target_checker = TargetChecker(
                 self.runtime,
                 solver.collision_model,
                 dynamic_rejection=solver.dynamic_rejection,
@@ -200,7 +200,7 @@ class KeyboardTeleopSession:
                     if row.hand is not None
                     else np.deg2rad(self.runtime.hand.home_qpos_deg)
                 )
-                rejection = admission.rejection(
+                rejection = target_checker.rejection(
                     result.qpos, measured_qpos, baseline_qpos, collision_hand_qpos=collision_hand
                 )
                 if rejection is not None:

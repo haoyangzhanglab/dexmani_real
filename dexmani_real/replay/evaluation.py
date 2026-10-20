@@ -14,11 +14,11 @@ from dexmani_real.replay.trajectory import TrajectoryData
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
 from dexmani_real.utils.atomic_io import atomic_json_dump
 
-_ALIGNMENT_WINDOW_S = 0.4
-_MIN_ALIGNMENT_OFFSET_FRAMES = 6
-_MIN_ALIGNMENT_OVERLAP_FRAMES = 10
-_MIN_ALIGNMENT_SEQUENCE_FRAMES = 20
-_TARGET_GAP_PERCENTILE = 95.0
+ALIGNMENT_WINDOW_S = 0.4
+MIN_ALIGNMENT_OFFSET_FRAMES = 6
+MIN_ALIGNMENT_OVERLAP_FRAMES = 10
+MIN_ALIGNMENT_SEQUENCE_FRAMES = 20
+TARGET_GAP_PERCENTILE = 95.0
 
 
 def geodesic_distance_deg(rotation_a: np.ndarray, rotation_b: np.ndarray) -> float:
@@ -134,7 +134,7 @@ def compute_metrics(
         gaps = np.max(np.abs(commands[valid] - measured[valid]), axis=1)
         metrics["pre_submit_arm_target_gap"] = {
             "mean_deg": round(float(np.rad2deg(np.mean(gaps))), 2),
-            "p95_deg": round(float(np.rad2deg(np.percentile(gaps, _TARGET_GAP_PERCENTILE))), 2),
+            "p95_deg": round(float(np.rad2deg(np.percentile(gaps, TARGET_GAP_PERCENTILE))), 2),
             "max_deg": round(float(np.rad2deg(np.max(gaps))), 2),
         }
 
@@ -228,16 +228,15 @@ def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str) -> Pat
 
 
 def trajectory_alignment_offsets(orig_q, rep_q, fps):
-    """RMSE alignment: positive offset matches higher replay indices.
-    Nominal fps bounds the search; stationary axes cannot identify command-to-feedback delay."""
+    """RMSE alignment within nominal-fps bounds; positive lags match higher replay indices."""
     frame_count = len(orig_q)
     lags = {}
-    if frame_count >= _MIN_ALIGNMENT_SEQUENCE_FRAMES:
-        max_lag = max(int(np.ceil(fps * _ALIGNMENT_WINDOW_S)), _MIN_ALIGNMENT_OFFSET_FRAMES)
+    if frame_count >= MIN_ALIGNMENT_SEQUENCE_FRAMES:
+        max_lag = max(int(np.ceil(fps * ALIGNMENT_WINDOW_S)), MIN_ALIGNMENT_OFFSET_FRAMES)
         for joint_index in range(ARM_JOINT_SHAPE[0]):
             original_finite = orig_q[np.isfinite(orig_q[:, joint_index]), joint_index]
             replay_finite = rep_q[np.isfinite(rep_q[:, joint_index]), joint_index]
-            if min(len(original_finite), len(replay_finite)) < _MIN_ALIGNMENT_OVERLAP_FRAMES:
+            if min(len(original_finite), len(replay_finite)) < MIN_ALIGNMENT_OVERLAP_FRAMES:
                 continue
             if min(np.ptp(original_finite), np.ptp(replay_finite)) < np.deg2rad(1):
                 continue  # A stationary axis cannot identify temporal lag.
@@ -254,7 +253,7 @@ def trajectory_alignment_offsets(orig_q, rep_q, fps):
                     original = orig_q[:, joint_index]
                     replayed = rep_q[:, joint_index]
                 finite = np.isfinite(original) & np.isfinite(replayed)
-                if int(np.count_nonzero(finite)) < _MIN_ALIGNMENT_OVERLAP_FRAMES:
+                if int(np.count_nonzero(finite)) < MIN_ALIGNMENT_OVERLAP_FRAMES:
                     continue
                 rmse = float(np.sqrt(np.mean((original[finite] - replayed[finite]) ** 2)))
                 candidate_key = (rmse, abs(lag), lag)

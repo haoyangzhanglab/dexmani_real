@@ -1,9 +1,9 @@
-"""Serializable native RGB-D intrinsics and depth-to-color extrinsics."""
+"""Color-grid intrinsics and model camera parameters for aligned RGB-D."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, cast
+from typing import Any, cast
 
 import numpy as np
 
@@ -92,12 +92,25 @@ class CameraIntrinsics:
         )
 
 
+@dataclass(frozen=True)
+class RGBDGeometry:
+    """Depth/color calibration retained at the driver and external Raw-reader boundaries."""
+
+    depth: CameraIntrinsics
+    color: CameraIntrinsics
+    T_color_from_depth: np.ndarray
+
+    def __post_init__(self) -> None:
+        transform = validate_rigid_transform(self.T_color_from_depth, label="T_color_from_depth")
+        transform.setflags(write=False)
+        object.__setattr__(self, "T_color_from_depth", transform)
+
+
 def camera_parameters_cv(
     color: CameraIntrinsics,
     T_xarm_base_from_color: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
-    """Float32 C-order K(9) and optional base-to-color [R|t](12), using optical RDF axes.
-    K omits distortion; a missing transform returns only K, never a default calibration."""
+    """Float32 C-order K(9) and optional base-to-color [R|t](12), using optical RDF axes."""
     matrices = {"camera_intrinsic": color.matrix()}
     if T_xarm_base_from_color is not None:
         base_from_color = validate_rigid_transform(
@@ -114,39 +127,3 @@ def camera_parameters_cv(
         values.setflags(write=False)
         result[name] = values
     return result
-
-
-@dataclass(frozen=True)
-class RGBDGeometry:
-    """Static depth/color calibration for one active native RGB-D profile."""
-
-    depth: CameraIntrinsics
-    color: CameraIntrinsics
-    T_color_from_depth: np.ndarray
-
-    def __post_init__(self) -> None:
-        transform = validate_rigid_transform(self.T_color_from_depth, label="T_color_from_depth")
-        transform.setflags(write=False)
-        object.__setattr__(self, "T_color_from_depth", transform)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "depth": self.depth.to_dict(),
-            "color": self.color.to_dict(),
-            "T_color_from_depth": self.T_color_from_depth.tolist(),
-        }
-
-    def aligned_depth_to_color(self) -> "RGBDGeometry":
-        """Return color-grid intrinsics with identity depth-to-color extrinsics for aligned depth deprojection."""
-        return RGBDGeometry(
-            depth=self.color,
-            color=self.color,
-            T_color_from_depth=np.eye(4, dtype=np.float64),
-        )
-
-    @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "RGBDGeometry":
-        fields = dict(value)
-        fields["depth"] = CameraIntrinsics(**fields["depth"])
-        fields["color"] = CameraIntrinsics(**fields["color"])
-        return cls(**fields)

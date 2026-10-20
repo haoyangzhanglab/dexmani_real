@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
-"""连接 RealSense 查看点云处理效果，支持桌面平面标定及确认后发布。
-
-python examples/pointcloud_process_example.py
-python examples/pointcloud_process_example.py --config local.yaml --save-dir snapshots
-
-参数：--config 覆盖处理配置，--save-dir 保存 RGB-D、点云及重建元数据。
-"""
+"""连接 RealSense 查看点云处理效果，支持桌面平面标定及确认后发布。"""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import shutil
 import tempfile
 import time
@@ -30,9 +23,8 @@ from dexmani_real.config.experiment import (
     resolve_table_plane,
     resolve_table_plane_path,
 )
+from dexmani_real.sensor.camera.geometry import CameraIntrinsics
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
-from dexmani_real.sensor.camera.geometry import RGBDGeometry
-from dexmani_real.sensor.pointcloud import processing as pointcloud_processing
 from dexmani_real.sensor.pointcloud.processing import (
     aligned_depth_points_in_base,
     build_point_cloud,
@@ -57,7 +49,7 @@ class PointCloudDiagnosticConfig:
     vis_depth_max_m: float = 2.5
 
 
-_SENSOR_OPTION_NAMES = (
+SENSOR_OPTION_NAMES = (
     "visual_preset",
     "laser_power",
     "receiver_gain",
@@ -154,8 +146,8 @@ def print_depth_stats(depth_m: np.ndarray, vmin: float, vmax: float) -> None:
     )
 
 
-_SNAPSHOT_SCHEMA_NAME = "dexmani-real-pointcloud-diagnostic-snapshot"
-_SNAPSHOT_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_NAME = "dexmani-real-pointcloud-diagnostic-snapshot"
+SNAPSHOT_SCHEMA_VERSION = 3
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -176,20 +168,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def validate_snapshot_cloud(cloud: np.ndarray, *, label: str) -> np.ndarray:
-    """Return one finite contiguous float32 ``[N,6]`` xyzrgb cloud."""
-    value = np.asarray(cloud)
-    if value.ndim != 2 or value.shape[1] != 6 or value.dtype != np.float32:
-        raise ValueError(
-            f"{label} must be float32 [N,6], got shape={value.shape} dtype={value.dtype}"
-        )
-    if not np.all(np.isfinite(value)):
-        raise ValueError(f"{label} contains NaN/Inf")
-    if value.size and (np.any(value[:, 3:] < 0.0) or np.any(value[:, 3:] > 1.0)):
-        raise ValueError(f"{label} RGB values must be in [0,1]")
-    return np.ascontiguousarray(value)
-
-
 def save_diagnostic_snapshot(
     *,
     output_root: Path,
@@ -198,48 +176,20 @@ def save_diagnostic_snapshot(
     raw_point_cloud: np.ndarray,
     processed_point_cloud: np.ndarray,
     depth_scale_m: float,
-    geometry: RGBDGeometry,
+    intrinsics: CameraIntrinsics,
     T_xarm_base_from_color: np.ndarray,
     table_plane_abcd: tuple[float, float, float, float] | None,
     table_plane_source: str,
     pointcloud_config: PointCloudConfig,
     camera_info: dict,
 ) -> Path:
-    color = np.asarray(rgb)
-    depth = np.asarray(depth_raw)
-    if color.dtype != np.uint8 or color.ndim != 3 or color.shape[2] != 3:
-        raise ValueError("rgb must be uint8 [H,W,3]")
-    if depth.dtype != np.uint16 or depth.shape != color.shape[:2]:
-        raise ValueError("depth_raw must be uint16 [H,W] matching rgb")
-    expected_shape = (geometry.color.height, geometry.color.width)
-    if (
-        color.shape[:2] != expected_shape
-        or (
-            geometry.depth.height,
-            geometry.depth.width,
-        )
-        != expected_shape
+    """Save pipeline results; RGB-D inputs and calibration are validated upstream."""
+    for name, cloud in (
+        ("raw_point_cloud", raw_point_cloud),
+        ("processed_point_cloud", processed_point_cloud),
     ):
-        raise ValueError("aligned RGB-D arrays must match color-grid geometry")
-    if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
-        raise ValueError("depth_scale_m must be finite and positive")
-    raw_cloud = validate_snapshot_cloud(raw_point_cloud, label="raw_point_cloud")
-    processed_cloud = validate_snapshot_cloud(
-        processed_point_cloud,
-        label="processed_point_cloud",
-    )
-    if processed_cloud.shape[0] not in {0, pointcloud_config.num_points}:
-        raise ValueError("processed_point_cloud must be empty or match configured N")
-    transform = np.asarray(T_xarm_base_from_color, dtype=np.float64)
-    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
-        raise ValueError("T_xarm_base_from_color must be a finite 4x4 transform")
-    if table_plane_abcd is None:
-        table_plane_json = None
-    else:
-        plane = np.asarray(table_plane_abcd, dtype=np.float64)
-        if plane.shape != (4,) or not np.all(np.isfinite(plane)):
-            raise ValueError("table_plane_abcd must contain four finite values")
-        table_plane_json = plane.tolist()
+        if not np.all(np.isfinite(cloud)):
+            raise ValueError(f"{name} contains NaN/Inf")
 
     root = output_root.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -249,30 +199,27 @@ def save_diagnostic_snapshot(
     temporary = Path(tempfile.mkdtemp(prefix=".pointcloud-tmp-", dir=root))
 
     arrays = {
-        "rgb.npy": np.ascontiguousarray(color),
-        "depth_aligned_to_color_raw.npy": np.ascontiguousarray(depth),
-        "raw_point_cloud.npy": raw_cloud,
-        "processed_point_cloud.npy": processed_cloud,
-        "T_xarm_base_from_color.npy": np.ascontiguousarray(transform),
+        "rgb.npy": rgb,
+        "depth_aligned_to_color_raw.npy": depth_raw,
+        "raw_point_cloud.npy": raw_point_cloud,
+        "processed_point_cloud.npy": processed_point_cloud,
+        "T_xarm_base_from_color.npy": T_xarm_base_from_color,
     }
     metadata = {
-        "schema_name": _SNAPSHOT_SCHEMA_NAME,
-        "schema_version": _SNAPSHOT_SCHEMA_VERSION,
+        "schema_name": SNAPSHOT_SCHEMA_NAME,
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "created_at": timestamp.isoformat(),
         "payload_mode": "depth_to_color_aligned_rgbd",
         "depth_payload_frame": "color",
         "depth_scale_m_per_unit": float(depth_scale_m),
-        "aligned_geometry": geometry.to_dict(),
-        "table_plane_abcd": table_plane_json,
+        "color_intrinsics": intrinsics.to_dict(),
+        "table_plane_abcd": None if table_plane_abcd is None else list(table_plane_abcd),
         "table_plane_source": table_plane_source,
         "pointcloud_config": asdict(pointcloud_config),
-        "pointcloud_source_sha256": hashlib.sha256(
-            Path(pointcloud_processing.__file__).read_bytes()
-        ).hexdigest(),
         "point_cloud_frame": "xarm_base",
         "point_cloud_columns": ["x_m", "y_m", "z_m", "r", "g", "b"],
         "raw_point_cloud_semantics": "all_finite_nonzero_aligned_depth_pixels",
-        "processed_point_cloud_empty": processed_cloud.shape[0] == 0,
+        "processed_point_cloud_empty": processed_point_cloud.shape[0] == 0,
         "camera": {key: camera_info[key] for key in ("name", "serial", "firmware")},
         "arrays": {
             name: {"shape": list(value.shape), "dtype": str(value.dtype)}
@@ -312,7 +259,7 @@ def print_device_info(camera: RealSenseCamera) -> dict:
     print(f"  Depth scale:    {camera.get_depth_scale():.6f} (raw_uint16 x scale = meters)")
 
     print("\n  --- Sensor read-back ---")
-    for name in _SENSOR_OPTION_NAMES:
+    for name in SENSOR_OPTION_NAMES:
         opt = getattr(rs.option, name)
         try:
             print(f"  {name}: {depth_sensor.get_option(opt)}")
@@ -349,7 +296,8 @@ def load_extrinsics(camera_info: dict, calib: CameraExtrinsics) -> np.ndarray:
     pos = base_from_color[:3, 3]
     quat_xyzw = R.from_matrix(base_from_color[:3, :3]).as_quat()
     print(
-        f"  Camera '{camera_info.get('name', camera_info['serial'])}' -> color/aligned-depth frame in xArm-base frame"
+        f"  Camera '{camera_info.get('name', camera_info['serial'])}' "
+        "-> color/aligned-depth frame in xArm-base frame"
     )
     print(f"  pos:         {np.round(pos, 4)} m")
     print(f"  quat (xyzw): {np.round(quat_xyzw, 4)}")
@@ -359,7 +307,7 @@ def load_extrinsics(camera_info: dict, calib: CameraExtrinsics) -> np.ndarray:
 def calibrate_table_plane(
     *,
     camera: RealSenseCamera,
-    geometry: RGBDGeometry,
+    intrinsics: CameraIntrinsics,
     T_xarm_base_from_color: np.ndarray,
     config: PointCloudConfig,
     plane_path: Path,
@@ -383,7 +331,7 @@ def calibrate_table_plane(
         points = aligned_depth_points_in_base(
             depth_raw=depth_raw,
             depth_scale_m=camera.get_depth_scale(),
-            aligned_depth_intrinsics=geometry.depth,
+            aligned_depth_intrinsics=intrinsics,
             T_xarm_base_from_color=T_xarm_base_from_color,
             config=config,
         )
@@ -424,7 +372,7 @@ def build_cloud(
     depth_raw: np.ndarray,
     rgb: np.ndarray,
     depth_scale_m: float,
-    geometry: RGBDGeometry,
+    intrinsics: CameraIntrinsics,
     T_xarm_base_from_color: np.ndarray,
     config: PointCloudConfig,
     table_plane_abcd: tuple[float, float, float, float] | None,
@@ -459,7 +407,7 @@ def build_cloud(
         depth_raw=depth_raw,
         color=rgb,
         depth_scale_m=depth_scale_m,
-        geometry=geometry,
+        intrinsics=intrinsics,
         T_xarm_base_from_color=T_xarm_base_from_color,
         table_plane_abcd=table_plane_abcd,
         config=config,
@@ -477,7 +425,7 @@ def build_cloud(
 def benchmark_production_pipeline(
     *,
     camera: RealSenseCamera,
-    geometry: RGBDGeometry,
+    intrinsics: CameraIntrinsics,
     T_xarm_base_from_color: np.ndarray,
     config: PointCloudConfig,
     table_plane_abcd: tuple[float, float, float, float] | None,
@@ -494,7 +442,7 @@ def benchmark_production_pipeline(
             depth_raw=frame.depth_aligned_to_color_raw,
             color=frame.rgb,
             depth_scale_m=camera.get_depth_scale(),
-            geometry=geometry,
+            intrinsics=intrinsics,
             T_xarm_base_from_color=T_xarm_base_from_color,
             table_plane_abcd=table_plane_abcd,
             config=config,
@@ -560,8 +508,8 @@ def visualize_result(
     import open3d as o3d
 
     base_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
-    depth_camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)
-    depth_camera_frame.transform(T_xarm_base_from_color)
+    color_camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)
+    color_camera_frame.transform(T_xarm_base_from_color)
 
     crop_box = build_workspace_box(config.workspace)
 
@@ -573,7 +521,7 @@ def visualize_result(
     print("\nLaunching open3d visualizer (close window to continue)...")
     print("  xArm-base point cloud + workspace crop box (green) + coordinate frames")
     o3d.visualization.draw_geometries(
-        [pcd, crop_box, base_frame, depth_camera_frame],
+        [pcd, crop_box, base_frame, color_camera_frame],
         window_name="Point Cloud",
         point_show_normal=False,
     )
@@ -621,13 +569,13 @@ class PointCloudExample:
             print_depth_stats(depth_m, self.cfg.vis_depth_min_m, self.cfg.vis_depth_max_m)
             show_rgbd_panels(rgb, depth_m, self.cfg)
 
-            self.geometry = self.camera.get_geometry().aligned_depth_to_color()
+            self.intrinsics = self.camera.get_geometry().color
             self.T_xarm_base_from_color = load_extrinsics(self.camera_info, self.calibration)
 
             if self.fit_table_requested:
                 fitted_plane = calibrate_table_plane(
                     camera=self.camera,
-                    geometry=self.geometry,
+                    intrinsics=self.intrinsics,
                     T_xarm_base_from_color=self.T_xarm_base_from_color,
                     config=self.pcd_config,
                     plane_path=resolve_table_plane_path(self.runtime.environment.table),
@@ -655,7 +603,7 @@ class PointCloudExample:
                 depth_raw=depth_raw,
                 rgb=rgb,
                 depth_scale_m=self.camera.get_depth_scale(),
-                geometry=self.geometry,
+                intrinsics=self.intrinsics,
                 T_xarm_base_from_color=self.T_xarm_base_from_color,
                 config=self.pcd_config,
                 table_plane_abcd=self.table_plane_abcd,
@@ -665,7 +613,7 @@ class PointCloudExample:
                     depth_raw=depth_raw,
                     color=rgb,
                     depth_scale_m=self.camera.get_depth_scale(),
-                    geometry=self.geometry,
+                    intrinsics=self.intrinsics,
                     T_xarm_base_from_color=self.T_xarm_base_from_color,
                 )
                 if raw_cloud is None:
@@ -677,7 +625,7 @@ class PointCloudExample:
                     raw_point_cloud=raw_cloud,
                     processed_point_cloud=result,
                     depth_scale_m=self.camera.get_depth_scale(),
-                    geometry=self.geometry,
+                    intrinsics=self.intrinsics,
                     T_xarm_base_from_color=self.T_xarm_base_from_color,
                     table_plane_abcd=self.table_plane_abcd,
                     table_plane_source=table_plane_source,
@@ -687,7 +635,7 @@ class PointCloudExample:
                 print(f"\nSaved point-cloud diagnostic snapshot: {snapshot_path}")
             benchmark_production_pipeline(
                 camera=self.camera,
-                geometry=self.geometry,
+                intrinsics=self.intrinsics,
                 T_xarm_base_from_color=self.T_xarm_base_from_color,
                 config=self.pcd_config,
                 table_plane_abcd=self.table_plane_abcd,

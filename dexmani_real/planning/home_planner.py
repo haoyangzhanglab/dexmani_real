@@ -15,15 +15,15 @@ from .paths import WORKSPACE_BOUNDS_TOLERANCE_M, interpolate_waypoints
 
 logger = logging.getLogger(__name__)
 
-_RRT_TIME_S = 0.5
-_RRT_RANGE = 0.12
-_PATH_DT = 1 / 15
-_MAX_WAYPOINT_DELTA_RAD = np.deg2rad(15.0)
-_MAX_POSE_ERROR_POS_M = 0.005
-_MAX_POSE_ERROR_ROT_RAD = 0.05
+RRT_TIME_S = 0.5
+RRT_RANGE = 0.12
+PATH_DT = 1 / 15
+MAX_WAYPOINT_DELTA_RAD = np.deg2rad(15.0)
+MAX_POSE_ERROR_POS_M = 0.005
+MAX_POSE_ERROR_ROT_RAD = 0.05
 
 
-class XArm7MotionPlanner:
+class HomePlanner:
     """Nominal-URDF arm kinematics plus the 19-DOF arm/hand collision model."""
 
     def __init__(
@@ -44,7 +44,7 @@ class XArm7MotionPlanner:
                 raise ValueError("workspace_bounds must be finite shape (3, 2) with lower <= upper")
             self.workspace_bounds = bounds.copy()
         self.kin = make_arm_kinematics()
-        self._elbow_joint_index = list(self.kin.pinocchio_model.get_joint_names()).index("joint4")
+        self.elbow_joint_index = list(self.kin.pinocchio_model.get_joint_names()).index("joint4")
         self.collision_model = CollisionModel(static_boxes=static_boxes, table=table)
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
@@ -61,9 +61,9 @@ class XArm7MotionPlanner:
         result = self.kin.mp_planner.plan_qpos(
             goal_qposes=[target_qpos],
             current_qpos=current_qpos,
-            time_step=_PATH_DT,
-            rrt_range=_RRT_RANGE,
-            planning_time=_RRT_TIME_S,
+            time_step=PATH_DT,
+            rrt_range=RRT_RANGE,
+            planning_time=RRT_TIME_S,
             simplify=True,
             verbose=False,
         )
@@ -130,7 +130,7 @@ class XArm7MotionPlanner:
     def check_rrt_candidate(self, path, target_pose, current_qpos, limits):
         if self.outside_limits(path, limits):
             raise ValueError("Path violates planning limits.")
-        elbow = path[:, self._elbow_joint_index]
+        elbow = path[:, self.elbow_joint_index]
         if (
             np.min(elbow) < np.deg2rad(-5.0)
             and np.max(elbow) > np.deg2rad(15.0)
@@ -139,12 +139,12 @@ class XArm7MotionPlanner:
             raise ValueError("Elbow branch flip detected.")
         if (
             np.max(np.abs(self.kin.compute_qpos_delta(path[0], current_qpos)))
-            > _MAX_WAYPOINT_DELTA_RAD + 1e-12
+            > MAX_WAYPOINT_DELTA_RAD + 1e-12
         ):
             raise ValueError("Path start is too far from current_qpos.")
         if (
             len(path) > 1
-            and np.max(np.abs(np.diff(path, axis=0))) > _MAX_WAYPOINT_DELTA_RAD + 1e-12
+            and np.max(np.abs(np.diff(path, axis=0))) > MAX_WAYPOINT_DELTA_RAD + 1e-12
         ):
             raise ValueError("Path waypoint delta too large.")
         pos_error, rot_error = compute_pose_error(
@@ -152,8 +152,8 @@ class XArm7MotionPlanner:
         )
         if (
             not np.isfinite((pos_error, rot_error)).all()
-            or pos_error > _MAX_POSE_ERROR_POS_M
-            or rot_error > _MAX_POSE_ERROR_ROT_RAD
+            or pos_error > MAX_POSE_ERROR_POS_M
+            or rot_error > MAX_POSE_ERROR_ROT_RAD
         ):
             raise ValueError("Terminal pose error too large.")
         self.check_workspace_path(path)

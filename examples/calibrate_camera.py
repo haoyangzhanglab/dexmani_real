@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""移动 xArm7 并采集 RealSense 图像标定相机外参，通过质量检查后保存。
-
-python examples/calibrate_camera.py --hand-geometry secured-home
-python examples/calibrate_camera.py --hand-geometry absent --config local.yaml --output cameras.json
-
-参数：--hand-geometry 声明手未安装（absent）或已固定在 HOME（secured-home）；--output 指定标定文件。
-"""
+"""移动 xArm7 并采集 RealSense 图像标定相机外参，通过质量检查后保存。"""
 
 from __future__ import annotations
 
@@ -51,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from dexmani_real.calibration import CAMERAS_PATH
     from dexmani_real.calibration.camera.session import CameraCalibrationSession
-    from dexmani_real.calibration.camera.solver import ARUCO_DICT_NAME, ArucoConfig
+    from dexmani_real.calibration.camera.aruco import ARUCO_DICT_NAME, ArucoConfig
 
     aruco = ArucoConfig()
 

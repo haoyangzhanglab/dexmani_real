@@ -39,4 +39,4 @@ class SensorChannels:
         self.vr_ready, self.camera_ready, self.pointcloud_ready = (ctx.Event() for _ in range(3))
         self.camera_depth_scale = ctx.Value("d", 0.0, lock=False)
         self.camera_serial = ctx.Array("c", 32, lock=False)
-        self.camera_geometry = ctx.Array("c", 2048, lock=False)
+        self.camera_intrinsics = ctx.Array("c", 2048, lock=False)

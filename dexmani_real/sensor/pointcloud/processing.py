@@ -14,7 +14,6 @@ from scipy.spatial import cKDTree  # type: ignore[import-untyped]
 
 from dexmani_real.sensor.camera.geometry import (
     CameraIntrinsics,
-    RGBDGeometry,
     validate_aligned_depth_distortion,
 )
 
@@ -36,7 +35,7 @@ def depth_meters(
     depth_scale_m: float,
 ) -> np.ndarray:
     if depth_raw.shape != (intrinsics.height, intrinsics.width) or depth_raw.dtype != np.uint16:
-        raise ValueError("depth_raw must be uint16 [H,W] matching depth intrinsics")
+        raise ValueError("depth_raw must be uint16 [H,W] matching aligned color intrinsics")
     if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
         raise ValueError("depth_scale_m must be finite and positive")
     return depth_raw.astype(np.float32) * np.float32(depth_scale_m)
@@ -59,10 +58,10 @@ def depth_valid_mask(
     return depth_m, valid
 
 
-def validate_color(color: np.ndarray, geometry: RGBDGeometry) -> None:
+def validate_color(color: np.ndarray, intrinsics: CameraIntrinsics) -> None:
     if color.dtype != np.uint8 or color.shape != (
-        geometry.color.height,
-        geometry.color.width,
+        intrinsics.height,
+        intrinsics.width,
         3,
     ):
         raise ValueError("color must be uint8 [H,W,3] matching color intrinsics")
@@ -419,8 +418,8 @@ def aligned_depth_points_in_base(
     trusted = reject_flying_depth(depth_m, valid, config)
     if not np.any(trusted):
         return np.empty((0, 3), dtype=np.float32)
-    points_depth, _, _ = deproject_depth(depth_m, trusted, aligned_depth_intrinsics)
-    return transform_points(points_depth, T_xarm_base_from_color)
+    points_color, _, _ = deproject_depth(depth_m, trusted, aligned_depth_intrinsics)
+    return transform_points(points_color, T_xarm_base_from_color)
 
 
 def build_raw_point_cloud(
@@ -428,17 +427,17 @@ def build_raw_point_cloud(
     depth_raw: np.ndarray,
     color: np.ndarray,
     depth_scale_m: float,
-    geometry: RGBDGeometry,
+    intrinsics: CameraIntrinsics,
     T_xarm_base_from_color: np.ndarray,
 ) -> np.ndarray | None:
     """Return diagnostic points using extrinsics validated when loading calibration."""
-    validate_color(color, geometry)
-    depth_m = depth_meters(depth_raw, geometry.depth, depth_scale_m)
+    validate_color(color, intrinsics)
+    depth_m = depth_meters(depth_raw, intrinsics, depth_scale_m)
     valid = (depth_raw > 0) & np.isfinite(depth_m)
     if not np.any(valid):
         return None
-    points_depth, rows, columns = deproject_depth(depth_m, valid, geometry.depth)
-    points_base = transform_points(points_depth, T_xarm_base_from_color)
+    points_color, rows, columns = deproject_depth(depth_m, valid, intrinsics)
+    points_base = transform_points(points_color, T_xarm_base_from_color)
     colors = color[rows, columns].astype(np.float32) / 255.0
     return np.ascontiguousarray(np.column_stack((points_base, colors)), dtype=np.float32)
 
@@ -448,7 +447,7 @@ def build_point_cloud(
     depth_raw: np.ndarray,
     color: np.ndarray,
     depth_scale_m: float,
-    geometry: RGBDGeometry,
+    intrinsics: CameraIntrinsics,
     T_xarm_base_from_color: np.ndarray,
     table_plane_abcd: tuple[float, float, float, float] | None,
     config: PointCloudConfig,
@@ -459,9 +458,9 @@ def build_point_cloud(
     elif table_plane_abcd is None:
         raise ValueError("remove_table=True requires a current calibrated table plane")
 
-    validate_color(color, geometry)
+    validate_color(color, intrinsics)
     depth_m, valid = depth_valid_mask(
-        depth_raw, intrinsics=geometry.depth, depth_scale_m=depth_scale_m, config=config
+        depth_raw, intrinsics=intrinsics, depth_scale_m=depth_scale_m, config=config
     )
     trusted = reject_flying_depth(depth_m, valid, config)
     if not np.any(trusted):
@@ -471,7 +470,7 @@ def build_point_cloud(
         table_keep = table_keep_mask(
             depth_m,
             trusted,
-            intrinsics=geometry.depth,
+            intrinsics=intrinsics,
             T_xarm_base_from_color=T_xarm_base_from_color,
             table_plane_abcd=table_plane_abcd,
             table_core_height_m=config.table_core_height_m,
@@ -483,10 +482,10 @@ def build_point_cloud(
     else:
         table_keep = trusted
 
-    points_depth, rows, columns = deproject_depth(depth_m, table_keep, geometry.depth)
+    points_color, rows, columns = deproject_depth(depth_m, table_keep, intrinsics)
     colors = color[rows, columns].astype(np.float32) / 255.0
 
-    points_base = transform_points(points_depth, T_xarm_base_from_color)
+    points_base = transform_points(points_color, T_xarm_base_from_color)
     workspace_keep = workspace_keep_mask(points_base, config.workspace)
     cropped_count = int(np.count_nonzero(workspace_keep))
     if cropped_count == 0:

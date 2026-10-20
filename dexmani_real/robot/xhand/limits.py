@@ -17,7 +17,7 @@ def validate_hand_limit_nesting(
     *,
     label: str = "hand",
 ) -> None:
-    """Validate finite ordered 12-DOF rated ⊇ mechanical ⊇ command bounds; label identifies diagnostic errors."""
+    """Require finite 12-DOF rated ⊇ mechanical ⊇ command bounds with lower < upper."""
     bounds = {
         "command_lower": np.asarray(command_lower, dtype=np.float64),
         "command_upper": np.asarray(command_upper, dtype=np.float64),
@@ -31,10 +31,10 @@ def validate_hand_limit_nesting(
             raise ValueError(f"{label} {name} must have shape {HAND_JOINT_SHAPE}")
     if not np.all(np.isfinite(np.concatenate(tuple(bounds.values())))):
         raise ValueError(f"{label} joint limits must be finite")
-    if np.any(bounds["command_lower"] > bounds["command_upper"]):
-        raise ValueError(f"{label} command limits must be ordered")
-    if np.any(bounds["mechanical_lower"] > bounds["mechanical_upper"]):
-        raise ValueError(f"{label} mechanical limits must be ordered")
+    if np.any(bounds["command_lower"] >= bounds["command_upper"]):
+        raise ValueError(f"{label} command limits must have lower < upper")
+    if np.any(bounds["mechanical_lower"] >= bounds["mechanical_upper"]):
+        raise ValueError(f"{label} mechanical limits must have lower < upper")
     if np.any(bounds["mechanical_lower"] < bounds["rated_lower"]) or np.any(
         bounds["mechanical_upper"] > bounds["rated_upper"]
     ):

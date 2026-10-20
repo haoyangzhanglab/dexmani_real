@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-_OBSERVATION_MAX_AGE_PERIODS = 4
+OBSERVATION_MAX_AGE_PERIODS = 4
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class CameraParams:
 
     @property
     def max_frame_age_s(self) -> float:
-        return _OBSERVATION_MAX_AGE_PERIODS / self.fps
+        return OBSERVATION_MAX_AGE_PERIODS / self.fps
 
     @property
     def rgb_shape(self) -> tuple[int, int, int]:

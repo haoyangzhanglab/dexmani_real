@@ -26,34 +26,34 @@ from dexmani_real.utils.log import (
 
 logger = logging.getLogger(__name__)
 
-_SDK_PROTOCOL = {"ethercat": "EtherCAT", "serial": "RS485"}
-_OPEN_RETRIES = {"ethercat": 2, "serial": 3}
-_OPEN_RETRY_DELAY_S = 2.0
-_INITIAL_STATE_READ_INTERVAL_S = 0.02
-_COMMUNICATION_CRC_ERROR_CODE = 1_501_070
-_COMBINED_FORCE_UNAVAILABLE_CODE = 1_501_018
-_DISTRIBUTED_FORCE_UNAVAILABLE_CODE = 1_501_019
-_TEMPERATURE_UNAVAILABLE_CODE = 1_501_020
+SDK_PROTOCOL = {"ethercat": "EtherCAT", "serial": "RS485"}
+OPEN_RETRIES = {"ethercat": 2, "serial": 3}
+OPEN_RETRY_DELAY_S = 2.0
+INITIAL_STATE_READ_INTERVAL_S = 0.02
+COMMUNICATION_CRC_ERROR_CODE = 1_501_070
+COMBINED_FORCE_UNAVAILABLE_CODE = 1_501_018
+DISTRIBUTED_FORCE_UNAVAILABLE_CODE = 1_501_019
+TEMPERATURE_UNAVAILABLE_CODE = 1_501_020
 # These codes permit joint reads and target sends; tactile trust is checked separately.
-_NONFATAL_SDK_CODES = frozenset(
+NONFATAL_SDK_CODES = frozenset(
     {
         0,
-        _COMBINED_FORCE_UNAVAILABLE_CODE,
-        _DISTRIBUTED_FORCE_UNAVAILABLE_CODE,
-        _TEMPERATURE_UNAVAILABLE_CODE,
+        COMBINED_FORCE_UNAVAILABLE_CODE,
+        DISTRIBUTED_FORCE_UNAVAILABLE_CODE,
+        TEMPERATURE_UNAVAILABLE_CODE,
     }
 )
 
-_EC_STATE_INIT = 1
-_STALE_EC_RECOVERY_S = 3.0
-_POST_EC_DISCONNECT_S = 2.0
-_TACTILE_SENSOR_IDS = (0x11, 0x12, 0x13, 0x14, 0x15)
-_PASSIVE_MODE = 0
-_POSITION_MODE = 3
-_STOP_RETRY_INTERVAL_S = 0.01
-_STOP_RETRY_TIMEOUT_S = 0.25
-_STOP_MAX_ATTEMPTS = 26
-_CONNECTION_HINT = {
+EC_STATE_INIT = 1
+STALE_EC_RECOVERY_S = 3.0
+POST_EC_DISCONNECT_S = 2.0
+TACTILE_SENSOR_IDS = (0x11, 0x12, 0x13, 0x14, 0x15)
+PASSIVE_MODE = 0
+POSITION_MODE = 3
+STOP_RETRY_INTERVAL_S = 0.01
+STOP_RETRY_TIMEOUT_S = 0.25
+STOP_MAX_ATTEMPTS = 26
+CONNECTION_HINT = {
     "ethercat": "Check XHand power, EtherCAT cable/link, SDK permissions, and stale slave state",
     "serial": "Check XHand power, USB cable, and serial-device permissions",
 }
@@ -74,11 +74,11 @@ def tactile_validity(code: int, *, comm_type: str) -> tuple[bool, bool]:
         return (code == 0, code == 0)
     if code == 0:
         return (True, True)
-    if code in (_COMBINED_FORCE_UNAVAILABLE_CODE, 200):
+    if code in (COMBINED_FORCE_UNAVAILABLE_CODE, 200):
         return (False, False)
-    if code in (_DISTRIBUTED_FORCE_UNAVAILABLE_CODE, 201):
+    if code in (DISTRIBUTED_FORCE_UNAVAILABLE_CODE, 201):
         return (True, False)
-    if code in (_TEMPERATURE_UNAVAILABLE_CODE, 202):
+    if code in (TEMPERATURE_UNAVAILABLE_CODE, 202):
         return (True, True)
     return (False, False)
 
@@ -118,9 +118,9 @@ class XHand:
             "serial_number": "unavailable",
         }
 
-        self._control: Any = None
-        self._command: Any = None
-        self._tactile_reset_metadata: dict[str, object] = {}
+        self.control: Any = None
+        self.command: Any = None
+        self.tactile_reset_metadata: dict[str, object] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -130,18 +130,18 @@ class XHand:
         """Open and seed live feedback; return the deadline shared with tactile acquisition."""
         from xhand_controller import xhand_control
 
-        self._sdk = xhand_control
+        self.sdk = xhand_control
         if self.connected_flag:
             return
 
         try:
             self.open_device()
-            self._tactile_reset_metadata = {}
+            self.tactile_reset_metadata = {}
             if self.cfg.comm_type == "serial" and self.cfg.rs485_post_open_settle_s:
                 time.sleep(self.cfg.rs485_post_open_settle_s)
 
             self.connected_flag = True
-            hand_ids = list(self._control.list_hands_id())
+            hand_ids = list(self.control.list_hands_id())
             if self.cfg.device_id not in hand_ids:
                 raise XHandError(
                     "connect",
@@ -163,16 +163,16 @@ class XHand:
             raise XHandError("connect", -1, str(exc)) from exc
 
     def open_device(self) -> None:
-        retries = _OPEN_RETRIES[self.cfg.comm_type]
+        retries = OPEN_RETRIES[self.cfg.comm_type]
         device_name = self.cfg.device_name
         last_error: XHandError | None = None
 
         for attempt in range(1, retries + 1):
-            self._control = self._sdk.XHandControl()
+            self.control = self.sdk.XHandControl()
             if device_name is None:
                 devices, _ = self.captured_sdk_call(
                     "discovery",
-                    lambda: self._control.enumerate_devices(_SDK_PROTOCOL[self.cfg.comm_type]),
+                    lambda: self.control.enumerate_devices(SDK_PROTOCOL[self.cfg.comm_type]),
                 )
                 if not devices:
                     self.close_control()
@@ -186,12 +186,12 @@ class XHand:
             if self.cfg.comm_type == "serial":
 
                 def open_call():
-                    return self._control.open_serial(device_name, self.cfg.baudrate)
+                    return self.control.open_serial(device_name, self.cfg.baudrate)
 
             else:
 
                 def open_call():
-                    return self._control.open_ethercat(device_name)
+                    return self.control.open_ethercat(device_name)
 
             error, output = self.captured_sdk_call(
                 f"open attempt {attempt}/{retries}",
@@ -216,9 +216,9 @@ class XHand:
             )
             self.close_control()
             if attempt < retries:
-                delay = _OPEN_RETRY_DELAY_S
+                delay = OPEN_RETRY_DELAY_S
                 if self.cfg.comm_type == "ethercat" and attempt == 1:
-                    delay = max(delay, _STALE_EC_RECOVERY_S)
+                    delay = max(delay, STALE_EC_RECOVERY_S)
                 logger.warning(
                     "XHand open attempt %d/%d failed: %s; retrying in %.1fs",
                     attempt,
@@ -233,7 +233,7 @@ class XHand:
             retries,
             last_error.message if last_error is not None else "unknown error",
         )
-        logger.warning(_CONNECTION_HINT[self.cfg.comm_type])
+        logger.warning(CONNECTION_HINT[self.cfg.comm_type])
         if last_error is None:
             raise XHandError("connect", -1, "device open failed without an SDK error")
         raise last_error
@@ -255,10 +255,10 @@ class XHand:
 
     def read_identity(self) -> None:
         try:
-            self.device_identity["sdk_version"] = str(self._control.get_sdk_version())
+            self.device_identity["sdk_version"] = str(self.control.get_sdk_version())
             for key, getter in (
-                ("hand_type", self._control.get_hand_type),
-                ("serial_number", self._control.get_serial_number),
+                ("hand_type", self.control.get_hand_type),
+                ("serial_number", self.control.get_serial_number),
             ):
                 error, value = getter(self.cfg.device_id)
                 if error_ok(error):
@@ -287,9 +287,9 @@ class XHand:
             if remaining_ns <= 0:
                 break
             if sample is not None:
-                self._command = self.make_command(sample.qpos)
+                self.command = self.make_command(sample.qpos)
                 return deadline_ns
-            time.sleep(min(_INITIAL_STATE_READ_INTERVAL_S, remaining_ns / 1e9))
+            time.sleep(min(INITIAL_STATE_READ_INTERVAL_S, remaining_ns / 1e9))
         raise XHandError("connect", -1, "initial XHand joint feedback timed out")
 
     def disconnect(self) -> None:
@@ -297,7 +297,7 @@ class XHand:
         connected_ethercat = self.connected_flag and self.cfg.comm_type == "ethercat"
         errors = []
         try:
-            if self._control is not None:
+            if self.control is not None:
                 if connected_ethercat:
                     try:
                         self.request_ethercat_init()
@@ -308,7 +308,7 @@ class XHand:
                 except Exception as exc:
                     errors.append(exc)
                 if connected_ethercat:
-                    time.sleep(_POST_EC_DISCONNECT_S)
+                    time.sleep(POST_EC_DISCONNECT_S)
         finally:
             self.connected_flag = False
         if errors:
@@ -318,10 +318,10 @@ class XHand:
         if self.cfg.ethercat_slave_position < 0:
             logger.warning("XHand EtherCAT slave position unknown; skipping explicit INIT request")
             return
-        error, _ = self._control.set_firmware_state(
+        error, _ = self.control.set_firmware_state(
             self.cfg.device_id,
             self.cfg.ethercat_slave_position,
-            _EC_STATE_INIT,
+            EC_STATE_INIT,
             500_000,
         )
         if not error_ok(error):
@@ -329,21 +329,21 @@ class XHand:
         time.sleep(0.2)
 
     def close_control(self) -> None:
-        control, self._control = self._control, None
+        control, self.control = self.control, None
         if control is None:
             return
         control.close_device()
 
     def reset_tactile_sensors(self, *, cancel_requested=lambda: False) -> bool:
-        """Request one reset per unloaded fingertip while idle; cancellation fences later calls, firmware effect is unproven."""
-        if self._control is None or not self.connected_flag:
+        """Request idle, unloaded fingertip resets; SDK success does not prove firmware effect."""
+        if self.control is None or not self.connected_flag:
             raise RuntimeError("XHand is not connected")
         result = {
             "hand_tactile_reset_time_ns": time.time_ns(),
             "hand_tactile_reset_result": "incomplete (0/5)",
         }
-        self._tactile_reset_metadata = result
-        for completed, sensor_id in enumerate(_TACTILE_SENSOR_IDS):
+        self.tactile_reset_metadata = result
+        for completed, sensor_id in enumerate(TACTILE_SENSOR_IDS):
             if cancel_requested():
                 result["hand_tactile_reset_result"] = f"cancelled ({completed}/5)"
                 raise CancelledError(
@@ -353,7 +353,7 @@ class XHand:
                 f"incomplete ({completed}/5), sensor=0x{sensor_id:02x}"
             )
             try:
-                reply = self._control.reset_sensor(self.cfg.device_id, sensor_id)
+                reply = self.control.reset_sensor(self.cfg.device_id, sensor_id)
             except Exception as exc:
                 result["hand_tactile_reset_result"] = (
                     f"exception ({completed}/5), sensor=0x{sensor_id:02x}: {exc}"
@@ -386,19 +386,19 @@ class XHand:
         """Snapshot this connection's last explicit reset request without reads."""
         return {
             "hand_tactile_reset_result": "not_requested",
-            **self._tactile_reset_metadata,
+            **self.tactile_reset_metadata,
         }
 
     def get_state(self) -> XHandState | None:
         """One read: CRC returns None; invalid joints raise, and tactile status masks untrusted channels."""
-        if self._control is None or not self.connected_flag:
+        if self.control is None or not self.connected_flag:
             raise RuntimeError("XHand is not connected")
-        error, raw_state = self._control.read_state(self.cfg.device_id, True)
+        error, raw_state = self.control.read_state(self.cfg.device_id, True)
         code = error_code(error)
-        if code == _COMMUNICATION_CRC_ERROR_CODE:
+        if code == COMMUNICATION_CRC_ERROR_CODE:
             # Never inspect a CRC payload, even when it looks finite and well formed.
             return None
-        if code not in _NONFATAL_SDK_CODES:
+        if code not in NONFATAL_SDK_CODES:
             raise XHandError("read", code, getattr(error, "error_message", ""))
         if raw_state is None:
             raise XHandError("read", code, "missing state payload")
@@ -451,13 +451,13 @@ class XHand:
         except ValueError as exc:
             logger.warning("XHand send rejected: %s", exc)
             return DispatchStatus.REJECTED
-        if self._control is None or self._command is None or not self.connected_flag:
+        if self.control is None or self.command is None or not self.connected_flag:
             raise RuntimeError("XHand command path is not initialized")
 
         try:
             for index, value in enumerate(target):
-                joint = self._command.finger_command[index]
-                joint.mode = _POSITION_MODE
+                joint = self.command.finger_command[index]
+                joint.mode = POSITION_MODE
                 joint.position = float(value)
         except Exception:
             logger.warning("XHand command preparation failed", exc_info=True)
@@ -474,18 +474,18 @@ class XHand:
         )
 
     def set_passive(self) -> DispatchStatus:
-        if self._control is None or self._command is None or not self.connected_flag:
+        if self.control is None or self.command is None or not self.connected_flag:
             raise RuntimeError("XHand command path is not initialized")
         for index in range(HAND_DOF):
-            self._command.finger_command[index].mode = _PASSIVE_MODE
+            self.command.finger_command[index].mode = PASSIVE_MODE
         return self.send_command()
 
     def stop(self, qpos: np.ndarray | None = None, *, timestamp_ns: int = 0) -> None:
         """Hold fresh measured joints or request passive mode; SDK acceptance is not standstill."""
         if not self.is_connected:
             raise RuntimeError("XHand disconnected before stop")
-        deadline = time.monotonic() + _STOP_RETRY_TIMEOUT_S
-        for attempt in range(_STOP_MAX_ATTEMPTS):
+        deadline = time.monotonic() + STOP_RETRY_TIMEOUT_S
+        for attempt in range(STOP_MAX_ATTEMPTS):
             now_ns = time.monotonic_ns()
             fresh = 0 < int(timestamp_ns) <= now_ns and now_ns - int(timestamp_ns) < int(
                 self.cfg.feedback_max_age_s * 1e9
@@ -500,24 +500,24 @@ class XHand:
             if attempt == 0:
                 logger.warning("XHand stop CRC; retrying within the stop deadline")
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or attempt + 1 == _STOP_MAX_ATTEMPTS:
+            if remaining <= 0 or attempt + 1 == STOP_MAX_ATTEMPTS:
                 break
-            time.sleep(min(_STOP_RETRY_INTERVAL_S, remaining))
+            time.sleep(min(STOP_RETRY_INTERVAL_S, remaining))
         raise RuntimeError("XHand stop confirmation timed out: CRC_UNCONFIRMED")
 
     def send_command(self) -> DispatchStatus:
-        error = self._control.send_command(self.cfg.device_id, self._command)
+        error = self.control.send_command(self.cfg.device_id, self.command)
 
         code = error_code(error)
-        if code == _COMMUNICATION_CRC_ERROR_CODE:
+        if code == COMMUNICATION_CRC_ERROR_CODE:
             return DispatchStatus.CRC_UNCONFIRMED
-        if code not in _NONFATAL_SDK_CODES:
+        if code not in NONFATAL_SDK_CODES:
             # 1501035 is overcurrent, not contact; termination retains UNKNOWN delivery and the SDK error.
             raise XHandError("send", code, getattr(error, "error_message", ""))
         return DispatchStatus.ACCEPTED
 
     def make_command(self, qpos: np.ndarray) -> Any:
-        command = self._sdk.HandCommand_t()
+        command = self.sdk.HandCommand_t()
         for index in range(HAND_DOF):
             joint = command.finger_command[index]
             joint.id = index
@@ -526,7 +526,7 @@ class XHand:
             joint.ki = int(self.cfg.ki)
             joint.kd = int(self.cfg.kd)
             joint.tor_max = int(self.cfg.tor_max[index])
-            joint.mode = _POSITION_MODE
+            joint.mode = POSITION_MODE
             joint.res0 = 0
             joint.res1 = 0
             joint.res2 = 0

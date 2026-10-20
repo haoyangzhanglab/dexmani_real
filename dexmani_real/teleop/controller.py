@@ -6,13 +6,13 @@ from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.robot.action import ActionIntent
-from dexmani_real.teleop.control.vr_mapping import ema_smooth_pose
+from dexmani_real.teleop.vr_mapping import ema_smooth_pose
 
 
 class TeleopController:
-    def __init__(self, realizer, arm_mapper, runtime, hand_retargeter):
-        self.realizer, self.arm_mapper, self.runtime = (
-            realizer,
+    def __init__(self, action_mapper, arm_mapper, runtime, hand_retargeter):
+        self.action_mapper, self.arm_mapper, self.runtime = (
+            action_mapper,
             arm_mapper,
             runtime,
         )
@@ -78,14 +78,14 @@ class TeleopController:
             if self.hand_target is None:
                 return None
             hand = self.hand_target
-        realized = self.realizer.realize(
+        mapped = self.action_mapper.map(
             ActionIntent("eef", target, hand), row.arm["qpos"][0], self.previous_arm_command
         )
-        solution = realized.ik_result
+        solution = mapped.ik_result
         if solution is not None and solution.failure_kind == IKFailureKind.INVALID_OUTPUT:
             raise RuntimeError(f"online IK technical failure: {solution.reason}")
-        return realized
+        return mapped
 
-    def commit_dispatched_target(self, realization):
-        self.previous_arm_command = realization.arm_qpos.copy()
-        self.smoothed_eef_pose = realization.eef_pose.copy()
+    def commit_dispatched_target(self, action_result):
+        self.previous_arm_command = action_result.arm_qpos.copy()
+        self.smoothed_eef_pose = action_result.eef_pose.copy()

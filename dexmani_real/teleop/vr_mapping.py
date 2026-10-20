@@ -52,13 +52,9 @@ class VRWristMapper:
         # Validate before committing the new anchor; failed resets clear stale state.
         try:
             next_wrist_pos0 = finite_vector(wrist_pos, (3,), "wrist_pos")
-            next_wrist_rot0 = quat_wxyz_to_rotmat(
-                normalize_quat_wxyz(wrist_quat_wxyz, name="wrist_quat_wxyz")
-            )
+            next_wrist_rot0 = quat_wxyz_to_rotmat(wrist_quat_wxyz)
             next_eef_pos0 = finite_vector(eef_pos, (3,), "eef_pos")
-            next_eef_rot0 = quat_wxyz_to_rotmat(
-                normalize_quat_wxyz(eef_quat_wxyz, name="eef_quat_wxyz")
-            )
+            next_eef_rot0 = quat_wxyz_to_rotmat(eef_quat_wxyz)
         except (TypeError, ValueError):
             self.clear()
             logger.warning(
@@ -82,9 +78,7 @@ class VRWristMapper:
 
         try:
             current_wrist_pos = finite_vector(wrist_pos, (3,), "wrist_pos")
-            wrist_rot = quat_wxyz_to_rotmat(
-                normalize_quat_wxyz(wrist_quat_wxyz, name="wrist_quat_wxyz")
-            )
+            wrist_rot = quat_wxyz_to_rotmat(wrist_quat_wxyz)
         except (TypeError, ValueError):
             logger.warning("VRWristMapper.map: invalid wrist pose — no target", exc_info=True)
             return None
@@ -96,17 +90,16 @@ class VRWristMapper:
         delta_rot_vr = wrist_rot @ self.wrist_rot0.T
         delta_rot_base = self.vr_to_robot_rot @ delta_rot_vr @ self.vr_to_robot_rot.T
         target_pos = self.eef_pos0 + delta_pos_base
-        target_rot = delta_rot_base @ self.eef_rot0
-        target_quat_wxyz = normalize_quat_wxyz(matrix_quat_wxyz(target_rot))
-        if np.dot(target_quat_wxyz, self.last_quat_wxyz) < 0:
-            target_quat_wxyz = -target_quat_wxyz
         if not np.all(np.isfinite(target_pos)):
             logger.warning("VRWristMapper.map: non-finite mapped pose — no target")
             return None
 
-        self.last_quat_wxyz = target_quat_wxyz.copy()
-
-        return Pose(target_pos, target_quat_wxyz)
+        target_rot = delta_rot_base @ self.eef_rot0
+        pose = Pose(target_pos, matrix_quat_wxyz(target_rot))
+        if np.dot(pose.q, self.last_quat_wxyz) < 0:
+            pose.q = -pose.q
+        self.last_quat_wxyz = pose.q.copy()
+        return pose
 
     def clear(self) -> None:
         self.wrist_pos0 = None

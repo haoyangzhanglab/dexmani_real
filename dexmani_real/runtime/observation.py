@@ -7,10 +7,8 @@ from typing import Mapping
 
 import numpy as np
 
-
-def sample_is_fresh(timestamp_ns, max_age_s, now_ns=None):
-    now = time.monotonic_ns() if now_ns is None else now_ns
-    return 0 < int(timestamp_ns) <= now and now - int(timestamp_ns) <= int(max_age_s * 1e9)
+from dexmani_real.robot.xhand.feedback import hand_feedback_time_ns
+from dexmani_real.utils.timing import sample_is_fresh
 
 
 def feedback_deadline_ns(row, runtime, *, include_vr=False):
@@ -25,18 +23,6 @@ def feedback_deadline_ns(row, runtime, *, include_vr=False):
             int(row.vr["recv_ts_ns"]) + int(runtime.control.vr_mapping.stale_threshold_s * 1e9) + 1
         )
     return min(deadlines)
-
-
-def hand_feedback_time_ns(hand):
-    """Oldest required hand source, without conflating tactile age with joint time."""
-    return min(
-        int(hand[name][0])
-        for name in (
-            "timestamp_ns",
-            "tactile_aggregate_timestamp_ns",
-            "tactile_dense_timestamp_ns",
-        )
-    )
 
 
 def read_vr_frame(runtime_state):
@@ -178,27 +164,20 @@ def read_observation(
         pointcloud_published_ns=int(cloud_result[1]) if cloud_result is not None else -1,
     )
 
-    robot.update_observation_health(row)
+    deadlines = []
+    if row.camera is not None:
+        deadlines.append(
+            int(row.camera["timestamp_ns"]) + int(runtime.camera.max_frame_age_s * 1e9)
+        )
+    if row.pointcloud_timestamp_ns > 0:
+        deadlines.append(
+            row.pointcloud_timestamp_ns + int(runtime.camera.max_frame_age_s * 1e9)
+        )
+    if row.vr is not None:
+        deadlines.append(
+            int(row.vr["recv_ts_ns"])
+            + int(runtime.control.vr_mapping.stale_threshold_s * 1e9)
+        )
+    # Arm freshness is independently checked against the executor's live snapshot.
+    robot.arm.update_health(upstream_until_ns=min(deadlines) if deadlines else 2**63 - 1)
     return row
-
-
-def observation_timing(row):
-    """Host observation and pipeline clocks in monotonic nanoseconds."""
-    return dict(
-        observation_ns=int(row.observation_timestamp_ns),
-        control_ns=int(row.control_timestamp_ns),
-        arm_ns=int(row.arm["timestamp_ns"][0]),
-        hand_ns=int(row.hand["timestamp_ns"][0]) if row.hand is not None else -1,
-        camera_ns=int(row.camera["timestamp_ns"]) if row.camera is not None else -1,
-        pointcloud_ns=int(row.pointcloud_timestamp_ns) if row.pointcloud_timestamp_ns > 0 else -1,
-        camera_sequence=int(row.camera["ring_sequence"]) if row.camera is not None else -1,
-        pointcloud_camera_sequence=int(row.pointcloud_camera_sequence),
-        **{
-            f"camera_{name}": int(row.camera[name]) if row.camera is not None else -1
-            for name in ("received_ns", "published_ns", "depth_frame_number", "color_frame_number")
-        },
-        pointcloud_camera_received_ns=int(row.pointcloud_camera_received_ns),
-        pointcloud_camera_published_ns=int(row.pointcloud_camera_published_ns),
-        pointcloud_started_ns=int(row.pointcloud_started_ns),
-        pointcloud_published_ns=int(row.pointcloud_published_ns),
-    )

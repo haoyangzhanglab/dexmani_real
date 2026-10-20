@@ -9,18 +9,18 @@ import numpy as np
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_EQUIVALENT_JOINT_MASK
 
 if TYPE_CHECKING:
-    from dexmani_real.planning.planner import XArm7MotionPlanner
+    from dexmani_real.planning.home_planner import HomePlanner
 
 
 # The proximal-first HOME candidate moves J1–J4 before J5–J7.
-_PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=bool)
+PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=bool)
 
 # Allow a small outward tolerance for nonlinear FK interpolation at workspace edges.
 WORKSPACE_BOUNDS_TOLERANCE_M = 1e-3
 
 
 def table_clearance_m(
-    planner: "XArm7MotionPlanner",
+    planner: "HomePlanner",
     arm_qpos: np.ndarray,
     *,
     table_z_surface_m: float,
@@ -99,7 +99,7 @@ def wrap_nearest_equivalent(
 
 def check_home_path(
     path: np.ndarray,
-    planner: "XArm7MotionPlanner",
+    planner: "HomePlanner",
     *,
     table_z_surface_m: float,
     hand_safety_margin_m: float,
@@ -180,7 +180,7 @@ def home_joint_vector(value, name):
 def compute_joint_home_path(
     qpos: np.ndarray,
     home_qpos: np.ndarray,
-    planner: "XArm7MotionPlanner",
+    planner: "HomePlanner",
     *,
     table_z_surface_m: float,
     hand_safety_margin_m: float,
@@ -219,12 +219,12 @@ def compute_joint_home_path(
     if admitted(direct, "direct"):
         return direct
     mid = qpos.copy()
-    mid[_PROXIMAL_MASK] = target[_PROXIMAL_MASK]
+    mid[PROXIMAL_MASK] = target[PROXIMAL_MASK]
     proximal = unique_milestones(qpos, mid, target)
     if admitted(proximal, "proximal_first"):
         return proximal
     mid = qpos.copy()
-    mid[~_PROXIMAL_MASK] = target[~_PROXIMAL_MASK]
+    mid[~PROXIMAL_MASK] = target[~PROXIMAL_MASK]
     distal = unique_milestones(qpos, mid, target)
     if admitted(distal, "distal_first"):
         return distal
@@ -247,7 +247,7 @@ def compute_joint_home_path(
 def compute_band_alignment_path(
     wrapped_home: np.ndarray,
     canonical_home: np.ndarray,
-    planner: "XArm7MotionPlanner",
+    planner: "HomePlanner",
     *,
     table_z_surface_m: float,
     hand_safety_margin_m: float,

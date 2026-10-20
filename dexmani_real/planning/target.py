@@ -1,4 +1,4 @@
-"""Physical endpoint admission shared by real motion producers, on the parent."""
+"""Physical endpoint checks shared by motion producers in the parent process."""
 
 import numpy as np
 
@@ -6,7 +6,7 @@ from .kinematics.arm_fk import make_arm_fk
 from .kinematics.ik import DEFAULT_JUMP_DEG, joint_target_rejection
 
 
-class TargetAdmission:
+class TargetChecker:
     """Check a target, not the swept arm/hand path from feedback to that target."""
 
     def __init__(self, runtime, collision_model, *, dynamic_rejection=None, target_fk=None):
@@ -15,6 +15,7 @@ class TargetAdmission:
         self.limits = np.column_stack(
             (runtime.arm.joint_limit_lower, runtime.arm.joint_limit_upper)
         )
+        self.jump_limit = np.deg2rad(DEFAULT_JUMP_DEG)
         self.workspace = runtime.control.workspace.as_array()
         self.margin = runtime.control.eef_workspace_margin_m
         if type(self.margin) not in (int, float) or not np.isfinite(self.margin) or self.margin < 0:
@@ -26,7 +27,7 @@ class TargetAdmission:
             self.dynamic_rejection(target, current, previous)
             if self.dynamic_rejection is not None
             else joint_target_rejection(
-                target, current, previous, self.limits, np.deg2rad(DEFAULT_JUMP_DEG)
+                target, current, previous, self.limits, self.jump_limit
             )
         )
         if reason is not None:

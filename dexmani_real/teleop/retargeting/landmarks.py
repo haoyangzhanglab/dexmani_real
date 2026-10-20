@@ -1,4 +1,4 @@
-"""Shared TAG/DexPilot landmark geometry with pinky-chain and wrist→MCP size compensation."""
+"""TAG/DexPilot landmark frames and pinky-chain/wrist→MCP scale compensation."""
 
 from __future__ import annotations
 
@@ -8,12 +8,12 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_PINKY_MCP = 17
-_PINKY_PIP = 18
-_PINKY_DIP = 19
-_PINKY_TIP = 20
+PINKY_MCP = 17
+PINKY_PIP = 18
+PINKY_DIP = 19
+PINKY_TIP = 20
 
-_CONTIGUOUS_BONES = tuple(
+CONTIGUOUS_BONES = tuple(
     (parent, child)
     for chain in (
         (0, 1, 2, 3, 4),
@@ -26,7 +26,7 @@ _CONTIGUOUS_BONES = tuple(
 )
 
 # Right-hand operator→MANO rotation; Unity→FLU conversion occurs in the VR receiver.
-_OPERATOR2MANO_RIGHT = np.array(
+OPERATOR2MANO_RIGHT = np.array(
     [
         [0, 0, -1],
         [-1, 0, 0],
@@ -42,7 +42,7 @@ def validate_landmarks(points: np.ndarray) -> tuple[bool, str]:
     if not np.all(np.isfinite(points)):
         return False, "contains NaN/Inf"
     shortest_bone = min(
-        float(np.linalg.norm(points[child] - points[parent])) for parent, child in _CONTIGUOUS_BONES
+        float(np.linalg.norm(points[child] - points[parent])) for parent, child in CONTIGUOUS_BONES
     )
     if shortest_bone < 0.002:
         return False, "a retargeting bone is shorter than 2 mm"
@@ -93,16 +93,16 @@ def scale_pinky(
     landmarks = raw.copy()
 
     if palm_scale != 1.0:
-        landmarks[_PINKY_MCP] = landmarks[0] + (raw[_PINKY_MCP] - landmarks[0]) * palm_scale
+        landmarks[PINKY_MCP] = landmarks[0] + (raw[PINKY_MCP] - landmarks[0]) * palm_scale
 
-    mcp_to_pip = raw[_PINKY_PIP] - raw[_PINKY_MCP]
-    landmarks[_PINKY_PIP] = landmarks[_PINKY_MCP] + mcp_to_pip * scale
+    mcp_to_pip = raw[PINKY_PIP] - raw[PINKY_MCP]
+    landmarks[PINKY_PIP] = landmarks[PINKY_MCP] + mcp_to_pip * scale
 
-    pip_to_dip = raw[_PINKY_DIP] - raw[_PINKY_PIP]
-    landmarks[_PINKY_DIP] = landmarks[_PINKY_PIP] + pip_to_dip * scale
+    pip_to_dip = raw[PINKY_DIP] - raw[PINKY_PIP]
+    landmarks[PINKY_DIP] = landmarks[PINKY_PIP] + pip_to_dip * scale
 
-    dip_to_tip = raw[_PINKY_TIP] - raw[_PINKY_DIP]
-    landmarks[_PINKY_TIP] = landmarks[_PINKY_DIP] + dip_to_tip * scale
+    dip_to_tip = raw[PINKY_TIP] - raw[PINKY_DIP]
+    landmarks[PINKY_TIP] = landmarks[PINKY_DIP] + dip_to_tip * scale
 
     return landmarks
 
@@ -118,7 +118,7 @@ def prepare_landmarks(landmarks, *, pinky_scale, pinky_palm_scale):
         return None
     try:
         wrist_rot = estimate_palm_frame(landmarks)
-        mano = landmarks @ wrist_rot @ _OPERATOR2MANO_RIGHT
+        mano = landmarks @ wrist_rot @ OPERATOR2MANO_RIGHT
     except ValueError:
         logger.warning("Coordinate transform failed — no target produced")
         return None

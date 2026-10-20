@@ -96,7 +96,7 @@ class VRWorker:
                             (21, 3),
                             "landmarks",
                         )
-                        # Either HTS component can advance; the older receive time establishes freshness of both.
+                        # The older HTS component's receive time bounds freshness of both.
                         recv_ts_ns = min(
                             uint64(event.wrist_recv_ts_ns), uint64(event.landmarks_recv_ts_ns)
                         )

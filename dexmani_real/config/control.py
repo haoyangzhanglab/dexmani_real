@@ -32,7 +32,6 @@ class ControlParams:
     """Shared Real control settings; deployment cadence comes from saved Policy."""
 
     ema: EMAParams = field(default_factory=EMAParams)
-
     vr_mapping: VRMappingParams = field(default_factory=VRMappingParams)
 
     workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
@@ -84,22 +83,19 @@ class KeyboardTeleopParams:
 class TAGRetargetingParams:
     """TAG two-stage NLopt hand retargeting parameters."""
 
-    robot_finger_lengths: tuple[float, ...] = (0.161, 0.208, 0.206, 0.204, 0.145)
     # Thumb→pinky lengths in meters.
-
+    robot_finger_lengths: tuple[float, ...] = (0.161, 0.208, 0.206, 0.204, 0.145)
     human_finger_lengths: tuple[float, ...] = (0.13, 0.18, 0.19, 0.18, 0.145)
-
-    finger_scale_boost: float = 1.0
     # Multiplies the robot/human length ratio.
+    finger_scale_boost: float = 1.0
 
-    pinky_scale: float = 1.3
     # Pinky MCP→TIP scale before TAG optimization.
-
-    pinky_palm_scale: float = 1.25
+    pinky_scale: float = 1.3
     # Pinky wrist→MCP scale before TAG optimization.
+    pinky_palm_scale: float = 1.25
 
-    mano_to_urdf_euler: tuple[float, float, float] = (0.0, 0.0, 0.0)
     # MANO→URDF extrinsic XYZ Euler angles, radians.
+    mano_to_urdf_euler: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     smooth_weight: float = 0.003
     ftol_abs_s1: float = 1e-4

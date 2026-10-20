@@ -10,7 +10,7 @@ import numpy as np
 
 from dexmani_real.deployment.observation import (
     build_policy_observation,
-    decision_is_fresh,
+    decision_expires_at_ns,
     policy_observation_issue,
     policy_sources,
 )
@@ -20,6 +20,7 @@ from dexmani_real.recording.recorder import (
     RecordingError,
     snapshot_recording_metadata,
 )
+from dexmani_real.recording.storage.schema import observation_timing
 from dexmani_real.robot.action import ActionIntent
 from dexmani_real.robot.commands import (
     DispatchError,
@@ -29,7 +30,6 @@ from dexmani_real.robot.commands import (
 )
 from dexmani_real.runtime.observation import (
     feedback_deadline_ns,
-    observation_timing,
     read_observation,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState
@@ -45,7 +45,7 @@ class PolicyQuery:
     query_id: int
     run_id: int
     slot: int
-    sources: dict[str, tuple[int, ...]]
+    expires_at_ns: int
     handoff_slot: int | None
     result: np.ndarray | None = None
     evidence: dict = field(default_factory=dict)
@@ -58,7 +58,7 @@ class ActionPlan:
     actions: np.ndarray
     anchor_slot: int
     segment_end: int
-    sources: dict[str, tuple[int, ...]]
+    expires_at_ns: int
     frozen: dict[int, RobotCommand]
     query_id: int
 
@@ -79,7 +79,7 @@ class PolicyRunner:
         policy_info,
         *,
         robot,
-        realizer,
+        action_mapper,
         recorder=None,
         operator,
         model_runtime,
@@ -122,12 +122,13 @@ class PolicyRunner:
         self.reset_ready = False
         self.last_slot = -1
         self.dt_ns = int(policy_info.control_dt_s * 1e9)
+        self.max_decision_age_ns = int(self.execution.max_decision_age_s * 1e9)
         self.run_id = None
         self.started_ns = 0
         self.next_step_ns = 0
         self.previous_arm = None
         self.completed = 0
-        self.realizer = realizer
+        self.action_mapper = action_mapper
         fields = set(self.policy_info.observation_fields)
         requires_rgb = "rgb" in fields
         self.requires_cloud = "point_cloud" in fields
@@ -412,7 +413,7 @@ class PolicyRunner:
         try:
             if self.recorder is not None:
                 metadata = snapshot_recording_metadata(
-                    self.runtime_state,
+                    self.runtime_state.sensors,
                     camera_calibration=self.camera_calibration,
                     hand=self.robot.hand,
                 )
@@ -533,19 +534,7 @@ class PolicyRunner:
             return
         if result.error is not None:
             raise result.error
-        prediction = np.asarray(result.value)
-        expected = (
-            self.policy_info.horizon - self.policy_info.n_obs_steps + 1,
-            self.policy_info.control_action_dim,
-        )
-        valid_prediction = (
-            prediction.shape == expected
-            and prediction.dtype.kind == "f"
-            and np.isfinite(prediction).all()
-        )
-        if not valid_prediction:
-            raise ValueError(f"Policy prediction requires finite floating point {expected}")
-        query.result = prediction
+        query.result = result.value
 
     def submit(self, rows, slot, *, handoff_slot=None, prefix=None, commands=None):
         observation = build_policy_observation(
@@ -561,13 +550,12 @@ class PolicyRunner:
         if not authorized:
             return ControlRejection("query_authority_revoked")
         sources = policy_sources(rows[-1], self.policy_info.observation_fields)
-        if not decision_is_fresh(sources, now, self.execution.max_decision_age_s):
+        expires_at_ns = decision_expires_at_ns(sources, now, self.max_decision_age_ns)
+        if expires_at_ns is None:
             return ControlRejection("query_sources_invalid_or_expired")
-        if prefix is not None and not decision_is_fresh(
-            self.plan.sources, now, self.execution.max_decision_age_s
-        ):
+        if prefix is not None and now >= self.plan.expires_at_ns:
             return ControlRejection("prefix_decision_expired")
-        query = PolicyQuery(self.query_id + 1, self.run_id, slot, sources, handoff_slot)
+        query = PolicyQuery(self.query_id + 1, self.run_id, slot, expires_at_ns, handoff_slot)
         kwargs = (
             dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot) if prefix is not None else {}
         )
@@ -628,14 +616,14 @@ class PolicyRunner:
             expired = self.expired_budget()
             if expired is not None:
                 return None, None, ControlRejection(f"{expired[1]}_timeout", RunEndReason.TIMEOUT)
-            command, issue = self.realize_command(
+            command, issue = self.map_command(
                 prefix[index], row, previous, context="prefix_action"
             )
             if issue is not None:
                 return None, None, issue
             commands[slot + index] = command
             previous = command.arm_qpos
-            prefix[index] = self.realizer.control_from_command(
+            prefix[index] = self.action_mapper.control_from_command(
                 command, self.policy_info.action_mode
             )
         return prefix, commands, None
@@ -648,8 +636,8 @@ class PolicyRunner:
         if self.recorder is not None and row is not None:
             self.recorder.add_frame(row, command, result, timing=self.slot_timing)
 
-    def realize_command(self, action, row, previous, *, context="action"):
-        """Decode a row of the admitted physical future and apply shared target admission."""
+    def map_command(self, action, row, previous, *, context="action"):
+        """Map one policy action to a checked joint command."""
         action = np.asarray(action, dtype=np.float64)
         mode = self.policy_info.action_mode
         intent = (
@@ -657,7 +645,7 @@ class PolicyRunner:
             if mode == "joint"
             else ActionIntent(mode, Pose(action[:3], rot6d_to_quat_wxyz(action[3:9])), action[9:])
         )
-        decoded = self.realizer.realize(intent, row.arm["qpos"][0], previous)
+        decoded = self.action_mapper.map(intent, row.arm["qpos"][0], previous)
         if decoded.arm_qpos is None:
             if (
                 decoded.ik_result is not None
@@ -671,13 +659,13 @@ class PolicyRunner:
         plan = self.plan
         command = plan.frozen.get(slot)
         if command is not None:
-            rejection = self.realizer.frozen_rejection(
+            rejection = self.action_mapper.frozen_rejection(
                 command, row.arm["qpos"][0], self.previous_arm, self.policy_info.action_mode
             )
             if rejection is not None:
                 return None, ControlRejection(f"frozen_target_rejected: {rejection}")
         else:
-            return self.realize_command(
+            return self.map_command(
                 plan.actions[slot - plan.anchor_slot],
                 row,
                 self.previous_arm,
@@ -698,11 +686,7 @@ class PolicyRunner:
             self.finish_budget(expired, row=row)
             return
         budget_limit = self.budget_limit()
-        decision_deadline_ns = min(
-            stamp + int(self.execution.max_decision_age_s * 1e9) + 1
-            for times in plan.sources.values()
-            for stamp in times
-        )
+        decision_deadline_ns = plan.expires_at_ns
         action_deadline_ns = min(
             self.next_step_ns,
             feedback_deadline_ns(row, self.runtime),
@@ -818,7 +802,7 @@ class PolicyRunner:
                 actions=query.result,
                 anchor_slot=slot if bootstrap else query.slot,
                 segment_end=slot + self.execution.action_steps,
-                sources=query.sources,
+                expires_at_ns=query.expires_at_ns,
                 frozen={},
                 query_id=query.query_id,
             ),

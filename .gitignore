@@ -4,7 +4,6 @@
 /rollouts/
 /replay_results/
 /results/
-/reports/
 /outputs/
 /logs/
 *.log

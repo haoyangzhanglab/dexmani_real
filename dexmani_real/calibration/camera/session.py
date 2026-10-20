@@ -7,41 +7,45 @@ import logging
 import multiprocessing as mp
 import time
 from concurrent.futures import CancelledError
-from datetime import datetime, timezone
 
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 
 from dexmani_real.calibration import CAMERAS_PATH
-from dexmani_real.calibration.camera.solver import (
+from dexmani_real.calibration.camera.aruco import (
     ARUCO_DICT,
     ARUCO_DICT_NAME,
     ArucoConfig,
-    CalibrationConfig,
-    CalibrationSamples,
-    HandEyeCalibrator,
     detect_aruco_pose,
     draw_calibration_overlay,
-    eef_rpy_from_rot6d,
     marker_corners_3d,
+)
+from dexmani_real.calibration.camera.extrinsics import (
+    calibration_capture_metadata,
     save_camera_calibration,
+)
+from dexmani_real.calibration.camera.hand_eye import (
+    CalibrationConfig,
+    CalibrationSamples,
+    solve_hand_eye,
 )
 from dexmani_real.config.experiment import ExperimentConfig, validate_keyboard_workspace
 from dexmani_real.ipc.channels import SensorChannels
-from dexmani_real.planning import XArm7MotionPlanner
-from dexmani_real.planning.admission import TargetAdmission
+from dexmani_real.planning.home_planner import HomePlanner
+from dexmani_real.planning.target import TargetChecker
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import IKFailureKind, OnlineIKSolver, make_online_ik_solver
+from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.robot.commands import DispatchError
 from dexmani_real.robot.home import build_home_planner, execute_arm_home
 from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.observation import read_camera_frame, sample_is_fresh
+from dexmani_real.runtime.observation import read_camera_frame
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, SafetyState, RuntimeState
 from dexmani_real.sensor.camera.worker import run_camera_worker
-from dexmani_real.teleop.jog import (
+from dexmani_real.runtime.jog import (
     any_jog_key_held,
     compute_cartesian_jog_delta,
     jog_motion_requested,
@@ -49,12 +53,19 @@ from dexmani_real.teleop.jog import (
     submit_jog_target,
 )
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.timing import LoopRate
+from dexmani_real.utils.timing import LoopRate, sample_is_fresh
 
 logger = logging.getLogger(__name__)
 
-_WINDOW_NAME = "ArUco Calibration"
-_IDLE_STATUS_INTERVAL_FRAMES = 150
+WINDOW_NAME = "ArUco Calibration"
+IDLE_STATUS_INTERVAL_FRAMES = 150
+
+
+def eef_rpy_from_rot6d(rot6d: np.ndarray) -> np.ndarray:
+    """Convert an arm EEF rot6d orientation to xyz RPY in radians."""
+    quat_wxyz = rot6d_to_quat_wxyz(rot6d)
+    rpy_rad = Rotation.from_quat(np.roll(quat_wxyz, -1)).as_euler("xyz", degrees=False)
+    return np.asarray(rpy_rad, dtype=np.float64)
 
 
 def detect_aruco_stable(
@@ -66,8 +77,8 @@ def detect_aruco_stable(
     marker_corners: np.ndarray,
     target_id: int | None,
     max_frame_age_s: float,
-    n_frames: int = 5,
-    cancel_requested=lambda: False,
+    n_frames: int,
+    cancel_requested,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Capture N frames and return SO(3) mean rotation and median translation for noise reduction."""
     rvecs_all: list[np.ndarray] = []
@@ -115,7 +126,7 @@ def detect_aruco_stable(
 
 def build_planner(
     runtime: ExperimentConfig,
-) -> tuple[XArm7MotionPlanner, OnlineIKSolver]:
+) -> tuple[HomePlanner, OnlineIKSolver]:
     """Share arm kinematics while keeping HOME and online collision scenes separate."""
     planner = build_home_planner(runtime)
     home_hand_qpos = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
@@ -151,41 +162,6 @@ def read_stationary_calibration_arm_state(
     return arm_state, ""
 
 
-def calibration_capture_metadata(
-    *,
-    width: int,
-    height: int,
-    requested_fps: int,
-    intrinsics: np.ndarray,
-    distortion: np.ndarray,
-    method: str,
-    sample_count: int,
-    position_errors_mm: np.ndarray,
-    rotation_errors_deg: np.ndarray,
-) -> dict[str, object]:
-    """Summarize solver residuals and camera geometry for publication."""
-
-    def summary(values: np.ndarray) -> dict[str, float]:
-        return {
-            "mean": float(values.mean()),
-            "rms": float(np.sqrt(np.mean(values**2))),
-            "max": float(values.max()),
-        }
-
-    return {
-        "width": width,
-        "height": height,
-        "requested_fps": requested_fps,
-        "intrinsics": intrinsics.tolist(),
-        "distortion": distortion.tolist(),
-        "method": method,
-        "sample_count": sample_count,
-        "position_error_mm": summary(position_errors_mm),
-        "rotation_error_deg": summary(rotation_errors_deg),
-        "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
-    }
-
-
 def solve_calibration(
     samples: CalibrationSamples,
     config: CalibrationConfig,
@@ -196,11 +172,11 @@ def solve_calibration(
     intrinsics: np.ndarray,
     distortion: np.ndarray,
 ):
-    """Compute a qualified T_base_camera candidate; the session owns publication."""
+    """Compute a qualified T_base_from_camera candidate; the session owns publication."""
     sample_count = len(samples)
     print(f"\n  computing hand-eye calibration ({sample_count} samples, 5 methods)...")
     try:
-        result = HandEyeCalibrator(config).solve(samples)
+        result = solve_hand_eye(samples, config)
     except (ValueError, cv2.error) as exc:
         logger.warning("solve failed", exc_info=True)
         print(f"FAILED — {exc}, skipped")
@@ -208,7 +184,7 @@ def solve_calibration(
 
     errors_mm, errors_deg = result.position_errors_mm, result.rotation_errors_deg
     method = result.method
-    T_base_camera = result.T_base_camera
+    T_base_from_camera = result.T_base_from_camera
     samples.residuals_mm = errors_mm.copy()
 
     print("  method consistency (mm, lower is better):")
@@ -216,7 +192,7 @@ def solve_calibration(
         selected = "  ← selected" if name == method else ""
         score_text = "  FAILED" if np.isnan(score_mm) else f"{score_mm:7.1f}"
         print(f"    {name:11s} {score_text}{selected}")
-    print(f"  quality ({method}, T_ee_marker consistency):")
+    print(f"  quality ({method}, T_eef_from_marker consistency):")
     print(
         f"    position mean={errors_mm.mean():.1f}mm "
         f"max={errors_mm.max():.1f}mm rms={result.position_rms_mm:.1f}mm"
@@ -234,7 +210,7 @@ def solve_calibration(
         )
         flag = "  ← worst, press X to remove" if index == worst_index else ""
         print(f"    #{index + 1:2d} {residual_mm:6.1f} {bar}{flag}")
-    print(f"  T_base_camera position: {np.round(T_base_camera[:3, 3], 4)}m")
+    print(f"  T_base_from_camera position: {np.round(T_base_from_camera[:3, 3], 4)}m")
 
     metadata = calibration_capture_metadata(
         width=width,
@@ -248,7 +224,7 @@ def solve_calibration(
         rotation_errors_deg=errors_deg,
     )
     metadata["excitation"] = result.excitation
-    return T_base_camera, metadata
+    return T_base_from_camera, metadata
 
 
 def log_workspace_clipping(
@@ -407,7 +383,7 @@ class CameraCalibrationSession:
                 marker_size_m=self.aruco_config.marker_size_m,
             )
         if self.display_image is not None:
-            cv2.imshow(_WINDOW_NAME, self.display_image)
+            cv2.imshow(WINDOW_NAME, self.display_image)
         cv2.waitKey(1)
 
     def handle_sample_events(self):
@@ -497,26 +473,24 @@ class CameraCalibrationSession:
                 estop_callback=lambda: self.fault("operator e-stop callback", estop=True),
             )
             self.serial = self.runtime_state.sensors.camera_serial.value.decode()
-            geometry = json.loads(self.runtime_state.sensors.camera_geometry.value.decode())[
-                "color"
-            ]
-            self.camera_width, self.camera_height = geometry["width"], geometry["height"]
+            color_intrinsics = json.loads(self.runtime_state.sensors.camera_intrinsics.value.decode())
+            self.camera_width, self.camera_height = color_intrinsics["width"], color_intrinsics["height"]
             self.intrinsics = np.array(
                 [
-                    [geometry["fx"], 0, geometry["ppx"]],
-                    [0, geometry["fy"], geometry["ppy"]],
+                    [color_intrinsics["fx"], 0, color_intrinsics["ppx"]],
+                    [0, color_intrinsics["fy"], color_intrinsics["ppy"]],
                     [0, 0, 1],
                 ],
                 dtype=np.float64,
             )
-            self.distortion = np.asarray(geometry["distortion_coeffs"], dtype=np.float64)
+            self.distortion = np.asarray(color_intrinsics["distortion_coeffs"], dtype=np.float64)
             print(f"  Camera serial: {self.serial}")
             print(
                 f"  Intrinsics: fx={self.intrinsics[0, 0]:.1f} "
                 f"fy={self.intrinsics[1, 1]:.1f} ({self.camera_width}x{self.camera_height})"
             )
             self.keys.start()
-            cv2.namedWindow(_WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+            cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
             self.window_created = True
             exit_code = self.run_control_loop(initial_state)
         except KeyboardInterrupt:
@@ -544,7 +518,7 @@ class CameraCalibrationSession:
         )
         if self.window_created:
             try:
-                cv2.destroyWindow(_WINDOW_NAME)
+                cv2.destroyWindow(WINDOW_NAME)
                 self.window_created = False
             except Exception:
                 logger.exception("calibration window cleanup failed")
@@ -576,7 +550,7 @@ class CameraCalibrationSession:
         )
         print("  Controls: WASD/arrows move, ←→/I/J/K/L rotate, SPACE capture, ENTER calibrate")
         print("  Jog key changes stop and re-prepare motion; release all jog keys after a rejected target")
-        print(f"  Preview window: {_WINDOW_NAME} (green=detected, red=not found)")
+        print(f"  Preview window: {WINDOW_NAME} (green=detected, red=not found)")
 
         self.display_image: np.ndarray | None = None
         while self.runtime_state.running:
@@ -689,7 +663,7 @@ class CameraCalibrationSession:
                 self.runtime_state.revoke_motion()
                 self.robot.stop()
                 self.command_qpos = self.command_pose = None
-            if self.frame % _IDLE_STATUS_INTERVAL_FRAMES == 0:
+            if self.frame % IDLE_STATUS_INTERVAL_FRAMES == 0:
                 measured_pose = self.solver.kin.compute_eef_pose_base(self.current_qpos)
                 print(
                     f"[f={self.frame}] samples={len(self.samples)} "
@@ -755,7 +729,7 @@ class CameraCalibrationSession:
             self.blocked_until_release = True
             return
 
-        rejection = self.admission.rejection(
+        rejection = self.target_checker.rejection(
             ik_result.qpos,
             self.current_qpos,
             baseline_qpos,
@@ -834,7 +808,7 @@ class CameraCalibrationSession:
             )
 
         self.home_planner, self.solver = planner, solver
-        self.admission = TargetAdmission(
+        self.target_checker = TargetChecker(
             self.runtime, solver.collision_model, dynamic_rejection=solver.dynamic_rejection
         )
         self.workspace = workspace

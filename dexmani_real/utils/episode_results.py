@@ -31,7 +31,7 @@ class EpisodeResults:
             errors=[],
         )
         self.current = None
-        self._running_ns = None
+        self.running_ns = None
         atomic_json_dump(self.session, self.path, overwrite=False)
 
     def begin_episode(self):
@@ -59,7 +59,7 @@ class EpisodeResults:
     def entered(self, run_id):
         if self.current is not None:
             self.current.update(started=True, run_id=int(run_id), started_utc=utc_now())
-            self._running_ns = time.monotonic_ns()
+            self.running_ns = time.monotonic_ns()
 
     def record_inference(self, duration_ns):
         if self.current is None or not self.current["started"]:
@@ -97,8 +97,8 @@ class EpisodeResults:
             return
         if duration_s is None:
             duration_s = (
-                (time.monotonic_ns() - self._running_ns) / 1e9
-                if self._running_ns is not None
+                (time.monotonic_ns() - self.running_ns) / 1e9
+                if self.running_ns is not None
                 else 0.0
             )
         self.current.update(
@@ -110,7 +110,7 @@ class EpisodeResults:
         )
         self.current["metrics"].update(metrics)
         self.session["episodes"].append(self.current)
-        self.current = self._running_ns = None
+        self.current = self.running_ns = None
         atomic_json_dump(self.session, self.path)
 
     def finish_session(self, *, outcome, reason, shutdown_clean, **details):

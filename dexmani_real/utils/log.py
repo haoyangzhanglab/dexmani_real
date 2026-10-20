@@ -19,11 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-_FORMATTER = logging.Formatter(
+FORMATTER = logging.Formatter(
     "[%(asctime)s] [%(levelname)-7s] [%(name)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-_CONSOLE_FORMATTER = logging.Formatter(
+CONSOLE_FORMATTER = logging.Formatter(
     "[%(asctime)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S"
 )
 
@@ -34,7 +34,7 @@ def configure_logging() -> None:
     if logger.handlers:
         return
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(_CONSOLE_FORMATTER)
+    handler.setFormatter(CONSOLE_FORMATTER)
     handler.setLevel(logging.INFO)
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)
@@ -44,7 +44,7 @@ def configure_logging() -> None:
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / (f"dexmani_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.log")
         handler = logging.FileHandler(str(log_path), encoding="utf-8")
-        handler.setFormatter(_FORMATTER)
+        handler.setFormatter(FORMATTER)
         handler.setLevel(logging.DEBUG)
         logger.addHandler(handler)
     except OSError:
@@ -130,12 +130,12 @@ class ThrottledWarner:
     """Throttle each solver warning to once every five seconds."""
 
     def __init__(self, *, logger: logging.Logger) -> None:
-        self._last_ns = 0
-        self._logger = logger
+        self.last_ns = 0
+        self.logger = logger
 
     def __call__(self, msg: str, *args: Any, **kwargs: Any) -> None:
         now_ns = time.monotonic_ns()
-        if now_ns - self._last_ns < 5_000_000_000:
+        if now_ns - self.last_ns < 5_000_000_000:
             return
-        self._last_ns = now_ns
-        self._logger.warning(msg, *args, **kwargs)
+        self.last_ns = now_ns
+        self.logger.warning(msg, *args, **kwargs)

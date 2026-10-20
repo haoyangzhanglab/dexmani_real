@@ -6,13 +6,13 @@ import time
 import numpy as np
 
 logger = logging.getLogger(__name__)
-_TORN_WARN_INTERVAL_NS = 5_000_000_000
+TORN_WARN_INTERVAL_NS = 5_000_000_000
 
 
 class SharedMemoryRingBuffer:
     """Owned copies via odd/even publication markers on Linux x86_64."""
 
-    _HEADER_SIZE = 16
+    HEADER_SIZE = 16
 
     def __init__(self, ctx, dtype: np.dtype, maxlen: int):
         if type(maxlen) is not int or maxlen <= 0:
@@ -20,7 +20,7 @@ class SharedMemoryRingBuffer:
         self.dtype, self.maxlen = np.dtype(dtype), maxlen
         if not self.dtype.names or self.dtype.hasobject:
             raise ValueError("shared-memory payload must have fields without Python objects")
-        self._slot_dtype = np.dtype(
+        self.slot_dtype = np.dtype(
             [
                 ("timestamp_ns", "<u8"),
                 ("sequence", "<u8"),
@@ -28,19 +28,19 @@ class SharedMemoryRingBuffer:
             ],
             align=True,
         )
-        self._buffer = ctx.RawArray("b", self._HEADER_SIZE + maxlen * self._slot_dtype.itemsize)
-        self._last_good = None
-        self._last_torn_warn_ns = 0
+        self.buffer = ctx.RawArray("b", self.HEADER_SIZE + maxlen * self.slot_dtype.itemsize)
+        self.last_good = None
+        self.last_torn_warn_ns = 0
 
     @property
     def header(self):
-        return np.frombuffer(self._buffer, dtype=np.uint64, count=2)
+        return np.frombuffer(self.buffer, dtype=np.uint64, count=2)
 
     @property
     def slots(self):
         # Construct local views after spawn; pickling an ndarray would copy its data.
         return np.frombuffer(
-            self._buffer, dtype=self._slot_dtype, count=self.maxlen, offset=self._HEADER_SIZE
+            self.buffer, dtype=self.slot_dtype, count=self.maxlen, offset=self.HEADER_SIZE
         )
 
     def write(self, **fields) -> int:
@@ -88,14 +88,14 @@ class SharedMemoryRingBuffer:
             sample = self.copy_slot(int(self.header[0]))
             if sample is not None:
                 if use_last_good:
-                    self._last_good = sample
+                    self.last_good = sample
                 return sample
         if use_last_good and int(self.header[1]) != 0:
             now = time.monotonic_ns()
-            if now - self._last_torn_warn_ns >= _TORN_WARN_INTERVAL_NS:
-                self._last_torn_warn_ns = now
+            if now - self.last_torn_warn_ns >= TORN_WARN_INTERVAL_NS:
+                self.last_torn_warn_ns = now
                 logger.warning("sensor ring torn read; returning last verified sample or None")
-            return self._last_good
+            return self.last_good
         return None
 
     @property

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
-from dexmani_real.sensor.camera.geometry import RGBDGeometry
+from dexmani_real.sensor.camera.geometry import CameraIntrinsics
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud
 from dexmani_real.utils.log import configure_logging
@@ -41,7 +41,7 @@ class PointCloudWorker:
         static_inputs = self.load_static_inputs()
         if static_inputs is None:
             return
-        geometry, depth_scale_m, base_from_color = static_inputs
+        intrinsics, depth_scale_m, base_from_color = static_inputs
         logger.debug(
             "pointcloud config=%s table_plane_abcd=%s",
             json.dumps(asdict(self.config.pointcloud), sort_keys=True, separators=(",", ":")),
@@ -72,7 +72,7 @@ class PointCloudWorker:
                     depth_raw=depth_raw,
                     color=color,
                     depth_scale_m=depth_scale_m,
-                    geometry=geometry,
+                    intrinsics=intrinsics,
                     T_xarm_base_from_color=base_from_color,
                     table_plane_abcd=self.config.table_plane_abcd,
                     config=self.config.pointcloud,
@@ -106,8 +106,8 @@ class PointCloudWorker:
             if not self.shared.camera_ready.wait(timeout=0.05):
                 continue
             # Geometry/scale are published once, before ready; malformed values cannot recover here.
-            geometry = RGBDGeometry.from_dict(
-                json.loads(self.shared.camera_geometry.value.decode("utf-8"))
+            intrinsics = CameraIntrinsics(
+                **json.loads(self.shared.camera_intrinsics.value.decode("utf-8"))
             )
             depth_scale_m = float(self.shared.camera_depth_scale.value)
             if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
@@ -115,7 +115,7 @@ class PointCloudWorker:
             serial = self.shared.camera_serial.value.decode("utf-8")
             base_from_color = self.config.camera_calibration.for_serial(serial)
             # The aligned color pixel grid requires color-camera deprojection.
-            return geometry.aligned_depth_to_color(), depth_scale_m, base_from_color
+            return intrinsics, depth_scale_m, base_from_color
         return None
 
 

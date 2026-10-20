@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
-from dexmani_real.recording.storage.reader import EpisodeReader
+from dexmani_real.recording.storage.reader import EpisodeReader, text_attr
 from dexmani_real.recording.storage.schema import validate_dispatch_rows
 
 
@@ -25,10 +25,7 @@ class TrajectoryData:
 def load_trajectory(episode_path):
     with EpisodeReader(episode_path) as reader:
         meta = reader.meta
-        collection_source = meta["collection_source"]
-        if isinstance(collection_source, bytes):
-            collection_source = collection_source.decode("utf-8")
-        if collection_source != "teleop":
+        if text_attr(meta, "collection_source") != "teleop":
             raise ValueError("physical replay requires a teleop episode")
         reader.require_fields(
             "action_arm_joint_target",
@@ -51,13 +48,12 @@ def load_trajectory(episode_path):
         errors = validate_dispatch_rows(reader["dispatch_status"][:])
         if errors:
             raise ValueError("; ".join(errors))
-        timing = reader.read_timing()
-        reader.validate_arm_execution(timing["rows"])
+        reader.validate_arm_execution()
         return TrajectoryData(
             str(reader.path),
             len(arm),
             reader.control_hz,
-            str(meta["task_label"]),
+            text_attr(meta, "task_label"),
             arm,
             hand,
             aq,

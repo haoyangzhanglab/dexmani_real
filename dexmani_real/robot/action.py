@@ -1,17 +1,17 @@
-"""Realize source-neutral targets; motion epochs and SDK authorization stay downstream."""
+"""Map absolute targets to joint commands; downstream execution owns motion authority."""
 
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 
-from dexmani_real.planning import Pose
+from dexmani_real.planning.kinematics.pose import Pose
 from dexmani_real.planning.kinematics.ik import (
     IKResult,
     make_online_ik_solver,
 )
 from dexmani_real.planning.paths import wrap_nearest_equivalent
-from dexmani_real.planning.admission import TargetAdmission
+from dexmani_real.planning.target import TargetChecker
 
 
 @dataclass(frozen=True)
@@ -24,7 +24,7 @@ class ActionIntent:
 
 
 @dataclass(frozen=True)
-class ActionRealization:
+class ActionResult:
     arm_qpos: np.ndarray | None
     hand_qpos: np.ndarray | None
     ik_result: IKResult | None = None
@@ -33,10 +33,10 @@ class ActionRealization:
     eef_pose: Pose | None = None
 
 
-class ActionRealizer:
+class ActionMapper:
     def __init__(self, runtime, *, solver=None, collision_model):
         self.runtime, self.solver = runtime, solver
-        self.admission = TargetAdmission(
+        self.target_checker = TargetChecker(
             runtime,
             collision_model,
             dynamic_rejection=solver.dynamic_rejection if solver is not None else None,
@@ -58,11 +58,11 @@ class ActionRealizer:
 
     def joint_rejection(self, target, hand, current, previous):
         physical_hand = hand if hand is not None else np.deg2rad(self.runtime.hand.home_qpos_deg)
-        return self.admission.rejection(
+        return self.target_checker.rejection(
             target, current, previous, collision_hand_qpos=physical_hand
         )
 
-    def realize(self, intent, current_arm_qpos, previous_arm_command_qpos=None):
+    def map(self, intent, current_arm_qpos, previous_arm_command_qpos=None):
         if intent.mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
         if intent.mode == "joint":
@@ -82,10 +82,9 @@ class ActionRealizer:
         cfg = self.runtime
         if cfg.control.hand_enabled:
             if intent.hand is None:
-                raise ValueError("hand-enabled action realization requires a hand intent")
-        else:
-            if intent.hand is not None:
-                raise ValueError("hand-disabled action realization must not include a hand intent")
+                raise ValueError("hand-enabled action mapping requires a hand intent")
+        elif intent.hand is not None:
+            raise ValueError("hand-disabled action mapping must not include a hand intent")
         hand = None
         if intent.hand is not None:
             hand = project_hand_command(
@@ -99,14 +98,14 @@ class ActionRealizer:
                 joint_upper_rad=cfg.arm.joint_limit_upper,
             )
             reason = self.joint_rejection(target, hand, current, previous)
-            return ActionRealization(
+            return ActionResult(
                 target if reason is None else None, hand, rejection_reason=reason
             )
         if self.solver is None:
-            raise ValueError("EEF realization requires an online IK solver")
+            raise ValueError("EEF mapping requires an online IK solver")
         # Project an owned pose so the source target and teleop EMA reference stay unchanged.
         pose = intent.arm.copy()
-        workspace = cfg.control.workspace.as_array()
+        workspace = self.target_checker.workspace
         pose.p = np.clip(pose.p, workspace[:, 0], workspace[:, 1])
         self.solver.collision_model.set_hand_qpos(
             hand if hand is not None else np.deg2rad(cfg.hand.home_qpos_deg)
@@ -115,9 +114,9 @@ class ActionRealizer:
         reason = (
             result.reason
             if not result.success
-            else (self.joint_rejection(result.qpos, hand, current, previous))
+            else self.joint_rejection(result.qpos, hand, current, previous)
         )
-        return ActionRealization(
+        return ActionResult(
             result.qpos if reason is None else None,
             hand,
             ik_result=result,

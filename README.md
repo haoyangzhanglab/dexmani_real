@@ -80,6 +80,8 @@ python examples/pointcloud_process_example.py --help
 
 采集允许缺相机外参，点云重建需要数据对应的内外参与 depth scale。采集可通过 `--vr-transform`、`--camera-calibration` 选择标定，部署支持 `--camera-calibration`。VR 质量为 `poor` 的标定不能用于遥操作启动。
 
+ArUco 预览与采样使用相同的 PnP 数值检查；无效姿态不显示坐标轴，也不进入标定样本。
+
 ### 2. 遥操作与采集
 
 ```bash
@@ -102,7 +104,9 @@ python examples/collect_teleop.py test --config local.yaml --control-hz 20
 
 `--control-hz` 同时设置目标、观测采样与录制频率，默认 16 Hz；机械臂伺服频率独立。频率须满足设备与反馈新鲜度预算，调频会改变输入 EMA 的时间响应，应记录实际配置。错过时隙或反馈过期时停止并保留真实前缀，不追赶补发。
 
-手部默认使用 TAG，`control.hand_retargeting_type: dexpilot` 切换到 DexPilot。位置映射与 EMA 分别由 `control.vr_mapping`、`control.ema` 配置。`--no-record` 关闭录制及相机采集，遥操作仍会执行；`--no-hand` 仅用于明确无手或手已固定在 HOME 的无录制调试。
+手部默认使用 TAG，在固定手基座的 12 关节模型上拟合指尖位置，再按拇指与其余四指的距离细化捏合；`control.hand_retargeting_type: dexpilot` 切换到 DexPilot。位置映射与 EMA 分别由 `control.vr_mapping`、`control.ema` 配置。
+
+`--no-record` 关闭录制及相机采集，遥操作仍会执行；`--no-hand` 仅用于明确无手或手已固定在 HOME 的无录制调试。
 
 ### 3. 离线查看与导出
 
@@ -114,13 +118,19 @@ python examples/export_policy_zarr.py episodes/test --config local.yaml
 
 `--info` 打印数据概要，无需启动 Rerun；交互查看可用 `--no-point-cloud` 关闭点云。查看和导出使用 Raw 保存的相机几何，以及当前点云、桌面、手部安装与指尖配置。仅启用去桌时读取桌面平面。
 
+RGB-D 使用对齐后的 color 像素网格和内参。Raw 外参保存 color→xArm-base 变换；Canonical 和模型的 `camera_extrinsic` 使用其逆变换 base→color 的 `[R|t]`，两者不能混用。
+
+Raw 文本元数据统一按 UTF-8 读取；HDF5 定长字节串与变长字符串表示同一文本，导出和回放保留原任务名。
+
 公共导出要求每段全部 **15 字段**完整、浮点数值有限，并通过时序及动作执行证据检查。缺字段、NaN/Inf、RGB-D 行数不符、相机几何缺失或非法、空点云均整段拒绝，记录原因并保留原 Raw；任务失败本身不排除技术有效的数据。导出不删坏帧、不填补缺测、不修改 Raw。
+
+导出和回放检查各自所需的核心数据及执行证据，允许额外诊断列，缺失查询日志不再单独阻止使用。完整时序诊断仍检查查询关联；录制端继续保存完整证据。
 
 默认输出 `datasets/test.zarr`，目标必须不存在；`--output` 指定新路径，`--exclude` 排除指定 episode，`--chunk-frames` 调整处理批大小，`--pointcloud-num-points` 覆盖点数。同一缓存要求 task、dt、depth scale 和数组 shape/dtype 一致；合法 metadata 冲突会在读取后续数值前中止导出。文件系统或处理异常保留 staging 供排查。
 
 处理批次受 64 MiB 总数据预算约束；存储按各字段独立分块，目标解压大小约 1 MiB、时间维 1–128 行。默认 640×480 RGB/depth 为单帧块，低维字段保留批量块；单帧超过目标大小时仍保存完整帧，该预算不能限制单帧最小解码量。已有缓存不会自动改写，使用正常导出和新的 `--output` 重建。新导出生成新 `data_revision`，已有 checkpoint／手部表示产物的来源检查仍生效，不能复制旧 revision 绕过检查。
 
-训练 action 表示本拍提交的绝对关节目标，`action_ee` 是该目标的 FK，均不代表下一拍已到达。时序筛选同时检查逐拍间隔与累计偏离；Raw 采集正常结束不等于可导出。布局采用 `data/*` 与 `meta/episode_ends`，字段定义见 [Canonical 数据契约](dexmani_real/dataset/contracts.py)，处理入口见 [dataset/processing.py](dexmani_real/dataset/processing.py)。
+训练 action 表示本拍提交的绝对关节目标，`action_ee` 是该目标的 FK，均不代表下一拍已到达。时序筛选同时检查逐拍间隔与累计偏离；Raw 采集正常结束不等于可导出。布局采用 `data/*` 与 `meta/episode_ends`，字段定义见 [Canonical 字段定义](dexmani_real/dataset/schema.py)，处理入口见 [dataset/processing.py](dexmani_real/dataset/processing.py)。
 
 在线与离线共用[点云处理](dexmani_real/sensor/pointcloud/processing.py)：去飞点、桌面过滤、workspace、体素 XYZ/RGB 均值、密度与连通分量筛选，再限制候选并做 **CPU QuickFPS**。默认输出 1024 点、最多 8192 个候选，依赖固定为 `fpsample==0.3.3`，无需 CUDA。不足点数时循环已有点，空云保留无有效输出。
 
@@ -133,7 +143,7 @@ python examples/run_policy.py policy/task/experiment --config local.yaml
 python examples/run_policy.py policy/task/experiment --config local.yaml --execution-mode async --prefetch-steps 1 --n-action-steps 4
 ```
 
-实验输入为不带 `experiments/` 前缀的 `policy/task/experiment`，也可使用有效的绝对实验目录。策略 artifact 提供模型输入、动作表示和控制 dt；Real 提供当前设备、标定与执行配置。每段执行步数按 `--n-action-steps` > YAML 的 `execution.action_steps` > 策略默认值确定。
+实验输入为不带 `experiments/` 前缀的 `policy/task/experiment`，也可使用有效的绝对实验目录。策略预检与加载共用检查时的保存配置快照，接口见 [Policy 部署边界](https://github.com/haoyangzhanglab/dexmani_policy/blob/main/docs/项目架构.md#部署边界)。策略 artifact 提供模型输入、动作表示和控制 dt；Real 提供当前设备、标定与执行配置。每段执行步数按 `--n-action-steps` > YAML 的 `execution.action_steps` > 策略默认值确定。
 
 | 执行模式 | 行为与配置 |
 | --- | --- |
@@ -173,7 +183,7 @@ python examples/replay_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config
 | 点云诊断 / 桌面标定 | [pointcloud_process_example.py](examples/pointcloud_process_example.py) | 连接相机；`--save-dir` 保存本次 RGB-D、点云及重建 metadata |
 | 物体重建与跟踪 | [CORDViP 示例](examples/cordvip/README.md) | 使用独立的 `cordvip_geometry` 依赖与入口，区分离线数据和实时相机模式 |
 
-点云诊断保存与最终显示使用同一帧，后续连续帧测速仅报告耗时和有效点云数量。RGB-D 基础预览仅受相机与深度显示参数约束；启用点云时才检查对应处理配置与标定，不可用时继续 RGB/Depth 预览。关闭 `pointcloud.remove_table` 时处理不使用桌面平面；拟合结果只有确认后才发布。各入口的参数与按键以 `--help` 和交互提示为准。
+点云诊断保存与最终显示使用同一帧，快照保留处理配置、相机内外参、depth scale 和实际使用的桌面平面。后续连续帧测速仅报告耗时和有效点云数量。RGB-D 基础预览仅受相机与深度显示参数约束；启用点云时才检查对应处理配置与标定，不可用时继续 RGB/Depth 预览。关闭 `pointcloud.remove_table` 时处理不使用桌面平面；拟合结果只有确认后才发布。各入口的参数与按键以 `--help` 和交互提示为准。
 
 键盘遥操作与手眼标定的 jog 在运动键组合变化时先撤销旧动作授权，再准备后续目标；方向完全抵消或释放最后一个运动键会停止 jog。触界、IK 或准入拒绝后必须释放全部 jog 键才能重新操作。
 
@@ -190,6 +200,8 @@ python examples/replay_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config
 xArm 控制器碰撞检测默认关闭（`arm.collision_sensitivity: 0`），不能依赖它触发碰撞停机；软件几何检查仍执行。真机运行前确认安装、标定、限位和工作空间，保持操作者监督及硬件急停可用。SDK 或 CUDA 阻塞可能影响停止响应，离线检查不能证明真机安全。
 
 ## 开发
+
+设备驱动负责 I/O，机器人协调器负责运动权限与发送，XHand 反馈组件负责有界触觉保持和不可变快照；观测构造汇总相机、点云与 VR 的健康期限。录制器负责队列和 Raw 发布，存储 writer 独占 HDF5、视频及批缓冲，训练准入留在 `dataset/`。相机标定按 ArUco 检测、手眼求解、外参存取和交互会话分工。
 
 默认运行无设备副作用的检查：
 

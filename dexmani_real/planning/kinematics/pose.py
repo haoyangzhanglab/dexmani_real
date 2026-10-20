@@ -32,10 +32,10 @@ class Pose:
         return Pose(p=self.p.copy(), q=self.q.copy())
 
 
-_WXYZ_TO_XYZW = np.array([1, 2, 3, 0], dtype=np.intp)
-_XYZW_TO_WXYZ = np.array([3, 0, 1, 2], dtype=np.intp)
-_ROT6D_MIN_BASIS_NORM = 1e-4
-_ROT6D_MIN_ORTHOGONAL_RATIO = 1e-4
+WXYZ_TO_XYZW = np.array([1, 2, 3, 0], dtype=np.intp)
+XYZW_TO_WXYZ = np.array([3, 0, 1, 2], dtype=np.intp)
+ROT6D_MIN_BASIS_NORM = 1e-4
+ROT6D_MIN_ORTHOGONAL_RATIO = 1e-4
 
 __all__ = [
     "compose_pose",
@@ -44,7 +44,6 @@ __all__ = [
     "invert_pose",
     "quat_multiply",
     "quat_wxyz_to_rotmat",
-    "validate_rot6d_geometry",
     "rot6d_to_quat_wxyz",
     "rot6d_to_rotmat",
 ]
@@ -52,12 +51,12 @@ __all__ = [
 
 def wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
     q = np.asarray(q, dtype=np.float64).reshape(4)
-    return q[_WXYZ_TO_XYZW]
+    return q[WXYZ_TO_XYZW]
 
 
 def xyzw_to_wxyz(q: np.ndarray) -> np.ndarray:
     q = np.asarray(q, dtype=np.float64).reshape(4)
-    return q[_XYZW_TO_WXYZ]
+    return q[XYZW_TO_WXYZ]
 
 
 def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
@@ -110,47 +109,6 @@ def compute_pose_error(target: Pose, actual: Pose) -> tuple[float, float]:
     return position_error, rotation_error
 
 
-def validate_rot6d_geometry(
-    rot6d: np.ndarray,
-    *,
-    label: str = "rot6d",
-    min_basis_norm: float = _ROT6D_MIN_BASIS_NORM,
-    min_orthogonal_ratio: float = _ROT6D_MIN_ORTHOGONAL_RATIO,
-) -> np.ndarray:
-    """Validate finite, nondegenerate 6D bases of arbitrary scale; return (N,6) for single or batched input."""
-    values = np.asarray(rot6d, dtype=np.float64)
-    if values.ndim == 1:
-        if values.shape != (6,):
-            raise ValueError(f"{label} must have shape (6,), got {values.shape}")
-        values = values[None, :]
-    elif values.ndim != 2 or values.shape[1] != 6:
-        raise ValueError(f"{label} must have shape (N, 6), got {values.shape}")
-    if (
-        not np.isfinite(min_basis_norm)
-        or min_basis_norm <= 0.0
-        or not np.isfinite(min_orthogonal_ratio)
-        or min_orthogonal_ratio <= 0.0
-    ):
-        raise ValueError("rot6d geometry thresholds must be finite and positive")
-    if not np.all(np.isfinite(values)):
-        raise ValueError(f"{label} contains NaN/Inf")
-
-    first = values[:, :3]
-    second = values[:, 3:]
-    first_norm = np.linalg.norm(first, axis=1)
-    second_norm = np.linalg.norm(second, axis=1)
-    unit_first = first / np.maximum(first_norm[:, None], min_basis_norm)
-    orthogonal_second = second - np.sum(second * unit_first, axis=1)[:, None] * unit_first
-    orthogonal_norm = np.linalg.norm(orthogonal_second, axis=1)
-    if (
-        np.any(first_norm < min_basis_norm)
-        or np.any(second_norm < min_basis_norm)
-        or np.any(orthogonal_norm / np.maximum(second_norm, min_basis_norm) < min_orthogonal_ratio)
-    ):
-        raise ValueError(f"{label} contains a zero or near-collinear basis")
-    return values
-
-
 def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
     """Gram-Schmidt [c1x,c1y,c1z,c2x,c2y,c2z] to WXYZ; reject nonfinite or near-collinear bases."""
     quat_xyzw = Rotation.from_matrix(rot6d_to_rotmat(r6)).as_quat()
@@ -159,24 +117,31 @@ def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
 
 def rot6d_to_rotmat(r6: np.ndarray) -> np.ndarray:
     """Gram-Schmidt rot6d columns to a right-handed rotation matrix."""
-    r6 = validate_rot6d_geometry(r6, label="rot6d")[0]
-    c1 = r6[:3].copy()
-    c2 = r6[3:].copy()
+    values = np.asarray(r6, dtype=np.float64)
+    if values.shape != (6,) or not np.isfinite(values).all():
+        raise ValueError("rot6d must be a finite (6,) vector")
+    first, second = values[:3], values[3:]
+    first_norm = float(np.linalg.norm(first))
+    second_norm = float(np.linalg.norm(second))
+    if (
+        not np.isfinite([first_norm, second_norm]).all()
+        or min(first_norm, second_norm) < ROT6D_MIN_BASIS_NORM
+    ):
+        raise ValueError("rot6d contains a zero or unrepresentable basis")
 
-    c1_norm = float(np.linalg.norm(c1))
-    u1 = c1 / c1_norm
-    c2_orth = c2 - np.dot(c2, u1) * u1
-    c2_orth_norm = float(np.linalg.norm(c2_orth))
-    u2 = c2_orth / c2_orth_norm
-
-    u3 = np.cross(u1, u2)
-    R = np.column_stack([u1, u2, u3])
-
-    return R
+    unit_first = first / first_norm
+    orthogonal_second = second - np.dot(second, unit_first) * unit_first
+    orthogonal_norm = float(np.linalg.norm(orthogonal_second))
+    if (
+        not np.isfinite(orthogonal_norm)
+        or orthogonal_norm / second_norm < ROT6D_MIN_ORTHOGONAL_RATIO
+    ):
+        raise ValueError("rot6d contains a near-collinear basis")
+    unit_second = orthogonal_second / orthogonal_norm
+    return np.column_stack((unit_first, unit_second, np.cross(unit_first, unit_second)))
 
 
 def quat_wxyz_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
-    """Convert WXYZ to a (3,3) rotation matrix."""
     quat_xyzw = wxyz_to_xyzw(normalize_quat_wxyz(q_wxyz))
     return Rotation.from_quat(quat_xyzw).as_matrix()
 

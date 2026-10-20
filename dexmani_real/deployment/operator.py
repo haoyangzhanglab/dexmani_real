@@ -5,7 +5,7 @@ from concurrent.futures import CancelledError
 
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.runtime.state import RuntimeState, RunEndReason, SafetyState
-from dexmani_real.planning import XArm7MotionPlanner
+from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.robot.home import home_robot
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 
@@ -19,7 +19,7 @@ class PolicyOperator:
         self,
         runtime_state: RuntimeState,
         runtime: ExperimentConfig,
-        planner: XArm7MotionPlanner,
+        planner: HomePlanner,
         *,
         robot,
     ):

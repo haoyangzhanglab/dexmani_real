@@ -7,18 +7,18 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.config.experiment import ExperimentConfig
-from dexmani_real.planning import XArm7MotionPlanner
+from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.planning.paths import (
     compute_band_alignment_path,
     compute_joint_home_path,
 )
-from dexmani_real.runtime.observation import sample_is_fresh
+from dexmani_real.utils.timing import sample_is_fresh
 from dexmani_real.robot.commands import RobotCommand, DispatchError, DispatchInterrupted
-from dexmani_real.utils.limits import validate_hand_command_bounds
+from dexmani_real.robot.xhand.limits import validate_hand_command_bounds
 from dexmani_real.runtime.state import RunEndReason, SafetyState
 
 logger = logging.getLogger(__name__)
-_HOME_CONSECUTIVE_SAMPLES = 3
+HOME_CONSECUTIVE_SAMPLES = 3
 
 
 @dataclass(frozen=True)
@@ -166,9 +166,9 @@ def execute_arm_home(
             logger.exception("HOME cleanup also failed")
 
 
-def build_home_planner(runtime: ExperimentConfig) -> XArm7MotionPlanner:
+def build_home_planner(runtime: ExperimentConfig) -> HomePlanner:
     """Build HOME planning with current workspace/table/static geometry beyond online IK endpoint checks."""
-    return XArm7MotionPlanner(
+    return HomePlanner(
         workspace_bounds=runtime.control.workspace.as_array(),
         static_boxes=tuple(runtime.environment.static_boxes),
         table=runtime.environment.table,
@@ -285,7 +285,7 @@ def home_hand(runtime_state, runtime, *, robot, abort_requested=None):
                     consecutive += 1
                 else:
                     consecutive = 0
-                if consecutive >= _HOME_CONSECUTIVE_SAMPLES:
+                if consecutive >= HOME_CONSECUTIVE_SAMPLES:
                     if (
                         time.monotonic_ns() < deadline
                         and not (abort_requested is not None and abort_requested())

@@ -29,8 +29,8 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dexmani_real*"]
-exclude = ["examples*", "assets*"]
-namespaces = false
+exclude = ["dexmani_real.calibration.state"]
+namespaces = true
 
 [tool.setuptools.package-data]
 "dexmani_real.calibration" = ["state/*.json"]

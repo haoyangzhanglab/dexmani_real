@@ -8,9 +8,9 @@ import numpy as np
 
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
-from dexmani_real.utils.limits import validate_hand_limit_nesting
+from dexmani_real.robot.xhand.limits import validate_hand_limit_nesting
 
-_XHAND_RATED_QPOS_MIN_RAD: tuple[float, ...] = (
+XHAND_RATED_QPOS_MIN_RAD: tuple[float, ...] = (
     0.0,
     -0.698,
     0.0,
@@ -26,7 +26,7 @@ _XHAND_RATED_QPOS_MIN_RAD: tuple[float, ...] = (
 )
 
 
-_XHAND_RATED_QPOS_MAX_RAD: tuple[float, ...] = (
+XHAND_RATED_QPOS_MAX_RAD: tuple[float, ...] = (
     1.832,
     1.745,
     1.745,
@@ -67,8 +67,8 @@ class HandParams:
         5.0,
     )
 
-    mechanical_qpos_min_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MIN_RAD
-    mechanical_qpos_max_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MAX_RAD
+    mechanical_qpos_min_rad: tuple[float, ...] = XHAND_RATED_QPOS_MIN_RAD
+    mechanical_qpos_max_rad: tuple[float, ...] = XHAND_RATED_QPOS_MAX_RAD
 
     qpos_min_rad: tuple[float, ...] = (
         0.0,
@@ -84,7 +84,7 @@ class HandParams:
         0.0,
         0.08726646259971647,
     )
-    qpos_max_rad: tuple[float, ...] = _XHAND_RATED_QPOS_MAX_RAD
+    qpos_max_rad: tuple[float, ...] = XHAND_RATED_QPOS_MAX_RAD
 
     kp: tuple[int, ...] = (
         100,
@@ -192,14 +192,10 @@ class HandParams:
             command_upper,
             self.mechanical_qpos_min_rad,
             self.mechanical_qpos_max_rad,
-            _XHAND_RATED_QPOS_MIN_RAD,
-            _XHAND_RATED_QPOS_MAX_RAD,
+            XHAND_RATED_QPOS_MIN_RAD,
+            XHAND_RATED_QPOS_MAX_RAD,
             label="hand",
         )
-        if np.any(command_lower >= command_upper) or np.any(
-            np.asarray(self.mechanical_qpos_min_rad) >= self.mechanical_qpos_max_rad
-        ):
-            raise ValueError("hand command and mechanical limits must have lower < upper")
         home_rad = np.deg2rad(np.asarray(self.home_qpos_deg, dtype=np.float64))
         limit_tolerance_rad = 1e-9
         if (

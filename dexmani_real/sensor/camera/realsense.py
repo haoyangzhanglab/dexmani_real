@@ -7,16 +7,13 @@ import time
 from dataclasses import dataclass
 from typing import Any, cast
 
-__all__ = [
-    "RealSenseCamera",
-    "RGBDFrame",
-]
-
 import numpy as np
 import pyrealsense2 as rs
 
 from dexmani_real.sensor.camera.config import CameraParams
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
+
+__all__ = ["RealSenseCamera", "RGBDFrame"]
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +49,7 @@ class RealSenseCamera:
 
         self.depth_scale: float | None = None
         self.geometry: RGBDGeometry | None = None
-        self._depth_to_color_aligner: rs.align | None = None
+        self.depth_to_color_aligner: rs.align | None = None
 
     def connect(self) -> None:
         """Start once; failures require cleanup and an explicit new connection."""
@@ -101,7 +98,7 @@ class RealSenseCamera:
             self.apply_color_config()
             self.depth_scale = float(sensor.get_depth_scale())
             self.geometry = self.read_geometry()
-            self._depth_to_color_aligner = rs.align(rs.stream.color)
+            self.depth_to_color_aligner = rs.align(rs.stream.color)
             for _ in range(self.config.warmup_frames):
                 # Initialize alignment and owned copies before live publication.
                 self.read(timeout_ms=5000)
@@ -215,7 +212,7 @@ class RealSenseCamera:
         self.profile = None
         self.depth_scale = None
         self.geometry = None
-        self._depth_to_color_aligner = None
+        self.depth_to_color_aligner = None
 
     def create_rs_config(self) -> rs.config:
         width, height = self.config.width, self.config.height
@@ -273,7 +270,7 @@ class RealSenseCamera:
         )
 
     def read(self, timeout_ms: int = 5000) -> RGBDFrame:
-        if self.frame_queue is None or self._depth_to_color_aligner is None:
+        if self.frame_queue is None or self.depth_to_color_aligner is None:
             raise RuntimeError("RealSense is not connected. Call connect() first.")
 
         queued_frame = self.frame_queue.wait_for_frame(timeout_ms)
@@ -289,7 +286,7 @@ class RealSenseCamera:
         if not color_frame:
             raise RuntimeError("Failed to get color frame.")
 
-        aligned_frames = self._depth_to_color_aligner.process(frames)
+        aligned_frames = self.depth_to_color_aligner.process(frames)
         aligned_depth_frame = aligned_frames.get_depth_frame()
         if not aligned_depth_frame:
             raise RuntimeError("Failed to align depth to the color stream.")

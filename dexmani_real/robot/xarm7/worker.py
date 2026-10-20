@@ -83,8 +83,7 @@ class ArmWorker:
         tolerance_rad=None,
         strict=False,
     ):
-        """Target error and anchor drift each require velocity/dwell.
-        Strict HOME fails on a bad sample and sleeps before reading; other stages reset dwell."""
+        """Require position/velocity dwell; strict HOME rejects any bad sample."""
         tolerance = self.cfg.homing.convergence_rad if tolerance_rad is None else tolerance_rad
         deadline = self.clock() + int(timeout_s * 1e9)
         stable = self.clock() if strict else None
@@ -251,7 +250,7 @@ class ArmWorker:
             def check_abort():
                 if self.io.cancel_operation.is_set() or not self.authorized(epoch, preparing=True):
                     raise OperationCancelled(f"{kind} authority revoked")
-                # HOME uses parent-service and actual hand-feedback deadlines, independently of streaming clocks.
+                # HOME uses parent-service and hand-feedback deadlines, separate from streaming.
                 if self.clock() >= min(self.io.service_until.value, self.io.hand_until.value):
                     raise TimeoutError(f"{kind} hand feedback or parent service expired")
 

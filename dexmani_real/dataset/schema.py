@@ -12,17 +12,6 @@ from dexmani_real.config.environment import validate_table_plane
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 
 
-def validate_task_identity(value: str) -> str:
-    """Validate an ordinary task label, not a path component."""
-    if not isinstance(value, str):
-        raise TypeError("task_name must be a string")
-    if not value.strip():
-        raise ValueError("task_name must be non-empty")
-    if any(ord(char) < 32 or ord(char) == 127 for char in value):
-        raise ValueError("task_name must not contain control characters")
-    return value
-
-
 @dataclass(frozen=True)
 class ProcessingConfig:
     """Full-modal processing requires complete physical/derived modalities and finite floats on every row."""
@@ -69,7 +58,7 @@ class ProcessingConfig:
             )
 
 
-_CORE_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
+CORE_FIELD_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "joint_state": ((19,), np.dtype(np.float32)),
     "arm_qvel": ((7,), np.dtype(np.float32)),
     "arm_effort": ((7,), np.dtype(np.float32)),
@@ -91,7 +80,7 @@ def canonical_array_specs(
     rgb_width: int,
 ) -> dict[str, tuple[tuple[int, ...], np.dtype[Any]]]:
     """Canonical per-row shapes and dtypes for aligned RGB-D."""
-    specs = dict(_CORE_DATASET_SPECS)
+    specs = dict(CORE_FIELD_SPECS)
     specs.update(
         {
             "rgb": ((rgb_height, rgb_width, 3), np.dtype(np.uint8)),

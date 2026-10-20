@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
-import json
 
 import av
 import h5py
@@ -42,9 +42,8 @@ def text_attr(attrs: h5py.AttributeManager, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise RawDataError(f"episode metadata {name} must be a non-empty string")
     try:
-        value.encode(
-            "utf-8"
-        )  # h5py may expose malformed variable-length bytes as surrogate escapes.
+        # h5py may expose malformed variable-length bytes as surrogate escapes.
+        value.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise RawDataError(f"episode metadata {name}: invalid UTF-8") from exc
     return value
@@ -85,35 +84,35 @@ class EpisodeReader:
     """Read current immutable Raw evidence without deciding training eligibility."""
 
     def __init__(self, episode_path: str | Path) -> None:
-        self._path = Path(episode_path)
-        self._data = self._video = None
-        self._fields = None
-        self._datasets = {}
-        if not self._path.is_dir():
-            raise ValueError(f"episode must be a directory: {self._path}")
-        self._rgb_path = self._path / "rgb.mp4"
+        self.episode_path = Path(episode_path)
+        self.data_file = self.video_container = None
+        self.fields_cache = None
+        self.dataset_cache = {}
+        if not self.episode_path.is_dir():
+            raise ValueError(f"episode must be a directory: {self.episode_path}")
+        self.rgb_path = self.episode_path / "rgb.mp4"
         try:
-            self._data = h5py.File(self._path / "data.h5", "r")
-            if "meta" not in self._data or not isinstance(self._data["meta"], h5py.Group):
+            self.data_file = h5py.File(self.episode_path / "data.h5", "r")
+            if "meta" not in self.data_file or not isinstance(self.data_file["meta"], h5py.Group):
                 raise RawDataError("episode is missing meta")
             attrs = self.meta
             if text_attr(attrs, "format") != RAW_FORMAT:
                 raise RawDataError(f"unsupported Raw format (expected {RAW_FORMAT!r})")
-            if attrs.get("arm_execution_format") != ARM_EXECUTION_FORMAT:
+            if text_attr(attrs, "arm_execution_format") != ARM_EXECUTION_FORMAT:
                 raise RawDataError(
                     f"unsupported arm execution format (expected {ARM_EXECUTION_FORMAT!r}); "
                     "use the historical code version for old Raw; do not rewrite it"
                 )
             if (
                 attrs.get("arm_control_mode") != 1
-                or attrs.get("arm_action_semantics") != "q_goal_submitted"
+                or text_attr(attrs, "arm_action_semantics") != "q_goal_submitted"
             ):
                 raise RawDataError("unknown arm control/action semantics")
             if text_attr(attrs, "timestamp_source") != "host_monotonic_relative":
                 raise RawDataError("Raw timestamp must use host monotonic relative seconds")
             text_attr(attrs, "termination_reason")
-            self._num_frames = nonnegative_int_attr(attrs, "num_frames")
-            self._control_hz = positive_float_attr(attrs, "control_hz")
+            self.frame_count = nonnegative_int_attr(attrs, "num_frames")
+            self.sampling_hz = positive_float_attr(attrs, "control_hz")
             text_attr(attrs, "task_label")
             text_attr(attrs, "collection_source")
         except BaseException:
@@ -122,62 +121,63 @@ class EpisodeReader:
 
     @property
     def meta(self):
-        return self._data["meta"].attrs
+        return self.data_file["meta"].attrs
 
     @property
     def fields(self) -> frozenset[str]:
-        if self._data is None:
+        if self.data_file is None:
             raise RuntimeError("Raw reader is closed")
-        if self._fields is None:
-            names = {key for key, value in self._data.items() if isinstance(value, h5py.Dataset)}
-            if self._rgb_path.is_file():
+        if self.fields_cache is None:
+            names = {key for key, value in self.data_file.items() if isinstance(value, h5py.Dataset)}
+            if self.rgb_path.is_file():
                 names.add("rgb")
-            self._fields = frozenset(names)
-        return self._fields
+            self.fields_cache = frozenset(names)
+        return self.fields_cache
 
     @property
     def path(self):
-        return self._path
+        return self.episode_path
 
     def require_fields(self, *names: str) -> None:
         missing = set(names) - self.fields
         if missing:
-            raise RawDataError(f"Raw {self._path.name} missing required fields: {sorted(missing)}")
+            raise RawDataError(f"Raw {self.episode_path.name} missing required fields: {sorted(missing)}")
 
     def __getitem__(self, name):
-        if self._data is None:
+        if self.data_file is None:
             raise RuntimeError("Raw reader is closed")
-        if name in self._datasets:
-            return self._datasets[name]
-        array = self._data[name]
+        if name in self.dataset_cache:
+            return self.dataset_cache[name]
+        array = self.data_file[name]
         if not isinstance(array, h5py.Dataset):
             raise RawDataError(f"Raw {name}: expected a dataset")
         if name in DATASET_SPECS:
             spec = DATASET_SPECS[name]
             if array.shape != (self.num_frames, *spec.tail_shape) or array.dtype != spec.dtype:
                 raise RawDataError(f"Raw {name}: incompatible shape/dtype")
-        self._datasets[name] = array
+        self.dataset_cache[name] = array
         return array
 
-    def read_timing_rows(self):
-        """Read only the compound rows needed by arm execution accounting."""
-        if "timing/rows" not in self._data:
+    def read_timing_rows(self, fields=("run_id", "command_seq")):
+        """Read the consumer's required columns without imposing diagnostic layout."""
+        if "timing/rows" not in self.data_file:
             raise RawDataError("Raw is missing timing rows")
-        rows = self._data["timing/rows"]
+        rows = self.data_file["timing/rows"]
         if (
             not isinstance(rows, h5py.Dataset)
             or rows.shape != (self.num_frames,)
-            or rows.dtype != TIMING_ROW_DTYPE
+            or rows.dtype.names is None
         ):
-            raise RawDataError(
-                "timing rows must align with core rows and match the current timing layout"
-            )
-        return rows[:]
+            raise RawDataError("timing rows must be a compound dataset aligned with core rows")
+        for name in fields:
+            if name not in rows.dtype.names or rows.dtype[name] != TIMING_ROW_DTYPE[name]:
+                raise RawDataError(f"timing rows require int64 column {name}")
+        return rows.fields(fields)[:]
 
     def read_termination(self):
-        if "timing/termination" not in self._data:
+        if "timing/termination" not in self.data_file:
             return None
-        value = self._data["timing/termination"]
+        value = self.data_file["timing/termination"]
         if not isinstance(value, h5py.Dataset) or value.shape != ():
             raise RawDataError("timing termination format: expected a scalar dataset")
         try:
@@ -186,9 +186,9 @@ class EpisodeReader:
             raise RawDataError(f"timing termination format: {exc}") from exc
 
     def read_timing(self):
-        """Full provenance admission, explicitly used by export and physical replay."""
-        values = self.read_timing_rows()
-        group = self._data["timing"]
+        """Read complete diagnostic timing and validate query associations."""
+        values = self.read_timing_rows(TIMING_ROW_DTYPE.names)
+        group = self.data_file["timing"]
         if "queries" not in group:
             raise RawDataError("Raw is missing timing queries")
         records = group["queries"]
@@ -211,10 +211,10 @@ class EpisodeReader:
             termination=self.read_termination(),
         )
 
-    def validate_arm_execution(self, rows=None):
-        """Use the same episode admission for export and physical replay."""
+    def validate_arm_execution(self):
+        """Check execution evidence independently of inference diagnostics."""
         try:
-            group = self._data["arm_execution"]
+            group = self.data_file["arm_execution"]
             if not isinstance(group, h5py.Group):
                 raise RawDataError("arm_execution must be a group")
             for name in ("start", "end"):
@@ -224,14 +224,14 @@ class EpisodeReader:
             validate_arm_execution(
                 json.loads(group["start"].asstr()[()]),
                 json.loads(group["end"].asstr()[()]),
-                self.read_timing_rows() if rows is None else rows,
+                self.read_timing_rows(),
                 self["dispatch_status"][:],
             )
         except (KeyError, ValueError, TypeError) as exc:
             raise RawDataError(f"Mode-1 execution evidence: {exc}") from exc
 
     def timing_diagnostics(self):
-        """Return host ages/deltas in seconds (NaN/None if missing), without cross-modality admission thresholds."""
+        """Return host ages/deltas in seconds, with NaN/None for missing diagnostics."""
         evidence = self.read_timing()
         rows = evidence["rows"]
 
@@ -278,34 +278,34 @@ class EpisodeReader:
 
     @property
     def num_frames(self) -> int:
-        return self._num_frames
+        return self.frame_count
 
     @property
     def control_hz(self) -> float:
-        return self._control_hz
+        return self.sampling_hz
 
     @property
     def dt(self) -> float:
-        return 1.0 / self._control_hz
+        return 1.0 / self.sampling_hz
 
     def iter_rgb_frames(self) -> Iterator[np.ndarray]:
         """Decode RGB in HDF5 row order; sampling times come from Raw ``timestamp``."""
         self.require_fields("rgb")
         try:
-            if self._video is None:
-                self._video = av.open(str(self._rgb_path), "r")
-            self._video.seek(0)
+            if self.video_container is None:
+                self.video_container = av.open(str(self.rgb_path), "r")
+            self.video_container.seek(0)
             # The reader owns the container if the consumer stops iteration early.
-            for frame in self._video.decode(video=0):
+            for frame in self.video_container.decode(video=0):
                 yield frame.to_ndarray(format="rgb24")
         except (av.error.InvalidDataError, av.error.EOFError) as exc:
-            raise RawDataError(f"{self._rgb_path}: invalid RGB video: {exc}") from exc
+            raise RawDataError(f"{self.rgb_path}: invalid RGB video: {exc}") from exc
 
     def close(self) -> None:
-        self._datasets.clear()
-        self._fields = None
+        self.dataset_cache.clear()
+        self.fields_cache = None
         errors = []
-        for name in ("_video", "_data"):
+        for name in ("video_container", "data_file"):
             resource = getattr(self, name)
             if resource is not None:
                 try:

@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""通过 VR 控制 xArm7/XHand，并将示教录制为 Raw episode。
-
-python examples/collect_teleop.py test
-python examples/collect_teleop.py test --config local.yaml
-python examples/collect_teleop.py --print-config
-
-参数：TASK 指定任务和录制目录；--config 覆盖配置，--print-config 仅打印配置、不连接设备。
-"""
+"""通过 VR 控制 xArm7/XHand，并将示教录制为 Raw episode。"""
 
 from __future__ import annotations
 
@@ -37,7 +30,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-hand",
         action="store_true",
-        help="Do not start XHand; it must be absent or secured at configured home. Arm debug only; also pass --no-record (or disable recording in config).",
+        help=(
+            "Do not start XHand; it must be absent or secured at configured home. "
+            "Arm debug only; also pass --no-record (or disable recording in config)."
+        ),
     )
     parser.add_argument(
         "--no-record",

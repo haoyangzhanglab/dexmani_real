@@ -14,7 +14,7 @@ class SensorProcesses:
 
     def __init__(self, runtime_state):
         self.runtime_state = runtime_state
-        self._started = []
+        self.started = []
 
     def start(self, process, *, ready, timeout_s=None) -> None:
         """Start ownership immediately; a timeout also requests a blocking readiness wait."""
@@ -27,7 +27,7 @@ class SensorProcesses:
         ):
             raise RuntimeError("sensor startup cancelled")
         process.start()
-        self._started.append((process, ready))
+        self.started.append((process, ready))
         if timeout_s is not None:
             deadline = time.monotonic() + timeout_s
             while time.monotonic() < deadline:
@@ -50,7 +50,7 @@ class SensorProcesses:
             raise RuntimeError(f"{process.name} failed to become ready")
 
     def check(self) -> bool:
-        dead = [(process, ready) for process, ready in self._started if not process.is_alive()]
+        dead = [(process, ready) for process, ready in self.started if not process.is_alive()]
         if not dead:
             return True
         for process, ready in dead:
@@ -65,7 +65,7 @@ class SensorProcesses:
         deadline = time.monotonic() + graceful_timeout_s
         clean = True
         errors = []
-        for process, ready in self._started:
+        for process, ready in self.started:
             try:
                 process.join(timeout=max(0.0, deadline - time.monotonic()))
                 escalation = "graceful"
@@ -95,7 +95,7 @@ class SensorProcesses:
             self.runtime_state.end_session(fault=True)
         if errors:
             raise RuntimeError(f"sensor shutdown unresolved: {errors}") from errors[0]
-        self._started.clear()
+        self.started.clear()
         return clean
 
 

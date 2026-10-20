@@ -12,10 +12,10 @@ from dexmani_real.calibration.camera.extrinsics import (
 )
 from dexmani_real.config.experiment import resolve_runtime_table
 from dexmani_real.deployment.config import (
-    validate_deployment_config,
     validate_max_running_s,
     validate_num_episodes,
 )
+from dexmani_real.deployment.startup import validate_deployment_config
 from dexmani_real.deployment.observation import (
     build_observation_camera,
     build_observation_kinematics,
@@ -26,7 +26,7 @@ from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.runtime.state import RuntimeState, RunEndReason
 from dexmani_real.recording.recorder import AsyncEpisodeRecorder
 from dexmani_real.utils.episode_results import EpisodeResults, error_detail
-from dexmani_real.robot.action import ActionRealizer
+from dexmani_real.robot.action import ActionMapper
 from dexmani_real.robot.home import build_home_planner
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
@@ -37,10 +37,10 @@ from dexmani_real.utils.log import configure_logging
 logger = logging.getLogger(__name__)
 
 
-def load_configured_policy(saved_config, info, execution_config, *, device, seed):
+def load_configured_policy(info, execution_config, *, device, seed):
     from dexmani_policy.deployment import load_policy
 
-    loaded = load_policy(saved_config, info, device=device, seed=seed)
+    loaded = load_policy(info, device=device, seed=seed)
     try:
         loaded.configure_execution(
             execution_config.execution_mode, execution_config.rtc_guidance_cap
@@ -60,7 +60,6 @@ class PolicyDeploymentSession:
     def __init__(
         self,
         runtime,
-        saved_config,
         info,
         *,
         device="cuda:0",
@@ -73,7 +72,6 @@ class PolicyDeploymentSession:
         save_run_config=None,
     ):
         self.runtime = runtime
-        self.saved_config = saved_config
         self.info = info
         self.device = device
         self.seed = seed
@@ -87,7 +85,7 @@ class PolicyDeploymentSession:
     def run(self):
         """Run a session with independently optional Raw recording and evaluation summaries."""
         cloud_recipe = validate_deployment_config(
-            self.saved_config, self.info, self.runtime, record_raw=self.recording_dir is not None
+            self.info, self.runtime, record_raw=self.recording_dir is not None
         )
         self.max_running_s = validate_max_running_s(self.max_running_s)
         self.num_episodes = validate_num_episodes(self.num_episodes)
@@ -108,9 +106,8 @@ class PolicyDeploymentSession:
         self.results = (
             EpisodeResults(self.results_dir, "policy") if self.results_dir is not None else None
         )
-        self.runtime_state = self.sensors = self.robot = self.model = self.operator = (
-            self.recorder
-        ) = None
+        self.runtime_state = self.sensors = self.robot = None
+        self.model = self.operator = self.recorder = None
         failure = None
         model_close = dict(status="completed", reason="model_not_created")
         clean = shutdown_clean = home_fault = False
@@ -122,15 +119,12 @@ class PolicyDeploymentSession:
                 bool(fields & {"point_cloud", "rgb", "camera_intrinsic", "camera_extrinsic"})
                 or self.recording_dir is not None
             )
-            camera_calibration = (
-                CameraExtrinsics(self.camera_calibration_path)
-                if cloud or "camera_extrinsic" in fields
-                else (
-                    load_optional_camera_extrinsics(self.camera_calibration_path)
-                    if self.recording_dir is not None
-                    else None
-                )
-            )
+            if cloud or "camera_extrinsic" in fields:
+                camera_calibration = CameraExtrinsics(self.camera_calibration_path)
+            elif self.recording_dir is not None:
+                camera_calibration = load_optional_camera_extrinsics(self.camera_calibration_path)
+            else:
+                camera_calibration = None
             pointcloud_config = (
                 PointCloudWorkerConfig(
                     pointcloud=cloud_recipe,
@@ -158,7 +152,6 @@ class PolicyDeploymentSession:
             )
             self.model = InferenceWorker(
                 lambda: load_configured_policy(
-                    self.saved_config,
                     self.info,
                     self.runtime.execution,
                     device=self.device,
@@ -167,7 +160,8 @@ class PolicyDeploymentSession:
             )
             self.warmup_policy()
             logger.debug(
-                "Validated policy: inputs=%s action=%s dt=%s N/H/A_exec=%s/%s/%s mode=%s d=%s beta=%s recording=%s; "
+                "Validated policy: inputs=%s action=%s dt=%s N/H/A_exec=%s/%s/%s "
+                "mode=%s d=%s beta=%s recording=%s; "
                 "cadence/cloud recipe from saved Policy, physical configuration from Real",
                 self.info.observation_fields,
                 self.info.action_mode,
@@ -181,7 +175,7 @@ class PolicyDeploymentSession:
                 self.recording_dir is not None,
             )
             kinematics = build_observation_kinematics(self.info, self.runtime)
-            realizer = ActionRealizer.for_mode(self.runtime, self.info.action_mode)
+            action_mapper = ActionMapper.for_mode(self.runtime, self.info.action_mode)
             home_planner = build_home_planner(self.runtime)
             if self.save_run_config is not None:
                 self.save_run_config(self.runtime)
@@ -236,7 +230,7 @@ class PolicyDeploymentSession:
                 self.runtime,
                 self.info,
                 robot=self.robot,
-                realizer=realizer,
+                action_mapper=action_mapper,
                 recorder=self.recorder,
                 operator=self.operator,
                 model_runtime=self.model,

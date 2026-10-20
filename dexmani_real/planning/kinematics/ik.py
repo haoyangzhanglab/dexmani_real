@@ -16,9 +16,9 @@ if TYPE_CHECKING:
 
 
 # Relative rank diagnosis is a search guard, never an execution constraint.
-_SVD_RANK_RTOL = 1e-4
-_NUMERIC_EPS = 1e-12
-_MODEL_LIMIT_TOL_RAD = 1e-5
+SVD_RANK_RTOL = 1e-4
+NUMERIC_EPS = 1e-12
+MODEL_LIMIT_TOL_RAD = 1e-5
 
 
 DEFAULT_JUMP_DEG = (30, 30, 30, 35, 40, 40, 40)
@@ -100,14 +100,14 @@ def make_online_ik_config(
 class IKCandidate:
     qpos: np.ndarray
     source: str
-    pos_err_m: float
-    rot_err_rad: float
-    max_physical_delta: float
-    base_score: float
+    position_error_m: float
+    rotation_error_rad: float
+    max_joint_displacement_rad: float
+    base_cost: float
     near_limit: bool
     collision_free: bool | None = None
-    singularity_margin: float | None = None
-    score: float = 0.0
+    reciprocal_condition_number: float | None = None
+    cost: float = 0.0
 
 
 def make_online_ik_solver(runtime, *, kin=None, **tolerances):
@@ -127,17 +127,19 @@ class OnlineIKSolver:
         self,
         kin: XArm7Kinematics,
         collision_model: CollisionModel,
-        online_ik_profile: OnlineIKConfig,
+        config: OnlineIKConfig,
     ) -> None:
-        self.kin, self.collision_model, self.profile = kin, collision_model, online_ik_profile
+        self.kin = kin
+        self.collision_model = collision_model
+        self.config = config
         model = kin.joint_limits
         if kin.dof != 7 or model.shape != (7, 2) or not np.isfinite(model).all():
             raise ValueError("online IK requires finite (7, 2) model limits")
         if np.any(model[:, 0] >= model[:, 1]):
             raise ValueError("online IK model limits must be ordered")
         lower, upper = (
-            online_ik_profile.operational_joint_lower_rad,
-            online_ik_profile.operational_joint_upper_rad,
+            config.operational_joint_lower_rad,
+            config.operational_joint_upper_rad,
         )
         if lower is None and upper is None:
             self.operational_limits = model.copy()
@@ -147,43 +149,41 @@ class OnlineIKSolver:
                 raise ValueError("operational lower/upper limits must both be finite (7,) arrays")
             if np.any(lower >= upper):
                 raise ValueError("operational lower limits must be less than upper limits")
-            if np.any(lower < model[:, 0] - _MODEL_LIMIT_TOL_RAD) or np.any(
-                upper > model[:, 1] + _MODEL_LIMIT_TOL_RAD
+            if np.any(lower < model[:, 0] - MODEL_LIMIT_TOL_RAD) or np.any(
+                upper > model[:, 1] + MODEL_LIMIT_TOL_RAD
             ):
                 raise ValueError("runtime operational limits exceed the loaded model/URDF limits")
             self.operational_limits = np.column_stack((lower, upper))
-        self._jump_limit = np.deg2rad(self.finite_q(online_ik_profile.max_ik_jump_deg))
-        self._weights = self.finite_q(online_ik_profile.joint_weights)
-        self._previous_weights = self.finite_q(
-            (
-                online_ik_profile.previous_command_joint_weights
-                if online_ik_profile.previous_command_joint_weights is not None
-                else online_ik_profile.joint_weights
-            ),
+        self.jump_limit = np.deg2rad(self.validate_joint_vector(config.max_ik_jump_deg))
+        self.weights = self.validate_joint_vector(config.joint_weights)
+        self.previous_weights = self.validate_joint_vector(
+            config.previous_command_joint_weights
+            if config.previous_command_joint_weights is not None
+            else config.joint_weights
         )
-        self._joint_ranges = np.maximum(model[:, 1] - model[:, 0], 1e-6)
-        self._limit_center = 0.5 * (self.operational_limits[:, 0] + self.operational_limits[:, 1])
-        self._limit_radius = np.maximum(
+        self.joint_ranges = np.maximum(model[:, 1] - model[:, 0], 1e-6)
+        self.limit_center = 0.5 * (self.operational_limits[:, 0] + self.operational_limits[:, 1])
+        self.limit_radius = np.maximum(
             0.5 * (self.operational_limits[:, 1] - self.operational_limits[:, 0]), 1e-6
         )
         positive = (
-            online_ik_profile.max_pose_error_pos_m,
-            online_ik_profile.max_pose_error_rot_rad,
-            online_ik_profile.redundancy_seed_step_deg,
+            config.max_pose_error_pos_m,
+            config.max_pose_error_rot_rad,
+            config.redundancy_seed_step_deg,
         )
         nonnegative = (
-            online_ik_profile.fast_accept_max_delta_deg,
-            online_ik_profile.joint_limit_search_margin_deg,
-            online_ik_profile.previous_command_distance_weight,
-            online_ik_profile.joint_limit_penalty_weight,
-            online_ik_profile.pose_accuracy_weight,
-            online_ik_profile.pose_rotation_weight,
-            online_ik_profile.singularity_margin_weight,
+            config.fast_accept_max_delta_deg,
+            config.joint_limit_search_margin_deg,
+            config.previous_command_distance_weight,
+            config.joint_limit_penalty_weight,
+            config.pose_accuracy_weight,
+            config.pose_rotation_weight,
+            config.singularity_margin_weight,
         )
         if (
             any(not np.isfinite(v) or v <= 0 for v in positive)
             or any(not np.isfinite(v) or v < 0 for v in nonnegative)
-            or any(np.any(a < 0) for a in (self._jump_limit, self._weights, self._previous_weights))
+            or any(np.any(a < 0) for a in (self.jump_limit, self.weights, self.previous_weights))
         ):
             raise ValueError("online IK tolerances, radii and weights must be finite and valid")
 
@@ -191,8 +191,8 @@ class OnlineIKSolver:
         self, target_eef_pose_base: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
     ) -> IKResult:
         try:
-            current = self.finite_q(current_qpos)
-            previous = self.finite_q(previous_qpos_cmd)
+            current = self.validate_joint_vector(current_qpos)
+            previous = self.validate_joint_vector(previous_qpos_cmd)
             if (
                 not np.isfinite(target_eef_pose_base.p).all()
                 or not np.isfinite(target_eef_pose_base.q).all()
@@ -227,7 +227,7 @@ class OnlineIKSolver:
         return result
 
     @staticmethod
-    def finite_q(value: np.ndarray) -> np.ndarray:
+    def validate_joint_vector(value: np.ndarray) -> np.ndarray:
         q = np.asarray(value, dtype=np.float64)
         if q.shape != (7,) or not np.isfinite(q).all():
             raise ValueError("IK joint vectors must be finite shape (7,)")
@@ -263,40 +263,42 @@ class OnlineIKSolver:
             if (
                 candidate.source == "prev_cmd"
                 and not candidate.near_limit
-                and candidate.max_physical_delta
-                <= np.deg2rad(self.profile.fast_accept_max_delta_deg)
-                and candidate.pos_err_m <= 0.5 * self.profile.max_pose_error_pos_m
-                and candidate.rot_err_rad <= 0.5 * self.profile.max_pose_error_rot_rad
+                and candidate.max_joint_displacement_rad
+                <= np.deg2rad(self.config.fast_accept_max_delta_deg)
+                and candidate.position_error_m <= 0.5 * self.config.max_pose_error_pos_m
+                and candidate.rotation_error_rad <= 0.5 * self.config.max_pose_error_rot_rad
                 and self.collision_free(candidate)
             ):
                 return candidate, converged, ""
 
-        base = self.select_collision_free(sorted(pool, key=lambda c: c.base_score))
+        base = self.select_collision_free(sorted(pool, key=lambda c: c.base_cost))
         if base is not None and not base.near_limit:
             return base, converged, ""
-        anchor = min(pool, key=lambda c: c.base_score) if pool else None
+        anchor = min(pool, key=lambda c: c.base_cost) if pool else None
         if anchor is not None:
-            direction = self.scaled_jacobian_svd(anchor)
+            direction = self.compute_nullspace_direction(anchor)
             if direction is not None:
-                for name, seed in self.make_null_seeds(anchor.qpos, direction):
+                for name, seed in self.generate_nullspace_seeds(anchor.qpos, direction):
                     candidate = try_seed(name, seed)
                     if candidate is not None:
                         pool.append(candidate)
             # Known collisions can anchor search, but cannot participate in final selection.
             viable = [c for c in pool if c.collision_free is not False]
-            weight = self.profile.singularity_margin_weight
+            weight = self.config.singularity_margin_weight
             for candidate in viable:
-                # Dexterity ∈ [0,1], so its weight bounds the base-score gap it can reverse.
+                # The reciprocal condition number is in [0,1], bounding its effect on cost.
                 if weight <= 0 or not any(
                     other is not candidate
-                    and abs(other.base_score - candidate.base_score) <= weight
+                    and abs(other.base_cost - candidate.base_cost) <= weight
                     for other in viable
                 ):
                     continue
-                if candidate.singularity_margin is None:
-                    self.scaled_jacobian_svd(candidate)
-                candidate.score = candidate.base_score - weight * candidate.singularity_margin
-            selected = self.select_collision_free(sorted(viable, key=lambda c: c.score))
+                if candidate.reciprocal_condition_number is None:
+                    self.compute_nullspace_direction(candidate)
+                candidate.cost = (
+                    candidate.base_cost - weight * candidate.reciprocal_condition_number
+                )
+            selected = self.select_collision_free(sorted(viable, key=lambda c: c.cost))
             if selected is not None:
                 return selected, converged, ""
 
@@ -311,7 +313,7 @@ class OnlineIKSolver:
             [],
         )
         if raw is not None:
-            raw = self.finite_q(raw)
+            raw = self.validate_joint_vector(raw)
         if not converged:
             return None, "solver_no_convergence"
         if raw is None:
@@ -319,9 +321,9 @@ class OnlineIKSolver:
         return self.prepare_candidate(raw, name, target, current, previous, pool)
 
     def dynamic_rejection(self, q, current, previous):
-        """Recheck a frozen solution against new feedback without changing its branch."""
+        """Check joint limits and continuity against feedback without changing the target branch."""
         return joint_target_rejection(
-            q, current, previous, self.operational_limits, self._jump_limit
+            q, current, previous, self.operational_limits, self.jump_limit
         )
 
     def prepare_candidate(self, raw, source, target, current, previous, pool):
@@ -337,50 +339,56 @@ class OnlineIKSolver:
         rejection = self.dynamic_rejection(q, current, previous)
         if rejection is not None:
             return None, rejection
-        delta_prev = self.kin.compute_qpos_delta(q, previous)
+        previous_delta = self.kin.compute_qpos_delta(q, previous)
         delta = self.kin.compute_qpos_delta(q, current)
         distance = float(np.max(np.abs(delta)))
-        pos_err, rot_err = compute_pose_error(target, self.kin.compute_eef_pose_base(q))
-        if not np.isfinite((pos_err, rot_err)).all():
+        position_error_m, rotation_error_rad = compute_pose_error(
+            target, self.kin.compute_eef_pose_base(q)
+        )
+        if not np.isfinite((position_error_m, rotation_error_rad)).all():
             raise ValueError("IK FK/pose error is non-finite")
-        p = self.profile
-        if pos_err > p.max_pose_error_pos_m or rot_err > p.max_pose_error_rot_rad:
+        config = self.config
+        if (
+            position_error_m > config.max_pose_error_pos_m
+            or rotation_error_rad > config.max_pose_error_rot_rad
+        ):
             return None, "pose_error"
-        score = (
-            self.weighted_joint_distance(delta, self._weights)
-            + p.previous_command_distance_weight
-            * self.weighted_joint_distance(delta_prev, self._previous_weights)
-            + p.joint_limit_penalty_weight * self.joint_limit_penalty(q)
-            + p.pose_accuracy_weight
+        cost = (
+            self.weighted_joint_distance(delta, self.weights)
+            + config.previous_command_distance_weight
+            * self.weighted_joint_distance(previous_delta, self.previous_weights)
+            + config.joint_limit_penalty_weight * self.joint_limit_penalty(q)
+            + config.pose_accuracy_weight
             * (
-                pos_err / p.max_pose_error_pos_m
-                + p.pose_rotation_weight * rot_err / p.max_pose_error_rot_rad
+                position_error_m / config.max_pose_error_pos_m
+                + config.pose_rotation_weight * rotation_error_rad / config.max_pose_error_rot_rad
             )
         )
-        if not np.isfinite(score):
-            raise ValueError("IK candidate score is non-finite")
+        if not np.isfinite(cost):
+            raise ValueError("IK candidate cost is non-finite")
         return (
             IKCandidate(
                 q,
                 source,
-                pos_err,
-                rot_err,
+                position_error_m,
+                rotation_error_rad,
                 distance,
-                score,
+                cost,
                 bool(
-                    np.min(np.minimum(q - lo, hi - q)) < np.deg2rad(p.joint_limit_search_margin_deg)
+                    np.min(np.minimum(q - lo, hi - q))
+                    < np.deg2rad(config.joint_limit_search_margin_deg)
                 ),
-                score=score,
+                cost=cost,
             ),
             "",
         )
 
     def weighted_joint_distance(self, delta, weights):
-        """LeFranX ranking: weighted squared joint deltas normalized by model ranges."""
-        return float(np.sqrt(np.sum(weights * (delta / self._joint_ranges) ** 2)))
+        """Weighted joint-space norm after normalization by model ranges."""
+        return float(np.sqrt(np.sum(weights * (delta / self.joint_ranges) ** 2)))
 
     def joint_limit_penalty(self, qpos):
-        return float(np.sum(((qpos - self._limit_center) / self._limit_radius) ** 2))
+        return float(np.sum(((qpos - self.limit_center) / self.limit_radius) ** 2))
 
     def collision_free(self, candidate):
         if candidate.collision_free is None:
@@ -393,34 +401,34 @@ class OnlineIKSolver:
                 return candidate
         return None
 
-    def scaled_jacobian_svd(self, candidate):
+    def compute_nullspace_direction(self, candidate):
         jacobian = self.kin.compute_eef_jacobian_base(candidate.qpos)
         if jacobian.shape != (6, 7) or not np.isfinite(jacobian).all():
             raise ValueError("IK Jacobian must be finite shape (6, 7)")
         norms = np.array([np.linalg.norm(jacobian[:3]), np.linalg.norm(jacobian[3:])])
         if not np.isfinite(norms).all():
             raise ValueError("IK Jacobian block norms are non-finite")
-        if np.any(norms <= _NUMERIC_EPS):
-            candidate.singularity_margin = 0.0
+        if np.any(norms <= NUMERIC_EPS):
+            candidate.reciprocal_condition_number = 0.0
             return None
         conditioned = jacobian / np.repeat(norms, 3)[:, None]
         _, sigma, vh = np.linalg.svd(conditioned, full_matrices=True)
         if not np.isfinite(sigma).all() or not np.isfinite(vh).all():
             raise ValueError("conditioned Jacobian SVD is non-finite")
-        rank = int(np.count_nonzero(sigma > _SVD_RANK_RTOL * sigma[0]))
-        candidate.singularity_margin = float(sigma[-1] / max(sigma[0], _NUMERIC_EPS))
+        rank = int(np.count_nonzero(sigma > SVD_RANK_RTOL * sigma[0]))
+        candidate.reciprocal_condition_number = float(sigma[-1] / max(sigma[0], NUMERIC_EPS))
         return vh[-1] if rank == 6 else None
 
-    def make_null_seeds(self, anchor, direction):
+    def generate_nullspace_seeds(self, anchor, direction):
         desired = (
-            np.deg2rad(self.profile.redundancy_seed_step_deg)
+            np.deg2rad(self.config.redundancy_seed_step_deg)
             * direction
             / np.max(np.abs(direction))
         )
         seeds = []
         for sign in (1, -1):
             delta = sign * desired
-            moving = np.abs(delta) > _NUMERIC_EPS
+            moving = np.abs(delta) > NUMERIC_EPS
             room = np.where(
                 delta > 0,
                 self.operational_limits[:, 1] - anchor,

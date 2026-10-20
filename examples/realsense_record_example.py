@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""实时查看 RealSense RGB-D/点云，退出时恢复原曝光优先级。
-
-python examples/realsense_record_example.py
-python examples/realsense_record_example.py --config local.yaml --camera-calibration cameras.json
-
-参数：--config 覆盖相机与处理配置，--camera-calibration 指定点云重建所用相机外参。
-启用点云时才验证对应处理配置与外参；不可用时继续 RGB/Depth 预览。
-"""
+"""实时查看 RealSense RGB-D/点云，退出时恢复原曝光优先级。"""
 
 from __future__ import annotations
 
@@ -22,15 +15,15 @@ import numpy as np
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
-from dexmani_real.sensor.camera.geometry import RGBDGeometry, validate_aligned_depth_distortion
+from dexmani_real.sensor.camera.geometry import CameraIntrinsics, validate_aligned_depth_distortion
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud, build_raw_point_cloud
 from dexmani_real.utils.log import configure_logging
 
 if TYPE_CHECKING:
     from dexmani_real.sensor.camera.realsense import RealSenseCamera
 
-_WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
-_FPS_WINDOW = 100
+WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
+FPS_WINDOW = 100
 
 
 @dataclass
@@ -56,9 +49,9 @@ class PointCloudDisplayState:
 
 class NonBlockingPCDViewer:
     def __init__(self, point_size: float = 3.0) -> None:
-        self._vis: Any | None = None
-        self._pcd: Any | None = None
-        self._frame: Any | None = None
+        self.vis: Any | None = None
+        self.pcd: Any | None = None
+        self.frame: Any | None = None
         self.point_size = point_size
 
     def update(self, points: np.ndarray) -> bool:
@@ -71,34 +64,34 @@ class NonBlockingPCDViewer:
         if points.size and np.any((points[:, 3:] < 0.0) | (points[:, 3:] > 1.0)):
             raise ValueError("viewer RGB values must be within [0,1]")
 
-        if self._pcd is None:
-            self._pcd = o3d.geometry.PointCloud()
-        self._pcd.points = o3d.utility.Vector3dVector(points[:, :3].astype(np.float64))
-        self._pcd.colors = o3d.utility.Vector3dVector(points[:, 3:].astype(np.float64))
+        if self.pcd is None:
+            self.pcd = o3d.geometry.PointCloud()
+        self.pcd.points = o3d.utility.Vector3dVector(points[:, :3].astype(np.float64))
+        self.pcd.colors = o3d.utility.Vector3dVector(points[:, 3:].astype(np.float64))
 
-        if self._vis is None:
-            self._vis = o3d.visualization.Visualizer()
-            self._vis.create_window(window_name="Point Cloud", width=800, height=600)
-            self._vis.add_geometry(self._pcd)
-            self._frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
-            self._vis.add_geometry(self._frame)
-            opt = self._vis.get_render_option()
+        if self.vis is None:
+            self.vis = o3d.visualization.Visualizer()
+            self.vis.create_window(window_name="Point Cloud", width=800, height=600)
+            self.vis.add_geometry(self.pcd)
+            self.frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+            self.vis.add_geometry(self.frame)
+            opt = self.vis.get_render_option()
             opt.point_size = float(self.point_size)
             opt.background_color = np.array([1.0, 1.0, 1.0])
         else:
-            self._vis.update_geometry(self._pcd)
+            self.vis.update_geometry(self.pcd)
 
-        if not self._vis.poll_events():
+        if not self.vis.poll_events():
             return False
-        self._vis.update_renderer()
+        self.vis.update_renderer()
         return True
 
     def close(self) -> None:
-        if self._vis is not None:
-            self._vis.destroy_window()
-        self._vis = None
-        self._pcd = None
-        self._frame = None
+        if self.vis is not None:
+            self.vis.destroy_window()
+        self.vis = None
+        self.pcd = None
+        self.frame = None
 
 
 def overlay_text(
@@ -175,15 +168,14 @@ def build_hud_lines(
     point_count: int,
     state: PointCloudDisplayState,
     total_dropped: int,
-    geometry: RGBDGeometry,
+    intrinsics: CameraIntrinsics,
     production: PointCloudConfig,
 ) -> list[str]:
-    depth_intrinsics = geometry.depth
     lines = [
         f"frame={frame_count}  fps={fps:.1f}",
         f"read={read_ms:.1f}ms  pcd={pcd_ms:.1f}ms  valid={valid_ratio:.3f}",
-        f"depthK=[{depth_intrinsics.fx:.0f},{depth_intrinsics.fy:.0f},"
-        f"{depth_intrinsics.ppx:.0f},{depth_intrinsics.ppy:.0f}]",
+        f"colorK=[{intrinsics.fx:.0f},{intrinsics.fy:.0f},"
+        f"{intrinsics.ppx:.0f},{intrinsics.ppy:.0f}]",
     ]
     if state.show:
         if state.cloud_mode == "raw":
@@ -405,13 +397,13 @@ class RealSenseExample:
 
         self.state = PointCloudDisplayState()
         self.viewer = NonBlockingPCDViewer(point_size=3.0)
-        self.frame_intervals: deque[float] = deque(maxlen=_FPS_WINDOW)
+        self.frame_intervals: deque[float] = deque(maxlen=FPS_WINDOW)
         previous_frame_start = None
         frame_count = 0
         total_dropped = 0
 
         try:
-            geometry = self.camera.get_geometry().aligned_depth_to_color()
+            intrinsics = self.camera.get_geometry().color
             depth_scale_m = self.camera.get_depth_scale()
             if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
                 raise ValueError("display depth scale must be finite and positive")
@@ -457,7 +449,7 @@ class RealSenseExample:
                                 depth_raw=aligned_depth_raw,
                                 color=frame_rgb,
                                 depth_scale_m=depth_scale_m,
-                                geometry=geometry,
+                                intrinsics=intrinsics,
                                 T_xarm_base_from_color=base_from_color,
                             )
                             self.state.cached_cloud = pcd_array
@@ -466,7 +458,7 @@ class RealSenseExample:
                                 depth_raw=aligned_depth_raw,
                                 color=frame_rgb,
                                 depth_scale_m=depth_scale_m,
-                                geometry=geometry,
+                                intrinsics=intrinsics,
                                 T_xarm_base_from_color=base_from_color,
                                 table_plane_abcd=table_plane_abcd,
                                 config=self.production,
@@ -517,11 +509,11 @@ class RealSenseExample:
                     point_count,
                     self.state,
                     total_dropped,
-                    geometry,
+                    intrinsics,
                     self.production,
                 )
                 overlay_text(panel, lines)
-                cv2.imshow(_WINDOW_NAME, panel)
+                cv2.imshow(WINDOW_NAME, panel)
 
                 if self.state.show:
                     live_cloud = (
@@ -545,7 +537,7 @@ class RealSenseExample:
                     break
                 if self.state.show and key in (ord("p"), ord("s")):
                     try:
-                        validate_aligned_depth_distortion(geometry.depth.distortion_model)
+                        validate_aligned_depth_distortion(intrinsics.distortion_model)
                         base_from_color, table_plane_abcd = self.load_pointcloud_geometry(
                             self.state.cloud_mode,
                             self.camera.active_serial,

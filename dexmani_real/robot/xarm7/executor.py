@@ -67,30 +67,30 @@ class ArmChannels:
 class ArmExecutor:
     def __init__(self, cfg, runtime_state, *, driver_factory=None):
         cfg.validate()
-        self.cfg, self.runtime_state, self._factory = cfg, runtime_state, driver_factory
-        self._ctx = mp.get_context("spawn")
-        self._io = ArmChannels(self._ctx)
-        self._pipe, self._child_pipe = self._ctx.Pipe()
-        self._process = None
-        self._sequence = self._operation_id = 0
-        self._operation_unresolved = False
+        self.cfg, self.runtime_state, self.factory = cfg, runtime_state, driver_factory
+        self.ctx = mp.get_context("spawn")
+        self.io = ArmChannels(self.ctx)
+        self.pipe, self.child_pipe = self.ctx.Pipe()
+        self.process = None
+        self.sequence = self.operation_id = 0
+        self.operation_unresolved = False
 
     @property
     def is_connected(self):
         return (
-            self._process is not None and self._process.is_alive() and self._io.connected.is_set()
+            self.process is not None and self.process.is_alive() and self.io.connected.is_set()
         )
 
     @property
     def fault(self):
-        return self._io.fault.value.decode(errors="replace") or None
+        return self.io.fault.value.decode(errors="replace") or None
 
     def connect(self):
         from ruckig import Ruckig
         from dexmani_real.robot.xarm7.worker import run_arm
 
         Ruckig(7)
-        if self._process is not None:
+        if self.process is not None:
             raise RuntimeError("arm executor is single-use")
         if (
             not self.runtime_state.running
@@ -99,32 +99,32 @@ class ArmExecutor:
         ):
             raise RuntimeError("arm startup unauthorized")
         self.runtime_state.arm_authority, self.runtime_state.arm_emergency = (
-            self._io.authority,
-            self._io.emergency,
+            self.io.authority,
+            self.io.emergency,
         )
         # Explicit connect authorizes initialization only, never streaming.
-        self._io.authority.value = -self.runtime_state.run_id
-        self._process = self._ctx.Process(
+        self.io.authority.value = -self.runtime_state.run_id
+        self.process = self.ctx.Process(
             target=run_arm,
-            args=(self.cfg, self._io, self._child_pipe, self._factory),
+            args=(self.cfg, self.io, self.child_pipe, self.factory),
             name="xarm-owner",
             daemon=False,
         )
-        self._process.start()
-        self._child_pipe.close()
-        if not self._io.ready.wait(
+        self.process.start()
+        self.child_pipe.close()
+        if not self.io.ready.wait(
             self.cfg.homing.convergence_timeout_s + self.cfg.executor_timeout_s
         ):
             self.request_stop()
-            self._io.closing.set()
+            self.io.closing.set()
             raise TimeoutError("arm initialization unresolved; owner process may still be in SDK")
         self.check_error()
         self.runtime_state.publish_arm_authority()
 
     def check_error(self):
         issue = self.fault
-        if not issue and self._process is not None and not self._process.is_alive():
-            issue = f"arm owner exited: {self._process.exitcode}"
+        if not issue and self.process is not None and not self.process.is_alive():
+            issue = f"arm owner exited: {self.process.exitcode}"
         if issue:
             self.runtime_state.mark_error()
             self.runtime_state.revoke_motion(SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
@@ -132,7 +132,7 @@ class ArmExecutor:
 
     def snapshot(self):
         self.check_error()
-        status = self._io.read_status()
+        status = self.io.read_status()
         stamp = int(status["frame"]["timestamp_ns"])
         if not status["valid"] or not 0 < stamp <= time.monotonic_ns() < stamp + int(
             self.cfg.feedback_max_age_s * 1e9
@@ -143,27 +143,26 @@ class ArmExecutor:
         return frame
 
     def execution_snapshot(self):
-        """Detached diagnostics remain readable after faults.
-        Stop completion and SDK acceptance are separate; neither proves physical standstill."""
-        status = self._io.read_status()
-        with self._io.goal_lock:
-            pending = int(np.frombuffer(self._io.goal, dtype=GOAL_DTYPE, count=1)["sequence"][0])
+        """Detached diagnostics survive faults; SDK stop acceptance does not prove standstill."""
+        status = self.io.read_status()
+        with self.io.goal_lock:
+            pending = int(np.frombuffer(self.io.goal, dtype=GOAL_DTYPE, count=1)["sequence"][0])
         point = status["point"]
         return dict(
-            submitted=self._sequence,
+            submitted=self.sequence,
             **{name: int(status[name]) for name in COUNTERS},
             active_sequence=int(status["active_sequence"]),
             pending_sequence=pending,
-            stopped=self._io.stopped.is_set(),
+            stopped=self.io.stopped.is_set(),
             connected=self.is_connected,
             stop_request=dict(
                 started_ns=int(status["stop_started_ns"]),
                 completed_ns=int(status["stop_completed_ns"]),
                 sdk_accepted=bool(status["stop_accepted"]),
             ),
-            operation_unresolved=self._operation_unresolved,
+            operation_unresolved=self.operation_unresolved,
             fault=self.fault,
-            close_error=self._io.close_error.value.decode(errors="replace") or None,
+            close_error=self.io.close_error.value.decode(errors="replace") or None,
             timing={name: int(status["stats"][name]) for name in STAT_NAMES},
             last_call={name: point[name].tolist() for name in CALL_DTYPE.names},
         )
@@ -195,41 +194,41 @@ class ArmExecutor:
 
     def update_health(self, *, service_until_ns=None, upstream_until_ns=None, hand_until_ns=None):
         for value, destination in (
-            (service_until_ns, self._io.service_until),
-            (upstream_until_ns, self._io.upstream_until),
-            (hand_until_ns, self._io.hand_until),
+            (service_until_ns, self.io.service_until),
+            (upstream_until_ns, self.io.upstream_until),
+            (hand_until_ns, self.io.hand_until),
         ):
             if value is not None:
                 destination.value = int(value)
 
     def limit_execution_until(self, deadline_ns):
-        limit = self._io.execution_limit
+        limit = self.io.execution_limit
         with limit.get_lock():
             limit[0] = (
-                min(limit[0], int(deadline_ns)) if limit[1] == self._sequence else int(deadline_ns)
+                min(limit[0], int(deadline_ns)) if limit[1] == self.sequence else int(deadline_ns)
             )
-            limit[1] = self._sequence
+            limit[1] = self.sequence
 
     def submit(self, command, *, submit_until_ns, execute_until_ns):
         self.check_error()
         if not self.is_connected:
             raise RuntimeError("arm device unavailable")
-        prepared_run_id = self._io.read_status()["prepared_run_id"]
+        prepared_run_id = self.io.read_status()["prepared_run_id"]
         goal = np.zeros((), dtype=GOAL_DTYPE)
         goal[()] = (
-            self._sequence + 1,
+            self.sequence + 1,
             command.run_id,
             submit_until_ns,
             execute_until_ns,
             command.arm_qpos,
         )
-        with self._io.goal_lock:
+        with self.io.goal_lock:
             # Both IPC waits precede this fence. Revoked jog epochs are never reused.
             if (
-                self._io.closing.is_set()
-                or self._io.stop.is_set()
-                or self._io.emergency.is_set()
-                or self._io.authority.value != command.run_id
+                self.io.closing.is_set()
+                or self.io.stop.is_set()
+                or self.io.emergency.is_set()
+                or self.io.authority.value != command.run_id
             ):
                 raise DispatchError(
                     "arm target authority revoked", DispatchResult(),
@@ -242,15 +241,15 @@ class ArmExecutor:
                 )
             if prepared_run_id != command.run_id:
                 raise RuntimeError("arm target epoch was not prepared")
-            slot = np.frombuffer(self._io.goal, dtype=GOAL_DTYPE, count=1)
+            slot = np.frombuffer(self.io.goal, dtype=GOAL_DTYPE, count=1)
             if slot["sequence"][0]:
                 raise RuntimeError("arm target slot is full")
             slot[0] = goal
-            self._sequence += 1
-        return (int(command.run_id), self._sequence)
+            self.sequence += 1
+        return (int(command.run_id), self.sequence)
 
     def receive_reply(self, identity):
-        reply = self._pipe.recv()
+        reply = self.pipe.recv()
         if not isinstance(reply, LifecycleReply) or reply.operation_id != identity:
             raise RuntimeError("arm lifecycle reply mismatch")
         if not isinstance(reply.status, OperationStatus):
@@ -258,27 +257,27 @@ class ArmExecutor:
         return reply
 
     def operation(self, kind, epoch, *, service, abort, timeout_s, waypoints=None, target=None):
-        if self._operation_unresolved and self._pipe.poll():
-            self.receive_reply(self._operation_id)
-            self._operation_unresolved = False
-        if not self.is_connected or self._operation_unresolved:
+        if self.operation_unresolved and self.pipe.poll():
+            self.receive_reply(self.operation_id)
+            self.operation_unresolved = False
+        if not self.is_connected or self.operation_unresolved:
             raise RuntimeError(f"arm {kind}: owner unavailable or previous operation unresolved")
-        self._operation_id += 1
-        identity = self._operation_id
+        self.operation_id += 1
+        identity = self.operation_id
         service()
         if abort():
             raise OperationCancelled(f"{kind} authority revoked")
-        self._io.cancel_operation.clear()
+        self.io.cancel_operation.clear()
         request = (
             PrepareRequest(identity, epoch)
             if kind == "prepare"
             else HomeRequest(identity, epoch, waypoints, target)
         )
-        self._pipe.send(request)
+        self.pipe.send(request)
         deadline = time.monotonic() + timeout_s
         service_due, received = 0, False
         try:
-            while not self._pipe.poll(0.005):
+            while not self.pipe.poll(0.005):
                 now = time.monotonic()
                 if now >= service_due:
                     service()  # XHand/input service remains exclusively in the parent.
@@ -294,9 +293,9 @@ class ArmExecutor:
             if reply.status is OperationStatus.FAILED:
                 raise RuntimeError(reply.detail)
         except BaseException:
-            self._io.cancel_operation.set()
+            self.io.cancel_operation.set()
             self.request_stop()
-            self._operation_unresolved = not received
+            self.operation_unresolved = not received
             raise
 
     def prepare(self, epoch, *, service, abort):
@@ -324,43 +323,43 @@ class ArmExecutor:
         )
 
     def request_stop(self):
-        self._io.authority.value = 0
+        self.io.authority.value = 0
         if self.runtime_state.estop_request:
-            self._io.emergency.set()
-        self._io.stopped.clear()
-        self._io.stop.set()
+            self.io.emergency.set()
+        self.io.stopped.clear()
+        self.io.stop.set()
 
     def wait_stopped(self):
         deadline = time.monotonic() + self.cfg.executor_timeout_s
-        if self._process is not None and self._process.is_alive():
-            if not self._io.stopped.wait(self.cfg.executor_timeout_s):
+        if self.process is not None and self.process.is_alive():
+            if not self.io.stopped.wait(self.cfg.executor_timeout_s):
                 raise TimeoutError(
                     "arm stop unresolved; SDK acceptance/physical stop not confirmed"
                 )
-            if self._operation_unresolved:
-                if not self._pipe.poll(max(0, deadline - time.monotonic())):
+            if self.operation_unresolved:
+                if not self.pipe.poll(max(0, deadline - time.monotonic())):
                     raise TimeoutError(
                         "arm stopped but cancelled lifecycle operation remains unresolved"
                     )
-                self.receive_reply(self._operation_id)
-                self._operation_unresolved = False
-        elif self._process is not None and self._process.exitcode not in (None, 0):
+                self.receive_reply(self.operation_id)
+                self.operation_unresolved = False
+        elif self.process is not None and self.process.exitcode not in (None, 0):
             raise RuntimeError(
-                f"arm owner exited without confirming stop: {self._process.exitcode}"
+                f"arm owner exited without confirming stop: {self.process.exitcode}"
             )
-        if self._io.close_error.value:
-            raise RuntimeError(self._io.close_error.value.decode(errors="replace"))
+        if self.io.close_error.value:
+            raise RuntimeError(self.io.close_error.value.decode(errors="replace"))
 
     def close(self):
         self.request_stop()
-        self._io.closing.set()
-        if self._process is not None and self._process.pid is not None:
-            self._process.join(self.cfg.executor_timeout_s)
-            if self._process.is_alive():
+        self.io.closing.set()
+        if self.process is not None and self.process.pid is not None:
+            self.process.join(self.cfg.executor_timeout_s)
+            if self.process.is_alive():
                 raise TimeoutError("arm owner process still active; stop/disconnect unresolved")
-            if self._process.exitcode != 0:
-                raise RuntimeError(f"arm owner abnormal exit: {self._process.exitcode}")
-        self._pipe.close()
-        self._child_pipe.close()
-        if self._io.close_error.value:
-            raise RuntimeError(self._io.close_error.value.decode(errors="replace"))
+            if self.process.exitcode != 0:
+                raise RuntimeError(f"arm owner abnormal exit: {self.process.exitcode}")
+        self.pipe.close()
+        self.child_pipe.close()
+        if self.io.close_error.value:
+            raise RuntimeError(self.io.close_error.value.decode(errors="replace"))

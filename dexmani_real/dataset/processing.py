@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.dataset.contracts import ProcessingConfig
+from dexmani_real.dataset.schema import ProcessingConfig
 from dexmani_real.dataset.pointcloud import (
     RawEpisodeCameraModel,
     load_raw_episode_base_from_color,
@@ -18,12 +18,42 @@ from dexmani_real.planning.kinematics.arm_fk import (
 )
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
-from dexmani_real.recording.storage.schema import DATASET_SPECS, validate_training_rows
+from dexmani_real.recording.storage.schema import (
+    DATASET_SPECS,
+    validate_capture_rows,
+    validate_dispatch_rows,
+)
 from dexmani_real.sensor.camera.geometry import (
     camera_parameters_cv,
     validate_aligned_depth_distortion,
 )
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud
+from dexmani_real.utils.timing import sampling_clock_ns
+
+
+def validate_training_rows(timestamp, dispatch_status, control_hz) -> tuple[str, ...]:
+    """Whole-episode admission only; failed evidence remains readable as Raw."""
+    errors = validate_capture_rows(timestamp, dispatch_status)
+    if errors:
+        return errors
+    dt_ns, epsilon_ns = sampling_clock_ns(control_hz)
+    # Raw seconds originate from integer ns; round only representation error.
+    stamps = np.rint(np.asarray(timestamp) * 1e9)
+    intervals = np.diff(stamps)
+    deviations = stamps - np.arange(len(stamps)) * dt_ns
+    bad_interval = np.flatnonzero(np.abs(intervals - dt_ns) > epsilon_ns)
+    bad_grid = np.flatnonzero(np.abs(deviations) > epsilon_ns)
+    bad_rows = [int(bad_interval[0]) + 1] if len(bad_interval) else []
+    if len(bad_grid):
+        bad_rows.append(int(bad_grid[0]))
+    if bad_rows:
+        row = min(bad_rows)
+        return (
+            f"timing row {row}: interval_ns={intervals[row - 1]:.0f}, "
+            f"nominal_ns={dt_ns}, grid_deviation_ns={deviations[row]:.0f}, "
+            f"tolerance_ns={epsilon_ns}",
+        )
+    return validate_dispatch_rows(dispatch_status)
 
 
 def validate_export_episode(
@@ -51,8 +81,7 @@ def validate_export_episode(
     )
     if errors:
         raise RawDataError("; ".join(errors))
-    timing = reader.read_timing()
-    reader.validate_arm_execution(timing["rows"])
+    reader.validate_arm_execution()
     if frames == 1:
         logging.getLogger(__name__).warning(
             "%s: single row, no sampling interval to verify", reader.path
@@ -126,8 +155,8 @@ class CanonicalEpisodeProcessor:
                 poses,
                 hand,
                 hand_fk=self.hand_fk,
-                handbase_position_eef_m=np.asarray(self.config.handbase_position_eef_m),
-                handbase_quat_eef_wxyz=np.asarray(self.config.handbase_quat_eef_wxyz),
+                handbase_position_eef_m=self.config.handbase_position_eef_m,
+                handbase_quat_eef_wxyz=self.config.handbase_quat_eef_wxyz,
             )
             block = {
                 "joint_state": np.concatenate((arm, hand), axis=1).astype(np.float32),
@@ -156,7 +185,7 @@ class CanonicalEpisodeProcessor:
                     depth_raw=depth[offset],
                     color=image,
                     depth_scale_m=camera.depth_scale_m,
-                    geometry=camera.geometry,
+                    intrinsics=camera.geometry.color,
                     T_xarm_base_from_color=base_from_color,
                     table_plane_abcd=self.config.table_plane_abcd,
                     config=self.config.pointcloud,

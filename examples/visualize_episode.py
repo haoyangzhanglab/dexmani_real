@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
-"""离线查看 Raw episode 的观测与点云，或输出数据概要。
-
-python examples/visualize_episode.py episodes/test/episode_001 --info
-python examples/visualize_episode.py episodes/test/episode_001 --max-frames 100 --config local.yaml
-
-参数：--info 仅打印概要，--max-frames 限制帧数，--config 指定当前点云与手部几何配置。
-"""
+"""离线查看 Raw episode 的观测与点云，或输出数据概要。"""
 
 from __future__ import annotations
 
-import logging
 import argparse
+import logging
 import os
 import time
 from dataclasses import replace
@@ -38,11 +32,11 @@ from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
 logger = logging.getLogger("dexmani_real.cli.visualize_episode")
 
 
-_SERIES_GROUPS = {
+SERIES_GROUPS = {
     "state": ("arm_effort", "arm_qpos", "arm_qvel", "hand_current", "hand_qpos"),
     "action": ("action_arm_joint_target", "action_hand_joint_target"),
 }
-_FORCE_SERIES = {
+FORCE_SERIES = {
     "hand_contact_mag": (
         "thumb (SDK-scaled)",
         "index (SDK-scaled)",
@@ -54,7 +48,7 @@ _FORCE_SERIES = {
     "hand_force_index": ("Fx", "Fy", "Fz"),
 }
 
-_FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
+FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
     (255, 60, 60),  # thumb  — red
     (60, 255, 60),  # index  — green
     (60, 120, 255),  # middle — blue
@@ -62,7 +56,7 @@ _FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
     (220, 60, 255),  # pinky  — magenta
 )
 # Fixed, easily distinguishable from the five finger colors.
-_EEF_COLOR = (255, 255, 255)
+EEF_COLOR = (255, 255, 255)
 
 
 def eef_position_or_none(eef_row: np.ndarray) -> np.ndarray | None:
@@ -74,7 +68,7 @@ def eef_position_or_none(eef_row: np.ndarray) -> np.ndarray | None:
 
 def fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None:
     row = np.asarray(fingertip_row, dtype=np.float32)
-    if row.ndim != 2 or row.shape != HAND_FINGERTIP_SHAPE or not np.all(np.isfinite(row)):
+    if row.shape != HAND_FINGERTIP_SHAPE or not np.all(np.isfinite(row)):
         return None
     return row
 
@@ -129,10 +123,10 @@ class EpisodeVisualizer:
         import rerun.blueprint as rrb
 
         episode_name = Path(episode_path).stem
-        self._fingertip_link_names = fingertip_link_names
-        self._reader = EpisodeReader(episode_path)
+        self.fingertip_link_names = fingertip_link_names
+        self.reader = EpisodeReader(episode_path)
         try:
-            self._reader.require_fields(
+            self.reader.require_fields(
                 "rgb",
                 "depth",
                 "arm_qpos",
@@ -146,58 +140,58 @@ class EpisodeVisualizer:
                 "timestamp",
             )
 
-            self._T = self.resolve_frame_count(max_frames)
-            self._rgb_frames = iter(self._reader.iter_rgb_frames())
+            self.frame_count = self.resolve_frame_count(max_frames)
+            self.rgb_frames = iter(self.reader.iter_rgb_frames())
             self.rgb = None
-            self._rgb_index = -1
-            meta = self._reader.meta
-            self._camera_model = load_raw_episode_camera_model(self._reader)
-            self._camera_K = self._camera_model.geometry.color.matrix()
-            self._depth_meter = 1.0 / self._camera_model.depth_scale_m
-            self._T_xarm_base_from_color = (
-                load_raw_episode_base_from_color(self._reader)
+            self.rgb_index = -1
+            meta = self.reader.meta
+            self.camera_model = load_raw_episode_camera_model(self.reader)
+            self.camera_K = self.camera_model.geometry.color.matrix()
+            self.depth_meter = 1.0 / self.camera_model.depth_scale_m
+            self.T_xarm_base_from_color = (
+                load_raw_episode_base_from_color(self.reader)
                 if "camera_T_xarm_base_from_color" in meta
                 else None
             )
-            if self._T_xarm_base_from_color is None:
+            if self.T_xarm_base_from_color is None:
                 logger.warning("No camera extrinsics: displaying pixels without point cloud")
-            self._handbase_position_eef_m = np.asarray(handbase_position_eef_m, dtype=np.float64)
-            self._handbase_quat_eef_wxyz = validate_unit_quaternion_wxyz(
+            self.handbase_position_eef_m = np.asarray(handbase_position_eef_m, dtype=np.float64)
+            self.handbase_quat_eef_wxyz = validate_unit_quaternion_wxyz(
                 handbase_quat_eef_wxyz, name="hand base quaternion"
             )
-            self._pointcloud_config = None
-            self._table_plane_abcd = table_plane_abcd
-            self._empty_pointcloud_frames = 0
-            self._pointcloud_processing_ns = 0
-            self._pointcloud_processed_frames = 0
-            if point_cloud and self._T_xarm_base_from_color is not None:
+            self.pointcloud_config = None
+            self.table_plane_abcd = table_plane_abcd
+            self.empty_cloud_count = 0
+            self.pointcloud_processing_ns = 0
+            self.pointcloud_processed_frames = 0
+            if point_cloud and self.T_xarm_base_from_color is not None:
                 if pointcloud_config is None:
                     raise ValueError("point-cloud visualization requires resolved config")
                 validate_aligned_depth_distortion(
-                    self._camera_model.geometry.color.distortion_model
+                    self.camera_model.geometry.color.distortion_model
                 )
-                self._pointcloud_config = pointcloud_config
+                self.pointcloud_config = pointcloud_config
                 logger.info(
                     "Canonical point cloud enabled: N=%d table=%s",
                     pointcloud_config.num_points,
                     "enabled" if table_plane_abcd is not None else "disabled",
                 )
 
-            logger.info("Frames=%d", self._T)
+            logger.info("Frames=%d", self.frame_count)
 
             self.state = self.preload_state()
 
-            self._blueprint = self.build_blueprint()
+            self.blueprint = self.build_blueprint()
             app_id = f"DexMani - {episode_name}"
             rec_id = f"{episode_name}-{time.time_ns()}"
             rr.init(
                 app_id,
                 recording_id=rec_id,
                 spawn=True,
-                default_blueprint=self._blueprint,
+                default_blueprint=self.blueprint,
             )
             rr.send_blueprint(
-                blueprint=self._blueprint
+                blueprint=self.blueprint
             )  # force-override any cached blueprint for this app_id
             self.log_static()
         except BaseException:
@@ -205,7 +199,7 @@ class EpisodeVisualizer:
             raise
 
     def resolve_frame_count(self, max_frames: int | None) -> int:
-        raw = self._reader.num_frames
+        raw = self.reader.num_frames
         if raw <= 0:
             raise ValueError("episode /meta num_frames must be positive")
         if max_frames is not None:
@@ -214,28 +208,28 @@ class EpisodeVisualizer:
 
     def preload_state(self) -> dict[str, np.ndarray]:
         state = {
-            key: self._reader[key][: self._T] for keys in _SERIES_GROUPS.values() for key in keys
+            key: self.reader[key][: self.frame_count] for keys in SERIES_GROUPS.values() for key in keys
         }
 
         arm = state["arm_qpos"]
         hand = state["hand_qpos"]
         arm_valid = np.all(np.isfinite(arm), axis=1)
         hand_valid = arm_valid & np.all(np.isfinite(hand), axis=1)
-        state["arm_ee"] = np.full((self._T, 9), np.nan)
-        state["hand_fingertip"] = np.full((self._T, 5, 3), np.nan, dtype=np.float32)
+        state["arm_ee"] = np.full((self.frame_count, 9), np.nan)
+        state["hand_fingertip"] = np.full((self.frame_count, 5, 3), np.nan, dtype=np.float32)
         if np.any(arm_valid):
             state["arm_ee"][arm_valid] = compute_eef_pose_history_xarm_base(arm[arm_valid])
         if np.any(hand_valid):
-            hand_fk = HandKinematics(str(XHAND_RIGHT_URDF_PATH), list(self._fingertip_link_names))
+            hand_fk = HandKinematics(str(XHAND_RIGHT_URDF_PATH), self.fingertip_link_names)
             state["hand_fingertip"][hand_valid] = compute_fingertip_history_xarm_base(
                 state["arm_ee"][hand_valid],
                 hand[hand_valid],
                 hand_fk=hand_fk,
-                handbase_position_eef_m=self._handbase_position_eef_m,
-                handbase_quat_eef_wxyz=self._handbase_quat_eef_wxyz,
+                handbase_position_eef_m=self.handbase_position_eef_m,
+                handbase_quat_eef_wxyz=self.handbase_quat_eef_wxyz,
             )
 
-        contact = self._reader["hand_contact"][: self._T]
+        contact = self.reader["hand_contact"][: self.frame_count]
         state["hand_contact_mag"] = np.linalg.norm(contact, axis=2)
         state["hand_force_thumb"] = contact[:, 0, :]
         state["hand_force_index"] = contact[:, 1, :]
@@ -244,9 +238,9 @@ class EpisodeVisualizer:
 
     def build_blueprint(self) -> rrb.Blueprint:
         ts_verticals = []
-        for category, keys in _SERIES_GROUPS.items():
+        for category, keys in SERIES_GROUPS.items():
             if category == "state":
-                keys = (*keys, *_FORCE_SERIES)
+                keys = (*keys, *FORCE_SERIES)
             views = [rrb.TimeSeriesView(origin=f"{category}/{key}", name=key) for key in keys]
             ts_verticals.append(rrb.Vertical(contents=views, name=category.title()))
         return rrb.Blueprint(
@@ -262,7 +256,7 @@ class EpisodeVisualizer:
         )
 
     def log_static(self) -> None:
-        for category, keys in _SERIES_GROUPS.items():
+        for category, keys in SERIES_GROUPS.items():
             for key in keys:
                 arr = self.state[key]
                 base = f"{category}/{key}"
@@ -272,11 +266,11 @@ class EpisodeVisualizer:
                     for i in range(arr.shape[1]):
                         rr.log(f"{base}/{i}", rr.SeriesLine(name=f"{i}"), static=True)
 
-        h, w = self._camera_model.geometry.color.height, self._camera_model.geometry.color.width
+        h, w = self.camera_model.geometry.color.height, self.camera_model.geometry.color.width
         rr.log(
             "camera/color",
             rr.Pinhole(
-                image_from_camera=self._camera_K,
+                image_from_camera=self.camera_K,
                 resolution=[w, h],
                 camera_xyz=rr.ViewCoordinates.RDF,
                 image_plane_distance=1.25,
@@ -284,23 +278,23 @@ class EpisodeVisualizer:
             static=True,
         )
         logger.info("Camera pinhole logged (%dx%d)", w, h)
-        if self._T_xarm_base_from_color is not None:
+        if self.T_xarm_base_from_color is not None:
             rr.log(
                 "camera/color",
                 rr.Transform3D(
-                    translation=self._T_xarm_base_from_color[:3, 3],
-                    mat3x3=self._T_xarm_base_from_color[:3, :3],
+                    translation=self.T_xarm_base_from_color[:3, 3],
+                    mat3x3=self.T_xarm_base_from_color[:3, :3],
                 ),
                 static=True,
             )
 
-        for key, labels in _FORCE_SERIES.items():
+        for key, labels in FORCE_SERIES.items():
             for i, label in enumerate(labels):
                 rr.log(f"state/{key}/{i}", rr.SeriesLine(name=label), static=True)
 
     def log_step(self, step_idx: int) -> None:
         rr.set_time_sequence("step", step_idx)
-        rr.set_time_seconds("time", float(self._reader["timestamp"][step_idx]))
+        rr.set_time_seconds("time", float(self.reader["timestamp"][step_idx]))
         depth = self.log_camera(step_idx)
         self.log_pointcloud(depth)
         self.log_fingertips(step_idx)
@@ -308,41 +302,41 @@ class EpisodeVisualizer:
         self.log_time_series(step_idx)
 
     def log_camera(self, step_idx: int) -> np.ndarray:
-        if step_idx != self._rgb_index + 1:
+        if step_idx != self.rgb_index + 1:
             raise ValueError("viewer reads frames sequentially")
-        self.rgb = next(self._rgb_frames, None)
+        self.rgb = next(self.rgb_frames, None)
         if self.rgb is None:
             raise ValueError(f"RGB missing at frame {step_idx}")
-        self._rgb_index = step_idx
-        depth = np.asarray(self._reader["depth"][step_idx])
+        self.rgb_index = step_idx
+        depth = np.asarray(self.reader["depth"][step_idx])
         rr.log("camera/color/rgb", rr.Image(self.rgb))
         rr.log(
             "depth/image",
             rr.DepthImage(
                 depth,
-                meter=self._depth_meter,
+                meter=self.depth_meter,
                 depth_range=(0, 10000),  # Clamp outliers to stabilize the colormap.
             ),
         )
         return depth
 
     def log_pointcloud(self, depth: np.ndarray) -> None:
-        if self._pointcloud_config is None:
+        if self.pointcloud_config is None:
             return
         started_ns = time.perf_counter_ns()
         cloud = build_point_cloud(
             depth_raw=depth,
             color=self.rgb,
-            depth_scale_m=self._camera_model.depth_scale_m,
-            geometry=self._camera_model.geometry,
-            T_xarm_base_from_color=self._T_xarm_base_from_color,
-            table_plane_abcd=self._table_plane_abcd,
-            config=self._pointcloud_config,
+            depth_scale_m=self.camera_model.depth_scale_m,
+            intrinsics=self.camera_model.geometry.color,
+            T_xarm_base_from_color=self.T_xarm_base_from_color,
+            table_plane_abcd=self.table_plane_abcd,
+            config=self.pointcloud_config,
         )
-        self._pointcloud_processing_ns += time.perf_counter_ns() - started_ns
-        self._pointcloud_processed_frames += 1
+        self.pointcloud_processing_ns += time.perf_counter_ns() - started_ns
+        self.pointcloud_processed_frames += 1
         if cloud is None:
-            self._empty_pointcloud_frames += 1
+            self.empty_cloud_count += 1
             rr.log("pcd", rr.Clear(recursive=False))
             return
         colors = (cloud[:, 3:] * 255.0).astype(np.uint8)
@@ -362,7 +356,7 @@ class EpisodeVisualizer:
             "fingertips",
             rr.Points3D(
                 positions=fp,
-                colors=np.array(_FINGERTIP_COLORS, dtype=np.uint8),
+                colors=np.array(FINGERTIP_COLORS, dtype=np.uint8),
                 radii=0.012,
             ),
         )
@@ -377,13 +371,13 @@ class EpisodeVisualizer:
             "eef",
             rr.Points3D(
                 positions=position[None, :],
-                colors=np.array([_EEF_COLOR], dtype=np.uint8),
+                colors=np.array([EEF_COLOR], dtype=np.uint8),
                 radii=0.020,  # EEF sphere is intentionally larger than fingertips
             ),
         )
 
     def log_time_series(self, step_idx: int) -> None:
-        for category, keys in _SERIES_GROUPS.items():
+        for category, keys in SERIES_GROUPS.items():
             for key in keys:
                 arr = self.state[key]
                 base = f"{category}/{key}"
@@ -393,30 +387,30 @@ class EpisodeVisualizer:
                     for i in range(arr.shape[1]):
                         rr.log(f"{base}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
-        for key in _FORCE_SERIES:
+        for key in FORCE_SERIES:
             arr = self.state[key]
             for i in range(arr.shape[1]):
                 rr.log(f"state/{key}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
     @property
     def num_steps(self) -> int:
-        return self._T
+        return self.frame_count
 
     @property
     def empty_pointcloud_frames(self) -> int:
-        return self._empty_pointcloud_frames
+        return self.empty_cloud_count
 
     @property
     def mean_pointcloud_processing_ms(self) -> float | None:
         """Mean cloud derivation time, excluding depth reads and viewer logging."""
-        if self._pointcloud_processed_frames == 0:
+        if self.pointcloud_processed_frames == 0:
             return None
-        return self._pointcloud_processing_ns / self._pointcloud_processed_frames / 1e6
+        return self.pointcloud_processing_ns / self.pointcloud_processed_frames / 1e6
 
     def close(self) -> None:
-        if self._reader is not None:
-            self._reader.close()
-            self._reader = None  # type: ignore[assignment]
+        if self.reader is not None:
+            self.reader.close()
+            self.reader = None  # type: ignore[assignment]
         try:
             rr.disconnect()
         except Exception:

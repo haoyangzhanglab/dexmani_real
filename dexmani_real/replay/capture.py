@@ -12,7 +12,7 @@ class ReplayRecorder:
 
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
-        self._count = 0
+        self.count = 0
         self.arm_qpos = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
         self.arm_cmd = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
         self.arm_observation_ns = np.full(capacity, -1, dtype=np.int64)
@@ -35,7 +35,7 @@ class ReplayRecorder:
         submit_completed_ns: int = -1,
     ) -> None:
         """Append one physical row; unavailable commands remain NaN with factual dispatch."""
-        if idx != self._count or idx >= self.capacity:
+        if idx != self.count or idx >= self.capacity:
             raise ValueError("replay rows must be sequential and within capacity")
         self.dispatch_status[idx] = int(dispatch.arm), int(dispatch.hand)
         self.command_ids[idx] = dispatch.command_id
@@ -50,11 +50,11 @@ class ReplayRecorder:
         self.hand_qpos[idx] = row.hand["qpos"][0]
         if dispatch.hand:
             self.hand_cmd[idx] = command.hand_qpos
-        self._count = idx + 1
+        self.count = idx + 1
 
     def to_dict(self) -> dict[str, np.ndarray]:
         """Copy the physical prefix with NaN EEF fields pending offline derivation."""
-        count = self._count
+        count = self.count
         return {
             "dispatch_status": self.dispatch_status[:count].copy(),
             "command_ids": self.command_ids[:count].copy(),

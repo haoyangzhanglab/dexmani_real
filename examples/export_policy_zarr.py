@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""离线将完整 Raw episode 导出为可重建的全模态 Canonical Zarr 缓存。
-
-python examples/export_policy_zarr.py episodes/test
-python examples/export_policy_zarr.py episodes/test --config local.yaml --output datasets/test_new.zarr
-
-参数：--output 指定新缓存路径，--config 覆盖处理配置，--exclude 排除指定 episode。
-"""
+"""离线将完整 Raw episode 导出为可重建的全模态 Canonical Zarr 缓存。"""
 
 from __future__ import annotations
 
@@ -19,13 +13,16 @@ import yaml
 from tqdm import tqdm
 
 from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
-from dexmani_real.dataset.contracts import ProcessingConfig
+from dexmani_real.dataset.schema import ProcessingConfig
 from dexmani_real.dataset.export import CanonicalExporter
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Export complete Raw episodes to a canonical multimodal Zarr; reject incomplete episodes as a whole."
+        description=(
+            "Export complete Raw episodes to a canonical multimodal Zarr; "
+            "reject incomplete episodes as a whole."
+        )
     )
     parser.add_argument(
         "input_root",

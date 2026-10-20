@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""在真机上按标称节拍回放 teleop Raw 关节目标，并保存回放结果。
-
-python examples/replay_episode.py episodes/test/episode_001
-python examples/replay_episode.py episodes/test/episode_001 --config local.yaml --output replay_results/test
-
-参数：episode 是已发布 Raw 目录；--config 覆盖配置，--output 指定新建或空结果目录。
-"""
+"""在真机上按标称节拍回放 teleop Raw 关节目标，并保存回放结果。"""
 
 from __future__ import annotations
 

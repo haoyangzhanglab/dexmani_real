@@ -9,7 +9,7 @@ from enum import Enum
 import numpy as np
 
 from dexmani_real.planning.paths import wrap_nearest_equivalent
-from dexmani_real.planning.admission import TargetAdmission
+from dexmani_real.planning.target import TargetChecker
 from dexmani_real.planning.collision import CollisionModel
 from dexmani_real.replay.capture import ReplayRecorder
 from dexmani_real.recording.storage.schema import ARM_EXECUTION_FORMAT, validate_execution_boundary
@@ -64,7 +64,7 @@ class TrajectoryReplayer:
         self.capture = ReplayRecorder(trajectory.num_frames)
         arm_start = self.robot.arm.execution_snapshot()
         control_metadata = self.robot.arm.execution_metadata(1 / trajectory.fps)
-        self.admission = TargetAdmission(
+        self.target_checker = TargetChecker(
             self.runtime, CollisionModel(static_boxes=self.runtime.environment.static_boxes)
         )
         self.previous_arm = None
@@ -157,7 +157,7 @@ class TrajectoryReplayer:
                         qpos_min_rad=self.runtime.hand.qpos_min_rad,
                         qpos_max_rad=self.runtime.hand.qpos_max_rad,
                     )
-                    rejection = self.admission.rejection(
+                    rejection = self.target_checker.rejection(
                         arm,
                         row.arm["qpos"][0],
                         self.previous_arm,
@@ -418,7 +418,7 @@ class TrajectoryReplayer:
                     if step == steps
                     else hand_start + weight * (hand_target - hand_start)
                 )
-                rejection = self.admission.rejection(
+                rejection = self.target_checker.rejection(
                     arm_hold,
                     row.arm["qpos"][0],
                     arm_hold,

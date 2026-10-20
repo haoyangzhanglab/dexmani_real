@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 # Vendor error titles and recovery actions; startup errors are never cleared implicitly.
-_CONTROLLER_ERROR_HELP: dict[int, str] = {
+CONTROLLER_ERROR_HELP: dict[int, str] = {
     1: "Emergency Stop button pressed — release the E-stop button, then re-enable the robot",
     2: "Emergency IO of the control box triggered — ground the two EI pins, then re-enable the robot",
     3: "Three-state switch E-stop pressed — release the three-state switch, then re-enable the robot",
@@ -51,7 +51,7 @@ def describe_controller_error(code: int) -> str:
     code = int(code)
     if 11 <= code <= 17:
         return f"servo motor {code - 10} error"
-    return _CONTROLLER_ERROR_HELP.get(code, "controller error")
+    return CONTROLLER_ERROR_HELP.get(code, "controller error")
 
 
 def read_live_state_and_error(arm_api: Any) -> LiveStateError:
@@ -124,11 +124,11 @@ class XArm7:
     def __init__(self, cfg: ArmParams) -> None:
         cfg.validate()
         self.cfg = cfg
-        self._api: Any = None
+        self.api: Any = None
 
     @property
     def is_connected(self) -> bool:
-        return self._api is not None and bool(self._api.connected)
+        return self.api is not None and bool(self.api.connected)
 
     def connect(self) -> None:
         """Connect and inspect; enabling/mode changes belong to explicit initialize/prepare."""
@@ -138,7 +138,7 @@ class XArm7:
                 from xarm.wrapper import XArmAPI
 
                 logging.getLogger("origin.print").setLevel(logging.WARNING)
-                self._api = XArmAPI(self.cfg.ip, is_radian=True)
+                self.api = XArmAPI(self.cfg.ip, is_radian=True)
         except Exception as exc:
             vendor_detail = sdk_connect_output.text if sdk_connect_output is not None else ""
             raise RuntimeError(
@@ -149,7 +149,7 @@ class XArm7:
         if sdk_diagnostics:
             logger.warning("xArm SDK initialization diagnostics:\n%s", "\n".join(sdk_diagnostics))
 
-        self._api.set_timeout(self.cfg.sdk_timeout_s)
+        self.api.set_timeout(self.cfg.sdk_timeout_s)
         self.wait_for_axis_report()
         self.check_controller_error()
 
@@ -158,47 +158,47 @@ class XArm7:
         check_abort()
         self.check_controller_error()
         check_abort()
-        check_sdk_return_code(self._api.motion_enable(True), "startup motion_enable")
+        check_sdk_return_code(self.api.motion_enable(True), "startup motion_enable")
         self.enter_mode0(check_abort=check_abort)
         check_abort()
         self.apply_config()
 
     def stop(self) -> int:
         """Request State 4 without confirmation polling; checked SDK acceptance is not physical standstill."""
-        if self._api is None:
+        if self.api is None:
             raise RuntimeError("stop has no connected SDK owner")
         # The vendor emergency_stop helper discards return codes; all stops use this checked primitive.
-        code = self._api.set_state(4)
+        code = self.api.set_state(4)
         check_sdk_return_code(code, "stop set_state(4)")
         return int(code)
 
     def close(self) -> None:
         """Disconnect and propagate SDK errors to the runtime cleanup owner."""
-        if self._api is None:
+        if self.api is None:
             return
-        self._api.disconnect()
-        self._api = None
+        self.api.disconnect()
+        self.api = None
 
     def read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Read radians, rad/s and SDK-native effort; auxiliary effort may be NaN, joint/SDK failures raise."""
-        code, states = self._api.get_joint_states(is_radian=True, num=3)
+        code, states = self.api.get_joint_states(is_radian=True, num=3)
         return decode_joint_states(code, states)
 
     def servo(self, qpos: np.ndarray) -> int:
         """One Mode-1 reference; speed/acceleration arguments do not plan this path."""
-        return self._api.set_servo_angle_j(angles=qpos.tolist(), is_radian=True)
+        return self.api.set_servo_angle_j(angles=qpos.tolist(), is_radian=True)
 
     def read_status(self):
-        return read_live_state_and_error(self._api)
+        return read_live_state_and_error(self.api)
 
     @property
     def mode(self):
         """SDK report cache, not a timestamped joint observation or synchronous query."""
-        return int(self._api.mode)
+        return int(self.api.mode)
 
     def move_home_milestone(self, target: np.ndarray) -> None:
         """Submit one prevalidated Mode-0 milestone; arrival belongs to the child owner."""
-        code = self._api.set_servo_angle(
+        code = self.api.set_servo_angle(
             angle=target,
             is_radian=True,
             speed=self.cfg.homing.max_speed_rad_per_s,
@@ -210,15 +210,15 @@ class XArm7:
 
     def enter_mode0(self, *, check_abort: Callable[[], None]) -> None:
         """Enter Mode 0 (MoveJoint) and wait for a movable state; raise on failure."""
-        enter_mode(self._api, 0, check_abort=check_abort)
+        enter_mode(self.api, 0, check_abort=check_abort)
 
     def enter_mode1(self, *, check_abort: Callable[[], None]) -> None:
         """Enter servo Mode 1 and wait for a movable state; raise on failure."""
-        enter_mode(self._api, 1, check_abort=check_abort)
+        enter_mode(self.api, 1, check_abort=check_abort)
 
     @property
     def axis(self) -> int:
-        return int(self._api.axis)
+        return int(self.api.axis)
 
     def wait_for_axis_report(self) -> None:
         deadline = time.monotonic() + 3.0
@@ -231,7 +231,7 @@ class XArm7:
 
     def check_controller_error(self) -> None:
         """Refuse to proceed on a pre-existing controller error; warn is diagnostic."""
-        live = read_live_state_and_error(self._api)
+        live = read_live_state_and_error(self.api)
         if live.error_code != 0:
             raise RuntimeError(
                 f"startup controller error C{live.error_code} (warn={live.warn_code}, "
@@ -244,18 +244,18 @@ class XArm7:
     def apply_config(self) -> None:
         """Preserve collision/load configuration and the firmware Mode-0 HOME acc cap."""
         check_sdk_return_code(
-            self._api.set_collision_sensitivity(self.cfg.collision_sensitivity),
+            self.api.set_collision_sensitivity(self.cfg.collision_sensitivity),
             "set_collision_sensitivity",
         )
         check_sdk_return_code(
-            self._api.set_tcp_load(
+            self.api.set_tcp_load(
                 weight=self.cfg.tcp_load_mass_kg,
                 center_of_gravity=list(self.cfg.tcp_load_cog_mm),
             ),
             "set_tcp_load",
         )
         check_sdk_return_code(
-            self._api.set_joint_maxacc(
+            self.api.set_joint_maxacc(
                 self.cfg.max_joint_acceleration_rad_per_s2,
                 is_radian=True,
             ),

@@ -16,15 +16,15 @@ from dexmani_real.config.experiment import (
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.runtime.state import RuntimeState, RunEndReason
 from dexmani_real.recording.recorder import AsyncEpisodeRecorder
-from dexmani_real.robot.action import ActionRealizer
+from dexmani_real.robot.action import ActionMapper
 from dexmani_real.robot.home import build_home_planner
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.vr.worker import run_vr_worker
-from dexmani_real.teleop.control.controller import TeleopController
-from dexmani_real.teleop.control.vr_mapping import VRWristMapper
+from dexmani_real.teleop.controller import TeleopController
+from dexmani_real.teleop.vr_mapping import VRWristMapper
 from dexmani_real.teleop.runner import TeleopRunner
 from dexmani_real.teleop.vr_transform import load_vr_transform
 from dexmani_real.utils.log import configure_logging
@@ -67,7 +67,7 @@ class TeleopSession:
         calibration = load_vr_transform(self.vr_transform_path)
         mapping = self.runtime.control.vr_mapping
         self.controller = TeleopController(
-            ActionRealizer.for_mode(self.runtime, "eef"),
+            ActionMapper.for_mode(self.runtime, "eef"),
             VRWristMapper(
                 pos_scale=mapping.pos_scale,
                 vr_to_robot_rot=calibration.transform,
@@ -164,7 +164,7 @@ class TeleopSession:
         if not self.runtime.control.hand_enabled:
             return None
         if self.runtime.control.hand_retargeting_type == "tag":
-            from dexmani_real.teleop.retargeting.tag_optimizer import TAGHandRetargeter
+            from dexmani_real.teleop.retargeting.tag import TAGHandRetargeter
 
             return TAGHandRetargeter(
                 fingertip_link_names=self.runtime.hand.fingertip_link_names,

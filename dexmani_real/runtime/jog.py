@@ -47,12 +47,7 @@ def submit_jog_target(
     execute_until_ns: int,
     commit_reference: Callable[[], None],
 ) -> DispatchResult | None:
-    """Bind input to an epoch, submit without input locks, then commit local references.
-
-    Every jog generation change revokes the bound epoch. A late enqueue therefore
-    cannot restore old authority, even if input changes while IPC is blocked.
-    commit_reference must only assign already constructed local command references.
-    """
+    """Bind input to an epoch; commit_reference only assigns preconstructed references."""
     def reserve() -> int | None:
         with runtime_state.motion_lock:
             if runtime_state.run_id != epoch or not runtime_state.requests_allow_motion():
@@ -74,6 +69,7 @@ def submit_jog_target(
     if run_id is None:
         return None
     try:
+        # Input changes revoke the epoch even while IPC blocks without the input lock.
         result = robot.send_action(
             RobotCommand(run_id, target),
             valid_until_ns=valid_until_ns,
