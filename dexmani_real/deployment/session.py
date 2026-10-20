@@ -10,15 +10,11 @@ from dexmani_real.calibration.camera.extrinsics import (
     CameraExtrinsics,
     load_optional_camera_extrinsics,
 )
-from dexmani_real.config.experiment import (
-    resolve_runtime_table,
-    validate_robot_config,
-    validate_control_rate,
-)
+from dexmani_real.config.experiment import resolve_runtime_table
 from dexmani_real.deployment.config import (
+    validate_deployment_config,
     validate_max_running_s,
     validate_num_episodes,
-    validate_policy_inputs,
 )
 from dexmani_real.deployment.observation import (
     build_observation_camera,
@@ -90,18 +86,17 @@ class PolicyDeploymentSession:
 
     def run(self):
         """Run a session with independently optional Raw recording and evaluation summaries."""
+        cloud_recipe = validate_deployment_config(
+            self.saved_config, self.info, self.runtime, record_raw=self.recording_dir is not None
+        )
+        self.max_running_s = validate_max_running_s(self.max_running_s)
+        self.num_episodes = validate_num_episodes(self.num_episodes)
         configure_logging()
         from dexmani_real.deployment.inference import InferenceWorker
 
-        cloud_recipe = validate_policy_inputs(self.info, self.runtime)
-        self.max_running_s = validate_max_running_s(self.max_running_s)
-        self.runtime.execution.validate(self.info)
-        validate_robot_config(self.runtime)
-        validate_control_rate(self.runtime, 1.0 / self.info.control_dt_s)
         if cloud_recipe is not None:
             self.runtime = replace(self.runtime, pointcloud=cloud_recipe)
         self.runtime = resolve_runtime_table(self.runtime, pointcloud=cloud_recipe)
-        self.num_episodes = validate_num_episodes(self.num_episodes)
         if self.recording_dir is not None:
             self.recording_dir = Path(self.recording_dir).expanduser().resolve()
         print(
@@ -127,9 +122,7 @@ class PolicyDeploymentSession:
                 bool(fields & {"point_cloud", "rgb", "camera_intrinsic", "camera_extrinsic"})
                 or self.recording_dir is not None
             )
-            if camera:
-                self.runtime.camera.validate()
-            self.camera_calibration = (
+            camera_calibration = (
                 CameraExtrinsics(self.camera_calibration_path)
                 if cloud or "camera_extrinsic" in fields
                 else (
@@ -138,19 +131,19 @@ class PolicyDeploymentSession:
                     else None
                 )
             )
-            self.pointcloud_config = (
+            pointcloud_config = (
                 PointCloudWorkerConfig(
                     pointcloud=cloud_recipe,
-                    camera_calibration=self.camera_calibration,
+                    camera_calibration=camera_calibration,
                     table_plane_abcd=self.runtime.environment.table.plane_abcd,
                 )
                 if cloud
                 else None
             )
-            self.ctx = mp.get_context("spawn")
+            ctx = mp.get_context("spawn")
             self.runtime_state = RuntimeState(
                 SensorChannels(
-                    self.ctx,
+                    ctx,
                     camera=self.runtime.camera,
                     pointcloud_num_points=self.runtime.pointcloud.num_points if cloud else None,
                 )
@@ -187,9 +180,9 @@ class PolicyDeploymentSession:
                 self.runtime.execution.rtc_guidance_cap,
                 self.recording_dir is not None,
             )
-            self.kinematics = build_observation_kinematics(self.info, self.runtime)
-            self.realizer = ActionRealizer.for_mode(self.runtime, self.info.action_mode)
-            self.home_planner = build_home_planner(self.runtime)
+            kinematics = build_observation_kinematics(self.info, self.runtime)
+            realizer = ActionRealizer.for_mode(self.runtime, self.info.action_mode)
+            home_planner = build_home_planner(self.runtime)
             if self.save_run_config is not None:
                 self.save_run_config(self.runtime)
             self.recorder = (
@@ -203,7 +196,7 @@ class PolicyDeploymentSession:
             self.robot.connect()
             if camera:
                 self.sensors.start(
-                    self.ctx.Process(
+                    ctx.Process(
                         name="camera",
                         target=run_camera_worker,
                         args=(self.runtime_state.sensors, self.runtime.camera),
@@ -213,10 +206,10 @@ class PolicyDeploymentSession:
                 )
             if cloud:
                 self.sensors.start(
-                    self.ctx.Process(
+                    ctx.Process(
                         name="pointcloud",
                         target=run_pointcloud_worker,
-                        args=(self.runtime_state.sensors, self.pointcloud_config),
+                        args=(self.runtime_state.sensors, pointcloud_config),
                     ),
                     ready=self.runtime_state.sensors.pointcloud_ready,
                     timeout_s=self.runtime.safety.pointcloud_ready_timeout_s,
@@ -225,32 +218,32 @@ class PolicyDeploymentSession:
                 self.runtime_state.sensors,
                 self.runtime.camera,
                 fields,
-                self.camera_calibration,
+                camera_calibration,
             )
             self.runtime_state.arm()
             self.operator = PolicyOperator(
                 self.runtime_state,
                 self.runtime,
-                self.home_planner,
+                home_planner,
                 robot=self.robot,
             )
             self.operator.keyboard.start()
             self.robot.check_services = lambda: (
                 (self.sensors is None or self.sensors.check()) and self.operator.keyboard.healthy
             )
-            self.runner = PolicyRunner(
+            runner = PolicyRunner(
                 self.runtime_state,
                 self.runtime,
                 self.info,
                 robot=self.robot,
-                realizer=self.realizer,
+                realizer=realizer,
                 recorder=self.recorder,
                 operator=self.operator,
                 model_runtime=self.model,
-                kinematics=self.kinematics,
+                kinematics=kinematics,
                 max_running_s=self.max_running_s,
                 num_episodes=self.num_episodes,
-                camera_calibration=self.camera_calibration,
+                camera_calibration=camera_calibration,
                 camera_parameters=camera_parameters,
                 results=self.results,
             )
@@ -259,7 +252,7 @@ class PolicyDeploymentSession:
                 "T 请求复位触觉（空闲且无接触）。",
                 flush=True,
             )
-            self.runner.run()
+            runner.run()
             clean = bool(
                 self.runtime_state.quit_requested
                 and not self.runtime_state.estop_request

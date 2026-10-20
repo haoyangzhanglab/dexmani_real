@@ -1,4 +1,4 @@
-"""One serialized model owner; no device access and no queued observations."""
+"""One model thread owns inference and cleanup; robot and sensor I/O stay with the runtime."""
 
 import logging
 import time
@@ -19,22 +19,22 @@ class ModelResult:
 
 class InferenceWorker:
     def __init__(self, factory):
-        self._factory = factory
-        self._model = None
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-model")
+        self.model_factory = factory
+        self.model = None
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-model")
         self.future = None
         self.operation = None
         self.close_future = None
 
-    def call(self, operation, args, kwargs, query_context=None):
+    def run_operation(self, operation, args, kwargs, query_context=None):
         start = time.monotonic_ns()
         value, error = None, None
         try:
             if operation == "load":
-                self._model = self._factory()
-                value = self._model.warmup(**kwargs)
-            elif operation != "close" or self._model is not None:
-                value = getattr(self._model, operation)(*args, **kwargs)
+                self.model = self.model_factory()
+                value = self.model.warmup(**kwargs)
+            elif operation != "close" or self.model is not None:
+                value = getattr(self.model, operation)(*args, **kwargs)
         except BaseException as exc:
             error = exc
         # Completion includes the blocking transfer to an owned CPU NumPy prediction.
@@ -43,7 +43,7 @@ class InferenceWorker:
     def submit(self, operation, *args, query_context=None, **kwargs):
         if self.close_future is not None or self.future is not None:
             raise RuntimeError("Model worker already owns an unreclaimed Future or is closing")
-        future = self._executor.submit(self.call, operation, args, kwargs, query_context)
+        future = self.executor.submit(self.run_operation, operation, args, kwargs, query_context)
         self.operation, self.future = operation, future
 
     def poll(self):
@@ -58,7 +58,7 @@ class InferenceWorker:
         if self.close_future is not None:
             return self.close_future
 
-        def recovered(future):
+        def log_retired_result(future):
             result = future.result()
             logger.info(
                 "retired model result after shutdown: context=%s started_ns=%s completed_ns=%s error=%s",
@@ -71,14 +71,14 @@ class InferenceWorker:
                 logger.error("retired model task failed during shutdown: %s", result.error)
 
         # Queue cleanup behind load/predict while the executor still accepts work.
-        self.close_future = self._executor.submit(self.call, "close", (), {})
+        self.close_future = self.executor.submit(self.run_operation, "close", (), {})
         if self.future is not None:
-            self.future.add_done_callback(recovered)
-        self._executor.shutdown(wait=False, cancel_futures=False)
+            self.future.add_done_callback(log_retired_result)
+        self.executor.shutdown(wait=False, cancel_futures=False)
         return self.close_future
 
     def close_result(self, timeout_s=0.0):
-        """Wait for the sole close Future; timeout means pending and does not bound thread/CUDA process exit."""
+        """Wait for model close; timeout leaves cleanup pending and does not bound process exit."""
         if self.close_future is None:
             return dict(status="pending", reason="close_not_requested")
         try:

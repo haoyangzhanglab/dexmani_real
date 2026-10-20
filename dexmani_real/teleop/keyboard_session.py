@@ -4,19 +4,23 @@ import logging
 
 import numpy as np
 
-from dexmani_real.runtime.state import RuntimeState, RunEndReason, SafetyState
+from dexmani_real.config.experiment import (
+    resolve_runtime_table,
+    validate_keyboard_workspace,
+    validate_robot_config,
+)
 from dexmani_real.planning.admission import TargetAdmission
 from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_solver
+from dexmani_real.robot.commands import DispatchError, RobotCommand
 from dexmani_real.robot.home import build_home_planner, home_robot
-from dexmani_real.robot.commands import RobotCommand, DispatchError
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_local_runtime
-from dexmani_real.config.experiment import validate_keyboard_workspace
+from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
 from dexmani_real.teleop.jog import compute_cartesian_jog_delta, propose_cartesian_jog_pose
-from dexmani_real.utils.timing import LoopRate
 from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.timing import LoopRate
 
 logger = logging.getLogger(__name__)
 
@@ -30,195 +34,195 @@ class KeyboardTeleopSession:
 
     def run(self):
         configure_logging()
-        from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
-
         validate_robot_config(self.runtime)
         self.runtime = resolve_runtime_table(self.runtime)
-        self.workspace = validate_keyboard_workspace(self.runtime)
+        workspace = validate_keyboard_workspace(self.runtime)
         if not self.runtime.control.hand_enabled and not self.no_hand:
             raise ValueError("hand-disabled operation requires --no-hand")
-        self.runtime_state = RuntimeState()
-        self.robot = DexManiRobot(self.runtime_state, self.runtime)
 
-        self.keys = KeyboardInput(
-            quit_callback=self.runtime_state.request_quit,
+        runtime_state = RuntimeState()
+        robot = DexManiRobot(runtime_state, self.runtime)
+
+        keys = KeyboardInput(
+            quit_callback=runtime_state.request_quit,
             capture_commands=False,
-            estop_callback=self.runtime_state.request_emergency_stop,
-            jog_change_callback=self.runtime_state.revoke_motion,
+            estop_callback=runtime_state.request_emergency_stop,
+            jog_change_callback=runtime_state.revoke_motion,
         )
-        self.cfg = self.runtime.keyboard_teleop
-        self.home_down = False
-        self.blocked_until_release = False
+        jog_config = self.runtime.keyboard_teleop
+        home_down = False
+        blocked_until_release = False
         # Keep the operator target independent of tracking lag and IK pose residuals.
-        self.command_qpos = None
-        self.command_pose = None
+        command_qpos = None
+        command_pose = None
         clean = False
         try:
-            self.solver = make_online_ik_solver(
+            solver = make_online_ik_solver(
                 self.runtime,
-                max_pose_error_pos_m=self.cfg.ik_max_pose_error_pos_m,
-                max_pose_error_rot_rad=self.cfg.ik_max_pose_error_rot_rad,
+                max_pose_error_pos_m=jog_config.ik_max_pose_error_pos_m,
+                max_pose_error_rot_rad=jog_config.ik_max_pose_error_rot_rad,
             )
             if not self.runtime.control.hand_enabled:
-                self.solver.collision_model.set_hand_qpos(
-                    np.deg2rad(self.runtime.hand.home_qpos_deg)
-                )
-            self.admission = TargetAdmission(
+                solver.collision_model.set_hand_qpos(np.deg2rad(self.runtime.hand.home_qpos_deg))
+            admission = TargetAdmission(
                 self.runtime,
-                self.solver.collision_model,
-                dynamic_rejection=self.solver.dynamic_rejection,
+                solver.collision_model,
+                dynamic_rejection=solver.dynamic_rejection,
             )
-            self.home_planner = build_home_planner(self.runtime)
-            self.robot.connect()
-            self.runtime_state.arm()
-            self.keys.start()
-            if not self.keys.healthy:
+            home_planner = build_home_planner(self.runtime)
+            robot.connect()
+            runtime_state.arm()
+            keys.start()
+            if not keys.healthy:
                 raise RuntimeError("keyboard stop listener unavailable")
-            self.robot.check_services = lambda: self.keys.healthy
+            robot.check_services = lambda: keys.healthy
             print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
-            self.rate = LoopRate(self.cfg.control_hz, label="keyboard_teleop")
-            while self.runtime_state.running and not self.runtime_state.quit_requested:
-                self.rate.wait()
+            rate = LoopRate(jog_config.control_hz, label="keyboard_teleop")
+
+            while runtime_state.running and not runtime_state.quit_requested:
+                rate.wait()
                 if (
-                    self.runtime_state.estop_request
-                    or self.runtime_state.error_state
-                    or not self.keys.healthy
+                    runtime_state.estop_request
+                    or runtime_state.error_state
+                    or not keys.healthy
                 ):
                     break
-                if self.runtime_state.quit_requested or self.keys.is_pressed("q"):
+                if runtime_state.quit_requested or keys.is_pressed("q"):
                     clean = True
                     break
-                pressed = self.keys.is_pressed("r")
-                if pressed and not self.home_down:
-                    self.command_qpos = None
-                    self.command_pose = None
-                    self.runtime_state.revoke_motion()
-                    self.robot.stop()
+
+                home_pressed = keys.is_pressed("r")
+                if home_pressed and not home_down:
+                    command_qpos = None
+                    command_pose = None
+                    runtime_state.revoke_motion()
+                    robot.stop()
                     home_result = home_robot(
-                        self.runtime_state,
+                        runtime_state,
                         self.runtime,
-                        self.home_planner,
-                        robot=self.robot,
+                        home_planner,
+                        robot=robot,
                         abort_requested=lambda: (
-                            bool(
-                                self.runtime_state.estop_request
-                                or self.runtime_state.quit_requested
-                            )
-                            or not self.keys.healthy
+                            bool(runtime_state.estop_request or runtime_state.quit_requested)
+                            or not keys.healthy
                         ),
                     )
                     if not home_result.ok:
                         if not home_result.interrupted:
                             raise RuntimeError(f"HOME failed: {home_result.reason}")
                         logger.info("HOME cancelled: %s", home_result.reason)
-                    self.rate.reset()
-                    self.home_down = pressed
+                    rate.reset()
+                    home_down = home_pressed
                     continue
-                self.home_down = pressed
-                pressed_keys, generation = self.keys.snapshot()
+                home_down = home_pressed
+
+                pressed_keys, generation = keys.snapshot()
                 dx, drpy = compute_cartesian_jog_delta(
-                    pressed_keys, self.cfg.delta_pos_m, self.cfg.delta_rpy_rad
+                    pressed_keys, jog_config.delta_pos_m, jog_config.delta_rpy_rad
                 )
                 moving = np.any(dx) or np.any(drpy)
                 if not moving:
-                    self.blocked_until_release = False
-                if not moving or pressed or self.blocked_until_release:
-                    if self.robot.stop_required:
-                        self.runtime_state.revoke_motion()
-                        self.robot.stop()
-                    self.command_qpos = self.command_pose = None
-                    self.robot.service_idle()
+                    blocked_until_release = False
+                if not moving or home_pressed or blocked_until_release:
+                    if robot.stop_required:
+                        runtime_state.revoke_motion()
+                        robot.stop()
+                    command_qpos = command_pose = None
+                    robot.service_idle()
                     continue
-                safety_state = self.runtime_state.safety_state
-                epoch = self.runtime_state.run_id
-                if moving and not pressed and safety_state == SafetyState.ARMED:
+
+                safety_state = runtime_state.safety_state
+                epoch = runtime_state.run_id
+                if safety_state == SafetyState.ARMED:
                     preparation_generation = generation
-                    self.command_qpos = self.command_pose = None
-                    if self.robot.stop_required:
-                        self.robot.stop()
+                    command_qpos = command_pose = None
+                    if robot.stop_required:
+                        robot.stop()
                     try:
-                        self.robot.prepare_streaming(epoch)
+                        robot.prepare_streaming(epoch)
                     except DispatchError as exc:
                         if not exc.revoked:
                             raise
-                        self.robot.stop()
-                        self.command_qpos = self.command_pose = None
+                        robot.stop()
+                        command_qpos = command_pose = None
                         continue
-                    pressed_keys, generation = self.keys.snapshot()
+                    pressed_keys, generation = keys.snapshot()
                     if generation != preparation_generation:
                         continue
                     dx, drpy = compute_cartesian_jog_delta(
-                        pressed_keys, self.cfg.delta_pos_m, self.cfg.delta_rpy_rad
+                        pressed_keys, jog_config.delta_pos_m, jog_config.delta_rpy_rad
                     )
                     if not (np.any(dx) or np.any(drpy)) or "r" in pressed_keys:
                         continue
+
                 row = read_observation(
-                    self.runtime_state,
+                    runtime_state,
                     self.runtime,
-                    self.robot,
+                    robot,
                     require_hand=self.runtime.control.hand_enabled,
                 )
                 if row is None:
-                    self.command_qpos = None
-                    self.command_pose = None
-                    if self.robot.stop_required:
-                        self.runtime_state.revoke_motion()
-                        self.robot.stop()
+                    command_qpos = None
+                    command_pose = None
+                    if robot.stop_required:
+                        runtime_state.revoke_motion()
+                        robot.stop()
                     continue
+
                 measured_qpos = row.arm["qpos"][0]
-                baseline_qpos = self.command_qpos
-                baseline_pose = self.command_pose
+                baseline_qpos = command_qpos
+                baseline_pose = command_pose
                 if baseline_qpos is None:
                     baseline_qpos = measured_qpos.copy()
-                    baseline_pose = self.solver.kin.compute_eef_pose_base(measured_qpos)
+                    baseline_pose = solver.kin.compute_eef_pose_base(measured_qpos)
                 proposed_pose, _, changed = propose_cartesian_jog_pose(
                     baseline_pose,
                     dx,
                     drpy,
-                    self.workspace[:, 0] + self.cfg.workspace_command_margin_m,
-                    self.workspace[:, 1] - self.cfg.workspace_command_margin_m,
+                    workspace[:, 0] + jog_config.workspace_command_margin_m,
+                    workspace[:, 1] - jog_config.workspace_command_margin_m,
                 )
                 if not changed:
-                    self.blocked_until_release = True
+                    blocked_until_release = True
                     continue
+
                 if row.hand is not None:
-                    self.solver.collision_model.set_hand_qpos(row.hand["qpos"][0])
-                result = self.solver.solve(
-                    proposed_pose,
-                    measured_qpos,
-                    baseline_qpos,
-                )
+                    solver.collision_model.set_hand_qpos(row.hand["qpos"][0])
+                result = solver.solve(proposed_pose, measured_qpos, baseline_qpos)
                 if result.failure_kind == IKFailureKind.INVALID_OUTPUT:
                     raise RuntimeError(f"online IK technical failure: {result.reason}")
                 if not result.success:
-                    self.blocked_until_release = True
+                    blocked_until_release = True
                     continue
+
                 collision_hand = (
                     row.hand["qpos"][0]
                     if row.hand is not None
                     else np.deg2rad(self.runtime.hand.home_qpos_deg)
                 )
-                rejection = self.admission.rejection(
+                rejection = admission.rejection(
                     result.qpos, measured_qpos, baseline_qpos, collision_hand_qpos=collision_hand
                 )
                 if rejection is not None:
-                    self.blocked_until_release = True
+                    blocked_until_release = True
                     continue
-                if self.keys.snapshot()[1] != generation:
+
+                if keys.snapshot()[1] != generation:
                     continue
                 if safety_state == SafetyState.ARMED:
-                    with self.runtime_state.motion_lock:
+                    with runtime_state.motion_lock:
                         # A revoke during IK must also fence the first jog proposal.
-                        if self.runtime_state.run_id != epoch:
-                            self.command_qpos = None
-                            self.command_pose = None
+                        if runtime_state.run_id != epoch:
+                            command_qpos = None
+                            command_pose = None
                             continue
-                        if not self.runtime_state.begin_motion():
+                        if not runtime_state.begin_motion():
                             break
-                        epoch = self.runtime_state.run_id
+                        epoch = runtime_state.run_id
+
                 target = result.qpos
                 try:
-                    self.robot.send_action(
+                    robot.send_action(
                         RobotCommand(epoch, target),
                         valid_until_ns=feedback_deadline_ns(row, self.runtime),
                         execute_until_ns=row.observation_timestamp_ns
@@ -228,19 +232,21 @@ class KeyboardTeleopSession:
                     if not exc.revoked:
                         raise
                     logger.info("keyboard motion interrupted: dispatch=%s", exc.result)
-                    self.runtime_state.revoke_motion(expected_run_id=epoch)
-                    self.robot.stop()
-                    self.command_qpos = self.command_pose = None
+                    runtime_state.revoke_motion(expected_run_id=epoch)
+                    robot.stop()
+                    command_qpos = command_pose = None
                     continue
-                self.command_pose = proposed_pose
-                self.command_qpos = target.copy()
-            clean = clean or bool(self.runtime_state.quit_requested)
+
+                command_pose = proposed_pose
+                command_qpos = target.copy()
+
+            clean = clean or bool(runtime_state.quit_requested)
         except KeyboardInterrupt:
-            self.runtime_state.request_emergency_stop()
+            runtime_state.request_emergency_stop()
             raise
         except Exception as exc:
-            self.runtime_state.mark_error()
-            self.runtime_state.revoke_motion(
+            runtime_state.mark_error()
+            runtime_state.revoke_motion(
                 reason=(
                     RunEndReason.HARDWARE_FAULT
                     if isinstance(exc, DispatchError)
@@ -249,7 +255,5 @@ class KeyboardTeleopSession:
             )
             raise
         finally:
-            shutdown_clean = shutdown_local_runtime(
-                self.runtime_state, self.robot, keyboard=self.keys
-            )
+            shutdown_clean = shutdown_local_runtime(runtime_state, robot, keyboard=keys)
         return int(not clean or not shutdown_clean)

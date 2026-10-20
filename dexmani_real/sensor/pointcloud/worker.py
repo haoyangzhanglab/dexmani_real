@@ -1,9 +1,9 @@
-"""Build at most one float32 [N,6] base-frame cloud per newest camera sequence; no camera SDK or frame queue."""
+"""Publish float32 [N,6] base-frame clouds once per newest camera sequence."""
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import time
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING
@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
-from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.sensor.camera.geometry import RGBDGeometry
+from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud
 from dexmani_real.utils.log import configure_logging
 
@@ -21,71 +21,66 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_IDLE_POLL_S = 0.001
+IDLE_POLL_S = 0.001
 
 
 @dataclass(frozen=True)
 class PointCloudWorkerConfig:
-    """Clouds inherit camera sequence and oldest receive time; RGB/cloud consumers match RGB-D."""
-
     pointcloud: PointCloudConfig
     camera_calibration: CameraExtrinsics
     table_plane_abcd: tuple[float, float, float, float] | None = None
 
 
 class PointCloudWorker:
-    """Own point-cloud preprocessing state and publish at most once per camera sequence."""
-
     def __init__(self, shared: "SensorChannels", config: PointCloudWorkerConfig):
         self.shared = shared
         self.config = config
 
     def run(self):
-        """Consume only the newest camera sequence and publish fixed ``[N,6]`` clouds."""
         configure_logging()
         static_inputs = self.load_static_inputs()
         if static_inputs is None:
             return
-        self.geometry, self.depth_scale_m, self.base_from_color = static_inputs
+        geometry, depth_scale_m, base_from_color = static_inputs
         logger.debug(
             "pointcloud config=%s table_plane_abcd=%s",
             json.dumps(asdict(self.config.pointcloud), sort_keys=True, separators=(",", ":")),
             json.dumps(self.config.table_plane_abcd, separators=(",", ":")),
         )
 
-        self.last_camera_sequence = 0
+        last_camera_sequence = 0
         ready = False
 
         try:
             while self.shared.is_running.value:
                 latest_sequence = self.shared.camera_ring.latest_sequence
-                if latest_sequence <= self.last_camera_sequence:
-                    time.sleep(_IDLE_POLL_S)
+                if latest_sequence <= last_camera_sequence:
+                    time.sleep(IDLE_POLL_S)
                     continue
                 result = self.shared.camera_ring.read_latest()
                 if result is None:
-                    time.sleep(_IDLE_POLL_S)
+                    time.sleep(IDLE_POLL_S)
                     continue
                 data, camera_published_ns, camera_sequence = result
-                header = data["header"]
                 color, depth_raw = data["rgb"][0], data["depth"][0]
-                if camera_sequence <= self.last_camera_sequence:
+                if camera_sequence <= last_camera_sequence:
                     continue
-                self.last_camera_sequence = camera_sequence
+                last_camera_sequence = camera_sequence
 
                 processing_started_ns = time.monotonic_ns()
                 cloud = build_point_cloud(
                     depth_raw=depth_raw,
                     color=color,
-                    depth_scale_m=self.depth_scale_m,
-                    geometry=self.geometry,
-                    T_xarm_base_from_color=self.base_from_color,
+                    depth_scale_m=depth_scale_m,
+                    geometry=geometry,
+                    T_xarm_base_from_color=base_from_color,
                     table_plane_abcd=self.config.table_plane_abcd,
                     config=self.config.pointcloud,
                 )
                 if cloud is None:
                     continue
-                camera_header = header[0]
+                camera_header = data["header"][0]
+                # Processing must not refresh the camera's original observation time.
                 self.shared.pointcloud_ring.write(
                     source_camera_sequence=np.uint64(camera_sequence),
                     timestamp_ns=camera_header["timestamp_ns"],

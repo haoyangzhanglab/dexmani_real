@@ -1,4 +1,4 @@
-"""Validate saved Policy numerical requirements against current Real capability without model imports."""
+"""Validate saved Policy requirements against Real capabilities without loading models."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any
 
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig, resolve_saved_pointcloud_recipe
 
-_SUPPORTED_OBSERVATION_FIELDS = frozenset(
+SUPPORTED_OBSERVATION_FIELDS = frozenset(
     {
         "joint_state",
         "point_cloud",
@@ -40,7 +40,7 @@ def validate_policy_inputs(info: Any, runtime: Any) -> PointCloudConfig | None:
     if not runtime.control.hand_enabled:
         raise ValueError("Dexterous policy deployment requires hand_enabled=true")
     names = set(info.observation_fields)
-    unsupported = names - _SUPPORTED_OBSERVATION_FIELDS
+    unsupported = names - SUPPORTED_OBSERVATION_FIELDS
     if unsupported:
         raise ValueError(
             f"Real has no live producer for requested modalities: {sorted(unsupported)}"
@@ -61,20 +61,37 @@ def validate_policy_inputs(info: Any, runtime: Any) -> PointCloudConfig | None:
     return None
 
 
-def control_dt_ns(info):
-    dt = info.control_dt_s
-    if (
-        isinstance(dt, bool)
-        or not isinstance(dt, (int, float))
-        or not math.isfinite(dt)
-        or dt <= 0
-        or not math.isfinite(dt * 1e9)
-        or int(dt * 1e9) <= 0
-    ):
-        raise ValueError(
-            "Real deployment requires saved real_runtime.dt with positive control_dt_s"
+def validate_deployment_config(
+    saved_config: Any, info: Any, runtime: Any, *, record_raw: bool
+) -> PointCloudConfig | None:
+    """Check both deployment entries before outputs, models or devices; no calibration I/O."""
+    target = saved_config["agent"].get("_target_")
+    if target == "dexmani_policy.agents.core.lamp_policy.LAMPPolicy":
+        raise NotImplementedError(
+            "LAMP live deployment is not supported: Real does not yet provide strictly past "
+            "executed hand commands as hand_history. Enable it only after real "
+            "action_context.hand_history is integrated."
         )
-    return int(dt * 1e9)
+    runtime.execution.validate(info)
+    if (
+        target == "dexmani_policy.agents.core.temporal_latent_flow_policy.TemporalLatentFlowPolicy"
+        and runtime.execution.execution_mode != "sync"
+    ):
+        raise NotImplementedError("TemporalLatentFlowPolicy live deployment supports sync only")
+    cloud_recipe = validate_policy_inputs(info, runtime)
+    # Defer this import because ExperimentConfig contains ExecutionConfig.
+    from dexmani_real.config.experiment import validate_control_rate, validate_robot_config
+
+    validate_robot_config(runtime)
+    validate_control_rate(runtime, 1.0 / info.control_dt_s)
+    if record_raw or set(info.observation_fields) & {
+        "point_cloud",
+        "rgb",
+        "camera_intrinsic",
+        "camera_extrinsic",
+    }:
+        runtime.camera.validate()
+    return cloud_recipe
 
 
 def validate_num_episodes(num_episodes: Any) -> int | None:
@@ -104,7 +121,17 @@ class ExecutionConfig:
     rtc_guidance_cap: float | None = None
 
     def validate(self, info) -> None:
-        control_dt_ns(info)
+        dt = info.control_dt_s
+        if (
+            isinstance(dt, bool)
+            or not isinstance(dt, (int, float))
+            or not math.isfinite(dt)
+            or dt <= 0
+            or not math.isfinite(dt * 1e9)
+            or int(dt * 1e9) <= 0
+        ):
+            raise ValueError("Real deployment requires finite positive control_dt_s of at least 1 ns")
+
         for name in ("n_obs_steps", "horizon"):
             value = getattr(info, name)
             if type(value) is not int or value < 1:
@@ -125,19 +152,31 @@ class ExecutionConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or value is None or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be a finite positive experimental budget")
-        p = info.horizon - info.n_obs_steps + 1
-        a = self.action_steps
-        if type(a) is not int:
+
+        prediction_steps = info.horizon - info.n_obs_steps + 1
+        action_steps = self.action_steps
+        if type(action_steps) is not int:
             raise ValueError("Resolve effective A_exec at the deployment entry before validation")
-        if not 1 <= a <= p:
+        if not 1 <= action_steps <= prediction_steps:
             raise ValueError("execution requires 1 <= A_exec <= P=H-N+1")
         if self.execution_mode != "sync":
-            d = self.prefetch_steps
-            if type(d) is not int or not 1 <= d <= a or a + d > p:
+            prefetch_steps = self.prefetch_steps
+            if (
+                type(prefetch_steps) is not int
+                or not 1 <= prefetch_steps <= action_steps
+                or action_steps + prefetch_steps > prediction_steps
+            ):
                 raise ValueError(
-                    f"async/rtc require 1 <= d <= A_exec and A_exec+d <= P; A_exec={a}, P={p}, d={d}"
+                    "async/rtc require 1 <= d <= A_exec and A_exec+d <= P; "
+                    f"A_exec={action_steps}, P={prediction_steps}, d={prefetch_steps}"
                 )
+
         if self.execution_mode == "rtc":
-            beta = self.rtc_guidance_cap
-            if isinstance(beta, bool) or beta is None or not math.isfinite(beta) or beta < 0:
+            guidance_cap = self.rtc_guidance_cap
+            if (
+                isinstance(guidance_cap, bool)
+                or guidance_cap is None
+                or not math.isfinite(guidance_cap)
+                or guidance_cap < 0
+            ):
                 raise ValueError("rtc_guidance_cap requires an explicit finite nonnegative value")

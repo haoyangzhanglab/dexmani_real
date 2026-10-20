@@ -2,9 +2,9 @@
 
 import logging
 import time
+from collections import deque
 from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
-from collections import deque
 
 import numpy as np
 
@@ -16,17 +16,16 @@ from dexmani_real.deployment.observation import (
 )
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import Pose, rot6d_to_quat_wxyz
-from dexmani_real.robot.action import ActionIntent
 from dexmani_real.recording.recorder import (
     RecordingError,
     snapshot_recording_metadata,
 )
-from dexmani_real.utils.episode_results import error_detail
+from dexmani_real.robot.action import ActionIntent
 from dexmani_real.robot.commands import (
-    DispatchStatus,
-    RobotCommand,
     DispatchError,
     DispatchInterrupted,
+    DispatchStatus,
+    RobotCommand,
 )
 from dexmani_real.runtime.observation import (
     feedback_deadline_ns,
@@ -34,6 +33,7 @@ from dexmani_real.runtime.observation import (
     read_observation,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState
+from dexmani_real.utils.episode_results import error_detail
 
 logger = logging.getLogger(__name__)
 
@@ -525,17 +525,19 @@ class PolicyRunner:
             return
         if result.error is not None:
             raise result.error
-        future = np.asarray(result.value)
+        prediction = np.asarray(result.value)
         expected = (
             self.policy_info.horizon - self.policy_info.n_obs_steps + 1,
             self.policy_info.control_action_dim,
         )
-        valid_future = (
-            future.shape == expected and future.dtype.kind == "f" and np.isfinite(future).all()
+        valid_prediction = (
+            prediction.shape == expected
+            and prediction.dtype.kind == "f"
+            and np.isfinite(prediction).all()
         )
-        if not valid_future:
-            raise ValueError(f"Policy future requires finite floating point {expected}")
-        query.result = future
+        if not valid_prediction:
+            raise ValueError(f"Policy prediction requires finite floating point {expected}")
+        query.result = prediction
 
     def submit(self, rows, slot, *, handoff_slot=None, prefix=None, commands=None):
         observation = build_policy_observation(

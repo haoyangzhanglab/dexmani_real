@@ -1,4 +1,4 @@
-"""Deterministic aligned RGB-D→xArm-base geometry without SDK, device, calibration-file or IPC ownership."""
+"""Deterministic aligned RGB-D geometry in the xArm base frame, without device or file I/O."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from dexmani_real.sensor.camera.geometry import (
 if TYPE_CHECKING:
     from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 
-_KERNEL_3X3 = np.ones((3, 3), dtype=np.uint8)
+NEIGHBORHOOD_KERNEL = np.ones((3, 3), dtype=np.uint8)
 
 __all__ = [
     "build_raw_point_cloud",
@@ -90,7 +90,7 @@ def reject_flying_depth(
         np.ndarray,
         cv2.erode(
             np.where(valid, depth_m, np.float32(np.inf)),
-            _KERNEL_3X3,
+            NEIGHBORHOOD_KERNEL,
             borderType=cv2.BORDER_CONSTANT,
             borderValue=(float("inf"),),
         ),
@@ -99,7 +99,7 @@ def reject_flying_depth(
         np.ndarray,
         cv2.dilate(
             np.where(valid, depth_m, np.float32(-np.inf)),
-            _KERNEL_3X3,
+            NEIGHBORHOOD_KERNEL,
             borderType=cv2.BORDER_CONSTANT,
             borderValue=(float("-inf"),),
         ),
@@ -346,6 +346,9 @@ def radius_component_keep_mask(
     )
     neighbor_counts = np.bincount(pairs.reshape(-1), minlength=count)
     density_keep = neighbor_counts >= min_neighbors
+    if min_component_points <= 1 or not np.any(density_keep):
+        return density_keep
+
     retained_pairs = pairs[density_keep[pairs[:, 0]] & density_keep[pairs[:, 1]]]
     graph = coo_matrix(
         (
@@ -354,7 +357,7 @@ def radius_component_keep_mask(
         ),
         shape=(count, count),
     )
-    _component_count, labels = connected_components(graph, directed=False, return_labels=True)
+    _, labels = connected_components(graph, directed=False, return_labels=True)
     component_sizes = np.bincount(labels, minlength=count)
     return density_keep & (component_sizes[labels] >= min_component_points)
 
@@ -416,7 +419,7 @@ def aligned_depth_points_in_base(
     trusted = reject_flying_depth(depth_m, valid, config)
     if not np.any(trusted):
         return np.empty((0, 3), dtype=np.float32)
-    points_depth, _rows, _columns = deproject_depth(depth_m, trusted, aligned_depth_intrinsics)
+    points_depth, _, _ = deproject_depth(depth_m, trusted, aligned_depth_intrinsics)
     return transform_points(points_depth, T_xarm_base_from_color)
 
 
@@ -451,11 +454,11 @@ def build_point_cloud(
     config: PointCloudConfig,
 ) -> np.ndarray | None:
     """Build ``float32[num_points,6]`` with static inputs validated at session/episode setup."""
-    if config.remove_table:
-        if table_plane_abcd is None:
-            raise ValueError("remove_table=True requires a current calibrated table plane")
-    else:
+    if not config.remove_table:
         table_plane_abcd = None
+    elif table_plane_abcd is None:
+        raise ValueError("remove_table=True requires a current calibrated table plane")
+
     validate_color(color, geometry)
     depth_m, valid = depth_valid_mask(
         depth_raw, intrinsics=geometry.depth, depth_scale_m=depth_scale_m, config=config

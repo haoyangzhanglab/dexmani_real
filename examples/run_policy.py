@@ -11,14 +11,16 @@
 常用参数：
     --checkpoint 默认 latest；也支持已有百分比 milestone、best 或文件名。
     --inference-steps 设置 NFE，--weights 选择 ema/raw；默认使用实验保存的评估设置。
-    --n-action-steps 设置每段执行步数，默认使用策略的 n_action_steps。
+    --n-action-steps 设置每段执行步数，未指定时依次使用 YAML execution.action_steps、策略的 n_action_steps。
     默认最多评估 20 轮，每轮按 B 开始、S 结束；Q 提前退出，--num-episodes N 修改轮数。
     --no-record / --no-results 分别关闭 Raw / 评估摘要；--output 指定输出目录。
     prefetch_steps = d 表示：在当前动作段距离交接还剩 d 个控制步时，提前启动下一次策略推理，让推理与当前动作的执行重叠。
 
 执行模式默认 sync；CLI 执行参数优先于 --config YAML。
 RTC 使用 --execution-mode rtc，并显式设置 --prefetch-steps 和 --rtc-guidance-cap。
-当前 RTC 仅支持连续动作 BaseAgent DDIM 策略；ManiFlow 支持 sync/async。
+当前 RTC 仅支持连续动作 BasePolicy DDIM 策略；ManiFlow 支持 sync/async，Temporal 仅支持 sync。
+LAMP 暂不支持真机部署，需先接入严格过去时序的已执行手命令 action_context.hand_history。
+执行窗口、输入能力及 LAMP/Temporal 限制在创建会话目录、加载模型和连接设备前检查。
 普通运行会连接设备，关闭输出不是离线模式；--print-config 不连接设备。
 其他参数见 --help。
 """
@@ -100,7 +102,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--num-episodes",
-        dest="num_episodes",
         type=positive_int,
         default=20,
         help=(
@@ -157,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--n-action-steps",
         type=positive_int,
         default=None,
-        help="A_exec: actions per segment (default: saved Policy n_action_steps)",
+        help="A_exec: actions per segment (default: YAML execution.action_steps or saved Policy n_action_steps)",
     )
     research = parser.add_argument_group("Policy inference")
     research.add_argument("--weights", choices=("ema", "raw"), default=None)
@@ -239,9 +240,8 @@ def write_run_config(session_dir, *, args, runtime, info):
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not args.print_config:
-        if args.experiment is None:
-            parser.error("EXPERIMENT is required unless --print-config is used")
+    if not args.print_config and args.experiment is None:
+        parser.error("EXPERIMENT is required unless --print-config is used")
 
     import yaml
 
@@ -266,12 +266,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from dexmani_policy.deployment import (
             inspect_policy,
-            load_experiment_config,
+            load_experiment_config as load_policy_config,
             resolve_experiment,
         )
 
         experiment = resolve_experiment(args.experiment)
-        saved_config = load_experiment_config(experiment)
+        saved_config = load_policy_config(experiment)
         checkpoint = args.checkpoint
         if checkpoint.endswith("pct"):
             from dexmani_policy.evaluation.protocol import resolve_checkpoint_path
@@ -289,10 +289,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        from dexmani_real.deployment.config import validate_deployment_config
+
         action_steps = runtime.execution.action_steps
         if action_steps is None:
             action_steps = info.n_action_steps
         runtime = replace(runtime, execution=replace(runtime.execution, action_steps=action_steps))
+        validate_deployment_config(saved_config, info, runtime, record_raw=not args.no_record)
         selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
     except Exception as exc:
         print(f"[PREFLIGHT] preflight failed: {exc}", file=sys.stderr)

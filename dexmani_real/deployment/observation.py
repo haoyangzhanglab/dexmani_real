@@ -1,12 +1,11 @@
 """Project real control-row history into the requested Policy observation mapping."""
 
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
-from dexmani_real.robot.xhand.config import HandParams
 from dexmani_real.planning.kinematics.arm_fk import (
     ArmFK,
     compute_eef_pose_history_xarm_base,
@@ -15,6 +14,7 @@ from dexmani_real.planning.kinematics.arm_fk import (
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
+from dexmani_real.robot.xhand.config import HandParams
 from dexmani_real.sensor.camera.geometry import RGBDGeometry, camera_parameters_cv
 
 
@@ -26,7 +26,7 @@ class ObservationKinematics:
 
 
 def build_observation_kinematics(policy_info: Any, runtime: Any):
-    """Build only requested FK resources; EEF and fingertips share aligned qpos history and canonical ArmFK."""
+    """Build requested FK resources; EEF and fingertips share measured joint history."""
     requested = set(policy_info.observation_fields)
     needs_hand_fk = "fingertip_xyz" in requested
     if not needs_hand_fk and "eef_pose" not in requested:
@@ -97,7 +97,7 @@ def policy_observation_issue(row, fields):
 
 
 def build_policy_observation(rows, policy_info, *, kinematics=None, camera_parameters=None):
-    """Stack frozen rows already admitted by policy_observation_issue; validate new numerical transforms."""
+    """Stack admitted rows and validate numerical transforms."""
     requested = set(policy_info.observation_fields)
     arrays = {}
     if requested & {"joint_state", "eef_pose", "fingertip_xyz"}:
@@ -122,19 +122,21 @@ def build_policy_observation(rows, policy_info, *, kinematics=None, camera_param
             raise ValueError(f"Missing session camera parameter {name}")
         values = camera_parameters[name]
         arrays[name] = np.broadcast_to(values, (len(rows), values.size)).copy()
+
     if requested & {"eef_pose", "fingertip_xyz"}:
-        arm_fk, hand_fk, cfg = kinematics.arm_fk, kinematics.hand_fk, kinematics.mount
-        poses = compute_eef_pose_history_xarm_base(arm, arm_fk=arm_fk)
+        poses = compute_eef_pose_history_xarm_base(arm, arm_fk=kinematics.arm_fk)
         if "eef_pose" in requested:
             arrays["eef_pose"] = poses.astype(np.float32)
         if "fingertip_xyz" in requested:
+            mount = kinematics.mount
             arrays["fingertip_xyz"] = compute_fingertip_history_xarm_base(
                 poses,
                 hand,
-                hand_fk=hand_fk,
-                handbase_position_eef_m=np.asarray(cfg.T_eef_handbase_pos_xyz),
-                handbase_quat_eef_wxyz=np.asarray(cfg.T_eef_handbase_quat_wxyz),
+                hand_fk=kinematics.hand_fk,
+                handbase_position_eef_m=np.asarray(mount.T_eef_handbase_pos_xyz),
+                handbase_quat_eef_wxyz=np.asarray(mount.T_eef_handbase_quat_wxyz),
             )
+
     result = {}
     for name in policy_info.observation_fields:
         values = np.ascontiguousarray(arrays[name])

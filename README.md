@@ -139,7 +139,9 @@ python examples/run_policy.py policy/task/experiment --config local.yaml --execu
 | `async` | 当前段执行时预取下一段，需设置 `prefetch_steps` |
 | `rtc` | 预取并冻结交接前已承诺的动作前缀，需设置 `prefetch_steps` 与 `rtc_guidance_cap` |
 
-预取步数表示距交接还剩多少个控制步时启动下一次推理，必须满足策略 horizon 的容量约束。当前 RTC 支持连续动作 BaseAgent DDIM，ManiFlow 支持 sync/async；具体参数见 `--help`。
+预取步数表示距交接还剩多少个控制步时启动下一次推理，必须满足策略 horizon 的容量约束。当前 RTC 支持连续动作 BasePolicy DDIM，ManiFlow 支持 sync/async，Temporal 仅支持 sync；具体参数见 `--help`。
+
+LAMP 暂不支持真机部署，需先接入严格过去时序的已执行手命令 `action_context.hand_history`。执行窗口、输入能力及 LAMP/Temporal 限制会在创建会话目录、加载模型和连接设备前检查。
 
 H 回 HOME、B 开始本轮、S 结束本轮；整理场景后再次按 H、B 开始下一轮。Q 提前退出，ESC 请求急停，T 在空闲且无接触时请求复位触觉。部署不使用 C/D。默认最多 20 轮，每轮运行预算 60 秒，分别用 `--num-episodes`、`--max-duration` 修改；这些预算不保证阻塞 SDK 或模型调用能立即返回。
 
