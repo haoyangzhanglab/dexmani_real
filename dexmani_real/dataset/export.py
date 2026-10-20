@@ -32,6 +32,10 @@ from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
 
+# Storage blocks are independent of the multi-modal processing batch budget.
+STORAGE_CHUNK_BYTES = 1024 * 1024
+STORAGE_CHUNK_MAX_ROWS = 128
+
 
 class CanonicalExporter:
     """Own one canonical export, its metadata baseline, staging and shared FK."""
@@ -178,7 +182,7 @@ class CanonicalExporter:
                                         prefix=f".{self.target.name}.tmp-", dir=self.target.parent
                                     )
                                 )
-                            self.root, self.data = self.create_store(attrs, tails, chunk)
+                            self.root, self.data = self.create_store(attrs, tails)
                         count = self.consume_episode(blocks, tails, frames)
                     except RawDataError as exc:
                         for key, (tail, _) in tails.items():
@@ -222,12 +226,15 @@ class CanonicalExporter:
             if self.staging is not None:
                 logger.warning("Export staging retained for inspection: %s", self.staging)
 
-    def create_store(self, attrs, tails, chunk):
+    def create_store(self, attrs, tails):
         root = zarr.open_group(str(self.staging), mode="w")
         root.attrs.update(dict(attrs, data_revision=self.revision))
         data = root.create_group("data")
         compressor = zarr.get_codec({"id": "zstd", "level": self.compression_level})
         for key, (tail, dtype) in tails.items():
+            row_bytes = int(np.prod(tail)) * dtype.itemsize
+            # A full frame is the minimum decode unit, even when larger than the target.
+            chunk = max(1, min(STORAGE_CHUNK_MAX_ROWS, STORAGE_CHUNK_BYTES // row_bytes))
             data.create_dataset(
                 key,
                 shape=(0, *tail),

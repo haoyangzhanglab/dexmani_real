@@ -33,7 +33,7 @@ from dexmani_real.planning import XArm7MotionPlanner
 from dexmani_real.planning.admission import TargetAdmission
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import IKFailureKind, OnlineIKSolver, make_online_ik_solver
-from dexmani_real.robot.commands import RobotCommand, DispatchError
+from dexmani_real.robot.commands import DispatchError
 from dexmani_real.robot.home import build_home_planner, execute_arm_home
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.observation import read_camera_frame, sample_is_fresh
@@ -44,7 +44,9 @@ from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.teleop.jog import (
     any_jog_key_held,
     compute_cartesian_jog_delta,
+    jog_motion_requested,
     propose_cartesian_jog_pose,
+    submit_jog_target,
 )
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import LoopRate
@@ -488,7 +490,7 @@ class CameraCalibrationSession:
             initial_state = self.robot.read_state().arm[0]
 
             self.keys = KeyboardInput(
-                jog_change_callback=self.runtime_state.revoke_motion,
+                jog_change_callback=self.runtime_state.jog_input_changed,
                 quit_callback=self.runtime_state.request_quit,
                 capture_commands=False,
                 capture_raw_events=True,
@@ -651,13 +653,15 @@ class CameraCalibrationSession:
         self.feedback_timestamp_ns = int(refreshed["timestamp_ns"])
         if not home_result.ok:
             print("  WARNING: return-home request was not executed")
-        self.blocked_until_release = False
+        if not any_jog_key_held(self.keys.pressed_keys()):
+            self.blocked_until_release = False
         self.rate.reset()
         return True
 
     def motion_tick(self):
         """Propose a jog target and commit it only after successful dispatch."""
-        safety_state = self.runtime_state.safety_state
+        with self.runtime_state.motion_lock:
+            safety_state, epoch = self.runtime_state.safety_state, self.runtime_state.run_id
         if (
             self.runtime_state.error_state
             or self.runtime_state.estop_request
@@ -678,12 +682,7 @@ class CameraCalibrationSession:
             return
         keyboard = self.runtime.keyboard_teleop
         pressed_keys, generation = self.keys.snapshot()
-        dx, drpy = compute_cartesian_jog_delta(
-            pressed_keys,
-            keyboard.delta_pos_m,
-            keyboard.delta_rpy_rad,
-        )
-        moving = bool(np.any(dx != 0.0) or np.any(drpy != 0.0))
+        moving = jog_motion_requested(pressed_keys)
         if not moving:
             if self.robot.stop_required:
                 self.runtime_state.revoke_motion()
@@ -698,7 +697,6 @@ class CameraCalibrationSession:
                 )
             return
 
-        epoch = self.runtime_state.run_id
         if safety_state == SafetyState.ARMED:
             self.command_qpos = self.command_pose = None
             if self.robot.stop_required:
@@ -715,14 +713,8 @@ class CameraCalibrationSession:
             refreshed = self.robot.read_state().arm[0]
             self.current_qpos = refreshed["qpos"]
             self.feedback_timestamp_ns = int(refreshed["timestamp_ns"])
-            pressed_keys, refreshed_generation = self.keys.snapshot()
-            if refreshed_generation != generation:
+            if self.keys.snapshot()[1] != generation:
                 return
-            dx, drpy = compute_cartesian_jog_delta(
-                pressed_keys,
-                keyboard.delta_pos_m,
-                keyboard.delta_rpy_rad,
-            )
         baseline_qpos = self.command_qpos
         baseline_pose = self.command_pose
         if baseline_qpos is None:
@@ -731,6 +723,9 @@ class CameraCalibrationSession:
         workspace_margin_m = float(self.runtime.keyboard_teleop.workspace_command_margin_m)
         command_low = self.workspace[:, 0] + workspace_margin_m
         command_high = self.workspace[:, 1] - workspace_margin_m
+        dx, drpy = compute_cartesian_jog_delta(
+            pressed_keys, keyboard.delta_pos_m, keyboard.delta_rpy_rad
+        )
         proposed_pose, desired_pos, changed = propose_cartesian_jog_pose(
             baseline_pose, dx, drpy, command_low, command_high
         )
@@ -769,27 +764,11 @@ class CameraCalibrationSession:
             self.blocked_until_release = True
             logger.warning("calibration target rejected: %s", rejection)
             return
-        if self.keys.snapshot()[1] != generation:
-            return
-
-        if safety_state == SafetyState.ARMED:
-            with self.runtime_state.motion_lock:
-                # A revoke during IK must also fence the first jog proposal.
-                if self.runtime_state.run_id != epoch:
-                    self.command_qpos = None
-                    self.command_pose = None
-                    return
-                if not self.runtime_state.begin_motion():
-                    self.command_qpos = None
-                    self.command_pose = None
-                    self.fault("failed to enter calibration motion")
-                    return
-                epoch = self.runtime_state.run_id
         q_cmd = ik_result.qpos
         try:
             self.robot.arm.update_health(upstream_until_ns=2**63 - 1)
-            self.robot.send_action(
-                RobotCommand(epoch, q_cmd),
+            committed = submit_jog_target(
+                self.keys, generation, self.runtime_state, self.robot, q_cmd, epoch,
                 valid_until_ns=self.feedback_timestamp_ns
                 + int(self.runtime.arm.feedback_max_age_s * 1e9)
                 + 1,
@@ -803,9 +782,10 @@ class CameraCalibrationSession:
                 )
                 raise
             logger.info("calibration motion interrupted: dispatch=%s", exc.result)
-            self.runtime_state.revoke_motion(expected_run_id=epoch)
             self.robot.stop()
             self.command_qpos = self.command_pose = None
+            return
+        if committed is None:
             return
         self.command_pose = proposed_pose
         self.command_qpos = q_cmd.copy()

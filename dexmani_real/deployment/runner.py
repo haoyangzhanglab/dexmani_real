@@ -105,6 +105,10 @@ class PolicyRunner:
         self.camera_parameters = camera_parameters
         self.recorder = recorder
         self.history = deque(maxlen=policy_info.n_obs_steps)
+        self.hand_history = (
+            deque(maxlen=policy_info.hand_history_steps)
+            if policy_info.hand_history_steps is not None else None
+        )
         self.recording_started = False
         self.plan = None
         self.query = None
@@ -212,6 +216,8 @@ class PolicyRunner:
         if self.model.future is None:
             self.query = None
         self.history.clear()
+        if self.hand_history is not None:
+            self.hand_history.clear()
         self.previous_arm = None
         self.run_id = None
         self.wait_started_ns = None
@@ -441,6 +447,8 @@ class PolicyRunner:
             if self.results is not None:
                 self.results.entered(self.run_id)
             self.history.clear()
+            if self.hand_history is not None:
+                self.hand_history.clear()
             self.plan = self.query = None
             self.previous_arm = None
             self.last_slot = -1
@@ -563,6 +571,15 @@ class PolicyRunner:
         kwargs = (
             dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot) if prefix is not None else {}
         )
+        if self.hand_history is not None:
+            if not self.hand_history:
+                # Match training's episode-initial measured pose, before the first query action.
+                hand = np.asarray(observation["joint_state"][-1, -12:], dtype=np.float64)
+                if hand.shape != (12,) or not np.isfinite(hand).all():
+                    return ControlRejection("invalid_hand_history_bootstrap")
+                self.hand_history.extend(hand.copy() for _ in range(self.hand_history.maxlen))
+            # The model thread owns this snapshot; later appends/reset cannot change it.
+            kwargs["action_context"] = {"hand_history": np.stack(self.hand_history)}
         if self.recorder is not None:
             query.evidence = dict(
                 query_id=query.query_id,
@@ -708,6 +725,10 @@ class PolicyRunner:
             result = self.robot.send_action(
                 command, valid_until_ns=valid_until_ns, execute_until_ns=execute_until_ns
             )
+            if result.arm != DispatchStatus.SUBMITTED or result.hand not in (
+                DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED
+            ):
+                raise DispatchError("incomplete action dispatch", result, cause="dispatch_status")
         except (DispatchError, DispatchInterrupted) as exc:
             result, failure = exc.result, exc
         finally:
@@ -770,6 +791,9 @@ class PolicyRunner:
                 raise failure
             return
         self.previous_arm = command.arm_qpos
+        if self.hand_history is not None:
+            # Ordinary-send CRC is admitted but unconfirmed, just as in canonical actions.
+            self.hand_history.append(command.hand_qpos.copy())
         self.wait_started_ns = None
         self.record(row, command, result)
         if slot + 1 == plan.segment_end and self.execution.execution_mode == "sync":

@@ -11,14 +11,20 @@ from dexmani_real.config.experiment import (
 )
 from dexmani_real.planning.admission import TargetAdmission
 from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_solver
-from dexmani_real.robot.commands import DispatchError, RobotCommand
+from dexmani_real.robot.commands import DispatchError
 from dexmani_real.robot.home import build_home_planner, home_robot
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
-from dexmani_real.teleop.jog import compute_cartesian_jog_delta, propose_cartesian_jog_pose
+from dexmani_real.teleop.jog import (
+    any_jog_key_held,
+    compute_cartesian_jog_delta,
+    jog_motion_requested,
+    propose_cartesian_jog_pose,
+    submit_jog_target,
+)
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import LoopRate
 
@@ -47,7 +53,7 @@ class KeyboardTeleopSession:
             quit_callback=runtime_state.request_quit,
             capture_commands=False,
             estop_callback=runtime_state.request_emergency_stop,
-            jog_change_callback=runtime_state.revoke_motion,
+            jog_change_callback=runtime_state.jog_input_changed,
         )
         jog_config = self.runtime.keyboard_teleop
         home_down = False
@@ -117,11 +123,8 @@ class KeyboardTeleopSession:
                 home_down = home_pressed
 
                 pressed_keys, generation = keys.snapshot()
-                dx, drpy = compute_cartesian_jog_delta(
-                    pressed_keys, jog_config.delta_pos_m, jog_config.delta_rpy_rad
-                )
-                moving = np.any(dx) or np.any(drpy)
-                if not moving:
+                moving = jog_motion_requested(pressed_keys)
+                if not any_jog_key_held(pressed_keys):
                     blocked_until_release = False
                 if not moving or home_pressed or blocked_until_release:
                     if robot.stop_required:
@@ -131,10 +134,9 @@ class KeyboardTeleopSession:
                     robot.service_idle()
                     continue
 
-                safety_state = runtime_state.safety_state
-                epoch = runtime_state.run_id
+                with runtime_state.motion_lock:
+                    safety_state, epoch = runtime_state.safety_state, runtime_state.run_id
                 if safety_state == SafetyState.ARMED:
-                    preparation_generation = generation
                     command_qpos = command_pose = None
                     if robot.stop_required:
                         robot.stop()
@@ -146,13 +148,7 @@ class KeyboardTeleopSession:
                         robot.stop()
                         command_qpos = command_pose = None
                         continue
-                    pressed_keys, generation = keys.snapshot()
-                    if generation != preparation_generation:
-                        continue
-                    dx, drpy = compute_cartesian_jog_delta(
-                        pressed_keys, jog_config.delta_pos_m, jog_config.delta_rpy_rad
-                    )
-                    if not (np.any(dx) or np.any(drpy)) or "r" in pressed_keys:
+                    if keys.snapshot()[1] != generation:
                         continue
 
                 row = read_observation(
@@ -175,6 +171,9 @@ class KeyboardTeleopSession:
                 if baseline_qpos is None:
                     baseline_qpos = measured_qpos.copy()
                     baseline_pose = solver.kin.compute_eef_pose_base(measured_qpos)
+                dx, drpy = compute_cartesian_jog_delta(
+                    pressed_keys, jog_config.delta_pos_m, jog_config.delta_rpy_rad
+                )
                 proposed_pose, _, changed = propose_cartesian_jog_pose(
                     baseline_pose,
                     dx,
@@ -207,23 +206,10 @@ class KeyboardTeleopSession:
                     blocked_until_release = True
                     continue
 
-                if keys.snapshot()[1] != generation:
-                    continue
-                if safety_state == SafetyState.ARMED:
-                    with runtime_state.motion_lock:
-                        # A revoke during IK must also fence the first jog proposal.
-                        if runtime_state.run_id != epoch:
-                            command_qpos = None
-                            command_pose = None
-                            continue
-                        if not runtime_state.begin_motion():
-                            break
-                        epoch = runtime_state.run_id
-
                 target = result.qpos
                 try:
-                    robot.send_action(
-                        RobotCommand(epoch, target),
+                    committed = submit_jog_target(
+                        keys, generation, runtime_state, robot, target, epoch,
                         valid_until_ns=feedback_deadline_ns(row, self.runtime),
                         execute_until_ns=row.observation_timestamp_ns
                         + int(self.runtime.control.vr_mapping.stale_threshold_s * 1e9),
@@ -232,11 +218,12 @@ class KeyboardTeleopSession:
                     if not exc.revoked:
                         raise
                     logger.info("keyboard motion interrupted: dispatch=%s", exc.result)
-                    runtime_state.revoke_motion(expected_run_id=epoch)
                     robot.stop()
                     command_qpos = command_pose = None
                     continue
 
+                if committed is None:
+                    continue
                 command_pose = proposed_pose
                 command_qpos = target.copy()
 

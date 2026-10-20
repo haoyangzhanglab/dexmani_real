@@ -110,7 +110,7 @@ class KeyboardInput:
         quit_callback: Callable[[], None] | None = None,
         capture_commands: bool = True,
         capture_raw_events: bool = False,
-        jog_change_callback: Callable[[], None] | None = None,
+        jog_change_callback: Callable[[bool], None] | None = None,
     ) -> None:
         self._buffer: deque[OperatorCommand] = deque()
         self._events: deque[str] = deque()
@@ -210,7 +210,7 @@ class KeyboardInput:
                     self._keys.add(name)
                     if first_press:
                         self._generation += 1
-                self.jog_changed(name, first_press)
+                    self.jog_changed(name, first_press)
                 if name == "esc":
                     self.latch_emergency_stop()
                     return
@@ -240,18 +240,20 @@ class KeyboardInput:
                         self._keys.discard(name)
                         if changed:
                             self._generation += 1
-                self.jog_changed(name, changed)
+                    self.jog_changed(name, changed)
             except Exception:
                 logger.warning("keyboard release callback failed", exc_info=True)
 
         return on_press, on_release
 
-    def jog_changed(self, name, changed):
+    def jog_changed(self, name: str | None, changed: bool) -> None:
+        """Called under the input lock; the callback may only update motion authority."""
         if changed and self._jog_change_callback is not None:
-            from dexmani_real.teleop.jog import CARTESIAN_JOG_KEYS
+            from dexmani_real.teleop.jog import CARTESIAN_JOG_KEYS, jog_motion_requested
 
-            if name in CARTESIAN_JOG_KEYS:
-                self._jog_change_callback()
+            # HOME is edge-triggered: releasing R must not cancel a HOME already in progress.
+            if name in CARTESIAN_JOG_KEYS or (name == "r" and name in self._keys):
+                self._jog_change_callback(jog_motion_requested(self._keys))
 
     def start(self) -> None:
         """Start the daemon keyboard listener once."""
@@ -284,6 +286,7 @@ class KeyboardInput:
             self._buffer.clear()
             self._events.clear()
             self._keys.clear()
+            self._generation += 1  # A restarted listener cannot revive old proposals.
             self._callbacks_active = True
         on_press, on_release = self.callbacks(keyboard)
 
@@ -367,7 +370,9 @@ class KeyboardInput:
             healthy = False
         if not healthy:
             with self._condition:
-                self._keys.clear()
+                if self._keys:
+                    self._keys.clear()
+                    self._generation += 1
             if self._running:
                 # SDK fences also check keyboard health; losing emergency-stop input must fail safe.
                 self.latch_emergency_stop()
@@ -392,6 +397,18 @@ class KeyboardInput:
         """One atomic held-key proposal; release/repress never revives its generation."""
         with self._condition:
             return frozenset(self._keys), self._generation
+
+    def commit_if_current(self, generation: int, submit: Callable[[], Any]) -> Any:
+        """Serialize input changes with a short parent-only enqueue, never SDK I/O."""
+        with self._condition:
+            if (
+                not self._callbacks_active
+                or self._estop_latched.is_set()
+                or generation != self._generation
+            ):
+                return None
+            # Lock order: input -> RuntimeState.motion_lock -> short arm IPC locks.
+            return submit()
 
     def pop_event(self) -> str | None:
         with self._condition:

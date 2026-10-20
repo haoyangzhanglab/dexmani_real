@@ -67,7 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
     )
-    parser.add_argument("--chunk-frames", type=int, default=100)
+    parser.add_argument(
+        "--chunk-frames", type=int, default=100,
+        help="Maximum processing batch rows; storage chunks are sized independently per field",
+    )
     parser.add_argument("--compression-level", type=int, default=3)
     return parser
 

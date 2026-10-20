@@ -66,13 +66,20 @@ def validate_deployment_config(
 ) -> PointCloudConfig | None:
     """Check both deployment entries before outputs, models or devices; no calibration I/O."""
     target = saved_config["agent"].get("_target_")
-    if target == "dexmani_policy.agents.core.lamp_policy.LAMPPolicy":
-        raise NotImplementedError(
-            "LAMP live deployment is not supported: Real does not yet provide strictly past "
-            "executed hand commands as hand_history. Enable it only after real "
-            "action_context.hand_history is integrated."
-        )
     runtime.execution.validate(info)
+    history_steps = info.hand_history_steps
+    if history_steps is not None:
+        if type(history_steps) is not int or history_steps < 1:
+            raise ValueError("hand_history_steps must be a positive integer or None")
+        if (
+            info.action_mode != "joint"
+            or info.control_action_dim != 19
+            or "joint_state" not in info.observation_fields
+            or (info.horizon, info.n_obs_steps, info.n_action_steps, runtime.execution.action_steps)
+            != (1, 1, 1, 1)
+            or runtime.execution.execution_mode != "sync"
+        ):
+            raise ValueError("LAMP hand history requires joint, joint_state, H=Nobs=C=A_exec=1 and sync")
     if (
         target == "dexmani_policy.agents.core.temporal_latent_flow_policy.TemporalLatentFlowPolicy"
         and runtime.execution.execution_mode != "sync"

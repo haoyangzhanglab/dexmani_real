@@ -116,7 +116,9 @@ python examples/export_policy_zarr.py episodes/test --config local.yaml
 
 公共导出要求每段全部 **15 字段**完整、浮点数值有限，并通过时序及动作执行证据检查。缺字段、NaN/Inf、RGB-D 行数不符、相机几何缺失或非法、空点云均整段拒绝，记录原因并保留原 Raw；任务失败本身不排除技术有效的数据。导出不删坏帧、不填补缺测、不修改 Raw。
 
-默认输出 `datasets/test.zarr`，目标必须不存在；`--output` 指定新路径，`--exclude` 排除指定 episode，`--chunk-frames` 调整批大小，`--pointcloud-num-points` 覆盖点数。同一缓存要求 task、dt、depth scale 和数组 shape/dtype 一致；合法 metadata 冲突会在读取后续数值前中止导出。文件系统或处理异常保留 staging 供排查。
+默认输出 `datasets/test.zarr`，目标必须不存在；`--output` 指定新路径，`--exclude` 排除指定 episode，`--chunk-frames` 调整处理批大小，`--pointcloud-num-points` 覆盖点数。同一缓存要求 task、dt、depth scale 和数组 shape/dtype 一致；合法 metadata 冲突会在读取后续数值前中止导出。文件系统或处理异常保留 staging 供排查。
+
+处理批次受 64 MiB 总数据预算约束；存储按各字段独立分块，目标解压大小约 1 MiB、时间维 1–128 行。默认 640×480 RGB/depth 为单帧块，低维字段保留批量块；单帧超过目标大小时仍保存完整帧，该预算不能限制单帧最小解码量。已有缓存不会自动改写，使用正常导出和新的 `--output` 重建。新导出生成新 `data_revision`，已有 checkpoint／手部表示产物的来源检查仍生效，不能复制旧 revision 绕过检查。
 
 训练 action 表示本拍提交的绝对关节目标，`action_ee` 是该目标的 FK，均不代表下一拍已到达。时序筛选同时检查逐拍间隔与累计偏离；Raw 采集正常结束不等于可导出。布局采用 `data/*` 与 `meta/episode_ends`，字段定义见 [Canonical 数据契约](dexmani_real/dataset/contracts.py)，处理入口见 [dataset/processing.py](dexmani_real/dataset/processing.py)。
 
@@ -141,7 +143,7 @@ python examples/run_policy.py policy/task/experiment --config local.yaml --execu
 
 预取步数表示距交接还剩多少个控制步时启动下一次推理，必须满足策略 horizon 的容量约束。当前 RTC 支持连续动作 BasePolicy DDIM，ManiFlow 支持 sync/async，Temporal 仅支持 sync；具体参数见 `--help`。
 
-LAMP 暂不支持真机部署，需先接入严格过去时序的已执行手命令 `action_context.hand_history`。执行窗口、输入能力及 LAMP/Temporal 限制会在创建会话目录、加载模型和连接设备前检查。
+LAMP 支持 joint、H=Nobs=A_exec=1、sync，历史长度来自保存配置。每轮以初始实测手姿补齐历史，之后按实际下发的手部目标推进；允许的 `CRC_UNCONFIRMED` 仍未确认，不代表 ACK 或关节到位。WAIT 不追加命令；sync 保留实际推理延迟，执行间隔可能与训练不同。真机闭环 **NOT VERIFIED**。执行窗口、输入能力及 LAMP/Temporal 限制在创建会话目录、加载模型和连接设备前检查。
 
 H 回 HOME、B 开始本轮、S 结束本轮；整理场景后再次按 H、B 开始下一轮。Q 提前退出，ESC 请求急停，T 在空闲且无接触时请求复位触觉。部署不使用 C/D。默认最多 20 轮，每轮运行预算 60 秒，分别用 `--num-episodes`、`--max-duration` 修改；这些预算不保证阻塞 SDK 或模型调用能立即返回。
 
@@ -165,13 +167,15 @@ python examples/replay_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config
 
 | 用途 | 入口 | 运行边界 |
 | --- | --- | --- |
-| 键盘 jog / HOME | [keyboard_teleop.py](examples/keyboard_teleop.py) | 连接机器人，不启动相机或 VR；松键停止 jog，R 执行 HOME |
+| 键盘 jog / HOME | [keyboard_teleop.py](examples/keyboard_teleop.py) | 连接机器人，不启动相机或 VR；净运动意图归零停止 jog，R 执行 HOME |
 | XHand 动作与反馈 | [xhand_control_example.py](examples/xhand_control_example.py) | 默认执行动作；`--read-only` 仍连接手并读取反馈 |
 | RGB-D 诊断 | [realsense_record_example.py](examples/realsense_record_example.py) | 连接相机，交互查看 RGB-D 与点云 |
 | 点云诊断 / 桌面标定 | [pointcloud_process_example.py](examples/pointcloud_process_example.py) | 连接相机；`--save-dir` 保存本次 RGB-D、点云及重建 metadata |
 | 物体重建与跟踪 | [CORDViP 示例](examples/cordvip/README.md) | 使用独立的 `cordvip_geometry` 依赖与入口，区分离线数据和实时相机模式 |
 
 点云诊断保存与最终显示使用同一帧，后续连续帧测速仅报告耗时和有效点云数量。RGB-D 诊断缺少有效相机外参或无匹配 serial 时关闭点云显示，继续 RGB/Depth 预览。关闭 `pointcloud.remove_table` 时处理不使用桌面平面；拟合结果只有确认后才发布。各入口的参数与按键以 `--help` 和交互提示为准。
+
+键盘遥操作与手眼标定的 jog 共用提交规则：连续 RUNNING 时，非零方向组合变化更新后续目标；完全抵消或释放最后一个运动键立即撤销授权。准备期间的输入变化使旧准备失效；触界、IK 或准入拒绝后必须完全释放 jog 键才能重新使能。目标入队与输入 generation 校验在同一提交点完成，停止继续通过原有 authority fence 使待执行目标失效，无法撤回已经跨过 SDK 边界的调用。该交互调整仅经离线检查，真机 **NOT VERIFIED**。
 
 ## 数据与安全边界
 

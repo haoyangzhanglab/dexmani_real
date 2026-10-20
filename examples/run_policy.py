@@ -19,7 +19,8 @@
 执行模式默认 sync；CLI 执行参数优先于 --config YAML。
 RTC 使用 --execution-mode rtc，并显式设置 --prefetch-steps 和 --rtc-guidance-cap。
 当前 RTC 仅支持连续动作 BasePolicy DDIM 策略；ManiFlow 支持 sync/async，Temporal 仅支持 sync。
-LAMP 暂不支持真机部署，需先接入严格过去时序的已执行手命令 action_context.hand_history。
+LAMP 仅支持 joint、H=Nobs=A_exec=1、sync；Real 提供历史手部下发目标，CRC_UNCONFIRMED 不代表 ACK。
+LAMP 的 sync 等待保留实际推理延迟；真机闭环尚未验证。
 执行窗口、输入能力及 LAMP/Temporal 限制在创建会话目录、加载模型和连接设备前检查。
 普通运行会连接设备，关闭输出不是离线模式；--print-config 不连接设备。
 其他参数见 --help。

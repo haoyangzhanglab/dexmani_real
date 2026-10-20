@@ -61,6 +61,14 @@ class RuntimeState:
             if not self.requests_allow_motion() or not self.revoke_motion():
                 raise RuntimeError("arming rejected")
 
+    def jog_input_changed(self, moving: bool) -> None:
+        """Keep a running jog epoch only while the new net intent remains nonzero."""
+        with self.motion_lock:
+            if self.safety_state == SafetyState.RUNNING and moving and self.requests_allow_motion():
+                return
+            if self.safety_state in (SafetyState.ARMED, SafetyState.RUNNING):
+                self.revoke_motion()
+
     def begin_motion(self) -> tuple[int, int] | None:
         with self.motion_lock:
             if self.safety_state != SafetyState.ARMED or not self.requests_allow_motion():
