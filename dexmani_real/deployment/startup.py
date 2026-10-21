@@ -53,7 +53,7 @@ def validate_deployment_config(
     info: Any, runtime: Any, *, record_raw: bool
 ) -> PointCloudConfig | None:
     """Check both deployment entries before outputs, models or devices; no calibration I/O."""
-    target = info.saved_config["agent"].get("_target_")
+    info.validate_execution_mode(runtime.execution.execution_mode)
     runtime.execution.validate(info)
     history_steps = info.hand_history_steps
     if history_steps is not None:
@@ -65,14 +65,8 @@ def validate_deployment_config(
             or "joint_state" not in info.observation_fields
             or (info.horizon, info.n_obs_steps, info.n_action_steps, runtime.execution.action_steps)
             != (1, 1, 1, 1)
-            or runtime.execution.execution_mode != "sync"
         ):
-            raise ValueError("LAMP hand history requires joint, joint_state, H=Nobs=C=A_exec=1 and sync")
-    if (
-        target == "dexmani_policy.agents.core.temporal_latent_flow_policy.TemporalLatentFlowPolicy"
-        and runtime.execution.execution_mode != "sync"
-    ):
-        raise NotImplementedError("TemporalLatentFlowPolicy live deployment supports sync only")
+            raise ValueError("LAMP hand history requires joint, joint_state, H=Nobs=C=A_exec=1")
     cloud_recipe = validate_policy_inputs(info, runtime)
     validate_robot_config(runtime)
     validate_control_rate(runtime, 1.0 / info.control_dt_s)

@@ -46,6 +46,7 @@ class ExecutionConfig:
     rtc_guidance_cap: float | None = None
 
     def validate(self, info) -> None:
+        """Validate Real budgets after PolicyInfo checks the execution mode."""
         dt = info.control_dt_s
         if (
             isinstance(dt, bool)
@@ -63,8 +64,7 @@ class ExecutionConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if info.n_obs_steps > info.horizon:
             raise ValueError("n_obs_steps must not exceed horizon")
-        if self.execution_mode not in {"sync", "async", "rtc"}:
-            raise ValueError("execution_mode must be sync, async or rtc")
+
         tolerance = self.start_arm_home_tolerance_deg
         if (
             isinstance(tolerance, bool)

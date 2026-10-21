@@ -64,6 +64,7 @@ class ControlParams:
 @dataclass(frozen=True)
 class KeyboardTeleopParams:
     control_hz: float = 30.0
+    target_max_age_s: float = 0.5
     delta_pos_m: float = 0.008
     delta_rpy_rad: float = 0.03
     workspace_command_margin_m: float = 0.005
@@ -71,7 +72,7 @@ class KeyboardTeleopParams:
     ik_max_pose_error_rot_rad: float = radians(2.0)
 
     def validate(self) -> None:
-        for name in ("control_hz", "delta_pos_m", "delta_rpy_rad"):
+        for name in ("control_hz", "target_max_age_s", "delta_pos_m", "delta_rpy_rad"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"keyboard {name} must be finite and positive")
         margin = self.workspace_command_margin_m

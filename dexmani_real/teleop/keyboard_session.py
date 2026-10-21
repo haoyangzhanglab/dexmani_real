@@ -237,7 +237,7 @@ class KeyboardTeleopSession:
                 self.keys, generation, self.runtime_state, self.robot, target, epoch,
                 valid_until_ns=feedback_deadline_ns(row, self.runtime),
                 execute_until_ns=row.observation_timestamp_ns
-                + int(self.runtime.control.vr_mapping.stale_threshold_s * 1e9),
+                + int(self.jog_config.target_max_age_s * 1e9),
                 commit_reference=commit_reference,
             )
         except DispatchError as exc:

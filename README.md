@@ -154,7 +154,7 @@ python examples/run_policy.py policy/task/experiment --config local.yaml --execu
 
 预取步数表示距交接还剩多少个控制步时启动下一次推理，必须满足策略 horizon 的容量约束。当前 RTC 支持连续动作 BasePolicy DDIM，ManiFlow 支持 sync/async，Temporal 仅支持 sync；具体参数见 `--help`。
 
-LAMP 支持 joint、H=Nobs=A_exec=1、sync，历史长度来自保存配置。每轮以初始实测手姿补齐历史，之后按实际下发的手部目标推进；允许的 `CRC_UNCONFIRMED` 仍未确认，不代表 ACK 或关节到位。WAIT 不追加命令；sync 保留实际推理延迟，执行间隔可能与训练不同。真机闭环 **NOT VERIFIED**。执行窗口、输入能力及 LAMP/Temporal 限制在创建会话目录、加载模型和连接设备前检查。
+LAMP 支持 joint、H=Nobs=C=A_exec=1、sync，历史长度来自保存配置。每轮以初始实测手姿补齐历史，之后按实际下发的手部目标推进；允许的 `CRC_UNCONFIRMED` 仍未确认，不代表 ACK 或关节到位。WAIT 不追加命令；sync 保留实际推理延迟，执行间隔可能与训练不同。真机闭环 **NOT VERIFIED**。执行窗口、输入能力与 Policy 已知模式限制在创建会话目录、加载模型和连接设备前检查；RTC 的实际适配在恢复模型后检查。
 
 H 回 HOME、B 开始本轮、S 结束本轮；整理场景后再次按 H、B 开始下一轮。Q 提前退出，ESC 请求急停，T 在空闲且无接触时请求复位触觉。部署不使用 C/D。默认最多 20 轮，每轮运行预算 60 秒，分别用 `--num-episodes`、`--max-duration` 修改；这些预算不保证阻塞 SDK 或模型调用能立即返回。
 
@@ -187,6 +187,8 @@ python examples/replay_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config
 点云诊断保存与最终显示使用同一帧，快照保留处理配置、相机内外参、depth scale 和实际使用的桌面平面。后续连续帧测速仅报告耗时和有效点云数量。RGB-D 基础预览仅受相机与深度显示参数约束；启用点云时才检查对应处理配置与标定，不可用时继续 RGB/Depth 预览。关闭 `pointcloud.remove_table` 时处理不使用桌面平面；拟合结果只有确认后才发布。各入口的参数与按键以 `--help` 和交互提示为准。
 
 键盘遥操作与手眼标定的 jog 在运动键组合变化时先撤销旧动作授权，再准备后续目标；方向完全抵消或释放最后一个运动键会停止 jog。触界、IK 或准入拒绝后必须释放全部 jog 键才能重新操作。
+
+两者共用 `keyboard_teleop.target_max_age_s` 限制 jog 目标年龄，默认 0.5 秒，须为有限正值；`control.vr_mapping.stale_threshold_s` 仅用于 VR 路径。
 
 ## 数据与安全边界
 

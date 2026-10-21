@@ -30,7 +30,12 @@ from dexmani_real.calibration.camera.hand_eye import (
     CalibrationSamples,
     solve_hand_eye,
 )
-from dexmani_real.config.experiment import ExperimentConfig, validate_keyboard_workspace
+from dexmani_real.config.experiment import (
+    ExperimentConfig,
+    resolve_runtime_table,
+    validate_keyboard_workspace,
+    validate_robot_config,
+)
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.planning.target import TargetChecker
@@ -138,8 +143,8 @@ def build_planner(
     solver = make_online_ik_solver(
         runtime,
         kin=planner.kin,
-        max_pose_error_pos_m=float(runtime.keyboard_teleop.ik_max_pose_error_pos_m),
-        max_pose_error_rot_rad=float(runtime.keyboard_teleop.ik_max_pose_error_rot_rad),
+        max_pose_error_pos_m=runtime.keyboard_teleop.ik_max_pose_error_pos_m,
+        max_pose_error_rot_rad=runtime.keyboard_teleop.ik_max_pose_error_rot_rad,
     )
     # Online jog permits table contact; both scenes retain the declared fixed-home hand.
     solver.collision_model.set_hand_qpos(home_hand_qpos)
@@ -565,7 +570,7 @@ class CameraCalibrationSession:
             capture_params,
         )
         self.rate = LoopRate(
-            float(self.runtime.keyboard_teleop.control_hz),
+            self.runtime.keyboard_teleop.control_hz,
             label="camera_calibration",
         )
 
@@ -726,7 +731,7 @@ class CameraCalibrationSession:
         if baseline_qpos is None:
             baseline_qpos = self.current_qpos.copy()
             baseline_pose = self.solver.kin.compute_eef_pose_base(self.current_qpos)
-        workspace_margin_m = float(self.runtime.keyboard_teleop.workspace_command_margin_m)
+        workspace_margin_m = keyboard.workspace_command_margin_m
         command_low = self.workspace[:, 0] + workspace_margin_m
         command_high = self.workspace[:, 1] - workspace_margin_m
         dx, drpy = compute_cartesian_jog_delta(
@@ -779,7 +784,7 @@ class CameraCalibrationSession:
                 + int(self.runtime.arm.feedback_max_age_s * 1e9)
                 + 1,
                 execute_until_ns=self.feedback_timestamp_ns
-                + int(self.runtime.control.vr_mapping.stale_threshold_s * 1e9),
+                + int(keyboard.target_max_age_s * 1e9),
                 commit_reference=commit_reference,
             )
         except DispatchError as exc:
@@ -813,8 +818,6 @@ class CameraCalibrationSession:
             raise ValueError(
                 "camera calibration requires explicit hand_enabled=false and secured/absent hand"
             )
-        from dexmani_real.config.experiment import resolve_runtime_table, validate_robot_config
-
         validate_robot_config(self.runtime)
         self.runtime = resolve_runtime_table(self.runtime)
         workspace = validate_keyboard_workspace(self.runtime)
