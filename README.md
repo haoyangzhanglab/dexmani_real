@@ -158,7 +158,7 @@ LAMP 支持 joint、H=Nobs=A_exec=1、sync，历史长度来自保存配置。�
 
 H 回 HOME、B 开始本轮、S 结束本轮；整理场景后再次按 H、B 开始下一轮。Q 提前退出，ESC 请求急停，T 在空闲且无接触时请求复位触觉。部署不使用 C/D。默认最多 20 轮，每轮运行预算 60 秒，分别用 `--num-episodes`、`--max-duration` 修改；这些预算不保证阻塞 SDK 或模型调用能立即返回。
 
-checkpoint 默认 `latest`，也支持 `best`、已有百分比 milestone（如 `80pct`）或实验内的明确 checkpoint 路径，统一由 Policy 解析。`best` 使用选优记录中的推理设置，`--weights`、`--inference-steps` 可分别覆盖。默认产物位于 `rollouts/policy/task/experiment/session_*/`，`--output` 可指定根目录；`run_config.yaml` 保存实际配置与模型信息，`session_result.json` 保存评估摘要。
+checkpoint 默认 `latest`，也支持 `best`、已有百分比 milestone（如 `80pct`）或相对于实验 `checkpoints/` 的路径；绝对路径也必须位于该目录内，选择统一由 Policy 解析。`best` 从选优记录读取推理默认值，其他选择从实验保存配置的 `eval` 读取，`--weights`、`--inference-steps` 可分别覆盖。默认产物位于 `rollouts/policy/task/experiment/session_*/`，`--output` 可指定根目录；`run_config.yaml` 保存实际配置与模型信息，`session_result.json` 保存评估摘要。
 
 `--no-record` 与 `--no-results` 分别关闭 Raw 和摘要，同时关闭时不创建会话产物；**它们不会关闭设备连接或动作执行**。相机按策略输入与 Raw 录制需求启动，仅使用机器人状态且关闭 Raw 时不启动相机。
 

@@ -77,7 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--checkpoint",
         default="latest",
-        help="latest (default), best, milestone percentage (e.g. 80pct), or checkpoint filename",
+        help=(
+            "latest (default), best, milestone percentage (e.g. 80pct), "
+            "or a relative/absolute path within the experiment's checkpoints directory"
+        ),
     )
     parser.add_argument(
         "--num-episodes",
