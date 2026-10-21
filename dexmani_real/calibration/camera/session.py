@@ -78,21 +78,25 @@ def detect_aruco_stable(
     target_id: int | None,
     max_frame_age_s: float,
     n_frames: int,
-    cancel_requested,
+    not_before_ns: int,
+    check_capture,
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """Capture N frames and return SO(3) mean rotation and median translation for noise reduction."""
+    """Aggregate post-barrier RGB poses using an SO(3) mean and median translation."""
     rvecs_all: list[np.ndarray] = []
     tvecs_all: list[np.ndarray] = []
-    last_stamp = 0
+    last_stamp = not_before_ns
+    last_sequence = 0
+    last_color_frame = -1
     for _ in range(n_frames):
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            if cancel_requested():
-                raise CancelledError("calibration capture cancelled")
+            check_capture()
             frame = read_camera_frame(runtime_state)
             if (
                 frame
                 and frame["timestamp_ns"] > last_stamp
+                and frame["ring_sequence"] > last_sequence
+                and frame["color_frame_number"] > last_color_frame
                 and sample_is_fresh(frame["timestamp_ns"], max_frame_age_s)
             ):
                 break
@@ -100,8 +104,9 @@ def detect_aruco_stable(
         else:
             raise TimeoutError("fresh calibration image unavailable")
         last_stamp = frame["timestamp_ns"]
-        if cancel_requested():
-            raise CancelledError("calibration capture cancelled")
+        last_sequence = frame["ring_sequence"]
+        last_color_frame = frame["color_frame_number"]
+        check_capture()
         image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
         result = detect_aruco_pose(
             image,
@@ -111,8 +116,7 @@ def detect_aruco_stable(
             marker_corners=marker_corners,
             target_id=target_id,
         )
-        if cancel_requested():
-            raise CancelledError("calibration capture cancelled")
+        check_capture()
         if result is not None:
             rvecs_all.append(result[0])
             tvecs_all.append(result[1])
@@ -140,26 +144,6 @@ def build_planner(
     # Online jog permits table contact; both scenes retain the declared fixed-home hand.
     solver.collision_model.set_hand_qpos(home_hand_qpos)
     return planner, solver
-
-
-def read_stationary_calibration_arm_state(
-    runtime: ExperimentConfig,
-    robot,
-) -> tuple[np.void | None, str]:
-    """Read fresh arm feedback using the homing stationary bound."""
-    arm_state = robot.read_state().arm[0]
-    if not sample_is_fresh(arm_state["timestamp_ns"], runtime.arm.feedback_max_age_s):
-        return None, "arm feedback stale"
-    max_velocity_rad_s = float(np.max(np.abs(np.asarray(arm_state["qvel"]))))
-    velocity_convergence_rad_s = float(runtime.arm.homing.velocity_convergence_rad_s)
-    if max_velocity_rad_s > velocity_convergence_rad_s:
-        return (
-            None,
-            "arm velocity exceeds stationary bound "
-            f"({max_velocity_rad_s:.4f}rad/s > "
-            f"{velocity_convergence_rad_s:.4f}rad/s)",
-        )
-    return arm_state, ""
 
 
 def solve_calibration(
@@ -292,6 +276,7 @@ class CameraCalibrationSession:
             self.runtime_state.quit_requested
             or self.runtime_state.estop_request
             or self.runtime_state.error_state
+            or self.runtime_state.safety_state == SafetyState.FAULT
             or not self.runtime_state.running
             or not self.keys.healthy
             or self.keys.is_pressed("q")
@@ -299,16 +284,58 @@ class CameraCalibrationSession:
             or not self.camera_process.is_alive()
         )
 
+    def stop_jog(self):
+        """Revoke the target and require a physical key release before another jog."""
+        revoked = self.runtime_state.revoke_motion()
+        try:
+            self.robot.stop()
+        finally:
+            self.command_qpos = self.command_pose = None
+            self.blocked_until_release = True
+        return revoked and not self.cancel_requested()
+
+    def read_capture_feedback(self):
+        """Read one arm snapshot while servicing capture cancellation and device faults."""
+        if self.cancel_requested():
+            raise CancelledError("calibration capture cancelled")
+        arm = self.robot.read_state().arm[0]
+        issue = self.runtime_issue(arm)
+        if issue is not None:
+            self.fault(issue)
+        if self.cancel_requested():
+            raise CancelledError("calibration capture cancelled")
+        return arm
+
+    def read_capture_arm_state(self, after_ns):
+        """Confirm standstill from feedback acquired after the stop or sampling barrier."""
+        deadline_ns = time.monotonic_ns() + int(self.runtime.arm.feedback_max_age_s * 1e9)
+        while time.monotonic_ns() < deadline_ns:
+            arm = self.read_capture_feedback()
+            if arm["timestamp_ns"] <= after_ns:
+                time.sleep(0.01)
+                continue
+            speed_rad_s = float(np.max(np.abs(arm["qvel"])))
+            bound_rad_s = self.runtime.arm.homing.velocity_convergence_rad_s
+            if speed_rad_s > bound_rad_s:
+                return None, (
+                    "arm velocity exceeds stationary bound "
+                    f"({speed_rad_s:.4f}rad/s > {bound_rad_s:.4f}rad/s)"
+                )
+            return arm, ""
+        raise TimeoutError("new arm feedback unavailable after calibration capture barrier")
+
     def capture_sample(self):
         """Append one marker/arm observation only when the arm stayed stationary."""
         if self.cancel_requested():
             return
-        print(f"\n  [{len(self.samples) + 1}] capturing ArUco pose...", end=" ", flush=True)
-        arm_before, feedback_issue = read_stationary_calibration_arm_state(self.runtime, self.robot)
-        if arm_before is None:
-            print(f"FAILED — before capture: {feedback_issue}, skipped")
+        if not self.stop_jog():
             return
+        print(f"\n  [{len(self.samples) + 1}] capturing ArUco pose...", end=" ", flush=True)
         try:
+            arm_before, feedback_issue = self.read_capture_arm_state(time.monotonic_ns())
+            if arm_before is None:
+                print(f"FAILED — before capture: {feedback_issue}, skipped")
+                return
             aruco_pose = detect_aruco_stable(
                 self.runtime_state,
                 self.intrinsics,
@@ -318,8 +345,10 @@ class CameraCalibrationSession:
                 target_id=self.aruco_config.target_id,
                 max_frame_age_s=self.runtime.camera.max_frame_age_s,
                 n_frames=self.aruco_config.capture_frames,
-                cancel_requested=self.cancel_requested,
+                not_before_ns=time.monotonic_ns(),
+                check_capture=self.read_capture_feedback,
             )
+            arm_after, feedback_issue = self.read_capture_arm_state(time.monotonic_ns())
         except CancelledError:
             print("CANCELLED")
             return
@@ -328,9 +357,6 @@ class CameraCalibrationSession:
             print(f"FAILED — {exc}, skipped")
             return
 
-        if self.cancel_requested():
-            return
-        arm_after, feedback_issue = read_stationary_calibration_arm_state(self.runtime, self.robot)
         if self.cancel_requested():
             return
         if arm_after is None:
@@ -412,9 +438,8 @@ class CameraCalibrationSession:
                         "— press ENTER to recompute"
                     )
             elif event == "enter":
-                self.runtime_state.revoke_motion()
-                self.robot.stop()
-                self.command_qpos = self.command_pose = None
+                if not self.stop_jog():
+                    return
                 epoch = self.runtime_state.run_id
 
                 def cancelled():
@@ -557,8 +582,14 @@ class CameraCalibrationSession:
             self.rate.wait()
             self.frame += 1
 
-            if self.keys.is_pressed("esc"):
+            if self.runtime_state.estop_request or self.keys.is_pressed("esc"):
                 self.fault("operator e-stop", estop=True)
+                return 1
+            if (
+                self.runtime_state.error_state
+                or self.runtime_state.safety_state == SafetyState.FAULT
+            ):
+                self.fault("runtime fault during calibration")
                 return 1
             if not self.keys.healthy:
                 self.fault("keyboard listener exited", estop=True)
@@ -729,12 +760,7 @@ class CameraCalibrationSession:
             self.blocked_until_release = True
             return
 
-        rejection = self.target_checker.rejection(
-            ik_result.qpos,
-            self.current_qpos,
-            baseline_qpos,
-            collision_hand_qpos=np.deg2rad(self.runtime.hand.home_qpos_deg),
-        )
+        rejection = self.target_checker.endpoint_rejection(ik_result.qpos)
         if rejection is not None:
             self.blocked_until_release = True
             logger.warning("calibration target rejected: %s", rejection)
@@ -808,9 +834,7 @@ class CameraCalibrationSession:
             )
 
         self.home_planner, self.solver = planner, solver
-        self.target_checker = TargetChecker(
-            self.runtime, solver.collision_model, dynamic_rejection=solver.dynamic_rejection
-        )
+        self.target_checker = TargetChecker(self.runtime, solver.collision_model)
         self.workspace = workspace
         self.calibration_config = calib_cfg
         self.aruco_config = aruco_cfg

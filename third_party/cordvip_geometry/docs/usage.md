@@ -117,6 +117,8 @@ FoundationPose++ 2D 引导来自 [上游核心](https://github.com/teal024/Found
 
 `--with-hand` 读取同 Raw 行的实测 arm/hand 关节，使用对应相机外参与当前实验安装配置（可设 `--experiment-config`）做 FK。默认 1024 手点和固定 link IDs；缺失关节不能用 action、零或历史值填充。无真实时钟证据时 `hand_timing_available=False`、skew 为 NaN；Raw 行关联不等于物理同步。
 
+Raw 几何只读取所需的源时间与身份列，不依赖 `queries` 推理诊断。缺少必需列会报错；列中缺失源时钟时仅保留按行关联。
+
 ## 内存接口与产物
 
 宿主已有的 RGB-D 和实测关节应直接调用内存接口，不另开设备。模型加载及顺序调用须位于同一个推理 owner，GUI 可用 `SceneWorker`：

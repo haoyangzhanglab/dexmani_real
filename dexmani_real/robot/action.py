@@ -114,7 +114,7 @@ class ActionMapper:
         reason = (
             result.reason
             if not result.success
-            else self.joint_rejection(result.qpos, hand, current, previous)
+            else self.target_checker.endpoint_rejection(result.qpos)
         )
         return ActionResult(
             result.qpos if reason is None else None,

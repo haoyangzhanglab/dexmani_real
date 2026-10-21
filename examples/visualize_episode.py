@@ -146,7 +146,7 @@ class EpisodeVisualizer:
             self.rgb_index = -1
             meta = self.reader.meta
             self.camera_model = load_raw_episode_camera_model(self.reader)
-            self.camera_K = self.camera_model.geometry.color.matrix()
+            self.camera_K = self.camera_model.intrinsics.matrix()
             self.depth_meter = 1.0 / self.camera_model.depth_scale_m
             self.T_xarm_base_from_color = (
                 load_raw_episode_base_from_color(self.reader)
@@ -168,7 +168,7 @@ class EpisodeVisualizer:
                 if pointcloud_config is None:
                     raise ValueError("point-cloud visualization requires resolved config")
                 validate_aligned_depth_distortion(
-                    self.camera_model.geometry.color.distortion_model
+                    self.camera_model.intrinsics.distortion_model
                 )
                 self.pointcloud_config = pointcloud_config
                 logger.info(
@@ -266,7 +266,7 @@ class EpisodeVisualizer:
                     for i in range(arr.shape[1]):
                         rr.log(f"{base}/{i}", rr.SeriesLine(name=f"{i}"), static=True)
 
-        h, w = self.camera_model.geometry.color.height, self.camera_model.geometry.color.width
+        h, w = self.camera_model.intrinsics.height, self.camera_model.intrinsics.width
         rr.log(
             "camera/color",
             rr.Pinhole(
@@ -328,7 +328,7 @@ class EpisodeVisualizer:
             depth_raw=depth,
             color=self.rgb,
             depth_scale_m=self.camera_model.depth_scale_m,
-            intrinsics=self.camera_model.geometry.color,
+            intrinsics=self.camera_model.intrinsics,
             T_xarm_base_from_color=self.T_xarm_base_from_color,
             table_plane_abcd=self.table_plane_abcd,
             config=self.pointcloud_config,

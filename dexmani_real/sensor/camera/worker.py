@@ -30,7 +30,7 @@ class CameraWorker:
             self.shared.camera_depth_scale.value = self.camera.get_depth_scale()
             self.shared.camera_serial.value = self.camera.active_serial.encode()
             self.shared.camera_intrinsics.value = json.dumps(
-                self.camera.get_geometry().color.to_dict()
+                self.camera.get_color_intrinsics().to_dict()
             ).encode()
             self.last_frame = None
             self.last_advance_ns = [time.monotonic_ns(), time.monotonic_ns()]

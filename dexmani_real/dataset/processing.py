@@ -66,11 +66,11 @@ def validate_export_episode(
     reader.require_fields(*DATASET_SPECS, "rgb", "depth")
     try:
         camera = load_raw_episode_camera_model(reader)
-        validate_aligned_depth_distortion(camera.geometry.color.distortion_model)
+        validate_aligned_depth_distortion(camera.intrinsics.distortion_model)
         base_from_color = load_raw_episode_base_from_color(reader)
     except (ValueError, TypeError, KeyError) as exc:
         raise RawDataError(f"invalid camera geometry: {exc}") from exc
-    color = camera.geometry.color
+    color = camera.intrinsics
     expected = (frames, color.height, color.width)
     if reader["depth"].shape != expected or reader["depth"].dtype != np.uint16:
         raise RawDataError(f"depth must be uint16 {expected}")
@@ -122,10 +122,10 @@ class CanonicalEpisodeProcessor:
         self, reader: EpisodeReader, *, camera: RawEpisodeCameraModel, base_from_color: np.ndarray
     ):
         """Check and convert each Raw block without repairing or resampling rows."""
-        height, width = camera.geometry.color.height, camera.geometry.color.width
+        height, width = camera.intrinsics.height, camera.intrinsics.width
         try:
             camera_parameters = camera_parameters_cv(
-                camera.geometry.color,
+                camera.intrinsics,
                 base_from_color,
             )
         except ValueError as exc:
@@ -139,6 +139,9 @@ class CanonicalEpisodeProcessor:
                 if name not in ("timestamp", "dispatch_status")
             }
             for name, values in raw.items():
+                # Unchanged float32 tactile arrays are checked at the canonical write boundary.
+                if name in {"hand_contact", "hand_tactile_force"}:
+                    continue
                 if np.issubdtype(values.dtype, np.floating):
                     valid = np.isfinite(values).reshape(len(values), -1).all(axis=1)
                     if not valid.all():
@@ -185,7 +188,7 @@ class CanonicalEpisodeProcessor:
                     depth_raw=depth[offset],
                     color=image,
                     depth_scale_m=camera.depth_scale_m,
-                    intrinsics=camera.geometry.color,
+                    intrinsics=camera.intrinsics,
                     T_xarm_base_from_color=base_from_color,
                     table_plane_abcd=self.config.table_plane_abcd,
                     config=self.config.pointcloud,

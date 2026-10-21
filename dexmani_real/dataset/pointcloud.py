@@ -13,15 +13,15 @@ from dexmani_real.recording.storage.reader import (
     positive_int_attr,
     text_attr,
 )
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
+from dexmani_real.sensor.camera.geometry import CameraIntrinsics
 from dexmani_real.utils.geometry import validate_rigid_transform
 
 
 @dataclass(frozen=True)
 class RawEpisodeCameraModel:
-    """Aligned RGB-D geometry and depth scale from one raw episode."""
+    """Color-grid intrinsics and depth scale saved with aligned Raw RGB-D."""
 
-    geometry: RGBDGeometry
+    intrinsics: CameraIntrinsics
     depth_scale_m: float
 
 
@@ -49,15 +49,8 @@ def load_raw_episode_camera_model(reader: EpisodeReader) -> RawEpisodeCameraMode
     meta = reader.meta
     if text_attr(meta, "camera_payload_mode") != "depth_to_color_aligned_rgbd":
         raise ValueError("raw camera payload is not depth-to-color aligned RGB-D")
-    color = color_intrinsics_from_meta(meta)
-    # Raw aligned depth shares the color frame; CordViP consumes geometry.color.
-    geometry = RGBDGeometry(
-        depth=color,
-        color=color,
-        T_color_from_depth=np.eye(4, dtype=np.float64),
-    )
     return RawEpisodeCameraModel(
-        geometry=geometry,
+        intrinsics=color_intrinsics_from_meta(meta),
         depth_scale_m=positive_float_attr(meta, "depth_scale"),
     )
 

@@ -403,7 +403,7 @@ class RealSenseExample:
         total_dropped = 0
 
         try:
-            intrinsics = self.camera.get_geometry().color
+            intrinsics = self.camera.get_color_intrinsics()
             depth_scale_m = self.camera.get_depth_scale()
             if not np.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
                 raise ValueError("display depth scale must be finite and positive")

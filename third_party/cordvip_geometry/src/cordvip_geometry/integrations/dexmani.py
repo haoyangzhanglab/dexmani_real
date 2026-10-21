@@ -32,7 +32,7 @@ def iter_raw_episode(path: str | Path) -> Iterator[Frame]:
     with EpisodeReader(episode_path) as reader:
         reader.require_fields("rgb", "depth", "timestamp")
         camera = load_raw_episode_camera_model(reader)
-        intrinsics = camera.geometry.color
+        intrinsics = camera.intrinsics
         K = intrinsics.matrix()
         expected_shape = (intrinsics.height, intrinsics.width)
         depth = reader["depth"]
@@ -45,8 +45,7 @@ def iter_raw_episode(path: str | Path) -> Iterator[Frame]:
             or np.any(np.diff(observation_s) <= 0)
         ):
             raise ValueError("Raw observation timestamps must be finite and strictly increasing")
-        evidence = reader.read_timing()
-        timing = evidence["rows"]
+        timing = reader.read_timing_rows(("camera_sequence", "camera_ns"))
         images = iter(reader.iter_rgb_frames())
         for row_index in range(reader.num_frames):
             rgb = next(images, None)
@@ -94,7 +93,7 @@ def iter_live_realsense(
         active_serial = camera.active_serial
         if not isinstance(active_serial, str) or not active_serial.strip():
             raise RuntimeError("RealSense active serial is unavailable")
-        intrinsics = camera.get_geometry().color
+        intrinsics = camera.get_color_intrinsics()
         K = intrinsics.matrix()
         stall_timeout_ns = int(config.source_stall_timeout_s * 1e9)
         while True:
@@ -129,7 +128,7 @@ def iter_live_realsense(
 
 class RawHandCloudProvider:
     """Use exact-row measured joints, recorded camera extrinsics and the current hand mount.
-    Explicit fallback row/relative identities preserve missing camera clocks; alignment is not sync.
+    Missing camera clocks retain row/relative identities; row alignment does not establish sync.
     """
 
     def __init__(self, episode, config_path=None, num_points=1024, seed=0):
@@ -158,16 +157,17 @@ class RawHandCloudProvider:
             raise ValueError("hand mount must be finite shape (3,)")
         validate_unit_quaternion_wxyz(config.hand.T_eef_handbase_quat_wxyz, name="hand mount")
         self._T_eef_handbase = np.eye(4)
-        self._T_eef_handbase[:3, 3] = config.hand.T_eef_handbase_pos_xyz
+        self._T_eef_handbase[:3, 3] = mount
         self._T_eef_handbase[:3, :3] = quat_wxyz_to_rotmat(config.hand.T_eef_handbase_quat_wxyz)
         with EpisodeReader(self.episode) as reader:
             reader.require_fields("arm_qpos", "hand_qpos", "timestamp")
-            self._arm = np.asarray(reader["arm_qpos"][:])
-            self._hand = np.asarray(reader["hand_qpos"][:])
-            self._observation_s = np.asarray(reader["timestamp"][:])
+            self._arm = reader["arm_qpos"][:]
+            self._hand = reader["hand_qpos"][:]
+            self._observation_s = reader["timestamp"][:]
             self.T_base_camera = load_raw_episode_base_from_color(reader)
-            evidence = reader.read_timing()
-            self._timing = evidence["rows"]
+            self._timing = reader.read_timing_rows(
+                ("arm_ns", "hand_ns", "camera_ns", "camera_sequence")
+            )
             raw_notes = {
                 key: str(reader.meta[key])
                 for key in ("notes", "timestamp_source", "termination_reason")
@@ -185,10 +185,9 @@ class RawHandCloudProvider:
         # Hash consumed joints/times without rereading unrelated RGB-D payloads at startup.
         import hashlib
 
-        state_hash = hashlib.sha256(
-            self._arm.tobytes() + self._hand.tobytes() + self._observation_s.tobytes()
-        )
-        state_hash.update(self._timing.tobytes())
+        state_hash = hashlib.sha256()
+        for values in (self._arm, self._hand, self._observation_s, self._timing):
+            state_hash.update(values.tobytes())
         self.metadata = {
             **self.hand_model.metadata,
             "episode": str(self.episode),
@@ -205,7 +204,6 @@ class RawHandCloudProvider:
             "T_eef_handbase": self._T_eef_handbase.tolist(),
             "T_base_camera": self.T_base_camera.tolist(),
             "camera_extrinsics_source": "Raw meta.camera_T_xarm_base_from_color",
-            "timing_available": self._timing is not None,
             "timing_semantics": "host_monotonic_source_times_if_present_no_exposure_time_claim",
             "missing_timing": "row_aligned_geometry_only_not_verified_for_policy",
             "raw_notes": raw_notes,
@@ -262,7 +260,7 @@ class RawHandCloudProvider:
         )
         return {
             **cloud,
-            "joint_state": joint_state.copy(),
+            "joint_state": joint_state,
             "T_base_camera": self.T_base_camera,
             "source_id": frame.source_id,
             "row_index": int(row),

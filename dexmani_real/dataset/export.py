@@ -111,8 +111,8 @@ class CanonicalExporter:
                     frames = reader.num_frames
                     specs = canonical_array_specs(
                         self.processing.pointcloud.num_points,
-                        camera.geometry.color.height,
-                        camera.geometry.color.width,
+                        camera.intrinsics.height,
+                        camera.intrinsics.width,
                     )
                     period_ns, tolerance_ns = sampling_clock_ns(reader.control_hz)
                     attrs = dict(

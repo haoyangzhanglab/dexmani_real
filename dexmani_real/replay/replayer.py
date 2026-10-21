@@ -72,180 +72,9 @@ class TrajectoryReplayer:
         status, reason = ReplayStatus.COMPLETED, ""
         run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
         try:
-            if results is not None:
-                results.begin_episode()
-            self.robot.prepare_streaming(self.epoch)
-            row = read_observation(self.runtime_state, self.runtime, self.robot)
-            if row is None:
-                status, reason = ReplayStatus.REJECTED, "fresh robot feedback unavailable"
-            else:
-                self.previous_arm = row.arm["qpos"][0].copy()
-                # Reposition separately with operator oversight; never synthesize replay rows.
-                start_arm = wrap_nearest_equivalent(
-                    trajectory.arm_qpos[0],
-                    row.arm["qpos"][0],
-                    self.runtime.arm.joint_limit_lower,
-                    self.runtime.arm.joint_limit_upper,
-                )
-                start_pairs = [
-                    (row.arm["qpos"][0], start_arm),
-                    (row.hand["qpos"][0], trajectory.hand_qpos[0]),
-                ]
-                if hand_start_duration_s > 0:
-                    start_pairs.append((row.hand["qpos"][0], trajectory.action_hand_joint[0]))
-                for measured, recorded in start_pairs:
-                    if np.max(np.abs(measured - recorded)) > np.deg2rad(10):
-                        status, reason = (
-                            ReplayStatus.REJECTED,
-                            "start posture differs by more than 10 degrees",
-                        )
-                        break
-            if status == ReplayStatus.COMPLETED and hand_start_duration_s > 0:
-                target = trajectory.action_hand_joint[0]
-                if (
-                    not np.isfinite(target).all()
-                    or np.any(target < self.runtime.hand.qpos_min_rad)
-                    or np.any(target > self.runtime.hand.qpos_max_rad)
-                ):
-                    status, reason = (
-                        ReplayStatus.REJECTED,
-                        "hand preparation target violates limits",
-                    )
+            status, reason = self.admit_replay(trajectory, hand_start_duration_s, results)
             if status == ReplayStatus.COMPLETED:
-                with self.runtime_state.motion_lock:
-                    if (
-                        self.runtime_state.run_id != self.epoch
-                        or not self.runtime_state.begin_motion()
-                    ):
-                        status, reason = ReplayStatus.REJECTED, "motion authority unavailable"
-                    else:
-                        self.epoch = self.runtime_state.run_id
-            if results is not None and status == ReplayStatus.COMPLETED:
-                results.entered(self.epoch)
-            if status == ReplayStatus.COMPLETED and hand_start_duration_s > 0:
-                interrupted = self.warm_up_hand(trajectory, self.epoch, row, hand_start_duration_s)
-                if interrupted is not None:
-                    status, reason = interrupted.status, interrupted.reason
-            if status == ReplayStatus.COMPLETED:
-                origin_ns = time.monotonic_ns()
-                for index in range(trajectory.num_frames):
-                    slot_start_ns = origin_ns + index * period_ns
-                    slot_deadline_ns = slot_start_ns + period_ns
-                    interrupted = self.wait_replay(self.epoch, slot_start_ns)
-                    if interrupted is not None:
-                        status, reason = interrupted.status, interrupted.reason
-                        break
-                    if time.monotonic_ns() >= slot_deadline_ns:
-                        raise DispatchError(
-                            f"replay slot {index} missed before observation",
-                            DispatchResult(),
-                            revoked=True,
-                            cause="deadline_expired",
-                        )
-                    row = read_observation(self.runtime_state, self.runtime, self.robot)
-                    if row is None:
-                        status, reason = ReplayStatus.REJECTED, "robot feedback stale"
-                        break
-                    arm = project_arm_command(
-                        trajectory.action_arm_joint[index],
-                        row.arm["qpos"][0],
-                        joint_lower_rad=self.runtime.arm.joint_limit_lower,
-                        joint_upper_rad=self.runtime.arm.joint_limit_upper,
-                    )
-                    hand = project_hand_command(
-                        trajectory.action_hand_joint[index],
-                        qpos_min_rad=self.runtime.hand.qpos_min_rad,
-                        qpos_max_rad=self.runtime.hand.qpos_max_rad,
-                    )
-                    rejection = self.target_checker.rejection(
-                        arm,
-                        row.arm["qpos"][0],
-                        self.previous_arm,
-                        collision_hand_qpos=hand,
-                    )
-                    if rejection is not None:
-                        self.capture.record(
-                            index, row, RobotCommand(self.epoch, arm, hand), DispatchResult()
-                        )
-                        status, reason = ReplayStatus.REJECTED, f"replay target: {rejection}"
-                        break
-                    dispatch_error = None
-                    submit_started_ns = submit_completed_ns = -1
-                    valid_until_ns = min(slot_deadline_ns, feedback_deadline_ns(row, self.runtime))
-                    try:
-                        command = RobotCommand(self.epoch, arm, hand)
-                        if time.monotonic_ns() >= valid_until_ns:
-                            raise DispatchError(
-                                f"replay slot {index} expired before submission",
-                                DispatchResult(),
-                                revoked=True,
-                                cause="deadline_expired",
-                            )
-                        submit_started_ns = time.monotonic_ns()
-                        try:
-                            result = self.robot.send_action(
-                                command,
-                                valid_until_ns=valid_until_ns,
-                                execute_until_ns=row.observation_timestamp_ns
-                                + int(self.runtime.execution.max_decision_age_s * 1e9),
-                            )
-                        finally:
-                            submit_completed_ns = time.monotonic_ns()
-                        # A blocking SDK call can outlive the last pre-send check, including the final row.
-                        if submit_completed_ns >= valid_until_ns:
-                            raise DispatchError(
-                                f"replay slot {index} dispatch returned after deadline",
-                                result,
-                                revoked=True,
-                                cause="deadline_expired",
-                            )
-                    except (DispatchError, DispatchInterrupted) as exc:
-                        result, dispatch_error = exc.result, exc
-                        cancelled = isinstance(exc, DispatchInterrupted)
-                        if cancelled:
-                            self.runtime_state.request_emergency_stop()
-                        self.runtime_state.revoke_motion(
-                            reason=(
-                                RunEndReason.ESTOP
-                                if cancelled
-                                else (
-                                    RunEndReason.EXECUTOR_BOUNDARY
-                                    if exc.revoked
-                                    else RunEndReason.HARDWARE_FAULT
-                                )
-                            ),
-                        )
-                        try:
-                            self.robot.stop()
-                        except Exception as exc:
-                            self.failure_details.append(
-                                f"dispatch stop failed: {type(exc).__name__}: {exc}"
-                            )
-                            logger.exception("replay stop after dispatch failed")
-                            self.runtime_state.mark_error()
-                    try:
-                        self.capture.record(
-                            index,
-                            row,
-                            command,
-                            result,
-                            submit_started_ns=submit_started_ns,
-                            submit_completed_ns=submit_completed_ns,
-                        )
-                    except Exception as exc:
-                        self.runtime_state.mark_error()
-                        self.failure_details.append(f"capture failed: {type(exc).__name__}: {exc}")
-                        if dispatch_error is not None:
-                            logger.exception("replay recording after dispatch failed")
-                            raise dispatch_error from exc
-                        raise
-                    if dispatch_error is not None:
-                        raise dispatch_error
-                    self.previous_arm = arm.copy()
-                    interrupted = self.wait_replay(self.epoch, slot_deadline_ns)
-                    if interrupted is not None:
-                        status, reason = interrupted.status, interrupted.reason
-                        break
+                status, reason = self.replay_rows(trajectory, period_ns)
         except DispatchError as exc:
             result = exc.result
             reason = f"{exc}; arm={result.arm.name}, hand={result.hand.name}, command_id={result.command_id}"
@@ -294,6 +123,193 @@ class TrajectoryReplayer:
                 self.runtime_state.mark_error()
                 logger.exception("replay stop failed")
                 status, reason = ReplayStatus.FAULT, f"{reason or status.value}; stop failed: {exc}"
+        return self.finalize_capture(status, reason, arm_start, control_metadata)
+
+    def admit_replay(self, trajectory, hand_start_duration_s, results):
+        status, reason = ReplayStatus.COMPLETED, ""
+        if results is not None:
+            results.begin_episode()
+        self.robot.prepare_streaming(self.epoch)
+        row = read_observation(self.runtime_state, self.runtime, self.robot)
+        if row is None:
+            status, reason = ReplayStatus.REJECTED, "fresh robot feedback unavailable"
+        else:
+            self.previous_arm = row.arm["qpos"][0].copy()
+            # Reposition separately with operator oversight; never synthesize replay rows.
+            start_arm = wrap_nearest_equivalent(
+                trajectory.arm_qpos[0],
+                row.arm["qpos"][0],
+                self.runtime.arm.joint_limit_lower,
+                self.runtime.arm.joint_limit_upper,
+            )
+            start_pairs = [
+                (row.arm["qpos"][0], start_arm),
+                (row.hand["qpos"][0], trajectory.hand_qpos[0]),
+            ]
+            if hand_start_duration_s > 0:
+                start_pairs.append((row.hand["qpos"][0], trajectory.action_hand_joint[0]))
+            for measured, recorded in start_pairs:
+                if np.max(np.abs(measured - recorded)) > np.deg2rad(10):
+                    status, reason = (
+                        ReplayStatus.REJECTED,
+                        "start posture differs by more than 10 degrees",
+                    )
+                    break
+        if status == ReplayStatus.COMPLETED and hand_start_duration_s > 0:
+            target = trajectory.action_hand_joint[0]
+            if (
+                not np.isfinite(target).all()
+                or np.any(target < self.runtime.hand.qpos_min_rad)
+                or np.any(target > self.runtime.hand.qpos_max_rad)
+            ):
+                status, reason = (
+                    ReplayStatus.REJECTED,
+                    "hand preparation target violates limits",
+                )
+        if status == ReplayStatus.COMPLETED:
+            with self.runtime_state.motion_lock:
+                if (
+                    self.runtime_state.run_id != self.epoch
+                    or not self.runtime_state.begin_motion()
+                ):
+                    status, reason = ReplayStatus.REJECTED, "motion authority unavailable"
+                else:
+                    self.epoch = self.runtime_state.run_id
+        if results is not None and status == ReplayStatus.COMPLETED:
+            results.entered(self.epoch)
+        if status == ReplayStatus.COMPLETED and hand_start_duration_s > 0:
+            interrupted = self.warm_up_hand(trajectory, self.epoch, row, hand_start_duration_s)
+            if interrupted is not None:
+                status, reason = interrupted.status, interrupted.reason
+        return status, reason
+
+    def replay_rows(self, trajectory, period_ns):
+        status, reason = ReplayStatus.COMPLETED, ""
+        origin_ns = time.monotonic_ns()
+        for index in range(trajectory.num_frames):
+            slot_start_ns = origin_ns + index * period_ns
+            slot_deadline_ns = slot_start_ns + period_ns
+            interrupted = self.wait_replay(self.epoch, slot_start_ns)
+            if interrupted is not None:
+                status, reason = interrupted.status, interrupted.reason
+                break
+            if time.monotonic_ns() >= slot_deadline_ns:
+                raise DispatchError(
+                    f"replay slot {index} missed before observation",
+                    DispatchResult(),
+                    revoked=True,
+                    cause="deadline_expired",
+                )
+            row = read_observation(self.runtime_state, self.runtime, self.robot)
+            if row is None:
+                status, reason = ReplayStatus.REJECTED, "robot feedback stale"
+                break
+            arm = project_arm_command(
+                trajectory.action_arm_joint[index],
+                row.arm["qpos"][0],
+                joint_lower_rad=self.runtime.arm.joint_limit_lower,
+                joint_upper_rad=self.runtime.arm.joint_limit_upper,
+            )
+            hand = project_hand_command(
+                trajectory.action_hand_joint[index],
+                qpos_min_rad=self.runtime.hand.qpos_min_rad,
+                qpos_max_rad=self.runtime.hand.qpos_max_rad,
+            )
+            rejection = self.target_checker.rejection(
+                arm,
+                row.arm["qpos"][0],
+                self.previous_arm,
+                collision_hand_qpos=hand,
+            )
+            if rejection is not None:
+                self.capture.record(
+                    index, row, RobotCommand(self.epoch, arm, hand), DispatchResult()
+                )
+                status, reason = ReplayStatus.REJECTED, f"replay target: {rejection}"
+                break
+            self.dispatch_row(index, row, arm, hand, slot_deadline_ns)
+            self.previous_arm = arm.copy()
+            interrupted = self.wait_replay(self.epoch, slot_deadline_ns)
+            if interrupted is not None:
+                status, reason = interrupted.status, interrupted.reason
+                break
+        return status, reason
+
+    def dispatch_row(self, index, row, arm, hand, slot_deadline_ns):
+        dispatch_error = None
+        submit_started_ns = submit_completed_ns = -1
+        valid_until_ns = min(slot_deadline_ns, feedback_deadline_ns(row, self.runtime))
+        try:
+            command = RobotCommand(self.epoch, arm, hand)
+            if time.monotonic_ns() >= valid_until_ns:
+                raise DispatchError(
+                    f"replay slot {index} expired before submission",
+                    DispatchResult(),
+                    revoked=True,
+                    cause="deadline_expired",
+                )
+            submit_started_ns = time.monotonic_ns()
+            try:
+                result = self.robot.send_action(
+                    command,
+                    valid_until_ns=valid_until_ns,
+                    execute_until_ns=row.observation_timestamp_ns
+                    + int(self.runtime.execution.max_decision_age_s * 1e9),
+                )
+            finally:
+                submit_completed_ns = time.monotonic_ns()
+            # A blocking SDK call can outlive the last pre-send check, including the final row.
+            if submit_completed_ns >= valid_until_ns:
+                raise DispatchError(
+                    f"replay slot {index} dispatch returned after deadline",
+                    result,
+                    revoked=True,
+                    cause="deadline_expired",
+                )
+        except (DispatchError, DispatchInterrupted) as exc:
+            result, dispatch_error = exc.result, exc
+            cancelled = isinstance(exc, DispatchInterrupted)
+            if cancelled:
+                self.runtime_state.request_emergency_stop()
+            self.runtime_state.revoke_motion(
+                reason=(
+                    RunEndReason.ESTOP
+                    if cancelled
+                    else (
+                        RunEndReason.EXECUTOR_BOUNDARY
+                        if exc.revoked
+                        else RunEndReason.HARDWARE_FAULT
+                    )
+                ),
+            )
+            try:
+                self.robot.stop()
+            except Exception as exc:
+                self.failure_details.append(
+                    f"dispatch stop failed: {type(exc).__name__}: {exc}"
+                )
+                logger.exception("replay stop after dispatch failed")
+                self.runtime_state.mark_error()
+        try:
+            self.capture.record(
+                index,
+                row,
+                command,
+                result,
+                submit_started_ns=submit_started_ns,
+                submit_completed_ns=submit_completed_ns,
+            )
+        except Exception as exc:
+            self.runtime_state.mark_error()
+            self.failure_details.append(f"capture failed: {type(exc).__name__}: {exc}")
+            if dispatch_error is not None:
+                logger.exception("replay recording after dispatch failed")
+                raise dispatch_error from exc
+            raise
+        if dispatch_error is not None:
+            raise dispatch_error
+
+    def finalize_capture(self, status, reason, arm_start, control_metadata):
         # Deliver physical evidence even if post-motion diagnostics cannot be formed.
         data = self.capture.to_dict()
         arm_end = None

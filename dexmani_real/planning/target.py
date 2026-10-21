@@ -36,6 +36,11 @@ class TargetChecker:
         model.set_hand_qpos(collision_hand_qpos)
         if model.check_self_collision(target):
             return "self_collision"
+        return self.endpoint_rejection(target)
+
+    def endpoint_rejection(self, target):
+        """Check model limits, FK workspace and environment with the current collision hand pose."""
+        model = self.collision_model
         if not model.within_joint_limits(target):
             return "model_joint_limits"
         position, _ = self.target_fk.compute(target)

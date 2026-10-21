@@ -559,15 +559,22 @@ class PolicyRunner:
         kwargs = (
             dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot) if prefix is not None else {}
         )
+        initial_hand_history = None
         if self.hand_history is not None:
             if not self.hand_history:
                 # Match training's episode-initial measured pose, before the first query action.
                 hand = np.asarray(observation["joint_state"][-1, -12:], dtype=np.float64)
                 if hand.shape != (12,) or not np.isfinite(hand).all():
                     return ControlRejection("invalid_hand_history_bootstrap")
-                self.hand_history.extend(hand.copy() for _ in range(self.hand_history.maxlen))
+                initial_hand_history = tuple(
+                    hand.copy() for _ in range(self.hand_history.maxlen)
+                )
             # The model thread owns this snapshot; later appends/reset cannot change it.
-            kwargs["action_context"] = {"hand_history": np.stack(self.hand_history)}
+            kwargs["action_context"] = {
+                "hand_history": np.stack(
+                    self.hand_history if initial_hand_history is None else initial_hand_history
+                )
+            }
         if self.recorder is not None:
             query.evidence = dict(
                 query_id=query.query_id,
@@ -598,6 +605,8 @@ class PolicyRunner:
             query_context=dict(run_id=self.run_id, query_id=query.query_id),
             **kwargs,
         )
+        if initial_hand_history is not None:
+            self.hand_history.extend(initial_hand_history)
         self.query_id, self.query = query.query_id, query
         if commands is not None:
             self.plan.frozen.update(commands)

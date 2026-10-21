@@ -569,7 +569,7 @@ class PointCloudExample:
             print_depth_stats(depth_m, self.cfg.vis_depth_min_m, self.cfg.vis_depth_max_m)
             show_rgbd_panels(rgb, depth_m, self.cfg)
 
-            self.intrinsics = self.camera.get_geometry().color
+            self.intrinsics = self.camera.get_color_intrinsics()
             self.T_xarm_base_from_color = load_extrinsics(self.camera_info, self.calibration)
 
             if self.fit_table_requested:

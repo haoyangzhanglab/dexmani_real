@@ -90,8 +90,6 @@ def compute_eef_pose_history_xarm_base(
         raise ValueError(
             f"arm qpos history must have shape (T, {ARM_JOINT_SHAPE[0]}), got {qpos_history.shape}"
         )
-    if not np.all(np.isfinite(qpos_history)):
-        raise ValueError("arm qpos history contains non-finite values")
     fk = make_arm_fk() if arm_fk is None else arm_fk
     poses = np.empty((len(qpos_history), 9), dtype=np.float64)
     for index, qpos in enumerate(qpos_history):

@@ -244,20 +244,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        from dexmani_policy.deployment import (
-            inspect_policy,
-            resolve_experiment,
-        )
+        from dexmani_policy.deployment import inspect_policy
 
-        experiment = resolve_experiment(args.experiment)
-        checkpoint = args.checkpoint
-        if checkpoint.endswith("pct"):
-            from dexmani_policy.evaluation.checkpoints import resolve_checkpoint_path
-
-            checkpoint, _ = resolve_checkpoint_path(experiment, checkpoint)
         info = inspect_policy(
-            experiment,
-            checkpoint=checkpoint,
+            args.experiment,
+            checkpoint=args.checkpoint,
             weights=args.weights,
             inference_steps=args.inference_steps,
         )

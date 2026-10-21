@@ -1,4 +1,4 @@
-"""RealSense D400/L515 driver with aligned RGB-D and native stream geometry."""
+"""RealSense D400/L515 driver with RGB-D aligned to the color grid."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import numpy as np
 import pyrealsense2 as rs
 
 from dexmani_real.sensor.camera.config import CameraParams
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics, RGBDGeometry
+from dexmani_real.sensor.camera.geometry import CameraIntrinsics
 
 __all__ = ["RealSenseCamera", "RGBDFrame"]
 
@@ -48,7 +48,7 @@ class RealSenseCamera:
         self.profile: rs.pipeline_profile | None = None
 
         self.depth_scale: float | None = None
-        self.geometry: RGBDGeometry | None = None
+        self.color_intrinsics: CameraIntrinsics | None = None
         self.depth_to_color_aligner: rs.align | None = None
 
     def connect(self) -> None:
@@ -97,7 +97,8 @@ class RealSenseCamera:
                 self.apply_d400_depth_config(sensor)
             self.apply_color_config()
             self.depth_scale = float(sensor.get_depth_scale())
-            self.geometry = self.read_geometry()
+            color_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
+            self.color_intrinsics = self.intrinsics_from_sdk(color_profile.get_intrinsics())
             self.depth_to_color_aligner = rs.align(rs.stream.color)
             for _ in range(self.config.warmup_frames):
                 # Initialize alignment and owned copies before live publication.
@@ -211,7 +212,7 @@ class RealSenseCamera:
         self.frame_queue = None
         self.profile = None
         self.depth_scale = None
-        self.geometry = None
+        self.color_intrinsics = None
         self.depth_to_color_aligner = None
 
     def create_rs_config(self) -> rs.config:
@@ -247,26 +248,6 @@ class RealSenseCamera:
             ppy=float(intrinsics.ppy),
             distortion_model=str(intrinsics.model),
             distortion_coeffs=cast(tuple[float, float, float, float, float], coefficients),
-        )
-
-    @staticmethod
-    def transform_from_sdk_extrinsics(extrinsics: Any) -> np.ndarray:
-        """RealSense stores rotation column-major; translation is in meters."""
-        transform = np.eye(4, dtype=np.float64)
-        transform[:3, :3] = np.asarray(extrinsics.rotation).reshape(3, 3, order="F")
-        transform[:3, 3] = extrinsics.translation
-        return transform
-
-    def read_geometry(self) -> RGBDGeometry:
-        """Read immutable native stream calibration from the active profile."""
-        depth_profile = self.profile.get_stream(rs.stream.depth).as_video_stream_profile()
-        color_profile = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
-        return RGBDGeometry(
-            depth=self.intrinsics_from_sdk(depth_profile.get_intrinsics()),
-            color=self.intrinsics_from_sdk(color_profile.get_intrinsics()),
-            T_color_from_depth=self.transform_from_sdk_extrinsics(
-                depth_profile.get_extrinsics_to(color_profile)
-            ),
         )
 
     def read(self, timeout_ms: int = 5000) -> RGBDFrame:
@@ -309,10 +290,10 @@ class RealSenseCamera:
             timestamp_ns=wait_return_monotonic_ns,
         )
 
-    def get_geometry(self) -> RGBDGeometry:
-        if self.geometry is None:
-            raise RuntimeError("RealSense native RGB-D geometry is unavailable.")
-        return self.geometry
+    def get_color_intrinsics(self) -> CameraIntrinsics:
+        if self.color_intrinsics is None:
+            raise RuntimeError("RealSense color intrinsics are unavailable.")
+        return self.color_intrinsics
 
     def get_depth_scale(self) -> float:
         if self.depth_scale is None:

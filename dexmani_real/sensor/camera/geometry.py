@@ -11,7 +11,6 @@ from dexmani_real.utils.geometry import validate_rigid_transform
 
 __all__ = [
     "CameraIntrinsics",
-    "RGBDGeometry",
     "camera_parameters_cv",
     "validate_aligned_depth_distortion",
 ]
@@ -90,20 +89,6 @@ class CameraIntrinsics:
             [[self.fx, 0.0, self.ppx], [0.0, self.fy, self.ppy], [0.0, 0.0, 1.0]],
             dtype=dtype,
         )
-
-
-@dataclass(frozen=True)
-class RGBDGeometry:
-    """Depth/color calibration retained at the driver and external Raw-reader boundaries."""
-
-    depth: CameraIntrinsics
-    color: CameraIntrinsics
-    T_color_from_depth: np.ndarray
-
-    def __post_init__(self) -> None:
-        transform = validate_rigid_transform(self.T_color_from_depth, label="T_color_from_depth")
-        transform.setflags(write=False)
-        object.__setattr__(self, "T_color_from_depth", transform)
 
 
 def camera_parameters_cv(
