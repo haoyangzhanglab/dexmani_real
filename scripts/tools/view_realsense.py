@@ -14,15 +14,15 @@ import numpy as np
 
 from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
-from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics, validate_aligned_depth_distortion
+from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud, build_raw_point_cloud
 from dexmani_real.utils.log import configure_logging
 
 if TYPE_CHECKING:
     from dexmani_real.sensor.camera.realsense import RealSenseCamera
 
-WINDOW_NAME = "RealSense Test | RGB(left) Depth(right)"
+WINDOW_NAME = "RealSense RGB-D | RGB(left) Depth(right)"
 FPS_WINDOW = 100
 
 

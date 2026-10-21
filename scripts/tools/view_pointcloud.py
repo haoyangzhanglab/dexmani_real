@@ -152,7 +152,7 @@ SNAPSHOT_SCHEMA_VERSION = 3
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="L515 tabletop point-cloud processing and calibration diagnostic"
+        description="RealSense tabletop point-cloud processing and calibration diagnostic"
     )
     parser.add_argument(
         "--save-dir",

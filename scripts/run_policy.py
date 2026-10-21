@@ -165,7 +165,7 @@ def safe_selector_parts(selector: Any) -> tuple[str, str, str]:
         raise ValueError("Policy selector must be a string")
     parts = tuple(selector.split("/"))
     if len(parts) != 3 or any(
-        not part or part in {".", ".."} or "/" in part or "\\" in part or Path(part).name != part
+        not part or part in {".", ".."} or "\\" in part or Path(part).name != part
         for part in parts
     ):
         raise ValueError("experiment must be a canonical policy/task/experiment selector")
@@ -260,7 +260,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        from dexmani_real.deployment.startup import validate_deployment_config
+        from dexmani_real.deployment.preflight import validate_deployment_config
 
         action_steps = runtime.execution.action_steps
         if action_steps is None:

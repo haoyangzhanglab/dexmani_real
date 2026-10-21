@@ -6,6 +6,17 @@
 
 工作流：**标定 → 遥操作采集 → Raw → Canonical Zarr → 策略训练 → 真机评估**。
 
+## 目录导航
+
+| 目录 | 职责 |
+| --- | --- |
+| [robot/](dexmani_real/robot/)、[sensor/](dexmani_real/sensor/) | 设备接口、配置与采集 worker |
+| [runtime/](dexmani_real/runtime/)、[teleop/](dexmani_real/teleop/)、[deployment/](dexmani_real/deployment/)、[replay/](dexmani_real/replay/) | 运行协调及各入口的 session / runner |
+| [data/](dexmani_real/data/) | 异步录制；`raw/` 原始记录与相机几何；`canonical/` 派生处理与导出 |
+| [calibration/](dexmani_real/calibration/)、[config/](dexmani_real/config/)、[planning/](dexmani_real/planning/) | 现场标定、实验配置与运动规划 |
+| [ipc/](dexmani_real/ipc/)、[utils/](dexmani_real/utils/) | 进程间通信与通用辅助函数 |
+| [scripts/](scripts/) | 主要运行入口；[tools/](scripts/tools/) 设备与感知工具；[cordvip/](scripts/cordvip/README.md) 物体重建与跟踪 |
+
 ## 安装与配置
 
 使用 Python ≥ 3.10，在仓库根目录执行下列命令。机器人资产按源码 checkout 路径读取，实验环境使用 editable 安装：
@@ -29,8 +40,8 @@ python -m pip install -e ".[interactive,control]"
 配置优先级为 **CLI 覆盖 > `--config` YAML > 包内默认值**。先查看完整声明配置：
 
 ```bash
-python examples/collect_teleop.py --print-config
-python examples/run_policy.py --print-config
+python scripts/collect_teleop.py --print-config
+python scripts/run_policy.py --print-config
 ```
 
 将本次实验需要覆盖的字段保存为 `local.yaml`，例如：
@@ -43,7 +54,7 @@ pointcloud:
 ```
 
 ```bash
-python examples/collect_teleop.py --config local.yaml --print-config
+python scripts/collect_teleop.py --config local.yaml --print-config
 ```
 
 字段以当前输出及[配置加载入口](dexmani_real/config/experiment.py)为准，未知字段直接报错。运行前核对设备地址、serial、工作空间与现场标定；示例 YAML 仅展示覆盖方式。
@@ -64,16 +75,16 @@ XHand 默认通过 `/dev/ttyUSB0` 串口连接。使用 EtherCAT 时，同时设
 
 | 标定 | 入口与要求 |
 | --- | --- |
-| 相机外参 | `examples/calibrate_camera.py`；会连接并移动机械臂、采集图像，必须显式声明 `--hand-geometry absent` 或 `secured-home` |
-| VR 朝向 | `examples/calibrate_vr_heading.py`；`--ref head` 面向机器人 +X，`--ref wrist` 将手腕指向机器人 +X |
-| 桌面平面 | `examples/pointcloud_process_example.py`；启动后选择 table calibration，确认后发布拟合结果 |
+| 相机外参 | `scripts/calibrate_camera.py`；会连接并移动机械臂、采集图像，必须显式声明 `--hand-geometry absent` 或 `secured-home` |
+| VR 朝向 | `scripts/calibrate_vr_heading.py`；`--ref head` 面向机器人 +X，`--ref wrist` 将手腕指向机器人 +X |
+| 桌面平面 | `scripts/tools/view_pointcloud.py`；启动后选择 table calibration，确认后发布拟合结果 |
 
 先查看各入口的具体操作：
 
 ```bash
-python examples/calibrate_camera.py --help
-python examples/calibrate_vr_heading.py --help
-python examples/pointcloud_process_example.py --help
+python scripts/calibrate_camera.py --help
+python scripts/calibrate_vr_heading.py --help
+python scripts/tools/view_pointcloud.py --help
 ```
 
 相机标定中的 `absent` 表示手未安装，`secured-home` 表示已物理固定在配置 HOME 手形；两者均按固定 HOME 手形做碰撞检查。标定在线 jog 允许桌面接触，HOME 独立检查桌面路径净空。相机与 VR 标定支持 `--output`；桌面文件由 `environment.table.plane_path` 指定。
@@ -86,8 +97,8 @@ SPACE 采样和 ENTER 求解都会撤销并停止 jog；采样确认停止后的
 ### 2. 遥操作与采集
 
 ```bash
-python examples/collect_teleop.py test --config local.yaml
-python examples/collect_teleop.py test --config local.yaml --control-hz 20
+python scripts/collect_teleop.py test --config local.yaml
+python scripts/collect_teleop.py test --config local.yaml --control-hz 20
 ```
 
 任务名默认 `test`，录制默认写入 `episodes/test/`，根目录由 `control.episodes_dir` 配置。启动时建立停止监听并执行手部 HOME，随后等待操作者开始。
@@ -112,9 +123,9 @@ python examples/collect_teleop.py test --config local.yaml --control-hz 20
 ### 3. 离线查看与导出
 
 ```bash
-python examples/visualize_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --info
-python examples/visualize_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config local.yaml --max-frames 100
-python examples/export_policy_zarr.py episodes/test --config local.yaml
+python scripts/visualize_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --info
+python scripts/visualize_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config local.yaml --max-frames 100
+python scripts/export_zarr.py episodes/test --config local.yaml
 ```
 
 `--info` 打印数据概要，无需启动 Rerun；交互查看可用 `--no-point-cloud` 关闭点云。查看和导出使用 Raw 保存的相机几何，以及当前点云、桌面、手部安装与指尖配置。仅启用去桌时读取桌面平面。
@@ -125,13 +136,13 @@ Raw 文本元数据统一按 UTF-8 读取；HDF5 定长字节串与变长字符�
 
 公共导出要求每段全部 **15 字段**完整、浮点数值有限，并通过时序及动作执行证据检查。缺字段、NaN/Inf、RGB-D 行数不符、相机几何缺失或非法、空点云均整段拒绝，记录原因并保留原 Raw；任务失败本身不排除技术有效的数据。导出不删坏帧、不填补缺测、不修改 Raw。
 
-导出和回放检查各自所需的核心数据及执行证据，允许额外诊断列，缺失查询日志不再单独阻止使用。完整时序诊断仍检查查询关联；录制端继续保存完整证据。
+导出和回放检查各自所需的核心数据及执行证据，允许额外诊断列；录制端保存完整查询、时钟和终止证据。
 
 默认输出 `datasets/test.zarr`，目标必须不存在；`--output` 指定新路径，`--exclude` 排除指定 episode，`--chunk-frames` 调整处理批大小，`--pointcloud-num-points` 覆盖点数。同一缓存要求 task、dt、depth scale 和数组 shape/dtype 一致；合法 metadata 冲突会在读取后续数值前中止导出。文件系统或处理异常保留 staging 供排查。
 
 处理批次受 64 MiB 总数据预算约束；存储按各字段独立分块，目标解压大小约 1 MiB、时间维 1–128 行。默认 640×480 RGB/depth 为单帧块，低维字段保留批量块；单帧超过目标大小时仍保存完整帧，该预算不能限制单帧最小解码量。已有缓存不会自动改写，使用正常导出和新的 `--output` 重建。新导出生成新 `data_revision`，已有 checkpoint／手部表示产物的来源检查仍生效，不能复制旧 revision 绕过检查。
 
-训练 action 表示本拍提交的绝对关节目标，`action_ee` 是该目标的 FK，均不代表下一拍已到达。时序筛选同时检查逐拍间隔与累计偏离；Raw 采集正常结束不等于可导出。布局采用 `data/*` 与 `meta/episode_ends`，字段定义见 [Canonical 字段定义](dexmani_real/dataset/schema.py)，处理入口见 [dataset/processing.py](dexmani_real/dataset/processing.py)。
+训练 action 表示本拍提交的绝对关节目标，`action_ee` 是该目标的 FK，均不代表下一拍已到达。时序筛选同时检查逐拍间隔与累计偏离；Raw 采集正常结束不等于可导出。布局采用 `data/*` 与 `meta/episode_ends`，字段定义见 [Canonical 字段定义](dexmani_real/data/canonical/schema.py)，处理入口见 [data/canonical/processing.py](dexmani_real/data/canonical/processing.py)。
 
 在线与离线共用[点云处理](dexmani_real/sensor/pointcloud/processing.py)：去飞点、桌面过滤、workspace、体素 XYZ/RGB 均值、密度与连通分量筛选，再限制候选并做 **CPU QuickFPS**。默认输出 1024 点、最多 8192 个候选，依赖固定为 `fpsample==0.3.3`，无需 CUDA。不足点数时循环已有点，空云保留无有效输出。
 
@@ -140,8 +151,8 @@ Raw 文本元数据统一按 UTF-8 读取；HDF5 定长字节串与变长字符�
 ### 4. 策略部署
 
 ```bash
-python examples/run_policy.py policy/task/experiment --config local.yaml
-python examples/run_policy.py policy/task/experiment --config local.yaml --execution-mode async --prefetch-steps 1 --n-action-steps 4
+python scripts/run_policy.py policy/task/experiment --config local.yaml
+python scripts/run_policy.py policy/task/experiment --config local.yaml --execution-mode async --prefetch-steps 1 --n-action-steps 4
 ```
 
 实验输入为不带 `experiments/` 前缀的 `policy/task/experiment`，也可使用有效的绝对实验目录。策略预检与加载共用检查时的保存配置快照，接口见 [Policy 部署边界](https://github.com/haoyangzhanglab/dexmani_policy/blob/main/docs/项目架构.md#部署边界)。策略 artifact 提供模型输入、动作表示和控制 dt；Real 提供当前设备、标定与执行配置。每段执行步数按 `--n-action-steps` > YAML 的 `execution.action_steps` > 策略默认值确定。
@@ -167,22 +178,22 @@ Rollout Raw 保留 bootstrap/WAIT 的无动作行及终止原因，公共导出�
 ### 5. 真机轨迹回放
 
 ```bash
-python examples/replay_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config local.yaml --output replay_results/test_run
+python scripts/replay_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config local.yaml --output replay_results/test_run
 ```
 
 回放读取当前格式的 teleop Raw，按标称节拍执行已记录关节目标；会连接机械臂与手，不启动相机或 VR。启动先执行手部 HOME，再默认用 0.5 秒渐变到首帧手部目标；`--hand-start-duration 0` 仅跳过渐变。
 
 输出目录须新建或为空，保存 `session_result.json`、`replay_data.npz` 和可计算的 `metrics.json`。Q 保存前缀并退出，ESC 请求急停，完成后可按 H 规划回 HOME。晚帧或发送超时会停止，输入 Raw 保持不变。评价中的轨迹帧偏移用于跨运行对齐，不表示硬件响应延迟。
 
-## 诊断与其他入口
+## 设备工具与其他入口
 
 | 用途 | 入口 | 运行边界 |
 | --- | --- | --- |
-| 键盘 jog / HOME | [keyboard_teleop.py](examples/keyboard_teleop.py) | 连接机器人，不启动相机或 VR；净运动意图归零停止 jog，R 执行 HOME |
-| XHand 动作与反馈 | [xhand_control_example.py](examples/xhand_control_example.py) | 默认执行动作；`--read-only` 仍连接手并读取反馈 |
-| RGB-D 诊断 | [realsense_record_example.py](examples/realsense_record_example.py) | 连接相机，交互查看 RGB-D 与点云 |
-| 点云诊断 / 桌面标定 | [pointcloud_process_example.py](examples/pointcloud_process_example.py) | 连接相机；`--save-dir` 保存本次 RGB-D、点云及重建 metadata |
-| 物体重建与跟踪 | [CORDViP 示例](examples/cordvip/README.md) | 使用独立的 `cordvip_geometry` 依赖与入口，区分离线数据和实时相机模式 |
+| 键盘 jog / HOME | [keyboard_teleop.py](scripts/keyboard_teleop.py) | 连接机器人，不启动相机或 VR；净运动意图归零停止 jog，R 执行 HOME |
+| XHand 动作与反馈 | [control_xhand.py](scripts/tools/control_xhand.py) | 默认执行动作；`--read-only` 仍连接手并读取反馈 |
+| RGB-D 诊断 | [view_realsense.py](scripts/tools/view_realsense.py) | 连接相机，交互查看 RGB-D 与点云 |
+| 点云诊断 / 桌面标定 | [view_pointcloud.py](scripts/tools/view_pointcloud.py) | 连接相机；`--save-dir` 保存本次 RGB-D、点云及重建 metadata |
+| 物体重建与跟踪 | [CORDViP 示例](scripts/cordvip/README.md) | 使用独立的 `cordvip_geometry` 依赖与入口，区分离线数据和实时相机模式 |
 
 点云诊断保存与最终显示使用同一帧，快照保留处理配置、相机内外参、depth scale 和实际使用的桌面平面。后续连续帧测速仅报告耗时和有效点云数量。RGB-D 基础预览仅受相机与深度显示参数约束；启用点云时才检查对应处理配置与标定，不可用时继续 RGB/Depth 预览。关闭 `pointcloud.remove_table` 时处理不使用桌面平面；拟合结果只有确认后才发布。各入口的参数与按键以 `--help` 和交互提示为准。
 
@@ -204,12 +215,12 @@ xArm 控制器碰撞检测默认关闭（`arm.collision_sensitivity: 0`），不
 
 ## 开发
 
-设备驱动负责 I/O，机器人协调器负责运动权限与发送，XHand 反馈组件负责有界触觉保持和不可变快照；观测构造汇总相机、点云与 VR 的健康期限。录制器负责队列和 Raw 发布，存储 writer 独占 HDF5、视频及批缓冲，训练准入留在 `dataset/`。相机标定按 ArUco 检测、手眼求解、外参存取和交互会话分工。
+设备驱动负责 I/O，机器人协调器负责运动权限与发送，XHand 反馈组件负责有界触觉保持和不可变快照；观测构造汇总相机、点云与 VR 的健康期限。`data/recorder.py` 负责异步录制生命周期与 Raw 发布；`data/raw/` 负责原始记录读写、编码、契约和已录制相机几何，writer 独占 HDF5、视频及批缓冲；`data/canonical/` 负责派生数组、处理、训练准入与导出。相机标定按 ArUco 检测、手眼求解、外参存取和交互会话分工。
 
 默认运行无设备副作用的检查：
 
 ```bash
-python -m compileall -q dexmani_real examples
+python -m compileall -q dexmani_real scripts
 git diff --check
 ```
 

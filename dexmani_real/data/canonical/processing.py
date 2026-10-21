@@ -7,22 +7,22 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.dataset.schema import ProcessingConfig
-from dexmani_real.dataset.pointcloud import (
+from dexmani_real.data.canonical.schema import ProcessingConfig
+from dexmani_real.data.raw.camera_geometry import (
     RawEpisodeCameraModel,
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
+)
+from dexmani_real.data.raw.reader import EpisodeReader, RawDataError
+from dexmani_real.data.raw.schema import (
+    DATASET_SPECS,
+    validate_capture_rows,
+    validate_dispatch_rows,
 )
 from dexmani_real.planning.kinematics.arm_fk import (
     compute_eef_pose_history_xarm_base,
 )
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
-from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError
-from dexmani_real.recording.storage.schema import (
-    DATASET_SPECS,
-    validate_capture_rows,
-    validate_dispatch_rows,
-)
 from dexmani_real.sensor.camera.geometry import (
     camera_parameters_cv,
     validate_aligned_depth_distortion,

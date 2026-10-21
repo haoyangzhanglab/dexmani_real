@@ -10,7 +10,7 @@ import av
 import h5py
 import numpy as np
 
-from dexmani_real.recording.storage.schema import (
+from dexmani_real.data.raw.schema import (
     DATASET_SPECS,
     RAW_FORMAT,
     ARM_EXECUTION_FORMAT,
@@ -174,43 +174,6 @@ class EpisodeReader:
                 raise RawDataError(f"timing rows require int64 column {name}")
         return rows.fields(fields)[:]
 
-    def read_termination(self):
-        if "timing/termination" not in self.data_file:
-            return None
-        value = self.data_file["timing/termination"]
-        if not isinstance(value, h5py.Dataset) or value.shape != ():
-            raise RawDataError("timing termination format: expected a scalar dataset")
-        try:
-            return json.loads(value.asstr()[()])
-        except (ValueError, TypeError) as exc:
-            raise RawDataError(f"timing termination format: {exc}") from exc
-
-    def read_timing(self):
-        """Read complete diagnostic timing and validate query associations."""
-        values = self.read_timing_rows(TIMING_ROW_DTYPE.names)
-        group = self.data_file["timing"]
-        if "queries" not in group:
-            raise RawDataError("Raw is missing timing queries")
-        records = group["queries"]
-        if not isinstance(records, h5py.Dataset) or records.ndim != 1:
-            raise RawDataError("timing query format: expected a one-dimensional dataset")
-        try:
-            queries = [json.loads(value) for value in records.asstr()[:]]
-            keys = {(item["run_id"], item["query_id"]) for item in queries}
-        except (ValueError, KeyError, TypeError) as exc:
-            raise RawDataError(f"timing query format: {exc}") from exc
-        if len(keys) != len(queries):
-            raise RawDataError("duplicate timing query identity")
-        for row in values:
-            if row["query_id"] >= 0 and (int(row["run_id"]), int(row["query_id"])) not in keys:
-                raise RawDataError("action timing references an absent query")
-        return dict(
-            rows=values,
-            queries=queries,
-            metadata=dict(group.attrs),
-            termination=self.read_termination(),
-        )
-
     def validate_arm_execution(self):
         """Check execution evidence independently of inference diagnostics."""
         try:
@@ -229,52 +192,6 @@ class EpisodeReader:
             )
         except (KeyError, ValueError, TypeError) as exc:
             raise RawDataError(f"Mode-1 execution evidence: {exc}") from exc
-
-    def timing_diagnostics(self):
-        """Return host ages/deltas in seconds, with NaN/None for missing diagnostics."""
-        evidence = self.read_timing()
-        rows = evidence["rows"]
-
-        def delta(end, start):
-            result = np.full(len(rows), np.nan)
-            valid = (rows[end] > 0) & (rows[start] > 0)
-            result[valid] = (rows[end][valid] - rows[start][valid]) / 1e9
-            return result
-
-        def inference(query):
-            start, end = query.get("started_ns"), query.get("completed_ns")
-            return None if start is None or end is None else (end - start) / 1e9
-
-        return dict(
-            metadata=evidence["metadata"],
-            observation_age_s={
-                name: delta("observation_ns", f"{name}_ns")
-                for name in ("arm", "hand", "camera", "pointcloud")
-            },
-            modality_delta_s={
-                "arm_hand": delta("arm_ns", "hand_ns"),
-                "arm_camera": delta("arm_ns", "camera_ns"),
-                "camera_pointcloud": delta("camera_ns", "pointcloud_ns"),
-            },
-            camera_pipeline_s={
-                "receive_to_publish": delta("camera_published_ns", "camera_received_ns"),
-            },
-            pointcloud_pipeline_s={
-                "camera_receive_to_publish": delta(
-                    "pointcloud_camera_published_ns", "pointcloud_camera_received_ns"
-                ),
-                "camera_publish_to_processing": delta(
-                    "pointcloud_started_ns", "pointcloud_camera_published_ns"
-                ),
-                # Includes the ring copy/commit, not just build_point_cloud.
-                "processing_to_publish": delta("pointcloud_published_ns", "pointcloud_started_ns"),
-                "publish_to_observation": delta("observation_ns", "pointcloud_published_ns"),
-            },
-            submit_duration_s=delta("submit_completed_ns", "submit_started_ns"),
-            inference_duration_s={
-                (q["run_id"], q["query_id"]): inference(q) for q in evidence["queries"]
-            },
-        )
 
     @property
     def num_frames(self) -> int:

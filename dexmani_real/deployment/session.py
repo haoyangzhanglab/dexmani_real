@@ -11,27 +11,27 @@ from dexmani_real.calibration.camera.extrinsics import (
     load_optional_camera_extrinsics,
 )
 from dexmani_real.config.experiment import resolve_runtime_table
+from dexmani_real.data.recorder import AsyncEpisodeRecorder
 from dexmani_real.deployment.config import (
     validate_max_running_s,
     validate_num_episodes,
 )
-from dexmani_real.deployment.startup import validate_deployment_config
 from dexmani_real.deployment.observation import (
     build_observation_camera,
     build_observation_kinematics,
 )
 from dexmani_real.deployment.operator import PolicyOperator
+from dexmani_real.deployment.preflight import validate_deployment_config
 from dexmani_real.deployment.runner import PolicyRunner
 from dexmani_real.ipc.channels import SensorChannels
-from dexmani_real.runtime.state import RuntimeState, RunEndReason
-from dexmani_real.recording.recorder import AsyncEpisodeRecorder
-from dexmani_real.utils.episode_results import EpisodeResults, error_detail
 from dexmani_real.robot.action import ActionMapper
 from dexmani_real.robot.home import build_home_planner
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
+from dexmani_real.runtime.state import RuntimeState, RunEndReason
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.pointcloud.worker import PointCloudWorkerConfig, run_pointcloud_worker
+from dexmani_real.utils.episode_results import EpisodeResults, error_detail
 from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger(__name__)

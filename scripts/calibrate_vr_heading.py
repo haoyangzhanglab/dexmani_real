@@ -14,17 +14,17 @@ from pathlib import Path
 import numpy as np
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
-from dexmani_real.sensor.vr.config import VRParams
-from dexmani_real.ipc.channels import SensorChannels
-from dexmani_real.runtime.state import RuntimeState
-from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz
-from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
-from dexmani_real.sensor.vr.worker import run_vr_worker
-from dexmani_real.teleop.audio_feedback import AudioFeedback
-from dexmani_real.teleop.vr_transform import (
+from dexmani_real.calibration.vr_heading import (
     VR_TRANSFORM_MIN_FRAMES,
     parse_vr_transform,
 )
+from dexmani_real.ipc.channels import SensorChannels
+from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz
+from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
+from dexmani_real.runtime.state import RuntimeState
+from dexmani_real.sensor.vr.config import VRParams
+from dexmani_real.sensor.vr.worker import run_vr_worker
+from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.utils.atomic_io import atomic_json_dump
 
 MIN_FORWARD_NORM = 1e-6

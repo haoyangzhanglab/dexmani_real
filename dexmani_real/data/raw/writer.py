@@ -1,13 +1,13 @@
 """Writer-thread HDF5 and video storage for one unpublished Raw episode."""
 
-from contextlib import ExitStack
 import json
+from contextlib import ExitStack
 from pathlib import Path
 
 import h5py
 import numpy as np
 
-from dexmani_real.recording.storage.schema import (
+from dexmani_real.data.raw.schema import (
     ARM_EXECUTION_FORMAT,
     DATASET_SPECS,
     RAW_FORMAT,
@@ -15,7 +15,7 @@ from dexmani_real.recording.storage.schema import (
     encode_raw_row,
     encode_timing_row,
 )
-from dexmani_real.recording.storage.video import VideoEncoder
+from dexmani_real.data.raw.video import VideoEncoder
 
 
 class RawEpisodeWriter:

@@ -158,7 +158,7 @@ real robot
 
 ## Changing Data
 
-修改 `recording/`、`dataset/` 或 export workflow 时，确认：
+修改 `data/` 或 export workflow 时，确认：
 
 - 数据来自哪个实验时刻；
 - frame / unit / ordering 是否变化；
@@ -192,7 +192,7 @@ README 不维护容易过时的类清单、字段级 runtime contract、状态�
 默认只运行无硬件副作用的检查：
 
 ```bash
-python -m compileall -q dexmani_real examples
+python -m compileall -q dexmani_real scripts
 git diff --check
 ```
 

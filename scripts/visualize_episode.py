@@ -15,17 +15,17 @@ os.environ.setdefault("RUST_LOG", "error")
 import numpy as np
 
 from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
-from dexmani_real.sensor.pointcloud.config import PointCloudConfig
-from dexmani_real.dataset.pointcloud import (
+from dexmani_real.data.raw.camera_geometry import (
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
 )
+from dexmani_real.data.raw.reader import EpisodeReader
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
-from dexmani_real.recording.storage.reader import EpisodeReader
 from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE, XHAND_RIGHT_URDF_PATH
 from dexmani_real.sensor.camera.geometry import validate_aligned_depth_distortion
+from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud
 from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
 
@@ -188,11 +188,11 @@ class EpisodeVisualizer:
                 app_id,
                 recording_id=rec_id,
                 spawn=True,
-                default_blueprint=self.blueprint,
             )
+            # Activate the current layout even when the viewer remembers a previous one.
             rr.send_blueprint(
-                blueprint=self.blueprint
-            )  # force-override any cached blueprint for this app_id
+                blueprint=self.blueprint, make_active=True, make_default=True
+            )
             self.log_static()
         except BaseException:
             self.close()
@@ -408,18 +408,20 @@ class EpisodeVisualizer:
         return self.pointcloud_processing_ns / self.pointcloud_processed_frames / 1e6
 
     def close(self) -> None:
-        if self.reader is not None:
-            self.reader.close()
-            self.reader = None  # type: ignore[assignment]
         try:
-            rr.disconnect()
-        except Exception:
-            pass
+            if self.reader is not None:
+                self.reader.close()
+                self.reader = None  # type: ignore[assignment]
+        finally:
+            try:
+                rr.disconnect()
+            except Exception:
+                logger.warning("Rerun disconnect failed", exc_info=True)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Visualize DexMani HDF5 teleop episodes with Rerun 3D."
+        description="Visualize Raw episodes with Rerun 3D."
     )
     parser.add_argument(
         "episode",

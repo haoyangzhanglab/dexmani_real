@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import logging
 import argparse
+import logging
 from pathlib import Path
 
 import yaml
@@ -20,9 +20,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python examples/replay_episode.py episodes/<task_name>/<episode_dir>
-  python examples/replay_episode.py episodes/<task_name>/<episode_dir> --config local.yaml
-  python examples/replay_episode.py episodes/<task_name>/<episode_dir> --output replay_results/my_replay/
+  python scripts/replay_episode.py episodes/<task_name>/<episode_dir>
+  python scripts/replay_episode.py episodes/<task_name>/<episode_dir> --config local.yaml
+  python scripts/replay_episode.py episodes/<task_name>/<episode_dir> --output replay_results/my_replay/
 
 Controls:
   Q     clean exit (save partial results)

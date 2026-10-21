@@ -41,7 +41,7 @@ python -m cordvip_geometry check --offline-input --headless
 单物体与多物体均由同一个 scene 核心执行：
 
 ```bash
-python examples/cordvip/track_object.py \
+python scripts/cordvip/track_object.py \
   --scene reports/cordvip_multiobject/toy_basket.json \
   --episode episodes/pick_place_toy/episode_20260827_165923 \
   --with-hand --headless --all-frames --save-frames --save-video \
@@ -51,7 +51,7 @@ python examples/cordvip/track_object.py \
 已有本地 toy 资产也可直接运行单物体：
 
 ```bash
-python examples/cordvip/track_object.py \
+python scripts/cordvip/track_object.py \
   --episode episodes/pick_place_toy/episode_20260827_165923 \
   --asset reports/cordvip_toy/asset \
   --initial-selection reports/cordvip_toy/first_frame_selected \
@@ -98,7 +98,7 @@ python -m cordvip_geometry replay --episode /path/to/raw_episode \
 下面命令会连接 RealSense，须由操作者明确启动；不会读取机器人关节或发送运动命令：
 
 ```bash
-python examples/cordvip/track_object.py \
+python scripts/cordvip/track_object.py \
   --asset reports/cordvip_demo/object_asset --object-prompt 'white basket' \
   --serial CAMERA_SERIAL --output reports/cordvip_demo/live
 ```
@@ -167,7 +167,7 @@ NPZ 的 `object_ids/object_roles` 给出实例顺序；数组按 `toy__`、`bask
 
 ```bash
 python -m cordvip_geometry download --models shape
-python examples/cordvip/reconstruct_object.py \
+python scripts/cordvip/reconstruct_object.py \
   --image /path/to/object.jpg --text 'white basket' \
   --output-dir reports/cordvip_demo/build --preview
 ```

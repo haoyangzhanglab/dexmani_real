@@ -13,7 +13,7 @@ conda activate real_robot
 Grounded-SAM2 分割目标，确认候选后用 Hunyuan3D-2.1 生成形状，并采样点云：
 
 ```bash
-python examples/cordvip/reconstruct_object.py \
+python scripts/cordvip/reconstruct_object.py \
   --image /path/to/object.jpg --text 'white basket.' \
   --output-dir outputs/cordvip_demo/object_build --preview
 ```
@@ -38,7 +38,7 @@ python -m cordvip_geometry prepare \
 两个资产和首帧选择由一个 JSON 指定；以下路径为示例，需自行准备资产、选择和场景文件。SAM2.1 small 共享编码两物体，每个物体独立维护 FoundationPose++ 2D 引导状态，网络权重共享。直接在窗口查看已有录像：
 
 ```bash
-python examples/cordvip/track_object.py \
+python scripts/cordvip/track_object.py \
   --scene outputs/cordvip_multiobject/toy_basket.json \
   --episode episodes/pick_place_toy/episode_20260827_165923 \
   --with-hand --replay-fps 16 \
@@ -71,7 +71,7 @@ python examples/cordvip/track_object.py \
 已有 toy 资产和首帧分割可直接复用，Grounded-SAM2 从该 mask 开始连续传播。单物体与多物体共用 SceneTracker，单物体 ID 为 object。下面只读 Raw，在窗口显示物体模型点、实测目标点与同一行实测关节生成的 XHand 点：
 
 ```bash
-python examples/cordvip/track_object.py \
+python scripts/cordvip/track_object.py \
   --episode episodes/pick_place_toy/episode_20260827_165923 \
   --asset outputs/cordvip_toy/asset \
   --initial-selection outputs/cordvip_toy/first_frame_selected \
@@ -86,7 +86,7 @@ python examples/cordvip/track_object.py \
 实时相机使用米制资产、RGB-D 和内参进行 FoundationPose++ 2D 引导追踪。**以下命令会连接 RealSense，目前输出物体点云，不读取机器人关节**：
 
 ```bash
-python examples/cordvip/track_object.py \
+python scripts/cordvip/track_object.py \
   --asset outputs/cordvip_demo/object_asset --object-prompt 'white basket.' \
   --serial CAMERA_SERIAL --output outputs/cordvip_demo/live_run
 ```

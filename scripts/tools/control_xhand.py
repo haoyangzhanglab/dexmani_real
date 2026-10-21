@@ -18,13 +18,13 @@ import numpy as np
 import yaml
 
 from dexmani_real.config.experiment import load_experiment_config
-from dexmani_real.robot.xhand.config import HandParams
 from dexmani_real.robot.commands import DispatchStatus
-from dexmani_real.robot.xhand.driver import XHand
 from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
 )
+from dexmani_real.robot.xhand.config import HandParams
+from dexmani_real.robot.xhand.driver import XHand
 from dexmani_real.robot.xhand.limits import validate_hand_command_bounds
 from dexmani_real.utils.log import configure_logging
 
@@ -33,7 +33,7 @@ FEEDBACK_POLL_INTERVAL_S = 0.01
 CONVERGENCE_SAMPLES = 3
 ACTION_DWELL_S = 1.0
 
-# XHand1 example targets in degrees; HOME/palm use the current configuration.
+# XHand1 diagnostic targets in degrees; HOME/palm use the current configuration.
 PRESET_QPOS_DEG = {
     "fist": (
         11.85,
@@ -267,7 +267,7 @@ def run_hardware_session(config: HandParams, *, finger_id: int, read_only: bool)
     except (InterruptedError, CancelledError):
         print("\nSequence interrupted; stopping any attempted action before closing")
     except Exception as exc:
-        print(f"\nXHand example failed: {exc}", file=sys.stderr)
+        print(f"\nXHand diagnostic failed: {exc}", file=sys.stderr)
         result = 2
     finally:
         cleaning_up = True

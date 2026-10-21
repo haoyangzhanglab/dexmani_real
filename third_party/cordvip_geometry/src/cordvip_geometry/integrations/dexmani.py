@@ -25,8 +25,8 @@ def raw_frame_identity(episode, row_index, observation_s, timing):
 
 def iter_raw_episode(path: str | Path) -> Iterator[Frame]:
     """Read Raw rows using decoded MP4 RGB; exhausting the iterator verifies the full frame count."""
-    from dexmani_real.dataset.pointcloud import load_raw_episode_camera_model
-    from dexmani_real.recording.storage.reader import EpisodeReader
+    from dexmani_real.data.raw.camera_geometry import load_raw_episode_camera_model
+    from dexmani_real.data.raw.reader import EpisodeReader
 
     episode_path = Path(path).expanduser().resolve()
     with EpisodeReader(episode_path) as reader:
@@ -133,10 +133,10 @@ class RawHandCloudProvider:
 
     def __init__(self, episode, config_path=None, num_points=1024, seed=0):
         from dexmani_real.config.experiment import load_experiment_config
-        from dexmani_real.dataset.pointcloud import load_raw_episode_base_from_color
+        from dexmani_real.data.raw.camera_geometry import load_raw_episode_base_from_color
         from dexmani_real.planning.kinematics.arm_fk import ArmFK
         from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rotmat
-        from dexmani_real.recording.storage.reader import EpisodeReader
+        from dexmani_real.data.raw.reader import EpisodeReader
         from dexmani_real.robot.model import (
             XARM7_JOINT_NAMES,
             XARM7_XHAND_COLLISION_URDF_PATH,

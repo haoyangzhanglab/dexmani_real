@@ -3,14 +3,13 @@
 
 from __future__ import annotations
 
-import logging
 import argparse
+import logging
 from dataclasses import asdict
 
 import yaml
 
-from dexmani_real.config.experiment import load_experiment_config
-from dexmani_real.config.experiment import DEFAULT_TASK_NAME
+from dexmani_real.config.experiment import DEFAULT_TASK_NAME, load_experiment_config
 
 logger = logging.getLogger("dexmani_real.cli.collect_teleop")
 

@@ -13,17 +13,17 @@ import h5py
 import numpy as np
 import zarr
 
-from dexmani_real.dataset.schema import (
-    CANONICAL_FORMAT,
-    ProcessingConfig,
-    canonical_array_specs,
-)
-from dexmani_real.dataset.processing import (
+from dexmani_real.data.canonical.processing import (
     discover_episode_dirs,
     CanonicalEpisodeProcessor,
     validate_export_episode,
 )
-from dexmani_real.recording.storage.reader import EpisodeReader, RawDataError, text_attr
+from dexmani_real.data.canonical.schema import (
+    CANONICAL_FORMAT,
+    ProcessingConfig,
+    canonical_array_specs,
+)
+from dexmani_real.data.raw.reader import EpisodeReader, RawDataError, text_attr
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
@@ -70,7 +70,7 @@ class CanonicalExporter:
             raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {target}")
         if any(p.suffix == ".zarr" and p.exists() for p in target.parents):
             raise ValueError("output must not be inside an existing Zarr store")
-        repo_root = Path(__file__).resolve().parents[2]
+        repo_root = Path(__file__).resolve().parents[3]
         for name in ("episodes", "rollouts"):
             protected = (repo_root / name).resolve()
             if target == protected or protected in target.parents:

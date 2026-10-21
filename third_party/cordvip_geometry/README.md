@@ -2,7 +2,7 @@
 
 独立的 CordViP / ProxiDex 手—物感知工具。Grounding DINO 提供首帧文本候选，SAM2.1 small 生成 mask 并逐帧传播；FoundationPose++ 核心用当前 mask 的 2D bbox 中心引导位姿细化。当前变体不使用 Kalman。Hunyuan3D-2.1 继续负责可选的离线单图建模，生成 mesh 须经实测尺度校准。
 
-两个示例入口 [reconstruct_object.py](../../examples/cordvip/reconstruct_object.py) 和 [track_object.py](../../examples/cordvip/track_object.py) 分别调用 `python -m cordvip_geometry object build` 与 `track` 的同一实现。先看[示例](../../examples/cordvip/README.md)，安装、Python 调用和输出说明见[使用文档](docs/usage.md)。
+两个示例入口 [reconstruct_object.py](../../scripts/cordvip/reconstruct_object.py) 和 [track_object.py](../../scripts/cordvip/track_object.py) 分别调用 `python -m cordvip_geometry object build` 与 `track` 的同一实现。先看[示例](../../scripts/cordvip/README.md)，安装、Python 调用和输出说明见[使用文档](docs/usage.md)。
 
 ```bash
 conda activate real_robot
