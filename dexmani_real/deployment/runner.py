@@ -133,10 +133,11 @@ class PolicyRunner:
         fields = set(self.policy_info.observation_fields)
         requires_rgb = "rgb" in fields
         self.requires_cloud = "point_cloud" in fields
-        self.requires_camera_payload = (
+        self.requires_camera = (
             bool(fields & {"rgb", "camera_intrinsic", "camera_extrinsic"})
             or self.recorder is not None
         )
+        self.camera_header_only = not requires_rgb and self.recorder is None
         self.requires_rgb_cloud_identity = (
             requires_rgb or self.recorder is not None
         ) and self.requires_cloud
@@ -149,7 +150,8 @@ class PolicyRunner:
             self.robot,
             issues=self.observation_read_issues,
             require_hand=True,
-            require_camera=self.requires_camera_payload,
+            require_camera=self.requires_camera,
+            camera_header_only=self.camera_header_only,
             require_pointcloud=self.requires_cloud,
             require_rgb_cloud_identity=self.requires_rgb_cloud_identity,
             wait_for_hand=wait_for_hand,
@@ -1033,7 +1035,19 @@ class PolicyRunner:
                     self.results is not None and self.results.current is not None
                 ):
                     self.finalize_outputs(
-                        "start_cancelled", str(failure) if failure else "shutdown"
+                        (
+                            "start_cancelled"
+                            if isinstance(failure, KeyboardInterrupt) or (
+                                failure is None and (
+                                    self.runtime_state.stop_request
+                                    or self.runtime_state.quit_requested
+                                    or self.runtime_state.estop_request
+                                )
+                            )
+                            else "preparation_failed"
+                        ),
+                        str(failure) if failure else "shutdown",
+                        errors=[error_detail("preparation", failure)] if failure else [],
                     )
             except Exception as exc:
                 failure = failure or exc

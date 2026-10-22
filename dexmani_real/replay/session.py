@@ -57,16 +57,18 @@ class ReplaySession:
 
             self.keyboard = KeyboardInput(
                 quit_callback=self.runtime_state.request_quit,
+                stop_callback=self.runtime_state.request_stop,
                 estop_callback=self.runtime_state.request_emergency_stop,
             )
             from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 
             make_arm_fk()
             self.home_planner = build_home_planner(self.runtime)
-            self.robot.connect()
-            self.runtime_state.arm()
             self.keyboard.start()
             self.robot.check_services = lambda: self.keyboard.healthy
+            self.robot.connect()
+            self.robot.check()
+            self.runtime_state.arm()
             home_result = home_hand(
                 self.runtime_state,
                 self.runtime,

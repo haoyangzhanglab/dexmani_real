@@ -35,7 +35,8 @@ class DexManiRobot:
         return self.motion_active or self.hand_stop_pending
 
     def __init__(
-        self, runtime_state, runtime, *, arm_factory=None, hand_factory=None, check_services=None
+        self, runtime_state, runtime, *, arm_factory=None, hand_factory=None, check_services=None,
+        required_tactile=("aggregate", "dense"),
     ):
         self.runtime_state, self.runtime = runtime_state, runtime
         self.arm_factory, self.hand_factory = arm_factory, hand_factory
@@ -45,7 +46,7 @@ class DexManiRobot:
         self.connected = False
         self.motion_active = False
         self.hand_stop_pending = False
-        self.hand_feedback = XHandFeedback(runtime.hand)
+        self.hand_feedback = XHandFeedback(runtime.hand, required_tactile=required_tactile)
         self.hand_send_failure_started_ns = None
         self.idle_next_ns = 0
 
@@ -77,13 +78,16 @@ class DexManiRobot:
             return self.initial_state_cancelled(epoch)
 
         try:
+            if cancelled():
+                raise CancelledError("robot startup cancelled")
             from dexmani_real.robot.xarm7.executor import ArmExecutor
 
             self.arm = ArmExecutor(
                 self.runtime.arm, self.runtime_state, driver_factory=self.arm_factory
             )
-            self.arm.connect()
-            self.check()
+            self.arm.connect(check_services=self.check_services)
+            if cancelled():
+                raise CancelledError("robot startup cancelled before hand connection")
             deadline_ns = None
             if self.runtime.control.hand_enabled:
                 if self.hand_factory is None:
@@ -147,7 +151,7 @@ class DexManiRobot:
         frame = self.hand_feedback.consume(state, time.monotonic_ns())
         if frame is not None and self.arm is not None:
             self.arm.update_health(
-                hand_until_ns=hand_feedback_time_ns(frame)
+                hand_until_ns=hand_feedback_time_ns(frame, self.hand_feedback.required_tactile)
                 + int(self.runtime.hand.feedback_max_age_s * 1e9)
             )
         return frame

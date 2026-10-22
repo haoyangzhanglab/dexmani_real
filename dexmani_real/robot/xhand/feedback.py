@@ -9,15 +9,11 @@ from dexmani_real.ipc.schema import HAND_STATE_DTYPE
 logger = logging.getLogger(__name__)
 
 
-def hand_feedback_time_ns(hand):
+def hand_feedback_time_ns(hand, required_tactile=("aggregate", "dense")):
     """Oldest required hand source, without conflating tactile age with joint time."""
     return min(
         int(hand[name][0])
-        for name in (
-            "timestamp_ns",
-            "tactile_aggregate_timestamp_ns",
-            "tactile_dense_timestamp_ns",
-        )
+        for name in ("timestamp_ns", *(f"tactile_{name}_timestamp_ns" for name in required_tactile))
     )
 
 
@@ -37,8 +33,11 @@ def update_tactile_cache(raw, values, valid_ns, now_ns):
 class XHandFeedback:
     """Own consumed samples and their validity clocks within one robot connection."""
 
-    def __init__(self, config):
+    def __init__(self, config, *, required_tactile=("aggregate", "dense")):
         self.config = config
+        self.required_tactile = tuple(required_tactile)
+        if not set(self.required_tactile) <= {"aggregate", "dense"}:
+            raise ValueError("unknown required tactile channel")
         self.latest = None
         self.tactile_cache = {}
         self.tactile_held = set()
@@ -111,14 +110,15 @@ class XHandFeedback:
         max_age_ns = int(self.config.feedback_max_age_s * 1e9)
         issue = "hand joint feedback has no valid initial value"
         if frame is not None:
+            if not np.isfinite(frame["qpos"]).all():
+                raise RuntimeError("hand joint feedback is nonfinite")
             issue = None
             for name in (
                 "timestamp_ns",
-                "tactile_aggregate_timestamp_ns",
-                "tactile_dense_timestamp_ns",
+                *(f"tactile_{channel}_timestamp_ns" for channel in self.required_tactile),
             ):
                 stamp = int(frame[name][0])
-                if stamp <= 0 or now_ns - stamp >= max_age_ns:
+                if not 0 < stamp <= now_ns < stamp + max_age_ns:
                     issue = (
                         f"hand {name}: no valid initial value or feedback age reached "
                         f"{self.config.feedback_max_age_s:.3f}s"

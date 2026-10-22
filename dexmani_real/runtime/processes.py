@@ -16,35 +16,28 @@ class SensorProcesses:
         self.runtime_state = runtime_state
         self.started = []
 
-    def start(self, process, *, ready, timeout_s=None) -> None:
+    def start(self, process, *, ready, timeout_s=None, check_services=None) -> None:
         """Start ownership immediately; a timeout also requests a blocking readiness wait."""
         if timeout_s is not None and (not math.isfinite(timeout_s) or timeout_s <= 0):
             raise ValueError("readiness timeout must be finite and positive")
-        if (
-            not self.runtime_state.running
-            or self.runtime_state.error_state
-            or self.runtime_state.estop_request
-        ):
+
+        def allowed():
+            return (
+                (check_services is None or check_services())
+                and self.runtime_state.requests_allow_motion()
+            )
+
+        if not allowed():
             raise RuntimeError("sensor startup cancelled")
         process.start()
         self.started.append((process, ready))
         if timeout_s is not None:
             deadline = time.monotonic() + timeout_s
             while time.monotonic() < deadline:
-                if (
-                    not self.check()
-                    or not self.runtime_state.running
-                    or self.runtime_state.error_state
-                    or self.runtime_state.estop_request
-                ):
+                if not allowed() or not self.check():
                     break
                 if ready.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
-                    if (
-                        self.check()
-                        and self.runtime_state.running
-                        and not self.runtime_state.error_state
-                        and not self.runtime_state.estop_request
-                    ):
+                    if allowed() and self.check():
                         return
                     break
             raise RuntimeError(f"{process.name} failed to become ready")

@@ -138,7 +138,13 @@ class RuntimeState:
             self.estop_request = True
             self.publish_arm_authority()
             if not already_requested:
-                self.revoke_motion(reason=RunEndReason.ESTOP)
+                self.revoke_motion(
+                    (
+                        SafetyState.DISARMED
+                        if self.safety_state == SafetyState.DISARMED else SafetyState.ARMED
+                    ),
+                    reason=RunEndReason.ESTOP,
+                )
 
     def mark_error(self):
         """Latch a session error without conflating it with a hardware FAULT."""

@@ -122,7 +122,12 @@ class TeleopSession:
                         args=(self.runtime_state.sensors, self.runtime.vr),
                     ),
                     ready=self.runtime_state.sensors.vr_ready,
+                    check_services=lambda: self.runner.keyboard.healthy,
                 ),
+            )
+            self.runner.keyboard.start()
+            self.robot.check_services = lambda: (
+                self.runner.keyboard.healthy and self.sensors.check()
             )
             self.robot.connect()
             if self.runtime.control.recording_enabled:
@@ -134,7 +139,9 @@ class TeleopSession:
                     ),
                     ready=self.runtime_state.sensors.camera_ready,
                     timeout_s=self.runtime.safety.camera_ready_timeout_s,
+                    check_services=lambda: self.runner.keyboard.healthy,
                 )
+            self.robot.check()
             self.runtime_state.arm()
             self.runner.run()
             clean = bool(self.runtime_state.quit_requested)

@@ -16,7 +16,8 @@ def feedback_deadline_ns(row, runtime, *, include_vr=False):
     deadlines = [int(row.arm["timestamp_ns"][0]) + int(runtime.arm.feedback_max_age_s * 1e9) + 1]
     if row.hand is not None:
         deadlines.append(
-            hand_feedback_time_ns(row.hand) + int(runtime.hand.feedback_max_age_s * 1e9)
+            hand_feedback_time_ns(row.hand, row.required_tactile)
+            + int(runtime.hand.feedback_max_age_s * 1e9)
         )
     if include_vr:
         deadlines.append(
@@ -36,17 +37,20 @@ def read_vr_frame(runtime_state):
     }
 
 
-def read_camera_frame(runtime_state, sequence=None):
+def read_camera_frame(runtime_state, sequence=None, *, header_only=False):
     ring = runtime_state.sensors.camera_ring
-    result = ring.read_latest() if sequence is None else ring.read_sequence(sequence)
+    result = (
+        ring.read_latest_field("header")
+        if header_only
+        else ring.read_latest() if sequence is None else ring.read_sequence(sequence)
+    )
     if result is None:
         return None
     data, publication_ns, sequence = result
     frame = data[0]
-    header = frame["header"]
+    header = frame if header_only else frame["header"]
     return {
-        "rgb": frame["rgb"],
-        "depth": frame["depth"],
+        **({} if header_only else {"rgb": frame["rgb"], "depth": frame["depth"]}),
         "ring_sequence": sequence,
         "published_ns": publication_ns,
         **{name: int(header[name]) for name in header.dtype.names},
@@ -76,6 +80,7 @@ class ObservationRow:
     pointcloud_camera_published_ns: int = -1
     pointcloud_started_ns: int = -1
     pointcloud_published_ns: int = -1
+    required_tactile: tuple[str, ...] = ("aggregate", "dense")
 
 
 def read_observation(
@@ -85,6 +90,7 @@ def read_observation(
     *,
     require_hand=True,
     require_camera=False,
+    camera_header_only=False,
     require_vr=False,
     require_pointcloud=False,
     require_rgb_cloud_identity=False,
@@ -115,7 +121,10 @@ def read_observation(
             else None
         )
     else:
-        camera = read_camera_frame(runtime_state) if require_camera else None
+        camera = (
+            read_camera_frame(runtime_state, header_only=camera_header_only)
+            if require_camera else None
+        )
     vr = read_vr_frame(runtime_state) if require_vr else None
     if (require_camera or require_rgb_cloud_identity) and camera is None:
         unavailable.append("camera_source_unavailable_or_unmatched")
@@ -125,7 +134,7 @@ def read_observation(
     if not sample_is_fresh(arm["timestamp_ns"][0], runtime.arm.feedback_max_age_s, now):
         unavailable.append("arm_feedback_stale")
     if hand is not None:
-        hand_ns = hand_feedback_time_ns(hand)
+        hand_ns = hand_feedback_time_ns(hand, robot.hand_feedback.required_tactile)
         if not 0 < hand_ns <= now < hand_ns + int(runtime.hand.feedback_max_age_s * 1e9):
             unavailable.append("hand_feedback_stale")
     if camera is not None and not sample_is_fresh(
@@ -162,6 +171,7 @@ def read_observation(
         ),
         pointcloud_started_ns=int(cloud["processing_started_ns"]) if cloud is not None else -1,
         pointcloud_published_ns=int(cloud_result[1]) if cloud_result is not None else -1,
+        required_tactile=robot.hand_feedback.required_tactile,
     )
 
     deadlines = []

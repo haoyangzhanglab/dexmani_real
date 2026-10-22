@@ -654,11 +654,6 @@ class TeleopRunner:
 
     def run(self) -> None:
         try:
-            self.keyboard.start()
-            check_services = self.robot.check_services
-            self.robot.check_services = lambda: (
-                (check_services is None or check_services()) and self.keyboard.healthy
-            )
             ready = self.initialize()
             while ready and self.runtime_state.running and not self.runtime_state.quit_requested:
                 self.robot.arm.check_error()

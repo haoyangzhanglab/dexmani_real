@@ -70,7 +70,7 @@ class SharedMemoryRingBuffer:
         header[0] = index
         return sequence
 
-    def copy_slot(self, index, expected=None):
+    def copy_slot(self, index, expected=None, *, field=None):
         slot = self.slots[index]
         marker = int(slot["sequence"])
         if marker == 0 or marker & 1:
@@ -79,8 +79,16 @@ class SharedMemoryRingBuffer:
         if expected is not None and sequence != expected:
             return None
         stamp = int(slot["timestamp_ns"])
-        data = slot["data"].copy().reshape(1)
+        payload = slot["data"] if field is None else slot["data"][field]
+        data = payload.copy().reshape((1,) + payload.shape)
         return (data, stamp, sequence) if marker == int(slot["sequence"]) else None
+
+    def read_latest_field(self, field: str) -> tuple[np.ndarray, int, int] | None:
+        """Copy one field under the same publication/sequence fence as a full frame."""
+        sequence = self.latest_sequence
+        if sequence <= 0:
+            return None
+        return self.copy_slot(sequence % self.maxlen, expected=sequence, field=field)
 
     def read_latest(self, *, use_last_good=False) -> tuple[np.ndarray, int, int] | None:
         """Cached readers retry twice; fallback retains its original source/publication clocks."""

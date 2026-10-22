@@ -72,7 +72,6 @@ def policy_observation_issue(row, fields):
         return "required_observation_unavailable"
     if not np.isfinite(row.arm["qpos"]).all() or not np.isfinite(row.hand["qpos"]).all():
         return "control_feedback_nonfinite"
-    camera_checked = False
     for name in fields:
         if name in {"finger_tactile_force", "taxel_tactile_force"}:
             channel = "aggregate" if name == "finger_tactile_force" else "dense"
@@ -82,11 +81,11 @@ def policy_observation_issue(row, fields):
             if row.point_cloud is None or not np.isfinite(row.point_cloud).all():
                 return "required_point_cloud_unavailable_or_nonfinite"
         elif name in {"rgb", "camera_intrinsic", "camera_extrinsic"}:
-            if camera_checked:
-                continue
             if row.camera is None:
                 return f"required_{name}_unavailable"
-            image = row.camera["rgb"]
+            if name != "rgb":
+                continue
+            image = row.camera.get("rgb")
             if (
                 not isinstance(image, np.ndarray)
                 or image.dtype != np.uint8
@@ -95,7 +94,6 @@ def policy_observation_issue(row, fields):
                 or min(image.shape[:2]) <= 0
             ):
                 return f"required_{name}_invalid"
-            camera_checked = True
     return None
 
 

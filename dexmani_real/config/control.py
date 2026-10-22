@@ -154,6 +154,7 @@ class DexPilotRetargetingParams:
 
 @dataclass(frozen=True)
 class SafetyParams:
+    model_startup_timeout_s: float = 300.0
     camera_ready_timeout_s: float = 15.0
     pointcloud_ready_timeout_s: float = 30.0
     vr_ready_timeout_s: float = 120.0

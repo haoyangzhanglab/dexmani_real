@@ -171,6 +171,14 @@ class PolicyDeploymentSession:
             self.runtime_state,
             self.runtime,
             check_services=self.sensors.check if self.sensors else None,
+            required_tactile=tuple(
+                channel
+                for field, channel in (
+                    ("finger_tactile_force", "aggregate"),
+                    ("taxel_tactile_force", "dense"),
+                )
+                if field in fields or self.recording_dir is not None
+            ),
         )
         self.model = InferenceWorker(
             lambda: load_configured_policy(
@@ -211,6 +219,16 @@ class PolicyDeploymentSession:
         )
 
     def start_devices(self):
+        self.operator = PolicyOperator(
+            self.runtime_state,
+            self.runtime,
+            self.home_planner,
+            robot=self.robot,
+        )
+        self.operator.keyboard.start()
+        self.robot.check_services = lambda: (
+            self.operator.keyboard.healthy and (self.sensors is None or self.sensors.check())
+        )
         self.robot.connect()
         if self.sensors is not None:
             self.sensors.start(
@@ -221,6 +239,7 @@ class PolicyDeploymentSession:
                 ),
                 ready=self.runtime_state.sensors.camera_ready,
                 timeout_s=self.runtime.safety.camera_ready_timeout_s,
+                check_services=lambda: self.operator.keyboard.healthy,
             )
         if self.pointcloud_config is not None:
             self.sensors.start(
@@ -231,6 +250,7 @@ class PolicyDeploymentSession:
                 ),
                 ready=self.runtime_state.sensors.pointcloud_ready,
                 timeout_s=self.runtime.safety.pointcloud_ready_timeout_s,
+                check_services=lambda: self.operator.keyboard.healthy,
             )
         self.camera_parameters = build_observation_camera(
             self.runtime_state.sensors,
@@ -238,17 +258,8 @@ class PolicyDeploymentSession:
             self.info.observation_fields,
             self.camera_calibration,
         )
+        self.robot.check()
         self.runtime_state.arm()
-        self.operator = PolicyOperator(
-            self.runtime_state,
-            self.runtime,
-            self.home_planner,
-            robot=self.robot,
-        )
-        self.operator.keyboard.start()
-        self.robot.check_services = lambda: (
-            (self.sensors is None or self.sensors.check()) and self.operator.keyboard.healthy
-        )
 
     def run_control(self):
         runner = PolicyRunner(
@@ -356,6 +367,8 @@ class PolicyDeploymentSession:
         return int(not clean or failure is not None or not shutdown_clean or home_fault)
 
     def warmup_policy(self):
+        timeout_s = self.runtime.safety.model_startup_timeout_s
+        deadline = time.monotonic() + timeout_s
         self.model.submit(
             "load",
             samples=5,
@@ -367,7 +380,13 @@ class PolicyDeploymentSession:
             ),
         )
         while (completion := self.model.poll()) is None:
-            time.sleep(0.005)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"model load/warmup timed out after {timeout_s:g}s; status=pending; "
+                    "model thread/native call cannot be interrupted"
+                )
+            time.sleep(min(0.005, remaining))
         if completion[1].error is not None:
             raise completion[1].error
         logger.debug("Model warmup durations: %s", completion[1].value)

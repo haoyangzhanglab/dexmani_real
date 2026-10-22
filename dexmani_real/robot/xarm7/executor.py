@@ -85,25 +85,30 @@ class ArmExecutor:
     def fault(self):
         return self.io.fault.value.decode(errors="replace") or None
 
-    def connect(self):
+    def connect(self, *, check_services=None):
         from ruckig import Ruckig
         from dexmani_real.robot.xarm7.worker import run_arm
 
         Ruckig(7)
         if self.process is not None:
             raise RuntimeError("arm executor is single-use")
-        if (
-            not self.runtime_state.running
-            or self.runtime_state.estop_request
-            or self.runtime_state.error_state
-        ):
-            raise RuntimeError("arm startup unauthorized")
-        self.runtime_state.arm_authority, self.runtime_state.arm_emergency = (
-            self.io.authority,
-            self.io.emergency,
-        )
-        # Explicit connect authorizes initialization only, never streaming.
-        self.io.authority.value = -self.runtime_state.run_id
+
+        def check_startup():
+            if check_services is not None and not check_services():
+                self.runtime_state.mark_error()
+            if not self.runtime_state.requests_allow_motion():
+                raise OperationCancelled("arm startup unauthorized/cancelled")
+
+        check_startup()
+        with self.runtime_state.motion_lock:
+            if not self.runtime_state.requests_allow_motion():
+                raise OperationCancelled("arm startup unauthorized/cancelled")
+            self.runtime_state.arm_authority, self.runtime_state.arm_emergency = (
+                self.io.authority,
+                self.io.emergency,
+            )
+            # Publish initialization authority atomically with the stop/quit fence.
+            self.io.authority.value = -self.runtime_state.run_id
         self.process = self.ctx.Process(
             target=run_arm,
             args=(self.cfg, self.io, self.child_pipe, self.factory),
@@ -112,13 +117,23 @@ class ArmExecutor:
         )
         self.process.start()
         self.child_pipe.close()
-        if not self.io.ready.wait(
+        deadline = time.monotonic() + (
             self.cfg.homing.convergence_timeout_s + self.cfg.executor_timeout_s
-        ):
+        )
+        try:
+            while not self.io.ready.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
+                check_startup()
+                self.check_error()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "arm initialization unresolved; owner process may still be in SDK"
+                    )
+            check_startup()
+            self.check_error()
+        except BaseException:
             self.request_stop()
             self.io.closing.set()
-            raise TimeoutError("arm initialization unresolved; owner process may still be in SDK")
-        self.check_error()
+            raise
         self.runtime_state.publish_arm_authority()
 
     def check_error(self):
