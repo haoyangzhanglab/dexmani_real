@@ -229,18 +229,6 @@ def compute_joint_home_path(
     if admitted(distal, "distal_first"):
         return distal
 
-    try:
-        milestones = planner.plan_joint_qpos_path(target, qpos)
-        if len(milestones) < 2:
-            raise ValueError("planner returned fewer than two milestones")
-    except (ValueError, RuntimeError) as exc:
-        rejections.append(f"joint_qpos_rrt: {exc}")
-    else:
-        if float(np.max(np.abs(milestones[-1] - target))) > 1e-6:
-            milestones = np.concatenate([milestones, target[None]], axis=0)
-        # Appending the absolute target may introduce a new segment.
-        if admitted(milestones, "joint_qpos_rrt"):
-            return milestones
     raise ValueError("no safe home path; " + "; ".join(rejections))
 
 

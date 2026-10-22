@@ -129,7 +129,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=None,
         help=(
-            "A_exec: actions per segment "
+            "A_exec: actions per segment (nominal replan length in async; "
+            "valid old tails may run longer) "
             "(default: YAML execution.action_steps or saved Policy n_action_steps)"
         ),
     )

@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PolicyQuery:
-    """slot anchors the observation; handoff_slot is the first consumable slot."""
+    """slot anchors the observation; handoff_slot is the earliest planned takeover."""
 
     query_id: int
     run_id: int
@@ -53,7 +53,7 @@ class PolicyQuery:
 
 @dataclass
 class ActionPlan:
-    """actions index from anchor_slot; execution ends at exclusive segment_end."""
+    """actions index from anchor_slot; async may consume the tail past nominal segment_end."""
 
     actions: np.ndarray
     anchor_slot: int
@@ -584,9 +584,16 @@ class PolicyRunner:
                 run_id=self.run_id,
                 slot=int(slot),
                 handoff_slot=handoff_slot,
+                planned_handoff_ns=(
+                    self.started_ns + handoff_slot * self.dt_ns
+                    if handoff_slot is not None else None
+                ),
+                decision_expires_at_ns=expires_at_ns,
+                actual_handoff_slot=None,
+                actual_handoff_ns=None,
                 deadline_ns=(
                     (self.started_ns + (handoff_slot + 1) * self.dt_ns)
-                    if handoff_slot is not None
+                    if handoff_slot is not None and self.execution.execution_mode == "rtc"
                     else None
                 ),
                 submitted_ns=time.monotonic_ns(),
@@ -805,15 +812,25 @@ class PolicyRunner:
             return None, None
         if not self.has_motion_authority():
             return None, ControlRejection("handoff_authority_revoked")
-        if slot != handoff:
+        ordinary_async = self.execution.execution_mode == "async" and not bootstrap
+        if not ordinary_async and slot != handoff:
             return None, ControlRejection("handoff_slot_missed")
         if query.result is None:
+            if ordinary_async:
+                return None, None
             return None, ControlRejection("handoff_result_not_ready")
+        segment_end = slot + self.execution.action_steps
+        if ordinary_async:
+            if not 0 <= slot - query.slot < len(query.result):
+                return None, ControlRejection("handoff_prediction_exhausted")
+            if time.monotonic_ns() >= query.expires_at_ns:
+                return None, ControlRejection("handoff_decision_expired")
+            segment_end = min(segment_end, query.slot + len(query.result))
         return (
             ActionPlan(
                 actions=query.result,
                 anchor_slot=slot if bootstrap else query.slot,
-                segment_end=slot + self.execution.action_steps,
+                segment_end=segment_end,
                 expires_at_ns=query.expires_at_ns,
                 frozen={},
                 query_id=query.query_id,
@@ -822,15 +839,21 @@ class PolicyRunner:
         )
 
     def prefetch(self, row, rows, slot):
-        if (
-            self.execution.execution_mode == "sync"
-            or slot != self.plan.segment_end - self.execution.prefetch_steps
-        ):
+        mode = self.execution.execution_mode
+        if mode == "sync":
             return None
-        if not rows or self.query is not None or self.model.future is not None:
+        prefetch_slot = self.plan.segment_end - self.execution.prefetch_steps
+        if mode == "async":
+            if slot < prefetch_slot:
+                return None
+        elif slot != prefetch_slot:
+            return None
+        if self.query is not None or self.model.future is not None:
+            return None if mode == "async" else ControlRejection("prefetch_unavailable")
+        if not rows:
             return ControlRejection("prefetch_unavailable")
         prefix = commands = None
-        if self.execution.execution_mode == "rtc":
+        if mode == "rtc":
             prefix, commands, issue = self.prepare_prefix(row, slot)
             if issue is not None:
                 return issue
@@ -895,8 +918,12 @@ class PolicyRunner:
                 self.finish_episode(issue.detail, run_end_reason=issue.run_end_reason, row=row)
                 return
             if new_plan is not None:
-                if self.query.handoff_slot is None and self.recorder is not None:
-                    self.query.evidence.update(handoff_slot=int(slot), bootstrap=True)
+                if self.recorder is not None:
+                    if self.query.handoff_slot is None:
+                        self.query.evidence.update(handoff_slot=int(slot), bootstrap=True)
+                    self.query.evidence.update(
+                        actual_handoff_slot=int(slot), actual_handoff_ns=time.monotonic_ns()
+                    )
                     self.record_query(self.query)
                 self.plan, self.query = new_plan, None
             if self.plan is None:
@@ -913,11 +940,18 @@ class PolicyRunner:
                         return
                 self.record(row)
             else:
+                if self.execution.execution_mode == "async":
+                    if not 0 <= slot - self.plan.anchor_slot < len(self.plan.actions):
+                        self.finish_episode("plan_exhausted_without_handoff", row=row)
+                        return
+                    if time.monotonic_ns() >= self.plan.expires_at_ns:
+                        self.finish_episode("dispatch_deadline_expired", row=row)
+                        return
                 issue = self.prefetch(row, rows, slot)
                 if issue is not None:
                     self.finish_episode(issue.detail, run_end_reason=issue.run_end_reason, row=row)
                     return
-                if slot >= self.plan.segment_end:
+                if self.execution.execution_mode != "async" and slot >= self.plan.segment_end:
                     self.finish_episode("plan_exhausted_without_handoff", row=row)
                     return
                 # Pending prefetch never suspends a still-valid current plan.

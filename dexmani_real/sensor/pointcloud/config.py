@@ -22,7 +22,7 @@ class PointCloudConfig:
     depth_support_min_neighbors: int = 2
     # Reject unsupported thin structures at unresolved depth edges.
     edge_support_min_neighbors: int = 5
-    # Retain low surfaces only with coherent seeds above the observed 7–13 mm table residual.
+    # Retain above-core surfaces only when connected to a sufficiently large high seed.
     table_core_height_m: float = 0.007
     table_object_seed_height_m: float = 0.016
     table_object_seed_min_pixels: int = 4

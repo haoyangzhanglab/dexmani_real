@@ -35,6 +35,7 @@ class ExecutionConfig:
     """Policy action horizon and runtime execution budgets."""
 
     # Effective A_exec, resolved from CLI, YAML or saved default at the Real entry.
+    # Ordinary async uses this nominal replan length; late inference may consume more old actions.
     action_steps: int | None = None
     execution_mode: str = "sync"
     # Policy may start near HOME without relaxing the physical HOME convergence.

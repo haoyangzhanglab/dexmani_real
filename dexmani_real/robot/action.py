@@ -110,12 +110,13 @@ class ActionMapper:
         self.solver.collision_model.set_hand_qpos(
             hand if hand is not None else np.deg2rad(cfg.hand.home_qpos_deg)
         )
-        result = self.solver.solve(pose, current, previous)
-        reason = (
-            result.reason
-            if not result.success
-            else self.target_checker.endpoint_rejection(result.qpos)
+        result = self.solver.solve(
+            pose,
+            current,
+            previous,
+            endpoint_rejection=self.target_checker.endpoint_rejection,
         )
+        reason = None if result.success else result.reason
         return ActionResult(
             result.qpos if reason is None else None,
             hand,

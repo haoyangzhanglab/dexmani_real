@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -105,7 +106,8 @@ class IKCandidate:
     max_joint_displacement_rad: float
     base_cost: float
     near_limit: bool
-    collision_free: bool | None = None
+    checked: bool = False
+    rejection_reason: str | None = None
     reciprocal_condition_number: float | None = None
     cost: float = 0.0
 
@@ -188,7 +190,12 @@ class OnlineIKSolver:
             raise ValueError("online IK tolerances, radii and weights must be finite and valid")
 
     def solve(
-        self, target_eef_pose_base: Pose, current_qpos: np.ndarray, previous_qpos_cmd: np.ndarray
+        self,
+        target_eef_pose_base: Pose,
+        current_qpos: np.ndarray,
+        previous_qpos_cmd: np.ndarray,
+        *,
+        endpoint_rejection: Callable[[np.ndarray], str | None],
     ) -> IKResult:
         try:
             current = self.validate_joint_vector(current_qpos)
@@ -198,7 +205,9 @@ class OnlineIKSolver:
                 or not np.isfinite(target_eef_pose_base.q).all()
             ):
                 raise ValueError("non-finite target pose")
-            selected, converged, rejection = self.search(target_eef_pose_base, current, previous)
+            selected, converged, rejection = self.search(
+                target_eef_pose_base, current, previous, endpoint_rejection
+            )
             if selected is not None:
                 result = IKResult(success=True, qpos=selected.qpos)
             else:
@@ -233,15 +242,15 @@ class OnlineIKSolver:
             raise ValueError("IK joint vectors must be finite shape (7,)")
         return q
 
-    def search(self, target, current, previous):
+    def search(self, target, current, previous, endpoint_rejection):
         target_base = self.kin.to_mplib_pose(target)
         pool: list[IKCandidate] = []
         tried_seeds = []
         converged = False
-        rejection = "solver_no_convergence"
+        rejections = []
 
         def try_seed(name, seed):
-            nonlocal converged, rejection
+            nonlocal converged
             # Exact equality only; even a nearby distinct seed can reach another IK branch.
             if any(np.array_equal(seed, tried) for tried in tried_seeds):
                 return None
@@ -251,8 +260,8 @@ class OnlineIKSolver:
             )
             if issue != "solver_no_convergence":
                 converged = True
-                if issue:
-                    rejection = issue
+                if issue and issue != "duplicate":
+                    rejections.append(issue)
             return candidate
 
         for name, seed in (("prev_cmd", previous), ("current_qpos", current)):
@@ -267,11 +276,11 @@ class OnlineIKSolver:
                 <= np.deg2rad(self.config.fast_accept_max_delta_deg)
                 and candidate.position_error_m <= 0.5 * self.config.max_pose_error_pos_m
                 and candidate.rotation_error_rad <= 0.5 * self.config.max_pose_error_rot_rad
-                and self.collision_free(candidate)
+                and self.candidate_rejection(candidate, endpoint_rejection) is None
             ):
                 return candidate, converged, ""
 
-        base = self.select_collision_free(sorted(pool, key=lambda c: c.base_cost))
+        base = self.select_valid(sorted(pool, key=lambda c: c.base_cost), endpoint_rejection)
         if base is not None and not base.near_limit:
             return base, converged, ""
         anchor = min(pool, key=lambda c: c.base_cost) if pool else None
@@ -282,8 +291,8 @@ class OnlineIKSolver:
                     candidate = try_seed(name, seed)
                     if candidate is not None:
                         pool.append(candidate)
-            # Known collisions can anchor search, but cannot participate in final selection.
-            viable = [c for c in pool if c.collision_free is not False]
+            # Rejected endpoints can anchor search, but cannot participate in final selection.
+            viable = [c for c in pool if c.rejection_reason is None]
             weight = self.config.singularity_margin_weight
             for candidate in viable:
                 # The reciprocal condition number is in [0,1], bounding its effect on cost.
@@ -298,11 +307,12 @@ class OnlineIKSolver:
                 candidate.cost = (
                     candidate.base_cost - weight * candidate.reciprocal_condition_number
                 )
-            selected = self.select_collision_free(sorted(viable, key=lambda c: c.cost))
+            selected = self.select_valid(sorted(viable, key=lambda c: c.cost), endpoint_rejection)
             if selected is not None:
                 return selected, converged, ""
 
-        return None, converged, "self_collision" if pool else rejection
+        rejections.extend(c.rejection_reason for c in pool if c.rejection_reason is not None)
+        return None, converged, "; ".join(dict.fromkeys(rejections)) or "solver_no_convergence"
 
     def try_clik(self, name, seed, target_base, target, current, previous, pool):
         model = self.kin.mp_planner
@@ -390,14 +400,20 @@ class OnlineIKSolver:
     def joint_limit_penalty(self, qpos):
         return float(np.sum(((qpos - self.limit_center) / self.limit_radius) ** 2))
 
-    def collision_free(self, candidate):
-        if candidate.collision_free is None:
-            candidate.collision_free = not self.collision_model.check_self_collision(candidate.qpos)
-        return candidate.collision_free
+    def candidate_rejection(self, candidate, endpoint_rejection):
+        # Candidates belong to one solve and its fixed hand pose; never cache across solves.
+        if not candidate.checked:
+            candidate.rejection_reason = (
+                "self_collision"
+                if self.collision_model.check_self_collision(candidate.qpos)
+                else endpoint_rejection(candidate.qpos)
+            )
+            candidate.checked = True
+        return candidate.rejection_reason
 
-    def select_collision_free(self, candidates):
+    def select_valid(self, candidates, endpoint_rejection):
         for candidate in candidates:
-            if self.collision_free(candidate):
+            if self.candidate_rejection(candidate, endpoint_rejection) is None:
                 return candidate
         return None
 

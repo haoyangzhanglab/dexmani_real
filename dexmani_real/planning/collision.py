@@ -301,10 +301,6 @@ class CollisionModel:
         )
 
     @property
-    def has_static_environment(self) -> bool:
-        return self.environment_collision_model is not None
-
-    @property
     def has_table(self) -> bool:
         return self.table is not None
 
@@ -336,27 +332,10 @@ class CollisionModel:
             raise RuntimeError("table distance query returned a non-finite value")
         return minimum_m
 
-    def check_environment_collision(self, qpos: np.ndarray) -> bool:
-        """Return whether nominal robot geometry touches a configured box or table."""
-        if not self.has_static_environment:
-            self.to_full_qpos(qpos)  # validate even without obstacles
-            return False
-        full_qpos = self.to_full_qpos(qpos)
-        return bool(
-            self.pin.computeCollisions(
-                self.model,
-                self.data,
-                self.environment_collision_model,
-                self.environment_collision_data,
-                full_qpos,
-                True,
-            )
-        )
-
     def check_environment_collision_details(self, qpos: np.ndarray) -> "CollisionInfo":
         """Return robot link, obstacle name, and sampled qpos for a scene contact."""
         full_qpos = self.to_full_qpos(qpos)
-        if not self.has_static_environment:
+        if self.environment_collision_model is None:
             return CollisionInfo(in_collision=False)
         collided = bool(
             self.pin.computeCollisions(
@@ -395,10 +374,6 @@ class CollisionModel:
             num_contacts=max(1, len(pairs)),
             sample_qpos_rad=tuple(float(value) for value in full_qpos),
         )
-
-    def check_collision(self, qpos: np.ndarray) -> bool:
-        """Fast combined self + static-environment collision query."""
-        return self.check_self_collision(qpos) or self.check_environment_collision(qpos)
 
     def check_collision_details(self, qpos: np.ndarray) -> "CollisionInfo":
         """Detailed combined query; self collision takes diagnostic precedence."""

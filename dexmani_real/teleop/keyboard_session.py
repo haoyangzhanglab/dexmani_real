@@ -214,15 +214,15 @@ class KeyboardTeleopSession:
 
         if row.hand is not None:
             self.solver.collision_model.set_hand_qpos(row.hand["qpos"][0])
-        result = self.solver.solve(proposed_pose, measured_qpos, baseline_qpos)
+        result = self.solver.solve(
+            proposed_pose,
+            measured_qpos,
+            baseline_qpos,
+            endpoint_rejection=self.target_checker.endpoint_rejection,
+        )
         if result.failure_kind == IKFailureKind.INVALID_OUTPUT:
             raise RuntimeError(f"online IK technical failure: {result.reason}")
         if not result.success:
-            self.blocked_until_release = True
-            return
-
-        rejection = self.target_checker.endpoint_rejection(result.qpos)
-        if rejection is not None:
             self.blocked_until_release = True
             return
 

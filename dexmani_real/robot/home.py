@@ -38,7 +38,9 @@ def home_path(current, target, planner, config):
             current, target, planner, use_canonical_target=True, **options
         )
     except ValueError:
-        pass
+        # Retry only when the equivalent representation gives different candidates.
+        if np.array_equal(planner.kin.canonicalize_qpos(target, current), target):
+            raise
     wrapped = compute_joint_home_path(current, target, planner, **options)
     start = wrapped[-1] if len(wrapped) else planner.kin.canonicalize_qpos(target, current)
     alignment = compute_band_alignment_path(start, target, planner, **options)

@@ -753,6 +753,7 @@ class CameraCalibrationSession:
             proposed_pose,
             self.current_qpos,
             baseline_qpos,
+            endpoint_rejection=self.target_checker.endpoint_rejection,
         )
         if ik_result.failure_kind == IKFailureKind.INVALID_OUTPUT:
             raise RuntimeError(f"online IK technical failure: {ik_result.reason}")
@@ -765,11 +766,6 @@ class CameraCalibrationSession:
             self.blocked_until_release = True
             return
 
-        rejection = self.target_checker.endpoint_rejection(ik_result.qpos)
-        if rejection is not None:
-            self.blocked_until_release = True
-            logger.warning("calibration target rejected: %s", rejection)
-            return
         q_cmd = ik_result.qpos
         next_qpos = q_cmd.copy()
 

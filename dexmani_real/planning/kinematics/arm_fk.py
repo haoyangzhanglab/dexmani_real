@@ -162,24 +162,6 @@ class XArm7Kinematics:
             equivalent_mask=self.equivalent_joint_mask,
         )
 
-    def planning_limits(self, reference_qpos: np.ndarray) -> np.ndarray:
-        """Bound HOME's equivalent representations around the measured joint band."""
-        limits = self.joint_limits.copy()
-        mask = self.equivalent_joint_mask
-        limits[mask, 0] = np.maximum(limits[mask, 0], reference_qpos[mask] - 3.0 * np.pi)
-        limits[mask, 1] = np.minimum(limits[mask, 1], reference_qpos[mask] + 3.0 * np.pi)
-        return limits
-
-    def canonicalize_path(self, path: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
-        """Choose continuous equivalent angles within model limits, then HOME limits."""
-        path = path.copy()
-        for limits in (self.joint_limits, self.planning_limits(reference_qpos)):
-            previous = reference_qpos
-            for index, qpos in enumerate(path):
-                path[index] = self.canonicalize_qpos(qpos, previous, limits)
-                previous = path[index]
-        return path
-
     def compute_qpos_delta(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
         """Signed deltas of admitted joint vectors; equivalent axes wrap to [-π, π)."""
         delta = qpos - reference_qpos
