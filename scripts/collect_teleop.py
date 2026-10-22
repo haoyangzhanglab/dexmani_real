@@ -4,14 +4,11 @@
 from __future__ import annotations
 
 import argparse
-import logging
 from dataclasses import asdict
 
 import yaml
 
 from dexmani_real.config.experiment import DEFAULT_TASK_NAME, load_experiment_config
-
-logger = logging.getLogger("dexmani_real.cli.collect_teleop")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -59,22 +56,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    try:
-        runtime = load_experiment_config(
-            yaml_path=args.config,
-            cli_overrides={
-                "teleop.control_hz": args.control_hz,
-                "control.hand_enabled": False if args.no_hand else None,
-                "control.recording_enabled": False if args.no_record else None,
-            },
-        )
-    except (
-        OSError,
-        TypeError,
-        ValueError,
-        yaml.YAMLError,
-    ) as exc:
-        parser.error(f"invalid experiment config: {exc}")
+    runtime = load_experiment_config(
+        yaml_path=args.config,
+        cli_overrides={
+            "teleop.control_hz": args.control_hz,
+            "control.hand_enabled": False if args.no_hand else None,
+            "control.recording_enabled": False if args.no_record else None,
+        },
+    )
     if args.print_config:
         print(
             yaml.safe_dump(asdict(runtime), allow_unicode=True, sort_keys=True),
@@ -84,20 +73,16 @@ def main(argv: list[str] | None = None) -> int:
     if not runtime.control.hand_enabled and not args.no_hand:
         parser.error("control.hand_enabled=false requires explicit --no-hand confirmation")
 
-    try:
-        from dexmani_real.calibration import VR_TRANSFORM_PATH
-        from dexmani_real.teleop.session import TeleopSession
+    from dexmani_real.calibration import VR_TRANSFORM_PATH
+    from dexmani_real.teleop.session import TeleopSession
 
-        return TeleopSession(
-            runtime,
-            task_name=args.task_name,
-            allow_no_hand=args.no_hand,
-            vr_transform_path=args.vr_transform or VR_TRANSFORM_PATH,
-            camera_calibration_path=args.camera_calibration,
-        ).run()
-    except Exception:
-        logger.error("teleoperation failed", exc_info=True)
-        return 1
+    return TeleopSession(
+        runtime,
+        task_name=args.task_name,
+        allow_no_hand=args.no_hand,
+        vr_transform_path=args.vr_transform or VR_TRANSFORM_PATH,
+        camera_calibration_path=args.camera_calibration,
+    ).run()
 
 
 if __name__ == "__main__":

@@ -8,7 +8,6 @@ import h5py
 import numpy as np
 
 from dexmani_real.data.raw.schema import (
-    ARM_EXECUTION_FORMAT,
     DATASET_SPECS,
     RAW_FORMAT,
     TIMING_ROW_DTYPE,
@@ -38,7 +37,6 @@ class RawEpisodeWriter:
             dispatch_status_source="recorded",
             arm_control_mode=1,
             arm_action_semantics="q_goal_submitted",
-            arm_execution_format=ARM_EXECUTION_FORMAT,
         )
         self.datasets = {
             name: self.data.create_dataset(

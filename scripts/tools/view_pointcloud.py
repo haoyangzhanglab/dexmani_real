@@ -147,7 +147,6 @@ def print_depth_stats(depth_m: np.ndarray, vmin: float, vmax: float) -> None:
 
 
 SNAPSHOT_SCHEMA_NAME = "dexmani-real-pointcloud-diagnostic-snapshot"
-SNAPSHOT_SCHEMA_VERSION = 3
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -207,7 +206,6 @@ def save_diagnostic_snapshot(
     }
     metadata = {
         "schema_name": SNAPSHOT_SCHEMA_NAME,
-        "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "created_at": timestamp.isoformat(),
         "payload_mode": "depth_to_color_aligned_rgbd",
         "depth_payload_frame": "color",

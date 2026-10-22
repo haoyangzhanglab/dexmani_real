@@ -88,7 +88,8 @@ class RealSenseCamera:
             rs_config = self.create_rs_config()
             # Use a separate SDK context for L515 discovery isolation.
             self.pipeline = rs.pipeline()
-            self.frame_queue = rs.frame_queue(self.config.frame_queue_capacity)
+            # Favor fresh feedback over retaining old SDK frames.
+            self.frame_queue = rs.frame_queue(2)
             self.profile = self.pipeline.start(rs_config, self.frame_queue)
             sensor = self.profile.get_device().first_depth_sensor()
             if self.is_l515_device(device):

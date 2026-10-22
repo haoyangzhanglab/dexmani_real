@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import tempfile
-import uuid
 from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
@@ -26,6 +25,7 @@ from dexmani_real.data.canonical.schema import (
 from dexmani_real.data.raw.reader import EpisodeReader, RawDataError, text_attr
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
+from dexmani_real.sensor.pointcloud.config import SAMPLING_METHOD
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 from dexmani_real.utils.timing import sampling_clock_ns
 
@@ -39,12 +39,9 @@ STORAGE_CHUNK_MAX_ROWS = 128
 class CanonicalExporter:
     """Export Raw episodes with one processing and storage configuration."""
 
-    def __init__(
-        self, processing: ProcessingConfig, *, chunk_frames: int = 100, compression_level: int = 3
-    ):
+    def __init__(self, processing: ProcessingConfig, *, chunk_frames: int = 100):
         self.processing = processing
         self.chunk_frames = chunk_frames
-        self.compression_level = compression_level
 
     def export(
         self,
@@ -57,8 +54,6 @@ class CanonicalExporter:
         """Export all 15 fields; reject bad Raw and retain staging on conversion or write failures."""
         if type(self.chunk_frames) is not int or self.chunk_frames <= 0:
             raise ValueError("chunk_frames must be a positive integer")
-        if type(self.compression_level) is not int or not 0 <= self.compression_level <= 9:
-            raise ValueError("compression_level must be an integer in [0, 9]")
         source = Path(input_root).expanduser().resolve()
         output = Path(output_path).expanduser()
         target = output.resolve()
@@ -80,9 +75,7 @@ class CanonicalExporter:
         staging = root = data = None
         first_attrs = first_specs = None
         ends, offset = [], 0
-        revision = uuid.uuid4().hex
         episode_ids = []
-        episode_arm_execution = []
         hand_fk = None
         try:
             for index, episode in enumerate(selected):
@@ -117,7 +110,6 @@ class CanonicalExporter:
                     period_ns, tolerance_ns = sampling_clock_ns(reader.control_hz)
                     attrs = dict(
                         format=CANONICAL_FORMAT,
-                        data_revision=revision,
                         task_name=task,
                         dt=reader.dt,
                         timing_admission=dict(
@@ -127,7 +119,9 @@ class CanonicalExporter:
                         ),
                         action_semantics="absolute_joint_goal_not_next_step_arrival",
                         depth_scale_m_per_unit=camera.depth_scale_m,
-                        pointcloud_config=asdict(self.processing.pointcloud),
+                        pointcloud_config=dict(
+                            asdict(self.processing.pointcloud), sampling_method=SAMPLING_METHOD
+                        ),
                         fingertip_link_names=list(self.processing.fingertip_link_names),
                     )
                     # Reject mixed cache semantics before consuming the episode payload.
@@ -192,14 +186,12 @@ class CanonicalExporter:
                         if episode == source
                         else episode.relative_to(source).as_posix()
                     )
-                    episode_arm_execution.append(text_attr(reader.meta, "arm_execution_format"))
             if not ends:
                 raise ValueError("all selected episodes were rejected; no Zarr written")
             root.create_group("meta").create_dataset(
                 "episode_ends", data=np.asarray(ends, dtype=np.int64)
             )
             root.attrs["episode_ids"] = episode_ids
-            root.attrs["episode_arm_execution"] = episode_arm_execution
             atomic_publish(staging, target)
             staging = None
             if progress_callback:
@@ -210,9 +202,6 @@ class CanonicalExporter:
                 rejected_episodes=rejected,
                 excluded_episodes=sorted(excluded),
             )
-        except Exception:
-            logger.exception("%s: canonical export failed", episode.name)
-            raise
         finally:
             if staging is not None:
                 logger.warning("Export staging retained for inspection: %s", staging)
@@ -221,7 +210,7 @@ class CanonicalExporter:
         root = zarr.open_group(str(staging), mode="w")
         root.attrs.update(attrs)
         data = root.create_group("data")
-        compressor = zarr.get_codec({"id": "zstd", "level": self.compression_level})
+        compressor = zarr.get_codec({"id": "zstd", "level": 3})
         for key, (tail, dtype) in specs.items():
             row_bytes = int(np.prod(tail)) * dtype.itemsize
             # A full frame is the minimum decode unit, even when larger than the target.

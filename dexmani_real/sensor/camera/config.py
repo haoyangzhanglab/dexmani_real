@@ -19,9 +19,6 @@ class CameraParams:
     source_stall_timeout_s: float = 2.0
     l515_visual_preset: int = 5
     l515_confidence_threshold: int | None = None
-    # Keep the SDK queue small to favor fresh feedback over frame retention.
-    frame_queue_capacity: int = 2
-    ring_maxlen: int = 5
 
     @property
     def max_frame_age_s(self) -> float:
@@ -36,7 +33,7 @@ class CameraParams:
         return (self.height, self.width)
 
     def validate(self) -> None:
-        for name in ("width", "height", "fps", "frame_queue_capacity", "ring_maxlen"):
+        for name in ("width", "height", "fps"):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"camera {name} must be a positive integer")

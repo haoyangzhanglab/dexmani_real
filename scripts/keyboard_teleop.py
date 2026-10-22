@@ -6,8 +6,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import yaml
-
 from dexmani_real.config.experiment import load_experiment_config
 
 
@@ -26,21 +24,13 @@ def main(argv: list[str] | None = None) -> int:
 
     from dexmani_real.teleop.keyboard_session import KeyboardTeleopSession
 
-    try:
-        runtime = load_experiment_config(
-            yaml_path=args.config,
-            cli_overrides={
-                "control.hand_enabled": False if args.no_hand else None,
-                "keyboard_teleop.control_hz": args.control_hz,
-            },
-        )
-    except (
-        OSError,
-        TypeError,
-        ValueError,
-        yaml.YAMLError,
-    ) as exc:
-        parser.error(f"invalid experiment config: {exc}")
+    runtime = load_experiment_config(
+        yaml_path=args.config,
+        cli_overrides={
+            "control.hand_enabled": False if args.no_hand else None,
+            "keyboard_teleop.control_hz": args.control_hz,
+        },
+    )
     return KeyboardTeleopSession(runtime, no_hand=args.no_hand).run()
 
 

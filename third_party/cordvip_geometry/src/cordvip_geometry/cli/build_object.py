@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 
-from ..io import existing_file, output_path, sha256, write_json, write_confirmed_selection
+from ..io import existing_file, output_path, write_confirmed_selection, write_json
 from .arguments import positive_float, positive_int
 
 
@@ -30,7 +30,7 @@ def load_rgb(args):
     from PIL import Image, ImageOps
 
     path = existing_file(args.image if args.image is not None else args.rgbd)
-    info = {"source_file": str(path), "source_sha256": sha256(path)}
+    info = {"source_file": str(path)}
     if args.image is not None:
         with Image.open(path) as image:
             rgb = np.asarray(ImageOps.exif_transpose(image).convert("RGB")).copy()
@@ -126,14 +126,10 @@ def choose(rgb, candidates, instance, *, headless):
 
 
 def save_selection(output, rgb, candidates, index, provenance):
-    import numpy as np
-    from PIL import Image
-
     candidate = candidates[index]
     mask = candidate["mask"]
     if not mask.any() or mask.all():
         raise ValueError("生成输入必须包含非空物体和非空背景；请重新分割或拍摄")
-    np.save(output / "mask.npy", mask, allow_pickle=False)
     overlay(rgb, candidate, index).save(output / "overlay.png")
     write_confirmed_selection(
         output,
@@ -142,7 +138,7 @@ def save_selection(output, rgb, candidates, index, provenance):
             **provenance,
             "selected_instance": index,
             "selection": (
-                "explicit_headless_instance" if provenance.get("headless") else "gui_confirmed"
+                "explicit_headless_instance" if provenance["headless"] else "gui_confirmed"
             ),
             "label": candidate["label"],
             "box_xyxy": candidate["box_xyxy"].tolist(),
@@ -150,7 +146,6 @@ def save_selection(output, rgb, candidates, index, provenance):
             "score_kind": "grounding_dino",
             "mask_score": candidate["mask_score"],
             "mask_score_kind": "sam2_predicted_iou",
-            "rgb_sha256": sha256(output / "rgb.png"),
         },
         mask_file="mask.png",
         foreground_rgb=rgb,
@@ -293,11 +288,7 @@ class ObjectModelBuilder:
             write_json(output / "segmentation_result.json", {**provenance, "num_candidates": 0})
             raise RuntimeError(f"没有检测到目标；原图和请求已保留在 {output}，可调整文本或阈值")
         save_candidates(output, rgb, candidates)
-        provenance.update(
-            num_candidates=len(candidates),
-            rgb_sha256=sha256(output / "rgb.png"),
-            candidates_sha256=sha256(output / "candidates.npz"),
-        )
+        provenance.update(num_candidates=len(candidates))
         write_json(output / "segmentation_result.json", provenance)
         if self.args.list_only:
             print(f"候选已保存：{output / 'candidates.jpg'}；使用 select 确认，无需重跑模型。")
@@ -310,11 +301,10 @@ class ObjectModelBuilder:
         from PIL import Image
 
         source = self.args.segmentation_dir.expanduser().resolve()
-        output = output_path(self.args.output_dir, workspace=self.args.workspace)
+        output = output_path(
+            self.args.output_dir, workspace=self.args.workspace, protected=(source,)
+        )
         provenance = json.loads(existing_file(source / "segmentation_result.json").read_text())
-        for name, key in (("rgb.png", "rgb_sha256"), ("candidates.npz", "candidates_sha256")):
-            if sha256(existing_file(source / name)) != provenance[key]:
-                raise ValueError(f"{name} 与分割记录的 SHA256 不一致，请重新分割")
         with Image.open(existing_file(source / "rgb.png")) as image:
             rgb = np.asarray(image.convert("RGB")).copy()
         with np.load(existing_file(source / "candidates.npz"), allow_pickle=False) as saved:
@@ -354,18 +344,19 @@ class ObjectModelBuilder:
             display_available()
         source = self.args.segmentation_dir.expanduser().resolve()
         metadata = json.loads(existing_file(source / "selection.json").read_text())
+        if metadata["selection"] not in {"explicit_headless_instance", "gui_confirmed"}:
+            raise ValueError("建模需要已明确确认的分割")
         image = existing_file(source / "foreground_rgba.png")
-        if sha256(image) != metadata["foreground_sha256"]:
-            raise ValueError("RGBA 与分割记录 SHA256 不一致，请重新确认分割")
-        output = output_path(self.args.output_dir, workspace=self.args.workspace)
+        output = output_path(
+            self.args.output_dir, workspace=self.args.workspace, protected=(source,)
+        )
         output.mkdir(parents=True)
         write_json(
             output / "generation_request.json",
             {
                 "method": "Hunyuan3D-2.1 shape_only",
                 "segmentation_directory": str(source),
-                "selection_sha256": sha256(source / "selection.json"),
-                "foreground_sha256": metadata["foreground_sha256"],
+                "selected_instance": metadata["selected_instance"],
                 "source_root": str(self.args.hunyuan_root.expanduser().resolve()),
                 "weights_dir": str(self.args.weights.expanduser().resolve()),
                 "seed": self.args.seed,
@@ -405,13 +396,10 @@ class ObjectModelBuilder:
             {
                 **result,
                 "mesh_file": mesh_path.name,
-                "mesh_sha256": sha256(mesh_path),
                 "units": "unscaled",
                 "frame": "object",
                 "points_file": points_path.name,
                 "normals_file": normals_path.name,
-                "points_sha256": sha256(points_path),
-                "normals_sha256": sha256(normals_path),
                 "num_points": self.args.num_points,
                 "seed": self.args.seed,
                 "sampling": "area_weighted_triangle_barycentric",
@@ -437,7 +425,7 @@ class ObjectModelBuilder:
             raise ValueError("headless 必须显式提供 --instance N")
         output = output_path(self.args.output_dir, workspace=self.args.workspace)
         output.mkdir(parents=True)
-        # Fresh model processes need the source checkout even when only parent sys.path was edited.
+        # Fresh model processes need the source directory even when only parent sys.path was edited.
         environment = os.environ.copy()
         source = str(Path(__file__).resolve().parents[2])
         current = environment.get("PYTHONPATH")
@@ -575,7 +563,7 @@ def build_parser(*, workspace=None):
     )
     for command in (segment, select, generate, build):
         command.add_argument(
-            "--output-dir", type=Path, required=True, help="reports/ 下尚不存在的目录，拒绝覆盖"
+            "--output-dir", type=Path, required=True, help="尚不存在的新输出目录，拒绝覆盖"
         )
     for command in (generate, build):
         command.add_argument("--device", default="cuda:0", help="Hunyuan 生成阶段使用的 CUDA 设备")
@@ -584,23 +572,12 @@ def build_parser(*, workspace=None):
 
 def main(argv=None, *, workspace=None):
     args = build_parser(workspace=workspace).parse_args(argv)
-    try:
-        if hasattr(args, "seed") and args.seed < 0:
-            raise ValueError("--seed 必须非负")
-        for name in ("box_threshold", "text_threshold"):
-            if hasattr(args, name) and not 0 < getattr(args, name) < 1:
-                raise ValueError(f"{name} 必须在 (0, 1) 内")
-        ObjectModelBuilder(args).run()
-    except (
-        OSError,
-        ValueError,
-        ImportError,
-        RuntimeError,
-        KeyError,
-        subprocess.CalledProcessError,
-    ) as error:
-        print(f"错误：{error}", file=sys.stderr)
-        return 1
+    if hasattr(args, "seed") and args.seed < 0:
+        raise ValueError("--seed 必须非负")
+    for name in ("box_threshold", "text_threshold"):
+        if hasattr(args, name) and not 0 < getattr(args, name) < 1:
+            raise ValueError(f"{name} 必须在 (0, 1) 内")
+    ObjectModelBuilder(args).run()
     return 0
 
 

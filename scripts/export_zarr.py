@@ -5,11 +5,9 @@ from __future__ import annotations
 
 import argparse
 import sys
-import traceback
 from collections.abc import Sequence
 from pathlib import Path
 
-import yaml
 from tqdm import tqdm
 
 from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
@@ -68,14 +66,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--chunk-frames", type=int, default=100,
         help="Maximum processing batch rows; storage chunks are sized independently per field",
     )
-    parser.add_argument("--compression-level", type=int, default=3)
     return parser
 
 
 def default_output_path(input_root: Path) -> Path:
     task_name = (
         input_root.parent.name
-        if (input_root / "data.h5").exists() or input_root.name.startswith("episode_")
+        if (input_root / "data.h5").is_file()
         else input_root.name
     )
     if not task_name:
@@ -98,48 +95,29 @@ def load_processing_config(path: Path | None, *, num_points: int | None) -> Proc
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    try:
-        args.input_root = args.input_root.expanduser().resolve()
-        output_path = (
-            args.output if args.output is not None else default_output_path(args.input_root)
+    args.input_root = args.input_root.expanduser().resolve()
+    output_path = (
+        args.output if args.output is not None else default_output_path(args.input_root)
+    )
+    processing = load_processing_config(args.config, num_points=args.pointcloud_num_points)
+    from dexmani_real.utils.log import configure_logging
+
+    configure_logging()
+    with tqdm(desc="Raw to canonical Zarr", unit="episode", file=sys.stderr) as progress:
+
+        def update_progress(completed, total):
+            progress.total = total
+            progress.update(completed - progress.n)
+
+        result = CanonicalExporter(
+            processing=processing,
+            chunk_frames=args.chunk_frames,
+        ).export(
+            args.input_root,
+            output_path,
+            exclude=tuple(args.exclude),
+            progress_callback=update_progress,
         )
-    except (TypeError, ValueError) as exc:
-        parser.error(str(exc))
-    try:
-        processing = load_processing_config(args.config, num_points=args.pointcloud_num_points)
-        from dexmani_real.utils.log import configure_logging
-
-        configure_logging()
-        with tqdm(desc="Raw to canonical Zarr", unit="episode", file=sys.stderr) as progress:
-
-            def update_progress(completed, total):
-                progress.total = total
-                progress.update(completed - progress.n)
-
-            result = CanonicalExporter(
-                processing=processing,
-                chunk_frames=args.chunk_frames,
-                compression_level=args.compression_level,
-            ).export(
-                args.input_root,
-                output_path,
-                exclude=tuple(args.exclude),
-                progress_callback=update_progress,
-            )
-    except (FileExistsError, FileNotFoundError, NotADirectoryError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except (
-        KeyError,
-        OSError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-        yaml.YAMLError,
-    ) as exc:
-        traceback.print_exc()
-        print(f"Export failed: {exc}", file=sys.stderr)
-        return 1
     print(
         f"Exported {result['episode_count']} episode(s), {result['total_frames']} frames.",
         file=sys.stderr,

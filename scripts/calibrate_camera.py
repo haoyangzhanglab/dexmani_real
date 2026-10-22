@@ -4,10 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
-
-import yaml
 
 from dexmani_real.config.experiment import load_experiment_config
 
@@ -57,19 +54,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  hand physical-state assertion: {args.hand_geometry}")
     print("=" * 60)
 
-    try:
-        runtime = load_experiment_config(
-            yaml_path=args.config,
-            cli_overrides={"camera.serial": args.serial, "control.hand_enabled": False},
-        )
-    except (
-        OSError,
-        TypeError,
-        ValueError,
-        yaml.YAMLError,
-    ) as exc:
-        print(f"Invalid calibration config: {exc}", file=sys.stderr)
-        return 2
+    runtime = load_experiment_config(
+        yaml_path=args.config,
+        cli_overrides={"camera.serial": args.serial, "control.hand_enabled": False},
+    )
 
     return CameraCalibrationSession(
         runtime,

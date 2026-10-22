@@ -6,6 +6,8 @@ from dataclasses import dataclass, fields
 
 import numpy as np
 
+SAMPLING_METHOD = "quickfps"
+
 
 @dataclass(frozen=True)
 class PointCloudConfig:
@@ -39,12 +41,8 @@ class PointCloudConfig:
     outlier_min_component_points: int = 10
     # Bounds final sampling work after density/component filtering.
     outlier_candidate_multiplier: int = 8
-    # Identify the numerical representation stored with training data.
-    sampling_method: str = "quickfps"
 
     def validate(self) -> None:
-        if self.sampling_method != "quickfps":
-            raise ValueError("point-cloud sampling_method must be 'quickfps'")
         if type(self.remove_table) is not bool:
             raise TypeError("remove_table must be bool")
         for name, minimum in (
@@ -91,16 +89,13 @@ class PointCloudConfig:
 
 
 def resolve_saved_pointcloud_recipe(recipe):
-    """Only inactive table-removal values may use defaults in an artifact recipe."""
+    """Restore the complete saved recipe without filling fields from current defaults."""
     if not isinstance(recipe, dict):
         raise ValueError("saved pointcloud recipe must be a mapping")
+    recipe = dict(recipe)
+    if recipe.pop("sampling_method", None) != SAMPLING_METHOD:
+        raise ValueError(f"saved point-cloud sampling_method must be {SAMPLING_METHOD!r}")
     required = {field.name for field in fields(PointCloudConfig)}
-    if recipe.get("remove_table") is False:
-        required -= {
-            "table_core_height_m",
-            "table_object_seed_height_m",
-            "table_object_seed_min_pixels",
-        }
     missing = required - recipe.keys()
     if missing:
         raise ValueError(f"Saved pointcloud recipe missing fields: {sorted(missing)}")

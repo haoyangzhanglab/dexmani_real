@@ -14,10 +14,10 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 Usage: conda activate real_robot
        bash third_party/cordvip_geometry/scripts/install_perception.sh [--workspace PATH]
 
-Validate the existing Python 3.10 / Torch 2.4.1+cu124 base environment, fetch
-pinned official source checkouts, install incremental requirements, and build
+Preserve the existing base environment, fetch missing official source checkouts
+at recorded revisions, install incremental requirements, and build
 nvdiffrast and FoundationPose mycpp. No model downloads or device access.
-Existing checkouts must match their pinned revisions and have no tracked edits.
+Existing source directories and local edits are reused without checkout or reset.
 The workspace defaults to the current directory; --workspace must be the first option.
 Logs and environment snapshots are saved under its reports/cordvip_install/.
 USAGE
@@ -34,22 +34,12 @@ if [[ -z "${CONDA_PREFIX:-}" ]]; then
     exit 1
 fi
 python - <<'PY'
-import importlib.metadata
 import os
 from pathlib import Path
 import sys
 
 if Path(sys.prefix).resolve() != Path(os.environ['CONDA_PREFIX']).resolve():
     raise SystemExit('python does not belong to the active conda environment')
-if sys.version_info[:2] != (3, 10):
-    raise SystemExit('This recipe is validated for Python 3.10')
-expected = {'torch': '2.4.1+cu124', 'torchvision': '0.19.1+cu124',
-            'numpy': '1.26.4', 'transformers': '4.48.0'}
-for package, version in expected.items():
-    actual = importlib.metadata.version(package)
-    if actual != version:
-        raise SystemExit(f'{package}: expected {version}, found {actual}; base packages were not changed')
-print('Base environment versions match; base packages will be constrained during installation.')
 PY
 
 for cordvip_command in git cmake c++; do
@@ -59,7 +49,7 @@ for cordvip_command in git cmake c++; do
     fi
 done
 if [[ ! -x "$CONDA_PREFIX/bin/nvcc" || ! -d "$CONDA_PREFIX/targets/x86_64-linux/include" ]]; then
-    printf 'The conda prefix must contain the CUDA 12.4 compiler and target headers.\n' >&2
+    printf 'The conda prefix must contain the CUDA compiler and target headers.\n' >&2
     exit 1
 fi
 
@@ -68,12 +58,11 @@ cordvip_log_dir="$(mktemp -d "$cordvip_root/reports/cordvip_install/install_XXXX
 exec > >(tee -a "$cordvip_log_dir/install.log") 2>&1
 printf 'Installation log: %s\n' "$cordvip_log_dir"
 python -m pip list --format=json > "$cordvip_log_dir/packages_before.json"
-cat > "$cordvip_log_dir/base_constraints.txt" <<'CONSTRAINTS'
-torch==2.4.1+cu124
-torchvision==0.19.1+cu124
-numpy==1.26.4
-transformers==4.48.0
-CONSTRAINTS
+python - <<'PY' > "$cordvip_log_dir/base_constraints.txt"
+from importlib.metadata import version
+for package in ('torch', 'torchvision', 'numpy', 'transformers'):
+    print(f'{package}=={version(package)}')
+PY
 
 checkout_source() {
     local cordvip_name="$1" cordvip_url="$2" cordvip_revision="$3"
@@ -87,19 +76,15 @@ checkout_source() {
             git -C "$cordvip_path" fetch --depth 1 origin "$cordvip_revision"
         fi
         git -C "$cordvip_path" checkout --detach "$cordvip_revision"
+    elif [[ ! -d "$cordvip_path" ]]; then
+        printf 'Source path is not a directory: %s\n' "$cordvip_path" >&2
+        return 1
+    fi
+    if [[ -e "$cordvip_path/.git" ]]; then
+        cordvip_revision="$(git -C "$cordvip_path" rev-parse HEAD)"
+        git -C "$cordvip_path" status --short > "$cordvip_log_dir/${cordvip_name}_status.txt"
     else
-        if [[ ! -d "$cordvip_path" ]] || [[ "$(git -C "$cordvip_path" rev-parse --show-toplevel 2>/dev/null || true)" != "$(cd -- "$cordvip_path" && pwd -P)" ]]; then
-            printf 'Refusing to modify an existing non-checkout: %s\n' "$cordvip_path" >&2
-            return 1
-        fi
-        if [[ "$(git -C "$cordvip_path" rev-parse HEAD)" != "$cordvip_revision" ]]; then
-            printf '%s is at a different revision; inspect it manually. Nothing was checked out or reset.\n' "$cordvip_path" >&2
-            return 1
-        fi
-        if ! git -C "$cordvip_path" diff --quiet || ! git -C "$cordvip_path" diff --cached --quiet; then
-            printf '%s contains tracked changes; preserve and inspect them before installation.\n' "$cordvip_path" >&2
-            return 1
-        fi
+        cordvip_revision="local_directory"
     fi
     printf '%s %s\n' "$cordvip_name" "$cordvip_revision" >> "$cordvip_log_dir/source_revisions.txt"
 }

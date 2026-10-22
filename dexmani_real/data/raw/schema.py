@@ -7,7 +7,6 @@ import numpy as np
 from dexmani_real.robot.commands import DispatchStatus
 
 RAW_FORMAT = "dexmani.raw"
-ARM_EXECUTION_FORMAT = "mode1_episode_summary_v1"
 
 
 @dataclass(frozen=True)

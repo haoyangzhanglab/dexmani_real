@@ -8,7 +8,7 @@ from enum import Enum
 
 import numpy as np
 
-from dexmani_real.data.raw.schema import ARM_EXECUTION_FORMAT, validate_execution_boundary
+from dexmani_real.data.raw.schema import validate_execution_boundary
 from dexmani_real.planning.collision import CollisionModel
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.planning.target import TargetChecker
@@ -341,7 +341,6 @@ class TrajectoryReplayer:
             data["arm_execution"] = np.asarray(
                 json.dumps(
                     dict(
-                        format=ARM_EXECUTION_FORMAT,
                         scope="replay_including_hand_start",
                         start=arm_start,
                         end=arm_end,

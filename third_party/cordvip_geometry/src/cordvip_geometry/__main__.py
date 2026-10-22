@@ -12,7 +12,7 @@ COMMANDS = {
     "track": ("scene_tracking", "实时位姿与点云；默认连接相机"),
     "replay": ("object_tracking_demo", "只读 Raw 或 RGB-D 离线回放"),
     "check": ("check_tracking", "静态检查追踪依赖，不连接设备"),
-    "download": ("download_models", "下载或校验固定版本的模型权重"),
+    "download": ("download_models", "从明确的官方 revision 下载模型权重"),
 }
 
 

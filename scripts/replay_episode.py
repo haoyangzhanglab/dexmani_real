@@ -4,14 +4,9 @@
 from __future__ import annotations
 
 import argparse
-import logging
 from pathlib import Path
 
-import yaml
-
 from dexmani_real.config.experiment import load_experiment_config
-
-logger = logging.getLogger("dexmani_real.cli.replay_episode")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -69,17 +64,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     from dexmani_real.replay.trajectory import load_trajectory
 
-    try:
-        trajectory = load_trajectory(args.episode)
-    except (OSError, ValueError) as exc:
-        print(f"Error loading episode: {exc}")
-        return 1
+    trajectory = load_trajectory(args.episode)
 
-    try:
-        runtime = load_experiment_config(yaml_path=args.config)
-    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
-        print(f"Error resolving replay config: {exc}")
-        return 1
+    runtime = load_experiment_config(yaml_path=args.config)
 
     print(f"Trajectory: {trajectory.episode_path}")
     print(
@@ -97,17 +84,12 @@ def main(argv: list[str] | None = None) -> int:
         output_dir = args.output
     print(f"Output: {output_dir}")
 
-    try:
-        outcome = ReplaySession(
-            trajectory,
-            runtime,
-            output_dir=output_dir,
-            hand_start_duration_s=args.hand_start_duration,
-        ).run()
-    except Exception as exc:
-        logger.error("physical replay failed", exc_info=True)
-        print(f"\nPhysical replay failed: {exc}")
-        return 1
+    outcome = ReplaySession(
+        trajectory,
+        runtime,
+        output_dir=output_dir,
+        hand_start_duration_s=args.hand_start_duration,
+    ).run()
 
     if not outcome.successful:
         print(f"Replay stopped: {outcome.status.value}: {outcome.reason}")

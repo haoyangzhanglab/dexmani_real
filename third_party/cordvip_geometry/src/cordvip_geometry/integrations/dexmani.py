@@ -145,7 +145,6 @@ class RawHandCloudProvider:
             XHAND_SDK_JOINT_NAMES,
         )
         from ..hand_cloud import HandCloudModel
-        from ..io import sha256
 
         self.episode = Path(episode).expanduser().resolve()
         config_path = Path(config_path).expanduser().resolve() if config_path is not None else None
@@ -182,25 +181,16 @@ class RawHandCloudProvider:
             num_points=num_points,
             seed=seed,
         )
-        # Hash consumed joints/times without rereading unrelated RGB-D payloads at startup.
-        import hashlib
-
-        state_hash = hashlib.sha256()
-        for values in (self._arm, self._hand, self._observation_s, self._timing):
-            state_hash.update(values.tobytes())
         self.metadata = {
             **self.hand_model.metadata,
             "episode": str(self.episode),
             "joint_source": str(self.episode / "data.h5"),
-            "joint_and_timing_sha256": state_hash.hexdigest(),
             "arm_urdf": str(XARM7_XHAND_COLLISION_URDF_PATH),
-            "arm_urdf_sha256": sha256(XARM7_XHAND_COLLISION_URDF_PATH),
             "joint_state_names": [*XARM7_JOINT_NAMES, *XHAND_SDK_JOINT_NAMES],
             "joint_state_semantics": "measured_arm_qpos_then_measured_hand_qpos_no_interpolation",
             "mount_source": (
                 str(config_path) if config_path else "current_ExperimentConfig_defaults"
             ),
-            "mount_config_sha256": sha256(config_path) if config_path else None,
             "T_eef_handbase": self._T_eef_handbase.tolist(),
             "T_base_camera": self.T_base_camera.tolist(),
             "camera_extrinsics_source": "Raw meta.camera_T_xarm_base_from_color",

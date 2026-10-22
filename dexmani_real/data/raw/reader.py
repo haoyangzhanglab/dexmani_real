@@ -13,7 +13,6 @@ import numpy as np
 from dexmani_real.data.raw.schema import (
     DATASET_SPECS,
     RAW_FORMAT,
-    ARM_EXECUTION_FORMAT,
     TIMING_ROW_DTYPE,
     validate_arm_execution,
 )
@@ -98,11 +97,6 @@ class EpisodeReader:
             attrs = self.meta
             if text_attr(attrs, "format") != RAW_FORMAT:
                 raise RawDataError(f"unsupported Raw format (expected {RAW_FORMAT!r})")
-            if text_attr(attrs, "arm_execution_format") != ARM_EXECUTION_FORMAT:
-                raise RawDataError(
-                    f"unsupported arm execution format (expected {ARM_EXECUTION_FORMAT!r}); "
-                    "use the historical code version for old Raw; do not rewrite it"
-                )
             if (
                 attrs.get("arm_control_mode") != 1
                 or text_attr(attrs, "arm_action_semantics") != "q_goal_submitted"

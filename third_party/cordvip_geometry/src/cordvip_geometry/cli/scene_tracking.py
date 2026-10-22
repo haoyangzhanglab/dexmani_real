@@ -64,7 +64,7 @@ def parse_args(argv=None, *, workspace=None):
     )
     parser.add_argument("--experiment-config", type=Path, help="手安装变换使用的当前实验配置 YAML")
     parser.add_argument("--hand-points", type=int, default=1024, help="固定手表面采样点数")
-    parser.add_argument("--output", type=Path, help="reports/ 下的新输出目录")
+    parser.add_argument("--output", type=Path, help="尚不存在的新输出目录")
     parser.add_argument(
         "--save-inputs", action="store_true", help="保存所有送入推理的源 RGB-D；注册帧总是保存"
     )
@@ -174,7 +174,7 @@ def load_scene(path, workspace, *, offline, headless):
 
 def choose_masks(objects, frame, args, viewer, output, worker):
     import numpy as np
-    from ..io import sha256, load_initial_selection
+    from ..io import load_initial_selection, write_confirmed_selection, write_json
     from ..rgbd import rectify_frame, save_frame
 
     masks, details, replay_objects = {}, {}, []
@@ -261,8 +261,6 @@ def choose_masks(objects, frame, args, viewer, output, worker):
                         selected = output / "initial_selections" / name
                         selected.mkdir(parents=True)
                         save_frame(selected / "source_rgbd.npz", frame)
-                        from ..io import write_confirmed_selection
-
                         write_confirmed_selection(
                             selected,
                             mask,
@@ -289,31 +287,24 @@ def choose_masks(objects, frame, args, viewer, output, worker):
         for name, mask in masks.items():
             path = output / f"initial_{name}_rectified.npy"
             np.save(path, mask, allow_pickle=False)
-            details[name]["rectified_mask_sha256"] = sha256(path)
-        (output / "initialization.json").write_text(
-            json.dumps(
-                dict(
-                    source_id=frame.source_id,
-                    timestamp_ns=frame.timestamp_ns,
-                    clock=frame.clock,
-                    row_index=frame.row_index,
-                    objects=details,
-                ),
-                indent=2,
-                ensure_ascii=False,
-            )
+        write_json(
+            output / "initialization.json",
+            dict(
+                source_id=frame.source_id,
+                timestamp_ns=frame.timestamp_ns,
+                clock=frame.clock,
+                row_index=frame.row_index,
+                objects=details,
+            ),
         )
-        (output / "replay_scene.json").write_text(
-            json.dumps(
-                {
-                    "objects": [
-                        {k: str(v) if isinstance(v, Path) else v for k, v in item.items()}
-                        for item in replay_objects
-                    ]
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
+        write_json(
+            output / "replay_scene.json",
+            {
+                "objects": [
+                    {k: str(v) if isinstance(v, Path) else v for k, v in item.items()}
+                    for item in replay_objects
+                ]
+            },
         )
         return masks
     finally:
@@ -451,7 +442,7 @@ class SceneTrackingSession:
 
         import cv2
         import numpy as np
-        from ..io import load_asset, new_output, sha256, write_observation
+        from ..io import load_asset, new_output, write_json, write_observation
         from ..integrations.dexmani import (
             iter_raw_episode,
             iter_live_realsense,
@@ -496,34 +487,30 @@ class SceneTrackingSession:
             if self.args.with_hand
             else None
         )
-        (self.output / "run.json").write_text(
-            json.dumps(
-                dict(
-                    config=config,
-                    scene={
-                        n: {k: str(v) if isinstance(v, Path) else v for k, v in o.items()}
-                        for n, o in self.objects.items()
-                    },
-                    assets=self.asset_metadata,
-                    environment_check=report,
-                    scene_sha256=sha256(self.args.scene) if self.args.scene else None,
-                    coordinate_frame="color_camera",
-                    units="m",
-                    colors_rgb=self.colors,
-                    observed_semantics="current semantic mask + measured depth, independent of mesh; segmentation can be wrong",
-                    model_semantics="fixed generated surface + per-instance T_camera_object; geometry agreement is not confidence",
-                    processing=(
-                        "all frames, unpaced"
-                        if self.args.all_frames
-                        else "latest frame, bounded mailbox, no backlog"
-                    ),
-                    source_clock="preserved; offline timestamps do not prove sensor synchronization",
-                    hand=self.hand_provider.metadata if self.hand_provider else None,
-                    video="processed frames only, replay-fps playback, no reconstruction of original timing",
+        write_json(
+            self.output / "run.json",
+            dict(
+                config=config,
+                scene={
+                    n: {k: str(v) if isinstance(v, Path) else v for k, v in o.items()}
+                    for n, o in self.objects.items()
+                },
+                assets=self.asset_metadata,
+                environment_check=report,
+                coordinate_frame="color_camera",
+                units="m",
+                colors_rgb=self.colors,
+                observed_semantics="current semantic mask + measured depth, independent of mesh; segmentation can be wrong",
+                model_semantics="fixed generated surface + per-instance T_camera_object; geometry agreement is not confidence",
+                processing=(
+                    "all frames, unpaced"
+                    if self.args.all_frames
+                    else "latest frame, bounded mailbox, no backlog"
                 ),
-                indent=2,
-                ensure_ascii=False,
-            )
+                source_clock="preserved; offline timestamps do not prove sensor synchronization",
+                hand=self.hand_provider.metadata if self.hand_provider else None,
+                video="processed frames only, replay-fps playback, no reconstruction of original timing",
+            ),
         )
         if self.args.episode:
             source_factory = lambda: iter_raw_episode(self.args.episode)
@@ -897,9 +884,6 @@ def main(argv=None, *, workspace=None):
         return SceneTrackingSession(parse_args(argv, workspace=workspace)).run()
     except KeyboardInterrupt:
         return 130
-    except (OSError, ValueError, ImportError, RuntimeError, KeyError) as error:
-        print(f"追踪失败：{error}", file=sys.stderr)
-        return 1
 
 
 if __name__ == "__main__":

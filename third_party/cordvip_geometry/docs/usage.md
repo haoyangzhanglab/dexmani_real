@@ -2,30 +2,29 @@
 
 当前路径为 Grounding DINO 首帧定位与 SAM2.1 small 连续分割 → FoundationPose++ 2D 引导与位姿细化 → 独立的实测点、固定模型点与 FK 手点。FoundationPose++ 只采用 bbox 引导核心，不含 Kalman、Cutie、Qwen 或 SAM-HQ。分割与单图 3D 重建是不同任务；Hunyuan3D-2.1 的资产准备流程保留。
 
-命令从 workspace 根目录执行，输出须位于尚不存在的 `reports/` 子目录。Raw 始终只读。`--help` 和 `--check` 不连接设备。
+命令从 workspace 根目录执行，运行产物输出到新目录，默认使用 `reports/`，也可指定其他位置；不覆盖输入文件或写回 Raw，模型下载可复用已有缓存目录。Raw 始终只读。`--help` 和 `--check` 不连接设备。
 
 ## 安装与权重
 
-命令中的 `real_robot` 是示例环境名，不作准入条件。安装脚本约束已有基础版本（Python 3.10、Torch 2.4.1+cu124），不升级基础 Torch；新工作站先按 `scripts/install_perception.sh --help` 准备所需组件。FoundationPose 源码固定为 `a1b694b83e633c2cb6115b9063d940a687759392`，其官方权重需放入 `third_party/FoundationPose/weights/2023-10-28-18-33-37` 与 `2024-01-11-20-02-45`，每个目录包含 `config.yml` 和 `model_best.pth`。下载入口见 [FoundationPose 官方说明](https://github.com/NVlabs/FoundationPose)。
+命令中的 `real_robot` 是示例环境名，不作准入条件。安装脚本根据当前已安装版本生成基础依赖约束，避免安装增量依赖时替换 Torch、Torchvision、NumPy 和 Transformers；新工作站先按 `scripts/install_perception.sh --help` 准备所需组件。缺少 FoundationPose 源码时下载 revision `a1b694b83e633c2cb6115b9063d940a687759392`，已有源码及本地修改直接复用。其官方权重需放入 `third_party/FoundationPose/weights/2023-10-28-18-33-37` 与 `2024-01-11-20-02-45`，每个目录包含 `config.yml` 和 `model_best.pth`。下载入口见 [FoundationPose 官方说明](https://github.com/NVlabs/FoundationPose)。
 
-安装脚本补齐 Grounded-SAM2 的固定源码和增量依赖；已准备好的环境只需核验本地模型：
+安装脚本补齐缺少的源码和增量依赖；已准备好的环境可直接下载权重并检查本地文件与依赖：
 
 ```bash
 conda activate real_robot
 # 新工作站配置完成基础环境后执行；已有环境不必重复安装。
 bash third_party/cordvip_geometry/scripts/install_perception.sh
 python -m cordvip_geometry download --models grounding sam
-python -m cordvip_geometry download --models grounding sam --verify-only
 python -m cordvip_geometry check --offline-input --headless
 ```
 
-[Grounded-SAM-2](https://github.com/IDEA-Research/Grounded-SAM-2) 源码固定 `b7a9c29f196edff0eb54dbe14588d7ae5e3dde28`。默认权重为 `reports/cordvip_models/sam2.1_hiera_small.pt` 和 `reports/cordvip_models/grounding-dino-base/`，固定官方 revision，下载及加载时核验 SHA256。SAM2 从源码目录直接加载；禁用填洞后处理，不需要编译 SAM2 可选 CUDA 扩展。Grounding DINO 使用 Transformers 4.48.0 和本地 safetensors，关闭自定义算子，不在推理时联网下载。
+[Grounded-SAM-2](https://github.com/IDEA-Research/Grounded-SAM-2) 默认下载 revision `b7a9c29f196edff0eb54dbe14588d7ae5e3dde28`；运行允许使用本地修改。默认权重为 `reports/cordvip_models/sam2.1_hiera_small.pt` 和 `reports/cordvip_models/grounding-dino-base/`，下载使用明确的官方 revision 并保存来源记录。SAM2 从源码目录直接加载；禁用填洞后处理，不需要编译 SAM2 可选 CUDA 扩展。Grounding DINO 使用本地 safetensors，关闭自定义算子，不在推理时联网下载。模型加载要求所用源码与依赖提供实际调用的 API。
 
-`--sam-python` 默认当前解释器，也可指向另一个满足固定依赖的环境；不按环境名判断。SAM 的固定 Python/依赖版本见 [SAM 配方](../src/cordvip_geometry/sam2_config.py)，首帧文本检测额外检查 Grounding DINO 依赖。父进程按实际能力检查：mask-only 配合 `--no-3d` 不要求父环境的 Torch 或 Open3D；位姿估计仍需要 Open3D，即使不显示 3D；图像处理始终需要 cv2。手点另需 Real 包的离线 FK 依赖。
+`--sam-python` 默认当前解释器，也可指向另一个具备推理依赖的环境；不按环境名或精确版本判断。[SAM 配方](../src/cordvip_geometry/sam2_config.py)检查本地文件与依赖是否存在，首帧文本检测额外检查 Grounding DINO 依赖。父进程按实际能力检查：mask-only 配合 `--no-3d` 不要求父环境的 Torch 或 Open3D；位姿估计仍需要 Open3D，即使不显示 3D；图像处理始终需要 cv2。手点另需 Real 包的离线 FK 依赖。
 
-`--sam-root`、`--sam-checkpoint`、`--sam-config`、`--dino-weights` 可指定位置。SAM 源码可位于 checkout 或 worktree；版本、可执行源码及配置须匹配，文档修改不影响准入。权重与配置须匹配固定版本。`--box-threshold` 默认 0.3，`--text-threshold` 默认 0.25，只控制首帧检测，不表示追踪或位姿置信度。分割和位姿估计使用各进程可见的第 0 张 CUDA 卡，通过 `CUDA_VISIBLE_DEVICES` 选卡；建模命令的 `--device` 仅控制 Hunyuan 生成阶段。静态检查不证明 GPU 推理或扩展 ABI 可用。
+`--sam-root`、`--sam-checkpoint`、`--sam-config`、`--dino-weights` 可指定位置。源码目录不要求 Git checkout，权重与模型配置的实际结构须匹配。`--box-threshold` 默认 0.3，`--text-threshold` 默认 0.25，只控制首帧检测，不表示追踪或位姿置信度。分割和位姿估计使用各进程可见的第 0 张 CUDA 卡，通过 `CUDA_VISIBLE_DEVICES` 选卡；建模命令的 `--device` 仅控制 Hunyuan 生成阶段。静态检查不证明 GPU 推理或扩展 ABI 可用。
 
-追踪默认 BF16 autocast、eager。首帧文本检测按需加载 Grounding DINO，确认后释放；SAM2 图像预测和视频传播共用一份模型。复用确认 mask 或手动画多边形时，不加载也不要求 Grounding DINO 权重。每个追踪帧共享一次图像编码，图像和特征缓存各 1 帧，保留首帧 conditioning 和最多 15 个必要历史输出。SAM2 对初始化 mask 会重采样，不承诺首帧输出与输入逐像素相等。
+追踪默认 BF16 autocast、eager。首帧文本检测按需加载 Grounding DINO，确认后释放；SAM2 图像预测和视频传播共用一份模型。复用确认 mask 或手动画多边形时，不加载也不要求 Grounding DINO 权重。每个追踪帧共享一次图像编码，图像和特征缓存各 1 帧；保留首帧 conditioning，历史窗口由模型所需的时序记忆和指针决定，并记录在 `models.json`。SAM2 对初始化 mask 会重采样，不承诺首帧输出与输入逐像素相等。
 
 如需 large 对照，先 `python -m cordvip_geometry download --models sam --sam-variant large`，然后给追踪或建模命令同时追加：
 
@@ -34,7 +33,7 @@ python -m cordvip_geometry check --offline-input --headless
 --sam-checkpoint reports/cordvip_models/sam2.1_hiera_large.pt
 ```
 
-`models.json` 记录实际配置、源码和权重 SHA 及加载耗时；`records.jsonl` 记录分割计算、IPC、各物体位姿耗时与场景处理总耗时。首条记录包含初始化；稳态处理耗时不等于含解码、FK、显示、存盘和策略推理的端到端帧率。
+`models.json` 记录实际配置、源码和权重路径、依赖版本及加载耗时；`records.jsonl` 记录分割计算、IPC、各物体位姿耗时与场景处理总耗时。首条记录包含初始化；稳态处理耗时不等于含解码、FK、显示、存盘和策略推理的端到端帧率。
 
 ## 完整离线回放
 
@@ -78,7 +77,7 @@ python scripts/cordvip/track_object.py \
 
 相机尺寸和采集帧率仅用于实时源，手点数仅用于 `--with-hand`；`--replay-fps` 用于有节拍的离线输入或保存视频。检测阈值仅在首帧文本检测时检查，位姿匹配参数仅在场景包含资产时检查；未启用的分支不阻塞独立实测点云。
 
-输入也可用 `--rgbd-dir DIR`。其中 NPZ 采用六位编号，包含 RGB uint8、米制 `depth_m`、`K`、畸变模型及五项系数、`source_id/timestamp_ns/clock` 和可选 `row_index`。不猜测缺失单位、内参或时间。
+输入也可用 `--rgbd-dir DIR`。其中 NPZ 采用六位编号，包含 RGB uint8、米制 `depth_m`、`K`、畸变模型及五项系数、`source_id/timestamp_ns/clock` 和可选 `row_index`。不猜测缺失单位、内参或时间。复用 Raw 首帧选择时，保存帧必须包含匹配的 `row_index`，缺失时拒绝复用。
 
 只看输入而不加载模型：
 
@@ -151,7 +150,7 @@ finally:
 
 | 输出 | 内容 |
 |---|---|
-| `run.json` / `models.json` | 配置、资产/标定来源、源码与权重 SHA、模型变体、加载耗时 |
+| `run.json` / `models.json` | 配置、资产/标定来源、源码与权重路径、依赖版本、加载耗时 |
 | `records.jsonl` | 实际处理行、分割/IPC/位姿耗时、GPU 内存、状态与诊断 |
 | `latest.npz` | 原子发布最近快照；退出时写失效快照，失败则尝试删除 |
 | `result.json` | 最终状态、错误、各资源清理状态与快照失效确认；发布失败会报告错误并以失败状态退出 |
@@ -183,7 +182,7 @@ python -m cordvip_geometry prepare \
 
 已有 CAD/扫描 mesh 可直接 `prepare`。完整单图流程使用 `object build`，与 `reconstruct_object.py` 共用参数和实现；分阶段使用 `object segment --list-only` 保存候选、`object select` 继续选择、`object generate` 生成。无窗口选择必须指定 `--instance`；候选 score 是 Grounding DINO 检测分数，mask_score 是 SAM2 预测 IoU，均不是人工真值。
 
-首帧复用以 `selection.json` 指向的 mask 及其 hash、原始 RGB-D 与来源证据为准。便利副本不参与追踪准入；`foreground_rgba.png` 是 `object generate` 的实际输入，生成阶段仍要求它存在。
+首帧复用读取 `selection.json` 指向的 mask，并核对原始 RGB-D、相机参数、来源身份、时间和 Raw 行号。分割建模保存一份 `mask.png`，场景追踪保存一份 `mask.npy`；`foreground_rgba.png` 是 `object generate` 的实际输入。
 
 ## 数据语义与资源归属
 
@@ -199,4 +198,4 @@ Frame 保留原 RGB-D、source identity、row 和 clock。没有相机来源证�
 
 手部几何按明确关节名称顺序接收 rad，URDF origins/mesh scales 定义 m。每个 link 至少一个固定样本，其余按表面积分配，sample/link ID 在模型生命周期内固定；法向来自 mesh faces。Raw 手点使用同一 row 的实测关节、数据对应的相机外参与当前 mount，不插值，也不连接设备。
 
-Hunyuan 仅在独立阶段使用本地 2.1 权重，输出任意尺度与对象轴；物理定尺度是单独的显式步骤。生成不隐式执行 rembg、几何清理、居中或缩放。模型文件、输入与输出 hashes 留在 provenance 中。
+Hunyuan 仅在独立阶段使用本地 2.1 权重，输出任意尺度与对象轴；物理定尺度是单独的显式步骤。生成不隐式执行 rembg、几何清理、居中或缩放。来源记录保留源码、权重、输入与输出路径，以及实际参数和依赖版本。

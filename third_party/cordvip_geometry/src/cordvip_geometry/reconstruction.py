@@ -4,14 +4,12 @@ import gc
 import importlib.metadata
 import os
 from pathlib import Path
-import subprocess
 import sys
 import time
-import zipfile
 
 import numpy as np
 
-from .io import sha256, existing_file
+from .io import existing_file
 
 
 def generate_mesh(
@@ -25,7 +23,7 @@ def generate_mesh(
     num_chunks=8000,
     device="cuda",
 ):
-    """Generate from local 2.1 weights and retain provenance; no automatic cleanup or metric scaling."""
+    """Generate from local 2.1 weights and retain provenance; no mesh cleanup or metric scaling."""
     for name, value, minimum in (
         ("seed", seed, 0),
         ("steps", steps, 1),
@@ -37,16 +35,12 @@ def generate_mesh(
     image_path = existing_file(image_rgba_path)
     root = Path(source_root).expanduser().resolve()
     package_parent = root / "hy3dshape"
-    pipeline_file = existing_file(package_parent / "hy3dshape" / "pipelines.py")
+    existing_file(package_parent / "hy3dshape" / "pipelines.py")
     weights = Path(weights_dir).expanduser().resolve()
     if (weights / "hunyuan3d-dit-v2-1").is_dir():
         weights = weights / "hunyuan3d-dit-v2-1"
     config_path = existing_file(weights / "config.yaml")
     checkpoint_path = existing_file(weights / "model.fp16.ckpt")
-    if not zipfile.is_zipfile(checkpoint_path):
-        raise ValueError(
-            f"Hunyuan checkpoint is incomplete or not a PyTorch ZIP archive: {checkpoint_path}"
-        )
     output = Path(output_mesh_path).expanduser().resolve()
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite generated mesh: {output}")
@@ -157,24 +151,12 @@ def generate_mesh(
             with torch_module.cuda.device(target):
                 torch_module.cuda.empty_cache()
 
-    revision = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
     return {
         "method": "Hunyuan3D-2.1 shape-only",
         "source_root": str(root),
-        "source_revision": revision.stdout.strip() if revision.returncode == 0 else None,
-        "pipeline_sha256": sha256(pipeline_file),
         "image_rgba_path": str(image_path),
-        "image_rgba_sha256": sha256(image_path),
         "weights_directory": str(weights),
-        "checkpoint_sha256": sha256(checkpoint_path),
-        "config_sha256": sha256(config_path),
         "mesh_path": str(output),
-        "mesh_sha256": sha256(output),
         "units": "unscaled",
         "object_frame": "generator_output_without_recentering",
         "seed": seed,

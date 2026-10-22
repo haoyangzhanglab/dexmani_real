@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from .io import sha256
 from .geometry import sample_mesh_surface, validate_pose
 
 
@@ -58,7 +56,7 @@ class HandCloudModel:
         unknown = excluded - {link.get("name") for link in root.findall("link")}
         if unknown:
             raise ValueError(f"excluded links are absent from URDF: {sorted(unknown)}")
-        meshes, names, assets = [], [], {str(path): sha256(path)}
+        meshes, names, assets = [], [], [str(path)]
         for link in root.findall("link"):
             name = link.get("name")
             if name in excluded:
@@ -94,7 +92,7 @@ class HandCloudModel:
                 ):
                     raise ValueError(f"{mesh_path}: mesh must have finite, positive surface area")
                 parts.append(mesh)
-                assets[str(mesh_path)] = sha256(mesh_path)
+                assets.append(str(mesh_path))
             if parts:
                 names.append(name)
                 meshes.append(trimesh.util.concatenate(parts))
@@ -121,7 +119,7 @@ class HandCloudModel:
         self.link_ids.setflags(write=False)
         self.metadata = {
             "urdf": str(path),
-            "source_sha256": assets,
+            "source_files": assets,
             "joint_names": list(self.joint_names),
             "joint_units": "rad",
             "link_names": names,
@@ -132,9 +130,6 @@ class HandCloudModel:
             "sampling": "fixed_per_link_area_samples_one_minimum_no_per_frame_fps",
             "points_per_link": counts.tolist(),
             "normals": "visual_mesh_face_normals",
-            "samples_sha256": hashlib.sha256(
-                self.points.tobytes() + self._normals.tobytes() + self.link_ids.tobytes()
-            ).hexdigest(),
         }
 
     def transform(self, q, T_camera_handbase):

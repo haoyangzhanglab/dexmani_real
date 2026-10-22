@@ -1,7 +1,6 @@
 """Asset/selection validation and result publication; no model or device imports."""
 
 from datetime import datetime
-import hashlib
 import json
 from pathlib import Path
 
@@ -9,16 +8,13 @@ from pathlib import Path
 def new_output(path, *, workspace, protected=()):
     reports = (Path(workspace).expanduser().resolve() / "reports").resolve()
     path = path or reports / "cordvip_demo" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = output_path(path, workspace=workspace)
-    for source in protected:
-        if source is not None and path.is_relative_to(source.expanduser().resolve()):
-            raise ValueError("输出不能写入 Raw、RGB-D 输入或物体资产目录内部")
+    path = output_path(path, workspace=workspace, protected=protected)
     path.mkdir(parents=True, exist_ok=False)
     return path
 
 
 def load_asset(path):
-    """Load one metric asset and its ordered surface samples; verify every file hash."""
+    """Load one metric asset and its ordered surface samples."""
     import numpy as np
     from .geometry import load_metric_mesh, load_points
 
@@ -31,8 +27,6 @@ def load_asset(path):
         file = (path / metadata[f"{name}_file"]).resolve()
         if not file.is_relative_to(path):
             raise ValueError("资产文件必须位于资产目录内")
-        if sha256(file) != metadata[f"{name}_sha256"]:
-            raise ValueError(f"资产 {name} 与保存的 SHA256 不一致；请重新 prepare")
         files[name] = file
     mesh, points = load_metric_mesh(files["mesh"]), load_points(files["points"])
     # Normals describe the generated surface, not measured contact geometry.
@@ -62,29 +56,24 @@ def load_mask(path, shape):
     return mask > 0
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def existing_file(path: Path) -> Path:
     path = Path(path).expanduser().resolve()
     if not path.is_file() or path.stat().st_size == 0:
         raise FileNotFoundError(f"Missing or empty local file: {path}")
-    if any(Path(str(path) + suffix).exists() for suffix in (".part", ".aria2", ".incomplete")):
-        raise ValueError(f"Unfinished local file: {path}")
     return path
 
 
-def output_path(path: Path, *, workspace) -> Path:
-    path = Path(path).expanduser().resolve()
-    reports = (Path(workspace).expanduser().resolve() / "reports").resolve()
-    if reports not in path.parents:
-        raise ValueError(f"输出目录必须位于 {reports} 下")
-    if path.exists():
+def output_path(path: Path, *, workspace, protected=(), allow_existing=False) -> Path:
+    requested = Path(path).expanduser()
+    path = requested.resolve()
+    workspace = Path(workspace).expanduser().resolve()
+    for source in (workspace / "episodes", workspace / "rollouts", *protected):
+        if source is not None and path.is_relative_to(Path(source).expanduser().resolve()):
+            raise ValueError("输出不能写入 Raw、RGB-D 输入或物体资产目录内部")
+    # Published Raw may also live outside the workspace's default capture roots.
+    if any((parent / "data.h5").is_file() for parent in (path, *path.parents)):
+        raise ValueError("输出不能写入 Raw episode 内部")
+    if not allow_existing and (path.exists() or requested.is_symlink()):
         raise FileExistsError(f"输出目录已存在，拒绝覆盖：{path}")
     return path
 
@@ -96,7 +85,7 @@ def write_json(path: Path, value: dict) -> None:
 
 
 def write_confirmed_selection(directory, mask, metadata, *, mask_file, foreground_rgb=None):
-    """One authoritative mask/hash/confirmation writer; RGBA is a build attachment."""
+    """Save an explicitly confirmed mask; RGBA is a build attachment."""
     import numpy as np
     from PIL import Image
 
@@ -115,14 +104,14 @@ def write_confirmed_selection(directory, mask, metadata, *, mask_file, foregroun
         Image.fromarray(mask.astype(np.uint8) * 255).save(path)
     else:
         raise ValueError("confirmed masks use PNG or NPY")
-    result = {**metadata, "mask_file": mask_file, "mask_sha256": sha256(path)}
+    result = {**metadata, "mask_file": mask_file}
     if foreground_rgb is not None:
         rgb = np.asarray(foreground_rgb)
         if rgb.dtype != np.uint8 or rgb.shape != (*mask.shape, 3):
             raise ValueError("foreground RGB must align with the confirmed mask")
         foreground = directory / "foreground_rgba.png"
         Image.fromarray(np.dstack((rgb, mask.astype(np.uint8) * 255))).save(foreground)
-        result.update(foreground_file=foreground.name, foreground_sha256=sha256(foreground))
+        result.update(foreground_file=foreground.name)
     write_json(directory / "selection.json", result)
     return result
 
@@ -130,7 +119,7 @@ def write_confirmed_selection(directory, mask, metadata, *, mask_file, foregroun
 def load_initial_selection(directory, frame):
     """Reuse only an explicitly selected mask for the exact original RGB-D frame."""
     import numpy as np
-    from .rgbd import rectify_frame
+    from .rgbd import load_frame, rectify_frame
 
     directory = Path(directory).expanduser().resolve()
     metadata = json.loads((directory / "selection.json").read_text())
@@ -138,30 +127,19 @@ def load_initial_selection(directory, frame):
         raise ValueError("initial-selection must contain an explicitly confirmed selection")
     if metadata.get("mask_grid") != "original_rgb_grid; not_automatically_rectified":
         raise ValueError("initial-selection mask must use the original source RGB grid")
-    expected = dict(
-        rgb=frame.rgb,
-        depth_m=frame.depth_m,
-        K=frame.K,
-        distortion_model=frame.distortion_model,
-        distortion_coeffs=frame.distortion_coeffs,
-        source_id=frame.source_id,
-        timestamp_ns=frame.timestamp_ns,
-        clock=frame.clock,
-    )
-    with np.load(directory / "source_rgbd.npz", allow_pickle=False) as saved:
-        for key, value in expected.items():
-            if key not in saved.files or not np.array_equal(saved[key], np.asarray(value)):
-                raise ValueError(
-                    f"initial-selection {key} differs from the actual first source frame"
-                )
-        if "row_index" in saved.files and not np.array_equal(saved["row_index"], frame.row_index):
-            raise ValueError("initial-selection row_index differs from the first Raw row")
+    saved = load_frame(directory / "source_rgbd.npz")
+    for key in (
+        "rgb", "depth_m", "K", "distortion_model", "distortion_coeffs",
+        "source_id", "timestamp_ns", "clock", "row_index",
+    ):
+        if not np.array_equal(getattr(saved, key), getattr(frame, key)):
+            raise ValueError(f"initial-selection {key} differs from the actual first source frame")
     for key in ("source_id", "timestamp_ns", "clock"):
-        if metadata.get(key) != expected[key]:
+        if metadata.get(key) != getattr(frame, key):
             raise ValueError(f"initial-selection metadata {key} differs from the source frame")
     mask_path = (directory / metadata["mask_file"]).resolve()
-    if not mask_path.is_relative_to(directory) or sha256(mask_path) != metadata["mask_sha256"]:
-        raise ValueError("initial-selection mask path/hash does not match the confirmed selection")
+    if not mask_path.is_relative_to(directory):
+        raise ValueError("initial-selection mask must remain inside its directory")
     mask = load_mask(mask_path, frame.depth_m.shape)
     _, depth, _, mask = rectify_frame(frame, mask)
     if np.count_nonzero(mask & (depth > 0)) < 4:
@@ -169,9 +147,7 @@ def load_initial_selection(directory, frame):
     return mask, dict(
         method="reused_confirmed_selection",
         directory=str(directory),
-        selection_sha256=sha256(directory / "selection.json"),
-        mask_sha256=metadata["mask_sha256"],
-        source_check="exact_rgb_depth_K_distortion_identity_time_clock",
+        source_check="exact_rgb_depth_K_distortion_identity_time_clock_row",
         selected_instance=metadata["selected_instance"],
     )
 

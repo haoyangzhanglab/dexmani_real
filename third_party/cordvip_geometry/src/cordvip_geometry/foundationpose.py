@@ -3,11 +3,9 @@
 import importlib
 from pathlib import Path
 import sys
-import subprocess
 
 import numpy as np
 
-from .io import sha256
 from .geometry import validate_pose, validate_rgbd
 
 
@@ -77,21 +75,6 @@ class FoundationPosePlusTracker:
         self._registered = False
         self._intrinsics = None
         self._image_shape = None
-        self._source_revision = subprocess.check_output(
-            ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True
-        ).strip()
-        self._weight_hashes = (
-            shared_with._weight_hashes
-            if shared_with is not None
-            else {
-                str(path.relative_to(self.root)): sha256(path)
-                for run in ("2023-10-28-18-33-37", "2024-01-11-20-02-45")
-                for path in (
-                    self.root / "weights" / run / "model_best.pth",
-                    self.root / "weights" / run / "config.yml",
-                )
-            }
-        )
 
         import torch
 
@@ -99,7 +82,7 @@ class FoundationPosePlusTracker:
             raise RuntimeError(
                 "FoundationPose requires CUDA; input validation alone does not run tracking"
             )
-        # Upstream uses generic module names. Refuse a mixture of different checkouts.
+        # Upstream uses generic module names. Refuse a mixture of different source directories.
         for name in ("estimater", "Utils", "learning", "datareader"):
             existing = sys.modules.get(name)
             if existing is not None:
@@ -117,7 +100,7 @@ class FoundationPosePlusTracker:
 
         # Share immutable weights/context on one owner; each object retains its own mesh and pose.
         if shared_with is not None and shared_with.root != self.root:
-            raise ValueError("Shared FoundationPose weights must use the same checkout")
+            raise ValueError("Shared FoundationPose weights must use the same source directory")
         self._context = (
             shared_with._context if shared_with is not None else dr.RasterizeCudaContext()
         )
@@ -217,8 +200,6 @@ class FoundationPosePlusTracker:
             depth_guidance="previous centered-mesh z",
             bbox="inclusive mask min/max midpoint",
             foundationpose_root=str(self.root),
-            foundationpose_revision=self._source_revision,
-            weight_sha256=self._weight_hashes,
             register_iterations=self.register_iterations,
             track_iterations=self.track_iterations,
             tracking_preprocessing="shared per source frame; upstream erosion/bilateral radius=2 and XYZ",

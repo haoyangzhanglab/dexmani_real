@@ -5,9 +5,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import sys
 
-from ..io import existing_file, output_path, sha256, write_json
+from ..io import existing_file, output_path, write_json
 from .arguments import positive_float, positive_int
 
 
@@ -52,10 +51,6 @@ def prepare(args: argparse.Namespace) -> None:
         "frame": "object",
         "units": "m",
         "source_mesh": str(source),
-        "source_mesh_sha256": sha256(source),
-        "mesh_sha256": sha256(mesh_file),
-        "points_sha256": sha256(output / "points.npy"),
-        "normals_sha256": sha256(output / "normals.npy"),
         "scale_to_meters": scale,
         "measured_extent": measured_extent,
         "origin": "source_mesh_origin_scaled_without_recentering",
@@ -98,7 +93,7 @@ def build_parser(*, workspace=None) -> argparse.ArgumentParser:
     )
     parser.add_argument("--num-points", type=positive_int, default=1024)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output-dir", type=Path, required=True, help="reports/ 下尚不存在的目录")
+    parser.add_argument("--output-dir", type=Path, required=True, help="尚不存在的新输出目录")
     parser.add_argument("--preview", action="store_true", help="保存后用 Open3D 查看点云")
     return parser
 
@@ -106,11 +101,7 @@ def build_parser(*, workspace=None) -> argparse.ArgumentParser:
 def main(argv=None, *, workspace=None) -> int:
     parser = build_parser(workspace=workspace)
     args = parser.parse_args(argv)
-    try:
-        prepare(args)
-    except (OSError, ValueError, ImportError, RuntimeError) as error:
-        print(f"错误：{error}", file=sys.stderr)
-        return 1
+    prepare(args)
     return 0
 
 

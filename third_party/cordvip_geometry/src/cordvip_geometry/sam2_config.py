@@ -1,31 +1,24 @@
-"""Pinned local Grounded-SAM2 inputs; checks never import models or open devices."""
+"""Local Grounded-SAM2 inputs; checks never import models or open devices."""
 
 import json
 from pathlib import Path
 import subprocess
 import sys
 
-from .io import sha256, existing_file
+from .io import existing_file
 
-SOURCE_REVISION = "b7a9c29f196edff0eb54dbe14588d7ae5e3dde28"
-CORE_VERSIONS = dict(torch="2.4.1+cu124", torchvision="0.19.1+cu124", numpy="1.26.4")
-TRANSFORMERS_VERSION = "4.48.0"
 SAM_MODELS = {
     "small": dict(
         config="configs/sam2.1/sam2.1_hiera_s.yaml",
         repo_id="facebook/sam2.1-hiera-small",
         revision="ee5bba1d82bb8749febdf90f45e84b687142ba03",
         weight="sam2.1_hiera_small.pt",
-        size=184416285,
-        sha256="6d1aa6f30de5c92224f8172114de081d104bbd23dd9dc5c58996f0cad5dc4d38",
     ),
     "large": dict(
         config="configs/sam2.1/sam2.1_hiera_l.yaml",
         repo_id="facebook/sam2.1-hiera-large",
         revision="665f8e2ad61cf5f53d65644ff27c8ee525124610",
         weight="sam2.1_hiera_large.pt",
-        size=898083611,
-        sha256="2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318",
     ),
 }
 GROUNDING_MODEL = dict(
@@ -33,8 +26,6 @@ GROUNDING_MODEL = dict(
     revision="12bdfa3120f3e7ec7b434d90674b3396eccf88eb",
     directory="grounding-dino-base",
     weight="model.safetensors",
-    size=933400872,
-    sha256="5548f844c928c4b6f411fa8cbcc2bfa8dbbba437cb1d513975519f93c2a9ed21",
     patterns=["*.json", "model.safetensors", "vocab.txt", "README.md", "LICENSE*"],
 )
 GROUNDING_FILES = (
@@ -52,7 +43,7 @@ def add_sam_arguments(parser, workspace):
         "--sam-python",
         type=Path,
         default=Path(sys.executable),
-        help="分割子进程解释器；默认当前解释器，须满足固定 Python/依赖版本",
+        help="分割子进程解释器；默认当前解释器，需具备 SAM2 推理依赖",
     )
     parser.add_argument("--sam-root", type=Path, default=workspace / "third_party/Grounded-SAM-2")
     parser.add_argument(
@@ -86,68 +77,19 @@ def validate_sam_source(root):
         "sam2/sam2_image_predictor.py",
     ):
         existing_file(root / relative)
-    revision = subprocess.check_output(
-        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
-    ).strip()
-    top = subprocess.check_output(
-        ["git", "-C", str(root), "rev-parse", "--show-toplevel"], text=True
-    ).strip()
-    if Path(top).resolve() != root:
-        raise ValueError("Grounded-SAM2 root must be a checkout/worktree top level")
-    if revision != SOURCE_REVISION:
-        raise ValueError(f"Grounded-SAM2 requires source {SOURCE_REVISION}; found {revision}")
-    # Hash untracked SAM/Hydra code too: it can shadow pinned executable inputs.
-    protected = (
-        "setup.py",
-        "pyproject.toml",
-        "setup.cfg",
-        *(
-            f":(glob)sam2/**/*.{suffix}"
-            for suffix in ("py", "yaml", "yml", "json", "cu", "cpp", "h", "cuh")
-        ),
-    )
-    dirty = subprocess.check_output(
-        [
-            "git",
-            "-C",
-            str(root),
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--",
-            *protected,
-        ],
-        text=True,
-    )
-    if dirty:
-        raise ValueError("Grounded-SAM2 executable source/config contains edits")
     return root
 
 
-def validate_sam_checkpoint(root, checkpoint, config, *, verify_hash=True):
-    spec = next((spec for spec in SAM_MODELS.values() if spec["config"] == config), None)
-    if spec is None:
-        raise ValueError("Use the pinned SAM2.1 small or large configuration")
-    existing_file(Path(root) / "sam2" / config)
-    checkpoint = existing_file(checkpoint)
-    if checkpoint.stat().st_size != spec["size"] or (
-        verify_hash and sha256(checkpoint) != spec["sha256"]
-    ):
-        raise ValueError(f"SAM2.1 checkpoint does not match {config}: {checkpoint}")
-    return spec
+def validate_sam_checkpoint(root, checkpoint, config):
+    existing_file(Path(root).expanduser() / "sam2" / config)
+    return existing_file(checkpoint)
 
 
-def validate_grounding_weights(directory, *, verify_hash=True):
+def validate_grounding_weights(directory):
     directory = Path(directory).expanduser().resolve()
     for name in GROUNDING_FILES:
         existing_file(directory / name)
-    weight = existing_file(directory / GROUNDING_MODEL["weight"])
-    if weight.stat().st_size != GROUNDING_MODEL["size"] or (
-        verify_hash and sha256(weight) != GROUNDING_MODEL["sha256"]
-    ):
-        raise ValueError(
-            f"Grounding DINO weight does not match the pinned official SHA256: {weight}"
-        )
+    existing_file(directory / GROUNDING_MODEL["weight"])
     return directory
 
 
@@ -157,33 +99,43 @@ def check_sam_environment(args, *, require_grounding=True):
         ("Grounded-SAM2 source", lambda: validate_sam_source(args.sam_root)),
         (
             "SAM2.1 checkpoint/config",
-            lambda: validate_sam_checkpoint(
-                args.sam_root, args.sam_checkpoint, args.sam_config, verify_hash=False
-            ),
+            lambda: validate_sam_checkpoint(args.sam_root, args.sam_checkpoint, args.sam_config),
         ),
     ):
         try:
             detail = check()
             checks.append(dict(name=name, ok=True, detail=str(detail)))
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except (OSError, ValueError) as error:
             checks.append(dict(name=name, ok=False, detail=str(error)))
     if require_grounding:
         try:
-            directory = validate_grounding_weights(args.dino_weights, verify_hash=False)
+            directory = validate_grounding_weights(args.dino_weights)
             checks.append(dict(name="Grounding DINO local files", ok=True, detail=str(directory)))
         except (OSError, ValueError) as error:
             checks.append(dict(name="Grounding DINO local files", ok=False, detail=str(error)))
-    # Metadata only. The source checkout is added by the worker, not installed via pip.
-    script = """import sys,json,importlib.metadata as m,importlib.util as u
-packages = {}
-for p in ['torch', 'torchvision', 'numpy', 'transformers']:
-    try: packages[p] = m.version(p)
-    except m.PackageNotFoundError: packages[p] = None
-modules = ['hydra','omegaconf','iopath','PIL','tqdm']
-if sys.argv[1] == 'grounding': modules.append('safetensors')
-print(json.dumps(dict(python=list(sys.version_info[:2]), packages=packages,
-    modules={p:u.find_spec(p) is not None for p in
-             modules})))
+    # Metadata only. The worker adds the local source directory to its import path.
+    script = """
+import importlib.metadata
+import importlib.util
+import json
+import sys
+
+packages = ["torch", "torchvision", "numpy"]
+modules = ["hydra", "omegaconf", "iopath", "PIL", "tqdm"]
+if sys.argv[1] == "grounding":
+    packages.append("transformers")
+    modules.append("safetensors")
+versions = {}
+for name in packages:
+    try:
+        versions[name] = importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        versions[name] = None
+print(json.dumps(dict(
+    python=list(sys.version_info[:2]),
+    packages=versions,
+    modules={name: importlib.util.find_spec(name) is not None for name in modules},
+)))
 """
     try:
         result = subprocess.run(
@@ -200,14 +152,7 @@ print(json.dumps(dict(python=list(sys.version_info[:2]), packages=packages,
             check=True,
         )
         data = json.loads(result.stdout)
-        expected = CORE_VERSIONS.copy()
-        if require_grounding:
-            expected["transformers"] = TRANSFORMERS_VERSION
-        ok = (
-            data["python"] == [3, 10]
-            and all(data["packages"][k] == v for k, v in expected.items())
-            and all(data["modules"].values())
-        )
+        ok = all(data["packages"].values()) and all(data["modules"].values())
         checks.append(dict(name="Grounded-SAM2 environment", ok=ok, detail=json.dumps(data)))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         checks.append(

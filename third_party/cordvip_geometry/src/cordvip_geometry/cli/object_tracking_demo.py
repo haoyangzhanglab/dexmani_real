@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 import time
 
-from ..io import new_output
+from ..io import new_output, write_json
 
 
 def parse_args(argv=None, *, workspace=None):
@@ -25,7 +25,7 @@ def parse_args(argv=None, *, workspace=None):
     )
     parser.add_argument("--no-3d", action="store_true", help="只显示 RGB-D，不加载 Open3D viewer")
     parser.add_argument("--max-frames", type=int, default=0, help="0 表示处理全部输入")
-    parser.add_argument("--output", type=Path, help="新的 reports/ 子目录；默认按时间命名")
+    parser.add_argument("--output", type=Path, help="尚不存在的新输出目录；默认在 reports/ 下按时间命名")
     parser.add_argument("--save-inputs", action="store_true", help="保存实际处理的原网格 RGB-D")
     parser.add_argument(
         "--save-video", action="store_true", help="保存 RGB-D 预览视频，时间戳以 records.jsonl 为准"
@@ -65,17 +65,14 @@ def run(args):
     config = {
         key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
     }
-    (output / "run.json").write_text(
-        json.dumps(
-            {
-                "config": config,
-                "coordinate_frame": "color_camera",
-                "units": "m",
-                "rgb_source": "decoded_raw_video" if args.episode else "rgbd_input",
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
+    write_json(
+        output / "run.json",
+        {
+            "config": config,
+            "coordinate_frame": "color_camera",
+            "units": "m",
+            "rgb_source": "decoded_raw_video" if args.episode else "rgbd_input",
+        },
     )
     if args.save_inputs:
         (output / "inputs").mkdir()
@@ -223,9 +220,6 @@ def main(argv=None, *, workspace=None):
     except KeyboardInterrupt:
         print("示例已停止。", file=sys.stderr)
         return 130
-    except (ImportError, OSError, RuntimeError, ValueError, KeyError) as error:
-        print(f"示例失败：{error}", file=sys.stderr)
-        return 1
 
 
 if __name__ == "__main__":

@@ -129,9 +129,9 @@ python scripts/export_zarr.py episodes/test --config local.yaml
 
 默认输出 `datasets/test.zarr`，目标必须是 Raw 之外的新路径。`--output` 指定路径，`--exclude` 排除整段 episode，`--chunk-frames` 调整处理批大小，`--pointcloud-num-points` 覆盖点数。同一缓存要求 task、dt、depth scale 和数组 shape/dtype 一致；文件系统或处理异常保留 staging。
 
-缓存从 Raw 重新导出至新路径，不自动改写旧缓存。新导出生成新的 `data_revision`，已有训练产物仍须通过来源检查，不得复制旧 revision 绕过检查。字段与数值表示见 [Canonical 定义](dexmani_real/data/canonical/schema.py)，处理与存储细节见[处理入口](dexmani_real/data/canonical/processing.py)和[导出入口](dexmani_real/data/canonical/export.py)。
+缓存从 Raw 重新导出至新路径，不自动改写旧缓存。Policy 按实际 episode 顺序、长度、训练划分与训练配方检查恢复条件。字段与数值表示见 [Canonical 定义](dexmani_real/data/canonical/schema.py)，处理与存储细节见[处理入口](dexmani_real/data/canonical/processing.py)和[导出入口](dexmani_real/data/canonical/export.py)。
 
-在线与离线共用[点云处理](dexmani_real/sensor/pointcloud/processing.py)；部署采用训练 artifact 保存的点云 recipe 和当前现场标定。更换采样表示后须重新导出并训练，不能仅凭点数相同沿用模型。
+在线与离线共用[点云处理](dexmani_real/sensor/pointcloud/processing.py)；部署采用训练 artifact 保存的完整点云 recipe 和当前现场标定，缺字段不使用当前默认值补齐。更换采样表示后须重新导出并训练，不能仅凭点数相同沿用模型。
 
 ### 4. 策略部署
 

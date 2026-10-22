@@ -24,7 +24,7 @@ class SensorChannels:
             SharedMemoryRingBuffer(
                 ctx,
                 make_camera_frame_dtype(camera.rgb_shape, camera.depth_shape),
-                camera.ring_maxlen,
+                5,
             )
             if camera is not None
             else None

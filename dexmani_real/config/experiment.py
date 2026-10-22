@@ -148,13 +148,9 @@ def resolve_table_plane(table: TableCollisionConfig) -> tuple[float, float, floa
     if table.plane_path is None:
         return validate_table_plane(table.plane_abcd)
     plane_path = resolve_table_plane_path(table)
-    try:
-        with plane_path.open(encoding="utf-8") as stream:
-            plane = json.load(stream)
-        resolved = validate_table_plane(tuple(float(plane[k]) for k in ("a", "b", "c", "d")))
-    except (OSError, KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"failed to load calibrated table plane from {plane_path}: {exc}") from exc
-    return resolved
+    with plane_path.open(encoding="utf-8") as stream:
+        plane = json.load(stream)
+    return validate_table_plane(tuple(float(plane[k]) for k in ("a", "b", "c", "d")))
 
 
 def load_experiment_config(

@@ -12,7 +12,7 @@ import shlex
 import sys
 import time
 
-from ..io import new_output, sha256, write_json
+from ..io import new_output, write_json
 
 
 def parse_args(argv=None, *, workspace=None):
@@ -25,7 +25,7 @@ def parse_args(argv=None, *, workspace=None):
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--output-dir", type=Path, required=True, help="reports/ 下尚不存在的目录")
+    parser.add_argument("--output-dir", type=Path, required=True, help="尚不存在的新输出目录")
     args = parser.parse_args(argv)
     if args.rgbd_dir is not None and args.serial is not None:
         parser.error("--serial 与 --rgbd-dir 不能同时使用")
@@ -51,9 +51,7 @@ def save_frame(output, frame, *, frozen_ns, confirmed_ns, mode):
         "frozen_host_monotonic_ns": frozen_ns,
         "confirmed_host_monotonic_ns": confirmed_ns,
         "rgb_file": "rgb.png",
-        "rgb_sha256": sha256(output / "rgb.png"),
         "rgbd_file": "frame.npz",
-        "rgbd_sha256": sha256(output / "frame.npz"),
         "rgb_shape": list(frame.rgb.shape),
         "K": frame.K.tolist(),
         "distortion_model": frame.distortion_model,
@@ -269,11 +267,7 @@ def run(args):
 
 def main(argv=None, *, workspace=None):
     args = parse_args(argv, workspace=workspace)
-    try:
-        return run(args)
-    except (OSError, ValueError, ImportError, RuntimeError) as error:
-        print(f"错误：{error}", file=sys.stderr)
-        return 1
+    return run(args)
 
 
 if __name__ == "__main__":

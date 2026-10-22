@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import math
 import subprocess
-import sys
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -14,40 +13,28 @@ from typing import Any
 
 
 def positive_int(raw: str) -> int:
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    value = int(raw)
     if value < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return value
 
 
 def nonnegative_int(raw: str) -> int:
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    value = int(raw)
     if value < 0:
         raise argparse.ArgumentTypeError("must be a non-negative integer")
     return value
 
 
 def nonnegative_float(raw: str) -> float:
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a finite non-negative number") from exc
+    value = float(raw)
     if not math.isfinite(value) or value < 0.0:
         raise argparse.ArgumentTypeError("must be a finite non-negative number")
     return value
 
 
 def positive_running_seconds(raw: str) -> float:
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a finite positive number") from exc
+    value = float(raw)
     if not math.isfinite(value) or value <= 0.0:
         raise argparse.ArgumentTypeError("must be a finite positive number")
     return value
@@ -231,63 +218,48 @@ def main(argv: list[str] | None = None) -> int:
 
     from dexmani_real.config.experiment import load_experiment_config
 
-    try:
-        runtime = load_experiment_config(
-            yaml_path=args.config,
-            cli_overrides={
-                "execution.execution_mode": args.execution_mode,
-                "execution.prefetch_steps": args.prefetch_steps,
-                "execution.rtc_guidance_cap": args.rtc_guidance_cap,
-                "execution.action_steps": args.n_action_steps,
-            },
-        )
-    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
-        parser.error(f"invalid experiment config: {exc}")
+    runtime = load_experiment_config(
+        yaml_path=args.config,
+        cli_overrides={
+            "execution.execution_mode": args.execution_mode,
+            "execution.prefetch_steps": args.prefetch_steps,
+            "execution.rtc_guidance_cap": args.rtc_guidance_cap,
+            "execution.action_steps": args.n_action_steps,
+        },
+    )
     if args.print_config:
         print(yaml.safe_dump(asdict(runtime), allow_unicode=True, sort_keys=False), end="")
         return 0
 
-    try:
-        from dexmani_policy.deployment import inspect_policy
+    from dexmani_policy.deployment import inspect_policy
 
-        info = inspect_policy(
-            args.experiment,
-            checkpoint=args.checkpoint,
-            weights=args.weights,
-            inference_steps=args.inference_steps,
+    info = inspect_policy(
+        args.experiment,
+        checkpoint=args.checkpoint,
+        weights=args.weights,
+        inference_steps=args.inference_steps,
+    )
+
+    from dexmani_real.deployment.preflight import validate_deployment_config
+
+    action_steps = runtime.execution.action_steps
+    if action_steps is None:
+        action_steps = info.n_action_steps
+    runtime = replace(runtime, execution=replace(runtime.execution, action_steps=action_steps))
+    validate_deployment_config(info, runtime, record_raw=not args.no_record)
+    selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
+
+    session_dir = None
+    recording_dir = None
+    if not (args.no_record and args.no_results):
+        root = args.output or Path(__file__).resolve().parents[1] / "rollouts"
+        session_dir = session_directory(root, selector)
+        if not args.no_record:
+            recording_dir = session_dir
+    elif args.output is not None:
+        print(
+            "--no-record --no-results: --output is unused; no session artifacts will be created"
         )
-    except Exception as exc:
-        print(f"[POLICY] experiment inspection failed: {exc}", file=sys.stderr)
-        return 1
-
-    try:
-        from dexmani_real.deployment.preflight import validate_deployment_config
-
-        action_steps = runtime.execution.action_steps
-        if action_steps is None:
-            action_steps = info.n_action_steps
-        runtime = replace(runtime, execution=replace(runtime.execution, action_steps=action_steps))
-        validate_deployment_config(info, runtime, record_raw=not args.no_record)
-        selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
-    except Exception as exc:
-        print(f"[PREFLIGHT] preflight failed: {exc}", file=sys.stderr)
-        return 1
-
-    try:
-        session_dir = None
-        recording_dir = None
-        if not (args.no_record and args.no_results):
-            root = args.output or Path(__file__).resolve().parents[1] / "rollouts"
-            session_dir = session_directory(root, selector)
-            if not args.no_record:
-                recording_dir = session_dir
-        elif args.output is not None:
-            print(
-                "--no-record --no-results: --output is unused; no session artifacts will be created"
-            )
-    except Exception as exc:
-        print(f"[SESSION] session setup failed: {exc}", file=sys.stderr)
-        return 1
 
     print(f"策略：{args.experiment}")
     print(
@@ -295,35 +267,31 @@ def main(argv: list[str] | None = None) -> int:
         f"输入：{', '.join(info.observation_fields)}"
     )
     print(f"输出：{session_dir}" if session_dir else "输出：Raw 和评估摘要均关闭")
-    try:
-        from dexmani_real.deployment.session import PolicyDeploymentSession
+    from dexmani_real.deployment.session import PolicyDeploymentSession
 
-        return PolicyDeploymentSession(
-            runtime,
-            info,
-            device=args.device,
-            seed=args.seed,
-            max_running_s=args.max_running_s,
-            num_episodes=args.num_episodes,
-            recording_dir=recording_dir,
-            results_dir=session_dir if not args.no_results else None,
-            camera_calibration_path=args.camera_calibration,
-            save_run_config=(
-                (
-                    lambda resolved: write_run_config(
-                        session_dir,
-                        args=args,
-                        runtime=resolved,
-                        info=info,
-                    )
+    return PolicyDeploymentSession(
+        runtime,
+        info,
+        device=args.device,
+        seed=args.seed,
+        max_running_s=args.max_running_s,
+        num_episodes=args.num_episodes,
+        recording_dir=recording_dir,
+        results_dir=session_dir if not args.no_results else None,
+        camera_calibration_path=args.camera_calibration,
+        save_run_config=(
+            (
+                lambda resolved: write_run_config(
+                    session_dir,
+                    args=args,
+                    runtime=resolved,
+                    info=info,
                 )
-                if session_dir is not None
-                else None
-            ),
-        ).run()
-    except Exception as exc:
-        print(f"[LIFECYCLE] lifecycle failed: {exc}", file=sys.stderr)
-        return 1
+            )
+            if session_dir is not None
+            else None
+        ),
+    ).run()
 
 
 if __name__ == "__main__":

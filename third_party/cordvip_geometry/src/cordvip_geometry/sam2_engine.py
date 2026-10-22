@@ -4,17 +4,10 @@ import gc
 from importlib.metadata import version
 from pathlib import Path
 import sys
-import subprocess
 
 import numpy as np
 
-from .io import sha256
 from .sam2_config import (
-    CORE_VERSIONS,
-    GROUNDING_FILES,
-    GROUNDING_MODEL,
-    SOURCE_REVISION,
-    TRANSFORMERS_VERSION,
     validate_grounding_weights,
     validate_sam_checkpoint,
     validate_sam_source,
@@ -50,13 +43,8 @@ def normalize_prompt(text):
 class SAM2Engine:
     def __init__(self, root, checkpoint, config, dino_weights):
         root = validate_sam_source(root)
-        checkpoint = Path(checkpoint).expanduser().resolve()
-        spec = validate_sam_checkpoint(root, checkpoint, config)
-        versions = {name: version(name) for name in CORE_VERSIONS}
-        if sys.version_info[:2] != (3, 10) or versions != CORE_VERSIONS:
-            raise RuntimeError(
-                "Use the validated Python 3.10 / Torch 2.4.1+cu124 Grounded-SAM2 environment"
-            )
+        checkpoint = validate_sam_checkpoint(root, checkpoint, config)
+        versions = {name: version(name) for name in ("torch", "torchvision", "numpy")}
         import torch
         import sam2
         from sam2.build_sam import build_sam2_video_predictor
@@ -84,7 +72,7 @@ class SAM2Engine:
         )
         self.preprocess = process_stream_frame
         if not callable(getattr(self.tracker, "infer_single_frame", None)):
-            raise RuntimeError("Pinned SAM2 single-frame API is missing")
+            raise RuntimeError("SAM2 infer_single_frame API is missing")
         stride = int(self.tracker.memory_temporal_stride_for_eval)
         if stride < 1:
             raise ValueError("SAM2 memory stride must be positive")
@@ -98,20 +86,11 @@ class SAM2Engine:
         self.state = self.ids = self.shape = None
         self.index = -1
         self.provenance = dict(
-            source_dirty=subprocess.check_output(
-                ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
-                text=True,
-            ),
             method="Grounding DINO + SAM2.1; fixed IDs; causal single-frame propagation",
             sam_root=str(root),
-            source_revision=SOURCE_REVISION,
             checkpoint=str(checkpoint),
-            checkpoint_sha256=spec["sha256"],
-            weight_revision=spec["revision"],
             sam_config=config,
-            sam_config_sha256=sha256(root / "sam2" / config),
             device=str(self.device),
-            torch_version=torch.__version__,
             precision="SAM2 bfloat16 autocast",
             python_version=sys.version.split()[0],
             package_versions=versions,
@@ -123,14 +102,12 @@ class SAM2Engine:
             overlap_policy="initial overlap excluded; propagated SAM2 logit winner",
             compile_model=False,
             grounding=None,
-            image_preprocessing="pinned SAM2 image predictor; video: RGB PIL LANCZOS square resize",
+            image_preprocessing="SAM2 image predictor; video: RGB PIL LANCZOS square resize",
         )
 
     def load_grounding(self):
         if self.detector is not None:
             return
-        if version("transformers") != TRANSFORMERS_VERSION:
-            raise RuntimeError(f"Grounding DINO requires Transformers {TRANSFORMERS_VERSION}")
         from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
         from transformers.models.grounding_dino import modeling_grounding_dino
 
@@ -138,7 +115,7 @@ class SAM2Engine:
         self.processor = AutoProcessor.from_pretrained(
             str(directory), local_files_only=True, trust_remote_code=False
         )
-        # Pinned Transformers 4.48 ignores disable_custom_kernels in the attention
+        # Transformers 4.48 ignores disable_custom_kernels in the attention
         # constructor and attempts JIT compilation anyway. Suppress only that
         # loader during construction; forward still uses the official torch path.
         loader = modeling_grounding_dino.load_cuda_kernels
@@ -159,12 +136,9 @@ class SAM2Engine:
             modeling_grounding_dino.load_cuda_kernels = loader
         self.provenance["grounding"] = dict(
             directory=str(directory),
-            revision=GROUNDING_MODEL["revision"],
-            transformers_version=TRANSFORMERS_VERSION,
+            transformers_version=version("transformers"),
             precision="float32",
-            checkpoint_sha256=GROUNDING_MODEL["sha256"],
             disable_custom_kernels=True,
-            configuration_sha256={name: sha256(directory / name) for name in GROUNDING_FILES},
         )
 
     def predict(self, rgb, text, box_threshold, text_threshold):

@@ -11,7 +11,7 @@ python -m cordvip_geometry download --models grounding sam
 python -m cordvip_geometry check --offline-input --headless
 ```
 
-`real_robot` 是示例环境名。SAM 子解释器按 Python 和固定依赖版本检查，父环境按实际启用的位姿、手点或显示能力检查；具体要求见[使用文档](docs/usage.md)。源码与权重版本固定，支持合法 Git worktree，SAM 文档修改不影响源码准入。模型从本地加载；`--help`、静态检查和普通 import 不加载模型或连接设备。
+`real_robot` 是示例环境名。SAM 子解释器检查依赖是否存在，父环境按实际启用的位姿、手点或显示能力检查；具体要求见[使用文档](docs/usage.md)。运行允许使用修改过的源码和自选权重，配置与所需 API 须匹配。模型从本地加载；`--help`、静态检查和普通 import 不加载模型或连接设备。
 
 默认 SAM2.1 small、BF16、eager。文本检测只用于首帧候选确认，进入跟踪后释放 Grounding DINO；多实例共享图像编码与位姿细化预处理。已有确认 mask 可直接开始传播。large 对照、参数及内存接口见[使用文档](docs/usage.md)。
 
@@ -23,4 +23,4 @@ python -m cordvip_geometry check --offline-input --headless
 
 实时相机命令会连接 RealSense；`--with-hand` 目前只支持只读 Raw。宿主接入时应复用已有 RGB-D、实测关节和时间证据。主包 runtime、采集、15 字段导出与部署尚未接入本工具。
 
-运行产物与模型放在 workspace 的 `reports/` 下，不写回 Raw。脚本入口显式传入 workspace，模块入口默认使用当前目录。
+运行产物与模型默认放在 workspace 的 `reports/` 下，也可显式指定其他输出位置。运行产物使用新目录，不覆盖输入文件或写回 Raw；模型下载可复用已有缓存目录。脚本入口显式传入 workspace，模块入口默认使用当前目录。
