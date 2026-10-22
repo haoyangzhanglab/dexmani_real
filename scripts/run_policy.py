@@ -87,8 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         default=20,
         help=(
-            "exit after N episodes (default: 20); press B for each episode or Q to exit early; "
-            "each truly begun episode counts once at its end, regardless of recording"
+            "exit after N episodes that entered RUNNING have ended (default: 20); "
+            "press B for each episode or Q to exit early; "
+            "failed/cancelled preparations do not count; independent of Raw recording"
         ),
     )
     parser.add_argument(
@@ -290,7 +291,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"策略：{args.experiment}")
     print(
-        f"评估：{args.num_episodes} 轮后退出 | 每轮预算 {args.max_running_s:g} s | 输入：{', '.join(info.observation_fields)}"
+        f"评估：{args.num_episodes} 轮正式运行结束后退出 | 每轮预算 {args.max_running_s:g} s | "
+        f"输入：{', '.join(info.observation_fields)}"
     )
     print(f"输出：{session_dir}" if session_dir else "输出：Raw 和评估摘要均关闭")
     try:

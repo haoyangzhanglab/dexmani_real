@@ -20,7 +20,7 @@ def validate_max_running_s(max_running_s: float | None) -> float | None:
 
 
 def validate_num_episodes(num_episodes: Any) -> int | None:
-    """None waits for operator exit; a limit counts begun episodes, not saves."""
+    """Count episodes that entered RUNNING once they end; None waits for operator exit."""
     if num_episodes is None:
         return None
     if type(num_episodes) is not int:

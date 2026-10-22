@@ -128,6 +128,7 @@ class PolicyRunner:
         self.next_step_ns = 0
         self.previous_arm = None
         self.completed = 0
+        self.recording_attempts = 0
         self.action_mapper = action_mapper
         fields = set(self.policy_info.observation_fields)
         requires_rgb = "rgb" in fields
@@ -277,7 +278,7 @@ class PolicyRunner:
         failure, raw = None, None
         try:
             if self.recorder is not None and self.recording_started:
-                saved, status = None, "empty"
+                saved = None
                 try:
                     saved = self.recorder.save_episode(
                         reason=reason,
@@ -418,13 +419,15 @@ class PolicyRunner:
                     hand=self.robot.hand,
                 )
                 self.recording_started = True
+                # Failed preparations can publish Raw without counting as completed runs.
+                self.recording_attempts += 1
                 self.recorder.start_episode(
                     task_label=self.policy_info.task_name,
                     arm_execution=self.robot.arm.execution_snapshot(),
                     arm_control_metadata=self.robot.arm.execution_metadata(
                         1 / self.recorder.control_hz
                     ),
-                    episode_name=f"episode_{self.completed + 1:03d}",
+                    episode_name=f"episode_{self.recording_attempts:03d}",
                     collection_source="policy_rollout",
                     metadata=metadata,
                 )
