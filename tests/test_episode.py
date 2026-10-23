@@ -1,7 +1,5 @@
 import tempfile
 import unittest
-from dataclasses import replace
-from pathlib import Path
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -310,6 +308,48 @@ class EpisodeTests(unittest.TestCase):
         self.assertTrue(session.runtime_state.quit_requested)
         self.assertFalse(session.model.future.done())
         self.assertIsNotNone(session.episode)
+
+    def test_session_loop_runs_two_attempts_with_unique_queries_and_captures(self):
+        recorder = FakeRecorder()
+        session = make_session(make_episode(self.clock, recorder=recorder))
+        session.num_episodes = 2
+        events = iter(([Key.BEGIN], [], [], [Key.STOP], [Key.BEGIN], [], [], [Key.STOP]))
+        def poll(timeout=0):
+            batch = next(events)
+            if Key.STOP in batch:
+                session.request_stop()
+            return batch
+        def advance_clock(delay):
+            self.clock.advance(.05)
+            if session.model.future is not None and not session.model.future.done():
+                session.model.complete(self.predictions() if session.model.operation == "predict" else None)
+        session.keyboard.poll = poll
+        with patch("dexmani_real.deployment.session.time.sleep", side_effect=advance_clock):
+            session.run_control_loop()
+        self.assertEqual(session.completed, 2)
+        self.assertEqual(len(session.robot.sent), 2)
+        self.assertEqual(len(recorder.finishes), 2)
+        contexts = [call[3] for call in session.model.calls if call[0] == "predict"]
+        self.assertEqual([context["query_id"] for context in contexts], [1, 2])
+        self.assertLess(contexts[0]["run_id"], contexts[1]["run_id"])
+        self.assertEqual([item["episode_name"] for item in recorder.starts], ["episode_001", "episode_002"])
+        self.assertIsNone(session.episode)
+
+    def test_quit_during_reset_finishes_without_waiting_or_granting_motion(self):
+        session = make_session(make_episode(self.clock))
+        events = iter(([Key.BEGIN], [Key.QUIT]))
+        def poll(timeout=0):
+            batch = next(events)
+            if Key.QUIT in batch:
+                session.request_quit()
+            return batch
+        session.keyboard.poll = poll
+        with patch("dexmani_real.deployment.session.time.sleep"):
+            session.run_control_loop()
+        self.assertEqual(session.completed, 0)
+        self.assertEqual(session.episode.termination.reason, "start_cancelled")
+        self.assertFalse(session.model.future.done())
+        self.assertEqual(session.robot.sent, [])
 
     def test_stop_failure_still_finalizes_with_unresolved_evidence(self):
         recorder = FakeRecorder()

@@ -588,22 +588,15 @@ class PolicyEpisode:
         cancelled = isinstance(failure, DispatchInterrupted)
         cause = failure.cause if isinstance(failure, DispatchError) else None
         if failure is not None or expired is not None or late or not self.has_motion_authority():
-            if cancelled:
-                self.runtime_state.request_emergency_stop()
             hardware_failure = (
                 not cancelled
                 and failure is not None
                 and (not failure.revoked or cause not in {"authority_revoked", "deadline_expired"})
             )
+            if hardware_failure or cancelled:
+                raise failure
             budget_timeout = expired is not None and budget_limit[0] < action_deadline_ns
-            if cancelled:
-                reason, detail = RunEndReason.ESTOP, "dispatch_cancelled"
-            elif hardware_failure:
-                reason, detail = (
-                    RunEndReason.HARDWARE_FAULT,
-                    f"dispatch_failed: {cause or str(failure)}",
-                )
-            elif budget_timeout:
+            if budget_timeout:
                 reason = RunEndReason.TIMEOUT
                 detail = (
                     f"dispatch_failed: {cause or str(failure)}"
@@ -618,19 +611,10 @@ class PolicyEpisode:
                     detail = "dispatch_return_deadline_expired"
                 else:
                     detail = "dispatch_authority_revoked"
-            errors = [error_detail("dispatch", failure)] if failure is not None else []
-            try:
-                self.finish(
-                    detail,
-                    run_end_reason=reason,
-                    errors=errors,
-                )
-            except Exception as exc:
-                if hardware_failure or cancelled:
-                    raise failure from exc
-                raise
-            if hardware_failure or cancelled:
-                raise failure
+            self.finish(
+                detail, run_end_reason=reason,
+                errors=[error_detail("dispatch", failure)] if failure is not None else [],
+            )
             return
         self.previous_arm = command.arm_qpos
         if self.hand_history is not None:
@@ -665,17 +649,28 @@ class PolicyEpisode:
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()
-            preparing = self.run_id is None and self.termination is None
+            if self.termination is not None:
+                raise
+            preparing = self.run_id is None
             cancelled = (
                 preparing and isinstance(exc, DispatchError)
                 and exc.revoked and exc.cause == "authority_revoked"
             )
+            stage = "preparation" if preparing else "control"
+            if preparing:
+                detail = str(exc)
+            elif isinstance(exc, DispatchInterrupted):
+                stage, detail = "dispatch", "dispatch_cancelled"
+            elif isinstance(exc, DispatchError):
+                stage, detail = "dispatch", f"dispatch_failed: {exc.cause or str(exc)}"
+            else:
+                detail = f"control_failed: {type(exc).__name__}: {exc}"
             try:
                 self.finish(
-                    str(exc) if preparing else f"control_failed: {type(exc).__name__}: {exc}",
+                    detail,
                     run_end_reason=failure_reason(exc),
-                    errors=[] if cancelled or isinstance(exc, KeyboardInterrupt)
-                    else [error_detail("preparation" if preparing else "control", exc)],
+                    errors=[] if cancelled or (preparing and isinstance(exc, KeyboardInterrupt))
+                    else [error_detail(stage, exc)],
                 )
             except BaseException:
                 if cancelled:

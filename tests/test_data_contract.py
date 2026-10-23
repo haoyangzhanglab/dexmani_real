@@ -14,7 +14,7 @@ from fakes import FakeClock, camera_metadata, execution_snapshot, observation
 from dexmani_real.data.canonical.export import CanonicalExporter
 from dexmani_real.data.canonical.schema import ProcessingConfig, canonical_array_specs
 from dexmani_real.data.raw.reader import EpisodeReader
-from dexmani_real.data.raw.schema import DATASET_SPECS, RAW_FORMAT, encode_raw_row
+from dexmani_real.data.raw.schema import RAW_FORMAT, encode_raw_row
 from dexmani_real.data.raw.writer import RawEpisodeWriter
 from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError
 from dexmani_real.robot.commands import DispatchResult, DispatchStatus, RobotCommand

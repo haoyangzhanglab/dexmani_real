@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.runtime.observation import ObservationNeeds
+from fakes import FakeClock, make_episode, make_session
 
 
 class AssemblyTests(unittest.TestCase):
@@ -98,3 +99,39 @@ class AssemblyTests(unittest.TestCase):
             session.run()
             replayer.return_value.run.assert_called_once()
             process_start.assert_not_called()
+
+
+class SessionShutdownTests(unittest.TestCase):
+    def test_recorder_close_failure_does_not_skip_devices_keyboard_or_model(self):
+        session = make_session(make_episode(FakeClock()))
+        session.recorder = Mock()
+        session.recorder.close.side_effect = RuntimeError("recorder close failure")
+        session.model = Mock()
+        session.model.close_result.return_value = {"status": "pending", "reason": "busy"}
+        session.results = Mock()
+        with patch("dexmani_real.deployment.session.shutdown_local_runtime", return_value=True) as shutdown:
+            self.assertEqual(session.close(clean=True, failure=None), 1)
+        session.model.close.assert_called_once()
+        session.recorder.close.assert_called_once()
+        shutdown.assert_called_once()
+        self.assertIs(shutdown.call_args.kwargs["keyboard"], session.keyboard)
+        self.assertEqual(session.results.finish_session.call_args.kwargs["model_close"]["status"], "pending")
+        self.assertFalse(session.results.finish_session.call_args.kwargs["shutdown_clean"])
+
+    def test_independent_runtime_resources_close_after_robot_failure(self):
+        from dexmani_real.runtime.processes import shutdown_local_runtime
+        from dexmani_real.runtime.state import RuntimeState
+        robot, keyboard, sensors = Mock(), Mock(), Mock()
+        robot.close.side_effect = RuntimeError("device close failed")
+        sensors.shutdown.return_value = True
+        self.assertFalse(shutdown_local_runtime(RuntimeState(), robot, sensors=sensors, keyboard=keyboard))
+        keyboard.stop.assert_called_once()
+        sensors.shutdown.assert_called_once()
+
+    def test_listener_loss_is_an_immediate_software_fence(self):
+        session = make_session(make_episode(FakeClock()))
+        epoch, _ = session.runtime_state.begin_motion()
+        session.keyboard.healthy = False
+        self.assertFalse(session.check_services())
+        self.assertTrue(session.runtime_state.estop_request)
+        self.assertFalse(session.runtime_state.command_may_cross_sdk(run_id=epoch))
