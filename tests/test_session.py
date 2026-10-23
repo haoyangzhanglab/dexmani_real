@@ -43,7 +43,7 @@ class AssemblyTests(unittest.TestCase):
                 session.results = None
                 session.warmup_policy = lambda: None
                 session.prepare_resources()
-                session.runner.keyboard = Mock(healthy=True)
+                session.keyboard = Mock(healthy=True, estop_latched=False)
                 session.start_devices()
                 self.assertEqual([call.kwargs["name"] for call in process_context.Process.call_args_list], expected)
                 self.assertEqual(doubles["DexManiRobot"].call_args.kwargs["required_tactile"], session.needs.required_tactile)

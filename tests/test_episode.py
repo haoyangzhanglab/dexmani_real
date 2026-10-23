@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from fakes import FakeClock, FakeRecorder, camera_metadata, make_runner, observation, start_runner
+from fakes import FakeClock, FakeRecorder, camera_metadata, make_runner, make_session, observation, start_runner
 from dexmani_real.data.recorder import RecordingError
 from dexmani_real.data.results import EpisodeResults
 from dexmani_real.deployment.schedule import ActionPlan
@@ -106,11 +106,26 @@ class EpisodeTests(unittest.TestCase):
         np.testing.assert_array_equal(prefix[0], np.concatenate((frozen.arm_qpos, frozen.hand_qpos)))
         self.assertEqual(runner.action_mapper.maps, 2)
 
+    def test_rtc_checkpoint_cancels_without_operator_reentry(self):
+        runner = make_runner(self.clock, mode="rtc")
+        start_runner(runner)
+        session = make_session(runner)
+        session.keyboard.signals = [Key.HOME, Key.BEGIN]
+        session.run_home = Mock(side_effect=AssertionError("HOME during prefix"))
+        runner.plan = ActionPlan(self.predictions(), 0, 2, self.clock.now + 1_000_000_000, {}, 1)
+        runner.robot.check = runner.runtime_state.request_stop
+        prefix, commands, issue = runner.prepare_prefix(observation(self.clock), 1)
+        self.assertEqual(issue.detail, "prefix_authority_revoked")
+        self.assertIsNone(prefix)
+        self.assertIsNone(commands)
+        session.run_home.assert_not_called()
+        self.assertEqual(session.keyboard.signals, [Key.HOME, Key.BEGIN])
+
     def test_cancelled_reset_cannot_start_next_run(self):
         runner = make_runner(self.clock)
         runner.request_start()
         runner.step()
-        runner.request_stop()
+        runner.runtime_state.request_stop()
         runner.step()
         self.assertIsNone(runner.run_id)
         runner.model.complete()
@@ -128,7 +143,7 @@ class EpisodeTests(unittest.TestCase):
         runner = make_runner(self.clock)
         start_runner(runner)
         old_query = runner.query
-        runner.request_stop()
+        runner.runtime_state.request_stop()
         runner.step()
         self.assertIs(runner.query, old_query)
         runner.request_start()
@@ -169,7 +184,7 @@ class EpisodeTests(unittest.TestCase):
         real_start = recorder.start_episode
         def cancelled_start(**kwargs):
             real_start(**kwargs)
-            runner.request_stop()
+            runner.runtime_state.request_stop()
         recorder.start_episode = cancelled_start
         start_runner(runner)
         self.assertEqual(len(recorder.frames), 0)
@@ -178,7 +193,7 @@ class EpisodeTests(unittest.TestCase):
         runner.step()
         recorder.start_episode = real_start
         start_runner(runner)
-        runner.request_stop()
+        runner.runtime_state.request_stop()
         runner.step()
         self.assertEqual(runner.completed, 1)
         self.assertEqual([item["episode_name"] for item in recorder.starts], ["episode_001", "episode_002"])
@@ -217,7 +232,7 @@ class EpisodeTests(unittest.TestCase):
         start_runner(runner)
         runner.robot.stop_required = True
         runner.robot.stop_error = RuntimeError("stop unresolved")
-        runner.request_stop()
+        runner.runtime_state.request_stop()
         with self.assertRaises(RuntimeError):
             runner.step()
         self.assertFalse(recorder.finishes[0]["arm_execution"]["robot_stopped"])
@@ -228,17 +243,19 @@ class EpisodeTests(unittest.TestCase):
             for batch in ([Key.BEGIN, Key.HOME, terminal], [terminal, Key.BEGIN, Key.HOME]):
                 with self.subTest(batch=batch):
                     runner = make_runner(self.clock)
-                    runner.run_home = Mock()
-                    runner.handle_command_batch(batch)
+                    session = make_session(runner)
+                    session.run_home = Mock()
+                    session.handle_command_batch(batch)
                     self.assertFalse(runner.start_requested)
-                    runner.run_home.assert_not_called()
+                    session.run_home.assert_not_called()
 
     def test_home_drains_stale_preparation_but_keeps_stop(self):
         runner = make_runner(self.clock)
+        session = make_session(runner)
         def home(*args, **kwargs):
-            runner.keyboard.signals.extend((Key.HOME, Key.BEGIN, Key.RESET_TACTILE, Key.STOP))
+            session.keyboard.signals.extend((Key.HOME, Key.BEGIN, Key.RESET_TACTILE, Key.STOP))
             return HomeResult(True)
-        with patch("dexmani_real.deployment.runner.home_robot", side_effect=home):
-            runner.handle_command_batch([Key.HOME, Key.BEGIN])
+        with patch("dexmani_real.deployment.session.home_robot", side_effect=home):
+            session.handle_command_batch([Key.HOME, Key.BEGIN])
         self.assertFalse(runner.start_requested)
-        self.assertEqual(runner.keyboard.signals, [Key.STOP])
+        self.assertEqual(session.keyboard.signals, [Key.STOP])

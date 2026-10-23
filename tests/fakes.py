@@ -221,12 +221,23 @@ def make_runner(clock, *, mode="sync", recorder=None, results=None):
         state, runtime, info, robot=robot,
         needs=ObservationNeeds.for_policy(info.observation_fields, record_raw=recorder is not None),
         sensors=SimpleNamespace(channels=None), action_mapper=FakeMapper(),
-        recorder=recorder, home_planner=None, model_runtime=model, kinematics=None,
+        recorder=recorder, model_runtime=model, kinematics=None,
         max_running_s=60, results=results,
     )
-    runner.keyboard = FakeKeyboard()
     runner.read_observation = lambda **kw: observation(clock, runtime, camera=recorder is not None)
     return runner
+
+
+def make_session(runner):
+    from dexmani_real.deployment.session import _PolicySession
+
+    session = _PolicySession(runner.runtime, runner.policy_info, needs=runner.needs)
+    session.runner = runner
+    session.runtime_state = runner.runtime_state
+    session.robot = runner.robot
+    session.keyboard = FakeKeyboard()
+    session.home_planner = None
+    return session
 
 
 def start_runner(runner):

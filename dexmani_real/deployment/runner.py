@@ -38,13 +38,11 @@ from dexmani_real.robot.commands import (
     DispatchStatus,
     RobotCommand,
 )
-from dexmani_real.robot.home import home_robot
 from dexmani_real.runtime.observation import (
     feedback_deadline_ns,
     read_observation,
     upstream_deadline_ns,
 )
-from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.state import RunEndReason, SafetyState
 
 logger = logging.getLogger(__name__)
@@ -62,7 +60,6 @@ class PolicyRunner:
         sensors,
         action_mapper,
         recorder=None,
-        home_planner,
         model_runtime,
         kinematics,
         max_running_s,
@@ -74,14 +71,7 @@ class PolicyRunner:
         self.results = results
         self.runtime_state = runtime_state
         self.robot = robot
-        self.home_planner = home_planner
-        self.home_results = []
         self.start_requested = False
-        self.keyboard = KeyboardInput(
-            estop_callback=runtime_state.request_emergency_stop,
-            stop_callback=self.request_stop,
-            quit_callback=self.request_quit,
-        )
         self.runtime = runtime
         self.policy_info = policy_info
         self.model = model_runtime
@@ -131,169 +121,6 @@ class PolicyRunner:
                 return False
             self.start_requested = True
             return True
-
-    def request_stop(self, *, reason=RunEndReason.OPERATOR) -> None:
-        """Fence motion even while the I/O owner is blocked in HOME, inference or SDK I/O."""
-        with self.runtime_state.motion_lock:
-            self.start_requested = False
-            self.runtime_state.request_stop(reason=reason)
-
-    def request_quit(self) -> None:
-        """Apply Q's motion fence before requesting session shutdown."""
-        with self.runtime_state.motion_lock:
-            self.start_requested = False
-            self.runtime_state.request_quit()
-
-    def poll_operator(self, *, allow_tactile_reset: bool = False) -> None:
-        if self.keyboard.estop_latched or not self.keyboard.healthy:
-            self.runtime_state.request_emergency_stop()
-            return
-        self.handle_command_batch(
-            self.keyboard.poll(timeout=0),
-            allow_tactile_reset=allow_tactile_reset,
-        )
-
-    def discard_pending_start(self):
-        self.keyboard.drain_signal(OperatorCommand.BEGIN)
-
-    def handle_command_batch(self, signals, *, allow_tactile_reset=False) -> None:
-        # HOME blocks; H/B/T from the same batch need a fresh request afterwards.
-        discard_preparation_in_batch = False
-        home_handled_in_batch = False
-        # S/Q suppress H/B/T throughout the batch; ESC uses the latch/callback.
-        stop_in_batch = any(
-            signal in {OperatorCommand.STOP, OperatorCommand.QUIT} for signal in signals
-        )
-        for signal in signals:
-            if signal is OperatorCommand.BEGIN:
-                if stop_in_batch:
-                    logger.warning("operator: ignored B received in the same batch as S/Q")
-                    continue
-                if discard_preparation_in_batch or not self.request_start():
-                    logger.warning(
-                        "operator: ignored B while stopped or after preparation in this batch"
-                    )
-                    continue
-            elif signal is OperatorCommand.STOP:
-                # Keyboard callbacks already revoked motion; a second revoke could cross a cleared stop request.
-                continue
-            elif signal is OperatorCommand.PAUSE:
-                logger.warning("operator: C is not used in policy deployment; ignored")
-            elif signal is OperatorCommand.DISCARD:
-                logger.warning("operator: D is not used in policy deployment; ignored")
-            elif signal is OperatorCommand.RESET_TACTILE:
-                if discard_preparation_in_batch:
-                    logger.warning("operator: ignored T after preparation in the same batch")
-                    continue
-                discard_preparation_in_batch = True
-                # B earlier in this batch may have created a pending start.
-                if stop_in_batch or self.start_requested or not allow_tactile_reset:
-                    logger.warning(
-                        "T ignored: tactile reset requires idle, no capture/reset/pending inference"
-                    )
-                    continue
-                if self.runtime_state.safety_state != SafetyState.ARMED:
-                    continue
-                try:
-                    logger.info(
-                        "正在请求触觉传感器复位，请保持手部无接触；S/Q/Esc 可中断后续请求。"
-                    )
-                    self.robot.reset_tactile_sensors(cancel_requested=self.home_abort_requested)
-                except CancelledError as exc:
-                    logger.info("%s", exc)
-                finally:
-                    for command in (
-                        OperatorCommand.RESET_TACTILE,
-                        OperatorCommand.HOME,
-                        OperatorCommand.BEGIN,
-                    ):
-                        self.keyboard.drain_signal(command)
-                return
-            elif signal is OperatorCommand.HOME:
-                if home_handled_in_batch:
-                    continue
-                if stop_in_batch:
-                    logger.warning("operator: ignored H received in the same batch as S/Q")
-                    continue
-                if self.run_home():
-                    home_handled_in_batch = True
-                    discard_preparation_in_batch = True
-            elif signal is OperatorCommand.QUIT:
-                # Listener stays available through final recording cleanup.
-                continue
-            elif signal is OperatorCommand.EMERGENCY_STOP:
-                self.runtime_state.request_emergency_stop()
-                return
-
-    def run_home(self) -> bool:
-        with self.runtime_state.motion_lock:
-            home_allowed = self.runtime_state.command_may_cross_sdk(
-                run_id=self.runtime_state.run_id,
-                required_safety_state=SafetyState.ARMED,
-            )
-            if home_allowed:
-                # Only the owner consumes S; HOME never clears a newer stop.
-                self.start_requested = False
-        if not home_allowed:
-            logger.warning("operator: ignored H unless ARMED without shutdown, fault or stop")
-            return False
-        home_result = {"outcome": "incomplete"}
-        self.home_results.append(home_result)
-        try:
-            logger.info("正在回初始位…")
-            result = home_robot(
-                self.runtime_state,
-                self.runtime,
-                self.home_planner,
-                robot=self.robot,
-                abort_requested=self.home_abort_requested,
-            )
-        except BaseException as exc:
-            home_result.update(outcome="fault", reason=f"{type(exc).__name__}: {exc}")
-            raise
-        with self.runtime_state.motion_lock:
-            completed_without_stop = result.ok and self.runtime_state.command_may_cross_sdk(
-                run_id=self.runtime_state.run_id,
-                required_safety_state=SafetyState.ARMED,
-            )
-        interrupted = bool(
-            result.interrupted
-            or (
-                result.ok
-                and (
-                    self.runtime_state.quit_requested
-                    or self.runtime_state.estop_request
-                    or self.runtime_state.stop_request
-                )
-            )
-        )
-        home_result.update(
-            outcome=(
-                "completed"
-                if completed_without_stop
-                else "interrupted" if interrupted else "failed"
-            ),
-            reason=result.reason,
-        )
-        if completed_without_stop:
-            logger.info("已回初始位，按 B 开始。")
-        else:
-            logger.warning("回初始位未完成，请检查当前姿态：%s", result.reason)
-        # Discard stale H/B/T after blocking HOME; preserve S/Q/ESC.
-        self.keyboard.drain_signal(OperatorCommand.RESET_TACTILE)
-        self.keyboard.drain_signal(OperatorCommand.HOME)
-        self.keyboard.drain_signal(OperatorCommand.BEGIN)
-        return True
-
-    def home_abort_requested(self) -> bool:
-        self.robot.check()
-        return bool(
-            not self.runtime_state.running
-            or self.runtime_state.quit_requested
-            or self.runtime_state.error_state
-            or self.runtime_state.estop_request
-            or self.runtime_state.stop_request
-        )
 
     def read_observation(self, *, wait_for_hand=False):
         self.observation_read_issues.clear()
@@ -354,7 +181,6 @@ class PolicyRunner:
                 prediction_index=self.slot_timing.get("prediction_index"),
             )
         self.runtime_state.revoke_motion(reason=run_end_reason, expected_run_id=epoch)
-        self.discard_pending_start()
         with self.runtime_state.motion_lock:
             self.start_requested = False
             stopped_epoch = self.runtime_state.run_id
@@ -775,7 +601,7 @@ class PolicyRunner:
         prefix, slots = rtc_prefix_request(self.plan, slot, self.execution.prefetch_steps)
         commands, previous = {}, self.previous_arm
         for index, command_slot in enumerate(slots):
-            self.poll_operator()
+            self.robot.check()
             if not self.has_motion_authority():
                 return None, None, ControlRejection("prefix_authority_revoked")
             expired = self.expired_budget()
@@ -1085,73 +911,3 @@ class PolicyRunner:
             except Exception:
                 logger.exception("control failure cleanup also failed")
             raise
-
-    def run(self):
-        failure = None
-        reason = RunEndReason.RUNTIME_SHUTDOWN
-        try:
-            while self.runtime_state.running and not self.runtime_state.quit_requested:
-                self.robot.arm.check_error()
-                self.poll_operator(
-                    allow_tactile_reset=(
-                        self.run_id is None
-                        and self.preparing_epoch is None
-                        and self.model.future is None
-                        and (self.recorder is None or not self.recorder.is_recording)
-                    )
-                )
-                if self.runtime_state.estop_request or self.runtime_state.error_state:
-                    break
-                if self.run_id is None:
-                    self.robot.service_idle()
-                self.step()
-                time.sleep(0.001 if self.run_id is not None else 0.005)
-        except KeyboardInterrupt as exc:
-            self.runtime_state.request_emergency_stop()
-            failure = exc
-            reason = RunEndReason.ESTOP
-        except Exception as exc:
-            failure = exc
-            if isinstance(exc, RecordingError):
-                reason = RunEndReason.RECORDING_FAILURE
-            elif isinstance(exc, DispatchError):
-                reason = RunEndReason.HARDWARE_FAULT
-            else:
-                reason = RunEndReason.POLICY_FAILURE
-            self.runtime_state.mark_error()
-            self.sensors.request_shutdown(reason=reason)
-        finally:
-            try:
-                self.finish_episode(str(failure) if failure else "shutdown", run_end_reason=reason)
-            except Exception as exc:
-                failure = failure or exc
-                logger.exception("episode cleanup failed")
-            try:
-                if self.robot.stop_required:
-                    self.robot.stop()
-            except Exception as exc:
-                failure = failure or exc
-                logger.exception(
-                    "policy shutdown stop failed before remaining artifact finalization"
-                )
-            try:
-                if self.capture_attempted or (
-                    self.results is not None and self.results.current is not None
-                ):
-                    cancelled = isinstance(failure, KeyboardInterrupt) or (
-                        failure is None and (
-                            self.runtime_state.stop_request
-                            or self.runtime_state.quit_requested
-                            or self.runtime_state.estop_request
-                        )
-                    )
-                    preparation_reason = "start_cancelled" if cancelled else "preparation_failed"
-                    detail = str(failure) if failure else "shutdown"
-                    errors = [error_detail("preparation", failure)] if failure else []
-                    self.finalize_outputs(
-                        preparation_reason, detail, errors=errors,
-                    )
-            except Exception as exc:
-                failure = failure or exc
-        if failure is not None:
-            raise failure
