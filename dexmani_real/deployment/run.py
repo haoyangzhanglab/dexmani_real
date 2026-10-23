@@ -13,7 +13,7 @@ from dexmani_real.deployment.preflight import (
     validate_max_running_s,
     validate_num_episodes,
 )
-from dexmani_real.deployment.session import _PolicySession
+from dexmani_real.deployment.session import PolicySession
 from dexmani_real.runtime.observation import ObservationNeeds
 
 
@@ -125,7 +125,7 @@ def run_policy(
         f"每轮预算 {duration} | 输入：{', '.join(info.observation_fields)}"
     )
     print(f"输出：{session_dir}" if session_dir else "输出：Raw 和评估摘要均关闭")
-    return _PolicySession(
+    return PolicySession(
         runtime,
         info,
         needs=needs,

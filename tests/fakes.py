@@ -3,6 +3,7 @@
 from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
+from itertools import count
 from types import SimpleNamespace
 
 import numpy as np
@@ -204,8 +205,8 @@ class FakeMapper:
         return np.concatenate((command.arm_qpos, command.hand_qpos))
 
 
-def make_runner(clock, *, mode="sync", recorder=None, results=None):
-    from dexmani_real.deployment.runner import PolicyRunner
+def make_episode(clock, *, mode="sync", recorder=None, results=None):
+    from dexmani_real.deployment.episode import PolicyEpisode
 
     runtime = ExperimentConfig()
     runtime = replace(runtime, execution=replace(
@@ -217,31 +218,38 @@ def make_runner(clock, *, mode="sync", recorder=None, results=None):
     state = RuntimeState()
     state.arm()
     model, robot = FakeModel(clock), FakeRobot(clock, runtime)
-    runner = PolicyRunner(
-        state, runtime, info, robot=robot,
+    episode = PolicyEpisode(
+        state, runtime, info, preparing_epoch=state.run_id, robot=robot,
+        query_ids=count(1), capture_ids=count(1),
         needs=ObservationNeeds.for_policy(info.observation_fields, record_raw=recorder is not None),
         sensors=SimpleNamespace(channels=None), action_mapper=FakeMapper(),
         recorder=recorder, model_runtime=model, kinematics=None,
         max_running_s=60, results=results,
     )
-    runner.read_observation = lambda **kw: observation(clock, runtime, camera=recorder is not None)
-    return runner
+    episode.read_observation = lambda **kw: observation(clock, runtime, camera=recorder is not None)
+    return episode
 
 
-def make_session(runner):
-    from dexmani_real.deployment.session import _PolicySession
+def make_session(episode):
+    from dexmani_real.deployment.session import PolicySession
 
-    session = _PolicySession(runner.runtime, runner.policy_info, needs=runner.needs)
-    session.runner = runner
-    session.runtime_state = runner.runtime_state
-    session.robot = runner.robot
+    session = PolicySession(episode.runtime, episode.policy_info, needs=episode.needs)
+    for name in ("runtime_state", "robot", "model", "sensors", "action_mapper", "kinematics",
+                 "recorder", "results", "camera_calibration", "camera_parameters"):
+        setattr(session, name, getattr(episode, name))
     session.keyboard = FakeKeyboard()
     session.home_planner = None
     return session
 
 
-def start_runner(runner):
-    runner.request_start()
-    runner.step()
-    runner.model.complete()
-    runner.step()
+def start_episode(episode):
+    episode.step()
+    episode.model.complete()
+    episode.step()
+
+
+def start_session_episode(session):
+    session.request_start()
+    session.advance_episode()
+    session.model.complete()
+    session.advance_episode()

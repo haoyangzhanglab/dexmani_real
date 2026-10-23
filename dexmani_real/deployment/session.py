@@ -1,25 +1,27 @@
 """Own deployment resources, operator input and the multi-round experiment session."""
 
+import json
 import logging
 import multiprocessing as mp
 import time
 from concurrent.futures import CancelledError
+from itertools import count
 
 from dexmani_real.calibration.camera.extrinsics import (
     CameraExtrinsics,
     load_optional_camera_extrinsics,
 )
-from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError
+from dexmani_real.data.recorder import AsyncEpisodeRecorder
 from dexmani_real.data.results import EpisodeResults, error_detail
-from dexmani_real.deployment.observation import (
-    build_observation_camera,
-    build_observation_kinematics,
-)
-from dexmani_real.deployment.runner import PolicyRunner
+from dexmani_real.deployment.observation import ObservationKinematics
+from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+from dexmani_real.planning.kinematics.hand_fk import HandKinematics
+from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
+from dexmani_real.sensor.camera.geometry import CameraIntrinsics, camera_parameters_cv
+from dexmani_real.deployment.episode import PolicyEpisode, failure_reason
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
 from dexmani_real.robot.home import build_home_planner, home_robot
-from dexmani_real.robot.commands import DispatchError
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
@@ -29,6 +31,47 @@ from dexmani_real.sensor.pointcloud.worker import PointCloudWorkerConfig, run_po
 from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger(__name__)
+
+
+def build_observation_kinematics(policy_info, runtime):
+    """Build requested FK resources; EEF and fingertips share measured joint history."""
+    requested = set(policy_info.observation_fields)
+    needs_hand_fk = "fingertip_xyz" in requested
+    if not needs_hand_fk and "eef_pose" not in requested:
+        return None
+    if not needs_hand_fk:
+        return ObservationKinematics(make_arm_fk())
+    hand_fk = HandKinematics(
+        str(XHAND_RIGHT_URDF_PATH),
+        policy_info.fingertip_link_names,
+    )
+    return ObservationKinematics(make_arm_fk(), hand_fk, runtime.hand)
+
+
+def build_observation_camera(sensors, camera_config, fields, calibration):
+    """Snapshot requested K/E once after the fixed camera worker becomes ready."""
+    requested = set(fields) & {"camera_intrinsic", "camera_extrinsic"}
+    if not requested:
+        return {}
+    if sensors is None or not sensors.camera_ready.is_set():
+        raise ValueError("Policy camera parameters require a ready camera")
+    serial = sensors.camera_serial.value.decode("utf-8").strip()
+    if not serial or (camera_config.serial is not None and serial != camera_config.serial):
+        raise ValueError(
+            "Policy camera parameters require the active camera serial to match configuration"
+        )
+    color = CameraIntrinsics(**json.loads(sensors.camera_intrinsics.value.decode("utf-8")))
+    if (color.height, color.width) != (camera_config.height, camera_config.width):
+        raise ValueError("Policy color intrinsics do not match the configured RGB resolution")
+    if sensors.camera_ring.dtype["rgb"].shape != (color.height, color.width, 3):
+        raise ValueError("Policy color intrinsics do not match the camera RGB payload")
+    transform = None
+    if "camera_extrinsic" in requested:
+        if calibration is None:
+            raise ValueError("camera_extrinsic requires current camera calibration")
+        transform = calibration.for_serial(serial)
+    parameters = camera_parameters_cv(color, transform)
+    return {name: parameters[name] for name in requested}
 
 
 def load_configured_policy(info, execution_config, *, device, seed):
@@ -48,7 +91,7 @@ def load_configured_policy(info, execution_config, *, device, seed):
         raise
 
 
-class _PolicySession:
+class PolicySession:
     """Own deployment resources while the inference worker serializes model work."""
 
     def __init__(
@@ -77,6 +120,10 @@ class _PolicySession:
         self.needs = needs
         self.keyboard = None
         self.home_results = []
+        self.episode = None
+        self.start_epoch = None
+        self.completed = 0
+        self.query_ids, self.capture_ids = count(1), count(1)
 
     def run(self):
         """Run a session with independently optional Raw recording and evaluation summaries."""
@@ -91,7 +138,7 @@ class _PolicySession:
             EpisodeResults(self.results_dir, "policy") if self.results_dir is not None else None
         )
         self.runtime_state = self.sensors = self.robot = None
-        self.model = self.runner = self.recorder = None
+        self.model = self.recorder = None
         failure = None
         clean = False
         try:
@@ -185,8 +232,8 @@ class _PolicySession:
             self.runtime.execution.rtc_guidance_cap,
             self.recording_dir is not None,
         )
-        kinematics = build_observation_kinematics(self.info, self.runtime)
-        action_mapper = ActionMapper.for_mode(self.runtime, self.info.action_mode)
+        self.kinematics = build_observation_kinematics(self.info, self.runtime)
+        self.action_mapper = ActionMapper.for_mode(self.runtime, self.info.action_mode)
         self.home_planner = build_home_planner(self.runtime)
         self.recorder = (
             AsyncEpisodeRecorder(
@@ -195,23 +242,6 @@ class _PolicySession:
             )
             if self.recording_dir is not None
             else None
-        )
-
-        self.runner = PolicyRunner(
-            self.runtime_state,
-            self.runtime,
-            self.info,
-            robot=self.robot,
-            action_mapper=action_mapper,
-            needs=self.needs,
-            sensors=self.sensors,
-            recorder=self.recorder,
-            model_runtime=self.model,
-            kinematics=kinematics,
-            max_running_s=self.max_running_s,
-            num_episodes=self.num_episodes,
-            camera_calibration=self.camera_calibration,
-            results=self.results,
         )
 
         self.keyboard = KeyboardInput(
@@ -252,7 +282,7 @@ class _PolicySession:
                 timeout_s=self.runtime.safety.pointcloud_ready_timeout_s,
                 check_services=lambda: self.keyboard.healthy,
             )
-        self.runner.camera_parameters = build_observation_camera(
+        self.camera_parameters = build_observation_camera(
             self.sensors.channels,
             self.runtime.camera,
             self.info.observation_fields,
@@ -280,6 +310,9 @@ class _PolicySession:
         if self.model is not None:
             try:
                 self.model.close()
+                # close() owns late task reclamation, including the immutable query identity.
+                if self.episode is not None and self.episode.termination is not None:
+                    self.episode = None
             except Exception as exc:
                 cleanup_errors.append(error_detail("model_close_submit", exc))
         try:
@@ -362,20 +395,17 @@ class _PolicySession:
             raise completion[1].error
         logger.debug("Model warmup durations: %s", completion[1].value)
 
-
     def request_stop(self, *, reason=RunEndReason.OPERATOR) -> None:
         """Fence motion even while the I/O owner is blocked in HOME, inference or SDK I/O."""
         with self.runtime_state.motion_lock:
-            self.runner.start_requested = False
+            self.start_epoch = None
             self.runtime_state.request_stop(reason=reason)
-
 
     def request_quit(self) -> None:
         """Apply Q's motion fence before requesting session shutdown."""
         with self.runtime_state.motion_lock:
-            self.runner.start_requested = False
+            self.start_epoch = None
             self.runtime_state.request_quit()
-
 
     def poll_operator(self, *, allow_tactile_reset: bool = False) -> None:
         if self.keyboard.estop_latched or not self.keyboard.healthy:
@@ -385,7 +415,6 @@ class _PolicySession:
             self.keyboard.poll(timeout=0),
             allow_tactile_reset=allow_tactile_reset,
         )
-
 
     def handle_command_batch(self, signals, *, allow_tactile_reset=False) -> None:
         # HOME blocks; H/B/T from the same batch need a fresh request afterwards.
@@ -400,7 +429,7 @@ class _PolicySession:
                 if stop_in_batch:
                     logger.warning("operator: ignored B received in the same batch as S/Q")
                     continue
-                if discard_preparation_in_batch or not self.runner.request_start():
+                if discard_preparation_in_batch or not self.request_start():
                     logger.warning(
                         "operator: ignored B while stopped or after preparation in this batch"
                     )
@@ -418,7 +447,7 @@ class _PolicySession:
                     continue
                 discard_preparation_in_batch = True
                 # B earlier in this batch may have created a pending start.
-                if stop_in_batch or self.runner.start_requested or not allow_tactile_reset:
+                if stop_in_batch or self.start_epoch is not None or not allow_tactile_reset:
                     logger.warning(
                         "T ignored: tactile reset requires idle, no capture/reset/pending inference"
                     )
@@ -456,7 +485,6 @@ class _PolicySession:
                 self.runtime_state.request_emergency_stop()
                 return
 
-
     def run_home(self) -> bool:
         with self.runtime_state.motion_lock:
             home_allowed = self.runtime_state.command_may_cross_sdk(
@@ -465,7 +493,7 @@ class _PolicySession:
             )
             if home_allowed:
                 # Only the owner consumes S; HOME never clears a newer stop.
-                self.runner.start_requested = False
+                self.start_epoch = None
         if not home_allowed:
             logger.warning("operator: ignored H unless ARMED without shutdown, fault or stop")
             return False
@@ -517,7 +545,6 @@ class _PolicySession:
         self.keyboard.drain_signal(OperatorCommand.BEGIN)
         return True
 
-
     def home_abort_requested(self) -> bool:
         self.robot.check()
         return bool(
@@ -528,6 +555,64 @@ class _PolicySession:
             or self.runtime_state.stop_request
         )
 
+    def request_start(self):
+        with self.runtime_state.motion_lock:
+            if self.episode is not None or self.model.future is not None:
+                return False
+            epoch = self.runtime_state.run_id
+            if not self.runtime_state.command_may_cross_sdk(
+                run_id=epoch, required_safety_state=SafetyState.ARMED,
+            ):
+                return False
+            self.start_epoch = epoch
+            return True
+
+    def advance_episode(self, *, shutdown=False, failure=None, reason=RunEndReason.RUNTIME_SHUTDOWN):
+        if self.episode is None:
+            epoch, self.start_epoch = self.start_epoch, None
+            if shutdown or epoch is None:
+                return
+            if not self.runtime_state.command_may_cross_sdk(
+                run_id=epoch, required_safety_state=SafetyState.ARMED,
+            ):
+                return
+            self.episode = PolicyEpisode(
+                self.runtime_state, self.runtime, self.info, preparing_epoch=epoch,
+                robot=self.robot, sensors=self.sensors, needs=self.needs,
+                action_mapper=self.action_mapper, model_runtime=self.model,
+                kinematics=self.kinematics, max_running_s=self.max_running_s,
+                query_ids=self.query_ids, capture_ids=self.capture_ids,
+                recorder=self.recorder, results=self.results,
+                camera_calibration=self.camera_calibration, camera_parameters=self.camera_parameters,
+            )
+        episode = self.episode
+        before = episode.termination
+        try:
+            if shutdown:
+                episode.finish(
+                    str(failure) if failure else "shutdown", run_end_reason=reason,
+                    errors=[error_detail("session", failure)]
+                    if failure is not None and not isinstance(failure, KeyboardInterrupt) else [],
+                )
+            else:
+                episode.step()
+        finally:
+            ended = episode.termination
+            if before is None and ended is not None:
+                self.start_epoch = None
+                self.keyboard.drain_signal(OperatorCommand.BEGIN)
+                if ended.run_id is not None:
+                    self.completed += 1
+                    logger.info("第 %d 轮结束：%s（%s，%.1f s）。",
+                                self.completed, ended.reason, ended.detail, ended.duration_s)
+                    if self.num_episodes is not None and self.completed >= self.num_episodes:
+                        self.runtime_state.request_quit()
+                        print(f"已达到 {self.num_episodes} 轮上限，正在退出。", flush=True)
+                    elif self.runtime_state.requests_allow_motion():
+                        print("等待下一轮：整理场景后 H 回初始位 → B 开始；Q 退出。", flush=True)
+            # A finished attempt still owns reset/predict identity until poll() reclaims it.
+            if ended is not None and self.model.future is None:
+                self.episode = None
 
     def run_control_loop(self):
         failure = None
@@ -537,69 +622,33 @@ class _PolicySession:
                 self.robot.arm.check_error()
                 self.poll_operator(
                     allow_tactile_reset=(
-                        self.runner.run_id is None
-                        and self.runner.preparing_epoch is None
-                        and self.model.future is None
+                        self.episode is None and self.model.future is None
                         and (self.recorder is None or not self.recorder.is_recording)
                     )
                 )
                 if self.runtime_state.estop_request or self.runtime_state.error_state:
                     break
-                if self.runner.run_id is None:
+                if self.episode is None or self.episode.run_id is None:
                     self.robot.service_idle()
-                epoch = self.runner.run_id
-                try:
-                    self.runner.step()
-                finally:
-                    if epoch is not None and self.runner.run_id is None:
-                        self.keyboard.drain_signal(OperatorCommand.BEGIN)
-                time.sleep(0.001 if self.runner.run_id is not None else 0.005)
+                    if not self.robot.stop_required and (
+                        self.episode is None or self.episode.termination is not None
+                    ):
+                        self.runtime_state.acknowledge_stop(self.runtime_state.run_id)
+                self.advance_episode()
+                running = self.episode is not None and self.episode.run_id is not None
+                time.sleep(0.001 if running else 0.005)
         except KeyboardInterrupt as exc:
             self.runtime_state.request_emergency_stop()
-            failure = exc
-            reason = RunEndReason.ESTOP
+            failure, reason = exc, RunEndReason.ESTOP
         except Exception as exc:
-            failure = exc
-            if isinstance(exc, RecordingError):
-                reason = RunEndReason.RECORDING_FAILURE
-            elif isinstance(exc, DispatchError):
-                reason = RunEndReason.HARDWARE_FAULT
-            else:
-                reason = RunEndReason.POLICY_FAILURE
+            failure, reason = exc, failure_reason(exc)
             self.runtime_state.mark_error()
             self.sensors.request_shutdown(reason=reason)
         finally:
             try:
-                self.runner.finish_episode(str(failure) if failure else "shutdown", run_end_reason=reason)
-            except Exception as exc:
+                self.advance_episode(shutdown=True, failure=failure, reason=reason)
+            except BaseException as exc:
                 failure = failure or exc
                 logger.exception("episode cleanup failed")
-            try:
-                if self.robot.stop_required:
-                    self.robot.stop()
-            except Exception as exc:
-                failure = failure or exc
-                logger.exception(
-                    "policy shutdown stop failed before remaining artifact finalization"
-                )
-            try:
-                if self.runner.capture_attempted or (
-                    self.results is not None and self.results.current is not None
-                ):
-                    cancelled = isinstance(failure, KeyboardInterrupt) or (
-                        failure is None and (
-                            self.runtime_state.stop_request
-                            or self.runtime_state.quit_requested
-                            or self.runtime_state.estop_request
-                        )
-                    )
-                    preparation_reason = "start_cancelled" if cancelled else "preparation_failed"
-                    detail = str(failure) if failure else "shutdown"
-                    errors = [error_detail("preparation", failure)] if failure else []
-                    self.runner.finalize_outputs(
-                        preparation_reason, detail, errors=errors,
-                    )
-            except Exception as exc:
-                failure = failure or exc
         if failure is not None:
             raise failure

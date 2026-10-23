@@ -12,7 +12,7 @@ from dexmani_real.runtime.observation import ObservationNeeds
 
 class AssemblyTests(unittest.TestCase):
     def test_policy_starts_only_requested_sensor_workers(self):
-        from dexmani_real.deployment.session import _PolicySession
+        from dexmani_real.deployment.session import PolicySession
 
         for fields, raw, expected in (
             (("joint_state",), False, []),
@@ -36,7 +36,7 @@ class AssemblyTests(unittest.TestCase):
                 stack.enter_context(patch("dexmani_real.deployment.session.mp.get_context", return_value=process_context))
                 info = SimpleNamespace(observation_fields=fields, n_obs_steps=1, hand_history_steps=None,
                                        control_dt_s=.05, horizon=8, action_mode="joint")
-                session = _PolicySession(ExperimentConfig(), info,
+                session = PolicySession(ExperimentConfig(), info,
                                          needs=ObservationNeeds.for_policy(fields, record_raw=raw),
                                          recording_dir=Path("/tmp/fake-recording") if raw else None)
                 session.runtime_state = session.sensors = session.robot = None

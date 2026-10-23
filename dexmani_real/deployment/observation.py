@@ -1,21 +1,16 @@
 """Project real control-row history into the requested Policy observation mapping."""
 
-import json
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 
 from dexmani_real.planning.kinematics.arm_fk import (
     ArmFK,
     compute_eef_pose_history_xarm_base,
-    make_arm_fk,
 )
 from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
-from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.xhand.config import HandParams
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics, camera_parameters_cv
 
 
 @dataclass(frozen=True)
@@ -23,47 +18,6 @@ class ObservationKinematics:
     arm_fk: ArmFK
     hand_fk: HandKinematics | None = None
     mount: HandParams | None = None
-
-
-def build_observation_kinematics(policy_info: Any, runtime: Any):
-    """Build requested FK resources; EEF and fingertips share measured joint history."""
-    requested = set(policy_info.observation_fields)
-    needs_hand_fk = "fingertip_xyz" in requested
-    if not needs_hand_fk and "eef_pose" not in requested:
-        return None
-    if not needs_hand_fk:
-        return ObservationKinematics(make_arm_fk())
-    hand_fk = HandKinematics(
-        str(XHAND_RIGHT_URDF_PATH),
-        policy_info.fingertip_link_names,
-    )
-    return ObservationKinematics(make_arm_fk(), hand_fk, runtime.hand)
-
-
-def build_observation_camera(sensors, camera_config, fields, calibration):
-    """Snapshot requested K/E once after the fixed camera worker becomes ready."""
-    requested = set(fields) & {"camera_intrinsic", "camera_extrinsic"}
-    if not requested:
-        return {}
-    if sensors is None or not sensors.camera_ready.is_set():
-        raise ValueError("Policy camera parameters require a ready camera")
-    serial = sensors.camera_serial.value.decode("utf-8").strip()
-    if not serial or (camera_config.serial is not None and serial != camera_config.serial):
-        raise ValueError(
-            "Policy camera parameters require the active camera serial to match configuration"
-        )
-    color = CameraIntrinsics(**json.loads(sensors.camera_intrinsics.value.decode("utf-8")))
-    if (color.height, color.width) != (camera_config.height, camera_config.width):
-        raise ValueError("Policy color intrinsics do not match the configured RGB resolution")
-    if sensors.camera_ring.dtype["rgb"].shape != (color.height, color.width, 3):
-        raise ValueError("Policy color intrinsics do not match the camera RGB payload")
-    transform = None
-    if "camera_extrinsic" in requested:
-        if calibration is None:
-            raise ValueError("camera_extrinsic requires current camera calibration")
-        transform = calibration.for_serial(serial)
-    parameters = camera_parameters_cv(color, transform)
-    return {name: parameters[name] for name in requested}
 
 
 def policy_observation_issue(row, fields):
