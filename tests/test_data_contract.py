@@ -11,7 +11,7 @@ import numpy as np
 import zarr
 from scipy.spatial.transform import Rotation
 
-from fakes import FakeClock, camera_metadata, execution_snapshot, observation
+from fakes import FakeClock, camera_metadata, execution_snapshot, file_contents, observation
 from dexmani_real.data.canonical.export import CanonicalExporter
 from dexmani_real.data.canonical.schema import ProcessingConfig, canonical_array_specs
 from dexmani_real.data.raw.reader import EpisodeReader
@@ -25,14 +25,6 @@ from dexmani_real.robot.model import (
     XHAND_SDK_JOINT_NAMES,
 )
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig, SAMPLING_METHOD
-
-
-def file_contents(root):
-    return {
-        path.relative_to(root): path.read_bytes()
-        for path in root.rglob("*")
-        if path.is_file()
-    }
 
 
 class DataContractTests(unittest.TestCase):

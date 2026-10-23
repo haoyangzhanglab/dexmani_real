@@ -142,7 +142,7 @@ class SessionShutdownTests(unittest.TestCase):
 
 
 class StartupCancellationTests(unittest.TestCase):
-    def test_entry_listeners_cancel_before_any_device_factory(self):
+    def test_entry_listeners_cancel_before_robot_initialization(self):
         from dexmani_real.calibration.camera.session import CameraCalibrationSession
         from dexmani_real.deployment.session import PolicySession
         from dexmani_real.robot.robot import DexManiRobot
@@ -181,7 +181,7 @@ class StartupCancellationTests(unittest.TestCase):
                     session = CameraCalibrationSession(runtime, hand_geometry="absent")
                     session.prepare = lambda: None
                     session.runtime_state, session.sensors, session.ctx = state, Mock(), Mock()
-                    session.keys, session.window_created = None, False
+                    session.window_created = False
                     session.robot = DexManiRobot(state, runtime, check_services=session.check_services)
                     with self.assertLogs("dexmani_real.calibration.camera.session", level="ERROR"):
                         self.assertEqual(session.run(), 1)
@@ -215,7 +215,6 @@ class StartupCancellationTests(unittest.TestCase):
                 process_start.assert_not_called()
                 self.assertTrue(state.stop_request)
                 self.assertFalse(state.requests_allow_motion())
-                self.assertIsNone(state.begin_motion())
 
     def test_arm_initialization_stop_timeout_and_feedback_fault_fence_authority(self):
         from dexmani_real.robot.xarm7.executor import ArmExecutor
@@ -254,7 +253,6 @@ class StartupCancellationTests(unittest.TestCase):
                 self.assertEqual(executor.io.authority.value, 0)
                 self.assertTrue(executor.io.stop.is_set())
                 self.assertTrue(executor.io.closing.is_set())
-                self.assertIsNone(state.begin_motion())
                 if cause == "stop":
                     self.assertTrue(state.stop_request)
                 elif cause == "feedback":

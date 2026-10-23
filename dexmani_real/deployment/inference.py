@@ -86,13 +86,13 @@ class InferenceWorker:
             # A failed retired task must not prevent the model's own cleanup attempt.
             return self.run_operation("close", (), {}), retired
 
-        # Queue cleanup behind load/predict while the executor still accepts work.
+        # Cleanup follows the current model task on the same worker thread.
         self.close_future = self.executor.submit(close_model)
         self.executor.shutdown(wait=False, cancel_futures=False)
         return self.close_future
 
     def close_result(self, timeout_s=0.0):
-        """Wait for model close; timeout leaves cleanup pending and does not bound process exit."""
+        """Report close and retired-task failures; timeout leaves cleanup pending."""
         if self.close_future is None:
             return dict(status="pending", reason="close_not_requested")
         try:

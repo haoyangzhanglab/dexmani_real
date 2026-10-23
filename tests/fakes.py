@@ -2,8 +2,8 @@
 
 from concurrent.futures import Future
 from dataclasses import replace
-from pathlib import Path
 from itertools import count
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,6 +14,14 @@ from dexmani_real.robot.commands import DispatchResult, DispatchStatus
 from dexmani_real.robot.feedback import ARM_STATE_DTYPE, HAND_STATE_DTYPE
 from dexmani_real.runtime.observation import ObservationNeeds, ObservationRow
 from dexmani_real.runtime.state import RuntimeState
+
+
+def file_contents(root):
+    return {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
 class FakeClock:

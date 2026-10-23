@@ -1,14 +1,24 @@
-from concurrent.futures import CancelledError
-from copy import deepcopy
 import tempfile
 import unittest
+from concurrent.futures import CancelledError
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
 
-from fakes import FakeClock, FakeRecorder, camera_metadata, make_episode, make_session, observation, start_episode, start_session_episode
+from fakes import (
+    FakeClock,
+    FakeRecorder,
+    camera_metadata,
+    file_contents,
+    make_episode,
+    make_session,
+    observation,
+    start_episode,
+    start_session_episode,
+)
 from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError
 from dexmani_real.data.results import EpisodeResults
 from dexmani_real.deployment.schedule import ActionPlan
@@ -195,8 +205,7 @@ class EpisodeTests(unittest.TestCase):
                     expected = "operator" if operation == "predict" else "start_cancelled"
                     self.assertEqual(ended.reason, expected)
                     episodes = deepcopy(results.session["episodes"])
-                    before = {path.relative_to(root): path.read_bytes()
-                              for path in (root / "raw").rglob("*") if path.is_file()}
+                    before = file_contents(root / "raw")
                     error = error_type("retired model failed")
                     session.model.complete(error=error)
                     with self.assertRaisesRegex(RuntimeError, "retired model") as caught:
@@ -220,8 +229,7 @@ class EpisodeTests(unittest.TestCase):
                     self.assertEqual(detail["query_context"], context)
                     self.assertEqual(detail["exception_type"], error_type.__name__)
                     self.assertEqual(detail["message"], str(error))
-                    self.assertEqual({path.relative_to(root): path.read_bytes()
-                                      for path in (root / "raw").rglob("*") if path.is_file()}, before)
+                    self.assertEqual(file_contents(root / "raw"), before)
                     if operation == "predict":
                         self.assertEqual(len(before), 2)
                         self.assertEqual(session.runtime_state.run_ended_reason, RunEndReason.OPERATOR)

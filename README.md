@@ -144,7 +144,7 @@ python scripts/run_policy.py policy/task/experiment --config local.yaml --execut
 
 CLI 与 Python 调用共用 [run_policy](dexmani_real/deployment/run.py) 入口，先完成输入与调度参数预检，再保存配置和准备资源。加载后的 Policy 在连接设备前检查模型是否支持所选模式。修改交接、预取和时隙计算时，从无设备 I/O 的 [schedule.py](dexmani_real/deployment/schedule.py) 开始；动作转换与目标准入位于 [planning/action.py](dexmani_real/planning/action.py)。
 
-[会话流程](dexmani_real/deployment/session.py)负责设备、操作员输入和多轮实验；[单轮流程](dexmani_real/deployment/episode.py)负责准备、推理调度、执行和当前 capture 的结束。停止立即撤销软件运动授权；旧模型任务完成并回收后，才接受下一轮开始。
+[会话流程](dexmani_real/deployment/session.py)负责设备、操作员输入和多轮实验；[单轮流程](dexmani_real/deployment/episode.py)负责准备、推理调度、执行和当前 capture 的结束。停止立即撤销软件运动授权，取消中的模型准备无需等待 reset 返回即可结束。旧模型任务成功完成并回收后，才接受下一轮开始；迟到模型异常会结束会话，并保留原有结束事实和已发布 Raw。
 
 | 执行模式 | 行为与配置 |
 | --- | --- |
@@ -162,7 +162,7 @@ H 回 HOME、B 开始本轮、S 结束本轮；整理场景后再次按 H、B �
 
 checkpoint 默认 `latest`，支持 `best`、已有百分比 milestone（如 `80pct`）及实验 `checkpoints/` 内的路径；由 Policy 统一解析。`--weights`、`--inference-steps` 可覆盖推理设置。
 
-默认产物位于 `rollouts/policy/task/experiment/session_*/`，`--output` 指定根目录；`run_config.yaml` 保存实际配置与模型信息，`session_result.json` 保存评估摘要。
+默认产物位于 `rollouts/policy/task/experiment/session_*/`，`--output` 指定根目录；`run_config.yaml` 保存实际配置与模型信息，`session_result.json` 保存评估摘要。会话关闭同时报告未回收模型任务和模型关闭的结果，模型关闭成功不会掩盖旧任务失败。
 
 Rollout Raw 按会话内录制启动尝试依次命名为 `episode_001`、`episode_002` 等。准备失败或取消时，已启动且正常收尾的采集继续保存，包括零行采集；后续启动使用新编号。评估摘要区分是否发布与实际行数：零行不等于未发布。查找采集时使用摘要中的 Raw 路径，不能按正式运行轮次推算目录名。
 
@@ -220,4 +220,4 @@ python -m compileall -q dexmani_real scripts
 git diff --check
 ```
 
-测试使用假时钟、设备与模型替身和系统临时目录中的合成数据，覆盖调度、授权、观测、单轮收尾及 Raw→Canonical，并逐文件比较合成 Raw 在读取、导出前后的内容。运行前使用已安装项目依赖的 Python 环境。这些离线结果不证明真机安全。本仓库不使用 pytest 或 Ruff。代码代理的长期规则见 [AGENTS.md](AGENTS.md)，Claude 阅读入口见 [CLAUDE.md](CLAUDE.md)。
+测试使用假时钟、设备与模型替身和系统临时目录中的合成数据，覆盖调度、授权、观测、启动取消、迟到模型任务、单轮收尾及 Raw→Canonical，并逐文件比较合成 Raw 在读取、导出前后的内容。两项完整 Canonical 数值测试使用真实 Pinocchio FK；缺少 Pinocchio 时会明确跳过，不能据此完成数值验收。运行前使用已安装项目依赖的 Python 环境。这些离线结果不证明真机安全。本仓库不使用 pytest 或 Ruff。代码代理的长期规则见 [AGENTS.md](AGENTS.md)，Claude 阅读入口见 [CLAUDE.md](CLAUDE.md)。
