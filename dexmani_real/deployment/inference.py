@@ -58,22 +58,36 @@ class InferenceWorker:
         if self.close_future is not None:
             return self.close_future
 
-        def log_retired_result(future):
-            result = future.result()
-            logger.info(
-                "retired model result after shutdown: context=%s started_ns=%s completed_ns=%s error=%s",
-                result.query_context,
-                result.started_ns,
-                result.completed_ns,
-                result.error,
-            )
-            if result.error is not None:
-                logger.error("retired model task failed during shutdown: %s", result.error)
+        # Capture ownership before poll() can reclaim the finished task during shutdown.
+        retired_future, retired_operation = self.future, self.operation
+
+        def close_model():
+            retired = None
+            if retired_future is not None:
+                retired = dict(
+                    operation=retired_operation, query_context=None,
+                    exception_type=None, message=None, started_ns=None, completed_ns=None,
+                )
+                try:
+                    result = retired_future.result()
+                    retired.update(
+                        query_context=result.query_context,
+                        started_ns=result.started_ns, completed_ns=result.completed_ns,
+                    )
+                    error = result.error
+                except BaseException as exc:
+                    error = exc
+                if error is not None:
+                    retired.update(exception_type=type(error).__name__, message=str(error))
+                logger.log(
+                    logging.ERROR if error is not None else logging.INFO,
+                    "retired model task after shutdown: %s", retired,
+                )
+            # A failed retired task must not prevent the model's own cleanup attempt.
+            return self.run_operation("close", (), {}), retired
 
         # Queue cleanup behind load/predict while the executor still accepts work.
-        self.close_future = self.executor.submit(self.run_operation, "close", (), {})
-        if self.future is not None:
-            self.future.add_done_callback(log_retired_result)
+        self.close_future = self.executor.submit(close_model)
         self.executor.shutdown(wait=False, cancel_futures=False)
         return self.close_future
 
@@ -82,16 +96,29 @@ class InferenceWorker:
         if self.close_future is None:
             return dict(status="pending", reason="close_not_requested")
         try:
-            result = self.close_future.result(timeout=max(0.0, timeout_s))
+            result, retired = self.close_future.result(timeout=max(0.0, timeout_s))
         except TimeoutError:
             return dict(status="pending", reason="model_close_wait_timeout")
         except BaseException as exc:
             return dict(status="failed", reason=f"{type(exc).__name__}: {exc}")
-        return dict(
+        outcome = dict(
             status="completed" if result.error is None else "failed",
             reason=(
                 None if result.error is None else f"{type(result.error).__name__}: {result.error}"
             ),
             started_ns=result.started_ns,
             completed_ns=result.completed_ns,
+            close_error=(
+                dict(exception_type=type(result.error).__name__, message=str(result.error))
+                if result.error is not None else None
+            ),
+            retired_task=retired,
         )
+        if retired is not None and retired["exception_type"] is not None:
+            outcome["status"] = "failed"
+            if outcome["reason"] is None:
+                outcome["reason"] = (
+                    f"retired {retired['operation']} failed: "
+                    f"{retired['exception_type']}: {retired['message']}"
+                )
+        return outcome

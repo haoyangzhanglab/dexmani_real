@@ -1,5 +1,6 @@
 import threading
 import unittest
+from concurrent.futures import CancelledError
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -113,3 +114,81 @@ class AuthorityTests(unittest.TestCase):
         self.assertEqual(closed["status"], "completed")
         operation, result = worker.poll()
         self.assertEqual((operation, result.query_context), ("reset_episode", {"preparing_epoch": epoch}))
+
+    def test_shutdown_retains_failed_model_operation_after_poll(self):
+        for operation, context in (
+            ("reset_episode", {"preparing_epoch": 17}),
+            ("predict", {"run_id": 23, "query_id": 29}),
+        ):
+            for error_type in (CancelledError, RuntimeError):
+                for close_fails in (False, True):
+                    with self.subTest(operation=operation, error=error_type, close_fails=close_fails):
+                        entered, release = threading.Event(), threading.Event()
+                        error = error_type("retired model failed")
+                        close_error = RuntimeError("model close failed") if close_fails else None
+                        closes = []
+
+                        class Model:
+                            def reset_episode(self):
+                                entered.set()
+                                if not release.wait(2):
+                                    raise RuntimeError("test did not release model")
+                                raise error
+
+                            predict = reset_episode
+
+                            def close(self):
+                                closes.append(True)
+                                if close_error is not None:
+                                    raise close_error
+
+                        worker = InferenceWorker(Model)
+                        worker.model = Model()
+                        try:
+                            worker.submit(operation, query_context=context)
+                            self.assertTrue(entered.wait(1))
+                            closing = worker.close()
+                            self.assertIs(worker.close(), closing)
+                            self.assertEqual(worker.close_result(0)["status"], "pending")
+                            release.set()
+                            closing.result(timeout=2)
+                            retired_operation, retired_result = worker.poll()
+                            self.assertEqual(retired_operation, operation)
+                            self.assertIs(retired_result.error, error)
+                            self.assertIsNone(worker.future)
+                            result = worker.close_result(0)
+                        finally:
+                            release.set()
+                            worker.close()
+                            worker.close_result(2)
+                        self.assertEqual(closes, [True])
+                        self.assertEqual(result["status"], "failed")
+                        self.assertEqual(result["close_error"], (
+                            dict(exception_type="RuntimeError", message=str(close_error))
+                            if close_error is not None else None
+                        ))
+                        retired = result["retired_task"]
+                        self.assertEqual(retired["operation"], operation)
+                        self.assertEqual(retired["query_context"], context)
+                        self.assertEqual(retired["exception_type"], error_type.__name__)
+                        self.assertEqual(retired["message"], str(error))
+                        self.assertEqual(retired["started_ns"], retired_result.started_ns)
+                        self.assertEqual(retired["completed_ns"], retired_result.completed_ns)
+                        self.assertLessEqual(result["started_ns"], result["completed_ns"])
+                        self.assertIn(str(close_error) if close_error else operation, result["reason"])
+
+    def test_shutdown_preserves_close_failure_without_retired_task(self):
+        class Model:
+            def close(self):
+                raise RuntimeError("model close failed")
+
+        worker = InferenceWorker(Model)
+        worker.model = Model()
+        worker.close()
+        result = worker.close_result(2)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "RuntimeError: model close failed")
+        self.assertIsNone(result["retired_task"])
+        self.assertEqual(result["close_error"], dict(
+            exception_type="RuntimeError", message="model close failed",
+        ))

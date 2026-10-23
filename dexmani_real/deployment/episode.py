@@ -371,12 +371,21 @@ class PolicyEpisode:
         if operation == "reset_episode":
             if result.query_context != dict(preparing_epoch=self.preparing_epoch):
                 raise RuntimeError("model reset/preparation ownership mismatch")
+            retired = self.termination is not None or not self.preparation_valid()
+            failure = (
+                self.retired_model_error(operation, result)
+                if retired and result.error is not None else None
+            )
+            if self.termination is None and retired:
+                self.finish("cancelled during model reset")
+            if retired:
+                self.preparing_epoch = None
+                if failure is not None:
+                    raise failure from result.error
+                return
             if result.error is not None:
                 raise result.error
-            if self.termination is None:
-                self.admit()
-            else:
-                self.preparing_epoch = None
+            self.admit()
             return
         query = self.query
         if query is None:
@@ -394,17 +403,32 @@ class PolicyEpisode:
         if self.results is not None and query.run_id == self.run_id:
             self.results.record_inference(result.completed_ns - result.started_ns)
         if query.run_id != self.run_id or not self.has_motion_authority():
-            logger.debug(
-                "retired query %s from run %s reclaimed; error=%s",
-                query.query_id,
-                query.run_id,
-                result.error,
-            )
+            failure = self.retired_model_error(operation, result) if result.error is not None else None
+            if self.termination is None:
+                self.finish("owner_authority_revoked")
             self.query = None
+            if failure is not None:
+                raise failure from result.error
             return
         if result.error is not None:
             raise result.error
         query.result = result.value
+
+    def retired_model_error(self, operation, result):
+        # An ended episode remains immutable; an unknown model state fences the session.
+        self.runtime_state.mark_error()
+        detail = dict(
+            error_detail("retired_model", result.error), operation=operation,
+            query_context=dict(result.query_context),
+            started_ns=result.started_ns, completed_ns=result.completed_ns,
+        )
+        logger.error("retired model task failed: %s", detail)
+        if self.results is not None:
+            self.results.record_errors([detail])
+        return RuntimeError(
+            f"retired model {operation} failed: context={result.query_context}; "
+            f"{type(result.error).__name__}: {result.error}"
+        )
 
     def submit(self, rows, slot, *, handoff_slot=None, prefix=None, commands=None):
         observation = build_policy_observation(
@@ -711,6 +735,9 @@ class PolicyEpisode:
             return
         if self.run_id is None and self.model.future is None:
             self.prepare()
+            return
+        if self.run_id is None and not self.preparation_valid():
+            self.finish("cancelled during model reset")
             return
         if self.run_id is not None and not self.has_motion_authority():
             self.finish("owner_authority_revoked")

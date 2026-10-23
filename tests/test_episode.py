@@ -1,17 +1,21 @@
+from concurrent.futures import CancelledError
+from copy import deepcopy
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
 
 from fakes import FakeClock, FakeRecorder, camera_metadata, make_episode, make_session, observation, start_episode, start_session_episode
-from dexmani_real.data.recorder import RecordingError
+from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError
 from dexmani_real.data.results import EpisodeResults
 from dexmani_real.deployment.schedule import ActionPlan
 from dexmani_real.robot.commands import DispatchError, DispatchResult, DispatchStatus
 from dexmani_real.robot.home import HomeResult
 from dexmani_real.runtime.operator_input import OperatorCommand as Key
+from dexmani_real.runtime.state import RunEndReason, SafetyState
 
 
 class EpisodeTests(unittest.TestCase):
@@ -131,6 +135,9 @@ class EpisodeTests(unittest.TestCase):
         session.request_stop()
         session.advance_episode()
         self.assertIsNone(old_episode.run_id)
+        self.assertIsNotNone(old_episode.termination)
+        self.assertEqual(old_episode.termination.reason, "start_cancelled")
+        self.assertFalse(session.model.future.done())
         self.assertFalse(session.request_start())
         session.model.complete()
         session.advance_episode()
@@ -154,7 +161,7 @@ class EpisodeTests(unittest.TestCase):
         self.assertIs(old_episode.query, old_query)
         self.assertFalse(session.request_start())
         self.assertEqual([call[0] for call in session.model.calls], ["reset_episode", "predict"])
-        session.model.complete(error=RuntimeError("retired prediction failed"))
+        session.model.complete(self.predictions())
         self.assertFalse(session.request_start())  # done is not reclaimed
         session.advance_episode()
         self.assertIsNone(session.episode)
@@ -164,6 +171,132 @@ class EpisodeTests(unittest.TestCase):
         self.assertTrue(session.request_start())
         session.advance_episode()
         self.assertEqual(session.model.calls[-1][0], "reset_episode")
+
+    def test_retired_model_errors_preserve_end_and_prevent_reuse(self):
+        for operation in ("reset_episode", "predict"):
+            for error_type in (CancelledError, RuntimeError):
+                with self.subTest(operation=operation, error_type=error_type), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    results = EpisodeResults(root / "results", "policy")
+                    recorder = AsyncEpisodeRecorder(root / "raw", control_hz=20)
+                    self.addCleanup(recorder.close)
+                    session = make_session(make_episode(self.clock, recorder=recorder, results=results))
+                    session.request_start()
+                    session.advance_episode()
+                    if operation == "predict":
+                        session.model.complete()
+                        session.advance_episode()
+                    old_episode = session.episode
+                    context = dict(session.model.context)
+                    session.request_stop()
+                    session.advance_episode()
+                    ended = old_episode.termination
+                    self.assertIsNotNone(ended)
+                    expected = "operator" if operation == "predict" else "start_cancelled"
+                    self.assertEqual(ended.reason, expected)
+                    episodes = deepcopy(results.session["episodes"])
+                    before = {path.relative_to(root): path.read_bytes()
+                              for path in (root / "raw").rglob("*") if path.is_file()}
+                    error = error_type("retired model failed")
+                    session.model.complete(error=error)
+                    with self.assertRaisesRegex(RuntimeError, "retired model") as caught:
+                        session.advance_episode()
+                    self.assertIs(caught.exception.__cause__, error)
+                    self.assertIs(old_episode.termination, ended)
+                    self.assertIsNone(old_episode.query)
+                    self.assertIsNone(old_episode.preparing_epoch)
+                    self.assertIsNone(session.episode)
+                    self.assertTrue(session.runtime_state.error_state)
+                    self.assertNotEqual(session.runtime_state.safety_state, SafetyState.FAULT)
+                    self.assertFalse(session.request_start())
+                    self.assertEqual(session.robot.sent, [])
+                    self.assertEqual(session.completed, int(operation == "predict"))
+                    old_episode.finish("second cleanup")
+                    session.advance_episode(shutdown=True)
+                    self.assertEqual(results.session["episodes"], episodes)
+                    self.assertEqual(len(results.session["errors"]), 1)
+                    detail = results.session["errors"][0]
+                    self.assertEqual(detail["operation"], operation)
+                    self.assertEqual(detail["query_context"], context)
+                    self.assertEqual(detail["exception_type"], error_type.__name__)
+                    self.assertEqual(detail["message"], str(error))
+                    self.assertEqual({path.relative_to(root): path.read_bytes()
+                                      for path in (root / "raw").rglob("*") if path.is_file()}, before)
+                    if operation == "predict":
+                        self.assertEqual(len(before), 2)
+                        self.assertEqual(session.runtime_state.run_ended_reason, RunEndReason.OPERATOR)
+
+    def test_reset_cancellation_during_poll_preserves_cancellation(self):
+        for request in ("request_stop", "request_quit", "request_emergency_stop"):
+            for error in (None, CancelledError("reset failed"), RuntimeError("reset failed")):
+                with self.subTest(request=request, error=error):
+                    episode = make_episode(self.clock)
+                    episode.results = Mock()
+                    episode.step()
+                    episode.model.complete(error=error)
+                    poll = episode.model.poll
+                    def stop_during_poll():
+                        getattr(episode.runtime_state, request)()
+                        return poll()
+                    episode.model.poll = stop_during_poll
+                    if error is None:
+                        episode.step()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "retired model") as caught:
+                            episode.step()
+                        self.assertIs(caught.exception.__cause__, error)
+                    self.assertEqual(episode.termination.reason, "start_cancelled")
+                    self.assertEqual(episode.robot.sent, [])
+                    episode.results.finish_episode.assert_called_once()
+
+    def test_retired_model_failure_ends_session_as_policy_failure(self):
+        session = make_session(make_episode(self.clock, recorder=FakeRecorder()))
+        session.sensors = SimpleNamespace(channels=None, request_shutdown=Mock())
+        start_session_episode(session)
+        old_episode = session.episode
+        session.request_stop()
+        session.advance_episode()
+        ended = old_episode.termination
+        session.model.complete(error=RuntimeError("predict failed"))
+        with patch("dexmani_real.deployment.session.time.sleep", side_effect=lambda delay: session.request_quit()):
+            with self.assertRaisesRegex(RuntimeError, "retired model predict"):
+                session.run_control_loop()
+        session.sensors.request_shutdown.assert_called_once_with(reason=RunEndReason.POLICY_FAILURE)
+        self.assertTrue(session.runtime_state.error_state)
+        self.assertIs(old_episode.termination, ended)
+        self.assertEqual(len(session.recorder.finishes), 1)
+
+    def test_polled_model_error_survives_cancelled_cleanup_failure(self):
+        for operation in ("reset_episode", "predict"):
+            with self.subTest(operation=operation):
+                episode = make_episode(self.clock, recorder=FakeRecorder(), results=Mock())
+                if operation == "predict":
+                    start_episode(episode)
+                else:
+                    episode.step()
+                model_error = RuntimeError("model task failed")
+                episode.model.complete(error=model_error)
+                poll = episode.model.poll
+                stop_error = RuntimeError("stop unconfirmed")
+                def stop_during_poll():
+                    episode.runtime_state.request_stop()
+                    episode.robot.stop_required = True
+                    episode.robot.stop_error = stop_error
+                    return poll()
+                episode.model.poll = stop_during_poll
+                with self.assertRaisesRegex(RuntimeError, "stop unconfirmed") as caught:
+                    episode.step()
+                self.assertIs(caught.exception, stop_error)
+                self.assertIsNone(episode.model.future)
+                self.assertTrue(episode.runtime_state.error_state)
+                episode.results.record_errors.assert_called_once()
+                detail, = episode.results.record_errors.call_args.args[0]
+                self.assertEqual(detail["operation"], operation)
+                self.assertEqual(detail["message"], str(model_error))
+                errors = episode.results.finish_episode.call_args.kwargs["errors"]
+                self.assertEqual(errors[0]["stage"], "stop")
+                self.assertEqual(errors[0]["message"], str(stop_error))
+                episode.results.finish_episode.assert_called_once()
 
     def test_writer_start_failure_keeps_attempt_and_does_not_count_run(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -301,13 +434,16 @@ class EpisodeTests(unittest.TestCase):
         self.assertEqual(episode.robot.sent, [])
 
     def test_reset_error_is_not_silently_treated_as_operator_cancellation(self):
-        from concurrent.futures import CancelledError
-        episode = make_episode(self.clock)
-        episode.step()
-        episode.model.complete(error=CancelledError("model reset failed"))
-        with self.assertRaises(CancelledError):
-            episode.step()
-        self.assertEqual(episode.termination.reason, "preparation_failed")
+        for error_type in (CancelledError, RuntimeError):
+            with self.subTest(error_type=error_type):
+                episode = make_episode(self.clock)
+                episode.step()
+                error = error_type("model reset failed")
+                episode.model.complete(error=error)
+                with self.assertRaises(error_type) as caught:
+                    episode.step()
+                self.assertIs(caught.exception, error)
+                self.assertEqual(episode.termination.reason, "preparation_failed")
 
     def test_session_counts_once_even_when_finalization_raises(self):
         recorder = FakeRecorder()
