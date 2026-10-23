@@ -3,8 +3,8 @@
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass
 from concurrent.futures import CancelledError
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -69,19 +69,43 @@ class EpisodeEnd:
 
 class PolicyEpisode:
     def __init__(
-        self, runtime_state, runtime, policy_info, *, preparing_epoch,
-        robot, needs, sensors, action_mapper, model_runtime, kinematics,
-        max_running_s, query_ids, capture_ids, recorder=None,
-        camera_calibration=None, camera_parameters=None, results=None,
+        self,
+        runtime_state,
+        runtime,
+        policy_info,
+        *,
+        preparing_epoch,
+        robot,
+        needs,
+        sensors,
+        action_mapper,
+        model_runtime,
+        kinematics,
+        max_running_s,
+        query_ids,
+        capture_ids,
+        recorder=None,
+        camera_calibration=None,
+        camera_parameters=None,
+        results=None,
     ):
-        self.runtime_state, self.runtime = runtime_state, runtime
-        self.policy_info, self.execution = policy_info, runtime.execution
-        self.robot, self.sensors, self.needs = robot, sensors, needs
-        self.action_mapper, self.kinematics = action_mapper, kinematics
-        self.model, self.recorder, self.results = model_runtime, recorder, results
-        self.camera_calibration, self.camera_parameters = camera_calibration, camera_parameters
+        self.runtime_state = runtime_state
+        self.runtime = runtime
+        self.policy_info = policy_info
+        self.execution = runtime.execution
+        self.robot = robot
+        self.sensors = sensors
+        self.needs = needs
+        self.action_mapper = action_mapper
+        self.kinematics = kinematics
+        self.model = model_runtime
+        self.recorder = recorder
+        self.results = results
+        self.camera_calibration = camera_calibration
+        self.camera_parameters = camera_parameters
         self.max_running_s = max_running_s
-        self.query_ids, self.capture_ids = query_ids, capture_ids
+        self.query_ids = query_ids
+        self.capture_ids = capture_ids
         self.preparing_epoch = preparing_epoch
         self.run_id = None
         self.termination = None
@@ -94,7 +118,6 @@ class PolicyEpisode:
         self.capture_attempted = False
         self.plan = self.query = None
         self.slot_timing = {}
-        self.termination_timing = None
         self.preparation_issue = None
         self.observation_read_issues = []
         self.wait_started_ns = None
@@ -144,8 +167,9 @@ class PolicyEpisode:
         epoch = self.run_id
         ended_ns = time.monotonic_ns()
         duration_s = (ended_ns - self.started_ns) / 1e9 if epoch is not None else 0.0
+        termination_timing = None
         if epoch is not None and self.recorder is not None:
-            self.termination_timing = dict(
+            termination_timing = dict(
                 run_id=epoch, started_ns=self.started_ns, slot=self.last_slot,
                 ended_ns=ended_ns, reason=detail,
                 query=dict(self.query.evidence) if self.query is not None else None,
@@ -196,14 +220,16 @@ class PolicyEpisode:
             failure = failure or exc
             errors.append(error_detail("recording", exc))
         try:
-            self.finalize_outputs(reason_name, detail, errors, duration_s=duration_s)
+            self.finalize_outputs(
+                reason_name, detail, errors, duration_s=duration_s, timing=termination_timing
+            )
         except BaseException as exc:
             failure = failure or exc
         if failure is not None:
             raise failure
 
-    def finalize_outputs(self, reason, detail, errors=None, *, duration_s=0.0):
-        errors = list(errors or ())
+    def finalize_outputs(self, reason, detail, errors, *, duration_s, timing):
+        errors = list(errors)
         failure, raw = None, None
         try:
             if self.recorder is not None and self.capture_attempted:
@@ -212,13 +238,13 @@ class PolicyEpisode:
                     saved = self.recorder.save_episode(
                         reason=reason,
                         details=[dict(stage="termination", reason=detail), *errors],
-                        timing=self.termination_timing,
+                        timing=timing,
                         arm_execution=dict(
                             self.robot.arm.execution_snapshot(),
                             robot_stopped=not self.robot.stop_required,
                         ),
                     )
-                    status = "published" if saved is not None else "empty"
+                    status = "published" if saved is not None else "not_published"
                 except BaseException as exc:
                     failure, status = exc, "failed"
                     errors.append(error_detail("recorder_finalize", exc))

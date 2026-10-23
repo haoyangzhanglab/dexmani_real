@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -203,6 +204,28 @@ class EpisodeTests(unittest.TestCase):
         session.advance_episode()
         self.assertEqual(session.completed, 1)
         self.assertEqual([item["episode_name"] for item in recorder.starts], ["episode_001", "episode_002"])
+
+    def test_capture_summary_distinguishes_publication_from_row_count(self):
+        for saved, status in ((Path("/tmp/fake-published"), "published"), (None, "not_published")):
+            with self.subTest(status=status):
+                recorder = FakeRecorder()
+                recorder.save_episode = Mock(return_value=saved)
+                episode = make_episode(self.clock, recorder=recorder)
+                episode.results = Mock()
+                episode.prepare()
+                episode.model.complete()
+                episode.poll_model()
+                episode.runtime_state.request_stop()
+                episode.step()
+                raw = episode.results.finish_episode.call_args.kwargs["raw"]
+                self.assertEqual(raw["status"], status)
+                self.assertEqual(raw["row_count"], 0)
+                self.assertEqual(raw["path"], str(saved) if saved is not None else None)
+                timing = recorder.save_episode.call_args.kwargs["timing"]
+                self.assertEqual(timing["run_id"], episode.termination.run_id)
+                self.assertEqual(timing["ended_ns"], self.clock.now)
+                episode.finish("again")
+                recorder.save_episode.assert_called_once()
 
     def test_partial_dispatch_is_recorded_once_before_failure(self):
         recorder = FakeRecorder()

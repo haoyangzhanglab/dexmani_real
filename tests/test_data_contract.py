@@ -1,4 +1,3 @@
-import hashlib
 import importlib.util
 import json
 import tempfile
@@ -22,9 +21,12 @@ from dexmani_real.robot.commands import DispatchResult, DispatchStatus, RobotCom
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 
 
-def tree_hash(root):
-    return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in root.rglob("*") if path.is_file()}
+def file_contents(root):
+    return {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
 class DataContractTests(unittest.TestCase):
@@ -50,9 +52,9 @@ class DataContractTests(unittest.TestCase):
             self.assertEqual(reader.num_frames, 0)
             self.assertEqual(reader.meta["termination_reason"], "start_cancelled")
             self.assertEqual(reader.meta["format"], RAW_FORMAT)
-        before = tree_hash(path)
+        before = file_contents(path)
         recorder.close()
-        self.assertEqual(tree_hash(path), before)
+        self.assertEqual(file_contents(path), before)
 
     def test_not_ready_writer_keeps_staging(self):
         recorder = self.recorder()
@@ -169,7 +171,7 @@ class DataContractTests(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec("pinocchio"), "full numerical export requires optional Pinocchio")
     def test_full_export_preserves_15_fields_geometry_tactile_and_raw(self):
         source = self.fixture("episode_valid")
-        before = tree_hash(source)
+        before = file_contents(source)
         target = self.root / "canonical.zarr"
         result = self.exporter().export(source, target)
         self.assertEqual(result["total_frames"], 2)
@@ -188,7 +190,7 @@ class DataContractTests(unittest.TestCase):
         expected[0, 3] = -.1
         np.testing.assert_allclose(store["data/camera_extrinsic"][0], expected.ravel())
         np.testing.assert_array_equal(store["meta/episode_ends"][:], [2])
-        self.assertEqual(tree_hash(source), before)
+        self.assertEqual(file_contents(source), before)
         with self.assertRaises(FileExistsError):
             self.exporter().export(source, target)
 
@@ -197,10 +199,10 @@ class DataContractTests(unittest.TestCase):
         self.fixture("episode_valid")
         for issue in ("missing", "nan", "geometry", "dispatch", "depth_rows", "sdk", "empty_cloud", "timing"):
             self.fixture("episode_" + issue, invalid=issue)
-        before = tree_hash(self.root / "raw")
+        before = file_contents(self.root / "raw")
         result = self.exporter().export(self.root / "raw", self.root / "canonical.zarr")
         self.assertEqual(result["episode_count"], 1)
         self.assertEqual(result["total_frames"], 2)
         self.assertEqual(len(result["rejected_episodes"]), 8)
         self.assertTrue(all(result["rejected_episodes"].values()))
-        self.assertEqual(tree_hash(self.root / "raw"), before)
+        self.assertEqual(file_contents(self.root / "raw"), before)

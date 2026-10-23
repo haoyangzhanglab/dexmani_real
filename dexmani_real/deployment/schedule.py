@@ -1,4 +1,4 @@
-"""Pure Policy scheduling; the runner supplies clocks and owns model/device/recording I/O."""
+"""Pure Policy scheduling; the episode supplies clocks and handles execution I/O."""
 
 from dataclasses import dataclass, field
 

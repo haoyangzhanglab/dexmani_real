@@ -13,19 +13,19 @@ from dexmani_real.calibration.camera.extrinsics import (
 )
 from dexmani_real.data.recorder import AsyncEpisodeRecorder
 from dexmani_real.data.results import EpisodeResults, error_detail
-from dexmani_real.deployment.observation import ObservationKinematics
-from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
-from dexmani_real.planning.kinematics.hand_fk import HandKinematics
-from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics, camera_parameters_cv
 from dexmani_real.deployment.episode import PolicyEpisode, failure_reason
+from dexmani_real.deployment.observation import ObservationKinematics
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
+from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.robot.home import build_home_planner, home_robot
+from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
+from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
+from dexmani_real.sensor.camera.geometry import CameraIntrinsics, camera_parameters_cv
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.pointcloud.worker import PointCloudWorkerConfig, run_pointcloud_worker
 from dexmani_real.utils.log import configure_logging
@@ -123,7 +123,8 @@ class PolicySession:
         self.episode = None
         self.start_epoch = None
         self.completed = 0
-        self.query_ids, self.capture_ids = count(1), count(1)
+        self.query_ids = count(1)
+        self.capture_ids = count(1)
 
     def run(self):
         """Run a session with independently optional Raw recording and evaluation summaries."""
@@ -341,8 +342,7 @@ class PolicySession:
             )
             if self.results is not None:
                 self.results.record_errors(cleanup_errors)
-            home_results = self.home_results
-            home_fault = any(item["outcome"] in ("failed", "fault") for item in home_results)
+            home_fault = any(item["outcome"] in ("failed", "fault") for item in self.home_results)
             successful = clean and failure is None and shutdown_clean and not home_fault
             if self.results is not None:
                 try:
@@ -361,7 +361,7 @@ class PolicySession:
                         reason=reason,
                         shutdown_clean=shutdown_clean,
                         model_close=model_close,
-                        home_results=home_results,
+                        home_results=self.home_results,
                     )
                 except Exception:
                     successful = False
@@ -577,13 +577,23 @@ class PolicySession:
             ):
                 return
             self.episode = PolicyEpisode(
-                self.runtime_state, self.runtime, self.info, preparing_epoch=epoch,
-                robot=self.robot, sensors=self.sensors, needs=self.needs,
-                action_mapper=self.action_mapper, model_runtime=self.model,
-                kinematics=self.kinematics, max_running_s=self.max_running_s,
-                query_ids=self.query_ids, capture_ids=self.capture_ids,
-                recorder=self.recorder, results=self.results,
-                camera_calibration=self.camera_calibration, camera_parameters=self.camera_parameters,
+                self.runtime_state,
+                self.runtime,
+                self.info,
+                preparing_epoch=epoch,
+                robot=self.robot,
+                sensors=self.sensors,
+                needs=self.needs,
+                action_mapper=self.action_mapper,
+                model_runtime=self.model,
+                kinematics=self.kinematics,
+                max_running_s=self.max_running_s,
+                query_ids=self.query_ids,
+                capture_ids=self.capture_ids,
+                recorder=self.recorder,
+                results=self.results,
+                camera_calibration=self.camera_calibration,
+                camera_parameters=self.camera_parameters,
             )
         episode = self.episode
         before = episode.termination
@@ -606,9 +616,14 @@ class PolicySession:
                     normal = ended.reason in {"operator", "quit"} or (
                         ended.reason == "timeout" and ended.detail == "duration_timeout"
                     )
-                    logger.log(logging.INFO if normal else logging.WARNING,
-                               "第 %d 轮结束：%s（%s，%.1f s）。",
-                               self.completed, ended.reason, ended.detail, ended.duration_s)
+                    logger.log(
+                        logging.INFO if normal else logging.WARNING,
+                        "第 %d 轮结束：%s（%s，%.1f s）。",
+                        self.completed,
+                        ended.reason,
+                        ended.detail,
+                        ended.duration_s,
+                    )
                     if self.num_episodes is not None and self.completed >= self.num_episodes:
                         self.runtime_state.request_quit()
                         print(f"已达到 {self.num_episodes} 轮上限，正在退出。", flush=True)

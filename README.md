@@ -164,7 +164,7 @@ checkpoint 默认 `latest`，支持 `best`、已有百分比 milestone（如 `80
 
 默认产物位于 `rollouts/policy/task/experiment/session_*/`，`--output` 指定根目录；`run_config.yaml` 保存实际配置与模型信息，`session_result.json` 保存评估摘要。
 
-Rollout Raw 按会话内录制启动尝试依次命名为 `episode_001`、`episode_002` 等。准备失败或取消时，已启动且正常收尾的采集继续保存，包括零行采集；后续启动使用新编号。评估摘要保留准备尝试，查找采集时使用摘要中的 Raw 路径，不能按正式运行轮次推算目录名。
+Rollout Raw 按会话内录制启动尝试依次命名为 `episode_001`、`episode_002` 等。准备失败或取消时，已启动且正常收尾的采集继续保存，包括零行采集；后续启动使用新编号。评估摘要区分是否发布与实际行数：零行不等于未发布。查找采集时使用摘要中的 Raw 路径，不能按正式运行轮次推算目录名。
 
 `--no-record` 与 `--no-results` 分别关闭 Raw 和摘要，同时关闭时不创建会话产物；**它们不会关闭设备连接或动作执行**。相机按策略输入与 Raw 录制需求启动，仅使用机器人状态且关闭 Raw 时不启动相机。
 
@@ -220,4 +220,4 @@ python -m compileall -q dexmani_real scripts
 git diff --check
 ```
 
-测试使用假时钟、设备/model 替身和系统临时目录中的合成数据，覆盖调度、授权、观测、单轮收尾及 Raw→Canonical；运行前使用已安装项目依赖的 Python 环境。这些离线结果不证明真机安全。本仓库不使用 pytest 或 Ruff。代码代理的长期规则见 [AGENTS.md](AGENTS.md)，Claude 阅读入口见 [CLAUDE.md](CLAUDE.md)。
+测试使用假时钟、设备与模型替身和系统临时目录中的合成数据，覆盖调度、授权、观测、单轮收尾及 Raw→Canonical，并逐文件比较合成 Raw 在读取、导出前后的内容。运行前使用已安装项目依赖的 Python 环境。这些离线结果不证明真机安全。本仓库不使用 pytest 或 Ruff。代码代理的长期规则见 [AGENTS.md](AGENTS.md)，Claude 阅读入口见 [CLAUDE.md](CLAUDE.md)。

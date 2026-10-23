@@ -1,4 +1,4 @@
-"""One model thread owns inference and cleanup; robot and sensor I/O stay with the runtime."""
+"""One model thread owns inference and cleanup independently of device I/O."""
 
 import logging
 import time
