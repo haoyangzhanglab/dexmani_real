@@ -3,12 +3,51 @@
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
+from typing import Literal, Mapping
 
 import numpy as np
 
 from dexmani_real.robot.xhand.feedback import hand_feedback_time_ns
 from dexmani_real.utils.timing import sample_is_fresh
+
+
+@dataclass(frozen=True)
+class ObservationNeeds:
+    """Coordinator copies and required sources, shared with device assembly."""
+
+    camera: Literal["none", "header", "rgbd"] = "none"
+    point_cloud: bool = False
+    vr: bool = False
+    required_tactile: tuple[str, ...] = ("aggregate", "dense")
+
+    @classmethod
+    def for_policy(cls, fields, *, record_raw):
+        fields = set(fields)
+        return cls(
+            camera=(
+                "rgbd" if record_raw or "rgb" in fields
+                else "header" if fields & {"camera_intrinsic", "camera_extrinsic"}
+                else "none"
+            ),
+            point_cloud="point_cloud" in fields,
+            required_tactile=tuple(
+                channel
+                for field, channel in (
+                    ("finger_tactile_force", "aggregate"),
+                    ("taxel_tactile_force", "dense"),
+                )
+                if record_raw or field in fields
+            ),
+        )
+
+    @property
+    def camera_worker(self):
+        # Cloud-only still needs a producer, but no coordinator RGB-D copy.
+        return self.camera != "none" or self.point_cloud
+
+    @property
+    def paired_camera(self):
+        return self.camera == "rgbd" and self.point_cloud
 
 
 def feedback_deadline_ns(row, runtime, *, include_vr=False):
@@ -26,8 +65,8 @@ def feedback_deadline_ns(row, runtime, *, include_vr=False):
     return min(deadlines)
 
 
-def read_vr_frame(runtime_state):
-    result = runtime_state.sensors.vr_ring.read_latest(use_last_good=True)
+def read_vr_frame(channels):
+    result = channels.vr_ring.read_latest(use_last_good=True)
     if result is None:
         return None
     record = result[0][0]
@@ -37,8 +76,8 @@ def read_vr_frame(runtime_state):
     }
 
 
-def read_camera_frame(runtime_state, sequence=None, *, header_only=False):
-    ring = runtime_state.sensors.camera_ring
+def read_camera_frame(channels, sequence=None, *, header_only=False):
+    ring = channels.camera_ring
     result = (
         ring.read_latest_field("header")
         if header_only
@@ -84,16 +123,12 @@ class ObservationRow:
 
 
 def read_observation(
-    runtime_state,
+    channels,
     runtime,
     robot,
     *,
+    needs=ObservationNeeds(),
     require_hand=True,
-    require_camera=False,
-    camera_header_only=False,
-    require_vr=False,
-    require_pointcloud=False,
-    require_rgb_cloud_identity=False,
     issues=None,
     wait_for_hand=False,
     cancel_requested=None,
@@ -107,34 +142,34 @@ def read_observation(
     )
     arm, hand = state.arm, state.hand if require_hand else None
     cloud_result = (
-        runtime_state.sensors.pointcloud_ring.read_latest(use_last_good=True)
-        if require_pointcloud
+        channels.pointcloud_ring.read_latest(use_last_good=True)
+        if needs.point_cloud
         else None
     )
-    if (require_hand and hand is None) or (require_pointcloud and cloud_result is None):
+    if (require_hand and hand is None) or (needs.point_cloud and cloud_result is None):
         unavailable.append("feedback_or_pointcloud_unavailable")
     cloud = cloud_result[0][0] if cloud_result else None
-    if require_rgb_cloud_identity:
+    if needs.paired_camera:
         camera = (
-            read_camera_frame(runtime_state, int(cloud["source_camera_sequence"]))
+            read_camera_frame(channels, int(cloud["source_camera_sequence"]))
             if cloud is not None
             else None
         )
     else:
         camera = (
-            read_camera_frame(runtime_state, header_only=camera_header_only)
-            if require_camera else None
+            read_camera_frame(channels, header_only=needs.camera == "header")
+            if needs.camera != "none" else None
         )
-    vr = read_vr_frame(runtime_state) if require_vr else None
-    if (require_camera or require_rgb_cloud_identity) and camera is None:
+    vr = read_vr_frame(channels) if needs.vr else None
+    if needs.camera != "none" and camera is None:
         unavailable.append("camera_source_unavailable_or_unmatched")
-    if require_vr and vr is None:
+    if needs.vr and vr is None:
         unavailable.append("vr_unavailable")
     now = time.monotonic_ns()
     if not sample_is_fresh(arm["timestamp_ns"][0], runtime.arm.feedback_max_age_s, now):
         unavailable.append("arm_feedback_stale")
     if hand is not None:
-        hand_ns = hand_feedback_time_ns(hand, robot.hand_feedback.required_tactile)
+        hand_ns = hand_feedback_time_ns(hand, needs.required_tactile)
         if not 0 < hand_ns <= now < hand_ns + int(runtime.hand.feedback_max_age_s * 1e9):
             unavailable.append("hand_feedback_stale")
     if camera is not None and not sample_is_fresh(
@@ -153,7 +188,7 @@ def read_observation(
         if issues is not None:
             issues.extend(unavailable)
         return None
-    row = ObservationRow(
+    return ObservationRow(
         arm=freeze(arm),
         hand=freeze(hand),
         camera=freeze(camera),
@@ -171,9 +206,12 @@ def read_observation(
         ),
         pointcloud_started_ns=int(cloud["processing_started_ns"]) if cloud is not None else -1,
         pointcloud_published_ns=int(cloud_result[1]) if cloud_result is not None else -1,
-        required_tactile=robot.hand_feedback.required_tactile,
+        required_tactile=needs.required_tactile,
     )
 
+
+def upstream_deadline_ns(row, runtime):
+    """Compute the executor upstream fence from original source times, not processing time."""
     deadlines = []
     if row.camera is not None:
         deadlines.append(
@@ -189,5 +227,4 @@ def read_observation(
             + int(runtime.control.vr_mapping.stale_threshold_s * 1e9)
         )
     # Arm freshness is independently checked against the executor's live snapshot.
-    robot.arm.update_health(upstream_until_ns=min(deadlines) if deadlines else 2**63 - 1)
-    return row
+    return min(deadlines) if deadlines else 2**63 - 1

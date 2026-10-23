@@ -12,9 +12,16 @@ logger = logging.getLogger(__name__)
 class SensorProcesses:
     """Own started sensor processes; workflows choose devices and start order."""
 
-    def __init__(self, runtime_state):
+    def __init__(self, runtime_state, channels=None):
         self.runtime_state = runtime_state
+        self.channels = channels
         self.started = []
+
+    def request_shutdown(self, *, reason=RunEndReason.RUNTIME_SHUTDOWN, fault=False):
+        """Revoke software authority before notifying sensor producers; never join here."""
+        self.runtime_state.end_session(reason=reason, fault=fault)
+        if self.channels is not None:
+            self.channels.is_running.value = False
 
     def start(self, process, *, ready, timeout_s=None, check_services=None) -> None:
         """Start ownership immediately; a timeout also requests a blocking readiness wait."""
@@ -49,12 +56,12 @@ class SensorProcesses:
         for process, ready in dead:
             ready.clear()
             logger.error("required worker %s exited: %s", process.name, process.exitcode)
-        self.runtime_state.end_session(reason=RunEndReason.HARDWARE_FAULT, fault=True)
+        self.request_shutdown(reason=RunEndReason.HARDWARE_FAULT, fault=True)
         return False
 
     def shutdown(self, *, graceful_timeout_s=5.0, terminate_timeout_s=1.0, kill_timeout_s=1.0):
         """Verify every child exited; retain handles if any exit remains unresolved."""
-        self.runtime_state.end_session()
+        self.request_shutdown()
         deadline = time.monotonic() + graceful_timeout_s
         clean = True
         errors = []
@@ -85,7 +92,7 @@ class SensorProcesses:
                 errors.append(exc)
                 logger.exception("worker %s shutdown failed", process.name)
         if errors or not clean:
-            self.runtime_state.end_session(fault=True)
+            self.request_shutdown(fault=True)
         if errors:
             raise RuntimeError(f"sensor shutdown unresolved: {errors}") from errors[0]
         self.started.clear()
@@ -116,7 +123,8 @@ def shutdown_local_runtime(
         except Exception:
             runtime_state.mark_error()
             logger.exception("local runtime cleanup failed")
-    runtime_state.end_session()
+    if sensors is None:
+        runtime_state.end_session()
     sensors_clean = True
     if sensors is not None:
         try:

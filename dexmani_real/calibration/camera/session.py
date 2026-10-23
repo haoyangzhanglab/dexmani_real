@@ -74,7 +74,7 @@ def eef_rpy_from_rot6d(rot6d: np.ndarray) -> np.ndarray:
 
 
 def detect_aruco_stable(
-    runtime_state: RuntimeState,
+    channels: SensorChannels,
     intrinsics: np.ndarray,
     distortion: np.ndarray,
     *,
@@ -96,7 +96,7 @@ def detect_aruco_stable(
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             check_capture()
-            frame = read_camera_frame(runtime_state)
+            frame = read_camera_frame(channels)
             if (
                 frame
                 and frame["timestamp_ns"] > last_stamp
@@ -255,7 +255,7 @@ class CameraCalibrationSession:
         self.output_path = output_path
 
     def check_services(self):
-        return self.sensors.check() and (self.keys is None or self.keys.healthy)
+        return self.keys is not None and self.keys.healthy and self.sensors.check()
 
     def fault(self, reason, *, estop=False, run_end_reason=RunEndReason.HARDWARE_FAULT):
         if estop:
@@ -342,7 +342,7 @@ class CameraCalibrationSession:
                 print(f"FAILED — before capture: {feedback_issue}, skipped")
                 return
             aruco_pose = detect_aruco_stable(
-                self.runtime_state,
+                self.sensors.channels,
                 self.intrinsics,
                 self.distortion,
                 detector=self.capture_detector,
@@ -399,7 +399,7 @@ class CameraCalibrationSession:
 
     def show_preview(self):
         """Poll and display the newest camera preview without blocking control."""
-        frame = read_camera_frame(self.runtime_state)
+        frame = read_camera_frame(self.sensors.channels)
         if frame and sample_is_fresh(frame["timestamp_ns"], self.runtime.camera.max_frame_age_s):
             image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
             self.display_image = draw_calibration_overlay(
@@ -480,21 +480,6 @@ class CameraCalibrationSession:
         self.prepare()
         exit_code = 1
         try:
-            self.robot.connect()
-            self.camera_process = self.ctx.Process(
-                name="camera",
-                target=run_camera_worker,
-                args=(self.runtime_state.sensors, self.runtime.camera),
-            )
-            self.sensors.start(
-                self.camera_process,
-                ready=self.runtime_state.sensors.camera_ready,
-                timeout_s=self.runtime.safety.camera_ready_timeout_s,
-            )
-            self.runtime_state.arm()
-            print("  local arm connected (owner process; Mode 1 prepared on jog)")
-            initial_state = self.robot.read_state().arm[0]
-
             self.keys = KeyboardInput(
                 jog_change_callback=self.runtime_state.jog_input_changed,
                 quit_callback=self.runtime_state.request_quit,
@@ -502,8 +487,28 @@ class CameraCalibrationSession:
                 capture_raw_events=True,
                 estop_callback=lambda: self.fault("operator e-stop callback", estop=True),
             )
-            self.serial = self.runtime_state.sensors.camera_serial.value.decode()
-            color_intrinsics = json.loads(self.runtime_state.sensors.camera_intrinsics.value.decode())
+            self.keys.start()
+            if not self.keys.healthy:
+                raise RuntimeError("keyboard stop listener unavailable")
+            self.robot.connect()
+            self.camera_process = self.ctx.Process(
+                name="camera",
+                target=run_camera_worker,
+                args=(self.sensors.channels, self.runtime.camera),
+            )
+            self.sensors.start(
+                self.camera_process,
+                ready=self.sensors.channels.camera_ready,
+                timeout_s=self.runtime.safety.camera_ready_timeout_s,
+                check_services=lambda: self.keys.healthy,
+            )
+            self.robot.check()
+            self.runtime_state.arm()
+            print("  local arm connected (owner process; Mode 1 prepared on jog)")
+            initial_state = self.robot.read_state().arm[0]
+
+            self.serial = self.sensors.channels.camera_serial.value.decode()
+            color_intrinsics = json.loads(self.sensors.channels.camera_intrinsics.value.decode())
             self.camera_width, self.camera_height = color_intrinsics["width"], color_intrinsics["height"]
             self.intrinsics = np.array(
                 [
@@ -519,7 +524,6 @@ class CameraCalibrationSession:
                 f"  Intrinsics: fx={self.intrinsics[0, 0]:.1f} "
                 f"fy={self.intrinsics[1, 1]:.1f} ({self.camera_width}x{self.camera_height})"
             )
-            self.keys.start()
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
             self.window_created = True
             exit_code = self.run_control_loop(initial_state)
@@ -838,8 +842,10 @@ class CameraCalibrationSession:
         self.calibration_config = calib_cfg
         self.aruco_config = aruco_cfg
         self.ctx = mp.get_context("spawn")
-        self.runtime_state = RuntimeState(SensorChannels(self.ctx, camera=self.runtime.camera))
-        self.sensors = SensorProcesses(self.runtime_state)
+        self.runtime_state = RuntimeState()
+        self.sensors = SensorProcesses(
+            self.runtime_state, SensorChannels(self.ctx, camera=self.runtime.camera)
+        )
         self.keys = None
         self.window_created = False
         self.robot = DexManiRobot(

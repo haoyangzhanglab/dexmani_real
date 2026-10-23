@@ -1,15 +1,8 @@
-"""NumPy layouts for sensor IPC and local robot feedback."""
+"""NumPy layouts for camera, VR and point-cloud IPC."""
 
 from __future__ import annotations
 
 import numpy as np
-
-from dexmani_real.robot.model import (
-    ARM_JOINT_SHAPE,
-    HAND_JOINT_SHAPE,
-    HAND_TACTILE_FORCE_SHAPE,
-    HAND_TACTILE_SUM_SHAPE,
-)
 
 POINT_CLOUD_FEATURE_DIM = 6
 
@@ -35,28 +28,6 @@ def make_pointcloud_frame_dtype(num_points: int) -> np.dtype:
         align=True,
     )
 
-
-ARM_STATE_DTYPE = np.dtype(
-    [
-        ("qpos", "<f8", ARM_JOINT_SHAPE),
-        ("qvel", "<f8", ARM_JOINT_SHAPE),
-        ("effort", "<f8", ARM_JOINT_SHAPE),
-        ("timestamp_ns", "<u8"),
-    ]
-)
-HAND_STATE_DTYPE = np.dtype(
-    [
-        ("qpos", "<f8", HAND_JOINT_SHAPE),
-        ("current", "<f8", HAND_JOINT_SHAPE),
-        ("tactile_aggregate", "<f4", HAND_TACTILE_SUM_SHAPE),
-        ("tactile_dense", "<f4", HAND_TACTILE_FORCE_SHAPE),
-        # Oldest valid vector in each modality; taxel clocks stay inside the I/O owner.
-        ("tactile_aggregate_timestamp_ns", "<u8"),
-        ("tactile_dense_timestamp_ns", "<u8"),
-        # Last trustworthy joint read, independent of held tactile values.
-        ("timestamp_ns", "<u8"),
-    ]
-)
 
 # Right-hand publications cache head pose; recv_ts_ns is the older wrist/landmarks receive time.
 VR_FRAME_DTYPE = np.dtype(
@@ -106,9 +77,7 @@ def make_camera_frame_dtype(rgb_shape, depth_shape):
 
 
 __all__ = [
-    "ARM_STATE_DTYPE",
     "CAMERA_FRAME_HEADER_DTYPE",
-    "HAND_STATE_DTYPE",
     "POINT_CLOUD_FEATURE_DIM",
     "VR_FRAME_DTYPE",
     "make_pointcloud_frame_dtype",

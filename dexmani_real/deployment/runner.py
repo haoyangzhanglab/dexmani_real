@@ -4,7 +4,6 @@ import logging
 import time
 from collections import deque
 from concurrent.futures import CancelledError
-from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -13,62 +12,42 @@ from dexmani_real.data.recorder import (
     RecordingError,
     snapshot_recording_metadata,
 )
+from dexmani_real.data.results import error_detail
 from dexmani_real.deployment.observation import (
     build_policy_observation,
-    decision_expires_at_ns,
     policy_observation_issue,
     policy_sources,
 )
+from dexmani_real.deployment.schedule import (
+    ControlRejection,
+    PolicyQuery,
+    control_slot,
+    decision_expires_at_ns,
+    handoff_plan,
+    plan_rejection,
+    prefetch_handoff,
+    rtc_prefix_request,
+    run_budget,
+)
+from dexmani_real.planning.action import ActionIntent
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import Pose, rot6d_to_quat_wxyz
-from dexmani_real.robot.action import ActionIntent
 from dexmani_real.robot.commands import (
     DispatchError,
     DispatchInterrupted,
     DispatchStatus,
     RobotCommand,
 )
+from dexmani_real.robot.home import home_robot
 from dexmani_real.runtime.observation import (
     feedback_deadline_ns,
     read_observation,
+    upstream_deadline_ns,
 )
+from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.state import RunEndReason, SafetyState
-from dexmani_real.utils.episode_results import error_detail
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class PolicyQuery:
-    """slot anchors the observation; handoff_slot is the earliest planned takeover."""
-
-    query_id: int
-    run_id: int
-    slot: int
-    expires_at_ns: int
-    handoff_slot: int | None
-    result: np.ndarray | None = None
-    evidence: dict = field(default_factory=dict)
-
-
-@dataclass
-class ActionPlan:
-    """actions index from anchor_slot; async may consume the tail past nominal segment_end."""
-
-    actions: np.ndarray
-    anchor_slot: int
-    segment_end: int
-    expires_at_ns: int
-    frozen: dict[int, RobotCommand]
-    query_id: int
-
-
-@dataclass(frozen=True)
-class ControlRejection:
-    """A scheduling/target decision; only the episode owner applies termination."""
-
-    detail: str
-    run_end_reason: RunEndReason = RunEndReason.EXECUTOR_BOUNDARY
 
 
 class PolicyRunner:
@@ -79,9 +58,11 @@ class PolicyRunner:
         policy_info,
         *,
         robot,
+        needs,
+        sensors,
         action_mapper,
         recorder=None,
-        operator,
+        home_planner,
         model_runtime,
         kinematics,
         max_running_s,
@@ -93,7 +74,14 @@ class PolicyRunner:
         self.results = results
         self.runtime_state = runtime_state
         self.robot = robot
-        self.operator = operator
+        self.home_planner = home_planner
+        self.home_results = []
+        self.start_requested = False
+        self.keyboard = KeyboardInput(
+            estop_callback=runtime_state.request_emergency_stop,
+            stop_callback=self.request_stop,
+            quit_callback=self.request_quit,
+        )
         self.runtime = runtime
         self.policy_info = policy_info
         self.model = model_runtime
@@ -109,7 +97,8 @@ class PolicyRunner:
             deque(maxlen=policy_info.hand_history_steps)
             if policy_info.hand_history_steps is not None else None
         )
-        self.recording_started = False
+        # An attempted capture needs finalization even if its writer never becomes ready.
+        self.capture_attempted = False
         self.plan = None
         self.query = None
         self.query_id = 0
@@ -130,45 +119,203 @@ class PolicyRunner:
         self.completed = 0
         self.recording_attempts = 0
         self.action_mapper = action_mapper
-        fields = set(self.policy_info.observation_fields)
-        requires_rgb = "rgb" in fields
-        self.requires_cloud = "point_cloud" in fields
-        self.requires_camera = (
-            bool(fields & {"rgb", "camera_intrinsic", "camera_extrinsic"})
-            or self.recorder is not None
+        self.sensors = sensors
+        self.needs = needs
+
+    def request_start(self) -> bool:
+        with self.runtime_state.motion_lock:
+            if not self.runtime_state.command_may_cross_sdk(
+                run_id=self.runtime_state.run_id,
+                required_safety_state=SafetyState.ARMED,
+            ):
+                return False
+            self.start_requested = True
+            return True
+
+    def request_stop(self, *, reason=RunEndReason.OPERATOR) -> None:
+        """Fence motion even while the I/O owner is blocked in HOME, inference or SDK I/O."""
+        with self.runtime_state.motion_lock:
+            self.start_requested = False
+            self.runtime_state.request_stop(reason=reason)
+
+    def request_quit(self) -> None:
+        """Apply Q's motion fence before requesting session shutdown."""
+        with self.runtime_state.motion_lock:
+            self.start_requested = False
+            self.runtime_state.request_quit()
+
+    def poll_operator(self, *, allow_tactile_reset: bool = False) -> None:
+        if self.keyboard.estop_latched or not self.keyboard.healthy:
+            self.runtime_state.request_emergency_stop()
+            return
+        self.handle_command_batch(
+            self.keyboard.poll(timeout=0),
+            allow_tactile_reset=allow_tactile_reset,
         )
-        self.camera_header_only = not requires_rgb and self.recorder is None
-        self.requires_rgb_cloud_identity = (
-            requires_rgb or self.recorder is not None
-        ) and self.requires_cloud
+
+    def discard_pending_start(self):
+        self.keyboard.drain_signal(OperatorCommand.BEGIN)
+
+    def handle_command_batch(self, signals, *, allow_tactile_reset=False) -> None:
+        # HOME blocks; H/B/T from the same batch need a fresh request afterwards.
+        discard_preparation_in_batch = False
+        home_handled_in_batch = False
+        # S/Q suppress H/B/T throughout the batch; ESC uses the latch/callback.
+        stop_in_batch = any(
+            signal in {OperatorCommand.STOP, OperatorCommand.QUIT} for signal in signals
+        )
+        for signal in signals:
+            if signal is OperatorCommand.BEGIN:
+                if stop_in_batch:
+                    logger.warning("operator: ignored B received in the same batch as S/Q")
+                    continue
+                if discard_preparation_in_batch or not self.request_start():
+                    logger.warning(
+                        "operator: ignored B while stopped or after preparation in this batch"
+                    )
+                    continue
+            elif signal is OperatorCommand.STOP:
+                # Keyboard callbacks already revoked motion; a second revoke could cross a cleared stop request.
+                continue
+            elif signal is OperatorCommand.PAUSE:
+                logger.warning("operator: C is not used in policy deployment; ignored")
+            elif signal is OperatorCommand.DISCARD:
+                logger.warning("operator: D is not used in policy deployment; ignored")
+            elif signal is OperatorCommand.RESET_TACTILE:
+                if discard_preparation_in_batch:
+                    logger.warning("operator: ignored T after preparation in the same batch")
+                    continue
+                discard_preparation_in_batch = True
+                # B earlier in this batch may have created a pending start.
+                if stop_in_batch or self.start_requested or not allow_tactile_reset:
+                    logger.warning(
+                        "T ignored: tactile reset requires idle, no capture/reset/pending inference"
+                    )
+                    continue
+                if self.runtime_state.safety_state != SafetyState.ARMED:
+                    continue
+                try:
+                    logger.info(
+                        "正在请求触觉传感器复位，请保持手部无接触；S/Q/Esc 可中断后续请求。"
+                    )
+                    self.robot.reset_tactile_sensors(cancel_requested=self.home_abort_requested)
+                except CancelledError as exc:
+                    logger.info("%s", exc)
+                finally:
+                    for command in (
+                        OperatorCommand.RESET_TACTILE,
+                        OperatorCommand.HOME,
+                        OperatorCommand.BEGIN,
+                    ):
+                        self.keyboard.drain_signal(command)
+                return
+            elif signal is OperatorCommand.HOME:
+                if home_handled_in_batch:
+                    continue
+                if stop_in_batch:
+                    logger.warning("operator: ignored H received in the same batch as S/Q")
+                    continue
+                if self.run_home():
+                    home_handled_in_batch = True
+                    discard_preparation_in_batch = True
+            elif signal is OperatorCommand.QUIT:
+                # Listener stays available through final recording cleanup.
+                continue
+            elif signal is OperatorCommand.EMERGENCY_STOP:
+                self.runtime_state.request_emergency_stop()
+                return
+
+    def run_home(self) -> bool:
+        with self.runtime_state.motion_lock:
+            home_allowed = self.runtime_state.command_may_cross_sdk(
+                run_id=self.runtime_state.run_id,
+                required_safety_state=SafetyState.ARMED,
+            )
+            if home_allowed:
+                # Only the owner consumes S; HOME never clears a newer stop.
+                self.start_requested = False
+        if not home_allowed:
+            logger.warning("operator: ignored H unless ARMED without shutdown, fault or stop")
+            return False
+        home_result = {"outcome": "incomplete"}
+        self.home_results.append(home_result)
+        try:
+            logger.info("正在回初始位…")
+            result = home_robot(
+                self.runtime_state,
+                self.runtime,
+                self.home_planner,
+                robot=self.robot,
+                abort_requested=self.home_abort_requested,
+            )
+        except BaseException as exc:
+            home_result.update(outcome="fault", reason=f"{type(exc).__name__}: {exc}")
+            raise
+        with self.runtime_state.motion_lock:
+            completed_without_stop = result.ok and self.runtime_state.command_may_cross_sdk(
+                run_id=self.runtime_state.run_id,
+                required_safety_state=SafetyState.ARMED,
+            )
+        interrupted = bool(
+            result.interrupted
+            or (
+                result.ok
+                and (
+                    self.runtime_state.quit_requested
+                    or self.runtime_state.estop_request
+                    or self.runtime_state.stop_request
+                )
+            )
+        )
+        home_result.update(
+            outcome=(
+                "completed"
+                if completed_without_stop
+                else "interrupted" if interrupted else "failed"
+            ),
+            reason=result.reason,
+        )
+        if completed_without_stop:
+            logger.info("已回初始位，按 B 开始。")
+        else:
+            logger.warning("回初始位未完成，请检查当前姿态：%s", result.reason)
+        # Discard stale H/B/T after blocking HOME; preserve S/Q/ESC.
+        self.keyboard.drain_signal(OperatorCommand.RESET_TACTILE)
+        self.keyboard.drain_signal(OperatorCommand.HOME)
+        self.keyboard.drain_signal(OperatorCommand.BEGIN)
+        return True
+
+    def home_abort_requested(self) -> bool:
+        self.robot.check()
+        return bool(
+            not self.runtime_state.running
+            or self.runtime_state.quit_requested
+            or self.runtime_state.error_state
+            or self.runtime_state.estop_request
+            or self.runtime_state.stop_request
+        )
 
     def read_observation(self, *, wait_for_hand=False):
         self.observation_read_issues.clear()
-        return read_observation(
-            self.runtime_state,
+        row = read_observation(
+            self.sensors.channels,
             self.runtime,
             self.robot,
             issues=self.observation_read_issues,
             require_hand=True,
-            require_camera=self.requires_camera,
-            camera_header_only=self.camera_header_only,
-            require_pointcloud=self.requires_cloud,
-            require_rgb_cloud_identity=self.requires_rgb_cloud_identity,
+            needs=self.needs,
             wait_for_hand=wait_for_hand,
             cancel_requested=lambda: not self.preparation_valid(),
         )
+        if row is not None:
+            self.robot.arm.update_health(upstream_until_ns=upstream_deadline_ns(row, self.runtime))
+        return row
 
     def budget_limit(self):
-        deadlines = []
-        if self.run_id is not None:
-            if self.max_running_s is not None:
-                deadlines.append((self.started_ns + int(self.max_running_s * 1e9), "duration"))
-            if self.wait_started_ns is not None:
-                deadlines.append(
-                    (self.wait_started_ns + int(self.execution.max_wait_s * 1e9), "wait")
-                )
-        # WAIT wins a tie: no action was supplied before its strict deadline.
-        return min(deadlines, key=lambda item: (item[0], item[1] != "wait")) if deadlines else None
+        return run_budget(
+            run_id=self.run_id, started_ns=self.started_ns, max_running_s=self.max_running_s,
+            wait_started_ns=self.wait_started_ns, max_wait_s=self.execution.max_wait_s,
+        )
 
     def expired_budget(self):
         limit = self.budget_limit()
@@ -207,9 +354,9 @@ class PolicyRunner:
                 prediction_index=self.slot_timing.get("prediction_index"),
             )
         self.runtime_state.revoke_motion(reason=run_end_reason, expected_run_id=epoch)
-        self.operator.discard_pending_start()
+        self.discard_pending_start()
         with self.runtime_state.motion_lock:
-            self.operator.start_requested = False
+            self.start_requested = False
             stopped_epoch = self.runtime_state.run_id
             reason = (
                 self.runtime_state.run_ended_reason
@@ -279,7 +426,7 @@ class PolicyRunner:
         errors = list(errors or ())
         failure, raw = None, None
         try:
-            if self.recorder is not None and self.recording_started:
+            if self.recorder is not None and self.capture_attempted:
                 saved = None
                 try:
                     saved = self.recorder.save_episode(
@@ -316,7 +463,7 @@ class PolicyRunner:
             if failure is not None:
                 raise failure
         finally:
-            self.recording_started = False
+            self.capture_attempted = False
 
     def observation_issue(self, row):
         if row is None and self.observation_read_issues:
@@ -360,9 +507,9 @@ class PolicyRunner:
     def begin_episode(self):
         if self.preparing_epoch is None:
             with self.runtime_state.motion_lock:
-                if not self.operator.start_requested:
+                if not self.start_requested:
                     return
-                self.operator.start_requested = False
+                self.start_requested = False
                 if self.model.future is not None:
                     return
                 if not self.runtime_state.command_may_cross_sdk(
@@ -371,7 +518,7 @@ class PolicyRunner:
                 ):
                     return
                 epoch = self.runtime_state.run_id
-            self.recording_started = False
+            self.capture_attempted = False
             self.termination_timing = None
             self.preparation_issue = None
             self.preparing_epoch = epoch
@@ -416,11 +563,11 @@ class PolicyRunner:
         try:
             if self.recorder is not None:
                 metadata = snapshot_recording_metadata(
-                    self.runtime_state.sensors,
+                    self.sensors.channels,
                     camera_calibration=self.camera_calibration,
                     hand=self.robot.hand,
                 )
-                self.recording_started = True
+                self.capture_attempted = True
                 # Failed preparations can publish Raw without counting as completed runs.
                 self.recording_attempts += 1
                 self.recorder.start_episode(
@@ -485,19 +632,17 @@ class PolicyRunner:
                     raise
                 finally:
                     try:
-                        self.finalize_outputs(
-                            (
-                                "preparation_failed"
-                                if self.preparation_issue or (start_failure and not cancelled)
-                                else "start_cancelled"
-                            ),
-                            (
-                                str(start_failure)
-                                if start_failure
-                                else self.preparation_issue or "final admission declined"
-                            ),
-                            errors=errors,
+                        reason = (
+                            "preparation_failed"
+                            if self.preparation_issue or (start_failure and not cancelled)
+                            else "start_cancelled"
                         )
+                        detail = (
+                            str(start_failure)
+                            if start_failure
+                            else self.preparation_issue or "final admission declined"
+                        )
+                        self.finalize_outputs(reason, detail, errors=errors)
                     except Exception:
                         if start_failure is None or cancelled:
                             raise
@@ -627,11 +772,10 @@ class PolicyRunner:
 
     def prepare_prefix(self, row, slot):
         """Prepare the whole guidance tail and d physical commands without committing either."""
-        start = slot - self.plan.anchor_slot
-        prefix = self.plan.actions[start:].copy()
+        prefix, slots = rtc_prefix_request(self.plan, slot, self.execution.prefetch_steps)
         commands, previous = {}, self.previous_arm
-        for index in range(self.execution.prefetch_steps):
-            self.operator.poll()
+        for index, command_slot in enumerate(slots):
+            self.poll_operator()
             if not self.has_motion_authority():
                 return None, None, ControlRejection("prefix_authority_revoked")
             expired = self.expired_budget()
@@ -642,7 +786,7 @@ class PolicyRunner:
             )
             if issue is not None:
                 return None, None, issue
-            commands[slot + index] = command
+            commands[command_slot] = command
             previous = command.arm_qpos
             prefix[index] = self.action_mapper.control_from_command(
                 command, self.policy_info.action_mode
@@ -650,7 +794,7 @@ class PolicyRunner:
         return prefix, commands, None
 
     def record_query(self, query):
-        if self.recorder is not None and self.recording_started:
+        if self.recorder is not None and self.capture_attempted:
             self.recorder.record_query(query.evidence)
 
     def record(self, row, command=None, result=None):
@@ -804,63 +948,22 @@ class PolicyRunner:
         if slot + 1 == plan.segment_end and self.execution.execution_mode == "sync":
             self.plan = None
 
-    def handoff(self, slot):
-        query = self.query
-        if query is None or query.run_id != self.run_id:
-            return None, None
-        bootstrap = query.handoff_slot is None
-        handoff = slot if bootstrap and query.result is not None else query.handoff_slot
-        if handoff is None or slot < handoff:
-            return None, None
-        if not self.has_motion_authority():
-            return None, ControlRejection("handoff_authority_revoked")
-        ordinary_async = self.execution.execution_mode == "async" and not bootstrap
-        if not ordinary_async and slot != handoff:
-            return None, ControlRejection("handoff_slot_missed")
-        if query.result is None:
-            if ordinary_async:
-                return None, None
-            return None, ControlRejection("handoff_result_not_ready")
-        segment_end = slot + self.execution.action_steps
-        if ordinary_async:
-            if not 0 <= slot - query.slot < len(query.result):
-                return None, ControlRejection("handoff_prediction_exhausted")
-            if time.monotonic_ns() >= query.expires_at_ns:
-                return None, ControlRejection("handoff_decision_expired")
-            segment_end = min(segment_end, query.slot + len(query.result))
-        return (
-            ActionPlan(
-                actions=query.result,
-                anchor_slot=slot if bootstrap else query.slot,
-                segment_end=segment_end,
-                expires_at_ns=query.expires_at_ns,
-                frozen={},
-                query_id=query.query_id,
-            ),
-            None,
+    def submit_prefetch(self, row, rows, slot):
+        handoff_slot, issue = prefetch_handoff(
+            self.plan, slot=slot, mode=self.execution.execution_mode,
+            prefetch_steps=self.execution.prefetch_steps,
+            query_pending=self.query is not None, model_pending=self.model.future is not None,
+            history_ready=bool(rows),
         )
-
-    def prefetch(self, row, rows, slot):
-        mode = self.execution.execution_mode
-        if mode == "sync":
-            return None
-        prefetch_slot = self.plan.segment_end - self.execution.prefetch_steps
-        if mode == "async":
-            if slot < prefetch_slot:
-                return None
-        elif slot != prefetch_slot:
-            return None
-        if self.query is not None or self.model.future is not None:
-            return None if mode == "async" else ControlRejection("prefetch_unavailable")
-        if not rows:
-            return ControlRejection("prefetch_unavailable")
+        if issue is not None or handoff_slot is None:
+            return issue
         prefix = commands = None
-        if mode == "rtc":
+        if self.execution.execution_mode == "rtc":
             prefix, commands, issue = self.prepare_prefix(row, slot)
             if issue is not None:
                 return issue
         return self.submit(
-            rows, slot, handoff_slot=self.plan.segment_end, prefix=prefix, commands=commands
+            rows, slot, handoff_slot=handoff_slot, prefix=prefix, commands=commands
         )
 
     def step(self):
@@ -873,7 +976,7 @@ class PolicyRunner:
         if self.run_id is None:
             if self.preparing_epoch is None and not self.robot.stop_required:
                 self.runtime_state.acknowledge_stop(self.runtime_state.run_id)
-            if self.preparing_epoch is not None or self.operator.start_requested:
+            if self.preparing_epoch is not None or self.start_requested:
                 self.begin_episode()
             if self.run_id is None:
                 return
@@ -881,19 +984,15 @@ class PolicyRunner:
             self.finish_budget(expired)
             return
         now = time.monotonic_ns()
-        synchronous = self.execution.execution_mode == "sync"
-        if (
-            synchronous
-            and self.plan is None
-            and self.query is not None
-            and self.query.result is not None
-        ):
-            # Resume without an extra grid wait, using a new physical observation.
-            self.next_step_ns = min(self.next_step_ns, now)
-        if now < self.next_step_ns:
+        slot, self.next_step_ns, skipped = control_slot(
+            now_ns=now, next_step_ns=self.next_step_ns, last_slot=self.last_slot,
+            dt_ns=self.dt_ns, synchronous=self.execution.execution_mode == "sync",
+            resume_ready=(
+                self.plan is None and self.query is not None and self.query.result is not None
+            ),
+        )
+        if slot is None:
             return
-        slot = self.last_slot + 1
-        skipped = (now - self.next_step_ns) // self.dt_ns
         if skipped:
             if self.results is not None:
                 self.results.record_skipped_slots(skipped)
@@ -901,7 +1000,6 @@ class PolicyRunner:
             return
         self.slot_timing = dict(run_id=self.run_id, slot=int(slot), control_ns=now)
         self.last_slot = slot
-        self.next_step_ns = (now if synchronous else self.next_step_ns) + self.dt_ns
         row = None
         try:
             row = self.read_observation()
@@ -915,7 +1013,11 @@ class PolicyRunner:
                 return
             self.history.append(row)
             rows = tuple(self.history) if len(self.history) == self.history.maxlen else ()
-            new_plan, issue = self.handoff(slot)
+            new_plan, issue = handoff_plan(
+                self.query, run_id=self.run_id, slot=slot,
+                mode=self.execution.execution_mode, action_steps=self.execution.action_steps,
+                now_ns=time.monotonic_ns(), authorized=self.has_motion_authority(),
+            )
             if issue is not None:
                 self.finish_episode(issue.detail, run_end_reason=issue.run_end_reason, row=row)
                 return
@@ -943,19 +1045,21 @@ class PolicyRunner:
                 self.record(row)
             else:
                 if self.execution.execution_mode == "async":
-                    if not 0 <= slot - self.plan.anchor_slot < len(self.plan.actions):
-                        self.finish_episode("plan_exhausted_without_handoff", row=row)
+                    issue = plan_rejection(self.plan, slot, "async", time.monotonic_ns())
+                    if issue is not None:
+                        self.finish_episode(issue.detail, row=row)
                         return
-                    if time.monotonic_ns() >= self.plan.expires_at_ns:
-                        self.finish_episode("dispatch_deadline_expired", row=row)
-                        return
-                issue = self.prefetch(row, rows, slot)
+                issue = self.submit_prefetch(row, rows, slot)
                 if issue is not None:
                     self.finish_episode(issue.detail, run_end_reason=issue.run_end_reason, row=row)
                     return
-                if self.execution.execution_mode != "async" and slot >= self.plan.segment_end:
-                    self.finish_episode("plan_exhausted_without_handoff", row=row)
-                    return
+                if self.execution.execution_mode != "async":
+                    issue = plan_rejection(
+                        self.plan, slot, self.execution.execution_mode, time.monotonic_ns()
+                    )
+                    if issue is not None:
+                        self.finish_episode(issue.detail, row=row)
+                        return
                 # Pending prefetch never suspends a still-valid current plan.
                 self.execute_slot(row, slot)
             if (expired := self.expired_budget()) is not None:
@@ -988,7 +1092,7 @@ class PolicyRunner:
         try:
             while self.runtime_state.running and not self.runtime_state.quit_requested:
                 self.robot.arm.check_error()
-                self.operator.poll(
+                self.poll_operator(
                     allow_tactile_reset=(
                         self.run_id is None
                         and self.preparing_epoch is None
@@ -1015,7 +1119,7 @@ class PolicyRunner:
             else:
                 reason = RunEndReason.POLICY_FAILURE
             self.runtime_state.mark_error()
-            self.runtime_state.end_session(reason=reason)
+            self.sensors.request_shutdown(reason=reason)
         finally:
             try:
                 self.finish_episode(str(failure) if failure else "shutdown", run_end_reason=reason)
@@ -1031,23 +1135,21 @@ class PolicyRunner:
                     "policy shutdown stop failed before remaining artifact finalization"
                 )
             try:
-                if self.recording_started or (
+                if self.capture_attempted or (
                     self.results is not None and self.results.current is not None
                 ):
+                    cancelled = isinstance(failure, KeyboardInterrupt) or (
+                        failure is None and (
+                            self.runtime_state.stop_request
+                            or self.runtime_state.quit_requested
+                            or self.runtime_state.estop_request
+                        )
+                    )
+                    preparation_reason = "start_cancelled" if cancelled else "preparation_failed"
+                    detail = str(failure) if failure else "shutdown"
+                    errors = [error_detail("preparation", failure)] if failure else []
                     self.finalize_outputs(
-                        (
-                            "start_cancelled"
-                            if isinstance(failure, KeyboardInterrupt) or (
-                                failure is None and (
-                                    self.runtime_state.stop_request
-                                    or self.runtime_state.quit_requested
-                                    or self.runtime_state.estop_request
-                                )
-                            )
-                            else "preparation_failed"
-                        ),
-                        str(failure) if failure else "shutdown",
-                        errors=[error_detail("preparation", failure)] if failure else [],
+                        preparation_reason, detail, errors=errors,
                     )
             except Exception as exc:
                 failure = failure or exc

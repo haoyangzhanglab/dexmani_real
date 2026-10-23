@@ -170,12 +170,3 @@ def policy_sources(row, fields):
             raise ValueError(f"No source clock for {name}")
         sources[name] = times
     return sources
-
-
-def decision_expires_at_ns(sources, now_ns, max_age_ns):
-    """An exclusive deadline preserves age <= budget on the integer-nanosecond clock."""
-    timestamps = [stamp for times in sources.values() for stamp in times]
-    if not timestamps or any(stamp <= 0 or stamp > now_ns for stamp in timestamps):
-        return None
-    expires_at_ns = min(timestamps) + max_age_ns + 1
-    return expires_at_ns if now_ns < expires_at_ns else None

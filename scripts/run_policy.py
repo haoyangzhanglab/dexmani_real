@@ -5,11 +5,8 @@ from __future__ import annotations
 
 import argparse
 import math
-import subprocess
-import time
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
 
 
 def positive_int(raw: str) -> int:
@@ -149,66 +146,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def safe_selector_parts(selector: Any) -> tuple[str, str, str]:
-    if not isinstance(selector, str):
-        raise ValueError("Policy selector must be a string")
-    parts = tuple(selector.split("/"))
-    if len(parts) != 3 or any(
-        not part or part in {".", ".."} or "\\" in part or Path(part).name != part
-        for part in parts
-    ):
-        raise ValueError("experiment must be a canonical policy/task/experiment selector")
-    return parts[0], parts[1], parts[2]
-
-
-def session_directory(root: Path, selector: str) -> Path:
-    parts = safe_selector_parts(selector)
-    root = root.expanduser().resolve()
-    base = root / Path(*parts)
-    if not base.resolve().is_relative_to(root):
-        raise ValueError("session output must remain inside its root")
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    candidate = base / f"session_{stamp}"
-    dedup = 1
-    while candidate.exists():
-        candidate = base / f"session_{stamp}_{dedup:02d}"
-        dedup += 1
-    candidate.mkdir(parents=True, exist_ok=False)
-    return candidate
-
-
-def write_run_config(session_dir, *, args, runtime, info):
-    import dexmani_policy
-    import yaml
-
-    def head(root):
-        try:
-            return subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.DEVNULL
-            ).strip()
-        except (OSError, subprocess.CalledProcessError):
-            return None
-
-    compact_info = info.to_dict()
-    payload = {
-        "experiment": args.experiment,
-        "checkpoint": args.checkpoint,
-        "policy": compact_info,
-        "future_steps": info.horizon - info.n_obs_steps + 1,
-        "runtime": asdict(runtime),
-        "seed": args.seed,
-        "device": args.device,
-        "num_episodes": args.num_episodes,
-        "max_duration_s": args.max_running_s,
-        "record_raw": not args.no_record,
-        "record_results": not args.no_results,
-        "n_action_steps_override": args.n_action_steps,
-        "dexmani_real_head": head(Path(__file__).resolve().parents[1]),
-        "dexmani_policy_head": head(Path(dexmani_policy.__file__).resolve().parents[1]),
-    }
-    (session_dir / "run_config.yaml").write_text(yaml.safe_dump(payload, sort_keys=False))
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -232,67 +169,24 @@ def main(argv: list[str] | None = None) -> int:
         print(yaml.safe_dump(asdict(runtime), allow_unicode=True, sort_keys=False), end="")
         return 0
 
-    from dexmani_policy.deployment import inspect_policy
+    from dexmani_real.deployment.run import run_policy
 
-    info = inspect_policy(
+    return run_policy(
         args.experiment,
+        runtime,
         checkpoint=args.checkpoint,
         weights=args.weights,
         inference_steps=args.inference_steps,
-    )
-
-    from dexmani_real.deployment.preflight import validate_deployment_config
-
-    action_steps = runtime.execution.action_steps
-    if action_steps is None:
-        action_steps = info.n_action_steps
-    runtime = replace(runtime, execution=replace(runtime.execution, action_steps=action_steps))
-    validate_deployment_config(info, runtime, record_raw=not args.no_record)
-    selector = "/".join((info.policy_name, info.task_name, info.experiment_dir.name))
-
-    session_dir = None
-    recording_dir = None
-    if not (args.no_record and args.no_results):
-        root = args.output or Path(__file__).resolve().parents[1] / "rollouts"
-        session_dir = session_directory(root, selector)
-        if not args.no_record:
-            recording_dir = session_dir
-    elif args.output is not None:
-        print(
-            "--no-record --no-results: --output is unused; no session artifacts will be created"
-        )
-
-    print(f"策略：{args.experiment}")
-    print(
-        f"评估：{args.num_episodes} 轮正式运行结束后退出 | 每轮预算 {args.max_running_s:g} s | "
-        f"输入：{', '.join(info.observation_fields)}"
-    )
-    print(f"输出：{session_dir}" if session_dir else "输出：Raw 和评估摘要均关闭")
-    from dexmani_real.deployment.session import PolicyDeploymentSession
-
-    return PolicyDeploymentSession(
-        runtime,
-        info,
         device=args.device,
         seed=args.seed,
-        max_running_s=args.max_running_s,
         num_episodes=args.num_episodes,
-        recording_dir=recording_dir,
-        results_dir=session_dir if not args.no_results else None,
+        max_running_s=args.max_running_s,
+        record_raw=not args.no_record,
+        record_results=not args.no_results,
+        output=args.output,
         camera_calibration_path=args.camera_calibration,
-        save_run_config=(
-            (
-                lambda resolved: write_run_config(
-                    session_dir,
-                    args=args,
-                    runtime=resolved,
-                    info=info,
-                )
-            )
-            if session_dir is not None
-            else None
-        ),
-    ).run()
+        action_steps_override=args.n_action_steps,
+    )
 
 
 if __name__ == "__main__":

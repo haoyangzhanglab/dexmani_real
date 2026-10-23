@@ -114,8 +114,8 @@ def quality_measurements(
     }
 
 
-def read_heading(runtime_state: RuntimeState, reference: str):
-    result = runtime_state.sensors.vr_ring.read_latest(use_last_good=True)
+def read_heading(channels: SensorChannels, reference: str):
+    result = channels.vr_ring.read_latest(use_last_good=True)
     if result is None:
         return None
     frame = result[0][0]
@@ -127,7 +127,7 @@ def read_heading(runtime_state: RuntimeState, reference: str):
 
 
 def wait_for_vr_tracking(
-    runtime_state: RuntimeState,
+    channels: SensorChannels,
     sensors: SensorProcesses,
     reference: str,
     timeout_s: float,
@@ -137,7 +137,7 @@ def wait_for_vr_tracking(
     while time.monotonic() < deadline:
         if not sensors.check():
             return False
-        if read_heading(runtime_state, reference) is not None:
+        if read_heading(channels, reference) is not None:
             print("  VR tracking active\n", flush=True)
             return True
         now = time.monotonic()
@@ -214,10 +214,11 @@ def main(argv: list[str] | None = None) -> int:
 
     configure_logging()
     ctx = mp.get_context("spawn")
-    runtime_state = RuntimeState(SensorChannels(ctx, vr=True))
-    sensors = SensorProcesses(runtime_state)
+    runtime_state = RuntimeState()
+    channels = SensorChannels(ctx, vr=True)
+    sensors = SensorProcesses(runtime_state, channels)
     vr_proc = ctx.Process(
-        name="vr", target=run_vr_worker, args=(runtime_state.sensors, vr_config), daemon=True
+        name="vr", target=run_vr_worker, args=(channels, vr_config), daemon=True
     )
     forwards: list[np.ndarray] = []
     stale_count = 0
@@ -229,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             sensors.start(
                 vr_proc,
-                ready=runtime_state.sensors.vr_ready,
+                ready=channels.vr_ready,
                 timeout_s=cfg.vr_ready_timeout_s,
             )
         except RuntimeError as exc:
@@ -238,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
         print("  VR connected", flush=True)
 
         print("  Waiting for VR tracking data (up to 15 s)...", flush=True)
-        if not wait_for_vr_tracking(runtime_state, sensors, args.ref, cfg.tracking_data_timeout_s):
+        if not wait_for_vr_tracking(channels, sensors, args.ref, cfg.tracking_data_timeout_s):
             print("  ERROR: no VR tracking data received", flush=True)
             return 1
 
@@ -262,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
             if not sensors.check():
                 print("  ERROR: VR receiver exited during collection", flush=True)
                 return 1
-            sample = read_heading(runtime_state, args.ref)
+            sample = read_heading(channels, args.ref)
             if sample is None:
                 time.sleep(POLL_INTERVAL_S)
                 continue

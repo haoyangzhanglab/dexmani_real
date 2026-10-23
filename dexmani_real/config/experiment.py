@@ -27,12 +27,12 @@ from dexmani_real.config.environment import (
     TableCollisionConfig,
     validate_table_plane,
 )
+from dexmani_real.config.execution import ExecutionConfig
 from dexmani_real.robot.xarm7.config import ArmParams
-from dexmani_real.sensor.camera.config import CameraParams
 from dexmani_real.robot.xhand.config import HandParams
-from dexmani_real.sensor.vr.config import VRParams
+from dexmani_real.sensor.camera.config import CameraParams
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
-from dexmani_real.deployment.config import ExecutionConfig
+from dexmani_real.sensor.vr.config import VRParams
 
 
 @dataclass(frozen=True)

@@ -9,18 +9,22 @@ from enum import Enum
 import numpy as np
 
 from dexmani_real.data.raw.schema import validate_execution_boundary
+from dexmani_real.planning.action import project_arm_command, project_hand_command
 from dexmani_real.planning.collision import CollisionModel
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.planning.target import TargetChecker
 from dexmani_real.replay.capture import ReplayRecorder
-from dexmani_real.robot.action import project_arm_command, project_hand_command
 from dexmani_real.robot.commands import (
     RobotCommand,
     DispatchError,
     DispatchInterrupted,
     DispatchResult,
 )
-from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
+from dexmani_real.runtime.observation import (
+    feedback_deadline_ns,
+    read_observation,
+    upstream_deadline_ns,
+)
 from dexmani_real.runtime.operator_input import OperatorCommand
 from dexmani_real.runtime.state import RunEndReason
 from dexmani_real.utils.timing import sampling_clock_ns
@@ -130,7 +134,9 @@ class TrajectoryReplayer:
         if results is not None:
             results.begin_episode()
         self.robot.prepare_streaming(self.epoch)
-        row = read_observation(self.runtime_state, self.runtime, self.robot)
+        row = read_observation(None, self.runtime, self.robot)
+        if row is not None:
+            self.robot.arm.update_health(upstream_until_ns=upstream_deadline_ns(row, self.runtime))
         if row is None:
             status, reason = ReplayStatus.REJECTED, "fresh robot feedback unavailable"
         else:
@@ -200,7 +206,9 @@ class TrajectoryReplayer:
                     revoked=True,
                     cause="deadline_expired",
                 )
-            row = read_observation(self.runtime_state, self.runtime, self.robot)
+            row = read_observation(None, self.runtime, self.robot)
+            if row is not None:
+                self.robot.arm.update_health(upstream_until_ns=upstream_deadline_ns(row, self.runtime))
             if row is None:
                 status, reason = ReplayStatus.REJECTED, "robot feedback stale"
                 break
@@ -420,7 +428,9 @@ class TrajectoryReplayer:
             interrupted = self.wait_replay(epoch, deadline_ns)
             if interrupted is not None:
                 return interrupted
-            row = read_observation(self.runtime_state, self.runtime, self.robot)
+            row = read_observation(None, self.runtime, self.robot)
+            if row is not None:
+                self.robot.arm.update_health(upstream_until_ns=upstream_deadline_ns(row, self.runtime))
             if row is None:
                 return ReplayOutcome(ReplayStatus.REJECTED, reason="hand start feedback stale")
             if np.max(np.abs(row.arm["qpos"][0] - arm_hold)) > np.deg2rad(10):

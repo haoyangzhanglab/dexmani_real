@@ -1,37 +1,28 @@
-"""Own the local policy/robot, sensor processes and operator lifecycle."""
+"""Assemble and close deployment resources; PolicyRunner owns the experiment lifecycle."""
 
 import logging
 import multiprocessing as mp
 import time
-from dataclasses import replace
-from pathlib import Path
 
 from dexmani_real.calibration.camera.extrinsics import (
     CameraExtrinsics,
     load_optional_camera_extrinsics,
 )
-from dexmani_real.config.experiment import resolve_runtime_table
 from dexmani_real.data.recorder import AsyncEpisodeRecorder
-from dexmani_real.deployment.config import (
-    validate_max_running_s,
-    validate_num_episodes,
-)
+from dexmani_real.data.results import EpisodeResults, error_detail
 from dexmani_real.deployment.observation import (
     build_observation_camera,
     build_observation_kinematics,
 )
-from dexmani_real.deployment.operator import PolicyOperator
-from dexmani_real.deployment.preflight import validate_deployment_config
 from dexmani_real.deployment.runner import PolicyRunner
 from dexmani_real.ipc.channels import SensorChannels
-from dexmani_real.robot.action import ActionMapper
+from dexmani_real.planning.action import ActionMapper
 from dexmani_real.robot.home import build_home_planner
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
-from dexmani_real.runtime.state import RuntimeState, RunEndReason
+from dexmani_real.runtime.state import RunEndReason, RuntimeState
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.pointcloud.worker import PointCloudWorkerConfig, run_pointcloud_worker
-from dexmani_real.utils.episode_results import EpisodeResults, error_detail
 from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -54,7 +45,7 @@ def load_configured_policy(info, execution_config, *, device, seed):
         raise
 
 
-class PolicyDeploymentSession:
+class _PolicySession:
     """Own deployment resources while the inference worker serializes model work."""
 
     def __init__(
@@ -62,6 +53,7 @@ class PolicyDeploymentSession:
         runtime,
         info,
         *,
+        needs,
         device="cuda:0",
         seed=0,
         max_running_s=None,
@@ -69,7 +61,6 @@ class PolicyDeploymentSession:
         recording_dir=None,
         results_dir=None,
         camera_calibration_path=None,
-        save_run_config=None,
     ):
         self.runtime = runtime
         self.info = info
@@ -80,22 +71,11 @@ class PolicyDeploymentSession:
         self.recording_dir = recording_dir
         self.results_dir = results_dir
         self.camera_calibration_path = camera_calibration_path
-        self.save_run_config = save_run_config
+        self.needs = needs
 
     def run(self):
         """Run a session with independently optional Raw recording and evaluation summaries."""
-        cloud_recipe = validate_deployment_config(
-            self.info, self.runtime, record_raw=self.recording_dir is not None
-        )
-        self.max_running_s = validate_max_running_s(self.max_running_s)
-        self.num_episodes = validate_num_episodes(self.num_episodes)
         configure_logging()
-
-        if cloud_recipe is not None:
-            self.runtime = replace(self.runtime, pointcloud=cloud_recipe)
-        self.runtime = resolve_runtime_table(self.runtime, pointcloud=cloud_recipe)
-        if self.recording_dir is not None:
-            self.recording_dir = Path(self.recording_dir).expanduser().resolve()
         print(
             f"执行：{self.info.checkpoint_path.name} ({self.info.weights}) | NFE={self.info.inference_steps} | "
             f"A_exec={self.runtime.execution.action_steps} | {self.runtime.execution.execution_mode} | "
@@ -106,13 +86,18 @@ class PolicyDeploymentSession:
             EpisodeResults(self.results_dir, "policy") if self.results_dir is not None else None
         )
         self.runtime_state = self.sensors = self.robot = None
-        self.model = self.operator = self.recorder = None
+        self.model = self.runner = self.recorder = None
         failure = None
         clean = False
         try:
-            self.prepare_resources(cloud_recipe)
+            self.prepare_resources()
             self.start_devices()
-            self.run_control()
+            print(
+                "就绪（无需回车）：H 回初始位 → B 开始 | S 结束本轮 | Q 退出 | Esc 急停 | "
+                "T 请求复位触觉（空闲且无接触）。",
+                flush=True,
+            )
+            self.runner.run()
             clean = bool(
                 self.runtime_state.quit_requested
                 and not self.runtime_state.estop_request
@@ -131,17 +116,11 @@ class PolicyDeploymentSession:
             exit_code = self.close(clean=clean, failure=failure)
         return exit_code
 
-    def prepare_resources(self, cloud_recipe):
+    def prepare_resources(self):
         from dexmani_real.deployment.inference import InferenceWorker
 
         fields = set(self.info.observation_fields)
-        cloud = "point_cloud" in fields
-        # Parameters, cloud production and RGB-D recording share the camera worker.
-        camera = (
-            bool(fields & {"point_cloud", "rgb", "camera_intrinsic", "camera_extrinsic"})
-            or self.recording_dir is not None
-        )
-        if cloud or "camera_extrinsic" in fields:
+        if self.needs.point_cloud or "camera_extrinsic" in fields:
             self.camera_calibration = CameraExtrinsics(self.camera_calibration_path)
         elif self.recording_dir is not None:
             self.camera_calibration = load_optional_camera_extrinsics(self.camera_calibration_path)
@@ -149,37 +128,34 @@ class PolicyDeploymentSession:
             self.camera_calibration = None
         self.pointcloud_config = (
             PointCloudWorkerConfig(
-                pointcloud=cloud_recipe,
+                pointcloud=self.runtime.pointcloud,
                 camera_calibration=self.camera_calibration,
                 table_plane_abcd=self.runtime.environment.table.plane_abcd,
             )
-            if cloud
+            if self.needs.point_cloud
             else None
         )
         self.process_context = mp.get_context("spawn")
-        self.runtime_state = RuntimeState(
+        self.runtime_state = RuntimeState()
+        channels = (
             SensorChannels(
                 self.process_context,
                 camera=self.runtime.camera,
-                pointcloud_num_points=self.runtime.pointcloud.num_points if cloud else None,
+                pointcloud_num_points=(
+                    self.runtime.pointcloud.num_points if self.needs.point_cloud else None
+                ),
             )
-            if camera
+            if self.needs.camera_worker
             else None
         )
-        self.sensors = SensorProcesses(self.runtime_state) if camera else None
+        self.sensors = SensorProcesses(self.runtime_state, channels)
         self.robot = DexManiRobot(
             self.runtime_state,
             self.runtime,
-            check_services=self.sensors.check if self.sensors else None,
-            required_tactile=tuple(
-                channel
-                for field, channel in (
-                    ("finger_tactile_force", "aggregate"),
-                    ("taxel_tactile_force", "dense"),
-                )
-                if field in fields or self.recording_dir is not None
-            ),
+            check_services=self.sensors.check,
+            required_tactile=self.needs.required_tactile,
         )
+
         self.model = InferenceWorker(
             lambda: load_configured_policy(
                 self.info,
@@ -204,11 +180,9 @@ class PolicyDeploymentSession:
             self.runtime.execution.rtc_guidance_cap,
             self.recording_dir is not None,
         )
-        self.kinematics = build_observation_kinematics(self.info, self.runtime)
-        self.action_mapper = ActionMapper.for_mode(self.runtime, self.info.action_mode)
-        self.home_planner = build_home_planner(self.runtime)
-        if self.save_run_config is not None:
-            self.save_run_config(self.runtime)
+        kinematics = build_observation_kinematics(self.info, self.runtime)
+        action_mapper = ActionMapper.for_mode(self.runtime, self.info.action_mode)
+        home_planner = build_home_planner(self.runtime)
         self.recorder = (
             AsyncEpisodeRecorder(
                 self.recording_dir,
@@ -218,72 +192,60 @@ class PolicyDeploymentSession:
             else None
         )
 
-    def start_devices(self):
-        self.operator = PolicyOperator(
+        self.runner = PolicyRunner(
             self.runtime_state,
             self.runtime,
-            self.home_planner,
+            self.info,
             robot=self.robot,
+            action_mapper=action_mapper,
+            needs=self.needs,
+            sensors=self.sensors,
+            recorder=self.recorder,
+            home_planner=home_planner,
+            model_runtime=self.model,
+            kinematics=kinematics,
+            max_running_s=self.max_running_s,
+            num_episodes=self.num_episodes,
+            camera_calibration=self.camera_calibration,
+            results=self.results,
         )
-        self.operator.keyboard.start()
+
+    def start_devices(self):
+        self.runner.keyboard.start()
         self.robot.check_services = lambda: (
-            self.operator.keyboard.healthy and (self.sensors is None or self.sensors.check())
+            self.runner.keyboard.healthy and self.sensors.check()
         )
         self.robot.connect()
-        if self.sensors is not None:
+        if self.needs.camera_worker:
             self.sensors.start(
                 self.process_context.Process(
                     name="camera",
                     target=run_camera_worker,
-                    args=(self.runtime_state.sensors, self.runtime.camera),
+                    args=(self.sensors.channels, self.runtime.camera),
                 ),
-                ready=self.runtime_state.sensors.camera_ready,
+                ready=self.sensors.channels.camera_ready,
                 timeout_s=self.runtime.safety.camera_ready_timeout_s,
-                check_services=lambda: self.operator.keyboard.healthy,
+                check_services=lambda: self.runner.keyboard.healthy,
             )
         if self.pointcloud_config is not None:
             self.sensors.start(
                 self.process_context.Process(
                     name="pointcloud",
                     target=run_pointcloud_worker,
-                    args=(self.runtime_state.sensors, self.pointcloud_config),
+                    args=(self.sensors.channels, self.pointcloud_config),
                 ),
-                ready=self.runtime_state.sensors.pointcloud_ready,
+                ready=self.sensors.channels.pointcloud_ready,
                 timeout_s=self.runtime.safety.pointcloud_ready_timeout_s,
-                check_services=lambda: self.operator.keyboard.healthy,
+                check_services=lambda: self.runner.keyboard.healthy,
             )
-        self.camera_parameters = build_observation_camera(
-            self.runtime_state.sensors,
+        self.runner.camera_parameters = build_observation_camera(
+            self.sensors.channels,
             self.runtime.camera,
             self.info.observation_fields,
             self.camera_calibration,
         )
         self.robot.check()
         self.runtime_state.arm()
-
-    def run_control(self):
-        runner = PolicyRunner(
-            self.runtime_state,
-            self.runtime,
-            self.info,
-            robot=self.robot,
-            action_mapper=self.action_mapper,
-            recorder=self.recorder,
-            operator=self.operator,
-            model_runtime=self.model,
-            kinematics=self.kinematics,
-            max_running_s=self.max_running_s,
-            num_episodes=self.num_episodes,
-            camera_calibration=self.camera_calibration,
-            camera_parameters=self.camera_parameters,
-            results=self.results,
-        )
-        print(
-            "就绪（无需回车）：H 回初始位 → B 开始 | S 结束本轮 | Q 退出 | Esc 急停 | "
-            "T 请求复位触觉（空闲且无接触）。",
-            flush=True,
-        )
-        runner.run()
 
     def close(self, *, clean, failure):
         shutdown_clean = False
@@ -317,7 +279,7 @@ class PolicyDeploymentSession:
                     self.runtime_state,
                     self.robot,
                     sensors=self.sensors,
-                    keyboard=self.operator.keyboard if self.operator else None,
+                    keyboard=self.runner.keyboard if self.runner else None,
                     timeout_s=max(0.0, shutdown_deadline - time.monotonic()),
                 )
             else:
@@ -332,39 +294,34 @@ class PolicyDeploymentSession:
             )
             if self.results is not None:
                 self.results.record_errors(cleanup_errors)
-            home_results = self.operator.home_results if self.operator is not None else []
+            home_results = self.runner.home_results if self.runner is not None else []
             home_fault = any(item["outcome"] in ("failed", "fault") for item in home_results)
+            successful = clean and failure is None and shutdown_clean and not home_fault
             if self.results is not None:
                 try:
+                    if failure:
+                        reason = str(failure)
+                    elif home_fault:
+                        reason = "return_home_failed"
+                    elif model_close["status"] != "completed":
+                        reason = f"model_close_{model_close['status']}"
+                    elif not shutdown_clean:
+                        reason = "shutdown_failed"
+                    else:
+                        reason = None
                     self.results.finish_session(
-                        outcome=(
-                            "finished"
-                            if clean and failure is None and shutdown_clean and not home_fault
-                            else "fault"
-                        ),
-                        reason=(
-                            str(failure)
-                            if failure
-                            else (
-                                "return_home_failed"
-                                if home_fault
-                                else (
-                                    f"model_close_{model_close['status']}"
-                                    if model_close["status"] != "completed"
-                                    else "shutdown_failed" if not shutdown_clean else None
-                                )
-                            )
-                        ),
+                        outcome="finished" if successful else "fault",
+                        reason=reason,
                         shutdown_clean=shutdown_clean,
                         model_close=model_close,
                         home_results=home_results,
                     )
-                except Exception as exc:
-                    failure = failure or exc
+                except Exception:
+                    successful = False
                     logger.exception("session result publication failed")
         if model_close["status"] == "pending":
             logger.warning("Model cleanup remains pending; Python/CUDA exit is not bounded")
-        return int(not clean or failure is not None or not shutdown_clean or home_fault)
+        return int(not successful)
 
     def warmup_policy(self):
         timeout_s = self.runtime.safety.model_startup_timeout_s

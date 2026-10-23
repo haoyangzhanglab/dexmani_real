@@ -1,11 +1,9 @@
-"""Local motion authority; only sensor channels and the xArm authority signal cross spawn."""
+"""Local motion authority; only the xArm authority signal crosses spawn."""
 
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from threading import RLock
-
-from dexmani_real.ipc.channels import SensorChannels
 
 
 class SafetyState(IntEnum):
@@ -32,7 +30,6 @@ class RunEndReason(IntEnum):
 
 @dataclass
 class RuntimeState:
-    sensors: SensorChannels | None = None
     running: bool = True
     run_id: int = 1
     run_ended_id: int = 0
@@ -172,11 +169,9 @@ class RuntimeState:
             self.request_stop(reason=RunEndReason.QUIT)
 
     def end_session(self, *, reason=RunEndReason.RUNTIME_SHUTDOWN, fault=False) -> None:
-        """Fence motion and notify sensor workers before any blocking cleanup."""
+        """Fence motion before the resource owner notifies workers or closes devices."""
         with self.motion_lock:
             self.running = False
-            if self.sensors is not None:
-                self.sensors.is_running.value = False
             if fault:
                 self.mark_error()
                 self.revoke_motion(SafetyState.FAULT, reason=reason)

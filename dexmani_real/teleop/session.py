@@ -16,10 +16,11 @@ from dexmani_real.config.experiment import (
 )
 from dexmani_real.data.recorder import AsyncEpisodeRecorder
 from dexmani_real.ipc.channels import SensorChannels
-from dexmani_real.robot.action import ActionMapper
+from dexmani_real.planning.action import ActionMapper
 from dexmani_real.robot.home import build_home_planner
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.robot import DexManiRobot
+from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.state import RuntimeState, RunEndReason
 from dexmani_real.sensor.camera.worker import run_camera_worker
@@ -66,7 +67,7 @@ class TeleopSession:
             raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")
         calibration = load_vr_transform(self.vr_transform_path)
         mapping = self.runtime.control.vr_mapping
-        self.controller = TeleopController(
+        controller = TeleopController(
             ActionMapper.for_mode(self.runtime, "eef"),
             VRWristMapper(
                 pos_scale=mapping.pos_scale,
@@ -75,35 +76,40 @@ class TeleopSession:
             self.runtime,
             self.build_hand_retargeter(),
         )
-        self.home_planner = build_home_planner(self.runtime)
-        self.camera_calibration = (
+        home_planner = build_home_planner(self.runtime)
+        camera_calibration = (
             load_optional_camera_extrinsics(self.camera_calibration_path)
             if self.runtime.control.recording_enabled
             else None
         )
-        self.ctx = mp.get_context("spawn")
-        self.runtime_state = RuntimeState(
-            SensorChannels(
-                self.ctx,
-                camera=self.runtime.camera if self.runtime.control.recording_enabled else None,
-                vr=True,
-            )
+        needs = ObservationNeeds(
+            camera="rgbd" if self.runtime.control.recording_enabled else "none", vr=True
+        )
+        ctx = mp.get_context("spawn")
+        self.runtime_state = RuntimeState()
+        channels = SensorChannels(
+            ctx,
+            camera=self.runtime.camera if needs.camera_worker else None,
+            vr=needs.vr,
         )
         self.sensors = self.robot = None
         clean = False
         self.runner = None
         try:
-            self.sensors = SensorProcesses(self.runtime_state)
+            self.sensors = SensorProcesses(self.runtime_state, channels)
             self.robot = DexManiRobot(
-                self.runtime_state, self.runtime, check_services=self.sensors.check
+                self.runtime_state, self.runtime, check_services=self.sensors.check,
+                required_tactile=needs.required_tactile,
             )
             self.runner = TeleopRunner(
                 self.runtime_state,
                 self.runtime,
                 self.robot,
                 task_label=self.task_name,
-                controller=self.controller,
-                home_planner=self.home_planner,
+                needs=needs,
+                sensors=self.sensors,
+                controller=controller,
+                home_planner=home_planner,
                 recorder=(
                     AsyncEpisodeRecorder(
                         Path(__file__).resolve().parents[2]
@@ -114,15 +120,11 @@ class TeleopSession:
                     if self.runtime.control.recording_enabled
                     else None
                 ),
-                camera_calibration=self.camera_calibration,
-                start_vr=lambda: self.sensors.start(
-                    self.ctx.Process(
-                        name="vr",
-                        target=run_vr_worker,
-                        args=(self.runtime_state.sensors, self.runtime.vr),
-                    ),
-                    ready=self.runtime_state.sensors.vr_ready,
-                    check_services=lambda: self.runner.keyboard.healthy,
+                camera_calibration=camera_calibration,
+                vr_process=ctx.Process(
+                    name="vr",
+                    target=run_vr_worker,
+                    args=(channels, self.runtime.vr),
                 ),
             )
             self.runner.keyboard.start()
@@ -130,14 +132,14 @@ class TeleopSession:
                 self.runner.keyboard.healthy and self.sensors.check()
             )
             self.robot.connect()
-            if self.runtime.control.recording_enabled:
+            if needs.camera_worker:
                 self.sensors.start(
-                    self.ctx.Process(
+                    ctx.Process(
                         name="camera",
                         target=run_camera_worker,
-                        args=(self.runtime_state.sensors, self.runtime.camera),
+                        args=(self.sensors.channels, self.runtime.camera),
                     ),
-                    ready=self.runtime_state.sensors.camera_ready,
+                    ready=self.sensors.channels.camera_ready,
                     timeout_s=self.runtime.safety.camera_ready_timeout_s,
                     check_services=lambda: self.runner.keyboard.healthy,
                 )

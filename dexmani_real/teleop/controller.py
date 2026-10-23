@@ -2,10 +2,10 @@
 
 import numpy as np
 
+from dexmani_real.planning.action import ActionIntent
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import Pose, rot6d_to_quat_wxyz
-from dexmani_real.robot.action import ActionIntent
 from dexmani_real.teleop.vr_mapping import ema_smooth_pose
 
 

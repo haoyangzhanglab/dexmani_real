@@ -96,7 +96,7 @@ python scripts/collect_teleop.py test --config local.yaml
 python scripts/collect_teleop.py test --config local.yaml --control-hz 20
 ```
 
-任务名默认 `test`，录制默认写入 `episodes/test/`，根目录由 `control.episodes_dir` 配置。启动时建立停止监听并执行手部 HOME，随后等待操作者开始。
+任务名默认 `test`，录制默认写入 `episodes/test/`，根目录由 `control.episodes_dir` 配置。连接机器人前建立停止监听；手部 HOME 成功后启动 VR，待其就绪再等待操作者开始。
 
 | 按键 | 遥操作行为 |
 | --- | --- |
@@ -142,13 +142,15 @@ python scripts/run_policy.py policy/task/experiment --config local.yaml --execut
 
 实验输入为不带 `experiments/` 前缀的 `policy/task/experiment`，也可使用有效的绝对实验目录。策略 artifact 提供模型输入、动作表示和控制 dt；Real 提供当前设备、标定与执行配置。每段执行步数按 `--n-action-steps` > YAML 的 `execution.action_steps` > 策略默认值确定。
 
+CLI 与 Python 调用共用 [run_policy](dexmani_real/deployment/run.py) 入口，先完成输入与调度参数预检，再保存配置和准备资源。加载后的 Policy 在连接设备前检查模型是否支持所选模式。修改交接、预取和时隙计算时，从无设备 I/O 的 [schedule.py](dexmani_real/deployment/schedule.py) 开始；动作转换与目标准入位于 [planning/action.py](dexmani_real/planning/action.py)。
+
 | 执行模式 | 行为与配置 |
 | --- | --- |
 | `sync`（默认） | 执行一段后等待下一次推理，保留真实段间等待 |
 | `async` | 当前段执行时预取下一段；推理迟到时继续消费未过期的旧预测尾部，需设置 `prefetch_steps` |
 | `rtc` | 预取并冻结交接前已承诺的动作前缀，需设置 `prefetch_steps` 与 `rtc_guidance_cap` |
 
-预取步数表示距交接还剩多少个控制步时启动下一次推理，须满足策略 horizon 的容量约束。策略与模式兼容性由 [Real 预检](dexmani_real/deployment/preflight.py)和 [Policy 部署边界](https://github.com/haoyangzhanglab/dexmani_policy/blob/main/docs/项目架构.md#部署边界)检查，具体选项见 `--help`。LAMP 真机闭环尚未验证；离线预检不作为真机验证。
+预取步数表示距交接还剩多少个控制步时启动下一次推理，须满足策略 horizon 的容量约束。[Policy 部署入口](https://github.com/haoyangzhanglab/dexmani_policy/tree/main/dexmani_policy/deployment)检查训练 artifact 和模型能力，[Real 预检](dexmani_real/deployment/preflight.py)负责现场输入与执行预算，具体选项见 `--help`。LAMP 真机闭环尚未验证；离线预检不作为真机验证。
 
 H 回 HOME、B 开始本轮、S 结束本轮；整理场景后再次按 H、B 开始下一轮。Q 提前退出，ESC 请求急停，T 在空闲且无接触时请求复位触觉。部署不使用 C/D。
 
@@ -186,6 +188,8 @@ python scripts/replay_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config 
 
 各入口的参数与按键以 `--help` 和交互提示为准。键盘遥操作与相机标定中，触界、IK 或准入拒绝后须释放全部 jog 键才能重新操作。
 
+键盘 jog 与相机标定在连接机器人之前启动退出/急停监听；连接和相机就绪等待期间的取消会撤销软件运动授权。
+
 ## 数据与安全边界
 
 **Raw 发布后不可变，Canonical 是可重建的训练缓存。** Raw episode 使用 `data.h5` 和 `rgb.mp4`，保留物理观测、目标、真实 dispatch、时钟和终止原因。RGB 与深度按保存行对齐，实际采样时刻以 HDF5 时间为准；视频使用标称帧率编码。历史格式使用对应版本代码读取，不改写 Raw 来满足新格式。
@@ -196,7 +200,7 @@ python scripts/replay_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config 
 
 训练 action 表示本拍提交的绝对关节目标，`action_ee` 是该目标的 FK，均不代表下一拍已到达。Rollout Raw 保留 bootstrap/WAIT 的无动作行及终止原因，通常会被公共导出拒绝；不能通过填动作或裁行冒充当前训练格式。
 
-触觉按明确时限保存上一有效三轴向量保持后的消费值，保留原有效时间，过期停止；导出直接使用保存值，不再次修补或扣偏置。hand current / arm effort 等辅助缺测保留 NaN，这些 Raw 可留存，但不满足完整导出要求。
+运行时触觉按明确时限保持上一有效三轴向量，以原有效时间判断过期；Raw 保存实际消费值和处理语义，导出不再次修补或扣偏置。hand current / arm effort 等辅助缺测保留 NaN，这些 Raw 可留存，但不满足完整导出要求。
 
 运动入口检查关节限位、FK 工作空间、自碰撞与静态障碍，并按入口采用相应手形和桌面接触规则；整机 HOME 额外检查路径并等待实测稳定。目标准入、SDK 接受、实测到位和真实停止是不同结果；`CRC_UNCONFIRMED` 不代表 ACK 或关节到位。
 

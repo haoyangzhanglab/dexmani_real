@@ -6,9 +6,14 @@ from concurrent.futures import CancelledError
 from enum import Enum
 
 from dexmani_real.data.recorder import RecordingError, snapshot_recording_metadata
+from dexmani_real.data.results import error_detail
 from dexmani_real.robot.commands import RobotCommand, DispatchError, DispatchInterrupted
 from dexmani_real.robot.home import home_robot, home_hand
-from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
+from dexmani_real.runtime.observation import (
+    feedback_deadline_ns,
+    read_observation,
+    upstream_deadline_ns,
+)
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.state import RunEndReason, SafetyState
 from dexmani_real.teleop.audio_feedback import AudioFeedback
@@ -36,15 +41,19 @@ class TeleopRunner:
         robot,
         *,
         task_label,
+        needs,
+        sensors,
         controller,
         home_planner,
-        start_vr,
+        vr_process,
         recorder,
         camera_calibration=None,
     ):
+        self.sensors = sensors
+        self.needs = needs
         self.runtime_state = runtime_state
         self.robot = robot
-        self.start_vr = start_vr
+        self.vr_process = vr_process
         self.camera_calibration = camera_calibration
         self.task_label = task_label
         self.runtime = runtime
@@ -90,9 +99,7 @@ class TeleopRunner:
         try:
             self.robot.stop()
         except Exception as exc:
-            self.termination_details.append(
-                dict(stage=stage, exception_type=type(exc).__name__, message=str(exc))
-            )
+            self.termination_details.append(error_detail(stage, exc))
             raise
 
     def pause_control(self, reason, *, run_end_reason=RunEndReason.OPERATOR):
@@ -158,13 +165,7 @@ class TeleopRunner:
                 self.recorder.add_frame(row, command, dispatch, timing=timing)
         except Exception as exc:
             failure = failure or exc
-            self.termination_details.append(
-                dict(
-                    stage="recording",
-                    exception_type=type(exc).__name__,
-                    message=str(exc),
-                )
-            )
+            self.termination_details.append(error_detail("recording", exc))
         try:
             if failure is None:
                 self.end_segment(True, reason, announce=False)
@@ -222,17 +223,18 @@ class TeleopRunner:
         self.robot.reset_hand_feedback()
         try:
             row = read_observation(
-                self.runtime_state,
+                self.sensors.channels,
                 self.runtime,
                 self.robot,
                 require_hand=self.runtime.control.hand_enabled,
-                require_camera=self.recorder is not None,
-                require_vr=True,
+                needs=self.needs,
                 wait_for_hand=True,
                 cancel_requested=lambda: (
                     self.poll_blocking_commands() or not self.preparation_valid()
                 ),
             )
+            if row is not None:
+                self.robot.arm.update_health(upstream_until_ns=upstream_deadline_ns(row, self.runtime))
         except CancelledError:
             # S/Q may already have finalized preparation in poll_blocking_commands.
             if self.preparing_epoch is not None:
@@ -252,7 +254,7 @@ class TeleopRunner:
                 ),
                 collection_source="teleop",
                 metadata=snapshot_recording_metadata(
-                    self.runtime_state.sensors,
+                    self.sensors.channels,
                     camera_calibration=self.camera_calibration,
                     hand=self.robot.hand,
                 ),
@@ -502,7 +504,7 @@ class TeleopRunner:
             if self.poll_blocking_commands():
                 return False
             self.robot.service_idle()
-            if self.runtime_state.sensors.vr_ready.wait(timeout=0.05):
+            if self.sensors.channels.vr_ready.wait(timeout=0.05):
                 # Consume startup keystrokes before accepting a new B after readiness.
                 return not self.poll_blocking_commands()
             if time.monotonic() >= deadline:
@@ -523,7 +525,11 @@ class TeleopRunner:
             raise RuntimeError(f"startup hand home failed: {home_result.reason}")
         if self.poll_blocking_commands():
             return False
-        self.start_vr()
+        self.sensors.start(
+            self.vr_process,
+            ready=self.sensors.channels.vr_ready,
+            check_services=lambda: self.keyboard.healthy,
+        )
         if not self.wait_for_vr():
             return False
         print(
@@ -559,14 +565,15 @@ class TeleopRunner:
                 return
         issues = []
         row = read_observation(
-            self.runtime_state,
+            self.sensors.channels,
             self.runtime,
             self.robot,
             require_hand=self.runtime.control.hand_enabled,
-            require_camera=self.recorder is not None,
-            require_vr=True,
+            needs=self.needs,
             issues=issues,
         )
+        if row is not None:
+            self.robot.arm.update_health(upstream_until_ns=upstream_deadline_ns(row, self.runtime))
         if row is None:
             if self.recorder is not None and any(
                 issue in {"camera_source_unavailable_or_unmatched", "camera_source_stale"}
@@ -614,13 +621,7 @@ class TeleopRunner:
         except Exception as exc:
             if failure is None:
                 failure = exc
-            self.termination_details.append(
-                dict(
-                    stage="reference_cleanup",
-                    exception_type=type(exc).__name__,
-                    message=str(exc),
-                )
-            )
+            self.termination_details.append(error_detail("reference_cleanup", exc))
             logger.exception("teleop reference cleanup failed")
         try:
             self.finish_capture(True, "interrupted", announce=False)
@@ -707,14 +708,8 @@ class TeleopRunner:
             else:
                 reason = RunEndReason.POLICY_FAILURE
             self.runtime_state.revoke_motion(reason=reason)
-            self.runtime_state.end_session(reason=reason)
-            self.termination_details.append(
-                dict(
-                    stage="runtime",
-                    exception_type=type(exc).__name__,
-                    message=str(exc),
-                )
-            )
+            self.sensors.request_shutdown(reason=reason)
+            self.termination_details.append(error_detail("runtime", exc))
             logger.exception("teleop failed")
             self.audio.play("emergency")
             raise

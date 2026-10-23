@@ -4,7 +4,7 @@ import logging
 
 import numpy as np
 
-from dexmani_real.ipc.schema import HAND_STATE_DTYPE
+from dexmani_real.robot.feedback import HAND_STATE_DTYPE
 
 logger = logging.getLogger(__name__)
 

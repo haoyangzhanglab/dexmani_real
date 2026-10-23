@@ -5,7 +5,7 @@ from enum import Enum
 
 import numpy as np
 
-from dexmani_real.ipc.schema import ARM_STATE_DTYPE
+from dexmani_real.robot.feedback import ARM_STATE_DTYPE
 
 SDK_CODE_UNAVAILABLE = -999
 MAX_TIME = 2**63 - 1

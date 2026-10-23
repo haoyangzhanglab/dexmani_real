@@ -14,7 +14,11 @@ from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_so
 from dexmani_real.robot.commands import DispatchError
 from dexmani_real.robot.home import build_home_planner, home_robot
 from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.observation import feedback_deadline_ns, read_observation
+from dexmani_real.runtime.observation import (
+    feedback_deadline_ns,
+    read_observation,
+    upstream_deadline_ns,
+)
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
@@ -94,12 +98,13 @@ class KeyboardTeleopSession:
             self.solver.collision_model.set_hand_qpos(np.deg2rad(self.runtime.hand.home_qpos_deg))
         self.target_checker = TargetChecker(self.runtime, self.solver.collision_model)
         self.home_planner = build_home_planner(self.runtime)
-        self.robot.connect()
-        self.runtime_state.arm()
         self.keys.start()
         if not self.keys.healthy:
             raise RuntimeError("keyboard stop listener unavailable")
         self.robot.check_services = lambda: self.keys.healthy
+        self.robot.connect()
+        self.robot.check()
+        self.runtime_state.arm()
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         print("Jog key changes stop and re-prepare motion; release all jog keys after a rejected target")
         self.rate = LoopRate(self.jog_config.control_hz, label="keyboard_teleop")
@@ -179,11 +184,13 @@ class KeyboardTeleopSession:
                 return
 
         row = read_observation(
-            self.runtime_state,
+            None,
             self.runtime,
             self.robot,
             require_hand=self.runtime.control.hand_enabled,
         )
+        if row is not None:
+            self.robot.arm.update_health(upstream_until_ns=upstream_deadline_ns(row, self.runtime))
         if row is None:
             self.command_qpos = None
             self.command_pose = None

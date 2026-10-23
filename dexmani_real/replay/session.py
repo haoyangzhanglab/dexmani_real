@@ -5,8 +5,7 @@ import math
 from dataclasses import replace
 from pathlib import Path
 
-from dexmani_real.runtime.state import RuntimeState
-from dexmani_real.utils.episode_results import EpisodeResults, error_detail
+from dexmani_real.data.results import EpisodeResults, error_detail
 from dexmani_real.replay.evaluation import evaluate_replay
 from dexmani_real.replay.replayer import ReplayOutcome, ReplayStatus, TrajectoryReplayer
 from dexmani_real.replay.trajectory import verify_replay_preflight
@@ -14,6 +13,7 @@ from dexmani_real.robot.home import build_home_planner, home_robot, home_hand
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.processes import shutdown_local_runtime
+from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.utils.log import configure_logging
 
 DEFAULT_OUTPUT_DIR = "replay_results"
