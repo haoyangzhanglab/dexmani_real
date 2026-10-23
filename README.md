@@ -215,9 +215,8 @@ xArm 控制器碰撞检测默认关闭（`arm.collision_sensitivity: 0`），不
 默认运行无设备副作用的检查：
 
 ```bash
-python -m unittest discover -s tests -v
 python -m compileall -q dexmani_real scripts
 git diff --check
 ```
 
-测试使用假时钟、设备与模型替身和系统临时目录中的合成数据，覆盖调度、授权、观测、启动取消、迟到模型任务、单轮收尾及 Raw→Canonical，并逐文件比较合成 Raw 在读取、导出前后的内容。两项完整 Canonical 数值测试使用真实 Pinocchio FK；缺少 Pinocchio 时会明确跳过，不能据此完成数值验收。运行前使用已安装项目依赖的 Python 环境。这些离线结果不证明真机安全。本仓库不使用 pytest 或 Ruff。代码代理的长期规则见 [AGENTS.md](AGENTS.md)，Claude 阅读入口见 [CLAUDE.md](CLAUDE.md)。
+编译检查不证明真机安全；几何、配置与数据处理等行为按具体改动补充纯离线验证。代码代理的长期规则见 [AGENTS.md](AGENTS.md)，Claude 阅读入口见 [CLAUDE.md](CLAUDE.md)。
