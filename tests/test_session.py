@@ -1,7 +1,9 @@
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import CancelledError
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
@@ -137,6 +139,238 @@ class SessionShutdownTests(unittest.TestCase):
         self.assertFalse(session.check_services())
         self.assertTrue(session.runtime_state.estop_request)
         self.assertFalse(session.runtime_state.command_may_cross_sdk(run_id=epoch))
+
+
+class StartupCancellationTests(unittest.TestCase):
+    def test_entry_listeners_cancel_before_any_device_factory(self):
+        from dexmani_real.calibration.camera.session import CameraCalibrationSession
+        from dexmani_real.deployment.session import PolicySession
+        from dexmani_real.robot.robot import DexManiRobot
+        from dexmani_real.runtime.state import RuntimeState
+        from dexmani_real.teleop.keyboard_session import KeyboardTeleopSession
+        from dexmani_real.teleop.session import TeleopSession
+
+        for entry in ("keyboard", "calibration", "policy", "teleop"):
+            with self.subTest(entry=entry), ExitStack() as stack:
+                runtime, state = ExperimentConfig(), RuntimeState()
+                listener = Mock(healthy=True, estop_latched=False)
+                listener.start.side_effect = state.request_quit if entry in ("keyboard", "calibration") else state.request_stop
+                arm = stack.enter_context(patch(
+                    "dexmani_real.robot.xarm7.executor.ArmExecutor",
+                    side_effect=AssertionError("device factory after startup cancellation"),
+                ))
+                process_start = stack.enter_context(patch(
+                    "multiprocessing.process.BaseProcess.start", side_effect=AssertionError("real process start"),
+                ))
+                stack.enter_context(patch(
+                    "dexmani_real.runtime.operator_input.KeyboardInput.start",
+                    side_effect=AssertionError("real listener start"),
+                ))
+                if entry == "keyboard":
+                    for name in ("make_online_ik_solver", "TargetChecker", "build_home_planner"):
+                        stack.enter_context(patch("dexmani_real.teleop.keyboard_session." + name))
+                    session = KeyboardTeleopSession(runtime, no_hand=False)
+                    session.runtime_state, session.keys = state, listener
+                    session.jog_config = runtime.keyboard_teleop
+                    session.robot = DexManiRobot(state, runtime)
+                    with self.assertRaises(CancelledError):
+                        session.start()
+                elif entry == "calibration":
+                    stack.enter_context(patch("dexmani_real.calibration.camera.session.KeyboardInput", return_value=listener))
+                    stack.enter_context(patch("dexmani_real.calibration.camera.session.shutdown_local_runtime", return_value=True))
+                    session = CameraCalibrationSession(runtime, hand_geometry="absent")
+                    session.prepare = lambda: None
+                    session.runtime_state, session.sensors, session.ctx = state, Mock(), Mock()
+                    session.keys, session.window_created = None, False
+                    session.robot = DexManiRobot(state, runtime, check_services=session.check_services)
+                    with self.assertLogs("dexmani_real.calibration.camera.session", level="ERROR"):
+                        self.assertEqual(session.run(), 1)
+                    session.ctx.Process.assert_not_called()
+                elif entry == "policy":
+                    session = PolicySession(runtime, SimpleNamespace(), needs=ObservationNeeds.for_policy(
+                        ("joint_state",), record_raw=False,
+                    ))
+                    session.runtime_state, session.keyboard, session.sensors = state, listener, Mock()
+                    session.robot = DexManiRobot(state, runtime)
+                    with self.assertRaises(CancelledError):
+                        session.start_devices()
+                else:
+                    runtime = replace(runtime, control=replace(runtime.control, recording_enabled=False))
+                    for name in ("configure_logging", "load_vr_transform", "ActionMapper", "VRWristMapper",
+                                 "TeleopController", "build_home_planner", "SensorChannels", "SensorProcesses"):
+                        stack.enter_context(patch("dexmani_real.teleop.session." + name))
+                    stack.enter_context(patch("dexmani_real.teleop.session.resolve_runtime_table", side_effect=lambda cfg: cfg))
+                    stack.enter_context(patch("dexmani_real.teleop.session.shutdown_local_runtime", return_value=True))
+                    stack.enter_context(patch("dexmani_real.teleop.session.RuntimeState", return_value=state))
+                    runner = Mock(keyboard=listener)
+                    stack.enter_context(patch("dexmani_real.teleop.session.TeleopRunner", return_value=runner))
+                    stack.enter_context(patch("dexmani_real.teleop.session.mp.get_context", return_value=Mock()))
+                    session = TeleopSession(runtime)
+                    session.build_hand_retargeter = lambda: None
+                    with self.assertLogs("dexmani_real.teleop.session", level="ERROR"):
+                        self.assertEqual(session.run(), 1)
+                    runner.run.assert_not_called()
+                listener.start.assert_called_once()
+                arm.assert_not_called()
+                process_start.assert_not_called()
+                self.assertTrue(state.stop_request)
+                self.assertFalse(state.requests_allow_motion())
+                self.assertIsNone(state.begin_motion())
+
+    def test_arm_initialization_stop_timeout_and_feedback_fault_fence_authority(self):
+        from dexmani_real.robot.xarm7.executor import ArmExecutor
+        from dexmani_real.robot.xarm7.protocol import OperationCancelled
+        from dexmani_real.runtime.state import RuntimeState, SafetyState
+
+        for cause, error in (("stop", OperationCancelled), ("timeout", TimeoutError), ("feedback", RuntimeError)):
+            with self.subTest(cause=cause), ExitStack() as stack:
+                state = RuntimeState()
+                executor = ArmExecutor.__new__(ArmExecutor)
+                executor.cfg = SimpleNamespace(homing=SimpleNamespace(convergence_timeout_s=.01), executor_timeout_s=.01)
+                executor.runtime_state, executor.factory, executor.process = state, None, None
+                executor.io = SimpleNamespace(
+                    authority=SimpleNamespace(value=0), emergency=threading.Event(), ready=Mock(),
+                    fault=SimpleNamespace(value=b""), stopped=threading.Event(), stop=threading.Event(),
+                    closing=threading.Event(),
+                )
+                executor.ctx, executor.child_pipe = Mock(), Mock()
+                executor.ctx.Process.return_value.is_alive.return_value = True
+                stack.enter_context(patch.dict(sys.modules, {"ruckig": SimpleNamespace(Ruckig=Mock())}))
+                stack.enter_context(patch("multiprocessing.process.BaseProcess.start", side_effect=AssertionError("real process start")))
+
+                def wait(**kwargs):
+                    if cause == "stop":
+                        state.request_stop()
+                        self.assertEqual(executor.io.authority.value, 0)
+                    elif cause == "feedback":
+                        executor.io.fault.value = b"feedback fault"
+                    return False
+
+                executor.io.ready.wait.side_effect = wait
+                if cause == "timeout":
+                    stack.enter_context(patch("dexmani_real.robot.xarm7.executor.time.monotonic", side_effect=[0., 1., 1.]))
+                with self.assertRaises(error):
+                    executor.connect()
+                self.assertEqual(executor.io.authority.value, 0)
+                self.assertTrue(executor.io.stop.is_set())
+                self.assertTrue(executor.io.closing.is_set())
+                self.assertIsNone(state.begin_motion())
+                if cause == "stop":
+                    self.assertTrue(state.stop_request)
+                elif cause == "feedback":
+                    self.assertEqual(state.safety_state, SafetyState.FAULT)
+
+    def test_sensor_start_cancellation_and_timeout_retain_started_ownership(self):
+        from dexmani_real.runtime.processes import SensorProcesses
+        from dexmani_real.runtime.state import RuntimeState
+
+        for cause in ("stop_before_start", "quit_at_ready", "timeout"):
+            with self.subTest(cause=cause), ExitStack() as stack:
+                state, process, ready = RuntimeState(), Mock(), Mock()
+                process.is_alive.return_value = True
+                sensors = SensorProcesses(state)
+                if cause == "stop_before_start":
+                    state.request_stop()
+                elif cause == "quit_at_ready":
+                    def became_ready(**kwargs):
+                        state.request_quit()
+                        return True
+                    ready.wait.side_effect = became_ready
+                else:
+                    stack.enter_context(patch("dexmani_real.runtime.processes.time.monotonic", side_effect=[0., 1.]))
+                stack.enter_context(patch("multiprocessing.process.BaseProcess.start", side_effect=AssertionError("real process start")))
+                with self.assertRaises(RuntimeError):
+                    sensors.start(process, ready=ready, timeout_s=.5)
+                if cause == "stop_before_start":
+                    process.start.assert_not_called()
+                    self.assertEqual(sensors.started, [])
+                else:
+                    process.start.assert_called_once()
+                    self.assertEqual(sensors.started, [(process, ready)])
+                if cause != "timeout":
+                    self.assertTrue(state.stop_request)
+                    next_process = Mock()
+                    with self.assertRaises(RuntimeError):
+                        sensors.start(next_process, ready=Mock())
+                    next_process.start.assert_not_called()
+
+    def test_quit_at_vr_readiness_is_consumed_before_startup_succeeds(self):
+        from dexmani_real.runtime.operator_input import OperatorCommand
+        from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
+        from dexmani_real.teleop.runner import TeleopRunner
+
+        runtime, state, ready = ExperimentConfig(), RuntimeState(), Mock()
+        state.arm()
+        epoch = state.run_id
+        with patch("dexmani_real.teleop.runner.AudioFeedback"), patch("dexmani_real.teleop.runner.KeyboardInput"):
+            runner = TeleopRunner(
+                state, runtime, Mock(), task_label="test", needs=ObservationNeeds(camera="none", vr=True),
+                sensors=SimpleNamespace(channels=SimpleNamespace(vr_ready=ready)), controller=Mock(),
+                home_planner=None, vr_process=Mock(), recorder=None,
+            )
+        runner.keyboard.healthy = True
+        runner.keyboard.poll.side_effect = [[], [OperatorCommand.QUIT]]
+
+        def became_ready(**kwargs):
+            state.request_stop(reason=RunEndReason.QUIT)
+            self.assertFalse(state.command_may_cross_sdk(run_id=epoch, required_safety_state=SafetyState.ARMED))
+            return True
+
+        ready.wait.side_effect = became_ready
+        self.assertFalse(runner.wait_for_vr())
+        self.assertTrue(state.quit_requested)
+        self.assertIsNone(state.begin_motion())
+        runner.robot.stop.assert_called_once()
+
+    def test_robot_partial_start_and_close_failures_still_close_both_devices(self):
+        from dexmani_real.robot.robot import DexManiRobot
+        from dexmani_real.runtime.state import RuntimeState
+
+        for cause in ("hand_connect", "arm_close"):
+            with self.subTest(cause=cause):
+                state = RuntimeState()
+                arm, hand = Mock(is_connected=True), Mock(is_connected=True)
+                robot = DexManiRobot(state, ExperimentConfig(), hand_factory=lambda cfg: hand)
+                if cause == "hand_connect":
+                    hand.connect.side_effect = RuntimeError("hand startup failed")
+                    with patch("dexmani_real.robot.xarm7.executor.ArmExecutor", return_value=arm), self.assertRaisesRegex(RuntimeError, "hand startup failed"):
+                        robot.connect()
+                else:
+                    robot.owner, robot.arm, robot.hand = threading.get_ident(), arm, hand
+                    arm.close.side_effect = RuntimeError("arm close unresolved")
+                    with self.assertRaises(RuntimeError):
+                        robot.close()
+                    self.assertTrue(robot.stop_required)
+                arm.close.assert_called_once()
+                hand.disconnect.assert_called_once()
+                self.assertTrue(state.error_state)
+                self.assertFalse(state.requests_allow_motion())
+
+    def test_sensor_shutdown_failures_retain_handles_and_do_not_skip_other_workers(self):
+        from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
+        from dexmani_real.runtime.state import RuntimeState, SafetyState
+
+        for cause in ("join_failure", "unconfirmed_exit"):
+            with self.subTest(cause=cause):
+                state = RuntimeState()
+                first, second, first_ready, second_ready = Mock(), Mock(), Mock(), Mock()
+                second.is_alive.return_value, second.exitcode = False, 0
+                if cause == "join_failure":
+                    first.join.side_effect = RuntimeError("join failed")
+                else:
+                    first.is_alive.return_value, first.exitcode = True, None
+                sensors = SensorProcesses(state)
+                sensors.started = [(first, first_ready), (second, second_ready)]
+                with self.assertLogs("dexmani_real.runtime.processes", level="ERROR"):
+                    self.assertFalse(shutdown_local_runtime(state, sensors=sensors, timeout_s=0.))
+                second.join.assert_called_once()
+                second_ready.clear.assert_called_once()
+                self.assertEqual(sensors.started, [(first, first_ready), (second, second_ready)])
+                self.assertEqual(state.safety_state, SafetyState.FAULT)
+                self.assertTrue(state.error_state)
+                if cause == "unconfirmed_exit":
+                    first.terminate.assert_called_once()
+                    first.kill.assert_called_once()
 
 
 class OfflineEntryTests(unittest.TestCase):

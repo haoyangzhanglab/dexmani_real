@@ -2,13 +2,14 @@ import importlib.util
 import json
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from unittest.mock import patch
 
 import h5py
 import numpy as np
 import zarr
+from scipy.spatial.transform import Rotation
 
 from fakes import FakeClock, camera_metadata, execution_snapshot, observation
 from dexmani_real.data.canonical.export import CanonicalExporter
@@ -18,7 +19,12 @@ from dexmani_real.data.raw.schema import RAW_FORMAT, encode_raw_row
 from dexmani_real.data.raw.writer import RawEpisodeWriter
 from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError
 from dexmani_real.robot.commands import DispatchResult, DispatchStatus, RobotCommand
-from dexmani_real.sensor.pointcloud.config import PointCloudConfig
+from dexmani_real.robot.model import (
+    XARM7_XHAND_COLLISION_URDF_PATH,
+    XHAND_RIGHT_URDF_PATH,
+    XHAND_SDK_JOINT_NAMES,
+)
+from dexmani_real.sensor.pointcloud.config import PointCloudConfig, SAMPLING_METHOD
 
 
 def file_contents(root):
@@ -119,8 +125,8 @@ class DataContractTests(unittest.TestCase):
         staging = self.root / "raw" / (".tmp_" + name)
         staging.mkdir(parents=True)
         metadata = camera_metadata()
-        transform = np.eye(4)
-        transform[0, 3] = .1
+        transform = np.array([[0., -1., 0., .1], [1., 0., 0., -.2],
+                              [0., 0., 1., .3], [0., 0., 0., 1.]])
         metadata["camera_T_xarm_base_from_color"] = transform.ravel()
         metadata.update(task_label="test", collection_source="teleop")
         writer = RawEpisodeWriter(staging, control_hz=20)
@@ -128,7 +134,19 @@ class DataContractTests(unittest.TestCase):
             writer.open(metadata, execution_snapshot(), {})
             for index in range(2):
                 row = observation(self.clock, camera=True)
-                command = RobotCommand(3, row.arm["qpos"][0] + .001, row.hand["qpos"][0])
+                row.arm["qpos"] += .002 * index * np.arange(1, 8)
+                row.arm["qvel"] = .01 * np.arange(7) + .1 * (index + 1)
+                row.arm["effort"] = .02 * np.arange(7) + .3 * (index + 1)
+                row.hand["qpos"] += .01 * np.arange(1, 13) * (index + 1)
+                row.hand["current"] = np.arange(12) + 3 * (index + 1)
+                row.hand["tactile_aggregate"] = np.arange(15).reshape(5, 3) * .01 + 1.25 + index
+                row.hand["tactile_dense"] = np.arange(1800).reshape(5, 120, 3) * .001 + 2.5 + index
+                pixels = np.arange(16).reshape(4, 4)
+                row.camera["rgb"][:] = np.stack((pixels * 10 + index, pixels * 7 + 20,
+                                                 200 - pixels * 9), axis=-1)
+                row.camera["depth"][:] = 500 + 20 * index
+                command = RobotCommand(3, row.arm["qpos"][0] + .001 * np.arange(1, 8),
+                                       row.hand["qpos"][0] + .005 * (index + 1))
                 receipt = DispatchResult(DispatchStatus.SUBMITTED, DispatchStatus.CRC_UNCONFIRMED,
                                          self.clock.now, (3, index + 1))
                 writer.append_frame(row, command, receipt, {"run_id": 3, "slot": index})
@@ -170,10 +188,13 @@ class DataContractTests(unittest.TestCase):
 
     @unittest.skipUnless(importlib.util.find_spec("pinocchio"), "full numerical export requires optional Pinocchio")
     def test_full_export_preserves_15_fields_geometry_tactile_and_raw(self):
+        import pinocchio
+
         source = self.fixture("episode_valid")
         before = file_contents(source)
         target = self.root / "canonical.zarr"
-        result = self.exporter().export(source, target)
+        exporter = self.exporter()
+        result = exporter.export(source, target)
         self.assertEqual(result["total_frames"], 2)
         store = zarr.open_group(str(target), mode="r")
         specs = canonical_array_specs(4, 4, 4)
@@ -183,26 +204,96 @@ class DataContractTests(unittest.TestCase):
             self.assertEqual(store["data"][name].shape, (2, *tail))
             self.assertEqual(store["data"][name].dtype, dtype)
             self.assertTrue(np.isfinite(store["data"][name][:]).all())
-        np.testing.assert_array_equal(store["data/finger_tactile_force"][:], np.full((2, 5, 3), 1.25))
-        np.testing.assert_array_equal(store["data/taxel_tactile_force"][:], np.full((2, 5, 120, 3), 2.5))
-        np.testing.assert_allclose(store["data/point_cloud"][:, :, 2], .5)
-        expected = np.eye(4)[:3]
-        expected[0, 3] = -.1
-        np.testing.assert_allclose(store["data/camera_extrinsic"][0], expected.ravel())
+        arm_model = pinocchio.buildModelFromUrdf(str(XARM7_XHAND_COLLISION_URDF_PATH))
+        hand_model = pinocchio.buildModelFromUrdf(str(XHAND_RIGHT_URDF_PATH))
+
+        def placements(model, qpos, names):
+            data = model.createData()
+            pinocchio.forwardKinematics(model, data, qpos)
+            pinocchio.updateFramePlacements(model, data)
+            return [data.oMf[model.getFrameId(name)].copy() for name in names]
+
+        def pose_values(placement):
+            return np.concatenate((placement.translation, placement.rotation[:, 0],
+                                   placement.rotation[:, 1]))
+
+        config = exporter.processing
+        mount_quat = config.handbase_quat_eef_wxyz
+        mount = pinocchio.SE3(Rotation.from_quat((*mount_quat[1:], mount_quat[0])).as_matrix(),
+                             np.asarray(config.handbase_position_eef_m))
+        with EpisodeReader(source) as reader:
+            np.testing.assert_array_equal(reader["timestamp"][:], [0., .05])
+            np.testing.assert_array_equal(np.diff(reader.read_timing_rows(("observation_ns",))["observation_ns"]),
+                                          [50_000_000])
+            self.assertEqual(store.attrs["dt"], reader.dt)
+            self.assertEqual(store.attrs["dt"], .05)
+            intrinsic = reader.meta["camera_color_intrinsics"].reshape(3, 3)
+            transform = reader.meta["camera_T_xarm_base_from_color"].reshape(4, 4)
+            for index, rgb in enumerate(reader.iter_rgb_frames()):
+                arm, hand = reader["arm_qpos"][index], reader["hand_qpos"][index]
+                arm_goal = reader["action_arm_joint_target"][index]
+                hand_goal = reader["action_hand_joint_target"][index]
+                np.testing.assert_array_equal(store["data/joint_state"][index],
+                                              np.concatenate((arm, hand)).astype(np.float32))
+                np.testing.assert_array_equal(store["data/action"][index],
+                                              np.concatenate((arm_goal, hand_goal)).astype(np.float32))
+                for canonical, raw in (("arm_qvel", "arm_qvel"), ("arm_effort", "arm_effort"),
+                                       ("hand_current", "hand_current"),
+                                       ("finger_tactile_force", "hand_contact"),
+                                       ("taxel_tactile_force", "hand_tactile_force")):
+                    np.testing.assert_array_equal(store["data/" + canonical][index],
+                                                  reader[raw][index].astype(np.float32))
+                # Direct URDF FK distinguishes measured state from the submitted target.
+                measured, = placements(arm_model, arm, ("custom_eef_link",))
+                commanded, = placements(arm_model, arm_goal, ("custom_eef_link",))
+                np.testing.assert_allclose(store["data/eef_pose"][index], pose_values(measured), atol=1e-7)
+                np.testing.assert_allclose(store["data/action_ee"][index],
+                                          np.concatenate((pose_values(commanded), hand_goal)), atol=1e-7)
+                hand_urdf = np.empty(hand_model.nq)
+                for joint, name in zip(hand_model.joints[1:], hand_model.names[1:]):
+                    hand_urdf[joint.idx_q] = hand[XHAND_SDK_JOINT_NAMES.index(name)]
+                tips = placements(hand_model, hand_urdf, config.fingertip_link_names)
+                expected_tips = [(measured * mount).act(tip.translation) for tip in tips]
+                np.testing.assert_allclose(store["data/fingertip_xyz"][index], expected_tips, atol=1e-7)
+                np.testing.assert_array_equal(store["data/camera_intrinsic"][index],
+                                              intrinsic.astype(np.float32).ravel())
+                np.testing.assert_allclose(store["data/camera_extrinsic"][index],
+                                          np.linalg.inv(transform)[:3].ravel(), atol=1e-7)
+                depth = reader["depth"][index]
+                np.testing.assert_array_equal(store["data/rgb"][index], rgb)
+                np.testing.assert_array_equal(store["data/depth"][index], depth)
+                # Each sampled point and its color must come from the same decoded RGB-D pixel.
+                v, u = np.indices(depth.shape)
+                pixels = np.stack((u, v, np.ones_like(u)), axis=-1).reshape(-1, 3)
+                points = (pixels @ np.linalg.inv(intrinsic).T
+                          * depth.reshape(-1, 1) * reader.meta["depth_scale"])
+                points = points @ transform[:3, :3].T + transform[:3, 3]
+                cloud = store["data/point_cloud"][index]
+                distances = np.linalg.norm(cloud[:, None, :3] - points[None], axis=-1)
+                matches = distances.argmin(axis=1)
+                np.testing.assert_allclose(cloud[:, :3], points[matches], atol=1e-6)
+                np.testing.assert_allclose(cloud[:, 3:], rgb.reshape(-1, 3)[matches] / 255., atol=1e-6)
+        recipe = json.loads(json.dumps(asdict(config.pointcloud)))
+        recipe["sampling_method"] = SAMPLING_METHOD
+        self.assertEqual(store.attrs["pointcloud_config"], recipe)
         np.testing.assert_array_equal(store["meta/episode_ends"][:], [2])
         self.assertEqual(file_contents(source), before)
+        canonical_before = file_contents(target)
         with self.assertRaises(FileExistsError):
             self.exporter().export(source, target)
+        self.assertEqual(file_contents(source), before)
+        self.assertEqual(file_contents(target), canonical_before)
 
     @unittest.skipUnless(importlib.util.find_spec("pinocchio"), "full numerical export requires optional Pinocchio")
     def test_bad_episodes_are_rejected_whole_without_raw_changes(self):
         self.fixture("episode_valid")
-        for issue in ("missing", "nan", "geometry", "dispatch", "depth_rows", "sdk", "empty_cloud", "timing"):
+        issues = ("missing", "nan", "geometry", "dispatch", "depth_rows", "sdk", "empty_cloud", "timing")
+        for issue in issues:
             self.fixture("episode_" + issue, invalid=issue)
         before = file_contents(self.root / "raw")
         result = self.exporter().export(self.root / "raw", self.root / "canonical.zarr")
         self.assertEqual(result["episode_count"], 1)
         self.assertEqual(result["total_frames"], 2)
-        self.assertEqual(len(result["rejected_episodes"]), 8)
+        self.assertEqual(set(result["rejected_episodes"]), {"episode_" + issue for issue in issues})
         self.assertTrue(all(result["rejected_episodes"].values()))
         self.assertEqual(file_contents(self.root / "raw"), before)
