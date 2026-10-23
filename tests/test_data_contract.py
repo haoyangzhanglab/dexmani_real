@@ -1,4 +1,5 @@
 import hashlib
+import importlib.util
 import json
 import tempfile
 import unittest
@@ -165,6 +166,7 @@ class DataContractTests(unittest.TestCase):
                                  outlier_min_neighbors=0, outlier_min_component_points=1)
         return CanonicalExporter(ProcessingConfig(pointcloud=cloud), chunk_frames=1)
 
+    @unittest.skipUnless(importlib.util.find_spec("pinocchio"), "full numerical export requires optional Pinocchio")
     def test_full_export_preserves_15_fields_geometry_tactile_and_raw(self):
         source = self.fixture("episode_valid")
         before = tree_hash(source)
@@ -190,6 +192,7 @@ class DataContractTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.exporter().export(source, target)
 
+    @unittest.skipUnless(importlib.util.find_spec("pinocchio"), "full numerical export requires optional Pinocchio")
     def test_bad_episodes_are_rejected_whole_without_raw_changes(self):
         self.fixture("episode_valid")
         for issue in ("missing", "nan", "geometry", "dispatch", "depth_rows", "sdk", "empty_cloud", "timing"):

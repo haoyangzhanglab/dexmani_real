@@ -144,6 +144,8 @@ python scripts/run_policy.py policy/task/experiment --config local.yaml --execut
 
 CLI 与 Python 调用共用 [run_policy](dexmani_real/deployment/run.py) 入口，先完成输入与调度参数预检，再保存配置和准备资源。加载后的 Policy 在连接设备前检查模型是否支持所选模式。修改交接、预取和时隙计算时，从无设备 I/O 的 [schedule.py](dexmani_real/deployment/schedule.py) 开始；动作转换与目标准入位于 [planning/action.py](dexmani_real/planning/action.py)。
 
+[会话流程](dexmani_real/deployment/session.py)负责设备、操作员输入和多轮实验；[单轮流程](dexmani_real/deployment/episode.py)负责准备、推理调度、执行和当前 capture 的结束。停止立即撤销软件运动授权；旧模型任务完成并回收后，才接受下一轮开始。
+
 | 执行模式 | 行为与配置 |
 | --- | --- |
 | `sync`（默认） | 执行一段后等待下一次推理，保留真实段间等待 |
@@ -213,8 +215,9 @@ xArm 控制器碰撞检测默认关闭（`arm.collision_sensitivity: 0`），不
 默认运行无设备副作用的检查：
 
 ```bash
+python -m unittest discover -s tests -v
 python -m compileall -q dexmani_real scripts
 git diff --check
 ```
 
-按改动补充纯逻辑、假时钟或 SDK/model 替身验证，本仓库不使用 pytest 或 Ruff。代码代理的长期规则见 [AGENTS.md](AGENTS.md)，Claude 阅读入口见 [CLAUDE.md](CLAUDE.md)。
+测试使用假时钟、设备/model 替身和系统临时目录中的合成数据，覆盖调度、授权、观测、单轮收尾及 Raw→Canonical；运行前使用已安装项目依赖的 Python 环境。这些离线结果不证明真机安全。本仓库不使用 pytest 或 Ruff。代码代理的长期规则见 [AGENTS.md](AGENTS.md)，Claude 阅读入口见 [CLAUDE.md](CLAUDE.md)。

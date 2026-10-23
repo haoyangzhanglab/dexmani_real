@@ -1,4 +1,6 @@
 import tempfile
+import subprocess
+import sys
 import unittest
 from contextlib import ExitStack
 from dataclasses import replace
@@ -135,3 +137,43 @@ class SessionShutdownTests(unittest.TestCase):
         self.assertFalse(session.check_services())
         self.assertTrue(session.runtime_state.estop_request)
         self.assertFalse(session.runtime_state.command_may_cross_sdk(run_id=epoch))
+
+
+class OfflineEntryTests(unittest.TestCase):
+    def test_help_and_declared_config_never_start_devices_or_load_models(self):
+        root = Path(__file__).resolve().parents[1]
+        guard = r'''
+import importlib.abc
+import multiprocessing.process
+import runpy
+import sys
+from unittest.mock import patch
+
+class BlockDeviceImports(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {
+            'xarm', 'xhand', 'xhand_sdk', 'pyrealsense2', 'pynput',
+            'dexmani_policy', 'torch', 'pinocchio', 'mplib',
+        }:
+            raise AssertionError('unexpected device/model import: ' + fullname)
+
+sys.meta_path.insert(0, BlockDeviceImports())
+script = sys.argv[1]
+sys.argv = sys.argv[1:]
+with patch('multiprocessing.process.BaseProcess.start', side_effect=AssertionError('process start')), \
+     patch('dexmani_real.robot.robot.DexManiRobot.connect', side_effect=AssertionError('robot connect')), \
+     patch('dexmani_real.runtime.operator_input.KeyboardInput.start', side_effect=AssertionError('listener start')):
+    runpy.run_path(script, run_name='__main__')
+'''
+        cases = [(name, "--help") for name in (
+            "collect_teleop", "run_policy", "replay_episode", "calibrate_camera",
+            "calibrate_vr_heading", "keyboard_teleop",
+        )] + [("collect_teleop", "--print-config"), ("run_policy", "--print-config")]
+        for name, flag in cases:
+            with self.subTest(script=name, flag=flag):
+                completed = subprocess.run(
+                    [sys.executable, "-c", guard, str(root / "scripts" / (name + ".py")), flag],
+                    cwd=root, capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertTrue(completed.stdout)

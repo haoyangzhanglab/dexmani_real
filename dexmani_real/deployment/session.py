@@ -603,12 +603,18 @@ class PolicySession:
                 self.keyboard.drain_signal(OperatorCommand.BEGIN)
                 if ended.run_id is not None:
                     self.completed += 1
-                    logger.info("第 %d 轮结束：%s（%s，%.1f s）。",
-                                self.completed, ended.reason, ended.detail, ended.duration_s)
+                    normal = ended.reason in {"operator", "quit"} or (
+                        ended.reason == "timeout" and ended.detail == "duration_timeout"
+                    )
+                    logger.log(logging.INFO if normal else logging.WARNING,
+                               "第 %d 轮结束：%s（%s，%.1f s）。",
+                               self.completed, ended.reason, ended.detail, ended.duration_s)
                     if self.num_episodes is not None and self.completed >= self.num_episodes:
                         self.runtime_state.request_quit()
                         print(f"已达到 {self.num_episodes} 轮上限，正在退出。", flush=True)
-                    elif self.runtime_state.requests_allow_motion():
+                    elif ended.reason in {"operator", "timeout", "executor_boundary"} and (
+                        self.runtime_state.requests_allow_motion()
+                    ):
                         print("等待下一轮：整理场景后 H 回初始位 → B 开始；Q 退出。", flush=True)
             # A finished attempt still owns reset/predict identity until poll() reclaims it.
             if ended is not None and self.model.future is None:
