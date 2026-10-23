@@ -89,7 +89,7 @@ class DexManiRobot:
             if cancelled():
                 raise CancelledError("robot startup cancelled before hand connection")
             deadline_ns = None
-            if self.runtime.control.hand_enabled:
+            if self.runtime.hand.enabled:
                 if self.hand_factory is None:
                     from dexmani_real.robot.xhand.driver import XHand
 
@@ -97,7 +97,7 @@ class DexManiRobot:
                 self.hand = self.hand_factory(self.runtime.hand)
                 deadline_ns = self.hand.connect(cancel_requested=cancelled)
             self.connected = True
-            # Joint command seeding and complete tactile acquisition share one budget.
+            # Joint command seeding and required feedback acquisition share one budget.
             self.reset_hand_feedback(deadline_ns=deadline_ns)
             self.read_initial_state(cancel_requested=cancelled)
         except BaseException as exc:

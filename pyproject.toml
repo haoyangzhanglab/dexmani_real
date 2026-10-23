@@ -22,6 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 interactive = ["pynput>=1.7"]
 control = ["ruckig==0.17.3"]
+geometry = ["trimesh>=4"]
 
 [tool.setuptools]
 include-package-data = true

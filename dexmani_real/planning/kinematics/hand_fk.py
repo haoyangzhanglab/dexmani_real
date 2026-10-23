@@ -1,4 +1,4 @@
-"""Hand-base fingertip FK maps SDK thumb/index/mid/ring/pinky joints to the URDF's active order."""
+"""Hand-base link FK maps SDK thumb/index/mid/ring/pinky joints to the URDF's active order."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from collections.abc import Sequence
 import numpy as np
 
 from dexmani_real.robot.model import (
-    HAND_FINGERTIP_SHAPE,
     HAND_JOINT_SHAPE,
     HAND_SDK_TO_URDF_IDX,
     XHAND_FINGERTIP_LINK_NAMES,
@@ -18,7 +17,7 @@ SDK_TO_URDF_IDX = np.array(HAND_SDK_TO_URDF_IDX, dtype=np.intp)
 
 
 class HandKinematics:
-    """Map 12 SDK joint angles to five hand-base fingertip positions with Pinocchio."""
+    """Own a Pinocchio workspace for SDK-order hand joints and requested link frames."""
 
     def __init__(
         self,
@@ -54,15 +53,15 @@ class HandKinematics:
                 raise ValueError(f"hand FK frame {name!r} is missing in {hand_urdf_path}")
             self.fingertip_frame_ids.append(fid)
 
-    def compute_tip_positions_in_handbase(self, hand_qpos: np.ndarray) -> np.ndarray:
-        """Returns (5, 3) fingertip positions in hand_base frame."""
-        q = np.asarray(hand_qpos, dtype=np.float64).reshape(HAND_JOINT_SHAPE)
+    def compute_frame_placements(self, hand_qpos: np.ndarray, frame_ids) -> np.ndarray:
+        """Return owned hand-base link transforms after one SDK-order FK update."""
+        q = np.asarray(hand_qpos, dtype=np.float64)
+        if q.shape != HAND_JOINT_SHAPE or not np.isfinite(q).all():
+            raise ValueError("hand qpos must be finite shape (12,)")
         q_urdf = q[SDK_TO_URDF_IDX]
         self.pin.forwardKinematics(self.model, self.data, q_urdf)
         self.pin.updateFramePlacements(self.model, self.data)
-
-        tips = np.empty(HAND_FINGERTIP_SHAPE, dtype=np.float64)
-        for i, fid in enumerate(self.fingertip_frame_ids):
-            placement = self.data.oMf[fid]
-            tips[i] = placement.translation
-        return tips
+        placements = np.stack([self.data.oMf[int(fid)].homogeneous for fid in frame_ids])
+        if not np.isfinite(placements).all():
+            raise RuntimeError("hand FK produced nonfinite link placements")
+        return placements

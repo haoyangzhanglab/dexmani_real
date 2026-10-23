@@ -39,8 +39,7 @@ from dexmani_real.config.experiment import (
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.planning.target import TargetChecker
-from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
-from dexmani_real.planning.kinematics.ik import IKFailureKind, OnlineIKSolver, make_online_ik_solver
+from dexmani_real.planning.kinematics.ik import IKFailureKind, OnlineIKConfig, OnlineIKSolver, make_online_ik_solver
 from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.robot.commands import DispatchError
 from dexmani_real.robot.home import build_home_planner, execute_arm_home
@@ -141,10 +140,14 @@ def build_planner(
     home_hand_qpos = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
     planner.set_hand_qpos(home_hand_qpos)
     solver = make_online_ik_solver(
-        runtime,
+        OnlineIKConfig(
+            max_pose_error_pos_m=runtime.keyboard_teleop.ik_max_pose_error_pos_m,
+            max_pose_error_rot_rad=runtime.keyboard_teleop.ik_max_pose_error_rot_rad,
+            operational_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
+            operational_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
+        ),
+        static_boxes=runtime.environment.static_boxes,
         kin=planner.kin,
-        max_pose_error_pos_m=runtime.keyboard_teleop.ik_max_pose_error_pos_m,
-        max_pose_error_rot_rad=runtime.keyboard_teleop.ik_max_pose_error_rot_rad,
     )
     # Online jog permits table contact; both scenes retain the declared fixed-home hand.
     solver.collision_model.set_hand_qpos(home_hand_qpos)
@@ -382,7 +385,7 @@ class CameraCalibrationSession:
             return
 
         marker_rvec, marker_tvec = aruco_pose
-        eef_pos_base_m, eef_rot6d_base = make_arm_fk().compute(arm_after_qpos)
+        eef_pos_base_m, eef_rot6d_base = self.target_checker.target_fk.compute(arm_after_qpos)
         eef_rpy_base_rad = eef_rpy_from_rot6d(eef_rot6d_base)
         if self.cancel_requested():
             return
@@ -814,9 +817,9 @@ class CameraCalibrationSession:
         configure_logging()
         if self.hand_geometry not in {"absent", "secured-home"}:
             raise ValueError("hand_geometry must be 'absent' or 'secured-home'")
-        if self.runtime.control.hand_enabled:
+        if self.runtime.hand.enabled:
             raise ValueError(
-                "camera calibration requires explicit hand_enabled=false and secured/absent hand"
+                "camera calibration requires hand.enabled=false and secured/absent hand"
             )
         validate_robot_config(self.runtime)
         self.runtime = resolve_runtime_table(self.runtime)
@@ -837,7 +840,13 @@ class CameraCalibrationSession:
             )
 
         self.home_planner, self.solver = planner, solver
-        self.target_checker = TargetChecker(self.runtime, solver.collision_model)
+        self.target_checker = TargetChecker(
+            solver.collision_model,
+            joint_lower_rad=self.runtime.arm.joint_limit_lower,
+            joint_upper_rad=self.runtime.arm.joint_limit_upper,
+            workspace=self.runtime.environment.workspace.as_array(),
+            workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
+        )
         self.workspace = workspace
         self.calibration_config = calib_cfg
         self.aruco_config = aruco_cfg

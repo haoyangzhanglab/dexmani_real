@@ -1,6 +1,6 @@
 """Pure Policy scheduling; the episode supplies clocks and handles execution I/O."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -18,7 +18,6 @@ class PolicyQuery:
     expires_at_ns: int
     handoff_slot: int | None
     result: np.ndarray | None = None
-    evidence: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -30,7 +29,6 @@ class ActionPlan:
     segment_end: int
     expires_at_ns: int
     frozen: dict[int, RobotCommand]
-    query_id: int
 
 
 @dataclass(frozen=True)
@@ -41,9 +39,8 @@ class ControlRejection:
     run_end_reason: RunEndReason = RunEndReason.EXECUTOR_BOUNDARY
 
 
-def decision_expires_at_ns(sources, now_ns, max_age_ns):
+def decision_expires_at_ns(timestamps, now_ns, max_age_ns):
     """An exclusive deadline preserves age <= budget on the integer-nanosecond clock."""
-    timestamps = [stamp for times in sources.values() for stamp in times]
     if not timestamps or any(stamp <= 0 or stamp > now_ns for stamp in timestamps):
         return None
     expires_at_ns = min(timestamps) + max_age_ns + 1
@@ -82,7 +79,6 @@ def handoff_plan(
             segment_end=segment_end,
             expires_at_ns=query.expires_at_ns,
             frozen={},
-            query_id=query.query_id,
         ),
         None,
     )

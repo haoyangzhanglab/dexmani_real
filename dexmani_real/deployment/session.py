@@ -2,10 +2,13 @@
 
 import json
 import logging
+import math
 import multiprocessing as mp
 import time
 from concurrent.futures import CancelledError
 from itertools import count
+
+import numpy as np
 
 from dexmani_real.calibration.camera.extrinsics import (
     CameraExtrinsics,
@@ -14,11 +17,12 @@ from dexmani_real.calibration.camera.extrinsics import (
 from dexmani_real.data.recorder import AsyncEpisodeRecorder
 from dexmani_real.data.results import EpisodeResults, error_detail
 from dexmani_real.deployment.episode import PolicyEpisode, failure_reason
-from dexmani_real.deployment.observation import ObservationKinematics
+from dexmani_real.deployment.observation import ObservationKinematics, build_policy_observation
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
+from dexmani_real.planning.kinematics.ik import OnlineIKConfig
 from dexmani_real.robot.home import build_home_planner, home_robot
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.robot import DexManiRobot
@@ -34,23 +38,33 @@ logger = logging.getLogger(__name__)
 
 
 def build_observation_kinematics(policy_info, runtime):
-    """Build requested FK resources; EEF and fingertips share measured joint history."""
+    """Build requested geometry once; the inference worker owns all FK workspaces."""
     requested = set(policy_info.observation_fields)
-    needs_hand_fk = "fingertip_xyz" in requested
+    needs_hand_fk = bool(requested & {"fingertip_xyz", "hand_pointcloud"})
     if not needs_hand_fk and "eef_pose" not in requested:
         return None
     if not needs_hand_fk:
         return ObservationKinematics(make_arm_fk())
     hand_fk = HandKinematics(
         str(XHAND_RIGHT_URDF_PATH),
-        policy_info.fingertip_link_names,
+        policy_info.fingertip_link_names if "fingertip_xyz" in requested else None,
     )
-    return ObservationKinematics(make_arm_fk(), hand_fk, runtime.hand)
+    hand_cloud = None
+    if "hand_pointcloud" in requested:
+        from dexmani_real.planning.kinematics.hand_pointcloud import HandPointCloudTemplate
+
+        hand_cloud = HandPointCloudTemplate(runtime.hand_pointcloud, hand_fk)
+    return ObservationKinematics(
+        make_arm_fk(), hand_fk,
+        tuple(runtime.hand.T_eef_handbase_pos_xyz),
+        tuple(runtime.hand.T_eef_handbase_quat_wxyz),
+        hand_cloud,
+    )
 
 
-def build_observation_camera(sensors, camera_config, fields, calibration):
-    """Snapshot requested K/E once after the fixed camera worker becomes ready."""
-    requested = set(fields) & {"camera_intrinsic", "camera_extrinsic"}
+def build_observation_camera(sensors, camera_config, fields, calibration, *, depth_config=None):
+    """Read requested camera geometry and check the live depth scale after startup."""
+    requested = set(fields) & {"depth", "camera_intrinsic", "camera_extrinsic"}
     if not requested:
         return {}
     if sensors is None or not sensors.camera_ready.is_set():
@@ -65,13 +79,19 @@ def build_observation_camera(sensors, camera_config, fields, calibration):
         raise ValueError("Policy color intrinsics do not match the configured RGB resolution")
     if sensors.camera_ring.dtype["rgb"].shape != (color.height, color.width, 3):
         raise ValueError("Policy color intrinsics do not match the camera RGB payload")
+    if "depth" in requested:
+        scale = float(sensors.camera_depth_scale.value)
+        if depth_config is None or not math.isclose(
+            scale, depth_config["depth_scale_m"], rel_tol=1e-9, abs_tol=0.0
+        ):
+            raise ValueError("Live depth scale differs from the saved raw-count input recipe")
     transform = None
     if "camera_extrinsic" in requested:
         if calibration is None:
             raise ValueError("camera_extrinsic requires current camera calibration")
         transform = calibration.for_serial(serial)
     parameters = camera_parameters_cv(color, transform)
-    return {name: parameters[name] for name in requested}
+    return {name: parameters[name] for name in requested - {"depth"}}
 
 
 def load_configured_policy(info, execution_config, *, device, seed):
@@ -209,13 +229,19 @@ class PolicySession:
             required_tactile=self.needs.required_tactile,
         )
 
+        self.kinematics = build_observation_kinematics(self.info, self.runtime)
+        self.camera_parameters = None
         self.model = InferenceWorker(
             lambda: load_configured_policy(
                 self.info,
                 self.runtime.execution,
                 device=self.device,
                 seed=self.seed,
-            )
+            ),
+            build_observation=lambda rows: build_policy_observation(
+                rows, self.info, kinematics=self.kinematics,
+                camera_parameters=self.camera_parameters,
+            ),
         )
         self.warmup_policy()
         logger.debug(
@@ -233,8 +259,22 @@ class PolicySession:
             self.runtime.execution.rtc_guidance_cap,
             self.recording_dir is not None,
         )
-        self.kinematics = build_observation_kinematics(self.info, self.runtime)
-        self.action_mapper = ActionMapper.for_mode(self.runtime, self.info.action_mode)
+        self.action_mapper = ActionMapper.for_mode(
+            self.info.action_mode,
+            ik_config=OnlineIKConfig(
+                max_pose_error_pos_m=self.runtime.motion.ik_max_pose_error_pos_m,
+                max_pose_error_rot_rad=self.runtime.motion.ik_max_pose_error_rot_rad,
+                operational_joint_lower_rad=tuple(self.runtime.arm.joint_limit_lower),
+                operational_joint_upper_rad=tuple(self.runtime.arm.joint_limit_upper),
+            ),
+            hand_enabled=self.runtime.hand.enabled,
+            hand_lower_rad=self.runtime.hand.qpos_min_rad,
+            hand_upper_rad=self.runtime.hand.qpos_max_rad,
+            home_hand_qpos=np.deg2rad(self.runtime.hand.home_qpos_deg),
+            workspace=self.runtime.environment.workspace.as_array(),
+            workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
+            static_boxes=self.runtime.environment.static_boxes,
+        )
         self.home_planner = build_home_planner(self.runtime)
         self.recorder = (
             AsyncEpisodeRecorder(
@@ -288,6 +328,7 @@ class PolicySession:
             self.runtime.camera,
             self.info.observation_fields,
             self.camera_calibration,
+            depth_config=self.info.depth_config,
         )
         self.robot.check()
         self.runtime_state.arm()
@@ -586,14 +627,12 @@ class PolicySession:
                 needs=self.needs,
                 action_mapper=self.action_mapper,
                 model_runtime=self.model,
-                kinematics=self.kinematics,
                 max_running_s=self.max_running_s,
                 query_ids=self.query_ids,
                 capture_ids=self.capture_ids,
                 recorder=self.recorder,
                 results=self.results,
                 camera_calibration=self.camera_calibration,
-                camera_parameters=self.camera_parameters,
             )
         episode = self.episode
         before = episode.termination

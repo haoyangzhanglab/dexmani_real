@@ -1,4 +1,4 @@
-"""One Policy attempt owns preparation, control, capture and termination evidence."""
+"""One Policy attempt owns preparation, control, capture and its first termination."""
 
 import logging
 import time
@@ -8,16 +8,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.data.raw.schema import observation_timing
 from dexmani_real.data.recorder import (
     RecordingError,
     snapshot_recording_metadata,
 )
 from dexmani_real.data.results import error_detail
 from dexmani_real.deployment.observation import (
-    build_policy_observation,
     policy_observation_issue,
-    policy_sources,
+    policy_source_times,
 )
 from dexmani_real.deployment.schedule import (
     ControlRejection,
@@ -80,13 +78,11 @@ class PolicyEpisode:
         sensors,
         action_mapper,
         model_runtime,
-        kinematics,
         max_running_s,
         query_ids,
         capture_ids,
         recorder=None,
         camera_calibration=None,
-        camera_parameters=None,
         results=None,
     ):
         self.runtime_state = runtime_state
@@ -97,12 +93,10 @@ class PolicyEpisode:
         self.sensors = sensors
         self.needs = needs
         self.action_mapper = action_mapper
-        self.kinematics = kinematics
         self.model = model_runtime
         self.recorder = recorder
         self.results = results
         self.camera_calibration = camera_calibration
-        self.camera_parameters = camera_parameters
         self.max_running_s = max_running_s
         self.query_ids = query_ids
         self.capture_ids = capture_ids
@@ -117,7 +111,6 @@ class PolicyEpisode:
         # A START attempt needs finalization even when the writer never becomes ready.
         self.capture_attempted = False
         self.plan = self.query = None
-        self.slot_timing = {}
         self.preparation_issue = None
         self.observation_read_issues = []
         self.wait_started_ns = None
@@ -167,15 +160,6 @@ class PolicyEpisode:
         epoch = self.run_id
         ended_ns = time.monotonic_ns()
         duration_s = (ended_ns - self.started_ns) / 1e9 if epoch is not None else 0.0
-        termination_timing = None
-        if epoch is not None and self.recorder is not None:
-            termination_timing = dict(
-                run_id=epoch, started_ns=self.started_ns, slot=self.last_slot,
-                ended_ns=ended_ns, reason=detail,
-                query=dict(self.query.evidence) if self.query is not None else None,
-                action_query_id=self.slot_timing.get("query_id"),
-                prediction_index=self.slot_timing.get("prediction_index"),
-            )
         self.runtime_state.revoke_motion(
             reason=run_end_reason,
             expected_run_id=epoch if epoch is not None else self.preparing_epoch,
@@ -202,9 +186,12 @@ class PolicyEpisode:
             self.hand_history.clear()
         self.previous_arm = self.wait_started_ns = None
         errors, failure = list(errors or ()), None
+        stop_result = "not_applicable"
         try:
             if epoch is not None or self.robot.stop_required:
+                stop_result = "unconfirmed"
                 self.robot.stop()
+                stop_result = "confirmed"
             self.runtime_state.acknowledge_stop(stopped_epoch)
         except BaseException as exc:
             failure = exc
@@ -221,15 +208,14 @@ class PolicyEpisode:
             errors.append(error_detail("recording", exc))
         try:
             self.finalize_outputs(
-                reason_name, detail, errors, duration_s=duration_s, timing=termination_timing
+                reason_name, detail, errors, duration_s=duration_s, stop_result=stop_result,
             )
         except BaseException as exc:
             failure = failure or exc
         if failure is not None:
             raise failure
 
-    def finalize_outputs(self, reason, detail, errors, *, duration_s, timing):
-        errors = list(errors)
+    def finalize_outputs(self, reason, detail, errors, *, duration_s, stop_result):
         failure, raw = None, None
         try:
             if self.recorder is not None and self.capture_attempted:
@@ -238,10 +224,12 @@ class PolicyEpisode:
                     saved = self.recorder.save_episode(
                         reason=reason,
                         details=[dict(stage="termination", reason=detail), *errors],
-                        timing=timing,
-                        arm_execution=dict(
-                            self.robot.arm.execution_snapshot(),
-                            robot_stopped=not self.robot.stop_required,
+                        stop_result=stop_result,
+                        technical_status=(
+                            "normal" if not errors and (
+                                reason in {"operator", "quit"}
+                                or (reason == "timeout" and detail == "duration_timeout")
+                            ) else "failed"
                         ),
                     )
                     status = "published" if saved is not None else "not_published"
@@ -279,7 +267,7 @@ class PolicyEpisode:
                 and issue.startswith("camera_")
                 and not (
                     set(self.policy_info.observation_fields)
-                    & {"rgb", "camera_intrinsic", "camera_extrinsic"}
+                    & {"rgb", "depth", "point_cloud", "camera_intrinsic", "camera_extrinsic"}
                 )
             ):
                 return f"recording_source_{issue}"
@@ -340,8 +328,6 @@ class PolicyEpisode:
             capture_id = next(self.capture_ids)
             self.recorder.start_episode(
                 task_label=self.policy_info.task_name,
-                arm_execution=self.robot.arm.execution_snapshot(),
-                arm_control_metadata=self.robot.arm.execution_metadata(1 / self.recorder.control_hz),
                 episode_name=f"episode_{capture_id:03d}", collection_source="policy_rollout", metadata=metadata,
             )
         # START and mode restoration can block; each boundary requires fresh feedback.
@@ -392,14 +378,6 @@ class PolicyEpisode:
             raise RuntimeError("Model result has no owned query")
         if result.query_context != dict(run_id=query.run_id, query_id=query.query_id):
             raise RuntimeError("model result/query ownership mismatch")
-        if self.recorder is not None and query.run_id == self.run_id:
-            query.evidence.update(
-                started_ns=result.started_ns,
-                completed_ns=result.completed_ns,
-                status="failed" if result.error is not None else "completed",
-                error=str(result.error) if result.error is not None else None,
-            )
-            self.record_query(query)
         if self.results is not None and query.run_id == self.run_id:
             self.results.record_inference(result.completed_ns - result.started_ns)
         if query.run_id != self.run_id or not self.has_motion_authority():
@@ -431,19 +409,13 @@ class PolicyEpisode:
         )
 
     def submit(self, rows, slot, *, handoff_slot=None, prefix=None, commands=None):
-        observation = build_policy_observation(
-            rows,
-            self.policy_info,
-            kinematics=self.kinematics,
-            camera_parameters=self.camera_parameters,
-        )
         now = time.monotonic_ns()
         authorized, expired = self.has_motion_authority(), self.expired_budget()
         if expired is not None:
             return ControlRejection(f"{expired[1]}_timeout", RunEndReason.TIMEOUT)
         if not authorized:
             return ControlRejection("query_authority_revoked")
-        sources = policy_sources(rows[-1], self.policy_info.observation_fields)
+        sources = policy_source_times(rows[-1], self.policy_info.observation_fields)
         expires_at_ns = decision_expires_at_ns(sources, now, self.max_decision_age_ns)
         if expires_at_ns is None:
             return ControlRejection("query_sources_invalid_or_expired")
@@ -457,7 +429,7 @@ class PolicyEpisode:
         if self.hand_history is not None:
             if not self.hand_history:
                 # Match training's episode-initial measured pose, before the first query action.
-                hand = np.asarray(observation["joint_state"][-1, -12:], dtype=np.float64)
+                hand = rows[-1].hand["qpos"][0].astype(np.float32).astype(np.float64)
                 if hand.shape != (12,) or not np.isfinite(hand).all():
                     return ControlRejection("invalid_hand_history_bootstrap")
                 initial_hand_history = tuple(
@@ -469,40 +441,9 @@ class PolicyEpisode:
                     self.hand_history if initial_hand_history is None else initial_hand_history
                 )
             }
-        if self.recorder is not None:
-            query.evidence = dict(
-                query_id=query.query_id,
-                run_id=self.run_id,
-                slot=int(slot),
-                handoff_slot=handoff_slot,
-                planned_handoff_ns=(
-                    self.started_ns + handoff_slot * self.dt_ns
-                    if handoff_slot is not None else None
-                ),
-                decision_expires_at_ns=expires_at_ns,
-                actual_handoff_slot=None,
-                actual_handoff_ns=None,
-                deadline_ns=(
-                    (self.started_ns + (handoff_slot + 1) * self.dt_ns)
-                    if handoff_slot is not None and self.execution.execution_mode == "rtc"
-                    else None
-                ),
-                submitted_ns=time.monotonic_ns(),
-                started_ns=None,
-                completed_ns=None,
-                status="submitted",
-                bootstrap=handoff_slot is None,
-                observations=[
-                    dict(
-                        observation_timing(row),
-                        policy_sources=policy_sources(row, self.policy_info.observation_fields),
-                    )
-                    for row in rows
-                ],
-            )
         self.model.submit(
             "predict",
-            observation,
+            tuple(rows),
             query_context=dict(run_id=self.run_id, query_id=query.query_id),
             **kwargs,
         )
@@ -511,7 +452,6 @@ class PolicyEpisode:
         self.query = query
         if commands is not None:
             self.plan.frozen.update(commands)
-        self.record_query(query)
         return None
 
     def prepare_prefix(self, row, slot):
@@ -537,14 +477,10 @@ class PolicyEpisode:
             )
         return prefix, commands, None
 
-    def record_query(self, query):
-        if self.recorder is not None and self.capture_attempted:
-            self.recorder.record_query(query.evidence)
-
     def record_pending(self):
         frame, self.pending_frame = self.pending_frame, None
         if self.recorder is not None and frame is not None and frame[0] is not None:
-            self.recorder.add_frame(*frame, timing=self.slot_timing)
+            self.recorder.add_frame(*frame)
 
     def map_command(self, action, row, previous, *, context="action"):
         """Map one policy action to a checked joint command."""
@@ -584,7 +520,6 @@ class PolicyEpisode:
 
     def execute_slot(self, row, slot):
         plan = self.plan
-        self.slot_timing.update(query_id=plan.query_id, prediction_index=slot - plan.anchor_slot)
         command, issue = self.command_for_slot(row, slot)
         if issue is not None:
             self.finish(issue.detail, run_end_reason=issue.run_end_reason)
@@ -610,7 +545,6 @@ class PolicyEpisode:
             return
         failure = None
         try:
-            self.slot_timing["submit_started_ns"] = time.monotonic_ns()
             execute_until_ns = decision_deadline_ns
             if self.max_running_s is not None:
                 execute_until_ns = min(
@@ -625,8 +559,6 @@ class PolicyEpisode:
                 raise DispatchError("incomplete action dispatch", result, cause="dispatch_status")
         except (DispatchError, DispatchInterrupted) as exc:
             result, failure = exc.result, exc
-        finally:
-            self.slot_timing["submit_completed_ns"] = time.monotonic_ns()
         self.pending_frame = (row, command, result)
         if self.results is not None and (
             result.arm != DispatchStatus.NOT_CALLED or result.hand != DispatchStatus.NOT_CALLED
@@ -767,7 +699,6 @@ class PolicyEpisode:
                 self.results.record_skipped_slots(skipped)
             self.finish(f"missed_slot: expected={slot}, actual={slot + skipped}")
             return
-        self.slot_timing = dict(run_id=self.run_id, slot=int(slot), control_ns=now)
         self.last_slot = slot
         row = self.read_observation()
         self.pending_frame = (row, None, None)
@@ -790,13 +721,6 @@ class PolicyEpisode:
             self.finish(issue.detail, run_end_reason=issue.run_end_reason)
             return
         if new_plan is not None:
-            if self.recorder is not None:
-                if self.query.handoff_slot is None:
-                    self.query.evidence.update(handoff_slot=int(slot), bootstrap=True)
-                self.query.evidence.update(
-                    actual_handoff_slot=int(slot), actual_handoff_ns=time.monotonic_ns()
-                )
-                self.record_query(self.query)
             self.plan, self.query = new_plan, None
         if self.plan is None:
             self.robot.end_hand_send_interval()

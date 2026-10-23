@@ -44,6 +44,7 @@ XHAND_RATED_QPOS_MAX_RAD: tuple[float, ...] = (
 
 @dataclass(frozen=True)
 class HandParams:
+    enabled: bool = True
     ethercat_slave_position: int = -1
 
     comm_type: str = "serial"

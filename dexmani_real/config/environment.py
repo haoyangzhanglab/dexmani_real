@@ -107,5 +107,7 @@ class TableCollisionConfig:
 
 @dataclass(frozen=True)
 class EnvironmentConfig:
+    workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
+    eef_workspace_margin_m: float = 0.005
     table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
     static_boxes: tuple[StaticCollisionBox, ...] = ()

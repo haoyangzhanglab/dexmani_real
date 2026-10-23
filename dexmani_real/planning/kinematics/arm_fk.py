@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -15,9 +14,6 @@ from dexmani_real.robot.model import (
 )
 from ..paths import wrap_nearest_equivalent
 from .pose import Pose
-
-ARM_FK_URDF = str(XARM7_XHAND_COLLISION_URDF_PATH)
-
 
 def make_arm_kinematics():
     """Construct the seven-joint MPlib backend in xArm-base coordinates, without devices."""
@@ -37,10 +33,9 @@ def make_arm_kinematics():
     return XArm7Kinematics(model)
 
 
-@lru_cache(maxsize=1)
 def make_arm_fk() -> "ArmFK":
-    """Return cached per-process FK for deriving the URDF EEF pose from arm qpos."""
-    return ArmFK(ARM_FK_URDF)
+    """Create an owner-local FK workspace; Pinocchio Data must not cross worker ownership."""
+    return ArmFK(str(XARM7_XHAND_COLLISION_URDF_PATH))
 
 
 class ArmFK:

@@ -1,6 +1,5 @@
 """Parent target submission and authority; the arm worker owns all SDK calls."""
 
-from importlib.metadata import version
 import multiprocessing as mp
 import time
 
@@ -11,10 +10,7 @@ from dexmani_real.runtime.state import SafetyState, RunEndReason
 from dexmani_real.robot.xarm7.protocol import (
     MAX_TIME,
     GOAL_DTYPE,
-    CALL_DTYPE,
-    COUNTERS,
     STATUS_DTYPE,
-    STAT_NAMES,
     PrepareRequest,
     HomeRequest,
     LifecycleReply,
@@ -156,56 +152,6 @@ class ArmExecutor:
         frame = status["frame"].copy().reshape(1)
         frame.flags.writeable = False
         return frame
-
-    def execution_snapshot(self):
-        """Detached diagnostics survive faults; SDK stop acceptance does not prove standstill."""
-        status = self.io.read_status()
-        with self.io.goal_lock:
-            pending = int(np.frombuffer(self.io.goal, dtype=GOAL_DTYPE, count=1)["sequence"][0])
-        point = status["point"]
-        return dict(
-            submitted=self.sequence,
-            **{name: int(status[name]) for name in COUNTERS},
-            active_sequence=int(status["active_sequence"]),
-            pending_sequence=pending,
-            stopped=self.io.stopped.is_set(),
-            connected=self.is_connected,
-            stop_request=dict(
-                started_ns=int(status["stop_started_ns"]),
-                completed_ns=int(status["stop_completed_ns"]),
-                sdk_accepted=bool(status["stop_accepted"]),
-            ),
-            operation_unresolved=self.operation_unresolved,
-            fault=self.fault,
-            close_error=self.io.close_error.value.decode(errors="replace") or None,
-            timing={name: int(status["stats"][name]) for name in STAT_NAMES},
-            last_call={name: point[name].tolist() for name in CALL_DTYPE.names},
-        )
-
-    def execution_metadata(self, target_dt):
-        versions = {}
-        for name, package in (("ruckig", "ruckig"), ("sdk", "xarm-python-sdk")):
-            try:
-                versions[f"{name}_version"] = version(package)
-            except Exception as exc:
-                versions[f"{name}_version"] = "unknown"
-                versions[f"{name}_version_error"] = f"{type(exc).__name__}: {exc}"
-        return dict(
-            mode=1,
-            implementation="ruckig_monotonic_process",
-            **versions,
-            servo_hz=self.cfg.servo_hz,
-            target_dt=target_dt,
-            max_velocity_rad_s=self.cfg.max_joint_velocity_rad_per_s,
-            max_acceleration_rad_s2=self.cfg.max_joint_acceleration_rad_per_s2,
-            servo_max_interval_s=self.cfg.servo_max_interval_s,
-            sdk_timeout_s=self.cfg.sdk_timeout_s,
-            clock="host_monotonic_ns",
-            receipt="submitted; SDK acceptance counted in episode summary",
-            action="q_goal_absolute_joint_position_not_next_step_arrival",
-            feedback="synchronous_query_start_host_monotonic; effort SDK-native",
-            trajectory_time="actual_sample_ns_minus_activation_ns; no catch-up sends",
-        )
 
     def update_health(self, *, service_until_ns=None, upstream_until_ns=None, hand_until_ns=None):
         for value, destination in (

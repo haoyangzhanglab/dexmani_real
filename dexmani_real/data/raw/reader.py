@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -14,12 +13,12 @@ from dexmani_real.data.raw.schema import (
     DATASET_SPECS,
     RAW_FORMAT,
     TIMING_ROW_DTYPE,
-    validate_arm_execution,
+    validate_fixed_rate_rows,
 )
 
 
 class RawDataError(ValueError):
-    """Malformed or unsupported Raw input; distinct from program and system errors."""
+    """Raw is unsuitable for the requested use; distinct from program and system errors."""
 
 
 def scalar_attr(attrs: h5py.AttributeManager, name: str) -> object:
@@ -58,13 +57,9 @@ def nonnegative_int_attr(attrs: h5py.AttributeManager, name: str) -> int:
 
 
 def positive_int_attr(attrs: h5py.AttributeManager, name: str) -> int:
-    """Parse a Raw dimension without coercing text/bools or truncating fractional values."""
+    """Require positive integer dimensions without numeric or text coercion."""
     value = scalar_attr(attrs, name)
-    if (
-        type(value) not in (int, float)
-        or value <= 0
-        or (type(value) is float and (not np.isfinite(value) or not value.is_integer()))
-    ):
+    if type(value) is not int or value <= 0:
         raise RawDataError(f"episode metadata {name} must be a positive integer")
     return int(value)
 
@@ -80,33 +75,43 @@ def positive_float_attr(attrs: h5py.AttributeManager, name: str) -> float:
 
 
 class EpisodeReader:
-    """Read current immutable Raw evidence without deciding training eligibility."""
+    """Read immutable Raw; consumers explicitly request their needed validation."""
 
     def __init__(self, episode_path: str | Path) -> None:
-        self.episode_path = Path(episode_path)
+        self.path = Path(episode_path)
         self.data_file = self.video_container = None
         self.fields_cache = None
         self.dataset_cache = {}
-        if not self.episode_path.is_dir():
-            raise ValueError(f"episode must be a directory: {self.episode_path}")
-        self.rgb_path = self.episode_path / "rgb.mp4"
+        if not self.path.is_dir():
+            raise ValueError(f"episode must be a directory: {self.path}")
+        self.rgb_path = self.path / "rgb.mp4"
         try:
-            self.data_file = h5py.File(self.episode_path / "data.h5", "r")
+            try:
+                self.data_file = h5py.File(self.path / "data.h5", "r")
+            except OSError as exc:
+                # h5py reports format failures without a filesystem errno. Keep
+                # permission/device/filesystem failures distinct from bad episodes.
+                if exc.errno is None and any(
+                    message in str(exc).lower()
+                    for message in (
+                        "file signature not found", "truncated file", "bad object header",
+                        "bad superblock", "incorrect metadata checksum",
+                    )
+                ):
+                    raise RawDataError(f"invalid Raw HDF5: {exc}") from exc
+                raise
             if "meta" not in self.data_file or not isinstance(self.data_file["meta"], h5py.Group):
                 raise RawDataError("episode is missing meta")
             attrs = self.meta
             if text_attr(attrs, "format") != RAW_FORMAT:
                 raise RawDataError(f"unsupported Raw format (expected {RAW_FORMAT!r})")
-            if (
-                attrs.get("arm_control_mode") != 1
-                or text_attr(attrs, "arm_action_semantics") != "q_goal_submitted"
-            ):
-                raise RawDataError("unknown arm control/action semantics")
+            if text_attr(attrs, "arm_action_semantics") != "q_goal_submitted":
+                raise RawDataError("unknown arm action semantics")
             if text_attr(attrs, "timestamp_source") != "host_monotonic_relative":
                 raise RawDataError("Raw timestamp must use host monotonic relative seconds")
             text_attr(attrs, "termination_reason")
-            self.frame_count = nonnegative_int_attr(attrs, "num_frames")
-            self.sampling_hz = positive_float_attr(attrs, "control_hz")
+            self.num_frames = nonnegative_int_attr(attrs, "num_frames")
+            self.control_hz = positive_float_attr(attrs, "control_hz")
             text_attr(attrs, "task_label")
             text_attr(attrs, "collection_source")
         except BaseException:
@@ -128,14 +133,10 @@ class EpisodeReader:
             self.fields_cache = frozenset(names)
         return self.fields_cache
 
-    @property
-    def path(self):
-        return self.episode_path
-
     def require_fields(self, *names: str) -> None:
         missing = set(names) - self.fields
         if missing:
-            raise RawDataError(f"Raw {self.episode_path.name} missing required fields: {sorted(missing)}")
+            raise RawDataError(f"Raw {self.path.name} missing required fields: {sorted(missing)}")
 
     def __getitem__(self, name):
         if self.data_file is None:
@@ -152,52 +153,86 @@ class EpisodeReader:
         self.dataset_cache[name] = array
         return array
 
-    def read_timing_rows(self, fields=("run_id", "command_seq")):
-        """Read the consumer's required columns without imposing diagnostic layout."""
+    def read_timing_rows(self, fields=TIMING_ROW_DTYPE.names, *, start=0, stop=None):
+        """Read required source-clock columns in a bounded row range."""
         if "timing/rows" not in self.data_file:
             raise RawDataError("Raw is missing timing rows")
         rows = self.data_file["timing/rows"]
         if (
             not isinstance(rows, h5py.Dataset)
             or rows.shape != (self.num_frames,)
-            or rows.dtype.names is None
+            or rows.dtype != TIMING_ROW_DTYPE
         ):
-            raise RawDataError("timing rows must be a compound dataset aligned with core rows")
-        for name in fields:
-            if name not in rows.dtype.names or rows.dtype[name] != TIMING_ROW_DTYPE[name]:
-                raise RawDataError(f"timing rows require int64 column {name}")
-        return rows.fields(fields)[:]
+            raise RawDataError("timing rows must match the current eight-column layout and row count")
+        return rows.fields(fields)[start:stop]
 
-    def validate_arm_execution(self):
-        """Check execution evidence independently of inference diagnostics."""
-        try:
-            group = self.data_file["arm_execution"]
-            if not isinstance(group, h5py.Group):
-                raise RawDataError("arm_execution must be a group")
-            for name in ("start", "end"):
-                value = group[name]
-                if not isinstance(value, h5py.Dataset) or value.shape != ():
-                    raise RawDataError(f"{name} must be a scalar dataset")
-            validate_arm_execution(
-                json.loads(group["start"].asstr()[()]),
-                json.loads(group["end"].asstr()[()]),
-                self.read_timing_rows(),
-                self["dispatch_status"][:],
+    def validate_completion(self):
+        """Strict numerical consumers require a normal capture and confirmed stop."""
+        if text_attr(self.meta, "technical_status") != "normal":
+            raise RawDataError("capture ended with a technical failure")
+        if text_attr(self.meta, "stop_result") != "confirmed":
+            raise RawDataError("capture stop was not confirmed")
+
+    def validate_fixed_rate_rows(self, *, chunk_frames=4096):
+        """Validate sampling and dispatch in bounded blocks with one overlap row."""
+        if type(chunk_frames) is not int or chunk_frames <= 0:
+            raise ValueError("chunk_frames must be a positive integer")
+        timestamp, dispatch = self["timestamp"], self["dispatch_status"]
+        for start in range(0, self.num_frames, chunk_frames):
+            first, end = max(0, start - 1), min(start + chunk_frames, self.num_frames)
+            errors = validate_fixed_rate_rows(
+                timestamp[first:end], dispatch[first:end], self.control_hz, row_offset=first
             )
-        except (KeyError, ValueError, TypeError) as exc:
-            raise RawDataError(f"Mode-1 execution evidence: {exc}") from exc
+            if errors:
+                raise RawDataError("; ".join(errors))
 
-    @property
-    def num_frames(self) -> int:
-        return self.frame_count
-
-    @property
-    def control_hz(self) -> float:
-        return self.sampling_hz
+    def validate_source_times(
+        self, *, required_tactile=("aggregate", "dense"), require_camera=True, chunk_frames=4096
+    ):
+        """Check factual source ages in bounded blocks without inventing old Raw clocks."""
+        if type(chunk_frames) is not int or chunk_frames <= 0:
+            raise ValueError("chunk_frames must be a positive integer")
+        if not set(required_tactile) <= {"aggregate", "dense"}:
+            raise ValueError("unknown tactile source")
+        fields = ("observation_ns", "control_ns", "arm_ns", "hand_ns")
+        fields += tuple(f"tactile_{name}_ns" for name in required_tactile)
+        if require_camera:
+            fields += ("camera_ns", "camera_sequence")
+        max_age_ns = (
+            positive_float_attr(self.meta, "hand_tactile_hold_max_age_s") * 1e9
+            if required_tactile else None
+        )
+        first_observation = None
+        for start in range(0, self.num_frames, chunk_frames):
+            first, end = max(0, start - 1), min(start + chunk_frames, self.num_frames)
+            rows = self.read_timing_rows(fields, start=first, stop=end)
+            observation = rows["observation_ns"]
+            if np.any(observation <= 0) or np.any(np.diff(observation) <= 0):
+                raise RawDataError("observation clocks must be positive and strictly increasing")
+            if first_observation is None:
+                first_observation = int(observation[0])
+            for name in fields[1:]:
+                values = rows[name]
+                if name == "camera_sequence":
+                    if np.any(values < 0) or np.any(np.diff(values) < 0):
+                        raise RawDataError("camera sequence must be nonnegative and nondecreasing")
+                    continue
+                if np.any(values <= 0) or np.any(values > observation):
+                    raise RawDataError(f"invalid consumed source clock: {name}")
+                if np.any(np.diff(values) < 0):
+                    raise RawDataError(f"consumed source clock regressed: {name}")
+            timestamp = self["timestamp"][first:end]
+            if not np.isfinite(timestamp).all() or not np.allclose(
+                timestamp * 1e9, observation - first_observation, rtol=0, atol=1.0
+            ):
+                raise RawDataError("timestamp differs from actual observation clock")
+            for name in required_tactile:
+                if np.any(observation - rows[f"tactile_{name}_ns"] >= max_age_ns):
+                    raise RawDataError(f"consumed tactile {name} exceeds hold age budget")
 
     @property
     def dt(self) -> float:
-        return 1.0 / self.sampling_hz
+        return 1.0 / self.control_hz
 
     def iter_rgb_frames(self) -> Iterator[np.ndarray]:
         """Decode RGB in HDF5 row order; sampling times come from Raw ``timestamp``."""

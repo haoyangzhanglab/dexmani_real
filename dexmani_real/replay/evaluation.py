@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.pose import rot6d_to_rotmat
 from dexmani_real.replay.trajectory import TrajectoryData
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
-from dexmani_real.utils.atomic_io import atomic_json_dump
+from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
 
 ALIGNMENT_WINDOW_S = 0.4
 MIN_ALIGNMENT_OFFSET_FRAMES = 6
@@ -34,6 +32,12 @@ def compute_metrics(
     fps = trajectory.fps
     original_frames = len(trajectory.arm_qpos)
     replayed_frames = len(replay_data["arm_qpos"])
+    if any(
+        len(replay_data[name]) != replayed_frames
+        for name in ("hand_qpos", "arm_cmd", "eef_pos", "eef_rot6d")
+    ):
+        raise ValueError("replay sample arrays must have the same row count")
+    # Separate runs may have different lengths; fields within a capture may not.
     count = min(original_frames, replayed_frames)
     metrics = {
         "hand_start": {
@@ -90,18 +94,12 @@ def compute_metrics(
 
     orig_rot, rep_rot = trajectory.arm_ee[:count, 3:9], replay_data["eef_rot6d"][:count]
     valid = np.isfinite(orig_rot).all(axis=1) & np.isfinite(rep_rot).all(axis=1)
-    errors = []
-    for index in np.flatnonzero(valid):
-        try:
-            errors.append(
-                geodesic_distance_deg(
-                    rot6d_to_rotmat(orig_rot[index]),
-                    rot6d_to_rotmat(rep_rot[index]),
-                )
-            )
-        except ValueError:
-            pass
-    finite_errors = np.asarray(errors)[np.isfinite(errors)]
+    finite_errors = np.array([
+        geodesic_distance_deg(
+            rot6d_to_rotmat(orig_rot[index]), rot6d_to_rotmat(rep_rot[index])
+        )
+        for index in np.flatnonzero(valid)
+    ])
     metrics["valid_frames"]["eef_rotation"] = len(finite_errors)
     if len(finite_errors):
         metrics["eef_orientation"].update(
@@ -109,8 +107,7 @@ def compute_metrics(
             max_error_deg=round(float(np.max(finite_errors)), 2),
         )
 
-    hand_count = min(len(trajectory.hand_qpos), len(replay_data["hand_qpos"]))
-    orig_hand, rep_hand = trajectory.hand_qpos[:hand_count], replay_data["hand_qpos"][:hand_count]
+    orig_hand, rep_hand = trajectory.hand_qpos[:count], replay_data["hand_qpos"][:count]
     valid = np.isfinite(orig_hand).all(axis=1) & np.isfinite(rep_hand).all(axis=1)
     metrics["valid_frames"]["hand"] = int(valid.sum())
     if valid.any():
@@ -127,8 +124,7 @@ def compute_metrics(
             np.median(list(offsets.values()))
         )
 
-    gap_count = min(len(replay_data["arm_cmd"]), replayed_frames)
-    commands, measured = replay_data["arm_cmd"][:gap_count], replay_data["arm_qpos"][:gap_count]
+    commands, measured = replay_data["arm_cmd"], replay_data["arm_qpos"]
     valid = np.isfinite(commands).all(axis=1) & np.isfinite(measured).all(axis=1)
     if valid.any():
         gaps = np.max(np.abs(commands[valid] - measured[valid]), axis=1)
@@ -183,7 +179,7 @@ def evaluate_replay(
     if replay_data is None:
         print("\nNo replay data collected (replay interrupted before any frames captured).")
         return
-    # Preserve execution/termination evidence even when preparation produced zero rows.
+    # Preserve dispatch and termination even when preparation produced zero replay rows.
     save_replay_data(replay_data, output_dir)
     if replay_data["arm_qpos"].shape[0] == 0:
         print("\nSkipping metrics: no valid reference or replay data available")
@@ -193,22 +189,15 @@ def evaluate_replay(
         count = len(replay_data["arm_qpos"])
         eef_pos = np.empty((count, 3), dtype=np.float64)
         eef_rot6d = np.empty((count, 6), dtype=np.float64)
-        eef_quat_wxyz = np.full((count, 4), np.nan, dtype=np.float64)
         for index, qpos in enumerate(replay_data["arm_qpos"]):
             eef_pos[index], eef_rot6d[index] = fk.compute(qpos)
-            try:
-                quat_xyzw = Rotation.from_matrix(rot6d_to_rotmat(eef_rot6d[index])).as_quat()
-                eef_quat_wxyz[index] = quat_xyzw[[3, 0, 1, 2]]
-            except ValueError:
-                pass
     except Exception as exc:
         raise RuntimeError(
             f"replay EEF derivation failed after physical capture was saved: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
-    replay_data.update(eef_pos=eef_pos, eef_rot6d=eef_rot6d, eef_quat_wxyz=eef_quat_wxyz)
-    save_replay_data(replay_data, output_dir)
-    metrics = compute_metrics(trajectory, replay_data, hand_start_duration_s=hand_start_duration_s)
+    derived = dict(replay_data, eef_pos=eef_pos, eef_rot6d=eef_rot6d)
+    metrics = compute_metrics(trajectory, derived, hand_start_duration_s=hand_start_duration_s)
     report_consistency(metrics)
     metrics_path = atomic_json_dump(metrics, Path(output_dir) / "metrics.json", ensure_ascii=False)
     print(f"\nMetrics saved: {metrics_path}")
@@ -222,7 +211,7 @@ def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str) -> Pat
     # NumPy appends .npz; match the temporary suffix before atomic publication.
     tmp_path = npz_path.with_suffix(".tmp.npz")
     np.savez_compressed(tmp_path, **replay_data)
-    os.replace(tmp_path, npz_path)
+    atomic_publish(tmp_path, npz_path)
     print(f"Replay data saved: {npz_path}  ({replay_data['arm_qpos'].shape[0]} frames)")
     return npz_path
 

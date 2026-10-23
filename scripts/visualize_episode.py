@@ -21,9 +21,9 @@ from dexmani_real.data.raw.camera_geometry import (
 )
 from dexmani_real.data.raw.reader import EpisodeReader
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
-from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
+from dexmani_real.planning.kinematics.fingertip import compute_hand_geometry_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
-from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE, XHAND_RIGHT_URDF_PATH
+from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.sensor.camera.geometry import validate_aligned_depth_distortion
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud
@@ -33,16 +33,16 @@ logger = logging.getLogger("dexmani_real.cli.visualize_episode")
 
 
 SERIES_GROUPS = {
-    "state": ("arm_effort", "arm_qpos", "arm_qvel", "hand_current", "hand_qpos"),
+    "state": ("arm_qpos", "hand_qpos"),
     "action": ("action_arm_joint_target", "action_hand_joint_target"),
 }
 FORCE_SERIES = {
     "hand_contact_mag": (
-        "thumb (SDK-scaled)",
-        "index (SDK-scaled)",
-        "middle (SDK-scaled)",
-        "ring (SDK-scaled)",
-        "pinky (SDK-scaled)",
+        "thumb (SDK native)",
+        "index (SDK native)",
+        "middle (SDK native)",
+        "ring (SDK native)",
+        "pinky (SDK native)",
     ),
     "hand_force_thumb": ("Fx", "Fy", "Fz"),
     "hand_force_index": ("Fx", "Fy", "Fz"),
@@ -57,20 +57,6 @@ FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
 )
 # Fixed, easily distinguishable from the five finger colors.
 EEF_COLOR = (255, 255, 255)
-
-
-def eef_position_or_none(eef_row: np.ndarray) -> np.ndarray | None:
-    row = np.asarray(eef_row, dtype=np.float64)
-    if row.shape != (9,) or not np.all(np.isfinite(row)):
-        return None
-    return row[:3]
-
-
-def fingertip_positions_or_none(fingertip_row: np.ndarray) -> np.ndarray | None:
-    row = np.asarray(fingertip_row, dtype=np.float32)
-    if row.shape != HAND_FINGERTIP_SHAPE or not np.all(np.isfinite(row)):
-        return None
-    return row
 
 
 def print_episode_info(episode_path: str) -> None:
@@ -130,17 +116,18 @@ class EpisodeVisualizer:
                 "rgb",
                 "depth",
                 "arm_qpos",
-                "arm_qvel",
-                "arm_effort",
                 "hand_qpos",
-                "hand_current",
                 "hand_contact",
                 "action_arm_joint_target",
                 "action_hand_joint_target",
                 "timestamp",
             )
 
-            self.frame_count = self.resolve_frame_count(max_frames)
+            self.frame_count = self.reader.num_frames
+            if self.frame_count <= 0:
+                raise ValueError("episode /meta num_frames must be positive")
+            if max_frames is not None:
+                self.frame_count = min(self.frame_count, max_frames)
             self.rgb_frames = iter(self.reader.iter_rgb_frames())
             self.rgb = None
             self.rgb_index = -1
@@ -198,14 +185,6 @@ class EpisodeVisualizer:
             self.close()
             raise
 
-    def resolve_frame_count(self, max_frames: int | None) -> int:
-        raw = self.reader.num_frames
-        if raw <= 0:
-            raise ValueError("episode /meta num_frames must be positive")
-        if max_frames is not None:
-            return min(raw, max_frames)
-        return raw
-
     def preload_state(self) -> dict[str, np.ndarray]:
         state = {
             key: self.reader[key][: self.frame_count] for keys in SERIES_GROUPS.values() for key in keys
@@ -221,13 +200,13 @@ class EpisodeVisualizer:
             state["arm_ee"][arm_valid] = compute_eef_pose_history_xarm_base(arm[arm_valid])
         if np.any(hand_valid):
             hand_fk = HandKinematics(str(XHAND_RIGHT_URDF_PATH), self.fingertip_link_names)
-            state["hand_fingertip"][hand_valid] = compute_fingertip_history_xarm_base(
+            state["hand_fingertip"][hand_valid] = compute_hand_geometry_history_xarm_base(
                 state["arm_ee"][hand_valid],
                 hand[hand_valid],
                 hand_fk=hand_fk,
                 handbase_position_eef_m=self.handbase_position_eef_m,
                 handbase_quat_eef_wxyz=self.handbase_quat_eef_wxyz,
-            )
+            )["fingertip_xyz"]
 
         contact = self.reader["hand_contact"][: self.frame_count]
         state["hand_contact_mag"] = np.linalg.norm(contact, axis=2)
@@ -260,11 +239,8 @@ class EpisodeVisualizer:
             for key in keys:
                 arr = self.state[key]
                 base = f"{category}/{key}"
-                if arr.ndim == 1:
-                    rr.log(base, rr.SeriesLine(name=key), static=True)
-                else:
-                    for i in range(arr.shape[1]):
-                        rr.log(f"{base}/{i}", rr.SeriesLine(name=f"{i}"), static=True)
+                for i in range(arr.shape[1]):
+                    rr.log(f"{base}/{i}", rr.SeriesLine(name=f"{i}"), static=True)
 
         h, w = self.camera_model.intrinsics.height, self.camera_model.intrinsics.width
         rr.log(
@@ -346,8 +322,8 @@ class EpisodeVisualizer:
         )
 
     def log_fingertips(self, step_idx: int) -> None:
-        fp = fingertip_positions_or_none(self.state["hand_fingertip"][step_idx])
-        if fp is None:
+        fp = self.state["hand_fingertip"][step_idx]
+        if not np.isfinite(fp).all():
             # Clear stale geometry on invalid rows.
             rr.log("fingertips", rr.Clear(recursive=False))
             return
@@ -362,15 +338,15 @@ class EpisodeVisualizer:
         )
 
     def log_eef(self, step_idx: int) -> None:
-        position = eef_position_or_none(self.state["arm_ee"][step_idx])
-        if position is None:
+        pose = self.state["arm_ee"][step_idx]
+        if not np.isfinite(pose).all():
             # Clear stale geometry on invalid rows.
             rr.log("eef", rr.Clear(recursive=False))
             return
         rr.log(
             "eef",
             rr.Points3D(
-                positions=position[None, :],
+                positions=pose[None, :3],
                 colors=np.array([EEF_COLOR], dtype=np.uint8),
                 radii=0.020,  # EEF sphere is intentionally larger than fingertips
             ),
@@ -381,24 +357,13 @@ class EpisodeVisualizer:
             for key in keys:
                 arr = self.state[key]
                 base = f"{category}/{key}"
-                if arr.ndim == 1:
-                    rr.log(base, rr.Scalar(float(arr[step_idx])))
-                else:
-                    for i in range(arr.shape[1]):
-                        rr.log(f"{base}/{i}", rr.Scalar(float(arr[step_idx, i])))
+                for i in range(arr.shape[1]):
+                    rr.log(f"{base}/{i}", rr.Scalar(float(arr[step_idx, i])))
 
         for key in FORCE_SERIES:
             arr = self.state[key]
             for i in range(arr.shape[1]):
                 rr.log(f"state/{key}/{i}", rr.Scalar(float(arr[step_idx, i])))
-
-    @property
-    def num_steps(self) -> int:
-        return self.frame_count
-
-    @property
-    def empty_pointcloud_frames(self) -> int:
-        return self.empty_cloud_count
 
     @property
     def mean_pointcloud_processing_ms(self) -> float | None:
@@ -495,21 +460,21 @@ def main(argv: list[str] | None = None) -> int:
         table_plane_abcd=table_plane_abcd,
     )
     try:
-        logger.info("Logging %d frames to Rerun...", viz.num_steps)
-        for step in range(viz.num_steps):
+        logger.info("Logging %d frames to Rerun...", viz.frame_count)
+        for step in range(viz.frame_count):
             viz.log_step(step)
             if step % 500 == 0:
-                logger.info("  frame %d/%d", step, viz.num_steps)
+                logger.info("  frame %d/%d", step, viz.frame_count)
         mean_pointcloud_ms = viz.mean_pointcloud_processing_ms
         if mean_pointcloud_ms is not None:
             logger.info(
                 "Point-cloud derivation average (excluding RGB-D I/O and rendering): %.2f ms/frame",
                 mean_pointcloud_ms,
             )
-        if viz.empty_pointcloud_frames:
+        if viz.empty_cloud_count:
             logger.warning(
                 "%d point-cloud frames were empty and explicitly cleared",
-                viz.empty_pointcloud_frames,
+                viz.empty_cloud_count,
             )
         logger.info("Done. Close the Rerun window to exit.")
     finally:

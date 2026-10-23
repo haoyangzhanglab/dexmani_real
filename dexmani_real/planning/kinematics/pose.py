@@ -1,4 +1,4 @@
-"""Pose composition, error, quaternion, and rotation-6D operations."""
+"""Pose errors, WXYZ quaternions, and column-ordered rotation-6D operations."""
 
 from __future__ import annotations
 
@@ -37,18 +37,6 @@ XYZW_TO_WXYZ = np.array([3, 0, 1, 2], dtype=np.intp)
 ROT6D_MIN_BASIS_NORM = 1e-4
 ROT6D_MIN_ORTHOGONAL_RATIO = 1e-4
 
-__all__ = [
-    "compose_pose",
-    "compute_pose_error",
-    "forward_from_quat_wxyz",
-    "invert_pose",
-    "quat_multiply",
-    "quat_wxyz_to_rotmat",
-    "rot6d_to_quat_wxyz",
-    "rot6d_to_rotmat",
-]
-
-
 def wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
     q = np.asarray(q, dtype=np.float64).reshape(4)
     return q[WXYZ_TO_XYZW]
@@ -72,29 +60,6 @@ def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
         ],
         dtype=np.float64,
     )
-
-
-def quat_conjugate(q: np.ndarray) -> np.ndarray:
-    return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float64)
-
-
-def quat_rotate_vector(q: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """Rotate a 3D vector by a wxyz quaternion."""
-    qv = np.array([0.0, v[0], v[1], v[2]], dtype=np.float64)
-    qv_rot = quat_multiply(quat_multiply(q, qv), quat_conjugate(q))
-    return qv_rot[1:]
-
-
-def compose_pose(parent: Pose, child: Pose) -> Pose:
-    p = parent.p + quat_rotate_vector(parent.q, child.p)
-    q = quat_multiply(parent.q, child.q)
-    return Pose(p=p, q=q)
-
-
-def invert_pose(pose: Pose) -> Pose:
-    q_inv = quat_conjugate(pose.q)
-    p = quat_rotate_vector(q_inv, -pose.p)
-    return Pose(p=p, q=q_inv)
 
 
 def compute_pose_error(target: Pose, actual: Pose) -> tuple[float, float]:

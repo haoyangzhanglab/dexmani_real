@@ -1,6 +1,5 @@
 """Dispatch every raw target once at nominal dt, with current feedback."""
 
-import json
 import logging
 import time
 from dataclasses import dataclass
@@ -8,7 +7,6 @@ from enum import Enum
 
 import numpy as np
 
-from dexmani_real.data.raw.schema import validate_execution_boundary
 from dexmani_real.planning.action import project_arm_command, project_hand_command
 from dexmani_real.planning.collision import CollisionModel
 from dexmani_real.planning.paths import wrap_nearest_equivalent
@@ -21,6 +19,7 @@ from dexmani_real.robot.commands import (
     DispatchResult,
 )
 from dexmani_real.runtime.observation import (
+    ObservationNeeds,
     feedback_deadline_ns,
     read_observation,
     upstream_deadline_ns,
@@ -64,21 +63,36 @@ class TrajectoryReplayer:
 
     def run(self, trajectory, *, hand_start_duration_s, results=None):
         self.failure_details = []
+        self.preparation_dispatch_count = 0
+        self.preparation_last_dispatch = None
         self.epoch = self.runtime_state.run_id
         self.capture = ReplayRecorder(trajectory.num_frames)
-        arm_start = self.robot.arm.execution_snapshot()
-        control_metadata = self.robot.arm.execution_metadata(1 / trajectory.fps)
         self.target_checker = TargetChecker(
-            self.runtime, CollisionModel(static_boxes=self.runtime.environment.static_boxes)
+            CollisionModel(static_boxes=self.runtime.environment.static_boxes),
+            joint_lower_rad=self.runtime.arm.joint_limit_lower,
+            joint_upper_rad=self.runtime.arm.joint_limit_upper,
+            workspace=self.runtime.environment.workspace.as_array(),
+            workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
         )
         self.previous_arm = None
         period_ns, _ = sampling_clock_ns(trajectory.fps)
         status, reason = ReplayStatus.COMPLETED, ""
         run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
         try:
-            status, reason = self.admit_replay(trajectory, hand_start_duration_s, results)
+            if results is not None:
+                results.begin_episode()
+            status, reason, row = self.admit_replay(trajectory, hand_start_duration_s)
             if status == ReplayStatus.COMPLETED:
-                status, reason = self.replay_rows(trajectory, period_ns)
+                if results is not None:
+                    results.entered(self.epoch)
+                if hand_start_duration_s > 0:
+                    interrupted = self.warm_up_hand(
+                        trajectory, self.epoch, row, hand_start_duration_s
+                    )
+                    if interrupted is not None:
+                        status, reason = interrupted.status, interrupted.reason
+                if status == ReplayStatus.COMPLETED:
+                    status, reason = self.replay_rows(trajectory, period_ns)
         except DispatchError as exc:
             result = exc.result
             reason = f"{exc}; arm={result.arm.name}, hand={result.hand.name}, command_id={result.command_id}"
@@ -127,14 +141,14 @@ class TrajectoryReplayer:
                 self.runtime_state.mark_error()
                 logger.exception("replay stop failed")
                 status, reason = ReplayStatus.FAULT, f"{reason or status.value}; stop failed: {exc}"
-        return self.finalize_capture(status, reason, arm_start, control_metadata)
+        return self.finalize_capture(status, reason)
 
-    def admit_replay(self, trajectory, hand_start_duration_s, results):
+    def admit_replay(self, trajectory, hand_start_duration_s):
         status, reason = ReplayStatus.COMPLETED, ""
-        if results is not None:
-            results.begin_episode()
         self.robot.prepare_streaming(self.epoch)
-        row = read_observation(None, self.runtime, self.robot)
+        row = read_observation(
+            None, self.runtime, self.robot, needs=ObservationNeeds(required_tactile=())
+        )
         if row is not None:
             self.robot.arm.update_health(upstream_until_ns=upstream_deadline_ns(row, self.runtime))
         if row is None:
@@ -181,13 +195,7 @@ class TrajectoryReplayer:
                     status, reason = ReplayStatus.REJECTED, "motion authority unavailable"
                 else:
                     self.epoch = self.runtime_state.run_id
-        if results is not None and status == ReplayStatus.COMPLETED:
-            results.entered(self.epoch)
-        if status == ReplayStatus.COMPLETED and hand_start_duration_s > 0:
-            interrupted = self.warm_up_hand(trajectory, self.epoch, row, hand_start_duration_s)
-            if interrupted is not None:
-                status, reason = interrupted.status, interrupted.reason
-        return status, reason
+        return status, reason, row
 
     def replay_rows(self, trajectory, period_ns):
         status, reason = ReplayStatus.COMPLETED, ""
@@ -206,7 +214,9 @@ class TrajectoryReplayer:
                     revoked=True,
                     cause="deadline_expired",
                 )
-            row = read_observation(None, self.runtime, self.robot)
+            row = read_observation(
+                None, self.runtime, self.robot, needs=ObservationNeeds(required_tactile=())
+            )
             if row is not None:
                 self.robot.arm.update_health(upstream_until_ns=upstream_deadline_ns(row, self.runtime))
             if row is None:
@@ -317,55 +327,31 @@ class TrajectoryReplayer:
         if dispatch_error is not None:
             raise dispatch_error
 
-    def finalize_capture(self, status, reason, arm_start, control_metadata):
-        # Deliver physical evidence even if post-motion diagnostics cannot be formed.
+    def finalize_capture(self, status, reason):
+        """Retain physical samples and the stop fact independently of offline FK."""
         data = self.capture.to_dict()
-        arm_end = None
-        try:
-            arm_end = dict(
-                self.robot.arm.execution_snapshot(), robot_stopped=not self.robot.stop_required
-            )
-            validate_execution_boundary(arm_end, stopped=True)
-            if arm_end["fault"]:
-                raise RuntimeError(arm_end["fault"])
-            if (
-                arm_end["sdk_completed"] - arm_start["sdk_completed"]
-                != arm_end["sdk_accepted"] - arm_start["sdk_accepted"]
-            ):
-                raise RuntimeError("replay contains unaccepted arm SDK calls")
-            if (
-                status == ReplayStatus.COMPLETED
-                and arm_end["first_accepted"] - arm_start["first_accepted"]
-                != arm_end["submitted"] - arm_start["submitted"]
-            ):
-                status, reason = (
-                    ReplayStatus.REJECTED,
-                    "replay target stopped before first SDK acceptance",
-                )
-        except Exception as exc:
+        stopped = not self.robot.stop_required
+        if not stopped:
             self.runtime_state.mark_error()
-            self.failure_details.append(f"arm execution: {exc}")
-        try:
-            data["arm_execution"] = np.asarray(
-                json.dumps(
-                    dict(
-                        scope="replay_including_hand_start",
-                        start=arm_start,
-                        end=arm_end,
-                        control=control_metadata,
-                    ),
-                    allow_nan=False,
-                )
-            )
-        except Exception as exc:
-            self.runtime_state.mark_error()
-            self.failure_details.append(
-                f"arm diagnostic serialization: {type(exc).__name__}: {exc}"
-            )
+            self.failure_details.append("robot stop unconfirmed")
         if self.failure_details:
             reason = "; ".join([reason or status.value, *self.failure_details])
             status = ReplayStatus.FAULT
+        data["preparation_dispatch_count"] = np.asarray(self.preparation_dispatch_count)
+        if self.preparation_last_dispatch is not None:
+            command, result = self.preparation_last_dispatch
+            data["preparation_last_dispatch_status"] = np.asarray(
+                [int(result.arm), int(result.hand)], dtype=np.uint8
+            )
+            data["preparation_last_dispatch_ns"] = np.asarray(result.timestamp_ns, dtype=np.int64)
+            for name, status_code in (("arm", result.arm), ("hand", result.hand)):
+                if status_code:
+                    data[f"preparation_last_{name}_target"] = getattr(command, f"{name}_qpos")
         data["termination_reason"] = np.asarray(reason or status.value)
+        data["stop_result"] = np.asarray("confirmed" if stopped else "unconfirmed")
+        data["technical_status"] = np.asarray(
+            "normal" if status in {ReplayStatus.COMPLETED, ReplayStatus.USER_QUIT} else "failed"
+        )
         return ReplayOutcome(status, data, reason)
 
     def wait_replay(self, epoch, deadline_ns):
@@ -428,7 +414,9 @@ class TrajectoryReplayer:
             interrupted = self.wait_replay(epoch, deadline_ns)
             if interrupted is not None:
                 return interrupted
-            row = read_observation(None, self.runtime, self.robot)
+            row = read_observation(
+                None, self.runtime, self.robot, needs=ObservationNeeds(required_tactile=())
+            )
             if row is not None:
                 self.robot.arm.update_health(upstream_until_ns=upstream_deadline_ns(row, self.runtime))
             if row is None:
@@ -453,12 +441,23 @@ class TrajectoryReplayer:
                     return ReplayOutcome(
                         ReplayStatus.REJECTED, reason=f"hand start target: {rejection}"
                     )
-                stamp = self.robot.send_action(
-                    RobotCommand(epoch, arm_hold, hand),
-                    valid_until_ns=feedback_deadline_ns(row, self.runtime),
-                    execute_until_ns=row.observation_timestamp_ns
-                    + int(self.runtime.hand.home_timeout_s * 1e9),
-                ).timestamp_ns
+                command = RobotCommand(epoch, arm_hold, hand)
+                result = None
+                try:
+                    result = self.robot.send_action(
+                        command,
+                        valid_until_ns=feedback_deadline_ns(row, self.runtime),
+                        execute_until_ns=row.observation_timestamp_ns
+                        + int(self.runtime.hand.home_timeout_s * 1e9),
+                    )
+                except (DispatchError, DispatchInterrupted) as exc:
+                    result = exc.result
+                    raise
+                finally:
+                    if result is not None and (result.arm or result.hand):
+                        self.preparation_dispatch_count += 1
+                        self.preparation_last_dispatch = command, result
+                stamp = result.timestamp_ns
                 if step == steps:
                     final_stamp = stamp
                     last_sample = stamp

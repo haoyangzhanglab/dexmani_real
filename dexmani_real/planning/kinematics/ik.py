@@ -75,28 +75,6 @@ class OnlineIKConfig:
     previous_command_joint_weights: tuple[float, ...] | None = (10, 4, 2, 1, 0.5, 0.6, 0.1)
 
 
-def make_online_ik_config(
-    runtime,
-    *,
-    max_pose_error_pos_m: float | None = None,
-    max_pose_error_rot_rad: float | None = None,
-) -> OnlineIKConfig:
-    return OnlineIKConfig(
-        max_pose_error_pos_m=(
-            runtime.control.ik_max_pose_error_pos_m
-            if max_pose_error_pos_m is None
-            else max_pose_error_pos_m
-        ),
-        max_pose_error_rot_rad=(
-            runtime.control.ik_max_pose_error_rot_rad
-            if max_pose_error_rot_rad is None
-            else max_pose_error_rot_rad
-        ),
-        operational_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
-        operational_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
-    )
-
-
 @dataclass
 class IKCandidate:
     qpos: np.ndarray
@@ -112,14 +90,14 @@ class IKCandidate:
     cost: float = 0.0
 
 
-def make_online_ik_solver(runtime, *, kin=None, **tolerances):
+def make_online_ik_solver(config: OnlineIKConfig, *, static_boxes=(), kin=None):
     """Build the online collision scene, which permits table contact."""
     from .arm_fk import make_arm_kinematics
     from ..collision import CollisionModel
 
     kin = make_arm_kinematics() if kin is None else kin
-    collision_model = CollisionModel(static_boxes=runtime.environment.static_boxes)
-    return OnlineIKSolver(kin, collision_model, make_online_ik_config(runtime, **tolerances))
+    collision_model = CollisionModel(static_boxes=static_boxes)
+    return OnlineIKSolver(kin, collision_model, config)
 
 
 class OnlineIKSolver:

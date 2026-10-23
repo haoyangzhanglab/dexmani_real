@@ -185,7 +185,6 @@ def main(argv: list[str] | None = None) -> int:
         record_results=not args.no_results,
         output=args.output,
         camera_calibration_path=args.camera_calibration,
-        action_steps_override=args.n_action_steps,
     )
 
 

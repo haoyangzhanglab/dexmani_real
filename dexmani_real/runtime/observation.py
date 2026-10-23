@@ -15,7 +15,7 @@ from dexmani_real.utils.timing import sample_is_fresh
 class ObservationNeeds:
     """Coordinator copies and required sources, shared with device assembly."""
 
-    camera: Literal["none", "header", "rgbd"] = "none"
+    camera: Literal["none", "header", "rgb", "depth", "rgbd"] = "none"
     point_cloud: bool = False
     vr: bool = False
     required_tactile: tuple[str, ...] = ("aggregate", "dense")
@@ -25,7 +25,9 @@ class ObservationNeeds:
         fields = set(fields)
         return cls(
             camera=(
-                "rgbd" if record_raw or "rgb" in fields
+                "rgbd" if record_raw or {"rgb", "depth"} <= fields
+                else "rgb" if "rgb" in fields
+                else "depth" if "depth" in fields
                 else "header" if fields & {"camera_intrinsic", "camera_extrinsic"}
                 else "none"
             ),
@@ -47,7 +49,7 @@ class ObservationNeeds:
 
     @property
     def paired_camera(self):
-        return self.camera == "rgbd" and self.point_cloud
+        return self.camera != "none" and self.point_cloud
 
 
 def feedback_deadline_ns(row, runtime, *, include_vr=False):
@@ -60,7 +62,7 @@ def feedback_deadline_ns(row, runtime, *, include_vr=False):
         )
     if include_vr:
         deadlines.append(
-            int(row.vr["recv_ts_ns"]) + int(runtime.control.vr_mapping.stale_threshold_s * 1e9) + 1
+            int(row.vr["recv_ts_ns"]) + int(runtime.teleop.vr_mapping.stale_threshold_s * 1e9) + 1
         )
     return min(deadlines)
 
@@ -76,23 +78,18 @@ def read_vr_frame(channels):
     }
 
 
-def read_camera_frame(channels, sequence=None, *, header_only=False):
+def read_camera_frame(channels, sequence=None, *, payload="rgbd"):
     ring = channels.camera_ring
-    result = (
-        ring.read_latest_field("header")
-        if header_only
-        else ring.read_latest() if sequence is None else ring.read_sequence(sequence)
-    )
+    fields = {"header": (), "rgb": ("rgb",), "depth": ("depth",), "rgbd": ("rgb", "depth")}[payload]
+    result = ring.read_fields(("header", *fields), sequence=sequence)
     if result is None:
         return None
-    data, publication_ns, sequence = result
+    data, _, sequence = result
     frame = data[0]
-    header = frame if header_only else frame["header"]
     return {
-        **({} if header_only else {"rgb": frame["rgb"], "depth": frame["depth"]}),
+        **{name: frame[name] for name in fields},
         "ring_sequence": sequence,
-        "published_ns": publication_ns,
-        **{name: int(header[name]) for name in header.dtype.names},
+        "timestamp_ns": int(frame["header"]["timestamp_ns"]),
     }
 
 
@@ -113,12 +110,7 @@ class ObservationRow:
     point_cloud: np.ndarray | None
     observation_timestamp_ns: int
     pointcloud_timestamp_ns: int = 0
-    pointcloud_camera_sequence: int = -1
     control_timestamp_ns: int = -1
-    pointcloud_camera_received_ns: int = -1
-    pointcloud_camera_published_ns: int = -1
-    pointcloud_started_ns: int = -1
-    pointcloud_published_ns: int = -1
     required_tactile: tuple[str, ...] = ("aggregate", "dense")
 
 
@@ -151,13 +143,13 @@ def read_observation(
     cloud = cloud_result[0][0] if cloud_result else None
     if needs.paired_camera:
         camera = (
-            read_camera_frame(channels, int(cloud["source_camera_sequence"]))
+            read_camera_frame(channels, int(cloud["source_camera_sequence"]), payload=needs.camera)
             if cloud is not None
             else None
         )
     else:
         camera = (
-            read_camera_frame(channels, header_only=needs.camera == "header")
+            read_camera_frame(channels, payload=needs.camera)
             if needs.camera != "none" else None
         )
     vr = read_vr_frame(channels) if needs.vr else None
@@ -181,7 +173,7 @@ def read_observation(
     ):
         unavailable.append("pointcloud_stale")
     if vr is not None and not sample_is_fresh(
-        vr["recv_ts_ns"], runtime.control.vr_mapping.stale_threshold_s, now
+        vr["recv_ts_ns"], runtime.teleop.vr_mapping.stale_threshold_s, now
     ):
         unavailable.append("vr_stale")
     if unavailable:
@@ -196,16 +188,7 @@ def read_observation(
         point_cloud=freeze(cloud["point_cloud"]) if cloud is not None else None,
         observation_timestamp_ns=now,
         pointcloud_timestamp_ns=int(cloud["timestamp_ns"]) if cloud is not None else 0,
-        pointcloud_camera_sequence=(
-            int(cloud["source_camera_sequence"]) if cloud is not None else -1
-        ),
         control_timestamp_ns=control_ns,
-        pointcloud_camera_received_ns=int(cloud["camera_received_ns"]) if cloud is not None else -1,
-        pointcloud_camera_published_ns=(
-            int(cloud["camera_published_ns"]) if cloud is not None else -1
-        ),
-        pointcloud_started_ns=int(cloud["processing_started_ns"]) if cloud is not None else -1,
-        pointcloud_published_ns=int(cloud_result[1]) if cloud_result is not None else -1,
         required_tactile=needs.required_tactile,
     )
 
@@ -224,7 +207,7 @@ def upstream_deadline_ns(row, runtime):
     if row.vr is not None:
         deadlines.append(
             int(row.vr["recv_ts_ns"])
-            + int(runtime.control.vr_mapping.stale_threshold_s * 1e9)
+            + int(runtime.teleop.vr_mapping.stale_threshold_s * 1e9)
         )
     # Arm freshness is independently checked against the executor's live snapshot.
     return min(deadlines) if deadlines else 2**63 - 1

@@ -10,6 +10,7 @@ import numpy as np
 from dexmani_real.config.environment import validate_table_plane
 from dexmani_real.robot.xhand.config import HandParams
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
+from dexmani_real.sensor.pointcloud.hand_config import HandPointCloudConfig
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,7 @@ class ProcessingConfig:
     """Full-modal processing requires complete physical/derived modalities and finite floats on every row."""
 
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
+    hand_pointcloud: HandPointCloudConfig = field(default_factory=HandPointCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
     fingertip_link_names: tuple[str, ...] = HandParams.fingertip_link_names
     handbase_position_eef_m: tuple[float, ...] = HandParams.T_eef_handbase_pos_xyz
@@ -26,6 +28,7 @@ class ProcessingConfig:
     def from_runtime(cls, runtime, *, table_plane_abcd=None):
         return cls(
             pointcloud=runtime.pointcloud,
+            hand_pointcloud=runtime.hand_pointcloud,
             table_plane_abcd=table_plane_abcd,
             fingertip_link_names=tuple(runtime.hand.fingertip_link_names),
             handbase_position_eef_m=tuple(runtime.hand.T_eef_handbase_pos_xyz),
@@ -34,6 +37,7 @@ class ProcessingConfig:
 
     def __post_init__(self) -> None:
         self.pointcloud.validate()
+        self.hand_pointcloud.validate()
         if (
             len(self.fingertip_link_names) != 5
             or len(set(self.fingertip_link_names)) != 5
@@ -60,9 +64,6 @@ class ProcessingConfig:
 
 CORE_FIELD_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
     "joint_state": ((19,), np.dtype(np.float32)),
-    "arm_qvel": ((7,), np.dtype(np.float32)),
-    "arm_effort": ((7,), np.dtype(np.float32)),
-    "hand_current": ((12,), np.dtype(np.float32)),
     "action": ((19,), np.dtype(np.float32)),
     "action_ee": ((21,), np.dtype(np.float32)),
     "finger_tactile_force": ((5, 3), np.dtype(np.float32)),
@@ -78,6 +79,7 @@ def canonical_array_specs(
     num_points: int,
     rgb_height: int,
     rgb_width: int,
+    hand_num_points: int,
 ) -> dict[str, tuple[tuple[int, ...], np.dtype[Any]]]:
     """Canonical per-row shapes and dtypes for aligned RGB-D."""
     specs = dict(CORE_FIELD_SPECS)
@@ -86,6 +88,7 @@ def canonical_array_specs(
             "rgb": ((rgb_height, rgb_width, 3), np.dtype(np.uint8)),
             "depth": ((rgb_height, rgb_width), np.dtype(np.uint16)),
             "point_cloud": ((num_points, 6), np.dtype(np.float32)),
+            "hand_pointcloud": ((hand_num_points, 6), np.dtype(np.float32)),
         }
     )
     return specs

@@ -70,7 +70,7 @@ class SharedMemoryRingBuffer:
         header[0] = index
         return sequence
 
-    def copy_slot(self, index, expected=None, *, field=None):
+    def copy_slot(self, index, expected=None, *, fields=None):
         slot = self.slots[index]
         marker = int(slot["sequence"])
         if marker == 0 or marker & 1:
@@ -79,16 +79,22 @@ class SharedMemoryRingBuffer:
         if expected is not None and sequence != expected:
             return None
         stamp = int(slot["timestamp_ns"])
-        payload = slot["data"] if field is None else slot["data"][field]
-        data = payload.copy().reshape((1,) + payload.shape)
+        payload = slot["data"]
+        if fields is None:
+            data = payload.copy().reshape(1)
+        else:
+            # A NumPy multi-field view keeps the full RGB-D itemsize; pack only requested bytes.
+            data = np.empty(1, dtype=[(name, self.dtype[name]) for name in fields])
+            for name in fields:
+                data[name][0] = payload[name]
         return (data, stamp, sequence) if marker == int(slot["sequence"]) else None
 
-    def read_latest_field(self, field: str) -> tuple[np.ndarray, int, int] | None:
-        """Copy one field under the same publication/sequence fence as a full frame."""
-        sequence = self.latest_sequence
+    def read_fields(self, fields, *, sequence=None) -> tuple[np.ndarray, int, int] | None:
+        """Copy selected fields from one verified publication, without unrelated pixel payloads."""
+        sequence = self.latest_sequence if sequence is None else sequence
         if sequence <= 0:
             return None
-        return self.copy_slot(sequence % self.maxlen, expected=sequence, field=field)
+        return self.copy_slot(sequence % self.maxlen, expected=sequence, fields=fields)
 
     def read_latest(self, *, use_last_good=False) -> tuple[np.ndarray, int, int] | None:
         """Cached readers retry twice; fallback retains its original source/publication clocks."""

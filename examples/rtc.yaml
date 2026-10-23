@@ -1,0 +1,5 @@
+execution:
+  execution_mode: rtc
+  action_steps: 4
+  prefetch_steps: 1
+  rtc_guidance_cap: 1.0

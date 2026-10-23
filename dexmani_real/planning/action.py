@@ -5,11 +5,11 @@ from typing import Literal
 
 import numpy as np
 
-from dexmani_real.planning.kinematics.pose import Pose
 from dexmani_real.planning.kinematics.ik import (
     IKResult,
     make_online_ik_solver,
 )
+from dexmani_real.planning.kinematics.pose import Pose
 from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.planning.target import TargetChecker
 
@@ -34,30 +34,71 @@ class ActionResult:
 
 
 class ActionMapper:
-    def __init__(self, runtime, *, solver=None, collision_model):
-        self.runtime, self.solver = runtime, solver
-        self.target_checker = TargetChecker(
-            runtime,
-            collision_model,
-            dynamic_rejection=solver.dynamic_rejection if solver is not None else None,
-        )
+    def __init__(
+        self,
+        target_checker,
+        *,
+        hand_enabled,
+        hand_lower_rad,
+        hand_upper_rad,
+        home_hand_qpos,
+        solver=None,
+    ):
+        self.target_checker, self.solver = target_checker, solver
+        self.hand_enabled = hand_enabled
+        self.hand_lower = np.array(hand_lower_rad, dtype=np.float64, copy=True)
+        self.hand_upper = np.array(hand_upper_rad, dtype=np.float64, copy=True)
+        self.home_hand_qpos = np.array(home_hand_qpos, dtype=np.float64, copy=True)
+        if any(
+            q.shape != (12,) or not np.isfinite(q).all()
+            for q in (self.hand_lower, self.hand_upper, self.home_hand_qpos)
+        ) or np.any(self.hand_lower > self.hand_upper):
+            raise ValueError("action hand limits and home must be finite (12,) vectors")
 
     @classmethod
-    def for_mode(cls, runtime, mode):
+    def for_mode(
+        cls,
+        mode,
+        *,
+        ik_config,
+        hand_enabled,
+        hand_lower_rad,
+        hand_upper_rad,
+        home_hand_qpos,
+        workspace,
+        workspace_margin_m,
+        static_boxes=(),
+    ):
         """Online geometry permits table contact; HOME owns its separate path scene."""
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
-        if mode == "eef":
-            solver = make_online_ik_solver(runtime)
-            return cls(runtime, solver=solver, collision_model=solver.collision_model)
         from dexmani_real.planning.collision import CollisionModel
 
+        solver = make_online_ik_solver(ik_config, static_boxes=static_boxes) if mode == "eef" else None
+        collision = (
+            solver.collision_model
+            if solver is not None
+            else CollisionModel(static_boxes=static_boxes)
+        )
+        checker = TargetChecker(
+            collision,
+            joint_lower_rad=ik_config.operational_joint_lower_rad,
+            joint_upper_rad=ik_config.operational_joint_upper_rad,
+            workspace=workspace,
+            workspace_margin_m=workspace_margin_m,
+            dynamic_rejection=solver.dynamic_rejection if solver is not None else None,
+        )
         return cls(
-            runtime, collision_model=CollisionModel(static_boxes=runtime.environment.static_boxes)
+            checker,
+            solver=solver,
+            hand_enabled=hand_enabled,
+            hand_lower_rad=hand_lower_rad,
+            hand_upper_rad=hand_upper_rad,
+            home_hand_qpos=home_hand_qpos,
         )
 
     def joint_rejection(self, target, hand, current, previous):
-        physical_hand = hand if hand is not None else np.deg2rad(self.runtime.hand.home_qpos_deg)
+        physical_hand = hand if hand is not None else self.home_hand_qpos
         return self.target_checker.rejection(
             target, current, previous, collision_hand_qpos=physical_hand
         )
@@ -79,8 +120,7 @@ class ActionMapper:
         )
         if any(q.shape != (7,) or not np.isfinite(q).all() for q in (current, previous)):
             raise ValueError("current and previous arm state must be finite (7,) vectors")
-        cfg = self.runtime
-        if cfg.control.hand_enabled:
+        if self.hand_enabled:
             if intent.hand is None:
                 raise ValueError("hand-enabled action mapping requires a hand intent")
         elif intent.hand is not None:
@@ -88,14 +128,14 @@ class ActionMapper:
         hand = None
         if intent.hand is not None:
             hand = project_hand_command(
-                intent.hand, qpos_min_rad=cfg.hand.qpos_min_rad, qpos_max_rad=cfg.hand.qpos_max_rad
+                intent.hand, qpos_min_rad=self.hand_lower, qpos_max_rad=self.hand_upper
             )
         if intent.mode == "joint":
             target = project_arm_command(
                 arm,
                 current,
-                joint_lower_rad=cfg.arm.joint_limit_lower,
-                joint_upper_rad=cfg.arm.joint_limit_upper,
+                joint_lower_rad=self.target_checker.limits[:, 0],
+                joint_upper_rad=self.target_checker.limits[:, 1],
             )
             reason = self.joint_rejection(target, hand, current, previous)
             return ActionResult(
@@ -108,7 +148,7 @@ class ActionMapper:
         workspace = self.target_checker.workspace
         pose.p = np.clip(pose.p, workspace[:, 0], workspace[:, 1])
         self.solver.collision_model.set_hand_qpos(
-            hand if hand is not None else np.deg2rad(cfg.hand.home_qpos_deg)
+            hand if hand is not None else self.home_hand_qpos
         )
         result = self.solver.solve(
             pose,
@@ -130,7 +170,9 @@ class ActionMapper:
             return np.concatenate((command.arm_qpos, command.hand_qpos))
         from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 
-        pose = compute_eef_pose_history_xarm_base(command.arm_qpos[None])[0]
+        pose = compute_eef_pose_history_xarm_base(
+            command.arm_qpos[None], arm_fk=self.target_checker.target_fk
+        )[0]
         return np.concatenate((pose, command.hand_qpos))
 
     def frozen_rejection(self, command, current, previous, mode):
@@ -142,8 +184,8 @@ class ActionMapper:
             else project_arm_command(
                 command.arm_qpos,
                 current,
-                joint_lower_rad=self.runtime.arm.joint_limit_lower,
-                joint_upper_rad=self.runtime.arm.joint_limit_upper,
+                joint_lower_rad=self.target_checker.limits[:, 0],
+                joint_upper_rad=self.target_checker.limits[:, 1],
             )
         )
         if not np.array_equal(projected, command.arm_qpos):

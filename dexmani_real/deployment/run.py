@@ -66,7 +66,6 @@ def run_policy(
     record_results=True,
     output=None,
     camera_calibration_path=None,
-    action_steps_override=None,
 ) -> int:
     """Inspect, resolve and run one evaluation session from CLI or Python."""
     from dexmani_policy.deployment import inspect_policy
@@ -77,18 +76,22 @@ def run_policy(
         weights=weights,
         inference_steps=inference_steps,
     )
-    action_steps = action_steps_override
-    if action_steps is None:
-        action_steps = runtime.execution.action_steps
+    action_steps = runtime.execution.action_steps
     if action_steps is None:
         action_steps = info.n_action_steps
     runtime = replace(runtime, execution=replace(runtime.execution, action_steps=action_steps))
     needs = ObservationNeeds.for_policy(info.observation_fields, record_raw=record_raw)
-    cloud_recipe = validate_deployment_config(info, runtime, needs=needs)
+    cloud_recipe, hand_cloud_recipe = validate_deployment_config(info, runtime, needs=needs)
     max_running_s = validate_max_running_s(max_running_s)
     num_episodes = validate_num_episodes(num_episodes)
-    if cloud_recipe is not None:
-        runtime = replace(runtime, pointcloud=cloud_recipe)
+    if cloud_recipe is not None or hand_cloud_recipe is not None:
+        runtime = replace(
+            runtime,
+            pointcloud=cloud_recipe if cloud_recipe is not None else runtime.pointcloud,
+            hand_pointcloud=(
+                hand_cloud_recipe if hand_cloud_recipe is not None else runtime.hand_pointcloud
+            ),
+        )
     runtime = resolve_runtime_table(runtime, pointcloud=cloud_recipe)
 
     session_dir = None
@@ -110,7 +113,6 @@ def run_policy(
             "max_duration_s": max_running_s,
             "record_raw": record_raw,
             "record_results": record_results,
-            "n_action_steps_override": action_steps_override,
             "dexmani_real_head": git_head(Path(__file__).resolve().parents[2]),
             "dexmani_policy_head": git_head(Path(dexmani_policy.__file__).resolve().parents[1]),
         }

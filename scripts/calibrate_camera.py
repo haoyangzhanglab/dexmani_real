@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
 
     runtime = load_experiment_config(
         yaml_path=args.config,
-        cli_overrides={"camera.serial": args.serial, "control.hand_enabled": False},
+        cli_overrides={"camera.serial": args.serial, "hand.enabled": False},
     )
 
     return CameraCalibrationSession(

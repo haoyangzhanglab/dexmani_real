@@ -10,55 +10,24 @@ import numpy as np
 from dexmani_real.data.canonical.schema import ProcessingConfig
 from dexmani_real.data.raw.camera_geometry import (
     RawEpisodeCameraModel,
-    load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
 )
 from dexmani_real.data.raw.reader import EpisodeReader, RawDataError
-from dexmani_real.data.raw.schema import (
-    DATASET_SPECS,
-    validate_capture_rows,
-    validate_dispatch_rows,
-)
+from dexmani_real.data.raw.schema import DATASET_SPECS
 from dexmani_real.planning.kinematics.arm_fk import (
     compute_eef_pose_history_xarm_base,
 )
-from dexmani_real.planning.kinematics.fingertip import compute_fingertip_history_xarm_base
+from dexmani_real.planning.kinematics.fingertip import compute_hand_geometry_history_xarm_base
 from dexmani_real.sensor.camera.geometry import (
     camera_parameters_cv,
     validate_aligned_depth_distortion,
 )
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud
-from dexmani_real.utils.timing import sampling_clock_ns
-
-
-def validate_training_rows(timestamp, dispatch_status, control_hz) -> tuple[str, ...]:
-    """Whole-episode admission only; failed evidence remains readable as Raw."""
-    errors = validate_capture_rows(timestamp, dispatch_status)
-    if errors:
-        return errors
-    dt_ns, epsilon_ns = sampling_clock_ns(control_hz)
-    # Raw seconds originate from integer ns; round only representation error.
-    stamps = np.rint(np.asarray(timestamp) * 1e9)
-    intervals = np.diff(stamps)
-    deviations = stamps - np.arange(len(stamps)) * dt_ns
-    bad_interval = np.flatnonzero(np.abs(intervals - dt_ns) > epsilon_ns)
-    bad_grid = np.flatnonzero(np.abs(deviations) > epsilon_ns)
-    bad_rows = [int(bad_interval[0]) + 1] if len(bad_interval) else []
-    if len(bad_grid):
-        bad_rows.append(int(bad_grid[0]))
-    if bad_rows:
-        row = min(bad_rows)
-        return (
-            f"timing row {row}: interval_ns={intervals[row - 1]:.0f}, "
-            f"nominal_ns={dt_ns}, grid_deviation_ns={deviations[row]:.0f}, "
-            f"tolerance_ns={epsilon_ns}",
-        )
-    return validate_dispatch_rows(dispatch_status)
 
 
 def validate_export_episode(
     reader: EpisodeReader,
-) -> tuple[RawEpisodeCameraModel, np.ndarray]:
+) -> tuple[RawEpisodeCameraModel, np.ndarray, dict[str, np.ndarray]]:
     """Check metadata/layout/timing and prepare static camera geometry once per episode."""
     frames = reader.num_frames
     if frames <= 0:
@@ -67,28 +36,26 @@ def validate_export_episode(
     try:
         camera = load_raw_episode_camera_model(reader)
         validate_aligned_depth_distortion(camera.intrinsics.distortion_model)
-        base_from_color = load_raw_episode_base_from_color(reader)
+        base_from_color = np.asarray(
+            reader.meta["camera_T_xarm_base_from_color"], dtype=np.float64
+        ).reshape(4, 4)
+        camera_parameters = camera_parameters_cv(camera.intrinsics, base_from_color)
     except (ValueError, TypeError, KeyError) as exc:
         raise RawDataError(f"invalid camera geometry: {exc}") from exc
     color = camera.intrinsics
     expected = (frames, color.height, color.width)
     if reader["depth"].shape != expected or reader["depth"].dtype != np.uint16:
         raise RawDataError(f"depth must be uint16 {expected}")
-    errors = validate_training_rows(
-        reader["timestamp"][:],
-        reader["dispatch_status"][:],
-        reader.control_hz,
-    )
-    if errors:
-        raise RawDataError("; ".join(errors))
-    reader.validate_arm_execution()
+    reader.validate_fixed_rate_rows()
+    reader.validate_completion()
+    reader.validate_source_times()
     if frames == 1:
         logging.getLogger(__name__).warning(
             "%s: single row, no sampling interval to verify", reader.path
         )
     for name in DATASET_SPECS:
         reader[name]  # EpisodeReader validates shape/dtype without reading the array.
-    return camera, base_from_color
+    return camera, base_from_color, camera_parameters
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
@@ -110,93 +77,86 @@ def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
     return episodes
 
 
-class CanonicalEpisodeProcessor:
-    """Convert Raw blocks with one explicit recipe and an export-owned hand FK."""
-
-    def __init__(self, config: ProcessingConfig, hand_fk, *, chunk_frames: int):
-        self.config = config
-        self.hand_fk = hand_fk
-        self.chunk_frames = chunk_frames
-
-    def iter_blocks(
-        self, reader: EpisodeReader, *, camera: RawEpisodeCameraModel, base_from_color: np.ndarray
-    ):
-        """Check and convert each Raw block without repairing or resampling rows."""
-        height, width = camera.intrinsics.height, camera.intrinsics.width
-        try:
-            camera_parameters = camera_parameters_cv(
-                camera.intrinsics,
-                base_from_color,
-            )
-        except ValueError as exc:
-            raise RawDataError(f"invalid camera parameters: {exc}") from exc
-        images = reader.iter_rgb_frames()
-        for start in range(0, reader.num_frames, self.chunk_frames):
-            end = min(reader.num_frames, start + self.chunk_frames)
-            raw = {
-                name: reader[name][start:end]
-                for name in DATASET_SPECS
-                if name not in ("timestamp", "dispatch_status")
-            }
-            for name, values in raw.items():
-                # Unchanged float32 tactile arrays are checked at the canonical write boundary.
-                if name in {"hand_contact", "hand_tactile_force"}:
-                    continue
-                if np.issubdtype(values.dtype, np.floating):
-                    valid = np.isfinite(values).reshape(len(values), -1).all(axis=1)
-                    if not valid.all():
-                        row = start + int(np.flatnonzero(~valid)[0])
-                        raise RawDataError(f"Raw {name}: nonfinite values at row {row}")
-            arm, hand = raw["arm_qpos"], raw["hand_qpos"]
-            arm_action, hand_action = (
-                raw["action_arm_joint_target"],
-                raw["action_hand_joint_target"],
-            )
-            poses = compute_eef_pose_history_xarm_base(arm)
-            action_poses = compute_eef_pose_history_xarm_base(arm_action)
-            tips = compute_fingertip_history_xarm_base(
-                poses,
-                hand,
-                hand_fk=self.hand_fk,
-                handbase_position_eef_m=self.config.handbase_position_eef_m,
-                handbase_quat_eef_wxyz=self.config.handbase_quat_eef_wxyz,
-            )
-            block = {
-                "joint_state": np.concatenate((arm, hand), axis=1).astype(np.float32),
-                "action": np.concatenate((arm_action, hand_action), axis=1).astype(np.float32),
-                "action_ee": np.concatenate((action_poses, hand_action), axis=1).astype(np.float32),
-                "eef_pose": poses.astype(np.float32),
-                "fingertip_xyz": tips,
-                "finger_tactile_force": raw["hand_contact"],
-                "taxel_tactile_force": raw["hand_tactile_force"],
-            }
-            for name in ("arm_qvel", "arm_effort", "hand_current"):
-                block[name] = raw[name].astype(np.float32)
-            for name, values in camera_parameters.items():
-                block[name] = np.broadcast_to(values, (end - start, values.size))
-            # Fill output arrays directly; read depth once per block and retain no decoded-frame list.
-            rgb = np.empty((end - start, height, width, 3), dtype=np.uint8)
-            depth = reader["depth"][start:end]
-            clouds = np.empty((end - start, self.config.pointcloud.num_points, 6), dtype=np.float32)
-            for offset, index in enumerate(range(start, end)):
-                image = next(images, None)
-                if image is None or image.shape != (height, width, 3) or image.dtype != np.uint8:
-                    raise RawDataError(
-                        f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
-                    )
-                cloud = build_point_cloud(
-                    depth_raw=depth[offset],
-                    color=image,
-                    depth_scale_m=camera.depth_scale_m,
-                    intrinsics=camera.intrinsics,
-                    T_xarm_base_from_color=base_from_color,
-                    table_plane_abcd=self.config.table_plane_abcd,
-                    config=self.config.pointcloud,
+def iter_canonical_blocks(
+    reader: EpisodeReader,
+    config: ProcessingConfig,
+    *,
+    arm_fk,
+    hand_fk,
+    hand_cloud,
+    chunk_frames: int,
+    camera: RawEpisodeCameraModel,
+    base_from_color: np.ndarray,
+    camera_parameters: dict[str, np.ndarray],
+):
+    """Convert admitted Raw blocks with export-owned FK, without repairing or resampling rows."""
+    height, width = camera.intrinsics.height, camera.intrinsics.width
+    images = reader.iter_rgb_frames()
+    for start in range(0, reader.num_frames, chunk_frames):
+        end = min(reader.num_frames, start + chunk_frames)
+        raw = {
+            name: reader[name][start:end]
+            for name in DATASET_SPECS
+            if name not in ("timestamp", "dispatch_status")
+        }
+        for name, values in raw.items():
+            # Unchanged float32 tactile arrays are checked at the canonical write boundary.
+            if name in {"hand_contact", "hand_tactile_force"}:
+                continue
+            if np.issubdtype(values.dtype, np.floating):
+                valid = np.isfinite(values).reshape(len(values), -1).all(axis=1)
+                if not valid.all():
+                    row = start + int(np.flatnonzero(~valid)[0])
+                    raise RawDataError(f"Raw {name}: nonfinite values at row {row}")
+        arm, hand = raw["arm_qpos"], raw["hand_qpos"]
+        arm_action, hand_action = (
+            raw["action_arm_joint_target"],
+            raw["action_hand_joint_target"],
+        )
+        poses = compute_eef_pose_history_xarm_base(arm, arm_fk=arm_fk)
+        action_poses = compute_eef_pose_history_xarm_base(arm_action, arm_fk=arm_fk)
+        hand_geometry = compute_hand_geometry_history_xarm_base(
+            poses,
+            hand,
+            hand_fk=hand_fk,
+            handbase_position_eef_m=config.handbase_position_eef_m,
+            handbase_quat_eef_wxyz=config.handbase_quat_eef_wxyz,
+            hand_cloud=hand_cloud,
+        )
+        block = {
+            "joint_state": np.concatenate((arm, hand), axis=1).astype(np.float32),
+            "action": np.concatenate((arm_action, hand_action), axis=1).astype(np.float32),
+            "action_ee": np.concatenate((action_poses, hand_action), axis=1).astype(np.float32),
+            "eef_pose": poses.astype(np.float32),
+            "finger_tactile_force": raw["hand_contact"],
+            "taxel_tactile_force": raw["hand_tactile_force"],
+            **hand_geometry,
+        }
+        for name, values in camera_parameters.items():
+            block[name] = np.broadcast_to(values, (end - start, values.size))
+        # Fill output arrays directly; read depth once per block and retain no decoded-frame list.
+        rgb = np.empty((end - start, height, width, 3), dtype=np.uint8)
+        depth = reader["depth"][start:end]
+        clouds = np.empty((end - start, config.pointcloud.num_points, 6), dtype=np.float32)
+        for offset, index in enumerate(range(start, end)):
+            image = next(images, None)
+            if image is None or image.shape != (height, width, 3) or image.dtype != np.uint8:
+                raise RawDataError(
+                    f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
                 )
-                if cloud is None:
-                    raise RawDataError(f"point_cloud unavailable at row {index}")
-                rgb[offset], clouds[offset] = image, cloud
-            block.update(rgb=rgb, depth=depth, point_cloud=clouds)
-            yield block
-        if next(images, None) is not None:
-            raise RawDataError(f"{reader.path / 'rgb.mp4'}: RGB contains extra frames")
+            cloud = build_point_cloud(
+                depth_raw=depth[offset],
+                color=image,
+                depth_scale_m=camera.depth_scale_m,
+                intrinsics=camera.intrinsics,
+                T_xarm_base_from_color=base_from_color,
+                table_plane_abcd=config.table_plane_abcd,
+                config=config.pointcloud,
+            )
+            if cloud is None:
+                raise RawDataError(f"point_cloud unavailable at row {index}")
+            rgb[offset], clouds[offset] = image, cloud
+        block.update(rgb=rgb, depth=depth, point_cloud=clouds)
+        yield block
+    if next(images, None) is not None:
+        raise RawDataError(f"{reader.path / 'rgb.mp4'}: RGB contains extra frames")

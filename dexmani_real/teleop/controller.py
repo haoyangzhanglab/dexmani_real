@@ -10,14 +10,10 @@ from dexmani_real.teleop.vr_mapping import ema_smooth_pose
 
 
 class TeleopController:
-    def __init__(self, action_mapper, arm_mapper, runtime, hand_retargeter):
-        self.action_mapper, self.arm_mapper, self.runtime = (
-            action_mapper,
-            arm_mapper,
-            runtime,
-        )
+    def __init__(self, action_mapper, arm_mapper, ema, hand_retargeter, *, arm_fk=None):
+        self.action_mapper, self.arm_mapper, self.ema = action_mapper, arm_mapper, ema
         self.hand_retargeter = hand_retargeter
-        self.arm_fk = make_arm_fk()
+        self.arm_fk = make_arm_fk() if arm_fk is None else arm_fk
         self.clear_reference()
 
     def clear_reference(self):
@@ -55,18 +51,17 @@ class TeleopController:
                 self.clear_reference()
 
     def compute_target(self, row):
-        cfg = self.runtime
         mapped = self.arm_mapper.map(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
         if mapped is None:
             return None
         target = ema_smooth_pose(
             mapped,
             self.smoothed_eef_pose,
-            cfg.control.ema.alpha_pos,
-            cfg.control.ema.alpha_rot,
+            self.ema.alpha_pos,
+            self.ema.alpha_rot,
         )
         hand = None
-        if cfg.control.hand_enabled:
+        if self.hand_retargeter is not None:
             observation_id = row.vr["ring_sequence"]
             if self.hand_observation_id != observation_id:
                 # Claim each sample before solving; a failed solve is not retried on later ticks.

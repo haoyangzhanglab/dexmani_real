@@ -14,12 +14,12 @@ import numpy as np
 import yaml
 
 from dexmani_real.config.control import (
-    ControlParams,
     DexPilotRetargetingParams,
     KeyboardTeleopParams,
+    MotionParams,
     SafetyParams,
     TAGRetargetingParams,
-    TeleopTimingParams,
+    TeleopParams,
 )
 from dexmani_real.config.environment import (
     EnvironmentConfig,
@@ -32,6 +32,7 @@ from dexmani_real.robot.xarm7.config import ArmParams
 from dexmani_real.robot.xhand.config import HandParams
 from dexmani_real.sensor.camera.config import CameraParams
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
+from dexmani_real.sensor.pointcloud.hand_config import HandPointCloudConfig
 from dexmani_real.sensor.vr.config import VRParams
 
 
@@ -42,13 +43,14 @@ class ExperimentConfig:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     arm: ArmParams = field(default_factory=ArmParams)
     hand: HandParams = field(default_factory=HandParams)
-    control: ControlParams = field(default_factory=ControlParams)
-    teleop: TeleopTimingParams = field(default_factory=TeleopTimingParams)
+    motion: MotionParams = field(default_factory=MotionParams)
+    teleop: TeleopParams = field(default_factory=TeleopParams)
     keyboard_teleop: KeyboardTeleopParams = field(default_factory=KeyboardTeleopParams)
     vr: VRParams = field(default_factory=VRParams)
     safety: SafetyParams = field(default_factory=SafetyParams)
     camera: CameraParams = field(default_factory=CameraParams)
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
+    hand_pointcloud: HandPointCloudConfig = field(default_factory=HandPointCloudConfig)
     tag_retargeting: TAGRetargetingParams = field(default_factory=TAGRetargetingParams)
     dexpilot_retargeting: DexPilotRetargetingParams = field(
         default_factory=DexPilotRetargetingParams
@@ -98,7 +100,7 @@ def validate_robot_config(cfg: ExperimentConfig) -> None:
     """Values used by every robot owner, including HOME and hand-disabled geometry."""
     cfg.arm.validate()
     cfg.arm.homing.validate()
-    if cfg.control.hand_enabled:
+    if cfg.hand.enabled:
         cfg.hand.validate()
     else:
         cfg.hand.validate_home_pose()
@@ -113,7 +115,7 @@ def validate_control_rate(cfg: ExperimentConfig, control_hz: float) -> None:
         raise ValueError(
             "target period must fit arm.feedback_max_age_s (coordinator health budget)"
         )
-    if cfg.control.hand_enabled:
+    if cfg.hand.enabled:
         if control_hz > 83:
             raise ValueError("XHand targets exceed the documented 83 Hz upper bound")
         if 1 / control_hz >= cfg.hand.feedback_max_age_s:
@@ -153,6 +155,18 @@ def resolve_table_plane(table: TableCollisionConfig) -> tuple[float, float, floa
     return validate_table_plane(tuple(float(plane[k]) for k in ("a", "b", "c", "d")))
 
 
+def read_config_yaml(path: str | Path | None) -> dict:
+    if path is None:
+        return {}
+    with Path(path).open(encoding="utf-8") as stream:
+        loaded = yaml.safe_load(stream)
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, Mapping):
+        raise TypeError("experiment config root must be a mapping")
+    return dict(loaded)
+
+
 def load_experiment_config(
     *,
     yaml_path: str | Path | None = None,
@@ -164,11 +178,7 @@ def load_experiment_config(
         raise ValueError("provide at most one of yaml_path or data")
     loaded = data if data is not None else {}
     if yaml_path is not None:
-        path = Path(yaml_path)
-        with path.open(encoding="utf-8") as stream:
-            loaded = yaml.safe_load(stream)
-        if loaded is None:
-            loaded = {}
+        loaded = read_config_yaml(yaml_path)
     if not isinstance(loaded, Mapping):
         raise TypeError("experiment config root must be a mapping")
     loaded = deepcopy(dict(loaded))
@@ -178,12 +188,13 @@ def load_experiment_config(
         *sections, name = key.split(".")
         cursor = loaded
         for section in sections:
-            if not isinstance(cursor.get(section), dict):
+            if section not in cursor:
                 cursor[section] = {}
+            elif not isinstance(cursor[section], dict):
+                raise TypeError(f"config section {section!r} must be a mapping")
             cursor = cursor[section]
         cursor[name] = value
-    cfg = apply_config_overrides(ExperimentConfig(), loaded)
-    return cfg
+    return apply_config_overrides(ExperimentConfig(), loaded)
 
 
 def validate_keyboard_workspace(runtime):
@@ -191,7 +202,7 @@ def validate_keyboard_workspace(runtime):
     cfg = runtime.keyboard_teleop
     cfg.validate()
     validate_control_rate(runtime, cfg.control_hz)
-    workspace = runtime.control.workspace.as_array()
+    workspace = runtime.environment.workspace.as_array()
     if np.any(
         workspace[:, 0] + cfg.workspace_command_margin_m
         >= workspace[:, 1] - cfg.workspace_command_margin_m

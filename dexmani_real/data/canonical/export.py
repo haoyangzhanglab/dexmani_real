@@ -8,13 +8,12 @@ from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 
-import h5py
 import numpy as np
 import zarr
 
 from dexmani_real.data.canonical.processing import (
     discover_episode_dirs,
-    CanonicalEpisodeProcessor,
+    iter_canonical_blocks,
     validate_export_episode,
 )
 from dexmani_real.data.canonical.schema import (
@@ -23,7 +22,9 @@ from dexmani_real.data.canonical.schema import (
     canonical_array_specs,
 )
 from dexmani_real.data.raw.reader import EpisodeReader, RawDataError, text_attr
+from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
+from dexmani_real.planning.kinematics.hand_pointcloud import HandPointCloudTemplate
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.sensor.pointcloud.config import SAMPLING_METHOD
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
@@ -51,7 +52,7 @@ class CanonicalExporter:
         exclude: tuple[str, ...] = (),
         progress_callback=None,
     ) -> dict:
-        """Export all 15 fields; reject bad Raw and retain staging on conversion or write failures."""
+        """Export all 13 fields; reject bad Raw and retain staging on conversion or write failures."""
         if type(self.chunk_frames) is not int or self.chunk_frames <= 0:
             raise ValueError("chunk_frames must be a positive integer")
         source = Path(input_root).expanduser().resolve()
@@ -76,7 +77,7 @@ class CanonicalExporter:
         first_attrs = first_specs = None
         ends, offset = [], 0
         episode_ids = []
-        hand_fk = None
+        arm_fk = hand_fk = hand_cloud = None
         try:
             for index, episode in enumerate(selected):
                 if progress_callback:
@@ -88,10 +89,8 @@ class CanonicalExporter:
                                 (episode / name).stat()
                             except FileNotFoundError as exc:
                                 raise RawDataError(f"missing required file: {name}") from exc
-                        if not h5py.is_hdf5(episode / "data.h5"):
-                            raise RawDataError("data.h5 is not an HDF5 file")
                         reader = resources.enter_context(EpisodeReader(episode))
-                        camera, base_from_color = validate_export_episode(reader)
+                        camera, base_from_color, camera_parameters = validate_export_episode(reader)
                         task = text_attr(reader.meta, "task_label")
                         if any(ord(char) < 32 or ord(char) == 127 for char in task):
                             raise RawDataError(
@@ -106,6 +105,7 @@ class CanonicalExporter:
                         self.processing.pointcloud.num_points,
                         camera.intrinsics.height,
                         camera.intrinsics.width,
+                        self.processing.hand_pointcloud.num_points,
                     )
                     period_ns, tolerance_ns = sampling_clock_ns(reader.control_hz)
                     attrs = dict(
@@ -123,6 +123,9 @@ class CanonicalExporter:
                             asdict(self.processing.pointcloud), sampling_method=SAMPLING_METHOD
                         ),
                         fingertip_link_names=list(self.processing.fingertip_link_names),
+                        handbase_position_eef_m=list(self.processing.handbase_position_eef_m),
+                        handbase_quat_eef_wxyz=list(self.processing.handbase_quat_eef_wxyz),
+                        table_plane_abcd=self.processing.table_plane_abcd,
                     )
                     # Reject mixed cache semantics before consuming the episode payload.
                     if first_attrs is not None:
@@ -150,15 +153,24 @@ class CanonicalExporter:
                     chunk = min(self.chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes))
                     try:
                         if hand_fk is None:
+                            arm_fk = make_arm_fk()
                             hand_fk = HandKinematics(
                                 str(XHAND_RIGHT_URDF_PATH),
                                 self.processing.fingertip_link_names,
                             )
-                        blocks = CanonicalEpisodeProcessor(
+                            hand_cloud = HandPointCloudTemplate(self.processing.hand_pointcloud, hand_fk)
+                        attrs["hand_pointcloud_config"] = hand_cloud.recipe
+                        blocks = iter_canonical_blocks(
+                            reader,
                             self.processing,
-                            hand_fk,
+                            arm_fk=arm_fk,
+                            hand_fk=hand_fk,
+                            hand_cloud=hand_cloud,
                             chunk_frames=chunk,
-                        ).iter_blocks(reader, camera=camera, base_from_color=base_from_color)
+                            camera=camera,
+                            base_from_color=base_from_color,
+                            camera_parameters=camera_parameters,
+                        )
                         if root is None:
                             if staging is None:
                                 target.parent.mkdir(parents=True, exist_ok=True)

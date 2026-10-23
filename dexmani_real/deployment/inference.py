@@ -18,8 +18,9 @@ class ModelResult:
 
 
 class InferenceWorker:
-    def __init__(self, factory):
+    def __init__(self, factory, *, build_observation):
         self.model_factory = factory
+        self.build_observation = build_observation
         self.model = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-model")
         self.future = None
@@ -33,6 +34,11 @@ class InferenceWorker:
             if operation == "load":
                 self.model = self.model_factory()
                 value = self.model.warmup(**kwargs)
+            elif operation == "predict":
+                # This worker exclusively owns observation FK workspaces and the model.
+                observation = self.build_observation(args[0])
+                start = time.monotonic_ns()
+                value = self.model.predict(observation, **kwargs)
             elif operation != "close" or self.model is not None:
                 value = getattr(self.model, operation)(*args, **kwargs)
         except BaseException as exc:

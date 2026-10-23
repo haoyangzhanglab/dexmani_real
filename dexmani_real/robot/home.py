@@ -171,7 +171,7 @@ def execute_arm_home(
 def build_home_planner(runtime: ExperimentConfig) -> HomePlanner:
     """Build HOME planning with current workspace/table/static geometry beyond online IK endpoint checks."""
     return HomePlanner(
-        workspace_bounds=runtime.control.workspace.as_array(),
+        workspace_bounds=runtime.environment.workspace.as_array(),
         static_boxes=tuple(runtime.environment.static_boxes),
         table=runtime.environment.table,
     )
@@ -188,7 +188,7 @@ def home_robot(runtime_state, runtime, planner, *, robot, abort_requested) -> Ho
         if not hand_result.ok:
             return hand_result
         # Hand-disabled mode assumes the hand is absent or secured at home.
-        if not runtime.control.hand_enabled:
+        if not runtime.hand.enabled:
             planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
         result = execute_arm_home(
             runtime_state,
@@ -200,7 +200,7 @@ def home_robot(runtime_state, runtime, planner, *, robot, abort_requested) -> Ho
             estop_requested=lambda: bool(runtime_state.estop_request),
             progress=logger.debug,
             hand_state_max_age_s=(
-                runtime.hand.feedback_max_age_s if runtime.control.hand_enabled else None
+                runtime.hand.feedback_max_age_s if runtime.hand.enabled else None
             ),
         )
         return result
@@ -222,7 +222,7 @@ def home_robot(runtime_state, runtime, planner, *, robot, abort_requested) -> Ho
 
 
 def home_hand(runtime_state, runtime, *, robot, abort_requested=None):
-    if not runtime.control.hand_enabled:
+    if not runtime.hand.enabled:
         return HomeResult(True)
     cfg = runtime.hand
     target = validate_hand_command_bounds(

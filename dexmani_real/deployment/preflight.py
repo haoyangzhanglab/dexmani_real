@@ -7,6 +7,10 @@ from typing import Any
 
 from dexmani_real.config.experiment import validate_control_rate, validate_robot_config
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig, resolve_saved_pointcloud_recipe
+from dexmani_real.sensor.pointcloud.hand_config import (
+    HandPointCloudConfig,
+    resolve_saved_hand_pointcloud_recipe,
+)
 
 
 def validate_max_running_s(max_running_s: float | None) -> float | None:
@@ -94,6 +98,8 @@ SUPPORTED_OBSERVATION_FIELDS = frozenset(
         "joint_state",
         "point_cloud",
         "rgb",
+        "depth",
+        "hand_pointcloud",
         "finger_tactile_force",
         "fingertip_xyz",
         "eef_pose",
@@ -104,10 +110,12 @@ SUPPORTED_OBSERVATION_FIELDS = frozenset(
 )
 
 
-def validate_policy_inputs(info: Any, runtime: Any) -> PointCloudConfig | None:
-    """Check physical capability before allocating IPC or connecting devices."""
-    if not runtime.control.hand_enabled:
-        raise ValueError("Dexterous policy deployment requires hand_enabled=true")
+def validate_policy_inputs(
+    info: Any, runtime: Any,
+) -> tuple[PointCloudConfig | None, HandPointCloudConfig | None]:
+    """Resolve inspected Policy recipes against the current Real capabilities."""
+    if not runtime.hand.enabled:
+        raise ValueError("Dexterous policy deployment requires hand.enabled=true")
     names = set(info.observation_fields)
     unsupported = names - SUPPORTED_OBSERVATION_FIELDS
     if unsupported:
@@ -123,12 +131,18 @@ def validate_policy_inputs(info: Any, runtime: Any) -> PointCloudConfig | None:
             or len(set(links)) != 5
         ):
             raise ValueError("Live fingertip_xyz requires five distinct non-empty link names")
-    if "point_cloud" in names:
-        return resolve_saved_pointcloud_recipe(info.pointcloud_config)
-    return None
+    if "depth" in names and tuple(info.depth_config["shape"]) != runtime.camera.depth_shape:
+        raise ValueError("Live camera shape differs from the saved depth input")
+    return (
+        resolve_saved_pointcloud_recipe(info.pointcloud_config) if "point_cloud" in names else None,
+        resolve_saved_hand_pointcloud_recipe(info.hand_pointcloud_config)
+        if "hand_pointcloud" in names else None,
+    )
 
 
-def validate_deployment_config(info: Any, runtime: Any, *, needs) -> PointCloudConfig | None:
+def validate_deployment_config(
+    info: Any, runtime: Any, *, needs,
+) -> tuple[PointCloudConfig | None, HandPointCloudConfig | None]:
     """Check Real constraints on inspected Policy metadata; no calibration I/O."""
     validate_execution_config(info, runtime.execution)
     if info.hand_history_steps is not None:
@@ -139,9 +153,9 @@ def validate_deployment_config(info: Any, runtime: Any, *, needs) -> PointCloudC
             != (1, 1, 1, 1)
         ):
             raise ValueError("LAMP hand history requires joint, joint_state, H=Nobs=C=A_exec=1")
-    cloud_recipe = validate_policy_inputs(info, runtime)
+    recipes = validate_policy_inputs(info, runtime)
     validate_robot_config(runtime)
     validate_control_rate(runtime, 1.0 / info.control_dt_s)
     if needs.camera_worker:
         runtime.camera.validate()
-    return cloud_recipe
+    return recipes

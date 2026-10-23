@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime = load_experiment_config(
         yaml_path=args.config,
         cli_overrides={
-            "control.hand_enabled": False if args.no_hand else None,
+            "hand.enabled": False if args.no_hand else None,
             "keyboard_teleop.control_hz": args.control_hz,
         },
     )

@@ -4,9 +4,12 @@ import logging
 import multiprocessing as mp
 from pathlib import Path
 
+import numpy as np
+
 from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extrinsics
 from dexmani_real.calibration.vr_heading import load_vr_transform
+from dexmani_real.config.control import CollectionOptions
 from dexmani_real.config.experiment import (
     DEFAULT_TASK_NAME,
     resolve_runtime_table,
@@ -17,6 +20,7 @@ from dexmani_real.config.experiment import (
 from dexmani_real.data.recorder import AsyncEpisodeRecorder
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
+from dexmani_real.planning.kinematics.ik import OnlineIKConfig
 from dexmani_real.robot.home import build_home_planner
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.robot import DexManiRobot
@@ -40,12 +44,14 @@ class TeleopSession:
         self,
         runtime,
         *,
+        collection=CollectionOptions(),
         task_name=DEFAULT_TASK_NAME,
         allow_no_hand=False,
         vr_transform_path=VR_TRANSFORM_PATH,
         camera_calibration_path=None,
     ):
         self.runtime = runtime
+        self.collection = collection
         self.task_name = task_name
         self.allow_no_hand = allow_no_hand
         self.vr_transform_path = vr_transform_path
@@ -56,34 +62,51 @@ class TeleopSession:
         self.task_name = validate_task_dir_name(self.task_name)
         validate_robot_config(self.runtime)
         validate_control_rate(self.runtime, self.runtime.teleop.control_hz)
-        self.runtime.control.validate()
+        self.runtime.teleop.validate()
+        self.collection.validate()
         self.runtime.vr.validate()
-        if self.runtime.control.recording_enabled:
+        if self.collection.enabled:
             self.runtime.camera.validate()
         self.runtime = resolve_runtime_table(self.runtime)
-        if not self.runtime.control.hand_enabled and (
-            self.runtime.control.recording_enabled or not self.allow_no_hand
+        if not self.runtime.hand.enabled and (
+            self.collection.enabled or not self.allow_no_hand
         ):
             raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")
         calibration = load_vr_transform(self.vr_transform_path)
-        mapping = self.runtime.control.vr_mapping
+        mapping = self.runtime.teleop.vr_mapping
         controller = TeleopController(
-            ActionMapper.for_mode(self.runtime, "eef"),
+            ActionMapper.for_mode(
+                "eef",
+                ik_config=OnlineIKConfig(
+                    max_pose_error_pos_m=self.runtime.motion.ik_max_pose_error_pos_m,
+                    max_pose_error_rot_rad=self.runtime.motion.ik_max_pose_error_rot_rad,
+                    operational_joint_lower_rad=tuple(self.runtime.arm.joint_limit_lower),
+                    operational_joint_upper_rad=tuple(self.runtime.arm.joint_limit_upper),
+                ),
+                hand_enabled=self.runtime.hand.enabled,
+                hand_lower_rad=self.runtime.hand.qpos_min_rad,
+                hand_upper_rad=self.runtime.hand.qpos_max_rad,
+                home_hand_qpos=np.deg2rad(self.runtime.hand.home_qpos_deg),
+                workspace=self.runtime.environment.workspace.as_array(),
+                workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
+                static_boxes=self.runtime.environment.static_boxes,
+            ),
             VRWristMapper(
                 pos_scale=mapping.pos_scale,
                 vr_to_robot_rot=calibration.transform,
             ),
-            self.runtime,
+            self.runtime.teleop.ema,
             self.build_hand_retargeter(),
         )
         home_planner = build_home_planner(self.runtime)
         camera_calibration = (
             load_optional_camera_extrinsics(self.camera_calibration_path)
-            if self.runtime.control.recording_enabled
+            if self.collection.enabled
             else None
         )
         needs = ObservationNeeds(
-            camera="rgbd" if self.runtime.control.recording_enabled else "none", vr=True
+            camera="rgbd" if self.collection.enabled else "none", vr=True,
+            required_tactile=("aggregate", "dense") if self.collection.enabled else (),
         )
         ctx = mp.get_context("spawn")
         self.runtime_state = RuntimeState()
@@ -106,6 +129,7 @@ class TeleopSession:
                 self.runtime,
                 self.robot,
                 task_label=self.task_name,
+                max_record_duration_s=self.collection.max_duration_s,
                 needs=needs,
                 sensors=self.sensors,
                 controller=controller,
@@ -113,11 +137,11 @@ class TeleopSession:
                 recorder=(
                     AsyncEpisodeRecorder(
                         Path(__file__).resolve().parents[2]
-                        / self.runtime.control.episodes_dir
+                        / self.collection.episodes_dir
                         / self.task_name,
                         control_hz=self.runtime.teleop.control_hz,
                     )
-                    if self.runtime.control.recording_enabled
+                    if self.collection.enabled
                     else None
                 ),
                 camera_calibration=camera_calibration,
@@ -170,9 +194,9 @@ class TeleopSession:
         return int(not clean or not shutdown_clean)
 
     def build_hand_retargeter(self):
-        if not self.runtime.control.hand_enabled:
+        if not self.runtime.hand.enabled:
             return None
-        if self.runtime.control.hand_retargeting_type == "tag":
+        if self.runtime.teleop.hand_retargeting_type == "tag":
             from dexmani_real.teleop.retargeting.tag import TAGHandRetargeter
 
             return TAGHandRetargeter(
@@ -180,7 +204,7 @@ class TeleopSession:
                 tag_config=self.runtime.tag_retargeting,
                 urdf_path=str(XHAND_RIGHT_URDF_PATH),
             )
-        if self.runtime.control.hand_retargeting_type == "dexpilot":
+        if self.runtime.teleop.hand_retargeting_type == "dexpilot":
             from dexmani_real.teleop.retargeting.dexpilot import DexPilotHandRetargeter
 
             return DexPilotHandRetargeter(

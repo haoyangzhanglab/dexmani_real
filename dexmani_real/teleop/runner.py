@@ -48,6 +48,7 @@ class TeleopRunner:
         vr_process,
         recorder,
         camera_calibration=None,
+        max_record_duration_s=60.0,
     ):
         self.sensors = sensors
         self.needs = needs
@@ -55,6 +56,7 @@ class TeleopRunner:
         self.robot = robot
         self.vr_process = vr_process
         self.camera_calibration = camera_calibration
+        self.max_record_duration_s = max_record_duration_s
         self.task_label = task_label
         self.runtime = runtime
         self.recorder = recorder
@@ -70,6 +72,7 @@ class TeleopRunner:
         self.resume_context = False
         self.preparing_epoch = None
         self.resume_after_ns = 0
+        self.capture_failed = False
         self.pending_termination_reason = None
         self.termination_details = []
         self.control_run_id = None
@@ -132,8 +135,11 @@ class TeleopRunner:
             published = self.recorder.save_episode(
                 reason=reason,
                 details=self.termination_details,
-                arm_execution=dict(
-                    self.robot.arm.execution_snapshot(), robot_stopped=not self.robot.stop_required
+                stop_result="unconfirmed" if self.robot.stop_required else "confirmed",
+                technical_status=(
+                    "normal" if not self.capture_failed and reason in {"operator", "quit", "timeout"}
+                    and not any("exception_type" in item for item in self.termination_details)
+                    else "failed"
                 ),
             )
         else:
@@ -151,8 +157,8 @@ class TeleopRunner:
         row=None,
         command=None,
         dispatch=None,
-        timing=None,
     ):
+        self.capture_failed = True
         failure = None
         try:
             self.pause_control(reason, run_end_reason=run_end_reason)
@@ -162,7 +168,7 @@ class TeleopRunner:
         self.audio.play("emergency")
         try:
             if row is not None and self.recorder is not None:
-                self.recorder.add_frame(row, command, dispatch, timing=timing)
+                self.recorder.add_frame(row, command, dispatch)
         except Exception as exc:
             failure = failure or exc
             self.termination_details.append(error_detail("recording", exc))
@@ -226,7 +232,7 @@ class TeleopRunner:
                 self.sensors.channels,
                 self.runtime,
                 self.robot,
-                require_hand=self.runtime.control.hand_enabled,
+                require_hand=self.runtime.hand.enabled,
                 needs=self.needs,
                 wait_for_hand=True,
                 cancel_requested=lambda: (
@@ -248,10 +254,6 @@ class TeleopRunner:
         if self.recorder is not None:
             self.recorder.start_episode(
                 task_label=self.task_label,
-                arm_execution=self.robot.arm.execution_snapshot(),
-                arm_control_metadata=self.robot.arm.execution_metadata(
-                    1 / self.recorder.control_hz
-                ),
                 collection_source="teleop",
                 metadata=snapshot_recording_metadata(
                     self.sensors.channels,
@@ -260,6 +262,7 @@ class TeleopRunner:
                 ),
             )
         self.capture_started_s = time.monotonic()
+        self.capture_failed = False
         self.pending_termination_reason = None
         self.termination_details = []
         try:
@@ -418,7 +421,6 @@ class TeleopRunner:
         epoch = self.control_run_id
         deadline_ns = min(deadline_ns, feedback_deadline_ns(row, self.runtime, include_vr=True))
         action_result = command = dispatch = failure = None
-        timing = dict(run_id=epoch, slot=self.tick_index - 1)
         reason = None
         interrupted = False
         run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
@@ -431,16 +433,12 @@ class TeleopRunner:
                 command = RobotCommand(epoch, action_result.arm_qpos, action_result.hand_qpos)
                 if self.recorder is not None:
                     self.recorder.check_error()
-                timing["submit_started_ns"] = time.monotonic_ns()
-                try:
-                    dispatch = self.robot.send_action(
-                        command,
-                        valid_until_ns=deadline_ns,
-                        execute_until_ns=int(row.vr["recv_ts_ns"])
-                        + int(self.runtime.control.vr_mapping.stale_threshold_s * 1e9),
-                    )
-                finally:
-                    timing["submit_completed_ns"] = time.monotonic_ns()
+                dispatch = self.robot.send_action(
+                    command,
+                    valid_until_ns=deadline_ns,
+                    execute_until_ns=int(row.vr["recv_ts_ns"])
+                    + int(self.runtime.teleop.vr_mapping.stale_threshold_s * 1e9),
+                )
         except BaseException as exc:
             failure = exc
             if isinstance(exc, (DispatchError, DispatchInterrupted)):
@@ -483,7 +481,6 @@ class TeleopRunner:
                     row=row,
                     command=command,
                     dispatch=dispatch,
-                    timing=timing,
                 )
             except Exception as exc:
                 if failure is not None and not interrupted:
@@ -494,7 +491,7 @@ class TeleopRunner:
             return
         self.controller.commit_dispatched_target(action_result)
         if self.recorder is not None:
-            self.recorder.add_frame(row, command, dispatch, timing=timing)
+            self.recorder.add_frame(row, command, dispatch)
 
     def wait_for_vr(self) -> bool:
         deadline = time.monotonic() + self.runtime.safety.vr_ready_timeout_s
@@ -542,7 +539,7 @@ class TeleopRunner:
             self.recorder is not None
             and self.recorder.is_recording
             and time.monotonic() - self.capture_started_s
-            >= self.runtime.control.max_record_duration_s
+            >= self.max_record_duration_s
         ):
             self.pause_control("max_record_duration", run_end_reason=RunEndReason.TIMEOUT)
             self.end_segment(True, "max_record_duration")
@@ -568,7 +565,7 @@ class TeleopRunner:
             self.sensors.channels,
             self.runtime,
             self.robot,
-            require_hand=self.runtime.control.hand_enabled,
+            require_hand=self.runtime.hand.enabled,
             needs=self.needs,
             issues=issues,
         )

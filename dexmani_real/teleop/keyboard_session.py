@@ -10,7 +10,7 @@ from dexmani_real.config.experiment import (
     validate_robot_config,
 )
 from dexmani_real.planning.target import TargetChecker
-from dexmani_real.planning.kinematics.ik import IKFailureKind, make_online_ik_solver
+from dexmani_real.planning.kinematics.ik import IKFailureKind, OnlineIKConfig, make_online_ik_solver
 from dexmani_real.robot.commands import DispatchError
 from dexmani_real.robot.home import build_home_planner, home_robot
 from dexmani_real.robot.robot import DexManiRobot
@@ -47,7 +47,7 @@ class KeyboardTeleopSession:
         validate_robot_config(self.runtime)
         self.runtime = resolve_runtime_table(self.runtime)
         self.workspace = validate_keyboard_workspace(self.runtime)
-        if not self.runtime.control.hand_enabled and not self.no_hand:
+        if not self.runtime.hand.enabled and not self.no_hand:
             raise ValueError("hand-disabled operation requires --no-hand")
 
         self.runtime_state = RuntimeState()
@@ -90,13 +90,23 @@ class KeyboardTeleopSession:
 
     def start(self):
         self.solver = make_online_ik_solver(
-            self.runtime,
-            max_pose_error_pos_m=self.jog_config.ik_max_pose_error_pos_m,
-            max_pose_error_rot_rad=self.jog_config.ik_max_pose_error_rot_rad,
+            OnlineIKConfig(
+                max_pose_error_pos_m=self.jog_config.ik_max_pose_error_pos_m,
+                max_pose_error_rot_rad=self.jog_config.ik_max_pose_error_rot_rad,
+                operational_joint_lower_rad=tuple(self.runtime.arm.joint_limit_lower),
+                operational_joint_upper_rad=tuple(self.runtime.arm.joint_limit_upper),
+            ),
+            static_boxes=self.runtime.environment.static_boxes,
         )
-        if not self.runtime.control.hand_enabled:
+        if not self.runtime.hand.enabled:
             self.solver.collision_model.set_hand_qpos(np.deg2rad(self.runtime.hand.home_qpos_deg))
-        self.target_checker = TargetChecker(self.runtime, self.solver.collision_model)
+        self.target_checker = TargetChecker(
+            self.solver.collision_model,
+            joint_lower_rad=self.runtime.arm.joint_limit_lower,
+            joint_upper_rad=self.runtime.arm.joint_limit_upper,
+            workspace=self.runtime.environment.workspace.as_array(),
+            workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
+        )
         self.home_planner = build_home_planner(self.runtime)
         self.keys.start()
         if not self.keys.healthy:
@@ -187,7 +197,7 @@ class KeyboardTeleopSession:
             None,
             self.runtime,
             self.robot,
-            require_hand=self.runtime.control.hand_enabled,
+            require_hand=self.runtime.hand.enabled,
         )
         if row is not None:
             self.robot.arm.update_health(upstream_until_ns=upstream_deadline_ns(row, self.runtime))

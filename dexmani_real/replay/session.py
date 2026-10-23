@@ -53,7 +53,7 @@ class ReplaySession:
         outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="startup failed")
         try:
             self.runtime_state = RuntimeState()
-            self.robot = DexManiRobot(self.runtime_state, self.runtime)
+            self.robot = DexManiRobot(self.runtime_state, self.runtime, required_tactile=())
 
             self.keyboard = KeyboardInput(
                 quit_callback=self.runtime_state.request_quit,

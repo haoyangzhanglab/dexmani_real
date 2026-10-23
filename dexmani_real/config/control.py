@@ -1,4 +1,4 @@
-"""Control, retargeting and runtime timing parameters."""
+"""Teleoperation, motion tolerances and local session options."""
 
 from __future__ import annotations
 
@@ -6,8 +6,6 @@ from dataclasses import astuple, dataclass, field
 from math import radians
 
 import numpy as np
-
-from dexmani_real.config.environment import WorkspaceBounds
 
 
 @dataclass(frozen=True)
@@ -23,28 +21,10 @@ class VRMappingParams:
 
 
 @dataclass(frozen=True)
-class TeleopTimingParams:
+class TeleopParams:
     control_hz: float = 16.0
-
-
-@dataclass(frozen=True)
-class ControlParams:
-    """Shared Real control settings; deployment cadence comes from saved Policy."""
-
     ema: EMAParams = field(default_factory=EMAParams)
     vr_mapping: VRMappingParams = field(default_factory=VRMappingParams)
-
-    workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
-    eef_workspace_margin_m: float = 0.005
-
-    recording_enabled: bool = True
-    max_record_duration_s: float = 60.0
-    episodes_dir: str = "episodes"
-
-    ik_max_pose_error_pos_m: float = 0.02
-    ik_max_pose_error_rot_rad: float = radians(5.0)
-
-    hand_enabled: bool = True
     hand_retargeting_type: str = "tag"
 
     def validate(self) -> None:
@@ -55,10 +35,31 @@ class ControlParams:
             for v in (self.vr_mapping.pos_scale, self.vr_mapping.stale_threshold_s)
         ):
             raise ValueError("VR position scale and stale threshold must be finite and positive")
-        if self.recording_enabled and (
-            not np.isfinite(self.max_record_duration_s) or self.max_record_duration_s <= 0
-        ):
-            raise ValueError("max_record_duration_s must be finite and positive")
+        if self.hand_retargeting_type not in {"tag", "dexpilot"}:
+            raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")
+
+
+@dataclass(frozen=True)
+class MotionParams:
+    ik_max_pose_error_pos_m: float = 0.02
+    ik_max_pose_error_rot_rad: float = radians(5.0)
+
+
+@dataclass(frozen=True)
+class CollectionOptions:
+    """Local capture options; unrecorded teleop has no capture-duration limit."""
+
+    enabled: bool = True
+    episodes_dir: str = "episodes"
+    max_duration_s: float = 60.0
+
+    def validate(self) -> None:
+        if type(self.enabled) is not bool:
+            raise TypeError("collection.enabled must be a boolean")
+        if not isinstance(self.episodes_dir, str) or not self.episodes_dir.strip():
+            raise ValueError("collection.episodes_dir must be non-empty")
+        if self.enabled and (not np.isfinite(self.max_duration_s) or self.max_duration_s <= 0):
+            raise ValueError("collection.max_duration_s must be finite and positive")
 
 
 @dataclass(frozen=True)
