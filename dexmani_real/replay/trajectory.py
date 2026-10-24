@@ -45,9 +45,8 @@ def load_trajectory(episode_path):
         ]
         if len(arm) == 0 or not all(np.isfinite(v).all() for v in (arm, hand, aq, hq)):
             raise ValueError("replay requires nonempty finite targets and robot states")
-        reader.validate_fixed_rate_rows()
         reader.validate_completion()
-        reader.validate_source_times(required_tactile=(), require_camera=False)
+        reader.validate_rows(required_tactile=(), require_camera=False)
         return TrajectoryData(
             str(reader.path),
             len(arm),

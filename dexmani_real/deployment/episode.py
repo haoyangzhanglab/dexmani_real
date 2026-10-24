@@ -736,22 +736,17 @@ class PolicyEpisode:
                     return
             self.record_pending()
         else:
-            if self.execution.execution_mode == "async":
-                issue = plan_rejection(self.plan, slot, "async", time.monotonic_ns())
-                if issue is not None:
-                    self.finish(issue.detail)
-                    return
+            # Exhausted sync/RTC segments cannot prefetch; async also checks its live tail/age.
+            issue = plan_rejection(
+                self.plan, slot, self.execution.execution_mode, time.monotonic_ns()
+            )
+            if issue is not None:
+                self.finish(issue.detail)
+                return
             issue = self.submit_prefetch(row, rows, slot)
             if issue is not None:
                 self.finish(issue.detail, run_end_reason=issue.run_end_reason)
                 return
-            if self.execution.execution_mode != "async":
-                issue = plan_rejection(
-                    self.plan, slot, self.execution.execution_mode, time.monotonic_ns()
-                )
-                if issue is not None:
-                    self.finish(issue.detail)
-                    return
             # Pending prefetch never suspends a still-valid current plan.
             self.execute_slot(row, slot)
         if (expired := self.expired_budget()) is not None:

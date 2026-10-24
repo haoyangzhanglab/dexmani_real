@@ -7,7 +7,6 @@ import numpy as np
 from dexmani_real.robot.xarm7.protocol import (
     MAX_TIME,
     STATUS_DTYPE,
-    SDK_CODE_UNAVAILABLE,
     PrepareRequest,
     HomeRequest,
     LifecycleReply,
@@ -25,7 +24,6 @@ class ArmWorker:
         self.clock = clock_ns
         self.status = np.zeros((), dtype=STATUS_DTYPE)
         self.active = self.reference = None
-        self.first_accepted = False
         self.last_send_ns = 0
 
     def authorized(self, run_id, *, preparing=False):
@@ -47,9 +45,9 @@ class ArmWorker:
     def read_feedback(self):
         started = self.clock()
         try:
-            q, v, effort = self.driver.read()
+            q, v = self.driver.read()
             if (
-                any(np.asarray(x).shape != (7,) for x in (q, v, effort))
+                any(np.asarray(x).shape != (7,) for x in (q, v))
                 or not np.isfinite([q, v]).all()
             ):
                 raise RuntimeError("invalid arm feedback shape/values")
@@ -61,7 +59,6 @@ class ArmWorker:
                 raise RuntimeError(f"arm disconnected/controller error {status.error_code}")
             self.status["frame"]["qpos"] = q
             self.status["frame"]["qvel"] = v
-            self.status["frame"]["effort"] = effort
             # Host query start is conservative; never replace this with cache-read time.
             self.status["frame"]["timestamp_ns"] = started
             self.status["valid"] = True
@@ -199,41 +196,23 @@ class ArmWorker:
             interval_s=self.cfg.homing.step_interval_s,
         )
 
-    def end_active(self):
-        if self.active is not None:
-            if not self.first_accepted:
-                self.status["cancelled_before_first"] += 1
-            self.active = None
-            self.status["active_sequence"] = 0
-
-    def cancel_goal(self, goal):
-        if goal is not None:
-            self.status["cancelled_before_first"] += 1
-
     def stop(self):
         self.io.authority.value = 0
         self.status["prepared_run_id"] = 0
-        self.reference = None
-        self.end_active()
-        self.cancel_goal(self.io.take_goal(block=True))
-        self.status["stop_started_ns"] = self.clock()
-        self.status["stop_completed_ns"] = 0
-        self.status["stop_accepted"] = False
+        self.active = self.reference = None
+        self.io.take_goal(block=True)
         self.io.publish(self.status)
         try:
             code = self.driver.stop()
             if isinstance(code, bool) or not isinstance(code, (int, np.integer)) or code != 0:
                 raise RuntimeError(f"stop acceptance unavailable/rejected: {code!r}")
-            self.status["stop_accepted"] = True
         except BaseException as exc:
             if not self.io.close_error.value:
                 self.io.close_error.value = f"stop SDK failure: {exc}".encode()[:1023]
             self.fault(exc)
         finally:
-            self.status["stop_completed_ns"] = self.clock()
             self.io.stop.clear()
-            self.io.publish(self.status)
-            self.io.stopped.set()  # Processing finished; stop_accepted records the independent SDK result.
+            self.io.stopped.set()  # Processing finished; SDK failures remain latched in close_error.
 
     def operation(self, message):
         identity = message.operation_id
@@ -257,7 +236,7 @@ class ArmWorker:
             check_abort()
             if self.active is not None:
                 raise RuntimeError("prepare/HOME requires stopped streaming")
-            self.cancel_goal(self.io.take_goal(block=True))
+            self.io.take_goal(block=True)
             self.status["prepared_run_id"] = 0
             self.io.stopped.clear()
             self.wait_stationary(check_abort)
@@ -312,37 +291,26 @@ class ArmWorker:
             return "controller_not_streaming"
         return None
 
-    def tick(self, planned_ns):
+    def tick(self):
         pending = self.io.take_goal()
         if self.active is None and pending is None:
             return
         now = self.clock()
-        self.status["stats"]["max_lateness_ns"] = max(
-            self.status["stats"]["max_lateness_ns"], now - planned_ns
-        )
         goal = pending if pending is not None else self.active
         issue = self.command_issue(goal, now, first=pending is not None)
         if issue:
-            self.cancel_goal(pending)
             if issue != "revoked":
                 raise RuntimeError(issue)
             self.io.stop.set()
             return
         if pending is not None:
-            try:
-                if self.active is None:
-                    q, v = self.status["frame"]["qpos"], self.status["frame"]["qvel"]
-                    if np.max(np.abs(v)) > self.cfg.homing.velocity_convergence_rad_s:
-                        raise RuntimeError("arm moved after standstill preparation")
-                    self.reference = ArmReference(self.cfg, q, v, now)
-                self.reference.replace(pending["q_goal"], now)
-            except Exception:
-                self.cancel_goal(pending)
-                raise
-            self.end_active()
+            if self.active is None:
+                q, v = self.status["frame"]["qpos"], self.status["frame"]["qvel"]
+                if np.max(np.abs(v)) > self.cfg.homing.velocity_convergence_rad_s:
+                    raise RuntimeError("arm moved after standstill preparation")
+                self.reference = ArmReference(self.cfg, q, v, now)
+            self.reference.replace(pending["q_goal"], now)
             self.active = pending
-            self.first_accepted = False
-            self.status["active_sequence"] = pending["sequence"]
         q, _, _ = self.reference.sample(now)
         started = self.clock()
         issue = self.command_issue(goal, started, first=pending is not None)
@@ -355,18 +323,7 @@ class ArmWorker:
             raise TimeoutError("reference computation exceeded interval budget")
         if np.max(np.abs(self.status["frame"]["qpos"] - q)) > self.cfg.tracking_error_rad:
             raise RuntimeError("tracking_error")
-        point = self.status["point"]
-        point["run_id"], point["command_seq"] = goal["run_id"], goal["sequence"]
-        point["planned_ns"], point["sampled_ns"], point["started_ns"] = planned_ns, now, started
-        point["completed_ns"], point["status"], point["code"] = (
-            0,
-            DispatchStatus.UNKNOWN,
-            SDK_CODE_UNAVAILABLE,
-        )
-        point["q_ref"] = q
-        self.status["sdk_attempted"] += 1
-        self.io.publish(self.status)
-        # Publication never authorizes a call: revocation can race the copy.
+        # Recheck authority and timing after computing the reference and tracking error.
         started = self.clock()
         interval = started - self.last_send_ns if self.last_send_ns else 0
         issue = self.command_issue(goal, started, first=pending is not None)
@@ -375,16 +332,10 @@ class ArmWorker:
         if issue is None and started - now >= int(self.cfg.servo_max_interval_s * 1e9):
             issue = "servo dispatch stalled before SDK"
         if issue:
-            # The pre-call fence prevented this attempt from reaching the SDK.
-            self.status["sdk_attempted"] -= 1
-            point["status"], point["completed_ns"] = DispatchStatus.NOT_CALLED, self.clock()
-            self.io.publish(self.status)
             if issue != "revoked":
                 raise RuntimeError(issue)
             self.io.stop.set()
             return
-        # Fence unresolved dispatch before the SDK call; finalized points retain actual start/end times.
-        point["started_ns"] = started
         code, error, result = None, "", DispatchStatus.UNKNOWN
         try:
             code = self.driver.servo(q)
@@ -405,24 +356,6 @@ class ArmWorker:
             error = str(exc)
         completed = self.clock()
         self.last_send_ns = started
-        self.status["sdk_completed"] += 1
-        if result == DispatchStatus.ACCEPTED:
-            self.status["sdk_accepted"] += 1
-            if not self.first_accepted:
-                self.first_accepted = True
-                self.status["first_accepted"] += 1
-        self.status["stats"]["max_call_ns"] = max(
-            self.status["stats"]["max_call_ns"], completed - started
-        )
-        self.status["stats"]["max_interval_ns"] = max(
-            self.status["stats"]["max_interval_ns"], interval
-        )
-        point["completed_ns"], point["status"], point["code"] = (
-            completed,
-            result,
-            SDK_CODE_UNAVAILABLE if code is None else code,
-        )
-        self.io.publish(self.status)
         if result != DispatchStatus.ACCEPTED:
             raise RuntimeError(error or f"servo SDK status={result.name} code={code}")
         if completed - started >= int(self.cfg.servo_max_interval_s * 1e9):
@@ -457,7 +390,7 @@ class ArmWorker:
                 now = self.clock()
                 if now >= tick:
                     try:
-                        self.tick(tick)
+                        self.tick()
                     except Exception as exc:
                         self.fault(exc)
                     tick = next_tick_ns(tick, period, self.clock())

@@ -13,14 +13,12 @@ ARM_STATE_DTYPE = np.dtype(
     [
         ("qpos", "<f8", ARM_JOINT_SHAPE),
         ("qvel", "<f8", ARM_JOINT_SHAPE),
-        ("effort", "<f8", ARM_JOINT_SHAPE),
         ("timestamp_ns", "<u8"),
     ]
 )
 HAND_STATE_DTYPE = np.dtype(
     [
         ("qpos", "<f8", HAND_JOINT_SHAPE),
-        ("current", "<f8", HAND_JOINT_SHAPE),
         ("tactile_aggregate", "<f4", HAND_TACTILE_SUM_SHAPE),
         ("tactile_dense", "<f4", HAND_TACTILE_FORCE_SHAPE),
         # Oldest original valid vector per modality; individual taxel clocks remain local.

@@ -7,9 +7,9 @@ from collections.abc import Iterable
 import numpy as np
 
 from dexmani_real.config.environment import StaticCollisionBox, TableCollisionConfig
-from .collision import CollisionModel
-from .kinematics.arm_fk import make_arm_kinematics
-from .paths import WORKSPACE_BOUNDS_TOLERANCE_M, interpolate_waypoints
+from dexmani_real.planning.collision import CollisionModel
+from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+from dexmani_real.planning.paths import WORKSPACE_BOUNDS_TOLERANCE_M, wrap_nearest_equivalent
 
 
 class HomePlanner:
@@ -32,19 +32,25 @@ class HomePlanner:
             ):
                 raise ValueError("workspace_bounds must be finite shape (3, 2) with lower <= upper")
             self.workspace_bounds = bounds.copy()
-        self.kin = make_arm_kinematics()
+        self.arm_fk = make_arm_fk()
         self.collision_model = CollisionModel(static_boxes=static_boxes, table=table)
+
+    def canonicalize_qpos(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
+        model = self.arm_fk.model
+        return wrap_nearest_equivalent(
+            qpos, reference_qpos, model.lowerPositionLimit, model.upperPositionLimit
+        )
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
         self.collision_model.set_hand_qpos(hand_qpos)
 
     def check_workspace_path(self, path: np.ndarray) -> None:
-        """Check EEF workspace at joint intervals of at most 0.02 rad; reject failed FK."""
+        """Check the owner's dense HOME samples against the EEF workspace."""
         if self.workspace_bounds is None:
             return
-        for index, qpos in enumerate(interpolate_waypoints(path, max_step=0.02)):
+        for index, qpos in enumerate(path):
             try:
-                position = self.kin.compute_eef_pose_base(qpos).p
+                position, _ = self.arm_fk.compute(qpos)
             except (ValueError, RuntimeError) as exc:
                 raise ValueError(f"workspace FK failed at sample {index}: {exc}") from exc
             if (

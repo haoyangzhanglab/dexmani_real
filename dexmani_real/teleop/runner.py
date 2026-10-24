@@ -14,13 +14,11 @@ from dexmani_real.runtime.observation import (
     read_observation,
     upstream_deadline_ns,
 )
-from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
+from dexmani_real.runtime.operator_input import OperatorCommand
 from dexmani_real.runtime.state import RunEndReason, SafetyState
-from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
-END_AUDIO_GRACE_S = 3.0
 
 
 class TeleopPhase(str, Enum):
@@ -47,6 +45,8 @@ class TeleopRunner:
         home_planner,
         vr_process,
         recorder,
+        keyboard,
+        audio,
         camera_calibration=None,
         max_record_duration_s=60.0,
     ):
@@ -60,12 +60,8 @@ class TeleopRunner:
         self.task_label = task_label
         self.runtime = runtime
         self.recorder = recorder
-        self.keyboard = KeyboardInput(
-            estop_callback=runtime_state.request_emergency_stop,
-            stop_callback=runtime_state.request_stop,
-            quit_callback=lambda: runtime_state.request_stop(reason=RunEndReason.QUIT),
-        )
-        self.audio = AudioFeedback()
+        self.keyboard = keyboard
+        self.audio = audio
         self.controller = controller
         self.phase = TeleopPhase.IDLE
         # BEGIN/RESUME context survives preparation and the quit/save choice.
@@ -604,7 +600,7 @@ class TeleopRunner:
         self.execute_control_step(row, self.next_tick_ns)
 
     def close(self):
-        """Revoke, preserve the capture, and close inputs; called once by the session owner."""
+        """Revoke and preserve the capture; the session owns input/audio resources."""
         failure = None
         self.runtime_state.revoke_motion(reason=RunEndReason.RUNTIME_SHUTDOWN)
         try:
@@ -634,19 +630,6 @@ class TeleopRunner:
                     if failure is None:
                         failure = exc
                     logger.exception("teleop recorder close failed")
-        try:
-            # After revoke/finalization, let the exit or emergency cue finish before closing audio.
-            if not self.audio.wait_until_idle(timeout_s=END_AUDIO_GRACE_S):
-                logger.warning("Final audio did not finish within %.1fs", END_AUDIO_GRACE_S)
-        except Exception:
-            logger.warning("Final audio unavailable", exc_info=True)
-        for close in (self.keyboard.stop, self.audio.close):
-            try:
-                close()
-            except Exception as exc:
-                if failure is None:
-                    failure = exc
-                logger.exception("teleop resource cleanup failed")
         if failure is not None:
             raise failure
 

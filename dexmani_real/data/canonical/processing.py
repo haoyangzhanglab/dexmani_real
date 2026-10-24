@@ -46,9 +46,8 @@ def validate_export_episode(
     expected = (frames, color.height, color.width)
     if reader["depth"].shape != expected or reader["depth"].dtype != np.uint16:
         raise RawDataError(f"depth must be uint16 {expected}")
-    reader.validate_fixed_rate_rows()
     reader.validate_completion()
-    reader.validate_source_times()
+    reader.validate_rows()
     if frames == 1:
         logging.getLogger(__name__).warning(
             "%s: single row, no sampling interval to verify", reader.path

@@ -1,4 +1,0 @@
-teleop:
-  control_hz: 20.0
-collection:
-  max_duration_s: 30.0

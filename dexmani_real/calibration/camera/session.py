@@ -135,7 +135,7 @@ def detect_aruco_stable(
 def build_planner(
     runtime: ExperimentConfig,
 ) -> tuple[HomePlanner, OnlineIKSolver]:
-    """Share arm kinematics while keeping HOME and online collision scenes separate."""
+    """Build HOME geometry and online IK with their separate collision scenes."""
     planner = build_home_planner(runtime)
     home_hand_qpos = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
     planner.set_hand_qpos(home_hand_qpos)
@@ -147,7 +147,6 @@ def build_planner(
             operational_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
         ),
         static_boxes=runtime.environment.static_boxes,
-        kin=planner.kin,
     )
     # Online jog permits table contact; both scenes retain the declared fixed-home hand.
     solver.collision_model.set_hand_qpos(home_hand_qpos)

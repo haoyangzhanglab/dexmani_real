@@ -173,23 +173,10 @@ class EpisodeReader:
         if text_attr(self.meta, "stop_result") != "confirmed":
             raise RawDataError("capture stop was not confirmed")
 
-    def validate_fixed_rate_rows(self, *, chunk_frames=4096):
-        """Validate sampling and dispatch in bounded blocks with one overlap row."""
-        if type(chunk_frames) is not int or chunk_frames <= 0:
-            raise ValueError("chunk_frames must be a positive integer")
-        timestamp, dispatch = self["timestamp"], self["dispatch_status"]
-        for start in range(0, self.num_frames, chunk_frames):
-            first, end = max(0, start - 1), min(start + chunk_frames, self.num_frames)
-            errors = validate_fixed_rate_rows(
-                timestamp[first:end], dispatch[first:end], self.control_hz, row_offset=first
-            )
-            if errors:
-                raise RawDataError("; ".join(errors))
-
-    def validate_source_times(
+    def validate_rows(
         self, *, required_tactile=("aggregate", "dense"), require_camera=True, chunk_frames=4096
     ):
-        """Check factual source ages in bounded blocks without inventing old Raw clocks."""
+        """Check sampling, dispatch and source ages in blocks with one overlap row."""
         if type(chunk_frames) is not int or chunk_frames <= 0:
             raise ValueError("chunk_frames must be a positive integer")
         if not set(required_tactile) <= {"aggregate", "dense"}:
@@ -202,9 +189,16 @@ class EpisodeReader:
             positive_float_attr(self.meta, "hand_tactile_hold_max_age_s") * 1e9
             if required_tactile else None
         )
+        timestamps, dispatch = self["timestamp"], self["dispatch_status"]
         first_observation = None
         for start in range(0, self.num_frames, chunk_frames):
             first, end = max(0, start - 1), min(start + chunk_frames, self.num_frames)
+            timestamp = timestamps[first:end]
+            errors = validate_fixed_rate_rows(
+                timestamp, dispatch[first:end], self.control_hz, row_offset=first
+            )
+            if errors:
+                raise RawDataError("; ".join(errors))
             rows = self.read_timing_rows(fields, start=first, stop=end)
             observation = rows["observation_ns"]
             if np.any(observation <= 0) or np.any(np.diff(observation) <= 0):
@@ -221,8 +215,7 @@ class EpisodeReader:
                     raise RawDataError(f"invalid consumed source clock: {name}")
                 if np.any(np.diff(values) < 0):
                     raise RawDataError(f"consumed source clock regressed: {name}")
-            timestamp = self["timestamp"][first:end]
-            if not np.isfinite(timestamp).all() or not np.allclose(
+            if not np.allclose(
                 timestamp * 1e9, observation - first_observation, rtol=0, atol=1.0
             ):
                 raise RawDataError("timestamp differs from actual observation clock")

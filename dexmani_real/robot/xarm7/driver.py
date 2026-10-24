@@ -1,4 +1,4 @@
-"""Checked xArm primitives; the child owns HOME and records stop acceptance separately."""
+"""Checked xArm primitives; the worker owns HOME, streaming and stop failures."""
 
 from __future__ import annotations
 
@@ -102,20 +102,16 @@ def enter_mode(arm_api: Any, mode: int, *, check_abort: Callable[[], None]) -> N
     wait_controller_ready(arm_api, expected_mode=mode, timeout_s=1.0, check_abort=check_abort)
 
 
-def decode_joint_states(code: Any, states: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Validate position, velocity, and SDK effort at the driver boundary."""
+def decode_joint_states(code: Any, states: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Validate measured radians and rad/s at the driver boundary."""
     check_sdk_return_code(code, "get_joint_states")
-    if not isinstance(states, (list, tuple)) or len(states) < 3:
-        raise RuntimeError("get_joint_states(num=3) must return position, velocity, and effort")
+    if not isinstance(states, (list, tuple)) or len(states) != 2:
+        raise RuntimeError("get_joint_states(num=2) must return position and velocity")
     qpos = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
     qvel = np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
-    tau = np.asarray(states[2], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
     if any(v.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(v)) for v in (qpos, qvel)):
         raise RuntimeError("get_joint_states returned invalid qpos/qvel shape or non-finite values")
-    if tau.shape != ARM_JOINT_SHAPE:
-        raise RuntimeError("get_joint_states returned invalid effort shape")
-    tau[~np.isfinite(tau)] = np.nan
-    return qpos, qvel, tau
+    return qpos, qvel
 
 
 class XArm7:
@@ -179,9 +175,9 @@ class XArm7:
         self.api.disconnect()
         self.api = None
 
-    def read(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Read radians, rad/s and SDK-native effort; auxiliary effort may be NaN, joint/SDK failures raise."""
-        code, states = self.api.get_joint_states(is_radian=True, num=3)
+    def read(self) -> tuple[np.ndarray, np.ndarray]:
+        """Read radians and rad/s for control and measured standstill checks."""
+        code, states = self.api.get_joint_states(is_radian=True, num=2)
         return decode_joint_states(code, states)
 
     def servo(self, qpos: np.ndarray) -> int:

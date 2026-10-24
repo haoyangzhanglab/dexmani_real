@@ -9,11 +9,12 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from .pose import Pose, compute_pose_error
+from dexmani_real.planning.kinematics.pose import Pose, compute_pose_error
+from dexmani_real.planning.paths import equivalent_joint_delta, wrap_nearest_equivalent
+from dexmani_real.robot.model import XARM7_XHAND_COLLISION_URDF_PATH, XARM7_XHAND_SRDF_PATH
 
 if TYPE_CHECKING:
-    from .arm_fk import XArm7Kinematics
-    from ..collision import CollisionModel
+    from dexmani_real.planning.collision import CollisionModel
 
 
 # Relative rank diagnosis is a search guard, never an execution constraint.
@@ -90,14 +91,73 @@ class IKCandidate:
     cost: float = 0.0
 
 
-def make_online_ik_solver(config: OnlineIKConfig, *, static_boxes=(), kin=None):
+def make_online_ik_solver(config: OnlineIKConfig, *, static_boxes=()):
     """Build the online collision scene, which permits table contact."""
-    from .arm_fk import make_arm_kinematics
-    from ..collision import CollisionModel
+    from dexmani_real.planning.collision import CollisionModel
 
-    kin = make_arm_kinematics() if kin is None else kin
+    kin = XArm7Kinematics()
     collision_model = CollisionModel(static_boxes=static_boxes)
     return OnlineIKSolver(kin, collision_model, config)
+
+
+class XArm7Kinematics:
+    """MPlib FK and Jacobians for online CLIK, in the collision model's xArm-base frame."""
+
+    def __init__(self) -> None:
+        import mplib
+
+        if not XARM7_XHAND_SRDF_PATH.is_file():
+            raise FileNotFoundError(XARM7_XHAND_SRDF_PATH)
+        velocity = np.deg2rad(np.full(7, 180.0))
+        self.mp_planner = mplib.Planner(
+            urdf=str(XARM7_XHAND_COLLISION_URDF_PATH),
+            srdf=str(XARM7_XHAND_SRDF_PATH),
+            move_group="custom_eef_link",
+            use_convex=False,
+            joint_vel_limits=velocity.tolist(),
+            joint_acc_limits=(velocity * 2).tolist(),
+        )
+        self.pinocchio_model = self.mp_planner.pinocchio_model
+        self.eef_link_id = list(self.pinocchio_model.get_link_names()).index(self.mp_planner.move_group)
+        self.joint_limits = np.asarray(self.mp_planner.joint_limits, dtype=np.float64)
+        self.dof = len(self.joint_limits)
+        self.mp_planner.set_base_pose(self.to_mplib_pose(Pose.identity()))
+
+    def compute_eef_pose_base(self, qpos: np.ndarray) -> Pose:
+        """Return an owned nominal URDF EEF pose in xArm-base coordinates."""
+        if not np.all(np.isfinite(qpos)):
+            raise ValueError("compute_eef_pose_base: qpos contains NaN or Inf")
+        full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
+        self.pinocchio_model.compute_forward_kinematics(full_qpos)
+        link_pose = self.pinocchio_model.get_link_pose(self.eef_link_id)
+        return Pose(
+            p=np.asarray(link_pose.p, dtype=np.float64).copy(),
+            q=np.asarray(link_pose.q, dtype=np.float64),
+        )
+
+    def compute_eef_jacobian_base(self, qpos: np.ndarray) -> np.ndarray:
+        """Return [EEF linear velocity; angular velocity] in xArm-base axes."""
+        if not np.all(np.isfinite(qpos)):
+            raise ValueError("compute_eef_jacobian_base: qpos contains NaN or Inf")
+        full_qpos = self.mp_planner.pad_move_group_qpos(qpos)
+        self.pinocchio_model.compute_forward_kinematics(full_qpos)
+        jacobian = np.asarray(
+            self.pinocchio_model.compute_single_link_jacobian(full_qpos, self.eef_link_id, False),
+            dtype=np.float64,
+        )
+        if jacobian.ndim != 2 or jacobian.shape[0] != 6 or jacobian.shape[1] < self.dof:
+            raise RuntimeError(f"Expected a (6, >= {self.dof}) Jacobian, got {jacobian.shape}")
+        jacobian = jacobian[:, : self.dof]
+        position = np.asarray(self.pinocchio_model.get_link_pose(self.eef_link_id).p)
+        # Pinocchio WORLD uses the base origin; shift its linear velocity to the EEF.
+        linear = jacobian[:3] + np.cross(jacobian[3:].T, position).T
+        return np.vstack((linear, jacobian[3:]))
+
+    @staticmethod
+    def to_mplib_pose(pose: Pose):
+        import mplib
+
+        return mplib.Pose(p=pose.p, q=pose.q)
 
 
 class OnlineIKSolver:
@@ -316,8 +376,8 @@ class OnlineIKSolver:
 
     def prepare_candidate(self, raw, source, target, current, previous, pool):
         # Mechanical equivalence survives narrowing the operational interval below 2*pi.
-        q = self.kin.canonicalize_qpos(raw, current, self.operational_limits)
         lo, hi = self.operational_limits.T
+        q = wrap_nearest_equivalent(raw, current, lo, hi)
         if not np.isfinite(q).all():
             raise ValueError("canonical IK output is non-finite")
         if np.any(q < lo) or np.any(q > hi):
@@ -327,8 +387,8 @@ class OnlineIKSolver:
         rejection = self.dynamic_rejection(q, current, previous)
         if rejection is not None:
             return None, rejection
-        previous_delta = self.kin.compute_qpos_delta(q, previous)
-        delta = self.kin.compute_qpos_delta(q, current)
+        previous_delta = equivalent_joint_delta(q, previous)
+        delta = equivalent_joint_delta(q, current)
         distance = float(np.max(np.abs(delta)))
         position_error_m, rotation_error_rad = compute_pose_error(
             target, self.kin.compute_eef_pose_base(q)

@@ -20,7 +20,7 @@ WORKSPACE_BOUNDS_TOLERANCE_M = 1e-3
 
 
 def table_clearance_m(
-    planner: "HomePlanner",
+    planner: HomePlanner,
     arm_qpos: np.ndarray,
     *,
     table_z_surface_m: float,
@@ -97,22 +97,31 @@ def wrap_nearest_equivalent(
     return result
 
 
+def equivalent_joint_delta(qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
+    """Signed joint deltas; only the model's full-turn axes wrap to [-π, π)."""
+    delta = qpos - reference_qpos
+    mask = np.asarray(XARM7_EQUIVALENT_JOINT_MASK, dtype=bool)
+    delta[mask] = (delta[mask] + np.pi) % (2.0 * np.pi) - np.pi
+    return delta
+
+
 def check_home_path(
     path: np.ndarray,
-    planner: "HomePlanner",
+    planner: HomePlanner,
     *,
     table_z_surface_m: float,
     hand_safety_margin_m: float,
     allow_table_soft_escape: bool,
 ) -> None:
-    """Reject the first unsafe sample; table soft escape never permits mesh collision."""
+    """Check one shared 1° sampling; table soft escape never permits mesh collision."""
+    path = interpolate_waypoints(path, np.deg2rad(1.0))
     try:
         collision = planner.collision_model.check_path(path)
     except Exception as exc:
         raise ValueError(f"collision_check_error: {exc}") from exc
     if collision is not None:
         index, info = collision
-        raise ValueError(f"collision at segment {index}: {info}")
+        raise ValueError(f"collision at sample {index}: {info}")
 
     try:
         planner.check_workspace_path(path)
@@ -180,7 +189,7 @@ def home_joint_vector(value, name):
 def compute_joint_home_path(
     qpos: np.ndarray,
     home_qpos: np.ndarray,
-    planner: "HomePlanner",
+    planner: HomePlanner,
     *,
     table_z_surface_m: float,
     hand_safety_margin_m: float,
@@ -194,8 +203,8 @@ def compute_joint_home_path(
         target = home_qpos
         delta = float(np.max(np.abs(target - qpos)))
     else:
-        target = planner.kin.canonicalize_qpos(home_qpos, qpos)
-        delta = float(np.max(np.abs(planner.kin.compute_qpos_delta(target, qpos))))
+        target = planner.canonicalize_qpos(home_qpos, qpos)
+        delta = float(np.max(np.abs(equivalent_joint_delta(target, qpos))))
     if delta < np.deg2rad(0.15):
         return np.empty((0, 7), dtype=np.float64)
 
@@ -204,7 +213,7 @@ def compute_joint_home_path(
     def admitted(milestones, name):
         try:
             check_home_path(
-                interpolate_waypoints(milestones, np.deg2rad(1.0)),
+                milestones,
                 planner,
                 table_z_surface_m=table_z_surface_m,
                 hand_safety_margin_m=hand_safety_margin_m,
@@ -235,7 +244,7 @@ def compute_joint_home_path(
 def compute_band_alignment_path(
     wrapped_home: np.ndarray,
     canonical_home: np.ndarray,
-    planner: "HomePlanner",
+    planner: HomePlanner,
     *,
     table_z_surface_m: float,
     hand_safety_margin_m: float,
@@ -244,12 +253,12 @@ def compute_band_alignment_path(
     wrapped_home = home_joint_vector(wrapped_home, "wrapped home")
     canonical_home = home_joint_vector(canonical_home, "canonical home")
     delta = np.rad2deg(np.abs(wrapped_home - canonical_home))
-    if not np.any(delta[planner.kin.equivalent_joint_mask] > 1.0):
+    if not np.any(delta[np.asarray(XARM7_EQUIVALENT_JOINT_MASK, dtype=bool)] > 1.0):
         return np.empty((0, 7), dtype=np.float64)
     milestones = np.stack([wrapped_home, canonical_home])
     try:
         check_home_path(
-            interpolate_waypoints(milestones, np.deg2rad(1.0)),
+            milestones,
             planner,
             table_z_surface_m=table_z_surface_m,
             hand_safety_margin_m=hand_safety_margin_m,

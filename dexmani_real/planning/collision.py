@@ -383,28 +383,15 @@ class CollisionModel:
     def check_path(
         self,
         path: np.ndarray,
-        step_size: float = 0.02,
     ) -> tuple[int, CollisionInfo] | None:
-        """Return the first colliding segment/sample details; clear paths return None."""
+        """Check the owner's dense samples and return the first colliding sample index."""
         path = np.asarray(path, dtype=np.float64)
         if path.ndim != 2 or path.shape[1] != 7 or not np.isfinite(path).all():
             raise ValueError("collision path must be finite shape (N, 7)")
-        if not np.isfinite(step_size) or step_size <= 0:
-            raise ValueError("collision step_size must be finite and positive")
-        if len(path) == 0:
-            return None
-        first = self.check_collision_details(path[0])
-        if first:
-            return 0, first
-        for index, (start, end) in enumerate(zip(path[:-1], path[1:])):
-            start, end = self.to_full_qpos(start), self.to_full_qpos(end)
-            delta = end - start
-            count = max(1, int(np.ceil(float(np.max(np.abs(delta))) / step_size)))
-            for step in range(1, count + 1):
-                sample = start + (step / count) * delta
-                info = self.check_collision_details(sample)
-                if info:
-                    return index, info
+        for index, sample in enumerate(path):
+            info = self.check_collision_details(sample)
+            if info:
+                return index, info
         return None
 
     def get_geom_link_name(self, geom_id: int) -> str:

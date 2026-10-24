@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.planning.kinematics.pose import rot6d_to_rotmat
 from dexmani_real.replay.trajectory import TrajectoryData
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
@@ -185,18 +185,13 @@ def evaluate_replay(
         print("\nSkipping metrics: no valid reference or replay data available")
         return
     try:
-        fk = make_arm_fk()
-        count = len(replay_data["arm_qpos"])
-        eef_pos = np.empty((count, 3), dtype=np.float64)
-        eef_rot6d = np.empty((count, 6), dtype=np.float64)
-        for index, qpos in enumerate(replay_data["arm_qpos"]):
-            eef_pos[index], eef_rot6d[index] = fk.compute(qpos)
+        poses = compute_eef_pose_history_xarm_base(replay_data["arm_qpos"])
     except Exception as exc:
         raise RuntimeError(
             f"replay EEF derivation failed after physical capture was saved: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
-    derived = dict(replay_data, eef_pos=eef_pos, eef_rot6d=eef_rot6d)
+    derived = dict(replay_data, eef_pos=poses[:, :3], eef_rot6d=poses[:, 3:])
     metrics = compute_metrics(trajectory, derived, hand_start_duration_s=hand_start_duration_s)
     report_consistency(metrics)
     metrics_path = atomic_json_dump(metrics, Path(output_dir) / "metrics.json", ensure_ascii=False)

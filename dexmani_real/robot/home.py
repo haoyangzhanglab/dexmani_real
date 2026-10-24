@@ -39,10 +39,10 @@ def home_path(current, target, planner, config):
         )
     except ValueError:
         # Retry only when the equivalent representation gives different candidates.
-        if np.array_equal(planner.kin.canonicalize_qpos(target, current), target):
+        if np.array_equal(planner.canonicalize_qpos(target, current), target):
             raise
     wrapped = compute_joint_home_path(current, target, planner, **options)
-    start = wrapped[-1] if len(wrapped) else planner.kin.canonicalize_qpos(target, current)
+    start = wrapped[-1] if len(wrapped) else planner.canonicalize_qpos(target, current)
     alignment = compute_band_alignment_path(start, target, planner, **options)
     if len(alignment):
         tail = alignment[1:] if len(wrapped) else alignment

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import tempfile
-from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 
@@ -74,84 +73,64 @@ class CanonicalExporter:
         selected, excluded = select_episodes(source, exclude)
         rejected = {}
         staging = root = data = None
-        first_attrs = first_specs = None
-        ends, offset = [], 0
+        ends = []
         episode_ids = []
         arm_fk = hand_fk = hand_cloud = None
+        processing_attrs = dict(
+            format=CANONICAL_FORMAT,
+            action_semantics="absolute_joint_goal_not_next_step_arrival",
+            pointcloud_config=dict(
+                asdict(self.processing.pointcloud), sampling_method=SAMPLING_METHOD
+            ),
+            fingertip_link_names=list(self.processing.fingertip_link_names),
+            handbase_position_eef_m=list(self.processing.handbase_position_eef_m),
+            handbase_quat_eef_wxyz=list(self.processing.handbase_quat_eef_wxyz),
+            table_plane_abcd=self.processing.table_plane_abcd,
+        )
         try:
             for index, episode in enumerate(selected):
                 if progress_callback:
                     progress_callback(index, len(selected))
-                with ExitStack() as resources:
-                    try:
-                        for name in ("data.h5", "rgb.mp4"):
-                            try:
-                                (episode / name).stat()
-                            except FileNotFoundError as exc:
-                                raise RawDataError(f"missing required file: {name}") from exc
-                        reader = resources.enter_context(EpisodeReader(episode))
+                offset = ends[-1] if ends else 0
+                try:
+                    for name in ("data.h5", "rgb.mp4"):
+                        try:
+                            (episode / name).stat()
+                        except FileNotFoundError as exc:
+                            raise RawDataError(f"missing required file: {name}") from exc
+                    with EpisodeReader(episode) as reader:
                         camera, base_from_color, camera_parameters = validate_export_episode(reader)
                         task = text_attr(reader.meta, "task_label")
                         if any(ord(char) < 32 or ord(char) == 127 for char in task):
                             raise RawDataError(
                                 "invalid task metadata: task_name must not contain control characters"
                             )
-                    except RawDataError as exc:
-                        rejected[episode.name] = str(exc)
-                        logger.warning("Rejected %s: %s", episode.name, exc)
-                        continue
-                    frames = reader.num_frames
-                    specs = canonical_array_specs(
-                        self.processing.pointcloud.num_points,
-                        camera.intrinsics.height,
-                        camera.intrinsics.width,
-                        self.processing.hand_pointcloud.num_points,
-                    )
-                    period_ns, tolerance_ns = sampling_clock_ns(reader.control_hz)
-                    attrs = dict(
-                        format=CANONICAL_FORMAT,
-                        task_name=task,
-                        dt=reader.dt,
-                        timing_admission=dict(
-                            rule="adjacent_interval_and_cumulative_grid",
-                            period_ns=period_ns,
-                            tolerance_ns=tolerance_ns,
-                        ),
-                        action_semantics="absolute_joint_goal_not_next_step_arrival",
-                        depth_scale_m_per_unit=camera.depth_scale_m,
-                        pointcloud_config=dict(
-                            asdict(self.processing.pointcloud), sampling_method=SAMPLING_METHOD
-                        ),
-                        fingertip_link_names=list(self.processing.fingertip_link_names),
-                        handbase_position_eef_m=list(self.processing.handbase_position_eef_m),
-                        handbase_quat_eef_wxyz=list(self.processing.handbase_quat_eef_wxyz),
-                        table_plane_abcd=self.processing.table_plane_abcd,
-                    )
-                    # Reject mixed cache semantics before consuming the episode payload.
-                    if first_attrs is not None:
-                        if task != first_attrs["task_name"] or not np.isclose(
-                            reader.dt, first_attrs["dt"], rtol=0, atol=1e-12
-                        ):
-                            raise ValueError(
-                                f"{episode.name}: one canonical store requires uniform task and dt"
-                            )
-                        if (
-                            attrs["depth_scale_m_per_unit"]
-                            != first_attrs["depth_scale_m_per_unit"]
-                        ):
-                            raise ValueError(
-                                f"{episode.name}: depth_scale_m_per_unit must be uniform"
-                            )
-                        for key in specs:
-                            if specs[key] != first_specs[key]:
+                        height, width = camera.intrinsics.height, camera.intrinsics.width
+                        if ends:
+                            # Only these values vary by episode; the processing recipe is fixed.
+                            if task != root.attrs["task_name"] or not np.isclose(
+                                reader.dt, root.attrs["dt"], rtol=0, atol=1e-12
+                            ):
                                 raise ValueError(
-                                    f"{episode.name}: inconsistent {key} shape or dtype"
+                                    f"{episode.name}: one canonical store requires uniform task and dt"
                                 )
-                    row_bytes = sum(
-                        int(np.prod(tail)) * dtype.itemsize for tail, dtype in specs.values()
-                    )
-                    chunk = min(self.chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes))
-                    try:
+                            if camera.depth_scale_m != root.attrs["depth_scale_m_per_unit"]:
+                                raise ValueError(
+                                    f"{episode.name}: depth_scale_m_per_unit must be uniform"
+                                )
+                            if (height, width, 3) != specs["rgb"][0]:
+                                raise ValueError(f"{episode.name}: inconsistent rgb shape or dtype")
+                        else:
+                            specs = canonical_array_specs(
+                                self.processing.pointcloud.num_points, height, width,
+                                self.processing.hand_pointcloud.num_points,
+                            )
+                            row_bytes = sum(
+                                int(np.prod(tail)) * dtype.itemsize for tail, dtype in specs.values()
+                            )
+                            chunk = min(
+                                self.chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes)
+                            )
                         if hand_fk is None:
                             arm_fk = make_arm_fk()
                             hand_fk = HandKinematics(
@@ -159,7 +138,6 @@ class CanonicalExporter:
                                 self.processing.fingertip_link_names,
                             )
                             hand_cloud = HandPointCloudTemplate(self.processing.hand_pointcloud, hand_fk)
-                        attrs["hand_pointcloud_config"] = hand_cloud.recipe
                         blocks = iter_canonical_blocks(
                             reader,
                             self.processing,
@@ -171,7 +149,20 @@ class CanonicalExporter:
                             base_from_color=base_from_color,
                             camera_parameters=camera_parameters,
                         )
-                        if root is None:
+                        if not ends:
+                            period_ns, tolerance_ns = sampling_clock_ns(reader.control_hz)
+                            attrs = dict(
+                                processing_attrs,
+                                task_name=task,
+                                dt=reader.dt,
+                                timing_admission=dict(
+                                    rule="adjacent_interval_and_cumulative_grid",
+                                    period_ns=period_ns,
+                                    tolerance_ns=tolerance_ns,
+                                ),
+                                depth_scale_m_per_unit=camera.depth_scale_m,
+                                hand_pointcloud_config=hand_cloud.recipe,
+                            )
                             if staging is None:
                                 target.parent.mkdir(parents=True, exist_ok=True)
                                 staging = Path(
@@ -180,24 +171,15 @@ class CanonicalExporter:
                                     )
                                 )
                             root, data = self.create_store(staging, attrs, specs)
-                        count = append_episode(data, offset, blocks, specs, frames)
-                    except RawDataError as exc:
-                        for key, (tail, _) in specs.items():
-                            data[key].resize((offset, *tail))
-                        rejected[episode.name] = str(exc)
-                        logger.warning("Rejected %s: %s", episode.name, exc)
-                        if offset == 0:
-                            root = data = first_attrs = first_specs = None
-                        continue
-                    if first_attrs is None:
-                        first_attrs, first_specs = attrs, specs
-                    offset += count
-                    ends.append(offset)
-                    episode_ids.append(
-                        episode.name
-                        if episode == source
-                        else episode.relative_to(source).as_posix()
-                    )
+                        count = append_episode(data, offset, blocks, specs, reader.num_frames)
+                except RawDataError as exc:
+                    rejected[episode.name] = str(exc)
+                    logger.warning("Rejected %s: %s", episode.name, exc)
+                    continue
+                ends.append(offset + count)
+                episode_ids.append(
+                    episode.name if episode == source else episode.relative_to(source).as_posix()
+                )
             if not ends:
                 raise ValueError("all selected episodes were rejected; no Zarr written")
             root.create_group("meta").create_dataset(
@@ -210,7 +192,7 @@ class CanonicalExporter:
                 progress_callback(len(selected), len(selected))
             return dict(
                 episode_count=len(ends),
-                total_frames=offset,
+                total_frames=ends[-1],
                 rejected_episodes=rejected,
                 excluded_episodes=sorted(excluded),
             )
@@ -238,27 +220,32 @@ class CanonicalExporter:
 
 
 def append_episode(data, offset, blocks, specs, frames):
-    """Check every converted row and append it to the prepared destination."""
+    """Append a complete episode; invalid Raw rolls back only this episode's rows."""
     for key, (tail, _) in specs.items():
         data[key].resize((offset + frames, *tail))
     count = 0
-    for block in blocks:
-        rows = len(block["joint_state"])
-        if block.keys() != specs.keys():
-            raise ValueError("incomplete canonical modalities")
-        for key, values in block.items():
-            tail, dtype = specs[key]
-            if values.shape != (rows, *tail) or values.dtype != dtype:
-                raise ValueError(f"{key}: transformed shape/dtype mismatch")
-            if np.issubdtype(dtype, np.floating):
-                valid = np.isfinite(values).reshape(rows, -1).all(axis=1)
-                if not valid.all():
-                    row = count + int(np.flatnonzero(~valid)[0])
-                    raise RawDataError(f"canonical {key}: nonfinite values at row {row}")
-            data[key][offset + count : offset + count + rows] = values
-        count += rows
-    if count != frames:
-        raise ValueError("transformed row count differs from Raw")
+    try:
+        for block in blocks:
+            rows = len(block["joint_state"])
+            if block.keys() != specs.keys():
+                raise ValueError("incomplete canonical modalities")
+            for key, values in block.items():
+                tail, dtype = specs[key]
+                if values.shape != (rows, *tail) or values.dtype != dtype:
+                    raise ValueError(f"{key}: transformed shape/dtype mismatch")
+                if np.issubdtype(dtype, np.floating):
+                    valid = np.isfinite(values).reshape(rows, -1).all(axis=1)
+                    if not valid.all():
+                        row = count + int(np.flatnonzero(~valid)[0])
+                        raise RawDataError(f"canonical {key}: nonfinite values at row {row}")
+                data[key][offset + count : offset + count + rows] = values
+            count += rows
+        if count != frames:
+            raise ValueError("transformed row count differs from Raw")
+    except RawDataError:
+        for key, (tail, _) in specs.items():
+            data[key].resize((offset, *tail))
+        raise
     return count
 
 

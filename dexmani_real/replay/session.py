@@ -60,9 +60,6 @@ class ReplaySession:
                 stop_callback=self.runtime_state.request_stop,
                 estop_callback=self.runtime_state.request_emergency_stop,
             )
-            from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
-
-            make_arm_fk()
             self.home_planner = build_home_planner(self.runtime)
             self.keyboard.start()
             self.robot.check_services = lambda: self.keyboard.healthy

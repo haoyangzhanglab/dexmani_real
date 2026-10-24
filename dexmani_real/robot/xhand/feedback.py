@@ -88,7 +88,7 @@ class XHandFeedback:
             )
         self.previous_errors = errors
         frame = np.zeros(1, dtype=HAND_STATE_DTYPE)
-        frame["qpos"], frame["current"] = state.qpos, state.current_ma
+        frame["qpos"] = state.qpos
         for name, (values, valid_ns) in self.tactile_cache.items():
             held = update_tactile_cache(getattr(state, f"tactile_{name}"), values, valid_ns, now_ns)
             if held and name not in self.tactile_held:

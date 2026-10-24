@@ -116,8 +116,3 @@ class SharedMemoryRingBuffer:
     def latest_sequence(self) -> int:
         marker = int(self.slots[int(self.header[0])]["sequence"])
         return marker // 2 if marker and not marker & 1 else 0
-
-    def read_sequence(self, sequence: int) -> tuple[np.ndarray, int, int] | None:
-        if sequence <= 0:
-            return None
-        return self.copy_slot(sequence % self.maxlen, expected=sequence)

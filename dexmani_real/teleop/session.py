@@ -13,9 +13,9 @@ from dexmani_real.config.control import CollectionOptions
 from dexmani_real.config.experiment import (
     DEFAULT_TASK_NAME,
     resolve_runtime_table,
-    validate_task_dir_name,
-    validate_robot_config,
     validate_control_rate,
+    validate_robot_config,
+    validate_task_dir_name,
 )
 from dexmani_real.data.recorder import AsyncEpisodeRecorder
 from dexmani_real.ipc.channels import SensorChannels
@@ -25,20 +25,23 @@ from dexmani_real.robot.home import build_home_planner
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.observation import ObservationNeeds
+from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
-from dexmani_real.runtime.state import RuntimeState, RunEndReason
+from dexmani_real.runtime.state import RunEndReason, RuntimeState
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.vr.worker import run_vr_worker
+from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.controller import TeleopController
 from dexmani_real.teleop.runner import TeleopRunner
 from dexmani_real.teleop.vr_mapping import VRWristMapper
 from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger(__name__)
+END_AUDIO_GRACE_S = 3.0
 
 
 class TeleopSession:
-    """Own teleoperation components, startup and bounded shutdown."""
+    """Own teleoperation resources, operator input, startup and shutdown."""
 
     def __init__(
         self,
@@ -118,12 +121,19 @@ class TeleopSession:
         self.sensors = self.robot = None
         clean = False
         self.runner = None
+        keyboard = audio = None
         try:
             self.sensors = SensorProcesses(self.runtime_state, channels)
             self.robot = DexManiRobot(
                 self.runtime_state, self.runtime, check_services=self.sensors.check,
                 required_tactile=needs.required_tactile,
             )
+            keyboard = KeyboardInput(
+                estop_callback=self.runtime_state.request_emergency_stop,
+                stop_callback=self.runtime_state.request_stop,
+                quit_callback=lambda: self.runtime_state.request_stop(reason=RunEndReason.QUIT),
+            )
+            audio = AudioFeedback()
             self.runner = TeleopRunner(
                 self.runtime_state,
                 self.runtime,
@@ -134,6 +144,8 @@ class TeleopSession:
                 sensors=self.sensors,
                 controller=controller,
                 home_planner=home_planner,
+                keyboard=keyboard,
+                audio=audio,
                 recorder=(
                     AsyncEpisodeRecorder(
                         Path(__file__).resolve().parents[2]
@@ -151,9 +163,9 @@ class TeleopSession:
                     args=(channels, self.runtime.vr),
                 ),
             )
-            self.runner.keyboard.start()
+            keyboard.start()
             self.robot.check_services = lambda: (
-                self.runner.keyboard.healthy and self.sensors.check()
+                keyboard.healthy and self.sensors.check()
             )
             self.robot.connect()
             if needs.camera_worker:
@@ -165,7 +177,7 @@ class TeleopSession:
                     ),
                     ready=self.sensors.channels.camera_ready,
                     timeout_s=self.runtime.safety.camera_ready_timeout_s,
-                    check_services=lambda: self.runner.keyboard.healthy,
+                    check_services=lambda: keyboard.healthy,
                 )
             self.robot.check()
             self.runtime_state.arm()
@@ -178,12 +190,33 @@ class TeleopSession:
             logger.exception("teleop session failed")
         finally:
             self.runtime_state.revoke_motion(reason=RunEndReason.RUNTIME_SHUTDOWN)
+            cleanup_failed = False
             try:
-                if self.runner is not None:
-                    self.runner.close()
-            except Exception:
-                self.runtime_state.mark_error()
-                logger.exception("teleop capture/input cleanup failed")
+                try:
+                    if self.runner is not None:
+                        self.runner.close()
+                except Exception:
+                    cleanup_failed = True
+                    logger.exception("teleop capture cleanup failed")
+                try:
+                    # Preserve the final cue after capture finalization and before device shutdown.
+                    if audio is not None and not audio.wait_until_idle(timeout_s=END_AUDIO_GRACE_S):
+                        logger.warning("Final audio did not finish within %.1fs", END_AUDIO_GRACE_S)
+                except Exception:
+                    logger.warning("Final audio unavailable", exc_info=True)
+                for close in (
+                    keyboard.stop if keyboard is not None else None,
+                    audio.close if audio is not None else None,
+                ):
+                    if close is None:
+                        continue
+                    try:
+                        close()
+                    except Exception:
+                        cleanup_failed = True
+                        logger.exception("teleop input/audio cleanup failed")
+                if cleanup_failed:
+                    self.runtime_state.mark_error()
             finally:
                 shutdown_clean = shutdown_local_runtime(
                     self.runtime_state,

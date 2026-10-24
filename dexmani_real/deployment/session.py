@@ -31,7 +31,6 @@ from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runti
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics, camera_parameters_cv
 from dexmani_real.sensor.camera.worker import run_camera_worker
-from dexmani_real.sensor.pointcloud.worker import PointCloudWorkerConfig, run_pointcloud_worker
 from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -199,15 +198,15 @@ class PolicySession:
             self.camera_calibration = load_optional_camera_extrinsics(self.camera_calibration_path)
         else:
             self.camera_calibration = None
-        self.pointcloud_config = (
-            PointCloudWorkerConfig(
+        self.pointcloud_config = None
+        if self.needs.point_cloud:
+            from dexmani_real.sensor.pointcloud.worker import PointCloudWorkerConfig
+
+            self.pointcloud_config = PointCloudWorkerConfig(
                 pointcloud=self.runtime.pointcloud,
                 camera_calibration=self.camera_calibration,
                 table_plane_abcd=self.runtime.environment.table.plane_abcd,
             )
-            if self.needs.point_cloud
-            else None
-        )
         self.process_context = mp.get_context("spawn")
         self.runtime_state = RuntimeState()
         channels = (
@@ -313,6 +312,8 @@ class PolicySession:
                 check_services=lambda: self.keyboard.healthy,
             )
         if self.pointcloud_config is not None:
+            from dexmani_real.sensor.pointcloud.worker import run_pointcloud_worker
+
             self.sensors.start(
                 self.process_context.Process(
                     name="pointcloud",
