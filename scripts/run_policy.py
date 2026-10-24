@@ -100,12 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-record",
         action="store_true",
-        help="Disable Raw recording independently of --no-results",
-    )
-    parser.add_argument(
-        "--no-results",
-        action="store_true",
-        help="Disable evaluation summary independently of --no-record",
+        help="Disable Raw recording; evaluation results are always saved",
     )
     execution = parser.add_argument_group("Real execution")
     execution.add_argument(
@@ -198,7 +193,6 @@ def main(argv: list[str] | None = None) -> int:
         num_episodes=args.num_episodes,
         max_running_s=args.max_running_s,
         record_raw=not args.no_record,
-        record_results=not args.no_results,
         output=args.output,
         camera_calibration_path=args.camera_calibration,
     )

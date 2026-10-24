@@ -67,7 +67,6 @@ def run_policy(
     num_episodes=DEFAULT_NUM_EPISODES,
     max_running_s=DEFAULT_MAX_RUNNING_S,
     record_raw=True,
-    record_results=True,
     output=None,
     camera_calibration_path=None,
 ) -> int:
@@ -121,38 +120,34 @@ def run_policy(
     )
 
     camera_calibration_path = Path(camera_calibration_path or CAMERAS_PATH).expanduser().resolve()
-    session_dir = payload = None
-    if record_raw or record_results:
-        root = output or Path(__file__).resolve().parents[2] / "rollouts"
-        session_dir = session_directory(Path(root), info)
-        import dexmani_policy
+    root = output or Path(__file__).resolve().parents[2] / "rollouts"
+    session_dir = session_directory(Path(root), info)
+    import dexmani_policy
 
-        payload = {
-            "experiment": str(experiment),
-            "checkpoint": str(checkpoint),
-            "policy": info.to_dict(),
-            "future_steps": info.future_steps,
-            "runtime": asdict(runtime),
-            "camera_calibration_path": str(camera_calibration_path),
-            "effective_camera": None,
-            "table_plane_abcd": table_plane_abcd,
-            "table_plane_path": (
-                str(resolve_table_plane_path(runtime.environment.table))
-                if table_plane_abcd is not None else None
-            ),
-            "seed": seed,
-            "device": device,
-            "num_episodes": num_episodes,
-            "max_duration_s": max_running_s,
-            "output": str(session_dir),
-            "record_raw": record_raw,
-            "record_results": record_results,
-            "dexmani_real_head": git_head(Path(__file__).resolve().parents[2]),
-            "dexmani_policy_head": git_head(Path(dexmani_policy.__file__).resolve().parents[1]),
-        }
-        atomic_yaml_dump(payload, session_dir / "run_config.yaml")
-    elif output is not None:
-        print("--no-record --no-results: --output is unused; no session artifacts will be created")
+    payload = {
+        "experiment": str(experiment),
+        "checkpoint": str(checkpoint),
+        "policy": info.to_dict(),
+        "future_steps": info.future_steps,
+        "runtime": asdict(runtime),
+        "camera_calibration_path": str(camera_calibration_path),
+        "effective_camera": None,
+        "table_plane_abcd": table_plane_abcd,
+        "table_plane_path": (
+            str(resolve_table_plane_path(runtime.environment.table))
+            if table_plane_abcd is not None else None
+        ),
+        "seed": seed,
+        "device": device,
+        "num_episodes": num_episodes,
+        "max_duration_s": max_running_s,
+        "output": str(session_dir),
+        "record_raw": record_raw,
+        "record_results": True,
+        "dexmani_real_head": git_head(Path(__file__).resolve().parents[2]),
+        "dexmani_policy_head": git_head(Path(dexmani_policy.__file__).resolve().parents[1]),
+    }
+    atomic_yaml_dump(payload, session_dir / "run_config.yaml")
 
     print(f"策略：{experiment}；数值表示 recipe 与控制 dt 来自训练 artifact，设备和标定来自 Real")
     duration = f"{max_running_s:g} s" if max_running_s is not None else "无限制"
@@ -160,7 +155,7 @@ def run_policy(
         f"评估：{num_episodes if num_episodes is not None else '不限'} 轮正式运行结束后退出 | "
         f"每轮预算 {duration} | 输入：{', '.join(info.observation_fields)}"
     )
-    print(f"输出：{session_dir}" if session_dir else "输出：Raw 和评估摘要均关闭")
+    print(f"输出：{session_dir}")
     return PolicySession(
         runtime,
         info,
@@ -170,7 +165,7 @@ def run_policy(
         max_running_s=max_running_s,
         num_episodes=num_episodes,
         recording_dir=session_dir if record_raw else None,
-        results_dir=session_dir if record_results else None,
+        results_dir=session_dir,
         camera_calibration_path=camera_calibration_path,
         table_plane_abcd=table_plane_abcd,
         run_config=payload,

@@ -75,7 +75,7 @@ class PolicySession:
         self.capture_ids = count(1)
 
     def run(self):
-        """Run a session with independently optional Raw recording and evaluation summaries."""
+        """Run a session with required evaluation results and optional Raw recording."""
         configure_logging()
         print(
             f"执行：{self.info.checkpoint_path.name} ({self.info.weights}) | NFE={self.info.inference_steps} | "
