@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.config.environment import StaticCollisionBox, TableCollisionConfig
+from dexmani_real.config.environment import StaticCollisionBox, TableCollisionConfig, validate_table_plane
 from dexmani_real.robot.model import (
     ARM_JOINT_SHAPE,
     HAND_DOF,
@@ -53,6 +53,7 @@ class CollisionModel:
         *,
         static_boxes: Iterable[StaticCollisionBox] = (),
         table: TableCollisionConfig | None = None,
+        table_plane_abcd: tuple[float, float, float, float] | None = None,
     ) -> None:
         import pinocchio as pin
 
@@ -95,6 +96,7 @@ class CollisionModel:
         self.table = table if table is not None and table.enabled else None
         if self.table is not None:
             self.table.validate()
+            table_plane_abcd = validate_table_plane(table_plane_abcd)
         boxes = tuple(static_boxes)
         for box in boxes:
             box.validate()
@@ -127,7 +129,7 @@ class CollisionModel:
                     )
             if self.table is not None:
                 table_config = self.table
-                plane = np.asarray(table_config.plane_abcd, dtype=np.float64)
+                plane = np.asarray(table_plane_abcd, dtype=np.float64)
                 normal_norm = np.linalg.norm(plane[:3])
                 normal = plane[:3] / normal_norm
                 surface_origin = -(plane[3] / normal_norm) * normal

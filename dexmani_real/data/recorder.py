@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 import threading
@@ -16,7 +15,6 @@ from types import SimpleNamespace
 import numpy as np
 
 from dexmani_real.data.raw.writer import RawEpisodeWriter
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish, target_is_occupied
 
 logger = logging.getLogger(__name__)
@@ -37,35 +35,9 @@ class CaptureFinishRequest:
     technical_status: str = "failed"
 
 
-def snapshot_recording_metadata(sensors, *, camera_calibration, hand):
-    """Build physical HDF5 attributes from the active camera and consumed tactile semantics."""
-    serial = sensors.camera_serial.value.decode("utf-8")
-    if not serial.strip():
-        raise ValueError("recording START requires a nonempty camera serial")
-    color = CameraIntrinsics(**json.loads(sensors.camera_intrinsics.value.decode("utf-8")))
-    transform = None
-    if camera_calibration is None:
-        logger.warning("Recording without camera extrinsics: session has no calibration")
-    else:
-        try:
-            transform = camera_calibration.for_serial(serial)
-        except KeyError as exc:
-            logger.warning("Recording without camera extrinsics: %s", exc)
-    depth_scale = float(sensors.camera_depth_scale.value)
-    if not np.isfinite(depth_scale) or depth_scale <= 0:
-        raise ValueError("depth_scale must be finite and positive")
-    metadata = {
-        "camera_serial": serial,
-        "camera_payload_mode": "depth_to_color_aligned_rgbd",
-        "camera_color_width": color.width,
-        "camera_color_height": color.height,
-        "camera_color_intrinsics": color.matrix().reshape(-1),
-        "camera_color_distortion_model": color.distortion_model,
-        "camera_color_distortion_coeffs": np.asarray(color.distortion_coeffs, dtype=np.float64),
-        "depth_scale": depth_scale,
-    }
-    if transform is not None:
-        metadata["camera_T_xarm_base_from_color"] = transform.reshape(-1)
+def snapshot_recording_metadata(camera_snapshot, *, hand):
+    """复用初始化相机快照，补入当前 capture 消费的触觉处理语义。"""
+    metadata = camera_snapshot.metadata()
     if hand is not None:
         metadata.update(hand.get_tactile_reset_metadata())
         metadata.update(

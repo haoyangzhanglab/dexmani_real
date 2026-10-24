@@ -75,7 +75,7 @@ class PolicyEpisode:
         query_ids,
         capture_ids,
         recorder=None,
-        camera_calibration=None,
+        camera_snapshot=None,
         results=None,
     ):
         self.runtime_state = runtime_state
@@ -90,7 +90,7 @@ class PolicyEpisode:
         self.model = model_runtime
         self.recorder = recorder
         self.results = results
-        self.camera_calibration = camera_calibration
+        self.camera_snapshot = camera_snapshot
         self.max_running_s = max_running_s
         self.query_ids = query_ids
         self.capture_ids = capture_ids
@@ -299,7 +299,7 @@ class PolicyEpisode:
         epoch = self.preparing_epoch
         if self.recorder is not None:
             metadata = snapshot_recording_metadata(
-                self.sensors.channels, camera_calibration=self.camera_calibration, hand=self.robot.hand,
+                self.camera_snapshot, hand=self.robot.hand,
             )
             capture_id = next(self.capture_ids)
             self.recorder.start_episode(

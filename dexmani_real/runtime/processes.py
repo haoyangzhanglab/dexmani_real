@@ -12,8 +12,7 @@ logger = logging.getLogger(__name__)
 class SensorProcesses:
     """Own started sensor processes; workflows choose devices and start order."""
 
-    def __init__(self, runtime_state, channels=None):
-        self.runtime_state = runtime_state
+    def __init__(self, channels=None):
         self.channels = channels
         self.started = []
 
@@ -22,28 +21,22 @@ class SensorProcesses:
         if self.channels is not None:
             self.channels.is_running.value = False
 
-    def start(self, process, *, ready, timeout_s=None, check_services=None) -> None:
+    def start(self, process, *, ready, timeout_s=None, may_start) -> None:
         """Start ownership immediately; a timeout also requests a blocking readiness wait."""
         if timeout_s is not None and (not math.isfinite(timeout_s) or timeout_s <= 0):
             raise ValueError("readiness timeout must be finite and positive")
 
-        def allowed():
-            return (
-                (check_services is None or check_services())
-                and self.runtime_state.requests_allow_motion()
-            )
-
-        if not allowed():
+        if not may_start():
             raise RuntimeError("sensor startup cancelled")
         process.start()
         self.started.append((process, ready))
         if timeout_s is not None:
             deadline = time.monotonic() + timeout_s
             while time.monotonic() < deadline:
-                if not allowed() or not self.check():
+                if not may_start() or not self.check():
                     break
                 if ready.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
-                    if allowed() and self.check():
+                    if may_start() and self.check():
                         return
                     break
             raise RuntimeError(f"{process.name} failed to become ready")
@@ -90,8 +83,6 @@ class SensorProcesses:
             except Exception as exc:
                 errors.append(exc)
                 logger.exception("worker %s shutdown failed", process.name)
-        if errors or not clean:
-            self.request_shutdown()
         if errors:
             raise RuntimeError(f"sensor shutdown unresolved: {errors}") from errors[0]
         self.started.clear()

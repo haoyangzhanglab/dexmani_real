@@ -29,7 +29,7 @@ Controls:
         "episode",
         type=str,
         help=(
-            "Published dexmani.raw.v2 teleop episode directory (episodes/<task_name>/episode_*) "
+            "Published Raw teleop episode directory (episodes/<task_name>/episode_*) "
             "with a technically normal capture and complete finite submission-attempt targets."
         ),
     )

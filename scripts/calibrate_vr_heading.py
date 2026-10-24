@@ -216,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     ctx = mp.get_context("spawn")
     runtime_state = RuntimeState()
     channels = SensorChannels(ctx, vr=True)
-    sensors = SensorProcesses(runtime_state, channels)
+    sensors = SensorProcesses(channels)
     vr_proc = ctx.Process(
         name="vr", target=run_vr_worker, args=(channels, vr_config), daemon=True
     )
@@ -232,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
                 vr_proc,
                 ready=channels.vr_ready,
                 timeout_s=cfg.vr_ready_timeout_s,
+                may_start=runtime_state.requests_allow_motion,
             )
         except RuntimeError as exc:
             print(f"  ERROR: VR receiver startup failed: {exc}", flush=True)

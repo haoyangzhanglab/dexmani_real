@@ -6,7 +6,6 @@ import numpy as np
 
 from dexmani_real.utils.timing import sampling_clock_ns
 
-RAW_FORMAT = "dexmani.raw.v2"
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
 
 

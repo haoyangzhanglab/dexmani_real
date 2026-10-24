@@ -1,8 +1,6 @@
 """Own deployment resources, operator input and the multi-round experiment session."""
 
-import json
 import logging
-import math
 import multiprocessing as mp
 import time
 from concurrent.futures import CancelledError
@@ -12,91 +10,27 @@ from dexmani_real.calibration.camera.extrinsics import (
     CameraExtrinsics,
     load_optional_camera_extrinsics,
 )
+from dexmani_real.config.execution import DEFAULT_NUM_EPISODES
 from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError
 from dexmani_real.data.results import EpisodeResults, error_detail
 from dexmani_real.deployment.episode import PolicyEpisode, failure_reason
 from dexmani_real.deployment.observation import (
-    ObservationKinematics, build_policy_observation, policy_dependencies,
+    build_observation_kinematics, build_observation_camera, build_policy_observation,
 )
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
-from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
-from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.robot.commands import RobotError
-from dexmani_real.robot.home import build_home_planner, home_robot
-from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.robot import DexManiRobot
+from dexmani_real.runtime.home import build_home_planner, home_robot
+from dexmani_real.runtime.observation import service_feedback, snapshot_camera_parameters
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics, camera_parameters_cv
 from dexmani_real.sensor.camera.worker import run_camera_worker
+from dexmani_real.utils.atomic_io import atomic_yaml_dump
 from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger(__name__)
-
-
-def build_observation_kinematics(policy_info, runtime):
-    """Build requested geometry once; the inference worker owns all FK workspaces."""
-    dependencies = policy_dependencies(policy_info.observation_fields)
-    needs_hand_fk = "hand_fk" in dependencies
-    if "arm_fk" not in dependencies:
-        return None
-    execution = runtime.execution
-    minimum_gap = (
-        execution.action_steps + 1 if execution.execution_mode == "sync"
-        else min(execution.action_steps, execution.action_steps - execution.prefetch_steps + 1)
-    )
-    row_features = {} if policy_info.n_obs_steps > minimum_gap else None
-    if not needs_hand_fk:
-        return ObservationKinematics(make_arm_fk(), row_features=row_features)
-    hand_fk = HandKinematics(
-        str(XHAND_RIGHT_URDF_PATH),
-        policy_info.fingertip_link_names if "fingertips" in dependencies else None,
-    )
-    hand_cloud = None
-    if "hand_cloud" in dependencies:
-        from dexmani_real.planning.kinematics.hand_pointcloud import HandPointCloudTemplate
-
-        hand_cloud = HandPointCloudTemplate(runtime.hand_pointcloud, hand_fk)
-    return ObservationKinematics(
-        make_arm_fk(), hand_fk,
-        tuple(runtime.hand.T_eef_handbase_pos_xyz),
-        tuple(runtime.hand.T_eef_handbase_quat_wxyz),
-        hand_cloud, row_features,
-    )
-
-
-def build_observation_camera(sensors, camera_config, fields, calibration, *, depth_config=None):
-    """Read requested camera geometry and check the live depth scale after startup."""
-    requested = set(fields) & {"depth", "camera_intrinsic", "camera_extrinsic"}
-    if not requested:
-        return {}
-    if sensors is None or not sensors.camera_ready.is_set():
-        raise ValueError("Policy camera parameters require a ready camera")
-    serial = sensors.camera_serial.value.decode("utf-8").strip()
-    if not serial or (camera_config.serial is not None and serial != camera_config.serial):
-        raise ValueError(
-            "Policy camera parameters require the active camera serial to match configuration"
-        )
-    color = CameraIntrinsics(**json.loads(sensors.camera_intrinsics.value.decode("utf-8")))
-    if (color.height, color.width) != (camera_config.height, camera_config.width):
-        raise ValueError("Policy color intrinsics do not match the configured RGB resolution")
-    if sensors.camera_ring.dtype["rgb"].shape != (color.height, color.width, 3):
-        raise ValueError("Policy color intrinsics do not match the camera RGB payload")
-    if "depth" in requested:
-        scale = float(sensors.camera_depth_scale.value)
-        if depth_config is None or not math.isclose(
-            scale, depth_config["depth_scale_m"], rel_tol=1e-9, abs_tol=0.0
-        ):
-            raise ValueError("Live depth scale differs from the saved raw-count input recipe")
-    transform = None
-    if "camera_extrinsic" in requested:
-        if calibration is None:
-            raise ValueError("camera_extrinsic requires current camera calibration")
-        transform = calibration.for_serial(serial)
-    parameters = camera_parameters_cv(color, transform)
-    return {name: parameters[name] for name in requested - {"depth"}}
 
 
 def load_configured_policy(info, execution_config, *, device, seed):
@@ -129,12 +63,16 @@ class PolicySession:
         device="cuda:0",
         seed=0,
         max_running_s=None,
-        num_episodes=20,
+        num_episodes=DEFAULT_NUM_EPISODES,
         recording_dir=None,
         results_dir=None,
         camera_calibration_path=None,
+        table_plane_abcd=None,
+        run_config=None,
     ):
+        self.run_config = run_config
         self.runtime = runtime
+        self.table_plane_abcd = table_plane_abcd
         self.info = info
         self.device = device
         self.seed = seed
@@ -206,15 +144,7 @@ class PolicySession:
             self.camera_calibration = load_optional_camera_extrinsics(self.camera_calibration_path)
         else:
             self.camera_calibration = None
-        self.pointcloud_config = None
-        if self.needs.point_cloud:
-            from dexmani_real.sensor.pointcloud.worker import PointCloudWorkerConfig
-
-            self.pointcloud_config = PointCloudWorkerConfig(
-                pointcloud=self.runtime.pointcloud,
-                camera_calibration=self.camera_calibration,
-                table_plane_abcd=self.runtime.environment.table.plane_abcd,
-            )
+        self.camera_snapshot = None
         self.process_context = mp.get_context("spawn")
         self.runtime_state = RuntimeState()
         channels = (
@@ -228,16 +158,19 @@ class PolicySession:
             if self.needs.camera_worker
             else None
         )
-        self.sensors = SensorProcesses(self.runtime_state, channels)
+        self.sensors = SensorProcesses(channels)
         self.robot = DexManiRobot(
-            self.runtime, run_signal=self.runtime_state.run_signal,
+            self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
             stop_signal=self.runtime_state.stop_signal,
             emergency_signal=self.runtime_state.emergency_signal,
             signal_lock=self.runtime_state.motion_lock,
             check_services=self.sensors.check,
         )
 
-        self.kinematics = build_observation_kinematics(self.info, self.runtime)
+        self.kinematics = build_observation_kinematics(
+            self.info, execution=self.runtime.execution,
+            hand=self.runtime.hand, hand_pointcloud=self.runtime.hand_pointcloud,
+        )
         self.camera_parameters = None
         self.model = InferenceWorker(
             lambda: load_configured_policy(
@@ -271,8 +204,13 @@ class PolicySession:
             self.runtime.execution.rtc_guidance_cap,
             self.recording_dir is not None,
         )
-        self.action_mapper = ActionMapper.for_mode(self.runtime, self.info.action_mode)
-        self.home_planner = build_home_planner(self.runtime)
+        self.action_mapper = ActionMapper.for_mode(
+            self.info.action_mode, arm=self.runtime.arm, hand=self.runtime.hand,
+            motion=self.runtime.motion, environment=self.runtime.environment,
+        )
+        self.home_planner = build_home_planner(
+            self.runtime.environment, table_plane_abcd=self.table_plane_abcd,
+        )
         self.keyboard = KeyboardInput(
             estop_callback=self.runtime_state.request_emergency_stop,
             stop_callback=self.request_stop,
@@ -307,28 +245,45 @@ class PolicySession:
                 ),
                 ready=self.sensors.channels.camera_ready,
                 timeout_s=self.runtime.safety.camera_ready_timeout_s,
-                check_services=lambda: self.keyboard.healthy,
+                may_start=lambda: self.keyboard.healthy and self.runtime_state.requests_allow_motion(),
             )
-        if self.pointcloud_config is not None:
+            self.camera_snapshot = snapshot_camera_parameters(
+                self.sensors.channels, self.runtime.camera, self.camera_calibration,
+                require_extrinsics=self.needs.point_cloud or "camera_extrinsic" in self.info.observation_fields,
+            )
+        self.camera_parameters = build_observation_camera(
+            self.camera_snapshot, self.info.observation_fields, depth_config=self.info.depth_config,
+        )
+        if self.run_config is not None and self.camera_snapshot is not None:
+            self.run_config["effective_camera"] = {
+                "camera_T_xarm_base_from_color": None,
+                **self.camera_snapshot.metadata(),
+                "transform_direction": "color_optical_to_xarm_base",
+                "translation_units": "m",
+            }
+            atomic_yaml_dump(
+                self.run_config, (self.results_dir or self.recording_dir) / "run_config.yaml",
+            )
+        if self.needs.point_cloud:
             from dexmani_real.sensor.pointcloud.worker import run_pointcloud_worker
 
             self.sensors.start(
                 self.process_context.Process(
-                    name="pointcloud",
-                    target=run_pointcloud_worker,
-                    args=(self.sensors.channels, self.pointcloud_config),
+                    name="pointcloud", target=run_pointcloud_worker,
+                    args=(
+                        self.sensors.channels, self.runtime.pointcloud,
+                        self.camera_snapshot, self.table_plane_abcd,
+                    ),
                 ),
                 ready=self.sensors.channels.pointcloud_ready,
                 timeout_s=self.runtime.safety.pointcloud_ready_timeout_s,
-                check_services=lambda: self.keyboard.healthy,
+                may_start=lambda: self.keyboard.healthy and self.runtime_state.requests_allow_motion(),
             )
-        self.camera_parameters = build_observation_camera(
-            self.sensors.channels,
-            self.runtime.camera,
-            self.info.observation_fields,
-            self.camera_calibration,
-            depth_config=self.info.depth_config,
-        )
+        if self.needs.camera_static and self.needs.camera == "none" and not self.needs.point_cloud:
+            # Policy 无 VR worker，此分支只持有已初始化的相机。
+            if not self.sensors.shutdown(graceful_timeout_s=self.runtime.safety.shutdown_timeout_s):
+                raise RuntimeError("static camera failed to close normally")
+            self.sensors.channels = None
         self.robot.check()
         self.runtime_state.arm()
 
@@ -480,8 +435,6 @@ class PolicySession:
             elif signal is OperatorCommand.STOP:
                 # Keyboard callbacks already revoked motion; a second revoke could cross a cleared stop request.
                 continue
-            elif signal is OperatorCommand.PAUSE:
-                logger.warning("operator: C is not used in policy deployment; ignored")
             elif signal is OperatorCommand.DISCARD:
                 logger.warning("operator: D is not used in policy deployment; ignored")
             elif signal is OperatorCommand.RESET_TACTILE:
@@ -546,9 +499,10 @@ class PolicySession:
             logger.info("正在回初始位…")
             result = home_robot(
                 self.runtime_state,
-                self.runtime,
+                self.runtime.arm, self.runtime.hand,
                 self.home_planner,
                 robot=self.robot,
+                service=lambda: service_feedback(self.robot, self.runtime),
                 abort_requested=self.home_abort_requested,
             )
         except BaseException as exc:
@@ -642,7 +596,7 @@ class PolicySession:
                 capture_ids=self.capture_ids,
                 recorder=self.recorder,
                 results=self.results,
-                camera_calibration=self.camera_calibration,
+                camera_snapshot=self.camera_snapshot,
             )
         episode = self.episode
         before = episode.termination

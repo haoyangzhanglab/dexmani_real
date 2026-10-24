@@ -93,10 +93,19 @@ def validate_execution_config(info, execution) -> None:
             raise ValueError("rtc_guidance_cap requires an explicit finite nonnegative value")
 
 
-def validate_policy_inputs(
-    info: Any, runtime: Any,
+def validate_deployment_config(
+    info: Any, runtime: Any, *, needs,
 ) -> tuple[PointCloudConfig | None, HandPointCloudConfig | None]:
-    """Resolve inspected Policy recipes against the current Real capabilities."""
+    """Check Real constraints on inspected Policy metadata; no calibration I/O."""
+    validate_execution_config(info, runtime.execution)
+    if info.hand_history_steps is not None:
+        if (
+            info.action_mode != "joint"
+            or "joint_state" not in info.observation_fields
+            or (info.horizon, info.n_obs_steps, info.n_action_steps, runtime.execution.action_steps)
+            != (1, 1, 1, 1)
+        ):
+            raise ValueError("LAMP hand history requires joint, joint_state, H=Nobs=C=A_exec=1")
     if not runtime.hand.enabled:
         raise ValueError("Dexterous policy deployment requires hand.enabled=true")
     names = set(info.observation_fields)
@@ -111,27 +120,11 @@ def validate_policy_inputs(
             raise ValueError("Live fingertip_xyz requires five distinct non-empty link names")
     if "depth" in names and tuple(info.depth_config["shape"]) != runtime.camera.depth_shape:
         raise ValueError("Live camera shape differs from the saved depth input")
-    return (
+    recipes = (
         resolve_saved_pointcloud_recipe(info.pointcloud_config) if "point_cloud" in names else None,
         resolve_saved_hand_pointcloud_recipe(info.hand_pointcloud_config)
         if "hand_pointcloud" in names else None,
     )
-
-
-def validate_deployment_config(
-    info: Any, runtime: Any, *, needs,
-) -> tuple[PointCloudConfig | None, HandPointCloudConfig | None]:
-    """Check Real constraints on inspected Policy metadata; no calibration I/O."""
-    validate_execution_config(info, runtime.execution)
-    if info.hand_history_steps is not None:
-        if (
-            info.action_mode != "joint"
-            or "joint_state" not in info.observation_fields
-            or (info.horizon, info.n_obs_steps, info.n_action_steps, runtime.execution.action_steps)
-            != (1, 1, 1, 1)
-        ):
-            raise ValueError("LAMP hand history requires joint, joint_state, H=Nobs=C=A_exec=1")
-    recipes = validate_policy_inputs(info, runtime)
     validate_robot_config(runtime)
     validate_control_rate(runtime, 1.0 / info.control_dt_s)
     if needs.camera_worker:

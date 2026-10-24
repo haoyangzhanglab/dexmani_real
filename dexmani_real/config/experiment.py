@@ -65,6 +65,8 @@ def apply_config_overrides(current: Any, changes: Any) -> Any:
         if not isinstance(changes, Mapping):
             raise TypeError(f"{type(current).__name__} overrides must be a mapping")
         updated = dict(changes)
+        if isinstance(current, TableCollisionConfig) and "plane_abcd" in updated:
+            raise ValueError("environment.table.plane_abcd was removed; use plane_path")
         if isinstance(current, EnvironmentConfig) and "static_boxes" in updated:
             updated["static_boxes"] = tuple(
                 apply_config_overrides(StaticCollisionBox(), box) for box in updated["static_boxes"]
@@ -125,17 +127,6 @@ def validate_control_rate(cfg: ExperimentConfig, control_hz: float) -> None:
             )
 
 
-def resolve_runtime_table(cfg: ExperimentConfig, *, pointcloud=None) -> ExperimentConfig:
-    """One session snapshot for HOME and the effective (possibly saved) cloud recipe."""
-    table = cfg.environment.table
-    if table.enabled or (pointcloud is not None and pointcloud.remove_table):
-        table = dataclasses.replace(table, plane_abcd=resolve_table_plane(table))
-        cfg = dataclasses.replace(
-            cfg, environment=dataclasses.replace(cfg.environment, table=table)
-        )
-    return cfg
-
-
 def resolve_table_plane_path(table: TableCollisionConfig) -> Path:
     """Resolve the configured plane path relative to the repository root."""
     if table.plane_path is None:
@@ -146,10 +137,12 @@ def resolve_table_plane_path(table: TableCollisionConfig) -> Path:
     return path.resolve()
 
 
-def resolve_table_plane(table: TableCollisionConfig) -> tuple[float, float, float, float]:
-    """Read the current plane file, or use inline geometry when plane_path is null."""
-    if table.plane_path is None:
-        return validate_table_plane(table.plane_abcd)
+def resolve_table_plane(
+    table: TableCollisionConfig, *, required=True,
+) -> tuple[float, float, float, float] | None:
+    """仅在消费者需要时读取一次当前桌面，数值由装配层共享。"""
+    if not required:
+        return None
     plane_path = resolve_table_plane_path(table)
     with plane_path.open(encoding="utf-8") as stream:
         plane = json.load(stream)

@@ -58,7 +58,10 @@ class TrajectoryReplayer:
         self.capture_failed = False
         self.epoch = self.runtime_state.run_id
         self.capture = ReplayRecorder(trajectory.num_frames)
-        self.action_mapper = ActionMapper.for_mode(self.runtime, "joint")
+        self.action_mapper = ActionMapper.for_mode(
+            "joint", arm=self.runtime.arm, hand=self.runtime.hand,
+            motion=self.runtime.motion, environment=self.runtime.environment,
+        )
         self.previous_arm = None
         period_ns, _ = sampling_clock_ns(trajectory.fps)
         status, reason = ReplayStatus.COMPLETED, ""

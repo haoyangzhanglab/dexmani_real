@@ -9,8 +9,9 @@ from dexmani_real.data.results import EpisodeResults, error_detail
 from dexmani_real.replay.evaluation import evaluate_replay
 from dexmani_real.replay.replayer import ReplayOutcome, ReplayStatus, TrajectoryReplayer
 from dexmani_real.replay.trajectory import verify_replay_preflight
-from dexmani_real.robot.home import build_home_planner, home_robot, home_hand
 from dexmani_real.robot.robot import DexManiRobot
+from dexmani_real.runtime.home import build_home_planner, home_robot, home_hand
+from dexmani_real.runtime.observation import service_feedback
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.state import RuntimeState
@@ -32,7 +33,7 @@ class ReplaySession:
     def run(self):
         configure_logging()
         from dexmani_real.config.experiment import (
-            resolve_runtime_table,
+            resolve_table_plane,
             validate_robot_config,
             validate_control_rate,
         )
@@ -41,7 +42,9 @@ class ReplaySession:
             raise ValueError("hand_start_duration_s must be finite and >= 0")
         validate_robot_config(self.runtime)
         validate_control_rate(self.runtime, self.trajectory.fps)
-        self.runtime = resolve_runtime_table(self.runtime)
+        self.table_plane_abcd = resolve_table_plane(
+            self.runtime.environment.table, required=self.runtime.environment.table.enabled,
+        )
         target = Path(self.output_dir)
         if target.exists() and (not target.is_dir() or any(target.iterdir())):
             raise ValueError("replay output must be missing or empty")
@@ -54,7 +57,7 @@ class ReplaySession:
         try:
             self.runtime_state = RuntimeState()
             self.robot = DexManiRobot(
-                self.runtime, run_signal=self.runtime_state.run_signal,
+                self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
                 stop_signal=self.runtime_state.stop_signal,
                 emergency_signal=self.runtime_state.emergency_signal,
                 signal_lock=self.runtime_state.motion_lock,
@@ -65,7 +68,9 @@ class ReplaySession:
                 stop_callback=self.runtime_state.request_stop,
                 estop_callback=self.runtime_state.request_emergency_stop,
             )
-            self.home_planner = build_home_planner(self.runtime)
+            self.home_planner = build_home_planner(
+                self.runtime.environment, table_plane_abcd=self.table_plane_abcd,
+            )
             self.keyboard.start()
             self.robot.check_services = lambda: self.keyboard.healthy
             self.robot.connect()
@@ -73,7 +78,7 @@ class ReplaySession:
             self.runtime_state.arm()
             home_result = home_hand(
                 self.runtime_state,
-                self.runtime,
+                self.runtime.hand,
                 robot=self.robot,
                 abort_requested=lambda: (
                     bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
@@ -124,9 +129,10 @@ class ReplaySession:
                     if OperatorCommand.HOME in signals:
                         home_result = home_robot(
                             self.runtime_state,
-                            self.runtime,
+                            self.runtime.arm, self.runtime.hand,
                             self.home_planner,
                             robot=self.robot,
+                            service=lambda: service_feedback(self.robot, self.runtime),
                             abort_requested=lambda: (
                                 bool(
                                     self.runtime_state.estop_request

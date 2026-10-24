@@ -75,7 +75,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.print_config:
         runtime.collection.validate()
-        print(yaml.safe_dump(asdict(runtime), allow_unicode=True, sort_keys=False), end="")
+        sections = ["arm", "hand", "motion", "teleop", "collection", "vr", "safety", "environment"]
+        if runtime.collection.enabled:
+            sections.append("camera")
+        if runtime.hand.enabled:
+            sections.append(runtime.teleop.hand_retargeting_type + "_retargeting")
+        print("# 声明配置；CLI 专属参数仍需在命令行指定。")
+        for name in ("task_name", "vr_transform", "camera_calibration", "no_hand"):
+            print(f"# {name}: {getattr(args, name)}")
+        print(yaml.safe_dump(
+            {name: asdict(getattr(runtime, name)) for name in sections},
+            allow_unicode=True, sort_keys=False,
+        ), end="")
         return 0
     if not runtime.hand.enabled and not args.no_hand:
         parser.error("hand.enabled=false requires explicit --no-hand confirmation")

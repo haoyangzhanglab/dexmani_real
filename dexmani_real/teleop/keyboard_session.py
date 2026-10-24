@@ -5,15 +5,16 @@ import logging
 import numpy as np
 
 from dexmani_real.config.experiment import (
-    resolve_runtime_table,
+    resolve_table_plane,
     validate_keyboard_workspace,
     validate_robot_config,
 )
-from dexmani_real.planning.target import TargetChecker
 from dexmani_real.planning.kinematics.ik import OnlineIKConfig, make_online_ik_solver
+from dexmani_real.planning.target import TargetChecker
 from dexmani_real.robot.commands import OperationCancelled, RobotError
-from dexmani_real.robot.home import build_home_planner, home_robot
 from dexmani_real.robot.robot import DexManiRobot
+from dexmani_real.runtime.home import build_home_planner, home_robot
+from dexmani_real.runtime.jog import JogController, jog_motion_requested
 from dexmani_real.runtime.observation import (
     feedback_deadline_ns,
     read_observation, observation_issues, ObservationNeeds, service_feedback,
@@ -22,7 +23,6 @@ from dexmani_real.runtime.observation import (
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
-from dexmani_real.runtime.jog import JogController, jog_motion_requested
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import LoopRate
 
@@ -39,14 +39,16 @@ class KeyboardTeleopSession:
     def run(self):
         configure_logging()
         validate_robot_config(self.runtime)
-        self.runtime = resolve_runtime_table(self.runtime)
+        self.table_plane_abcd = resolve_table_plane(
+            self.runtime.environment.table, required=self.runtime.environment.table.enabled,
+        )
         self.workspace = validate_keyboard_workspace(self.runtime)
         if not self.runtime.hand.enabled and not self.no_hand:
             raise ValueError("hand-disabled operation requires --no-hand")
 
         self.runtime_state = RuntimeState()
         self.robot = DexManiRobot(
-            self.runtime, run_signal=self.runtime_state.run_signal,
+            self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
             stop_signal=self.runtime_state.stop_signal,
             emergency_signal=self.runtime_state.emergency_signal,
             signal_lock=self.runtime_state.motion_lock,
@@ -100,7 +102,9 @@ class KeyboardTeleopSession:
             workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
         )
         self.jog = JogController(solver, target_checker, self.jog_config, self.workspace)
-        self.home_planner = build_home_planner(self.runtime)
+        self.home_planner = build_home_planner(
+            self.runtime.environment, table_plane_abcd=self.table_plane_abcd,
+        )
         self.keys.start()
         if not self.keys.healthy:
             raise RuntimeError("keyboard stop listener unavailable")
@@ -138,9 +142,10 @@ class KeyboardTeleopSession:
             self.robot.stop()
             home_result = home_robot(
                 self.runtime_state,
-                self.runtime,
+                self.runtime.arm, self.runtime.hand,
                 self.home_planner,
                 robot=self.robot,
+                service=lambda: service_feedback(self.robot, self.runtime),
                 abort_requested=lambda: (
                     bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
                     or not self.keys.healthy

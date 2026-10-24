@@ -10,7 +10,6 @@ import numpy as np
 from dexmani_real.data.raw.schema import (
     ARM_ACTION_SEMANTICS,
     DATASET_SPECS,
-    RAW_FORMAT,
     TIMING_ROW_DTYPE,
     encode_raw_row,
     encode_timing_row,
@@ -132,7 +131,6 @@ class RawEpisodeWriter:
         ):
             raise RuntimeError("recording accepted/written/camera row count mismatch")
         self.meta.attrs.update(
-            format=RAW_FORMAT,
             num_frames=self.frame_count,
             termination_reason=reason,
             technical_status=technical_status,

@@ -22,10 +22,10 @@ class RobotState:
 
 class DexManiRobot:
     def __init__(
-        self, runtime, *, run_signal, stop_signal, emergency_signal, signal_lock,
+        self, arm_config, hand_config, *, run_signal, stop_signal, emergency_signal, signal_lock,
         arm_factory=None, hand_factory=None, check_services=None,
     ):
-        self.runtime = runtime
+        self.arm_config, self.hand_config = arm_config, hand_config
         self.run_signal, self.stop_signal = run_signal, stop_signal
         self.emergency_signal, self.signal_lock = emergency_signal, signal_lock
         self.arm_factory, self.hand_factory = arm_factory, hand_factory
@@ -36,7 +36,7 @@ class DexManiRobot:
         self.motion_active = False
         self.hand_stop_pending = False
         self.stop_failure = None
-        self.hand_feedback = XHandFeedback(runtime.hand)
+        self.hand_feedback = XHandFeedback(hand_config)
         self.idle_next_ns = 0
         self.input_signal = None
 
@@ -85,7 +85,7 @@ class DexManiRobot:
             from dexmani_real.robot.xarm7.executor import ArmExecutor
 
             self.arm = ArmExecutor(
-                self.runtime.arm, run_signal=self.run_signal, stop_signal=self.stop_signal,
+                self.arm_config, run_signal=self.run_signal, stop_signal=self.stop_signal,
                 emergency_signal=self.emergency_signal, signal_lock=self.signal_lock,
                 driver_factory=self.arm_factory, input_signal=self.input_signal,
             )
@@ -93,12 +93,12 @@ class DexManiRobot:
             if cancelled():
                 raise CancelledError("robot startup cancelled before hand connection")
             deadline_ns = None
-            if self.runtime.hand.enabled:
+            if self.hand_config.enabled:
                 if self.hand_factory is None:
                     from dexmani_real.robot.xhand.driver import XHand
 
                     self.hand_factory = XHand
-                self.hand = self.hand_factory(self.runtime.hand)
+                self.hand = self.hand_factory(self.hand_config)
                 deadline_ns = self.hand.connect(cancel_requested=cancelled)
             self.connected = True
             self.reset_hand_feedback(deadline_ns=deadline_ns)
@@ -203,8 +203,8 @@ class DexManiRobot:
                 raise RobotError("arm device unavailable")
             issue = check_arm_target(
                 command.arm_qpos,
-                joint_limit_lower_rad=np.asarray(self.runtime.arm.joint_limit_lower),
-                joint_limit_upper_rad=np.asarray(self.runtime.arm.joint_limit_upper),
+                joint_limit_lower_rad=np.asarray(self.arm_config.joint_limit_lower),
+                joint_limit_upper_rad=np.asarray(self.arm_config.joint_limit_upper),
             )
             if issue:
                 raise ValueError(f"unsafe arm target: {issue}")
@@ -215,8 +215,8 @@ class DexManiRobot:
                 raise RobotError("hand device unavailable")
             issue = check_hand_target(
                 command.hand_qpos,
-                mechanical_lower_rad=np.asarray(self.runtime.hand.mechanical_qpos_min_rad),
-                mechanical_upper_rad=np.asarray(self.runtime.hand.mechanical_qpos_max_rad),
+                mechanical_lower_rad=np.asarray(self.hand_config.mechanical_qpos_min_rad),
+                mechanical_upper_rad=np.asarray(self.hand_config.mechanical_qpos_max_rad),
             )
             if issue:
                 raise ValueError(f"unsafe hand target: {issue}")

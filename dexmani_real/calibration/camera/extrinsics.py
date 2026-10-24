@@ -146,9 +146,5 @@ def save_camera_calibration(
         cam_name = f"camera_{idx}"
 
     existing[cam_name] = entry
-    try:
-        json.dumps(existing, allow_nan=False)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("camera calibration payload must contain finite JSON values") from exc
     atomic_json_dump(existing, json_path, ensure_ascii=False, cancelled=cancelled)
     print(f"  calibration written → {json_path} (camera: {cam_name})")

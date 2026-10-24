@@ -44,19 +44,17 @@ collection:
   max_duration_s: 60.0
 teleop:
   control_hz: 16.0
-pointcloud:
-  num_points: 1024
 ```
 
 ```bash
 python scripts/collect_teleop.py --config local.yaml --print-config
 ```
 
-采集、导出、可视化、回放及策略入口共享同一配置结构与加载器；`collection` 仅由遥操作采集使用，不影响策略 rollout 的录制、时限或结果保存。字段以当前输出及[配置入口](dexmani_real/config/experiment.py)为准，未知字段和类型错误会报错。示例不替代设备地址、serial、工作空间与现场标定的核对。
+采集、导出、可视化、回放及策略入口共享同一配置结构与加载器；`collection` 仅由遥操作采集使用，不影响策略 rollout 的录制、时限或结果保存。teleop 仅展示所选手部重定向器；policy 的表示 recipe 来自训练 artifact，不接受本地 `pointcloud`／`hand_pointcloud` 覆盖。已知但无关的共享区段仍可加载，CLI 专属选项在输出注释中列出，仍须通过命令行指定。字段以当前输出及[配置入口](dexmani_real/config/experiment.py)为准，未知字段和类型错误会报错。示例不替代设备地址、serial、工作空间与现场标定的核对。
 
 XHand 默认通过 `/dev/ttyUSB0` 串口连接。使用 EtherCAT 时，设置 `hand.comm_type: ethercat` 并将 `hand.device_name` 设为实际网卡接口名；显式设为 `null` 才使用所选传输的设备发现。
 
-各入口的 `--help` 不连接设备；采集和策略入口的 `--print-config` 打印完整共享配置，可保存后再次用作 `--config`，不读取现场标定或加载策略。采集入口同时校验 `collection` 的运行约束，其他入口不执行采集专属校验。日志默认写入 `~/.dexmani/logs/`，可用 `DEXMANI_LOG_DIR` 指定位置。
+各入口的 `--help` 不连接设备；采集和策略入口的 `--print-config` 只打印本入口可用的声明区段，可保存后再次用作 `--config`，不读取现场标定或加载策略。采集入口同时校验 `collection` 的运行约束，其他入口不执行采集专属校验。日志默认写入 `~/.dexmani/logs/`，可用 `DEXMANI_LOG_DIR` 指定位置。
 
 ## 实验工作流
 
@@ -82,7 +80,7 @@ python scripts/tools/view_pointcloud.py --help
 
 `absent` 表示手未安装，`secured-home` 表示已物理固定在配置 HOME 手形；两者均按固定 HOME 手形检查碰撞。标定 jog 允许桌面接触，HOME 独立检查路径净空。采样、求解或目标被拒绝后，先释放全部 jog 键再继续移动。
 
-采集通过 `--vr-transform`、`--camera-calibration` 选择标定，部署支持 `--camera-calibration`；桌面文件由 `environment.table.plane_path` 指定。采集允许缺相机外参，点云重建需要数据对应的相机几何；质量为 `poor` 的 VR 标定不能用于遥操作启动。
+采集通过 `--vr-transform`、`--camera-calibration` 选择标定，部署支持 `--camera-calibration`；桌面仅由 `environment.table.plane_path` 指定；旧 YAML 的 `plane_abcd` 须删除，改用标定文件。碰撞和去桌都不需要时不读取该文件。采集允许缺相机外参，点云重建需要数据对应的相机几何；质量为 `poor` 的 VR 标定不能用于遥操作启动。
 
 ### 2. 遥操作与采集
 
@@ -95,12 +93,11 @@ python scripts/collect_teleop.py test --config local.yaml
 | 按键 | 遥操作行为 |
 | --- | --- |
 | H | 保存并结束当前段，整机 HOME 后等待新的 B |
-| B | 开始采集 |
-| C | 暂停或恢复；恢复开始新的 episode |
+| B | 空闲时开始新一段遥操作；启用录制时创建新 capture |
 | S | 停止并保存，回到空闲 |
 | D | 丢弃当前未发布 capture，回到空闲 |
 | T | 空闲且无 capture 时请求复位触觉；操作前确保五指无接触 |
-| Q | 暂停并进入退出确认，再按 Q 保存退出；空闲且无 capture 时直接退出 |
+| Q | 一次按键停止、保存并退出；空闲时直接退出 |
 | ESC | 请求急停 |
 
 `--control-hz` 同时设置目标、观测采样与录制频率，默认 16 Hz；机械臂伺服频率独立。调频影响反馈新鲜度预算与 EMA 时间响应，须记录实际配置。晚帧或反馈过期时停止并保留前缀，不追赶补发。
@@ -146,9 +143,9 @@ H 回 HOME、B 开始本轮、S 结束本轮；整理场景后再次按 H、B。
 
 默认最多 20 轮正式运行，每轮运行预算 60 秒，用 `--num-episodes`、`--max-duration` 调整；准备失败或取消不占轮数。预算不保证阻塞 SDK 或模型调用立即返回。checkpoint 默认 `latest`，其余推理选项见 `--help`。
 
-默认产物位于 `rollouts/policy/task/experiment/session_*/`；`run_config.yaml` 保存实际配置与模型信息，`session_result.json` 保存评估摘要。按摘要中的 Raw 路径定位采集，正式轮次与录制尝试不一一对应；准备失败或取消时，已启动且正常收尾的采集也会保留，包括零行采集。
+默认产物位于 `rollouts/policy/task/experiment/session_*/`；`run_config.yaml` 保存实际配置、模型信息及本次桌面数值／来源；相机初始化后、运动授权前补入实际 serial、内参、depth scale 和采用的外参（缺失时明确标注），`session_result.json` 保存评估摘要。按摘要中的 Raw 路径定位采集，正式轮次与录制尝试不一一对应；准备失败或取消时，已启动且正常收尾的采集也会保留，包括零行采集。
 
-`--no-record` 与 `--no-results` 分别关闭 Raw 和摘要，**均不关闭设备连接或动作执行**；同时关闭时不创建会话产物。相机按策略输入与录制需求的并集启动。控制与录制消费同一份采样，但分别检查所需来源；完整录制缺失必需数据会结束本轮，不自动转为只控制不录制。
+`--no-record` 与 `--no-results` 分别关闭 Raw 和摘要，**均不关闭设备连接或动作执行**；同时关闭时不创建会话产物。相机按策略输入与录制需求的并集启动；只有静态相机输入时，取得并记录参数后正常结束相机采集。控制与录制消费同一份采样，但分别检查所需来源；完整录制缺失必需数据会结束本轮，不自动转为只控制不录制。
 
 ### 5. 真机轨迹回放
 
@@ -178,11 +175,11 @@ RGB-D、点云和 episode 查看统一使用 Rerun，冻结、时间浏览、配
 
 ## 数据与安全边界
 
-**Raw 发布后不可变，Canonical 是可重建的训练缓存。** Raw 使用 `data.h5` 和 `rgb.mp4`，当前格式为 `dexmani.raw.v2`，保存实测观测、最终提交尝试目标、来源时间与终止原因，不再保存发送回执。RGB-D 按保存行对齐，视频按标称帧率编码，实际采样时刻以 HDF5 时间为准。
+**Raw 发布后不可变，Canonical 是可重建的训练缓存。** Raw 使用 `data.h5` 和 `rgb.mp4`，保存实测观测、最终提交尝试目标、来源时间与终止原因，不保存发送回执。RGB-D 按保存行对齐，视频按标称帧率编码，实际采样时刻以 HDF5 时间为准。
 
 停止、晚帧和控制失败保留真实前缀；仅操作者显式重录或丢弃才删除当前 capture。写入、编码、关闭或发布失败保留 staging。I/O 完整的失败采集可以发布 Raw，但采集技术失败或含 WAIT／缺失目标的段不能严格导出或回放。结束后的单独停止清理错误另存详情，不改写此前的采集结果；设备仍禁止自行重启。发布不证明任务成功、目标送达或设备停止。
 
-新 reader 明确拒绝旧 Raw 格式；历史文件保持原样，可使用对应旧提交查看，不提供原地迁移或混合格式读取。
+Raw 不维护格式版本号，读取和使用时直接检查必需字段、动作含义、时间来源与数据完整性。缺少这些信息的数据明确拒绝，不猜测或补齐。历史文件保持原样，需要时使用对应旧提交查看，不提供原地迁移或兼容读取分支。
 
 | 概念 | 数值含义 |
 | --- | --- |

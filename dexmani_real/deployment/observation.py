@@ -1,14 +1,19 @@
 """Fixed policy dependencies and projections of admitted physical rows."""
 
+import math
 from dataclasses import dataclass
 from typing import Mapping
 
 import numpy as np
 
-from dexmani_real.planning.kinematics.arm_fk import ArmFK, compute_eef_pose_history_xarm_base
+from dexmani_real.planning.kinematics.arm_fk import (
+    ArmFK, compute_eef_pose_history_xarm_base, make_arm_fk,
+)
 from dexmani_real.planning.kinematics.fingertip import compute_hand_geometry_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
+from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.runtime.observation import ObservationNeeds, freeze
+from dexmani_real.sensor.camera.geometry import camera_parameters_cv
 
 
 FIELD_DEPENDENCIES = {
@@ -59,7 +64,6 @@ class PolicyObservationRow:
     observation_timestamp_ns: int
     source_times: tuple[int, ...]
     values: Mapping
-    camera_sequence: int
 
 
 def policy_source_times(row, fields):
@@ -80,10 +84,12 @@ def policy_source_times(row, fields):
 
 
 def project_policy_row(row, fields):
-    values = {
-        "arm_qpos": row.arm["qpos"][0].copy(),
-        "hand_qpos": row.hand["qpos"][0].copy(),
-    }
+    dependencies = policy_dependencies(fields)
+    values = {}
+    if "arm" in dependencies:
+        values["arm_qpos"] = row.arm["qpos"][0].copy()
+    if "hand" in dependencies:
+        values["hand_qpos"] = row.hand["qpos"][0].copy()
     for name in fields:
         if name == "finger_tactile_force":
             # A structured-field view would retain the recording-only dense payload.
@@ -95,8 +101,63 @@ def project_policy_row(row, fields):
         elif name in {"rgb", "depth"}:
             values[name] = row.camera[name]
     return PolicyObservationRow(
-        row.observation_timestamp_ns, policy_source_times(row, fields), freeze(values), row.camera_sequence,
+        row.observation_timestamp_ns, policy_source_times(row, fields), freeze(values),
     )
+
+
+def build_observation_kinematics(policy_info, *, execution, hand, hand_pointcloud):
+    """Build requested geometry once; the inference worker owns all FK workspaces."""
+    dependencies = policy_dependencies(policy_info.observation_fields)
+    needs_hand_fk = "hand_fk" in dependencies
+    if "arm_fk" not in dependencies:
+        return None
+    minimum_gap = (
+        execution.action_steps + 1 if execution.execution_mode == "sync"
+        else min(execution.action_steps, execution.action_steps - execution.prefetch_steps + 1)
+    )
+    row_features = {} if policy_info.n_obs_steps > minimum_gap else None
+    if not needs_hand_fk:
+        return ObservationKinematics(make_arm_fk(), row_features=row_features)
+    hand_fk = HandKinematics(
+        str(XHAND_RIGHT_URDF_PATH),
+        policy_info.fingertip_link_names if "fingertips" in dependencies else None,
+    )
+    hand_cloud = None
+    if "hand_cloud" in dependencies:
+        from dexmani_real.planning.kinematics.hand_pointcloud import HandPointCloudTemplate
+
+        hand_cloud = HandPointCloudTemplate(hand_pointcloud, hand_fk)
+    return ObservationKinematics(
+        make_arm_fk(), hand_fk,
+        tuple(hand.T_eef_handbase_pos_xyz),
+        tuple(hand.T_eef_handbase_quat_wxyz),
+        hand_cloud, row_features,
+    )
+
+
+def build_observation_camera(camera, fields, *, depth_config=None):
+    """从已取得的静态快照构造模型输入，不读取设备或录制资源。"""
+    requested = set(fields) & {"depth", "camera_intrinsic", "camera_extrinsic"}
+    if not requested:
+        return {}
+    if camera is None:
+        raise ValueError("Policy camera parameters require an initialized camera")
+    if "depth" in requested and (
+        depth_config is None or not math.isclose(
+            camera.depth_scale_m, depth_config["depth_scale_m"], rel_tol=1e-9, abs_tol=0.0,
+        )
+    ):
+        raise ValueError("Live depth scale differs from the saved raw-count input recipe")
+    if "camera_extrinsic" in requested and camera.T_xarm_base_from_color is None:
+        raise ValueError("camera_extrinsic requires current camera calibration")
+    requested.discard("depth")
+    if not requested:
+        return {}
+    parameters = camera_parameters_cv(
+        camera.color,
+        camera.T_xarm_base_from_color if "camera_extrinsic" in requested else None,
+    )
+    return {name: parameters[name] for name in requested}
 
 
 def build_policy_observation(rows, policy_info, *, kinematics=None, camera_parameters=None):

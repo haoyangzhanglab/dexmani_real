@@ -21,6 +21,7 @@ class HomePlanner:
         workspace_bounds: np.ndarray | None = None,
         static_boxes: Iterable[StaticCollisionBox] = (),
         table: TableCollisionConfig | None = None,
+        table_plane_abcd: tuple[float, float, float, float] | None = None,
     ) -> None:
         self.workspace_bounds = None
         if workspace_bounds is not None:
@@ -33,7 +34,9 @@ class HomePlanner:
                 raise ValueError("workspace_bounds must be finite shape (3, 2) with lower <= upper")
             self.workspace_bounds = bounds.copy()
         self.arm_fk = make_arm_fk()
-        self.collision_model = CollisionModel(static_boxes=static_boxes, table=table)
+        self.collision_model = CollisionModel(
+            static_boxes=static_boxes, table=table, table_plane_abcd=table_plane_abcd,
+        )
 
     def canonicalize_qpos(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
         model = self.arm_fk.model

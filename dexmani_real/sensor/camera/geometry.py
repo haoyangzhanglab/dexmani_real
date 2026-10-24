@@ -11,6 +11,7 @@ from dexmani_real.utils.geometry import validate_rigid_transform
 
 __all__ = [
     "CameraIntrinsics",
+    "CameraSnapshot",
     "camera_parameters_cv",
     "validate_aligned_depth_distortion",
 ]
@@ -89,6 +90,43 @@ class CameraIntrinsics:
             [[self.fx, 0.0, self.ppx], [0.0, self.fy, self.ppy], [0.0, 0.0, 1.0]],
             dtype=dtype,
         )
+
+
+@dataclass(frozen=True)
+class CameraSnapshot:
+    """实际相机的静态参数；变换由 color optical frame 到 xArm base，平移单位米。"""
+
+    serial: str
+    color: CameraIntrinsics
+    depth_scale_m: float
+    T_xarm_base_from_color: np.ndarray | None
+
+    def __post_init__(self):
+        if not isinstance(self.serial, str) or not self.serial.strip():
+            raise ValueError("active camera serial must be nonempty")
+        object.__setattr__(self, "depth_scale_m", finite_positive(self.depth_scale_m, name="depth_scale"))
+        if self.T_xarm_base_from_color is not None:
+            transform = validate_rigid_transform(
+                self.T_xarm_base_from_color, label="T_xarm_base_from_color",
+            ).copy()
+            transform.setflags(write=False)
+            object.__setattr__(self, "T_xarm_base_from_color", transform)
+
+    def metadata(self):
+        color = self.color
+        values = {
+            "camera_serial": self.serial,
+            "camera_payload_mode": "depth_to_color_aligned_rgbd",
+            "camera_color_width": color.width,
+            "camera_color_height": color.height,
+            "camera_color_intrinsics": color.matrix().reshape(-1).tolist(),
+            "camera_color_distortion_model": color.distortion_model,
+            "camera_color_distortion_coeffs": list(color.distortion_coeffs),
+            "depth_scale": self.depth_scale_m,
+        }
+        if self.T_xarm_base_from_color is not None:
+            values["camera_T_xarm_base_from_color"] = self.T_xarm_base_from_color.reshape(-1).tolist()
+        return values
 
 
 def camera_parameters_cv(

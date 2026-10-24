@@ -12,7 +12,6 @@ import numpy as np
 from dexmani_real.data.raw.schema import (
     ARM_ACTION_SEMANTICS,
     DATASET_SPECS,
-    RAW_FORMAT,
     TIMING_ROW_DTYPE,
     validate_fixed_rate_rows,
 )
@@ -104,8 +103,6 @@ class EpisodeReader:
             if "meta" not in self.data_file or not isinstance(self.data_file["meta"], h5py.Group):
                 raise RawDataError("episode is missing meta")
             attrs = self.meta
-            if text_attr(attrs, "format") != RAW_FORMAT:
-                raise RawDataError(f"unsupported Raw format (expected {RAW_FORMAT!r})")
             if text_attr(attrs, "arm_action_semantics") != ARM_ACTION_SEMANTICS:
                 raise RawDataError("unknown arm action semantics")
             if text_attr(attrs, "timestamp_source") != "host_monotonic_relative":

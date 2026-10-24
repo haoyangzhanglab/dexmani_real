@@ -74,9 +74,6 @@ def print_depth_stats(depth_m: np.ndarray, vmin: float, vmax: float) -> None:
     )
 
 
-SNAPSHOT_SCHEMA_NAME = "dexmani-real-pointcloud-diagnostic-snapshot"
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="RealSense tabletop point-cloud processing and calibration diagnostic"
@@ -133,7 +130,6 @@ def save_diagnostic_snapshot(
         "T_xarm_base_from_color.npy": T_xarm_base_from_color,
     }
     metadata = {
-        "schema_name": SNAPSHOT_SCHEMA_NAME,
         "created_at": timestamp.isoformat(),
         "payload_mode": "depth_to_color_aligned_rgbd",
         "depth_payload_frame": "color",

@@ -7,7 +7,9 @@ import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from dexmani_real.config.experiment import resolve_runtime_table
+from dexmani_real.calibration import CAMERAS_PATH
+from dexmani_real.config.execution import DEFAULT_NUM_EPISODES, DEFAULT_MAX_RUNNING_S
+from dexmani_real.config.experiment import resolve_table_plane, resolve_table_plane_path
 from dexmani_real.deployment.observation import policy_needs
 from dexmani_real.deployment.preflight import (
     validate_deployment_config,
@@ -16,6 +18,7 @@ from dexmani_real.deployment.preflight import (
 )
 from dexmani_real.deployment.session import PolicySession
 from dexmani_real.runtime.observation import ObservationNeeds
+from dexmani_real.utils.atomic_io import atomic_yaml_dump
 
 
 def session_directory(root: Path, info) -> Path:
@@ -61,8 +64,8 @@ def run_policy(
     inference_steps=None,
     device="cuda:0",
     seed=0,
-    num_episodes=20,
-    max_running_s=60.0,
+    num_episodes=DEFAULT_NUM_EPISODES,
+    max_running_s=DEFAULT_MAX_RUNNING_S,
     record_raw=True,
     record_results=True,
     output=None,
@@ -98,14 +101,17 @@ def run_policy(
                 hand_cloud_recipe if hand_cloud_recipe is not None else runtime.hand_pointcloud
             ),
         )
-    runtime = resolve_runtime_table(runtime, pointcloud=cloud_recipe)
+    table_plane_abcd = resolve_table_plane(
+        runtime.environment.table,
+        required=runtime.environment.table.enabled or (cloud_recipe is not None and cloud_recipe.remove_table),
+    )
 
-    session_dir = None
+    camera_calibration_path = Path(camera_calibration_path or CAMERAS_PATH).expanduser().resolve()
+    session_dir = payload = None
     if record_raw or record_results:
         root = output or Path(__file__).resolve().parents[2] / "rollouts"
         session_dir = session_directory(Path(root), info)
         import dexmani_policy
-        import yaml
 
         payload = {
             "experiment": str(experiment),
@@ -113,20 +119,28 @@ def run_policy(
             "policy": info.to_dict(),
             "future_steps": info.future_steps,
             "runtime": asdict(runtime),
+            "camera_calibration_path": str(camera_calibration_path),
+            "effective_camera": None,
+            "table_plane_abcd": table_plane_abcd,
+            "table_plane_path": (
+                str(resolve_table_plane_path(runtime.environment.table))
+                if table_plane_abcd is not None else None
+            ),
             "seed": seed,
             "device": device,
             "num_episodes": num_episodes,
             "max_duration_s": max_running_s,
+            "output": str(session_dir),
             "record_raw": record_raw,
             "record_results": record_results,
             "dexmani_real_head": git_head(Path(__file__).resolve().parents[2]),
             "dexmani_policy_head": git_head(Path(dexmani_policy.__file__).resolve().parents[1]),
         }
-        (session_dir / "run_config.yaml").write_text(yaml.safe_dump(payload, sort_keys=False))
+        atomic_yaml_dump(payload, session_dir / "run_config.yaml")
     elif output is not None:
         print("--no-record --no-results: --output is unused; no session artifacts will be created")
 
-    print(f"策略：{experiment}")
+    print(f"策略：{experiment}；数值表示 recipe 与控制 dt 来自训练 artifact，设备和标定来自 Real")
     duration = f"{max_running_s:g} s" if max_running_s is not None else "无限制"
     print(
         f"评估：{num_episodes if num_episodes is not None else '不限'} 轮正式运行结束后退出 | "
@@ -144,4 +158,6 @@ def run_policy(
         recording_dir=session_dir if record_raw else None,
         results_dir=session_dir if record_results else None,
         camera_calibration_path=camera_calibration_path,
+        table_plane_abcd=table_plane_abcd,
+        run_config=payload,
     ).run()

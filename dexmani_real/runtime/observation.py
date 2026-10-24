@@ -1,5 +1,7 @@
 """One immutable consumption snapshot; consumers admit physical sources independently."""
 
+import json
+import logging
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -9,6 +11,7 @@ import numpy as np
 
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.xhand.feedback import hand_feedback_time_ns
+from dexmani_real.sensor.camera.geometry import CameraIntrinsics, CameraSnapshot
 from dexmani_real.utils.timing import sample_is_fresh
 
 
@@ -37,6 +40,29 @@ class ObservationNeeds:
             ),
             camera_static=self.camera_static or other.camera_static,
         )
+
+
+def snapshot_camera_parameters(channels, config, calibration, *, require_extrinsics=False):
+    """在 ready 边界复制相机静态参数，之后不再依赖 worker 或共享通道。"""
+    if not channels.camera_ready.is_set():
+        raise ValueError("camera parameters require a ready camera")
+    serial = channels.camera_serial.value.decode("utf-8").strip()
+    if config.serial is not None and serial != config.serial:
+        raise ValueError("active camera serial differs from configuration")
+    color = CameraIntrinsics(**json.loads(channels.camera_intrinsics.value.decode("utf-8")))
+    if (color.height, color.width) != (config.height, config.width):
+        raise ValueError("camera intrinsics differ from configured resolution")
+    transform = None
+    if calibration is not None:
+        try:
+            transform = calibration.for_serial(serial)
+        except KeyError:
+            if require_extrinsics:
+                raise
+            logging.getLogger(__name__).warning("No camera extrinsics for active serial %s", serial)
+    if require_extrinsics and transform is None:
+        raise ValueError("camera consumer requires current extrinsics")
+    return CameraSnapshot(serial, color, channels.camera_depth_scale.value, transform)
 
 
 def read_vr_frame(channels):

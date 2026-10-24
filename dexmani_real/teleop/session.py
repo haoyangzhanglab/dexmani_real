@@ -9,19 +9,19 @@ from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extr
 from dexmani_real.calibration.vr_heading import load_vr_transform
 from dexmani_real.config.experiment import (
     DEFAULT_TASK_NAME,
-    resolve_runtime_table,
+    resolve_table_plane,
     validate_control_rate,
     validate_robot_config,
     validate_task_dir_name,
 )
+from dexmani_real.data.recorder import RecordingError
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
-from dexmani_real.data.recorder import RecordingError
 from dexmani_real.robot.commands import RobotError
-from dexmani_real.robot.home import build_home_planner
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.observation import ObservationNeeds
+from dexmani_real.runtime.home import build_home_planner
+from dexmani_real.runtime.observation import ObservationNeeds, snapshot_camera_parameters
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, RuntimeState
@@ -65,7 +65,9 @@ class TeleopSession:
         self.runtime.vr.validate()
         if self.runtime.collection.enabled:
             self.runtime.camera.validate()
-        self.runtime = resolve_runtime_table(self.runtime)
+        self.table_plane_abcd = resolve_table_plane(
+            self.runtime.environment.table, required=self.runtime.environment.table.enabled,
+        )
         if not self.runtime.hand.enabled and (
             self.runtime.collection.enabled or not self.allow_no_hand
         ):
@@ -73,7 +75,10 @@ class TeleopSession:
         calibration = load_vr_transform(self.vr_transform_path)
         mapping = self.runtime.teleop.vr_mapping
         controller = TeleopController(
-            ActionMapper.for_mode(self.runtime, "eef"),
+            ActionMapper.for_mode(
+                "eef", arm=self.runtime.arm, hand=self.runtime.hand,
+                motion=self.runtime.motion, environment=self.runtime.environment,
+            ),
             VRWristMapper(
                 pos_scale=mapping.pos_scale,
                 vr_to_robot_rot=calibration.transform,
@@ -81,7 +86,9 @@ class TeleopSession:
             self.runtime.teleop.ema,
             self.build_hand_retargeter(),
         )
-        home_planner = build_home_planner(self.runtime)
+        home_planner = build_home_planner(
+            self.runtime.environment, table_plane_abcd=self.table_plane_abcd,
+        )
         camera_calibration = (
             load_optional_camera_extrinsics(self.camera_calibration_path)
             if self.runtime.collection.enabled
@@ -105,9 +112,9 @@ class TeleopSession:
         self.runner = None
         keyboard = audio = None
         try:
-            self.sensors = SensorProcesses(self.runtime_state, channels)
+            self.sensors = SensorProcesses(channels)
             self.robot = DexManiRobot(
-                self.runtime, run_signal=self.runtime_state.run_signal,
+                self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
                 stop_signal=self.runtime_state.stop_signal,
                 emergency_signal=self.runtime_state.emergency_signal,
                 signal_lock=self.runtime_state.motion_lock, check_services=self.sensors.check,
@@ -134,7 +141,6 @@ class TeleopSession:
                     / self.runtime.collection.episodes_dir / self.task_name
                     if self.runtime.collection.enabled else None
                 ),
-                camera_calibration=camera_calibration,
                 vr_process=ctx.Process(
                     name="vr",
                     target=run_vr_worker,
@@ -160,7 +166,10 @@ class TeleopSession:
                     ),
                     ready=self.sensors.channels.camera_ready,
                     timeout_s=self.runtime.safety.camera_ready_timeout_s,
-                    check_services=lambda: keyboard.healthy,
+                    may_start=lambda: keyboard.healthy and self.runtime_state.requests_allow_motion(),
+                )
+                self.runner.camera_snapshot = snapshot_camera_parameters(
+                    channels, self.runtime.camera, camera_calibration,
                 )
             self.robot.check()
             self.runtime_state.arm()

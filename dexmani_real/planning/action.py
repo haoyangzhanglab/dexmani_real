@@ -57,19 +57,19 @@ class ActionMapper:
             raise ValueError("action hand limits and home must be finite (12,) vectors")
 
     @classmethod
-    def for_mode(cls, runtime, mode):
+    def for_mode(cls, mode, *, arm, hand, motion, environment):
         """Online geometry permits table contact; HOME owns its separate path scene."""
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
         from dexmani_real.planning.collision import CollisionModel
 
         ik_config = OnlineIKConfig(
-            max_pose_error_pos_m=runtime.motion.ik_max_pose_error_pos_m,
-            max_pose_error_rot_rad=runtime.motion.ik_max_pose_error_rot_rad,
-            operational_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
-            operational_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
+            max_pose_error_pos_m=motion.ik_max_pose_error_pos_m,
+            max_pose_error_rot_rad=motion.ik_max_pose_error_rot_rad,
+            operational_joint_lower_rad=tuple(arm.joint_limit_lower),
+            operational_joint_upper_rad=tuple(arm.joint_limit_upper),
         )
-        static_boxes = runtime.environment.static_boxes
+        static_boxes = environment.static_boxes
         solver = make_online_ik_solver(ik_config, static_boxes=static_boxes) if mode == "eef" else None
         collision = (
             solver.collision_model
@@ -80,17 +80,17 @@ class ActionMapper:
             collision,
             joint_lower_rad=ik_config.operational_joint_lower_rad,
             joint_upper_rad=ik_config.operational_joint_upper_rad,
-            workspace=runtime.environment.workspace.as_array(),
-            workspace_margin_m=runtime.environment.eef_workspace_margin_m,
+            workspace=environment.workspace.as_array(),
+            workspace_margin_m=environment.eef_workspace_margin_m,
             dynamic_rejection=solver.dynamic_rejection if solver is not None else None,
         )
         return cls(
             checker,
             solver=solver,
-            hand_enabled=runtime.hand.enabled,
-            hand_lower_rad=runtime.hand.qpos_min_rad,
-            hand_upper_rad=runtime.hand.qpos_max_rad,
-            home_hand_qpos=np.deg2rad(runtime.hand.home_qpos_deg),
+            hand_enabled=hand.enabled,
+            hand_lower_rad=hand.qpos_min_rad,
+            hand_upper_rad=hand.qpos_max_rad,
+            home_hand_qpos=np.deg2rad(hand.home_qpos_deg),
         )
 
     def joint_rejection(self, target, hand, current, previous):

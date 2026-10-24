@@ -20,13 +20,10 @@ AUDIO_DIR = str(ASSET_DIR / "audio")
 
 EVENT_MAP: dict[str, str] = {
     "begin": "遥操作启动.wav",
-    "pause": "操作暂停.wav",
-    "resume": "工作继续.wav",
     "save": "成功保存轨迹.wav",
     "discard": "放弃保存轨迹.wav",
     "home": "即将回到初始姿态.wav",
     "home_done": "已经回到初始姿态.wav",
-    "quit": "准备退出遥操作.wav",
     "end": "操作结束.wav",
     "emergency": "意外的事情出现了.wav",
     "calibrated": "轴向已标定.wav",

@@ -8,6 +8,8 @@ import math
 from dataclasses import asdict
 from pathlib import Path
 
+from dexmani_real.config.execution import DEFAULT_NUM_EPISODES, DEFAULT_MAX_RUNNING_S
+
 
 def positive_int(raw: str) -> int:
     value = int(raw)
@@ -69,9 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num-episodes",
         type=positive_int,
-        default=20,
+        default=DEFAULT_NUM_EPISODES,
         help=(
-            "exit after N episodes that entered RUNNING have ended (default: 20); "
+            f"exit after N episodes that entered RUNNING have ended (default: {DEFAULT_NUM_EPISODES}); "
             "press B for each episode or Q to exit early; "
             "failed/cancelled preparations do not count; independent of Raw recording"
         ),
@@ -80,8 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-duration",
         dest="max_running_s",
         type=positive_running_seconds,
-        default=60.0,
-        help="per-episode cooperative duration budget from RUNNING admission (default: 60 seconds)",
+        default=DEFAULT_MAX_RUNNING_S,
+        help=(
+            "per-episode cooperative duration budget from RUNNING admission "
+            f"(default: {DEFAULT_MAX_RUNNING_S:g} seconds)"
+        ),
     )
     parser.add_argument(
         "--print-config",
@@ -166,7 +171,18 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
     if args.print_config:
-        print(yaml.safe_dump(asdict(runtime), allow_unicode=True, sort_keys=False), end="")
+        print("# 声明配置；数值表示 recipe 来自训练 artifact，此处不加载策略。")
+        print("# 以下 CLI 专属参数仍需在命令行指定：")
+        for name in (
+            "experiment", "checkpoint", "output", "camera_calibration", "no_record",
+            "no_results", "num_episodes", "max_running_s", "weights", "inference_steps", "seed", "device",
+        ):
+            print(f"# {name}: {getattr(args, name)}")
+        print(yaml.safe_dump(
+            {name: asdict(getattr(runtime, name)) for name in (
+                "execution", "arm", "hand", "motion", "safety", "camera", "environment",
+            )}, allow_unicode=True, sort_keys=False,
+        ), end="")
         return 0
 
     from dexmani_real.deployment.run import run_policy

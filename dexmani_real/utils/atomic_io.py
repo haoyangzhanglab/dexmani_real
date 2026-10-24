@@ -24,8 +24,6 @@ def atomic_publish(src: str | Path, dst: str | Path, *, cancelled=None) -> Path:
     target = Path(dst)
     if source.parent.resolve() != target.parent.resolve():
         raise OSError("temporary and final artifacts must share one parent filesystem")
-    if target_is_occupied(target):
-        raise FileExistsError(f"refusing to overwrite existing artifact: {target}")
     if cancelled is not None and cancelled():
         raise RuntimeError("artifact publication cancelled")
     # RENAME_NOREPLACE atomically checks occupancy; exists() cannot prevent publication races.
@@ -47,6 +45,22 @@ def atomic_publish(src: str | Path, dst: str | Path, *, cancelled=None) -> Path:
     return target
 
 
+def atomic_yaml_dump(obj: object, path: str | Path) -> Path:
+    """原子替换同一运行记录，失败时保留上一份已发布内容。"""
+    import yaml
+
+    target = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.tmp-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            yaml.safe_dump(obj, stream, allow_unicode=True, sort_keys=False)
+        os.replace(temporary, target)
+    except BaseException:
+        os.unlink(temporary)
+        raise
+    return target
+
+
 def atomic_json_dump(
     obj: object,
     path: str | Path,
@@ -55,14 +69,14 @@ def atomic_json_dump(
     cancelled=None,
     overwrite: bool = True,
 ) -> Path:
-    """Write JSON atomically; use overwrite=False to claim a new result path."""
+    """原子写入有限 JSON；overwrite=False 时禁止覆盖已有产物。"""
     target = Path(path)
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.tmp-", dir=str(parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(obj, stream, indent=2, ensure_ascii=ensure_ascii)
+            json.dump(obj, stream, indent=2, ensure_ascii=ensure_ascii, allow_nan=False)
         # Cancellation after this check cannot promise rollback of a published replacement.
         if cancelled is not None and cancelled():
             raise CancelledError("JSON publication cancelled")

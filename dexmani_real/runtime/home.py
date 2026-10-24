@@ -1,4 +1,4 @@
-"""Planned return-home with full path/environment collision checks."""
+"""协调手臂与手部 HOME，保留取消、反馈收敛及停止边界。"""
 
 import logging
 import time
@@ -6,17 +6,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.config.experiment import ExperimentConfig
 from dexmani_real.planning.home_planner import HomePlanner
-from dexmani_real.planning.paths import (
-    compute_band_alignment_path,
-    compute_joint_home_path,
-)
-from dexmani_real.utils.timing import sample_is_fresh
+from dexmani_real.planning.paths import home_path
 from dexmani_real.robot.commands import RobotCommand, OperationCancelled
-from dexmani_real.runtime.observation import service_feedback
 from dexmani_real.robot.xhand.limits import validate_hand_command_bounds
 from dexmani_real.runtime.state import SafetyState
+from dexmani_real.utils.timing import sample_is_fresh
 
 logger = logging.getLogger(__name__)
 HOME_CONSECUTIVE_SAMPLES = 3
@@ -29,28 +24,6 @@ class HomeResult:
     interrupted: bool = False
 
 
-def home_path(current, target, planner, config):
-    options = dict(
-        table_z_surface_m=config.table_z_surface_m,
-        hand_safety_margin_m=config.hand_safety_margin_m,
-    )
-    try:
-        return compute_joint_home_path(
-            current, target, planner, use_canonical_target=True, **options
-        )
-    except ValueError:
-        # Retry only when the equivalent representation gives different candidates.
-        if np.array_equal(planner.canonicalize_qpos(target, current), target):
-            raise
-    wrapped = compute_joint_home_path(current, target, planner, **options)
-    start = wrapped[-1] if len(wrapped) else planner.canonicalize_qpos(target, current)
-    alignment = compute_band_alignment_path(start, target, planner, **options)
-    if len(alignment):
-        tail = alignment[1:] if len(wrapped) else alignment
-        return np.concatenate((wrapped, tail))
-    return wrapped
-
-
 def execute_arm_home(
     runtime_state,
     home_qpos,
@@ -58,6 +31,7 @@ def execute_arm_home(
     robot,
     planner,
     config,
+    service,
     estop_requested=None,
     cancel_requested=None,
     progress=None,
@@ -113,7 +87,11 @@ def execute_arm_home(
     try:
         if hand_state is not None:
             planner.set_hand_qpos(hand_state["qpos"][0])
-        waypoints = home_path(state["qpos"][0], target, planner, config)
+        waypoints = home_path(
+            state["qpos"][0], target, planner,
+            table_z_surface_m=config.table_z_surface_m,
+            hand_safety_margin_m=config.hand_safety_margin_m,
+        )
     except Exception as exc:
         return HomeResult(False, f"home planning failed: {exc}")
     if aborted():
@@ -133,7 +111,7 @@ def execute_arm_home(
     try:
         ok = robot.home_arm(
             waypoints, target, epoch, lambda: aborted() or time.monotonic() >= deadline,
-            service=lambda: service_feedback(robot, robot.runtime),
+            service=service,
         )
         interrupted = not ok and time.monotonic() < deadline
         return HomeResult(
@@ -141,21 +119,16 @@ def execute_arm_home(
             "" if ok else "home interrupted" if interrupted else "arm home timed out",
             interrupted=interrupted,
         )
-    except BaseException as exc:
-        failure = exc
-
-        if isinstance(exc, KeyboardInterrupt):
-            runtime_state.request_emergency_stop()
-            raise
-        if not isinstance(exc, Exception):
-            raise
-        if not isinstance(exc, OperationCancelled):
-            raise
+    except OperationCancelled as exc:
         interrupted = time.monotonic() < deadline
-        failure = None  # OperationCancelled is handled; a cleanup failure must still propagate.
         return HomeResult(
             False, str(exc) if interrupted else "arm home timed out", interrupted=interrupted
         )
+    except BaseException as exc:
+        failure = exc
+        if isinstance(exc, KeyboardInterrupt):
+            runtime_state.request_emergency_stop()
+        raise
     finally:
         try:
             robot.stop()
@@ -166,42 +139,43 @@ def execute_arm_home(
             logger.exception("HOME cleanup also failed")
 
 
-def build_home_planner(runtime: ExperimentConfig) -> HomePlanner:
+def build_home_planner(environment, *, table_plane_abcd) -> HomePlanner:
     """Build HOME planning with current workspace/table/static geometry beyond online IK endpoint checks."""
     return HomePlanner(
-        workspace_bounds=runtime.environment.workspace.as_array(),
-        static_boxes=tuple(runtime.environment.static_boxes),
-        table=runtime.environment.table,
+        workspace_bounds=environment.workspace.as_array(),
+        static_boxes=tuple(environment.static_boxes),
+        table=environment.table,
+        table_plane_abcd=table_plane_abcd,
     )
 
 
-def home_robot(runtime_state, runtime, planner, *, robot, abort_requested) -> HomeResult:
+def home_robot(runtime_state, arm, hand, planner, *, robot, abort_requested, service) -> HomeResult:
     if runtime_state.safety_state != SafetyState.ARMED:
         return HomeResult(False, "home requires ARMED")
     failure = None
     try:
         hand_result = home_hand(
-            runtime_state, runtime, robot=robot, abort_requested=abort_requested
+            runtime_state, hand, robot=robot, abort_requested=abort_requested
         )
         if not hand_result.ok:
             return hand_result
         # Hand-disabled mode assumes the hand is absent or secured at home.
-        if not runtime.hand.enabled:
-            planner.set_hand_qpos(np.deg2rad(runtime.hand.home_qpos_deg))
-        result = execute_arm_home(
+        if not hand.enabled:
+            planner.set_hand_qpos(np.deg2rad(hand.home_qpos_deg))
+        return execute_arm_home(
             runtime_state,
-            runtime.arm.home_qpos,
+            arm.home_qpos,
             robot=robot,
             planner=planner,
-            config=runtime.arm,
+            config=arm,
+            service=service,
             cancel_requested=abort_requested,
             estop_requested=lambda: bool(runtime_state.estop_request),
             progress=logger.debug,
             hand_state_max_age_s=(
-                runtime.hand.feedback_max_age_s if runtime.hand.enabled else None
+                hand.feedback_max_age_s if hand.enabled else None
             ),
         )
-        return result
     except BaseException as exc:
         failure = exc
         if isinstance(exc, KeyboardInterrupt):
@@ -219,16 +193,15 @@ def home_robot(runtime_state, runtime, planner, *, robot, abort_requested) -> Ho
             logger.exception("combined HOME cleanup also failed")
 
 
-def home_hand(runtime_state, runtime, *, robot, abort_requested=None):
-    if not runtime.hand.enabled:
+def home_hand(runtime_state, hand, *, robot, abort_requested=None):
+    if not hand.enabled:
         return HomeResult(True)
-    cfg = runtime.hand
     target = validate_hand_command_bounds(
-        np.deg2rad(cfg.home_qpos_deg),
-        np.asarray(cfg.qpos_min_rad),
-        np.asarray(cfg.qpos_max_rad),
-        np.asarray(cfg.mechanical_qpos_min_rad),
-        np.asarray(cfg.mechanical_qpos_max_rad),
+        np.deg2rad(hand.home_qpos_deg),
+        np.asarray(hand.qpos_min_rad),
+        np.asarray(hand.qpos_max_rad),
+        np.asarray(hand.mechanical_qpos_min_rad),
+        np.asarray(hand.mechanical_qpos_max_rad),
     )
     if runtime_state.safety_state != SafetyState.ARMED:
         return HomeResult(False, "hand home requires ARMED")
@@ -239,7 +212,7 @@ def home_hand(runtime_state, runtime, *, robot, abort_requested=None):
         return HomeResult(False, "hand home requires ARMED authority", interrupted=True)
     if abort_requested is not None and abort_requested():
         return HomeResult(False, "home interrupted", interrupted=True)
-    deadline = time.monotonic_ns() + int(cfg.home_timeout_s * 1e9)
+    deadline = time.monotonic_ns() + int(hand.home_timeout_s * 1e9)
     try:
         robot.send_hand_home(RobotCommand(epoch, hand_qpos=target), valid_until_ns=deadline)
     except OperationCancelled:
@@ -249,7 +222,7 @@ def home_hand(runtime_state, runtime, *, robot, abort_requested=None):
     # Only feedback newer than submission completion can establish arrival.
     last_sample_ns = time.monotonic_ns()
     consecutive = 0
-    tolerance_rad = np.deg2rad(cfg.home_tolerance_deg)
+    tolerance_rad = np.deg2rad(hand.home_tolerance_deg)
     interrupted = False
     while time.monotonic_ns() < deadline:
         if abort_requested is not None and abort_requested():
@@ -268,7 +241,7 @@ def home_hand(runtime_state, runtime, *, robot, abort_requested=None):
                 last_sample_ns = stamp
                 qpos = sample["qpos"]
                 if (
-                    sample_is_fresh(stamp, cfg.feedback_max_age_s)
+                    sample_is_fresh(stamp, hand.feedback_max_age_s)
                     and np.isfinite(qpos).all()
                     and np.max(np.abs(qpos - target)) <= tolerance_rad
                 ):

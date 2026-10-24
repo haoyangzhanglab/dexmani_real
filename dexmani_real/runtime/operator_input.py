@@ -26,7 +26,6 @@ __all__ = [
 
 class OperatorCommand(Enum):
     BEGIN = "BEGIN"
-    PAUSE = "PAUSE"
     STOP = "STOP"
     DISCARD = "DISCARD"
     HOME = "HOME"
@@ -37,7 +36,6 @@ class OperatorCommand(Enum):
 
 KEY_MAP: dict[str, OperatorCommand] = {
     "b": OperatorCommand.BEGIN,
-    "c": OperatorCommand.PAUSE,
     "s": OperatorCommand.STOP,
     "d": OperatorCommand.DISCARD,
     "h": OperatorCommand.HOME,

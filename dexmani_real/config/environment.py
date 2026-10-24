@@ -79,7 +79,6 @@ class TableCollisionConfig:
 
     enabled: bool = True
     plane_path: str | None = "dexmani_real/calibration/state/table_plane.json"
-    plane_abcd: tuple[float, float, float, float] = (0.0, 0.0, 1.0, -0.022)
     size_xy_m: tuple[float, float] = (2.0, 2.0)
     thickness_m: float = 0.04
     # Includes the calibrated flange-model residual.
@@ -91,7 +90,6 @@ class TableCollisionConfig:
             not isinstance(self.plane_path, str) or not self.plane_path.strip()
         ):
             raise ValueError("table plane_path must be a non-empty string or null")
-        validate_table_plane(self.plane_abcd)
         size = np.asarray(self.size_xy_m, dtype=np.float64)
         if size.shape != (2,) or not np.isfinite(size).all():
             raise ValueError("table size_xy_m must be finite shape (2,)")

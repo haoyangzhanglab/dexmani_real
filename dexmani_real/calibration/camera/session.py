@@ -32,24 +32,24 @@ from dexmani_real.calibration.camera.hand_eye import (
 )
 from dexmani_real.config.experiment import (
     ExperimentConfig,
-    resolve_runtime_table,
+    resolve_table_plane,
     validate_keyboard_workspace,
     validate_robot_config,
 )
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.home_planner import HomePlanner
-from dexmani_real.planning.target import TargetChecker
 from dexmani_real.planning.kinematics.ik import OnlineIKConfig, OnlineIKSolver, make_online_ik_solver
 from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
+from dexmani_real.planning.target import TargetChecker
 from dexmani_real.robot.commands import OperationCancelled
-from dexmani_real.robot.home import build_home_planner, execute_arm_home
 from dexmani_real.robot.robot import DexManiRobot
+from dexmani_real.runtime.home import build_home_planner, execute_arm_home
+from dexmani_real.runtime.jog import JogController, jog_motion_requested
 from dexmani_real.runtime.observation import read_camera_frame, service_feedback
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, SafetyState, RuntimeState
 from dexmani_real.sensor.camera.worker import run_camera_worker
-from dexmani_real.runtime.jog import JogController, jog_motion_requested
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import LoopRate, sample_is_fresh
 
@@ -127,10 +127,10 @@ def detect_aruco_stable(
 
 
 def build_planner(
-    runtime: ExperimentConfig,
+    runtime: ExperimentConfig, *, table_plane_abcd,
 ) -> tuple[HomePlanner, OnlineIKSolver]:
     """Build HOME geometry and online IK with their separate collision scenes."""
-    planner = build_home_planner(runtime)
+    planner = build_home_planner(runtime.environment, table_plane_abcd=table_plane_abcd)
     home_hand_qpos = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
     planner.set_hand_qpos(home_hand_qpos)
     solver = make_online_ik_solver(
@@ -496,7 +496,7 @@ class CameraCalibrationSession:
                 self.camera_process,
                 ready=self.sensors.channels.camera_ready,
                 timeout_s=self.runtime.safety.camera_ready_timeout_s,
-                check_services=lambda: self.keys.healthy,
+                may_start=lambda: self.keys.healthy and self.runtime_state.requests_allow_motion(),
             )
             self.robot.check()
             self.runtime_state.arm()
@@ -650,6 +650,7 @@ class CameraCalibrationSession:
             robot=self.robot,
             planner=self.home_planner,
             config=self.runtime.arm,
+            service=lambda: service_feedback(self.robot, self.runtime),
             estop_requested=lambda: self.keys.is_pressed("esc") or not self.keys.healthy,
             cancel_requested=lambda: bool(self.runtime_state.quit_requested),
             progress=lambda message: print(f"  {message}", flush=True),
@@ -779,12 +780,14 @@ class CameraCalibrationSession:
                 "camera calibration requires hand.enabled=false and secured/absent hand"
             )
         validate_robot_config(self.runtime)
-        self.runtime = resolve_runtime_table(self.runtime)
+        self.table_plane_abcd = resolve_table_plane(
+            self.runtime.environment.table, required=self.runtime.environment.table.enabled,
+        )
         workspace = validate_keyboard_workspace(self.runtime)
         self.runtime.camera.validate()
         calib_cfg = self.calibration_config or CalibrationConfig()
         aruco_cfg = self.aruco_config or ArucoConfig()
-        planner, solver = build_planner(self.runtime)
+        planner, solver = build_planner(self.runtime, table_plane_abcd=self.table_plane_abcd)
         if self.hand_geometry == "absent":
             print(
                 "  XHand: absent (operator assertion); IK/home geometry conservatively "
@@ -809,12 +812,12 @@ class CameraCalibrationSession:
         self.ctx = mp.get_context("spawn")
         self.runtime_state = RuntimeState()
         self.sensors = SensorProcesses(
-            self.runtime_state, SensorChannels(self.ctx, camera=self.runtime.camera)
+            SensorChannels(self.ctx, camera=self.runtime.camera)
         )
         self.keys = None
         self.window_created = False
         self.robot = DexManiRobot(
-            self.runtime, run_signal=self.runtime_state.run_signal,
+            self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
             stop_signal=self.runtime_state.stop_signal,
             emergency_signal=self.runtime_state.emergency_signal,
             signal_lock=self.runtime_state.motion_lock,
