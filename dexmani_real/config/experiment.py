@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import json
 from collections.abc import Mapping
-from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,6 +13,7 @@ import numpy as np
 import yaml
 
 from dexmani_real.config.control import (
+    CollectionOptions,
     DexPilotRetargetingParams,
     KeyboardTeleopParams,
     MotionParams,
@@ -45,6 +45,7 @@ class ExperimentConfig:
     hand: HandParams = field(default_factory=HandParams)
     motion: MotionParams = field(default_factory=MotionParams)
     teleop: TeleopParams = field(default_factory=TeleopParams)
+    collection: CollectionOptions = field(default_factory=CollectionOptions)
     keyboard_teleop: KeyboardTeleopParams = field(default_factory=KeyboardTeleopParams)
     vr: VRParams = field(default_factory=VRParams)
     safety: SafetyParams = field(default_factory=SafetyParams)
@@ -170,18 +171,10 @@ def read_config_yaml(path: str | Path | None) -> dict:
 def load_experiment_config(
     *,
     yaml_path: str | Path | None = None,
-    data: Mapping[str, Any] | None = None,
     cli_overrides: Mapping[str, Any] | None = None,
 ) -> ExperimentConfig:
-    """Merge CLI > YAML/data > defaults without hardware/calibration I/O; consumers validate runtime values."""
-    if yaml_path is not None and data is not None:
-        raise ValueError("provide at most one of yaml_path or data")
-    loaded = data if data is not None else {}
-    if yaml_path is not None:
-        loaded = read_config_yaml(yaml_path)
-    if not isinstance(loaded, Mapping):
-        raise TypeError("experiment config root must be a mapping")
-    loaded = deepcopy(dict(loaded))
+    """合并 CLI > YAML > 默认值；运行约束由使用方校验，不连接设备或读取标定。"""
+    loaded = read_config_yaml(yaml_path)
     for key, value in (cli_overrides or {}).items():
         if value is None:
             continue

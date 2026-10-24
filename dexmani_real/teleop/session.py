@@ -9,7 +9,6 @@ import numpy as np
 from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extrinsics
 from dexmani_real.calibration.vr_heading import load_vr_transform
-from dexmani_real.config.control import CollectionOptions
 from dexmani_real.config.experiment import (
     DEFAULT_TASK_NAME,
     resolve_runtime_table,
@@ -47,14 +46,12 @@ class TeleopSession:
         self,
         runtime,
         *,
-        collection=CollectionOptions(),
         task_name=DEFAULT_TASK_NAME,
         allow_no_hand=False,
         vr_transform_path=VR_TRANSFORM_PATH,
         camera_calibration_path=None,
     ):
         self.runtime = runtime
-        self.collection = collection
         self.task_name = task_name
         self.allow_no_hand = allow_no_hand
         self.vr_transform_path = vr_transform_path
@@ -66,13 +63,13 @@ class TeleopSession:
         validate_robot_config(self.runtime)
         validate_control_rate(self.runtime, self.runtime.teleop.control_hz)
         self.runtime.teleop.validate()
-        self.collection.validate()
+        self.runtime.collection.validate()
         self.runtime.vr.validate()
-        if self.collection.enabled:
+        if self.runtime.collection.enabled:
             self.runtime.camera.validate()
         self.runtime = resolve_runtime_table(self.runtime)
         if not self.runtime.hand.enabled and (
-            self.collection.enabled or not self.allow_no_hand
+            self.runtime.collection.enabled or not self.allow_no_hand
         ):
             raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")
         calibration = load_vr_transform(self.vr_transform_path)
@@ -104,12 +101,12 @@ class TeleopSession:
         home_planner = build_home_planner(self.runtime)
         camera_calibration = (
             load_optional_camera_extrinsics(self.camera_calibration_path)
-            if self.collection.enabled
+            if self.runtime.collection.enabled
             else None
         )
         needs = ObservationNeeds(
-            camera="rgbd" if self.collection.enabled else "none", vr=True,
-            required_tactile=("aggregate", "dense") if self.collection.enabled else (),
+            camera="rgbd" if self.runtime.collection.enabled else "none", vr=True,
+            required_tactile=("aggregate", "dense") if self.runtime.collection.enabled else (),
         )
         ctx = mp.get_context("spawn")
         self.runtime_state = RuntimeState()
@@ -139,7 +136,6 @@ class TeleopSession:
                 self.runtime,
                 self.robot,
                 task_label=self.task_name,
-                max_record_duration_s=self.collection.max_duration_s,
                 needs=needs,
                 sensors=self.sensors,
                 controller=controller,
@@ -149,11 +145,11 @@ class TeleopSession:
                 recorder=(
                     AsyncEpisodeRecorder(
                         Path(__file__).resolve().parents[2]
-                        / self.collection.episodes_dir
+                        / self.runtime.collection.episodes_dir
                         / self.task_name,
                         control_hz=self.runtime.teleop.control_hz,
                     )
-                    if self.collection.enabled
+                    if self.runtime.collection.enabled
                     else None
                 ),
                 camera_calibration=camera_calibration,

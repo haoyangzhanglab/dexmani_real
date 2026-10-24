@@ -38,6 +38,8 @@ python scripts/run_policy.py --print-config
 将本次实验需要覆盖的字段保存为 `local.yaml`，例如：
 
 ```yaml
+collection:
+  max_duration_s: 60.0
 teleop:
   control_hz: 16.0
 pointcloud:
@@ -48,11 +50,11 @@ pointcloud:
 python scripts/collect_teleop.py --config local.yaml --print-config
 ```
 
-字段以当前输出及[配置入口](dexmani_real/config/experiment.py)为准，未知字段直接报错；采集还读取同一 YAML 中的 `collection` 选项。示例不替代设备地址、serial、工作空间与现场标定的核对。
+采集、导出、可视化、回放及策略入口共享同一配置结构与加载器；`collection` 仅由遥操作采集使用，不影响策略 rollout 的录制、时限或结果保存。字段以当前输出及[配置入口](dexmani_real/config/experiment.py)为准，未知字段和类型错误会报错。示例不替代设备地址、serial、工作空间与现场标定的核对。
 
 XHand 默认通过 `/dev/ttyUSB0` 串口连接。使用 EtherCAT 时，设置 `hand.comm_type: ethercat` 并将 `hand.device_name` 设为实际网卡接口名；显式设为 `null` 才使用所选传输的设备发现。
 
-各入口的 `--help` 不连接设备；`--print-config` 只打印声明配置，不读取现场标定或加载策略。日志默认写入 `~/.dexmani/logs/`，可用 `DEXMANI_LOG_DIR` 指定位置。
+各入口的 `--help` 不连接设备；采集和策略入口的 `--print-config` 打印完整共享配置，可保存后再次用作 `--config`，不读取现场标定或加载策略。采集入口同时校验 `collection` 的运行约束，其他入口不执行采集专属校验。日志默认写入 `~/.dexmani/logs/`，可用 `DEXMANI_LOG_DIR` 指定位置。
 
 ## 实验工作流
 

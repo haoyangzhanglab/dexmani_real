@@ -48,7 +48,6 @@ class TeleopRunner:
         keyboard,
         audio,
         camera_calibration=None,
-        max_record_duration_s=60.0,
     ):
         self.sensors = sensors
         self.needs = needs
@@ -56,7 +55,6 @@ class TeleopRunner:
         self.robot = robot
         self.vr_process = vr_process
         self.camera_calibration = camera_calibration
-        self.max_record_duration_s = max_record_duration_s
         self.task_label = task_label
         self.runtime = runtime
         self.recorder = recorder
@@ -535,7 +533,7 @@ class TeleopRunner:
             self.recorder is not None
             and self.recorder.is_recording
             and time.monotonic() - self.capture_started_s
-            >= self.max_record_duration_s
+            >= self.runtime.collection.max_duration_s
         ):
             self.pause_control("max_record_duration", run_end_reason=RunEndReason.TIMEOUT)
             self.end_segment(True, "max_record_duration")
