@@ -39,7 +39,7 @@ from dexmani_real.config.experiment import (
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.planning.target import TargetChecker
-from dexmani_real.planning.kinematics.ik import IKFailureKind, OnlineIKConfig, OnlineIKSolver, make_online_ik_solver
+from dexmani_real.planning.kinematics.ik import OnlineIKConfig, OnlineIKSolver, make_online_ik_solver
 from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.robot.commands import DispatchError
 from dexmani_real.robot.home import build_home_planner, execute_arm_home
@@ -49,13 +49,7 @@ from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, SafetyState, RuntimeState
 from dexmani_real.sensor.camera.worker import run_camera_worker
-from dexmani_real.runtime.jog import (
-    any_jog_key_held,
-    compute_cartesian_jog_delta,
-    jog_motion_requested,
-    propose_cartesian_jog_pose,
-    submit_jog_target,
-)
+from dexmani_real.runtime.jog import JogController, jog_motion_requested
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import LoopRate, sample_is_fresh
 
@@ -297,8 +291,8 @@ class CameraCalibrationSession:
         try:
             self.robot.stop()
         finally:
-            self.command_qpos = self.command_pose = None
-            self.blocked_until_release = True
+            self.jog.clear_reference()
+            self.jog.blocked_until_release = True
         return revoked and not self.cancel_requested()
 
     def read_capture_feedback(self):
@@ -643,8 +637,7 @@ class CameraCalibrationSession:
         if self.home_key_down:
             return False
         self.home_key_down = True
-        self.command_qpos = None
-        self.command_pose = None
+        self.jog.clear_reference()
 
         if self.runtime_state.safety_state == SafetyState.RUNNING:
             if not self.runtime_state.revoke_motion(SafetyState.ARMED):
@@ -670,8 +663,7 @@ class CameraCalibrationSession:
         self.feedback_timestamp_ns = int(refreshed["timestamp_ns"])
         if not home_result.ok:
             print("  WARNING: return-home request was not executed")
-        if not any_jog_key_held(self.keys.pressed_keys()):
-            self.blocked_until_release = False
+        self.jog.release_if_idle(self.keys.pressed_keys())
         self.rate.reset()
         return True
 
@@ -685,17 +677,15 @@ class CameraCalibrationSession:
             or not self.runtime_state.running
             or safety_state not in (SafetyState.ARMED, SafetyState.RUNNING)
         ):
-            self.command_qpos = None
-            self.command_pose = None
+            self.jog.clear_reference()
             self.fault("unexpected calibration motion state")
             return
-        if self.blocked_until_release:
+        if self.jog.blocked_until_release:
             if self.robot.stop_required:
                 self.runtime_state.revoke_motion()
                 self.robot.stop()
-                self.command_qpos = self.command_pose = None
-            if not any_jog_key_held(self.keys.pressed_keys()):
-                self.blocked_until_release = False
+                self.jog.clear_reference()
+            self.jog.release_if_idle(self.keys.pressed_keys())
             return
         keyboard = self.runtime.keyboard_teleop
         pressed_keys, generation = self.keys.snapshot()
@@ -704,7 +694,7 @@ class CameraCalibrationSession:
             if self.robot.stop_required:
                 self.runtime_state.revoke_motion()
                 self.robot.stop()
-                self.command_qpos = self.command_pose = None
+                self.jog.clear_reference()
             if self.frame % IDLE_STATUS_INTERVAL_FRAMES == 0:
                 measured_pose = self.solver.kin.compute_eef_pose_base(self.current_qpos)
                 print(
@@ -715,7 +705,7 @@ class CameraCalibrationSession:
             return
 
         if safety_state == SafetyState.ARMED:
-            self.command_qpos = self.command_pose = None
+            self.jog.clear_reference()
             if self.robot.stop_required:
                 self.robot.stop()
             try:
@@ -724,7 +714,7 @@ class CameraCalibrationSession:
                 if not exc.revoked:
                     raise
                 self.robot.stop()
-                self.command_qpos = self.command_pose = None
+                self.jog.clear_reference()
                 return
             # Mode preparation may block; IK must use feedback read afterwards.
             refreshed = self.robot.read_state().arm[0]
@@ -732,62 +722,34 @@ class CameraCalibrationSession:
             self.feedback_timestamp_ns = int(refreshed["timestamp_ns"])
             if self.keys.snapshot()[1] != generation:
                 return
-        baseline_qpos = self.command_qpos
-        baseline_pose = self.command_pose
-        if baseline_qpos is None:
-            baseline_qpos = self.current_qpos.copy()
-            baseline_pose = self.solver.kin.compute_eef_pose_base(self.current_qpos)
-        workspace_margin_m = keyboard.workspace_command_margin_m
-        command_low = self.workspace[:, 0] + workspace_margin_m
-        command_high = self.workspace[:, 1] - workspace_margin_m
-        dx, drpy = compute_cartesian_jog_delta(
-            pressed_keys, keyboard.delta_pos_m, keyboard.delta_rpy_rad
-        )
-        proposed_pose, desired_pos, changed = propose_cartesian_jog_pose(
-            baseline_pose, dx, drpy, command_low, command_high
+        proposed_pose, desired_pos, ik_result = self.jog.propose(
+            pressed_keys, self.current_qpos,
+            hand_qpos=np.deg2rad(self.runtime.hand.home_qpos_deg),
         )
         self.last_boundary_warning_s = log_workspace_clipping(
             desired_pos,
             proposed_pose.p,
             self.last_boundary_warning_s,
         )
-        if not changed:
-            self.blocked_until_release = True
+        if ik_result is None:
             return
-
-        ik_result = self.solver.solve(
-            proposed_pose,
-            self.current_qpos,
-            baseline_qpos,
-            endpoint_rejection=self.target_checker.endpoint_rejection,
-        )
-        if ik_result.failure_kind == IKFailureKind.INVALID_OUTPUT:
-            raise RuntimeError(f"online IK technical failure: {ik_result.reason}")
-        if not ik_result.success or ik_result.qpos is None:
+        if self.jog.blocked_until_release:
             now_s = time.monotonic()
             if now_s - self.last_ik_warning_s >= 1.0:
                 logger.warning("IK rejected target: %s", ik_result.reason or "unknown")
                 self.last_ik_warning_s = now_s
-            # Rejection does not renew the previous reference's bounded input lifetime.
-            self.blocked_until_release = True
             return
-
-        q_cmd = ik_result.qpos
-        next_qpos = q_cmd.copy()
-
-        def commit_reference():
-            self.command_pose, self.command_qpos = proposed_pose, next_qpos
 
         try:
             self.robot.arm.update_health(upstream_until_ns=2**63 - 1)
-            committed = submit_jog_target(
-                self.keys, generation, self.runtime_state, self.robot, q_cmd, epoch,
+            committed = self.jog.submit(
+                proposed_pose, ik_result.qpos, self.keys, generation,
+                self.runtime_state, self.robot, epoch,
                 valid_until_ns=self.feedback_timestamp_ns
                 + int(self.runtime.arm.feedback_max_age_s * 1e9)
                 + 1,
                 execute_until_ns=self.feedback_timestamp_ns
                 + int(keyboard.target_max_age_s * 1e9),
-                commit_reference=commit_reference,
             )
         except DispatchError as exc:
             if not exc.revoked:
@@ -797,7 +759,7 @@ class CameraCalibrationSession:
                 raise
             logger.info("calibration motion interrupted: dispatch=%s", exc.result)
             self.robot.stop()
-            self.command_qpos = self.command_pose = None
+            self.jog.clear_reference()
             return
         if committed is None:
             return
@@ -846,7 +808,6 @@ class CameraCalibrationSession:
             workspace=self.runtime.environment.workspace.as_array(),
             workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
         )
-        self.workspace = workspace
         self.calibration_config = calib_cfg
         self.aruco_config = aruco_cfg
         self.ctx = mp.get_context("spawn")
@@ -860,9 +821,8 @@ class CameraCalibrationSession:
             self.runtime_state, self.runtime, check_services=self.check_services
         )
         self.samples = CalibrationSamples()
-        self.command_qpos = self.command_pose = None
+        self.jog = JogController(solver, self.target_checker, self.runtime.keyboard_teleop, workspace)
         self.calibration_saved = False
         self.home_key_down = False
         self.frame = 0
         self.last_ik_warning_s = self.last_boundary_warning_s = 0.0
-        self.blocked_until_release = False

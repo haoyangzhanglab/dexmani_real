@@ -7,10 +7,8 @@ from enum import Enum
 
 import numpy as np
 
-from dexmani_real.planning.action import project_arm_command, project_hand_command
-from dexmani_real.planning.collision import CollisionModel
+from dexmani_real.planning.action import ActionMapper, project_arm_command, project_hand_command
 from dexmani_real.planning.paths import wrap_nearest_equivalent
-from dexmani_real.planning.target import TargetChecker
 from dexmani_real.replay.capture import ReplayRecorder
 from dexmani_real.robot.commands import (
     RobotCommand,
@@ -67,13 +65,7 @@ class TrajectoryReplayer:
         self.preparation_last_dispatch = None
         self.epoch = self.runtime_state.run_id
         self.capture = ReplayRecorder(trajectory.num_frames)
-        self.target_checker = TargetChecker(
-            CollisionModel(static_boxes=self.runtime.environment.static_boxes),
-            joint_lower_rad=self.runtime.arm.joint_limit_lower,
-            joint_upper_rad=self.runtime.arm.joint_limit_upper,
-            workspace=self.runtime.environment.workspace.as_array(),
-            workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
-        )
+        self.action_mapper = ActionMapper.for_mode(self.runtime, "joint")
         self.previous_arm = None
         period_ns, _ = sampling_clock_ns(trajectory.fps)
         status, reason = ReplayStatus.COMPLETED, ""
@@ -222,22 +214,11 @@ class TrajectoryReplayer:
             if row is None:
                 status, reason = ReplayStatus.REJECTED, "robot feedback stale"
                 break
-            arm = project_arm_command(
+            arm, hand, rejection = self.action_mapper.prepare_joint_target(
                 trajectory.action_arm_joint[index],
-                row.arm["qpos"][0],
-                joint_lower_rad=self.runtime.arm.joint_limit_lower,
-                joint_upper_rad=self.runtime.arm.joint_limit_upper,
-            )
-            hand = project_hand_command(
                 trajectory.action_hand_joint[index],
-                qpos_min_rad=self.runtime.hand.qpos_min_rad,
-                qpos_max_rad=self.runtime.hand.qpos_max_rad,
-            )
-            rejection = self.target_checker.rejection(
-                arm,
                 row.arm["qpos"][0],
                 self.previous_arm,
-                collision_hand_qpos=hand,
             )
             if rejection is not None:
                 self.capture.record(
@@ -431,7 +412,7 @@ class TrajectoryReplayer:
                     if step == steps
                     else hand_start + weight * (hand_target - hand_start)
                 )
-                rejection = self.target_checker.rejection(
+                rejection = self.action_mapper.target_checker.rejection(
                     arm_hold,
                     row.arm["qpos"][0],
                     arm_hold,

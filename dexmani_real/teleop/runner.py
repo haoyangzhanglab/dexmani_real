@@ -5,7 +5,9 @@ import time
 from concurrent.futures import CancelledError
 from enum import Enum
 
-from dexmani_real.data.recorder import RecordingError, snapshot_recording_metadata
+from dexmani_real.data.recorder import (
+    AsyncEpisodeRecorder, RecordingError, snapshot_recording_metadata,
+)
 from dexmani_real.data.results import error_detail
 from dexmani_real.robot.commands import RobotCommand, DispatchError, DispatchInterrupted
 from dexmani_real.robot.home import home_robot, home_hand
@@ -30,7 +32,7 @@ class TeleopPhase(str, Enum):
 
 
 class TeleopRunner:
-    """Own teleop control and capture lifecycle with the session's optional recorder."""
+    """持有遥操作控制和当前 capture；录制配置独立于 capture 是否存在。"""
 
     def __init__(
         self,
@@ -44,7 +46,7 @@ class TeleopRunner:
         controller,
         home_planner,
         vr_process,
-        recorder,
+        recording_dir,
         keyboard,
         audio,
         camera_calibration=None,
@@ -57,7 +59,8 @@ class TeleopRunner:
         self.camera_calibration = camera_calibration
         self.task_label = task_label
         self.runtime = runtime
-        self.recorder = recorder
+        self.recording_dir = recording_dir
+        self.recorder = None
         self.keyboard = keyboard
         self.audio = audio
         self.controller = controller
@@ -119,7 +122,7 @@ class TeleopRunner:
         self.preparing_epoch = self.control_run_id = None
 
     def finish_capture(self, save, reason, *, announce=True) -> None:
-        if self.recorder is None or not self.recorder.is_recording:
+        if self.recorder is None or not self.recorder.start_attempted:
             self.pending_termination_reason = None
             self.termination_details = []
             return
@@ -138,6 +141,8 @@ class TeleopRunner:
             )
         else:
             self.recorder.discard_episode(reason=reason)
+        self.recorder.check_error()
+        self.recorder = None
         self.pending_termination_reason = None
         self.termination_details = []
         if announce:
@@ -215,8 +220,10 @@ class TeleopRunner:
             self.preparing_epoch = self.runtime_state.run_id
         self.stop_motion("segment_stop")
         self.phase = TeleopPhase.PREPARING
-        if self.recorder is not None and self.recorder.is_recording:
+        if self.recorder is not None:
             self.finish_capture(True, "pause")
+            if self.recorder is not None:
+                raise RecordingError("previous capture still owns resources")
         if not self.preparation_valid():
             self.stop_capture("preparation_revoked")
             return
@@ -245,7 +252,10 @@ class TeleopRunner:
             self.stop_capture("preparation_unavailable")
             return
         self.control_run_id = None
-        if self.recorder is not None:
+        if self.recording_dir is not None:
+            self.recorder = AsyncEpisodeRecorder(
+                self.recording_dir, control_hz=self.runtime.teleop.control_hz,
+            )
             self.recorder.start_episode(
                 task_label=self.task_label,
                 collection_source="teleop",
@@ -621,7 +631,10 @@ class TeleopRunner:
                 failure = exc
             logger.exception("teleop recording cleanup failed")
         finally:
-            if self.recorder is not None:
+            if self.recorder is not None and (
+                self.recorder.finish_request is None or self.recorder.writer_pending
+            ):
+                # START 失败或首次收尾超时仍由当前 owner 等待；不重试写入。
                 try:
                     self.recorder.close()
                 except Exception as exc:

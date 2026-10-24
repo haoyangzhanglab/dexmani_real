@@ -13,14 +13,14 @@ class ReplayRecorder:
     def __init__(self, capacity: int) -> None:
         self.count = 0
         self.arm_qpos = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
-        self.arm_cmd = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
+        self.arm_candidate = np.full((capacity, *ARM_JOINT_SHAPE), np.nan, dtype=np.float64)
         self.arm_observation_ns = np.full(capacity, -1, dtype=np.int64)
         self.hand_observation_ns = np.full(capacity, -1, dtype=np.int64)
         self.submit_started_ns = np.full(capacity, -1, dtype=np.int64)
         self.submit_completed_ns = np.full(capacity, -1, dtype=np.int64)
         self.hand_qpos = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
         self.dispatch_status = np.zeros((capacity, 2), dtype=np.uint8)
-        self.hand_cmd = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
+        self.hand_candidate = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
 
     def record(
         self,
@@ -32,32 +32,32 @@ class ReplayRecorder:
         submit_started_ns: int = -1,
         submit_completed_ns: int = -1,
     ) -> None:
-        """Append one physical row; unavailable commands remain NaN with factual dispatch."""
+        """记录候选与真实 dispatch；未发送候选不能成为已提交命令。"""
         if idx != self.count or idx >= len(self.arm_qpos):
             raise ValueError("replay rows must be sequential and within capacity")
         self.dispatch_status[idx] = int(dispatch.arm), int(dispatch.hand)
         self.arm_qpos[idx] = row.arm["qpos"][0]
-        if dispatch.arm:
-            self.arm_cmd[idx] = command.arm_qpos
+        if command.arm_qpos is not None:
+            self.arm_candidate[idx] = command.arm_qpos
         # Source clocks belong to the consumed samples; submission does not imply arrival.
         self.arm_observation_ns[idx] = row.arm["timestamp_ns"][0]
         self.hand_observation_ns[idx] = row.hand["timestamp_ns"][0]
         self.submit_started_ns[idx] = submit_started_ns
         self.submit_completed_ns[idx] = submit_completed_ns
         self.hand_qpos[idx] = row.hand["qpos"][0]
-        if dispatch.hand:
-            self.hand_cmd[idx] = command.hand_qpos
+        if command.hand_qpos is not None:
+            self.hand_candidate[idx] = command.hand_qpos
         self.count = idx + 1
 
     def to_dict(self) -> dict[str, np.ndarray]:
-        """Copy only the measured prefix and submitted targets."""
+        """导出实测前缀和候选；是否发送由同一行的 dispatch 表达。"""
         count = self.count
         return {
             "dispatch_status": self.dispatch_status[:count].copy(),
             "arm_qpos": self.arm_qpos[:count].copy(),
             "hand_qpos": self.hand_qpos[:count].copy(),
-            "hand_cmd": self.hand_cmd[:count].copy(),
-            "arm_cmd": self.arm_cmd[:count].copy(),
+            "hand_candidate": self.hand_candidate[:count].copy(),
+            "arm_candidate": self.arm_candidate[:count].copy(),
             "arm_observation_ns": self.arm_observation_ns[:count].copy(),
             "hand_observation_ns": self.hand_observation_ns[:count].copy(),
             "submit_started_ns": self.submit_started_ns[:count].copy(),

@@ -91,7 +91,7 @@ def snapshot_recording_metadata(sensors, *, camera_calibration, hand):
 
 
 class AsyncEpisodeRecorder:
-    """One FIFO writer owns snapshots and I/O; revoke motion before blocking finalization."""
+    """单次 START 的 FIFO writer；阻塞收尾前由调用方撤销运动授权。"""
 
     def __init__(self, data_dir, *, control_hz):
         if not np.isfinite(control_hz) or control_hz <= 0:
@@ -106,6 +106,8 @@ class AsyncEpisodeRecorder:
         self.io_failed = False
         self.failed_dispatches = []
         self.is_recording = False
+        self.start_attempted = False
+        self.finish_request = None
         self.staging_path = self.episode_dir = self.published_path = None
         self.submitted_frames = 0
         self.writer = None
@@ -113,6 +115,10 @@ class AsyncEpisodeRecorder:
     @property
     def written_frames(self):
         return self.writer.frame_count if self.writer is not None else 0
+
+    @property
+    def writer_pending(self):
+        return self.thread is not None and self.thread.is_alive()
 
     def store_error(self, error, *, io=False):
         if io:
@@ -132,13 +138,9 @@ class AsyncEpisodeRecorder:
         metadata,
         episode_name=None,
     ):
-        self.check_error()
-        if self.is_recording or (self.thread is not None and self.thread.is_alive()):
-            raise RecordingError("previous recording still owns resources")
-        self.staging_path = self.episode_dir = self.published_path = None
-        self.submitted_frames = 0
-        self.writer = None
-        self.failed_dispatches = []
+        if self.start_attempted or self.finish_request is not None:
+            raise RecordingError("recorder permits only one START attempt")
+        self.start_attempted = True
         try:
             if not isinstance(task_label, str) or not task_label.strip():
                 raise ValueError("task_label must be a non-empty string")
@@ -171,9 +173,6 @@ class AsyncEpisodeRecorder:
                 suffix += 1
             staging.mkdir(exist_ok=False)
             self.staging_path, self.episode_dir = staging, destination
-            self.queue = Queue(maxsize=16)
-            self.ready.clear()
-            self.cancelled.clear()
             self.thread = threading.Thread(
                 target=self.write_episode,
                 args=(metadata,),
@@ -247,58 +246,52 @@ class AsyncEpisodeRecorder:
     ):
         was_recording, self.is_recording = self.is_recording, False
         thread = self.thread
-        if thread is None:
-            if self.io_failed:
-                self.check_error()
-            return self.published_path
         deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
         interrupted = None
         try:
-            if was_recording and thread.is_alive() and not self.cancelled.is_set():
+            if self.finish_request is None:
                 try:
-                    finish = CaptureFinishRequest(
+                    self.finish_request = CaptureFinishRequest(
                         save, reason, deepcopy(details), stop_result, technical_status
                     )
                 except BaseException as exc:
                     self.store_error(exc, io=True)
-                    finish = CaptureFinishRequest(True, reason, None)
+                    self.finish_request = CaptureFinishRequest(True, reason, None)
                     if not isinstance(exc, Exception):
                         interrupted = exc
-                self.queue.put(finish, timeout=max(0.0, deadline - time.monotonic()))
+            if was_recording and self.writer_pending and not self.cancelled.is_set():
+                self.queue.put(self.finish_request, timeout=max(0.0, deadline - time.monotonic()))
         except BaseException as exc:
             self.store_error(exc)
             self.cancelled.set()
             if not isinstance(exc, Exception):
                 interrupted = exc
         finally:
-            try:
-                thread.join(timeout=max(0.0, deadline - time.monotonic()))
-            except BaseException as exc:
-                self.store_error(exc)
-                self.cancelled.set()
-                if not isinstance(exc, Exception):
-                    interrupted = exc
-                thread.join(timeout=max(0.0, deadline - time.monotonic()))
-            if thread.is_alive():
-                self.store_error(
-                    TimeoutError("recording finalization timed out; staging remains owned")
-                )
-                self.cancelled.set()
-        if not thread.is_alive():
-            # An enqueue may have passed check_error before the writer failed,
-            # then reached the queue after its final drain. The producer is now stopped.
+            if thread is not None and thread.ident is not None:
+                try:
+                    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+                except BaseException as exc:
+                    self.store_error(exc)
+                    self.cancelled.set()
+                    if not isinstance(exc, Exception):
+                        interrupted = exc
+                    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+                if self.writer_pending:
+                    self.store_error(
+                        TimeoutError("recording finalization timed out; staging remains owned")
+                    )
+                    self.cancelled.set()
+        if not self.writer_pending:
+            # Writer 的末次 drain 之后仍可能有已越过 check_error 的提交。
             self.drain_unwritten_frames()
         if interrupted is not None:
             raise interrupted
-        if not thread.is_alive() and not save:
+        if not self.writer_pending and not save:
             if self.staging_path is not None:
                 shutil.rmtree(self.staging_path)
                 self.staging_path = None
-            self.thread = None
-            self.error = None
-            self.io_failed = False
             return None
-        if self.staging_path is not None and not thread.is_alive() and self.error is not None:
+        if self.staging_path is not None and not self.writer_pending and self.error is not None:
             # The failing encoder/HDF5 may already be closed when the last send
             # returns. Only unpublished staging receives this bounded evidence.
             dispatches = [*self.failed_dispatches]
@@ -311,13 +304,15 @@ class AsyncEpisodeRecorder:
             failure_path = self.staging_path / "capture_failure.json"
             if not failure_path.exists():
                 atomic_json_dump(
-                    dict(reason=reason, technical_status="failed", stop_result=stop_result,
-                         error=str(self.error), unwritten_dispatches=unique),
+                    dict(
+                        reason=self.finish_request.reason, technical_status="failed",
+                        stop_result=self.finish_request.stop_result,
+                        error=str(self.error), unwritten_dispatches=unique,
+                    ),
                     failure_path, overwrite=False,
                 )
         if self.io_failed or self.published_path is None:
             self.check_error()
-        self.thread = None
         return self.published_path
 
     def write_episode(self, metadata):

@@ -108,8 +108,6 @@ class PolicyEpisode:
             deque(maxlen=policy_info.hand_history_steps)
             if policy_info.hand_history_steps is not None else None
         )
-        # A START attempt needs finalization even when the writer never becomes ready.
-        self.capture_attempted = False
         self.plan = self.query = None
         self.preparation_issue = None
         self.observation_read_issues = []
@@ -217,47 +215,44 @@ class PolicyEpisode:
 
     def finalize_outputs(self, reason, detail, errors, *, duration_s, stop_result):
         failure, raw = None, None
-        try:
-            if self.recorder is not None and self.capture_attempted:
-                saved = None
-                try:
-                    saved = self.recorder.save_episode(
-                        reason=reason,
-                        details=[dict(stage="termination", reason=detail), *errors],
-                        stop_result=stop_result,
-                        technical_status=(
-                            "normal" if not errors and (
-                                reason in {"operator", "quit"}
-                                or (reason == "timeout" and detail == "duration_timeout")
-                            ) else "failed"
-                        ),
-                    )
-                    status = "published" if saved is not None else "not_published"
-                except BaseException as exc:
-                    failure, status = exc, "failed"
-                    errors.append(error_detail("recorder_finalize", exc))
-                raw = dict(
-                    status=status,
-                    path=str(saved) if saved is not None else None,
-                    staging_path=(
-                        str(self.recorder.staging_path)
-                        if self.recorder.staging_path is not None and saved is None
-                        else None
+        if self.recorder is not None and self.recorder.start_attempted:
+            saved = None
+            try:
+                saved = self.recorder.save_episode(
+                    reason=reason,
+                    details=[dict(stage="termination", reason=detail), *errors],
+                    stop_result=stop_result,
+                    technical_status=(
+                        "normal" if not errors and (
+                            reason in {"operator", "quit"}
+                            or (reason == "timeout" and detail == "duration_timeout")
+                        ) else "failed"
                     ),
-                    row_count=self.recorder.written_frames,
                 )
-            if self.results is not None:
-                try:
-                    self.results.finish_episode(
-                        reason, details=detail, errors=errors, raw=raw, duration_s=duration_s
-                    )
-                except BaseException as exc:
-                    failure = failure or exc
-                    self.results.record_errors([error_detail("evaluation_save", exc)])
-            if failure is not None:
-                raise failure
-        finally:
-            self.capture_attempted = False
+                status = "published" if saved is not None else "not_published"
+            except BaseException as exc:
+                failure, status = exc, "failed"
+                errors.append(error_detail("recorder_finalize", exc))
+            raw = dict(
+                status=status,
+                path=str(saved) if saved is not None else None,
+                staging_path=(
+                    str(self.recorder.staging_path)
+                    if self.recorder.staging_path is not None and saved is None
+                    else None
+                ),
+                row_count=self.recorder.written_frames,
+            )
+        if self.results is not None:
+            try:
+                self.results.finish_episode(
+                    reason, details=detail, errors=errors, raw=raw, duration_s=duration_s
+                )
+            except BaseException as exc:
+                failure = failure or exc
+                self.results.record_errors([error_detail("evaluation_save", exc)])
+        if failure is not None:
+            raise failure
 
     def observation_issue(self, row):
         if row is None and self.observation_read_issues:
@@ -324,7 +319,6 @@ class PolicyEpisode:
             metadata = snapshot_recording_metadata(
                 self.sensors.channels, camera_calibration=self.camera_calibration, hand=self.robot.hand,
             )
-            self.capture_attempted = True
             capture_id = next(self.capture_ids)
             self.recorder.start_episode(
                 task_label=self.policy_info.task_name,

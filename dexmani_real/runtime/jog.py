@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import Pose, quat_multiply
 from dexmani_real.robot.commands import DispatchError, DispatchResult, DispatchStatus, RobotCommand
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
@@ -20,6 +21,64 @@ if TYPE_CHECKING:
 CARTESIAN_JOG_KEYS = frozenset(
     {"w", "s", "a", "d", "up", "down", "left", "right", "i", "k", "j", "l"}
 )
+
+
+class JogController:
+    """持有成功提交的目标参考；跟踪误差不改变操作者目标。"""
+
+    def __init__(self, solver, target_checker, config, workspace):
+        self.solver, self.target_checker = solver, target_checker
+        self.config, self.workspace = config, workspace
+        self.command_pose = self.command_qpos = None
+        self.blocked_until_release = False
+
+    def clear_reference(self):
+        self.command_pose = self.command_qpos = None
+
+    def release_if_idle(self, pressed_keys):
+        if not any_jog_key_held(pressed_keys):
+            self.blocked_until_release = False
+
+    def propose(self, pressed_keys, measured_qpos, *, hand_qpos):
+        baseline_qpos, baseline_pose = self.command_qpos, self.command_pose
+        if baseline_qpos is None:
+            baseline_qpos = measured_qpos.copy()
+            baseline_pose = self.solver.kin.compute_eef_pose_base(measured_qpos)
+        dx, drpy = compute_cartesian_jog_delta(
+            pressed_keys, self.config.delta_pos_m, self.config.delta_rpy_rad
+        )
+        pose, desired_position, changed = propose_cartesian_jog_pose(
+            baseline_pose, dx, drpy,
+            self.workspace[:, 0] + self.config.workspace_command_margin_m,
+            self.workspace[:, 1] - self.config.workspace_command_margin_m,
+        )
+        result = None
+        if changed:
+            self.solver.collision_model.set_hand_qpos(hand_qpos)
+            result = self.solver.solve(
+                pose, measured_qpos, baseline_qpos,
+                endpoint_rejection=self.target_checker.endpoint_rejection,
+            )
+            if result.failure_kind == IKFailureKind.INVALID_OUTPUT:
+                raise RuntimeError(f"online IK technical failure: {result.reason}")
+        if result is None or not result.success or result.qpos is None:
+            self.blocked_until_release = True
+        return pose, desired_position, result
+
+    def submit(
+        self, pose, target, keys, generation, runtime_state, robot, epoch, *,
+        valid_until_ns, execute_until_ns,
+    ):
+        next_pose, next_qpos = pose.copy(), target.copy()
+
+        def commit_reference():
+            self.command_pose, self.command_qpos = next_pose, next_qpos
+
+        return submit_jog_target(
+            keys, generation, runtime_state, robot, target, epoch,
+            valid_until_ns=valid_until_ns, execute_until_ns=execute_until_ns,
+            commit_reference=commit_reference,
+        )
 
 
 def any_jog_key_held(active_keys: Iterable[str]) -> bool:

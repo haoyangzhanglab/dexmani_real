@@ -14,6 +14,7 @@ os.environ.setdefault("RUST_LOG", "error")
 
 import numpy as np
 
+from dexmani_real.config.environment import TableCollisionConfig
 from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
 from dexmani_real.data.raw.camera_geometry import (
     load_raw_episode_base_from_color,
@@ -28,6 +29,9 @@ from dexmani_real.sensor.camera.geometry import validate_aligned_depth_distortio
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud
 from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
+from dexmani_real.visualization import (
+    log_camera_geometry, log_points, log_rgbd, log_series, viewer_blueprint,
+)
 
 logger = logging.getLogger("dexmani_real.cli.visualize_episode")
 
@@ -99,14 +103,13 @@ class EpisodeVisualizer:
         handbase_position_eef_m: tuple[float, float, float],
         handbase_quat_eef_wxyz: tuple[float, float, float, float],
         fingertip_link_names: tuple[str, ...],
+        table_config: TableCollisionConfig,
         max_frames: int | None = None,
-        point_cloud: bool = True,
         pointcloud_config: PointCloudConfig | None = None,
-        table_plane_abcd: tuple[float, float, float, float] | None = None,
     ):
-        global rr, rrb
         import rerun as rr
-        import rerun.blueprint as rrb
+
+        self.rr = rr
 
         episode_name = Path(episode_path).stem
         self.fingertip_link_names = fingertip_link_names
@@ -133,8 +136,6 @@ class EpisodeVisualizer:
             self.rgb_index = -1
             meta = self.reader.meta
             self.camera_model = load_raw_episode_camera_model(self.reader)
-            self.camera_K = self.camera_model.intrinsics.matrix()
-            self.depth_meter = 1.0 / self.camera_model.depth_scale_m
             self.T_xarm_base_from_color = (
                 load_raw_episode_base_from_color(self.reader)
                 if "camera_T_xarm_base_from_color" in meta
@@ -147,28 +148,28 @@ class EpisodeVisualizer:
                 handbase_quat_eef_wxyz, name="hand base quaternion"
             )
             self.pointcloud_config = None
-            self.table_plane_abcd = table_plane_abcd
+            self.table_plane_abcd = None
             self.empty_cloud_count = 0
             self.pointcloud_processing_ns = 0
             self.pointcloud_processed_frames = 0
-            if point_cloud and self.T_xarm_base_from_color is not None:
-                if pointcloud_config is None:
-                    raise ValueError("point-cloud visualization requires resolved config")
+            if pointcloud_config is not None and self.T_xarm_base_from_color is not None:
+                pointcloud_config.validate()
                 validate_aligned_depth_distortion(
                     self.camera_model.intrinsics.distortion_model
                 )
+                if pointcloud_config.remove_table:
+                    self.table_plane_abcd = resolve_table_plane(table_config)
                 self.pointcloud_config = pointcloud_config
                 logger.info(
                     "Canonical point cloud enabled: N=%d table=%s",
                     pointcloud_config.num_points,
-                    "enabled" if table_plane_abcd is not None else "disabled",
+                    "enabled" if self.table_plane_abcd is not None else "disabled",
                 )
 
             logger.info("Frames=%d", self.frame_count)
 
             self.state = self.preload_state()
 
-            self.blueprint = self.build_blueprint()
             app_id = f"DexMani - {episode_name}"
             rec_id = f"{episode_name}-{time.time_ns()}"
             rr.init(
@@ -176,9 +177,18 @@ class EpisodeVisualizer:
                 recording_id=rec_id,
                 spawn=True,
             )
-            # Activate the current layout even when the viewer remembers a previous one.
+            series_groups = []
+            for category, keys in SERIES_GROUPS.items():
+                if category == "state":
+                    keys = (*keys, *FORCE_SERIES)
+                series_groups.append((category.title(), [f"{category}/{key}" for key in keys]))
+            # 当前布局覆盖 viewer 记忆的旧布局。
             rr.send_blueprint(
-                blueprint=self.blueprint, make_active=True, make_default=True
+                viewer_blueprint(
+                    series_groups,
+                    camera_in_base=self.T_xarm_base_from_color is not None,
+                ),
+                make_active=True, make_default=True,
             )
             self.log_static()
         except BaseException:
@@ -215,67 +225,35 @@ class EpisodeVisualizer:
 
         return state
 
-    def build_blueprint(self) -> rrb.Blueprint:
-        ts_verticals = []
-        for category, keys in SERIES_GROUPS.items():
-            if category == "state":
-                keys = (*keys, *FORCE_SERIES)
-            views = [rrb.TimeSeriesView(origin=f"{category}/{key}", name=key) for key in keys]
-            ts_verticals.append(rrb.Vertical(contents=views, name=category.title()))
-        return rrb.Blueprint(
-            rrb.Horizontal(
-                rrb.Vertical(
-                    rrb.Spatial2DView(origin="camera/color/rgb", name="RGB"),
-                    rrb.Spatial2DView(origin="depth/image", name="Depth"),
-                    name="Camera",
-                ),
-                rrb.Spatial3DView(origin="/", name="Point Cloud", background=[0.12, 0.12, 0.14]),
-                rrb.Tabs(contents=ts_verticals, active_tab=0, name="Time Series"),
-            )
-        )
-
     def log_static(self) -> None:
         for category, keys in SERIES_GROUPS.items():
             for key in keys:
-                arr = self.state[key]
-                base = f"{category}/{key}"
-                for i in range(arr.shape[1]):
-                    rr.log(f"{base}/{i}", rr.SeriesLine(name=f"{i}"), static=True)
-
-        h, w = self.camera_model.intrinsics.height, self.camera_model.intrinsics.width
-        rr.log(
-            "camera/color",
-            rr.Pinhole(
-                image_from_camera=self.camera_K,
-                resolution=[w, h],
-                camera_xyz=rr.ViewCoordinates.RDF,
-                image_plane_distance=1.25,
-            ),
-            static=True,
-        )
-        logger.info("Camera pinhole logged (%dx%d)", w, h)
-        if self.T_xarm_base_from_color is not None:
-            rr.log(
-                "camera/color",
-                rr.Transform3D(
-                    translation=self.T_xarm_base_from_color[:3, 3],
-                    mat3x3=self.T_xarm_base_from_color[:3, :3],
-                ),
-                static=True,
-            )
-
+                log_series(
+                    f"{category}/{key}", labels=[str(i) for i in range(self.state[key].shape[1])],
+                )
         for key, labels in FORCE_SERIES.items():
-            for i, label in enumerate(labels):
-                rr.log(f"state/{key}/{i}", rr.SeriesLine(name=label), static=True)
+            log_series(f"state/{key}", labels=labels)
+        log_camera_geometry(self.camera_model.intrinsics, self.T_xarm_base_from_color)
 
     def log_step(self, step_idx: int) -> None:
-        rr.set_time_sequence("step", step_idx)
-        rr.set_time_seconds("time", float(self.reader["timestamp"][step_idx]))
+        self.rr.set_time_sequence("step", step_idx)
+        self.rr.set_time_seconds("time", float(self.reader["timestamp"][step_idx]))
         depth = self.log_camera(step_idx)
         self.log_pointcloud(depth)
-        self.log_fingertips(step_idx)
-        self.log_eef(step_idx)
-        self.log_time_series(step_idx)
+        log_points(
+            "fingertips", self.state["hand_fingertip"][step_idx],
+            colors=FINGERTIP_COLORS, radii=0.012,
+        )
+        pose = self.state["arm_ee"][step_idx]
+        log_points(
+            "eef", pose[None, :3] if np.isfinite(pose).all() else None,
+            colors=[EEF_COLOR], radii=0.020,
+        )
+        for category, keys in SERIES_GROUPS.items():
+            for key in keys:
+                log_series(f"{category}/{key}", self.state[key][step_idx])
+        for key in FORCE_SERIES:
+            log_series(f"state/{key}", self.state[key][step_idx])
 
     def log_camera(self, step_idx: int) -> np.ndarray:
         if step_idx != self.rgb_index + 1:
@@ -285,14 +263,9 @@ class EpisodeVisualizer:
             raise ValueError(f"RGB missing at frame {step_idx}")
         self.rgb_index = step_idx
         depth = np.asarray(self.reader["depth"][step_idx])
-        rr.log("camera/color/rgb", rr.Image(self.rgb))
-        rr.log(
-            "depth/image",
-            rr.DepthImage(
-                depth,
-                meter=self.depth_meter,
-                depth_range=(0, 10000),  # Clamp outliers to stabilize the colormap.
-            ),
+        log_rgbd(
+            self.rgb, depth, depth_scale_m=self.camera_model.depth_scale_m,
+            depth_range_m=(0, 10000 * self.camera_model.depth_scale_m),
         )
         return depth
 
@@ -313,57 +286,7 @@ class EpisodeVisualizer:
         self.pointcloud_processed_frames += 1
         if cloud is None:
             self.empty_cloud_count += 1
-            rr.log("pcd", rr.Clear(recursive=False))
-            return
-        colors = (cloud[:, 3:] * 255.0).astype(np.uint8)
-        rr.log(
-            "pcd",
-            rr.Points3D(positions=cloud[:, :3], colors=colors, radii=0.003),
-        )
-
-    def log_fingertips(self, step_idx: int) -> None:
-        fp = self.state["hand_fingertip"][step_idx]
-        if not np.isfinite(fp).all():
-            # Clear stale geometry on invalid rows.
-            rr.log("fingertips", rr.Clear(recursive=False))
-            return
-
-        rr.log(
-            "fingertips",
-            rr.Points3D(
-                positions=fp,
-                colors=np.array(FINGERTIP_COLORS, dtype=np.uint8),
-                radii=0.012,
-            ),
-        )
-
-    def log_eef(self, step_idx: int) -> None:
-        pose = self.state["arm_ee"][step_idx]
-        if not np.isfinite(pose).all():
-            # Clear stale geometry on invalid rows.
-            rr.log("eef", rr.Clear(recursive=False))
-            return
-        rr.log(
-            "eef",
-            rr.Points3D(
-                positions=pose[None, :3],
-                colors=np.array([EEF_COLOR], dtype=np.uint8),
-                radii=0.020,  # EEF sphere is intentionally larger than fingertips
-            ),
-        )
-
-    def log_time_series(self, step_idx: int) -> None:
-        for category, keys in SERIES_GROUPS.items():
-            for key in keys:
-                arr = self.state[key]
-                base = f"{category}/{key}"
-                for i in range(arr.shape[1]):
-                    rr.log(f"{base}/{i}", rr.Scalar(float(arr[step_idx, i])))
-
-        for key in FORCE_SERIES:
-            arr = self.state[key]
-            for i in range(arr.shape[1]):
-                rr.log(f"state/{key}/{i}", rr.Scalar(float(arr[step_idx, i])))
+        log_points("pcd", cloud)
 
     @property
     def mean_pointcloud_processing_ms(self) -> float | None:
@@ -379,7 +302,7 @@ class EpisodeVisualizer:
                 self.reader = None  # type: ignore[assignment]
         finally:
             try:
-                rr.disconnect()
+                self.rr.disconnect()
             except Exception:
                 logger.warning("Rerun disconnect failed", exc_info=True)
 
@@ -438,26 +361,19 @@ def main(argv: list[str] | None = None) -> int:
 
     configure_logging()
     pointcloud_config = None
-    table_plane_abcd = None
     if args.point_cloud:
-        # Use current table calibration and the camera geometry recorded with Raw.
         pointcloud_config = runtime.pointcloud
         if args.pointcloud_num_points is not None:
             pointcloud_config = replace(pointcloud_config, num_points=args.pointcloud_num_points)
-        pointcloud_config.validate()
-        if pointcloud_config.remove_table:
-            table_plane_abcd = resolve_table_plane(runtime.environment.table)
-            logger.info("Using current calibrated table plane: %s", table_plane_abcd)
 
     viz = EpisodeVisualizer(
         str(episode_path),
         handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
         handbase_quat_eef_wxyz=runtime.hand.T_eef_handbase_quat_wxyz,
         fingertip_link_names=runtime.hand.fingertip_link_names,
+        table_config=runtime.environment.table,
         max_frames=args.max_frames,
-        point_cloud=args.point_cloud,
         pointcloud_config=pointcloud_config,
-        table_plane_abcd=table_plane_abcd,
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.frame_count)
@@ -476,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
                 "%d point-cloud frames were empty and explicitly cleared",
                 viz.empty_cloud_count,
             )
-        logger.info("Done. Close the Rerun window to exit.")
+        logger.info("数据已发送，脚本结束；可在 Rerun 中继续浏览。")
     finally:
         viz.close()
     return 0

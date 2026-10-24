@@ -12,7 +12,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
@@ -32,18 +31,17 @@ from dexmani_real.sensor.pointcloud.processing import (
 )
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
 from dexmani_real.utils.log import configure_logging
+from dexmani_real.visualization import (
+    log_camera_geometry, log_points, log_rgbd, log_workspace, viewer_blueprint,
+)
 
 if TYPE_CHECKING:
-    import open3d as o3d
     from dexmani_real.sensor.camera.realsense import RealSenseCamera
 
 
 @dataclass(frozen=True)
 class PointCloudDiagnosticConfig:
     table_calibration_frames: int = 5
-
-    show_rgbd_panels: bool = True
-    show_o3d: bool = True
 
     vis_depth_min_m: float = 0.3
     vis_depth_max_m: float = 2.5
@@ -62,76 +60,6 @@ SENSOR_OPTION_NAMES = (
     "pre_processing_sharpening",
     "noise_estimation",
 )
-
-
-def jet_colormap(values: np.ndarray) -> np.ndarray:
-    """Map normalized [0, 1] values to float RGB [..., 3] in [0, 1]."""
-    t = np.clip(values, 0.0, 1.0)
-    red = np.where(
-        t < 0.375,
-        0.0,
-        np.where(t < 0.625, 4.0 * t - 1.5, 1.0),
-    )
-    green = np.where(
-        t < 0.125,
-        0.0,
-        np.where(
-            t < 0.375,
-            4.0 * t - 0.5,
-            np.where(t < 0.625, 1.0, np.where(t < 0.875, 3.5 - 4.0 * t, 0.0)),
-        ),
-    )
-    blue = np.where(
-        t < 0.125,
-        1.0,
-        np.where(t < 0.375, 1.5 - 4.0 * t, 0.0),
-    )
-    return np.stack([red, green, blue], axis=-1)
-
-
-def make_depth_vis(depth_m: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
-    valid = np.isfinite(depth_m) & (depth_m > 0.0)
-    safe = np.where(valid, depth_m, vmin)
-    normalized = (safe - float(vmin)) / (float(vmax) - float(vmin))
-    depth_bgr = (jet_colormap(normalized)[..., ::-1] * 255.0).astype(np.uint8)
-    depth_bgr[~valid] = 0
-    return depth_bgr
-
-
-def show_rgbd_panels(
-    rgb: np.ndarray,
-    depth_m: np.ndarray,
-    cfg: PointCloudDiagnosticConfig,
-) -> None:
-    if not cfg.show_rgbd_panels:
-        return
-    bgr = np.ascontiguousarray(rgb[..., ::-1])
-    panels: list[tuple[str, np.ndarray]] = [
-        ("RGB", bgr),
-        ("Depth", make_depth_vis(depth_m, cfg.vis_depth_min_m, cfg.vis_depth_max_m)),
-    ]
-    labeled = []
-    for title, image in panels:
-        canvas = image.copy()
-        cv2.putText(
-            canvas,
-            title,
-            (10, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.72,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        labeled.append(canvas)
-
-    try:
-        print("\nShowing RGBD window -- press any key to continue...")
-        cv2.imshow("L515 RGBD diagnostic", np.hstack(labeled))
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-    except cv2.error as error:
-        print(f"  RGBD window skipped (no display?): {error}")
 
 
 def print_depth_stats(depth_m: np.ndarray, vmin: float, vmax: float) -> None:
@@ -294,7 +222,7 @@ def load_extrinsics(camera_info: dict, calib: CameraExtrinsics) -> np.ndarray:
     pos = base_from_color[:3, 3]
     quat_xyzw = R.from_matrix(base_from_color[:3, :3]).as_quat()
     print(
-        f"  Camera '{camera_info.get('name', camera_info['serial'])}' "
+        f"  Camera '{camera_info['name']}' "
         "-> color/aligned-depth frame in xArm-base frame"
     )
     print(f"  pos:         {np.round(pos, 4)} m")
@@ -461,70 +389,6 @@ def benchmark_production_pipeline(
     )
 
 
-def build_workspace_box(workspace: tuple[float, ...]) -> "o3d.geometry.LineSet":
-    import open3d as o3d
-
-    ws = workspace
-    corners = np.array(
-        [
-            [ws[0], ws[1], ws[2]],
-            [ws[3], ws[1], ws[2]],
-            [ws[3], ws[4], ws[2]],
-            [ws[0], ws[4], ws[2]],
-            [ws[0], ws[1], ws[5]],
-            [ws[3], ws[1], ws[5]],
-            [ws[3], ws[4], ws[5]],
-            [ws[0], ws[4], ws[5]],
-        ]
-    )
-    edges = [
-        [0, 1],
-        [1, 2],
-        [2, 3],
-        [3, 0],
-        [4, 5],
-        [5, 6],
-        [6, 7],
-        [7, 4],
-        [0, 4],
-        [1, 5],
-        [2, 6],
-        [3, 7],
-    ]
-    box = o3d.geometry.LineSet()
-    box.points = o3d.utility.Vector3dVector(corners)
-    box.lines = o3d.utility.Vector2iVector(edges)
-    box.colors = o3d.utility.Vector3dVector([[0.0, 1.0, 0.0] for _ in edges])
-    return box
-
-
-def visualize_result(
-    result: np.ndarray,
-    T_xarm_base_from_color: np.ndarray,
-    config: PointCloudConfig,
-) -> None:
-    import open3d as o3d
-
-    base_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2)
-    color_camera_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.15)
-    color_camera_frame.transform(T_xarm_base_from_color)
-
-    crop_box = build_workspace_box(config.workspace)
-
-    pcd = o3d.geometry.PointCloud()
-    if result.shape[0]:
-        pcd.points = o3d.utility.Vector3dVector(result[:, :3].astype(np.float64))
-        pcd.colors = o3d.utility.Vector3dVector(result[:, 3:6].astype(np.float64))
-
-    print("\nLaunching open3d visualizer (close window to continue)...")
-    print("  xArm-base point cloud + workspace crop box (green) + coordinate frames")
-    o3d.visualization.draw_geometries(
-        [pcd, crop_box, base_frame, color_camera_frame],
-        window_name="Point Cloud",
-        point_show_normal=False,
-    )
-
-
 class PointCloudExample:
     """Own camera diagnostics, optional table fitting and snapshot output."""
 
@@ -532,6 +396,7 @@ class PointCloudExample:
         self.args = args
 
     def run(self) -> int:
+        import rerun as rr
         from dexmani_real.sensor.camera.realsense import RealSenseCamera
 
         self.save_dir = (
@@ -558,17 +423,25 @@ class PointCloudExample:
         configure_logging()
         self.camera = RealSenseCamera(self.runtime.camera)
         print("Connecting to RealSense...")
-        self.camera.connect()
-
         try:
+            self.camera.connect()
+            rr.init("DexMani Point Cloud Diagnostic", spawn=True)
+            rr.send_blueprint(viewer_blueprint(camera_in_base=True))
             self.camera_info = print_device_info(self.camera)
 
-            rgb, _, depth_m = capture_frame(self.camera)
+            rgb, depth_raw, depth_m = capture_frame(self.camera)
             print_depth_stats(depth_m, self.cfg.vis_depth_min_m, self.cfg.vis_depth_max_m)
-            show_rgbd_panels(rgb, depth_m, self.cfg)
+            rr.set_time_sequence("capture", 0)
+            log_rgbd(
+                rgb, depth_raw, depth_scale_m=self.camera.get_depth_scale(),
+                depth_range_m=(self.cfg.vis_depth_min_m, self.cfg.vis_depth_max_m),
+            )
+            input("在 Rerun 查看 RGB-D，按 Enter 继续...")
 
             self.intrinsics = self.camera.get_color_intrinsics()
             self.T_xarm_base_from_color = load_extrinsics(self.camera_info, self.calibration)
+            log_camera_geometry(self.intrinsics, self.T_xarm_base_from_color)
+            log_workspace(self.pcd_config.workspace)
 
             if self.fit_table_requested:
                 fitted_plane = calibrate_table_plane(
@@ -596,6 +469,11 @@ class PointCloudExample:
 
             # Apply the fitted plane to a fresh post-calibration frame.
             rgb, depth_raw, _ = capture_frame(self.camera)
+            rr.set_time_sequence("capture", 1)
+            log_rgbd(
+                rgb, depth_raw, depth_scale_m=self.camera.get_depth_scale(),
+                depth_range_m=(self.cfg.vis_depth_min_m, self.cfg.vis_depth_max_m),
+            )
 
             result = build_cloud(
                 depth_raw=depth_raw,
@@ -638,16 +516,17 @@ class PointCloudExample:
                 config=self.pcd_config,
                 table_plane_abcd=self.table_plane_abcd,
             )
-            if self.cfg.show_o3d:
-                visualize_result(result, self.T_xarm_base_from_color, self.pcd_config)
-            else:
-                print("\n  open3d visualizer skipped (show_o3d=False)")
+            log_points("pcd", result)
+            input("在 Rerun 查看处理结果，按 Enter 退出...")
 
             print("\nDone.")
 
         finally:
-            self.camera.disconnect()
-            print("RealSense pipeline stopped cleanly.")
+            try:
+                self.camera.disconnect()
+                print("RealSense pipeline stopped cleanly.")
+            finally:
+                rr.disconnect()
 
         return 0
 

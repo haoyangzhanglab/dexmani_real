@@ -4,8 +4,6 @@ import logging
 import multiprocessing as mp
 from pathlib import Path
 
-import numpy as np
-
 from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extrinsics
 from dexmani_real.calibration.vr_heading import load_vr_transform
@@ -16,10 +14,8 @@ from dexmani_real.config.experiment import (
     validate_robot_config,
     validate_task_dir_name,
 )
-from dexmani_real.data.recorder import AsyncEpisodeRecorder
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
-from dexmani_real.planning.kinematics.ik import OnlineIKConfig
 from dexmani_real.robot.home import build_home_planner
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.robot import DexManiRobot
@@ -75,22 +71,7 @@ class TeleopSession:
         calibration = load_vr_transform(self.vr_transform_path)
         mapping = self.runtime.teleop.vr_mapping
         controller = TeleopController(
-            ActionMapper.for_mode(
-                "eef",
-                ik_config=OnlineIKConfig(
-                    max_pose_error_pos_m=self.runtime.motion.ik_max_pose_error_pos_m,
-                    max_pose_error_rot_rad=self.runtime.motion.ik_max_pose_error_rot_rad,
-                    operational_joint_lower_rad=tuple(self.runtime.arm.joint_limit_lower),
-                    operational_joint_upper_rad=tuple(self.runtime.arm.joint_limit_upper),
-                ),
-                hand_enabled=self.runtime.hand.enabled,
-                hand_lower_rad=self.runtime.hand.qpos_min_rad,
-                hand_upper_rad=self.runtime.hand.qpos_max_rad,
-                home_hand_qpos=np.deg2rad(self.runtime.hand.home_qpos_deg),
-                workspace=self.runtime.environment.workspace.as_array(),
-                workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
-                static_boxes=self.runtime.environment.static_boxes,
-            ),
+            ActionMapper.for_mode(self.runtime, "eef"),
             VRWristMapper(
                 pos_scale=mapping.pos_scale,
                 vr_to_robot_rot=calibration.transform,
@@ -142,15 +123,10 @@ class TeleopSession:
                 home_planner=home_planner,
                 keyboard=keyboard,
                 audio=audio,
-                recorder=(
-                    AsyncEpisodeRecorder(
-                        Path(__file__).resolve().parents[2]
-                        / self.runtime.collection.episodes_dir
-                        / self.task_name,
-                        control_hz=self.runtime.teleop.control_hz,
-                    )
-                    if self.runtime.collection.enabled
-                    else None
+                recording_dir=(
+                    Path(__file__).resolve().parents[2]
+                    / self.runtime.collection.episodes_dir / self.task_name
+                    if self.runtime.collection.enabled else None
                 ),
                 camera_calibration=camera_calibration,
                 vr_process=ctx.Process(
@@ -185,14 +161,12 @@ class TeleopSession:
             self.runtime_state.mark_error()
             logger.exception("teleop session failed")
         finally:
-            self.runtime_state.revoke_motion(reason=RunEndReason.RUNTIME_SHUTDOWN)
-            cleanup_failed = False
             try:
                 try:
                     if self.runner is not None:
                         self.runner.close()
                 except Exception:
-                    cleanup_failed = True
+                    self.runtime_state.mark_error()
                     logger.exception("teleop capture cleanup failed")
                 try:
                     # Preserve the final cue after capture finalization and before device shutdown.
@@ -200,24 +174,15 @@ class TeleopSession:
                         logger.warning("Final audio did not finish within %.1fs", END_AUDIO_GRACE_S)
                 except Exception:
                     logger.warning("Final audio unavailable", exc_info=True)
-                for close in (
-                    keyboard.stop if keyboard is not None else None,
-                    audio.close if audio is not None else None,
-                ):
-                    if close is None:
-                        continue
-                    try:
-                        close()
-                    except Exception:
-                        cleanup_failed = True
-                        logger.exception("teleop input/audio cleanup failed")
-                if cleanup_failed:
+                try:
+                    if audio is not None:
+                        audio.close()
+                except Exception:
                     self.runtime_state.mark_error()
+                    logger.exception("teleop audio cleanup failed")
             finally:
                 shutdown_clean = shutdown_local_runtime(
-                    self.runtime_state,
-                    self.robot,
-                    sensors=self.sensors,
+                    self.runtime_state, self.robot, sensors=self.sensors, keyboard=keyboard,
                     timeout_s=self.runtime.safety.shutdown_timeout_s,
                 )
         return int(not clean or not shutdown_clean)

@@ -34,7 +34,7 @@ def compute_metrics(
     replayed_frames = len(replay_data["arm_qpos"])
     if any(
         len(replay_data[name]) != replayed_frames
-        for name in ("hand_qpos", "arm_cmd", "eef_pos", "eef_rot6d")
+        for name in ("hand_qpos", "arm_candidate", "dispatch_status", "eef_pos", "eef_rot6d")
     ):
         raise ValueError("replay sample arrays must have the same row count")
     # Separate runs may have different lengths; fields within a capture may not.
@@ -124,8 +124,13 @@ def compute_metrics(
             np.median(list(offsets.values()))
         )
 
-    commands, measured = replay_data["arm_cmd"], replay_data["arm_qpos"]
-    valid = np.isfinite(commands).all(axis=1) & np.isfinite(measured).all(axis=1)
+    commands, measured = replay_data["arm_candidate"], replay_data["arm_qpos"]
+    # 拒绝候选保留在诊断中；仅发生过 dispatch 的行参与提交目标误差。
+    valid = (
+        (replay_data["dispatch_status"][:, 0] != 0)
+        & np.isfinite(commands).all(axis=1)
+        & np.isfinite(measured).all(axis=1)
+    )
     if valid.any():
         gaps = np.max(np.abs(commands[valid] - measured[valid]), axis=1)
         metrics["pre_submit_arm_target_gap"] = {

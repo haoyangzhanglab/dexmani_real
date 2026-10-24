@@ -8,13 +8,11 @@ import time
 from concurrent.futures import CancelledError
 from itertools import count
 
-import numpy as np
-
 from dexmani_real.calibration.camera.extrinsics import (
     CameraExtrinsics,
     load_optional_camera_extrinsics,
 )
-from dexmani_real.data.recorder import AsyncEpisodeRecorder
+from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError
 from dexmani_real.data.results import EpisodeResults, error_detail
 from dexmani_real.deployment.episode import PolicyEpisode, failure_reason
 from dexmani_real.deployment.observation import ObservationKinematics, build_policy_observation
@@ -22,7 +20,6 @@ from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
-from dexmani_real.planning.kinematics.ik import OnlineIKConfig
 from dexmani_real.robot.home import build_home_planner, home_robot
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.robot import DexManiRobot
@@ -258,32 +255,8 @@ class PolicySession:
             self.runtime.execution.rtc_guidance_cap,
             self.recording_dir is not None,
         )
-        self.action_mapper = ActionMapper.for_mode(
-            self.info.action_mode,
-            ik_config=OnlineIKConfig(
-                max_pose_error_pos_m=self.runtime.motion.ik_max_pose_error_pos_m,
-                max_pose_error_rot_rad=self.runtime.motion.ik_max_pose_error_rot_rad,
-                operational_joint_lower_rad=tuple(self.runtime.arm.joint_limit_lower),
-                operational_joint_upper_rad=tuple(self.runtime.arm.joint_limit_upper),
-            ),
-            hand_enabled=self.runtime.hand.enabled,
-            hand_lower_rad=self.runtime.hand.qpos_min_rad,
-            hand_upper_rad=self.runtime.hand.qpos_max_rad,
-            home_hand_qpos=np.deg2rad(self.runtime.hand.home_qpos_deg),
-            workspace=self.runtime.environment.workspace.as_array(),
-            workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
-            static_boxes=self.runtime.environment.static_boxes,
-        )
+        self.action_mapper = ActionMapper.for_mode(self.runtime, self.info.action_mode)
         self.home_planner = build_home_planner(self.runtime)
-        self.recorder = (
-            AsyncEpisodeRecorder(
-                self.recording_dir,
-                control_hz=1.0 / self.info.control_dt_s,
-            )
-            if self.recording_dir is not None
-            else None
-        )
-
         self.keyboard = KeyboardInput(
             estop_callback=self.runtime_state.request_emergency_stop,
             stop_callback=self.request_stop,
@@ -359,7 +332,10 @@ class PolicySession:
             except Exception as exc:
                 cleanup_errors.append(error_detail("model_close_submit", exc))
         try:
-            if self.recorder is not None:
+            if self.recorder is not None and (
+                self.recorder.finish_request is None or self.recorder.writer_pending
+            ):
+                # Episode 已结束也不能丢失仍在退出的 writer。
                 try:
                     self.recorder.close()
                 except Exception as exc:
@@ -618,6 +594,14 @@ class PolicySession:
                 run_id=epoch, required_safety_state=SafetyState.ARMED,
             ):
                 return
+            if self.recorder is not None:
+                self.recorder.check_error()
+                if self.recorder.is_recording or self.recorder.writer_pending:
+                    raise RecordingError("previous capture still owns resources")
+            self.recorder = (
+                AsyncEpisodeRecorder(self.recording_dir, control_hz=1.0 / self.info.control_dt_s)
+                if self.recording_dir is not None else None
+            )
             self.episode = PolicyEpisode(
                 self.runtime_state,
                 self.runtime,

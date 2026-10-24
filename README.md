@@ -23,8 +23,10 @@ python -m pip install -e ".[interactive,control]"
 | 笛卡尔目标在线 IK | Pinocchio、MPlib |
 | 手部模型点云 | Trimesh，可选依赖组 `geometry` |
 | TAG / DexPilot 重定向 | NLopt 及所选后端的几何依赖 |
-| 点云诊断 / episode 交互查看 | Open3D / Rerun |
+| RGB-D / 点云诊断 / episode 交互查看 | Rerun 0.22.1，可选依赖组 `visualization` |
 | 策略部署 | 已安装的 `dexmani_policy` 及训练实验对应的推理依赖 |
+
+查看工具安装 `python -m pip install -e ".[visualization]"`；实时 RGB-D 工具还需要 `interactive`。支持的 Rerun 版本为 0.22.1，其声明依赖满足项目的 `numpy<2` 要求。
 
 离线 FK、HOME 规划和关节动作部署无需 MPlib。键盘交互使用 pynput，需要桌面显示会话。安装不验证设备连接或现场标定。
 
@@ -115,7 +117,7 @@ python scripts/visualize_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --conf
 python scripts/export_zarr.py episodes/test --config local.yaml
 ```
 
-`--info` 无需启动 Rerun；交互查看可用 `--no-point-cloud` 关闭点云。处理使用 Raw 保存的相机几何，以及当前点云、桌面、手部安装与指尖配置；仅启用去桌时读取桌面平面。
+`--info` 无需安装或启动 Rerun；交互查看可用 `--no-point-cloud` 关闭点云。处理使用 Raw 保存的相机几何，以及当前点云、桌面、手部安装与指尖配置；只有实际启用点云且需要去桌时才读取桌面平面。缺相机外参时仍可查看 RGB-D 和机器人状态。脚本发送完数据即退出，Rerun 窗口可继续浏览。
 
 公共导出要求每段全部 **13 字段**完整、浮点有限，并通过来源时间、dispatch、触觉新鲜度和技术结束检查，包含手部模型点云与两类触觉。任一检查不通过均整段拒绝并记录原因，保留原 Raw；任务失败本身不排除技术有效的数据。完整字段见 [Canonical 定义](dexmani_real/data/canonical/schema.py)。
 
@@ -158,6 +160,8 @@ python scripts/replay_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config 
 
 输出目录须新建或为空，保存 `session_result.json`、`replay_data.npz` 和可计算的 `metrics.json`。Q 保存前缀并退出，ESC 请求急停，完成后可按 H 回 HOME；晚帧或发送超时会停止，输入 Raw 保持不变。
 
+回放诊断分别保存投影后的候选目标和真实 dispatch；被拒绝、未发送的候选也保留，但不计入提交目标误差。候选存在不代表已执行；诊断读写使用当前字段，不补齐旧产物。
+
 ## 设备工具
 
 | 用途 | 入口 | 运行边界 |
@@ -167,6 +171,8 @@ python scripts/replay_episode.py episodes/test/episode_YYYYMMDD_HHMMSS --config 
 | RGB-D 诊断 | [view_realsense.py](scripts/tools/view_realsense.py) | 连接相机，交互查看 RGB-D 与点云 |
 | 点云诊断 / 桌面标定 | [view_pointcloud.py](scripts/tools/view_pointcloud.py) | 连接相机；`--save-dir` 保存 RGB-D、点云及重建 metadata |
 | 物体重建与跟踪 | [CORDViP 示例](scripts/cordvip/README.md) | 独立的 `cordvip_geometry` 依赖，区分离线数据和实时相机模式 |
+
+RGB-D、点云和 episode 查看统一使用 Rerun，冻结、时间浏览、配色和实体显隐在 viewer 内操作。实时 RGB-D 工具默认不计算点云：P 开关计算，S 切换 raw/processed，R 重置为关闭，C 打印配置，A 切换曝光优先级，Q/Esc 退出并恢复原曝光设置；这些按键使用全局监听。关闭 viewer 不会停止相机。点云诊断仍在终端确认桌面发布、继续和退出；Rerun 仅承担显示，Raw 仍保存 HDF5／视频。
 
 各入口的参数与交互以 `--help` 和提示为准。键盘 jog 与相机标定在连接机器人前启动退出/急停监听；触界、IK 或准入拒绝后须释放全部 jog 键才能重新操作。
 

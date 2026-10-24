@@ -110,6 +110,7 @@ class KeyboardInput:
         quit_callback: Callable[[], None] | None = None,
         capture_commands: bool = True,
         capture_raw_events: bool = False,
+        raw_event_keys: frozenset[str] = EVENT_ONLY_KEYS,
         jog_change_callback: Callable[[], None] | None = None,
     ) -> None:
         self.buffer: deque[OperatorCommand] = deque()
@@ -127,6 +128,7 @@ class KeyboardInput:
         self.quit_callback = quit_callback
         self.capture_commands = bool(capture_commands)
         self.capture_raw_events = bool(capture_raw_events)
+        self.raw_event_keys = raw_event_keys
         self.estop_event = threading.Event()
         self.listener_failure_reported = False
         self.saved_termios: list | None = None
@@ -209,7 +211,7 @@ class KeyboardInput:
                     if not self.callbacks_active:
                         return
                     if name in EVENT_ONLY_KEYS:
-                        if self.capture_raw_events:
+                        if self.capture_raw_events and name in self.raw_event_keys:
                             self.events.append(name)
                         return
                     # Held keys also deduplicate command edges across OS repeat.
@@ -230,6 +232,8 @@ class KeyboardInput:
                     if not self.callbacks_active:
                         return
                     self.held_keys.add(name)
+                    if self.capture_raw_events and name in self.raw_event_keys:
+                        self.events.append(name)
                     self.jog_changed(name, True)
                     if self.capture_commands and signal is not None:
                         self.buffer.append(signal)
