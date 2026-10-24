@@ -23,7 +23,10 @@ dependencies = [
 interactive = ["pynput>=1.7"]
 control = ["ruckig==0.17.3"]
 geometry = ["trimesh>=4"]
-visualization = ["rerun-sdk==0.22.1"]
+visualization = [
+    "rerun-sdk==0.22.1",
+    "pyarrow==19.0.1",
+]
 
 [tool.setuptools]
 include-package-data = true

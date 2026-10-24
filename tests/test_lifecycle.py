@@ -166,6 +166,12 @@ class CleanupTests(unittest.TestCase):
             for name, value in replacements.items():
                 stack.enter_context(patch("dexmani_real.teleop.session." + name, value))
             stack.enter_context(patch.object(TeleopSession, "build_hand_retargeter", return_value=None))
+            stack.enter_context(
+                patch(
+                    "dexmani_real.teleop.controller.make_arm_fk",
+                    return_value=Mock(),
+                )
+            )
             with self.assertLogs("dexmani_real.teleop.session", level="ERROR"):
                 self.assertEqual(TeleopSession(runtime).run(), 1)
         audio.close.assert_called_once()

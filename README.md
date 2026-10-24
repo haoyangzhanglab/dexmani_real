@@ -26,7 +26,7 @@ python -m pip install -e ".[interactive,control]"
 | RGB-D / 点云诊断 / episode 交互查看 | Rerun 0.22.1，可选依赖组 `visualization` |
 | 策略部署 | 已安装的 `dexmani_policy` 及训练实验对应的推理依赖 |
 
-查看工具安装 `python -m pip install -e ".[visualization]"`；实时 RGB-D 工具还需要 `interactive`。支持的 Rerun 版本为 0.22.1，其声明依赖满足项目的 `numpy<2` 要求。
+查看工具安装 `python -m pip install -e ".[visualization]"`；实时 RGB-D 工具还需要 `interactive`。`visualization` 固定 Rerun 0.22.1 和 PyArrow 19.0.1，以兼容项目的 `numpy>=1.23,<2` 要求。
 
 离线 FK、HOME 规划和关节动作部署无需 MPlib。键盘交互使用 pynput，需要桌面显示会话。安装不验证设备连接或现场标定。
 
