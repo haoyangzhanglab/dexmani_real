@@ -401,7 +401,8 @@ class PolicyEpisode:
             return ControlRejection("prefix_decision_expired")
         query = PolicyQuery(next(self.query_ids), self.run_id, slot, expires_at_ns, handoff_slot)
         kwargs = (
-            dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot) if prefix is not None else {}
+            dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot,
+                 rtc_guidance_cap=self.execution.rtc_guidance_cap) if prefix is not None else {}
         )
         initial_hand_history = None
         if self.hand_history is not None:

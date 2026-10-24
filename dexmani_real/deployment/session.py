@@ -33,23 +33,6 @@ from dexmani_real.utils.log import configure_logging
 logger = logging.getLogger(__name__)
 
 
-def load_configured_policy(info, execution_config, *, device, seed):
-    from dexmani_policy.deployment import load_policy
-
-    loaded = load_policy(info, device=device, seed=seed)
-    try:
-        loaded.configure_execution(
-            execution_config.execution_mode, execution_config.rtc_guidance_cap
-        )
-        return loaded
-    except BaseException:
-        try:
-            loaded.close()
-        except Exception:
-            logger.exception("model cleanup after configure failure also failed")
-        raise
-
-
 class PolicySession:
     """Own deployment resources while the inference worker serializes model work."""
 
@@ -136,6 +119,7 @@ class PolicySession:
 
     def prepare_resources(self):
         from dexmani_real.deployment.inference import InferenceWorker
+        from dexmani_policy.deployment import load_policy
 
         fields = set(self.info.observation_fields)
         if self.needs.point_cloud or "camera_extrinsic" in fields:
@@ -173,9 +157,8 @@ class PolicySession:
         )
         self.camera_parameters = None
         self.model = InferenceWorker(
-            lambda: load_configured_policy(
+            lambda: load_policy(
                 self.info,
-                self.runtime.execution,
                 device=self.device,
                 seed=self.seed,
             ),
@@ -375,6 +358,10 @@ class PolicySession:
             "load",
             samples=5,
             rgb_hw=(self.runtime.camera.height, self.runtime.camera.width),
+            rtc_guidance_cap=(
+                self.runtime.execution.rtc_guidance_cap
+                if self.runtime.execution.execution_mode == "rtc" else None
+            ),
             rtc_delay=(
                 self.runtime.execution.prefetch_steps
                 if self.runtime.execution.execution_mode == "rtc"

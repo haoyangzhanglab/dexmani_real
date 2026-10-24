@@ -37,9 +37,11 @@ def validate_num_episodes(num_episodes: Any) -> int | None:
 
 
 def validate_execution_config(info, execution) -> None:
-    """Validate Real scheduling; the loaded Policy checks its model's mode support."""
+    """Validate saved mode support and Real scheduling before model/device startup."""
     if execution.execution_mode not in {"sync", "async", "rtc"}:
         raise ValueError("execution_mode must be sync, async or rtc")
+    if execution.execution_mode not in info.supported_execution_modes:
+        raise NotImplementedError(f"Policy does not support {execution.execution_mode} execution")
     dt = info.control_dt_s
     if (
         isinstance(dt, bool)

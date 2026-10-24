@@ -74,11 +74,25 @@ def run_policy(
     """Inspect, resolve and run one evaluation session from CLI or Python."""
     from dexmani_policy.deployment import inspect_policy
 
+    from dexmani_policy.deployment.metadata import resolve_experiment
+    from dexmani_policy.common.config import load_experiment_config
+    from dexmani_policy.common.experiments import resolve_best_checkpoint, resolve_checkpoint_path
+
+    directory = resolve_experiment(experiment)
+    cfg = load_experiment_config(directory)
+    if checkpoint == "best":
+        selected, checkpoint_path = resolve_best_checkpoint(directory)
+        defaults = selected["inference"]
+    else:
+        checkpoint_path = resolve_checkpoint_path(directory, str(checkpoint))
+        defaults = cfg["eval"]
+    if weights is None:
+        if type(defaults["use_ema"]) is not bool:
+            raise ValueError("Saved use_ema must be boolean")
+        weights = "ema" if defaults["use_ema"] else "raw"
     info = inspect_policy(
-        experiment,
-        checkpoint=checkpoint,
-        weights=weights,
-        inference_steps=inference_steps,
+        directory, checkpoint=checkpoint_path, weights=weights,
+        inference_steps=defaults["inference_steps"] if inference_steps is None else inference_steps,
     )
     action_steps = runtime.execution.action_steps
     if action_steps is None:
