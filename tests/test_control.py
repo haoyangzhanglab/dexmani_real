@@ -16,7 +16,7 @@ from dexmani_real.planning.target import TargetChecker
 from dexmani_real.replay.capture import ReplayRecorder
 from dexmani_real.replay.evaluation import compute_metrics, save_replay_data
 from dexmani_real.replay.replayer import ReplayStatus, TrajectoryReplayer
-from dexmani_real.robot.commands import DispatchError, DispatchResult, DispatchStatus, RobotCommand
+from dexmani_real.robot.commands import OperationCancelled, RobotError, RobotCommand
 from dexmani_real.runtime.jog import JogController
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.state import RuntimeState
@@ -33,6 +33,7 @@ class JogTests(unittest.TestCase):
     def reset_jog(self):
         self.state = RuntimeState()
         self.state.arm()
+        self.state.stop_signal.clear()
         self.keys = KeyboardInput(capture_commands=False)
         self.keys.callbacks_active = True
         self.keys.held_keys.add("w")
@@ -46,7 +47,7 @@ class JogTests(unittest.TestCase):
         self.checker = SimpleNamespace(endpoint_rejection=lambda q: None)
         self.config = SimpleNamespace(delta_pos_m=0.1, delta_rpy_rad=0.1, workspace_command_margin_m=0)
         self.jog = JogController(self.solver, self.checker, self.config, np.array([[-1., 1.]] * 3))
-        self.robot = SimpleNamespace(send_action=Mock(return_value=DispatchResult(arm=DispatchStatus.SUBMITTED)))
+        self.robot = SimpleNamespace(send_action=Mock(return_value=None))
         self.clock = [100]
 
     def propose(self):
@@ -84,14 +85,14 @@ class JogTests(unittest.TestCase):
                 else:
                     self.clock[0] = 180
                 if change == "deadline":
-                    with self.assertRaises(DispatchError):
+                    with self.assertRaises((OperationCancelled, TimeoutError, RobotError)):
                         self.submit(pose, result.qpos)
                 else:
-                    self.assertIsNone(self.submit(pose, result.qpos))
+                    self.assertFalse(self.submit(pose, result.qpos))
                 self.robot.send_action.assert_not_called()
                 self.assertIsNone(self.jog.command_pose)
 
-    def test_input_authority_deadline_and_partial_dispatch_during_send(self):
+    def test_input_authority_deadline_and_partial_submission_during_send(self):
         for change in ("generation", "authority", "deadline", "partial"):
             with self.subTest(change=change):
                 self.reset_jog()
@@ -104,12 +105,11 @@ class JogTests(unittest.TestCase):
                         self.state.request_stop()
                     elif change == "deadline":
                         self.clock[0] = 180
-                    return DispatchResult(arm=(
-                        DispatchStatus.ACCEPTED if change == "partial" else DispatchStatus.SUBMITTED
-                    ))
+                    elif change == "partial":
+                        raise RobotError("partial submission failed")
 
                 self.robot.send_action.side_effect = send
-                with self.assertRaises(DispatchError):
+                with self.assertRaises((OperationCancelled, TimeoutError, RobotError)):
                     self.submit(pose, result.qpos)
                 self.assertIsNone(self.jog.command_qpos)
                 self.robot.send_action.assert_called_once()
@@ -156,7 +156,7 @@ class JogTests(unittest.TestCase):
                     row.hand["timestamp_ns"] -= 50_000_000
                     refreshed = []
 
-                    def prepare(epoch):
+                    def prepare(epoch, **kwargs):
                         refreshed.append(True)
                         if revoke:
                             self.keys.generation += 1
@@ -179,15 +179,15 @@ class JogTests(unittest.TestCase):
                     session.frame = 1
                     session.last_boundary_warning_s = session.last_ik_warning_s = 0
                     session.calibration_config = SimpleNamespace(status_interval_frames=20)
-                    self.jog.submit = Mock(return_value=DispatchResult(arm=DispatchStatus.SUBMITTED))
+                    self.jog.submit = Mock(return_value=True)
 
                     def observe(*args, **kwargs):
                         self.assertTrue(refreshed)
                         return row
 
                     with patch("dexmani_real.teleop.keyboard_session.read_observation", side_effect=observe), patch(
-                        "dexmani_real.teleop.keyboard_session.upstream_deadline_ns", return_value=123,
-                    ):
+                        "dexmani_real.teleop.keyboard_session.control_deadline_ns", return_value=123,
+                    ), patch("dexmani_real.teleop.keyboard_session.observation_issues", return_value=[]):
                         session.motion_tick() if calibration else session.motion_tick(False)
                     if revoke:
                         self.solver.solve.assert_not_called()
@@ -203,7 +203,9 @@ class JogTests(unittest.TestCase):
                         if calibration else feedback_deadline_ns(row, runtime)
                     )
                     self.assertEqual(self.jog.submit.call_args.kwargs["valid_until_ns"], expected_deadline)
-                    robot.arm.update_health.assert_called_once_with(upstream_until_ns=2**63 - 1 if calibration else 123)
+                    self.assertEqual(robot.arm.update_health.call_count, 1)
+                    if not calibration:
+                        robot.arm.update_health.assert_called_once_with(health_until_ns=123)
 
 
 class JointTests(unittest.TestCase):
@@ -246,9 +248,7 @@ class JointTests(unittest.TestCase):
                 row = make_row(100)
                 robot = SimpleNamespace(
                     arm=SimpleNamespace(update_health=Mock()),
-                    send_action=Mock(return_value=DispatchResult(
-                        arm=DispatchStatus.SUBMITTED, hand=DispatchStatus.ACCEPTED,
-                    )),
+                    send_action=Mock(return_value=None),
                 )
                 replay = TrajectoryReplayer(RuntimeState(), ExperimentConfig(), None, robot=robot)
                 replay.action_mapper, replay.epoch = self.mapper, 1
@@ -258,7 +258,9 @@ class JointTests(unittest.TestCase):
                 trajectory = SimpleNamespace(num_frames=1, action_arm_joint=self.arm[None], action_hand_joint=self.hand[None])
                 with patch("dexmani_real.replay.replayer.time.monotonic_ns", return_value=100), patch(
                     "dexmani_real.replay.replayer.read_observation", return_value=row,
-                ), patch("dexmani_real.replay.replayer.upstream_deadline_ns", return_value=1000):
+                ), patch("dexmani_real.replay.replayer.control_deadline_ns", return_value=1000), patch(
+                    "dexmani_real.replay.replayer.observation_issues", return_value=[],
+                ), patch.object(replay.runtime_state, "command_may_cross_sdk", return_value=True):
                     status, _ = replay.replay_rows(trajectory, 1000)
                 data = replay.capture.to_dict()
                 np.testing.assert_allclose(data["arm_candidate"][0], self.expected)
@@ -268,7 +270,7 @@ class JointTests(unittest.TestCase):
                 if rejected:
                     self.assertEqual(status, ReplayStatus.REJECTED)
                     robot.send_action.assert_not_called()
-                    self.assertFalse(data["dispatch_status"].any())
+                    self.assertTrue((data["submit_started_ns"] < 0).all())
                     np.testing.assert_array_equal(replay.previous_arm, 0)
                 else:
                     self.assertEqual(status, ReplayStatus.COMPLETED)
@@ -290,16 +292,16 @@ class JointTests(unittest.TestCase):
         np.testing.assert_allclose(mapper.hand_lower, runtime.hand.qpos_min_rad)
         np.testing.assert_allclose(mapper.target_checker.workspace, runtime.environment.workspace.as_array())
 
-    def test_replay_metrics_use_dispatch_and_persist_only_current_fields(self):
+    def test_replay_metrics_use_submission_attempts_and_persist_current_fields(self):
         capture = ReplayRecorder(3)
         for index, (target, status) in enumerate((
-            (10.0, DispatchStatus.NOT_CALLED),
-            (0.1, DispatchStatus.UNKNOWN),
-            (0.3, DispatchStatus.SUBMITTED),
+            (10.0, -1),
+            (0.1, 100),
+            (0.3, 200),
         )):
             capture.record(
                 index, make_row(), RobotCommand(1, np.full(7, target)),
-                DispatchResult(arm=status),
+                submit_started_ns=status,
             )
         data = capture.to_dict()
         poses = np.tile([0, 0, 0, 1, 0, 0, 0, 1, 0], (3, 1))
@@ -312,7 +314,7 @@ class JointTests(unittest.TestCase):
         self.assertEqual(
             metrics["pre_submit_arm_target_gap"]["mean_deg"], round(np.rad2deg(0.2), 2),
         )
-        derived["dispatch_status"] = np.zeros((3, 2), dtype=np.uint8)
+        derived["submit_started_ns"] = np.full(3, -1, dtype=np.int64)
         self.assertNotIn("pre_submit_arm_target_gap", compute_metrics(trajectory, derived))
         with tempfile.TemporaryDirectory() as directory:
             saved = save_replay_data(data, directory)
@@ -320,7 +322,7 @@ class JointTests(unittest.TestCase):
                 self.assertNotIn("arm_cmd", loaded.files)
                 self.assertNotIn("hand_cmd", loaded.files)
                 np.testing.assert_array_equal(loaded["arm_candidate"], data["arm_candidate"])
-                np.testing.assert_array_equal(loaded["dispatch_status"], data["dispatch_status"])
+                np.testing.assert_array_equal(loaded["submit_started_ns"], data["submit_started_ns"])
 
     def test_eef_and_frozen_command_semantics(self):
         solver = SimpleNamespace(
@@ -336,3 +338,72 @@ class JointTests(unittest.TestCase):
         self.assertEqual(self.mapper.frozen_rejection(command, np.zeros(7), None, "joint"), "frozen_equivalent_branch_changed")
         with self.assertRaises(ValueError):
             self.mapper.prepare_joint_target(np.full(7, np.nan), self.hand, np.zeros(7))
+
+
+class PolicyScheduleTests(unittest.TestCase):
+    def test_async_tail_and_rtc_exact_handoff_remain_distinct(self):
+        from dexmani_real.deployment.schedule import PolicyQuery, handoff_plan, plan_rejection
+
+        query = PolicyQuery(1, 7, 3, 100, 5, np.zeros((6, 19)))
+        plan, issue = handoff_plan(query, run_id=7, slot=6, mode="async", action_steps=4, now_ns=10, authorized=True)
+        self.assertIsNone(issue)
+        self.assertEqual((plan.anchor_slot, plan.segment_end), (3, 9))
+        self.assertIsNone(plan_rejection(plan, 8, "async", 99))
+        self.assertEqual(plan_rejection(plan, 8, "async", 100).detail, "submission_deadline_expired")
+        plan, issue = handoff_plan(query, run_id=7, slot=6, mode="rtc", action_steps=4, now_ns=10, authorized=True)
+        self.assertIsNone(plan)
+        self.assertEqual(issue.detail, "handoff_slot_missed")
+        plan, issue = handoff_plan(query, run_id=8, slot=5, mode="rtc", action_steps=4, now_ns=10, authorized=True)
+        self.assertIsNone(plan)
+        self.assertIsNone(issue)
+
+    def test_sync_wait_grid_and_owned_rtc_prefix(self):
+        from dexmani_real.deployment.schedule import ActionPlan, control_slot, prefetch_handoff, rtc_prefix_request
+
+        actions = np.arange(6 * 19, dtype=float).reshape(6, 19)
+        plan = ActionPlan(actions, 3, 7, 100, {})
+        kwargs = dict(slot=5, prefetch_steps=2, query_pending=False, model_pending=False, history_ready=True)
+        self.assertEqual(prefetch_handoff(plan, mode="sync", **kwargs), (None, None))
+        self.assertEqual(prefetch_handoff(plan, mode="async", **kwargs), (7, None))
+        self.assertEqual(prefetch_handoff(plan, mode="rtc", **kwargs), (7, None))
+        prefix, slots = rtc_prefix_request(plan, 5, 2)
+        self.assertEqual(list(slots), [5, 6])
+        np.testing.assert_array_equal(prefix, actions[2:])
+        prefix[:] = -1
+        self.assertTrue(np.all(actions >= 0))
+        self.assertEqual(
+            control_slot(now_ns=150, next_step_ns=200, last_slot=3, dt_ns=100,
+                         synchronous=True, resume_ready=True),
+            (4, 250, 0),
+        )
+        self.assertEqual(
+            control_slot(now_ns=300, next_step_ns=200, last_slot=3, dt_ns=100,
+                         synchronous=False, resume_ready=False),
+            (4, 200, 1),
+        )
+
+    def test_hand_home_requires_distinct_feedback_after_submission(self):
+        from dexmani_real.robot.home import home_hand
+        from tests.offline_fixtures import make_row
+
+        runtime, state = ExperimentConfig(), RuntimeState()
+        state.arm()
+        now = [1_000_000_000]
+        reads = []
+        target = np.deg2rad(runtime.hand.home_qpos_deg)
+        row = make_row(now[0])
+        row.hand["qpos"] = target
+
+        def read_state():
+            reads.append(now[0])
+            if len(reads) > 1:
+                now[0] += 10_000_000
+                row.hand["timestamp_ns"] = now[0]
+            return row
+
+        robot = SimpleNamespace(send_hand_home=Mock(), read_state=read_state, stop=Mock())
+        with patch("time.monotonic_ns", side_effect=lambda: now[0]), patch("time.sleep"):
+            result = home_hand(state, runtime, robot=robot)
+        self.assertTrue(result.ok)
+        self.assertEqual(len(reads), 4)
+        robot.send_hand_home.assert_called_once()

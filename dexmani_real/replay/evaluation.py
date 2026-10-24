@@ -34,7 +34,7 @@ def compute_metrics(
     replayed_frames = len(replay_data["arm_qpos"])
     if any(
         len(replay_data[name]) != replayed_frames
-        for name in ("hand_qpos", "arm_candidate", "dispatch_status", "eef_pos", "eef_rot6d")
+        for name in ("hand_qpos", "arm_candidate", "submit_started_ns", "eef_pos", "eef_rot6d")
     ):
         raise ValueError("replay sample arrays must have the same row count")
     # Separate runs may have different lengths; fields within a capture may not.
@@ -125,9 +125,9 @@ def compute_metrics(
         )
 
     commands, measured = replay_data["arm_candidate"], replay_data["arm_qpos"]
-    # 拒绝候选保留在诊断中；仅发生过 dispatch 的行参与提交目标误差。
+    # 拒绝候选保留在诊断中；仅进入提交入口的行参与尝试目标误差。
     valid = (
-        (replay_data["dispatch_status"][:, 0] != 0)
+        (replay_data["submit_started_ns"] >= 0)
         & np.isfinite(commands).all(axis=1)
         & np.isfinite(measured).all(axis=1)
     )
@@ -170,7 +170,7 @@ def report_consistency(metrics: dict) -> None:
         print(f"  Hand: {metrics['hand_joint']}")
     if "pre_submit_arm_target_gap" in metrics:
         print(
-            f"  Arm submitted target vs consumed pre-submit feedback: {metrics['pre_submit_arm_target_gap']}"
+            f"  Arm attempted target vs consumed pre-submit feedback: {metrics['pre_submit_arm_target_gap']}"
         )
 
 
@@ -184,7 +184,7 @@ def evaluate_replay(
     if replay_data is None:
         print("\nNo replay data collected (replay interrupted before any frames captured).")
         return
-    # Preserve dispatch and termination even when preparation produced zero replay rows.
+    # 准备阶段零行结束时仍保存提交尝试统计及终止详情。
     save_replay_data(replay_data, output_dir)
     if replay_data["arm_qpos"].shape[0] == 0:
         print("\nSkipping metrics: no valid reference or replay data available")

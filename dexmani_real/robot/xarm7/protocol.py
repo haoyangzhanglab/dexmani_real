@@ -12,6 +12,7 @@ GOAL_DTYPE = np.dtype(
     [
         ("sequence", "<i8"),
         ("run_id", "<i8"),
+        ("input_generation", "<i8"),
         ("submit_until_ns", "<i8"),
         ("execute_until_ns", "<i8"),
         ("q_goal", "<f8", (7,)),
@@ -33,20 +34,16 @@ class OperationStatus(str, Enum):
     FAILED = "failed"
 
 
-class OperationCancelled(RuntimeError):
-    """Lifecycle authority was revoked; independent of any vendor driver."""
-
-
 @dataclass(frozen=True)
 class PrepareRequest:
     operation_id: int
-    epoch: int
+    run_id: int
 
 
 @dataclass(frozen=True)
 class HomeRequest:
     operation_id: int
-    epoch: int
+    run_id: int
     waypoints: np.ndarray
     target: np.ndarray
 

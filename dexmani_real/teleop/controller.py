@@ -1,4 +1,4 @@
-"""Current-row teleop mapping and commit of dispatched absolute targets."""
+"""映射当前遥操作观测，并在正常提交后更新绝对目标参考。"""
 
 import numpy as np
 
@@ -81,6 +81,6 @@ class TeleopController:
             raise RuntimeError(f"online IK technical failure: {solution.reason}")
         return mapped
 
-    def commit_dispatched_target(self, action_result):
+    def commit_submitted_target(self, action_result):
         self.previous_arm_command = action_result.arm_qpos.copy()
         self.smoothed_eef_pose = action_result.eef_pose.copy()

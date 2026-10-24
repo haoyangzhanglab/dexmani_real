@@ -131,7 +131,7 @@ def plan_rejection(plan, slot, mode, now_ns):
         if not 0 <= slot - plan.anchor_slot < len(plan.actions):
             return ControlRejection("plan_exhausted_without_handoff")
         if now_ns >= plan.expires_at_ns:
-            return ControlRejection("dispatch_deadline_expired")
+            return ControlRejection("submission_deadline_expired")
     elif slot >= plan.segment_end:
         return ControlRejection("plan_exhausted_without_handoff")
     return None

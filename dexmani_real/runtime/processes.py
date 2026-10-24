@@ -17,9 +17,8 @@ class SensorProcesses:
         self.channels = channels
         self.started = []
 
-    def request_shutdown(self, *, reason=RunEndReason.RUNTIME_SHUTDOWN, fault=False):
-        """Revoke software authority before notifying sensor producers; never join here."""
-        self.runtime_state.end_session(reason=reason, fault=fault)
+    def request_shutdown(self):
+        """Notify sensor producers after the coordinator revokes motion; never join here."""
         if self.channels is not None:
             self.channels.is_running.value = False
 
@@ -49,14 +48,14 @@ class SensorProcesses:
                     break
             raise RuntimeError(f"{process.name} failed to become ready")
 
-    def check(self) -> bool:
-        dead = [(process, ready) for process, ready in self.started if not process.is_alive()]
+    def check(self, *, names=None) -> bool:
+        dead = [(process, ready) for process, ready in self.started
+                if (names is None or process.name in names) and not process.is_alive()]
         if not dead:
             return True
         for process, ready in dead:
             ready.clear()
             logger.error("required worker %s exited: %s", process.name, process.exitcode)
-        self.request_shutdown(reason=RunEndReason.HARDWARE_FAULT, fault=True)
         return False
 
     def shutdown(self, *, graceful_timeout_s=5.0, terminate_timeout_s=1.0, kill_timeout_s=1.0):
@@ -92,7 +91,7 @@ class SensorProcesses:
                 errors.append(exc)
                 logger.exception("worker %s shutdown failed", process.name)
         if errors or not clean:
-            self.request_shutdown(fault=True)
+            self.request_shutdown()
         if errors:
             raise RuntimeError(f"sensor shutdown unresolved: {errors}") from errors[0]
         self.started.clear()
@@ -123,8 +122,7 @@ def shutdown_local_runtime(
         except Exception:
             runtime_state.mark_error()
             logger.exception("local runtime cleanup failed")
-    if sensors is None:
-        runtime_state.end_session()
+    runtime_state.end_session()
     sensors_clean = True
     if sensors is not None:
         try:

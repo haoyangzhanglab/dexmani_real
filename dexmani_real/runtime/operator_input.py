@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing as mp
 import os
 import sys
 import threading
@@ -111,13 +112,11 @@ class KeyboardInput:
         capture_commands: bool = True,
         capture_raw_events: bool = False,
         raw_event_keys: frozenset[str] = EVENT_ONLY_KEYS,
-        jog_change_callback: Callable[[], None] | None = None,
     ) -> None:
         self.buffer: deque[OperatorCommand] = deque()
         self.events: deque[str] = deque()
         self.held_keys: set[str] = set()
-        self.generation = 0
-        self.jog_change_callback = jog_change_callback
+        self.generation_signal = mp.get_context("spawn").Value("q", 0)
         self.condition = threading.Condition(threading.Lock())
         self.listener: Any = None
         self.running: bool = False
@@ -256,19 +255,20 @@ class KeyboardInput:
 
         return on_press, on_release
 
+    @property
+    def generation(self):
+        return self.generation_signal.value
+
+    @generation.setter
+    def generation(self, value):
+        self.generation_signal.value = value
+
     def jog_changed(self, name: str | None, changed: bool) -> None:
-        """Under the input lock, publish a jog generation after fencing its old epoch."""
         if not changed:
-            return
-        if self.jog_change_callback is None or name == "q":
-            self.generation += 1
             return
         from dexmani_real.runtime.jog import CARTESIAN_JOG_KEYS
 
-        # HOME is edge-triggered: releasing R must not cancel a HOME in progress.
-        # Other keys do not change the motion proposal represented by generation.
-        if name in CARTESIAN_JOG_KEYS or (name == "r" and name in self.held_keys):
-            self.jog_change_callback()
+        if name in CARTESIAN_JOG_KEYS or name == "q" or (name == "r" and name in self.held_keys):
             self.generation += 1
 
     def start(self) -> None:

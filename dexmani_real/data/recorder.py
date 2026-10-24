@@ -15,7 +15,6 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from dexmani_real.data.raw.schema import unwritten_dispatch_detail
 from dexmani_real.data.raw.writer import RawEpisodeWriter
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish, target_is_occupied
@@ -35,18 +34,7 @@ class CaptureFinishRequest:
     save: bool
     reason: str
     details: object
-    stop_result: str = "unconfirmed"
     technical_status: str = "failed"
-
-
-def frame_dispatch_detail(row, command, result):
-    if result is None:
-        return None
-    return unwritten_dispatch_detail(
-        row.observation_timestamp_ns, (result.arm, result.hand),
-        command.arm_qpos if command is not None else None,
-        command.hand_qpos if command is not None else None,
-    )
 
 
 def snapshot_recording_metadata(sensors, *, camera_calibration, hand):
@@ -104,7 +92,6 @@ class AsyncEpisodeRecorder:
         self.cancelled = threading.Event()
         self.error = None
         self.io_failed = False
-        self.failed_dispatches = []
         self.is_recording = False
         self.start_attempted = False
         self.finish_request = None
@@ -193,7 +180,7 @@ class AsyncEpisodeRecorder:
                 raise
             raise RecordingError(f"recording START failed: {exc}") from exc
 
-    def add_frame(self, row, command=None, result=None):
+    def add_frame(self, row, command=None):
         """Snapshot mutable inputs once; live observations already own read-only arrays."""
         def owned(value):
             if isinstance(value, np.ndarray) and value.flags.writeable:
@@ -214,24 +201,17 @@ class AsyncEpisodeRecorder:
                 observation_timestamp_ns=row.observation_timestamp_ns,
                 control_timestamp_ns=row.control_timestamp_ns,
             )
-            self.queue.put_nowait((snapshot, command, result))
+            self.queue.put_nowait((snapshot, command))
             self.submitted_frames += 1
-        except (Full, RecordingError) as exc:
-            # Queue saturation may follow a real dispatch. Keep that bounded fact
-            # even though its RGB-D row never entered the accepted prefix.
-            detail = frame_dispatch_detail(row, command, result)
-            if detail is not None:
-                self.failed_dispatches.append(detail)
-            if isinstance(exc, Full):
-                error = RecordingError("recording queue full (capacity=16)")
-                self.store_error(error)
-                raise error from exc
-            raise
+        except Full as exc:
+            error = RecordingError("recording queue full (capacity=16)")
+            self.store_error(error)
+            raise error from exc
 
-    def save_episode(self, reason="manual", *, stop_result, technical_status="normal", details=None):
+    def save_episode(self, reason="manual", *, technical_status="normal", details=None):
         return self.finish(
             save=True, reason=reason, details=details,
-            stop_result=stop_result, technical_status=technical_status,
+            technical_status=technical_status,
         )
 
     def discard_episode(self, reason="discard"):
@@ -242,7 +222,7 @@ class AsyncEpisodeRecorder:
         self.finish(save=True, reason="close")
 
     def finish(
-        self, *, save, reason, details=None, stop_result="unconfirmed", technical_status="failed"
+        self, *, save, reason, details=None, technical_status="failed"
     ):
         was_recording, self.is_recording = self.is_recording, False
         thread = self.thread
@@ -252,7 +232,7 @@ class AsyncEpisodeRecorder:
             if self.finish_request is None:
                 try:
                     self.finish_request = CaptureFinishRequest(
-                        save, reason, deepcopy(details), stop_result, technical_status
+                        save, reason, deepcopy(details), technical_status
                     )
                 except BaseException as exc:
                     self.store_error(exc, io=True)
@@ -283,7 +263,7 @@ class AsyncEpisodeRecorder:
                     self.cancelled.set()
         if not self.writer_pending:
             # Writer 的末次 drain 之后仍可能有已越过 check_error 的提交。
-            self.drain_unwritten_frames()
+            self.drain_frames()
         if interrupted is not None:
             raise interrupted
         if not self.writer_pending and not save:
@@ -292,22 +272,14 @@ class AsyncEpisodeRecorder:
                 self.staging_path = None
             return None
         if self.staging_path is not None and not self.writer_pending and self.error is not None:
-            # The failing encoder/HDF5 may already be closed when the last send
-            # returns. Only unpublished staging receives this bounded evidence.
-            dispatches = [*self.failed_dispatches]
-            if self.writer is not None:
-                dispatches.extend(self.writer.unwritten_dispatches)
-            unique = []
-            for detail in dispatches:
-                if detail not in unique:
-                    unique.append(detail)
             failure_path = self.staging_path / "capture_failure.json"
             if not failure_path.exists():
                 atomic_json_dump(
                     dict(
                         reason=self.finish_request.reason, technical_status="failed",
-                        stop_result=self.finish_request.stop_result,
-                        error=str(self.error), unwritten_dispatches=unique,
+                        error=str(self.error),
+                        accepted_frames=self.submitted_frames,
+                        written_frames=self.written_frames,
                     ),
                     failure_path, overwrite=False,
                 )
@@ -336,9 +308,6 @@ class AsyncEpisodeRecorder:
                 except BaseException as exc:
                     # Notify control before flushing or closing potentially blocking native I/O.
                     self.store_error(exc, io=True)
-                    detail = frame_dispatch_detail(*item)
-                    if detail is not None:
-                        self.failed_dispatches.append(detail)
                 writer.flush()
                 reason = finish.reason if finish is not None else "recording_failure"
                 details = list(finish.details or []) if finish is not None else []
@@ -350,11 +319,9 @@ class AsyncEpisodeRecorder:
                             message=str(self.error),
                         )
                     )
-                details.extend(self.failed_dispatches)
                 writer.write_termination(
                     reason, details,
                     expected_frames=self.submitted_frames if not self.io_failed else None,
-                    stop_result=finish.stop_result if finish is not None else "unconfirmed",
                     technical_status=(
                         finish.technical_status
                         if finish is not None and self.error is None else "failed"
@@ -384,16 +351,12 @@ class AsyncEpisodeRecorder:
                 logger.error(
                     "Recording staging retained: %s frames=%d", staging, self.written_frames
                 )
-            self.drain_unwritten_frames()
+            self.drain_frames()
 
-    def drain_unwritten_frames(self):
-        """Retain bounded queued dispatches after the writer stops consuming rows."""
+    def drain_frames(self):
+        """Release queued snapshots after the writer stops consuming rows."""
         while True:
             try:
-                item = self.queue.get_nowait()
+                self.queue.get_nowait()
             except Empty:
-                break
-            if not isinstance(item, CaptureFinishRequest):
-                detail = frame_dispatch_detail(*item)
-                if detail is not None:
-                    self.failed_dispatches.append(detail)
+                return

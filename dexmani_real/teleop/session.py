@@ -16,6 +16,8 @@ from dexmani_real.config.experiment import (
 )
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
+from dexmani_real.data.recorder import RecordingError
+from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.home import build_home_planner
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.robot import DexManiRobot
@@ -85,10 +87,12 @@ class TeleopSession:
             if self.runtime.collection.enabled
             else None
         )
-        needs = ObservationNeeds(
-            camera="rgbd" if self.runtime.collection.enabled else "none", vr=True,
-            required_tactile=("aggregate", "dense") if self.runtime.collection.enabled else (),
+        control_needs = ObservationNeeds(vr=True)
+        record_needs = (
+            ObservationNeeds(camera="rgbd", required_tactile=("aggregate", "dense"))
+            if self.runtime.collection.enabled else ObservationNeeds()
         )
+        needs = control_needs.union(record_needs)
         ctx = mp.get_context("spawn")
         self.runtime_state = RuntimeState()
         channels = SensorChannels(
@@ -103,8 +107,10 @@ class TeleopSession:
         try:
             self.sensors = SensorProcesses(self.runtime_state, channels)
             self.robot = DexManiRobot(
-                self.runtime_state, self.runtime, check_services=self.sensors.check,
-                required_tactile=needs.required_tactile,
+                self.runtime, run_signal=self.runtime_state.run_signal,
+                stop_signal=self.runtime_state.stop_signal,
+                emergency_signal=self.runtime_state.emergency_signal,
+                signal_lock=self.runtime_state.motion_lock, check_services=self.sensors.check,
             )
             keyboard = KeyboardInput(
                 estop_callback=self.runtime_state.request_emergency_stop,
@@ -117,7 +123,7 @@ class TeleopSession:
                 self.runtime,
                 self.robot,
                 task_label=self.task_name,
-                needs=needs,
+                control_needs=control_needs, record_needs=record_needs,
                 sensors=self.sensors,
                 controller=controller,
                 home_planner=home_planner,
@@ -136,9 +142,14 @@ class TeleopSession:
                 ),
             )
             keyboard.start()
-            self.robot.check_services = lambda: (
-                keyboard.healthy and self.sensors.check()
-            )
+            def check_services():
+                if not keyboard.healthy or not self.sensors.check(names=("vr",)):
+                    raise RobotError("teleop control service unavailable")
+                if self.runtime.collection.enabled and not self.sensors.check(names=("camera",)):
+                    raise RecordingError("recording camera process exited")
+                return True
+
+            self.robot.check_services = check_services
             self.robot.connect()
             if needs.camera_worker:
                 self.sensors.start(

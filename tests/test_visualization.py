@@ -50,7 +50,7 @@ class VisualizationTests(unittest.TestCase):
                     row = make_row()
                     row.arm["qpos"] = row.hand["qpos"] = np.nan
                     recorder.add_frame(row)
-                    saved = recorder.save_episode("operator", stop_result="confirmed")
+                    saved = recorder.save_episode("operator")
                     rr.init(
                         "offline-episode", recording_id=f"{extrinsics}-{enabled}-{remove_table}",
                         spawn=False, strict=True,

@@ -12,7 +12,7 @@ import numpy as np
 
 from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError
 from dexmani_real.data.raw.writer import RawEpisodeWriter
-from dexmani_real.robot.commands import DispatchResult, DispatchStatus, RobotCommand
+from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.utils.atomic_io import atomic_publish
 from tests.offline_fixtures import make_row, recording_metadata
 
@@ -23,7 +23,6 @@ class RecorderTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.command = RobotCommand(1, np.zeros(7), np.zeros(12))
-        self.dispatch = DispatchResult(arm=DispatchStatus.SUBMITTED, hand=DispatchStatus.UNKNOWN)
 
     def new_recorder(self, name="capture"):
         return AsyncEpisodeRecorder(self.root / name, control_hz=10)
@@ -41,10 +40,10 @@ class RecorderTests(unittest.TestCase):
             if index:
                 row = make_row()
                 row.arm["qpos"] = 0.4
-                recorder.add_frame(row, self.command, self.dispatch)
+                recorder.add_frame(row, self.command)
                 row.arm["qpos"] = 9
                 row.camera["depth"][:] = 9
-            saved = recorder.save_episode("operator", stop_result="confirmed")
+            saved = recorder.save_episode("operator")
             destinations.append(saved)
             with h5py.File(saved / "data.h5") as data:
                 self.assertEqual(data["meta"].attrs["num_frames"], index)
@@ -52,9 +51,10 @@ class RecorderTests(unittest.TestCase):
                 if index:
                     np.testing.assert_allclose(data["arm_qpos"][0], 0.4)
                     np.testing.assert_array_equal(data["depth"][0], 500)
-                    np.testing.assert_array_equal(data["dispatch_status"][0], [5, 4])
+                    np.testing.assert_array_equal(data["action_arm_joint_target"][0], self.command.arm_qpos)
+                    self.assertNotIn("dispatch_status", data)
             before = (saved / "data.h5").read_bytes()
-            self.assertEqual(recorder.save_episode("changed", stop_result="unconfirmed"), saved)
+            self.assertEqual(recorder.save_episode("changed"), saved)
             recorder.close()
             recorder.discard_episode()
             self.assertEqual((saved / "data.h5").read_bytes(), before)
@@ -84,7 +84,7 @@ class RecorderTests(unittest.TestCase):
                         self.start(recorder)
                 self.assertTrue(recorder.staging_path.is_dir())
                 with self.assertRaises(RecordingError):
-                    recorder.save_episode("start_failed", stop_result="unconfirmed")
+                    recorder.save_episode("start_failed")
                 evidence = json.loads((recorder.staging_path / "capture_failure.json").read_text())
                 self.assertEqual(evidence["reason"], "start_failed")
                 self.assertIsNone(recorder.published_path)
@@ -119,7 +119,7 @@ class RecorderTests(unittest.TestCase):
         self.assertTrue(recorder.staging_path.exists())
         self.assertIsNone(recorder.published_path)
 
-    def test_queue_full_preserves_prefix_and_unwritten_dispatch(self):
+    def test_queue_full_preserves_prefix_without_a_send_ledger(self):
         recorder = self.new_recorder()
         entered, release = threading.Event(), threading.Event()
         original = RawEpisodeWriter.append_frame
@@ -133,43 +133,44 @@ class RecorderTests(unittest.TestCase):
         with patch.object(RawEpisodeWriter, "append_frame", blocked):
             self.start(recorder)
             try:
-                recorder.add_frame(make_row(), self.command, self.dispatch)
+                recorder.add_frame(make_row(), self.command)
                 self.assertTrue(entered.wait(1))
                 for index in range(1, 17):
-                    recorder.add_frame(make_row(1_000_000_000 + index * 100_000_000), self.command, self.dispatch)
+                    recorder.add_frame(make_row(1_000_000_000 + index * 100_000_000), self.command)
                 with self.assertRaisesRegex(RecordingError, "queue full"):
-                    recorder.add_frame(make_row(2_700_000_000), self.command, self.dispatch)
+                    recorder.add_frame(make_row(2_700_000_000), self.command)
             finally:
                 release.set()
-            saved = recorder.save_episode("queue_full", stop_result="unconfirmed")
+            saved = recorder.save_episode("queue_full")
         with h5py.File(saved / "data.h5") as data:
             self.assertEqual(data["meta"].attrs["num_frames"], 17)
             self.assertEqual(data["meta"].attrs["technical_status"], "failed")
-            self.assertEqual(data["meta"].attrs["stop_result"], "unconfirmed")
+            self.assertNotIn("stop_result", data["meta"].attrs)
             details = json.loads(data["meta/termination_details"][()])
-            self.assertTrue(any(item.get("observation_ns") == 2_700_000_000 for item in details))
+            self.assertTrue(any(item.get("stage") == "recording" for item in details))
         with self.assertRaises(RecordingError):
             recorder.check_error()
 
-    def test_io_failure_keeps_partial_dispatch_and_never_retries(self):
+    def test_io_failure_keeps_staging_and_never_retries(self):
         for target in ("dexmani_real.data.raw.writer.RawEpisodeWriter.append_frame",
                        "dexmani_real.data.raw.video.VideoEncoder.write_frame"):
             with self.subTest(target=target):
                 recorder = self.new_recorder(target.rsplit(".", 1)[-1])
                 with patch(target, side_effect=OSError("I/O injected")) as failing:
                     self.start(recorder)
-                    recorder.add_frame(make_row(), self.command, self.dispatch)
+                    recorder.add_frame(make_row(), self.command)
                     recorder.thread.join(2)
                     self.assertFalse(recorder.writer_pending)
                     with self.assertRaises(RecordingError):
-                        recorder.save_episode("io_failed", stop_result="unconfirmed")
+                        recorder.save_episode("io_failed")
                     with self.assertRaises(RecordingError):
                         recorder.close()
                     self.assertEqual(failing.call_count, 1)
                 self.assertIsNone(recorder.published_path)
                 evidence = json.loads((recorder.staging_path / "capture_failure.json").read_text())
                 self.assertEqual(evidence["reason"], "io_failed")
-                self.assertEqual(evidence["unwritten_dispatches"][0]["dispatch_status"], [5, 4])
+                self.assertEqual(evidence["accepted_frames"], 1)
+                self.assertNotIn("unwritten_dispatches", evidence)
                 staging = recorder.staging_path
                 recorder.discard_episode()
                 self.assertFalse(staging.exists())
@@ -187,14 +188,14 @@ class RecorderTests(unittest.TestCase):
 
         with patch("dexmani_real.data.recorder.atomic_publish", side_effect=conflict) as publish:
             with self.assertRaises(RecordingError):
-                recorder.save_episode("first_reason", stop_result="confirmed")
+                recorder.save_episode("first_reason")
             with self.assertRaises(RecordingError):
-                recorder.save_episode("second_reason", stop_result="unconfirmed")
+                recorder.save_episode("second_reason")
             self.assertEqual(publish.call_count, 1)
         self.assertEqual((recorder.episode_dir / "existing").read_text(), "untouched")
         evidence = json.loads((recorder.staging_path / "capture_failure.json").read_text())
         self.assertEqual(evidence["reason"], "first_reason")
-        self.assertEqual(evidence["stop_result"], "confirmed")
+        self.assertNotIn("stop_result", evidence)
 
     def test_close_timeout_keeps_owner_and_first_end(self):
         recorder = self.new_recorder()
@@ -215,7 +216,7 @@ class RecorderTests(unittest.TestCase):
             self.start(recorder)
             try:
                 with self.assertRaises(RecordingError):
-                    recorder.save_episode("original", stop_result="unconfirmed")
+                    recorder.save_episode("original")
                 self.assertTrue(entered.is_set())
                 self.assertTrue(recorder.writer_pending)
                 self.assertTrue(recorder.staging_path.exists())
@@ -229,3 +230,46 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(calls, ["close"])
         self.assertIsNone(recorder.published_path)
         self.assertEqual(json.loads((recorder.staging_path / "capture_failure.json").read_text())["reason"], "original")
+
+    def test_partial_batch_and_encoder_close_failures_never_publish_or_retry(self):
+        original_resize = h5py.Dataset.resize
+        resize_calls = []
+
+        def partial_resize(dataset, *args, **kwargs):
+            resize_calls.append(dataset.name)
+            if len(resize_calls) == 2:
+                raise OSError("partial batch resize")
+            return original_resize(dataset, *args, **kwargs)
+
+        recorder = self.new_recorder("partial-batch")
+        self.start(recorder)
+        recorder.add_frame(make_row(), self.command)
+        with patch.object(h5py.Dataset, "resize", partial_resize):
+            with self.assertRaises(RecordingError):
+                recorder.save_episode("operator")
+            with self.assertRaises(RecordingError):
+                recorder.close()
+        self.assertEqual(len(resize_calls), 2)
+        self.assertIsNone(recorder.published_path)
+        self.assertTrue((recorder.staging_path / "capture_failure.json").is_file())
+
+        from dexmani_real.data.raw.video import VideoEncoder
+        original_close = VideoEncoder.close
+        close_calls = []
+
+        def fail_close(encoder):
+            close_calls.append(encoder)
+            original_close(encoder)
+            raise OSError("encoder flush failed")
+
+        recorder = self.new_recorder("close-failure")
+        with patch.object(VideoEncoder, "close", fail_close):
+            self.start(recorder)
+            recorder.add_frame(make_row(), self.command)
+            with self.assertRaises(RecordingError):
+                recorder.save_episode("operator")
+            with self.assertRaises(RecordingError):
+                recorder.close()
+        self.assertEqual(len(close_calls), 1)
+        self.assertIsNone(recorder.published_path)
+        self.assertTrue((recorder.staging_path / "capture_failure.json").is_file())

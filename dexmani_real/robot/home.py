@@ -13,9 +13,10 @@ from dexmani_real.planning.paths import (
     compute_joint_home_path,
 )
 from dexmani_real.utils.timing import sample_is_fresh
-from dexmani_real.robot.commands import RobotCommand, DispatchError, DispatchInterrupted
+from dexmani_real.robot.commands import RobotCommand, OperationCancelled
+from dexmani_real.runtime.observation import service_feedback
 from dexmani_real.robot.xhand.limits import validate_hand_command_bounds
-from dexmani_real.runtime.state import RunEndReason, SafetyState
+from dexmani_real.runtime.state import SafetyState
 
 logger = logging.getLogger(__name__)
 HOME_CONSECUTIVE_SAMPLES = 3
@@ -67,7 +68,6 @@ def execute_arm_home(
         return HomeResult(False, "home target must be finite (7,)")
     if runtime_state.safety_state != SafetyState.ARMED:
         return HomeResult(False, "home requires ARMED")
-    runtime_state.revoke_motion()
     epoch = runtime_state.run_id
     boundary_ns = time.monotonic_ns()
 
@@ -132,7 +132,8 @@ def execute_arm_home(
     failure = None
     try:
         ok = robot.home_arm(
-            waypoints, target, epoch, lambda: aborted() or time.monotonic() >= deadline
+            waypoints, target, epoch, lambda: aborted() or time.monotonic() >= deadline,
+            service=lambda: service_feedback(robot, robot.runtime),
         )
         interrupted = not ok and time.monotonic() < deadline
         return HomeResult(
@@ -142,7 +143,6 @@ def execute_arm_home(
         )
     except BaseException as exc:
         failure = exc
-        from dexmani_real.robot.xarm7.protocol import OperationCancelled
 
         if isinstance(exc, KeyboardInterrupt):
             runtime_state.request_emergency_stop()
@@ -150,8 +150,6 @@ def execute_arm_home(
         if not isinstance(exc, Exception):
             raise
         if not isinstance(exc, OperationCancelled):
-            runtime_state.mark_error()
-            runtime_state.revoke_motion(SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT)
             raise
         interrupted = time.monotonic() < deadline
         failure = None  # OperationCancelled is handled; a cleanup failure must still propagate.
@@ -234,7 +232,6 @@ def home_hand(runtime_state, runtime, *, robot, abort_requested=None):
     )
     if runtime_state.safety_state != SafetyState.ARMED:
         return HomeResult(False, "hand home requires ARMED")
-    runtime_state.revoke_motion()
     epoch = runtime_state.run_id
     if not runtime_state.command_may_cross_sdk(
         run_id=epoch, required_safety_state=SafetyState.ARMED
@@ -245,20 +242,11 @@ def home_hand(runtime_state, runtime, *, robot, abort_requested=None):
     deadline = time.monotonic_ns() + int(cfg.home_timeout_s * 1e9)
     try:
         robot.send_hand_home(RobotCommand(epoch, hand_qpos=target), valid_until_ns=deadline)
-    except DispatchInterrupted as exc:
-        logger.warning("hand HOME cancelled: dispatch=%s", exc.result)
-        raise
-    except DispatchError as exc:
-        if not exc.revoked:
-            raise
-        logger.info("hand HOME dispatch stopped: %s; dispatch=%s", exc, exc.result)
-        runtime_state.revoke_motion(expected_run_id=epoch)
+    except OperationCancelled:
         robot.stop()
-        if exc.cause != "authority_revoked":
-            raise
         return HomeResult(False, "home interrupted", interrupted=True)
 
-    # Only feedback newer than the submission result can establish arrival.
+    # Only feedback newer than submission completion can establish arrival.
     last_sample_ns = time.monotonic_ns()
     consecutive = 0
     tolerance_rad = np.deg2rad(cfg.home_tolerance_deg)
@@ -299,7 +287,6 @@ def home_hand(runtime_state, runtime, *, robot, abort_requested=None):
                     interrupted = time.monotonic_ns() < deadline
                     break
         time.sleep(0.01)
-    runtime_state.revoke_motion(expected_run_id=epoch)
     robot.stop()
     return HomeResult(
         False,

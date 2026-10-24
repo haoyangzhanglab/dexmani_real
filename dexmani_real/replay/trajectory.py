@@ -31,7 +31,6 @@ def load_trajectory(episode_path):
             "action_hand_joint_target",
             "arm_qpos",
             "hand_qpos",
-            "dispatch_status",
             "timestamp",
         )
         arm, hand, aq, hq = [

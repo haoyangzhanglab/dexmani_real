@@ -1,9 +1,9 @@
-"""Local motion authority; only the xArm authority signal crosses spawn."""
+"""Coordinator-owned lifecycle; only run identity and stop signals cross spawn."""
 
+import multiprocessing as mp
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
-from threading import RLock
 
 
 class SafetyState(IntEnum):
@@ -31,7 +31,6 @@ class RunEndReason(IntEnum):
 @dataclass
 class RuntimeState:
     running: bool = True
-    run_id: int = 1
     run_ended_id: int = 0
     run_ended_reason: RunEndReason = RunEndReason.NONE
     error_state: bool = False
@@ -39,10 +38,15 @@ class RuntimeState:
     quit_requested: bool = False
     stop_request: bool = False
     safety_state: SafetyState = SafetyState.DISARMED
-    # Never held across target IPC waits or SDK calls; input callbacks use this lock.
-    motion_lock: object = field(default_factory=RLock, repr=False)
-    arm_authority: object = field(default=None, repr=False)
-    arm_emergency: object = field(default=None, repr=False)
+    # The shared lock protects only identity/stop transitions, never SDK I/O.
+    motion_lock: object = field(default_factory=lambda: mp.get_context("spawn").RLock(), repr=False)
+    run_signal: object = field(default_factory=lambda: mp.get_context("spawn").Value("q", 1), repr=False)
+    stop_signal: object = field(default_factory=lambda: mp.get_context("spawn").Event(), repr=False)
+    emergency_signal: object = field(default_factory=lambda: mp.get_context("spawn").Event(), repr=False)
+
+    @property
+    def run_id(self):
+        return self.run_signal.value
 
     def requests_allow_motion(self):
         return (
@@ -58,21 +62,16 @@ class RuntimeState:
             if not self.requests_allow_motion() or not self.revoke_motion():
                 raise RuntimeError("arming rejected")
 
-    def jog_input_changed(self) -> None:
-        """Fence every changed jog proposal, including nonzero direction changes."""
-        with self.motion_lock:
-            if self.safety_state in (SafetyState.ARMED, SafetyState.RUNNING):
-                self.revoke_motion()
-
     def begin_motion(self) -> tuple[int, int] | None:
         with self.motion_lock:
-            if self.safety_state != SafetyState.ARMED or not self.requests_allow_motion():
+            if (
+                self.safety_state != SafetyState.ARMED
+                or not self.requests_allow_motion() or self.stop_signal.is_set()
+            ):
                 return None
-            self.run_id += 1
             started = time.monotonic_ns()
             self.run_ended_reason = RunEndReason.NONE
             self.safety_state = SafetyState.RUNNING
-            self.publish_arm_authority()
             return self.run_id, started
 
     def command_may_cross_sdk(self, *, run_id, required_safety_state=SafetyState.RUNNING):
@@ -83,6 +82,7 @@ class RuntimeState:
                 and self.run_id == run_id
                 and self.safety_state == required_safety_state
                 and required_safety_state in (SafetyState.ARMED, SafetyState.RUNNING)
+                and (required_safety_state != SafetyState.RUNNING or not self.stop_signal.is_set())
             )
 
     def revoke_motion(
@@ -106,34 +106,18 @@ class RuntimeState:
                     reason = RunEndReason.HARDWARE_FAULT
                 self.run_ended_id = self.run_id
                 self.run_ended_reason = reason
-            self.run_id += 1
+            self.stop_signal.set()
+            self.run_signal.value += 1
             self.safety_state = new_state
-            self.publish_arm_authority()
             return True
-
-    def publish_arm_authority(self):
-        """Signed epoch: ARMED preparation < 0, RUNNING > 0, revoked = 0."""
-        with self.motion_lock:
-            if self.arm_authority is not None:
-                if not self.requests_allow_motion():
-                    self.arm_authority.value = 0
-                elif self.safety_state == SafetyState.RUNNING:
-                    self.arm_authority.value = self.run_id
-                elif self.safety_state == SafetyState.ARMED:
-                    self.arm_authority.value = -self.run_id
-                else:
-                    self.arm_authority.value = 0
-            if self.estop_request and self.arm_emergency is not None:
-                self.arm_emergency.set()
 
     def request_emergency_stop(self):
         # Reach the SDK owner before any local authority bookkeeping can wait.
-        if self.arm_emergency is not None:
-            self.arm_emergency.set()
+        self.emergency_signal.set()
+        self.stop_signal.set()
         with self.motion_lock:
             already_requested = self.estop_request
             self.estop_request = True
-            self.publish_arm_authority()
             if not already_requested:
                 self.revoke_motion(
                     (
@@ -147,15 +131,14 @@ class RuntimeState:
         """Latch a session error without conflating it with a hardware FAULT."""
         with self.motion_lock:
             self.error_state = True
-            self.publish_arm_authority()
+            self.stop_signal.set()
 
     def request_stop(self, *, reason=RunEndReason.OPERATOR):
+        self.stop_signal.set()
         with self.motion_lock:
             self.stop_request = True
             if self.safety_state in (SafetyState.ARMED, SafetyState.RUNNING):
                 self.revoke_motion(reason=reason)
-            else:
-                self.publish_arm_authority()
 
     def acknowledge_stop(self, expected_run_id):
         """Only an owner which finished stopping may clear this generation's fence."""
@@ -178,4 +161,4 @@ class RuntimeState:
             elif self.safety_state == SafetyState.RUNNING:
                 self.revoke_motion(reason=reason)
             else:
-                self.publish_arm_authority()
+                self.stop_signal.set()

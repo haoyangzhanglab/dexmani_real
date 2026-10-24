@@ -8,6 +8,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from dexmani_real.config.experiment import resolve_runtime_table
+from dexmani_real.deployment.observation import policy_needs
 from dexmani_real.deployment.preflight import (
     validate_deployment_config,
     validate_max_running_s,
@@ -80,7 +81,12 @@ def run_policy(
     if action_steps is None:
         action_steps = info.n_action_steps
     runtime = replace(runtime, execution=replace(runtime.execution, action_steps=action_steps))
-    needs = ObservationNeeds.for_policy(info.observation_fields, record_raw=record_raw)
+    control_needs = policy_needs(info.observation_fields)
+    record_needs = (
+        ObservationNeeds(camera="rgbd", required_tactile=("aggregate", "dense"))
+        if record_raw else ObservationNeeds()
+    )
+    needs = control_needs.union(record_needs)
     cloud_recipe, hand_cloud_recipe = validate_deployment_config(info, runtime, needs=needs)
     max_running_s = validate_max_running_s(max_running_s)
     num_episodes = validate_num_episodes(num_episodes)
@@ -105,7 +111,7 @@ def run_policy(
             "experiment": str(experiment),
             "checkpoint": str(checkpoint),
             "policy": info.to_dict(),
-            "future_steps": info.horizon - info.n_obs_steps + 1,
+            "future_steps": info.future_steps,
             "runtime": asdict(runtime),
             "seed": seed,
             "device": device,
@@ -130,7 +136,7 @@ def run_policy(
     return PolicySession(
         runtime,
         info,
-        needs=needs,
+        control_needs=control_needs, record_needs=record_needs,
         device=device,
         seed=seed,
         max_running_s=max_running_s,

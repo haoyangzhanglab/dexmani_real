@@ -96,7 +96,7 @@ def iter_canonical_blocks(
         raw = {
             name: reader[name][start:end]
             for name in DATASET_SPECS
-            if name not in ("timestamp", "dispatch_status")
+            if name != "timestamp"
         }
         for name, values in raw.items():
             # Unchanged float32 tactile arrays are checked at the canonical write boundary.

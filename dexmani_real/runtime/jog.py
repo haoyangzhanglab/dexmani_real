@@ -1,4 +1,4 @@
-"""Cartesian jog proposals, input-bound epochs and guarded command references."""
+"""笛卡尔 jog 提案、输入代际与正常提交后的目标参考。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from scipy.spatial.transform import Rotation
 
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import Pose, quat_multiply
-from dexmani_real.robot.commands import DispatchError, DispatchResult, DispatchStatus, RobotCommand
+from dexmani_real.robot.commands import OperationCancelled, RobotError, RobotCommand
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
 
 if TYPE_CHECKING:
@@ -105,18 +105,15 @@ def submit_jog_target(
     valid_until_ns: int,
     execute_until_ns: int,
     commit_reference: Callable[[], None],
-) -> DispatchResult | None:
-    """Bind input to an epoch; commit_reference only assigns preconstructed references."""
+) -> bool:
+    """约束输入代际与运行身份；正常提交后仅赋值已构造的参考。"""
     def reserve() -> int | None:
         with runtime_state.motion_lock:
             if runtime_state.run_id != epoch or not runtime_state.requests_allow_motion():
                 return None
             if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
                 runtime_state.revoke_motion(expected_run_id=epoch)
-                raise DispatchError(
-                    "jog proposal deadline expired", DispatchResult(),
-                    revoked=True, cause="deadline_expired",
-                )
+                raise TimeoutError("jog proposal deadline expired")
             if runtime_state.safety_state == SafetyState.ARMED:
                 if runtime_state.begin_motion() is None:
                     return None
@@ -125,17 +122,15 @@ def submit_jog_target(
             return runtime_state.run_id
 
     run_id = keys.commit_if_current(generation, reserve)
-    if run_id is None:
-        return None
+    if not run_id:
+        return False
     try:
-        # Input changes revoke the epoch even while IPC blocks without the input lock.
-        result = robot.send_action(
-            RobotCommand(run_id, target),
+        # The input generation is checked again by the IPC consumer before first send.
+        robot.send_action(
+            RobotCommand(run_id, target, input_generation=generation),
             valid_until_ns=valid_until_ns,
             execute_until_ns=execute_until_ns,
         )
-        if result.arm != DispatchStatus.SUBMITTED or result.hand != DispatchStatus.NOT_CALLED:
-            raise DispatchError("incomplete arm-only dispatch", result)
 
         def finish() -> bool:
             with runtime_state.motion_lock:
@@ -147,19 +142,14 @@ def submit_jog_target(
                 return True
 
         if not keys.commit_if_current(generation, finish):
-            # SUBMITTED remains a fact; this only declines advancing the jog reference.
-            expired = time.monotonic_ns() >= min(valid_until_ns, execute_until_ns)
-            raise DispatchError(
-                "jog proposal expired or revoked during submission",
-                result,
-                revoked=True,
-                cause="deadline_expired" if expired else "authority_revoked",
-            )
-        return result
+            if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
+                raise TimeoutError("jog proposal expired during submission")
+            raise OperationCancelled("jog proposal changed during submission")
+        return True
     except BaseException as exc:
         if isinstance(exc, KeyboardInterrupt):
             reason = RunEndReason.ESTOP
-        elif isinstance(exc, DispatchError) and not exc.revoked:
+        elif isinstance(exc, RobotError):
             reason = RunEndReason.HARDWARE_FAULT
         else:
             reason = RunEndReason.EXECUTOR_BOUNDARY
@@ -174,7 +164,7 @@ def propose_cartesian_jog_pose(
     position_lower: np.ndarray,
     position_upper: np.ndarray,
 ) -> tuple[Pose, np.ndarray, bool]:
-    """Project a jog proposal without advancing the dispatched target reference."""
+    """投影 jog 提案，保留上次正常提交的目标参考。"""
     desired_position = command_pose.p + dx
     position = np.clip(desired_position, position_lower, position_upper)
     rotating = bool(np.any(drpy != 0.0))

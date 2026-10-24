@@ -19,7 +19,6 @@ class ReplayRecorder:
         self.submit_started_ns = np.full(capacity, -1, dtype=np.int64)
         self.submit_completed_ns = np.full(capacity, -1, dtype=np.int64)
         self.hand_qpos = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
-        self.dispatch_status = np.zeros((capacity, 2), dtype=np.uint8)
         self.hand_candidate = np.full((capacity, *HAND_JOINT_SHAPE), np.nan, dtype=np.float64)
 
     def record(
@@ -27,15 +26,13 @@ class ReplayRecorder:
         idx: int,
         row,
         command,
-        dispatch,
         *,
         submit_started_ns: int = -1,
         submit_completed_ns: int = -1,
     ) -> None:
-        """记录候选与真实 dispatch；未发送候选不能成为已提交命令。"""
+        """记录候选及提交尝试时间；候选不表示已提交或到位。"""
         if idx != self.count or idx >= len(self.arm_qpos):
             raise ValueError("replay rows must be sequential and within capacity")
-        self.dispatch_status[idx] = int(dispatch.arm), int(dispatch.hand)
         self.arm_qpos[idx] = row.arm["qpos"][0]
         if command.arm_qpos is not None:
             self.arm_candidate[idx] = command.arm_qpos
@@ -50,10 +47,9 @@ class ReplayRecorder:
         self.count = idx + 1
 
     def to_dict(self) -> dict[str, np.ndarray]:
-        """导出实测前缀和候选；是否发送由同一行的 dispatch 表达。"""
+        """导出实测前缀、候选与提交起止时刻。"""
         count = self.count
         return {
-            "dispatch_status": self.dispatch_status[:count].copy(),
             "arm_qpos": self.arm_qpos[:count].copy(),
             "hand_qpos": self.hand_qpos[:count].copy(),
             "hand_candidate": self.hand_candidate[:count].copy(),

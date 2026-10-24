@@ -83,13 +83,11 @@ class SharedMemoryRingBuffer:
         if fields is None:
             data = payload.copy().reshape(1)
         else:
-            # A NumPy multi-field view keeps the full RGB-D itemsize; pack only requested bytes.
-            data = np.empty(1, dtype=[(name, self.dtype[name]) for name in fields])
-            for name in fields:
-                data[name][0] = payload[name]
+            # Independent owned fields avoid RGB views retaining recording-only depth.
+            data = {name: payload[name].copy() for name in fields}
         return (data, stamp, sequence) if marker == int(slot["sequence"]) else None
 
-    def read_fields(self, fields, *, sequence=None) -> tuple[np.ndarray, int, int] | None:
+    def read_fields(self, fields, *, sequence=None) -> tuple[dict, int, int] | None:
         """Copy selected fields from one verified publication, without unrelated pixel payloads."""
         sequence = self.latest_sequence if sequence is None else sequence
         if sequence <= 0:

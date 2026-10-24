@@ -11,13 +11,13 @@ from dexmani_real.config.experiment import (
 )
 from dexmani_real.planning.target import TargetChecker
 from dexmani_real.planning.kinematics.ik import OnlineIKConfig, make_online_ik_solver
-from dexmani_real.robot.commands import DispatchError
+from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.home import build_home_planner, home_robot
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.observation import (
     feedback_deadline_ns,
-    read_observation,
-    upstream_deadline_ns,
+    read_observation, observation_issues, ObservationNeeds, service_feedback,
+    control_deadline_ns,
 )
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import shutdown_local_runtime
@@ -45,13 +45,17 @@ class KeyboardTeleopSession:
             raise ValueError("hand-disabled operation requires --no-hand")
 
         self.runtime_state = RuntimeState()
-        self.robot = DexManiRobot(self.runtime_state, self.runtime)
+        self.robot = DexManiRobot(
+            self.runtime, run_signal=self.runtime_state.run_signal,
+            stop_signal=self.runtime_state.stop_signal,
+            emergency_signal=self.runtime_state.emergency_signal,
+            signal_lock=self.runtime_state.motion_lock,
+        )
 
         self.keys = KeyboardInput(
             quit_callback=self.runtime_state.request_quit,
             capture_commands=False,
             estop_callback=self.runtime_state.request_emergency_stop,
-            jog_change_callback=self.runtime_state.jog_input_changed,
         )
         self.jog_config = self.runtime.keyboard_teleop
         self.home_key_down = False
@@ -67,7 +71,7 @@ class KeyboardTeleopSession:
             self.runtime_state.revoke_motion(
                 reason=(
                     RunEndReason.HARDWARE_FAULT
-                    if isinstance(exc, DispatchError)
+                    if isinstance(exc, RobotError)
                     else RunEndReason.POLICY_FAILURE
                 ),
             )
@@ -101,6 +105,7 @@ class KeyboardTeleopSession:
         if not self.keys.healthy:
             raise RuntimeError("keyboard stop listener unavailable")
         self.robot.check_services = lambda: self.keys.healthy
+        self.robot.input_signal = self.keys.generation_signal
         self.robot.connect()
         self.robot.check()
         self.runtime_state.arm()
@@ -170,25 +175,23 @@ class KeyboardTeleopSession:
             if self.robot.stop_required:
                 self.robot.stop()
             try:
-                self.robot.prepare_streaming(epoch)
-            except DispatchError as exc:
-                if not exc.revoked:
-                    raise
+                self.robot.prepare_streaming(epoch, service=lambda: service_feedback(self.robot, self.runtime))
+            except OperationCancelled:
                 self.robot.stop()
                 self.jog.clear_reference()
                 return
             if self.keys.snapshot()[1] != generation:
                 return
 
-        row = read_observation(
-            None,
-            self.runtime,
-            self.robot,
-            require_hand=self.runtime.hand.enabled,
+        row = read_observation(None, self.robot)
+        issues = observation_issues(
+            row, self.runtime, ObservationNeeds(), require_hand=self.runtime.hand.enabled,
         )
-        if row is not None:
-            self.robot.arm.update_health(upstream_until_ns=upstream_deadline_ns(row, self.runtime))
-        if row is None:
+        if not issues:
+            self.robot.arm.update_health(
+                health_until_ns=control_deadline_ns(row, self.runtime, ObservationNeeds()),
+            )
+        if issues:
             self.jog.clear_reference()
             if self.robot.stop_required:
                 self.runtime_state.revoke_motion()
@@ -213,10 +216,8 @@ class KeyboardTeleopSession:
                 execute_until_ns=row.observation_timestamp_ns
                 + int(self.jog_config.target_max_age_s * 1e9),
             )
-        except DispatchError as exc:
-            if not exc.revoked:
-                raise
-            logger.info("keyboard motion interrupted: dispatch=%s", exc.result)
+        except (OperationCancelled, TimeoutError) as exc:
+            logger.info("jog interrupted: %s", exc)
             self.robot.stop()
             self.jog.clear_reference()
             return

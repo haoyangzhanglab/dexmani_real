@@ -17,7 +17,7 @@ def make_row(stamp=1_000_000_000):
         if "timestamp_ns" in name:
             hand[name] = stamp
     return SimpleNamespace(
-        arm=arm, hand=hand, required_tactile=(),
+        arm=arm, hand=hand, point_cloud=None, pointcloud_timestamp_ns=0, camera_sequence=1,
         camera=dict(rgb=np.zeros((8, 8, 3), dtype=np.uint8),
                     depth=np.full((8, 8), 500, dtype=np.uint16),
                     timestamp_ns=stamp, ring_sequence=1),

@@ -64,12 +64,12 @@ def validate_execution_config(info, execution) -> None:
         if isinstance(value, bool) or value is None or not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be a finite positive experimental budget")
 
-    prediction_steps = info.horizon - info.n_obs_steps + 1
+    prediction_steps = info.future_steps
     action_steps = execution.action_steps
     if type(action_steps) is not int:
         raise ValueError("Resolve effective A_exec at the deployment entry before validation")
     if not 1 <= action_steps <= prediction_steps:
-        raise ValueError("execution requires 1 <= A_exec <= P=H-N+1")
+        raise ValueError("execution requires 1 <= A_exec <= policy future_steps")
     if execution.execution_mode != "sync":
         prefetch_steps = execution.prefetch_steps
         if (
@@ -93,23 +93,6 @@ def validate_execution_config(info, execution) -> None:
             raise ValueError("rtc_guidance_cap requires an explicit finite nonnegative value")
 
 
-SUPPORTED_OBSERVATION_FIELDS = frozenset(
-    {
-        "joint_state",
-        "point_cloud",
-        "rgb",
-        "depth",
-        "hand_pointcloud",
-        "finger_tactile_force",
-        "fingertip_xyz",
-        "eef_pose",
-        "taxel_tactile_force",
-        "camera_intrinsic",
-        "camera_extrinsic",
-    }
-)
-
-
 def validate_policy_inputs(
     info: Any, runtime: Any,
 ) -> tuple[PointCloudConfig | None, HandPointCloudConfig | None]:
@@ -117,11 +100,6 @@ def validate_policy_inputs(
     if not runtime.hand.enabled:
         raise ValueError("Dexterous policy deployment requires hand.enabled=true")
     names = set(info.observation_fields)
-    unsupported = names - SUPPORTED_OBSERVATION_FIELDS
-    if unsupported:
-        raise ValueError(
-            f"Real has no live producer for requested modalities: {sorted(unsupported)}"
-        )
     if "fingertip_xyz" in names:
         links = info.fingertip_link_names
         if (

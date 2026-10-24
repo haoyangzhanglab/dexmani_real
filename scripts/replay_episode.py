@@ -29,8 +29,8 @@ Controls:
         "episode",
         type=str,
         help=(
-            "Published teleop Raw episode directory (episodes/<task_name>/episode_*) "
-            "with finite joint targets and continued dispatch status for both devices."
+            "Published dexmani.raw.v2 teleop episode directory (episodes/<task_name>/episode_*) "
+            "with a technically normal capture and complete finite submission-attempt targets."
         ),
     )
     parser.add_argument(
@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         f"  Frames: {trajectory.num_frames}  Nominal FPS: {trajectory.fps:.1f}  "
         f"Nominal duration: {trajectory.num_frames / trajectory.fps:.1f}s"
     )
-    print(f"  Task: {trajectory.task_label or '(none)'}")
+    print(f"  Task: {trajectory.task_label}")
     print(f"  Acc: {runtime.arm.max_joint_acceleration_deg_per_s2:.0f}°/s²")
     print(f"  Joint speed: {runtime.arm.max_joint_velocity_deg_per_s:.0f}°/s")
 

@@ -10,6 +10,7 @@ import h5py
 import numpy as np
 
 from dexmani_real.data.raw.schema import (
+    ARM_ACTION_SEMANTICS,
     DATASET_SPECS,
     RAW_FORMAT,
     TIMING_ROW_DTYPE,
@@ -105,7 +106,7 @@ class EpisodeReader:
             attrs = self.meta
             if text_attr(attrs, "format") != RAW_FORMAT:
                 raise RawDataError(f"unsupported Raw format (expected {RAW_FORMAT!r})")
-            if text_attr(attrs, "arm_action_semantics") != "q_goal_submitted":
+            if text_attr(attrs, "arm_action_semantics") != ARM_ACTION_SEMANTICS:
                 raise RawDataError("unknown arm action semantics")
             if text_attr(attrs, "timestamp_source") != "host_monotonic_relative":
                 raise RawDataError("Raw timestamp must use host monotonic relative seconds")
@@ -167,16 +168,14 @@ class EpisodeReader:
         return rows.fields(fields)[start:stop]
 
     def validate_completion(self):
-        """Strict numerical consumers require a normal capture and confirmed stop."""
+        """Strict numerical consumers require a technically normal capture."""
         if text_attr(self.meta, "technical_status") != "normal":
             raise RawDataError("capture ended with a technical failure")
-        if text_attr(self.meta, "stop_result") != "confirmed":
-            raise RawDataError("capture stop was not confirmed")
 
     def validate_rows(
         self, *, required_tactile=("aggregate", "dense"), require_camera=True, chunk_frames=4096
     ):
-        """Check sampling, dispatch and source ages in blocks with one overlap row."""
+        """Check sampling and source ages in blocks with one overlap row."""
         if type(chunk_frames) is not int or chunk_frames <= 0:
             raise ValueError("chunk_frames must be a positive integer")
         if not set(required_tactile) <= {"aggregate", "dense"}:
@@ -189,13 +188,13 @@ class EpisodeReader:
             positive_float_attr(self.meta, "hand_tactile_hold_max_age_s") * 1e9
             if required_tactile else None
         )
-        timestamps, dispatch = self["timestamp"], self["dispatch_status"]
+        timestamps = self["timestamp"]
         first_observation = None
         for start in range(0, self.num_frames, chunk_frames):
             first, end = max(0, start - 1), min(start + chunk_frames, self.num_frames)
             timestamp = timestamps[first:end]
             errors = validate_fixed_rate_rows(
-                timestamp, dispatch[first:end], self.control_hz, row_offset=first
+                timestamp, self.control_hz, row_offset=first
             )
             if errors:
                 raise RawDataError("; ".join(errors))

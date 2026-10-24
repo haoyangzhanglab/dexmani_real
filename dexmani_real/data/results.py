@@ -52,7 +52,6 @@ class EpisodeResults:
                 inference_mean_s=None,
                 inference_max_s=None,
                 skipped_slots=0,
-                dispatch_count=0,
             ),
         )
 
@@ -61,22 +60,23 @@ class EpisodeResults:
             self.current.update(started=True, run_id=int(run_id), started_utc=utc_now())
             self.running_ns = time.monotonic_ns()
 
-    def record_inference(self, duration_ns):
+    def record_duration(self, name, duration_ns):
         if self.current is None or not self.current["started"]:
             return
         metrics = self.current["metrics"]
         duration = duration_ns / 1e9
-        count = metrics["inference_count"]
-        mean = metrics["inference_mean_s"] or 0.0
-        metrics.update(
-            inference_count=count + 1,
-            inference_mean_s=mean + (duration - mean) / (count + 1),
-            inference_max_s=max(metrics["inference_max_s"] or 0.0, duration),
-        )
+        count = metrics.get(f"{name}_count", 0)
+        mean = metrics.get(f"{name}_mean_s") or 0.0
+        metrics[f"{name}_count"] = count + 1
+        metrics[f"{name}_mean_s"] = mean + (duration - mean) / (count + 1)
+        metrics[f"{name}_max_s"] = max(metrics.get(f"{name}_max_s") or 0.0, duration)
 
-    def record_dispatch(self):
-        if self.current is not None:
-            self.current["metrics"]["dispatch_count"] += 1
+    def record_inference(self, result):
+        self.record_duration("prediction_total", result.completed_ns - result.started_ns)
+        build_end = result.completed_ns if result.model_started_ns is None else result.model_started_ns
+        self.record_duration("observation_build", build_end - result.started_ns)
+        if result.model_started_ns is not None:
+            self.record_duration("inference", result.completed_ns - result.model_started_ns)
 
     def record_skipped_slots(self, count):
         if self.current is not None:

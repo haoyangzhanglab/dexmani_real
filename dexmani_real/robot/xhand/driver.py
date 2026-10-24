@@ -11,7 +11,6 @@ from typing import Any, Callable
 import numpy as np
 
 from dexmani_real.robot.xhand.config import HandParams
-from dexmani_real.robot.commands import DispatchStatus
 from dexmani_real.robot.model import (
     HAND_DOF,
     HAND_JOINT_SHAPE,
@@ -111,6 +110,7 @@ class XHand:
         config.validate()
         self.cfg = config
         self.connected_flag = False
+        self.send_crc_started_ns = None
         self.device_identity = {
             "backend": "hardware",
             "hand_type": "unavailable",
@@ -443,37 +443,45 @@ class XHand:
             **board_errors,
         )
 
-    def send_action(self, action: np.ndarray) -> DispatchStatus:
-        """Send one absolute endpoint and preserve CRC delivery uncertainty."""
+    def send_action(self, action: np.ndarray) -> None:
+        """Send once; tolerate transient CRC only within the ordinary-send budget."""
+        code = self.send_position(action)
+        now_ns = time.monotonic_ns()
+        if code == COMMUNICATION_CRC_ERROR_CODE:
+            if self.send_crc_started_ns is None:
+                self.send_crc_started_ns = now_ns
+                logger.warning("XHand send CRC; delivery unconfirmed, continuing with next target")
+            if now_ns - self.send_crc_started_ns >= int(self.cfg.feedback_max_age_s * 1e9):
+                raise XHandError("send", code, "continuous send CRC exceeded age budget")
+        else:
+            if self.send_crc_started_ns is not None:
+                logger.info("XHand send responses recovered")
+            self.send_crc_started_ns = None
+
+    def end_send_interval(self):
+        self.send_crc_started_ns = None
+
+    def send_position(self, action: np.ndarray) -> int:
         target = np.asarray(action, dtype=np.float64)
-        try:
-            self.validate_action(target)
-        except ValueError as exc:
-            logger.warning("XHand send rejected: %s", exc)
-            return DispatchStatus.REJECTED
+        self.validate_action(target)
         if self.control is None or self.command is None or not self.connected_flag:
             raise RuntimeError("XHand command path is not initialized")
-
-        try:
-            for index, value in enumerate(target):
-                joint = self.command.finger_command[index]
-                joint.mode = POSITION_MODE
-                joint.position = float(value)
-        except Exception:
-            logger.warning("XHand command preparation failed", exc_info=True)
-            return DispatchStatus.REJECTED
+        for index, value in enumerate(target):
+            joint = self.command.finger_command[index]
+            joint.mode = POSITION_MODE
+            joint.position = float(value)
         return self.send_command()
 
-    def hold_current(self, qpos: np.ndarray) -> DispatchStatus:
+    def hold_current(self, qpos: np.ndarray) -> int:
         """Actively hold measured joint positions clipped to mechanical limits."""
         measured = np.asarray(qpos, dtype=np.float64)
         if measured.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(measured)):
             raise ValueError("XHand.hold_current requires twelve finite joint positions")
-        return self.send_action(
+        return self.send_position(
             np.clip(measured, self.cfg.mechanical_qpos_min_rad, self.cfg.mechanical_qpos_max_rad)
         )
 
-    def set_passive(self) -> DispatchStatus:
+    def set_passive(self) -> int:
         if self.control is None or self.command is None or not self.connected_flag:
             raise RuntimeError("XHand command path is not initialized")
         for index in range(HAND_DOF):
@@ -491,30 +499,30 @@ class XHand:
                 self.cfg.feedback_max_age_s * 1e9
             )
             status = self.hold_current(qpos) if qpos is not None and fresh else self.set_passive()
-            if status == DispatchStatus.ACCEPTED:
+            if status in NONFATAL_SDK_CODES:
                 if attempt:
                     logger.info("XHand stop SDK response recovered after %d attempts", attempt + 1)
                 return
-            if status != DispatchStatus.CRC_UNCONFIRMED:
-                raise RuntimeError(f"XHand stop rejected: {status.name}")
+            if status != COMMUNICATION_CRC_ERROR_CODE:
+                raise RuntimeError(f"XHand stop rejected: {status}")
             if attempt == 0:
                 logger.warning("XHand stop CRC; retrying within the stop deadline")
             remaining = deadline - time.monotonic()
             if remaining <= 0 or attempt + 1 == STOP_MAX_ATTEMPTS:
                 break
             time.sleep(min(STOP_RETRY_INTERVAL_S, remaining))
-        raise RuntimeError("XHand stop confirmation timed out: CRC_UNCONFIRMED")
+        raise RuntimeError("XHand stop timed out: CRC replies remain unconfirmed")
 
-    def send_command(self) -> DispatchStatus:
+    def send_command(self) -> int:
         error = self.control.send_command(self.cfg.device_id, self.command)
 
         code = error_code(error)
         if code == COMMUNICATION_CRC_ERROR_CODE:
-            return DispatchStatus.CRC_UNCONFIRMED
+            return code
         if code not in NONFATAL_SDK_CODES:
-            # 1501035 is overcurrent, not contact; termination retains UNKNOWN delivery and the SDK error.
+            # 1501035 is overcurrent, not contact; the SDK error must terminate the owning run.
             raise XHandError("send", code, getattr(error, "error_message", ""))
-        return DispatchStatus.ACCEPTED
+        return code
 
     def make_command(self, qpos: np.ndarray) -> Any:
         command = self.sdk.HandCommand_t()

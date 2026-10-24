@@ -30,7 +30,7 @@ class ActionResult:
     hand_qpos: np.ndarray | None
     ik_result: IKResult | None = None
     rejection_reason: str | None = None
-    # Projected Cartesian target; Teleop commits its EMA only after dispatch.
+    # 投影后的笛卡尔目标；Teleop 仅在公共提交正常返回后更新 EMA。
     eef_pose: Pose | None = None
 
 

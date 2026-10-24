@@ -9,7 +9,7 @@ from dexmani_real.robot.feedback import HAND_STATE_DTYPE
 logger = logging.getLogger(__name__)
 
 
-def hand_feedback_time_ns(hand, required_tactile=("aggregate", "dense")):
+def hand_feedback_time_ns(hand, required_tactile):
     """Oldest required hand source, without conflating tactile age with joint time."""
     return min(
         int(hand[name][0])
@@ -17,7 +17,7 @@ def hand_feedback_time_ns(hand, required_tactile=("aggregate", "dense")):
     )
 
 
-def update_tactile_cache(raw, values, valid_ns, now_ns):
+def update_tactile_cache(raw, values, valid_ns, source_ns):
     """Hold whole three-axis vectors; only finite new vectors advance their clocks."""
     # Validate in the observation dtype too: finite float64 may overflow float32.
     with np.errstate(over="ignore", invalid="ignore"):
@@ -26,18 +26,15 @@ def update_tactile_cache(raw, values, valid_ns, now_ns):
         raise RuntimeError(f"invalid tactile shape: {raw.shape}, expected {values.shape}")
     valid = np.isfinite(raw).all(axis=-1)
     np.copyto(values, raw, where=valid[..., None])
-    np.copyto(valid_ns, now_ns, where=valid)
+    np.copyto(valid_ns, source_ns, where=valid)
     return not valid.all()
 
 
 class XHandFeedback:
     """Own consumed samples and their validity clocks within one robot connection."""
 
-    def __init__(self, config, *, required_tactile=("aggregate", "dense")):
+    def __init__(self, config):
         self.config = config
-        self.required_tactile = tuple(required_tactile)
-        if not set(self.required_tactile) <= {"aggregate", "dense"}:
-            raise ValueError("unknown required tactile channel")
         self.latest = None
         self.tactile_cache = {}
         self.tactile_held = set()
@@ -62,7 +59,7 @@ class XHandFeedback:
             else deadline_ns
         )
 
-    def consume(self, state, now_ns):
+    def consume(self, state, *, source_ns, now_ns):
         if state is None:
             if not self.read_crc:
                 logger.warning("XHand read CRC; holding previous feedback within age budget")
@@ -90,7 +87,7 @@ class XHandFeedback:
         frame = np.zeros(1, dtype=HAND_STATE_DTYPE)
         frame["qpos"] = state.qpos
         for name, (values, valid_ns) in self.tactile_cache.items():
-            held = update_tactile_cache(getattr(state, f"tactile_{name}"), values, valid_ns, now_ns)
+            held = update_tactile_cache(getattr(state, f"tactile_{name}"), values, valid_ns, source_ns)
             if held and name not in self.tactile_held:
                 logger.warning("XHand tactile %s incomplete; holding previous finite vectors", name)
                 self.tactile_held.add(name)
@@ -100,7 +97,7 @@ class XHandFeedback:
             # Assignment copies into an independent snapshot for recording/model workers.
             frame[f"tactile_{name}"] = values
             frame[f"tactile_{name}_timestamp_ns"] = valid_ns.min()
-        frame["timestamp_ns"] = now_ns
+        frame["timestamp_ns"] = source_ns
         frame.flags.writeable = False
         self.latest = frame
         return self.checked_feedback(now_ns)
@@ -113,17 +110,12 @@ class XHandFeedback:
             if not np.isfinite(frame["qpos"]).all():
                 raise RuntimeError("hand joint feedback is nonfinite")
             issue = None
-            for name in (
-                "timestamp_ns",
-                *(f"tactile_{channel}_timestamp_ns" for channel in self.required_tactile),
-            ):
-                stamp = int(frame[name][0])
-                if not 0 < stamp <= now_ns < stamp + max_age_ns:
-                    issue = (
-                        f"hand {name}: no valid initial value or feedback age reached "
-                        f"{self.config.feedback_max_age_s:.3f}s"
-                    )
-                    break
+            stamp = int(frame["timestamp_ns"][0])
+            if not 0 < stamp <= now_ns < stamp + max_age_ns:
+                issue = (
+                    "hand timestamp_ns: no valid initial value or feedback age reached "
+                    f"{self.config.feedback_max_age_s:.3f}s"
+                )
         # Idle feedback may recover after a cancelled wait; the deadline only bounds missing values.
         if issue is not None and self.initializing_until_ns is not None:
             if now_ns >= self.initializing_until_ns:

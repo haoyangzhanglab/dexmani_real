@@ -15,11 +15,14 @@ from dexmani_real.calibration.camera.extrinsics import (
 from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError
 from dexmani_real.data.results import EpisodeResults, error_detail
 from dexmani_real.deployment.episode import PolicyEpisode, failure_reason
-from dexmani_real.deployment.observation import ObservationKinematics, build_policy_observation
+from dexmani_real.deployment.observation import (
+    ObservationKinematics, build_policy_observation, policy_dependencies,
+)
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
+from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.home import build_home_planner, home_robot
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.robot import DexManiRobot
@@ -35,18 +38,24 @@ logger = logging.getLogger(__name__)
 
 def build_observation_kinematics(policy_info, runtime):
     """Build requested geometry once; the inference worker owns all FK workspaces."""
-    requested = set(policy_info.observation_fields)
-    needs_hand_fk = bool(requested & {"fingertip_xyz", "hand_pointcloud"})
-    if not needs_hand_fk and "eef_pose" not in requested:
+    dependencies = policy_dependencies(policy_info.observation_fields)
+    needs_hand_fk = "hand_fk" in dependencies
+    if "arm_fk" not in dependencies:
         return None
+    execution = runtime.execution
+    minimum_gap = (
+        execution.action_steps + 1 if execution.execution_mode == "sync"
+        else min(execution.action_steps, execution.action_steps - execution.prefetch_steps + 1)
+    )
+    row_features = {} if policy_info.n_obs_steps > minimum_gap else None
     if not needs_hand_fk:
-        return ObservationKinematics(make_arm_fk())
+        return ObservationKinematics(make_arm_fk(), row_features=row_features)
     hand_fk = HandKinematics(
         str(XHAND_RIGHT_URDF_PATH),
-        policy_info.fingertip_link_names if "fingertip_xyz" in requested else None,
+        policy_info.fingertip_link_names if "fingertips" in dependencies else None,
     )
     hand_cloud = None
-    if "hand_pointcloud" in requested:
+    if "hand_cloud" in dependencies:
         from dexmani_real.planning.kinematics.hand_pointcloud import HandPointCloudTemplate
 
         hand_cloud = HandPointCloudTemplate(runtime.hand_pointcloud, hand_fk)
@@ -54,7 +63,7 @@ def build_observation_kinematics(policy_info, runtime):
         make_arm_fk(), hand_fk,
         tuple(runtime.hand.T_eef_handbase_pos_xyz),
         tuple(runtime.hand.T_eef_handbase_quat_wxyz),
-        hand_cloud,
+        hand_cloud, row_features,
     )
 
 
@@ -115,7 +124,8 @@ class PolicySession:
         runtime,
         info,
         *,
-        needs,
+        control_needs,
+        record_needs,
         device="cuda:0",
         seed=0,
         max_running_s=None,
@@ -133,7 +143,8 @@ class PolicySession:
         self.recording_dir = recording_dir
         self.results_dir = results_dir
         self.camera_calibration_path = camera_calibration_path
-        self.needs = needs
+        self.control_needs, self.record_needs = control_needs, record_needs
+        self.needs = control_needs.union(record_needs)
         self.keyboard = None
         self.home_results = []
         self.episode = None
@@ -219,10 +230,11 @@ class PolicySession:
         )
         self.sensors = SensorProcesses(self.runtime_state, channels)
         self.robot = DexManiRobot(
-            self.runtime_state,
-            self.runtime,
+            self.runtime, run_signal=self.runtime_state.run_signal,
+            stop_signal=self.runtime_state.stop_signal,
+            emergency_signal=self.runtime_state.emergency_signal,
+            signal_lock=self.runtime_state.motion_lock,
             check_services=self.sensors.check,
-            required_tactile=self.needs.required_tactile,
         )
 
         self.kinematics = build_observation_kinematics(self.info, self.runtime)
@@ -237,6 +249,10 @@ class PolicySession:
             build_observation=lambda rows: build_policy_observation(
                 rows, self.info, kinematics=self.kinematics,
                 camera_parameters=self.camera_parameters,
+            ),
+            reset_observation=(
+                self.kinematics.row_features.clear
+                if self.kinematics is not None and self.kinematics.row_features is not None else None
             ),
         )
         self.warmup_policy()
@@ -267,7 +283,16 @@ class PolicySession:
         if self.keyboard.estop_latched or not self.keyboard.healthy:
             self.runtime_state.request_emergency_stop()
             return False
-        return self.sensors.check()
+        control_services = []
+        if self.control_needs.camera != "none" or self.control_needs.point_cloud:
+            control_services.append("camera")
+        if self.control_needs.point_cloud:
+            control_services.append("pointcloud")
+        if not self.sensors.check(names=control_services):
+            raise RobotError("control sensor process exited")
+        if self.record_needs.camera != "none" and not self.sensors.check(names=("camera",)):
+            raise RecordingError("recording camera process exited")
+        return True
 
     def start_devices(self):
         self.keyboard.start()
@@ -609,7 +634,7 @@ class PolicySession:
                 preparing_epoch=epoch,
                 robot=self.robot,
                 sensors=self.sensors,
-                needs=self.needs,
+                control_needs=self.control_needs, record_needs=self.record_needs,
                 action_mapper=self.action_mapper,
                 model_runtime=self.model,
                 max_running_s=self.max_running_s,
@@ -688,7 +713,8 @@ class PolicySession:
         except Exception as exc:
             failure, reason = exc, failure_reason(exc)
             self.runtime_state.mark_error()
-            self.sensors.request_shutdown(reason=reason)
+            self.runtime_state.end_session(reason=reason)
+            self.sensors.request_shutdown()
         finally:
             try:
                 self.advance_episode(shutdown=True, failure=failure, reason=reason)

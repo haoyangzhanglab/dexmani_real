@@ -18,7 +18,6 @@ import numpy as np
 import yaml
 
 from dexmani_real.config.experiment import load_experiment_config
-from dexmani_real.robot.commands import DispatchStatus
 from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
@@ -182,10 +181,8 @@ class XHandControlExample(XHand):
         self.check_cancelled()
         deadline_ns = time.monotonic_ns() + int(self.cfg.home_timeout_s * 1e9)
         self.motion_pending = True  # SDK exceptions do not establish non-delivery.
-        status = self.send_action(target)
-        print(f"  send_action: {status.name}")
-        if status not in (DispatchStatus.ACCEPTED, DispatchStatus.CRC_UNCONFIRMED):
-            raise RuntimeError(f"action rejected: {status.name}")
+        self.send_action(target)
+        print("  final target submission attempted; checking measured convergence")
         tolerance_rad = np.deg2rad(self.cfg.home_tolerance_deg)
         consecutive = 0
         while time.monotonic_ns() < deadline_ns:

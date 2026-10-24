@@ -15,12 +15,14 @@ class ModelResult:
     started_ns: int
     completed_ns: int
     query_context: dict | None = None
+    model_started_ns: int | None = None
 
 
 class InferenceWorker:
-    def __init__(self, factory, *, build_observation):
+    def __init__(self, factory, *, build_observation, reset_observation=None):
         self.model_factory = factory
         self.build_observation = build_observation
+        self.reset_observation = reset_observation
         self.model = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-model")
         self.future = None
@@ -29,6 +31,7 @@ class InferenceWorker:
 
     def run_operation(self, operation, args, kwargs, query_context=None):
         start = time.monotonic_ns()
+        model_start = None
         value, error = None, None
         try:
             if operation == "load":
@@ -37,14 +40,16 @@ class InferenceWorker:
             elif operation == "predict":
                 # This worker exclusively owns observation FK workspaces and the model.
                 observation = self.build_observation(args[0])
-                start = time.monotonic_ns()
+                model_start = time.monotonic_ns()
                 value = self.model.predict(observation, **kwargs)
             elif operation != "close" or self.model is not None:
+                if operation == "reset_episode" and self.reset_observation is not None:
+                    self.reset_observation()
                 value = getattr(self.model, operation)(*args, **kwargs)
         except BaseException as exc:
             error = exc
         # Completion includes the blocking transfer to an owned CPU NumPy prediction.
-        return ModelResult(value, error, start, time.monotonic_ns(), query_context)
+        return ModelResult(value, error, start, time.monotonic_ns(), query_context, model_start)
 
     def submit(self, operation, *args, query_context=None, **kwargs):
         if self.close_future is not None or self.future is not None:

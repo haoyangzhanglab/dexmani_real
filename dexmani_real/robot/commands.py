@@ -1,20 +1,8 @@
-"""Owned absolute targets for arm submission and hand SDK dispatch."""
+"""Owned final targets and device-boundary errors."""
 
 from dataclasses import dataclass
-from enum import IntEnum
 
 import numpy as np
-
-
-class DispatchStatus(IntEnum):
-    """Dispatch facts. SUBMITTED is a host goal, ACCEPTED is an actual SDK result."""
-
-    NOT_CALLED = 0
-    ACCEPTED = 1
-    CRC_UNCONFIRMED = 2
-    REJECTED = 3
-    UNKNOWN = 4
-    SUBMITTED = 5
 
 
 @dataclass(frozen=True)
@@ -22,6 +10,7 @@ class RobotCommand:
     run_id: int
     arm_qpos: np.ndarray | None = None
     hand_qpos: np.ndarray | None = None
+    input_generation: int = -1
 
     def __post_init__(self):
         if self.arm_qpos is None and self.hand_qpos is None:
@@ -34,28 +23,12 @@ class RobotCommand:
                 object.__setattr__(self, name, value)
 
 
-@dataclass(frozen=True)
-class DispatchResult:
-    arm: DispatchStatus = DispatchStatus.NOT_CALLED
-    hand: DispatchStatus = DispatchStatus.NOT_CALLED
-    timestamp_ns: int = 0  # host dispatch completion, never arrival
-    command_id: tuple[int, int] = (-1, -1)
+class OperationCancelled(RuntimeError):
+    """The owning run or input was revoked before an operation could complete."""
 
 
-class DispatchError(RuntimeError):
-    def __init__(self, message, result, *, revoked=False, cause=None):
-        super().__init__(message)
-        self.result = result
-        self.revoked = revoked
-        self.cause = cause
-
-
-class DispatchInterrupted(KeyboardInterrupt):
-    """Cancellation evidence local to one attempted dispatch."""
-
-    def __init__(self, result):
-        super().__init__("dispatch interrupted")
-        self.result = result
+class RobotError(RuntimeError):
+    """Device I/O or a local executor failed; the coordinator must end the run."""
 
 
 def check_arm_target(

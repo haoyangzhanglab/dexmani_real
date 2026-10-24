@@ -41,10 +41,10 @@ from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.planning.target import TargetChecker
 from dexmani_real.planning.kinematics.ik import OnlineIKConfig, OnlineIKSolver, make_online_ik_solver
 from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
-from dexmani_real.robot.commands import DispatchError
+from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.home import build_home_planner, execute_arm_home
 from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.observation import read_camera_frame
+from dexmani_real.runtime.observation import read_camera_frame, service_feedback
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, SafetyState, RuntimeState
@@ -477,15 +477,15 @@ class CameraCalibrationSession:
         exit_code = 1
         try:
             self.keys = KeyboardInput(
-                jog_change_callback=self.runtime_state.jog_input_changed,
                 quit_callback=self.runtime_state.request_quit,
                 capture_commands=False,
                 capture_raw_events=True,
-                estop_callback=lambda: self.fault("operator e-stop callback", estop=True),
+                estop_callback=self.runtime_state.request_emergency_stop,
             )
             self.keys.start()
             if not self.keys.healthy:
                 raise RuntimeError("keyboard stop listener unavailable")
+            self.robot.input_signal = self.keys.generation_signal
             self.robot.connect()
             self.camera_process = self.ctx.Process(
                 name="camera",
@@ -668,7 +668,7 @@ class CameraCalibrationSession:
         return True
 
     def motion_tick(self):
-        """Propose a jog target and commit it only after successful dispatch."""
+        """构造 jog 目标，仅在公共提交正常返回后更新参考。"""
         with self.runtime_state.motion_lock:
             safety_state, epoch = self.runtime_state.safety_state, self.runtime_state.run_id
         if (
@@ -709,10 +709,8 @@ class CameraCalibrationSession:
             if self.robot.stop_required:
                 self.robot.stop()
             try:
-                self.robot.prepare_streaming(epoch)
-            except DispatchError as exc:
-                if not exc.revoked:
-                    raise
+                self.robot.prepare_streaming(epoch, service=lambda: service_feedback(self.robot, self.runtime))
+            except OperationCancelled:
                 self.robot.stop()
                 self.jog.clear_reference()
                 return
@@ -741,7 +739,10 @@ class CameraCalibrationSession:
             return
 
         try:
-            self.robot.arm.update_health(upstream_until_ns=2**63 - 1)
+            self.robot.arm.update_health(health_until_ns=min(
+                time.monotonic_ns() + int(self.runtime.arm.feedback_max_age_s * 1e9),
+                self.feedback_timestamp_ns + int(self.runtime.arm.feedback_max_age_s * 1e9) + 1,
+            ))
             committed = self.jog.submit(
                 proposed_pose, ik_result.qpos, self.keys, generation,
                 self.runtime_state, self.robot, epoch,
@@ -751,17 +752,12 @@ class CameraCalibrationSession:
                 execute_until_ns=self.feedback_timestamp_ns
                 + int(keyboard.target_max_age_s * 1e9),
             )
-        except DispatchError as exc:
-            if not exc.revoked:
-                self.runtime_state.revoke_motion(
-                    SafetyState.FAULT, reason=RunEndReason.HARDWARE_FAULT
-                )
-                raise
-            logger.info("calibration motion interrupted: dispatch=%s", exc.result)
+        except (OperationCancelled, TimeoutError) as exc:
+            logger.info("jog interrupted: %s", exc)
             self.robot.stop()
             self.jog.clear_reference()
             return
-        if committed is None:
+        if not committed:
             return
 
         if self.frame % self.calibration_config.status_interval_frames == 0:
@@ -818,7 +814,11 @@ class CameraCalibrationSession:
         self.keys = None
         self.window_created = False
         self.robot = DexManiRobot(
-            self.runtime_state, self.runtime, check_services=self.check_services
+            self.runtime, run_signal=self.runtime_state.run_signal,
+            stop_signal=self.runtime_state.stop_signal,
+            emergency_signal=self.runtime_state.emergency_signal,
+            signal_lock=self.runtime_state.motion_lock,
+            check_services=self.check_services,
         )
         self.samples = CalibrationSamples()
         self.jog = JogController(solver, self.target_checker, self.runtime.keyboard_teleop, workspace)
