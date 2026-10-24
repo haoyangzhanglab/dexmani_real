@@ -43,15 +43,15 @@ class PolicySession:
         *,
         control_needs,
         record_needs,
+        results_dir,
+        run_config,
         device="cuda:0",
         seed=0,
         max_running_s=None,
         num_episodes=DEFAULT_NUM_EPISODES,
         recording_dir=None,
-        results_dir=None,
         camera_calibration_path=None,
         table_plane_abcd=None,
-        run_config=None,
     ):
         self.run_config = run_config
         self.runtime = runtime
@@ -83,9 +83,7 @@ class PolicySession:
             f"{1.0 / self.info.control_dt_s:g} Hz"
         )
         print("正在初始化模型和设备…", flush=True)
-        self.results = (
-            EpisodeResults(self.results_dir, "policy") if self.results_dir is not None else None
-        )
+        self.results = EpisodeResults(self.results_dir, "policy")
         self.runtime_state = self.sensors = self.robot = None
         self.model = self.recorder = None
         failure = None
@@ -237,7 +235,7 @@ class PolicySession:
         self.camera_parameters = build_observation_camera(
             self.camera_snapshot, self.info.observation_fields, depth_config=self.info.depth_config,
         )
-        if self.run_config is not None and self.camera_snapshot is not None:
+        if self.camera_snapshot is not None:
             self.run_config["effective_camera"] = {
                 "camera_T_xarm_base_from_color": None,
                 **self.camera_snapshot.metadata(),
@@ -245,7 +243,7 @@ class PolicySession:
                 "translation_units": "m",
             }
             atomic_yaml_dump(
-                self.run_config, (self.results_dir or self.recording_dir) / "run_config.yaml",
+                self.run_config, self.results_dir / "run_config.yaml",
             )
         if self.needs.point_cloud:
             from dexmani_real.sensor.pointcloud.worker import run_pointcloud_worker
@@ -321,32 +319,30 @@ class PolicySession:
             shutdown_clean = (
                 shutdown_clean and not cleanup_errors and model_close["status"] == "completed"
             )
-            if self.results is not None:
-                self.results.record_errors(cleanup_errors)
+            self.results.record_errors(cleanup_errors)
             home_fault = any(item["outcome"] in ("failed", "fault") for item in self.home_results)
             successful = clean and failure is None and shutdown_clean and not home_fault
-            if self.results is not None:
-                try:
-                    if failure:
-                        reason = str(failure)
-                    elif home_fault:
-                        reason = "return_home_failed"
-                    elif model_close["status"] != "completed":
-                        reason = f"model_close_{model_close['status']}"
-                    elif not shutdown_clean:
-                        reason = "shutdown_failed"
-                    else:
-                        reason = None
-                    self.results.finish_session(
-                        outcome="finished" if successful else "fault",
-                        reason=reason,
-                        shutdown_clean=shutdown_clean,
-                        model_close=model_close,
-                        home_results=self.home_results,
-                    )
-                except Exception:
-                    successful = False
-                    logger.exception("session result publication failed")
+            try:
+                if failure:
+                    reason = str(failure)
+                elif home_fault:
+                    reason = "return_home_failed"
+                elif model_close["status"] != "completed":
+                    reason = f"model_close_{model_close['status']}"
+                elif not shutdown_clean:
+                    reason = "shutdown_failed"
+                else:
+                    reason = None
+                self.results.finish_session(
+                    outcome="finished" if successful else "fault",
+                    reason=reason,
+                    shutdown_clean=shutdown_clean,
+                    model_close=model_close,
+                    home_results=self.home_results,
+                )
+            except Exception:
+                successful = False
+                logger.exception("session result publication failed")
         if model_close["status"] == "pending":
             logger.warning("Model cleanup remains pending; Python/CUDA exit is not bounded")
         return int(not successful)

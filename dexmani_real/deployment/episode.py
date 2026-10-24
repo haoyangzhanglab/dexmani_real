@@ -74,9 +74,9 @@ class PolicyEpisode:
         max_running_s,
         query_ids,
         capture_ids,
+        results,
         recorder=None,
         camera_snapshot=None,
-        results=None,
     ):
         self.runtime_state = runtime_state
         self.runtime = runtime
@@ -234,14 +234,13 @@ class PolicyEpisode:
                 ),
                 row_count=self.recorder.written_frames,
             )
-        if self.results is not None:
-            try:
-                self.results.finish_episode(
-                    reason, details=detail, errors=errors, raw=raw, duration_s=duration_s
-                )
-            except BaseException as exc:
-                failure = failure or exc
-                self.results.record_errors([error_detail("evaluation_save", exc)])
+        try:
+            self.results.finish_episode(
+                reason, details=detail, errors=errors, raw=raw, duration_s=duration_s
+            )
+        except BaseException as exc:
+            failure = failure or exc
+            self.results.record_errors([error_detail("evaluation_save", exc)])
         if failure is not None:
             raise failure
 
@@ -276,8 +275,7 @@ class PolicyEpisode:
         return row
 
     def prepare(self):
-        if self.results is not None:
-            self.results.begin_episode()
+        self.results.begin_episode()
         try:
             self.robot.reset_hand_feedback()
             row = self.start_observation(wait_for_hand=True)
@@ -322,8 +320,7 @@ class PolicyEpisode:
         self.run_id, self.started_ns = admitted
         self.preparing_epoch = None
         self.next_step_ns = self.wait_started_ns = self.started_ns
-        if self.results is not None:
-            self.results.entered(self.run_id)
+        self.results.entered(self.run_id)
 
     def poll_model(self):
         item = self.model.poll()
@@ -354,7 +351,7 @@ class PolicyEpisode:
             raise RuntimeError("Model result has no owned query")
         if result.query_context != dict(run_id=query.run_id, query_id=query.query_id):
             raise RuntimeError("model result/query ownership mismatch")
-        if self.results is not None and query.run_id == self.run_id:
+        if query.run_id == self.run_id:
             self.results.record_inference(result)
         if query.run_id != self.run_id or not self.has_motion_authority():
             failure = self.retired_model_error(operation, result) if result.error is not None else None
@@ -377,8 +374,7 @@ class PolicyEpisode:
             started_ns=result.started_ns, completed_ns=result.completed_ns,
         )
         logger.error("retired model task failed: %s", detail)
-        if self.results is not None:
-            self.results.record_errors([detail])
+        self.results.record_errors([detail])
         return RuntimeError(
             f"retired model {operation} failed: context={result.query_context}; "
             f"{type(result.error).__name__}: {result.error}"
@@ -393,8 +389,7 @@ class PolicyEpisode:
             return ControlRejection("query_authority_revoked")
         sources = rows[-1].source_times
         expires_at_ns = decision_expires_at_ns(sources, now, self.max_decision_age_ns)
-        if self.results is not None:
-            self.results.record_duration("source_age", now - min(sources))
+        self.results.record_duration("source_age", now - min(sources))
         if expires_at_ns is None:
             return ControlRejection("query_sources_invalid_or_expired")
         if prefix is not None and now >= self.plan.expires_at_ns:
@@ -501,8 +496,7 @@ class PolicyEpisode:
         plan = self.plan
         mapping_started = time.monotonic_ns()
         command, issue = self.command_for_slot(row, slot)
-        if self.results is not None:
-            self.results.record_duration("mapping", time.monotonic_ns() - mapping_started)
+        self.results.record_duration("mapping", time.monotonic_ns() - mapping_started)
         if issue is not None:
             self.finish(issue.detail, run_end_reason=issue.run_end_reason)
             return
@@ -536,8 +530,7 @@ class PolicyEpisode:
                     command, valid_until_ns=valid_until_ns, execute_until_ns=execute_until_ns,
                 )
             finally:
-                if self.results is not None:
-                    self.results.record_duration("submission", time.monotonic_ns() - started_ns)
+                self.results.record_duration("submission", time.monotonic_ns() - started_ns)
         except (OperationCancelled, TimeoutError) as exc:
             self.finish(
                 str(exc), run_end_reason=RunEndReason.EXECUTOR_BOUNDARY,
@@ -638,8 +631,7 @@ class PolicyEpisode:
         if slot is None:
             return
         if skipped:
-            if self.results is not None:
-                self.results.record_skipped_slots(skipped)
+            self.results.record_skipped_slots(skipped)
             self.finish(f"missed_slot: expected={slot}, actual={slot + skipped}")
             return
         self.last_slot = slot

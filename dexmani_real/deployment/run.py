@@ -143,7 +143,6 @@ def run_policy(
         "max_duration_s": max_running_s,
         "output": str(session_dir),
         "record_raw": record_raw,
-        "record_results": True,
         "dexmani_real_head": git_head(Path(__file__).resolve().parents[2]),
         "dexmani_policy_head": git_head(Path(dexmani_policy.__file__).resolve().parents[1]),
     }

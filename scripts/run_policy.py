@@ -42,8 +42,7 @@ def positive_running_seconds(raw: str) -> float:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run one policy-evaluation session with independently optional "
-            "Raw recording and evaluation summary"
+            "Run one policy-evaluation session with required results and optional Raw recording"
         )
     )
     parser.add_argument(

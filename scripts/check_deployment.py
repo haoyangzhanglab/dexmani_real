@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+import json
 import tempfile
 import threading
 import time
@@ -68,12 +69,13 @@ class DeploymentChecks(unittest.TestCase):
         episode = PolicyEpisode.__new__(PolicyEpisode)
         episode.run_id = 2
         episode.query = PolicyQuery(7, 1, 0, 100, None)
-        episode.results = None
+        episode.results = Mock()
         episode.termination = object()
         episode.has_motion_authority = lambda: True
         episode.model = SimpleNamespace(poll=lambda: ("predict", ModelResult(np.ones((4, 19)), None, 1, 2, dict(run_id=1, query_id=7))))
         episode.poll_model()
         self.assertIsNone(episode.query)
+        episode.results.record_inference.assert_not_called()
 
     def test_worker_single_inflight_and_serial_close(self):
         entered, release = threading.Event(), threading.Event()
@@ -105,6 +107,28 @@ class DeploymentChecks(unittest.TestCase):
         result = worker.close_result(timeout_s=2)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(operations, ["warmup", "predict", "close"])
+
+    def test_startup_failure_publishes_required_result_without_devices(self):
+        from dexmani_real.deployment.session import PolicySession
+        from dexmani_real.runtime.observation import ObservationNeeds
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            info = SimpleNamespace(checkpoint_path=Path("model.pt"), weights="raw",
+                                   inference_steps=10, control_dt_s=.0625)
+            session = PolicySession(
+                ExperimentConfig(), info, control_needs=ObservationNeeds(),
+                record_needs=ObservationNeeds(), results_dir=root, run_config={},
+            )
+            with patch.object(session, "prepare_resources", side_effect=RuntimeError("model failed")), \
+                 patch.object(session, "start_devices") as devices:
+                self.assertEqual(session.run(), 1)
+            devices.assert_not_called()
+            result = json.loads((root / "session_result.json").read_text())
+            self.assertEqual(result["outcome"], "fault")
+            self.assertEqual(result["reason"], "model failed")
+            self.assertEqual(result["episodes"], [])
+            self.assertTrue(result["shutdown_clean"])
 
     def test_result_required_raw_optional_and_output_failure(self):
         with tempfile.TemporaryDirectory() as directory:
