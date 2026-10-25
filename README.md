@@ -81,13 +81,21 @@ python scripts/run_policy.py policy/task/experiment --config local.yaml
 python scripts/run_policy.py policy/task/experiment --config local.yaml --execution-mode async --prefetch-steps 1 --n-action-steps 4
 ```
 
-实验参数为不带 `experiments/` 前缀的 `policy/task/experiment`，或绝对实验目录。训练 artifact 决定输入、预处理、动作表示和控制周期；Real 提供当前设备、标定与执行配置。
+实验参数为不带 `experiments/` 前缀的 `policy/task/experiment`，或绝对实验目录。`policy` 是方法身份（如 `sat`），`ddp/sat` 仅用于 Policy 的 Hydra 配置选择与 DDP 启动；新 DDP 实验同样以 `sat/task/experiment` 部署。训练 artifact 决定输入、预处理、动作表示和控制周期；Real 提供当前设备、标定与执行配置。
 
-默认使用 `sync`；`async` 需设置 `prefetch_steps`，`rtc` 还需设置 `rtc_guidance_cap`，并由模型支持。执行参数见 [execution.py](dexmani_real/config/execution.py)。LAMP 真机闭环尚未验证。
+默认 checkpoint 为 `latest`；选择 `--checkpoint best` 时，EMA/raw 与 NFE 默认取选点记录，可由 `--weights`、`--inference-steps` 覆盖。Real 执行长度取 YAML/CLI 的 `execution.action_steps`（CLI 为 `--n-action-steps`），未设置时取保存的 `n_action_steps`，不继承仿真选点的执行长度。默认使用 `sync`；`async` 需设置 `prefetch_steps`，`rtc` 还需设置 `rtc_guidance_cap`，并由模型支持。执行参数见 [execution.py](dexmani_real/config/execution.py)。LAMP 真机闭环尚未验证。
 
 H 回 HOME、B 开始本轮、S 结束本轮，整理场景后再次按 H、B；Q 退出，ESC 请求急停。T 仅在空闲、无 capture 且五指无接触时请求复位触觉。默认最多 20 轮、每轮 60 秒，可用 `--num-episodes`、`--max-duration` 调整。
 
-产物默认位于 `rollouts/policy/task/experiment/session_*/`，包含实际配置、评估摘要与 Raw。`--no-record` 仅关闭 Raw，**仍连接设备、执行动作并保存配置和结果**。从 `session_result.json` 查看本轮收尾时记录的结果与 Raw 路径。
+产物默认位于 `rollouts/policy/task/experiment/session_*/`，包含实际配置、评估摘要与 Raw。方法、任务与 run 均须为单层目录名，输出不得通过符号链接逃逸 `--output` 根目录；不兼容带 `ddp/` 的旧方法名或迁移旧产物。`--no-record` 仅关闭 Raw，**仍连接设备、执行动作并保存配置和结果**。从 `session_result.json` 查看本轮收尾时记录的结果与 Raw 路径。
+
+从本仓库根目录、使用已安装两个仓库及 Real 离线依赖（含 fpsample）的环境执行：
+
+```bash
+python scripts/check_deployment.py
+```
+
+该入口使用临时产物与 PolicySession 替身，检查 DDP 方法名到会话目录、路径拒绝、best 推理默认值与 Real 执行参数的职责及既有模式/模态限制；不加载模型、不连接设备或外部服务。Policy 侧的全部 DDP 配方和原启动入口检查见[验证指南](../dexmani_policy/docs/验证指南.md#基础设施与跨仓库离线检查)。通过只证明名称与接口一致性，不代表所有方法支持真机部署或已验证真机安全。
 
 ### 5. 真机轨迹回放
 
