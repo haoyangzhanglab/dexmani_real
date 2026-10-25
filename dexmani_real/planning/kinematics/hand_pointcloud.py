@@ -1,8 +1,4 @@
-"""Fixed XHand visual-surface XYZRGB samples; only measured FK moves them.
-
-Surface sampling follows cordvip_geometry/hand_cloud.py; FK stays in HandKinematics.
-The small URDF marker meshes are excluded as in Sim's hand-template generator.
-"""
+"""按 XHand URDF 表面面积分配固定 XYZRGB 样本，再由实测关节 FK 变换。"""
 
 import xml.etree.ElementTree as ET
 
@@ -17,7 +13,7 @@ from dexmani_real.sensor.pointcloud.hand_config import (
 )
 
 
-def _vector(text, default):
+def parse_urdf_vector(text, default):
     value = np.asarray(default if text is None else text.split(), dtype=np.float64)
     if value.shape != (3,) or not np.isfinite(value).all():
         raise ValueError("URDF visual scale/origin must contain three finite numbers")
@@ -54,16 +50,16 @@ class HandPointCloudTemplate:
                 mesh = trimesh.load(mesh_path, process=False)
                 if not isinstance(mesh, trimesh.Trimesh):
                     raise ValueError(f"{mesh_path}: expected one triangle mesh")
-                scale = _vector(mesh_tag.get("scale"), (1, 1, 1))
+                scale = parse_urdf_vector(mesh_tag.get("scale"), (1, 1, 1))
                 if np.any(scale <= 0):
                     raise ValueError("hand visual scale must be positive")
                 mesh.apply_scale(scale)
                 origin = visual.find("origin")
                 if origin is not None:
                     transform = np.eye(4)
-                    transform[:3, 3] = _vector(origin.get("xyz"), (0, 0, 0))
+                    transform[:3, 3] = parse_urdf_vector(origin.get("xyz"), (0, 0, 0))
                     transform[:3, :3] = hand_fk.pin.rpy.rpyToMatrix(
-                        _vector(origin.get("rpy"), (0, 0, 0))
+                        parse_urdf_vector(origin.get("rpy"), (0, 0, 0))
                     )
                     mesh.apply_transform(transform)
                 if not np.isfinite(mesh.vertices).all() or not np.isfinite(mesh.area) or mesh.area <= 0:

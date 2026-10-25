@@ -10,15 +10,14 @@ from dexmani_real.robot.model import (
 )
 
 
-def make_arm_fk() -> ArmFK:
-    """Create an owner-local FK workspace; Pinocchio Data must not cross worker ownership."""
-    return ArmFK(str(XARM7_XHAND_COLLISION_URDF_PATH))
-
-
 class ArmFK:
-    """Pinocchio FK in the URDF EEF frame, which differs from the xArm firmware EEF frame."""
+    """独占 Pinocchio 工作区的 URDF EEF FK；坐标定义不同于 xArm 固件 EEF。"""
 
-    def __init__(self, urdf_path: str, eef_frame_name: str = "custom_eef_link") -> None:
+    def __init__(
+        self,
+        urdf_path: str = str(XARM7_XHAND_COLLISION_URDF_PATH),
+        eef_frame_name: str = "custom_eef_link",
+    ) -> None:
         import pinocchio
 
         self.model = pinocchio.buildModelFromUrdf(str(urdf_path))
@@ -40,13 +39,8 @@ class ArmFK:
 
         R = np.asarray(pose.rotation, dtype=np.float64)
         eef_pos = np.asarray(pose.translation, dtype=np.float64).copy()
-        if (
-            eef_pos.shape != (3,)
-            or R.shape != (3, 3)
-            or not np.all(np.isfinite(eef_pos))
-            or not np.all(np.isfinite(R))
-        ):
-            raise RuntimeError("ArmFK produced a malformed or non-finite pose")
+        if not np.all(np.isfinite(eef_pos)) or not np.all(np.isfinite(R)):
+            raise RuntimeError("ArmFK produced a non-finite pose")
         eef_rot6d = np.concatenate([R[:, 0], R[:, 1]])
         return eef_pos, eef_rot6d
 
@@ -62,7 +56,7 @@ def compute_eef_pose_history_xarm_base(
         raise ValueError(
             f"arm qpos history must have shape (T, {ARM_JOINT_SHAPE[0]}), got {qpos_history.shape}"
         )
-    fk = make_arm_fk() if arm_fk is None else arm_fk
+    fk = ArmFK() if arm_fk is None else arm_fk
     poses = np.empty((len(qpos_history), 9), dtype=np.float64)
     for index, qpos in enumerate(qpos_history):
         eef_pos, eef_rot6d = fk.compute(qpos)

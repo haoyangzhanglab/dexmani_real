@@ -3,7 +3,7 @@
 import numpy as np
 
 from dexmani_real.planning.action import ActionIntent
-from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
+from dexmani_real.planning.kinematics.arm_fk import ArmFK
 from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.teleop.vr_mapping import ema_smooth_pose
@@ -13,7 +13,7 @@ class TeleopController:
     def __init__(self, action_mapper, arm_mapper, ema, hand_retargeter, *, arm_fk=None):
         self.action_mapper, self.arm_mapper, self.ema = action_mapper, arm_mapper, ema
         self.hand_retargeter = hand_retargeter
-        self.arm_fk = make_arm_fk() if arm_fk is None else arm_fk
+        self.arm_fk = ArmFK() if arm_fk is None else arm_fk
         self.clear_reference()
 
     def clear_reference(self):

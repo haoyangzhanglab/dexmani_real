@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from .kinematics.arm_fk import make_arm_fk
+from .kinematics.arm_fk import ArmFK
 from .kinematics.ik import DEFAULT_JUMP_DEG, joint_target_rejection
 
 
@@ -21,7 +21,7 @@ class TargetChecker:
         target_fk=None,
     ):
         self.collision_model = collision_model
-        self.target_fk = make_arm_fk() if target_fk is None else target_fk
+        self.target_fk = ArmFK() if target_fk is None else target_fk
         self.limits = np.column_stack((joint_lower_rad, joint_upper_rad))
         if self.limits.shape != (7, 2) or not np.isfinite(self.limits).all() or np.any(
             self.limits[:, 0] >= self.limits[:, 1]

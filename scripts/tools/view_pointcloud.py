@@ -31,7 +31,7 @@ from dexmani_real.sensor.pointcloud.processing import (
 )
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.visualization import (
+from dexmani_real.utils.visualization import (
     log_camera_geometry, log_points, log_rgbd, log_workspace, viewer_blueprint,
 )
 

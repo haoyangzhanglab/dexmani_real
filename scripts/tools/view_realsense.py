@@ -16,7 +16,7 @@ from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.sensor.camera.geometry import validate_aligned_depth_distortion
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud, build_raw_point_cloud
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.visualization import (
+from dexmani_real.utils.visualization import (
     log_camera_geometry, log_points, log_rgbd, log_series, viewer_blueprint,
 )
 

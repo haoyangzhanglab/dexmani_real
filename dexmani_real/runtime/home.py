@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.planning.paths import home_path
 from dexmani_real.robot.commands import RobotCommand, OperationCancelled
 from dexmani_real.robot.xhand.limits import validate_hand_command_bounds
@@ -137,16 +136,6 @@ def execute_arm_home(
                 raise
 
             logger.exception("HOME cleanup also failed")
-
-
-def build_home_planner(environment, *, table_plane_abcd) -> HomePlanner:
-    """Build HOME planning with current workspace/table/static geometry beyond online IK endpoint checks."""
-    return HomePlanner(
-        workspace_bounds=environment.workspace.as_array(),
-        static_boxes=tuple(environment.static_boxes),
-        table=environment.table,
-        table_plane_abcd=table_plane_abcd,
-    )
 
 
 def home_robot(runtime_state, arm, hand, planner, *, robot, abort_requested, service) -> HomeResult:

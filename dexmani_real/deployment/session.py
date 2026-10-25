@@ -19,9 +19,10 @@ from dexmani_real.deployment.observation import (
 )
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
+from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.home import build_home_planner, home_robot
+from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.observation import service_feedback, snapshot_camera_parameters
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
@@ -190,7 +191,7 @@ class PolicySession:
             self.info.action_mode, arm=self.runtime.arm, hand=self.runtime.hand,
             motion=self.runtime.motion, environment=self.runtime.environment,
         )
-        self.home_planner = build_home_planner(
+        self.home_planner = HomePlanner(
             self.runtime.environment, table_plane_abcd=self.table_plane_abcd,
         )
         self.keyboard = KeyboardInput(

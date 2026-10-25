@@ -175,12 +175,8 @@ class ActionMapper:
     def control_from_command(self, command, mode):
         if mode == "joint":
             return np.concatenate((command.arm_qpos, command.hand_qpos))
-        from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
-
-        pose = compute_eef_pose_history_xarm_base(
-            command.arm_qpos[None], arm_fk=self.target_checker.target_fk
-        )[0]
-        return np.concatenate((pose, command.hand_qpos))
+        position, rotation = self.target_checker.target_fk.compute(command.arm_qpos)
+        return np.concatenate((position, rotation, command.hand_qpos))
 
     def frozen_rejection(self, command, current, previous, mode):
         previous = current if previous is None else previous

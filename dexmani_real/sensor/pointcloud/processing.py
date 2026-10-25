@@ -67,17 +67,6 @@ def validate_color(color: np.ndarray, intrinsics: CameraIntrinsics) -> None:
         raise ValueError("color must be uint8 [H,W,3] matching color intrinsics")
 
 
-def local_3x3_count(mask: np.ndarray) -> np.ndarray:
-    """Count true pixels in each clipped 3x3 neighborhood."""
-    return cv2.boxFilter(
-        mask.astype(np.uint8),
-        ddepth=cv2.CV_8U,
-        ksize=(3, 3),
-        normalize=False,
-        borderType=cv2.BORDER_CONSTANT,
-    )
-
-
 def reject_flying_depth(
     depth_m: np.ndarray, valid: np.ndarray, config: PointCloudConfig
 ) -> np.ndarray:
@@ -103,7 +92,13 @@ def reject_flying_depth(
             borderValue=(float("-inf"),),
         ),
     )
-    local_valid_count = local_3x3_count(valid)
+    local_valid_count = cv2.boxFilter(
+        valid.astype(np.uint8),
+        ddepth=cv2.CV_8U,
+        ksize=(3, 3),
+        normalize=False,
+        borderType=cv2.BORDER_CONSTANT,
+    )
     endpoint_distance = np.minimum(depth_m - local_min, local_max - depth_m)
     depth_discontinuity = (
         valid & (local_valid_count >= 3) & ((local_max - local_min) > config.edge_jump_m)

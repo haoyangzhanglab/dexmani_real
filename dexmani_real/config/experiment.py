@@ -147,25 +147,20 @@ def resolve_table_plane(
     return validate_table_plane(tuple(float(plane[k]) for k in ("a", "b", "c", "d")))
 
 
-def read_config_yaml(path: str | Path | None) -> dict:
-    if path is None:
-        return {}
-    with Path(path).open(encoding="utf-8") as stream:
-        loaded = yaml.safe_load(stream)
-    if loaded is None:
-        return {}
-    if not isinstance(loaded, Mapping):
-        raise TypeError("experiment config root must be a mapping")
-    return dict(loaded)
-
-
 def load_experiment_config(
     *,
     yaml_path: str | Path | None = None,
     cli_overrides: Mapping[str, Any] | None = None,
 ) -> ExperimentConfig:
     """合并 CLI > YAML > 默认值；运行约束由使用方校验，不连接设备或读取标定。"""
-    loaded = read_config_yaml(yaml_path)
+    loaded = {}
+    if yaml_path is not None:
+        with Path(yaml_path).open(encoding="utf-8") as stream:
+            values = yaml.safe_load(stream)
+        if values is not None:
+            if not isinstance(values, Mapping):
+                raise TypeError("experiment config root must be a mapping")
+            loaded = dict(values)
     for key, value in (cli_overrides or {}).items():
         if value is None:
             continue

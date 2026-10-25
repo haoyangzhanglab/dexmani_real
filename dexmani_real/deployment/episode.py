@@ -501,10 +501,10 @@ class PolicyEpisode:
         if not self.has_motion_authority():
             self.finish("before_submission_revoked")
             return
-        if (expired := self.expired_budget()) is not None:
-            self.finish_budget(expired)
-            return
         budget_limit = self.budget_limit()
+        if budget_limit is not None and time.monotonic_ns() >= budget_limit[0]:
+            self.finish_budget(budget_limit)
+            return
         decision_deadline_ns = plan.expires_at_ns
         action_deadline_ns = min(
             self.next_step_ns,

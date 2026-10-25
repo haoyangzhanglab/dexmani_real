@@ -30,7 +30,7 @@ from dexmani_real.sensor.camera.geometry import validate_aligned_depth_distortio
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud
 from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
-from dexmani_real.visualization import (
+from dexmani_real.utils.visualization import (
     log_camera_geometry, log_points, log_rgbd, log_series, viewer_blueprint,
 )
 

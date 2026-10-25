@@ -11,7 +11,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
-from dexmani_real.data.canonical.export import CanonicalExporter
+from dexmani_real.data.canonical.export import export_canonical
 from dexmani_real.data.canonical.schema import ProcessingConfig
 
 
@@ -109,12 +109,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             progress.total = total
             progress.update(completed - progress.n)
 
-        result = CanonicalExporter(
-            processing=processing,
-            chunk_frames=args.chunk_frames,
-        ).export(
+        result = export_canonical(
             args.input_root,
             output_path,
+            processing=processing,
+            chunk_frames=args.chunk_frames,
             exclude=tuple(args.exclude),
             progress_callback=update_progress,
         )

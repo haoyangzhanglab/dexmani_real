@@ -7,7 +7,7 @@ from typing import Mapping
 import numpy as np
 
 from dexmani_real.planning.kinematics.arm_fk import (
-    ArmFK, compute_eef_pose_history_xarm_base, make_arm_fk,
+    ArmFK, compute_eef_pose_history_xarm_base,
 )
 from dexmani_real.planning.kinematics.fingertip import compute_hand_geometry_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
@@ -109,7 +109,7 @@ def build_observation_kinematics(dependencies, *, fingertip_link_names, hand, ha
     if "arm_fk" not in dependencies:
         return None
     if "hand_fk" not in dependencies:
-        return ObservationKinematics(make_arm_fk())
+        return ObservationKinematics(ArmFK())
     hand_fk = HandKinematics(
         str(XHAND_RIGHT_URDF_PATH),
         fingertip_link_names if "fingertips" in dependencies else None,
@@ -120,7 +120,7 @@ def build_observation_kinematics(dependencies, *, fingertip_link_names, hand, ha
 
         hand_cloud = HandPointCloudTemplate(hand_pointcloud, hand_fk)
     return ObservationKinematics(
-        make_arm_fk(), hand_fk,
+        ArmFK(), hand_fk,
         tuple(hand.T_eef_handbase_pos_xyz),
         quat_wxyz_to_rotmat(hand.T_eef_handbase_quat_wxyz),
         hand_cloud,

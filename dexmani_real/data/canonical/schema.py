@@ -62,36 +62,28 @@ class ProcessingConfig:
             )
 
 
-CORE_FIELD_SPECS: dict[str, tuple[tuple[int, ...], np.dtype[Any]]] = {
-    "joint_state": ((19,), np.dtype(np.float32)),
-    "action": ((19,), np.dtype(np.float32)),
-    "action_ee": ((21,), np.dtype(np.float32)),
-    "finger_tactile_force": ((5, 3), np.dtype(np.float32)),
-    "taxel_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
-    "fingertip_xyz": ((5, 3), np.dtype(np.float32)),
-    "eef_pose": ((9,), np.dtype(np.float32)),
-    "camera_intrinsic": ((9,), np.dtype(np.float32)),
-    "camera_extrinsic": ((12,), np.dtype(np.float32)),
-}
-
-
 def canonical_array_specs(
     num_points: int,
     rgb_height: int,
     rgb_width: int,
     hand_num_points: int,
 ) -> dict[str, tuple[tuple[int, ...], np.dtype[Any]]]:
-    """Canonical per-row shapes and dtypes for aligned RGB-D."""
-    specs = dict(CORE_FIELD_SPECS)
-    specs.update(
-        {
-            "rgb": ((rgb_height, rgb_width, 3), np.dtype(np.uint8)),
-            "depth": ((rgb_height, rgb_width), np.dtype(np.uint16)),
-            "point_cloud": ((num_points, 6), np.dtype(np.float32)),
-            "hand_pointcloud": ((hand_num_points, 6), np.dtype(np.float32)),
-        }
-    )
-    return specs
+    """公共导出的固定 13 字段及逐行形状、类型。"""
+    return {
+        "joint_state": ((19,), np.dtype(np.float32)),
+        "action": ((19,), np.dtype(np.float32)),
+        "action_ee": ((21,), np.dtype(np.float32)),
+        "finger_tactile_force": ((5, 3), np.dtype(np.float32)),
+        "taxel_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
+        "fingertip_xyz": ((5, 3), np.dtype(np.float32)),
+        "eef_pose": ((9,), np.dtype(np.float32)),
+        "camera_intrinsic": ((9,), np.dtype(np.float32)),
+        "camera_extrinsic": ((12,), np.dtype(np.float32)),
+        "rgb": ((rgb_height, rgb_width, 3), np.dtype(np.uint8)),
+        "depth": ((rgb_height, rgb_width), np.dtype(np.uint16)),
+        "point_cloud": ((num_points, 6), np.dtype(np.float32)),
+        "hand_pointcloud": ((hand_num_points, 6), np.dtype(np.float32)),
+    }
 
 
 CANONICAL_FORMAT = "dexmani.real.canonical"

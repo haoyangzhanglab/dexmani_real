@@ -17,10 +17,10 @@ from dexmani_real.config.experiment import (
 from dexmani_real.data.recorder import RecordingError
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
+from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.home import build_home_planner
 from dexmani_real.runtime.observation import ObservationNeeds, snapshot_camera_parameters
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
@@ -86,7 +86,7 @@ class TeleopSession:
             self.runtime.teleop.ema,
             self.build_hand_retargeter(),
         )
-        home_planner = build_home_planner(
+        home_planner = HomePlanner(
             self.runtime.environment, table_plane_abcd=self.table_plane_abcd,
         )
         camera_calibration = (

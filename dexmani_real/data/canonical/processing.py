@@ -98,15 +98,12 @@ def iter_canonical_blocks(
             for name in DATASET_SPECS
             if name != "timestamp"
         }
-        for name, values in raw.items():
-            # Unchanged float32 tactile arrays are checked at the canonical write boundary.
-            if name in {"hand_contact", "hand_tactile_force"}:
-                continue
-            if np.issubdtype(values.dtype, np.floating):
-                valid = np.isfinite(values).reshape(len(values), -1).all(axis=1)
-                if not valid.all():
-                    row = start + int(np.flatnonzero(~valid)[0])
-                    raise RawDataError(f"Raw {name}: nonfinite values at row {row}")
+        # Reader 已核对关节数组布局；触觉原值在 Canonical 写入边界检查。
+        for name in ("arm_qpos", "hand_qpos", "action_arm_joint_target", "action_hand_joint_target"):
+            valid = np.isfinite(raw[name]).all(axis=1)
+            if not valid.all():
+                row = start + int(np.flatnonzero(~valid)[0])
+                raise RawDataError(f"Raw {name}: nonfinite values at row {row}")
         arm, hand = raw["arm_qpos"], raw["hand_qpos"]
         arm_action, hand_action = (
             raw["action_arm_joint_target"],

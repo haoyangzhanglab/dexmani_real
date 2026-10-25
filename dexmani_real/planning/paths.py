@@ -55,31 +55,24 @@ def wrap_nearest_equivalent(
     reference: np.ndarray,
     joint_limit_lower: tuple[float, ...] | np.ndarray,
     joint_limit_upper: tuple[float, ...] | np.ndarray,
-    *,
-    equivalent_mask=XARM7_EQUIVALENT_JOINT_MASK,
 ) -> np.ndarray:
-    """Return a float64 copy with equivalent axes shifted by 2π to the nearest limit-valid radian values."""
+    """返回 xArm7 七关节副本，将可等价轴移到限位内最接近参考值的 2π 分支。"""
     result = np.asarray(qpos, dtype=np.float64).copy()
     lo = np.asarray(joint_limit_lower, dtype=np.float64)
     hi = np.asarray(joint_limit_upper, dtype=np.float64)
     ref = np.asarray(reference, dtype=np.float64)
     if (
-        result.ndim != 1
+        result.shape != ARM_JOINT_SHAPE
         or ref.shape != result.shape
         or lo.shape != result.shape
         or hi.shape != result.shape
     ):
-        raise ValueError("qpos, reference, and joint limits must be matching 1-D arrays")
+        raise ValueError(f"qpos, reference, and joint limits must have shape {ARM_JOINT_SHAPE}")
     if not all(np.all(np.isfinite(values)) for values in (result, ref, lo, hi)):
         raise ValueError("qpos, reference, and joint limits must be finite")
     if np.any(lo > hi):
         raise ValueError("joint lower limits must not exceed upper limits")
-    is_equiv = np.asarray(equivalent_mask, dtype=bool)
-    if is_equiv.shape != result.shape:
-        raise ValueError("equivalent mask must match joint shape")
-
-    if not np.any(is_equiv):
-        return result
+    is_equiv = np.asarray(XARM7_EQUIVALENT_JOINT_MASK, dtype=bool)
 
     period = 2.0 * np.pi
     lo_equiv = lo[is_equiv]

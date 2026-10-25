@@ -9,11 +9,12 @@ from dexmani_real.config.experiment import (
     validate_keyboard_workspace,
     validate_robot_config,
 )
+from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.planning.kinematics.ik import OnlineIKConfig, make_online_ik_solver
 from dexmani_real.planning.target import TargetChecker
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.home import build_home_planner, home_robot
+from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.jog import JogController, jog_motion_requested
 from dexmani_real.runtime.observation import (
     read_observation, check_observation, ObservationNeeds, service_feedback,
@@ -101,7 +102,7 @@ class KeyboardTeleopSession:
             workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
         )
         self.jog = JogController(solver, target_checker, self.jog_config, self.workspace)
-        self.home_planner = build_home_planner(
+        self.home_planner = HomePlanner(
             self.runtime.environment, table_plane_abcd=self.table_plane_abcd,
         )
         self.keys.start()

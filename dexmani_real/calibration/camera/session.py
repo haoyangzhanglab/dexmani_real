@@ -43,7 +43,7 @@ from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
 from dexmani_real.planning.target import TargetChecker
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.home import build_home_planner, execute_arm_home
+from dexmani_real.runtime.home import execute_arm_home
 from dexmani_real.runtime.jog import JogController, jog_motion_requested
 from dexmani_real.runtime.observation import read_camera_frame, service_feedback
 from dexmani_real.runtime.operator_input import KeyboardInput
@@ -130,7 +130,7 @@ def build_planner(
     runtime: ExperimentConfig, *, table_plane_abcd,
 ) -> tuple[HomePlanner, OnlineIKSolver]:
     """Build HOME geometry and online IK with their separate collision scenes."""
-    planner = build_home_planner(runtime.environment, table_plane_abcd=table_plane_abcd)
+    planner = HomePlanner(runtime.environment, table_plane_abcd=table_plane_abcd)
     home_hand_qpos = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
     planner.set_hand_qpos(home_hand_qpos)
     solver = make_online_ik_solver(
