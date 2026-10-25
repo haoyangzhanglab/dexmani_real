@@ -18,14 +18,12 @@ def target_is_occupied(path: str | Path) -> bool:
     return target.exists() or target.is_symlink()
 
 
-def atomic_publish(src: str | Path, dst: str | Path, *, cancelled=None) -> Path:
-    """Rename and publish one unpublished artifact to an unoccupied target."""
+def atomic_publish(src: str | Path, dst: str | Path) -> Path:
+    """原子发布到未占用的同目录目标；取消决策由调用方同步。"""
     source = Path(src)
     target = Path(dst)
     if source.parent.resolve() != target.parent.resolve():
         raise OSError("temporary and final artifacts must share one parent filesystem")
-    if cancelled is not None and cancelled():
-        raise RuntimeError("artifact publication cancelled")
     # RENAME_NOREPLACE atomically checks occupancy; exists() cannot prevent publication races.
     if sys.platform != "linux":
         raise OSError(errno.ENOSYS, "atomic publication requires Linux renameat2")

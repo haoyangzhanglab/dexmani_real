@@ -15,15 +15,17 @@ from dataclasses import replace
 from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import numpy as np
 
 from dexmani_real.config.execution import ExecutionConfig
 from dexmani_real.config.experiment import ExperimentConfig, load_experiment_config
-from dexmani_real.data.recorder import RecordingError
+from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError, snapshot_recording_metadata
+from dexmani_real.data.raw.reader import EpisodeReader, RawDataError
 from dexmani_real.data.raw.schema import encode_raw_row
-from dexmani_real.deployment.episode import PolicyEpisode
+from dexmani_real.data.results import EpisodeResults
+from dexmani_real.deployment.episode import EpisodeEnd, PolicyEpisode
 from dexmani_real.deployment.inference import InferenceWorker, ModelResult
 from dexmani_real.deployment.observation import (
     build_observation_camera,
@@ -530,6 +532,221 @@ importlib.import_module('dexmani_real.sensor.camera.realsense')
                     self.assertFalse(episode.has_motion_authority())
                     self.assertLess(events.index("stop"), events.index("record"))
                     recorder.save_episode.assert_called_once()
+
+    def test_submission_return_deadlines_duration_and_failure_evidence(self):
+        start, tick, early = 1_000_000_000, 62_500_000, 31_250_000
+        cases = [
+            ("duration_before", "control", early - 1, early / 1e9, None, None, False),
+            ("duration", "control", early, early / 1e9, None, None, False),
+            ("duration_after", "control", early + 1, early / 1e9, None, None, False),
+            ("stop_cleanup", "control", early, early / 1e9, None, None, True),
+            ("revoke", "control", early, early / 1e9, RunEndReason.OPERATOR, None, False),
+            ("revoke_and_deadline", "control", tick, tick / 1e9, RunEndReason.OPERATOR, None, False),
+        ]
+        for source in ("control", "feedback", "decision"):
+            deadline = tick if source == "control" else early
+            for offset in (-1, 0, 1):
+                for duration in (60., deadline / 1e9):
+                    cases.append((f"{source}_{offset}_{duration}", source, deadline + offset,
+                                  duration, None, None, False))
+        for error_type in (OperationCancelled, TimeoutError, RobotError):
+            cases.append((error_type.__name__, "control", tick, tick / 1e9,
+                          None, error_type, False))
+        cases.append(("cancel_after_revoke", "control", tick, tick / 1e9,
+                      RunEndReason.OPERATOR, OperationCancelled, False))
+
+        for mode in ("sync", "async", "rtc"):
+            for name, source, returned, duration, revoke, error_type, stop_fails in cases:
+                with self.subTest(mode=mode, case=name), tempfile.TemporaryDirectory() as directory:
+                    root, now = Path(directory), [start]
+                    recorder = AsyncEpisodeRecorder(root, control_hz=16)
+                    camera = CameraSnapshot(
+                        "synthetic", CameraIntrinsics(4, 4, 100., 100., 1.5, 1.5, "none", (0.,) * 5),
+                        .001, np.eye(4),
+                    )
+                    recorder.start_episode(
+                        task_label="synthetic", collection_source="policy_rollout", episode_name="raw",
+                        metadata=snapshot_recording_metadata(
+                            camera, tactile_reset_metadata=dict(hand_tactile_reset_result="not_requested"),
+                            tactile_hold_max_age_s=ExperimentConfig().hand.feedback_max_age_s,
+                        ),
+                    )
+                    episode, row = running_episode(recorder=recorder), observation_row(start)
+                    run_id = episode.run_id
+                    episode.execution = replace(episode.execution, execution_mode=mode, prefetch_steps=1)
+                    episode.max_running_s = duration
+                    episode.results = EpisodeResults(root, "policy")
+                    episode.results.begin_episode()
+                    episode.results.entered(run_id)
+                    action = np.concatenate((row.arm["qpos"][0], row.hand["qpos"][0]))
+                    decision = start + (early if source == "decision" else 100_000_000)
+                    feedback = start + (early if source == "feedback" else 100_000_000)
+                    episode.plan = ActionPlan(np.tile(action, (4, 1)), 0, 4, decision, {})
+                    episode.action_mapper.map.return_value = SimpleNamespace(
+                        arm_qpos=action[:7], hand_qpos=action[7:],
+                    )
+                    sdk_error = error_type("synthetic SDK failure") if error_type else None
+                    stop_error = RobotError("synthetic stop cleanup failure") if stop_fails else None
+                    def submitted(*args, **kwargs):
+                        self.assertTrue(episode.has_motion_authority())
+                        now[0] = start + returned
+                        if revoke is not None:
+                            episode.runtime_state.request_stop(reason=revoke)
+                        if sdk_error is not None:
+                            raise sdk_error
+                    def stopped():
+                        self.assertFalse(episode.has_motion_authority())
+                        if stop_error is not None:
+                            raise stop_error
+                    episode.robot.send_action.side_effect = submitted
+                    episode.robot.stop.side_effect = stopped
+                    late = start + returned >= min(start + tick, feedback, decision)
+                    failed = late or revoke is not None or sdk_error is not None
+                    ended = failed or returned >= int(duration * 1e9)
+                    try:
+                        with patch.object(episode, "read_observation", return_value=(row, None, feedback)), \
+                             patch("time.monotonic_ns", side_effect=lambda: now[0]), \
+                             patch.object(recorder, "add_frame", wraps=recorder.add_frame) as add, \
+                             patch.object(recorder, "save_episode", wraps=recorder.save_episode) as save:
+                            raised = sdk_error if isinstance(sdk_error, RobotError) else stop_error
+                            if raised is not None:
+                                with self.assertRaises(type(raised)) as caught:
+                                    episode.step()
+                                self.assertIs(caught.exception, raised)
+                            else:
+                                episode.step()
+                            episode.robot.send_action.assert_called_once()
+                            call = episode.robot.send_action.call_args
+                            self.assertEqual(call.kwargs, dict(
+                                valid_until_ns=min(start + tick, feedback, decision, start + int(duration * 1e9)),
+                                execute_until_ns=min(decision, start + int(duration * 1e9)),
+                            ))
+                            add.assert_called_once()
+                            self.assertIs(add.call_args.args[0], row)
+                            self.assertIs(add.call_args.args[1], call.args[0])
+                            self.assertIsNone(episode.pending_frame)
+                            if not ended:
+                                self.assertIsNone(episode.termination)
+                                self.assertTrue(episode.has_motion_authority())
+                                self.assertEqual(episode.runtime_state.run_ended_reason, RunEndReason.NONE)
+                                self.assertIs(episode.previous_arm, call.args[0].arm_qpos)
+                                save.assert_not_called()
+                                episode.finish("operator", run_end_reason=RunEndReason.OPERATOR)
+                            if isinstance(sdk_error, RobotError):
+                                reason = RunEndReason.HARDWARE_FAULT
+                                detail = f"control_failed: RobotError: {sdk_error}"
+                            elif sdk_error is not None:
+                                reason, detail = RunEndReason.EXECUTOR_BOUNDARY, str(sdk_error)
+                            elif failed:
+                                reason = RunEndReason.EXECUTOR_BOUNDARY
+                                detail = "submission_return_expired_or_cancelled"
+                            elif ended:
+                                reason, detail = RunEndReason.TIMEOUT, "duration_timeout"
+                            else:
+                                reason, detail = RunEndReason.OPERATOR, "operator"
+                            if revoke is not None:
+                                reason = revoke
+                            self.assertEqual(
+                                episode.termination,
+                                EpisodeEnd(run_id, reason.name.lower(), detail, returned / 1e9),
+                            )
+                            self.assertEqual(episode.runtime_state.run_ended_reason, reason)
+                            self.assertEqual(episode.runtime_state.run_ended_id, run_id)
+                            self.assertFalse(episode.runtime_state.command_may_cross_sdk(run_id=run_id))
+                            self.assertTrue(episode.runtime_state.stop_signal.is_set())
+                            first = episode.termination
+                            episode.finish("later", run_end_reason=RunEndReason.HARDWARE_FAULT)
+                            self.assertIs(episode.termination, first)
+                            add.assert_called_once()
+                            save.assert_called_once()
+                            episode.robot.stop.assert_called_once()
+                            self.assertEqual(save.call_args.kwargs["technical_status"], "failed" if failed else "normal")
+                        result = json.loads(episode.results.path.read_text())["episodes"][0]
+                        self.assertEqual(result["termination_reason"], reason.name.lower())
+                        self.assertEqual(result["termination_details"], detail)
+                        self.assertEqual(result["raw"]["status"], "published")
+                        self.assertEqual(result["raw"]["path"], str(recorder.published_path))
+                        self.assertEqual(result["raw"]["row_count"], 1)
+                        if sdk_error is not None or stop_error is not None:
+                            error = sdk_error or stop_error
+                            stage = "control" if isinstance(sdk_error, RobotError) else "submission"
+                            self.assertIn(
+                                dict(stage=stage if sdk_error else "stop",
+                                     exception_type=type(error).__name__, message=str(error)),
+                                result["errors"],
+                            )
+                        with EpisodeReader(recorder.published_path) as reader:
+                            self.assertEqual(reader.num_frames, 1)
+                            self.assertEqual(reader.meta["termination_reason"], result["termination_reason"])
+                            self.assertEqual(reader.meta["technical_status"], "failed" if failed else "normal")
+                            np.testing.assert_array_equal(reader["action_arm_joint_target"][0], action[:7])
+                            np.testing.assert_array_equal(reader["action_hand_joint_target"][0], action[7:])
+                            if failed:
+                                with self.assertRaises(RawDataError):
+                                    reader.validate_completion()
+                            else:
+                                reader.validate_completion()
+                    finally:
+                        recorder.close()
+                        recorder.thread.join(2)
+                        self.assertFalse(recorder.writer_pending)
+
+    def test_finalize_records_pending_publication_and_shutdown_ownership(self):
+        from dexmani_real.deployment.session import PolicySession
+
+        for published, pending in ((False, True), (True, True), (False, False)):
+            with self.subTest(published=published, pending=pending), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                recorder = Mock(
+                    start_attempted=True, published_path=root / "raw" if published else None,
+                    staging_path=None if published else root / ".tmp_raw", written_frames=1,
+                    writer_pending=pending,
+                )
+                error = RecordingError(
+                    "status=pending; writer retains ownership" if pending else "rename failed"
+                )
+                recorder.save_episode.side_effect = error
+                if pending:
+                    recorder.close.side_effect = error
+                episode = running_episode(recorder=recorder)
+                episode.results = EpisodeResults(root, "policy")
+                episode.results.begin_episode()
+                episode.results.entered(episode.run_id)
+                with patch("time.monotonic_ns", return_value=1_010_000_000), \
+                     patch.object(type(recorder), "staging_path", new_callable=PropertyMock, create=True) as staging:
+                    staging.return_value = None if published else root / ".tmp_raw"
+                    if pending and not published:
+                        # Writer 可在摘要构造期间完成发布并清空 staging_path。
+                        staging.side_effect = [root / ".tmp_raw", None]
+                    with self.assertRaises(RecordingError) as caught:
+                        episode.finish("duration_timeout", run_end_reason=RunEndReason.TIMEOUT)
+                self.assertIs(caught.exception, error)
+                self.assertFalse(episode.has_motion_authority())
+                self.assertEqual(episode.termination.reason, "timeout")
+                self.assertEqual(recorder.save_episode.call_args.kwargs["technical_status"], "normal")
+                session = PolicySession(
+                    episode.runtime, episode.policy_info, control_needs=episode.control_needs,
+                    record_needs=episode.record_needs, dependencies=episode.dependencies,
+                    results_dir=root, run_config={},
+                )
+                session.runtime_state, session.robot = episode.runtime_state, episode.robot
+                session.recorder, session.results = recorder, episode.results
+                session.model = session.sensors = None
+                self.assertEqual(session.close(clean=False, failure=error), 1)
+                self.assertIs(session.recorder, recorder)
+                recorder.close.assert_called_once()
+                result = json.loads(episode.results.path.read_text())
+                self.assertEqual(result["outcome"], "fault")
+                self.assertEqual(result["shutdown_clean"], not pending)
+                raw = result["episodes"][0]["raw"]
+                self.assertEqual(raw["status"], "published" if published else "pending" if pending else "failed")
+                self.assertEqual(raw["path"], str(root / "raw") if published else None)
+                self.assertEqual(raw["staging_path"], None if published else str(root / ".tmp_raw"))
+                self.assertIn(dict(stage="recorder_finalize", exception_type="RecordingError", message=str(error)),
+                              result["episodes"][0]["errors"])
+                if pending:
+                    self.assertIn(dict(stage="recorder_close", exception_type="RecordingError", message=str(error)),
+                                  result["errors"])
 
     def test_rtc_prefix_freezes_only_after_query_submission(self):
         episode, row = running_episode(), observation_row()

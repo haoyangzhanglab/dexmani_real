@@ -223,16 +223,18 @@ class PolicyEpisode:
                 )
                 status = "published" if saved is not None else "not_published"
             except BaseException as exc:
-                failure, status = exc, "failed"
+                failure = exc
+                saved = self.recorder.published_path
+                status = (
+                    "published" if saved is not None
+                    else "pending" if self.recorder.writer_pending else "failed"
+                )
                 errors.append(error_detail("recorder_finalize", exc))
+            staging = self.recorder.staging_path
             raw = dict(
                 status=status,
                 path=str(saved) if saved is not None else None,
-                staging_path=(
-                    str(self.recorder.staging_path)
-                    if self.recorder.staging_path is not None and saved is None
-                    else None
-                ),
+                staging_path=str(staging) if staging is not None and saved is None else None,
                 row_count=self.recorder.written_frames,
             )
         try:
@@ -534,11 +536,19 @@ class PolicyEpisode:
             )
             return
         now = time.monotonic_ns()
+        if now >= action_deadline_ns or not self.has_motion_authority():
+            error = (
+                TimeoutError("submission returned after action deadline")
+                if now >= action_deadline_ns
+                else OperationCancelled("motion authority revoked during submission")
+            )
+            self.finish(
+                "submission_return_expired_or_cancelled",
+                errors=[error_detail("submission", error)],
+            )
+            return
         if budget_limit is not None and now >= budget_limit[0]:
             self.finish_budget(budget_limit)
-            return
-        if now >= action_deadline_ns or not self.has_motion_authority():
-            self.finish("submission_return_expired_or_cancelled")
             return
         self.previous_arm = command.arm_qpos
         if self.hand_history is not None:

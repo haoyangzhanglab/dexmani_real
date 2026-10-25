@@ -141,7 +141,7 @@ python scripts/run_policy.py policy/task/experiment --config local.yaml --execut
 
 H 回 HOME、B 开始本轮、S 结束本轮；整理场景后再次按 H、B。Q 提前退出，ESC 请求急停，T 在空闲且无接触时请求复位触觉；部署不使用 C/D。
 
-默认最多 20 轮正式运行，每轮运行预算 60 秒，用 `--num-episodes`、`--max-duration` 调整；准备失败或取消不占轮数。预算不保证阻塞 SDK 或模型调用立即返回。checkpoint 默认 `latest`，其余推理选项见 `--help`。
+默认最多 20 轮正式运行，每轮运行预算 60 秒，用 `--num-episodes`、`--max-duration` 调整；准备失败或取消不占轮数。预算不保证阻塞 SDK 或模型调用立即返回。自然达到时长预算属于正常结束；提交超期、提交期间撤权或 SDK 异常仍按技术失败记录，不会被同时发生的时长到期掩盖。checkpoint 默认 `latest`，其余推理选项见 `--help`。
 
 默认产物位于 `rollouts/policy/task/experiment/session_*/`；`run_config.yaml` 保存实际配置、模型信息及本次桌面数值／来源；相机初始化后、运动授权前补入实际 serial、内参、depth scale 和采用的外参（缺失时明确标注），`session_result.json` 保存评估摘要。按摘要中的 Raw 路径定位采集，正式轮次与录制尝试不一一对应；准备失败或取消时，已启动且正常收尾的采集也会保留，包括零行采集。
 
@@ -178,6 +178,8 @@ RGB-D、点云和 episode 查看统一使用 Rerun，冻结、时间浏览、配
 **Raw 发布后不可变，Canonical 是可重建的训练缓存。** Raw 使用 `data.h5` 和 `rgb.mp4`，保存实测观测、最终提交尝试目标、来源时间与终止原因，不保存发送回执。RGB-D 按保存行对齐，视频按标称帧率编码，实际采样时刻以 HDF5 时间为准。
 
 停止、晚帧和控制失败保留真实前缀；仅操作者显式重录或丢弃才删除当前 capture。写入、编码、关闭或发布失败保留 staging。I/O 完整的失败采集可以发布 Raw，但采集技术失败或含 WAIT／缺失目标的段不能严格导出或回放。结束后的单独停止清理错误另存详情，不改写此前的采集结果；设备仍禁止自行重启。发布不证明任务成功、目标送达或设备停止。
+
+录制收尾超时不等于发布已取消：发布提交点前取消生效会保留 staging；已进入提交点时，收尾报告 pending，Writer 继续持有资源，之后可能发布成功或失败。已发布的 Raw 不回滚，等待超时也不改写其技术状态。部署摘要保留本轮收尾时已知的结果及异常，pending 不能视为资源已关闭；具体处理见 [Recorder](dexmani_real/data/recorder.py) 和[部署收尾](dexmani_real/deployment/episode.py)。
 
 Raw 不维护格式版本号。[Reader](dexmani_real/data/raw/reader.py) 在打开时检查必需元数据和关节单位、顺序；消费触觉时额外检查触觉语义和有效时限。导出和回放按用途检查动作、来源时间与数值完整性，缺失或不符的数据明确拒绝。历史文件保持原样，需要时使用对应旧提交查看，不提供迁移或兼容读取分支。
 

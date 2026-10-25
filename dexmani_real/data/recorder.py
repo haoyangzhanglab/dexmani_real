@@ -64,6 +64,7 @@ class AsyncEpisodeRecorder:
         self.queue = Queue(maxsize=16)
         self.ready = threading.Event()
         self.cancelled = threading.Event()
+        self.publication_lock = threading.Lock()
         self.error = None
         self.io_failed = False
         self.is_recording = False
@@ -196,13 +197,25 @@ class AsyncEpisodeRecorder:
         if self.finish_request is None or self.writer_pending:
             self.finish(save=True, reason="close")
 
+    def cancel_publication(self):
+        """提交点之后不可撤销；协调线程不得等待发布锁。"""
+        if not self.publication_lock.acquire(blocking=False):
+            return False
+        try:
+            if self.published_path is not None:
+                return False
+            self.cancelled.set()
+            return True
+        finally:
+            self.publication_lock.release()
+
     def finish(
         self, *, save, reason, details=None, technical_status="failed"
     ):
         was_recording, self.is_recording = self.is_recording, False
         thread = self.thread
         deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
-        interrupted = None
+        interrupted = pending = None
         try:
             if self.finish_request is None:
                 try:
@@ -218,7 +231,7 @@ class AsyncEpisodeRecorder:
                 self.queue.put(self.finish_request, timeout=max(0.0, deadline - time.monotonic()))
         except BaseException as exc:
             self.store_error(exc)
-            self.cancelled.set()
+            self.cancel_publication()
             if not isinstance(exc, Exception):
                 interrupted = exc
         finally:
@@ -227,26 +240,35 @@ class AsyncEpisodeRecorder:
                     thread.join(timeout=max(0.0, deadline - time.monotonic()))
                 except BaseException as exc:
                     self.store_error(exc)
-                    self.cancelled.set()
+                    self.cancel_publication()
                     if not isinstance(exc, Exception):
                         interrupted = exc
                     thread.join(timeout=max(0.0, deadline - time.monotonic()))
                 if self.writer_pending:
-                    self.store_error(
-                        TimeoutError("recording finalization timed out; staging remains owned")
+                    cancelled = self.cancel_publication()
+                    publication = (
+                        "cancelled" if cancelled
+                        else "published" if self.published_path is not None else "unresolved"
                     )
-                    self.cancelled.set()
+                    pending = TimeoutError(
+                        f"recording finalization timed out; status=pending; publication={publication}; "
+                        "writer retains ownership"
+                    )
+                    if cancelled:
+                        self.store_error(pending)
         if not self.writer_pending:
             # Writer 的末次 drain 之后仍可能有已越过 check_error 的提交。
             self.drain_frames()
         if interrupted is not None:
             raise interrupted
-        if not self.writer_pending and not save:
+        if pending is not None:
+            raise RecordingError(str(pending)) from pending
+        if not self.finish_request.save:
             if self.staging_path is not None:
                 shutil.rmtree(self.staging_path)
                 self.staging_path = None
             return None
-        if self.staging_path is not None and not self.writer_pending and self.error is not None:
+        if self.staging_path is not None and self.error is not None:
             failure_path = self.staging_path / "capture_failure.json"
             if not failure_path.exists():
                 atomic_json_dump(
@@ -304,19 +326,25 @@ class AsyncEpisodeRecorder:
                 )
             finally:
                 writer.close()
-            if not self.io_failed and not self.cancelled.is_set() and finish is not None:
-                if finish.save:
-                    # Zero-row captures retain failure evidence until explicit discard.
-                    atomic_publish(staging, destination, cancelled=self.cancelled.is_set)
-                    self.published_path = destination
-                    logger.info("Raw 已保存：%s（%d 帧）。", destination.name, self.written_frames)
-                    logger.debug(
-                        "Episode saved: %s frames=%d reason=%s",
-                        destination,
-                        self.written_frames,
-                        finish.reason,
-                    )
-                    self.staging_path = None
+            with self.publication_lock:
+                if (
+                    not self.io_failed and not self.cancelled.is_set()
+                    and finish is not None and finish.save
+                ):
+                    # 锁内决策是不可撤销提交点，覆盖 rename 与结果登记。
+                    try:
+                        atomic_publish(staging, destination)
+                    except BaseException as exc:
+                        # 先保留真实发布错误，再允许超时取消取得锁。
+                        self.store_error(exc, io=True)
+                        raise
+                    self.published_path, self.staging_path = destination, None
+            if self.published_path is not None:
+                logger.info("Raw 已保存：%s（%d 帧）。", destination.name, self.written_frames)
+                logger.debug(
+                    "Episode saved: %s frames=%d reason=%s",
+                    destination, self.written_frames, finish.reason,
+                )
         except BaseException as exc:
             self.store_error(exc, io=True)
             logger.exception("Recording failed; staging retained: %s", staging)

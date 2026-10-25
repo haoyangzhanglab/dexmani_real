@@ -28,6 +28,7 @@ from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
 from dexmani_real.runtime.observation import ObservationRow
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics, CameraSnapshot
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
+from dexmani_real.utils.atomic_io import atomic_publish
 
 
 def recording_metadata(*, extrinsics=True, reset="not_requested"):
@@ -350,6 +351,158 @@ class RecordingChecks(unittest.TestCase):
         self.assertFalse(recorder.writer_pending)
         self.assertIsNone(recorder.published_path)
         self.assertTrue(recorder.staging_path.exists())
+
+    def test_publication_normal_and_repeated_finish(self):
+        recorder = AsyncEpisodeRecorder(self.root, control_hz=16)
+        recorder.start_episode(task_label="synthetic", collection_source="teleop",
+                               episode_name="normal", metadata=recording_metadata())
+        recorder.add_frame(*recording_row(0))
+        staging = recorder.staging_path
+        with patch("dexmani_real.data.recorder.atomic_publish", wraps=atomic_publish) as publish:
+            path = recorder.save_episode(reason="operator")
+            first = recorder.finish_request
+            original = {item.name: item.read_bytes() for item in path.iterdir()}
+            self.assertEqual(recorder.save_episode(reason="later", technical_status="failed"), path)
+            self.assertEqual(recorder.finish(save=False, reason="later_discard"), path)
+            recorder.close()
+            publish.assert_called_once()
+        self.assertIs(recorder.finish_request, first)
+        self.assertFalse(recorder.writer_pending)
+        self.assertFalse(recorder.cancelled.is_set())
+        self.assertIsNone(recorder.error)
+        self.assertFalse(recorder.io_failed)
+        self.assertIsNone(recorder.staging_path)
+        self.assertFalse(staging.exists())
+        self.assertEqual(recorder.published_path, path)
+        self.assertFalse(recorder.writer.meta.id.valid)
+        self.assertTrue(recorder.writer.video.closed)
+        self.assertEqual(original, {item.name: item.read_bytes() for item in path.iterdir()})
+        with EpisodeReader(path) as reader:
+            self.assertEqual(reader.meta["technical_status"], "normal")
+            self.assertEqual(reader.meta["termination_reason"], "operator")
+            self.assertEqual(reader.num_frames, 1)
+
+    def test_finish_timeout_publication_commit_interleavings(self):
+        for phase, outcome in (("close", "cancel"), ("commit", "success"),
+                               ("commit", "error"), ("commit", "occupied"),
+                               ("renamed", "success"), ("completed", "success")):
+            with self.subTest(phase=phase, outcome=outcome):
+                entered, release = threading.Event(), threading.Event()
+                recorder = AsyncEpisodeRecorder(self.root / f"{phase}_{outcome}", control_hz=16)
+                close, drain = RawEpisodeWriter.close, recorder.drain_frames
+                rename_error = OSError("synthetic rename failure after commit")
+                def blocked():
+                    entered.set()
+                    if not release.wait(5):
+                        raise TimeoutError("synthetic publication barrier not released")
+                def closed(writer):
+                    close(writer)
+                    if phase == "close":
+                        blocked()
+                def publish(source, target):
+                    if phase == "commit":
+                        blocked()
+                        if outcome == "error":
+                            raise rename_error
+                    result = atomic_publish(source, target)
+                    if phase == "renamed":
+                        blocked()
+                    return result
+                def drained():
+                    if phase == "completed" and threading.current_thread() is recorder.thread:
+                        blocked()
+                    drain()
+                with patch.object(RawEpisodeWriter, "close", closed), \
+                     patch.object(recorder, "drain_frames", drained), \
+                     patch("dexmani_real.data.recorder.atomic_publish", side_effect=publish) as publishing, \
+                     patch("dexmani_real.data.recorder.RECORDER_STOP_TIMEOUT_S", .01):
+                    recorder.start_episode(task_label="synthetic", collection_source="teleop",
+                                           episode_name="capture", metadata=recording_metadata())
+                    recorder.add_frame(*recording_row(0))
+                    staging, destination = recorder.staging_path, recorder.episode_dir
+                    if outcome == "occupied":
+                        destination.mkdir()
+                        (destination / "keep").write_text("existing Raw")
+                    join = recorder.thread.join
+                    def joined(timeout):
+                        self.assertTrue(entered.wait(2), "writer did not reach publication barrier")
+                        join(timeout)
+                    try:
+                        with patch.object(recorder.thread, "join", side_effect=joined):
+                            with self.assertRaises(RecordingError) as caught:
+                                recorder.save_episode(reason="operator")
+                            first = recorder.finish_request
+                            cancelled_at_timeout = recorder.cancelled.is_set()
+                            error_at_timeout = recorder.error
+                            self.assertTrue(recorder.writer_pending)
+                            self.assertIsNotNone(recorder.writer)
+                            self.assertFalse(recorder.writer.meta.id.valid)
+                            self.assertTrue(recorder.writer.video.closed)
+                            self.assertFalse(recorder.is_recording)
+                            self.assertEqual(staging.exists(), phase not in {"renamed", "completed"})
+                            self.assertEqual(recorder.published_path, destination if phase == "completed" else None)
+                            for _ in range(3):
+                                with self.assertRaises(RecordingError):
+                                    recorder.close()
+                                self.assertTrue(recorder.writer_pending)
+                                self.assertIs(recorder.finish_request, first)
+                            with self.assertRaisesRegex(RecordingError, "one START"):
+                                recorder.start_episode(task_label="synthetic", collection_source="teleop",
+                                                       metadata=recording_metadata())
+                    finally:
+                        release.set()
+                        join(2)
+                        self.assertFalse(recorder.writer_pending)
+                    self.assertEqual(cancelled_at_timeout, phase == "close",
+                                     f"cancelled={cancelled_at_timeout}, published={recorder.published_path}")
+                    self.assertIn("status=pending", str(caught.exception))
+                    self.assertEqual(recorder.cancelled.is_set(), phase == "close")
+                    self.assertIs(recorder.finish_request, first)
+                    self.assertEqual(recorder.queue.qsize(), 0)
+                    if outcome == "success":
+                        self.assertIsNone(error_at_timeout)
+                        self.assertIsNone(recorder.error)
+                        self.assertFalse(recorder.io_failed)
+                        self.assertIsNone(recorder.staging_path)
+                        self.assertEqual(recorder.published_path, destination)
+                        self.assertFalse(staging.exists())
+                        original = {item.name: item.read_bytes() for item in destination.iterdir()}
+                        self.assertEqual(recorder.save_episode(reason="later"), destination)
+                        self.assertEqual(recorder.finish(save=False, reason="later_discard"), destination)
+                        recorder.close()
+                        self.assertEqual(original, {item.name: item.read_bytes() for item in destination.iterdir()})
+                        with EpisodeReader(destination) as reader:
+                            self.assertEqual(reader.num_frames, 1)
+                            self.assertEqual(reader.meta["technical_status"], "normal")
+                            self.assertEqual(reader.meta["termination_reason"], "operator")
+                    else:
+                        self.assertIsNone(recorder.published_path)
+                        self.assertEqual(recorder.staging_path, staging)
+                        self.assertTrue(staging.exists())
+                        self.assertEqual(destination.exists(), outcome == "occupied")
+                        if outcome == "cancel":
+                            self.assertIsInstance(error_at_timeout, TimeoutError)
+                            self.assertIs(recorder.error, error_at_timeout)
+                            self.assertFalse(recorder.io_failed)
+                        else:
+                            self.assertIsNone(error_at_timeout)
+                            self.assertTrue(recorder.io_failed)
+                            if outcome == "error":
+                                self.assertIs(recorder.error, rename_error)
+                            else:
+                                self.assertIsInstance(recorder.error, FileExistsError)
+                                self.assertEqual((destination / "keep").read_text(), "existing Raw")
+                        with self.assertRaises(RecordingError) as final:
+                            recorder.save_episode(reason="later")
+                        self.assertIs(final.exception.__cause__, recorder.error)
+                        with self.assertRaises(RecordingError):
+                            recorder.finish(save=False, reason="later_discard")
+                        recorder.close()
+                        self.assertTrue(staging.exists())
+                        failure = json.loads((staging / "capture_failure.json").read_text())
+                        self.assertEqual(failure["reason"], "operator")
+                        self.assertEqual(failure["error"], str(recorder.error))
+                    self.assertEqual(publishing.call_count, 0 if phase == "close" else 1)
 
     def test_explicit_discard_and_repeated_close(self):
         kept = record_episode(self.root, "kept")
