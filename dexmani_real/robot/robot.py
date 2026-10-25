@@ -26,6 +26,10 @@ class DexManiRobot:
         arm_factory=None, hand_factory=None, check_services=None,
     ):
         self.arm_config, self.hand_config = arm_config, hand_config
+        self.arm_lower = np.asarray(arm_config.joint_limit_lower, dtype=np.float64)
+        self.arm_upper = np.asarray(arm_config.joint_limit_upper, dtype=np.float64)
+        self.hand_lower = np.asarray(hand_config.mechanical_qpos_min_rad, dtype=np.float64)
+        self.hand_upper = np.asarray(hand_config.mechanical_qpos_max_rad, dtype=np.float64)
         self.run_signal, self.stop_signal = run_signal, stop_signal
         self.emergency_signal, self.signal_lock = emergency_signal, signal_lock
         self.arm_factory, self.hand_factory = arm_factory, hand_factory
@@ -203,8 +207,8 @@ class DexManiRobot:
                 raise RobotError("arm device unavailable")
             issue = check_arm_target(
                 command.arm_qpos,
-                joint_limit_lower_rad=np.asarray(self.arm_config.joint_limit_lower),
-                joint_limit_upper_rad=np.asarray(self.arm_config.joint_limit_upper),
+                joint_limit_lower_rad=self.arm_lower,
+                joint_limit_upper_rad=self.arm_upper,
             )
             if issue:
                 raise ValueError(f"unsafe arm target: {issue}")
@@ -215,8 +219,8 @@ class DexManiRobot:
                 raise RobotError("hand device unavailable")
             issue = check_hand_target(
                 command.hand_qpos,
-                mechanical_lower_rad=np.asarray(self.hand_config.mechanical_qpos_min_rad),
-                mechanical_upper_rad=np.asarray(self.hand_config.mechanical_qpos_max_rad),
+                mechanical_lower_rad=self.hand_lower,
+                mechanical_upper_rad=self.hand_upper,
             )
             if issue:
                 raise ValueError(f"unsafe hand target: {issue}")

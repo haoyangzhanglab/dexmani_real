@@ -24,6 +24,7 @@ from dexmani_real.data.raw.reader import EpisodeReader, RawDataError, text_attr
 from dexmani_real.planning.kinematics.arm_fk import make_arm_fk
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.planning.kinematics.hand_pointcloud import HandPointCloudTemplate
+from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rotmat
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.sensor.pointcloud.config import SAMPLING_METHOD
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
@@ -42,6 +43,7 @@ class CanonicalExporter:
     def __init__(self, processing: ProcessingConfig, *, chunk_frames: int = 100):
         self.processing = processing
         self.chunk_frames = chunk_frames
+        self.handbase_rotation_eef = quat_wxyz_to_rotmat(processing.handbase_quat_eef_wxyz)
 
     def export(
         self,
@@ -148,6 +150,7 @@ class CanonicalExporter:
                             camera=camera,
                             base_from_color=base_from_color,
                             camera_parameters=camera_parameters,
+                            handbase_rotation_eef=self.handbase_rotation_eef,
                         )
                         if not ends:
                             period_ns, tolerance_ns = sampling_clock_ns(reader.control_hz)

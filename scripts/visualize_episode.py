@@ -24,6 +24,7 @@ from dexmani_real.data.raw.reader import EpisodeReader
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 from dexmani_real.planning.kinematics.fingertip import compute_hand_geometry_history_xarm_base
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
+from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rotmat
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.sensor.camera.geometry import validate_aligned_depth_distortion
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
@@ -144,9 +145,10 @@ class EpisodeVisualizer:
             if self.T_xarm_base_from_color is None:
                 logger.warning("No camera extrinsics: displaying pixels without point cloud")
             self.handbase_position_eef_m = np.asarray(handbase_position_eef_m, dtype=np.float64)
-            self.handbase_quat_eef_wxyz = validate_unit_quaternion_wxyz(
+            handbase_quat = validate_unit_quaternion_wxyz(
                 handbase_quat_eef_wxyz, name="hand base quaternion"
             )
+            self.handbase_rotation_eef = quat_wxyz_to_rotmat(handbase_quat)
             self.pointcloud_config = None
             self.table_plane_abcd = None
             self.empty_cloud_count = 0
@@ -215,7 +217,7 @@ class EpisodeVisualizer:
                 hand[hand_valid],
                 hand_fk=hand_fk,
                 handbase_position_eef_m=self.handbase_position_eef_m,
-                handbase_quat_eef_wxyz=self.handbase_quat_eef_wxyz,
+                handbase_rotation_eef=self.handbase_rotation_eef,
             )["fingertip_xyz"]
 
         contact = self.reader["hand_contact"][: self.frame_count]

@@ -1,4 +1,4 @@
-"""Public Policy deployment entry: preflight once before artifacts or device startup."""
+"""加载策略信息并完成准入，再创建评估产物和设备会话。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 from dexmani_real.calibration import CAMERAS_PATH
 from dexmani_real.config.execution import DEFAULT_NUM_EPISODES, DEFAULT_MAX_RUNNING_S
 from dexmani_real.config.experiment import resolve_table_plane, resolve_table_plane_path
-from dexmani_real.deployment.observation import policy_needs
+from dexmani_real.deployment.observation import policy_dependencies, policy_needs
 from dexmani_real.deployment.preflight import (
     validate_deployment_config,
     validate_max_running_s,
@@ -97,7 +97,8 @@ def run_policy(
     if action_steps is None:
         action_steps = info.n_action_steps
     runtime = replace(runtime, execution=replace(runtime.execution, action_steps=action_steps))
-    control_needs = policy_needs(info.observation_fields)
+    dependencies = policy_dependencies(info.observation_fields)
+    control_needs = policy_needs(dependencies)
     record_needs = (
         ObservationNeeds(camera="rgbd", required_tactile=("aggregate", "dense"))
         if record_raw else ObservationNeeds()
@@ -159,6 +160,7 @@ def run_policy(
         runtime,
         info,
         control_needs=control_needs, record_needs=record_needs,
+        dependencies=dependencies,
         device=device,
         seed=seed,
         max_running_s=max_running_s,

@@ -10,7 +10,7 @@ import numpy as np
 from dexmani_real.data.raw.reader import (
     EpisodeReader,
     positive_float_attr,
-    positive_int_attr,
+    scalar_attr,
     text_attr,
 )
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics
@@ -29,8 +29,8 @@ def color_intrinsics_from_meta(meta: Any) -> CameraIntrinsics:
     matrix = np.asarray(meta["camera_color_intrinsics"], dtype=np.float64).reshape(3, 3)
     coefficients = tuple(meta["camera_color_distortion_coeffs"])
     color = CameraIntrinsics(
-        width=positive_int_attr(meta, "camera_color_width"),
-        height=positive_int_attr(meta, "camera_color_height"),
+        width=scalar_attr(meta, "camera_color_width"),
+        height=scalar_attr(meta, "camera_color_height"),
         fx=float(matrix[0, 0]),
         fy=float(matrix[1, 1]),
         ppx=float(matrix[0, 2]),

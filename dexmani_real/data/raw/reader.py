@@ -1,7 +1,8 @@
-"""Read Raw metadata at open and validate numerical layout only when requested."""
+"""打开时校验 Raw 元数据，按消费需求校验数组和触觉语义。"""
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -12,9 +13,14 @@ import numpy as np
 from dexmani_real.data.raw.schema import (
     ARM_ACTION_SEMANTICS,
     DATASET_SPECS,
+    TACTILE_AXES,
+    TACTILE_FINGER_ORDER,
+    TACTILE_PROCESSING,
+    TACTILE_UNITS,
     TIMING_ROW_DTYPE,
     validate_fixed_rate_rows,
 )
+from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
 
 
 class RawDataError(ValueError):
@@ -56,14 +62,6 @@ def nonnegative_int_attr(attrs: h5py.AttributeManager, name: str) -> int:
     return value
 
 
-def positive_int_attr(attrs: h5py.AttributeManager, name: str) -> int:
-    """Require positive integer dimensions without numeric or text coercion."""
-    value = scalar_attr(attrs, name)
-    if type(value) is not int or value <= 0:
-        raise RawDataError(f"episode metadata {name} must be a positive integer")
-    return int(value)
-
-
 def positive_float_attr(attrs: h5py.AttributeManager, name: str) -> float:
     value = scalar_attr(attrs, name)
     if type(value) not in (int, float):
@@ -82,6 +80,7 @@ class EpisodeReader:
         self.data_file = self.video_container = None
         self.fields_cache = None
         self.dataset_cache = {}
+        self.tactile_hold_max_age_s = None
         if not self.path.is_dir():
             raise ValueError(f"episode must be a directory: {self.path}")
         self.rgb_path = self.path / "rgb.mp4"
@@ -107,6 +106,18 @@ class EpisodeReader:
                 raise RawDataError("unknown arm action semantics")
             if text_attr(attrs, "timestamp_source") != "host_monotonic_relative":
                 raise RawDataError("Raw timestamp must use host monotonic relative seconds")
+            if text_attr(attrs, "joint_units") != "rad":
+                raise RawDataError("Raw joint units must be rad")
+            for name, expected in (
+                ("arm_joint_names", XARM7_JOINT_NAMES),
+                ("hand_joint_names", XHAND_SDK_JOINT_NAMES),
+            ):
+                try:
+                    names = json.loads(text_attr(attrs, name))
+                except json.JSONDecodeError as exc:
+                    raise RawDataError(f"Raw {name}: invalid JSON") from exc
+                if names != list(expected):
+                    raise RawDataError(f"Raw {name}: incompatible joint order")
             text_attr(attrs, "termination_reason")
             self.num_frames = nonnegative_int_attr(attrs, "num_frames")
             self.control_hz = positive_float_attr(attrs, "control_hz")
@@ -141,33 +152,36 @@ class EpisodeReader:
             raise RuntimeError("Raw reader is closed")
         if name in self.dataset_cache:
             return self.dataset_cache[name]
+        if name in {"hand_contact", "hand_tactile_force"}:
+            self.validate_tactile_metadata()
         array = self.data_file[name]
         if not isinstance(array, h5py.Dataset):
             raise RawDataError(f"Raw {name}: expected a dataset")
         if name in DATASET_SPECS:
-            spec = DATASET_SPECS[name]
-            if array.shape != (self.num_frames, *spec.tail_shape) or array.dtype != spec.dtype:
+            tail_shape, dtype = DATASET_SPECS[name]
+            if array.shape != (self.num_frames, *tail_shape) or array.dtype != dtype:
                 raise RawDataError(f"Raw {name}: incompatible shape/dtype")
         self.dataset_cache[name] = array
         return array
-
-    def read_timing_rows(self, fields=TIMING_ROW_DTYPE.names, *, start=0, stop=None):
-        """Read required source-clock columns in a bounded row range."""
-        if "timing/rows" not in self.data_file:
-            raise RawDataError("Raw is missing timing rows")
-        rows = self.data_file["timing/rows"]
-        if (
-            not isinstance(rows, h5py.Dataset)
-            or rows.shape != (self.num_frames,)
-            or rows.dtype != TIMING_ROW_DTYPE
-        ):
-            raise RawDataError("timing rows must match the current eight-column layout and row count")
-        return rows.fields(fields)[start:stop]
 
     def validate_completion(self):
         """Strict numerical consumers require a technically normal capture."""
         if text_attr(self.meta, "technical_status") != "normal":
             raise RawDataError("capture ended with a technical failure")
+
+    def validate_tactile_metadata(self):
+        """仅在消费触觉时确认文件语义；Raw 打开期间保持不可变。"""
+        if self.tactile_hold_max_age_s is None:
+            for name, expected in (
+                ("hand_tactile_processing", TACTILE_PROCESSING),
+                ("hand_tactile_units", TACTILE_UNITS),
+                ("hand_tactile_axes", TACTILE_AXES),
+                ("hand_tactile_finger_order", TACTILE_FINGER_ORDER),
+            ):
+                if text_attr(self.meta, name) != expected:
+                    raise RawDataError(f"Raw {name}: incompatible tactile semantics")
+            self.tactile_hold_max_age_s = positive_float_attr(self.meta, "hand_tactile_hold_max_age_s")
+        return self.tactile_hold_max_age_s
 
     def validate_rows(
         self, *, required_tactile=("aggregate", "dense"), require_camera=True, chunk_frames=4096
@@ -177,12 +191,21 @@ class EpisodeReader:
             raise ValueError("chunk_frames must be a positive integer")
         if not set(required_tactile) <= {"aggregate", "dense"}:
             raise ValueError("unknown tactile source")
+        if "timing/rows" not in self.data_file:
+            raise RawDataError("Raw is missing timing rows")
+        timing = self.data_file["timing/rows"]
+        if (
+            not isinstance(timing, h5py.Dataset)
+            or timing.shape != (self.num_frames,)
+            or timing.dtype != TIMING_ROW_DTYPE
+        ):
+            raise RawDataError("timing rows must match the source-clock layout and row count")
         fields = ("observation_ns", "control_ns", "arm_ns", "hand_ns")
         fields += tuple(f"tactile_{name}_ns" for name in required_tactile)
         if require_camera:
             fields += ("camera_ns", "camera_sequence")
         max_age_ns = (
-            positive_float_attr(self.meta, "hand_tactile_hold_max_age_s") * 1e9
+            self.validate_tactile_metadata() * 1e9
             if required_tactile else None
         )
         timestamps = self["timestamp"]
@@ -195,7 +218,7 @@ class EpisodeReader:
             )
             if errors:
                 raise RawDataError("; ".join(errors))
-            rows = self.read_timing_rows(fields, start=first, stop=end)
+            rows = timing.fields(fields)[first:end]
             observation = rows["observation_ns"]
             if np.any(observation <= 0) or np.any(np.diff(observation) <= 0):
                 raise RawDataError("observation clocks must be positive and strictly increasing")

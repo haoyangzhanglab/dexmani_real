@@ -12,9 +12,8 @@ from dexmani_real.data.results import error_detail
 from dexmani_real.robot.commands import RobotCommand, RobotError, OperationCancelled
 from dexmani_real.runtime.home import home_robot, home_hand
 from dexmani_real.runtime.observation import (
-    feedback_deadline_ns,
     read_observation,
-    control_deadline_ns, observation_issues, service_feedback,
+    control_deadline_ns, check_observation, service_feedback,
 )
 from dexmani_real.runtime.operator_input import OperatorCommand
 from dexmani_real.runtime.state import RunEndReason, SafetyState
@@ -233,7 +232,7 @@ class TeleopRunner:
                     self.poll_blocking_commands() or not self.preparation_valid()
                 ),
             )
-            issues = self.admit_observation(row)
+            issues, _ = self.admit_observation(row)
         except CancelledError:
             # S/Q may already have finalized preparation in poll_blocking_commands.
             if self.preparing_epoch is not None:
@@ -253,7 +252,8 @@ class TeleopRunner:
                 collection_source="teleop",
                 metadata=snapshot_recording_metadata(
                     self.camera_snapshot,
-                    hand=self.robot.hand,
+                    tactile_reset_metadata=self.robot.hand.get_tactile_reset_metadata(),
+                    tactile_hold_max_age_s=self.runtime.hand.feedback_max_age_s,
                 ),
             )
         self.capture_started_s = time.monotonic()
@@ -387,9 +387,9 @@ class TeleopRunner:
             self.stop_capture("begin_unavailable")
         return False
 
-    def execute_control_step(self, row, deadline_ns):
+    def execute_control_step(self, row, deadline_ns, feedback_until_ns):
         epoch = self.control_run_id
-        deadline_ns = min(deadline_ns, feedback_deadline_ns(row, self.runtime, needs=self.control_needs))
+        deadline_ns = min(deadline_ns, feedback_until_ns)
         action_result = command = failure = None
         reason = None
         interrupted = False
@@ -504,19 +504,19 @@ class TeleopRunner:
         return True
 
     def admit_observation(self, row):
-        issues = observation_issues(
+        issues, feedback_until_ns = check_observation(
             row, self.runtime, self.control_needs, require_hand=self.runtime.hand.enabled,
         )
         if issues:
-            return issues
+            return issues, feedback_until_ns
         if self.recording_dir is not None:
-            record_issues = observation_issues(row, self.runtime, self.record_needs)
+            record_issues, _ = check_observation(row, self.runtime, self.record_needs)
             if record_issues:
                 raise RecordingError("recording sources: " + "; ".join(record_issues))
         self.robot.arm.update_health(
-            health_until_ns=control_deadline_ns(row, self.runtime, self.control_needs),
+            health_until_ns=control_deadline_ns(feedback_until_ns, self.runtime.arm),
         )
-        return []
+        return issues, feedback_until_ns
 
     def run_control_tick(self):
         if (
@@ -547,7 +547,7 @@ class TeleopRunner:
         row = read_observation(
             self.sensors.channels, self.robot, needs=self.needs,
         )
-        issues = self.admit_observation(row)
+        issues, feedback_until_ns = self.admit_observation(row)
         if issues:
             self.stop_capture("control_sources: " + "; ".join(issues))
             return
@@ -571,7 +571,7 @@ class TeleopRunner:
             self.stop_capture("late_observation", row=row)
             return
         self.tick_index += 1
-        self.execute_control_step(row, self.next_tick_ns)
+        self.execute_control_step(row, self.next_tick_ns, feedback_until_ns)
 
     def close(self):
         """Revoke and preserve the capture; the session owns input/audio resources."""
@@ -597,9 +597,7 @@ class TeleopRunner:
                 failure = exc
             logger.exception("teleop recording cleanup failed")
         finally:
-            if self.recorder is not None and (
-                self.recorder.finish_request is None or self.recorder.writer_pending
-            ):
+            if self.recorder is not None:
                 # START 失败或首次收尾超时仍由当前 owner 等待；不重试写入。
                 try:
                     self.recorder.close()

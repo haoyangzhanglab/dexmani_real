@@ -10,6 +10,7 @@ import numpy as np
 from dexmani_real.data.canonical.schema import ProcessingConfig
 from dexmani_real.data.raw.camera_geometry import (
     RawEpisodeCameraModel,
+    load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
 )
 from dexmani_real.data.raw.reader import EpisodeReader, RawDataError
@@ -36,9 +37,7 @@ def validate_export_episode(
     try:
         camera = load_raw_episode_camera_model(reader)
         validate_aligned_depth_distortion(camera.intrinsics.distortion_model)
-        base_from_color = np.asarray(
-            reader.meta["camera_T_xarm_base_from_color"], dtype=np.float64
-        ).reshape(4, 4)
+        base_from_color = load_raw_episode_base_from_color(reader)
         camera_parameters = camera_parameters_cv(camera.intrinsics, base_from_color)
     except (ValueError, TypeError, KeyError) as exc:
         raise RawDataError(f"invalid camera geometry: {exc}") from exc
@@ -87,6 +86,7 @@ def iter_canonical_blocks(
     camera: RawEpisodeCameraModel,
     base_from_color: np.ndarray,
     camera_parameters: dict[str, np.ndarray],
+    handbase_rotation_eef: np.ndarray,
 ):
     """Convert admitted Raw blocks with export-owned FK, without repairing or resampling rows."""
     height, width = camera.intrinsics.height, camera.intrinsics.width
@@ -119,7 +119,7 @@ def iter_canonical_blocks(
             hand,
             hand_fk=hand_fk,
             handbase_position_eef_m=config.handbase_position_eef_m,
-            handbase_quat_eef_wxyz=config.handbase_quat_eef_wxyz,
+            handbase_rotation_eef=handbase_rotation_eef,
             hand_cloud=hand_cloud,
         )
         block = {

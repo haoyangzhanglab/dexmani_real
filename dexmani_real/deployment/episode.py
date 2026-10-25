@@ -32,7 +32,7 @@ from dexmani_real.planning.kinematics.ik import IKFailureKind
 from dexmani_real.planning.kinematics.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.robot.commands import OperationCancelled, RobotError, RobotCommand
 from dexmani_real.runtime.observation import (
-    feedback_deadline_ns, read_observation, observation_issues, control_deadline_ns, service_feedback,
+    read_observation, check_observation, control_deadline_ns, service_feedback,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState
 
@@ -68,6 +68,7 @@ class PolicyEpisode:
         robot,
         control_needs,
         record_needs,
+        dependencies,
         sensors,
         action_mapper,
         model_runtime,
@@ -85,6 +86,7 @@ class PolicyEpisode:
         self.robot = robot
         self.sensors = sensors
         self.control_needs, self.record_needs = control_needs, record_needs
+        self.dependencies = dependencies
         self.needs = control_needs.union(record_needs)
         self.action_mapper = action_mapper
         self.model = model_runtime
@@ -104,7 +106,6 @@ class PolicyEpisode:
         )
         self.plan = self.query = None
         self.preparation_issue = None
-        self.observation_read_issues = []
         self.wait_started_ns = None
         self.last_slot = -1
         self.dt_ns = int(policy_info.control_dt_s * 1e9)
@@ -120,16 +121,16 @@ class PolicyEpisode:
             needs=self.needs, wait_for_hand=wait_for_hand,
             cancel_requested=lambda: not self.preparation_valid(),
         )
-        self.observation_read_issues = observation_issues(row, self.runtime, self.control_needs)
-        if not self.observation_read_issues:
+        issues, feedback_until_ns = check_observation(row, self.runtime, self.control_needs)
+        if not issues:
             if self.recorder is not None:
-                record_issues = observation_issues(row, self.runtime, self.record_needs)
+                record_issues, _ = check_observation(row, self.runtime, self.record_needs)
                 if record_issues:
                     raise RecordingError("recording sources: " + "; ".join(record_issues))
             self.robot.arm.update_health(
-                health_until_ns=control_deadline_ns(row, self.runtime, self.control_needs),
+                health_until_ns=control_deadline_ns(feedback_until_ns, self.runtime.arm),
             )
-        return row
+        return row, "control_input_" + issues[0] if issues else None, feedback_until_ns
 
     def budget_limit(self):
         return run_budget(
@@ -172,7 +173,7 @@ class PolicyEpisode:
         self.termination = EpisodeEnd(epoch, reason_name, detail, duration_s)
         self.run_id = None
         self.plan = None
-        if self.model.future is None:
+        if not self.model.has_pending_task:
             self.query = self.preparing_epoch = None
         self.history.clear()
         if self.hand_history is not None:
@@ -244,12 +245,6 @@ class PolicyEpisode:
         if failure is not None:
             raise failure
 
-    def observation_issue(self):
-        return (
-            "control_input_" + self.observation_read_issues[0]
-            if self.observation_read_issues else None
-        )
-
     def preparation_valid(self):
         return self.runtime_state.command_may_cross_sdk(
             run_id=self.preparing_epoch,
@@ -257,8 +252,7 @@ class PolicyEpisode:
         )
 
     def start_observation(self, *, wait_for_hand=False):
-        row = self.read_observation(wait_for_hand=wait_for_hand)
-        self.preparation_issue = self.observation_issue()
+        row, self.preparation_issue, _ = self.read_observation(wait_for_hand=wait_for_hand)
         if self.preparation_issue is not None:
             logger.warning("本轮未开始：%s", self.preparation_issue)
             return None
@@ -297,7 +291,9 @@ class PolicyEpisode:
         epoch = self.preparing_epoch
         if self.recorder is not None:
             metadata = snapshot_recording_metadata(
-                self.camera_snapshot, hand=self.robot.hand,
+                self.camera_snapshot,
+                tactile_reset_metadata=self.robot.hand.get_tactile_reset_metadata(),
+                tactile_hold_max_age_s=self.runtime.hand.feedback_max_age_s,
             )
             capture_id = next(self.capture_ids)
             self.recorder.start_episode(
@@ -492,7 +488,7 @@ class PolicyEpisode:
             )
         return command, None
 
-    def execute_slot(self, row, slot):
+    def execute_slot(self, row, slot, feedback_until_ns):
         plan = self.plan
         mapping_started = time.monotonic_ns()
         command, issue = self.command_for_slot(row, slot)
@@ -510,7 +506,7 @@ class PolicyEpisode:
         decision_deadline_ns = plan.expires_at_ns
         action_deadline_ns = min(
             self.next_step_ns,
-            feedback_deadline_ns(row, self.runtime, needs=self.control_needs),
+            feedback_until_ns,
             decision_deadline_ns,
         )
         valid_until_ns = (
@@ -557,7 +553,7 @@ class PolicyEpisode:
         handoff_slot, issue = prefetch_handoff(
             self.plan, slot=slot, mode=self.execution.execution_mode,
             prefetch_steps=self.execution.prefetch_steps,
-            query_pending=self.query is not None, model_pending=self.model.future is not None,
+            query_pending=self.query is not None, model_pending=self.model.has_pending_task,
             history_ready=bool(rows),
         )
         if issue is not None or handoff_slot is None:
@@ -601,7 +597,7 @@ class PolicyEpisode:
         if self.termination is not None:
             self.poll_model()
             return
-        if self.run_id is None and self.model.future is None:
+        if self.run_id is None and not self.model.has_pending_task:
             self.prepare()
             return
         if self.run_id is None and not self.preparation_valid():
@@ -635,17 +631,16 @@ class PolicyEpisode:
             self.finish(f"missed_slot: expected={slot}, actual={slot + skipped}")
             return
         self.last_slot = slot
-        row = self.read_observation()
+        row, issue, feedback_until_ns = self.read_observation()
         self.pending_frame = (row, None)
         self.poll_model()
         if not self.has_motion_authority():
             self.finish("observation_authority_revoked")
             return
-        issue = self.observation_issue()
         if issue is not None:
             self.finish(issue)
             return
-        self.history.append(project_policy_row(row, self.policy_info.observation_fields))
+        self.history.append(project_policy_row(row, self.policy_info.observation_fields, self.dependencies))
         rows = tuple(self.history) if len(self.history) == self.history.maxlen else ()
         new_plan, issue = handoff_plan(
             self.query, run_id=self.run_id, slot=slot,
@@ -662,7 +657,7 @@ class PolicyEpisode:
             if self.wait_started_ns is None:
                 self.wait_started_ns = now
                 self.robot.arm.limit_execution_until(now + int(self.execution.max_wait_s * 1e9))
-            if rows and self.query is None and self.model.future is None:
+            if rows and self.query is None and not self.model.has_pending_task:
                 issue = self.submit(rows, slot)
                 if issue is not None:
                     self.finish(
@@ -683,6 +678,6 @@ class PolicyEpisode:
                 self.finish(issue.detail, run_end_reason=issue.run_end_reason)
                 return
             # Pending prefetch never suspends a still-valid current plan.
-            self.execute_slot(row, slot)
+            self.execute_slot(row, slot, feedback_until_ns)
         if (expired := self.expired_budget()) is not None:
             self.finish_budget(expired)

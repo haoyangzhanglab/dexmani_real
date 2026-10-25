@@ -65,8 +65,6 @@ def apply_config_overrides(current: Any, changes: Any) -> Any:
         if not isinstance(changes, Mapping):
             raise TypeError(f"{type(current).__name__} overrides must be a mapping")
         updated = dict(changes)
-        if isinstance(current, TableCollisionConfig) and "plane_abcd" in updated:
-            raise ValueError("environment.table.plane_abcd was removed; use plane_path")
         if isinstance(current, EnvironmentConfig) and "static_boxes" in updated:
             updated["static_boxes"] = tuple(
                 apply_config_overrides(StaticCollisionBox(), box) for box in updated["static_boxes"]

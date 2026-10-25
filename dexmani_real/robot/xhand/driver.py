@@ -109,6 +109,8 @@ class XHand:
     def __init__(self, config: HandParams):
         config.validate()
         self.cfg = config
+        self.mechanical_lower = np.asarray(config.mechanical_qpos_min_rad, dtype=np.float64)
+        self.mechanical_upper = np.asarray(config.mechanical_qpos_max_rad, dtype=np.float64)
         self.connected_flag = False
         self.send_crc_started_ns = None
         self.device_identity = {
@@ -546,8 +548,8 @@ class XHand:
 
         reason = check_hand_target(
             qpos,
-            mechanical_lower_rad=np.asarray(self.cfg.mechanical_qpos_min_rad),
-            mechanical_upper_rad=np.asarray(self.cfg.mechanical_qpos_max_rad),
+            mechanical_lower_rad=self.mechanical_lower,
+            mechanical_upper_rad=self.mechanical_upper,
         )
         if reason is not None:
             raise ValueError(f"XHand.send_action: {reason}")

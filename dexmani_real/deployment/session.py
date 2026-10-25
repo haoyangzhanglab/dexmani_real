@@ -43,6 +43,7 @@ class PolicySession:
         *,
         control_needs,
         record_needs,
+        dependencies,
         results_dir,
         run_config,
         device="cuda:0",
@@ -65,6 +66,7 @@ class PolicySession:
         self.results_dir = results_dir
         self.camera_calibration_path = camera_calibration_path
         self.control_needs, self.record_needs = control_needs, record_needs
+        self.dependencies = dependencies
         self.needs = control_needs.union(record_needs)
         self.keyboard = None
         self.home_results = []
@@ -119,8 +121,7 @@ class PolicySession:
         from dexmani_real.deployment.inference import InferenceWorker
         from dexmani_policy.deployment import load_policy
 
-        fields = set(self.info.observation_fields)
-        if self.needs.point_cloud or "camera_extrinsic" in fields:
+        if self.needs.point_cloud or "camera_extrinsic" in self.info.observation_fields:
             self.camera_calibration = CameraExtrinsics(self.camera_calibration_path)
         elif self.recording_dir is not None:
             self.camera_calibration = load_optional_camera_extrinsics(self.camera_calibration_path)
@@ -150,7 +151,7 @@ class PolicySession:
         )
 
         self.kinematics = build_observation_kinematics(
-            self.info, execution=self.runtime.execution,
+            self.dependencies, fingertip_link_names=self.info.fingertip_link_names,
             hand=self.runtime.hand, hand_pointcloud=self.runtime.hand_pointcloud,
         )
         self.camera_parameters = None
@@ -161,12 +162,12 @@ class PolicySession:
                 seed=self.seed,
             ),
             build_observation=lambda rows: build_policy_observation(
-                rows, self.info, kinematics=self.kinematics,
+                rows, self.info.observation_fields, self.dependencies, kinematics=self.kinematics,
                 camera_parameters=self.camera_parameters,
             ),
             reset_observation=(
                 self.kinematics.row_features.clear
-                if self.kinematics is not None and self.kinematics.row_features is not None else None
+                if self.kinematics is not None else None
             ),
         )
         self.warmup_policy()
@@ -293,9 +294,7 @@ class PolicySession:
             except Exception as exc:
                 cleanup_errors.append(error_detail("model_close_submit", exc))
         try:
-            if self.recorder is not None and (
-                self.recorder.finish_request is None or self.recorder.writer_pending
-            ):
+            if self.recorder is not None:
                 # Episode 已结束也不能丢失仍在退出的 writer。
                 try:
                     self.recorder.close()
@@ -537,7 +536,7 @@ class PolicySession:
 
     def request_start(self):
         with self.runtime_state.motion_lock:
-            if self.episode is not None or self.model.future is not None:
+            if self.episode is not None or self.model.has_pending_task:
                 return False
             epoch = self.runtime_state.run_id
             if not self.runtime_state.command_may_cross_sdk(
@@ -572,6 +571,7 @@ class PolicySession:
                 robot=self.robot,
                 sensors=self.sensors,
                 control_needs=self.control_needs, record_needs=self.record_needs,
+                dependencies=self.dependencies,
                 action_mapper=self.action_mapper,
                 model_runtime=self.model,
                 max_running_s=self.max_running_s,
@@ -618,7 +618,7 @@ class PolicySession:
                     ):
                         print("等待下一轮：整理场景后 H 回初始位 → B 开始；Q 退出。", flush=True)
             # A finished attempt still owns reset/predict identity until poll() reclaims it.
-            if ended is not None and self.model.future is None:
+            if ended is not None and not self.model.has_pending_task:
                 self.episode = None
 
     def run_control_loop(self):
@@ -629,7 +629,7 @@ class PolicySession:
                 self.robot.arm.check_error()
                 self.poll_operator(
                     allow_tactile_reset=(
-                        self.episode is None and self.model.future is None
+                        self.episode is None and not self.model.has_pending_task
                         and (self.recorder is None or not self.recorder.is_recording)
                     )
                 )

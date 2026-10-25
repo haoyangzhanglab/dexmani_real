@@ -16,8 +16,7 @@ from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.home import build_home_planner, home_robot
 from dexmani_real.runtime.jog import JogController, jog_motion_requested
 from dexmani_real.runtime.observation import (
-    feedback_deadline_ns,
-    read_observation, observation_issues, ObservationNeeds, service_feedback,
+    read_observation, check_observation, ObservationNeeds, service_feedback,
     control_deadline_ns,
 )
 from dexmani_real.runtime.operator_input import KeyboardInput
@@ -189,12 +188,12 @@ class KeyboardTeleopSession:
                 return
 
         row = read_observation(None, self.robot)
-        issues = observation_issues(
+        issues, feedback_until_ns = check_observation(
             row, self.runtime, ObservationNeeds(), require_hand=self.runtime.hand.enabled,
         )
         if not issues:
             self.robot.arm.update_health(
-                health_until_ns=control_deadline_ns(row, self.runtime, ObservationNeeds()),
+                health_until_ns=control_deadline_ns(feedback_until_ns, self.runtime.arm),
             )
         if issues:
             self.jog.clear_reference()
@@ -217,7 +216,7 @@ class KeyboardTeleopSession:
             self.jog.submit(
                 proposed_pose, result.qpos, self.keys, generation,
                 self.runtime_state, self.robot, epoch,
-                valid_until_ns=feedback_deadline_ns(row, self.runtime),
+                valid_until_ns=feedback_until_ns,
                 execute_until_ns=row.observation_timestamp_ns
                 + int(self.jog_config.target_max_age_s * 1e9),
             )

@@ -12,7 +12,7 @@ from dexmani_real.planning.paths import wrap_nearest_equivalent
 from dexmani_real.replay.capture import ReplayRecorder
 from dexmani_real.robot.commands import RobotCommand, OperationCancelled, RobotError
 from dexmani_real.runtime.observation import (
-    ObservationNeeds, feedback_deadline_ns, read_observation, observation_issues,
+    ObservationNeeds, read_observation, check_observation,
     control_deadline_ns, service_feedback,
 )
 from dexmani_real.runtime.operator_input import OperatorCommand
@@ -123,10 +123,10 @@ class TrajectoryReplayer:
         row = read_observation(
             None, self.robot, needs=ObservationNeeds()
         )
-        issues = observation_issues(row, self.runtime, ObservationNeeds())
+        issues, feedback_until_ns = check_observation(row, self.runtime, ObservationNeeds())
         if not issues:
             self.robot.arm.update_health(
-                health_until_ns=control_deadline_ns(row, self.runtime, ObservationNeeds()),
+                health_until_ns=control_deadline_ns(feedback_until_ns, self.runtime.arm),
             )
         if issues:
             status, reason = ReplayStatus.REJECTED, "fresh robot feedback unavailable"
@@ -189,10 +189,10 @@ class TrajectoryReplayer:
             row = read_observation(
                 None, self.robot, needs=ObservationNeeds()
             )
-            issues = observation_issues(row, self.runtime, ObservationNeeds())
+            issues, feedback_until_ns = check_observation(row, self.runtime, ObservationNeeds())
             if not issues:
                 self.robot.arm.update_health(
-                    health_until_ns=control_deadline_ns(row, self.runtime, ObservationNeeds()),
+                    health_until_ns=control_deadline_ns(feedback_until_ns, self.runtime.arm),
                 )
             if issues:
                 status, reason = ReplayStatus.REJECTED, "robot feedback stale"
@@ -209,7 +209,7 @@ class TrajectoryReplayer:
                 )
                 status, reason = ReplayStatus.REJECTED, f"replay target: {rejection}"
                 break
-            self.submit_row(index, row, arm, hand, slot_deadline_ns)
+            self.submit_row(index, row, arm, hand, min(slot_deadline_ns, feedback_until_ns))
             self.previous_arm = arm.copy()
             interrupted = self.wait_replay(self.epoch, slot_deadline_ns)
             if interrupted is not None:
@@ -217,10 +217,9 @@ class TrajectoryReplayer:
                 break
         return status, reason
 
-    def submit_row(self, index, row, arm, hand, slot_deadline_ns):
+    def submit_row(self, index, row, arm, hand, valid_until_ns):
         failure = None
         submit_started_ns = submit_completed_ns = -1
-        valid_until_ns = min(slot_deadline_ns, feedback_deadline_ns(row, self.runtime))
         command = RobotCommand(self.epoch, arm, hand)
         try:
             if time.monotonic_ns() >= valid_until_ns:
@@ -334,10 +333,10 @@ class TrajectoryReplayer:
             row = read_observation(
                 None, self.robot, needs=ObservationNeeds()
             )
-            issues = observation_issues(row, self.runtime, ObservationNeeds())
+            issues, feedback_until_ns = check_observation(row, self.runtime, ObservationNeeds())
             if not issues:
                 self.robot.arm.update_health(
-                    health_until_ns=control_deadline_ns(row, self.runtime, ObservationNeeds()),
+                    health_until_ns=control_deadline_ns(feedback_until_ns, self.runtime.arm),
                 )
             if issues:
                 return ReplayOutcome(ReplayStatus.REJECTED, reason="hand start feedback stale")
@@ -364,7 +363,7 @@ class TrajectoryReplayer:
                 command = RobotCommand(epoch, arm_hold, hand)
                 self.preparation_submission_count += 1
                 self.robot.send_action(
-                    command, valid_until_ns=feedback_deadline_ns(row, self.runtime),
+                    command, valid_until_ns=feedback_until_ns,
                     execute_until_ns=row.observation_timestamp_ns + int(self.runtime.hand.home_timeout_s * 1e9),
                 )
                 stamp = time.monotonic_ns()

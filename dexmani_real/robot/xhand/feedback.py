@@ -9,14 +9,6 @@ from dexmani_real.robot.feedback import HAND_STATE_DTYPE
 logger = logging.getLogger(__name__)
 
 
-def hand_feedback_time_ns(hand, required_tactile):
-    """Oldest required hand source, without conflating tactile age with joint time."""
-    return min(
-        int(hand[name][0])
-        for name in ("timestamp_ns", *(f"tactile_{name}_timestamp_ns" for name in required_tactile))
-    )
-
-
 def update_tactile_cache(raw, values, valid_ns, source_ns):
     """Hold whole three-axis vectors; only finite new vectors advance their clocks."""
     # Validate in the observation dtype too: finite float64 may overflow float32.

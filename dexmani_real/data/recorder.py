@@ -15,6 +15,9 @@ from types import SimpleNamespace
 import numpy as np
 
 from dexmani_real.data.raw.writer import RawEpisodeWriter
+from dexmani_real.data.raw.schema import (
+    TACTILE_PROCESSING, TACTILE_UNITS, TACTILE_AXES, TACTILE_FINGER_ORDER,
+)
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish, target_is_occupied
 
 logger = logging.getLogger(__name__)
@@ -35,18 +38,17 @@ class CaptureFinishRequest:
     technical_status: str = "failed"
 
 
-def snapshot_recording_metadata(camera_snapshot, *, hand):
+def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata, tactile_hold_max_age_s):
     """复用初始化相机快照，补入当前 capture 消费的触觉处理语义。"""
     metadata = camera_snapshot.metadata()
-    if hand is not None:
-        metadata.update(hand.get_tactile_reset_metadata())
-        metadata.update(
-            hand_tactile_processing="sdk_native_bounded_previous_valid_vector_hold",
-            hand_tactile_units="sdk_native_unknown_physical_scale",
-            hand_tactile_axes="sdk_sensor_axes_not_world_frame",
-            hand_tactile_finger_order="thumb,index,middle,ring,pinky",
-            hand_tactile_hold_max_age_s=float(hand.cfg.feedback_max_age_s),
-        )
+    metadata.update(tactile_reset_metadata)
+    metadata.update(
+        hand_tactile_processing=TACTILE_PROCESSING,
+        hand_tactile_units=TACTILE_UNITS,
+        hand_tactile_axes=TACTILE_AXES,
+        hand_tactile_finger_order=TACTILE_FINGER_ORDER,
+        hand_tactile_hold_max_age_s=float(tactile_hold_max_age_s),
+    )
     return metadata
 
 
@@ -191,7 +193,8 @@ class AsyncEpisodeRecorder:
 
     def close(self):
         """Join an active writer without inventing a physical stop confirmation."""
-        self.finish(save=True, reason="close")
+        if self.finish_request is None or self.writer_pending:
+            self.finish(save=True, reason="close")
 
     def finish(
         self, *, save, reason, details=None, technical_status="failed"

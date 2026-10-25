@@ -169,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         print("# 以下 CLI 专属参数仍需在命令行指定：")
         for name in (
             "experiment", "checkpoint", "output", "camera_calibration", "no_record",
-            "no_results", "num_episodes", "max_running_s", "weights", "inference_steps", "seed", "device",
+            "num_episodes", "max_running_s", "weights", "inference_steps", "seed", "device",
         ):
             print(f"# {name}: {getattr(args, name)}")
         print(yaml.safe_dump(

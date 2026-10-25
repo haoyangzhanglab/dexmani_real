@@ -1,35 +1,27 @@
 """Raw observations, final submission attempts and host timing."""
 
-from dataclasses import dataclass
-
 import numpy as np
 
 from dexmani_real.utils.timing import sampling_clock_ns
 
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
+TACTILE_PROCESSING = "sdk_native_bounded_previous_valid_vector_hold"
+TACTILE_UNITS = "sdk_native_unknown_physical_scale"
+TACTILE_AXES = "sdk_sensor_axes_not_world_frame"
+TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
 
 
-@dataclass(frozen=True)
-class DatasetSpec:
-    tail_shape: tuple[int, ...]
-    dtype: np.dtype
-
-
-def dataset_spec(dtype, tail_shape=()):
-    return DatasetSpec(tail_shape, np.dtype(dtype))
-
-
-DATASET_SPECS = {
-    "arm_qpos": dataset_spec(np.float64, (7,)),
-    "hand_qpos": dataset_spec(np.float64, (12,)),
+DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
+    "arm_qpos": ((7,), np.dtype(np.float64)),
+    "hand_qpos": ((12,), np.dtype(np.float64)),
     # Consumed tactile observation: SDK units, bounded previous-valid vector hold (see metadata).
-    "hand_contact": dataset_spec(np.float32, (5, 3)),
-    "hand_tactile_force": dataset_spec(np.float32, (5, 120, 3)),
+    "hand_contact": ((5, 3), np.dtype(np.float32)),
+    "hand_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
     # Final absolute q_goal passed to submission, including failed attempts.
-    "action_arm_joint_target": dataset_spec(np.float64, (7,)),
-    "action_hand_joint_target": dataset_spec(np.float64, (12,)),
+    "action_arm_joint_target": ((7,), np.dtype(np.float64)),
+    "action_hand_joint_target": ((12,), np.dtype(np.float64)),
     # Seconds relative to the first observation.
-    "timestamp": dataset_spec(np.float64),
+    "timestamp": ((), np.dtype(np.float64)),
 }
 
 
@@ -110,10 +102,10 @@ def encode_raw_row(row, command, timestamp):
         ),
     }
     for name, value in values.items():
-        spec = DATASET_SPECS[name]
-        array = np.asarray(value, dtype=spec.dtype)
-        if array.shape != spec.tail_shape:
-            raise ValueError(f"Raw {name}: expected {spec.tail_shape}, got {array.shape}")
+        tail_shape, dtype = DATASET_SPECS[name]
+        array = np.asarray(value, dtype=dtype)
+        if array.shape != tail_shape:
+            raise ValueError(f"Raw {name}: expected {tail_shape}, got {array.shape}")
         values[name] = array
     return values
 

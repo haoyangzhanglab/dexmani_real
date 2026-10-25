@@ -108,7 +108,7 @@ class CameraSnapshot:
         if self.T_xarm_base_from_color is not None:
             transform = validate_rigid_transform(
                 self.T_xarm_base_from_color, label="T_xarm_base_from_color",
-            ).copy()
+            )
             transform.setflags(write=False)
             object.__setattr__(self, "T_xarm_base_from_color", transform)
 
@@ -133,13 +133,10 @@ def camera_parameters_cv(
     color: CameraIntrinsics,
     T_xarm_base_from_color: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
-    """Float32 C-order K(9) and optional base-to-color [R|t](12), using optical RDF axes."""
+    """将已校验几何转为 float32 K(9) 和 base→color [R|t](12)，采用 optical RDF 轴。"""
     matrices = {"camera_intrinsic": color.matrix()}
     if T_xarm_base_from_color is not None:
-        base_from_color = validate_rigid_transform(
-            T_xarm_base_from_color, label="T_xarm_base_from_color"
-        )
-        matrices["camera_extrinsic"] = np.linalg.inv(base_from_color)[:3, :4]
+        matrices["camera_extrinsic"] = np.linalg.inv(T_xarm_base_from_color)[:3, :4]
     result = {}
     for name, matrix in matrices.items():
         if not np.isfinite(matrix).all() or np.any(np.abs(matrix) > np.finfo(np.float32).max):

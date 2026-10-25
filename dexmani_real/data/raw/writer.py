@@ -42,11 +42,11 @@ class RawEpisodeWriter:
         self.datasets = {
             name: data.create_dataset(
                 name,
-                shape=(0, *spec.tail_shape),
-                maxshape=(None, *spec.tail_shape),
-                dtype=spec.dtype,
+                shape=(0, *tail_shape),
+                maxshape=(None, *tail_shape),
+                dtype=dtype,
             )
-            for name, spec in DATASET_SPECS.items()
+            for name, (tail_shape, dtype) in DATASET_SPECS.items()
         }
         timing = data.create_group("timing")
         timing.attrs.update(

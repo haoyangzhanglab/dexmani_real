@@ -29,6 +29,11 @@ class InferenceWorker:
         self.operation = None
         self.close_future = None
 
+    @property
+    def has_pending_task(self):
+        """已完成但尚未回收的模型任务仍算在途。"""
+        return self.future is not None
+
     def run_operation(self, operation, args, kwargs, query_context=None):
         start = time.monotonic_ns()
         model_start = None

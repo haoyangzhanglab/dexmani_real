@@ -80,7 +80,7 @@ python scripts/tools/view_pointcloud.py --help
 
 `absent` 表示手未安装，`secured-home` 表示已物理固定在配置 HOME 手形；两者均按固定 HOME 手形检查碰撞。标定 jog 允许桌面接触，HOME 独立检查路径净空。采样、求解或目标被拒绝后，先释放全部 jog 键再继续移动。
 
-采集通过 `--vr-transform`、`--camera-calibration` 选择标定，部署支持 `--camera-calibration`；桌面仅由 `environment.table.plane_path` 指定；旧 YAML 的 `plane_abcd` 须删除，改用标定文件。碰撞和去桌都不需要时不读取该文件。采集允许缺相机外参，点云重建需要数据对应的相机几何；质量为 `poor` 的 VR 标定不能用于遥操作启动。
+采集通过 `--vr-transform`、`--camera-calibration` 选择标定，部署支持 `--camera-calibration`；桌面标定文件由 `environment.table.plane_path` 指定。碰撞和去桌都不需要时不读取该文件。采集允许缺相机外参，点云重建需要数据对应的相机几何；质量为 `poor` 的 VR 标定不能用于遥操作启动。
 
 ### 2. 遥操作与采集
 
@@ -179,7 +179,7 @@ RGB-D、点云和 episode 查看统一使用 Rerun，冻结、时间浏览、配
 
 停止、晚帧和控制失败保留真实前缀；仅操作者显式重录或丢弃才删除当前 capture。写入、编码、关闭或发布失败保留 staging。I/O 完整的失败采集可以发布 Raw，但采集技术失败或含 WAIT／缺失目标的段不能严格导出或回放。结束后的单独停止清理错误另存详情，不改写此前的采集结果；设备仍禁止自行重启。发布不证明任务成功、目标送达或设备停止。
 
-Raw 不维护格式版本号，读取和使用时直接检查必需字段、动作含义、时间来源与数据完整性。缺少这些信息的数据明确拒绝，不猜测或补齐。历史文件保持原样，需要时使用对应旧提交查看，不提供原地迁移或兼容读取分支。
+Raw 不维护格式版本号。[Reader](dexmani_real/data/raw/reader.py) 在打开时检查必需元数据和关节单位、顺序；消费触觉时额外检查触觉语义和有效时限。导出和回放按用途检查动作、来源时间与数值完整性，缺失或不符的数据明确拒绝。历史文件保持原样，需要时使用对应旧提交查看，不提供迁移或兼容读取分支。
 
 | 概念 | 数值含义 |
 | --- | --- |
@@ -211,4 +211,4 @@ Raw 不维护格式版本号，读取和使用时直接检查必需字段、动�
 
 编码约定、改动核对及验证方式统一见 [AGENTS.md](AGENTS.md#验证与交付)，按改动选择必要的离线检查。Claude 使用 [CLAUDE.md](CLAUDE.md) 按任务定位，无需全篇重复阅读。
 
-部署变更可在安装了配套 dexmani_policy 的环境中离线运行 `python scripts/check_deployment.py`。该 unittest 脚本只使用 mock、可控时钟和临时产物，检查模式边界、迟到/过期/撤权/reset、单在途查询、模型启动失败时结果收尾与结果写入；不会连接设备，不代替真机验证。
+部署变更运行 `python scripts/check_deployment.py`；Raw 录制和 Canonical 导出变更运行 `python scripts/check_recording.py`。检查使用合成输入、假设备和临时文件，包含现有 Pinocchio 运动学与 HDF5/PyAV/Zarr 集成；部署检查还需要配套 dexmani_policy。沿用现有实验环境，不连接设备，也不代替真机验证。
