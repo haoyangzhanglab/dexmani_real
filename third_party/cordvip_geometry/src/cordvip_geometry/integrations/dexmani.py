@@ -132,7 +132,7 @@ class RawHandCloudProvider:
     """
 
     def __init__(self, episode, config_path=None, num_points=1024, seed=0):
-        from dexmani_real.config.experiment import load_experiment_config
+        from dexmani_real.config import load_experiment_config
         from dexmani_real.data.raw.camera_geometry import load_raw_episode_base_from_color
         from dexmani_real.planning.kinematics.arm_fk import ArmFK
         from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rotmat

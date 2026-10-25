@@ -68,10 +68,14 @@ def export_canonical(
             raise ValueError(f"output must not be inside Raw directory: {protected}")
     selected, excluded = select_episodes(source, exclude)
     rejected = {}
-    staging = root = data = None
-    ends = []
-    episode_ids = []
-    arm_fk = hand_fk = hand_cloud = None
+    staging = None
+    root: zarr.Group
+    data: zarr.Group
+    ends: list[int] = []
+    episode_ids: list[str] = []
+    arm_fk: ArmFK
+    hand_fk: HandKinematics
+    hand_cloud = None
     processing_attrs = dict(
         format=CANONICAL_FORMAT,
         action_semantics="absolute_joint_goal_not_next_step_arrival",
@@ -102,50 +106,21 @@ def export_canonical(
                             "invalid task metadata: task_name must not contain control characters"
                         )
                     height, width = camera.intrinsics.height, camera.intrinsics.width
-                    if ends:
-                        # Only these values vary by episode; the processing recipe is fixed.
-                        if task != root.attrs["task_name"] or not np.isclose(
-                            reader.dt, root.attrs["dt"], rtol=0, atol=1e-12
-                        ):
-                            raise ValueError(
-                                f"{episode.name}: one canonical store requires uniform task and dt"
-                            )
-                        if camera.depth_scale_m != root.attrs["depth_scale_m_per_unit"]:
-                            raise ValueError(
-                                f"{episode.name}: depth_scale_m_per_unit must be uniform"
-                            )
-                        if (height, width, 3) != specs["rgb"][0]:
-                            raise ValueError(f"{episode.name}: inconsistent rgb shape or dtype")
-                    else:
-                        specs = canonical_array_specs(
-                            processing.pointcloud.num_points, height, width,
-                            processing.hand_pointcloud.num_points,
-                        )
-                        row_bytes = sum(
-                            int(np.prod(tail)) * dtype.itemsize for tail, dtype in specs.values()
-                        )
-                        chunk = min(
-                            chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes)
-                        )
-                    if hand_fk is None:
+                    specs = canonical_array_specs(
+                        processing.pointcloud.num_points, height, width,
+                        processing.hand_pointcloud.num_points,
+                    )
+                    row_bytes = sum(
+                        int(np.prod(tail)) * dtype.itemsize for tail, dtype in specs.values()
+                    )
+                    chunk = min(chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes))
+                    if hand_cloud is None:
                         arm_fk = ArmFK()
                         hand_fk = HandKinematics(
                             str(XHAND_RIGHT_URDF_PATH),
                             processing.fingertip_link_names,
                         )
                         hand_cloud = HandPointCloudTemplate(processing.hand_pointcloud, hand_fk)
-                    blocks = iter_canonical_blocks(
-                        reader,
-                        processing,
-                        arm_fk=arm_fk,
-                        hand_fk=hand_fk,
-                        hand_cloud=hand_cloud,
-                        chunk_frames=chunk,
-                        camera=camera,
-                        base_from_color=base_from_color,
-                        camera_parameters=camera_parameters,
-                        handbase_rotation_eef=handbase_rotation_eef,
-                    )
                     if not ends:
                         period_ns, tolerance_ns = sampling_clock_ns(reader.control_hz)
                         attrs = dict(
@@ -184,6 +159,32 @@ def export_canonical(
                                 dtype=dtype,
                                 compressor=compressor,
                             )
+                    else:
+                        # Only these values vary by episode; the processing recipe is fixed.
+                        if task != root.attrs["task_name"] or not np.isclose(
+                            reader.dt, root.attrs["dt"], rtol=0, atol=1e-12
+                        ):
+                            raise ValueError(
+                                f"{episode.name}: one canonical store requires uniform task and dt"
+                            )
+                        if camera.depth_scale_m != root.attrs["depth_scale_m_per_unit"]:
+                            raise ValueError(
+                                f"{episode.name}: depth_scale_m_per_unit must be uniform"
+                            )
+                        if (height, width, 3) != data["rgb"].shape[1:]:
+                            raise ValueError(f"{episode.name}: inconsistent rgb shape")
+                    blocks = iter_canonical_blocks(
+                        reader,
+                        processing,
+                        arm_fk=arm_fk,
+                        hand_fk=hand_fk,
+                        hand_cloud=hand_cloud,
+                        chunk_frames=chunk,
+                        camera=camera,
+                        base_from_color=base_from_color,
+                        camera_parameters=camera_parameters,
+                        handbase_rotation_eef=handbase_rotation_eef,
+                    )
                     count = append_episode(data, offset, blocks, specs, reader.num_frames)
             except RawDataError as exc:
                 rejected[episode.name] = str(exc)

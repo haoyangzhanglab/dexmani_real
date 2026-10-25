@@ -7,13 +7,15 @@ from pathlib import Path
 
 from dexmani_real.data.results import EpisodeResults, error_detail
 from dexmani_real.planning.home_planner import HomePlanner
+from dexmani_real.planning.table_plane import resolve_table_plane
 from dexmani_real.replay.evaluation import evaluate_replay
 from dexmani_real.replay.replayer import ReplayOutcome, ReplayStatus, TrajectoryReplayer
 from dexmani_real.replay.trajectory import verify_replay_preflight
 from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.home import home_robot, home_hand
+from dexmani_real.runtime.home import home_hand, home_robot
 from dexmani_real.runtime.observation import service_feedback
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
+from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.utils.log import configure_logging
@@ -33,12 +35,6 @@ class ReplaySession:
 
     def run(self):
         configure_logging()
-        from dexmani_real.config.experiment import (
-            resolve_table_plane,
-            validate_robot_config,
-            validate_control_rate,
-        )
-
         if not math.isfinite(self.hand_start_duration_s) or self.hand_start_duration_s < 0:
             raise ValueError("hand_start_duration_s must be finite and >= 0")
         validate_robot_config(self.runtime)

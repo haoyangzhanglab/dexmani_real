@@ -12,12 +12,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import yaml
-from omegaconf import OmegaConf
-
 from dexmani_policy.common.config import PROJECT_ROOT, load_policy_config
 from dexmani_policy.deployment import PolicyInfo, inspect_policy
-from dexmani_real.config.execution import ExecutionConfig
-from dexmani_real.config.experiment import ExperimentConfig
+from omegaconf import OmegaConf
+
+from dexmani_real.config import ExperimentConfig
+from dexmani_real.deployment.config import ExecutionConfig
 from dexmani_real.deployment.preflight import validate_execution_config
 from dexmani_real.deployment.run import run_policy, session_directory
 

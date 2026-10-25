@@ -7,39 +7,21 @@ import logging
 import multiprocessing as mp
 import time
 from concurrent.futures import CancelledError
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 
-from dexmani_real.calibration import CAMERAS_PATH
-from dexmani_real.calibration.camera.aruco import (
-    ARUCO_DICT,
-    ARUCO_DICT_NAME,
-    ArucoConfig,
-    detect_aruco_pose,
-    draw_calibration_overlay,
-    marker_corners_3d,
-)
-from dexmani_real.calibration.camera.extrinsics import (
-    calibration_capture_metadata,
-    save_camera_calibration,
-)
-from dexmani_real.calibration.camera.hand_eye import (
-    CalibrationConfig,
-    CalibrationSamples,
-    solve_hand_eye,
-)
-from dexmani_real.config.experiment import (
-    ExperimentConfig,
-    resolve_table_plane,
-    validate_keyboard_workspace,
-    validate_robot_config,
-)
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.home_planner import HomePlanner
-from dexmani_real.planning.kinematics.ik import OnlineIKConfig, OnlineIKSolver, make_online_ik_solver
+from dexmani_real.planning.kinematics.ik import (
+    OnlineIKConfig,
+    OnlineIKSolver,
+    make_online_ik_solver,
+)
 from dexmani_real.planning.kinematics.pose import rot6d_to_quat_wxyz
+from dexmani_real.planning.table_plane import resolve_table_plane
 from dexmani_real.planning.target import TargetChecker
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.robot import DexManiRobot
@@ -47,16 +29,42 @@ from dexmani_real.runtime.home import execute_arm_home
 from dexmani_real.runtime.jog import JogController, jog_motion_requested
 from dexmani_real.runtime.observation import read_camera_frame, service_feedback
 from dexmani_real.runtime.operator_input import KeyboardInput
+from dexmani_real.runtime.preflight import (
+    validate_keyboard_workspace,
+    validate_robot_config,
+)
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
-from dexmani_real.runtime.state import RunEndReason, SafetyState, RuntimeState
+from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
+from dexmani_real.sensor.camera.aruco import (
+    ARUCO_DICT,
+    ARUCO_DICT_NAME,
+    ArucoConfig,
+    detect_aruco_pose,
+    draw_calibration_overlay,
+    marker_corners_3d,
+)
+from dexmani_real.sensor.camera.extrinsics import (
+    calibration_capture_metadata,
+    save_camera_calibration,
+)
+from dexmani_real.sensor.camera.hand_eye import (
+    CalibrationConfig,
+    CalibrationSamples,
+    solve_hand_eye,
+)
 from dexmani_real.sensor.camera.worker import run_camera_worker
+from dexmani_real.state import CAMERAS_PATH
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import LoopRate, sample_is_fresh
+
+if TYPE_CHECKING:
+    from dexmani_real.config import ExperimentConfig
 
 logger = logging.getLogger(__name__)
 
 WINDOW_NAME = "ArUco Calibration"
 IDLE_STATUS_INTERVAL_FRAMES = 150
+MOTION_STATUS_INTERVAL_FRAMES = 50
 
 
 def eef_rpy_from_rot6d(rot6d: np.ndarray) -> np.ndarray:
@@ -469,7 +477,7 @@ class CameraCalibrationSession:
                         print("  calibration publication cancelled")
                     else:
                         self.calibration_saved = True
-                        print("  calibration saved")
+                        print(f"  calibration saved → {self.output_path} (serial: {self.serial})")
             event = self.keys.pop_event()
 
     def run(self) -> int:
@@ -761,7 +769,7 @@ class CameraCalibrationSession:
         if not committed:
             return
 
-        if self.frame % self.calibration_config.status_interval_frames == 0:
+        if self.frame % MOTION_STATUS_INTERVAL_FRAMES == 0:
             measured_pose = self.solver.kin.compute_eef_pose_base(self.current_qpos)
             print(
                 f"[f={self.frame}] samples={len(self.samples)} "
@@ -804,7 +812,7 @@ class CameraCalibrationSession:
             solver.collision_model,
             joint_lower_rad=self.runtime.arm.joint_limit_lower,
             joint_upper_rad=self.runtime.arm.joint_limit_upper,
-            workspace=self.runtime.environment.workspace.as_array(),
+            workspace=workspace,
             workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
         )
         self.calibration_config = calib_cfg

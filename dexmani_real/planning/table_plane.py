@@ -1,15 +1,53 @@
-"""Pure table-plane fitting plus explicit calibration replacement."""
+"""桌面平面拟合、几何验证及显式标定读写；坐标均在机器人基座系。"""
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from dexmani_real import PACKAGE_DIR
 from dexmani_real.utils.atomic_io import atomic_json_dump
+
+if TYPE_CHECKING:
+    from dexmani_real.planning.config import TableCollisionConfig
+
+
+def validate_table_plane(value, *, min_normal_norm=1e-9):
+    """Validate only the consumed upward plane; collision box dimensions are separate."""
+    plane = np.asarray(value, dtype=np.float64)
+    if plane.shape != (4,) or not np.isfinite(plane).all():
+        raise ValueError("table plane must be finite shape (4,)")
+    norm = float(np.linalg.norm(plane[:3]))
+    if norm <= min_normal_norm or plane[2] / norm <= 0:
+        raise ValueError("table plane must have an upward non-zero normal")
+    return tuple(float(x) for x in plane)
+
+
+def resolve_table_plane_path(table: TableCollisionConfig) -> Path:
+    """Resolve the configured plane path relative to the repository root."""
+    if table.plane_path is None:
+        raise RuntimeError("runtime table calibration has no plane_path")
+    path = Path(table.plane_path).expanduser()
+    if not path.is_absolute():
+        path = PACKAGE_DIR.parent / path
+    return path.resolve()
+
+
+def resolve_table_plane(
+    table: TableCollisionConfig, *, required=True,
+) -> tuple[float, float, float, float] | None:
+    """仅在消费者需要时读取一次当前桌面，数值由装配层共享。"""
+    if not required:
+        return None
+    plane_path = resolve_table_plane_path(table)
+    with plane_path.open(encoding="utf-8") as stream:
+        plane = json.load(stream)
+    return validate_table_plane(tuple(float(plane[k]) for k in ("a", "b", "c", "d")))
 
 
 @dataclass(frozen=True)
@@ -25,7 +63,7 @@ class TablePlaneFit:
     tilt_deg: float
 
     def __post_init__(self) -> None:
-        plane = np.asarray(self.plane_abcd, dtype=np.float64)
+        validate_table_plane(self.plane_abcd, min_normal_norm=0.0)
         metrics = np.asarray(
             (
                 self.inlier_ratio,
@@ -35,14 +73,6 @@ class TablePlaneFit:
             ),
             dtype=np.float64,
         )
-        norm = float(np.linalg.norm(plane[:3])) if plane.shape == (4,) else 0.0
-        if (
-            plane.shape != (4,)
-            or not np.all(np.isfinite(plane))
-            or norm <= 0.0
-            or plane[2] / norm <= 0.0
-        ):
-            raise ValueError("table fit must contain a finite upward plane")
         if (
             self.inlier_points <= 0
             or self.evaluated_points < self.inlier_points
@@ -190,9 +220,6 @@ def publish_table_plane(path: str | Path, fit: TablePlaneFit, *, confirmed: bool
     """Replace current calibration with a validated, explicitly confirmed fit."""
     if not confirmed:
         raise PermissionError("table calibration publish requires explicit confirmation")
-    target = Path(path)
-    if not target.parent.is_dir():
-        raise FileNotFoundError(f"table calibration directory does not exist: {target.parent}")
     payload = fit.to_dict()
     payload["calibrated_at_utc"] = datetime.now(timezone.utc).isoformat()
-    atomic_json_dump(payload, target, ensure_ascii=False)
+    atomic_json_dump(payload, path, ensure_ascii=False)

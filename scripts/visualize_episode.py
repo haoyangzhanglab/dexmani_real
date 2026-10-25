@@ -14,24 +14,31 @@ os.environ.setdefault("RUST_LOG", "error")
 
 import numpy as np
 
-from dexmani_real.config.environment import TableCollisionConfig
-from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
+from dexmani_real.config import load_experiment_config
 from dexmani_real.data.raw.camera_geometry import (
     load_raw_episode_base_from_color,
     load_raw_episode_camera_model,
 )
 from dexmani_real.data.raw.reader import EpisodeReader
+from dexmani_real.planning.config import TableCollisionConfig
 from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
-from dexmani_real.planning.kinematics.fingertip import compute_hand_geometry_history_xarm_base
+from dexmani_real.planning.kinematics.fingertip import (
+    compute_hand_geometry_history_xarm_base,
+)
 from dexmani_real.planning.kinematics.hand_fk import HandKinematics
 from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rotmat
+from dexmani_real.planning.table_plane import resolve_table_plane
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.sensor.camera.geometry import validate_aligned_depth_distortion
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud
 from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
 from dexmani_real.utils.visualization import (
-    log_camera_geometry, log_points, log_rgbd, log_series, viewer_blueprint,
+    log_camera_geometry,
+    log_points,
+    log_rgbd,
+    log_series,
+    viewer_blueprint,
 )
 
 logger = logging.getLogger("dexmani_real.cli.visualize_episode")

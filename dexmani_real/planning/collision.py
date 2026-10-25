@@ -8,7 +8,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.config.environment import StaticCollisionBox, TableCollisionConfig, validate_table_plane
+from dexmani_real.planning.config import StaticCollisionBox, TableCollisionConfig
+from dexmani_real.planning.table_plane import validate_table_plane
 from dexmani_real.robot.model import (
     ARM_JOINT_SHAPE,
     HAND_DOF,

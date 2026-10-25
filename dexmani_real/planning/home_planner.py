@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from dexmani_real.config.environment import EnvironmentConfig
 from dexmani_real.planning.collision import CollisionModel
+from dexmani_real.planning.config import EnvironmentConfig
 from dexmani_real.planning.kinematics.arm_fk import ArmFK
-from dexmani_real.planning.paths import WORKSPACE_BOUNDS_TOLERANCE_M, wrap_nearest_equivalent
+from dexmani_real.planning.paths import (
+    WORKSPACE_BOUNDS_TOLERANCE_M,
+    wrap_nearest_equivalent,
+)
 
 
 class HomePlanner:

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.config.environment import validate_table_plane
+from dexmani_real.planning.table_plane import validate_table_plane
 from dexmani_real.sensor.camera.geometry import CameraSnapshot
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.sensor.pointcloud.processing import build_point_cloud

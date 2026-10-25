@@ -7,27 +7,30 @@ import argparse
 import math
 import multiprocessing as mp
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.calibration import VR_TRANSFORM_PATH
-from dexmani_real.calibration.vr_heading import (
-    VR_TRANSFORM_MIN_FRAMES,
-    parse_vr_transform,
-)
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz
+from dexmani_real.runtime.config import SafetyParams
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.sensor.vr.config import VRParams
 from dexmani_real.sensor.vr.worker import run_vr_worker
+from dexmani_real.state import VR_TRANSFORM_PATH
 from dexmani_real.teleop.audio_feedback import AudioFeedback
+from dexmani_real.teleop.vr_alignment import (
+    VR_TRANSFORM_MIN_FRAMES,
+    VRTransformCalibration,
+    circular_mean,
+    parse_vr_transform,
+    quality_measurements,
+)
 from dexmani_real.utils.atomic_io import atomic_json_dump
 
-MIN_FORWARD_NORM = 1e-6
 POLL_INTERVAL_S = 0.01
 PRINT_INTERVAL_S = 5.0
 JOIN_TIMEOUT_S = 5.0
@@ -38,80 +41,35 @@ AUDIO_IDLE_TIMEOUT_S = 5.0
 @dataclass(frozen=True)
 class HeadingCalibrationConfig:
     duration_s: float = 10.0
-    port: int = 8000
-    vr_ready_timeout_s: float = 120.0
     tracking_data_timeout_s: float = 15.0
     settle_s: float = 3.0
     min_frames: int = VR_TRANSFORM_MIN_FRAMES
-    outlier_sigma: float = 3.0
 
 
-def circular_mean(
-    forwards: np.ndarray, *, outlier_sigma: float = 3.0
-) -> tuple[float, np.ndarray, np.ndarray]:
-    """Return the circular mean heading and an inlier mask."""
-    fwd_2d = forwards[:, :2]
-    norms = np.linalg.norm(fwd_2d, axis=1)
-    valid = norms >= MIN_FORWARD_NORM
-    n_bad = int(np.sum(~valid))
-    if n_bad:
-        print(f"  WARNING: {n_bad} frames with near-vertical forward (skipped)")
-    fwd_2d = fwd_2d[valid]
-    norms = norms[valid]
-    if fwd_2d.shape[0] == 0:
-        raise ValueError("all VR forward samples are near-vertical")
-    fwd_unit = fwd_2d / norms[:, None]
-
-    mean_0 = np.mean(fwd_unit, axis=0)
-    mean_0_norm = float(np.linalg.norm(mean_0))
-    if mean_0_norm < MIN_FORWARD_NORM:
-        raise ValueError("VR forward samples have no stable mean heading")
-    mean_0 /= mean_0_norm
-
-    angles = np.arctan2(fwd_unit[:, 1], fwd_unit[:, 0])
-    center = np.arctan2(mean_0[1], mean_0[0])
-    delta = np.angle(np.exp(1j * (angles - center)))
-    dists = np.abs(delta)
-    threshold = max(1e-12, outlier_sigma * float(np.sqrt(np.mean(delta**2))))
-    inlier = dists <= threshold
-    n_out = int(np.sum(~inlier))
-    if n_out > 0:
-        print(f"  INFO: rejected {n_out} outlier frames (> {outlier_sigma}σ)")
-
-    if not inlier.any():
-        raise ValueError("no VR heading inliers")
-    fwd_inlier = fwd_unit[inlier]
-    mean_fwd = np.mean(fwd_inlier, axis=0)
-    mean_fwd_norm = float(np.linalg.norm(mean_fwd))
-    if mean_fwd_norm < MIN_FORWARD_NORM:
-        raise ValueError("VR heading inliers have no stable mean direction")
-    mean_fwd /= mean_fwd_norm
-    theta = float(np.arctan2(mean_fwd[1], mean_fwd[0]))
-
-    full_inlier = np.zeros(len(forwards), dtype=bool)
-    full_inlier[valid] = inlier
-    return theta, mean_fwd, full_inlier
-
-
-def quality_measurements(
-    forwards: np.ndarray,
-    theta_mean: float,
-    inlier: np.ndarray,
-) -> dict[str, float]:
-    """Measure heading scatter for runtime preflight."""
-    fwd_2d = forwards[:, :2]
-    norms = np.linalg.norm(fwd_2d, axis=1)
-    mask = (norms >= MIN_FORWARD_NORM) & inlier
-    fwd_unit = fwd_2d[mask] / norms[mask, None]
-    thetas = np.arctan2(fwd_unit[:, 1], fwd_unit[:, 0])
-    dtheta = np.angle(np.exp(1j * (thetas - theta_mean)))
-    std_deg = float(np.rad2deg(np.std(dtheta)))
-    max_dev = float(np.rad2deg(float(np.max(np.abs(dtheta)))))
-
-    return {
-        "std_deg": std_deg,
-        "max_deviation_deg": max_dev,
+def publish_vr_transform(
+    calibration: VRTransformCalibration,
+    output: Path | None,
+    *,
+    force: bool = False,
+) -> Path:
+    """合格结果可更新当前标定；低质量结果只能显式导出到未占用的新文件。"""
+    path = VR_TRANSFORM_PATH if output is None else output
+    poor = calibration.quality.grade == "poor"
+    if poor:
+        if not force:
+            raise ValueError(
+                "quality grade is 'poor'; re-collect a steadier sample, "
+                "or use --force --output NEW_FILE for diagnostic export"
+            )
+        if output is None or path.resolve() == VR_TRANSFORM_PATH.resolve():
+            raise ValueError("poor calibration requires --output pointing to a new non-default file")
+    payload = {
+        "theta_deg": calibration.theta_deg,
+        "ref": calibration.reference,
+        "quality": asdict(calibration.quality),
+        "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
+    return atomic_json_dump(payload, path, overwrite=not poor)
 
 
 def read_heading(channels: SensorChannels, reference: str):
@@ -168,6 +126,7 @@ def play_completion_audio() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     cfg = HeadingCalibrationConfig()
+    safety = SafetyParams()
     parser = argparse.ArgumentParser(description="VR heading calibration")
     parser.add_argument(
         "--duration",
@@ -176,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         help=f"collection duration (s), default: {cfg.duration_s}",
     )
     parser.add_argument(
-        "--port", type=int, default=cfg.port, help=f"VR TCP port, default: {cfg.port}"
+        "--port", type=int, default=VRParams.port, help=f"VR TCP port, default: {VRParams.port}"
     )
     parser.add_argument(
         "--ref",
@@ -187,10 +146,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="write the transform even when quality grade is 'poor'",
+        help="export poor-quality results only with --output pointing to a new non-default file",
     )
     parser.add_argument(
-        "--output", type=Path, default=VR_TRANSFORM_PATH, help="VR alignment JSON destination"
+        "--output", type=Path, default=None,
+        help=f"VR alignment JSON destination (default: {VR_TRANSFORM_PATH})",
     )
     args = parser.parse_args(argv)
 
@@ -224,14 +184,15 @@ def main(argv: list[str] | None = None) -> int:
     stale_count = 0
     try:
         print(
-            "\n  Waiting for VR connection (up to 120 s) — put on Quest headset...",
+            f"\n  Waiting for VR connection (up to {safety.vr_ready_timeout_s:g} s) "
+            "— put on Quest headset...",
             flush=True,
         )
         try:
             sensors.start(
                 vr_proc,
                 ready=channels.vr_ready,
-                timeout_s=cfg.vr_ready_timeout_s,
+                timeout_s=safety.vr_ready_timeout_s,
                 may_start=runtime_state.requests_allow_motion,
             )
         except RuntimeError as exc:
@@ -239,7 +200,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print("  VR connected", flush=True)
 
-        print("  Waiting for VR tracking data (up to 15 s)...", flush=True)
+        print(
+            f"  Waiting for VR tracking data (up to {cfg.tracking_data_timeout_s:g} s)...",
+            flush=True,
+        )
         if not wait_for_vr_tracking(channels, sensors, args.ref, cfg.tracking_data_timeout_s):
             print("  ERROR: no VR tracking data received", flush=True)
             return 1
@@ -299,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
 
     forwards_arr = np.array(forwards, dtype=np.float64)
     try:
-        theta_rad, mean_fwd, inlier = circular_mean(forwards_arr, outlier_sigma=cfg.outlier_sigma)
+        theta_rad, mean_fwd, inlier = circular_mean(forwards_arr)
     except ValueError as exc:
         print(f"ERROR: invalid heading sample: {exc}")
         return 1
@@ -308,19 +272,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: only {inlier_frames} inlier frames remain (< {cfg.min_frames} required)")
         return 1
     theta_deg = float(np.rad2deg(theta_rad))
-    quality = quality_measurements(
-        forwards_arr,
-        theta_rad,
-        inlier,
-    )
-
-    config = {
+    calibration = parse_vr_transform({
         "theta_deg": theta_deg,
         "ref": args.ref,
-        "quality": {**quality, "frames": inlier_frames},
-        "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
-    }
-    calibration = parse_vr_transform(config)
+        "quality": {
+            **quality_measurements(forwards_arr, theta_rad, inlier),
+            "frames": inlier_frames,
+        },
+    })
     T = calibration.transform
 
     corrected = T @ np.array([mean_fwd[0], mean_fwd[1], 0.0])
@@ -335,8 +294,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  theta:         {theta_deg:.1f}°")
     print(
         "  quality:       "
-        f"{calibration.quality.grade} (σ={float(quality['std_deg']):.1f}°, "
-        f"max={float(quality['max_deviation_deg']):.1f}°)"
+        f"{calibration.quality.grade} (σ={calibration.quality.std_deg:.1f}°, "
+        f"max={calibration.quality.max_deviation_deg:.1f}°)"
     )
     print(f"  verification:  T·forward = [{corrected[0]:.4f}, {corrected[1]:.4f}] (expect [1, 0])")
     print(f"  T = R_z(-{theta_deg:.1f}°):")
@@ -345,16 +304,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"    [{T[2, 0]:.4f}, {T[2, 1]:.4f}, {T[2, 2]:.4f}]")
     print(f"{'=' * 55}")
 
-    if calibration.quality.grade == "poor" and not args.force:
-        print(
-            f"\n  NOT written: quality grade is 'poor' "
-            f"(σ={float(quality['std_deg']):.1f}°). Re-collect a steadier sample, "
-            f"or pass --force to write anyway."
-        )
+    try:
+        output_path = publish_vr_transform(calibration, args.output, force=args.force)
+    except (ValueError, FileExistsError) as exc:
+        print(f"\n  NOT written: {exc}")
         return 1
 
-    atomic_json_dump(config, args.output)
-    print(f"\nSaved to: {args.output}")
+    print(f"\nSaved to: {output_path}")
 
     play_completion_audio()
     return 0

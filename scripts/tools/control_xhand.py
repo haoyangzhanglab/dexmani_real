@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from dexmani_real.config.experiment import load_experiment_config
+from dexmani_real.config import load_experiment_config
 from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,

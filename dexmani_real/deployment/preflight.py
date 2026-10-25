@@ -5,8 +5,11 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from dexmani_real.config.experiment import validate_control_rate, validate_robot_config
-from dexmani_real.sensor.pointcloud.config import PointCloudConfig, resolve_saved_pointcloud_recipe
+from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
+from dexmani_real.sensor.pointcloud.config import (
+    PointCloudConfig,
+    resolve_saved_pointcloud_recipe,
+)
 from dexmani_real.sensor.pointcloud.hand_config import (
     HandPointCloudConfig,
     resolve_saved_hand_pointcloud_recipe,

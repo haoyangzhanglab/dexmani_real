@@ -10,14 +10,22 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
-from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
+from dexmani_real.config import load_experiment_config
+from dexmani_real.planning.table_plane import resolve_table_plane
 from dexmani_real.runtime.operator_input import KeyboardInput
+from dexmani_real.sensor.camera.extrinsics import CameraExtrinsics
 from dexmani_real.sensor.camera.geometry import validate_aligned_depth_distortion
-from dexmani_real.sensor.pointcloud.processing import build_point_cloud, build_raw_point_cloud
+from dexmani_real.sensor.pointcloud.processing import (
+    build_point_cloud,
+    build_raw_point_cloud,
+)
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.visualization import (
-    log_camera_geometry, log_points, log_rgbd, log_series, viewer_blueprint,
+    log_camera_geometry,
+    log_points,
+    log_rgbd,
+    log_series,
+    viewer_blueprint,
 )
 
 if TYPE_CHECKING:
@@ -110,6 +118,7 @@ class RealSenseExample:
         self.calibration = self.table_plane_abcd = None
 
         import rerun as rr
+
         from dexmani_real.sensor.camera.realsense import RealSenseCamera
 
         self.rr = rr

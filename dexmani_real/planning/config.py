@@ -1,23 +1,20 @@
-"""Workspace bounds and static environment geometry in the robot base frame."""
+"""运动容差、机器人基座系 Workspace 与静态环境参数。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import radians
 
 import numpy as np
 
+from dexmani_real.state import TABLE_PLANE_RELATIVE_PATH
 from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
 
 
-def validate_table_plane(value, *, min_normal_norm=1e-9):
-    """Validate only the consumed upward plane; collision box dimensions are separate."""
-    plane = np.asarray(value, dtype=np.float64)
-    if plane.shape != (4,) or not np.isfinite(plane).all():
-        raise ValueError("table plane must be finite shape (4,)")
-    norm = float(np.linalg.norm(plane[:3]))
-    if norm <= min_normal_norm or plane[2] / norm <= 0:
-        raise ValueError("table plane must have an upward non-zero normal")
-    return tuple(float(x) for x in plane)
+@dataclass(frozen=True)
+class MotionParams:
+    ik_max_pose_error_pos_m: float = 0.02
+    ik_max_pose_error_rot_rad: float = radians(5.0)
 
 
 @dataclass(frozen=True)
@@ -78,7 +75,7 @@ class TableCollisionConfig:
     """Base-frame plane ax+by+cz+d=0; HOME needs clearance, online control permits table contact."""
 
     enabled: bool = True
-    plane_path: str | None = "dexmani_real/calibration/state/table_plane.json"
+    plane_path: str | None = TABLE_PLANE_RELATIVE_PATH
     size_xy_m: tuple[float, float] = (2.0, 2.0)
     thickness_m: float = 0.04
     # Includes the calibrated flange-model residual.

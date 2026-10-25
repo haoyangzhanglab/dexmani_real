@@ -7,8 +7,8 @@ import logging
 import nlopt
 import numpy as np
 
-from dexmani_real.config.control import TAGRetargetingParams
 from dexmani_real.robot.model import HAND_JOINT_SHAPE, XHAND_SDK_JOINT_NAMES
+from dexmani_real.teleop.config import TAGRetargetingParams
 from dexmani_real.teleop.retargeting.fingertip_objective import (
     FingertipObjective,
     joint_regularization,

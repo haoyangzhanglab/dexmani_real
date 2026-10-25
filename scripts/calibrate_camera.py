@@ -6,7 +6,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from dexmani_real.config.experiment import load_experiment_config
+from dexmani_real.config import load_experiment_config
+from dexmani_real.state import CAMERAS_PATH
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,13 +37,12 @@ def main(argv: list[str] | None = None) -> int:
         "--output",
         type=Path,
         default=None,
-        help="Camera calibration JSON (default: checkout calibration/state/cameras.json)",
+        help=f"Camera calibration JSON (default: {CAMERAS_PATH})",
     )
     args = parser.parse_args(argv)
 
-    from dexmani_real.calibration import CAMERAS_PATH
-    from dexmani_real.calibration.camera.session import CameraCalibrationSession
-    from dexmani_real.calibration.camera.aruco import ARUCO_DICT_NAME, ArucoConfig
+    from dexmani_real.runtime.camera_calibration import CameraCalibrationSession
+    from dexmani_real.sensor.camera.aruco import ARUCO_DICT_NAME, ArucoConfig
 
     aruco = ArucoConfig()
 

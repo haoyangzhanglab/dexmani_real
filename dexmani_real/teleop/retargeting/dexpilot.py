@@ -11,13 +11,13 @@ from dex_retargeting.optimizer_utils import LPFilter
 from dex_retargeting.robot_wrapper import RobotWrapper
 from dex_retargeting.seq_retarget import SeqRetargeting
 
-from dexmani_real.config.control import DexPilotRetargetingParams
 from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
     XHAND_FINGERTIP_LINK_NAMES,
     XHAND_RIGHT_URDF_PATH,
     XHAND_SDK_JOINT_NAMES,
 )
+from dexmani_real.teleop.config import DexPilotRetargetingParams
 from dexmani_real.teleop.retargeting.landmarks import prepare_landmarks
 
 logger = logging.getLogger(__name__)

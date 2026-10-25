@@ -1,4 +1,4 @@
-"""Teleoperation, motion tolerances and local session options."""
+"""遥操作、手部重定向及本地采集参数；不导入优化器或设备后端。"""
 
 from __future__ import annotations
 
@@ -37,12 +37,6 @@ class TeleopParams:
             raise ValueError("VR position scale and stale threshold must be finite and positive")
         if self.hand_retargeting_type not in {"tag", "dexpilot"}:
             raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")
-
-
-@dataclass(frozen=True)
-class MotionParams:
-    ik_max_pose_error_pos_m: float = 0.02
-    ik_max_pose_error_rot_rad: float = radians(5.0)
 
 
 @dataclass(frozen=True)
@@ -153,14 +147,15 @@ class DexPilotRetargetingParams:
             raise ValueError("DexPilot distances must satisfy 0 < project_dist_m <= escape_dist_m")
 
 
-@dataclass(frozen=True)
-class SafetyParams:
-    model_startup_timeout_s: float = 300.0
-    camera_ready_timeout_s: float = 15.0
-    pointcloud_ready_timeout_s: float = 30.0
-    vr_ready_timeout_s: float = 120.0
-    shutdown_timeout_s: float = 65.0
+DEFAULT_TASK_NAME = "test"
 
-    def validate(self) -> None:
-        if not all(np.isfinite(value) and value > 0 for value in astuple(self)):
-            raise ValueError("safety timeouts must be finite and positive")
+
+def validate_task_dir_name(value: str) -> str:
+    """Validate one task name as a safe directory component."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("task_name must be a non-empty string without surrounding whitespace")
+    if value.startswith("."):
+        raise ValueError("task_name must not be a hidden or relative directory name")
+    if "/" in value or "\\" in value or any(ord(char) < 32 for char in value):
+        raise ValueError("task_name must be one safe directory component")
+    return value

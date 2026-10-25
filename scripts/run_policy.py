@@ -8,7 +8,7 @@ import math
 from dataclasses import asdict
 from pathlib import Path
 
-from dexmani_real.config.execution import DEFAULT_NUM_EPISODES, DEFAULT_MAX_RUNNING_S
+from dexmani_real.deployment.config import DEFAULT_MAX_RUNNING_S, DEFAULT_NUM_EPISODES
 
 
 def positive_int(raw: str) -> int:
@@ -153,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
 
     import yaml
 
-    from dexmani_real.config.experiment import load_experiment_config
+    from dexmani_real.config import load_experiment_config
 
     runtime = load_experiment_config(
         yaml_path=args.config,

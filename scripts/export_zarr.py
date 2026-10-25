@@ -10,9 +10,10 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from dexmani_real.config.experiment import load_experiment_config, resolve_table_plane
+from dexmani_real.config import load_experiment_config
 from dexmani_real.data.canonical.export import export_canonical
 from dexmani_real.data.canonical.schema import ProcessingConfig
+from dexmani_real.planning.table_plane import resolve_table_plane
 
 
 def build_parser() -> argparse.ArgumentParser:

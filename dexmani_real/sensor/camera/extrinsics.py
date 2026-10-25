@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.calibration import CAMERAS_PATH
+from dexmani_real.state import CAMERAS_PATH
 from dexmani_real.utils.atomic_io import atomic_json_dump
-from dexmani_real.utils.geometry import validate_rigid_transform, validate_unit_quaternion_wxyz
+from dexmani_real.utils.geometry import (
+    validate_rigid_transform,
+    validate_unit_quaternion_wxyz,
+)
 
 
 def pose_to_matrix(position, orientation) -> np.ndarray:
@@ -58,7 +61,7 @@ class CameraExtrinsics:
         return transform
 
 
-def load_optional_camera_extrinsics(path=None):
+def load_optional_camera_extrinsics(path: str | Path | None = None) -> CameraExtrinsics | None:
     """Missing or invalid extrinsics do not block physical Raw recording."""
     try:
         return CameraExtrinsics(path)
@@ -147,4 +150,3 @@ def save_camera_calibration(
 
     existing[cam_name] = entry
     atomic_json_dump(existing, json_path, ensure_ascii=False, cancelled=cancelled)
-    print(f"  calibration written → {json_path} (camera: {cam_name})")

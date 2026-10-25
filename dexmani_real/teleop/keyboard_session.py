@@ -4,23 +4,26 @@ import logging
 
 import numpy as np
 
-from dexmani_real.config.experiment import (
-    resolve_table_plane,
-    validate_keyboard_workspace,
-    validate_robot_config,
-)
 from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.planning.kinematics.ik import OnlineIKConfig, make_online_ik_solver
+from dexmani_real.planning.table_plane import resolve_table_plane
 from dexmani_real.planning.target import TargetChecker
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.jog import JogController, jog_motion_requested
 from dexmani_real.runtime.observation import (
-    read_observation, check_observation, ObservationNeeds, service_feedback,
+    ObservationNeeds,
+    check_observation,
     control_deadline_ns,
+    read_observation,
+    service_feedback,
 )
 from dexmani_real.runtime.operator_input import KeyboardInput
+from dexmani_real.runtime.preflight import (
+    validate_keyboard_workspace,
+    validate_robot_config,
+)
 from dexmani_real.runtime.processes import shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
 from dexmani_real.utils.log import configure_logging
@@ -98,7 +101,7 @@ class KeyboardTeleopSession:
             solver.collision_model,
             joint_lower_rad=self.runtime.arm.joint_limit_lower,
             joint_upper_rad=self.runtime.arm.joint_limit_upper,
-            workspace=self.runtime.environment.workspace.as_array(),
+            workspace=self.workspace,
             workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
         )
         self.jog = JogController(solver, target_checker, self.jog_config, self.workspace)

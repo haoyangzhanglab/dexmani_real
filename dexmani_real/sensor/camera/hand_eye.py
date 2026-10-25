@@ -26,7 +26,6 @@ class CalibrationConfig:
     min_axis_separation_deg: float = 15.0
     max_consistency_rms_mm: float = 5.0
     max_consistency_rot_rms_deg: float = 3.0
-    status_interval_frames: int = 50
 
     def __post_init__(self) -> None:
         if not isinstance(self.min_samples, int) or self.min_samples < 3:
@@ -43,8 +42,6 @@ class CalibrationConfig:
                 raise ValueError(f"{field_name} must be finite and positive")
         if self.min_relative_rotation_deg > 180 or self.min_axis_separation_deg > 90:
             raise ValueError("excitation thresholds exceed rotation/axis angle ranges")
-        if not isinstance(self.status_interval_frames, int) or self.status_interval_frames < 1:
-            raise ValueError("status_interval_frames must be at least 1")
 
 
 def calibrate_eye_to_hand(

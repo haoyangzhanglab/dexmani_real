@@ -15,13 +15,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
-from dexmani_real.calibration.table import fit_table_plane, publish_table_plane
-from dexmani_real.config.experiment import (
-    load_experiment_config,
+from dexmani_real.config import load_experiment_config
+from dexmani_real.planning.table_plane import (
+    fit_table_plane,
+    publish_table_plane,
     resolve_table_plane,
     resolve_table_plane_path,
 )
+from dexmani_real.sensor.camera.extrinsics import CameraExtrinsics
 from dexmani_real.sensor.camera.geometry import CameraIntrinsics
 from dexmani_real.sensor.pointcloud.config import PointCloudConfig
 from dexmani_real.sensor.pointcloud.processing import (
@@ -32,7 +33,11 @@ from dexmani_real.sensor.pointcloud.processing import (
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.visualization import (
-    log_camera_geometry, log_points, log_rgbd, log_workspace, viewer_blueprint,
+    log_camera_geometry,
+    log_points,
+    log_rgbd,
+    log_workspace,
+    viewer_blueprint,
 )
 
 if TYPE_CHECKING:
@@ -393,6 +398,7 @@ class PointCloudExample:
 
     def run(self) -> int:
         import rerun as rr
+
         from dexmani_real.sensor.camera.realsense import RealSenseCamera
 
         self.save_dir = (

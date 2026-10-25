@@ -7,9 +7,7 @@ import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from dexmani_real.calibration import CAMERAS_PATH
-from dexmani_real.config.execution import DEFAULT_NUM_EPISODES, DEFAULT_MAX_RUNNING_S
-from dexmani_real.config.experiment import resolve_table_plane, resolve_table_plane_path
+from dexmani_real.deployment.config import DEFAULT_MAX_RUNNING_S, DEFAULT_NUM_EPISODES
 from dexmani_real.deployment.observation import policy_dependencies, policy_needs
 from dexmani_real.deployment.preflight import (
     validate_deployment_config,
@@ -17,7 +15,12 @@ from dexmani_real.deployment.preflight import (
     validate_num_episodes,
 )
 from dexmani_real.deployment.session import PolicySession
+from dexmani_real.planning.table_plane import (
+    resolve_table_plane,
+    resolve_table_plane_path,
+)
 from dexmani_real.runtime.observation import ObservationNeeds
+from dexmani_real.state import CAMERAS_PATH
 from dexmani_real.utils.atomic_io import atomic_yaml_dump
 
 
@@ -71,11 +74,13 @@ def run_policy(
     camera_calibration_path=None,
 ) -> int:
     """Inspect, resolve and run one evaluation session from CLI or Python."""
-    from dexmani_policy.deployment import inspect_policy
-
-    from dexmani_policy.deployment.metadata import resolve_experiment
     from dexmani_policy.common.config import load_experiment_config
-    from dexmani_policy.common.experiments import resolve_best_checkpoint, resolve_checkpoint_path
+    from dexmani_policy.common.experiments import (
+        resolve_best_checkpoint,
+        resolve_checkpoint_path,
+    )
+    from dexmani_policy.deployment import inspect_policy
+    from dexmani_policy.deployment.metadata import resolve_experiment
 
     directory = resolve_experiment(experiment)
     cfg = load_experiment_config(directory)

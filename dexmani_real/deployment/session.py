@@ -6,16 +6,14 @@ import time
 from concurrent.futures import CancelledError
 from itertools import count
 
-from dexmani_real.calibration.camera.extrinsics import (
-    CameraExtrinsics,
-    load_optional_camera_extrinsics,
-)
-from dexmani_real.config.execution import DEFAULT_NUM_EPISODES
 from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError
 from dexmani_real.data.results import EpisodeResults, error_detail
+from dexmani_real.deployment.config import DEFAULT_NUM_EPISODES
 from dexmani_real.deployment.episode import PolicyEpisode, failure_reason
 from dexmani_real.deployment.observation import (
-    build_observation_kinematics, build_observation_camera, build_policy_observation,
+    build_observation_camera,
+    build_observation_kinematics,
+    build_policy_observation,
 )
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.planning.action import ActionMapper
@@ -23,10 +21,17 @@ from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.robot import DexManiRobot
 from dexmani_real.runtime.home import home_robot
-from dexmani_real.runtime.observation import service_feedback, snapshot_camera_parameters
+from dexmani_real.runtime.observation import (
+    service_feedback,
+    snapshot_camera_parameters,
+)
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
+from dexmani_real.sensor.camera.extrinsics import (
+    CameraExtrinsics,
+    load_optional_camera_extrinsics,
+)
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.utils.atomic_io import atomic_yaml_dump
 from dexmani_real.utils.log import configure_logging
@@ -119,8 +124,9 @@ class PolicySession:
         return exit_code
 
     def prepare_resources(self):
-        from dexmani_real.deployment.inference import InferenceWorker
         from dexmani_policy.deployment import load_policy
+
+        from dexmani_real.deployment.inference import InferenceWorker
 
         if self.needs.point_cloud or "camera_extrinsic" in self.info.observation_fields:
             self.camera_calibration = CameraExtrinsics(self.camera_calibration_path)
