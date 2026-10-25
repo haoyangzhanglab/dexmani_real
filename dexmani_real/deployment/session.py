@@ -6,32 +6,33 @@ import time
 from concurrent.futures import CancelledError
 from itertools import count
 
+from dexmani_real.calibration.camera.extrinsics import (
+    CameraExtrinsics,
+    load_optional_camera_extrinsics,
+)
+from dexmani_real.control.action_mapping import ActionMapper
+from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError
-from dexmani_real.data.results import EpisodeResults, error_detail
+from dexmani_real.data.session_results import SessionResults, error_detail
 from dexmani_real.deployment.config import DEFAULT_NUM_EPISODES
-from dexmani_real.deployment.episode import PolicyEpisode, failure_reason
-from dexmani_real.deployment.observation import (
+from dexmani_real.deployment.policy_observation import (
     build_observation_camera,
     build_observation_kinematics,
     build_policy_observation,
 )
+from dexmani_real.deployment.rollout.episode import PolicyEpisode, failure_reason
 from dexmani_real.ipc.channels import SensorChannels
-from dexmani_real.planning.action import ActionMapper
-from dexmani_real.planning.home_planner import HomePlanner
 from dexmani_real.robot.commands import RobotError
-from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.home import home_robot
+from dexmani_real.robot.system import DexManiRobot
+from dexmani_real.runtime.motion.home import home_robot
 from dexmani_real.runtime.observation import (
     service_feedback,
     snapshot_camera_parameters,
 )
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
-from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
+from dexmani_real.runtime.sensor_processes import SensorProcesses
+from dexmani_real.runtime.shutdown import shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
-from dexmani_real.sensor.camera.extrinsics import (
-    CameraExtrinsics,
-    load_optional_camera_extrinsics,
-)
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.utils.atomic_io import atomic_yaml_dump
 from dexmani_real.utils.log import configure_logging
@@ -91,7 +92,7 @@ class PolicySession:
             f"{1.0 / self.info.control_dt_s:g} Hz"
         )
         print("正在初始化模型和设备…", flush=True)
-        self.results = EpisodeResults(self.results_dir, "policy")
+        self.results = SessionResults(self.results_dir, "policy")
         self.runtime_state = self.sensors = self.robot = None
         self.model = self.recorder = None
         failure = None
@@ -254,7 +255,7 @@ class PolicySession:
                 self.run_config, self.results_dir / "run_config.yaml",
             )
         if self.needs.point_cloud:
-            from dexmani_real.sensor.pointcloud.worker import run_pointcloud_worker
+            from dexmani_real.perception.pointcloud.worker import run_pointcloud_worker
 
             self.sensors.start(
                 self.process_context.Process(

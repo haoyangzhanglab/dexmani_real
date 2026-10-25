@@ -37,4 +37,4 @@ include = ["dexmani_real*"]
 namespaces = true
 
 [tool.setuptools.package-data]
-"dexmani_real.state" = ["*.json"]
+"dexmani_real.calibration" = ["parameters/*.json"]

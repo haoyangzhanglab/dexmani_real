@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     if not runtime.hand.enabled and not args.no_hand:
         parser.error("hand.enabled=false requires explicit --no-hand confirmation")
 
-    from dexmani_real.state import VR_TRANSFORM_PATH
+    from dexmani_real.calibration.paths import VR_TRANSFORM_PATH
     from dexmani_real.teleop.session import TeleopSession
 
     return TeleopSession(

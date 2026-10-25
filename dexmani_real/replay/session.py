@@ -5,18 +5,18 @@ import math
 from dataclasses import replace
 from pathlib import Path
 
-from dexmani_real.data.results import EpisodeResults, error_detail
-from dexmani_real.planning.home_planner import HomePlanner
-from dexmani_real.planning.table_plane import resolve_table_plane
-from dexmani_real.replay.evaluation import evaluate_replay
+from dexmani_real.calibration.table_plane import resolve_table_plane
+from dexmani_real.control.homing import HomePlanner
+from dexmani_real.data.session_results import SessionResults, error_detail
+from dexmani_real.replay.consistency import evaluate_replay
 from dexmani_real.replay.replayer import ReplayOutcome, ReplayStatus, TrajectoryReplayer
 from dexmani_real.replay.trajectory import verify_replay_preflight
-from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.home import home_hand, home_robot
+from dexmani_real.robot.system import DexManiRobot
+from dexmani_real.runtime.motion.home import home_hand, home_robot
 from dexmani_real.runtime.observation import service_feedback
 from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
-from dexmani_real.runtime.processes import shutdown_local_runtime
+from dexmani_real.runtime.shutdown import shutdown_local_runtime
 from dexmani_real.runtime.state import RuntimeState
 from dexmani_real.utils.log import configure_logging
 
@@ -46,7 +46,7 @@ class ReplaySession:
         if target.exists() and (not target.is_dir() or any(target.iterdir())):
             raise ValueError("replay output must be missing or empty")
         verify_replay_preflight(self.trajectory, self.runtime)
-        self.results = EpisodeResults(target, "replay")
+        self.results = SessionResults(target, "replay")
         self.runtime_state = self.robot = self.keyboard = None
         trajectory_outcome = None
         shutdown_clean = False

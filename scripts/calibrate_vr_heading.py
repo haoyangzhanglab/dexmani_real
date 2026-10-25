@@ -13,22 +13,23 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.ipc.channels import SensorChannels
-from dexmani_real.planning.kinematics.pose import forward_from_quat_wxyz
-from dexmani_real.runtime.config import SafetyParams
-from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
-from dexmani_real.runtime.state import RuntimeState
-from dexmani_real.sensor.vr.config import VRParams
-from dexmani_real.sensor.vr.worker import run_vr_worker
-from dexmani_real.state import VR_TRANSFORM_PATH
-from dexmani_real.teleop.audio_feedback import AudioFeedback
-from dexmani_real.teleop.vr_alignment import (
+from dexmani_real.calibration.paths import VR_TRANSFORM_PATH
+from dexmani_real.calibration.vr_alignment import (
     VR_TRANSFORM_MIN_FRAMES,
     VRTransformCalibration,
     circular_mean,
     parse_vr_transform,
     quality_measurements,
 )
+from dexmani_real.geometry.pose import forward_from_quat_wxyz
+from dexmani_real.ipc.channels import SensorChannels
+from dexmani_real.runtime.config import RuntimeTimeouts
+from dexmani_real.runtime.sensor_processes import SensorProcesses
+from dexmani_real.runtime.shutdown import shutdown_local_runtime
+from dexmani_real.runtime.state import RuntimeState
+from dexmani_real.sensor.vr.config import VRParams
+from dexmani_real.sensor.vr.worker import run_vr_worker
+from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.utils.atomic_io import atomic_json_dump
 
 POLL_INTERVAL_S = 0.01
@@ -126,7 +127,7 @@ def play_completion_audio() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     cfg = HeadingCalibrationConfig()
-    safety = SafetyParams()
+    safety = RuntimeTimeouts()
     parser = argparse.ArgumentParser(description="VR heading calibration")
     parser.add_argument(
         "--duration",

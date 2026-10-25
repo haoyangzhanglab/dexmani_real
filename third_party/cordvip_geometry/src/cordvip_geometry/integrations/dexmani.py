@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from pathlib import Path
-import time
 
 import numpy as np
 
@@ -133,10 +133,12 @@ class RawHandCloudProvider:
 
     def __init__(self, episode, config_path=None, num_points=1024, seed=0):
         from dexmani_real.config import load_experiment_config
-        from dexmani_real.data.raw.camera_geometry import load_raw_episode_base_from_color
-        from dexmani_real.planning.kinematics.arm_fk import ArmFK
-        from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rotmat
+        from dexmani_real.data.raw.camera_geometry import (
+            load_raw_episode_base_from_color,
+        )
         from dexmani_real.data.raw.reader import EpisodeReader
+        from dexmani_real.geometry.kinematics.arm_fk import ArmFK
+        from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
         from dexmani_real.robot.model import (
             XARM7_JOINT_NAMES,
             XARM7_XHAND_COLLISION_URDF_PATH,
@@ -144,12 +146,13 @@ class RawHandCloudProvider:
             XHAND_RIGHT_URDF_PATH,
             XHAND_SDK_JOINT_NAMES,
         )
+
         from ..hand_cloud import HandCloudModel
 
         self.episode = Path(episode).expanduser().resolve()
         config_path = Path(config_path).expanduser().resolve() if config_path is not None else None
         config = load_experiment_config(yaml_path=config_path)
-        from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
+        from dexmani_real.geometry.transforms import validate_unit_quaternion_wxyz
 
         mount = np.asarray(config.hand.T_eef_handbase_pos_xyz, dtype=np.float64)
         if mount.shape != (3,) or not np.isfinite(mount).all():
@@ -201,7 +204,7 @@ class RawHandCloudProvider:
 
     def for_frame(self, frame):
         """Reject mismatched rows and missing joints; never substitute commands."""
-        from dexmani_real.planning.kinematics.pose import rot6d_to_rotmat
+        from dexmani_real.geometry.pose import rot6d_to_rotmat
 
         row = frame.row_index
         if (

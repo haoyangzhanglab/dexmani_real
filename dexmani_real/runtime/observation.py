@@ -9,8 +9,8 @@ from typing import Literal, Mapping
 
 import numpy as np
 
+from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.robot.commands import RobotError
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics, CameraSnapshot
 from dexmani_real.utils.timing import sample_is_fresh
 
 

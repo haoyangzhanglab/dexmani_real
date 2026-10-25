@@ -4,14 +4,18 @@ import logging
 
 import numpy as np
 
-from dexmani_real.planning.home_planner import HomePlanner
-from dexmani_real.planning.kinematics.ik import OnlineIKConfig, make_online_ik_solver
-from dexmani_real.planning.table_plane import resolve_table_plane
-from dexmani_real.planning.target import TargetChecker
+from dexmani_real.calibration.table_plane import resolve_table_plane
+from dexmani_real.control.homing import HomePlanner
+from dexmani_real.control.online_ik import OnlineIKConfig, make_online_ik_solver
+from dexmani_real.control.target_validation import TargetChecker
 from dexmani_real.robot.commands import OperationCancelled, RobotError
-from dexmani_real.robot.robot import DexManiRobot
-from dexmani_real.runtime.home import home_robot
-from dexmani_real.runtime.jog import JogController, jog_motion_requested
+from dexmani_real.robot.system import DexManiRobot
+from dexmani_real.runtime.motion.home import home_robot
+from dexmani_real.runtime.motion.jog import (
+    JogController,
+    jog_motion_requested,
+    validate_keyboard_workspace,
+)
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
@@ -20,11 +24,8 @@ from dexmani_real.runtime.observation import (
     service_feedback,
 )
 from dexmani_real.runtime.operator_input import KeyboardInput
-from dexmani_real.runtime.preflight import (
-    validate_keyboard_workspace,
-    validate_robot_config,
-)
-from dexmani_real.runtime.processes import shutdown_local_runtime
+from dexmani_real.runtime.preflight import validate_robot_config
+from dexmani_real.runtime.shutdown import shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import LoopRate

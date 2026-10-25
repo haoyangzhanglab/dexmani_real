@@ -10,8 +10,8 @@ from typing import Any, cast
 import numpy as np
 import pyrealsense2 as rs
 
+from dexmani_real.geometry.camera import CameraIntrinsics
 from dexmani_real.sensor.camera.config import CameraParams
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics
 
 __all__ = ["RealSenseCamera", "RGBDFrame"]
 

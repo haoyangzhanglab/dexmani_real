@@ -1,9 +1,14 @@
 """Coordinator-owned lifecycle; only run identity and stop signals cross spawn."""
 
+from __future__ import annotations
+
 import multiprocessing as mp
 import time
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from enum import IntEnum
+from multiprocessing.sharedctypes import Synchronized
+from multiprocessing.synchronize import Event
 
 
 class SafetyState(IntEnum):
@@ -39,10 +44,14 @@ class RuntimeState:
     stop_request: bool = False
     safety_state: SafetyState = SafetyState.DISARMED
     # The shared lock protects only identity/stop transitions, never SDK I/O.
-    motion_lock: object = field(default_factory=lambda: mp.get_context("spawn").RLock(), repr=False)
-    run_signal: object = field(default_factory=lambda: mp.get_context("spawn").Value("q", 1), repr=False)
-    stop_signal: object = field(default_factory=lambda: mp.get_context("spawn").Event(), repr=False)
-    emergency_signal: object = field(default_factory=lambda: mp.get_context("spawn").Event(), repr=False)
+    motion_lock: AbstractContextManager = field(
+        default_factory=lambda: mp.get_context("spawn").RLock(), repr=False
+    )
+    run_signal: Synchronized = field(
+        default_factory=lambda: mp.get_context("spawn").Value("q", 1), repr=False
+    )
+    stop_signal: Event = field(default_factory=lambda: mp.get_context("spawn").Event(), repr=False)
+    emergency_signal: Event = field(default_factory=lambda: mp.get_context("spawn").Event(), repr=False)
 
     @property
     def run_id(self):

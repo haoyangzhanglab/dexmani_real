@@ -4,31 +4,32 @@ import logging
 import multiprocessing as mp
 from pathlib import Path
 
+from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extrinsics
+from dexmani_real.calibration.paths import VR_TRANSFORM_PATH
+from dexmani_real.calibration.table_plane import resolve_table_plane
+from dexmani_real.calibration.vr_alignment import load_vr_transform
+from dexmani_real.control.action_mapping import ActionMapper
+from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.recorder import RecordingError
 from dexmani_real.ipc.channels import SensorChannels
-from dexmani_real.planning.action import ActionMapper
-from dexmani_real.planning.home_planner import HomePlanner
-from dexmani_real.planning.table_plane import resolve_table_plane
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
-from dexmani_real.robot.robot import DexManiRobot
+from dexmani_real.robot.system import DexManiRobot
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     snapshot_camera_parameters,
 )
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
-from dexmani_real.runtime.processes import SensorProcesses, shutdown_local_runtime
+from dexmani_real.runtime.sensor_processes import SensorProcesses
+from dexmani_real.runtime.shutdown import shutdown_local_runtime
 from dexmani_real.runtime.state import RunEndReason, RuntimeState
-from dexmani_real.sensor.camera.extrinsics import load_optional_camera_extrinsics
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.vr.worker import run_vr_worker
-from dexmani_real.state import VR_TRANSFORM_PATH
 from dexmani_real.teleop.audio_feedback import AudioFeedback
 from dexmani_real.teleop.config import DEFAULT_TASK_NAME, validate_task_dir_name
 from dexmani_real.teleop.controller import TeleopController
 from dexmani_real.teleop.runner import TeleopRunner
-from dexmani_real.teleop.vr_alignment import load_vr_transform
 from dexmani_real.teleop.vr_mapping import VRWristMapper
 from dexmani_real.utils.log import configure_logging
 

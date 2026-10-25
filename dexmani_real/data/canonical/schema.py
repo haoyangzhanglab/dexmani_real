@@ -7,10 +7,10 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.planning.table_plane import validate_table_plane
+from dexmani_real.geometry.plane import validate_table_plane
+from dexmani_real.perception.hand_config import HandPointCloudConfig
+from dexmani_real.perception.pointcloud.config import PointCloudConfig
 from dexmani_real.robot.xhand.config import HandParams
-from dexmani_real.sensor.pointcloud.config import PointCloudConfig
-from dexmani_real.sensor.pointcloud.hand_config import HandPointCloudConfig
 
 
 @dataclass(frozen=True)

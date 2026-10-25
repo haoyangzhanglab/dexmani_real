@@ -10,18 +10,18 @@ from typing import Any
 
 import yaml
 
-from dexmani_real.deployment.config import ExecutionConfig
-from dexmani_real.planning.config import (
+from dexmani_real.control.config import (
     EnvironmentConfig,
     MotionParams,
     StaticCollisionBox,
 )
+from dexmani_real.deployment.config import ExecutionConfig
+from dexmani_real.perception.hand_config import HandPointCloudConfig
+from dexmani_real.perception.pointcloud.config import PointCloudConfig
 from dexmani_real.robot.xarm7.config import ArmParams
 from dexmani_real.robot.xhand.config import HandParams
-from dexmani_real.runtime.config import SafetyParams
+from dexmani_real.runtime.config import RuntimeTimeouts
 from dexmani_real.sensor.camera.config import CameraParams
-from dexmani_real.sensor.pointcloud.config import PointCloudConfig
-from dexmani_real.sensor.pointcloud.hand_config import HandPointCloudConfig
 from dexmani_real.sensor.vr.config import VRParams
 from dexmani_real.teleop.config import (
     CollectionOptions,
@@ -44,7 +44,7 @@ class ExperimentConfig:
     collection: CollectionOptions = field(default_factory=CollectionOptions)
     keyboard_teleop: KeyboardTeleopParams = field(default_factory=KeyboardTeleopParams)
     vr: VRParams = field(default_factory=VRParams)
-    safety: SafetyParams = field(default_factory=SafetyParams)
+    safety: RuntimeTimeouts = field(default_factory=RuntimeTimeouts)
     camera: CameraParams = field(default_factory=CameraParams)
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     hand_pointcloud: HandPointCloudConfig = field(default_factory=HandPointCloudConfig)

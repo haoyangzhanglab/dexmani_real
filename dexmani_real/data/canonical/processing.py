@@ -15,15 +15,17 @@ from dexmani_real.data.raw.camera_geometry import (
 )
 from dexmani_real.data.raw.reader import EpisodeReader, RawDataError
 from dexmani_real.data.raw.schema import DATASET_SPECS
-from dexmani_real.planning.kinematics.arm_fk import (
-    compute_eef_pose_history_xarm_base,
-)
-from dexmani_real.planning.kinematics.fingertip import compute_hand_geometry_history_xarm_base
-from dexmani_real.sensor.camera.geometry import (
+from dexmani_real.geometry.camera import (
     camera_parameters_cv,
     validate_aligned_depth_distortion,
 )
-from dexmani_real.sensor.pointcloud.processing import build_point_cloud
+from dexmani_real.geometry.kinematics.arm_fk import (
+    compute_eef_pose_history_xarm_base,
+)
+from dexmani_real.perception.hand_geometry import (
+    compute_hand_geometry_history_xarm_base,
+)
+from dexmani_real.perception.pointcloud.processing import build_point_cloud
 
 
 def validate_export_episode(

@@ -6,9 +6,9 @@ from contextlib import closing
 
 import numpy as np
 
-from dexmani_real.planning.kinematics.pose import xyzw_to_wxyz
+from dexmani_real.geometry.pose import xyzw_to_wxyz
+from dexmani_real.geometry.transforms import normalize_quat_wxyz
 from dexmani_real.sensor.vr.config import VRParams
-from dexmani_real.utils.geometry import normalize_quat_wxyz
 from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger(__name__)

@@ -6,8 +6,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from dexmani_real.geometry.transforms import validate_unit_quaternion_wxyz
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
-from dexmani_real.utils.geometry import validate_unit_quaternion_wxyz
 from dexmani_real.robot.xhand.limits import validate_hand_limit_nesting
 
 XHAND_RATED_QPOS_MIN_RAD: tuple[float, ...] = (

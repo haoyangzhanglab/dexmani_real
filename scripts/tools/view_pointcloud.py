@@ -15,17 +15,17 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from dexmani_real.config import load_experiment_config
-from dexmani_real.planning.table_plane import (
+from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
+from dexmani_real.calibration.table_plane import (
     fit_table_plane,
     publish_table_plane,
     resolve_table_plane,
     resolve_table_plane_path,
 )
-from dexmani_real.sensor.camera.extrinsics import CameraExtrinsics
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics
-from dexmani_real.sensor.pointcloud.config import PointCloudConfig
-from dexmani_real.sensor.pointcloud.processing import (
+from dexmani_real.config import load_experiment_config
+from dexmani_real.geometry.camera import CameraIntrinsics
+from dexmani_real.perception.pointcloud.config import PointCloudConfig
+from dexmani_real.perception.pointcloud.processing import (
     aligned_depth_points_in_base,
     build_point_cloud,
     build_raw_point_cloud,

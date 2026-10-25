@@ -5,8 +5,11 @@ import logging
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.planning.kinematics.pose import Pose, quat_multiply, quat_wxyz_to_rotmat
-from dexmani_real.utils.geometry import normalize_quat_wxyz, validate_rotation_matrix
+from dexmani_real.geometry.pose import Pose, quat_multiply, quat_wxyz_to_rotmat
+from dexmani_real.geometry.transforms import (
+    normalize_quat_wxyz,
+    validate_rotation_matrix,
+)
 
 logger = logging.getLogger(__name__)
 

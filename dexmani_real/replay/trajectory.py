@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.data.raw.reader import EpisodeReader, text_attr
-from dexmani_real.planning.kinematics.arm_fk import compute_eef_pose_history_xarm_base
+from dexmani_real.geometry.kinematics.arm_fk import compute_eef_pose_history_xarm_base
 
 
 @dataclass

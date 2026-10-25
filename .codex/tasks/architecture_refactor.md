@@ -5,7 +5,7 @@
 - 仓库：`haoyangzhanglab/dexmani_real`。
 - 编制日期：2026-10-25。
 - 已核对的代码基线：`43ffe6a04916d7e8413f4c488efdef6c0d2f5046`。
-- 任务状态：规格已制定；本文件的提交不表示代码重构、测试或真机验收已经完成。
+- 任务状态：P0–P6 离线实施及后续代码审查已完成，证据见第 10 节；真机验收未执行。
 - 本文件是前期架构讨论的统一实施规格；执行不依赖此前聊天记录。先阅读根目录及相关目录中适用的 `AGENTS.md` / `AGENTS.override.md`，再按本任务书实施。
 - 开始时以本地实际源码和工作区为准，记录实际 HEAD 与本基线的差异；不要为了匹配本文件而回退仓库。路径已有变化时跟踪实际职责，避免重复重构。
 - 用户启动本任务后，目标是完成代码、测试与必要文档修改，不是再次输出一份设计方案。按下文阶段连续推进，每阶段形成可验证的闭环；不得只完成目录图或阶段 P0 就宣称完成。
@@ -442,15 +442,15 @@ git diff --stat
 
 只有对应证据实际成立时才标记完成：
 
-- [ ] 目标领域归属落实，旧模块及所有实际调用方同步迁移，无无效导入、循环导入或双份权威实现。
-- [ ] runtime/motion 与 deployment/rollout 保持浅层结构，无额外 manager、注册系统或通用框架。
-- [ ] 状态/设备/模型/记录 owner 清晰，未改变锁、进程所有权、期限、停止与清理的关键边界。
-- [ ] 在线/离线表示共享、数值与数据契约保持；真实 backend 未验证部分被单独列出。
-- [ ] CLI、配置键、结果字段和实验输出位置保持；批准的默认标定路径变化有明确迁移说明。
-- [ ] 三份默认标定 JSON 内容保留、路径解析与 wheel package-data 已检查。
-- [ ] 测试、脚本、仓内集成适配器及 README 已同步；不需要同时维护新旧导入路径。
-- [ ] 相关离线检查给出具体命令和真实结果；失败、跳过、环境阻塞与真机待验收相互区分。
-- [ ] diff 已检查，无无关格式化、依赖升级、算法优化、用户数据改动或未获授权的外部操作。
+- [x] 目标领域归属落实，旧模块及所有实际调用方同步迁移，无无效导入、循环导入或双份权威实现。
+- [x] runtime/motion 与 deployment/rollout 保持浅层结构，无额外 manager、注册系统或通用框架。
+- [x] 状态/设备/模型/记录 owner 清晰，未改变锁、进程所有权、期限、停止与清理的关键边界。
+- [x] 在线/离线表示共享、数值与数据契约保持；真实 backend 未验证部分被单独列出。
+- [x] CLI、配置键、结果字段和实验输出位置保持；批准的默认标定路径变化有明确迁移说明。
+- [x] 三份默认标定 JSON 内容保留、路径解析与 wheel package-data 已检查。
+- [x] 测试、脚本、仓内集成适配器及 README 已同步；不需要同时维护新旧导入路径。
+- [x] 相关离线检查给出具体命令和真实结果；失败、跳过、环境阻塞与真机待验收相互区分。
+- [x] diff 已检查，无无关格式化、依赖升级、算法优化、用户数据改动或未获授权的外部操作。
 
 最终用中文报告：
 
@@ -467,13 +467,64 @@ git diff --stat
 
 本文件集中保存任务规格及少量执行证据，不承担长期设计日志。实施者仅在下面更新实际完成的阶段、执行命令摘要、阻塞与必要偏差，避免把任务扩展成文档工程。
 
-| 阶段 | 初始状态 | 实施证据/阻塞 |
+| 阶段 | 当前状态 | 实施证据/阻塞 |
 | --- | --- | --- |
-| P0 基线 | 未开始 | — |
-| P1 几何 | 未开始 | — |
-| P2 感知 | 未开始 | — |
-| P3 控制与标定 | 未开始 | — |
-| P4 Runtime | 未开始 | — |
-| P5 Deployment 与命名 | 未开始 | — |
-| P6 离线验收与交付 | 未开始 | — |
+| P0 基线 | 已完成 | HEAD 1d1069e；相较设计基线仅新增任务书，原工作区干净。使用 real_robot Python 3.10.20；部署契约迁入 tests，新增数值与调度用例后 20 项全部通过。固定输入 8 组数组、标定 SHA-256 与原源码位于 /tmp/dexmani-refactor-mm0h9oo_，未连接设备。 |
+| P1 几何 | 已完成 | pose/transforms、相机类型、两类 FK 与平面验证已归位，所有消费者含相对导入已更新；20 项测试通过，8 组数组与 P0 精确相等；配置导入未加载数值后端/设备/策略。 |
+| P2 感知 | 已完成 | 点云配置/处理/worker 与手几何已迁入 perception；7 项数值/表示测试通过，包含真实在线 Policy 与离线 Canonical 输出精确一致；8 组 P0 数组精确一致。设备采集仍在 sensor。 |
+| P3 控制与标定 | 已完成 | control 与 calibration 已按表迁移；合并 HOME，拆出等价角；相机 session 提前在 P3 迁入。8 项控制测试迁移前后通过；7 项配置/路径/CLI 检查通过；8 组数值、2 组真实 IK 命令、三份 JSON SHA-256 不变。默认配置仅批准路径变化，package-data 已更新（wheel 留 P6 核验）；旧 planning/state 已删除。 |
+| P4 Runtime | 已完成 | SensorProcesses/shutdown 已分离，HOME/jog 迁入 motion，键集合和工作空间验证归位；SafetyParams 改名 RuntimeTimeouts，safety 键及数值不变。14 项状态/输入/退出/HOME/spawn 用例迁移前后通过；3 项观测/触觉用例通过；输入模块不再导入 jog/IK。 |
+| P5 Deployment 与命名 | 已完成 | rollout/、policy_observation、robot/system、data/session_results、replay/consistency 已迁移，SessionResults 改名完成；所有调用方/patch/类型提示同步。11 项模型/单轮/录制/会话测试迁移前后通过；完整发现 64 项通过，无 skip。保留 run→session→episode 与各 owner。 |
+| P6 离线验收与交付 | 已完成（离线） | 最终 unittest 69 项全部通过、0 skip；106 模块/652 个导入名及 10 个冷启动入口通过；8 个 CLI help、2 个 print-config、compileall、diff 检查通过。新旧 wheel 三份 JSON 逐字节一致，仓库外临时安装定位通过；README 26 个本地链接有效。真机与完整独立硬件部署未执行。 |
 | 真机验收 | 未执行；不在默认执行授权内 | 由操作者另行安排 |
+
+
+### P0–P6 结束时的执行证据与边界
+
+- 最终仍基于 HEAD `1d1069eb90822f4ed7342a47e297811327386ab0`；未切分支、创建提交、修改依赖版本或执行远端 Git 操作。初始源码与设计基线一致，仅多出任务书。
+- 使用 `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`（Python 3.10.20，NumPy 1.26.4、SciPy 1.15.3、MPlib 0.2.1、fpsample 0.3.3）。系统 shell 没有 `python`，实际验证使用上述现有解释器，未安装/升级依赖。
+- 最终测试 **69 项通过、0 失败、0 skip**，包括原有 5 项 Policy/Real 契约测试。固定输入的 8 组 FK/手几何/点云数组及两组真实 IK/动作映射结果与迁移前精确相等；在线 Policy 与离线 Canonical 的共同表示逐字段精确一致。真实数值后端使用仓库 URDF/mesh，设备、模型生命周期和录制边界使用替身。
+- 393 个原有函数/类定义与 167 个常量完成 AST 对照，无算法差异：比较时去除导入语句并归一化两处批准的类型名；默认标定路径及键集合导出调整另行核验。所有配置默认值除批准的桌面路径外保持一致，Raw/Canonical 字段、期限比较和锁/清理代码未改写。
+- 106 个源码模块导入、652 个仓内导入名解析、10 个关键入口独立新解释器导入均通过；CordViP 集成可导入。源代码、脚本和适配器无旧模块引用；历史说明和显式旧路径失败测试保留旧字符串。
+- wheel 使用当前源码的任务自有临时副本构建，逐字节核对其中 106 个 Python 文件与最终工作区一致；三份 JSON 与迁移前 wheel 及工作区一致。只把本项目 wheel 安装到临时 target，使用 `python -I` 从仓库外确认包来源、三份资源和默认桌面路径，未改变全局环境。
+- 目录归属没有偏离任务书；相机交互会话按允许顺序随 P3 迁移。新包初始化仅包含说明，不导入算法或会话。未保留旧路径兼容模块。
+
+主要验证命令（均为离线）：
+
+```bash
+DEXMANI_PY=/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python
+MPLCONFIGDIR=/tmp/dexmani-refactor-mm0h9oo_/mpl "$DEXMANI_PY" -m unittest discover -s tests -p 'test_*.py' -v
+"$DEXMANI_PY" -m compileall -q dexmani_real scripts tests
+"$DEXMANI_PY" scripts/run_policy.py --print-config
+"$DEXMANI_PY" scripts/collect_teleop.py --print-config
+git diff --check
+# cwd=/tmp/dexmani-refactor-mm0h9oo_/wheel-source
+"$DEXMANI_PY" -m pip wheel --no-deps --no-build-isolation --no-index --wheel-dir /tmp/dexmani-refactor-mm0h9oo_/wheels .
+```
+
+8 个主实验脚本的 `--help` 均返回 0；键盘入口本来没有 `--print-config`，按既有 CLI 检查 `--help`，未扩充参数。测试日志、固定输入基线、AST 审计和 wheel 等临时证据保存在 `/tmp/dexmani-refactor-mm0h9oo_/`；该目录不是项目运行依赖。
+
+三份标定文件的迁移前后 SHA-256：
+
+```text
+a97d21d566477bbcfcea18c08ef9d5455feedfbef2db5b1659ae3d6c414f6c4d  cameras.json
+f6e66d2157e27fcb290a133a0379a9026b97bf70577bd763ad63ff6716d468eb  table_plane.json
+2f3f53446fb0f8435dc0cacc2ede27c69e11ba9db03e42cc3f10970ac91e239e  vr_transform.json
+```
+
+**既有限制与未执行项：** 当前验证环境无未解决的依赖阻塞。新旧 wheel 均不包含机器人 `assets/`，这是既有打包限制，未扩大本次范围修复，不能声称完整独立安装可运行机器人。未连接任何硬件、未加载真实策略权重/GPU 推理、未执行全工作空间或时延性能验收。固定算例和设备替身不构成物理碰撞、停稳或到位证明。
+
+**人工迁移与验收：** 外部代码需改用新模块路径；外部 YAML 显式引用旧标定位置时需人工迁移，缺失文件仍透明失败。配置 `safety` 键、结果字段/文件名和实验输出目录保持不变。操作者后续另行安排设备启停、取消/急停、HOME/jog、遥操作录制、sync/async/RTC 策略运行及回放；本次授权不包含这些操作。P0–P6 的代码、测试与文档工作已结束，无待续接的源码迁移阶段。
+
+
+### 后续全链路审查与清理（2026-10-26）
+
+- 保留此前全部未提交改动，HEAD 仍为 `1d1069eb90822f4ed7342a47e297811327386ab0`。本轮在迁移后的实际调用链上检查配置、感知、控制、标定、runtime、deployment、数据消费者、脚本及 CordViP 引用。
+- `DEFAULT_JUMP_DEG` 与 `joint_target_rejection()` 从 `online_ik.py` 归入已有的 `control/joint_angles.py`，函数体和阈值不变；`TargetChecker` 不再反向依赖在线 IK。合并碰撞模型中重复的几何体→link 名称解析，删除旧专用方法并更新全部调用点。无新文件、兼容模块、框架或配置键。
+- 整理迁移后的导入并合并同模块重复导入；区分 IK 配置元组与计算数组、手表面采样的片段列表与拼接数组；使用实际的多进程锁/信号类型。外部 OpenCV 的 CV_8U 输出及构造时已保证存在的碰撞工作区/IPC 通道用类型表达其不变量，没有添加逐帧重复验证或忽略错误的注释。
+- 未发现需移除的旧格式/旧流程兼容层或运行时 SHA-256 完整性校验。点云 `spatial_hash()` 是确定性采样算法的一部分，继续保留。相机外参可选录制、碰撞诊断失败仍保留碰撞结论、HOME 等价角候选和清理错误报告均有现行消费者，未误删为历史 fallback。
+- 初始 69 项测试通过；新增纯关节检查的导入边界、真实共享内存点云 worker 发布/时钟/ready 清理、真实环境碰撞诊断及详情失败仍拒绝的 3 项测试后，**72 项通过、0 失败、0 skip**。原 8 组数值数组与 P0 精确一致；本轮开始前快照与清理后在两组 IK/ActionMapper 输出及 12 份碰撞报告上精确一致。三份标定 JSON 仍逐字节不变。
+- `python -m mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases` 对 README 所列 53 个模块通过（初始 39 条诊断已处理）。这是默认的有标注代码检查，不覆盖未标注函数体或外部无类型 SDK。`ruff check --isolated --select E9,F` 对源码/脚本/测试/集成通过，本轮 Python 文件的 `I` 导入规则通过；未限定规则的扫描并非零告警：core/scripts/tests 从 226 条降至 177 条，无新增诊断，保留既有风格及异常清理相关告警，没有添加 suppression 或更改工具配置。
+- 106 个模块和 775 个仓内导入引用（本次含测试）解析通过，CordViP 集成可导入；8 个实验脚本 `--help`、2 个 `--print-config`、compileall、diff 检查通过。使用现有工具在临时副本构建 wheel，106 个 Python 文件与工作区逐字节匹配、三份 JSON 完整；只将本项目安装到临时 target，仓库外 `python -I` 导入及默认路径读取通过。README 26 个本地链接有效。
+- README 已补充当前关节检查职责、静态检查命令及范围。未升级依赖、创建提交或连接硬件。既有 wheel 缺少机器人 assets 的限制保持；真实模型/GPU 推理、物理停稳/到位和受控真机验收仍未执行。
+- 本轮快照、测试日志、数值/碰撞比较、完整 Ruff 扫描和构建产物位于 `/tmp/dexmani-review-d0xa3cyr/`，不是项目运行依赖。上文 69 项测试与 393 定义 AST 一致性是前一阶段证据；本轮局部简化以本节的新比较与 72 项结果为准。

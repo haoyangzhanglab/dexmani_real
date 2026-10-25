@@ -10,15 +10,15 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
+from dexmani_real.calibration.table_plane import resolve_table_plane
 from dexmani_real.config import load_experiment_config
-from dexmani_real.planning.table_plane import resolve_table_plane
-from dexmani_real.runtime.operator_input import KeyboardInput
-from dexmani_real.sensor.camera.extrinsics import CameraExtrinsics
-from dexmani_real.sensor.camera.geometry import validate_aligned_depth_distortion
-from dexmani_real.sensor.pointcloud.processing import (
+from dexmani_real.geometry.camera import validate_aligned_depth_distortion
+from dexmani_real.perception.pointcloud.processing import (
     build_point_cloud,
     build_raw_point_cloud,
 )
+from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.visualization import (
     log_camera_geometry,

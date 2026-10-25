@@ -21,12 +21,12 @@ from dexmani_real.data.canonical.schema import (
     canonical_array_specs,
 )
 from dexmani_real.data.raw.reader import EpisodeReader, RawDataError, text_attr
-from dexmani_real.planning.kinematics.arm_fk import ArmFK
-from dexmani_real.planning.kinematics.hand_fk import HandKinematics
-from dexmani_real.planning.kinematics.hand_pointcloud import HandPointCloudTemplate
-from dexmani_real.planning.kinematics.pose import quat_wxyz_to_rotmat
+from dexmani_real.geometry.kinematics.arm_fk import ArmFK
+from dexmani_real.geometry.kinematics.hand_fk import HandKinematics
+from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
+from dexmani_real.perception.hand_surface import HandPointCloudTemplate
+from dexmani_real.perception.pointcloud.config import SAMPLING_METHOD
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
-from dexmani_real.sensor.pointcloud.config import SAMPLING_METHOD
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 from dexmani_real.utils.timing import sampling_clock_ns
 

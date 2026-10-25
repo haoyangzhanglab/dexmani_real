@@ -19,6 +19,7 @@ LISTENER_STOP_TIMEOUT_S = 0.25
 LISTENER_START_TIMEOUT_S = 2.0
 
 __all__ = [
+    "CARTESIAN_JOG_KEYS",
     "OperatorCommand",
     "KeyboardInput",
 ]
@@ -42,6 +43,10 @@ KEY_MAP: dict[str, OperatorCommand] = {
     "t": OperatorCommand.RESET_TACTILE,
     "q": OperatorCommand.QUIT,
 }
+
+CARTESIAN_JOG_KEYS = frozenset(
+    {"w", "s", "a", "d", "up", "down", "left", "right", "i", "k", "j", "l"}
+)
 
 EVENT_ONLY_KEYS = frozenset({"x", "space", "enter", "backspace"})
 
@@ -264,8 +269,6 @@ class KeyboardInput:
     def jog_changed(self, name: str | None, changed: bool) -> None:
         if not changed:
             return
-        from dexmani_real.runtime.jog import CARTESIAN_JOG_KEYS
-
         if name in CARTESIAN_JOG_KEYS or name == "q" or (name == "r" and name in self.held_keys):
             self.generation += 1
 

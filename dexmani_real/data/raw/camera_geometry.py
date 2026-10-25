@@ -13,8 +13,8 @@ from dexmani_real.data.raw.reader import (
     scalar_attr,
     text_attr,
 )
-from dexmani_real.sensor.camera.geometry import CameraIntrinsics
-from dexmani_real.utils.geometry import validate_rigid_transform
+from dexmani_real.geometry.camera import CameraIntrinsics
+from dexmani_real.geometry.transforms import validate_rigid_transform
 
 
 @dataclass(frozen=True)

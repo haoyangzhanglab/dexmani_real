@@ -8,7 +8,7 @@ import numpy as np
 
 
 @dataclass(frozen=True)
-class SafetyParams:
+class RuntimeTimeouts:
     model_startup_timeout_s: float = 300.0
     camera_ready_timeout_s: float = 15.0
     pointcloud_ready_timeout_s: float = 30.0

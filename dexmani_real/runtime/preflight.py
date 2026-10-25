@@ -36,17 +36,3 @@ def validate_control_rate(cfg: ExperimentConfig, control_hz: float) -> None:
             raise ValueError(
                 "target period must fit hand.feedback_max_age_s; configure both explicitly"
             )
-
-
-def validate_keyboard_workspace(runtime: ExperimentConfig) -> np.ndarray:
-    """Validate the selected jog configuration before any device connects."""
-    cfg = runtime.keyboard_teleop
-    cfg.validate()
-    validate_control_rate(runtime, cfg.control_hz)
-    workspace = runtime.environment.workspace.as_array()
-    if np.any(
-        workspace[:, 0] + cfg.workspace_command_margin_m
-        >= workspace[:, 1] - cfg.workspace_command_margin_m
-    ):
-        raise ValueError("keyboard workspace command margin leaves no interior workspace")
-    return workspace

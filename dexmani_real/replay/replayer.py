@@ -7,13 +7,20 @@ from enum import Enum
 
 import numpy as np
 
-from dexmani_real.planning.action import ActionMapper, project_arm_command, project_hand_command
-from dexmani_real.planning.paths import wrap_nearest_equivalent
+from dexmani_real.control.action_mapping import (
+    ActionMapper,
+    project_arm_command,
+    project_hand_command,
+)
+from dexmani_real.control.joint_angles import wrap_nearest_equivalent
 from dexmani_real.replay.capture import ReplayRecorder
-from dexmani_real.robot.commands import RobotCommand, OperationCancelled, RobotError
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
 from dexmani_real.runtime.observation import (
-    ObservationNeeds, read_observation, check_observation,
-    control_deadline_ns, service_feedback,
+    ObservationNeeds,
+    check_observation,
+    control_deadline_ns,
+    read_observation,
+    service_feedback,
 )
 from dexmani_real.runtime.operator_input import OperatorCommand
 from dexmani_real.runtime.state import RunEndReason
