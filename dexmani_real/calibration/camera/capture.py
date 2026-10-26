@@ -14,7 +14,7 @@ from dexmani_real.calibration.camera.aruco import (
     marker_corners_3d,
 )
 from dexmani_real.geometry.pose import rot6d_to_quat_wxyz
-from dexmani_real.ipc.channels import SensorChannels
+from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.runtime.observation import read_camera_frame
 from dexmani_real.utils.timing import sample_is_fresh
 

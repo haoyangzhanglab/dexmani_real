@@ -25,7 +25,7 @@ from dexmani_real.deployment.policy_observation import (
     build_policy_observation,
 )
 from dexmani_real.deployment.rollout.episode import PolicyEpisode, failure_reason
-from dexmani_real.ipc.channels import SensorChannels
+from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.system import DexManiRobot
 from dexmani_real.runtime.motion.home import home_robot

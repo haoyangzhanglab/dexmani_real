@@ -11,7 +11,7 @@ from dexmani_real.calibration.vr_alignment import load_vr_transform
 from dexmani_real.control.action_mapping import ActionMapper
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.recorder import RecordingError
-from dexmani_real.ipc.channels import SensorChannels
+from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.system import DexManiRobot

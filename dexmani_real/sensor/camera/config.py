@@ -25,10 +25,6 @@ class CameraParams:
         return OBSERVATION_MAX_AGE_PERIODS / self.fps
 
     @property
-    def rgb_shape(self) -> tuple[int, int, int]:
-        return (self.height, self.width, 3)
-
-    @property
     def depth_shape(self) -> tuple[int, int]:
         return (self.height, self.width)
 

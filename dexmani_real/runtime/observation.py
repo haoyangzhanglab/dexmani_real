@@ -65,24 +65,26 @@ def snapshot_camera_parameters(channels, config, calibration, *, require_extrins
 
 
 def read_vr_frame(channels):
-    result = channels.vr_ring.read_latest(use_last_good=True)
+    result = channels.vr_ring.read()
     if result is None:
         return None
-    record = result[0][0]
-    return {**{name: record[name] for name in record.dtype.names}, "ring_sequence": result[2]}
+    record, sequence = result
+    return {**{name: record[name] for name in record.dtype.names}, "ring_sequence": sequence}
 
 
 def read_camera_frame(channels, sequence=None, *, payload="rgbd"):
     fields = {"rgb": ("rgb",), "depth": ("depth",), "rgbd": ("rgb", "depth")}[payload]
-    result = channels.camera_ring.read_fields(("header", *fields), sequence=sequence)
+    result = channels.camera_ring.read(
+        fields=("timestamp_ns", "color_frame_number", *fields), sequence=sequence,
+    )
     if result is None:
         return None
-    data, _, sequence = result
+    data, sequence = result
     return {
         **{name: data[name] for name in fields},
         "ring_sequence": sequence,
-        "timestamp_ns": int(data["header"]["timestamp_ns"]),
-        "color_frame_number": int(data["header"]["color_frame_number"]),
+        "timestamp_ns": int(data["timestamp_ns"]),
+        "color_frame_number": int(data["color_frame_number"]),
     }
 
 
@@ -115,10 +117,8 @@ def read_observation(
         robot.read_initial_state(cancel_requested=cancel_requested)
         if wait_for_hand else robot.read_state()
     )
-    cloud_result = (
-        channels.pointcloud_ring.read_latest(use_last_good=True) if needs.point_cloud else None
-    )
-    cloud = cloud_result[0][0] if cloud_result else None
+    cloud_result = channels.pointcloud_ring.read() if needs.point_cloud else None
+    cloud = cloud_result[0] if cloud_result else None
     camera = None
     if needs.camera != "none":
         if needs.point_cloud:

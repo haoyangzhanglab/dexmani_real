@@ -83,6 +83,10 @@ IK 使用入口明确提供的运行关节限位，正常无解返回 `IKResult`
 
 ## 观测与产物契约
 
+传感器 IPC 布局和通道分配位于 [`ipc/sensors.py`](dexmani_real/ipc/sensors.py)，[`SharedRing`](dexmani_real/ipc/ring.py) 面向 Linux x86_64，通过 `spawn` 传给单个生产者和多个消费者。`write(**fields)` 返回发布序列；`read(sequence=None, fields=None)` 返回 `(data, sequence)`，完整帧为结构化标量，按字段读取为独立副本字典。空缓冲、目标序列被覆盖或复制期间发生覆盖均返回 `None`，不重试、不缓存旧帧。
+
+来源时间由载荷携带，IPC 不生成替代来源时间的发布时钟。点云携带 `source_camera_sequence` 和原始相机 `timestamp_ns`；同时需要像素与点云时，只读取对应相机序列，匹配失败视为观测缺失。控制所需观测缺失时，遥操作或部署按现有准入规则结束本轮；标定采样继续在自身期限内等待。
+
 `read_camera_frame()` 返回来源 `timestamp_ns`、共享内存发布序列 `ring_sequence`、RGB 设备帧号 `color_frame_number` 及请求的像素通道。发布序列不是设备帧身份；时间戳保留 RGB-D 中较早通道的首次主机接收时间，不代表曝光时刻。标定采样和预览只读取 RGB，采样仍要求屏障后的新鲜、不同 RGB 帧。
 
 `termination_reason` 保留首次终止原因，`technical_status` 反映该次产物的技术完成状态，发布状态单独描述文件是否已发布。发布前已知的停止或录制失败不会因为首次原因是 operator、quit 或正常时长结束而变为技术正常。失败产物可保留有效数据前缀；已发布 Raw 不因后续独立会话清理错误而回写。Teleop 的显式 DISCARD 在停止失败时仍保持丢弃意图。
@@ -97,6 +101,7 @@ Teleop 中断会登记技术失败并传播，关闭时继续按原保存或丢�
 
 ```bash
 python -m compileall -q dexmani_real scripts
+python -m unittest discover -s tests -v
 python scripts/run_policy.py --print-config
 python scripts/collect_teleop.py --print-config
 git diff --check
@@ -105,8 +110,9 @@ git diff --check
 已有 Ruff/mypy 的开发环境可补充静态检查，无需为运行实验安装它们：
 
 ```bash
-ruff check --no-cache --isolated --select E9,F dexmani_real scripts third_party/cordvip_geometry/src
+ruff check --no-cache --isolated --select E9,F dexmani_real scripts tests third_party/cordvip_geometry/src
 mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases \
+  dexmani_real/ipc dexmani_real/sensor/camera/worker.py \
   dexmani_real/geometry dexmani_real/perception dexmani_real/control \
   dexmani_real/calibration dexmani_real/runtime dexmani_real/deployment \
   dexmani_real/data/session_results.py dexmani_real/data/raw/reader.py \

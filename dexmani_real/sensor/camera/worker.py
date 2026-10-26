@@ -3,10 +3,8 @@
 import json
 import logging
 import time
+from typing import cast
 
-import numpy as np
-
-from dexmani_real.ipc.schema import CAMERA_FRAME_HEADER_DTYPE
 from dexmani_real.sensor.camera.config import CameraParams
 from dexmani_real.utils.log import configure_logging
 
@@ -22,7 +20,7 @@ def run_camera_worker(shared, config: CameraParams) -> None:
     camera.connect()
     try:
         shared.camera_depth_scale.value = camera.get_depth_scale()
-        shared.camera_serial.value = camera.active_serial.encode()
+        shared.camera_serial.value = cast(str, camera.active_serial).encode()
         shared.camera_intrinsics.value = json.dumps(
             camera.get_color_intrinsics().to_dict()
         ).encode()
@@ -53,12 +51,9 @@ def run_camera_worker(shared, config: CameraParams) -> None:
                     raise RuntimeError(f"RealSense stopped producing new {name}")
             if identity == last_frame:
                 continue
-            header = np.array(
-                (min(last_advance_ns), frame.timestamp_ns, *identity),
-                dtype=CAMERA_FRAME_HEADER_DTYPE,
-            )
             shared.camera_ring.write(
-                header=header,
+                timestamp_ns=min(last_advance_ns),
+                color_frame_number=frame.color_frame_number,
                 rgb=frame.rgb,
                 depth=frame.depth_aligned_to_color_raw,
             )

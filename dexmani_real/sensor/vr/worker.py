@@ -105,7 +105,7 @@ def run_vr_worker(shared, config: VRParams) -> None:
                     landmarks=landmarks,
                     head_pos=head_pos,
                     head_quat_wxyz=head_quat_wxyz,
-                    head_recv_ts_ns=np.uint64(head_recv_ts_ns),
+                    head_recv_ts_ns=head_recv_ts_ns,
                     recv_ts_ns=recv_ts_ns,
                     sequence_id=sequence_id,
                 )

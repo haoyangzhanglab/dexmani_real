@@ -6,16 +6,14 @@ import logging
 import time
 from typing import TYPE_CHECKING, cast
 
-import numpy as np
-
 from dexmani_real.geometry.camera import CameraSnapshot
 from dexmani_real.perception.pointcloud.config import PointCloudConfig
 from dexmani_real.perception.pointcloud.processing import build_point_cloud
 from dexmani_real.utils.log import configure_logging
 
 if TYPE_CHECKING:
-    from dexmani_real.ipc.channels import SensorChannels
-    from dexmani_real.ipc.ring import SharedMemoryRingBuffer
+    from dexmani_real.ipc.ring import SharedRing
+    from dexmani_real.ipc.sensors import SensorChannels
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +33,9 @@ def run_pointcloud_worker(
     )
 
     last_camera_sequence = 0
-    ready = False
-    # PolicySession starts this worker only with point-cloud storage; SensorChannels
-    # requires camera storage for that allocation. Both handles live for the process.
-    camera_ring = cast("SharedMemoryRingBuffer", shared.camera_ring)
-    pointcloud_ring = cast("SharedMemoryRingBuffer", shared.pointcloud_ring)
+    # 会话仅在相机和点云通道均已分配时启动本进程。
+    camera_ring = cast("SharedRing", shared.camera_ring)
+    pointcloud_ring = cast("SharedRing", shared.pointcloud_ring)
 
     try:
         while shared.is_running.value:
@@ -47,20 +43,16 @@ def run_pointcloud_worker(
             if latest_sequence <= last_camera_sequence:
                 time.sleep(IDLE_POLL_S)
                 continue
-            result = camera_ring.read_latest()
+            result = camera_ring.read(sequence=latest_sequence)
             if result is None:
                 time.sleep(IDLE_POLL_S)
                 continue
-            data, camera_published_ns, camera_sequence = result
-            color, depth_raw = data["rgb"][0], data["depth"][0]
-            if camera_sequence <= last_camera_sequence:
-                continue
+            data, camera_sequence = result
             last_camera_sequence = camera_sequence
 
-            processing_started_ns = time.monotonic_ns()
             cloud = build_point_cloud(
-                depth_raw=depth_raw,
-                color=color,
+                depth_raw=data["depth"],
+                color=data["rgb"],
                 depth_scale_m=camera.depth_scale_m,
                 intrinsics=camera.color,
                 T_xarm_base_from_color=camera.T_xarm_base_from_color,
@@ -69,19 +61,14 @@ def run_pointcloud_worker(
             )
             if cloud is None:
                 continue
-            camera_header = data["header"][0]
-            # Processing must not refresh the camera's original observation time.
+            # 点云处理保留相机的原始来源时间。
             pointcloud_ring.write(
-                source_camera_sequence=np.uint64(camera_sequence),
-                timestamp_ns=camera_header["timestamp_ns"],
-                camera_received_ns=camera_header["received_ns"],
-                camera_published_ns=np.uint64(camera_published_ns),
-                processing_started_ns=np.uint64(processing_started_ns),
+                source_camera_sequence=camera_sequence,
+                timestamp_ns=data["timestamp_ns"],
                 point_cloud=cloud,
             )
-            if not ready:
+            if not shared.pointcloud_ready.is_set():
                 shared.pointcloud_ready.set()
-                ready = True
                 logger.debug(
                     "run_pointcloud_worker: ready (shape=(%d,6), frame=xarm_base)",
                     pointcloud.num_points,

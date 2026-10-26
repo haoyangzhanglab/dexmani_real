@@ -22,7 +22,7 @@ from dexmani_real.calibration.vr_alignment import (
     quality_measurements,
 )
 from dexmani_real.geometry.pose import forward_from_quat_wxyz
-from dexmani_real.ipc.channels import SensorChannels
+from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.runtime.config import RuntimeTimeouts
 from dexmani_real.runtime.observation import read_vr_frame
 from dexmani_real.runtime.sensor_processes import SensorProcesses

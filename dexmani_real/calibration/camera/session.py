@@ -40,7 +40,7 @@ from dexmani_real.control.online_ik import (
     make_online_ik_solver,
 )
 from dexmani_real.control.target_validation import TargetChecker
-from dexmani_real.ipc.channels import SensorChannels
+from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.system import DexManiRobot
 from dexmani_real.runtime.motion.home import execute_arm_home
