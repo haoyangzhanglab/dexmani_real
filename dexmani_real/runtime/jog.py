@@ -22,8 +22,8 @@ if TYPE_CHECKING:
 class JogController:
     """持有成功提交的目标参考；跟踪误差不改变操作者目标。"""
 
-    def __init__(self, solver, target_checker, config, workspace):
-        self.solver, self.target_checker = solver, target_checker
+    def __init__(self, solver, config, workspace):
+        self.solver = solver
         self.config = config
         self.position_lower = workspace[:, 0] + config.workspace_command_margin_m
         self.position_upper = workspace[:, 1] - config.workspace_command_margin_m
@@ -41,7 +41,7 @@ class JogController:
         baseline_qpos, baseline_pose = self.command_qpos, self.command_pose
         if baseline_pose is None:
             baseline_qpos = measured_qpos
-            baseline_pose = self.solver.kin.compute_eef_pose_base(measured_qpos)
+            baseline_pose = self.solver.compute_eef_pose_base(measured_qpos)
         dx, drpy = compute_cartesian_jog_delta(
             pressed_keys, self.config.delta_pos_m, self.config.delta_rpy_rad
         )
@@ -51,10 +51,9 @@ class JogController:
         )
         result = None
         if changed:
-            self.solver.collision_model.set_hand_qpos(hand_qpos)
             result = self.solver.solve(
                 pose, measured_qpos, baseline_qpos,
-                endpoint_rejection=self.target_checker.endpoint_rejection,
+                hand_qpos=hand_qpos,
             )
         if result is None or not result.success or result.qpos is None:
             self.blocked_until_release = True

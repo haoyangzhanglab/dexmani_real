@@ -36,7 +36,7 @@ def resolve_table_plane(
     plane_path = resolve_table_plane_path(table)
     with plane_path.open(encoding="utf-8") as stream:
         plane = json.load(stream)
-    coefficients = tuple(float(plane[k]) for k in ("a", "b", "c", "d"))
+    coefficients = (float(plane["a"]), float(plane["b"]), float(plane["c"]), float(plane["d"]))
     if not np.isfinite(coefficients).all():
         raise ValueError("table plane must be finite")
     norm = np.linalg.norm(coefficients[:3])

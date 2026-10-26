@@ -1,7 +1,6 @@
-"""Fixed arm channels and low-rate lifecycle messages shared by parent and child."""
+"""机械臂共享通道、反馈布局与低频操作消息。"""
 
 from dataclasses import dataclass
-from enum import Enum
 
 import numpy as np
 
@@ -36,12 +35,6 @@ STATUS_DTYPE = np.dtype(
 )
 
 
-class OperationStatus(str, Enum):
-    COMPLETED = "completed"
-    CANCELLED = "cancelled"
-    FAILED = "failed"
-
-
 @dataclass(frozen=True)
 class PrepareRequest:
     operation_id: int
@@ -54,10 +47,50 @@ class HomeRequest:
     run_id: int
     waypoints: np.ndarray
     target: np.ndarray
+    deadline_ns: int
 
 
 @dataclass(frozen=True)
 class LifecycleReply:
     operation_id: int
-    status: OperationStatus
-    detail: str = ""
+    error: Exception | None = None
+
+
+class ArmChannels:
+    def __init__(
+        self, ctx, *, run_signal, stop_signal, emergency_signal, signal_lock, input_signal=None
+    ):
+        self.run_id, self.stop, self.emergency = run_signal, stop_signal, emergency_signal
+        self.signal_lock = signal_lock
+        self.input_generation = input_signal if input_signal is not None else ctx.Value("q", -1)
+        self.closing, self.stopped, self.ready = (ctx.Event() for _ in range(3))
+        self.connected = ctx.Event()
+        self.fault = ctx.Array("c", 1024, lock=False)
+        self.close_error = ctx.Array("c", 1024, lock=False)
+        self.health_until = ctx.Value("q", 0)
+        self.execution_limit = ctx.Array("q", [MAX_TIME, 0])  # 截止时间、最后受影响的命令序号
+        self.goal_lock, self.status_lock = ctx.Lock(), ctx.Lock()
+        self.goal = ctx.RawArray("b", GOAL_DTYPE.itemsize)
+        self.status = ctx.RawArray("b", STATUS_DTYPE.itemsize)
+
+    def take_goal(self, *, block=False):
+        if not self.goal_lock.acquire(block):
+            return None  # 父进程持锁时跳过本次读取，不阻塞伺服。
+        try:
+            slot = np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)
+            if not slot["sequence"][0]:
+                return None
+            goal = slot[0].copy()
+            slot["sequence"][0] = 0
+            return goal
+        finally:
+            self.goal_lock.release()
+
+    def read_status(self):
+        with self.status_lock:
+            return np.frombuffer(self.status, dtype=STATUS_DTYPE, count=1)[0].copy()
+
+    def publish(self, status):
+        # 锁内只复制快照，不执行 SDK I/O。
+        with self.status_lock:
+            np.frombuffer(self.status, dtype=STATUS_DTYPE, count=1)[0] = status

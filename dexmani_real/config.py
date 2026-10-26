@@ -12,14 +12,14 @@ import yaml
 
 from dexmani_real.control.config import (
     EnvironmentConfig,
-    MotionParams,
+    MotionConfig,
     StaticCollisionBox,
 )
 from dexmani_real.deployment.config import ExecutionConfig
 from dexmani_real.perception.hand_config import HandPointCloudConfig
 from dexmani_real.perception.pointcloud.config import PointCloudConfig
-from dexmani_real.robot.xarm7.config import ArmParams
-from dexmani_real.robot.xhand.config import HandParams
+from dexmani_real.robot.xarm7.config import ArmConfig
+from dexmani_real.robot.xhand.config import HandConfig
 from dexmani_real.sensor.camera.config import CameraParams
 from dexmani_real.sensor.vr.config import VRParams
 from dexmani_real.teleop.config import (
@@ -36,9 +36,9 @@ class ExperimentConfig:
     """Experiment values loaded together and validated at their usage boundaries."""
 
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
-    arm: ArmParams = field(default_factory=ArmParams)
-    hand: HandParams = field(default_factory=HandParams)
-    motion: MotionParams = field(default_factory=MotionParams)
+    arm: ArmConfig = field(default_factory=ArmConfig)
+    hand: HandConfig = field(default_factory=HandConfig)
+    motion: MotionConfig = field(default_factory=MotionConfig)
     teleop: TeleopParams = field(default_factory=TeleopParams)
     collection: CollectionOptions = field(default_factory=CollectionOptions)
     keyboard_teleop: KeyboardTeleopParams = field(default_factory=KeyboardTeleopParams)

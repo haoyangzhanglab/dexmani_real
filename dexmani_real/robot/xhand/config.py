@@ -1,5 +1,3 @@
-"""XHand parameters and nested rated, mechanical and command limits."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,38 +5,14 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.geometry.transforms import validate_unit_quaternion_wxyz
-from dexmani_real.robot.model import HAND_JOINT_SHAPE, XHAND_FINGERTIP_LINK_NAMES
-
-XHAND_RATED_QPOS_MIN_RAD: tuple[float, ...] = (
-    0.0,
-    -0.698,
-    0.0,
-    -0.174,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
+from dexmani_real.robot.model import (
+    HAND_JOINT_SHAPE,
+    XHAND_RATED_QPOS_MAX_RAD,
+    XHAND_RATED_QPOS_MIN_RAD,
 )
 
-
-XHAND_RATED_QPOS_MAX_RAD: tuple[float, ...] = (
-    1.832,
-    1.745,
-    1.745,
-    0.174,
-    1.919,
-    1.919,
-    1.919,
-    1.919,
-    1.919,
-    1.919,
-    1.919,
-    1.919,
-)
+SERIAL_SETTLE_S = 1.0
+INITIAL_STATE_TIMEOUT_S = 1.0
 
 
 def validate_hand_command_bounds(
@@ -46,7 +20,6 @@ def validate_hand_command_bounds(
     operational_lower: object,
     operational_upper: object,
 ) -> np.ndarray:
-    """Check one endpoint against startup-validated operational bounds."""
     command = np.asarray(hand_cmd, dtype=np.float64)
     op_lower = np.asarray(operational_lower, dtype=np.float64)
     op_upper = np.asarray(operational_upper, dtype=np.float64)
@@ -60,7 +33,7 @@ def validate_hand_command_bounds(
 
 
 @dataclass(frozen=True)
-class HandParams:
+class HandConfig:
     enabled: bool = True
     ethercat_slave_position: int = -1
 
@@ -68,7 +41,6 @@ class HandParams:
     device_name: str | None = "/dev/ttyUSB0"
     baudrate: int = 3_000_000
     device_id: int = 0
-    rs485_post_open_settle_s: float = 1.0
 
     home_qpos_deg: tuple[float, ...] = (
         30.0,
@@ -84,9 +56,6 @@ class HandParams:
         1.33,
         5.0,
     )
-
-    mechanical_qpos_min_rad: tuple[float, ...] = XHAND_RATED_QPOS_MIN_RAD
-    mechanical_qpos_max_rad: tuple[float, ...] = XHAND_RATED_QPOS_MAX_RAD
 
     qpos_min_rad: tuple[float, ...] = (
         0.0,
@@ -121,7 +90,7 @@ class HandParams:
     ki: int = 0
     kd: int = 0
 
-    # Mode 3 SDK output scale: 0–400, with 400 = 100% output (not mA).
+    # Mode 3 输出范围为 0–400，400 表示 100%，单位不是 mA。
     tor_max: tuple[int, ...] = (
         360,
         300,
@@ -137,15 +106,12 @@ class HandParams:
         300,
     )
 
-    # Maximum age of consumed joint/tactile feedback, measured with monotonic time.
     feedback_max_age_s: float = 4 / 30
-    initial_state_timeout_s: float = 1.0  # Only acquisition after connect/session start/reset.
 
     home_timeout_s: float = 2.0
     home_tolerance_deg: float = 5.0
 
-    fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
-    # Real-pose FK uses a 10 mm thinner mount (-0.015 m); planning keeps the nominal -0.005 m URDF.
+    # 实测 FK 安装偏移为 -0.015 m，规划保留标称 URDF 的 -0.005 m。
     T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
     T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = (
         0.707107,
@@ -171,8 +137,6 @@ class HandParams:
             raise ValueError("hand baudrate must be a positive integer")
         if not isinstance(self.device_id, int) or self.device_id < 0:
             raise ValueError("hand device_id must be a non-negative integer")
-        if not np.isfinite(self.rs485_post_open_settle_s) or self.rs485_post_open_settle_s < 0:
-            raise ValueError("hand rs485_post_open_settle_s must be finite and non-negative")
         self.validate_home_pose()
         if len(self.kp) != 12 or any(not isinstance(value, int) or value <= 0 for value in self.kp):
             raise ValueError("hand kp must contain twelve positive integer gains")
@@ -186,43 +150,24 @@ class HandParams:
             )
         for name in (
             "feedback_max_age_s",
-            "initial_state_timeout_s",
             "home_timeout_s",
             "home_tolerance_deg",
         ):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"hand {name} must be finite and positive")
-        if len(self.fingertip_link_names) != 5 or any(
-            not name for name in self.fingertip_link_names
-        ):
-            raise ValueError("hand fingertip_link_names must contain five non-empty names")
         position = np.asarray(self.T_eef_handbase_pos_xyz, dtype=np.float64)
         if position.shape != (3,) or not np.all(np.isfinite(position)):
             raise ValueError("hand base position must be a finite (3,) vector")
         validate_unit_quaternion_wxyz(self.T_eef_handbase_quat_wxyz, name="hand base quaternion")
 
     def validate_home_pose(self) -> None:
-        """Validate the configured collision posture, including when XHand is disconnected."""
-        bounds = np.asarray(
-            (
-                self.qpos_min_rad, self.qpos_max_rad,
-                self.mechanical_qpos_min_rad, self.mechanical_qpos_max_rad,
-            ),
-            dtype=np.float64,
-        )
-        if bounds.shape != (4, 12) or not np.isfinite(bounds).all():
-            raise ValueError("hand command and mechanical limits must each contain 12 finite values")
-        command_lower, command_upper, mechanical_lower, mechanical_upper = bounds
-        if np.any(command_lower >= command_upper) or np.any(mechanical_lower >= mechanical_upper):
-            raise ValueError("hand command and mechanical limits must have lower < upper")
-        if np.any(mechanical_lower < XHAND_RATED_QPOS_MIN_RAD) or np.any(
-            mechanical_upper > XHAND_RATED_QPOS_MAX_RAD
-        ):
-            raise ValueError("hand mechanical limits cannot exceed the rated device envelope")
-        if np.any(command_lower < mechanical_lower) or np.any(command_upper > mechanical_upper):
-            raise ValueError("hand command limits must be inside mechanical limits")
-        validate_hand_command_bounds(
-            np.deg2rad(np.asarray(self.home_qpos_deg, dtype=np.float64)),
-            command_lower,
-            command_upper,
-        )
+        """手部禁用时仍须验证规划使用的固定姿态。"""
+        bounds = np.asarray((self.qpos_min_rad, self.qpos_max_rad), dtype=np.float64)
+        if bounds.shape != (2, 12) or not np.isfinite(bounds).all():
+            raise ValueError("hand command limits must each contain 12 finite values")
+        lower, upper = bounds
+        if np.any(lower >= upper):
+            raise ValueError("hand command limits must have lower < upper")
+        if np.any(lower < XHAND_RATED_QPOS_MIN_RAD) or np.any(upper > XHAND_RATED_QPOS_MAX_RAD):
+            raise ValueError("hand command limits exceed the rated device envelope")
+        validate_hand_command_bounds(np.deg2rad(self.home_qpos_deg), lower, upper)

@@ -14,7 +14,10 @@ from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.recorder import RecordingError
 from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import RobotError
-from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
+from dexmani_real.robot.model import (
+    XHAND_FINGERTIP_LINK_NAMES,
+    XHAND_RIGHT_URDF_PATH,
+)
 from dexmani_real.robot.system import DexManiRobot
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
@@ -88,7 +91,7 @@ def run_teleop(
         ema_alpha_rot=runtime.teleop.ema_alpha_rot,
     )
     home_planner = HomePlanner(
-        runtime.environment, table_plane_abcd=table_plane_abcd,
+        runtime.environment, runtime.arm, table_plane_abcd=table_plane_abcd,
     )
     camera_calibration = (
         load_optional_camera_extrinsics(camera_calibration_path)
@@ -216,7 +219,7 @@ def build_hand_retargeter(runtime):
         from dexmani_real.teleop.retargeting.tag import TAGHandRetargeter
 
         return TAGHandRetargeter(
-            fingertip_link_names=runtime.hand.fingertip_link_names,
+            fingertip_link_names=XHAND_FINGERTIP_LINK_NAMES,
             tag_config=runtime.tag_retargeting,
             urdf_path=str(XHAND_RIGHT_URDF_PATH),
         )

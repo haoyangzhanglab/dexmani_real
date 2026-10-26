@@ -22,7 +22,7 @@ from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
 )
-from dexmani_real.robot.xhand.config import HandParams, validate_hand_command_bounds
+from dexmani_real.robot.xhand.config import HandConfig, validate_hand_command_bounds
 from dexmani_real.robot.xhand.driver import XHand
 from dexmani_real.utils.log import configure_logging
 
@@ -65,7 +65,7 @@ PRESET_QPOS_DEG = {
 }
 
 
-def action_sequence(config: HandParams) -> list[tuple[str, np.ndarray]]:
+def action_sequence(config: HandConfig) -> list[tuple[str, np.ndarray]]:
     actions = (
         ("HOME", config.home_qpos_deg),
         ("fist", PRESET_QPOS_DEG["fist"]),
@@ -88,7 +88,7 @@ def action_sequence(config: HandParams) -> list[tuple[str, np.ndarray]]:
 class XHandControlExample(XHand):
     """Inspect and exercise the same read/send/stop path used by the runtime."""
 
-    def __init__(self, config: HandParams, *, cancel_requested=lambda: False) -> None:
+    def __init__(self, config: HandConfig, *, cancel_requested=lambda: False) -> None:
         super().__init__(config)
         self.cancel_requested = cancel_requested
         self.motion_pending = False
@@ -96,16 +96,6 @@ class XHandControlExample(XHand):
     def check_cancelled(self) -> None:
         if self.cancel_requested():
             raise InterruptedError("XHand action sequence interrupted")
-
-    def connect(self) -> int | None:
-        if self.cfg.comm_type == "serial" and self.cfg.device_name is not None:
-            problem = serial_port_problem(self.cfg.device_name)
-            if problem is not None:
-                raise RuntimeError(problem)
-        self.check_cancelled()
-        deadline_ns = super().connect(cancel_requested=self.cancel_requested)
-        self.check_cancelled()
-        return deadline_ns
 
     @staticmethod
     def header(title: str) -> None:
@@ -226,7 +216,7 @@ def serial_port_problem(serial_port: str) -> str | None:
     return None
 
 
-def run_hardware_session(config: HandParams, *, finger_id: int, read_only: bool) -> int:
+def run_hardware_session(config: HandConfig, *, finger_id: int, read_only: bool) -> int:
     # Validate every endpoint before connecting, including narrowed experiment limits.
     actions = [] if read_only else action_sequence(config)
     configure_logging()
@@ -246,7 +236,12 @@ def run_hardware_session(config: HandParams, *, finger_id: int, read_only: bool)
     }
     result = 0
     try:
-        hand.connect()
+        if config.comm_type == "serial" and config.device_name is not None:
+            problem = serial_port_problem(config.device_name)
+            if problem is not None:
+                raise RuntimeError(problem)
+        hand.check_cancelled()
+        hand.connect(cancel_requested=hand.cancel_requested)
         hand.check_cancelled()
         hand.read_sdk_version()
         hand.read_device_info()

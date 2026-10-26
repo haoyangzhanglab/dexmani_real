@@ -12,7 +12,7 @@ from dexmani_real.control.action_mapping import (
     project_arm_command,
     project_hand_command,
 )
-from dexmani_real.control.joint_angles import wrap_nearest_equivalent
+from dexmani_real.control.constraints import wrap_nearest_equivalent
 from dexmani_real.replay.capture import ReplayRecorder
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
 from dexmani_real.runtime.observation import (
@@ -357,7 +357,7 @@ class TrajectoryReplayer:
                     if step == steps
                     else hand_start + weight * (hand_target - hand_start)
                 )
-                rejection = self.action_mapper.target_checker.rejection(
+                rejection = self.action_mapper.constraints.rejection(
                     arm_hold,
                     row.arm["qpos"][0],
                     arm_hold,

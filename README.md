@@ -43,7 +43,7 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 实验配置使用 `from dexmani_real.config import load_experiment_config`，覆盖优先级为 CLI > YAML > dataclass 默认值。配置加载不读取标定或连接设备，运行约束在使用边界验证。`environment.table.plane_path` 的相对路径以仓库根目录解析；显式指定的必需标定缺失时直接报错。VR 标定脚本的 `--force` 仅允许将低质量结果导出到显式指定、非默认且未占用的 `--output` 文件；遥操作启动仍拒绝低质量标定。
 
-机器人会话在 preflight 统一检查设备、HOME 和实际启用的碰撞配置；相机及 XHand 独立工具在自己的入口检查。内部 driver、executor 和计算函数接收已经通过入口检查的配置与标定，不重复预检。新的 SDK 反馈、模型输出、文件数据及最终发送目标仍在各自边界校验。`--print-config` 仅展示声明值；`run_policy()` 在加载策略前检查运行轮数和时长。
+机器人会话在 preflight 统一检查设备、HOME、工作空间及实际启用的碰撞配置；相机及 XHand 独立工具在自己的入口检查。内部 driver、controller 和计算函数接收已经通过入口检查的配置与标定，不重复预检。新的 SDK 反馈、模型输出、文件数据及最终发送目标仍在各自边界校验。`--print-config` 仅展示声明值；`run_policy()` 在加载策略前检查运行轮数和时长。
 
 ## 代码导航
 
@@ -51,9 +51,15 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 部署保留 `deployment/run.py → session.py → rollout/episode.py`：入口装配配置，会话持有设备和模型，单轮协调观测、提交与录制。`rollout/action_schedule.py` 只根据传入的时钟与状态决定 sync/async/RTC 调度，`inference.py` 独占模型线程。回放的帧索引一致性指标位于 [`replay/consistency.py`](dexmani_real/replay/consistency.py)。
 
-`control/joint_angles.py` 统一关节等价角、绝对跳变阈值和关节目标拒绝规则，由 `target_validation.py` 与 `online_ik.py` 直接使用；纯关节检查不依赖 IK 求解器。
+`control/constraints.py` 统一等价角、绝对跳变和 `MotionConstraints` 端点约束。`control/ik.py` 的 `IKSolver` 接收共享约束、位置和旋转容差，`solve(..., hand_qpos=...)` 显式指定碰撞手姿；动作映射、键盘 jog 和相机标定共用这一接口。
+
+IK 保留上一命令、实测状态及正负零空间初值；评分只使用关节距离和限位惩罚，搜索权重与步长固定在算法模块。位姿误差用于容差准入，SVD 只用于生成零空间方向。候选 FK 同时用于误差和工作空间检查，碰撞模型统一管理自碰撞、静态障碍和可选桌面。`HomePlanner(environment, arm, table_plane_abcd=...)` 与执行器共用 `ArmConfig` 的运行限位、到位容差及桌面间隙配置；`plan(current, target)` 保留三种关节路径、1° 采样及绝对等价分支对齐。无需移动的 HOME 仍检查几何约束，并由实测反馈确认停稳。
 
 点云的 RGB-D 处理流程位于 `perception/pointcloud/processing.py`，体素聚合、连通域过滤和采样位于 `sampling.py`，诊断输出与性能测量位于 `diagnostics.py`。XHand 的 SDK 载荷解析、反馈布局与缓存位于 `robot/xhand/feedback.py`；机械臂反馈布局位于 `robot/xarm7/protocol.py`。
+
+机械臂由 `robot/xarm7/client.py` 的 `ArmClient` 提交目标，`worker.py` 的 `ArmController` 独占 SDK 与默认 100 Hz 伺服，Ruckig 负责连续参考。共享通道及操作消息集中在 `protocol.py`；HOME 总截止时间从运行层传到父、子进程，取消使用同一个停止信号。操作回复直接携带超时、取消或设备异常，保留失败原因；停止失败始终作为设备故障报告。
+
+控制与设备配置类使用 `MotionConfig`、`ArmConfig`、`HomingConfig`、`HandConfig`。SDK 超时和伺服间隔预算均固定为 20 ms，进程等待为 3 s；HOME 的到位附加预算、稳定持续时间、收敛等待分别为 0.5、0.3、15 s，轮询周期使用机械臂反馈频率。XHand 串口稳定等待和初始反馈等待均为 1 s。这些预算不再接受 YAML 覆盖；机械限位和指尖名称由 `robot/model.py` 提供，实验仍可配置运行关节限位、控制频率、HOME 姿态、收敛容差及硬件增益。
 
 `JogController.submit()` 负责输入代际、运动授权和提交后参考更新。录制使用 `AsyncEpisodeRecorder.finish()` 显式指定保存意图、终止原因和技术状态。
 
@@ -84,6 +90,8 @@ teleop:
 VR 接收器在发布前拒绝无效传感数据。映射器按已接纳的观测建立锚点，映射或重置发生技术错误时直接抛出异常；重置失败会清除旧锚点。遥操作控制器复用动作检查器的 FK 初始化 VR 锚点与 EMA，EMA 只在命令正常提交后更新参考。
 
 IK 使用入口明确提供的运行关节限位，正常无解返回 `IKResult`，求解器、FK 或碰撞后端故障直接抛出原始异常。HOME 仅对 `HomePathRejected` 表示的几何拒绝尝试其他候选路径，候选耗尽、取消或等待超时返回失败结果；非法目标与技术异常传播到会话错误处理和收尾边界。
+
+XHand 保留 serial 与 EtherCAT，连接失败直接报告，不自动重试。普通发送遇到 CRC 只等待下一条目标，持续失败超过反馈预算即报错；停止请求可在 0.25 s 内重发。状态码明确不可用的触觉被屏蔽，有限向量缓存保留原始来源时间；SDK 结构错误和复位调用异常直接传播。连接清理失败不会覆盖初始错误，未释放的句柄仍由设备对象保留。
 
 回放先保存实测数据，再计算并写入指标。没有有效样本的指标显式记为 `null`；计算产生的非有限数值由 JSON 写入边界拒绝并报告评估失败，保留已保存的实测数据。
 
@@ -121,7 +129,7 @@ git diff --check
 ruff check --no-cache --isolated --select E9,F dexmani_real scripts tests third_party/cordvip_geometry/src
 mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases \
   dexmani_real/ipc dexmani_real/sensor/camera/worker.py \
-  dexmani_real/geometry dexmani_real/perception dexmani_real/control \
+  dexmani_real/geometry dexmani_real/perception dexmani_real/control dexmani_real/robot \
   dexmani_real/calibration dexmani_real/runtime dexmani_real/deployment \
   dexmani_real/data/session_results.py dexmani_real/data/raw/reader.py \
   dexmani_real/teleop/runner.py dexmani_real/replay/replayer.py \
@@ -129,6 +137,8 @@ mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases \
 ```
 
 mypy 按现有类型标注检查上述模块，不检查未标注函数体或外部无类型声明的 SDK；不能替代数值与运行边界测试。
+
+`tests/test_control.py` 使用真实模型和可控求解结果检查 IK、碰撞、HOME 及策略动作格式；`tests/test_robot.py` 使用假 SDK 和进程管道检查时效、取消、异常传递、停止、CRC 和资源收尾，并验证真实 Ruckig 的连续性与制动限位。测试不会连接机器人，需要已安装 Pinocchio、MPlib、HPP-FCL 和 Ruckig。
 
 键盘遥操作入口保留 `--help`，没有 `--print-config` 参数。
 

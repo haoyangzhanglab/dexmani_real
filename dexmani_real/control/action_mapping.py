@@ -1,22 +1,18 @@
-"""Map absolute targets to joint commands; downstream execution owns motion authority."""
+"""动作映射只生成目标，执行授权由运行层管理。"""
 
 from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 
-from dexmani_real.control.joint_angles import wrap_nearest_equivalent
-from dexmani_real.control.online_ik import (
-    OnlineIKConfig,
-    make_online_ik_solver,
-)
-from dexmani_real.control.target_validation import TargetChecker
+from dexmani_real.control.constraints import MotionConstraints, wrap_nearest_equivalent
+from dexmani_real.control.ik import IKSolver
 from dexmani_real.geometry.pose import Pose
 
 
 @dataclass(frozen=True)
 class ActionIntent:
-    """Absolute joint targets or an xArm-base EEF pose in meters with WXYZ rotation."""
+    """机械臂绝对关节目标或基座系 EEF 位姿，位置单位 m、旋转为 WXYZ。"""
 
     mode: Literal["joint", "eef"]
     arm: np.ndarray | Pose
@@ -35,7 +31,7 @@ class ActionResult:
 class ActionMapper:
     def __init__(
         self,
-        target_checker,
+        constraints,
         *,
         hand_enabled,
         hand_lower_rad,
@@ -43,7 +39,7 @@ class ActionMapper:
         home_hand_qpos,
         solver=None,
     ):
-        self.target_checker, self.solver = target_checker, solver
+        self.constraints, self.solver = constraints, solver
         self.hand_enabled = hand_enabled
         self.hand_lower = np.array(hand_lower_rad, dtype=np.float64, copy=True)
         self.hand_upper = np.array(hand_upper_rad, dtype=np.float64, copy=True)
@@ -51,38 +47,30 @@ class ActionMapper:
 
     @classmethod
     def for_mode(cls, mode, *, arm, hand, motion, environment):
-        """Online geometry permits table contact; HOME owns its separate path scene."""
+        """在线允许桌面接触，HOME 使用独立场景。"""
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
         from dexmani_real.control.collision import CollisionModel
 
-        static_boxes = environment.static_boxes
-        solver = None
-        if mode == "eef":
-            solver = make_online_ik_solver(
-                OnlineIKConfig(
-                    max_pose_error_pos_m=motion.ik_max_pose_error_pos_m,
-                    max_pose_error_rot_rad=motion.ik_max_pose_error_rot_rad,
-                    operational_joint_lower_rad=tuple(arm.joint_limit_lower),
-                    operational_joint_upper_rad=tuple(arm.joint_limit_upper),
-                ),
-                static_boxes=static_boxes,
-            )
-        collision = (
-            solver.collision_model
-            if solver is not None
-            else CollisionModel(static_boxes=static_boxes)
-        )
-        checker = TargetChecker(
+        collision = CollisionModel(static_boxes=environment.static_boxes)
+        constraints = MotionConstraints(
             collision,
             joint_lower_rad=arm.joint_limit_lower,
             joint_upper_rad=arm.joint_limit_upper,
             workspace=environment.workspace.as_array(),
             workspace_margin_m=environment.eef_workspace_margin_m,
-            dynamic_rejection=solver.dynamic_rejection if solver is not None else None,
+        )
+        solver = (
+            IKSolver(
+                constraints,
+                position_tolerance=motion.ik_max_pose_error_pos_m,
+                rotation_tolerance=motion.ik_max_pose_error_rot_rad,
+            )
+            if mode == "eef"
+            else None
         )
         return cls(
-            checker,
+            constraints,
             solver=solver,
             hand_enabled=hand.enabled,
             hand_lower_rad=hand.qpos_min_rad,
@@ -92,7 +80,7 @@ class ActionMapper:
 
     def joint_rejection(self, target, hand, current, previous):
         physical_hand = hand if hand is not None else self.home_hand_qpos
-        return self.target_checker.rejection(
+        return self.constraints.rejection(
             target, current, previous, collision_hand_qpos=physical_hand
         )
 
@@ -117,7 +105,7 @@ class ActionMapper:
         return current, previous, hand
 
     def prepare_joint_target(self, arm, hand, current_arm_qpos, previous_arm_command_qpos=None):
-        """保留投影候选；拒绝原因必须在发送前处理。"""
+        """保留投影候选，调用方必须在发送前处理拒绝原因。"""
         arm = np.asarray(arm, dtype=np.float64)
         if arm.shape != (7,) or not np.isfinite(arm).all():
             raise ValueError("joint intent must be a finite (7,) vector")
@@ -127,8 +115,8 @@ class ActionMapper:
         target = project_arm_command(
             arm,
             current,
-            joint_lower_rad=self.target_checker.limits[:, 0],
-            joint_upper_rad=self.target_checker.limits[:, 1],
+            joint_lower_rad=self.constraints.limits[:, 0],
+            joint_upper_rad=self.constraints.limits[:, 1],
         )
         return target, hand, self.joint_rejection(target, hand, current, previous)
 
@@ -147,18 +135,15 @@ class ActionMapper:
         )
         if self.solver is None:
             raise ValueError("EEF mapping requires an online IK solver")
-        # Project an owned pose so the source target and teleop EMA reference stay unchanged.
+        # 复制后投影，避免改写输入目标及 Teleop 的 EMA 参考。
         pose = intent.arm.copy()
-        workspace = self.target_checker.workspace
+        workspace = self.constraints.workspace
         pose.p = np.clip(pose.p, workspace[:, 0], workspace[:, 1])
-        self.solver.collision_model.set_hand_qpos(
-            hand if hand is not None else self.home_hand_qpos
-        )
         result = self.solver.solve(
             pose,
             current,
             previous,
-            endpoint_rejection=self.target_checker.endpoint_rejection,
+            hand_qpos=hand if hand is not None else self.home_hand_qpos,
         )
         reason = None if result.success else result.reason
         return ActionResult(
@@ -171,20 +156,20 @@ class ActionMapper:
     def control_from_command(self, command, mode):
         if mode == "joint":
             return np.concatenate((command.arm_qpos, command.hand_qpos))
-        position, rotation = self.target_checker.target_fk.compute(command.arm_qpos)
+        position, rotation = self.constraints.target_fk.compute(command.arm_qpos)
         return np.concatenate((position, rotation, command.hand_qpos))
 
     def frozen_rejection(self, command, current, previous, mode):
         previous = current if previous is None else previous
-        # Reprojection after preparation would change the reserved equivalent branch.
+        # 已准备的目标不能重新选择等价分支。
         projected = (
             command.arm_qpos
             if mode == "eef"
             else project_arm_command(
                 command.arm_qpos,
                 current,
-                joint_lower_rad=self.target_checker.limits[:, 0],
-                joint_upper_rad=self.target_checker.limits[:, 1],
+                joint_lower_rad=self.constraints.limits[:, 0],
+                joint_upper_rad=self.constraints.limits[:, 1],
             )
         )
         if not np.array_equal(projected, command.arm_qpos):

@@ -1,5 +1,3 @@
-"""运动容差、机器人基座系 Workspace 与静态环境参数。"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -12,15 +10,13 @@ from dexmani_real.geometry.transforms import validate_unit_quaternion_wxyz
 
 
 @dataclass(frozen=True)
-class MotionParams:
+class MotionConfig:
     ik_max_pose_error_pos_m: float = 0.02
     ik_max_pose_error_rot_rad: float = radians(5.0)
 
 
 @dataclass(frozen=True)
 class WorkspaceBounds:
-    """EEF workspace bounds in arm-base frame (meters)."""
-
     x_min: float = 0.25
     x_max: float = 0.72
     y_min: float = -0.50
@@ -29,7 +25,6 @@ class WorkspaceBounds:
     z_max: float = 0.50
 
     def as_array(self) -> np.ndarray:
-        """Return finite, strictly ordered (3,2) bounds as an owned mutable array."""
         bounds = np.array(
             [
                 [self.x_min, self.x_max],
@@ -45,8 +40,6 @@ class WorkspaceBounds:
 
 @dataclass(frozen=True)
 class StaticCollisionBox:
-    """Static box in xArm base: full side lengths and box-local→base WXYZ rotation."""
-
     name: str = "obstacle"
     center_xyz_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
     size_xyz_m: tuple[float, float, float] = (1.0, 1.0, 1.0)
@@ -72,13 +65,11 @@ class StaticCollisionBox:
 
 @dataclass(frozen=True)
 class TableCollisionConfig:
-    """Base-frame plane ax+by+cz+d=0; HOME needs clearance, online control permits table contact."""
-
     enabled: bool = True
     plane_path: str | None = TABLE_PLANE_RELATIVE_PATH
     size_xy_m: tuple[float, float] = (2.0, 2.0)
     thickness_m: float = 0.04
-    # Includes the calibrated flange-model residual.
+    # 包含标定得到的法兰模型残差。
     soft_clearance_m: float = 0.02
     allowed_contact_links: tuple[str, ...] = ("link_base",)
 
@@ -106,3 +97,15 @@ class EnvironmentConfig:
     eef_workspace_margin_m: float = 0.005
     table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
     static_boxes: tuple[StaticCollisionBox, ...] = ()
+
+    def validate(self) -> None:
+        self.workspace.as_array()
+        if not np.isfinite(self.eef_workspace_margin_m) or self.eef_workspace_margin_m < 0:
+            raise ValueError("EEF workspace margin must be finite and nonnegative")
+        if self.table.enabled:
+            self.table.validate()
+        for box in self.static_boxes:
+            box.validate()
+        names = [box.name for box in self.static_boxes]
+        if len(names) != len(set(names)):
+            raise ValueError("static collision box names must be unique")

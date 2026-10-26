@@ -7,8 +7,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.control.homing import HomePathRejected, home_path
+from dexmani_real.control.homing import HomePathRejected
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
+from dexmani_real.robot.xarm7.config import (
+    HOME_CONVERGENCE_TIMEOUT_S,
+    HOME_TARGET_TIMEOUT_S,
+)
 from dexmani_real.runtime.state import SafetyState
 from dexmani_real.utils.timing import sample_is_fresh
 
@@ -64,7 +68,7 @@ def home_arm(state, robot, planner, *, cancel_requested, service):
         )
 
     with _home_motion(state, robot):
-        deadline = time.monotonic() + config.homing.convergence_timeout_s
+        deadline = time.monotonic() + HOME_CONVERGENCE_TIMEOUT_S
         feedback_issue = "fresh stationary arm state unavailable"
         while time.monotonic() < deadline:
             if cancelled():
@@ -74,7 +78,7 @@ def home_arm(state, robot, planner, *, cancel_requested, service):
             feedback_issue = "fresh stationary arm state unavailable"
             if (
                 int(arm_state["timestamp_ns"][0]) > boundary_ns
-                and sample_is_fresh(arm_state["timestamp_ns"][0], config.homing.state_max_age_s)
+                and sample_is_fresh(arm_state["timestamp_ns"][0], config.feedback_max_age_s)
                 and np.max(np.abs(arm_state["qvel"][0])) <= config.homing.velocity_convergence_rad_s
             ):
                 if not hand.enabled:
@@ -96,11 +100,7 @@ def home_arm(state, robot, planner, *, cancel_requested, service):
 
         planner.set_hand_qpos(hand_qpos)
         try:
-            waypoints = home_path(
-                arm_state["qpos"][0], target, planner,
-                table_z_surface_m=config.table_z_surface_m,
-                hand_safety_margin_m=config.hand_safety_margin_m,
-            )
+            waypoints = planner.plan(arm_state["qpos"][0], target)
         except HomePathRejected as exc:
             return HomeResult(False, f"home planning failed: {exc}")
         if cancelled():
@@ -111,26 +111,22 @@ def home_arm(state, robot, planner, *, cancel_requested, service):
             float(np.max(np.abs(np.diff(waypoints, axis=0)), axis=1).sum())
             if len(waypoints) > 1 else 0
         )
-        deadline = time.monotonic() + max(
+        duration_s = max(
             10.0,
             2 * travel / config.homing.max_speed_rad_per_s
-            + len(waypoints) * config.homing.target_timeout_s + 7,
+            + len(waypoints) * HOME_TARGET_TIMEOUT_S + 7,
         )
+        deadline_ns = time.monotonic_ns() + int(duration_s * 1e9)
         try:
-            ok = robot.home_arm(
-                waypoints, target, run_id, lambda: cancelled() or time.monotonic() >= deadline,
-                service=service,
+            robot.home_arm(
+                waypoints, target, run_id, cancelled,
+                service=service, deadline_ns=deadline_ns,
             )
         except OperationCancelled as exc:
-            interrupted = time.monotonic() < deadline
-            return HomeResult(
-                False, str(exc) if interrupted else "arm home timed out", interrupted,
-            )
-        interrupted = not ok and time.monotonic() < deadline
-        return HomeResult(
-            ok, "" if ok else "home interrupted" if interrupted else "arm home timed out",
-            interrupted,
-        )
+            return HomeResult(False, str(exc), interrupted=True)
+        except TimeoutError as exc:
+            return HomeResult(False, f"arm home timed out: {exc}")
+        return HomeResult(True)
 
 
 def home_hand(state, robot, *, cancel_requested):

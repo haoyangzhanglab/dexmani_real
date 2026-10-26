@@ -1,4 +1,4 @@
-"""Causal seven-joint Ruckig reference; no feedback reset, clipping or second filter while active."""
+"""Ruckig 连续参考；运动中替换目标不以实测反馈重置轨迹。"""
 
 import numpy as np
 
@@ -17,7 +17,7 @@ class ArmReference:
         self.input = InputParameter(7)
         self.input.max_velocity = [self.vmax] * 7
         self.input.max_acceleration = [self.amax] * 7
-        # Community 0.17.3: omitted max_jerk = infinity selects second-order OTG.
+        # Ruckig 0.17.3 的默认无限 jerk 选择二阶轨迹。
         self.input.target_velocity = [0.0] * 7
         self.goal = None
         self.q, self.v = self.state(q, v, np.zeros(7))[:2]
@@ -59,7 +59,7 @@ class ArmReference:
         if self.goal is not None:
             self.sample(now_ns)
             if np.array_equal(goal, self.goal):
-                return  # Identical commands retain the existing trajectory and velocity.
+                return  # 相同目标保留原轨迹与速度。
         self.input.current_position = self.q.tolist()
         self.input.current_velocity = self.v.tolist()
         self.input.target_position = goal.tolist()
@@ -67,7 +67,7 @@ class ArmReference:
         trajectory = Trajectory(7)
         if self.otg.calculate(self.input, trajectory) not in (Result.Working, Result.Finished):
             raise ValueError("Ruckig calculation failed")
-        # Admit the complete trajectory, including braking extrema; Ruckig position fields do not enforce them.
+        # Ruckig 不强制位置限位，必须检查包含制动段的整条轨迹极值。
         for i, bounds in enumerate(trajectory.position_extrema):
             if (
                 not np.isfinite([bounds.min, bounds.max]).all()

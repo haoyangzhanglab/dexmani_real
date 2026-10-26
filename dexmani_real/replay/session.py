@@ -60,7 +60,7 @@ def run_replay(
             estop_callback=runtime_state.request_emergency_stop,
         )
         home_planner = HomePlanner(
-            runtime.environment, table_plane_abcd=table_plane_abcd,
+            runtime.environment, runtime.arm, table_plane_abcd=table_plane_abcd,
         )
         keyboard.start()
         robot.check_services = lambda: keyboard.healthy

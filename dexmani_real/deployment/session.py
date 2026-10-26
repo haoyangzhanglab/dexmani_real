@@ -210,7 +210,7 @@ class PolicySession:
             motion=self.runtime.motion, environment=self.runtime.environment,
         )
         self.home_planner = HomePlanner(
-            self.runtime.environment, table_plane_abcd=self.table_plane_abcd,
+            self.runtime.environment, self.runtime.arm, table_plane_abcd=self.table_plane_abcd,
         )
         self.keyboard = Keyboard(
             estop_callback=self.runtime_state.request_emergency_stop,

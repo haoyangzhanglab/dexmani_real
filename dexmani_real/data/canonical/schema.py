@@ -9,7 +9,8 @@ import numpy as np
 
 from dexmani_real.perception.hand_config import HandPointCloudConfig
 from dexmani_real.perception.pointcloud.config import PointCloudConfig
-from dexmani_real.robot.xhand.config import HandParams
+from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
+from dexmani_real.robot.xhand.config import HandConfig
 
 
 @dataclass(frozen=True)
@@ -19,9 +20,9 @@ class ProcessingConfig:
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     hand_pointcloud: HandPointCloudConfig = field(default_factory=HandPointCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
-    fingertip_link_names: tuple[str, ...] = HandParams.fingertip_link_names
-    handbase_position_eef_m: tuple[float, ...] = HandParams.T_eef_handbase_pos_xyz
-    handbase_quat_eef_wxyz: tuple[float, ...] = HandParams.T_eef_handbase_quat_wxyz
+    fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
+    handbase_position_eef_m: tuple[float, ...] = HandConfig.T_eef_handbase_pos_xyz
+    handbase_quat_eef_wxyz: tuple[float, ...] = HandConfig.T_eef_handbase_quat_wxyz
 
     @classmethod
     def from_runtime(cls, runtime, *, table_plane_abcd=None):
@@ -29,7 +30,7 @@ class ProcessingConfig:
             pointcloud=runtime.pointcloud,
             hand_pointcloud=runtime.hand_pointcloud,
             table_plane_abcd=table_plane_abcd,
-            fingertip_link_names=tuple(runtime.hand.fingertip_link_names),
+            fingertip_link_names=XHAND_FINGERTIP_LINK_NAMES,
             handbase_position_eef_m=tuple(runtime.hand.T_eef_handbase_pos_xyz),
             handbase_quat_eef_wxyz=tuple(runtime.hand.T_eef_handbase_quat_wxyz),
         )

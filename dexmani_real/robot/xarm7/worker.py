@@ -1,23 +1,28 @@
-"""Own xArm SDK calls and causal references; a blocked native call cannot be interrupted here."""
+"""机械臂 SDK 与伺服循环；阻塞的原生调用无法在此中断。"""
 
 import time
+from typing import cast
 
 import numpy as np
 
+from dexmani_real.robot.commands import OperationCancelled, RobotError
+from dexmani_real.robot.xarm7.config import (
+    HOME_CONVERGENCE_TIMEOUT_S,
+    HOME_DWELL_S,
+    HOME_TARGET_TIMEOUT_S,
+    SERVO_MAX_INTERVAL_S,
+)
 from dexmani_real.robot.xarm7.protocol import (
     MAX_TIME,
     STATUS_DTYPE,
-    PrepareRequest,
     HomeRequest,
     LifecycleReply,
-    OperationStatus,
 )
 from dexmani_real.robot.xarm7.reference import ArmReference
-from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.utils.timing import next_tick_ns
 
 
-class ArmWorker:
+class ArmController:
     def __init__(self, cfg, io, pipe, driver):
         self.cfg, self.io, self.pipe, self.driver = cfg, io, pipe, driver
         self.status = np.zeros((), dtype=STATUS_DTYPE)
@@ -50,7 +55,7 @@ class ArmWorker:
                 raise RuntimeError(f"arm disconnected/controller error {status.error_code}")
             self.status["frame"]["qpos"] = q
             self.status["frame"]["qvel"] = v
-            # Host query start is conservative; never replace this with cache-read time.
+            # 来源时间采用查询开始时刻，不能替换为缓存读取时间。
             self.status["frame"]["timestamp_ns"] = started
             self.status["valid"] = True
             self.status["state"] = status.state
@@ -71,7 +76,7 @@ class ArmWorker:
         tolerance_rad=None,
         strict=False,
     ):
-        """Require position/velocity dwell; strict HOME rejects any bad sample."""
+        """确认位置与速度连续稳定，strict 模式遇到不合格样本立即失败。"""
         tolerance = self.cfg.homing.convergence_rad if tolerance_rad is None else tolerance_rad
         deadline = time.monotonic_ns() + int(timeout_s * 1e9)
         stable = time.monotonic_ns() if strict else None
@@ -79,7 +84,7 @@ class ArmWorker:
         while time.monotonic_ns() < deadline:
             check_abort()
             if strict:
-                self.io.stop.wait(min(interval_s, self.cfg.homing.dwell_s))
+                self.io.stop.wait(min(interval_s, HOME_DWELL_S))
                 check_abort()
             self.read_feedback()
             check_abort()
@@ -94,7 +99,7 @@ class ArmWorker:
                 if target is None and (anchor is None or np.max(np.abs(q - anchor)) > tolerance):
                     stable, anchor = None, q.copy()
                 stable = now if stable is None else stable
-                if now - stable >= int(self.cfg.homing.dwell_s * 1e9):
+                if now - stable >= int(HOME_DWELL_S * 1e9):
                     return
             else:
                 stable = anchor = None
@@ -106,20 +111,23 @@ class ArmWorker:
         self.wait_settled(
             check_abort,
             stage="arm standstill",
-            timeout_s=self.cfg.homing.convergence_timeout_s,
+            timeout_s=HOME_CONVERGENCE_TIMEOUT_S,
             interval_s=1 / self.cfg.feedback_hz,
         )
-        # Check braking extrema before Mode 1; seed the first causal goal from fresh feedback.
+        # 进入 Mode 1 前确认实测状态可生成限位内的制动轨迹。
         ArmReference(
-            self.cfg, self.status["frame"]["qpos"], self.status["frame"]["qvel"], time.monotonic_ns()
+            self.cfg,
+            self.status["frame"]["qpos"],
+            self.status["frame"]["qvel"],
+            time.monotonic_ns(),
         )
 
     def home(self, waypoints, final_qpos, *, check_abort):
-        """Advance the admitted HOME milestones entirely inside the SDK owner."""
         waypoints = np.asarray(waypoints, dtype=np.float64)
         final_qpos = np.asarray(final_qpos, dtype=np.float64)
-        lower, upper = np.asarray(self.cfg.joint_limit_lower), np.asarray(
-            self.cfg.joint_limit_upper
+        lower, upper = (
+            np.asarray(self.cfg.joint_limit_lower),
+            np.asarray(self.cfg.joint_limit_upper),
         )
         if waypoints.ndim != 2 or waypoints.shape[1:] != (7,) or not np.isfinite(waypoints).all():
             raise ValueError("invalid home waypoint array")
@@ -147,19 +155,19 @@ class ArmWorker:
         targets = waypoints[1:]
         if len(targets):
             check_abort()
-            self.driver.enter_mode0(check_abort=check_abort)
+            self.driver.enter_mode(0, check_abort=check_abort)
             for index, target in enumerate(targets, 1):
                 check_abort()
                 self.driver.move_home_milestone(target)
                 check_abort()
-                nominal = float(np.max(np.abs(target - current))) / max(
-                    self.cfg.homing.max_speed_rad_per_s, 1e-6
+                nominal = (
+                    float(np.max(np.abs(target - current))) / self.cfg.homing.max_speed_rad_per_s
                 )
                 self.wait_settled(
                     check_abort,
                     stage=f"home milestone {index}",
-                    timeout_s=2 * nominal + self.cfg.homing.target_timeout_s,
-                    interval_s=self.cfg.homing.step_interval_s,
+                    timeout_s=2 * nominal + HOME_TARGET_TIMEOUT_S,
+                    interval_s=(1 / self.cfg.feedback_hz),
                     target=target,
                     tolerance_rad=min(self.cfg.homing.convergence_rad, np.deg2rad(0.5)),
                 )
@@ -172,19 +180,17 @@ class ArmWorker:
                 stage="home dwell",
                 strict=True,
                 target=final_qpos,
-                timeout_s=self.cfg.homing.dwell_s + self.cfg.homing.step_interval_s,
-                interval_s=self.cfg.homing.step_interval_s,
+                timeout_s=HOME_DWELL_S + (1 / self.cfg.feedback_hz),
+                interval_s=(1 / self.cfg.feedback_hz),
             )
         check_abort()
-        self.driver.enter_mode1(check_abort=check_abort)
+        self.driver.enter_mode(1, check_abort=check_abort)
         self.wait_settled(
             check_abort,
             stage="post-Mode1 home settle",
             target=final_qpos,
-            timeout_s=self.cfg.homing.target_timeout_s
-            + self.cfg.homing.dwell_s
-            + self.cfg.homing.step_interval_s,
-            interval_s=self.cfg.homing.step_interval_s,
+            timeout_s=HOME_TARGET_TIMEOUT_S + HOME_DWELL_S + (1 / self.cfg.feedback_hz),
+            interval_s=(1 / self.cfg.feedback_hz),
         )
 
     def stop(self):
@@ -194,31 +200,26 @@ class ArmWorker:
         self.io.take_goal(block=True)
         self.io.publish(self.status)
         try:
-            code = self.driver.stop()
-            if isinstance(code, bool) or not isinstance(code, (int, np.integer)) or code != 0:
-                raise RuntimeError(f"stop acceptance unavailable/rejected: {code!r}")
+            self.driver.stop()
         except BaseException as exc:
             if not self.io.close_error.value:
                 self.io.close_error.value = f"stop SDK failure: {exc}".encode()[:1023]
             self.fault(exc)
         finally:
-            self.io.stopped.set()  # Processing finished; SDK failures remain latched in close_error.
+            self.io.stopped.set()  # 处理结束；停止失败仍保存在 close_error。
 
     def operation(self, message):
         identity = message.operation_id
         kind = "home" if isinstance(message, HomeRequest) else "prepare"
-        detail = ""
-        result = OperationStatus.COMPLETED
+        error = None
         try:
-            if self.io.cancel_operation.is_set():
-                raise OperationCancelled(f"cancelled {kind}")
-            if not isinstance(message, (PrepareRequest, HomeRequest)):
-                raise RuntimeError(f"unknown arm operation: {type(message).__name__}")
             run_id = message.run_id
 
             def check_abort():
-                if self.io.cancel_operation.is_set() or not self.authorized(run_id):
+                if not self.authorized(run_id):
                     raise OperationCancelled(f"{kind} authority revoked")
+                if isinstance(message, HomeRequest) and time.monotonic_ns() >= message.deadline_ns:
+                    raise TimeoutError("HOME execution deadline expired")
                 # HOME 使用协调者健康截止，不消费 streaming 目标的执行期限。
                 if time.monotonic_ns() >= self.io.health_until.value:
                     raise TimeoutError(f"{kind} hand feedback or parent service expired")
@@ -233,35 +234,35 @@ class ArmWorker:
             if isinstance(message, HomeRequest):
                 self.home(message.waypoints, message.target, check_abort=check_abort)
             else:
-                self.driver.enter_mode1(check_abort=check_abort)
-            self.wait_stationary(check_abort)
+                self.driver.enter_mode(1, check_abort=check_abort)
+                self.wait_stationary(check_abort)
             check_abort()
             self.last_send_ns = 0
             self.io.execution_limit[:] = (MAX_TIME, 0)
             self.status["prepared_run_id"] = run_id
         except BaseException as exc:
             detail = f"{type(exc).__name__}: {exc}"
-            result = (
-                OperationStatus.CANCELLED
-                if isinstance(exc, OperationCancelled)
-                else OperationStatus.FAILED
+            error_type = (
+                type(exc) if isinstance(exc, (OperationCancelled, TimeoutError)) else RobotError
             )
+            error = error_type(detail)
             if not isinstance(exc, OperationCancelled):
                 self.fault(exc)
-            # Do not wait for a parent blocked in another device's SDK.
+            # 无需等待可能阻塞在其他设备 SDK 内的父进程。
             self.stop()
             if self.io.close_error.value:
                 detail += "; " + self.io.close_error.value.decode(errors="replace")
-                result = OperationStatus.FAILED
-        # Lifecycle replies include publication; never hold this lock over SDK I/O.
+                error = RobotError(detail)
+
         self.io.publish(self.status)
-        self.pipe.send(LifecycleReply(identity, result, detail))
+        self.pipe.send(LifecycleReply(identity, error))
 
     def command_issue(self, goal, now, *, first=False):
         if not self.authorized(int(goal["run_id"])):
             return "revoked"
         if (
-            first and goal["input_generation"] >= 0
+            first
+            and goal["input_generation"] >= 0
             and goal["input_generation"] != self.io.input_generation.value
         ):
             return "input_changed"
@@ -301,39 +302,28 @@ class ArmWorker:
                 if np.max(np.abs(v)) > self.cfg.homing.velocity_convergence_rad_s:
                     raise RuntimeError("arm moved after standstill preparation")
                 self.reference = ArmReference(self.cfg, q, v, now)
-            self.reference.replace(pending["q_goal"], now)
+            cast(ArmReference, self.reference).replace(pending["q_goal"], now)
             self.active = pending
-        q, _, _ = self.reference.sample(now)
-        started = time.monotonic_ns()
-        issue = self.command_issue(goal, started, first=pending is not None)
-        if issue:
-            if issue not in {"revoked", "input_changed"}:
-                raise RuntimeError(issue)
-            self.io.stop.set()
-            return
-        if started - now > int(self.cfg.servo_max_interval_s * 1e9):
-            raise TimeoutError("reference computation exceeded interval budget")
+        q, _, _ = cast(ArmReference, self.reference).sample(now)
         if np.max(np.abs(self.status["frame"]["qpos"] - q)) > self.cfg.tracking_error_rad:
             raise RuntimeError("tracking_error")
-        # Recheck authority and timing after computing the reference and tracking error.
+        # 计算结束后、进入 SDK 前重新检查授权与期限。
         started = time.monotonic_ns()
         interval = started - self.last_send_ns if self.last_send_ns else 0
         issue = self.command_issue(goal, started, first=pending is not None)
-        if issue is None and interval > int(self.cfg.servo_max_interval_s * 1e9):
+        if issue is None and interval > int(SERVO_MAX_INTERVAL_S * 1e9):
             issue = "servo interval exceeded; no catch-up sends"
-        if issue is None and started - now >= int(self.cfg.servo_max_interval_s * 1e9):
+        if issue is None and started - now >= int(SERVO_MAX_INTERVAL_S * 1e9):
             issue = "servo computation stalled before SDK"
         if issue:
             if issue not in {"revoked", "input_changed"}:
                 raise RuntimeError(issue)
             self.io.stop.set()
             return
-        code = self.driver.servo(q)
+        self.driver.servo(q)
         completed = time.monotonic_ns()
         self.last_send_ns = started
-        if isinstance(code, bool) or not isinstance(code, (int, np.integer)) or code != 0:
-            raise RuntimeError(f"servo SDK failed: {code!r}")
-        if completed - started >= int(self.cfg.servo_max_interval_s * 1e9):
+        if completed - started >= int(SERVO_MAX_INTERVAL_S * 1e9):
             raise TimeoutError("servo SDK blocked beyond interval budget")
 
     def run(self):
@@ -377,10 +367,9 @@ class ArmWorker:
                     except Exception as exc:
                         self.fault(exc)
                     feedback_due = time.monotonic_ns() + round(1e9 / self.cfg.feedback_hz)
-                # A stop interrupts this wait; goals only activate on a scheduled tick.
+                # 停止可中断等待，目标仅在计划的伺服时刻生效。
                 delay = max(0, min(tick, feedback_due) - time.monotonic_ns()) / 1e9
                 if self.io.stopped.is_set():
-                    # Stopped motion still needs feedback for idle checks and the next HOME.
                     self.pipe.poll(0.01 if self.io.fault.value else delay)
                 else:
                     self.io.stop.wait(delay)
@@ -412,4 +401,4 @@ def run_arm(cfg, io, pipe):
         io.ready.set()
         pipe.close()
         return
-    ArmWorker(cfg, io, pipe, driver).run()
+    ArmController(cfg, io, pipe, driver).run()

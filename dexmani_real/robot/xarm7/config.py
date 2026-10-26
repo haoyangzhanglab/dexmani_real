@@ -1,5 +1,3 @@
-"""xArm7 hardware and firmware-planned HOME parameters."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -8,29 +6,27 @@ import numpy as np
 
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_HARD_LOWER, XARM7_HARD_UPPER
 
+SERVO_MAX_INTERVAL_S = 0.020
+SDK_TIMEOUT_S = 0.020
+EXECUTOR_TIMEOUT_S = 3.0
+HOME_TARGET_TIMEOUT_S = 0.5
+HOME_DWELL_S = 0.30
+HOME_CONVERGENCE_TIMEOUT_S = 15.0
+
 
 @dataclass(frozen=True)
-class HomingParams:
-    """Firmware-planned execution parameters for validated home milestones."""
-
+class HomingConfig:
     convergence_rad: float = 0.002618
-    step_interval_s: float = 0.04
-    max_speed_deg_s: float = 30.0  # Conservative Mode-0 speed; tuning needs hardware validation.
-    # Settling budget for HOME milestones and Mode-1 restoration.
-    target_timeout_s: float = 0.5
+    max_speed_deg_s: float = 30.0
     velocity_convergence_rad_s: float = 0.03
-    dwell_s: float = 0.30
-    convergence_timeout_s: float = 15.0
-    state_max_age_s: float = 0.5
 
     @property
     def max_speed_rad_per_s(self) -> float:
-        """Maximum Mode-0 homing speed in radians per second."""
         return float(np.deg2rad(self.max_speed_deg_s))
 
 
 @dataclass(frozen=True)
-class ArmParams:
+class ArmConfig:
     home_qpos: tuple[float, ...] = (
         0.0,
         0.041888,
@@ -44,17 +40,12 @@ class ArmParams:
     joint_limit_lower: tuple[float, ...] = XARM7_HARD_LOWER
     joint_limit_upper: tuple[float, ...] = XARM7_HARD_UPPER
 
-    max_joint_velocity_deg_per_s: float = 135.0  # 75% of the 180 deg/s SDK command limit
-    # ~14.14 rad/s²; ~71% of the 20 rad/s² SDK limit.
+    max_joint_velocity_deg_per_s: float = 135.0
     max_joint_acceleration_deg_per_s2: float = 810.0
-    feedback_max_age_s: float = 4 / 30  # host-side feedback freshness budget
+    feedback_max_age_s: float = 4 / 30
 
-    # Host reference generation is independent of teleop/policy observation cadence.
     servo_hz: float = 100.0
     feedback_hz: float = 25.0
-    servo_max_interval_s: float = 0.020
-    sdk_timeout_s: float = 0.020
-    executor_timeout_s: float = 3.0
     tracking_error_rad: float = 0.35
 
     ip: str = "192.168.1.111"
@@ -62,12 +53,12 @@ class ArmParams:
     table_z_surface_m: float = 0.022
     hand_safety_margin_m: float = 0.05
 
-    collision_sensitivity: int = 0  # 0 disables xArm controller collision detection.
+    collision_sensitivity: int = 0  # 0 关闭控制器碰撞检测。
 
     tcp_load_mass_kg: float = 1.1
     tcp_load_cog_mm: tuple[float, float, float] = (16.3, 7.9, 109.5)
 
-    homing: HomingParams = field(default_factory=HomingParams)
+    homing: HomingConfig = field(default_factory=HomingConfig)
 
     @property
     def max_joint_velocity_rad_per_s(self) -> float:
@@ -106,9 +97,6 @@ class ArmParams:
         for name in (
             "servo_hz",
             "feedback_hz",
-            "servo_max_interval_s",
-            "sdk_timeout_s",
-            "executor_timeout_s",
             "tracking_error_rad",
             "feedback_max_age_s",
         ):
@@ -118,16 +106,19 @@ class ArmParams:
             self.feedback_hz <= self.servo_hz and 1 / self.feedback_hz < self.feedback_max_age_s
         ):
             raise ValueError("feedback period must fit freshness budget and not exceed servo rate")
-        if not 1 / self.servo_hz < self.servo_max_interval_s:
+        if not 1 / self.servo_hz < SERVO_MAX_INTERVAL_S:
             raise ValueError("servo interval budget must exceed one servo period")
-        # These physical v/a limits also remain valid for firmware-planned Mode-0 HOME.
-        max_speed_rad = self.max_joint_velocity_rad_per_s
+
+        for value in (self.homing.convergence_rad, self.homing.velocity_convergence_rad_s):
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError("HOME position/velocity tolerances must be finite and positive")
+        for name, speed in (
+            ("max_joint_velocity_deg_per_s", self.max_joint_velocity_rad_per_s),
+            ("homing.max_speed_deg_s", self.homing.max_speed_rad_per_s),
+        ):
+            if not (np.isfinite(speed) and 0.0001 <= speed <= np.pi):
+                raise ValueError(f"{name} must resolve to an SDK speed in [0.0001, π] rad/s")
         max_acc_rad = self.max_joint_acceleration_rad_per_s2
-        if not (np.isfinite(max_speed_rad) and 0.0001 <= max_speed_rad <= np.pi):
-            raise ValueError(
-                f"max_joint_velocity_deg_per_s={self.max_joint_velocity_deg_per_s} "
-                f"resolves to {max_speed_rad} rad/s, outside the SDK command range [0.0001, π]"
-            )
         if not (np.isfinite(max_acc_rad) and 0.01 <= max_acc_rad <= 20.0):
             raise ValueError(
                 f"max_joint_acceleration_deg_per_s2={self.max_joint_acceleration_deg_per_s2} "

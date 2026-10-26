@@ -1,4 +1,4 @@
-"""Robot-model resources, physical limits, and joint mappings."""
+"""机器人模型、SDK 关节顺序和额定机械限位。"""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ HAND_TACTILE_FORCE_SHAPE = (
 )
 HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
 
-# XHand SDK joint order used by commands, feedback and Raw joint vectors.
+
 XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
     "right_hand_thumb_bend_joint",
     "right_hand_thumb_rota_joint1",
@@ -50,13 +50,13 @@ XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
 )
 
 XHAND_MODEL_DIR = ASSET_DIR / "robots" / "xhand"
-# Arm planning model with the hand geometry fixed in its open/home posture.
+# 七关节规划模型中的手固定在 open/home 姿态。
 XARM7_XHAND_COLLISION_URDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand_collision.urdf"
 XARM7_XHAND_RIGHT_URDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand_right.urdf"
 XARM7_XHAND_SRDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand.srdf"
 XHAND_RIGHT_URDF_PATH = XHAND_MODEL_DIR / "xhand_right.urdf"
 
-# Hand joint order remap: XHand SDK → URDF / Pinocchio.
+
 XHAND_URDF_JOINT_NAMES: tuple[str, ...] = (
     "right_hand_index_bend_joint",
     "right_hand_index_joint1",
@@ -75,7 +75,7 @@ HAND_SDK_TO_URDF_IDX: tuple[int, ...] = tuple(
     XHAND_SDK_JOINT_NAMES.index(name) for name in XHAND_URDF_JOINT_NAMES
 )
 
-# Mechanical limits from the xArm7 robot model, radians.
+
 XARM7_HARD_LOWER = (
     -6.28318530718,
     -2.059,
@@ -95,5 +95,37 @@ XARM7_HARD_UPPER = (
     6.28318530718,
 )
 
-# Full-turn axes admit 2π equivalents within mechanical limits; operational limits may be narrower.
+# 只有这些轴允许 2π 等价角，运行限位仍可能窄于一整圈。
 XARM7_EQUIVALENT_JOINT_MASK = (True, False, True, False, True, False, True)
+
+
+XHAND_RATED_QPOS_MIN_RAD: tuple[float, ...] = (
+    0.0,
+    -0.698,
+    0.0,
+    -0.174,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+)
+
+
+XHAND_RATED_QPOS_MAX_RAD: tuple[float, ...] = (
+    1.832,
+    1.745,
+    1.745,
+    0.174,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+    1.919,
+)

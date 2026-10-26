@@ -33,13 +33,10 @@ from dexmani_real.calibration.camera.hand_eye import (
     solve_hand_eye,
 )
 from dexmani_real.calibration.table_plane import resolve_table_plane
+from dexmani_real.control.collision import CollisionModel
+from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
-from dexmani_real.control.online_ik import (
-    OnlineIKConfig,
-    OnlineIKSolver,
-    make_online_ik_solver,
-)
-from dexmani_real.control.target_validation import TargetChecker
+from dexmani_real.control.ik import IKSolver
 from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.system import DexManiRobot
@@ -57,7 +54,10 @@ from dexmani_real.runtime.observation import (
     read_camera_frame,
     service_feedback,
 )
-from dexmani_real.runtime.preflight import validate_keyboard_workspace, validate_robot_config
+from dexmani_real.runtime.preflight import (
+    validate_keyboard_workspace,
+    validate_robot_config,
+)
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.utils.log import configure_logging
@@ -75,22 +75,23 @@ MOTION_STATUS_INTERVAL_FRAMES = 50
 
 def build_planner(
     runtime: ExperimentConfig, *, table_plane_abcd,
-) -> tuple[HomePlanner, OnlineIKSolver]:
+) -> tuple[HomePlanner, IKSolver]:
     """Build HOME geometry and online IK with their separate collision scenes."""
-    planner = HomePlanner(runtime.environment, table_plane_abcd=table_plane_abcd)
+    planner = HomePlanner(runtime.environment, runtime.arm, table_plane_abcd=table_plane_abcd)
     home_hand_qpos = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
     planner.set_hand_qpos(home_hand_qpos)
-    solver = make_online_ik_solver(
-        OnlineIKConfig(
-            max_pose_error_pos_m=runtime.keyboard_teleop.ik_max_pose_error_pos_m,
-            max_pose_error_rot_rad=runtime.keyboard_teleop.ik_max_pose_error_rot_rad,
-            operational_joint_lower_rad=tuple(runtime.arm.joint_limit_lower),
-            operational_joint_upper_rad=tuple(runtime.arm.joint_limit_upper),
-        ),
-        static_boxes=runtime.environment.static_boxes,
+    constraints = MotionConstraints(
+        CollisionModel(static_boxes=runtime.environment.static_boxes),
+        joint_lower_rad=runtime.arm.joint_limit_lower,
+        joint_upper_rad=runtime.arm.joint_limit_upper,
+        workspace=runtime.environment.workspace.as_array(),
+        workspace_margin_m=runtime.environment.eef_workspace_margin_m,
     )
-    # Online jog permits table contact; both scenes retain the declared fixed-home hand.
-    solver.collision_model.set_hand_qpos(home_hand_qpos)
+    solver = IKSolver(
+        constraints,
+        position_tolerance=runtime.keyboard_teleop.ik_max_pose_error_pos_m,
+        rotation_tolerance=runtime.keyboard_teleop.ik_max_pose_error_rot_rad,
+    )
     return planner, solver
 
 
@@ -278,7 +279,7 @@ class CameraCalibrationSession:
         if sample is None or self.cancel_requested():
             return
         arm_qpos, marker_rvec, marker_tvec = sample
-        eef_pos_base_m, eef_rot6d_base = self.target_checker.target_fk.compute(arm_qpos)
+        eef_pos_base_m, eef_rot6d_base = self.constraints.target_fk.compute(arm_qpos)
         eef_rpy_base_rad = eef_rpy_from_rot6d(eef_rot6d_base)
         if self.cancel_requested():
             return
@@ -570,7 +571,7 @@ class CameraCalibrationSession:
                 self.robot.stop()
                 self.jog.clear_reference()
             if self.frame % IDLE_STATUS_INTERVAL_FRAMES == 0:
-                measured_pose = self.solver.kin.compute_eef_pose_base(self.current_qpos)
+                measured_pose = self.solver.compute_eef_pose_base(self.current_qpos)
                 print(
                     f"[f={self.frame}] samples={len(self.samples)} "
                     f"eef={np.round(measured_pose.p, 3)}m",
@@ -635,7 +636,7 @@ class CameraCalibrationSession:
             return
 
         if self.frame % MOTION_STATUS_INTERVAL_FRAMES == 0:
-            measured_pose = self.solver.kin.compute_eef_pose_base(self.current_qpos)
+            measured_pose = self.solver.compute_eef_pose_base(self.current_qpos)
             print(
                 f"[f={self.frame}] samples={len(self.samples)} "
                 f"eef={np.round(measured_pose.p, 3)}m "
@@ -673,13 +674,7 @@ class CameraCalibrationSession:
             )
 
         self.home_planner, self.solver = planner, solver
-        self.target_checker = TargetChecker(
-            solver.collision_model,
-            joint_lower_rad=self.runtime.arm.joint_limit_lower,
-            joint_upper_rad=self.runtime.arm.joint_limit_upper,
-            workspace=workspace,
-            workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
-        )
+        self.constraints = solver.constraints
         self.calibration_config = calib_cfg
         self.aruco_config = aruco_cfg
         self.ctx = mp.get_context("spawn")
@@ -697,7 +692,7 @@ class CameraCalibrationSession:
             check_services=self.check_services,
         )
         self.samples = CalibrationSamples()
-        self.jog = JogController(solver, self.target_checker, self.runtime.keyboard_teleop, workspace)
+        self.jog = JogController(solver, self.runtime.keyboard_teleop, workspace)
         self.calibration_saved = False
         self.frame = 0
         self.last_ik_warning_s = self.last_boundary_warning_s = 0.0

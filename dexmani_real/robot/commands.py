@@ -1,5 +1,3 @@
-"""Owned final targets and device-boundary errors."""
-
 from dataclasses import dataclass
 
 import numpy as np
@@ -24,11 +22,11 @@ class RobotCommand:
 
 
 class OperationCancelled(RuntimeError):
-    """The owning run or input was revoked before an operation could complete."""
+    """本次运行或输入已撤销。"""
 
 
 class RobotError(RuntimeError):
-    """Device I/O or a local executor failed; the coordinator must end the run."""
+    """设备或执行器失败，调用方须终止本次运行。"""
 
 
 def check_arm_target(
@@ -37,7 +35,6 @@ def check_arm_target(
     joint_limit_lower_rad: np.ndarray,
     joint_limit_upper_rad: np.ndarray,
 ) -> str | None:
-    """Return why an arm target cannot cross the SDK boundary (hard limits)."""
     target = np.asarray(target_qpos_rad, dtype=np.float64)
     if target.shape != (7,):
         return "invalid target shape"
@@ -54,7 +51,6 @@ def check_hand_target(
     mechanical_lower_rad: np.ndarray,
     mechanical_upper_rad: np.ndarray,
 ) -> str | None:
-    """Return why a hand target cannot cross the SDK boundary."""
     target = np.asarray(target_qpos_rad, dtype=np.float64)
     if target.shape != (12,):
         return "invalid target shape"

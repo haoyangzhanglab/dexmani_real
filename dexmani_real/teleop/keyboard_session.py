@@ -5,9 +5,10 @@ import logging
 import numpy as np
 
 from dexmani_real.calibration.table_plane import resolve_table_plane
+from dexmani_real.control.collision import CollisionModel
+from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
-from dexmani_real.control.online_ik import OnlineIKConfig, make_online_ik_solver
-from dexmani_real.control.target_validation import TargetChecker
+from dexmani_real.control.ik import IKSolver
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import DexManiRobot
 from dexmani_real.runtime.home import home_robot
@@ -21,7 +22,10 @@ from dexmani_real.runtime.observation import (
     read_observation,
     service_feedback,
 )
-from dexmani_real.runtime.preflight import validate_keyboard_workspace, validate_robot_config
+from dexmani_real.runtime.preflight import (
+    validate_keyboard_workspace,
+    validate_robot_config,
+)
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import LoopRate
@@ -83,25 +87,21 @@ class KeyboardTeleopSession:
         return int(not clean or not shutdown_clean)
 
     def start(self):
-        solver = make_online_ik_solver(
-            OnlineIKConfig(
-                max_pose_error_pos_m=self.jog_config.ik_max_pose_error_pos_m,
-                max_pose_error_rot_rad=self.jog_config.ik_max_pose_error_rot_rad,
-                operational_joint_lower_rad=tuple(self.runtime.arm.joint_limit_lower),
-                operational_joint_upper_rad=tuple(self.runtime.arm.joint_limit_upper),
-            ),
-            static_boxes=self.runtime.environment.static_boxes,
-        )
-        target_checker = TargetChecker(
-            solver.collision_model,
+        constraints = MotionConstraints(
+            CollisionModel(static_boxes=self.runtime.environment.static_boxes),
             joint_lower_rad=self.runtime.arm.joint_limit_lower,
             joint_upper_rad=self.runtime.arm.joint_limit_upper,
             workspace=self.workspace,
             workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
         )
-        self.jog = JogController(solver, target_checker, self.jog_config, self.workspace)
+        solver = IKSolver(
+            constraints,
+            position_tolerance=self.jog_config.ik_max_pose_error_pos_m,
+            rotation_tolerance=self.jog_config.ik_max_pose_error_rot_rad,
+        )
+        self.jog = JogController(solver, self.jog_config, self.workspace)
         self.home_planner = HomePlanner(
-            self.runtime.environment, table_plane_abcd=self.table_plane_abcd,
+            self.runtime.environment, self.runtime.arm, table_plane_abcd=self.table_plane_abcd,
         )
         self.keys.start()
         if not self.keys.healthy:

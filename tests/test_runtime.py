@@ -12,8 +12,8 @@ import numpy as np
 from dexmani_real.config import load_experiment_config
 from dexmani_real.geometry.pose import Pose
 from dexmani_real.robot.commands import OperationCancelled
-from dexmani_real.robot.xarm7.config import ArmParams
-from dexmani_real.robot.xhand.config import HandParams
+from dexmani_real.robot.xarm7.config import ArmConfig
+from dexmani_real.robot.xhand.config import HandConfig
 from dexmani_real.runtime import home, keyboard, lifecycle
 from dexmani_real.runtime.jog import JogController, compute_cartesian_jog_delta, jog_motion_requested
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
@@ -387,7 +387,7 @@ class JogTests(unittest.TestCase):
         self.generation = self.keys.snapshot()[1]
         self.addCleanup(self.keys.stop)
         self.jog = JogController(
-            None, None, SimpleNamespace(workspace_command_margin_m=.01),
+            None, SimpleNamespace(workspace_command_margin_m=.01),
             np.array([[-1., 1.]] * 3),
         )
         self.robot = Mock()
@@ -481,8 +481,8 @@ class HomeTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         self.state = armed_state()
         self.robot = SimpleNamespace(
-            arm_config=ArmParams(),
-            hand_config=replace(HandParams(), home_timeout_s=.08),
+            arm_config=ArmConfig(),
+            hand_config=replace(HandConfig(), home_timeout_s=.08),
             stop_required=False,
         )
         self.robot.stop = Mock(side_effect=lambda: setattr(self.robot, "stop_required", False))
@@ -497,9 +497,8 @@ class HomeTests(unittest.TestCase):
 
         self.robot.home_arm = Mock(side_effect=move_arm)
         self.planner = Mock()
-        patcher = patch.object(home, "home_path", return_value=np.zeros((2, 7)))
-        self.path = patcher.start()
-        self.addCleanup(patcher.stop)
+        self.path = self.planner.plan
+        self.path.return_value = np.zeros((2, 7))
 
     def feedback(self):
         self.clock.sleep(.001)
@@ -547,10 +546,9 @@ class HomeTests(unittest.TestCase):
         self.robot.stop.assert_not_called()
 
     def test_stationary_feedback_timeout_does_not_plan_or_send(self):
-        self.robot.arm_config = replace(
-            self.robot.arm_config,
-            homing=replace(self.robot.arm_config.homing, convergence_timeout_s=.03),
-        )
+        patcher = patch.object(home, "HOME_CONVERGENCE_TIMEOUT_S", .03)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         old_feedback = self.feedback()
         self.robot.read_state.side_effect = None
         self.robot.read_state.return_value = old_feedback
@@ -587,8 +585,9 @@ class HomeTests(unittest.TestCase):
         def move(waypoints, target, run_id, abort, **kwargs):
             self.robot.stop_required = True
             self.clock.sleep(100)
-            self.assertTrue(abort())
-            return False
+            self.assertGreaterEqual(self.clock.ns, kwargs["deadline_ns"])
+            self.assertFalse(abort())
+            raise TimeoutError("HOME execution deadline expired")
 
         self.robot.home_arm.side_effect = move
         result = home.home_arm(
@@ -596,7 +595,23 @@ class HomeTests(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertFalse(result.interrupted)
-        self.assertEqual(result.reason, "arm home timed out")
+        self.assertIn("arm home timed out", result.reason)
+        self.assertIn("HOME execution deadline expired", result.reason)
+        self.robot.stop.assert_called_once()
+
+    def test_arm_cancellation_remains_distinct_from_elapsed_deadline(self):
+        def cancel(*args, **kwargs):
+            self.robot.stop_required = True
+            self.clock.sleep(100)
+            raise OperationCancelled("operator cancelled HOME")
+
+        self.robot.home_arm.side_effect = cancel
+        result = home.home_arm(
+            self.state, self.robot, self.planner, cancel_requested=lambda: False, service=Mock(),
+        )
+        self.assertFalse(result.ok)
+        self.assertTrue(result.interrupted)
+        self.assertEqual(result.reason, "operator cancelled HOME")
         self.robot.stop.assert_called_once()
 
     def test_keyboard_interrupt_latches_estop_and_stops(self):

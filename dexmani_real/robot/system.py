@@ -1,10 +1,11 @@
-"""Single-threaded hand I/O and arm submission, without session lifecycle ownership."""
+"""父进程独占手部 I/O，机械臂 SDK 由子进程持有。"""
 
 import logging
 import threading
 import time
 from concurrent.futures import CancelledError
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
@@ -14,7 +15,15 @@ from dexmani_real.robot.commands import (
     check_arm_target,
     check_hand_target,
 )
+from dexmani_real.robot.model import (
+    XHAND_RATED_QPOS_MAX_RAD,
+    XHAND_RATED_QPOS_MIN_RAD,
+)
 from dexmani_real.robot.xhand.feedback import XHandFeedback
+
+if TYPE_CHECKING:
+    from dexmani_real.robot.xarm7.client import ArmClient
+    from dexmani_real.robot.xhand.driver import XHand
 
 logger = logging.getLogger(__name__)
 
@@ -27,18 +36,26 @@ class RobotState:
 
 class DexManiRobot:
     def __init__(
-        self, arm_config, hand_config, *, run_signal, stop_signal, emergency_signal, signal_lock,
+        self,
+        arm_config,
+        hand_config,
+        *,
+        run_signal,
+        stop_signal,
+        emergency_signal,
+        signal_lock,
         check_services=None,
     ):
         self.arm_config, self.hand_config = arm_config, hand_config
         self.arm_lower = np.asarray(arm_config.joint_limit_lower, dtype=np.float64)
         self.arm_upper = np.asarray(arm_config.joint_limit_upper, dtype=np.float64)
-        self.hand_lower = np.asarray(hand_config.mechanical_qpos_min_rad, dtype=np.float64)
-        self.hand_upper = np.asarray(hand_config.mechanical_qpos_max_rad, dtype=np.float64)
+        self.hand_lower = np.asarray(XHAND_RATED_QPOS_MIN_RAD, dtype=np.float64)
+        self.hand_upper = np.asarray(XHAND_RATED_QPOS_MAX_RAD, dtype=np.float64)
         self.run_signal, self.stop_signal = run_signal, stop_signal
         self.emergency_signal, self.signal_lock = emergency_signal, signal_lock
         self.check_services = check_services
-        self.arm = self.hand = None
+        self.arm: ArmClient | None = None
+        self.hand: XHand | None = None
         self.owner = None
         self.connected = False
         self.motion_active = False
@@ -90,11 +107,14 @@ class DexManiRobot:
         try:
             if cancelled():
                 raise CancelledError("robot startup cancelled")
-            from dexmani_real.robot.xarm7.executor import ArmExecutor
+            from dexmani_real.robot.xarm7.client import ArmClient
 
-            self.arm = ArmExecutor(
-                self.arm_config, run_signal=self.run_signal, stop_signal=self.stop_signal,
-                emergency_signal=self.emergency_signal, signal_lock=self.signal_lock,
+            self.arm = ArmClient(
+                self.arm_config,
+                run_signal=self.run_signal,
+                stop_signal=self.stop_signal,
+                emergency_signal=self.emergency_signal,
+                signal_lock=self.signal_lock,
                 input_signal=self.input_signal,
             )
             self.arm.connect(check_services=self.check_services)
@@ -127,7 +147,8 @@ class DexManiRobot:
         def cancelled():
             self.check()
             return bool(
-                cancel_requested() or self.run_signal.value != run_id
+                cancel_requested()
+                or self.run_signal.value != run_id
                 or self.emergency_signal.is_set()
             )
 
@@ -154,12 +175,14 @@ class DexManiRobot:
         state = self.hand.get_state()
         query_completed_ns = time.monotonic_ns()
         return self.hand_feedback.consume(
-            state, source_ns=query_started_ns, now_ns=query_completed_ns,
+            state,
+            source_ns=query_started_ns,
+            now_ns=query_completed_ns,
         )
 
     def read_state(self):
         self.check()
-        if not self.connected:
+        if not self.connected or self.arm is None:
             raise RobotError("robot is not connected")
         try:
             return RobotState(self.arm.snapshot(), self.read_hand())
@@ -175,7 +198,8 @@ class DexManiRobot:
         def check_wait():
             if (
                 (cancel_requested is not None and cancel_requested())
-                or self.run_signal.value != run_id or self.emergency_signal.is_set()
+                or self.run_signal.value != run_id
+                or self.emergency_signal.is_set()
             ):
                 raise CancelledError("XHand initial feedback acquisition cancelled")
             if deadline_ns is not None and time.monotonic_ns() >= deadline_ns:
@@ -185,7 +209,7 @@ class DexManiRobot:
             check_wait()
             state = self.read_state()
             check_wait()
-            if self.hand is None or state.hand is not None:
+            if deadline_ns is None or state.hand is not None:
                 return state
             remaining_ns = deadline_ns - time.monotonic_ns()
             if remaining_ns > 0:
@@ -197,7 +221,7 @@ class DexManiRobot:
             raise RobotError("previous robot stop remains unresolved")
         self.end_hand_send_interval()
         self.motion_active = True
-        self.arm.prepare(run_id, service=service)
+        cast("ArmClient", self.arm).prepare(run_id, service=service)
         self.check_run(run_id)
 
     def send_action(self, command, *, valid_until_ns, execute_until_ns=None):
@@ -237,11 +261,13 @@ class DexManiRobot:
         try:
             if command.arm_qpos is not None:
                 check_send()
-                self.arm.submit(command, submit_until_ns=valid_until_ns, execute_until_ns=execute_until_ns)
+                cast("ArmClient", self.arm).submit(
+                    command, submit_until_ns=valid_until_ns, execute_until_ns=execute_until_ns
+                )
             if command.hand_qpos is not None:
                 check_send()
                 try:
-                    self.hand.send_action(command.hand_qpos)
+                    cast("XHand", self.hand).send_action(command.hand_qpos)
                 except Exception as exc:
                     raise RobotError(f"XHand send failed: {exc}") from exc
             self.check_run(command.run_id)
@@ -255,23 +281,32 @@ class DexManiRobot:
             self.hand.end_send_interval()
 
     def send_hand_home(self, command, *, valid_until_ns):
+        self.check_owner()
         if command.arm_qpos is not None:
             raise ValueError("hand HOME cannot carry an arm streaming target")
         if self.hand_stop_pending or self.stop_failure is not None:
             raise RobotError("previous robot stop remains unresolved")
-        self.arm.begin_operation(command.run_id)
+        cast("ArmClient", self.arm).begin_operation(command.run_id)
         self.end_hand_send_interval()
         self.send_action(command, valid_until_ns=valid_until_ns)
 
-    def home_arm(self, waypoints, target, run_id, abort_check, *, service):
+    def home_arm(self, waypoints, target, run_id, abort_check, *, service, deadline_ns):
         self.check_owner()
         if self.hand_stop_pending or self.stop_failure is not None:
             raise RobotError("previous robot stop remains unresolved")
         if abort_check():
-            return False
+            raise OperationCancelled("arm HOME cancelled before submission")
         self.motion_active = True
-        self.arm.home(waypoints, target, run_id, abort=abort_check, service=service)
-        return not abort_check()
+        cast("ArmClient", self.arm).home(
+            waypoints,
+            target,
+            run_id,
+            abort=abort_check,
+            service=service,
+            deadline_ns=deadline_ns,
+        )
+        if abort_check():
+            raise OperationCancelled("arm HOME cancelled during execution")
 
     def stop_hand(self, *, passive=False):
         if self.hand is None:

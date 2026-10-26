@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import astuple
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -13,19 +12,11 @@ if TYPE_CHECKING:
 
 def validate_robot_config(cfg: ExperimentConfig) -> None:
     cfg.arm.validate()
-    if not all(np.isfinite(value) and value > 0 for value in astuple(cfg.arm.homing)):
-        raise ValueError("all homing parameters must be finite and positive")
     if cfg.hand.enabled:
         cfg.hand.validate()
     else:
         cfg.hand.validate_home_pose()
-    if cfg.environment.table.enabled:
-        cfg.environment.table.validate()
-    for box in cfg.environment.static_boxes:
-        box.validate()
-    names = [box.name for box in cfg.environment.static_boxes]
-    if len(names) != len(set(names)):
-        raise ValueError("static collision box names must be unique")
+    cfg.environment.validate()
 
 
 def validate_control_rate(cfg: ExperimentConfig, control_hz: float) -> None:
