@@ -19,13 +19,9 @@ from dexmani_real.geometry.camera import (
     camera_parameters_cv,
     validate_aligned_depth_distortion,
 )
-from dexmani_real.geometry.kinematics.arm_fk import (
-    compute_eef_pose_history_xarm_base,
-)
-from dexmani_real.perception.hand_geometry import (
-    compute_hand_geometry_history_xarm_base,
-)
-from dexmani_real.perception.pointcloud.processing import build_point_cloud
+from dexmani_real.geometry.kinematics import eef_pose_sequence
+from dexmani_real.perception.hand import hand_geometry_sequence
+from dexmani_real.perception.pointcloud import build_point_cloud
 
 
 def validate_export_episode(
@@ -111,9 +107,9 @@ def iter_canonical_blocks(
             raw["action_arm_joint_target"],
             raw["action_hand_joint_target"],
         )
-        poses = compute_eef_pose_history_xarm_base(arm, arm_fk=arm_fk)
-        action_poses = compute_eef_pose_history_xarm_base(arm_action, arm_fk=arm_fk)
-        hand_geometry = compute_hand_geometry_history_xarm_base(
+        poses = eef_pose_sequence(arm, arm_fk=arm_fk)
+        action_poses = eef_pose_sequence(arm_action, arm_fk=arm_fk)
+        hand_geometry = hand_geometry_sequence(
             poses,
             hand,
             hand_fk=hand_fk,

@@ -21,12 +21,9 @@ from dexmani_real.data.canonical.schema import (
     canonical_array_specs,
 )
 from dexmani_real.data.raw.reader import EpisodeReader, RawDataError, text_attr
-from dexmani_real.geometry.kinematics.arm_fk import ArmFK
-from dexmani_real.geometry.kinematics.hand_fk import HandKinematics
+from dexmani_real.geometry.kinematics import ArmFK, HandFK
 from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
-from dexmani_real.perception.hand_surface import HandPointCloudTemplate
-from dexmani_real.perception.pointcloud.config import SAMPLING_METHOD
-from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
+from dexmani_real.perception.hand import HandSurface
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 from dexmani_real.utils.timing import sampling_clock_ns
 
@@ -74,14 +71,12 @@ def export_canonical(
     ends: list[int] = []
     episode_ids: list[str] = []
     arm_fk: ArmFK
-    hand_fk: HandKinematics
+    hand_fk: HandFK
     hand_cloud = None
     processing_attrs = dict(
         format=CANONICAL_FORMAT,
         action_semantics="absolute_joint_goal_not_next_step_arrival",
-        pointcloud_config=dict(
-            asdict(processing.pointcloud), sampling_method=SAMPLING_METHOD
-        ),
+        pointcloud_config=asdict(processing.pointcloud),
         fingertip_link_names=list(processing.fingertip_link_names),
         handbase_position_eef_m=list(processing.handbase_position_eef_m),
         handbase_quat_eef_wxyz=list(processing.handbase_quat_eef_wxyz),
@@ -116,11 +111,8 @@ def export_canonical(
                     chunk = min(chunk_frames, max(1, (64 * 1024 * 1024) // row_bytes))
                     if hand_cloud is None:
                         arm_fk = ArmFK()
-                        hand_fk = HandKinematics(
-                            str(XHAND_RIGHT_URDF_PATH),
-                            processing.fingertip_link_names,
-                        )
-                        hand_cloud = HandPointCloudTemplate(processing.hand_pointcloud, hand_fk)
+                        hand_fk = HandFK(processing.fingertip_link_names)
+                        hand_cloud = HandSurface(processing.hand_pointcloud, hand_fk)
                     if not ends:
                         period_ns, tolerance_ns = sampling_clock_ns(reader.control_hz)
                         attrs = dict(
@@ -133,7 +125,7 @@ def export_canonical(
                                 tolerance_ns=tolerance_ns,
                             ),
                             depth_scale_m_per_unit=camera.depth_scale_m,
-                            hand_pointcloud_config=hand_cloud.recipe,
+                            hand_pointcloud_config=asdict(processing.hand_pointcloud),
                         )
                         if staging is None:
                             target.parent.mkdir(parents=True, exist_ok=True)
@@ -194,7 +186,7 @@ def export_canonical(
             episode_ids.append(
                 episode.name if episode == source else episode.relative_to(source).as_posix()
             )
-        if not ends:
+        if not ends or staging is None:
             raise ValueError("all selected episodes were rejected; no Zarr written")
         root.create_group("meta").create_dataset(
             "episode_ends", data=np.asarray(ends, dtype=np.int64)

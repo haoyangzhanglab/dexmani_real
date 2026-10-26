@@ -7,16 +7,14 @@ from typing import Mapping
 import numpy as np
 
 from dexmani_real.geometry.camera import camera_parameters_cv
-from dexmani_real.geometry.kinematics.arm_fk import (
+from dexmani_real.geometry.kinematics import (
     ArmFK,
-    compute_eef_pose_history_xarm_base,
+    HandFK,
+    eef_pose_sequence,
 )
-from dexmani_real.geometry.kinematics.hand_fk import HandKinematics
 from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
-from dexmani_real.perception.hand_geometry import (
-    compute_hand_geometry_history_xarm_base,
-)
-from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
+from dexmani_real.perception.hand import HandSurface, hand_geometry_sequence
+from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.runtime.observation import ObservationNeeds, freeze
 
 FIELD_DEPENDENCIES = {
@@ -54,10 +52,10 @@ def policy_needs(dependencies):
 @dataclass(frozen=True)
 class ObservationKinematics:
     arm_fk: ArmFK
-    hand_fk: HandKinematics | None = None
+    hand_fk: HandFK | None = None
     handbase_position_eef_m: tuple[float, float, float] | None = None
     handbase_rotation_eef: np.ndarray | None = None
-    hand_cloud: object | None = None
+    hand_cloud: HandSurface | None = None
     row_features: dict = field(default_factory=dict)
 
 
@@ -112,15 +110,12 @@ def build_observation_kinematics(dependencies, *, fingertip_link_names, hand, ha
         return None
     if "hand_fk" not in dependencies:
         return ObservationKinematics(ArmFK())
-    hand_fk = HandKinematics(
-        str(XHAND_RIGHT_URDF_PATH),
-        fingertip_link_names if "fingertips" in dependencies else None,
+    hand_fk = HandFK(
+        fingertip_link_names if "fingertips" in dependencies else XHAND_FINGERTIP_LINK_NAMES,
     )
     hand_cloud = None
     if "hand_cloud" in dependencies:
-        from dexmani_real.perception.hand_surface import HandPointCloudTemplate
-
-        hand_cloud = HandPointCloudTemplate(hand_pointcloud, hand_fk)
+        hand_cloud = HandSurface(hand_pointcloud, hand_fk)
     return ObservationKinematics(
         ArmFK(), hand_fk,
         tuple(hand.T_eef_handbase_pos_xyz),
@@ -174,11 +169,11 @@ def build_policy_observation(rows, fields, dependencies, *, kinematics=None, cam
         features = {}
         if new_rows:
             arm = np.stack([r.values["arm_qpos"] for r in new_rows])
-            poses = compute_eef_pose_history_xarm_base(arm, arm_fk=kinematics.arm_fk)
+            poses = eef_pose_sequence(arm, arm_fk=kinematics.arm_fk)
             if "eef_pose" in fields:
                 features["eef_pose"] = poses.astype(np.float32)
             if "hand_fk" in dependencies:
-                features.update(compute_hand_geometry_history_xarm_base(
+                features.update(hand_geometry_sequence(
                     poses, np.stack([r.values["hand_qpos"] for r in new_rows]),
                     hand_fk=kinematics.hand_fk,
                     handbase_position_eef_m=kinematics.handbase_position_eef_m,

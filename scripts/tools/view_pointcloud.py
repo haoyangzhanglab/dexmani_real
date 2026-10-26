@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import json
+import time
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -19,15 +23,10 @@ from dexmani_real.calibration.table_plane import (
 from dexmani_real.config import load_experiment_config
 from dexmani_real.geometry.camera import CameraIntrinsics
 from dexmani_real.geometry.plane import fit_table_plane
-from dexmani_real.perception.pointcloud.config import PointCloudConfig
-from dexmani_real.perception.pointcloud.diagnostics import (
-    benchmark_production_pipeline,
-    build_cloud,
-    print_depth_stats,
-    save_diagnostic_snapshot,
-)
-from dexmani_real.perception.pointcloud.processing import (
+from dexmani_real.perception.config import PointCloudConfig
+from dexmani_real.perception.pointcloud import (
     aligned_depth_points_in_base,
+    build_point_cloud,
     build_raw_point_cloud,
 )
 from dexmani_real.utils.log import configure_logging
@@ -62,6 +61,112 @@ SENSOR_OPTION_NAMES = (
 )
 
 
+def print_depth_stats(depth_m: np.ndarray, vmin: float, vmax: float) -> None:
+    print("\n" + "=" * 60)
+    print("2-D Depth Gate (diagnostic view)")
+    print("=" * 60)
+    valid = np.isfinite(depth_m) & (depth_m >= float(vmin)) & (depth_m <= float(vmax))
+    ratio = float(np.mean(valid))
+    print(
+        f"  Range [{vmin:.2f}, {vmax:.2f}] m:  {int(valid.sum()):6d} / "
+        f"{depth_m.size} pixels  ({ratio * 100:.1f}%)"
+    )
+
+
+def save_diagnostic_snapshot(
+    *,
+    output_root: Path,
+    rgb: np.ndarray,
+    depth_raw: np.ndarray,
+    raw_point_cloud: np.ndarray,
+    processed_point_cloud: np.ndarray,
+    depth_scale_m: float,
+    intrinsics: CameraIntrinsics,
+    T_xarm_base_from_color: np.ndarray,
+    table_plane_abcd: tuple[float, float, float, float] | None,
+    table_plane_source: str,
+    pointcloud_config: PointCloudConfig,
+    camera_info: dict,
+) -> Path:
+    timestamp = datetime.now().astimezone()
+    target = output_root.expanduser().resolve() / timestamp.strftime("pointcloud_%Y%m%d_%H%M%S_%f")
+    target.mkdir(parents=True)
+
+    arrays = {
+        "rgb.npy": rgb,
+        "depth_aligned_to_color_raw.npy": depth_raw,
+        "raw_point_cloud.npy": raw_point_cloud,
+        "processed_point_cloud.npy": processed_point_cloud,
+        "T_xarm_base_from_color.npy": T_xarm_base_from_color,
+    }
+    metadata = {
+        "created_at": timestamp.isoformat(),
+        "payload_mode": "depth_to_color_aligned_rgbd",
+        "depth_payload_frame": "color",
+        "depth_scale_m_per_unit": float(depth_scale_m),
+        "color_intrinsics": intrinsics.to_dict(),
+        "table_plane_abcd": None if table_plane_abcd is None else list(table_plane_abcd),
+        "table_plane_source": table_plane_source,
+        "pointcloud_config": asdict(pointcloud_config),
+        "point_cloud_frame": "xarm_base",
+        "point_cloud_columns": ["x_m", "y_m", "z_m", "r", "g", "b"],
+        "raw_point_cloud_semantics": "all_finite_nonzero_aligned_depth_pixels",
+        "processed_point_cloud_empty": processed_point_cloud.shape[0] == 0,
+        "camera": {key: camera_info[key] for key in ("name", "serial", "firmware")},
+        "arrays": {
+            name: {"shape": list(value.shape), "dtype": str(value.dtype)}
+            for name, value in arrays.items()
+        },
+    }
+
+    for name, value in arrays.items():
+        np.save(target / name, value, allow_pickle=False)
+    with (target / "metadata.json").open("w", encoding="utf-8") as stream:
+        json.dump(metadata, stream, ensure_ascii=False, indent=2)
+    return target
+
+
+def benchmark_production_pipeline(
+    *,
+    camera: RealSenseCamera,
+    intrinsics: CameraIntrinsics,
+    T_xarm_base_from_color: np.ndarray,
+    config: PointCloudConfig,
+    table_plane_abcd: tuple[float, float, float, float] | None,
+    frame_count: int = 20,
+) -> None:
+    elapsed_ms: list[float] = []
+    end_to_end_ms: list[float] = []
+    valid_clouds = 0
+    for _ in range(frame_count):
+        frame_started = time.perf_counter()
+        frame = camera.read()
+        started = time.perf_counter()
+        cloud = build_point_cloud(
+            depth_raw=frame.depth_aligned_to_color_raw,
+            color=frame.rgb,
+            depth_scale_m=camera.get_depth_scale(),
+            intrinsics=intrinsics,
+            T_xarm_base_from_color=T_xarm_base_from_color,
+            table_plane_abcd=table_plane_abcd,
+            config=config,
+        )
+        elapsed_ms.append((time.perf_counter() - started) * 1000.0)
+        end_to_end_ms.append((time.perf_counter() - frame_started) * 1000.0)
+        valid_clouds += cloud is not None
+    values = np.asarray(elapsed_ms, dtype=np.float64)
+    end_to_end_values = np.asarray(end_to_end_ms, dtype=np.float64)
+    print(
+        f"  Fresh-frame benchmark: n={frame_count} "
+        f"p50={np.percentile(values, 50):.1f} ms "
+        f"p95={np.percentile(values, 95):.1f} ms; valid clouds={valid_clouds}/{frame_count}"
+    )
+    print(
+        f"  Capture-to-cloud benchmark: p50={np.percentile(end_to_end_values, 50):.1f} ms "
+        f"p95={np.percentile(end_to_end_values, 95):.1f} ms"
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="RealSense tabletop point-cloud processing and calibration diagnostic"
@@ -71,7 +176,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Atomically save the post-calibration aligned RGB-D frame, raw and "
+            "Save the post-calibration aligned RGB-D frame, raw and "
             "processed clouds, and reconstruction metadata below this directory"
         ),
     )
@@ -90,7 +195,7 @@ def print_device_info(camera: RealSenseCamera) -> dict:
     print(f"Firmware: {info['firmware']}")
     print("=" * 60)
 
-    device = camera.profile.get_device()
+    device = cast("rs.pipeline_profile", camera.profile).get_device()
     depth_sensor = device.first_depth_sensor()
 
     preset = depth_sensor.get_option(rs.option.visual_preset)
@@ -229,7 +334,6 @@ def run_pointcloud_diagnostic(args) -> int:
     runtime = load_experiment_config(yaml_path=args.config)
     runtime.camera.validate()
     pcd_config = runtime.pointcloud
-    pcd_config.validate()
     calibration = CameraExtrinsics(args.camera_calibration)
     table_plane_abcd = (
         resolve_table_plane(runtime.environment.table)
@@ -277,7 +381,7 @@ def run_pointcloud_diagnostic(args) -> int:
             table_plane_source = "resolved_runtime"
             print(
                 "  Table calibration skipped; using resolved table_plane.json: "
-                f"{np.round(table_plane_abcd, 6)}"
+                f"{table_plane_abcd}"
             )
         else:
             table_plane_abcd = None
@@ -292,15 +396,21 @@ def run_pointcloud_diagnostic(args) -> int:
             depth_range_m=(VIS_DEPTH_MIN_M, VIS_DEPTH_MAX_M),
         )
 
-        result = build_cloud(
+        print(f"Point-cloud processing: {pcd_config}")
+        started = time.perf_counter()
+        result = build_point_cloud(
             depth_raw=depth_raw,
-            rgb=rgb,
+            color=rgb,
             depth_scale_m=camera.get_depth_scale(),
             intrinsics=intrinsics,
             T_xarm_base_from_color=T_xarm_base_from_color,
             config=pcd_config,
             table_plane_abcd=table_plane_abcd,
         )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if result is None:
+            result = np.empty((0, 6), dtype=np.float32)
+        print(f"Output: {len(result)} points ({elapsed_ms:.1f} ms)")
         if save_dir is not None:
             raw_cloud = build_raw_point_cloud(
                 depth_raw=depth_raw,

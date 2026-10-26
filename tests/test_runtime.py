@@ -342,6 +342,28 @@ class ReplayInputTests(unittest.TestCase):
 
 
 class PreviewInputTests(unittest.TestCase):
+    def test_cloud_geometry_loads_current_config_without_legacy_validation(self):
+        from scripts.tools import view_realsense as preview
+
+        runtime = load_experiment_config()
+        example = preview.RealSenseExample(SimpleNamespace(camera_calibration=None))
+        example.production = runtime.pointcloud
+        example.table = runtime.environment.table
+        example.calibration = None
+        example.table_plane_abcd = None
+        transform, plane = np.eye(4), (0.0, 0.0, 1.0, 0.0)
+        with (
+            patch.object(preview, "CameraExtrinsics") as calibration,
+            patch.object(preview, "resolve_table_plane", return_value=plane) as resolve,
+        ):
+            calibration.return_value.for_serial.return_value = transform
+            np.testing.assert_array_equal(example.load_pointcloud_geometry("raw", "camera")[0], transform)
+            resolve.assert_not_called()
+            self.assertEqual(example.load_pointcloud_geometry("processed", "camera")[1], plane)
+            self.assertEqual(example.load_pointcloud_geometry("processed", "camera")[1], plane)
+            resolve.assert_called_once_with(runtime.environment.table)
+            calibration.assert_called_once_with(None)
+
     def test_cloud_toggle_mode_and_reset_share_geometry_state(self):
         from scripts.tools import view_realsense as preview
 

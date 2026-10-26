@@ -1,44 +1,21 @@
-"""Color-grid intrinsics and model camera parameters for aligned RGB-D."""
+"""对齐到 color 网格的相机参数与 RGB-D 反投影。"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from functools import lru_cache
 from typing import Any, cast
 
 import numpy as np
 
-__all__ = [
-    "CameraIntrinsics",
-    "CameraSnapshot",
-    "camera_parameters_cv",
-    "validate_aligned_depth_distortion",
-]
-
 
 def validate_aligned_depth_distortion(model: str) -> None:
-    """Require a model implemented by canonical color-grid depth deprojection."""
     if model not in {"distortion.none", "none", "distortion.brown_conrady", "brown_conrady"}:
         raise ValueError(f"depth deprojection has no validated path for distortion model {model!r}")
 
 
-def finite_positive(value: float, *, name: str) -> float:
-    result = float(value)
-    if not np.isfinite(result) or result <= 0.0:
-        raise ValueError(f"{name} must be finite and positive")
-    return result
-
-
-def positive_int(value: object, *, name: str) -> int:
-    """Validate one dimension without silently truncating a numeric value."""
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
 @dataclass(frozen=True)
 class CameraIntrinsics:
-    """One camera stream's immutable active profile calibration."""
-
     width: int
     height: int
     fx: float
@@ -49,19 +26,13 @@ class CameraIntrinsics:
     distortion_coeffs: tuple[float, float, float, float, float]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "width", positive_int(self.width, name="width"))
-        object.__setattr__(self, "height", positive_int(self.height, name="height"))
-        object.__setattr__(self, "fx", finite_positive(self.fx, name="fx"))
-        object.__setattr__(self, "fy", finite_positive(self.fy, name="fy"))
-        for name in ("ppx", "ppy"):
-            value = float(getattr(self, name))
-            if not np.isfinite(value):
-                raise ValueError(f"{name} must be finite")
-            object.__setattr__(self, name, value)
-        model = str(self.distortion_model).strip()
-        if not model:
-            raise ValueError("distortion_model must be non-empty")
-        object.__setattr__(self, "distortion_model", model)
+        if any(type(v) is not int or v <= 0 for v in (self.width, self.height)):
+            raise ValueError("camera width and height must be positive integers")
+        if (
+            not np.isfinite((self.fx, self.fy, self.ppx, self.ppy)).all()
+            or min(self.fx, self.fy) <= 0
+        ):
+            raise ValueError("camera intrinsics must be finite with positive focal lengths")
         coeffs = tuple(float(value) for value in self.distortion_coeffs)
         if len(coeffs) != 5 or not np.all(np.isfinite(coeffs)):
             raise ValueError("distortion_coeffs must contain five finite values")
@@ -72,16 +43,7 @@ class CameraIntrinsics:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "width": self.width,
-            "height": self.height,
-            "fx": self.fx,
-            "fy": self.fy,
-            "ppx": self.ppx,
-            "ppy": self.ppy,
-            "distortion_model": self.distortion_model,
-            "distortion_coeffs": list(self.distortion_coeffs),
-        }
+        return {**asdict(self), "distortion_coeffs": list(self.distortion_coeffs)}
 
     def matrix(self, *, dtype: np.typing.DTypeLike = np.float64) -> np.ndarray:
         return np.array(
@@ -102,7 +64,8 @@ class CameraSnapshot:
     def __post_init__(self):
         if not isinstance(self.serial, str) or not self.serial.strip():
             raise ValueError("active camera serial must be nonempty")
-        object.__setattr__(self, "depth_scale_m", finite_positive(self.depth_scale_m, name="depth_scale"))
+        if not np.isfinite(self.depth_scale_m) or self.depth_scale_m <= 0:
+            raise ValueError("depth_scale_m must be finite and positive")
         if self.T_xarm_base_from_color is not None:
             transform = np.array(self.T_xarm_base_from_color, dtype=np.float64, copy=True)
             transform.setflags(write=False)
@@ -121,7 +84,9 @@ class CameraSnapshot:
             "depth_scale": self.depth_scale_m,
         }
         if self.T_xarm_base_from_color is not None:
-            values["camera_T_xarm_base_from_color"] = self.T_xarm_base_from_color.reshape(-1).tolist()
+            values["camera_T_xarm_base_from_color"] = self.T_xarm_base_from_color.reshape(
+                -1
+            ).tolist()
         return values
 
 
@@ -130,16 +95,60 @@ def camera_parameters_cv(
     T_xarm_base_from_color: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """将已校验几何转为 float32 K(9) 和 base→color [R|t](12)，采用 optical RDF 轴。"""
-    matrices = {"camera_intrinsic": color.matrix()}
+    parameters = {"camera_intrinsic": color.matrix(dtype=np.float32).ravel()}
     if T_xarm_base_from_color is not None:
-        matrices["camera_extrinsic"] = np.linalg.inv(T_xarm_base_from_color)[:3, :4]
-    result = {}
-    for name, matrix in matrices.items():
-        if not np.isfinite(matrix).all() or np.any(np.abs(matrix) > np.finfo(np.float32).max):
-            raise ValueError(f"{name} must be finite and representable as float32")
-        values = matrix.astype(np.float32).reshape(-1)
-        if name == "camera_intrinsic" and (values[0] <= 0 or values[4] <= 0):
-            raise ValueError("camera_intrinsic fx/fy must remain positive in float32")
+        rotation = T_xarm_base_from_color[:3, :3].T
+        translation = -rotation @ T_xarm_base_from_color[:3, 3]
+        parameters["camera_extrinsic"] = (
+            np.column_stack((rotation, translation)).astype(np.float32).ravel()
+        )
+    for values in parameters.values():
         values.setflags(write=False)
-        result[name] = values
-    return result
+    return parameters
+
+
+def undistorted_depth_coordinates(
+    rows: np.ndarray,
+    columns: np.ndarray,
+    intrinsics: CameraIntrinsics,
+) -> tuple[np.ndarray, np.ndarray]:
+    validate_aligned_depth_distortion(intrinsics.distortion_model)
+    xd = (columns.astype(np.float32) - np.float32(intrinsics.ppx)) / np.float32(intrinsics.fx)
+    yd = (rows.astype(np.float32) - np.float32(intrinsics.ppy)) / np.float32(intrinsics.fy)
+    if intrinsics.distortion_model in {"distortion.none", "none"}:
+        x, y = xd, yd
+    else:
+        # 与 librealsense 一致，固定点迭代反解 Brown-Conrady 畸变。
+        k1, k2, p1, p2, k3 = (np.float32(value) for value in intrinsics.distortion_coeffs)
+        x, y = xd.copy(), yd.copy()
+        for _ in range(10):
+            r2 = x * x + y * y
+            radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+            delta_x = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+            delta_y = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+            x = (xd - delta_x) / radial
+            y = (yd - delta_y) / radial
+    return x, y
+
+
+@lru_cache(maxsize=4)
+def depth_rays(intrinsics: CameraIntrinsics) -> np.ndarray:
+    """缓存静态内参对应的逐像素射线。"""
+    rows, columns = np.indices((intrinsics.height, intrinsics.width), dtype=np.int64)
+    x, y = undistorted_depth_coordinates(rows.reshape(-1), columns.reshape(-1), intrinsics)
+    rays = np.column_stack((x, y, np.ones(x.size, dtype=np.float32))).reshape(
+        intrinsics.height, intrinsics.width, 3
+    )
+    rays.setflags(write=False)
+    return rays
+
+
+def deproject_depth(
+    depth_m: np.ndarray,
+    valid: np.ndarray,
+    intrinsics: CameraIntrinsics,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rows, columns = np.nonzero(valid)
+    z = depth_m[rows, columns]
+    rays = depth_rays(intrinsics)[rows, columns]
+    return np.ascontiguousarray(rays * z[:, None], dtype=np.float32), rows, columns

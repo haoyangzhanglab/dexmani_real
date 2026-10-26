@@ -10,7 +10,7 @@ from dexmani_real.control.constraints import (
     equivalent_joint_delta,
     wrap_nearest_equivalent,
 )
-from dexmani_real.geometry.kinematics.arm_fk import ArmFK
+from dexmani_real.geometry.kinematics import ArmFK
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_EQUIVALENT_JOINT_MASK
 from dexmani_real.robot.xarm7.config import ArmConfig
 
@@ -110,7 +110,7 @@ def check_home_path(
         reason = planner.collision_model.rejection(waypoint)
         if reason is not None:
             raise HomePathRejected(f"collision at sample {index}: {reason}")
-        position, _ = planner.arm_fk.compute(waypoint)
+        position, _ = planner.arm_fk.forward(waypoint)
         if np.any(
             position < planner.workspace_bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M
         ) or np.any(position > planner.workspace_bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M):

@@ -5,8 +5,12 @@ from __future__ import annotations
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.geometry.pose import Pose, quat_multiply, quat_wxyz_to_rotmat
-from dexmani_real.geometry.transforms import normalize_quat_wxyz
+from dexmani_real.geometry.pose import (
+    Pose,
+    normalize_quat_wxyz,
+    quat_multiply,
+    quat_wxyz_to_rotmat,
+)
 
 
 def matrix_quat_wxyz(matrix):

@@ -1,4 +1,4 @@
-"""Publish float32 [N,6] base-frame clouds once per newest camera sequence."""
+"""每个最新相机序列处理一次，保留原始来源时间。"""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import time
 from typing import TYPE_CHECKING, cast
 
 from dexmani_real.geometry.camera import CameraSnapshot
-from dexmani_real.perception.pointcloud.config import PointCloudConfig
-from dexmani_real.perception.pointcloud.processing import build_point_cloud
+from dexmani_real.perception.config import PointCloudConfig
+from dexmani_real.perception.pointcloud import build_point_cloud
 from dexmani_real.utils.log import configure_logging
 
 if TYPE_CHECKING:
@@ -21,7 +21,9 @@ IDLE_POLL_S = 0.001
 
 
 def run_pointcloud_worker(
-    shared: "SensorChannels", pointcloud: PointCloudConfig, camera: CameraSnapshot,
+    shared: "SensorChannels",
+    pointcloud: PointCloudConfig,
+    camera: CameraSnapshot,
     table_plane_abcd: tuple[float, float, float, float] | None,
 ) -> None:
     configure_logging()
@@ -29,7 +31,8 @@ def run_pointcloud_worker(
         raise ValueError("pointcloud requires camera extrinsics")
     logger.debug(
         "pointcloud config=%s table_plane_abcd=%s",
-        pointcloud, table_plane_abcd,
+        pointcloud,
+        table_plane_abcd,
     )
 
     last_camera_sequence = 0

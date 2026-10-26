@@ -319,7 +319,7 @@ class SensorWorkerTests(unittest.TestCase):
         self.assertFalse(self.channels.camera_ready.is_set())
 
     def test_pointcloud_processes_each_camera_frame_once(self):
-        from dexmani_real.perception.pointcloud import worker
+        from dexmani_real.perception import worker
 
         frame = np.zeros((), dtype=self.channels.camera_ring.dtype)
         frame["timestamp_ns"] = 101

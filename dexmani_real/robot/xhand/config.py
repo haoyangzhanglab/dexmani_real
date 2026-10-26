@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.geometry.transforms import validate_unit_quaternion_wxyz
+from dexmani_real.geometry.pose import validate_unit_quaternion_wxyz
 from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
     XHAND_RATED_QPOS_MAX_RAD,

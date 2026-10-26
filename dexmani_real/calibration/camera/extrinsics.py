@@ -11,7 +11,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real.calibration import CAMERAS_PATH
-from dexmani_real.geometry.transforms import (
+from dexmani_real.geometry.pose import (
     validate_rigid_transform,
     validate_unit_quaternion_wxyz,
 )

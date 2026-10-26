@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.geometry.transforms import validate_rigid_transform
+from dexmani_real.geometry.pose import validate_rigid_transform
 
 HAND_EYE_METHODS = {
     "TSAI": cv2.CALIB_HAND_EYE_TSAI,

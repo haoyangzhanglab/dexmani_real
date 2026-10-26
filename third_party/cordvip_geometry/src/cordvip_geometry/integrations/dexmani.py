@@ -136,7 +136,7 @@ class RawHandCloudProvider:
             load_raw_episode_base_from_color,
         )
         from dexmani_real.data.raw.reader import EpisodeReader
-        from dexmani_real.geometry.kinematics.arm_fk import ArmFK
+        from dexmani_real.geometry.kinematics import ArmFK
         from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
         from dexmani_real.robot.model import (
             XARM7_JOINT_NAMES,
@@ -151,7 +151,7 @@ class RawHandCloudProvider:
         self.episode = Path(episode).expanduser().resolve()
         config_path = Path(config_path).expanduser().resolve() if config_path is not None else None
         config = load_experiment_config(yaml_path=config_path)
-        from dexmani_real.geometry.transforms import validate_unit_quaternion_wxyz
+        from dexmani_real.geometry.pose import validate_unit_quaternion_wxyz
 
         mount = np.asarray(config.hand.T_eef_handbase_pos_xyz, dtype=np.float64)
         if mount.shape != (3,) or not np.isfinite(mount).all():
@@ -175,7 +175,7 @@ class RawHandCloudProvider:
                 if key in reader.meta
             }
         self.T_camera_base = np.linalg.inv(self.T_base_camera)
-        self.arm_fk = ArmFK(str(XARM7_XHAND_COLLISION_URDF_PATH))
+        self.arm_fk = ArmFK()
         self.hand_model = HandCloudModel(
             XHAND_RIGHT_URDF_PATH,
             XHAND_SDK_JOINT_NAMES,
@@ -233,7 +233,7 @@ class RawHandCloudProvider:
         joint_state = np.concatenate((self.arm_qpos[row], self.hand_qpos[row]))
         if not np.isfinite(joint_state).all():
             raise ValueError(f"Raw row {row}: measured arm/hand joints are missing or nonfinite")
-        position, rot6d = self.arm_fk.compute(self.arm_qpos[row])
+        position, rot6d = self.arm_fk.forward(self.arm_qpos[row])
         T_base_eef = np.eye(4)
         T_base_eef[:3, 3] = position
         T_base_eef[:3, :3] = rot6d_to_rotmat(rot6d)

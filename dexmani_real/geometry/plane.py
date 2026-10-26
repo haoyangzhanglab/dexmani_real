@@ -1,4 +1,4 @@
-"""机器人基座系的桌面拟合与质量评估；不进行文件或设备 I/O。"""
+"""用 RANSAC 和最小二乘拟合基座系的向上桌面平面。"""
 
 from __future__ import annotations
 
@@ -10,8 +10,6 @@ import numpy as np
 
 @dataclass(frozen=True)
 class TablePlaneFit:
-    """Validated upward table plane and auditable fit quality."""
-
     plane_abcd: tuple[float, float, float, float]
     inlier_points: int
     evaluated_points: int
@@ -19,27 +17,6 @@ class TablePlaneFit:
     rms_residual_m: float
     max_abs_residual_m: float
     tilt_deg: float
-
-    def __post_init__(self) -> None:
-        metrics = np.asarray(
-            (
-                self.inlier_ratio,
-                self.rms_residual_m,
-                self.max_abs_residual_m,
-                self.tilt_deg,
-            ),
-            dtype=np.float64,
-        )
-        if (
-            self.inlier_points <= 0
-            or self.evaluated_points < self.inlier_points
-            or not np.all(np.isfinite(metrics))
-            or not 0.0 < self.inlier_ratio <= 1.0
-            or self.rms_residual_m < 0.0
-            or self.max_abs_residual_m < self.rms_residual_m
-            or not 0.0 <= self.tilt_deg < 90.0
-        ):
-            raise ValueError("table fit quality metrics are inconsistent")
 
     def to_dict(self) -> dict[str, Any]:
         a, b, c, d = self.plane_abcd
@@ -74,9 +51,9 @@ def normalized_upward_plane(normal: np.ndarray, offset: float) -> tuple[np.ndarr
 def least_squares_plane(points: np.ndarray) -> tuple[np.ndarray, float]:
     center = np.mean(points, axis=0, dtype=np.float64)
     centered = points - center
-    covariance = centered.T @ centered / max(1, points.shape[0])
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    normal = eigenvectors[:, int(np.argmin(eigenvalues))]
+    covariance = centered.T @ centered / len(points)
+    _, eigenvectors = np.linalg.eigh(covariance)
+    normal = eigenvectors[:, 0]
     return normalized_upward_plane(normal, -float(normal @ center))
 
 
@@ -84,30 +61,22 @@ def fit_table_plane(
     points_base: np.ndarray,
     *,
     distance_threshold_m: float = 0.006,
-    max_iterations: int = 500,
-    max_evaluated_points: int = 60_000,
-    min_inlier_points: int = 1_000,
-    min_inlier_ratio: float = 0.20,
     max_tilt_deg: float = 20.0,
-    random_seed: int = 0,
 ) -> TablePlaneFit:
-    """Fit/refine the dominant near-horizontal plane with deterministic RANSAC; reject wall-like tilt."""
+    min_inlier_points, min_inlier_ratio = 1000, 0.20
+    max_evaluated_points = 60_000
     points = np.asarray(points_base, dtype=np.float64)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("points_base must have shape [N,3]")
     points = points[np.all(np.isfinite(points), axis=1)]
-    if points.shape[0] < max(3, min_inlier_points):
+    if points.shape[0] < min_inlier_points:
         raise ValueError("not enough finite points for table calibration")
     if not np.isfinite(distance_threshold_m) or distance_threshold_m <= 0.0:
         raise ValueError("distance_threshold_m must be finite and positive")
-    if max_iterations <= 0 or max_evaluated_points < 3:
-        raise ValueError("RANSAC iteration and point limits must be positive")
-    if not 0.0 < min_inlier_ratio <= 1.0:
-        raise ValueError("min_inlier_ratio must be in (0,1]")
     if not 0.0 < max_tilt_deg < 90.0:
         raise ValueError("max_tilt_deg must be in (0,90)")
 
-    rng = np.random.default_rng(random_seed)
+    rng = np.random.default_rng(0)
     if points.shape[0] > max_evaluated_points:
         evaluated = points[rng.choice(points.shape[0], size=max_evaluated_points, replace=False)]
     else:
@@ -117,13 +86,12 @@ def fit_table_plane(
     best_mask: np.ndarray | None = None
     best_count = 0
     best_mean_residual = np.inf
-    for _ in range(max_iterations):
+    for _ in range(500):
         triplet = evaluated[rng.choice(evaluated.shape[0], size=3, replace=False)]
         normal = np.cross(triplet[1] - triplet[0], triplet[2] - triplet[0])
-        try:
-            normal, offset = normalized_upward_plane(normal, -float(normal @ triplet[0]))
-        except ValueError:
+        if np.linalg.norm(normal) <= 1e-12:
             continue
+        normal, offset = normalized_upward_plane(normal, -float(normal @ triplet[0]))
         if normal[2] < min_normal_z:
             continue
         residual = np.abs(evaluated @ normal + offset)

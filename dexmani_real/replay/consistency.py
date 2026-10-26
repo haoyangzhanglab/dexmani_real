@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.geometry.kinematics.arm_fk import compute_eef_pose_history_xarm_base
+from dexmani_real.geometry.kinematics import eef_pose_sequence
 from dexmani_real.geometry.pose import rot6d_to_rotmat
 from dexmani_real.replay.trajectory import TrajectoryData
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
@@ -183,7 +183,7 @@ def evaluate_replay(
         print("\nSkipping metrics: no valid reference or replay data available")
         return
     try:
-        poses = compute_eef_pose_history_xarm_base(replay_data["arm_qpos"])
+        poses = eef_pose_sequence(replay_data["arm_qpos"])
     except Exception as exc:
         raise RuntimeError(
             f"replay EEF derivation failed after physical capture was saved: "

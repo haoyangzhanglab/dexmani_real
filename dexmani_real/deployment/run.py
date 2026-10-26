@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import subprocess
 import time
@@ -85,8 +86,8 @@ def run_policy(
 
     from dexmani_policy.common.config import load_experiment_config
     from dexmani_policy.common.experiments import (
-        resolve_best_checkpoint,
         resolve_checkpoint_path,
+        resolve_milestone_path,
     )
     from dexmani_policy.deployment import inspect_policy
     from dexmani_policy.deployment.metadata import resolve_experiment
@@ -94,7 +95,8 @@ def run_policy(
     directory = resolve_experiment(experiment)
     cfg = load_experiment_config(directory)
     if checkpoint == "best":
-        selected, checkpoint_path = resolve_best_checkpoint(directory)
+        selected = json.loads((directory / "best_ckpt.json").read_text())
+        checkpoint_path = resolve_milestone_path(directory, selected["ckpt_relpath"])
         defaults = selected["inference"]
     else:
         checkpoint_path = resolve_checkpoint_path(directory, str(checkpoint))

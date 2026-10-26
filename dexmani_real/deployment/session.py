@@ -266,7 +266,7 @@ class PolicySession:
                 self.run_config, self.results_dir / "run_config.yaml",
             )
         if self.needs.point_cloud:
-            from dexmani_real.perception.pointcloud.worker import run_pointcloud_worker
+            from dexmani_real.perception.worker import run_pointcloud_worker
 
             self.sensors.start(
                 self.process_context.Process(

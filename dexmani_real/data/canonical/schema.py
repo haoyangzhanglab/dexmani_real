@@ -7,8 +7,8 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.perception.hand_config import HandPointCloudConfig
-from dexmani_real.perception.pointcloud.config import PointCloudConfig
+from dexmani_real.geometry.pose import validate_unit_quaternion_wxyz
+from dexmani_real.perception.config import HandCloudConfig, PointCloudConfig
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.robot.xhand.config import HandConfig
 
@@ -18,7 +18,7 @@ class ProcessingConfig:
     """Full-modal processing requires complete physical/derived modalities and finite floats on every row."""
 
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
-    hand_pointcloud: HandPointCloudConfig = field(default_factory=HandPointCloudConfig)
+    hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
     fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
     handbase_position_eef_m: tuple[float, ...] = HandConfig.T_eef_handbase_pos_xyz
@@ -36,16 +36,10 @@ class ProcessingConfig:
         )
 
     def __post_init__(self) -> None:
-        self.pointcloud.validate()
-        self.hand_pointcloud.validate()
-        if (
-            len(self.fingertip_link_names) != 5
-            or len(set(self.fingertip_link_names)) != 5
-            or any(
-                not isinstance(name, str) or not name.strip() for name in self.fingertip_link_names
-            )
-        ):
-            raise ValueError("fingertip geometry requires five distinct link names")
+        position = np.asarray(self.handbase_position_eef_m, dtype=np.float64)
+        if position.shape != (3,) or not np.isfinite(position).all():
+            raise ValueError("hand base position must be a finite (3,) vector")
+        validate_unit_quaternion_wxyz(self.handbase_quat_eef_wxyz, name="hand base quaternion")
         if not self.pointcloud.remove_table:
             object.__setattr__(self, "table_plane_abcd", None)
         elif self.table_plane_abcd is None:

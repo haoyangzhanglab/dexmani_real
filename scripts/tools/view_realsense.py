@@ -14,7 +14,7 @@ from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
 from dexmani_real.calibration.table_plane import resolve_table_plane
 from dexmani_real.config import load_experiment_config
 from dexmani_real.geometry.camera import validate_aligned_depth_distortion
-from dexmani_real.perception.pointcloud.processing import (
+from dexmani_real.perception.pointcloud import (
     build_point_cloud,
     build_raw_point_cloud,
 )
@@ -110,10 +110,6 @@ class RealSenseExample:
         # Resolve experiment settings before enumerating or opening a camera.
         self.runtime = load_experiment_config(yaml_path=self.args.config)
         self.production = self.runtime.pointcloud
-        if not np.isfinite([self.production.depth_min_m, self.production.depth_max_m]).all() or not (
-            0.0 < self.production.depth_min_m < self.production.depth_max_m
-        ):
-            raise ValueError("display depth range must be finite and satisfy 0 < min < max")
         self.table = self.runtime.environment.table
         self.calibration: CameraExtrinsics | None = None
         self.table_plane_abcd: tuple[float, float, float, float] | None = None
@@ -301,8 +297,6 @@ class RealSenseExample:
     def load_pointcloud_geometry(
         self, mode: str, serial: str,
     ) -> tuple[np.ndarray, tuple[float, float, float, float] | None]:
-        if mode == "processed":
-            self.production.validate()
         if self.calibration is None:
             self.calibration = CameraExtrinsics(self.args.camera_calibration)
         transform = self.calibration.for_serial(serial)

@@ -174,7 +174,7 @@ class GeometryTests(unittest.TestCase):
         for _ in range(12):
             target_q = current + rng.uniform(-0.025, 0.025, 7)
             target = solver.compute_eef_pose_base(target_q)
-            position, _ = self.mapper.constraints.target_fk.compute(target_q)
+            position, _ = self.mapper.constraints.target_fk.forward(target_q)
             np.testing.assert_allclose(target.p, position, atol=1e-8)
             result = solver.solve(
                 target, current, current, hand_qpos=np.deg2rad(self.hand.home_qpos_deg)
@@ -219,7 +219,7 @@ class GeometryTests(unittest.TestCase):
                 if mode == "joint":
                     np.testing.assert_array_equal(control[:7], command.arm_qpos)
                 else:
-                    position, rotation = self.mapper.constraints.target_fk.compute(command.arm_qpos)
+                    position, rotation = self.mapper.constraints.target_fk.forward(command.arm_qpos)
                     np.testing.assert_array_equal(control[:9], np.r_[position, rotation])
 
     def test_real_home_uses_narrow_limits_and_custom_convergence(self):
@@ -246,7 +246,7 @@ class HomeGeometryTests(unittest.TestCase):
             arm=ArmConfig(),
             limits=np.array([[-1.0, 1.0]] * 7),
             workspace_bounds=np.array([[-1.0, 1.0]] * 3),
-            arm_fk=SimpleNamespace(compute=Mock(return_value=(np.zeros(3), np.zeros(6)))),
+            arm_fk=SimpleNamespace(forward=Mock(return_value=(np.zeros(3), np.zeros(6)))),
             collision_model=SimpleNamespace(
                 rejection=Mock(return_value=None),
                 table=SimpleNamespace(soft_clearance_m=0.02),
@@ -273,7 +273,7 @@ class HomeGeometryTests(unittest.TestCase):
             self.check_path()
 
     def test_workspace_and_backend_failures_are_distinct(self):
-        self.planner.arm_fk.compute.return_value = (np.ones(3) * 2, None)
+        self.planner.arm_fk.forward.return_value = (np.ones(3) * 2, None)
         with self.assertRaisesRegex(homing.HomePathRejected, "workspace"):
             self.check_path()
         self.planner.collision_model.rejection.side_effect = RuntimeError("geometry failure")

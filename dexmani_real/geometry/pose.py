@@ -1,4 +1,4 @@
-"""Pose errors, WXYZ quaternions, and column-ordered rotation-6D operations."""
+"""WXYZ 四元数、列序 rot6d 与刚体变换。"""
 
 from __future__ import annotations
 
@@ -6,14 +6,58 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from numpy.typing import ArrayLike
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.geometry.transforms import normalize_quat_wxyz
+WXYZ_TO_XYZW = np.array([1, 2, 3, 0], dtype=np.intp)
+XYZW_TO_WXYZ = np.array([3, 0, 1, 2], dtype=np.intp)
+ROT6D_MIN_BASIS_NORM = 1e-4
+ROT6D_MIN_ORTHOGONAL_RATIO = 1e-4
+
+ROTATION_ATOL = 1e-6
+HOMOGENEOUS_ATOL = 1e-9
+QUAT_NORM_EPS = 1e-12
+
+
+def validate_rigid_transform(value, *, label="transform"):
+    matrix = np.asarray(value, dtype=np.float64)
+    if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+        raise ValueError(f"{label} must be a finite (4, 4) transform")
+    if not np.allclose(matrix[3], (0, 0, 0, 1), atol=HOMOGENEOUS_ATOL, rtol=0):
+        raise ValueError(f"{label} must have homogeneous final row")
+    rotation = matrix[:3, :3]
+    orthogonality_error = float(np.max(np.abs(rotation.T @ rotation - np.eye(3))))
+    determinant_error = abs(float(np.linalg.det(rotation)) - 1.0)
+    if orthogonality_error > ROTATION_ATOL or determinant_error > ROTATION_ATOL:
+        raise ValueError(f"{label} must have a proper SO(3) rotation")
+    return matrix.copy()
+
+
+def _quaternion(value, name):
+    quat = np.asarray(value, dtype=np.float64)
+    if quat.shape != (4,) or not np.isfinite(quat).all():
+        raise ValueError(f"{name} must be a finite (4,) WXYZ quaternion")
+    norm = float(np.linalg.norm(quat))
+    if not np.isfinite(norm) or norm <= QUAT_NORM_EPS:
+        raise ValueError(f"{name} quaternion norm is invalid")
+    return quat, norm
+
+
+def normalize_quat_wxyz(value, *, name="quaternion"):
+    quat, norm = _quaternion(value, name)
+    return quat / norm
+
+
+def validate_unit_quaternion_wxyz(value, *, name="quaternion"):
+    quat, norm = _quaternion(value, name)
+    if abs(norm - 1.0) > ROTATION_ATOL:
+        raise ValueError(f"{name} must be unit length within {ROTATION_ATOL}")
+    return quat.copy()
 
 
 @dataclass
 class Pose:
-    """Pose with position and wxyz quaternion."""
+    """位置单位米，四元数顺序 WXYZ。"""
 
     p: np.ndarray
     q: np.ndarray
@@ -32,23 +76,17 @@ class Pose:
         return Pose(p=self.p.copy(), q=self.q.copy())
 
 
-WXYZ_TO_XYZW = np.array([1, 2, 3, 0], dtype=np.intp)
-XYZW_TO_WXYZ = np.array([3, 0, 1, 2], dtype=np.intp)
-ROT6D_MIN_BASIS_NORM = 1e-4
-ROT6D_MIN_ORTHOGONAL_RATIO = 1e-4
-
-def wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
+def wxyz_to_xyzw(q: ArrayLike) -> np.ndarray:
     q = np.asarray(q, dtype=np.float64).reshape(4)
     return q[WXYZ_TO_XYZW]
 
 
-def xyzw_to_wxyz(q: np.ndarray) -> np.ndarray:
+def xyzw_to_wxyz(q: ArrayLike) -> np.ndarray:
     q = np.asarray(q, dtype=np.float64).reshape(4)
     return q[XYZW_TO_WXYZ]
 
 
 def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """Multiply two wxyz quaternions."""
     w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
     w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
     return np.array(
@@ -63,25 +101,19 @@ def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
 
 
 def compute_pose_error(target: Pose, actual: Pose) -> tuple[float, float]:
-    # Return infinite errors for non-finite poses so gates reject them.
-    if not np.all(np.isfinite(actual.p)) or not np.all(np.isfinite(actual.q)):
-        return (float("inf"), float("inf"))
-    if not np.all(np.isfinite(target.p)) or not np.all(np.isfinite(target.q)):
-        return (float("inf"), float("inf"))
     position_error = float(np.linalg.norm(target.p - actual.p))
     q_dot = abs(float(np.dot(target.q, actual.q)))
-    rotation_error = 2.0 * np.arccos(min(1.0, q_dot))
+    rotation_error = 2.0 * np.arccos(np.clip(q_dot, 0.0, 1.0))
     return position_error, rotation_error
 
 
 def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
-    """Gram-Schmidt [c1x,c1y,c1z,c2x,c2y,c2z] to WXYZ; reject nonfinite or near-collinear bases."""
     quat_xyzw = Rotation.from_matrix(rot6d_to_rotmat(r6)).as_quat()
     return xyzw_to_wxyz(quat_xyzw)
 
 
 def rot6d_to_rotmat(r6: np.ndarray) -> np.ndarray:
-    """Gram-Schmidt rot6d columns to a right-handed rotation matrix."""
+    """Gram-Schmidt 将 rot6d 的两列还原为右手旋转矩阵。"""
     values = np.asarray(r6, dtype=np.float64)
     if values.shape != (6,) or not np.isfinite(values).all():
         raise ValueError("rot6d must be a finite (6,) vector")
@@ -106,12 +138,12 @@ def rot6d_to_rotmat(r6: np.ndarray) -> np.ndarray:
     return np.column_stack((unit_first, unit_second, np.cross(unit_first, unit_second)))
 
 
-def quat_wxyz_to_rotmat(q_wxyz: np.ndarray) -> np.ndarray:
-    quat_xyzw = wxyz_to_xyzw(normalize_quat_wxyz(q_wxyz))
+def quat_wxyz_to_rotmat(q_wxyz: ArrayLike) -> np.ndarray:
+    quat_xyzw = wxyz_to_xyzw(q_wxyz)
     return Rotation.from_quat(quat_xyzw).as_matrix()
 
 
-def forward_from_quat_wxyz(q_wxyz: np.ndarray) -> np.ndarray:
-    """Return the rotated FLU +X forward vector for a WXYZ quaternion."""
-    quat_xyzw = wxyz_to_xyzw(normalize_quat_wxyz(q_wxyz))
+def forward_from_quat_wxyz(q_wxyz: ArrayLike) -> np.ndarray:
+    """返回旋转后的 FLU +X 朝向。"""
+    quat_xyzw = wxyz_to_xyzw(q_wxyz)
     return Rotation.from_quat(quat_xyzw).apply(np.array([1.0, 0.0, 0.0]))

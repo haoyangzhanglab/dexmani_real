@@ -279,7 +279,7 @@ class CameraCalibrationSession:
         if sample is None or self.cancel_requested():
             return
         arm_qpos, marker_rvec, marker_tvec = sample
-        eef_pos_base_m, eef_rot6d_base = self.constraints.target_fk.compute(arm_qpos)
+        eef_pos_base_m, eef_rot6d_base = self.constraints.target_fk.forward(arm_qpos)
         eef_rpy_base_rad = eef_rpy_from_rot6d(eef_rot6d_base)
         if self.cancel_requested():
             return

@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from dexmani_real.geometry.kinematics.arm_fk import ArmFK
+from dexmani_real.geometry.kinematics import ArmFK
 from dexmani_real.robot.model import XARM7_EQUIVALENT_JOINT_MASK
 
 JUMP_LIMIT_RAD = np.deg2rad((30, 30, 30, 35, 40, 40, 40))
@@ -74,7 +74,7 @@ class MotionConstraints:
 
     def endpoint_rejection(self, target, *, position=None):
         if position is None:
-            position, _ = self.target_fk.compute(target)
+            position, _ = self.target_fk.forward(target)
         if np.any(position < self.workspace[:, 0] - self.margin) or np.any(
             position > self.workspace[:, 1] + self.margin
         ):

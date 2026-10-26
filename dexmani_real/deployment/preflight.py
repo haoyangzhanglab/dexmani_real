@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import math
+from dataclasses import fields
 from typing import Any
 
-from dexmani_real.perception.hand_config import (
-    HandPointCloudConfig,
-    resolve_saved_hand_pointcloud_recipe,
-)
-from dexmani_real.perception.pointcloud.config import (
-    PointCloudConfig,
-    resolve_saved_pointcloud_recipe,
-)
+from dexmani_real.perception.config import HandCloudConfig, PointCloudConfig
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
+
+
+def _restore_cloud_config(recipe, config_type):
+    if not isinstance(recipe, dict) or recipe.keys() != {f.name for f in fields(config_type)}:
+        raise ValueError(
+            f"Saved {config_type.__name__} is incomplete or obsolete; "
+            "re-export the dataset and retrain the checkpoint"
+        )
+    return config_type(**recipe)
 
 
 def validate_execution_config(info, execution) -> None:
@@ -77,7 +80,7 @@ def validate_execution_config(info, execution) -> None:
 
 def validate_deployment_config(
     info: Any, runtime: Any, *, needs,
-) -> tuple[PointCloudConfig | None, HandPointCloudConfig | None]:
+) -> tuple[PointCloudConfig | None, HandCloudConfig | None]:
     """Check Real constraints on inspected Policy metadata; no calibration I/O."""
     validate_execution_config(info, runtime.execution)
     if info.hand_history_steps is not None:
@@ -103,8 +106,8 @@ def validate_deployment_config(
     if "depth" in names and tuple(info.depth_config["shape"]) != runtime.camera.depth_shape:
         raise ValueError("Live camera shape differs from the saved depth input")
     recipes = (
-        resolve_saved_pointcloud_recipe(info.pointcloud_config) if "point_cloud" in names else None,
-        resolve_saved_hand_pointcloud_recipe(info.hand_pointcloud_config)
+        _restore_cloud_config(info.pointcloud_config, PointCloudConfig) if "point_cloud" in names else None,
+        _restore_cloud_config(info.hand_pointcloud_config, HandCloudConfig)
         if "hand_pointcloud" in names else None,
     )
     validate_robot_config(runtime)

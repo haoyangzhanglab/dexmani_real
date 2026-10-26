@@ -55,7 +55,13 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 IK 保留上一命令、实测状态及正负零空间初值；评分只使用关节距离和限位惩罚，搜索权重与步长固定在算法模块。位姿误差用于容差准入，SVD 只用于生成零空间方向。候选 FK 同时用于误差和工作空间检查，碰撞模型统一管理自碰撞、静态障碍和可选桌面。`HomePlanner(environment, arm, table_plane_abcd=...)` 与执行器共用 `ArmConfig` 的运行限位、到位容差及桌面间隙配置；`plan(current, target)` 保留三种关节路径、1° 采样及绝对等价分支对齐。无需移动的 HOME 仍检查几何约束，并由实测反馈确认停稳。
 
-点云的 RGB-D 处理流程位于 `perception/pointcloud/processing.py`，体素聚合、连通域过滤和采样位于 `sampling.py`，诊断输出与性能测量位于 `diagnostics.py`。XHand 的 SDK 载荷解析、反馈布局与缓存位于 `robot/xhand/feedback.py`；机械臂反馈布局位于 `robot/xarm7/protocol.py`。
+`geometry` 中，`camera.py` 负责内参与反投影，`pose.py` 负责位姿与刚体变换，`kinematics.py` 提供 `ArmFK`、`HandFK`，`plane.py` 拟合桌面。`perception/pointcloud.py` 将 RGB-D 经深度边缘过滤、工作空间与桌面裁剪、体素均值、半径去噪和 QuickFPS 转为基座系 XYZRGB；`hand.py` 生成指尖与固定手表面点云，`worker.py` 发布在线点云。诊断快照与性能测量位于 `scripts/tools/view_pointcloud.py`。
+
+点云参数集中在 `perception/config.py`。`table_margin_m` 是点到向上桌面平面的最小距离，默认 7 mm；该范围内的低矮物体表面也会被裁掉。点数不足时循环已有点，空点云不发布。Canonical 保存完整实验参数，部署按保存参数恢复；旧版连通域、双阈值桌面配置及采样描述字段不再接受，需要重新导出数据并重新训练受影响的 checkpoint。诊断快照直接写入独立目录，失败时可能保留部分文件。
+
+单阈值裁剪对桌面标定残差更敏感。可根据实验物体高度和当前标定调整 YAML 中的 `pointcloud.table_margin_m`；增大余量会减少桌面残留，也会裁掉更多低矮表面。离线导出和查看在配置入口校验手部安装位姿，指尖名称与 SDK→URDF 关节顺序由 `HandFK` 核对。
+
+XHand 的 SDK 载荷解析、反馈布局与缓存位于 `robot/xhand/feedback.py`；机械臂反馈布局位于 `robot/xarm7/protocol.py`。
 
 机械臂由 `robot/xarm7/client.py` 的 `ArmClient` 提交目标，`worker.py` 的 `ArmController` 独占 SDK 与默认 100 Hz 伺服，Ruckig 负责连续参考。共享通道及操作消息集中在 `protocol.py`；HOME 总截止时间从运行层传到父、子进程，取消使用同一个停止信号。操作回复直接携带超时、取消或设备异常，保留失败原因；停止失败始终作为设备故障报告。
 
@@ -73,7 +79,7 @@ IK 保留上一命令、实测状态及正负零空间初值；评分只使用�
 
 ## 运行接口与错误处理
 
-遥操作入口为 `teleop.session.run_teleop(...)`，回放入口为 `replay.session.run_replay(...)`，点云诊断入口为 `scripts.tools.view_pointcloud.run_pointcloud_diagnostic(args)`。入口负责装配资源、运行和收尾，脚本只解析参数并调用入口。
+遥操作入口为 `teleop.session.run_teleop(...)`，回放入口为 `replay.session.run_replay(...)`，对应脚本解析参数并调用入口。点云诊断的装配、运行、快照输出及收尾集中在 `scripts/tools/view_pointcloud.py`。
 
 遥操作配置直接使用以下字段，覆盖顺序为 CLI > YAML > 默认值；未定义的配置键会报错。
 
@@ -131,14 +137,19 @@ mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases \
   dexmani_real/ipc dexmani_real/sensor/camera/worker.py \
   dexmani_real/geometry dexmani_real/perception dexmani_real/control dexmani_real/robot \
   dexmani_real/calibration dexmani_real/runtime dexmani_real/deployment \
+  dexmani_real/data/canonical \
   dexmani_real/data/session_results.py dexmani_real/data/raw/reader.py \
   dexmani_real/teleop/runner.py dexmani_real/replay/replayer.py \
+  scripts/tools/view_pointcloud.py scripts/tools/view_realsense.py \
+  scripts/visualize_episode.py scripts/export_zarr.py \
   third_party/cordvip_geometry/src/cordvip_geometry/integrations/dexmani.py
 ```
 
 mypy 按现有类型标注检查上述模块，不检查未标注函数体或外部无类型声明的 SDK；不能替代数值与运行边界测试。
 
 `tests/test_control.py` 使用真实模型和可控求解结果检查 IK、碰撞、HOME 及策略动作格式；`tests/test_robot.py` 使用假 SDK 和进程管道检查时效、取消、异常传递、停止、CRC 和资源收尾，并验证真实 Ruckig 的连续性与制动限位。测试不会连接机器人，需要已安装 Pinocchio、MPlib、HPP-FCL 和 Ruckig。
+
+`tests/test_geometry.py` 与 `tests/test_perception.py` 检查坐标约定、畸变反投影、桌面拟合、采样以及在线和离线几何一致性；导出测试使用实际 HDF5、视频和 Zarr，覆盖完整参数恢复与无效点云 episode 的回滚。
 
 键盘遥操作入口保留 `--help`，没有 `--print-config` 参数。
 

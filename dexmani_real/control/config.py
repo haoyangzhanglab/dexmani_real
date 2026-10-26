@@ -6,7 +6,7 @@ from math import radians
 import numpy as np
 
 from dexmani_real.calibration import TABLE_PLANE_RELATIVE_PATH
-from dexmani_real.geometry.transforms import validate_unit_quaternion_wxyz
+from dexmani_real.geometry.pose import validate_unit_quaternion_wxyz
 
 
 @dataclass(frozen=True)

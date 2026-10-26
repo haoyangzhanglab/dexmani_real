@@ -28,7 +28,7 @@ class TeleopController:
         self.clear_reference()
         try:
             arm_qpos = row.arm["qpos"][0].copy()
-            pos, rot = self.action_mapper.constraints.target_fk.compute(arm_qpos)
+            pos, rot = self.action_mapper.constraints.target_fk.forward(arm_qpos)
             quat = rot6d_to_quat_wxyz(rot)
             self.arm_mapper.reset(
                 wrist_pos=row.vr["wrist_pos"],

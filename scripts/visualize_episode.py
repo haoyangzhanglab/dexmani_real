@@ -23,19 +23,15 @@ from dexmani_real.data.raw.camera_geometry import (
 )
 from dexmani_real.data.raw.reader import EpisodeReader
 from dexmani_real.geometry.camera import validate_aligned_depth_distortion
-from dexmani_real.geometry.kinematics.arm_fk import compute_eef_pose_history_xarm_base
-from dexmani_real.geometry.kinematics.hand_fk import HandKinematics
-from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
-from dexmani_real.geometry.transforms import validate_unit_quaternion_wxyz
-from dexmani_real.perception.hand_geometry import (
-    compute_hand_geometry_history_xarm_base,
+from dexmani_real.geometry.kinematics import HandFK, eef_pose_sequence
+from dexmani_real.geometry.pose import (
+    quat_wxyz_to_rotmat,
+    validate_unit_quaternion_wxyz,
 )
-from dexmani_real.perception.pointcloud.config import PointCloudConfig
-from dexmani_real.perception.pointcloud.processing import build_point_cloud
-from dexmani_real.robot.model import (
-    XHAND_FINGERTIP_LINK_NAMES,
-    XHAND_RIGHT_URDF_PATH,
-)
+from dexmani_real.perception.config import PointCloudConfig
+from dexmani_real.perception.hand import hand_geometry_sequence
+from dexmani_real.perception.pointcloud import build_point_cloud
+from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.utils.visualization import (
     log_camera_geometry,
     log_points,
@@ -154,6 +150,10 @@ class EpisodeVisualizer:
             if self.T_xarm_base_from_color is None:
                 logger.warning("No camera extrinsics: displaying pixels without point cloud")
             self.handbase_position_eef_m = np.asarray(handbase_position_eef_m, dtype=np.float64)
+            if self.handbase_position_eef_m.shape != (3,) or not np.isfinite(
+                self.handbase_position_eef_m
+            ).all():
+                raise ValueError("hand base position must be a finite (3,) vector")
             handbase_quat = validate_unit_quaternion_wxyz(
                 handbase_quat_eef_wxyz, name="hand base quaternion"
             )
@@ -164,7 +164,6 @@ class EpisodeVisualizer:
             self.pointcloud_processing_ns = 0
             self.pointcloud_processed_frames = 0
             if pointcloud_config is not None and self.T_xarm_base_from_color is not None:
-                pointcloud_config.validate()
                 validate_aligned_depth_distortion(
                     self.camera_model.intrinsics.distortion_model
                 )
@@ -216,10 +215,10 @@ class EpisodeVisualizer:
         state["arm_ee"] = np.full((self.frame_count, 9), np.nan)
         state["hand_fingertip"] = np.full((self.frame_count, 5, 3), np.nan, dtype=np.float32)
         if np.any(arm_valid):
-            state["arm_ee"][arm_valid] = compute_eef_pose_history_xarm_base(arm[arm_valid])
+            state["arm_ee"][arm_valid] = eef_pose_sequence(arm[arm_valid])
         if np.any(hand_valid):
-            hand_fk = HandKinematics(str(XHAND_RIGHT_URDF_PATH), self.fingertip_link_names)
-            state["hand_fingertip"][hand_valid] = compute_hand_geometry_history_xarm_base(
+            hand_fk = HandFK(self.fingertip_link_names)
+            state["hand_fingertip"][hand_valid] = hand_geometry_sequence(
                 state["arm_ee"][hand_valid],
                 hand[hand_valid],
                 hand_fk=hand_fk,

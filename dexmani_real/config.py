@@ -16,8 +16,7 @@ from dexmani_real.control.config import (
     StaticCollisionBox,
 )
 from dexmani_real.deployment.config import ExecutionConfig
-from dexmani_real.perception.hand_config import HandPointCloudConfig
-from dexmani_real.perception.pointcloud.config import PointCloudConfig
+from dexmani_real.perception.config import HandCloudConfig, PointCloudConfig
 from dexmani_real.robot.xarm7.config import ArmConfig
 from dexmani_real.robot.xhand.config import HandConfig
 from dexmani_real.sensor.camera.config import CameraParams
@@ -45,7 +44,7 @@ class ExperimentConfig:
     vr: VRParams = field(default_factory=VRParams)
     camera: CameraParams = field(default_factory=CameraParams)
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
-    hand_pointcloud: HandPointCloudConfig = field(default_factory=HandPointCloudConfig)
+    hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
     tag_retargeting: TAGRetargetingParams = field(default_factory=TAGRetargetingParams)
     dexpilot_retargeting: DexPilotRetargetingParams = field(
         default_factory=DexPilotRetargetingParams

@@ -14,7 +14,7 @@ from dexmani_real.data.raw.reader import (
     text_attr,
 )
 from dexmani_real.geometry.camera import CameraIntrinsics
-from dexmani_real.geometry.transforms import validate_rigid_transform
+from dexmani_real.geometry.pose import validate_rigid_transform
 
 
 @dataclass(frozen=True)
