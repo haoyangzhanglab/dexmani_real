@@ -108,8 +108,9 @@ class CalibrationPathsTests(unittest.TestCase):
         relative = replace(TableCollisionConfig(), plane_path='custom/table.json')
         self.assertEqual(resolve_table_plane_path(relative), PACKAGE_DIR.parent / 'custom/table.json')
 
-    def test_missing_explicit_old_path_does_not_fallback(self):
-        old = replace(TableCollisionConfig(), plane_path='dexmani_real/state/table_plane.json')
-        with self.assertRaises(FileNotFoundError):
-            resolve_table_plane(old)
-        self.assertIsNone(resolve_table_plane(old, required=False))
+    def test_missing_explicit_path_does_not_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = replace(TableCollisionConfig(), plane_path=str(Path(directory) / 'missing.json'))
+            with self.assertRaises(FileNotFoundError):
+                resolve_table_plane(config)
+            self.assertIsNone(resolve_table_plane(config, required=False))

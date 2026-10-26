@@ -100,6 +100,8 @@ class TeleopRunner:
         try:
             self.robot.stop()
         except Exception as exc:
+            if self.recorder is not None and self.recorder.published_path is None:
+                self.capture_failed = True
             self.termination_details.append(error_detail(stage, exc))
             raise
 
@@ -132,7 +134,7 @@ class TeleopRunner:
             self.pending_termination_reason = None
             self.termination_details = []
             return
-        reason = self.end_reason(self.pending_termination_reason or reason)
+        reason = self.pending_termination_reason or self.end_reason(reason)
         published = None
         if save:
             published = self.recorder.save_episode(
@@ -296,7 +298,16 @@ class TeleopRunner:
             return True
         elif cmd in (OperatorCommand.STOP, OperatorCommand.DISCARD):
             reason = cmd.value.lower()
-            self.stop_control(reason)
+            try:
+                self.stop_control(reason)
+            except Exception as stop_error:
+                if cmd is OperatorCommand.DISCARD:
+                    # 锁定已有 recorder 的丢弃请求，避免 close() 默认保存。
+                    try:
+                        self.finish_capture(False, reason, announce=False)
+                    except Exception as discard_error:
+                        raise stop_error from discard_error
+                raise
             self.end_segment(cmd is OperatorCommand.STOP, reason)
         elif cmd is OperatorCommand.RESET_TACTILE:
             if (
@@ -590,6 +601,8 @@ class TeleopRunner:
         try:
             self.controller.clear_reference()
         except Exception as exc:
+            if self.recorder is not None and self.recorder.published_path is None:
+                self.capture_failed = True
             if failure is None:
                 failure = exc
             self.termination_details.append(error_detail("reference_cleanup", exc))
@@ -667,7 +680,8 @@ class TeleopRunner:
             else:
                 reason = RunEndReason.POLICY_FAILURE
             self.runtime_state.revoke_motion(reason=reason)
-            self.capture_failed = self.capture_failed or self.pending_termination_reason is None
+            if self.recorder is not None and self.recorder.published_path is None:
+                self.capture_failed = True
             self.sensors.request_shutdown()
             self.termination_details.append(error_detail("runtime", exc))
             logger.exception("teleop failed")

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
+from typing import cast
 
 import av
 import h5py
@@ -64,7 +65,7 @@ def nonnegative_int_attr(attrs: h5py.AttributeManager, name: str) -> int:
 
 def positive_float_attr(attrs: h5py.AttributeManager, name: str) -> float:
     value = scalar_attr(attrs, name)
-    if type(value) not in (int, float):
+    if type(value) is not int and type(value) is not float:
         raise RawDataError(f"episode metadata {name} must be numeric")
     result = float(value)
     if not np.isfinite(result) or result <= 0.0:
@@ -77,10 +78,11 @@ class EpisodeReader:
 
     def __init__(self, episode_path: str | Path) -> None:
         self.path = Path(episode_path)
-        self.data_file = self.video_container = None
-        self.fields_cache = None
-        self.dataset_cache = {}
-        self.tactile_hold_max_age_s = None
+        self.data_file: h5py.File | None = None
+        self.video_container: av.container.InputContainer | None = None
+        self.fields_cache: frozenset[str] | None = None
+        self.dataset_cache: dict[str, h5py.Dataset] = {}
+        self.tactile_hold_max_age_s: float | None = None
         if not self.path.is_dir():
             raise ValueError(f"episode must be a directory: {self.path}")
         self.rgb_path = self.path / "rgb.mp4"
@@ -128,7 +130,9 @@ class EpisodeReader:
             raise
 
     @property
-    def meta(self):
+    def meta(self) -> h5py.AttributeManager:
+        if self.data_file is None:
+            raise RuntimeError("Raw reader is closed")
         return self.data_file["meta"].attrs
 
     @property
@@ -147,11 +151,13 @@ class EpisodeReader:
         if missing:
             raise RawDataError(f"Raw {self.path.name} missing required fields: {sorted(missing)}")
 
-    def __getitem__(self, name):
+    def __getitem__(self, name: str) -> h5py.Dataset:
         if self.data_file is None:
             raise RuntimeError("Raw reader is closed")
         if name in self.dataset_cache:
             return self.dataset_cache[name]
+        if name not in self.data_file:
+            raise RawDataError(f"Raw is missing dataset: {name}")
         if name in {"hand_contact", "hand_tactile_force"}:
             self.validate_tactile_metadata()
         array = self.data_file[name]
@@ -164,12 +170,12 @@ class EpisodeReader:
         self.dataset_cache[name] = array
         return array
 
-    def validate_completion(self):
+    def validate_completion(self) -> None:
         """Strict numerical consumers require a technically normal capture."""
         if text_attr(self.meta, "technical_status") != "normal":
             raise RawDataError("capture ended with a technical failure")
 
-    def validate_tactile_metadata(self):
+    def validate_tactile_metadata(self) -> float:
         """仅在消费触觉时确认文件语义；Raw 打开期间保持不可变。"""
         if self.tactile_hold_max_age_s is None:
             for name, expected in (
@@ -183,6 +189,26 @@ class EpisodeReader:
             self.tactile_hold_max_age_s = positive_float_attr(self.meta, "hand_tactile_hold_max_age_s")
         return self.tactile_hold_max_age_s
 
+    def _timing_dataset(self) -> h5py.Dataset:
+        timing = self["timing/rows"]
+        if timing.shape != (self.num_frames,) or timing.dtype != TIMING_ROW_DTYPE:
+            raise RawDataError("Raw timing/rows: incompatible source-clock layout or row count")
+        return timing
+
+    def read_timing_rows(self, fields: Sequence[str]) -> np.ndarray:
+        """读取指定来源时钟字段，保留原值；不隐式执行训练准入校验。"""
+        if isinstance(fields, (str, bytes)) or not isinstance(fields, Sequence):
+            raise TypeError("timing fields must be a sequence of field names")
+        fields = tuple(fields)
+        if any(not isinstance(name, str) for name in fields):
+            raise TypeError("timing field names must be strings")
+        if not fields or len(set(fields)) != len(fields):
+            raise ValueError("timing fields must be nonempty and unique")
+        unknown = set(fields).difference(cast(tuple[str, ...], TIMING_ROW_DTYPE.names))
+        if unknown:
+            raise ValueError(f"unknown timing fields: {sorted(unknown)}")
+        return self._timing_dataset().fields(fields)[:]
+
     def validate_rows(
         self, *, required_tactile=("aggregate", "dense"), require_camera=True, chunk_frames=4096
     ):
@@ -191,15 +217,7 @@ class EpisodeReader:
             raise ValueError("chunk_frames must be a positive integer")
         if not set(required_tactile) <= {"aggregate", "dense"}:
             raise ValueError("unknown tactile source")
-        if "timing/rows" not in self.data_file:
-            raise RawDataError("Raw is missing timing rows")
-        timing = self.data_file["timing/rows"]
-        if (
-            not isinstance(timing, h5py.Dataset)
-            or timing.shape != (self.num_frames,)
-            or timing.dtype != TIMING_ROW_DTYPE
-        ):
-            raise RawDataError("timing rows must match the source-clock layout and row count")
+        timing = self._timing_dataset()
         fields = ("observation_ns", "control_ns", "arm_ns", "hand_ns")
         fields += tuple(f"tactile_{name}_ns" for name in required_tactile)
         if require_camera:
@@ -262,6 +280,7 @@ class EpisodeReader:
     def close(self) -> None:
         self.dataset_cache.clear()
         self.fields_cache = None
+        self.tactile_hold_max_age_s = None
         errors = []
         for name in ("video_container", "data_file"):
             resource = getattr(self, name)
@@ -275,7 +294,7 @@ class EpisodeReader:
         if errors:
             raise RuntimeError(f"Raw reader close failures: {errors}") from errors[0]
 
-    def __enter__(self):
+    def __enter__(self) -> EpisodeReader:
         return self
 
     def __exit__(self, *args):

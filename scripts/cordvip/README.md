@@ -81,7 +81,7 @@ python scripts/cordvip/track_object.py \
 
 输出目录必须尚不存在。加 `--headless` 可无窗口运行；省略两个 `--save-*` 可减少落盘开销。离线源先停在首帧，注册通过后按指定速率供给最新帧，结束自动退出；处理不及时会跳帧，保存结果不补齐。`--initial-selection` 仅接受已人工确认且 RGB-D、内参、身份、时间与首帧完全匹配的选择，不能套用到新相机帧。
 
-`--with-hand` 当前仅支持 `--episode`；`--hand-points` 默认 1024，`--experiment-config` 可指定当前手安装配置。输出包含 robot-base 下的物体/手点、法向、link IDs 和 19 维实测关节。Toy 的历史 Raw 只有名义时间：可看交互几何，不能证明手/相机同步。**几何有效不等于策略输入的时序已合格**，未知时间差为 NaN。
+`--with-hand` 当前仅支持 `--episode`；`--hand-points` 默认 1024，`--experiment-config` 可指定当前手安装配置。输出包含 robot-base 下的物体/手点、法向、link IDs 和 19 维实测关节。输入必须符合当前 Raw schema，包含有效结构的 `timing/rows`；来源时钟为 `-1` 时仅可查看按行关联的几何，未知时间差为 NaN。**几何有效不等于策略输入的时序已合格**，同一行也不能证明手/相机物理同步。
 
 实时相机使用米制资产、RGB-D 和内参进行 FoundationPose++ 2D 引导追踪。**以下命令会连接 RealSense，目前输出物体点云，不读取机器人关节**：
 

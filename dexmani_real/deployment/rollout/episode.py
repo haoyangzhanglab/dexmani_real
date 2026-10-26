@@ -194,6 +194,7 @@ class PolicyEpisode:
         except BaseException as exc:
             failure = exc
             errors.append(error_detail("stop", exc))
+            capture_failed = True
             if isinstance(exc, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()
             if epoch is None:

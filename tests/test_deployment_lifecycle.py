@@ -11,16 +11,18 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+from raw_fixture import raw_row, start_raw_recorder
 from test_runtime_contract import armed_state
 
 from dexmani_real.config import ExperimentConfig
+from dexmani_real.data.raw.reader import EpisodeReader, RawDataError
 from dexmani_real.data.session_results import SessionResults
 from dexmani_real.deployment.inference import InferenceWorker, ModelResult
 from dexmani_real.deployment.policy_observation import PolicyObservationRow
 from dexmani_real.deployment.rollout.action_schedule import ActionPlan, PolicyQuery
 from dexmani_real.deployment.rollout.episode import PolicyEpisode
 from dexmani_real.deployment.session import PolicySession
-from dexmani_real.robot.commands import RobotError
+from dexmani_real.robot.commands import RobotCommand, RobotError
 from dexmani_real.robot.feedback import ARM_STATE_DTYPE
 from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.runtime.state import RunEndReason
@@ -174,6 +176,87 @@ class DeploymentLifecycleTests(unittest.TestCase):
         self.assertEqual(saved['errors'][0]['stage'], 'stop')
         self.assertEqual(saved['raw']['row_count'], 1)
         self.assertEqual(saved['raw']['status'], 'published')
+        self.assertEqual(recorder.save_episode.call_args.kwargs['technical_status'], 'failed')
+
+    def test_stop_outcome_reaches_real_raw_metadata_and_completion_admission(self):
+        root = self.root
+        for reason, detail in ((RunEndReason.OPERATOR, 'operator requested'),
+                               (RunEndReason.QUIT, 'quit'), (RunEndReason.TIMEOUT, 'duration_timeout')):
+            for stop_fails in (False, True):
+                with self.subTest(reason=reason, stop_fails=stop_fails):
+                    self.root = root / f'{reason.name}_{stop_fails}'
+                    recorder = start_raw_recorder(self.root / 'raw')
+                    self.addCleanup(recorder.close)
+                    episode = self.episode(running=True, recorder=recorder)
+                    command = RobotCommand(episode.run_id, np.zeros(7), np.zeros(12))
+                    recorder.add_frame(raw_row(0), command)
+                    episode.pending_frame = (raw_row(1), command)
+                    failure = RobotError('stop unresolved')
+                    if stop_fails:
+                        episode.robot.stop.side_effect = failure
+                        with self.assertRaises(RobotError) as raised:
+                            episode.finish(detail, run_end_reason=reason)
+                        self.assertIs(raised.exception, failure)
+                    else:
+                        episode.finish(detail, run_end_reason=reason)
+                    episode.finish('later cleanup')
+                    episode.robot.stop.assert_called_once()
+                    self.assertIsNone(episode.pending_frame)
+                    self.assertEqual(recorder.submitted_frames, 2)
+                    with EpisodeReader(recorder.published_path) as reader:
+                        self.assertEqual(reader.num_frames, 2)
+                        self.assertEqual(reader.meta['termination_reason'], reason.name.lower())
+                        self.assertEqual(reader.meta['technical_status'], 'failed' if stop_fails else 'normal')
+                        np.testing.assert_array_equal(reader['timestamp'][:], [0, .1])
+                        if stop_fails:
+                            with self.assertRaisesRegex(RawDataError, 'technical failure'):
+                                reader.validate_completion()
+                            details = json.loads(reader.data_file['meta/termination_details'][()])
+                            self.assertEqual(details[-1]['stage'], 'stop')
+                            self.assertEqual(details[-1]['message'], 'stop unresolved')
+                        else:
+                            reader.validate_completion()
+                    saved = episode.results.session['episodes'][0]
+                    self.assertEqual(saved['termination_reason'], reason.name.lower())
+                    self.assertEqual(saved['raw']['status'], 'published')
+
+    def test_existing_control_error_is_not_cleared_by_successful_stop(self):
+        recorder = Mock(start_attempted=True, published_path=None, staging_path=None, written_frames=1)
+        episode = self.episode(running=True, recorder=recorder)
+        episode.finish('operator requested', run_end_reason=RunEndReason.OPERATOR,
+                       errors=[dict(stage='control', message='control failed')])
+        self.assertEqual(episode.termination.reason, 'operator')
+        self.assertEqual(recorder.save_episode.call_args.kwargs['technical_status'], 'failed')
+        self.assertEqual(recorder.save_episode.call_args.kwargs['details'][-1]['stage'], 'control')
+
+    def test_wait_timeout_remains_a_technical_failure(self):
+        recorder = Mock(start_attempted=True, published_path=None, staging_path=None, written_frames=1)
+        episode = self.episode(running=True, recorder=recorder)
+        episode.finish('wait_timeout', run_end_reason=RunEndReason.TIMEOUT)
+        self.assertEqual(episode.termination.reason, 'timeout')
+        self.assertEqual(recorder.save_episode.call_args.kwargs['technical_status'], 'failed')
+
+    def test_published_raw_is_unchanged_by_independent_session_stop_failure(self):
+        recorder = start_raw_recorder(self.root / 'raw')
+        self.addCleanup(recorder.close)
+        episode = self.episode(running=True, recorder=recorder)
+        episode.pending_frame = (raw_row(), RobotCommand(episode.run_id, np.zeros(7), np.zeros(12)))
+        episode.finish('operator requested', run_end_reason=RunEndReason.OPERATOR)
+        before = {path.name: path.read_bytes() for path in recorder.published_path.iterdir()}
+        session = self.session(episode)
+        session.robot.stop_required = True
+        session.robot.stop.side_effect = RobotError('session stop unresolved')
+        session.model.close_result.return_value = dict(status='completed')
+        session.sensors.shutdown.return_value = True
+        self.assertEqual(session.close(clean=True, failure=None), 1)
+        self.assertEqual({path.name: path.read_bytes() for path in recorder.published_path.iterdir()}, before)
+        with EpisodeReader(recorder.published_path) as reader:
+            reader.validate_completion()
+            self.assertEqual(reader.meta['termination_reason'], 'operator')
+        result = json.loads(session.results.path.read_text())
+        self.assertEqual(result['outcome'], 'fault')
+        self.assertEqual(result['errors'][0]['stage'], 'stop')
+        self.assertEqual(result['episodes'][0]['termination_reason'], 'operator')
 
     def test_recorder_finalize_failure_preserves_staging_and_result(self):
         recorder = Mock(start_attempted=True, written_frames=2, published_path=None,
@@ -188,14 +271,17 @@ class DeploymentLifecycleTests(unittest.TestCase):
         self.assertEqual(saved['errors'][0]['stage'], 'recorder_finalize')
 
     def test_failed_frame_enqueue_is_not_retried(self):
-        recorder = Mock(start_attempted=False)
+        recorder = Mock(start_attempted=True, published_path=None, staging_path=None, written_frames=1)
         recorder.add_frame.side_effect = RuntimeError('enqueue failed')
         episode = self.episode(running=True, recorder=recorder)
         episode.pending_frame = ('row', 'attempt')
         with self.assertRaisesRegex(RuntimeError, 'enqueue failed'):
-            episode.finish('failure')
+            episode.finish('operator requested', run_end_reason=RunEndReason.OPERATOR)
         episode.record_pending()
         recorder.add_frame.assert_called_once()
+        self.assertEqual(recorder.save_episode.call_args.kwargs['technical_status'], 'failed')
+        self.assertEqual(recorder.save_episode.call_args.kwargs['details'][-1]['stage'], 'recording')
+        self.assertEqual(episode.termination.reason, 'operator')
 
     def test_rtc_physical_prefix_is_committed_only_after_query_submission(self):
         episode = self.episode(running=True)

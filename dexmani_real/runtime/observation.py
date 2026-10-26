@@ -82,6 +82,7 @@ def read_camera_frame(channels, sequence=None, *, payload="rgbd"):
         **{name: data[name] for name in fields},
         "ring_sequence": sequence,
         "timestamp_ns": int(data["header"]["timestamp_ns"]),
+        "color_frame_number": int(data["header"]["color_frame_number"]),
     }
 
 

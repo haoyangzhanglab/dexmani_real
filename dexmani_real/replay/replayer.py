@@ -118,6 +118,7 @@ class TrajectoryReplayer:
             try:
                 self.robot.stop()
             except Exception as exc:
+                self.capture_failed = True
                 self.runtime_state.mark_error()
                 logger.exception("replay stop failed")
                 self.failure_details.append(f"stop failed: {exc}")

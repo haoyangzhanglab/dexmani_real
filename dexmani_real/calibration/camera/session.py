@@ -99,7 +99,7 @@ def detect_aruco_stable(
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             check_capture()
-            frame = read_camera_frame(channels)
+            frame = read_camera_frame(channels, payload="rgb")
             if (
                 frame
                 and frame["timestamp_ns"] > last_stamp
@@ -405,7 +405,7 @@ class CameraCalibrationSession:
 
     def show_preview(self):
         """Poll and display the newest camera preview without blocking control."""
-        frame = read_camera_frame(self.sensors.channels)
+        frame = read_camera_frame(self.sensors.channels, payload="rgb")
         if frame and sample_is_fresh(frame["timestamp_ns"], self.runtime.camera.max_frame_age_s):
             image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
             self.display_image = draw_calibration_overlay(
