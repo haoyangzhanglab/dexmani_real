@@ -7,7 +7,6 @@ import numpy as np
 
 from dexmani_real.control.joint_angles import wrap_nearest_equivalent
 from dexmani_real.control.online_ik import (
-    IKResult,
     OnlineIKConfig,
     make_online_ik_solver,
 )
@@ -28,7 +27,6 @@ class ActionIntent:
 class ActionResult:
     arm_qpos: np.ndarray | None
     hand_qpos: np.ndarray | None
-    ik_result: IKResult | None = None
     rejection_reason: str | None = None
     # 投影后的笛卡尔目标；Teleop 仅在公共提交正常返回后更新 EMA。
     eef_pose: Pose | None = None
@@ -50,11 +48,6 @@ class ActionMapper:
         self.hand_lower = np.array(hand_lower_rad, dtype=np.float64, copy=True)
         self.hand_upper = np.array(hand_upper_rad, dtype=np.float64, copy=True)
         self.home_hand_qpos = np.array(home_hand_qpos, dtype=np.float64, copy=True)
-        if any(
-            q.shape != (12,) or not np.isfinite(q).all()
-            for q in (self.hand_lower, self.hand_upper, self.home_hand_qpos)
-        ) or np.any(self.hand_lower > self.hand_upper):
-            raise ValueError("action hand limits and home must be finite (12,) vectors")
 
     @classmethod
     def for_mode(cls, mode, *, arm, hand, motion, environment):
@@ -63,14 +56,18 @@ class ActionMapper:
             raise ValueError("action mode must be joint or eef")
         from dexmani_real.control.collision import CollisionModel
 
-        ik_config = OnlineIKConfig(
-            max_pose_error_pos_m=motion.ik_max_pose_error_pos_m,
-            max_pose_error_rot_rad=motion.ik_max_pose_error_rot_rad,
-            operational_joint_lower_rad=tuple(arm.joint_limit_lower),
-            operational_joint_upper_rad=tuple(arm.joint_limit_upper),
-        )
         static_boxes = environment.static_boxes
-        solver = make_online_ik_solver(ik_config, static_boxes=static_boxes) if mode == "eef" else None
+        solver = None
+        if mode == "eef":
+            solver = make_online_ik_solver(
+                OnlineIKConfig(
+                    max_pose_error_pos_m=motion.ik_max_pose_error_pos_m,
+                    max_pose_error_rot_rad=motion.ik_max_pose_error_rot_rad,
+                    operational_joint_lower_rad=tuple(arm.joint_limit_lower),
+                    operational_joint_upper_rad=tuple(arm.joint_limit_upper),
+                ),
+                static_boxes=static_boxes,
+            )
         collision = (
             solver.collision_model
             if solver is not None
@@ -78,8 +75,8 @@ class ActionMapper:
         )
         checker = TargetChecker(
             collision,
-            joint_lower_rad=ik_config.operational_joint_lower_rad,
-            joint_upper_rad=ik_config.operational_joint_upper_rad,
+            joint_lower_rad=arm.joint_limit_lower,
+            joint_upper_rad=arm.joint_limit_upper,
             workspace=environment.workspace.as_array(),
             workspace_margin_m=environment.eef_workspace_margin_m,
             dynamic_rejection=solver.dynamic_rejection if solver is not None else None,
@@ -167,7 +164,6 @@ class ActionMapper:
         return ActionResult(
             result.qpos if reason is None else None,
             hand,
-            ik_result=result,
             rejection_reason=reason,
             eef_pose=pose,
         )

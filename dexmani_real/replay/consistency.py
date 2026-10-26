@@ -39,7 +39,7 @@ def compute_metrics(
         raise ValueError("replay sample arrays must have the same row count")
     # Separate runs may have different lengths; fields within a capture may not.
     count = min(original_frames, replayed_frames)
-    metrics = {
+    metrics: dict = {
         "hand_start": {
             "requested_ramp_duration_s": hand_start_duration_s,
             "target": "first_recorded_action" if hand_start_duration_s > 0 else "none",
@@ -139,14 +139,7 @@ def compute_metrics(
             "max_deg": round(float(np.rad2deg(np.max(gaps))), 2),
         }
 
-    def json_defined(value):
-        if isinstance(value, dict):
-            return {k: json_defined(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [json_defined(v) for v in value]
-        return None if isinstance(value, float) and not np.isfinite(value) else value
-
-    return json_defined(metrics)
+    return metrics
 
 
 def report_consistency(metrics: dict) -> None:
@@ -178,7 +171,7 @@ def evaluate_replay(
     trajectory: TrajectoryData,
     replay_data: dict[str, np.ndarray] | None,
     *,
-    output_dir: str,
+    output_dir: str | Path,
     hand_start_duration_s: float = 0.0,
 ) -> None:
     if replay_data is None:
@@ -203,7 +196,7 @@ def evaluate_replay(
     print(f"\nMetrics saved: {metrics_path}")
 
 
-def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str) -> Path:
+def save_replay_data(replay_data: dict[str, np.ndarray], output_dir: str | Path) -> Path:
     """Persist captured replay samples even when consistency metrics are unavailable."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)

@@ -16,15 +16,16 @@ def validate_points(points):
 
 
 def float32_points(points):
+    """Convert newly computed geometry, retaining the post-conversion finite check."""
     with np.errstate(over="ignore", invalid="ignore"):
-        points = validate_points(points).astype(np.float32)
+        points = np.array(points, dtype=np.float32, copy=True)
     if not np.isfinite(points).all():
         raise ValueError("Point coordinates exceed the finite float32 range")
     return points
 
 
 def validate_normals(value, points):
-    normals = float32_points(value)
+    normals = float32_points(validate_points(value))
     if normals.shape != points.shape or not np.allclose(
         np.linalg.norm(normals, axis=1), 1.0, rtol=0, atol=1e-4
     ):
@@ -59,15 +60,13 @@ def validate_pose(pose):
 
 
 def transform_points(points, pose):
-    """Apply T_destination_source to row-vector XYZ points in the source frame."""
-    points = validate_points(points)
-    pose = validate_pose(pose)
+    """Transform admitted XYZ/SE(3) inputs; the new float32 result can still overflow."""
     return float32_points(points @ pose[:3, :3].T + pose[:3, 3])
 
 
 def save_points(path, points):
     """Save a fixed sampling asset without overwriting an existing file."""
-    points = float32_points(points)
+    points = float32_points(validate_points(points))
     if not len(points):
         raise ValueError("A sampling asset must contain at least one point")
     with Path(path).open("xb") as stream:
@@ -75,7 +74,7 @@ def save_points(path, points):
 
 
 def load_points(path):
-    points = float32_points(np.load(path, allow_pickle=False))
+    points = float32_points(validate_points(np.load(path, allow_pickle=False)))
     if not len(points):
         raise ValueError("A sampling asset must contain at least one point")
     return points
@@ -91,8 +90,7 @@ def load_metric_mesh(path, *, scale_to_meters=1.0):
     mesh = trimesh.load(str(Path(path)), process=False)
     if not isinstance(mesh, trimesh.Trimesh):
         raise ValueError("Expected one triangle mesh; export a merged mesh first")
-    vertices = validate_points(mesh.vertices)
-    if not len(vertices) or not len(mesh.faces):
+    if not len(mesh.vertices) or not len(mesh.faces):
         raise ValueError("Mesh must contain vertices and triangular faces")
     if np.asarray(mesh.faces).ndim != 2 or np.asarray(mesh.faces).shape[1] != 3:
         raise ValueError("Mesh faces must be triangles")
@@ -109,9 +107,7 @@ def mesh_scale_from_extent(mesh, axis, extent_m):
     extent_m = float(extent_m)
     if not np.isfinite(extent_m) or extent_m <= 0:
         raise ValueError("extent_m must be finite and positive")
-    vertices = validate_points(mesh.vertices)
-    if not len(vertices):
-        raise ValueError("Mesh contains no vertices")
+    vertices = np.asarray(mesh.vertices)
     original_extent = np.ptp(vertices[:, axis])
     if original_extent <= 0:
         raise ValueError("Mesh has zero extent along the selected axis")
@@ -146,7 +142,26 @@ def sample_mesh_surface(mesh, num_points=1024, seed=0):
     return float32_points(points), float32_points(normals)
 
 
-def validate_intrinsics(intrinsics):
+def validate_rgbd(rgb, depth_m, intrinsics):
+    """Admit external RGB-D and own the camera matrix shared by downstream geometry."""
+    depth_m = np.asarray(depth_m)
+    if np.iscomplexobj(depth_m):
+        raise ValueError("Depth must be real")
+    if (
+        depth_m.ndim != 2
+        or not all(depth_m.shape)
+        or np.any(depth_m < 0)
+    ):
+        raise ValueError(
+            "Depth must be finite nonnegative (H, W), in meters; zero denotes missing depth"
+        )
+    with np.errstate(over="ignore", invalid="ignore"):
+        depth_m = np.asarray(depth_m, dtype=np.float32)
+    if not np.isfinite(depth_m).all():
+        raise ValueError("Depth exceeds the finite float32 range")
+    rgb = np.asarray(rgb)
+    if rgb.dtype != np.uint8 or rgb.shape != (*depth_m.shape, 3):
+        raise ValueError("RGB must be uint8 (H, W, 3), aligned with depth")
     if np.iscomplexobj(intrinsics):
         raise ValueError("Intrinsics must be real")
     intrinsics = np.array(intrinsics, dtype=np.float64, copy=True)
@@ -158,40 +173,7 @@ def validate_intrinsics(intrinsics):
         raise ValueError("Intrinsics have an invalid homogeneous row")
     if abs(intrinsics[0, 1]) > 1e-9 or abs(intrinsics[1, 0]) > 1e-9:
         raise ValueError("Only zero-skew pinhole intrinsics are supported")
-    return intrinsics
-
-
-def depth_and_mask(depth_m, mask):
-    depth_m = np.asarray(depth_m)
-    if np.iscomplexobj(depth_m):
-        raise ValueError("Depth must be real")
-    if (
-        depth_m.ndim != 2
-        or not all(depth_m.shape)
-        or not np.isfinite(depth_m).all()
-        or np.any(depth_m < 0)
-    ):
-        raise ValueError(
-            "Depth must be finite nonnegative (H, W), in meters; zero denotes missing depth"
-        )
-    with np.errstate(over="ignore", invalid="ignore"):
-        depth_m = np.asarray(depth_m, dtype=np.float32)
-    if not np.isfinite(depth_m).all():
-        raise ValueError("Depth exceeds the finite float32 range")
-    if mask is not None:
-        mask = np.asarray(mask)
-        if mask.shape != depth_m.shape or not np.isfinite(mask).all():
-            raise ValueError("Mask must be finite and have the same (H, W) shape as depth")
-        mask = mask.astype(bool)
-    return depth_m, mask
-
-
-def validate_rgbd(rgb, depth_m, intrinsics, mask=None):
-    depth_m, mask = depth_and_mask(depth_m, mask)
-    rgb = np.asarray(rgb)
-    if rgb.dtype != np.uint8 or rgb.shape != (*depth_m.shape, 3):
-        raise ValueError("RGB must be uint8 (H, W, 3), aligned with depth")
-    return rgb, depth_m, validate_intrinsics(intrinsics), mask
+    return rgb, depth_m, intrinsics
 
 
 class RectificationMaps:
@@ -223,8 +205,13 @@ class RectificationMaps:
 
 
 def rectify_rgbd(rgb, depth_m, intrinsics, distortion, mask=None, *, maps=None):
-    """Rectify forward Brown-Conrady RGB-D; nearest-neighbor depth/mask sampling preserves boundaries."""
-    rgb, depth_m, intrinsics, mask = validate_rgbd(rgb, depth_m, intrinsics, mask)
+    """Rectify admitted Frame arrays; a separately supplied mask remains an input boundary."""
+    intrinsics = intrinsics.copy()
+    if mask is not None:
+        mask = np.asarray(mask)
+        if mask.shape != depth_m.shape or not np.isfinite(mask).all():
+            raise ValueError("Mask must be finite and have the same (H, W) shape as depth")
+        mask = mask.astype(bool)
     if np.iscomplexobj(distortion):
         raise ValueError("Distortion coefficients must be real")
     distortion = np.asarray(distortion, dtype=np.float64)
@@ -256,9 +243,7 @@ def rectify_rgbd(rgb, depth_m, intrinsics, distortion, mask=None, *, maps=None):
 
 
 def deproject_depth(depth_m, intrinsics, mask=None):
-    """Return camera-frame XYZ meters, in row-major order of (depth > 0) & mask."""
-    depth_m, mask = depth_and_mask(depth_m, mask)
-    intrinsics = validate_intrinsics(intrinsics)
+    """Deproject an admitted rectified frame and its preview mask in row-major order."""
     valid = depth_m > 0
     if mask is not None:
         valid &= mask

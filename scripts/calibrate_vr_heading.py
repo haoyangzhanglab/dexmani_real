@@ -7,7 +7,7 @@ import argparse
 import math
 import multiprocessing as mp
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +24,7 @@ from dexmani_real.calibration.vr_alignment import (
 from dexmani_real.geometry.pose import forward_from_quat_wxyz
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.runtime.config import RuntimeTimeouts
+from dexmani_real.runtime.observation import read_vr_frame
 from dexmani_real.runtime.sensor_processes import SensorProcesses
 from dexmani_real.runtime.shutdown import shutdown_local_runtime
 from dexmani_real.runtime.state import RuntimeState
@@ -37,14 +38,9 @@ PRINT_INTERVAL_S = 5.0
 JOIN_TIMEOUT_S = 5.0
 COUNTDOWN_DWELL_S = 1.0
 AUDIO_IDLE_TIMEOUT_S = 5.0
-
-
-@dataclass(frozen=True)
-class HeadingCalibrationConfig:
-    duration_s: float = 10.0
-    tracking_data_timeout_s: float = 15.0
-    settle_s: float = 3.0
-    min_frames: int = VR_TRANSFORM_MIN_FRAMES
+DEFAULT_DURATION_S = 10.0
+TRACKING_DATA_TIMEOUT_S = 15.0
+SETTLE_S = 3.0
 
 
 def publish_vr_transform(
@@ -74,10 +70,9 @@ def publish_vr_transform(
 
 
 def read_heading(channels: SensorChannels, reference: str):
-    result = channels.vr_ring.read_latest(use_last_good=True)
-    if result is None:
+    frame = read_vr_frame(channels)
+    if frame is None:
         return None
-    frame = result[0][0]
     # Hand publications cache head pose; only its own receive time identifies a head sample.
     if reference == "head":
         stamp = int(frame["head_recv_ts_ns"])
@@ -126,14 +121,13 @@ def play_completion_audio() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    cfg = HeadingCalibrationConfig()
     safety = RuntimeTimeouts()
     parser = argparse.ArgumentParser(description="VR heading calibration")
     parser.add_argument(
         "--duration",
         type=float,
-        default=cfg.duration_s,
-        help=f"collection duration (s), default: {cfg.duration_s}",
+        default=DEFAULT_DURATION_S,
+        help=f"collection duration (s), default: {DEFAULT_DURATION_S}",
     )
     parser.add_argument(
         "--port", type=int, default=VRParams.port, help=f"VR TCP port, default: {VRParams.port}"
@@ -202,15 +196,15 @@ def main(argv: list[str] | None = None) -> int:
         print("  VR connected", flush=True)
 
         print(
-            f"  Waiting for VR tracking data (up to {cfg.tracking_data_timeout_s:g} s)...",
+            f"  Waiting for VR tracking data (up to {TRACKING_DATA_TIMEOUT_S:g} s)...",
             flush=True,
         )
-        if not wait_for_vr_tracking(channels, sensors, args.ref, cfg.tracking_data_timeout_s):
+        if not wait_for_vr_tracking(channels, sensors, args.ref, TRACKING_DATA_TIMEOUT_S):
             print("  ERROR: no VR tracking data received", flush=True)
             return 1
 
-        print(f"  Settling ({cfg.settle_s:.0f} s) — fine-tune your pose...", flush=True)
-        time.sleep(cfg.settle_s)
+        print(f"  Settling ({SETTLE_S:.0f} s) — fine-tune your pose...", flush=True)
+        time.sleep(SETTLE_S)
 
         if args.ref == "head":
             print("  Face the robot +X direction, hold your head still...")
@@ -258,8 +252,8 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: VR receiver cleanup failed; calibration was not published")
         return 1
 
-    if len(forwards) < cfg.min_frames:
-        print(f"ERROR: only {len(forwards)} frames collected (< {cfg.min_frames} required)")
+    if len(forwards) < VR_TRANSFORM_MIN_FRAMES:
+        print(f"ERROR: only {len(forwards)} frames collected (< {VR_TRANSFORM_MIN_FRAMES} required)")
         return 1
 
     forwards_arr = np.array(forwards, dtype=np.float64)
@@ -269,8 +263,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: invalid heading sample: {exc}")
         return 1
     inlier_frames = int(np.sum(inlier))
-    if inlier_frames < cfg.min_frames:
-        print(f"ERROR: only {inlier_frames} inlier frames remain (< {cfg.min_frames} required)")
+    if inlier_frames < VR_TRANSFORM_MIN_FRAMES:
+        print(f"ERROR: only {inlier_frames} inlier frames remain (< {VR_TRANSFORM_MIN_FRAMES} required)")
         return 1
     theta_deg = float(np.rad2deg(theta_rad))
     calibration = parse_vr_transform({

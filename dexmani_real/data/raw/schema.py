@@ -2,8 +2,6 @@
 
 import numpy as np
 
-from dexmani_real.utils.timing import sampling_clock_ns
-
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
 TACTILE_PROCESSING = "sdk_native_bounded_previous_valid_vector_hold"
 TACTILE_UNITS = "sdk_native_unknown_physical_scale"
@@ -23,40 +21,6 @@ DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
     # Seconds relative to the first observation.
     "timestamp": ((), np.dtype(np.float64)),
 }
-
-
-def validate_fixed_rate_rows(
-    timestamp, control_hz, *, row_offset=0
-) -> tuple[str, ...]:
-    """Admit complete fixed-rate rows without compressing waits or missed slots."""
-    timestamp = np.asarray(timestamp)
-    if timestamp.ndim != 1:
-        return ("timestamp must be a one-dimensional array",)
-    if not np.isfinite(timestamp).all() or np.any(timestamp < 0):
-        return ("timestamp must contain finite nonnegative relative seconds",)
-    if len(timestamp) and row_offset == 0 and timestamp[0] != 0:
-        return ("timestamp must start at zero",)
-    if np.any(np.diff(timestamp) <= 0):
-        return ("timestamp must be strictly increasing within an episode",)
-
-    dt_ns, tolerance_ns = sampling_clock_ns(control_hz)
-    stamps = np.rint(timestamp * 1e9)
-    intervals = np.diff(stamps)
-    deviations = stamps - np.arange(row_offset, row_offset + len(stamps)) * dt_ns
-    bad_interval = np.flatnonzero(np.abs(intervals - dt_ns) > tolerance_ns)
-    bad_grid = np.flatnonzero(np.abs(deviations) > tolerance_ns)
-    bad_rows = [int(bad_interval[0]) + 1] if len(bad_interval) else []
-    if len(bad_grid):
-        bad_rows.append(int(bad_grid[0]))
-    if bad_rows:
-        row = min(bad_rows)
-        interval = intervals[row - 1] if row else float("nan")
-        return (
-            f"timing row {row + row_offset}: interval_ns={interval:.0f}, "
-            f"nominal_ns={dt_ns}, grid_deviation_ns={deviations[row]:.0f}, "
-            f"tolerance_ns={tolerance_ns}",
-        )
-    return ()
 
 
 # Host monotonic clocks; unavailable sources use -1. Tactile clocks retain the

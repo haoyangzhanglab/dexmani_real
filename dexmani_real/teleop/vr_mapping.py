@@ -1,25 +1,12 @@
-from __future__ import annotations
+"""以重置锚点映射 VR 手腕位姿，并平滑已提交的遥操作目标。"""
 
-import logging
+from __future__ import annotations
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real.geometry.pose import Pose, quat_multiply, quat_wxyz_to_rotmat
-from dexmani_real.geometry.transforms import (
-    normalize_quat_wxyz,
-    validate_rotation_matrix,
-)
-
-logger = logging.getLogger(__name__)
-
-
-def finite_vector(value: np.ndarray, shape: tuple[int, ...], name: str) -> np.ndarray:
-    """Return a finite float64 copy with the exact expected shape."""
-    array = np.asarray(value, dtype=np.float64)
-    if array.shape != shape or not np.all(np.isfinite(array)):
-        raise ValueError(f"{name} must be a finite array with shape {shape}")
-    return array.copy()
+from dexmani_real.geometry.transforms import normalize_quat_wxyz
 
 
 def matrix_quat_wxyz(matrix):
@@ -37,13 +24,9 @@ class VRWristMapper:
         vr_to_robot_rot: np.ndarray,
     ) -> None:
         self.pos_scale = pos_scale
-        self.vr_to_robot_rot = validate_rotation_matrix(vr_to_robot_rot, name="vr_to_robot_rot")
+        self.vr_to_robot_rot = np.array(vr_to_robot_rot, dtype=np.float64, copy=True)
 
-        self.wrist_pos0: np.ndarray | None = None
-        self.wrist_rot0: np.ndarray | None = None
-        self.eef_pos0: np.ndarray | None = None
-        self.eef_rot0: np.ndarray | None = None
-        self.last_quat_wxyz: np.ndarray | None = None
+        self.anchor: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
 
     def reset(
         self,
@@ -52,67 +35,33 @@ class VRWristMapper:
         eef_pos: np.ndarray,
         eef_quat_wxyz: np.ndarray,
     ) -> None:
-        # Validate before committing the new anchor; failed resets clear stale state.
-        try:
-            next_wrist_pos0 = finite_vector(wrist_pos, (3,), "wrist_pos")
-            next_wrist_rot0 = quat_wxyz_to_rotmat(wrist_quat_wxyz)
-            next_eef_pos0 = finite_vector(eef_pos, (3,), "eef_pos")
-            next_eef_rot0 = quat_wxyz_to_rotmat(eef_quat_wxyz)
-        except (TypeError, ValueError):
-            self.clear()
-            logger.warning(
-                "VRWristMapper.reset: invalid pose input — mapper cleared",
-                exc_info=True,
-            )
-            return
-        self.wrist_pos0 = next_wrist_pos0
-        self.wrist_rot0 = next_wrist_rot0
-        self.eef_pos0 = next_eef_pos0
-        self.eef_rot0 = next_eef_rot0
-        self.last_quat_wxyz = matrix_quat_wxyz(self.eef_rot0)
+        # A failed reset must not leave an older anchor available.
+        self.clear()
+        wrist = Pose(wrist_pos, wrist_quat_wxyz)
+        eef = Pose(eef_pos, eef_quat_wxyz)
+        self.anchor = (
+            wrist.p.copy(), quat_wxyz_to_rotmat(wrist.q),
+            eef.p.copy(), quat_wxyz_to_rotmat(eef.q),
+        )
 
     def map(
         self,
         wrist_pos: np.ndarray,
         wrist_quat_wxyz: np.ndarray,
-    ) -> Pose | None:
-        if not self.is_ready():
-            return None
-
-        try:
-            current_wrist_pos = finite_vector(wrist_pos, (3,), "wrist_pos")
-            wrist_rot = quat_wxyz_to_rotmat(wrist_quat_wxyz)
-        except (TypeError, ValueError):
-            logger.warning("VRWristMapper.map: invalid wrist pose — no target", exc_info=True)
-            return None
-
-        delta_pos_vr = current_wrist_pos - self.wrist_pos0
-        delta_pos_base = self.pos_scale * (self.vr_to_robot_rot @ delta_pos_vr)
+    ) -> Pose:
+        if self.anchor is None:
+            raise RuntimeError("VR wrist mapping requires a reset anchor")
+        wrist_pos0, wrist_rot0, eef_pos0, eef_rot0 = self.anchor
+        wrist = Pose(wrist_pos, wrist_quat_wxyz)
+        delta_pos_base = self.pos_scale * (self.vr_to_robot_rot @ (wrist.p - wrist_pos0))
 
         # C maps VR axes into xarm_base; conjugation expresses the anchored rotation there.
-        delta_rot_vr = wrist_rot @ self.wrist_rot0.T
+        delta_rot_vr = quat_wxyz_to_rotmat(wrist.q) @ wrist_rot0.T
         delta_rot_base = self.vr_to_robot_rot @ delta_rot_vr @ self.vr_to_robot_rot.T
-        target_pos = self.eef_pos0 + delta_pos_base
-        if not np.all(np.isfinite(target_pos)):
-            logger.warning("VRWristMapper.map: non-finite mapped pose — no target")
-            return None
-
-        target_rot = delta_rot_base @ self.eef_rot0
-        pose = Pose(target_pos, matrix_quat_wxyz(target_rot))
-        if np.dot(pose.q, self.last_quat_wxyz) < 0:
-            pose.q = -pose.q
-        self.last_quat_wxyz = pose.q.copy()
-        return pose
+        return Pose(eef_pos0 + delta_pos_base, matrix_quat_wxyz(delta_rot_base @ eef_rot0))
 
     def clear(self) -> None:
-        self.wrist_pos0 = None
-        self.wrist_rot0 = None
-        self.eef_pos0 = None
-        self.eef_rot0 = None
-        self.last_quat_wxyz = None
-
-    def is_ready(self) -> bool:
-        return self.wrist_pos0 is not None
+        self.anchor = None
 
 
 def quat_to_rotvec(q: np.ndarray) -> np.ndarray:

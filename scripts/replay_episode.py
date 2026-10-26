@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     from dexmani_real.replay.replayer import ReplayStatus
     from dexmani_real.replay.session import (
         DEFAULT_OUTPUT_DIR,
-        ReplaySession,
+        run_replay,
     )
     from dexmani_real.replay.trajectory import load_trajectory
 
@@ -84,12 +84,12 @@ def main(argv: list[str] | None = None) -> int:
         output_dir = args.output
     print(f"Output: {output_dir}")
 
-    outcome = ReplaySession(
+    outcome = run_replay(
         trajectory,
         runtime,
         output_dir=output_dir,
         hand_start_duration_s=args.hand_start_duration,
-    ).run()
+    )
 
     if not outcome.successful:
         print(f"Replay stopped: {outcome.status.value}: {outcome.reason}")

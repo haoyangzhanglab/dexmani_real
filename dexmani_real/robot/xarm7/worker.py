@@ -18,9 +18,8 @@ from dexmani_real.utils.timing import next_tick_ns
 
 
 class ArmWorker:
-    def __init__(self, cfg, io, pipe, driver, *, clock_ns=time.monotonic_ns):
+    def __init__(self, cfg, io, pipe, driver):
         self.cfg, self.io, self.pipe, self.driver = cfg, io, pipe, driver
-        self.clock = clock_ns
         self.status = np.zeros((), dtype=STATUS_DTYPE)
         self.active = self.reference = None
         self.last_send_ns = 0
@@ -40,16 +39,11 @@ class ArmWorker:
         self.io.stop.set()
 
     def read_feedback(self):
-        started = self.clock()
+        started = time.monotonic_ns()
         try:
             q, v = self.driver.read()
-            if (
-                any(np.asarray(x).shape != (7,) for x in (q, v))
-                or not np.isfinite([q, v]).all()
-            ):
-                raise RuntimeError("invalid arm feedback shape/values")
             status = self.driver.read_status()
-            completed = self.clock()
+            completed = time.monotonic_ns()
             if completed - started >= int(self.cfg.feedback_max_age_s * 1e9):
                 raise TimeoutError("arm query exceeded feedback freshness budget")
             if not self.driver.is_connected or status.error_code:
@@ -79,10 +73,10 @@ class ArmWorker:
     ):
         """Require position/velocity dwell; strict HOME rejects any bad sample."""
         tolerance = self.cfg.homing.convergence_rad if tolerance_rad is None else tolerance_rad
-        deadline = self.clock() + int(timeout_s * 1e9)
-        stable = self.clock() if strict else None
+        deadline = time.monotonic_ns() + int(timeout_s * 1e9)
+        stable = time.monotonic_ns() if strict else None
         anchor = None
-        while self.clock() < deadline:
+        while time.monotonic_ns() < deadline:
             check_abort()
             if strict:
                 self.io.stop.wait(min(interval_s, self.cfg.homing.dwell_s))
@@ -90,7 +84,7 @@ class ArmWorker:
             self.read_feedback()
             check_abort()
             q, v = self.status["frame"]["qpos"], self.status["frame"]["qvel"]
-            now = self.clock()
+            now = time.monotonic_ns()
             valid = np.max(np.abs(v)) <= self.cfg.homing.velocity_convergence_rad_s
             if target is not None:
                 valid = valid and np.max(np.abs(q - target)) <= tolerance
@@ -117,7 +111,7 @@ class ArmWorker:
         )
         # Check braking extrema before Mode 1; seed the first causal goal from fresh feedback.
         ArmReference(
-            self.cfg, self.status["frame"]["qpos"], self.status["frame"]["qvel"], self.clock()
+            self.cfg, self.status["frame"]["qpos"], self.status["frame"]["qvel"], time.monotonic_ns()
         )
 
     def home(self, waypoints, final_qpos, *, check_abort):
@@ -226,7 +220,7 @@ class ArmWorker:
                 if self.io.cancel_operation.is_set() or not self.authorized(run_id):
                     raise OperationCancelled(f"{kind} authority revoked")
                 # HOME 使用协调者健康截止，不消费 streaming 目标的执行期限。
-                if self.clock() >= self.io.health_until.value:
+                if time.monotonic_ns() >= self.io.health_until.value:
                     raise TimeoutError(f"{kind} hand feedback or parent service expired")
 
             check_abort()
@@ -293,7 +287,7 @@ class ArmWorker:
         pending = self.io.take_goal()
         if self.active is None and pending is None:
             return
-        now = self.clock()
+        now = time.monotonic_ns()
         goal = pending if pending is not None else self.active
         issue = self.command_issue(goal, now, first=pending is not None)
         if issue:
@@ -310,7 +304,7 @@ class ArmWorker:
             self.reference.replace(pending["q_goal"], now)
             self.active = pending
         q, _, _ = self.reference.sample(now)
-        started = self.clock()
+        started = time.monotonic_ns()
         issue = self.command_issue(goal, started, first=pending is not None)
         if issue:
             if issue not in {"revoked", "input_changed"}:
@@ -322,7 +316,7 @@ class ArmWorker:
         if np.max(np.abs(self.status["frame"]["qpos"] - q)) > self.cfg.tracking_error_rad:
             raise RuntimeError("tracking_error")
         # Recheck authority and timing after computing the reference and tracking error.
-        started = self.clock()
+        started = time.monotonic_ns()
         interval = started - self.last_send_ns if self.last_send_ns else 0
         issue = self.command_issue(goal, started, first=pending is not None)
         if issue is None and interval > int(self.cfg.servo_max_interval_s * 1e9):
@@ -335,7 +329,7 @@ class ArmWorker:
             self.io.stop.set()
             return
         code = self.driver.servo(q)
-        completed = self.clock()
+        completed = time.monotonic_ns()
         self.last_send_ns = started
         if isinstance(code, bool) or not isinstance(code, (int, np.integer)) or code != 0:
             raise RuntimeError(f"servo SDK failed: {code!r}")
@@ -357,8 +351,8 @@ class ArmWorker:
             self.read_feedback()
             self.io.ready.set()
             period = round(1e9 / self.cfg.servo_hz)
-            tick = self.clock() + period
-            feedback_due = self.clock() + round(1e9 / self.cfg.feedback_hz)
+            tick = time.monotonic_ns() + period
+            feedback_due = time.monotonic_ns() + round(1e9 / self.cfg.feedback_hz)
             while True:
                 if self.io.stop.is_set() and not self.io.stopped.is_set():
                     self.stop()
@@ -366,25 +360,25 @@ class ArmWorker:
                     break
                 if self.pipe.poll():
                     self.operation(self.pipe.recv())
-                    tick = self.clock() + period
-                    feedback_due = self.clock()
-                now = self.clock()
+                    tick = time.monotonic_ns() + period
+                    feedback_due = time.monotonic_ns()
+                now = time.monotonic_ns()
                 if now >= tick:
                     try:
                         self.tick()
                     except Exception as exc:
                         self.fault(exc)
-                    tick = next_tick_ns(tick, period, self.clock())
+                    tick = next_tick_ns(tick, period, time.monotonic_ns())
                 if self.active is not None and not self.authorized(int(self.active["run_id"])):
                     self.io.stop.set()
-                if self.clock() >= feedback_due and not self.io.fault.value:
+                if time.monotonic_ns() >= feedback_due and not self.io.fault.value:
                     try:
                         self.read_feedback()
                     except Exception as exc:
                         self.fault(exc)
-                    feedback_due = self.clock() + round(1e9 / self.cfg.feedback_hz)
+                    feedback_due = time.monotonic_ns() + round(1e9 / self.cfg.feedback_hz)
                 # A stop interrupts this wait; goals only activate on a scheduled tick.
-                delay = max(0, min(tick, feedback_due) - self.clock()) / 1e9
+                delay = max(0, min(tick, feedback_due) - time.monotonic_ns()) / 1e9
                 if self.io.stopped.is_set():
                     # Stopped motion still needs feedback for idle checks and the next HOME.
                     self.pipe.poll(0.01 if self.io.fault.value else delay)
@@ -408,13 +402,11 @@ class ArmWorker:
             self.pipe.close()
 
 
-def run_arm(cfg, io, pipe, driver_factory=None):
+def run_arm(cfg, io, pipe):
     try:
-        if driver_factory is None:
-            from dexmani_real.robot.xarm7.driver import XArm7
+        from dexmani_real.robot.xarm7.driver import XArm7
 
-            driver_factory = XArm7
-        driver = driver_factory(cfg)
+        driver = XArm7(cfg)
     except BaseException as exc:
         io.fault.value = f"driver construction failed: {exc}".encode()[:1023]
         io.ready.set()

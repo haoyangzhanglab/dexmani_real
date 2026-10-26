@@ -24,7 +24,6 @@ class HandPointCloudTemplate:
     """One immutable template per consumer, using its existing hand FK workspace."""
 
     def __init__(self, config: HandPointCloudConfig, hand_fk):
-        config.validate()
         import trimesh
 
         path = XHAND_RIGHT_URDF_PATH

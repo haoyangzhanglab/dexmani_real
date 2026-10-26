@@ -118,7 +118,6 @@ class XArm7:
     """Normalize finite vendor operations; the arm child owns HOME and stopping."""
 
     def __init__(self, cfg: ArmParams) -> None:
-        cfg.validate()
         self.cfg = cfg
         self.api: Any = None
 

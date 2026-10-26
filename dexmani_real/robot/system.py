@@ -28,7 +28,7 @@ class RobotState:
 class DexManiRobot:
     def __init__(
         self, arm_config, hand_config, *, run_signal, stop_signal, emergency_signal, signal_lock,
-        arm_factory=None, hand_factory=None, check_services=None,
+        check_services=None,
     ):
         self.arm_config, self.hand_config = arm_config, hand_config
         self.arm_lower = np.asarray(arm_config.joint_limit_lower, dtype=np.float64)
@@ -37,7 +37,6 @@ class DexManiRobot:
         self.hand_upper = np.asarray(hand_config.mechanical_qpos_max_rad, dtype=np.float64)
         self.run_signal, self.stop_signal = run_signal, stop_signal
         self.emergency_signal, self.signal_lock = emergency_signal, signal_lock
-        self.arm_factory, self.hand_factory = arm_factory, hand_factory
         self.check_services = check_services
         self.arm = self.hand = None
         self.owner = None
@@ -96,18 +95,16 @@ class DexManiRobot:
             self.arm = ArmExecutor(
                 self.arm_config, run_signal=self.run_signal, stop_signal=self.stop_signal,
                 emergency_signal=self.emergency_signal, signal_lock=self.signal_lock,
-                driver_factory=self.arm_factory, input_signal=self.input_signal,
+                input_signal=self.input_signal,
             )
             self.arm.connect(check_services=self.check_services)
             if cancelled():
                 raise CancelledError("robot startup cancelled before hand connection")
             deadline_ns = None
             if self.hand_config.enabled:
-                if self.hand_factory is None:
-                    from dexmani_real.robot.xhand.driver import XHand
+                from dexmani_real.robot.xhand.driver import XHand
 
-                    self.hand_factory = XHand
-                self.hand = self.hand_factory(self.hand_config)
+                self.hand = XHand(self.hand_config)
                 deadline_ns = self.hand.connect(cancel_requested=cancelled)
             self.connected = True
             self.reset_hand_feedback(deadline_ns=deadline_ns)

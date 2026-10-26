@@ -2,37 +2,27 @@
 
 from __future__ import annotations
 
-from dataclasses import astuple, dataclass, field
+from dataclasses import astuple, dataclass
 from math import radians
 
 import numpy as np
 
 
 @dataclass(frozen=True)
-class EMAParams:
-    alpha_pos: float = 0.7
-    alpha_rot: float = 0.5
-
-
-@dataclass(frozen=True)
-class VRMappingParams:
-    pos_scale: float = 0.4
-    stale_threshold_s: float = 0.5
-
-
-@dataclass(frozen=True)
 class TeleopParams:
     control_hz: float = 16.0
-    ema: EMAParams = field(default_factory=EMAParams)
-    vr_mapping: VRMappingParams = field(default_factory=VRMappingParams)
+    ema_alpha_pos: float = 0.7
+    ema_alpha_rot: float = 0.5
+    vr_pos_scale: float = 0.4
+    vr_stale_threshold_s: float = 0.5
     hand_retargeting_type: str = "tag"
 
     def validate(self) -> None:
-        if not (0.0 <= self.ema.alpha_pos <= 1.0 and 0.0 <= self.ema.alpha_rot <= 1.0):
+        if not (0.0 <= self.ema_alpha_pos <= 1.0 and 0.0 <= self.ema_alpha_rot <= 1.0):
             raise ValueError("EMA alphas must be in [0, 1]")
         if not all(
             np.isfinite(v) and v > 0
-            for v in (self.vr_mapping.pos_scale, self.vr_mapping.stale_threshold_s)
+            for v in (self.vr_pos_scale, self.vr_stale_threshold_s)
         ):
             raise ValueError("VR position scale and stale threshold must be finite and positive")
         if self.hand_retargeting_type not in {"tag", "dexpilot"}:
@@ -48,8 +38,6 @@ class CollectionOptions:
     max_duration_s: float = 60.0
 
     def validate(self) -> None:
-        if type(self.enabled) is not bool:
-            raise TypeError("collection.enabled must be a boolean")
         if not isinstance(self.episodes_dir, str) or not self.episodes_dir.strip():
             raise ValueError("collection.episodes_dir must be non-empty")
         if self.enabled and (not np.isfinite(self.max_duration_s) or self.max_duration_s <= 0):
@@ -65,14 +53,6 @@ class KeyboardTeleopParams:
     workspace_command_margin_m: float = 0.005
     ik_max_pose_error_pos_m: float = 0.002
     ik_max_pose_error_rot_rad: float = radians(2.0)
-
-    def validate(self) -> None:
-        for name in ("control_hz", "target_max_age_s", "delta_pos_m", "delta_rpy_rad"):
-            if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
-                raise ValueError(f"keyboard {name} must be finite and positive")
-        margin = self.workspace_command_margin_m
-        if not np.isfinite(margin) or margin < 0:
-            raise ValueError("workspace_command_margin_m must be finite and non-negative")
 
 
 @dataclass(frozen=True)
@@ -148,14 +128,3 @@ class DexPilotRetargetingParams:
 
 
 DEFAULT_TASK_NAME = "test"
-
-
-def validate_task_dir_name(value: str) -> str:
-    """Validate one task name as a safe directory component."""
-    if not isinstance(value, str) or not value or value != value.strip():
-        raise ValueError("task_name must be a non-empty string without surrounding whitespace")
-    if value.startswith("."):
-        raise ValueError("task_name must not be a hidden or relative directory name")
-    if "/" in value or "\\" in value or any(ord(char) < 32 for char in value):
-        raise ValueError("task_name must be one safe directory component")
-    return value

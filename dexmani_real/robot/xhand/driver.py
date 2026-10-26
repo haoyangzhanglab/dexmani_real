@@ -85,12 +85,11 @@ class XHandError(RuntimeError):
 
 class XHand:
     def __init__(self, config: HandParams):
-        config.validate()
         self.cfg = config
         self.mechanical_lower = np.asarray(config.mechanical_qpos_min_rad, dtype=np.float64)
         self.mechanical_upper = np.asarray(config.mechanical_qpos_max_rad, dtype=np.float64)
         self.connected_flag = False
-        self.send_crc_started_ns = None
+        self.send_crc_started_ns: int | None = None
         self.device_identity = {
             "backend": "hardware",
             "hand_type": "unavailable",
@@ -112,7 +111,7 @@ class XHand:
 
         self.sdk = xhand_control
         if self.connected_flag:
-            return
+            return None
 
         try:
             self.open_device()
@@ -145,7 +144,6 @@ class XHand:
     def open_device(self) -> None:
         retries = OPEN_RETRIES[self.cfg.comm_type]
         device_name = self.cfg.device_name
-        last_error: XHandError | None = None
 
         for attempt in range(1, retries + 1):
             self.control = self.sdk.XHandControl()
@@ -195,28 +193,23 @@ class XHand:
                 str(getattr(error, "error_message", "empty error object")),
             )
             self.close_control()
-            if attempt < retries:
-                delay = OPEN_RETRY_DELAY_S
-                if self.cfg.comm_type == "ethercat" and attempt == 1:
-                    delay = max(delay, STALE_EC_RECOVERY_S)
-                logger.warning(
-                    "XHand open attempt %d/%d failed: %s; retrying in %.1fs",
-                    attempt,
-                    retries,
-                    last_error.message,
-                    delay,
+            if attempt == retries:
+                logger.error(
+                    "XHand connect failed after %d attempts: %s", retries, last_error.message
                 )
-                time.sleep(delay)
-
-        logger.error(
-            "XHand connect failed after %d attempts: %s",
-            retries,
-            last_error.message if last_error is not None else "unknown error",
-        )
-        logger.warning(CONNECTION_HINT[self.cfg.comm_type])
-        if last_error is None:
-            raise XHandError("connect", -1, "device open failed without an SDK error")
-        raise last_error
+                logger.warning(CONNECTION_HINT[self.cfg.comm_type])
+                raise last_error
+            delay = OPEN_RETRY_DELAY_S
+            if self.cfg.comm_type == "ethercat" and attempt == 1:
+                delay = max(delay, STALE_EC_RECOVERY_S)
+            logger.warning(
+                "XHand open attempt %d/%d failed: %s; retrying in %.1fs",
+                attempt,
+                retries,
+                last_error.message,
+                delay,
+            )
+            time.sleep(delay)
 
     def captured_sdk_call(
         self,
@@ -442,8 +435,16 @@ class XHand:
         self.send_crc_started_ns = None
 
     def send_position(self, action: np.ndarray) -> int:
+        from dexmani_real.robot.commands import check_hand_target
+
         target = np.asarray(action, dtype=np.float64)
-        self.validate_action(target)
+        reason = check_hand_target(
+            target,
+            mechanical_lower_rad=self.mechanical_lower,
+            mechanical_upper_rad=self.mechanical_upper,
+        )
+        if reason is not None:
+            raise ValueError(f"XHand.send_action: {reason}")
         if self.control is None or self.command is None or not self.connected_flag:
             raise RuntimeError("XHand command path is not initialized")
         for index, value in enumerate(target):
@@ -520,14 +521,3 @@ class XHand:
             joint.res2 = 0
             joint.res3 = 0
         return command
-
-    def validate_action(self, qpos: np.ndarray) -> None:
-        from dexmani_real.robot.commands import check_hand_target
-
-        reason = check_hand_target(
-            qpos,
-            mechanical_lower_rad=self.mechanical_lower,
-            mechanical_upper_rad=self.mechanical_upper,
-        )
-        if reason is not None:
-            raise ValueError(f"XHand.send_action: {reason}")

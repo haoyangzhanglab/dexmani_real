@@ -35,20 +35,6 @@ OPERATOR2MANO_RIGHT = np.array(
 )
 
 
-def validate_landmarks(points: np.ndarray) -> tuple[bool, str]:
-    """Apply the fail-closed geometric gate before touching temporal state."""
-    if points.shape != (21, 3):
-        return False, f"shape {points.shape} != (21, 3)"
-    if not np.all(np.isfinite(points)):
-        return False, "contains NaN/Inf"
-    shortest_bone = min(
-        float(np.linalg.norm(points[child] - points[parent])) for parent, child in CONTIGUOUS_BONES
-    )
-    if shortest_bone < 0.002:
-        return False, "a retargeting bone is shorter than 2 mm"
-    return True, ""
-
-
 def estimate_palm_frame(keypoint_3d_array: np.ndarray) -> np.ndarray:
     """Construct the admitted palm triangle's right-handed frame, X toward wrist."""
     eps = 1e-8
@@ -112,9 +98,13 @@ def prepare_landmarks(landmarks, *, pinky_scale, pinky_palm_scale):
     if landmarks is None:
         return None
     landmarks = np.asarray(landmarks, dtype=np.float64)
-    valid, reason = validate_landmarks(landmarks)
-    if not valid:
-        logger.warning("VR landmarks rejected (%s) — no target produced", reason)
+    if any(
+        np.linalg.norm(landmarks[child] - landmarks[parent]) < 0.002
+        for parent, child in CONTIGUOUS_BONES
+    ):
+        logger.warning(
+            "VR landmarks rejected (a retargeting bone is shorter than 2 mm) — no target produced"
+        )
         return None
     try:
         wrist_rot = estimate_palm_frame(landmarks)

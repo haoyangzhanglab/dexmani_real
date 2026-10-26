@@ -9,6 +9,8 @@ import re
 
 import numpy as np
 
+from .geometry import validate_rgbd
+
 
 @dataclass(frozen=True)
 class Frame:
@@ -26,28 +28,11 @@ class Frame:
     row_index: int | None = None
 
     def __post_init__(self) -> None:
-        if (
-            self.rgb.dtype != np.uint8
-            or self.rgb.ndim != 3
-            or self.rgb.shape[2] != 3
-            or min(self.rgb.shape[:2]) <= 0
-        ):
-            raise ValueError("RGB must be nonempty uint8 [H,W,3]")
-        if (
-            self.depth_m.dtype != np.float32
-            or self.depth_m.shape != self.rgb.shape[:2]
-            or not np.isfinite(self.depth_m).all()
-            or np.any(self.depth_m < 0)
-        ):
+        if self.depth_m.dtype != np.float32:
             raise ValueError("aligned depth must be finite nonnegative float32 [H,W] metres")
-        if (
-            self.K.shape != (3, 3)
-            or not np.isfinite(self.K).all()
-            or self.K[0, 0] <= 0
-            or self.K[1, 1] <= 0
-            or not np.allclose(self.K[2], (0, 0, 1), rtol=0, atol=1e-9)
-        ):
-            raise ValueError("K must be a finite pinhole matrix with positive focal lengths")
+        _, _, intrinsics = validate_rgbd(self.rgb, self.depth_m, self.K)
+        intrinsics.setflags(write=False)
+        object.__setattr__(self, "K", intrinsics)
         if (
             len(self.distortion_coeffs) != 5
             or not np.isfinite(self.distortion_coeffs).all()

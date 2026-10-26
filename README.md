@@ -43,6 +43,8 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 实验配置使用 `from dexmani_real.config import load_experiment_config`，覆盖优先级为 CLI > YAML > dataclass 默认值。配置加载不读取标定或连接设备，运行约束在使用边界验证。`environment.table.plane_path` 的相对路径以仓库根目录解析；显式指定的必需标定缺失时直接报错。VR 标定脚本的 `--force` 仅允许将低质量结果导出到显式指定、非默认且未占用的 `--output` 文件；遥操作启动仍拒绝低质量标定。
 
+机器人会话在 preflight 统一检查设备、HOME 和实际启用的碰撞配置；相机及 XHand 独立工具在自己的入口检查。内部 driver、executor 和计算函数接收已经通过入口检查的配置与标定，不重复预检。新的 SDK 反馈、模型输出、文件数据及最终发送目标仍在各自边界校验。`--print-config` 仅展示声明值；`run_policy()` 在加载策略前检查运行轮数和时长。
+
 ## 代码导航
 
 核心实现位于 [`dexmani_real/`](dexmani_real/)，实验入口与设备工具集中在 [`scripts/`](scripts/)；[`assets/`](assets/) 存放机器人模型等资源，[`third_party/`](third_party/) 包含第三方相关代码。
@@ -57,11 +59,27 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 项目依赖与打包配置见 [`pyproject.toml`](pyproject.toml)，开发约定见 [`AGENTS.md`](AGENTS.md)。
 
-## 迁移说明
+## 运行接口与错误处理
 
-默认标定由 `dexmani_real/state/*.json` 迁至 `dexmani_real/calibration/parameters/*.json`。外部 YAML 若显式配置旧路径，需要手动更新；缺失文件仍报错，不会静默改用默认标定。
+遥操作入口为 `teleop.session.run_teleop(...)`，回放入口为 `replay.session.run_replay(...)`，点云诊断入口为 `scripts.tools.view_pointcloud.run_pointcloud_diagnostic(args)`。入口负责装配资源、运行和收尾，脚本只解析参数并调用入口。
 
-原有 `planning` 等模块路径已迁移，外部导入需按上方模块导航同步更新。`SafetyParams` 改名为 `RuntimeTimeouts`，`EpisodeResults` 改名为 `SessionResults`；YAML `safety` 键、现有结果字段及输出目录仍保持原有含义。
+遥操作配置直接使用以下字段，覆盖顺序为 CLI > YAML > 默认值；未定义的配置键会报错。
+
+```yaml
+teleop:
+  control_hz: 16.0
+  ema_alpha_pos: 0.7
+  ema_alpha_rot: 0.5
+  vr_pos_scale: 0.4
+  vr_stale_threshold_s: 0.5
+  hand_retargeting_type: tag
+```
+
+VR 接收器在发布前拒绝无效传感数据。映射器按已接纳的观测建立锚点，映射或重置发生技术错误时直接抛出异常；重置失败会清除旧锚点。遥操作控制器复用动作检查器的 FK 初始化 VR 锚点与 EMA，EMA 只在命令正常提交后更新参考。
+
+IK 使用入口明确提供的运行关节限位，正常无解返回 `IKResult`，求解器、FK 或碰撞后端故障直接抛出原始异常。HOME 仅对 `HomePathRejected` 表示的几何拒绝尝试其他候选路径，候选耗尽、取消或等待超时返回失败结果；非法目标与技术异常传播到会话错误处理和收尾边界。
+
+回放先保存实测数据，再计算并写入指标。没有有效样本的指标显式记为 `null`；计算产生的非有限数值由 JSON 写入边界拒绝并报告评估失败，保留已保存的实测数据。
 
 ## 观测与产物契约
 

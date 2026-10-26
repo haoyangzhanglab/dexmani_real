@@ -9,7 +9,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.control.action_mapping import ActionIntent
-from dexmani_real.control.online_ik import IKFailureKind
 from dexmani_real.data.recorder import (
     RecordingError,
     snapshot_recording_metadata,
@@ -458,11 +457,6 @@ class PolicyEpisode:
         )
         decoded = self.action_mapper.map(intent, row.arm["qpos"][0], previous)
         if decoded.arm_qpos is None:
-            if (
-                decoded.ik_result is not None
-                and decoded.ik_result.failure_kind == IKFailureKind.INVALID_OUTPUT
-            ):
-                raise RuntimeError(f"online IK technical failure: {decoded.ik_result.reason}")
             return None, ControlRejection(f"{context}_rejected: {decoded.rejection_reason}")
         return RobotCommand(self.run_id, decoded.arm_qpos, decoded.hand_qpos), None
 

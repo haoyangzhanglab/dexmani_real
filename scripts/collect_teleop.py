@@ -72,7 +72,6 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
     if args.print_config:
-        runtime.collection.validate()
         sections = ["arm", "hand", "motion", "teleop", "collection", "vr", "safety", "environment"]
         if runtime.collection.enabled:
             sections.append("camera")
@@ -90,15 +89,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("hand.enabled=false requires explicit --no-hand confirmation")
 
     from dexmani_real.calibration import VR_TRANSFORM_PATH
-    from dexmani_real.teleop.session import TeleopSession
+    from dexmani_real.teleop.session import run_teleop
 
-    return TeleopSession(
+    return run_teleop(
         runtime,
         task_name=args.task_name,
         allow_no_hand=args.no_hand,
         vr_transform_path=args.vr_transform or VR_TRANSFORM_PATH,
         camera_calibration_path=args.camera_calibration,
-    ).run()
+    )
 
 
 if __name__ == "__main__":

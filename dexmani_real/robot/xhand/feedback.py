@@ -210,8 +210,6 @@ class XHandFeedback:
         max_age_ns = int(self.config.feedback_max_age_s * 1e9)
         issue = "hand joint feedback has no valid initial value"
         if frame is not None:
-            if not np.isfinite(frame["qpos"]).all():
-                raise RuntimeError("hand joint feedback is nonfinite")
             issue = None
             stamp = int(frame["timestamp_ns"][0])
             if not 0 < stamp <= now_ns < stamp + max_age_ns:

@@ -2,8 +2,6 @@
 
 import numpy as np
 
-from .geometry import validate_intrinsics, validate_pose
-
 
 class ModelDepthRenderer:
     """Cache a metre-scale mesh; render camera Z on the global stride grid, with zero for missing hits."""
@@ -106,14 +104,7 @@ class ModelDepthRenderer:
 
     def render(self, image_shape, intrinsics, T_camera_object):
         """Render the first positive model intersection for this frame's camera/pose."""
-        image_shape = tuple(image_shape)
-        if len(image_shape) != 2 or any(
-            isinstance(n, (bool, np.bool_)) or not isinstance(n, (int, np.integer)) or n <= 0
-            for n in image_shape
-        ):
-            raise ValueError("Image shape must contain positive integer height and width")
-        intrinsics = validate_intrinsics(intrinsics)
-        pose = validate_pose(T_camera_object)
+        pose = T_camera_object
         directions = self.camera_rays(image_shape, intrinsics)
         roi = self.ray_roi(directions, intrinsics, pose)
         roi_directions = directions[roi]

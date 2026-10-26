@@ -389,10 +389,10 @@ class TeleopRunner:
                 ),
             )
         ):
-            prepared = self.controller.reset_reference(row)
+            self.controller.reset_reference(row)
             with self.runtime_state.motion_lock:
                 authorized = (
-                    prepared and self.preparation_valid() and self.runtime_state.begin_motion()
+                    self.preparation_valid() and self.runtime_state.begin_motion()
                 )
                 if authorized:
                     self.control_run_id = self.runtime_state.run_id
@@ -431,7 +431,7 @@ class TeleopRunner:
                     command,
                     valid_until_ns=deadline_ns,
                     execute_until_ns=int(row.vr["recv_ts_ns"])
-                    + int(self.runtime.teleop.vr_mapping.stale_threshold_s * 1e9),
+                    + int(self.runtime.teleop.vr_stale_threshold_s * 1e9),
                 )
         except BaseException as exc:
             failure = exc

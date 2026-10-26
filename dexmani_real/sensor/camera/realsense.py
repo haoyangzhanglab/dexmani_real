@@ -31,7 +31,6 @@ class RGBDFrame:
 
 class RealSenseCamera:
     def __init__(self, config: CameraParams, *, auto_exposure_priority: float | None = 0.0) -> None:
-        config.validate()
         if auto_exposure_priority is not None and (
             isinstance(auto_exposure_priority, bool)
             or not isinstance(auto_exposure_priority, (int, float))

@@ -19,9 +19,9 @@ from dexmani_real.data.raw.schema import (
     TACTILE_PROCESSING,
     TACTILE_UNITS,
     TIMING_ROW_DTYPE,
-    validate_fixed_rate_rows,
 )
 from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
+from dexmani_real.utils.timing import sampling_clock_ns
 
 
 class RawDataError(ValueError):
@@ -222,15 +222,30 @@ class EpisodeReader:
             if required_tactile else None
         )
         timestamps = self["timestamp"]
+        dt_ns, tolerance_ns = sampling_clock_ns(self.control_hz)
         first_observation = None
         for start in range(0, self.num_frames, chunk_frames):
             first, end = max(0, start - 1), min(start + chunk_frames, self.num_frames)
             timestamp = timestamps[first:end]
-            errors = validate_fixed_rate_rows(
-                timestamp, self.control_hz, row_offset=first
-            )
-            if errors:
-                raise RawDataError("; ".join(errors))
+            if not np.isfinite(timestamp).all() or np.any(timestamp < 0):
+                raise RawDataError("timestamp must contain finite nonnegative relative seconds")
+            if first == 0 and timestamp[0] != 0:
+                raise RawDataError("timestamp must start at zero")
+            if np.any(np.diff(timestamp) <= 0):
+                raise RawDataError("timestamp must be strictly increasing within an episode")
+            stamps = np.rint(timestamp * 1e9)
+            intervals = np.diff(stamps)
+            deviations = stamps - np.arange(first, end) * dt_ns
+            bad = np.abs(deviations) > tolerance_ns
+            bad[1:] |= np.abs(intervals - dt_ns) > tolerance_ns
+            if bad.any():
+                row = int(np.flatnonzero(bad)[0])
+                interval = intervals[row - 1] if row else float("nan")
+                raise RawDataError(
+                    f"timing row {row + first}: interval_ns={interval:.0f}, "
+                    f"nominal_ns={dt_ns}, grid_deviation_ns={deviations[row]:.0f}, "
+                    f"tolerance_ns={tolerance_ns}"
+                )
             rows = timing.fields(fields)[first:end]
             observation = rows["observation_ns"]
             if np.any(observation <= 0) or np.any(np.diff(observation) <= 0):

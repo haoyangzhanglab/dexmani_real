@@ -22,9 +22,8 @@ from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
 )
-from dexmani_real.robot.xhand.config import HandParams
+from dexmani_real.robot.xhand.config import HandParams, validate_hand_command_bounds
 from dexmani_real.robot.xhand.driver import XHand
-from dexmani_real.robot.xhand.limits import validate_hand_command_bounds
 from dexmani_real.utils.log import configure_logging
 
 HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
@@ -66,16 +65,6 @@ PRESET_QPOS_DEG = {
 }
 
 
-def validate_target(qpos_rad, config: HandParams) -> np.ndarray:
-    return validate_hand_command_bounds(
-        qpos_rad,
-        config.qpos_min_rad,
-        config.qpos_max_rad,
-        config.mechanical_qpos_min_rad,
-        config.mechanical_qpos_max_rad,
-    )
-
-
 def action_sequence(config: HandParams) -> list[tuple[str, np.ndarray]]:
     actions = (
         ("HOME", config.home_qpos_deg),
@@ -85,7 +74,15 @@ def action_sequence(config: HandParams) -> list[tuple[str, np.ndarray]]:
         ("OK", PRESET_QPOS_DEG["ok"]),
         ("HOME", config.home_qpos_deg),
     )
-    return [(name, validate_target(np.deg2rad(values), config)) for name, values in actions]
+    return [
+        (
+            name,
+            validate_hand_command_bounds(
+                np.deg2rad(values), config.qpos_min_rad, config.qpos_max_rad,
+            ),
+        )
+        for name, values in actions
+    ]
 
 
 class XHandControlExample(XHand):
@@ -175,8 +172,7 @@ class XHandControlExample(XHand):
             raise RuntimeError("action joint feedback unavailable")
         return state.qpos
 
-    def execute_action(self, qpos_rad) -> None:
-        target = validate_target(qpos_rad, self.cfg)
+    def execute_action(self, target: np.ndarray) -> None:
         self.read_action_positions()
         self.check_cancelled()
         deadline_ns = time.monotonic_ns() + int(self.cfg.home_timeout_s * 1e9)
@@ -366,11 +362,10 @@ def main(argv: list[str] | None = None) -> int:
                 "hand.device_id": args.hand_id,
             },
         ).hand
-        config.validate()
+        if not args.print_config:
+            config.validate()
         if not 0 <= args.finger_id < HAND_DOF:
             raise ValueError(f"finger-id must be in 0..{HAND_DOF - 1}")
-        if not args.read_only and not args.print_config:
-            action_sequence(config)
     except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
         parser.error(str(exc))
     if args.print_config:

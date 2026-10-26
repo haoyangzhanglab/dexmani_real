@@ -24,206 +24,200 @@ DEFAULT_OUTPUT_DIR = "replay_results"
 logger = logging.getLogger(__name__)
 
 
-class ReplaySession:
-    """Own replay startup, physical evidence, return-home and evaluation."""
-
-    def __init__(self, trajectory, runtime, *, output_dir, hand_start_duration_s=0.5):
-        self.trajectory = trajectory
-        self.runtime = runtime
-        self.output_dir = output_dir
-        self.hand_start_duration_s = hand_start_duration_s
-
-    def run(self):
-        configure_logging()
-        if not math.isfinite(self.hand_start_duration_s) or self.hand_start_duration_s < 0:
-            raise ValueError("hand_start_duration_s must be finite and >= 0")
-        validate_robot_config(self.runtime)
-        validate_control_rate(self.runtime, self.trajectory.fps)
-        self.table_plane_abcd = resolve_table_plane(
-            self.runtime.environment.table, required=self.runtime.environment.table.enabled,
+def run_replay(
+    trajectory, runtime, *, output_dir, hand_start_duration_s=0.5,
+) -> ReplayOutcome:
+    """运行一次回放，完成机器人收尾并保存评估结果。"""
+    configure_logging()
+    if not math.isfinite(hand_start_duration_s) or hand_start_duration_s < 0:
+        raise ValueError("hand_start_duration_s must be finite and >= 0")
+    validate_robot_config(runtime)
+    validate_control_rate(runtime, trajectory.fps)
+    table_plane_abcd = resolve_table_plane(
+        runtime.environment.table, required=runtime.environment.table.enabled,
+    )
+    target = Path(output_dir)
+    if target.exists() and (not target.is_dir() or any(target.iterdir())):
+        raise ValueError("replay output must be missing or empty")
+    verify_replay_preflight(trajectory, runtime)
+    results = SessionResults(target, "replay")
+    runtime_state = robot = keyboard = None
+    trajectory_outcome = None
+    shutdown_clean = False
+    outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="startup failed")
+    try:
+        runtime_state = RuntimeState()
+        robot = DexManiRobot(
+            runtime.arm, runtime.hand, run_signal=runtime_state.run_signal,
+            stop_signal=runtime_state.stop_signal,
+            emergency_signal=runtime_state.emergency_signal,
+            signal_lock=runtime_state.motion_lock,
         )
-        target = Path(self.output_dir)
-        if target.exists() and (not target.is_dir() or any(target.iterdir())):
-            raise ValueError("replay output must be missing or empty")
-        verify_replay_preflight(self.trajectory, self.runtime)
-        self.results = SessionResults(target, "replay")
-        self.runtime_state = self.robot = self.keyboard = None
-        trajectory_outcome = None
-        shutdown_clean = False
-        outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="startup failed")
-        try:
-            self.runtime_state = RuntimeState()
-            self.robot = DexManiRobot(
-                self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
-                stop_signal=self.runtime_state.stop_signal,
-                emergency_signal=self.runtime_state.emergency_signal,
-                signal_lock=self.runtime_state.motion_lock,
-            )
 
-            self.keyboard = KeyboardInput(
-                quit_callback=self.runtime_state.request_quit,
-                stop_callback=self.runtime_state.request_stop,
-                estop_callback=self.runtime_state.request_emergency_stop,
+        keyboard = KeyboardInput(
+            quit_callback=runtime_state.request_quit,
+            stop_callback=runtime_state.request_stop,
+            estop_callback=runtime_state.request_emergency_stop,
+        )
+        home_planner = HomePlanner(
+            runtime.environment, table_plane_abcd=table_plane_abcd,
+        )
+        keyboard.start()
+        robot.check_services = lambda: keyboard.healthy
+        robot.connect()
+        robot.check()
+        runtime_state.arm()
+        home_result = home_hand(
+            runtime_state,
+            runtime.hand,
+            robot=robot,
+            abort_requested=lambda: (
+                bool(runtime_state.estop_request or runtime_state.quit_requested)
+                or not keyboard.healthy
+            ),
+        )
+        if home_result.ok:
+            outcome = TrajectoryReplayer(
+                runtime_state, runtime, keyboard, robot=robot
+            ).run(
+                trajectory,
+                hand_start_duration_s=hand_start_duration_s,
+                results=results,
             )
-            self.home_planner = HomePlanner(
-                self.runtime.environment, table_plane_abcd=self.table_plane_abcd,
+        else:
+            if runtime_state.estop_request:
+                status = ReplayStatus.ESTOP
+            elif home_result.interrupted and runtime_state.quit_requested:
+                status = ReplayStatus.USER_QUIT
+            else:
+                status = ReplayStatus.REJECTED
+            outcome = ReplayOutcome(
+                status,
+                reason=f"startup hand home incomplete: {home_result.reason}",
             )
-            self.keyboard.start()
-            self.robot.check_services = lambda: self.keyboard.healthy
-            self.robot.connect()
-            self.robot.check()
-            self.runtime_state.arm()
-            home_result = home_hand(
-                self.runtime_state,
-                self.runtime.hand,
-                robot=self.robot,
-                abort_requested=lambda: (
-                    bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
-                    or not self.keyboard.healthy
+        trajectory_outcome = outcome
+        if results.current is not None:
+            results.finish_episode(
+                outcome.status.value,
+                details=outcome.reason,
+                replay_rows=(
+                    len(outcome.replay_data["arm_qpos"])
+                    if outcome.replay_data is not None
+                    else 0
                 ),
             )
-            if home_result.ok:
-                outcome = TrajectoryReplayer(
-                    self.runtime_state, self.runtime, self.keyboard, robot=self.robot
-                ).run(
-                    self.trajectory,
-                    hand_start_duration_s=self.hand_start_duration_s,
-                    results=self.results,
-                )
-            else:
-                if self.runtime_state.estop_request:
-                    status = ReplayStatus.ESTOP
-                elif home_result.interrupted and self.runtime_state.quit_requested:
-                    status = ReplayStatus.USER_QUIT
-                else:
-                    status = ReplayStatus.REJECTED
-                outcome = ReplayOutcome(
-                    status,
-                    reason=f"startup hand home incomplete: {home_result.reason}",
-                )
-            trajectory_outcome = outcome
-            if self.results.current is not None:
-                self.results.finish_episode(
-                    outcome.status.value,
-                    details=outcome.reason,
-                    replay_rows=(
-                        len(outcome.replay_data["arm_qpos"])
-                        if outcome.replay_data is not None
-                        else 0
-                    ),
-                )
-            if outcome.successful:
-                print("H: planned return_home; Q: exit", flush=True)
-                while self.runtime_state.running and not self.runtime_state.quit_requested:
-                    self.robot.service_idle()
-                    if not self.keyboard.healthy:
-                        self.runtime_state.request_emergency_stop()
-                    if self.runtime_state.error_state or self.runtime_state.estop_request:
-                        break
-                    signals = self.keyboard.poll(timeout=0.1)
-                    if OperatorCommand.QUIT in signals:
-                        break
-                    if OperatorCommand.HOME in signals:
-                        home_result = home_robot(
-                            self.runtime_state,
-                            self.runtime.arm, self.runtime.hand,
-                            self.home_planner,
-                            robot=self.robot,
-                            service=lambda: service_feedback(self.robot, self.runtime),
-                            abort_requested=lambda: (
-                                bool(
-                                    self.runtime_state.estop_request
-                                    or self.runtime_state.quit_requested
-                                )
-                                or not self.keyboard.healthy
-                            ),
-                        )
-                        self.results.record_home_result(
-                            ok=home_result.ok,
-                            interrupted=home_result.interrupted,
-                            reason=home_result.reason,
-                        )
-                        if not home_result.ok:
-                            if home_result.interrupted and self.runtime_state.quit_requested:
-                                status = ReplayStatus.USER_QUIT
-                            elif self.runtime_state.estop_request:
-                                status = ReplayStatus.ESTOP
-                            else:
-                                status = ReplayStatus.FAULT
-                            outcome = replace(
-                                outcome,
-                                status=status,
-                                reason=f"return_home incomplete: {home_result.reason}",
+        if outcome.successful:
+            print("H: planned return_home; Q: exit", flush=True)
+            while runtime_state.running and not runtime_state.quit_requested:
+                robot.service_idle()
+                if not keyboard.healthy:
+                    runtime_state.request_emergency_stop()
+                if runtime_state.error_state or runtime_state.estop_request:
+                    break
+                signals = keyboard.poll(timeout=0.1)
+                if OperatorCommand.QUIT in signals:
+                    break
+                if OperatorCommand.HOME in signals:
+                    home_result = home_robot(
+                        runtime_state,
+                        runtime.arm, runtime.hand,
+                        home_planner,
+                        robot=robot,
+                        service=lambda: service_feedback(robot, runtime),
+                        abort_requested=lambda: (
+                            bool(
+                                runtime_state.estop_request
+                                or runtime_state.quit_requested
                             )
-                            break
-                        print("Return-home completed. H: planned return_home; Q: exit", flush=True)
-        except KeyboardInterrupt:
-            if self.runtime_state is not None:
-                self.runtime_state.request_emergency_stop()
-            outcome = replace(outcome, status=ReplayStatus.ESTOP, reason="KeyboardInterrupt")
+                            or not keyboard.healthy
+                        ),
+                    )
+                    results.record_home_result(
+                        ok=home_result.ok,
+                        interrupted=home_result.interrupted,
+                        reason=home_result.reason,
+                    )
+                    if not home_result.ok:
+                        if home_result.interrupted and runtime_state.quit_requested:
+                            status = ReplayStatus.USER_QUIT
+                        elif runtime_state.estop_request:
+                            status = ReplayStatus.ESTOP
+                        else:
+                            status = ReplayStatus.FAULT
+                        outcome = replace(
+                            outcome,
+                            status=status,
+                            reason=f"return_home incomplete: {home_result.reason}",
+                        )
+                        break
+                    print("Return-home completed. H: planned return_home; Q: exit", flush=True)
+    except KeyboardInterrupt:
+        if runtime_state is not None:
+            runtime_state.request_emergency_stop()
+        outcome = replace(outcome, status=ReplayStatus.ESTOP, reason="KeyboardInterrupt")
+    except Exception as exc:
+        if runtime_state is not None:
+            runtime_state.mark_error()
+        logger.exception("replay session failed")
+        outcome = replace(
+            outcome, status=ReplayStatus.FAULT, reason=f"{type(exc).__name__}: {exc}"
+        )
+    finally:
+        try:
+            if runtime_state is not None:
+                shutdown_clean = shutdown_local_runtime(
+                    runtime_state,
+                    robot,
+                    keyboard=keyboard,
+                )
         except Exception as exc:
-            if self.runtime_state is not None:
-                self.runtime_state.mark_error()
-            logger.exception("replay session failed")
-            outcome = replace(
-                outcome, status=ReplayStatus.FAULT, reason=f"{type(exc).__name__}: {exc}"
+            results.record_errors([error_detail("shutdown", exc)])
+        if runtime_state is not None:
+            if runtime_state.error_state or (
+                not shutdown_clean and not runtime_state.estop_request
+            ):
+                outcome = replace(
+                    outcome,
+                    status=ReplayStatus.FAULT,
+                    reason=f"{outcome.reason}; hardware/shutdown failure".lstrip("; "),
+                )
+            elif runtime_state.estop_request:
+                outcome = replace(
+                    outcome,
+                    status=ReplayStatus.ESTOP,
+                    reason=outcome.reason or "operator emergency stop",
+                )
+        try:
+            if results.current is not None:
+                results.finish_episode(outcome.status.value, details=outcome.reason)
+            evaluate_replay(
+                trajectory,
+                outcome.replay_data,
+                output_dir=output_dir,
+                hand_start_duration_s=hand_start_duration_s,
             )
-        finally:
-            try:
-                if self.runtime_state is not None:
-                    shutdown_clean = shutdown_local_runtime(
-                        self.runtime_state,
-                        self.robot,
-                        keyboard=self.keyboard,
-                    )
-            except Exception as exc:
-                self.results.record_errors([error_detail("shutdown", exc)])
-            if self.runtime_state is not None:
-                if self.runtime_state.error_state or (
-                    not shutdown_clean and not self.runtime_state.estop_request
-                ):
-                    outcome = replace(
-                        outcome,
-                        status=ReplayStatus.FAULT,
-                        reason=f"{outcome.reason}; hardware/shutdown failure".lstrip("; "),
-                    )
-                elif self.runtime_state.estop_request:
-                    outcome = replace(
-                        outcome,
-                        status=ReplayStatus.ESTOP,
-                        reason=outcome.reason or "operator emergency stop",
-                    )
-            try:
-                if self.results.current is not None:
-                    self.results.finish_episode(outcome.status.value, details=outcome.reason)
-                evaluate_replay(
-                    self.trajectory,
-                    outcome.replay_data,
-                    output_dir=self.output_dir,
-                    hand_start_duration_s=self.hand_start_duration_s,
-                )
-            except Exception as exc:
-                self.results.record_errors([error_detail("evaluation_save", exc)])
-                outcome = replace(
-                    outcome,
-                    status=ReplayStatus.FAULT,
-                    reason=f"{outcome.reason}; {exc}".lstrip("; "),
-                )
-            try:
-                self.results.finish_session(
-                    outcome=outcome.status.value,
-                    reason=outcome.reason,
-                    shutdown_clean=shutdown_clean,
-                    trajectory_status=(
-                        trajectory_outcome.status.value if trajectory_outcome else None
-                    ),
-                    trajectory_reason=trajectory_outcome.reason if trajectory_outcome else None,
-                )
-            except Exception as exc:
-                logger.exception("replay final result publication failed")
-                outcome = replace(
-                    outcome,
-                    status=ReplayStatus.FAULT,
-                    reason=f"{outcome.reason}; final result: {exc}".lstrip("; "),
-                )
-        return outcome
+        except Exception as exc:
+            results.record_errors([error_detail("evaluation_save", exc)])
+            outcome = replace(
+                outcome,
+                status=ReplayStatus.FAULT,
+                reason=f"{outcome.reason}; {exc}".lstrip("; "),
+            )
+        try:
+            results.finish_session(
+                outcome=outcome.status.value,
+                reason=outcome.reason,
+                shutdown_clean=shutdown_clean,
+                trajectory_status=(
+                    trajectory_outcome.status.value if trajectory_outcome else None
+                ),
+                trajectory_reason=trajectory_outcome.reason if trajectory_outcome else None,
+            )
+        except Exception as exc:
+            logger.exception("replay final result publication failed")
+            outcome = replace(
+                outcome,
+                status=ReplayStatus.FAULT,
+                reason=f"{outcome.reason}; final result: {exc}".lstrip("; "),
+            )
+    return outcome

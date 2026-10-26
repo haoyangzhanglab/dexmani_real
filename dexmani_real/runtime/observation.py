@@ -176,7 +176,7 @@ def check_observation(row, runtime, needs, *, require_hand=True, now_ns=None):
             issues.append("vr_unavailable")
         else:
             stamp = int(row.vr["recv_ts_ns"])
-            age = runtime.teleop.vr_mapping.stale_threshold_s
+            age = runtime.teleop.vr_stale_threshold_s
             deadlines.append(stamp + int(age * 1e9) + 1)
             if not sample_is_fresh(stamp, age, now):
                 issues.append("vr_stale")

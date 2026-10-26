@@ -4,6 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .geometry import validate_points
+
 
 class LiveViewer:
     """Display color-camera metres; selection freezes RGB, and the host binds its exact source frame."""
@@ -243,15 +245,6 @@ class LiveViewer:
         return image
 
     @staticmethod
-    def validate_points(points):
-        if points is None:
-            return np.empty((0, 3))
-        points = np.asarray(points)
-        if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
-            raise ValueError("Viewer points must be finite (N, 3), in camera-frame meters")
-        return points
-
-    @staticmethod
     def colors(colors, points):
         if colors is None:
             return None
@@ -278,11 +271,12 @@ class LiveViewer:
         observed_colors=None,
         model_colors=None,
     ):
-        observed = self.validate_points(observed_points)
-        model = self.validate_points(model_points)
+        empty = np.empty((0, 3))
+        observed = empty if observed_points is None else validate_points(observed_points)
+        model = empty if model_points is None else validate_points(model_points)
+        hand = empty if hand_points is None else validate_points(hand_points)
         observed_colors = self.colors(observed_colors, observed)
         model_colors = self.colors(model_colors, model)
-        empty = np.empty((0, 3))
         self.observed.points = self.o3d.utility.Vector3dVector(
             observed if self.layer != 2 else empty
         )
@@ -303,13 +297,13 @@ class LiveViewer:
             )
         self.vis.update_geometry(self.observed)
         self.vis.update_geometry(self.model)
-        self.hand.points = self.o3d.utility.Vector3dVector(self.validate_points(hand_points))
+        self.hand.points = self.o3d.utility.Vector3dVector(hand)
         self.hand.paint_uniform_color([1.0, 0.55, 0.1] if valid else [0.4, 0.4, 0.4])
         self.vis.update_geometry(self.hand)
         if not self._view_initialized and (len(observed) or len(model)):
             self.vis.reset_view_point(True)
             # Initialize optical +Z-forward/+Y-down view once; keep the view fixed to reveal motion.
-            points = np.concatenate((observed, model, self.validate_points(hand_points)))
+            points = np.concatenate((observed, model, hand))
             control = self.vis.get_view_control()
             control.set_lookat((points.min(axis=0) + points.max(axis=0)) / 2)
             control.set_front([0, 0, -1])

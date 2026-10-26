@@ -32,13 +32,6 @@ def nonnegative_float(raw: str) -> float:
     return value
 
 
-def positive_running_seconds(raw: str) -> float:
-    value = float(raw)
-    if not math.isfinite(value) or value <= 0.0:
-        raise argparse.ArgumentTypeError("must be a finite positive number")
-    return value
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -69,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--num-episodes",
-        type=positive_int,
+        type=int,
         default=DEFAULT_NUM_EPISODES,
         help=(
             f"exit after N episodes that entered RUNNING have ended (default: {DEFAULT_NUM_EPISODES}); "
@@ -80,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-duration",
         dest="max_running_s",
-        type=positive_running_seconds,
+        type=float,
         default=DEFAULT_MAX_RUNNING_S,
         help=(
             "per-episode cooperative duration budget from RUNNING admission "

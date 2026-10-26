@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 
 from dexmani_real.geometry.camera import CameraSnapshot
-from dexmani_real.geometry.plane import validate_table_plane
 from dexmani_real.perception.pointcloud.config import PointCloudConfig
 from dexmani_real.perception.pointcloud.processing import build_point_cloud
 from dexmani_real.utils.log import configure_logging
@@ -30,8 +29,6 @@ def run_pointcloud_worker(
     configure_logging()
     if camera.T_xarm_base_from_color is None:
         raise ValueError("pointcloud requires camera extrinsics")
-    if pointcloud.remove_table:
-        validate_table_plane(table_plane_abcd)
     logger.debug(
         "pointcloud config=%s table_plane_abcd=%s",
         pointcloud, table_plane_abcd,

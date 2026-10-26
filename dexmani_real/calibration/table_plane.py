@@ -7,8 +7,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from dexmani_real import PACKAGE_DIR
-from dexmani_real.geometry.plane import TablePlaneFit, validate_table_plane
+from dexmani_real.geometry.plane import TablePlaneFit
 from dexmani_real.utils.atomic_io import atomic_json_dump
 
 if TYPE_CHECKING:
@@ -34,7 +36,13 @@ def resolve_table_plane(
     plane_path = resolve_table_plane_path(table)
     with plane_path.open(encoding="utf-8") as stream:
         plane = json.load(stream)
-    return validate_table_plane(tuple(float(plane[k]) for k in ("a", "b", "c", "d")))
+    coefficients = tuple(float(plane[k]) for k in ("a", "b", "c", "d"))
+    if not np.isfinite(coefficients).all():
+        raise ValueError("table plane must be finite")
+    norm = np.linalg.norm(coefficients[:3])
+    if norm <= 1e-9 or coefficients[2] / norm <= 0:
+        raise ValueError("table plane must have an upward non-zero normal")
+    return coefficients
 
 
 def publish_table_plane(path: str | Path, fit: TablePlaneFit, *, confirmed: bool) -> None:

@@ -60,10 +60,9 @@ class ArmChannels:
 class ArmExecutor:
     def __init__(
         self, cfg, *, run_signal, stop_signal, emergency_signal, signal_lock,
-        driver_factory=None, input_signal=None,
+        input_signal=None,
     ):
-        cfg.validate()
-        self.cfg, self.factory = cfg, driver_factory
+        self.cfg = cfg
         self.ctx = mp.get_context("spawn")
         self.io = ArmChannels(
             self.ctx, run_signal=run_signal, stop_signal=stop_signal,
@@ -106,7 +105,7 @@ class ArmExecutor:
         check_startup()
         self.process = self.ctx.Process(
             target=run_arm,
-            args=(self.cfg, self.io, self.child_pipe, self.factory),
+            args=(self.cfg, self.io, self.child_pipe),
             name="xarm-owner",
             daemon=False,
         )

@@ -4,8 +4,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .geometry import validate_rgbd
-
 
 @dataclass
 class SceneObjectCloud:
@@ -39,7 +37,6 @@ def extract_scene_clouds(rgb, depth_m, K, masks, *, pixel_stride=2):
         or pixel_stride <= 0
     ):
         raise ValueError("pixel_stride must be a positive integer")
-    rgb, depth_m, K, _ = validate_rgbd(rgb, depth_m, K)
     if not isinstance(masks, dict):
         raise ValueError("masks must map nonempty instance names to boolean (H, W) arrays")
     shape = depth_m.shape

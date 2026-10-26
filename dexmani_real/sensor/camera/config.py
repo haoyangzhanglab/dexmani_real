@@ -47,14 +47,12 @@ class CameraParams:
                 "camera source_stall_timeout_s must be finite and greater than derived max frame age"
             )
         if (
-            not isinstance(self.l515_visual_preset, int)
-            or isinstance(self.l515_visual_preset, bool)
+            type(self.l515_visual_preset) is not int
             or not 0 <= self.l515_visual_preset <= 5
         ):
             raise ValueError("camera l515_visual_preset must be an integer in [0, 5]")
         if self.l515_confidence_threshold is not None and (
-            not isinstance(self.l515_confidence_threshold, int)
-            or isinstance(self.l515_confidence_threshold, bool)
+            type(self.l515_confidence_threshold) is not int
             or not 0 <= self.l515_confidence_threshold <= 3
         ):
             raise ValueError("camera l515_confidence_threshold must be in [0, 3] or null")

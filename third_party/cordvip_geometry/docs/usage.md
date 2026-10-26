@@ -148,6 +148,8 @@ finally:
 
 `HandCloudModel.transform(measured_hand_qpos, T_camera_handbase)` 供已有宿主生成固定 FK 手点。每帧结果带源身份、row、时钟、时间、每个实例的 cloud、pose、固定模型点/法向与独立有效性；内存数组借用，异步保存者应复制。
 
+`Frame` 检查原始 RGB-D 与内参，`SceneTracker.step()` 检查宿主传入的去畸变数组。内部场景提取、逐物体跟踪和渲染复用入口保证；新模型位姿及转换为 float32 后的几何结果仍需检查。静态资产的点和法向在 `SceneTracker` 构造时检查并复制，调用方后续修改原数组不会改变追踪资产。帧和结果中的借用数组在消费期间应保持不变；`scene_payload()` 单独检查宿主提供的手部几何和来源信息。
+
 | 输出 | 内容 |
 |---|---|
 | `run.json` / `models.json` | 配置、资产/标定来源、源码与权重路径、依赖版本、加载耗时 |

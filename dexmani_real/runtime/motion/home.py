@@ -6,9 +6,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.control.homing import home_path
+from dexmani_real.control.homing import HomePathRejected, home_path
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
-from dexmani_real.robot.xhand.limits import validate_hand_command_bounds
 from dexmani_real.runtime.state import SafetyState
 from dexmani_real.utils.timing import sample_is_fresh
 
@@ -38,7 +37,7 @@ def execute_arm_home(
 ):
     target = np.asarray(home_qpos, dtype=np.float64)
     if target.shape != (7,) or not np.isfinite(target).all():
-        return HomeResult(False, "home target must be finite (7,)")
+        raise ValueError("home target must be finite (7,)")
     if runtime_state.safety_state != SafetyState.ARMED:
         return HomeResult(False, "home requires ARMED")
     epoch = runtime_state.run_id
@@ -91,7 +90,7 @@ def execute_arm_home(
             table_z_surface_m=config.table_z_surface_m,
             hand_safety_margin_m=config.hand_safety_margin_m,
         )
-    except Exception as exc:
+    except HomePathRejected as exc:
         return HomeResult(False, f"home planning failed: {exc}")
     if aborted():
         return HomeResult(False, "home interrupted during planning", interrupted=True)
@@ -185,13 +184,7 @@ def home_robot(runtime_state, arm, hand, planner, *, robot, abort_requested, ser
 def home_hand(runtime_state, hand, *, robot, abort_requested=None):
     if not hand.enabled:
         return HomeResult(True)
-    target = validate_hand_command_bounds(
-        np.deg2rad(hand.home_qpos_deg),
-        np.asarray(hand.qpos_min_rad),
-        np.asarray(hand.qpos_max_rad),
-        np.asarray(hand.mechanical_qpos_min_rad),
-        np.asarray(hand.mechanical_qpos_max_rad),
-    )
+    target = np.deg2rad(hand.home_qpos_deg)
     if runtime_state.safety_state != SafetyState.ARMED:
         return HomeResult(False, "hand home requires ARMED")
     epoch = runtime_state.run_id

@@ -7,7 +7,6 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.geometry.plane import validate_table_plane
 from dexmani_real.perception.hand_config import HandPointCloudConfig
 from dexmani_real.perception.pointcloud.config import PointCloudConfig
 from dexmani_real.robot.xhand.config import HandParams
@@ -50,16 +49,6 @@ class ProcessingConfig:
             object.__setattr__(self, "table_plane_abcd", None)
         elif self.table_plane_abcd is None:
             raise ValueError("remove_table=True requires an explicit table_plane_abcd")
-        if self.table_plane_abcd is not None:
-            # Plane coefficients are scale-free; processing requires only a nonzero normal.
-            object.__setattr__(
-                self,
-                "table_plane_abcd",
-                validate_table_plane(
-                    self.table_plane_abcd,
-                    min_normal_norm=0.0,
-                ),
-            )
 
 
 def canonical_array_specs(

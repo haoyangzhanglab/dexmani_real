@@ -8,6 +8,7 @@ import numpy as np
 from .geometry import (
     float32_points,
     transform_points,
+    validate_points,
     validate_pose,
     validate_rgbd,
     validate_normals,
@@ -35,7 +36,14 @@ class SceneTracker:
         from .foundationpose import FoundationPosePlusTracker
 
         self.segmenter = segmenter
-        self.assets = assets
+        self.assets = {}
+        # The documented memory API may supply assets without going through load_asset.
+        for name, (mesh, points, normals) in assets.items():
+            points = validate_points(points).copy()
+            normals = validate_normals(normals, points)
+            points.setflags(write=False)
+            normals.setflags(write=False)
+            self.assets[name] = mesh, points, normals
         self.pixel_stride = pixel_stride
         self.depth_tolerance_m = depth_tolerance_m
         self.min_matched_pixels = min_matched_pixels
@@ -44,7 +52,7 @@ class SceneTracker:
         self.lost_objects = {}
         self.instance_ids = self.previous_frame_identity = self.image_shape = self.intrinsics = None
         shared = None
-        for name, (mesh, points, normals) in assets.items():
+        for name, (mesh, points, normals) in self.assets.items():
             tracker = FoundationPosePlusTracker(
                 foundationpose_root, mesh, Path(debug_dir) / name, shared_with=shared
             )
@@ -60,7 +68,7 @@ class SceneTracker:
             torch.cuda.synchronize()
 
     def step(self, frame, rgb, depth_m, K, *, initial_masks=None):
-        rgb, depth_m, K, _ = validate_rgbd(rgb, depth_m, K)
+        rgb, depth_m, K = validate_rgbd(rgb, depth_m, K)
         identity = (frame.source_id, frame.row_index, frame.clock, frame.timestamp_ns)
         first = self.instance_ids is None
         if first != (initial_masks is not None):
@@ -229,7 +237,7 @@ def scene_payload(result, roles, *, valid, state, max_age_ms, hand=None):
         ):
             raise ValueError("Hand and scene must refer to exactly the same source row and clock")
         T_base_camera = validate_pose(hand["T_base_camera"])
-        hand_points = float32_points(hand["points_camera"])
+        hand_points = float32_points(validate_points(hand["points_camera"]))
         hand_normals = validate_normals(hand["normals_camera"], hand_points)
         link_ids = np.asarray(hand["link_ids"])
         joints = np.asarray(hand["joint_state"])
@@ -296,7 +304,7 @@ def scene_payload(result, roles, *, valid, state, max_age_ms, hand=None):
             pose_valid=pose_ok,
             error=str(item["error"]) if item and item.get("error") is not None else "",
             observed_valid=bool(item and item["observed_valid"]),
-            T_camera_object=validate_pose(item["pose"]) if pose_ok else np.full((4, 4), np.nan),
+            T_camera_object=item["pose"].copy() if pose_ok else np.full((4, 4), np.nan),
             model_points_camera=item["model_points_camera"] if pose_ok else empty,
             model_normals_camera=item["model_normals_camera"] if pose_ok else empty,
             observed_points_camera=cloud.observed_points_camera if cloud else empty,

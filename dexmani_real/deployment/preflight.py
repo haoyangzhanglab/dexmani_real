@@ -16,29 +16,6 @@ from dexmani_real.perception.pointcloud.config import (
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 
 
-def validate_max_running_s(max_running_s: float | None) -> float | None:
-    """Validate the cooperative duration budget from RUNNING admission."""
-    if max_running_s is None:
-        return None
-    if isinstance(max_running_s, bool):
-        raise TypeError("max_running_s must be a finite positive number or None")
-    value = float(max_running_s)
-    if not math.isfinite(value) or value <= 0.0:
-        raise ValueError("max_running_s must be finite and positive")
-    return value
-
-
-def validate_num_episodes(num_episodes: Any) -> int | None:
-    """Count episodes that entered RUNNING once they end; None waits for operator exit."""
-    if num_episodes is None:
-        return None
-    if type(num_episodes) is not int:
-        raise TypeError("num_episodes must be a positive integer or None")
-    if num_episodes < 1:
-        raise ValueError("num_episodes must be a positive integer")
-    return num_episodes
-
-
 def validate_execution_config(info, execution) -> None:
     """Validate saved mode support and Real scheduling before model/device startup."""
     if execution.execution_mode not in {"sync", "async", "rtc"}:

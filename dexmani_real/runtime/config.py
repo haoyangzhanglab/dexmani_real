@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import astuple, dataclass
-
-import numpy as np
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -14,7 +12,3 @@ class RuntimeTimeouts:
     pointcloud_ready_timeout_s: float = 30.0
     vr_ready_timeout_s: float = 120.0
     shutdown_timeout_s: float = 65.0
-
-    def validate(self) -> None:
-        if not all(np.isfinite(value) and value > 0 for value in astuple(self)):
-            raise ValueError("safety timeouts must be finite and positive")

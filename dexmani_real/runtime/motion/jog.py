@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.control.online_ik import IKFailureKind
 from dexmani_real.geometry.pose import Pose, quat_multiply
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
 from dexmani_real.runtime.operator_input import CARTESIAN_JOG_KEYS
@@ -58,8 +57,6 @@ class JogController:
                 pose, measured_qpos, baseline_qpos,
                 endpoint_rejection=self.target_checker.endpoint_rejection,
             )
-            if result.failure_kind == IKFailureKind.INVALID_OUTPUT:
-                raise RuntimeError(f"online IK technical failure: {result.reason}")
         if result is None or not result.success or result.qpos is None:
             self.blocked_until_release = True
         return pose, desired_position, result
@@ -201,12 +198,15 @@ def compute_cartesian_jog_delta(
 def validate_keyboard_workspace(runtime: ExperimentConfig) -> np.ndarray:
     """Validate the selected jog configuration before any device connects."""
     cfg = runtime.keyboard_teleop
-    cfg.validate()
+    for name in ("target_max_age_s", "delta_pos_m", "delta_rpy_rad"):
+        value = getattr(cfg, name)
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"keyboard {name} must be finite and positive")
+    margin = cfg.workspace_command_margin_m
+    if not np.isfinite(margin) or margin < 0:
+        raise ValueError("workspace_command_margin_m must be finite and non-negative")
     validate_control_rate(runtime, cfg.control_hz)
     workspace = runtime.environment.workspace.as_array()
-    if np.any(
-        workspace[:, 0] + cfg.workspace_command_margin_m
-        >= workspace[:, 1] - cfg.workspace_command_margin_m
-    ):
+    if np.any(workspace[:, 0] + margin >= workspace[:, 1] - margin):
         raise ValueError("keyboard workspace command margin leaves no interior workspace")
     return workspace

@@ -124,6 +124,7 @@ class RealSenseExample:
         self.rr = rr
         # Leave exposure priority untouched until it is snapshotted.
         config = self.runtime.camera
+        config.validate()
         configure_logging()
 
         print("=" * 60)

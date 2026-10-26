@@ -20,6 +20,10 @@ PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=bo
 WORKSPACE_BOUNDS_TOLERANCE_M = 1e-3
 
 
+class HomePathRejected(ValueError):
+    """几何约束拒绝了 HOME 路径；技术故障不属于可尝试其他候选的拒绝。"""
+
+
 class HomePlanner:
     """Nominal-URDF arm kinematics plus the 19-DOF arm/hand collision model."""
 
@@ -49,15 +53,14 @@ class HomePlanner:
     def check_workspace_path(self, path: np.ndarray) -> None:
         """Check the owner's dense HOME samples against the EEF workspace."""
         for index, qpos in enumerate(path):
-            try:
-                position, _ = self.arm_fk.compute(qpos)
-            except (ValueError, RuntimeError) as exc:
-                raise ValueError(f"workspace FK failed at sample {index}: {exc}") from exc
+            position, _ = self.arm_fk.compute(qpos)
             if (
                 np.any(position < self.workspace_bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M)
                 or np.any(position > self.workspace_bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M)
             ):
-                raise ValueError(f"Path leaves configured workspace at sample {index}: {position}")
+                raise HomePathRejected(
+                    f"Path leaves configured workspace at sample {index}: {position}"
+                )
 
 
 def table_clearance_m(
@@ -101,32 +104,23 @@ def check_home_path(
 ) -> None:
     """Check one shared 1° sampling; table soft escape never permits mesh collision."""
     path = interpolate_waypoints(path, np.deg2rad(1.0))
-    try:
-        collision = planner.collision_model.check_path(path)
-    except Exception as exc:
-        raise ValueError(f"collision_check_error: {exc}") from exc
+    collision = planner.collision_model.check_path(path)
     if collision is not None:
         index, info = collision
-        raise ValueError(f"collision at sample {index}: {info}")
+        raise HomePathRejected(f"collision at sample {index}: {info}")
 
-    try:
-        planner.check_workspace_path(path)
-    except (ValueError, RuntimeError) as exc:
-        raise ValueError(f"workspace: {exc}") from exc
+    planner.check_workspace_path(path)
 
     table_samples = []
     for index, waypoint in enumerate(path):
-        try:
-            clearance, measurement, source = table_clearance_m(
-                planner,
-                waypoint,
-                table_z_surface_m=table_z_surface_m,
-                hand_safety_margin_m=hand_safety_margin_m,
-            )
-        except Exception as exc:
-            raise ValueError(f"table_check_error at waypoint {index}: {exc}") from exc
+        clearance, measurement, source = table_clearance_m(
+            planner,
+            waypoint,
+            table_z_surface_m=table_z_surface_m,
+            hand_safety_margin_m=hand_safety_margin_m,
+        )
         if not np.isfinite(clearance):
-            raise ValueError(f"table_check_nonfinite at waypoint {index}")
+            raise RuntimeError(f"table_check_nonfinite at waypoint {index}")
         table_samples.append((index, clearance, measurement, source))
 
     negative = [sample for sample in table_samples if sample[1] < 0.0]
@@ -150,7 +144,7 @@ def check_home_path(
     ):
         return
     index, clearance, measurement, source = negative[0]
-    raise ValueError(
+    raise HomePathRejected(
         f"table_clearance at waypoint {index}: clearance={clearance:g} m, "
         f"{source}={measurement:g} m"
     )
@@ -181,7 +175,7 @@ def compute_joint_home_path(
     hand_safety_margin_m: float,
     use_canonical_target: bool = False,
 ) -> np.ndarray:
-    """Return admitted milestones, an empty (0,7) path if home, or raise ValueError."""
+    """Return admitted milestones, an empty (0,7) path if home, or raise HomePathRejected."""
     qpos = home_joint_vector(qpos, "current qpos")
     home_qpos = home_joint_vector(home_qpos, "home qpos")
     if use_canonical_target:
@@ -205,7 +199,7 @@ def compute_joint_home_path(
                 hand_safety_margin_m=hand_safety_margin_m,
                 allow_table_soft_escape=True,
             )
-        except ValueError as exc:
+        except HomePathRejected as exc:
             rejections.append(f"{name}: {exc}")
             return False
         return True
@@ -224,7 +218,7 @@ def compute_joint_home_path(
     if admitted(distal, "distal_first"):
         return distal
 
-    raise ValueError("no safe home path; " + "; ".join(rejections))
+    raise HomePathRejected("no safe home path; " + "; ".join(rejections))
 
 
 def compute_band_alignment_path(
@@ -250,8 +244,8 @@ def compute_band_alignment_path(
             hand_safety_margin_m=hand_safety_margin_m,
             allow_table_soft_escape=False,
         )
-    except ValueError as exc:
-        raise ValueError(f"band_alignment: {exc}") from exc
+    except HomePathRejected as exc:
+        raise HomePathRejected(f"band_alignment: {exc}") from exc
     return milestones
 
 
@@ -264,7 +258,7 @@ def home_path(current, target, planner, *, table_z_surface_m, hand_safety_margin
         return compute_joint_home_path(
             current, target, planner, use_canonical_target=True, **options
         )
-    except ValueError:
+    except HomePathRejected:
         # Retry only when the equivalent representation gives different candidates.
         if np.array_equal(planner.canonicalize_qpos(target, current), target):
             raise

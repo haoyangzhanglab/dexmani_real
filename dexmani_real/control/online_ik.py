@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -36,13 +35,6 @@ class IKResult:
     success: bool
     qpos: np.ndarray | None
     reason: str = ""
-    failure_kind: IKFailureKind | None = None
-
-
-class IKFailureKind(str, Enum):
-    NO_SOLUTION_FOUND = "no_solution_found"
-    NO_VALID_CANDIDATE = "no_valid_candidate"
-    INVALID_OUTPUT = "invalid_output"
 
 
 @dataclass(kw_only=True)
@@ -53,8 +45,8 @@ class OnlineIKConfig:
     max_pose_error_pos_m: float = 0.008
     max_pose_error_rot_rad: float = 0.08
     fast_accept_max_delta_deg: float = 8.0
-    operational_joint_lower_rad: tuple[float, ...] | None = None
-    operational_joint_upper_rad: tuple[float, ...] | None = None
+    operational_joint_lower_rad: tuple[float, ...]
+    operational_joint_upper_rad: tuple[float, ...]
     redundancy_seed_step_deg: float = 5.0
     joint_limit_search_margin_deg: float = 15.0
     previous_command_distance_weight: float = 0.25
@@ -63,7 +55,7 @@ class OnlineIKConfig:
     pose_rotation_weight: float = 0.5
     singularity_margin_weight: float = 0.02
     joint_weights: tuple[float, ...] = (4.0, 1.8, 1.2, 0.6, 0.6, 0.9, 0.35)
-    previous_command_joint_weights: tuple[float, ...] | None = (10, 4, 2, 1, 0.5, 0.6, 0.1)
+    previous_command_joint_weights: tuple[float, ...] = (10, 4, 2, 1, 0.5, 0.6, 0.1)
 
 
 @dataclass
@@ -167,26 +159,22 @@ class OnlineIKSolver:
             raise ValueError("online IK requires finite (7, 2) model limits")
         if np.any(model[:, 0] >= model[:, 1]):
             raise ValueError("online IK model limits must be ordered")
-        if config.operational_joint_lower_rad is None and config.operational_joint_upper_rad is None:
-            self.operational_limits = model.copy()
-        else:
-            lower = np.asarray(config.operational_joint_lower_rad, dtype=float)
-            upper = np.asarray(config.operational_joint_upper_rad, dtype=float)
-            if any(a.shape != (7,) or not np.isfinite(a).all() for a in (lower, upper)):
-                raise ValueError("operational lower/upper limits must both be finite (7,) arrays")
-            if np.any(lower >= upper):
-                raise ValueError("operational lower limits must be less than upper limits")
-            if np.any(lower < model[:, 0] - MODEL_LIMIT_TOL_RAD) or np.any(
-                upper > model[:, 1] + MODEL_LIMIT_TOL_RAD
-            ):
-                raise ValueError("runtime operational limits exceed the loaded model/URDF limits")
-            self.operational_limits = np.column_stack((lower, upper))
-        self.jump_limit = np.deg2rad(self.validate_joint_vector(config.max_ik_jump_deg))
-        self.weights = self.validate_joint_vector(config.joint_weights)
-        self.previous_weights = self.validate_joint_vector(
-            config.previous_command_joint_weights
-            if config.previous_command_joint_weights is not None
-            else config.joint_weights
+        lower = np.asarray(config.operational_joint_lower_rad, dtype=float)
+        upper = np.asarray(config.operational_joint_upper_rad, dtype=float)
+        if any(a.shape != (7,) or not np.isfinite(a).all() for a in (lower, upper)):
+            raise ValueError("operational lower/upper limits must both be finite (7,) arrays")
+        if np.any(lower >= upper):
+            raise ValueError("operational lower limits must be less than upper limits")
+        if np.any(lower < model[:, 0] - MODEL_LIMIT_TOL_RAD) or np.any(
+            upper > model[:, 1] + MODEL_LIMIT_TOL_RAD
+        ):
+            raise ValueError("runtime operational limits exceed the loaded model/URDF limits")
+        self.operational_limits = np.column_stack((lower, upper))
+        self.jump_limit = np.deg2rad(config.max_ik_jump_deg)
+        self.weights = np.asarray(config.joint_weights, dtype=np.float64)
+        self.previous_weights = np.asarray(
+            config.previous_command_joint_weights,
+            dtype=np.float64,
         )
         self.joint_ranges = np.maximum(model[:, 1] - model[:, 0], 1e-6)
         self.limit_center = 0.5 * (self.operational_limits[:, 0] + self.operational_limits[:, 1])
@@ -222,50 +210,19 @@ class OnlineIKSolver:
         *,
         endpoint_rejection: Callable[[np.ndarray], str | None],
     ) -> IKResult:
-        try:
-            current = self.validate_joint_vector(current_qpos)
-            previous = self.validate_joint_vector(previous_qpos_cmd)
-            if (
-                not np.isfinite(target_eef_pose_base.p).all()
-                or not np.isfinite(target_eef_pose_base.q).all()
-            ):
-                raise ValueError("non-finite target pose")
-            selected, converged, rejection = self.search(
-                target_eef_pose_base, current, previous, endpoint_rejection
-            )
-            if selected is not None:
-                result = IKResult(success=True, qpos=selected.qpos)
-            else:
-                kind = (
-                    IKFailureKind.NO_VALID_CANDIDATE
-                    if converged
-                    else IKFailureKind.NO_SOLUTION_FOUND
-                )
-                reason = (
-                    f"no_valid_candidate: {rejection}" if converged else "solver_no_convergence"
-                )
-                result = IKResult(success=False, qpos=None, reason=reason, failure_kind=kind)
-        except (
-            ValueError,
-            RuntimeError,
-            TypeError,
-            FloatingPointError,
-        ) as exc:
-            # Model/numerical contract failures must not masquerade as local solver rejection.
-            result = IKResult(
-                success=False,
-                qpos=None,
-                reason=str(exc),
-                failure_kind=IKFailureKind.INVALID_OUTPUT,
-            )
-        return result
-
-    @staticmethod
-    def validate_joint_vector(value: tuple[float, ...] | np.ndarray) -> np.ndarray:
-        q = np.asarray(value, dtype=np.float64)
-        if q.shape != (7,) or not np.isfinite(q).all():
-            raise ValueError("IK joint vectors must be finite shape (7,)")
-        return q
+        """返回正常求解结果；模型或数值契约错误直接传播给运行边界。"""
+        if (
+            not np.isfinite(target_eef_pose_base.p).all()
+            or not np.isfinite(target_eef_pose_base.q).all()
+        ):
+            raise ValueError("non-finite target pose")
+        selected, converged, rejection = self.search(
+            target_eef_pose_base, current_qpos, previous_qpos_cmd, endpoint_rejection
+        )
+        if selected is not None:
+            return IKResult(success=True, qpos=selected.qpos)
+        reason = f"no_valid_candidate: {rejection}" if converged else "solver_no_convergence"
+        return IKResult(success=False, qpos=None, reason=reason)
 
     def search(self, target, current, previous, endpoint_rejection):
         target_base = self.kin.to_mplib_pose(target)
@@ -348,7 +305,9 @@ class OnlineIKSolver:
             [],
         )
         if raw is not None:
-            raw = self.validate_joint_vector(raw)
+            raw = np.asarray(raw, dtype=np.float64)
+            if raw.shape != (7,) or not np.isfinite(raw).all():
+                raise ValueError("CLIK output must be finite shape (7,)")
         if not converged:
             return None, "solver_no_convergence"
         if raw is None:

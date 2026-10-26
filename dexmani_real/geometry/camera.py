@@ -7,8 +7,6 @@ from typing import Any, cast
 
 import numpy as np
 
-from dexmani_real.geometry.transforms import validate_rigid_transform
-
 __all__ = [
     "CameraIntrinsics",
     "CameraSnapshot",
@@ -106,9 +104,7 @@ class CameraSnapshot:
             raise ValueError("active camera serial must be nonempty")
         object.__setattr__(self, "depth_scale_m", finite_positive(self.depth_scale_m, name="depth_scale"))
         if self.T_xarm_base_from_color is not None:
-            transform = validate_rigid_transform(
-                self.T_xarm_base_from_color, label="T_xarm_base_from_color",
-            )
+            transform = np.array(self.T_xarm_base_from_color, dtype=np.float64, copy=True)
             transform.setflags(write=False)
             object.__setattr__(self, "T_xarm_base_from_color", transform)
 

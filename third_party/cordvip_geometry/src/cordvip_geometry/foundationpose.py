@@ -6,21 +6,7 @@ import sys
 
 import numpy as np
 
-from .geometry import validate_pose, validate_rgbd
-
-
-def validate_foundationpose_root(root):
-    """Check source and local weights without importing CUDA or loading a model."""
-    root = Path(root).expanduser().resolve()
-    required = ["estimater.py", "Utils.py"]
-    for run in ("2023-10-28-18-33-37", "2024-01-11-20-02-45"):
-        required.extend((f"weights/{run}/config.yml", f"weights/{run}/model_best.pth"))
-    missing = [name for name in required if not (root / name).is_file()]
-    if missing:
-        raise FileNotFoundError(
-            f"FoundationPose source/weights missing under {root}: {', '.join(missing)}"
-        )
-    return root
+from .geometry import validate_pose
 
 
 PLUS_REVISION = "58aa7154de23ae86d542366858fc6bcca3b747b0"
@@ -66,14 +52,24 @@ class FoundationPosePlusTracker:
     def __init__(
         self, root, mesh, debug_dir, register_iterations=5, track_iterations=2, *, shared_with=None
     ):
-        self.root = validate_foundationpose_root(root)
+        self.root = Path(root).expanduser().resolve()
+        if shared_with is None:
+            required = ["estimater.py", "Utils.py"]
+            for run in ("2023-10-28-18-33-37", "2024-01-11-20-02-45"):
+                required.extend((f"weights/{run}/config.yml", f"weights/{run}/model_best.pth"))
+            missing = [name for name in required if not (self.root / name).is_file()]
+            if missing:
+                raise FileNotFoundError(
+                    f"FoundationPose source/weights missing under {self.root}: {', '.join(missing)}"
+                )
+        elif shared_with.root != self.root:
+            raise ValueError("Shared FoundationPose weights must use the same source directory")
         for value in (register_iterations, track_iterations):
             if not isinstance(value, int) or value <= 0:
                 raise ValueError("Refinement iterations must be positive integers")
         self.register_iterations = register_iterations
         self.track_iterations = track_iterations
         self.intrinsics = None
-        self.image_shape = None
 
         import torch
 
@@ -98,8 +94,6 @@ class FoundationPosePlusTracker:
         import nvdiffrast.torch as dr
 
         # Share immutable weights/context on one owner; each object retains its own mesh and pose.
-        if shared_with is not None and shared_with.root != self.root:
-            raise ValueError("Shared FoundationPose weights must use the same source directory")
         self.context = (
             shared_with.context if shared_with is not None else dr.RasterizeCudaContext()
         )
@@ -123,8 +117,7 @@ class FoundationPosePlusTracker:
     def register(self, rgb, depth_m, intrinsics, mask):
         """Initialize pose from an explicitly supplied object mask on the first frame."""
         self.intrinsics = None
-        rgb, depth_m, intrinsics, mask = validate_rgbd(rgb, depth_m, intrinsics, mask)
-        if mask is None or np.count_nonzero(mask & (depth_m >= 0.001)) < 4:
+        if np.count_nonzero(mask & (depth_m >= 0.001)) < 4:
             raise ValueError("Registration requires at least four masked valid depth pixels")
         # An upstream early return must not preserve a previous registration.
         self.estimator.pose_last = None
@@ -138,7 +131,6 @@ class FoundationPosePlusTracker:
         if self.estimator.pose_last is None:
             raise RuntimeError("FoundationPose registration did not initialize tracking")
         pose = validate_pose(pose)
-        self.image_shape = depth_m.shape
         self.intrinsics = intrinsics
         return pose
 
@@ -147,14 +139,7 @@ class FoundationPosePlusTracker:
         if self.intrinsics is None:
             raise RuntimeError("Register an object before tracking")
         try:
-            rgb, depth_m, intrinsics, mask = validate_rgbd(rgb, depth_m, intrinsics, mask)
-            if depth_m.shape != self.image_shape or not np.array_equal(
-                intrinsics, self.intrinsics
-            ):
-                raise ValueError(
-                    "Image shape/intrinsics changed; start a new explicit registration"
-                )
-            if mask is None or np.count_nonzero(mask & (depth_m >= 0.001)) < 4:
+            if np.count_nonzero(mask & (depth_m >= 0.001)) < 4:
                 raise ValueError("Tracking requires current exclusive mask and valid depth")
             import torch
 

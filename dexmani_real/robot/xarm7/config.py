@@ -23,20 +23,6 @@ class HomingParams:
     convergence_timeout_s: float = 15.0
     state_max_age_s: float = 0.5
 
-    def validate(self) -> None:
-        values = (
-            self.convergence_rad,
-            self.step_interval_s,
-            self.max_speed_deg_s,
-            self.target_timeout_s,
-            self.velocity_convergence_rad_s,
-            self.dwell_s,
-            self.convergence_timeout_s,
-            self.state_max_age_s,
-        )
-        if not all(np.isfinite(value) and value > 0 for value in values):
-            raise ValueError("all homing parameters must be finite and positive")
-
     @property
     def max_speed_rad_per_s(self) -> float:
         """Maximum Mode-0 homing speed in radians per second."""

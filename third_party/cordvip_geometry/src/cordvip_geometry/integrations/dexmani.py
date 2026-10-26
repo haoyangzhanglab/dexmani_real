@@ -82,6 +82,7 @@ def iter_live_realsense(
     from dexmani_real.sensor.camera.realsense import RealSenseCamera
 
     config = CameraParams(serial=serial, width=width, height=height, fps=fps)
+    config.validate()
     camera = RealSenseCamera(config, auto_exposure_priority=None)
     previous_identity: tuple[int, int] | None = None
     channel_received_ns = [0, 0]

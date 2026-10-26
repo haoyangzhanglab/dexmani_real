@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import subprocess
 import time
 from dataclasses import asdict, replace
@@ -14,11 +15,7 @@ from dexmani_real.calibration.table_plane import (
 )
 from dexmani_real.deployment.config import DEFAULT_MAX_RUNNING_S, DEFAULT_NUM_EPISODES
 from dexmani_real.deployment.policy_observation import policy_dependencies, policy_needs
-from dexmani_real.deployment.preflight import (
-    validate_deployment_config,
-    validate_max_running_s,
-    validate_num_episodes,
-)
+from dexmani_real.deployment.preflight import validate_deployment_config
 from dexmani_real.deployment.session import PolicySession
 from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.utils.atomic_io import atomic_yaml_dump
@@ -74,6 +71,18 @@ def run_policy(
     camera_calibration_path=None,
 ) -> int:
     """Inspect, resolve and run one evaluation session from CLI or Python."""
+    if max_running_s is not None:
+        if isinstance(max_running_s, bool):
+            raise TypeError("max_running_s must be a finite positive number or None")
+        max_running_s = float(max_running_s)
+        if not math.isfinite(max_running_s) or max_running_s <= 0:
+            raise ValueError("max_running_s must be finite and positive")
+    if num_episodes is not None:
+        if type(num_episodes) is not int:
+            raise TypeError("num_episodes must be a positive integer or None")
+        if num_episodes < 1:
+            raise ValueError("num_episodes must be a positive integer")
+
     from dexmani_policy.common.config import load_experiment_config
     from dexmani_policy.common.experiments import (
         resolve_best_checkpoint,
@@ -110,8 +119,6 @@ def run_policy(
     )
     needs = control_needs.union(record_needs)
     cloud_recipe, hand_cloud_recipe = validate_deployment_config(info, runtime, needs=needs)
-    max_running_s = validate_max_running_s(max_running_s)
-    num_episodes = validate_num_episodes(num_episodes)
     if cloud_recipe is not None or hand_cloud_recipe is not None:
         runtime = replace(
             runtime,

@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 
 from dexmani_real.control.config import StaticCollisionBox, TableCollisionConfig
-from dexmani_real.geometry.plane import validate_table_plane
 from dexmani_real.robot.model import (
     ARM_JOINT_SHAPE,
     HAND_DOF,
@@ -99,15 +98,7 @@ class CollisionModel:
         self.environment_names: dict[int, str] = {}
         self.table_pair_indices: tuple[int, ...] = ()
         self.table = table if table is not None and table.enabled else None
-        if self.table is not None:
-            self.table.validate()
-            table_plane_abcd = validate_table_plane(table_plane_abcd)
         boxes = tuple(static_boxes)
-        for box in boxes:
-            box.validate()
-        box_names = [box.name for box in boxes]
-        if len(box_names) != len(set(box_names)):
-            raise ValueError("static collision box names must be unique")
         if boxes or self.table is not None:
             self.environment_collision_model = pin.buildGeomFromUrdf(
                 self.model, urdf_path, pin.GeometryType.COLLISION, package_dirs=package_dirs
