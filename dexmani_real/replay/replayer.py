@@ -22,7 +22,6 @@ from dexmani_real.runtime.observation import (
     read_observation,
     service_feedback,
 )
-from dexmani_real.runtime.operator_input import OperatorCommand
 from dexmani_real.runtime.state import RunEndReason
 from dexmani_real.utils.timing import sampling_clock_ns
 
@@ -232,7 +231,7 @@ class TrajectoryReplayer:
         try:
             if time.monotonic_ns() >= valid_until_ns:
                 raise TimeoutError(f"replay slot {index} expired before submission")
-            if not self.runtime_state.command_may_cross_sdk(run_id=self.epoch):
+            if not self.runtime_state.can_move(run_id=self.epoch):
                 raise OperationCancelled("replay cancelled before submission")
             submit_started_ns = time.monotonic_ns()
             try:
@@ -289,7 +288,7 @@ class TrajectoryReplayer:
                 return ReplayOutcome(ReplayStatus.ESTOP, reason="operator emergency stop")
             if self.runtime_state.error_state:
                 return ReplayOutcome(ReplayStatus.FAULT, reason="runtime failure")
-            if self.runtime_state.quit_requested or OperatorCommand.QUIT in signals:
+            if self.runtime_state.quit_requested or "q" in signals:
                 return ReplayOutcome(ReplayStatus.USER_QUIT, reason="operator quit")
             if not self.runtime_state.running or self.runtime_state.run_id != epoch:
                 cause = self.runtime_state.run_ended_reason

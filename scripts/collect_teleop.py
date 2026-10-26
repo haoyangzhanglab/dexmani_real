@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         },
     )
     if args.print_config:
-        sections = ["arm", "hand", "motion", "teleop", "collection", "vr", "safety", "environment"]
+        sections = ["arm", "hand", "motion", "teleop", "collection", "vr", "environment"]
         if runtime.collection.enabled:
             sections.append("camera")
         if runtime.hand.enabled:

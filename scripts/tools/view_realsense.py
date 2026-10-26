@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import time
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
@@ -18,7 +18,7 @@ from dexmani_real.perception.pointcloud.processing import (
     build_point_cloud,
     build_raw_point_cloud,
 )
-from dexmani_real.runtime.operator_input import KeyboardInput
+from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.visualization import (
     log_camera_geometry,
@@ -115,7 +115,8 @@ class RealSenseExample:
         ):
             raise ValueError("display depth range must be finite and satisfy 0 < min < max")
         self.table = self.runtime.environment.table
-        self.calibration = self.table_plane_abcd = None
+        self.calibration: CameraExtrinsics | None = None
+        self.table_plane_abcd: tuple[float, float, float, float] | None = None
 
         import rerun as rr
 
@@ -181,15 +182,13 @@ class RealSenseExample:
         print("\nQ/Esc=退出 P=点云计算 S=raw/processed R=重置计算 C=配置 A=曝光优先级")
         print("冻结、时间浏览、配色和实体显隐使用 Rerun；关闭 viewer 不会停止相机。")
         rr = self.rr
-        keys = KeyboardInput(
-            capture_commands=False, capture_raw_events=True,
-            raw_event_keys=frozenset({"q", "p", "s", "r", "c", "a"}),
-        )
-        intervals = deque(maxlen=FPS_WINDOW)
+        keys = Keyboard()
+        intervals: deque[float] = deque(maxlen=FPS_WINDOW)
         previous_frame_start = None
         frame_count = total_dropped = 0
-        show_cloud, mode = False, "processed"
-        base_from_color = table_plane_abcd = None
+        mode = "processed"
+        base_from_color: np.ndarray | None = None
+        table_plane_abcd = None
         metric_names = ("fps", "read_ms", "pcd_ms", "valid_ratio", "point_count", "dropped")
         series = [("Diagnostic", [f"diagnostic/{name}" for name in metric_names])]
         try:
@@ -198,6 +197,7 @@ class RealSenseExample:
             keys.start()
             intrinsics = self.camera.get_color_intrinsics()
             depth_scale_m = self.camera.get_depth_scale()
+            serial = cast(str, self.camera.active_serial)
             if not np.isfinite(depth_scale_m) or depth_scale_m <= 0:
                 raise ValueError("display depth scale must be finite and positive")
             log_camera_geometry(intrinsics)
@@ -206,7 +206,7 @@ class RealSenseExample:
                     raise RuntimeError("diagnostic keyboard listener unavailable")
                 if keys.estop_latched:
                     return "user_exit"
-                while (key := keys.pop_event()) is not None:
+                for key in keys.poll(timeout=0):
                     if key == "q":
                         return "user_exit"
                     if key == "a":
@@ -215,27 +215,29 @@ class RealSenseExample:
                         else:
                             print("Exposure changes disabled: original priority could not be read")
                     elif key == "c":
-                        print(f"Point cloud: enabled={show_cloud} mode={mode} config={self.production}")
+                        print(f"Point cloud: enabled={base_from_color is not None} mode={mode} config={self.production}")
                     elif key in {"p", "s", "r"}:
+                        enable_cloud = base_from_color is not None
                         if key == "p":
-                            show_cloud = not show_cloud
+                            enable_cloud = not enable_cloud
                         elif key == "s":
                             mode = "raw" if mode == "processed" else "processed"
                         else:
-                            show_cloud, mode = False, "processed"
+                            enable_cloud, mode = False, "processed"
+                        base_from_color = None
                         log_points("pcd", None)
-                        if show_cloud:
+                        if enable_cloud:
                             try:
                                 validate_aligned_depth_distortion(intrinsics.distortion_model)
                                 base_from_color, table_plane_abcd = self.load_pointcloud_geometry(
-                                    mode, self.camera.active_serial,
+                                    mode, serial,
                                 )
                                 log_camera_geometry(intrinsics, base_from_color)
                                 rr.send_blueprint(viewer_blueprint(series, camera_in_base=True))
                             except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
-                                show_cloud = False
                                 print(f"PCD {mode} unavailable for {self.camera.active_serial!r}: {exc}")
-                        print(f"Point cloud: enabled={show_cloud} mode={mode}")
+                                base_from_color = None
+                        print(f"Point cloud: enabled={base_from_color is not None} mode={mode}")
 
                 started = time.perf_counter()
                 if previous_frame_start is not None:
@@ -258,18 +260,20 @@ class RealSenseExample:
                     depth_range_m=(self.production.depth_min_m, self.production.depth_max_m),
                 )
                 cloud, pcd_ms = None, 0.0
-                if show_cloud:
+                if base_from_color is not None:
                     started = time.perf_counter()
                     try:
-                        kwargs = dict(
-                            depth_raw=depth, color=rgb, depth_scale_m=depth_scale_m,
-                            intrinsics=intrinsics, T_xarm_base_from_color=base_from_color,
-                        )
-                        cloud = (
-                            build_raw_point_cloud(**kwargs) if mode == "raw" else build_point_cloud(
-                                **kwargs, table_plane_abcd=table_plane_abcd, config=self.production,
+                        if mode == "raw":
+                            cloud = build_raw_point_cloud(
+                                depth_raw=depth, color=rgb, depth_scale_m=depth_scale_m,
+                                intrinsics=intrinsics, T_xarm_base_from_color=base_from_color,
                             )
-                        )
+                        else:
+                            cloud = build_point_cloud(
+                                depth_raw=depth, color=rgb, depth_scale_m=depth_scale_m,
+                                intrinsics=intrinsics, T_xarm_base_from_color=base_from_color,
+                                table_plane_abcd=table_plane_abcd, config=self.production,
+                            )
                     except (ValueError, RuntimeError) as exc:
                         total_dropped += 1
                         if total_dropped <= 3:
@@ -294,7 +298,9 @@ class RealSenseExample:
             finally:
                 rr.disconnect()
 
-    def load_pointcloud_geometry(self, mode, serial):
+    def load_pointcloud_geometry(
+        self, mode: str, serial: str,
+    ) -> tuple[np.ndarray, tuple[float, float, float, float] | None]:
         if mode == "processed":
             self.production.validate()
         if self.calibration is None:

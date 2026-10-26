@@ -11,14 +11,12 @@ from scipy.spatial.transform import Rotation
 
 from dexmani_real.geometry.pose import Pose, quat_multiply
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
-from dexmani_real.runtime.operator_input import CARTESIAN_JOG_KEYS
-from dexmani_real.runtime.preflight import validate_control_rate
-from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
+from dexmani_real.runtime.keyboard import CARTESIAN_JOG_KEYS
+from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 
 if TYPE_CHECKING:
-    from dexmani_real.config import ExperimentConfig
     from dexmani_real.robot.system import DexManiRobot
-    from dexmani_real.runtime.operator_input import KeyboardInput
+    from dexmani_real.runtime.keyboard import Keyboard
 
 
 class JogController:
@@ -26,7 +24,9 @@ class JogController:
 
     def __init__(self, solver, target_checker, config, workspace):
         self.solver, self.target_checker = solver, target_checker
-        self.config, self.workspace = config, workspace
+        self.config = config
+        self.position_lower = workspace[:, 0] + config.workspace_command_margin_m
+        self.position_upper = workspace[:, 1] - config.workspace_command_margin_m
         self.command_pose = self.command_qpos = None
         self.blocked_until_release = False
 
@@ -39,16 +39,15 @@ class JogController:
 
     def propose(self, pressed_keys, measured_qpos, *, hand_qpos):
         baseline_qpos, baseline_pose = self.command_qpos, self.command_pose
-        if baseline_qpos is None:
-            baseline_qpos = measured_qpos.copy()
+        if baseline_pose is None:
+            baseline_qpos = measured_qpos
             baseline_pose = self.solver.kin.compute_eef_pose_base(measured_qpos)
         dx, drpy = compute_cartesian_jog_delta(
             pressed_keys, self.config.delta_pos_m, self.config.delta_rpy_rad
         )
         pose, desired_position, changed = propose_cartesian_jog_pose(
             baseline_pose, dx, drpy,
-            self.workspace[:, 0] + self.config.workspace_command_margin_m,
-            self.workspace[:, 1] - self.config.workspace_command_margin_m,
+            self.position_lower, self.position_upper,
         )
         result = None
         if changed:
@@ -62,18 +61,18 @@ class JogController:
         return pose, desired_position, result
 
     def submit(
-        self, pose: Pose, target: np.ndarray, keys: KeyboardInput, generation: int,
-        runtime_state: RuntimeState, robot: DexManiRobot, epoch: int, *,
+        self, pose: Pose, target: np.ndarray, keys: Keyboard, generation: int,
+        runtime_state: SessionState, robot: DexManiRobot, epoch: int, *,
         valid_until_ns: int, execute_until_ns: int,
     ) -> bool:
         """约束输入代际与运行身份，仅在正常提交后更新目标参考。"""
-        next_pose, next_qpos = pose.copy(), target.copy()
+        deadline_ns = min(valid_until_ns, execute_until_ns)
 
         def reserve() -> int | None:
             with runtime_state.motion_lock:
                 if runtime_state.run_id != epoch or not runtime_state.requests_allow_motion():
                     return None
-                if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
+                if time.monotonic_ns() >= deadline_ns:
                     runtime_state.revoke_motion(expected_run_id=epoch)
                     raise TimeoutError("jog proposal deadline expired")
                 if runtime_state.safety_state == SafetyState.ARMED:
@@ -87,24 +86,26 @@ class JogController:
         if not run_id:
             return False
         try:
-            # The input generation is checked again by the IPC consumer before first send.
+            command = RobotCommand(run_id, target, input_generation=generation)
+            next_pose = pose.copy()
+            # IPC 消费者在首次发送前再次核对输入代际。
             robot.send_action(
-                RobotCommand(run_id, target, input_generation=generation),
+                command,
                 valid_until_ns=valid_until_ns,
                 execute_until_ns=execute_until_ns,
             )
 
             def finish() -> bool:
                 with runtime_state.motion_lock:
-                    if not runtime_state.command_may_cross_sdk(run_id=run_id):
+                    if not runtime_state.can_move(run_id=run_id):
                         return False
-                    if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
+                    if time.monotonic_ns() >= deadline_ns:
                         return False
-                    self.command_pose, self.command_qpos = next_pose, next_qpos
+                    self.command_pose, self.command_qpos = next_pose, command.arm_qpos
                     return True
 
             if not keys.commit_if_current(generation, finish):
-                if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
+                if time.monotonic_ns() >= deadline_ns:
                     raise TimeoutError("jog proposal expired during submission")
                 raise OperationCancelled("jog proposal changed during submission")
             return True
@@ -120,7 +121,7 @@ class JogController:
 
 
 def any_jog_key_held(active_keys: Iterable[str]) -> bool:
-    """Check physical jog keys even when opposite increments cancel out."""
+    """相反方向相互抵消时，仍需等待所有 jog 键释放。"""
     return not CARTESIAN_JOG_KEYS.isdisjoint(active_keys)
 
 
@@ -128,8 +129,13 @@ def jog_motion_requested(active_keys: Iterable[str]) -> bool:
     keys = frozenset(active_keys)
     if keys.intersection({"r", "q", "esc"}):
         return False
-    dx, drpy = compute_cartesian_jog_delta(keys, 1.0, 1.0)
-    return bool(np.any(dx) or np.any(drpy))
+    return any(
+        (positive in keys) != (negative in keys)
+        for positive, negative in (
+            ("w", "s"), ("d", "a"), ("up", "down"),
+            ("left", "right"), ("i", "k"), ("j", "l"),
+        )
+    )
 
 
 def propose_cartesian_jog_pose(
@@ -139,7 +145,6 @@ def propose_cartesian_jog_pose(
     position_lower: np.ndarray,
     position_upper: np.ndarray,
 ) -> tuple[Pose, np.ndarray, bool]:
-    """投影 jog 提案，保留上次正常提交的目标参考。"""
     desired_position = command_pose.p + dx
     position = np.clip(desired_position, position_lower, position_upper)
     rotating = bool(np.any(drpy != 0.0))
@@ -156,7 +161,6 @@ def compute_cartesian_jog_delta(
     delta_pos: float,
     delta_rpy: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Map held keys to EEF position and rotation increments."""
     keys = frozenset(pressed_keys)
     dx = np.zeros(3, dtype=np.float64)
     if "w" in keys:
@@ -193,20 +197,3 @@ def compute_cartesian_jog_delta(
         drpy *= delta_rpy / drpy_norm
 
     return dx, drpy
-
-
-def validate_keyboard_workspace(runtime: ExperimentConfig) -> np.ndarray:
-    """Validate the selected jog configuration before any device connects."""
-    cfg = runtime.keyboard_teleop
-    for name in ("target_max_age_s", "delta_pos_m", "delta_rpy_rad"):
-        value = getattr(cfg, name)
-        if not np.isfinite(value) or value <= 0:
-            raise ValueError(f"keyboard {name} must be finite and positive")
-    margin = cfg.workspace_command_margin_m
-    if not np.isfinite(margin) or margin < 0:
-        raise ValueError("workspace_command_margin_m must be finite and non-negative")
-    validate_control_rate(runtime, cfg.control_hz)
-    workspace = runtime.environment.workspace.as_array()
-    if np.any(workspace[:, 0] + margin >= workspace[:, 1] - margin):
-        raise ValueError("keyboard workspace command margin leaves no interior workspace")
-    return workspace

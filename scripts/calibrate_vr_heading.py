@@ -23,11 +23,13 @@ from dexmani_real.calibration.vr_alignment import (
 )
 from dexmani_real.geometry.pose import forward_from_quat_wxyz
 from dexmani_real.ipc.sensors import SensorChannels
-from dexmani_real.runtime.config import RuntimeTimeouts
+from dexmani_real.runtime.lifecycle import (
+    SensorWorkers,
+    VR_READY_TIMEOUT_S,
+    close_runtime,
+)
 from dexmani_real.runtime.observation import read_vr_frame
-from dexmani_real.runtime.sensor_processes import SensorProcesses
-from dexmani_real.runtime.shutdown import shutdown_local_runtime
-from dexmani_real.runtime.state import RuntimeState
+from dexmani_real.runtime.state import SessionState
 from dexmani_real.sensor.vr.config import VRParams
 from dexmani_real.sensor.vr.worker import run_vr_worker
 from dexmani_real.teleop.audio_feedback import AudioFeedback
@@ -82,7 +84,7 @@ def read_heading(channels: SensorChannels, reference: str):
 
 def wait_for_vr_tracking(
     channels: SensorChannels,
-    sensors: SensorProcesses,
+    sensors: SensorWorkers,
     reference: str,
     timeout_s: float,
 ) -> bool:
@@ -121,7 +123,6 @@ def play_completion_audio() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    safety = RuntimeTimeouts()
     parser = argparse.ArgumentParser(description="VR heading calibration")
     parser.add_argument(
         "--duration",
@@ -169,9 +170,9 @@ def main(argv: list[str] | None = None) -> int:
 
     configure_logging()
     ctx = mp.get_context("spawn")
-    runtime_state = RuntimeState()
+    runtime_state = SessionState()
     channels = SensorChannels(ctx, vr=True)
-    sensors = SensorProcesses(channels)
+    sensors = SensorWorkers(channels)
     vr_proc = ctx.Process(
         name="vr", target=run_vr_worker, args=(channels, vr_config), daemon=True
     )
@@ -179,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     stale_count = 0
     try:
         print(
-            f"\n  Waiting for VR connection (up to {safety.vr_ready_timeout_s:g} s) "
+            f"\n  Waiting for VR connection (up to {VR_READY_TIMEOUT_S:g} s) "
             "— put on Quest headset...",
             flush=True,
         )
@@ -187,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
             sensors.start(
                 vr_proc,
                 ready=channels.vr_ready,
-                timeout_s=safety.vr_ready_timeout_s,
+                timeout_s=VR_READY_TIMEOUT_S,
                 may_start=runtime_state.requests_allow_motion,
             )
         except RuntimeError as exc:
@@ -242,10 +243,10 @@ def main(argv: list[str] | None = None) -> int:
                 last_print = now
             time.sleep(POLL_INTERVAL_S)
     finally:
-        shutdown_clean = shutdown_local_runtime(
+        shutdown_clean = close_runtime(
             runtime_state,
             sensors=sensors,
-            timeout_s=JOIN_TIMEOUT_S,
+            deadline=time.monotonic() + JOIN_TIMEOUT_S,
         )
 
     if not shutdown_clean:

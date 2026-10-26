@@ -2,6 +2,7 @@
 
 import logging
 import multiprocessing as mp
+import time
 from pathlib import Path
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
@@ -15,15 +16,19 @@ from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.model import XHAND_RIGHT_URDF_PATH
 from dexmani_real.robot.system import DexManiRobot
+from dexmani_real.runtime.keyboard import Keyboard
+from dexmani_real.runtime.lifecycle import (
+    CAMERA_READY_TIMEOUT_S,
+    SHUTDOWN_TIMEOUT_S,
+    SensorWorkers,
+    close_runtime,
+)
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     snapshot_camera_parameters,
 )
-from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
-from dexmani_real.runtime.sensor_processes import SensorProcesses
-from dexmani_real.runtime.shutdown import shutdown_local_runtime
-from dexmani_real.runtime.state import RunEndReason, RuntimeState
+from dexmani_real.runtime.state import RunEndReason, SessionState
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.sensor.vr.worker import run_vr_worker
 from dexmani_real.teleop.audio_feedback import AudioFeedback
@@ -97,7 +102,7 @@ def run_teleop(
     )
     needs = control_needs.union(record_needs)
     ctx = mp.get_context("spawn")
-    runtime_state = RuntimeState()
+    runtime_state = SessionState()
     channels = SensorChannels(
         ctx,
         camera=runtime.camera if needs.camera_worker else None,
@@ -108,14 +113,14 @@ def run_teleop(
     runner = None
     keyboard = audio = None
     try:
-        sensors = SensorProcesses(channels)
+        sensors = SensorWorkers(channels)
         robot = DexManiRobot(
             runtime.arm, runtime.hand, run_signal=runtime_state.run_signal,
             stop_signal=runtime_state.stop_signal,
             emergency_signal=runtime_state.emergency_signal,
             signal_lock=runtime_state.motion_lock, check_services=sensors.check,
         )
-        keyboard = KeyboardInput(
+        keyboard = Keyboard(
             estop_callback=runtime_state.request_emergency_stop,
             stop_callback=runtime_state.request_stop,
             quit_callback=lambda: runtime_state.request_stop(reason=RunEndReason.QUIT),
@@ -161,7 +166,7 @@ def run_teleop(
                     args=(sensors.channels, runtime.camera),
                 ),
                 ready=sensors.channels.camera_ready,
-                timeout_s=runtime.safety.camera_ready_timeout_s,
+                timeout_s=CAMERA_READY_TIMEOUT_S,
                 may_start=lambda: keyboard.healthy and runtime_state.requests_allow_motion(),
             )
             runner.camera_snapshot = snapshot_camera_parameters(
@@ -197,9 +202,9 @@ def run_teleop(
                 runtime_state.mark_error()
                 logger.exception("teleop audio cleanup failed")
         finally:
-            shutdown_clean = shutdown_local_runtime(
+            shutdown_clean = close_runtime(
                 runtime_state, robot, sensors=sensors, keyboard=keyboard,
-                timeout_s=runtime.safety.shutdown_timeout_s,
+                deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S,
             )
     return int(not clean or not shutdown_clean)
 

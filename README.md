@@ -23,7 +23,7 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 | 设备接入 | [`robot/`](dexmani_real/robot/) · [`sensor/`](dexmani_real/sensor/) | 机械臂、灵巧手、RGB-D 相机及 VR 的连接与采集；机器人协调入口为 `robot/system.py` |
 | 几何与感知 | [`geometry/`](dexmani_real/geometry/) · [`perception/`](dexmani_real/perception/) | 位姿、坐标变换和 FK；在线/离线共享点云、指尖与手表面表示 |
 | 动作控制 | [`control/`](dexmani_real/control/) | 动作映射、在线 IK、目标约束、关节等价角与 HOME 路径；在线接触和 HOME 间隙规则保持分离 |
-| 共享运行 | [`runtime/`](dexmani_real/runtime/) · [`runtime/motion/`](dexmani_real/runtime/motion/) · [`ipc/`](dexmani_real/ipc/) | 运行身份、输入、观测、传感进程与退出；HOME/jog 协调及进程间通信 |
+| 共享运行 | [`runtime/`](dexmani_real/runtime/) · [`ipc/`](dexmani_real/ipc/) | 会话状态、键盘输入、观测、资源启停、HOME/jog 协调及进程间通信 |
 | 实验执行 | [`teleop/`](dexmani_real/teleop/) · [`deployment/`](dexmani_real/deployment/) · [`replay/`](dexmani_real/replay/) | 遥操作、学习策略执行与轨迹回放 |
 | 数据管理 | [`data/`](dexmani_real/data/) | Raw 记录、Canonical 处理与导出；`session_results.py` 管理会话结果 |
 | 配置与标定 | [`config.py`](dexmani_real/config.py) · [`calibration/`](dexmani_real/calibration/) | 实验配置装配、标定算法、交互会话及默认参数；配置定义仍位于各领域 |
@@ -57,6 +57,12 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 `JogController.submit()` 负责输入代际、运动授权和提交后参考更新。录制使用 `AsyncEpisodeRecorder.finish()` 显式指定保存意图、终止原因和技术状态。
 
+`runtime` 按职责平铺为 `state`、`keyboard`、`observation`、`lifecycle`、`preflight`、`home` 和 `jog`。`SessionState` 管理运行代际与停止请求，`SensorWorkers` 持有传感进程，`close_runtime()` 按顺序回收资源。`home_hand()`、`home_arm()` 直接使用机器人对象中的设备配置，并分别负责本次运动的停止；`home_robot()` 顺序执行两者。
+
+`Keyboard.poll()` 返回小写按键字符串；命令、标定和预览共用一个事件队列。离散操作每次按下只触发一次，长按 jog 仍连续移动，松键会使旧提案失效。每个键盘实例只启动一次，`discard_events(*keys)` 用于丢弃阻塞操作期间的旧事件。
+
+运行资源超时使用代码常量：相机、点云、VR 启动分别为 15、30、120 秒，正常退出等待预算为 65 秒，定义于 `runtime/lifecycle.py`；模型启动为 300 秒，定义于 `deployment/session.py`。部署清理共享同一截止时间；仍存活的传感进程依次执行 terminate、kill，各等待至多 1 秒，因此总清理时间可能超过正常退出预算。超时不属于 YAML 配置项，未知配置键会报错。
+
 项目依赖与打包配置见 [`pyproject.toml`](pyproject.toml)，开发约定见 [`AGENTS.md`](AGENTS.md)。
 
 ## 运行接口与错误处理
@@ -80,6 +86,8 @@ VR 接收器在发布前拒绝无效传感数据。映射器按已接纳的观�
 IK 使用入口明确提供的运行关节限位，正常无解返回 `IKResult`，求解器、FK 或碰撞后端故障直接抛出原始异常。HOME 仅对 `HomePathRejected` 表示的几何拒绝尝试其他候选路径，候选耗尽、取消或等待超时返回失败结果；非法目标与技术异常传播到会话错误处理和收尾边界。
 
 回放先保存实测数据，再计算并写入指标。没有有效样本的指标显式记为 `null`；计算产生的非有限数值由 JSON 写入边界拒绝并报告评估失败，保留已保存的实测数据。
+
+回放结束后，H 请求回初始位，S 取消 HOME，Q 退出，Esc 急停。S 优先于同批次 H；完成停止确认后可重新按 H。HOME 期间积累的 H 不会在返回后自动执行，S 中断记录为取消。
 
 ## 观测与产物契约
 

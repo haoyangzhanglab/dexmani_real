@@ -10,12 +10,10 @@ from dexmani_real.control.online_ik import OnlineIKConfig, make_online_ik_solver
 from dexmani_real.control.target_validation import TargetChecker
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import DexManiRobot
-from dexmani_real.runtime.motion.home import home_robot
-from dexmani_real.runtime.motion.jog import (
-    JogController,
-    jog_motion_requested,
-    validate_keyboard_workspace,
-)
+from dexmani_real.runtime.home import home_robot
+from dexmani_real.runtime.jog import JogController, jog_motion_requested
+from dexmani_real.runtime.keyboard import Keyboard
+from dexmani_real.runtime.lifecycle import close_runtime
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
@@ -23,10 +21,8 @@ from dexmani_real.runtime.observation import (
     read_observation,
     service_feedback,
 )
-from dexmani_real.runtime.operator_input import KeyboardInput
-from dexmani_real.runtime.preflight import validate_robot_config
-from dexmani_real.runtime.shutdown import shutdown_local_runtime
-from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
+from dexmani_real.runtime.preflight import validate_keyboard_workspace, validate_robot_config
+from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import LoopRate
 
@@ -50,7 +46,7 @@ class KeyboardTeleopSession:
         if not self.runtime.hand.enabled and not self.no_hand:
             raise ValueError("hand-disabled operation requires --no-hand")
 
-        self.runtime_state = RuntimeState()
+        self.runtime_state = SessionState()
         self.robot = DexManiRobot(
             self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
             stop_signal=self.runtime_state.stop_signal,
@@ -58,13 +54,11 @@ class KeyboardTeleopSession:
             signal_lock=self.runtime_state.motion_lock,
         )
 
-        self.keys = KeyboardInput(
+        self.keys = Keyboard(
             quit_callback=self.runtime_state.request_quit,
-            capture_commands=False,
             estop_callback=self.runtime_state.request_emergency_stop,
         )
         self.jog_config = self.runtime.keyboard_teleop
-        self.home_key_down = False
         clean = False
         try:
             self.start()
@@ -83,7 +77,7 @@ class KeyboardTeleopSession:
             )
             raise
         finally:
-            shutdown_clean = shutdown_local_runtime(
+            shutdown_clean = close_runtime(
                 self.runtime_state, self.robot, keyboard=self.keys
             )
         return int(not clean or not shutdown_clean)
@@ -124,6 +118,7 @@ class KeyboardTeleopSession:
     def run_control_loop(self):
         while self.runtime_state.running and not self.runtime_state.quit_requested:
             self.rate.wait()
+            events = self.keys.poll(timeout=0)
             if (
                 self.runtime_state.estop_request
                 or self.runtime_state.error_state
@@ -133,43 +128,36 @@ class KeyboardTeleopSession:
             if self.runtime_state.quit_requested or self.keys.is_pressed("q"):
                 return True
 
-            home_pressed = self.keys.is_pressed("r")
-            if self.handle_home_key(home_pressed):
+            if "r" in events:
+                self.run_home()
                 continue
-            self.motion_tick(home_pressed)
+            self.motion_tick()
         return bool(self.runtime_state.quit_requested)
 
-    def handle_home_key(self, home_pressed):
-        if home_pressed and not self.home_key_down:
-            self.jog.clear_reference()
-            self.runtime_state.revoke_motion()
-            self.robot.stop()
-            home_result = home_robot(
-                self.runtime_state,
-                self.runtime.arm, self.runtime.hand,
-                self.home_planner,
-                robot=self.robot,
-                service=lambda: service_feedback(self.robot, self.runtime),
-                abort_requested=lambda: (
-                    bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
-                    or not self.keys.healthy
-                ),
-            )
-            if not home_result.ok:
-                if not home_result.interrupted:
-                    raise RuntimeError(f"HOME failed: {home_result.reason}")
-                logger.info("HOME cancelled: %s", home_result.reason)
-            self.rate.reset()
-            self.home_key_down = home_pressed
-            return True
-        self.home_key_down = home_pressed
-        return False
+    def run_home(self):
+        self.jog.clear_reference()
+        self.runtime_state.revoke_motion()
+        self.robot.stop()
+        home_result = home_robot(
+            self.runtime_state, self.robot, self.home_planner,
+            service=lambda: service_feedback(self.robot, self.runtime),
+            cancel_requested=lambda: (
+                bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
+                or not self.keys.healthy
+            ),
+        )
+        if not home_result.ok:
+            if not home_result.interrupted:
+                raise RuntimeError(f"HOME failed: {home_result.reason}")
+            logger.info("HOME cancelled: %s", home_result.reason)
+        self.keys.discard_events("r")
+        self.rate.reset()
 
-    def motion_tick(self, home_pressed):
+    def motion_tick(self):
         pressed_keys, generation = self.keys.snapshot()
         moving = jog_motion_requested(pressed_keys)
         self.jog.release_if_idle(pressed_keys)
-        if not moving or home_pressed or self.jog.blocked_until_release:
+        if not moving or self.jog.blocked_until_release:
             if self.robot.stop_required:
                 self.runtime_state.revoke_motion()
                 self.robot.stop()

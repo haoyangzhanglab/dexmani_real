@@ -12,12 +12,12 @@ from dexmani_real.replay.consistency import evaluate_replay
 from dexmani_real.replay.replayer import ReplayOutcome, ReplayStatus, TrajectoryReplayer
 from dexmani_real.replay.trajectory import verify_replay_preflight
 from dexmani_real.robot.system import DexManiRobot
-from dexmani_real.runtime.motion.home import home_hand, home_robot
+from dexmani_real.runtime.home import home_hand, home_robot
+from dexmani_real.runtime.keyboard import Keyboard
+from dexmani_real.runtime.lifecycle import close_runtime
 from dexmani_real.runtime.observation import service_feedback
-from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
-from dexmani_real.runtime.shutdown import shutdown_local_runtime
-from dexmani_real.runtime.state import RuntimeState
+from dexmani_real.runtime.state import SessionState
 from dexmani_real.utils.log import configure_logging
 
 DEFAULT_OUTPUT_DIR = "replay_results"
@@ -46,7 +46,7 @@ def run_replay(
     shutdown_clean = False
     outcome = ReplayOutcome(ReplayStatus.REJECTED, reason="startup failed")
     try:
-        runtime_state = RuntimeState()
+        runtime_state = SessionState()
         robot = DexManiRobot(
             runtime.arm, runtime.hand, run_signal=runtime_state.run_signal,
             stop_signal=runtime_state.stop_signal,
@@ -54,7 +54,7 @@ def run_replay(
             signal_lock=runtime_state.motion_lock,
         )
 
-        keyboard = KeyboardInput(
+        keyboard = Keyboard(
             quit_callback=runtime_state.request_quit,
             stop_callback=runtime_state.request_stop,
             estop_callback=runtime_state.request_emergency_stop,
@@ -68,10 +68,8 @@ def run_replay(
         robot.check()
         runtime_state.arm()
         home_result = home_hand(
-            runtime_state,
-            runtime.hand,
-            robot=robot,
-            abort_requested=lambda: (
+            runtime_state, robot,
+            cancel_requested=lambda: (
                 bool(runtime_state.estop_request or runtime_state.quit_requested)
                 or not keyboard.healthy
             ),
@@ -107,24 +105,27 @@ def run_replay(
                 ),
             )
         if outcome.successful:
+            keyboard.discard_events("h")
             print("H: planned return_home; Q: exit", flush=True)
             while runtime_state.running and not runtime_state.quit_requested:
+                stopped_epoch = runtime_state.run_id
                 robot.service_idle()
                 if not keyboard.healthy:
                     runtime_state.request_emergency_stop()
                 if runtime_state.error_state or runtime_state.estop_request:
                     break
                 signals = keyboard.poll(timeout=0.1)
-                if OperatorCommand.QUIT in signals:
+                if runtime_state.quit_requested or "q" in signals:
                     break
-                if OperatorCommand.HOME in signals:
+                if runtime_state.stop_request or "s" in signals:
+                    if not robot.stop_required:
+                        runtime_state.acknowledge_stop(stopped_epoch)
+                    continue
+                if "h" in signals:
                     home_result = home_robot(
-                        runtime_state,
-                        runtime.arm, runtime.hand,
-                        home_planner,
-                        robot=robot,
+                        runtime_state, robot, home_planner,
                         service=lambda: service_feedback(robot, runtime),
-                        abort_requested=lambda: (
+                        cancel_requested=lambda: (
                             bool(
                                 runtime_state.estop_request
                                 or runtime_state.quit_requested
@@ -132,12 +133,17 @@ def run_replay(
                             or not keyboard.healthy
                         ),
                     )
+                    keyboard.discard_events("h")
                     results.record_home_result(
                         ok=home_result.ok,
                         interrupted=home_result.interrupted,
                         reason=home_result.reason,
                     )
                     if not home_result.ok:
+                        if home_result.interrupted and runtime_state.stop_request and not (
+                            runtime_state.quit_requested or runtime_state.estop_request
+                        ):
+                            continue
                         if home_result.interrupted and runtime_state.quit_requested:
                             status = ReplayStatus.USER_QUIT
                         elif runtime_state.estop_request:
@@ -165,7 +171,7 @@ def run_replay(
     finally:
         try:
             if runtime_state is not None:
-                shutdown_clean = shutdown_local_runtime(
+                shutdown_clean = close_runtime(
                     runtime_state,
                     robot,
                     keyboard=keyboard,

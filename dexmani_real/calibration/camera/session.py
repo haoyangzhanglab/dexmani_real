@@ -43,22 +43,22 @@ from dexmani_real.control.target_validation import TargetChecker
 from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.system import DexManiRobot
-from dexmani_real.runtime.motion.home import execute_arm_home
-from dexmani_real.runtime.motion.jog import (
-    JogController,
-    jog_motion_requested,
-    validate_keyboard_workspace,
+from dexmani_real.runtime.home import home_arm
+from dexmani_real.runtime.jog import JogController, jog_motion_requested
+from dexmani_real.runtime.keyboard import Keyboard
+from dexmani_real.runtime.lifecycle import (
+    CAMERA_READY_TIMEOUT_S,
+    SHUTDOWN_TIMEOUT_S,
+    SensorWorkers,
+    close_runtime,
 )
 from dexmani_real.runtime.observation import (
     control_deadline_ns,
     read_camera_frame,
     service_feedback,
 )
-from dexmani_real.runtime.operator_input import KeyboardInput
-from dexmani_real.runtime.preflight import validate_robot_config
-from dexmani_real.runtime.sensor_processes import SensorProcesses
-from dexmani_real.runtime.shutdown import shutdown_local_runtime
-from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
+from dexmani_real.runtime.preflight import validate_keyboard_workspace, validate_robot_config
+from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import LoopRate, sample_is_fresh
@@ -308,10 +308,9 @@ class CameraCalibrationSession:
             cv2.imshow(WINDOW_NAME, self.display_image)
         cv2.waitKey(1)
 
-    def handle_sample_events(self):
+    def handle_sample_events(self, events):
         """Drain edge-triggered capture, undo, reject, and solve events."""
-        event = self.keys.pop_event()
-        while event is not None:
+        for event in events:
             if self.cancel_requested():
                 return
             self.robot.check()
@@ -365,16 +364,13 @@ class CameraCalibrationSession:
                     else:
                         self.calibration_saved = True
                         print(f"  calibration saved → {self.output_path} (serial: {self.serial})")
-            event = self.keys.pop_event()
 
     def run(self) -> int:
         self.prepare()
         exit_code = 1
         try:
-            self.keys = KeyboardInput(
+            self.keys = Keyboard(
                 quit_callback=self.runtime_state.request_quit,
-                capture_commands=False,
-                capture_raw_events=True,
                 estop_callback=self.runtime_state.request_emergency_stop,
             )
             self.keys.start()
@@ -390,7 +386,7 @@ class CameraCalibrationSession:
             self.sensors.start(
                 self.camera_process,
                 ready=self.sensors.channels.camera_ready,
-                timeout_s=self.runtime.safety.camera_ready_timeout_s,
+                timeout_s=CAMERA_READY_TIMEOUT_S,
                 may_start=lambda: self.keys.healthy and self.runtime_state.requests_allow_motion(),
             )
             self.robot.check()
@@ -434,12 +430,12 @@ class CameraCalibrationSession:
         return exit_code
 
     def close(self) -> bool:
-        clean = shutdown_local_runtime(
+        clean = close_runtime(
             self.runtime_state,
             self.robot,
             sensors=self.sensors,
             keyboard=self.keys,
-            timeout_s=self.runtime.safety.shutdown_timeout_s,
+            deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S,
         )
         if self.window_created:
             try:
@@ -498,7 +494,8 @@ class CameraCalibrationSession:
                 self.robot.stop()
                 return 0 if self.calibration_saved else 2
             self.show_preview()
-            self.handle_sample_events()
+            events = self.keys.poll(timeout=0)
+            self.handle_sample_events(events)
             if self.cancel_requested():
                 continue
             # Capture/solve can block; jog must use feedback read afterwards.
@@ -510,52 +507,39 @@ class CameraCalibrationSession:
             self.current_qpos = arm_state["qpos"]
             self.feedback_timestamp_ns = int(arm_state["timestamp_ns"])
 
-            if self.handle_home_key():
+            if "r" in events:
+                self.run_home()
                 if self.runtime_state.safety_state == SafetyState.FAULT:
                     return 1
                 continue
             self.motion_tick()
         return 0
 
-    def handle_home_key(self):
-        """Handle one return-home key edge and re-anchor the motion state."""
-        home_pressed = self.keys.is_pressed("r")
-        if not home_pressed:
-            self.home_key_down = False
-            return False
-        if self.home_key_down:
-            return False
-        self.home_key_down = True
+    def run_home(self):
         self.jog.clear_reference()
 
         if self.runtime_state.safety_state == SafetyState.RUNNING:
             if not self.runtime_state.revoke_motion(SafetyState.ARMED):
                 self.fault("failed to stop calibration motion before home")
-                return True
+                return
         self.robot.stop()
-        home_result = execute_arm_home(
-            self.runtime_state,
-            np.asarray(self.runtime.arm.home_qpos, dtype=np.float64),
-            robot=self.robot,
-            planner=self.home_planner,
-            config=self.runtime.arm,
+        home_result = home_arm(
+            self.runtime_state, self.robot, self.home_planner,
             service=lambda: service_feedback(self.robot, self.runtime),
-            estop_requested=lambda: self.keys.is_pressed("esc") or not self.keys.healthy,
-            cancel_requested=lambda: bool(self.runtime_state.quit_requested),
-            progress=lambda message: print(f"  {message}", flush=True),
+            cancel_requested=self.cancel_requested,
         )
         if self.runtime_state.estop_request:
             self.fault("operator e-stop during homing")
-            return True
+            return
         refreshed = self.robot.read_state().arm[0]
 
         self.current_qpos = np.asarray(refreshed["qpos"], dtype=np.float64)
         self.feedback_timestamp_ns = int(refreshed["timestamp_ns"])
         if not home_result.ok:
             print("  WARNING: return-home request was not executed")
-        self.jog.release_if_idle(self.keys.pressed_keys())
+        self.jog.release_if_idle(self.keys.snapshot()[0])
+        self.keys.discard_events("r")
         self.rate.reset()
-        return True
 
     def motion_tick(self):
         """构造 jog 目标，仅在公共提交正常返回后更新参考。"""
@@ -575,7 +559,7 @@ class CameraCalibrationSession:
                 self.runtime_state.revoke_motion()
                 self.robot.stop()
                 self.jog.clear_reference()
-            self.jog.release_if_idle(self.keys.pressed_keys())
+            self.jog.release_if_idle(self.keys.snapshot()[0])
             return
         keyboard = self.runtime.keyboard_teleop
         pressed_keys, generation = self.keys.snapshot()
@@ -699,8 +683,8 @@ class CameraCalibrationSession:
         self.calibration_config = calib_cfg
         self.aruco_config = aruco_cfg
         self.ctx = mp.get_context("spawn")
-        self.runtime_state = RuntimeState()
-        self.sensors = SensorProcesses(
+        self.runtime_state = SessionState()
+        self.sensors = SensorWorkers(
             SensorChannels(self.ctx, camera=self.runtime.camera)
         )
         self.keys = None
@@ -715,6 +699,5 @@ class CameraCalibrationSession:
         self.samples = CalibrationSamples()
         self.jog = JogController(solver, self.target_checker, self.runtime.keyboard_teleop, workspace)
         self.calibration_saved = False
-        self.home_key_down = False
         self.frame = 0
         self.last_ik_warning_s = self.last_boundary_warning_s = 0.0

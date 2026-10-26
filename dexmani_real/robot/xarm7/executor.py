@@ -18,7 +18,7 @@ from dexmani_real.robot.xarm7.protocol import (
 
 
 class ArmChannels:
-    """Fixed xArm channels created before spawn; no SDK or RuntimeState inside."""
+    """Fixed xArm channels created before spawn; no SDK or SessionState inside."""
 
     def __init__(self, ctx, *, run_signal, stop_signal, emergency_signal, signal_lock, input_signal=None):
         self.run_id, self.stop, self.emergency = run_signal, stop_signal, emergency_signal

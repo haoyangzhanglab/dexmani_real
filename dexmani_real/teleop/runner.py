@@ -12,14 +12,14 @@ from dexmani_real.data.recorder import (
 )
 from dexmani_real.data.session_results import error_detail
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
-from dexmani_real.runtime.motion.home import home_hand, home_robot
+from dexmani_real.runtime.home import home_hand, home_robot
+from dexmani_real.runtime.lifecycle import VR_READY_TIMEOUT_S
 from dexmani_real.runtime.observation import (
     check_observation,
     control_deadline_ns,
     read_observation,
     service_feedback,
 )
-from dexmani_real.runtime.operator_input import OperatorCommand
 from dexmani_real.runtime.state import RunEndReason, SafetyState
 from dexmani_real.utils.timing import sampling_clock_ns
 
@@ -201,8 +201,7 @@ class TeleopRunner:
         aborted = False
         terminal = tuple(
             cmd for cmd in (*commands, *self.keyboard.poll(timeout=0))
-            if cmd in (OperatorCommand.EMERGENCY_STOP, OperatorCommand.QUIT,
-                       OperatorCommand.STOP, OperatorCommand.DISCARD)
+            if cmd in ("esc", "q", "s", "d")
         )
         if terminal:
             self.handle_commands(terminal, self.runtime_state.run_id)
@@ -217,7 +216,7 @@ class TeleopRunner:
         )
 
     def preparation_valid(self):
-        return self.runtime_state.command_may_cross_sdk(
+        return self.runtime_state.can_move(
             run_id=self.preparing_epoch,
             required_safety_state=SafetyState.ARMED,
         )
@@ -290,7 +289,7 @@ class TeleopRunner:
             self.stop_capture("preparation_revoked")
 
     def handle_operator_command(self, cmd, *, home_commands=(), expected_run_id=None) -> bool:
-        if cmd is OperatorCommand.EMERGENCY_STOP:
+        if cmd == "esc":
             self.runtime_state.request_emergency_stop()
             self.audio.play("emergency")
             return True
@@ -301,19 +300,19 @@ class TeleopRunner:
             or not self.runtime_state.running
         ):
             return True
-        if cmd is OperatorCommand.QUIT:
+        if cmd == "q":
             self.runtime_state.request_quit()
             self.stop_control("quit", run_end_reason=RunEndReason.QUIT)
             self.end_segment(True, "quit", announce=False)
             self.audio.play("end")
             return True
-        elif cmd in (OperatorCommand.STOP, OperatorCommand.DISCARD):
-            reason = cmd.value.lower()
-            if cmd is OperatorCommand.DISCARD and self.recorder is not None:
+        elif cmd in ("s", "d"):
+            reason = "stop" if cmd == "s" else "discard"
+            if cmd == "d" and self.recorder is not None:
                 self.discard_requested = True
             self.stop_control(reason)
-            self.end_segment(cmd is OperatorCommand.STOP, reason)
-        elif cmd is OperatorCommand.RESET_TACTILE:
+            self.end_segment(cmd == "s", reason)
+        elif cmd == "t":
             if (
                 self.preparing_epoch is not None
                 or self.phase is not TeleopPhase.IDLE
@@ -328,22 +327,18 @@ class TeleopRunner:
             except CancelledError as exc:
                 logger.info("%s", exc)
             finally:
-                self.keyboard.drain_signal(OperatorCommand.RESET_TACTILE)
-                self.keyboard.drain_signal(OperatorCommand.BEGIN)
+                self.keyboard.discard_events("t", "b")
             return True
-        elif cmd is OperatorCommand.HOME:
+        elif cmd == "h":
             if not self.stop_control("home", expected_run_id=expected_run_id):
                 return True
             self.end_segment(True, "home")
             if not self.poll_blocking_commands(home_commands):
                 self.audio.play("home")
                 result = home_robot(
-                    self.runtime_state,
-                    self.runtime.arm, self.runtime.hand,
-                    self.home_planner,
-                    robot=self.robot,
+                    self.runtime_state, self.robot, self.home_planner,
                     service=lambda: service_feedback(self.robot, self.runtime),
-                    abort_requested=self.poll_blocking_commands,
+                    cancel_requested=self.poll_blocking_commands,
                 )
                 if result.ok:
                     self.audio.play("home_done", interrupt=False)
@@ -353,15 +348,12 @@ class TeleopRunner:
                     raise RuntimeError(f"HOME failed: {result.reason}")
             self.poll_blocking_commands()
             return True
-        elif cmd is OperatorCommand.BEGIN and self.phase is TeleopPhase.IDLE:
+        elif cmd == "b" and self.phase is TeleopPhase.IDLE:
             self.start_segment(expected_run_id)
         return False
 
     def handle_commands(self, commands, expected_run_id):
-        for terminal in (
-            OperatorCommand.EMERGENCY_STOP, OperatorCommand.QUIT,
-            OperatorCommand.STOP, OperatorCommand.DISCARD,
-        ):
+        for terminal in ("esc", "q", "s", "d"):
             if terminal in commands:
                 commands = [terminal]
                 break
@@ -369,7 +361,7 @@ class TeleopRunner:
             if self.handle_operator_command(
                 cmd,
                 expected_run_id=expected_run_id,
-                home_commands=commands[index + 1 :] if cmd is OperatorCommand.HOME else (),
+                home_commands=commands[index + 1 :] if cmd == "h" else (),
             ):
                 break
 
@@ -422,7 +414,7 @@ class TeleopRunner:
                 candidate = RobotCommand(epoch, action_result.arm_qpos, action_result.hand_qpos)
                 if self.recorder is not None:
                     self.recorder.check_error()
-                if not self.runtime_state.command_may_cross_sdk(run_id=epoch):
+                if not self.runtime_state.can_move(run_id=epoch):
                     raise OperationCancelled("teleop cancelled before submission")
                 if time.monotonic_ns() >= deadline_ns:
                     raise TimeoutError("teleop expired before submission")
@@ -481,7 +473,7 @@ class TeleopRunner:
             self.recorder.add_frame(row, command)
 
     def wait_for_vr(self) -> bool:
-        deadline = time.monotonic() + self.runtime.safety.vr_ready_timeout_s
+        deadline = time.monotonic() + VR_READY_TIMEOUT_S
         while True:
             if not self.keyboard.healthy:
                 self.runtime_state.request_emergency_stop()
@@ -497,17 +489,14 @@ class TeleopRunner:
     def initialize(self) -> bool:
         # Keyboard callbacks are active before the startup hand HOME.
         home_result = home_hand(
-            self.runtime_state,
-            self.runtime.hand,
-            robot=self.robot,
-            abort_requested=self.poll_blocking_commands,
+            self.runtime_state, self.robot,
+            cancel_requested=self.poll_blocking_commands,
         )
         if not home_result.ok:
             if home_result.interrupted:
                 self.runtime_state.request_quit()
                 return False
             raise RuntimeError(f"startup hand home failed: {home_result.reason}")
-        self.robot.stop()
         if self.poll_blocking_commands():
             return False
         self.sensors.start(

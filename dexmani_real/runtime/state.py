@@ -1,4 +1,4 @@
-"""Coordinator-owned lifecycle; only run identity and stop signals cross spawn."""
+"""会话持有运行状态，仅运行代际与停止信号跨进程共享。"""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ class SafetyState(IntEnum):
 
 
 class RunEndReason(IntEnum):
-    """First software RUNNING termination cause; never physical convergence."""
+    """保留本轮首次终止原因，不表示物理收敛。"""
 
     NONE = 0
     EXECUTOR_BOUNDARY = 1
@@ -34,7 +34,7 @@ class RunEndReason(IntEnum):
 
 
 @dataclass
-class RuntimeState:
+class SessionState:
     running: bool = True
     run_ended_id: int = 0
     run_ended_reason: RunEndReason = RunEndReason.NONE
@@ -43,7 +43,7 @@ class RuntimeState:
     quit_requested: bool = False
     stop_request: bool = False
     safety_state: SafetyState = SafetyState.DISARMED
-    # The shared lock protects only identity/stop transitions, never SDK I/O.
+    # 共享锁仅保护代际与停止状态，SDK I/O 在锁外执行。
     motion_lock: AbstractContextManager = field(
         default_factory=lambda: mp.get_context("spawn").RLock(), repr=False
     )
@@ -83,8 +83,7 @@ class RuntimeState:
             self.safety_state = SafetyState.RUNNING
             return self.run_id, started
 
-    def command_may_cross_sdk(self, *, run_id, required_safety_state=SafetyState.RUNNING):
-        """Last software fence; the subsequent SDK call runs without this lock."""
+    def can_move(self, *, run_id, required_safety_state=SafetyState.RUNNING):
         with self.motion_lock:
             return (
                 self.requests_allow_motion()
@@ -121,7 +120,7 @@ class RuntimeState:
             return True
 
     def request_emergency_stop(self):
-        # Reach the SDK owner before any local authority bookkeeping can wait.
+        # 先通知 SDK 所属进程，再等待本地状态锁。
         self.emergency_signal.set()
         self.stop_signal.set()
         with self.motion_lock:
@@ -137,7 +136,7 @@ class RuntimeState:
                 )
 
     def mark_error(self):
-        """Latch a session error without conflating it with a hardware FAULT."""
+        """会话错误独立于硬件 FAULT 锁存。"""
         with self.motion_lock:
             self.error_state = True
             self.stop_signal.set()
@@ -150,7 +149,7 @@ class RuntimeState:
                 self.revoke_motion(reason=reason)
 
     def acknowledge_stop(self, expected_run_id):
-        """Only an owner which finished stopping may clear this generation's fence."""
+        """完成停止的所有者只能确认对应代际的请求。"""
         with self.motion_lock:
             if self.run_id == expected_run_id and self.safety_state != SafetyState.RUNNING:
                 self.stop_request = False
@@ -160,14 +159,10 @@ class RuntimeState:
             self.quit_requested = True
             self.request_stop(reason=RunEndReason.QUIT)
 
-    def end_session(self, *, reason=RunEndReason.RUNTIME_SHUTDOWN, fault=False) -> None:
-        """Fence motion before the resource owner notifies workers or closes devices."""
+    def end_session(self, *, reason=RunEndReason.RUNTIME_SHUTDOWN) -> None:
         with self.motion_lock:
             self.running = False
-            if fault:
-                self.mark_error()
-                self.revoke_motion(SafetyState.FAULT, reason=reason)
-            elif self.safety_state == SafetyState.RUNNING:
+            if self.safety_state == SafetyState.RUNNING:
                 self.revoke_motion(reason=reason)
             else:
                 self.stop_signal.set()

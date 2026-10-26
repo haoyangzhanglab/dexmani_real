@@ -149,7 +149,7 @@ class PolicyEpisode:
         self.finish(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
 
     def has_motion_authority(self):
-        return self.runtime_state.command_may_cross_sdk(run_id=self.run_id)
+        return self.runtime_state.can_move(run_id=self.run_id)
 
     def finish(self, detail, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY, errors=None):
         if self.termination is not None:
@@ -240,7 +240,7 @@ class PolicyEpisode:
             raise failure
 
     def preparation_valid(self):
-        return self.runtime_state.command_may_cross_sdk(
+        return self.runtime_state.can_move(
             run_id=self.preparing_epoch,
             required_safety_state=SafetyState.ARMED,
         )

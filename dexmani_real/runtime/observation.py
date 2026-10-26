@@ -1,4 +1,4 @@
-"""One immutable consumption snapshot; consumers admit physical sources independently."""
+"""按需读取传感器快照，保留各来源时间与相机帧对应关系。"""
 
 import json
 import logging
@@ -97,7 +97,7 @@ def freeze(value):
 
 
 @dataclass(frozen=True)
-class ObservationRow:
+class Observation:
     arm: np.ndarray
     hand: np.ndarray | None
     camera: Mapping | None
@@ -129,8 +129,8 @@ def read_observation(
         else:
             camera = read_camera_frame(channels, payload=needs.camera)
     vr = read_vr_frame(channels) if needs.vr else None
-    return ObservationRow(
-        arm=freeze(state.arm), hand=freeze(state.hand),
+    return Observation(
+        arm=state.arm, hand=state.hand,
         camera=freeze(camera), vr=freeze(vr),
         point_cloud=freeze(cloud["point_cloud"]) if cloud is not None else None,
         observation_timestamp_ns=time.monotonic_ns(), control_timestamp_ns=control_ns,
@@ -192,7 +192,7 @@ def control_deadline_ns(feedback_until_ns, arm_config, *, now_ns=None):
 
 
 def service_feedback(robot, runtime):
-    """Coordinator preparation/HOME service; only motion feedback renews its bounded health."""
+    """准备与 HOME 期间，仅由有效运动反馈更新控制期限。"""
     needs = ObservationNeeds()
     row = read_observation(None, robot, needs=needs)
     issues, feedback_until_ns = check_observation(

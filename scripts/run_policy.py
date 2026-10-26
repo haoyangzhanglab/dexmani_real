@@ -167,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"# {name}: {getattr(args, name)}")
         print(yaml.safe_dump(
             {name: asdict(getattr(runtime, name)) for name in (
-                "execution", "arm", "hand", "motion", "safety", "camera", "environment",
+                "execution", "arm", "hand", "motion", "camera", "environment",
             )}, allow_unicode=True, sort_keys=False,
         ), end="")
         return 0

@@ -12,7 +12,6 @@ if TYPE_CHECKING:
 
 
 def validate_robot_config(cfg: ExperimentConfig) -> None:
-    """Values used by every robot owner, including HOME and hand-disabled geometry."""
     cfg.arm.validate()
     if not all(np.isfinite(value) and value > 0 for value in astuple(cfg.arm.homing)):
         raise ValueError("all homing parameters must be finite and positive")
@@ -20,8 +19,6 @@ def validate_robot_config(cfg: ExperimentConfig) -> None:
         cfg.hand.validate()
     else:
         cfg.hand.validate_home_pose()
-    if not all(np.isfinite(value) and value > 0 for value in astuple(cfg.safety)):
-        raise ValueError("safety timeouts must be finite and positive")
     if cfg.environment.table.enabled:
         cfg.environment.table.validate()
     for box in cfg.environment.static_boxes:
@@ -32,7 +29,6 @@ def validate_robot_config(cfg: ExperimentConfig) -> None:
 
 
 def validate_control_rate(cfg: ExperimentConfig, control_hz: float) -> None:
-    """Validate cadence before connecting; never silently decimate hand targets."""
     if not np.isfinite(control_hz) or not 0 < control_hz <= cfg.arm.servo_hz:
         raise ValueError("target frequency must be positive and no greater than arm.servo_hz")
     if 1 / control_hz >= cfg.arm.feedback_max_age_s:
@@ -46,3 +42,19 @@ def validate_control_rate(cfg: ExperimentConfig, control_hz: float) -> None:
             raise ValueError(
                 "target period must fit hand.feedback_max_age_s; configure both explicitly"
             )
+
+
+def validate_keyboard_workspace(runtime: ExperimentConfig) -> np.ndarray:
+    cfg = runtime.keyboard_teleop
+    for name in ("target_max_age_s", "delta_pos_m", "delta_rpy_rad"):
+        value = getattr(cfg, name)
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"keyboard {name} must be finite and positive")
+    margin = cfg.workspace_command_margin_m
+    if not np.isfinite(margin) or margin < 0:
+        raise ValueError("workspace_command_margin_m must be finite and non-negative")
+    validate_control_rate(runtime, cfg.control_hz)
+    workspace = runtime.environment.workspace.as_array()
+    if np.any(workspace[:, 0] + margin >= workspace[:, 1] - margin):
+        raise ValueError("keyboard workspace command margin leaves no interior workspace")
+    return workspace

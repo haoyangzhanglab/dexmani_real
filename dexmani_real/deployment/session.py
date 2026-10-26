@@ -28,20 +28,26 @@ from dexmani_real.deployment.rollout.episode import PolicyEpisode, failure_reaso
 from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.system import DexManiRobot
-from dexmani_real.runtime.motion.home import home_robot
+from dexmani_real.runtime.home import home_robot
+from dexmani_real.runtime.keyboard import Keyboard
+from dexmani_real.runtime.lifecycle import (
+    CAMERA_READY_TIMEOUT_S,
+    POINTCLOUD_READY_TIMEOUT_S,
+    SHUTDOWN_TIMEOUT_S,
+    SensorWorkers,
+    close_runtime,
+)
 from dexmani_real.runtime.observation import (
     service_feedback,
     snapshot_camera_parameters,
 )
-from dexmani_real.runtime.operator_input import KeyboardInput, OperatorCommand
-from dexmani_real.runtime.sensor_processes import SensorProcesses
-from dexmani_real.runtime.shutdown import shutdown_local_runtime
-from dexmani_real.runtime.state import RunEndReason, RuntimeState, SafetyState
+from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.camera.worker import run_camera_worker
 from dexmani_real.utils.atomic_io import atomic_yaml_dump
 from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger(__name__)
+MODEL_STARTUP_TIMEOUT_S = 300.0
 
 
 class PolicySession:
@@ -142,7 +148,7 @@ class PolicySession:
             self.camera_calibration = None
         self.camera_snapshot = None
         self.process_context = mp.get_context("spawn")
-        self.runtime_state = RuntimeState()
+        self.runtime_state = SessionState()
         channels = (
             SensorChannels(
                 self.process_context,
@@ -154,7 +160,7 @@ class PolicySession:
             if self.needs.camera_worker
             else None
         )
-        self.sensors = SensorProcesses(channels)
+        self.sensors = SensorWorkers(channels)
         self.robot = DexManiRobot(
             self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
             stop_signal=self.runtime_state.stop_signal,
@@ -206,7 +212,7 @@ class PolicySession:
         self.home_planner = HomePlanner(
             self.runtime.environment, table_plane_abcd=self.table_plane_abcd,
         )
-        self.keyboard = KeyboardInput(
+        self.keyboard = Keyboard(
             estop_callback=self.runtime_state.request_emergency_stop,
             stop_callback=self.request_stop,
             quit_callback=self.request_quit,
@@ -239,7 +245,7 @@ class PolicySession:
                     args=(self.sensors.channels, self.runtime.camera),
                 ),
                 ready=self.sensors.channels.camera_ready,
-                timeout_s=self.runtime.safety.camera_ready_timeout_s,
+                timeout_s=CAMERA_READY_TIMEOUT_S,
                 may_start=lambda: self.keyboard.healthy and self.runtime_state.requests_allow_motion(),
             )
             self.camera_snapshot = snapshot_camera_parameters(
@@ -271,12 +277,12 @@ class PolicySession:
                     ),
                 ),
                 ready=self.sensors.channels.pointcloud_ready,
-                timeout_s=self.runtime.safety.pointcloud_ready_timeout_s,
+                timeout_s=POINTCLOUD_READY_TIMEOUT_S,
                 may_start=lambda: self.keyboard.healthy and self.runtime_state.requests_allow_motion(),
             )
         if self.needs.camera_static and self.needs.camera == "none" and not self.needs.point_cloud:
             # Policy 无 VR worker，此分支只持有已初始化的相机。
-            if not self.sensors.shutdown(graceful_timeout_s=self.runtime.safety.shutdown_timeout_s):
+            if not self.sensors.shutdown(deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S):
                 raise RuntimeError("static camera failed to close normally")
             self.sensors.channels = None
         self.robot.check()
@@ -286,7 +292,7 @@ class PolicySession:
         shutdown_clean = False
         model_close = dict(status="completed", reason="model_not_created")
         # Sensor joins and model cleanup share the remaining budget; SDK/recorder calls may exceed it.
-        shutdown_deadline = time.monotonic() + self.runtime.safety.shutdown_timeout_s
+        shutdown_deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
         cleanup_errors = []
         if self.runtime_state is not None:
             try:
@@ -315,12 +321,12 @@ class PolicySession:
                 except Exception as exc:
                     cleanup_errors.append(error_detail("recorder_close", exc))
             if self.runtime_state is not None:
-                shutdown_clean = shutdown_local_runtime(
+                shutdown_clean = close_runtime(
                     self.runtime_state,
                     self.robot,
                     sensors=self.sensors,
                     keyboard=self.keyboard,
-                    timeout_s=max(0.0, shutdown_deadline - time.monotonic()),
+                    deadline=shutdown_deadline,
                 )
             else:
                 shutdown_clean = True
@@ -366,7 +372,7 @@ class PolicySession:
         return int(not successful)
 
     def warmup_policy(self):
-        timeout_s = self.runtime.safety.model_startup_timeout_s
+        timeout_s = MODEL_STARTUP_TIMEOUT_S
         deadline = time.monotonic() + timeout_s
         self.model.submit(
             "load",
@@ -420,11 +426,9 @@ class PolicySession:
         discard_preparation_in_batch = False
         home_handled_in_batch = False
         # S/Q suppress H/B/T throughout the batch; ESC uses the latch/callback.
-        stop_in_batch = any(
-            signal in {OperatorCommand.STOP, OperatorCommand.QUIT} for signal in signals
-        )
+        stop_in_batch = any(signal in {"s", "q"} for signal in signals)
         for signal in signals:
-            if signal is OperatorCommand.BEGIN:
+            if signal == "b":
                 if stop_in_batch:
                     logger.warning("operator: ignored B received in the same batch as S/Q")
                     continue
@@ -433,12 +437,12 @@ class PolicySession:
                         "operator: ignored B while stopped or after preparation in this batch"
                     )
                     continue
-            elif signal is OperatorCommand.STOP:
+            elif signal == "s":
                 # Keyboard callbacks already revoked motion; a second revoke could cross a cleared stop request.
                 continue
-            elif signal is OperatorCommand.DISCARD:
+            elif signal == "d":
                 logger.warning("operator: D is not used in policy deployment; ignored")
-            elif signal is OperatorCommand.RESET_TACTILE:
+            elif signal == "t":
                 if discard_preparation_in_batch:
                     logger.warning("operator: ignored T after preparation in the same batch")
                     continue
@@ -459,14 +463,9 @@ class PolicySession:
                 except CancelledError as exc:
                     logger.info("%s", exc)
                 finally:
-                    for command in (
-                        OperatorCommand.RESET_TACTILE,
-                        OperatorCommand.HOME,
-                        OperatorCommand.BEGIN,
-                    ):
-                        self.keyboard.drain_signal(command)
+                    self.keyboard.discard_events("t", "h", "b")
                 return
-            elif signal is OperatorCommand.HOME:
+            elif signal == "h":
                 if home_handled_in_batch:
                     continue
                 if stop_in_batch:
@@ -475,16 +474,16 @@ class PolicySession:
                 if self.run_home():
                     home_handled_in_batch = True
                     discard_preparation_in_batch = True
-            elif signal is OperatorCommand.QUIT:
+            elif signal == "q":
                 # Listener stays available through final recording cleanup.
                 continue
-            elif signal is OperatorCommand.EMERGENCY_STOP:
+            elif signal == "esc":
                 self.runtime_state.request_emergency_stop()
                 return
 
     def run_home(self) -> bool:
         with self.runtime_state.motion_lock:
-            home_allowed = self.runtime_state.command_may_cross_sdk(
+            home_allowed = self.runtime_state.can_move(
                 run_id=self.runtime_state.run_id,
                 required_safety_state=SafetyState.ARMED,
             )
@@ -499,18 +498,15 @@ class PolicySession:
         try:
             logger.info("正在回初始位…")
             result = home_robot(
-                self.runtime_state,
-                self.runtime.arm, self.runtime.hand,
-                self.home_planner,
-                robot=self.robot,
+                self.runtime_state, self.robot, self.home_planner,
                 service=lambda: service_feedback(self.robot, self.runtime),
-                abort_requested=self.home_abort_requested,
+                cancel_requested=self.home_abort_requested,
             )
         except BaseException as exc:
             home_result.update(outcome="fault", reason=f"{type(exc).__name__}: {exc}")
             raise
         with self.runtime_state.motion_lock:
-            completed_without_stop = result.ok and self.runtime_state.command_may_cross_sdk(
+            completed_without_stop = result.ok and self.runtime_state.can_move(
                 run_id=self.runtime_state.run_id,
                 required_safety_state=SafetyState.ARMED,
             )
@@ -538,9 +534,7 @@ class PolicySession:
         else:
             logger.warning("回初始位未完成，请检查当前姿态：%s", result.reason)
         # Discard stale H/B/T after blocking HOME; preserve S/Q/ESC.
-        self.keyboard.drain_signal(OperatorCommand.RESET_TACTILE)
-        self.keyboard.drain_signal(OperatorCommand.HOME)
-        self.keyboard.drain_signal(OperatorCommand.BEGIN)
+        self.keyboard.discard_events("t", "h", "b")
         return True
 
     def home_abort_requested(self) -> bool:
@@ -558,7 +552,7 @@ class PolicySession:
             if self.episode is not None or self.model.has_pending_task:
                 return False
             epoch = self.runtime_state.run_id
-            if not self.runtime_state.command_may_cross_sdk(
+            if not self.runtime_state.can_move(
                 run_id=epoch, required_safety_state=SafetyState.ARMED,
             ):
                 return False
@@ -570,7 +564,7 @@ class PolicySession:
             epoch, self.start_epoch = self.start_epoch, None
             if shutdown or epoch is None:
                 return
-            if not self.runtime_state.command_may_cross_sdk(
+            if not self.runtime_state.can_move(
                 run_id=epoch, required_safety_state=SafetyState.ARMED,
             ):
                 return
@@ -620,7 +614,7 @@ class PolicySession:
             ended = episode.termination
             if before is None and ended is not None:
                 self.start_epoch = None
-                self.keyboard.drain_signal(OperatorCommand.BEGIN)
+                self.keyboard.discard_events("b")
                 if ended.run_id is not None:
                     self.completed += 1
                     normal = ended.reason in {"operator", "quit"} or (
