@@ -5,7 +5,15 @@ from enum import Enum
 
 import numpy as np
 
-from dexmani_real.robot.feedback import ARM_STATE_DTYPE
+from dexmani_real.robot.model import ARM_JOINT_SHAPE
+
+ARM_STATE_DTYPE = np.dtype(
+    [
+        ("qpos", "<f8", ARM_JOINT_SHAPE),
+        ("qvel", "<f8", ARM_JOINT_SHAPE),
+        ("timestamp_ns", "<u8"),
+    ]
+)
 
 MAX_TIME = 2**63 - 1
 GOAL_DTYPE = np.dtype(

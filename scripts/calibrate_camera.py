@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from dexmani_real.calibration.paths import CAMERAS_PATH
+from dexmani_real.calibration import CAMERAS_PATH
 from dexmani_real.config import load_experiment_config
 
 

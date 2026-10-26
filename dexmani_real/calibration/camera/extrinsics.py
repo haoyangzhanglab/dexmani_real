@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.calibration.paths import CAMERAS_PATH
+from dexmani_real.calibration import CAMERAS_PATH
 from dexmani_real.geometry.transforms import (
     validate_rigid_transform,
     validate_unit_quaternion_wxyz,

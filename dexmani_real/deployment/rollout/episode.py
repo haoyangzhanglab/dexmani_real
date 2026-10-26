@@ -13,6 +13,7 @@ from dexmani_real.control.online_ik import IKFailureKind
 from dexmani_real.data.recorder import (
     RecordingError,
     snapshot_recording_metadata,
+    snapshot_recording_result,
 )
 from dexmani_real.data.session_results import error_detail
 from dexmani_real.deployment.policy_observation import (
@@ -218,29 +219,17 @@ class PolicyEpisode:
     def finalize_outputs(self, reason, detail, errors, *, duration_s, capture_failed):
         failure, raw = None, None
         if self.recorder is not None and self.recorder.start_attempted:
-            saved = None
             try:
-                saved = self.recorder.save_episode(
+                self.recorder.finish(
+                    save=True,
                     reason=reason,
                     details=[dict(stage="termination", reason=detail), *errors],
                     technical_status="failed" if capture_failed else "normal",
                 )
-                status = "published" if saved is not None else "not_published"
             except BaseException as exc:
                 failure = exc
-                saved = self.recorder.published_path
-                status = (
-                    "published" if saved is not None
-                    else "pending" if self.recorder.writer_pending else "failed"
-                )
                 errors.append(error_detail("recorder_finalize", exc))
-            staging = self.recorder.staging_path
-            raw = dict(
-                status=status,
-                path=str(saved) if saved is not None else None,
-                staging_path=str(staging) if staging is not None and saved is None else None,
-                row_count=self.recorder.written_frames,
-            )
+            raw = snapshot_recording_result(self.recorder, failed=failure is not None)
         try:
             self.results.finish_episode(
                 reason, details=detail, errors=errors, raw=raw, duration_s=duration_s

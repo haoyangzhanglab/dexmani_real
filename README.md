@@ -39,7 +39,7 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 标定与设备诊断为这些流程提供共同的实验支持。
 
-相机标定算法、外参读写与交互会话位于 [`calibration/camera/`](dexmani_real/calibration/camera/)，桌面拟合与读写位于 [`calibration/table_plane.py`](dexmani_real/calibration/table_plane.py)，VR 对齐与启动质量检查位于 [`calibration/vr_alignment.py`](dexmani_real/calibration/vr_alignment.py)。默认参数集中在 [`calibration/parameters/`](dexmani_real/calibration/parameters/)，由轻量的 `calibration/paths.py` 定位，消费者需要时才读取。
+相机标定位于 [`calibration/camera/`](dexmani_real/calibration/camera/)，其中 `capture.py` 负责静止采样，`session.py` 负责运动、样本管理与标定发布。桌面拟合与质量评估位于 [`geometry/plane.py`](dexmani_real/geometry/plane.py)，路径解析和标定读写位于 [`calibration/table_plane.py`](dexmani_real/calibration/table_plane.py)；VR 对齐与启动质量检查位于 [`calibration/vr_alignment.py`](dexmani_real/calibration/vr_alignment.py)。默认参数集中在 [`calibration/parameters/`](dexmani_real/calibration/parameters/)，路径常量由 `dexmani_real.calibration` 提供，消费者需要时才读取。
 
 实验配置使用 `from dexmani_real.config import load_experiment_config`，覆盖优先级为 CLI > YAML > dataclass 默认值。配置加载不读取标定或连接设备，运行约束在使用边界验证。`environment.table.plane_path` 的相对路径以仓库根目录解析；显式指定的必需标定缺失时直接报错。VR 标定脚本的 `--force` 仅允许将低质量结果导出到显式指定、非默认且未占用的 `--output` 文件；遥操作启动仍拒绝低质量标定。
 
@@ -51,7 +51,17 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 `control/joint_angles.py` 统一关节等价角、绝对跳变阈值和关节目标拒绝规则，由 `target_validation.py` 与 `online_ik.py` 直接使用；纯关节检查不依赖 IK 求解器。
 
+点云的 RGB-D 处理流程位于 `perception/pointcloud/processing.py`，体素聚合、连通域过滤和采样位于 `sampling.py`，诊断输出与性能测量位于 `diagnostics.py`。XHand 的 SDK 载荷解析、反馈布局与缓存位于 `robot/xhand/feedback.py`；机械臂反馈布局位于 `robot/xarm7/protocol.py`。
+
+`JogController.submit()` 负责输入代际、运动授权和提交后参考更新。录制使用 `AsyncEpisodeRecorder.finish()` 显式指定保存意图、终止原因和技术状态。
+
 项目依赖与打包配置见 [`pyproject.toml`](pyproject.toml)，开发约定见 [`AGENTS.md`](AGENTS.md)。
+
+## 迁移说明
+
+默认标定由 `dexmani_real/state/*.json` 迁至 `dexmani_real/calibration/parameters/*.json`。外部 YAML 若显式配置旧路径，需要手动更新；缺失文件仍报错，不会静默改用默认标定。
+
+原有 `planning` 等模块路径已迁移，外部导入需按上方模块导航同步更新。`SafetyParams` 改名为 `RuntimeTimeouts`，`EpisodeResults` 改名为 `SessionResults`；YAML `safety` 键、现有结果字段及输出目录仍保持原有含义。
 
 ## 观测与产物契约
 
@@ -59,15 +69,16 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 `termination_reason` 保留首次终止原因，`technical_status` 反映该次产物的技术完成状态，发布状态单独描述文件是否已发布。发布前已知的停止或录制失败不会因为首次原因是 operator、quit 或正常时长结束而变为技术正常。失败产物可保留有效数据前缀；已发布 Raw 不因后续独立会话清理错误而回写。Teleop 的显式 DISCARD 在停止失败时仍保持丢弃意图。
 
-`EpisodeReader.read_timing_rows(fields)` 按请求顺序返回 `timing/rows` 的结构化字段，验证当前 schema、dtype 和行数，保留 `int64` 纳秒及 `-1` 缺失标记。诊断读取不隐式执行训练或物理回放准入；Canonical 导出与物理回放均显式调用 `validate_completion()`、`validate_rows()` 执行各自所需的技术状态和时序检查。CordViP 可读取失败产物或缺失来源时钟的诊断数据，但同一 Raw 行不能证明手和相机物理同步。Reader 关闭后文件读取与校验接口报错，已返回的 NumPy 数组仍可使用。
+Teleop 中断会登记技术失败并传播，关闭时继续按原保存或丢弃意图收尾；recorder 的首次收尾请求不会被重入覆盖。收尾超时仍报告 pending，不在同一次关闭中重新开启等待预算。Policy 在会话关闭末尾核对对应 episode 的 Raw 发布状态、实际路径和帧数，再写入 `session_result.json`；该摘要反映最后一次确认，不保证仍 pending 的 writer 之后的结果，也不会清除首次终止原因或已有错误。
+
+`EpisodeReader` 在首次读取时统一校验已定义数值字段和 `timing/rows` 的布局，并缓存数据集。`read_timing_rows(fields)` 按请求顺序返回结构化字段，保留 `int64` 纳秒及 `-1` 缺失标记。诊断读取不隐式执行训练或物理回放准入；Canonical 导出与物理回放均显式调用 `validate_completion()`、`validate_rows()` 执行各自所需的技术状态和时序检查。CordViP 可读取失败产物或缺失来源时钟的诊断数据，但同一 Raw 行不能证明手和相机物理同步。Reader 关闭后文件读取与校验接口报错，已返回的 NumPy 数组仍可使用。
 
 ## 离线验证
 
-在已安装项目及测试依赖的 Python 环境中运行：
+在已安装项目及相关依赖的 Python 环境中运行：
 
 ```bash
-PYTHONPATH=third_party/cordvip_geometry/src python -m unittest discover -s tests -p 'test_*.py' -v
-python -m compileall -q dexmani_real scripts tests
+python -m compileall -q dexmani_real scripts
 python scripts/run_policy.py --print-config
 python scripts/collect_teleop.py --print-config
 git diff --check
@@ -76,7 +87,7 @@ git diff --check
 已有 Ruff/mypy 的开发环境可补充静态检查，无需为运行实验安装它们：
 
 ```bash
-ruff check --isolated --select E9,F dexmani_real scripts tests third_party/cordvip_geometry/src/cordvip_geometry/integrations/dexmani.py
+ruff check --no-cache --isolated --select E9,F dexmani_real scripts third_party/cordvip_geometry/src
 mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases \
   dexmani_real/geometry dexmani_real/perception dexmani_real/control \
   dexmani_real/calibration dexmani_real/runtime dexmani_real/deployment \
@@ -87,8 +98,8 @@ mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases \
 
 mypy 按现有类型标注检查上述模块，不检查未标注函数体或外部无类型声明的 SDK；不能替代数值与运行边界测试。
 
-数值测试使用真实 Pinocchio、MPlib、trimesh、OpenCV 和 fpsample；部署契约测试还需要可导入的 `dexmani_policy` 与其配置依赖。上述 `PYTHONPATH` 让 CordViP 回归直接使用仓内源码，无需额外安装该包。Raw 回归使用 h5py 和 PyAV 的实际 H.264 编解码。缺失依赖必须单独记录，不能将导入失败或全部跳过视为通过。键盘遥操作入口保留 `--help`，没有 `--print-config` 参数。
+键盘遥操作入口保留 `--help`，没有 `--print-config` 参数。
 
-测试覆盖共享表示、控制候选、碰撞诊断、调度边界、来源时钟、运行状态、模型线程及清理行为。标定和点云测试使用合成 RGB-D 与真实共享内存；Raw 测试在临时目录实际写入、发布并读取 HDF5/视频，验证失败产物准入及 CordViP 消费。设备和策略模型使用替身，hand-cloud 接口测试替换昂贵几何计算。真机启停、取消/急停、HOME/jog、遥操作录制、三种策略模式和回放仍需操作者单独验收。软件授权撤销和 SDK 接受请求不代表物理停稳或到位。
+真机启停、取消/急停、HOME/jog、遥操作录制、三种策略模式和回放仍需操作者单独验收。软件授权撤销和 SDK 接受请求不代表物理停稳或到位。
 
 默认标定 JSON 随 wheel 打包；机器人 `assets/` 仍沿用 checkout 定位方式，验证 wheel 中的 JSON 不等于验证了完整独立安装的机器人运行环境。

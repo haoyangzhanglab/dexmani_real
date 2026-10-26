@@ -32,8 +32,7 @@ class SceneCloudResult:
 
 
 def extract_scene_clouds(rgb, depth_m, K, masks, *, pixel_stride=2):
-    """Backproject exclusive same-frame masks without repairing holes or overlaps.
-    Zero depth is missing; coverage is measured points/exclusive sampled pixels, not confidence."""
+    """反投影互斥掩码中的非零实测深度；coverage 为有效点占独占采样像素的比例。"""
     if (
         isinstance(pixel_stride, bool)
         or not isinstance(pixel_stride, (int, np.integer))
@@ -77,7 +76,7 @@ def extract_scene_clouds(rgb, depth_m, K, masks, *, pixel_stride=2):
             ).astype(np.float32)
         if not np.isfinite(points).all():
             raise ValueError(f"Observed points for {name!r} exceed the finite float32 range")
-        colors = sampled_rgb[selected].copy()
+        colors = sampled_rgb[selected]
         observed_mask = np.zeros(shape, dtype=bool)
         observed_mask[sample] = selected
         count = len(points)
@@ -113,9 +112,7 @@ def extract_scene_clouds(rgb, depth_m, K, masks, *, pixel_stride=2):
 
 
 def add_model_depth_support(measured, model_depths, *, depth_tolerance_m=0.015):
-    """Add same-grid model-Z comparisons in place, preserving measured pixel ordering.
-    Coverage/support use measured-point counts; missing model depth is zero, undefined metrics None.
-    """
+    """原位附加同网格模型深度比较；保持实测点序，缺失模型深度为零、未定义指标为 None。"""
     if not isinstance(model_depths, dict) or not model_depths.keys() <= measured.objects.keys():
         raise ValueError("model_depths must name measured objects")
     if not model_depths:
@@ -155,9 +152,9 @@ def add_model_depth_support(measured, model_depths, *, depth_tolerance_m=0.015):
         residual = np.full(count, np.nan, dtype=np.float32)
         residual[comparable] = points[comparable, 2] - model_depth[comparable]
         supported = comparable & (np.abs(residual) <= depth_tolerance_m)
-        support_pixels = pixels[supported].copy()
-        cloud.model_supported_points_camera = points[supported].copy()
-        cloud.model_supported_colors = colors[supported].copy()
+        support_pixels = pixels[supported]
+        cloud.model_supported_points_camera = points[supported]
+        cloud.model_supported_colors = colors[supported]
         cloud.model_supported_pixel_indices = support_pixels
         cloud.model_supported_mask = np.zeros(shape, dtype=bool)
         cloud.model_supported_mask[support_pixels[:, 0], support_pixels[:, 1]] = True

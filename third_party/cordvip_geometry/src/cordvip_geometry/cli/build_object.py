@@ -3,26 +3,17 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
-from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
-from ..io import existing_file, output_path, write_confirmed_selection, write_json
-from .arguments import positive_float, positive_int
-
-
-def display_available() -> None:
-    if sys.platform.startswith("linux") and not (
-        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
-    ):
-        raise RuntimeError(
-            "没有图形会话；请使用 --headless --instance N，或 --list-only 查看候选后 select"
-        )
+from ..io import existing_file, output_path, write_json
+from .arguments import parse_object_args
+from .object_selection import choose, display_available, save_candidates, save_selection
 
 
 def load_rgb(args):
@@ -52,107 +43,6 @@ def load_rgb(args):
     return rgb, path, info
 
 
-def overlay(rgb, candidate, index):
-    import numpy as np
-    from PIL import Image, ImageDraw
-
-    canvas = rgb.copy()
-    mask = candidate["mask"]
-    canvas[mask] = (canvas[mask] * 0.4 + np.array([30, 220, 100]) * 0.6).astype(np.uint8)
-    image = Image.fromarray(canvas)
-    draw = ImageDraw.Draw(image)
-    draw.rectangle(tuple(float(x) for x in candidate["box_xyxy"]), outline=(255, 180, 0), width=2)
-    caption = f"#{index} {candidate['label']}  detection={candidate['score']:.3f}"
-    draw.rectangle((0, 0, image.width, 22), fill=(20, 20, 20))
-    draw.text((5, 4), caption, fill=(255, 255, 255))
-    return image
-
-
-def save_candidates(output, rgb, candidates):
-    import numpy as np
-    from PIL import Image
-
-    np.savez_compressed(
-        output / "candidates.npz",
-        masks=np.stack([c["mask"] for c in candidates]),
-        boxes=np.stack([c["box_xyxy"] for c in candidates]),
-        scores=np.asarray([c["score"] for c in candidates]),
-        mask_scores=np.asarray([c["mask_score"] for c in candidates]),
-        labels=np.asarray([c["label"] for c in candidates], dtype=str),
-    )
-    width = min(rgb.shape[1], 420)
-    height = max(1, round(rgb.shape[0] * width / rgb.shape[1]))
-    columns = min(3, len(candidates))
-    sheet = Image.new(
-        "RGB", (columns * width, ((len(candidates) + columns - 1) // columns) * height)
-    )
-    for index, candidate in enumerate(candidates):
-        thumb = overlay(rgb, candidate, index).resize((width, height))
-        sheet.paste(thumb, ((index % columns) * width, (index // columns) * height))
-        print(f"候选 {index}: {candidate['label']}，检测分数 {candidate['score']:.3f}", flush=True)
-    sheet.save(output / "candidates.jpg", quality=95)
-
-
-def choose(rgb, candidates, instance, *, headless):
-    if instance is not None and not 0 <= instance < len(candidates):
-        raise ValueError(f"--instance 必须位于 0..{len(candidates) - 1}；索引参见 candidates.jpg")
-    if headless:
-        if instance is None:
-            raise ValueError("headless 必须显式指定 --instance N；不会按检测分数自动选物体")
-        return instance
-    display_available()
-    import cv2
-    import numpy as np
-
-    index = 0 if instance is None else instance
-    title = "Grounded-SAM2: n/p candidate; Enter confirm; Esc cancel"
-    cv2.namedWindow(title, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(title, min(rgb.shape[1], 1280), min(rgb.shape[0], 850))
-    try:
-        while True:
-            canvas = np.asarray(overlay(rgb, candidates[index], index))
-            cv2.imshow(title, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
-            key = cv2.waitKey(50) & 0xFF
-            if key in (10, 13):
-                return index
-            if key in (27, ord("q")) or cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
-                raise RuntimeError("已取消候选确认；候选文件保留，可通过 select 继续")
-            if key in (ord("n"), ord(" "), ord("]")):
-                index = (index + 1) % len(candidates)
-            elif key in (ord("p"), ord("[")):
-                index = (index - 1) % len(candidates)
-    finally:
-        cv2.destroyWindow(title)
-
-
-def save_selection(output, rgb, candidates, index, provenance):
-    candidate = candidates[index]
-    mask = candidate["mask"]
-    if not mask.any() or mask.all():
-        raise ValueError("生成输入必须包含非空物体和非空背景；请重新分割或拍摄")
-    overlay(rgb, candidate, index).save(output / "overlay.png")
-    write_confirmed_selection(
-        output,
-        mask,
-        {
-            **provenance,
-            "selected_instance": index,
-            "selection": (
-                "explicit_headless_instance" if provenance["headless"] else "gui_confirmed"
-            ),
-            "label": candidate["label"],
-            "box_xyxy": candidate["box_xyxy"].tolist(),
-            "detection_score": candidate["score"],
-            "score_kind": "grounding_dino",
-            "mask_score": candidate["mask_score"],
-            "mask_score_kind": "sam2_predicted_iou",
-        },
-        mask_file="mask.png",
-        foreground_rgb=rgb,
-    )
-    print(f"已确认候选 {index}；全分辨率 mask、RGBA 与 overlay：{output}", flush=True)
-
-
 def preview_mesh(mesh_path, *, units="unscaled", points=None, normals=None):
     display_available()
     import open3d as o3d
@@ -177,38 +67,6 @@ def preview_mesh(mesh_path, *, units="unscaled", points=None, normals=None):
     title = "Object mesh + surface points" if points is not None else "Object mesh"
     o3d.visualization.draw_geometries(
         geometries, window_name=f"{title} ({units}); x=red y=green z=blue", mesh_show_back_face=True
-    )
-
-
-def add_segment_arguments(parser, *, workspace):
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--image", type=Path, help="物体照片；按 EXIF 纠正朝向")
-    source.add_argument("--rgbd", type=Path, help="单帧已保存的规范 RGB-D NPZ；不连接相机")
-    parser.add_argument("--text", required=True, help="英文物体描述，例如 'red mug.'")
-    from ..sam2_config import add_sam_arguments
-
-    add_sam_arguments(parser, workspace)
-    parser.add_argument("--instance", type=int, help="零起始候选索引；headless 必须显式选择")
-    parser.add_argument("--headless", action="store_true", help="不创建窗口；必须提供 --instance")
-
-
-def add_generate_arguments(parser, *, workspace):
-    models = workspace / "reports" / "cordvip_models"
-    source_root = workspace / "third_party"
-    parser.add_argument("--hunyuan-root", type=Path, default=source_root / "Hunyuan3D-2.1")
-    parser.add_argument("--weights", type=Path, default=models / "Hunyuan3D-2.1")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--steps", type=positive_int, default=50)
-    parser.add_argument("--octree-resolution", type=positive_int, default=384)
-    parser.add_argument("--num-chunks", type=positive_int, default=8000)
-    parser.add_argument(
-        "--num-points",
-        type=positive_int,
-        default=1024,
-        help="固定表面点数；点云与 mesh 使用相同坐标系和单位",
-    )
-    parser.add_argument(
-        "--preview", action="store_true", help="生成后交互查看 mesh、表面点云和坐标轴"
     )
 
 
@@ -531,52 +389,8 @@ class ObjectModelBuilder:
         print(workspace_prefix + shlex.join(live), flush=True)
 
 
-def build_parser(*, workspace=None):
-    workspace = Path(workspace or Path.cwd()).expanduser().resolve()
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.set_defaults(workspace=workspace)
-    commands = parser.add_subparsers(dest="command", required=True)
-    segment = commands.add_parser("segment", help="Grounded-SAM2 分割并确认物体")
-    add_segment_arguments(segment, workspace=workspace)
-    segment.add_argument(
-        "--list-only",
-        action="store_true",
-        help="只保存候选和预览图，后续用 select 选择；不创建窗口",
-    )
-    select = commands.add_parser("select", help="从保存的候选继续确认，不再加载模型")
-    select.add_argument("--segmentation-dir", type=Path, required=True)
-    select.add_argument("--instance", type=int)
-    select.add_argument("--headless", action="store_true")
-    generate = commands.add_parser("generate", help="从已确认的 RGBA 生成未定尺度 mesh 与表面点云")
-    generate.add_argument("--segmentation-dir", type=Path, required=True)
-    add_generate_arguments(generate, workspace=workspace)
-    build = commands.add_parser("build", help="按分割、生成、可选米制资产准备串行执行")
-    add_segment_arguments(build, workspace=workspace)
-    add_generate_arguments(build, workspace=workspace)
-    build.add_argument("--scale-to-meters", type=positive_float)
-    build.add_argument("--size-axis", choices=("x", "y", "z"))
-    build.add_argument("--size-meters", type=positive_float)
-    preview = commands.add_parser("preview", help="单独查看 mesh，无需加载任何模型")
-    preview.add_argument("--mesh", type=Path, required=True)
-    preview.add_argument(
-        "--units", choices=("unscaled", "m"), default="unscaled", help="显示标签；不进行缩放"
-    )
-    for command in (segment, select, generate, build):
-        command.add_argument(
-            "--output-dir", type=Path, required=True, help="尚不存在的新输出目录，拒绝覆盖"
-        )
-    for command in (generate, build):
-        command.add_argument("--device", default="cuda:0", help="Hunyuan 生成阶段使用的 CUDA 设备")
-    return parser
-
-
 def main(argv=None, *, workspace=None):
-    args = build_parser(workspace=workspace).parse_args(argv)
-    if hasattr(args, "seed") and args.seed < 0:
-        raise ValueError("--seed 必须非负")
-    for name in ("box_threshold", "text_threshold"):
-        if hasattr(args, name) and not 0 < getattr(args, name) < 1:
-            raise ValueError(f"{name} 必须在 (0, 1) 内")
+    args = parse_object_args(argv, workspace=workspace)
     ObjectModelBuilder(args).run()
     return 0
 

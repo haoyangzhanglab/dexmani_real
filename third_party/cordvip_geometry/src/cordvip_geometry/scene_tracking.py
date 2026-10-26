@@ -18,8 +18,7 @@ from .scene_geometry import extract_scene_clouds, add_model_depth_support
 
 
 class SceneTracker:
-    """One GPU owner shares weights; missing assets still yield observed semantic clouds.
-    Pose loss latches per object until a new session registers explicit initial masks."""
+    """共享模型权重；无资产时保留实测点，位姿丢失持续到新会话显式注册。"""
 
     def __init__(
         self,
@@ -42,8 +41,8 @@ class SceneTracker:
         self.min_matched_pixels = min_matched_pixels
         self.min_matched_fraction = min_matched_fraction
         self.trackers, self.renderers = {}, {}
-        self._lost = {}
-        self._ids = self._previous = self._shape = self._K = None
+        self.lost_objects = {}
+        self.instance_ids = self.previous_frame_identity = self.image_shape = self.intrinsics = None
         shared = None
         for name, (mesh, points, normals) in assets.items():
             tracker = FoundationPosePlusTracker(
@@ -63,23 +62,23 @@ class SceneTracker:
     def step(self, frame, rgb, depth_m, K, *, initial_masks=None):
         rgb, depth_m, K, _ = validate_rgbd(rgb, depth_m, K)
         identity = (frame.source_id, frame.row_index, frame.clock, frame.timestamp_ns)
-        first = self._ids is None
+        first = self.instance_ids is None
         if first != (initial_masks is not None):
             raise ValueError("Supply initial_masks exactly once, on the first scene frame")
         if not first:
             if (
-                identity == self._previous
-                or frame.clock != self._previous[2]
-                or frame.timestamp_ns < self._previous[3]
+                identity == self.previous_frame_identity
+                or frame.clock != self.previous_frame_identity[2]
+                or frame.timestamp_ns < self.previous_frame_identity[3]
             ):
                 raise ValueError("Scene requires chronological, distinct frames on one clock")
-            if (frame.row_index is None) != (self._previous[1] is None) or (
-                frame.row_index is not None and frame.row_index <= self._previous[1]
+            if (frame.row_index is None) != (self.previous_frame_identity[1] is None) or (
+                frame.row_index is not None and frame.row_index <= self.previous_frame_identity[1]
             ):
                 raise ValueError(
                     "Scene source row must advance; explicitly start a new session on replay reset"
                 )
-            if rgb.shape != self._shape or not np.array_equal(K, self._K):
+            if rgb.shape != self.image_shape or not np.array_equal(K, self.intrinsics):
                 raise ValueError(
                     "Scene image shape/intrinsics changed; explicitly start a new session"
                 )
@@ -99,22 +98,21 @@ class SceneTracker:
         )
         segmentation_ns = time.monotonic_ns()
         if first:
-            self._ids = tuple(initial_masks)
-            self._shape, self._K = rgb.shape, K.copy()
-        if tuple(masks) != self._ids:
+            self.instance_ids = tuple(initial_masks)
+            self.image_shape, self.intrinsics = rgb.shape, K.copy()
+        if tuple(masks) != self.instance_ids:
             raise RuntimeError("Streaming segmentation changed instance identity/order")
         # Independent evidence survives pose failure or the absence of an asset.
         measured = extract_scene_clouds(rgb, depth_m, K, masks, pixel_stride=self.pixel_stride)
-        poses, depths, pose_ms, reasons = {}, {}, {}, {}
+        poses, depths, pose_ms = {}, {}, {}
         prepared_frame = None
         for name, tracker in self.trackers.items():
             start = time.monotonic_ns()
-            if name in self._lost:
-                reasons[name] = self._lost[name]
+            if name in self.lost_objects:
                 continue
             cloud = measured.objects[name]
             if len(cloud.observed_points_camera) < self.min_matched_pixels:
-                self._lost[name] = reasons[name] = (
+                self.lost_objects[name] = (
                     "Insufficient independently segmented depth; pose lost"
                 )
                 continue
@@ -132,22 +130,18 @@ class SceneTracker:
                 depths[name] = self.renderers[name].render(depth_m.shape, K, poses[name])
             except Exception as error:
                 poses.pop(name, None)
-                self._lost[name] = reasons[name] = f"{type(error).__name__}: {error}"
-        clouds = add_model_depth_support(measured, depths, depth_tolerance_m=self.depth_tolerance_m)
+                self.lost_objects[name] = f"{type(error).__name__}: {error}"
+        add_model_depth_support(measured, depths, depth_tolerance_m=self.depth_tolerance_m)
         objects = {}
-        for name in self._ids:
-            cloud = clouds.objects[name]
+        for name in self.instance_ids:
+            cloud = measured.objects[name]
             pose = poses.get(name)
-            supported = (
-                int(np.count_nonzero(cloud.model_supported_mask))
-                if cloud.model_supported_mask is not None
-                else 0
-            )
-            fraction = supported / max(1, len(cloud.observed_points_camera))
+            supported = cloud.diagnostics["model_supported_point_count"] or 0
+            fraction = cloud.diagnostics["model_supported_fraction"] or 0.0
             if pose is not None and (
                 supported < self.min_matched_pixels or fraction < self.min_matched_fraction
             ):
-                self._lost[name] = reasons[name] = "Semantic depth/model disagreement; pose lost"
+                self.lost_objects[name] = "Semantic depth/model disagreement; pose lost"
                 pose = None
             pose_valid = pose is not None
             points = (
@@ -171,19 +165,19 @@ class SceneTracker:
                     if pose_valid
                     else "POSE_LOST" if name in self.assets else "OBSERVED_ONLY"
                 ),
-                error=reasons.get(name),
+                error=self.lost_objects.get(name),
                 diagnostic_pose=poses.get(name),
                 observed_valid=bool(len(cloud.observed_points_camera)),
                 semantic_model_support_fraction=fraction if name in depths else None,
             )
-        self._previous = identity
+        self.previous_frame_identity = identity
         return dict(
             frame=frame,
             rgb=rgb,
             depth_m=depth_m,
             K=K,
             objects=objects,
-            overlap_mask=clouds.overlap_mask,
+            overlap_mask=measured.overlap_mask,
             started_ns=started_ns,
             completed_ns=time.monotonic_ns(),
             operation="initialize" if first else "track",

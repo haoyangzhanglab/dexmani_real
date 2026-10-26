@@ -17,10 +17,14 @@ python -m cordvip_geometry check --offline-input --headless
 
 单物体与多物体使用同一个追踪入口。默认处理最新帧，离线加 `--all-frames` 逐帧处理。`replay` 提供无模型 RGB-D 预览。
 
+`SceneTrackingSession` 按准备、启动、逐帧处理、发布显示和关闭组织流程；正常帧、过期提示与退出共用最新结果发布入口，失效时同时撤销手和物体的可用几何。二维预览和视频跳过 3D 窗口专用的点云拼接与着色。位姿失败后不自动重试，当前会话仍保留独立分割得到的实测点。
+
+CLI 参数集中在 `cli/arguments.py`；场景声明与首帧选择位于 `cli/scene_initialization.py`，离线建模的候选确认位于 `cli/object_selection.py`。`live_workers.py` 管理线程与等待，`viewer.py` 提供结果绘制；会话仍统一管理发布状态和资源关闭。
+
 语义实测点来自当前 mask 和原始实测深度；完整物体点来自固定资产和追踪位姿。二者独立保存，模型与深度的一致性仅用于诊断。分割误差、遮挡、物体形变及资产尺度误差仍须结合源数据评估。
 
 `--with-hand` 从同一 Raw 行的实测关节生成 FK 手点，使用数据对应的相机外参与当前实验安装配置。手—物表示与原始模型输入的适配、训练和 contact/proximity 标签属于 `dexmani_policy`。
 
-实时相机命令会连接 RealSense；`--with-hand` 目前只支持只读 Raw。宿主接入时应复用已有 RGB-D、实测关节和时间证据。主包 runtime、采集、15 字段导出与部署尚未接入本工具。
+实时相机命令会连接 RealSense；`--with-hand` 目前只支持只读 Raw。宿主接入时应复用已有 RGB-D、实测关节和时间证据。主包 runtime、采集、13 字段导出与部署尚未接入本工具。
 
 运行产物与模型默认放在 workspace 的 `reports/` 下，也可显式指定其他输出位置。运行产物使用新目录，不覆盖输入文件或写回 Raw；模型下载可复用已有缓存目录。脚本入口显式传入 workspace，模块入口默认使用当前目录。

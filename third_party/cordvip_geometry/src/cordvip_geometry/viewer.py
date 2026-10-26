@@ -86,3 +86,50 @@ class DemoViewer:
         if self.vis is not None:
             self.vis.destroy_window()
         cv2.destroyAllWindows()
+
+
+def scene_display(result, colors, hand=None, *, include_clouds):
+    import cv2
+    import numpy as np
+
+    from .geometry import project_points
+
+    overlay = result["rgb"].copy()
+    observed, models, observed_colors, model_colors = [], [], [], []
+    for name, item in result["objects"].items():
+        color = colors[name]
+        mask = item["cloud"].semantic_mask
+        overlay[mask] = (overlay[mask] * 0.62 + np.asarray(color) * 0.38).astype(np.uint8)
+        contours, _ = cv2.findContours(
+            mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(overlay, contours, -1, color, 1)
+        if include_clouds:
+            points = item["cloud"].observed_points_camera
+            observed.append(points)
+            observed_colors.append(np.tile(np.asarray(color) / 255.0, (len(points), 1)))
+            points = item["model_points_camera"]
+            models.append(points)
+            model_colors.append(np.tile(np.asarray(color) / 255.0, (len(points), 1)))
+        if item["pose_valid"]:
+            p = item["pose"]
+            axes = np.array([[0, 0, 0], [0.035, 0, 0], [0, 0.035, 0], [0, 0, 0.035]])
+            uv, good = project_points(axes @ p[:3, :3].T + p[:3, 3], result["K"])
+            if good.all() and np.abs(uv).max() < 1e6:
+                uv = np.rint(uv).astype(int)
+                for i, axis_color in enumerate(((255, 70, 70), (70, 255, 70), (70, 70, 255)), 1):
+                    cv2.line(overlay, tuple(uv[0]), tuple(uv[i]), axis_color, 2)
+                cv2.putText(overlay, name, tuple(uv[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+    if hand is not None:
+        uv, good = project_points(hand["points_camera"], result["K"])
+        h, w = overlay.shape[:2]
+        good &= (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+        for u, v in np.rint(uv[good]).astype(int):
+            cv2.circle(overlay, (int(u), int(v)), 1, (255, 140, 35), -1)
+    clouds = dict(
+        observed_points=np.concatenate(observed),
+        model_points=np.concatenate(models),
+        observed_colors=np.concatenate(observed_colors),
+        model_colors=np.concatenate(model_colors),
+    ) if include_clouds else {}
+    return overlay, clouds

@@ -71,6 +71,8 @@ class TeleopRunner:
         self.preparing_epoch = None
         self.prepared_after_ns = 0
         self.capture_failed = False
+        self.discard_requested = False
+        self.last_capture_error = None
         self.pending_termination_reason = None
         self.termination_details = []
         self.control_run_id = None
@@ -96,13 +98,21 @@ class TeleopRunner:
                 return self.runtime_state.run_ended_reason.name.lower()
         return fallback
 
+    def record_capture_error(self, stage, exc):
+        if isinstance(exc, KeyboardInterrupt):
+            self.runtime_state.request_emergency_stop()
+        if self.recorder is not None and self.recorder.published_path is None:
+            self.capture_failed = True
+        # 同一个异常可能由 stop 边界传播到 run；只登记一次详情。
+        if exc is not self.last_capture_error:
+            self.termination_details.append(error_detail(stage, exc))
+            self.last_capture_error = exc
+
     def stop_motion(self, stage):
         try:
             self.robot.stop()
-        except Exception as exc:
-            if self.recorder is not None and self.recorder.published_path is None:
-                self.capture_failed = True
-            self.termination_details.append(error_detail(stage, exc))
+        except BaseException as exc:
+            self.record_capture_error(stage, exc)
             raise
 
     def stop_control(self, reason, *, run_end_reason=RunEndReason.OPERATOR, expected_run_id=None):
@@ -130,14 +140,13 @@ class TeleopRunner:
         self.preparing_epoch = self.control_run_id = None
 
     def finish_capture(self, save, reason, *, announce=True) -> None:
-        if self.recorder is None or not self.recorder.start_attempted:
-            self.pending_termination_reason = None
-            self.termination_details = []
-            return
-        reason = self.pending_termination_reason or self.end_reason(reason)
         published = None
-        if save:
-            published = self.recorder.save_episode(
+        captured = self.recorder is not None and self.recorder.start_attempted
+        if captured:
+            reason = self.pending_termination_reason or self.end_reason(reason)
+            # 首次请求是否已锁定，由 recorder.finish() 唯一决定。
+            published = self.recorder.finish(
+                save=save and not self.discard_requested,
                 reason=reason,
                 details=self.termination_details,
                 technical_status=(
@@ -145,13 +154,13 @@ class TeleopRunner:
                     else "failed"
                 ),
             )
-        else:
-            self.recorder.discard_episode(reason=reason)
-        self.recorder.check_error()
+            self.recorder.check_error()
         self.recorder = None
         self.pending_termination_reason = None
         self.termination_details = []
-        if announce:
+        self.discard_requested = False
+        self.last_capture_error = None
+        if announce and captured:
             self.audio.play("save" if published is not None else "discard")
 
     def stop_capture(
@@ -264,6 +273,8 @@ class TeleopRunner:
             )
         self.capture_started_s = time.monotonic()
         self.capture_failed = False
+        self.discard_requested = False
+        self.last_capture_error = None
         self.pending_termination_reason = None
         self.termination_details = []
         try:
@@ -298,16 +309,9 @@ class TeleopRunner:
             return True
         elif cmd in (OperatorCommand.STOP, OperatorCommand.DISCARD):
             reason = cmd.value.lower()
-            try:
-                self.stop_control(reason)
-            except Exception as stop_error:
-                if cmd is OperatorCommand.DISCARD:
-                    # 锁定已有 recorder 的丢弃请求，避免 close() 默认保存。
-                    try:
-                        self.finish_capture(False, reason, announce=False)
-                    except Exception as discard_error:
-                        raise stop_error from discard_error
-                raise
+            if cmd is OperatorCommand.DISCARD and self.recorder is not None:
+                self.discard_requested = True
+            self.stop_control(reason)
             self.end_segment(cmd is OperatorCommand.STOP, reason)
         elif cmd is OperatorCommand.RESET_TACTILE:
             if (
@@ -589,39 +593,29 @@ class TeleopRunner:
         self.execute_control_step(row, self.next_tick_ns, feedback_until_ns)
 
     def close(self):
-        """Revoke and preserve the capture; the session owns input/audio resources."""
+        """撤销运动并按既有意图收尾一次；未解决的 writer 仍由 recorder 持有。"""
         failure = None
         self.runtime_state.revoke_motion(reason=RunEndReason.RUNTIME_SHUTDOWN)
         try:
             if self.robot.stop_required:
                 self.stop_motion("shutdown_stop")
-        except Exception as exc:
+        except BaseException as exc:
             failure = exc
             logger.exception("teleop stop failed")
         try:
             self.controller.clear_reference()
-        except Exception as exc:
-            if self.recorder is not None and self.recorder.published_path is None:
-                self.capture_failed = True
-            if failure is None:
+        except BaseException as exc:
+            self.record_capture_error("reference_cleanup", exc)
+            if failure is None or (isinstance(exc, KeyboardInterrupt) and isinstance(failure, Exception)):
                 failure = exc
-            self.termination_details.append(error_detail("reference_cleanup", exc))
             logger.exception("teleop reference cleanup failed")
         try:
             self.finish_capture(True, "interrupted", announce=False)
-        except Exception as exc:
-            if failure is None:
+        except BaseException as exc:
+            self.record_capture_error("recording_cleanup", exc)
+            if failure is None or (isinstance(exc, KeyboardInterrupt) and isinstance(failure, Exception)):
                 failure = exc
             logger.exception("teleop recording cleanup failed")
-        finally:
-            if self.recorder is not None:
-                # START 失败或首次收尾超时仍由当前 owner 等待；不重试写入。
-                try:
-                    self.recorder.close()
-                except Exception as exc:
-                    if failure is None:
-                        failure = exc
-                    logger.exception("teleop recorder close failed")
         if failure is not None:
             raise failure
 
@@ -668,8 +662,8 @@ class TeleopRunner:
                 ):
                     continue
                 self.run_control_tick()
-        except KeyboardInterrupt:
-            self.runtime_state.request_emergency_stop()
+        except KeyboardInterrupt as exc:
+            self.record_capture_error("runtime", exc)
             raise
         except Exception as exc:
             self.runtime_state.mark_error()
@@ -680,10 +674,8 @@ class TeleopRunner:
             else:
                 reason = RunEndReason.POLICY_FAILURE
             self.runtime_state.revoke_motion(reason=reason)
-            if self.recorder is not None and self.recorder.published_path is None:
-                self.capture_failed = True
+            self.record_capture_error("runtime", exc)
             self.sensors.request_shutdown()
-            self.termination_details.append(error_detail("runtime", exc))
             logger.exception("teleop failed")
             self.audio.play("emergency")
             raise

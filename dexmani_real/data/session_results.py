@@ -113,6 +113,10 @@ class SessionResults:
         self.current = self.running_ns = None
         atomic_json_dump(self.session, self.path)
 
+    def update_episode_raw(self, index: int, raw):
+        """关闭阶段只核对指定轮次已有的 Raw 摘要，随最终会话结果一起落盘。"""
+        self.session["episodes"][index - 1]["raw"] = raw
+
     def finish_session(self, *, outcome, reason, shutdown_clean, **details):
         self.session.update(
             ended_utc=utc_now(),

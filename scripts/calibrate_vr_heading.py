@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.calibration.paths import VR_TRANSFORM_PATH
+from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.calibration.vr_alignment import (
     VR_TRANSFORM_MIN_FRAMES,
     VRTransformCalibration,

@@ -160,7 +160,7 @@ finally:
 
 NPZ 的 `object_ids/object_roles` 给出实例顺序；数组按 `toy__`、`basket__` 或单物体 `object__` 前缀保存。顶层 `valid` 表示此次源帧发布有效，每实例另有 `pose_valid/observed_valid`。pose 失效时该实例 pose 为 NaN、模型点为空，当前实测点仍可有效。成功发布的会话失效快照会清空全部可消费几何。手点另含相机/base 系点和法向、link IDs、joint_state、源时间与 skew。
 
-实时消费者须自行核对原始源时间、时钟与进程存活；`published_ns` 新不等于图像新。强制终止或文件系统故障可能留下旧的 valid 快照，不能只凭其标志继续消费。`REPLAY` 不做 live 年龄准入，也不授权机器人运动。库没有接入主包 runtime、Raw writer、15 字段导出或策略部署。
+实时消费者须自行核对原始源时间、时钟与进程存活；`published_ns` 新不等于图像新。强制终止或文件系统故障可能留下旧的 valid 快照，不能只凭其标志继续消费。`REPLAY` 不做 live 年龄准入，也不授权机器人运动。库没有接入主包 runtime、Raw writer、13 字段导出或策略部署。
 
 ## 新物体资产
 

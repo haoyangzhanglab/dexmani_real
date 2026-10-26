@@ -7,7 +7,7 @@ import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from dexmani_real.calibration.paths import CAMERAS_PATH
+from dexmani_real.calibration import CAMERAS_PATH
 from dexmani_real.calibration.table_plane import (
     resolve_table_plane,
     resolve_table_plane_path,

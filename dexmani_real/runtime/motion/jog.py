@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -65,19 +65,61 @@ class JogController:
         return pose, desired_position, result
 
     def submit(
-        self, pose, target, keys, generation, runtime_state, robot, epoch, *,
-        valid_until_ns, execute_until_ns,
-    ):
+        self, pose: Pose, target: np.ndarray, keys: KeyboardInput, generation: int,
+        runtime_state: RuntimeState, robot: DexManiRobot, epoch: int, *,
+        valid_until_ns: int, execute_until_ns: int,
+    ) -> bool:
+        """约束输入代际与运行身份，仅在正常提交后更新目标参考。"""
         next_pose, next_qpos = pose.copy(), target.copy()
 
-        def commit_reference():
-            self.command_pose, self.command_qpos = next_pose, next_qpos
+        def reserve() -> int | None:
+            with runtime_state.motion_lock:
+                if runtime_state.run_id != epoch or not runtime_state.requests_allow_motion():
+                    return None
+                if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
+                    runtime_state.revoke_motion(expected_run_id=epoch)
+                    raise TimeoutError("jog proposal deadline expired")
+                if runtime_state.safety_state == SafetyState.ARMED:
+                    if runtime_state.begin_motion() is None:
+                        return None
+                elif runtime_state.safety_state != SafetyState.RUNNING:
+                    return None
+                return runtime_state.run_id
 
-        return submit_jog_target(
-            keys, generation, runtime_state, robot, target, epoch,
-            valid_until_ns=valid_until_ns, execute_until_ns=execute_until_ns,
-            commit_reference=commit_reference,
-        )
+        run_id = keys.commit_if_current(generation, reserve)
+        if not run_id:
+            return False
+        try:
+            # The input generation is checked again by the IPC consumer before first send.
+            robot.send_action(
+                RobotCommand(run_id, target, input_generation=generation),
+                valid_until_ns=valid_until_ns,
+                execute_until_ns=execute_until_ns,
+            )
+
+            def finish() -> bool:
+                with runtime_state.motion_lock:
+                    if not runtime_state.command_may_cross_sdk(run_id=run_id):
+                        return False
+                    if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
+                        return False
+                    self.command_pose, self.command_qpos = next_pose, next_qpos
+                    return True
+
+            if not keys.commit_if_current(generation, finish):
+                if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
+                    raise TimeoutError("jog proposal expired during submission")
+                raise OperationCancelled("jog proposal changed during submission")
+            return True
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                reason = RunEndReason.ESTOP
+            elif isinstance(exc, RobotError):
+                reason = RunEndReason.HARDWARE_FAULT
+            else:
+                reason = RunEndReason.EXECUTOR_BOUNDARY
+            runtime_state.revoke_motion(reason=reason, expected_run_id=run_id)
+            raise
 
 
 def any_jog_key_held(active_keys: Iterable[str]) -> bool:
@@ -91,69 +133,6 @@ def jog_motion_requested(active_keys: Iterable[str]) -> bool:
         return False
     dx, drpy = compute_cartesian_jog_delta(keys, 1.0, 1.0)
     return bool(np.any(dx) or np.any(drpy))
-
-
-def submit_jog_target(
-    keys: KeyboardInput,
-    generation: int,
-    runtime_state: RuntimeState,
-    robot: DexManiRobot,
-    target: np.ndarray,
-    epoch: int,
-    *,
-    valid_until_ns: int,
-    execute_until_ns: int,
-    commit_reference: Callable[[], None],
-) -> bool:
-    """约束输入代际与运行身份；正常提交后仅赋值已构造的参考。"""
-    def reserve() -> int | None:
-        with runtime_state.motion_lock:
-            if runtime_state.run_id != epoch or not runtime_state.requests_allow_motion():
-                return None
-            if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
-                runtime_state.revoke_motion(expected_run_id=epoch)
-                raise TimeoutError("jog proposal deadline expired")
-            if runtime_state.safety_state == SafetyState.ARMED:
-                if runtime_state.begin_motion() is None:
-                    return None
-            elif runtime_state.safety_state != SafetyState.RUNNING:
-                return None
-            return runtime_state.run_id
-
-    run_id = keys.commit_if_current(generation, reserve)
-    if not run_id:
-        return False
-    try:
-        # The input generation is checked again by the IPC consumer before first send.
-        robot.send_action(
-            RobotCommand(run_id, target, input_generation=generation),
-            valid_until_ns=valid_until_ns,
-            execute_until_ns=execute_until_ns,
-        )
-
-        def finish() -> bool:
-            with runtime_state.motion_lock:
-                if not runtime_state.command_may_cross_sdk(run_id=run_id):
-                    return False
-                if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
-                    return False
-                commit_reference()
-                return True
-
-        if not keys.commit_if_current(generation, finish):
-            if time.monotonic_ns() >= min(valid_until_ns, execute_until_ns):
-                raise TimeoutError("jog proposal expired during submission")
-            raise OperationCancelled("jog proposal changed during submission")
-        return True
-    except BaseException as exc:
-        if isinstance(exc, KeyboardInterrupt):
-            reason = RunEndReason.ESTOP
-        elif isinstance(exc, RobotError):
-            reason = RunEndReason.HARDWARE_FAULT
-        else:
-            reason = RunEndReason.EXECUTOR_BOUNDARY
-        runtime_state.revoke_motion(reason=reason, expected_run_id=run_id)
-        raise
 
 
 def propose_cartesian_jog_pose(

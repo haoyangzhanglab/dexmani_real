@@ -11,15 +11,17 @@ from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
-from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 
+from dexmani_real.calibration import CAMERAS_PATH
 from dexmani_real.calibration.camera.aruco import (
     ARUCO_DICT,
     ARUCO_DICT_NAME,
     ArucoConfig,
-    detect_aruco_pose,
     draw_calibration_overlay,
-    marker_corners_3d,
+)
+from dexmani_real.calibration.camera.capture import (
+    CalibrationSampler,
+    eef_rpy_from_rot6d,
 )
 from dexmani_real.calibration.camera.extrinsics import (
     calibration_capture_metadata,
@@ -30,7 +32,6 @@ from dexmani_real.calibration.camera.hand_eye import (
     CalibrationSamples,
     solve_hand_eye,
 )
-from dexmani_real.calibration.paths import CAMERAS_PATH
 from dexmani_real.calibration.table_plane import resolve_table_plane
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.control.online_ik import (
@@ -39,7 +40,6 @@ from dexmani_real.control.online_ik import (
     make_online_ik_solver,
 )
 from dexmani_real.control.target_validation import TargetChecker
-from dexmani_real.geometry.pose import rot6d_to_quat_wxyz
 from dexmani_real.ipc.channels import SensorChannels
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.system import DexManiRobot
@@ -49,7 +49,11 @@ from dexmani_real.runtime.motion.jog import (
     jog_motion_requested,
     validate_keyboard_workspace,
 )
-from dexmani_real.runtime.observation import read_camera_frame, service_feedback
+from dexmani_real.runtime.observation import (
+    control_deadline_ns,
+    read_camera_frame,
+    service_feedback,
+)
 from dexmani_real.runtime.operator_input import KeyboardInput
 from dexmani_real.runtime.preflight import validate_robot_config
 from dexmani_real.runtime.sensor_processes import SensorProcesses
@@ -67,73 +71,6 @@ logger = logging.getLogger(__name__)
 WINDOW_NAME = "ArUco Calibration"
 IDLE_STATUS_INTERVAL_FRAMES = 150
 MOTION_STATUS_INTERVAL_FRAMES = 50
-
-
-def eef_rpy_from_rot6d(rot6d: np.ndarray) -> np.ndarray:
-    """Convert an arm EEF rot6d orientation to xyz RPY in radians."""
-    quat_wxyz = rot6d_to_quat_wxyz(rot6d)
-    rpy_rad = Rotation.from_quat(np.roll(quat_wxyz, -1)).as_euler("xyz", degrees=False)
-    return np.asarray(rpy_rad, dtype=np.float64)
-
-
-def detect_aruco_stable(
-    channels: SensorChannels,
-    intrinsics: np.ndarray,
-    distortion: np.ndarray,
-    *,
-    detector: cv2.aruco.ArucoDetector,
-    marker_corners: np.ndarray,
-    target_id: int | None,
-    max_frame_age_s: float,
-    n_frames: int,
-    not_before_ns: int,
-    check_capture,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Aggregate post-barrier RGB poses using an SO(3) mean and median translation."""
-    rvecs_all: list[np.ndarray] = []
-    tvecs_all: list[np.ndarray] = []
-    last_stamp = not_before_ns
-    last_sequence = 0
-    last_color_frame = -1
-    for _ in range(n_frames):
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            check_capture()
-            frame = read_camera_frame(channels, payload="rgb")
-            if (
-                frame
-                and frame["timestamp_ns"] > last_stamp
-                and frame["ring_sequence"] > last_sequence
-                and frame["color_frame_number"] > last_color_frame
-                and sample_is_fresh(frame["timestamp_ns"], max_frame_age_s)
-            ):
-                break
-            time.sleep(0.01)
-        else:
-            raise TimeoutError("fresh calibration image unavailable")
-        last_stamp = frame["timestamp_ns"]
-        last_sequence = frame["ring_sequence"]
-        last_color_frame = frame["color_frame_number"]
-        check_capture()
-        image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
-        result = detect_aruco_pose(
-            image,
-            intrinsics,
-            distortion,
-            detector=detector,
-            marker_corners=marker_corners,
-            target_id=target_id,
-        )
-        check_capture()
-        if result is not None:
-            rvecs_all.append(result[0])
-            tvecs_all.append(result[1])
-
-    if len(rvecs_all) < max(1, n_frames // 2):
-        return None
-    return Rotation.from_rotvec(np.asarray(rvecs_all)).mean().as_rotvec(), np.median(
-        tvecs_all, axis=0
-    )
 
 
 def build_planner(
@@ -317,49 +254,20 @@ class CameraCalibrationSession:
             raise CancelledError("calibration capture cancelled")
         return arm
 
-    def read_capture_arm_state(self, after_ns):
-        """Confirm standstill from feedback acquired after the stop or sampling barrier."""
-        deadline_ns = time.monotonic_ns() + int(self.runtime.arm.feedback_max_age_s * 1e9)
-        while time.monotonic_ns() < deadline_ns:
-            arm = self.read_capture_feedback()
-            if arm["timestamp_ns"] <= after_ns:
-                time.sleep(0.01)
-                continue
-            speed_rad_s = float(np.max(np.abs(arm["qvel"])))
-            bound_rad_s = self.runtime.arm.homing.velocity_convergence_rad_s
-            if speed_rad_s > bound_rad_s:
-                return None, (
-                    "arm velocity exceeds stationary bound "
-                    f"({speed_rad_s:.4f}rad/s > {bound_rad_s:.4f}rad/s)"
-                )
-            return arm, ""
-        raise TimeoutError("new arm feedback unavailable after calibration capture barrier")
-
     def capture_sample(self):
-        """Append one marker/arm observation only when the arm stayed stationary."""
+        """Stop jog and append a sample only while capture remains authorized."""
         if self.cancel_requested():
             return
         if not self.stop_jog():
             return
         print(f"\n  [{len(self.samples) + 1}] capturing ArUco pose...", end=" ", flush=True)
         try:
-            arm_before, feedback_issue = self.read_capture_arm_state(time.monotonic_ns())
-            if arm_before is None:
-                print(f"FAILED — before capture: {feedback_issue}, skipped")
-                return
-            aruco_pose = detect_aruco_stable(
+            sample = self.sampler.capture(
                 self.sensors.channels,
-                self.intrinsics,
-                self.distortion,
-                detector=self.capture_detector,
-                marker_corners=self.marker_corners,
-                target_id=self.aruco_config.target_id,
-                max_frame_age_s=self.runtime.camera.max_frame_age_s,
-                n_frames=self.aruco_config.capture_frames,
-                not_before_ns=time.monotonic_ns(),
-                check_capture=self.read_capture_feedback,
+                self.read_capture_feedback,
+                camera_config=self.runtime.camera,
+                arm_config=self.runtime.arm,
             )
-            arm_after, feedback_issue = self.read_capture_arm_state(time.monotonic_ns())
         except CancelledError:
             print("CANCELLED")
             return
@@ -367,37 +275,14 @@ class CameraCalibrationSession:
             logger.warning("capture failed", exc_info=True)
             print(f"FAILED — {exc}, skipped")
             return
-
-        if self.cancel_requested():
+        if sample is None or self.cancel_requested():
             return
-        if arm_after is None:
-            print(f"FAILED — after capture: {feedback_issue}, skipped")
-            return
-        arm_before_qpos = np.asarray(arm_before["qpos"], dtype=np.float64)
-        arm_after_qpos = np.asarray(arm_after["qpos"], dtype=np.float64)
-        drift_rad = float(np.max(np.abs(arm_after_qpos - arm_before_qpos)))
-        convergence_rad = float(self.runtime.arm.homing.convergence_rad)
-        if drift_rad > convergence_rad:
-            print(
-                "FAILED — arm moved during capture "
-                f"({drift_rad:.4f}rad > {convergence_rad:.4f}rad), skipped"
-            )
-            return
-        if aruco_pose is None:
-            print("FAILED — marker not detected, skipped")
-            return
-
-        marker_rvec, marker_tvec = aruco_pose
-        eef_pos_base_m, eef_rot6d_base = self.target_checker.target_fk.compute(arm_after_qpos)
+        arm_qpos, marker_rvec, marker_tvec = sample
+        eef_pos_base_m, eef_rot6d_base = self.target_checker.target_fk.compute(arm_qpos)
         eef_rpy_base_rad = eef_rpy_from_rot6d(eef_rot6d_base)
         if self.cancel_requested():
             return
-        self.samples.append(
-            eef_pos_base_m,
-            eef_rpy_base_rad,
-            marker_rvec,
-            marker_tvec,
-        )
+        self.samples.append(eef_pos_base_m, eef_rpy_base_rad, marker_rvec, marker_tvec)
         print(
             f"OK (total {len(self.samples)})  EE={np.round(eef_pos_base_m, 3)}m  "
             f"marker_dist={np.linalg.norm(marker_tvec):.3f}m"
@@ -416,7 +301,7 @@ class CameraCalibrationSession:
                 n_samples=len(self.samples),
                 min_samples=self.calibration_config.min_samples,
                 target_id=self.aruco_config.target_id,
-                marker_corners=self.marker_corners,
+                marker_corners=self.sampler.marker_corners,
                 marker_size_m=self.aruco_config.marker_size_m,
             )
         if self.display_image is not None:
@@ -568,16 +453,10 @@ class CameraCalibrationSession:
     def run_control_loop(self, initial_state):
         self.current_qpos = initial_state["qpos"]
         self.feedback_timestamp_ns = int(initial_state["timestamp_ns"])
-        self.marker_corners = marker_corners_3d(self.aruco_config.marker_size_m)
+        self.sampler = CalibrationSampler(self.aruco_config, self.intrinsics, self.distortion)
         self.preview_detector = cv2.aruco.ArucoDetector(
             cv2.aruco.getPredefinedDictionary(ARUCO_DICT),
             cv2.aruco.DetectorParameters(),
-        )
-        capture_params = cv2.aruco.DetectorParameters()
-        capture_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        self.capture_detector = cv2.aruco.ArucoDetector(
-            cv2.aruco.getPredefinedDictionary(ARUCO_DICT),
-            capture_params,
         )
         self.rate = LoopRate(
             self.runtime.keyboard_teleop.control_hz,
@@ -750,16 +629,16 @@ class CameraCalibrationSession:
             return
 
         try:
-            self.robot.arm.update_health(health_until_ns=min(
-                time.monotonic_ns() + int(self.runtime.arm.feedback_max_age_s * 1e9),
-                self.feedback_timestamp_ns + int(self.runtime.arm.feedback_max_age_s * 1e9) + 1,
-            ))
+            feedback_until_ns = (
+                self.feedback_timestamp_ns + int(self.runtime.arm.feedback_max_age_s * 1e9) + 1
+            )
+            self.robot.arm.update_health(
+                health_until_ns=control_deadline_ns(feedback_until_ns, self.runtime.arm),
+            )
             committed = self.jog.submit(
                 proposed_pose, ik_result.qpos, self.keys, generation,
                 self.runtime_state, self.robot, epoch,
-                valid_until_ns=self.feedback_timestamp_ns
-                + int(self.runtime.arm.feedback_max_age_s * 1e9)
-                + 1,
+                valid_until_ns=feedback_until_ns,
                 execute_until_ns=self.feedback_timestamp_ns
                 + int(keyboard.target_max_age_s * 1e9),
             )

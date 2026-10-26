@@ -34,8 +34,7 @@ class ArmFK:
         import pinocchio
 
         pinocchio.forwardKinematics(self.model, self.data, qpos)
-        pinocchio.updateFramePlacements(self.model, self.data)
-        pose = self.data.oMf[self.eef_frame_id]
+        pose = pinocchio.updateFramePlacement(self.model, self.data, self.eef_frame_id)
 
         R = np.asarray(pose.rotation, dtype=np.float64)
         eef_pos = np.asarray(pose.translation, dtype=np.float64).copy()

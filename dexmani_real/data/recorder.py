@@ -14,11 +14,18 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from dexmani_real.data.raw.writer import RawEpisodeWriter
 from dexmani_real.data.raw.schema import (
-    TACTILE_PROCESSING, TACTILE_UNITS, TACTILE_AXES, TACTILE_FINGER_ORDER,
+    TACTILE_AXES,
+    TACTILE_FINGER_ORDER,
+    TACTILE_PROCESSING,
+    TACTILE_UNITS,
 )
-from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish, target_is_occupied
+from dexmani_real.data.raw.writer import RawEpisodeWriter
+from dexmani_real.utils.atomic_io import (
+    atomic_json_dump,
+    atomic_publish,
+    target_is_occupied,
+)
 
 logger = logging.getLogger(__name__)
 RECORDER_START_TIMEOUT_S = 10.0
@@ -50,6 +57,23 @@ def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata, tact
         hand_tactile_hold_max_age_s=float(tactile_hold_max_age_s),
     )
     return metadata
+
+
+def snapshot_recording_result(recorder: AsyncEpisodeRecorder, *, failed: bool = False):
+    """只读最后可观察的录制结果；pending 不推断线程之后的发布结局。"""
+    if not recorder.start_attempted:
+        return None
+    pending = recorder.writer_pending
+    published, staging = recorder.published_path, recorder.staging_path
+    return dict(
+        status=(
+            "published" if published is not None else "pending" if pending
+            else "failed" if failed or recorder.error is not None else "not_published"
+        ),
+        path=str(published) if published is not None else None,
+        staging_path=str(staging) if staging is not None and published is None else None,
+        row_count=recorder.written_frames,
+    )
 
 
 class AsyncEpisodeRecorder:
@@ -183,15 +207,6 @@ class AsyncEpisodeRecorder:
             self.store_error(error)
             raise error from exc
 
-    def save_episode(self, reason="manual", *, technical_status="normal", details=None):
-        return self.finish(
-            save=True, reason=reason, details=details,
-            technical_status=technical_status,
-        )
-
-    def discard_episode(self, reason="discard"):
-        self.finish(save=False, reason=reason)
-
     def close(self):
         """Join an active writer without inventing a physical stop confirmation."""
         if self.finish_request is None or self.writer_pending:
@@ -224,7 +239,7 @@ class AsyncEpisodeRecorder:
                     )
                 except BaseException as exc:
                     self.store_error(exc, io=True)
-                    self.finish_request = CaptureFinishRequest(True, reason, None)
+                    self.finish_request = CaptureFinishRequest(save, reason, None)
                     if not isinstance(exc, Exception):
                         interrupted = exc
             if was_recording and self.writer_pending and not self.cancelled.is_set():

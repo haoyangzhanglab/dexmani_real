@@ -127,9 +127,7 @@ def iter_live_realsense(
 
 
 class RawHandCloudProvider:
-    """Use exact-row measured joints, recorded camera extrinsics and the current hand mount.
-    Missing camera clocks retain row/relative identities; row alignment does not establish sync.
-    """
+    """使用同一 Raw 行实测关节、记录外参和当前手安装变换；行对齐不证明物理同步。"""
 
     def __init__(self, episode, config_path=None, num_points=1024, seed=0):
         from dexmani_real.config import load_experiment_config
@@ -158,16 +156,16 @@ class RawHandCloudProvider:
         if mount.shape != (3,) or not np.isfinite(mount).all():
             raise ValueError("hand mount must be finite shape (3,)")
         validate_unit_quaternion_wxyz(config.hand.T_eef_handbase_quat_wxyz, name="hand mount")
-        self._T_eef_handbase = np.eye(4)
-        self._T_eef_handbase[:3, 3] = mount
-        self._T_eef_handbase[:3, :3] = quat_wxyz_to_rotmat(config.hand.T_eef_handbase_quat_wxyz)
+        self.T_eef_handbase = np.eye(4)
+        self.T_eef_handbase[:3, 3] = mount
+        self.T_eef_handbase[:3, :3] = quat_wxyz_to_rotmat(config.hand.T_eef_handbase_quat_wxyz)
         with EpisodeReader(self.episode) as reader:
             reader.require_fields("arm_qpos", "hand_qpos", "timestamp")
-            self._arm = reader["arm_qpos"][:]
-            self._hand = reader["hand_qpos"][:]
-            self._observation_s = reader["timestamp"][:]
+            self.arm_qpos = reader["arm_qpos"][:]
+            self.hand_qpos = reader["hand_qpos"][:]
+            self.observation_s = reader["timestamp"][:]
             self.T_base_camera = load_raw_episode_base_from_color(reader)
-            self._timing = reader.read_timing_rows(
+            self.timing = reader.read_timing_rows(
                 ("arm_ns", "hand_ns", "camera_ns", "camera_sequence")
             )
             raw_notes = {
@@ -175,8 +173,8 @@ class RawHandCloudProvider:
                 for key in ("notes", "timestamp_source", "termination_reason")
                 if key in reader.meta
             }
-        self._T_camera_base = np.linalg.inv(self.T_base_camera)
-        self._arm_fk = ArmFK(str(XARM7_XHAND_COLLISION_URDF_PATH))
+        self.T_camera_base = np.linalg.inv(self.T_base_camera)
+        self.arm_fk = ArmFK(str(XARM7_XHAND_COLLISION_URDF_PATH))
         self.hand_model = HandCloudModel(
             XHAND_RIGHT_URDF_PATH,
             XHAND_SDK_JOINT_NAMES,
@@ -194,7 +192,7 @@ class RawHandCloudProvider:
             "mount_source": (
                 str(config_path) if config_path else "current_ExperimentConfig_defaults"
             ),
-            "T_eef_handbase": self._T_eef_handbase.tolist(),
+            "T_eef_handbase": self.T_eef_handbase.tolist(),
             "T_base_camera": self.T_base_camera.tolist(),
             "camera_extrinsics_source": "Raw meta.camera_T_xarm_base_from_color",
             "timing_semantics": "host_monotonic_source_times_if_present_no_exposure_time_claim",
@@ -210,14 +208,14 @@ class RawHandCloudProvider:
         if (
             isinstance(row, bool)
             or not isinstance(row, (int, np.integer))
-            or not 0 <= row < len(self._arm)
+            or not 0 <= row < len(self.arm_qpos)
         ):
             raise ValueError("hand cloud requires a valid Raw row_index")
-        timing = self._timing[row]
+        timing = self.timing[row]
         expected_source, expected_stamp, expected_clock = raw_frame_identity(
             self.episode,
             row,
-            self._observation_s[row],
+            self.observation_s[row],
             timing,
         )
         arm_ns, hand_ns, camera_ns = (
@@ -231,16 +229,16 @@ class RawHandCloudProvider:
             raise ValueError(
                 "hand cloud and RGB-D must come from the same Raw row and source clock"
             )
-        joint_state = np.concatenate((self._arm[row], self._hand[row]))
+        joint_state = np.concatenate((self.arm_qpos[row], self.hand_qpos[row]))
         if not np.isfinite(joint_state).all():
             raise ValueError(f"Raw row {row}: measured arm/hand joints are missing or nonfinite")
-        position, rot6d = self._arm_fk.compute(self._arm[row])
+        position, rot6d = self.arm_fk.compute(self.arm_qpos[row])
         T_base_eef = np.eye(4)
         T_base_eef[:3, 3] = position
         T_base_eef[:3, :3] = rot6d_to_rotmat(rot6d)
         cloud = self.hand_model.transform(
-            self._hand[row],
-            self._T_camera_base @ T_base_eef @ self._T_eef_handbase,
+            self.hand_qpos[row],
+            self.T_camera_base @ T_base_eef @ self.T_eef_handbase,
         )
         timing_available = (
             min(arm_ns, hand_ns, camera_ns) > 0

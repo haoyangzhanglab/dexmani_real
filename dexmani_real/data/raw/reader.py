@@ -163,8 +163,9 @@ class EpisodeReader:
         array = self.data_file[name]
         if not isinstance(array, h5py.Dataset):
             raise RawDataError(f"Raw {name}: expected a dataset")
-        if name in DATASET_SPECS:
-            tail_shape, dtype = DATASET_SPECS[name]
+        spec = ((), TIMING_ROW_DTYPE) if name == "timing/rows" else DATASET_SPECS.get(name)
+        if spec is not None:
+            tail_shape, dtype = spec
             if array.shape != (self.num_frames, *tail_shape) or array.dtype != dtype:
                 raise RawDataError(f"Raw {name}: incompatible shape/dtype")
         self.dataset_cache[name] = array
@@ -189,12 +190,6 @@ class EpisodeReader:
             self.tactile_hold_max_age_s = positive_float_attr(self.meta, "hand_tactile_hold_max_age_s")
         return self.tactile_hold_max_age_s
 
-    def _timing_dataset(self) -> h5py.Dataset:
-        timing = self["timing/rows"]
-        if timing.shape != (self.num_frames,) or timing.dtype != TIMING_ROW_DTYPE:
-            raise RawDataError("Raw timing/rows: incompatible source-clock layout or row count")
-        return timing
-
     def read_timing_rows(self, fields: Sequence[str]) -> np.ndarray:
         """读取指定来源时钟字段，保留原值；不隐式执行训练准入校验。"""
         if isinstance(fields, (str, bytes)) or not isinstance(fields, Sequence):
@@ -207,7 +202,7 @@ class EpisodeReader:
         unknown = set(fields).difference(cast(tuple[str, ...], TIMING_ROW_DTYPE.names))
         if unknown:
             raise ValueError(f"unknown timing fields: {sorted(unknown)}")
-        return self._timing_dataset().fields(fields)[:]
+        return self["timing/rows"].fields(fields)[:]
 
     def validate_rows(
         self, *, required_tactile=("aggregate", "dense"), require_camera=True, chunk_frames=4096
@@ -217,7 +212,7 @@ class EpisodeReader:
             raise ValueError("chunk_frames must be a positive integer")
         if not set(required_tactile) <= {"aggregate", "dense"}:
             raise ValueError("unknown tactile source")
-        timing = self._timing_dataset()
+        timing = self["timing/rows"]
         fields = ("observation_ns", "control_ns", "arm_ns", "hand_ns")
         fields += tuple(f"tactile_{name}_ns" for name in required_tactile)
         if require_camera:

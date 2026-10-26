@@ -4,8 +4,8 @@ import logging
 import multiprocessing as mp
 from pathlib import Path
 
+from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extrinsics
-from dexmani_real.calibration.paths import VR_TRANSFORM_PATH
 from dexmani_real.calibration.table_plane import resolve_table_plane
 from dexmani_real.calibration.vr_alignment import load_vr_transform
 from dexmani_real.control.action_mapping import ActionMapper

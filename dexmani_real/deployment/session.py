@@ -12,7 +12,11 @@ from dexmani_real.calibration.camera.extrinsics import (
 )
 from dexmani_real.control.action_mapping import ActionMapper
 from dexmani_real.control.homing import HomePlanner
-from dexmani_real.data.recorder import AsyncEpisodeRecorder, RecordingError
+from dexmani_real.data.recorder import (
+    AsyncEpisodeRecorder,
+    RecordingError,
+    snapshot_recording_result,
+)
 from dexmani_real.data.session_results import SessionResults, error_detail
 from dexmani_real.deployment.config import DEFAULT_NUM_EPISODES
 from dexmani_real.deployment.policy_observation import (
@@ -82,6 +86,7 @@ class PolicySession:
         self.completed = 0
         self.query_ids = count(1)
         self.capture_ids = count(1)
+        self.recorder_result_index: int | None = None
 
     def run(self):
         """Run a session with required evaluation results and optional Raw recording."""
@@ -306,6 +311,7 @@ class PolicySession:
                 # Episode 已结束也不能丢失仍在退出的 writer。
                 try:
                     self.recorder.close()
+                    self.recorder.check_error()
                 except Exception as exc:
                     cleanup_errors.append(error_detail("recorder_close", exc))
             if self.runtime_state is not None:
@@ -323,6 +329,11 @@ class PolicySession:
         finally:
             if self.model is not None:
                 model_close = self.model.close_result(shutdown_deadline - time.monotonic())
+            # 设备与模型清理期间 writer 仍可能退出；最终写会话前只核对一次。
+            if self.recorder is not None and self.recorder_result_index is not None:
+                raw = snapshot_recording_result(self.recorder)
+                if raw is not None:
+                    self.results.update_episode_raw(self.recorder_result_index, raw)
             shutdown_clean = (
                 shutdown_clean and not cleanup_errors and model_close["status"] == "completed"
             )
@@ -570,6 +581,11 @@ class PolicySession:
             self.recorder = (
                 AsyncEpisodeRecorder(self.recording_dir, control_hz=1.0 / self.info.control_dt_s)
                 if self.recording_dir is not None else None
+            )
+            # 本会话串行创建轮次；prepare() 将为此 recorder 开始下一条结果。
+            # episode 结束后可释放其控制状态，但 recorder 与结果的关联保留到关闭。
+            self.recorder_result_index = (
+                len(self.results.session["episodes"]) + 1 if self.recorder is not None else None
             )
             self.episode = PolicyEpisode(
                 self.runtime_state,

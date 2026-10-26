@@ -5,18 +5,27 @@ from __future__ import annotations
 import logging
 import time
 from concurrent.futures import CancelledError
-from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
 
-from dexmani_real.robot.xhand.config import HandParams
 from dexmani_real.robot.model import (
     HAND_DOF,
     HAND_JOINT_SHAPE,
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
     XHAND_TACTILE_SENSOR_FINGER_IDS,
+)
+from dexmani_real.robot.xhand.config import HandParams
+from dexmani_real.robot.xhand.feedback import (
+    COMBINED_FORCE_UNAVAILABLE_CODE,
+    DISTRIBUTED_FORCE_UNAVAILABLE_CODE,
+    TEMPERATURE_UNAVAILABLE_CODE,
+    XHandState,
+    parse_joints,
+    parse_tactile_aggregate,
+    parse_tactile_dense,
+    tactile_validity,
 )
 from dexmani_real.utils.log import (
     capture_native_stdout,
@@ -30,9 +39,6 @@ OPEN_RETRIES = {"ethercat": 2, "serial": 3}
 OPEN_RETRY_DELAY_S = 2.0
 INITIAL_STATE_READ_INTERVAL_S = 0.02
 COMMUNICATION_CRC_ERROR_CODE = 1_501_070
-COMBINED_FORCE_UNAVAILABLE_CODE = 1_501_018
-DISTRIBUTED_FORCE_UNAVAILABLE_CODE = 1_501_019
-TEMPERATURE_UNAVAILABLE_CODE = 1_501_020
 # These codes permit joint reads and target sends; tactile trust is checked separately.
 NONFATAL_SDK_CODES = frozenset(
     {
@@ -67,21 +73,6 @@ def error_ok(error: Any) -> bool:
     return error_code(error) == 0
 
 
-def tactile_validity(code: int, *, comm_type: str) -> tuple[bool, bool]:
-    """RS485 1501019/201 drops dense only; 1501020/202 keeps both; EtherCAT rejects nonzero status."""
-    if comm_type == "ethercat":
-        return (code == 0, code == 0)
-    if code == 0:
-        return (True, True)
-    if code in (COMBINED_FORCE_UNAVAILABLE_CODE, 200):
-        return (False, False)
-    if code in (DISTRIBUTED_FORCE_UNAVAILABLE_CODE, 201):
-        return (True, False)
-    if code in (TEMPERATURE_UNAVAILABLE_CODE, 202):
-        return (True, True)
-    return (False, False)
-
-
 class XHandError(RuntimeError):
     """An XHand SDK error retaining the device's original code."""
 
@@ -90,19 +81,6 @@ class XHandError(RuntimeError):
         self.code = int(code)
         self.message = str(message)
         super().__init__(f"XHand {self.operation} failed: code={self.code} msg={self.message}")
-
-
-@dataclass
-class XHandState:
-    """One trustworthy joint read; tactile may contain NaN/Inf or status-masked NaN."""
-
-    qpos: np.ndarray
-    current_ma: np.ndarray
-    tactile_aggregate: np.ndarray
-    tactile_dense: np.ndarray
-    commboard_err: np.ndarray
-    jointboard_err: np.ndarray
-    tipboard_err: np.ndarray
 
 
 class XHand:
@@ -406,7 +384,7 @@ class XHand:
             raise XHandError("read", code, "missing state payload")
 
         try:
-            qpos, current, board_errors = self.parse_joints(raw_state)
+            qpos, current, board_errors = parse_joints(raw_state)
         except (AttributeError, TypeError, ValueError, OverflowError) as exc:
             raise XHandError("read", code, f"invalid joint payload: {exc}") from exc
 
@@ -421,12 +399,12 @@ class XHand:
             logger.debug("XHand tactile read incomplete: code=%s", code)
         if aggregate_allowed:
             try:
-                tactile_aggregate = self.parse_tactile_aggregate(raw_state)
+                tactile_aggregate = parse_tactile_aggregate(raw_state)
             except (AttributeError, TypeError, ValueError, OverflowError):
                 logger.debug("XHand tactile aggregate payload invalid", exc_info=True)
         if dense_allowed:
             try:
-                tactile_dense = self.parse_tactile_dense(raw_state)
+                tactile_dense = parse_tactile_dense(raw_state)
             except (AttributeError, TypeError, ValueError, OverflowError):
                 logger.debug("XHand tactile dense payload invalid", exc_info=True)
         for sensor_index, finger_id in enumerate(XHAND_TACTILE_SENSOR_FINGER_IDS):
@@ -553,60 +531,3 @@ class XHand:
         )
         if reason is not None:
             raise ValueError(f"XHand.send_action: {reason}")
-
-    @staticmethod
-    def parse_joints(
-        state: Any,
-    ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-        qpos = np.full(HAND_JOINT_SHAPE, np.nan, dtype=np.float64)
-        current = np.full(HAND_JOINT_SHAPE, np.nan, dtype=np.float64)
-        errors = {
-            name: np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
-            for name in ("commboard_err", "jointboard_err", "tipboard_err")
-        }
-        seen: set[int] = set()
-        for joint in state.finger_state:
-            index = int(joint.id)
-            if index < 0 or index >= HAND_DOF or index in seen:
-                raise ValueError(f"invalid or duplicate joint id {index}")
-            seen.add(index)
-            qpos[index] = float(joint.position)
-            current[index] = float(getattr(joint, "torque", np.nan))
-            errors["commboard_err"][index] = int(joint.commboard_err)
-            # The vendor SDK spells this field jonitboard_err.
-            errors["jointboard_err"][index] = int(joint.jonitboard_err)
-            errors["tipboard_err"][index] = int(joint.tipboard_err)
-        if len(seen) != HAND_DOF:
-            raise ValueError(f"{len(seen)}/{HAND_DOF} joints reported")
-        if not np.all(np.isfinite(qpos)):
-            raise ValueError("non-finite joint position feedback")
-        current[~np.isfinite(current)] = np.nan
-        return qpos, current, errors
-
-    @staticmethod
-    def parse_tactile_aggregate(state: Any) -> np.ndarray:
-        """Return the SDK-native ``[5,3]`` aggregate ``calc_force`` payload."""
-        force_aggregate = np.asarray(
-            [
-                [sensor.calc_force.fx, sensor.calc_force.fy, sensor.calc_force.fz]
-                for sensor in state.sensor_data
-            ],
-            dtype=np.float64,
-        )
-        if force_aggregate.shape != HAND_TACTILE_SUM_SHAPE:
-            raise ValueError("aggregate tactile must have shape [5,3]")
-        return force_aggregate
-
-    @staticmethod
-    def parse_tactile_dense(state: Any) -> np.ndarray:
-        """Return the SDK-native ``[5,120,3]`` dense ``raw_force`` payload."""
-        tactile_dense = np.asarray(
-            [
-                [[force.fx, force.fy, force.fz] for force in sensor.raw_force]
-                for sensor in state.sensor_data
-            ],
-            dtype=np.float64,
-        )
-        if tactile_dense.shape != HAND_TACTILE_FORCE_SHAPE:
-            raise ValueError("dense tactile must have shape [5,120,3]")
-        return tactile_dense
