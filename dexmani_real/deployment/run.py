@@ -21,7 +21,7 @@ from dexmani_real.deployment.config import (
 from dexmani_real.deployment.observation import policy_dependencies, policy_needs
 from dexmani_real.deployment.session import PolicySession
 from dexmani_real.runtime.observation import ObservationNeeds
-from dexmani_real.utils.atomic_io import atomic_yaml_dump
+from dexmani_real.utils.io import write_yaml
 
 
 def session_directory(root: Path, info) -> Path:
@@ -93,7 +93,7 @@ def run_policy(
     dependencies = policy_dependencies(info.observation_fields)
     control_needs = policy_needs(dependencies)
     record_needs = (
-        ObservationNeeds(camera="rgbd", required_tactile=("aggregate", "dense"))
+        ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
         if record_raw else ObservationNeeds()
     )
     needs = control_needs.union(record_needs)
@@ -130,7 +130,7 @@ def run_policy(
         "dexmani_real_head": git_head(Path(__file__).resolve().parents[2]),
         "dexmani_policy_head": git_head(Path(dexmani_policy.__file__).resolve().parents[1]),
     }
-    atomic_yaml_dump(payload, session_dir / "run_config.yaml")
+    write_yaml(payload, session_dir / "run_config.yaml")
 
     print(f"策略：{experiment}；数值表示 recipe 与控制 dt 来自训练 artifact，设备和标定来自 Real")
     duration = f"{max_running_s:g} s" if max_running_s is not None else "无限制"

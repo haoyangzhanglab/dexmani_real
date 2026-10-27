@@ -18,7 +18,6 @@ from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotE
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
-    control_deadline_ns,
     read_observation,
     service_feedback,
 )
@@ -123,7 +122,7 @@ class ReplayPlayer:
         if issues:
             raise TimeoutError("replay feedback: " + "; ".join(issues))
         self.robot.arm.update_health(
-            health_until_ns=control_deadline_ns(deadline_ns, self.runtime.arm),
+            health_until_ns=deadline_ns,
         )
         return row, deadline_ns
 

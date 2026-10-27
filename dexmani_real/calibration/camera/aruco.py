@@ -7,7 +7,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real.calibration.camera.hand_eye import MIN_SAMPLES
-from dexmani_real.runtime.observation import read_camera_frame
+from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.utils.timing import sample_is_fresh
 
 ARUCO_DICT = cv2.aruco.DICT_7X7_50
@@ -107,7 +107,7 @@ class MarkerSampler:
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
                 read_arm()
-                frame = read_camera_frame(channels, payload="rgb")
+                frame = read_camera_frame(channels, fields=("rgb",))
                 if (
                     frame
                     and frame["timestamp_ns"] > last_stamp

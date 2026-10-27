@@ -57,9 +57,6 @@ def log_camera_geometry(intrinsics, base_from_color=None):
 def log_rgbd(rgb, depth_raw, *, depth_scale_m, depth_range_m=None):
     import rerun as rr
 
-    if not np.isfinite(depth_scale_m) or depth_scale_m <= 0:
-        raise ValueError("display depth scale must be finite and positive")
-
     rr.log("camera/color/rgb", rr.Image(rgb, color_model="RGB"))
     rr.log(
         "depth/image",

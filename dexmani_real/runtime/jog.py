@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -11,22 +13,42 @@ from scipy.spatial.transform import Rotation
 
 from dexmani_real.geometry.pose import Pose, quat_multiply
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
-from dexmani_real.runtime.keyboard import CARTESIAN_JOG_KEYS
+from dexmani_real.runtime.keyboard import CARTESIAN_JOG_KEYS, JOG_KEY_PAIRS
+from dexmani_real.runtime.observation import (
+    Observation,
+    ObservationNeeds,
+    check_observation,
+    read_observation,
+    service_feedback,
+)
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 
 if TYPE_CHECKING:
+    from dexmani_real.control.ik import IKResult
     from dexmani_real.robot.system import Robot
     from dexmani_real.runtime.keyboard import Keyboard
 
 
-class JogController:
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class JogStep:
+    observation: Observation | None = None
+    pose: Pose | None = None
+    desired_position: np.ndarray | None = None
+    ik_result: IKResult | None = None
+    committed: bool = False
+    issues: tuple[str, ...] = ()
+
+
+class CartesianJog:
     """持有成功提交的目标参考；跟踪误差不改变操作者目标。"""
 
-    def __init__(self, solver, config, workspace):
+    def __init__(self, solver, config, bounds):
         self.solver = solver
         self.config = config
-        self.position_lower = workspace[:, 0] + config.workspace_command_margin_m
-        self.position_upper = workspace[:, 1] - config.workspace_command_margin_m
+        self.position_lower, self.position_upper = bounds
         self.command_pose = self.command_qpos = None
         self.blocked_until_release = False
 
@@ -34,18 +56,104 @@ class JogController:
         self.command_pose = self.command_qpos = None
 
     def release_if_idle(self, pressed_keys):
-        if not any_jog_key_held(pressed_keys):
+        if CARTESIAN_JOG_KEYS.isdisjoint(pressed_keys):
             self.blocked_until_release = False
+
+    def stop(self, robot, state):
+        revoked = state.revoke_motion()
+        try:
+            robot.stop()
+        finally:
+            self.clear_reference()
+        return revoked
+
+    def pause(self, robot, state):
+        try:
+            return self.stop(robot, state)
+        finally:
+            self.blocked_until_release = True
+
+    def step(self, robot, keys, state, runtime, *, deadline_source):
+        """准备后采样一次，输入代际与两类期限共同约束提交。"""
+        step = JogStep()
+        pressed_keys, generation = keys.snapshot()
+        self.release_if_idle(pressed_keys)
+        moving = jog_motion_requested(pressed_keys) and not self.blocked_until_release
+        with state.motion_lock:
+            safety_state, epoch = state.safety_state, state.run_id
+            allowed = state.requests_allow_motion() and safety_state in (
+                SafetyState.ARMED, SafetyState.RUNNING,
+            )
+        if not allowed:
+            self.stop(robot, state)
+            step.issues = ("jog_motion_revoked",)
+            return step
+
+        if not moving:
+            if robot.stop_required:
+                self.stop(robot, state)
+            self.clear_reference()
+            robot.end_hand_send_interval()
+        elif safety_state == SafetyState.ARMED:
+            self.clear_reference()
+            if robot.stop_required:
+                robot.stop()
+            try:
+                robot.prepare_streaming(
+                    epoch, service=lambda: service_feedback(robot, runtime),
+                )
+                if keys.snapshot()[1] != generation or state.run_id != epoch:
+                    raise OperationCancelled("jog changed during preparation")
+            except (OperationCancelled, TimeoutError) as exc:
+                logger.info("jog preparation interrupted: %s", exc)
+                self.stop(robot, state)
+                return step
+
+        row = step.observation = read_observation(None, robot)
+        issues, feedback_until_ns = check_observation(
+            row, runtime, ObservationNeeds(), require_hand=runtime.hand.enabled,
+        )
+        if issues:
+            self.clear_reference()
+            if robot.stop_required:
+                self.stop(robot, state)
+            step.issues = tuple(issues)
+            return step
+        robot.arm.update_health(health_until_ns=feedback_until_ns)
+        if not moving:
+            return step
+
+        step.pose, step.desired_position, step.ik_result = self.propose(
+            pressed_keys, row.arm["qpos"][0],
+            hand_qpos=(row.hand["qpos"][0] if row.hand is not None
+                       else np.deg2rad(runtime.hand.home_qpos_deg)),
+        )
+        if self.blocked_until_release:
+            self.stop(robot, state)
+            return step
+        source_ns = (int(row.arm["timestamp_ns"][0]) if deadline_source == "arm"
+                     else row.observation_timestamp_ns)
+        try:
+            step.committed = self.submit(
+                step.pose, step.ik_result.qpos, keys, generation, state, robot, epoch,
+                valid_until_ns=feedback_until_ns,
+                execute_until_ns=source_ns + int(self.config.target_max_age_s * 1e9),
+            )
+        except (OperationCancelled, TimeoutError) as exc:
+            logger.info("jog submission interrupted: %s", exc)
+        if not step.committed:
+            self.stop(robot, state)
+        return step
 
     def propose(self, pressed_keys, measured_qpos, *, hand_qpos):
         baseline_qpos, baseline_pose = self.command_qpos, self.command_pose
         if baseline_pose is None:
             baseline_qpos = measured_qpos
             baseline_pose = self.solver.compute_eef_pose_base(measured_qpos)
-        dx, drpy = compute_cartesian_jog_delta(
+        dx, drpy = jog_delta(
             pressed_keys, self.config.delta_pos_m, self.config.delta_rpy_rad
         )
-        pose, desired_position, changed = propose_cartesian_jog_pose(
+        pose, desired_position, changed = jog_pose(
             baseline_pose, dx, drpy,
             self.position_lower, self.position_upper,
         )
@@ -119,25 +227,17 @@ class JogController:
             raise
 
 
-def any_jog_key_held(active_keys: Iterable[str]) -> bool:
-    """相反方向相互抵消时，仍需等待所有 jog 键释放。"""
-    return not CARTESIAN_JOG_KEYS.isdisjoint(active_keys)
-
-
 def jog_motion_requested(active_keys: Iterable[str]) -> bool:
     keys = frozenset(active_keys)
     if keys.intersection({"r", "q", "esc"}):
         return False
     return any(
         (positive in keys) != (negative in keys)
-        for positive, negative in (
-            ("w", "s"), ("d", "a"), ("up", "down"),
-            ("left", "right"), ("i", "k"), ("j", "l"),
-        )
+        for positive, negative in JOG_KEY_PAIRS
     )
 
 
-def propose_cartesian_jog_pose(
+def jog_pose(
     command_pose: Pose,
     dx: np.ndarray,
     drpy: np.ndarray,
@@ -155,44 +255,17 @@ def propose_cartesian_jog_pose(
     return Pose(p=position, q=quaternion), desired_position, changed
 
 
-def compute_cartesian_jog_delta(
+def jog_delta(
     pressed_keys: Iterable[str],
     delta_pos: float,
     delta_rpy: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     keys = frozenset(pressed_keys)
-    dx = np.zeros(3, dtype=np.float64)
-    if "w" in keys:
-        dx[0] += delta_pos
-    if "s" in keys:
-        dx[0] -= delta_pos
-    if "a" in keys:
-        dx[1] -= delta_pos
-    if "d" in keys:
-        dx[1] += delta_pos
-    if "up" in keys:
-        dx[2] += delta_pos
-    if "down" in keys:
-        dx[2] -= delta_pos
-    dx_norm = float(np.linalg.norm(dx))
-    if dx_norm > delta_pos:
-        dx *= delta_pos / dx_norm
-
-    drpy = np.zeros(3, dtype=np.float64)
-    if "left" in keys:
-        drpy[0] += delta_rpy
-    if "right" in keys:
-        drpy[0] -= delta_rpy
-    if "i" in keys:
-        drpy[1] += delta_rpy
-    if "k" in keys:
-        drpy[1] -= delta_rpy
-    if "j" in keys:
-        drpy[2] -= delta_rpy
-    if "l" in keys:
-        drpy[2] += delta_rpy
-    drpy_norm = float(np.linalg.norm(drpy))
-    if drpy_norm > delta_rpy:
-        drpy *= delta_rpy / drpy_norm
-
+    directions = np.array([
+        int(positive in keys) - int(negative in keys)
+        for positive, negative in JOG_KEY_PAIRS
+    ], dtype=np.float64)
+    dx, drpy = directions[:3], directions[3:]
+    dx *= delta_pos / max(1.0, float(np.linalg.norm(dx)))
+    drpy *= delta_rpy / max(1.0, float(np.linalg.norm(drpy)))
     return dx, drpy

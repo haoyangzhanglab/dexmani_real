@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -27,7 +28,7 @@ from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.robot.xhand.config import HandConfig
-from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
+from dexmani_real.utils.io import publish
 from dexmani_real.utils.timing import sampling_clock_ns
 
 CANONICAL_FORMAT = "dexmani.real.canonical"
@@ -228,7 +229,7 @@ def export_zarr(
     target = output.resolve()
     if target == source or source in target.parents or target in source.parents:
         raise ValueError("output and Raw input must not contain one another")
-    if target_is_occupied(output):
+    if os.path.lexists(output):
         raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {output}")
     selected, excluded = select_episodes(source, exclude)
     rotation = quat_wxyz_to_rotmat(processing.handbase_quat_eef_wxyz)
@@ -288,7 +289,7 @@ def export_zarr(
             "episode_ends", data=np.asarray(ends, dtype=np.int64)
         )
         root.attrs["episode_ids"] = episode_ids
-        atomic_publish(cast(Path, staging), target)
+        publish(cast(Path, staging), target)
         staging = None
         if progress_callback:
             progress_callback(len(selected), len(selected))

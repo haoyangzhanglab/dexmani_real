@@ -89,7 +89,6 @@ class SessionState:
                 self.requests_allow_motion()
                 and self.run_id == run_id
                 and self.safety_state == required_safety_state
-                and required_safety_state in (SafetyState.ARMED, SafetyState.RUNNING)
                 and (required_safety_state != SafetyState.RUNNING or not self.stop_signal.is_set())
             )
 
@@ -101,8 +100,6 @@ class SessionState:
         expected_run_id=None,
     ) -> bool:
         with self.motion_lock:
-            if new_state not in (SafetyState.ARMED, SafetyState.DISARMED, SafetyState.FAULT):
-                raise ValueError("revocation must leave streaming mode")
             if expected_run_id is not None and self.run_id != expected_run_id:
                 return False
             if self.safety_state == SafetyState.FAULT and new_state == SafetyState.ARMED:

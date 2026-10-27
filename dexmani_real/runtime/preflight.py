@@ -35,7 +35,7 @@ def validate_control_rate(cfg: ExperimentConfig, control_hz: float) -> None:
             )
 
 
-def validate_keyboard_workspace(runtime: ExperimentConfig) -> np.ndarray:
+def jog_bounds(runtime: ExperimentConfig) -> tuple[np.ndarray, np.ndarray]:
     cfg = runtime.keyboard_teleop
     for name in ("target_max_age_s", "delta_pos_m", "delta_rpy_rad"):
         value = getattr(cfg, name)
@@ -46,6 +46,7 @@ def validate_keyboard_workspace(runtime: ExperimentConfig) -> np.ndarray:
         raise ValueError("workspace_command_margin_m must be finite and non-negative")
     validate_control_rate(runtime, cfg.control_hz)
     workspace = runtime.environment.workspace.as_array()
-    if np.any(workspace[:, 0] + margin >= workspace[:, 1] - margin):
+    lower, upper = workspace[:, 0] + margin, workspace[:, 1] - margin
+    if np.any(lower >= upper):
         raise ValueError("keyboard workspace command margin leaves no interior workspace")
-    return workspace
+    return lower, upper

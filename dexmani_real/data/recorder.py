@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import threading
 import time
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from dexmani_real.data.raw import RawWriter
-from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
+from dexmani_real.utils.io import publish
 
 logger = logging.getLogger(__name__)
 RECORDER_START_TIMEOUT_S = 10.0
@@ -126,7 +127,7 @@ class EpisodeRecorder:
                     self.data_dir / candidate,
                     self.data_dir / f".tmp_{candidate}",
                 )
-                if not target_is_occupied(destination) and not target_is_occupied(staging):
+                if not os.path.lexists(destination) and not os.path.lexists(staging):
                     break
                 if episode_name is not None:
                     raise FileExistsError(f"explicit episode name already exists: {destination}")
@@ -157,7 +158,7 @@ class EpisodeRecorder:
         self.check_error()
         if not self.is_recording:
             return
-        # 观测和命令已拥有只读数组，仅保留写盘需要的字段。
+        # 数组已脱离共享缓冲，入队后生产者不再修改。
         snapshot = SimpleNamespace(
             arm=row.arm,
             hand=row.hand,
@@ -282,7 +283,7 @@ class EpisodeRecorder:
                     and finish is not None
                     and finish.save
                 ):
-                    atomic_publish(staging, destination)
+                    publish(staging, destination)
                     self.published_path, self.staging_path = destination, None
             if self.published_path is not None:
                 logger.info("Raw 已保存：%s（%d 帧）。", destination.name, self.written_frames)

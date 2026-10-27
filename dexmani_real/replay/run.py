@@ -17,7 +17,7 @@ from dexmani_real.runtime.lifecycle import close_runtime
 from dexmani_real.runtime.observation import service_feedback
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 from dexmani_real.runtime.state import SessionState
-from dexmani_real.utils.atomic_io import atomic_json_dump
+from dexmani_real.utils.io import write_json
 from dexmani_real.utils.log import configure_logging
 
 DEFAULT_OUTPUT_DIR = "replay_results"
@@ -57,7 +57,7 @@ def run_replay(
         "errors": [],
     }
     result_path = target / "session_result.json"
-    atomic_json_dump(summary, result_path, overwrite=False)
+    write_json(summary, result_path, overwrite=False)
     runtime_state = robot = keyboard = None
     trajectory_outcome = None
     shutdown_clean = False
@@ -74,9 +74,8 @@ def run_replay(
         )
 
         keyboard = Keyboard(
-            quit_callback=runtime_state.request_quit,
-            stop_callback=runtime_state.request_stop,
             estop_callback=runtime_state.request_emergency_stop,
+            bindings={'q': runtime_state.request_quit, 's': runtime_state.request_stop},
         )
         home_planner = HomePlanner(
             runtime.environment,
@@ -229,7 +228,7 @@ def run_replay(
                 if outcome.replay_data is not None
                 else 0,
             )
-            atomic_json_dump(summary, result_path)
+            write_json(summary, result_path)
         except Exception as exc:
             logger.exception("replay final result publication failed")
             outcome = replace(

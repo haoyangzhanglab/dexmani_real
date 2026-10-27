@@ -8,12 +8,12 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from dexmani_real.ipc.ring import SharedRing
-from dexmani_real.ipc.sensors import SensorChannels
+from dexmani_real.ipc.sensors import SensorChannels, read_vr_frame
 from dexmani_real.runtime.observation import (
+    Observation,
     ObservationNeeds,
     check_observation,
     read_observation,
-    read_vr_frame,
 )
 from dexmani_real.sensor.config import CameraConfig
 from dexmani_real.sensor.realsense import run_camera
@@ -129,7 +129,6 @@ class SharedRingTests(unittest.TestCase):
         invalid = (
             {name: value for name, value in valid.items() if name != "mirror"},
             {**valid, "extra": 0},
-            {**valid, "values": np.ones(1)},
             dict(frame_id=2, values=np.ones(4), unknown=np.ones(4)),
         )
         for fields in invalid:
@@ -216,7 +215,7 @@ class SensorChannelsTests(unittest.TestCase):
         publish_record(channels.camera_ring, camera)
         arm = np.array([(100,)], dtype=[("timestamp_ns", "<u8")])
         robot = SimpleNamespace(read_state=lambda: SimpleNamespace(arm=arm, hand=None))
-        needs = ObservationNeeds(camera="rgb", point_cloud=True, vr=True)
+        needs = ObservationNeeds(camera_fields=("rgb",), point_cloud=True, vr=True)
         row = read_observation(channels, robot, needs=needs)
         self.assertEqual(row.camera["ring_sequence"], camera_sequence)
         self.assertEqual(row.camera["timestamp_ns"], 101)
@@ -224,10 +223,10 @@ class SensorChannelsTests(unittest.TestCase):
         np.testing.assert_array_equal(row.camera["rgb"], np.full((2, 3, 3), 7))
         self.assertNotIn("depth", row.camera)
         self.assertTrue(row.camera["rgb"].flags.owndata)
-        self.assertFalse(row.camera["rgb"].flags.writeable)
+        self.assertFalse(np.shares_memory(row.camera["rgb"], channels.camera_ring.slots))
         self.assertEqual(row.pointcloud_timestamp_ns, 101)
         np.testing.assert_array_equal(row.point_cloud, np.full((4, 6), 3))
-        self.assertFalse(row.point_cloud.flags.writeable)
+        self.assertFalse(np.shares_memory(row.point_cloud, channels.pointcloud_ring.slots))
         self.assertEqual(row.vr["recv_ts_ns"], 99)
         self.assertEqual(row.vr["head_recv_ts_ns"], 90)
         self.assertEqual(row.vr["sequence_id"], 12)
@@ -242,6 +241,7 @@ class SensorChannelsTests(unittest.TestCase):
 
         for _ in range(4):
             publish_record(channels.camera_ring, camera)
+        np.testing.assert_array_equal(row.camera["rgb"], np.full((2, 3, 3), 7))
         self.assertIsNone(read_observation(channels, robot, needs=needs).camera)
         channels.pointcloud_ring.slots[1]["sequence"] = 3
         self.assertIsNone(read_observation(channels, robot, needs=needs).point_cloud)
@@ -250,7 +250,7 @@ class SensorChannelsTests(unittest.TestCase):
         row = read_observation(channels, robot, needs=needs)
         issues, deadline = check_observation(row, runtime, needs, require_hand=False, now_ns=200)
         self.assertEqual(issues, [
-            "camera_source_unavailable_or_unmatched", "pointcloud_unavailable_or_nonfinite",
+            "camera_source_unavailable_or_unmatched", "pointcloud_unavailable",
             "vr_unavailable",
         ])
         self.assertIsNone(deadline)
@@ -361,11 +361,67 @@ class SensorWorkerTests(unittest.TestCase):
 
         robot = SimpleNamespace(read_state=lambda: SimpleNamespace(arm=np.zeros(7), hand=None))
         row = read_observation(
-            self.channels, robot, needs=ObservationNeeds(camera="rgbd", point_cloud=True),
+            self.channels, robot, needs=ObservationNeeds(camera_fields=("rgb", "depth"), point_cloud=True),
         )
         self.assertEqual(row.camera["ring_sequence"], 2)
         self.assertEqual(row.camera["timestamp_ns"], row.pointcloud_timestamp_ns)
         np.testing.assert_array_equal(row.point_cloud, cloud)
+
+    def test_nonfinite_cloud_is_not_published_and_clears_ready(self):
+        from dexmani_real.perception import worker
+
+        publish_record(self.channels.camera_ring, np.zeros((), dtype=self.channels.camera_ring.dtype))
+        camera = SimpleNamespace(T_xarm_base_from_color=np.eye(4), depth_scale_m=0.001, color=None)
+        self.channels.pointcloud_ready.set()
+        with (
+            patch.object(worker, "configure_logging"),
+            patch.object(worker, "PointCloudProcessor") as processor,
+        ):
+            processor.return_value.process.return_value = np.full((4, 6), np.nan)
+            with self.assertRaisesRegex(ValueError, "nonfinite"):
+                worker.run_pointcloud_worker(self.channels, SimpleNamespace(num_points=4), camera, None)
+        self.assertEqual(self.channels.pointcloud_ring.latest_sequence, 0)
+        self.assertFalse(self.channels.pointcloud_ready.is_set())
+
+
+class ObservationTests(unittest.TestCase):
+    def test_camera_needs_merge_in_field_order_and_static_camera_needs_no_pixels(self):
+        needs = ObservationNeeds(camera_fields=("depth",)).union(
+            ObservationNeeds(camera_fields=("rgb", "depth"), camera_static=True),
+        )
+        self.assertEqual(needs.camera_fields, ("rgb", "depth"))
+        static = ObservationNeeds(camera_static=True)
+        self.assertTrue(static.camera_worker)
+        self.assertEqual(static.camera_fields, ())
+
+    def test_source_boundaries_and_control_budget(self):
+        runtime = SimpleNamespace(
+            arm=SimpleNamespace(feedback_max_age_s=2e-9),
+            hand=SimpleNamespace(feedback_max_age_s=2e-9),
+            camera=SimpleNamespace(max_frame_age_s=2e-9),
+            teleop=SimpleNamespace(vr_stale_threshold_s=2e-9),
+        )
+        for stamp, expected in ((0, None), (7, None), (8, 11), (10, 12), (11, None)):
+            with self.subTest(arm_timestamp=stamp):
+                row = Observation(
+                    arm=np.array([(stamp,)], dtype=[("timestamp_ns", "<u8")]),
+                    hand=None, camera=None, vr=None, point_cloud=None,
+                    observation_timestamp_ns=10,
+                )
+                issues, deadline = check_observation(
+                    row, runtime, ObservationNeeds(), require_hand=False, now_ns=10,
+                )
+                self.assertEqual(bool(issues), expected is None)
+                self.assertEqual(deadline, expected)
+        row = Observation(
+            arm=np.array([(10,)], dtype=[("timestamp_ns", "<u8")]),
+            hand=np.array([(8,)], dtype=[("timestamp_ns", "<u8")]),
+            camera=None, vr={"recv_ts_ns": 8}, point_cloud=None,
+            observation_timestamp_ns=10,
+        )
+        issues, deadline = check_observation(row, runtime, ObservationNeeds(vr=True), now_ns=10)
+        self.assertEqual(issues, ["hand_timestamp_ns_unavailable_or_stale"])
+        self.assertIsNone(deadline)
 
 
 if __name__ == "__main__":

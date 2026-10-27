@@ -13,7 +13,7 @@ from dexmani_real.calibration.vr_heading import load_vr_transform
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.recorder import RecordingError
-from dexmani_real.ipc.sensors import SensorChannels
+from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import home_hand
@@ -25,10 +25,7 @@ from dexmani_real.runtime.lifecycle import (
     SensorWorkers,
     close_runtime,
 )
-from dexmani_real.runtime.observation import (
-    ObservationNeeds,
-    snapshot_camera_parameters,
-)
+from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 from dexmani_real.runtime.state import RunEndReason, SessionState
 from dexmani_real.sensor.realsense import run_camera
@@ -98,7 +95,7 @@ def run_teleop(
     )
     control_needs = ObservationNeeds(vr=True)
     record_needs = (
-        ObservationNeeds(camera="rgbd", required_tactile=("aggregate", "dense"))
+        ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
         if runtime.collection.enabled
         else ObservationNeeds()
     )
@@ -127,8 +124,10 @@ def run_teleop(
         )
         keyboard = Keyboard(
             estop_callback=runtime_state.request_emergency_stop,
-            stop_callback=runtime_state.request_stop,
-            quit_callback=lambda: runtime_state.request_stop(reason=RunEndReason.QUIT),
+            bindings={
+                "s": runtime_state.request_stop,
+                "q": lambda: runtime_state.request_stop(reason=RunEndReason.QUIT),
+            },
         )
         audio = AudioFeedback()
         loop = TeleopLoop(
@@ -149,7 +148,7 @@ def run_teleop(
                 else None
             ),
         )
-        keyboard.discard_callback = loop.request_discard
+        keyboard.bindings["d"] = loop.request_discard
         keyboard.start()
 
         def check_services():

@@ -418,7 +418,7 @@ class DataTests(unittest.TestCase):
 
     def test_timeout_during_commit_reports_pending_then_actual_publication(self):
         entered, release = threading.Event(), threading.Event()
-        original = recording.atomic_publish
+        original = recording.publish
 
         def publish(source, destination):
             entered.set()
@@ -427,7 +427,7 @@ class DataTests(unittest.TestCase):
             return original(source, destination)
 
         with (
-            patch.object(recording, "atomic_publish", publish),
+            patch.object(recording, "publish", publish),
             patch.object(recording, "RECORDER_STOP_TIMEOUT_S", 0.03),
         ):
             recorder = self.start()

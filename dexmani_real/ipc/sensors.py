@@ -1,8 +1,10 @@
+import json
+
 import numpy as np
 
+from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.ipc.ring import SharedRing
 from dexmani_real.sensor.config import CameraConfig
-
 
 # 右手发布携带最近头部姿态；recv_ts_ns 取腕部与关键点中较早的接收时刻。
 VR_DTYPE = np.dtype(
@@ -70,3 +72,40 @@ class SensorChannels:
         self.camera_depth_scale = ctx.RawValue("d", 0.0)
         self.camera_serial = ctx.RawArray("c", 32)
         self.camera_intrinsics = ctx.RawArray("c", 2048)
+
+
+def snapshot_camera_parameters(channels, config, calibration, *, require_extrinsics=False):
+    """在 ready 边界复制相机静态参数，之后不再依赖 worker 或共享通道。"""
+    if not channels.camera_ready.is_set():
+        raise ValueError("camera parameters require a ready camera")
+    serial = channels.camera_serial.value.decode("utf-8").strip()
+    if config.serial is not None and serial != config.serial:
+        raise ValueError("active camera serial differs from configuration")
+    color = CameraIntrinsics(**json.loads(channels.camera_intrinsics.value.decode("utf-8")))
+    if (color.height, color.width) != (config.height, config.width):
+        raise ValueError("camera intrinsics differ from configured resolution")
+    transform = None if calibration is None else calibration[serial]
+    if require_extrinsics and transform is None:
+        raise ValueError("camera consumer requires current extrinsics")
+    return CameraSnapshot(serial, color, channels.camera_depth_scale.value, transform)
+
+
+def read_vr_frame(channels):
+    result = channels.vr_ring.read()
+    if result is None:
+        return None
+    record, sequence = result
+    return {**{name: record[name] for name in record.dtype.names}, "ring_sequence": sequence}
+
+
+def read_camera_frame(channels, sequence=None, *, fields=("rgb", "depth")):
+    result = channels.camera_ring.read(
+        fields=("timestamp_ns", "color_frame_number", *fields), sequence=sequence,
+    )
+    if result is None:
+        return None
+    data, sequence = result
+    data["ring_sequence"] = sequence
+    data["timestamp_ns"] = int(data["timestamp_ns"])
+    data["color_frame_number"] = int(data["color_frame_number"])
+    return data

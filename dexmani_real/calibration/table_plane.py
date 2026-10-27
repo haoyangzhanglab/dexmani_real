@@ -11,7 +11,7 @@ import numpy as np
 
 from dexmani_real import PACKAGE_DIR
 from dexmani_real.geometry.plane import TablePlaneFit
-from dexmani_real.utils.atomic_io import atomic_json_dump
+from dexmani_real.utils.io import write_json
 
 if TYPE_CHECKING:
     from dexmani_real.control.config import TableCollisionConfig
@@ -48,4 +48,4 @@ def resolve_table_plane(
 def save_table_plane(path: str | Path, fit: TablePlaneFit) -> None:
     payload = fit.to_dict()
     payload["calibrated_at_utc"] = datetime.now(timezone.utc).isoformat()
-    atomic_json_dump(payload, path, ensure_ascii=False)
+    write_json(payload, path)

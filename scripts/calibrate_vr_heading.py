@@ -15,18 +15,17 @@ import numpy as np
 from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.calibration.vr_heading import VRCalibration, estimate_heading
 from dexmani_real.geometry.pose import forward_from_quat_wxyz
-from dexmani_real.ipc.sensors import SensorChannels
+from dexmani_real.ipc.sensors import SensorChannels, read_vr_frame
 from dexmani_real.runtime.lifecycle import (
     VR_READY_TIMEOUT_S,
     SensorWorkers,
     close_runtime,
 )
-from dexmani_real.runtime.observation import read_vr_frame
 from dexmani_real.runtime.state import SessionState
 from dexmani_real.sensor.config import VRConfig
 from dexmani_real.sensor.vr import run_vr
 from dexmani_real.teleop.audio import AudioFeedback
-from dexmani_real.utils.atomic_io import atomic_json_dump
+from dexmani_real.utils.io import write_json
 
 POLL_INTERVAL_S = 0.01
 PRINT_INTERVAL_S = 5.0
@@ -65,7 +64,7 @@ def publish_vr_transform(
         },
         "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
-    return atomic_json_dump(payload, path, overwrite=not poor)
+    return write_json(payload, path, overwrite=not poor)
 
 
 def read_heading(channels: SensorChannels, reference: str):

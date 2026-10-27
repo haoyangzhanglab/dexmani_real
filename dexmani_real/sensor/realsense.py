@@ -205,6 +205,11 @@ def run_camera(shared, config: CameraConfig):
             frame = camera.read()
             if frame is None:
                 continue
+            if (
+                frame.rgb.shape != (config.height, config.width, 3)
+                or frame.depth.shape != (config.height, config.width)
+            ):
+                raise ValueError("camera pixels must match the configured RGB-D shape")
             shared.camera_ring.write(
                 timestamp_ns=frame.timestamp_ns,
                 color_frame_number=frame.color_frame_number,

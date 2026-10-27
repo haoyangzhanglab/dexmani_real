@@ -2,7 +2,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dexmani_real.utils.atomic_io import atomic_json_dump
+from dexmani_real.utils.io import write_json
 
 
 def utc_now():
@@ -26,7 +26,7 @@ class SessionResults:
         )
         self.current = None
         self.running_ns = None
-        atomic_json_dump(self.session, self.path, overwrite=False)
+        write_json(self.session, self.path, overwrite=False)
 
     def begin_episode(self):
         if self.current is not None:
@@ -102,7 +102,7 @@ class SessionResults:
         self.current["metrics"].update(metrics)
         self.session["episodes"].append(self.current)
         self.current = self.running_ns = None
-        atomic_json_dump(self.session, self.path)
+        write_json(self.session, self.path)
 
     def update_episode_raw(self, index: int, raw):
         """关闭阶段只核对指定轮次已有的 Raw 摘要，随最终会话结果一起落盘。"""
@@ -116,4 +116,4 @@ class SessionResults:
             shutdown_clean=bool(shutdown_clean),
             **details,
         )
-        atomic_json_dump(self.session, self.path)
+        write_json(self.session, self.path)

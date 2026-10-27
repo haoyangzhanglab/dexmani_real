@@ -82,9 +82,10 @@ class HandEyeTests(unittest.TestCase):
             session = CameraCalibration(SimpleNamespace(), hand_geometry="absent")
             session.samples = list(zip(eef, marker))
             session.runtime_state = SimpleNamespace(run_id=1)
-            session.stop_jog = Mock(return_value=True)
-            session.cancel_requested = Mock(return_value=False)
             session.robot = Mock()
+            session.jog = Mock()
+            session.jog.pause.return_value = True
+            session.cancel_requested = Mock(return_value=False)
             errors = np.full(16, position), np.full(16, rotation)
             errors[0][-1] *= 2
             errors[1][-1] *= 2
@@ -121,7 +122,9 @@ class HandEyeTests(unittest.TestCase):
             session = CameraCalibration(SimpleNamespace(), hand_geometry="absent", output_path=path)
             session.samples = list(zip(eef, marker))
             session.runtime_state = SimpleNamespace(run_id=1)
-            session.stop_jog = Mock(return_value=True)
+            session.robot = Mock()
+            session.jog = Mock()
+            session.jog.pause.return_value = True
             session.cancel_requested = Mock(return_value=False)
             session.serial = "test"
             session.camera_width, session.camera_height = 640, 480
@@ -151,7 +154,9 @@ class HandEyeTests(unittest.TestCase):
         session = CameraCalibration(SimpleNamespace(), hand_geometry="absent")
         session.samples = list(zip(eef, marker))
         session.runtime_state = SimpleNamespace(run_id=1)
-        session.stop_jog = Mock(return_value=True)
+        session.robot = Mock()
+        session.jog = Mock()
+        session.jog.pause.return_value = True
         session.cancel_requested = Mock(return_value=False)
 
         def solve(*args):

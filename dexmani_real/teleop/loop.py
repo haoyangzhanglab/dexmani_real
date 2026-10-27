@@ -13,7 +13,6 @@ from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotE
 from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.observation import (
     check_observation,
-    control_deadline_ns,
     read_observation,
     service_feedback,
 )
@@ -232,12 +231,14 @@ class TeleopLoop:
 
         self.robot.reset_hand_feedback()
         try:
-            row = read_observation(
-                self.sensors.channels, self.robot, needs=self.needs, wait_for_hand=True,
+            self.robot.read_initial_state(
                 cancel_requested=lambda: (
                     self.poll_blocking_commands() or not self.preparation_valid()
                 ),
             )
+            if not self.preparation_valid():
+                raise OperationCancelled("cancelled during initial feedback acquisition")
+            row = read_observation(self.sensors.channels, self.robot, needs=self.needs)
             issues, _ = self.admit_observation(row)
         except OperationCancelled:
             if self.phase is TeleopPhase.PREPARING:
@@ -423,7 +424,7 @@ class TeleopLoop:
             if record_issues:
                 raise RecordingError("recording sources: " + "; ".join(record_issues))
         self.robot.arm.update_health(
-            health_until_ns=control_deadline_ns(feedback_until_ns, self.runtime.arm),
+            health_until_ns=feedback_until_ns,
         )
         return issues, feedback_until_ns
 

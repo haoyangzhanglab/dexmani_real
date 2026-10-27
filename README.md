@@ -25,7 +25,7 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 | 动作控制 | [`control/`](dexmani_real/control/) | 动作映射、在线 IK、目标约束、关节等价角与 HOME 路径；在线接触和 HOME 间隙规则保持分离 |
 | 共享运行 | [`runtime/`](dexmani_real/runtime/) · [`ipc/`](dexmani_real/ipc/) | 会话状态、键盘输入、观测、资源启停、HOME/jog 协调及进程间通信 |
 | 实验执行 | [`teleop/`](dexmani_real/teleop/) · [`deployment/`](dexmani_real/deployment/) · [`replay/`](dexmani_real/replay/) | 遥操作、学习策略执行与轨迹回放 |
-| 数据管理 | [`data/`](dexmani_real/data/) | Raw 记录、Canonical 处理与导出；`session_results.py` 管理会话结果 |
+| 数据管理 | [`data/`](dexmani_real/data/) | Raw 记录、Canonical 处理与导出；`deployment/results.py` 管理策略会话结果 |
 | 配置与标定 | [`config.py`](dexmani_real/config.py) · [`calibration/`](dexmani_real/calibration/) | 实验配置装配、标定算法、交互会话及默认参数；配置定义仍位于各领域 |
 | 通用工具 | [`utils/`](dexmani_real/utils/) | 原子写入、计时、日志与可视化 |
 
@@ -55,6 +55,8 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 部署沿 `deployment/run.py → session.py → rollout.py` 执行：`config.py` 统一解析与校验执行配置，会话持有设备和模型，`PolicyRollout` 协调单轮观测、提交与录制。`schedule.py` 根据时钟与状态决定 sync/async/RTC 调度，`observation.py` 按需组装输入，`inference.py` 独占模型线程。来源时效在观测入口检查，策略输入的数值与形状在 `dexmani_policy` 边界检查；历史快照仅在提交预测时创建。回放沿 `replay/run.py → player.py` 执行，`data.py` 读取轨迹并缓存实测数据，`metrics.py` 在硬件收尾后计算匹配帧的关节与末端误差。
 
+策略选择交给 Policy 的公开 `inspect_policy`：Real 默认 latest，也支持 best、20pct 等 milestone 和显式 checkpoint 路径。显式相对路径以当前工作目录解析；weights/NFE 的显式参数优先。执行长度仍取 execution 配置或模型 n_action_steps。
+
 `control/constraints.py` 统一等价角、绝对跳变和 `MotionConstraints` 端点约束。`control/ik.py` 的 `IKSolver` 接收共享约束、位置和旋转容差，`solve(..., hand_qpos=...)` 显式指定碰撞手姿；动作映射、键盘 jog 和相机标定共用这一接口。
 
 IK 保留上一命令、实测状态及正负零空间初值；评分只使用关节距离和限位惩罚，搜索权重与步长固定在算法模块。位姿误差用于容差准入，SVD 只用于生成零空间方向。候选 FK 同时用于误差和工作空间检查，碰撞模型统一管理自碰撞、静态障碍和可选桌面。`HomePlanner(environment, arm, table_plane_abcd=...)` 与执行器共用 `ArmConfig` 的运行限位和到位容差，桌面间隙参数由 `EnvironmentConfig` 提供；`plan(current, target)` 保留三种关节路径、1° 采样及绝对等价分支对齐。无需移动的 HOME 仍检查几何约束，并由实测反馈确认停稳。
@@ -63,7 +65,7 @@ IK 保留上一命令、实测状态及正负零空间初值；评分只使用�
 
 `perception/config.py` 只保留点云点数、工作空间、桌面开关与余量，以及手点云点数。`table_margin_m` 是点到向上桌面平面的最小距离，默认 7 mm；该范围内的低矮物体表面也会被裁掉。深度范围 0.30–1.50 m、断层阈值 30 mm、表面带宽 8 mm、体素 5 mm、去噪半径 12 mm 和最少 6 个邻居固定在算法模块。点数不足时循环已有点，空点云在线不发布、离线导出报错。
 
-手表面按当前 XHand URDF 的单个本地网格、零 visual 位姿和内嵌颜色读取，这些资产前提由测试检查；采样按面积分配，按 link 顺序使用从 0 开始的固定种子。Canonical 从每个 episode 的相机快照统一派生点云与相机参数，并保存保留的实验参数，部署按保存参数恢复。包含已删除过滤参数或 `seed` 的旧配方不兼容，须重新导出数据并重新训练受影响的 checkpoint；未知 YAML 参数直接报错。
+手表面按当前 XHand URDF 的单个本地网格、零 visual 位姿和内嵌颜色读取，这些资产前提由测试检查；采样按面积分配，按 link 顺序使用从 0 开始的固定种子。Canonical 从每个 episode 的相机快照统一派生点云与相机参数，并保存保留的实验参数，部署按保存参数恢复。未知 YAML 参数直接报错。
 
 `scripts/tools/view_pointcloud.py` 提供诊断快照与性能测量；快照直接写入独立目录，失败时可能保留部分文件。`scripts/tools/view_realsense.py` 提供实时预览，点云计算、标定读取或设备故障会退出并报告失败；退出时停止键盘监听、断开 viewer、恢复原曝光优先级并断开相机，恢复失败也会报告失败。
 
@@ -79,13 +81,17 @@ XHand 的 SDK 载荷解析、错误码和板卡诊断位于 `robot/xhand/driver.
 
 机器人同步操作及 XHand 诊断脚本的取消统一抛出 `OperationCancelled`，运行边界以 `RobotError` 报告设备故障；初始化和收尾保留原始失败原因。SDK 原生输出直接显示。
 
-`JogController.submit()` 负责输入代际、运动授权和提交后参考更新。`EpisodeRecorder` 使用 `start()`、`append()`、`finish()`，收尾时显式指定保存意图、终止原因和技术状态，`result()` 返回最后可观察的录制结果。
+`CartesianJog.submit()` 负责输入代际、运动授权和提交后参考更新。`EpisodeRecorder` 使用 `start()`、`append()`、`finish()`，收尾时显式指定保存意图、终止原因和技术状态，`result()` 返回最后可观察的录制结果。
 
 `sensor` 平铺为 `config.py`、`realsense.py` 和 `vr.py`，进程入口为 `run_camera` 和 `run_vr`，SDK 在实际使用时导入。配置类型为 `CameraConfig`、`VRConfig`；相机预热固定为 10 帧，来源停滞期限为 2 秒，这两项不接受 YAML 覆盖。`RealSenseCamera.read()` 返回 `RGBDFrame`，单次读取等待固定为 300 ms，短暂等待超时或重复帧返回 `None`，持续停滞或 SDK 故障抛出异常。驱动统一维护来源时间与去重，`depth` 为对齐到 color 网格的原始深度，`color_intrinsics`、`depth_scale_m` 在连接成功后直接读取。
 
 `runtime` 按职责平铺为 `state`、`keyboard`、`observation`、`lifecycle`、`preflight`、`home` 和 `jog`。`SessionState` 管理运行代际与停止请求，`SensorWorkers` 持有传感进程，`close_runtime()` 按顺序回收资源。`home_hand()`、`home_arm()` 直接使用机器人对象中的设备配置，并分别负责本次运动的停止；`home_robot()` 顺序执行两者。
 
-`Keyboard.poll()` 返回小写按键字符串；命令、标定和预览共用一个事件队列。离散操作每次按下只触发一次，长按 jog 仍连续移动，松键会使旧提案失效。每个键盘实例只启动一次，`discard_events(*keys)` 用于丢弃阻塞操作期间的旧事件。
+`Keyboard(bindings={...})` 将离散按键绑定到会话操作，ESC 独立锁存急停。`Keyboard.poll()` 返回小写按键字符串；命令、标定和预览共用一个事件队列。离散操作每次按下只触发一次，长按 jog 仍连续移动，松键会使旧提案失效。每个键盘实例只启动一次，`discard_events(*keys)` 用于丢弃阻塞操作期间的旧事件。
+
+键盘遥操作与相机标定共用 `CartesianJog.step()`：准备、采样、IK、代际核对和提交位于同一路径，每个普通控制周期只读取一次机器人反馈，阻塞准备后再取新反馈。两者分别以观测时间和机械臂来源时间计算目标执行期限。输入代际在发布与首次 SDK 发送前核对；IK 拒绝或提交前输入失效时，当周期立即停止并清除目标参考。`pause()` 用于标定采样及保存前停止运动，并要求释放全部 jog 键后才能恢复。
+
+`utils/io.py` 提供 `write_json()`、`write_yaml()` 和 `publish()`，共用临时文件清理与原子发布；JSON 固定保留中文并拒绝非有限数值，`overwrite=False` 使用 Linux `renameat2` 禁止覆盖。`Rate(hz)` 每周期至多休眠一次，小幅迟到保留原时钟网格，错过整周期则重新计时；HOME 后调用 `reset()`。
 
 运行资源超时使用代码常量：相机、点云、VR 启动分别为 15、30、120 秒，正常退出等待预算为 65 秒，定义于 `runtime/lifecycle.py`；模型启动为 300 秒，定义于 `deployment/session.py`。部署清理共享同一截止时间；仍存活的传感进程依次执行 terminate、kill，各等待至多 1 秒，因此总清理时间可能超过正常退出预算。超时不属于 YAML 配置项，未知配置键会报错。
 
@@ -133,7 +139,9 @@ XHand 保留 serial 与 EtherCAT，连接失败直接报告，不自动重试。
 
 来源时间由载荷携带，IPC 不生成替代来源时间的发布时钟。点云携带 `source_camera_sequence` 和原始相机 `timestamp_ns`；同时需要像素与点云时，只读取对应相机序列，匹配失败视为观测缺失。控制所需观测缺失时，遥操作或部署按现有准入规则结束本轮；标定采样继续在自身期限内等待。
 
-`read_camera_frame()` 返回来源 `timestamp_ns`、共享内存发布序列 `ring_sequence`、RGB 设备帧号 `color_frame_number` 及请求的像素通道。发布序列不是设备帧身份；时间戳保留 RGB-D 中较早通道的首次主机接收时间，不代表曝光时刻。标定采样和预览只读取 RGB，采样仍要求屏障后的新鲜、不同 RGB 帧。
+`ipc/sensors.py` 提供 `read_camera_frame(fields=("rgb", "depth"))`、`read_vr_frame()` 和 `snapshot_camera_parameters()`。相机读取返回来源 `timestamp_ns`、共享内存发布序列 `ring_sequence`、RGB 设备帧号 `color_frame_number` 及请求的像素通道。发布序列不是设备帧身份；时间戳保留 RGB-D 中较早通道的首次主机接收时间，不代表曝光时刻。标定采样和预览只读取 RGB，采样仍要求屏障后的新鲜、不同 RGB 帧。
+
+`ObservationNeeds.camera_fields` 直接声明所需像素字段；静态参数需求独立声明。`read_observation()` 只负责当前采样，手部初始化等待由准备阶段显式完成；`check_observation()` 统一返回来源问题与提交期限。相机尺寸和点云有限性在生产者发布前检查，IPC 保留字段完整性、复制前后序列核对。观测与策略历史使用已脱离共享缓冲的数组，提交给推理或录制后，生产者不再修改这些快照。
 
 `termination_reason` 保留首次终止原因，Teleop 的准备与运行阶段均使用 `RunEndReason` 的小写名称，具体中止上下文写入 `termination_details`。`technical_status` 反映该次产物的技术完成状态，发布状态单独描述文件是否已发布。控制中止后的完整记录可以保存为 `failed` episode；录制队列满、写入或关闭失败则报错并保留临时目录，不发布正式 episode。Teleop 的 D 键回调先锁存丢弃意图并撤销运动，再发布按键事件；收尾请求前到达的 DISCARD 在准备、求解或停止失败时仍保持丢弃意图，writer 退出后删除临时目录。已发布 Raw 不因后续独立会话清理错误而回写。
 
@@ -182,7 +190,7 @@ mypy 按现有类型标注检查上述模块，不检查未标注函数体或外
 
 `tests/test_teleop.py` 检查 VR 映射、EMA 提交时机、TAG 梯度、DexPilot 数值等价及求解错误传播，并用假设备和播放器覆盖停止、录制收尾与音频抢占；还需遥操作原有的 NLopt 和 dex_retargeting 依赖。
 
-`tests/test_geometry.py` 与 `tests/test_perception.py` 检查坐标约定、批量旋转、畸变反投影、桌面拟合、XHand 资产前提、固定采样以及在线和离线几何一致性；导出测试使用实际 HDF5、视频和 Zarr，覆盖参数恢复、字段完整性、坏数据立即报错和显式排除。`tests/test_runtime.py` 覆盖实时预览模式切换、异常退出与曝光恢复；`tests/test_sensor.py` 使用假 SDK 检查来源时间、去重、停滞、资源释放和 VR 接收；`tests/test_data.py` 检查批量写盘、失败保留、显式丢弃及发布超时。
+`tests/test_geometry.py` 与 `tests/test_perception.py` 检查坐标约定、批量旋转、畸变反投影、桌面拟合、XHand 资产前提、固定采样以及在线和离线几何一致性；导出测试使用实际 HDF5、视频和 Zarr，覆盖参数恢复、字段完整性、坏数据立即报错和显式排除。`tests/test_runtime.py` 覆盖 jog 准备后采样、输入撤销、超时、停止失败，以及实时预览模式切换、异常退出与曝光恢复；`tests/test_sensor.py` 使用假 SDK 检查来源时间、去重、停滞、资源释放和 VR 接收；`tests/test_data.py` 检查批量写盘、失败保留、显式丢弃及发布超时。
 
 `tests/test_deployment.py` 使用假设备和可控模型结果检查三种调度、LAMP 历史、来源期限、初始化失败、迟到推理和收尾，核对 checkpoint 选择、配置恢复与实验结果字段，并通过已安装的 `dexmani_policy` 验证策略输入边界。`tests/test_utils.py` 检查原子写入和计时超期；这些测试均不连接硬件。
 

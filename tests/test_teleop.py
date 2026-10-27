@@ -283,7 +283,7 @@ def active_loop(recording=True):
     runtime = load_experiment_config()
     instance = loop.TeleopLoop(
         state, runtime, robot, task_label="test", control_needs=ObservationNeeds(vr=True),
-        record_needs=ObservationNeeds(camera="rgbd", required_tactile=("aggregate", "dense")),
+        record_needs=ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense")),
         sensors=Mock(), controller=Mock(), home_planner=Mock(),
         recording_dir=Path("unused") if recording else None, keyboard=Mock(), audio=Mock(),
     )
@@ -330,7 +330,9 @@ class LoopTests(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 instance = active_loop()
                 recorder = instance.recorder
-                keys = Keyboard(discard_callback=instance.request_discard)
+                keys = Keyboard(
+                    bindings={'d': instance.request_discard},
+                )
                 keys.active, keys.listener = True, Mock()
                 self.addCleanup(keys.stop)
                 instance.keyboard = keys
@@ -363,7 +365,9 @@ class LoopTests(unittest.TestCase):
         instance.phase = loop.TeleopPhase.IDLE
         instance.runtime_state.revoke_motion()
         instance.admit_observation = Mock(return_value=([], 10**30))
-        keys = Keyboard(discard_callback=instance.request_discard)
+        keys = Keyboard(
+            bindings={'d': instance.request_discard},
+        )
         keys.active, keys.listener = True, Mock()
         self.addCleanup(keys.stop)
         instance.keyboard = keys
@@ -555,7 +559,7 @@ class LoopTests(unittest.TestCase):
             raise OperationCancelled()
 
         with (
-            patch.object(loop, "read_observation", side_effect=read),
+            patch.object(instance.robot, "read_initial_state", side_effect=read),
             patch.object(loop, "EpisodeRecorder") as recorder,
         ):
             instance.start_episode(instance.runtime_state.run_id)
@@ -668,6 +672,7 @@ class SessionTests(unittest.TestCase):
             with self.subTest(stage=failing_stage), ExitStack() as stack:
                 state = SessionState()
                 robot, keys, sensors, player, control_loop = (Mock() for _ in range(5))
+                keys.bindings = {}
                 sensors.shutdown.return_value = True
                 player.wait_until_idle.return_value = True
                 control_loop.run.side_effect = state.request_quit
@@ -696,7 +701,7 @@ class SessionTests(unittest.TestCase):
                 })
                 result = session.run_teleop(runtime, allow_no_hand=True)
                 self.assertEqual(result, int(failing_stage is not None))
-                self.assertEqual(keys.discard_callback, control_loop.request_discard)
+                self.assertEqual(keys.bindings["d"], control_loop.request_discard)
                 control_loop.close.assert_called_once()
                 player.close.assert_called_once()
                 robot.close.assert_called_once()

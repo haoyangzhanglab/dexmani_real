@@ -13,7 +13,7 @@ from dexmani_real.geometry.pose import (
     validate_rigid_transform,
     validate_unit_quaternion_wxyz,
 )
-from dexmani_real.utils.atomic_io import atomic_json_dump
+from dexmani_real.utils.io import write_json
 
 
 def pose_to_matrix(position, orientation) -> np.ndarray:
@@ -93,4 +93,4 @@ def save_camera_calibration(
         cam_name = f"camera_{idx}"
 
     existing[cam_name] = entry
-    atomic_json_dump(existing, json_path, ensure_ascii=False, cancelled=cancelled)
+    write_json(existing, json_path, cancelled=cancelled)

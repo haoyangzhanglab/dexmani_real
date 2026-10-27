@@ -120,7 +120,7 @@ class RunTests(unittest.TestCase):
                     self.assertFalse(table.call_args.kwargs["required"])
                     kwargs = owner.call_args.kwargs
                     self.assertEqual(kwargs["record_raw"], record_raw)
-                    self.assertEqual(kwargs["record_needs"].camera, "rgbd" if record_raw else "none")
+                    self.assertEqual(kwargs["record_needs"].camera_fields, ("rgb", "depth") if record_raw else ())
                     config = yaml.safe_load((kwargs["output_dir"] / "run_config.yaml").read_text())
                     self.assertEqual(set(config), {
                         "experiment", "checkpoint", "policy", "future_steps", "runtime",
@@ -244,7 +244,12 @@ class RolloutTests(unittest.TestCase):
         self.tick(item)
         self.assertEqual(len(rows), 2)
         self.assertLess(rows[-1].observation_timestamp_ns, item.history[-1].observation_timestamp_ns)
-        self.assertFalse(rows[-1].values["hand_qpos"].flags.writeable)
+        hand = rows[-1].values["hand_qpos"].copy()
+        observation["joint_state"][:] = 99
+        np.testing.assert_array_equal(rows[-1].values["hand_qpos"], hand)
+        self.assertFalse(np.shares_memory(
+            rows[-1].values["hand_qpos"], item.history[-1].values["hand_qpos"],
+        ))
 
     def test_async_keeps_old_tail_until_late_prediction_takes_over(self):
         item = self.bootstrap("async")
@@ -352,7 +357,7 @@ class RolloutTests(unittest.TestCase):
             self.assertIn("arm_feedback_stale", issues)
 
     def test_policy_input_boundary_still_rejects_nonfinite_observations(self):
-        from dexmani_policy.deployment.runtime import PolicyRuntime
+        from dexmani_policy.deployment import PolicyRuntime
 
         info = policy_info(n_obs_steps=1, rgb_preprocessing={})
         policy = PolicyRuntime(

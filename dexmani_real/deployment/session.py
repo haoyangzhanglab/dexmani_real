@@ -25,7 +25,7 @@ from dexmani_real.deployment.observation import (
 )
 from dexmani_real.deployment.results import SessionResults
 from dexmani_real.deployment.rollout import PolicyRollout, failure_reason
-from dexmani_real.ipc.sensors import SensorChannels
+from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import home_robot
@@ -37,13 +37,10 @@ from dexmani_real.runtime.lifecycle import (
     SensorWorkers,
     close_runtime,
 )
-from dexmani_real.runtime.observation import (
-    service_feedback,
-    snapshot_camera_parameters,
-)
+from dexmani_real.runtime.observation import service_feedback
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
-from dexmani_real.utils.atomic_io import atomic_yaml_dump
+from dexmani_real.utils.io import write_yaml
 from dexmani_real.utils.log import configure_logging, error_detail
 
 logger = logging.getLogger(__name__)
@@ -227,8 +224,7 @@ class PolicySession:
         )
         self.keyboard = Keyboard(
             estop_callback=self.runtime_state.request_emergency_stop,
-            stop_callback=self.request_stop,
-            quit_callback=self.request_quit,
+            bindings={'s': self.request_stop, 'q': self.request_quit},
         )
 
     def check_services(self):
@@ -236,13 +232,13 @@ class PolicySession:
             self.runtime_state.request_emergency_stop()
             return False
         control_services = []
-        if self.control_needs.camera != "none" or self.control_needs.point_cloud:
+        if self.control_needs.camera_fields or self.control_needs.point_cloud:
             control_services.append("camera")
         if self.control_needs.point_cloud:
             control_services.append("pointcloud")
         if not self.sensors.check(names=control_services):
             raise RobotError("control sensor process exited")
-        if self.record_needs.camera != "none" and not self.sensors.check(names=("camera",)):
+        if self.record_needs.camera_fields and not self.sensors.check(names=("camera",)):
             raise RecordingError("recording camera process exited")
         return True
 
@@ -275,7 +271,7 @@ class PolicySession:
                 "transform_direction": "color_optical_to_xarm_base",
                 "translation_units": "m",
             }
-            atomic_yaml_dump(
+            write_yaml(
                 self.run_config, self.output_dir / "run_config.yaml",
             )
         if self.needs.point_cloud:
@@ -293,7 +289,7 @@ class PolicySession:
                 timeout_s=POINTCLOUD_READY_TIMEOUT_S,
                 may_start=lambda: self.keyboard.healthy and self.runtime_state.requests_allow_motion(),
             )
-        if self.needs.camera_static and self.needs.camera == "none" and not self.needs.point_cloud:
+        if self.needs.camera_static and not self.needs.camera_fields and not self.needs.point_cloud:
             if not self.sensors.shutdown(deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S):
                 raise RuntimeError("static camera failed to close normally")
             self.sensors.channels = None

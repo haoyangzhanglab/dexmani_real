@@ -15,9 +15,11 @@ logger = logging.getLogger(__name__)
 
 LISTENER_START_TIMEOUT_S = 2.0
 LISTENER_STOP_TIMEOUT_S = 0.25
-CARTESIAN_JOG_KEYS = frozenset(
-    {"w", "s", "a", "d", "up", "down", "left", "right", "i", "k", "j", "l"}
+JOG_KEY_PAIRS = (
+    ("w", "s"), ("d", "a"), ("up", "down"),
+    ("left", "right"), ("i", "k"), ("j", "l"),
 )
+CARTESIAN_JOG_KEYS = frozenset(key for pair in JOG_KEY_PAIRS for key in pair)
 
 
 def suppress_terminal_echo():
@@ -37,27 +39,23 @@ def restore_terminal_echo(saved):
 
 
 class Keyboard:
-    def __init__(
-        self, *, estop_callback=None, stop_callback=None, discard_callback=None, quit_callback=None,
-    ):
+    def __init__(self, *, bindings=None, estop_callback=None):
         self.events: deque[str] = deque()
         self.held_keys: set[str] = set()
         self.generation_signal = mp.get_context("spawn").Value("q", 0)
         self.condition = threading.Condition(threading.Lock())
         self.listener: Any = None
         self.active = False
-        self.estop_event = threading.Event()
+        self.estop_latched = False
         self.estop_callback = estop_callback
-        self.stop_callback = stop_callback
-        self.discard_callback = discard_callback
-        self.quit_callback = quit_callback
+        self.bindings = dict(bindings or {})
         self.saved_termios = None
 
     def latch_emergency_stop(self):
         with self.condition:
-            if not self.active or self.estop_event.is_set():
+            if not self.active or self.estop_latched:
                 return
-            self.estop_event.set()
+            self.estop_latched = True
         try:
             if self.estop_callback is not None:
                 self.estop_callback()
@@ -84,9 +82,7 @@ class Keyboard:
                 return
 
         # 停止回调先撤销权限，再发布按下事件；回调不执行 SDK I/O。
-        callback = {
-            "s": self.stop_callback, "d": self.discard_callback, "q": self.quit_callback,
-        }.get(name)
+        callback = self.bindings.get(name)
         if callback is not None:
             callback()
         with self.condition:
@@ -197,10 +193,6 @@ class Keyboard:
                     self.held_keys.clear()
                     self.generation_signal.value += 1
         return healthy
-
-    @property
-    def estop_latched(self):
-        return self.estop_event.is_set()
 
     def is_pressed(self, key):
         if key == "esc":

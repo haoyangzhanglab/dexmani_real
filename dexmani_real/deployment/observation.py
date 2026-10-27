@@ -2,7 +2,6 @@
 
 import math
 from dataclasses import dataclass, field
-from typing import Mapping
 
 import numpy as np
 
@@ -15,7 +14,7 @@ from dexmani_real.geometry.kinematics import (
 from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
-from dexmani_real.runtime.observation import ObservationNeeds, freeze
+from dexmani_real.runtime.observation import ObservationNeeds
 
 FIELD_DEPENDENCIES = {
     "joint_state": ("arm", "hand"),
@@ -40,9 +39,8 @@ def policy_dependencies(fields):
 
 
 def policy_needs(dependencies):
-    rgb, depth = "rgb" in dependencies, "depth" in dependencies
     return ObservationNeeds(
-        camera="rgbd" if rgb and depth else "rgb" if rgb else "depth" if depth else "none",
+        camera_fields=tuple(name for name in ("rgb", "depth") if name in dependencies),
         point_cloud="cloud" in dependencies,
         required_tactile=tuple(c for c in ("aggregate", "dense") if c in dependencies),
         camera_static="camera_static" in dependencies,
@@ -63,7 +61,7 @@ class ObservationKinematics:
 class PolicyObservationRow:
     observation_timestamp_ns: int
     source_timestamp_ns: int
-    values: Mapping
+    values: dict
 
 
 def policy_source_timestamp(row, dependencies):
@@ -100,7 +98,7 @@ def project_policy_row(row, fields, dependencies):
         elif name in {"rgb", "depth"}:
             values[name] = row.camera[name]
     return PolicyObservationRow(
-        row.observation_timestamp_ns, policy_source_timestamp(row, dependencies), freeze(values),
+        row.observation_timestamp_ns, policy_source_timestamp(row, dependencies), values,
     )
 
 

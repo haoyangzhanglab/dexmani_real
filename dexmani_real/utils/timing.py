@@ -2,64 +2,30 @@
 
 from __future__ import annotations
 
-import logging
 import math
 import time
 
-logger = logging.getLogger(__name__)
 
+class Rate:
+    """按绝对期限等待，错过整周期后重新计时。"""
 
-class LoopRate:
-    """按绝对期限等待，超时后不突发补步。"""
+    def __init__(self, hz: float):
+        if not math.isfinite(hz) or hz <= 0:
+            raise ValueError(f"hz must be finite and positive, got {hz}")
+        self.period = 1.0 / hz
+        self.reset()
 
-    def __init__(self, target_hz: float, *, label: str) -> None:
-        if not math.isfinite(target_hz) or target_hz <= 0:
-            raise ValueError(f"target_hz must be positive, got {target_hz}")
-        self.label = label
-        self.period = 1.0 / target_hz
-        self.next_deadline = time.perf_counter() + self.period
-        self.overdue_throttle: int = 0
-        self.missed_slot_count = 0
-
-    def wait(self) -> None:
+    def wait(self):
         now = time.perf_counter()
         remaining = self.next_deadline - now
-
         if remaining > 0:
-            if remaining > 0.002:
-                time.sleep(remaining - 0.001)
-            final_remaining = self.next_deadline - time.perf_counter()
-            if final_remaining > 0.0:
-                time.sleep(final_remaining)
-            self.next_deadline += self.period
-            return
+            time.sleep(remaining)
+            now = time.perf_counter()
+        base = now if now - self.next_deadline >= self.period else self.next_deadline
+        self.next_deadline = base + self.period
 
-        lateness = -remaining
-        self.missed_slot_count += int((lateness + self.period * 1e-12) // self.period)
-        if lateness > 1.0:
-            self.next_deadline = now + self.period
-            self.overdue_throttle = 0
-            return
-
-        if self.overdue_throttle <= 0:
-            logger.warning(
-                "Loop deadline missed: loop=%s period_ms=%.1f "
-                "deadline_lateness_ms=%.1f missed_total=%d",
-                self.label,
-                self.period * 1000,
-                lateness * 1000,
-                self.missed_slot_count,
-            )
-            self.overdue_throttle = 50
-        else:
-            self.overdue_throttle -= 1
-
-        self.next_deadline = (now if lateness >= self.period else self.next_deadline) + self.period
-
-    def reset(self) -> None:
-        """在 HOME 等阻塞操作后重置期限。"""
+    def reset(self):
         self.next_deadline = time.perf_counter() + self.period
-        self.overdue_throttle = 0
 
 
 def next_tick_ns(planned_ns, period_ns, now_ns):

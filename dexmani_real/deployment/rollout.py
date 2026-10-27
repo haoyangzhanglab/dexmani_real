@@ -27,7 +27,6 @@ from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
 from dexmani_real.runtime.observation import (
     check_observation,
-    control_deadline_ns,
     read_observation,
     service_feedback,
 )
@@ -112,11 +111,9 @@ class PolicyRollout:
         self.previous_arm = None
         self.pending_frame = None
 
-    def read_observation(self, *, wait_for_hand=False):
+    def read_observation(self):
         row = read_observation(
-            self.sensors.channels, self.robot,
-            needs=self.needs, wait_for_hand=wait_for_hand,
-            cancel_requested=lambda: not self.preparation_valid(),
+            self.sensors.channels, self.robot, needs=self.needs,
         )
         issues, feedback_until_ns = check_observation(row, self.runtime, self.control_needs)
         if not issues:
@@ -125,7 +122,7 @@ class PolicyRollout:
                 if record_issues:
                     raise RecordingError("recording sources: " + "; ".join(record_issues))
             self.robot.arm.update_health(
-                health_until_ns=control_deadline_ns(feedback_until_ns, self.runtime.arm),
+                health_until_ns=feedback_until_ns,
             )
         return row, "control_input_" + issues[0] if issues else None, feedback_until_ns
 
@@ -239,8 +236,8 @@ class PolicyRollout:
             required_safety_state=SafetyState.ARMED,
         )
 
-    def start_observation(self, *, wait_for_hand=False):
-        row, self.preparation_issue, _ = self.read_observation(wait_for_hand=wait_for_hand)
+    def start_observation(self):
+        row, self.preparation_issue, _ = self.read_observation()
         if self.preparation_issue is not None:
             logger.warning("本轮未开始：%s", self.preparation_issue)
             return None
@@ -260,9 +257,10 @@ class PolicyRollout:
         self.results.begin_episode()
         try:
             self.robot.reset_hand_feedback()
-            row = self.start_observation(wait_for_hand=True)
+            self.robot.read_initial_state(cancel_requested=lambda: not self.preparation_valid())
             if not self.preparation_valid():
                 raise OperationCancelled("cancelled during initial feedback acquisition")
+            row = self.start_observation()
         except OperationCancelled as exc:
             self.finish(str(exc))
             return

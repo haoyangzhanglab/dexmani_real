@@ -14,16 +14,16 @@ import numpy as np
 from dexmani_real.config import load_experiment_config
 from dexmani_real.data.raw import camera_metadata
 from dexmani_real.geometry.pose import Pose
+from dexmani_real.ipc.sensors import snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.xarm7.config import ArmConfig
 from dexmani_real.robot.xhand.config import HandConfig
 from dexmani_real.runtime import home, keyboard, lifecycle
 from dexmani_real.runtime.jog import (
-    JogController,
-    compute_cartesian_jog_delta,
+    CartesianJog,
+    jog_delta,
     jog_motion_requested,
 )
-from dexmani_real.runtime.observation import snapshot_camera_parameters
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 
 
@@ -57,9 +57,8 @@ class KeyboardTests(unittest.TestCase):
     def setUp(self):
         self.state = armed_state()
         self.keys = active_keyboard(
-            stop_callback=self.state.request_stop,
-            quit_callback=self.state.request_quit,
             estop_callback=self.state.request_emergency_stop,
+            bindings={'s': self.state.request_stop, 'q': self.state.request_quit},
         )
         self.press, self.release = self.keys.callbacks(KEY_BACKEND)
         self.addCleanup(self.keys.stop)
@@ -86,14 +85,14 @@ class KeyboardTests(unittest.TestCase):
                 state.request_stop()
                 observed.append((tuple(self.keys.events), state.can_move(run_id=state.run_id)))
 
-            self.keys.stop_callback = self.keys.discard_callback = self.keys.quit_callback = stop
+            self.keys.bindings["s"] = self.keys.bindings["d"] = self.keys.bindings["q"] = stop
             self.press(KeyCode(name))
             self.assertEqual(observed, [((), False)])
             self.assertEqual(self.keys.poll(0), [name])
             self.release(KeyCode(name))
 
     def test_callback_failure_latches_estop_without_publishing_success(self):
-        self.keys.stop_callback = Mock(side_effect=RuntimeError("stop failed"))
+        self.keys.bindings["s"] = Mock(side_effect=RuntimeError("stop failed"))
         with self.assertLogs(keyboard.logger, level="ERROR") as logs:
             self.press(KeyCode("s"))
         self.assertIn("stop failed", "\n".join(logs.output))
@@ -269,9 +268,8 @@ class ReplayInputTests(unittest.TestCase):
         self.output = stack.enter_context(TemporaryDirectory())
         self.state = armed_state()
         self.keys = active_keyboard(
-            stop_callback=self.state.request_stop,
-            quit_callback=self.state.request_quit,
             estop_callback=self.state.request_emergency_stop,
+            bindings={'s': self.state.request_stop, 'q': self.state.request_quit},
         )
         self.keys.start = Mock()
         self.addCleanup(self.keys.stop)
@@ -557,9 +555,9 @@ class JogTests(unittest.TestCase):
         self.keys.handle_key("w", True)
         self.generation = self.keys.snapshot()[1]
         self.addCleanup(self.keys.stop)
-        self.jog = JogController(
+        self.jog = CartesianJog(
             None, SimpleNamespace(workspace_command_margin_m=.01),
-            np.array([[-1., 1.]] * 3),
+            (-np.ones(3) * .99, np.ones(3) * .99),
         )
         self.robot = Mock()
         self.pose = Pose(p=np.zeros(3), q=np.array([1., 0., 0., 0.]))
@@ -574,7 +572,7 @@ class JogTests(unittest.TestCase):
         self.assertFalse(jog_motion_requested({"w", "s"}))
         self.assertFalse(jog_motion_requested({"w", "q"}))
         self.assertTrue(jog_motion_requested({"w", "s", "left"}))
-        dx, rotation = compute_cartesian_jog_delta({"w", "d", "i", "j"}, .008, .03)
+        dx, rotation = jog_delta({"w", "d", "i", "j"}, .008, .03)
         np.testing.assert_allclose(dx, [.008 / np.sqrt(2), .008 / np.sqrt(2), 0])
         self.assertAlmostEqual(np.linalg.norm(rotation), .03)
 
@@ -627,6 +625,149 @@ class JogTests(unittest.TestCase):
                 )
         self.assertIsNone(self.jog.command_qpos)
         self.assertFalse(self.state.can_move(run_id=old_id))
+
+
+class JogStepTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        clock_patch = patch("dexmani_real.runtime.jog.time.monotonic_ns", self.clock.monotonic_ns)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
+        self.state = armed_state()
+        self.keys = active_keyboard()
+        self.addCleanup(self.keys.stop)
+        self.keys.handle_key("w", True)
+        self.runtime = load_experiment_config(cli_overrides={"hand.enabled": False})
+        self.solver = Mock()
+        self.solver.compute_eef_pose_base.return_value = Pose(
+            p=np.zeros(3), q=np.array([1., 0., 0., 0.]),
+        )
+        self.solver.solve.return_value = SimpleNamespace(qpos=np.ones(7) * .01)
+        self.jog = CartesianJog(
+            self.solver, self.runtime.keyboard_teleop, (-np.ones(3), np.ones(3)),
+        )
+        self.arm = np.zeros(1, dtype=[("timestamp_ns", "u8"), ("qpos", "f8", (7,))])
+        self.arm["timestamp_ns"] = self.clock.ns - 10_000_000
+        self.robot = Mock(stop_required=False)
+        self.robot.read_state.return_value = SimpleNamespace(arm=self.arm, hand=None)
+
+        def prepare(*args, **kwargs):
+            self.clock.sleep(.1)
+            self.arm["timestamp_ns"] = self.clock.ns - 10_000_000
+            self.state.stop_signal.clear()
+            self.robot.stop_required = True
+
+        def stop():
+            self.state.stop_signal.set()
+            self.robot.stop_required = False
+
+        self.robot.prepare_streaming.side_effect = prepare
+        self.robot.stop.side_effect = stop
+
+    def step(self, source="observation"):
+        return self.jog.step(
+            self.robot, self.keys, self.state, self.runtime, deadline_source=source,
+        )
+
+    def test_preparation_refreshes_once_and_preserves_execution_clock(self):
+        for source in ("observation", "arm"):
+            with self.subTest(source=source):
+                result = self.step(source)
+                self.assertTrue(result.committed)
+                self.robot.read_state.assert_called_once()
+                self.robot.prepare_streaming.assert_called_once()
+                origin = (self.clock.ns if source == "observation"
+                          else int(self.arm["timestamp_ns"][0]))
+                self.assertEqual(
+                    self.robot.send_action.call_args.kwargs["execute_until_ns"],
+                    origin + int(self.runtime.keyboard_teleop.target_max_age_s * 1e9),
+                )
+                self.robot.read_state.reset_mock()
+        self.keys.handle_key("w", False)
+        result = self.step()
+        self.assertFalse(result.committed)
+        self.assertIsNotNone(result.observation)
+        self.robot.read_state.assert_called_once()
+        self.robot.stop.assert_called_once()
+        self.assertIsNone(self.jog.command_pose)
+
+    def test_release_during_prepare_stops_before_ik_or_submission(self):
+        self.robot.prepare_streaming.side_effect = lambda *a, **k: self.keys.handle_key("w", False)
+        result = self.step()
+        self.assertFalse(result.committed)
+        self.robot.stop.assert_called_once()
+        self.robot.read_state.assert_not_called()
+        self.solver.solve.assert_not_called()
+        self.robot.send_action.assert_not_called()
+
+    def test_rejected_target_waits_for_release(self):
+        self.solver.solve.return_value = SimpleNamespace(qpos=None, reason="collision")
+        self.assertFalse(self.step().committed)
+        self.assertTrue(self.jog.blocked_until_release)
+        self.robot.stop.assert_called_once()
+        self.assertIsNone(self.jog.command_pose)
+        self.step()
+        self.solver.solve.assert_called_once()
+        self.robot.stop.assert_called_once()
+        self.robot.send_action.assert_not_called()
+        self.keys.handle_key("w", False)
+        self.step()
+        self.assertFalse(self.jog.blocked_until_release)
+
+    def test_input_change_during_ik_stops_in_the_same_tick(self):
+        def solve(*args, **kwargs):
+            self.keys.handle_key("w", False)
+            return SimpleNamespace(qpos=np.ones(7) * .01)
+
+        self.solver.solve.side_effect = solve
+        result = self.step()
+        self.assertFalse(result.committed)
+        self.robot.send_action.assert_not_called()
+        self.robot.stop.assert_called_once()
+        self.assertIsNone(self.jog.command_pose)
+        self.assertEqual(self.state.safety_state, SafetyState.ARMED)
+
+    def test_stop_failure_after_rejection_is_not_treated_as_submission_timeout(self):
+        self.solver.solve.return_value = SimpleNamespace(qpos=None, reason="collision")
+        self.robot.stop.side_effect = TimeoutError("stop unresolved")
+        with self.assertRaisesRegex(TimeoutError, "stop unresolved"):
+            self.step()
+        self.robot.stop.assert_called_once()
+        self.assertIsNone(self.jog.command_pose)
+
+    def test_stale_feedback_stops_without_solving(self):
+        self.state.begin_motion()
+        self.robot.stop_required = True
+        self.arm["timestamp_ns"] = 1
+        result = self.step()
+        self.assertIn("arm_feedback_stale", result.issues)
+        self.robot.stop.assert_called_once()
+        self.solver.solve.assert_not_called()
+        self.robot.send_action.assert_not_called()
+
+    def test_expired_submission_stops_without_committing_reference(self):
+        self.robot.send_action.side_effect = TimeoutError("expired")
+        result = self.step()
+        self.assertFalse(result.committed)
+        self.assertIsNone(self.jog.command_pose)
+        self.robot.stop.assert_called_once()
+
+    def test_pause_clears_reference_even_when_stop_fails(self):
+        self.jog.command_pose = self.solver.compute_eef_pose_base.return_value
+        self.robot.stop.side_effect = OSError("stop failed")
+        with self.assertRaisesRegex(OSError, "stop failed"):
+            self.jog.pause(self.robot, self.state)
+        self.assertTrue(self.jog.blocked_until_release)
+        self.assertIsNone(self.jog.command_pose)
+
+    def test_unexpected_feedback_or_solver_error_propagates(self):
+        for operation in (self.robot.read_state, self.solver.solve):
+            with self.subTest(operation=operation):
+                operation.side_effect = TimeoutError("unexpected")
+                with self.assertRaisesRegex(TimeoutError, "unexpected"):
+                    self.step()
+                operation.side_effect = None
+        self.robot.send_action.assert_not_called()
 
 
 class Clock:

@@ -33,11 +33,6 @@ class SharedRing:
     def write(self, **fields) -> int:
         if fields.keys() != self._field_names:
             raise ValueError("ring fields do not match the payload dtype")
-        for name, value in fields.items():
-            shape = self.dtype[name].shape
-            if np.shape(value) != shape:
-                raise ValueError(f"ring field {name!r} must have shape {shape}")
-
         sequence = self.latest_sequence + 1
         slot = self.slots[sequence % self.capacity]
         slot["sequence"] = 2 * sequence - 1

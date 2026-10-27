@@ -6,7 +6,7 @@ import numpy as np
 
 from dexmani_real.geometry.kinematics import ArmFK, eef_poses
 from dexmani_real.replay.data import Trajectory
-from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
+from dexmani_real.utils.io import publish, write_json
 
 
 def joint_errors(original, replayed):
@@ -72,10 +72,10 @@ def evaluate_replay(trajectory, replay_data, *, output_dir):
     # 先保存实测数据，离线 FK 或指标计算失败时仍可重新评估。
     temporary = output / "replay_data.tmp.npz"
     np.savez_compressed(temporary, **replay_data)
-    atomic_publish(temporary, output / "replay_data.npz")
+    publish(temporary, output / "replay_data.npz")
 
     metrics = compute_metrics(trajectory, replay_data)
-    atomic_json_dump(metrics, output / "metrics.json", ensure_ascii=False)
+    write_json(metrics, output / "metrics.json")
     print(f"Replay: {metrics['matching_frames']}/{metrics['original_frames']} matching frames")
     for name in ("arm_joint", "hand_joint", "eef_position", "eef_orientation"):
         print(f"  {name}: {metrics[name]}")

@@ -2,32 +2,24 @@
 
 import logging
 
-import numpy as np
-
 from dexmani_real.calibration.table_plane import resolve_table_plane
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.control.ik import IKSolver
-from dexmani_real.robot.commands import OperationCancelled, RobotError
+from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import home_robot
-from dexmani_real.runtime.jog import JogController, jog_motion_requested
+from dexmani_real.runtime.jog import CartesianJog
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime
-from dexmani_real.runtime.observation import (
-    ObservationNeeds,
-    check_observation,
-    control_deadline_ns,
-    read_observation,
-    service_feedback,
-)
+from dexmani_real.runtime.observation import service_feedback
 from dexmani_real.runtime.preflight import (
-    validate_keyboard_workspace,
+    jog_bounds,
     validate_robot_config,
 )
-from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
+from dexmani_real.runtime.state import RunEndReason, SessionState
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.timing import LoopRate
+from dexmani_real.utils.timing import Rate
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +35,7 @@ class KeyboardTeleop:
         self.table_plane_abcd = resolve_table_plane(
             self.runtime.environment.table, required=self.runtime.environment.table.enabled,
         )
-        self.workspace = validate_keyboard_workspace(self.runtime)
+        self.bounds = jog_bounds(self.runtime)
         if not self.runtime.hand.enabled and not self.no_hand:
             raise ValueError("hand-disabled operation requires --no-hand")
 
@@ -56,8 +48,8 @@ class KeyboardTeleop:
         )
 
         self.keys = Keyboard(
-            quit_callback=self.runtime_state.request_quit,
             estop_callback=self.runtime_state.request_emergency_stop,
+            bindings={'q': self.runtime_state.request_quit},
         )
         self.jog_config = self.runtime.keyboard_teleop
         clean = False
@@ -90,7 +82,7 @@ class KeyboardTeleop:
             position_tolerance=self.jog_config.ik_max_pose_error_pos_m,
             rotation_tolerance=self.jog_config.ik_max_pose_error_rot_rad,
         )
-        self.jog = JogController(solver, self.jog_config, self.workspace)
+        self.jog = CartesianJog(solver, self.jog_config, self.bounds)
         self.home_planner = HomePlanner(
             self.runtime.environment,
             self.runtime.arm,
@@ -106,9 +98,9 @@ class KeyboardTeleop:
         self.runtime_state.arm()
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         print(
-            "Jog key changes stop and re-prepare motion; release all jog keys after a rejected target"
+            "Key changes invalidate pending targets; release all jog keys after a rejected target"
         )
-        self.rate = LoopRate(self.jog_config.control_hz, label="keyboard_teleop")
+        self.rate = Rate(self.jog_config.control_hz)
 
     def run_control_loop(self):
         while self.runtime_state.running and not self.runtime_state.quit_requested:
@@ -130,9 +122,7 @@ class KeyboardTeleop:
         return bool(self.runtime_state.quit_requested)
 
     def run_home(self):
-        self.jog.clear_reference()
-        self.runtime_state.revoke_motion()
-        self.robot.stop()
+        self.jog.stop(self.robot, self.runtime_state)
         home_result = home_robot(
             self.runtime_state, self.robot, self.home_planner,
             service=lambda: service_feedback(self.robot, self.runtime),
@@ -149,69 +139,7 @@ class KeyboardTeleop:
         self.rate.reset()
 
     def motion_tick(self):
-        pressed_keys, generation = self.keys.snapshot()
-        moving = jog_motion_requested(pressed_keys)
-        self.jog.release_if_idle(pressed_keys)
-        if not moving or self.jog.blocked_until_release:
-            if self.robot.stop_required:
-                self.runtime_state.revoke_motion()
-                self.robot.stop()
-            self.jog.clear_reference()
-            self.robot.service_idle()
-            return
-
-        with self.runtime_state.motion_lock:
-            safety_state, epoch = self.runtime_state.safety_state, self.runtime_state.run_id
-        if safety_state == SafetyState.ARMED:
-            self.jog.clear_reference()
-            if self.robot.stop_required:
-                self.robot.stop()
-            try:
-                self.robot.prepare_streaming(
-                    epoch, service=lambda: service_feedback(self.robot, self.runtime),
-                )
-            except OperationCancelled:
-                self.robot.stop()
-                self.jog.clear_reference()
-                return
-            if self.keys.snapshot()[1] != generation:
-                return
-
-        row = read_observation(None, self.robot)
-        issues, feedback_until_ns = check_observation(
-            row, self.runtime, ObservationNeeds(), require_hand=self.runtime.hand.enabled,
+        self.jog.step(
+            self.robot, self.keys, self.runtime_state, self.runtime,
+            deadline_source="observation",
         )
-        if not issues:
-            self.robot.arm.update_health(
-                health_until_ns=control_deadline_ns(feedback_until_ns, self.runtime.arm),
-            )
-        if issues:
-            self.jog.clear_reference()
-            if self.robot.stop_required:
-                self.runtime_state.revoke_motion()
-                self.robot.stop()
-            return
-
-        proposed_pose, _, result = self.jog.propose(
-            pressed_keys, row.arm["qpos"][0],
-            hand_qpos=(
-                row.hand["qpos"][0] if row.hand is not None
-                else np.deg2rad(self.runtime.hand.home_qpos_deg)
-            ),
-        )
-        if self.jog.blocked_until_release:
-            return
-
-        try:
-            self.jog.submit(
-                proposed_pose, result.qpos, self.keys, generation,
-                self.runtime_state, self.robot, epoch,
-                valid_until_ns=feedback_until_ns,
-                execute_until_ns=row.observation_timestamp_ns
-                + int(self.jog_config.target_max_age_s * 1e9),
-            )
-        except (OperationCancelled, TimeoutError) as exc:
-            logger.info("jog interrupted: %s", exc)
-            self.robot.stop()
-            self.jog.clear_reference()
-            return
