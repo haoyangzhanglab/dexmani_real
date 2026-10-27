@@ -41,15 +41,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    from dexmani_real.calibration.camera.aruco import ARUCO_DICT_NAME, ArucoConfig
-    from dexmani_real.calibration.camera.session import CameraCalibrationSession
-
-    aruco = ArucoConfig()
+    from dexmani_real.calibration.camera.aruco import ARUCO_DICT_NAME, MARKER_ID, MARKER_SIZE_M
+    from dexmani_real.calibration.camera.run import CameraCalibration
 
     print("=" * 60)
     print("  ArUco Hand-Eye Calibration — xArm7 + RealSense (eye-to-hand)")
     print(
-        f"  ArUco: {ARUCO_DICT_NAME} ID={aruco.target_id} size={aruco.marker_size_m * 1000:.1f}mm"
+        f"  ArUco: {ARUCO_DICT_NAME} ID={MARKER_ID} size={MARKER_SIZE_M * 1000:.1f}mm"
     )
     print(f"  hand physical-state assertion: {args.hand_geometry}")
     print("=" * 60)
@@ -59,10 +57,9 @@ def main(argv: list[str] | None = None) -> int:
         cli_overrides={"camera.serial": args.serial, "hand.enabled": False},
     )
 
-    return CameraCalibrationSession(
+    return CameraCalibration(
         runtime,
         hand_geometry=args.hand_geometry,
-        aruco_config=aruco,
         output_path=args.output or CAMERAS_PATH,
     ).run()
 

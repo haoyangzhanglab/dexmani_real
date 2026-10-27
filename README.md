@@ -39,7 +39,11 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 标定与设备诊断为这些流程提供共同的实验支持。
 
-相机标定位于 [`calibration/camera/`](dexmani_real/calibration/camera/)，其中 `capture.py` 负责静止采样，`session.py` 负责运动、样本管理与标定发布。桌面拟合与质量评估位于 [`geometry/plane.py`](dexmani_real/geometry/plane.py)，路径解析和标定读写位于 [`calibration/table_plane.py`](dexmani_real/calibration/table_plane.py)；VR 对齐与启动质量检查位于 [`calibration/vr_alignment.py`](dexmani_real/calibration/vr_alignment.py)。默认参数集中在 [`calibration/parameters/`](dexmani_real/calibration/parameters/)，路径常量由 `dexmani_real.calibration` 提供，消费者需要时才读取。
+相机标定位于 [`calibration/camera/`](dexmani_real/calibration/camera/)，其中 `aruco.py` 负责检测、预览与静止采样，`hand_eye.py` 使用五种算法择优求解，`run.py` 负责运动、样本管理与标定保存。标记和质量阈值在所属模块就近定义。只有位置 RMS ≤ 5 mm 且旋转 RMS ≤ 3° 的结果可以保存；未达标结果保留残差，X 按两种残差相对门限的最大值删除最差样本，之后需重新求解。
+
+桌面拟合与质量评估位于 [`geometry/plane.py`](dexmani_real/geometry/plane.py)，路径解析和标定读写位于 [`calibration/table_plane.py`](dexmani_real/calibration/table_plane.py)；VR 对齐与启动质量检查位于 [`calibration/vr_heading.py`](dexmani_real/calibration/vr_heading.py)。默认参数集中在 [`calibration/parameters/`](dexmani_real/calibration/parameters/)，路径常量由 `dexmani_real.calibration` 提供，消费者需要时才读取。
+
+相机外参通过 `load_camera_extrinsics()` 按 serial 返回矩阵字典；可选录制仅允许默认文件缺失，损坏文件、显式路径错误或文件中缺少当前相机 serial 均直接报错。
 
 实验配置使用 `from dexmani_real.config import load_experiment_config`，覆盖优先级为 CLI > YAML > dataclass 默认值。配置加载不读取标定或连接设备，运行约束在使用边界验证。`environment.table.plane_path` 的相对路径以仓库根目录解析；显式指定的必需标定缺失时直接报错。VR 标定脚本的 `--force` 仅允许将低质量结果导出到显式指定、非默认且未占用的 `--output` 文件；遥操作启动仍拒绝低质量标定。
 
@@ -49,7 +53,7 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 核心实现位于 [`dexmani_real/`](dexmani_real/)，实验入口与设备工具集中在 [`scripts/`](scripts/)；[`assets/`](assets/) 存放机器人模型等资源，[`third_party/`](third_party/) 包含第三方相关代码。
 
-部署沿 `deployment/run.py → session.py → rollout.py` 执行：`config.py` 统一解析与校验执行配置，会话持有设备和模型，`PolicyRollout` 协调单轮观测、提交与录制。`schedule.py` 根据时钟与状态决定 sync/async/RTC 调度，`observation.py` 按需组装输入，`inference.py` 独占模型线程。来源时效在观测入口检查，策略输入的数值与形状在 `dexmani_policy` 边界检查；历史快照仅在提交预测时创建。回放的帧索引一致性指标位于 [`replay/consistency.py`](dexmani_real/replay/consistency.py)。
+部署沿 `deployment/run.py → session.py → rollout.py` 执行：`config.py` 统一解析与校验执行配置，会话持有设备和模型，`PolicyRollout` 协调单轮观测、提交与录制。`schedule.py` 根据时钟与状态决定 sync/async/RTC 调度，`observation.py` 按需组装输入，`inference.py` 独占模型线程。来源时效在观测入口检查，策略输入的数值与形状在 `dexmani_policy` 边界检查；历史快照仅在提交预测时创建。回放沿 `replay/run.py → player.py` 执行，`data.py` 读取轨迹并缓存实测数据，`metrics.py` 在硬件收尾后计算匹配帧的关节与末端误差。
 
 `control/constraints.py` 统一等价角、绝对跳变和 `MotionConstraints` 端点约束。`control/ik.py` 的 `IKSolver` 接收共享约束、位置和旋转容差，`solve(..., hand_qpos=...)` 显式指定碰撞手姿；动作映射、键盘 jog 和相机标定共用这一接口。
 
@@ -81,7 +85,13 @@ XHand 的 SDK 载荷解析、反馈布局与缓存位于 `robot/xhand/feedback.p
 
 ## 运行接口与错误处理
 
-遥操作入口为 `teleop.session.run_teleop(...)`，回放入口为 `replay.session.run_replay(...)`，对应脚本解析参数并调用入口。点云诊断的装配、运行、快照输出及收尾集中在 `scripts/tools/view_pointcloud.py`。
+遥操作入口为 `teleop.session.run_teleop(...)`，回放入口为 `replay.run.run_replay(...)`，对应脚本解析参数并调用入口。
+
+回放输出 `replay_data.npz`（实测关节、候选及来源/提交时间戳）、`metrics.json`（按帧索引比较的误差）和 `session_result.json`（回放、回零与收尾结果）。候选和提交完成都不代表物理到位；手部准备不占回放行，准备时长保存在运行摘要中。零行指标使用 `null`，不表示零误差。
+
+回放使用 Raw 的帧率安排提交，过期帧立即中止；目标的执行期限沿用 `execution.max_decision_age_s`，入口要求该值为有限正数。
+
+点云诊断的装配、运行、快照输出及收尾集中在 `scripts/tools/view_pointcloud.py`。
 
 `teleop` 中，`session.py` 装配资源，`loop.py` 的 `TeleopLoop` 管理准备、控制和录制收尾，`vr.py` 的 `VRController` 负责锚点映射与 EMA；键盘点动和语音分别位于 `keyboard.py`、`audio.py`。手部算法保留 `retargeting/tag.py`、`dexpilot.py` 和共用的 `landmarks.py`。配置类型统一使用 `Config` 后缀，YAML 字段及默认值保持不变。
 
@@ -147,7 +157,7 @@ mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases \
   dexmani_real/calibration dexmani_real/runtime dexmani_real/deployment dexmani_real/utils \
   dexmani_real/data/canonical \
   dexmani_real/data/session_results.py dexmani_real/data/raw/reader.py \
-  dexmani_real/teleop dexmani_real/config.py dexmani_real/replay/replayer.py \
+  dexmani_real/teleop dexmani_real/config.py dexmani_real/replay \
   scripts/tools/view_pointcloud.py scripts/tools/view_realsense.py \
   scripts/visualize_episode.py scripts/export_zarr.py \
   third_party/cordvip_geometry/src/cordvip_geometry/integrations/dexmani.py
@@ -164,6 +174,8 @@ mypy 按现有类型标注检查上述模块，不检查未标注函数体或外
 `tests/test_deployment.py` 使用假设备和可控模型结果检查三种调度、LAMP 历史、来源期限、初始化失败、迟到推理和收尾，核对 checkpoint 选择、配置恢复与实验结果字段，并通过已安装的 `dexmani_policy` 验证策略输入边界。`tests/test_utils.py` 检查原子写入、stdout 恢复和计时超期；这些测试均不连接硬件。
 
 键盘遥操作入口保留 `--help`，没有 `--print-config` 参数。
+
+`tests/test_replay.py` 覆盖 Raw 轨迹读取、核心误差、部分采样、过期提交、退出、急停与手部准备；`tests/test_calibration.py` 使用合成姿态和图像验证五算法求解、双轴激励、质量门限、ArUco 采样及 VR 环绕，并检查标定读写和取消。测试均不连接硬件。
 
 真机启停、取消/急停、HOME/jog、遥操作录制、三种策略模式和回放仍需操作者单独验收。软件授权撤销和 SDK 接受请求不代表物理停稳或到位。
 

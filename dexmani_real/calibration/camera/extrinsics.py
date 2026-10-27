@@ -1,10 +1,8 @@
-"""Persist and load camera extrinsics (XYZ meters, WXYZ) by device serial."""
+"""按相机 serial 读写基座系外参，位置单位为米，四元数使用 WXYZ。"""
 
 from __future__ import annotations
 
 import json
-import logging
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -29,80 +27,27 @@ def pose_to_matrix(position, orientation) -> np.ndarray:
     return transform
 
 
-class CameraExtrinsics:
-    def __init__(self, calib_path: str | Path | None = None):
-        self.calib_path = Path(CAMERAS_PATH if calib_path is None else calib_path).resolve()
-        raw = json.loads(self.calib_path.read_text())
-        if not isinstance(raw, dict):
-            raise ValueError("camera calibration root must be an object")
-        self.transforms: dict[str, np.ndarray] = {}
-        for name, camera in raw.items():
-            if not isinstance(camera, dict) or not isinstance(camera.get("pose"), dict):
-                raise ValueError(
-                    f"camera calibration {name!r} requires pose.position and pose.orientation"
-                )
-            if camera["type"] != "eye_to_hand":
-                raise ValueError(f"camera calibration {name!r} must be eye_to_hand")
-            serial = camera["serial"]
-            if not isinstance(serial, str) or not serial.strip():
-                raise ValueError("camera serial must be a non-empty string")
-            if serial in self.transforms:
-                raise ValueError(f"camera calibration serial {serial!r} appears more than once")
-            pose = camera["pose"]
-            self.transforms[serial] = pose_to_matrix(pose["position"], pose["orientation"])
-
-    def for_serial(self, serial: str) -> np.ndarray:
-        """Return an owned, read-only T_base_from_camera, including after process spawn."""
-        try:
-            transform = self.transforms[serial].copy()
-        except KeyError:
-            raise KeyError(f"No camera in {self.calib_path.name} has serial {serial!r}") from None
-        transform.setflags(write=False)
-        return transform
+def load_camera_extrinsics(path: str | Path | None = None) -> dict[str, np.ndarray]:
+    path = CAMERAS_PATH if path is None else Path(path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    transforms = {}
+    for camera in raw.values():
+        if camera["type"] != "eye_to_hand":
+            raise ValueError("camera calibration must be eye_to_hand")
+        serial = camera["serial"]
+        if not isinstance(serial, str) or not serial.strip() or serial in transforms:
+            raise ValueError(f"invalid or duplicate camera serial: {serial!r}")
+        pose = camera["pose"]
+        transforms[serial] = pose_to_matrix(pose["position"], pose["orientation"])
+    return transforms
 
 
-def load_optional_camera_extrinsics(path: str | Path | None = None) -> CameraExtrinsics | None:
-    """Missing or invalid extrinsics do not block physical Raw recording."""
-    try:
-        return CameraExtrinsics(path)
-    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
-        logging.getLogger(__name__).warning("Recording without camera extrinsics: %s", exc)
+def load_optional_camera_extrinsics(
+    path: str | Path | None = None,
+) -> dict[str, np.ndarray] | None:
+    if path is None and not CAMERAS_PATH.exists():
         return None
-
-
-def calibration_capture_metadata(
-    *,
-    width: int,
-    height: int,
-    requested_fps: int,
-    intrinsics: np.ndarray,
-    distortion: np.ndarray,
-    method: str,
-    sample_count: int,
-    position_errors_mm: np.ndarray,
-    rotation_errors_deg: np.ndarray,
-) -> dict[str, object]:
-    """Summarize solver residuals and camera geometry for publication."""
-
-    def summary(values: np.ndarray) -> dict[str, float]:
-        return {
-            "mean": float(values.mean()),
-            "rms": float(np.sqrt(np.mean(values**2))),
-            "max": float(values.max()),
-        }
-
-    return {
-        "width": width,
-        "height": height,
-        "requested_fps": requested_fps,
-        "intrinsics": intrinsics.tolist(),
-        "distortion": distortion.tolist(),
-        "method": method,
-        "sample_count": sample_count,
-        "position_error_mm": summary(position_errors_mm),
-        "rotation_error_deg": summary(rotation_errors_deg),
-        "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
-    }
+    return load_camera_extrinsics(path)
 
 
 def save_camera_calibration(
@@ -113,12 +58,11 @@ def save_camera_calibration(
     calibration_capture: dict[str, object] | None = None,
     cancelled=None,
 ) -> None:
-    """Write an xArm-base camera pose to cameras.json, preserving other entries."""
     T_base_from_camera = validate_rigid_transform(T_base_from_camera, label="T_base_from_camera")
     if not serial.strip():
         raise ValueError("camera serial must be non-empty")
     rot = Rotation.from_matrix(T_base_from_camera[:3, :3])
-    quat_wxyz = rot.as_quat()[[3, 0, 1, 2]]  # scipy xyzw → wxyz
+    quat_wxyz = rot.as_quat()[[3, 0, 1, 2]]
     pos = T_base_from_camera[:3, 3]
 
     entry = {
@@ -139,7 +83,7 @@ def save_camera_calibration(
         existing = {}
 
     for name, cam_data in existing.items():
-        if cam_data.get("serial") == serial:
+        if cam_data["serial"] == serial:
             cam_name = name
             break
     else:

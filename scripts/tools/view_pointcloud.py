@@ -14,9 +14,9 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from dexmani_real.calibration.camera.extrinsics import CameraExtrinsics
+from dexmani_real.calibration.camera.extrinsics import load_camera_extrinsics
 from dexmani_real.calibration.table_plane import (
-    publish_table_plane,
+    save_table_plane,
     resolve_table_plane,
     resolve_table_plane_path,
 )
@@ -239,10 +239,10 @@ def capture_frame(
     return rgb, depth_raw, depth_m
 
 
-def load_extrinsics(camera_info: dict, calib: CameraExtrinsics) -> np.ndarray:
+def load_extrinsics(camera_info: dict, calib: dict[str, np.ndarray]) -> np.ndarray:
     """Load T_xarm_base_from_color for aligned depth-to-color samples."""
     print("\nLoading extrinsics from cameras.json...")
-    base_from_color = calib.for_serial(camera_info["serial"])
+    base_from_color = calib[camera_info["serial"]]
 
     pos = base_from_color[:3, 3]
     quat_xyzw = R.from_matrix(base_from_color[:3, :3]).as_quat()
@@ -313,7 +313,7 @@ def calibrate_table_plane(
         "yes",
     }
     if confirmed:
-        publish_table_plane(plane_path, fit, confirmed=True)
+        save_table_plane(plane_path, fit)
         print("  Published table calibration.")
     else:
         print("  Calibration file unchanged; using the new fit for this run only.")
@@ -339,7 +339,7 @@ def run_pointcloud_diagnostic(args) -> int:
     runtime = load_experiment_config(yaml_path=args.config)
     runtime.camera.validate()
     pcd_config = runtime.pointcloud
-    calibration = CameraExtrinsics(args.camera_calibration)
+    calibration = load_camera_extrinsics(args.camera_calibration)
     table_plane_abcd = (
         resolve_table_plane(runtime.environment.table)
         if pcd_config.remove_table and not fit_table_requested

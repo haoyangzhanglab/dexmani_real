@@ -1,4 +1,4 @@
-"""桌面标定路径、读取与确认后发布；平面数学位于 geometry.plane。"""
+"""桌面标定读写；平面拟合位于 geometry.plane。"""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 
 
 def resolve_table_plane_path(table: TableCollisionConfig) -> Path:
-    """Resolve the configured plane path relative to the repository root."""
     if table.plane_path is None:
         raise RuntimeError("runtime table calibration has no plane_path")
     path = Path(table.plane_path).expanduser()
@@ -28,9 +27,10 @@ def resolve_table_plane_path(table: TableCollisionConfig) -> Path:
 
 
 def resolve_table_plane(
-    table: TableCollisionConfig, *, required=True,
+    table: TableCollisionConfig,
+    *,
+    required=True,
 ) -> tuple[float, float, float, float] | None:
-    """仅在消费者需要时读取一次当前桌面，数值由装配层共享。"""
     if not required:
         return None
     plane_path = resolve_table_plane_path(table)
@@ -45,10 +45,7 @@ def resolve_table_plane(
     return coefficients
 
 
-def publish_table_plane(path: str | Path, fit: TablePlaneFit, *, confirmed: bool) -> None:
-    """Replace current calibration with a validated, explicitly confirmed fit."""
-    if not confirmed:
-        raise PermissionError("table calibration publish requires explicit confirmation")
+def save_table_plane(path: str | Path, fit: TablePlaneFit) -> None:
     payload = fit.to_dict()
     payload["calibrated_at_utc"] = datetime.now(timezone.utc).isoformat()
     atomic_json_dump(payload, path, ensure_ascii=False)

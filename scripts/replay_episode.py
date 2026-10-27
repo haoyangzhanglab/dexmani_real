@@ -57,12 +57,12 @@ Controls:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    from dexmani_real.replay.replayer import ReplayStatus
-    from dexmani_real.replay.session import (
+    from dexmani_real.replay.player import ReplayStatus
+    from dexmani_real.replay.run import (
         DEFAULT_OUTPUT_DIR,
         run_replay,
     )
-    from dexmani_real.replay.trajectory import load_trajectory
+    from dexmani_real.replay.data import load_trajectory
 
     trajectory = load_trajectory(args.episode)
 
@@ -70,8 +70,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Trajectory: {trajectory.episode_path}")
     print(
-        f"  Frames: {trajectory.num_frames}  Nominal FPS: {trajectory.fps:.1f}  "
-        f"Nominal duration: {trajectory.num_frames / trajectory.fps:.1f}s"
+        f"  Frames: {len(trajectory)}  Nominal FPS: {trajectory.fps:.1f}  "
+        f"Nominal duration: {len(trajectory) / trajectory.fps:.1f}s"
     )
     print(f"  Task: {trajectory.task_label}")
     print(f"  Acc: {runtime.arm.max_joint_acceleration_deg_per_s2:.0f}°/s²")

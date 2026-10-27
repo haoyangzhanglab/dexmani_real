@@ -7,20 +7,13 @@ import argparse
 import math
 import multiprocessing as mp
 import time
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
-from dexmani_real.calibration.vr_alignment import (
-    VR_TRANSFORM_MIN_FRAMES,
-    VRTransformCalibration,
-    circular_mean,
-    parse_vr_transform,
-    quality_measurements,
-)
+from dexmani_real.calibration.vr_heading import VRCalibration, estimate_heading
 from dexmani_real.geometry.pose import forward_from_quat_wxyz
 from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.runtime.lifecycle import (
@@ -46,14 +39,14 @@ SETTLE_S = 3.0
 
 
 def publish_vr_transform(
-    calibration: VRTransformCalibration,
+    calibration: VRCalibration,
     output: Path | None,
     *,
     force: bool = False,
 ) -> Path:
     """合格结果可更新当前标定；低质量结果只能显式导出到未占用的新文件。"""
     path = VR_TRANSFORM_PATH if output is None else output
-    poor = calibration.quality.grade == "poor"
+    poor = calibration.grade == "poor"
     if poor:
         if not force:
             raise ValueError(
@@ -65,7 +58,11 @@ def publish_vr_transform(
     payload = {
         "theta_deg": calibration.theta_deg,
         "ref": calibration.reference,
-        "quality": asdict(calibration.quality),
+        "quality": {
+            "std_deg": calibration.std_deg,
+            "max_deviation_deg": calibration.max_deviation_deg,
+            "frames": calibration.frames,
+        },
         "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     return atomic_json_dump(payload, path, overwrite=not poor)
@@ -253,52 +250,19 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: VR receiver cleanup failed; calibration was not published")
         return 1
 
-    if len(forwards) < VR_TRANSFORM_MIN_FRAMES:
-        print(f"ERROR: only {len(forwards)} frames collected (< {VR_TRANSFORM_MIN_FRAMES} required)")
-        return 1
-
-    forwards_arr = np.array(forwards, dtype=np.float64)
     try:
-        theta_rad, mean_fwd, inlier = circular_mean(forwards_arr)
+        calibration = estimate_heading(np.asarray(forwards, dtype=np.float64).reshape(-1, 3), args.ref)
     except ValueError as exc:
         print(f"ERROR: invalid heading sample: {exc}")
         return 1
-    inlier_frames = int(np.sum(inlier))
-    if inlier_frames < VR_TRANSFORM_MIN_FRAMES:
-        print(f"ERROR: only {inlier_frames} inlier frames remain (< {VR_TRANSFORM_MIN_FRAMES} required)")
-        return 1
-    theta_deg = float(np.rad2deg(theta_rad))
-    calibration = parse_vr_transform({
-        "theta_deg": theta_deg,
-        "ref": args.ref,
-        "quality": {
-            **quality_measurements(forwards_arr, theta_rad, inlier),
-            "frames": inlier_frames,
-        },
-    })
-    T = calibration.transform
-
-    corrected = T @ np.array([mean_fwd[0], mean_fwd[1], 0.0])
-
-    print(f"\n{'=' * 55}")
-    print("Calibration result")
     print(
-        f"  valid frames:  {inlier_frames} "
-        f"(rejected {int(np.sum(~inlier))} outliers, skipped {stale_count} dupes)"
+        f"VR heading: {calibration.theta_deg:.2f}°, {calibration.frames} inliers, "
+        f"{len(forwards) - calibration.frames} rejected, {stale_count} duplicate frames"
     )
-    print(f"  forward:       [{mean_fwd[0]:.4f}, {mean_fwd[1]:.4f}]")
-    print(f"  theta:         {theta_deg:.1f}°")
     print(
-        "  quality:       "
-        f"{calibration.quality.grade} (σ={calibration.quality.std_deg:.1f}°, "
-        f"max={calibration.quality.max_deviation_deg:.1f}°)"
+        f"Quality: {calibration.grade}, σ={calibration.std_deg:.2f}°, "
+        f"max={calibration.max_deviation_deg:.2f}°"
     )
-    print(f"  verification:  T·forward = [{corrected[0]:.4f}, {corrected[1]:.4f}] (expect [1, 0])")
-    print(f"  T = R_z(-{theta_deg:.1f}°):")
-    print(f"    [{T[0, 0]:.4f}, {T[0, 1]:.4f}, {T[0, 2]:.4f}],")
-    print(f"    [{T[1, 0]:.4f}, {T[1, 1]:.4f}, {T[1, 2]:.4f}],")
-    print(f"    [{T[2, 0]:.4f}, {T[2, 1]:.4f}, {T[2, 2]:.4f}]")
-    print(f"{'=' * 55}")
 
     try:
         output_path = publish_vr_transform(calibration, args.output, force=args.force)

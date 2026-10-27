@@ -8,7 +8,7 @@ from pathlib import Path
 from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extrinsics
 from dexmani_real.calibration.table_plane import resolve_table_plane
-from dexmani_real.calibration.vr_alignment import load_vr_transform
+from dexmani_real.calibration.vr_heading import load_vr_transform
 from dexmani_real.control.action_mapping import ActionMapper
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.recorder import RecordingError

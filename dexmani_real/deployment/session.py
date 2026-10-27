@@ -7,7 +7,7 @@ from concurrent.futures import CancelledError
 from itertools import count
 
 from dexmani_real.calibration.camera.extrinsics import (
-    CameraExtrinsics,
+    load_camera_extrinsics,
     load_optional_camera_extrinsics,
 )
 from dexmani_real.control.action_mapping import ActionMapper
@@ -152,7 +152,7 @@ class PolicySession:
         from dexmani_real.deployment.inference import InferenceWorker
 
         if self.needs.point_cloud or "camera_extrinsic" in self.info.observation_fields:
-            self.camera_calibration = CameraExtrinsics(self.camera_calibration_path)
+            self.camera_calibration = load_camera_extrinsics(self.camera_calibration_path)
         elif self.record_raw:
             self.camera_calibration = load_optional_camera_extrinsics(self.camera_calibration_path)
         else:

@@ -1,8 +1,10 @@
+import json
 import threading
 import unittest
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from enum import Enum
+from pathlib import Path
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -16,6 +18,7 @@ from dexmani_real.robot.xarm7.config import ArmConfig
 from dexmani_real.robot.xhand.config import HandConfig
 from dexmani_real.runtime import home, keyboard, lifecycle
 from dexmani_real.runtime.jog import JogController, compute_cartesian_jog_delta, jog_motion_requested
+from dexmani_real.runtime.observation import snapshot_camera_parameters
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 
 
@@ -252,9 +255,10 @@ class CommandRoutingTests(unittest.TestCase):
 
 class ReplayInputTests(unittest.TestCase):
     def setUp(self):
-        from dexmani_real.replay import session
+        from dexmani_real.replay import run as session
 
         self.session = session
+        self.runtime = load_experiment_config()
         stack = ExitStack()
         self.addCleanup(stack.close)
         self.output = stack.enter_context(TemporaryDirectory())
@@ -267,7 +271,6 @@ class ReplayInputTests(unittest.TestCase):
         self.keys.start = Mock()
         self.addCleanup(self.keys.stop)
         self.robot = Mock(stop_required=False)
-        self.results = Mock(current=None)
         self.home = Mock(return_value=home.HomeResult(True))
         replacements = {
             "configure_logging": Mock(),
@@ -280,14 +283,14 @@ class ReplayInputTests(unittest.TestCase):
             "Keyboard": Mock(return_value=self.keys),
             "DexManiRobot": Mock(return_value=self.robot),
             "HomePlanner": Mock(),
-            "SessionResults": Mock(return_value=self.results),
             "home_hand": Mock(return_value=home.HomeResult(True)),
             "home_robot": self.home,
-            "TrajectoryReplayer": Mock(),
+            "ReplayPlayer": Mock(),
         }
-        replacements["TrajectoryReplayer"].return_value.run.return_value = session.ReplayOutcome(
+        replacements["ReplayPlayer"].return_value.run.return_value = session.ReplayResult(
             session.ReplayStatus.COMPLETED,
         )
+        self.evaluate = replacements["evaluate_replay"]
         stack.enter_context(patch.multiple(session, **replacements))
         stack.enter_context(patch("builtins.print"))
 
@@ -295,7 +298,7 @@ class ReplayInputTests(unittest.TestCase):
         self.keys.handle_key(key, True)
         self.keys.handle_key(key, False)
 
-    def run_batches(self, batches):
+    def run_batches(self, batches, expected_status=None):
         batches = iter(batches)
 
         def poll(timeout):
@@ -305,12 +308,26 @@ class ReplayInputTests(unittest.TestCase):
 
         self.keys.poll = poll
         outcome = self.session.run_replay(
-            SimpleNamespace(fps=30),
-            SimpleNamespace(arm=None, hand=None, environment=SimpleNamespace(table=Mock())),
+            SimpleNamespace(fps=30, episode_path="episode"),
+            self.runtime,
             output_dir=self.output,
         )
-        self.assertEqual(outcome.status, self.session.ReplayStatus.COMPLETED, outcome.reason)
+        self.assertEqual(outcome.status, expected_status or self.session.ReplayStatus.COMPLETED, outcome.reason)
         self.robot.close.assert_called_once()
+
+    def test_invalid_execution_age_fails_before_device_startup(self):
+        for age in (0, -1, float("nan"), float("inf")):
+            with self.subTest(age=age), self.assertRaisesRegex(ValueError, "max_decision_age_s"):
+                self.session.run_replay(
+                    SimpleNamespace(fps=30, episode_path="episode"),
+                    replace(
+                        self.runtime,
+                        execution=replace(self.runtime.execution, max_decision_age_s=age),
+                    ),
+                    output_dir=self.output,
+                )
+        self.session.DexManiRobot.assert_not_called()
+        self.assertEqual(list(Path(self.output).iterdir()), [])
 
     def test_stop_blocks_same_batch_home_and_allows_new_request_after_acknowledgment(self):
         self.run_batches([["s", "h"], [], ["h"], ["q"]])
@@ -334,8 +351,73 @@ class ReplayInputTests(unittest.TestCase):
         self.home.side_effect = interrupt
         self.run_batches([["h"], [], ["h"], ["q"]])
         self.assertEqual(self.home.call_count, 2)
-        self.results.record_home_result.assert_any_call(
-            ok=False, interrupted=True, reason="home interrupted",
+        result = json.loads((Path(self.output) / "session_result.json").read_text())
+        self.assertIn(dict(ok=False, interrupted=True, reason="home interrupted"), result["home_results"])
+
+    def test_home_failure_does_not_erase_completed_trajectory(self):
+        self.home.return_value = home.HomeResult(False, "home failed")
+        self.run_batches([["h"]], self.session.ReplayStatus.FAULT)
+        result = json.loads((Path(self.output) / "session_result.json").read_text())
+        self.assertEqual(result["trajectory_status"], "completed")
+        self.assertEqual(result["status"], "fault")
+        self.assertIn("home failed", result["reason"])
+
+    def test_evaluation_failure_is_recorded_after_cleanup(self):
+        def fail(*args, **kwargs):
+            self.robot.close.assert_called_once()
+            raise RuntimeError("metrics failed")
+
+        self.evaluate.side_effect = fail
+        with self.assertLogs(self.session.logger, "ERROR"):
+            self.run_batches([["q"]], self.session.ReplayStatus.FAULT)
+        result = json.loads((Path(self.output) / "session_result.json").read_text())
+        self.assertEqual(result["trajectory_status"], "completed")
+        self.assertIn("metrics failed", result["errors"][0])
+
+    def test_shutdown_failure_cannot_report_success(self):
+        self.robot.close.side_effect = RuntimeError("close failed")
+        with self.assertLogs("dexmani_real.runtime.lifecycle", "ERROR"):
+            self.run_batches([["q"]], self.session.ReplayStatus.FAULT)
+        result = json.loads((Path(self.output) / "session_result.json").read_text())
+        self.assertFalse(result["shutdown_clean"])
+
+
+class CameraSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.config = SimpleNamespace(serial=None, width=640, height=480)
+        self.channels = SimpleNamespace(
+            camera_ready=Mock(is_set=Mock(return_value=True)),
+            camera_serial=SimpleNamespace(value=b"active"),
+            camera_intrinsics=SimpleNamespace(value=json.dumps({
+                "width": 640, "height": 480, "fx": 600, "fy": 600, "ppx": 320, "ppy": 240,
+                "distortion_model": "none", "distortion_coeffs": [0] * 5,
+            }).encode()),
+            camera_depth_scale=SimpleNamespace(value=0.001),
+        )
+
+    def test_existing_calibration_must_contain_active_serial(self):
+        for required in (False, True):
+            with self.subTest(required=required), self.assertRaisesRegex(KeyError, "active"):
+                snapshot_camera_parameters(
+                    self.channels, self.config, {"other": np.eye(4)}, require_extrinsics=required,
+                )
+
+    def test_absent_calibration_is_allowed_only_for_optional_consumers(self):
+        camera = snapshot_camera_parameters(self.channels, self.config, None)
+        self.assertIsNone(camera.T_xarm_base_from_color)
+        self.assertNotIn("camera_T_xarm_base_from_color", camera.metadata())
+        with self.assertRaisesRegex(ValueError, "requires current extrinsics"):
+            snapshot_camera_parameters(self.channels, self.config, None, require_extrinsics=True)
+
+    def test_snapshot_owns_transform_and_records_matching_serial(self):
+        transform = np.eye(4)
+        camera = snapshot_camera_parameters(self.channels, self.config, {"active": transform})
+        transform[:3, 3] = 1
+        np.testing.assert_array_equal(camera.T_xarm_base_from_color, np.eye(4))
+        self.assertFalse(camera.T_xarm_base_from_color.flags.writeable)
+        self.assertEqual(camera.metadata()["camera_serial"], "active")
+        self.assertEqual(
+            camera.metadata()["camera_T_xarm_base_from_color"], np.eye(4).ravel().tolist(),
         )
 
 
@@ -351,10 +433,10 @@ class PreviewInputTests(unittest.TestCase):
         example.table_plane_abcd = None
         transform, plane = np.eye(4), (0.0, 0.0, 1.0, 0.0)
         with (
-            patch.object(preview, "CameraExtrinsics") as calibration,
+            patch.object(preview, "load_camera_extrinsics") as calibration,
             patch.object(preview, "resolve_table_plane", return_value=plane) as resolve,
         ):
-            calibration.return_value.for_serial.return_value = transform
+            calibration.return_value = {"camera": transform}
             np.testing.assert_array_equal(example.load_pointcloud_geometry("raw", "camera")[0], transform)
             resolve.assert_not_called()
             self.assertEqual(example.load_pointcloud_geometry("processed", "camera")[1], plane)

@@ -1,7 +1,6 @@
 """按需读取传感器快照，保留各来源时间与相机帧对应关系。"""
 
 import json
-import logging
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -51,14 +50,7 @@ def snapshot_camera_parameters(channels, config, calibration, *, require_extrins
     color = CameraIntrinsics(**json.loads(channels.camera_intrinsics.value.decode("utf-8")))
     if (color.height, color.width) != (config.height, config.width):
         raise ValueError("camera intrinsics differ from configured resolution")
-    transform = None
-    if calibration is not None:
-        try:
-            transform = calibration.for_serial(serial)
-        except KeyError:
-            if require_extrinsics:
-                raise
-            logging.getLogger(__name__).warning("No camera extrinsics for active serial %s", serial)
+    transform = None if calibration is None else calibration[serial]
     if require_extrinsics and transform is None:
         raise ValueError("camera consumer requires current extrinsics")
     return CameraSnapshot(serial, color, channels.camera_depth_scale.value, transform)
