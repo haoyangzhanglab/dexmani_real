@@ -10,7 +10,7 @@ from pathlib import Path
 
 from dexmani_real.calibration import CAMERAS_PATH
 from dexmani_real.calibration.table_plane import (
-    resolve_table_plane,
+    load_table_plane,
     resolve_table_plane_path,
 )
 from dexmani_real.deployment.config import (
@@ -98,12 +98,14 @@ def run_policy(
     )
     needs = control_needs.union(record_needs)
     runtime = resolve_deployment_config(info, runtime, needs)
-    table_plane_abcd = resolve_table_plane(
-        runtime.environment.table,
-        required=runtime.environment.table.enabled or (needs.point_cloud and runtime.pointcloud.remove_table),
+    table_plane_abcd = (
+        load_table_plane(runtime.environment.table)
+        if runtime.environment.table.enabled or (needs.point_cloud and runtime.pointcloud.remove_table)
+        else None
     )
 
-    camera_calibration_path = Path(camera_calibration_path or CAMERAS_PATH).expanduser().resolve()
+    if camera_calibration_path is not None:
+        camera_calibration_path = Path(camera_calibration_path).expanduser().resolve()
     root = output or Path(__file__).resolve().parents[2] / "rollouts"
     session_dir = session_directory(Path(root), info)
     import dexmani_policy
@@ -114,7 +116,7 @@ def run_policy(
         "policy": info.to_dict(),
         "future_steps": info.future_steps,
         "runtime": asdict(runtime),
-        "camera_calibration_path": str(camera_calibration_path),
+        "camera_calibration_path": str(camera_calibration_path or CAMERAS_PATH),
         "effective_camera": None,
         "table_plane_abcd": table_plane_abcd,
         "table_plane_path": (

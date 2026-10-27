@@ -279,21 +279,23 @@ class ReplayInputTests(unittest.TestCase):
             "configure_logging": Mock(),
             "validate_robot_config": Mock(),
             "validate_control_rate": Mock(),
-            "verify_replay_preflight": Mock(),
-            "resolve_table_plane": Mock(),
-            "evaluate_replay": Mock(),
+            "validate_trajectory": Mock(),
+            "load_table_plane": Mock(),
+            "compute_metrics": Mock(return_value=dict(
+                matching_frames=0, original_frames=0, arm_joint=None, hand_joint=None,
+                eef_position=None, eef_orientation=None,
+            )),
             "SessionState": Mock(return_value=self.state),
             "Keyboard": Mock(return_value=self.keys),
             "Robot": Mock(return_value=self.robot),
             "HomePlanner": Mock(),
-            "home_hand": Mock(return_value=home.HomeResult(True)),
             "home_robot": self.home,
-            "ReplayPlayer": Mock(),
+            "JointReplay": Mock(),
         }
-        replacements["ReplayPlayer"].return_value.run.return_value = session.ReplayResult(
+        replacements["JointReplay"].return_value.run.return_value = session.ReplayResult(
             session.ReplayStatus.COMPLETED,
         )
-        self.evaluate = replacements["evaluate_replay"]
+        self.evaluate = replacements["compute_metrics"]
         stack.enter_context(patch.multiple(session, **replacements))
         stack.enter_context(patch("builtins.print"))
 
@@ -331,6 +333,47 @@ class ReplayInputTests(unittest.TestCase):
                 )
         self.session.Robot.assert_not_called()
         self.assertEqual(list(Path(self.output).iterdir()), [])
+
+    def test_startup_preserves_hand_pose_until_replay(self):
+        self.run_batches([["q"]])
+        self.robot.send_hand_home.assert_not_called()
+        self.home.assert_not_called()
+        self.session.JointReplay.return_value.run.assert_called_once()
+
+    def test_startup_failure_still_saves_empty_data_and_failure(self):
+        self.robot.connect.side_effect = RuntimeError("connect failed")
+        with self.assertLogs(self.session.logger, "ERROR"):
+            self.run_batches([], self.session.ReplayStatus.FAULT)
+        result = json.loads((Path(self.output) / "session_result.json").read_text())
+        self.assertIn("connect failed", result["reason"])
+        self.assertIsNone(result["trajectory_status"])
+        with np.load(Path(self.output) / "replay_data.npz") as saved:
+            self.assertEqual(saved["arm_qpos"].shape, (0, 7))
+
+    def test_quit_during_connection_is_clean_and_retains_empty_data(self):
+        def quit():
+            self.press("q")
+            raise self.session.OperationCancelled("connection cancelled")
+
+        self.robot.connect.side_effect = quit
+        self.run_batches([], self.session.ReplayStatus.USER_QUIT)
+        self.session.JointReplay.assert_not_called()
+        result = json.loads((Path(self.output) / "session_result.json").read_text())
+        self.assertTrue(result["shutdown_clean"])
+        self.assertEqual(result["replay_rows"], 0)
+
+    def test_final_publication_failure_propagates_after_cleanup(self):
+        write = self.session.write_json
+
+        def fail_final(payload, path, **kwargs):
+            if path.name == "session_result.json" and payload["status"] != "incomplete":
+                self.robot.close.assert_called_once()
+                raise OSError("result disk failure")
+            return write(payload, path, **kwargs)
+
+        with patch.object(self.session, "write_json", side_effect=fail_final):
+            with self.assertRaisesRegex(OSError, "result disk failure"):
+                self.run_batches([["q"]])
 
     def test_stop_blocks_same_batch_home_and_allows_new_request_after_acknowledgment(self):
         self.run_batches([["s", "h"], [], ["h"], ["q"]])
@@ -375,7 +418,9 @@ class ReplayInputTests(unittest.TestCase):
             self.run_batches([["q"]], self.session.ReplayStatus.FAULT)
         result = json.loads((Path(self.output) / "session_result.json").read_text())
         self.assertEqual(result["trajectory_status"], "completed")
-        self.assertIn("metrics failed", result["errors"][0])
+        self.assertIn("metrics failed", result["reason"])
+        self.assertTrue((Path(self.output) / "replay_data.npz").is_file())
+        self.assertFalse((Path(self.output) / "metrics.json").exists())
 
     def test_shutdown_failure_cannot_report_success(self):
         self.robot.close.side_effect = RuntimeError("close failed")
@@ -461,7 +506,7 @@ class PreviewInputTests(unittest.TestCase):
         transform, plane = np.eye(4), (0.0, 0.0, 1.0, 0.0)
         with (
             patch.object(self.preview, "load_camera_extrinsics") as calibration,
-            patch.object(self.preview, "resolve_table_plane", return_value=plane) as resolve,
+            patch.object(self.preview, "load_table_plane", return_value=plane) as resolve,
         ):
             calibration.return_value = {"camera": transform}
             np.testing.assert_array_equal(self.viewer.load_pointcloud_geometry("raw", "camera")[0], transform)

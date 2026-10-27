@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 
 from dexmani_real.calibration.camera.extrinsics import load_camera_extrinsics
-from dexmani_real.calibration.table_plane import resolve_table_plane
+from dexmani_real.calibration.table_plane import load_table_plane
 from dexmani_real.config import load_experiment_config
 from dexmani_real.geometry.camera import validate_aligned_depth_distortion
 from dexmani_real.perception.pointcloud import (
@@ -290,7 +290,7 @@ class RealSenseViewer:
             self.calibration = load_camera_extrinsics(self.args.camera_calibration)
         transform = self.calibration[serial]
         if mode == "processed" and self.pointcloud_config.remove_table and self.table_plane_abcd is None:
-            self.table_plane_abcd = resolve_table_plane(self.table)
+            self.table_plane_abcd = load_table_plane(self.table)
         return transform, self.table_plane_abcd
 
 

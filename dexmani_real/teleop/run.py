@@ -8,7 +8,7 @@ from pathlib import Path
 
 from dexmani_real.calibration import VR_TRANSFORM_PATH
 from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extrinsics
-from dexmani_real.calibration.table_plane import resolve_table_plane
+from dexmani_real.calibration.table_plane import load_table_plane
 from dexmani_real.calibration.vr_heading import load_vr_transform
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePlanner
@@ -64,9 +64,9 @@ def run_teleop(
     runtime.vr.validate()
     if runtime.collection.enabled:
         runtime.camera.validate()
-    table_plane_abcd = resolve_table_plane(
-        runtime.environment.table,
-        required=runtime.environment.table.enabled,
+    table_plane_abcd = (
+        load_table_plane(runtime.environment.table)
+        if runtime.environment.table.enabled else None
     )
     if not runtime.hand.enabled and (runtime.collection.enabled or not allow_no_hand):
         raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")

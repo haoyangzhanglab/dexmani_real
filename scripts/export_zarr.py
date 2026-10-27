@@ -10,7 +10,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from dexmani_real.calibration.table_plane import resolve_table_plane
+from dexmani_real.calibration.table_plane import load_table_plane
 from dexmani_real.config import load_experiment_config
 from dexmani_real.data.export import ExportConfig, export_zarr
 
@@ -82,7 +82,7 @@ def load_processing_config(path: Path | None, *, num_points: int | None) -> Expo
         cli_overrides={"pointcloud.num_points": num_points},
     )
     plane = (
-        resolve_table_plane(runtime.environment.table) if runtime.pointcloud.remove_table else None
+        load_table_plane(runtime.environment.table) if runtime.pointcloud.remove_table else None
     )
     return ExportConfig.from_runtime(runtime, table_plane_abcd=plane)
 

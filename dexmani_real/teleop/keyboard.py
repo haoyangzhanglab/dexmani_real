@@ -2,7 +2,7 @@
 
 import logging
 
-from dexmani_real.calibration.table_plane import resolve_table_plane
+from dexmani_real.calibration.table_plane import load_table_plane
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.control.ik import IKSolver
@@ -32,8 +32,9 @@ class KeyboardTeleop:
     def run(self):
         configure_logging()
         validate_robot_config(self.runtime)
-        self.table_plane_abcd = resolve_table_plane(
-            self.runtime.environment.table, required=self.runtime.environment.table.enabled,
+        self.table_plane_abcd = (
+            load_table_plane(self.runtime.environment.table)
+            if self.runtime.environment.table.enabled else None
         )
         self.bounds = jog_bounds(self.runtime)
         if not self.runtime.hand.enabled and not self.no_hand:

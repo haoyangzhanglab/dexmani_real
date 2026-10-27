@@ -14,7 +14,7 @@ os.environ.setdefault("RUST_LOG", "error")
 
 import numpy as np
 
-from dexmani_real.calibration.table_plane import resolve_table_plane
+from dexmani_real.calibration.table_plane import load_table_plane
 from dexmani_real.config import load_experiment_config
 from dexmani_real.control.config import TableCollisionConfig
 from dexmani_real.data.raw import RawReader
@@ -153,7 +153,7 @@ class EpisodeVisualizer:
             self.pointcloud_processing_ns = 0
             self.pointcloud_processed_frames = 0
             if pointcloud_config is not None and self.T_xarm_base_from_color is not None:
-                table_plane = resolve_table_plane(table_config) if pointcloud_config.remove_table else None
+                table_plane = load_table_plane(table_config) if pointcloud_config.remove_table else None
                 self.pointcloud_processor = PointCloudProcessor(
                     depth_scale_m=self.camera_model.depth_scale_m,
                     intrinsics=self.camera_model.color,

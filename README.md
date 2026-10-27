@@ -39,13 +39,13 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 标定与设备诊断为这些流程提供共同的实验支持。
 
-相机标定位于 [`calibration/camera/`](dexmani_real/calibration/camera/)，其中 `aruco.py` 负责检测、预览与静止采样，`hand_eye.py` 使用五种算法择优求解，`run.py` 负责运动、样本管理与标定保存。标记和质量阈值在所属模块就近定义。只有位置 RMS ≤ 5 mm 且旋转 RMS ≤ 3° 的结果可以保存；未达标结果保留残差，X 按两种残差相对门限的最大值删除最差样本，之后需重新求解。
+相机标定位于 [`calibration/camera/`](dexmani_real/calibration/camera/)，其中 `aruco.py` 的 `ArucoSampler` 负责检测与静止采样，`hand_eye.py` 使用五种算法择优求解，`calibrate.py` 的 `CameraCalibrator` 负责运动、预览、样本管理与标定保存。标记和质量阈值在所属模块就近定义。只有位置 RMS ≤ 5 mm 且旋转 RMS ≤ 3° 的结果可以保存；未达标结果保留残差，X 按两种残差相对门限的最大值删除最差样本，之后需重新求解。
 
 桌面拟合与质量评估位于 [`geometry/plane.py`](dexmani_real/geometry/plane.py)，路径解析和标定读写位于 [`calibration/table_plane.py`](dexmani_real/calibration/table_plane.py)；VR 对齐与启动质量检查位于 [`calibration/vr_heading.py`](dexmani_real/calibration/vr_heading.py)。默认参数集中在 [`calibration/parameters/`](dexmani_real/calibration/parameters/)，路径常量由 `dexmani_real.calibration` 提供，消费者需要时才读取。
 
-相机外参通过 `load_camera_extrinsics()` 按 serial 返回矩阵字典；可选录制仅允许默认文件缺失，损坏文件、显式路径错误或文件中缺少当前相机 serial 均直接报错。
+相机外参 JSON 以 serial 为键，条目包含 `T_base_from_camera` 四阶矩阵（相机到基座，平移单位米）和可选的 `calibration_capture` 元数据。`load_camera_extrinsics()` 返回 serial 到矩阵的字典；读写使用同一文件校验，更新一台相机时保留其他条目。可选录制仅允许默认文件缺失，损坏文件、显式路径错误或文件中缺少当前相机 serial 均直接报错。
 
-实验配置使用 `from dexmani_real.config import load_experiment_config`，覆盖优先级为 CLI > YAML > dataclass 默认值。配置加载不读取标定或连接设备，运行约束在使用边界验证。`environment.table.plane_path` 的相对路径以仓库根目录解析；显式指定的必需标定缺失时直接报错。VR 标定脚本的 `--force` 仅允许将低质量结果导出到显式指定、非默认且未占用的 `--output` 文件；遥操作启动仍拒绝低质量标定。
+实验配置使用 `from dexmani_real.config import load_experiment_config`，覆盖优先级为 CLI > YAML > dataclass 默认值。配置加载不读取标定或连接设备，运行约束在使用边界验证。`environment.table.plane_path` 的相对路径以仓库根目录解析；显式指定的必需标定缺失时直接报错。桌面读取使用 `load_table_plane(table)`，由调用方决定是否需要加载。VR 标定模块提供 `collect_headings()`、`estimate_heading()` 和 `save_vr_transform()`；脚本只保存合格结果，保存成功后播放完成提示音。相机标定前必须拆除 XHand 或将其固定在 HOME 姿态，脚本禁用手部驱动，碰撞检查统一使用固定 HOME 包络；采样期间持续检查关节速度，并核对前后姿态漂移。
 
 机器人会话在 preflight 统一检查设备、HOME、工作空间及实际启用的碰撞配置；相机及 XHand 独立工具在自己的入口检查。内部 driver、controller 和计算函数接收已经通过入口检查的配置与标定，不重复预检。新的 SDK 反馈、模型输出、文件数据及最终发送目标仍在各自边界校验。`--print-config` 仅展示声明值；`run_policy()` 在加载策略前检查运行轮数和时长。
 
@@ -53,7 +53,7 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 核心实现位于 [`dexmani_real/`](dexmani_real/)，实验入口与设备工具集中在 [`scripts/`](scripts/)；[`assets/`](assets/) 存放机器人模型等资源，[`third_party/`](third_party/) 包含第三方相关代码。
 
-部署沿 `deployment/run.py → session.py → rollout.py` 执行：`config.py` 统一解析与校验执行配置，会话持有设备和模型，`PolicyRollout` 协调单轮观测、提交与录制。`schedule.py` 根据时钟与状态决定 sync/async/RTC 调度，`observation.py` 按需组装输入，`inference.py` 独占模型线程。来源时效在观测入口检查，策略输入的数值与形状在 `dexmani_policy` 边界检查；历史快照仅在提交预测时创建。回放沿 `replay/run.py → player.py` 执行，`data.py` 读取轨迹并缓存实测数据，`metrics.py` 在硬件收尾后计算匹配帧的关节与末端误差。
+部署沿 `deployment/run.py → session.py → rollout.py` 执行：`config.py` 统一解析与校验执行配置，会话持有设备和模型，`PolicyRollout` 协调单轮观测、提交与录制。`schedule.py` 根据时钟与状态决定 sync/async/RTC 调度，`observation.py` 按需组装输入，`inference.py` 独占模型线程。来源时效在观测入口检查，策略输入的数值与形状在 `dexmani_policy` 边界检查；历史快照仅在提交预测时创建。回放沿 `replay/run.py → joint_replay.py` 执行，`JointReplay` 负责逐帧提交，`trajectory.py` 读取轨迹并缓存、保存实测数据，`metrics.py` 只计算匹配帧的关节与末端误差。运行入口在硬件收尾后保存 NPZ、计算指标并写入 JSON；指标失败时原始采样仍可用于离线评估。
 
 策略选择交给 Policy 的公开 `inspect_policy`：Real 默认 latest，也支持 best、20pct 等 milestone 和显式 checkpoint 路径。显式相对路径以当前工作目录解析；weights/NFE 的显式参数优先。执行长度仍取 execution 配置或模型 n_action_steps。
 
@@ -101,7 +101,9 @@ XHand 的 SDK 载荷解析、错误码和板卡诊断位于 `robot/xhand/driver.
 
 遥操作入口为 `teleop.run.run_teleop(...)`，回放入口为 `replay.run.run_replay(...)`，对应脚本解析参数并调用入口。
 
-回放输出 `replay_data.npz`（实测关节、候选及来源/提交时间戳）、`metrics.json`（按帧索引比较的误差）和 `session_result.json`（回放、回零与收尾结果）。候选和提交完成都不代表物理到位；手部准备不占回放行，准备时长保存在运行摘要中。零行指标使用 `null`，不表示零误差。
+回放输出 `replay_data.npz`（实测关节、候选及来源/提交时间戳）、`metrics.json`（按帧索引比较的误差）和 `session_result.json`（回放、回零与收尾结果）。候选和提交完成都不代表物理到位；手部准备不占回放行，准备时长保存在运行摘要中。零行指标使用 `null`，不表示零误差。摘要的 `status`、`reason` 表示会话最终结果，`trajectory_status` 独立保留回放阶段的结束状态；回零失败不会抹去已完成的回放状态。启动及准备阶段按 Q 取消也记为 `user_quit`；文件写入失败不会报告成功。
+
+回放启动保留当前手部姿态。操作者应先摆好录像首帧姿态；新鲜实测关节与首帧相差超过 10° 时拒绝回放。`--hand-start-duration` 默认 0.5 秒，按“平滑插值 → 三个不同的新鲜反馈确认到位”准备首个手部目标；设为 0 可跳过准备。回放结束后支持 H 手动回零、S 停止和 Q 退出。
 
 回放使用 Raw 的帧率安排提交，过期帧立即中止；目标的执行期限沿用 `execution.max_decision_age_s`，入口要求该值为有限正数。
 
@@ -196,7 +198,7 @@ mypy 按现有类型标注检查上述模块，不检查未标注函数体或外
 
 键盘遥操作入口保留 `--help`，没有 `--print-config` 参数。
 
-`tests/test_replay.py` 覆盖 Raw 轨迹读取、核心误差、部分采样、过期提交、退出、急停与手部准备；`tests/test_calibration.py` 使用合成姿态和图像验证五算法求解、双轴激励、质量门限、ArUco 采样及 VR 环绕，并检查标定读写和取消。测试均不连接硬件。
+`tests/test_replay.py` 覆盖 Raw 读取、核心误差、部分采样、过期提交、退出、急停与手部准备的取消和去重；`tests/test_runtime.py` 检查启动不回手部 HOME、手动回零及收尾发布失败。`tests/test_calibration.py` 使用合成姿态和图像验证五算法求解、双轴激励、质量门限、ArUco 采样、预览、VR 环绕与去重，并检查标定读写、取消及保存后的完成提示音。测试均不连接硬件。
 
 真机启停、取消/急停、HOME/jog、遥操作录制、三种策略模式和回放仍需操作者单独验收。软件授权撤销和 SDK 接受请求不代表物理停稳或到位。
 

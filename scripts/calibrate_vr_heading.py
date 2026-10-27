@@ -7,15 +7,16 @@ import argparse
 import math
 import multiprocessing as mp
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
-
 from dexmani_real.calibration import VR_TRANSFORM_PATH
-from dexmani_real.calibration.vr_heading import VRCalibration, estimate_heading
-from dexmani_real.geometry.pose import forward_from_quat_wxyz
-from dexmani_real.ipc.sensors import SensorChannels, read_vr_frame
+from dexmani_real.calibration.vr_heading import (
+    collect_headings,
+    estimate_heading,
+    read_heading,
+    save_vr_transform,
+)
+from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.runtime.lifecycle import (
     VR_READY_TIMEOUT_S,
     SensorWorkers,
@@ -25,9 +26,7 @@ from dexmani_real.runtime.state import SessionState
 from dexmani_real.sensor.config import VRConfig
 from dexmani_real.sensor.vr import run_vr
 from dexmani_real.teleop.audio import AudioFeedback
-from dexmani_real.utils.io import write_json
 
-POLL_INTERVAL_S = 0.01
 PRINT_INTERVAL_S = 5.0
 JOIN_TIMEOUT_S = 5.0
 COUNTDOWN_DWELL_S = 1.0
@@ -35,47 +34,6 @@ AUDIO_IDLE_TIMEOUT_S = 5.0
 DEFAULT_DURATION_S = 10.0
 TRACKING_DATA_TIMEOUT_S = 15.0
 SETTLE_S = 3.0
-
-
-def publish_vr_transform(
-    calibration: VRCalibration,
-    output: Path | None,
-    *,
-    force: bool = False,
-) -> Path:
-    """合格结果可更新当前标定；低质量结果只能显式导出到未占用的新文件。"""
-    path = VR_TRANSFORM_PATH if output is None else output
-    poor = calibration.grade == "poor"
-    if poor:
-        if not force:
-            raise ValueError(
-                "quality grade is 'poor'; re-collect a steadier sample, "
-                "or use --force --output NEW_FILE for diagnostic export"
-            )
-        if output is None or path.resolve() == VR_TRANSFORM_PATH.resolve():
-            raise ValueError("poor calibration requires --output pointing to a new non-default file")
-    payload = {
-        "theta_deg": calibration.theta_deg,
-        "ref": calibration.reference,
-        "quality": {
-            "std_deg": calibration.std_deg,
-            "max_deviation_deg": calibration.max_deviation_deg,
-            "frames": calibration.frames,
-        },
-        "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
-    }
-    return write_json(payload, path, overwrite=not poor)
-
-
-def read_heading(channels: SensorChannels, reference: str):
-    frame = read_vr_frame(channels)
-    if frame is None:
-        return None
-    # Hand publications cache head pose; only its own receive time identifies a head sample.
-    if reference == "head":
-        stamp = int(frame["head_recv_ts_ns"])
-        return (stamp, frame["head_quat_wxyz"]) if stamp > 0 else None
-    return int(frame["sequence_id"]), frame["wrist_quat_wxyz"]
 
 
 def wait_for_vr_tracking(
@@ -102,20 +60,13 @@ def wait_for_vr_tracking(
 
 
 def play_completion_audio() -> None:
-    audio: AudioFeedback | None = None
+    audio = AudioFeedback()
     try:
-        audio = AudioFeedback()
         audio.play("calibrated")
         if not audio.wait_until_idle(timeout_s=AUDIO_IDLE_TIMEOUT_S):
             print("  WARNING: audio feedback timed out")
-    except Exception as exc:
-        print(f"  WARNING: audio feedback unavailable: {exc}")
     finally:
-        if audio is not None:
-            try:
-                audio.close()
-            except Exception as exc:
-                print(f"  WARNING: audio feedback cleanup failed: {exc}")
+        audio.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -134,11 +85,6 @@ def main(argv: list[str] | None = None) -> int:
         choices=["wrist", "head"],
         default="head",
         help="reference: head=face robot +X, wrist=extend arm pointing at robot +X",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="export poor-quality results only with --output pointing to a new non-default file",
     )
     parser.add_argument(
         "--output", type=Path, default=None,
@@ -172,8 +118,6 @@ def main(argv: list[str] | None = None) -> int:
     vr_proc = ctx.Process(
         name="vr", target=run_vr, args=(channels, vr_config), daemon=True
     )
-    forwards: list[np.ndarray] = []
-    stale_count = 0
     try:
         print(
             f"\n  Waiting for VR connection (up to {VR_READY_TIMEOUT_S:g} s) "
@@ -211,33 +155,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {i}...")
             time.sleep(COUNTDOWN_DWELL_S)
 
-        deadline = time.monotonic() + args.duration
-        last_print = 0.0
-        prev_seq: int | None = None
-
         print(f"  Collecting {args.duration}s (hold still)...")
-        while time.monotonic() < deadline:
-            if not sensors.check():
-                print("  ERROR: VR receiver exited during collection", flush=True)
-                return 1
-            sample = read_heading(channels, args.ref)
-            if sample is None:
-                time.sleep(POLL_INTERVAL_S)
-                continue
-            sequence, quaternion = sample
-            # Ignore duplicate sequence numbers in the quality estimate.
-            if sequence == prev_seq:
-                stale_count += 1
-                time.sleep(POLL_INTERVAL_S)
-                continue
-            prev_seq = sequence
-            forwards.append(forward_from_quat_wxyz(quaternion))
-
-            now = time.monotonic()
-            if now - last_print >= 1.0:
-                print(f"    collected {len(forwards)} frames...")
-                last_print = now
-            time.sleep(POLL_INTERVAL_S)
+        forwards, stale_count = collect_headings(channels, sensors, args.ref, args.duration)
     finally:
         shutdown_clean = close_runtime(
             runtime_state,
@@ -250,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        calibration = estimate_heading(np.asarray(forwards, dtype=np.float64).reshape(-1, 3), args.ref)
+        calibration = estimate_heading(forwards, args.ref)
     except ValueError as exc:
         print(f"ERROR: invalid heading sample: {exc}")
         return 1
@@ -264,8 +183,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        output_path = publish_vr_transform(calibration, args.output, force=args.force)
-    except (ValueError, FileExistsError) as exc:
+        output_path = save_vr_transform(calibration, args.output or VR_TRANSFORM_PATH)
+    except ValueError as exc:
         print(f"\n  NOT written: {exc}")
         return 1
 

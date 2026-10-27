@@ -104,7 +104,7 @@ class RunTests(unittest.TestCase):
                     self.subTest(record_raw=record_raw, selector=selector), patch("builtins.print"),
                     patch("dexmani_policy.deployment.inspect_policy", return_value=info) as inspect,
                     patch.object(run, "git_head", return_value=None),
-                    patch.object(run, "resolve_table_plane", return_value=None) as table,
+                    patch.object(run, "load_table_plane", return_value=None) as table,
                     patch.object(run, "PolicySession") as owner,
                 ):
                     owner.return_value.run.return_value = 0
@@ -117,8 +117,9 @@ class RunTests(unittest.TestCase):
                     resolved = owner.call_args.args[0]
                     self.assertEqual(resolved.execution.action_steps, info.n_action_steps)
                     self.assertEqual(resolved.pointcloud.num_points, 16)
-                    self.assertFalse(table.call_args.kwargs["required"])
+                    table.assert_not_called()
                     kwargs = owner.call_args.kwargs
+                    self.assertIsNone(kwargs["camera_calibration_path"])
                     self.assertEqual(kwargs["record_raw"], record_raw)
                     self.assertEqual(kwargs["record_needs"].camera_fields, ("rgb", "depth") if record_raw else ())
                     config = yaml.safe_load((kwargs["output_dir"] / "run_config.yaml").read_text())

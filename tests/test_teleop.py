@@ -688,7 +688,7 @@ class SessionTests(unittest.TestCase):
                     stack.enter_context(self.assertLogs(session.logger, level="ERROR"))
                 stack.enter_context(patch.multiple(
                     session, configure_logging=Mock(), validate_robot_config=Mock(),
-                    validate_control_rate=Mock(), resolve_table_plane=Mock(),
+                    validate_control_rate=Mock(), load_table_plane=Mock(),
                     load_vr_transform=Mock(return_value=SimpleNamespace(transform=np.eye(3))),
                     ActionMapper=Mock(), VRController=Mock(), HomePlanner=Mock(),
                     SensorChannels=Mock(), SessionState=Mock(return_value=state),

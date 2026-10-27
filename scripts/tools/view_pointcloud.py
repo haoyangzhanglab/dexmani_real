@@ -17,7 +17,7 @@ from scipy.spatial.transform import Rotation as R
 from dexmani_real.calibration.camera.extrinsics import load_camera_extrinsics
 from dexmani_real.calibration.table_plane import (
     save_table_plane,
-    resolve_table_plane,
+    load_table_plane,
     resolve_table_plane_path,
 )
 from dexmani_real.config import load_experiment_config
@@ -329,7 +329,7 @@ def run_pointcloud_diagnostic(args) -> int:
     pcd_config = runtime.pointcloud
     calibration = load_camera_extrinsics(args.camera_calibration)
     table_plane_abcd = (
-        resolve_table_plane(runtime.environment.table)
+        load_table_plane(runtime.environment.table)
         if pcd_config.remove_table and not fit_table_requested
         else None
     )

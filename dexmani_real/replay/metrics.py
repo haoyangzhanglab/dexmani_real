@@ -1,12 +1,15 @@
 """按帧索引比较两次运行的关节与末端误差。"""
 
-from pathlib import Path
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from dexmani_real.geometry.kinematics import ArmFK, eef_poses
-from dexmani_real.replay.data import Trajectory
-from dexmani_real.utils.io import publish, write_json
+
+if TYPE_CHECKING:
+    from dexmani_real.replay.trajectory import Trajectory
 
 
 def joint_errors(original, replayed):
@@ -62,20 +65,3 @@ def compute_metrics(trajectory: Trajectory, replay_data: dict) -> dict:
         "max_error_deg": float(rotation_error.max()),
     }
     return metrics
-
-
-def evaluate_replay(trajectory, replay_data, *, output_dir):
-    if replay_data is None:
-        return
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    # 先保存实测数据，离线 FK 或指标计算失败时仍可重新评估。
-    temporary = output / "replay_data.tmp.npz"
-    np.savez_compressed(temporary, **replay_data)
-    publish(temporary, output / "replay_data.npz")
-
-    metrics = compute_metrics(trajectory, replay_data)
-    write_json(metrics, output / "metrics.json")
-    print(f"Replay: {metrics['matching_frames']}/{metrics['original_frames']} matching frames")
-    for name in ("arm_joint", "hand_joint", "eef_position", "eef_orientation"):
-        print(f"  {name}: {metrics[name]}")

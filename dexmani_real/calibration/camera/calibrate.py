@@ -17,11 +17,11 @@ from dexmani_real.calibration.camera.aruco import (
     ARUCO_DICT_NAME,
     MARKER_ID,
     MARKER_SIZE_M,
-    MarkerSampler,
+    ArucoSampler,
 )
 from dexmani_real.calibration.camera.extrinsics import save_camera_calibration
-from dexmani_real.calibration.camera.hand_eye import HandEyeResult, solve_hand_eye
-from dexmani_real.calibration.table_plane import resolve_table_plane
+from dexmani_real.calibration.camera.hand_eye import MIN_SAMPLES, HandEyeResult, solve_hand_eye
+from dexmani_real.calibration.table_plane import load_table_plane
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.control.ik import IKSolver
@@ -57,58 +57,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 WINDOW_NAME = "ArUco Calibration"
-IDLE_STATUS_INTERVAL_FRAMES = 150
-MOTION_STATUS_INTERVAL_FRAMES = 50
 
 
-def build_planner(
-    runtime: ExperimentConfig,
-    *,
-    table_plane_abcd,
-) -> tuple[HomePlanner, IKSolver]:
-    """HOME 路径与在线 IK 使用各自的碰撞场景。"""
-    planner = HomePlanner(runtime.environment, runtime.arm, table_plane_abcd=table_plane_abcd)
-    home_hand_qpos = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
-    planner.set_hand_qpos(home_hand_qpos)
-    constraints = MotionConstraints(runtime.arm, runtime.environment)
-    solver = IKSolver(
-        constraints,
-        position_tolerance=runtime.keyboard_teleop.ik_max_pose_error_pos_m,
-        rotation_tolerance=runtime.keyboard_teleop.ik_max_pose_error_rot_rad,
-    )
-    return planner, solver
-
-
-def log_workspace_clipping(
-    desired_pos: np.ndarray,
-    clipped_pos: np.ndarray,
-    last_warning_s: float,
-) -> float:
-    clipped = np.abs(desired_pos - clipped_pos) > 1e-9
-    if not np.any(clipped):
-        return last_warning_s
-    parts: list[str] = []
-    for axis_index, axis_name in enumerate(("x", "y", "z")):
-        if clipped[axis_index]:
-            side = "⁺" if desired_pos[axis_index] > clipped_pos[axis_index] else "⁻"
-            parts.append(f"{axis_name}{side}{clipped_pos[axis_index]:.3f}")
-    now_s = time.monotonic()
-    if now_s - last_warning_s >= 2.0:
-        logger.warning("Workspace boundary: %s", " ".join(parts))
-        return now_s
-    return last_warning_s
-
-
-class CameraCalibration:
+class CameraCalibrator:
     def __init__(
         self,
         runtime: ExperimentConfig,
         *,
-        hand_geometry: str,
         output_path=CAMERAS_PATH,
     ):
         self.runtime = runtime
-        self.hand_geometry = hand_geometry
         self.output_path = output_path
         self.samples: list[tuple[np.ndarray, np.ndarray]] = []
         self.result: HandEyeResult | None = None
@@ -116,8 +74,6 @@ class CameraCalibration:
         self.window_created = False
         self.display_image: np.ndarray | None = None
         self.preview_sequence = 0
-        self.frame = 0
-        self.last_ik_warning_s = self.last_boundary_warning_s = 0.0
 
     def check_services(self):
         return self.keys.healthy and self.sensors.check()
@@ -130,17 +86,6 @@ class CameraCalibration:
         self.runtime_state.revoke_motion(SafetyState.FAULT, reason=run_end_reason)
         logger.error("Calibration fault: %s", reason)
 
-    def runtime_issue(self, arm):
-        if self.runtime_state.estop_request:
-            return "e-stop is requested"
-        if self.runtime_state.error_state:
-            return "runtime error latch is set"
-        if self.runtime_state.safety_state == SafetyState.FAULT:
-            return "safety state is FAULT"
-        if not sample_is_fresh(arm["timestamp_ns"], self.runtime.arm.feedback_max_age_s):
-            return "arm feedback stale"
-        return None
-
     def cancel_requested(self):
         return bool(
             self.runtime_state.quit_requested
@@ -148,19 +93,16 @@ class CameraCalibration:
             or self.runtime_state.error_state
             or self.runtime_state.safety_state == SafetyState.FAULT
             or not self.runtime_state.running
-            or not self.keys.healthy
             or self.keys.is_pressed("q")
             or self.keys.is_pressed("esc")
-            or not self.sensors.check()
         )
 
     def read_capture_feedback(self):
         if self.cancel_requested():
             raise CancelledError("calibration capture cancelled")
         arm = self.robot.read_state().arm[0]
-        issue = self.runtime_issue(arm)
-        if issue is not None:
-            self.fault(issue)
+        if not sample_is_fresh(arm["timestamp_ns"], self.runtime.arm.feedback_max_age_s):
+            self.fault("arm feedback stale")
         if self.cancel_requested():
             raise CancelledError("calibration capture cancelled")
         return arm
@@ -193,6 +135,7 @@ class CameraCalibration:
         eef_pose[:3, 3] = position
         if self.cancel_requested():
             return
+        self.robot.check()
         self.samples.append((eef_pose, marker_pose))
         self.result = None
         print(f"OK (total {len(self.samples)})  EE={np.round(position, 3)}m")
@@ -205,7 +148,17 @@ class CameraCalibration:
             and sample_is_fresh(frame["timestamp_ns"], self.runtime.camera.max_frame_age_s)
         ):
             image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
-            self.display_image = self.sampler.preview(image, len(self.samples))
+            detected = self.sampler.detect(image, draw=True) is not None
+            cv2.putText(
+                image, f"MARKER {'OK' if detected else 'NOT FOUND'}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                (0, 200, 0) if detected else (0, 0, 255), 2,
+            )
+            cv2.putText(
+                image, f"samples={len(self.samples)}/{MIN_SAMPLES}  SPACE=capture ENTER=calibrate",
+                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
+            )
+            self.display_image = image
             self.preview_sequence = frame["ring_sequence"]
         if self.display_image is not None:
             cv2.imshow(WINDOW_NAME, self.display_image)
@@ -217,6 +170,7 @@ class CameraCalibration:
         epoch = self.runtime_state.run_id
 
         def cancelled():
+            self.robot.check()
             return self.cancel_requested() or self.runtime_state.run_id != epoch
 
         self.result = None
@@ -241,10 +195,10 @@ class CameraCalibration:
             )
             return
         metadata = {
-            "width": self.camera_width,
-            "height": self.camera_height,
-            "intrinsics": self.intrinsics.tolist(),
-            "distortion": self.distortion.tolist(),
+            "width": self.camera.color.width,
+            "height": self.camera.color.height,
+            "intrinsics": self.camera.color.matrix().tolist(),
+            "distortion": list(self.camera.color.distortion_coeffs),
             "method": result.method,
             "sample_count": len(self.samples),
             "position_rms_mm": result.position_rms_mm,
@@ -254,7 +208,7 @@ class CameraCalibration:
         try:
             save_camera_calibration(
                 result.T_base_from_camera,
-                self.serial,
+                self.camera.serial,
                 self.output_path,
                 calibration_capture=metadata,
                 cancelled=cancelled,
@@ -263,7 +217,7 @@ class CameraCalibration:
             print("Calibration publication cancelled")
             return
         self.calibration_saved = True
-        print(f"Calibration saved → {self.output_path} (serial: {self.serial})")
+        print(f"Calibration saved → {self.output_path} (serial: {self.camera.serial})")
 
     def handle_sample_events(self, events):
         for event in events:
@@ -308,16 +262,9 @@ class CameraCalibration:
             self.robot.check()
             self.runtime_state.arm()
             print("  local arm connected (owner process; Mode 1 prepared on jog)")
-            camera = snapshot_camera_parameters(self.sensors.channels, self.runtime.camera, None)
-            self.serial = camera.serial
-            self.camera_width, self.camera_height = camera.color.width, camera.color.height
-            self.intrinsics = camera.color.matrix()
-            self.distortion = np.asarray(camera.color.distortion_coeffs)
-            print(f"  Camera serial: {self.serial}")
-            print(
-                f"  Intrinsics: fx={self.intrinsics[0, 0]:.1f} "
-                f"fy={self.intrinsics[1, 1]:.1f} ({self.camera_width}x{self.camera_height})"
-            )
+            self.camera = snapshot_camera_parameters(self.sensors.channels, self.runtime.camera, None)
+            print(f"  Camera serial: {self.camera.serial}")
+            print(f"  Resolution: {self.camera.color.width}x{self.camera.color.height}")
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
             self.window_created = True
             exit_code = self.run_control_loop()
@@ -354,7 +301,9 @@ class CameraCalibration:
         return clean
 
     def run_control_loop(self):
-        self.sampler: MarkerSampler = MarkerSampler(self.intrinsics, self.distortion)
+        self.sampler = ArucoSampler(
+            self.camera.color.matrix(), np.asarray(self.camera.color.distortion_coeffs),
+        )
         self.rate = Rate(self.runtime.keyboard_teleop.control_hz)
 
         print(f"\n  ArUco: {ARUCO_DICT_NAME} ID={MARKER_ID} size={MARKER_SIZE_M * 1000:.1f}mm")
@@ -366,7 +315,6 @@ class CameraCalibration:
 
         while self.runtime_state.running:
             self.rate.wait()
-            self.frame += 1
 
             if self.runtime_state.estop_request or self.keys.is_pressed("esc"):
                 self.fault("operator e-stop", estop=True)
@@ -426,54 +374,35 @@ class CameraCalibration:
         if step.issues:
             self.fault("; ".join(step.issues))
             return
-        if step.pose is not None:
-            self.last_boundary_warning_s = log_workspace_clipping(
-                step.desired_position, step.pose.p, self.last_boundary_warning_s,
-            )
         if step.ik_result is not None and step.ik_result.qpos is None:
-            now_s = time.monotonic()
-            if now_s - self.last_ik_warning_s >= 1.0:
-                logger.warning("IK rejected target: %s", step.ik_result.reason or "unknown")
-                self.last_ik_warning_s = now_s
-        interval = MOTION_STATUS_INTERVAL_FRAMES if step.committed else IDLE_STATUS_INTERVAL_FRAMES
-        if step.observation is not None and self.frame % interval == 0:
-            measured_pose = self.solver.compute_eef_pose_base(step.observation.arm["qpos"][0])
-            target = f" target={np.round(step.pose.p, 3)}m" if step.committed else ""
-            print(
-                f"[f={self.frame}] samples={len(self.samples)} "
-                f"eef={np.round(measured_pose.p, 3)}m{target}", flush=True,
-            )
+            logger.warning("IK rejected target: %s", step.ik_result.reason)
 
-    def prepare(self):
-        """两种手部声明均使用保守的固定 HOME 碰撞包络。"""
+    def prepare(self) -> None:
         configure_logging()
-        if self.hand_geometry not in {"absent", "secured-home"}:
-            raise ValueError("hand_geometry must be 'absent' or 'secured-home'")
         if self.runtime.hand.enabled:
             raise ValueError(
                 "camera calibration requires hand.enabled=false and secured/absent hand"
             )
         validate_robot_config(self.runtime)
-        table_plane_abcd = resolve_table_plane(
-            self.runtime.environment.table,
-            required=self.runtime.environment.table.enabled,
+        table_plane_abcd = (
+            load_table_plane(self.runtime.environment.table)
+            if self.runtime.environment.table.enabled else None
         )
         bounds = jog_bounds(self.runtime)
         self.runtime.camera.validate()
-        planner, solver = build_planner(self.runtime, table_plane_abcd=table_plane_abcd)
-        if self.hand_geometry == "absent":
-            print(
-                "  XHand: absent (operator assertion); IK/home geometry conservatively "
-                "retains the fixed-home XHand envelope"
-            )
-        else:
-            print(
-                "  XHand: mounted and secured at configured home (operator assertion); "
-                "IK/home geometry uses the fixed-home XHand envelope"
-            )
+        print("  XHand must be removed or secured at HOME; collision checks use the fixed-HOME envelope")
 
-        self.home_planner, self.solver = planner, solver
-        self.constraints = solver.constraints
+        # HOME 路径与在线 IK 使用各自的碰撞场景。
+        self.home_planner = HomePlanner(
+            self.runtime.environment, self.runtime.arm, table_plane_abcd=table_plane_abcd,
+        )
+        self.home_planner.set_hand_qpos(np.deg2rad(self.runtime.hand.home_qpos_deg))
+        self.constraints = MotionConstraints(self.runtime.arm, self.runtime.environment)
+        solver = IKSolver(
+            self.constraints,
+            position_tolerance=self.runtime.keyboard_teleop.ik_max_pose_error_pos_m,
+            rotation_tolerance=self.runtime.keyboard_teleop.ik_max_pose_error_rot_rad,
+        )
         ctx = mp.get_context("spawn")
         self.runtime_state = SessionState()
         self.sensors = SensorWorkers(SensorChannels(ctx, camera=self.runtime.camera))

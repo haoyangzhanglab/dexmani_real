@@ -18,16 +18,6 @@ def main(argv: list[str] | None = None) -> int:
         help="RealSense serial (required with multiple devices)",
     )
     parser.add_argument(
-        "--hand-geometry",
-        choices=("absent", "secured-home"),
-        required=True,
-        help=(
-            "required physical-state assertion: absent means no XHand is mounted; "
-            "secured-home means a mounted XHand is physically fixed at configured "
-            "home. Collision checks use the fixed-home XHand envelope in both cases."
-        ),
-    )
-    parser.add_argument(
         "--config",
         type=Path,
         default=None,
@@ -42,14 +32,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     from dexmani_real.calibration.camera.aruco import ARUCO_DICT_NAME, MARKER_ID, MARKER_SIZE_M
-    from dexmani_real.calibration.camera.run import CameraCalibration
+    from dexmani_real.calibration.camera.calibrate import CameraCalibrator
 
     print("=" * 60)
     print("  ArUco Hand-Eye Calibration — xArm7 + RealSense (eye-to-hand)")
     print(
         f"  ArUco: {ARUCO_DICT_NAME} ID={MARKER_ID} size={MARKER_SIZE_M * 1000:.1f}mm"
     )
-    print(f"  hand physical-state assertion: {args.hand_geometry}")
     print("=" * 60)
 
     runtime = load_experiment_config(
@@ -57,9 +46,8 @@ def main(argv: list[str] | None = None) -> int:
         cli_overrides={"camera.serial": args.serial, "hand.enabled": False},
     )
 
-    return CameraCalibration(
+    return CameraCalibrator(
         runtime,
-        hand_geometry=args.hand_geometry,
         output_path=args.output or CAMERAS_PATH,
     ).run()
 

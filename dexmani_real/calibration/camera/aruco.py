@@ -1,4 +1,4 @@
-"""ArUco 预览与静止机械臂上的多帧采样。"""
+"""ArUco 检测与静止机械臂上的多帧采样。"""
 
 import time
 
@@ -6,7 +6,6 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.calibration.camera.hand_eye import MIN_SAMPLES
 from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.utils.timing import sample_is_fresh
 
@@ -17,7 +16,7 @@ MARKER_SIZE_M = 0.0982
 CAPTURE_FRAMES = 5
 
 
-class MarkerSampler:
+class ArucoSampler:
     def __init__(self, intrinsics, distortion):
         self.intrinsics = intrinsics
         self.distortion = distortion
@@ -64,29 +63,6 @@ class MarkerSampler:
             return rvec.ravel(), tvec.ravel()
         return None
 
-    def preview(self, image, sample_count):
-        pose = self.detect(image, draw=True)
-        detected = pose is not None
-        cv2.putText(
-            image,
-            f"MARKER {'OK' if detected else 'NOT FOUND'}",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 200, 0) if detected else (0, 0, 255),
-            2,
-        )
-        cv2.putText(
-            image,
-            f"samples={sample_count}/{MIN_SAMPLES}  SPACE=capture ENTER=calibrate",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2,
-        )
-        return image
-
     def stationary_arm(self, read_arm, arm_config, after_ns):
         deadline = time.monotonic_ns() + int(arm_config.feedback_max_age_s * 1e9)
         while time.monotonic_ns() < deadline:
@@ -101,17 +77,18 @@ class MarkerSampler:
 
     def capture(self, channels, read_arm, *, camera_config, arm_config):
         arm_before = self.stationary_arm(read_arm, arm_config, time.monotonic_ns())
-        last_stamp, last_sequence, last_color_frame = time.monotonic_ns(), 0, -1
+        last_stamp, last_color_frame = time.monotonic_ns(), -1
         rotations, translations = [], []
         for _ in range(CAPTURE_FRAMES):
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
-                read_arm()
+                arm = read_arm()
+                if np.max(np.abs(arm["qvel"])) > arm_config.homing.velocity_convergence_rad_s:
+                    raise ValueError("arm is moving during calibration capture")
                 frame = read_camera_frame(channels, fields=("rgb",))
                 if (
                     frame
                     and frame["timestamp_ns"] > last_stamp
-                    and frame["ring_sequence"] > last_sequence
                     and frame["color_frame_number"] > last_color_frame
                     and sample_is_fresh(frame["timestamp_ns"], camera_config.max_frame_age_s)
                 ):
@@ -120,11 +97,8 @@ class MarkerSampler:
             else:
                 raise TimeoutError("fresh calibration image unavailable")
             last_stamp = frame["timestamp_ns"]
-            last_sequence = frame["ring_sequence"]
             last_color_frame = frame["color_frame_number"]
-            read_arm()
             pose = self.detect(cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR))
-            read_arm()
             if pose is not None:
                 rotations.append(pose[0])
                 translations.append(pose[1])

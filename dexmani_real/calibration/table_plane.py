@@ -26,13 +26,7 @@ def resolve_table_plane_path(table: TableCollisionConfig) -> Path:
     return path.resolve()
 
 
-def resolve_table_plane(
-    table: TableCollisionConfig,
-    *,
-    required=True,
-) -> tuple[float, float, float, float] | None:
-    if not required:
-        return None
+def load_table_plane(table: TableCollisionConfig) -> tuple[float, float, float, float]:
     plane_path = resolve_table_plane_path(table)
     with plane_path.open(encoding="utf-8") as stream:
         plane = json.load(stream)

@@ -22,6 +22,7 @@ Examples:
 Controls:
   Q     clean exit (save partial results)
   H     planned robot return-home, then wait for Q to exit (post-replay prompt)
+  S     stop current motion
   ESC   emergency stop
         """,
     )
@@ -48,7 +49,7 @@ Controls:
         default=0.5,
         help=(
             "Seconds to ramp XHand to the first target before replay (default: 0.5). "
-            "Only small start differences are allowed; 0 skips the ramp. Startup hand HOME still runs."
+            "Only small start differences are allowed; 0 skips the ramp. Startup preserves the current hand posture."
         ),
     )
     return parser.parse_args(argv)
@@ -57,12 +58,12 @@ Controls:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    from dexmani_real.replay.player import ReplayStatus
+    from dexmani_real.replay.joint_replay import ReplayStatus
     from dexmani_real.replay.run import (
         DEFAULT_OUTPUT_DIR,
         run_replay,
     )
-    from dexmani_real.replay.data import load_trajectory
+    from dexmani_real.replay.trajectory import load_trajectory
 
     trajectory = load_trajectory(args.episode)
 

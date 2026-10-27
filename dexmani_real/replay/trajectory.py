@@ -1,11 +1,13 @@
 """Raw 轨迹读取与回放采样缓存。"""
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from dexmani_real.data.raw import RawReader
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.utils.io import publish
 
 
 @dataclass
@@ -51,7 +53,7 @@ def load_trajectory(episode_path):
         )
 
 
-def verify_replay_preflight(trajectory, runtime):
+def validate_trajectory(trajectory, runtime):
     if not runtime.hand.enabled:
         raise ValueError("physical replay requires XHand")
     for values, lower, upper in (
@@ -82,18 +84,24 @@ class ReplayBuffer:
         ):
             self.data[name] = np.full(capacity, -1, dtype=np.int64)
 
-    def append(self, row, command):
+    def append(self, row, arm_target, hand_target):
         index = self.count
         for name, state, target in (
-            ("arm", row.arm, command.arm_qpos),
-            ("hand", row.hand, command.hand_qpos),
+            ("arm", row.arm, arm_target),
+            ("hand", row.hand, hand_target),
         ):
             self.data[f"{name}_qpos"][index] = state["qpos"][0]
             self.data[f"{name}_observation_ns"][index] = state["timestamp_ns"][0]
-            if target is not None:
-                self.data[f"{name}_candidate"][index] = target
+            self.data[f"{name}_candidate"][index] = target
         self.count += 1
         return index
 
     def to_dict(self):
         return {name: values[: self.count].copy() for name, values in self.data.items()}
+
+
+def save_replay_data(replay_data, output_dir):
+    output = Path(output_dir)
+    temporary = output / "replay_data.tmp.npz"
+    np.savez_compressed(temporary, **replay_data)
+    publish(temporary, output / "replay_data.npz")

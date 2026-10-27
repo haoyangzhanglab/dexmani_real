@@ -2,7 +2,7 @@
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
@@ -13,7 +13,7 @@ from dexmani_real.control.actions import (
     project_hand_command,
 )
 from dexmani_real.control.constraints import wrap_nearest_equivalent
-from dexmani_real.replay.data import ReplayBuffer
+from dexmani_real.replay.trajectory import ReplayBuffer
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
@@ -35,10 +35,10 @@ class ReplayStatus(str, Enum):
     FAULT = "fault"
 
 
-@dataclass(frozen=True)
+@dataclass
 class ReplayResult:
     status: ReplayStatus
-    replay_data: dict[str, np.ndarray] | None = None
+    replay_data: dict[str, np.ndarray] = field(default_factory=lambda: ReplayBuffer(0).to_dict())
     reason: str = ""
 
     @property
@@ -46,7 +46,7 @@ class ReplayResult:
         return self.status in (ReplayStatus.COMPLETED, ReplayStatus.USER_QUIT)
 
 
-class ReplayPlayer:
+class JointReplay:
     def __init__(self, runtime_state, runtime, keyboard, *, robot):
         self.runtime_state = runtime_state
         self.runtime = runtime
@@ -63,48 +63,47 @@ class ReplayPlayer:
             motion=self.runtime.motion,
             environment=self.runtime.environment,
         )
-        self.previous_arm = None
         period_ns, _ = sampling_clock_ns(trajectory.fps)
-        status, reason = ReplayStatus.COMPLETED, ""
+        result = ReplayResult(ReplayStatus.COMPLETED)
+        self.decision_age_ns = int(self.runtime.execution.max_decision_age_s * 1e9)
         run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
         try:
-            status, reason, row = self.admit_replay(trajectory, hand_start_duration_s)
-            if status == ReplayStatus.COMPLETED:
+            result.status, result.reason, row = self.admit_replay(trajectory, hand_start_duration_s)
+            if result.status == ReplayStatus.COMPLETED:
                 if hand_start_duration_s > 0:
-                    interrupted = self.warm_up_hand(
-                        trajectory, self.epoch, row, hand_start_duration_s
+                    interrupted = self.prepare_hand(
+                        trajectory, row, hand_start_duration_s, period_ns
                     )
                     if interrupted is not None:
-                        status, reason = interrupted.status, interrupted.reason
-                if status == ReplayStatus.COMPLETED:
-                    status, reason = self.replay_rows(trajectory, period_ns)
+                        result.status, result.reason = interrupted
+                if result.status == ReplayStatus.COMPLETED:
+                    result.status, result.reason = self.replay_rows(trajectory, period_ns)
         except (OperationCancelled, TimeoutError) as exc:
             operator_quit = (
                 isinstance(exc, OperationCancelled)
-                and self.runtime_state.run_ended_id == self.epoch
-                and self.runtime_state.run_ended_reason == RunEndReason.QUIT
+                and self.runtime_state.quit_requested
             )
-            status = ReplayStatus.USER_QUIT if operator_quit else ReplayStatus.REJECTED
+            result.status = ReplayStatus.USER_QUIT if operator_quit else ReplayStatus.REJECTED
             if self.runtime_state.estop_request:
-                status = ReplayStatus.ESTOP
-            reason = str(exc)
+                result.status = ReplayStatus.ESTOP
+            result.reason = str(exc)
         except KeyboardInterrupt:
             self.runtime_state.request_emergency_stop()
-            status, reason = ReplayStatus.ESTOP, "KeyboardInterrupt"
+            result.status, result.reason = ReplayStatus.ESTOP, "KeyboardInterrupt"
             run_end_reason = RunEndReason.ESTOP
         except Exception as exc:
             self.runtime_state.mark_error()
             logger.exception("replay failed")
-            status, reason = ReplayStatus.FAULT, str(exc)
+            result.status, result.reason = ReplayStatus.FAULT, str(exc)
             run_end_reason = (
                 RunEndReason.HARDWARE_FAULT
                 if isinstance(exc, RobotError)
                 else RunEndReason.POLICY_FAILURE
             )
         finally:
-            if status == ReplayStatus.USER_QUIT:
+            if result.status == ReplayStatus.USER_QUIT:
                 run_end_reason = RunEndReason.QUIT
-            elif status == ReplayStatus.ESTOP:
+            elif result.status == ReplayStatus.ESTOP:
                 run_end_reason = RunEndReason.ESTOP
             self.runtime_state.revoke_motion(reason=run_end_reason)
             try:
@@ -112,9 +111,10 @@ class ReplayPlayer:
             except Exception as exc:
                 self.runtime_state.mark_error()
                 logger.exception("replay stop failed")
-                reason = f"{reason}; stop failed: {exc}".lstrip("; ")
-                status = ReplayStatus.FAULT
-        return ReplayResult(status, self.capture.to_dict(), reason)
+                result.reason = f"{result.reason}; stop failed: {exc}".lstrip("; ")
+                result.status = ReplayStatus.FAULT
+        result.replay_data = self.capture.to_dict()
+        return result
 
     def read_feedback(self):
         row = read_observation(None, self.robot)
@@ -154,7 +154,6 @@ class ReplayPlayer:
         with self.runtime_state.motion_lock:
             if self.runtime_state.run_id != self.epoch or not self.runtime_state.begin_motion():
                 return ReplayStatus.REJECTED, "motion authority unavailable", row
-            self.epoch = self.runtime_state.run_id
         return ReplayStatus.COMPLETED, "", row
 
     def replay_rows(self, trajectory, period_ns):
@@ -163,9 +162,9 @@ class ReplayPlayer:
         for index in range(len(trajectory)):
             slot_start_ns = origin_ns + index * period_ns
             slot_deadline_ns = slot_start_ns + period_ns
-            interrupted = self.wait_replay(self.epoch, slot_start_ns)
+            interrupted = self.wait_replay(slot_start_ns)
             if interrupted is not None:
-                status, reason = interrupted.status, interrupted.reason
+                status, reason = interrupted
                 break
             if time.monotonic_ns() >= slot_deadline_ns:
                 raise TimeoutError(f"replay slot {index} missed before observation")
@@ -178,30 +177,29 @@ class ReplayPlayer:
             )
             arm, hand, rejection = mapped.arm_qpos, mapped.hand_qpos, mapped.rejection_reason
             if rejection is not None:
-                self.capture.append(row, RobotCommand(self.epoch, arm, hand))
+                self.capture.append(row, arm, hand)
                 status, reason = ReplayStatus.REJECTED, f"replay target: {rejection}"
                 break
             self.submit_row(index, row, arm, hand, min(slot_deadline_ns, feedback_until_ns))
             self.previous_arm = arm.copy()
-            interrupted = self.wait_replay(self.epoch, slot_deadline_ns)
+            interrupted = self.wait_replay(slot_deadline_ns)
             if interrupted is not None:
-                status, reason = interrupted.status, interrupted.reason
+                status, reason = interrupted
                 break
         return status, reason
 
     def submit_row(self, index, row, arm, hand, valid_until_ns):
-        command = RobotCommand(self.epoch, arm, hand)
-        captured = self.capture.append(row, command)
+        captured = self.capture.append(row, arm, hand)
         if time.monotonic_ns() >= valid_until_ns:
             raise TimeoutError(f"replay slot {index} expired before submission")
         # 候选与提交尝试分开记录，send_action 返回不代表机器人已到位。
         self.capture.data["submit_started_ns"][captured] = time.monotonic_ns()
         try:
             self.robot.send_action(
-                command,
+                RobotCommand(self.epoch, arm, hand),
                 valid_until_ns=valid_until_ns,
                 execute_until_ns=row.observation_timestamp_ns
-                + int(self.runtime.execution.max_decision_age_s * 1e9),
+                + self.decision_age_ns,
             )
         finally:
             completed_ns = time.monotonic_ns()
@@ -209,31 +207,29 @@ class ReplayPlayer:
         if completed_ns >= valid_until_ns:
             raise TimeoutError(f"replay slot {index} submission returned after deadline")
 
-    def wait_replay(self, epoch, deadline_ns):
+    def wait_replay(self, deadline_ns):
         while True:
             self.robot.check()
             signals = self.keyboard.poll(timeout=0)
             if not self.keyboard.healthy:
                 self.runtime_state.request_emergency_stop()
             if self.runtime_state.estop_request:
-                return ReplayResult(ReplayStatus.ESTOP, reason="operator emergency stop")
+                return ReplayStatus.ESTOP, "operator emergency stop"
             if self.runtime_state.error_state:
-                return ReplayResult(ReplayStatus.FAULT, reason="runtime failure")
+                return ReplayStatus.FAULT, "runtime failure"
             if self.runtime_state.quit_requested or "q" in signals:
-                return ReplayResult(ReplayStatus.USER_QUIT, reason="operator quit")
-            if not self.runtime_state.running or self.runtime_state.run_id != epoch:
+                return ReplayStatus.USER_QUIT, "operator quit"
+            if not self.runtime_state.running or self.runtime_state.run_id != self.epoch:
                 cause = self.runtime_state.run_ended_reason
                 if cause == RunEndReason.QUIT:
-                    return ReplayResult(ReplayStatus.USER_QUIT, reason="operator quit")
-                return ReplayResult(
-                    ReplayStatus.REJECTED, reason=f"motion interrupted: {cause.name.lower()}"
-                )
+                    return ReplayStatus.USER_QUIT, "operator quit"
+                return ReplayStatus.REJECTED, f"motion interrupted: {cause.name.lower()}"
             remaining_ns = deadline_ns - time.monotonic_ns()
             if remaining_ns <= 0:
                 return None
             time.sleep(min(0.005, remaining_ns / 1e9))
 
-    def warm_up_hand(self, trajectory, epoch, row, duration_s):
+    def prepare_hand(self, trajectory, row, duration_s, period_ns):
         """首帧手部准备不计入回放采样。"""
         arm_hold = project_arm_command(
             row.arm["qpos"][0],
@@ -252,74 +248,65 @@ class ReplayPlayer:
             qpos_max_rad=self.runtime.hand.qpos_max_rad,
         )
         steps = max(1, int(np.ceil(duration_s * trajectory.fps)))
-        period_ns, _ = sampling_clock_ns(trajectory.fps)
         print(
             f"XHand start: {steps * period_ns / 1e9:g}s ramp to first target, then wait for arrival. "
             "Preparation is outside replay rows; initial hand state differs from Raw. "
             "Q: stop; ESC: emergency stop",
             flush=True,
         )
-        step = 0
+        timeout_ns = int(self.runtime.hand.home_timeout_s * 1e9)
+        tolerance = np.deg2rad(self.runtime.hand.home_tolerance_deg)
         deadline_ns = 0
-        final_stamp = None
-        last_sample = 0
-        consecutive = 0
-        while True:
-            interrupted = self.wait_replay(epoch, deadline_ns)
+        for step in range(steps + 1):
+            interrupted = self.wait_replay(deadline_ns)
             if interrupted is not None:
                 return interrupted
             row, feedback_until_ns = self.read_feedback()
             if np.max(np.abs(row.arm["qpos"][0] - arm_hold)) > np.deg2rad(10):
-                return ReplayResult(ReplayStatus.REJECTED, reason="arm moved during hand start")
-            if final_stamp is None:
-                progress = step / steps
-                weight = progress * progress * (3 - 2 * progress)
-                hand = (
-                    hand_target
-                    if step == steps
-                    else hand_start + weight * (hand_target - hand_start)
-                )
-                rejection = self.action_mapper.constraints.rejection(
-                    arm_hold,
-                    row.arm["qpos"][0],
-                    arm_hold,
-                    collision_hand_qpos=hand,
-                )
-                if rejection is not None:
-                    return ReplayResult(
-                        ReplayStatus.REJECTED, reason=f"hand start target: {rejection}"
-                    )
-                command = RobotCommand(epoch, arm_hold, hand)
-                self.robot.send_action(
-                    command,
-                    valid_until_ns=feedback_until_ns,
-                    execute_until_ns=row.observation_timestamp_ns
-                    + int(self.runtime.hand.home_timeout_s * 1e9),
-                )
-                stamp = time.monotonic_ns()
-                if step == steps:
-                    final_stamp = stamp
-                    last_sample = stamp
-                    self.robot.end_hand_send_interval()
-                step += 1
-                deadline_ns = stamp + period_ns
-                continue
+                return ReplayStatus.REJECTED, "arm moved during hand start"
+            progress = step / steps
+            weight = progress * progress * (3 - 2 * progress)
+            hand = hand_target if step == steps else hand_start + weight * (hand_target - hand_start)
+            rejection = self.action_mapper.constraints.rejection(
+                arm_hold, row.arm["qpos"][0], arm_hold, collision_hand_qpos=hand,
+            )
+            if rejection is not None:
+                return ReplayStatus.REJECTED, f"hand start target: {rejection}"
+            self.robot.send_action(
+                RobotCommand(self.epoch, arm_hold, hand),
+                valid_until_ns=feedback_until_ns,
+                execute_until_ns=row.observation_timestamp_ns + timeout_ns,
+            )
+            submitted_ns = time.monotonic_ns()
+            deadline_ns = submitted_ns + period_ns
 
-            if time.monotonic_ns() >= final_stamp + int(self.runtime.hand.home_timeout_s * 1e9):
-                return ReplayResult(
-                    ReplayStatus.REJECTED, reason="hand start convergence timed out"
-                )
-            sample = int(row.hand["timestamp_ns"][0])
-            if sample > last_sample:
-                last_sample = sample
-                if np.max(np.abs(row.hand["qpos"][0] - hand_target)) <= np.deg2rad(
-                    self.runtime.hand.home_tolerance_deg
-                ):
-                    consecutive += 1
-                else:
-                    consecutive = 0
-                # 只有最终提交完成后不同的新鲜反馈样本才能判定到位。
+        self.robot.end_hand_send_interval()
+        expires_ns = submitted_ns + timeout_ns
+        last_sample_ns = submitted_ns
+        consecutive = 0
+        while True:
+            interrupted = self.wait_replay(min(deadline_ns, expires_ns))
+            if interrupted is not None:
+                return interrupted
+            if time.monotonic_ns() >= expires_ns:
+                return ReplayStatus.REJECTED, "hand start convergence timed out"
+            row, _ = self.read_feedback()
+            if np.max(np.abs(row.arm["qpos"][0] - arm_hold)) > np.deg2rad(10):
+                return ReplayStatus.REJECTED, "arm moved during hand start"
+            if time.monotonic_ns() >= expires_ns:
+                return ReplayStatus.REJECTED, "hand start convergence timed out"
+            stamp = int(row.hand["timestamp_ns"][0])
+            # 到位判定只计最终提交完成之后、时间不同的新鲜反馈。
+            if stamp > last_sample_ns:
+                last_sample_ns = stamp
+                arrived = np.max(np.abs(row.hand["qpos"][0] - hand_target)) <= tolerance
+                consecutive = consecutive + 1 if arrived else 0
                 if consecutive >= 3:
-                    print("XHand start ready; replaying recorded targets.", flush=True)
+                    interrupted = self.wait_replay(time.monotonic_ns())
+                    if interrupted is not None:
+                        return interrupted
+                    if time.monotonic_ns() >= expires_ns:
+                        return ReplayStatus.REJECTED, "hand start convergence timed out"
+                    print("XHand start ready; replaying recorded targets.")
                     return None
             deadline_ns = time.monotonic_ns() + 10_000_000

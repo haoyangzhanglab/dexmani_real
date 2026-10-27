@@ -89,24 +89,15 @@ def solve_hand_eye(eef_poses: np.ndarray, marker_poses: np.ndarray) -> HandEyeRe
     eef_inverse = np.broadcast_to(np.eye(4), eef_poses.shape).copy()
     eef_inverse[:, :3, :3] = eef_poses[:, :3, :3].transpose(0, 2, 1)
     eef_inverse[:, :3, 3] = -np.einsum("nij,nj->ni", eef_inverse[:, :3, :3], eef_poses[:, :3, 3])
-    eef_rotations, eef_positions, marker_rotations, marker_positions = [
-        list(values)
-        for values in (
-            eef_inverse[:, :3, :3],
-            eef_inverse[:, :3, 3],
-            marker_poses[:, :3, :3],
-            marker_poses[:, :3, 3],
-        )
-    ]
     best = None
     best_score = (True, float("inf"), float("inf"))
     for name, method in HAND_EYE_METHODS.items():
         try:
-            rotation, translation = cv2.calibrateHandEye(
-                eef_rotations,
-                eef_positions,
-                marker_rotations,
-                marker_positions,
+            rotation, translation = cv2.calibrateHandEye(  # type: ignore[call-overload]  # 类型桩未声明 ndarray。
+                eef_inverse[:, :3, :3],
+                eef_inverse[:, :3, 3],
+                marker_poses[:, :3, :3],
+                marker_poses[:, :3, 3],
                 method=method,
             )
             transform = np.eye(4)
