@@ -332,10 +332,10 @@ class SensorWorkerTests(unittest.TestCase):
             frame["rgb"] = 2
             publish_record(self.channels.camera_ring, frame)
 
-        def build_cloud(**inputs):
+        def build_cloud(depth_raw, color):
             self.assertLessEqual(build.call_count, 2)
-            np.testing.assert_array_equal(inputs["depth_raw"], np.full((2, 3), 1000))
-            if inputs["color"][0, 0, 0] == 1:
+            np.testing.assert_array_equal(depth_raw, np.full((2, 3), 1000))
+            if color[0, 0, 0] == 1:
                 return None
             self.channels.is_running.value = False
             return cloud
@@ -344,9 +344,12 @@ class SensorWorkerTests(unittest.TestCase):
         with (
             patch.object(worker, "configure_logging"),
             patch.object(worker.time, "sleep", side_effect=next_frame) as idle,
-            patch.object(worker, "build_point_cloud", side_effect=build_cloud) as build,
+            patch.object(worker, "PointCloudProcessor") as processor,
         ):
+            build = processor.return_value.process
+            build.side_effect = build_cloud
             worker.run_pointcloud_worker(self.channels, SimpleNamespace(num_points=4), camera, None)
+        processor.assert_called_once()
         self.assertEqual(build.call_count, 2)
         idle.assert_called_once()
         data, sequence = self.channels.pointcloud_ring.read()

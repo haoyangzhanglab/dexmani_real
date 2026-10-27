@@ -26,7 +26,7 @@ from dexmani_real.geometry.plane import fit_table_plane
 from dexmani_real.perception.config import PointCloudConfig
 from dexmani_real.perception.pointcloud import (
     aligned_depth_points_in_base,
-    build_point_cloud,
+    PointCloudProcessor,
     build_raw_point_cloud,
 )
 from dexmani_real.utils.log import configure_logging
@@ -129,10 +129,7 @@ def save_diagnostic_snapshot(
 def benchmark_production_pipeline(
     *,
     camera: RealSenseCamera,
-    intrinsics: CameraIntrinsics,
-    T_xarm_base_from_color: np.ndarray,
-    config: PointCloudConfig,
-    table_plane_abcd: tuple[float, float, float, float] | None,
+    processor: PointCloudProcessor,
     frame_count: int = 20,
 ) -> None:
     elapsed_ms: list[float] = []
@@ -144,15 +141,7 @@ def benchmark_production_pipeline(
         if frame is None:
             continue
         started = time.perf_counter()
-        cloud = build_point_cloud(
-            depth_raw=frame.depth,
-            color=frame.rgb,
-            depth_scale_m=camera.depth_scale_m,
-            intrinsics=intrinsics,
-            T_xarm_base_from_color=T_xarm_base_from_color,
-            table_plane_abcd=table_plane_abcd,
-            config=config,
-        )
+        cloud = processor.process(frame.depth, frame.rgb)
         elapsed_ms.append((time.perf_counter() - started) * 1000.0)
         end_to_end_ms.append((time.perf_counter() - frame_started) * 1000.0)
         valid_clouds += cloud is not None
@@ -286,7 +275,6 @@ def calibrate_table_plane(
             depth_scale_m=camera.depth_scale_m,
             aligned_depth_intrinsics=intrinsics,
             T_xarm_base_from_color=T_xarm_base_from_color,
-            config=config,
         )
         points = points[np.all((points >= lower) & (points <= upper), axis=1)]
         if points.shape[0] > 30_000:
@@ -402,16 +390,15 @@ def run_pointcloud_diagnostic(args) -> int:
         )
 
         print(f"Point-cloud processing: {pcd_config}")
-        started = time.perf_counter()
-        result = build_point_cloud(
-            depth_raw=depth_raw,
-            color=rgb,
+        processor = PointCloudProcessor(
             depth_scale_m=camera.depth_scale_m,
             intrinsics=intrinsics,
             T_xarm_base_from_color=T_xarm_base_from_color,
             config=pcd_config,
             table_plane_abcd=table_plane_abcd,
         )
+        started = time.perf_counter()
+        result = processor.process(depth_raw, rgb)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         if result is None:
             result = np.empty((0, 6), dtype=np.float32)
@@ -443,10 +430,7 @@ def run_pointcloud_diagnostic(args) -> int:
             print(f"\nSaved point-cloud diagnostic snapshot: {snapshot_path}")
         benchmark_production_pipeline(
             camera=camera,
-            intrinsics=intrinsics,
-            T_xarm_base_from_color=T_xarm_base_from_color,
-            config=pcd_config,
-            table_plane_abcd=table_plane_abcd,
+            processor=processor,
         )
         log_points("pcd", result)
         input("在 Rerun 查看处理结果，按 Enter 退出...")

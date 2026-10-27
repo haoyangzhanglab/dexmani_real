@@ -11,7 +11,7 @@ import numpy as np
 
 from dexmani_real.config import load_experiment_config
 from dexmani_real.data.raw.schema import ARM_ACTION_SEMANTICS, TIMING_ROW_DTYPE
-from dexmani_real.geometry.kinematics import eef_pose_sequence
+from dexmani_real.geometry.kinematics import eef_poses
 from dexmani_real.geometry.pose import rot6d_to_rotmat
 from dexmani_real.replay import metrics, player
 from dexmani_real.replay.data import (
@@ -108,8 +108,8 @@ class ReplayDataTests(unittest.TestCase):
         self.assertEqual(result["matching_frames"], 2)
         self.assertAlmostEqual(result["arm_joint"]["mae_per_joint_deg"][0], 1)
         self.assertAlmostEqual(result["hand_joint"]["pooled_rmse_deg"], 2)
-        a = eef_pose_sequence(source.arm_qpos[:2])[0]
-        b = eef_pose_sequence(replayed["arm_qpos"])[0]
+        a = eef_poses(source.arm_qpos[:2])[0]
+        b = eef_poses(replayed["arm_qpos"])[0]
         angle = np.rad2deg(
             np.arccos(
                 np.clip(

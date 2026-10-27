@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
@@ -19,50 +19,24 @@ class TablePlaneFit:
     tilt_deg: float
 
     def to_dict(self) -> dict[str, Any]:
-        a, b, c, d = self.plane_abcd
-        return {
-            "a": a,
-            "b": b,
-            "c": c,
-            "d": d,
-            "fit": {
-                "inlier_points": self.inlier_points,
-                "evaluated_points": self.evaluated_points,
-                "inlier_ratio": self.inlier_ratio,
-                "rms_residual_m": self.rms_residual_m,
-                "max_abs_residual_m": self.max_abs_residual_m,
-                "tilt_deg": self.tilt_deg,
-            },
-        }
+        values = asdict(self)
+        a, b, c, d = values.pop("plane_abcd")
+        return {"a": a, "b": b, "c": c, "d": d, "fit": values}
 
 
-def normalized_upward_plane(normal: np.ndarray, offset: float) -> tuple[np.ndarray, float]:
-    norm = float(np.linalg.norm(normal))
-    if not np.isfinite(norm) or norm <= 1e-12:
-        raise ValueError("table plane normal is degenerate")
-    normalized = np.asarray(normal, dtype=np.float64) / norm
-    normalized_offset = float(offset) / norm
-    if normalized[2] < 0.0:
-        normalized = -normalized
-        normalized_offset = -normalized_offset
-    return normalized, normalized_offset
-
-
-def least_squares_plane(points: np.ndarray) -> tuple[np.ndarray, float]:
+def _least_squares_plane(points: np.ndarray) -> tuple[np.ndarray, float]:
     center = np.mean(points, axis=0, dtype=np.float64)
     centered = points - center
     covariance = centered.T @ centered / len(points)
     _, eigenvectors = np.linalg.eigh(covariance)
     normal = eigenvectors[:, 0]
-    return normalized_upward_plane(normal, -float(normal @ center))
+    if normal[2] < 0:
+        normal = -normal
+    return normal, -float(normal @ center)
 
 
-def fit_table_plane(
-    points_base: np.ndarray,
-    *,
-    distance_threshold_m: float = 0.006,
-    max_tilt_deg: float = 20.0,
-) -> TablePlaneFit:
+def fit_table_plane(points_base: np.ndarray) -> TablePlaneFit:
+    distance_threshold_m, max_tilt_deg = 0.006, 20.0
     min_inlier_points, min_inlier_ratio = 1000, 0.20
     max_evaluated_points = 60_000
     points = np.asarray(points_base, dtype=np.float64)
@@ -71,10 +45,6 @@ def fit_table_plane(
     points = points[np.all(np.isfinite(points), axis=1)]
     if points.shape[0] < min_inlier_points:
         raise ValueError("not enough finite points for table calibration")
-    if not np.isfinite(distance_threshold_m) or distance_threshold_m <= 0.0:
-        raise ValueError("distance_threshold_m must be finite and positive")
-    if not 0.0 < max_tilt_deg < 90.0:
-        raise ValueError("max_tilt_deg must be in (0,90)")
 
     rng = np.random.default_rng(0)
     if points.shape[0] > max_evaluated_points:
@@ -89,11 +59,15 @@ def fit_table_plane(
     for _ in range(500):
         triplet = evaluated[rng.choice(evaluated.shape[0], size=3, replace=False)]
         normal = np.cross(triplet[1] - triplet[0], triplet[2] - triplet[0])
-        if np.linalg.norm(normal) <= 1e-12:
+        norm = np.linalg.norm(normal)
+        if norm <= 1e-12:
             continue
-        normal, offset = normalized_upward_plane(normal, -float(normal @ triplet[0]))
+        normal /= norm
+        if normal[2] < 0:
+            normal = -normal
         if normal[2] < min_normal_z:
             continue
+        offset = -float(normal @ triplet[0])
         residual = np.abs(evaluated @ normal + offset)
         inlier = residual <= distance_threshold_m
         count = int(np.count_nonzero(inlier))
@@ -108,13 +82,13 @@ def fit_table_plane(
     if best_count / evaluated.shape[0] < min_inlier_ratio:
         raise ValueError("dominant horizontal plane has insufficient support")
 
-    normal, offset = least_squares_plane(evaluated[best_mask])
+    normal, offset = _least_squares_plane(evaluated[best_mask])
     for _ in range(2):
         residual = np.abs(evaluated @ normal + offset)
         inlier = residual <= distance_threshold_m
         if int(np.count_nonzero(inlier)) < min_inlier_points:
             raise ValueError("refined table plane lost required support")
-        normal, offset = least_squares_plane(evaluated[inlier])
+        normal, offset = _least_squares_plane(evaluated[inlier])
 
     residual = np.abs(evaluated @ normal + offset)
     inlier = residual <= distance_threshold_m

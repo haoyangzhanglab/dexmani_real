@@ -36,15 +36,14 @@ from dexmani_real.deployment.config import _restore_cloud_config
 from dexmani_real.geometry.camera import (
     CameraIntrinsics,
     CameraSnapshot,
-    camera_parameters_cv,
 )
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
 from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
 from dexmani_real.perception import worker
 from dexmani_real.perception.config import HandCloudConfig, PointCloudConfig
-from dexmani_real.perception.hand import HandSurface
+from dexmani_real.perception.hand_cloud import HandPointCloud
 from dexmani_real.perception.pointcloud import (
-    build_point_cloud,
+    PointCloudProcessor,
     filter_depth,
     radius_inliers,
     sample_indices,
@@ -58,45 +57,43 @@ from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
 
 class PointCloudTests(unittest.TestCase):
     def setUp(self):
-        self.camera = CameraIntrinsics(12, 10, 80.0, 90.0, 5.5, 4.5, "none", (0, 0, 0, 0, 0))
+        self.camera = CameraIntrinsics(40, 40, 100.0, 100.0, 19.5, 19.5, "none", (0, 0, 0, 0, 0))
         self.config = PointCloudConfig(
             num_points=256,
             workspace=(-1, -1, 0, 1, 1, 1),
-            voxel_size_m=0.0001,
-            outlier_min_neighbors=0,
         )
-        rows, columns = np.indices((10, 12))
-        self.rgb = np.stack((rows * 16, columns * 16, np.full_like(rows, 200)), axis=-1).astype(
+        rows, columns = np.indices((40, 40))
+        self.rgb = np.stack((rows * 5, columns * 5, np.full_like(rows, 200)), axis=-1).astype(
             np.uint8
         )
         x = (columns - self.camera.ppx) / self.camera.fx
         self.plane = (0.1, 0, 1, -0.5)
-        height = np.where(columns < 6, 0, 0.02)
+        height = np.where(columns < 20, 0, 0.02)
         depth_m = (0.5 + height * np.linalg.norm(self.plane[:3])) / (1 + 0.1 * x)
         self.depth = np.rint(depth_m * 1000).astype(np.uint16)
 
     def cloud(self, **changes):
         inputs = dict(
-            depth_raw=self.depth,
-            color=self.rgb,
             depth_scale_m=0.001,
             intrinsics=self.camera,
             T_xarm_base_from_color=np.eye(4),
             table_plane_abcd=self.plane,
             config=self.config,
         )
+        depth = changes.pop("depth_raw", self.depth)
+        color = changes.pop("color", self.rgb)
         inputs.update(changes)
-        return build_point_cloud(**inputs)
+        return PointCloudProcessor(**inputs).process(depth, color)
 
     def test_tilted_table_crop_preserves_rgb_and_point_coordinates(self):
         cloud = self.cloud()
         self.assertEqual(cloud.shape, (256, 6))
         self.assertEqual(cloud.dtype, np.float32)
-        rows = np.rint(cloud[:, 3] * 255 / 16).astype(int)
-        columns = np.rint(cloud[:, 4] * 255 / 16).astype(int)
-        self.assertTrue((columns >= 6).all())
+        rows = np.rint(cloud[:, 3] * 255 / 5).astype(int)
+        columns = np.rint(cloud[:, 4] * 255 / 5).astype(int)
+        self.assertTrue((columns >= 20).all())
         z = self.depth[rows, columns].astype(np.float32) * 0.001
-        expected = np.column_stack(((columns - 5.5) * z / 80, (rows - 4.5) * z / 90, z))
+        expected = np.column_stack(((columns - 19.5) * z / 100, (rows - 19.5) * z / 100, z))
         np.testing.assert_allclose(cloud[:, :3], expected, atol=1e-7)
         np.testing.assert_allclose(cloud[:, 3:], self.rgb[rows, columns] / 255, atol=1e-7)
         np.testing.assert_array_equal(
@@ -109,7 +106,7 @@ class PointCloudTests(unittest.TestCase):
         transform[:3, 3] = [0.2, -0.1, 0.1]
         plane_base = tuple(np.linalg.inv(transform).T @ self.plane)
         transformed = self.cloud(T_xarm_base_from_color=transform, table_plane_abcd=plane_base)
-        self.assertTrue((transformed[:, 4] * 255 / 16 >= 6).all())
+        self.assertTrue((transformed[:, 4] * 255 / 5 >= 20).all())
         height = (transformed[:, :3] @ plane_base[:3] + plane_base[3]) / np.linalg.norm(plane_base[:3])
         np.testing.assert_allclose(height, 0.02, atol=0.0006)
 
@@ -126,25 +123,50 @@ class PointCloudTests(unittest.TestCase):
             np.full_like(self.depth, 2000),
         ):
             self.assertIsNone(self.cloud(depth_raw=depth))
-        self.assertIsNone(self.cloud(config=replace(self.config, outlier_min_neighbors=1000)))
+        sparse = np.zeros_like(self.depth)
+        sparse[24, 24] = self.depth[24, 24]
+        self.assertIsNone(self.cloud(depth_raw=sparse))
+        self.assertIsNone(self.cloud(config=replace(self.config, workspace=(2, 2, 2, 3, 3, 3))))
         with self.assertRaisesRegex(ValueError, "calibrated table"):
             self.cloud(table_plane_abcd=None)
+        with self.assertRaisesRegex(ValueError, "extrinsics"):
+            self.cloud(T_xarm_base_from_color=None)
 
     def test_depth_edges_remove_intermediate_measurements(self):
         depth = np.array([[0.5, 0.5, 0.8], [0.5, 0.65, 0.8], [0.5, 0.8, 0.8]], dtype=np.float32)
-        keep = filter_depth(depth, self.config)
+        keep = filter_depth(depth)
         self.assertFalse(keep[1, 1])
         self.assertEqual(keep.sum(), 8)
+
+    def test_processor_reuse_returns_fresh_clouds_and_no_stale_empty_frame(self):
+        processor = PointCloudProcessor(
+            depth_scale_m=0.001,
+            intrinsics=self.camera,
+            T_xarm_base_from_color=np.eye(4),
+            table_plane_abcd=self.plane,
+            config=self.config,
+        )
+        first = processor.process(self.depth, self.rgb)
+        snapshot = first.copy()
+        second = processor.process(self.depth + 50, 255 - self.rgb)
+        self.assertFalse(np.array_equal(first, second))
+        self.assertFalse(np.shares_memory(first, second))
+        self.assertIsNone(processor.process(np.zeros_like(self.depth), self.rgb))
+        np.testing.assert_array_equal(first, snapshot)
+        np.testing.assert_array_equal(processor.process(self.depth, self.rgb), snapshot)
 
     def test_voxel_means_and_radius_neighbors(self):
         points = np.array([[0, 0, 0], [0.002, 0, 0], [0.1, 0, 0]], dtype=np.float32)
         colors = np.eye(3, dtype=np.float32)
-        xyz, rgb = voxel_downsample(points, colors, 0.005)
+        xyz, rgb = voxel_downsample(points, colors)
         np.testing.assert_allclose(xyz, [[0.001, 0, 0], [0.1, 0, 0]])
         np.testing.assert_allclose(rgb, [[0.5, 0.5, 0], [0, 0, 1]])
-        np.testing.assert_array_equal(radius_inliers(points, 0.003, 1), [True, True, False])
-        np.testing.assert_array_equal(radius_inliers(points, 0.003, 2), [False, False, False])
-        np.testing.assert_array_equal(radius_inliers(points, 0.003, 0), [True, True, True])
+        cluster = np.zeros((7, 3), dtype=np.float32)
+        cluster[:, 0] = np.arange(7) * 0.001
+        points = np.vstack((cluster, [0.1, 0, 0]))
+        np.testing.assert_array_equal(radius_inliers(points), [True] * 7 + [False])
+        self.assertFalse(radius_inliers(cluster[:6]).any())
+        self.assertFalse(radius_inliers(points[-1:]).any())
 
     def test_fps_is_deterministic_and_padding_uses_observed_points(self):
         points = np.random.default_rng(1).uniform(size=(300, 3)).astype(np.float32)
@@ -153,28 +175,28 @@ class PointCloudTests(unittest.TestCase):
         np.testing.assert_array_equal(selected, sample_indices(points, 32))
         np.testing.assert_array_equal(sample_indices(points[:3], 8), [0, 1, 2, 0, 1, 2, 0, 1])
 
-    def test_configs_roundtrip_and_old_recipes_are_rejected(self):
+    def test_config_roundtrip_requires_exact_current_fields(self):
         config = load_experiment_config(cli_overrides={"pointcloud.table_margin_m": 0.012})
         self.assertEqual(config.pointcloud.table_margin_m, 0.012)
-        with self.assertRaises(TypeError):
-            load_experiment_config(cli_overrides={"pointcloud.table_core_height_m": 0.007})
-        for config in (self.config, HandCloudConfig(seed=17)):
+        for config in (self.config, HandCloudConfig(num_points=17)):
             recipe = json.loads(json.dumps(asdict(config)))
             self.assertEqual(_restore_cloud_config(recipe, type(config)), config)
-            old = {**recipe, "sampling_method": "quickfps"}
+            extra = {"voxel_size_m": 0.01} if isinstance(config, PointCloudConfig) else {"seed": 0}
             with self.assertRaisesRegex(ValueError, "re-export"):
-                _restore_cloud_config(old, type(config))
+                _restore_cloud_config({**recipe, **extra}, type(config))
             del recipe["num_points"]
             with self.assertRaisesRegex(ValueError, "incomplete"):
                 _restore_cloud_config(recipe, type(config))
         for change in (
             dict(num_points=0),
-            dict(voxel_size_m=0),
             dict(table_margin_m=-1),
-            dict(outlier_radius_m=float("nan")),
+            dict(table_margin_m=float("nan")),
+            dict(workspace=(0, 0, 0, 0, 1, 1)),
         ):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 replace(self.config, **change)
+        with self.assertRaises(TypeError):
+            load_experiment_config(cli_overrides={"pointcloud.voxel_size_m": 0.01})
 
     def test_offline_mount_config_rejects_invalid_geometry(self):
         config = ExportConfig(pointcloud=self.config, table_plane_abcd=self.plane)
@@ -240,7 +262,7 @@ class PointCloudTests(unittest.TestCase):
             store = zarr.open_group(str(output), mode="r")
             self.assertEqual(store.attrs["episode_ids"], ["episode_1"])
             np.testing.assert_array_equal(store["meta/episode_ends"][:], [2])
-            for name, (shape, dtype) in canonical_array_specs(256, 10, 12, 1024).items():
+            for name, (shape, dtype) in canonical_array_specs(256, 40, 40, 1024).items():
                 self.assertEqual(store[f"data/{name}"].shape, (2, *shape))
                 self.assertEqual(store[f"data/{name}"].dtype, dtype)
             restored = _restore_cloud_config(store.attrs["pointcloud_config"], PointCloudConfig)
@@ -268,9 +290,12 @@ class PointCloudTests(unittest.TestCase):
         processing = ExportConfig(
             pointcloud=self.config, hand_pointcloud=hand_config, table_plane_abcd=self.plane
         )
-        parameters = camera_parameters_cv(self.camera, np.eye(4))
+        transform = np.eye(4)
+        transform[:3, :3] = Rotation.from_euler("z", 15, degrees=True).as_matrix()
+        transform[:3, 3] = (0.1, -0.2, 0.03)
+        camera = CameraSnapshot("test", self.camera, 0.001, transform)
         hand_fk = HandFK()
-        surface = HandSurface(hand_config, hand_fk)
+        surface = HandPointCloud(hand_fk, hand_config.num_points)
         blocks = list(
             iter_canonical_blocks(
                 reader,
@@ -279,18 +304,21 @@ class PointCloudTests(unittest.TestCase):
                 hand_fk=hand_fk,
                 hand_cloud=surface,
                 chunk_frames=1,
-                camera=CameraSnapshot("test", self.camera, 0.001, np.eye(4)),
-                base_from_color=np.eye(4),
-                camera_parameters=parameters,
+                camera=camera,
                 handbase_rotation_eef=quat_wxyz_to_rotmat(processing.handbase_quat_eef_wxyz),
             )
         )
         block = blocks[0]
-        specs = canonical_array_specs(256, 10, 12, 1024)
+        specs = canonical_array_specs(256, 40, 40, 1024)
         self.assertEqual(set(block), set(specs))
         for name, (shape, dtype) in specs.items():
             self.assertEqual(block[name].shape, (1, *shape))
             self.assertEqual(block[name].dtype, dtype)
+        np.testing.assert_allclose(
+            block["camera_extrinsic"][0].reshape(3, 4),
+            np.linalg.inv(transform)[:3],
+            atol=1e-7,
+        )
 
         channels = SimpleNamespace(
             is_running=SimpleNamespace(value=True),
@@ -303,7 +331,6 @@ class PointCloudTests(unittest.TestCase):
             return {"depth": self.depth, "rgb": self.rgb, "timestamp_ns": 123}, sequence
 
         channels.camera_ring = SimpleNamespace(latest_sequence=7, read=read_frame)
-        camera = CameraSnapshot("test", self.camera, 0.001, np.eye(4))
         with patch.object(worker, "configure_logging"):
             worker.run_pointcloud_worker(channels, self.config, camera, self.plane)
         published = channels.pointcloud_ring.write.call_args.kwargs

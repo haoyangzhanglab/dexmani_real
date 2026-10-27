@@ -113,29 +113,29 @@ def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
 
 
 def rot6d_to_rotmat(r6: np.ndarray) -> np.ndarray:
-    """Gram-Schmidt 将 rot6d 的两列还原为右手旋转矩阵。"""
+    """Gram-Schmidt 将 (...,6) 列序 rot6d 还原为 (...,3,3) 旋转矩阵。"""
     values = np.asarray(r6, dtype=np.float64)
-    if values.shape != (6,) or not np.isfinite(values).all():
-        raise ValueError("rot6d must be a finite (6,) vector")
-    first, second = values[:3], values[3:]
-    first_norm = float(np.linalg.norm(first))
-    second_norm = float(np.linalg.norm(second))
+    if values.ndim == 0 or values.shape[-1] != 6 or not np.isfinite(values).all():
+        raise ValueError("rot6d must have finite shape (...,6)")
+    first, second = values[..., :3], values[..., 3:]
+    first_norm = np.linalg.norm(first, axis=-1, keepdims=True)
+    second_norm = np.linalg.norm(second, axis=-1, keepdims=True)
     if (
         not np.isfinite([first_norm, second_norm]).all()
-        or min(first_norm, second_norm) < ROT6D_MIN_BASIS_NORM
+        or np.any(np.minimum(first_norm, second_norm) < ROT6D_MIN_BASIS_NORM)
     ):
         raise ValueError("rot6d contains a zero or unrepresentable basis")
 
     unit_first = first / first_norm
-    orthogonal_second = second - np.dot(second, unit_first) * unit_first
-    orthogonal_norm = float(np.linalg.norm(orthogonal_second))
+    orthogonal_second = second - np.sum(second * unit_first, axis=-1, keepdims=True) * unit_first
+    orthogonal_norm = np.linalg.norm(orthogonal_second, axis=-1, keepdims=True)
     if (
-        not np.isfinite(orthogonal_norm)
-        or orthogonal_norm / second_norm < ROT6D_MIN_ORTHOGONAL_RATIO
+        not np.isfinite(orthogonal_norm).all()
+        or np.any(orthogonal_norm / second_norm < ROT6D_MIN_ORTHOGONAL_RATIO)
     ):
         raise ValueError("rot6d contains a near-collinear basis")
     unit_second = orthogonal_second / orthogonal_norm
-    return np.column_stack((unit_first, unit_second, np.cross(unit_first, unit_second)))
+    return np.stack((unit_first, unit_second, np.cross(unit_first, unit_second)), axis=-1)
 
 
 def quat_wxyz_to_rotmat(q_wxyz: ArrayLike) -> np.ndarray:

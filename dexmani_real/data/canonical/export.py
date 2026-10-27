@@ -18,7 +18,7 @@ from dexmani_real.data.canonical.schema import CANONICAL_FORMAT, ExportConfig, c
 from dexmani_real.data.raw.reader import EpisodeReader
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
 from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
-from dexmani_real.perception.hand import HandSurface
+from dexmani_real.perception.hand_cloud import HandPointCloud
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 from dexmani_real.utils.timing import sampling_clock_ns
@@ -56,7 +56,7 @@ def export_canonical(
                 progress_callback(index, len(selected))
             offset = ends[-1] if ends else 0
             with EpisodeReader(episode) as reader:
-                camera, base_from_color, camera_parameters = validate_export_episode(reader)
+                camera = validate_export_episode(reader)
                 task = reader.meta["task_label"]
                 if not task.strip() or any(ord(char) < 32 or ord(char) == 127 for char in task):
                     raise ValueError("task_label must be nonempty without control characters")
@@ -73,7 +73,7 @@ def export_canonical(
                     )
                     chunk = min(MAX_BATCH_FRAMES, max(1, PROCESSING_BYTES // row_bytes))
                     arm_fk, hand_fk = ArmFK(), HandFK()
-                    hand_cloud = HandSurface(processing.hand_pointcloud, hand_fk)
+                    hand_cloud = HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
                     period_ns, tolerance_ns = sampling_clock_ns(reader.control_hz)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     staging = Path(
@@ -130,8 +130,6 @@ def export_canonical(
                     hand_cloud=hand_cloud,
                     chunk_frames=chunk,
                     camera=camera,
-                    base_from_color=base_from_color,
-                    camera_parameters=camera_parameters,
                     handbase_rotation_eef=rotation,
                 )
                 append_episode(arrays, offset, blocks, reader.num_frames)

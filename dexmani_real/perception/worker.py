@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, cast
 
 from dexmani_real.geometry.camera import CameraSnapshot
 from dexmani_real.perception.config import PointCloudConfig
-from dexmani_real.perception.pointcloud import build_point_cloud
+from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.utils.log import configure_logging
 
 if TYPE_CHECKING:
@@ -27,8 +27,13 @@ def run_pointcloud_worker(
     table_plane_abcd: tuple[float, float, float, float] | None,
 ) -> None:
     configure_logging()
-    if camera.T_xarm_base_from_color is None:
-        raise ValueError("pointcloud requires camera extrinsics")
+    processor = PointCloudProcessor(
+        depth_scale_m=camera.depth_scale_m,
+        intrinsics=camera.color,
+        T_xarm_base_from_color=camera.T_xarm_base_from_color,
+        table_plane_abcd=table_plane_abcd,
+        config=pointcloud,
+    )
     logger.debug(
         "pointcloud config=%s table_plane_abcd=%s",
         pointcloud,
@@ -53,18 +58,9 @@ def run_pointcloud_worker(
             data, camera_sequence = result
             last_camera_sequence = camera_sequence
 
-            cloud = build_point_cloud(
-                depth_raw=data["depth"],
-                color=data["rgb"],
-                depth_scale_m=camera.depth_scale_m,
-                intrinsics=camera.color,
-                T_xarm_base_from_color=camera.T_xarm_base_from_color,
-                table_plane_abcd=table_plane_abcd,
-                config=pointcloud,
-            )
+            cloud = processor.process(data["depth"], data["rgb"])
             if cloud is None:
                 continue
-            # 点云处理保留相机的原始来源时间。
             pointcloud_ring.write(
                 source_camera_sequence=camera_sequence,
                 timestamp_ns=data["timestamp_ns"],

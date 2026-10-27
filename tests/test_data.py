@@ -46,7 +46,7 @@ class DataTests(unittest.TestCase):
         self.root = Path(directory.name)
         self.camera = CameraSnapshot(
             "test",
-            CameraIntrinsics(4, 4, 40.0, 40.0, 1.5, 1.5, "none", (0, 0, 0, 0, 0)),
+            CameraIntrinsics(4, 4, 100.0, 100.0, 1.5, 1.5, "none", (0, 0, 0, 0, 0)),
             0.001,
             np.eye(4),
         )
@@ -60,8 +60,6 @@ class DataTests(unittest.TestCase):
             pointcloud=PointCloudConfig(
                 num_points=16,
                 workspace=(-1, -1, 0, 1, 1, 1),
-                voxel_size_m=0.0001,
-                outlier_min_neighbors=0,
                 remove_table=False,
             )
         )

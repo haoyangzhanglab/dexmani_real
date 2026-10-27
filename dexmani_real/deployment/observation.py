@@ -10,10 +10,10 @@ from dexmani_real.geometry.camera import camera_parameters_cv
 from dexmani_real.geometry.kinematics import (
     ArmFK,
     HandFK,
-    eef_pose_sequence,
+    eef_poses,
 )
 from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
-from dexmani_real.perception.hand import HandSurface, hand_geometry_sequence
+from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.runtime.observation import ObservationNeeds, freeze
 
@@ -55,7 +55,7 @@ class ObservationKinematics:
     hand_fk: HandFK | None = None
     handbase_position_eef_m: tuple[float, float, float] | None = None
     handbase_rotation_eef: np.ndarray | None = None
-    hand_cloud: HandSurface | None = None
+    hand_cloud: HandPointCloud | None = None
     row_features: dict = field(default_factory=dict)
 
 
@@ -115,7 +115,7 @@ def build_observation_kinematics(dependencies, *, fingertip_link_names, hand, ha
     )
     hand_cloud = None
     if "hand_cloud" in dependencies:
-        hand_cloud = HandSurface(hand_pointcloud, hand_fk)
+        hand_cloud = HandPointCloud(hand_fk, hand_pointcloud.num_points)
     return ObservationKinematics(
         ArmFK(), hand_fk,
         tuple(hand.T_eef_handbase_pos_xyz),
@@ -168,11 +168,11 @@ def build_policy_observation(rows, fields, dependencies, *, kinematics=None, cam
         features = {}
         if new_rows:
             arm = np.stack([r.values["arm_qpos"] for r in new_rows])
-            poses = eef_pose_sequence(arm, arm_fk=kinematics.arm_fk)
+            poses = eef_poses(arm, arm_fk=kinematics.arm_fk)
             if "eef_pose" in fields:
                 features["eef_pose"] = poses.astype(np.float32)
             if "hand_fk" in dependencies:
-                features.update(hand_geometry_sequence(
+                features.update(hand_geometry(
                     poses, np.stack([r.values["hand_qpos"] for r in new_rows]),
                     hand_fk=kinematics.hand_fk,
                     handbase_position_eef_m=kinematics.handbase_position_eef_m,

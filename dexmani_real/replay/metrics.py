@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.geometry.kinematics import ArmFK, eef_pose_sequence
+from dexmani_real.geometry.kinematics import ArmFK, eef_poses
 from dexmani_real.replay.data import Trajectory
 from dexmani_real.utils.atomic_io import atomic_json_dump, atomic_publish
 
@@ -43,8 +43,8 @@ def compute_metrics(trajectory: Trajectory, replay_data: dict) -> dict:
     metrics["hand_joint"] = joint_errors(trajectory.hand_qpos[:count], hand)
 
     fk = ArmFK()
-    original = eef_pose_sequence(trajectory.arm_qpos[:count], arm_fk=fk)
-    replayed = eef_pose_sequence(arm, arm_fk=fk)
+    original = eef_poses(trajectory.arm_qpos[:count], arm_fk=fk)
+    replayed = eef_poses(arm, arm_fk=fk)
     position_error = np.linalg.norm(replayed[:, :3] - original[:, :3], axis=1) * 1000
     # FK 的 rot6d 已是正交单位列，无需逐帧重复归一化。
     first_a, second_a = original[:, 3:6], original[:, 6:9]

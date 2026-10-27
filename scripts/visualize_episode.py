@@ -18,15 +18,14 @@ from dexmani_real.calibration.table_plane import resolve_table_plane
 from dexmani_real.config import load_experiment_config
 from dexmani_real.control.config import TableCollisionConfig
 from dexmani_real.data.raw.reader import EpisodeReader
-from dexmani_real.geometry.camera import validate_aligned_depth_distortion
-from dexmani_real.geometry.kinematics import HandFK, eef_pose_sequence
+from dexmani_real.geometry.kinematics import HandFK, eef_poses
 from dexmani_real.geometry.pose import (
     quat_wxyz_to_rotmat,
     validate_unit_quaternion_wxyz,
 )
 from dexmani_real.perception.config import PointCloudConfig
-from dexmani_real.perception.hand import hand_geometry_sequence
-from dexmani_real.perception.pointcloud import build_point_cloud
+from dexmani_real.perception.hand_cloud import hand_geometry
+from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.utils.visualization import (
     log_camera_geometry,
@@ -149,21 +148,23 @@ class EpisodeVisualizer:
                 handbase_quat_eef_wxyz, name="hand base quaternion"
             )
             self.handbase_rotation_eef = quat_wxyz_to_rotmat(handbase_quat)
-            self.pointcloud_config = pointcloud_config
-            self.table_plane_abcd = None
+            self.pointcloud_processor = None
             self.empty_cloud_count = 0
             self.pointcloud_processing_ns = 0
             self.pointcloud_processed_frames = 0
             if pointcloud_config is not None and self.T_xarm_base_from_color is not None:
-                validate_aligned_depth_distortion(
-                    self.camera_model.color.distortion_model
+                table_plane = resolve_table_plane(table_config) if pointcloud_config.remove_table else None
+                self.pointcloud_processor = PointCloudProcessor(
+                    depth_scale_m=self.camera_model.depth_scale_m,
+                    intrinsics=self.camera_model.color,
+                    T_xarm_base_from_color=self.T_xarm_base_from_color,
+                    table_plane_abcd=table_plane,
+                    config=pointcloud_config,
                 )
-                if pointcloud_config.remove_table:
-                    self.table_plane_abcd = resolve_table_plane(table_config)
                 logger.info(
                     "Canonical point cloud enabled: N=%d table=%s",
                     pointcloud_config.num_points,
-                    "enabled" if self.table_plane_abcd is not None else "disabled",
+                    "enabled" if table_plane is not None else "disabled",
                 )
 
             logger.info("Frames=%d", self.frame_count)
@@ -206,10 +207,10 @@ class EpisodeVisualizer:
         state["arm_ee"] = np.full((self.frame_count, 9), np.nan)
         state["hand_fingertip"] = np.full((self.frame_count, 5, 3), np.nan, dtype=np.float32)
         if np.any(arm_valid):
-            state["arm_ee"][arm_valid] = eef_pose_sequence(arm[arm_valid])
+            state["arm_ee"][arm_valid] = eef_poses(arm[arm_valid])
         if np.any(hand_valid):
             hand_fk = HandFK(self.fingertip_link_names)
-            state["hand_fingertip"][hand_valid] = hand_geometry_sequence(
+            state["hand_fingertip"][hand_valid] = hand_geometry(
                 state["arm_ee"][hand_valid],
                 hand[hand_valid],
                 hand_fk=hand_fk,
@@ -269,18 +270,10 @@ class EpisodeVisualizer:
         return rgb, depth
 
     def log_pointcloud(self, rgb: np.ndarray, depth: np.ndarray) -> None:
-        if self.pointcloud_config is None or self.T_xarm_base_from_color is None:
+        if self.pointcloud_processor is None:
             return
         started_ns = time.perf_counter_ns()
-        cloud = build_point_cloud(
-            depth_raw=depth,
-            color=rgb,
-            depth_scale_m=self.camera_model.depth_scale_m,
-            intrinsics=self.camera_model.color,
-            T_xarm_base_from_color=self.T_xarm_base_from_color,
-            table_plane_abcd=self.table_plane_abcd,
-            config=self.pointcloud_config,
-        )
+        cloud = self.pointcloud_processor.process(depth, rgb)
         self.pointcloud_processing_ns += time.perf_counter_ns() - started_ns
         self.pointcloud_processed_frames += 1
         if cloud is None:

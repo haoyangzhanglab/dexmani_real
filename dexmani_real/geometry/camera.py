@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from functools import lru_cache
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 
@@ -36,11 +36,7 @@ class CameraIntrinsics:
         coeffs = tuple(float(value) for value in self.distortion_coeffs)
         if len(coeffs) != 5 or not np.all(np.isfinite(coeffs)):
             raise ValueError("distortion_coeffs must contain five finite values")
-        object.__setattr__(
-            self,
-            "distortion_coeffs",
-            cast(tuple[float, float, float, float, float], coeffs),
-        )
+        object.__setattr__(self, "distortion_coeffs", coeffs)
 
     def to_dict(self) -> dict[str, Any]:
         return {**asdict(self), "distortion_coeffs": list(self.distortion_coeffs)}
@@ -113,8 +109,8 @@ def undistorted_depth_coordinates(
     intrinsics: CameraIntrinsics,
 ) -> tuple[np.ndarray, np.ndarray]:
     validate_aligned_depth_distortion(intrinsics.distortion_model)
-    xd = (columns.astype(np.float32) - np.float32(intrinsics.ppx)) / np.float32(intrinsics.fx)
-    yd = (rows.astype(np.float32) - np.float32(intrinsics.ppy)) / np.float32(intrinsics.fy)
+    xd = (np.asarray(columns, dtype=np.float32) - np.float32(intrinsics.ppx)) / np.float32(intrinsics.fx)
+    yd = (np.asarray(rows, dtype=np.float32) - np.float32(intrinsics.ppy)) / np.float32(intrinsics.fy)
     if intrinsics.distortion_model in {"distortion.none", "none"}:
         x, y = xd, yd
     else:
@@ -133,12 +129,9 @@ def undistorted_depth_coordinates(
 
 @lru_cache(maxsize=4)
 def depth_rays(intrinsics: CameraIntrinsics) -> np.ndarray:
-    """缓存静态内参对应的逐像素射线。"""
-    rows, columns = np.indices((intrinsics.height, intrinsics.width), dtype=np.int64)
-    x, y = undistorted_depth_coordinates(rows.reshape(-1), columns.reshape(-1), intrinsics)
-    rays = np.column_stack((x, y, np.ones(x.size, dtype=np.float32))).reshape(
-        intrinsics.height, intrinsics.width, 3
-    )
+    rows, columns = np.indices((intrinsics.height, intrinsics.width), dtype=np.float32)
+    x, y = undistorted_depth_coordinates(rows, columns, intrinsics)
+    rays = np.stack((x, y, np.ones_like(x)), axis=-1)
     rays.setflags(write=False)
     return rays
 

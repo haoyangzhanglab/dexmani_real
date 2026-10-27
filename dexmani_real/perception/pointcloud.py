@@ -9,10 +9,16 @@ from dexmani_real.geometry.camera import CameraIntrinsics, deproject_depth, dept
 from dexmani_real.perception.config import PointCloudConfig
 
 NEIGHBORHOOD_KERNEL = np.ones((3, 3), dtype=np.uint8)
+DEPTH_RANGE_M = (0.30, 1.50)
+EDGE_JUMP_M = 0.030
+EDGE_SURFACE_BAND_M = 0.008
+VOXEL_SIZE_M = 0.005
+OUTLIER_RADIUS_M = 0.012
+OUTLIER_MIN_NEIGHBORS = 6
 
 
-def filter_depth(depth_m: np.ndarray, config: PointCloudConfig) -> np.ndarray:
-    valid = (depth_m >= config.depth_min_m) & (depth_m <= config.depth_max_m)
+def filter_depth(depth_m: np.ndarray) -> np.ndarray:
+    valid = (depth_m >= DEPTH_RANGE_M[0]) & (depth_m <= DEPTH_RANGE_M[1])
     local_min: np.ndarray = cv2.erode(
         np.where(valid, depth_m, np.float32(np.inf)),
         NEIGHBORHOOD_KERNEL,
@@ -26,23 +32,19 @@ def filter_depth(depth_m: np.ndarray, config: PointCloudConfig) -> np.ndarray:
         borderValue=(float("-inf"),),
     )
     # 深度断层中，远离前后表面的中间值视为飞点。
-    edge = (local_max - local_min) > config.edge_jump_m
+    edge = (local_max - local_min) > EDGE_JUMP_M
     distance = np.minimum(depth_m - local_min, local_max - depth_m)
-    return valid & ~(edge & (distance > config.edge_surface_band_m))
+    return valid & ~(edge & (distance > EDGE_SURFACE_BAND_M))
 
 
 def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return (points @ transform[:3, :3].T + transform[:3, 3]).astype(np.float32)
 
 
-def voxel_downsample(points: np.ndarray, colors: np.ndarray, voxel_size_m: float):
-    keys = np.floor(points / np.float32(voxel_size_m)).astype(np.int64)
-    shifted = keys - keys.min(axis=0)
-    extents = shifted.max(axis=0) + 1
-    stride = int(extents[1]) * int(extents[2])
-    if int(extents[0]) * stride > np.iinfo(np.int64).max:
-        raise ValueError("voxel grid exceeds int64; increase voxel_size_m")
-    packed = shifted[:, 0] * stride + shifted[:, 1] * int(extents[2]) + shifted[:, 2]
+def voxel_downsample(points: np.ndarray, colors: np.ndarray):
+    keys = np.floor(points / np.float32(VOXEL_SIZE_M)).astype(np.int64)
+    keys -= keys.min(axis=0)
+    packed = np.ravel_multi_index(keys.T, keys.max(axis=0) + 1)
     _, inverse = np.unique(packed, return_inverse=True)
     counts = np.bincount(inverse)
 
@@ -54,14 +56,12 @@ def voxel_downsample(points: np.ndarray, colors: np.ndarray, voxel_size_m: float
     return mean(points), mean(colors)
 
 
-def radius_inliers(points: np.ndarray, radius_m: float, min_neighbors: int) -> np.ndarray:
-    if min_neighbors == 0:
-        return np.ones(len(points), dtype=bool)
+def radius_inliers(points: np.ndarray) -> np.ndarray:
     pairs = cKDTree(points, compact_nodes=False, balanced_tree=False).query_pairs(
-        radius_m,
+        OUTLIER_RADIUS_M,
         output_type="ndarray",
     )
-    return np.bincount(pairs.ravel(), minlength=len(points)) >= min_neighbors
+    return np.bincount(pairs.ravel(), minlength=len(points)) >= OUTLIER_MIN_NEIGHBORS
 
 
 def sample_indices(points: np.ndarray, num_points: int) -> np.ndarray:
@@ -81,13 +81,12 @@ def aligned_depth_points_in_base(
     depth_scale_m: float,
     aligned_depth_intrinsics: CameraIntrinsics,
     T_xarm_base_from_color: np.ndarray,
-    config: PointCloudConfig,
 ) -> np.ndarray:
     """桌面标定使用深度过滤后的点，不执行桌面和工作空间裁剪。"""
     depth_m = depth_raw.astype(np.float32) * np.float32(depth_scale_m)
     points, _, _ = deproject_depth(
         depth_m,
-        filter_depth(depth_m, config),
+        filter_depth(depth_m),
         aligned_depth_intrinsics,
     )
     return transform_points(points, T_xarm_base_from_color)
@@ -110,41 +109,54 @@ def build_raw_point_cloud(
     return np.column_stack((xyz, rgb))
 
 
-def build_point_cloud(
-    *,
-    depth_raw: np.ndarray,
-    color: np.ndarray,
-    depth_scale_m: float,
-    intrinsics: CameraIntrinsics,
-    T_xarm_base_from_color: np.ndarray,
-    table_plane_abcd: tuple[float, float, float, float] | None,
-    config: PointCloudConfig,
-) -> np.ndarray | None:
-    if config.remove_table and table_plane_abcd is None:
-        raise ValueError("remove_table=True requires a calibrated table plane")
+class PointCloudProcessor:
+    def __init__(
+        self,
+        *,
+        depth_scale_m: float,
+        intrinsics: CameraIntrinsics,
+        T_xarm_base_from_color: np.ndarray | None,
+        table_plane_abcd: tuple[float, float, float, float] | None,
+        config: PointCloudConfig,
+    ):
+        if T_xarm_base_from_color is None:
+            raise ValueError("pointcloud requires camera extrinsics")
+        if config.remove_table and table_plane_abcd is None:
+            raise ValueError("remove_table=True requires a calibrated table plane")
 
-    depth_m = depth_raw.astype(np.float32) * np.float32(depth_scale_m)
-    valid = filter_depth(depth_m, config)
-    if config.remove_table:
-        plane = np.asarray(table_plane_abcd, dtype=np.float64)
-        plane_color = T_xarm_base_from_color.T @ (plane / np.linalg.norm(plane[:3]))
-        # 在相机射线上计算桌面高度，避免为桌面像素分配三维点。
-        height = depth_m * (depth_rays(intrinsics) @ plane_color[:3]) + plane_color[3]
-        valid &= height > config.table_margin_m
-    points, rows, columns = deproject_depth(depth_m, valid, intrinsics)
-    points = transform_points(points, T_xarm_base_from_color)
-    lower, upper = np.asarray(config.workspace, dtype=np.float32).reshape(2, 3)
-    keep = np.all((points >= lower) & (points <= upper), axis=1)
-    if not keep.any():
-        return None
+        self.config = config
+        self.depth_scale = np.float32(depth_scale_m)
+        self.lower, self.upper = np.asarray(config.workspace, dtype=np.float32).reshape(2, 3)
+        rays = depth_rays(intrinsics)
+        transform = T_xarm_base_from_color
+        self.rays_base = (rays @ transform[:3, :3].T).astype(np.float32)
+        self.translation = transform[:3, 3].astype(np.float32)
+        if config.remove_table:
+            plane = np.asarray(table_plane_abcd, dtype=np.float64)
+            plane_color = transform.T @ (plane / np.linalg.norm(plane[:3]))
+            self.table_height_per_depth = rays @ plane_color[:3]
+            self.table_offset = plane_color[3]
 
-    points = points[keep]
-    colors = color[rows[keep], columns[keep]].astype(np.float32) / 255.0
-    points, colors = voxel_downsample(points, colors, config.voxel_size_m)
-    keep = radius_inliers(points, config.outlier_radius_m, config.outlier_min_neighbors)
-    points, colors = points[keep], colors[keep]
-    if len(points) == 0:
-        return None
+    def process(self, depth_raw: np.ndarray, color: np.ndarray) -> np.ndarray | None:
+        depth_m = depth_raw.astype(np.float32) * self.depth_scale
+        valid = filter_depth(depth_m)
+        if self.config.remove_table:
+            # 先沿射线裁掉桌面，避免为桌面像素分配三维点。
+            height = depth_m * self.table_height_per_depth + self.table_offset
+            valid &= height > self.config.table_margin_m
+        rows, columns = np.nonzero(valid)
+        points = self.rays_base[rows, columns] * depth_m[rows, columns, None] + self.translation
+        keep = np.all((points >= self.lower) & (points <= self.upper), axis=1)
+        if not keep.any():
+            return None
 
-    selected = sample_indices(points, config.num_points)
-    return np.column_stack((points[selected], colors[selected]))
+        points = points[keep]
+        colors = color[rows[keep], columns[keep]].astype(np.float32) / 255.0
+        points, colors = voxel_downsample(points, colors)
+        keep = radius_inliers(points)
+        points, colors = points[keep], colors[keep]
+        if len(points) == 0:
+            return None
+
+        selected = sample_indices(points, self.config.num_points)
+        return np.column_stack((points[selected], colors[selected]))

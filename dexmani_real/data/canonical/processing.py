@@ -13,24 +13,20 @@ from dexmani_real.geometry.camera import (
     camera_parameters_cv,
     validate_aligned_depth_distortion,
 )
-from dexmani_real.geometry.kinematics import eef_pose_sequence
-from dexmani_real.perception.hand import hand_geometry_sequence
-from dexmani_real.perception.pointcloud import build_point_cloud
+from dexmani_real.geometry.kinematics import eef_poses
+from dexmani_real.perception.hand_cloud import hand_geometry
+from dexmani_real.perception.pointcloud import PointCloudProcessor
 
 
-def validate_export_episode(
-    reader: EpisodeReader,
-) -> tuple[CameraSnapshot, np.ndarray, dict[str, np.ndarray]]:
+def validate_export_episode(reader: EpisodeReader) -> CameraSnapshot:
     frames = reader.num_frames
     if frames <= 0:
         raise ValueError("episode contains no rows")
     reader.require_fields(*DATASET_SPECS, "rgb", "depth")
     camera = reader.read_camera()
     validate_aligned_depth_distortion(camera.color.distortion_model)
-    base_from_color = camera.T_xarm_base_from_color
-    if base_from_color is None:
+    if camera.T_xarm_base_from_color is None:
         raise ValueError("canonical export requires camera extrinsics")
-    camera_parameters = camera_parameters_cv(camera.color, base_from_color)
     color = camera.color
     expected = (frames, color.height, color.width)
     if reader["depth"].shape != expected or reader["depth"].dtype != np.uint16:
@@ -43,7 +39,7 @@ def validate_export_episode(
         )
     for name in DATASET_SPECS:
         reader[name]
-    return camera, base_from_color, camera_parameters
+    return camera
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
@@ -74,12 +70,18 @@ def iter_canonical_blocks(
     hand_cloud,
     chunk_frames: int,
     camera: CameraSnapshot,
-    base_from_color: np.ndarray,
-    camera_parameters: dict[str, np.ndarray],
     handbase_rotation_eef: np.ndarray,
 ):
     """分块转换，不修补缺失观测或重采样行。"""
     height, width = camera.color.height, camera.color.width
+    processor = PointCloudProcessor(
+        depth_scale_m=camera.depth_scale_m,
+        intrinsics=camera.color,
+        T_xarm_base_from_color=camera.T_xarm_base_from_color,
+        table_plane_abcd=config.table_plane_abcd,
+        config=config.pointcloud,
+    )
+    camera_parameters = camera_parameters_cv(camera.color, camera.T_xarm_base_from_color)
     images = reader.iter_rgb_frames()
     for start in range(0, reader.num_frames, chunk_frames):
         end = min(reader.num_frames, start + chunk_frames)
@@ -99,9 +101,9 @@ def iter_canonical_blocks(
             raw["action_arm_joint_target"],
             raw["action_hand_joint_target"],
         )
-        poses = eef_pose_sequence(arm, arm_fk=arm_fk)
-        action_poses = eef_pose_sequence(arm_action, arm_fk=arm_fk)
-        hand_geometry = hand_geometry_sequence(
+        poses = eef_poses(arm, arm_fk=arm_fk)
+        action_poses = eef_poses(arm_action, arm_fk=arm_fk)
+        hand_features = hand_geometry(
             poses,
             hand,
             hand_fk=hand_fk,
@@ -116,7 +118,7 @@ def iter_canonical_blocks(
             "eef_pose": poses.astype(np.float32),
             "finger_tactile_force": raw["hand_contact"],
             "taxel_tactile_force": raw["hand_tactile_force"],
-            **hand_geometry,
+            **hand_features,
         }
         for name, values in camera_parameters.items():
             block[name] = np.broadcast_to(values, (end - start, values.size))
@@ -130,15 +132,7 @@ def iter_canonical_blocks(
                 raise ValueError(
                     f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
                 )
-            cloud = build_point_cloud(
-                depth_raw=depth[offset],
-                color=image,
-                depth_scale_m=camera.depth_scale_m,
-                intrinsics=camera.color,
-                T_xarm_base_from_color=base_from_color,
-                table_plane_abcd=config.table_plane_abcd,
-                config=config.pointcloud,
-            )
+            cloud = processor.process(depth[offset], image)
             if cloud is None:
                 raise ValueError(f"point_cloud unavailable at row {index}")
             rgb[offset], clouds[offset] = image, cloud

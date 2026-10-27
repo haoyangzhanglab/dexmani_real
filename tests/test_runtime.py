@@ -426,63 +426,127 @@ class CameraSnapshotTests(unittest.TestCase):
 
 
 class PreviewInputTests(unittest.TestCase):
-    def test_cloud_geometry_loads_current_config_without_legacy_validation(self):
+    def setUp(self):
         from scripts.tools import view_realsense as preview
 
-        runtime = load_experiment_config()
-        example = preview.RealSenseExample(SimpleNamespace(camera_calibration=None))
-        example.production = runtime.pointcloud
-        example.table = runtime.environment.table
-        example.calibration = None
-        example.table_plane_abcd = None
-        transform, plane = np.eye(4), (0.0, 0.0, 1.0, 0.0)
-        with (
-            patch.object(preview, "load_camera_extrinsics") as calibration,
-            patch.object(preview, "resolve_table_plane", return_value=plane) as resolve,
-        ):
-            calibration.return_value = {"camera": transform}
-            np.testing.assert_array_equal(example.load_pointcloud_geometry("raw", "camera")[0], transform)
-            resolve.assert_not_called()
-            self.assertEqual(example.load_pointcloud_geometry("processed", "camera")[1], plane)
-            self.assertEqual(example.load_pointcloud_geometry("processed", "camera")[1], plane)
-            resolve.assert_called_once_with(runtime.environment.table)
-            calibration.assert_called_once_with(None)
-
-    def test_cloud_toggle_mode_and_reset_share_geometry_state(self):
-        from scripts.tools import view_realsense as preview
-
-        example = preview.RealSenseExample(SimpleNamespace())
-        example.rr = Mock()
-        example.production = load_experiment_config().pointcloud
-        example.camera = Mock(active_serial="camera")
-        example.camera.depth_scale_m = 0.001
-        example.camera.read.return_value = SimpleNamespace(
+        self.preview = preview
+        self.runtime = load_experiment_config()
+        self.viewer = preview.RealSenseViewer(SimpleNamespace(config=None, camera_calibration=None))
+        self.viewer.rr = Mock()
+        self.viewer.pointcloud_config = self.runtime.pointcloud
+        self.viewer.table = self.runtime.environment.table
+        self.viewer.calibration = None
+        self.viewer.table_plane_abcd = None
+        self.viewer.camera = Mock(active_serial="camera")
+        self.viewer.camera.depth_scale_m = 0.001
+        self.viewer.camera.read.return_value = SimpleNamespace(
             rgb=np.zeros((2, 2, 3), dtype=np.uint8),
             depth=np.ones((2, 2), dtype=np.uint16),
             timestamp_ns=1,
         )
-        example.load_pointcloud_geometry = Mock(return_value=(np.eye(4), None))
-        keys = Mock(healthy=True, estop_latched=False)
-        keys.poll.side_effect = [["p"], ["s"], ["p"], ["p"], ["r"], ["q"]]
-        with ExitStack() as stack:
-            for name in (
-                "log_camera_geometry", "log_rgbd", "log_points", "log_series",
-                "viewer_blueprint", "validate_aligned_depth_distortion",
-            ):
-                stack.enter_context(patch.object(preview, name))
-            stack.enter_context(patch.object(preview, "Keyboard", return_value=keys))
-            stack.enter_context(patch("builtins.print"))
-            raw = stack.enter_context(patch.object(preview, "build_raw_point_cloud", return_value=np.empty((0, 6))))
-            processed = stack.enter_context(patch.object(preview, "build_point_cloud", return_value=np.empty((0, 6))))
-            self.assertEqual(example.capture(allow_exposure_changes=False), "user_exit")
-        self.assertEqual(raw.call_count, 2)
-        processed.assert_called_once()
+        self.keys = Mock(healthy=True, estop_latched=False)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        for name in (
+            "log_camera_geometry", "log_rgbd", "log_points", "log_series",
+            "viewer_blueprint", "validate_aligned_depth_distortion",
+        ):
+            stack.enter_context(patch.object(preview, name))
+        stack.enter_context(patch.object(preview, "Keyboard", return_value=self.keys))
+        stack.enter_context(patch("builtins.print"))
+        self.raw = stack.enter_context(patch.object(preview, "build_raw_point_cloud", return_value=None))
+        self.processor = stack.enter_context(patch.object(preview, "PointCloudProcessor"))
+        self.processor.return_value.process.return_value = None
+
+    def test_geometry_is_cached_and_raw_does_not_require_table(self):
+        transform, plane = np.eye(4), (0.0, 0.0, 1.0, 0.0)
+        with (
+            patch.object(self.preview, "load_camera_extrinsics") as calibration,
+            patch.object(self.preview, "resolve_table_plane", return_value=plane) as resolve,
+        ):
+            calibration.return_value = {"camera": transform}
+            np.testing.assert_array_equal(self.viewer.load_pointcloud_geometry("raw", "camera")[0], transform)
+            resolve.assert_not_called()
+            self.assertEqual(self.viewer.load_pointcloud_geometry("processed", "camera")[1], plane)
+            self.assertEqual(self.viewer.load_pointcloud_geometry("processed", "camera")[1], plane)
+            resolve.assert_called_once_with(self.runtime.environment.table)
+            calibration.assert_called_once_with(None)
+
+    def test_cloud_toggle_mode_and_reset_share_geometry_state(self):
+        self.viewer.load_pointcloud_geometry = Mock(return_value=(np.eye(4), None))
+        self.keys.poll.side_effect = [["p"], ["s"], ["p"], ["p"], ["r"], ["q"]]
+        self.assertIsNone(self.viewer.capture(allow_exposure_changes=False))
+        self.assertEqual(self.raw.call_count, 2)
+        self.processor.return_value.process.assert_called_once()
+        self.processor.assert_called_once()
         self.assertEqual(
-            [call.args for call in example.load_pointcloud_geometry.call_args_list],
+            [call.args for call in self.viewer.load_pointcloud_geometry.call_args_list],
             [("processed", "camera"), ("raw", "camera"), ("raw", "camera")],
         )
-        keys.stop.assert_called_once()
-        example.rr.disconnect.assert_called_once()
+        self.keys.stop.assert_called_once()
+        self.viewer.rr.disconnect.assert_called_once()
+
+    def test_capture_errors_propagate_and_close_viewer(self):
+        self.viewer.load_pointcloud_geometry = Mock(return_value=(np.eye(4), None))
+        for operation, keys, error in (
+            (self.viewer.load_pointcloud_geometry, ["p"], OSError("calibration failed")),
+            (self.viewer.camera.read, [], RuntimeError("camera failed")),
+            (self.raw, ["p", "s"], ValueError("raw cloud failed")),
+            (self.processor.return_value.process, ["p"], ValueError("processed cloud failed")),
+        ):
+            with self.subTest(error=error):
+                self.keys.poll.side_effect = [keys, ["q"]]
+                self.keys.stop.reset_mock()
+                self.viewer.rr.disconnect.reset_mock()
+                operation.side_effect = error
+                try:
+                    with self.assertRaises(type(error)) as raised:
+                        self.viewer.capture(allow_exposure_changes=False)
+                finally:
+                    operation.side_effect = None
+                self.assertIs(raised.exception, error)
+                self.keys.stop.assert_called_once()
+                self.viewer.rr.disconnect.assert_called_once()
+
+    def test_run_restores_exposure_and_reports_failures(self):
+        camera = self.viewer.camera
+        for error, restored, status in (
+            (None, 1.0, 0),
+            (RuntimeError("capture failed"), 1.0, 1),
+            (ValueError("invalid geometry"), 1.0, None),
+            (None, None, 1),
+            (None, OSError("restore failed"), 1),
+        ):
+            with (
+                self.subTest(error=error, restored=restored),
+                patch.dict("sys.modules", {"rerun": self.viewer.rr}),
+                patch("dexmani_real.sensor.realsense.RealSenseCamera", return_value=camera),
+                patch.object(self.preview, "list_cameras", return_value=[{}]),
+                patch.object(self.preview, "configure_logging"),
+                patch.object(self.preview, "get_ae_priority", return_value=1.0),
+                patch.object(self.preview, "set_ae_priority", side_effect=[0.0, restored]) as priority,
+                patch.object(self.viewer, "capture", side_effect=error),
+            ):
+                camera.reset_mock()
+                if isinstance(error, ValueError):
+                    with self.assertRaises(ValueError) as raised:
+                        self.viewer.run()
+                    self.assertIs(raised.exception, error)
+                else:
+                    self.assertEqual(self.viewer.run(), status)
+                self.assertEqual([call.args for call in priority.call_args_list], [(camera, 0.0), (camera, 1.0)])
+                camera.disconnect.assert_called_once()
+
+    def test_exposure_read_failure_is_not_treated_as_unsupported(self):
+        sensor = self.viewer.camera.color_sensor
+        sensor.supports.return_value = True
+        sensor.get_option.side_effect = RuntimeError("sensor read failed")
+        sdk = SimpleNamespace(option=SimpleNamespace(auto_exposure_priority=1))
+        with patch.dict("sys.modules", {"pyrealsense2": sdk}):
+            with self.assertRaisesRegex(RuntimeError, "sensor read failed"):
+                self.preview.get_ae_priority(self.viewer.camera)
+            sensor.supports.return_value = False
+            self.assertIsNone(self.preview.get_ae_priority(self.viewer.camera))
 
 
 class JogTests(unittest.TestCase):

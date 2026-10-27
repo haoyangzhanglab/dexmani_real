@@ -59,9 +59,13 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 IK 保留上一命令、实测状态及正负零空间初值；评分只使用关节距离和限位惩罚，搜索权重与步长固定在算法模块。位姿误差用于容差准入，SVD 只用于生成零空间方向。候选 FK 同时用于误差和工作空间检查，碰撞模型统一管理自碰撞、静态障碍和可选桌面。`HomePlanner(environment, arm, table_plane_abcd=...)` 与执行器共用 `ArmConfig` 的运行限位和到位容差，桌面间隙参数由 `EnvironmentConfig` 提供；`plan(current, target)` 保留三种关节路径、1° 采样及绝对等价分支对齐。无需移动的 HOME 仍检查几何约束，并由实测反馈确认停稳。
 
-`geometry` 中，`camera.py` 负责内参与反投影，`pose.py` 负责位姿与刚体变换，`kinematics.py` 提供 `ArmFK`、`HandFK`，`plane.py` 拟合桌面。`perception/pointcloud.py` 将 RGB-D 经深度边缘过滤、工作空间与桌面裁剪、体素均值、半径去噪和 QuickFPS 转为基座系 XYZRGB；`hand.py` 生成指尖与固定手表面点云，`worker.py` 发布在线点云。诊断快照与性能测量位于 `scripts/tools/view_pointcloud.py`。
+`geometry` 中，`camera.py` 负责内参与反投影，`pose.py` 负责位姿与刚体变换，`kinematics.py` 提供 `ArmFK`、`HandFK` 和批量 `eef_poses`，`plane.py` 拟合桌面。`perception/pointcloud.py` 的 `PointCloudProcessor` 在初始化时计算基座系射线和桌面高度系数，逐帧通过 `process(depth_raw, color)` 完成深度过滤、裁剪、体素均值、半径去噪和 QuickFPS。每个相机或 episode 复用一个处理器，几何参数变化时重新构造。`hand_cloud.py` 提供 `HandPointCloud(hand_fk, num_points)` 和 `hand_geometry`，指尖与手点云每行共用一次 FK；`worker.py` 发布在线点云。
 
-点云参数集中在 `perception/config.py`。`table_margin_m` 是点到向上桌面平面的最小距离，默认 7 mm；该范围内的低矮物体表面也会被裁掉。点数不足时循环已有点，空点云不发布。Canonical 保存完整实验参数，部署按保存参数恢复；参数缺失或与当前定义不符时，须重新导出数据并重新训练受影响的 checkpoint。诊断快照直接写入独立目录，失败时可能保留部分文件。
+`perception/config.py` 只保留点云点数、工作空间、桌面开关与余量，以及手点云点数。`table_margin_m` 是点到向上桌面平面的最小距离，默认 7 mm；该范围内的低矮物体表面也会被裁掉。深度范围 0.30–1.50 m、断层阈值 30 mm、表面带宽 8 mm、体素 5 mm、去噪半径 12 mm 和最少 6 个邻居固定在算法模块。点数不足时循环已有点，空点云在线不发布、离线导出报错。
+
+手表面按当前 XHand URDF 的单个本地网格、零 visual 位姿和内嵌颜色读取，这些资产前提由测试检查；采样按面积分配，按 link 顺序使用从 0 开始的固定种子。Canonical 从每个 episode 的相机快照统一派生点云与相机参数，并保存保留的实验参数，部署按保存参数恢复。包含已删除过滤参数或 `seed` 的旧配方不兼容，须重新导出数据并重新训练受影响的 checkpoint；未知 YAML 参数直接报错。
+
+`scripts/tools/view_pointcloud.py` 提供诊断快照与性能测量；快照直接写入独立目录，失败时可能保留部分文件。`scripts/tools/view_realsense.py` 提供实时预览，点云计算、标定读取或设备故障会退出并报告失败；退出时停止键盘监听、断开 viewer、恢复原曝光优先级并断开相机，恢复失败也会报告失败。
 
 单阈值裁剪对桌面标定残差更敏感。可根据实验物体高度和当前标定调整 YAML 中的 `pointcloud.table_margin_m`；增大余量会减少桌面残留，也会裁掉更多低矮表面。离线导出和查看在配置入口校验手部安装位姿，指尖名称与 SDK→URDF 关节顺序由 `HandFK` 核对。
 
@@ -175,7 +179,7 @@ mypy 按现有类型标注检查上述模块，不检查未标注函数体或外
 
 `tests/test_teleop.py` 检查 VR 映射、EMA 提交时机、TAG 梯度、DexPilot 数值等价及求解错误传播，并用假设备和播放器覆盖停止、录制收尾与音频抢占；还需遥操作原有的 NLopt 和 dex_retargeting 依赖。
 
-`tests/test_geometry.py` 与 `tests/test_perception.py` 检查坐标约定、畸变反投影、桌面拟合、采样以及在线和离线几何一致性；导出测试使用实际 HDF5、视频和 Zarr，覆盖完整参数恢复、坏数据立即报错和显式排除。`tests/test_sensor.py` 使用假 SDK 检查来源时间、去重、停滞、资源释放和 VR 接收；`tests/test_data.py` 检查批量写盘、失败保留、显式丢弃及发布超时。
+`tests/test_geometry.py` 与 `tests/test_perception.py` 检查坐标约定、批量旋转、畸变反投影、桌面拟合、XHand 资产前提、固定采样以及在线和离线几何一致性；导出测试使用实际 HDF5、视频和 Zarr，覆盖参数恢复、字段完整性、坏数据立即报错和显式排除。`tests/test_runtime.py` 覆盖实时预览模式切换、异常退出与曝光恢复；`tests/test_sensor.py` 使用假 SDK 检查来源时间、去重、停滞、资源释放和 VR 接收；`tests/test_data.py` 检查批量写盘、失败保留、显式丢弃及发布超时。
 
 `tests/test_deployment.py` 使用假设备和可控模型结果检查三种调度、LAMP 历史、来源期限、初始化失败、迟到推理和收尾，核对 checkpoint 选择、配置恢复与实验结果字段，并通过已安装的 `dexmani_policy` 验证策略输入边界。`tests/test_utils.py` 检查原子写入和计时超期；这些测试均不连接硬件。
 

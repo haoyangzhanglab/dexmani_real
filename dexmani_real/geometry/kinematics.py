@@ -58,12 +58,14 @@ class HandFK:
     def forward(self, qpos: np.ndarray, frame_ids) -> np.ndarray:
         q = np.asarray(qpos, dtype=np.float64)[SDK_TO_URDF_IDX]
         self.pin.forwardKinematics(self.model, self.data, q)
-        self.pin.updateFramePlacements(self.model, self.data)
-        # link 使用 frame placement，返回副本以免后续 FK 覆盖。
-        return np.stack([self.data.oMf[int(fid)].homogeneous for fid in frame_ids])
+        # stack 复制 placement，避免后续 FK 覆盖结果。
+        return np.stack([
+            self.pin.updateFramePlacement(self.model, self.data, int(fid)).homogeneous
+            for fid in frame_ids
+        ])
 
 
-def eef_pose_sequence(arm_qpos: np.ndarray, *, arm_fk: ArmFK | None = None) -> np.ndarray:
+def eef_poses(arm_qpos: np.ndarray, *, arm_fk: ArmFK | None = None) -> np.ndarray:
     """返回 float64[T,9]，依次为基座系 XYZ 和旋转矩阵前两列。"""
     fk = ArmFK() if arm_fk is None else arm_fk
     poses = np.empty((len(arm_qpos), 9), dtype=np.float64)
