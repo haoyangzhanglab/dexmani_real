@@ -244,6 +244,7 @@ class HomeGeometryTests(unittest.TestCase):
         self.path = np.array([np.full(7, value) for value in (0, 0.01, 0.02)])
         self.planner = SimpleNamespace(
             arm=ArmConfig(),
+            environment=EnvironmentConfig(),
             limits=np.array([[-1.0, 1.0]] * 7),
             workspace_bounds=np.array([[-1.0, 1.0]] * 3),
             arm_fk=SimpleNamespace(forward=Mock(return_value=(np.zeros(3), np.zeros(6)))),
@@ -260,6 +261,17 @@ class HomeGeometryTests(unittest.TestCase):
             self.planner,
             allow_table_soft_escape=escape,
         )
+
+    def test_table_proxy_uses_environment_height_and_margin(self):
+        self.planner.collision_model.table = None
+        self.planner.collision_model.minimum_hand_frame_z = Mock(return_value=0.12)
+        self.planner.environment = replace(
+            self.planner.environment, table_z_surface_m=0.03, hand_safety_margin_m=0.06
+        )
+        clearance, measurement, source = homing.table_clearance_m(self.planner, np.zeros(7))
+        self.assertAlmostEqual(clearance, 0.03)
+        self.assertEqual(measurement, 0.12)
+        self.assertEqual(source, "hand_frame_proxy")
 
     def test_soft_escape_requires_monotonic_clearance_and_no_mesh_collision(self):
         self.check_path()

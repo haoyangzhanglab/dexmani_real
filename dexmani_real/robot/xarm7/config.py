@@ -50,9 +50,6 @@ class ArmConfig:
 
     ip: str = "192.168.1.111"
 
-    table_z_surface_m: float = 0.022
-    hand_safety_margin_m: float = 0.05
-
     collision_sensitivity: int = 0  # 0 关闭控制器碰撞检测。
 
     tcp_load_mass_kg: float = 1.1
@@ -86,10 +83,6 @@ class ArmConfig:
             raise ValueError("home_qpos must be within joint limits")
         if not self.ip:
             raise ValueError("arm ip must be non-empty")
-        if not np.isfinite(self.table_z_surface_m):
-            raise ValueError("table_z_surface_m must be finite")
-        if not np.isfinite(self.hand_safety_margin_m) or self.hand_safety_margin_m < 0:
-            raise ValueError("hand_safety_margin_m must be finite and non-negative")
         if not (0 <= self.collision_sensitivity <= 5):
             raise ValueError(
                 f"collision_sensitivity={self.collision_sensitivity} out of range [0, 5]"

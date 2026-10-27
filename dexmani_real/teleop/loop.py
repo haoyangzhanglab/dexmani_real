@@ -2,7 +2,6 @@
 
 import logging
 import time
-from concurrent.futures import CancelledError
 from enum import Enum
 
 from dexmani_real.data.recorder import (
@@ -230,7 +229,7 @@ class TeleopLoop:
                 ),
             )
             issues, _ = self.admit_observation(row)
-        except CancelledError:
+        except OperationCancelled:
             if self.phase is TeleopPhase.PREPARING:
                 self.abort_episode("preparation_revoked")
             return
@@ -291,7 +290,7 @@ class TeleopLoop:
             try:
                 logger.info("正在请求触觉传感器复位，请保持手部无接触；S/Q/Esc 可中断后续请求。")
                 self.robot.reset_tactile_sensors(cancel_requested=self.poll_blocking_commands)
-            except CancelledError as exc:
+            except OperationCancelled as exc:
                 logger.info("%s", exc)
             finally:
                 self.keyboard.discard_events("t", "b")

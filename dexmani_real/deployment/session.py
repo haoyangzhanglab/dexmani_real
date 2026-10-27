@@ -3,7 +3,6 @@
 import logging
 import multiprocessing as mp
 import time
-from concurrent.futures import CancelledError
 from itertools import count
 
 from dexmani_real.calibration.camera.extrinsics import (
@@ -24,8 +23,8 @@ from dexmani_real.deployment.observation import (
 )
 from dexmani_real.deployment.rollout import PolicyRollout, failure_reason
 from dexmani_real.ipc.sensors import SensorChannels
-from dexmani_real.robot.commands import RobotError
-from dexmani_real.robot.system import DexManiRobot
+from dexmani_real.robot.commands import OperationCancelled, RobotError
+from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
@@ -40,7 +39,7 @@ from dexmani_real.runtime.observation import (
     snapshot_camera_parameters,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
-from dexmani_real.sensor.camera import run_camera_worker
+from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.atomic_io import atomic_yaml_dump
 from dexmani_real.utils.log import configure_logging
 
@@ -172,7 +171,7 @@ class PolicySession:
             else None
         )
         self.sensors = SensorWorkers(channels)
-        self.robot = DexManiRobot(
+        self.robot = Robot(
             self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
             stop_signal=self.runtime_state.stop_signal,
             emergency_signal=self.runtime_state.emergency_signal,
@@ -252,7 +251,7 @@ class PolicySession:
             self.sensors.start(
                 self.process_context.Process(
                     name="camera",
-                    target=run_camera_worker,
+                    target=run_camera,
                     args=(self.sensors.channels, self.runtime.camera),
                 ),
                 ready=self.sensors.channels.camera_ready,
@@ -466,7 +465,7 @@ class PolicySession:
                         "正在请求触觉传感器复位，请保持手部无接触；S/Q/Esc 可中断后续请求。"
                     )
                     self.robot.reset_tactile_sensors(cancel_requested=self.home_abort_requested)
-                except CancelledError as exc:
+                except OperationCancelled as exc:
                     logger.info("%s", exc)
                 finally:
                     self.keyboard.discard_events("t", "h", "b")

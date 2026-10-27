@@ -10,27 +10,28 @@ import numpy as np
 
 from dexmani_real.config import load_experiment_config
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
-from dexmani_real.robot.system import DexManiRobot
+from dexmani_real.robot.system import Robot
 from dexmani_real.robot.xarm7 import worker
-from dexmani_real.robot.xarm7.client import ArmClient
 from dexmani_real.robot.xarm7.config import ArmConfig
 from dexmani_real.robot.xarm7.driver import XArm7
+from dexmani_real.robot.xarm7.process import ArmProcess
 from dexmani_real.robot.xarm7.protocol import (
     GOAL_DTYPE,
     HomeRequest,
     LifecycleReply,
     PrepareRequest,
 )
-from dexmani_real.robot.xarm7.reference import ArmReference
+from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
 from dexmani_real.robot.xhand import driver as hand_driver
 from dexmani_real.robot.xhand.config import HandConfig
 from dexmani_real.robot.xhand.feedback import XHandFeedback, XHandState
 from dexmani_real.runtime.preflight import validate_robot_config
+from scripts.tools.control_xhand import XHandControlExample
 
 
-def make_client():
+def make_arm_process():
     ctx = mp.get_context("spawn")
-    return ArmClient(
+    return ArmProcess(
         ArmConfig(),
         run_signal=ctx.Value("q", 1),
         stop_signal=ctx.Event(),
@@ -61,7 +62,7 @@ class ArmTests(unittest.TestCase):
             patcher = patch.object(worker.time, name, getattr(self.clock, name))
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.client = make_client()
+        self.client = make_arm_process()
         self.addCleanup(self.client.pipe.close)
         self.addCleanup(self.client.child_pipe.close)
         self.io = self.client.io
@@ -74,10 +75,10 @@ class ArmTests(unittest.TestCase):
         status["frame"]["qpos"] = self.qpos
         status["frame"]["timestamp_ns"] = self.clock.ns
         status["valid"], status["prepared_run_id"] = True, 1
-        self.io.publish(status)
+        self.io.publish_status(status)
         self.reference = Mock()
-        self.reference.sample.return_value = (self.qpos.copy(), np.zeros(7), np.zeros(7))
-        patcher = patch.object(worker, "ArmReference", return_value=self.reference)
+        self.reference.step.return_value = self.qpos.copy()
+        patcher = patch.object(worker, "ArmTrajectory", return_value=self.reference)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -103,21 +104,17 @@ class ArmTests(unittest.TestCase):
 
     def test_checks_are_repeated_after_reference_computation(self):
         self.publish_goal()
-        self.reference.sample.side_effect = lambda now: (
-            self.io.stop.set() or self.qpos.copy(),
-            np.zeros(7),
-            np.zeros(7),
-        )
+        self.reference.step.side_effect = lambda *args: self.io.stop.set() or self.qpos.copy()
         self.controller.tick()
         self.driver.servo.assert_not_called()
 
     def test_reference_and_sdk_stalls_do_not_trigger_catchup_sends(self):
         self.publish_goal()
-        self.reference.replace.side_effect = lambda *args: self.clock.sleep(0.03)
+        self.reference.step.side_effect = lambda *args: self.clock.sleep(0.03) or self.qpos.copy()
         with self.assertRaisesRegex(RuntimeError, "stalled"):
             self.controller.tick()
         self.driver.servo.assert_not_called()
-        self.reference.replace.side_effect = None
+        self.reference.step.side_effect = None
         self.controller.active = None
         self.publish_goal()
         self.driver.servo.side_effect = lambda q: self.clock.sleep(0.03)
@@ -131,7 +128,7 @@ class ArmTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "arm_feedback_expired"):
             self.controller.tick()
         self.controller.status["frame"]["timestamp_ns"] = self.clock.ns
-        self.reference.sample.return_value = (self.qpos + 0.5, np.zeros(7), np.zeros(7))
+        self.reference.step.return_value = self.qpos + 0.5
         self.publish_goal()
         with self.assertRaisesRegex(RuntimeError, "tracking_error"):
             self.controller.tick()
@@ -230,6 +227,43 @@ class ArmTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     driver.stop()
 
+    def test_full_slot_preserves_previous_command_and_sequence(self):
+        self.client.process = Mock(is_alive=Mock(return_value=True))
+        first = RobotCommand(1, self.qpos, input_generation=3)
+        second = RobotCommand(1, self.qpos + 0.01, input_generation=3)
+        deadlines = dict(submit_until_ns=2_000_000_000, execute_until_ns=2_000_000_000)
+        self.client.submit(first, **deadlines)
+        with self.assertRaisesRegex(RuntimeError, "slot is full"):
+            self.client.submit(second, **deadlines)
+        self.assertEqual(self.client.sequence, 1)
+        np.testing.assert_array_equal(self.io.take_goal()["q_goal"], first.arm_qpos)
+
+    def test_cancellation_while_waiting_for_publication_lock_leaves_slot_empty(self):
+        self.client.process = Mock(is_alive=Mock(return_value=True))
+        lock = Mock()
+        lock.__enter__ = Mock(side_effect=self.io.stop.set)
+        lock.__exit__ = Mock(return_value=False)
+        with patch.object(self.io, "goal_lock", lock):
+            with self.assertRaises(OperationCancelled):
+                self.client.submit(
+                    RobotCommand(1, self.qpos, input_generation=3),
+                    submit_until_ns=2_000_000_000,
+                    execute_until_ns=2_000_000_000,
+                )
+        self.assertEqual(self.client.sequence, 0)
+        self.assertIsNone(self.io.take_goal())
+
+    def test_encoding_failure_does_not_publish_or_advance_sequence(self):
+        self.client.process = Mock(is_alive=Mock(return_value=True))
+        with self.assertRaises(ValueError):
+            self.client.submit(
+                RobotCommand(1, np.zeros(8), input_generation=3),
+                submit_until_ns=2_000_000_000,
+                execute_until_ns=2_000_000_000,
+            )
+        self.assertEqual(self.client.sequence, 0)
+        self.assertIsNone(self.io.take_goal())
+
     def test_cancelled_operation_is_drained_before_reuse(self):
         self.client.process = Mock(is_alive=Mock(return_value=True))
         self.client.pipe = Mock(poll=Mock(return_value=False))
@@ -270,20 +304,20 @@ class ArmTests(unittest.TestCase):
         self.assertTrue(self.io.stop.is_set())
 
 
-class ReferenceTests(unittest.TestCase):
+class TrajectoryTests(unittest.TestCase):
     def test_retargeting_preserves_position_velocity_and_duplicate_trajectory(self):
         cfg = ArmConfig()
         q = np.asarray(cfg.home_qpos)
-        reference = ArmReference(cfg, q, np.zeros(7), 1_000_000_000)
-        reference.replace(q + 0.1, 1_000_000_000)
+        reference = ArmTrajectory(cfg, q, np.zeros(7), 1_000_000_000)
+        reference.step(1_000_000_000, q + 0.1)
         now = 1_050_000_000
-        position, velocity, _ = reference.sample(now)
-        reference.replace(q - 0.1, now)
-        updated_position, updated_velocity, _ = reference.sample(now)
+        position = reference.step(now).copy()
+        velocity = reference.v.copy()
+        updated_position = reference.step(now, q - 0.1)
         np.testing.assert_allclose(updated_position, position)
-        np.testing.assert_allclose(updated_velocity, velocity)
+        np.testing.assert_allclose(reference.v, velocity)
         trajectory = reference.trajectory
-        reference.replace(q - 0.1, now + 10_000_000)
+        reference.step(now + 10_000_000, q - 0.1)
         self.assertIs(reference.trajectory, trajectory)
 
     def test_braking_extrema_cannot_leave_joint_limits(self):
@@ -293,7 +327,21 @@ class ReferenceTests(unittest.TestCase):
         velocity = np.zeros(7)
         velocity[0] = 1
         with self.assertRaisesRegex(ValueError, "extremum"):
-            ArmReference(cfg, q, velocity, 1_000_000_000)
+            ArmTrajectory(cfg, q, velocity, 1_000_000_000)
+
+    def test_retargeting_matches_a_single_sample_of_previous_trajectory(self):
+        cfg = ArmConfig()
+        q = np.asarray(cfg.home_qpos)
+        reference = ArmTrajectory(cfg, q, np.zeros(7), 1_000_000_000)
+        reference.step(1_000_000_000, q + 0.1)
+        previous = reference.trajectory
+        expected_q, expected_v, _ = previous.at_time(0.05)
+        sampled = Mock(wraps=previous)
+        reference.trajectory = sampled
+        actual = reference.step(1_050_000_000, q - 0.1)
+        sampled.at_time.assert_called_once_with(0.05)
+        np.testing.assert_allclose(actual, expected_q)
+        np.testing.assert_allclose(reference.v, expected_v)
 
 
 def sdk_error(code=0):
@@ -322,7 +370,6 @@ class HandTests(unittest.TestCase):
     def make_hand(self, **overrides):
         hand = hand_driver.XHand(replace(HandConfig(), **overrides))
         hand.control = Mock()
-        hand.captured_sdk_call = lambda label, call, **kwargs: (call(), "")
         return hand
 
     def test_both_transports_open_once_and_support_discovery(self):
@@ -386,6 +433,64 @@ class HandTests(unittest.TestCase):
             self.assertTrue(np.isnan(state.tactile_dense).all())
             self.assertEqual(np.isfinite(state.tactile_aggregate).all(), transport == "serial")
 
+    def test_tip_diagnostics_report_changes_and_keep_per_finger_masking(self):
+        hand = self.make_hand()
+        hand.connected_flag = True
+        raw = raw_hand_state()
+        finger_id = hand_driver.XHAND_TACTILE_SENSOR_FINGER_IDS[0]
+        raw.finger_state[finger_id].tipboard_err = 201
+        hand.control.read_state.return_value = (sdk_error(), raw)
+        with self.assertLogs(hand_driver.logger, level="WARNING") as logs:
+            state = hand.get_state()
+            hand.get_state()
+            raw.finger_state[finger_id].tipboard_err = 0
+            hand.get_state()
+            raw.finger_state[finger_id].tipboard_err = 201
+            hand.get_state()
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn(f"tip[{finger_id}]=201", logs.output[0])
+        self.assertTrue(np.isnan(state.tactile_dense[0]).all())
+        self.assertTrue(np.isfinite(state.tactile_dense[1:]).all())
+        self.assertTrue(np.isfinite(state.tactile_aggregate).all())
+
+    def test_float32_overflow_holds_previous_tactile_vector_and_source_time(self):
+        hand = self.make_hand()
+        hand.connected_flag = True
+        raw = raw_hand_state()
+        hand.control.read_state.return_value = (sdk_error(), raw)
+        feedback = XHandFeedback(hand.cfg)
+        start = 1_000_000_000
+        feedback.reset(start)
+        first = feedback.consume(hand.get_state(), source_ns=start, now_ns=start)
+        raw.sensor_data[0].raw_force[0] = SimpleNamespace(fx=1e50, fy=2.0, fz=3.0)
+        state = hand.get_state()
+        self.assertEqual(state.tactile_dense.dtype, np.float32)
+        self.assertEqual(state.tactile_aggregate.dtype, np.float32)
+        with self.assertLogs("dexmani_real.robot.xhand.feedback"):
+            frame = feedback.consume(state, source_ns=start + 20_000_000, now_ns=start + 20_000_000)
+        np.testing.assert_array_equal(frame["tactile_dense"], first["tactile_dense"])
+        self.assertEqual(frame["tactile_dense_timestamp_ns"][0], start)
+        self.assertEqual(frame["timestamp_ns"][0], start + 20_000_000)
+
+    def test_initialization_and_partial_reset_use_operation_cancelled(self):
+        hand = self.make_hand()
+        hand.connected_flag = True
+        with self.assertRaises(OperationCancelled):
+            hand.initialize_command(cancel_requested=lambda: True)
+        hand.control.read_state.assert_not_called()
+        hand.control.reset_sensor.return_value = sdk_error()
+        with self.assertRaises(OperationCancelled):
+            hand.reset_tactile_sensors(cancel_requested=Mock(side_effect=[False, True]))
+        hand.control.reset_sensor.assert_called_once()
+        self.assertEqual(hand.get_tactile_reset_metadata()["hand_tactile_reset_result"], "cancelled (1/5)")
+
+    def test_diagnostic_cancellation_prevents_sdk_read(self):
+        hand = XHandControlExample(HandConfig(), cancel_requested=lambda: True)
+        hand.get_state = Mock()
+        with self.assertRaises(OperationCancelled):
+            hand.read_action_positions()
+        hand.get_state.assert_not_called()
+
     def test_stop_retries_crc_only_until_deadline(self):
         hand = self.make_hand()
         hand.connected_flag = True
@@ -440,8 +545,8 @@ class HandTests(unittest.TestCase):
         state = XHandState(
             np.zeros(12),
             np.zeros(12),
-            np.ones((5, 3)),
-            np.ones((5, 120, 3)),
+            np.ones((5, 3), dtype=np.float32),
+            np.ones((5, 120, 3), dtype=np.float32),
             np.zeros(12),
             np.zeros(12),
             np.zeros(12),
@@ -462,10 +567,10 @@ class HandTests(unittest.TestCase):
 
 class RobotBoundaryTests(unittest.TestCase):
     def setUp(self):
-        client = make_client()
+        client = make_arm_process()
         self.addCleanup(client.pipe.close)
         self.addCleanup(client.child_pipe.close)
-        self.robot = DexManiRobot(
+        self.robot = Robot(
             ArmConfig(),
             HandConfig(),
             run_signal=client.io.run_id,
@@ -503,6 +608,33 @@ class RobotBoundaryTests(unittest.TestCase):
         arm.close.assert_called_once()
         hand.disconnect.assert_called_once()
         self.assertTrue(self.robot.stop_required)
+
+    def test_arm_close_failure_keeps_handle_and_still_disconnects_hand(self):
+        arm, hand = self.robot.arm, self.robot.hand
+        arm.close.side_effect = OSError("arm close failed")
+        with self.assertRaisesRegex(RobotError, "arm close failed"):
+            self.robot.close()
+        self.assertIs(self.robot.arm, arm)
+        self.assertIsNone(self.robot.hand)
+        hand.stop.assert_called()
+        hand.disconnect.assert_called_once()
+        self.assertTrue(self.robot.stop_required)
+
+    def test_initial_feedback_cancellation_does_not_query_devices(self):
+        with self.assertRaises(OperationCancelled):
+            self.robot.read_initial_state(cancel_requested=lambda: True)
+        self.robot.arm.snapshot.assert_not_called()
+        self.robot.hand.get_state.assert_not_called()
+
+    def test_environment_table_geometry_configuration(self):
+        changes = {"table_z_surface_m": 0.03, "hand_safety_margin_m": 0.06}
+        cfg = load_experiment_config(cli_overrides={f"environment.{k}": v for k, v in changes.items()})
+        validate_robot_config(cfg)
+        for name, value in changes.items():
+            self.assertEqual(getattr(cfg.environment, name), value)
+        for name, value in (("table_z_surface_m", float("nan")), ("hand_safety_margin_m", -0.01)):
+            with self.assertRaises(ValueError):
+                validate_robot_config(load_experiment_config(cli_overrides={f"environment.{name}": value}))
 
     def test_unknown_configuration_keys_are_rejected(self):
         for section in ("arm", "arm.homing", "hand", "motion", "environment"):

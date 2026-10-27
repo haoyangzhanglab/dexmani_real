@@ -17,14 +17,14 @@ from dexmani_real.calibration.vr_heading import VRCalibration, estimate_heading
 from dexmani_real.geometry.pose import forward_from_quat_wxyz
 from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.runtime.lifecycle import (
-    SensorWorkers,
     VR_READY_TIMEOUT_S,
+    SensorWorkers,
     close_runtime,
 )
 from dexmani_real.runtime.observation import read_vr_frame
 from dexmani_real.runtime.state import SessionState
 from dexmani_real.sensor.config import VRConfig
-from dexmani_real.sensor.vr import run_vr_worker
+from dexmani_real.sensor.vr import run_vr
 from dexmani_real.teleop.audio import AudioFeedback
 from dexmani_real.utils.atomic_io import atomic_json_dump
 
@@ -171,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
     channels = SensorChannels(ctx, vr=True)
     sensors = SensorWorkers(channels)
     vr_proc = ctx.Process(
-        name="vr", target=run_vr_worker, args=(channels, vr_config), daemon=True
+        name="vr", target=run_vr, args=(channels, vr_config), daemon=True
     )
     forwards: list[np.ndarray] = []
     stale_count = 0

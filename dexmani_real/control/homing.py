@@ -33,6 +33,7 @@ class HomePlanner:
         table_plane_abcd: tuple[float, float, float, float] | None,
     ) -> None:
         self.arm = arm
+        self.environment = environment
         self.limits = np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper))
         self.workspace_bounds = environment.workspace.as_array()
         self.arm_fk = ArmFK()
@@ -78,7 +79,8 @@ def table_clearance_m(
         clearance_m = distance_m - float(collision_model.table.soft_clearance_m)
         return clearance_m, distance_m, "calibrated_mesh_distance"
     hand_min_z_m = float(collision_model.minimum_hand_frame_z(arm_qpos))
-    clearance_m = hand_min_z_m - planner.arm.hand_safety_margin_m - planner.arm.table_z_surface_m
+    environment = planner.environment
+    clearance_m = hand_min_z_m - environment.hand_safety_margin_m - environment.table_z_surface_m
     return clearance_m, hand_min_z_m, "hand_frame_proxy"
 
 

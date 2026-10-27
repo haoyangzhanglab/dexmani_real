@@ -15,7 +15,7 @@ from dexmani_real.runtime.keyboard import CARTESIAN_JOG_KEYS
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 
 if TYPE_CHECKING:
-    from dexmani_real.robot.system import DexManiRobot
+    from dexmani_real.robot.system import Robot
     from dexmani_real.runtime.keyboard import Keyboard
 
 
@@ -61,7 +61,7 @@ class JogController:
 
     def submit(
         self, pose: Pose, target: np.ndarray, keys: Keyboard, generation: int,
-        runtime_state: SessionState, robot: DexManiRobot, epoch: int, *,
+        runtime_state: SessionState, robot: Robot, epoch: int, *,
         valid_until_ns: int, execute_until_ns: int,
     ) -> bool:
         """约束输入代际与运行身份，仅在正常提交后更新目标参考。"""

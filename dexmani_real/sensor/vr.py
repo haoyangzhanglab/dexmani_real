@@ -18,16 +18,29 @@ def finite_vector(value, shape, name):
     return array
 
 
-def run_vr_worker(shared, config: VRConfig) -> None:
+def _pose_to_flu(pose):
+    from hand_tracking_sdk import unity_left_to_flu_position, unity_left_to_flu_rotation
+
+    position = finite_vector(unity_left_to_flu_position(pose.x, pose.y, pose.z), (3,), "position")
+    rotation = normalize_quat_wxyz(
+        xyzw_to_wxyz(unity_left_to_flu_rotation(pose.qx, pose.qy, pose.qz, pose.qw)),
+        name="quaternion",
+    )
+    return position, rotation
+
+
+def _landmarks_to_flu(points):
+    from hand_tracking_sdk import unity_left_to_flu_position
+
+    return finite_vector(
+        [unity_left_to_flu_position(*point) for point in points], (21, 3), "landmarks"
+    )
+
+
+def run_vr(shared, config: VRConfig) -> None:
     """接收 HTS 事件，保留头部状态并发布右手观测。"""
     configure_logging()
-    from hand_tracking_sdk import (
-        HandFrame,
-        HandSide,
-        HeadFrame,
-        unity_left_to_flu_position,
-        unity_left_to_flu_rotation,
-    )
+    from hand_tracking_sdk import HandFrame, HandSide, HeadFrame
 
     head_pos = np.full(3, np.nan)
     head_quat_wxyz = np.full(4, np.nan)
@@ -39,19 +52,7 @@ def run_vr_worker(shared, config: VRConfig) -> None:
                     break
                 if isinstance(event, HeadFrame):
                     try:
-                        position = finite_vector(
-                            unity_left_to_flu_position(event.head.x, event.head.y, event.head.z),
-                            (3,),
-                            "head_pos",
-                        )
-                        rotation = normalize_quat_wxyz(
-                            xyzw_to_wxyz(
-                                unity_left_to_flu_rotation(
-                                    event.head.qx, event.head.qy, event.head.qz, event.head.qw
-                                )
-                            ),
-                            name="head_quat_wxyz",
-                        )
+                        position, rotation = _pose_to_flu(event.head)
                     except ValueError:
                         logger.warning("Invalid VR head pose rejected", exc_info=True)
                         continue
@@ -61,21 +62,8 @@ def run_vr_worker(shared, config: VRConfig) -> None:
                 if not isinstance(event, HandFrame) or event.side != HandSide.RIGHT:
                     continue
                 try:
-                    wrist = event.wrist
-                    wrist_pos = finite_vector(
-                        unity_left_to_flu_position(wrist.x, wrist.y, wrist.z), (3,), "wrist_pos"
-                    )
-                    wrist_quat = normalize_quat_wxyz(
-                        xyzw_to_wxyz(
-                            unity_left_to_flu_rotation(wrist.qx, wrist.qy, wrist.qz, wrist.qw)
-                        ),
-                        name="wrist_quat_wxyz",
-                    )
-                    landmarks = finite_vector(
-                        [unity_left_to_flu_position(*p) for p in event.landmarks.points],
-                        (21, 3),
-                        "landmarks",
-                    )
+                    wrist_pos, wrist_quat = _pose_to_flu(event.wrist)
+                    landmarks = _landmarks_to_flu(event.landmarks.points)
                 except ValueError:
                     logger.warning("Invalid VR hand frame rejected", exc_info=True)
                     continue
@@ -125,7 +113,6 @@ def iter_vr_events(shared, config: VRConfig):
         receiver = TCPClientLineReceiver(
             TCPClientConfig(config.host, config.port, connect_timeout_s=1.0, read_timeout_s=1.0)
         )
-    # 发布时过滤左右手，保留 heading 标定需要的头部包。
     assembler = HandFrameAssembler(include_wall_time=False, include_head_frames=True)
     if not shared.is_running.value:
         return

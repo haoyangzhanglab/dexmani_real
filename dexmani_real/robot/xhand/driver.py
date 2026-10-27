@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import CancelledError
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
+from dexmani_real.robot.commands import OperationCancelled, validate_hand_target
 from dexmani_real.robot.model import (
     HAND_DOF,
     HAND_JOINT_SHAPE,
@@ -23,26 +23,17 @@ from dexmani_real.robot.xhand.config import (
     SERIAL_SETTLE_S,
     HandConfig,
 )
-from dexmani_real.robot.xhand.feedback import (
-    COMBINED_FORCE_UNAVAILABLE_CODE,
-    DISTRIBUTED_FORCE_UNAVAILABLE_CODE,
-    TEMPERATURE_UNAVAILABLE_CODE,
-    XHandState,
-    parse_joints,
-    parse_tactile_aggregate,
-    parse_tactile_dense,
-    tactile_validity,
-)
-from dexmani_real.utils.log import (
-    capture_native_stdout,
-    extract_native_diagnostics,
-)
+from dexmani_real.robot.xhand.feedback import XHandState
 
 logger = logging.getLogger(__name__)
 
 SDK_PROTOCOL = {"ethercat": "EtherCAT", "serial": "RS485"}
 INITIAL_STATE_READ_INTERVAL_S = 0.02
 COMMUNICATION_CRC_ERROR_CODE = 1_501_070
+COMBINED_FORCE_UNAVAILABLE_CODE = 1_501_018
+DISTRIBUTED_FORCE_UNAVAILABLE_CODE = 1_501_019
+TEMPERATURE_UNAVAILABLE_CODE = 1_501_020
+
 # 这些状态仍允许关节读写，触觉有效性单独判断。
 NONFATAL_SDK_CODES = frozenset(
     {
@@ -62,8 +53,74 @@ STOP_RETRY_INTERVAL_S = 0.01
 STOP_RETRY_TIMEOUT_S = 0.25
 
 
-def error_code(error: Any) -> int:
-    return int(error.error_code)
+def _tactile_validity(code: int, *, comm_type: str) -> tuple[bool, bool]:
+    """RS485 201 仅禁用 dense、202 不禁用触觉；EtherCAT 要求状态为零。"""
+    if comm_type == "ethercat":
+        return (code == 0, code == 0)
+    if code == 0:
+        return (True, True)
+    if code in (COMBINED_FORCE_UNAVAILABLE_CODE, 200):
+        return (False, False)
+    if code in (DISTRIBUTED_FORCE_UNAVAILABLE_CODE, 201):
+        return (True, False)
+    if code in (TEMPERATURE_UNAVAILABLE_CODE, 202):
+        return (True, True)
+    return (False, False)
+
+
+def _parse_joints(
+    state: Any,
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    qpos = np.full(HAND_JOINT_SHAPE, np.nan, dtype=np.float64)
+    current = np.full(HAND_JOINT_SHAPE, np.nan, dtype=np.float64)
+    errors = {
+        name: np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
+        for name in ("commboard_err", "jointboard_err", "tipboard_err")
+    }
+    seen: set[int] = set()
+    for joint in state.finger_state:
+        index = int(joint.id)
+        if index < 0 or index >= HAND_DOF or index in seen:
+            raise ValueError(f"invalid or duplicate joint id {index}")
+        seen.add(index)
+        qpos[index] = float(joint.position)
+        current[index] = float(getattr(joint, "torque", np.nan))
+        errors["commboard_err"][index] = int(joint.commboard_err)
+        # SDK 字段名实际拼写为 jonitboard_err。
+        errors["jointboard_err"][index] = int(joint.jonitboard_err)
+        errors["tipboard_err"][index] = int(joint.tipboard_err)
+    if len(seen) != HAND_DOF:
+        raise ValueError(f"{len(seen)}/{HAND_DOF} joints reported")
+    if not np.all(np.isfinite(qpos)):
+        raise ValueError("non-finite joint position feedback")
+    current[~np.isfinite(current)] = np.nan
+    return qpos, current, errors
+
+
+def _parse_tactile_aggregate(state: Any) -> np.ndarray:
+    force_aggregate = np.asarray(
+        [
+            [sensor.calc_force.fx, sensor.calc_force.fy, sensor.calc_force.fz]
+            for sensor in state.sensor_data
+        ],
+        dtype=np.float32,
+    )
+    if force_aggregate.shape != HAND_TACTILE_SUM_SHAPE:
+        raise ValueError("aggregate tactile must have shape [5,3]")
+    return force_aggregate
+
+
+def _parse_tactile_dense(state: Any) -> np.ndarray:
+    tactile_dense = np.asarray(
+        [
+            [[force.fx, force.fy, force.fz] for force in sensor.raw_force]
+            for sensor in state.sensor_data
+        ],
+        dtype=np.float32,
+    )
+    if tactile_dense.shape != HAND_TACTILE_FORCE_SHAPE:
+        raise ValueError("dense tactile must have shape [5,120,3]")
+    return tactile_dense
 
 
 class XHandError(RuntimeError):
@@ -81,6 +138,8 @@ class XHand:
         self.mechanical_upper = np.asarray(XHAND_RATED_QPOS_MAX_RAD, dtype=np.float64)
         self.connected_flag = False
         self.send_crc_started_ns: int | None = None
+        self.read_crc = False
+        self.previous_tip_errors: tuple[int, ...] = ()
         self.device_identity = {
             "backend": "hardware",
             "hand_type": "unavailable",
@@ -119,7 +178,7 @@ class XHand:
                     f"configured device_id={self.cfg.device_id} not found in {hand_ids}",
                 )
             self.read_identity()
-            return self.seed_command_history(cancel_requested=cancel_requested)
+            return self.initialize_command(cancel_requested=cancel_requested)
         except BaseException:
             try:
                 self.disconnect()
@@ -131,40 +190,17 @@ class XHand:
         self.control = self.sdk.XHandControl()
         device_name = self.cfg.device_name
         if device_name is None:
-            devices, _ = self.captured_sdk_call(
-                "discovery",
-                lambda: self.control.enumerate_devices(SDK_PROTOCOL[self.cfg.comm_type]),
-            )
+            devices = self.control.enumerate_devices(SDK_PROTOCOL[self.cfg.comm_type])
             if not devices:
                 raise XHandError("connect", -2, f"no device found for {self.cfg.comm_type}")
             device_name = devices[0]
 
         if self.cfg.comm_type == "serial":
-            open_call = lambda: self.control.open_serial(device_name, self.cfg.baudrate)
+            error = self.control.open_serial(device_name, self.cfg.baudrate)
         else:
-            open_call = lambda: self.control.open_ethercat(device_name)
-        error, output = self.captured_sdk_call(
-            "open", open_call, ignore=("Operation not permitted",)
-        )
-        if error_code(error) != 0:
-            raise XHandError("connect", error_code(error), error.error_message)
-        if "Operation not permitted" in output:
-            logger.warning("XHand real-time scheduling unavailable; using normal scheduling")
-
-    def captured_sdk_call(
-        self,
-        label: str,
-        call: Callable[[], Any],
-        *,
-        ignore: tuple[str, ...] = (),
-    ) -> tuple[Any, str]:
-        with capture_native_stdout() as capture:
-            result = call()
-        output = capture.text
-        diagnostics = extract_native_diagnostics(output, ignore=ignore)
-        if diagnostics:
-            logger.warning("XHand SDK %s diagnostics:\n%s", label, "\n".join(diagnostics))
-        return result, output
+            error = self.control.open_ethercat(device_name)
+        if error.error_code != 0:
+            raise XHandError("connect", error.error_code, error.error_message)
 
     def read_identity(self) -> None:
         self.device_identity["sdk_version"] = str(self.control.get_sdk_version())
@@ -173,10 +209,10 @@ class XHand:
             ("serial_number", self.control.get_serial_number),
         ):
             error, value = getter(self.cfg.device_id)
-            if error_code(error) == 0:
+            if int(error.error_code) == 0:
                 self.device_identity[key] = str(value)
             else:
-                logger.warning("XHand %s unavailable: code=%s", key, error_code(error))
+                logger.warning("XHand %s unavailable: code=%s", key, int(error.error_code))
         logger.debug(
             "XHand ready: SDK=%s type=%s serial=%s device_id=%d",
             self.device_identity["sdk_version"],
@@ -185,14 +221,14 @@ class XHand:
             self.cfg.device_id,
         )
 
-    def seed_command_history(self, *, cancel_requested=lambda: False) -> int:
+    def initialize_command(self, *, cancel_requested=lambda: False) -> int:
         deadline_ns = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
         while time.monotonic_ns() < deadline_ns:
             if cancel_requested():
-                raise CancelledError("XHand initial joint feedback acquisition cancelled")
+                raise OperationCancelled("XHand initial joint feedback acquisition cancelled")
             sample = self.get_state()
             if cancel_requested():
-                raise CancelledError("XHand initial joint feedback acquisition cancelled")
+                raise OperationCancelled("XHand initial joint feedback acquisition cancelled")
             remaining_ns = deadline_ns - time.monotonic_ns()
             if remaining_ns <= 0:
                 break
@@ -213,7 +249,8 @@ class XHand:
                     except Exception as exc:
                         errors.append(exc)
                 try:
-                    self.close_control()
+                    self.control.close_device()
+                    self.control = None
                 except Exception as exc:
                     errors.append(exc)
                 if connected_ethercat:
@@ -233,14 +270,9 @@ class XHand:
             EC_STATE_INIT,
             500_000,
         )
-        if error_code(error) != 0:
-            raise XHandError("ethercat INIT", error_code(error), "INIT request failed")
+        if int(error.error_code) != 0:
+            raise XHandError("ethercat INIT", int(error.error_code), "INIT request failed")
         time.sleep(0.2)
-
-    def close_control(self) -> None:
-        if self.control is not None:
-            self.control.close_device()
-            self.control = None
 
     def reset_tactile_sensors(self, *, cancel_requested=lambda: False) -> bool:
         """仅在静止、卸载时复位；SDK 成功不等于固件零点已生效。"""
@@ -254,7 +286,7 @@ class XHand:
         for completed, sensor_id in enumerate(TACTILE_SENSOR_IDS):
             if cancel_requested():
                 result["hand_tactile_reset_result"] = f"cancelled ({completed}/5)"
-                raise CancelledError(
+                raise OperationCancelled(
                     f"触觉复位请求已中断，已完成 {completed}/5 次 SDK 调用；已发送的请求不会撤销。"
                 )
             result["hand_tactile_reset_result"] = (
@@ -267,7 +299,7 @@ class XHand:
                     f"exception ({completed}/5), sensor=0x{sensor_id:02x}: {exc}"
                 )
                 raise
-            code = error_code(reply)
+            code = int(reply.error_code)
             if code != 0:
                 result["hand_tactile_reset_result"] = (
                     f"failed ({completed}/5), sensor=0x{sensor_id:02x}, code={code}"
@@ -294,9 +326,11 @@ class XHand:
         if self.control is None or not self.connected_flag:
             raise RuntimeError("XHand is not connected")
         error, raw_state = self.control.read_state(self.cfg.device_id, True)
-        code = error_code(error)
+        code = int(error.error_code)
         if code == COMMUNICATION_CRC_ERROR_CODE:
-            # CRC 失败的载荷不可使用，即使数值看似正常。
+            if not self.read_crc:
+                logger.warning("XHand read CRC; payload discarded")
+            self.read_crc = True
             return None
         if code not in NONFATAL_SDK_CODES:
             raise XHandError("read", code, error.error_message)
@@ -304,7 +338,7 @@ class XHand:
             raise XHandError("read", code, "missing state payload")
 
         try:
-            qpos, current, board_errors = parse_joints(raw_state)
+            qpos, current, board_errors = _parse_joints(raw_state)
         except (AttributeError, TypeError, ValueError, OverflowError) as exc:
             raise XHandError("read", code, f"invalid joint payload: {exc}") from exc
 
@@ -312,23 +346,38 @@ class XHand:
         if any(np.any(board_errors[name]) for name in ("commboard_err", "jointboard_err")):
             raise XHandError("read", code, f"joint/communication board fault: {board_errors}")
 
-        tactile_dense = np.full(HAND_TACTILE_FORCE_SHAPE, np.nan, dtype=np.float64)
-        tactile_aggregate = np.full(HAND_TACTILE_SUM_SHAPE, np.nan, dtype=np.float64)
-        aggregate_allowed, dense_allowed = tactile_validity(code, comm_type=self.cfg.comm_type)
-        if not aggregate_allowed or not dense_allowed:
-            logger.debug("XHand tactile read incomplete: code=%s", code)
-        if aggregate_allowed:
-            tactile_aggregate = parse_tactile_aggregate(raw_state)
-        if dense_allowed:
-            tactile_dense = parse_tactile_dense(raw_state)
+        aggregate_allowed, dense_allowed = _tactile_validity(code, comm_type=self.cfg.comm_type)
+        # 按最终 float32 类型判定触觉有效性，溢出值由反馈缓存处理。
+        with np.errstate(over="ignore", invalid="ignore"):
+            tactile_aggregate = (
+                _parse_tactile_aggregate(raw_state)
+                if aggregate_allowed
+                else np.full(HAND_TACTILE_SUM_SHAPE, np.nan, dtype=np.float32)
+            )
+            tactile_dense = (
+                _parse_tactile_dense(raw_state)
+                if dense_allowed
+                else np.full(HAND_TACTILE_FORCE_SHAPE, np.nan, dtype=np.float32)
+            )
         for sensor_index, finger_id in enumerate(XHAND_TACTILE_SENSOR_FINGER_IDS):
-            aggregate_allowed, dense_allowed = tactile_validity(
+            aggregate_allowed, dense_allowed = _tactile_validity(
                 int(board_errors["tipboard_err"][finger_id]), comm_type=self.cfg.comm_type
             )
             if not aggregate_allowed:
                 tactile_aggregate[sensor_index] = np.nan
             if not dense_allowed:
                 tactile_dense[sensor_index] = np.nan
+        tip_errors = tuple(int(code) for code in board_errors["tipboard_err"])
+        if tip_errors != self.previous_tip_errors and any(tip_errors):
+            logger.warning(
+                "XHand tip board errors: %s",
+                ", ".join(f"tip[{index}]={code}" for index, code in enumerate(tip_errors) if code),
+            )
+        self.previous_tip_errors = tip_errors
+        if self.read_crc:
+            logger.info("XHand trustworthy reads recovered")
+        self.read_crc = False
+
         return XHandState(
             qpos=qpos,
             current_ma=current,
@@ -355,16 +404,7 @@ class XHand:
         self.send_crc_started_ns = None
 
     def send_position(self, action: np.ndarray) -> int:
-        from dexmani_real.robot.commands import check_hand_target
-
-        target = np.asarray(action, dtype=np.float64)
-        reason = check_hand_target(
-            target,
-            mechanical_lower_rad=self.mechanical_lower,
-            mechanical_upper_rad=self.mechanical_upper,
-        )
-        if reason is not None:
-            raise ValueError(f"XHand.send_action: {reason}")
+        target = validate_hand_target(action, self.mechanical_lower, self.mechanical_upper)
         if self.control is None or self.command is None or not self.connected_flag:
             raise RuntimeError("XHand command path is not initialized")
         for index, value in enumerate(target):
@@ -416,7 +456,7 @@ class XHand:
     def send_command(self) -> int:
         error = self.control.send_command(self.cfg.device_id, self.command)
 
-        code = error_code(error)
+        code = int(error.error_code)
         if code == COMMUNICATION_CRC_ERROR_CODE:
             return code
         if code not in NONFATAL_SDK_CODES:

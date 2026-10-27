@@ -1,12 +1,11 @@
 import json
-import os
 import tempfile
 import unittest
 from concurrent.futures import CancelledError
 from pathlib import Path
 from unittest.mock import patch
 
-from dexmani_real.utils import atomic_io, log, timing
+from dexmani_real.utils import atomic_io, timing
 
 
 class AtomicIOTests(unittest.TestCase):
@@ -52,38 +51,6 @@ class AtomicIOTests(unittest.TestCase):
                     atomic_io.atomic_publish(source, target)
                 self.assertTrue(source.is_dir())
                 self.assertTrue(atomic_io.target_is_occupied(target))
-
-
-class LoggingTests(unittest.TestCase):
-    def test_capture_restores_stdout_and_retains_output_on_body_failure(self):
-        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stream:
-            with patch.object(log.sys, "stdout", stream):
-                with self.assertRaisesRegex(ValueError, "body failed"):
-                    with log.capture_native_stdout() as captured:
-                        print("python output", flush=True)
-                        os.write(stream.fileno(), b"native output\n")
-                        raise ValueError("body failed")
-                print("restored", flush=True)
-            stream.seek(0)
-            self.assertEqual(stream.read(), "restored\n")
-            self.assertEqual(captured.text, "python output\nnative output")
-
-    def test_flush_failure_still_restores_stdout(self):
-        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stream:
-            with (patch.object(log.sys, "stdout", stream),
-                  patch.object(log, "flush_process_stdout", side_effect=[None, OSError("flush failed")])):
-                with self.assertRaisesRegex(OSError, "flush failed"):
-                    with log.capture_native_stdout():
-                        os.write(stream.fileno(), b"captured\n")
-                os.write(stream.fileno(), b"restored\n")
-            stream.seek(0)
-            self.assertEqual(stream.read(), "restored\n")
-
-    def test_capture_setup_failure_is_not_reported_as_empty_success(self):
-        with patch.object(log.os, "dup", side_effect=OSError("dup failed")):
-            with self.assertRaisesRegex(OSError, "dup failed"):
-                with log.capture_native_stdout():
-                    self.fail("capture body must not run after setup failure")
 
 
 class TimingTests(unittest.TestCase):

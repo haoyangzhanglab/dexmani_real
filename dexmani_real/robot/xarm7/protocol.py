@@ -1,9 +1,11 @@
 """机械臂共享通道、反馈布局与低频操作消息。"""
 
+import time
 from dataclasses import dataclass
 
 import numpy as np
 
+from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
 
 ARM_STATE_DTYPE = np.dtype(
@@ -73,6 +75,40 @@ class ArmChannels:
         self.goal = ctx.RawArray("b", GOAL_DTYPE.itemsize)
         self.status = ctx.RawArray("b", STATUS_DTYPE.itemsize)
 
+    def publish_goal(self, command, *, sequence, submit_until_ns, execute_until_ns):
+        prepared_run_id = self.read_status()["prepared_run_id"]
+        goal = np.zeros((), dtype=GOAL_DTYPE)
+        goal[()] = (
+            sequence,
+            command.run_id,
+            command.input_generation,
+            submit_until_ns,
+            execute_until_ns,
+            command.arm_qpos,
+        )
+        with self.goal_lock:
+            # IPC 等待之后重新检查运行身份、停止信号和 jog 输入代际。
+            if (
+                self.closing.is_set()
+                or self.stop.is_set()
+                or self.emergency.is_set()
+                or self.run_id.value != command.run_id
+            ):
+                raise OperationCancelled("arm target run cancelled")
+            if (
+                command.input_generation >= 0
+                and self.input_generation.value != command.input_generation
+            ):
+                raise OperationCancelled("jog input changed before publication")
+            if time.monotonic_ns() >= min(submit_until_ns, execute_until_ns):
+                raise TimeoutError("arm target deadline expired")
+            if prepared_run_id != command.run_id:
+                raise RuntimeError("arm target run was not prepared")
+            slot = np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)
+            if slot["sequence"][0]:
+                raise RuntimeError("arm target slot is full")
+            slot[0] = goal
+
     def take_goal(self, *, block=False):
         if not self.goal_lock.acquire(block):
             return None  # 父进程持锁时跳过本次读取，不阻塞伺服。
@@ -90,7 +126,7 @@ class ArmChannels:
         with self.status_lock:
             return np.frombuffer(self.status, dtype=STATUS_DTYPE, count=1)[0].copy()
 
-    def publish(self, status):
+    def publish_status(self, status):
         # 锁内只复制快照，不执行 SDK I/O。
         with self.status_lock:
             np.frombuffer(self.status, dtype=STATUS_DTYPE, count=1)[0] = status

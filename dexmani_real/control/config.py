@@ -95,11 +95,17 @@ class TableCollisionConfig:
 class EnvironmentConfig:
     workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
     eef_workspace_margin_m: float = 0.005
+    table_z_surface_m: float = 0.022
+    hand_safety_margin_m: float = 0.05
     table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
     static_boxes: tuple[StaticCollisionBox, ...] = ()
 
     def validate(self) -> None:
         self.workspace.as_array()
+        if not np.isfinite(self.table_z_surface_m):
+            raise ValueError("table_z_surface_m must be finite")
+        if not np.isfinite(self.hand_safety_margin_m) or self.hand_safety_margin_m < 0:
+            raise ValueError("hand_safety_margin_m must be finite and non-negative")
         if not np.isfinite(self.eef_workspace_margin_m) or self.eef_workspace_margin_m < 0:
             raise ValueError("EEF workspace margin must be finite and nonnegative")
         if self.table.enabled:

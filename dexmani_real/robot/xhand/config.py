@@ -5,31 +5,14 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.geometry.pose import validate_unit_quaternion_wxyz
+from dexmani_real.robot.commands import validate_hand_target
 from dexmani_real.robot.model import (
-    HAND_JOINT_SHAPE,
     XHAND_RATED_QPOS_MAX_RAD,
     XHAND_RATED_QPOS_MIN_RAD,
 )
 
 SERIAL_SETTLE_S = 1.0
 INITIAL_STATE_TIMEOUT_S = 1.0
-
-
-def validate_hand_command_bounds(
-    hand_cmd: object,
-    operational_lower: object,
-    operational_upper: object,
-) -> np.ndarray:
-    command = np.asarray(hand_cmd, dtype=np.float64)
-    op_lower = np.asarray(operational_lower, dtype=np.float64)
-    op_upper = np.asarray(operational_upper, dtype=np.float64)
-    if command.shape != HAND_JOINT_SHAPE:
-        raise ValueError(f"hand command must have shape {HAND_JOINT_SHAPE}, got {command.shape}")
-    if not np.all(np.isfinite(command)):
-        raise ValueError("hand command must be finite")
-    if np.any(command < op_lower - 1e-12) or np.any(command > op_upper + 1e-12):
-        raise ValueError("hand command violates operational joint limits")
-    return command.copy()
 
 
 @dataclass(frozen=True)
@@ -170,4 +153,4 @@ class HandConfig:
             raise ValueError("hand command limits must have lower < upper")
         if np.any(lower < XHAND_RATED_QPOS_MIN_RAD) or np.any(upper > XHAND_RATED_QPOS_MAX_RAD):
             raise ValueError("hand command limits exceed the rated device envelope")
-        validate_hand_command_bounds(np.deg2rad(self.home_qpos_deg), lower, upper)
+        validate_hand_target(np.deg2rad(self.home_qpos_deg), lower, upper)

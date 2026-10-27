@@ -10,7 +10,7 @@ from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.control.ik import IKSolver
 from dexmani_real.robot.commands import OperationCancelled, RobotError
-from dexmani_real.robot.system import DexManiRobot
+from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.jog import JogController, jog_motion_requested
 from dexmani_real.runtime.keyboard import Keyboard
@@ -50,7 +50,7 @@ class KeyboardTeleop:
             raise ValueError("hand-disabled operation requires --no-hand")
 
         self.runtime_state = SessionState()
-        self.robot = DexManiRobot(
+        self.robot = Robot(
             self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
             stop_signal=self.runtime_state.stop_signal,
             emergency_signal=self.runtime_state.emergency_signal,

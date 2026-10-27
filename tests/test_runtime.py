@@ -5,8 +5,8 @@ from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from types import SimpleNamespace
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -17,7 +17,11 @@ from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.xarm7.config import ArmConfig
 from dexmani_real.robot.xhand.config import HandConfig
 from dexmani_real.runtime import home, keyboard, lifecycle
-from dexmani_real.runtime.jog import JogController, compute_cartesian_jog_delta, jog_motion_requested
+from dexmani_real.runtime.jog import (
+    JogController,
+    compute_cartesian_jog_delta,
+    jog_motion_requested,
+)
 from dexmani_real.runtime.observation import snapshot_camera_parameters
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 
@@ -196,7 +200,7 @@ class KeyboardTests(unittest.TestCase):
     def test_terminal_restore_failure_marks_shutdown_failed(self):
         self.keys.saved_termios = ["saved"]
         with (
-            patch.object(keyboard.termios, "tcsetattr", side_effect=OSError("terminal closed")),
+            patch.object(keyboard, "restore_terminal_echo", side_effect=OSError("terminal closed")),
             self.assertLogs(lifecycle.logger, level="ERROR") as logs,
         ):
             self.assertFalse(lifecycle.close_runtime(self.state, keyboard=self.keys))
@@ -281,7 +285,7 @@ class ReplayInputTests(unittest.TestCase):
             "evaluate_replay": Mock(),
             "SessionState": Mock(return_value=self.state),
             "Keyboard": Mock(return_value=self.keys),
-            "DexManiRobot": Mock(return_value=self.robot),
+            "Robot": Mock(return_value=self.robot),
             "HomePlanner": Mock(),
             "home_hand": Mock(return_value=home.HomeResult(True)),
             "home_robot": self.home,
@@ -326,7 +330,7 @@ class ReplayInputTests(unittest.TestCase):
                     ),
                     output_dir=self.output,
                 )
-        self.session.DexManiRobot.assert_not_called()
+        self.session.Robot.assert_not_called()
         self.assertEqual(list(Path(self.output).iterdir()), [])
 
     def test_stop_blocks_same_batch_home_and_allows_new_request_after_acknowledgment(self):

@@ -2,6 +2,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+
 
 @dataclass(frozen=True)
 class RobotCommand:
@@ -29,35 +31,24 @@ class RobotError(RuntimeError):
     """设备或执行器失败，调用方须终止本次运行。"""
 
 
-def check_arm_target(
-    target_qpos_rad: np.ndarray,
-    *,
-    joint_limit_lower_rad: np.ndarray,
-    joint_limit_upper_rad: np.ndarray,
-) -> str | None:
-    target = np.asarray(target_qpos_rad, dtype=np.float64)
-    if target.shape != (7,):
-        return "invalid target shape"
+def validate_arm_target(qpos, lower, upper) -> np.ndarray:
+    target = np.asarray(qpos, dtype=np.float64)
+    if target.shape != ARM_JOINT_SHAPE:
+        raise ValueError("arm target must have shape (7,)")
     if not np.all(np.isfinite(target)):
-        return "non-finite target"
-    if np.any(target < joint_limit_lower_rad) or np.any(target > joint_limit_upper_rad):
-        return "joint limit violation"
-    return None
+        raise ValueError("arm target must be finite")
+    if np.any(target < lower) or np.any(target > upper):
+        raise ValueError("arm target violates joint limits")
+    return target
 
 
-def check_hand_target(
-    target_qpos_rad: np.ndarray,
-    *,
-    mechanical_lower_rad: np.ndarray,
-    mechanical_upper_rad: np.ndarray,
-) -> str | None:
-    target = np.asarray(target_qpos_rad, dtype=np.float64)
-    if target.shape != (12,):
-        return "invalid target shape"
+def validate_hand_target(qpos, lower, upper) -> np.ndarray:
+    target = np.asarray(qpos, dtype=np.float64)
+    lower, upper = np.asarray(lower), np.asarray(upper)
+    if target.shape != HAND_JOINT_SHAPE:
+        raise ValueError("hand target must have shape (12,)")
     if not np.all(np.isfinite(target)):
-        return "non-finite target"
-    if np.any(target < mechanical_lower_rad - 1e-12) or np.any(
-        target > mechanical_upper_rad + 1e-12
-    ):
-        return "mechanical joint limit violation"
-    return None
+        raise ValueError("hand target must be finite")
+    if np.any(target < lower - 1e-12) or np.any(target > upper + 1e-12):
+        raise ValueError("hand target violates joint limits")
+    return target

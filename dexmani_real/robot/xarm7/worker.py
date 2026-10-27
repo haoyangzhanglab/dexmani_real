@@ -5,7 +5,7 @@ from typing import cast
 
 import numpy as np
 
-from dexmani_real.robot.commands import OperationCancelled, RobotError
+from dexmani_real.robot.commands import OperationCancelled, RobotError, validate_arm_target
 from dexmani_real.robot.xarm7.config import (
     HOME_CONVERGENCE_TIMEOUT_S,
     HOME_DWELL_S,
@@ -18,7 +18,7 @@ from dexmani_real.robot.xarm7.protocol import (
     HomeRequest,
     LifecycleReply,
 )
-from dexmani_real.robot.xarm7.reference import ArmReference
+from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
 from dexmani_real.utils.timing import next_tick_ns
 
 
@@ -63,7 +63,7 @@ class ArmController:
             self.status["valid"] = False
             raise
         finally:
-            self.io.publish(self.status)
+            self.io.publish_status(self.status)
 
     def wait_settled(
         self,
@@ -71,13 +71,13 @@ class ArmController:
         *,
         stage,
         timeout_s,
-        interval_s,
         target=None,
         tolerance_rad=None,
         strict=False,
     ):
         """确认位置与速度连续稳定，strict 模式遇到不合格样本立即失败。"""
         tolerance = self.cfg.homing.convergence_rad if tolerance_rad is None else tolerance_rad
+        interval_s = 1 / self.cfg.feedback_hz
         deadline = time.monotonic_ns() + int(timeout_s * 1e9)
         stable = time.monotonic_ns() if strict else None
         anchor = None
@@ -112,10 +112,9 @@ class ArmController:
             check_abort,
             stage="arm standstill",
             timeout_s=HOME_CONVERGENCE_TIMEOUT_S,
-            interval_s=1 / self.cfg.feedback_hz,
         )
         # 进入 Mode 1 前确认实测状态可生成限位内的制动轨迹。
-        ArmReference(
+        ArmTrajectory(
             self.cfg,
             self.status["frame"]["qpos"],
             self.status["frame"]["qvel"],
@@ -124,17 +123,13 @@ class ArmController:
 
     def home(self, waypoints, final_qpos, *, check_abort):
         waypoints = np.asarray(waypoints, dtype=np.float64)
-        final_qpos = np.asarray(final_qpos, dtype=np.float64)
         lower, upper = (
             np.asarray(self.cfg.joint_limit_lower),
             np.asarray(self.cfg.joint_limit_upper),
         )
         if waypoints.ndim != 2 or waypoints.shape[1:] != (7,) or not np.isfinite(waypoints).all():
             raise ValueError("invalid home waypoint array")
-        if final_qpos.shape != (7,) or not np.isfinite(final_qpos).all():
-            raise ValueError("invalid home final_qpos")
-        if np.any(final_qpos < lower) or np.any(final_qpos > upper):
-            raise ValueError("home final target violates joint limits")
+        final_qpos = validate_arm_target(final_qpos, lower, upper)
         if np.any(waypoints < lower) or np.any(waypoints > upper):
             raise ValueError("home waypoint violates joint limits")
         if len(waypoints) and np.max(np.abs(waypoints[-1] - final_qpos)) > 1e-6:
@@ -167,7 +162,6 @@ class ArmController:
                     check_abort,
                     stage=f"home milestone {index}",
                     timeout_s=2 * nominal + HOME_TARGET_TIMEOUT_S,
-                    interval_s=(1 / self.cfg.feedback_hz),
                     target=target,
                     tolerance_rad=min(self.cfg.homing.convergence_rad, np.deg2rad(0.5)),
                 )
@@ -181,7 +175,6 @@ class ArmController:
                 strict=True,
                 target=final_qpos,
                 timeout_s=HOME_DWELL_S + (1 / self.cfg.feedback_hz),
-                interval_s=(1 / self.cfg.feedback_hz),
             )
         check_abort()
         self.driver.enter_mode(1, check_abort=check_abort)
@@ -190,7 +183,6 @@ class ArmController:
             stage="post-Mode1 home settle",
             target=final_qpos,
             timeout_s=HOME_TARGET_TIMEOUT_S + HOME_DWELL_S + (1 / self.cfg.feedback_hz),
-            interval_s=(1 / self.cfg.feedback_hz),
         )
 
     def stop(self):
@@ -198,7 +190,7 @@ class ArmController:
         self.status["prepared_run_id"] = 0
         self.active = self.reference = None
         self.io.take_goal(block=True)
-        self.io.publish(self.status)
+        self.io.publish_status(self.status)
         try:
             self.driver.stop()
         except BaseException as exc:
@@ -254,7 +246,7 @@ class ArmController:
                 detail += "; " + self.io.close_error.value.decode(errors="replace")
                 error = RobotError(detail)
 
-        self.io.publish(self.status)
+        self.io.publish_status(self.status)
         self.pipe.send(LifecycleReply(identity, error))
 
     def command_issue(self, goal, now, *, first=False):
@@ -301,10 +293,11 @@ class ArmController:
                 q, v = self.status["frame"]["qpos"], self.status["frame"]["qvel"]
                 if np.max(np.abs(v)) > self.cfg.homing.velocity_convergence_rad_s:
                     raise RuntimeError("arm moved after standstill preparation")
-                self.reference = ArmReference(self.cfg, q, v, now)
-            cast(ArmReference, self.reference).replace(pending["q_goal"], now)
+                self.reference = ArmTrajectory(self.cfg, q, v, now)
             self.active = pending
-        q, _, _ = cast(ArmReference, self.reference).sample(now)
+        q = cast(ArmTrajectory, self.reference).step(
+            now, pending["q_goal"] if pending is not None else None
+        )
         if np.max(np.abs(self.status["frame"]["qpos"] - q)) > self.cfg.tracking_error_rad:
             raise RuntimeError("tracking_error")
         # 计算结束后、进入 SDK 前重新检查授权与期限。

@@ -30,7 +30,7 @@ from dexmani_real.control.ik import IKSolver
 from dexmani_real.geometry.pose import rot6d_to_rotmat
 from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import OperationCancelled
-from dexmani_real.robot.system import DexManiRobot
+from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import home_arm
 from dexmani_real.runtime.jog import JogController, jog_motion_requested
 from dexmani_real.runtime.keyboard import Keyboard
@@ -50,13 +50,13 @@ from dexmani_real.runtime.preflight import (
     validate_robot_config,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
-from dexmani_real.sensor.camera import run_camera_worker
+from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import LoopRate, sample_is_fresh
 
 if TYPE_CHECKING:
     from dexmani_real.config import ExperimentConfig
-    from dexmani_real.robot.xarm7.client import ArmClient
+    from dexmani_real.robot.xarm7.process import ArmProcess
 
 logger = logging.getLogger(__name__)
 
@@ -552,7 +552,7 @@ class CameraCalibration:
             feedback_until_ns = (
                 self.feedback_timestamp_ns + int(self.runtime.arm.feedback_max_age_s * 1e9) + 1
             )
-            cast("ArmClient", self.robot.arm).update_health(
+            cast("ArmProcess", self.robot.arm).update_health(
                 health_until_ns=control_deadline_ns(feedback_until_ns, self.runtime.arm),
             )
             committed = self.jog.submit(
@@ -622,10 +622,10 @@ class CameraCalibration:
         )
         self.camera_process = ctx.Process(
             name="camera",
-            target=run_camera_worker,
+            target=run_camera,
             args=(self.sensors.channels, self.runtime.camera),
         )
-        self.robot: DexManiRobot = DexManiRobot(
+        self.robot: Robot = Robot(
             self.runtime.arm,
             self.runtime.hand,
             run_signal=self.runtime_state.run_signal,

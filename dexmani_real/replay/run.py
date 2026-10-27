@@ -10,7 +10,7 @@ from dexmani_real.control.homing import HomePlanner
 from dexmani_real.replay.data import verify_replay_preflight
 from dexmani_real.replay.metrics import evaluate_replay
 from dexmani_real.replay.player import ReplayPlayer, ReplayResult, ReplayStatus
-from dexmani_real.robot.system import DexManiRobot
+from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import home_hand, home_robot
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime
@@ -64,7 +64,7 @@ def run_replay(
     outcome = ReplayResult(ReplayStatus.REJECTED, reason="startup failed")
     try:
         runtime_state = SessionState()
-        robot = DexManiRobot(
+        robot = Robot(
             runtime.arm,
             runtime.hand,
             run_signal=runtime_state.run_signal,

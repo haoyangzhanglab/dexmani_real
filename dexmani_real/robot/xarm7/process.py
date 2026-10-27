@@ -3,15 +3,12 @@
 import multiprocessing as mp
 import time
 
-import numpy as np
-
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.xarm7.config import (
     EXECUTOR_TIMEOUT_S,
     HOME_CONVERGENCE_TIMEOUT_S,
 )
 from dexmani_real.robot.xarm7.protocol import (
-    GOAL_DTYPE,
     ArmChannels,
     HomeRequest,
     LifecycleReply,
@@ -19,7 +16,7 @@ from dexmani_real.robot.xarm7.protocol import (
 )
 
 
-class ArmClient:
+class ArmProcess:
     def __init__(
         self,
         cfg,
@@ -60,7 +57,7 @@ class ArmClient:
 
         Ruckig(7)
         if self.process is not None:
-            raise RuntimeError("arm client is single-use")
+            raise RuntimeError("arm process is single-use")
 
         run_id = self.io.run_id.value
 
@@ -133,39 +130,13 @@ class ArmClient:
         self.check_error()
         if not self.is_connected:
             raise RobotError("arm device unavailable")
-        prepared_run_id = self.io.read_status()["prepared_run_id"]
-        goal = np.zeros((), dtype=GOAL_DTYPE)
-        goal[()] = (
-            self.sequence + 1,
-            command.run_id,
-            command.input_generation,
-            submit_until_ns,
-            execute_until_ns,
-            command.arm_qpos,
+        self.io.publish_goal(
+            command,
+            sequence=self.sequence + 1,
+            submit_until_ns=submit_until_ns,
+            execute_until_ns=execute_until_ns,
         )
-        with self.io.goal_lock:
-            # IPC 等待之后重新检查运行身份、停止信号和 jog 输入代际。
-            if (
-                self.io.closing.is_set()
-                or self.io.stop.is_set()
-                or self.io.emergency.is_set()
-                or self.io.run_id.value != command.run_id
-            ):
-                raise OperationCancelled("arm target run cancelled")
-            if (
-                command.input_generation >= 0
-                and self.io.input_generation.value != command.input_generation
-            ):
-                raise OperationCancelled("jog input changed before publication")
-            if time.monotonic_ns() >= min(submit_until_ns, execute_until_ns):
-                raise TimeoutError("arm target deadline expired")
-            if prepared_run_id != command.run_id:
-                raise RuntimeError("arm target run was not prepared")
-            slot = np.frombuffer(self.io.goal, dtype=GOAL_DTYPE, count=1)
-            if slot["sequence"][0]:
-                raise RuntimeError("arm target slot is full")
-            slot[0] = goal
-            self.sequence += 1
+        self.sequence += 1
 
     def receive_reply(self, identity) -> LifecycleReply:
         reply = self.pipe.recv()

@@ -539,7 +539,7 @@ class LoopTests(unittest.TestCase):
 
         def read(*args, **kwargs):
             self.assertTrue(kwargs["cancel_requested"]())
-            raise loop.CancelledError()
+            raise OperationCancelled()
 
         with (
             patch.object(loop, "read_observation", side_effect=read),
@@ -650,7 +650,7 @@ class SessionTests(unittest.TestCase):
                     load_vr_transform=Mock(return_value=SimpleNamespace(transform=np.eye(3))),
                     ActionMapper=Mock(), VRController=Mock(), HomePlanner=Mock(),
                     SensorChannels=Mock(), SessionState=Mock(return_value=state),
-                    SensorWorkers=Mock(return_value=sensors), DexManiRobot=Mock(return_value=robot),
+                    SensorWorkers=Mock(return_value=sensors), Robot=Mock(return_value=robot),
                     Keyboard=Mock(return_value=keys), AudioFeedback=Mock(return_value=player),
                     TeleopLoop=Mock(return_value=control_loop),
                 ))

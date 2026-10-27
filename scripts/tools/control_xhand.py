@@ -5,12 +5,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import resource
 import signal
 import stat
 import subprocess
 import sys
 import time
-from concurrent.futures import CancelledError
 from dataclasses import asdict
 from pathlib import Path
 
@@ -18,11 +18,12 @@ import numpy as np
 import yaml
 
 from dexmani_real.config import load_experiment_config
+from dexmani_real.robot.commands import OperationCancelled, validate_hand_target
 from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
 )
-from dexmani_real.robot.xhand.config import HandConfig, validate_hand_command_bounds
+from dexmani_real.robot.xhand.config import HandConfig
 from dexmani_real.robot.xhand.driver import XHand
 from dexmani_real.utils.log import configure_logging
 
@@ -77,7 +78,7 @@ def action_sequence(config: HandConfig) -> list[tuple[str, np.ndarray]]:
     return [
         (
             name,
-            validate_hand_command_bounds(
+            validate_hand_target(
                 np.deg2rad(values), config.qpos_min_rad, config.qpos_max_rad,
             ),
         )
@@ -95,7 +96,7 @@ class XHandControlExample(XHand):
 
     def check_cancelled(self) -> None:
         if self.cancel_requested():
-            raise InterruptedError("XHand action sequence interrupted")
+            raise OperationCancelled("XHand action sequence interrupted")
 
     @staticmethod
     def header(title: str) -> None:
@@ -227,7 +228,7 @@ def run_hardware_session(config: HandConfig, *, finger_id: int, read_only: bool)
         nonlocal interrupted_signal
         interrupted_signal = signum
         if not cleaning_up:
-            raise InterruptedError("XHand action sequence interrupted")
+            raise OperationCancelled("XHand action sequence interrupted")
 
     hand = XHandControlExample(config, cancel_requested=lambda: interrupted_signal is not None)
     previous_handlers = {
@@ -252,7 +253,7 @@ def run_hardware_session(config: HandConfig, *, finger_id: int, read_only: bool)
             print(f"\n  -> {name} (degrees): {np.rad2deg(target).round(3).tolist()}")
             hand.execute_action(target)
             time.sleep(ACTION_DWELL_S)
-    except (InterruptedError, CancelledError):
+    except OperationCancelled:
         print("\nSequence interrupted; stopping any attempted action before closing")
     except Exception as exc:
         print(f"\nXHand diagnostic failed: {exc}", file=sys.stderr)
@@ -273,15 +274,6 @@ def run_hardware_session(config: HandConfig, *, finger_id: int, read_only: bool)
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
     return result or (128 + interrupted_signal if interrupted_signal is not None else 0)
-
-
-def disable_worker_core_dump() -> None:
-    try:
-        import resource
-
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    except (ImportError, OSError, ValueError):
-        pass
 
 
 def run_isolated_hardware_session(argv: list[str]) -> int:
@@ -367,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
         print(yaml.safe_dump({"hand": asdict(config)}, sort_keys=False), end="")
         return 0
     if args.xhand_hardware_worker:
-        disable_worker_core_dump()
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         return run_hardware_session(config, finger_id=args.finger_id, read_only=args.read_only)
     return run_isolated_hardware_session(argv)
 

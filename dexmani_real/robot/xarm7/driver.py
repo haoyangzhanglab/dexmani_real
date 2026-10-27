@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
@@ -11,10 +11,6 @@ from dexmani_real.robot.model import ARM_JOINT_SHAPE
 from dexmani_real.robot.xarm7.config import (
     SDK_TIMEOUT_S,
     ArmConfig,
-)
-from dexmani_real.utils.log import (
-    capture_native_stdout,
-    extract_native_diagnostics,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,54 +48,6 @@ def describe_controller_error(code: int) -> str:
     return CONTROLLER_ERROR_HELP.get(code, "controller error")
 
 
-def read_controller_status(arm_api: Any) -> ControllerStatus:
-    code, state = arm_api.get_state()
-    check_sdk_return_code(code, "get_state")
-    code, values = arm_api.get_err_warn_code()
-    check_sdk_return_code(code, "get_err_warn_code")
-    return ControllerStatus(state=int(state), error_code=int(values[0]), warn_code=int(values[1]))
-
-
-def wait_controller_ready(
-    arm_api: Any,
-    *,
-    expected_mode: int,
-    timeout_s: float,
-    check_abort: Callable[[], None],
-) -> int:
-    deadline = time.monotonic() + timeout_s
-    last: ControllerStatus | None = None
-    while time.monotonic() < deadline:
-        check_abort()
-        last = read_controller_status(arm_api)
-        check_abort()
-        if (
-            bool(arm_api.connected)
-            and last.error_code == 0
-            and int(arm_api.mode) == expected_mode
-            and int(last.state) in (0, 1, 2)
-        ):
-            return last.state
-        time.sleep(0.03)
-    check_abort()
-    raise RuntimeError(
-        f"controller postcondition failed: expected mode={expected_mode} "
-        f"error=0 movable-state, got state={last.state if last else None} "
-        f"error={last.error_code if last else None}"
-    )
-
-
-def decode_joint_states(code: Any, states: Any) -> tuple[np.ndarray, np.ndarray]:
-    check_sdk_return_code(code, "get_joint_states")
-    if not isinstance(states, (list, tuple)) or len(states) != 2:
-        raise RuntimeError("get_joint_states(num=2) must return position and velocity")
-    qpos = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
-    qvel = np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
-    if any(v.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(v)) for v in (qpos, qvel)):
-        raise RuntimeError("get_joint_states returned invalid qpos/qvel shape or non-finite values")
-    return qpos, qvel
-
-
 class XArm7:
     def __init__(self, cfg: ArmConfig) -> None:
         self.cfg = cfg
@@ -110,23 +58,9 @@ class XArm7:
         return self.api is not None and bool(self.api.connected)
 
     def connect(self) -> None:
-        sdk_connect_output = None
-        try:
-            with capture_native_stdout() as sdk_connect_output:
-                from xarm.wrapper import XArmAPI
+        from xarm.wrapper import XArmAPI
 
-                logging.getLogger("origin.print").setLevel(logging.WARNING)
-                self.api = XArmAPI(self.cfg.ip, is_radian=True)
-        except Exception as exc:
-            vendor_detail = sdk_connect_output.text if sdk_connect_output is not None else ""
-            raise RuntimeError(
-                f"connect failed: {exc}"
-                + (f"; vendor output:\n{vendor_detail}" if vendor_detail else "")
-            ) from exc
-        sdk_diagnostics = extract_native_diagnostics(sdk_connect_output.text)
-        if sdk_diagnostics:
-            logger.warning("xArm SDK initialization diagnostics:\n%s", "\n".join(sdk_diagnostics))
-
+        self.api = XArmAPI(self.cfg.ip, is_radian=True)
         self.api.set_timeout(SDK_TIMEOUT_S)
         self.wait_for_axis_report()
         self.check_controller_error()
@@ -156,7 +90,16 @@ class XArm7:
 
     def read(self) -> tuple[np.ndarray, np.ndarray]:
         code, states = self.api.get_joint_states(is_radian=True, num=2)
-        return decode_joint_states(code, states)
+        check_sdk_return_code(code, "get_joint_states")
+        if not isinstance(states, (list, tuple)) or len(states) != 2:
+            raise RuntimeError("get_joint_states(num=2) must return position and velocity")
+        qpos = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
+        qvel = np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
+        if any(v.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(v)) for v in (qpos, qvel)):
+            raise RuntimeError(
+                "get_joint_states returned invalid qpos/qvel shape or non-finite values"
+            )
+        return qpos, qvel
 
     def servo(self, qpos: np.ndarray) -> None:
         """Mode 1 只发送采样参考，SDK 速度参数不负责轨迹规划。"""
@@ -164,7 +107,13 @@ class XArm7:
         check_sdk_return_code(code, "servo")
 
     def read_status(self):
-        return read_controller_status(self.api)
+        code, state = self.api.get_state()
+        check_sdk_return_code(code, "get_state")
+        code, values = self.api.get_err_warn_code()
+        check_sdk_return_code(code, "get_err_warn_code")
+        return ControllerStatus(
+            state=int(state), error_code=int(values[0]), warn_code=int(values[1])
+        )
 
     @property
     def mode(self):
@@ -187,7 +136,27 @@ class XArm7:
         check_sdk_return_code(self.api.set_mode(mode), f"set_mode({mode})")
         check_abort()
         check_sdk_return_code(self.api.set_state(0), f"set_state(0) after Mode {mode}")
-        wait_controller_ready(self.api, expected_mode=mode, timeout_s=1.0, check_abort=check_abort)
+
+        deadline = time.monotonic() + 1.0
+        last: ControllerStatus | None = None
+        while time.monotonic() < deadline:
+            check_abort()
+            last = self.read_status()
+            check_abort()
+            if (
+                bool(self.api.connected)
+                and last.error_code == 0
+                and int(self.api.mode) == mode
+                and int(last.state) in (0, 1, 2)
+            ):
+                return last.state
+            time.sleep(0.03)
+        check_abort()
+        raise RuntimeError(
+            f"controller postcondition failed: expected mode={mode} "
+            f"error=0 movable-state, got state={last.state if last else None} "
+            f"error={last.error_code if last else None}"
+        )
 
     @property
     def axis(self) -> int:
@@ -203,7 +172,7 @@ class XArm7:
             raise RuntimeError(f"device reports {self.axis} axes, expected {ARM_JOINT_SHAPE[0]}")
 
     def check_controller_error(self) -> None:
-        live = read_controller_status(self.api)
+        live = self.read_status()
         if live.error_code != 0:
             raise RuntimeError(
                 f"startup controller error C{live.error_code} (warn={live.warn_code}, "

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
-import pyrealsense2 as rs
 
 from dexmani_real.geometry.camera import CameraIntrinsics
 from dexmani_real.sensor.config import CameraConfig
+from dexmani_real.utils.log import configure_logging
+
+if TYPE_CHECKING:
+    import pyrealsense2 as rs
 
 logger = logging.getLogger(__name__)
 WARMUP_FRAMES = 10
@@ -33,11 +38,13 @@ class RealSenseCamera:
         self.config = config
         self.auto_exposure_priority = auto_exposure_priority
         self.active_serial: str
-        self.pipeline = None
+        self.pipeline: rs.pipeline | None = None
         self.last_identity: tuple[int, int] | None = None
         self.received_ns = [0, 0]
 
     def connect(self):
+        import pyrealsense2 as rs
+
         if self.pipeline is not None:
             raise RuntimeError("RealSense is already connected")
         context = rs.context()
@@ -119,8 +126,8 @@ class RealSenseCamera:
                 logger.exception("RealSense startup cleanup failed")
             raise
 
-    def read(self, timeout_ms: int = 300) -> RGBDFrame | None:
-        ready, queued = self.frame_queue.try_wait_for_frame(timeout_ms)
+    def read(self) -> RGBDFrame | None:
+        ready, queued = self.frame_queue.try_wait_for_frame(300)
         received = time.monotonic_ns()
         if not ready:
             if received - min(self.received_ns) >= SOURCE_STALL_TIMEOUT_NS:
@@ -167,6 +174,8 @@ class RealSenseCamera:
 
     @staticmethod
     def device_info(device):
+        import pyrealsense2 as rs
+
         return {
             name: device.get_info(key) if device.supports(key) else ""
             for name, key in (
@@ -179,4 +188,30 @@ class RealSenseCamera:
 
     @staticmethod
     def list_cameras():
+        import pyrealsense2 as rs
+
         return [RealSenseCamera.device_info(device) for device in rs.context().query_devices()]
+
+
+def run_camera(shared, config: CameraConfig):
+    configure_logging()
+    camera = RealSenseCamera(config)
+    camera.connect()
+    try:
+        shared.camera_depth_scale.value = camera.depth_scale_m
+        shared.camera_serial.value = camera.active_serial.encode()
+        shared.camera_intrinsics.value = json.dumps(camera.color_intrinsics.to_dict()).encode()
+        while shared.is_running.value:
+            frame = camera.read()
+            if frame is None:
+                continue
+            shared.camera_ring.write(
+                timestamp_ns=frame.timestamp_ns,
+                color_frame_number=frame.color_frame_number,
+                rgb=frame.rgb,
+                depth=frame.depth,
+            )
+            shared.camera_ready.set()
+    finally:
+        shared.camera_ready.clear()
+        camera.disconnect()

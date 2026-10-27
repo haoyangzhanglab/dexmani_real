@@ -1,26 +1,19 @@
-import importlib.util
 import subprocess
 import sys
 import threading
 import unittest
 from enum import Enum
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
 
-from dexmani_real.sensor import vr
+from dexmani_real.sensor import realsense, vr
 from dexmani_real.sensor.config import CameraConfig, VRConfig
 
 
 class RealSenseTests(unittest.TestCase):
     def setUp(self):
-        spec = importlib.util.spec_from_file_location(
-            "sensor_driver_test",
-            Path(__file__).resolve().parents[1] / "dexmani_real/sensor/realsense.py",
-        )
-        self.driver = importlib.util.module_from_spec(spec)
         self.sdk = SimpleNamespace(
             camera_info=SimpleNamespace(
                 name="name",
@@ -42,9 +35,10 @@ class RealSenseTests(unittest.TestCase):
             frame_queue=Mock(),
             align=Mock(),
         )
-        with patch.dict(sys.modules, {spec.name: self.driver, "pyrealsense2": self.sdk}):
-            spec.loader.exec_module(self.driver)
-        self.camera = self.driver.RealSenseCamera(CameraConfig(width=3, height=2))
+        sdk_patch = patch.dict(sys.modules, {"pyrealsense2": self.sdk})
+        sdk_patch.start()
+        self.addCleanup(sdk_patch.stop)
+        self.camera = realsense.RealSenseCamera(CameraConfig(width=3, height=2))
         self.camera.frame_queue = Mock()
         self.camera.aligner = Mock()
         self.camera.aligner.process.side_effect = lambda frames: frames
@@ -67,7 +61,7 @@ class RealSenseTests(unittest.TestCase):
     def test_duplicate_frames_are_skipped_before_alignment_and_owned_copies(self):
         queued = [self.frame(*identity) for identity in ((1, 10), (1, 10), (2, 10), (2, 11))]
         self.camera.frame_queue.try_wait_for_frame.side_effect = [(True, frame) for frame in queued]
-        with patch.object(self.driver.time, "monotonic_ns", side_effect=[100, 200, 300, 400]):
+        with patch.object(realsense.time, "monotonic_ns", side_effect=[100, 200, 300, 400]):
             frames = [self.camera.read() for _ in queued]
         self.assertEqual(
             [None if frame is None else frame.timestamp_ns for frame in frames],
@@ -84,7 +78,7 @@ class RealSenseTests(unittest.TestCase):
 
     def test_empty_read_and_persistent_stall_are_distinct(self):
         self.camera.frame_queue.try_wait_for_frame.return_value = (False, None)
-        with patch.object(self.driver.time, "monotonic_ns", side_effect=[1_000_000, 3_000_000_000]):
+        with patch.object(realsense.time, "monotonic_ns", side_effect=[1_000_000, 3_000_000_000]):
             self.assertIsNone(self.camera.read())
             with self.assertRaisesRegex(TimeoutError, "stopped producing"):
                 self.camera.read()
@@ -93,11 +87,11 @@ class RealSenseTests(unittest.TestCase):
     def test_frame_regression_and_single_channel_stall_are_rejected(self):
         self.camera.last_identity = (2, 10)
         self.camera.frame_queue.try_wait_for_frame.return_value = (True, self.frame(1, 10))
-        with patch.object(self.driver.time, "monotonic_ns", return_value=200):
+        with patch.object(realsense.time, "monotonic_ns", return_value=200):
             with self.assertRaisesRegex(RuntimeError, "backward"):
                 self.camera.read()
         self.camera.frame_queue.try_wait_for_frame.return_value = (True, self.frame(2, 11))
-        with patch.object(self.driver.time, "monotonic_ns", return_value=3_000_000_000):
+        with patch.object(realsense.time, "monotonic_ns", return_value=3_000_000_000):
             with self.assertRaisesRegex(TimeoutError, "depth"):
                 self.camera.read()
         self.camera.aligner.process.assert_not_called()
@@ -138,8 +132,8 @@ class RealSenseTests(unittest.TestCase):
             with self.subTest(model=model):
                 device = self.connect_device(model)
                 with (
-                    patch.object(self.driver, "WARMUP_FRAMES", 0),
-                    patch.object(self.driver.time, "sleep"),
+                    patch.object(realsense, "WARMUP_FRAMES", 0),
+                    patch.object(realsense.time, "sleep"),
                 ):
                     self.camera.connect()
                 self.assertEqual(self.camera.depth_scale_m, 0.001)
@@ -155,7 +149,7 @@ class RealSenseTests(unittest.TestCase):
         error = OSError("option failed")
         device.first_depth_sensor().set_option.side_effect = error
         self.sdk.pipeline().stop.side_effect = RuntimeError("stop failed")
-        with self.assertLogs(self.driver.logger, level="ERROR"):
+        with self.assertLogs(realsense.logger, level="ERROR"):
             with self.assertRaises(OSError) as caught:
                 self.camera.connect()
         self.assertIs(caught.exception, error)
@@ -173,7 +167,7 @@ class RealSenseTests(unittest.TestCase):
             [
                 sys.executable,
                 "-c",
-                "import sys; sys.modules['pyrealsense2'] = None; sys.modules['hand_tracking_sdk'] = None; from dexmani_real.config import load_experiment_config; from dexmani_real.sensor.camera import run_camera_worker; from dexmani_real.sensor.vr import run_vr_worker; load_experiment_config()",
+                "import sys; sys.modules['pyrealsense2'] = None; sys.modules['hand_tracking_sdk'] = None; from dexmani_real.config import load_experiment_config; from dexmani_real.sensor.realsense import run_camera; from dexmani_real.sensor.vr import run_vr; load_experiment_config()",
             ],
             capture_output=True,
             text=True,
@@ -190,6 +184,55 @@ class HandFrame(SimpleNamespace):
 
 
 class VRTests(unittest.TestCase):
+    def test_pose_conversion_normalizes_quaternion_and_rejects_invalid_input(self):
+        sdk = SimpleNamespace(
+            unity_left_to_flu_position=lambda x, y, z: (z, -x, y),
+            unity_left_to_flu_rotation=lambda *values: values,
+        )
+        pose = SimpleNamespace(x=1.0, y=2.0, z=3.0, qx=2.0, qy=0.0, qz=0.0, qw=2.0)
+        with patch.dict(sys.modules, {"hand_tracking_sdk": sdk}):
+            position, quaternion = vr._pose_to_flu(pose)
+            landmarks = vr._landmarks_to_flu([(1, 2, 3)] * 21)
+            np.testing.assert_array_equal(position, [3, -1, 2])
+            np.testing.assert_allclose(quaternion, np.array([1, 1, 0, 0]) / np.sqrt(2))
+            np.testing.assert_array_equal(landmarks, np.tile([3, -1, 2], (21, 1)))
+            pose.qx = pose.qw = 0
+            with self.assertRaises(ValueError):
+                vr._pose_to_flu(pose)
+            with self.assertRaises(ValueError):
+                vr._landmarks_to_flu([(1, 2, 3)] * 20)
+
+    def test_ipc_failure_propagates_and_clears_ready(self):
+        channels = SimpleNamespace(
+            is_running=SimpleNamespace(value=True),
+            vr_ready=threading.Event(),
+            vr_ring=Mock(),
+        )
+        channels.vr_ready.set()
+        error = ValueError("IPC write failed")
+        channels.vr_ring.write.side_effect = error
+        pose = SimpleNamespace(x=0.0, y=0.0, z=0.0, qx=0.0, qy=0.0, qz=0.0, qw=1.0)
+        event = HandFrame(
+            wrist=pose, landmarks=SimpleNamespace(points=[(0, 0, 0)] * 21),
+            side="right", wrist_recv_ts_ns=100, landmarks_recv_ts_ns=120, sequence_id=0,
+        )
+        sdk = SimpleNamespace(
+            HandFrame=HandFrame, HeadFrame=HeadFrame, HandSide=SimpleNamespace(RIGHT="right"),
+            unity_left_to_flu_position=lambda *values: values,
+            unity_left_to_flu_rotation=lambda *values: values,
+        )
+        events = Mock(__iter__=Mock(return_value=iter([event])))
+        with (
+            patch.dict(sys.modules, {"hand_tracking_sdk": sdk}),
+            patch.object(vr, "iter_vr_events", return_value=events),
+            patch.object(vr, "configure_logging"),
+        ):
+            with self.assertRaises(ValueError) as raised:
+                vr.run_vr(channels, VRConfig())
+        self.assertIs(raised.exception, error)
+        events.close.assert_called_once()
+        self.assertFalse(channels.vr_ready.is_set())
+
     def test_invalid_pose_is_rejected_and_source_clocks_are_preserved(self):
         channels = SimpleNamespace(
             is_running=SimpleNamespace(value=True),
@@ -227,7 +270,7 @@ class VRTests(unittest.TestCase):
             patch.object(vr, "configure_logging"),
         ):
             with self.assertLogs(vr.logger, level="WARNING"):
-                vr.run_vr_worker(channels, VRConfig())
+                vr.run_vr(channels, VRConfig())
         channels.vr_ring.write.assert_called_once()
         fields = channels.vr_ring.write.call_args.kwargs
         self.assertEqual(

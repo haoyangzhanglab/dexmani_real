@@ -14,7 +14,7 @@ from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.recorder import RecordingError
 from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import RobotError
-from dexmani_real.robot.system import DexManiRobot
+from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
@@ -28,8 +28,8 @@ from dexmani_real.runtime.observation import (
 )
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 from dexmani_real.runtime.state import RunEndReason, SessionState
-from dexmani_real.sensor.camera import run_camera_worker
-from dexmani_real.sensor.vr import run_vr_worker
+from dexmani_real.sensor.realsense import run_camera
+from dexmani_real.sensor.vr import run_vr
 from dexmani_real.teleop.audio import AudioFeedback
 from dexmani_real.teleop.config import DEFAULT_TASK_NAME
 from dexmani_real.teleop.loop import TeleopLoop
@@ -108,7 +108,7 @@ def run_teleop(
     keyboard = audio = None
     try:
         sensors = SensorWorkers(channels)
-        robot = DexManiRobot(
+        robot = Robot(
             runtime.arm, runtime.hand, run_signal=runtime_state.run_signal,
             stop_signal=runtime_state.stop_signal,
             emergency_signal=runtime_state.emergency_signal,
@@ -138,7 +138,7 @@ def run_teleop(
             ),
             vr_process=ctx.Process(
                 name="vr",
-                target=run_vr_worker,
+                target=run_vr,
                 args=(channels, runtime.vr),
             ),
         )
@@ -158,7 +158,7 @@ def run_teleop(
             sensors.start(
                 ctx.Process(
                     name="camera",
-                    target=run_camera_worker,
+                    target=run_camera,
                     args=(sensors.channels, runtime.camera),
                 ),
                 ready=sensors.channels.camera_ready,

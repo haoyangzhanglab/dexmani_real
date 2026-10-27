@@ -16,7 +16,7 @@ from dexmani_real.runtime.observation import (
     read_vr_frame,
 )
 from dexmani_real.sensor.config import CameraConfig
-from dexmani_real.sensor.camera import run_camera_worker
+from dexmani_real.sensor.realsense import run_camera
 
 
 def publish_record(ring, record):
@@ -278,12 +278,11 @@ class SensorWorkerTests(unittest.TestCase):
         camera.color_intrinsics.to_dict.return_value = {"width": 3, "height": 2}
         camera.read.side_effect = read
         self.addCleanup(camera.disconnect.assert_called_once)
-        with patch.dict("sys.modules", {
-            "dexmani_real.sensor.realsense": SimpleNamespace(
-                RealSenseCamera=Mock(return_value=camera),
-            ),
-        }), patch("dexmani_real.sensor.camera.configure_logging"):
-            run_camera_worker(self.channels, self.config)
+        with (
+            patch("dexmani_real.sensor.realsense.RealSenseCamera", return_value=camera),
+            patch("dexmani_real.sensor.realsense.configure_logging"),
+        ):
+            run_camera(self.channels, self.config)
         self.assertFalse(self.channels.camera_ready.is_set())
 
     def test_camera_publishes_driver_timestamps_and_skips_empty_reads(self):

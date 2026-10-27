@@ -3,7 +3,6 @@
 import logging
 import time
 from collections import deque
-from concurrent.futures import CancelledError
 from dataclasses import dataclass
 
 import numpy as np
@@ -264,8 +263,8 @@ class PolicyRollout:
             self.robot.reset_hand_feedback()
             row = self.start_observation(wait_for_hand=True)
             if not self.preparation_valid():
-                raise CancelledError("cancelled during initial feedback acquisition")
-        except CancelledError as exc:
+                raise OperationCancelled("cancelled during initial feedback acquisition")
+        except OperationCancelled as exc:
             self.finish(str(exc))
             return
         if row is None:
@@ -571,7 +570,7 @@ class PolicyRollout:
             if self.termination is not None:
                 raise
             preparing = self.run_id is None
-            cancelled = preparing and isinstance(exc, (OperationCancelled, CancelledError))
+            cancelled = preparing and isinstance(exc, OperationCancelled)
             stage = "preparation" if preparing else "control"
             detail = f"{stage}_failed: {type(exc).__name__}: {exc}"
             try:
