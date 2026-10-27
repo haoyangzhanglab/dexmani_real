@@ -9,17 +9,13 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def error_detail(stage, error):
-    return dict(stage=stage, exception_type=type(error).__name__, message=str(error))
-
-
 class SessionResults:
     """运动前创建未完成摘要，撤销运动后写入本轮结果。"""
 
-    def __init__(self, directory, kind):
+    def __init__(self, directory):
         self.path = Path(directory) / "session_result.json"
         self.session = dict(
-            kind=kind,
+            kind="policy",
             started_utc=utc_now(),
             ended_utc=None,
             outcome="incomplete",
@@ -84,11 +80,6 @@ class SessionResults:
 
     def record_errors(self, errors):
         self.session["errors"].extend(errors)
-
-    def record_home_result(self, *, ok, interrupted, reason):
-        self.session.setdefault("home_results", []).append(
-            dict(ok=ok, interrupted=interrupted, reason=reason)
-        )
 
     def finish_episode(
         self, reason, *, details=None, errors=(), raw=None, duration_s=None, **metrics

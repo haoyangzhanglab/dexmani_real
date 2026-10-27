@@ -3,7 +3,6 @@
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.control.action_mapping import ActionIntent
 from dexmani_real.geometry.pose import Pose, quat_wxyz_to_rotmat, rot6d_to_quat_wxyz
 
 
@@ -59,8 +58,10 @@ class VRController:
     def compute_target(self, row):
         mapped = self.map_wrist(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
         target = ema_smooth_pose(
-            mapped, self.smoothed_eef_pose,
-            self.config.ema_alpha_pos, self.config.ema_alpha_rot,
+            mapped,
+            self.smoothed_eef_pose,
+            self.config.ema_alpha_pos,
+            self.config.ema_alpha_rot,
         )
         hand = None
         if self.hand_retargeter is not None:
@@ -73,8 +74,8 @@ class VRController:
             if self.hand_target is None:
                 return None
             hand = self.hand_target
-        return self.action_mapper.map(
-            ActionIntent("eef", target, hand), row.arm["qpos"][0], self.previous_arm_command
+        return self.action_mapper.map_eef(
+            target, hand, row.arm["qpos"][0], self.previous_arm_command
         )
 
     def commit(self, result):

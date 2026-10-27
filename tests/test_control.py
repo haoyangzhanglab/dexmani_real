@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from dexmani_real.control import homing
-from dexmani_real.control.action_mapping import ActionIntent, ActionMapper
+from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.collision import CollisionModel
 from dexmani_real.control.config import (
     EnvironmentConfig,
@@ -80,7 +80,7 @@ class IKSearchTests(unittest.TestCase):
     def test_continuation_accepts_once_and_receives_explicit_hand_pose(self):
         self.solver.model.compute_IK_CLIK.return_value = (np.zeros(7), True, None)
         result = self.solve()
-        self.assertTrue(result.success)
+        self.assertIsNotNone(result.qpos)
         self.solver.model.compute_IK_CLIK.assert_called_once()
         self.solver.constraints.endpoint_rejection.assert_called_once()
         self.solver.constraints.collision_model.set_hand_qpos.assert_called_once_with(self.hand)
@@ -88,7 +88,7 @@ class IKSearchTests(unittest.TestCase):
     def test_same_seed_is_not_retried(self):
         self.solver.model.compute_IK_CLIK.return_value = (np.zeros(7), False, None)
         result = self.solve()
-        self.assertFalse(result.success)
+        self.assertIsNone(result.qpos)
         self.assertEqual(result.reason, "solver_no_convergence")
         self.solver.model.compute_IK_CLIK.assert_called_once()
         self.solver.constraints.endpoint_rejection.assert_not_called()
@@ -97,7 +97,7 @@ class IKSearchTests(unittest.TestCase):
         current = np.full(7, 0.9)
         self.solver.model.compute_IK_CLIK.return_value = (current, True, None)
         self.solver.nullspace_direction = Mock(return_value=None)
-        self.assertTrue(self.solve(current, current - 0.01).success)
+        self.assertIsNotNone(self.solve(current, current - 0.01).qpos)
         self.assertEqual(self.solver.model.compute_IK_CLIK.call_count, 2)
         self.solver.constraints.endpoint_rejection.assert_called_once()
 
@@ -114,7 +114,7 @@ class IKSearchTests(unittest.TestCase):
         self.solver.compute_eef_jacobian_base = Mock(return_value=np.eye(6, 7))
         with patch.object(np.linalg, "svd", wraps=np.linalg.svd) as svd:
             result = self.solve(current, current + 0.01)
-        self.assertTrue(result.success)
+        self.assertIsNotNone(result.qpos)
         np.testing.assert_array_equal(result.qpos, candidates[2])
         self.assertEqual(self.solver.model.compute_IK_CLIK.call_count, 4)
         self.assertEqual(self.solver.constraints.endpoint_rejection.call_count, 4)
@@ -179,7 +179,7 @@ class GeometryTests(unittest.TestCase):
             result = solver.solve(
                 target, current, current, hand_qpos=np.deg2rad(self.hand.home_qpos_deg)
             )
-            self.assertTrue(result.success, result.reason)
+            self.assertIsNotNone(result.qpos, result.reason)
             current = result.qpos
 
     def test_unified_scene_preserves_obstacles_table_and_model_limits(self):
@@ -194,7 +194,7 @@ class GeometryTests(unittest.TestCase):
         table = CollisionModel(table=EnvironmentConfig().table, table_plane_abcd=(0, 0, 1, 1))
         table.set_hand_qpos(hand)
         self.assertIsNone(table.rejection(q))
-        self.assertGreater(table.minimum_table_distance(q), 0.5)
+        self.assertGreater(table.minimum_table_distance(), 0.5)
         hand[0] = 10
         table.set_hand_qpos(hand)
         self.assertEqual(table.rejection(q), "model_joint_limits")
@@ -209,7 +209,7 @@ class GeometryTests(unittest.TestCase):
             ("eef", self.mapper.solver.compute_eef_pose_base(current + 0.01)),
         ):
             with self.subTest(mode=mode):
-                result = self.mapper.map(ActionIntent(mode, target, hand), current)
+                result = getattr(self.mapper, f"map_{mode}")(target, hand, current)
                 self.assertIsNone(result.rejection_reason)
                 command = RobotCommand(1, result.arm_qpos, result.hand_qpos)
                 control = self.mapper.control_from_command(command, mode)
@@ -242,23 +242,23 @@ class GeometryTests(unittest.TestCase):
 class HomeGeometryTests(unittest.TestCase):
     def setUp(self):
         self.path = np.array([np.full(7, value) for value in (0, 0.01, 0.02)])
-        self.planner = SimpleNamespace(
+        self.planner = homing.HomePlanner.__new__(homing.HomePlanner)
+        self.planner.__dict__.update(
             arm=ArmConfig(),
             environment=EnvironmentConfig(),
             limits=np.array([[-1.0, 1.0]] * 7),
             workspace_bounds=np.array([[-1.0, 1.0]] * 3),
-            arm_fk=SimpleNamespace(forward=Mock(return_value=(np.zeros(3), np.zeros(6)))),
             collision_model=SimpleNamespace(
                 rejection=Mock(return_value=None),
+                eef_position=Mock(return_value=np.zeros(3)),
                 table=SimpleNamespace(soft_clearance_m=0.02),
                 minimum_table_distance=Mock(side_effect=[0.01, 0.015, 0.03]),
             ),
         )
 
     def check_path(self, *, escape=True):
-        homing.check_home_path(
+        self.planner._check_path(
             self.path,
-            self.planner,
             allow_table_soft_escape=escape,
         )
 
@@ -268,7 +268,7 @@ class HomeGeometryTests(unittest.TestCase):
         self.planner.environment = replace(
             self.planner.environment, table_z_surface_m=0.03, hand_safety_margin_m=0.06
         )
-        clearance, measurement, source = homing.table_clearance_m(self.planner, np.zeros(7))
+        clearance, measurement, source = self.planner._table_clearance()
         self.assertAlmostEqual(clearance, 0.03)
         self.assertEqual(measurement, 0.12)
         self.assertEqual(source, "hand_frame_proxy")
@@ -285,7 +285,7 @@ class HomeGeometryTests(unittest.TestCase):
             self.check_path()
 
     def test_workspace_and_backend_failures_are_distinct(self):
-        self.planner.arm_fk.forward.return_value = (np.ones(3) * 2, None)
+        self.planner.collision_model.eef_position.return_value = np.ones(3) * 2
         with self.assertRaisesRegex(homing.HomePathRejected, "workspace"):
             self.check_path()
         self.planner.collision_model.rejection.side_effect = RuntimeError("geometry failure")
@@ -298,8 +298,8 @@ class HomeGeometryTests(unittest.TestCase):
         planner.canonicalize_qpos = Mock(side_effect=lambda q, ref: q)
         current, target = np.zeros(7), np.full(7, 0.2)
         with patch.object(
-            homing,
-            "check_home_path",
+            homing.HomePlanner,
+            "_check_path",
             side_effect=[
                 homing.HomePathRejected("direct"),
                 homing.HomePathRejected("proximal"),
@@ -315,14 +315,14 @@ class HomeGeometryTests(unittest.TestCase):
         planner.canonicalize_qpos.side_effect = None
         with (
             patch.object(
-                homing,
-                "compute_joint_home_path",
+                homing.HomePlanner,
+                "_candidate_path",
                 side_effect=[
                     homing.HomePathRejected("canonical"),
                     np.stack([current, wrapped]),
                 ],
             ),
-            patch.object(homing, "check_home_path") as check,
+            patch.object(homing.HomePlanner, "_check_path") as check,
         ):
             path = planner.plan(current, target)
         np.testing.assert_array_equal(path[-1], target)
@@ -331,7 +331,7 @@ class HomeGeometryTests(unittest.TestCase):
     def test_technical_failure_does_not_try_another_home_candidate(self):
         planner = homing.HomePlanner.__new__(homing.HomePlanner)
         planner.arm = ArmConfig()
-        with patch.object(homing, "check_home_path", side_effect=RuntimeError("backend")) as check:
+        with patch.object(homing.HomePlanner, "_check_path", side_effect=RuntimeError("backend")) as check:
             with self.assertRaisesRegex(RuntimeError, "backend"):
                 planner.plan(np.zeros(7), np.ones(7) * 0.2)
         check.assert_called_once()
@@ -341,7 +341,7 @@ class HomeGeometryTests(unittest.TestCase):
         planner.arm = replace(ArmConfig(), homing=HomingConfig(convergence_rad=0.0001))
         planner.limits = np.array([[-0.5, 0.5]] * 7)
         current, target = np.zeros(7), np.full(7, 0.001)
-        with patch.object(homing, "check_home_path") as check:
+        with patch.object(homing.HomePlanner, "_check_path") as check:
             path = planner.plan(current, target)
             np.testing.assert_array_equal(path, [current, target])
             self.assertEqual(planner.plan(target, target).shape, (0, 7))
@@ -359,7 +359,7 @@ class HomeGeometryTests(unittest.TestCase):
         planner.arm = ArmConfig()
         planner.limits = np.array([[-1.0, 1.0]] * 7)
         with patch.object(
-            homing, "check_home_path", side_effect=homing.HomePathRejected("collision")
+            homing.HomePlanner, "_check_path", side_effect=homing.HomePathRejected("collision")
         ) as check:
             with self.assertRaisesRegex(homing.HomePathRejected, "collision"):
                 planner.plan(np.zeros(7), np.zeros(7))

@@ -93,7 +93,7 @@ XHand 的 SDK 载荷解析、错误码和板卡诊断位于 `robot/xhand/driver.
 
 ## 运行接口与错误处理
 
-遥操作入口为 `teleop.session.run_teleop(...)`，回放入口为 `replay.run.run_replay(...)`，对应脚本解析参数并调用入口。
+遥操作入口为 `teleop.run.run_teleop(...)`，回放入口为 `replay.run.run_replay(...)`，对应脚本解析参数并调用入口。
 
 回放输出 `replay_data.npz`（实测关节、候选及来源/提交时间戳）、`metrics.json`（按帧索引比较的误差）和 `session_result.json`（回放、回零与收尾结果）。候选和提交完成都不代表物理到位；手部准备不占回放行，准备时长保存在运行摘要中。零行指标使用 `null`，不表示零误差。
 
@@ -101,7 +101,7 @@ XHand 的 SDK 载荷解析、错误码和板卡诊断位于 `robot/xhand/driver.
 
 点云诊断的装配、运行、快照输出及收尾集中在 `scripts/tools/view_pointcloud.py`。
 
-`teleop` 中，`session.py` 装配资源，`loop.py` 的 `TeleopLoop` 管理准备、控制和录制收尾，`vr.py` 的 `VRController` 负责锚点映射与 EMA；键盘点动和语音分别位于 `keyboard.py`、`audio.py`。手部算法保留 `retargeting/tag.py`、`dexpilot.py` 和共用的 `landmarks.py`。配置类型统一使用 `Config` 后缀，YAML 字段及默认值保持不变。
+`teleop` 中，`run.py` 装配资源并完成手部回零与 VR 启动，`loop.py` 的 `TeleopLoop` 管理分段控制和录制收尾，`vr.py` 的 `VRController` 负责锚点映射与 EMA；键盘点动和语音分别位于 `keyboard.py`、`audio.py`。手部算法保留 `retargeting/tag.py`、`dexpilot.py` 和共用的 `landmarks.py`。配置类型统一使用 `Config` 后缀。TAG 的机器人指长、坐标约定及优化器容差和迭代上限固定在算法内部；人体指长、缩放、平滑和捏合权重仍可配置。
 
 遥操作配置直接使用以下字段，覆盖顺序为 CLI > YAML > 默认值；未定义的配置键会报错。
 
@@ -117,9 +117,9 @@ teleop:
 
 VR 接收器在发布前拒绝无效传感数据。映射器按已接纳的观测建立锚点，映射或重置发生技术错误时直接抛出异常；重置失败会清除旧锚点。遥操作控制器复用动作检查器的 FK 初始化 VR 锚点与 EMA，手部重定向仅在建立新锚点时用实测关节角重置，EMA 只在命令正常提交后更新参考。
 
-`TAGRetargeter` 集中实现两阶段目标函数和解析梯度，复用 `HandFK` 的固定模型与关节顺序；`DexPilotRetargeter` 直接调用现有 DexPilot 目标函数、NLopt 和低通滤波器。退化手部几何不产生目标；求解异常（包括 `RoundoffLimited`）停止当前段并沿会话错误路径退出，不返回旧目标或退回 TAG 第一阶段。显式提供的非法初值直接报错；省略初值仍从关节限位中点开始。
+`TAGRetargeter` 集中实现两阶段目标函数和解析梯度，仅在优化器请求梯度时计算雅可比，复用 `HandFK` 的固定模型与关节顺序；`DexPilotRetargeter` 直接调用现有 DexPilot 目标函数、NLopt 和低通滤波器。退化手部几何不产生目标；求解异常（包括 `RoundoffLimited`）停止当前段并沿会话错误路径退出，不返回旧目标或退回 TAG 第一阶段。显式提供的非法初值直接报错；省略初值仍从关节限位中点开始。
 
-IK 使用入口明确提供的运行关节限位，正常无解返回 `IKResult`，求解器、FK 或碰撞后端故障直接抛出原始异常。HOME 仅对 `HomePathRejected` 表示的几何拒绝尝试其他候选路径，候选耗尽、取消或等待超时返回失败结果；非法目标与技术异常传播到会话错误处理和收尾边界。
+`control/actions.py` 提供 `map_joint` 与 `map_eef`，统一返回 `ActionResult`；关节拒绝仍保留诊断候选，发送入口必须检查 `rejection_reason`。IK 直接使用 MPlib 的 `PinocchioModel` 和入口提供的运行关节限位，以 `IKResult.qpos is None` 表示正常无解，求解器、FK 或碰撞后端故障直接抛出原始异常。HOME 每个路径点共用一次运动学更新完成碰撞、EEF 工作空间和桌面间距检查，仅对 `HomePathRejected` 表示的几何拒绝尝试其他候选路径，候选耗尽、取消或等待超时返回失败结果；非法目标与技术异常传播到会话错误处理和收尾边界。
 
 XHand 保留 serial 与 EtherCAT，连接失败直接报告，不自动重试。普通发送遇到 CRC 只等待下一条目标，持续失败超过反馈预算即报错；停止请求可在 0.25 s 内重发。状态码明确不可用的触觉被屏蔽，有限向量缓存保留原始来源时间；SDK 结构错误和复位调用异常直接传播。连接清理失败不会覆盖初始错误，未释放的句柄仍由设备对象保留。
 
@@ -139,9 +139,13 @@ XHand 保留 serial 与 EtherCAT，连接失败直接报告，不自动重试。
 
 Teleop 中断会登记技术失败并传播，关闭时继续按原保存或丢弃意图收尾；recorder 的首次收尾请求不会被重入覆盖。收尾超时仍报告 pending，不在同一次关闭中重新开启等待预算。Policy 在会话关闭末尾核对对应 episode 的 Raw 发布状态、实际路径和帧数，再写入 `session_result.json`；该摘要反映最后一次确认，不保证仍 pending 的 writer 之后的结果，也不会清除首次终止原因或已有错误。
 
-`EpisodeReader` 从 `timestamp` 数据集推导帧数，Raw 不再保存冗余 `num_frames` 属性。首次读取时校验已定义数值字段和 `timing/rows` 的布局，并缓存数据集；`read_camera()` 返回 `CameraSnapshot`，`read_timing_rows(fields)` 保留原始 `int64` 纳秒及 `-1` 缺失标记。诊断读取不隐式执行训练或物理回放准入；Canonical 导出与物理回放显式调用 `validate_completion()`、`validate_rows()`。CordViP 可读取失败产物或缺失来源时钟的诊断数据，但同一 Raw 行不能证明手和相机物理同步。文件和视频由 Reader 统一关闭。
+`data/raw.py` 集中提供 `RawReader`、`RawWriter` 和元数据编解码。Raw 以 `timing/rows.observation_ns` 为唯一观测时钟，以该表长度作为帧数。`timestamps_s` 在整数时钟相减后转换为相对秒数，空录制返回空数组；反复访问时间轴的调用方应在本地保存该数组。
 
-Canonical 使用 `ExportConfig`，保留 13 个训练字段、episode 边界及物理参数。导出遇到损坏或不满足训练要求的 episode 立即报错，保留已有临时结果；使用 `--exclude EPISODE` 显式排除后重新导出。最终输出必须尚未占用且不与输入目录重叠，全部完成后才原子发布。处理批次根据 64 MiB 数组预算和最多 100 帧确定，不再提供 `--chunk-frames`；存储块仍按字段大小独立选择。
+`RawReader` 首次读取时校验数值字段和 `timing/rows` 的布局，并缓存数据集。`read_camera()` 返回 `CameraSnapshot`，`read_timing_rows(fields)` 保留原始 `int64` 纳秒和 `-1` 缺失标记，文件与视频由 Reader 统一关闭。诊断读取与训练、物理回放准入分开；导出和物理回放显式调用 `validate_completion()`、`validate_rows()`。CordViP 的 Raw 行关联不证明手和相机物理同步；缺失相机时钟时显式使用观测时钟，原始相机时钟仍保留 `-1`。
+
+Raw 写入缓冲按 8 MiB 预算选择 1–32 帧，单帧超过预算时保留一帧。`RawWriter.finish()` 刷新行缓冲、结束视频编码并写入终止详情，再写入技术状态；`close()` 释放资源。录制器在成功收尾后原子发布，写入或收尾失败时保留临时产物并报告错误。
+
+Canonical 由 `data/export.py` 的 `export_zarr(..., processing=ExportConfig(...))` 导出，提供 13 个训练字段、episode 边界及物理参数。导出遇到损坏或不满足训练要求的 episode 立即报错，保留已有临时结果；使用 `--exclude EPISODE` 显式排除后重新导出。最终输出必须尚未占用且不与输入目录重叠，全部完成后才原子发布。处理批次根据 64 MiB 数组预算和最多 100 帧确定，不再提供 `--chunk-frames`；存储块仍按字段大小独立选择。
 
 ## 离线验证
 
@@ -165,8 +169,7 @@ mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases \
   dexmani_real/ipc dexmani_real/sensor \
   dexmani_real/geometry dexmani_real/perception dexmani_real/control dexmani_real/robot \
   dexmani_real/calibration dexmani_real/runtime dexmani_real/deployment dexmani_real/utils \
-  dexmani_real/data/canonical \
-  dexmani_real/data/session_results.py dexmani_real/data/raw/reader.py \
+  dexmani_real/data \
   dexmani_real/teleop dexmani_real/config.py dexmani_real/replay \
   scripts/tools/view_pointcloud.py scripts/tools/view_realsense.py scripts/tools/control_xhand.py \
   scripts/visualize_episode.py scripts/export_zarr.py \

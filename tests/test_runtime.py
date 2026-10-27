@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from dexmani_real.config import load_experiment_config
+from dexmani_real.data.raw import camera_metadata
 from dexmani_real.geometry.pose import Pose
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.xarm7.config import ArmConfig
@@ -409,7 +410,7 @@ class CameraSnapshotTests(unittest.TestCase):
     def test_absent_calibration_is_allowed_only_for_optional_consumers(self):
         camera = snapshot_camera_parameters(self.channels, self.config, None)
         self.assertIsNone(camera.T_xarm_base_from_color)
-        self.assertNotIn("camera_T_xarm_base_from_color", camera.metadata())
+        self.assertNotIn("camera_T_xarm_base_from_color", camera_metadata(camera))
         with self.assertRaisesRegex(ValueError, "requires current extrinsics"):
             snapshot_camera_parameters(self.channels, self.config, None, require_extrinsics=True)
 
@@ -419,9 +420,9 @@ class CameraSnapshotTests(unittest.TestCase):
         transform[:3, 3] = 1
         np.testing.assert_array_equal(camera.T_xarm_base_from_color, np.eye(4))
         self.assertFalse(camera.T_xarm_base_from_color.flags.writeable)
-        self.assertEqual(camera.metadata()["camera_serial"], "active")
+        self.assertEqual(camera_metadata(camera)["camera_serial"], "active")
         self.assertEqual(
-            camera.metadata()["camera_T_xarm_base_from_color"], np.eye(4).ravel().tolist(),
+            camera_metadata(camera)["camera_T_xarm_base_from_color"], np.eye(4).ravel().tolist(),
         )
 
 

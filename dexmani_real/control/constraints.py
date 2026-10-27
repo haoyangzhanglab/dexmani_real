@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from dexmani_real.control.collision import CollisionModel
 from dexmani_real.geometry.kinematics import ArmFK
 from dexmani_real.robot.model import XARM7_EQUIVALENT_JOINT_MASK
 
@@ -47,20 +48,12 @@ def equivalent_joint_delta(qpos, reference_qpos):
 class MotionConstraints:
     """检查目标端点；HOME 路径由 HomePlanner 单独检查。"""
 
-    def __init__(
-        self,
-        collision_model,
-        *,
-        joint_lower_rad,
-        joint_upper_rad,
-        workspace,
-        workspace_margin_m,
-    ):
-        self.collision_model = collision_model
+    def __init__(self, arm, environment):
+        self.collision_model = CollisionModel(static_boxes=environment.static_boxes)
         self.target_fk = ArmFK()
-        self.limits = np.column_stack((joint_lower_rad, joint_upper_rad))
-        self.workspace = np.array(workspace, dtype=np.float64, copy=True)
-        self.margin = workspace_margin_m
+        self.limits = np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper))
+        self.workspace = environment.workspace.as_array()
+        self.margin = environment.eef_workspace_margin_m
 
     def joint_rejection(self, target, current, previous):
         return joint_target_rejection(target, current, previous, self.limits)

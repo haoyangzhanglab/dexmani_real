@@ -10,12 +10,12 @@ import numpy as np
 from ..rgbd import Frame
 
 
-def raw_frame_identity(episode, row_index, observation_s, timing):
-    """One construction of the existing Raw source string and consumed camera clock."""
+def raw_frame_identity(episode, row_index, timing):
+    """使用 Raw 纳秒时钟；缺失相机时钟时明确标记为观测时钟。"""
     source = f"raw:{episode}:row:{row_index}"
-    stamp = int(round(float(observation_s) * 1e9))
-    clock = "raw_observation_relative"
-    if int(timing["camera_sequence"]) > 0:
+    stamp = int(timing["observation_ns"])
+    clock = "host_monotonic_observation"
+    if int(timing["camera_sequence"]) >= 0:
         source = f"raw:{episode}:camera:{int(timing['camera_sequence'])}"
     if int(timing["camera_ns"]) > 0:
         stamp, clock = int(timing["camera_ns"]), "host_monotonic_oldest_rgbd_receive"
@@ -24,11 +24,11 @@ def raw_frame_identity(episode, row_index, observation_s, timing):
 
 def iter_raw_episode(path: str | Path) -> Iterator[Frame]:
     """Read Raw rows using decoded MP4 RGB; exhausting the iterator verifies the full frame count."""
-    from dexmani_real.data.raw.reader import EpisodeReader
+    from dexmani_real.data.raw import RawReader
 
     episode_path = Path(path).expanduser().resolve()
-    with EpisodeReader(episode_path) as reader:
-        reader.require_fields("rgb", "depth", "timestamp")
+    with RawReader(episode_path) as reader:
+        reader.require_fields("rgb", "depth")
         camera = reader.read_camera()
         intrinsics = camera.color
         K = intrinsics.matrix()
@@ -36,14 +36,10 @@ def iter_raw_episode(path: str | Path) -> Iterator[Frame]:
         depth = reader["depth"]
         if depth.shape != (reader.num_frames, *expected_shape) or depth.dtype != np.uint16:
             raise ValueError("Raw depth must be uint16 [rows,H,W] matching color intrinsics")
-        observation_s = np.asarray(reader["timestamp"][:], dtype=np.float64)
-        if (
-            not np.isfinite(observation_s).all()
-            or np.any(observation_s < 0)
-            or np.any(np.diff(observation_s) <= 0)
-        ):
-            raise ValueError("Raw observation timestamps must be finite and strictly increasing")
-        timing = reader.read_timing_rows(("camera_sequence", "camera_ns"))
+        timing = reader.read_timing_rows(("observation_ns", "camera_sequence", "camera_ns"))
+        observation = timing["observation_ns"]
+        if np.any(observation <= 0) or np.any(np.diff(observation) <= 0):
+            raise ValueError("Raw observation clocks must be positive and strictly increasing")
         images = iter(reader.iter_rgb_frames())
         for row_index in range(reader.num_frames):
             rgb = next(images, None)
@@ -54,7 +50,6 @@ def iter_raw_episode(path: str | Path) -> Iterator[Frame]:
             source_id, timestamp_ns, clock = raw_frame_identity(
                 episode_path,
                 row_index,
-                observation_s[row_index],
                 timing[row_index],
             )
             yield Frame(
@@ -112,7 +107,7 @@ class RawHandCloudProvider:
 
     def __init__(self, episode, config_path=None, num_points=1024, seed=0):
         from dexmani_real.config import load_experiment_config
-        from dexmani_real.data.raw.reader import EpisodeReader
+        from dexmani_real.data.raw import RawReader
         from dexmani_real.geometry.kinematics import ArmFK
         from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
         from dexmani_real.robot.model import (
@@ -137,16 +132,15 @@ class RawHandCloudProvider:
         self.T_eef_handbase = np.eye(4)
         self.T_eef_handbase[:3, 3] = mount
         self.T_eef_handbase[:3, :3] = quat_wxyz_to_rotmat(config.hand.T_eef_handbase_quat_wxyz)
-        with EpisodeReader(self.episode) as reader:
-            reader.require_fields("arm_qpos", "hand_qpos", "timestamp")
+        with RawReader(self.episode) as reader:
+            reader.require_fields("arm_qpos", "hand_qpos")
             self.arm_qpos = reader["arm_qpos"][:]
             self.hand_qpos = reader["hand_qpos"][:]
-            self.observation_s = reader["timestamp"][:]
             self.T_base_camera = reader.read_camera().T_xarm_base_from_color
             if self.T_base_camera is None:
                 raise ValueError("hand cloud requires recorded camera extrinsics")
             self.timing = reader.read_timing_rows(
-                ("arm_ns", "hand_ns", "camera_ns", "camera_sequence")
+                ("observation_ns", "arm_ns", "hand_ns", "camera_ns", "camera_sequence")
             )
             raw_notes = {
                 key: str(reader.meta[key])
@@ -195,7 +189,6 @@ class RawHandCloudProvider:
         expected_source, expected_stamp, expected_clock = raw_frame_identity(
             self.episode,
             row,
-            self.observation_s[row],
             timing,
         )
         arm_ns, hand_ns, camera_ns = (

@@ -1,22 +1,12 @@
 """动作映射只生成目标，执行授权由运行层管理。"""
 
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 
 from dexmani_real.control.constraints import MotionConstraints, wrap_nearest_equivalent
 from dexmani_real.control.ik import IKSolver
 from dexmani_real.geometry.pose import Pose
-
-
-@dataclass(frozen=True)
-class ActionIntent:
-    """机械臂绝对关节目标或基座系 EEF 位姿，位置单位 m、旋转为 WXYZ。"""
-
-    mode: Literal["joint", "eef"]
-    arm: np.ndarray | Pose
-    hand: np.ndarray | None
 
 
 @dataclass(frozen=True)
@@ -50,16 +40,7 @@ class ActionMapper:
         """在线允许桌面接触，HOME 使用独立场景。"""
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
-        from dexmani_real.control.collision import CollisionModel
-
-        collision = CollisionModel(static_boxes=environment.static_boxes)
-        constraints = MotionConstraints(
-            collision,
-            joint_lower_rad=arm.joint_limit_lower,
-            joint_upper_rad=arm.joint_limit_upper,
-            workspace=environment.workspace.as_array(),
-            workspace_margin_m=environment.eef_workspace_margin_m,
-        )
+        constraints = MotionConstraints(arm, environment)
         solver = (
             IKSolver(
                 constraints,
@@ -91,8 +72,6 @@ class ActionMapper:
             if previous_arm_command_qpos is None
             else np.asarray(previous_arm_command_qpos, dtype=np.float64)
         )
-        if any(q.shape != (7,) or not np.isfinite(q).all() for q in (current, previous)):
-            raise ValueError("current and previous arm state must be finite (7,) vectors")
         if self.hand_enabled:
             if hand is None:
                 raise ValueError("hand-enabled action mapping requires a hand intent")
@@ -104,7 +83,7 @@ class ActionMapper:
             )
         return current, previous, hand
 
-    def prepare_joint_target(self, arm, hand, current_arm_qpos, previous_arm_command_qpos=None):
+    def map_joint(self, arm, hand, current_arm_qpos, previous_arm_command_qpos=None):
         """保留投影候选，调用方必须在发送前处理拒绝原因。"""
         arm = np.asarray(arm, dtype=np.float64)
         if arm.shape != (7,) or not np.isfinite(arm).all():
@@ -112,31 +91,24 @@ class ActionMapper:
         current, previous, hand = self.prepare_inputs(
             hand, current_arm_qpos, previous_arm_command_qpos
         )
+        if any(q.shape != (7,) or not np.isfinite(q).all() for q in (current, previous)):
+            raise ValueError("current and previous arm state must be finite (7,) vectors")
         target = project_arm_command(
             arm,
             current,
             joint_lower_rad=self.constraints.limits[:, 0],
             joint_upper_rad=self.constraints.limits[:, 1],
         )
-        return target, hand, self.joint_rejection(target, hand, current, previous)
+        return ActionResult(target, hand, self.joint_rejection(target, hand, current, previous))
 
-    def map(self, intent, current_arm_qpos, previous_arm_command_qpos=None):
-        if intent.mode not in ("joint", "eef"):
-            raise ValueError("action mode must be joint or eef")
-        if intent.mode == "joint":
-            target, hand, reason = self.prepare_joint_target(
-                intent.arm, intent.hand, current_arm_qpos, previous_arm_command_qpos
-            )
-            return ActionResult(target if reason is None else None, hand, rejection_reason=reason)
-        if not isinstance(intent.arm, Pose):
-            raise TypeError("EEF intent must be an xArm-base Pose")
+    def map_eef(self, pose: Pose, hand, current_arm_qpos, previous_arm_command_qpos=None):
         current, previous, hand = self.prepare_inputs(
-            intent.hand, current_arm_qpos, previous_arm_command_qpos
+            hand, current_arm_qpos, previous_arm_command_qpos
         )
         if self.solver is None:
             raise ValueError("EEF mapping requires an online IK solver")
         # 复制后投影，避免改写输入目标及 Teleop 的 EMA 参考。
-        pose = intent.arm.copy()
+        pose = pose.copy()
         workspace = self.constraints.workspace
         pose.p = np.clip(pose.p, workspace[:, 0], workspace[:, 1])
         result = self.solver.solve(
@@ -145,9 +117,9 @@ class ActionMapper:
             previous,
             hand_qpos=hand if hand is not None else self.home_hand_qpos,
         )
-        reason = None if result.success else result.reason
+        reason = None if result.qpos is not None else result.reason
         return ActionResult(
-            result.qpos if reason is None else None,
+            result.qpos,
             hand,
             rejection_reason=reason,
             eef_pose=pose,

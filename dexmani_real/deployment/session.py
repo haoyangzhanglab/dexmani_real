@@ -5,22 +5,25 @@ import multiprocessing as mp
 import time
 from itertools import count
 
+import numpy as np
+
 from dexmani_real.calibration.camera.extrinsics import (
     load_camera_extrinsics,
     load_optional_camera_extrinsics,
 )
-from dexmani_real.control.action_mapping import ActionMapper
+from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePlanner
+from dexmani_real.data.raw import camera_metadata
 from dexmani_real.data.recorder import (
     EpisodeRecorder,
     RecordingError,
 )
-from dexmani_real.data.session_results import SessionResults, error_detail
 from dexmani_real.deployment.observation import (
     build_observation_camera,
     build_observation_kinematics,
     build_policy_observation,
 )
+from dexmani_real.deployment.results import SessionResults
 from dexmani_real.deployment.rollout import PolicyRollout, failure_reason
 from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import OperationCancelled, RobotError
@@ -41,7 +44,7 @@ from dexmani_real.runtime.observation import (
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.atomic_io import atomic_yaml_dump
-from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.log import configure_logging, error_detail
 
 logger = logging.getLogger(__name__)
 MODEL_STARTUP_TIMEOUT_S = 300.0
@@ -97,7 +100,7 @@ class PolicySession:
             f"{1.0 / self.info.control_dt_s:g} Hz"
         )
         print("正在初始化模型和设备…", flush=True)
-        self.results = SessionResults(self.output_dir, "policy")
+        self.results = SessionResults(self.output_dir)
         self.runtime_state = self.sensors = self.robot = None
         self.model = self.recorder = None
         failure = None
@@ -268,7 +271,7 @@ class PolicySession:
         if self.camera_snapshot is not None:
             self.run_config["effective_camera"] = {
                 "camera_T_xarm_base_from_color": None,
-                **self.camera_snapshot.metadata(),
+                **camera_metadata(self.camera_snapshot),
                 "transform_direction": "color_optical_to_xarm_base",
                 "translation_units": "m",
             }
@@ -382,8 +385,15 @@ class PolicySession:
     def warmup_policy(self):
         timeout_s = MODEL_STARTUP_TIMEOUT_S
         deadline = time.monotonic() + timeout_s
+        context = None
+        if self.info.hand_history_steps is not None:
+            initial_hand = np.deg2rad(self.runtime.hand.home_qpos_deg).astype(np.float32)
+            context = {"hand_history": np.repeat(
+                initial_hand[None], self.info.hand_history_steps, axis=0,
+            )}
         self.model.submit(
             "load",
+            action_context=context,
             samples=5,
             rgb_hw=(self.runtime.camera.height, self.runtime.camera.width),
             rtc_guidance_cap=(

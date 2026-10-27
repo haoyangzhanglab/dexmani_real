@@ -2,7 +2,6 @@ import threading
 import time
 import unittest
 from contextlib import ExitStack
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -12,7 +11,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
 from dexmani_real.config import load_experiment_config
-from dexmani_real.control.action_mapping import ActionResult
+from dexmani_real.control.actions import ActionResult
 from dexmani_real.data.recorder import RecordingError
 from dexmani_real.geometry.kinematics import SDK_TO_URDF_IDX
 from dexmani_real.geometry.pose import Pose, quat_wxyz_to_rotmat
@@ -20,10 +19,14 @@ from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.runtime.state import RunEndReason, SessionState
-from dexmani_real.teleop import audio, loop, session
+from dexmani_real.teleop import audio, loop
+from dexmani_real.teleop import run as session
 from dexmani_real.teleop.config import DexPilotConfig, TAGConfig, TeleopConfig
 from dexmani_real.teleop.retargeting.dexpilot import DexPilotRetargeter
-from dexmani_real.teleop.retargeting.landmarks import estimate_palm_frame, prepare_landmarks
+from dexmani_real.teleop.retargeting.landmarks import (
+    estimate_palm_frame,
+    prepare_landmarks,
+)
 from dexmani_real.teleop.retargeting.tag import TAGRetargeter
 from dexmani_real.teleop.vr import VRController, ema_smooth_pose
 
@@ -60,8 +63,8 @@ def vr_controller(hand=None):
     mapper.constraints.target_fk.forward.return_value = (
         np.array([.4, .1, .3]), np.array([1., 0., 0., 0., 1., 0.]),
     )
-    mapper.map.side_effect = lambda intent, current, previous: ActionResult(
-        np.arange(7, dtype=float), intent.hand, eef_pose=intent.arm,
+    mapper.map_eef.side_effect = lambda pose, hand, current, previous: ActionResult(
+        np.arange(7, dtype=float), hand, eef_pose=pose,
     )
     rotation = Rotation.from_euler("xyz", [.3, -.2, .4]).as_matrix()
     return VRController(mapper, hand, TeleopConfig(), rotation)
@@ -152,7 +155,7 @@ class VRTests(unittest.TestCase):
         self.assertIsNone(controller.compute_target(row))
         self.assertIsNone(controller.compute_target(row))
         hand.retarget.assert_called_once()
-        controller.action_mapper.map.assert_not_called()
+        controller.action_mapper.map_eef.assert_not_called()
 
 
 class RetargetingTests(unittest.TestCase):
@@ -205,7 +208,7 @@ class RetargetingTests(unittest.TestCase):
 
     def test_tag_solver_failures_do_not_fall_back(self):
         for stage in ("position_optimizer", "pinch_optimizer"):
-            tag = TAGRetargeter(replace(TAGConfig(), pinch_skip_threshold=0.))
+            tag = TAGRetargeter(TAGConfig())
             initial = tag.previous_solution.copy()
             tag.position_optimizer = Mock()
             tag.position_optimizer.optimize.return_value = initial.copy()
@@ -281,7 +284,7 @@ def active_loop(recording=True):
     instance = loop.TeleopLoop(
         state, runtime, robot, task_label="test", control_needs=ObservationNeeds(vr=True),
         record_needs=ObservationNeeds(camera="rgbd", required_tactile=("aggregate", "dense")),
-        sensors=Mock(), controller=Mock(), home_planner=Mock(), vr_process=Mock(),
+        sensors=Mock(), controller=Mock(), home_planner=Mock(),
         recording_dir=Path("unused") if recording else None, keyboard=Mock(), audio=Mock(),
     )
     instance.phase = loop.TeleopPhase.ACTIVE
@@ -297,6 +300,16 @@ def active_loop(recording=True):
 
 
 class LoopTests(unittest.TestCase):
+    def test_rejected_candidate_is_not_sent_or_committed(self):
+        instance = active_loop()
+        instance.controller.compute_target.return_value = ActionResult(
+            np.zeros(7), np.zeros(12), rejection_reason="collision",
+        )
+        with self.assertLogs(loop.logger, level="WARNING"):
+            instance.execute_control_step(observation(), 10**30, 10**30)
+        instance.robot.send_action.assert_not_called()
+        instance.controller.commit.assert_not_called()
+
     def test_preparation_uses_the_same_termination_reasons_as_active_control(self):
         for reason, end_reason in (
             ("stop", RunEndReason.OPERATOR), ("quit", RunEndReason.QUIT),
@@ -628,15 +641,39 @@ class LoopTests(unittest.TestCase):
 
 
 class SessionTests(unittest.TestCase):
+    def test_startup_homes_before_vr_and_services_idle_while_waiting(self):
+        instance = active_loop(False)
+        instance.poll_blocking_commands = Mock(return_value=False)
+        instance.sensors.channels.vr_ready.wait.side_effect = [False, True]
+        calls = []
+        instance.sensors.start.side_effect = lambda *a, **kw: calls.append("vr")
+        with patch.object(session, "home_hand", side_effect=lambda *a, **kw: (
+            calls.append("home") or SimpleNamespace(ok=True)
+        )):
+            self.assertTrue(session.initialize_teleop(instance, Mock()))
+        self.assertEqual(calls, ["home", "vr"])
+        self.assertEqual(instance.robot.service_idle.call_count, 2)
+
+    def test_startup_cancellation_prevents_vr_start_or_exits_readiness_wait(self):
+        for polls, starts in (([True], 0), ([False, True], 1)):
+            with self.subTest(polls=polls):
+                instance = active_loop(False)
+                instance.poll_blocking_commands = Mock(side_effect=polls)
+                with patch.object(session, "home_hand", return_value=SimpleNamespace(ok=True)):
+                    self.assertFalse(session.initialize_teleop(instance, Mock()))
+                self.assertEqual(instance.sensors.start.call_count, starts)
+
     def test_cleanup_runs_after_startup_capture_and_audio_failures(self):
-        for failing_stage in (None, "keyboard", "control", "capture", "audio"):
+        for failing_stage in (None, "keyboard", "startup", "control", "capture", "audio"):
             with self.subTest(stage=failing_stage), ExitStack() as stack:
                 state = SessionState()
                 robot, keys, sensors, player, control_loop = (Mock() for _ in range(5))
                 sensors.shutdown.return_value = True
                 player.wait_until_idle.return_value = True
                 control_loop.run.side_effect = state.request_quit
+                initialize = Mock(return_value=True)
                 operations = {
+                    "startup": initialize,
                     "keyboard": keys.start, "control": control_loop.run,
                     "capture": control_loop.close,
                     "audio": player.wait_until_idle,
@@ -652,7 +689,7 @@ class SessionTests(unittest.TestCase):
                     SensorChannels=Mock(), SessionState=Mock(return_value=state),
                     SensorWorkers=Mock(return_value=sensors), Robot=Mock(return_value=robot),
                     Keyboard=Mock(return_value=keys), AudioFeedback=Mock(return_value=player),
-                    TeleopLoop=Mock(return_value=control_loop),
+                    TeleopLoop=Mock(return_value=control_loop), initialize_teleop=initialize,
                 ))
                 runtime = load_experiment_config(cli_overrides={
                     "collection.enabled": False, "hand.enabled": False,

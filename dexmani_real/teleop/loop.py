@@ -4,15 +4,13 @@ import logging
 import time
 from enum import Enum
 
+from dexmani_real.data.raw import snapshot_recording_metadata
 from dexmani_real.data.recorder import (
     EpisodeRecorder,
     RecordingError,
-    snapshot_recording_metadata,
 )
-from dexmani_real.data.session_results import error_detail
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
-from dexmani_real.runtime.home import home_hand, home_robot
-from dexmani_real.runtime.lifecycle import VR_READY_TIMEOUT_S
+from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.observation import (
     check_observation,
     control_deadline_ns,
@@ -20,6 +18,7 @@ from dexmani_real.runtime.observation import (
     service_feedback,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState
+from dexmani_real.utils.log import error_detail
 from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -43,8 +42,20 @@ class TeleopPhase(Enum):
 
 class TeleopLoop:
     def __init__(
-        self, runtime_state, runtime, robot, *, task_label, control_needs, record_needs,
-        sensors, controller, home_planner, vr_process, recording_dir, keyboard, audio,
+        self,
+        runtime_state,
+        runtime,
+        robot,
+        *,
+        task_label,
+        control_needs,
+        record_needs,
+        sensors,
+        controller,
+        home_planner,
+        recording_dir,
+        keyboard,
+        audio,
         camera_snapshot=None,
     ):
         self.runtime_state = runtime_state
@@ -55,7 +66,6 @@ class TeleopLoop:
         self.needs = control_needs.union(record_needs)
         self.controller = controller
         self.home_planner = home_planner
-        self.vr_process = vr_process
         self.recording_dir = recording_dir
         self.task_label = task_label
         self.camera_snapshot = camera_snapshot
@@ -357,7 +367,7 @@ class TeleopLoop:
         reason = None
         try:
             result = self.controller.compute_target(row)
-            if result is None or result.arm_qpos is None:
+            if result is None or result.rejection_reason is not None or result.arm_qpos is None:
                 detail = result.rejection_reason if result is not None else "hand geometry rejected"
                 reason = f"target_unavailable: {detail}"
             else:
@@ -370,7 +380,8 @@ class TeleopLoop:
                         raise TimeoutError("teleop expired before submission")
                     command = RobotCommand(epoch, result.arm_qpos, result.hand_qpos)
                     self.robot.send_action(
-                        command, valid_until_ns=deadline_ns,
+                        command,
+                        valid_until_ns=deadline_ns,
                         execute_until_ns=int(row.vr["recv_ts_ns"])
                         + int(self.runtime.teleop.vr_stale_threshold_s * 1e9),
                     )
@@ -381,7 +392,9 @@ class TeleopLoop:
             try:
                 self.abort_episode(
                     f"control_failed: {type(exc).__name__}: {exc}",
-                    run_end_reason=failure_reason(exc), row=row, command=command,
+                    run_end_reason=failure_reason(exc),
+                    row=row,
+                    command=command,
                 )
             except BaseException as cleanup:
                 raise exc from cleanup
@@ -398,45 +411,6 @@ class TeleopLoop:
             self.controller.commit(result)
             if self.recorder is not None:
                 self.recorder.append(row, command)
-
-    def wait_for_vr(self) -> bool:
-        deadline = time.monotonic() + VR_READY_TIMEOUT_S
-        while True:
-            if not self.keyboard.healthy:
-                self.runtime_state.request_emergency_stop()
-            if self.poll_blocking_commands():
-                return False
-            self.robot.service_idle()
-            if self.sensors.channels.vr_ready.wait(timeout=0.05):
-                # 就绪前积累的 B 不触发新一段控制。
-                return not self.poll_blocking_commands()
-            if time.monotonic() >= deadline:
-                raise RuntimeError("VR failed to become ready before the startup timeout")
-
-    def initialize(self) -> bool:
-        # 启动手部回零前，键盘停止回调已经生效。
-        home_result = home_hand(
-            self.runtime_state, self.robot,
-            cancel_requested=self.poll_blocking_commands,
-        )
-        if not home_result.ok:
-            if home_result.interrupted:
-                self.runtime_state.request_quit()
-                return False
-            raise RuntimeError(f"startup hand home failed: {home_result.reason}")
-        if self.poll_blocking_commands():
-            return False
-        self.sensors.start(
-            self.vr_process,
-            ready=self.sensors.channels.vr_ready,
-            may_start=lambda: self.keyboard.healthy and self.runtime_state.requests_allow_motion(),
-        )
-        if not self.wait_for_vr():
-            return False
-        print(
-            "准备进入遥操作；空闲且确认手部无接触后按 T 请求复位触觉，S/Q/ESC 可取消。", flush=True
-        )
-        return True
 
     def admit_observation(self, row):
         issues, feedback_until_ns = check_observation(
@@ -513,40 +487,39 @@ class TeleopLoop:
         )
 
     def run(self):
-        try:
-            ready = self.initialize()
-            while ready and self.runtime_state.running and not self.runtime_state.quit_requested:
-                self.robot.arm.check_error()
-                if self.phase is TeleopPhase.IDLE:
-                    self.robot.service_idle()
-                if not self.keyboard.healthy:
-                    self.runtime_state.request_emergency_stop()
-                if self.runtime_state.estop_request or self.runtime_state.error_state:
-                    self.abort_episode(
-                        "estop" if self.runtime_state.estop_request else "runtime_failure"
-                    )
-                    break
-                if self.recorder is not None:
-                    self.recorder.check_error()
+        while self.runtime_state.running and not self.runtime_state.quit_requested:
+            self.robot.arm.check_error()
+            if self.phase is TeleopPhase.IDLE:
+                self.robot.service_idle()
+            if not self.keyboard.healthy:
+                self.runtime_state.request_emergency_stop()
+            if self.runtime_state.estop_request or self.runtime_state.error_state:
+                self.abort_episode(
+                    "estop" if self.runtime_state.estop_request else "runtime_failure"
+                )
+                break
+            if self.recorder is not None:
+                self.recorder.check_error()
 
-                timeout = 0.005
-                if self.phase is TeleopPhase.ACTIVE:
-                    due = self.next_tick_ns
-                    timeout = 0.0 if due is None else min(
-                        timeout, max(0.0, (due - time.monotonic_ns()) / 1e9),
+            timeout = 0.005
+            if self.phase is TeleopPhase.ACTIVE:
+                due = self.next_tick_ns
+                timeout = (
+                    0.0
+                    if due is None
+                    else min(
+                        timeout,
+                        max(0.0, (due - time.monotonic_ns()) / 1e9),
                     )
-                epoch = self.runtime_state.run_id
-                self.handle_commands(self.keyboard.poll(timeout=timeout), epoch)
-                if (
-                    self.runtime_state.estop_request or self.runtime_state.error_state
-                    or not self.runtime_state.running or self.runtime_state.quit_requested
-                ):
-                    break
-                if self.phase is not TeleopPhase.IDLE:
-                    self.run_control_tick()
-        except BaseException as exc:
-            self.record_error("runtime", exc)
-            self.runtime_state.revoke_motion(reason=failure_reason(exc))
-            self.sensors.request_shutdown()
-            self.audio.play("emergency")
-            raise
+                )
+            epoch = self.runtime_state.run_id
+            self.handle_commands(self.keyboard.poll(timeout=timeout), epoch)
+            if (
+                self.runtime_state.estop_request
+                or self.runtime_state.error_state
+                or not self.runtime_state.running
+                or self.runtime_state.quit_requested
+            ):
+                break
+            if self.phase is not TeleopPhase.IDLE:
+                self.run_control_tick()

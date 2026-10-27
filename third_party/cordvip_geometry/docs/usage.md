@@ -116,7 +116,7 @@ FoundationPose++ 2D 引导来自 [上游核心](https://github.com/teal024/Found
 
 `--with-hand` 读取同 Raw 行的实测 arm/hand 关节，使用对应相机外参与当前实验安装配置（可设 `--experiment-config`）做 FK。默认 1024 手点和固定 link IDs；缺失关节不能用 action、零或历史值填充。无真实时钟证据时 `hand_timing_available=False`、skew 为 NaN；Raw 行关联不等于物理同步。
 
-Raw 几何通过 `EpisodeReader.read_timing_rows()` 读取所需的源时间与身份列，要求 `timing/rows` 符合当前 Raw schema、dtype 和行数。结构缺失或不匹配直接报错；列中的 `-1` 缺失源时钟保持原值，仅支持按行关联的诊断，不代表通过训练或物理回放准入。
+Raw 几何通过 `RawReader.read_timing_rows()` 读取所需的源时间与身份列；相机序列从 0 起有效，相机时钟缺失时使用整数 `observation_ns` 并标记 `host_monotonic_observation`。 `timing/rows` 符合当前 Raw schema、dtype 和行数。结构缺失或不匹配直接报错；列中的 `-1` 缺失源时钟保持原值，仅支持按行关联的诊断，不代表通过训练或物理回放准入。
 
 ## 内存接口与产物
 

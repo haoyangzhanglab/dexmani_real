@@ -75,6 +75,7 @@ class CollisionModel:
             for index, frame in enumerate(self.model.frames)
             if frame.name.startswith("right_hand_")
         ]
+        self.eef_frame_id = self.model.getFrameId("custom_eef_link")
         self.hand_qpos = None
 
     def add_obstacle(self, name, shape, placement, robot_count, *, allowed_links=()):
@@ -102,16 +103,13 @@ class CollisionModel:
             raise ValueError("collision hand posture must be finite shape (12,)")
         self.hand_qpos = hand_qpos[list(HAND_SDK_TO_URDF_IDX)]
 
-    def full_qpos(self, arm_qpos):
+    def rejection(self, arm_qpos):
         arm_qpos = np.asarray(arm_qpos, dtype=np.float64)
         if arm_qpos.shape != (7,) or not np.isfinite(arm_qpos).all():
             raise ValueError("collision arm posture must be finite shape (7,)")
         if self.hand_qpos is None:
             raise RuntimeError("set the collision hand posture before querying arm poses")
-        return np.concatenate((arm_qpos, self.hand_qpos))
-
-    def rejection(self, arm_qpos):
-        qpos = self.full_qpos(arm_qpos)
+        qpos = np.concatenate((arm_qpos, self.hand_qpos))
         if np.any(qpos < self.model.lowerPositionLimit) or np.any(
             qpos > self.model.upperPositionLimit
         ):
@@ -132,17 +130,18 @@ class CollisionModel:
         )
         return f"{kind}: {self.link_name(pair.first)}/{self.link_name(pair.second)}"
 
-    def minimum_hand_frame_z(self, arm_qpos):
-        self.pin.forwardKinematics(self.model, self.data, self.full_qpos(arm_qpos))
+    # 以下查询共用最近一次 rejection 更新的运动学。
+    def eef_position(self):
+        return self.pin.updateFramePlacement(self.model, self.data, self.eef_frame_id).translation
+
+    def minimum_hand_frame_z(self):
         self.pin.updateFramePlacements(self.model, self.data)
         heights = [self.data.oMf[index].translation[2] for index in self.hand_frame_ids]
         if not heights or not np.isfinite(heights).all():
             raise RuntimeError("XHand frame placements unavailable")
         return float(min(heights))
 
-    def minimum_table_distance(self, arm_qpos):
-        self.pin.forwardKinematics(self.model, self.data, self.full_qpos(arm_qpos))
-        self.pin.updateGeometryPlacements(self.model, self.data, self.geometry, self.geometry_data)
+    def minimum_table_distance(self):
         minimum = min(
             float(self.pin.computeDistance(self.geometry, self.geometry_data, index).min_distance)
             for index in self.table_pair_indices

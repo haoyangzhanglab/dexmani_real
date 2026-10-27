@@ -7,7 +7,7 @@ from enum import Enum
 
 import numpy as np
 
-from dexmani_real.control.action_mapping import (
+from dexmani_real.control.actions import (
     ActionMapper,
     project_arm_command,
     project_hand_command,
@@ -171,12 +171,13 @@ class ReplayPlayer:
             if time.monotonic_ns() >= slot_deadline_ns:
                 raise TimeoutError(f"replay slot {index} missed before observation")
             row, feedback_until_ns = self.read_feedback()
-            arm, hand, rejection = self.action_mapper.prepare_joint_target(
+            mapped = self.action_mapper.map_joint(
                 trajectory.action_arm_joint[index],
                 trajectory.action_hand_joint[index],
                 row.arm["qpos"][0],
                 self.previous_arm,
             )
+            arm, hand, rejection = mapped.arm_qpos, mapped.hand_qpos, mapped.rejection_reason
             if rejection is not None:
                 self.capture.append(row, RobotCommand(self.epoch, arm, hand))
                 status, reason = ReplayStatus.REJECTED, f"replay target: {rejection}"

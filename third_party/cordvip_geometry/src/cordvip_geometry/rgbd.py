@@ -14,8 +14,7 @@ from .geometry import validate_rgbd
 
 @dataclass(frozen=True)
 class Frame:
-    """Aligned color-camera metres; zero depth is invalid.
-    Source ID/clock distinguish received camera frames from explicit Raw row/relative identities."""
+    """Aligned color-camera RGB-D in metres; source identity and clock describe the recorded timing."""
 
     rgb: np.ndarray
     depth_m: np.ndarray

@@ -7,12 +7,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.control.action_mapping import ActionIntent
+from dexmani_real.data.raw import snapshot_recording_metadata
 from dexmani_real.data.recorder import (
     RecordingError,
-    snapshot_recording_metadata,
 )
-from dexmani_real.data.session_results import error_detail
 from dexmani_real.deployment.observation import (
     project_policy_row,
 )
@@ -34,6 +32,7 @@ from dexmani_real.runtime.observation import (
     service_feedback,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState
+from dexmani_real.utils.log import error_detail
 
 logger = logging.getLogger(__name__)
 
@@ -448,13 +447,13 @@ class PolicyRollout:
     def map_command(self, action, row, previous, *, context="action"):
         action = np.asarray(action, dtype=np.float64)
         mode = self.policy_info.action_mode
-        intent = (
-            ActionIntent(mode, action[:7], action[7:])
-            if mode == "joint"
-            else ActionIntent(mode, Pose(action[:3], rot6d_to_quat_wxyz(action[3:9])), action[9:])
-        )
-        decoded = self.action_mapper.map(intent, row.arm["qpos"][0], previous)
-        if decoded.arm_qpos is None:
+        current = row.arm["qpos"][0]
+        if mode == "joint":
+            decoded = self.action_mapper.map_joint(action[:7], action[7:], current, previous)
+        else:
+            pose = Pose(action[:3], rot6d_to_quat_wxyz(action[3:9]))
+            decoded = self.action_mapper.map_eef(pose, action[9:], current, previous)
+        if decoded.rejection_reason is not None or decoded.arm_qpos is None:
             return None, ControlRejection(f"{context}_rejected: {decoded.rejection_reason}")
         return RobotCommand(self.run_id, decoded.arm_qpos, decoded.hand_qpos), None
 

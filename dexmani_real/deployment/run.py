@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import subprocess
 import time
@@ -86,28 +85,10 @@ def run_policy(
         if num_episodes < 1:
             raise ValueError("num_episodes must be a positive integer")
 
-    from dexmani_policy.common.config import load_experiment_config
-    from dexmani_policy.common.experiments import resolve_milestone_path
     from dexmani_policy.deployment import inspect_policy
-    from dexmani_policy.deployment.metadata import resolve_experiment
-    from dexmani_policy.evaluation.config import resolve_checkpoint_path
 
-    directory = resolve_experiment(experiment)
-    cfg = load_experiment_config(directory)
-    if checkpoint == "best":
-        selected = json.loads((directory / "best_ckpt.json").read_text())
-        checkpoint_path = resolve_milestone_path(directory, selected["ckpt_relpath"])
-        defaults = selected["inference"]
-    else:
-        checkpoint_path = resolve_checkpoint_path(directory, str(checkpoint))
-        defaults = cfg["eval"]
-    if weights is None:
-        if type(defaults["use_ema"]) is not bool:
-            raise ValueError("Saved use_ema must be boolean")
-        weights = "ema" if defaults["use_ema"] else "raw"
     info = inspect_policy(
-        directory, checkpoint=checkpoint_path, weights=weights,
-        inference_steps=defaults["inference_steps"] if inference_steps is None else inference_steps,
+        experiment, checkpoint=checkpoint, weights=weights, inference_steps=inference_steps,
     )
     dependencies = policy_dependencies(info.observation_fields)
     control_needs = policy_needs(dependencies)

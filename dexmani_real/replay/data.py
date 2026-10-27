@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.data.raw.reader import EpisodeReader
+from dexmani_real.data.raw import RawReader
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 
@@ -23,7 +23,7 @@ class Trajectory:
 
 
 def load_trajectory(episode_path):
-    with EpisodeReader(episode_path) as reader:
+    with RawReader(episode_path) as reader:
         meta = reader.meta
         if meta["collection_source"] != "teleop":
             raise ValueError("physical replay requires a teleop episode")

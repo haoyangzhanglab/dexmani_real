@@ -12,8 +12,7 @@ from tqdm import tqdm
 
 from dexmani_real.calibration.table_plane import resolve_table_plane
 from dexmani_real.config import load_experiment_config
-from dexmani_real.data.canonical.export import export_canonical
-from dexmani_real.data.canonical.schema import ExportConfig
+from dexmani_real.data.export import ExportConfig, export_zarr
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -105,7 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             progress.total = total
             progress.update(completed - progress.n)
 
-        result = export_canonical(
+        result = export_zarr(
             args.input_root,
             output_path,
             processing=processing,

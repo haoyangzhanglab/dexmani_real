@@ -35,3 +35,7 @@ def configure_logging() -> None:
         logger.addHandler(file_handler)
     except OSError as exc:
         logger.warning("Cannot create file log: %s", exc)
+
+
+def error_detail(stage, error):
+    return dict(stage=stage, exception_type=type(error).__name__, message=str(error))

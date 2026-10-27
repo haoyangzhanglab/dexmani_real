@@ -23,7 +23,6 @@ from dexmani_real.calibration.camera.aruco import (
 from dexmani_real.calibration.camera.extrinsics import save_camera_calibration
 from dexmani_real.calibration.camera.hand_eye import HandEyeResult, solve_hand_eye
 from dexmani_real.calibration.table_plane import resolve_table_plane
-from dexmani_real.control.collision import CollisionModel
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.control.ik import IKSolver
@@ -74,13 +73,7 @@ def build_planner(
     planner = HomePlanner(runtime.environment, runtime.arm, table_plane_abcd=table_plane_abcd)
     home_hand_qpos = np.deg2rad(np.asarray(runtime.hand.home_qpos_deg, dtype=np.float64))
     planner.set_hand_qpos(home_hand_qpos)
-    constraints = MotionConstraints(
-        CollisionModel(static_boxes=runtime.environment.static_boxes),
-        joint_lower_rad=runtime.arm.joint_limit_lower,
-        joint_upper_rad=runtime.arm.joint_limit_upper,
-        workspace=runtime.environment.workspace.as_array(),
-        workspace_margin_m=runtime.environment.eef_workspace_margin_m,
-    )
+    constraints = MotionConstraints(runtime.arm, runtime.environment)
     solver = IKSolver(
         constraints,
         position_tolerance=runtime.keyboard_teleop.ik_max_pose_error_pos_m,

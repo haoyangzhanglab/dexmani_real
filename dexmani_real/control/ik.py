@@ -10,8 +10,8 @@ from dexmani_real.control.constraints import (
 )
 from dexmani_real.geometry.pose import Pose, compute_pose_error
 from dexmani_real.robot.model import (
+    XARM7_JOINT_NAMES,
     XARM7_XHAND_COLLISION_URDF_PATH,
-    XARM7_XHAND_SRDF_PATH,
 )
 
 JOINT_WEIGHTS = np.array((4.0, 1.8, 1.2, 0.6, 0.6, 0.9, 0.35))
@@ -26,7 +26,6 @@ MODEL_LIMIT_TOL_RAD = 1e-5
 
 @dataclass(kw_only=True)
 class IKResult:
-    success: bool
     qpos: np.ndarray | None
     reason: str = ""
 
@@ -44,25 +43,18 @@ class IKCandidate:
 
 class IKSolver:
     def __init__(self, constraints, *, position_tolerance, rotation_tolerance):
-        import mplib
+        from mplib.pymp.kinematics.pinocchio import PinocchioModel
 
         self.constraints = constraints
         self.position_tolerance = position_tolerance
         self.rotation_tolerance = rotation_tolerance
         if any(not np.isfinite(v) or v <= 0 for v in (position_tolerance, rotation_tolerance)):
             raise ValueError("IK pose tolerances must be finite and positive")
-        velocity = np.deg2rad(np.full(7, 180.0))
-        self.planner = mplib.Planner(
-            urdf=str(XARM7_XHAND_COLLISION_URDF_PATH),
-            srdf=str(XARM7_XHAND_SRDF_PATH),
-            move_group="custom_eef_link",
-            use_convex=False,
-            joint_vel_limits=velocity.tolist(),
-            joint_acc_limits=(velocity * 2).tolist(),
-        )
-        self.model = self.planner.pinocchio_model
-        self.eef_link_id = list(self.model.get_link_names()).index(self.planner.move_group)
-        model_limits = np.asarray(self.planner.joint_limits)
+        self.model = PinocchioModel(str(XARM7_XHAND_COLLISION_URDF_PATH))
+        self.model.set_joint_order(list(XARM7_JOINT_NAMES))
+        self.model.set_link_order(self.model.get_link_names(user=False))
+        self.eef_link_id = self.model.get_link_names().index("custom_eef_link")
+        model_limits = np.concatenate(self.model.get_joint_limits())
         if (
             model_limits.shape != (7, 2)
             or not np.isfinite(model_limits).all()
@@ -79,16 +71,14 @@ class IKSolver:
         self.limit_radius = 0.5 * (self.limits[:, 1] - self.limits[:, 0])
 
     def compute_eef_pose_base(self, qpos):
-        full = self.planner.pad_move_group_qpos(qpos)
-        self.model.compute_forward_kinematics(full)
+        self.model.compute_forward_kinematics(qpos)
         pose = self.model.get_link_pose(self.eef_link_id)
         return Pose(p=np.asarray(pose.p).copy(), q=np.asarray(pose.q))
 
     def compute_eef_jacobian_base(self, qpos):
-        full = self.planner.pad_move_group_qpos(qpos)
-        self.model.compute_forward_kinematics(full)
+        self.model.compute_forward_kinematics(qpos)
         jacobian = np.asarray(
-            self.model.compute_single_link_jacobian(full, self.eef_link_id, False)
+            self.model.compute_single_link_jacobian(qpos, self.eef_link_id, False)
         )[:, :7]
         if jacobian.shape != (6, 7) or not np.isfinite(jacobian).all():
             raise ValueError("IK Jacobian must be finite shape (6, 7)")
@@ -103,8 +93,6 @@ class IKSolver:
         current, previous = (np.asarray(q, dtype=np.float64) for q in (current, previous))
         if any(q.shape != (7,) or not np.isfinite(q).all() for q in (current, previous)):
             raise ValueError("IK states must be finite (7,) vectors")
-        if not np.isfinite(target.p).all() or not np.isfinite(target.q).all():
-            raise ValueError("non-finite IK target pose")
         self.constraints.collision_model.set_hand_qpos(hand_qpos)
         target_base = mplib.Pose(p=target.p, q=target.q)
         pool: list[IKCandidate] = []
@@ -138,11 +126,11 @@ class IKSolver:
                 and candidate.position_error_m <= 0.5 * self.position_tolerance
                 and candidate.rotation_error_rad <= 0.5 * self.rotation_tolerance
             ):
-                return IKResult(success=True, qpos=candidate.qpos)
+                return IKResult(qpos=candidate.qpos)
 
         best = self.select_valid(pool)
         if best is not None and not best.near_limit:
-            return IKResult(success=True, qpos=best.qpos)
+            return IKResult(qpos=best.qpos)
         if pool:
             # 碰撞端点可以作为搜索锚点，但不参与最终解的选择。
             anchor = min(pool, key=lambda c: c.cost)
@@ -152,13 +140,13 @@ class IKSolver:
                     try_seed(seed)
             best = self.select_valid(pool)
             if best is not None:
-                return IKResult(success=True, qpos=best.qpos)
+                return IKResult(qpos=best.qpos)
 
         rejections.extend(c.rejection_reason for c in pool if c.rejection_reason is not None)
         reason = "solver_no_convergence"
         if converged:
             reason = "no_valid_candidate: " + "; ".join(dict.fromkeys(rejections))
-        return IKResult(success=False, qpos=None, reason=reason)
+        return IKResult(qpos=None, reason=reason)
 
     def try_clik(self, seed, target_base, target, current, previous, pool):
         raw, converged, _ = self.model.compute_IK_CLIK(

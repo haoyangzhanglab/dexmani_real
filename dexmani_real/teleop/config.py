@@ -58,41 +58,29 @@ class KeyboardTeleopConfig:
 @dataclass(frozen=True)
 class TAGConfig:
     # 长度单位米，顺序为拇指到小指。
-    robot_finger_lengths: tuple[float, ...] = (0.161, 0.208, 0.206, 0.204, 0.145)
     human_finger_lengths: tuple[float, ...] = (0.13, 0.18, 0.19, 0.18, 0.145)
     finger_scale_boost: float = 1.0
 
     pinky_scale: float = 1.3
     pinky_palm_scale: float = 1.25
 
-    # MANO→URDF 的外旋 XYZ 欧拉角，单位弧度。
-    mano_to_urdf_euler: tuple[float, float, float] = (0.0, 0.0, 0.0)
-
     smooth_weight: float = 0.003
-    ftol_abs_s1: float = 1e-4
-    maxeval_s1: int = 80
 
-    ftol_abs_s2: float = 1e-6
-    maxeval_s2: int = 100
     pinch_base_weight: float = 2000.0
     pinch_start_dist_m: float = 0.030
     pinch_full_dist_m: float = 0.008
     pinch_ema_alpha: float = 0.75
-    pinch_skip_threshold: float = 0.01
     reg_stage1_weight: float = 1.0
     reg_last_weight: float = 0.8
 
     def validate(self) -> None:
         if not all(np.all(np.isfinite(value)) for value in astuple(self)):
             raise ValueError("TAG parameters must be finite")
-        robot = np.asarray(self.robot_finger_lengths, dtype=np.float64)
         human = np.asarray(self.human_finger_lengths, dtype=np.float64)
-        if robot.shape != (5,) or human.shape != (5,):
-            raise ValueError("TAG requires five robot and human finger lengths")
-        if np.any(robot <= 0) or np.any(human <= 0):
+        if human.shape != (5,):
+            raise ValueError("TAG requires five human finger lengths")
+        if np.any(human <= 0):
             raise ValueError("TAG finger lengths must be positive")
-        if self.maxeval_s1 <= 0 or self.maxeval_s2 <= 0:
-            raise ValueError("TAG optimizer maxeval values must be positive")
         if not 0 <= self.pinch_full_dist_m < self.pinch_start_dist_m:
             raise ValueError("TAG pinch distances must satisfy 0 <= full < start")
         if not 0.0 <= self.pinch_ema_alpha <= 1.0:

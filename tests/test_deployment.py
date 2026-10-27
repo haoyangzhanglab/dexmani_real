@@ -12,9 +12,8 @@ import numpy as np
 import yaml
 
 from dexmani_real.config import load_experiment_config
-from dexmani_real.control.action_mapping import ActionResult
+from dexmani_real.control.actions import ActionResult
 from dexmani_real.data.recorder import RecordingError
-from dexmani_real.data.session_results import SessionResults
 from dexmani_real.deployment import rollout, run, session
 from dexmani_real.deployment.config import ExecutionConfig, resolve_deployment_config
 from dexmani_real.deployment.inference import InferenceWorker, ModelResult
@@ -24,11 +23,16 @@ from dexmani_real.deployment.observation import (
     policy_needs,
     project_policy_row,
 )
+from dexmani_real.deployment.results import SessionResults
 from dexmani_real.deployment.schedule import PolicyQuery, control_slot, handoff_plan
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
 from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
-from dexmani_real.runtime.observation import Observation, ObservationNeeds, check_observation
+from dexmani_real.runtime.observation import (
+    Observation,
+    ObservationNeeds,
+    check_observation,
+)
 from dexmani_real.runtime.state import RunEndReason, SessionState
 
 
@@ -76,7 +80,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class RunTests(unittest.TestCase):
-    def test_entry_resolves_saved_recipe_and_preserves_run_config_with_optional_recording(self):
+    def test_entry_delegates_policy_resolution_and_preserves_run_config(self):
         runtime = load_experiment_config()
         runtime = replace(runtime, environment=replace(
             runtime.environment, table=replace(runtime.environment.table, enabled=False),
@@ -89,13 +93,6 @@ class RunTests(unittest.TestCase):
             root = Path(directory)
             experiment = root / "experiment"
             checkpoint = experiment / "checkpoints" / "epoch=4-step=80-milestone=80pct.pt"
-            checkpoint.parent.mkdir(parents=True)
-            checkpoint.touch()
-            (checkpoint.parent / "latest.pt").symlink_to(checkpoint.name)
-            (experiment / "best_ckpt.json").write_text(json.dumps({
-                "ckpt_relpath": str(checkpoint.relative_to(experiment)),
-                "inference": {"use_ema": False, "inference_steps": 5},
-            }))
             info = policy_info(
                 experiment_dir=experiment, checkpoint_path=checkpoint, policy_name="test_policy",
                 observation_fields=("point_cloud",), pointcloud_config=recipe,
@@ -105,9 +102,6 @@ class RunTests(unittest.TestCase):
             for record_raw, selector in product((False, True), selectors):
                 with (
                     self.subTest(record_raw=record_raw, selector=selector), patch("builtins.print"),
-                    patch("dexmani_policy.common.config.load_experiment_config", return_value={
-                        "eval": {"use_ema": True, "inference_steps": 10},
-                    }),
                     patch("dexmani_policy.deployment.inspect_policy", return_value=info) as inspect,
                     patch.object(run, "git_head", return_value=None),
                     patch.object(run, "resolve_table_plane", return_value=None) as table,
@@ -118,8 +112,7 @@ class RunTests(unittest.TestCase):
                         str(experiment), runtime, checkpoint=selector, output=root, record_raw=record_raw,
                     ), 0)
                     inspect.assert_called_once_with(
-                        experiment, checkpoint=checkpoint, weights="raw" if selector == "best" else "ema",
-                        inference_steps=5 if selector == "best" else 10,
+                        str(experiment), checkpoint=selector, weights=None, inference_steps=None,
                     )
                     resolved = owner.call_args.args[0]
                     self.assertEqual(resolved.execution.action_steps, info.n_action_steps)
@@ -164,7 +157,7 @@ class RolloutTests(unittest.TestCase):
 
         self.model.poll.side_effect = poll
         self.mapper = Mock()
-        self.mapper.map.side_effect = lambda intent, *args: ActionResult(intent.arm + 0.01, intent.hand)
+        self.mapper.map_joint.side_effect = lambda arm, hand, *args: ActionResult(arm + 0.01, hand)
         self.mapper.control_from_command.side_effect = lambda cmd, mode: np.r_[cmd.arm_qpos, cmd.hand_qpos]
         self.mapper.frozen_rejection.return_value = None
         self.results = Mock()
@@ -197,6 +190,17 @@ class RolloutTests(unittest.TestCase):
             record_needs=ObservationNeeds(), dependencies=dependencies, max_running_s=60,
             query_ids=count(1), capture_ids=count(1),
         )
+
+    def test_rejected_joint_candidate_does_not_become_a_command(self):
+        owner = self.make_rollout()
+        self.mapper.map_joint.side_effect = None
+        self.mapper.map_joint.return_value = ActionResult(
+            np.zeros(7), np.zeros(12), rejection_reason="collision",
+        )
+        command, rejection = owner.map_command(np.zeros(19), self.row(), None)
+        self.assertIsNone(command)
+        self.assertIn("collision", rejection.detail)
+        self.robot.send_action.assert_not_called()
 
     def complete(self, value=None, error=None):
         call = self.model.submit.call_args
@@ -260,7 +264,7 @@ class RolloutTests(unittest.TestCase):
         prefix = query.kwargs["rtc_prefix"]
         np.testing.assert_allclose(prefix[0, :7], self.robot.send_action.call_args.args[0].arm_qpos)
         self.assertEqual(query.kwargs["delay_steps"], 1)
-        self.assertEqual(self.mapper.map.call_count, 2)
+        self.assertEqual(self.mapper.map_joint.call_count, 2)
         self.tick(item)
         self.assertEqual(item.termination.detail, "handoff_result_not_ready")
         self.assertEqual(self.robot.send_action.call_count, 2)
@@ -488,6 +492,24 @@ class SessionTests(unittest.TestCase):
             record_raw=False, camera_calibration_path=None, table_plane_abcd=None,
         )
 
+    def test_warmup_provides_home_hand_history_only_when_policy_requires_it(self):
+        for history_steps in (None, 3):
+            with self.subTest(history_steps=history_steps):
+                owner = self.session
+                owner.info = policy_info(hand_history_steps=history_steps)
+                owner.model = Mock()
+                owner.model.poll.return_value = ("load", ModelResult([], None, 0, 1))
+                owner.warmup_policy()
+                context = owner.model.submit.call_args.kwargs["action_context"]
+                if history_steps is None:
+                    self.assertIsNone(context)
+                else:
+                    history = context["hand_history"]
+                    self.assertEqual(history.shape, (history_steps, 12))
+                    self.assertEqual(history.dtype, np.float32)
+                    expected = np.deg2rad(owner.runtime.hand.home_qpos_deg).astype(np.float32)
+                    np.testing.assert_array_equal(history, np.broadcast_to(expected, history.shape))
+
     def test_startup_failure_publishes_fault_without_creating_devices(self):
         owner = self.session
         owner.prepare_resources = Mock(side_effect=ValueError("invalid calibration"))
@@ -520,7 +542,7 @@ class SessionTests(unittest.TestCase):
 
     def test_close_updates_raw_and_preserves_session_result_fields(self):
         owner = self.session
-        owner.results = SessionResults(self.output, "policy")
+        owner.results = SessionResults(self.output)
         owner.results.begin_episode()
         owner.results.finish_episode("operator", raw={"status": "pending"})
         owner.runtime_state = SessionState()

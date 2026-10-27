@@ -10,7 +10,8 @@ import h5py
 import numpy as np
 
 from dexmani_real.config import load_experiment_config
-from dexmani_real.data.raw.schema import ARM_ACTION_SEMANTICS, TIMING_ROW_DTYPE
+from dexmani_real.control.actions import ActionResult
+from dexmani_real.data.raw import ARM_ACTION_SEMANTICS, TIMING_ROW_DTYPE
 from dexmani_real.geometry.kinematics import eef_poses
 from dexmani_real.geometry.pose import rot6d_to_rotmat
 from dexmani_real.replay import metrics, player
@@ -54,7 +55,7 @@ class ReplayDataTests(unittest.TestCase):
                 data.create_group("meta").attrs.update(
                     {
                         "arm_action_semantics": ARM_ACTION_SEMANTICS,
-                        "timestamp_source": "host_monotonic_relative",
+                        "timestamp_source": "host_monotonic_ns",
                         "joint_units": "rad",
                         "arm_joint_names": json.dumps(list(XARM7_JOINT_NAMES)),
                         "hand_joint_names": json.dumps(list(XHAND_SDK_JOINT_NAMES)),
@@ -71,7 +72,6 @@ class ReplayDataTests(unittest.TestCase):
                     ("action_hand_joint_target", 12),
                 ):
                     data[name] = np.zeros((2, width))
-                data["timestamp"] = np.array([0, 1 / 16])
                 timing = np.zeros(2, dtype=TIMING_ROW_DTYPE)
                 for name in ("observation_ns", "control_ns", "arm_ns", "hand_ns"):
                     timing[name] = [1_000_000_000, 1_062_500_000]
@@ -164,7 +164,7 @@ class ReplayControlTests(unittest.TestCase):
         self.driver = player.ReplayPlayer(self.state, self.runtime, self.keys, robot=self.robot)
         self.driver.read_feedback = lambda: (observation(self.clock), self.clock + 100_000_000)
         self.mapper = Mock()
-        self.mapper.prepare_joint_target.side_effect = lambda arm, hand, *_: (
+        self.mapper.map_joint.side_effect = lambda arm, hand, *_: ActionResult(
             arm.copy(),
             hand.copy(),
             None,
@@ -201,8 +201,8 @@ class ReplayControlTests(unittest.TestCase):
         self.assertFalse(self.state.can_move(run_id=self.driver.epoch))
 
     def test_rejected_target_is_recorded_without_submission(self):
-        self.mapper.prepare_joint_target.side_effect = None
-        self.mapper.prepare_joint_target.return_value = (np.zeros(7), np.zeros(12), "collision")
+        self.mapper.map_joint.side_effect = None
+        self.mapper.map_joint.return_value = ActionResult(np.zeros(7), np.zeros(12), "collision")
         result = self.run_replay()
         self.assertEqual(result.status, player.ReplayStatus.REJECTED)
         self.assertEqual(result.replay_data["submit_started_ns"].tolist(), [-1])

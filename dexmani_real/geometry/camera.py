@@ -67,24 +67,6 @@ class CameraSnapshot:
             transform.setflags(write=False)
             object.__setattr__(self, "T_xarm_base_from_color", transform)
 
-    def metadata(self):
-        color = self.color
-        values = {
-            "camera_serial": self.serial,
-            "camera_payload_mode": "depth_to_color_aligned_rgbd",
-            "camera_color_width": color.width,
-            "camera_color_height": color.height,
-            "camera_color_intrinsics": color.matrix().reshape(-1).tolist(),
-            "camera_color_distortion_model": color.distortion_model,
-            "camera_color_distortion_coeffs": list(color.distortion_coeffs),
-            "depth_scale": self.depth_scale_m,
-        }
-        if self.T_xarm_base_from_color is not None:
-            values["camera_T_xarm_base_from_color"] = self.T_xarm_base_from_color.reshape(
-                -1
-            ).tolist()
-        return values
-
 
 def camera_parameters_cv(
     color: CameraIntrinsics,

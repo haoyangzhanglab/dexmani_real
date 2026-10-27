@@ -11,13 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from dexmani_real.data.raw.schema import (
-    TACTILE_AXES,
-    TACTILE_FINGER_ORDER,
-    TACTILE_PROCESSING,
-    TACTILE_UNITS,
-)
-from dexmani_real.data.raw.writer import EpisodeWriter
+from dexmani_real.data.raw import RawWriter
 from dexmani_real.utils.atomic_io import atomic_publish, target_is_occupied
 
 logger = logging.getLogger(__name__)
@@ -36,20 +30,6 @@ class _FinishRequest:
     reason: str
     details: tuple[dict, ...]
     technical_status: str
-
-
-def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata, tactile_hold_max_age_s):
-    """复用初始化相机快照，补入当前 capture 消费的触觉处理语义。"""
-    metadata = camera_snapshot.metadata()
-    metadata.update(tactile_reset_metadata)
-    metadata.update(
-        hand_tactile_processing=TACTILE_PROCESSING,
-        hand_tactile_units=TACTILE_UNITS,
-        hand_tactile_axes=TACTILE_AXES,
-        hand_tactile_finger_order=TACTILE_FINGER_ORDER,
-        hand_tactile_hold_max_age_s=float(tactile_hold_max_age_s),
-    )
-    return metadata
 
 
 class EpisodeRecorder:
@@ -264,34 +244,34 @@ class EpisodeRecorder:
         staging, destination = self.staging_path, self.episode_dir
         finish = None
         try:
-            self.writer = writer = EpisodeWriter(staging, control_hz=self.control_hz)
+            self.writer = writer = RawWriter(staging, control_hz=self.control_hz)
             try:
-                try:
-                    writer.open(metadata)
-                    self.ready.set()
-                    while not self.cancelled.is_set():
-                        try:
-                            item = self.queue.get(timeout=0.05)
-                        except Empty:
-                            continue
-                        if isinstance(item, _FinishRequest):
-                            finish = item
-                            break
-                        writer.append_frame(*item)
-                except BaseException as exc:
-                    # 先通知控制线程，再进入可能阻塞的 flush/close。
-                    self.store_error(exc)
-                try:
+                writer.open(metadata)
+                self.ready.set()
+                while not self.cancelled.is_set():
+                    try:
+                        item = self.queue.get(timeout=0.05)
+                    except Empty:
+                        continue
+                    if isinstance(item, _FinishRequest):
+                        finish = item
+                        break
+                    writer.append_frame(*item)
+            except BaseException as exc:
+                # 先撤销发布，再进入可能阻塞的资源收尾。
+                self.store_error(exc)
+            try:
+                if finish is not None and self.error is None:
+                    writer.finish(
+                        finish.reason,
+                        finish.details,
+                        expected_frames=self.submitted_frames,
+                        technical_status=finish.technical_status,
+                    )
+                else:
                     writer.flush()
-                    if finish is not None and self.error is None:
-                        writer.write_termination(
-                            finish.reason,
-                            finish.details,
-                            expected_frames=self.submitted_frames,
-                            technical_status=finish.technical_status,
-                        )
-                except BaseException as exc:
-                    self.store_error(exc)
+            except BaseException as exc:
+                self.store_error(exc)
             finally:
                 writer.close()
 
@@ -302,11 +282,7 @@ class EpisodeRecorder:
                     and finish is not None
                     and finish.save
                 ):
-                    try:
-                        atomic_publish(staging, destination)
-                    except BaseException as exc:
-                        self.store_error(exc)
-                        raise
+                    atomic_publish(staging, destination)
                     self.published_path, self.staging_path = destination, None
             if self.published_path is not None:
                 logger.info("Raw 已保存：%s（%d 帧）。", destination.name, self.written_frames)

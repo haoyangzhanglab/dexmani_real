@@ -55,7 +55,7 @@ class JogController:
                 pose, measured_qpos, baseline_qpos,
                 hand_qpos=hand_qpos,
             )
-        if result is None or not result.success or result.qpos is None:
+        if result is None or result.qpos is None:
             self.blocked_until_release = True
         return pose, desired_position, result
 

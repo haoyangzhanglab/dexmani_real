@@ -5,7 +5,6 @@ import logging
 import numpy as np
 
 from dexmani_real.calibration.table_plane import resolve_table_plane
-from dexmani_real.control.collision import CollisionModel
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.control.ik import IKSolver
@@ -34,7 +33,6 @@ logger = logging.getLogger(__name__)
 
 
 class KeyboardTeleop:
-
     def __init__(self, runtime, *, no_hand):
         self.runtime = runtime
         self.no_hand = no_hand
@@ -86,13 +84,7 @@ class KeyboardTeleop:
         return int(not clean or not shutdown_clean)
 
     def start(self):
-        constraints = MotionConstraints(
-            CollisionModel(static_boxes=self.runtime.environment.static_boxes),
-            joint_lower_rad=self.runtime.arm.joint_limit_lower,
-            joint_upper_rad=self.runtime.arm.joint_limit_upper,
-            workspace=self.workspace,
-            workspace_margin_m=self.runtime.environment.eef_workspace_margin_m,
-        )
+        constraints = MotionConstraints(self.runtime.arm, self.runtime.environment)
         solver = IKSolver(
             constraints,
             position_tolerance=self.jog_config.ik_max_pose_error_pos_m,
@@ -100,7 +92,9 @@ class KeyboardTeleop:
         )
         self.jog = JogController(solver, self.jog_config, self.workspace)
         self.home_planner = HomePlanner(
-            self.runtime.environment, self.runtime.arm, table_plane_abcd=self.table_plane_abcd,
+            self.runtime.environment,
+            self.runtime.arm,
+            table_plane_abcd=self.table_plane_abcd,
         )
         self.keys.start()
         if not self.keys.healthy:
@@ -111,7 +105,9 @@ class KeyboardTeleop:
         self.robot.check()
         self.runtime_state.arm()
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
-        print("Jog key changes stop and re-prepare motion; release all jog keys after a rejected target")
+        print(
+            "Jog key changes stop and re-prepare motion; release all jog keys after a rejected target"
+        )
         self.rate = LoopRate(self.jog_config.control_hz, label="keyboard_teleop")
 
     def run_control_loop(self):

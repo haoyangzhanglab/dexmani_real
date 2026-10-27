@@ -17,7 +17,7 @@ import numpy as np
 from dexmani_real.calibration.table_plane import resolve_table_plane
 from dexmani_real.config import load_experiment_config
 from dexmani_real.control.config import TableCollisionConfig
-from dexmani_real.data.raw.reader import EpisodeReader
+from dexmani_real.data.raw import RawReader
 from dexmani_real.geometry.kinematics import HandFK, eef_poses
 from dexmani_real.geometry.pose import (
     quat_wxyz_to_rotmat,
@@ -66,7 +66,7 @@ EEF_COLOR = (255, 255, 255)
 
 
 def print_episode_info(episode_path: str) -> None:
-    with EpisodeReader(episode_path) as reader:
+    with RawReader(episode_path) as reader:
         keys = sorted(reader.fields - {"rgb"})
         print(f"Episode:    {episode_path}")
         print(f"Control/depth rows: {reader.num_frames}")
@@ -115,8 +115,9 @@ class EpisodeVisualizer:
 
         episode_name = Path(episode_path).stem
         self.fingertip_link_names = fingertip_link_names
-        self.reader = EpisodeReader(episode_path)
+        self.reader = RawReader(episode_path)
         try:
+            self.timestamps_s = self.reader.timestamps_s
             self.reader.require_fields(
                 "rgb",
                 "depth",
@@ -125,7 +126,6 @@ class EpisodeVisualizer:
                 "hand_contact",
                 "action_arm_joint_target",
                 "action_hand_joint_target",
-                "timestamp",
             )
 
             self.frame_count = self.reader.num_frames
@@ -237,7 +237,7 @@ class EpisodeVisualizer:
 
     def log_step(self, step_idx: int) -> None:
         self.rr.set_time_sequence("step", step_idx)
-        self.rr.set_time_seconds("time", float(self.reader["timestamp"][step_idx]))
+        self.rr.set_time_seconds("time", float(self.timestamps_s[step_idx]))
         rgb, depth = self.log_camera(step_idx)
         self.log_pointcloud(rgb, depth)
         log_points(

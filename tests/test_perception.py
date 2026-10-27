@@ -14,25 +14,29 @@ import zarr
 from scipy.spatial.transform import Rotation
 
 from dexmani_real.config import load_experiment_config
-from dexmani_real.data.canonical.export import export_canonical
-from dexmani_real.data.canonical.processing import iter_canonical_blocks
-from dexmani_real.data.canonical.schema import ExportConfig, canonical_array_specs
-from dexmani_real.data.raw.reader import EpisodeReader
-from dexmani_real.data.raw.schema import (
+from dexmani_real.data.export import (
+    ExportConfig,
+    canonical_array_specs,
+    export_zarr,
+    iter_canonical_blocks,
+)
+from dexmani_real.data.raw import (
     DATASET_SPECS,
     TACTILE_AXES,
     TACTILE_FINGER_ORDER,
     TACTILE_PROCESSING,
     TACTILE_UNITS,
+    RawReader,
+    RawWriter,
+    camera_metadata,
 )
-from dexmani_real.data.raw.writer import EpisodeWriter
+from dexmani_real.deployment.config import _restore_cloud_config
 from dexmani_real.deployment.observation import (
     PolicyObservationRow,
     build_observation_kinematics,
     build_policy_observation,
     policy_dependencies,
 )
-from dexmani_real.deployment.config import _restore_cloud_config
 from dexmani_real.geometry.camera import (
     CameraIntrinsics,
     CameraSnapshot,
@@ -216,10 +220,10 @@ class PointCloudTests(unittest.TestCase):
             root = Path(directory)
             episode = root / "raw" / "episode_1"
             episode.mkdir(parents=True)
-            writer = EpisodeWriter(episode, control_hz=16)
+            writer = RawWriter(episode, control_hz=16)
             try:
                 writer.open({
-                    **camera.metadata(),
+                    **camera_metadata(camera),
                     "task_label": "geometry",
                     "collection_source": "test",
                     "hand_tactile_processing": TACTILE_PROCESSING,
@@ -241,7 +245,7 @@ class PointCloudTests(unittest.TestCase):
                     command = SimpleNamespace(arm_qpos=arm["qpos"][0], hand_qpos=hand["qpos"][0])
                     writer.append_frame(row, command)
                 writer.flush()
-                writer.write_termination("operator", {}, expected_frames=2, technical_status="normal")
+                writer.finish("operator", {}, expected_frames=2, technical_status="normal")
             finally:
                 writer.close()
 
@@ -249,13 +253,13 @@ class PointCloudTests(unittest.TestCase):
             with h5py.File(rejected / "data.h5", "r+") as data:
                 data["depth"][1] = 0
             output = root / "canonical.zarr"
-            with self.assertLogs("dexmani_real.data.canonical.export", level="ERROR"):
+            with self.assertLogs("dexmani_real.data.export", level="ERROR"):
                 with self.assertRaisesRegex(ValueError, "point_cloud unavailable at row 1"):
-                    export_canonical(root / "raw", root / "failed.zarr", processing=config)
+                    export_zarr(root / "raw", root / "failed.zarr", processing=config)
             self.assertFalse((root / "failed.zarr").exists())
             self.assertEqual(len(list(root.glob(".failed.zarr.tmp-*"))), 1)
-            with patch("dexmani_real.data.canonical.export.MAX_BATCH_FRAMES", 1):
-                result = export_canonical(root / "raw", output, processing=config, exclude=("episode_0",))
+            with patch("dexmani_real.data.export.MAX_BATCH_FRAMES", 1):
+                result = export_zarr(root / "raw", output, processing=config, exclude=("episode_0",))
             self.assertEqual(result["total_frames"], 2)
             self.assertEqual(result["excluded_episodes"], ["episode_0"])
             self.assertNotIn("rejected_episodes", result)
@@ -271,7 +275,7 @@ class PointCloudTests(unittest.TestCase):
                 _restore_cloud_config(store.attrs["hand_pointcloud_config"], HandCloudConfig),
                 config.hand_pointcloud,
             )
-            with EpisodeReader(episode) as reader:
+            with RawReader(episode) as reader:
                 decoded = next(reader.iter_rgb_frames())
             np.testing.assert_array_equal(store["data/point_cloud"][0], self.cloud(color=decoded, config=restored))
             self.assertFalse(list(root.glob(".canonical.zarr.tmp-*")))

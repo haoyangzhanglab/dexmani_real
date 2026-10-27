@@ -3,13 +3,14 @@
 import nlopt
 import numpy as np
 import pinocchio as pin
-from scipy.spatial.transform import Rotation
 
-from dexmani_real.geometry.kinematics import HandFK, SDK_TO_URDF_IDX
+from dexmani_real.geometry.kinematics import SDK_TO_URDF_IDX, HandFK
 from dexmani_real.robot.model import HAND_JOINT_SHAPE
 from dexmani_real.teleop.config import TAGConfig
 from dexmani_real.teleop.retargeting.landmarks import prepare_landmarks
 
+ROBOT_FINGER_LENGTHS = np.array([0.161, 0.208, 0.206, 0.204, 0.145])
+PINCH_SKIP_THRESHOLD = 0.01
 FINGERTIP_INDICES = np.array([4, 8, 12, 16, 20])
 URDF_TO_SDK_IDX = np.argsort(SDK_TO_URDF_IDX)
 
@@ -23,16 +24,14 @@ class TAGRetargeter:
         self.upper = self.fk.model.upperPositionLimit
         self.dof = self.fk.model.nv
         self.finger_scale = (
-            np.asarray(config.robot_finger_lengths) / config.human_finger_lengths
-            * config.finger_scale_boost
+            ROBOT_FINGER_LENGTHS / config.human_finger_lengths * config.finger_scale_boost
         )[:, None]
-        self.mano_to_urdf = Rotation.from_euler("xyz", config.mano_to_urdf_euler).as_matrix()
 
         self.position_optimizer = nlopt.opt(nlopt.LD_LBFGS, self.dof)
         self.pinch_optimizer = nlopt.opt(nlopt.LD_SLSQP, self.dof)
         for optimizer, objective, tolerance, maxeval in (
-            (self.position_optimizer, self.position_objective, config.ftol_abs_s1, config.maxeval_s1),
-            (self.pinch_optimizer, self.pinch_objective, config.ftol_abs_s2, config.maxeval_s2),
+            (self.position_optimizer, self.position_objective, 1e-4, 80),
+            (self.pinch_optimizer, self.pinch_objective, 1e-6, 100),
         ):
             optimizer.set_lower_bounds(self.lower)
             optimizer.set_upper_bounds(self.upper)
@@ -55,12 +54,13 @@ class TAGRetargeter:
 
     def retarget(self, landmarks):
         mano = prepare_landmarks(
-            landmarks, pinky_scale=self.config.pinky_scale,
+            landmarks,
+            pinky_scale=self.config.pinky_scale,
             pinky_palm_scale=self.config.pinky_palm_scale,
         )
         if mano is None:
             return None
-        tips = (mano[FINGERTIP_INDICES] - mano[0]) @ self.mano_to_urdf.T
+        tips = mano[FINGERTIP_INDICES] - mano[0]
         return self.solve(tips)[URDF_TO_SDK_IDX]
 
     def solve(self, fingertips):
@@ -73,13 +73,14 @@ class TAGRetargeter:
         factors = np.clip(
             (self.config.pinch_start_dist_m - distances)
             / (self.config.pinch_start_dist_m - self.config.pinch_full_dist_m),
-            0, 1,
+            0,
+            1,
         )
         alpha = self.config.pinch_ema_alpha
         self.pinch_factors = (1 - alpha) * self.pinch_factors + alpha * factors
 
         solution = position
-        if self.pinch_factors.max() >= self.config.pinch_skip_threshold:
+        if self.pinch_factors.max() >= PINCH_SKIP_THRESHOLD:
             self.position_solution = position
             solution = self.bounded_solution(self.pinch_optimizer.optimize(position))
         self.previous_solution = solution
@@ -91,55 +92,69 @@ class TAGRetargeter:
             raise ValueError("TAG solver must return a finite (12,) array")
         return np.clip(qpos, self.lower, self.upper)
 
-    def update_kinematics(self, qpos):
-        pin.computeJointJacobians(self.fk.model, self.fk.data, qpos)
+    def update_kinematics(self, qpos, with_jacobian):
+        if with_jacobian:
+            pin.computeJointJacobians(self.fk.model, self.fk.data, qpos)
+        else:
+            pin.forwardKinematics(self.fk.model, self.fk.data, qpos)
         pin.updateFramePlacements(self.fk.model, self.fk.data)
 
     def position_objective(self, qpos, grad):
         """Σ‖p_tip(q) − target‖² + smooth_weight·‖q − q_prev‖²。"""
-        self.update_kinematics(qpos)
+        self.update_kinematics(qpos, bool(grad.size))
         error = qpos - self.previous_solution
         value = self.config.smooth_weight * np.dot(error, error)
-        gradient = 2 * self.config.smooth_weight * error
+        if grad.size:
+            grad[:] = 2 * self.config.smooth_weight * error
         for index, frame in enumerate(self.fk.fingertip_frame_ids):
-            jacobian = pin.getFrameJacobian(
-                self.fk.model, self.fk.data, frame, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
-            )[:3]
             error = self.fk.data.oMf[frame].translation - self.target_fingertips[index]
             value += np.dot(error, error)
-            gradient += 2 * (error @ jacobian)
-        if grad.size:
-            grad[:] = gradient
+            if grad.size:
+                jacobian = pin.getFrameJacobian(
+                    self.fk.model,
+                    self.fk.data,
+                    frame,
+                    pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+                )[:3]
+                grad[:] += 2 * (error @ jacobian)
         return float(value)
 
     def pinch_objective(self, qpos, grad):
         """两项关节正则 + Σ pinch_weight·factor²·‖p_finger(q) − p_thumb(q)‖²。"""
-        self.update_kinematics(qpos)
+        self.update_kinematics(qpos, bool(grad.size))
         value = 0.0
-        gradient = np.zeros(self.dof)
+        if grad.size:
+            grad[:] = 0
         for weight, reference in (
             (self.config.reg_stage1_weight, self.position_solution),
             (self.config.reg_last_weight, self.previous_solution),
         ):
             error = qpos - reference
             value += weight * np.dot(error, error)
-            gradient += 2 * weight * error
+            if grad.size:
+                grad[:] += 2 * weight * error
 
         thumb, *fingers = self.fk.fingertip_frame_ids
         thumb_position = self.fk.data.oMf[thumb].translation
-        thumb_jacobian = pin.getFrameJacobian(
-            self.fk.model, self.fk.data, thumb, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
-        )[:3]
+        if grad.size:
+            thumb_jacobian = pin.getFrameJacobian(
+                self.fk.model,
+                self.fk.data,
+                thumb,
+                pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+            )[:3]
         for frame, factor in zip(fingers, self.pinch_factors):
             if factor < 1e-4:
                 continue
             error = self.fk.data.oMf[frame].translation - thumb_position
-            jacobian = pin.getFrameJacobian(
-                self.fk.model, self.fk.data, frame, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
-            )[:3]
             weight = self.config.pinch_base_weight * factor**2
             value += weight * np.dot(error, error)
-            gradient += 2 * weight * (error @ (jacobian - thumb_jacobian))
-        if grad.size:
-            grad[:] = gradient
+            if grad.size:
+                jacobian = pin.getFrameJacobian(
+                    self.fk.model,
+                    self.fk.data,
+                    frame,
+                    pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+                )[:3]
+                grad[:] += 2 * weight * (error @ (jacobian - thumb_jacobian))
         return float(value)
