@@ -9,10 +9,9 @@ from dexmani_real.runtime.state import RunEndReason
 
 
 @dataclass
-class PolicyQuery:
+class Prediction:
     """slot 是观测锚点，handoff_slot 是最早交接时刻。"""
 
-    query_id: int
     run_id: int
     slot: int
     expires_at_ns: int
@@ -21,7 +20,7 @@ class PolicyQuery:
 
 
 @dataclass
-class ActionPlan:
+class ActionChunk:
     """actions 从 anchor_slot 索引，async 可继续使用 segment_end 后的有效尾部。"""
 
     actions: np.ndarray
@@ -63,7 +62,7 @@ def handoff_plan(
             return None, ControlRejection("handoff_decision_expired")
         segment_end = min(segment_end, query.slot + len(query.result))
     return (
-        ActionPlan(
+        ActionChunk(
             actions=query.result,
             anchor_slot=slot if bootstrap else query.slot,
             segment_end=segment_end,
@@ -101,17 +100,6 @@ def control_slot(*, now_ns, next_step_ns, last_slot, dt_ns, synchronous, resume_
     if skipped:
         return slot, next_step_ns, skipped
     return slot, (now_ns if synchronous else next_step_ns) + dt_ns, 0
-
-
-def run_budget(*, run_id, started_ns, max_running_s, wait_started_ns, max_wait_s):
-    deadlines = []
-    if run_id is not None:
-        if max_running_s is not None:
-            deadlines.append((started_ns + int(max_running_s * 1e9), "duration"))
-        if wait_started_ns is not None:
-            deadlines.append((wait_started_ns + int(max_wait_s * 1e9), "wait"))
-    # 同时到期时优先报告等待超时。
-    return min(deadlines, key=lambda item: (item[0], item[1] != "wait")) if deadlines else None
 
 
 def plan_rejection(plan, slot, mode, now_ns):

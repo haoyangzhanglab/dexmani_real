@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from dexmani_real.config import load_experiment_config
+from dexmani_real.config import load_config
 from dexmani_real.robot.commands import OperationCancelled, validate_hand_target
 from dexmani_real.robot.model import (
     HAND_DOF,
@@ -341,13 +341,13 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
     try:
-        config = load_experiment_config(
-            yaml_path=args.config,
-            cli_overrides={
-                "hand.comm_type": args.comm,
-                "hand.device_name": args.device,
-                "hand.device_id": args.hand_id,
-            },
+        config = load_config(
+            path=args.config,
+            overrides={"hand": {
+                "comm_type": args.comm,
+                "device_name": args.device,
+                "device_id": args.hand_id,
+            }},
         ).hand
         if not args.print_config:
             config.validate()

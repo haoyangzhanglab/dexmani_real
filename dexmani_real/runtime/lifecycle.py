@@ -3,7 +3,9 @@
 import logging
 import time
 
+from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.runtime.state import RunEndReason, SafetyState
+from dexmani_real.utils.log import error_detail
 
 logger = logging.getLogger(__name__)
 
@@ -26,18 +28,22 @@ class SensorWorkers:
     def start(self, process, *, ready, timeout_s=None, may_start) -> None:
         """传入超时时等待就绪，否则仅启动；失败后仍由本对象回收进程。"""
         if not may_start():
-            raise RuntimeError("sensor startup cancelled")
+            raise OperationCancelled("sensor startup cancelled")
         process.start()
         self.started.append((process, ready))
         if timeout_s is not None:
             deadline = time.monotonic() + timeout_s
             while time.monotonic() < deadline:
-                if not may_start() or not self.check():
-                    break
+                if not may_start():
+                    raise OperationCancelled(f"{process.name} startup cancelled")
+                if not self.check():
+                    raise RuntimeError(f"{process.name} exited during startup")
                 if ready.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
-                    if may_start() and self.check():
-                        return
-                    break
+                    if not may_start():
+                        raise OperationCancelled(f"{process.name} startup cancelled")
+                    if not self.check():
+                        raise RuntimeError(f"{process.name} exited during startup")
+                    return
             raise RuntimeError(f"{process.name} failed to become ready")
 
     def check(self, *, names=None) -> bool:
@@ -80,18 +86,18 @@ class SensorWorkers:
                         process.exitcode,
                         escalation,
                     )
-            except Exception as exc:
+            except BaseException as exc:
                 unresolved.append((process, ready))
                 errors.append(exc)
                 logger.exception("worker %s shutdown failed", process.name)
         self.started = unresolved
         if errors:
-            raise RuntimeError(f"sensor shutdown unresolved: {errors}") from errors[0]
+            raise errors[0]
         return clean
 
 
 def close_runtime(
-    runtime_state, robot=None, *, sensors=None, keyboard=None, deadline=None
+    runtime_state, robot=None, *, sensors=None, keyboard=None, deadline=None, errors=None,
 ):
     """先撤销运动权限，再关闭设备、输入和传感进程。"""
     if deadline is None:
@@ -105,15 +111,19 @@ def close_runtime(
             ),
             reason=RunEndReason.RUNTIME_SHUTDOWN,
         )
-    for close in (
-        robot.close if robot is not None else None,
-        keyboard.stop if keyboard is not None else None,
+    for stage, close in (
+        ("robot_close", robot.close if robot is not None else None),
+        ("keyboard_stop", keyboard.stop if keyboard is not None else None),
     ):
         if close is None:
             continue
         try:
             close()
-        except Exception:
+        except BaseException as exc:
+            if errors is not None:
+                errors.append(error_detail(stage, exc))
+            if isinstance(exc, KeyboardInterrupt):
+                runtime_state.request_emergency_stop()
             runtime_state.mark_error()
             logger.exception("local runtime cleanup failed")
     runtime_state.end_session()
@@ -121,7 +131,11 @@ def close_runtime(
     if sensors is not None:
         try:
             sensors_clean = sensors.shutdown(deadline=deadline)
-        except Exception:
+        except BaseException as exc:
+            if errors is not None:
+                errors.append(error_detail("sensor_shutdown", exc))
+            if isinstance(exc, KeyboardInterrupt):
+                runtime_state.request_emergency_stop()
             runtime_state.mark_error()
             logger.exception("sensor shutdown failed; unresolved process handles retained")
             sensors_clean = False

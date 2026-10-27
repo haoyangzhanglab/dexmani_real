@@ -12,7 +12,7 @@ import numpy as np
 
 from dexmani_real.calibration.camera.extrinsics import load_camera_extrinsics
 from dexmani_real.calibration.table_plane import load_table_plane
-from dexmani_real.config import load_experiment_config
+from dexmani_real.config import load_config
 from dexmani_real.geometry.camera import validate_aligned_depth_distortion
 from dexmani_real.perception.pointcloud import (
     DEPTH_RANGE_M,
@@ -106,7 +106,7 @@ class RealSenseViewer:
 
     def run(self) -> int:
         # Resolve experiment settings before enumerating or opening a camera.
-        runtime = load_experiment_config(yaml_path=self.args.config)
+        runtime = load_config(path=self.args.config)
         self.pointcloud_config = runtime.pointcloud
         self.table = runtime.environment.table
         self.calibration: dict[str, np.ndarray] | None = None

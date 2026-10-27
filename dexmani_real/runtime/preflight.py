@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from dexmani_real.config import ExperimentConfig
+    from dexmani_real.config import RealConfig
 
 
-def validate_robot_config(cfg: ExperimentConfig) -> None:
+def validate_robot_config(cfg: RealConfig) -> None:
     cfg.arm.validate()
     if cfg.hand.enabled:
         cfg.hand.validate()
@@ -19,7 +19,7 @@ def validate_robot_config(cfg: ExperimentConfig) -> None:
     cfg.environment.validate()
 
 
-def validate_control_rate(cfg: ExperimentConfig, control_hz: float) -> None:
+def validate_control_rate(cfg: RealConfig, control_hz: float) -> None:
     if not np.isfinite(control_hz) or not 0 < control_hz <= cfg.arm.servo_hz:
         raise ValueError("target frequency must be positive and no greater than arm.servo_hz")
     if 1 / control_hz >= cfg.arm.feedback_max_age_s:
@@ -35,7 +35,7 @@ def validate_control_rate(cfg: ExperimentConfig, control_hz: float) -> None:
             )
 
 
-def jog_bounds(runtime: ExperimentConfig) -> tuple[np.ndarray, np.ndarray]:
+def jog_bounds(runtime: RealConfig) -> tuple[np.ndarray, np.ndarray]:
     cfg = runtime.keyboard_teleop
     for name in ("target_max_age_s", "delta_pos_m", "delta_rpy_rad"):
         value = getattr(cfg, name)

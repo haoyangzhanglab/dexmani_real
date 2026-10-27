@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import subprocess
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -16,6 +15,7 @@ from dexmani_real.calibration.table_plane import (
 from dexmani_real.deployment.config import (
     DEFAULT_MAX_RUNNING_S,
     DEFAULT_NUM_EPISODES,
+    RUNTIME_SECTIONS,
     resolve_deployment_config,
 )
 from dexmani_real.deployment.observation import policy_dependencies, policy_needs
@@ -47,15 +47,6 @@ def session_directory(root: Path, info) -> Path:
         dedup += 1
     candidate.mkdir(parents=True, exist_ok=False)
     return candidate
-
-
-def git_head(root):
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.DEVNULL
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        return None
 
 
 def run_policy(
@@ -108,14 +99,9 @@ def run_policy(
         camera_calibration_path = Path(camera_calibration_path).expanduser().resolve()
     root = output or Path(__file__).resolve().parents[2] / "rollouts"
     session_dir = session_directory(Path(root), info)
-    import dexmani_policy
-
     payload = {
-        "experiment": str(experiment),
-        "checkpoint": str(checkpoint),
         "policy": info.to_dict(),
-        "future_steps": info.future_steps,
-        "runtime": asdict(runtime),
+        "runtime": {name: asdict(getattr(runtime, name)) for name in RUNTIME_SECTIONS},
         "camera_calibration_path": str(camera_calibration_path or CAMERAS_PATH),
         "effective_camera": None,
         "table_plane_abcd": table_plane_abcd,
@@ -127,10 +113,7 @@ def run_policy(
         "device": device,
         "num_episodes": num_episodes,
         "max_duration_s": max_running_s,
-        "output": str(session_dir),
         "record_raw": record_raw,
-        "dexmani_real_head": git_head(Path(__file__).resolve().parents[2]),
-        "dexmani_policy_head": git_head(Path(dexmani_policy.__file__).resolve().parents[1]),
     }
     write_yaml(payload, session_dir / "run_config.yaml")
 
@@ -144,8 +127,6 @@ def run_policy(
     return PolicySession(
         runtime,
         info,
-        control_needs=control_needs, record_needs=record_needs,
-        dependencies=dependencies,
         device=device,
         seed=seed,
         max_running_s=max_running_s,

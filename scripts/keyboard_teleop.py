@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from dexmani_real.config import load_experiment_config
+from dexmani_real.config import load_config
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -24,11 +24,11 @@ def main(argv: list[str] | None = None) -> int:
 
     from dexmani_real.teleop.keyboard import KeyboardTeleop
 
-    runtime = load_experiment_config(
-        yaml_path=args.config,
-        cli_overrides={
-            "hand.enabled": False if args.no_hand else None,
-            "keyboard_teleop.control_hz": args.control_hz,
+    runtime = load_config(
+        path=args.config,
+        overrides={
+            "hand": {"enabled": False if args.no_hand else None},
+            "keyboard_teleop": {"control_hz": args.control_hz},
         },
     )
     return KeyboardTeleop(runtime, no_hand=args.no_hand).run()

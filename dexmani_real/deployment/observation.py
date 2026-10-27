@@ -48,20 +48,10 @@ def policy_needs(dependencies):
 
 
 @dataclass(frozen=True)
-class ObservationKinematics:
-    arm_fk: ArmFK
-    hand_fk: HandFK | None = None
-    handbase_position_eef_m: tuple[float, float, float] | None = None
-    handbase_rotation_eef: np.ndarray | None = None
-    hand_cloud: HandPointCloud | None = None
-    row_features: dict = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
 class PolicyObservationRow:
-    observation_timestamp_ns: int
     source_timestamp_ns: int
-    values: dict
+    values: dict[str, np.ndarray]
+    features: dict[str, np.ndarray] = field(default_factory=dict, compare=False)
 
 
 def policy_source_timestamp(row, dependencies):
@@ -81,109 +71,100 @@ def policy_source_timestamp(row, dependencies):
     return min(times or (int(row.arm["timestamp_ns"][0]), int(row.hand["timestamp_ns"][0])))
 
 
-def project_policy_row(row, fields, dependencies):
-    values = {}
-    if "arm" in dependencies:
-        values["arm_qpos"] = row.arm["qpos"][0].copy()
-    if "hand" in dependencies:
-        values["hand_qpos"] = row.hand["qpos"][0].copy()
-    for name in fields:
-        if name == "finger_tactile_force":
-            # 独立复制，避免聚合触觉视图持有仅供录制的稠密载荷。
-            values[name] = row.hand["tactile_aggregate"][0].copy()
-        elif name == "taxel_tactile_force":
-            values[name] = row.hand["tactile_dense"][0]
-        elif name == "point_cloud":
-            values[name] = row.point_cloud
-        elif name in {"rgb", "depth"}:
-            values[name] = row.camera[name]
-    return PolicyObservationRow(
-        row.observation_timestamp_ns, policy_source_timestamp(row, dependencies), values,
-    )
+class ObservationBuilder:
+    def __init__(self, info, runtime):
+        self.info = info
+        self.fields = tuple(info.observation_fields)
+        self.dependencies = policy_dependencies(self.fields)
+        self.needs = policy_needs(self.dependencies)
+        self.camera_parameters = {}
+        self.arm_fk = ArmFK() if "arm_fk" in self.dependencies else None
+        self.hand_fk = self.hand_cloud = None
+        if "hand_fk" in self.dependencies:
+            self.hand_fk = HandFK(
+                info.fingertip_link_names
+                if "fingertips" in self.dependencies else XHAND_FINGERTIP_LINK_NAMES,
+            )
+            self.handbase_position_eef_m = tuple(runtime.hand.T_eef_handbase_pos_xyz)
+            self.handbase_rotation_eef = quat_wxyz_to_rotmat(runtime.hand.T_eef_handbase_quat_wxyz)
+            if "hand_cloud" in self.dependencies:
+                self.hand_cloud = HandPointCloud(self.hand_fk, runtime.hand_pointcloud.num_points)
 
-
-def build_observation_kinematics(dependencies, *, fingertip_link_names, hand, hand_pointcloud):
-    """按需构造 FK 工作区，由推理线程独占。"""
-    if "arm_fk" not in dependencies:
-        return None
-    if "hand_fk" not in dependencies:
-        return ObservationKinematics(ArmFK())
-    hand_fk = HandFK(
-        fingertip_link_names if "fingertips" in dependencies else XHAND_FINGERTIP_LINK_NAMES,
-    )
-    hand_cloud = None
-    if "hand_cloud" in dependencies:
-        hand_cloud = HandPointCloud(hand_fk, hand_pointcloud.num_points)
-    return ObservationKinematics(
-        ArmFK(), hand_fk,
-        tuple(hand.T_eef_handbase_pos_xyz),
-        quat_wxyz_to_rotmat(hand.T_eef_handbase_quat_wxyz),
-        hand_cloud,
-    )
-
-
-def build_observation_camera(camera, fields, *, depth_config=None):
-    requested = set(fields) & {"depth", "camera_intrinsic", "camera_extrinsic"}
-    if not requested:
-        return {}
-    if "depth" in requested and not math.isclose(
-        camera.depth_scale_m, depth_config["depth_scale_m"], rel_tol=1e-9, abs_tol=0.0,
-    ):
-        raise ValueError("Live depth scale differs from the saved raw-count input recipe")
-    requested.discard("depth")
-    if not requested:
-        return {}
-    parameters = camera_parameters_cv(
-        camera.color,
-        camera.T_xarm_base_from_color if "camera_extrinsic" in requested else None,
-    )
-    return {name: parameters[name] for name in requested}
-
-
-def build_policy_observation(rows, fields, dependencies, *, kinematics=None, camera_parameters=None):
-    arrays = {}
-    if "joint_state" in fields:
-        arrays["joint_state"] = np.stack([
-            np.concatenate((r.values["arm_qpos"], r.values["hand_qpos"])) for r in rows
-        ]).astype(np.float32)
-    for name in fields:
-        sources = FIELD_DEPENDENCIES[name]
-        if "camera_static" in sources:
-            values = camera_parameters[name]
-            arrays[name] = np.broadcast_to(values, (len(rows), values.size)).copy()
-        elif name != "joint_state" and "arm_fk" not in sources:
-            arrays[name] = np.stack([r.values[name] for r in rows])
-
-    if "arm_fk" in dependencies:
-        cache = kinematics.row_features
-        identities = {r.observation_timestamp_ns for r in rows}
-        for identity in tuple(cache):
-            if identity not in identities:
-                del cache[identity]
-        new_rows = tuple({
-            r.observation_timestamp_ns: r for r in rows if r.observation_timestamp_ns not in cache
-        }.values())
-        features = {}
-        if new_rows:
-            arm = np.stack([r.values["arm_qpos"] for r in new_rows])
-            poses = eef_poses(arm, arm_fk=kinematics.arm_fk)
-            if "eef_pose" in fields:
-                features["eef_pose"] = poses.astype(np.float32)
-            if "hand_fk" in dependencies:
-                features.update(hand_geometry(
-                    poses, np.stack([r.values["hand_qpos"] for r in new_rows]),
-                    hand_fk=kinematics.hand_fk,
-                    handbase_position_eef_m=kinematics.handbase_position_eef_m,
-                    handbase_rotation_eef=kinematics.handbase_rotation_eef,
-                    hand_cloud=kinematics.hand_cloud,
-                    include_fingertips="fingertips" in dependencies,
-                ))
-        for index, row in enumerate(new_rows):
-            cache[row.observation_timestamp_ns] = {
-                name: value[index].copy() for name, value in features.items()
-            }
+    def project(self, row):
+        fields, dependencies = self.fields, self.dependencies
+        values = {}
+        if "arm" in dependencies:
+            values["arm_qpos"] = row.arm["qpos"][0].copy()
+        if "hand" in dependencies:
+            values["hand_qpos"] = row.hand["qpos"][0].copy()
         for name in fields:
-            if "arm_fk" in FIELD_DEPENDENCIES[name]:
-                arrays[name] = np.stack([cache[r.observation_timestamp_ns][name] for r in rows])
+            if name == "finger_tactile_force":
+                # 独立复制，避免聚合触觉视图持有仅供录制的稠密载荷。
+                values[name] = row.hand["tactile_aggregate"][0].copy()
+            elif name == "taxel_tactile_force":
+                values[name] = row.hand["tactile_dense"][0]
+            elif name == "point_cloud":
+                values[name] = row.point_cloud
+            elif name in {"rgb", "depth"}:
+                values[name] = row.camera[name]
+        return PolicyObservationRow(
+            policy_source_timestamp(row, dependencies), values,
+        )
 
-    return {name: arrays[name] for name in fields}
+    def configure_camera(self, camera):
+        self.camera_parameters = {}
+        requested = set(self.fields) & {"depth", "camera_intrinsic", "camera_extrinsic"}
+        if not requested:
+            return
+        if "depth" in requested and not math.isclose(
+            camera.depth_scale_m, self.info.depth_config["depth_scale_m"], rel_tol=1e-9, abs_tol=0.0,
+        ):
+            raise ValueError("Live depth scale differs from the saved raw-count input recipe")
+        requested.discard("depth")
+        if not requested:
+            return
+        parameters = camera_parameters_cv(
+            camera.color,
+            camera.T_xarm_base_from_color if "camera_extrinsic" in requested else None,
+        )
+        self.camera_parameters = {name: parameters[name] for name in requested}
+
+    def build(self, rows):
+        fields, dependencies = self.fields, self.dependencies
+        arrays = {}
+        if "joint_state" in fields:
+            arrays["joint_state"] = np.stack([
+                np.concatenate((r.values["arm_qpos"], r.values["hand_qpos"])) for r in rows
+            ]).astype(np.float32)
+        for name in fields:
+            sources = FIELD_DEPENDENCIES[name]
+            if "camera_static" in sources:
+                values = self.camera_parameters[name]
+                arrays[name] = np.broadcast_to(values, (len(rows), values.size)).copy()
+            elif name != "joint_state" and "arm_fk" not in sources:
+                arrays[name] = np.stack([r.values[name] for r in rows])
+
+        if "arm_fk" in dependencies:
+            new_rows = [row for row in rows if not row.features]
+            features = {}
+            if new_rows:
+                arm = np.stack([r.values["arm_qpos"] for r in new_rows])
+                poses = eef_poses(arm, arm_fk=self.arm_fk)
+                if "eef_pose" in fields:
+                    features["eef_pose"] = poses.astype(np.float32)
+                if "hand_fk" in dependencies:
+                    features.update(hand_geometry(
+                        poses, np.stack([r.values["hand_qpos"] for r in new_rows]),
+                        hand_fk=self.hand_fk,
+                        handbase_position_eef_m=self.handbase_position_eef_m,
+                        handbase_rotation_eef=self.handbase_rotation_eef,
+                        hand_cloud=self.hand_cloud,
+                        include_fingertips="fingertips" in dependencies,
+                    ))
+            for index, row in enumerate(new_rows):
+                row.features.update({name: value[index].copy() for name, value in features.items()})
+            for name in fields:
+                if "arm_fk" in FIELD_DEPENDENCIES[name]:
+                    arrays[name] = np.stack([r.features[name] for r in rows])
+
+        return {name: arrays[name] for name in fields}

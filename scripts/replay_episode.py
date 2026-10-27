@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from dexmani_real.config import load_experiment_config
+from dexmani_real.config import load_config
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
 
     trajectory = load_trajectory(args.episode)
 
-    runtime = load_experiment_config(yaml_path=args.config)
+    runtime = load_config(path=args.config)
 
     print(f"Trajectory: {trajectory.episode_path}")
     print(

@@ -106,7 +106,7 @@ class RawHandCloudProvider:
     """使用同一 Raw 行实测关节、记录外参和当前手安装变换；行对齐不证明物理同步。"""
 
     def __init__(self, episode, config_path=None, num_points=1024, seed=0):
-        from dexmani_real.config import load_experiment_config
+        from dexmani_real.config import load_config
         from dexmani_real.data.raw import RawReader
         from dexmani_real.geometry.kinematics import ArmFK
         from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
@@ -122,7 +122,7 @@ class RawHandCloudProvider:
 
         self.episode = Path(episode).expanduser().resolve()
         config_path = Path(config_path).expanduser().resolve() if config_path is not None else None
-        config = load_experiment_config(yaml_path=config_path)
+        config = load_config(config_path)
         from dexmani_real.geometry.pose import validate_unit_quaternion_wxyz
 
         mount = np.asarray(config.hand.T_eef_handbase_pos_xyz, dtype=np.float64)
@@ -164,7 +164,7 @@ class RawHandCloudProvider:
             "joint_state_names": [*XARM7_JOINT_NAMES, *XHAND_SDK_JOINT_NAMES],
             "joint_state_semantics": "measured_arm_qpos_then_measured_hand_qpos_no_interpolation",
             "mount_source": (
-                str(config_path) if config_path else "current_ExperimentConfig_defaults"
+                str(config_path) if config_path else "current_RealConfig_defaults"
             ),
             "T_eef_handbase": self.T_eef_handbase.tolist(),
             "T_base_camera": self.T_base_camera.tolist(),

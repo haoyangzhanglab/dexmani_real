@@ -3,25 +3,24 @@
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import numpy as np
 
 from dexmani_real.data.raw import snapshot_recording_metadata
-from dexmani_real.data.recorder import (
-    RecordingError,
-)
-from dexmani_real.deployment.observation import (
-    project_policy_row,
+from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
+from dexmani_real.deployment.config import (
+    PREDICTION_TIMEOUT_NS,
+    START_ARM_TOLERANCE_DEG,
 )
 from dexmani_real.deployment.schedule import (
     ControlRejection,
-    PolicyQuery,
+    Prediction,
     control_slot,
     handoff_plan,
     plan_rejection,
     prefetch_handoff,
-    run_budget,
 )
 from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
@@ -46,56 +45,60 @@ def failure_reason(error):
     return RunEndReason.POLICY_FAILURE
 
 
-@dataclass(frozen=True)
-class EpisodeEnd:
-    run_id: int | None
-    reason: str
-    detail: str
-    duration_s: float
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
 
-class PolicyRollout:
+@dataclass
+class EpisodeResult:
+    index: int
+    started_utc: str | None = None
+    duration_s: float = 0.0
+    termination_reason: str | None = None
+    termination_details: str | None = None
+    errors: list[dict] = field(default_factory=list)
+    raw: dict | None = None
+    metrics: dict = field(default_factory=lambda: dict(
+        inference_count=0, inference_mean_s=None, inference_max_s=None, skipped_slots=0,
+    ))
+
+    def record_prediction(self, duration_ns):
+        metrics = self.metrics
+        count = metrics["inference_count"]
+        mean = metrics["inference_mean_s"] or 0.0
+        duration = duration_ns / 1e9
+        metrics.update(
+            inference_count=count + 1,
+            inference_mean_s=mean + (duration - mean) / (count + 1),
+            inference_max_s=max(metrics["inference_max_s"] or 0.0, duration),
+        )
+
+
+class Rollout:
     def __init__(
-        self,
-        runtime_state,
-        runtime,
-        policy_info,
-        *,
-        preparing_epoch,
-        robot,
-        control_needs,
-        record_needs,
-        dependencies,
-        sensors,
-        action_mapper,
-        model,
-        max_running_s,
-        query_ids,
-        capture_ids,
-        results,
-        recorder=None,
-        camera_snapshot=None,
+        self, runtime_state, runtime, policy_info, *, preparing_epoch, robot,
+        observations, record_needs, sensors, action_mapper, model, max_running_s,
+        capture_ids, index, output_dir, record_raw, camera_snapshot=None,
     ):
         self.runtime_state = runtime_state
         self.runtime = runtime
         self.policy_info = policy_info
         self.execution = runtime.execution
-        self.robot = robot
-        self.sensors = sensors
-        self.control_needs, self.record_needs = control_needs, record_needs
-        self.dependencies = dependencies
-        self.needs = control_needs.union(record_needs)
-        self.action_mapper = action_mapper
-        self.model = model
-        self.recorder = recorder
-        self.results = results
+        self.robot, self.sensors = robot, sensors
+        self.observations = observations
+        self.control_needs, self.record_needs = observations.needs, record_needs
+        self.needs = self.control_needs.union(record_needs)
+        self.action_mapper, self.model = action_mapper, model
+        self.recorder = (
+            EpisodeRecorder(output_dir, control_hz=1.0 / policy_info.control_dt_s)
+            if record_raw else None
+        )
+        self.result = EpisodeResult(index)
         self.camera_snapshot = camera_snapshot
-        self.max_running_s = max_running_s
-        self.query_ids = query_ids
+        self.max_duration_ns = int(max_running_s * 1e9) if max_running_s is not None else None
         self.capture_ids = capture_ids
         self.preparing_epoch = preparing_epoch
         self.run_id = None
-        self.termination = None
         self.history = deque(maxlen=policy_info.n_obs_steps)
         self.hand_history = (
             deque(maxlen=policy_info.hand_history_steps)
@@ -103,13 +106,16 @@ class PolicyRollout:
         )
         self.plan = self.query = None
         self.preparation_issue = None
-        self.wait_started_ns = None
+        self.run_deadline_ns = self.wait_deadline_ns = None
         self.last_slot = -1
         self.dt_ns = int(policy_info.control_dt_s * 1e9)
         self.max_decision_age_ns = int(self.execution.max_decision_age_s * 1e9)
         self.started_ns = self.next_step_ns = 0
         self.previous_arm = None
-        self.pending_frame = None
+
+    @property
+    def finished(self):
+        return self.result.termination_reason is not None
 
     def read_observation(self):
         row = read_observation(
@@ -127,27 +133,26 @@ class PolicyRollout:
         return row, "control_input_" + issues[0] if issues else None, feedback_until_ns
 
     def budget_limit(self):
-        return run_budget(
-            run_id=self.run_id, started_ns=self.started_ns, max_running_s=self.max_running_s,
-            wait_started_ns=self.wait_started_ns, max_wait_s=self.execution.max_wait_s,
-        )
+        if self.wait_deadline_ns is not None and (
+            self.run_deadline_ns is None or self.wait_deadline_ns <= self.run_deadline_ns
+        ):
+            return self.wait_deadline_ns, "wait"
+        if self.run_deadline_ns is not None:
+            return self.run_deadline_ns, "duration"
+        return None
 
     def expired_budget(self):
         limit = self.budget_limit()
         return limit if limit is not None and time.monotonic_ns() >= limit[0] else None
 
-    def finish_budget(self, limit):
-        self.finish(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
-
     def has_motion_authority(self):
         return self.runtime_state.can_move(run_id=self.run_id)
 
-    def finish(self, detail, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY, errors=None):
-        if self.termination is not None:
+    def stop(self, detail, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY, errors=()):
+        if self.finished:
             return
         epoch = self.run_id
         ended_ns = time.monotonic_ns()
-        duration_s = (ended_ns - self.started_ns) / 1e9 if epoch is not None else 0.0
         self.runtime_state.revoke_motion(
             reason=run_end_reason,
             expected_run_id=epoch if epoch is not None else self.preparing_epoch,
@@ -156,79 +161,66 @@ class PolicyRollout:
             stopped_epoch = self.runtime_state.run_id
             reason = (
                 self.runtime_state.run_ended_reason
-                if epoch is not None and self.runtime_state.run_ended_id == epoch
-                else run_end_reason
+                if epoch is not None and self.runtime_state.run_ended_id == epoch else run_end_reason
             )
-        if epoch is None:
-            reason_name = "preparation_failed" if self.preparation_issue or errors else "start_cancelled"
-        else:
-            reason_name = reason.name.lower()
-        # 首次终止即固定结果，收尾失败也不能重复提交。
-        self.termination = EpisodeEnd(epoch, reason_name, detail, duration_s)
-        self.run_id = None
-        self.plan = None
+        self.result.duration_s = (ended_ns - self.started_ns) / 1e9 if epoch is not None else 0.0
+        self.result.termination_reason = (
+            reason.name.lower() if epoch is not None
+            else "preparation_failed" if self.preparation_issue or errors else "start_cancelled"
+        )
+        self.result.termination_details = detail
+        self.result.errors.extend(errors)
+        self.run_id = self.plan = None
         if not self.model.has_pending_task:
             self.query = self.preparing_epoch = None
         self.history.clear()
         if self.hand_history is not None:
             self.hand_history.clear()
-        self.previous_arm = self.wait_started_ns = None
-        errors, failure = list(errors or ()), None
-        capture_failed = bool(errors) or not (
-            reason_name in {"operator", "quit"}
-            or (reason_name == "timeout" and detail == "duration_timeout")
-        )
+        self.previous_arm = self.wait_deadline_ns = self.run_deadline_ns = None
         try:
             if epoch is not None or self.robot.stop_required:
                 self.robot.stop()
             self.runtime_state.acknowledge_stop(stopped_epoch)
         except BaseException as exc:
-            failure = exc
-            errors.append(error_detail("stop", exc))
-            capture_failed = True
+            self.result.errors.append(error_detail("stop", exc))
             if isinstance(exc, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()
             if epoch is None:
-                reason_name = "preparation_failed"
-                self.termination = EpisodeEnd(None, reason_name, detail, duration_s)
-        try:
-            self.record_pending()
-        except BaseException as exc:
-            failure = failure or exc
-            errors.append(error_detail("recording", exc))
-            capture_failed = True
-        try:
-            self.finalize_outputs(
-                reason_name, detail, errors, duration_s=duration_s, capture_failed=capture_failed,
-            )
-        except BaseException as exc:
-            failure = failure or exc
-        if failure is not None:
-            raise failure
+                self.result.termination_reason = "preparation_failed"
+            raise
 
-    def finalize_outputs(self, reason, detail, errors, *, duration_s, capture_failed):
-        failure, raw = None, None
+    def finish(self):
+        result = self.result
+        normal = result.termination_reason in {"operator", "quit"} or (
+            result.termination_reason == "timeout" and result.termination_details == "duration_timeout"
+        )
         if self.recorder is not None and self.recorder.start_attempted:
             try:
                 self.recorder.finish(
-                    save=True,
-                    reason=reason,
-                    details=[dict(stage="termination", reason=detail), *errors],
-                    technical_status="failed" if capture_failed else "normal",
+                    save=True, reason=result.termination_reason,
+                    details=[dict(stage="termination", reason=result.termination_details), *result.errors],
+                    technical_status="normal" if normal and not result.errors else "failed",
                 )
             except BaseException as exc:
-                failure = exc
-                errors.append(error_detail("recorder_finalize", exc))
-            raw = self.recorder.result(failed=failure is not None)
-        try:
-            self.results.finish_episode(
-                reason, details=detail, errors=errors, raw=raw, duration_s=duration_s
-            )
-        except BaseException as exc:
-            failure = failure or exc
-            self.results.record_errors([error_detail("evaluation_save", exc)])
-        if failure is not None:
-            raise failure
+                result.errors.append(error_detail("recorder_finalize", exc))
+                raise
+            finally:
+                result.raw = self.recorder.result()
+
+    def close(self):
+        if self.recorder is not None:
+            try:
+                self.recorder.close()
+            finally:
+                self.refresh_raw()
+
+    def refresh_raw(self):
+        if self.recorder is not None:
+            self.result.raw = self.recorder.result()
+
+    @property
+    def writer_pending(self):
+        return self.recorder is not None and self.recorder.writer_pending
 
     def preparation_valid(self):
         return self.runtime_state.can_move(
@@ -242,7 +234,7 @@ class PolicyRollout:
             logger.warning("本轮未开始：%s", self.preparation_issue)
             return None
         if np.max(np.abs(row.arm["qpos"][0] - self.runtime.arm.home_qpos)) > np.deg2rad(
-            self.execution.start_arm_home_tolerance_deg
+            START_ARM_TOLERANCE_DEG
         ) or np.max(
             np.abs(row.hand["qpos"][0] - np.deg2rad(self.runtime.hand.home_qpos_deg))
         ) > np.deg2rad(
@@ -254,7 +246,6 @@ class PolicyRollout:
         return row
 
     def prepare(self):
-        self.results.begin_episode()
         try:
             self.robot.reset_hand_feedback()
             self.robot.read_initial_state(cancel_requested=lambda: not self.preparation_valid())
@@ -262,17 +253,17 @@ class PolicyRollout:
                 raise OperationCancelled("cancelled during initial feedback acquisition")
             row = self.start_observation()
         except OperationCancelled as exc:
-            self.finish(str(exc))
+            self.stop(str(exc))
             return
         if row is None:
-            self.finish(self.preparation_issue)
+            self.stop(self.preparation_issue)
             return
         logger.info("正在准备本轮模型…")
-        self.model.submit("reset_episode", query_context=dict(preparing_epoch=self.preparing_epoch))
+        self.model.reset()
 
     def admit(self):
         if not self.preparation_valid():
-            self.finish("cancelled during model reset")
+            self.stop("cancelled during model reset")
             return
         epoch = self.preparing_epoch
         if self.recorder is not None:
@@ -288,79 +279,46 @@ class PolicyRollout:
             )
         # 录制启动和设备模式恢复可能阻塞，之后分别读取新反馈。
         if self.start_observation() is None:
-            self.finish(self.preparation_issue)
+            self.stop(self.preparation_issue)
             return
         self.robot.prepare_streaming(epoch, service=lambda: service_feedback(self.robot, self.runtime))
         if self.start_observation() is None:
-            self.finish(self.preparation_issue)
+            self.stop(self.preparation_issue)
             return
         with self.runtime_state.motion_lock:
             admitted = self.runtime_state.begin_motion() if epoch == self.runtime_state.run_id else None
         if admitted is None:
-            self.finish("final admission declined")
+            self.stop("final admission declined")
             return
         self.run_id, self.started_ns = admitted
         self.preparing_epoch = None
-        self.next_step_ns = self.wait_started_ns = self.started_ns
-        self.results.entered(self.run_id)
+        self.next_step_ns = self.started_ns
+        self.wait_deadline_ns = self.started_ns + PREDICTION_TIMEOUT_NS
+        self.run_deadline_ns = (
+            self.started_ns + self.max_duration_ns if self.max_duration_ns is not None else None
+        )
+        self.result.started_utc = utc_now()
 
     def poll_model(self):
         item = self.model.poll()
         if item is None:
             return
         operation, result = item
-        if operation == "reset_episode":
-            if result.query_context != dict(preparing_epoch=self.preparing_epoch):
-                raise RuntimeError("model reset/preparation ownership mismatch")
-            retired = self.termination is not None or not self.preparation_valid()
-            failure = (
-                self.retired_model_error(operation, result)
-                if retired and result.error is not None else None
-            )
-            if self.termination is None and retired:
-                self.finish("cancelled during model reset")
-            if retired:
-                self.preparing_epoch = None
-                if failure is not None:
-                    raise failure from result.error
-                return
-            if result.error is not None:
-                raise result.error
-            self.admit()
+        if self.finished:
+            self.query = self.preparing_epoch = None
             return
-        query = self.query
-        if query is None:
-            raise RuntimeError("Model result has no owned query")
-        if result.query_context != dict(run_id=query.run_id, query_id=query.query_id):
-            raise RuntimeError("model result/query ownership mismatch")
-        if query.run_id == self.run_id:
-            self.results.record_inference(result)
-        if query.run_id != self.run_id or not self.has_motion_authority():
-            failure = self.retired_model_error(operation, result) if result.error is not None else None
-            if self.termination is None:
-                self.finish("owner_authority_revoked")
+        if operation == "reset":
+            if self.preparation_valid():
+                self.admit()
+            else:
+                self.stop("cancelled during model reset")
+            return
+        if not self.has_motion_authority():
+            self.stop("owner_authority_revoked")
             self.query = None
-            if failure is not None:
-                raise failure from result.error
             return
-        if result.error is not None:
-            raise result.error
-        query.result = result.value
-
-    def retired_model_error(self, operation, result):
-        # 已结束轮次不再改写；迟到模型错误终止整个会话。
-        self.runtime_state.mark_error()
-        detail = dict(
-            error_detail("retired_model", result.error), operation=operation,
-            query_context=dict(result.query_context),
-            started_ns=result.started_ns, completed_ns=result.completed_ns,
-        )
-        logger.error("retired model task failed: %s", detail)
-        self.results.record_errors([detail])
-        return RuntimeError(
-            f"retired model {operation} failed: context={result.query_context}; "
-            f"{type(result.error).__name__}: {result.error}"
-        )
+        self.result.record_prediction(result.duration_ns)
+        self.query.result = result.actions
 
     def submit(self, slot, *, handoff_slot=None, prefix=None, commands=None):
         now = time.monotonic_ns()
@@ -373,12 +331,11 @@ class PolicyRollout:
         source_ns = rows[-1].source_timestamp_ns
         # 来源时间已校验；+1 保持 age <= budget 的整数纳秒边界。
         expires_at_ns = source_ns + self.max_decision_age_ns + 1
-        self.results.record_duration("source_age", now - source_ns)
         if now >= expires_at_ns:
             return ControlRejection("query_sources_invalid_or_expired")
         if prefix is not None and now >= self.plan.expires_at_ns:
             return ControlRejection("prefix_decision_expired")
-        query = PolicyQuery(next(self.query_ids), self.run_id, slot, expires_at_ns, handoff_slot)
+        query = Prediction(self.run_id, slot, expires_at_ns, handoff_slot)
         kwargs = (
             dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot,
                  rtc_guidance_cap=self.execution.rtc_guidance_cap) if prefix is not None else {}
@@ -388,8 +345,6 @@ class PolicyRollout:
             if not self.hand_history:
                 # 与训练时一致，初始历史使用 float32 精度的实测手姿。
                 hand = rows[-1].values["hand_qpos"].astype(np.float32).astype(np.float64)
-                if hand.shape != (12,) or not np.isfinite(hand).all():
-                    return ControlRejection("invalid_hand_history_bootstrap")
                 initial_hand_history = tuple(
                     hand.copy() for _ in range(self.hand_history.maxlen)
                 )
@@ -399,12 +354,7 @@ class PolicyRollout:
                     self.hand_history if initial_hand_history is None else initial_hand_history
                 )
             }
-        self.model.submit(
-            "predict",
-            rows,
-            query_context=dict(run_id=self.run_id, query_id=query.query_id),
-            **kwargs,
-        )
+        self.model.predict(rows, **kwargs)
         if initial_hand_history is not None:
             self.hand_history.extend(initial_hand_history)
         self.query = query
@@ -436,12 +386,6 @@ class PolicyRollout:
             )
         return prefix, commands, None
 
-    def record_pending(self):
-        # 入队前取走待写帧，部分提交失败后也不重试。
-        frame, self.pending_frame = self.pending_frame, None
-        if self.recorder is not None and frame is not None:
-            self.recorder.append(*frame)
-
     def map_command(self, action, row, previous, *, context="action"):
         action = np.asarray(action, dtype=np.float64)
         mode = self.policy_info.action_mode
@@ -472,85 +416,16 @@ class PolicyRollout:
             )
         return command, None
 
-    def execute_slot(self, row, slot, feedback_until_ns):
-        plan = self.plan
-        mapping_started = time.monotonic_ns()
-        command, issue = self.command_for_slot(row, slot)
-        self.results.record_duration("mapping", time.monotonic_ns() - mapping_started)
-        if issue is not None:
-            self.finish(issue.detail, run_end_reason=issue.run_end_reason)
-            return
-        if not self.has_motion_authority():
-            self.finish("before_submission_revoked")
-            return
-        budget_limit = self.budget_limit()
-        if budget_limit is not None and time.monotonic_ns() >= budget_limit[0]:
-            self.finish_budget(budget_limit)
-            return
-        decision_deadline_ns = plan.expires_at_ns
-        action_deadline_ns = min(
-            self.next_step_ns,
-            feedback_until_ns,
-            decision_deadline_ns,
-        )
-        valid_until_ns = (
-            min(action_deadline_ns, budget_limit[0]) if budget_limit else action_deadline_ns
-        )
-        if time.monotonic_ns() >= valid_until_ns:
-            self.finish("submission_deadline_expired")
-            return
-        execute_until_ns = decision_deadline_ns
-        if self.max_running_s is not None:
-            execute_until_ns = min(execute_until_ns, self.started_ns + int(self.max_running_s * 1e9))
-        started_ns = time.monotonic_ns()
-        self.pending_frame = (row, command)
-        try:
-            try:
-                self.robot.send_action(
-                    command, valid_until_ns=valid_until_ns, execute_until_ns=execute_until_ns,
-                )
-            finally:
-                self.results.record_duration("submission", time.monotonic_ns() - started_ns)
-        except (OperationCancelled, TimeoutError) as exc:
-            self.finish(
-                str(exc), run_end_reason=RunEndReason.EXECUTOR_BOUNDARY,
-                errors=[error_detail("submission", exc)],
-            )
-            return
-        now = time.monotonic_ns()
-        if now >= action_deadline_ns or not self.has_motion_authority():
-            error = (
-                TimeoutError("submission returned after action deadline")
-                if now >= action_deadline_ns
-                else OperationCancelled("motion authority revoked during submission")
-            )
-            self.finish(
-                "submission_return_expired_or_cancelled",
-                errors=[error_detail("submission", error)],
-            )
-            return
-        if budget_limit is not None and now >= budget_limit[0]:
-            self.finish_budget(budget_limit)
-            return
-        self.previous_arm = command.arm_qpos
-        if self.hand_history is not None:
-            # 提交正常返回后更新动作历史，不代表设备已到位。
-            self.hand_history.append(command.hand_qpos.copy())
-        self.wait_started_ns = None
-        self.record_pending()
-        if slot + 1 == plan.segment_end and self.execution.execution_mode == "sync":
-            self.plan = None
-
     def submit_prefetch(self, row, slot):
         handoff_slot, issue = prefetch_handoff(
-            self.plan, slot=slot, mode=self.execution.execution_mode,
+            self.plan, slot=slot, mode=self.execution.mode,
             prefetch_steps=self.execution.prefetch_steps,
             query_pending=self.query is not None,
         )
         if issue is not None or handoff_slot is None:
             return issue
         prefix = commands = None
-        if self.execution.execution_mode == "rtc":
+        if self.execution.mode == "rtc":
             prefix, commands, issue = self.prepare_prefix(row, slot)
             if issue is not None:
                 return issue
@@ -559,116 +434,160 @@ class PolicyRollout:
         )
 
     def step(self):
+        row = attempted_command = None
+        failure = None
         try:
-            self.advance()
-        except BaseException as exc:
-            if isinstance(exc, KeyboardInterrupt):
-                self.runtime_state.request_emergency_stop()
-            if self.termination is not None:
-                raise
-            preparing = self.run_id is None
-            cancelled = preparing and isinstance(exc, OperationCancelled)
-            stage = "preparation" if preparing else "control"
-            detail = f"{stage}_failed: {type(exc).__name__}: {exc}"
-            try:
-                self.finish(
-                    detail,
-                    run_end_reason=failure_reason(exc),
-                    errors=[] if cancelled or (preparing and isinstance(exc, KeyboardInterrupt))
-                    else [error_detail(stage, exc)],
-                )
-            except BaseException:
-                if cancelled:
-                    raise
-                logger.exception("episode failure cleanup also failed")
-            if not cancelled:
-                raise
-
-    def advance(self):
-        if self.termination is not None:
+            if self.finished:
+                self.poll_model()
+                return
+            if self.run_id is None and not self.model.has_pending_task:
+                self.prepare()
+                return
+            if self.run_id is None and not self.preparation_valid():
+                self.stop("cancelled during model reset")
+                return
+            if self.run_id is not None and not self.has_motion_authority():
+                self.stop("owner_authority_revoked")
+                return
             self.poll_model()
-            return
-        if self.run_id is None and not self.model.has_pending_task:
-            self.prepare()
-            return
-        if self.run_id is None and not self.preparation_valid():
-            self.finish("cancelled during model reset")
-            return
-        if self.run_id is not None and not self.has_motion_authority():
-            self.finish("owner_authority_revoked")
-            return
-        self.poll_model()
-        if self.termination is not None:
-            return
-        if self.recorder is not None:
-            self.recorder.check_error()
-        if self.run_id is None:
-            return
-        if (expired := self.expired_budget()) is not None:
-            self.finish_budget(expired)
-            return
-        now = time.monotonic_ns()
-        slot, self.next_step_ns, skipped = control_slot(
-            now_ns=now, next_step_ns=self.next_step_ns, last_slot=self.last_slot,
-            dt_ns=self.dt_ns, synchronous=self.execution.execution_mode == "sync",
-            resume_ready=(
-                self.plan is None and self.query is not None and self.query.result is not None
-            ),
-        )
-        if slot is None:
-            return
-        if skipped:
-            self.results.record_skipped_slots(skipped)
-            self.finish(f"missed_slot: expected={slot}, actual={slot + skipped}")
-            return
-        self.last_slot = slot
-        row, issue, feedback_until_ns = self.read_observation()
-        self.pending_frame = (row, None)
-        self.poll_model()
-        if not self.has_motion_authority():
-            self.finish("observation_authority_revoked")
-            return
-        if issue is not None:
-            self.finish(issue)
-            return
-        self.history.append(project_policy_row(row, self.policy_info.observation_fields, self.dependencies))
-        new_plan, issue = handoff_plan(
-            self.query, run_id=self.run_id, slot=slot,
-            mode=self.execution.execution_mode, action_steps=self.execution.action_steps,
-            now_ns=time.monotonic_ns(), authorized=self.has_motion_authority(),
-        )
-        if issue is not None:
-            self.finish(issue.detail, run_end_reason=issue.run_end_reason)
-            return
-        if new_plan is not None:
-            self.plan, self.query = new_plan, None
-        if self.plan is None:
-            self.robot.end_hand_send_interval()
-            if self.wait_started_ns is None:
-                self.wait_started_ns = now
-                self.robot.arm.limit_execution_until(now + int(self.execution.max_wait_s * 1e9))
-            if (
-                len(self.history) == self.history.maxlen
-                and self.query is None and not self.model.has_pending_task
-            ):
-                issue = self.submit(slot)
-                if issue is not None:
-                    self.finish(
-                        issue.detail, run_end_reason=issue.run_end_reason
-                    )
-                    return
-            self.record_pending()
-        else:
-            issue = plan_rejection(
-                self.plan, slot, self.execution.execution_mode, time.monotonic_ns()
+            if self.finished or self.run_id is None:
+                return
+            if self.recorder is not None:
+                self.recorder.check_error()
+            if (limit := self.expired_budget()) is not None:
+                self.stop(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
+                return
+
+            now = time.monotonic_ns()
+            slot, self.next_step_ns, skipped = control_slot(
+                now_ns=now, next_step_ns=self.next_step_ns, last_slot=self.last_slot,
+                dt_ns=self.dt_ns, synchronous=self.execution.mode == "sync",
+                resume_ready=self.plan is None and self.query is not None and self.query.result is not None,
+            )
+            if slot is None:
+                return
+            if skipped:
+                self.result.metrics["skipped_slots"] += skipped
+                self.stop(f"missed_slot: expected={slot}, actual={slot + skipped}")
+                return
+            self.last_slot = slot
+            row, issue, feedback_until_ns = self.read_observation()
+            self.poll_model()
+            if not self.has_motion_authority():
+                self.stop("observation_authority_revoked")
+                return
+            if issue is not None:
+                self.stop(issue)
+                return
+            self.history.append(self.observations.project(row))
+
+            new_plan, issue = handoff_plan(
+                self.query, run_id=self.run_id, slot=slot, mode=self.execution.mode,
+                action_steps=self.execution.action_steps, now_ns=time.monotonic_ns(),
+                authorized=self.has_motion_authority(),
             )
             if issue is not None:
-                self.finish(issue.detail)
+                self.stop(issue.detail, run_end_reason=issue.run_end_reason)
                 return
-            issue = self.submit_prefetch(row, slot)
+            if new_plan is not None:
+                self.plan, self.query = new_plan, None
+            if self.plan is None:
+                self.robot.end_hand_send_interval()
+                if self.wait_deadline_ns is None:
+                    self.wait_deadline_ns = now + PREDICTION_TIMEOUT_NS
+                    self.robot.arm.limit_execution_until(self.wait_deadline_ns)
+                if len(self.history) == self.history.maxlen and self.query is None:
+                    issue = self.submit(slot)
+                    if issue is not None:
+                        self.stop(issue.detail, run_end_reason=issue.run_end_reason)
+                return
+
+            issue = plan_rejection(self.plan, slot, self.execution.mode, time.monotonic_ns())
+            if issue is None:
+                issue = self.submit_prefetch(row, slot)
             if issue is not None:
-                self.finish(issue.detail, run_end_reason=issue.run_end_reason)
+                self.stop(issue.detail, run_end_reason=issue.run_end_reason)
                 return
-            self.execute_slot(row, slot, feedback_until_ns)
-        if (expired := self.expired_budget()) is not None:
-            self.finish_budget(expired)
+            command, issue = self.command_for_slot(row, slot)
+            if issue is not None:
+                self.stop(issue.detail, run_end_reason=issue.run_end_reason)
+                return
+            if not self.has_motion_authority():
+                self.stop("before_submission_revoked")
+                return
+            limit = self.budget_limit()
+            if limit is not None and time.monotonic_ns() >= limit[0]:
+                self.stop(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
+                return
+            action_deadline_ns = min(self.next_step_ns, feedback_until_ns, self.plan.expires_at_ns)
+            valid_until_ns = min(action_deadline_ns, limit[0]) if limit else action_deadline_ns
+            if time.monotonic_ns() >= valid_until_ns:
+                self.stop("submission_deadline_expired")
+                return
+            execute_until_ns = self.plan.expires_at_ns
+            if self.run_deadline_ns is not None:
+                execute_until_ns = min(execute_until_ns, self.run_deadline_ns)
+
+            attempted_command = command
+            try:
+                self.robot.send_action(command, valid_until_ns=valid_until_ns, execute_until_ns=execute_until_ns)
+            except OperationCancelled as exc:
+                self.stop(str(exc))
+                return
+            except TimeoutError as exc:
+                self.stop(str(exc), errors=[error_detail("submission", exc)])
+                return
+            now = time.monotonic_ns()
+            if not self.has_motion_authority():
+                self.stop("motion authority revoked during submission")
+                return
+            if now >= action_deadline_ns:
+                error = TimeoutError("submission returned after action deadline")
+                self.stop(str(error), errors=[error_detail("submission", error)])
+                return
+            if limit is not None and now >= limit[0]:
+                self.stop(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
+                return
+            self.previous_arm = command.arm_qpos
+            if self.hand_history is not None:
+                # 只在提交正常返回后推进动作历史。
+                self.hand_history.append(command.hand_qpos.copy())
+            self.wait_deadline_ns = None
+            if slot + 1 == self.plan.segment_end and self.execution.mode == "sync":
+                self.plan = None
+        except BaseException as exc:
+            preparing = self.run_id is None and not self.finished
+            cancelled = preparing and isinstance(exc, OperationCancelled)
+            failure = None if cancelled else exc
+            if isinstance(exc, KeyboardInterrupt):
+                self.runtime_state.request_emergency_stop()
+            if not self.finished:
+                stage = "preparation" if preparing else "control"
+                try:
+                    self.stop(
+                        f"{stage}_failed: {type(exc).__name__}: {exc}", run_end_reason=failure_reason(exc),
+                        errors=[] if cancelled or isinstance(exc, KeyboardInterrupt) else [error_detail(stage, exc)],
+                    )
+                except BaseException as stop_error:
+                    failure = failure or stop_error
+        finally:
+            # 本步只尝试入队一次；终止时已先撤权和请求停止。
+            try:
+                if row is not None and self.recorder is not None:
+                    self.recorder.append(row, attempted_command)
+            except BaseException as exc:
+                failure = failure or exc
+                self.result.errors.append(error_detail("recording", exc))
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
+                try:
+                    self.stop(str(exc), run_end_reason=failure_reason(exc))
+                except BaseException as stop_error:
+                    failure = failure or stop_error
+            try:
+                if (limit := self.expired_budget()) is not None:
+                    self.stop(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
+            except BaseException as exc:
+                failure = failure or exc
+            if failure is not None:
+                raise failure

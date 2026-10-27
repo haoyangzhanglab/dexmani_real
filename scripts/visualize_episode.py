@@ -15,7 +15,7 @@ os.environ.setdefault("RUST_LOG", "error")
 import numpy as np
 
 from dexmani_real.calibration.table_plane import load_table_plane
-from dexmani_real.config import load_experiment_config
+from dexmani_real.config import load_config
 from dexmani_real.control.config import TableCollisionConfig
 from dexmani_real.data.raw import RawReader
 from dexmani_real.geometry.kinematics import HandFK, eef_poses
@@ -348,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
         print_episode_info(str(episode_path))
         return 0
 
-    runtime = load_experiment_config(yaml_path=args.config)
+    runtime = load_config(path=args.config)
     from dexmani_real.utils.log import configure_logging
 
     configure_logging()

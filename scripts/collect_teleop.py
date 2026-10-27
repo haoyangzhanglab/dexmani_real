@@ -8,7 +8,7 @@ from dataclasses import asdict
 
 import yaml
 
-from dexmani_real.config import load_experiment_config
+from dexmani_real.config import load_config
 from dexmani_real.teleop.config import DEFAULT_TASK_NAME
 
 
@@ -61,14 +61,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    runtime = load_experiment_config(
-        yaml_path=args.config,
-        cli_overrides={
-            "collection.enabled": args.record,
-            "collection.episodes_dir": args.episodes_dir,
-            "collection.max_duration_s": args.max_duration,
-            "teleop.control_hz": args.control_hz,
-            "hand.enabled": False if args.no_hand else None,
+    runtime = load_config(
+        path=args.config,
+        overrides={
+            "collection": {
+                "enabled": args.record,
+                "episodes_dir": args.episodes_dir,
+                "max_duration_s": args.max_duration,
+            },
+            "teleop": {"control_hz": args.control_hz},
+            "hand": {"enabled": False if args.no_hand else None},
         },
     )
     if args.print_config:

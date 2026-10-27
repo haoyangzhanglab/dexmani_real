@@ -11,7 +11,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from dexmani_real.calibration.table_plane import load_table_plane
-from dexmani_real.config import load_experiment_config
+from dexmani_real.config import load_config
 from dexmani_real.data.export import ExportConfig, export_zarr
 
 
@@ -77,9 +77,9 @@ def default_output_path(input_root: Path) -> Path:
 
 def load_processing_config(path: Path | None, *, num_points: int | None) -> ExportConfig:
     """Load processing values; read the current table plane only for table removal."""
-    runtime = load_experiment_config(
-        yaml_path=path,
-        cli_overrides={"pointcloud.num_points": num_points},
+    runtime = load_config(
+        path=path,
+        overrides={"pointcloud": {"num_points": num_points}},
     )
     plane = (
         load_table_plane(runtime.environment.table) if runtime.pointcloud.remove_table else None

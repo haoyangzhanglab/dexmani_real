@@ -8,7 +8,11 @@ import math
 from dataclasses import asdict
 from pathlib import Path
 
-from dexmani_real.deployment.config import DEFAULT_MAX_RUNNING_S, DEFAULT_NUM_EPISODES
+from dexmani_real.deployment.config import (
+    DEFAULT_MAX_RUNNING_S,
+    DEFAULT_NUM_EPISODES,
+    RUNTIME_SECTIONS,
+)
 
 
 def positive_int(raw: str) -> int:
@@ -146,16 +150,16 @@ def main(argv: list[str] | None = None) -> int:
 
     import yaml
 
-    from dexmani_real.config import load_experiment_config
+    from dexmani_real.config import load_config
 
-    runtime = load_experiment_config(
-        yaml_path=args.config,
-        cli_overrides={
-            "execution.execution_mode": args.execution_mode,
-            "execution.prefetch_steps": args.prefetch_steps,
-            "execution.rtc_guidance_cap": args.rtc_guidance_cap,
-            "execution.action_steps": args.n_action_steps,
-        },
+    runtime = load_config(
+        path=args.config,
+        overrides={"execution": {
+            "mode": args.execution_mode,
+            "prefetch_steps": args.prefetch_steps,
+            "rtc_guidance_cap": args.rtc_guidance_cap,
+            "action_steps": args.n_action_steps,
+        }},
     )
     if args.print_config:
         print("# 声明配置；数值表示 recipe 来自训练 artifact，此处不加载策略。")
@@ -166,9 +170,8 @@ def main(argv: list[str] | None = None) -> int:
         ):
             print(f"# {name}: {getattr(args, name)}")
         print(yaml.safe_dump(
-            {name: asdict(getattr(runtime, name)) for name in (
-                "execution", "arm", "hand", "motion", "camera", "environment",
-            )}, allow_unicode=True, sort_keys=False,
+            {name: asdict(getattr(runtime, name)) for name in RUNTIME_SECTIONS},
+            allow_unicode=True, sort_keys=False,
         ), end="")
         return 0
 

@@ -16,17 +16,17 @@ from scipy.spatial.transform import Rotation as R
 
 from dexmani_real.calibration.camera.extrinsics import load_camera_extrinsics
 from dexmani_real.calibration.table_plane import (
-    save_table_plane,
     load_table_plane,
     resolve_table_plane_path,
+    save_table_plane,
 )
-from dexmani_real.config import load_experiment_config
+from dexmani_real.config import load_config
 from dexmani_real.geometry.camera import CameraIntrinsics
 from dexmani_real.geometry.plane import fit_table_plane
 from dexmani_real.perception.config import PointCloudConfig
 from dexmani_real.perception.pointcloud import (
-    aligned_depth_points_in_base,
     PointCloudProcessor,
+    aligned_depth_points_in_base,
     build_raw_point_cloud,
 )
 from dexmani_real.utils.log import configure_logging
@@ -324,7 +324,7 @@ def run_pointcloud_diagnostic(args) -> int:
         "y",
         "yes",
     }
-    runtime = load_experiment_config(yaml_path=args.config)
+    runtime = load_config(path=args.config)
     runtime.camera.validate()
     pcd_config = runtime.pointcloud
     calibration = load_camera_extrinsics(args.camera_calibration)

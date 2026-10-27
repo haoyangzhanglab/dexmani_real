@@ -10,23 +10,25 @@ from dexmani_real.perception.config import HandCloudConfig, PointCloudConfig
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 
 if TYPE_CHECKING:
-    from dexmani_real.config import ExperimentConfig
+    from dexmani_real.config import RealConfig
     from dexmani_real.runtime.observation import ObservationNeeds
 
 DEFAULT_NUM_EPISODES = 20
 DEFAULT_MAX_RUNNING_S = 60.0
+START_ARM_TOLERANCE_DEG = 0.5
+PREDICTION_TIMEOUT_NS = 2_000_000_000
+RUNTIME_SECTIONS = (
+    "execution", "arm", "hand", "motion", "camera", "pointcloud", "hand_pointcloud", "environment",
+)
 
 
 @dataclass(frozen=True)
 class ExecutionConfig:
     # async 可继续使用旧预测的有效尾部，action_steps 是名义执行窗口。
     action_steps: int | None = None
-    execution_mode: str = "sync"
-    # 开始策略的容差独立于 HOME 的物理收敛容差。
-    start_arm_home_tolerance_deg: float = 0.5
+    mode: str = "sync"
     # 时效与等待预算不代表物理停止延迟。
     max_decision_age_s: float = 1.0
-    max_wait_s: float = 2.0
     prefetch_steps: int | None = None
     rtc_guidance_cap: float | None = None
 
@@ -41,10 +43,10 @@ def _restore_cloud_config(recipe, config_type):
 
 
 def validate_execution_config(info, execution: ExecutionConfig) -> None:
-    if execution.execution_mode not in {"sync", "async", "rtc"}:
-        raise ValueError("execution_mode must be sync, async or rtc")
-    if execution.execution_mode not in info.supported_execution_modes:
-        raise NotImplementedError(f"Policy does not support {execution.execution_mode} execution")
+    if execution.mode not in {"sync", "async", "rtc"}:
+        raise ValueError("execution.mode must be sync, async or rtc")
+    if execution.mode not in info.supported_execution_modes:
+        raise NotImplementedError(f"Policy does not support {execution.mode} execution")
 
     dt = info.control_dt_s
     if (
@@ -53,16 +55,15 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
         or int(dt * 1e9) <= 0
     ):
         raise ValueError("Real deployment requires finite positive control_dt_s of at least 1 ns")
-    for name in ("start_arm_home_tolerance_deg", "max_decision_age_s", "max_wait_s"):
-        value = getattr(execution, name)
-        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-            raise ValueError(f"{name} must be finite and positive")
+    age = execution.max_decision_age_s
+    if type(age) not in (int, float) or not math.isfinite(age) or age <= 0:
+        raise ValueError("max_decision_age_s must be finite and positive")
 
     prediction_steps = info.future_steps
     action_steps = execution.action_steps
     if type(action_steps) is not int or not 1 <= action_steps <= prediction_steps:
         raise ValueError("execution requires integer 1 <= A_exec <= policy future_steps")
-    if execution.execution_mode != "sync":
+    if execution.mode != "sync":
         prefetch_steps = execution.prefetch_steps
         if (
             type(prefetch_steps) is not int
@@ -73,7 +74,7 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
                 "async/rtc require 1 <= d <= A_exec and A_exec+d <= P; "
                 f"A_exec={action_steps}, P={prediction_steps}, d={prefetch_steps}"
             )
-    if execution.execution_mode == "rtc":
+    if execution.mode == "rtc":
         cap = execution.rtc_guidance_cap
         if (
             (type(cap) is not int and type(cap) is not float)
@@ -83,8 +84,8 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
 
 
 def resolve_deployment_config(
-    info, runtime: ExperimentConfig, needs: ObservationNeeds,
-) -> ExperimentConfig:
+    info, runtime: RealConfig, needs: ObservationNeeds,
+) -> RealConfig:
     action_steps = runtime.execution.action_steps
     execution = replace(
         runtime.execution,

@@ -1,4 +1,4 @@
-"""Load package defaults with explicit experiment and CLI overrides."""
+"""合并默认配置、实验 YAML 与显式覆盖。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import dataclasses
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -30,9 +30,7 @@ from dexmani_real.teleop.config import (
 
 
 @dataclass(frozen=True)
-class ExperimentConfig:
-    """Experiment values loaded together and validated at their usage boundaries."""
-
+class RealConfig:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     arm: ArmConfig = field(default_factory=ArmConfig)
     hand: HandConfig = field(default_factory=HandConfig)
@@ -49,35 +47,33 @@ class ExperimentConfig:
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
 
 
-def apply_config_overrides(current: Any, changes: Any) -> Any:
-    """Update dataclass sections; numerical constraints belong to consumers."""
-    if dataclasses.is_dataclass(current) and not isinstance(current, type):
+def _replace_config(current: Any, changes: Any) -> Any:
+    if dataclasses.is_dataclass(current):
         if not isinstance(changes, Mapping):
             raise TypeError(f"{type(current).__name__} overrides must be a mapping")
         updated = dict(changes)
         for name, value in changes.items():
             if isinstance(current, EnvironmentConfig) and name == "static_boxes":
                 updated[name] = tuple(
-                    apply_config_overrides(StaticCollisionBox(), box) for box in value
+                    _replace_config(StaticCollisionBox(), box) for box in value
                 )
             elif hasattr(current, name):
-                updated[name] = apply_config_overrides(getattr(current, name), value)
-        # The dataclass constructor rejects unknown fields.
-        return dataclasses.replace(current, **updated)
+                updated[name] = _replace_config(getattr(current, name), value)
+        return dataclasses.replace(cast(Any, current), **updated)
     if isinstance(current, tuple):
         if not isinstance(changes, (list, tuple)):
             raise TypeError("config arrays must use YAML sequences")
         return (
-            tuple(apply_config_overrides(current[0], value) for value in changes)
+            tuple(_replace_config(current[0], value) for value in changes)
             if current
             else tuple(changes)
         )
     if isinstance(current, bool):
-        # A quoted "false" must never enable a hardware or processing switch.
+        # 引号中的 "false" 不能启用设备。
         if type(changes) is not bool:
             raise TypeError("config switches must use YAML true/false")
     elif isinstance(current, (int, float)):
-        # SDKs may silently truncate integer gains; reject malformed numbers before connecting.
+        # SDK 可能静默截断整数增益。
         if type(changes) not in (int, float) or (
             isinstance(current, int) and type(changes) is not int
         ):
@@ -87,30 +83,33 @@ def apply_config_overrides(current: Any, changes: Any) -> Any:
     return changes
 
 
-def load_experiment_config(
-    *,
-    yaml_path: str | Path | None = None,
-    cli_overrides: Mapping[str, Any] | None = None,
-) -> ExperimentConfig:
-    """合并 CLI > YAML > 默认值；运行约束由使用方校验，不连接设备或读取标定。"""
-    loaded = {}
-    if yaml_path is not None:
-        with Path(yaml_path).open(encoding="utf-8") as stream:
-            values = yaml.safe_load(stream)
-        if values is not None:
-            if not isinstance(values, Mapping):
-                raise TypeError("experiment config root must be a mapping")
-            loaded = dict(values)
-    for key, value in (cli_overrides or {}).items():
+def _merge_overrides(values, overrides):
+    for name, value in overrides.items():
         if value is None:
             continue
-        *sections, name = key.split(".")
-        cursor = loaded
-        for section in sections:
-            if section not in cursor:
-                cursor[section] = {}
-            elif not isinstance(cursor[section], dict):
-                raise TypeError(f"config section {section!r} must be a mapping")
-            cursor = cursor[section]
-        cursor[name] = value
-    return apply_config_overrides(ExperimentConfig(), loaded)
+        if isinstance(value, Mapping):
+            section = values.setdefault(name, {})
+            if not isinstance(section, dict):
+                raise TypeError(f"config section {name!r} must be a mapping")
+            _merge_overrides(section, value)
+        else:
+            values[name] = value
+
+
+def load_config(
+    path: str | Path | None = None,
+    *,
+    overrides: Mapping[str, Any] | None = None,
+) -> RealConfig:
+    """覆盖优先级为 CLI > YAML > 默认值；此处不连接设备或读取标定。"""
+    values = {}
+    if path is not None:
+        with Path(path).open(encoding="utf-8") as stream:
+            loaded = yaml.safe_load(stream)
+        if loaded is not None:
+            if not isinstance(loaded, Mapping):
+                raise TypeError("experiment config root must be a mapping")
+            values = dict(loaded)
+    if overrides is not None:
+        _merge_overrides(values, overrides)
+    return _replace_config(RealConfig(), values)

@@ -25,7 +25,7 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 | 动作控制 | [`control/`](dexmani_real/control/) | 动作映射、在线 IK、目标约束、关节等价角与 HOME 路径；在线接触和 HOME 间隙规则保持分离 |
 | 共享运行 | [`runtime/`](dexmani_real/runtime/) · [`ipc/`](dexmani_real/ipc/) | 会话状态、键盘输入、观测、资源启停、HOME/jog 协调及进程间通信 |
 | 实验执行 | [`teleop/`](dexmani_real/teleop/) · [`deployment/`](dexmani_real/deployment/) · [`replay/`](dexmani_real/replay/) | 遥操作、学习策略执行与轨迹回放 |
-| 数据管理 | [`data/`](dexmani_real/data/) | Raw 记录、Canonical 处理与导出；`deployment/results.py` 管理策略会话结果 |
+| 数据管理 | [`data/`](dexmani_real/data/) | Raw 记录、Canonical 处理与导出；部署结果由 `Rollout` 和 `PolicySession` 持有 |
 | 配置与标定 | [`config.py`](dexmani_real/config.py) · [`calibration/`](dexmani_real/calibration/) | 实验配置装配、标定算法、交互会话及默认参数；配置定义仍位于各领域 |
 | 通用工具 | [`utils/`](dexmani_real/utils/) | 原子写入、计时、日志与可视化 |
 
@@ -45,15 +45,19 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 相机外参 JSON 以 serial 为键，条目包含 `T_base_from_camera` 四阶矩阵（相机到基座，平移单位米）和可选的 `calibration_capture` 元数据。`load_camera_extrinsics()` 返回 serial 到矩阵的字典；读写使用同一文件校验，更新一台相机时保留其他条目。可选录制仅允许默认文件缺失，损坏文件、显式路径错误或文件中缺少当前相机 serial 均直接报错。
 
-实验配置使用 `from dexmani_real.config import load_experiment_config`，覆盖优先级为 CLI > YAML > dataclass 默认值。配置加载不读取标定或连接设备，运行约束在使用边界验证。`environment.table.plane_path` 的相对路径以仓库根目录解析；显式指定的必需标定缺失时直接报错。桌面读取使用 `load_table_plane(table)`，由调用方决定是否需要加载。VR 标定模块提供 `collect_headings()`、`estimate_heading()` 和 `save_vr_transform()`；脚本只保存合格结果，保存成功后播放完成提示音。相机标定前必须拆除 XHand 或将其固定在 HOME 姿态，脚本禁用手部驱动，碰撞检查统一使用固定 HOME 包络；采样期间持续检查关节速度，并核对前后姿态漂移。
+实验配置使用 `from dexmani_real.config import RealConfig, load_config`，覆盖优先级为 CLI > YAML > dataclass 默认值。`load_config(path=None, overrides={"execution": {"mode": "async"}})` 使用嵌套字典；覆盖中的 `None` 表示未指定，YAML 的 `null` 保留原意。执行方式由 `execution.mode` 指定；CLI 使用 `--execution-mode`。配置加载不读取标定或连接设备，运行约束在使用边界验证。`environment.table.plane_path` 的相对路径以仓库根目录解析；显式指定的必需标定缺失时直接报错。桌面读取使用 `load_table_plane(table)`，由调用方决定是否需要加载。VR 标定模块提供 `collect_headings()`、`estimate_heading()` 和 `save_vr_transform()`；脚本只保存合格结果，保存成功后播放完成提示音。相机标定前必须拆除 XHand 或将其固定在 HOME 姿态，脚本禁用手部驱动，碰撞检查统一使用固定 HOME 包络；采样期间持续检查关节速度，并核对前后姿态漂移。
 
-机器人会话在 preflight 统一检查设备、HOME、工作空间及实际启用的碰撞配置；相机及 XHand 独立工具在自己的入口检查。内部 driver、controller 和计算函数接收已经通过入口检查的配置与标定，不重复预检。新的 SDK 反馈、模型输出、文件数据及最终发送目标仍在各自边界校验。`--print-config` 仅展示声明值；`run_policy()` 在加载策略前检查运行轮数和时长。
+机器人会话在 preflight 统一检查设备、HOME、工作空间及实际启用的碰撞配置；相机及 XHand 独立工具在自己的入口检查。内部 driver、controller 和计算函数接收已经通过入口检查的配置与标定，不重复预检。新的 SDK 反馈、模型输出、文件数据及最终发送目标仍在各自边界校验。`run_policy.py --print-config` 展示与运行快照相同的八个配置分区，数值仍为声明值；`run_policy()` 在加载策略前检查运行轮数和时长。
 
 ## 代码导航
 
 核心实现位于 [`dexmani_real/`](dexmani_real/)，实验入口与设备工具集中在 [`scripts/`](scripts/)；[`assets/`](assets/) 存放机器人模型等资源，[`third_party/`](third_party/) 包含第三方相关代码。
 
-部署沿 `deployment/run.py → session.py → rollout.py` 执行：`config.py` 统一解析与校验执行配置，会话持有设备和模型，`PolicyRollout` 协调单轮观测、提交与录制。`schedule.py` 根据时钟与状态决定 sync/async/RTC 调度，`observation.py` 按需组装输入，`inference.py` 独占模型线程。来源时效在观测入口检查，策略输入的数值与形状在 `dexmani_policy` 边界检查；历史快照仅在提交预测时创建。回放沿 `replay/run.py → joint_replay.py` 执行，`JointReplay` 负责逐帧提交，`trajectory.py` 读取轨迹并缓存、保存实测数据，`metrics.py` 只计算匹配帧的关节与末端误差。运行入口在硬件收尾后保存 NPZ、计算指标并写入 JSON；指标失败时原始采样仍可用于离线评估。
+部署沿 `deployment/run.py → session.py → rollout.py` 执行：`config.py` 解析与校验执行配置，`PolicySession` 持有设备和模型，`Rollout` 持有单轮录制器及唯一的 `EpisodeResult`。`schedule.py` 通过 `Prediction` 和 `ActionChunk` 表达 sync/async/RTC 调度；`ObservationBuilder` 集中管理字段依赖、FK 与相机参数，派生特征随观测行释放。`PolicyWorker` 在单线程中串行加载、重置、预测和关闭模型，只允许一个未回收任务。来源时效在观测入口检查，策略输入的数值与形状在 `dexmani_policy` 边界检查。
+
+部署先初始化配置与几何，再启动键盘、预热模型，最后连接设备；启动期间 S/Q 取消实验，Esc 按故障退出，H/B/T 不排队执行。启动姿态的机械臂容差固定为 0.5°，预测等待固定为 2 s。运行和等待使用绝对截止时间，不补发错过的控制步。终止按撤销权限、停止、追加最后一帧、录制收尾、登记结果的顺序执行；模型任务或 writer 尚未结束时，所属轮次继续持有资源。
+
+回放沿 `replay/run.py → joint_replay.py` 执行，`JointReplay` 负责逐帧提交，`trajectory.py` 读取轨迹并缓存、保存实测数据，`metrics.py` 只计算匹配帧的关节与末端误差。运行入口在硬件收尾后保存 NPZ、计算指标并写入 JSON；指标失败时原始采样仍可用于离线评估。
 
 策略选择交给 Policy 的公开 `inspect_policy`：Real 默认 latest，也支持 best、20pct 等 milestone 和显式 checkpoint 路径。显式相对路径以当前工作目录解析；weights/NFE 的显式参数优先。执行长度仍取 execution 配置或模型 n_action_steps。
 
@@ -149,6 +153,8 @@ XHand 保留 serial 与 EtherCAT，连接失败直接报告，不自动重试。
 
 Teleop 中断会登记技术失败并传播，关闭时继续按原保存或丢弃意图收尾；recorder 的首次收尾请求不会被重入覆盖。收尾超时仍报告 pending，不在同一次关闭中重新开启等待预算。Policy 在会话关闭末尾核对对应 episode 的 Raw 发布状态、实际路径和帧数，再写入 `session_result.json`；该摘要反映最后一次确认，不保证仍 pending 的 writer 之后的结果，也不会清除首次终止原因或已有错误。
 
+部署的 `run_config.yaml` 保留策略元数据、实际运行配置、seed/device、轮数与时长、录制开关及有效标定；runtime 仅包含 execution、arm、hand、motion、camera、pointcloud、hand_pointcloud、environment，不采集 Git 版本或文件哈希。`session_result.json` 保留会话起止 UTC、outcome、reason、shutdown、errors 和 episodes；每轮包含序号、开始 UTC、时长、终止原因与详情、errors、raw 和 metrics。metrics 仅包含成功预测的次数、平均/最大耗时及跳过步数。错误统一为 stage、exception_type、message；shutdown 取 null/pending/failed/completed，单轮技术错误、清理错误、pending 或结果写入失败均返回非零退出码；S/Q 导致的正常取消不记作技术错误。设备、键盘与传感器的清理错误写入会话 errors；一项清理失败或被中断后仍继续回收其他资源。
+
 `data/raw.py` 集中提供 `RawReader`、`RawWriter` 和元数据编解码。Raw 以 `timing/rows.observation_ns` 为唯一观测时钟，以该表长度作为帧数。`timestamps_s` 在整数时钟相减后转换为相对秒数，空录制返回空数组；反复访问时间轴的调用方应在本地保存该数组。
 
 `RawReader` 首次读取时校验数值字段和 `timing/rows` 的布局，并缓存数据集。`read_camera()` 返回 `CameraSnapshot`，`read_timing_rows(fields)` 保留原始 `int64` 纳秒和 `-1` 缺失标记，文件与视频由 Reader 统一关闭。诊断读取与训练、物理回放准入分开；导出和物理回放显式调用 `validate_completion()`、`validate_rows()`。CordViP 的 Raw 行关联不证明手和相机物理同步；缺失相机时钟时显式使用观测时钟，原始相机时钟仍保留 `-1`。
@@ -163,19 +169,16 @@ Canonical 由 `data/export.py` 的 `export_zarr(..., processing=ExportConfig(...
 
 ```bash
 python -m compileall -q dexmani_real scripts
-python -m unittest discover -s tests -v
 python scripts/run_policy.py --print-config
 python scripts/collect_teleop.py --print-config
 git diff --check
 ```
 
-使用 pytest 时运行 `python -m pytest -q`；默认只收集 `tests/`，不收集 `third_party/` 中的示例测试。
-
 已有 Ruff/mypy 的开发环境可补充静态检查，无需为运行实验安装它们：
 
 ```bash
-ruff check --no-cache --isolated --select E9,F dexmani_real scripts tests third_party/cordvip_geometry/src
-mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases \
+ruff check --no-cache --isolated --select E9,F dexmani_real scripts third_party/cordvip_geometry/src
+mypy --cache-dir=/dev/null --ignore-missing-imports --follow-imports silent --explicit-package-bases \
   dexmani_real/ipc dexmani_real/sensor \
   dexmani_real/geometry dexmani_real/perception dexmani_real/control dexmani_real/robot \
   dexmani_real/calibration dexmani_real/runtime dexmani_real/deployment dexmani_real/utils \
@@ -188,17 +191,7 @@ mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases \
 
 mypy 按现有类型标注检查上述模块，不检查未标注函数体或外部无类型声明的 SDK；不能替代数值与运行边界测试。
 
-`tests/test_control.py` 使用真实模型和可控求解结果检查 IK、碰撞、HOME 及策略动作格式；`tests/test_robot.py` 使用假 SDK 和进程管道检查时效、取消、异常传递、停止、CRC 和资源收尾，并验证真实 Ruckig 的连续性与制动限位。测试不会连接机器人，需要已安装 Pinocchio、MPlib、HPP-FCL 和 Ruckig。
-
-`tests/test_teleop.py` 检查 VR 映射、EMA 提交时机、TAG 梯度、DexPilot 数值等价及求解错误传播，并用假设备和播放器覆盖停止、录制收尾与音频抢占；还需遥操作原有的 NLopt 和 dex_retargeting 依赖。
-
-`tests/test_geometry.py` 与 `tests/test_perception.py` 检查坐标约定、批量旋转、畸变反投影、桌面拟合、XHand 资产前提、固定采样以及在线和离线几何一致性；导出测试使用实际 HDF5、视频和 Zarr，覆盖参数恢复、字段完整性、坏数据立即报错和显式排除。`tests/test_runtime.py` 覆盖 jog 准备后采样、输入撤销、超时、停止失败，以及实时预览模式切换、异常退出与曝光恢复；`tests/test_sensor.py` 使用假 SDK 检查来源时间、去重、停滞、资源释放和 VR 接收；`tests/test_data.py` 检查批量写盘、失败保留、显式丢弃及发布超时。
-
-`tests/test_deployment.py` 使用假设备和可控模型结果检查三种调度、LAMP 历史、来源期限、初始化失败、迟到推理和收尾，核对 checkpoint 选择、配置恢复与实验结果字段，并通过已安装的 `dexmani_policy` 验证策略输入边界。`tests/test_utils.py` 检查原子写入和计时超期；这些测试均不连接硬件。
-
 键盘遥操作入口保留 `--help`，没有 `--print-config` 参数。
-
-`tests/test_replay.py` 覆盖 Raw 读取、核心误差、部分采样、过期提交、退出、急停与手部准备的取消和去重；`tests/test_runtime.py` 检查启动不回手部 HOME、手动回零及收尾发布失败。`tests/test_calibration.py` 使用合成姿态和图像验证五算法求解、双轴激励、质量门限、ArUco 采样、预览、VR 环绕与去重，并检查标定读写、取消及保存后的完成提示音。测试均不连接硬件。
 
 真机启停、取消/急停、HOME/jog、遥操作录制、三种策略模式和回放仍需操作者单独验收。软件授权撤销和 SDK 接受请求不代表物理停稳或到位。
 

@@ -20,7 +20,11 @@ from dexmani_real.calibration.camera.aruco import (
     ArucoSampler,
 )
 from dexmani_real.calibration.camera.extrinsics import save_camera_calibration
-from dexmani_real.calibration.camera.hand_eye import MIN_SAMPLES, HandEyeResult, solve_hand_eye
+from dexmani_real.calibration.camera.hand_eye import (
+    MIN_SAMPLES,
+    HandEyeResult,
+    solve_hand_eye,
+)
 from dexmani_real.calibration.table_plane import load_table_plane
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
@@ -52,7 +56,7 @@ from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import Rate, sample_is_fresh
 
 if TYPE_CHECKING:
-    from dexmani_real.config import ExperimentConfig
+    from dexmani_real.config import RealConfig
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +66,7 @@ WINDOW_NAME = "ArUco Calibration"
 class CameraCalibrator:
     def __init__(
         self,
-        runtime: ExperimentConfig,
+        runtime: RealConfig,
         *,
         output_path=CAMERAS_PATH,
     ):

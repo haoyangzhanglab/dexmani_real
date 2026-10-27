@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 
 from dexmani_real.calibration import CAMERAS_PATH
-from dexmani_real.config import load_experiment_config
+from dexmani_real.config import load_config
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -31,7 +31,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    from dexmani_real.calibration.camera.aruco import ARUCO_DICT_NAME, MARKER_ID, MARKER_SIZE_M
+    from dexmani_real.calibration.camera.aruco import (
+        ARUCO_DICT_NAME,
+        MARKER_ID,
+        MARKER_SIZE_M,
+    )
     from dexmani_real.calibration.camera.calibrate import CameraCalibrator
 
     print("=" * 60)
@@ -41,9 +45,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     print("=" * 60)
 
-    runtime = load_experiment_config(
-        yaml_path=args.config,
-        cli_overrides={"camera.serial": args.serial, "hand.enabled": False},
+    runtime = load_config(
+        path=args.config,
+        overrides={"camera": {"serial": args.serial}, "hand": {"enabled": False}},
     )
 
     return CameraCalibrator(
