@@ -12,7 +12,6 @@ from dexmani_real.control.action_mapping import ActionIntent
 from dexmani_real.data.recorder import (
     RecordingError,
     snapshot_recording_metadata,
-    snapshot_recording_result,
 )
 from dexmani_real.data.session_results import error_detail
 from dexmani_real.deployment.policy_observation import (
@@ -228,7 +227,7 @@ class PolicyEpisode:
             except BaseException as exc:
                 failure = exc
                 errors.append(error_detail("recorder_finalize", exc))
-            raw = snapshot_recording_result(self.recorder, failed=failure is not None)
+            raw = self.recorder.result(failed=failure is not None)
         try:
             self.results.finish_episode(
                 reason, details=detail, errors=errors, raw=raw, duration_s=duration_s
@@ -290,7 +289,7 @@ class PolicyEpisode:
                 tactile_hold_max_age_s=self.runtime.hand.feedback_max_age_s,
             )
             capture_id = next(self.capture_ids)
-            self.recorder.start_episode(
+            self.recorder.start(
                 task_label=self.policy_info.task_name,
                 episode_name=f"episode_{capture_id:03d}", collection_source="policy_rollout", metadata=metadata,
             )
@@ -444,7 +443,7 @@ class PolicyEpisode:
     def record_pending(self):
         frame, self.pending_frame = self.pending_frame, None
         if self.recorder is not None and frame is not None:
-            self.recorder.add_frame(*frame)
+            self.recorder.append(*frame)
 
     def map_command(self, action, row, previous, *, context="action"):
         """Map one policy action to a checked joint command."""

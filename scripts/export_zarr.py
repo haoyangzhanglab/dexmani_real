@@ -13,14 +13,14 @@ from tqdm import tqdm
 from dexmani_real.calibration.table_plane import resolve_table_plane
 from dexmani_real.config import load_experiment_config
 from dexmani_real.data.canonical.export import export_canonical
-from dexmani_real.data.canonical.schema import ProcessingConfig
+from dexmani_real.data.canonical.schema import ExportConfig
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Export complete Raw episodes to a canonical multimodal Zarr; "
-            "reject incomplete episodes as a whole."
+            "stop on incomplete or invalid episodes."
         )
     )
     parser.add_argument(
@@ -41,8 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Alternative Zarr cache output path for this task "
             "(default: datasets/<task_name>.zarr). The default cache name "
             "comes from the input directory; task labels come from Raw. "
-            "The destination must be new and must not be a symlink. Its resolved path must not fall "
-            "inside episodes/, rollouts/, the input root, or an existing .zarr store."
+            "The destination must be new and must not overlap the input directory."
         ),
     )
     parser.add_argument(
@@ -63,10 +62,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
     )
-    parser.add_argument(
-        "--chunk-frames", type=int, default=100,
-        help="Maximum processing batch rows; storage chunks are sized independently per field",
-    )
     return parser
 
 
@@ -81,7 +76,7 @@ def default_output_path(input_root: Path) -> Path:
     return Path("datasets") / f"{task_name}.zarr"
 
 
-def load_processing_config(path: Path | None, *, num_points: int | None) -> ProcessingConfig:
+def load_processing_config(path: Path | None, *, num_points: int | None) -> ExportConfig:
     """Load processing values; read the current table plane only for table removal."""
     runtime = load_experiment_config(
         yaml_path=path,
@@ -90,7 +85,7 @@ def load_processing_config(path: Path | None, *, num_points: int | None) -> Proc
     plane = (
         resolve_table_plane(runtime.environment.table) if runtime.pointcloud.remove_table else None
     )
-    return ProcessingConfig.from_runtime(runtime, table_plane_abcd=plane)
+    return ExportConfig.from_runtime(runtime, table_plane_abcd=plane)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -114,16 +109,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.input_root,
             output_path,
             processing=processing,
-            chunk_frames=args.chunk_frames,
             exclude=tuple(args.exclude),
             progress_callback=update_progress,
         )
     print(
         f"Exported {result['episode_count']} episode(s), {result['total_frames']} frames.",
-        file=sys.stderr,
-    )
-    print(
-        f"Automatically rejected {len(result['rejected_episodes'])} episode(s).",
         file=sys.stderr,
     )
     print(

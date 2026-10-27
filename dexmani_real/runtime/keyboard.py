@@ -37,7 +37,9 @@ def restore_terminal_echo(saved):
 
 
 class Keyboard:
-    def __init__(self, *, estop_callback=None, stop_callback=None, quit_callback=None):
+    def __init__(
+        self, *, estop_callback=None, stop_callback=None, discard_callback=None, quit_callback=None,
+    ):
         self.events: deque[str] = deque()
         self.held_keys: set[str] = set()
         self.generation_signal = mp.get_context("spawn").Value("q", 0)
@@ -47,6 +49,7 @@ class Keyboard:
         self.estop_event = threading.Event()
         self.estop_callback = estop_callback
         self.stop_callback = stop_callback
+        self.discard_callback = discard_callback
         self.quit_callback = quit_callback
         self.saved_termios = None
 
@@ -81,7 +84,9 @@ class Keyboard:
                 return
 
         # 停止回调先撤销权限，再发布按下事件；回调不执行 SDK I/O。
-        callback = self.stop_callback if name == "s" else self.quit_callback if name == "q" else None
+        callback = {
+            "s": self.stop_callback, "d": self.discard_callback, "q": self.quit_callback,
+        }.get(name)
         if callback is not None:
             callback()
         with self.condition:

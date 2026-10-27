@@ -19,14 +19,13 @@ from dexmani_real.deployment.config import ExecutionConfig
 from dexmani_real.perception.config import HandCloudConfig, PointCloudConfig
 from dexmani_real.robot.xarm7.config import ArmConfig
 from dexmani_real.robot.xhand.config import HandConfig
-from dexmani_real.sensor.camera.config import CameraParams
-from dexmani_real.sensor.vr.config import VRParams
+from dexmani_real.sensor.config import CameraConfig, VRConfig
 from dexmani_real.teleop.config import (
-    CollectionOptions,
-    DexPilotRetargetingParams,
-    KeyboardTeleopParams,
-    TAGRetargetingParams,
-    TeleopParams,
+    CollectionConfig,
+    DexPilotConfig,
+    KeyboardTeleopConfig,
+    TAGConfig,
+    TeleopConfig,
 )
 
 
@@ -38,17 +37,15 @@ class ExperimentConfig:
     arm: ArmConfig = field(default_factory=ArmConfig)
     hand: HandConfig = field(default_factory=HandConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
-    teleop: TeleopParams = field(default_factory=TeleopParams)
-    collection: CollectionOptions = field(default_factory=CollectionOptions)
-    keyboard_teleop: KeyboardTeleopParams = field(default_factory=KeyboardTeleopParams)
-    vr: VRParams = field(default_factory=VRParams)
-    camera: CameraParams = field(default_factory=CameraParams)
+    teleop: TeleopConfig = field(default_factory=TeleopConfig)
+    collection: CollectionConfig = field(default_factory=CollectionConfig)
+    keyboard_teleop: KeyboardTeleopConfig = field(default_factory=KeyboardTeleopConfig)
+    vr: VRConfig = field(default_factory=VRConfig)
+    camera: CameraConfig = field(default_factory=CameraConfig)
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
-    tag_retargeting: TAGRetargetingParams = field(default_factory=TAGRetargetingParams)
-    dexpilot_retargeting: DexPilotRetargetingParams = field(
-        default_factory=DexPilotRetargetingParams
-    )
+    tag_retargeting: TAGConfig = field(default_factory=TAGConfig)
+    dexpilot_retargeting: DexPilotConfig = field(default_factory=DexPilotConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
 
 

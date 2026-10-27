@@ -9,7 +9,7 @@ import numpy as np
 
 
 @dataclass(frozen=True)
-class TeleopParams:
+class TeleopConfig:
     control_hz: float = 16.0
     ema_alpha_pos: float = 0.7
     ema_alpha_rot: float = 0.5
@@ -30,8 +30,8 @@ class TeleopParams:
 
 
 @dataclass(frozen=True)
-class CollectionOptions:
-    """Local capture options; unrecorded teleop has no capture-duration limit."""
+class CollectionConfig:
+    """时长限制仅用于录制。"""
 
     enabled: bool = True
     episodes_dir: str = "episodes"
@@ -45,7 +45,7 @@ class CollectionOptions:
 
 
 @dataclass(frozen=True)
-class KeyboardTeleopParams:
+class KeyboardTeleopConfig:
     control_hz: float = 30.0
     target_max_age_s: float = 0.5
     delta_pos_m: float = 0.008
@@ -56,21 +56,16 @@ class KeyboardTeleopParams:
 
 
 @dataclass(frozen=True)
-class TAGRetargetingParams:
-    """TAG two-stage NLopt hand retargeting parameters."""
-
-    # Thumb→pinky lengths in meters.
+class TAGConfig:
+    # 长度单位米，顺序为拇指到小指。
     robot_finger_lengths: tuple[float, ...] = (0.161, 0.208, 0.206, 0.204, 0.145)
     human_finger_lengths: tuple[float, ...] = (0.13, 0.18, 0.19, 0.18, 0.145)
-    # Multiplies the robot/human length ratio.
     finger_scale_boost: float = 1.0
 
-    # Pinky MCP→TIP scale before TAG optimization.
     pinky_scale: float = 1.3
-    # Pinky wrist→MCP scale before TAG optimization.
     pinky_palm_scale: float = 1.25
 
-    # MANO→URDF extrinsic XYZ Euler angles, radians.
+    # MANO→URDF 的外旋 XYZ 欧拉角，单位弧度。
     mano_to_urdf_euler: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     smooth_weight: float = 0.003
@@ -90,7 +85,6 @@ class TAGRetargetingParams:
     def validate(self) -> None:
         if not all(np.all(np.isfinite(value)) for value in astuple(self)):
             raise ValueError("TAG parameters must be finite")
-        # Zero weights and backend stopping tolerances are experiment choices.
         robot = np.asarray(self.robot_finger_lengths, dtype=np.float64)
         human = np.asarray(self.human_finger_lengths, dtype=np.float64)
         if robot.shape != (5,) or human.shape != (5,):
@@ -106,15 +100,12 @@ class TAGRetargetingParams:
 
 
 @dataclass(frozen=True)
-class DexPilotRetargetingParams:
-    # Human-to-robot length scale.
+class DexPilotConfig:
     scaling_factor: float = 1.15
-    # Pinky-chain scale before scaling_factor.
     pinky_scale: float = 1.15
-    # Pinky wrist→MCP scale before scaling_factor.
     pinky_palm_scale: float = 1.0
     low_pass_alpha: float = 0.6
-    # Enter/exit thresholds for the projected grasp regime.
+    # 抓取投影的进入与退出距离。
     project_dist_m: float = 0.03
     escape_dist_m: float = 0.05
 

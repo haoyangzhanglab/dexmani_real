@@ -57,7 +57,7 @@ class KeyboardTests(unittest.TestCase):
         self.addCleanup(self.keys.stop)
 
     def test_discrete_keys_fire_once_until_release(self):
-        for name in ("space", "enter", "backspace", "x", "b", "r"):
+        for name in ("space", "enter", "backspace", "x", "b", "r", "d"):
             key = KEY_BACKEND.Key.__members__.get(name, KeyCode(name))
             self.press(key)
             self.press(key)
@@ -66,9 +66,10 @@ class KeyboardTests(unittest.TestCase):
             self.press(key)
             self.assertEqual(self.keys.poll(0), [name])
             self.release(key)
+        self.assertFalse(self.state.stop_request)
 
-    def test_stop_and_quit_revoke_before_event_is_visible(self):
-        for name in ("s", "q"):
+    def test_stop_discard_and_quit_revoke_before_event_is_visible(self):
+        for name in ("s", "d", "q"):
             state = armed_state()
             state.begin_motion()
             observed = []
@@ -77,7 +78,7 @@ class KeyboardTests(unittest.TestCase):
                 state.request_stop()
                 observed.append((tuple(self.keys.events), state.can_move(run_id=state.run_id)))
 
-            self.keys.stop_callback = self.keys.quit_callback = stop
+            self.keys.stop_callback = self.keys.discard_callback = self.keys.quit_callback = stop
             self.press(KeyCode(name))
             self.assertEqual(observed, [((), False)])
             self.assertEqual(self.keys.poll(0), [name])
@@ -202,9 +203,9 @@ class KeyboardTests(unittest.TestCase):
 
 class CommandRoutingTests(unittest.TestCase):
     def test_keyboard_home_tap_is_not_lost_between_control_ticks(self):
-        from dexmani_real.teleop.keyboard_session import KeyboardTeleopSession
+        from dexmani_real.teleop.keyboard import KeyboardTeleop
 
-        session = object.__new__(KeyboardTeleopSession)
+        session = object.__new__(KeyboardTeleop)
         session.runtime_state = armed_state()
         session.keys = active_keyboard()
         self.addCleanup(session.keys.stop)
@@ -218,9 +219,9 @@ class CommandRoutingTests(unittest.TestCase):
         session.motion_tick.assert_not_called()
 
     def test_teleop_terminal_keys_take_priority(self):
-        from dexmani_real.teleop.runner import TeleopRunner
+        from dexmani_real.teleop.loop import TeleopLoop
 
-        runner = object.__new__(TeleopRunner)
+        runner = object.__new__(TeleopLoop)
         runner.handle_operator_command = Mock(return_value=False)
         for terminal in ("esc", "q", "s", "d"):
             runner.handle_operator_command.reset_mock()
@@ -228,17 +229,14 @@ class CommandRoutingTests(unittest.TestCase):
             self.assertEqual(runner.handle_operator_command.call_args.args, (terminal,))
 
     def test_teleop_stop_and_discard_keep_recorded_reason(self):
-        from dexmani_real.teleop.runner import TeleopRunner
+        from dexmani_real.teleop.loop import TeleopLoop
 
-        runner = object.__new__(TeleopRunner)
+        runner = object.__new__(TeleopLoop)
         runner.runtime_state = armed_state()
-        runner.recorder = Mock()
-        runner.stop_control = Mock()
-        runner.end_segment = Mock()
+        runner.end_episode = Mock()
         for key, reason, save in (("s", "stop", True), ("d", "discard", False)):
             runner.handle_operator_command(key)
-            runner.end_segment.assert_called_with(save, reason)
-        self.assertTrue(runner.discard_requested)
+            runner.end_episode.assert_called_with(save, reason)
 
     def test_policy_stop_batch_blocks_begin_and_home(self):
         from dexmani_real.deployment.session import PolicySession
@@ -371,10 +369,10 @@ class PreviewInputTests(unittest.TestCase):
         example.rr = Mock()
         example.production = load_experiment_config().pointcloud
         example.camera = Mock(active_serial="camera")
-        example.camera.get_depth_scale.return_value = 0.001
+        example.camera.depth_scale_m = 0.001
         example.camera.read.return_value = SimpleNamespace(
             rgb=np.zeros((2, 2, 3), dtype=np.uint8),
-            depth_aligned_to_color_raw=np.ones((2, 2), dtype=np.uint16),
+            depth=np.ones((2, 2), dtype=np.uint16),
             timestamp_ns=1,
         )
         example.load_pointcloud_geometry = Mock(return_value=(np.eye(4), None))

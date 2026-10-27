@@ -16,8 +16,7 @@ from scipy.spatial.transform import Rotation
 from dexmani_real.config import load_experiment_config
 from dexmani_real.data.canonical.export import export_canonical
 from dexmani_real.data.canonical.processing import iter_canonical_blocks
-from dexmani_real.data.canonical.schema import ProcessingConfig, canonical_array_specs
-from dexmani_real.data.raw.camera_geometry import RawEpisodeCameraModel
+from dexmani_real.data.canonical.schema import ExportConfig, canonical_array_specs
 from dexmani_real.data.raw.reader import EpisodeReader
 from dexmani_real.data.raw.schema import (
     DATASET_SPECS,
@@ -26,7 +25,7 @@ from dexmani_real.data.raw.schema import (
     TACTILE_PROCESSING,
     TACTILE_UNITS,
 )
-from dexmani_real.data.raw.writer import RawEpisodeWriter
+from dexmani_real.data.raw.writer import EpisodeWriter
 from dexmani_real.deployment.policy_observation import (
     PolicyObservationRow,
     build_observation_kinematics,
@@ -178,7 +177,7 @@ class PointCloudTests(unittest.TestCase):
                 replace(self.config, **change)
 
     def test_offline_mount_config_rejects_invalid_geometry(self):
-        config = ProcessingConfig(pointcloud=self.config, table_plane_abcd=self.plane)
+        config = ExportConfig(pointcloud=self.config, table_plane_abcd=self.plane)
         for change in (
             dict(handbase_position_eef_m=(0.1,)),
             dict(handbase_position_eef_m=(np.nan, 0, 0)),
@@ -187,15 +186,15 @@ class PointCloudTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 replace(config, **change)
 
-    def test_raw_export_publishes_current_recipe_and_rejects_empty_cloud_episode(self):
-        config = ProcessingConfig(pointcloud=self.config, table_plane_abcd=self.plane)
+    def test_raw_export_stops_on_bad_episode_and_supports_explicit_exclusion(self):
+        config = ExportConfig(pointcloud=self.config, table_plane_abcd=self.plane)
         camera = CameraSnapshot("test", self.camera, 0.001, np.eye(4))
         arm, hand = np.zeros(1, ARM_STATE_DTYPE), np.zeros(1, HAND_STATE_DTYPE)
         with TemporaryDirectory() as directory:
             root = Path(directory)
             episode = root / "raw" / "episode_1"
             episode.mkdir(parents=True)
-            writer = RawEpisodeWriter(episode, control_hz=16)
+            writer = EpisodeWriter(episode, control_hz=16)
             try:
                 writer.open({
                     **camera.metadata(),
@@ -228,10 +227,16 @@ class PointCloudTests(unittest.TestCase):
             with h5py.File(rejected / "data.h5", "r+") as data:
                 data["depth"][1] = 0
             output = root / "canonical.zarr"
-            with self.assertLogs("dexmani_real.data.canonical.export", level="WARNING"):
-                result = export_canonical(root / "raw", output, processing=config, chunk_frames=1)
+            with self.assertLogs("dexmani_real.data.canonical.export", level="ERROR"):
+                with self.assertRaisesRegex(ValueError, "point_cloud unavailable at row 1"):
+                    export_canonical(root / "raw", root / "failed.zarr", processing=config)
+            self.assertFalse((root / "failed.zarr").exists())
+            self.assertEqual(len(list(root.glob(".failed.zarr.tmp-*"))), 1)
+            with patch("dexmani_real.data.canonical.export.MAX_BATCH_FRAMES", 1):
+                result = export_canonical(root / "raw", output, processing=config, exclude=("episode_0",))
             self.assertEqual(result["total_frames"], 2)
-            self.assertEqual(result["rejected_episodes"], {"episode_0": "point_cloud unavailable at row 1"})
+            self.assertEqual(result["excluded_episodes"], ["episode_0"])
+            self.assertNotIn("rejected_episodes", result)
             store = zarr.open_group(str(output), mode="r")
             self.assertEqual(store.attrs["episode_ids"], ["episode_1"])
             np.testing.assert_array_equal(store["meta/episode_ends"][:], [2])
@@ -260,7 +265,7 @@ class PointCloudTests(unittest.TestCase):
         reader.__getitem__.side_effect = raw.__getitem__
         reader.iter_rgb_frames.return_value = iter([self.rgb])
         hand_config = HandCloudConfig()
-        processing = ProcessingConfig(
+        processing = ExportConfig(
             pointcloud=self.config, hand_pointcloud=hand_config, table_plane_abcd=self.plane
         )
         parameters = camera_parameters_cv(self.camera, np.eye(4))
@@ -274,7 +279,7 @@ class PointCloudTests(unittest.TestCase):
                 hand_fk=hand_fk,
                 hand_cloud=surface,
                 chunk_frames=1,
-                camera=RawEpisodeCameraModel(self.camera, 0.001),
+                camera=CameraSnapshot("test", self.camera, 0.001, np.eye(4)),
                 base_from_color=np.eye(4),
                 camera_parameters=parameters,
                 handbase_rotation_eef=quat_wxyz_to_rotmat(processing.handbase_quat_eef_wxyz),

@@ -59,7 +59,7 @@ from dexmani_real.runtime.preflight import (
     validate_robot_config,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
-from dexmani_real.sensor.camera.worker import run_camera_worker
+from dexmani_real.sensor.camera import run_camera_worker
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import LoopRate, sample_is_fresh
 

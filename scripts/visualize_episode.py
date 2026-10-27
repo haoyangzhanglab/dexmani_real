@@ -17,10 +17,6 @@ import numpy as np
 from dexmani_real.calibration.table_plane import resolve_table_plane
 from dexmani_real.config import load_experiment_config
 from dexmani_real.control.config import TableCollisionConfig
-from dexmani_real.data.raw.camera_geometry import (
-    load_raw_episode_base_from_color,
-    load_raw_episode_camera_model,
-)
 from dexmani_real.data.raw.reader import EpisodeReader
 from dexmani_real.geometry.camera import validate_aligned_depth_distortion
 from dexmani_real.geometry.kinematics import HandFK, eef_pose_sequence
@@ -135,18 +131,13 @@ class EpisodeVisualizer:
 
             self.frame_count = self.reader.num_frames
             if self.frame_count <= 0:
-                raise ValueError("episode /meta num_frames must be positive")
+                raise ValueError("episode must contain at least one row")
             if max_frames is not None:
                 self.frame_count = min(self.frame_count, max_frames)
             self.rgb_frames = iter(self.reader.iter_rgb_frames())
             self.rgb_index = -1
-            meta = self.reader.meta
-            self.camera_model = load_raw_episode_camera_model(self.reader)
-            self.T_xarm_base_from_color = (
-                load_raw_episode_base_from_color(self.reader)
-                if "camera_T_xarm_base_from_color" in meta
-                else None
-            )
+            self.camera_model = self.reader.read_camera()
+            self.T_xarm_base_from_color = self.camera_model.T_xarm_base_from_color
             if self.T_xarm_base_from_color is None:
                 logger.warning("No camera extrinsics: displaying pixels without point cloud")
             self.handbase_position_eef_m = np.asarray(handbase_position_eef_m, dtype=np.float64)
@@ -165,7 +156,7 @@ class EpisodeVisualizer:
             self.pointcloud_processed_frames = 0
             if pointcloud_config is not None and self.T_xarm_base_from_color is not None:
                 validate_aligned_depth_distortion(
-                    self.camera_model.intrinsics.distortion_model
+                    self.camera_model.color.distortion_model
                 )
                 if pointcloud_config.remove_table:
                     self.table_plane_abcd = resolve_table_plane(table_config)
@@ -241,7 +232,7 @@ class EpisodeVisualizer:
                 )
         for key, labels in FORCE_SERIES.items():
             log_series(f"state/{key}", labels=labels)
-        log_camera_geometry(self.camera_model.intrinsics, self.T_xarm_base_from_color)
+        log_camera_geometry(self.camera_model.color, self.T_xarm_base_from_color)
 
     def log_step(self, step_idx: int) -> None:
         self.rr.set_time_sequence("step", step_idx)
@@ -285,7 +276,7 @@ class EpisodeVisualizer:
             depth_raw=depth,
             color=rgb,
             depth_scale_m=self.camera_model.depth_scale_m,
-            intrinsics=self.camera_model.intrinsics,
+            intrinsics=self.camera_model.color,
             T_xarm_base_from_color=self.T_xarm_base_from_color,
             table_plane_abcd=self.table_plane_abcd,
             config=self.pointcloud_config,

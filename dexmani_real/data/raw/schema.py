@@ -1,5 +1,3 @@
-"""Raw observations, final submission attempts and host timing."""
-
 import numpy as np
 
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
@@ -12,38 +10,40 @@ TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
 DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
     "arm_qpos": ((7,), np.dtype(np.float64)),
     "hand_qpos": ((12,), np.dtype(np.float64)),
-    # Consumed tactile observation: SDK units, bounded previous-valid vector hold (see metadata).
+    # 触觉保留 SDK 单位和限时保持语义。
     "hand_contact": ((5, 3), np.dtype(np.float32)),
     "hand_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
-    # Final absolute q_goal passed to submission, including failed attempts.
+    # 记录最终提交的绝对目标，包括失败的提交尝试。
     "action_arm_joint_target": ((7,), np.dtype(np.float64)),
     "action_hand_joint_target": ((12,), np.dtype(np.float64)),
-    # Seconds relative to the first observation.
+    # 相对首条观测的秒数。
     "timestamp": ((), np.dtype(np.float64)),
 }
 
 
-# Host monotonic clocks; unavailable sources use -1. Tactile clocks retain the
-# oldest original valid vector, rather than the later joint-feedback read time.
+# 主机单调时钟；缺失用 -1，触觉保留最早有效向量的来源时间。
 TIMING_ROW_DTYPE = np.dtype(
     [
         (name, "<i8")
         for name in (
-            "observation_ns", "control_ns", "arm_ns", "hand_ns",
-            "tactile_aggregate_ns", "tactile_dense_ns", "camera_ns", "camera_sequence",
+            "observation_ns",
+            "control_ns",
+            "arm_ns",
+            "hand_ns",
+            "tactile_aggregate_ns",
+            "tactile_dense_ns",
+            "camera_ns",
+            "camera_sequence",
         )
     ]
 )
 
 
 def encode_raw_row(row, command, timestamp):
-    arm, hand, camera = (
+    arm, hand = (
         row.arm[0],
         None if row.hand is None else row.hand[0],
-        row.camera,
     )
-    if camera is None:
-        raise ValueError("recording requires RGB-D from the current observation")
     values = {
         "timestamp": timestamp,
         "arm_qpos": arm["qpos"],
@@ -54,28 +54,19 @@ def encode_raw_row(row, command, timestamp):
         ),
         "action_arm_joint_target": (
             command.arm_qpos
-            if command is not None
-            and command.arm_qpos is not None
+            if command is not None and command.arm_qpos is not None
             else np.full(7, np.nan)
         ),
         "action_hand_joint_target": (
             command.hand_qpos
-            if command is not None
-            and command.hand_qpos is not None
+            if command is not None and command.hand_qpos is not None
             else np.full(12, np.nan)
         ),
     }
-    for name, value in values.items():
-        tail_shape, dtype = DATASET_SPECS[name]
-        array = np.asarray(value, dtype=dtype)
-        if array.shape != tail_shape:
-            raise ValueError(f"Raw {name}: expected {tail_shape}, got {array.shape}")
-        values[name] = array
     return values
 
 
 def encode_timing_row(row):
-    """Capture consumed source clocks without scheduling or SDK bookkeeping."""
     hand = row.hand
     return (
         int(row.observation_timestamp_ns),
@@ -84,6 +75,6 @@ def encode_timing_row(row):
         int(hand["timestamp_ns"][0]) if hand is not None else -1,
         int(hand["tactile_aggregate_timestamp_ns"][0]) if hand is not None else -1,
         int(hand["tactile_dense_timestamp_ns"][0]) if hand is not None else -1,
-        int(row.camera["timestamp_ns"]) if row.camera is not None else -1,
-        int(row.camera["ring_sequence"]) if row.camera is not None else -1,
+        int(row.camera["timestamp_ns"]),
+        int(row.camera["ring_sequence"]),
     )

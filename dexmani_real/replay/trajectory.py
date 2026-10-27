@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.data.raw.reader import EpisodeReader, text_attr
+from dexmani_real.data.raw.reader import EpisodeReader
 from dexmani_real.geometry.kinematics import eef_pose_sequence
 
 
@@ -24,7 +24,7 @@ class TrajectoryData:
 def load_trajectory(episode_path):
     with EpisodeReader(episode_path) as reader:
         meta = reader.meta
-        if text_attr(meta, "collection_source") != "teleop":
+        if meta["collection_source"] != "teleop":
             raise ValueError("physical replay requires a teleop episode")
         reader.require_fields(
             "action_arm_joint_target",
@@ -50,7 +50,7 @@ def load_trajectory(episode_path):
             str(reader.path),
             len(arm),
             reader.control_hz,
-            text_attr(meta, "task_label"),
+            meta["task_label"],
             arm,
             hand,
             aq,

@@ -67,7 +67,9 @@ XHand 的 SDK 载荷解析、反馈布局与缓存位于 `robot/xhand/feedback.p
 
 控制与设备配置类使用 `MotionConfig`、`ArmConfig`、`HomingConfig`、`HandConfig`。SDK 超时和伺服间隔预算均固定为 20 ms，进程等待为 3 s；HOME 的到位附加预算、稳定持续时间、收敛等待分别为 0.5、0.3、15 s，轮询周期使用机械臂反馈频率。XHand 串口稳定等待和初始反馈等待均为 1 s。这些预算不再接受 YAML 覆盖；机械限位和指尖名称由 `robot/model.py` 提供，实验仍可配置运行关节限位、控制频率、HOME 姿态、收敛容差及硬件增益。
 
-`JogController.submit()` 负责输入代际、运动授权和提交后参考更新。录制使用 `AsyncEpisodeRecorder.finish()` 显式指定保存意图、终止原因和技术状态。
+`JogController.submit()` 负责输入代际、运动授权和提交后参考更新。`EpisodeRecorder` 使用 `start()`、`append()`、`finish()`，收尾时显式指定保存意图、终止原因和技术状态，`result()` 返回最后可观察的录制结果。
+
+`sensor` 平铺为 `config.py`、`camera.py`、`realsense.py` 和 `vr.py`。配置类型为 `CameraConfig`、`VRConfig`；相机预热固定为 10 帧，来源停滞期限为 2 秒，这两项不接受 YAML 覆盖。`RealSenseCamera.read()` 返回 `RGBDFrame`，短暂等待超时或重复帧返回 `None`，持续停滞或 SDK 故障抛出异常。驱动统一维护来源时间与去重，`depth` 为对齐到 color 网格的原始深度，`color_intrinsics`、`depth_scale_m` 在连接成功后直接读取。
 
 `runtime` 按职责平铺为 `state`、`keyboard`、`observation`、`lifecycle`、`preflight`、`home` 和 `jog`。`SessionState` 管理运行代际与停止请求，`SensorWorkers` 持有传感进程，`close_runtime()` 按顺序回收资源。`home_hand()`、`home_arm()` 直接使用机器人对象中的设备配置，并分别负责本次运动的停止；`home_robot()` 顺序执行两者。
 
@@ -81,6 +83,8 @@ XHand 的 SDK 载荷解析、反馈布局与缓存位于 `robot/xhand/feedback.p
 
 遥操作入口为 `teleop.session.run_teleop(...)`，回放入口为 `replay.session.run_replay(...)`，对应脚本解析参数并调用入口。点云诊断的装配、运行、快照输出及收尾集中在 `scripts/tools/view_pointcloud.py`。
 
+`teleop` 中，`session.py` 装配资源，`loop.py` 的 `TeleopLoop` 管理准备、控制和录制收尾，`vr.py` 的 `VRController` 负责锚点映射与 EMA；键盘点动和语音分别位于 `keyboard.py`、`audio.py`。手部算法保留 `retargeting/tag.py`、`dexpilot.py` 和共用的 `landmarks.py`。配置类型统一使用 `Config` 后缀，YAML 字段及默认值保持不变。
+
 遥操作配置直接使用以下字段，覆盖顺序为 CLI > YAML > 默认值；未定义的配置键会报错。
 
 ```yaml
@@ -93,7 +97,9 @@ teleop:
   hand_retargeting_type: tag
 ```
 
-VR 接收器在发布前拒绝无效传感数据。映射器按已接纳的观测建立锚点，映射或重置发生技术错误时直接抛出异常；重置失败会清除旧锚点。遥操作控制器复用动作检查器的 FK 初始化 VR 锚点与 EMA，EMA 只在命令正常提交后更新参考。
+VR 接收器在发布前拒绝无效传感数据。映射器按已接纳的观测建立锚点，映射或重置发生技术错误时直接抛出异常；重置失败会清除旧锚点。遥操作控制器复用动作检查器的 FK 初始化 VR 锚点与 EMA，手部重定向仅在建立新锚点时用实测关节角重置，EMA 只在命令正常提交后更新参考。
+
+`TAGRetargeter` 集中实现两阶段目标函数和解析梯度，复用 `HandFK` 的固定模型与关节顺序；`DexPilotRetargeter` 直接调用现有 DexPilot 目标函数、NLopt 和低通滤波器。退化手部几何不产生目标；求解异常（包括 `RoundoffLimited`）停止当前段并沿会话错误路径退出，不返回旧目标或退回 TAG 第一阶段。显式提供的非法初值直接报错；省略初值仍从关节限位中点开始。
 
 IK 使用入口明确提供的运行关节限位，正常无解返回 `IKResult`，求解器、FK 或碰撞后端故障直接抛出原始异常。HOME 仅对 `HomePathRejected` 表示的几何拒绝尝试其他候选路径，候选耗尽、取消或等待超时返回失败结果；非法目标与技术异常传播到会话错误处理和收尾边界。
 
@@ -111,11 +117,13 @@ XHand 保留 serial 与 EtherCAT，连接失败直接报告，不自动重试。
 
 `read_camera_frame()` 返回来源 `timestamp_ns`、共享内存发布序列 `ring_sequence`、RGB 设备帧号 `color_frame_number` 及请求的像素通道。发布序列不是设备帧身份；时间戳保留 RGB-D 中较早通道的首次主机接收时间，不代表曝光时刻。标定采样和预览只读取 RGB，采样仍要求屏障后的新鲜、不同 RGB 帧。
 
-`termination_reason` 保留首次终止原因，`technical_status` 反映该次产物的技术完成状态，发布状态单独描述文件是否已发布。发布前已知的停止或录制失败不会因为首次原因是 operator、quit 或正常时长结束而变为技术正常。失败产物可保留有效数据前缀；已发布 Raw 不因后续独立会话清理错误而回写。Teleop 的显式 DISCARD 在停止失败时仍保持丢弃意图。
+`termination_reason` 保留首次终止原因，Teleop 的准备与运行阶段均使用 `RunEndReason` 的小写名称，具体中止上下文写入 `termination_details`。`technical_status` 反映该次产物的技术完成状态，发布状态单独描述文件是否已发布。控制中止后的完整记录可以保存为 `failed` episode；录制队列满、写入或关闭失败则报错并保留临时目录，不发布正式 episode。Teleop 的 D 键回调先锁存丢弃意图并撤销运动，再发布按键事件；收尾请求前到达的 DISCARD 在准备、求解或停止失败时仍保持丢弃意图，writer 退出后删除临时目录。已发布 Raw 不因后续独立会话清理错误而回写。
 
 Teleop 中断会登记技术失败并传播，关闭时继续按原保存或丢弃意图收尾；recorder 的首次收尾请求不会被重入覆盖。收尾超时仍报告 pending，不在同一次关闭中重新开启等待预算。Policy 在会话关闭末尾核对对应 episode 的 Raw 发布状态、实际路径和帧数，再写入 `session_result.json`；该摘要反映最后一次确认，不保证仍 pending 的 writer 之后的结果，也不会清除首次终止原因或已有错误。
 
-`EpisodeReader` 在首次读取时统一校验已定义数值字段和 `timing/rows` 的布局，并缓存数据集。`read_timing_rows(fields)` 按请求顺序返回结构化字段，保留 `int64` 纳秒及 `-1` 缺失标记。诊断读取不隐式执行训练或物理回放准入；Canonical 导出与物理回放均显式调用 `validate_completion()`、`validate_rows()` 执行各自所需的技术状态和时序检查。CordViP 可读取失败产物或缺失来源时钟的诊断数据，但同一 Raw 行不能证明手和相机物理同步。Reader 关闭后文件读取与校验接口报错，已返回的 NumPy 数组仍可使用。
+`EpisodeReader` 从 `timestamp` 数据集推导帧数，Raw 不再保存冗余 `num_frames` 属性。首次读取时校验已定义数值字段和 `timing/rows` 的布局，并缓存数据集；`read_camera()` 返回 `CameraSnapshot`，`read_timing_rows(fields)` 保留原始 `int64` 纳秒及 `-1` 缺失标记。诊断读取不隐式执行训练或物理回放准入；Canonical 导出与物理回放显式调用 `validate_completion()`、`validate_rows()`。CordViP 可读取失败产物或缺失来源时钟的诊断数据，但同一 Raw 行不能证明手和相机物理同步。文件和视频由 Reader 统一关闭。
+
+Canonical 使用 `ExportConfig`，保留 13 个训练字段、episode 边界及物理参数。导出遇到损坏或不满足训练要求的 episode 立即报错，保留已有临时结果；使用 `--exclude EPISODE` 显式排除后重新导出。最终输出必须尚未占用且不与输入目录重叠，全部完成后才原子发布。处理批次根据 64 MiB 数组预算和最多 100 帧确定，不再提供 `--chunk-frames`；存储块仍按字段大小独立选择。
 
 ## 离线验证
 
@@ -134,12 +142,12 @@ git diff --check
 ```bash
 ruff check --no-cache --isolated --select E9,F dexmani_real scripts tests third_party/cordvip_geometry/src
 mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases \
-  dexmani_real/ipc dexmani_real/sensor/camera/worker.py \
+  dexmani_real/ipc dexmani_real/sensor \
   dexmani_real/geometry dexmani_real/perception dexmani_real/control dexmani_real/robot \
   dexmani_real/calibration dexmani_real/runtime dexmani_real/deployment \
   dexmani_real/data/canonical \
   dexmani_real/data/session_results.py dexmani_real/data/raw/reader.py \
-  dexmani_real/teleop/runner.py dexmani_real/replay/replayer.py \
+  dexmani_real/teleop dexmani_real/config.py dexmani_real/replay/replayer.py \
   scripts/tools/view_pointcloud.py scripts/tools/view_realsense.py \
   scripts/visualize_episode.py scripts/export_zarr.py \
   third_party/cordvip_geometry/src/cordvip_geometry/integrations/dexmani.py
@@ -149,7 +157,9 @@ mypy 按现有类型标注检查上述模块，不检查未标注函数体或外
 
 `tests/test_control.py` 使用真实模型和可控求解结果检查 IK、碰撞、HOME 及策略动作格式；`tests/test_robot.py` 使用假 SDK 和进程管道检查时效、取消、异常传递、停止、CRC 和资源收尾，并验证真实 Ruckig 的连续性与制动限位。测试不会连接机器人，需要已安装 Pinocchio、MPlib、HPP-FCL 和 Ruckig。
 
-`tests/test_geometry.py` 与 `tests/test_perception.py` 检查坐标约定、畸变反投影、桌面拟合、采样以及在线和离线几何一致性；导出测试使用实际 HDF5、视频和 Zarr，覆盖完整参数恢复与无效点云 episode 的回滚。
+`tests/test_teleop.py` 检查 VR 映射、EMA 提交时机、TAG 梯度、DexPilot 数值等价及求解错误传播，并用假设备和播放器覆盖停止、录制收尾与音频抢占；还需遥操作原有的 NLopt 和 dex_retargeting 依赖。
+
+`tests/test_geometry.py` 与 `tests/test_perception.py` 检查坐标约定、畸变反投影、桌面拟合、采样以及在线和离线几何一致性；导出测试使用实际 HDF5、视频和 Zarr，覆盖完整参数恢复、坏数据立即报错和显式排除。`tests/test_sensor.py` 使用假 SDK 检查来源时间、去重、停滞、资源释放和 VR 接收；`tests/test_data.py` 检查批量写盘、失败保留、显式丢弃及发布超时。
 
 键盘遥操作入口保留 `--help`，没有 `--print-config` 参数。
 

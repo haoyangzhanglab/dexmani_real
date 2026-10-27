@@ -13,9 +13,8 @@ from dexmani_real.calibration.camera.extrinsics import (
 from dexmani_real.control.action_mapping import ActionMapper
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.recorder import (
-    AsyncEpisodeRecorder,
+    EpisodeRecorder,
     RecordingError,
-    snapshot_recording_result,
 )
 from dexmani_real.data.session_results import SessionResults, error_detail
 from dexmani_real.deployment.config import DEFAULT_NUM_EPISODES
@@ -42,7 +41,7 @@ from dexmani_real.runtime.observation import (
     snapshot_camera_parameters,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
-from dexmani_real.sensor.camera.worker import run_camera_worker
+from dexmani_real.sensor.camera import run_camera_worker
 from dexmani_real.utils.atomic_io import atomic_yaml_dump
 from dexmani_real.utils.log import configure_logging
 
@@ -337,7 +336,7 @@ class PolicySession:
                 model_close = self.model.close_result(shutdown_deadline - time.monotonic())
             # 设备与模型清理期间 writer 仍可能退出；最终写会话前只核对一次。
             if self.recorder is not None and self.recorder_result_index is not None:
-                raw = snapshot_recording_result(self.recorder)
+                raw = self.recorder.result()
                 if raw is not None:
                     self.results.update_episode_raw(self.recorder_result_index, raw)
             shutdown_clean = (
@@ -573,7 +572,7 @@ class PolicySession:
                 if self.recorder.is_recording or self.recorder.writer_pending:
                     raise RecordingError("previous capture still owns resources")
             self.recorder = (
-                AsyncEpisodeRecorder(self.recording_dir, control_hz=1.0 / self.info.control_dt_s)
+                EpisodeRecorder(self.recording_dir, control_hz=1.0 / self.info.control_dt_s)
                 if self.recording_dir is not None else None
             )
             # 本会话串行创建轮次；prepare() 将为此 recorder 开始下一条结果。

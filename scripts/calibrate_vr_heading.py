@@ -30,9 +30,9 @@ from dexmani_real.runtime.lifecycle import (
 )
 from dexmani_real.runtime.observation import read_vr_frame
 from dexmani_real.runtime.state import SessionState
-from dexmani_real.sensor.vr.config import VRParams
-from dexmani_real.sensor.vr.worker import run_vr_worker
-from dexmani_real.teleop.audio_feedback import AudioFeedback
+from dexmani_real.sensor.config import VRConfig
+from dexmani_real.sensor.vr import run_vr_worker
+from dexmani_real.teleop.audio import AudioFeedback
 from dexmani_real.utils.atomic_io import atomic_json_dump
 
 POLL_INTERVAL_S = 0.01
@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         help=f"collection duration (s), default: {DEFAULT_DURATION_S}",
     )
     parser.add_argument(
-        "--port", type=int, default=VRParams.port, help=f"VR TCP port, default: {VRParams.port}"
+        "--port", type=int, default=VRConfig.port, help=f"VR TCP port, default: {VRConfig.port}"
     )
     parser.add_argument(
         "--ref",
@@ -164,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  port:       {args.port}")
     print("=" * 55)
 
-    vr_config = VRParams(port=args.port)
+    vr_config = VRConfig(port=args.port)
     vr_config.validate()
     from dexmani_real.utils.log import configure_logging
 

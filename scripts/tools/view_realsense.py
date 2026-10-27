@@ -29,7 +29,7 @@ from dexmani_real.utils.visualization import (
 )
 
 if TYPE_CHECKING:
-    from dexmani_real.sensor.camera.realsense import RealSenseCamera
+    from dexmani_real.sensor.realsense import RealSenseCamera
 
 FPS_WINDOW = 100
 
@@ -42,7 +42,7 @@ def depth_valid_ratio(depth: np.ndarray, min_d: float, max_d: float) -> float:
 
 
 def list_cameras() -> list[dict[str, str]]:
-    from dexmani_real.sensor.camera.realsense import RealSenseCamera
+    from dexmani_real.sensor.realsense import RealSenseCamera
 
     cameras = RealSenseCamera.list_cameras()
     if not cameras:
@@ -64,7 +64,7 @@ def get_ae_priority(camera: RealSenseCamera) -> float | None:
     import pyrealsense2 as rs
 
     try:
-        sensor = camera.get_color_sensor()
+        sensor = camera.color_sensor
         option = rs.option.auto_exposure_priority
         if sensor.supports(option):
             return float(sensor.get_option(option))
@@ -77,7 +77,7 @@ def set_ae_priority(camera: RealSenseCamera, value: float) -> float | None:
     """Set auto_exposure_priority and return the readback; None if unsupported."""
     import pyrealsense2 as rs
 
-    sensor = camera.get_color_sensor()
+    sensor = camera.color_sensor
     option = rs.option.auto_exposure_priority
     if not sensor.supports(option):
         return None
@@ -116,7 +116,7 @@ class RealSenseExample:
 
         import rerun as rr
 
-        from dexmani_real.sensor.camera.realsense import RealSenseCamera
+        from dexmani_real.sensor.realsense import RealSenseCamera
 
         self.rr = rr
         # Leave exposure priority untouched until it is snapshotted.
@@ -191,8 +191,8 @@ class RealSenseExample:
             rr.init("DexMani RealSense", spawn=True)
             rr.send_blueprint(viewer_blueprint(series))
             keys.start()
-            intrinsics = self.camera.get_color_intrinsics()
-            depth_scale_m = self.camera.get_depth_scale()
+            intrinsics = self.camera.color_intrinsics
+            depth_scale_m = self.camera.depth_scale_m
             serial = cast(str, self.camera.active_serial)
             if not np.isfinite(depth_scale_m) or depth_scale_m <= 0:
                 raise ValueError("display depth scale must be finite and positive")
@@ -240,13 +240,15 @@ class RealSenseExample:
                     intervals.append(started - previous_frame_start)
                 previous_frame_start = started
                 try:
-                    frame = self.camera.read(timeout_ms=5000)
+                    frame = self.camera.read()
                 except (RuntimeError, OSError) as exc:
                     print(f"read() failed: {exc}")
                     return "read_failed"
+                if frame is None:
+                    continue
                 read_ms = (time.perf_counter() - started) * 1000
                 frame_count += 1
-                rgb, depth = frame.rgb, frame.depth_aligned_to_color_raw
+                rgb, depth = frame.rgb, frame.depth
                 if rgb.shape[:2] != depth.shape:
                     raise ValueError("aligned RGB-D dimensions do not match")
                 rr.set_time_sequence("frame", frame_count)

@@ -1,7 +1,7 @@
 import numpy as np
 
 from dexmani_real.ipc.ring import SharedRing
-from dexmani_real.sensor.camera.config import CameraParams
+from dexmani_real.sensor.config import CameraConfig
 
 
 # 右手发布携带最近头部姿态；recv_ts_ns 取腕部与关键点中较早的接收时刻。
@@ -49,7 +49,7 @@ class SensorChannels:
         self,
         ctx,
         *,
-        camera: CameraParams | None = None,
+        camera: CameraConfig | None = None,
         vr: bool = False,
         pointcloud_num_points: int | None = None,
     ):

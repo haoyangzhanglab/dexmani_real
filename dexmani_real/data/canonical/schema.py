@@ -1,5 +1,3 @@
-"""Canonical arrays and numerical recipes."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -9,18 +7,14 @@ import numpy as np
 
 from dexmani_real.geometry.pose import validate_unit_quaternion_wxyz
 from dexmani_real.perception.config import HandCloudConfig, PointCloudConfig
-from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.robot.xhand.config import HandConfig
 
 
 @dataclass(frozen=True)
-class ProcessingConfig:
-    """Full-modal processing requires complete physical/derived modalities and finite floats on every row."""
-
+class ExportConfig:
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
-    fingertip_link_names: tuple[str, ...] = XHAND_FINGERTIP_LINK_NAMES
     handbase_position_eef_m: tuple[float, ...] = HandConfig.T_eef_handbase_pos_xyz
     handbase_quat_eef_wxyz: tuple[float, ...] = HandConfig.T_eef_handbase_quat_wxyz
 
@@ -30,7 +24,6 @@ class ProcessingConfig:
             pointcloud=runtime.pointcloud,
             hand_pointcloud=runtime.hand_pointcloud,
             table_plane_abcd=table_plane_abcd,
-            fingertip_link_names=XHAND_FINGERTIP_LINK_NAMES,
             handbase_position_eef_m=tuple(runtime.hand.T_eef_handbase_pos_xyz),
             handbase_quat_eef_wxyz=tuple(runtime.hand.T_eef_handbase_quat_wxyz),
         )

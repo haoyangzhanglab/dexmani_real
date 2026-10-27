@@ -1,5 +1,3 @@
-"""Writer-thread HDF5 and video storage for one unpublished Raw episode."""
-
 import json
 from contextlib import ExitStack
 from pathlib import Path
@@ -14,11 +12,11 @@ from dexmani_real.data.raw.schema import (
     encode_raw_row,
     encode_timing_row,
 )
-from dexmani_real.data.raw.video import VideoEncoder
+from dexmani_real.data.raw.video import VideoWriter
 from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
 
 
-class RawEpisodeWriter:
+class EpisodeWriter:
     def __init__(self, path, *, control_hz):
         self.path = Path(path)
         self.control_hz = control_hz
@@ -32,6 +30,8 @@ class RawEpisodeWriter:
         self.meta = data.create_group("meta")
         self.meta.attrs.update(metadata)
         self.meta.attrs.update(
+            technical_status="failed",
+            termination_reason="recording_incomplete",
             control_hz=self.control_hz,
             timestamp_source="host_monotonic_relative",
             arm_action_semantics=ARM_ACTION_SEMANTICS,
@@ -67,7 +67,7 @@ class RawEpisodeWriter:
             compression="gzip",
             compression_opts=1,
         )
-        # Copy columns once so buffered depth views do not retain RGB-D snapshots.
+        # 每列复制一次，批缓冲不持有整份 RGB-D 快照。
         batch_size = 32
         self.arrays = {
             name: np.empty((batch_size, *dataset.shape[1:]), dtype=dataset.dtype)
@@ -75,19 +75,21 @@ class RawEpisodeWriter:
         }
         self.timing_rows = np.empty(batch_size, dtype=TIMING_ROW_DTYPE)
         height, width, _ = self.rgb_shape
-        self.video = VideoEncoder(
+        self.video = VideoWriter(
             self.path / "rgb.mp4", fps=self.control_hz, width=width, height=height
         )
         self.resources.callback(self.video.close)
         self.video.open()
 
     def append_frame(self, row, command):
+        if row.camera is None:
+            raise ValueError("recording requires RGB-D from the current observation")
         stamp = int(row.observation_timestamp_ns)
         if stamp <= 0 or (self.previous_stamp is not None and stamp <= self.previous_stamp):
             raise ValueError("recording observation timestamps must be positive and increasing")
         if self.first_stamp is None:
             self.first_stamp = stamp
-        # Integer subtraction retains short intervals even for a large host clock.
+        # 先减整数时钟，避免长时间运行后的浮点精度损失。
         values = encode_raw_row(row, command, (stamp - self.first_stamp) / 1e9)
         rgb, depth = row.camera["rgb"], row.camera["depth"]
         if rgb.shape != self.rgb_shape or rgb.dtype != np.uint8:
@@ -108,7 +110,7 @@ class RawEpisodeWriter:
     def flush(self):
         if not self.buffered:
             return
-        # Never retry a partially written batch: that could duplicate rows.
+        # 写入前清空计数，失败后不能重试并重复追加部分数据。
         count, self.buffered = self.buffered, 0
         end = self.frame_count + count
         for name, values in self.arrays.items():
@@ -118,9 +120,7 @@ class RawEpisodeWriter:
         self.row_times[self.frame_count : end] = self.timing_rows[:count]
         self.frame_count = end
 
-    def write_termination(
-        self, reason, details, *, expected_frames, technical_status
-    ):
+    def write_termination(self, reason, details, *, expected_frames, technical_status):
         if technical_status not in {"normal", "failed"}:
             raise ValueError("invalid technical_status")
         if (
@@ -131,7 +131,6 @@ class RawEpisodeWriter:
         ):
             raise RuntimeError("recording accepted/written/camera row count mismatch")
         self.meta.attrs.update(
-            num_frames=self.frame_count,
             termination_reason=reason,
             technical_status=technical_status,
         )
@@ -144,6 +143,5 @@ class RawEpisodeWriter:
         try:
             self.resources.close()
         finally:
-            # The recorder retains frame_count after closure, but no longer needs batch storage.
             self.arrays = {}
             self.timing_rows = None

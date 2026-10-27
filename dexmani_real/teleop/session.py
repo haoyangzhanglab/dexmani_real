@@ -1,4 +1,4 @@
-"""Own the local teleop/robot and sensor startup; all hardware work is explicit."""
+"""装配遥操作资源并统一启停。"""
 
 import logging
 import multiprocessing as mp
@@ -14,10 +14,6 @@ from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.recorder import RecordingError
 from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import RobotError
-from dexmani_real.robot.model import (
-    XHAND_FINGERTIP_LINK_NAMES,
-    XHAND_RIGHT_URDF_PATH,
-)
 from dexmani_real.robot.system import DexManiRobot
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
@@ -32,13 +28,12 @@ from dexmani_real.runtime.observation import (
 )
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 from dexmani_real.runtime.state import RunEndReason, SessionState
-from dexmani_real.sensor.camera.worker import run_camera_worker
-from dexmani_real.sensor.vr.worker import run_vr_worker
-from dexmani_real.teleop.audio_feedback import AudioFeedback
+from dexmani_real.sensor.camera import run_camera_worker
+from dexmani_real.sensor.vr import run_vr_worker
+from dexmani_real.teleop.audio import AudioFeedback
 from dexmani_real.teleop.config import DEFAULT_TASK_NAME
-from dexmani_real.teleop.controller import TeleopController
-from dexmani_real.teleop.runner import TeleopRunner
-from dexmani_real.teleop.vr_mapping import VRWristMapper
+from dexmani_real.teleop.loop import TeleopLoop
+from dexmani_real.teleop.vr import VRController
 from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -77,18 +72,14 @@ def run_teleop(
     ):
         raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")
     calibration = load_vr_transform(vr_transform_path)
-    controller = TeleopController(
+    controller = VRController(
         ActionMapper.for_mode(
             "eef", arm=runtime.arm, hand=runtime.hand,
             motion=runtime.motion, environment=runtime.environment,
         ),
-        VRWristMapper(
-            pos_scale=runtime.teleop.vr_pos_scale,
-            vr_to_robot_rot=calibration.transform,
-        ),
         build_hand_retargeter(runtime),
-        ema_alpha_pos=runtime.teleop.ema_alpha_pos,
-        ema_alpha_rot=runtime.teleop.ema_alpha_rot,
+        runtime.teleop,
+        calibration.transform,
     )
     home_planner = HomePlanner(
         runtime.environment, runtime.arm, table_plane_abcd=table_plane_abcd,
@@ -113,7 +104,7 @@ def run_teleop(
     )
     sensors = robot = None
     clean = False
-    runner = None
+    loop = None
     keyboard = audio = None
     try:
         sensors = SensorWorkers(channels)
@@ -129,7 +120,7 @@ def run_teleop(
             quit_callback=lambda: runtime_state.request_stop(reason=RunEndReason.QUIT),
         )
         audio = AudioFeedback()
-        runner = TeleopRunner(
+        loop = TeleopLoop(
             runtime_state,
             runtime,
             robot,
@@ -151,7 +142,9 @@ def run_teleop(
                 args=(channels, runtime.vr),
             ),
         )
+        keyboard.discard_callback = loop.request_discard
         keyboard.start()
+
         def check_services():
             if not keyboard.healthy or not sensors.check(names=("vr",)):
                 raise RobotError("teleop control service unavailable")
@@ -172,12 +165,12 @@ def run_teleop(
                 timeout_s=CAMERA_READY_TIMEOUT_S,
                 may_start=lambda: keyboard.healthy and runtime_state.requests_allow_motion(),
             )
-            runner.camera_snapshot = snapshot_camera_parameters(
+            loop.camera_snapshot = snapshot_camera_parameters(
                 channels, runtime.camera, camera_calibration,
             )
         robot.check()
         runtime_state.arm()
-        runner.run()
+        loop.run()
         clean = bool(runtime_state.quit_requested)
     except KeyboardInterrupt:
         runtime_state.request_emergency_stop()
@@ -186,29 +179,27 @@ def run_teleop(
         logger.exception("teleop session failed")
     finally:
         try:
-            try:
-                if runner is not None:
-                    runner.close()
-            except Exception:
-                runtime_state.mark_error()
-                logger.exception("teleop capture cleanup failed")
-            try:
-                # Preserve the final cue after capture finalization and before device shutdown.
-                if audio is not None and not audio.wait_until_idle(timeout_s=END_AUDIO_GRACE_S):
-                    logger.warning("Final audio did not finish within %.1fs", END_AUDIO_GRACE_S)
-            except Exception:
-                logger.warning("Final audio unavailable", exc_info=True)
+            if loop is not None:
+                loop.close()
+        except Exception:
+            runtime_state.mark_error()
+            logger.exception("teleop capture cleanup failed")
+        finally:
             try:
                 if audio is not None:
-                    audio.close()
+                    try:
+                        if not audio.wait_until_idle(timeout_s=END_AUDIO_GRACE_S):
+                            logger.warning("Final audio did not finish within %.1fs", END_AUDIO_GRACE_S)
+                    finally:
+                        audio.close()
             except Exception:
                 runtime_state.mark_error()
                 logger.exception("teleop audio cleanup failed")
-        finally:
-            shutdown_clean = close_runtime(
-                runtime_state, robot, sensors=sensors, keyboard=keyboard,
-                deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S,
-            )
+            finally:
+                shutdown_clean = close_runtime(
+                    runtime_state, robot, sensors=sensors, keyboard=keyboard,
+                    deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S,
+                )
     return int(not clean or not shutdown_clean)
 
 
@@ -216,17 +207,11 @@ def build_hand_retargeter(runtime):
     if not runtime.hand.enabled:
         return None
     if runtime.teleop.hand_retargeting_type == "tag":
-        from dexmani_real.teleop.retargeting.tag import TAGHandRetargeter
+        from dexmani_real.teleop.retargeting.tag import TAGRetargeter
 
-        return TAGHandRetargeter(
-            fingertip_link_names=XHAND_FINGERTIP_LINK_NAMES,
-            tag_config=runtime.tag_retargeting,
-            urdf_path=str(XHAND_RIGHT_URDF_PATH),
-        )
+        return TAGRetargeter(runtime.tag_retargeting)
     if runtime.teleop.hand_retargeting_type == "dexpilot":
-        from dexmani_real.teleop.retargeting.dexpilot import DexPilotHandRetargeter
+        from dexmani_real.teleop.retargeting.dexpilot import DexPilotRetargeter
 
-        return DexPilotHandRetargeter(
-            dexpilot_config=runtime.dexpilot_retargeting,
-        )
+        return DexPilotRetargeter(runtime.dexpilot_retargeting)
     raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")

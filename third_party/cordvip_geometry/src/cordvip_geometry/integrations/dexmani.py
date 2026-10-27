@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -25,14 +24,13 @@ def raw_frame_identity(episode, row_index, observation_s, timing):
 
 def iter_raw_episode(path: str | Path) -> Iterator[Frame]:
     """Read Raw rows using decoded MP4 RGB; exhausting the iterator verifies the full frame count."""
-    from dexmani_real.data.raw.camera_geometry import load_raw_episode_camera_model
     from dexmani_real.data.raw.reader import EpisodeReader
 
     episode_path = Path(path).expanduser().resolve()
     with EpisodeReader(episode_path) as reader:
         reader.require_fields("rgb", "depth", "timestamp")
-        camera = load_raw_episode_camera_model(reader)
-        intrinsics = camera.intrinsics
+        camera = reader.read_camera()
+        intrinsics = camera.color
         K = intrinsics.matrix()
         expected_shape = (intrinsics.height, intrinsics.width)
         depth = reader["depth"]
@@ -78,49 +76,31 @@ def iter_live_realsense(
     *, serial: str | None = None, width: int = 640, height: int = 480, fps: int = 30
 ) -> Iterator[Frame]:
     """Preserve first host queue-return times per channel; SDK queue latency is unmeasured."""
-    from dexmani_real.sensor.camera.config import CameraParams
-    from dexmani_real.sensor.camera.realsense import RealSenseCamera
+    from dexmani_real.sensor.config import CameraConfig
+    from dexmani_real.sensor.realsense import RealSenseCamera
 
-    config = CameraParams(serial=serial, width=width, height=height, fps=fps)
+    config = CameraConfig(serial=serial, width=width, height=height, fps=fps)
     config.validate()
     camera = RealSenseCamera(config, auto_exposure_priority=None)
-    previous_identity: tuple[int, int] | None = None
-    channel_received_ns = [0, 0]
     try:
         camera.connect()
-        depth_scale_m = np.float32(camera.get_depth_scale())
-        if not np.isfinite(depth_scale_m) or depth_scale_m <= 0:
-            raise RuntimeError("RealSense depth scale must be finite and positive")
+        depth_scale_m = np.float32(camera.depth_scale_m)
         active_serial = camera.active_serial
-        if not isinstance(active_serial, str) or not active_serial.strip():
-            raise RuntimeError("RealSense active serial is unavailable")
-        intrinsics = camera.get_color_intrinsics()
+        intrinsics = camera.color_intrinsics
         K = intrinsics.matrix()
-        stall_timeout_ns = int(config.source_stall_timeout_s * 1e9)
         while True:
-            raw = camera.read(timeout_ms=1000)
-            identity = (raw.depth_frame_number, raw.color_frame_number)
-            for channel, number in enumerate(identity):
-                if number < 0 or (
-                    previous_identity is not None and number < previous_identity[channel]
-                ):
-                    raise RuntimeError("RealSense frame identity is invalid or moved backward")
-                if previous_identity is None or number != previous_identity[channel]:
-                    channel_received_ns[channel] = raw.timestamp_ns
-            oldest_received_ns = min(channel_received_ns)
-            if time.monotonic_ns() - oldest_received_ns >= stall_timeout_ns:
-                raise RuntimeError("RealSense stopped producing new RGB or depth")
-            if identity == previous_identity:
+            raw = camera.read()
+            if raw is None:
                 continue
-            previous_identity = identity
+            identity = (raw.depth_frame_number, raw.color_frame_number)
             yield Frame(
                 rgb=raw.rgb,
-                depth_m=raw.depth_aligned_to_color_raw.astype(np.float32) * depth_scale_m,
+                depth_m=raw.depth.astype(np.float32) * depth_scale_m,
                 K=K,
                 distortion_model=intrinsics.distortion_model,
                 distortion_coeffs=intrinsics.distortion_coeffs,
                 source_id=f"realsense:{active_serial}:{identity[0]}:{identity[1]}",
-                timestamp_ns=oldest_received_ns,
+                timestamp_ns=raw.timestamp_ns,
                 clock="host_monotonic_oldest_rgbd_receive",
             )
     finally:
@@ -132,9 +112,6 @@ class RawHandCloudProvider:
 
     def __init__(self, episode, config_path=None, num_points=1024, seed=0):
         from dexmani_real.config import load_experiment_config
-        from dexmani_real.data.raw.camera_geometry import (
-            load_raw_episode_base_from_color,
-        )
         from dexmani_real.data.raw.reader import EpisodeReader
         from dexmani_real.geometry.kinematics import ArmFK
         from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
@@ -165,7 +142,9 @@ class RawHandCloudProvider:
             self.arm_qpos = reader["arm_qpos"][:]
             self.hand_qpos = reader["hand_qpos"][:]
             self.observation_s = reader["timestamp"][:]
-            self.T_base_camera = load_raw_episode_base_from_color(reader)
+            self.T_base_camera = reader.read_camera().T_xarm_base_from_color
+            if self.T_base_camera is None:
+                raise ValueError("hand cloud requires recorded camera extrinsics")
             self.timing = reader.read_timing_rows(
                 ("arm_ns", "hand_ns", "camera_ns", "camera_sequence")
             )

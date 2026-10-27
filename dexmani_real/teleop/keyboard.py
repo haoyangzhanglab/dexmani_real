@@ -1,4 +1,4 @@
-"""Keyboard Cartesian jogging with persistent command targets."""
+"""键盘笛卡尔点动与回零。"""
 
 import logging
 
@@ -33,8 +33,7 @@ from dexmani_real.utils.timing import LoopRate
 logger = logging.getLogger(__name__)
 
 
-class KeyboardTeleopSession:
-    """管理 jog 输入、反馈和机器人资源；命令参考由 JogController 持有。"""
+class KeyboardTeleop:
 
     def __init__(self, runtime, *, no_hand):
         self.runtime = runtime
@@ -172,7 +171,9 @@ class KeyboardTeleopSession:
             if self.robot.stop_required:
                 self.robot.stop()
             try:
-                self.robot.prepare_streaming(epoch, service=lambda: service_feedback(self.robot, self.runtime))
+                self.robot.prepare_streaming(
+                    epoch, service=lambda: service_feedback(self.robot, self.runtime),
+                )
             except OperationCancelled:
                 self.robot.stop()
                 self.jog.clear_reference()

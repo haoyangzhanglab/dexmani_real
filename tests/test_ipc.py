@@ -15,8 +15,8 @@ from dexmani_real.runtime.observation import (
     read_observation,
     read_vr_frame,
 )
-from dexmani_real.sensor.camera.config import CameraParams
-from dexmani_real.sensor.camera.worker import run_camera_worker
+from dexmani_real.sensor.config import CameraConfig
+from dexmani_real.sensor.camera import run_camera_worker
 
 
 def publish_record(ring, record):
@@ -189,7 +189,7 @@ class SharedRingTests(unittest.TestCase):
 class SensorChannelsTests(unittest.TestCase):
     def test_observation_matches_cloud_to_source_camera(self):
         channels = SensorChannels(
-            mp.get_context("spawn"), camera=CameraParams(height=2, width=3),
+            mp.get_context("spawn"), camera=CameraConfig(height=2, width=3),
             vr=True, pointcloud_num_points=4,
         )
         camera = np.zeros((), dtype=channels.camera_ring.dtype)
@@ -233,7 +233,7 @@ class SensorChannelsTests(unittest.TestCase):
         self.assertEqual(row.vr["sequence_id"], 12)
         self.assertEqual(row.vr["ring_sequence"], 1)
         runtime = SimpleNamespace(
-            arm=SimpleNamespace(feedback_max_age_s=1.0), camera=CameraParams(),
+            arm=SimpleNamespace(feedback_max_age_s=1.0), camera=CameraConfig(),
             teleop=SimpleNamespace(vr_stale_threshold_s=0.5),
         )
         issues, deadline = check_observation(row, runtime, needs, require_hand=False, now_ns=200)
@@ -258,7 +258,7 @@ class SensorChannelsTests(unittest.TestCase):
 
 class SensorWorkerTests(unittest.TestCase):
     def setUp(self):
-        self.config = CameraParams(height=2, width=3)
+        self.config = CameraConfig(height=2, width=3)
         self.channels = SensorChannels(
             mp.get_context("spawn"), camera=self.config, pointcloud_num_points=4,
         )
@@ -267,35 +267,36 @@ class SensorWorkerTests(unittest.TestCase):
         frames = list(frames)
         pending = iter(enumerate(frames))
 
-        def read(timeout_ms):
+        def read():
             index, frame = next(pending)
             if index == len(frames) - 1:
                 self.channels.is_running.value = False
             return frame
 
         camera = Mock(active_serial="camera-test")
-        camera.get_depth_scale.return_value = 0.001
-        camera.get_color_intrinsics.return_value.to_dict.return_value = {"width": 3, "height": 2}
+        camera.depth_scale_m = 0.001
+        camera.color_intrinsics.to_dict.return_value = {"width": 3, "height": 2}
         camera.read.side_effect = read
         self.addCleanup(camera.disconnect.assert_called_once)
         with patch.dict("sys.modules", {
-            "dexmani_real.sensor.camera.realsense": SimpleNamespace(
+            "dexmani_real.sensor.realsense": SimpleNamespace(
                 RealSenseCamera=Mock(return_value=camera),
             ),
-        }), patch("dexmani_real.sensor.camera.worker.configure_logging"):
+        }), patch("dexmani_real.sensor.camera.configure_logging"):
             run_camera_worker(self.channels, self.config)
         self.assertFalse(self.channels.camera_ready.is_set())
 
-    def test_camera_preserves_first_receive_times(self):
+    def test_camera_publishes_driver_timestamps_and_skips_empty_reads(self):
         start = time.monotonic_ns() - 1_000_000
-        self.run_camera(
+        frames = [
             SimpleNamespace(
-                depth_frame_number=depth, color_frame_number=color, timestamp_ns=start + index,
+                depth_frame_number=depth, color_frame_number=color, timestamp_ns=start + offset,
                 rgb=np.full((2, 3, 3), color, dtype=np.uint8),
-                depth_aligned_to_color_raw=np.full((2, 3), depth, dtype=np.uint16),
+                depth=np.full((2, 3), depth, dtype=np.uint16),
             )
-            for index, (depth, color) in enumerate(((1, 10), (1, 10), (2, 10), (2, 11)))
-        )
+            for depth, color, offset in ((1, 10, 0), (2, 10, 0), (2, 11, 2))
+        ]
+        self.run_camera([frames[0], None, *frames[1:]])
         self.assertEqual(self.channels.camera_ring.latest_sequence, 3)
         for sequence, stamp, color in ((1, start, 10), (2, start, 10), (3, start + 2, 11)):
             data, _ = self.channels.camera_ring.read(sequence=sequence)
@@ -310,11 +311,10 @@ class SensorWorkerTests(unittest.TestCase):
         frame = SimpleNamespace(
             depth_frame_number=1, color_frame_number=1, timestamp_ns=time.monotonic_ns(),
             rgb=np.zeros((1, 1, 3), dtype=np.uint8),
-            depth_aligned_to_color_raw=np.zeros((2, 3), dtype=np.uint16),
+            depth=np.zeros((2, 3), dtype=np.uint16),
         )
-        with self.assertLogs("dexmani_real.sensor.camera.worker", level="ERROR"):
-            with self.assertRaisesRegex(ValueError, "shape"):
-                self.run_camera([frame])
+        with self.assertRaisesRegex(ValueError, "shape"):
+            self.run_camera([frame])
         self.assertEqual(self.channels.camera_ring.latest_sequence, 0)
         self.assertFalse(self.channels.camera_ready.is_set())
 

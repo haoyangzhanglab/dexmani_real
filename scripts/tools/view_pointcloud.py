@@ -39,7 +39,7 @@ from dexmani_real.utils.visualization import (
 )
 
 if TYPE_CHECKING:
-    from dexmani_real.sensor.camera.realsense import RealSenseCamera
+    from dexmani_real.sensor.realsense import RealSenseCamera
 
 
 TABLE_CALIBRATION_FRAMES = 5
@@ -138,14 +138,16 @@ def benchmark_production_pipeline(
     elapsed_ms: list[float] = []
     end_to_end_ms: list[float] = []
     valid_clouds = 0
-    for _ in range(frame_count):
+    while len(elapsed_ms) < frame_count:
         frame_started = time.perf_counter()
         frame = camera.read()
+        if frame is None:
+            continue
         started = time.perf_counter()
         cloud = build_point_cloud(
-            depth_raw=frame.depth_aligned_to_color_raw,
+            depth_raw=frame.depth,
             color=frame.rgb,
-            depth_scale_m=camera.get_depth_scale(),
+            depth_scale_m=camera.depth_scale_m,
             intrinsics=intrinsics,
             T_xarm_base_from_color=T_xarm_base_from_color,
             table_plane_abcd=table_plane_abcd,
@@ -204,7 +206,7 @@ def print_device_info(camera: RealSenseCamera) -> dict:
     except RuntimeError:
         preset_name = "unknown"
     print(f"  Runtime preset: {preset} {preset_name}")
-    print(f"  Depth scale:    {camera.get_depth_scale():.6f} (raw_uint16 x scale = meters)")
+    print(f"  Depth scale:    {camera.depth_scale_m:.6f} (raw_uint16 x scale = meters)")
 
     print("\n  --- Sensor read-back ---")
     for name in SENSOR_OPTION_NAMES:
@@ -221,17 +223,18 @@ def capture_frame(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Capture one aligned frame and return RGB and raw/metric depth."""
     print("\nCapturing depth-to-color aligned RGBD frame...")
-    frame = camera.read()
+    while (frame := camera.read()) is None:
+        pass
 
     rgb = frame.rgb
-    depth_raw = frame.depth_aligned_to_color_raw
-    depth_m = frame.depth_aligned_to_color_raw.astype(np.float32) * camera.get_depth_scale()
+    depth_raw = frame.depth
+    depth_m = frame.depth.astype(np.float32) * camera.depth_scale_m
     if rgb.shape[:2] != depth_raw.shape:
         raise RuntimeError("aligned RGB and depth frame dimensions do not match")
 
     print(f"  RGB:     shape={rgb.shape}, dtype={rgb.dtype}")
     print(f"  Depth:   shape={depth_m.shape}, valid={int((depth_m > 0).sum())}/{depth_m.size}")
-    print(f"  Depth scale: {camera.get_depth_scale():.6f} m")
+    print(f"  Depth scale: {camera.depth_scale_m:.6f} m")
 
     return rgb, depth_raw, depth_m
 
@@ -268,9 +271,11 @@ def calibrate_table_plane(
     input("  Press Enter to capture calibration frames...")
 
     depth_frames: list[np.ndarray] = []
-    for _ in range(frame_count):
+    while len(depth_frames) < frame_count:
         frame = camera.read()
-        depth_frames.append(frame.depth_aligned_to_color_raw)
+        if frame is None:
+            continue
+        depth_frames.append(frame.depth)
 
     point_batches: list[np.ndarray] = []
     lower = np.asarray(config.workspace[:3], dtype=np.float32)
@@ -278,7 +283,7 @@ def calibrate_table_plane(
     for depth_raw in depth_frames:
         points = aligned_depth_points_in_base(
             depth_raw=depth_raw,
-            depth_scale_m=camera.get_depth_scale(),
+            depth_scale_m=camera.depth_scale_m,
             aligned_depth_intrinsics=intrinsics,
             T_xarm_base_from_color=T_xarm_base_from_color,
             config=config,
@@ -319,7 +324,7 @@ def run_pointcloud_diagnostic(args) -> int:
     """执行相机诊断、可选桌面拟合与快照输出。"""
     import rerun as rr
 
-    from dexmani_real.sensor.camera.realsense import RealSenseCamera
+    from dexmani_real.sensor.realsense import RealSenseCamera
 
     save_dir = (
         None if args.save_dir is None else args.save_dir.expanduser().resolve()
@@ -354,12 +359,12 @@ def run_pointcloud_diagnostic(args) -> int:
         print_depth_stats(depth_m, VIS_DEPTH_MIN_M, VIS_DEPTH_MAX_M)
         rr.set_time_sequence("capture", 0)
         log_rgbd(
-            rgb, depth_raw, depth_scale_m=camera.get_depth_scale(),
+            rgb, depth_raw, depth_scale_m=camera.depth_scale_m,
             depth_range_m=(VIS_DEPTH_MIN_M, VIS_DEPTH_MAX_M),
         )
         input("在 Rerun 查看 RGB-D，按 Enter 继续...")
 
-        intrinsics = camera.get_color_intrinsics()
+        intrinsics = camera.color_intrinsics
         T_xarm_base_from_color = load_extrinsics(camera_info, calibration)
         log_camera_geometry(intrinsics, T_xarm_base_from_color)
         log_workspace(pcd_config.workspace)
@@ -392,7 +397,7 @@ def run_pointcloud_diagnostic(args) -> int:
         rgb, depth_raw, _ = capture_frame(camera)
         rr.set_time_sequence("capture", 1)
         log_rgbd(
-            rgb, depth_raw, depth_scale_m=camera.get_depth_scale(),
+            rgb, depth_raw, depth_scale_m=camera.depth_scale_m,
             depth_range_m=(VIS_DEPTH_MIN_M, VIS_DEPTH_MAX_M),
         )
 
@@ -401,7 +406,7 @@ def run_pointcloud_diagnostic(args) -> int:
         result = build_point_cloud(
             depth_raw=depth_raw,
             color=rgb,
-            depth_scale_m=camera.get_depth_scale(),
+            depth_scale_m=camera.depth_scale_m,
             intrinsics=intrinsics,
             T_xarm_base_from_color=T_xarm_base_from_color,
             config=pcd_config,
@@ -415,7 +420,7 @@ def run_pointcloud_diagnostic(args) -> int:
             raw_cloud = build_raw_point_cloud(
                 depth_raw=depth_raw,
                 color=rgb,
-                depth_scale_m=camera.get_depth_scale(),
+                depth_scale_m=camera.depth_scale_m,
                 intrinsics=intrinsics,
                 T_xarm_base_from_color=T_xarm_base_from_color,
             )
@@ -427,7 +432,7 @@ def run_pointcloud_diagnostic(args) -> int:
                 depth_raw=depth_raw,
                 raw_point_cloud=raw_cloud,
                 processed_point_cloud=result,
-                depth_scale_m=camera.get_depth_scale(),
+                depth_scale_m=camera.depth_scale_m,
                 intrinsics=intrinsics,
                 T_xarm_base_from_color=T_xarm_base_from_color,
                 table_plane_abcd=table_plane_abcd,

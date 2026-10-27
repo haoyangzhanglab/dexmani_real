@@ -1,5 +1,3 @@
-"""Small evaluation summaries; no recorder, model, or device ownership."""
-
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +14,7 @@ def error_detail(stage, error):
 
 
 class SessionResults:
-    """Create an incomplete session summary before motion; update it after revocation."""
+    """运动前创建未完成摘要，撤销运动后写入本轮结果。"""
 
     def __init__(self, directory, kind):
         self.path = Path(directory) / "session_result.json"
@@ -73,7 +71,9 @@ class SessionResults:
 
     def record_inference(self, result):
         self.record_duration("prediction_total", result.completed_ns - result.started_ns)
-        build_end = result.completed_ns if result.model_started_ns is None else result.model_started_ns
+        build_end = (
+            result.completed_ns if result.model_started_ns is None else result.model_started_ns
+        )
         self.record_duration("observation_build", build_end - result.started_ns)
         if result.model_started_ns is not None:
             self.record_duration("inference", result.completed_ns - result.model_started_ns)

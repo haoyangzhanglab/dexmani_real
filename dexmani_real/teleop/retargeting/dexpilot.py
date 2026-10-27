@@ -1,15 +1,9 @@
-"""DexPilot retargeting from right-hand landmarks to SDK-order joint angles."""
+"""DexPilot 指尖向量拟合，输出 SDK 顺序的关节角。"""
 
-from __future__ import annotations
-
-import logging
-
-import nlopt
 import numpy as np
 from dex_retargeting.optimizer import DexPilotOptimizer
 from dex_retargeting.optimizer_utils import LPFilter
 from dex_retargeting.robot_wrapper import RobotWrapper
-from dex_retargeting.seq_retarget import SeqRetargeting
 
 from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
@@ -17,97 +11,56 @@ from dexmani_real.robot.model import (
     XHAND_RIGHT_URDF_PATH,
     XHAND_SDK_JOINT_NAMES,
 )
-from dexmani_real.teleop.config import DexPilotRetargetingParams
+from dexmani_real.teleop.config import DexPilotConfig
 from dexmani_real.teleop.retargeting.landmarks import prepare_landmarks
 
-logger = logging.getLogger(__name__)
 
-
-class StrictDexPilotOptimizer(DexPilotOptimizer):
-    """Propagate solver failures rather than substituting a previous target."""
-
-    def retarget(
-        self,
-        ref_value: np.ndarray,
-        fixed_qpos: np.ndarray,
-        last_qpos: np.ndarray,
-    ) -> np.ndarray:
-        if len(fixed_qpos) != len(self.idx_pin2fixed):
-            raise ValueError(
-                f"Optimizer has {len(self.idx_pin2fixed)} joints but "
-                f"non_target_qpos {fixed_qpos} is given"
-            )
-        objective_fn = self.get_objective_function(
-            ref_value,
-            fixed_qpos,
-            np.asarray(last_qpos, dtype=np.float32),
-        )
-        self.opt.set_min_objective(objective_fn)
-        qpos = self.opt.optimize(last_qpos)
-        return np.asarray(qpos, dtype=np.float32)
-
-
-class DexPilotHandRetargeter:
-    def __init__(
-        self,
-        dexpilot_config: DexPilotRetargetingParams,
-    ):
-        dexpilot_config.validate()
-        self.pinky_scale = float(dexpilot_config.pinky_scale)
-        self.pinky_palm_scale = float(dexpilot_config.pinky_palm_scale)
+class DexPilotRetargeter:
+    def __init__(self, config: DexPilotConfig):
+        config.validate()
+        self.config = config
         robot = RobotWrapper(str(XHAND_RIGHT_URDF_PATH))
-        optimizer = StrictDexPilotOptimizer(
-            robot,
-            list(XHAND_SDK_JOINT_NAMES),
+        self.optimizer = DexPilotOptimizer(
+            robot, list(XHAND_SDK_JOINT_NAMES),
             finger_tip_link_names=list(XHAND_FINGERTIP_LINK_NAMES),
             wrist_link_name="right_hand_link",
-            scaling=dexpilot_config.scaling_factor,
-            project_dist=dexpilot_config.project_dist_m,
-            escape_dist=dexpilot_config.escape_dist_m,
+            scaling=config.scaling_factor,
+            project_dist=config.project_dist_m,
+            escape_dist=config.escape_dist_m,
         )
-        self.retargeter = SeqRetargeting(
-            optimizer,
-            has_joint_limits=True,
-            lp_filter=LPFilter(dexpilot_config.low_pass_alpha),
-        )
+        self.limits = robot.joint_limits[self.optimizer.idx_pin2target]
+        self.optimizer.set_joint_limit(self.limits)
+        self.landmark_pairs = self.optimizer.target_link_human_indices
+        self.fixed_qpos = np.empty(0, dtype=np.float32)
+        self.filter = LPFilter(config.low_pass_alpha)
+        self.reset()
 
-        self.landmark_pair_indices = self.retargeter.optimizer.target_link_human_indices
+    def reset(self, initial_qpos=None):
+        qpos = self.limits.mean(axis=1) if initial_qpos is None else initial_qpos
+        qpos = np.asarray(qpos, dtype=np.float32)
+        if qpos.shape != HAND_JOINT_SHAPE or not np.isfinite(qpos).all():
+            raise ValueError("DexPilot initial_qpos must be a finite (12,) array")
+        self.previous_solution = qpos.copy()
+        self.filter.reset()
+        self.optimizer.projected[:] = False
 
-        retargeter_joint_names = self.retargeter.optimizer.robot.dof_joint_names
-        self.model_to_sdk_indices = np.array(
-            [retargeter_joint_names.index(name) for name in XHAND_SDK_JOINT_NAMES], dtype=np.intp
-        )
-        self.sdk_to_model_indices = np.argsort(self.model_to_sdk_indices)
-
-    def retarget(self, landmarks: np.ndarray | None) -> np.ndarray | None:
-        """Invalid geometry/roundoff returns None; other solver errors propagate."""
+    def retarget(self, landmarks):
         mano = prepare_landmarks(
-            landmarks,
-            pinky_scale=self.pinky_scale,
-            pinky_palm_scale=self.pinky_palm_scale,
+            landmarks, pinky_scale=self.config.pinky_scale,
+            pinky_palm_scale=self.config.pinky_palm_scale,
         )
         if mano is None:
             return None
-        ref_value = mano[self.landmark_pair_indices[1]] - mano[self.landmark_pair_indices[0]]
-        try:
-            qpos = self.retargeter.retarget(ref_value, fixed_qpos=np.array([]))
-        except nlopt.RoundoffLimited:
-            logger.warning("Retargeting roundoff limit reached — no target produced")
-            return None
+        reference = (mano[self.landmark_pairs[1]] - mano[self.landmark_pairs[0]]).astype(np.float32)
+        seed = np.clip(self.previous_solution, self.limits[:, 0], self.limits[:, 1])
 
-        return qpos[self.model_to_sdk_indices]
-
-    def reset(self, initial_qpos: np.ndarray | None = None) -> None:
-        """Reset optimizer, filter, projection state, and optional warm start."""
-        self.retargeter.reset()
-        self.retargeter.filter.reset()
-        self.retargeter.optimizer.projected[:] = False
-
-        if initial_qpos is not None and initial_qpos.shape == HAND_JOINT_SHAPE:
-            qpos = np.asarray(initial_qpos, dtype=np.float32)
-            if np.all(np.isfinite(qpos)):
-                qpos_retargeter = qpos[self.sdk_to_model_indices]
-                idx = self.retargeter.optimizer.idx_pin2target
-                self.retargeter.last_qpos = qpos_retargeter[idx]
-            else:
-                logger.warning("initial_qpos contains NaN/Inf — falling back to neutral seed")
+        # 直接求解，避免上游 retarget() 捕获 RuntimeError 后返回旧目标。
+        objective = self.optimizer.get_objective_function(
+            reference, self.fixed_qpos, seed.astype(np.float32),
+        )
+        self.optimizer.opt.set_min_objective(objective)
+        qpos = np.asarray(self.optimizer.opt.optimize(seed), dtype=np.float32)
+        if qpos.shape != HAND_JOINT_SHAPE or not np.isfinite(qpos).all():
+            raise ValueError("DexPilot solver must return a finite (12,) array")
+        self.previous_solution = qpos
+        return self.filter.next(qpos.astype(np.float64))

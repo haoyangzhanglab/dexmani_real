@@ -1,5 +1,3 @@
-"""HTS receiver with cancellable reads and right-hand observation publication."""
-
 import logging
 import time
 from contextlib import closing
@@ -7,7 +5,7 @@ from contextlib import closing
 import numpy as np
 
 from dexmani_real.geometry.pose import normalize_quat_wxyz, xyzw_to_wxyz
-from dexmani_real.sensor.vr.config import VRParams
+from dexmani_real.sensor.config import VRConfig
 from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -20,13 +18,7 @@ def finite_vector(value, shape, name):
     return array
 
 
-def uint64(value):
-    if not 0 <= value < 2**64:
-        raise ValueError("VR timestamp/sequence is outside uint64 range")
-    return np.uint64(value)
-
-
-def run_vr_worker(shared, config: VRParams) -> None:
+def run_vr_worker(shared, config: VRConfig) -> None:
     """接收 HTS 事件，保留头部状态并发布右手观测。"""
     configure_logging()
     from hand_tracking_sdk import (
@@ -48,9 +40,7 @@ def run_vr_worker(shared, config: VRParams) -> None:
                 if isinstance(event, HeadFrame):
                     try:
                         position = finite_vector(
-                            unity_left_to_flu_position(
-                                event.head.x, event.head.y, event.head.z
-                            ),
+                            unity_left_to_flu_position(event.head.x, event.head.y, event.head.z),
                             (3,),
                             "head_pos",
                         )
@@ -62,14 +52,11 @@ def run_vr_worker(shared, config: VRParams) -> None:
                             ),
                             name="head_quat_wxyz",
                         )
-                        stamp = uint64(event.recv_ts_ns)
-                        if stamp == 0:
-                            raise ValueError("head receive timestamp must be positive")
                     except ValueError:
                         logger.warning("Invalid VR head pose rejected", exc_info=True)
                         continue
                     head_pos, head_quat_wxyz = position, rotation
-                    head_recv_ts_ns = stamp
+                    head_recv_ts_ns = event.recv_ts_ns
                     continue
                 if not isinstance(event, HandFrame) or event.side != HandSide.RIGHT:
                     continue
@@ -89,15 +76,10 @@ def run_vr_worker(shared, config: VRParams) -> None:
                         (21, 3),
                         "landmarks",
                     )
-                    # The older HTS component's receive time bounds freshness of both.
-                    recv_ts_ns = min(
-                        uint64(event.wrist_recv_ts_ns), uint64(event.landmarks_recv_ts_ns)
-                    )
-                    sequence_id = uint64(event.sequence_id)
                 except ValueError:
                     logger.warning("Invalid VR hand frame rejected", exc_info=True)
                     continue
-                # IPC errors are worker failures, not malformed sensor payloads.
+                # IPC 写入失败属于 worker 故障，不能当作坏包跳过。
                 shared.vr_ring.write(
                     wrist_pos=wrist_pos,
                     wrist_quat_wxyz=wrist_quat,
@@ -105,8 +87,8 @@ def run_vr_worker(shared, config: VRParams) -> None:
                     head_pos=head_pos,
                     head_quat_wxyz=head_quat_wxyz,
                     head_recv_ts_ns=head_recv_ts_ns,
-                    recv_ts_ns=recv_ts_ns,
-                    sequence_id=sequence_id,
+                    recv_ts_ns=min(event.wrist_recv_ts_ns, event.landmarks_recv_ts_ns),
+                    sequence_id=event.sequence_id,
                 )
                 if not shared.vr_ready.is_set():
                     shared.vr_ready.set()
@@ -116,7 +98,7 @@ def run_vr_worker(shared, config: VRParams) -> None:
     logger.info("VR receiver exited")
 
 
-def iter_vr_events(shared, config: VRParams):
+def iter_vr_events(shared, config: VRConfig):
     from hand_tracking_sdk import (
         HandFrameAssembler,
         ParseError,
@@ -134,28 +116,22 @@ def iter_vr_events(shared, config: VRParams):
 
     mode = TransportMode(config.transport)
     if mode == TransportMode.UDP:
-        receiver = UDPLineReceiver(
-            UDPReceiverConfig(config.host, config.port, timeout_s=1.0)
-        )
+        receiver = UDPLineReceiver(UDPReceiverConfig(config.host, config.port, timeout_s=1.0))
     elif mode == TransportMode.TCP_SERVER:
         receiver = TCPServerLineReceiver(
-            TCPServerConfig(
-                config.host, config.port, accept_timeout_s=1.0, read_timeout_s=1.0
-            )
+            TCPServerConfig(config.host, config.port, accept_timeout_s=1.0, read_timeout_s=1.0)
         )
     else:
         receiver = TCPClientLineReceiver(
-            TCPClientConfig(
-                config.host, config.port, connect_timeout_s=1.0, read_timeout_s=1.0
-            )
+            TCPClientConfig(config.host, config.port, connect_timeout_s=1.0, read_timeout_s=1.0)
         )
-    # Filter hands at publication so heading calibration still receives head packets.
+    # 发布时过滤左右手，保留 heading 标定需要的头部包。
     assembler = HandFrameAssembler(include_wall_time=False, include_head_frames=True)
     if not shared.is_running.value:
         return
     with receiver:
         logger.info("VR receiver opened: %s port=%d", mode.value, config.port)
-        # recv_line exposes timeouts so an idle/disconnected stream cannot hide shutdown.
+        # 使用有期限的单次读取，空闲连接也能响应退出。
         while shared.is_running.value:
             try:
                 line = receiver.recv_line()

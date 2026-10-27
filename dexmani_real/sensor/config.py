@@ -1,22 +1,16 @@
-"""Camera capture parameters and derived host freshness budget."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-import numpy as np
 
 OBSERVATION_MAX_AGE_PERIODS = 4
 
 
 @dataclass(frozen=True)
-class CameraParams:
+class CameraConfig:
     serial: str | None = None
     width: int = 640
     height: int = 480
     fps: int = 30
-    warmup_frames: int = 10
-    source_stall_timeout_s: float = 2.0
     l515_visual_preset: int = 5
     l515_confidence_threshold: int | None = None
 
@@ -33,19 +27,7 @@ class CameraParams:
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"camera {name} must be a positive integer")
-        if type(self.warmup_frames) is not int or self.warmup_frames < 0:
-            raise ValueError("camera warmup_frames must be a nonnegative integer")
-        if (
-            not np.isfinite(self.source_stall_timeout_s)
-            or self.source_stall_timeout_s <= self.max_frame_age_s
-        ):
-            raise ValueError(
-                "camera source_stall_timeout_s must be finite and greater than derived max frame age"
-            )
-        if (
-            type(self.l515_visual_preset) is not int
-            or not 0 <= self.l515_visual_preset <= 5
-        ):
+        if type(self.l515_visual_preset) is not int or not 0 <= self.l515_visual_preset <= 5:
             raise ValueError("camera l515_visual_preset must be an integer in [0, 5]")
         if self.l515_confidence_threshold is not None and (
             type(self.l515_confidence_threshold) is not int
@@ -56,3 +38,16 @@ class CameraParams:
             not isinstance(self.serial, str) or not self.serial.strip()
         ):
             raise ValueError("camera serial must be a non-empty string or None")
+
+
+@dataclass(frozen=True)
+class VRConfig:
+    transport: str = "tcp_server"
+    host: str = "0.0.0.0"
+    port: int = 8000
+
+    def validate(self) -> None:
+        if not self.transport or not self.host:
+            raise ValueError("VR transport and host must be non-empty")
+        if not (1 <= self.port <= 65535):
+            raise ValueError("VR port must be in [1, 65535]")

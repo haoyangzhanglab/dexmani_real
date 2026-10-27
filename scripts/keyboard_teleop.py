@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--control-hz", type=float, default=None, help="Keyboard target frequency")
     args = parser.parse_args(argv)
 
-    from dexmani_real.teleop.keyboard_session import KeyboardTeleopSession
+    from dexmani_real.teleop.keyboard import KeyboardTeleop
 
     runtime = load_experiment_config(
         yaml_path=args.config,
@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
             "keyboard_teleop.control_hz": args.control_hz,
         },
     )
-    return KeyboardTeleopSession(runtime, no_hand=args.no_hand).run()
+    return KeyboardTeleop(runtime, no_hand=args.no_hand).run()
 
 
 if __name__ == "__main__":
