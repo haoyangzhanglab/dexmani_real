@@ -1,4 +1,4 @@
-"""One model thread owns inference and cleanup independently of device I/O."""
+"""单线程串行执行模型操作，与设备 I/O 独立。"""
 
 import logging
 import time
@@ -43,17 +43,21 @@ class InferenceWorker:
                 self.model = self.model_factory()
                 value = self.model.warmup(**kwargs)
             elif operation == "predict":
-                # This worker exclusively owns observation FK workspaces and the model.
                 observation = self.build_observation(args[0])
                 model_start = time.monotonic_ns()
                 value = self.model.predict(observation, **kwargs)
-            elif operation != "close" or self.model is not None:
-                if operation == "reset_episode" and self.reset_observation is not None:
+            elif operation == "reset_episode":
+                if self.reset_observation is not None:
                     self.reset_observation()
-                value = getattr(self.model, operation)(*args, **kwargs)
+                value = self.model.reset_episode()
+            elif operation == "close":
+                if self.model is not None:
+                    value = self.model.close()
+            else:
+                raise ValueError(f"Unknown model operation: {operation}")
         except BaseException as exc:
             error = exc
-        # Completion includes the blocking transfer to an owned CPU NumPy prediction.
+        # 完成时间包含预测结果到 CPU 的阻塞传输。
         return ModelResult(value, error, start, time.monotonic_ns(), query_context, model_start)
 
     def submit(self, operation, *args, query_context=None, **kwargs):
@@ -70,45 +74,37 @@ class InferenceWorker:
         return operation, future.result()
 
     def close(self):
-        """Request serial close without waiting on running CUDA; process exit is not bounded."""
+        """排队关闭模型；不能强制中断在途 CUDA 调用。"""
         if self.close_future is not None:
             return self.close_future
 
-        # Capture ownership before poll() can reclaim the finished task during shutdown.
+        # 在 poll() 回收任务前保留其身份与结果。
         retired_future, retired_operation = self.future, self.operation
 
         def close_model():
             retired = None
             if retired_future is not None:
+                result = retired_future.result()
+                error = result.error
                 retired = dict(
-                    operation=retired_operation, query_context=None,
-                    exception_type=None, message=None, started_ns=None, completed_ns=None,
+                    operation=retired_operation, query_context=result.query_context,
+                    exception_type=type(error).__name__ if error is not None else None,
+                    message=str(error) if error is not None else None,
+                    started_ns=result.started_ns, completed_ns=result.completed_ns,
                 )
-                try:
-                    result = retired_future.result()
-                    retired.update(
-                        query_context=result.query_context,
-                        started_ns=result.started_ns, completed_ns=result.completed_ns,
-                    )
-                    error = result.error
-                except BaseException as exc:
-                    error = exc
-                if error is not None:
-                    retired.update(exception_type=type(error).__name__, message=str(error))
                 logger.log(
                     logging.ERROR if error is not None else logging.INFO,
                     "retired model task after shutdown: %s", retired,
                 )
-            # A failed retired task must not prevent the model's own cleanup attempt.
+            # 迟到任务失败后仍需关闭模型。
             return self.run_operation("close", (), {}), retired
 
-        # Cleanup follows the current model task on the same worker thread.
         self.close_future = self.executor.submit(close_model)
         self.executor.shutdown(wait=False, cancel_futures=False)
         return self.close_future
 
     def close_result(self, timeout_s=0.0):
-        """Report close and retired-task failures; timeout leaves cleanup pending."""
+        """超时保持 pending，并报告关闭与迟到任务的错误。"""
         if self.close_future is None:
             return dict(status="pending", reason="close_not_requested")
         try:
@@ -116,6 +112,7 @@ class InferenceWorker:
         except TimeoutError:
             return dict(status="pending", reason="model_close_wait_timeout")
         except BaseException as exc:
+            # 等待被中断也记为清理失败，允许会话结果落盘。
             return dict(status="failed", reason=f"{type(exc).__name__}: {exc}")
         outcome = dict(
             status="completed" if result.error is None else "failed",

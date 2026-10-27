@@ -1,4 +1,4 @@
-"""Own deployment resources, operator input and the multi-round experiment session."""
+"""管理模型、设备与多轮策略实验。"""
 
 import logging
 import multiprocessing as mp
@@ -17,13 +17,12 @@ from dexmani_real.data.recorder import (
     RecordingError,
 )
 from dexmani_real.data.session_results import SessionResults, error_detail
-from dexmani_real.deployment.config import DEFAULT_NUM_EPISODES
-from dexmani_real.deployment.policy_observation import (
+from dexmani_real.deployment.observation import (
     build_observation_camera,
     build_observation_kinematics,
     build_policy_observation,
 )
-from dexmani_real.deployment.rollout.episode import PolicyEpisode, failure_reason
+from dexmani_real.deployment.rollout import PolicyRollout, failure_reason
 from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.system import DexManiRobot
@@ -50,8 +49,6 @@ MODEL_STARTUP_TIMEOUT_S = 300.0
 
 
 class PolicySession:
-    """Own deployment resources while the inference worker serializes model work."""
-
     def __init__(
         self,
         runtime,
@@ -60,15 +57,15 @@ class PolicySession:
         control_needs,
         record_needs,
         dependencies,
-        results_dir,
+        output_dir,
         run_config,
-        device="cuda:0",
-        seed=0,
-        max_running_s=None,
-        num_episodes=DEFAULT_NUM_EPISODES,
-        recording_dir=None,
-        camera_calibration_path=None,
-        table_plane_abcd=None,
+        device,
+        seed,
+        max_running_s,
+        num_episodes,
+        record_raw,
+        camera_calibration_path,
+        table_plane_abcd,
     ):
         self.run_config = run_config
         self.runtime = runtime
@@ -78,8 +75,8 @@ class PolicySession:
         self.seed = seed
         self.max_running_s = max_running_s
         self.num_episodes = num_episodes
-        self.recording_dir = recording_dir
-        self.results_dir = results_dir
+        self.record_raw = record_raw
+        self.output_dir = output_dir
         self.camera_calibration_path = camera_calibration_path
         self.control_needs, self.record_needs = control_needs, record_needs
         self.dependencies = dependencies
@@ -94,7 +91,6 @@ class PolicySession:
         self.recorder_result_index: int | None = None
 
     def run(self):
-        """Run a session with required evaluation results and optional Raw recording."""
         configure_logging()
         print(
             f"执行：{self.info.checkpoint_path.name} ({self.info.weights}) | NFE={self.info.inference_steps} | "
@@ -102,11 +98,11 @@ class PolicySession:
             f"{1.0 / self.info.control_dt_s:g} Hz"
         )
         print("正在初始化模型和设备…", flush=True)
-        self.results = SessionResults(self.results_dir, "policy")
+        self.results = SessionResults(self.output_dir, "policy")
         self.runtime_state = self.sensors = self.robot = None
         self.model = self.recorder = None
         failure = None
-        clean = False
+        reason = RunEndReason.RUNTIME_SHUTDOWN
         try:
             self.prepare_resources()
             self.start_devices()
@@ -116,22 +112,38 @@ class PolicySession:
                 flush=True,
             )
             self.run_control_loop()
-            clean = bool(
-                self.runtime_state.quit_requested
-                and not self.runtime_state.estop_request
-                and not self.runtime_state.error_state
-            )
         except KeyboardInterrupt as exc:
+            failure, reason = exc, RunEndReason.ESTOP
             if self.runtime_state is not None:
                 self.runtime_state.request_emergency_stop()
-            failure = exc
         except Exception as exc:
-            failure = exc
+            failure, reason = exc, failure_reason(exc)
             if self.runtime_state is not None:
                 self.runtime_state.mark_error()
+                self.runtime_state.end_session(reason=reason)
+            if self.sensors is not None:
+                self.sensors.request_shutdown()
             logger.exception("policy session failed")
         finally:
-            exit_code = self.close(clean=clean, failure=failure)
+            try:
+                self.advance_episode(shutdown=True, failure=failure, reason=reason)
+            except BaseException as exc:
+                failure = failure or exc
+                logger.exception("episode cleanup failed")
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
+                elif isinstance(exc, Exception):
+                    self.runtime_state.mark_error()
+                else:
+                    raise
+            finally:
+                clean = bool(
+                    self.runtime_state is not None
+                    and self.runtime_state.quit_requested
+                    and not self.runtime_state.estop_request
+                    and not self.runtime_state.error_state
+                )
+                exit_code = self.close(clean=clean, failure=failure)
         return exit_code
 
     def prepare_resources(self):
@@ -141,7 +153,7 @@ class PolicySession:
 
         if self.needs.point_cloud or "camera_extrinsic" in self.info.observation_fields:
             self.camera_calibration = CameraExtrinsics(self.camera_calibration_path)
-        elif self.recording_dir is not None:
+        elif self.record_raw:
             self.camera_calibration = load_optional_camera_extrinsics(self.camera_calibration_path)
         else:
             self.camera_calibration = None
@@ -202,7 +214,7 @@ class PolicySession:
             self.runtime.execution.execution_mode,
             self.runtime.execution.prefetch_steps,
             self.runtime.execution.rtc_guidance_cap,
-            self.recording_dir is not None,
+            self.record_raw,
         )
         self.action_mapper = ActionMapper.for_mode(
             self.info.action_mode, arm=self.runtime.arm, hand=self.runtime.hand,
@@ -262,7 +274,7 @@ class PolicySession:
                 "translation_units": "m",
             }
             atomic_yaml_dump(
-                self.run_config, self.results_dir / "run_config.yaml",
+                self.run_config, self.output_dir / "run_config.yaml",
             )
         if self.needs.point_cloud:
             from dexmani_real.perception.worker import run_pointcloud_worker
@@ -280,7 +292,6 @@ class PolicySession:
                 may_start=lambda: self.keyboard.healthy and self.runtime_state.requests_allow_motion(),
             )
         if self.needs.camera_static and self.needs.camera == "none" and not self.needs.point_cloud:
-            # Policy 无 VR worker，此分支只持有已初始化的相机。
             if not self.sensors.shutdown(deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S):
                 raise RuntimeError("static camera failed to close normally")
             self.sensors.channels = None
@@ -290,7 +301,7 @@ class PolicySession:
     def close(self, *, clean, failure):
         shutdown_clean = False
         model_close = dict(status="completed", reason="model_not_created")
-        # Sensor joins and model cleanup share the remaining budget; SDK/recorder calls may exceed it.
+        # 传感进程与模型共享退出期限，SDK 和录制调用可能超出该期限。
         shutdown_deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
         cleanup_errors = []
         if self.runtime_state is not None:
@@ -306,17 +317,16 @@ class PolicySession:
         if self.model is not None:
             try:
                 self.model.close()
-                # close() owns late task reclamation, including the immutable query identity.
+                # 模型关闭流程接管迟到任务的回收。
                 if self.episode is not None and self.episode.termination is not None:
                     self.episode = None
             except Exception as exc:
                 cleanup_errors.append(error_detail("model_close_submit", exc))
         try:
             if self.recorder is not None:
-                # Episode 已结束也不能丢失仍在退出的 writer。
+                # 单轮已结束时，writer 仍可能持有待写数据。
                 try:
                     self.recorder.close()
-                    self.recorder.check_error()
                 except Exception as exc:
                     cleanup_errors.append(error_detail("recorder_close", exc))
             if self.runtime_state is not None:
@@ -400,13 +410,12 @@ class PolicySession:
         logger.debug("Model warmup durations: %s", completion[1].value)
 
     def request_stop(self, *, reason=RunEndReason.OPERATOR) -> None:
-        """Fence motion even while the I/O owner is blocked in HOME, inference or SDK I/O."""
+        """阻塞操作期间也立即撤销运动权限。"""
         with self.runtime_state.motion_lock:
             self.start_epoch = None
             self.runtime_state.request_stop(reason=reason)
 
     def request_quit(self) -> None:
-        """Apply Q's motion fence before requesting session shutdown."""
         with self.runtime_state.motion_lock:
             self.start_epoch = None
             self.runtime_state.request_quit()
@@ -421,10 +430,9 @@ class PolicySession:
         )
 
     def handle_command_batch(self, signals, *, allow_tactile_reset=False) -> None:
-        # HOME blocks; H/B/T from the same batch need a fresh request afterwards.
         discard_preparation_in_batch = False
         home_handled_in_batch = False
-        # S/Q suppress H/B/T throughout the batch; ESC uses the latch/callback.
+        # S/Q 压制同批 H/B/T，ESC 由锁存和回调优先处理。
         stop_in_batch = any(signal in {"s", "q"} for signal in signals)
         for signal in signals:
             if signal == "b":
@@ -437,7 +445,7 @@ class PolicySession:
                     )
                     continue
             elif signal == "s":
-                # Keyboard callbacks already revoked motion; a second revoke could cross a cleared stop request.
+                # 回调已撤权，不能再次撤销后续代际。
                 continue
             elif signal == "d":
                 logger.warning("operator: D is not used in policy deployment; ignored")
@@ -446,7 +454,6 @@ class PolicySession:
                     logger.warning("operator: ignored T after preparation in the same batch")
                     continue
                 discard_preparation_in_batch = True
-                # B earlier in this batch may have created a pending start.
                 if stop_in_batch or self.start_epoch is not None or not allow_tactile_reset:
                     logger.warning(
                         "T ignored: tactile reset requires idle, no capture/reset/pending inference"
@@ -474,7 +481,6 @@ class PolicySession:
                     home_handled_in_batch = True
                     discard_preparation_in_batch = True
             elif signal == "q":
-                # Listener stays available through final recording cleanup.
                 continue
             elif signal == "esc":
                 self.runtime_state.request_emergency_stop()
@@ -487,7 +493,6 @@ class PolicySession:
                 required_safety_state=SafetyState.ARMED,
             )
             if home_allowed:
-                # Only the owner consumes S; HOME never clears a newer stop.
                 self.start_epoch = None
         if not home_allowed:
             logger.warning("operator: ignored H unless ARMED without shutdown, fault or stop")
@@ -532,7 +537,7 @@ class PolicySession:
             logger.info("已回初始位，按 B 开始。")
         else:
             logger.warning("回初始位未完成，请检查当前姿态：%s", result.reason)
-        # Discard stale H/B/T after blocking HOME; preserve S/Q/ESC.
+        # HOME 阻塞期间积累的准备按键失效，保留停止与退出请求。
         self.keyboard.discard_events("t", "h", "b")
         return True
 
@@ -572,15 +577,14 @@ class PolicySession:
                 if self.recorder.is_recording or self.recorder.writer_pending:
                     raise RecordingError("previous capture still owns resources")
             self.recorder = (
-                EpisodeRecorder(self.recording_dir, control_hz=1.0 / self.info.control_dt_s)
-                if self.recording_dir is not None else None
+                EpisodeRecorder(self.output_dir, control_hz=1.0 / self.info.control_dt_s)
+                if self.record_raw else None
             )
-            # 本会话串行创建轮次；prepare() 将为此 recorder 开始下一条结果。
-            # episode 结束后可释放其控制状态，但 recorder 与结果的关联保留到关闭。
+            # recorder 与结果的对应关系保留到会话关闭，供最终核对发布状态。
             self.recorder_result_index = (
                 len(self.results.session["episodes"]) + 1 if self.recorder is not None else None
             )
-            self.episode = PolicyEpisode(
+            self.episode = PolicyRollout(
                 self.runtime_state,
                 self.runtime,
                 self.info,
@@ -590,7 +594,7 @@ class PolicySession:
                 control_needs=self.control_needs, record_needs=self.record_needs,
                 dependencies=self.dependencies,
                 action_mapper=self.action_mapper,
-                model_runtime=self.model,
+                model=self.model,
                 max_running_s=self.max_running_s,
                 query_ids=self.query_ids,
                 capture_ids=self.capture_ids,
@@ -634,46 +638,27 @@ class PolicySession:
                         self.runtime_state.requests_allow_motion()
                     ):
                         print("等待下一轮：整理场景后 H 回初始位 → B 开始；Q 退出。", flush=True)
-            # A finished attempt still owns reset/predict identity until poll() reclaims it.
+            # 结束后仍保留任务身份，直到 poll() 回收模型结果。
             if ended is not None and not self.model.has_pending_task:
                 self.episode = None
 
     def run_control_loop(self):
-        failure = None
-        reason = RunEndReason.RUNTIME_SHUTDOWN
-        try:
-            while self.runtime_state.running and not self.runtime_state.quit_requested:
-                self.robot.arm.check_error()
-                self.poll_operator(
-                    allow_tactile_reset=(
-                        self.episode is None and not self.model.has_pending_task
-                        and (self.recorder is None or not self.recorder.is_recording)
-                    )
+        while self.runtime_state.running and not self.runtime_state.quit_requested:
+            self.robot.arm.check_error()
+            self.poll_operator(
+                allow_tactile_reset=(
+                    self.episode is None and not self.model.has_pending_task
+                    and (self.recorder is None or not self.recorder.is_recording)
                 )
-                if self.runtime_state.estop_request or self.runtime_state.error_state:
-                    break
-                if self.episode is None or self.episode.run_id is None:
-                    self.robot.service_idle()
-                    if not self.robot.stop_required and (
-                        self.episode is None or self.episode.termination is not None
-                    ):
-                        self.runtime_state.acknowledge_stop(self.runtime_state.run_id)
-                self.advance_episode()
-                running = self.episode is not None and self.episode.run_id is not None
-                time.sleep(0.001 if running else 0.005)
-        except KeyboardInterrupt as exc:
-            self.runtime_state.request_emergency_stop()
-            failure, reason = exc, RunEndReason.ESTOP
-        except Exception as exc:
-            failure, reason = exc, failure_reason(exc)
-            self.runtime_state.mark_error()
-            self.runtime_state.end_session(reason=reason)
-            self.sensors.request_shutdown()
-        finally:
-            try:
-                self.advance_episode(shutdown=True, failure=failure, reason=reason)
-            except BaseException as exc:
-                failure = failure or exc
-                logger.exception("episode cleanup failed")
-        if failure is not None:
-            raise failure
+            )
+            if self.runtime_state.estop_request or self.runtime_state.error_state:
+                break
+            if self.episode is None or self.episode.run_id is None:
+                self.robot.service_idle()
+                if not self.robot.stop_required and (
+                    self.episode is None or self.episode.termination is not None
+                ):
+                    self.runtime_state.acknowledge_stop(self.runtime_state.run_id)
+            self.advance_episode()
+            running = self.episode is not None and self.episode.run_id is not None
+            time.sleep(0.001 if running else 0.005)

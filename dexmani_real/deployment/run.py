@@ -6,7 +6,7 @@ import json
 import math
 import subprocess
 import time
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 
 from dexmani_real.calibration import CAMERAS_PATH
@@ -14,9 +14,12 @@ from dexmani_real.calibration.table_plane import (
     resolve_table_plane,
     resolve_table_plane_path,
 )
-from dexmani_real.deployment.config import DEFAULT_MAX_RUNNING_S, DEFAULT_NUM_EPISODES
-from dexmani_real.deployment.policy_observation import policy_dependencies, policy_needs
-from dexmani_real.deployment.preflight import validate_deployment_config
+from dexmani_real.deployment.config import (
+    DEFAULT_MAX_RUNNING_S,
+    DEFAULT_NUM_EPISODES,
+    resolve_deployment_config,
+)
+from dexmani_real.deployment.observation import policy_dependencies, policy_needs
 from dexmani_real.deployment.session import PolicySession
 from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.utils.atomic_io import atomic_yaml_dump
@@ -71,7 +74,6 @@ def run_policy(
     output=None,
     camera_calibration_path=None,
 ) -> int:
-    """Inspect, resolve and run one evaluation session from CLI or Python."""
     if max_running_s is not None:
         if isinstance(max_running_s, bool):
             raise TypeError("max_running_s must be a finite positive number or None")
@@ -85,12 +87,10 @@ def run_policy(
             raise ValueError("num_episodes must be a positive integer")
 
     from dexmani_policy.common.config import load_experiment_config
-    from dexmani_policy.common.experiments import (
-        resolve_checkpoint_path,
-        resolve_milestone_path,
-    )
+    from dexmani_policy.common.experiments import resolve_milestone_path
     from dexmani_policy.deployment import inspect_policy
     from dexmani_policy.deployment.metadata import resolve_experiment
+    from dexmani_policy.evaluation.config import resolve_checkpoint_path
 
     directory = resolve_experiment(experiment)
     cfg = load_experiment_config(directory)
@@ -109,10 +109,6 @@ def run_policy(
         directory, checkpoint=checkpoint_path, weights=weights,
         inference_steps=defaults["inference_steps"] if inference_steps is None else inference_steps,
     )
-    action_steps = runtime.execution.action_steps
-    if action_steps is None:
-        action_steps = info.n_action_steps
-    runtime = replace(runtime, execution=replace(runtime.execution, action_steps=action_steps))
     dependencies = policy_dependencies(info.observation_fields)
     control_needs = policy_needs(dependencies)
     record_needs = (
@@ -120,18 +116,10 @@ def run_policy(
         if record_raw else ObservationNeeds()
     )
     needs = control_needs.union(record_needs)
-    cloud_recipe, hand_cloud_recipe = validate_deployment_config(info, runtime, needs=needs)
-    if cloud_recipe is not None or hand_cloud_recipe is not None:
-        runtime = replace(
-            runtime,
-            pointcloud=cloud_recipe if cloud_recipe is not None else runtime.pointcloud,
-            hand_pointcloud=(
-                hand_cloud_recipe if hand_cloud_recipe is not None else runtime.hand_pointcloud
-            ),
-        )
+    runtime = resolve_deployment_config(info, runtime, needs)
     table_plane_abcd = resolve_table_plane(
         runtime.environment.table,
-        required=runtime.environment.table.enabled or (cloud_recipe is not None and cloud_recipe.remove_table),
+        required=runtime.environment.table.enabled or (needs.point_cloud and runtime.pointcloud.remove_table),
     )
 
     camera_calibration_path = Path(camera_calibration_path or CAMERAS_PATH).expanduser().resolve()
@@ -179,8 +167,8 @@ def run_policy(
         seed=seed,
         max_running_s=max_running_s,
         num_episodes=num_episodes,
-        recording_dir=session_dir if record_raw else None,
-        results_dir=session_dir,
+        record_raw=record_raw,
+        output_dir=session_dir,
         camera_calibration_path=camera_calibration_path,
         table_plane_abcd=table_plane_abcd,
         run_config=payload,

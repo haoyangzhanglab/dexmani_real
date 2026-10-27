@@ -26,13 +26,13 @@ from dexmani_real.data.raw.schema import (
     TACTILE_UNITS,
 )
 from dexmani_real.data.raw.writer import EpisodeWriter
-from dexmani_real.deployment.policy_observation import (
+from dexmani_real.deployment.observation import (
     PolicyObservationRow,
     build_observation_kinematics,
     build_policy_observation,
     policy_dependencies,
 )
-from dexmani_real.deployment.preflight import _restore_cloud_config
+from dexmani_real.deployment.config import _restore_cloud_config
 from dexmani_real.geometry.camera import (
     CameraIntrinsics,
     CameraSnapshot,
@@ -322,7 +322,7 @@ class PointCloudTests(unittest.TestCase):
         rows = [
             PolicyObservationRow(
                 123,
-                (123,),
+                123,
                 {"arm_qpos": arm, "hand_qpos": hand, "point_cloud": published["point_cloud"]},
             )
         ]

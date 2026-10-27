@@ -1,4 +1,4 @@
-"""Absolute-deadline loop-rate control with overrun accounting."""
+"""绝对时钟调度与来源时效判断。"""
 
 from __future__ import annotations
 
@@ -10,14 +10,9 @@ logger = logging.getLogger(__name__)
 
 
 class LoopRate:
-    """Sleep to absolute deadlines without catch-up bursts."""
+    """按绝对期限等待，超时后不突发补步。"""
 
-    def __init__(
-        self,
-        target_hz: float,
-        *,
-        label: str,
-    ) -> None:
+    def __init__(self, target_hz: float, *, label: str) -> None:
         if not math.isfinite(target_hz) or target_hz <= 0:
             raise ValueError(f"target_hz must be positive, got {target_hz}")
         self.label = label
@@ -27,7 +22,6 @@ class LoopRate:
         self.missed_slot_count = 0
 
     def wait(self) -> None:
-        """Re-anchor after a missed period; this polling grid does not define data time."""
         now = time.perf_counter()
         remaining = self.next_deadline - now
 
@@ -38,48 +32,43 @@ class LoopRate:
             if final_remaining > 0.0:
                 time.sleep(final_remaining)
             self.next_deadline += self.period
+            return
+
+        lateness = -remaining
+        self.missed_slot_count += int((lateness + self.period * 1e-12) // self.period)
+        if lateness > 1.0:
+            self.next_deadline = now + self.period
+            self.overdue_throttle = 0
+            return
+
+        if self.overdue_throttle <= 0:
+            logger.warning(
+                "Loop deadline missed: loop=%s period_ms=%.1f "
+                "deadline_lateness_ms=%.1f missed_total=%d",
+                self.label,
+                self.period * 1000,
+                lateness * 1000,
+                self.missed_slot_count,
+            )
+            self.overdue_throttle = 50
         else:
-            lateness = -remaining
-            self.missed_slot_count += int((lateness + self.period * 1e-12) // self.period)
+            self.overdue_throttle -= 1
 
-            if lateness > 1.0:
-                self.next_deadline = now + self.period
-                self.overdue_throttle = 0
-            else:
-                if self.overdue_throttle <= 0:
-                    logger.warning(
-                        "Loop deadline missed: loop=%s period_ms=%.1f "
-                        "deadline_lateness_ms=%.1f missed_total=%d",
-                        self.label,
-                        self.period * 1000,
-                        lateness * 1000,
-                        self.missed_slot_count,
-                    )
-                    self.overdue_throttle = 50
-                else:
-                    self.overdue_throttle -= 1
-
-                if lateness >= self.period:
-                    # Missed a full slot or more: re-anchor to now (no catch-up burst)
-                    self.next_deadline = now + self.period
-                else:
-                    # Small overrun: keep the absolute grid, next tick absorbs it
-                    self.next_deadline += self.period
+        self.next_deadline = (now if lateness >= self.period else self.next_deadline) + self.period
 
     def reset(self) -> None:
-        """Re-anchor deadline/warning state after blocking work such as HOME."""
-        now = time.perf_counter()
-        self.next_deadline = now + self.period
+        """在 HOME 等阻塞操作后重置期限。"""
+        self.next_deadline = time.perf_counter() + self.period
         self.overdue_throttle = 0
 
 
 def next_tick_ns(planned_ns, period_ns, now_ns):
-    """Next future point of the absolute grid; never burst-send missed points."""
+    """跳到时钟网格的下一个未来时刻，不补发已错过的点。"""
     return planned_ns + max(1, (now_ns - planned_ns) // period_ns + 1) * period_ns
 
 
 def sampling_clock_ns(control_hz):
-    """Integer grid and dt/4 export tolerance; not a control-stop threshold."""
+    """整数采样周期及 dt/4 导出容差。"""
     if not math.isfinite(control_hz) or control_hz <= 0:
         raise ValueError("control_hz must be finite and positive")
     dt_ns = round(1e9 / control_hz)
@@ -90,4 +79,5 @@ def sampling_clock_ns(control_hz):
 
 def sample_is_fresh(timestamp_ns, max_age_s, now_ns=None):
     now = time.monotonic_ns() if now_ns is None else now_ns
-    return 0 < int(timestamp_ns) <= now and now - int(timestamp_ns) <= int(max_age_s * 1e9)
+    stamp = int(timestamp_ns)
+    return 0 < stamp <= now and now - stamp <= int(max_age_s * 1e9)

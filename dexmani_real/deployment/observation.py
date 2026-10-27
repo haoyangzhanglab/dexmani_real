@@ -1,4 +1,4 @@
-"""Fixed policy dependencies and projections of admitted physical rows."""
+"""从已校验的传感快照构造策略观测。"""
 
 import math
 from dataclasses import dataclass, field
@@ -62,11 +62,11 @@ class ObservationKinematics:
 @dataclass(frozen=True)
 class PolicyObservationRow:
     observation_timestamp_ns: int
-    source_times: tuple[int, ...]
+    source_timestamp_ns: int
     values: Mapping
 
 
-def policy_source_times(row, dependencies):
+def policy_source_timestamp(row, dependencies):
     times = []
     for source, stamp in (
         ("arm", int(row.arm["timestamp_ns"][0])),
@@ -79,8 +79,8 @@ def policy_source_times(row, dependencies):
             times.append(stamp)
     if "camera" in dependencies:
         times.append(int(row.camera["timestamp_ns"]))
-    # Static parameters do not expire, but a decision still uses real control feedback.
-    return tuple(times) or (int(row.arm["timestamp_ns"][0]), int(row.hand["timestamp_ns"][0]))
+    # 静态输入仍使用本轮机械臂和手的真实反馈时间。
+    return min(times or (int(row.arm["timestamp_ns"][0]), int(row.hand["timestamp_ns"][0])))
 
 
 def project_policy_row(row, fields, dependencies):
@@ -91,7 +91,7 @@ def project_policy_row(row, fields, dependencies):
         values["hand_qpos"] = row.hand["qpos"][0].copy()
     for name in fields:
         if name == "finger_tactile_force":
-            # A structured-field view would retain the recording-only dense payload.
+            # 独立复制，避免聚合触觉视图持有仅供录制的稠密载荷。
             values[name] = row.hand["tactile_aggregate"][0].copy()
         elif name == "taxel_tactile_force":
             values[name] = row.hand["tactile_dense"][0]
@@ -100,12 +100,12 @@ def project_policy_row(row, fields, dependencies):
         elif name in {"rgb", "depth"}:
             values[name] = row.camera[name]
     return PolicyObservationRow(
-        row.observation_timestamp_ns, policy_source_times(row, dependencies), freeze(values),
+        row.observation_timestamp_ns, policy_source_timestamp(row, dependencies), freeze(values),
     )
 
 
 def build_observation_kinematics(dependencies, *, fingertip_link_names, hand, hand_pointcloud):
-    """Build requested geometry once; the inference worker owns all FK workspaces."""
+    """按需构造 FK 工作区，由推理线程独占。"""
     if "arm_fk" not in dependencies:
         return None
     if "hand_fk" not in dependencies:
@@ -125,7 +125,6 @@ def build_observation_kinematics(dependencies, *, fingertip_link_names, hand, ha
 
 
 def build_observation_camera(camera, fields, *, depth_config=None):
-    """使用按策略需求准入的相机快照，核对实测深度尺度并构造静态输入。"""
     requested = set(fields) & {"depth", "camera_intrinsic", "camera_extrinsic"}
     if not requested:
         return {}
@@ -189,10 +188,4 @@ def build_policy_observation(rows, fields, dependencies, *, kinematics=None, cam
             if "arm_fk" in FIELD_DEPENDENCIES[name]:
                 arrays[name] = np.stack([cache[r.observation_timestamp_ns][name] for r in rows])
 
-    result = {}
-    for name in fields:
-        values = np.ascontiguousarray(arrays[name])
-        if values.dtype.kind == "f" and not np.isfinite(values).all():
-            raise ValueError(f"Nonfinite policy observation {name}")
-        result[name] = values
-    return result
+    return {name: arrays[name] for name in fields}

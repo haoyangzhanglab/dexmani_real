@@ -1,4 +1,4 @@
-"""One Policy attempt owns preparation, control, capture and its first termination."""
+"""单轮策略执行：准备、预测、控制与录制收尾。"""
 
 import logging
 import time
@@ -14,18 +14,16 @@ from dexmani_real.data.recorder import (
     snapshot_recording_metadata,
 )
 from dexmani_real.data.session_results import error_detail
-from dexmani_real.deployment.policy_observation import (
+from dexmani_real.deployment.observation import (
     project_policy_row,
 )
-from dexmani_real.deployment.rollout.action_schedule import (
+from dexmani_real.deployment.schedule import (
     ControlRejection,
     PolicyQuery,
     control_slot,
-    decision_expires_at_ns,
     handoff_plan,
     plan_rejection,
     prefetch_handoff,
-    rtc_prefix_request,
     run_budget,
 )
 from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
@@ -59,7 +57,7 @@ class EpisodeEnd:
     duration_s: float
 
 
-class PolicyEpisode:
+class PolicyRollout:
     def __init__(
         self,
         runtime_state,
@@ -73,7 +71,7 @@ class PolicyEpisode:
         dependencies,
         sensors,
         action_mapper,
-        model_runtime,
+        model,
         max_running_s,
         query_ids,
         capture_ids,
@@ -91,7 +89,7 @@ class PolicyEpisode:
         self.dependencies = dependencies
         self.needs = control_needs.union(record_needs)
         self.action_mapper = action_mapper
-        self.model = model_runtime
+        self.model = model
         self.recorder = recorder
         self.results = results
         self.camera_snapshot = camera_snapshot
@@ -114,7 +112,6 @@ class PolicyEpisode:
         self.max_decision_age_ns = int(self.execution.max_decision_age_s * 1e9)
         self.started_ns = self.next_step_ns = 0
         self.previous_arm = None
-        # Cleared before enqueue: a failed/partial writer submission must not be retried.
         self.pending_frame = None
 
     def read_observation(self, *, wait_for_hand=False):
@@ -171,7 +168,7 @@ class PolicyEpisode:
             reason_name = "preparation_failed" if self.preparation_issue or errors else "start_cancelled"
         else:
             reason_name = reason.name.lower()
-        # The first end owns all business finalization, even if cleanup later raises.
+        # 首次终止即固定结果，收尾失败也不能重复提交。
         self.termination = EpisodeEnd(epoch, reason_name, detail, duration_s)
         self.run_id = None
         self.plan = None
@@ -293,7 +290,7 @@ class PolicyEpisode:
                 task_label=self.policy_info.task_name,
                 episode_name=f"episode_{capture_id:03d}", collection_source="policy_rollout", metadata=metadata,
             )
-        # START and mode restoration can block; each boundary requires fresh feedback.
+        # 录制启动和设备模式恢复可能阻塞，之后分别读取新反馈。
         if self.start_observation() is None:
             self.finish(self.preparation_issue)
             return
@@ -355,7 +352,7 @@ class PolicyEpisode:
         query.result = result.value
 
     def retired_model_error(self, operation, result):
-        # An ended episode remains immutable; an unknown model state fences the session.
+        # 已结束轮次不再改写；迟到模型错误终止整个会话。
         self.runtime_state.mark_error()
         detail = dict(
             error_detail("retired_model", result.error), operation=operation,
@@ -369,17 +366,19 @@ class PolicyEpisode:
             f"{type(result.error).__name__}: {result.error}"
         )
 
-    def submit(self, rows, slot, *, handoff_slot=None, prefix=None, commands=None):
+    def submit(self, slot, *, handoff_slot=None, prefix=None, commands=None):
         now = time.monotonic_ns()
         authorized, expired = self.has_motion_authority(), self.expired_budget()
         if expired is not None:
             return ControlRejection(f"{expired[1]}_timeout", RunEndReason.TIMEOUT)
         if not authorized:
             return ControlRejection("query_authority_revoked")
-        sources = rows[-1].source_times
-        expires_at_ns = decision_expires_at_ns(sources, now, self.max_decision_age_ns)
-        self.results.record_duration("source_age", now - min(sources))
-        if expires_at_ns is None:
+        rows = tuple(self.history)
+        source_ns = rows[-1].source_timestamp_ns
+        # 来源时间已校验；+1 保持 age <= budget 的整数纳秒边界。
+        expires_at_ns = source_ns + self.max_decision_age_ns + 1
+        self.results.record_duration("source_age", now - source_ns)
+        if now >= expires_at_ns:
             return ControlRejection("query_sources_invalid_or_expired")
         if prefix is not None and now >= self.plan.expires_at_ns:
             return ControlRejection("prefix_decision_expired")
@@ -391,14 +390,14 @@ class PolicyEpisode:
         initial_hand_history = None
         if self.hand_history is not None:
             if not self.hand_history:
-                # Match training's episode-initial measured pose, before the first query action.
+                # 与训练时一致，初始历史使用 float32 精度的实测手姿。
                 hand = rows[-1].values["hand_qpos"].astype(np.float32).astype(np.float64)
                 if hand.shape != (12,) or not np.isfinite(hand).all():
                     return ControlRejection("invalid_hand_history_bootstrap")
                 initial_hand_history = tuple(
                     hand.copy() for _ in range(self.hand_history.maxlen)
                 )
-            # The model thread owns this snapshot; later appends/reset cannot change it.
+            # 推理持有独立历史快照，不受后续提交或重置影响。
             kwargs["action_context"] = {
                 "hand_history": np.stack(
                     self.hand_history if initial_hand_history is None else initial_hand_history
@@ -406,7 +405,7 @@ class PolicyEpisode:
             }
         self.model.submit(
             "predict",
-            tuple(rows),
+            rows,
             query_context=dict(run_id=self.run_id, query_id=query.query_id),
             **kwargs,
         )
@@ -418,8 +417,9 @@ class PolicyEpisode:
         return None
 
     def prepare_prefix(self, row, slot):
-        """Prepare the whole guidance tail and d physical commands without committing either."""
-        prefix, slots = rtc_prefix_request(self.plan, slot, self.execution.prefetch_steps)
+        """先计算引导尾部与冻结命令，预测成功提交后再提交冻结状态。"""
+        prefix = self.plan.actions[slot - self.plan.anchor_slot:].copy()
+        slots = range(slot, slot + self.execution.prefetch_steps)
         commands, previous = {}, self.previous_arm
         for index, command_slot in enumerate(slots):
             self.robot.check()
@@ -441,12 +441,12 @@ class PolicyEpisode:
         return prefix, commands, None
 
     def record_pending(self):
+        # 入队前取走待写帧，部分提交失败后也不重试。
         frame, self.pending_frame = self.pending_frame, None
         if self.recorder is not None and frame is not None:
             self.recorder.append(*frame)
 
     def map_command(self, action, row, previous, *, context="action"):
-        """Map one policy action to a checked joint command."""
         action = np.asarray(action, dtype=np.float64)
         mode = self.policy_info.action_mode
         intent = (
@@ -538,19 +538,18 @@ class PolicyEpisode:
             return
         self.previous_arm = command.arm_qpos
         if self.hand_history is not None:
-            # Normal submission updates action context; it does not prove delivery.
+            # 提交正常返回后更新动作历史，不代表设备已到位。
             self.hand_history.append(command.hand_qpos.copy())
         self.wait_started_ns = None
         self.record_pending()
         if slot + 1 == plan.segment_end and self.execution.execution_mode == "sync":
             self.plan = None
 
-    def submit_prefetch(self, row, rows, slot):
+    def submit_prefetch(self, row, slot):
         handoff_slot, issue = prefetch_handoff(
             self.plan, slot=slot, mode=self.execution.execution_mode,
             prefetch_steps=self.execution.prefetch_steps,
-            query_pending=self.query is not None, model_pending=self.model.has_pending_task,
-            history_ready=bool(rows),
+            query_pending=self.query is not None,
         )
         if issue is not None or handoff_slot is None:
             return issue
@@ -560,7 +559,7 @@ class PolicyEpisode:
             if issue is not None:
                 return issue
         return self.submit(
-            rows, slot, handoff_slot=handoff_slot, prefix=prefix, commands=commands
+            slot, handoff_slot=handoff_slot, prefix=prefix, commands=commands
         )
 
     def step(self):
@@ -637,7 +636,6 @@ class PolicyEpisode:
             self.finish(issue)
             return
         self.history.append(project_policy_row(row, self.policy_info.observation_fields, self.dependencies))
-        rows = tuple(self.history) if len(self.history) == self.history.maxlen else ()
         new_plan, issue = handoff_plan(
             self.query, run_id=self.run_id, slot=slot,
             mode=self.execution.execution_mode, action_steps=self.execution.action_steps,
@@ -653,8 +651,11 @@ class PolicyEpisode:
             if self.wait_started_ns is None:
                 self.wait_started_ns = now
                 self.robot.arm.limit_execution_until(now + int(self.execution.max_wait_s * 1e9))
-            if rows and self.query is None and not self.model.has_pending_task:
-                issue = self.submit(rows, slot)
+            if (
+                len(self.history) == self.history.maxlen
+                and self.query is None and not self.model.has_pending_task
+            ):
+                issue = self.submit(slot)
                 if issue is not None:
                     self.finish(
                         issue.detail, run_end_reason=issue.run_end_reason
@@ -662,18 +663,16 @@ class PolicyEpisode:
                     return
             self.record_pending()
         else:
-            # Exhausted sync/RTC segments cannot prefetch; async also checks its live tail/age.
             issue = plan_rejection(
                 self.plan, slot, self.execution.execution_mode, time.monotonic_ns()
             )
             if issue is not None:
                 self.finish(issue.detail)
                 return
-            issue = self.submit_prefetch(row, rows, slot)
+            issue = self.submit_prefetch(row, slot)
             if issue is not None:
                 self.finish(issue.detail, run_end_reason=issue.run_end_reason)
                 return
-            # Pending prefetch never suspends a still-valid current plan.
             self.execute_slot(row, slot, feedback_until_ns)
         if (expired := self.expired_budget()) is not None:
             self.finish_budget(expired)

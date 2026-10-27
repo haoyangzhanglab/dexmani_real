@@ -59,6 +59,7 @@ def log_rgbd(rgb, depth_raw, *, depth_scale_m, depth_range_m=None):
 
     if not np.isfinite(depth_scale_m) or depth_scale_m <= 0:
         raise ValueError("display depth scale must be finite and positive")
+
     rr.log("camera/color/rgb", rr.Image(rgb, color_model="RGB"))
     rr.log(
         "depth/image",
@@ -79,8 +80,9 @@ def log_points(path, points, *, colors=None, radii=0.003):
         return
     if points.ndim != 2 or points.shape[1] not in (3, 6):
         raise ValueError("display points must have shape (N, 3) or (N, 6)")
+
     if points.shape[1] == 6:
-        # 点云处理已将 uint8 RGB 归一化；此处只转换为显示格式。
+        # XYZRGB 中的颜色已归一化，此处恢复为显示格式。
         colors = (points[:, 3:] * 255.0).astype(np.uint8)
     rr.log(path, rr.Points3D(points[:, :3], colors=colors, radii=radii))
 
@@ -91,6 +93,7 @@ def log_series(path, values=None, *, labels=None):
     if labels is not None:
         for index, label in enumerate(labels):
             rr.log(f"{path}/{index}", rr.SeriesLine(name=label), static=True)
+
     if values is not None:
         for index, value in enumerate(np.atleast_1d(values)):
             rr.log(f"{path}/{index}", rr.Scalar(float(value)))

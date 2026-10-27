@@ -1,4 +1,4 @@
-"""Pure Policy scheduling; the episode supplies clocks and handles execution I/O."""
+"""sync、async 与 RTC 的动作窗口调度。"""
 
 from dataclasses import dataclass
 
@@ -10,7 +10,7 @@ from dexmani_real.runtime.state import RunEndReason
 
 @dataclass
 class PolicyQuery:
-    """slot anchors the observation; handoff_slot is the earliest planned takeover."""
+    """slot 是观测锚点，handoff_slot 是最早交接时刻。"""
 
     query_id: int
     run_id: int
@@ -22,7 +22,7 @@ class PolicyQuery:
 
 @dataclass
 class ActionPlan:
-    """actions index from anchor_slot; async may consume the tail past nominal segment_end."""
+    """actions 从 anchor_slot 索引，async 可继续使用 segment_end 后的有效尾部。"""
 
     actions: np.ndarray
     anchor_slot: int
@@ -33,18 +33,8 @@ class ActionPlan:
 
 @dataclass(frozen=True)
 class ControlRejection:
-    """A scheduling/target decision; only the episode owner applies termination."""
-
     detail: str
     run_end_reason: RunEndReason = RunEndReason.EXECUTOR_BOUNDARY
-
-
-def decision_expires_at_ns(timestamps, now_ns, max_age_ns):
-    """An exclusive deadline preserves age <= budget on the integer-nanosecond clock."""
-    if not timestamps or any(stamp <= 0 or stamp > now_ns for stamp in timestamps):
-        return None
-    expires_at_ns = min(timestamps) + max_age_ns + 1
-    return expires_at_ns if now_ns < expires_at_ns else None
 
 
 def handoff_plan(
@@ -85,7 +75,7 @@ def handoff_plan(
 
 
 def prefetch_handoff(
-    plan, *, slot, mode, prefetch_steps, query_pending, model_pending, history_ready,
+    plan, *, slot, mode, prefetch_steps, query_pending,
 ):
     if mode == "sync":
         return None, None
@@ -95,15 +85,13 @@ def prefetch_handoff(
             return None, None
     elif slot != prefetch_slot:
         return None, None
-    if query_pending or model_pending:
+    if query_pending:
         return None, None if mode == "async" else ControlRejection("prefetch_unavailable")
-    if not history_ready:
-        return None, ControlRejection("prefetch_unavailable")
     return plan.segment_end, None
 
 
 def control_slot(*, now_ns, next_step_ns, last_slot, dt_ns, synchronous, resume_ready):
-    """Return the due slot, next deadline and missed count without catch-up sends."""
+    """返回到期控制步与下一期限，不补发错过的动作。"""
     if synchronous and resume_ready:
         next_step_ns = min(next_step_ns, now_ns)
     if now_ns < next_step_ns:
@@ -122,7 +110,7 @@ def run_budget(*, run_id, started_ns, max_running_s, wait_started_ns, max_wait_s
             deadlines.append((started_ns + int(max_running_s * 1e9), "duration"))
         if wait_started_ns is not None:
             deadlines.append((wait_started_ns + int(max_wait_s * 1e9), "wait"))
-    # WAIT wins a tie: no action was supplied before its strict deadline.
+    # 同时到期时优先报告等待超时。
     return min(deadlines, key=lambda item: (item[0], item[1] != "wait")) if deadlines else None
 
 
@@ -135,8 +123,3 @@ def plan_rejection(plan, slot, mode, now_ns):
     elif slot >= plan.segment_end:
         return ControlRejection("plan_exhausted_without_handoff")
     return None
-
-
-def rtc_prefix_request(plan, slot, prefetch_steps):
-    """Owned guidance tail plus the slots whose physical commands must be committed."""
-    return plan.actions[slot - plan.anchor_slot:].copy(), range(slot, slot + prefetch_steps)

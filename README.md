@@ -49,7 +49,7 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 核心实现位于 [`dexmani_real/`](dexmani_real/)，实验入口与设备工具集中在 [`scripts/`](scripts/)；[`assets/`](assets/) 存放机器人模型等资源，[`third_party/`](third_party/) 包含第三方相关代码。
 
-部署保留 `deployment/run.py → session.py → rollout/episode.py`：入口装配配置，会话持有设备和模型，单轮协调观测、提交与录制。`rollout/action_schedule.py` 只根据传入的时钟与状态决定 sync/async/RTC 调度，`inference.py` 独占模型线程。回放的帧索引一致性指标位于 [`replay/consistency.py`](dexmani_real/replay/consistency.py)。
+部署沿 `deployment/run.py → session.py → rollout.py` 执行：`config.py` 统一解析与校验执行配置，会话持有设备和模型，`PolicyRollout` 协调单轮观测、提交与录制。`schedule.py` 根据时钟与状态决定 sync/async/RTC 调度，`observation.py` 按需组装输入，`inference.py` 独占模型线程。来源时效在观测入口检查，策略输入的数值与形状在 `dexmani_policy` 边界检查；历史快照仅在提交预测时创建。回放的帧索引一致性指标位于 [`replay/consistency.py`](dexmani_real/replay/consistency.py)。
 
 `control/constraints.py` 统一等价角、绝对跳变和 `MotionConstraints` 端点约束。`control/ik.py` 的 `IKSolver` 接收共享约束、位置和旋转容差，`solve(..., hand_qpos=...)` 显式指定碰撞手姿；动作映射、键盘 jog 和相机标定共用这一接口。
 
@@ -57,7 +57,7 @@ IK 保留上一命令、实测状态及正负零空间初值；评分只使用�
 
 `geometry` 中，`camera.py` 负责内参与反投影，`pose.py` 负责位姿与刚体变换，`kinematics.py` 提供 `ArmFK`、`HandFK`，`plane.py` 拟合桌面。`perception/pointcloud.py` 将 RGB-D 经深度边缘过滤、工作空间与桌面裁剪、体素均值、半径去噪和 QuickFPS 转为基座系 XYZRGB；`hand.py` 生成指尖与固定手表面点云，`worker.py` 发布在线点云。诊断快照与性能测量位于 `scripts/tools/view_pointcloud.py`。
 
-点云参数集中在 `perception/config.py`。`table_margin_m` 是点到向上桌面平面的最小距离，默认 7 mm；该范围内的低矮物体表面也会被裁掉。点数不足时循环已有点，空点云不发布。Canonical 保存完整实验参数，部署按保存参数恢复；旧版连通域、双阈值桌面配置及采样描述字段不再接受，需要重新导出数据并重新训练受影响的 checkpoint。诊断快照直接写入独立目录，失败时可能保留部分文件。
+点云参数集中在 `perception/config.py`。`table_margin_m` 是点到向上桌面平面的最小距离，默认 7 mm；该范围内的低矮物体表面也会被裁掉。点数不足时循环已有点，空点云不发布。Canonical 保存完整实验参数，部署按保存参数恢复；参数缺失或与当前定义不符时，须重新导出数据并重新训练受影响的 checkpoint。诊断快照直接写入独立目录，失败时可能保留部分文件。
 
 单阈值裁剪对桌面标定残差更敏感。可根据实验物体高度和当前标定调整 YAML 中的 `pointcloud.table_margin_m`；增大余量会减少桌面残留，也会裁掉更多低矮表面。离线导出和查看在配置入口校验手部安装位姿，指尖名称与 SDK→URDF 关节顺序由 `HandFK` 核对。
 
@@ -144,7 +144,7 @@ ruff check --no-cache --isolated --select E9,F dexmani_real scripts tests third_
 mypy --ignore-missing-imports --follow-imports silent --explicit-package-bases \
   dexmani_real/ipc dexmani_real/sensor \
   dexmani_real/geometry dexmani_real/perception dexmani_real/control dexmani_real/robot \
-  dexmani_real/calibration dexmani_real/runtime dexmani_real/deployment \
+  dexmani_real/calibration dexmani_real/runtime dexmani_real/deployment dexmani_real/utils \
   dexmani_real/data/canonical \
   dexmani_real/data/session_results.py dexmani_real/data/raw/reader.py \
   dexmani_real/teleop dexmani_real/config.py dexmani_real/replay/replayer.py \
@@ -160,6 +160,8 @@ mypy 按现有类型标注检查上述模块，不检查未标注函数体或外
 `tests/test_teleop.py` 检查 VR 映射、EMA 提交时机、TAG 梯度、DexPilot 数值等价及求解错误传播，并用假设备和播放器覆盖停止、录制收尾与音频抢占；还需遥操作原有的 NLopt 和 dex_retargeting 依赖。
 
 `tests/test_geometry.py` 与 `tests/test_perception.py` 检查坐标约定、畸变反投影、桌面拟合、采样以及在线和离线几何一致性；导出测试使用实际 HDF5、视频和 Zarr，覆盖完整参数恢复、坏数据立即报错和显式排除。`tests/test_sensor.py` 使用假 SDK 检查来源时间、去重、停滞、资源释放和 VR 接收；`tests/test_data.py` 检查批量写盘、失败保留、显式丢弃及发布超时。
+
+`tests/test_deployment.py` 使用假设备和可控模型结果检查三种调度、LAMP 历史、来源期限、初始化失败、迟到推理和收尾，核对 checkpoint 选择、配置恢复与实验结果字段，并通过已安装的 `dexmani_policy` 验证策略输入边界。`tests/test_utils.py` 检查原子写入、stdout 恢复和计时超期；这些测试均不连接硬件。
 
 键盘遥操作入口保留 `--help`，没有 `--print-config` 参数。
 

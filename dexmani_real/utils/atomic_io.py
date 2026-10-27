@@ -1,4 +1,4 @@
-"""Same-filesystem publication helpers for repository artifacts."""
+"""实验产物的原子写入与发布。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 def target_is_occupied(path: str | Path) -> bool:
-    """Treat files, directories, and dangling symlinks as occupied targets."""
+    """文件、目录和悬空符号链接均视为已占用。"""
     target = Path(path)
     return target.exists() or target.is_symlink()
 
@@ -24,7 +24,7 @@ def atomic_publish(src: str | Path, dst: str | Path) -> Path:
     target = Path(dst)
     if source.parent.resolve() != target.parent.resolve():
         raise OSError("temporary and final artifacts must share one parent filesystem")
-    # RENAME_NOREPLACE atomically checks occupancy; exists() cannot prevent publication races.
+    # RENAME_NOREPLACE 同时检查占用并发布，避免 exists() 检查后的竞争。
     if sys.platform != "linux":
         raise OSError(errno.ENOSYS, "atomic publication requires Linux renameat2")
     source_bytes, target_bytes = os.fsencode(source), os.fsencode(target)
@@ -36,7 +36,7 @@ def atomic_publish(src: str | Path, dst: str | Path) -> Path:
         raise OSError(errno.ENOSYS, "atomic publication requires libc renameat2") from exc
     rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
     rename.restype = ctypes.c_int
-    # AT_FDCWD = -100; RENAME_NOREPLACE = 1. No overwrite-capable fallback.
+    # AT_FDCWD = -100，RENAME_NOREPLACE = 1。
     if rename(-100, source_bytes, -100, target_bytes, 1) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), str(target))
@@ -53,9 +53,8 @@ def atomic_yaml_dump(obj: object, path: str | Path) -> Path:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             yaml.safe_dump(obj, stream, allow_unicode=True, sort_keys=False)
         os.replace(temporary, target)
-    except BaseException:
-        os.unlink(temporary)
-        raise
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     return target
 
 
@@ -75,17 +74,13 @@ def atomic_json_dump(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(obj, stream, indent=2, ensure_ascii=ensure_ascii, allow_nan=False)
-        # Cancellation after this check cannot promise rollback of a published replacement.
+        # 发布后的取消无法回滚已替换文件。
         if cancelled is not None and cancelled():
             raise CancelledError("JSON publication cancelled")
         if overwrite:
             os.replace(temp_name, target)
         else:
             atomic_publish(temp_name, target)
-    except BaseException:
-        try:
-            os.unlink(temp_name)
-        except FileNotFoundError:
-            pass
-        raise
+    finally:
+        Path(temp_name).unlink(missing_ok=True)
     return target
