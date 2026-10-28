@@ -419,7 +419,6 @@ class PolicySession:
         logger.info("正在回初始位…")
         result = home_robot(
             self.runtime_state, self.robot, self.home_planner,
-            service=self.robot.service_feedback,
             cancel_requested=self.home_abort_requested,
         )
         with self.runtime_state.motion_lock:

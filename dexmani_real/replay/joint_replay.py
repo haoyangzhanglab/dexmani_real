@@ -123,10 +123,7 @@ class JointReplay:
         return row, deadline_ns
 
     def admit_replay(self, trajectory, hand_start_duration_s):
-        self.robot.prepare_streaming(
-            self.epoch,
-            service=self.robot.service_feedback,
-        )
+        self.robot.prepare_streaming(self.epoch)
         row, _ = self.read_feedback()
         start_arm = wrap_nearest_equivalent(
             trajectory.arm_qpos[0],

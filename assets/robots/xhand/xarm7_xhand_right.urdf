@@ -214,71 +214,21 @@
     <parent link="link7" />
     <child link="link_eef" />
   </joint>
-  <link name="calibration_mount">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="0.025" />
-      <inertia ixx="1.005e-5" ixy="0" ixz="0" iyy="1.005e-5" iyz="0" izz="2.000e-5" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <cylinder radius="0.04" length="0.005" />
-      </geometry>
-      <material name="black">
-        <color rgba="0.1 0.1 0.1 1.0" />
-      </material>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <cylinder radius="0.04" length="0.005" />
-      </geometry>
-    </collision>
-  </link>
-  <joint name="calibration_mount_joint" type="fixed">
-    <origin rpy="0 0 0" xyz="0 0 0.0025" />
-    <parent link="link_eef" />
-    <child link="calibration_mount" />
-  </joint>
-  <link name="flange_link">
-    <inertial>
-      <origin xyz="0 0 0.0215" rpy="0 0 0" />
-      <mass value="0.04" />
-      <inertia ixx="1.84e-5" ixy="0" ixz="0" iyy="1.84e-5" iyz="0" izz="2.45e-5" />
-    </inertial>
-    <visual>
-      <geometry>
-        <mesh filename="meshes/flange.STL" />
-      </geometry>
-      <material name="Blue">
-        <color rgba="0.1 0.1 0.9 1.0" />
-      </material>
-      <origin rpy="0 0 0" xyz="0 0 0" />
-    </visual>
-    <collision>
-      <geometry>
-        <mesh filename="meshes/flange.STL" />
-      </geometry>
-      <origin rpy="0 0 0" xyz="0 0 0" />
-    </collision>
-  </link>
-  <joint name="flange_joint1" type="fixed">
-    <origin rpy="0 0 0" xyz="0 0 0.0025" />
-    <parent link="calibration_mount" />
-    <child link="flange_link" />
-  </joint>
+
   <link name="custom_eef_link" />
+
   <joint name="flange_joint2" type="fixed">
-    <origin rpy="0 -1.5708 0" xyz="0.0 0 0.043" />
-    <parent link="flange_link" />
+    <origin rpy="0 -1.5708 0" xyz="0.0 0 0.04" />
+    <parent link="link_eef" />
     <child link="custom_eef_link" />
   </joint>
+
   <joint name="right_hand_mount_joint" type="fixed">
-    <origin rpy="0 1.5708 0" xyz="-0.005 0 0.0" />
+    <origin rpy="0 1.5707963267948966 0" xyz="-0.005 0 0" />
     <parent link="custom_eef_link" />
     <child link="right_hand_link" />
   </joint>
+
   <link name="right_hand_link">
     <inertial>
       <origin xyz="0.010035126340455 -0.00366835056360167 0.0582695212892126" rpy="0 0 0" />

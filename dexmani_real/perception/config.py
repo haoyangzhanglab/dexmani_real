@@ -1,4 +1,4 @@
-"""点云处理与手表面采样的实验参数。"""
+"""点云处理与手表面模板的实验参数。"""
 
 from dataclasses import dataclass
 

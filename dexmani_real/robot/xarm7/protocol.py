@@ -39,23 +39,15 @@ STATUS_DTYPE = np.dtype(
 
 @dataclass(frozen=True)
 class PrepareRequest:
-    operation_id: int
     run_id: int
 
 
 @dataclass(frozen=True)
 class HomeRequest:
-    operation_id: int
     run_id: int
     waypoints: np.ndarray
     target: np.ndarray
     deadline_ns: int
-
-
-@dataclass(frozen=True)
-class LifecycleReply:
-    operation_id: int
-    error: BaseException | None = None
 
 
 class ArmChannels:
@@ -69,7 +61,6 @@ class ArmChannels:
         self.connected = ctx.Event()
         self.fault = ctx.Array("c", 1024, lock=False)
         self.close_error = ctx.Array("c", 1024, lock=False)
-        self.health_until = ctx.Value("q", 0)
         self.execution_limit = ctx.Array("q", [MAX_TIME, 0])  # 截止时间、最后受影响的命令序号
         self.goal_lock, self.status_lock = ctx.Lock(), ctx.Lock()
         self.goal = ctx.RawArray("b", GOAL_DTYPE.itemsize)

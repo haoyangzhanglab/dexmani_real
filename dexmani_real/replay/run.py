@@ -161,7 +161,6 @@ def wait_for_home(runtime_state, robot, keyboard, home_planner, outcome, home_re
                 runtime_state,
                 robot,
                 home_planner,
-                service=robot.service_feedback,
                 cancel_requested=lambda: (
                     bool(runtime_state.estop_request or runtime_state.quit_requested)
                     or not keyboard.healthy

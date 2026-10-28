@@ -18,11 +18,7 @@ from dexmani_real.calibration.table_plane import load_table_plane
 from dexmani_real.config import load_config
 from dexmani_real.control.config import TableCollisionConfig
 from dexmani_real.data.raw import RawReader
-from dexmani_real.geometry.kinematics import HandFK, eef_poses
-from dexmani_real.geometry.pose import (
-    quat_wxyz_to_rotmat,
-    validate_unit_quaternion_wxyz,
-)
+from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
 from dexmani_real.perception.config import PointCloudConfig
 from dexmani_real.perception.hand_cloud import hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
@@ -102,8 +98,6 @@ class EpisodeVisualizer:
         self,
         episode_path: str,
         *,
-        handbase_position_eef_m: tuple[float, float, float],
-        handbase_quat_eef_wxyz: tuple[float, float, float, float],
         fingertip_link_names: tuple[str, ...],
         table_config: TableCollisionConfig,
         max_frames: int | None = None,
@@ -139,15 +133,6 @@ class EpisodeVisualizer:
             self.T_xarm_base_from_color = self.camera_model.T_xarm_base_from_color
             if self.T_xarm_base_from_color is None:
                 logger.warning("No camera extrinsics: displaying pixels without point cloud")
-            self.handbase_position_eef_m = np.asarray(handbase_position_eef_m, dtype=np.float64)
-            if self.handbase_position_eef_m.shape != (3,) or not np.isfinite(
-                self.handbase_position_eef_m
-            ).all():
-                raise ValueError("hand base position must be a finite (3,) vector")
-            handbase_quat = validate_unit_quaternion_wxyz(
-                handbase_quat_eef_wxyz, name="hand base quaternion"
-            )
-            self.handbase_rotation_eef = quat_wxyz_to_rotmat(handbase_quat)
             self.pointcloud_processor = None
             self.empty_cloud_count = 0
             self.pointcloud_processing_ns = 0
@@ -207,15 +192,15 @@ class EpisodeVisualizer:
         state["arm_ee"] = np.full((self.frame_count, 9), np.nan)
         state["hand_fingertip"] = np.full((self.frame_count, 5, 3), np.nan, dtype=np.float32)
         if np.any(arm_valid):
-            state["arm_ee"][arm_valid] = eef_poses(arm[arm_valid])
+            arm_fk = ArmFK()
+            state["arm_ee"][arm_valid] = eef_poses(arm[arm_valid], arm_fk=arm_fk)
         if np.any(hand_valid):
             hand_fk = HandFK(self.fingertip_link_names)
             state["hand_fingertip"][hand_valid] = hand_geometry(
                 state["arm_ee"][hand_valid],
                 hand[hand_valid],
+                arm_fk=arm_fk,
                 hand_fk=hand_fk,
-                handbase_position_eef_m=self.handbase_position_eef_m,
-                handbase_rotation_eef=self.handbase_rotation_eef,
             )["fingertip_xyz"]
 
         contact = self.reader["hand_contact"][: self.frame_count]
@@ -315,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Limit number of state frames to load.",
     )
     parser.add_argument(
-        "--config", type=Path, help="Optional experiment YAML for current cloud and hand geometry"
+        "--config", type=Path, help="Optional experiment YAML for point-cloud processing and table calibration"
     )
     parser.add_argument(
         "--info",
@@ -360,8 +345,6 @@ def main(argv: list[str] | None = None) -> int:
 
     viz = EpisodeVisualizer(
         str(episode_path),
-        handbase_position_eef_m=runtime.hand.T_eef_handbase_pos_xyz,
-        handbase_quat_eef_wxyz=runtime.hand.T_eef_handbase_quat_wxyz,
         fingertip_link_names=XHAND_FINGERTIP_LINK_NAMES,
         table_config=runtime.environment.table,
         max_frames=args.max_frames,

@@ -69,7 +69,6 @@ def parse_tracking_args(argv=None, *, workspace=None):
     parser.add_argument(
         "--with-hand", action="store_true", help="读取同一 Raw 行的实测关节，附加 XHand FK 点云"
     )
-    parser.add_argument("--experiment-config", type=Path, help="手安装变换使用的当前实验配置 YAML")
     parser.add_argument("--hand-points", type=int, default=1024, help="固定手表面采样点数")
     parser.add_argument("--output", type=Path, help="尚不存在的新输出目录")
     parser.add_argument(
@@ -106,8 +105,6 @@ def parse_tracking_args(argv=None, *, workspace=None):
         parser.error("--headless 需要离线源和 --initial-selection")
     if args.with_hand and args.episode is None:
         parser.error("--with-hand 需要 --episode，以同一 Raw 行的实测关节生成手点")
-    if args.experiment_config is not None and not args.with_hand:
-        parser.error("--experiment-config 需要 --with-hand")
     if args.object_prompt is not None and not args.object_prompt.strip():
         parser.error("--object-prompt 不能为空")
     if not offline and min(args.width, args.height, args.fps) < 1:

@@ -19,15 +19,13 @@ from dexmani_real.geometry.camera import (
     validate_aligned_depth_distortion,
 )
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
-from dexmani_real.geometry.pose import (
-    quat_wxyz_to_rotmat,
-    validate_unit_quaternion_wxyz,
-)
 from dexmani_real.perception.config import HandCloudConfig, PointCloudConfig
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
-from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
-from dexmani_real.robot.xhand.config import HandConfig
+from dexmani_real.robot.model import (
+    XARM7_XHAND_RIGHT_URDF_PATH,
+    XHAND_FINGERTIP_LINK_NAMES,
+)
 from dexmani_real.utils.io import publish
 from dexmani_real.utils.timing import sampling_clock_ns
 
@@ -44,8 +42,6 @@ class ExportConfig:
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
-    handbase_position_eef_m: tuple[float, ...] = HandConfig.T_eef_handbase_pos_xyz
-    handbase_quat_eef_wxyz: tuple[float, ...] = HandConfig.T_eef_handbase_quat_wxyz
 
     @classmethod
     def from_runtime(cls, runtime, *, table_plane_abcd=None):
@@ -53,15 +49,9 @@ class ExportConfig:
             pointcloud=runtime.pointcloud,
             hand_pointcloud=runtime.hand_pointcloud,
             table_plane_abcd=table_plane_abcd,
-            handbase_position_eef_m=tuple(runtime.hand.T_eef_handbase_pos_xyz),
-            handbase_quat_eef_wxyz=tuple(runtime.hand.T_eef_handbase_quat_wxyz),
         )
 
     def __post_init__(self) -> None:
-        position = np.asarray(self.handbase_position_eef_m, dtype=np.float64)
-        if position.shape != (3,) or not np.isfinite(position).all():
-            raise ValueError("hand base position must be a finite (3,) vector")
-        validate_unit_quaternion_wxyz(self.handbase_quat_eef_wxyz, name="hand base quaternion")
         if not self.pointcloud.remove_table:
             object.__setattr__(self, "table_plane_abcd", None)
         elif self.table_plane_abcd is None:
@@ -202,7 +192,6 @@ def iter_canonical_blocks(
     hand_cloud,
     chunk_frames: int,
     camera: CameraSnapshot,
-    handbase_rotation_eef: np.ndarray,
     frames: int,
 ):
     """分块转换，不修补缺失观测或重采样行。"""
@@ -229,9 +218,8 @@ def iter_canonical_blocks(
         hand_features = hand_geometry(
             poses,
             hand,
+            arm_fk=arm_fk,
             hand_fk=hand_fk,
-            handbase_position_eef_m=config.handbase_position_eef_m,
-            handbase_rotation_eef=handbase_rotation_eef,
             hand_cloud=hand_cloud,
         )
         block = {
@@ -286,7 +274,6 @@ def export_zarr(
     if os.path.lexists(output):
         raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {output}")
     selected, excluded = select_episodes(source, exclude)
-    rotation = quat_wxyz_to_rotmat(processing.handbase_quat_eef_wxyz)
     arm_fk, hand_fk = ArmFK(), HandFK()
     hand_cloud = HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
     staging = None
@@ -337,7 +324,6 @@ def export_zarr(
                     hand_cloud=hand_cloud,
                     chunk_frames=chunk,
                     camera=camera,
-                    handbase_rotation_eef=rotation,
                     frames=frames,
                 )
                 append_episode(arrays, offset, blocks, frames)
@@ -387,8 +373,7 @@ def create_store(path, processing, camera, *, task, control_hz):
         pointcloud_config=asdict(processing.pointcloud),
         hand_pointcloud_config=asdict(processing.hand_pointcloud),
         fingertip_link_names=list(XHAND_FINGERTIP_LINK_NAMES),
-        handbase_position_eef_m=list(processing.handbase_position_eef_m),
-        handbase_quat_eef_wxyz=list(processing.handbase_quat_eef_wxyz),
+        kinematics_urdf=XARM7_XHAND_RIGHT_URDF_PATH.read_text(encoding="utf-8"),
         table_plane_abcd=processing.table_plane_abcd,
         depth_scale_m_per_unit=camera.depth_scale_m,
         timing_admission=dict(

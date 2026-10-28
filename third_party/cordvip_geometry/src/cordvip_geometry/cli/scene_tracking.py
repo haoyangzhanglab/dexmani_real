@@ -137,7 +137,6 @@ class SceneTrackingSession:
         self.hand_provider = (
             RawHandCloudProvider(
                 self.args.episode,
-                config_path=self.args.experiment_config,
                 num_points=self.args.hand_points,
             )
             if self.args.with_hand

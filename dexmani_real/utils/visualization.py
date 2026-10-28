@@ -9,7 +9,7 @@ def viewer_blueprint(series_groups=(), *, camera_in_base=False):
     spatial = ["/pcd/**", "/eef/**", "/fingertips/**", "/workspace/**", "/base/**"]
     if camera_in_base:
         spatial.append("/camera/**")
-    views = [
+    views: list[rrb.Container | rrb.View] = [
         rrb.Vertical(
             rrb.Spatial2DView(origin="camera/color/rgb", name="RGB"),
             rrb.Spatial2DView(origin="depth/image", name="Depth"),

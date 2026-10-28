@@ -4,22 +4,22 @@ import nlopt
 import numpy as np
 import pinocchio as pin
 
-from dexmani_real.geometry.kinematics import SDK_TO_URDF_IDX, HandFK
-from dexmani_real.robot.model import HAND_JOINT_SHAPE
+from dexmani_real.geometry.kinematics import HandFK
+from dexmani_real.robot.model import HAND_JOINT_SHAPE, XHAND_RIGHT_URDF_PATH
 from dexmani_real.teleop.config import TAGConfig
 from dexmani_real.teleop.retargeting.landmarks import prepare_landmarks
 
 ROBOT_FINGER_LENGTHS = np.array([0.161, 0.208, 0.206, 0.204, 0.145])
 PINCH_SKIP_THRESHOLD = 0.01
 FINGERTIP_INDICES = np.array([4, 8, 12, 16, 20])
-URDF_TO_SDK_IDX = np.argsort(SDK_TO_URDF_IDX)
 
 
 class TAGRetargeter:
     def __init__(self, config: TAGConfig):
         config.validate()
         self.config = config
-        self.fk = HandFK()
+        self.fk = HandFK(urdf_path=XHAND_RIGHT_URDF_PATH)
+        self.urdf_to_sdk = np.argsort(self.fk.sdk_to_urdf)
         self.lower = self.fk.model.lowerPositionLimit
         self.upper = self.fk.model.upperPositionLimit
         self.dof = self.fk.model.nv
@@ -47,9 +47,7 @@ class TAGRetargeter:
             qpos = np.asarray(initial_qpos, dtype=np.float64)
             if qpos.shape != HAND_JOINT_SHAPE or not np.isfinite(qpos).all():
                 raise ValueError("TAG initial_qpos must be a finite (12,) array")
-            self.previous_solution = np.clip(qpos[SDK_TO_URDF_IDX], self.lower, self.upper)
-        self.position_solution = None
-        self.target_fingertips = None
+            self.previous_solution = np.clip(qpos[self.fk.sdk_to_urdf], self.lower, self.upper)
         self.pinch_factors = np.zeros(4)
 
     def retarget(self, landmarks):
@@ -61,9 +59,9 @@ class TAGRetargeter:
         if mano is None:
             return None
         tips = mano[FINGERTIP_INDICES] - mano[0]
-        return self.solve(tips)[URDF_TO_SDK_IDX]
+        return self.solve(tips)[self.urdf_to_sdk]
 
-    def solve(self, fingertips):
+    def solve(self, fingertips: np.ndarray) -> np.ndarray:
         self.target_fingertips = fingertips * self.finger_scale
         position = self.bounded_solution(self.position_optimizer.optimize(self.previous_solution))
 
@@ -88,7 +86,7 @@ class TAGRetargeter:
         self.previous_solution = solution
         return solution
 
-    def bounded_solution(self, qpos):
+    def bounded_solution(self, qpos) -> np.ndarray:
         qpos = np.asarray(qpos, dtype=np.float64)
         if qpos.shape != HAND_JOINT_SHAPE or not np.isfinite(qpos).all():
             raise ValueError("TAG solver must return a finite (12,) array")

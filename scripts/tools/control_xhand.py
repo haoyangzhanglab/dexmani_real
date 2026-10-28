@@ -25,6 +25,7 @@ from dexmani_real.robot.model import (
 )
 from dexmani_real.robot.xhand.config import HandConfig
 from dexmani_real.robot.xhand.driver import XHand
+from dexmani_real.robot.xhand.feedback import XHandState
 from dexmani_real.utils.log import configure_logging
 
 HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
@@ -49,20 +50,8 @@ PRESET_QPOS_DEG = {
         109.15,
     ),
     "v": (38.32, 90, 52.08, 6.21, 2.6, 5.0, 2.1, 5.0, 109.5, 109.5, 109.5, 109.23),
-    "ok": (
-        45.88,
-        41.54,
-        67.35,
-        2.22,
-        80.45,
-        70.82,
-        31.37,
-        10.39,
-        13.69,
-        16.88,
-        1.39,
-        10.55,
-    ),
+    # 简化 OK：拇指、食指轻弯，其余手指张开，远端关节保留配置要求的 5° 下限。
+    "ok": (49.0, 43.0, 48.0, 0.0, 48.0, 48.0, 0.0, 5.0, 0.0, 5.0, 0.0, 5.0),
 }
 
 
@@ -121,14 +110,9 @@ class XHandControlExample(XHand):
 
         print(f"  hand_type:     {self.device_identity['hand_type']}")
 
-    def read_state(self, finger_id: int = 2) -> bool:
+    def read_state(self, finger_id: int = 2) -> None:
         self.header(f"Read state (finger {finger_id})")
-        self.check_cancelled()
-        state = self.get_state()
-        self.check_cancelled()
-        if state is None:
-            print("  Joint feedback unavailable")
-            return False
+        state = self.read_fresh_state()
         print("  joint positions (deg, SDK ids 0..11):", np.rad2deg(state.qpos).round(3).tolist())
         if finger_id in XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID:
             index = XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID[finger_id]
@@ -139,27 +123,27 @@ class XHandControlExample(XHand):
                 print(f"  tactile dense (SDK units): points={len(dense)} max_abs={np.abs(dense).max():.3f}")
             else:
                 print("  tactile dense (SDK units): unavailable")
-        return True
 
-    def read_action_positions(self, *, action_deadline_ns: int | None = None) -> np.ndarray:
-        """One driver read bounded by feedback freshness and the action deadline."""
-        self.check_cancelled()
-        started_ns = time.monotonic_ns()
-        deadline_ns = started_ns + int(self.cfg.feedback_max_age_s * 1e9)
+    def read_fresh_state(self, *, action_deadline_ns: int | None = None) -> XHandState:
+        """CRC 仅重读，所有尝试共用反馈与动作的固定截止时间。"""
+        deadline_ns = time.monotonic_ns() + int(self.cfg.feedback_max_age_s * 1e9)
         if action_deadline_ns is not None:
             deadline_ns = min(deadline_ns, action_deadline_ns)
-        if time.monotonic_ns() >= deadline_ns:
-            raise RuntimeError("action feedback deadline expired before read")
-        state = self.get_state()
-        self.check_cancelled()
-        if time.monotonic_ns() >= deadline_ns:
-            raise RuntimeError("action feedback deadline expired during read")
-        if state is None:
-            raise RuntimeError("action joint feedback unavailable")
-        return state.qpos
+        while True:
+            self.check_cancelled()
+            if time.monotonic_ns() >= deadline_ns:
+                raise RuntimeError("XHand feedback deadline expired before read")
+            state = self.get_state()
+            self.check_cancelled()
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            if remaining_ns <= 0:
+                raise RuntimeError("XHand feedback deadline expired during read")
+            if state is not None:
+                return state
+            time.sleep(min(FEEDBACK_POLL_INTERVAL_S, remaining_ns / 1e9))
 
     def execute_action(self, target: np.ndarray) -> None:
-        self.read_action_positions()
+        self.read_fresh_state()
         self.check_cancelled()
         deadline_ns = time.monotonic_ns() + int(self.cfg.home_timeout_s * 1e9)
         self.motion_pending = True  # SDK exceptions do not establish non-delivery.
@@ -169,7 +153,7 @@ class XHandControlExample(XHand):
         consecutive = 0
         while time.monotonic_ns() < deadline_ns:
             # Freshness belongs to each newly received sample, independently of previous read/send latency.
-            measured = self.read_action_positions(action_deadline_ns=deadline_ns)
+            measured = self.read_fresh_state(action_deadline_ns=deadline_ns).qpos
             if time.monotonic_ns() >= deadline_ns:
                 break
             error_rad = float(np.max(np.abs(measured - target)))
@@ -241,8 +225,7 @@ def run_hardware_session(config: HandConfig, *, finger_id: int, read_only: bool)
         hand.read_sdk_version()
         hand.read_device_info()
         hand.check_cancelled()
-        if not hand.read_state(finger_id):
-            raise RuntimeError("no valid initial joint state was received")
+        hand.read_state(finger_id)
         for name, target in actions:
             print(f"\n  -> {name} (degrees): {np.rad2deg(target).round(3).tolist()}")
             hand.execute_action(target)

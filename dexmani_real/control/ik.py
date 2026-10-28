@@ -9,11 +9,9 @@ from dexmani_real.control.constraints import (
     joint_target_rejection,
     wrap_nearest_equivalent,
 )
+from dexmani_real.geometry.kinematics import kinematic_urdf
 from dexmani_real.geometry.pose import Pose, compute_pose_error
-from dexmani_real.robot.model import (
-    XARM7_JOINT_NAMES,
-    XARM7_XHAND_COLLISION_URDF_PATH,
-)
+from dexmani_real.robot.model import XARM7_JOINT_NAMES
 
 JOINT_WEIGHTS = np.array((4.0, 1.8, 1.2, 0.6, 0.6, 0.9, 0.35))
 PREVIOUS_WEIGHTS = np.array((10, 4, 2, 1, 0.5, 0.6, 0.1))
@@ -51,7 +49,9 @@ class IKSolver:
         self.rotation_tolerance = rotation_tolerance
         if any(not np.isfinite(v) or v <= 0 for v in (position_tolerance, rotation_tolerance)):
             raise ValueError("IK pose tolerances must be finite and positive")
-        self.model = PinocchioModel(str(XARM7_XHAND_COLLISION_URDF_PATH))
+        self.model = PinocchioModel.create_from_urdf_string(
+            kinematic_urdf("link_base", stop_link="right_hand_link"),
+        )
         self.model.set_joint_order(list(XARM7_JOINT_NAMES))
         self.model.set_link_order(self.model.get_link_names(user=False))
         self.eef_link_id = self.model.get_link_names().index("custom_eef_link")

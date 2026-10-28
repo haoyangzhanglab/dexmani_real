@@ -1,4 +1,4 @@
-"""标称 URDF 的自碰撞、环境碰撞与桌面距离。"""
+"""组合 URDF 的自碰撞、环境碰撞与桌面距离。"""
 
 from itertools import combinations
 
@@ -6,12 +6,11 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real.robot.model import (
-    HAND_SDK_TO_URDF_IDX,
     XARM7_JOINT_NAMES,
     XARM7_XHAND_RIGHT_URDF_PATH,
     XARM7_XHAND_SRDF_PATH,
     XHAND_MODEL_DIR,
-    XHAND_URDF_JOINT_NAMES,
+    XHAND_SDK_JOINT_NAMES,
 )
 
 
@@ -23,16 +22,17 @@ class CollisionModel:
         self.pin = pin
         urdf = str(XARM7_XHAND_RIGHT_URDF_PATH)
         self.model = pin.buildModelFromUrdf(urdf)
-        active = sorted(
-            (joint.idx_q, self.model.names[i])
+        active = {
+            self.model.names[i]
             for i, joint in enumerate(self.model.joints)
             if i and joint.nq > 0
-        )
-        if self.model.nq != 19 or tuple(name for _, name in active) != (
-            *XARM7_JOINT_NAMES,
-            *XHAND_URDF_JOINT_NAMES,
-        ):
-            raise ValueError("collision model joint order must be xArm7 + XHand URDF joints")
+        }
+        sdk_names = (*XARM7_JOINT_NAMES, *XHAND_SDK_JOINT_NAMES)
+        if self.model.nq != 19 or active != set(sdk_names):
+            raise ValueError("collision model must contain the xArm7 and XHand SDK joints")
+        self.sdk_q_indices = np.array([
+            self.model.joints[self.model.getJointId(name)].idx_q for name in sdk_names
+        ], dtype=np.intp)
         self.data = self.model.createData()
         self.geometry = pin.buildGeomFromUrdf(
             self.model, urdf, pin.GeometryType.COLLISION, package_dirs=[str(XHAND_MODEL_DIR)]
@@ -101,7 +101,7 @@ class CollisionModel:
         hand_qpos = np.asarray(hand_qpos, dtype=np.float64)
         if hand_qpos.shape != (12,) or not np.isfinite(hand_qpos).all():
             raise ValueError("collision hand posture must be finite shape (12,)")
-        self.hand_qpos = hand_qpos[list(HAND_SDK_TO_URDF_IDX)]
+        self.hand_qpos = hand_qpos.copy()
 
     def rejection(self, arm_qpos):
         arm_qpos = np.asarray(arm_qpos, dtype=np.float64)
@@ -109,7 +109,8 @@ class CollisionModel:
             raise ValueError("collision arm posture must be finite shape (7,)")
         if self.hand_qpos is None:
             raise RuntimeError("set the collision hand posture before querying arm poses")
-        qpos = np.concatenate((arm_qpos, self.hand_qpos))
+        qpos = np.empty(self.model.nq)
+        qpos[self.sdk_q_indices] = np.concatenate((arm_qpos, self.hand_qpos))
         if np.any(qpos < self.model.lowerPositionLimit) or np.any(
             qpos > self.model.upperPositionLimit
         ):

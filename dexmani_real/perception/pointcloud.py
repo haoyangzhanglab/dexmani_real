@@ -144,14 +144,13 @@ class PointCloudProcessor:
             # 先沿射线裁掉桌面，避免为桌面像素分配三维点。
             height = depth_m * self.table_height_per_depth + self.table_offset
             valid &= height > self.config.table_margin_m
-        rows, columns = np.nonzero(valid)
-        points = self.rays_base[rows, columns] * depth_m[rows, columns, None] + self.translation
-        keep = np.all((points >= self.lower) & (points <= self.upper), axis=1)
-        if not keep.any():
+        for axis in range(3):
+            coordinate = self.rays_base[..., axis] * depth_m + self.translation[axis]
+            valid &= (coordinate >= self.lower[axis]) & (coordinate <= self.upper[axis])
+        if not valid.any():
             return None
-
-        points = points[keep]
-        colors = color[rows[keep], columns[keep]].astype(np.float32) / 255.0
+        points = self.rays_base[valid] * depth_m[valid, None] + self.translation
+        colors = color[valid].astype(np.float32) / 255.0
         points, colors = voxel_downsample(points, colors)
         keep = radius_inliers(points)
         points, colors = points[keep], colors[keep]

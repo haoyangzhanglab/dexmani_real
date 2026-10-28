@@ -89,7 +89,7 @@ class HomePlanner:
         if np.any(path < self.limits[:, 0]) or np.any(path > self.limits[:, 1]):
             raise HomePathRejected("home path violates operational joint limits")
         path = interpolate_waypoints(path, np.deg2rad(1.0))
-        table_samples = []
+        best_clearance = -np.inf
         for index, waypoint in enumerate(path):
             reason = self.collision_model.rejection(waypoint)
             if reason is not None:
@@ -102,33 +102,19 @@ class HomePlanner:
             clearance, measurement, source = self._table_clearance()
             if not np.isfinite(clearance):
                 raise RuntimeError(f"table_check_nonfinite at waypoint {index}")
-            table_samples.append((index, clearance, measurement, source))
-
-        negative = [sample for sample in table_samples if sample[1] < 0.0]
-        if not negative:
-            return
-        best_clearance = table_samples[0][1]
-        monotonic_escape = True
-        for sample in table_samples[1:]:
-            if best_clearance >= 0:
-                break
-            if sample[1] < best_clearance - 5e-4:
-                monotonic_escape = False
-                break
-            best_clearance = max(best_clearance, sample[1])
-        if (
-            allow_table_soft_escape
-            and table_samples[0][1] < 0.0
-            and all(sample[0] == index for index, sample in enumerate(negative))
-            and monotonic_escape
-            and table_samples[-1][1] >= 0.0
-        ):
-            return
-        index, clearance, measurement, source = negative[0]
-        raise HomePathRejected(
-            f"table_clearance at waypoint {index}: clearance={clearance:g} m, "
-            f"{source}={measurement:g} m"
-        )
+            if clearance < 0.0:
+                # 退出软间隙前的回退容差相对历史最佳间隙，退出后不能重新进入。
+                if (
+                    not allow_table_soft_escape
+                    or best_clearance >= 0.0
+                    or clearance < best_clearance - 5e-4
+                    or index == len(path) - 1
+                ):
+                    raise HomePathRejected(
+                        f"table_clearance at waypoint {index}: clearance={clearance:g} m, "
+                        f"{source}={measurement:g} m"
+                    )
+            best_clearance = max(best_clearance, clearance)
 
     def _candidate_path(
         self,

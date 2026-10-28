@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.geometry.pose import validate_unit_quaternion_wxyz
 from dexmani_real.robot.commands import validate_hand_target
 from dexmani_real.robot.model import (
     XHAND_RATED_QPOS_MAX_RAD,
@@ -96,15 +95,6 @@ class HandConfig:
     home_timeout_s: float = 2.0
     home_tolerance_deg: float = 5.0
 
-    # 实测 FK 安装偏移为 -0.015 m，规划保留标称 URDF 的 -0.005 m。
-    T_eef_handbase_pos_xyz: tuple[float, float, float] = (-0.015, 0.0, 0.0)
-    T_eef_handbase_quat_wxyz: tuple[float, float, float, float] = (
-        0.707107,
-        0.0,
-        0.707107,
-        0.0,
-    )
-
     def validate(self) -> None:
         if self.ethercat_slave_position < -1:
             raise ValueError("hand ethercat_slave_position must be -1 (unknown) or non-negative")
@@ -142,10 +132,6 @@ class HandConfig:
         ):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"hand {name} must be finite and positive")
-        position = np.asarray(self.T_eef_handbase_pos_xyz, dtype=np.float64)
-        if position.shape != (3,) or not np.all(np.isfinite(position)):
-            raise ValueError("hand base position must be a finite (3,) vector")
-        validate_unit_quaternion_wxyz(self.T_eef_handbase_quat_wxyz, name="hand base quaternion")
 
     def validate_home_pose(self) -> None:
         """手部禁用时仍须验证规划使用的固定姿态。"""

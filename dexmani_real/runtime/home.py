@@ -41,20 +41,22 @@ def _home_motion(state, robot):
         if robot.stop_required:
             try:
                 robot.stop()
-            except Exception:
+            except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    state.request_emergency_stop()
                 if failure is None:
                     raise
                 logger.exception("HOME cleanup also failed")
 
 
-def home_robot(state, robot, planner, *, cancel_requested, service):
+def home_robot(state, robot, planner, *, cancel_requested):
     result = home_hand(state, robot, cancel_requested=cancel_requested)
     if not result.ok:
         return result
-    return home_arm(state, robot, planner, cancel_requested=cancel_requested, service=service)
+    return home_arm(state, robot, planner, cancel_requested=cancel_requested)
 
 
-def home_arm(state, robot, planner, *, cancel_requested, service):
+def home_arm(state, robot, planner, *, cancel_requested):
     config, hand = robot.arm_config, robot.hand_config
     target = np.asarray(config.home_qpos, dtype=np.float64)
     if state.safety_state != SafetyState.ARMED:
@@ -73,7 +75,8 @@ def home_arm(state, robot, planner, *, cancel_requested, service):
         while time.monotonic() < deadline:
             if cancelled():
                 return HomeResult(False, "home interrupted", interrupted=True)
-            feedback = robot.service_feedback()
+            robot.service_feedback()
+            feedback = robot.read_state()
             arm_state = feedback.arm
             feedback_issue = "fresh stationary arm state unavailable"
             if (
@@ -120,7 +123,7 @@ def home_arm(state, robot, planner, *, cancel_requested, service):
         try:
             robot.home_arm(
                 waypoints, target, run_id, cancelled,
-                service=service, deadline_ns=deadline_ns,
+                deadline_ns=deadline_ns,
             )
         except OperationCancelled as exc:
             return HomeResult(False, str(exc), interrupted=True)
@@ -159,7 +162,8 @@ def home_hand(state, robot, *, cancel_requested):
         while time.monotonic_ns() < deadline:
             if cancelled():
                 return HomeResult(False, "home interrupted", interrupted=True)
-            feedback = robot.service_feedback().hand
+            robot.service_feedback()
+            feedback = robot.hand_feedback.checked_feedback(time.monotonic_ns())
             if feedback is not None:
                 sample = feedback[0]
                 stamp = int(sample["timestamp_ns"])

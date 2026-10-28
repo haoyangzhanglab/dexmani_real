@@ -298,7 +298,7 @@ class Rollout:
         if self.start_observation() is None:
             self.stop(self.preparation_issue)
             return
-        self.robot.prepare_streaming(epoch, service=self.robot.service_feedback)
+        self.robot.prepare_streaming(epoch)
         if self.start_observation() is None:
             self.stop(self.preparation_issue)
             return

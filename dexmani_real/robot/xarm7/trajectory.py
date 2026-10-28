@@ -1,14 +1,13 @@
 """Ruckig 连续参考；运动中替换目标不以实测反馈重置轨迹。"""
 
 import numpy as np
+from ruckig import InputParameter, Result, Ruckig, Trajectory
 
 from dexmani_real.robot.commands import validate_arm_target
 
 
 class ArmTrajectory:
     def __init__(self, cfg, q, v, now_ns):
-        from ruckig import InputParameter, Ruckig
-
         self.lower = np.asarray(cfg.joint_limit_lower)
         self.upper = np.asarray(cfg.joint_limit_upper)
         self.otg = Ruckig(7)
@@ -41,8 +40,6 @@ class ArmTrajectory:
         return self.q
 
     def _plan(self, goal, now_ns):
-        from ruckig import Result, Trajectory
-
         self.input.current_position = self.q.tolist()
         self.input.current_velocity = self.v.tolist()
         self.input.target_position = goal.tolist()

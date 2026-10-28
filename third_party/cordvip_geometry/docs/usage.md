@@ -114,7 +114,7 @@ FoundationPose++ 2D 引导来自 [上游核心](https://github.com/teal024/Found
 
 实测点由当前语义 mask 与原始实测深度反投影，独立于模型；完整模型点由固定资产采样与 pose 得到。支持像素和残差只诊断二者一致性，不是真值或置信度。软玩具形变、单图不可见面和尺度误差不会因替换模型自动解决。
 
-`--with-hand` 读取同 Raw 行的实测 arm/hand 关节，使用对应相机外参与当前实验安装配置（可设 `--experiment-config`）做 FK。默认 1024 手点和固定 link IDs；缺失关节不能用 action、零或历史值填充。无真实时钟证据时 `hand_timing_available=False`、skew 为 NaN；Raw 行关联不等于物理同步。
+`--with-hand` 读取同 Raw 行的实测 arm/hand 关节，使用对应相机外参与 DexMani Real 的完整组合 URDF（`assets/robots/xhand/xarm7_xhand_right.urdf`）做 FK。默认 1024 手点和固定 link IDs；缺失关节不能用 action、零或历史值填充。无真实时钟证据时 `hand_timing_available=False`、skew 为 NaN；Raw 行关联不等于物理同步。
 
 Raw 几何通过 `RawReader.read_timing_rows()` 读取所需的源时间与身份列；相机序列从 0 起有效，相机时钟缺失时使用整数 `observation_ns` 并标记 `host_monotonic_observation`。 `timing/rows` 符合当前 Raw schema、dtype 和行数。结构缺失或不匹配直接报错；列中的 `-1` 缺失源时钟保持原值，仅支持按行关联的诊断，不代表通过训练或物理回放准入。
 
@@ -146,7 +146,7 @@ finally:
     tracker.close() if tracker is not None else segmenter.close()
 ```
 
-`HandCloudModel.transform(measured_hand_qpos, T_camera_handbase)` 供已有宿主生成固定 FK 手点。每帧结果带源身份、row、时钟、时间、每个实例的 cloud、pose、固定模型点/法向与独立有效性；内存数组借用，异步保存者应复制。
+`HandCloudModel.transform(measured_qpos, T_camera_from_root)` 按构造时的 `joint_names` 顺序接收 URDF 的全部活动关节，以及 URDF 根坐标系到相机的变换。DexMani Real 使用 19 维实测 arm/hand 关节，根坐标系为 `link_base`。每帧结果带源身份、row、时钟、时间、每个实例的 cloud、pose、固定模型点/法向与独立有效性；内存数组借用，异步保存者应复制。
 
 `Frame` 检查原始 RGB-D 与内参，`SceneTracker.step()` 检查宿主传入的去畸变数组。内部场景提取、逐物体跟踪和渲染复用入口保证；新模型位姿及转换为 float32 后的几何结果仍需检查。静态资产的点和法向在 `SceneTracker` 构造时检查并复制，调用方后续修改原数组不会改变追踪资产。帧和结果中的借用数组在消费期间应保持不变；`scene_payload()` 单独检查宿主提供的手部几何和来源信息。
 

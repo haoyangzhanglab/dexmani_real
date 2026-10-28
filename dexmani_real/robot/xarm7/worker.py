@@ -17,7 +17,6 @@ from dexmani_real.robot.xarm7.protocol import (
     MAX_TIME,
     STATUS_DTYPE,
     HomeRequest,
-    LifecycleReply,
 )
 from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
 from dexmani_real.utils.timing import next_tick_ns
@@ -118,13 +117,6 @@ class ArmController:
             stage="arm standstill",
             timeout_s=HOME_CONVERGENCE_TIMEOUT_S,
         )
-        # 进入 Mode 1 前确认实测状态可生成限位内的制动轨迹。
-        ArmTrajectory(
-            self.cfg,
-            self.status["frame"]["qpos"],
-            self.status["frame"]["qvel"],
-            time.monotonic_ns(),
-        )
 
     def home(self, waypoints, final_qpos, *, check_abort):
         waypoints = np.asarray(waypoints, dtype=np.float64)
@@ -182,13 +174,6 @@ class ArmController:
                 timeout_s=HOME_DWELL_S + (1 / self.cfg.feedback_hz),
             )
         check_abort()
-        self.driver.enter_mode(1, check_abort=check_abort)
-        self.wait_settled(
-            check_abort,
-            stage="post-Mode1 home settle",
-            target=final_qpos,
-            timeout_s=HOME_TARGET_TIMEOUT_S + HOME_DWELL_S + (1 / self.cfg.feedback_hz),
-        )
 
     def stop(self):
         self.io.stop.set()
@@ -208,7 +193,6 @@ class ArmController:
             self.io.stopped.set()  # 处理结束；停止失败仍保存在 close_error。
 
     def operation(self, message):
-        identity = message.operation_id
         kind = "home" if isinstance(message, HomeRequest) else "prepare"
         error = None
         try:
@@ -219,9 +203,6 @@ class ArmController:
                     raise OperationCancelled(f"{kind} authority revoked")
                 if isinstance(message, HomeRequest) and time.monotonic_ns() >= message.deadline_ns:
                     raise TimeoutError("HOME execution deadline expired")
-                # HOME 使用协调者健康截止，不消费 streaming 目标的执行期限。
-                if time.monotonic_ns() >= self.io.health_until.value:
-                    raise TimeoutError(f"{kind} hand feedback or parent service expired")
 
             check_abort()
             if self.active is not None:
@@ -235,10 +216,10 @@ class ArmController:
             else:
                 self.driver.enter_mode(1, check_abort=check_abort)
                 self.wait_stationary(check_abort)
-            check_abort()
-            self.last_send_ns = 0
-            self.io.execution_limit[:] = (MAX_TIME, 0)
-            self.status["prepared_run_id"] = run_id
+                check_abort()
+                self.last_send_ns = 0
+                self.io.execution_limit[:] = (MAX_TIME, 0)
+                self.status["prepared_run_id"] = run_id
         except BaseException as exc:
             error = exc
             if not isinstance(exc, OperationCancelled):
@@ -247,7 +228,7 @@ class ArmController:
             self.stop()
 
         self.io.publish_status(self.status)
-        self.pipe.send(LifecycleReply(identity, error))
+        self.pipe.send(error)
 
     def command_issue(self, goal, now, *, first=False):
         if not self.authorized(int(goal["run_id"])):
@@ -266,8 +247,6 @@ class ArmController:
         limit = wait_until if goal["sequence"] <= wait_sequence else MAX_TIME
         if now >= min(goal["execute_until_ns"], limit):
             return "input_decision_expired"
-        if now >= self.io.health_until.value:
-            return "upstream_feedback_or_service_expired"
         if not self.status["valid"] or now - self.status["frame"]["timestamp_ns"] >= int(
             self.cfg.feedback_max_age_s * 1e9
         ):

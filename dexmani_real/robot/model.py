@@ -50,30 +50,9 @@ XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
 )
 
 XHAND_MODEL_DIR = ASSET_DIR / "robots" / "xhand"
-# 七关节规划模型中的手固定在 open/home 姿态。
-XARM7_XHAND_COLLISION_URDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand_collision.urdf"
 XARM7_XHAND_RIGHT_URDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand_right.urdf"
 XARM7_XHAND_SRDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand.srdf"
 XHAND_RIGHT_URDF_PATH = XHAND_MODEL_DIR / "xhand_right.urdf"
-
-
-XHAND_URDF_JOINT_NAMES: tuple[str, ...] = (
-    "right_hand_index_bend_joint",
-    "right_hand_index_joint1",
-    "right_hand_index_joint2",
-    "right_hand_mid_joint1",
-    "right_hand_mid_joint2",
-    "right_hand_pinky_joint1",
-    "right_hand_pinky_joint2",
-    "right_hand_ring_joint1",
-    "right_hand_ring_joint2",
-    "right_hand_thumb_bend_joint",
-    "right_hand_thumb_rota_joint1",
-    "right_hand_thumb_rota_joint2",
-)
-HAND_SDK_TO_URDF_IDX: tuple[int, ...] = tuple(
-    XHAND_SDK_JOINT_NAMES.index(name) for name in XHAND_URDF_JOINT_NAMES
-)
 
 
 XARM7_HARD_LOWER = (

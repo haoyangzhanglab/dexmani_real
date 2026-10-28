@@ -97,9 +97,7 @@ class CartesianJog:
             if robot.stop_required:
                 robot.stop()
             try:
-                robot.prepare_streaming(
-                    epoch, service=robot.service_feedback,
-                )
+                robot.prepare_streaming(epoch)
                 if keys.snapshot()[1] != generation or state.run_id != epoch:
                     raise OperationCancelled("jog changed during preparation")
             except (OperationCancelled, TimeoutError) as exc:
@@ -125,8 +123,8 @@ class CartesianJog:
             hand_qpos=(row.hand["qpos"][0] if row.hand is not None
                        else np.deg2rad(runtime.hand.home_qpos_deg)),
         )
-        if self.blocked_until_release:
-            self.stop(robot, state)
+        if step.ik_result is None or step.ik_result.qpos is None:
+            self.pause(robot, state)
             return step
         source_ns = (int(row.arm["timestamp_ns"][0]) if deadline_source == "arm"
                      else row.observation_timestamp_ns)
@@ -142,7 +140,7 @@ class CartesianJog:
             self.stop(robot, state)
         return step
 
-    def propose(self, pressed_keys, measured_qpos, *, hand_qpos):
+    def propose(self, pressed_keys, measured_qpos, *, hand_qpos) -> tuple[Pose, np.ndarray, IKResult | None]:
         baseline_qpos, baseline_pose = self.command_qpos, self.command_pose
         if baseline_pose is None:
             baseline_qpos = measured_qpos
@@ -160,8 +158,6 @@ class CartesianJog:
                 pose, measured_qpos, baseline_qpos,
                 hand_qpos=hand_qpos,
             )
-        if result is None or result.qpos is None:
-            self.blocked_until_release = True
         return pose, desired_position, result
 
     def submit(

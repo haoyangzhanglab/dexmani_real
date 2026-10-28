@@ -60,16 +60,11 @@ class Robot:
         self.hand: XHand | None = None
         self.owner = None
         self.connected = False
-        self.motion_active = False
-        self.hand_stop_pending = False
+        self.stop_required = False
         self.stop_failure = None
         self.hand_feedback = XHandFeedback(hand_config)
         self.feedback_next_ns = 0
         self.input_signal = None
-
-    @property
-    def stop_required(self):
-        return self.motion_active or self.hand_stop_pending
 
     def check_owner(self):
         if self.owner != threading.get_ident():
@@ -164,7 +159,7 @@ class Robot:
 
     def reset_hand_feedback(self, *, deadline_ns=None):
         self.check_owner()
-        if self.motion_active:
+        if self.stop_required:
             raise RuntimeError("cannot clear hand feedback during motion")
         self.hand_feedback.reset(time.monotonic_ns(), deadline_ns=deadline_ns)
         self.feedback_next_ns = 0
@@ -193,8 +188,8 @@ class Robot:
             self.hand_feedback.checked_feedback(time.monotonic_ns()) if self.hand is not None else None,
         )
 
-    def service_feedback(self):
-        """由 SDK 所有者线程独立服务硬件健康，不延长任何命令期限。"""
+    def service_feedback(self) -> None:
+        """服务手部采样与已有故障；arm 观测由消费方显式读取。"""
         self.check()
         try:
             now = time.monotonic_ns()
@@ -203,14 +198,6 @@ class Robot:
                 self.feedback_next_ns = next_tick_ns(
                     self.feedback_next_ns or now, FEEDBACK_PERIOD_NS, time.monotonic_ns(),
                 )
-            state = self.read_state()
-            if self.hand is None or state.hand is not None:
-                deadline = int(state.arm["timestamp_ns"][0]) + int(self.arm_config.feedback_max_age_s * 1e9)
-                if state.hand is not None:
-                    deadline = min(deadline, int(state.hand["timestamp_ns"][0])
-                                   + int(self.hand_config.feedback_max_age_s * 1e9))
-                cast("ArmProcess", self.arm).update_health(health_until_ns=deadline)
-            return state
         except BaseException:
             self.stop_signal.set()
             raise
@@ -236,7 +223,8 @@ class Robot:
 
         while True:
             check_wait()
-            state = self.service_feedback()
+            self.service_feedback()
+            state = self.read_state()
             check_wait()
             if self.hand is None:
                 return state
@@ -249,12 +237,12 @@ class Robot:
             if remaining_ns > 0:
                 time.sleep(min(0.01, remaining_ns / 1e9))
 
-    def prepare_streaming(self, run_id, *, service):
+    def prepare_streaming(self, run_id):
         self.check_owner()
-        if self.hand_stop_pending or self.stop_failure is not None:
+        if self.stop_failure is not None:
             raise RobotError("previous robot stop remains unresolved")
-        self.motion_active = True
-        cast("ArmProcess", self.arm).prepare(run_id, service=service)
+        self.stop_required = True
+        cast("ArmProcess", self.arm).prepare(run_id, service=self.service_feedback)
         self.check_run(run_id)
 
     def send_action(self, command, *, valid_until_ns, execute_until_ns=None):
@@ -264,7 +252,7 @@ class Robot:
     def validate_command(self, command, *, execute_until_ns=None):
         """组合预检必须先于任一执行器的副作用。"""
         self.check_owner()
-        if self.hand_stop_pending or self.stop_failure is not None:
+        if self.stop_failure is not None:
             raise RobotError("previous robot stop remains unresolved")
         if command.arm_qpos is not None:
             if not self.connected or self.arm is None or not self.arm.is_connected:
@@ -283,7 +271,7 @@ class Robot:
             now = time.monotonic_ns()
             if now >= valid_until_ns or (execute_until_ns is not None and now >= execute_until_ns):
                 raise TimeoutError("target submission deadline expired")
-            self.motion_active = True
+            self.stop_required = True
 
         try:
             if command.arm_qpos is not None:
@@ -306,19 +294,19 @@ class Robot:
         cast("ArmProcess", self.arm).begin_operation(command.run_id)
         self._send_action(command, valid_until_ns=valid_until_ns)
 
-    def home_arm(self, waypoints, target, run_id, abort_check, *, service, deadline_ns):
+    def home_arm(self, waypoints, target, run_id, abort_check, *, deadline_ns):
         self.check_owner()
-        if self.hand_stop_pending or self.stop_failure is not None:
+        if self.stop_failure is not None:
             raise RobotError("previous robot stop remains unresolved")
         if abort_check():
             raise OperationCancelled("arm HOME cancelled before submission")
-        self.motion_active = True
+        self.stop_required = True
         cast("ArmProcess", self.arm).home(
             waypoints,
             target,
             run_id,
             abort=abort_check,
-            service=service,
+            service=self.service_feedback,
             deadline_ns=deadline_ns,
         )
         if abort_check():
@@ -326,24 +314,20 @@ class Robot:
 
     def stop_hand(self, *, passive=False):
         if self.hand is None:
-            if self.hand_stop_pending:
-                raise RobotError("XHand stop unresolved after disconnect")
             return
-        self.hand_stop_pending = True
         frame = self.hand_feedback.latest
         if not passive and frame is not None:
             self.hand.stop(frame["qpos"][0], timestamp_ns=int(frame["timestamp_ns"][0]))
         else:
             self.hand.stop()
-        self.hand_stop_pending = False
 
     def stop(self):
         self.check_owner()
         self.stop_signal.set()
         errors = []
-        unresolved_motion = self.motion_active
+        unresolved_motion = self.stop_required
         if self.arm is not None or self.hand is not None:
-            self.motion_active = True
+            self.stop_required = True
         if self.arm is not None:
             try:
                 self.arm.request_stop()
@@ -365,10 +349,10 @@ class Robot:
             for error in errors[1:]:
                 logger.error("additional robot stop failure", exc_info=(type(error), error, error.__traceback__))
             raise errors[0]
-        self.motion_active = False
+        self.stop_required = False
 
     def service_idle(self):
-        if self.motion_active and (self.stop_signal.is_set() or self.emergency_signal.is_set()):
+        if self.stop_required and (self.stop_signal.is_set() or self.emergency_signal.is_set()):
             self.stop()
         if self.connected:
             self.service_feedback()
@@ -406,7 +390,7 @@ class Robot:
 
         self.connected = False
         if errors:
-            self.motion_active = True
+            self.stop_required = True
             for error in errors[1:]:
                 logger.error("additional robot close failure", exc_info=(type(error), error, error.__traceback__))
             raise errors[0]

@@ -12,7 +12,6 @@ from dexmani_real.robot.xarm7.config import (
 from dexmani_real.robot.xarm7.protocol import (
     ArmChannels,
     HomeRequest,
-    LifecycleReply,
     PrepareRequest,
 )
 
@@ -40,7 +39,7 @@ class ArmProcess:
         )
         self.pipe, self.child_pipe = self.ctx.Pipe()
         self.process = None
-        self.sequence = self.operation_id = 0
+        self.sequence = 0
         self.operation_unresolved = False
 
     @property
@@ -52,11 +51,8 @@ class ArmProcess:
         return self.io.fault.value.decode(errors="replace") or None
 
     def connect(self, *, check_services=None):
-        from ruckig import Ruckig
-
         from dexmani_real.robot.xarm7.worker import run_arm
 
-        Ruckig(7)
         if self.process is not None:
             raise RuntimeError("arm process is single-use")
 
@@ -116,9 +112,6 @@ class ArmProcess:
         frame.flags.writeable = False
         return frame
 
-    def update_health(self, *, health_until_ns):
-        self.io.health_until.value = int(health_until_ns)
-
     def limit_execution_until(self, deadline_ns):
         limit = self.io.execution_limit
         with limit.get_lock():
@@ -139,12 +132,6 @@ class ArmProcess:
         )
         self.sequence += 1
 
-    def receive_reply(self, identity) -> LifecycleReply:
-        reply = self.pipe.recv()
-        if reply.operation_id != identity:
-            raise RuntimeError("arm lifecycle reply mismatch")
-        return reply
-
     def request_operation(self, request, *, service, abort, deadline_ns):
         if not self.is_connected or self.operation_unresolved:
             raise RobotError("arm unavailable or previous operation unresolved")
@@ -153,7 +140,6 @@ class ArmProcess:
             raise OperationCancelled("arm operation cancelled before submission")
         if time.monotonic_ns() >= deadline_ns:
             raise TimeoutError("arm operation deadline expired before submission")
-        self.operation_id = request.operation_id
         self.pipe.send(request)
         received = False
         try:
@@ -163,20 +149,21 @@ class ArmProcess:
                     raise OperationCancelled("arm operation cancelled")
                 if time.monotonic_ns() >= deadline_ns or not self.is_connected:
                     raise TimeoutError("arm operation unresolved before deadline")
-            reply = self.receive_reply(request.operation_id)
+            error = self.pipe.recv()
             received = True
-            if reply.error is not None:
+            if error is not None:
                 if self.io.close_error.value:
-                    raise RobotError(self.io.close_error.value.decode(errors="replace")) from reply.error
-                if isinstance(reply.error, (OperationCancelled, TimeoutError)) or not isinstance(reply.error, Exception):
-                    raise reply.error
-                raise RobotError(f"arm operation failed: {reply.error}") from reply.error
+                    raise RobotError(self.io.close_error.value.decode(errors="replace")) from error
+                if isinstance(error, (OperationCancelled, TimeoutError)) or not isinstance(error, Exception):
+                    raise error
+                raise RobotError(f"arm operation failed: {error}") from error
             if abort():
                 raise OperationCancelled("arm operation cancelled")
             if time.monotonic_ns() >= deadline_ns:
                 raise TimeoutError("arm operation completed after deadline")
         except BaseException:
             self.request_stop()
+            # 取消回调可同步等待停止；退出请求等待后才交由收尾消费旧回复。
             self.operation_unresolved = not received
             raise
 
@@ -200,7 +187,7 @@ class ArmProcess:
     def prepare(self, run_id, *, service):
         self.begin_operation(run_id)
         self.request_operation(
-            PrepareRequest(self.operation_id + 1, run_id),
+            PrepareRequest(run_id),
             service=service,
             abort=lambda: self.io.run_id.value != run_id or self.io.stop.is_set(),
             deadline_ns=time.monotonic_ns() + int((HOME_CONVERGENCE_TIMEOUT_S + 2) * 1e9),
@@ -209,7 +196,7 @@ class ArmProcess:
     def home(self, waypoints, target, run_id, *, service, abort, deadline_ns):
         self.begin_operation(run_id)
         self.request_operation(
-            HomeRequest(self.operation_id + 1, run_id, waypoints, target, deadline_ns),
+            HomeRequest(run_id, waypoints, target, deadline_ns),
             service=service,
             abort=abort,
             deadline_ns=deadline_ns,
@@ -230,7 +217,7 @@ class ArmProcess:
                     raise TimeoutError(
                         "arm stopped but cancelled lifecycle operation remains unresolved"
                     )
-                self.receive_reply(self.operation_id)
+                self.pipe.recv()
                 self.operation_unresolved = False
         elif self.process is not None and self.process.exitcode not in (None, 0):
             raise RuntimeError(f"arm owner exited without confirming stop: {self.process.exitcode}")

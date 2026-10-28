@@ -359,7 +359,6 @@ class CameraCalibrator:
             self.runtime_state,
             self.robot,
             self.home_planner,
-            service=self.robot.service_feedback,
             cancel_requested=self.cancel_requested,
         )
         if self.runtime_state.estop_request:

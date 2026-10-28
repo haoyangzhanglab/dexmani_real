@@ -126,7 +126,6 @@ class KeyboardTeleop:
         self.jog.stop(self.robot, self.runtime_state)
         home_result = home_robot(
             self.runtime_state, self.robot, self.home_planner,
-            service=self.robot.service_feedback,
             cancel_requested=lambda: (
                 bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
                 or not self.keys.healthy

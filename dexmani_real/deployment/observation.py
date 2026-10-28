@@ -11,7 +11,6 @@ from dexmani_real.geometry.kinematics import (
     HandFK,
     eef_poses,
 )
-from dexmani_real.geometry.pose import quat_wxyz_to_rotmat
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.runtime.observation import ObservationNeeds
@@ -84,8 +83,6 @@ class ObservationBuilder:
                 info.fingertip_link_names
                 if "fingertips" in self.dependencies else XHAND_FINGERTIP_LINK_NAMES,
             )
-            self.handbase_position_eef_m = tuple(runtime.hand.T_eef_handbase_pos_xyz)
-            self.handbase_rotation_eef = quat_wxyz_to_rotmat(runtime.hand.T_eef_handbase_quat_wxyz)
             if "hand_cloud" in self.dependencies:
                 self.hand_cloud = HandPointCloud(self.hand_fk, runtime.hand_pointcloud.num_points)
 
@@ -143,7 +140,7 @@ class ObservationBuilder:
             elif name != "joint_state" and "arm_fk" not in sources:
                 arrays[name] = np.stack([r.values[name] for r in rows])
 
-        if "arm_fk" in dependencies:
+        if self.arm_fk is not None:
             new_rows = [row for row in rows if not row.features]
             features = {}
             if new_rows:
@@ -151,12 +148,10 @@ class ObservationBuilder:
                 poses = eef_poses(arm, arm_fk=self.arm_fk)
                 if "eef_pose" in fields:
                     features["eef_pose"] = poses.astype(np.float32)
-                if "hand_fk" in dependencies:
+                if self.hand_fk is not None:
                     features.update(hand_geometry(
                         poses, np.stack([r.values["hand_qpos"] for r in new_rows]),
-                        hand_fk=self.hand_fk,
-                        handbase_position_eef_m=self.handbase_position_eef_m,
-                        handbase_rotation_eef=self.handbase_rotation_eef,
+                        arm_fk=self.arm_fk, hand_fk=self.hand_fk,
                         hand_cloud=self.hand_cloud,
                         include_fingertips="fingertips" in dependencies,
                     ))

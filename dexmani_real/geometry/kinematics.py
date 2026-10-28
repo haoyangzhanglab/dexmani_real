@@ -1,18 +1,51 @@
 """xArm 基座系的机械臂 FK，以及手基座系的 XHand link FK。"""
 
+import xml.etree.ElementTree as ET
 from collections.abc import Sequence
+from pathlib import Path
 
 import numpy as np
 
 from dexmani_real.robot.model import (
-    HAND_SDK_TO_URDF_IDX,
-    XARM7_XHAND_COLLISION_URDF_PATH,
+    XARM7_JOINT_NAMES,
+    XARM7_XHAND_RIGHT_URDF_PATH,
     XHAND_FINGERTIP_LINK_NAMES,
-    XHAND_RIGHT_URDF_PATH,
-    XHAND_URDF_JOINT_NAMES,
+    XHAND_SDK_JOINT_NAMES,
 )
 
-SDK_TO_URDF_IDX = np.asarray(HAND_SDK_TO_URDF_IDX, dtype=np.intp)
+
+def kinematic_urdf(root_link: str, *, stop_link: str | None = None) -> str:
+    """从完整组合 URDF 提取运动学子树，保留原始 joint 定义并移除网格。"""
+    root = ET.parse(XARM7_XHAND_RIGHT_URDF_PATH).getroot()
+    if root_link not in {link.attrib["name"] for link in root.findall("link")}:
+        raise ValueError(f"robot URDF is missing {root_link}")
+    children: dict[str, list[tuple[str, str]]] = {}
+    for joint in root.findall("joint"):
+        parent, child = joint.find("parent"), joint.find("child")
+        if parent is None or child is None:
+            raise ValueError(f"URDF joint {joint.attrib['name']} must name its parent and child")
+        children.setdefault(parent.attrib["link"], []).append(
+            (joint.attrib["name"], child.attrib["link"]),
+        )
+    links, joints = set(), set()
+    pending = [root_link]
+    while pending:
+        name = pending.pop()
+        links.add(name)
+        if name != stop_link:
+            for joint_name, child_link in children.get(name, ()):
+                joints.add(joint_name)
+                pending.append(child_link)
+    for node in list(root):
+        if node.tag == "joint" and node.attrib["name"] not in joints:
+            root.remove(node)
+        elif node.tag == "link":
+            if node.attrib["name"] not in links:
+                root.remove(node)
+            else:
+                for geometry in (*node.findall("visual"), *node.findall("collision")):
+                    node.remove(geometry)
+    return ET.tostring(root, encoding="unicode")
 
 
 class ArmFK:
@@ -22,11 +55,19 @@ class ArmFK:
         import pinocchio as pin
 
         self.pin = pin
-        self.model = pin.buildModelFromUrdf(str(XARM7_XHAND_COLLISION_URDF_PATH))
+        self.model = pin.buildModelFromXML(kinematic_urdf("link_base", stop_link="right_hand_link"))
+        active = tuple(self.model.names[1:])
+        if self.model.nq != 7 or active != XARM7_JOINT_NAMES:
+            raise ValueError("arm FK active q order must match xArm7 URDF joints")
         self.data = self.model.createData()
         self.eef_frame_id = self.model.getFrameId("custom_eef_link")
-        if self.eef_frame_id >= self.model.nframes:
-            raise ValueError("arm URDF is missing custom_eef_link")
+        handbase_id = self.model.getFrameId("right_hand_link")
+        if max(self.eef_frame_id, handbase_id) >= self.model.nframes:
+            raise ValueError("arm URDF must include custom_eef_link and right_hand_link")
+        pin.forwardKinematics(self.model, self.data, np.zeros(self.model.nq))
+        eef = pin.updateFramePlacement(self.model, self.data, self.eef_frame_id)
+        handbase = pin.updateFramePlacement(self.model, self.data, handbase_id)
+        self.eef_from_handbase = (eef.inverse() * handbase).homogeneous
 
     def forward(self, qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         self.pin.forwardKinematics(self.model, self.data, np.asarray(qpos, dtype=np.float64))
@@ -36,31 +77,44 @@ class ArmFK:
 
 
 class HandFK:
-    def __init__(self, fingertip_link_names: Sequence[str] = XHAND_FINGERTIP_LINK_NAMES):
+    """默认提取整机中的手部子树；重定向可显式加载独立的纯手 URDF。"""
+
+    def __init__(
+        self,
+        fingertip_link_names: Sequence[str] = XHAND_FINGERTIP_LINK_NAMES,
+        *,
+        urdf_path: Path | None = None,
+    ):
         import pinocchio as pin
 
         self.pin = pin
-        self.model = pin.buildModelFromUrdf(str(XHAND_RIGHT_URDF_PATH))
+        self.model = (
+            pin.buildModelFromXML(kinematic_urdf("right_hand_link"))
+            if urdf_path is None else pin.buildModelFromUrdf(str(urdf_path))
+        )
         self.data = self.model.createData()
         active = sorted(
             (joint.idx_q, self.model.names[i])
             for i, joint in enumerate(self.model.joints)
             if i and joint.nq
         )
-        if self.model.nq != 12 or tuple(name for _, name in active) != XHAND_URDF_JOINT_NAMES:
-            raise ValueError("hand FK active q order must match XHand URDF joints")
+        if self.model.nq != 12 or {name for _, name in active} != set(XHAND_SDK_JOINT_NAMES):
+            raise ValueError("hand FK must contain the twelve XHand SDK joints")
+        self.sdk_to_urdf = np.array([
+            XHAND_SDK_JOINT_NAMES.index(name) for _, name in active
+        ], dtype=np.intp)
         if len(fingertip_link_names) != 5 or len(set(fingertip_link_names)) != 5:
             raise ValueError("hand FK requires five distinct fingertip frames")
         self.fingertip_frame_ids = tuple(self.model.getFrameId(n) for n in fingertip_link_names)
         if any(fid >= self.model.nframes for fid in self.fingertip_frame_ids):
             raise ValueError("fingertip frame is missing from the hand URDF")
 
-    def forward(self, qpos: np.ndarray, frame_ids) -> np.ndarray:
-        q = np.asarray(qpos, dtype=np.float64)[SDK_TO_URDF_IDX]
+    def forward(self, qpos: np.ndarray, frame_ids: Sequence[int]) -> np.ndarray:
+        q = np.asarray(qpos, dtype=np.float64)[self.sdk_to_urdf]
         self.pin.forwardKinematics(self.model, self.data, q)
         # stack 复制 placement，避免后续 FK 覆盖结果。
         return np.stack([
-            self.pin.updateFramePlacement(self.model, self.data, int(fid)).homogeneous
+            self.pin.updateFramePlacement(self.model, self.data, fid).homogeneous
             for fid in frame_ids
         ])
 

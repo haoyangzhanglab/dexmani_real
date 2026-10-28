@@ -262,9 +262,7 @@ class TeleopLoop:
             )
         self.capture_started_s = time.monotonic()
         try:
-            self.robot.prepare_streaming(
-                self.run_id, service=self.robot.service_feedback,
-            )
+            self.robot.prepare_streaming(self.run_id)
         except OperationCancelled:
             self.abort_episode("preparation_revoked")
             return
@@ -313,7 +311,6 @@ class TeleopLoop:
                 self.audio.play("home")
                 result = home_robot(
                     self.runtime_state, self.robot, self.home_planner,
-                    service=self.robot.service_feedback,
                     cancel_requested=self.poll_blocking_commands,
                 )
                 if result.ok:

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import numpy as np
 
@@ -100,8 +100,6 @@ class HandCloudModel:
             raise ValueError("num_points must cover every included visual link at least once")
         self.link_names = tuple(names)
         self._frame_ids = [self._model.getFrameId(name) for name in names]
-        if any(index >= self._model.nframes for index in self._frame_ids):
-            raise ValueError("visual link is absent from the FK model")
         areas = np.asarray([mesh.area for mesh in meshes])
         allocation = (int(num_points) - len(meshes)) * areas / areas.sum()
         counts = np.floor(allocation).astype(int) + 1
@@ -132,14 +130,14 @@ class HandCloudModel:
             "normals": "visual_mesh_face_normals",
         }
 
-    def transform(self, q, T_camera_handbase):
-        """Return fixed-order camera-frame points/normals for this measured state."""
+    def transform(self, q, T_camera_from_root):
+        """Map measured URDF joints and the URDF-root pose to camera-frame geometry."""
         if np.iscomplexobj(q):
-            raise ValueError("hand joint angles must be real")
+            raise ValueError("joint angles must be real")
         q = np.asarray(q, dtype=np.float64)
         if q.shape != (len(self.joint_names),) or not np.isfinite(q).all():
-            raise ValueError("hand joint angles must be finite and match joint_names")
-        pose = validate_pose(T_camera_handbase)
+            raise ValueError("joint angles must be finite and match joint_names")
+        pose = validate_pose(T_camera_from_root)
         configuration = np.empty(self._model.nq)
         configuration[self._q_indices] = q
         self._pin.forwardKinematics(self._model, self._data, configuration)
