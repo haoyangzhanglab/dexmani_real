@@ -209,16 +209,17 @@ class Robot:
                 if state.hand is not None:
                     deadline = min(deadline, int(state.hand["timestamp_ns"][0])
                                    + int(self.hand_config.feedback_max_age_s * 1e9))
-                self.arm.update_health(health_until_ns=deadline)
+                cast("ArmProcess", self.arm).update_health(health_until_ns=deadline)
             return state
         except BaseException:
             self.stop_signal.set()
             raise
 
-    def read_initial_state(self, *, cancel_requested=None):
+    def read_initial_state(self, *, required_tactile=(), cancel_requested=None):
         self.check_owner()
         run_id = self.run_signal.value
-        deadline_ns = self.hand_feedback.initializing_until_ns if self.hand is not None else None
+        deadline_ns = self.hand_feedback.initial_deadline_ns
+        max_age_ns = int(self.hand_config.feedback_max_age_s * 1e9)
 
         def check_wait():
             if (
@@ -227,15 +228,23 @@ class Robot:
                 or self.emergency_signal.is_set()
             ):
                 raise OperationCancelled("XHand initial feedback acquisition cancelled")
-            if deadline_ns is not None and time.monotonic_ns() >= deadline_ns:
-                raise RobotError("XHand initial feedback acquisition timed out")
+            if time.monotonic_ns() >= deadline_ns:
+                raise RobotError(
+                    "XHand initial feedback acquisition timed out; "
+                    f"required tactile={required_tactile}"
+                )
 
         while True:
             check_wait()
             state = self.service_feedback()
             check_wait()
-            if deadline_ns is None or state.hand is not None:
+            if self.hand is None:
                 return state
+            now_ns = time.monotonic_ns()
+            if state.hand is not None:
+                stamps = (int(state.hand[f"tactile_{name}_timestamp_ns"][0]) for name in required_tactile)
+                if all(0 < stamp <= now_ns < stamp + max_age_ns for stamp in stamps):
+                    return state
             remaining_ns = deadline_ns - time.monotonic_ns()
             if remaining_ns > 0:
                 time.sleep(min(0.01, remaining_ns / 1e9))

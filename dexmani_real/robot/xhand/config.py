@@ -90,6 +90,8 @@ class HandConfig:
     )
 
     feedback_max_age_s: float = 4 / 30
+    # 未经硬件定标的工程起点；达到该连续发送 CRC 次数即使普通位置发送失败。
+    send_crc_limit: int = 5
 
     home_timeout_s: float = 2.0
     home_tolerance_deg: float = 5.0
@@ -120,6 +122,8 @@ class HandConfig:
             raise ValueError("hand baudrate must be a positive integer")
         if not isinstance(self.device_id, int) or self.device_id < 0:
             raise ValueError("hand device_id must be a non-negative integer")
+        if type(self.send_crc_limit) is not int or self.send_crc_limit <= 0:
+            raise ValueError("hand send_crc_limit must be a positive integer")
         self.validate_home_pose()
         if len(self.kp) != 12 or any(not isinstance(value, int) or value <= 0 for value in self.kp):
             raise ValueError("hand kp must contain twelve positive integer gains")

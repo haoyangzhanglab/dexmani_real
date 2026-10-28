@@ -13,7 +13,11 @@ from dexmani_real.deployment.config import ExecutionConfig
 from dexmani_real.deployment.inference import PolicyWorker, PredictionResult
 from dexmani_real.deployment.rollout import Rollout
 from dexmani_real.deployment.schedule import (
-    ActionChunk, Prediction, control_slot, handoff_plan, plan_rejection,
+    ActionChunk,
+    Prediction,
+    control_slot,
+    handoff_plan,
+    plan_rejection,
 )
 from dexmani_real.deployment.session import PolicySession
 from dexmani_real.robot.commands import RobotError
@@ -22,7 +26,7 @@ from dexmani_real.runtime.preflight import validate_control_rate, validate_robot
 
 
 def make_rollout(env, clock, *, mode="sync", action_steps=1, dt=0.0625, delay_ms=20,
-                 hand_history_steps=None):
+                 hand_history_steps=None, control_tactile=(), record_tactile=()):
     runtime = replace(env.runtime, execution=ExecutionConfig(
         mode=mode, action_steps=action_steps, prefetch_steps=1, rtc_guidance_cap=1,
     ))
@@ -66,9 +70,11 @@ def make_rollout(env, clock, *, mode="sync", action_steps=1, dt=0.0625, delay_ms
         control_from_command=lambda command, mode: np.r_[command.arm_qpos, command.hand_qpos],
         frozen_rejection=lambda *args: None,
     )
+    control_needs = ObservationNeeds(required_tactile=control_tactile)
+    record_needs = ObservationNeeds(required_tactile=record_tactile)
     rollout = Rollout(env.state, runtime, info, preparing_epoch=env.state.run_id,
-                      robot=env.robot, observations=SimpleNamespace(needs=ObservationNeeds(), project=project),
-                      record_needs=ObservationNeeds(), needs=ObservationNeeds(),
+                      robot=env.robot, observations=SimpleNamespace(needs=control_needs, project=project),
+                      record_needs=record_needs, needs=control_needs.union(record_needs),
                       sensors=SimpleNamespace(channels=None), action_mapper=mapper, model=Model(),
                       max_running_s=None, capture_ids=count(1), index=1, output_dir=None,
                       record_raw=False)
@@ -81,6 +87,28 @@ def tick(env, rollout, clock, ms):
     clock.at(ms)
     env.robot.service_feedback()
     rollout.step()
+
+
+@pytest.mark.parametrize("control_tactile,record_tactile", [
+    (("dense",), ()), ((), ("aggregate", "dense")),
+])
+def test_rollout_preparation_waits_for_policy_and_recording_tactile(
+    robot_fixture, clock, monkeypatch, control_tactile, record_tactile,
+):
+    env = robot_fixture
+    original = env.robot.hand.get_state
+
+    def read():
+        sample = original()
+        if clock.now < clock.origin + 70_000_000:
+            sample.tactile_dense = None
+        return sample
+
+    monkeypatch.setattr(env.robot.hand, "get_state", read)
+    rollout, projected, _ = make_rollout(env, clock, control_tactile=control_tactile,
+                                        record_tactile=record_tactile)
+    assert not rollout.finished and len(projected) == 1
+    assert rollout.started_ns >= clock.origin + 70_000_000
 
 
 def test_async_skips_time_slots_without_reanchoring():

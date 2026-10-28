@@ -17,7 +17,7 @@ from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
 from dexmani_real.utils.timing import sampling_clock_ns
 
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
-TACTILE_PROCESSING = "sdk_native_bounded_previous_valid_vector_hold"
+TACTILE_PROCESSING = "sdk_native_bounded_previous_valid_channel_frame_hold"
 TACTILE_UNITS = "sdk_native_unknown_physical_scale"
 TACTILE_AXES = "sdk_sensor_axes_not_world_frame"
 TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
@@ -35,7 +35,7 @@ DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
 }
 
 
-# 主机单调时钟；缺失用 -1，触觉保留最早有效向量的来源时间。
+# 主机单调时钟；缺失用 -1，触觉时间为最后一份完整通道帧的来源时间。
 TIMING_ROW_DTYPE = np.dtype(
     [
         (name, "<i8")
@@ -334,7 +334,7 @@ class RawReader:
         self.rgb_path = self.path / "rgb.mp4"
         self.video_container = None
         self.dataset_cache: dict[str, h5py.Dataset] = {}
-        self.tactile_hold_max_age_s = None
+        self.tactile_hold_max_age_s: float | None = None
         with ExitStack() as resources:
             self.data_file = resources.enter_context(h5py.File(self.path / "data.h5", "r"))
             meta = self.meta
@@ -415,7 +415,7 @@ class RawReader:
         """物理回放的严格整段准入；训练导出另行选择连续前缀。"""
         chunk_frames = 4096
         timing = self["timing/rows"]
-        fields = ("observation_ns", "control_ns", "arm_ns", "hand_ns")
+        fields: tuple[str, ...] = ("observation_ns", "control_ns", "arm_ns", "hand_ns")
         fields += tuple(f"tactile_{name}_ns" for name in required_tactile)
         if require_camera:
             fields += ("camera_ns", "camera_sequence")

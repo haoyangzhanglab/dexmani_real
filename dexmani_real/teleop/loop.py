@@ -231,6 +231,7 @@ class TeleopLoop:
         self.robot.reset_hand_feedback()
         try:
             self.robot.read_initial_state(
+                required_tactile=self.needs.required_tactile,
                 cancel_requested=lambda: (
                     self.poll_blocking_commands() or not self.preparation_valid()
                 ),

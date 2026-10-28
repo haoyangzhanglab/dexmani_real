@@ -132,13 +132,13 @@ class XHandControlExample(XHand):
         print("  joint positions (deg, SDK ids 0..11):", np.rad2deg(state.qpos).round(3).tolist())
         if finger_id in XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID:
             index = XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID[finger_id]
-            force = state.tactile_aggregate[index]
-            print("  calc_pressure:", force.tolist() if np.isfinite(force).all() else "unavailable")
-            dense = state.tactile_dense[index]
-            if np.isfinite(dense).all():
-                print(f"  raw_pressure: points={len(dense)} max_abs={np.abs(dense).max():.3f}")
+            force = state.tactile_aggregate
+            print("  tactile aggregate (SDK units):", force[index].tolist() if force is not None else "unavailable")
+            if state.tactile_dense is not None:
+                dense = state.tactile_dense[index]
+                print(f"  tactile dense (SDK units): points={len(dense)} max_abs={np.abs(dense).max():.3f}")
             else:
-                print("  raw_pressure: unavailable")
+                print("  tactile dense (SDK units): unavailable")
         return True
 
     def read_action_positions(self, *, action_deadline_ns: int | None = None) -> np.ndarray:
@@ -184,15 +184,14 @@ class XHandControlExample(XHand):
         if not self.motion_pending:
             return
         started_ns = time.monotonic_ns()
+        measured = None
         try:
             # Cleanup must still read/stop after the operator has cancelled.
             state = self.get_state()
             measured = None if state is None else state.qpos
-        except Exception as exc:
-            print(f"  Stop feedback unavailable ({exc}); requesting vendor passive mode")
-            measured, started_ns = None, 0
-        self.stop(measured, timestamp_ns=started_ns)
-        self.motion_pending = False
+        finally:
+            self.stop(measured, timestamp_ns=started_ns)
+            self.motion_pending = False
         print("  Stop command accepted by SDK")
 
 

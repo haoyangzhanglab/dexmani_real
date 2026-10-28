@@ -10,7 +10,12 @@ import zarr
 
 from dexmani_real.config import RealConfig
 from dexmani_real.data.export import ExportConfig, export_zarr, validate_export_episode
-from dexmani_real.data.raw import RawReader, RawWriter, snapshot_recording_metadata
+from dexmani_real.data.raw import (
+    TACTILE_PROCESSING,
+    RawReader,
+    RawWriter,
+    snapshot_recording_metadata,
+)
 from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
 from dexmani_real.deployment.inference import PolicyWorker
 from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
@@ -67,8 +72,63 @@ def export(raw, target):
     ))
 
 
+def test_whole_tactile_frame_hold_preserves_values_and_source_times(tmp_path):
+    raw = write_raw(tmp_path / "episode_tactile")
+    with h5py.File(raw / "data.h5", "r+") as file:
+        rows = file["timing/rows"][:]
+        rows["tactile_dense_ns"][1] = rows["tactile_dense_ns"][0]
+        file["timing/rows"][:] = rows
+        file["hand_tactile_force"][1] = file["hand_tactile_force"][0]
+        expected = file["hand_tactile_force"][:]
+    with RawReader(raw) as reader:
+        assert reader.meta["hand_tactile_processing"] == TACTILE_PROCESSING
+        np.testing.assert_array_equal(reader["hand_tactile_force"][:], expected)
+        np.testing.assert_array_equal(reader["timing/rows"][:], rows)
+        reader.validate_rows()
+    result = export(raw, tmp_path / "train.zarr")
+    assert result["total_frames"] == 6
+    root = zarr.open_group(str(tmp_path / "train.zarr"), mode="r")
+    np.testing.assert_array_equal(root["data/taxel_tactile_force"][:], expected)
+    with RawReader(raw) as reader:
+        assert reader.meta["hand_tactile_processing"] == TACTILE_PROCESSING
+        np.testing.assert_array_equal(reader["timing/rows"][:], rows)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("hand_tactile_processing", "unknown"),
+    ("hand_tactile_processing", "sdk_native_bounded_previous_valid_vector_hold"),
+    ("hand_tactile_units", "newtons"),
+    ("hand_tactile_axes", "world"),
+    ("hand_tactile_finger_order", "reversed"),
+    ("hand_tactile_hold_max_age_s", 0),
+    ("hand_tactile_hold_max_age_s", np.nan),
+    ("joint_units", "deg"),
+])
+def test_tactile_metadata_rejects_unsupported_semantics(tmp_path, field, value):
+    raw = write_raw(tmp_path / "episode_bad_metadata")
+    with h5py.File(raw / "data.h5", "r+") as file:
+        file["meta"].attrs[field] = value
+    with pytest.raises(ValueError, match=field), RawReader(raw) as reader:
+        reader["hand_contact"]
+
+
+def test_tactile_age_budget_rejects_stale_held_frames(tmp_path):
+    raw = write_raw(tmp_path / "episode_stale_tactile")
+    with h5py.File(raw / "data.h5", "r+") as file:
+        rows = file["timing/rows"][:]
+        rows["tactile_dense_ns"] = rows["tactile_dense_ns"][0]
+        file["timing/rows"][:] = rows
+    with RawReader(raw) as reader:
+        with pytest.raises(ValueError, match="dense exceeds hold age budget"):
+            reader.validate_rows()
+        _, quality = validate_export_episode(reader)
+    assert quality["row_stop"] == 3 and quality["trim_reason"] == "stale_source:tactile_dense_ns"
+
+
 def test_readout_jitter_exports_without_changing_physical_replay(tmp_path):
     raw = write_raw(tmp_path / "episode_jitter", jitter=True)
+    with RawReader(raw) as reader:
+        assert reader.meta["hand_tactile_processing"] == TACTILE_PROCESSING
     result = export(raw, tmp_path / "train.zarr")
     assert result["total_frames"] == 6
     quality = result["episode_quality"][0]

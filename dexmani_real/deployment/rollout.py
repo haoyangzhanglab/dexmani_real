@@ -262,7 +262,10 @@ class Rollout:
     def prepare(self):
         try:
             self.robot.reset_hand_feedback()
-            self.robot.read_initial_state(cancel_requested=lambda: not self.preparation_valid())
+            self.robot.read_initial_state(
+                required_tactile=self.needs.required_tactile,
+                cancel_requested=lambda: not self.preparation_valid(),
+            )
             if not self.preparation_valid():
                 raise OperationCancelled("cancelled during initial feedback acquisition")
             row = self.start_observation()
@@ -608,7 +611,7 @@ class Rollout:
                 return
             self.previous_arm = command.arm_qpos
             if self.hand_history is not None:
-                # 只在提交正常返回后推进动作历史。
+                # 记录正常返回的提交尝试，包含 CRC 未确认执行的目标。
                 self.hand_history.append(command.hand_qpos.copy())
             self.wait_deadline_ns = None
             if slot + 1 == self.plan.segment_end and self.execution.mode == "sync":
