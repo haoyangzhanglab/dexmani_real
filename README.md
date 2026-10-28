@@ -79,6 +79,18 @@ python scripts/generate_hand_template.py --num-points 1024 --overwrite
 
 Raw episode 默认保存在 `episodes/TASK/`，训练数据导出到 `datasets/TASK.zarr`；策略评估和回放结果分别位于 `rollouts/`、`replay_results/`。Raw 保存实测反馈与提交目标，提交目标不表示硬件已执行到位。
 
+遥操作的 `data.h5` 还逐行保存该次观测消费的右手 VR 输入，仅用于调试，不导出到 zarr：
+
+| 字段 | 单行形状与含义 |
+| --- | --- |
+| `vr_wrist_pos` | `(3,)`，手腕位置，单位米 |
+| `vr_wrist_quat_wxyz` | `(4,)`，手腕旋转，四元数顺序 wxyz |
+| `vr_landmarks` | `(21, 3)`，SDK 原始顺序的手部关键点，单位米 |
+| `vr_recv_ts_ns` | 手腕与关键点中较早的主机单调接收时间，单位纳秒 |
+| `vr_sequence_id` | SDK 来源帧号，重复消费同一 VR 帧时保持不变 |
+
+位姿和关键点保留接收端转换后的 FLU（前、左、上）表示，尚未进行机器人映射、平滑或手部重定向；浮点字段为 float64，时间和帧号为 uint64。录制频率跟随 Raw 控制周期，不额外保存 VR 全速流。VR 列在遥操作录制启动时确定，每行直接写入对应输入；策略录制不创建这些字段。
+
 | 目录 | 职责 |
 | --- | --- |
 | [robot/](dexmani_real/robot/) · [sensor/](dexmani_real/sensor/) | 设备驱动与采集 |

@@ -23,7 +23,7 @@ TACTILE_AXES = "sdk_sensor_axes_not_world_frame"
 TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
 
 
-DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
+ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
     "arm_qpos": ((7,), np.dtype(np.float64)),
     "hand_qpos": ((12,), np.dtype(np.float64)),
     # 触觉保留 SDK 单位和限时保持语义。
@@ -32,6 +32,16 @@ DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
     # 记录最终提交的绝对目标，包括失败的提交尝试。
     "action_arm_joint_target": ((7,), np.dtype(np.float64)),
     "action_hand_joint_target": ((12,), np.dtype(np.float64)),
+}
+
+
+# 仅供遥操作调试，不参与训练导出的字段与有效前缀判定。
+VR_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
+    "vr_wrist_pos": ((3,), np.dtype(np.float64)),
+    "vr_wrist_quat_wxyz": ((4,), np.dtype(np.float64)),
+    "vr_landmarks": ((21, 3), np.dtype(np.float64)),
+    "vr_recv_ts_ns": ((), np.dtype(np.uint64)),
+    "vr_sequence_id": ((), np.dtype(np.uint64)),
 }
 
 
@@ -58,7 +68,7 @@ def encode_raw_row(row, command):
         row.arm[0],
         None if row.hand is None else row.hand[0],
     )
-    values = {
+    return {
         "arm_qpos": arm["qpos"],
         "hand_qpos": hand["qpos"] if hand is not None else np.full(12, np.nan),
         "hand_contact": hand["tactile_aggregate"] if hand is not None else np.full((5, 3), np.nan),
@@ -76,7 +86,6 @@ def encode_raw_row(row, command):
             else np.full(12, np.nan)
         ),
     }
-    return values
 
 
 def encode_timing_row(row):
@@ -216,14 +225,25 @@ class RawWriter:
             arm_joint_names=json.dumps(XARM7_JOINT_NAMES),
             hand_joint_names=json.dumps(XHAND_SDK_JOINT_NAMES),
         )
+        specs = ROBOT_DATASET_SPECS
+        if metadata["collection_source"] == "teleop":
+            specs = specs | VR_DATASET_SPECS
+            self.meta.attrs.update(
+                vr_hand_side="right",
+                vr_coordinate_axes="FLU",
+                vr_position_units="m",
+                vr_landmark_order="sdk_original",
+                vr_timestamp_source="oldest_channel_first_host_receive_monotonic",
+            )
         self.datasets = {
             name: data.create_dataset(
                 name,
                 shape=(0, *tail_shape),
                 maxshape=(None, *tail_shape),
+                chunks=(32, *tail_shape),
                 dtype=dtype,
             )
-            for name, (tail_shape, dtype) in DATASET_SPECS.items()
+            for name, (tail_shape, dtype) in specs.items()
         }
         timing = data.create_group("timing")
         timing.attrs.update(
@@ -269,15 +289,17 @@ class RawWriter:
         if stamp <= 0 or (self.previous_stamp is not None and stamp <= self.previous_stamp):
             raise ValueError("recording observation timestamps must be positive and increasing")
         values = encode_raw_row(row, command)
+        if "vr_landmarks" in self.datasets:
+            values.update({name: row.vr[name.removeprefix("vr_")] for name in VR_DATASET_SPECS})
         rgb, depth = row.camera["rgb"], row.camera["depth"]
         if rgb.shape != self.rgb_shape or rgb.dtype != np.uint8:
             raise ValueError("RGB shape or dtype mismatch")
         if depth.shape != self.rgb_shape[:2] or depth.dtype != np.uint16:
             raise ValueError("depth shape or dtype mismatch")
         timing = encode_timing_row(row)
-        for name, value in values.items():
-            self.arrays[name][self.buffered] = value
-        self.arrays["depth"][self.buffered] = depth
+        values["depth"] = depth
+        for name, array in self.arrays.items():
+            array[self.buffered] = values[name]
         self.timing_rows[self.buffered] = timing
         self.video.write_frame(rgb)
         self.buffered += 1
@@ -377,7 +399,10 @@ class RawReader:
             if name in {"hand_contact", "hand_tactile_force"}:
                 self.validate_tactile_metadata()
             array = self.data_file[name]
-            spec = ((), TIMING_ROW_DTYPE) if name == "timing/rows" else DATASET_SPECS.get(name)
+            spec = (
+                ((), TIMING_ROW_DTYPE) if name == "timing/rows"
+                else ROBOT_DATASET_SPECS.get(name, VR_DATASET_SPECS.get(name))
+            )
             if spec is not None:
                 shape, dtype = spec
                 if array.shape != (self.num_frames, *shape) or array.dtype != dtype:
@@ -411,15 +436,11 @@ class RawReader:
     def read_timing_rows(self, fields):
         return self["timing/rows"].fields(tuple(fields))[:]
 
-    def validate_rows(self, *, required_tactile=("aggregate", "dense"), require_camera=True):
+    def validate_replay_timing(self):
         """物理回放的严格整段准入；训练导出另行选择连续前缀。"""
         chunk_frames = 4096
         timing = self["timing/rows"]
-        fields: tuple[str, ...] = ("observation_ns", "control_ns", "arm_ns", "hand_ns")
-        fields += tuple(f"tactile_{name}_ns" for name in required_tactile)
-        if require_camera:
-            fields += ("camera_ns", "camera_sequence")
-        max_age_ns = self.validate_tactile_metadata() * 1e9 if required_tactile else None
+        fields = ("observation_ns", "control_ns", "arm_ns", "hand_ns")
         dt_ns, tolerance_ns = sampling_clock_ns(self.control_hz)
         first_observation = None
         for start in range(0, self.num_frames, chunk_frames):
@@ -444,17 +465,10 @@ class RawReader:
                 )
             for name in fields[1:]:
                 values = rows[name]
-                if name == "camera_sequence":
-                    if np.any(values < 0) or np.any(np.diff(values) < 0):
-                        raise ValueError("camera sequence must be nonnegative and nondecreasing")
-                    continue
                 if np.any(values <= 0) or np.any(values > observation):
                     raise ValueError(f"invalid consumed source clock: {name}")
                 if np.any(np.diff(values) < 0):
                     raise ValueError(f"consumed source clock regressed: {name}")
-            for name in required_tactile:
-                if np.any(observation - rows[f"tactile_{name}_ns"] >= max_age_ns):
-                    raise ValueError(f"consumed tactile {name} exceeds hold age budget")
 
     @property
     def timestamps_s(self):

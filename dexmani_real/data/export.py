@@ -12,7 +12,7 @@ from typing import Any, cast
 import numpy as np
 import zarr
 
-from dexmani_real.data.raw import DATASET_SPECS, RawReader
+from dexmani_real.data.raw import ROBOT_DATASET_SPECS, RawReader
 from dexmani_real.geometry.camera import (
     CameraSnapshot,
     camera_parameters_cv,
@@ -86,7 +86,7 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     frames = reader.num_frames
     if frames <= 0:
         raise ValueError("episode contains no rows")
-    reader.require_fields(*DATASET_SPECS, "rgb", "depth")
+    reader.require_fields(*ROBOT_DATASET_SPECS, "rgb", "depth")
     camera = reader.read_camera()
     validate_aligned_depth_distortion(camera.color.distortion_model)
     if camera.T_xarm_base_from_color is None:
@@ -99,7 +99,7 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
         logger.warning(
             "%s: single row, no sampling interval to verify", reader.path
         )
-    for name in DATASET_SPECS:
+    for name in ROBOT_DATASET_SPECS:
         reader[name]
     return camera, training_prefix(reader)
 
@@ -147,7 +147,7 @@ def training_prefix(reader: RawReader) -> dict:
     for start in range(0, end, 4096):
         if start >= end:
             break
-        for name in DATASET_SPECS:
+        for name in ROBOT_DATASET_SPECS:
             values = reader[name][start:min(end, start + 4096)]
             valid = np.isfinite(values).reshape(len(values), -1).all(axis=1)
             cut_at(~valid, f"nonfinite:{name}", start)
@@ -207,7 +207,7 @@ def iter_canonical_blocks(
     images = reader.iter_rgb_frames()
     for start in range(0, frames, chunk_frames):
         end = min(frames, start + chunk_frames)
-        raw = {name: reader[name][start:end] for name in DATASET_SPECS}
+        raw = {name: reader[name][start:end] for name in ROBOT_DATASET_SPECS}
         arm, hand = raw["arm_qpos"], raw["hand_qpos"]
         arm_action, hand_action = (
             raw["action_arm_joint_target"],

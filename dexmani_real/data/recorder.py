@@ -5,10 +5,9 @@ import os
 import shutil
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty, Full, Queue
-from types import SimpleNamespace
 
 import numpy as np
 
@@ -161,13 +160,7 @@ class EpisodeRecorder:
         if not self.is_recording:
             return
         # 数组已脱离共享缓冲，入队后生产者不再修改。
-        snapshot = SimpleNamespace(
-            arm=row.arm,
-            hand=row.hand,
-            camera=row.camera,
-            observation_timestamp_ns=row.observation_timestamp_ns,
-            control_timestamp_ns=row.control_timestamp_ns,
-        )
+        snapshot = replace(row, point_cloud=None)
         try:
             self.queue.put_nowait((snapshot, command))
         except Full as exc:
