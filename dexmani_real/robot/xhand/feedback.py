@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
     HAND_TACTILE_FORCE_SHAPE,
@@ -35,12 +36,8 @@ class XHandState:
     """关节数据可信，触觉仍可能包含无效值。"""
 
     qpos: np.ndarray
-    current_ma: np.ndarray
     tactile_aggregate: np.ndarray
     tactile_dense: np.ndarray
-    commboard_err: np.ndarray
-    jointboard_err: np.ndarray
-    tipboard_err: np.ndarray
 
 
 def update_tactile_cache(raw, values, valid_ns, source_ns):
@@ -109,5 +106,5 @@ class XHandFeedback:
         if self.initializing_until_ns is not None:
             if now_ns < self.initializing_until_ns:
                 return None
-            raise RuntimeError("XHand initial feedback timed out: no fresh joint state")
-        raise RuntimeError("XHand joint feedback unavailable/stale")
+            raise RobotError("XHand initial feedback timed out: no fresh joint state")
+        raise RobotError("XHand joint feedback unavailable/stale")

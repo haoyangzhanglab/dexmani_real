@@ -16,11 +16,7 @@ from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.raw import camera_metadata
 from dexmani_real.data.recorder import RecordingError
-from dexmani_real.deployment.observation import (
-    ObservationBuilder,
-    policy_dependencies,
-    policy_needs,
-)
+from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.rollout import Rollout, failure_reason, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
@@ -34,7 +30,6 @@ from dexmani_real.runtime.lifecycle import (
     SensorWorkers,
     close_runtime,
 )
-from dexmani_real.runtime.observation import ObservationNeeds, service_feedback
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.io import write_json, write_yaml
@@ -48,6 +43,7 @@ class PolicySession:
     def __init__(
         self, runtime, info, *, output_dir, run_config, device, seed,
         max_running_s, num_episodes, record_raw, camera_calibration_path, table_plane_abcd,
+        dependencies, control_needs, record_needs, needs,
     ):
         self.run_config = run_config
         self.runtime, self.info = runtime, info
@@ -57,12 +53,8 @@ class PolicySession:
         self.record_raw = record_raw
         self.output_dir = output_dir
         self.camera_calibration_path = camera_calibration_path
-        self.control_needs = policy_needs(policy_dependencies(info.observation_fields))
-        self.record_needs = (
-            ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
-            if record_raw else ObservationNeeds()
-        )
-        self.needs = self.control_needs.union(self.record_needs)
+        self.dependencies = dependencies
+        self.control_needs, self.record_needs, self.needs = control_needs, record_needs, needs
         self.control_services = tuple(
             name for name, needed in (
                 ("camera", bool(self.control_needs.camera_fields) or self.control_needs.point_cloud),
@@ -146,7 +138,9 @@ class PolicySession:
         else:
             self.camera_calibration = None
         self.camera_snapshot = None
-        self.observations = ObservationBuilder(self.info, self.runtime)
+        self.observations = ObservationBuilder(
+            self.info, self.runtime, dependencies=self.dependencies, needs=self.control_needs,
+        )
         self.action_mapper = ActionMapper.for_mode(
             self.info.action_mode, arm=self.runtime.arm, hand=self.runtime.hand,
             motion=self.runtime.motion, environment=self.runtime.environment,
@@ -425,7 +419,7 @@ class PolicySession:
         logger.info("正在回初始位…")
         result = home_robot(
             self.runtime_state, self.robot, self.home_planner,
-            service=lambda: service_feedback(self.robot, self.runtime),
+            service=self.robot.service_feedback,
             cancel_requested=self.home_abort_requested,
         )
         with self.runtime_state.motion_lock:
@@ -487,6 +481,7 @@ class PolicySession:
                 self.runtime_state, self.runtime, self.info, preparing_epoch=epoch,
                 robot=self.robot, sensors=self.sensors, observations=self.observations,
                 record_needs=self.record_needs, action_mapper=self.action_mapper, model=self.model,
+                needs=self.needs,
                 max_running_s=self.max_running_s, capture_ids=self.capture_ids,
                 index=len(self.episodes) + 1, output_dir=self.output_dir, record_raw=self.record_raw,
                 camera_snapshot=self.camera_snapshot,
@@ -497,8 +492,6 @@ class PolicySession:
             if shutdown:
                 episode.stop(
                     str(failure) if failure else "shutdown", run_end_reason=reason,
-                    errors=[error_detail("session", failure)]
-                    if failure is not None and not isinstance(failure, KeyboardInterrupt) else [],
                 )
             else:
                 episode.step()
@@ -533,7 +526,12 @@ class PolicySession:
                 episode.refresh_raw()
                 self.episode = None
         if error is not None:
-            raise error
+            # 单轮已登记主因并完成收尾；外层只登记不属于单轮的新故障。
+            logger.error("policy episode failed", exc_info=(type(error), error, error.__traceback__))
+            if not isinstance(error, Exception):
+                raise error
+            self.runtime_state.mark_error()
+            self.runtime_state.end_session(reason=failure_reason(error))
 
     def run_control_loop(self):
         while self.runtime_state.running and not self.runtime_state.quit_requested:
@@ -551,6 +549,8 @@ class PolicySession:
                     self.episode is None or self.episode.finished
                 ):
                     self.runtime_state.acknowledge_stop(self.runtime_state.run_id)
+            else:
+                self.robot.service_feedback()
             self.advance_episode()
             running = self.episode is not None and self.episode.run_id is not None
             time.sleep(0.001 if running else 0.005)

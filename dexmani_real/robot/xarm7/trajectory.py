@@ -11,19 +11,17 @@ class ArmTrajectory:
 
         self.lower = np.asarray(cfg.joint_limit_lower)
         self.upper = np.asarray(cfg.joint_limit_upper)
-        self.vmax = cfg.max_joint_velocity_rad_per_s
-        self.amax = cfg.max_joint_acceleration_rad_per_s2
         self.otg = Ruckig(7)
         self.input = InputParameter(7)
-        self.input.max_velocity = [self.vmax] * 7
-        self.input.max_acceleration = [self.amax] * 7
+        self.input.max_velocity = [cfg.max_joint_velocity_rad_per_s] * 7
+        self.input.max_acceleration = [cfg.max_joint_acceleration_rad_per_s2] * 7
         # Ruckig 0.17.3 的默认无限 jerk 选择二阶轨迹。
         self.input.target_velocity = [0.0] * 7
         self.q = validate_arm_target(q, self.lower, self.upper).copy()
         self.v = np.array(v, dtype=np.float64, copy=True)
         if self.v.shape != (7,) or not np.isfinite(self.v).all():
             raise ValueError("invalid initial arm velocity")
-        if np.any(np.abs(self.v) > self.vmax + 1e-8):
+        if np.any(np.abs(self.v) > cfg.max_joint_velocity_rad_per_s + 1e-8):
             raise ValueError("initial arm velocity exceeds limit")
         self.origin_ns = self.sample_ns = int(now_ns)
         self._plan(self.q, now_ns)
@@ -36,21 +34,10 @@ class ArmTrajectory:
             )
             if not all(np.isfinite(value).all() for value in (q, v, a)):
                 raise ValueError("non-finite arm reference")
-            if np.any(q < self.lower) or np.any(q > self.upper):
-                raise ValueError("arm reference violates joint limits")
-            if np.any(np.abs(v) > self.vmax + 1e-8) or np.any(np.abs(a) > self.amax + 1e-8):
-                raise ValueError("reference exceeds velocity/acceleration limits")
-
-            dt = (now_ns - self.sample_ns) / 1e9
-            if np.any(np.abs(q - self.q) > self.vmax * dt + 1e-8) or np.any(
-                np.abs(v - self.v) > self.amax * dt + 1e-8
-            ):
-                raise ValueError("unsafe reference step")
             self.q, self.v, self.sample_ns = q, v, int(now_ns)
 
         if goal is not None and not np.array_equal(goal, self.goal):
-            target = validate_arm_target(goal, self.lower, self.upper)
-            self._plan(target, now_ns)
+            self._plan(goal, now_ns)
         return self.q
 
     def _plan(self, goal, now_ns):

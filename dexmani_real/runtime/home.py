@@ -73,7 +73,7 @@ def home_arm(state, robot, planner, *, cancel_requested, service):
         while time.monotonic() < deadline:
             if cancelled():
                 return HomeResult(False, "home interrupted", interrupted=True)
-            feedback = robot.read_state()
+            feedback = robot.service_feedback()
             arm_state = feedback.arm
             feedback_issue = "fresh stationary arm state unavailable"
             if (
@@ -159,7 +159,7 @@ def home_hand(state, robot, *, cancel_requested):
         while time.monotonic_ns() < deadline:
             if cancelled():
                 return HomeResult(False, "home interrupted", interrupted=True)
-            feedback = robot.read_state().hand
+            feedback = robot.service_feedback().hand
             if feedback is not None:
                 sample = feedback[0]
                 stamp = int(sample["timestamp_ns"])

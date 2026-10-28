@@ -1,4 +1,4 @@
-"""关节等价角、连续性与运动目标约束。"""
+"""关节等价角、运行限位与运动目标端点约束。"""
 
 import numpy as np
 
@@ -6,21 +6,13 @@ from dexmani_real.control.collision import CollisionModel
 from dexmani_real.geometry.kinematics import ArmFK
 from dexmani_real.robot.model import XARM7_EQUIVALENT_JOINT_MASK
 
-JUMP_LIMIT_RAD = np.deg2rad((30, 30, 30, 35, 40, 40, 40))
 EQUIVALENT_JOINTS = np.asarray(XARM7_EQUIVALENT_JOINT_MASK, dtype=bool)
 
 
-def joint_target_rejection(q, current, previous, limits):
-    if q.shape != (7,) or not np.isfinite(q).all():
-        return "invalid_target"
+def joint_target_rejection(q, limits):
     lower, upper = limits.T
     if np.any(q < lower) or np.any(q > upper):
         return "operational_limits"
-    # 硬件接收绝对角度，跳变检查不能使用周期最短距离。
-    if np.any(np.abs(q - previous) > JUMP_LIMIT_RAD):
-        return "jump"
-    if np.max(np.abs(q - current)) > np.deg2rad(150):
-        return "hw_dist"
     return None
 
 
@@ -55,11 +47,8 @@ class MotionConstraints:
         self.workspace = environment.workspace.as_array()
         self.margin = environment.eef_workspace_margin_m
 
-    def joint_rejection(self, target, current, previous):
-        return joint_target_rejection(target, current, previous, self.limits)
-
-    def rejection(self, target, current, previous, *, collision_hand_qpos):
-        reason = self.joint_rejection(target, current, previous)
+    def rejection(self, target, *, collision_hand_qpos):
+        reason = joint_target_rejection(target, self.limits)
         if reason is not None:
             return reason
         self.collision_model.set_hand_qpos(collision_hand_qpos)

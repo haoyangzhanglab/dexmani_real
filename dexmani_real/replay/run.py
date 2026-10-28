@@ -14,7 +14,6 @@ from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime
-from dexmani_real.runtime.observation import service_feedback
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 from dexmani_real.runtime.state import SessionState
 from dexmani_real.utils.io import write_json
@@ -91,7 +90,7 @@ def run_replay(
         trajectory_status = outcome.status.value
         if outcome.successful:
             wait_for_home(
-                runtime_state, runtime, robot, keyboard, home_planner, outcome, summary["home_results"],
+                runtime_state, robot, keyboard, home_planner, outcome, summary["home_results"],
             )
     except OperationCancelled as exc:
         outcome.status = (
@@ -140,7 +139,7 @@ def run_replay(
     return outcome
 
 
-def wait_for_home(runtime_state, runtime, robot, keyboard, home_planner, outcome, home_results):
+def wait_for_home(runtime_state, robot, keyboard, home_planner, outcome, home_results):
     keyboard.discard_events("h")
     print("H: planned return_home; Q: exit", flush=True)
     while runtime_state.running and not runtime_state.quit_requested:
@@ -162,7 +161,7 @@ def wait_for_home(runtime_state, runtime, robot, keyboard, home_planner, outcome
                 runtime_state,
                 robot,
                 home_planner,
-                service=lambda: service_feedback(robot, runtime),
+                service=robot.service_feedback,
                 cancel_requested=lambda: (
                     bool(runtime_state.estop_request or runtime_state.quit_requested)
                     or not keyboard.healthy

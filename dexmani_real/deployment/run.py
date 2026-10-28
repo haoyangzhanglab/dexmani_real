@@ -136,4 +136,6 @@ def run_policy(
         camera_calibration_path=camera_calibration_path,
         table_plane_abcd=table_plane_abcd,
         run_config=payload,
+        dependencies=dependencies, control_needs=control_needs,
+        record_needs=record_needs, needs=needs,
     ).run()

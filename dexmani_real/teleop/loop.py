@@ -14,7 +14,6 @@ from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.observation import (
     check_observation,
     read_observation,
-    service_feedback,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState
 from dexmani_real.utils.log import error_detail
@@ -263,7 +262,7 @@ class TeleopLoop:
         self.capture_started_s = time.monotonic()
         try:
             self.robot.prepare_streaming(
-                self.run_id, service=lambda: service_feedback(self.robot, self.runtime),
+                self.run_id, service=self.robot.service_feedback,
             )
         except OperationCancelled:
             self.abort_episode("preparation_revoked")
@@ -313,7 +312,7 @@ class TeleopLoop:
                 self.audio.play("home")
                 result = home_robot(
                     self.runtime_state, self.robot, self.home_planner,
-                    service=lambda: service_feedback(self.robot, self.runtime),
+                    service=self.robot.service_feedback,
                     cancel_requested=self.poll_blocking_commands,
                 )
                 if result.ok:
@@ -397,8 +396,8 @@ class TeleopLoop:
                     row=row,
                     command=command,
                 )
-            except BaseException as cleanup:
-                raise exc from cleanup
+            except BaseException:
+                logger.exception("teleop control cleanup also failed")
             raise
 
         if reason is None:
@@ -423,9 +422,6 @@ class TeleopLoop:
             record_issues, _ = check_observation(row, self.runtime, self.record_needs)
             if record_issues:
                 raise RecordingError("recording sources: " + "; ".join(record_issues))
-        self.robot.arm.update_health(
-            health_until_ns=feedback_until_ns,
-        )
         return issues, feedback_until_ns
 
     def run_control_tick(self):
@@ -492,6 +488,8 @@ class TeleopLoop:
             self.robot.arm.check_error()
             if self.phase is TeleopPhase.IDLE:
                 self.robot.service_idle()
+            else:
+                self.robot.service_feedback()
             if not self.keyboard.healthy:
                 self.runtime_state.request_emergency_stop()
             if self.runtime_state.estop_request or self.runtime_state.error_state:

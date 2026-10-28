@@ -15,12 +15,17 @@ class Rate:
         self.period = 1.0 / hz
         self.reset()
 
-    def wait(self):
+    def wait(self, *, service=None):
         now = time.perf_counter()
         remaining = self.next_deadline - now
-        if remaining > 0:
-            time.sleep(remaining)
+        while remaining > 0:
+            if service is not None:
+                service()
+                remaining = self.next_deadline - time.perf_counter()
+            if remaining > 0:
+                time.sleep(min(0.005, remaining) if service is not None else remaining)
             now = time.perf_counter()
+            remaining = self.next_deadline - now
         base = now if now - self.next_deadline >= self.period else self.next_deadline
         self.next_deadline = base + self.period
 
@@ -34,7 +39,7 @@ def next_tick_ns(planned_ns, period_ns, now_ns):
 
 
 def sampling_clock_ns(control_hz):
-    """整数采样周期及 dt/4 导出容差。"""
+    """整数采样周期及网格容差；训练导出和严格回放分别选择时钟。"""
     if not math.isfinite(control_hz) or control_hz <= 0:
         raise ValueError("control_hz must be finite and positive")
     dt_ns = round(1e9 / control_hz)

@@ -72,11 +72,10 @@ def policy_source_timestamp(row, dependencies):
 
 
 class ObservationBuilder:
-    def __init__(self, info, runtime):
+    def __init__(self, info, runtime, *, dependencies, needs):
         self.info = info
         self.fields = tuple(info.observation_fields)
-        self.dependencies = policy_dependencies(self.fields)
-        self.needs = policy_needs(self.dependencies)
+        self.dependencies, self.needs = dependencies, needs
         self.camera_parameters = {}
         self.arm_fk = ArmFK() if "arm_fk" in self.dependencies else None
         self.hand_fk = self.hand_cloud = None

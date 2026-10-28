@@ -412,7 +412,7 @@ class RawReader:
         return self["timing/rows"].fields(tuple(fields))[:]
 
     def validate_rows(self, *, required_tactile=("aggregate", "dense"), require_camera=True):
-        """分块检查采样与来源时间，保留一行重叠以核对块边界。"""
+        """物理回放的严格整段准入；训练导出另行选择连续前缀。"""
         chunk_frames = 4096
         timing = self["timing/rows"]
         fields = ("observation_ns", "control_ns", "arm_ns", "hand_ns")

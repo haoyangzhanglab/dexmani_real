@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.robot.commands import OperationCancelled, validate_hand_target
+from dexmani_real.robot.commands import OperationCancelled, RobotError, validate_hand_target
 from dexmani_real.robot.model import (
     HAND_DOF,
     HAND_JOINT_SHAPE,
@@ -70,9 +70,8 @@ def _tactile_validity(code: int, *, comm_type: str) -> tuple[bool, bool]:
 
 def _parse_joints(
     state: Any,
-) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     qpos = np.full(HAND_JOINT_SHAPE, np.nan, dtype=np.float64)
-    current = np.full(HAND_JOINT_SHAPE, np.nan, dtype=np.float64)
     errors = {
         name: np.zeros(HAND_JOINT_SHAPE, dtype=np.int32)
         for name in ("commboard_err", "jointboard_err", "tipboard_err")
@@ -84,7 +83,6 @@ def _parse_joints(
             raise ValueError(f"invalid or duplicate joint id {index}")
         seen.add(index)
         qpos[index] = float(joint.position)
-        current[index] = float(getattr(joint, "torque", np.nan))
         errors["commboard_err"][index] = int(joint.commboard_err)
         # SDK 字段名实际拼写为 jonitboard_err。
         errors["jointboard_err"][index] = int(joint.jonitboard_err)
@@ -93,8 +91,7 @@ def _parse_joints(
         raise ValueError(f"{len(seen)}/{HAND_DOF} joints reported")
     if not np.all(np.isfinite(qpos)):
         raise ValueError("non-finite joint position feedback")
-    current[~np.isfinite(current)] = np.nan
-    return qpos, current, errors
+    return qpos, errors
 
 
 def _parse_tactile_aggregate(state: Any) -> np.ndarray:
@@ -123,7 +120,7 @@ def _parse_tactile_dense(state: Any) -> np.ndarray:
     return tactile_dense
 
 
-class XHandError(RuntimeError):
+class XHandError(RobotError):
     def __init__(self, operation: str, code: int, message: str) -> None:
         self.operation = str(operation)
         self.code = int(code)
@@ -182,7 +179,7 @@ class XHand:
         except BaseException:
             try:
                 self.disconnect()
-            except Exception:
+            except BaseException:
                 logger.exception("XHand connection cleanup failed")
             raise
 
@@ -246,19 +243,21 @@ class XHand:
                 if connected_ethercat:
                     try:
                         self.request_ethercat_init()
-                    except Exception as exc:
+                    except BaseException as exc:
                         errors.append(exc)
                 try:
                     self.control.close_device()
                     self.control = None
-                except Exception as exc:
+                except BaseException as exc:
                     errors.append(exc)
                 if connected_ethercat:
                     time.sleep(POST_EC_DISCONNECT_S)
         finally:
             self.connected_flag = False
         if errors:
-            raise RuntimeError(f"XHand disconnect failed: {errors}") from errors[0]
+            for error in errors[1:]:
+                logger.error("additional XHand disconnect failure", exc_info=(type(error), error, error.__traceback__))
+            raise errors[0]
 
     def request_ethercat_init(self) -> None:
         if self.cfg.ethercat_slave_position < 0:
@@ -338,7 +337,7 @@ class XHand:
             raise XHandError("read", code, "missing state payload")
 
         try:
-            qpos, current, board_errors = _parse_joints(raw_state)
+            qpos, board_errors = _parse_joints(raw_state)
         except (AttributeError, TypeError, ValueError, OverflowError) as exc:
             raise XHandError("read", code, f"invalid joint payload: {exc}") from exc
 
@@ -380,14 +379,17 @@ class XHand:
 
         return XHandState(
             qpos=qpos,
-            current_ma=current,
             tactile_aggregate=tactile_aggregate,
             tactile_dense=tactile_dense,
-            **board_errors,
         )
 
     def send_action(self, action: np.ndarray) -> None:
-        code = self.send_position(action)
+        target = validate_hand_target(action, self.mechanical_lower, self.mechanical_upper)
+        self._send_action(target)
+
+    def _send_action(self, target: np.ndarray) -> None:
+        """Robot 的组合预检或本驱动的公开入口已验证目标。"""
+        code = self._send_position(target)
         now_ns = time.monotonic_ns()
         if code == COMMUNICATION_CRC_ERROR_CODE:
             if self.send_crc_started_ns is None:
@@ -395,16 +397,7 @@ class XHand:
                 logger.warning("XHand send CRC; delivery unconfirmed, continuing with next target")
             if now_ns - self.send_crc_started_ns >= int(self.cfg.feedback_max_age_s * 1e9):
                 raise XHandError("send", code, "continuous send CRC exceeded age budget")
-        else:
-            if self.send_crc_started_ns is not None:
-                logger.info("XHand send responses recovered")
-            self.send_crc_started_ns = None
-
-    def end_send_interval(self):
-        self.send_crc_started_ns = None
-
-    def send_position(self, action: np.ndarray) -> int:
-        target = validate_hand_target(action, self.mechanical_lower, self.mechanical_upper)
+    def _send_position(self, target: np.ndarray) -> int:
         if self.control is None or self.command is None or not self.connected_flag:
             raise RuntimeError("XHand command path is not initialized")
         for index, value in enumerate(target):
@@ -417,7 +410,7 @@ class XHand:
         measured = np.asarray(qpos, dtype=np.float64)
         if measured.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(measured)):
             raise ValueError("XHand.hold_current requires twelve finite joint positions")
-        return self.send_position(
+        return self._send_position(
             np.clip(measured, XHAND_RATED_QPOS_MIN_RAD, XHAND_RATED_QPOS_MAX_RAD)
         )
 
@@ -462,6 +455,10 @@ class XHand:
         if code not in NONFATAL_SDK_CODES:
             # 1501035 表示过流，必须终止本次运行。
             raise XHandError("send", code, error.error_message)
+        # 包括成功停止请求；读取反馈不能当作发送确认。
+        if self.send_crc_started_ns is not None:
+            logger.info("XHand send responses recovered")
+        self.send_crc_started_ns = None
         return code
 
     def make_command(self, qpos: np.ndarray) -> Any:

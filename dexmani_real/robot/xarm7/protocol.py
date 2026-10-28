@@ -55,7 +55,7 @@ class HomeRequest:
 @dataclass(frozen=True)
 class LifecycleReply:
     operation_id: int
-    error: Exception | None = None
+    error: BaseException | None = None
 
 
 class ArmChannels:

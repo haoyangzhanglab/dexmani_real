@@ -57,11 +57,13 @@ Real 聚焦真实世界中的感知与动作执行，并对接 Policy 的训练�
 
 部署先初始化配置与几何，再启动键盘、预热模型，最后连接设备；启动期间 S/Q 取消实验，Esc 按故障退出，H/B/T 不排队执行。启动姿态的机械臂容差固定为 0.5°，预测等待固定为 2 s。运行和等待使用绝对截止时间，不补发错过的控制步。终止按撤销权限、停止、追加最后一帧、录制收尾、登记结果的顺序执行；模型任务或 writer 尚未结束时，所属轮次继续持有资源。
 
+sync 按计划周期采样并顺序使用动作，推理完成只提交本步结果，不再次采样或追加 history；超周期后移到下一未来网格点，不突发补发。普通 async 按实际 slot 跳过过时动作，迟到预测仍按原观测锚点索引；有效尾部可继续执行，耗尽或过期仍停止。RTC 保留严格交接时刻、冻结前缀和执行前复核，错过 slot 仍停止。动作历史记录已提交的命令目标，不表示硬件已经到位。
+
 回放沿 `replay/run.py → joint_replay.py` 执行，`JointReplay` 负责逐帧提交，`trajectory.py` 读取轨迹并缓存、保存实测数据，`metrics.py` 只计算匹配帧的关节与末端误差。运行入口在硬件收尾后保存 NPZ、计算指标并写入 JSON；指标失败时原始采样仍可用于离线评估。
 
 策略选择交给 Policy 的公开 `inspect_policy`：Real 默认 latest，也支持 best、20pct 等 milestone 和显式 checkpoint 路径。显式相对路径以当前工作目录解析；weights/NFE 的显式参数优先。执行长度仍取 execution 配置或模型 n_action_steps。
 
-`control/constraints.py` 统一等价角、绝对跳变和 `MotionConstraints` 端点约束。`control/ik.py` 的 `IKSolver` 接收共享约束、位置和旋转容差，`solve(..., hand_qpos=...)` 显式指定碰撞手姿；动作映射、键盘 jog 和相机标定共用这一接口。
+`control/constraints.py` 统一等价角、运行限位和 `MotionConstraints` 端点约束。目标不再受固定跳变角或目标距离阈值限制；Ruckig 负责速度和加速度约束，保留包含制动段的位置极值检查、输出有限性和参考—实测跟踪检查。端点碰撞检查不保证连续路径无碰撞。`control/ik.py` 的 `IKSolver` 接收共享约束、位置和旋转容差，`solve(..., hand_qpos=...)` 显式指定碰撞手姿；动作映射、键盘 jog 和相机标定共用这一接口。
 
 IK 保留上一命令、实测状态及正负零空间初值；评分只使用关节距离和限位惩罚，搜索权重与步长固定在算法模块。位姿误差用于容差准入，SVD 只用于生成零空间方向。候选 FK 同时用于误差和工作空间检查，碰撞模型统一管理自碰撞、静态障碍和可选桌面。`HomePlanner(environment, arm, table_plane_abcd=...)` 与执行器共用 `ArmConfig` 的运行限位和到位容差，桌面间隙参数由 `EnvironmentConfig` 提供；`plan(current, target)` 保留三种关节路径、1° 采样及绝对等价分支对齐。无需移动的 HOME 仍检查几何约束，并由实测反馈确认停稳。
 
@@ -75,9 +77,11 @@ IK 保留上一命令、实测状态及正负零空间初值；评分只使用�
 
 单阈值裁剪对桌面标定残差更敏感。可根据实验物体高度和当前标定调整 YAML 中的 `pointcloud.table_margin_m`；增大余量会减少桌面残留，也会裁掉更多低矮表面。离线导出和查看在配置入口校验手部安装位姿，指尖名称与 SDK→URDF 关节顺序由 `HandFK` 核对。
 
-XHand 的 SDK 载荷解析、错误码和板卡诊断位于 `robot/xhand/driver.py`，标准化状态、反馈布局与缓存位于 `feedback.py`；机械臂反馈布局位于 `robot/xarm7/protocol.py`。
+XHand 的 SDK 载荷解析、错误码和板卡诊断位于 `robot/xhand/driver.py`，标准化状态只含关节与触觉，不读取未使用的 torque。反馈布局与缓存位于 `feedback.py`；机械臂反馈布局位于 `robot/xarm7/protocol.py`。`Robot.send_action()` 在任一执行器发生副作用前预检组合目标，驱动内部发送路径接收已验证数组；HOME、独立手部工具和 stop/hold 各自覆盖直接入口。
 
 机械臂由 `robot/xarm7/process.py` 的 `ArmProcess` 提交目标，`worker.py` 的 `ArmController` 独占 SDK 与默认 100 Hz 伺服，`trajectory.py` 的 `ArmTrajectory.step(now_ns, goal=None)` 用 Ruckig 在每周期采样一次连续参考。共享通道及操作消息集中在 `protocol.py`，`ArmChannels` 负责目标发布、消费和状态快照；HOME 总截止时间从运行层传到父、子进程，取消使用同一个停止信号。操作回复直接携带超时、取消或设备异常，保留失败原因；停止失败始终作为设备故障报告。
+
+硬件反馈、策略采样/推理和机械臂伺服使用各自节拍。机械臂子进程按 `arm.feedback_hz` 发布反馈；父进程的 SDK 所有者线程以 30 Hz 服务 XHand，并在模型等待、HOME 和空闲时继续处理反馈与取消。策略只消费缓存，5 Hz 策略不再因反馈年龄预算被拒绝。缓存读取、CRC 和健康查询不刷新来源时间；硬件健康期限与策略、VR、jog 命令的执行期限分别检查。
 
 控制与设备配置类使用 `MotionConfig`、`ArmConfig`、`HomingConfig`、`HandConfig`。SDK 超时和伺服间隔预算均固定为 20 ms，进程等待为 3 s；HOME 的到位附加预算、稳定持续时间、收敛等待分别为 0.5、0.3、15 s，轮询周期使用机械臂反馈频率。XHand 串口稳定等待和初始反馈等待均为 1 s。这些预算不再接受 YAML 覆盖；机械限位和指尖名称由 `robot/model.py` 提供，实验仍可配置运行关节限位、控制频率、HOME 姿态、收敛容差及硬件增益。
 
@@ -129,11 +133,11 @@ teleop:
 
 VR 接收器在发布前拒绝无效传感数据。映射器按已接纳的观测建立锚点，映射或重置发生技术错误时直接抛出异常；重置失败会清除旧锚点。遥操作控制器复用动作检查器的 FK 初始化 VR 锚点与 EMA，手部重定向仅在建立新锚点时用实测关节角重置，EMA 只在命令正常提交后更新参考。
 
-`TAGRetargeter` 集中实现两阶段目标函数和解析梯度，仅在优化器请求梯度时计算雅可比，复用 `HandFK` 的固定模型与关节顺序；`DexPilotRetargeter` 直接调用现有 DexPilot 目标函数、NLopt 和低通滤波器。退化手部几何不产生目标；求解异常（包括 `RoundoffLimited`）停止当前段并沿会话错误路径退出，不返回旧目标或退回 TAG 第一阶段。显式提供的非法初值直接报错；省略初值仍从关节限位中点开始。
+`TAGRetargeter` 集中实现两阶段目标函数和解析梯度，仅在优化器请求梯度时计算雅可比，复用 `HandFK` 的固定模型与关节顺序；`DexPilotRetargeter` 直接调用现有 DexPilot 目标函数、NLopt 和低通滤波器。退化手部几何不产生目标；仅 TAG 第二阶段捏合细化的 `RoundoffLimited` 使用本帧已通过有限性与限位处理的第一阶段解，并更新后续解状态。第一阶段及其他程序异常继续传播，不返回旧目标。显式提供的非法初值直接报错；省略初值仍从关节限位中点开始。
 
 `control/actions.py` 提供 `map_joint` 与 `map_eef`，统一返回 `ActionResult`；关节拒绝仍保留诊断候选，发送入口必须检查 `rejection_reason`。IK 直接使用 MPlib 的 `PinocchioModel` 和入口提供的运行关节限位，以 `IKResult.qpos is None` 表示正常无解，求解器、FK 或碰撞后端故障直接抛出原始异常。HOME 每个路径点共用一次运动学更新完成碰撞、EEF 工作空间和桌面间距检查，仅对 `HomePathRejected` 表示的几何拒绝尝试其他候选路径，候选耗尽、取消或等待超时返回失败结果；非法目标与技术异常传播到会话错误处理和收尾边界。
 
-XHand 保留 serial 与 EtherCAT，连接失败直接报告，不自动重试。普通发送遇到 CRC 只等待下一条目标，持续失败超过反馈预算即报错；停止请求可在 0.25 s 内重发。状态码明确不可用的触觉被屏蔽，有限向量缓存保留原始来源时间；SDK 结构错误和复位调用异常直接传播。连接清理失败不会覆盖初始错误，未释放的句柄仍由设备对象保留。
+XHand 保留 serial 与 EtherCAT，连接失败直接报告，不自动重试。CRC 分类和故障状态仅由驱动维护：普通发送遇到单次 CRC 等待下一条目标，连续发送仍为 CRC 且跨越反馈预算时报错；推理等待不重置故障窗口，成功读取也不算发送确认。读 CRC 丢弃坏载荷，缓存仍受真实来源年龄限制。停止请求可在 0.25 s 内重发，只有原有可接受返回码才确认完成。状态码明确不可用的触觉被屏蔽，有限向量缓存保留原始来源时间；SDK 结构错误和复位调用异常直接传播。连接清理失败不会覆盖初始错误，未释放的句柄仍由设备对象保留。
 
 回放先保存实测数据，再计算并写入指标。没有有效样本的指标显式记为 `null`；计算产生的非有限数值由 JSON 写入边界拒绝并报告评估失败，保留已保存的实测数据。
 
@@ -147,21 +151,23 @@ XHand 保留 serial 与 EtherCAT，连接失败直接报告，不自动重试。
 
 `ipc/sensors.py` 提供 `read_camera_frame(fields=("rgb", "depth"))`、`read_vr_frame()` 和 `snapshot_camera_parameters()`。相机读取返回来源 `timestamp_ns`、共享内存发布序列 `ring_sequence`、RGB 设备帧号 `color_frame_number` 及请求的像素通道。发布序列不是设备帧身份；时间戳保留 RGB-D 中较早通道的首次主机接收时间，不代表曝光时刻。标定采样和预览只读取 RGB，采样仍要求屏障后的新鲜、不同 RGB 帧。
 
-`ObservationNeeds.camera_fields` 直接声明所需像素字段；静态参数需求独立声明。`read_observation()` 只负责当前采样，手部初始化等待由准备阶段显式完成；`check_observation()` 统一返回来源问题与提交期限。相机尺寸和点云有限性在生产者发布前检查，IPC 保留字段完整性、复制前后序列核对。观测与策略历史使用已脱离共享缓冲的数组，提交给推理或录制后，生产者不再修改这些快照。
+`ObservationNeeds.camera_fields` 直接声明所需像素字段；静态参数需求独立声明，部署入口一次构造依赖和 needs 并传给 session、builder、rollout。`read_observation()` 读取反馈缓存与传感器快照，不触发同一轮硬件查询；手部初始化等待由准备阶段显式完成。`check_observation()` 统一返回来源问题与提交期限。相机尺寸和点云有限性在生产者发布前检查，IPC 保留字段完整性、复制前后序列核对。观测与策略历史使用已脱离共享缓冲的数组，提交给推理或录制后，生产者不再修改这些快照。开启录制仍要求 RGB-D、聚合和密集触觉；推理等待期间的来源或 writer 故障仍终止控制。
 
 `termination_reason` 保留首次终止原因，Teleop 的准备与运行阶段均使用 `RunEndReason` 的小写名称，具体中止上下文写入 `termination_details`。`technical_status` 反映该次产物的技术完成状态，发布状态单独描述文件是否已发布。控制中止后的完整记录可以保存为 `failed` episode；录制队列满、写入或关闭失败则报错并保留临时目录，不发布正式 episode。Teleop 的 D 键回调先锁存丢弃意图并撤销运动，再发布按键事件；收尾请求前到达的 DISCARD 在准备、求解或停止失败时仍保持丢弃意图，writer 退出后删除临时目录。已发布 Raw 不因后续独立会话清理错误而回写。
 
-Teleop 中断会登记技术失败并传播，关闭时继续按原保存或丢弃意图收尾；recorder 的首次收尾请求不会被重入覆盖。收尾超时仍报告 pending，不在同一次关闭中重新开启等待预算。Policy 在会话关闭末尾核对对应 episode 的 Raw 发布状态、实际路径和帧数，再写入 `session_result.json`；该摘要反映最后一次确认，不保证仍 pending 的 writer 之后的结果，也不会清除首次终止原因或已有错误。
+Teleop 中断会登记技术失败并传播，关闭时继续按原保存或丢弃意图收尾；recorder 的首次收尾请求不会被重入覆盖。收尾超时仍报告 pending，不在同一次关闭中重新开启等待预算。Policy 即使最后一帧入队失败也会请求录制收尾；轮次结束后才返回的模型异常仍登记在该轮 errors 中，不覆盖首次终止原因。模型关闭异常保留摘要及日志中的原始 traceback。会话关闭末尾核对对应 episode 的 Raw 发布状态、实际路径和帧数，再写入 `session_result.json`；该摘要反映最后一次确认，不保证仍 pending 的 writer 之后的结果。
 
-部署的 `run_config.yaml` 保留策略元数据、实际运行配置、seed/device、轮数与时长、录制开关及有效标定；runtime 仅包含 execution、arm、hand、motion、camera、pointcloud、hand_pointcloud、environment，不采集 Git 版本或文件哈希。`session_result.json` 保留会话起止 UTC、outcome、reason、shutdown、errors 和 episodes；每轮包含序号、开始 UTC、时长、终止原因与详情、errors、raw 和 metrics。metrics 仅包含成功预测的次数、平均/最大耗时及跳过步数。错误统一为 stage、exception_type、message；shutdown 取 null/pending/failed/completed，单轮技术错误、清理错误、pending 或结果写入失败均返回非零退出码；S/Q 导致的正常取消不记作技术错误。设备、键盘与传感器的清理错误写入会话 errors；一项清理失败或被中断后仍继续回收其他资源。
+部署的 `run_config.yaml` 保留策略元数据、实际运行配置、seed/device、轮数与时长、录制开关及有效标定；runtime 仅包含 execution、arm、hand、motion、camera、pointcloud、hand_pointcloud、environment，不采集 Git 版本或文件哈希。`session_result.json` 保留会话起止 UTC、outcome、reason、shutdown、errors 和 episodes；每轮包含序号、开始 UTC、时长、终止原因与详情、errors、raw 和 metrics。metrics 仅包含成功预测的次数、平均/最大耗时及跳过步数；`inference_mean_s`/`inference_max_s` 从观测构造前计时，覆盖 FK、手点云、数组组装、模型推理直至返回 CPU 动作。错误统一为 stage、exception_type、message；shutdown 取 null/pending/failed/completed，单轮技术错误、清理错误、pending 或结果写入失败均返回非零退出码；S/Q 导致的正常取消不记作技术错误。设备、键盘与传感器的清理错误写入会话 errors；一项清理失败或被中断后仍继续回收其他资源。
 
 `data/raw.py` 集中提供 `RawReader`、`RawWriter` 和元数据编解码。Raw 以 `timing/rows.observation_ns` 为唯一观测时钟，以该表长度作为帧数。`timestamps_s` 在整数时钟相减后转换为相对秒数，空录制返回空数组；反复访问时间轴的调用方应在本地保存该数组。
 
-`RawReader` 首次读取时校验数值字段和 `timing/rows` 的布局，并缓存数据集。`read_camera()` 返回 `CameraSnapshot`，`read_timing_rows(fields)` 保留原始 `int64` 纳秒和 `-1` 缺失标记，文件与视频由 Reader 统一关闭。诊断读取与训练、物理回放准入分开；导出和物理回放显式调用 `validate_completion()`、`validate_rows()`。CordViP 的 Raw 行关联不证明手和相机物理同步；缺失相机时钟时显式使用观测时钟，原始相机时钟仍保留 `-1`。
+`RawReader` 首次读取时校验数值字段和 `timing/rows` 的布局，并缓存数据集。`read_camera()` 返回 `CameraSnapshot`，`read_timing_rows(fields)` 保留原始 `int64` 纳秒和 `-1` 缺失标记，文件与视频由 Reader 统一关闭。物理回放仍显式调用 `validate_completion()`、`validate_rows()`，严格要求正常录制与完整的观测节拍；训练导出使用下述独立准入。CordViP 的 Raw 行关联不证明手和相机物理同步；缺失相机时钟时显式使用观测时钟，原始相机时钟仍保留 `-1`，不满足训练导出的来源时间要求。
 
 Raw 写入缓冲按 8 MiB 预算选择 1–32 帧，单帧超过预算时保留一帧。`RawWriter.finish()` 刷新行缓冲、结束视频编码并写入终止详情，再写入技术状态；`close()` 释放资源。录制器在成功收尾后原子发布，写入或收尾失败时保留临时产物并报告错误。
 
 Canonical 由 `data/export.py` 的 `export_zarr(..., processing=ExportConfig(...))` 导出，提供 13 个训练字段、episode 边界及物理参数。导出遇到损坏或不满足训练要求的 episode 立即报错，保留已有临时结果；使用 `--exclude EPISODE` 显式排除后重新导出。最终输出必须尚未占用且不与输入目录重叠，全部完成后才原子发布。处理批次根据 64 MiB 数组预算和最多 100 帧确定，不再提供 `--chunk-frames`；存储块仍按字段大小独立选择。
+
+训练时间准入以 `control_ns` 判断连续周期，控制间隔与累计相位仍限制在 `dt/4` 内；`observation_ns` 保留读取完成时间，允许一个周期内且不越过下一控制起点的局部读取抖动，例如 16 Hz 下单次 20 ms 延迟。持续控制频率偏移、真实缺步、失效来源时间或非有限行会在首个问题处截断。每条 Raw 最多导出从第零行开始的一个连续前缀，所有观测、动作、RGB-D 和派生字段使用相同行范围，不补帧、不重采样。技术失败的 Raw 未逐行保存命令提交结果，因此保守排除最后一行，原始 `failed` 状态保持不变。空前缀拒绝；字段、形状、单位及视频整段帧数等结构损坏仍拒绝整条。Zarr 的 `episode_quality` 报告 `[row_start, row_stop)`、裁切原因、控制网格偏差及读取耗时；`readout_over_tolerance_rows` 统计 `observation_ns - control_ns > dt/4` 的行数，仅用于诊断，不作为拒绝条件。`timing_admission` 描述实际准入规则。
 
 ## 离线验证
 
@@ -171,13 +177,14 @@ Canonical 由 `data/export.py` 的 `export_zarr(..., processing=ExportConfig(...
 python -m compileall -q dexmani_real scripts
 python scripts/run_policy.py --print-config
 python scripts/collect_teleop.py --print-config
+python -m pytest -q tests
 git diff --check
 ```
 
 已有 Ruff/mypy 的开发环境可补充静态检查，无需为运行实验安装它们：
 
 ```bash
-ruff check --no-cache --isolated --select E9,F dexmani_real scripts third_party/cordvip_geometry/src
+ruff check --no-cache --isolated --select E9,F dexmani_real scripts tests third_party/cordvip_geometry/src
 mypy --cache-dir=/dev/null --ignore-missing-imports --follow-imports silent --explicit-package-bases \
   dexmani_real/ipc dexmani_real/sensor \
   dexmani_real/geometry dexmani_real/perception dexmani_real/control dexmani_real/robot \

@@ -19,6 +19,9 @@ from dexmani_real.robot.model import (
     XHAND_RATED_QPOS_MIN_RAD,
 )
 from dexmani_real.robot.xhand.feedback import XHandFeedback
+from dexmani_real.utils.timing import next_tick_ns
+
+FEEDBACK_PERIOD_NS = round(1e9 / 30)
 
 if TYPE_CHECKING:
     from dexmani_real.robot.xarm7.process import ArmProcess
@@ -61,7 +64,7 @@ class Robot:
         self.hand_stop_pending = False
         self.stop_failure = None
         self.hand_feedback = XHandFeedback(hand_config)
-        self.idle_next_ns = 0
+        self.feedback_next_ns = 0
         self.input_signal = None
 
     @property
@@ -132,7 +135,7 @@ class Robot:
             self.stop_signal.set()
             try:
                 self.close()
-            except Exception:
+            except BaseException:
                 logger.exception("partial robot connection cleanup failed")
             raise
 
@@ -164,6 +167,7 @@ class Robot:
         if self.motion_active:
             raise RuntimeError("cannot clear hand feedback during motion")
         self.hand_feedback.reset(time.monotonic_ns(), deadline_ns=deadline_ns)
+        self.feedback_next_ns = 0
 
     def read_hand(self):
         if self.hand is None:
@@ -180,14 +184,36 @@ class Robot:
         )
 
     def read_state(self):
+        """消费来源时间不变的反馈缓存，不执行硬件查询。"""
         self.check()
         if not self.connected or self.arm is None:
             raise RobotError("robot is not connected")
+        return RobotState(
+            self.arm.snapshot(),
+            self.hand_feedback.checked_feedback(time.monotonic_ns()) if self.hand is not None else None,
+        )
+
+    def service_feedback(self):
+        """由 SDK 所有者线程独立服务硬件健康，不延长任何命令期限。"""
+        self.check()
         try:
-            return RobotState(self.arm.snapshot(), self.read_hand())
-        except Exception as exc:
+            now = time.monotonic_ns()
+            if now >= self.feedback_next_ns:
+                self.read_hand()
+                self.feedback_next_ns = next_tick_ns(
+                    self.feedback_next_ns or now, FEEDBACK_PERIOD_NS, time.monotonic_ns(),
+                )
+            state = self.read_state()
+            if self.hand is None or state.hand is not None:
+                deadline = int(state.arm["timestamp_ns"][0]) + int(self.arm_config.feedback_max_age_s * 1e9)
+                if state.hand is not None:
+                    deadline = min(deadline, int(state.hand["timestamp_ns"][0])
+                                   + int(self.hand_config.feedback_max_age_s * 1e9))
+                self.arm.update_health(health_until_ns=deadline)
+            return state
+        except BaseException:
             self.stop_signal.set()
-            raise RobotError(f"robot feedback failed: {exc}") from exc
+            raise
 
     def read_initial_state(self, *, cancel_requested=None):
         self.check_owner()
@@ -206,7 +232,7 @@ class Robot:
 
         while True:
             check_wait()
-            state = self.read_state()
+            state = self.service_feedback()
             check_wait()
             if deadline_ns is None or state.hand is not None:
                 return state
@@ -218,12 +244,16 @@ class Robot:
         self.check_owner()
         if self.hand_stop_pending or self.stop_failure is not None:
             raise RobotError("previous robot stop remains unresolved")
-        self.end_hand_send_interval()
         self.motion_active = True
         cast("ArmProcess", self.arm).prepare(run_id, service=service)
         self.check_run(run_id)
 
     def send_action(self, command, *, valid_until_ns, execute_until_ns=None):
+        self.validate_command(command, execute_until_ns=execute_until_ns)
+        self._send_action(command, valid_until_ns=valid_until_ns, execute_until_ns=execute_until_ns)
+
+    def validate_command(self, command, *, execute_until_ns=None):
+        """组合预检必须先于任一执行器的副作用。"""
         self.check_owner()
         if self.hand_stop_pending or self.stop_failure is not None:
             raise RobotError("previous robot stop remains unresolved")
@@ -238,6 +268,7 @@ class Robot:
                 raise RobotError("hand device unavailable")
             validate_hand_target(command.hand_qpos, self.hand_lower, self.hand_upper)
 
+    def _send_action(self, command, *, valid_until_ns, execute_until_ns=None):
         def check_send():
             self.check_run(command.run_id)
             now = time.monotonic_ns()
@@ -253,29 +284,18 @@ class Robot:
                 )
             if command.hand_qpos is not None:
                 check_send()
-                try:
-                    cast("XHand", self.hand).send_action(command.hand_qpos)
-                except Exception as exc:
-                    raise RobotError(f"XHand send failed: {exc}") from exc
+                cast("XHand", self.hand)._send_action(command.hand_qpos)
             self.check_run(command.run_id)
         except BaseException:
             self.stop_signal.set()
             raise
 
-    def end_hand_send_interval(self):
-        self.check_owner()
-        if self.hand is not None:
-            self.hand.end_send_interval()
-
     def send_hand_home(self, command, *, valid_until_ns):
-        self.check_owner()
         if command.arm_qpos is not None:
             raise ValueError("hand HOME cannot carry an arm streaming target")
-        if self.hand_stop_pending or self.stop_failure is not None:
-            raise RobotError("previous robot stop remains unresolved")
+        self.validate_command(command)
         cast("ArmProcess", self.arm).begin_operation(command.run_id)
-        self.end_hand_send_interval()
-        self.send_action(command, valid_until_ns=valid_until_ns)
+        self._send_action(command, valid_until_ns=valid_until_ns)
 
     def home_arm(self, waypoints, target, run_id, abort_check, *, service, deadline_ns):
         self.check_owner()
@@ -311,37 +331,38 @@ class Robot:
     def stop(self):
         self.check_owner()
         self.stop_signal.set()
-        self.end_hand_send_interval()
         errors = []
         unresolved_motion = self.motion_active
         if self.arm is not None or self.hand is not None:
             self.motion_active = True
         if self.arm is not None:
-            self.arm.request_stop()
+            try:
+                self.arm.request_stop()
+            except BaseException as exc:
+                errors.append(exc)
         try:
             self.stop_hand()
-        except Exception as exc:
+        except BaseException as exc:
             errors.append(exc)
         if self.arm is not None:
             try:
                 self.arm.wait_stopped()
-            except Exception as exc:
+            except BaseException as exc:
                 errors.append(exc)
         if self.arm is None and self.hand is None and unresolved_motion:
             errors.append(RobotError("motion remains unresolved after disconnect"))
         if errors:
             self.stop_failure = self.stop_failure or errors[0]
-            raise RobotError(f"robot stop failures: {errors}") from errors[0]
+            for error in errors[1:]:
+                logger.error("additional robot stop failure", exc_info=(type(error), error, error.__traceback__))
+            raise errors[0]
         self.motion_active = False
 
     def service_idle(self):
-        self.end_hand_send_interval()
         if self.motion_active and (self.stop_signal.is_set() or self.emergency_signal.is_set()):
             self.stop()
-        now = time.monotonic_ns()
-        if now >= self.idle_next_ns and self.connected:
-            self.idle_next_ns = now + int(1e9 / 30)
-            self.read_state()
+        if self.connected:
+            self.service_feedback()
 
     def close(self):
         if self.owner is None:
@@ -350,12 +371,12 @@ class Robot:
         errors = []
         try:
             self.stop()
-        except Exception as exc:
+        except BaseException as exc:
             errors.append(exc)
         if self.arm is not None:
             try:
                 self.arm.close()
-            except Exception as exc:
+            except BaseException as exc:
                 errors.append(exc)
             else:
                 self.arm = None
@@ -364,12 +385,12 @@ class Robot:
             try:
                 if self.hand.is_connected:
                     self.stop_hand(passive=True)
-            except Exception as exc:
+            except BaseException as exc:
                 errors.append(exc)
             finally:
                 try:
                     self.hand.disconnect()
-                except Exception as exc:
+                except BaseException as exc:
                     errors.append(exc)
                 else:
                     self.hand = None
@@ -377,4 +398,6 @@ class Robot:
         self.connected = False
         if errors:
             self.motion_active = True
-            raise RobotError(f"robot close failures: {errors}") from errors[0]
+            for error in errors[1:]:
+                logger.error("additional robot close failure", exc_info=(type(error), error, error.__traceback__))
+            raise errors[0]

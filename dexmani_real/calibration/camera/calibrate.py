@@ -45,7 +45,6 @@ from dexmani_real.runtime.lifecycle import (
     SensorWorkers,
     close_runtime,
 )
-from dexmani_real.runtime.observation import service_feedback
 from dexmani_real.runtime.preflight import (
     jog_bounds,
     validate_robot_config,
@@ -318,7 +317,8 @@ class CameraCalibrator:
         print(f"  Preview window: {WINDOW_NAME} (green=detected, red=not found)")
 
         while self.runtime_state.running:
-            self.rate.wait()
+            self.rate.wait(service=self.robot.service_idle)
+            self.robot.service_feedback()
 
             if self.runtime_state.estop_request or self.keys.is_pressed("esc"):
                 self.fault("operator e-stop", estop=True)
@@ -359,7 +359,7 @@ class CameraCalibrator:
             self.runtime_state,
             self.robot,
             self.home_planner,
-            service=lambda: service_feedback(self.robot, self.runtime),
+            service=self.robot.service_feedback,
             cancel_requested=self.cancel_requested,
         )
         if self.runtime_state.estop_request:

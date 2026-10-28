@@ -65,8 +65,6 @@ class TAGRetargeter:
 
     def solve(self, fingertips):
         self.target_fingertips = fingertips * self.finger_scale
-        if not np.isfinite(self.target_fingertips).all():
-            raise ValueError("scaled fingertip positions must be finite")
         position = self.bounded_solution(self.position_optimizer.optimize(self.previous_solution))
 
         distances = np.linalg.norm(fingertips[1:] - fingertips[0], axis=1)
@@ -82,7 +80,11 @@ class TAGRetargeter:
         solution = position
         if self.pinch_factors.max() >= PINCH_SKIP_THRESHOLD:
             self.position_solution = position
-            solution = self.bounded_solution(self.pinch_optimizer.optimize(position))
+            try:
+                solution = self.bounded_solution(self.pinch_optimizer.optimize(position))
+            except nlopt.RoundoffLimited:
+                # 第一阶段已通过有限性与限位处理，仍可作为本帧解及下一帧初值。
+                solution = position
         self.previous_solution = solution
         return solution
 

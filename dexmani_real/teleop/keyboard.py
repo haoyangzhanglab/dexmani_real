@@ -12,7 +12,6 @@ from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.jog import CartesianJog
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime
-from dexmani_real.runtime.observation import service_feedback
 from dexmani_real.runtime.preflight import (
     jog_bounds,
     validate_robot_config,
@@ -105,7 +104,8 @@ class KeyboardTeleop:
 
     def run_control_loop(self):
         while self.runtime_state.running and not self.runtime_state.quit_requested:
-            self.rate.wait()
+            self.rate.wait(service=self.robot.service_idle)
+            self.robot.service_feedback()
             events = self.keys.poll(timeout=0)
             if (
                 self.runtime_state.estop_request
@@ -126,7 +126,7 @@ class KeyboardTeleop:
         self.jog.stop(self.robot, self.runtime_state)
         home_result = home_robot(
             self.runtime_state, self.robot, self.home_planner,
-            service=lambda: service_feedback(self.robot, self.runtime),
+            service=self.robot.service_feedback,
             cancel_requested=lambda: (
                 bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
                 or not self.keys.healthy

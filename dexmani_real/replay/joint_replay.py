@@ -19,7 +19,6 @@ from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
     read_observation,
-    service_feedback,
 )
 from dexmani_real.runtime.state import RunEndReason
 from dexmani_real.utils.timing import sampling_clock_ns
@@ -121,18 +120,14 @@ class JointReplay:
         issues, deadline_ns = check_observation(row, self.runtime, ObservationNeeds())
         if issues:
             raise TimeoutError("replay feedback: " + "; ".join(issues))
-        self.robot.arm.update_health(
-            health_until_ns=deadline_ns,
-        )
         return row, deadline_ns
 
     def admit_replay(self, trajectory, hand_start_duration_s):
         self.robot.prepare_streaming(
             self.epoch,
-            service=lambda: service_feedback(self.robot, self.runtime),
+            service=self.robot.service_feedback,
         )
         row, _ = self.read_feedback()
-        self.previous_arm = row.arm["qpos"][0].copy()
         start_arm = wrap_nearest_equivalent(
             trajectory.arm_qpos[0],
             row.arm["qpos"][0],
@@ -173,7 +168,6 @@ class JointReplay:
                 trajectory.action_arm_joint[index],
                 trajectory.action_hand_joint[index],
                 row.arm["qpos"][0],
-                self.previous_arm,
             )
             arm, hand, rejection = mapped.arm_qpos, mapped.hand_qpos, mapped.rejection_reason
             if rejection is not None:
@@ -181,7 +175,6 @@ class JointReplay:
                 status, reason = ReplayStatus.REJECTED, f"replay target: {rejection}"
                 break
             self.submit_row(index, row, arm, hand, min(slot_deadline_ns, feedback_until_ns))
-            self.previous_arm = arm.copy()
             interrupted = self.wait_replay(slot_deadline_ns)
             if interrupted is not None:
                 status, reason = interrupted
@@ -224,6 +217,7 @@ class JointReplay:
                 if cause == RunEndReason.QUIT:
                     return ReplayStatus.USER_QUIT, "operator quit"
                 return ReplayStatus.REJECTED, f"motion interrupted: {cause.name.lower()}"
+            self.robot.service_feedback()
             remaining_ns = deadline_ns - time.monotonic_ns()
             if remaining_ns <= 0:
                 return None
@@ -268,7 +262,7 @@ class JointReplay:
             weight = progress * progress * (3 - 2 * progress)
             hand = hand_target if step == steps else hand_start + weight * (hand_target - hand_start)
             rejection = self.action_mapper.constraints.rejection(
-                arm_hold, row.arm["qpos"][0], arm_hold, collision_hand_qpos=hand,
+                arm_hold, collision_hand_qpos=hand,
             )
             if rejection is not None:
                 return ReplayStatus.REJECTED, f"hand start target: {rejection}"
@@ -280,7 +274,6 @@ class JointReplay:
             submitted_ns = time.monotonic_ns()
             deadline_ns = submitted_ns + period_ns
 
-        self.robot.end_hand_send_interval()
         expires_ns = submitted_ns + timeout_ns
         last_sample_ns = submitted_ns
         consecutive = 0

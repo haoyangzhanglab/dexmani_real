@@ -19,7 +19,6 @@ from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
     read_observation,
-    service_feedback,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 
@@ -93,14 +92,13 @@ class CartesianJog:
             if robot.stop_required:
                 self.stop(robot, state)
             self.clear_reference()
-            robot.end_hand_send_interval()
         elif safety_state == SafetyState.ARMED:
             self.clear_reference()
             if robot.stop_required:
                 robot.stop()
             try:
                 robot.prepare_streaming(
-                    epoch, service=lambda: service_feedback(robot, runtime),
+                    epoch, service=robot.service_feedback,
                 )
                 if keys.snapshot()[1] != generation or state.run_id != epoch:
                     raise OperationCancelled("jog changed during preparation")
@@ -119,7 +117,6 @@ class CartesianJog:
                 self.stop(robot, state)
             step.issues = tuple(issues)
             return step
-        robot.arm.update_health(health_until_ns=feedback_until_ns)
         if not moving:
             return step
 

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.robot.commands import RobotCommand
-from dexmani_real.runtime.state import RunEndReason
 
 
 @dataclass
@@ -30,12 +29,6 @@ class ActionChunk:
     frozen: dict[int, RobotCommand]
 
 
-@dataclass(frozen=True)
-class ControlRejection:
-    detail: str
-    run_end_reason: RunEndReason = RunEndReason.EXECUTOR_BOUNDARY
-
-
 def handoff_plan(
     query, *, run_id, slot, mode, action_steps, now_ns, authorized,
 ):
@@ -46,25 +39,25 @@ def handoff_plan(
     if handoff is None or slot < handoff:
         return None, None
     if not authorized:
-        return None, ControlRejection("handoff_authority_revoked")
-    ordinary_async = mode == "async" and not bootstrap
+        return None, "handoff_authority_revoked"
+    ordinary_async = mode == "async"
     if not ordinary_async and slot != handoff:
-        return None, ControlRejection("handoff_slot_missed")
+        return None, "handoff_slot_missed"
     if query.result is None:
         if ordinary_async:
             return None, None
-        return None, ControlRejection("handoff_result_not_ready")
+        return None, "handoff_result_not_ready"
+    if now_ns >= query.expires_at_ns:
+        return None, "handoff_decision_expired"
     segment_end = slot + action_steps
     if ordinary_async:
         if not 0 <= slot - query.slot < len(query.result):
-            return None, ControlRejection("handoff_prediction_exhausted")
-        if now_ns >= query.expires_at_ns:
-            return None, ControlRejection("handoff_decision_expired")
+            return None, "handoff_prediction_exhausted"
         segment_end = min(segment_end, query.slot + len(query.result))
     return (
         ActionChunk(
             actions=query.result,
-            anchor_slot=slot if bootstrap else query.slot,
+            anchor_slot=slot if bootstrap and mode == "rtc" else query.slot,
             segment_end=segment_end,
             expires_at_ns=query.expires_at_ns,
             frozen={},
@@ -85,29 +78,26 @@ def prefetch_handoff(
     elif slot != prefetch_slot:
         return None, None
     if query_pending:
-        return None, None if mode == "async" else ControlRejection("prefetch_unavailable")
+        return None, None if mode == "async" else "prefetch_unavailable"
     return plan.segment_end, None
 
 
-def control_slot(*, now_ns, next_step_ns, last_slot, dt_ns, synchronous, resume_ready):
+def control_slot(*, now_ns, next_step_ns, last_slot, dt_ns, synchronous):
     """返回到期控制步与下一期限，不补发错过的动作。"""
-    if synchronous and resume_ready:
-        next_step_ns = min(next_step_ns, now_ns)
     if now_ns < next_step_ns:
         return None, next_step_ns, 0
-    slot = last_slot + 1
     skipped = (now_ns - next_step_ns) // dt_ns
-    if skipped:
-        return slot, next_step_ns, skipped
-    return slot, (now_ns if synchronous else next_step_ns) + dt_ns, 0
+    # sync 的动作序号只随真实控制步推进，async 则按预测的时间锚点索引。
+    slot = last_slot + 1 + (0 if synchronous else skipped)
+    return slot, next_step_ns + (skipped + 1) * dt_ns, skipped
 
 
 def plan_rejection(plan, slot, mode, now_ns):
+    if now_ns >= plan.expires_at_ns:
+        return "submission_deadline_expired"
     if mode == "async":
         if not 0 <= slot - plan.anchor_slot < len(plan.actions):
-            return ControlRejection("plan_exhausted_without_handoff")
-        if now_ns >= plan.expires_at_ns:
-            return ControlRejection("submission_deadline_expired")
+            return "plan_exhausted_without_handoff"
     elif slot >= plan.segment_end:
-        return ControlRejection("plan_exhausted_without_handoff")
+        return "plan_exhausted_without_handoff"
     return None

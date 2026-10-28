@@ -92,7 +92,7 @@ def canonical_array_specs(
     }
 
 
-def validate_export_episode(reader: RawReader) -> CameraSnapshot:
+def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     frames = reader.num_frames
     if frames <= 0:
         raise ValueError("episode contains no rows")
@@ -105,15 +105,73 @@ def validate_export_episode(reader: RawReader) -> CameraSnapshot:
     expected = (frames, color.height, color.width)
     if reader["depth"].shape != expected or reader["depth"].dtype != np.uint16:
         raise ValueError(f"depth must be uint16 {expected}")
-    reader.validate_completion()
-    reader.validate_rows()
     if frames == 1:
-        logging.getLogger(__name__).warning(
+        logger.warning(
             "%s: single row, no sampling interval to verify", reader.path
         )
     for name in DATASET_SPECS:
         reader[name]
-    return camera
+    return camera, training_prefix(reader)
+
+
+def training_prefix(reader: RawReader) -> dict:
+    """只接纳从第零行开始的真实连续片段，不重采样或改写来源时钟。"""
+    status = reader.meta["technical_status"]
+    if status not in {"normal", "failed"}:
+        raise ValueError(f"unknown Raw technical_status: {status}")
+    rows = reader["timing/rows"][:]
+    count = len(rows)
+    period, tolerance = sampling_clock_ns(reader.control_hz)
+    # Raw 未逐行记录提交成功；技术失败的末行不能推断为已成功提交。
+    end = count - 1 if status == "failed" else count
+    reason = "technical_failure_last_row" if status == "failed" else None
+
+    def cut_at(bad, detail, offset=0):
+        nonlocal end, reason
+        indices = np.flatnonzero(bad)
+        if len(indices) and int(indices[0]) + offset <= end:
+            end, reason = int(indices[0]) + offset, detail
+
+    control, observation = rows["control_ns"], rows["observation_ns"]
+    cut_at((control <= 0) | (observation < control), "invalid_control_or_observation_clock")
+    cut_at(np.diff(observation) <= 0, "observation_clock_not_increasing", 1)
+    grid_error = control - int(control[0]) - np.arange(count) * period
+    cut_at(np.abs(np.diff(control) - period) > tolerance, "control_interval_gap_or_drift", 1)
+    cut_at(np.abs(grid_error) > tolerance, "control_grid_drift")
+    readout = observation - control
+    cut_at(readout >= period, "observation_crossed_control_period")
+    cut_at(observation[:-1] >= control[1:], "overlapping_control_observations")
+
+    for name in ("arm_ns", "hand_ns", "tactile_aggregate_ns", "tactile_dense_ns", "camera_ns"):
+        values = rows[name]
+        cut_at((values <= 0) | (values > observation), f"invalid_source_clock:{name}")
+        cut_at(np.diff(values) < 0, f"source_clock_regressed:{name}", 1)
+    sequence = rows["camera_sequence"]
+    cut_at(sequence < 0, "invalid_camera_sequence")
+    cut_at(np.diff(sequence) < 0, "camera_sequence_regressed", 1)
+    tactile_age = int(reader.validate_tactile_metadata() * 1e9)
+    for name in ("tactile_aggregate_ns", "tactile_dense_ns"):
+        cut_at(observation - rows[name] >= tactile_age, f"stale_source:{name}")
+
+    # 结构已整段验证；数值只需扫描可能保留的前缀，不读整段 RGB-D 到内存。
+    for start in range(0, end, 4096):
+        if start >= end:
+            break
+        for name in DATASET_SPECS:
+            values = reader[name][start:min(end, start + 4096)]
+            valid = np.isfinite(values).reshape(len(values), -1).all(axis=1)
+            cut_at(~valid, f"nonfinite:{name}", start)
+            if end == start:
+                break
+    if end <= 0:
+        raise ValueError(f"Raw {reader.path}: no valid training prefix ({reason})")
+    return dict(
+        raw_frames=count, row_start=0, row_stop=end,
+        source_technical_status=status, trim_reason=reason,
+        max_control_grid_deviation_ns=int(np.abs(grid_error[:end]).max()),
+        max_readout_ns=int(readout[:end].max()),
+        readout_over_tolerance_rows=int(np.count_nonzero(readout[:end] > tolerance)),
+    )
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
@@ -145,6 +203,7 @@ def iter_canonical_blocks(
     chunk_frames: int,
     camera: CameraSnapshot,
     handbase_rotation_eef: np.ndarray,
+    frames: int,
 ):
     """分块转换，不修补缺失观测或重采样行。"""
     height, width = camera.color.height, camera.color.width
@@ -157,19 +216,9 @@ def iter_canonical_blocks(
     )
     camera_parameters = camera_parameters_cv(camera.color, camera.T_xarm_base_from_color)
     images = reader.iter_rgb_frames()
-    for start in range(0, reader.num_frames, chunk_frames):
-        end = min(reader.num_frames, start + chunk_frames)
+    for start in range(0, frames, chunk_frames):
+        end = min(frames, start + chunk_frames)
         raw = {name: reader[name][start:end] for name in DATASET_SPECS}
-        for name in (
-            "arm_qpos",
-            "hand_qpos",
-            "action_arm_joint_target",
-            "action_hand_joint_target",
-        ):
-            valid = np.isfinite(raw[name]).all(axis=1)
-            if not valid.all():
-                row = start + int(np.flatnonzero(~valid)[0])
-                raise ValueError(f"Raw {name}: nonfinite values at row {row}")
         arm, hand = raw["arm_qpos"], raw["hand_qpos"]
         arm_action, hand_action = (
             raw["action_arm_joint_target"],
@@ -212,6 +261,11 @@ def iter_canonical_blocks(
             rgb[offset], clouds[offset] = image, cloud
         block.update(rgb=rgb, depth=depth, point_cloud=clouds)
         yield block
+    # 即使裁切训练尾部，也不能隐藏视频结构损坏或与 HDF5 行数不符。
+    for index in range(frames, reader.num_frames):
+        image = next(images, None)
+        if image is None or image.shape != (height, width, 3) or image.dtype != np.uint8:
+            raise ValueError(f"{reader.rgb_path}: RGB missing or invalid at row {index}")
     if next(images, None) is not None:
         raise ValueError(f"{reader.path / 'rgb.mp4'}: RGB contains extra frames")
 
@@ -238,13 +292,18 @@ def export_zarr(
     staging = None
     ends: list[int] = []
     episode_ids: list[str] = []
+    episode_quality = []
     try:
         for index, episode in enumerate(selected):
             if progress_callback:
                 progress_callback(index, len(selected))
             offset = ends[-1] if ends else 0
             with RawReader(episode) as reader:
-                camera = validate_export_episode(reader)
+                camera, quality = validate_export_episode(reader)
+                frames = quality["row_stop"]
+                logger.info("%s: training rows [0, %d)/%d; trim=%s; readout over dt/4 rows=%d",
+                            episode.name, frames, reader.num_frames, quality["trim_reason"],
+                            quality["readout_over_tolerance_rows"])
                 task = reader.meta["task_label"]
                 if not task.strip() or any(ord(char) < 32 or ord(char) == 127 for char in task):
                     raise ValueError("task_label must be nonempty without control characters")
@@ -279,9 +338,11 @@ def export_zarr(
                     chunk_frames=chunk,
                     camera=camera,
                     handbase_rotation_eef=rotation,
+                    frames=frames,
                 )
-                append_episode(arrays, offset, blocks, reader.num_frames)
-                ends.append(offset + reader.num_frames)
+                append_episode(arrays, offset, blocks, frames)
+                ends.append(offset + frames)
+                episode_quality.append(quality)
             episode_ids.append(
                 episode.name if episode == source else episode.relative_to(source).as_posix()
             )
@@ -289,12 +350,14 @@ def export_zarr(
             "episode_ends", data=np.asarray(ends, dtype=np.int64)
         )
         root.attrs["episode_ids"] = episode_ids
+        root.attrs["episode_quality"] = episode_quality
         publish(cast(Path, staging), target)
         staging = None
         if progress_callback:
             progress_callback(len(selected), len(selected))
         return dict(
-            episode_count=len(ends), total_frames=ends[-1], excluded_episodes=sorted(excluded)
+            episode_count=len(ends), total_frames=ends[-1], excluded_episodes=sorted(excluded),
+            episode_quality=episode_quality,
         )
     except Exception:
         logger.exception("Export failed at %s", episode)
@@ -329,9 +392,14 @@ def create_store(path, processing, camera, *, task, control_hz):
         table_plane_abcd=processing.table_plane_abcd,
         depth_scale_m_per_unit=camera.depth_scale_m,
         timing_admission=dict(
-            rule="adjacent_interval_and_cumulative_grid",
+            rule="continuous_control_prefix_with_bounded_readout",
             period_ns=period_ns,
-            tolerance_ns=tolerance_ns,
+            control_tolerance_ns=tolerance_ns,
+            control_clock="control_ns",
+            observation_clock="observation_ns",
+            readout_limit_ns=period_ns,
+            resampled=False,
+            failed_capture_tail="exclude_last_row",
         ),
     )
     data = root.create_group("data")
@@ -363,6 +431,8 @@ def append_episode(arrays, offset, blocks, frames):
                     raise ValueError(f"canonical {name}: nonfinite values at row {row}")
             arrays[name][offset + count : offset + count + rows] = values
         count += rows
+    if count != frames:
+        raise ValueError(f"canonical row count mismatch: expected {frames}, wrote {count}")
 
 
 def select_episodes(source, exclude):

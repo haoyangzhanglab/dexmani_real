@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""离线将完整 Raw episode 导出为可重建的全模态 Canonical Zarr 缓存。"""
+"""将 Raw 的有效连续前缀导出为全模态 Canonical Zarr。"""
 
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ from dexmani_real.data.export import ExportConfig, export_zarr
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Export complete Raw episodes to a canonical multimodal Zarr; "
-            "stop on incomplete or invalid episodes."
+            "Export one valid continuous prefix per Raw episode to a canonical multimodal Zarr. "
+            "Report trimmed tails; reject structural corruption or an empty valid prefix."
         )
     )
     parser.add_argument(
@@ -29,7 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "One raw task or episode directory. Exports to "
             "datasets/<task_name>.zarr by default (see --output). "
-            "All modalities must be complete and finite. The destination must not already exist."
+            "All retained modalities share the same row range and must be valid. "
+            "The destination must not already exist."
         ),
     )
     parser.add_argument(

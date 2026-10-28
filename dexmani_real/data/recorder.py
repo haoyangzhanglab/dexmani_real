@@ -70,9 +70,11 @@ class EpisodeRecorder:
 
     def check_error(self):
         if self.error is not None:
+            if isinstance(self.error, RecordingError):
+                raise self.error
             raise RecordingError(f"Recording failed: {self.error}") from self.error
 
-    def result(self, *, failed=False):
+    def result(self):
         """仅报告最后可观察的结果，pending 不推断线程之后的结局。"""
         if not self.start_attempted:
             return None
@@ -82,7 +84,7 @@ class EpisodeRecorder:
             status = "published"
         elif pending:
             status = "pending"
-        elif failed or self.error is not None:
+        elif self.error is not None:
             status = "failed"
         else:
             status = "not_published"

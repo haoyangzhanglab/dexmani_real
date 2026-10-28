@@ -59,19 +59,13 @@ class ActionMapper:
             home_hand_qpos=np.deg2rad(hand.home_qpos_deg),
         )
 
-    def joint_rejection(self, target, hand, current, previous):
+    def joint_rejection(self, target, hand):
         physical_hand = hand if hand is not None else self.home_hand_qpos
         return self.constraints.rejection(
-            target, current, previous, collision_hand_qpos=physical_hand
+            target, collision_hand_qpos=physical_hand
         )
 
-    def prepare_inputs(self, hand, current_arm_qpos, previous_arm_command_qpos):
-        current = np.asarray(current_arm_qpos, dtype=np.float64)
-        previous = (
-            current
-            if previous_arm_command_qpos is None
-            else np.asarray(previous_arm_command_qpos, dtype=np.float64)
-        )
+    def prepare_hand(self, hand):
         if self.hand_enabled:
             if hand is None:
                 raise ValueError("hand-enabled action mapping requires a hand intent")
@@ -81,30 +75,27 @@ class ActionMapper:
             hand = project_hand_command(
                 hand, qpos_min_rad=self.hand_lower, qpos_max_rad=self.hand_upper
             )
-        return current, previous, hand
+        return hand
 
-    def map_joint(self, arm, hand, current_arm_qpos, previous_arm_command_qpos=None):
+    def map_joint(self, arm, hand, current_arm_qpos):
         """保留投影候选，调用方必须在发送前处理拒绝原因。"""
         arm = np.asarray(arm, dtype=np.float64)
         if arm.shape != (7,) or not np.isfinite(arm).all():
             raise ValueError("joint intent must be a finite (7,) vector")
-        current, previous, hand = self.prepare_inputs(
-            hand, current_arm_qpos, previous_arm_command_qpos
-        )
-        if any(q.shape != (7,) or not np.isfinite(q).all() for q in (current, previous)):
-            raise ValueError("current and previous arm state must be finite (7,) vectors")
+        current = np.asarray(current_arm_qpos, dtype=np.float64)
+        hand = self.prepare_hand(hand)
         target = project_arm_command(
             arm,
             current,
             joint_lower_rad=self.constraints.limits[:, 0],
             joint_upper_rad=self.constraints.limits[:, 1],
         )
-        return ActionResult(target, hand, self.joint_rejection(target, hand, current, previous))
+        return ActionResult(target, hand, self.joint_rejection(target, hand))
 
     def map_eef(self, pose: Pose, hand, current_arm_qpos, previous_arm_command_qpos=None):
-        current, previous, hand = self.prepare_inputs(
-            hand, current_arm_qpos, previous_arm_command_qpos
-        )
+        current = np.asarray(current_arm_qpos, dtype=np.float64)
+        previous = current if previous_arm_command_qpos is None else previous_arm_command_qpos
+        hand = self.prepare_hand(hand)
         if self.solver is None:
             raise ValueError("EEF mapping requires an online IK solver")
         # 复制后投影，避免改写输入目标及 Teleop 的 EMA 参考。
@@ -131,8 +122,7 @@ class ActionMapper:
         position, rotation = self.constraints.target_fk.forward(command.arm_qpos)
         return np.concatenate((position, rotation, command.hand_qpos))
 
-    def frozen_rejection(self, command, current, previous, mode):
-        previous = current if previous is None else previous
+    def frozen_rejection(self, command, current, mode):
         # 已准备的目标不能重新选择等价分支。
         projected = (
             command.arm_qpos
@@ -146,7 +136,7 @@ class ActionMapper:
         )
         if not np.array_equal(projected, command.arm_qpos):
             return "frozen_equivalent_branch_changed"
-        return self.joint_rejection(command.arm_qpos, command.hand_qpos, current, previous)
+        return self.joint_rejection(command.arm_qpos, command.hand_qpos)
 
 
 def project_arm_command(target_arm_qpos, reference_arm_qpos, *, joint_lower_rad, joint_upper_rad):

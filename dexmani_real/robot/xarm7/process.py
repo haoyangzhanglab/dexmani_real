@@ -2,6 +2,7 @@
 
 import multiprocessing as mp
 import time
+from contextlib import ExitStack
 
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.xarm7.config import (
@@ -110,7 +111,7 @@ class ArmProcess:
         if not status["valid"] or not 0 < stamp <= time.monotonic_ns() < stamp + int(
             self.cfg.feedback_max_age_s * 1e9
         ):
-            raise RuntimeError("arm feedback unavailable/stale")
+            raise RobotError("arm feedback unavailable/stale")
         frame = status["frame"].copy().reshape(1)
         frame.flags.writeable = False
         return frame
@@ -154,13 +155,10 @@ class ArmProcess:
             raise TimeoutError("arm operation deadline expired before submission")
         self.operation_id = request.operation_id
         self.pipe.send(request)
-        service_due, received = 0, False
+        received = False
         try:
             while not self.pipe.poll(0.005):
-                now = time.monotonic_ns()
-                if now >= service_due:
-                    service()
-                    service_due = now + round(1e9 / self.cfg.feedback_hz)
+                service()
                 if abort():
                     raise OperationCancelled("arm operation cancelled")
                 if time.monotonic_ns() >= deadline_ns or not self.is_connected:
@@ -168,7 +166,11 @@ class ArmProcess:
             reply = self.receive_reply(request.operation_id)
             received = True
             if reply.error is not None:
-                raise reply.error
+                if self.io.close_error.value:
+                    raise RobotError(self.io.close_error.value.decode(errors="replace")) from reply.error
+                if isinstance(reply.error, (OperationCancelled, TimeoutError)) or not isinstance(reply.error, Exception):
+                    raise reply.error
+                raise RobotError(f"arm operation failed: {reply.error}") from reply.error
             if abort():
                 raise OperationCancelled("arm operation cancelled")
             if time.monotonic_ns() >= deadline_ns:
@@ -242,9 +244,11 @@ class ArmProcess:
             self.process.join(EXECUTOR_TIMEOUT_S)
             if self.process.is_alive():
                 raise TimeoutError("arm owner process still active; stop/disconnect unresolved")
-            if self.process.exitcode != 0:
+        # 存活的 owner 仍持有管道；确认退出后，即使某项关闭失败也释放其余端点。
+        with ExitStack() as resources:
+            resources.callback(self.child_pipe.close)
+            resources.callback(self.pipe.close)
+            if self.process is not None and self.process.exitcode not in (None, 0):
                 raise RuntimeError(f"arm owner abnormal exit: {self.process.exitcode}")
-        self.pipe.close()
-        self.child_pipe.close()
-        if self.io.close_error.value:
-            raise RuntimeError(self.io.close_error.value.decode(errors="replace"))
+            if self.io.close_error.value:
+                raise RuntimeError(self.io.close_error.value.decode(errors="replace"))

@@ -6,6 +6,7 @@ import numpy as np
 
 from dexmani_real.control.constraints import (
     equivalent_joint_delta,
+    joint_target_rejection,
     wrap_nearest_equivalent,
 )
 from dexmani_real.geometry.pose import Pose, compute_pose_error
@@ -91,8 +92,6 @@ class IKSolver:
         import mplib
 
         current, previous = (np.asarray(q, dtype=np.float64) for q in (current, previous))
-        if any(q.shape != (7,) or not np.isfinite(q).all() for q in (current, previous)):
-            raise ValueError("IK states must be finite (7,) vectors")
         self.constraints.collision_model.set_hand_qpos(hand_qpos)
         target_base = mplib.Pose(p=target.p, q=target.q)
         pool: list[IKCandidate] = []
@@ -163,7 +162,7 @@ class IKSolver:
 
         lower, upper = self.limits.T
         q = wrap_nearest_equivalent(raw, current, lower, upper)
-        reason = self.constraints.joint_rejection(q, current, previous)
+        reason = joint_target_rejection(q, self.limits)
         if reason is not None:
             return None, reason
         if any(np.max(np.abs(q - c.qpos)) < 1e-4 for c in pool):

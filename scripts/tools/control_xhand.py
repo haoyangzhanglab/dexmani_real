@@ -130,11 +130,6 @@ class XHandControlExample(XHand):
             print("  Joint feedback unavailable")
             return False
         print("  joint positions (deg, SDK ids 0..11):", np.rad2deg(state.qpos).round(3).tolist())
-        print("  joint currents (mA; NaN means unavailable):", state.current_ma.tolist())
-        print(
-            f"  comm_err={state.commboard_err[finger_id]}  "
-            f"joint_err={state.jointboard_err[finger_id]}  tip_err={state.tipboard_err[finger_id]}"
-        )
         if finger_id in XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID:
             index = XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID[finger_id]
             force = state.tactile_aggregate[index]

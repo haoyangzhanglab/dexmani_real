@@ -1,11 +1,12 @@
 """机械臂 SDK 与伺服循环；阻塞的原生调用无法在此中断。"""
 
+import logging
 import time
 from typing import cast
 
 import numpy as np
 
-from dexmani_real.robot.commands import OperationCancelled, RobotError, validate_arm_target
+from dexmani_real.robot.commands import OperationCancelled, validate_arm_target
 from dexmani_real.robot.xarm7.config import (
     HOME_CONVERGENCE_TIMEOUT_S,
     HOME_DWELL_S,
@@ -20,6 +21,8 @@ from dexmani_real.robot.xarm7.protocol import (
 )
 from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
 from dexmani_real.utils.timing import next_tick_ns
+
+logger = logging.getLogger(__name__)
 
 
 class ArmController:
@@ -40,7 +43,9 @@ class ArmController:
 
     def fault(self, reason):
         if not self.io.fault.value:
-            self.io.fault.value = str(reason).encode()[:1023]
+            self.io.fault.value = f"{type(reason).__name__}: {reason}".encode()[:1023]
+            # traceback 不能经共享字符串/普通 pickle 传递，在 SDK 所有者处保留。
+            logger.error("arm controller failed", exc_info=(type(reason), reason, reason.__traceback__))
         self.io.stop.set()
 
     def read_feedback(self):
@@ -196,6 +201,8 @@ class ArmController:
         except BaseException as exc:
             if not self.io.close_error.value:
                 self.io.close_error.value = f"stop SDK failure: {exc}".encode()[:1023]
+            if self.io.fault.value:
+                logger.exception("arm stop also failed")
             self.fault(exc)
         finally:
             self.io.stopped.set()  # 处理结束；停止失败仍保存在 close_error。
@@ -233,18 +240,11 @@ class ArmController:
             self.io.execution_limit[:] = (MAX_TIME, 0)
             self.status["prepared_run_id"] = run_id
         except BaseException as exc:
-            detail = f"{type(exc).__name__}: {exc}"
-            error_type = (
-                type(exc) if isinstance(exc, (OperationCancelled, TimeoutError)) else RobotError
-            )
-            error = error_type(detail)
+            error = exc
             if not isinstance(exc, OperationCancelled):
                 self.fault(exc)
             # 无需等待可能阻塞在其他设备 SDK 内的父进程。
             self.stop()
-            if self.io.close_error.value:
-                detail += "; " + self.io.close_error.value.decode(errors="replace")
-                error = RobotError(detail)
 
         self.io.publish_status(self.status)
         self.pipe.send(LifecycleReply(identity, error))
@@ -374,7 +374,8 @@ class ArmController:
                 self.stop()
             try:
                 self.driver.close()
-            except Exception as exc:
+            except BaseException as exc:
+                logger.exception("arm disconnect failed")
                 previous = self.io.close_error.value.decode(errors="replace")
                 detail = f"disconnect failure: {exc}"
                 self.io.close_error.value = (
@@ -390,6 +391,7 @@ def run_arm(cfg, io, pipe):
 
         driver = XArm7(cfg)
     except BaseException as exc:
+        logger.exception("arm driver construction failed")
         io.fault.value = f"driver construction failed: {exc}".encode()[:1023]
         io.ready.set()
         pipe.close()

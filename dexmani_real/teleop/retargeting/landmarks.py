@@ -47,6 +47,4 @@ def prepare_landmarks(landmarks, *, pinky_scale, pinky_palm_scale):
     pinky = mano[17].copy()
     base = mano[0] + (pinky - mano[0]) * pinky_palm_scale
     mano[17:] = base + (mano[17:] - pinky) * pinky_scale
-    if not np.isfinite(mano).all():
-        raise ValueError("transformed hand landmarks must be finite")
     return mano

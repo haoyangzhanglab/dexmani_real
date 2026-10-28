@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.ipc.sensors import read_camera_frame, read_vr_frame
-from dexmani_real.robot.commands import RobotError
 from dexmani_real.utils.timing import sample_is_fresh
 
 
@@ -74,14 +73,14 @@ def read_observation(channels, robot, *, needs=ObservationNeeds()):
     )
 
 
-def check_observation(row, runtime, needs, *, require_hand=True, now_ns=None):
-    """返回来源问题及绝对提交期限；接收与提交保留各自的纳秒边界。"""
-    now = time.monotonic_ns() if now_ns is None else now_ns
+def check_observation(row, runtime, needs, *, require_hand=True):
+    """复制传感器快照后复核来源年龄，返回问题及绝对提交期限。"""
+    now = time.monotonic_ns()
     issues = []
     stamp = int(row.arm["timestamp_ns"][0])
-    arm_age_ns = int(runtime.arm.feedback_max_age_s * 1e9)
-    deadlines = [stamp + arm_age_ns + 1, now + arm_age_ns]
-    if not sample_is_fresh(stamp, runtime.arm.feedback_max_age_s, now):
+    deadline = stamp + int(runtime.arm.feedback_max_age_s * 1e9)
+    deadlines = [deadline]
+    if not 0 < stamp <= now < deadline:
         issues.append("arm_feedback_stale")
     if require_hand and row.hand is None:
         issues.append("hand_feedback_unavailable")
@@ -118,16 +117,3 @@ def check_observation(row, runtime, needs, *, require_hand=True, now_ns=None):
             if not sample_is_fresh(stamp, age, now):
                 issues.append("vr_stale")
     return issues, None if issues else min(deadlines)
-
-
-def service_feedback(robot, runtime):
-    """准备与 HOME 期间，仅由有效运动反馈更新控制期限。"""
-    needs = ObservationNeeds()
-    row = read_observation(None, robot, needs=needs)
-    issues, feedback_until_ns = check_observation(
-        row, runtime, needs, require_hand=runtime.hand.enabled,
-    )
-    if issues:
-        raise RobotError("preparation feedback: " + "; ".join(issues))
-    robot.arm.update_health(health_until_ns=feedback_until_ns)
-    return row
