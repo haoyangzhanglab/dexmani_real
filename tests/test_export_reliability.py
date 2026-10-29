@@ -110,9 +110,10 @@ class ExportReliabilityTests(unittest.TestCase):
                 self.assertEqual(quality["row_stop"], 2)
                 self.assertEqual(quality["trim_reason"], "technical_failure_last_row")
             # 有限 float64 转为 float32 溢出仍应失败，不能因原始检查通过而跳过输出检查。
-            with self.assertRaises((ValueError, RuntimeError)):
-                export_zarr(raw, Path(directory) / "overflow.zarr",
-                            processing=ExportConfig(pointcloud=PointCloudConfig(remove_table=False)))
+            with self.assertWarnsRegex(RuntimeWarning, "overflow encountered in cast"):
+                with self.assertRaisesRegex(ValueError, "canonical action: nonfinite values at row 1"):
+                    export_zarr(raw, Path(directory) / "overflow.zarr",
+                                processing=ExportConfig(pointcloud=PointCloudConfig(remove_table=False)))
 
 
 if __name__ == "__main__":
