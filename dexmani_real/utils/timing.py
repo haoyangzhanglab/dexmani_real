@@ -7,15 +7,18 @@ import time
 
 
 class Rate:
-    """按绝对期限等待，错过整周期后重新计时。"""
+    """按实际循环起点限频；超期立即返回，不追加等待或补跑旧周期。"""
 
-    def __init__(self, hz: float):
+    def __init__(self, hz: float) -> None:
         if not math.isfinite(hz) or hz <= 0:
             raise ValueError(f"hz must be finite and positive, got {hz}")
         self.period = 1.0 / hz
         self.reset()
 
-    def wait(self, *, service=None):
+    def reset(self) -> None:
+        self.next_deadline = time.perf_counter() + self.period
+
+    def wait(self, *, service=None) -> None:
         now = time.perf_counter()
         remaining = self.next_deadline - now
         while remaining > 0:
@@ -26,11 +29,7 @@ class Rate:
                 time.sleep(min(0.005, remaining) if service is not None else remaining)
             now = time.perf_counter()
             remaining = self.next_deadline - now
-        base = now if now - self.next_deadline >= self.period else self.next_deadline
-        self.next_deadline = base + self.period
-
-    def reset(self):
-        self.next_deadline = time.perf_counter() + self.period
+        self.next_deadline = now + self.period
 
 
 def next_tick_ns(planned_ns, period_ns, now_ns):

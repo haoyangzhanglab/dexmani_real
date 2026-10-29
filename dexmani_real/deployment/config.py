@@ -86,8 +86,11 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
 def resolve_deployment_config(
     info, runtime: RealConfig, needs: ObservationNeeds,
 ) -> RealConfig:
-    if info.policy_name == "adaptac" and info.saved_config.get("tactile_source") != "real":
-        raise ValueError("Real deployment requires real-source AdapTac; sim/unknown source is incompatible")
+    from dexmani_policy.common.config import require_tactile_source
+
+    source = require_tactile_source(info.observation_fields, info.saved_config.get("tactile_source"))
+    if source == "sim":
+        raise ValueError("Real deployment requires real-source tactile observations")
     action_steps = runtime.execution.action_steps
     execution = replace(
         runtime.execution,

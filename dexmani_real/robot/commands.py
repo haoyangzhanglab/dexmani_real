@@ -10,11 +10,13 @@ class RobotCommand:
     run_id: int
     arm_qpos: np.ndarray | None = None
     hand_qpos: np.ndarray | None = None
-    input_generation: int = -1
+    arm_hold: bool = False  # 从当前伺服参考减速到零并保持，不退出 Mode 1。
 
     def __post_init__(self):
-        if self.arm_qpos is None and self.hand_qpos is None:
+        if self.arm_qpos is None and self.hand_qpos is None and not self.arm_hold:
             raise ValueError("command requires an actuator target")
+        if self.arm_hold and self.arm_qpos is not None:
+            raise ValueError("arm hold cannot carry a position target")
         for name in ("arm_qpos", "hand_qpos"):
             value = getattr(self, name)
             if value is not None:
@@ -24,7 +26,7 @@ class RobotCommand:
 
 
 class OperationCancelled(RuntimeError):
-    """本次运行或输入已撤销。"""
+    """本次运行已撤销。"""
 
 
 class RobotError(RuntimeError):

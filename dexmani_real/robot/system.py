@@ -64,7 +64,6 @@ class Robot:
         self.stop_failure = None
         self.hand_feedback = XHandFeedback(hand_config)
         self.feedback_next_ns = 0
-        self.input_signal = None
 
     def check_owner(self):
         if self.owner != threading.get_ident():
@@ -112,7 +111,6 @@ class Robot:
                 stop_signal=self.stop_signal,
                 emergency_signal=self.emergency_signal,
                 signal_lock=self.signal_lock,
-                input_signal=self.input_signal,
             )
             self.arm.connect(check_services=self.check_services)
             if cancelled():
@@ -254,10 +252,11 @@ class Robot:
         self.check_owner()
         if self.stop_failure is not None:
             raise RobotError("previous robot stop remains unresolved")
-        if command.arm_qpos is not None:
+        if command.arm_qpos is not None or command.arm_hold:
             if not self.connected or self.arm is None or not self.arm.is_connected:
                 raise RobotError("arm device unavailable")
-            validate_arm_target(command.arm_qpos, self.arm_lower, self.arm_upper)
+            if command.arm_qpos is not None:
+                validate_arm_target(command.arm_qpos, self.arm_lower, self.arm_upper)
             if execute_until_ns is None or execute_until_ns <= 0:
                 raise ValueError("arm requires an explicit decision execution deadline")
         if command.hand_qpos is not None:
@@ -274,7 +273,7 @@ class Robot:
             self.stop_required = True
 
         try:
-            if command.arm_qpos is not None:
+            if command.arm_qpos is not None or command.arm_hold:
                 check_send()
                 cast("ArmProcess", self.arm).submit(
                     command, submit_until_ns=valid_until_ns, execute_until_ns=execute_until_ns
@@ -288,7 +287,7 @@ class Robot:
             raise
 
     def send_hand_home(self, command, *, valid_until_ns):
-        if command.arm_qpos is not None:
+        if command.arm_qpos is not None or command.arm_hold:
             raise ValueError("hand HOME cannot carry an arm streaming target")
         self.validate_command(command)
         cast("ArmProcess", self.arm).begin_operation(command.run_id)

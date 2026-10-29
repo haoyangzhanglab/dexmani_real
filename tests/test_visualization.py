@@ -16,7 +16,9 @@ from dexmani_real.calibration.camera.aruco import ARUCO_DICT, MARKER_ID, ArucoSa
 from dexmani_real.calibration.camera.calibrate import CameraCalibrator
 from dexmani_real.config import load_config
 from dexmani_real.geometry.camera import CameraIntrinsics
-from dexmani_real.runtime.state import SessionState
+from dexmani_real.robot.commands import OperationCancelled, RobotError
+from dexmani_real.runtime.home import HomeResult
+from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.utils.visualization.image import (
     colorize_depth,
     draw_aruco,
@@ -184,6 +186,95 @@ class PointCloudWindowTests(unittest.TestCase):
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_session_failure_keeps_cause_and_closes_resources(self):
+        for error, reason in (
+            (RobotError('arm feedback stale'), RunEndReason.HARDWARE_FAULT),
+            (ValueError('invalid target'), RunEndReason.POLICY_FAILURE),
+        ):
+            with self.subTest(reason=reason):
+                calibrator = CameraCalibrator(load_config())
+                calibrator.prepare = Mock()
+                calibrator.runtime_state = SessionState()
+                calibrator.keys = Mock(healthy=True)
+                calibrator.robot = Mock()
+                calibrator.sensors = Mock()
+                calibrator.sensors.shutdown.return_value = True
+
+                def fail_motion(state=calibrator.runtime_state, error=error):
+                    state.stop_signal.clear()
+                    state.begin_motion()
+                    raise error
+
+                calibrator.run_control_loop = fail_motion
+                with (
+                    patch('dexmani_real.calibration.camera.calibrate.snapshot_camera_parameters'),
+                    patch('dexmani_real.calibration.camera.calibrate.ImageViewer'),
+                    patch('builtins.print'),
+                    self.assertLogs('dexmani_real.calibration.camera.calibrate', level='ERROR') as logs,
+                ):
+                    self.assertEqual(calibrator.run(), 1)
+                self.assertIn(str(error), logs.output[0])
+                self.assertEqual(calibrator.runtime_state.run_ended_reason, reason)
+                self.assertEqual(calibrator.runtime_state.safety_state, SafetyState.FAULT)
+                self.assertTrue(calibrator.runtime_state.stop_signal.is_set())
+                calibrator.robot.close.assert_called_once()
+                calibrator.keys.stop.assert_called_once()
+                calibrator.sensors.shutdown.assert_called_once()
+                calibrator.preview.close.assert_called_once()
+
+    def test_home_reports_rejection_and_cancellation_reasons(self):
+        for interrupted, reason, message in (
+            (False, 'collision: test_obstacle', 'HOME failed'),
+            (True, 'home interrupted during planning', 'HOME cancelled'),
+        ):
+            with self.subTest(interrupted=interrupted):
+                calibrator = CameraCalibrator(load_config())
+                calibrator.runtime_state = SessionState()
+                calibrator.robot = Mock()
+                calibrator.jog = Mock()
+                calibrator.keys = Mock()
+                calibrator.rate = Mock()
+                calibrator.home_planner = Mock()
+                with (
+                    patch('dexmani_real.calibration.camera.calibrate.home_arm',
+                          return_value=HomeResult(False, reason, interrupted)),
+                    self.assertLogs('dexmani_real.calibration.camera.calibrate', level='INFO') as logs,
+                ):
+                    calibrator.run_home()
+                self.assertIn('Returning home...', logs.output[0])
+                self.assertIn(f'{message}: {reason}', logs.output[1])
+                calibrator.jog.stop.assert_called_once()
+                calibrator.keys.discard_events.assert_called_once_with('r')
+                calibrator.rate.reset.assert_called_once()
+
+    def test_quit_during_startup_keeps_calibration_exit_status(self):
+        for saved in (False, True):
+            with self.subTest(saved=saved):
+                calibrator = CameraCalibrator(load_config())
+                calibrator.prepare = Mock()
+                calibrator.runtime_state = SessionState()
+                calibrator.calibration_saved = saved
+                calibrator.keys = Mock(healthy=True)
+                calibrator.sensors = Mock()
+                calibrator.sensors.shutdown.return_value = True
+                calibrator.robot = Mock()
+
+                def cancel(state=calibrator.runtime_state):
+                    state.request_quit()
+                    raise OperationCancelled('startup cancelled')
+
+                calibrator.robot.connect.side_effect = cancel
+                with (
+                    patch('builtins.print'),
+                    self.assertLogs('dexmani_real.calibration.camera.calibrate', level='INFO') as logs,
+                ):
+                    self.assertEqual(calibrator.run(), 0 if saved else 2)
+                self.assertIn('startup cancelled', logs.output[0])
+                self.assertFalse(calibrator.runtime_state.error_state)
+                self.assertEqual(calibrator.runtime_state.safety_state, SafetyState.DISARMED)
+                calibrator.robot.close.assert_called_once()
+                calibrator.sensors.start.assert_not_called()
+
     def test_close_during_capture_cancels_before_read_or_append(self):
         calibrator = CameraCalibrator(load_config())
         calibrator.preview = Mock()

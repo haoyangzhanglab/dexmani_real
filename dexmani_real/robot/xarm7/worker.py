@@ -233,12 +233,6 @@ class ArmController:
     def command_issue(self, goal, now, *, first=False):
         if not self.authorized(int(goal["run_id"])):
             return "revoked"
-        if (
-            first
-            and goal["input_generation"] >= 0
-            and goal["input_generation"] != self.io.input_generation.value
-        ):
-            return "input_changed"
         if first and now >= goal["submit_until_ns"]:
             return "submission_expired_before_sdk"
         if self.status["prepared_run_id"] != goal["run_id"]:
@@ -263,7 +257,7 @@ class ArmController:
         goal = pending if pending is not None else self.active
         issue = self.command_issue(goal, now, first=pending is not None)
         if issue:
-            if issue not in {"revoked", "input_changed"}:
+            if issue != "revoked":
                 raise RuntimeError(issue)
             self.io.stop.set()
             return
@@ -275,7 +269,8 @@ class ArmController:
                 self.reference = ArmTrajectory(self.cfg, q, v, now)
             self.active = pending
         q = cast(ArmTrajectory, self.reference).step(
-            now, pending["q_goal"] if pending is not None else None
+            now, pending["q_goal"] if pending is not None and not pending["hold"] else None,
+            hold=bool(pending is not None and pending["hold"]),
         )
         if np.max(np.abs(self.status["frame"]["qpos"] - q)) > self.cfg.tracking_error_rad:
             raise RuntimeError("tracking_error")
@@ -288,7 +283,7 @@ class ArmController:
         if issue is None and started - now >= int(SERVO_MAX_INTERVAL_S * 1e9):
             issue = "servo computation stalled before SDK"
         if issue:
-            if issue not in {"revoked", "input_changed"}:
+            if issue != "revoked":
                 raise RuntimeError(issue)
             self.io.stop.set()
             return

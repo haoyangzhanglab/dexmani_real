@@ -6,7 +6,7 @@ from dexmani_real.calibration.table_plane import load_table_plane
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.control.ik import IKSolver
-from dexmani_real.robot.commands import RobotError
+from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.jog import CartesianJog
@@ -59,6 +59,9 @@ class KeyboardTeleop:
         except KeyboardInterrupt:
             self.runtime_state.request_emergency_stop()
             raise
+        except OperationCancelled as exc:
+            logger.info("Keyboard teleop cancelled: %s", exc)
+            clean = bool(self.runtime_state.quit_requested)
         except Exception as exc:
             self.runtime_state.mark_error()
             self.runtime_state.revoke_motion(
@@ -92,13 +95,13 @@ class KeyboardTeleop:
         if not self.keys.healthy:
             raise RuntimeError("keyboard stop listener unavailable")
         self.robot.check_services = lambda: self.keys.healthy
-        self.robot.input_signal = self.keys.generation_signal
         self.robot.connect()
         self.robot.check()
         self.runtime_state.arm()
+        self.jog.prepare(self.robot, self.runtime_state)
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         print(
-            "Key changes invalidate pending targets; release all jog keys after a rejected target"
+            "Release jog keys to brake and hold; release all jog keys after a rejected target"
         )
         self.rate = Rate(self.jog_config.control_hz)
 
@@ -119,10 +122,11 @@ class KeyboardTeleop:
             if "r" in events:
                 self.run_home()
                 continue
-            self.motion_tick()
+            self.jog.step(self.robot, self.keys, self.runtime_state, self.runtime)
         return bool(self.runtime_state.quit_requested)
 
     def run_home(self):
+        logger.info("Returning home...")
         self.jog.stop(self.robot, self.runtime_state)
         home_result = home_robot(
             self.runtime_state, self.robot, self.home_planner,
@@ -137,9 +141,3 @@ class KeyboardTeleop:
             logger.info("HOME cancelled: %s", home_result.reason)
         self.keys.discard_events("r")
         self.rate.reset()
-
-    def motion_tick(self):
-        self.jog.step(
-            self.robot, self.keys, self.runtime_state, self.runtime,
-            deadline_source="observation",
-        )

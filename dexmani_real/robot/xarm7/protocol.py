@@ -1,4 +1,4 @@
-"""机械臂共享通道、反馈布局与低频操作消息。"""
+"""机械臂共享通道：新目标覆盖未消费目标；反馈快照与低频操作独立传递。"""
 
 import time
 from dataclasses import dataclass
@@ -21,7 +21,7 @@ GOAL_DTYPE = np.dtype(
     [
         ("sequence", "<i8"),
         ("run_id", "<i8"),
-        ("input_generation", "<i8"),
+        ("hold", "?"),
         ("submit_until_ns", "<i8"),
         ("execute_until_ns", "<i8"),
         ("q_goal", "<f8", (7,)),
@@ -52,11 +52,10 @@ class HomeRequest:
 
 class ArmChannels:
     def __init__(
-        self, ctx, *, run_signal, stop_signal, emergency_signal, signal_lock, input_signal=None
+        self, ctx, *, run_signal, stop_signal, emergency_signal, signal_lock
     ):
         self.run_id, self.stop, self.emergency = run_signal, stop_signal, emergency_signal
         self.signal_lock = signal_lock
-        self.input_generation = input_signal if input_signal is not None else ctx.Value("q", -1)
         self.closing, self.stopped, self.ready = (ctx.Event() for _ in range(3))
         self.connected = ctx.Event()
         self.fault = ctx.Array("c", 1024, lock=False)
@@ -68,17 +67,8 @@ class ArmChannels:
 
     def publish_goal(self, command, *, sequence, submit_until_ns, execute_until_ns):
         prepared_run_id = self.read_status()["prepared_run_id"]
-        goal = np.zeros((), dtype=GOAL_DTYPE)
-        goal[()] = (
-            sequence,
-            command.run_id,
-            command.input_generation,
-            submit_until_ns,
-            execute_until_ns,
-            command.arm_qpos,
-        )
         with self.goal_lock:
-            # IPC 等待之后重新检查运行身份、停止信号和 jog 输入代际。
+            # IPC 等待之后重新检查运行身份和停止信号。
             if (
                 self.closing.is_set()
                 or self.stop.is_set()
@@ -86,19 +76,18 @@ class ArmChannels:
                 or self.run_id.value != command.run_id
             ):
                 raise OperationCancelled("arm target run cancelled")
-            if (
-                command.input_generation >= 0
-                and self.input_generation.value != command.input_generation
-            ):
-                raise OperationCancelled("jog input changed before publication")
             if time.monotonic_ns() >= min(submit_until_ns, execute_until_ns):
                 raise TimeoutError("arm target deadline expired")
             if prepared_run_id != command.run_id:
                 raise RuntimeError("arm target run was not prepared")
-            slot = np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)
-            if slot["sequence"][0]:
-                raise RuntimeError("arm target slot is full")
-            slot[0] = goal
+            np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)[0] = (
+                sequence,
+                command.run_id,
+                command.arm_hold,
+                submit_until_ns,
+                execute_until_ns,
+                command.arm_qpos if command.arm_qpos is not None else 0.0,
+            )
 
     def take_goal(self, *, block=False):
         if not self.goal_lock.acquire(block):

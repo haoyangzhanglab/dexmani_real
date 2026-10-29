@@ -1,7 +1,14 @@
 """Ruckig 连续参考；运动中替换目标不以实测反馈重置轨迹。"""
 
 import numpy as np
-from ruckig import InputParameter, Result, Ruckig, Trajectory
+from ruckig import (
+    ControlInterface,
+    InputParameter,
+    Result,
+    Ruckig,
+    Synchronization,
+    Trajectory,
+)
 
 from dexmani_real.robot.commands import validate_arm_target
 
@@ -25,7 +32,7 @@ class ArmTrajectory:
         self.origin_ns = self.sample_ns = int(now_ns)
         self._plan(self.q, now_ns)
 
-    def step(self, now_ns, goal=None) -> np.ndarray:
+    def step(self, now_ns, goal=None, *, hold=False) -> np.ndarray:
         if now_ns != self.sample_ns:
             q, v, a = (
                 np.asarray(value)
@@ -35,14 +42,20 @@ class ArmTrajectory:
                 raise ValueError("non-finite arm reference")
             self.q, self.v, self.sample_ns = q, v, int(now_ns)
 
-        if goal is not None and not np.array_equal(goal, self.goal):
+        if hold and self.goal is not None:
+            self._plan(None, now_ns)
+        elif goal is not None and not np.array_equal(goal, self.goal):
             self._plan(goal, now_ns)
         return self.q
 
     def _plan(self, goal, now_ns):
         self.input.current_position = self.q.tolist()
         self.input.current_velocity = self.v.tolist()
-        self.input.target_position = goal.tolist()
+        # 保持请求只制动；各关节独立停稳，不继续追赶此前积累的位置目标。
+        self.input.control_interface = ControlInterface.Velocity if goal is None else ControlInterface.Position
+        self.input.synchronization = Synchronization.No if goal is None else Synchronization.Time
+        if goal is not None:
+            self.input.target_position = goal.tolist()
         self.otg.validate_input(self.input, True, True)
         trajectory = Trajectory(7)
         if self.otg.calculate(self.input, trajectory) not in (Result.Working, Result.Finished):
@@ -59,4 +72,4 @@ class ArmTrajectory:
                 )
         self.trajectory = trajectory
         self.origin_ns = int(now_ns)
-        self.goal = goal.copy()
+        self.goal = goal.copy() if goal is not None else None

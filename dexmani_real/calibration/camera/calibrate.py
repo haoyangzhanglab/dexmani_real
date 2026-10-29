@@ -35,6 +35,7 @@ from dexmani_real.ipc.sensors import (
     read_camera_frame,
     snapshot_camera_parameters,
 )
+from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import home_arm
 from dexmani_real.runtime.jog import CartesianJog
@@ -95,9 +96,12 @@ class CameraCalibrator:
 
     def cancel_requested(self) -> bool:
         # 所有等待阶段（包括 HOME）使用同一取消入口，窗口关闭仅请求退出一次。
-        if not self.runtime_state.quit_requested and self.preview is not None:
-            if "closed" in self.preview.poll_events():
-                self.runtime_state.request_quit()
+        if (
+            not self.runtime_state.quit_requested
+            and self.preview is not None
+            and "closed" in self.preview.poll_events()
+        ):
+            self.runtime_state.request_quit()
         return bool(
             self.runtime_state.quit_requested
             or self.runtime_state.estop_request
@@ -294,7 +298,6 @@ class CameraCalibrator:
             self.keys.start()
             if not self.keys.healthy:
                 raise RuntimeError("keyboard stop listener unavailable")
-            self.robot.input_signal = self.keys.generation_signal
             self.robot.connect()
             self.sensors.start(
                 mp.get_context("spawn").Process(
@@ -307,7 +310,7 @@ class CameraCalibrator:
             )
             self.robot.check()
             self.runtime_state.arm()
-            print("  local arm connected (owner process; Mode 1 prepared on jog)")
+            print("  local arm connected (owner process)")
             self.camera = snapshot_camera_parameters(self.sensors.channels, self.runtime.camera, None)
             print(f"  Camera serial: {self.camera.serial}")
             print(f"  Resolution: {self.camera.color.width}x{self.camera.color.height}")
@@ -316,10 +319,18 @@ class CameraCalibrator:
         except KeyboardInterrupt:
             self.fault("KeyboardInterrupt", estop=True)
             exit_code = 130
+        except OperationCancelled as exc:
+            logger.info("Calibration cancelled: %s", exc)
+            if self.runtime_state.quit_requested:
+                exit_code = 0 if self.calibration_saved else 2
         except Exception as exc:
             self.fault(
                 f"calibration session failed: {exc}",
-                run_end_reason=RunEndReason.POLICY_FAILURE,
+                run_end_reason=(
+                    RunEndReason.HARDWARE_FAULT
+                    if isinstance(exc, RobotError)
+                    else RunEndReason.POLICY_FAILURE
+                ),
             )
             logger.exception("calibration session failed")
         finally:
@@ -348,12 +359,13 @@ class CameraCalibrator:
         self.sampler = ArucoSampler(
             self.camera.color.matrix(), np.asarray(self.camera.color.distortion_coeffs),
         )
+        self.jog.prepare(self.robot, self.runtime_state)
         self.rate = Rate(self.runtime.keyboard_teleop.control_hz)
 
         print(f"\n  ArUco: {ARUCO_DICT_NAME} ID={MARKER_ID} size={MARKER_SIZE_M * 1000:.1f}mm")
         print("  Controls: WASD/arrows move, ←→/I/J/K/L rotate, SPACE capture, ENTER calibrate")
         print(
-            "  Key changes invalidate pending targets; release all jog keys after a rejected target"
+            "  Release jog keys to brake and hold; release all jog keys after a rejected target"
         )
         print(f"  Preview window: {WINDOW_NAME} (green=detected, red=not found)")
 
@@ -391,10 +403,11 @@ class CameraCalibrator:
                 if self.runtime_state.safety_state == SafetyState.FAULT:
                     return 1
                 continue
-            self.motion_tick()
+            self.jog.step(self.robot, self.keys, self.runtime_state, self.runtime)
         return 0
 
     def run_home(self):
+        logger.info("Returning home...")
         self.jog.stop(self.robot, self.runtime_state)
         home_result = home_arm(
             self.runtime_state,
@@ -406,20 +419,12 @@ class CameraCalibrator:
             self.fault("operator e-stop during homing")
             return
         if not home_result.ok:
-            print("  WARNING: return-home request was not executed")
-        self.jog.release_if_idle(self.keys.snapshot()[0])
+            if home_result.interrupted:
+                logger.info("HOME cancelled: %s", home_result.reason)
+            else:
+                logger.warning("HOME failed: %s", home_result.reason)
         self.keys.discard_events("r")
         self.rate.reset()
-
-    def motion_tick(self):
-        step = self.jog.step(
-            self.robot, self.keys, self.runtime_state, self.runtime, deadline_source="arm",
-        )
-        if step.issues:
-            self.fault("; ".join(step.issues))
-            return
-        if step.ik_result is not None and step.ik_result.qpos is None:
-            logger.warning("IK rejected target: %s", step.ik_result.reason)
 
     def prepare(self) -> None:
         configure_logging()

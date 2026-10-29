@@ -17,7 +17,7 @@ HOME_CONVERGENCE_TIMEOUT_S = 15.0
 @dataclass(frozen=True)
 class HomingConfig:
     convergence_rad: float = 0.002618
-    max_speed_deg_s: float = 30.0
+    max_speed_deg_s: float = 45.0
     velocity_convergence_rad_s: float = 0.03
 
     @property
@@ -40,8 +40,8 @@ class ArmConfig:
     joint_limit_lower: tuple[float, ...] = XARM7_HARD_LOWER
     joint_limit_upper: tuple[float, ...] = XARM7_HARD_UPPER
 
-    max_joint_velocity_deg_per_s: float = 135.0
-    max_joint_acceleration_deg_per_s2: float = 810.0
+    max_joint_velocity_deg_per_s: float = 150.0
+    max_joint_acceleration_deg_per_s2: float = 900.0
     feedback_max_age_s: float = 4 / 30
 
     servo_hz: float = 100.0

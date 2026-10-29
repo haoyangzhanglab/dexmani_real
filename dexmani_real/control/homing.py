@@ -1,17 +1,17 @@
-"""HOME 候选路径、等价分支对齐与桌面间隙。"""
+"""HOME 完整候选路径按行程与停稳开销排序，共用几何校验。"""
 
 from __future__ import annotations
+
+from functools import cache
+from itertools import pairwise
 
 import numpy as np
 
 from dexmani_real.control.collision import CollisionModel
 from dexmani_real.control.config import EnvironmentConfig
-from dexmani_real.control.constraints import (
-    equivalent_joint_delta,
-    wrap_nearest_equivalent,
-)
-from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_EQUIVALENT_JOINT_MASK
-from dexmani_real.robot.xarm7.config import ArmConfig
+from dexmani_real.control.constraints import wrap_nearest_equivalent
+from dexmani_real.robot.model import ARM_JOINT_SHAPE
+from dexmani_real.robot.xarm7.config import HOME_DWELL_S, ArmConfig
 
 PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=bool)
 
@@ -41,9 +41,6 @@ class HomePlanner:
             table_plane_abcd=table_plane_abcd,
         )
 
-    def canonicalize_qpos(self, qpos: np.ndarray, reference_qpos: np.ndarray) -> np.ndarray:
-        return wrap_nearest_equivalent(qpos, reference_qpos, self.limits[:, 0], self.limits[:, 1])
-
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
         self.collision_model.set_hand_qpos(hand_qpos)
 
@@ -51,19 +48,54 @@ class HomePlanner:
         current, target = (np.asarray(q, dtype=np.float64) for q in (current, target))
         if any(q.shape != ARM_JOINT_SHAPE or not np.isfinite(q).all() for q in (current, target)):
             raise ValueError("HOME states must be finite shape (7,)")
-        try:
-            return self._candidate_path(current, target, use_canonical_target=True)
-        except HomePathRejected:
-            # 只有等价表示不同才尝试另一组路径。
-            if np.array_equal(self.canonicalize_qpos(target, current), target):
-                raise
-        wrapped = self._candidate_path(current, target)
-        start = wrapped[-1] if len(wrapped) else self.canonicalize_qpos(target, current)
-        alignment = self._align_branch(start, target)
-        if len(alignment):
-            tail = alignment[1:] if len(wrapped) else alignment
-            return np.concatenate((wrapped, tail))
-        return wrapped
+        if np.any(np.stack((current, target)) < self.limits[:, 0]) or np.any(
+            np.stack((current, target)) > self.limits[:, 1]
+        ):
+            raise HomePathRejected("home path violates operational joint limits")
+
+        # 缓存只属于本次规划；手部姿态变化后不能复用。路径上的退出软间隙规则仍逐点检查。
+        check_state = cache(self._check_state)
+        check_state(tuple(current))
+        self._check_path(target[None], check_state, allow_table_soft_escape=False)
+        if np.max(np.abs(target - current)) <= self.arm.homing.convergence_rad:
+            self._check_path(np.stack((current, target)), check_state, allow_table_soft_escape=False)
+            return np.empty((0, 7), dtype=np.float64)
+
+        nearest = wrap_nearest_equivalent(target, current, self.limits[:, 0], self.limits[:, 1])
+        paths: dict[bytes, np.ndarray] = {}
+        for endpoint in (target, nearest):
+            for mask in (np.ones(7, dtype=bool), PROXIMAL_MASK, ~PROXIMAL_MASK):
+                mid = np.where(mask, endpoint, current)
+                path = unique_milestones(current, mid, endpoint, target)
+                paths.setdefault(path.tobytes(), path)
+        # 行程/速度是时间下界；每段还需要一次停稳确认，不把 SDK 的实际耗时当作已知。
+        speed = self.arm.homing.max_speed_rad_per_s
+        candidates = sorted(paths.values(), key=lambda p: (
+            np.max(np.abs(np.diff(p, axis=0)), axis=1).sum() / speed
+            + (len(p) - 1) * HOME_DWELL_S
+        ))
+        rejections = []
+        for path in candidates:
+            try:
+                self._check_path(path, check_state, allow_table_soft_escape=True)
+                return path
+            except HomePathRejected as exc:
+                rejections.append(str(exc))
+        raise HomePathRejected("no safe home path; " + "; ".join(rejections))
+
+    def _check_state(self, qpos):
+        reason = self.collision_model.rejection(np.asarray(qpos))
+        if reason is not None:
+            raise HomePathRejected(f"collision: {reason}")
+        position = self.collision_model.eef_position()
+        if np.any(position < self.workspace_bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M) or np.any(
+            position > self.workspace_bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M
+        ):
+            raise HomePathRejected(f"path leaves workspace: {position}")
+        clearance, measurement, source = self._table_clearance()
+        if not np.isfinite(clearance):
+            raise RuntimeError("table_check_nonfinite")
+        return clearance, measurement, source
 
     def _table_clearance(self) -> tuple[float, float, str]:
         """返回净间隙、原始测量和测量来源。"""
@@ -82,95 +114,29 @@ class HomePlanner:
     def _check_path(
         self,
         path: np.ndarray,
+        check_state,
         *,
         allow_table_soft_escape: bool,
     ) -> None:
-        # 分段线性插值在端点限位内时，整段都在限位内。
-        if np.any(path < self.limits[:, 0]) or np.any(path > self.limits[:, 1]):
-            raise HomePathRejected("home path violates operational joint limits")
+        # 候选节点由限位内的端点组合而成，分段线性插值不会越过关节限位。
         path = interpolate_waypoints(path, np.deg2rad(1.0))
+        # 先查已有采样的中点，尽早拒绝穿过障碍的长路径；随后仍完整、按序检查。
+        check_state(tuple(path[len(path) // 2]))
         best_clearance = -np.inf
         for index, waypoint in enumerate(path):
-            reason = self.collision_model.rejection(waypoint)
-            if reason is not None:
-                raise HomePathRejected(f"collision at sample {index}: {reason}")
-            position = self.collision_model.eef_position()
-            if np.any(
-                position < self.workspace_bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M
-            ) or np.any(position > self.workspace_bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M):
-                raise HomePathRejected(f"path leaves workspace at sample {index}: {position}")
-            clearance, measurement, source = self._table_clearance()
-            if not np.isfinite(clearance):
-                raise RuntimeError(f"table_check_nonfinite at waypoint {index}")
-            if clearance < 0.0:
-                # 退出软间隙前的回退容差相对历史最佳间隙，退出后不能重新进入。
-                if (
-                    not allow_table_soft_escape
-                    or best_clearance >= 0.0
-                    or clearance < best_clearance - 5e-4
-                    or index == len(path) - 1
-                ):
-                    raise HomePathRejected(
-                        f"table_clearance at waypoint {index}: clearance={clearance:g} m, "
-                        f"{source}={measurement:g} m"
-                    )
+            clearance, measurement, source = check_state(tuple(waypoint))
+            # 退出软间隙前的回退容差相对历史最佳间隙，退出后不能重新进入。
+            if clearance < 0.0 and (
+                not allow_table_soft_escape
+                or best_clearance >= 0.0
+                or clearance < best_clearance - 5e-4
+                or index == len(path) - 1
+            ):
+                raise HomePathRejected(
+                    f"table_clearance at waypoint {index}: clearance={clearance:g} m, "
+                    f"{source}={measurement:g} m"
+                )
             best_clearance = max(best_clearance, clearance)
-
-    def _candidate_path(
-        self,
-        qpos: np.ndarray,
-        home_qpos: np.ndarray,
-        *,
-        use_canonical_target: bool = False,
-    ) -> np.ndarray:
-        if use_canonical_target:
-            # 绝对角差保留跨 2π 分支的回零需求。
-            target = home_qpos
-            delta = float(np.max(np.abs(target - qpos)))
-        else:
-            target = self.canonicalize_qpos(home_qpos, qpos)
-            delta = float(np.max(np.abs(equivalent_joint_delta(target, qpos))))
-        if delta <= self.arm.homing.convergence_rad:
-            self._check_path(np.stack([qpos, target]), allow_table_soft_escape=False)
-            return np.empty((0, 7), dtype=np.float64)
-
-        rejections = []
-        for name, mask in (
-            ("direct", None),
-            ("proximal_first", PROXIMAL_MASK),
-            ("distal_first", ~PROXIMAL_MASK),
-        ):
-            mid = qpos.copy()
-            if mask is not None:
-                mid[mask] = target[mask]
-            milestones = (
-                np.stack((qpos, target)) if mask is None else unique_milestones(qpos, mid, target)
-            )
-            try:
-                self._check_path(milestones, allow_table_soft_escape=True)
-            except HomePathRejected as exc:
-                rejections.append(f"{name}: {exc}")
-                continue
-            return milestones
-        raise HomePathRejected("no safe home path; " + "; ".join(rejections))
-
-    def _align_branch(
-        self,
-        wrapped_home: np.ndarray,
-        canonical_home: np.ndarray,
-    ) -> np.ndarray:
-        delta = np.rad2deg(np.abs(wrapped_home - canonical_home))
-        if not np.any(delta[np.asarray(XARM7_EQUIVALENT_JOINT_MASK, dtype=bool)] > 1.0):
-            return np.empty((0, 7), dtype=np.float64)
-        milestones = np.stack([wrapped_home, canonical_home])
-        try:
-            self._check_path(
-                milestones,
-                allow_table_soft_escape=False,
-            )
-        except HomePathRejected as exc:
-            raise HomePathRejected(f"band_alignment: {exc}") from exc
-        return milestones
 
 
 def interpolate_waypoints(path: np.ndarray, max_step: float) -> np.ndarray:
@@ -178,11 +144,12 @@ def interpolate_waypoints(path: np.ndarray, max_step: float) -> np.ndarray:
     if len(path) <= 1:
         return path.astype(np.float64)
     dense = [path[:1]]
-    for a, b in zip(path[:-1], path[1:]):
+    for a, b in pairwise(path):
         count = int(np.ceil(np.max(np.abs(b - a)) / max_step))
         if count:
             fractions = np.arange(1, count + 1)[:, None] / count
             dense.append(a + fractions * (b - a))
+            dense[-1][-1] = b  # 精确保留路点，也让相邻候选复用同一个姿态检查。
     return np.concatenate(dense).astype(np.float64, copy=False)
 
 

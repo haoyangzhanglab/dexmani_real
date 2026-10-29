@@ -1,14 +1,12 @@
-"""全局按键事件、持续按键与 jog 输入代际。"""
+"""全局按键事件与持续按键快照。"""
 
 from __future__ import annotations
 
 import logging
-import multiprocessing as mp
 import sys
 import termios
 import threading
 from collections import deque
-from collections.abc import Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -42,7 +40,6 @@ class Keyboard:
     def __init__(self, *, bindings=None, estop_callback=None):
         self.events: deque[str] = deque()
         self.held_keys: set[str] = set()
-        self.generation_signal = mp.get_context("spawn").Value("q", 0)
         self.condition = threading.Condition(threading.Lock())
         self.listener: Any = None
         self.active = False
@@ -64,7 +61,6 @@ class Keyboard:
         finally:
             with self.condition:
                 if self.active:
-                    self.generation_signal.value += 1
                     self.events.append("esc")
                     self.condition.notify()
 
@@ -77,8 +73,6 @@ class Keyboard:
                 return
             if not pressed:
                 self.held_keys.remove(name)
-                if name in CARTESIAN_JOG_KEYS or name == "q":
-                    self.generation_signal.value += 1
                 return
 
         # 停止回调先撤销权限，再发布按下事件；回调不执行 SDK I/O。
@@ -89,8 +83,6 @@ class Keyboard:
             if not self.active:
                 return
             self.held_keys.add(name)
-            if name in CARTESIAN_JOG_KEYS or name in {"r", "q"}:
-                self.generation_signal.value += 1
             self.events.append(name)
             self.condition.notify()
 
@@ -158,7 +150,6 @@ class Keyboard:
             self.active = False
             self.events.clear()
             self.held_keys.clear()
-            self.generation_signal.value += 1
             self.condition.notify_all()
         try:
             if self.listener is not None:
@@ -191,7 +182,6 @@ class Keyboard:
             with self.condition:
                 if self.held_keys:
                     self.held_keys.clear()
-                    self.generation_signal.value += 1
         return healthy
 
     def is_pressed(self, key):
@@ -200,16 +190,9 @@ class Keyboard:
         with self.condition:
             return key in self.held_keys
 
-    def snapshot(self):
+    def snapshot(self) -> frozenset[str]:
         with self.condition:
-            return frozenset(self.held_keys), self.generation_signal.value
-
-    def commit_if_current(self, generation: int, commit: Callable[[], Any]) -> Any:
-        with self.condition:
-            if not self.active or self.estop_latched or generation != self.generation_signal.value:
-                return None
-            # 锁顺序为键盘 → 会话状态；IPC 等待和 SDK I/O 在锁外执行。
-            return commit()
+            return frozenset(self.held_keys)
 
     def discard_events(self, *keys):
         with self.condition:

@@ -25,7 +25,6 @@ class ArmProcess:
         stop_signal,
         emergency_signal,
         signal_lock,
-        input_signal=None,
     ):
         self.cfg = cfg
         self.ctx = mp.get_context("spawn")
@@ -35,7 +34,6 @@ class ArmProcess:
             stop_signal=stop_signal,
             emergency_signal=emergency_signal,
             signal_lock=signal_lock,
-            input_signal=input_signal,
         )
         self.pipe, self.child_pipe = self.ctx.Pipe()
         self.process = None
