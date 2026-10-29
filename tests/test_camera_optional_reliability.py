@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from dexmani_real.config.sensor import CameraConfig
+from dexmani_real.ipc.sensors import snapshot_camera_parameters
 from dexmani_real.sensor import realsense
 from dexmani_real.utils.camera_calibrate.extrinsics import (
     load_camera_extrinsics,
@@ -84,6 +85,33 @@ class CameraReliabilityTests(unittest.TestCase):
             path.write_text("{broken")
             with self.assertRaises(json.JSONDecodeError):
                 load_camera_extrinsics("good", path)
+
+    def test_calibration_snapshot_does_not_require_the_transform_being_repaired(self):
+        config = CameraConfig(serial="selected")
+        channels = SimpleNamespace(
+            camera_ready=SimpleNamespace(is_set=lambda: True),
+            camera_serial=SimpleNamespace(value=b"selected"),
+            camera_depth_scale=SimpleNamespace(value=0.001),
+            camera_intrinsics=SimpleNamespace(value=json.dumps(dict(
+                width=config.width, height=config.height, fx=1, fy=1, ppx=0, ppy=0,
+                distortion_model="none", distortion_coeffs=[0, 0, 0, 0, 0],
+            )).encode()),
+        )
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "cameras.json"
+            for contents, error in (
+                ({"selected": {"T_base_from_camera": "broken"}}, ValueError),
+                ({}, KeyError),
+            ):
+                with self.subTest(contents=contents):
+                    path.write_text(json.dumps(contents))
+                    with self.assertRaises(error):
+                        snapshot_camera_parameters(channels, config, path)
+                    snapshot = snapshot_camera_parameters(
+                        channels, config, path, include_extrinsics=False,
+                    )
+                    self.assertEqual(snapshot.serial, "selected")
+                    self.assertIsNone(snapshot.T_xarm_base_from_color)
 
     def test_depth_sampling_and_benchmark_ignore_rgb_only_frames(self):
         frames = [

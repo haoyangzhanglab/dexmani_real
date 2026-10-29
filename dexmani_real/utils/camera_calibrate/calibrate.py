@@ -316,7 +316,9 @@ class CameraCalibrator:
             self.robot.check()
             self.runtime_state.arm()
             print("  local arm connected (owner process)")
-            self.camera = snapshot_camera_parameters(self.sensors.channels, self.runtime.camera, None)
+            self.camera = snapshot_camera_parameters(
+                self.sensors.channels, self.runtime.camera, None, include_extrinsics=False,
+            )
             print(f"  Camera serial: {self.camera.serial}")
             print(f"  Resolution: {self.camera.color.width}x{self.camera.color.height}")
             self.preview = ImageViewer(WINDOW_NAME)

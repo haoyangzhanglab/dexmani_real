@@ -78,7 +78,9 @@ class SensorChannels:
         self.camera_intrinsics = ctx.RawArray("c", 2048)
 
 
-def snapshot_camera_parameters(channels, config, calibration_path, *, require_extrinsics=False):
+def snapshot_camera_parameters(
+    channels, config, calibration_path, *, require_extrinsics=False, include_extrinsics=True,
+):
     """在 ready 边界复制相机静态参数，之后不再依赖 worker 或共享通道。"""
     if not channels.camera_ready.is_set():
         raise ValueError("camera parameters require a ready camera")
@@ -88,8 +90,10 @@ def snapshot_camera_parameters(channels, config, calibration_path, *, require_ex
     color = CameraIntrinsics(**json.loads(channels.camera_intrinsics.value.decode("utf-8")))
     if (color.height, color.width) != (config.height, config.width):
         raise ValueError("camera intrinsics differ from configured resolution")
-    loader = load_camera_extrinsics if require_extrinsics else load_optional_camera_extrinsics
-    transform = loader(serial, calibration_path)
+    transform = None
+    if include_extrinsics:
+        loader = load_camera_extrinsics if require_extrinsics else load_optional_camera_extrinsics
+        transform = loader(serial, calibration_path)
     return CameraSnapshot(serial, color, channels.camera_depth_scale.value, transform)
 
 
