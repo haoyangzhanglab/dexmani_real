@@ -31,12 +31,6 @@ def wrap_nearest_equivalent(qpos, reference, joint_limit_lower, joint_limit_uppe
     return result
 
 
-def equivalent_joint_delta(qpos, reference_qpos):
-    delta = qpos - reference_qpos
-    delta[EQUIVALENT_JOINTS] = (delta[EQUIVALENT_JOINTS] + np.pi) % (2 * np.pi) - np.pi
-    return delta
-
-
 class MotionConstraints:
     """检查目标端点；HOME 路径由 HomePlanner 单独检查。"""
 
