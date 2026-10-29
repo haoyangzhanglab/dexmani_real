@@ -23,6 +23,7 @@ from dexmani_real.perception.pointcloud import (
     aligned_depth_points_in_base,
     build_raw_point_cloud,
 )
+from dexmani_real.sensor.realsense import get_ae_priority, set_ae_priority
 from dexmani_real.utils.camera_calibrate.extrinsics import load_camera_extrinsics
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.table_plane import (
@@ -130,11 +131,13 @@ def benchmark_production_pipeline(
     elapsed_ms: list[float] = []
     end_to_end_ms: list[float] = []
     valid_clouds = 0
+    last_depth_frame_number = None
     while len(elapsed_ms) < frame_count:
         frame_started = time.perf_counter()
         frame = camera.read()
-        if frame is None:
+        if frame is None or frame.depth_frame_number == last_depth_frame_number:
             continue
+        last_depth_frame_number = frame.depth_frame_number
         started = time.perf_counter()
         cloud = processor.process(frame.depth, frame.rgb)
         elapsed_ms.append((time.perf_counter() - started) * 1000.0)
@@ -223,10 +226,10 @@ def capture_frame(
     return rgb, depth_raw, depth_m
 
 
-def load_extrinsics(camera_info: dict, calib: dict[str, np.ndarray]) -> np.ndarray:
+def load_extrinsics(camera_info: dict, calibration_path) -> np.ndarray:
     """Load T_xarm_base_from_color for aligned depth-to-color samples."""
     print("\nLoading extrinsics from cameras.json...")
-    base_from_color = calib[camera_info["serial"]]
+    base_from_color = load_camera_extrinsics(camera_info["serial"], calibration_path)
 
     pos = base_from_color[:3, 3]
     quat_xyzw = R.from_matrix(base_from_color[:3, :3]).as_quat()
@@ -255,10 +258,12 @@ def calibrate_table_plane(
     input("  Press Enter to capture calibration frames...")
 
     depth_frames: list[np.ndarray] = []
+    last_depth_frame_number = None
     while len(depth_frames) < frame_count:
         frame = camera.read()
-        if frame is None:
+        if frame is None or frame.depth_frame_number == last_depth_frame_number:
             continue
+        last_depth_frame_number = frame.depth_frame_number
         depth_frames.append(frame.depth)
 
     point_batches: list[np.ndarray] = []
@@ -320,7 +325,6 @@ def run_pointcloud_diagnostic(args) -> int:
     runtime = load_config(path=args.config)
     runtime.camera.validate()
     pcd_config = runtime.pointcloud
-    calibration = load_camera_extrinsics(args.camera_calibration)
     table_plane_abcd = (
         load_table_plane(runtime.environment.table)
         if pcd_config.remove_table and not fit_table_requested
@@ -328,10 +332,16 @@ def run_pointcloud_diagnostic(args) -> int:
     )
 
     configure_logging()
-    camera = RealSenseCamera(runtime.camera)
+    camera = RealSenseCamera(runtime.camera, auto_exposure_priority=None)
+    original_priority = None
     print("Connecting to RealSense...")
     try:
         camera.connect()
+        original_priority = get_ae_priority(camera)
+        if original_priority is not None:
+            applied = set_ae_priority(camera, 0.0)
+            if applied is None or not np.isclose(applied, 0.0):
+                raise RuntimeError("could not apply diagnostic exposure priority")
         camera_info = print_device_info(camera)
 
         rgb, depth_raw, depth_m = capture_frame(camera)
@@ -353,7 +363,7 @@ def run_pointcloud_diagnostic(args) -> int:
             preview.close()
 
         intrinsics = camera.color_intrinsics
-        T_xarm_base_from_color = load_extrinsics(camera_info, calibration)
+        T_xarm_base_from_color = load_extrinsics(camera_info, args.camera_calibration)
 
         if fit_table_requested:
             fitted_plane = calibrate_table_plane(
@@ -421,8 +431,14 @@ def run_pointcloud_diagnostic(args) -> int:
             processor=processor,
         )
     finally:
-        camera.disconnect()
-        print("RealSense pipeline stopped cleanly.")
+        try:
+            if original_priority is not None:
+                restored = set_ae_priority(camera, original_priority)
+                if restored is None or not np.isclose(restored, original_priority):
+                    raise RuntimeError(f"exposure priority readback mismatch: {restored}")
+        finally:
+            camera.disconnect()
+            print("RealSense pipeline stopped cleanly.")
 
     # 所有采集已完成；静态浏览不再占用相机。
     viewer = PointCloudViewer(

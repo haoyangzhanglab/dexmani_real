@@ -70,7 +70,7 @@ def iter_raw_episode(path: str | Path) -> Iterator[Frame]:
 def iter_live_realsense(
     *, serial: str | None = None, width: int = 640, height: int = 480, fps: int = 30
 ) -> Iterator[Frame]:
-    """Preserve first host queue-return times per channel; SDK queue latency is unmeasured."""
+    """Preserve first host callback receipt per channel; exposure-to-callback delay is unmeasured."""
     from dexmani_real.config.sensor import CameraConfig
     from dexmani_real.sensor.realsense import RealSenseCamera
 

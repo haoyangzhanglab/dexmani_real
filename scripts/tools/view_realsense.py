@@ -16,6 +16,7 @@ from dexmani_real.perception.pointcloud import (
     PointCloudProcessor,
     build_raw_point_cloud,
 )
+from dexmani_real.sensor.realsense import get_ae_priority, set_ae_priority
 from dexmani_real.utils.camera_calibrate.extrinsics import load_camera_extrinsics
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.table_plane import load_table_plane
@@ -51,29 +52,6 @@ def list_cameras() -> list[dict[str, str]]:
             f"PL={cam['product_line']}"
         )
     return cameras
-
-
-def get_ae_priority(camera: RealSenseCamera) -> float | None:
-    """Read auto_exposure_priority (0=OFF, 1=ON); None if unsupported."""
-    import pyrealsense2 as rs
-
-    sensor = camera.color_sensor
-    option = rs.option.auto_exposure_priority
-    if sensor.supports(option):
-        return float(sensor.get_option(option))
-    return None
-
-
-def set_ae_priority(camera: RealSenseCamera, value: float) -> float | None:
-    """Set auto_exposure_priority and return the readback; None if unsupported."""
-    import pyrealsense2 as rs
-
-    sensor = camera.color_sensor
-    option = rs.option.auto_exposure_priority
-    if not sensor.supports(option):
-        return None
-    sensor.set_option(option, float(value))
-    return float(sensor.get_option(option))
 
 
 def toggle_ae_priority(camera: RealSenseCamera) -> None:
@@ -235,7 +213,9 @@ class RealSenseViewer:
                 pcd_ms = 0.0
                 if enabled and not frozen:
                     if base_from_color is None:
-                        base_from_color = load_camera_extrinsics(self.args.camera_calibration)[serial]
+                        base_from_color = load_camera_extrinsics(
+                            serial, self.args.camera_calibration,
+                        )
                     if cloud_viewer is None:
                         cloud_viewer = PointCloudViewer(
                             workspace=self.pointcloud_config.workspace,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -39,6 +40,9 @@ class RealSenseCamera:
         self.auto_exposure_priority = auto_exposure_priority
         self.active_serial: str
         self.pipeline: rs.pipeline | None = None
+        self.condition = threading.Condition()
+        self.pending_frame = None
+        self.callback_error: Exception | None = None
         self.last_identity: tuple[int, int] | None = None
         self.received_ns = [0, 0]
 
@@ -72,9 +76,11 @@ class RealSenseCamera:
 
         try:
             # 独立 SDK context 保留 L515 的发现隔离。
+            with self.condition:
+                self.pending_frame = self.callback_error = self.last_identity = None
+                self.received_ns = [time.monotonic_ns()] * 2
             self.pipeline = rs.pipeline()
-            self.frame_queue = rs.frame_queue(2)
-            self.profile = self.pipeline.start(config, self.frame_queue)
+            self.profile = self.pipeline.start(config, self.receive_frame)
             device = self.profile.get_device()
             depth_sensor = device.first_depth_sensor()
             self.color_sensor = device.first_color_sensor()
@@ -115,8 +121,6 @@ class RealSenseCamera:
                 distortion_coeffs=tuple(color.coeffs),
             )
             self.aligner = rs.align(rs.stream.color)
-            self.last_identity = None
-            self.received_ns = [time.monotonic_ns()] * 2
             for _ in range(WARMUP_FRAMES):
                 self.read()
         except BaseException:
@@ -126,31 +130,59 @@ class RealSenseCamera:
                 logger.exception("RealSense startup cleanup failed")
             raise
 
-    def read(self) -> RGBDFrame | None:
-        ready, queued = self.frame_queue.try_wait_for_frame(300)
+    def receive_frame(self, queued):
+        """SDK 回调入口；帧和首次主机接收时间一起进入有界最新帧槽。"""
         received = time.monotonic_ns()
-        if not ready:
-            if received - min(self.received_ns) >= SOURCE_STALL_TIMEOUT_NS:
-                raise TimeoutError("RealSense stopped producing RGB-D frames")
-            return None
+        try:
+            frames = queued.as_frameset()
+            depth, color = frames.get_depth_frame(), frames.get_color_frame()
+            if not depth or not color:
+                raise RuntimeError("RealSense frameset is missing depth or RGB")
+            identity = (depth.get_frame_number(), color.get_frame_number())
+            with self.condition:
+                if self.callback_error is not None:
+                    return
+                for channel, name in enumerate(("depth", "RGB")):
+                    number = identity[channel]
+                    if number < 0 or (
+                        self.last_identity is not None and number < self.last_identity[channel]
+                    ):
+                        raise RuntimeError(
+                            f"RealSense {name} frame identity is invalid or moved backward"
+                        )
+                    if self.last_identity is None or number != self.last_identity[channel]:
+                        self.received_ns[channel] = received
+                if identity == self.last_identity:
+                    return
+                frames.keep()
+                self.pending_frame = frames, identity, tuple(self.received_ns)
+                self.last_identity = identity
+                self.condition.notify()
+        except Exception as error:
+            # Python 回调异常不能留在 SDK 线程中；交给设备 owner 的 read() 报告。
+            with self.condition:
+                self.callback_error = error
+                self.condition.notify()
 
-        frames = queued.as_frameset()
-        depth, color = frames.get_depth_frame(), frames.get_color_frame()
-        if not depth or not color:
-            raise RuntimeError("RealSense frameset is missing depth or RGB")
-        identity = (depth.get_frame_number(), color.get_frame_number())
-        for channel, name in enumerate(("depth", "RGB")):
-            number = identity[channel]
-            if number < 0 or (
-                self.last_identity is not None and number < self.last_identity[channel]
-            ):
-                raise RuntimeError(f"RealSense {name} frame identity is invalid or moved backward")
-            if self.last_identity is None or number != self.last_identity[channel]:
-                self.received_ns[channel] = received
-            if received - self.received_ns[channel] >= SOURCE_STALL_TIMEOUT_NS:
+    def read(self) -> RGBDFrame | None:
+        with self.condition:
+            self.condition.wait_for(
+                lambda: self.pending_frame is not None or self.callback_error is not None,
+                timeout=0.3,
+            )
+            if self.callback_error is not None:
+                raise self.callback_error
+            pending, self.pending_frame = self.pending_frame, None
+            now = time.monotonic_ns()
+            if pending is None:
+                if now - min(self.received_ns) >= SOURCE_STALL_TIMEOUT_NS:
+                    raise TimeoutError("RealSense stopped producing RGB-D frames")
+                return None
+
+        frames, identity, received_ns = pending
+        for name, received in zip(("depth", "RGB"), received_ns):
+            if now - received >= SOURCE_STALL_TIMEOUT_NS:
                 raise TimeoutError(f"RealSense stopped producing new {name}")
-        if identity == self.last_identity:
-            return None
 
         aligned = self.aligner.process(frames).get_depth_frame()
         if not aligned:
@@ -158,16 +190,19 @@ class RealSenseCamera:
         # SDK 缓冲在返回后可能复用，像素必须拥有独立内存。
         depth_array = np.array(aligned.get_data(), dtype=np.uint16, copy=True, order="C")
         rgb = np.array(
-            np.asarray(color.get_data())[..., ::-1], dtype=np.uint8, copy=True, order="C"
+            np.asarray(frames.get_color_frame().get_data())[..., ::-1],
+            dtype=np.uint8, copy=True, order="C",
         )
-        self.last_identity = identity
-        return RGBDFrame(rgb, depth_array, *identity, min(self.received_ns))
+        return RGBDFrame(rgb, depth_array, *identity, min(received_ns))
 
     def disconnect(self):
         # stop 失败时保留句柄，让资源所有者能继续收尾。
         if self.pipeline is not None:
+            # stop 等待在途回调退出，不能持有回调也要取得的 condition。
             self.pipeline.stop()
             self.pipeline = None
+            with self.condition:
+                self.pending_frame = None
 
     def get_device_info(self):
         return self.device_info(self.profile.get_device())
@@ -191,6 +226,27 @@ class RealSenseCamera:
         import pyrealsense2 as rs
 
         return [RealSenseCamera.device_info(device) for device in rs.context().query_devices()]
+
+
+def get_ae_priority(camera: RealSenseCamera) -> float | None:
+    """读取曝光优先级；设备不支持时返回 None。"""
+    import pyrealsense2 as rs
+
+    sensor = camera.color_sensor
+    option = rs.option.auto_exposure_priority
+    return float(sensor.get_option(option)) if sensor.supports(option) else None
+
+
+def set_ae_priority(camera: RealSenseCamera, value: float) -> float | None:
+    """设置并读回曝光优先级；设备不支持时返回 None。"""
+    import pyrealsense2 as rs
+
+    sensor = camera.color_sensor
+    option = rs.option.auto_exposure_priority
+    if not sensor.supports(option):
+        return None
+    sensor.set_option(option, float(value))
+    return float(sensor.get_option(option))
 
 
 def run_camera(shared, config: CameraConfig):

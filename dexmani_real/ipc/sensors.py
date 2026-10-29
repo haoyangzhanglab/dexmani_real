@@ -5,6 +5,10 @@ import numpy as np
 from dexmani_real.config.sensor import CameraConfig
 from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.ipc.ring import SharedRing
+from dexmani_real.utils.camera_calibrate.extrinsics import (
+    load_camera_extrinsics,
+    load_optional_camera_extrinsics,
+)
 
 # 右手发布携带最近头部姿态；recv_ts_ns 取腕部与关键点中较早的接收时刻。
 VR_DTYPE = np.dtype(
@@ -74,7 +78,7 @@ class SensorChannels:
         self.camera_intrinsics = ctx.RawArray("c", 2048)
 
 
-def snapshot_camera_parameters(channels, config, calibration, *, require_extrinsics=False):
+def snapshot_camera_parameters(channels, config, calibration_path, *, require_extrinsics=False):
     """在 ready 边界复制相机静态参数，之后不再依赖 worker 或共享通道。"""
     if not channels.camera_ready.is_set():
         raise ValueError("camera parameters require a ready camera")
@@ -84,9 +88,8 @@ def snapshot_camera_parameters(channels, config, calibration, *, require_extrins
     color = CameraIntrinsics(**json.loads(channels.camera_intrinsics.value.decode("utf-8")))
     if (color.height, color.width) != (config.height, config.width):
         raise ValueError("camera intrinsics differ from configured resolution")
-    transform = None if calibration is None else calibration[serial]
-    if require_extrinsics and transform is None:
-        raise ValueError("camera consumer requires current extrinsics")
+    loader = load_camera_extrinsics if require_extrinsics else load_optional_camera_extrinsics
+    transform = loader(serial, calibration_path)
     return CameraSnapshot(serial, color, channels.camera_depth_scale.value, transform)
 
 
