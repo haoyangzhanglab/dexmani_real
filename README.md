@@ -65,6 +65,13 @@ python scripts/replay_episode.py episodes/TASK/EPISODE
 
 默认标定参数位于 [calibration/parameters/](dexmani_real/calibration/parameters/)。相机标定前须拆除 XHand，或将其固定在配置的 HOME 姿态。SDK 接受命令不代表机器人已到位或停稳。
 
+RealSense 和点云诊断使用 OpenCV RGB-D 面板及 Open3D 点云窗口，需可用的桌面显示环境及 OpenGL 上下文；上述 `visualization` 安装项包含 Open3D 和离线查看所用的 Rerun。
+
+- RealSense：窗口内 `P` 开关点云、`S` 切换 raw/processed、`F` 仅冻结点云、`D` 切换 Jet/灰度、`R` 重置显示、`C` 打印配置、`A` 切换曝光优先级、`Q/Esc` 退出。关闭 RGB-D 窗口退出程序；关闭点云窗口仅关闭点云，可按 `P` 重开。退出时恢复原曝光优先级。
+- 点云诊断：RGB-D 窗口按 Enter 继续，`Q/Esc` 或关闭窗口取消；桌面标定和发布确认在终端进行。采集、快照和 benchmark 完成后即释放相机，最终静态点云窗口显示工作空间框及基座/相机坐标轴。
+- 相机标定：保留全局点动按键；Space 采样、Enter 求解并在质量合格后保存、Backspace 撤销、X 删除最差样本。预览显示检测、采样、求解和保存状态；关闭预览窗口请求退出，采样、求解/发布检查和回零等待共用同一取消入口。
+- 离线 episode：左侧为基座场景/点云标签页和 RGB，中间为 Depth，右侧为 State、Action、Contact Force 曲线。曲线按列批量发送，与图像共用 `step` 和 `time` 时间轴。
+
 ## 模型与手点云
 
 整机 FK、IK 与碰撞检查共用 [xarm7_xhand_right.urdf](assets/robots/xhand/xarm7_xhand_right.urdf)，手部安装位姿由该模型定义。TAG/DexPilot 重定向使用独立的 [xhand_right.urdf](assets/robots/xhand/xhand_right.urdf)。

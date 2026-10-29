@@ -7,7 +7,7 @@ import multiprocessing as mp
 import time
 from concurrent.futures import CancelledError
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import cv2
 import numpy as np
@@ -53,6 +53,7 @@ from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import Rate, sample_is_fresh
+from dexmani_real.utils.visualization.image import ImageViewer, draw_aruco, draw_text
 
 if TYPE_CHECKING:
     from dexmani_real.config import RealConfig
@@ -74,9 +75,12 @@ class CameraCalibrator:
         self.samples: list[tuple[np.ndarray, np.ndarray]] = []
         self.result: HandEyeResult | None = None
         self.calibration_saved = False
-        self.window_created = False
+        self.preview: ImageViewer | None = None
         self.display_image: np.ndarray | None = None
         self.preview_sequence = 0
+        self.preview_timestamp_ns = 0
+        self.marker_detected = False
+        self.status = "SPACE=capture a stationary pose"
 
     def check_services(self):
         return self.keys.healthy and self.sensors.check()
@@ -89,7 +93,11 @@ class CameraCalibrator:
         self.runtime_state.revoke_motion(SafetyState.FAULT, reason=run_end_reason)
         logger.error("Calibration fault: %s", reason)
 
-    def cancel_requested(self):
+    def cancel_requested(self) -> bool:
+        # 所有等待阶段（包括 HOME）使用同一取消入口，窗口关闭仅请求退出一次。
+        if not self.runtime_state.quit_requested and self.preview is not None:
+            if "closed" in self.preview.poll_events():
+                self.runtime_state.request_quit()
         return bool(
             self.runtime_state.quit_requested
             or self.runtime_state.estop_request
@@ -115,6 +123,10 @@ class CameraCalibrator:
             return
         if not self.jog.pause(self.robot, self.runtime_state) or self.cancel_requested():
             return
+        self.status = "CAPTURING: waiting for stationary arm and fresh images"
+        self.show_preview()
+        if self.cancel_requested():
+            return
         print(f"\n  [{len(self.samples) + 1}] capturing ArUco pose...", end=" ", flush=True)
         try:
             sample = self.sampler.capture(
@@ -124,9 +136,11 @@ class CameraCalibrator:
                 arm_config=self.runtime.arm,
             )
         except CancelledError:
+            self.status = "Capture cancelled"
             print("CANCELLED")
             return
         except (TimeoutError, ValueError, cv2.error) as exc:
+            self.status = f"Capture failed: {exc}"
             print(f"FAILED — {exc}, skipped")
             return
         if self.cancel_requested():
@@ -141,9 +155,12 @@ class CameraCalibrator:
         self.robot.check()
         self.samples.append((eef_pose, marker_pose))
         self.result = None
+        self.status = "Sample captured; ENTER=solve when enough poses are collected"
         print(f"OK (total {len(self.samples)})  EE={np.round(position, 3)}m")
 
     def show_preview(self):
+        if self.cancel_requested():
+            return
         frame = read_camera_frame(self.sensors.channels, fields=("rgb",))
         if (
             frame
@@ -151,21 +168,33 @@ class CameraCalibrator:
             and sample_is_fresh(frame["timestamp_ns"], self.runtime.camera.max_frame_age_s)
         ):
             image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
-            detected = self.sampler.detect(image, draw=True) is not None
-            cv2.putText(
-                image, f"MARKER {'OK' if detected else 'NOT FOUND'}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                (0, 200, 0) if detected else (0, 0, 255), 2,
+            detection = self.sampler.detect(frame["rgb"])
+            draw_aruco(
+                image, detection.corners, detection.ids, detection.pose,
+                intrinsics=self.sampler.intrinsics, distortion=self.sampler.distortion,
+                axis_length=MARKER_SIZE_M / 2,
             )
-            cv2.putText(
-                image, f"samples={len(self.samples)}/{MIN_SAMPLES}  SPACE=capture ENTER=calibrate",
-                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
-            )
+            self.marker_detected = detection.pose is not None
             self.display_image = image
             self.preview_sequence = frame["ring_sequence"]
-        if self.display_image is not None:
-            cv2.imshow(WINDOW_NAME, self.display_image)
-        cv2.waitKey(1)
+            self.preview_timestamp_ns = frame["timestamp_ns"]
+        fresh = sample_is_fresh(self.preview_timestamp_ns, self.runtime.camera.max_frame_age_s)
+        image = (
+            self.display_image.copy() if self.display_image is not None
+            else np.zeros((self.camera.color.height, self.camera.color.width, 3), dtype=np.uint8)
+        )
+        marker = "STALE" if not fresh else "OK" if self.marker_detected else "NOT FOUND"
+        draw_text(
+            image, [f"MARKER {marker}"],
+            color=(0, 200, 0) if fresh and self.marker_detected else (0, 0, 255),
+        )
+        draw_text(image, [
+            f"samples={len(self.samples)}/{MIN_SAMPLES}  {self.status}",
+            "SPACE=capture ENTER=solve/save BACKSPACE=undo X=remove worst",
+            "WASD/Up/Down=move Left/Right/IJKL=rotate R=home Q=quit Esc=stop",
+        ], origin=(10, 50))
+        cast(ImageViewer, self.preview).show(image)
+        self.cancel_requested()
 
     def solve_and_save(self):
         if not self.jog.pause(self.robot, self.runtime_state) or self.cancel_requested():
@@ -177,12 +206,17 @@ class CameraCalibrator:
             return self.cancel_requested() or self.runtime_state.run_id != epoch
 
         self.result = None
+        self.status = "SOLVING calibration"
+        self.show_preview()
+        if cancelled():
+            return
         try:
             if not self.samples:
                 raise ValueError("no calibration samples")
             eef_poses, marker_poses = (np.stack(poses) for poses in zip(*self.samples))
             result = solve_hand_eye(eef_poses, marker_poses)
         except (ValueError, cv2.error) as exc:
+            self.status = f"Solve failed: {exc}"
             print(f"Calibration failed: {exc}")
             return
         if cancelled():
@@ -193,6 +227,10 @@ class CameraCalibrator:
             f"rotation RMS={result.rotation_rms_deg:.2f}°, worst sample=#{result.worst_sample + 1}"
         )
         if not result.quality_ok:
+            self.status = (
+                f"Quality failed: {result.position_rms_mm:.2f}mm / "
+                f"{result.rotation_rms_deg:.2f}deg; X=remove worst"
+            )
             print(
                 "Calibration exceeds RMS limits; press X to remove the worst sample and recapture"
             )
@@ -217,9 +255,11 @@ class CameraCalibrator:
                 cancelled=cancelled,
             )
         except CancelledError:
+            self.status = "Publication cancelled"
             print("Calibration publication cancelled")
             return
         self.calibration_saved = True
+        self.status = f"SAVED: {result.method} {result.position_rms_mm:.2f}mm / {result.rotation_rms_deg:.2f}deg"
         print(f"Calibration saved → {self.output_path} (serial: {self.camera.serial})")
 
     def handle_sample_events(self, events):
@@ -232,14 +272,17 @@ class CameraCalibrator:
             elif event == "backspace" and self.samples:
                 self.samples.pop()
                 self.result = None
+                self.status = "Sample removed; ENTER=recompute"
                 print(f"Undone, {len(self.samples)} samples remaining")
             elif event == "x":
                 if self.result is None:
+                    self.status = "ENTER=solve before removing worst sample"
                     print("Press ENTER to evaluate before removing the worst sample")
                 else:
                     worst = self.result.worst_sample
                     self.samples.pop(worst)
                     self.result = None
+                    self.status = f"Removed sample #{worst + 1}; ENTER=recompute"
                     print(f"Removed sample #{worst + 1}; press ENTER to recompute")
             elif event == "enter":
                 self.solve_and_save()
@@ -268,8 +311,7 @@ class CameraCalibrator:
             self.camera = snapshot_camera_parameters(self.sensors.channels, self.runtime.camera, None)
             print(f"  Camera serial: {self.camera.serial}")
             print(f"  Resolution: {self.camera.color.width}x{self.camera.color.height}")
-            cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
-            self.window_created = True
+            self.preview = ImageViewer(WINDOW_NAME)
             exit_code = self.run_control_loop()
         except KeyboardInterrupt:
             self.fault("KeyboardInterrupt", estop=True)
@@ -294,10 +336,9 @@ class CameraCalibrator:
             keyboard=self.keys,
             deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S,
         )
-        if self.window_created:
+        if self.preview is not None:
             try:
-                cv2.destroyWindow(WINDOW_NAME)
-                self.window_created = False
+                self.preview.close()
             except cv2.error:
                 logger.exception("calibration window cleanup failed")
                 clean = False

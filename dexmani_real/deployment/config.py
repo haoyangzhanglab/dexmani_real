@@ -86,6 +86,8 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
 def resolve_deployment_config(
     info, runtime: RealConfig, needs: ObservationNeeds,
 ) -> RealConfig:
+    if info.policy_name == "adaptac" and info.saved_config.get("tactile_source") != "real":
+        raise ValueError("Real deployment requires real-source AdapTac; sim/unknown source is incompatible")
     action_steps = runtime.execution.action_steps
     execution = replace(
         runtime.execution,

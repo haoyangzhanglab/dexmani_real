@@ -23,32 +23,20 @@ from dexmani_real.perception.config import PointCloudConfig
 from dexmani_real.perception.hand_cloud import hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
-from dexmani_real.utils.visualization import (
+from dexmani_real.utils.visualization.rerun import (
+    episode_blueprint,
     log_camera_geometry,
     log_points,
     log_rgbd,
     log_series,
-    viewer_blueprint,
 )
 
 logger = logging.getLogger("dexmani_real.cli.visualize_episode")
 
 
-SERIES_GROUPS = {
-    "state": ("arm_qpos", "hand_qpos"),
-    "action": ("action_arm_joint_target", "action_hand_joint_target"),
-}
-FORCE_SERIES = {
-    "hand_contact_mag": (
-        "thumb (SDK native)",
-        "index (SDK native)",
-        "middle (SDK native)",
-        "ring (SDK native)",
-        "pinky (SDK native)",
-    ),
-    "hand_force_thumb": ("Fx", "Fy", "Fz"),
-    "hand_force_index": ("Fx", "Fy", "Fz"),
-}
+RAW_SERIES_FIELDS = (
+    "arm_qpos", "hand_qpos", "action_arm_joint_target", "action_hand_joint_target",
+)
 
 FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
     (255, 60, 60),  # thumb  — red
@@ -163,26 +151,41 @@ class EpisodeVisualizer:
                 recording_id=rec_id,
                 spawn=True,
             )
-            series_groups = []
-            for category, keys in SERIES_GROUPS.items():
-                series_keys = (*keys, *FORCE_SERIES) if category == "state" else keys
-                series_groups.append((category.title(), [f"{category}/{key}" for key in series_keys]))
+            # 同一份定义供布局、标签和批量发送使用，数组仅保留引用。
+            self.series = []
+            for group, path, key, labels in (
+                ("State", "state/arm_qpos", "arm_qpos", None),
+                ("State", "state/hand_qpos", "hand_qpos", None),
+                ("Action", "action/action_arm_joint_target", "action_arm_joint_target", None),
+                ("Action", "action/action_hand_joint_target", "action_hand_joint_target", None),
+                ("Contact Force", "state/hand_contact_mag", "hand_contact_mag",
+                 [f"{finger} (SDK native)" for finger in ("thumb", "index", "middle", "ring", "pinky")]),
+                ("Contact Force", "state/hand_force_thumb", "hand_force_thumb", ("Fx", "Fy", "Fz")),
+                ("Contact Force", "state/hand_force_index", "hand_force_index", ("Fx", "Fy", "Fz")),
+            ):
+                values = self.state[key]
+                if labels is None:
+                    labels = [str(i) for i in range(values.shape[1])]
+                self.series.append((group, path, values, labels))
+            series_groups: dict[str, list[str]] = {}
+            for group, path, _, _ in self.series:
+                series_groups.setdefault(group, []).append(path)
             # 当前布局覆盖 viewer 记忆的旧布局。
             rr.send_blueprint(
-                viewer_blueprint(
-                    series_groups,
+                episode_blueprint(
+                    series_groups.items(),
                     camera_in_base=self.T_xarm_base_from_color is not None,
                 ),
                 make_active=True, make_default=True,
             )
-            self.log_static()
+            self.log_recording_data()
         except BaseException:
             self.close()
             raise
 
     def preload_state(self) -> dict[str, np.ndarray]:
         state = {
-            key: self.reader[key][: self.frame_count] for keys in SERIES_GROUPS.values() for key in keys
+            key: self.reader[key][: self.frame_count] for key in RAW_SERIES_FIELDS
         }
 
         arm = state["arm_qpos"]
@@ -210,14 +213,13 @@ class EpisodeVisualizer:
 
         return state
 
-    def log_static(self) -> None:
-        for category, keys in SERIES_GROUPS.items():
-            for key in keys:
-                log_series(
-                    f"{category}/{key}", labels=[str(i) for i in range(self.state[key].shape[1])],
-                )
-        for key, labels in FORCE_SERIES.items():
-            log_series(f"state/{key}", labels=labels)
+    def log_recording_data(self) -> None:
+        steps = np.arange(self.frame_count)
+        for _, path, values, labels in self.series:
+            log_series(
+                path, values, labels=labels, steps=steps,
+                timestamps_s=self.timestamps_s[:self.frame_count],
+            )
         log_camera_geometry(self.camera_model.color, self.T_xarm_base_from_color)
 
     def log_step(self, step_idx: int) -> None:
@@ -225,8 +227,9 @@ class EpisodeVisualizer:
         self.rr.set_time_seconds("time", float(self.timestamps_s[step_idx]))
         rgb, depth = self.log_camera(step_idx)
         self.log_pointcloud(rgb, depth)
+        fingertips = self.state["hand_fingertip"][step_idx]
         log_points(
-            "fingertips", self.state["hand_fingertip"][step_idx],
+            "fingertips", fingertips if np.isfinite(fingertips).all() else None,
             colors=FINGERTIP_COLORS, radii=0.012,
         )
         pose = self.state["arm_ee"][step_idx]
@@ -234,11 +237,6 @@ class EpisodeVisualizer:
             "eef", pose[None, :3] if np.isfinite(pose).all() else None,
             colors=[EEF_COLOR], radii=0.020,
         )
-        for category, keys in SERIES_GROUPS.items():
-            for key in keys:
-                log_series(f"{category}/{key}", self.state[key][step_idx])
-        for key in FORCE_SERIES:
-            log_series(f"state/{key}", self.state[key][step_idx])
 
     def log_camera(self, step_idx: int) -> tuple[np.ndarray, np.ndarray]:
         if step_idx != self.rgb_index + 1:
@@ -274,14 +272,9 @@ class EpisodeVisualizer:
 
     def close(self) -> None:
         try:
-            if self.reader is not None:
-                self.reader.close()
-                self.reader = None  # type: ignore[assignment]
+            self.reader.close()
         finally:
-            try:
-                self.rr.disconnect()
-            except Exception:
-                logger.warning("Rerun disconnect failed", exc_info=True)
+            self.rr.disconnect()
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,6 +1,8 @@
 """ArUco 检测与静止机械臂上的多帧采样。"""
 
 import time
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -14,6 +16,13 @@ ARUCO_DICT_NAME = "7x7_50"
 MARKER_ID = 1
 MARKER_SIZE_M = 0.0982
 CAPTURE_FRAMES = 5
+
+
+@dataclass(frozen=True)
+class ArucoDetection:
+    corners: Sequence[np.ndarray]
+    ids: np.ndarray | None
+    pose: tuple[np.ndarray, np.ndarray] | None
 
 
 class ArucoSampler:
@@ -38,12 +47,10 @@ class ArucoSampler:
             parameters,
         )
 
-    def detect(self, image, *, draw=False):
-        corners, ids, _ = self.detector.detectMarkers(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+    def detect(self, rgb: np.ndarray) -> ArucoDetection:
+        corners, ids, _ = self.detector.detectMarkers(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY))
         if ids is None:
-            return None
-        if draw:
-            cv2.aruco.drawDetectedMarkers(image, corners, ids)
+            return ArucoDetection(corners, ids, None)
         for corner, marker_id in zip(corners, ids.ravel()):
             if marker_id != MARKER_ID:
                 continue
@@ -55,13 +62,9 @@ class ArucoSampler:
                 flags=cv2.SOLVEPNP_IPPE_SQUARE,
             )
             if not ok or not np.isfinite(rvec).all() or not np.isfinite(tvec).all():
-                return None
-            if draw:
-                cv2.drawFrameAxes(
-                    image, self.intrinsics, self.distortion, rvec, tvec, MARKER_SIZE_M / 2
-                )
-            return rvec.ravel(), tvec.ravel()
-        return None
+                return ArucoDetection(corners, ids, None)
+            return ArucoDetection(corners, ids, (rvec.ravel(), tvec.ravel()))
+        return ArucoDetection(corners, ids, None)
 
     def stationary_arm(self, read_arm, arm_config, after_ns):
         deadline = time.monotonic_ns() + int(arm_config.feedback_max_age_s * 1e9)
@@ -98,7 +101,7 @@ class ArucoSampler:
                 raise TimeoutError("fresh calibration image unavailable")
             last_stamp = frame["timestamp_ns"]
             last_color_frame = frame["color_frame_number"]
-            pose = self.detect(cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR))
+            pose = self.detect(frame["rgb"]).pose
             if pose is not None:
                 rotations.append(pose[0])
                 translations.append(pose[1])

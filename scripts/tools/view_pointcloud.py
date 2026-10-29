@@ -30,13 +30,8 @@ from dexmani_real.perception.pointcloud import (
     build_raw_point_cloud,
 )
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.visualization import (
-    log_camera_geometry,
-    log_points,
-    log_rgbd,
-    log_workspace,
-    viewer_blueprint,
-)
+from dexmani_real.utils.visualization.image import ImageViewer, rgbd_panel
+from dexmani_real.utils.visualization.pointcloud import PointCloudViewer
 
 if TYPE_CHECKING:
     from dexmani_real.sensor.realsense import RealSenseCamera
@@ -310,8 +305,6 @@ def calibrate_table_plane(
 
 def run_pointcloud_diagnostic(args) -> int:
     """执行相机诊断、可选桌面拟合与快照输出。"""
-    import rerun as rr
-
     from dexmani_real.sensor.realsense import RealSenseCamera
 
     save_dir = (
@@ -339,23 +332,28 @@ def run_pointcloud_diagnostic(args) -> int:
     print("Connecting to RealSense...")
     try:
         camera.connect()
-        rr.init("DexMani Point Cloud Diagnostic", spawn=True)
-        rr.send_blueprint(viewer_blueprint(camera_in_base=True))
         camera_info = print_device_info(camera)
 
         rgb, depth_raw, depth_m = capture_frame(camera)
         print_depth_stats(depth_m, VIS_DEPTH_MIN_M, VIS_DEPTH_MAX_M)
-        rr.set_time_sequence("capture", 0)
-        log_rgbd(
-            rgb, depth_raw, depth_scale_m=camera.depth_scale_m,
-            depth_range_m=(VIS_DEPTH_MIN_M, VIS_DEPTH_MAX_M),
-        )
-        input("在 Rerun 查看 RGB-D，按 Enter 继续...")
+        preview = ImageViewer("RGB-D diagnostic | Enter=continue Q/Esc=quit")
+        try:
+            preview.show(rgbd_panel(
+                rgb, depth_m, depth_range_m=(VIS_DEPTH_MIN_M, VIS_DEPTH_MAX_M),
+                lines=["RGB / Depth | Enter=continue Q/Esc=quit"],
+            ))
+            while True:
+                events = preview.poll_events()
+                if any(key in events for key in ("q", "esc", "closed")):
+                    return 0
+                if "enter" in events:
+                    break
+                time.sleep(0.01)
+        finally:
+            preview.close()
 
         intrinsics = camera.color_intrinsics
         T_xarm_base_from_color = load_extrinsics(camera_info, calibration)
-        log_camera_geometry(intrinsics, T_xarm_base_from_color)
-        log_workspace(pcd_config.workspace)
 
         if fit_table_requested:
             fitted_plane = calibrate_table_plane(
@@ -383,12 +381,6 @@ def run_pointcloud_diagnostic(args) -> int:
 
         # Apply the fitted plane to a fresh post-calibration frame.
         rgb, depth_raw, _ = capture_frame(camera)
-        rr.set_time_sequence("capture", 1)
-        log_rgbd(
-            rgb, depth_raw, depth_scale_m=camera.depth_scale_m,
-            depth_range_m=(VIS_DEPTH_MIN_M, VIS_DEPTH_MAX_M),
-        )
-
         print(f"Point-cloud processing: {pcd_config}")
         processor = PointCloudProcessor(
             depth_scale_m=camera.depth_scale_m,
@@ -432,17 +424,21 @@ def run_pointcloud_diagnostic(args) -> int:
             camera=camera,
             processor=processor,
         )
-        log_points("pcd", result)
-        input("在 Rerun 查看处理结果，按 Enter 退出...")
-
-        print("\nDone.")
-
     finally:
-        try:
-            camera.disconnect()
-            print("RealSense pipeline stopped cleanly.")
-        finally:
-            rr.disconnect()
+        camera.disconnect()
+        print("RealSense pipeline stopped cleanly.")
+
+    # 所有采集已完成；静态浏览不再占用相机。
+    viewer = PointCloudViewer(
+        workspace=pcd_config.workspace, base_from_color=T_xarm_base_from_color,
+    )
+    try:
+        viewer.update(result)
+        while not any(key in {"q", "esc", "closed"} for key in viewer.poll_events()):
+            time.sleep(0.01)
+    finally:
+        viewer.close()
+    print("\nDone.")
 
     return 0
 
