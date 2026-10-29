@@ -79,10 +79,10 @@ class LatestFrameReader:
         self.resume_event = threading.Event()
         if not wait_on_first:
             self.resume_event.set()
-        self.frame = None
+        self.frame: Frame | None = None
         self.version = 0
         self.finished = False
-        self.error = None
+        self.error: str | None = None
         self.thread = threading.Thread(target=self.run, name="cordvip-camera", daemon=True)
 
     def start(self) -> LatestFrameReader:
