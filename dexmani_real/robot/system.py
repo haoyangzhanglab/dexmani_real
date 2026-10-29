@@ -244,6 +244,7 @@ class Robot:
         self.check_run(run_id)
 
     def send_action(self, command, *, valid_until_ns, execute_until_ns=None):
+        """顺序尝试发布 arm 和下发 hand；返回不代表原子执行或到位。"""
         self.validate_command(command, execute_until_ns=execute_until_ns)
         self._send_action(command, valid_until_ns=valid_until_ns, execute_until_ns=execute_until_ns)
 

@@ -439,6 +439,8 @@ class XHand:
 
     def stop(self, qpos: np.ndarray | None = None, *, timestamp_ns: int = 0) -> None:
         """SDK 接受停止请求不代表物理停稳。"""
+        if self.command is None:
+            return  # 命令初始化前没有可发送的运动；部分启动只需关闭连接。
         if not self.is_connected:
             raise RuntimeError("XHand disconnected before stop")
         deadline = time.monotonic() + STOP_RETRY_TIMEOUT_S

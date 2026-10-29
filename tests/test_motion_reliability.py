@@ -14,7 +14,7 @@ from dexmani_real.config.xhand import HandConfig
 from dexmani_real.control.homing import home_segment_timeout_s
 from dexmani_real.robot.xarm7.worker import ArmController
 from dexmani_real.runtime.home import home_arm
-from dexmani_real.runtime.state import SafetyState
+from dexmani_real.runtime.state import SafetyState, SessionState
 
 
 class Clock:
@@ -86,3 +86,33 @@ def test_empty_home_observes_dwell_without_counting_query_time(monkeypatch):
 
     with pytest.raises(TimeoutError, match="dwell not confirmed"):
         controller.wait_settled(lambda: None, stage="late query", timeout_s=0.01)
+
+
+def test_partial_hand_connection_preserves_original_error_and_cleans_arm(monkeypatch):
+    from dexmani_real.robot.system import Robot
+    from dexmani_real.robot.xarm7 import process
+    from dexmani_real.robot.xhand.driver import XHand
+
+    state = SessionState()
+    robot = Robot(
+        ArmConfig(), HandConfig(), run_signal=state.run_signal,
+        stop_signal=state.stop_signal, emergency_signal=state.emergency_signal,
+        signal_lock=state.motion_lock,
+    )
+    arm = Mock()
+    monkeypatch.setattr(process, "ArmProcess", lambda *_, **__: arm)
+    monkeypatch.setattr(XHand, "connect", Mock(side_effect=ValueError("initial feedback failed")))
+    with pytest.raises(ValueError, match="initial feedback failed"):
+        robot.connect()
+    arm.close.assert_called_once()
+    assert robot.hand is None
+    assert robot.stop_failure is None
+    assert not robot.stop_required
+
+    disconnected_hand = XHand(HandConfig())
+    disconnected_hand.command = object()  # 曾完成初始化，断联不能视为从未执行。
+    robot.hand = disconnected_hand
+    with pytest.raises(RuntimeError, match="disconnected before stop"):
+        robot.close()
+    assert robot.stop_required
+    assert robot.stop_failure is not None
