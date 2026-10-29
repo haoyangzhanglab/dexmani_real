@@ -41,12 +41,18 @@ class PolicyWorker:
         self.future = self.executor.submit(function, *args, **kwargs)
         self.operation = operation
 
-    def _load(self, **kwargs):
+    def _load(self):
         self.model = self.factory()
-        self.model.warmup(**kwargs)
 
-    def load(self, **kwargs):
-        self._submit("load", self._load, **kwargs)
+    def load(self):
+        self._submit("load", self._load)
+
+    def _warmup(self, rows, **kwargs):
+        observation = self.build_observation(rows)
+        return cast("PolicyRuntime", self.model).warmup(observation, **kwargs)
+
+    def warmup(self, rows, **kwargs):
+        self._submit("warmup", self._warmup, rows, **kwargs)
 
     def reset(self):
         self._submit("reset", lambda: cast("PolicyRuntime", self.model).reset_episode())

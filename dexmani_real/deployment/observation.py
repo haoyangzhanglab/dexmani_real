@@ -49,6 +49,7 @@ def policy_needs(dependencies):
 @dataclass(frozen=True)
 class PolicyObservationRow:
     values: dict[str, np.ndarray]
+    observation_timestamp_ns: int
     features: dict[str, np.ndarray] = field(default_factory=dict, compare=False)
 
 
@@ -85,7 +86,7 @@ class ObservationBuilder:
                 values[name] = row.point_cloud
             elif name in {"rgb", "depth"}:
                 values[name] = row.camera[name]
-        return PolicyObservationRow(values)
+        return PolicyObservationRow(values, row.observation_timestamp_ns)
 
     def configure_camera(self, camera):
         self.camera_parameters = {}

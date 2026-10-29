@@ -8,6 +8,7 @@ from itertools import count
 
 import numpy as np
 
+from dexmani_real.config.deployment import ACTION_TIMEOUT_NS
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.raw import camera_metadata
@@ -26,12 +27,9 @@ from dexmani_real.runtime.lifecycle import (
     SensorWorkers,
     close_runtime,
 )
+from dexmani_real.runtime.observation import check_observation, read_observation
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
-from dexmani_real.utils.camera_calibrate.extrinsics import (
-    load_camera_extrinsics,
-    load_optional_camera_extrinsics,
-)
 from dexmani_real.utils.io import write_json, write_yaml
 from dexmani_real.utils.log import configure_logging, error_detail
 
@@ -131,12 +129,6 @@ class PolicySession:
         from dexmani_real.deployment.inference import PolicyWorker
 
         self.runtime_state = SessionState()
-        if self.needs.point_cloud or "camera_extrinsic" in self.info.observation_fields:
-            self.camera_calibration = load_camera_extrinsics(self.camera_calibration_path)
-        elif self.record_raw:
-            self.camera_calibration = load_optional_camera_extrinsics(self.camera_calibration_path)
-        else:
-            self.camera_calibration = None
         self.camera_snapshot = None
         self.observations = ObservationBuilder(
             self.info, self.runtime, dependencies=self.dependencies, needs=self.control_needs,
@@ -157,8 +149,7 @@ class PolicySession:
             lambda: load_policy(self.info, device=self.device, seed=self.seed),
             build_observation=self.observations.build,
         )
-        self.warmup_policy()
-        self.keyboard.discard_events("h", "b", "t")
+        self.model.load()
 
         self.process_context = mp.get_context("spawn")
         channels = (
@@ -175,7 +166,7 @@ class PolicySession:
         )
 
     def check_services(self):
-        if self.keyboard.estop_latched or not self.keyboard.healthy:
+        if self.keyboard.estop_latched or not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
             return False
         if self.control_services and not self.sensors.check(names=self.control_services):
@@ -195,10 +186,10 @@ class PolicySession:
                 ),
                 ready=self.sensors.channels.camera_ready,
                 timeout_s=CAMERA_READY_TIMEOUT_S,
-                may_start=lambda: self.keyboard.healthy and self.runtime_state.requests_allow_motion(),
+                may_start=lambda: self.keyboard.check_health() and self.runtime_state.requests_allow_motion(),
             )
             self.camera_snapshot = snapshot_camera_parameters(
-                self.sensors.channels, self.runtime.camera, self.camera_calibration,
+                self.sensors.channels, self.runtime.camera, self.camera_calibration_path,
                 require_extrinsics=self.needs.point_cloud or "camera_extrinsic" in self.info.observation_fields,
             )
         self.observations.configure_camera(self.camera_snapshot)
@@ -225,13 +216,14 @@ class PolicySession:
                 ),
                 ready=self.sensors.channels.pointcloud_ready,
                 timeout_s=POINTCLOUD_READY_TIMEOUT_S,
-                may_start=lambda: self.keyboard.healthy and self.runtime_state.requests_allow_motion(),
+                may_start=lambda: self.keyboard.check_health() and self.runtime_state.requests_allow_motion(),
             )
         if self.needs.camera_static and not self.needs.camera_fields and not self.needs.point_cloud:
             if not self.sensors.shutdown(deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S):
                 raise RuntimeError("static camera failed to close normally")
             self.sensors.channels = None
         self.robot.check()
+        self.warmup_policy()
         self.keyboard.discard_events("h", "b", "t")
         with self.runtime_state.motion_lock:
             if not self.runtime_state.requests_allow_motion():
@@ -316,19 +308,51 @@ class PolicySession:
             logger.warning("Cleanup remains pending; native model/writer calls may outlive this wait")
         return int(not successful)
 
+    def check_startup(self):
+        if self.keyboard.estop_latched or not self.keyboard.check_health():
+            self.runtime_state.request_emergency_stop()
+        if not self.runtime_state.requests_allow_motion():
+            raise OperationCancelled("startup cancelled")
+        self.robot.service_feedback()
+
+    def wait_model(self, deadline):
+        while True:
+            self.check_startup()
+            completion = self.model.poll()
+            if completion is not None:
+                return completion
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("model load/warmup timed out; native call remains pending")
+            time.sleep(min(0.005, remaining))
+
     def warmup_policy(self):
-        timeout_s = MODEL_STARTUP_TIMEOUT_S
-        deadline = time.monotonic() + timeout_s
+        deadline = time.monotonic() + MODEL_STARTUP_TIMEOUT_S
+        self.wait_model(deadline)
+        rows = []
+        dt_ns = round(self.info.control_dt_s * 1e9)
+        next_sample_ns = time.monotonic_ns()
+        history_deadline_ns = next_sample_ns + (self.info.n_obs_steps - 1) * dt_ns + ACTION_TIMEOUT_NS
+        while len(rows) < self.info.n_obs_steps:
+            self.check_startup()
+            now = time.monotonic_ns()
+            if now >= history_deadline_ns:
+                raise TimeoutError("warmup observation history timed out")
+            if now < next_sample_ns:
+                time.sleep(min(0.005, (next_sample_ns - now) / 1e9))
+                continue
+            row = read_observation(self.sensors.channels, self.robot, needs=self.control_needs)
+            issues, _ = check_observation(row, self.runtime, self.control_needs)
+            if issues:
+                raise ValueError("warmup observation: " + "; ".join(issues))
+            rows.append(self.observations.project(row))
+            next_sample_ns = time.monotonic_ns() + dt_ns
         context = None
         if self.info.hand_history_steps is not None:
-            initial_hand = np.deg2rad(self.runtime.hand.home_qpos_deg).astype(np.float32)
-            context = {"hand_history": np.repeat(
-                initial_hand[None], self.info.hand_history_steps, axis=0,
-            )}
-        self.model.load(
-            action_context=context,
-            samples=5,
-            rgb_hw=(self.runtime.camera.height, self.runtime.camera.width),
+            initial_hand = rows[-1].values["hand_qpos"].astype(np.float32)
+            context = {"hand_history": np.repeat(initial_hand[None], self.info.hand_history_steps, axis=0)}
+        self.model.warmup(
+            tuple(rows), action_context=context, samples=5,
             rtc_guidance_cap=(
                 self.runtime.execution.rtc_guidance_cap
                 if self.runtime.execution.mode == "rtc" else None
@@ -339,18 +363,7 @@ class PolicySession:
                 else 0
             ),
         )
-        while True:
-            if self.keyboard.estop_latched or not self.keyboard.healthy:
-                self.runtime_state.request_emergency_stop()
-            if not self.runtime_state.requests_allow_motion():
-                raise OperationCancelled("startup cancelled")
-            completion = self.model.poll()
-            if completion is not None:
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"model load/warmup timed out after {timeout_s:g}s; native call remains pending")
-            time.sleep(min(0.005, remaining))
+        self.wait_model(time.monotonic() + MODEL_STARTUP_TIMEOUT_S)
 
     def request_stop(self, *, reason=RunEndReason.OPERATOR) -> None:
         """阻塞操作期间也立即撤销运动权限。"""
@@ -364,7 +377,7 @@ class PolicySession:
             self.runtime_state.request_quit()
 
     def poll_operator(self, *, allow_tactile_reset: bool = False) -> None:
-        if self.keyboard.estop_latched or not self.keyboard.healthy:
+        if self.keyboard.estop_latched or not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
             return
         self.handle_command_batch(

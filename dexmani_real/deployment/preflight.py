@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import fields, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from dexmani_real.config.deployment import ExecutionConfig
@@ -16,12 +16,13 @@ if TYPE_CHECKING:
 
 
 def _restore_cloud_config(recipe, config_type):
-    if not isinstance(recipe, dict) or recipe.keys() != {f.name for f in fields(config_type)}:
-        raise ValueError(
-            f"Saved {config_type.__name__} is incomplete or obsolete; "
-            "re-export the dataset and retrain the checkpoint"
-        )
-    return config_type(**recipe)
+    names = (
+        ("remove_table", "num_points", "table_margin_m", "workspace")
+        if config_type is PointCloudConfig else ("num_points",)
+    )
+    if not isinstance(recipe, dict) or any(name not in recipe for name in names):
+        raise ValueError(f"Real deployment requires saved numerical {config_type.__name__} fields: {names}")
+    return config_type(**{name: recipe[name] for name in names})
 
 
 def validate_execution_config(info, execution: ExecutionConfig) -> None:
@@ -66,7 +67,7 @@ def resolve_deployment_config(
 ) -> RealConfig:
     from dexmani_policy.common.config import require_tactile_source
 
-    source = require_tactile_source(info.observation_fields, info.saved_config.get("tactile_source"))
+    source = require_tactile_source(info.observation_fields, info.tactile_source)
     if source == "sim":
         raise ValueError("Real deployment requires real-source tactile observations")
     action_steps = runtime.execution.action_steps
@@ -94,8 +95,15 @@ def resolve_deployment_config(
             or len(set(links)) != 5
         ):
             raise ValueError("Live fingertip_xyz requires five distinct non-empty link names")
-    if "depth" in names and tuple(info.depth_config["shape"]) != runtime.camera.depth_shape:
-        raise ValueError("Live camera shape differs from the saved depth input")
+    if "depth" in names:
+        recipe = info.depth_config
+        if not isinstance(recipe, dict) or "shape" not in recipe or "depth_scale_m" not in recipe:
+            raise ValueError("Real depth input requires saved shape and depth_scale_m")
+        scale = recipe["depth_scale_m"]
+        if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
+            raise ValueError("Saved depth_scale_m must be finite and positive")
+        if tuple(recipe["shape"]) != runtime.camera.depth_shape:
+            raise ValueError("Live camera shape differs from the saved depth input")
 
     runtime = replace(
         runtime,
