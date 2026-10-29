@@ -5,9 +5,11 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 import numpy as np
 import zarr
@@ -190,58 +192,51 @@ def iter_canonical_blocks(
         config=config.pointcloud,
     )
     camera_parameters = camera_parameters_cv(camera.color, camera.T_xarm_base_from_color)
-    images = reader.iter_rgb_frames()
-    for start in range(0, frames, chunk_frames):
-        end = min(frames, start + chunk_frames)
-        raw = {name: reader[name][start:end] for name in ROBOT_DATASET_SPECS}
-        arm, hand = raw["arm_qpos"], raw["hand_qpos"]
-        arm_action, hand_action = (
-            raw["action_arm_joint_target"],
-            raw["action_hand_joint_target"],
-        )
-        poses = eef_poses(arm, arm_fk=arm_fk)
-        action_poses = eef_poses(arm_action, arm_fk=arm_fk)
-        hand_features = hand_geometry(
-            poses,
-            hand,
-            arm_fk=arm_fk,
-            hand_fk=hand_fk,
-            hand_cloud=hand_cloud,
-        )
-        block = {
-            "joint_state": np.concatenate((arm, hand), axis=1, dtype=np.float32),
-            "action": np.concatenate((arm_action, hand_action), axis=1, dtype=np.float32),
-            "action_ee": np.concatenate((action_poses, hand_action), axis=1, dtype=np.float32),
-            "eef_pose": poses.astype(np.float32),
-            "finger_tactile_force": raw["hand_contact"],
-            "taxel_tactile_force": raw["hand_tactile_force"],
-            **hand_features,
-        }
-        for name, values in camera_parameters.items():
-            block[name] = np.broadcast_to(values, (end - start, values.size))
-        # 深度按块读取，RGB 逐帧解码到输出数组。
-        rgb = np.empty((end - start, height, width, 3), dtype=np.uint8)
-        depth = reader["depth"][start:end]
-        clouds = np.empty((end - start, config.pointcloud.num_points, 6), dtype=np.float32)
-        for offset, index in enumerate(range(start, end)):
-            image = next(images, None)
-            if image is None or image.shape != (height, width, 3) or image.dtype != np.uint8:
-                raise ValueError(
-                    f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
-                )
-            cloud = processor.process(depth[offset], image)
-            if not len(cloud):
-                raise ValueError(f"point_cloud unavailable at row {index}")
-            rgb[offset], clouds[offset] = image, cloud
-        block.update(rgb=rgb, depth=depth, point_cloud=clouds)
-        yield block
-    # 即使裁切训练尾部，也不能隐藏视频结构损坏或与 HDF5 行数不符。
-    for index in range(frames, reader.num_frames):
-        image = next(images, None)
-        if image is None or image.shape != (height, width, 3) or image.dtype != np.uint8:
-            raise ValueError(f"{reader.rgb_path}: RGB missing or invalid at row {index}")
-    if next(images, None) is not None:
-        raise ValueError(f"{reader.path / 'rgb.mp4'}: RGB contains extra frames")
+    with closing(reader.iter_rgb_frames()) as images:
+        for start in range(0, frames, chunk_frames):
+            end = min(frames, start + chunk_frames)
+            raw = {name: reader[name][start:end] for name in ROBOT_DATASET_SPECS}
+            arm, hand = raw["arm_qpos"], raw["hand_qpos"]
+            arm_action, hand_action = (
+                raw["action_arm_joint_target"],
+                raw["action_hand_joint_target"],
+            )
+            poses = eef_poses(arm, arm_fk=arm_fk)
+            action_poses = eef_poses(arm_action, arm_fk=arm_fk)
+            hand_features = hand_geometry(
+                poses,
+                hand,
+                arm_fk=arm_fk,
+                hand_fk=hand_fk,
+                hand_cloud=hand_cloud,
+            )
+            block = {
+                "joint_state": np.concatenate((arm, hand), axis=1, dtype=np.float32),
+                "action": np.concatenate((arm_action, hand_action), axis=1, dtype=np.float32),
+                "action_ee": np.concatenate((action_poses, hand_action), axis=1, dtype=np.float32),
+                "eef_pose": poses.astype(np.float32),
+                "finger_tactile_force": raw["hand_contact"],
+                "taxel_tactile_force": raw["hand_tactile_force"],
+                **hand_features,
+            }
+            for name, values in camera_parameters.items():
+                block[name] = np.broadcast_to(values, (end - start, values.size))
+            # 深度按块读取，RGB 逐帧解码到输出数组。
+            rgb = np.empty((end - start, height, width, 3), dtype=np.uint8)
+            depth = reader["depth"][start:end]
+            clouds = np.empty((end - start, config.pointcloud.num_points, 6), dtype=np.float32)
+            for offset, index in enumerate(range(start, end)):
+                image = next(images, None)
+                if image is None or image.shape != (height, width, 3) or image.dtype != np.uint8:
+                    raise ValueError(
+                        f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
+                    )
+                cloud = processor.process(depth[offset], image)
+                if not len(cloud):
+                    raise ValueError(f"point_cloud unavailable at row {index}")
+                rgb[offset], clouds[offset] = image, cloud
+            block.update(rgb=rgb, depth=depth, point_cloud=clouds)
+            yield block
 
 
 def export_zarr(
@@ -274,8 +269,9 @@ def export_zarr(
             with RawReader(episode) as reader:
                 camera, quality = validate_export_episode(reader)
                 frames = quality["row_stop"]
-                logger.info("%s: training rows [0, %d)/%d; trim=%s; readout over dt/4 rows=%d",
-                            episode.name, frames, reader.num_frames, quality["trim_reason"],
+                logger.info("%s: training rows [0, %d)/%d; discarded=%d; status=%s; trim=%s; readout over dt/4 rows=%d",
+                            episode.name, frames, reader.num_frames, reader.num_frames - frames,
+                            quality["source_technical_status"], quality["trim_reason"],
                             quality["readout_over_tolerance_rows"])
                 task = reader.meta["task_label"]
                 if not task.strip() or any(ord(char) < 32 or ord(char) == 127 for char in task):
@@ -323,6 +319,7 @@ def export_zarr(
         )
         root.attrs["episode_ids"] = episode_ids
         root.attrs["episode_quality"] = episode_quality
+        root.attrs["source_id"] = str(uuid4())
         publish(cast(Path, staging), target)
         staging = None
         if progress_callback:
@@ -360,6 +357,12 @@ def create_store(path, processing, camera, *, task, control_hz):
         hand_pointcloud_config=asdict(processing.hand_pointcloud),
         fingertip_link_names=list(XHAND_FINGERTIP_LINK_NAMES),
         kinematics_urdf=XARM7_XHAND_RIGHT_URDF_PATH.read_text(encoding="utf-8"),
+        processing_source=dict(
+            repository="https://github.com/haoyangzhanglab/dexmani_real",
+            pointcloud="dexmani_real/perception/pointcloud.py",
+            hand_geometry="dexmani_real/perception/hand_cloud.py",
+            hand_template=f"assets/pointcloud_template/hand/hand_{processing.hand_pointcloud.num_points}.npz",
+        ),
         table_plane_abcd=processing.table_plane_abcd,
         depth_scale_m_per_unit=camera.depth_scale_m,
         timing_admission=dict(
@@ -395,7 +398,10 @@ def append_episode(arrays, offset, blocks, frames):
     for block in blocks:
         rows = len(block["joint_state"])
         for name, values in block.items():
-            if np.issubdtype(values.dtype, np.floating):
+            # 两份触觉 float32 原样拷贝，已由 training_prefix 扫描；转换和新计算仍检查。
+            if np.issubdtype(values.dtype, np.floating) and name not in {
+                "finger_tactile_force", "taxel_tactile_force",
+            }:
                 valid = np.isfinite(values).reshape(rows, -1).all(axis=1)
                 if not valid.all():
                     row = count + int(np.flatnonzero(~valid)[0])
