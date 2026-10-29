@@ -377,3 +377,28 @@ def test_replay_fault_classification_does_not_label_business_errors_as_policy(mo
     assert result.status == joint_replay.ReplayStatus.FAULT
     assert state.run_ended_reason == expected
     assert failure_reason(error) == expected
+
+
+@pytest.mark.parametrize("failure", ["cancelled", "lifecycle", "streaming"])
+def test_arm_stop_keeps_independent_owner_failures_visible(failure):
+    from dexmani_real.robot.commands import OperationCancelled, RobotError
+    from dexmani_real.robot.xarm7.process import ArmProcess
+
+    arm = ArmProcess.__new__(ArmProcess)
+    error = ValueError("SDK failed during cancellation") if failure == "lifecycle" else OperationCancelled("revoked")
+    arm.process = SimpleNamespace(is_alive=lambda: True)
+    arm.pipe = SimpleNamespace(poll=lambda _: True, recv=lambda: error)
+    arm.operation_unresolved = failure != "streaming"
+    arm.io = SimpleNamespace(
+        stopped=SimpleNamespace(wait=lambda _: True),
+        close_error=SimpleNamespace(value=b""),
+        fault=SimpleNamespace(value=b"SDK stream failed" if failure == "streaming" else b""),
+    )
+    if failure == "cancelled":
+        arm.wait_stopped()
+    else:
+        with pytest.raises(RobotError, match="SDK") as caught:
+            arm.wait_stopped()
+        if failure == "lifecycle":
+            assert caught.value.__cause__ is error
+    assert not arm.operation_unresolved

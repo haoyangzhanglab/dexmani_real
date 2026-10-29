@@ -201,12 +201,20 @@ class ArmProcess:
                     raise TimeoutError(
                         "arm stopped but cancelled lifecycle operation remains unresolved"
                     )
-                self.pipe.recv()
+                error = self.pipe.recv()
                 self.operation_unresolved = False
+                if error is not None and not isinstance(error, OperationCancelled):
+                    if isinstance(error, TimeoutError) or not isinstance(error, Exception):
+                        raise error
+                    raise RobotError(f"arm operation failed while stopping: {error}") from error
         elif self.process is not None and self.process.exitcode not in (None, 0):
             raise RuntimeError(f"arm owner exited without confirming stop: {self.process.exitcode}")
         if self.io.close_error.value:
             raise RuntimeError(self.io.close_error.value.decode(errors="replace"))
+        # stopped 只确认停止请求已处理，不能抹掉同时发生的 owner 故障。
+        issue = self.fault
+        if issue:
+            raise RobotError(f"xArm controller fault: {issue}")
 
     def close(self):
         self.request_stop()
