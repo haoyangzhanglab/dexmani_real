@@ -28,7 +28,7 @@ python -m pip install -e ".[interactive,control,geometry,visualization]"
 
 策略与真机配置的匹配及部署前校验位于 [deployment/preflight.py](dexmani_real/deployment/preflight.py)。
 
-本轮修复的配套源码为 Real `288d172` 与 Policy `be328a7`。部署使用公开 `PolicyInfo`；控制周期、depth 形状/单位及实际使用的点云、手点云和指尖配方沿 Canonical → 训练配置/checkpoint → 公开元信息传递，触觉来源来自已验证训练配置。缺少真实部署所需事实时明确拒绝，不用当前 YAML 猜测历史训练配方。普通仿真训练和纯 policy inspect 不要求这些 Real 配方。
+训练与真机部署应固定配套源码版本。部署使用公开 `PolicyInfo`；控制周期、depth 形状/单位及实际使用的点云、手点云和指尖配方沿 Canonical → 训练配置/checkpoint → 公开元信息传递，触觉来源来自已验证训练配置。Real 在设备启动前要求 joint/EEF 的控制动作分别为 19/21 维，并拒绝缺少的部署事实，不用当前 YAML 猜测训练配方。普通仿真训练和纯 policy inspect 不要求这些 Real 配方。
 
 以下命令仅打印配置，不连接设备：
 

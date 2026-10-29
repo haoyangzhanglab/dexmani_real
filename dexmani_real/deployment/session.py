@@ -369,18 +369,13 @@ class PolicySession:
         if self.info.hand_history_steps is not None:
             initial_hand = rows[-1].values["hand_qpos"].astype(np.float32)
             context = {"hand_history": np.repeat(initial_hand[None], self.info.hand_history_steps, axis=0)}
-        self.model.warmup(
-            tuple(rows), action_context=context, samples=5,
-            rtc_guidance_cap=(
-                self.runtime.execution.rtc_guidance_cap
-                if self.runtime.execution.mode == "rtc" else None
-            ),
-            rtc_delay=(
-                self.runtime.execution.prefetch_steps
-                if self.runtime.execution.mode == "rtc"
-                else 0
-            ),
-        )
+        kwargs = {}
+        if self.runtime.execution.mode == "rtc":
+            kwargs = dict(
+                rtc_guidance_cap=self.runtime.execution.rtc_guidance_cap,
+                rtc_delay=self.runtime.execution.prefetch_steps,
+            )
+        self.model.warmup(tuple(rows), action_context=context, samples=5, **kwargs)
         self.wait_model(time.monotonic() + MODEL_STARTUP_TIMEOUT_S)
 
     def request_stop(self, *, reason=RunEndReason.OPERATOR) -> None:

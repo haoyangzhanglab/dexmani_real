@@ -352,10 +352,6 @@ class Rollout:
         if not authorized:
             return "query_authority_revoked"
         rows = tuple(self.history)
-        query = Prediction(
-            self.run_id, slot, handoff_slot,
-            observation_ns=rows[-1].observation_timestamp_ns, submitted_ns=time.monotonic_ns(),
-        )
         kwargs = (
             dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot,
                  rtc_guidance_cap=self.execution.rtc_guidance_cap) if prefix is not None else {}
@@ -364,7 +360,7 @@ class Rollout:
         if self.hand_history is not None:
             if not self.hand_history:
                 # 与训练时一致，初始历史使用 float32 精度的实测手姿。
-                hand = rows[-1].values["hand_qpos"].astype(np.float32).astype(np.float64)
+                hand = rows[-1].values["hand_qpos"].astype(np.float32)
                 initial_hand_history = tuple(
                     hand.copy() for _ in range(self.hand_history.maxlen)
                 )
@@ -374,6 +370,10 @@ class Rollout:
                     self.hand_history if initial_hand_history is None else initial_hand_history
                 )
             }
+        query = Prediction(
+            self.run_id, slot, handoff_slot,
+            observation_ns=rows[-1].observation_timestamp_ns, submitted_ns=time.monotonic_ns(),
+        )
         self.model.predict(rows, **kwargs)
         if self.plan is None:
             self.wait_deadline_ns = query.submitted_ns + ACTION_TIMEOUT_NS

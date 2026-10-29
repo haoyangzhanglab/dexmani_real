@@ -138,6 +138,11 @@ class DeploymentTests(unittest.TestCase):
                 resolve_deployment_config(replace(cloud_info, pointcloud_config=missing), runtime, ObservationNeeds())
             with self.assertRaisesRegex(ValueError, "control_dt_s"):
                 resolve_deployment_config(replace(info, control_dt_s=None), runtime, ObservationNeeds())
+            for mode, dimension in (("joint", 18), ("eef", 19)):
+                with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "control_action_dim"):
+                    resolve_deployment_config(
+                        replace(info, action_mode=mode, control_action_dim=dimension), runtime, ObservationNeeds(),
+                    )
 
     def make_rollout(self, directory, clock, *, n_obs=1):
         info = self.info(directory, n_obs=n_obs)
@@ -206,6 +211,60 @@ class DeploymentTests(unittest.TestCase):
                 rollout.run_deadline_ns = clock.now
                 rollout.step()
                 self.assertEqual(rollout.result.termination_details, "duration_timeout")
+
+    def test_async_and_rtc_keep_prediction_time_anchors_across_handoffs(self):
+        for mode in ("async", "rtc"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                clock = Clock()
+                with patch("time.monotonic_ns", side_effect=lambda: clock.now):
+                    rollout = self.make_rollout(directory, clock)
+                    rollout.execution = replace(rollout.execution, mode=mode, action_steps=2,
+                                                prefetch_steps=1, rtc_guidance_cap=1.0)
+                    rollout.policy_info = replace(rollout.policy_info, horizon=6, future_steps=6,
+                                                  n_action_steps=2, supported_execution_modes=(mode,))
+                    pending, calls, submitted = [], [], []
+
+                    def predict(rows, **kwargs):
+                        self.assertFalse(pending)
+                        calls.append((rows[-1].observation_timestamp_ns, kwargs))
+                        pending.append((clock.now + rollout.dt_ns // 2, np.zeros((6, 19))))
+                        rollout.model.has_pending_task = True
+
+                    def poll():
+                        if pending and clock.now >= pending[0][0]:
+                            _, actions = pending.pop()
+                            rollout.model.has_pending_task = False
+                            return "predict", PredictionResult(actions, rollout.dt_ns // 2)
+
+                    rollout.model.predict, rollout.model.poll = predict, poll
+                    rollout.robot.check = lambda: None
+                    rollout.map_command = lambda *args, **kwargs: (
+                        RobotCommand(rollout.run_id, np.zeros(7), np.zeros(12)), None)
+                    rollout.action_mapper = SimpleNamespace(
+                        frozen_rejection=lambda *args: None,
+                        control_from_command=lambda command, mode: np.r_[command.arm_qpos, command.hand_qpos],
+                    )
+                    rollout.robot.send_action = lambda command, **kwargs: submitted.append(
+                        (clock.now, rollout.plan.observation_ns))
+                    for tick in range(7):
+                        clock.now = rollout.started_ns + tick * rollout.dt_ns
+                        rollout.step()
+                        self.assertFalse(rollout.finished)
+                    self.assertEqual(len(submitted), 6)
+                    expected_sources = [calls[index // 2][0] for index in range(6)]
+                    self.assertEqual([source for _, source in submitted], expected_sources)
+                    expected_latency = np.mean([
+                        (now - expected_sources[index]) / 1e9 for index, (now, _) in enumerate(submitted)
+                    ])
+                    metrics = rollout.result.metrics
+                    self.assertEqual(metrics["inference_count"], 3)
+                    self.assertAlmostEqual(metrics["inference_mean_s"], .025)
+                    self.assertAlmostEqual(metrics["prediction_wait_mean_s"], .05)
+                    self.assertAlmostEqual(metrics["observation_to_submit_mean_s"], expected_latency)
+                    for _, kwargs in calls[1:]:
+                        self.assertEqual("rtc_prefix" in kwargs, mode == "rtc")
+                        if mode == "rtc":
+                            self.assertEqual(kwargs["delay_steps"], 1)
 
     def test_late_prediction_is_retired_and_directory_creation_is_atomic(self):
         with tempfile.TemporaryDirectory() as directory:
