@@ -6,6 +6,7 @@ import math
 import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import CancelledError
 from dataclasses import dataclass
 from typing import Any
 
@@ -258,14 +259,17 @@ class SceneWorker:
                     else:
                         value = tracker.step(frame, *args, **kwargs)
                 except Exception as error:
-                    error_text = format_error(error)
+                    if not (self.stop_event.is_set() and isinstance(error, CancelledError)):
+                        error_text = format_error(error)
                 with self.lock:
                     self.busy = False
                     if not self.stop_event.is_set():
                         self.result = SceneResult(operation, frame, value, error_text)
+                    elif error_text is not None:
+                        self.error = error_text
         except Exception as error:
             with self.lock:
-                if not self.stop_event.is_set():
+                if not (self.stop_event.is_set() and isinstance(error, CancelledError)):
                     self.error = format_error(error)
         finally:
             try:
@@ -275,7 +279,9 @@ class SceneWorker:
                     self.segmenter.close()
             except Exception as error:
                 with self.lock:
-                    self.error = format_error(error)
+                    if not (self.stop_event.is_set() and isinstance(error, CancelledError)):
+                        message = "model cleanup: " + format_error(error)
+                        self.error = f"{self.error}; {message}" if self.error else message
             with self.lock:
                 self.ready = self.busy = False
                 self.pending_task = None

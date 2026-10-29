@@ -1,6 +1,7 @@
 """One persistent Grounded-SAM2 process with cancellable, frame-matched replies."""
 
 import os
+from concurrent.futures import CancelledError
 from pathlib import Path
 import signal
 import subprocess
@@ -38,7 +39,7 @@ class GroundedSAM2Segmenter:
     def start(self):
         with self._lifecycle:
             if self._cancelled.is_set():
-                raise RuntimeError("SAM2 session was cancelled")
+                raise CancelledError("SAM2 session was cancelled")
             if self._process is not None:
                 return self
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,17 +87,21 @@ class GroundedSAM2Segmenter:
         if not self._request.acquire(blocking=False):
             raise RuntimeError("SAM2 allows exactly one in-flight request")
         try:
-            if self._cancelled.is_set() or self._process is None:
+            if self._cancelled.is_set():
+                raise CancelledError("SAM2 session was cancelled")
+            if self._process is None:
                 raise RuntimeError("SAM2 session is not running")
             self._counter += 1
             identity = dict(session=self._session, request=self._counter, frame_key=frame_key)
             started = time.monotonic_ns()
             send(self._process.stdin, dict(**identity, operation=operation, **parameters), arrays)
             reply, result = receive(self._process.stdout)
-            if self._cancelled.is_set() or any(reply.get(k) != v for k, v in identity.items()):
-                raise RuntimeError("Rejected cancelled or mismatched SAM2 reply")
+            if any(reply.get(k) != v for k, v in identity.items()):
+                raise RuntimeError("Rejected mismatched SAM2 reply")
             if reply.get("error"):
                 raise RuntimeError(f"SAM2 {operation}: {reply['error']}; log: {self.log_path}")
+            if self._cancelled.is_set():
+                raise CancelledError("Rejected cancelled SAM2 reply")
             self.last_metrics = reply["metrics"]
             self.last_metrics["round_trip_ms"] = (time.monotonic_ns() - started) / 1e6
             self.last_metrics["ipc_and_dispatch_ms"] = max(
@@ -104,8 +109,12 @@ class GroundedSAM2Segmenter:
             )
             return reply, result
         except (EOFError, BrokenPipeError) as error:
+            if self._cancelled.is_set():
+                raise CancelledError("SAM2 request was cancelled") from error
             self.cancel()
             raise RuntimeError(f"SAM2 worker stopped; log: {self.log_path}") from error
+        except CancelledError:
+            raise
         except Exception:
             self.cancel()
             raise

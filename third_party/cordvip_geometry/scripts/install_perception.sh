@@ -105,7 +105,6 @@ export CUDA_HOME="$CONDA_PREFIX"
 export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include"
 export PATH="$CONDA_PREFIX/bin:$PATH"
 export MAX_JOBS=4
-export TORCH_CUDA_ARCH_LIST=8.9
 python -m pip install --no-build-isolation --no-deps \
     -e third_party/cordvip_geometry
 python -m pip install --no-build-isolation --no-deps third_party/nvdiffrast

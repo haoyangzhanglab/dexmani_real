@@ -130,12 +130,23 @@ def load_initial_selection(directory, frame):
     saved = load_frame(directory / "source_rgbd.npz")
     for key in (
         "rgb", "depth_m", "K", "distortion_model", "distortion_coeffs",
-        "source_id", "timestamp_ns", "clock", "row_index",
+        "timestamp_ns", "clock", "row_index",
     ):
         if not np.array_equal(getattr(saved, key), getattr(frame, key)):
             raise ValueError(f"initial-selection {key} differs from the actual first source frame")
+    if saved.source_id != frame.source_id:
+        saved_raw, current_raw = (source.rsplit(":", 2) for source in (
+            saved.source_id, frame.source_id,
+        ))
+        if not (
+            saved.source_id.startswith("raw:") and frame.source_id.startswith("raw:")
+            and len(saved_raw) == len(current_raw) == 3
+            and saved_raw[1] in {"row", "camera"}
+            and saved_raw[1:] == current_raw[1:]
+        ):
+            raise ValueError("initial-selection source_id differs from the actual first source frame")
     for key in ("source_id", "timestamp_ns", "clock"):
-        if metadata.get(key) != getattr(frame, key):
+        if metadata.get(key) != getattr(saved, key):
             raise ValueError(f"initial-selection metadata {key} differs from the source frame")
     mask_path = (directory / metadata["mask_file"]).resolve()
     if not mask_path.is_relative_to(directory):
@@ -147,7 +158,8 @@ def load_initial_selection(directory, frame):
     return mask, dict(
         method="reused_confirmed_selection",
         directory=str(directory),
-        source_check="exact_rgb_depth_K_distortion_identity_time_clock_row",
+        source_check="exact_rgb_depth_K_distortion_identity_without_raw_path_time_clock_row",
+        selection_source_id=saved.source_id,
         selected_instance=metadata["selected_instance"],
     )
 

@@ -105,13 +105,22 @@ class SceneTracker:
             else self.segmenter.track(rgb, frame_key=frame_key)
         )
         segmentation_ns = time.monotonic_ns()
-        if first:
-            self.instance_ids = tuple(initial_masks)
-            self.image_shape, self.intrinsics = rgb.shape, K.copy()
-        if tuple(masks) != self.instance_ids:
+        instance_ids = tuple(initial_masks) if first else self.instance_ids
+        if tuple(masks) != instance_ids:
             raise RuntimeError("Streaming segmentation changed instance identity/order")
         # Independent evidence survives pose failure or the absence of an asset.
         measured = extract_scene_clouds(rgb, depth_m, K, masks, pixel_stride=self.pixel_stride)
+        if first:
+            for name in self.assets:
+                count = len(measured.objects[name].observed_points_camera)
+                if count < self.min_matched_pixels:
+                    raise ValueError(
+                        f"{name}: pose initialization has {count} independent depth points "
+                        f"after segmentation/overlap/stride; requires {self.min_matched_pixels}. "
+                        "Select a supported instance and start a new session."
+                    )
+            self.instance_ids = instance_ids
+            self.image_shape, self.intrinsics = rgb.shape, K.copy()
         poses, depths, pose_ms = {}, {}, {}
         prepared_frame = None
         for name, tracker in self.trackers.items():

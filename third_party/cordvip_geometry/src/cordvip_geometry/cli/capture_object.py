@@ -147,10 +147,15 @@ def run(args):
         reader.start()
         while True:
             snapshot = reader.snapshot()
-            if snapshot.error:
-                raise RuntimeError(snapshot.error)
+            source_error = snapshot.error
             if snapshot.finished and (live or snapshot.frame is None):
-                raise RuntimeError("相机在保存前停止" if live else "离线输入没有可用帧")
+                source_error = source_error or (
+                    "相机在保存前停止" if live else "离线输入没有可用帧"
+                )
+            if source_error:
+                if frozen is None:
+                    raise RuntimeError(source_error)
+                error = source_error
             latest = snapshot.frame
             displayed = frozen if frozen is not None else latest
             state = (
@@ -159,7 +164,9 @@ def run(args):
                 else "LIVE" if live else "REPLAY_END" if snapshot.finished else "REPLAY"
             )
             message = (
-                "Inspect the frozen RGB and depth; Enter saves this exact frame."
+                f"Source failed: {source_error}. Enter saves the frozen copy; q exits."
+                if source_error
+                else "Inspect the frozen RGB and depth; Enter saves this exact frame."
                 if frozen is not None
                 else "Keep the object unobstructed; space freezes the displayed frame."
             )
@@ -172,8 +179,9 @@ def run(args):
                 break
             if key == 32:
                 if frozen is not None:
-                    frozen = None
-                    frozen_ns = None
+                    if not source_error:
+                        frozen = None
+                        frozen_ns = None
                 elif latest is not None:
                     # Freeze RGB, depth, K and clock together so later frames cannot change the saved evidence.
                     frozen = replace(
@@ -195,7 +203,8 @@ def run(args):
     except KeyboardInterrupt:
         error = "KeyboardInterrupt"
     except Exception as failure:
-        error = f"{type(failure).__name__}: {failure}"
+        message = f"{type(failure).__name__}: {failure}"
+        error = f"{error}; {message}" if error else message
     finally:
         deadline = time.monotonic() + 15.0
         close = reader.close(timeout_s=0)
@@ -217,7 +226,7 @@ def run(args):
                     window_open = False
             close = reader.close(timeout_s=0.02)
         stopped = close.stopped
-        if close.error:
+        if close.error and close.error != error:
             error = f"{error}; {close.error}" if error else close.error
         if not stopped:
             error = f"{error}; source shutdown timeout" if error else "source shutdown timeout"

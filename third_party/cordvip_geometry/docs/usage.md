@@ -18,6 +18,8 @@ python -m cordvip_geometry download --models grounding sam
 python -m cordvip_geometry check --offline-input --headless
 ```
 
+安装脚本保留调用者的 `TORCH_CUDA_ARCH_LIST`；未设置时由 PyTorch 根据可见 GPU 选择编译目标。无可见 GPU 的离线构建需先按最终运行设备手动设置，例如 `export TORCH_CUDA_ARCH_LIST=8.9`；该值仅是示例。
+
 [Grounded-SAM-2](https://github.com/IDEA-Research/Grounded-SAM-2) 默认下载 revision `b7a9c29f196edff0eb54dbe14588d7ae5e3dde28`；运行允许使用本地修改。默认权重为 `reports/cordvip_models/sam2.1_hiera_small.pt` 和 `reports/cordvip_models/grounding-dino-base/`，下载使用明确的官方 revision 并保存来源记录。SAM2 从源码目录直接加载；禁用填洞后处理，不需要编译 SAM2 可选 CUDA 扩展。Grounding DINO 使用本地 safetensors，关闭自定义算子，不在推理时联网下载。模型加载要求所用源码与依赖提供实际调用的 API。
 
 `--sam-python` 默认当前解释器，也可指向另一个具备推理依赖的环境；不按环境名或精确版本判断。[SAM 配方](../src/cordvip_geometry/sam2_config.py)检查本地文件与依赖是否存在，首帧文本检测额外检查 Grounding DINO 依赖。父进程按实际能力检查：mask-only 配合 `--no-3d` 不要求父环境的 Torch 或 Open3D；位姿估计仍需要 Open3D，即使不显示 3D；图像处理始终需要 cv2。手点另需 Real 包的离线 FK 依赖。
@@ -59,6 +61,8 @@ python scripts/cordvip/track_object.py \
 ```
 
 本地资产与 Raw 不随 Git 分发。单物体输出使用 `object__` 前缀，与多物体使用相同格式。首帧选择核对原始 RGB、深度、内参、畸变、身份和时间；已有选择省去文本检测，但仍需 Grounded-SAM2 做后续传播。无窗口模式每个实例都须提供已确认选择；不会自动取最高分候选。
+
+Raw 原样搬迁目录后可复用初始选择，原路径保留为溯源；行、相机编号、时间及实际 RGB-D/标定仍须一致。带 pose 资产的首帧在 SAM、互斥和 stride 后必须达到 `--min-matched-pixels` 实测支持点，否则初始化失败，需重新选择并启动新 session；mask-only 实例保留较小的选择门槛。
 
 场景文件格式，路径相对 workspace：
 
