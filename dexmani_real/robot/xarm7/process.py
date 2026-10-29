@@ -56,14 +56,16 @@ class ArmProcess:
         run_id = self.io.run_id.value
 
         def check_startup():
-            if check_services is not None and not check_services():
-                raise RobotError("runtime service unavailable during arm startup")
-            if (
+            # 故障也会设置 stop；仅无故障的退出可以按操作者取消处理。
+            if not self.io.fault.value and (
                 self.io.run_id.value != run_id
                 or self.io.stop.is_set()
                 or self.io.emergency.is_set()
             ):
                 raise OperationCancelled("arm startup cancelled")
+            self.check_error()
+            if check_services is not None and not check_services():
+                raise RobotError("runtime service unavailable during arm startup")
 
         check_startup()
         self.process = self.ctx.Process(
@@ -78,13 +80,11 @@ class ArmProcess:
         try:
             while not self.io.ready.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
                 check_startup()
-                self.check_error()
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         "arm initialization unresolved; owner process may still be in SDK"
                     )
             check_startup()
-            self.check_error()
         except BaseException:
             self.request_stop()
             self.io.closing.set()
@@ -101,7 +101,7 @@ class ArmProcess:
         self.check_error()
         status = self.io.read_status()
         stamp = int(status["frame"]["timestamp_ns"])
-        if not status["valid"] or not 0 < stamp <= time.monotonic_ns() < stamp + int(
+        if not 0 < stamp <= time.monotonic_ns() < stamp + int(
             self.cfg.feedback_max_age_s * 1e9
         ):
             raise RobotError("arm feedback unavailable/stale")
@@ -110,9 +110,6 @@ class ArmProcess:
         return frame
 
     def submit(self, command, *, submit_until_ns, execute_until_ns):
-        self.check_error()
-        if not self.is_connected:
-            raise RobotError("arm device unavailable")
         self.io.publish_goal(
             command,
             submit_until_ns=submit_until_ns,
@@ -197,7 +194,7 @@ class ArmProcess:
         if self.process is not None and self.process.is_alive():
             if not self.io.stopped.wait(EXECUTOR_TIMEOUT_S):
                 raise TimeoutError(
-                    "arm stop unresolved; SDK acceptance/physical stop not confirmed"
+                    "arm stop unresolved; SDK acceptance not confirmed"
                 )
             if self.operation_unresolved:
                 if not self.pipe.poll(max(0, deadline - time.monotonic())):

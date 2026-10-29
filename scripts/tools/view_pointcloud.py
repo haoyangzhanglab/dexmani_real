@@ -139,7 +139,7 @@ def benchmark_production_pipeline(
         cloud = processor.process(frame.depth, frame.rgb)
         elapsed_ms.append((time.perf_counter() - started) * 1000.0)
         end_to_end_ms.append((time.perf_counter() - frame_started) * 1000.0)
-        valid_clouds += cloud is not None
+        valid_clouds += len(cloud) > 0
     values = np.asarray(elapsed_ms, dtype=np.float64)
     end_to_end_values = np.asarray(end_to_end_ms, dtype=np.float64)
     print(
@@ -392,8 +392,6 @@ def run_pointcloud_diagnostic(args) -> int:
         started = time.perf_counter()
         result = processor.process(depth_raw, rgb)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
-        if result is None:
-            result = np.empty((0, 6), dtype=np.float32)
         print(f"Output: {len(result)} points ({elapsed_ms:.1f} ms)")
         if save_dir is not None:
             raw_cloud = build_raw_point_cloud(
@@ -403,8 +401,6 @@ def run_pointcloud_diagnostic(args) -> int:
                 intrinsics=intrinsics,
                 T_xarm_base_from_color=T_xarm_base_from_color,
             )
-            if raw_cloud is None:
-                raw_cloud = np.zeros((0, 6), dtype=np.float32)
             snapshot_path = save_diagnostic_snapshot(
                 output_root=save_dir,
                 rgb=rgb,

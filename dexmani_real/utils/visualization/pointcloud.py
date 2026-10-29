@@ -48,9 +48,7 @@ class PointCloudViewer:
             return False
         return callback
 
-    def update(self, points: np.ndarray | None) -> None:
-        if points is None:
-            points = np.empty((0, 6), dtype=np.float32)
+    def update(self, points: np.ndarray) -> None:
         self.cloud.points = self.o3d.utility.Vector3dVector(points[:, :3])
         self.cloud.colors = self.o3d.utility.Vector3dVector(points[:, 3:6])
         self.vis.update_geometry(self.cloud)

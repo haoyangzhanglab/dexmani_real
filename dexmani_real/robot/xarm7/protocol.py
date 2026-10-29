@@ -23,14 +23,12 @@ GOAL_DTYPE = np.dtype(
         ("hold", "?"),
         ("submit_until_ns", "<i8"),
         ("execute_until_ns", "<i8"),
-        ("q_goal", "<f8", (7,)),
+        ("q_goal", "<f8", ARM_JOINT_SHAPE),
     ]
 )
 STATUS_DTYPE = np.dtype(
     [
         ("frame", ARM_STATE_DTYPE),
-        ("valid", "?"),
-        ("state", "<i4"),
         ("prepared_run_id", "<i8"),
     ]
 )

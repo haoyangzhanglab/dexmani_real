@@ -259,7 +259,7 @@ class EpisodeVisualizer:
         cloud = self.pointcloud_processor.process(depth, rgb)
         self.pointcloud_processing_ns += time.perf_counter_ns() - started_ns
         self.pointcloud_processed_frames += 1
-        if cloud is None:
+        if not len(cloud):
             self.empty_cloud_count += 1
         log_points("pcd", cloud)
 

@@ -8,7 +8,6 @@ import numpy as np
 
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, XARM7_HARD_LOWER, XARM7_HARD_UPPER
 
-SERVO_MAX_INTERVAL_S = 0.020
 SDK_TIMEOUT_S = 0.020
 EXECUTOR_TIMEOUT_S = 3.0
 HOME_TARGET_TIMEOUT_S = 0.5
@@ -44,11 +43,11 @@ class ArmConfig:
 
     max_joint_velocity_deg_per_s: float = 150.0
     max_joint_acceleration_deg_per_s2: float = 900.0
+    max_joint_jerk_deg_per_s3: float = 6000.0
     feedback_max_age_s: float = 4 / 30
 
     servo_hz: float = 100.0
     feedback_hz: float = 25.0
-    tracking_error_rad: float = 0.35
 
     ip: str = "192.168.1.111"
 
@@ -66,6 +65,10 @@ class ArmConfig:
     @property
     def max_joint_acceleration_rad_per_s2(self) -> float:
         return float(np.deg2rad(self.max_joint_acceleration_deg_per_s2))
+
+    @property
+    def max_joint_jerk_rad_per_s3(self) -> float:
+        return float(np.deg2rad(self.max_joint_jerk_deg_per_s3))
 
     def validate(self) -> None:
         home = np.asarray(self.home_qpos, dtype=np.float64)
@@ -92,8 +95,8 @@ class ArmConfig:
         for name in (
             "servo_hz",
             "feedback_hz",
-            "tracking_error_rad",
             "feedback_max_age_s",
+            "max_joint_jerk_deg_per_s3",
         ):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"arm {name} must be finite and positive")
@@ -101,9 +104,6 @@ class ArmConfig:
             self.feedback_hz <= self.servo_hz and 1 / self.feedback_hz < self.feedback_max_age_s
         ):
             raise ValueError("feedback period must fit freshness budget and not exceed servo rate")
-        if not 1 / self.servo_hz < SERVO_MAX_INTERVAL_S:
-            raise ValueError("servo interval budget must exceed one servo period")
-
         for value in (self.homing.convergence_rad, self.homing.velocity_convergence_rad_s):
             if not np.isfinite(value) or value <= 0:
                 raise ValueError("HOME position/velocity tolerances must be finite and positive")

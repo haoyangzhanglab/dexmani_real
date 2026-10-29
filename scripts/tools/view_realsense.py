@@ -167,7 +167,7 @@ class RealSenseViewer:
         frame_count = 0
         enabled, frozen = False, False
         mode, colormap = "processed", "jet"
-        cached_cloud = None
+        cached_cloud = np.empty((0, 6), dtype=np.float32)
         base_from_color = None
         processor = None
         image_viewer = cloud_viewer = None
@@ -185,7 +185,8 @@ class RealSenseViewer:
                     if "closed" in cloud_events:
                         cloud_viewer.close()
                         cloud_viewer = None
-                        enabled, frozen, cached_cloud = False, False, None
+                        enabled, frozen = False, False
+                        cached_cloud = np.empty((0, 6), dtype=np.float32)
                     events.extend(key for key in cloud_events if key != "closed")
                 for key in events:
                     if key in {"q", "esc"}:
@@ -199,12 +200,13 @@ class RealSenseViewer:
                     elif key == "d":
                         colormap = "gray" if colormap == "jet" else "jet"
                     elif key == "f":
-                        if enabled and cached_cloud is not None and len(cached_cloud):
+                        if enabled and len(cached_cloud):
                             frozen = not frozen
                         else:
                             print("Freeze unavailable until a nonempty point cloud is displayed")
                     elif key in {"p", "s", "r"}:
-                        frozen, cached_cloud = False, None
+                        frozen = False
+                        cached_cloud = np.empty((0, 6), dtype=np.float32)
                         if key == "p":
                             enabled = not enabled
                         elif key == "s":
@@ -213,7 +215,7 @@ class RealSenseViewer:
                             enabled, mode, colormap = False, "processed", "jet"
                         if cloud_viewer is not None:
                             if enabled:
-                                cloud_viewer.update(None)
+                                cloud_viewer.update(cached_cloud)
                             else:
                                 cloud_viewer.close()
                                 cloud_viewer = None
@@ -262,7 +264,7 @@ class RealSenseViewer:
                 depth_m = depth.astype(np.float32) * depth_scale_m
                 fps = len(intervals) / sum(intervals) if intervals else 0.0
                 valid = depth_valid_ratio(depth_m, *DEPTH_RANGE_M)
-                point_count = len(cached_cloud) if cached_cloud is not None else 0
+                point_count = len(cached_cloud)
                 lines = [
                     f"frame={frame_count} fps={fps:.1f} read={read_ms:.1f}ms pcd={pcd_ms:.1f}ms",
                     f"valid={valid:.3f} points={point_count} PCD={mode if enabled else 'OFF'} frozen={frozen}",

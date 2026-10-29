@@ -10,7 +10,6 @@ from dexmani_real.config.xarm7 import (
     HOME_CONVERGENCE_TIMEOUT_S,
     HOME_DWELL_S,
     HOME_TARGET_TIMEOUT_S,
-    SERVO_MAX_INTERVAL_S,
 )
 from dexmani_real.robot.commands import OperationCancelled, validate_arm_target
 from dexmani_real.robot.xarm7.protocol import (
@@ -18,7 +17,6 @@ from dexmani_real.robot.xarm7.protocol import (
     HomeRequest,
 )
 from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
-from dexmani_real.utils.timing import next_tick_ns
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +26,6 @@ class ArmController:
         self.cfg, self.io, self.pipe, self.driver = cfg, io, pipe, driver
         self.status = np.zeros((), dtype=STATUS_DTYPE)
         self.active = self.reference = None
-        self.last_send_ns = 0
 
     def authorized(self, run_id):
         return (
@@ -54,16 +51,14 @@ class ArmController:
             completed = time.monotonic_ns()
             if completed - started >= int(self.cfg.feedback_max_age_s * 1e9):
                 raise TimeoutError("arm query exceeded feedback freshness budget")
-            if not self.driver.is_connected or status.error_code:
-                raise RuntimeError(f"arm disconnected/controller error {status.error_code}")
+            if status.error_code:
+                raise RuntimeError(f"arm controller error C{status.error_code}")
             self.status["frame"]["qpos"] = q
             self.status["frame"]["qvel"] = v
             # 来源时间采用查询开始时刻，不能替换为缓存读取时间。
             self.status["frame"]["timestamp_ns"] = started
-            self.status["valid"] = True
-            self.status["state"] = status.state
         except Exception:
-            self.status["valid"] = False
+            self.status["frame"]["timestamp_ns"] = 0
             raise
         finally:
             self.io.publish_status(self.status)
@@ -80,19 +75,19 @@ class ArmController:
     ):
         """确认位置与速度连续稳定，strict 模式遇到不合格样本立即失败。"""
         tolerance = self.cfg.homing.convergence_rad if tolerance_rad is None else tolerance_rad
-        interval_s = 1 / self.cfg.feedback_hz
+        interval_ns = round(1e9 / self.cfg.feedback_hz)
         deadline = time.monotonic_ns() + int(timeout_s * 1e9)
-        stable = time.monotonic_ns() if strict else None
+        stable = None
         anchor = None
         while time.monotonic_ns() < deadline:
             check_abort()
-            if strict:
-                self.io.stop.wait(min(interval_s, HOME_DWELL_S))
-                check_abort()
             self.read_feedback()
             check_abort()
+            completed_ns = time.monotonic_ns()
+            if completed_ns >= deadline:
+                break
             q, v = self.status["frame"]["qpos"], self.status["frame"]["qvel"]
-            now = time.monotonic_ns()
+            sample_ns = int(self.status["frame"]["timestamp_ns"])
             valid = np.max(np.abs(v)) <= self.cfg.homing.velocity_convergence_rad_s
             if target is not None:
                 valid = valid and np.max(np.abs(q - target)) <= tolerance
@@ -101,13 +96,15 @@ class ArmController:
             if valid:
                 if target is None and (anchor is None or np.max(np.abs(q - anchor)) > tolerance):
                     stable, anchor = None, q.copy()
-                stable = now if stable is None else stable
-                if now - stable >= int(HOME_DWELL_S * 1e9):
+                # SDK 未提供采样时刻；首尾查询的等待时间不能算作已观测到的停稳。
+                stable = completed_ns if stable is None else stable
+                if sample_ns - stable >= int(HOME_DWELL_S * 1e9):
                     return
             else:
                 stable = anchor = None
-            if not strict:
-                self.io.stop.wait(interval_s)
+            # 按查询开始时刻限频，查询耗时既不拉长采样间隔，也不充作停稳时长。
+            remaining_ns = min(sample_ns + interval_ns, deadline) - time.monotonic_ns()
+            self.io.stop.wait(max(0, remaining_ns) / 1e9)
         raise TimeoutError(f"{stage}: measured position/velocity dwell not confirmed")
 
     def wait_stationary(self, check_abort):
@@ -209,14 +206,13 @@ class ArmController:
             self.io.take_goal(block=True)
             self.status["prepared_run_id"] = 0
             self.io.stopped.clear()
-            self.wait_stationary(check_abort)
             if isinstance(message, HomeRequest):
+                self.wait_stationary(check_abort)
                 self.home(message.waypoints, message.target, check_abort=check_abort)
             else:
                 self.driver.enter_mode(1, check_abort=check_abort)
                 self.wait_stationary(check_abort)
                 check_abort()
-                self.last_send_ns = 0
                 self.status["prepared_run_id"] = run_id
         except BaseException as exc:
             error = exc
@@ -237,68 +233,56 @@ class ArmController:
             return "unprepared_run"
         if now >= goal["execute_until_ns"]:
             return "command_expired"
-        if not self.status["valid"] or now - self.status["frame"]["timestamp_ns"] >= int(
-            self.cfg.feedback_max_age_s * 1e9
-        ):
+        stamp = int(self.status["frame"]["timestamp_ns"])
+        if not 0 < stamp <= now < stamp + int(self.cfg.feedback_max_age_s * 1e9):
             return "arm_feedback_expired"
-        if self.driver.mode != 1 or self.status["state"] not in (0, 1, 2):
+        status = self.driver.read_status()
+        if status.error_code:
+            return f"arm controller error C{status.error_code}"
+        if status.mode != 1 or status.state not in (0, 1, 2):
             return "controller_not_streaming"
         return None
 
-    def tick(self):
+    def tick(self) -> int | None:
         pending = self.io.take_goal()
-        if self.active is None and pending is None:
-            return
-        now = time.monotonic_ns()
         goal = pending if pending is not None else self.active
-        issue = self.command_issue(goal, now, first=pending is not None)
-        if issue:
-            if issue != "revoked":
-                raise RuntimeError(issue)
+        if goal is None:
+            return None
+        if not self.authorized(int(goal["run_id"])):
             self.io.stop.set()
-            return
+            return None
         if pending is not None:
             if self.active is None:
                 q, v = self.status["frame"]["qpos"], self.status["frame"]["qvel"]
                 if np.max(np.abs(v)) > self.cfg.homing.velocity_convergence_rad_s:
                     raise RuntimeError("arm moved after standstill preparation")
-                self.reference = ArmTrajectory(self.cfg, q, v, now)
+                self.reference = ArmTrajectory(self.cfg, q, v)
             self.active = pending
         q = cast(ArmTrajectory, self.reference).step(
-            now, pending["q_goal"] if pending is not None and not pending["hold"] else None,
+            pending["q_goal"] if pending is not None and not pending["hold"] else None,
             hold=bool(pending is not None and pending["hold"]),
         )
-        if np.max(np.abs(self.status["frame"]["qpos"] - q)) > self.cfg.tracking_error_rad:
-            raise RuntimeError("tracking_error")
-        # 计算结束后、进入 SDK 前重新检查授权与期限。
-        started = time.monotonic_ns()
-        interval = started - self.last_send_ns if self.last_send_ns else 0
-        issue = self.command_issue(goal, started, first=pending is not None)
-        if issue is None and interval > int(SERVO_MAX_INTERVAL_S * 1e9):
-            issue = "servo interval exceeded; no catch-up sends"
-        if issue is None and started - now >= int(SERVO_MAX_INTERVAL_S * 1e9):
-            issue = "servo computation stalled before SDK"
+        # 计算结束后、进入 SDK 前统一检查期限、反馈和最新控制器上报。
+        issue = self.command_issue(goal, time.monotonic_ns(), first=pending is not None)
         if issue:
             if issue != "revoked":
                 raise RuntimeError(issue)
             self.io.stop.set()
-            return
+            return None
+        started = time.monotonic_ns()
         self.driver.servo(q)
-        completed = time.monotonic_ns()
-        self.last_send_ns = started
-        if completed - started >= int(SERVO_MAX_INTERVAL_S * 1e9):
-            raise TimeoutError("servo SDK blocked beyond interval budget")
+        return started
 
     def run(self):
         try:
-            self.driver.connect()
-            self.io.connected.set()
             run_id = self.io.run_id.value
 
             def startup_abort():
                 if not self.authorized(run_id):
-                    raise RuntimeError("arm startup authority revoked")
+                    raise OperationCancelled("arm startup authority revoked")
 
+            self.driver.connect(check_abort=startup_abort)
+            self.io.connected.set()
             self.wait_stationary(startup_abort)
             self.driver.initialize(check_abort=startup_abort)
             self.read_feedback()
@@ -306,38 +290,34 @@ class ArmController:
             period = round(1e9 / self.cfg.servo_hz)
             tick = time.monotonic_ns() + period
             feedback_due = time.monotonic_ns() + round(1e9 / self.cfg.feedback_hz)
-            while True:
+            while not self.io.closing.is_set() and not self.io.fault.value:
                 if self.io.stop.is_set() and not self.io.stopped.is_set():
                     self.stop()
-                if self.io.closing.is_set():
-                    break
+                    continue
                 if self.pipe.poll():
                     self.operation(self.pipe.recv())
                     tick = time.monotonic_ns() + period
                     feedback_due = time.monotonic_ns()
+                    continue
                 now = time.monotonic_ns()
                 if now >= tick:
-                    try:
-                        self.tick()
-                    except Exception as exc:
-                        self.fault(exc)
-                    tick = next_tick_ns(tick, period, time.monotonic_ns())
+                    sent_ns = self.tick()
+                    # 从实际发送时刻限频；晚发后不追赶旧时钟网格。
+                    tick = (sent_ns if sent_ns is not None else time.monotonic_ns()) + period
                 if self.active is not None and not self.authorized(int(self.active["run_id"])):
                     self.io.stop.set()
-                if time.monotonic_ns() >= feedback_due and not self.io.fault.value:
-                    try:
-                        self.read_feedback()
-                    except Exception as exc:
-                        self.fault(exc)
+                if time.monotonic_ns() >= feedback_due:
+                    self.read_feedback()
                     feedback_due = time.monotonic_ns() + round(1e9 / self.cfg.feedback_hz)
                 # 停止可中断等待，目标仅在计划的伺服时刻生效。
                 delay = max(0, min(tick, feedback_due) - time.monotonic_ns()) / 1e9
                 if self.io.stopped.is_set():
-                    self.pipe.poll(0.01 if self.io.fault.value else delay)
+                    self.pipe.poll(delay)
                 else:
                     self.io.stop.wait(delay)
         except BaseException as exc:
-            self.fault(exc)
+            if not isinstance(exc, OperationCancelled):
+                self.fault(exc)
         finally:
             self.io.ready.set()
             if not self.io.stopped.is_set():
@@ -356,14 +336,6 @@ class ArmController:
 
 
 def run_arm(cfg, io, pipe):
-    try:
-        from dexmani_real.robot.xarm7.driver import XArm7
+    from dexmani_real.robot.xarm7.driver import XArm7
 
-        driver = XArm7(cfg)
-    except BaseException as exc:
-        logger.exception("arm driver construction failed")
-        io.fault.value = f"driver construction failed: {exc}".encode()[:1023]
-        io.ready.set()
-        pipe.close()
-        return
-    ArmController(cfg, io, pipe, driver).run()
+    ArmController(cfg, io, pipe, XArm7(cfg)).run()

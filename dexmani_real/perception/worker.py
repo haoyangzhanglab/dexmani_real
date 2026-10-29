@@ -6,8 +6,6 @@ import logging
 import time
 from typing import TYPE_CHECKING, cast
 
-import numpy as np
-
 from dexmani_real.config.perception import PointCloudConfig
 from dexmani_real.geometry.camera import CameraSnapshot
 from dexmani_real.perception.pointcloud import PointCloudProcessor
@@ -61,10 +59,8 @@ def run_pointcloud_worker(
             last_camera_sequence = camera_sequence
 
             cloud = processor.process(data["depth"], data["rgb"])
-            if cloud is None:
+            if not len(cloud):
                 continue
-            if not np.isfinite(cloud).all():
-                raise ValueError("pointcloud contains nonfinite values")
             pointcloud_ring.write(
                 source_camera_sequence=camera_sequence,
                 timestamp_ns=data["timestamp_ns"],

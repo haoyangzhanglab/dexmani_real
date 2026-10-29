@@ -43,12 +43,6 @@ class ExportConfig:
     hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
 
-    def __post_init__(self) -> None:
-        if not self.pointcloud.remove_table:
-            object.__setattr__(self, "table_plane_abcd", None)
-        elif self.table_plane_abcd is None:
-            raise ValueError("remove_table=True requires an explicit table_plane_abcd")
-
 
 def canonical_array_specs(
     num_points: int,
@@ -236,7 +230,7 @@ def iter_canonical_blocks(
                     f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
                 )
             cloud = processor.process(depth[offset], image)
-            if cloud is None:
+            if not len(cloud):
                 raise ValueError(f"point_cloud unavailable at row {index}")
             rgb[offset], clouds[offset] = image, cloud
         block.update(rgb=rgb, depth=depth, point_cloud=clouds)

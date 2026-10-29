@@ -1,4 +1,4 @@
-"""对齐 RGB-D 到 xArm 基座系的 float32[N,6] XYZRGB 点云。"""
+"""对齐 RGB-D 到 xArm 基座系的 float32[N,6] XYZRGB；无有效点时返回 (0,6)。"""
 
 import cv2
 import numpy as np
@@ -42,9 +42,10 @@ def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
 
 
 def voxel_downsample(points: np.ndarray, colors: np.ndarray):
-    keys = np.floor(points / np.float32(VOXEL_SIZE_M)).astype(np.int64)
-    keys -= keys.min(axis=0)
-    packed = np.ravel_multi_index(keys.T, keys.max(axis=0) + 1)
+    # 每个坐标轴连续存放，减少逐轴归约的跨步访存。
+    keys = np.floor(points.T / np.float32(VOXEL_SIZE_M)).astype(np.int64, order="C")
+    keys -= keys.min(axis=1)[:, None]
+    packed = np.ravel_multi_index(keys, keys.max(axis=1) + 1)
     _, inverse = np.unique(packed, return_inverse=True)
     counts = np.bincount(inverse)
 
@@ -99,11 +100,9 @@ def build_raw_point_cloud(
     depth_scale_m: float,
     intrinsics: CameraIntrinsics,
     T_xarm_base_from_color: np.ndarray,
-) -> np.ndarray | None:
+) -> np.ndarray:
     depth_m = depth_raw.astype(np.float32) * np.float32(depth_scale_m)
     points, rows, columns = deproject_depth(depth_m, depth_raw > 0, intrinsics)
-    if len(points) == 0:
-        return None
     xyz = transform_points(points, T_xarm_base_from_color)
     rgb = color[rows, columns].astype(np.float32) / 255.0
     return np.column_stack((xyz, rgb))
@@ -137,7 +136,7 @@ class PointCloudProcessor:
             self.table_height_per_depth = rays @ plane_color[:3]
             self.table_offset = plane_color[3]
 
-    def process(self, depth_raw: np.ndarray, color: np.ndarray) -> np.ndarray | None:
+    def process(self, depth_raw: np.ndarray, color: np.ndarray) -> np.ndarray:
         depth_m = depth_raw.astype(np.float32) * self.depth_scale
         valid = filter_depth(depth_m)
         if self.config.remove_table:
@@ -147,15 +146,16 @@ class PointCloudProcessor:
         for axis in range(3):
             coordinate = self.rays_base[..., axis] * depth_m + self.translation[axis]
             valid &= (coordinate >= self.lower[axis]) & (coordinate <= self.upper[axis])
-        if not valid.any():
-            return None
-        points = self.rays_base[valid] * depth_m[valid, None] + self.translation
-        colors = color[valid].astype(np.float32) / 255.0
+        pixels = np.flatnonzero(valid)
+        if not len(pixels):
+            return np.empty((0, 6), dtype=np.float32)
+        points = self.rays_base.reshape(-1, 3)[pixels] * depth_m.ravel()[pixels, None] + self.translation
+        colors = color.reshape(-1, 3)[pixels].astype(np.float32) / 255.0
         points, colors = voxel_downsample(points, colors)
         keep = radius_inliers(points)
         points, colors = points[keep], colors[keep]
         if len(points) == 0:
-            return None
+            return np.empty((0, 6), dtype=np.float32)
 
         selected = sample_indices(points, self.config.num_points)
         return np.column_stack((points[selected], colors[selected]))

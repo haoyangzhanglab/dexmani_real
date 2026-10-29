@@ -31,9 +31,11 @@ CONTROLLER_ERROR_HELP: dict[int, str] = {
 
 @dataclass(frozen=True)
 class ControllerStatus:
+    mode: int
     state: int
     error_code: int
     warn_code: int
+    report_timestamp_ns: int
 
 
 def check_sdk_return_code(code: Any, operation: str) -> None:
@@ -52,18 +54,41 @@ class XArm7:
     def __init__(self, cfg: ArmConfig) -> None:
         self.cfg = cfg
         self.api: Any = None
+        self._status: ControllerStatus | None = None
 
     @property
     def is_connected(self) -> bool:
         return self.api is not None and bool(self.api.connected)
 
-    def connect(self) -> None:
+    def connect(self, *, check_abort) -> None:
+        check_abort()
         from xarm.wrapper import XArmAPI
 
-        self.api = XArmAPI(self.cfg.ip, is_radian=True)
+        # SDK 的启停提示使用独立 logger；保留控制器告警和错误。
+        logging.getLogger("origin.print").setLevel(logging.WARNING)
+        self.api = XArmAPI(
+            self.cfg.ip, is_radian=True, report_type="rich", max_callback_thread_count=0,
+        )
+        check_abort()
         self.api.set_timeout(SDK_TIMEOUT_S)
-        self.wait_for_axis_report()
+        self.api.register_report_callback(
+            self._on_report,
+            report_cartesian=False, report_joints=False,
+            report_state=True, report_error_code=True, report_warn_code=True,
+            report_mtable=False, report_mtbrake=False, report_cmd_num=False,
+        )
+        self.wait_for_report(check_abort)
         self.check_controller_error()
+
+    def _on_report(self, data):
+        # 在 SDK 上报线程内替换完整快照，不查询设备、不等待 IPC。
+        # rich 上报的速度字段在此回调之后才更新，关节位置/速度另用一次查询读取。
+        received_ns = time.monotonic_ns()
+        self._status = ControllerStatus(
+            mode=int(self.api.mode), state=int(data["state"]),
+            error_code=int(data["error_code"]), warn_code=int(data["warn_code"]),
+            report_timestamp_ns=received_ns,
+        )
 
     def initialize(self, *, check_abort):
         check_abort()
@@ -77,7 +102,7 @@ class XArm7:
     def stop(self) -> None:
         """SDK 接受停止请求不代表物理停稳。"""
         if self.api is None:
-            raise RuntimeError("stop has no connected SDK owner")
+            return  # 启动在 SDK 创建前取消，没有设备调用需要收尾。
         # SDK emergency_stop 丢弃返回码，因此直接检查 set_state(4)。
         code = self.api.set_state(4)
         check_sdk_return_code(code, "stop set_state(4)")
@@ -85,16 +110,20 @@ class XArm7:
     def close(self) -> None:
         if self.api is None:
             return
-        self.api.disconnect()
-        self.api = None
+        try:
+            self.api.release_report_callback(self._on_report)
+        finally:
+            self.api.disconnect()
+            self.api = None
+            self._status = None
 
     def read(self) -> tuple[np.ndarray, np.ndarray]:
         code, states = self.api.get_joint_states(is_radian=True, num=2)
         check_sdk_return_code(code, "get_joint_states")
         if not isinstance(states, (list, tuple)) or len(states) != 2:
             raise RuntimeError("get_joint_states(num=2) must return position and velocity")
-        qpos = np.asarray(states[0], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
-        qvel = np.asarray(states[1], dtype=np.float64)[: ARM_JOINT_SHAPE[0]].copy()
+        qpos = np.asarray(states[0], dtype=np.float64).copy()
+        qvel = np.asarray(states[1], dtype=np.float64).copy()
         if any(v.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(v)) for v in (qpos, qvel)):
             raise RuntimeError(
                 "get_joint_states returned invalid qpos/qvel shape or non-finite values"
@@ -106,19 +135,16 @@ class XArm7:
         code = self.api.set_servo_angle_j(angles=qpos.tolist(), is_radian=True)
         check_sdk_return_code(code, "servo")
 
-    def read_status(self):
-        code, state = self.api.get_state()
-        check_sdk_return_code(code, "get_state")
-        code, values = self.api.get_err_warn_code()
-        check_sdk_return_code(code, "get_err_warn_code")
-        return ControllerStatus(
-            state=int(state), error_code=int(values[0]), warn_code=int(values[1])
-        )
-
-    @property
-    def mode(self):
-        """SDK 缓存的模式，不是带来源时间的同步观测。"""
-        return int(self.api.mode)
+    def read_status(self) -> ControllerStatus:
+        """只消费上报快照；读取缓存不能延长上报寿命。"""
+        status = self._status
+        if not self.is_connected:
+            raise RuntimeError("xArm disconnected")
+        if status is None or not 0 < status.report_timestamp_ns <= time.monotonic_ns() < (
+            status.report_timestamp_ns + int(self.cfg.feedback_max_age_s * 1e9)
+        ):
+            raise RuntimeError("xArm status report unavailable/stale")
+        return status
 
     def move_home_milestone(self, target: np.ndarray) -> None:
         code = self.api.set_servo_angle(
@@ -137,24 +163,29 @@ class XArm7:
         check_abort()
         check_sdk_return_code(self.api.set_state(0), f"set_state(0) after Mode {mode}")
 
+        issued_ns = time.monotonic_ns()
         deadline = time.monotonic() + 1.0
         last: ControllerStatus | None = None
         while time.monotonic() < deadline:
             check_abort()
             last = self.read_status()
             check_abort()
+            if time.monotonic() >= deadline:
+                break
+            if last.error_code:
+                raise RuntimeError(f"controller error C{last.error_code} while entering Mode {mode}")
             if (
-                bool(self.api.connected)
-                and last.error_code == 0
-                and int(self.api.mode) == mode
-                and int(last.state) in (0, 1, 2)
+                last.report_timestamp_ns > issued_ns
+                and last.mode == mode
+                and last.state in (0, 1, 2)
             ):
                 return last.state
             time.sleep(0.03)
         check_abort()
         raise RuntimeError(
             f"controller postcondition failed: expected mode={mode} "
-            f"error=0 movable-state, got state={last.state if last else None} "
+            f"error=0 movable-state, got mode={last.mode if last else None} "
+            f"state={last.state if last else None} "
             f"error={last.error_code if last else None}"
         )
 
@@ -162,12 +193,16 @@ class XArm7:
     def axis(self) -> int:
         return int(self.api.axis)
 
-    def wait_for_axis_report(self) -> None:
+    def wait_for_report(self, check_abort) -> None:
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
-            if self.axis > 0:
+            check_abort()
+            if self._status is not None and self.axis > 0:
                 break
             time.sleep(0.05)
+        else:
+            check_abort()
+            raise TimeoutError("xArm initial status report unavailable")
         if self.axis != ARM_JOINT_SHAPE[0]:
             raise RuntimeError(f"device reports {self.axis} axes, expected {ARM_JOINT_SHAPE[0]}")
 
