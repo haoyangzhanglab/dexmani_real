@@ -66,6 +66,12 @@ class CameraReliabilityTests(unittest.TestCase):
         camera = realsense.RealSenseCamera(CameraConfig())
         camera.receive_frame(Frames(2, 2))
         camera.receive_frame(Frames(1, 3))
+        original_error = camera.callback_error
+        camera.receive_frame(SimpleNamespace(
+            as_frameset=Mock(side_effect=ValueError("subsequent frameset failure")),
+        ))
+        self.assertIs(camera.callback_error, original_error)
+        self.assertIsNone(camera.pending_frame)
         with self.assertRaisesRegex(RuntimeError, "moved backward"):
             camera.read()
 

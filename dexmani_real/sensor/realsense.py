@@ -161,7 +161,9 @@ class RealSenseCamera:
         except Exception as error:
             # Python 回调异常不能留在 SDK 线程中；交给设备 owner 的 read() 报告。
             with self.condition:
-                self.callback_error = error
+                if self.callback_error is None:
+                    self.callback_error = error
+                self.pending_frame = None
                 self.condition.notify()
 
     def read(self) -> RGBDFrame | None:
