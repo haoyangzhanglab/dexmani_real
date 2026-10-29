@@ -31,7 +31,6 @@ from dexmani_real.sensor.vr import run_vr
 from dexmani_real.teleop.audio import AudioFeedback
 from dexmani_real.teleop.loop import TeleopLoop, failure_reason
 from dexmani_real.teleop.vr import VRController
-from dexmani_real.utils.camera_calibrate.extrinsics import load_optional_camera_extrinsics
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.vr_heading import load_vr_transform
@@ -87,11 +86,6 @@ def run_teleop(
         runtime.environment,
         runtime.arm,
         table_plane_abcd=table_plane_abcd,
-    )
-    camera_calibration = (
-        load_optional_camera_extrinsics(camera_calibration_path)
-        if runtime.collection.enabled
-        else None
     )
     control_needs = ObservationNeeds(vr=True)
     record_needs = (
@@ -174,7 +168,7 @@ def run_teleop(
             loop.camera_snapshot = snapshot_camera_parameters(
                 channels,
                 runtime.camera,
-                camera_calibration,
+                camera_calibration_path,
             )
         robot.check()
         runtime_state.arm()
