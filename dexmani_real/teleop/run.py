@@ -152,7 +152,7 @@ def run_teleop(
         keyboard.start()
 
         def check_services():
-            if not keyboard.healthy or not sensors.check(names=("vr",)):
+            if not keyboard.check_health() or not sensors.check(names=("vr",)):
                 raise RobotError("teleop control service unavailable")
             if runtime.collection.enabled and not sensors.check(names=("camera",)):
                 raise RecordingError("recording camera process exited")
@@ -169,7 +169,7 @@ def run_teleop(
                 ),
                 ready=sensors.channels.camera_ready,
                 timeout_s=CAMERA_READY_TIMEOUT_S,
-                may_start=lambda: keyboard.healthy and runtime_state.requests_allow_motion(),
+                may_start=lambda: keyboard.check_health() and runtime_state.requests_allow_motion(),
             )
             loop.camera_snapshot = snapshot_camera_parameters(
                 channels,
@@ -238,11 +238,11 @@ def initialize_teleop(loop, vr_process) -> bool:
     loop.sensors.start(
         vr_process,
         ready=loop.sensors.channels.vr_ready,
-        may_start=lambda: loop.keyboard.healthy and loop.runtime_state.requests_allow_motion(),
+        may_start=lambda: loop.keyboard.check_health() and loop.runtime_state.requests_allow_motion(),
     )
     deadline = time.monotonic() + VR_READY_TIMEOUT_S
     while True:
-        if not loop.keyboard.healthy:
+        if not loop.keyboard.check_health():
             loop.runtime_state.request_emergency_stop()
         if loop.poll_blocking_commands():
             return False

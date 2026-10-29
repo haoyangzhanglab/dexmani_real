@@ -163,7 +163,7 @@ class Keyboard:
             self.saved_termios = None
 
     def poll(self, timeout=0.05) -> list[str]:
-        if self.active and not self.healthy:
+        if self.active and not self.check_health():
             timeout = 0
         with self.condition:
             if timeout > 0:
@@ -172,8 +172,7 @@ class Keyboard:
             self.events.clear()
             return events
 
-    @property
-    def healthy(self):
+    def check_health(self):
         healthy = bool(self.active and self.listener is not None and self.listener.is_alive())
         if not healthy and self.active:
             if not self.estop_latched:

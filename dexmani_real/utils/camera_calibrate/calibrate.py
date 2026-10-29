@@ -84,7 +84,7 @@ class CameraCalibrator:
         self.status = "SPACE=capture a stationary pose"
 
     def check_services(self):
-        return self.keys.healthy and self.sensors.check()
+        return self.keys.check_health() and self.sensors.check()
 
     def fault(self, reason, *, estop=False, run_end_reason=RunEndReason.HARDWARE_FAULT):
         if estop:
@@ -271,8 +271,15 @@ class CameraCalibrator:
             if self.cancel_requested():
                 return
             self.robot.check()
-            if event == "space":
-                self.capture_sample()
+            if event in ("space", "enter"):
+                try:
+                    if event == "space":
+                        self.capture_sample()
+                    else:
+                        self.solve_and_save()
+                finally:
+                    self.keys.discard_events("space", "enter", "backspace", "x", "r")
+                return  # 同一批次余下的一次性操作已基于旧场景。
             elif event == "backspace" and self.samples:
                 self.samples.pop()
                 self.result = None
@@ -288,15 +295,13 @@ class CameraCalibrator:
                     self.result = None
                     self.status = f"Removed sample #{worst + 1}; ENTER=recompute"
                     print(f"Removed sample #{worst + 1}; press ENTER to recompute")
-            elif event == "enter":
-                self.solve_and_save()
 
     def run(self) -> int:
         self.prepare()
         exit_code = 1
         try:
             self.keys.start()
-            if not self.keys.healthy:
+            if not self.keys.check_health():
                 raise RuntimeError("keyboard stop listener unavailable")
             self.robot.connect()
             self.sensors.start(
@@ -306,7 +311,7 @@ class CameraCalibrator:
                 ),
                 ready=self.sensors.channels.camera_ready,
                 timeout_s=CAMERA_READY_TIMEOUT_S,
-                may_start=lambda: self.keys.healthy and self.runtime_state.requests_allow_motion(),
+                may_start=lambda: self.keys.check_health() and self.runtime_state.requests_allow_motion(),
             )
             self.robot.check()
             self.runtime_state.arm()
@@ -382,7 +387,7 @@ class CameraCalibrator:
             ):
                 self.fault("runtime fault during calibration")
                 return 1
-            if not self.keys.healthy:
+            if not self.keys.check_health():
                 self.fault("keyboard listener exited", estop=True)
                 return 1
             if not self.sensors.check():
@@ -395,7 +400,6 @@ class CameraCalibrator:
                 return 0 if self.calibration_saved else 2
             self.show_preview()
             events = self.keys.poll(timeout=0)
-            self.handle_sample_events(events)
             if self.cancel_requested():
                 continue
             if "r" in events:
@@ -403,28 +407,33 @@ class CameraCalibrator:
                 if self.runtime_state.safety_state == SafetyState.FAULT:
                     return 1
                 continue
+            self.handle_sample_events(events)
+            if self.cancel_requested():
+                continue
             self.jog.step(self.robot, self.keys, self.runtime_state, self.runtime)
         return 0
 
     def run_home(self):
         logger.info("Returning home...")
-        self.jog.stop(self.robot, self.runtime_state)
-        home_result = home_arm(
-            self.runtime_state,
-            self.robot,
-            self.home_planner,
-            cancel_requested=self.cancel_requested,
-        )
-        if self.runtime_state.estop_request:
-            self.fault("operator e-stop during homing")
-            return
-        if not home_result.ok:
-            if home_result.interrupted:
-                logger.info("HOME cancelled: %s", home_result.reason)
-            else:
-                logger.warning("HOME failed: %s", home_result.reason)
-        self.keys.discard_events("r")
-        self.rate.reset()
+        try:
+            self.jog.stop(self.robot, self.runtime_state)
+            home_result = home_arm(
+                self.runtime_state,
+                self.robot,
+                self.home_planner,
+                cancel_requested=self.cancel_requested,
+            )
+            if self.runtime_state.estop_request:
+                self.fault("operator e-stop during homing")
+                return
+            if not home_result.ok:
+                if home_result.interrupted:
+                    logger.info("HOME cancelled: %s", home_result.reason)
+                else:
+                    logger.warning("HOME failed: %s", home_result.reason)
+        finally:
+            self.keys.discard_events("space", "enter", "backspace", "x", "r")
+            self.rate.reset()
 
     def prepare(self) -> None:
         configure_logging()

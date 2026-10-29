@@ -77,7 +77,7 @@ def run_replay(
             table_plane_abcd=table_plane_abcd,
         )
         keyboard.start()
-        robot.check_services = lambda: keyboard.healthy
+        robot.check_services = lambda: keyboard.check_health()
         robot.connect()
         robot.check()
         runtime_state.arm()
@@ -142,7 +142,7 @@ def wait_for_home(runtime_state, robot, keyboard, home_planner, outcome, home_re
     while runtime_state.running and not runtime_state.quit_requested:
         stopped_epoch = runtime_state.run_id
         robot.service_idle()
-        if not keyboard.healthy:
+        if not keyboard.check_health():
             runtime_state.request_emergency_stop()
         if runtime_state.error_state or runtime_state.estop_request:
             break
@@ -160,7 +160,7 @@ def wait_for_home(runtime_state, robot, keyboard, home_planner, outcome, home_re
                 home_planner,
                 cancel_requested=lambda: (
                     bool(runtime_state.estop_request or runtime_state.quit_requested)
-                    or not keyboard.healthy
+                    or not keyboard.check_health()
                 ),
             )
             keyboard.discard_events("h")

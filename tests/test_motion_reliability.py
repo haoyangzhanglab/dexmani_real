@@ -285,3 +285,68 @@ def test_dexpilot_reset_seeds_the_real_filter():
     retargeter.reset(np.full(12, 0.2))
     np.testing.assert_allclose(retargeter.previous_solution, 0.2)
     np.testing.assert_allclose(retargeter.filter.next(np.full(12, 0.8)), 0.26)
+
+
+def test_replay_admits_measured_start_then_prepares_that_posture(monkeypatch):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.replay import joint_replay
+
+    clock, runtime = Clock(), RealConfig()
+    monkeypatch.setattr(joint_replay.time, "monotonic_ns", clock.monotonic_ns)
+    state = SessionState(safety_state=SafetyState.ARMED)
+    robot = SimpleNamespace(prepare_streaming=Mock(), send_action=Mock())
+    replay = joint_replay.JointReplay(state, runtime, None, robot=robot)
+    replay.epoch = state.run_id
+    arm = np.asarray(runtime.arm.home_qpos)
+    measured = np.maximum(np.zeros(12), runtime.hand.qpos_min_rad)
+    action = measured.copy()
+    action[1] = np.deg2rad(40)
+    trajectory = SimpleNamespace(
+        arm_qpos=arm[None], hand_qpos=measured[None], action_hand_joint=action[None], fps=20,
+    )
+    row = SimpleNamespace(arm={"qpos": [arm]}, hand={"qpos": [measured], "timestamp_ns": [clock.now_ns]})
+
+    def feedback():
+        clock.advance(0.01)
+        row.hand["timestamp_ns"][0] = clock.now_ns
+        return row, clock.now_ns + 1_000_000_000
+
+    replay.read_feedback = feedback
+    status, _, _ = replay.admit_replay(trajectory)
+    assert status == joint_replay.ReplayStatus.COMPLETED
+    replay.wait_replay = lambda _: None
+    replay.action_mapper = SimpleNamespace(constraints=SimpleNamespace(rejection=lambda *_, **__: None))
+    assert replay.prepare_hand(trajectory, row, 0.05, 50_000_000) is None
+    for call in robot.send_action.call_args_list:
+        np.testing.assert_array_equal(call.args[0].hand_qpos, measured)
+    robot.send_action.reset_mock()
+    trajectory.hand_qpos = measured[None].copy()
+    trajectory.hand_qpos[0, 0] = runtime.hand.qpos_max_rad[0] + 0.1
+    with pytest.raises(ValueError, match="hand target violates"):
+        replay.prepare_hand(trajectory, row, 0.05, 50_000_000)
+    robot.send_action.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["space", "enter", "home"])
+def test_calibration_discards_old_one_shot_events_but_keeps_stop_and_held_keys(monkeypatch, action):
+    from dexmani_real.runtime.home import HomeResult
+    from dexmani_real.runtime.keyboard import Keyboard
+    from dexmani_real.utils.camera_calibrate import calibrate
+
+    keys = Keyboard()
+    keys.held_keys.update(("w", "q"))
+    keys.events.extend(("space", "enter", "backspace", "x", "r", "q", "esc"))
+    calibration = calibrate.CameraCalibrator.__new__(calibrate.CameraCalibrator)
+    calibration.keys, calibration.robot = keys, Mock()
+    calibration.cancel_requested = lambda: False
+    calibration.capture_sample, calibration.solve_and_save = Mock(), Mock()
+    if action == "home":
+        calibration.runtime_state = SimpleNamespace(estop_request=False)
+        calibration.jog, calibration.home_planner, calibration.rate = Mock(), Mock(), Mock()
+        monkeypatch.setattr(calibrate, "home_arm", lambda *_, **__: HomeResult(True))
+        calibration.run_home()
+    else:
+        calibration.handle_sample_events([action, "space", "enter", "backspace"])
+        assert calibration.capture_sample.call_count + calibration.solve_and_save.call_count == 1
+    assert list(keys.events) == ["q", "esc"]
+    assert keys.snapshot() == frozenset(("w", "q"))

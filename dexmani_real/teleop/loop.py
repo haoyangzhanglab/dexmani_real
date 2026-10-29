@@ -507,7 +507,7 @@ class TeleopLoop:
                 self.robot.service_idle()
             else:
                 self.robot.service_feedback()
-            if not self.keyboard.healthy:
+            if not self.keyboard.check_health():
                 self.runtime_state.request_emergency_stop()
             if self.runtime_state.estop_request or self.runtime_state.error_state:
                 self.abort_episode(

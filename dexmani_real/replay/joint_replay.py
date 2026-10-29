@@ -15,7 +15,7 @@ from dexmani_real.control.actions import (
 )
 from dexmani_real.control.constraints import wrap_nearest_equivalent
 from dexmani_real.replay.trajectory import ReplayBuffer
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError, validate_hand_target
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
@@ -67,7 +67,7 @@ class JointReplay:
         result = ReplayResult(ReplayStatus.COMPLETED)
         run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
         try:
-            result.status, result.reason, row = self.admit_replay(trajectory, hand_start_duration_s)
+            result.status, result.reason, row = self.admit_replay(trajectory)
             if result.status == ReplayStatus.COMPLETED:
                 if hand_start_duration_s > 0:
                     interrupted = self.prepare_hand(
@@ -122,7 +122,7 @@ class JointReplay:
             raise TimeoutError("replay feedback: " + "; ".join(issues))
         return row, deadline_ns
 
-    def admit_replay(self, trajectory, hand_start_duration_s):
+    def admit_replay(self, trajectory):
         self.robot.prepare_streaming(self.epoch)
         row, _ = self.read_feedback()
         start_arm = wrap_nearest_equivalent(
@@ -135,8 +135,6 @@ class JointReplay:
             (row.arm["qpos"][0], start_arm),
             (row.hand["qpos"][0], trajectory.hand_qpos[0]),
         ]
-        if hand_start_duration_s > 0:
-            start_pairs.append((row.hand["qpos"][0], trajectory.action_hand_joint[0]))
         if any(
             np.max(np.abs(measured - recorded)) > np.deg2rad(10)
             for measured, recorded in start_pairs
@@ -200,7 +198,7 @@ class JointReplay:
         while True:
             self.robot.check()
             signals = self.keyboard.poll(timeout=0)
-            if not self.keyboard.healthy:
+            if not self.keyboard.check_health():
                 self.runtime_state.request_emergency_stop()
             if self.runtime_state.estop_request:
                 return ReplayStatus.ESTOP, "operator emergency stop"
@@ -232,15 +230,15 @@ class JointReplay:
             qpos_min_rad=self.runtime.hand.qpos_min_rad,
             qpos_max_rad=self.runtime.hand.qpos_max_rad,
         )
-        hand_target = project_hand_command(
-            trajectory.action_hand_joint[0],
-            qpos_min_rad=self.runtime.hand.qpos_min_rad,
-            qpos_max_rad=self.runtime.hand.qpos_max_rad,
+        hand_target = validate_hand_target(
+            trajectory.hand_qpos[0],
+            self.runtime.hand.qpos_min_rad,
+            self.runtime.hand.qpos_max_rad,
         )
         steps = max(1, int(np.ceil(duration_s * trajectory.fps)))
         print(
-            f"XHand start: {steps * period_ns / 1e9:g}s ramp to first target, then wait for arrival. "
-            "Preparation is outside replay rows; initial hand state differs from Raw. "
+            f"XHand start: {steps * period_ns / 1e9:g}s ramp to first recorded measured posture, then wait for arrival. "
+            "Preparation is outside replay rows; recorded targets start afterwards. "
             "Q: stop; ESC: emergency stop",
             flush=True,
         )

@@ -92,9 +92,9 @@ class KeyboardTeleop:
             table_plane_abcd=self.table_plane_abcd,
         )
         self.keys.start()
-        if not self.keys.healthy:
+        if not self.keys.check_health():
             raise RuntimeError("keyboard stop listener unavailable")
-        self.robot.check_services = lambda: self.keys.healthy
+        self.robot.check_services = lambda: self.keys.check_health()
         self.robot.connect()
         self.robot.check()
         self.runtime_state.arm()
@@ -113,7 +113,7 @@ class KeyboardTeleop:
             if (
                 self.runtime_state.estop_request
                 or self.runtime_state.error_state
-                or not self.keys.healthy
+                or not self.keys.check_health()
             ):
                 break
             if self.runtime_state.quit_requested or self.keys.is_pressed("q"):
@@ -132,7 +132,7 @@ class KeyboardTeleop:
             self.runtime_state, self.robot, self.home_planner,
             cancel_requested=lambda: (
                 bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
-                or not self.keys.healthy
+                or not self.keys.check_health()
             ),
         )
         if not home_result.ok:

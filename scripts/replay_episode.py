@@ -48,7 +48,7 @@ Controls:
         type=float,
         default=0.5,
         help=(
-            "Seconds to ramp XHand to the first target before replay (default: 0.5). "
+            "Seconds to ramp XHand to the first recorded measured posture before replay (default: 0.5). "
             "Only small start differences are allowed; 0 skips the ramp. Startup preserves the current hand posture."
         ),
     )
