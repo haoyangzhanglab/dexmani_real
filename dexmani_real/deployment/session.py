@@ -200,9 +200,11 @@ class PolicySession:
                 timeout_s=CAMERA_READY_TIMEOUT_S,
                 may_start=lambda: self.keyboard.check_health() and self.runtime_state.requests_allow_motion(),
             )
+            needs_extrinsics = self.needs.point_cloud or "camera_extrinsic" in self.info.observation_fields
             self.camera_snapshot = snapshot_camera_parameters(
                 self.sensors.channels, self.runtime.camera, self.camera_calibration_path,
-                require_extrinsics=self.needs.point_cloud or "camera_extrinsic" in self.info.observation_fields,
+                require_extrinsics=needs_extrinsics,
+                include_extrinsics=needs_extrinsics or self.record_raw,
             )
         self.observations.configure_camera(self.camera_snapshot)
         if self.camera_snapshot is not None:

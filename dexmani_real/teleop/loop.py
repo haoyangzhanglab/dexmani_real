@@ -201,6 +201,27 @@ class TeleopLoop:
             run_id=self.run_id, required_safety_state=SafetyState.ARMED,
         )
 
+    def preparation_interrupted(self):
+        if self.phase is not TeleopPhase.PREPARING:
+            return True
+        self.poll_blocking_commands()
+        if self.phase is not TeleopPhase.PREPARING:
+            return True
+        with self.runtime_state.motion_lock:
+            # 授权与停止分类使用同一份状态，避免回调在两次读取之间撤权。
+            if self.preparation_valid():
+                return False
+            if (
+                self.runtime_state.stop_request
+                and self.runtime_state.running
+                and not self.runtime_state.estop_request
+                and not self.runtime_state.error_state
+            ):
+                # 回调已撤权但按键可能尚未入队；保留本轮，由主循环处理保存/丢弃/退出。
+                return True
+        self.abort_episode("preparation_revoked")
+        return True
+
     def start_episode(self, expected_run_id):
         if self.phase is not TeleopPhase.IDLE:
             return
@@ -220,8 +241,7 @@ class TeleopLoop:
             self.run_id = self.runtime_state.run_id
             self.phase = TeleopPhase.PREPARING
         self.robot.stop()
-        if not self.preparation_valid():
-            self.abort_episode("preparation_revoked")
+        if self.preparation_interrupted():
             return
 
         self.robot.reset_hand_feedback()
@@ -237,11 +257,13 @@ class TeleopLoop:
             row = read_observation(self.sensors.channels, self.robot, needs=self.needs)
             issues, _ = self.admit_observation(row)
         except OperationCancelled:
-            if self.phase is TeleopPhase.PREPARING:
+            if not self.preparation_interrupted():
                 self.abort_episode("preparation_revoked")
             return
-        if issues or not self.preparation_valid():
+        if issues:
             self.abort_episode("preparation_unavailable")
+            return
+        if self.preparation_interrupted():
             return
 
         if self.recording_dir is not None:
@@ -257,15 +279,17 @@ class TeleopLoop:
                 ),
             )
         self.capture_started_s = time.monotonic()
+        if self.preparation_interrupted():
+            return
         try:
             self.robot.prepare_streaming(self.run_id)
         except OperationCancelled:
-            self.abort_episode("preparation_revoked")
+            if not self.preparation_interrupted():
+                self.abort_episode("preparation_revoked")
             return
         # 锚点与反馈必须来自 prepare 完成之后。
         self.prepared_after_ns = time.monotonic_ns()
-        if not self.preparation_valid():
-            self.abort_episode("preparation_revoked")
+        self.preparation_interrupted()
 
     def handle_operator_command(self, cmd, *, home_commands=(), expected_run_id=None):
         if cmd == "esc":
@@ -335,8 +359,7 @@ class TeleopLoop:
                 break
 
     def try_begin(self, row):
-        if not self.preparation_valid():
-            self.abort_episode("preparation_revoked")
+        if self.preparation_interrupted():
             return
         stamps = [row.arm["timestamp_ns"][0], row.vr["recv_ts_ns"]]
         if row.hand is not None:
@@ -347,7 +370,8 @@ class TeleopLoop:
         with self.runtime_state.motion_lock:
             authorized = self.preparation_valid() and self.runtime_state.begin_motion()
         if not authorized:
-            self.abort_episode("begin_unavailable")
+            if not self.preparation_interrupted():
+                self.abort_episode("begin_unavailable")
             return
         self.phase = TeleopPhase.ACTIVE
         self.tick_origin_ns = None
@@ -438,6 +462,8 @@ class TeleopLoop:
         return issues, feedback_until_ns
 
     def run_control_tick(self):
+        if self.phase is TeleopPhase.PREPARING and self.preparation_interrupted():
+            return
         if (
             self.recorder is not None
             and self.recorder.is_recording

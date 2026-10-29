@@ -67,7 +67,10 @@ class StaticCollisionBox:
 
 @dataclass(frozen=True)
 class TableCollisionConfig:
+    """HOME 的标定桌面几何与软间隙；在线 MotionConstraints 不使用此配置。"""
+
     enabled: bool = True
+    # 此标定平面路径也供点云去桌面和诊断工具使用。
     plane_path: str | None = TABLE_PLANE_RELATIVE_PATH
     size_xy_m: tuple[float, float] = (2.0, 2.0)
     thickness_m: float = 0.04
@@ -97,9 +100,11 @@ class TableCollisionConfig:
 class EnvironmentConfig:
     workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
     eef_workspace_margin_m: float = 0.005
+    # HOME 未启用标定桌面模型时使用的手部 frame 高度代理。
     table_z_surface_m: float = 0.022
     hand_safety_margin_m: float = 0.05
     table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
+    # HOME 与在线 MotionConstraints 共同使用的静态障碍物。
     static_boxes: tuple[StaticCollisionBox, ...] = ()
 
     def validate(self) -> None:

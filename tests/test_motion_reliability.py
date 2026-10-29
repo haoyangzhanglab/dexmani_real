@@ -212,6 +212,250 @@ def teleop_loop():
     return loop
 
 
+@pytest.fixture
+def teleop_preparation(monkeypatch, tmp_path):
+    from dexmani_real.runtime.keyboard import Keyboard
+    from dexmani_real.runtime.state import RunEndReason
+    from dexmani_real.teleop import loop as teleop
+
+    loop = teleop_loop()
+    state = loop.runtime_state
+    state.safety_state = SafetyState.ARMED
+    loop.phase, loop.run_id, loop.recorder = teleop.TeleopPhase.IDLE, None, None
+    loop.recording_dir, loop.sensors = tmp_path, SimpleNamespace(channels=None)
+    loop.robot.reset_hand_feedback = Mock()
+    loop.robot.read_initial_state = Mock()
+    loop.robot.prepare_streaming = Mock(side_effect=lambda _: state.stop_signal.clear())
+    loop.robot.hand = SimpleNamespace(get_tactile_reset_metadata=lambda: {})
+    loop.robot.arm = SimpleNamespace(check_error=Mock())
+    loop.robot.service_feedback = Mock()
+    loop.keyboard = Keyboard(bindings={
+        "s": state.request_stop,
+        "q": lambda: state.request_stop(reason=RunEndReason.QUIT),
+        "d": loop.request_discard,
+    })
+    loop.keyboard.active = True
+    loop.keyboard.listener = SimpleNamespace(is_alive=Mock(return_value=True))
+    recorder = Mock(start_attempted=True, published_path=None, is_recording=True)
+    recorder.finish.side_effect = lambda **kwargs: tmp_path if kwargs["save"] else None
+    row = SimpleNamespace(arm={"timestamp_ns": [10**30]}, vr={"recv_ts_ns": 10**30}, hand=None)
+    monkeypatch.setattr(teleop, "EpisodeRecorder", lambda *_, **__: recorder)
+    monkeypatch.setattr(teleop, "snapshot_recording_metadata", lambda *_, **__: {})
+    monkeypatch.setattr(teleop, "read_observation", Mock(return_value=row))
+    loop.admit_observation = Mock(return_value=((), 0))
+    return loop, recorder, row
+
+
+def test_teleop_preparation_still_admits_motion(teleop_preparation):
+    from dexmani_real.teleop.loop import TeleopPhase
+
+    loop, recorder, row = teleop_preparation
+    loop.start_episode(loop.runtime_state.run_id)
+    assert loop.phase is TeleopPhase.PREPARING
+    loop.try_begin(row)
+    assert loop.phase is TeleopPhase.ACTIVE
+    assert loop.runtime_state.can_move(run_id=loop.run_id)
+    loop.controller.reset.assert_called_once_with(row)
+    recorder.finish.assert_not_called()
+
+
+def interrupt_preparation(loop, recorder, row, stage, interrupt):
+    from dexmani_real.robot.commands import OperationCancelled
+
+    def cancel(*_, **__):
+        interrupt()
+        raise OperationCancelled("revoked during preparation")
+
+    if stage == "stop":
+        loop.robot.stop.side_effect = interrupt
+    elif stage == "initial":
+        loop.robot.read_initial_state.side_effect = cancel
+    elif stage == "observation":
+        loop.admit_observation.side_effect = lambda _: (interrupt() or (), 0)
+    elif stage == "recording":
+        recorder.start.side_effect = interrupt
+    elif stage in ("streaming", "prepared"):
+        loop.robot.prepare_streaming.side_effect = cancel if stage == "streaming" else interrupt
+    loop.start_episode(loop.runtime_state.run_id)
+    if stage == "begin":
+        interrupt()
+        loop.try_begin(row)
+    elif stage == "authorization":
+        loop.controller.reset.side_effect = interrupt
+        loop.try_begin(row)
+
+
+@pytest.mark.parametrize("command", ["s", "q", "d"])
+@pytest.mark.parametrize("stage", ["stop", "initial", "observation", "recording", "streaming", "prepared", "begin", "authorization"])
+def test_teleop_preparing_queued_cancel_keeps_command_semantics(teleop_preparation, command, stage):
+    from dexmani_real.teleop.loop import TeleopPhase
+
+    loop, recorder, row = teleop_preparation
+    interrupt_preparation(loop, recorder, row, stage, lambda *_, **__: loop.keyboard.handle_key(command, True))
+    assert loop.phase is TeleopPhase.IDLE
+    assert loop.runtime_state.quit_requested == (command == "q")
+    assert not loop.capture_failed
+    assert not loop.runtime_state.stop_request
+    loop.controller.clear.assert_called_once()
+    if recorder.start.called:
+        recorder.finish.assert_called_once()
+        assert recorder.finish.call_args.kwargs["save"] == (command != "d")
+        assert recorder.finish.call_args.kwargs["technical_status"] == "normal"
+        assert recorder.finish.call_args.kwargs["reason"] == ("quit" if command == "q" else "operator")
+    else:
+        recorder.finish.assert_not_called()
+    assert all(call.args[0] != "emergency" for call in loop.audio.play.call_args_list)
+
+
+@pytest.mark.parametrize("command", ["s", "q", "d"])
+@pytest.mark.parametrize("stage", ["streaming", "prepared", "begin", "authorization"])
+def test_teleop_preparing_cancel_before_event_publication(teleop_preparation, monkeypatch, command, stage):
+    from threading import Event, Thread
+    from dexmani_real.teleop import loop as teleop
+
+    loop, recorder, row = teleop_preparation
+    loop.runtime_state.begin_motion = Mock(wraps=loop.runtime_state.begin_motion)
+    revoked, publish = Event(), Event()
+    callback = loop.keyboard.bindings[command]
+    failures = []
+
+    def delayed_callback():
+        callback()
+        revoked.set()
+        if not publish.wait(5):
+            raise TimeoutError("test did not release keyboard callback")
+
+    loop.keyboard.bindings[command] = delayed_callback
+
+    def press():
+        try:
+            loop.keyboard.handle_key(command, True)
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = Thread(target=press)
+
+    def interrupt(*_, **__):
+        thread.start()
+        assert revoked.wait(5)
+
+    try:
+        interrupt_preparation(loop, recorder, row, stage, interrupt)
+        assert loop.phase is teleop.TeleopPhase.PREPARING
+        assert loop.recorder is recorder
+        assert loop.runtime_state.stop_request
+        assert not loop.runtime_state.quit_requested  # Q 的早期回调只撤权。
+        recorder.finish.assert_not_called()
+        loop.runtime_state.begin_motion.assert_not_called()
+        teleop.read_observation.reset_mock()
+        loop.keyboard.listener.is_alive.reset_mock()
+        loop.capture_started_s = 0  # 等待命令时也不能被录制时长判断抢先结束。
+        tick = loop.run_control_tick
+
+        def one_tick():
+            tick()
+            raise StopIteration("one controlled main-loop iteration")
+
+        monkeypatch.setattr(loop, "run_control_tick", one_tick)
+        with pytest.raises(StopIteration, match="controlled main-loop"):
+            loop.run()
+        loop.robot.service_feedback.assert_called_once()
+        loop.robot.arm.check_error.assert_called_once()
+        loop.keyboard.listener.is_alive.assert_called()
+        recorder.check_error.assert_called_once()
+        teleop.read_observation.assert_not_called()
+        loop.runtime_state.begin_motion.assert_not_called()
+        recorder.finish.assert_not_called()
+        assert not loop.capture_failed
+    finally:
+        publish.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert not failures
+    loop.handle_commands(loop.keyboard.poll(timeout=0), loop.runtime_state.run_id)
+    loop.preparation_interrupted()  # 已结束的阶段不能再次结束 episode。
+    assert loop.phase is teleop.TeleopPhase.IDLE
+    assert loop.runtime_state.quit_requested == (command == "q")
+    recorder.finish.assert_called_once()
+    assert recorder.finish.call_args.kwargs["save"] == (command != "d")
+    assert recorder.finish.call_args.kwargs["technical_status"] == "normal"
+    assert not loop.capture_failed
+
+
+@pytest.mark.parametrize("command", ["s", "q", "d"])
+def test_teleop_preparing_stop_during_validity_check(teleop_preparation, monkeypatch, command):
+    from dexmani_real.teleop.loop import TeleopPhase
+
+    loop, recorder, _ = teleop_preparation
+    loop.start_episode(loop.runtime_state.run_id)
+    preparation_valid = loop.preparation_valid
+
+    def revoke_before_validation():
+        # 精确落在 helper 消费队列之后、观察到授权失效之前。
+        loop.keyboard.handle_key(command, True)
+        return preparation_valid()
+
+    monkeypatch.setattr(loop, "preparation_valid", revoke_before_validation)
+    assert loop.preparation_interrupted()
+    assert loop.phase is TeleopPhase.PREPARING
+    assert loop.runtime_state.stop_request
+    assert loop.recorder is recorder
+    assert not loop.capture_failed
+    recorder.finish.assert_not_called()
+
+    loop.handle_commands(loop.keyboard.poll(timeout=0), loop.runtime_state.run_id)
+    assert loop.phase is TeleopPhase.IDLE
+    assert loop.runtime_state.quit_requested == (command == "q")
+    recorder.finish.assert_called_once()
+    assert recorder.finish.call_args.kwargs["save"] == (command != "d")
+    assert recorder.finish.call_args.kwargs["technical_status"] == "normal"
+
+
+@pytest.mark.parametrize("failure", ["timeout", "sdk", "recording", "service", "estop", "runtime", "unexplained"])
+def test_teleop_preparing_cancel_does_not_hide_failure(teleop_preparation, failure):
+    from dexmani_real.data.recorder import RecordingError
+    from dexmani_real.robot.commands import OperationCancelled, RobotError
+
+    loop, recorder, _ = teleop_preparation
+
+    def prepare(*_):
+        if failure != "unexplained":
+            loop.runtime_state.request_stop()
+        if failure in ("timeout", "sdk", "recording"):
+            raise {"timeout": TimeoutError, "sdk": RobotError, "recording": RecordingError}[failure]("independent failure")
+        if failure == "service":
+            loop.robot.check.side_effect = RobotError("independent service failure")
+        elif failure == "estop":
+            loop.runtime_state.request_emergency_stop()
+        elif failure == "runtime":
+            loop.runtime_state.mark_error()
+        raise OperationCancelled("preparation interrupted")
+
+    loop.robot.prepare_streaming.side_effect = prepare
+    if failure in ("timeout", "sdk", "recording", "service"):
+        with pytest.raises((TimeoutError, RobotError, RecordingError), match="independent") as caught:
+            loop.start_episode(loop.runtime_state.run_id)
+        loop.record_error("runtime", caught.value)
+        loop.close()
+    else:
+        loop.start_episode(loop.runtime_state.run_id)
+    assert loop.capture_failed
+    assert recorder.finish.call_args.kwargs["technical_status"] == "failed"
+
+
+def test_teleop_preparing_observation_failure_is_not_cancellation(teleop_preparation):
+    loop, recorder, _ = teleop_preparation
+
+    def invalid_observation(_):
+        loop.runtime_state.request_stop()
+        return ("independent stale observation",), 0
+
+    loop.admit_observation.side_effect = invalid_observation
+    loop.start_episode(loop.runtime_state.run_id)
+    assert loop.capture_failed
+    recorder.start.assert_not_called()
+
+
 @pytest.mark.parametrize("reason_name,phase", [("OPERATOR", "compute"), ("QUIT", "send")])
 def test_teleop_operator_cancellation_keeps_completed_rows(reason_name, phase):
     import time

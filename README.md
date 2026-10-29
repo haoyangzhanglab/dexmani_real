@@ -73,6 +73,10 @@ SDK 连接与伺服由机械臂子进程持有。关节反馈默认 25 Hz，每�
 
 HOME 保留直达、近端优先、远端优先及等价关节分支，按关节行程与逐段停稳开销选择通过校验的完整路径，终点始终为配置中的绝对 HOME 关节角。规划先检查公共端点和路径中点以快速拒绝无效路径，仍按不大于 1° 的关节步长完整检查碰撞、工作空间和桌面间隙；几何查询仅在单次规划内复用。停稳时长从首个合格样本查询完成算到后续合格样本查询开始，排除首尾查询的等待时间；超出本阶段期限的查询不能确认到达。
 
+HOME 的 `HomePlanner` 使用 `environment.table`、标定平面和 `soft_clearance_m` 检查桌面；关闭该桌面模型时，仍用 `table_z_surface_m` 与 `hand_safety_margin_m` 检查手部 frame 高度代理。在线 `MotionConstraints` 的环境碰撞模型只加入 `environment.static_boxes`，不会自动继承 HOME 的桌面几何、软间隙或高度代理规则。`static_boxes` 同时用于 HOME 与在线目标检查；HOME 的桌面检查不能作为在线抓取具有同等桌面保护的依据。
+
+`environment.table.plane_path` 也供点云去桌面和诊断工具使用；`pointcloud.remove_table` 只裁剪观测点云，不执行机器人碰撞检查。
+
 键盘与标定 jog 的目标执行期限均从机械臂反馈的来源时间计算，读取缓存不会延长目标寿命。机械臂进程独立检查目标执行期限、机械臂反馈时效和控制器状态，HOME 另有执行期限。执行或反馈故障会保留原始原因，停止、断开设备并退出机械臂进程。父进程阻塞时，机械臂仍按这些条件处理停止；软件期限不代表物理停止延迟。
 
 策略执行与轨迹逐帧回放每次提交目标时设置 2 秒执行期限；持续收到新目标就刷新期限，断流后由机械臂进程检查并停止。策略等待下一动作也使用这一预算，实验总时长仍限制执行期限。每轮首次历史准备另有 `(n_obs_steps-1)*dt + 2 秒` 的有限预算，首次提交预测后开始独立的 2 秒推理等待；实验总时长从 RUNNING 准入起计算，包含本轮历史准备。sync 收到预测后开始完整控制周期，来源时效与总期限仍生效。回放开始前的手部准备另按到位等待期限保持机械臂。
@@ -118,7 +122,9 @@ RealSense 和点云诊断使用 OpenCV RGB-D 面板及 Open3D 点云窗口，需
 python scripts/generate_hand_template.py --num-points 1024 --overwrite
 ```
 
-Canonical 保留完整 URDF，`processing_source` 记录加工模块及固定模板来源；实验应固定配套代码与资产版本。修改加工算法或模板后须重新导出数据，不能只复用同名配置或模板文件。没有实际 sampler/点云的耗时和内存收益证据时，保留当前 Zarr chunks、邻居枚举、冻结目标几何检查及两套 FK。
+Canonical 保留实际 `source_id`、影响数值结果的处理配方及完整 URDF。实验复现由人工记录 `source_id → 导出使用的 Real commit SHA、训练使用的 Policy commit SHA、手模板路径`，示例见 [Policy 的实验产物说明](https://github.com/haoyangzhanglab/dexmani_policy#实验产物)。Git 已跟踪的模板可按对应提交和路径恢复；不同处理阶段使用不同版本时分别记录。未提交的代码或自定义模板应随实验手动归档，或先提交再记录；已有实验缺失的来源信息须如实保留为未知。
+
+修改加工算法或模板后须重新导出数据，不能只复用同名配置或模板文件。没有实际 sampler/点云的耗时和内存收益证据时，保留当前 Zarr chunks、邻居枚举、冻结目标几何检查及两套 FK。
 
 ## 数据与代码导航
 
@@ -152,3 +158,26 @@ Canonical 默认保持固定周期有效前缀、完整 13 模态，并对真实
 | [scripts/](scripts/) | 实验与工具入口 |
 
 CordVIP 对象重建与跟踪见 [scripts/cordvip/README.md](scripts/cordvip/README.md)。依赖配置见 [pyproject.toml](pyproject.toml)，开发约定见 [AGENTS.md](AGENTS.md)。
+
+## 测试
+
+在仓库根目录、已激活的 Python 3.10+ 环境中运行统一入口：
+
+```bash
+python -m pip install -e . pytest
+python -m pytest tests
+```
+
+完整测试另需 `control` 中的 Ruckig、`dex_retargeting`、关联 `dexmani_policy` 及其 PyTorch、torchvision、Hydra/OmegaConf 依赖，并安装可选 CordVIP 包：`python -m pip install -e third_party/cordvip_geometry`。导出测试还需 Pinocchio，以及源码 checkout 中的 URDF 和默认手点云模板 `assets/pointcloud_template/hand/hand_1024.npz`。
+
+现有测试隔离了设备与模型调用，无需连接机器人、相机、GPU 或下载模型权重；它们不验证真实权重加载、GPU 推理、机器人执行或真实几何碰撞效果。使用 `pytest` 能同时收集现有 unittest 类与 pytest 自由函数测试。
+
+依赖不齐时可直接运行以下现有子集：
+
+```bash
+# 项目基础依赖；不需设备 SDK、Policy、Ruckig 或 CordVIP
+python -m pytest tests/test_camera_optional_reliability.py
+
+# 基础依赖、Pinocchio、源码 URDF 与手点云模板
+python -m pytest tests/test_export_reliability.py
+```

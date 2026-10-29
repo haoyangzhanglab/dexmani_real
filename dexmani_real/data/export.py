@@ -357,12 +357,6 @@ def create_store(path, processing, camera, *, task, control_hz):
         hand_pointcloud_config=asdict(processing.hand_pointcloud),
         fingertip_link_names=list(XHAND_FINGERTIP_LINK_NAMES),
         kinematics_urdf=XARM7_XHAND_RIGHT_URDF_PATH.read_text(encoding="utf-8"),
-        processing_source=dict(
-            repository="https://github.com/haoyangzhanglab/dexmani_real",
-            pointcloud="dexmani_real/perception/pointcloud.py",
-            hand_geometry="dexmani_real/perception/hand_cloud.py",
-            hand_template=f"assets/pointcloud_template/hand/hand_{processing.hand_pointcloud.num_points}.npz",
-        ),
         table_plane_abcd=processing.table_plane_abcd,
         depth_scale_m_per_unit=camera.depth_scale_m,
         timing_admission=dict(

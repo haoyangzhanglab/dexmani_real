@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -68,6 +68,176 @@ class DeploymentTests(unittest.TestCase):
         )
         (path / "config.yaml").write_text(yaml.safe_dump(cfg))
         return inspect_policy(path, checkpoint="latest")
+
+    def camera_session(self, directory, fields, *, record_raw, calibration_path):
+        session = PolicySession.__new__(PolicySession)
+        session.runtime = load_config()
+        session.info = SimpleNamespace(observation_fields=fields, depth_config={"depth_scale_m": .001})
+        dependencies = policy_dependencies(fields)
+        control_needs = policy_needs(dependencies)
+        session.needs = control_needs.union(
+            ObservationNeeds(camera_fields=("rgb", "depth")) if record_raw else ObservationNeeds()
+        )
+        camera = session.runtime.camera
+        channels = SimpleNamespace(
+            camera_ready=SimpleNamespace(is_set=lambda: True),
+            pointcloud_ready=None,
+            camera_serial=SimpleNamespace(value=b"selected"),
+            camera_depth_scale=SimpleNamespace(value=.001),
+            camera_intrinsics=SimpleNamespace(value=json.dumps(dict(
+                width=camera.width, height=camera.height, fx=1, fy=1, ppx=0, ppy=0,
+                distortion_model="none", distortion_coeffs=[0] * 5,
+            )).encode()),
+        )
+        session.record_raw, session.camera_calibration_path = record_raw, calibration_path
+        session.runtime_state = SessionState()
+        session.robot, session.keyboard = Mock(), Mock()
+        session.observations = ObservationBuilder(
+            session.info, session.runtime, dependencies=dependencies, needs=control_needs,
+        )
+        session.sensors = SimpleNamespace(channels=channels, start=Mock(), shutdown=Mock(return_value=True))
+        session.process_context = SimpleNamespace(Process=Mock())
+        session.output_dir, session.run_config = Path(directory), {}
+        session.table_plane_abcd = None
+        session.warmup_policy = Mock()
+        return session
+
+    def test_deployment_reads_extrinsics_only_for_consumers_or_recording(self):
+        from dexmani_real.utils.camera_calibrate import extrinsics
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cameras.json"
+            fields = ("rgb", "depth", "camera_intrinsic")
+            cases = (({}, KeyError), ({"selected": {"T_base_from_camera": "broken"}}, ValueError))
+            for contents, error in cases:
+                path.write_text(json.dumps(contents))
+                with self.subTest(contents=contents, consumer="rgb/depth/intrinsic"):
+                    session = self.camera_session(directory, fields, record_raw=False, calibration_path=path)
+                    session.start_devices()
+                    self.assertIsNone(session.camera_snapshot.T_xarm_base_from_color)
+                    self.assertEqual(session.runtime_state.safety_state, SafetyState.ARMED)
+                    self.assertEqual(set(session.observations.camera_parameters), {"camera_intrinsic"})
+                for required in (("point_cloud",), ("camera_extrinsic",)):
+                    with self.subTest(contents=contents, consumer=required):
+                        session = self.camera_session(directory, required, record_raw=False, calibration_path=path)
+                        with self.assertRaises(error):
+                            session.start_devices()
+                        session.warmup_policy.assert_not_called()
+                with self.subTest(contents=contents, recording=True):
+                    session = self.camera_session(directory, fields, record_raw=True, calibration_path=path)
+                    with self.assertRaises(error):
+                        session.start_devices()
+
+            transform = np.eye(4)
+            transform[0, 3] = .4
+            path.write_text(json.dumps({"selected": {"T_base_from_camera": transform.tolist()}}))
+            for requested, record_raw in ((("point_cloud",), False), (("camera_extrinsic",), False), (fields, True)):
+                with self.subTest(consumer=requested, recording=record_raw):
+                    session = self.camera_session(directory, requested, record_raw=record_raw, calibration_path=path)
+                    session.start_devices()
+                    np.testing.assert_array_equal(session.camera_snapshot.T_xarm_base_from_color, transform)
+                    self.assertEqual(session.run_config["effective_camera"]["camera_T_xarm_base_from_color"],
+                                     transform.ravel().tolist())
+
+            missing = Path(directory) / "missing.json"
+            for record_raw in (False, True):
+                with self.subTest(default_calibration_missing=True, recording=record_raw):
+                    session = self.camera_session(directory, fields, record_raw=record_raw, calibration_path=None)
+                    with patch.object(extrinsics, "CAMERAS_PATH", missing):
+                        session.start_devices()
+                    self.assertIsNone(session.camera_snapshot.T_xarm_base_from_color)
+            for required in (("point_cloud",), ("camera_extrinsic",)):
+                with self.subTest(default_calibration_missing=True, consumer=required):
+                    session = self.camera_session(directory, required, record_raw=False, calibration_path=None)
+                    with patch.object(extrinsics, "CAMERAS_PATH", missing), self.assertRaises(FileNotFoundError):
+                        session.start_devices()
+
+    def test_dataset_metadata_to_saved_config_and_public_inspect(self):
+        import zarr
+        from omegaconf import OmegaConf
+
+        from dexmani_policy.training.common.config import assemble_effective_config
+        from dexmani_policy.training.common.data import build_dataset
+        from dexmani_policy.training.common.logging import ExperimentLogger
+        from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "data.zarr"
+            runtime = load_config(overrides={
+                "pointcloud": {"num_points": 8, "remove_table": False},
+                "hand_pointcloud": {"num_points": 16},
+            })
+            attrs = dict(
+                format="dexmani.real.canonical", source_id="integration-source", dt=.05,
+                depth_scale_m_per_unit=.001,
+                pointcloud_config=asdict(runtime.pointcloud),
+                hand_pointcloud_config=asdict(runtime.hand_pointcloud),
+                fingertip_link_names=list(XHAND_FINGERTIP_LINK_NAMES),
+                processing_source={"repository": "legacy-constant"},
+            )
+            store = zarr.open_group(str(data_path), mode="w")
+            store.attrs.update(attrs)
+            attrs = dict(zarr.open_group(str(data_path), mode="r").attrs)
+            arrays = store.create_group("data")
+            for name, shape in dict(
+                joint_state=(2, 19), action=(2, 19), depth=(2, *runtime.camera.depth_shape),
+                point_cloud=(2, runtime.pointcloud.num_points, 6),
+                hand_pointcloud=(2, runtime.hand_pointcloud.num_points, 6),
+                fingertip_xyz=(2, 5, 3), finger_tactile_force=(2, 5, 3),
+            ).items():
+                arrays.create_dataset(name, data=np.zeros(shape, dtype=np.uint16 if name == "depth" else np.float32))
+            store.create_group("meta").create_dataset("episode_ends", data=np.array([2], dtype=np.int64))
+            modalities = [name for name in arrays if name != "action"]
+            cfg = OmegaConf.create(dict(
+                policy_name="test", task_name="test", action_key="action", tactile_source="real",
+                eval=dict(use_ema=False, inference_steps=1),
+                agent=dict(n_obs_steps=1, n_action_steps=1, horizon=1, action_dim=19),
+                normalization=(
+                    {name: "identity" for name in modalities} | {"action": "limits", "joint_state": "limits"}
+                ),
+                training=dict(lr_scheduler="cosine"),
+                dataset=dict(
+                    _target_="dexmani_policy.datasets.common.robot_dataset.RobotDataset",
+                    zarr_path=str(data_path), sensor_modalities=modalities,
+                    horizon=1, obs_horizon=1, val_ratio=0, tactile_source="real",
+                ),
+            ))
+            dataset, description = build_dataset(cfg, verbose=False)
+            model = SimpleNamespace(
+                inference_metadata=dict(
+                    action_start_index=dataset.action_start_index, control_action_dim=19,
+                    supported_execution_modes=["sync"], action_context_shapes={"hand_history": [3, 12]},
+                ),
+                effective_config={},
+            )
+            effective = assemble_effective_config(cfg, description, model)
+            experiment = root / "experiment"
+            logger = ExperimentLogger(experiment)
+            try:
+                logger.save_config(effective)
+            finally:
+                logger.close()
+            (experiment / "checkpoints").mkdir()
+            (experiment / "checkpoints/latest.pt").touch()  # inspect 只选择路径，不读取权重。
+            info = inspect_policy(experiment, checkpoint="latest")
+            self.assertEqual(info.control_dt_s, attrs["dt"])
+            self.assertEqual(info.depth_config, dict(shape=list(runtime.camera.depth_shape),
+                                                    depth_scale_m=attrs["depth_scale_m_per_unit"]))
+            self.assertEqual(info.pointcloud_config, attrs["pointcloud_config"])
+            self.assertEqual(info.hand_pointcloud_config, attrs["hand_pointcloud_config"])
+            self.assertEqual(info.fingertip_link_names, tuple(attrs["fingertip_link_names"]))
+            self.assertEqual(info.tactile_source, "real")
+            self.assertEqual(info.hand_history_steps, 3)
+            saved = yaml.safe_load((experiment / "config.yaml").read_text())
+            self.assertEqual(saved["dataset"]["split_manifest"]["source_id"], attrs["source_id"])
+            self.assertNotIn("processing_source", saved["deployment_metadata"])
+            needs = policy_needs(policy_dependencies(info.observation_fields))
+            resolved = resolve_deployment_config(info, load_config(), needs)
+            self.assertEqual(resolved.pointcloud, runtime.pointcloud)
+            self.assertEqual(resolved.hand_pointcloud, runtime.hand_pointcloud)
+            self.assertEqual(resolved.camera.depth_shape, runtime.camera.depth_shape)
+            self.assertEqual(resolved.execution.action_steps, info.n_action_steps)
 
     def test_real_public_info_to_warmup_and_predict(self):
         for mode, history in (("joint", 3), ("eef", None)):
