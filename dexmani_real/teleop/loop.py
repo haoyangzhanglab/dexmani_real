@@ -9,13 +9,13 @@ from dexmani_real.data.recorder import (
     EpisodeRecorder,
     RecordingError,
 )
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.observation import (
     check_observation,
     read_observation,
 )
-from dexmani_real.runtime.state import RunEndReason, SafetyState
+from dexmani_real.runtime.state import RunEndReason, SafetyState, device_failure_reason
 from dexmani_real.utils.log import error_detail
 from dexmani_real.utils.timing import sampling_clock_ns
 
@@ -23,13 +23,9 @@ logger = logging.getLogger(__name__)
 
 
 def failure_reason(exc):
-    if isinstance(exc, KeyboardInterrupt):
-        return RunEndReason.ESTOP
     if isinstance(exc, RecordingError):
         return RunEndReason.RECORDING_FAILURE
-    if isinstance(exc, RobotError):
-        return RunEndReason.HARDWARE_FAULT
-    return RunEndReason.POLICY_FAILURE
+    return device_failure_reason(exc) or RunEndReason.RUNTIME_FAILURE
 
 
 class TeleopPhase(Enum):

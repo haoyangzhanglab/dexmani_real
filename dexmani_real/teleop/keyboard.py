@@ -5,7 +5,7 @@ import logging
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.control.ik import IKSolver
-from dexmani_real.robot.commands import OperationCancelled, RobotError
+from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.jog import CartesianJog
@@ -15,7 +15,7 @@ from dexmani_real.runtime.preflight import (
     jog_bounds,
     validate_robot_config,
 )
-from dexmani_real.runtime.state import RunEndReason, SessionState
+from dexmani_real.runtime.state import RunEndReason, SessionState, device_failure_reason
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.timing import Rate
@@ -65,11 +65,7 @@ class KeyboardTeleop:
         except Exception as exc:
             self.runtime_state.mark_error()
             self.runtime_state.revoke_motion(
-                reason=(
-                    RunEndReason.HARDWARE_FAULT
-                    if isinstance(exc, RobotError)
-                    else RunEndReason.POLICY_FAILURE
-                ),
+                reason=device_failure_reason(exc) or RunEndReason.RUNTIME_FAILURE,
             )
             raise
         finally:

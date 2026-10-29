@@ -15,13 +15,17 @@ from dexmani_real.control.actions import (
 )
 from dexmani_real.control.constraints import wrap_nearest_equivalent
 from dexmani_real.replay.trajectory import ReplayBuffer
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError, validate_hand_target
+from dexmani_real.robot.commands import (
+    OperationCancelled,
+    RobotCommand,
+    validate_hand_target,
+)
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
     read_observation,
 )
-from dexmani_real.runtime.state import RunEndReason
+from dexmani_real.runtime.state import RunEndReason, device_failure_reason
 from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -94,11 +98,7 @@ class JointReplay:
             self.runtime_state.mark_error()
             logger.exception("replay failed")
             result.status, result.reason = ReplayStatus.FAULT, str(exc)
-            run_end_reason = (
-                RunEndReason.HARDWARE_FAULT
-                if isinstance(exc, RobotError)
-                else RunEndReason.POLICY_FAILURE
-            )
+            run_end_reason = device_failure_reason(exc) or RunEndReason.RUNTIME_FAILURE
         finally:
             if result.status == ReplayStatus.USER_QUIT:
                 run_end_reason = RunEndReason.QUIT

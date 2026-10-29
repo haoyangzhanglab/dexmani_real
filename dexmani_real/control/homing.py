@@ -15,6 +15,7 @@ from dexmani_real.robot.model import ARM_JOINT_SHAPE
 
 PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=bool)
 
+
 def home_segment_timeout_s(distance: float, arm: ArmConfig) -> float:
     """静止到静止的运动估计，加既有运动余量、停稳及查询预算。"""
     speed = arm.homing.max_speed_rad_per_s

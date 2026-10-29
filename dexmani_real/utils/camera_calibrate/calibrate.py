@@ -22,7 +22,7 @@ from dexmani_real.ipc.sensors import (
     read_camera_frame,
     snapshot_camera_parameters,
 )
-from dexmani_real.robot.commands import OperationCancelled, RobotError
+from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import home_arm
 from dexmani_real.runtime.jog import CartesianJog
@@ -37,7 +37,7 @@ from dexmani_real.runtime.preflight import (
     jog_bounds,
     validate_robot_config,
 )
-from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
+from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState, device_failure_reason
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.camera_calibrate.aruco import (
     ARUCO_DICT_NAME,
@@ -331,11 +331,7 @@ class CameraCalibrator:
         except Exception as exc:
             self.fault(
                 f"calibration session failed: {exc}",
-                run_end_reason=(
-                    RunEndReason.HARDWARE_FAULT
-                    if isinstance(exc, RobotError)
-                    else RunEndReason.POLICY_FAILURE
-                ),
+                run_end_reason=device_failure_reason(exc) or RunEndReason.RUNTIME_FAILURE,
             )
             logger.exception("calibration session failed")
         finally:

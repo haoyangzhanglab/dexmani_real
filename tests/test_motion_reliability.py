@@ -240,7 +240,7 @@ def test_teleop_operator_cancellation_keeps_completed_rows(reason_name, phase):
     assert not loop.capture_failed
 
 
-@pytest.mark.parametrize("failure", ["timeout", "sdk", "estop", "arm_fault"])
+@pytest.mark.parametrize("failure", ["timeout", "sdk", "estop", "arm_fault", "business"])
 def test_teleop_cancellation_does_not_hide_independent_failure(failure):
     import time
     from dexmani_real.control.actions import ActionResult
@@ -256,6 +256,8 @@ def test_teleop_cancellation_does_not_hide_independent_failure(failure):
             raise TimeoutError("real timeout")
         if failure == "sdk":
             raise RobotError("real SDK failure")
+        if failure == "business":
+            raise ValueError("retargeting failed")
         if failure == "estop":
             loop.runtime_state.request_emergency_stop()
         if failure == "arm_fault":
@@ -265,13 +267,16 @@ def test_teleop_cancellation_does_not_hide_independent_failure(failure):
     loop.robot.send_action = Mock(side_effect=send)
     deadline = time.monotonic_ns() + 1_000_000_000
     row = SimpleNamespace(vr={"recv_ts_ns": deadline})
-    if failure in ("sdk", "arm_fault"):
-        with pytest.raises(RobotError):
+    if failure in ("sdk", "arm_fault", "business"):
+        with pytest.raises(ValueError if failure == "business" else RobotError):
             loop.execute_control_step(row, deadline, deadline)
     else:
         loop.execute_control_step(row, deadline, deadline)
     assert loop.capture_failed
     assert recorder.finish.call_args.kwargs["technical_status"] == "failed"
+    if failure == "business":
+        assert loop.pending_termination_reason == "operator"  # 首次 S 仍保留；技术异常单独记录。
+        assert loop.termination_details[0]["exception_type"] == "ValueError"
 
 
 def test_dexpilot_reset_seeds_the_real_filter():
@@ -350,3 +355,25 @@ def test_calibration_discards_old_one_shot_events_but_keeps_stop_and_held_keys(m
         assert calibration.capture_sample.call_count + calibration.solve_and_save.call_count == 1
     assert list(keys.events) == ["q", "esc"]
     assert keys.snapshot() == frozenset(("w", "q"))
+
+
+@pytest.mark.parametrize("hardware", [False, True])
+def test_replay_fault_classification_does_not_label_business_errors_as_policy(monkeypatch, hardware):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.replay import joint_replay
+    from dexmani_real.replay.trajectory import Trajectory
+    from dexmani_real.robot.commands import RobotError
+    from dexmani_real.runtime.state import RunEndReason
+    from dexmani_real.teleop.loop import failure_reason
+
+    state = SessionState(safety_state=SafetyState.RUNNING)
+    replay = joint_replay.JointReplay(state, RealConfig(), None, robot=SimpleNamespace(stop=Mock()))
+    error = RobotError("device error") if hardware else ValueError("invalid replay input")
+    replay.admit_replay = Mock(side_effect=error)
+    monkeypatch.setattr(joint_replay.ActionMapper, "for_mode", lambda *_, **__: None)
+    trajectory = Trajectory("unused", 20, "test", np.zeros((1, 7)), np.zeros((1, 12)), np.zeros((1, 7)), np.zeros((1, 12)))
+    result = replay.run(trajectory, hand_start_duration_s=0)
+    expected = RunEndReason.HARDWARE_FAULT if hardware else RunEndReason.RUNTIME_FAILURE
+    assert result.status == joint_replay.ReplayStatus.FAULT
+    assert state.run_ended_reason == expected
+    assert failure_reason(error) == expected

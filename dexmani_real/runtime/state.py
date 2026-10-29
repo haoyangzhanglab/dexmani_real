@@ -10,6 +10,8 @@ from enum import IntEnum
 from multiprocessing.sharedctypes import Synchronized
 from multiprocessing.synchronize import Event
 
+from dexmani_real.robot.commands import RobotError
+
 
 class SafetyState(IntEnum):
     DISARMED = 0
@@ -31,6 +33,15 @@ class RunEndReason(IntEnum):
     HARDWARE_FAULT = 7
     RUNTIME_SHUTDOWN = 8
     RECORDING_FAILURE = 9
+    RUNTIME_FAILURE = 10
+
+
+def device_failure_reason(error):
+    if isinstance(error, KeyboardInterrupt):
+        return RunEndReason.ESTOP
+    if isinstance(error, RobotError):
+        return RunEndReason.HARDWARE_FAULT
+    return None
 
 
 @dataclass
