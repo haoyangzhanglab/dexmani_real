@@ -5,13 +5,13 @@ from dex_retargeting.optimizer import DexPilotOptimizer
 from dex_retargeting.optimizer_utils import LPFilter
 from dex_retargeting.robot_wrapper import RobotWrapper
 
+from dexmani_real.config.teleop import DexPilotConfig
 from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
     XHAND_FINGERTIP_LINK_NAMES,
     XHAND_RIGHT_URDF_PATH,
     XHAND_SDK_JOINT_NAMES,
 )
-from dexmani_real.teleop.config import DexPilotConfig
 from dexmani_real.teleop.retargeting.landmarks import prepare_landmarks
 
 

@@ -1,3 +1,5 @@
+"""XHand 通信、关节范围、增益与回零参数。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

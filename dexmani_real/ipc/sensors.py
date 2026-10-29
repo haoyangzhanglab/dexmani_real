@@ -2,9 +2,9 @@ import json
 
 import numpy as np
 
+from dexmani_real.config.sensor import CameraConfig
 from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.ipc.ring import SharedRing
-from dexmani_real.sensor.config import CameraConfig
 
 # 右手发布携带最近头部姿态；recv_ts_ns 取腕部与关键点中较早的接收时刻。
 VR_DTYPE = np.dtype(

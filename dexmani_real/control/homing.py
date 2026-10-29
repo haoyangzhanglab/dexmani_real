@@ -7,11 +7,11 @@ from itertools import pairwise
 
 import numpy as np
 
+from dexmani_real.config.control import EnvironmentConfig
+from dexmani_real.config.xarm7 import HOME_DWELL_S, ArmConfig
 from dexmani_real.control.collision import CollisionModel
-from dexmani_real.control.config import EnvironmentConfig
 from dexmani_real.control.constraints import wrap_nearest_equivalent
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
-from dexmani_real.robot.xarm7.config import HOME_DWELL_S, ArmConfig
 
 PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=bool)
 

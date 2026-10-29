@@ -14,7 +14,7 @@ from dexmani_real.geometry.plane import TablePlaneFit
 from dexmani_real.utils.io import write_json
 
 if TYPE_CHECKING:
-    from dexmani_real.control.config import TableCollisionConfig
+    from dexmani_real.config.control import TableCollisionConfig
 
 
 def resolve_table_plane_path(table: TableCollisionConfig) -> Path:

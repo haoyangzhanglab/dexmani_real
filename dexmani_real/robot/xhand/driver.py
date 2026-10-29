@@ -8,6 +8,11 @@ from typing import Any
 
 import numpy as np
 
+from dexmani_real.config.xhand import (
+    INITIAL_STATE_TIMEOUT_S,
+    SERIAL_SETTLE_S,
+    HandConfig,
+)
 from dexmani_real.robot.commands import (
     OperationCancelled,
     RobotError,
@@ -21,11 +26,6 @@ from dexmani_real.robot.model import (
     XHAND_RATED_QPOS_MAX_RAD,
     XHAND_RATED_QPOS_MIN_RAD,
     XHAND_TACTILE_SENSOR_FINGER_IDS,
-)
-from dexmani_real.robot.xhand.config import (
-    INITIAL_STATE_TIMEOUT_S,
-    SERIAL_SETTLE_S,
-    HandConfig,
 )
 from dexmani_real.robot.xhand.feedback import XHandState
 

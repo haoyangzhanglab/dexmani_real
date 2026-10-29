@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from dexmani_real.config import load_config
+from dexmani_real.config.real import load_config
 
 
 def main(argv: list[str] | None = None) -> int:

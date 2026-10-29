@@ -9,7 +9,7 @@ from unittest.mock import ANY, Mock, patch
 
 import numpy as np
 
-from dexmani_real.config import load_config
+from dexmani_real.config.real import load_config
 from dexmani_real.geometry.pose import Pose
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
 from dexmani_real.robot.system import Robot
@@ -55,7 +55,7 @@ class KeyboardJogTests(unittest.TestCase):
         )
         self.controller.read_feedback()
         self.arm = Mock(cfg=self.runtime.arm, io=self.io, is_connected=True,
-                        sequence=0, operation_unresolved=False)
+                        operation_unresolved=False)
         self.arm.request_stop.side_effect = self.io.stop.set
         self.arm.wait_stopped.side_effect = self.wait_stopped
         self.arm.prepare.side_effect = self.prepare_arm
@@ -91,9 +91,9 @@ class KeyboardJogTests(unittest.TestCase):
 
     def step(self, *, consume=True):
         self.controller.read_feedback()
-        sequence = self.arm.sequence
+        submissions = self.arm.submit.call_count
         self.jog.step(self.robot, self.keys, self.state, self.runtime)
-        published = self.arm.sequence != sequence
+        published = self.arm.submit.call_count != submissions
         if consume and published:
             self.controller.tick()
         return published

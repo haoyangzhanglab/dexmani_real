@@ -7,21 +7,21 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from dexmani_real.calibration import CAMERAS_PATH
-from dexmani_real.calibration.table_plane import (
-    load_table_plane,
-    resolve_table_plane_path,
-)
-from dexmani_real.deployment.config import (
+from dexmani_real.config.calibration_data import CAMERAS_PATH
+from dexmani_real.config.deployment import (
     DEFAULT_MAX_RUNNING_S,
     DEFAULT_NUM_EPISODES,
     RUNTIME_SECTIONS,
-    resolve_deployment_config,
 )
 from dexmani_real.deployment.observation import policy_dependencies, policy_needs
+from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.deployment.session import PolicySession
 from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.utils.io import write_yaml
+from dexmani_real.utils.table_plane import (
+    load_table_plane,
+    resolve_table_plane_path,
+)
 
 
 def session_directory(root: Path, info) -> Path:

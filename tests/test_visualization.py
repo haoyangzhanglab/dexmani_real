@@ -12,13 +12,13 @@ from unittest.mock import MagicMock, Mock, patch
 import cv2
 import numpy as np
 
-from dexmani_real.calibration.camera.aruco import ARUCO_DICT, MARKER_ID, ArucoSampler
-from dexmani_real.calibration.camera.calibrate import CameraCalibrator
-from dexmani_real.config import load_config
+from dexmani_real.config.real import load_config
 from dexmani_real.geometry.camera import CameraIntrinsics
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.runtime.home import HomeResult
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
+from dexmani_real.utils.camera_calibrate.aruco import ARUCO_DICT, MARKER_ID, ArucoSampler
+from dexmani_real.utils.camera_calibrate.calibrate import CameraCalibrator
 from dexmani_real.utils.visualization.image import (
     colorize_depth,
     draw_aruco,
@@ -207,10 +207,10 @@ class CalibrationTests(unittest.TestCase):
 
                 calibrator.run_control_loop = fail_motion
                 with (
-                    patch('dexmani_real.calibration.camera.calibrate.snapshot_camera_parameters'),
-                    patch('dexmani_real.calibration.camera.calibrate.ImageViewer'),
+                    patch('dexmani_real.utils.camera_calibrate.calibrate.snapshot_camera_parameters'),
+                    patch('dexmani_real.utils.camera_calibrate.calibrate.ImageViewer'),
                     patch('builtins.print'),
-                    self.assertLogs('dexmani_real.calibration.camera.calibrate', level='ERROR') as logs,
+                    self.assertLogs('dexmani_real.utils.camera_calibrate.calibrate', level='ERROR') as logs,
                 ):
                     self.assertEqual(calibrator.run(), 1)
                 self.assertIn(str(error), logs.output[0])
@@ -236,9 +236,9 @@ class CalibrationTests(unittest.TestCase):
                 calibrator.rate = Mock()
                 calibrator.home_planner = Mock()
                 with (
-                    patch('dexmani_real.calibration.camera.calibrate.home_arm',
+                    patch('dexmani_real.utils.camera_calibrate.calibrate.home_arm',
                           return_value=HomeResult(False, reason, interrupted)),
-                    self.assertLogs('dexmani_real.calibration.camera.calibrate', level='INFO') as logs,
+                    self.assertLogs('dexmani_real.utils.camera_calibrate.calibrate', level='INFO') as logs,
                 ):
                     calibrator.run_home()
                 self.assertIn('Returning home...', logs.output[0])
@@ -266,7 +266,7 @@ class CalibrationTests(unittest.TestCase):
                 calibrator.robot.connect.side_effect = cancel
                 with (
                     patch('builtins.print'),
-                    self.assertLogs('dexmani_real.calibration.camera.calibrate', level='INFO') as logs,
+                    self.assertLogs('dexmani_real.utils.camera_calibrate.calibrate', level='INFO') as logs,
                 ):
                     self.assertEqual(calibrator.run(), 0 if saved else 2)
                 self.assertIn('startup cancelled', logs.output[0])
@@ -311,7 +311,7 @@ class CalibrationTests(unittest.TestCase):
         calibrator.preview.poll_events.assert_called_once()
 
     def test_window_close_at_publication_keeps_existing_calibration(self):
-        from dexmani_real.calibration.camera.hand_eye import HandEyeResult
+        from dexmani_real.utils.camera_calibrate.hand_eye import HandEyeResult
 
         with TemporaryDirectory() as directory:
             target = Path(directory) / "cameras.json"
@@ -329,7 +329,7 @@ class CalibrationTests(unittest.TestCase):
             calibrator.samples = [(np.eye(4), np.eye(4))] * 10
             calibrator.show_preview = Mock()
             result = HandEyeResult(np.eye(4), "TEST", np.zeros(10), np.zeros(10))
-            with patch('dexmani_real.calibration.camera.calibrate.solve_hand_eye', return_value=result):
+            with patch('dexmani_real.utils.camera_calibrate.calibrate.solve_hand_eye', return_value=result):
                 calibrator.solve_and_save()
             self.assertTrue(calibrator.runtime_state.quit_requested)
             self.assertFalse(calibrator.calibration_saved)
@@ -348,8 +348,8 @@ class CalibrationTests(unittest.TestCase):
         calibrator.preview_timestamp_ns = 1
         calibrator.marker_detected = True
         calibrator.status = "Sample removed; ENTER=recompute"
-        with patch('dexmani_real.calibration.camera.calibrate.read_camera_frame', return_value=None), \
-             patch('dexmani_real.calibration.camera.calibrate.draw_text') as draw:
+        with patch('dexmani_real.utils.camera_calibrate.calibrate.read_camera_frame', return_value=None), \
+             patch('dexmani_real.utils.camera_calibrate.calibrate.draw_text') as draw:
             calibrator.show_preview()
         self.assertEqual(draw.call_args_list[0].args[1], ["MARKER STALE"])
         self.assertIn(calibrator.status, draw.call_args_list[1].args[1][0])

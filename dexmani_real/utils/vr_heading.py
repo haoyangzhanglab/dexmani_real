@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.calibration import VR_TRANSFORM_PATH
+from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
 from dexmani_real.geometry.pose import forward_from_quat_wxyz
 from dexmani_real.ipc.sensors import read_vr_frame
 from dexmani_real.utils.io import write_json

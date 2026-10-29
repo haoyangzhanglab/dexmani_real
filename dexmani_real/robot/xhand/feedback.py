@@ -6,13 +6,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S, HandConfig
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
 )
-from dexmani_real.robot.xhand.config import INITIAL_STATE_TIMEOUT_S, HandConfig
 
 HAND_STATE_DTYPE = np.dtype(
     [

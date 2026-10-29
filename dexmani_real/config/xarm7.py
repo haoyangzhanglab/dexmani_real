@@ -1,3 +1,5 @@
+"""xArm7 连接、运动限位、伺服与回零参数。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

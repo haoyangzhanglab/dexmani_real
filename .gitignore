@@ -24,6 +24,5 @@ __pycache__/
 /.vscode/
 /.claude/settings.local.json
 **/.DS_Store
-dexmani_real/state/*.json.bak.*
 
 /experiments

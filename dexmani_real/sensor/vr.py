@@ -4,8 +4,8 @@ from contextlib import closing
 
 import numpy as np
 
+from dexmani_real.config.sensor import VRConfig
 from dexmani_real.geometry.pose import normalize_quat_wxyz, xyzw_to_wxyz
-from dexmani_real.sensor.config import VRConfig
 from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger(__name__)

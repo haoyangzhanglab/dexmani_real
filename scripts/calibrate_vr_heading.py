@@ -9,13 +9,8 @@ import multiprocessing as mp
 import time
 from pathlib import Path
 
-from dexmani_real.calibration import VR_TRANSFORM_PATH
-from dexmani_real.calibration.vr_heading import (
-    collect_headings,
-    estimate_heading,
-    read_heading,
-    save_vr_transform,
-)
+from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
+from dexmani_real.config.sensor import VRConfig
 from dexmani_real.ipc.sensors import SensorChannels
 from dexmani_real.runtime.lifecycle import (
     VR_READY_TIMEOUT_S,
@@ -23,9 +18,14 @@ from dexmani_real.runtime.lifecycle import (
     close_runtime,
 )
 from dexmani_real.runtime.state import SessionState
-from dexmani_real.sensor.config import VRConfig
 from dexmani_real.sensor.vr import run_vr
 from dexmani_real.teleop.audio import AudioFeedback
+from dexmani_real.utils.vr_heading import (
+    collect_headings,
+    estimate_heading,
+    read_heading,
+    save_vr_transform,
+)
 
 PRINT_INTERVAL_S = 5.0
 JOIN_TIMEOUT_S = 5.0

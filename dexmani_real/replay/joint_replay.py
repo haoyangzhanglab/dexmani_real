@@ -7,6 +7,7 @@ from enum import Enum
 
 import numpy as np
 
+from dexmani_real.config.deployment import ACTION_TIMEOUT_NS
 from dexmani_real.control.actions import (
     ActionMapper,
     project_arm_command,
@@ -64,7 +65,6 @@ class JointReplay:
         )
         period_ns, _ = sampling_clock_ns(trajectory.fps)
         result = ReplayResult(ReplayStatus.COMPLETED)
-        self.decision_age_ns = int(self.runtime.execution.max_decision_age_s * 1e9)
         run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
         try:
             result.status, result.reason, row = self.admit_replay(trajectory, hand_start_duration_s)
@@ -188,8 +188,7 @@ class JointReplay:
             self.robot.send_action(
                 RobotCommand(self.epoch, arm, hand),
                 valid_until_ns=valid_until_ns,
-                execute_until_ns=row.observation_timestamp_ns
-                + self.decision_age_ns,
+                execute_until_ns=time.monotonic_ns() + ACTION_TIMEOUT_NS,
             )
         finally:
             completed_ns = time.monotonic_ns()
@@ -263,15 +262,15 @@ class JointReplay:
             )
             if rejection is not None:
                 return ReplayStatus.REJECTED, f"hand start target: {rejection}"
+            expires_ns = time.monotonic_ns() + timeout_ns
             self.robot.send_action(
                 RobotCommand(self.epoch, arm_hold, hand),
                 valid_until_ns=feedback_until_ns,
-                execute_until_ns=row.observation_timestamp_ns + timeout_ns,
+                execute_until_ns=expires_ns,
             )
             submitted_ns = time.monotonic_ns()
             deadline_ns = submitted_ns + period_ns
 
-        expires_ns = submitted_ns + timeout_ns
         last_sample_ns = submitted_ns
         consecutive = 0
         while True:

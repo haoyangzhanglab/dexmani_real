@@ -258,7 +258,7 @@ class Robot:
             if command.arm_qpos is not None:
                 validate_arm_target(command.arm_qpos, self.arm_lower, self.arm_upper)
             if execute_until_ns is None or execute_until_ns <= 0:
-                raise ValueError("arm requires an explicit decision execution deadline")
+                raise ValueError("arm requires an explicit command execution deadline")
         if command.hand_qpos is not None:
             if not self.connected or self.hand is None or not self.hand.is_connected:
                 raise RobotError("hand device unavailable")

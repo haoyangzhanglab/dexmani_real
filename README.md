@@ -14,7 +14,19 @@ python -m pip install -e ".[interactive,control,geometry,visualization]"
 
 设备 SDK、Pinocchio、MPlib 和手部重定向所需依赖需按实验环境另行安装；策略部署还需安装 `dexmani_policy`。机器人模型与模板从源码目录的 `assets/` 加载，运行时须保留源码 checkout。
 
-默认配置见 [config.py](dexmani_real/config.py) 及各模块的配置类。支持的入口可通过 `--config local.yaml` 覆盖，优先级为 **CLI > YAML > 默认值**；未知配置键会报错。运行前核对机械臂 IP、手部串口、工作空间和当前设备的标定参数。
+默认配置集中在 [config/](dexmani_real/config/)，[config/real.py](dexmani_real/config/real.py) 提供 `RealConfig` 和 `load_config`，负责组合配置及合并覆盖；各子配置可独立导入。支持的入口可通过 `--config local.yaml` 覆盖，优先级为 **CLI > YAML > 默认值**；未知配置键会报错。运行前核对机械臂 IP、手部串口、工作空间和当前设备的标定参数。
+
+| 配置文件 | 内容 |
+| --- | --- |
+| [xarm7.py](dexmani_real/config/xarm7.py) · [xhand.py](dexmani_real/config/xhand.py) | 机械臂与手的连接、限位、增益和回零参数 |
+| [control.py](dexmani_real/config/control.py) | 运动约束、工作空间、桌面与静态障碍物 |
+| [sensor.py](dexmani_real/config/sensor.py) | RealSense 与 VR 采集 |
+| [perception.py](dexmani_real/config/perception.py) | 点云处理与手点云模板 |
+| [teleop.py](dexmani_real/config/teleop.py) | 遥操作、键盘点动、采集和手部重定向 |
+| [deployment.py](dexmani_real/config/deployment.py) | 策略执行模式、命令超时与默认实验预算 |
+| [calibration_data/](dexmani_real/config/calibration_data/) | 相机外参、桌面平面与 VR 朝向标定结果 |
+
+策略与真机配置的匹配及部署前校验位于 [deployment/preflight.py](dexmani_real/deployment/preflight.py)。
 
 以下命令仅打印配置，不连接设备：
 
@@ -57,6 +69,8 @@ HOME 保留直达、近端优先、远端优先及等价关节分支，按关节
 
 键盘与标定 jog 的目标执行期限均从机械臂反馈的来源时间计算，读取缓存不会延长目标寿命。机械臂进程独立检查目标执行期限、机械臂反馈时效和控制器状态，HOME 另有执行期限。父进程阻塞时，机械臂仍按这些条件处理停止；软件期限不代表物理停止延迟。
 
+策略执行与轨迹逐帧回放每次提交目标时设置 2 秒执行期限；持续收到新目标就刷新期限，断流后由机械臂进程检查并停止。策略等待下一动作也使用这一预算，实验总时长仍限制执行期限。预测块按执行步数和调度时刻使用；传感器来源时效在读取与提交边界检查。回放开始前的手部准备另按到位等待期限保持机械臂。
+
 ## 标定与诊断
 
 | 用途 | 入口 |
@@ -67,7 +81,9 @@ HOME 保留直达、近端优先、远端优先及等价关节分支，按关节
 | 点云预览与桌面标定 | [view_pointcloud.py](scripts/tools/view_pointcloud.py) |
 | XHand 状态与动作诊断 | [control_xhand.py](scripts/tools/control_xhand.py) |
 
-默认标定参数位于 [calibration/parameters/](dexmani_real/calibration/parameters/)。相机标定前须拆除 XHand，或将其固定在配置的 HOME 姿态。SDK 接受命令不代表机器人已到位或停稳。
+默认标定参数位于 [config/calibration_data/](dexmani_real/config/calibration_data/)，包含相机外参、桌面平面和 VR 朝向三个 JSON。相机标定实现位于 [utils/camera_calibrate/](dexmani_real/utils/camera_calibrate/)，桌面与 VR 标定辅助代码分别位于 [utils/table_plane.py](dexmani_real/utils/table_plane.py) 和 [utils/vr_heading.py](dexmani_real/utils/vr_heading.py)。
+
+相机标定前须拆除 XHand，或将其固定在配置的 HOME 姿态。SDK 接受命令不代表机器人已到位或停稳。
 
 RealSense 和点云诊断使用 OpenCV RGB-D 面板及 Open3D 点云窗口，需可用的桌面显示环境及 OpenGL 上下文；上述 `visualization` 安装项包含 Open3D 和离线查看所用的 Rerun。
 
@@ -108,7 +124,9 @@ Raw episode 默认保存在 `episodes/TASK/`，训练数据导出到 `datasets/T
 | [geometry/](dexmani_real/geometry/) · [perception/](dexmani_real/perception/) | 坐标变换、FK、点云与手部表示 |
 | [control/](dexmani_real/control/) · [runtime/](dexmani_real/runtime/) · [ipc/](dexmani_real/ipc/) | 动作计算、运行协调与进程通信 |
 | [teleop/](dexmani_real/teleop/) · [deployment/](dexmani_real/deployment/) · [replay/](dexmani_real/replay/) | 遥操作、策略执行与回放 |
-| [data/](dexmani_real/data/) · [calibration/](dexmani_real/calibration/) | 数据记录、导出与标定 |
+| [config/](dexmani_real/config/) | 配置定义、覆盖合并与标定参数 |
+| [data/](dexmani_real/data/) | 数据记录与导出 |
+| [utils/](dexmani_real/utils/) | 标定工具、可视化与通用辅助函数 |
 | [scripts/](scripts/) | 实验与工具入口 |
 
 CordVIP 对象重建与跟踪见 [scripts/cordvip/README.md](scripts/cordvip/README.md)。依赖配置见 [pyproject.toml](pyproject.toml)，开发约定见 [AGENTS.md](AGENTS.md)。

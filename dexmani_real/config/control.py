@@ -1,3 +1,5 @@
+"""运动约束、工作空间与环境碰撞配置。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -5,7 +7,7 @@ from math import radians
 
 import numpy as np
 
-from dexmani_real.calibration import TABLE_PLANE_RELATIVE_PATH
+from dexmani_real.config.calibration_data import TABLE_PLANE_RELATIVE_PATH
 from dexmani_real.geometry.pose import validate_unit_quaternion_wxyz
 
 

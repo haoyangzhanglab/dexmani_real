@@ -3,34 +3,16 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, fields, replace
+from dataclasses import fields, replace
 from typing import TYPE_CHECKING
 
-from dexmani_real.perception.config import HandCloudConfig, PointCloudConfig
+from dexmani_real.config.deployment import ExecutionConfig
+from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 
 if TYPE_CHECKING:
-    from dexmani_real.config import RealConfig
+    from dexmani_real.config.real import RealConfig
     from dexmani_real.runtime.observation import ObservationNeeds
-
-DEFAULT_NUM_EPISODES = 20
-DEFAULT_MAX_RUNNING_S = 60.0
-START_ARM_TOLERANCE_DEG = 0.5
-PREDICTION_TIMEOUT_NS = 2_000_000_000
-RUNTIME_SECTIONS = (
-    "execution", "arm", "hand", "motion", "camera", "pointcloud", "hand_pointcloud", "environment",
-)
-
-
-@dataclass(frozen=True)
-class ExecutionConfig:
-    # async 可继续使用旧预测的有效尾部，action_steps 是名义执行窗口。
-    action_steps: int | None = None
-    mode: str = "sync"
-    # 时效与等待预算不代表物理停止延迟。
-    max_decision_age_s: float = 1.0
-    prefetch_steps: int | None = None
-    rtc_guidance_cap: float | None = None
 
 
 def _restore_cloud_config(recipe, config_type):
@@ -55,10 +37,6 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
         or int(dt * 1e9) <= 0
     ):
         raise ValueError("Real deployment requires finite positive control_dt_s of at least 1 ns")
-    age = execution.max_decision_age_s
-    if type(age) not in (int, float) or not math.isfinite(age) or age <= 0:
-        raise ValueError("max_decision_age_s must be finite and positive")
-
     prediction_steps = info.future_steps
     action_steps = execution.action_steps
     if type(action_steps) is not int or not 1 <= action_steps <= prediction_steps:

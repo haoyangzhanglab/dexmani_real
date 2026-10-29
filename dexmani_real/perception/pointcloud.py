@@ -5,8 +5,8 @@ import numpy as np
 from fpsample import bucket_fps_kdline_sampling
 from scipy.spatial import cKDTree
 
+from dexmani_real.config.perception import PointCloudConfig
 from dexmani_real.geometry.camera import CameraIntrinsics, deproject_depth, depth_rays
-from dexmani_real.perception.config import PointCloudConfig
 
 NEIGHBORHOOD_KERNEL = np.ones((3, 3), dtype=np.uint8)
 DEPTH_RANGE_M = (0.30, 1.50)

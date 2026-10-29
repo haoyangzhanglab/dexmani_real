@@ -12,6 +12,7 @@ from typing import Any, cast
 import numpy as np
 import zarr
 
+from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.data.raw import ROBOT_DATASET_SPECS, RawReader
 from dexmani_real.geometry.camera import (
     CameraSnapshot,
@@ -19,7 +20,6 @@ from dexmani_real.geometry.camera import (
     validate_aligned_depth_distortion,
 )
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
-from dexmani_real.perception.config import HandCloudConfig, PointCloudConfig
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.robot.model import (
@@ -42,14 +42,6 @@ class ExportConfig:
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
-
-    @classmethod
-    def from_runtime(cls, runtime, *, table_plane_abcd=None):
-        return cls(
-            pointcloud=runtime.pointcloud,
-            hand_pointcloud=runtime.hand_pointcloud,
-            table_plane_abcd=table_plane_abcd,
-        )
 
     def __post_init__(self) -> None:
         if not self.pointcloud.remove_table:

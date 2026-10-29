@@ -6,8 +6,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from dexmani_real.calibration import CAMERAS_PATH
-from dexmani_real.config import load_config
+from dexmani_real.config.calibration_data import CAMERAS_PATH
+from dexmani_real.config.real import load_config
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -31,12 +31,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    from dexmani_real.calibration.camera.aruco import (
+    from dexmani_real.utils.camera_calibrate.aruco import (
         ARUCO_DICT_NAME,
         MARKER_ID,
         MARKER_SIZE_M,
     )
-    from dexmani_real.calibration.camera.calibrate import CameraCalibrator
+    from dexmani_real.utils.camera_calibrate.calibrate import CameraCalibrator
 
     print("=" * 60)
     print("  ArUco Hand-Eye Calibration — xArm7 + RealSense (eye-to-hand)")

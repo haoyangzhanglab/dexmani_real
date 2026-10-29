@@ -54,6 +54,15 @@ class KeyboardTeleopConfig:
     ik_max_pose_error_pos_m: float = 0.002
     ik_max_pose_error_rot_rad: float = radians(2.0)
 
+    def validate(self) -> None:
+        for name in ("target_max_age_s", "delta_pos_m", "delta_rpy_rad"):
+            value = getattr(self, name)
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"keyboard {name} must be finite and positive")
+        margin = self.workspace_command_margin_m
+        if not np.isfinite(margin) or margin < 0:
+            raise ValueError("workspace_command_margin_m must be finite and non-negative")
+
 
 @dataclass(frozen=True)
 class TAGConfig:

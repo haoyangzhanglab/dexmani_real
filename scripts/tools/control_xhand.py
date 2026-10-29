@@ -17,13 +17,13 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from dexmani_real.config import load_config
+from dexmani_real.config.real import load_config
+from dexmani_real.config.xhand import HandConfig
 from dexmani_real.robot.commands import OperationCancelled, validate_hand_target
 from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
 )
-from dexmani_real.robot.xhand.config import HandConfig
 from dexmani_real.robot.xhand.driver import XHand
 from dexmani_real.robot.xhand.feedback import XHandState
 from dexmani_real.utils.log import configure_logging

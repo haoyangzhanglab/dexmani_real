@@ -7,12 +7,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.control.homing import HomePathRejected
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand
-from dexmani_real.robot.xarm7.config import (
+from dexmani_real.config.xarm7 import (
     HOME_CONVERGENCE_TIMEOUT_S,
     HOME_TARGET_TIMEOUT_S,
 )
+from dexmani_real.control.homing import HomePathRejected
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.runtime.state import SafetyState
 from dexmani_real.utils.timing import sample_is_fresh
 

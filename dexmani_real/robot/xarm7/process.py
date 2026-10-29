@@ -4,11 +4,11 @@ import multiprocessing as mp
 import time
 from contextlib import ExitStack
 
-from dexmani_real.robot.commands import OperationCancelled, RobotError
-from dexmani_real.robot.xarm7.config import (
+from dexmani_real.config.xarm7 import (
     EXECUTOR_TIMEOUT_S,
     HOME_CONVERGENCE_TIMEOUT_S,
 )
+from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.xarm7.protocol import (
     ArmChannels,
     HomeRequest,
@@ -37,7 +37,6 @@ class ArmProcess:
         )
         self.pipe, self.child_pipe = self.ctx.Pipe()
         self.process = None
-        self.sequence = 0
         self.operation_unresolved = False
 
     @property
@@ -110,25 +109,15 @@ class ArmProcess:
         frame.flags.writeable = False
         return frame
 
-    def limit_execution_until(self, deadline_ns):
-        limit = self.io.execution_limit
-        with limit.get_lock():
-            limit[0] = (
-                min(limit[0], int(deadline_ns)) if limit[1] == self.sequence else int(deadline_ns)
-            )
-            limit[1] = self.sequence
-
     def submit(self, command, *, submit_until_ns, execute_until_ns):
         self.check_error()
         if not self.is_connected:
             raise RobotError("arm device unavailable")
         self.io.publish_goal(
             command,
-            sequence=self.sequence + 1,
             submit_until_ns=submit_until_ns,
             execute_until_ns=execute_until_ns,
         )
-        self.sequence += 1
 
     def request_operation(self, request, *, service, abort, deadline_ns):
         if not self.is_connected or self.operation_unresolved:

@@ -8,7 +8,7 @@ import math
 from dataclasses import asdict
 from pathlib import Path
 
-from dexmani_real.deployment.config import (
+from dexmani_real.config.deployment import (
     DEFAULT_MAX_RUNNING_S,
     DEFAULT_NUM_EPISODES,
     RUNTIME_SECTIONS,
@@ -150,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
 
     import yaml
 
-    from dexmani_real.config import load_config
+    from dexmani_real.config.real import load_config
 
     runtime = load_config(
         path=args.config,

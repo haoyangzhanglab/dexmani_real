@@ -12,20 +12,7 @@ from typing import TYPE_CHECKING, cast
 import cv2
 import numpy as np
 
-from dexmani_real.calibration import CAMERAS_PATH
-from dexmani_real.calibration.camera.aruco import (
-    ARUCO_DICT_NAME,
-    MARKER_ID,
-    MARKER_SIZE_M,
-    ArucoSampler,
-)
-from dexmani_real.calibration.camera.extrinsics import save_camera_calibration
-from dexmani_real.calibration.camera.hand_eye import (
-    MIN_SAMPLES,
-    HandEyeResult,
-    solve_hand_eye,
-)
-from dexmani_real.calibration.table_plane import load_table_plane
+from dexmani_real.config.calibration_data import CAMERAS_PATH
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.control.ik import IKSolver
@@ -52,12 +39,25 @@ from dexmani_real.runtime.preflight import (
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
+from dexmani_real.utils.camera_calibrate.aruco import (
+    ARUCO_DICT_NAME,
+    MARKER_ID,
+    MARKER_SIZE_M,
+    ArucoSampler,
+)
+from dexmani_real.utils.camera_calibrate.extrinsics import save_camera_calibration
+from dexmani_real.utils.camera_calibrate.hand_eye import (
+    MIN_SAMPLES,
+    HandEyeResult,
+    solve_hand_eye,
+)
 from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.timing import Rate, sample_is_fresh
 from dexmani_real.utils.visualization.image import ImageViewer, draw_aruco, draw_text
 
 if TYPE_CHECKING:
-    from dexmani_real.config import RealConfig
+    from dexmani_real.config.real import RealConfig
 
 logger = logging.getLogger(__name__)
 

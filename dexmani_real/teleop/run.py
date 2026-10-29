@@ -6,10 +6,8 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
-from dexmani_real.calibration import VR_TRANSFORM_PATH
-from dexmani_real.calibration.camera.extrinsics import load_optional_camera_extrinsics
-from dexmani_real.calibration.table_plane import load_table_plane
-from dexmani_real.calibration.vr_heading import load_vr_transform
+from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
+from dexmani_real.config.teleop import DEFAULT_TASK_NAME
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.recorder import RecordingError
@@ -31,10 +29,12 @@ from dexmani_real.runtime.state import RunEndReason, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.sensor.vr import run_vr
 from dexmani_real.teleop.audio import AudioFeedback
-from dexmani_real.teleop.config import DEFAULT_TASK_NAME
 from dexmani_real.teleop.loop import TeleopLoop, failure_reason
 from dexmani_real.teleop.vr import VRController
+from dexmani_real.utils.camera_calibrate.extrinsics import load_optional_camera_extrinsics
 from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.table_plane import load_table_plane
+from dexmani_real.utils.vr_heading import load_vr_transform
 
 logger = logging.getLogger(__name__)
 END_AUDIO_GRACE_S = 3.0

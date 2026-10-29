@@ -6,15 +6,14 @@ from typing import cast
 
 import numpy as np
 
-from dexmani_real.robot.commands import OperationCancelled, validate_arm_target
-from dexmani_real.robot.xarm7.config import (
+from dexmani_real.config.xarm7 import (
     HOME_CONVERGENCE_TIMEOUT_S,
     HOME_DWELL_S,
     HOME_TARGET_TIMEOUT_S,
     SERVO_MAX_INTERVAL_S,
 )
+from dexmani_real.robot.commands import OperationCancelled, validate_arm_target
 from dexmani_real.robot.xarm7.protocol import (
-    MAX_TIME,
     STATUS_DTYPE,
     HomeRequest,
 )
@@ -218,7 +217,6 @@ class ArmController:
                 self.wait_stationary(check_abort)
                 check_abort()
                 self.last_send_ns = 0
-                self.io.execution_limit[:] = (MAX_TIME, 0)
                 self.status["prepared_run_id"] = run_id
         except BaseException as exc:
             error = exc
@@ -237,10 +235,8 @@ class ArmController:
             return "submission_expired_before_sdk"
         if self.status["prepared_run_id"] != goal["run_id"]:
             return "unprepared_run"
-        wait_until, wait_sequence = self.io.execution_limit[:]
-        limit = wait_until if goal["sequence"] <= wait_sequence else MAX_TIME
-        if now >= min(goal["execute_until_ns"], limit):
-            return "input_decision_expired"
+        if now >= goal["execute_until_ns"]:
+            return "command_expired"
         if not self.status["valid"] or now - self.status["frame"]["timestamp_ns"] >= int(
             self.cfg.feedback_max_age_s * 1e9
         ):

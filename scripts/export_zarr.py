@@ -10,9 +10,9 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from dexmani_real.calibration.table_plane import load_table_plane
-from dexmani_real.config import load_config
+from dexmani_real.config.real import load_config
 from dexmani_real.data.export import ExportConfig, export_zarr
+from dexmani_real.utils.table_plane import load_table_plane
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,7 +85,11 @@ def load_processing_config(path: Path | None, *, num_points: int | None) -> Expo
     plane = (
         load_table_plane(runtime.environment.table) if runtime.pointcloud.remove_table else None
     )
-    return ExportConfig.from_runtime(runtime, table_plane_abcd=plane)
+    return ExportConfig(
+        pointcloud=runtime.pointcloud,
+        hand_pointcloud=runtime.hand_pointcloud,
+        table_plane_abcd=plane,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

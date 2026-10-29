@@ -3,8 +3,8 @@
 import unittest
 from types import SimpleNamespace
 
-from dexmani_real.config import RealConfig
-from dexmani_real.deployment.config import resolve_deployment_config
+from dexmani_real.config.real import RealConfig
+from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.runtime.observation import ObservationNeeds
 
 

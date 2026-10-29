@@ -1,3 +1,5 @@
+"""RealSense 与 VR 采集参数。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

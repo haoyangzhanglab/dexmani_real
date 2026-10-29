@@ -7,8 +7,8 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
+from dexmani_real.config.xarm7 import ArmConfig
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
-from dexmani_real.robot.xarm7.config import ArmConfig
 from dexmani_real.robot.xarm7.protocol import STATUS_DTYPE, ArmChannels
 from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
 from dexmani_real.robot.xarm7.worker import ArmController
@@ -38,33 +38,32 @@ class ArmStreamingTests(unittest.TestCase):
         self.controller = ArmController(self.cfg, self.io, None, self.driver)
         self.controller.status = status.copy()
 
-    def publish(self, sequence, **overrides):
-        fields = {'run_id': 2, 'arm_qpos': self.home + sequence * 0.0001}
+    def publish(self, target_index, **overrides):
+        fields = {'run_id': 2, 'arm_qpos': self.home + target_index * 0.0001}
         fields.update(overrides)
         self.io.publish_goal(
-            RobotCommand(**fields), sequence=sequence,
+            RobotCommand(**fields),
             submit_until_ns=self.now + 100_000_000,
             execute_until_ns=self.now + 500_000_000,
         )
 
     def test_burst_keeps_latest_target_and_deadlines(self):
-        for sequence in range(1, 101):
+        for target_index in range(1, 101):
             self.now += 1_000
-            self.publish(sequence)
+            self.publish(target_index)
         goal = self.io.take_goal()
-        self.assertEqual(int(goal['sequence']), 100)
         np.testing.assert_allclose(goal['q_goal'], self.home + 0.01)
         self.assertEqual(int(goal['submit_until_ns']), self.now + 100_000_000)
         self.assertEqual(int(goal['execute_until_ns']), self.now + 500_000_000)
         self.assertIsNone(self.io.take_goal())
         self.publish(101)
-        self.assertEqual(int(goal['sequence']), 100)
+        np.testing.assert_allclose(goal['q_goal'], self.home + 0.01)
+        np.testing.assert_allclose(self.io.take_goal()['q_goal'], self.home + 0.0101)
 
     def test_hold_replaces_pending_target_without_stopping_controller(self):
         self.publish(1)
         self.publish(2, arm_qpos=None, arm_hold=True)
         self.controller.tick()
-        self.assertEqual(int(self.controller.active['sequence']), 2)
         self.assertTrue(self.controller.active['hold'])
         self.assertFalse(self.io.stop.is_set())
         np.testing.assert_allclose(self.driver.servo.call_args.args[0], self.home)
@@ -82,16 +81,16 @@ class ArmStreamingTests(unittest.TestCase):
         for submit_until, execute_until in ((self.now, self.now + 1), (self.now + 1, self.now)):
             with self.assertRaises(TimeoutError):
                 self.io.publish_goal(
-                    RobotCommand(2, self.home), sequence=2,
+                    RobotCommand(2, self.home),
                     submit_until_ns=submit_until, execute_until_ns=execute_until,
                 )
-        self.assertEqual(int(self.io.take_goal()['sequence']), 1)
+        np.testing.assert_allclose(self.io.take_goal()['q_goal'], self.home + 0.0001)
 
     def test_consumer_skips_locked_slot_without_losing_target(self):
         self.publish(1)
         with self.io.goal_lock:
             self.assertIsNone(self.io.take_goal())
-        self.assertEqual(int(self.io.take_goal()['sequence']), 1)
+        np.testing.assert_allclose(self.io.take_goal()['q_goal'], self.home + 0.0001)
 
     def test_replacing_target_keeps_ruckig_position_and_velocity(self):
         self.publish(1)
@@ -105,7 +104,7 @@ class ArmStreamingTests(unittest.TestCase):
         self.publish(4)
         self.controller.tick()
         self.assertIs(self.controller.reference, reference)
-        self.assertEqual(int(self.controller.active['sequence']), 4)
+        np.testing.assert_allclose(self.controller.active['q_goal'], self.home + 0.0004)
         np.testing.assert_allclose(reference.q, expected_q, atol=1e-12)
         np.testing.assert_allclose(reference.v, expected_v, atol=1e-12)
         np.testing.assert_allclose(reference.goal, self.home + 0.0004)
@@ -130,20 +129,27 @@ class ArmStreamingTests(unittest.TestCase):
         self.controller.tick()
         self.driver.servo.reset_mock()
         self.now += 500_000_000
-        with self.assertRaisesRegex(RuntimeError, 'input_decision_expired'):
+        with self.assertRaisesRegex(RuntimeError, 'command_expired'):
             self.controller.tick()
         self.driver.servo.assert_not_called()
 
-    def test_execution_limit_applies_only_to_covered_sequences(self):
-        self.publish(1)
-        self.publish(2)
-        self.io.execution_limit[:] = (self.now, 2)
-        with self.assertRaisesRegex(RuntimeError, 'input_decision_expired'):
+    def test_new_targets_refresh_deadline_but_fresh_feedback_does_not(self):
+        started = self.now
+        for tick in range(150):
+            self.now = started + tick * 10_000_000
+            self.controller.status['frame']['timestamp_ns'] = self.now
+            if tick <= 100 and tick % 10 == 0:
+                self.publish(tick // 10 + 1)
+            self.controller.tick()
+        self.assertEqual(self.driver.servo.call_count, 150)
+
+        # 最后一个目标在 1 秒提交、1.5 秒到期；反馈与伺服循环仍正常。
+        self.now = started + 1_500_000_000
+        self.controller.status['frame']['timestamp_ns'] = self.now
+        self.driver.servo.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, 'command_expired'):
             self.controller.tick()
         self.driver.servo.assert_not_called()
-        self.publish(3)
-        self.controller.tick()
-        self.driver.servo.assert_called_once()
 
     def test_hold_brakes_continuously_and_does_not_chase_previous_goal(self):
         reference = ArmTrajectory(self.cfg, self.home, np.zeros(7), self.now)
@@ -182,7 +188,7 @@ class ArmStreamingTests(unittest.TestCase):
         self.controller.tick()
         self.driver.servo.reset_mock()
         self.now += 500_000_000
-        with self.assertRaisesRegex(RuntimeError, 'input_decision_expired'):
+        with self.assertRaisesRegex(RuntimeError, 'command_expired'):
             self.controller.tick()
         self.driver.servo.assert_not_called()
 

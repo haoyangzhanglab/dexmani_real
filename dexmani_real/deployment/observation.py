@@ -48,26 +48,8 @@ def policy_needs(dependencies):
 
 @dataclass(frozen=True)
 class PolicyObservationRow:
-    source_timestamp_ns: int
     values: dict[str, np.ndarray]
     features: dict[str, np.ndarray] = field(default_factory=dict, compare=False)
-
-
-def policy_source_timestamp(row, dependencies):
-    times = []
-    for source, stamp in (
-        ("arm", int(row.arm["timestamp_ns"][0])),
-        ("hand", int(row.hand["timestamp_ns"][0])),
-        ("aggregate", int(row.hand["tactile_aggregate_timestamp_ns"][0])),
-        ("dense", int(row.hand["tactile_dense_timestamp_ns"][0])),
-        ("cloud", row.pointcloud_timestamp_ns),
-    ):
-        if source in dependencies:
-            times.append(stamp)
-    if "camera" in dependencies:
-        times.append(int(row.camera["timestamp_ns"]))
-    # 静态输入仍使用本轮机械臂和手的真实反馈时间。
-    return min(times or (int(row.arm["timestamp_ns"][0]), int(row.hand["timestamp_ns"][0])))
 
 
 class ObservationBuilder:
@@ -103,9 +85,7 @@ class ObservationBuilder:
                 values[name] = row.point_cloud
             elif name in {"rgb", "depth"}:
                 values[name] = row.camera[name]
-        return PolicyObservationRow(
-            policy_source_timestamp(row, dependencies), values,
-        )
+        return PolicyObservationRow(values)
 
     def configure_camera(self, camera):
         self.camera_parameters = {}

@@ -5,13 +5,13 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from dexmani_real.control.config import EnvironmentConfig
+from dexmani_real.config.control import EnvironmentConfig
+from dexmani_real.config.xarm7 import HOME_DWELL_S, ArmConfig
 from dexmani_real.control.homing import (
     HomePathRejected,
     HomePlanner,
     interpolate_waypoints,
 )
-from dexmani_real.robot.xarm7.config import HOME_DWELL_S, ArmConfig
 
 
 def joints(proximal, distal=0.):

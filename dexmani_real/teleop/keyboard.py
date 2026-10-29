@@ -2,7 +2,6 @@
 
 import logging
 
-from dexmani_real.calibration.table_plane import load_table_plane
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.control.ik import IKSolver
@@ -18,6 +17,7 @@ from dexmani_real.runtime.preflight import (
 )
 from dexmani_real.runtime.state import RunEndReason, SessionState
 from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.timing import Rate
 
 logger = logging.getLogger(__name__)

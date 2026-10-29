@@ -10,23 +10,23 @@ from typing import Any, cast
 
 import yaml
 
-from dexmani_real.control.config import (
+from dexmani_real.config.control import (
     EnvironmentConfig,
     MotionConfig,
     StaticCollisionBox,
 )
-from dexmani_real.deployment.config import ExecutionConfig
-from dexmani_real.perception.config import HandCloudConfig, PointCloudConfig
-from dexmani_real.robot.xarm7.config import ArmConfig
-from dexmani_real.robot.xhand.config import HandConfig
-from dexmani_real.sensor.config import CameraConfig, VRConfig
-from dexmani_real.teleop.config import (
+from dexmani_real.config.deployment import ExecutionConfig
+from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
+from dexmani_real.config.sensor import CameraConfig, VRConfig
+from dexmani_real.config.teleop import (
     CollectionConfig,
     DexPilotConfig,
     KeyboardTeleopConfig,
     TAGConfig,
     TeleopConfig,
 )
+from dexmani_real.config.xarm7 import ArmConfig
+from dexmani_real.config.xhand import HandConfig
 
 
 @dataclass(frozen=True)
@@ -63,11 +63,8 @@ def _replace_config(current: Any, changes: Any) -> Any:
     if isinstance(current, tuple):
         if not isinstance(changes, (list, tuple)):
             raise TypeError("config arrays must use YAML sequences")
-        return (
-            tuple(_replace_config(current[0], value) for value in changes)
-            if current
-            else tuple(changes)
-        )
+        # 空默认序列只有 static_boxes，已在上面按 StaticCollisionBox 构建。
+        return tuple(_replace_config(current[0], value) for value in changes)
     if isinstance(current, bool):
         # 引号中的 "false" 不能启用设备。
         if type(changes) is not bool:
@@ -102,14 +99,14 @@ def load_config(
     overrides: Mapping[str, Any] | None = None,
 ) -> RealConfig:
     """覆盖优先级为 CLI > YAML > 默认值；此处不连接设备或读取标定。"""
-    values = {}
+    values: dict[str, Any] = {}
     if path is not None:
         with Path(path).open(encoding="utf-8") as stream:
             loaded = yaml.safe_load(stream)
         if loaded is not None:
-            if not isinstance(loaded, Mapping):
+            if not isinstance(loaded, dict):
                 raise TypeError("experiment config root must be a mapping")
-            values = dict(loaded)
+            values = loaded
     if overrides is not None:
         _merge_overrides(values, overrides)
     return _replace_config(RealConfig(), values)

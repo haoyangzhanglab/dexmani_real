@@ -8,10 +8,6 @@ from itertools import count
 
 import numpy as np
 
-from dexmani_real.calibration.camera.extrinsics import (
-    load_camera_extrinsics,
-    load_optional_camera_extrinsics,
-)
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.raw import camera_metadata
@@ -32,6 +28,10 @@ from dexmani_real.runtime.lifecycle import (
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
+from dexmani_real.utils.camera_calibrate.extrinsics import (
+    load_camera_extrinsics,
+    load_optional_camera_extrinsics,
+)
 from dexmani_real.utils.io import write_json, write_yaml
 from dexmani_real.utils.log import configure_logging, error_detail
 

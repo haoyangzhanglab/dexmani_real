@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.calibration import CAMERAS_PATH
+from dexmani_real.config.calibration_data import CAMERAS_PATH
 from dexmani_real.geometry.pose import validate_rigid_transform
 from dexmani_real.utils.io import write_json
 

@@ -8,8 +8,8 @@ from dataclasses import asdict
 
 import yaml
 
-from dexmani_real.config import load_config
-from dexmani_real.teleop.config import DEFAULT_TASK_NAME
+from dexmani_real.config.real import load_config
+from dexmani_real.config.teleop import DEFAULT_TASK_NAME
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -90,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     if not runtime.hand.enabled and not args.no_hand:
         parser.error("hand.enabled=false requires explicit --no-hand confirmation")
 
-    from dexmani_real.calibration import VR_TRANSFORM_PATH
+    from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
     from dexmani_real.teleop.run import run_teleop
 
     return run_teleop(

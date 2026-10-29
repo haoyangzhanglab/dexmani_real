@@ -14,22 +14,22 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from dexmani_real.calibration.camera.extrinsics import load_camera_extrinsics
-from dexmani_real.calibration.table_plane import (
-    load_table_plane,
-    resolve_table_plane_path,
-    save_table_plane,
-)
-from dexmani_real.config import load_config
+from dexmani_real.config.perception import PointCloudConfig
+from dexmani_real.config.real import load_config
 from dexmani_real.geometry.camera import CameraIntrinsics
 from dexmani_real.geometry.plane import fit_table_plane
-from dexmani_real.perception.config import PointCloudConfig
 from dexmani_real.perception.pointcloud import (
     PointCloudProcessor,
     aligned_depth_points_in_base,
     build_raw_point_cloud,
 )
+from dexmani_real.utils.camera_calibrate.extrinsics import load_camera_extrinsics
 from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.table_plane import (
+    load_table_plane,
+    resolve_table_plane_path,
+    save_table_plane,
+)
 from dexmani_real.utils.visualization.image import ImageViewer, rgbd_panel
 from dexmani_real.utils.visualization.pointcloud import PointCloudViewer
 

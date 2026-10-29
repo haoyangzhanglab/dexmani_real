@@ -8,12 +8,12 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-from dexmani_real.data.raw import snapshot_recording_metadata
-from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
-from dexmani_real.deployment.config import (
-    PREDICTION_TIMEOUT_NS,
+from dexmani_real.config.deployment import (
+    ACTION_TIMEOUT_NS,
     START_ARM_TOLERANCE_DEG,
 )
+from dexmani_real.data.raw import snapshot_recording_metadata
+from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
 from dexmani_real.deployment.schedule import (
     Prediction,
     control_slot,
@@ -110,7 +110,6 @@ class Rollout:
         self.run_deadline_ns = self.wait_deadline_ns = None
         self.last_slot = -1
         self.dt_ns = round(policy_info.control_dt_s * 1e9)
-        self.max_decision_age_ns = int(self.execution.max_decision_age_s * 1e9)
         self.started_ns = self.next_step_ns = 0
         self.previous_arm = None
         # sync 推理期间持有本步观测，结果到达后只提交/录制一次。
@@ -310,7 +309,7 @@ class Rollout:
         self.run_id, self.started_ns = admitted
         self.preparing_epoch = None
         self.next_step_ns = self.started_ns
-        self.wait_deadline_ns = self.started_ns + PREDICTION_TIMEOUT_NS
+        self.wait_deadline_ns = self.started_ns + ACTION_TIMEOUT_NS
         self.run_deadline_ns = (
             self.started_ns + self.max_duration_ns if self.max_duration_ns is not None else None
         )
@@ -343,21 +342,13 @@ class Rollout:
         self.query.result = result.actions
 
     def submit(self, slot, *, handoff_slot=None, prefix=None, commands=None):
-        now = time.monotonic_ns()
         authorized, expired = self.has_motion_authority(), self.expired_budget()
         if expired is not None:
             return f"{expired[1]}_timeout"
         if not authorized:
             return "query_authority_revoked"
         rows = tuple(self.history)
-        source_ns = rows[-1].source_timestamp_ns
-        # 来源时间已校验；+1 保持 age <= budget 的整数纳秒边界。
-        expires_at_ns = source_ns + self.max_decision_age_ns + 1
-        if now >= expires_at_ns:
-            return "query_sources_invalid_or_expired"
-        if prefix is not None and now >= self.plan.expires_at_ns:
-            return "prefix_decision_expired"
-        query = Prediction(self.run_id, slot, expires_at_ns, handoff_slot)
+        query = Prediction(self.run_id, slot, handoff_slot)
         kwargs = (
             dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot,
                  rtc_guidance_cap=self.execution.rtc_guidance_cap) if prefix is not None else {}
@@ -543,7 +534,7 @@ class Rollout:
 
             new_plan, issue = handoff_plan(
                 self.query, run_id=self.run_id, slot=slot, mode=self.execution.mode,
-                action_steps=self.execution.action_steps, now_ns=time.monotonic_ns(),
+                action_steps=self.execution.action_steps,
                 authorized=self.has_motion_authority(),
             )
             if issue is not None:
@@ -553,8 +544,7 @@ class Rollout:
                 self.plan, self.query = new_plan, None
             if self.plan is None:
                 if self.wait_deadline_ns is None:
-                    self.wait_deadline_ns = now + PREDICTION_TIMEOUT_NS
-                    self.robot.arm.limit_execution_until(self.wait_deadline_ns)
+                    self.wait_deadline_ns = now + ACTION_TIMEOUT_NS
                 if len(self.history) == self.history.maxlen and self.query is None:
                     issue = self.submit(slot)
                     if issue is not None:
@@ -563,7 +553,7 @@ class Rollout:
                         self.sync_row, row = row, None
                 return
 
-            issue = plan_rejection(self.plan, slot, self.execution.mode, time.monotonic_ns())
+            issue = plan_rejection(self.plan, slot, self.execution.mode)
             if issue is None:
                 issue = self.submit_prefetch(row, slot)
             if issue is not None:
@@ -580,12 +570,12 @@ class Rollout:
             if limit is not None and time.monotonic_ns() >= limit[0]:
                 self.stop(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
                 return
-            action_deadline_ns = min(self.next_step_ns, feedback_until_ns, self.plan.expires_at_ns)
+            action_deadline_ns = min(self.next_step_ns, feedback_until_ns)
             valid_until_ns = min(action_deadline_ns, limit[0]) if limit else action_deadline_ns
             if time.monotonic_ns() >= valid_until_ns:
                 self.stop("submission_deadline_expired")
                 return
-            execute_until_ns = self.plan.expires_at_ns
+            execute_until_ns = time.monotonic_ns() + ACTION_TIMEOUT_NS
             if self.run_deadline_ns is not None:
                 execute_until_ns = min(execute_until_ns, self.run_deadline_ns)
 

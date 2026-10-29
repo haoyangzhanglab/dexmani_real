@@ -16,10 +16,9 @@ ARM_STATE_DTYPE = np.dtype(
     ]
 )
 
-MAX_TIME = 2**63 - 1
 GOAL_DTYPE = np.dtype(
     [
-        ("sequence", "<i8"),
+        ("pending", "?"),
         ("run_id", "<i8"),
         ("hold", "?"),
         ("submit_until_ns", "<i8"),
@@ -60,12 +59,11 @@ class ArmChannels:
         self.connected = ctx.Event()
         self.fault = ctx.Array("c", 1024, lock=False)
         self.close_error = ctx.Array("c", 1024, lock=False)
-        self.execution_limit = ctx.Array("q", [MAX_TIME, 0])  # 截止时间、最后受影响的命令序号
         self.goal_lock, self.status_lock = ctx.Lock(), ctx.Lock()
         self.goal = ctx.RawArray("b", GOAL_DTYPE.itemsize)
         self.status = ctx.RawArray("b", STATUS_DTYPE.itemsize)
 
-    def publish_goal(self, command, *, sequence, submit_until_ns, execute_until_ns):
+    def publish_goal(self, command, *, submit_until_ns, execute_until_ns):
         prepared_run_id = self.read_status()["prepared_run_id"]
         with self.goal_lock:
             # IPC 等待之后重新检查运行身份和停止信号。
@@ -81,7 +79,7 @@ class ArmChannels:
             if prepared_run_id != command.run_id:
                 raise RuntimeError("arm target run was not prepared")
             np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)[0] = (
-                sequence,
+                True,
                 command.run_id,
                 command.arm_hold,
                 submit_until_ns,
@@ -94,10 +92,10 @@ class ArmChannels:
             return None  # 父进程持锁时跳过本次读取，不阻塞伺服。
         try:
             slot = np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)
-            if not slot["sequence"][0]:
+            if not slot["pending"][0]:
                 return None
             goal = slot[0].copy()
-            slot["sequence"][0] = 0
+            slot["pending"][0] = False
             return goal
         finally:
             self.goal_lock.release()

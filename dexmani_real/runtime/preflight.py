@@ -9,7 +9,7 @@ import numpy as np
 from dexmani_real.robot.system import FEEDBACK_PERIOD_NS
 
 if TYPE_CHECKING:
-    from dexmani_real.config import RealConfig
+    from dexmani_real.config.real import RealConfig
 
 
 def validate_robot_config(cfg: RealConfig) -> None:
@@ -32,15 +32,10 @@ def validate_control_rate(cfg: RealConfig, control_hz: float) -> None:
 
 def jog_bounds(runtime: RealConfig) -> tuple[np.ndarray, np.ndarray]:
     cfg = runtime.keyboard_teleop
-    for name in ("target_max_age_s", "delta_pos_m", "delta_rpy_rad"):
-        value = getattr(cfg, name)
-        if not np.isfinite(value) or value <= 0:
-            raise ValueError(f"keyboard {name} must be finite and positive")
-    margin = cfg.workspace_command_margin_m
-    if not np.isfinite(margin) or margin < 0:
-        raise ValueError("workspace_command_margin_m must be finite and non-negative")
+    cfg.validate()
     validate_control_rate(runtime, cfg.control_hz)
     workspace = runtime.environment.workspace.as_array()
+    margin = cfg.workspace_command_margin_m
     lower, upper = workspace[:, 0] + margin, workspace[:, 1] - margin
     if np.any(lower >= upper):
         raise ValueError("keyboard workspace command margin leaves no interior workspace")

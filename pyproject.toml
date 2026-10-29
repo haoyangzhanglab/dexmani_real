@@ -38,4 +38,7 @@ include = ["dexmani_real*"]
 namespaces = true
 
 [tool.setuptools.package-data]
-"dexmani_real.calibration" = ["parameters/*.json"]
+"dexmani_real.config.calibration_data" = ["*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

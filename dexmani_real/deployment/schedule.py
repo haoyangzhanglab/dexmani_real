@@ -13,7 +13,6 @@ class Prediction:
 
     run_id: int
     slot: int
-    expires_at_ns: int
     handoff_slot: int | None
     result: np.ndarray | None = None
 
@@ -25,12 +24,11 @@ class ActionChunk:
     actions: np.ndarray
     anchor_slot: int
     segment_end: int
-    expires_at_ns: int
     frozen: dict[int, RobotCommand]
 
 
 def handoff_plan(
-    query, *, run_id, slot, mode, action_steps, now_ns, authorized,
+    query, *, run_id, slot, mode, action_steps, authorized,
 ):
     if query is None or query.run_id != run_id:
         return None, None
@@ -47,8 +45,6 @@ def handoff_plan(
         if ordinary_async:
             return None, None
         return None, "handoff_result_not_ready"
-    if now_ns >= query.expires_at_ns:
-        return None, "handoff_decision_expired"
     segment_end = slot + action_steps
     if ordinary_async:
         if not 0 <= slot - query.slot < len(query.result):
@@ -59,7 +55,6 @@ def handoff_plan(
             actions=query.result,
             anchor_slot=slot if bootstrap and mode == "rtc" else query.slot,
             segment_end=segment_end,
-            expires_at_ns=query.expires_at_ns,
             frozen={},
         ),
         None,
@@ -92,9 +87,7 @@ def control_slot(*, now_ns, next_step_ns, last_slot, dt_ns, synchronous):
     return slot, next_step_ns + (skipped + 1) * dt_ns, skipped
 
 
-def plan_rejection(plan, slot, mode, now_ns):
-    if now_ns >= plan.expires_at_ns:
-        return "submission_deadline_expired"
+def plan_rejection(plan, slot, mode):
     if mode == "async":
         if not 0 <= slot - plan.anchor_slot < len(plan.actions):
             return "plan_exhausted_without_handoff"

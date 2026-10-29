@@ -4,9 +4,9 @@ import nlopt
 import numpy as np
 import pinocchio as pin
 
+from dexmani_real.config.teleop import TAGConfig
 from dexmani_real.geometry.kinematics import HandFK
 from dexmani_real.robot.model import HAND_JOINT_SHAPE, XHAND_RIGHT_URDF_PATH
-from dexmani_real.teleop.config import TAGConfig
 from dexmani_real.teleop.retargeting.landmarks import prepare_landmarks
 
 ROBOT_FINGER_LENGTHS = np.array([0.161, 0.208, 0.206, 0.204, 0.145])

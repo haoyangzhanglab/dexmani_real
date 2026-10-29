@@ -71,7 +71,7 @@ def iter_live_realsense(
     *, serial: str | None = None, width: int = 640, height: int = 480, fps: int = 30
 ) -> Iterator[Frame]:
     """Preserve first host queue-return times per channel; SDK queue latency is unmeasured."""
-    from dexmani_real.sensor.config import CameraConfig
+    from dexmani_real.config.sensor import CameraConfig
     from dexmani_real.sensor.realsense import RealSenseCamera
 
     config = CameraConfig(serial=serial, width=width, height=height, fps=fps)

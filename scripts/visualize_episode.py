@@ -14,15 +14,15 @@ os.environ.setdefault("RUST_LOG", "error")
 
 import numpy as np
 
-from dexmani_real.calibration.table_plane import load_table_plane
-from dexmani_real.config import load_config
-from dexmani_real.control.config import TableCollisionConfig
+from dexmani_real.config.control import TableCollisionConfig
+from dexmani_real.config.perception import PointCloudConfig
+from dexmani_real.config.real import load_config
 from dexmani_real.data.raw import RawReader
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
-from dexmani_real.perception.config import PointCloudConfig
 from dexmani_real.perception.hand_cloud import hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
+from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.visualization.rerun import (
     episode_blueprint,
     log_camera_geometry,

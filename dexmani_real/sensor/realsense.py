@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dexmani_real.config.sensor import CameraConfig
 from dexmani_real.geometry.camera import CameraIntrinsics
-from dexmani_real.sensor.config import CameraConfig
 from dexmani_real.utils.log import configure_logging
 
 if TYPE_CHECKING:

@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.perception.config import HandCloudConfig
+from dexmani_real.config.perception import HandCloudConfig
 from dexmani_real.perception.hand_cloud import HAND_TEMPLATE_DIR
 from dexmani_real.robot.model import XARM7_XHAND_RIGHT_URDF_PATH
 from dexmani_real.utils.io import publish

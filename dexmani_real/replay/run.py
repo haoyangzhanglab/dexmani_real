@@ -4,7 +4,6 @@ import logging
 import math
 from pathlib import Path
 
-from dexmani_real.calibration.table_plane import load_table_plane
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.replay.joint_replay import JointReplay, ReplayResult, ReplayStatus
 from dexmani_real.replay.metrics import compute_metrics
@@ -18,6 +17,7 @@ from dexmani_real.runtime.preflight import validate_control_rate, validate_robot
 from dexmani_real.runtime.state import SessionState
 from dexmani_real.utils.io import write_json
 from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.table_plane import load_table_plane
 
 DEFAULT_OUTPUT_DIR = "replay_results"
 logger = logging.getLogger(__name__)
@@ -34,9 +34,6 @@ def run_replay(
     configure_logging()
     if not math.isfinite(hand_start_duration_s) or hand_start_duration_s < 0:
         raise ValueError("hand_start_duration_s must be finite and >= 0")
-    decision_age_s = runtime.execution.max_decision_age_s
-    if not math.isfinite(decision_age_s) or decision_age_s <= 0:
-        raise ValueError("max_decision_age_s must be finite and positive")
     validate_robot_config(runtime)
     validate_control_rate(runtime, trajectory.fps)
     table_plane_abcd = (
