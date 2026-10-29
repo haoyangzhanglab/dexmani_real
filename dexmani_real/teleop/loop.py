@@ -363,6 +363,7 @@ class TeleopLoop:
         deadline_ns = min(deadline_ns, feedback_until_ns)
         command = None
         reason = None
+        cancelled = False
         try:
             result = self.controller.compute_target(row)
             if result is None or result.rejection_reason is not None or result.arm_qpos is None:
@@ -383,8 +384,31 @@ class TeleopLoop:
                         execute_until_ns=int(row.vr["recv_ts_ns"])
                         + int(self.runtime.teleop.vr_stale_threshold_s * 1e9),
                     )
-                except (OperationCancelled, TimeoutError) as exc:
+                except OperationCancelled as exc:
+                    cancelled = True
                     reason = f"control_interrupted: {exc}"
+                except TimeoutError as exc:
+                    reason = f"control_interrupted: {exc}"
+
+            if reason is None or cancelled:
+                if time.monotonic_ns() >= deadline_ns:
+                    reason, cancelled = "submission_deadline_expired", False
+                elif not self.runtime_state.can_move(run_id=epoch):
+                    reason, cancelled = reason or "motion_revoked", True
+            if cancelled:
+                # 撤权不能掩盖同时发生的设备/服务故障。
+                self.robot.check()
+                with self.runtime_state.motion_lock:
+                    ended = self.runtime_state.run_ended_reason
+                    operator_end = (
+                        self.runtime_state.run_ended_id == epoch
+                        and ended in (RunEndReason.OPERATOR, RunEndReason.QUIT)
+                        and not self.runtime_state.estop_request
+                        and not self.runtime_state.error_state
+                    )
+                if operator_end:
+                    self.end_episode(True, ended.name.lower(), run_end_reason=ended)
+                    return  # 未完成的控制行不补录。
         except BaseException as exc:
             self.record_error("control", exc)
             try:
@@ -398,11 +422,6 @@ class TeleopLoop:
                 logger.exception("teleop control cleanup also failed")
             raise
 
-        if reason is None:
-            if time.monotonic_ns() >= deadline_ns:
-                reason = "submission_deadline_expired"
-            elif not self.runtime_state.can_move(run_id=epoch):
-                reason = "motion_revoked"
         if reason is not None:
             self.abort_episode(reason, row=row, command=command)
         else:

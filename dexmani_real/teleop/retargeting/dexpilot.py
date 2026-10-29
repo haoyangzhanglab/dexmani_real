@@ -42,6 +42,7 @@ class DexPilotRetargeter:
             raise ValueError("DexPilot initial_qpos must be a finite (12,) array")
         self.previous_solution = qpos.copy()
         self.filter.reset()
+        self.filter.next(qpos.astype(np.float64))
         self.optimizer.projected[:] = False
 
     def retarget(self, landmarks):

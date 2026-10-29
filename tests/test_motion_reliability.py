@@ -193,3 +193,95 @@ def test_home_and_online_workspace_share_the_configured_margin(outside):
             planner._check_state(tuple(np.zeros(7)))
     else:
         planner._check_state(tuple(np.zeros(7)))
+
+
+def teleop_loop():
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.runtime.observation import ObservationNeeds
+    from dexmani_real.teleop.loop import TeleopLoop, TeleopPhase
+
+    state = SessionState(safety_state=SafetyState.RUNNING)
+    loop = TeleopLoop(
+        state, RealConfig(), SimpleNamespace(stop_required=True, stop=Mock(), check=Mock()),
+        task_label="test", control_needs=ObservationNeeds(), record_needs=ObservationNeeds(),
+        sensors=None, controller=Mock(), home_planner=None, recording_dir=None,
+        keyboard=None, audio=Mock(),
+    )
+    loop.phase, loop.run_id = TeleopPhase.ACTIVE, state.run_id
+    loop.recorder = Mock(start_attempted=True, published_path=None)
+    return loop
+
+
+@pytest.mark.parametrize("reason_name,phase", [("OPERATOR", "compute"), ("QUIT", "send")])
+def test_teleop_operator_cancellation_keeps_completed_rows(reason_name, phase):
+    import time
+    from dexmani_real.control.actions import ActionResult
+    from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.runtime.state import RunEndReason
+
+    loop = teleop_loop()
+    recorder = loop.recorder
+    result = ActionResult(np.zeros(7), np.zeros(12))
+
+    def cancel(*_, **__):
+        loop.runtime_state.request_stop(reason=getattr(RunEndReason, reason_name))
+        if phase == "send":
+            raise OperationCancelled("cancelled in SDK boundary")
+        return result
+
+    loop.controller.compute_target.side_effect = cancel if phase == "compute" else lambda _: result
+    loop.robot.send_action = Mock(side_effect=cancel)
+    deadline = time.monotonic_ns() + 1_000_000_000
+    loop.execute_control_step(SimpleNamespace(vr={"recv_ts_ns": deadline}), deadline, deadline)
+    recorder.append.assert_not_called()
+    assert recorder.finish.call_args.kwargs["technical_status"] == "normal"
+    assert recorder.finish.call_args.kwargs["reason"] == reason_name.lower()
+    loop.controller.commit.assert_not_called()
+    assert not loop.capture_failed
+
+
+@pytest.mark.parametrize("failure", ["timeout", "sdk", "estop", "arm_fault"])
+def test_teleop_cancellation_does_not_hide_independent_failure(failure):
+    import time
+    from dexmani_real.control.actions import ActionResult
+    from dexmani_real.robot.commands import OperationCancelled, RobotError
+
+    loop = teleop_loop()
+    recorder = loop.recorder
+    loop.controller.compute_target.return_value = ActionResult(np.zeros(7), np.zeros(12))
+
+    def send(*_, **__):
+        loop.runtime_state.request_stop()
+        if failure == "timeout":
+            raise TimeoutError("real timeout")
+        if failure == "sdk":
+            raise RobotError("real SDK failure")
+        if failure == "estop":
+            loop.runtime_state.request_emergency_stop()
+        if failure == "arm_fault":
+            loop.robot.check.side_effect = RobotError("owner fault")
+        raise OperationCancelled("revoked")
+
+    loop.robot.send_action = Mock(side_effect=send)
+    deadline = time.monotonic_ns() + 1_000_000_000
+    row = SimpleNamespace(vr={"recv_ts_ns": deadline})
+    if failure in ("sdk", "arm_fault"):
+        with pytest.raises(RobotError):
+            loop.execute_control_step(row, deadline, deadline)
+    else:
+        loop.execute_control_step(row, deadline, deadline)
+    assert loop.capture_failed
+    assert recorder.finish.call_args.kwargs["technical_status"] == "failed"
+
+
+def test_dexpilot_reset_seeds_the_real_filter():
+    from dex_retargeting.optimizer_utils import LPFilter
+    from dexmani_real.teleop.retargeting.dexpilot import DexPilotRetargeter
+
+    retargeter = DexPilotRetargeter.__new__(DexPilotRetargeter)
+    retargeter.limits = np.tile([0, 1], (12, 1))
+    retargeter.optimizer = SimpleNamespace(projected=np.ones(10, dtype=bool))
+    retargeter.filter = LPFilter(0.1)
+    retargeter.reset(np.full(12, 0.2))
+    np.testing.assert_allclose(retargeter.previous_solution, 0.2)
+    np.testing.assert_allclose(retargeter.filter.next(np.full(12, 0.8)), 0.26)
