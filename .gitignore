@@ -10,9 +10,6 @@
 
 # Python build and bytecode artifacts
 __pycache__/
-.mypy_cache/
-.pytest_cache/
-.ruff_cache/
 *.py[cod]
 *.so
 /build/

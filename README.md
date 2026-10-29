@@ -158,26 +158,3 @@ Canonical 默认保持固定周期有效前缀、完整 13 模态，并对真实
 | [scripts/](scripts/) | 实验与工具入口 |
 
 CordVIP 对象重建与跟踪见 [scripts/cordvip/README.md](scripts/cordvip/README.md)。依赖配置见 [pyproject.toml](pyproject.toml)，开发约定见 [AGENTS.md](AGENTS.md)。
-
-## 测试
-
-在仓库根目录、已激活的 Python 3.10+ 环境中运行统一入口：
-
-```bash
-python -m pip install -e . pytest
-python -m pytest tests
-```
-
-完整测试另需 `control` 中的 Ruckig、`dex_retargeting`、关联 `dexmani_policy` 及其 PyTorch、torchvision、Hydra/OmegaConf 依赖，并安装可选 CordVIP 包：`python -m pip install -e third_party/cordvip_geometry`。导出测试还需 Pinocchio，以及源码 checkout 中的 URDF 和默认手点云模板 `assets/pointcloud_template/hand/hand_1024.npz`。
-
-现有测试隔离了设备与模型调用，无需连接机器人、相机、GPU 或下载模型权重；它们不验证真实权重加载、GPU 推理、机器人执行或真实几何碰撞效果。使用 `pytest` 能同时收集现有 unittest 类与 pytest 自由函数测试。
-
-依赖不齐时可直接运行以下现有子集：
-
-```bash
-# 项目基础依赖；不需设备 SDK、Policy、Ruckig 或 CordVIP
-python -m pytest tests/test_camera_optional_reliability.py
-
-# 基础依赖、Pinocchio、源码 URDF 与手点云模板
-python -m pytest tests/test_export_reliability.py
-```
