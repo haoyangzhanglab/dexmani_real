@@ -23,13 +23,13 @@ from dexmani_real.deployment.schedule import (
 )
 from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.ipc.sensors import read_camera_frame
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
     read_observation,
 )
-from dexmani_real.runtime.state import RunEndReason, SafetyState
+from dexmani_real.runtime.state import RunEndReason, SafetyState, device_failure_reason
 from dexmani_real.utils.log import error_detail
 from dexmani_real.utils.timing import next_tick_ns
 
@@ -37,13 +37,9 @@ logger = logging.getLogger(__name__)
 
 
 def failure_reason(error):
-    if isinstance(error, KeyboardInterrupt):
-        return RunEndReason.ESTOP
     if isinstance(error, RecordingError):
         return RunEndReason.RECORDING_FAILURE
-    if isinstance(error, RobotError):
-        return RunEndReason.HARDWARE_FAULT
-    return RunEndReason.POLICY_FAILURE
+    return device_failure_reason(error) or RunEndReason.POLICY_FAILURE
 
 
 def utc_now():
@@ -61,18 +57,26 @@ class EpisodeResult:
     raw: dict | None = None
     metrics: dict = field(default_factory=lambda: dict(
         inference_count=0, inference_mean_s=None, inference_max_s=None, skipped_slots=0,
+        prediction_wait_count=0, prediction_wait_mean_s=None, prediction_wait_max_s=None,
+        observation_to_submit_count=0, observation_to_submit_mean_s=None, observation_to_submit_max_s=None,
     ))
 
-    def record_prediction(self, duration_ns):
-        metrics = self.metrics
-        count = metrics["inference_count"]
-        mean = metrics["inference_mean_s"] or 0.0
-        duration = duration_ns / 1e9
-        metrics.update(
-            inference_count=count + 1,
-            inference_mean_s=mean + (duration - mean) / (count + 1),
-            inference_max_s=max(metrics["inference_max_s"] or 0.0, duration),
+    @property
+    def normal_termination(self):
+        return not self.errors and (
+            self.termination_reason in {"operator", "quit"} or (
+                self.termination_reason == "timeout" and self.termination_details == "duration_timeout"
+            )
         )
+
+    def record_duration(self, name, duration_ns):
+        metrics = self.metrics
+        count = metrics[f"{name}_count"]
+        mean = metrics[f"{name}_mean_s"] or 0.0
+        duration = duration_ns / 1e9
+        metrics[f"{name}_count"] = count + 1
+        metrics[f"{name}_mean_s"] = mean + (duration - mean) / (count + 1)
+        metrics[f"{name}_max_s"] = max(metrics[f"{name}_max_s"] or 0.0, duration)
 
 
 class Rollout:
@@ -191,9 +195,6 @@ class Rollout:
 
     def finish(self):
         result = self.result
-        normal = result.termination_reason in {"operator", "quit"} or (
-            result.termination_reason == "timeout" and result.termination_details == "duration_timeout"
-        )
         if self.recorder is not None and self.recorder.start_attempted:
             failure = None
             if self.sync_row is not None:
@@ -207,7 +208,7 @@ class Rollout:
                 self.recorder.finish(
                     save=True, reason=result.termination_reason,
                     details=[dict(stage="termination", reason=result.termination_details), *result.errors],
-                    technical_status="normal" if normal and not result.errors else "failed",
+                    technical_status="normal" if result.normal_termination else "failed",
                 )
             except BaseException as exc:
                 result.errors.append(error_detail("recorder_finalize", exc))
@@ -309,7 +310,9 @@ class Rollout:
         self.run_id, self.started_ns = admitted
         self.preparing_epoch = None
         self.next_step_ns = self.started_ns
-        self.wait_deadline_ns = self.started_ns + ACTION_TIMEOUT_NS
+        self.wait_deadline_ns = (
+            self.started_ns + (self.policy_info.n_obs_steps - 1) * self.dt_ns + ACTION_TIMEOUT_NS
+        )
         self.run_deadline_ns = (
             self.started_ns + self.max_duration_ns if self.max_duration_ns is not None else None
         )
@@ -338,7 +341,8 @@ class Rollout:
             self.stop("owner_authority_revoked")
             self.query = None
             return
-        self.result.record_prediction(result.duration_ns)
+        self.result.record_duration("inference", result.duration_ns)
+        self.result.record_duration("prediction_wait", time.monotonic_ns() - self.query.submitted_ns)
         self.query.result = result.actions
 
     def submit(self, slot, *, handoff_slot=None, prefix=None, commands=None):
@@ -348,7 +352,10 @@ class Rollout:
         if not authorized:
             return "query_authority_revoked"
         rows = tuple(self.history)
-        query = Prediction(self.run_id, slot, handoff_slot)
+        query = Prediction(
+            self.run_id, slot, handoff_slot,
+            observation_ns=rows[-1].observation_timestamp_ns, submitted_ns=time.monotonic_ns(),
+        )
         kwargs = (
             dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot,
                  rtc_guidance_cap=self.execution.rtc_guidance_cap) if prefix is not None else {}
@@ -368,6 +375,8 @@ class Rollout:
                 )
             }
         self.model.predict(rows, **kwargs)
+        if self.plan is None:
+            self.wait_deadline_ns = query.submitted_ns + ACTION_TIMEOUT_NS
         if initial_hand_history is not None:
             self.hand_history.extend(initial_hand_history)
         self.query = query
@@ -507,6 +516,8 @@ class Rollout:
                     self.next_step_ns = next_tick_ns(self.next_step_ns, self.dt_ns, now)
                 if self.query.result is None:
                     return
+                # 结果到达后开始完整控制周期，映射不再争用旧 tick 的相位余数。
+                self.next_step_ns = time.monotonic_ns() + self.dt_ns
                 row, self.sync_row = self.sync_row, None
                 slot = self.last_slot
             else:
@@ -589,6 +600,7 @@ class Rollout:
                 self.stop(str(exc), errors=[error_detail("submission", exc)])
                 return
             now = time.monotonic_ns()
+            self.result.record_duration("observation_to_submit", now - self.plan.observation_ns)
             if not self.has_motion_authority():
                 self.stop("motion authority revoked during submission")
                 return

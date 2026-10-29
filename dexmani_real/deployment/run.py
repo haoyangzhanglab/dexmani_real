@@ -42,11 +42,13 @@ def session_directory(root: Path, info) -> Path:
     stamp = time.strftime("%Y%m%d_%H%M%S")
     candidate = base / f"session_{stamp}"
     dedup = 1
-    while candidate.exists():
-        candidate = base / f"session_{stamp}_{dedup:02d}"
-        dedup += 1
-    candidate.mkdir(parents=True, exist_ok=False)
-    return candidate
+    while True:
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            candidate = base / f"session_{stamp}_{dedup:02d}"
+            dedup += 1
 
 
 def run_policy(

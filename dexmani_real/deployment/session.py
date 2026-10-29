@@ -3,6 +3,7 @@
 import logging
 import multiprocessing as mp
 import time
+from collections import Counter
 from dataclasses import asdict
 from itertools import count
 
@@ -71,8 +72,19 @@ class PolicySession:
         )
 
     def save_results(self, *, overwrite=True):
+        termination_counts = Counter(result.termination_reason for result in self.episodes)
         write_json(
-            dict(self.summary, errors=self.errors, episodes=[asdict(result) for result in self.episodes]),
+            dict(
+                self.summary, errors=self.errors, episodes=[asdict(result) for result in self.episodes],
+                started_episode_count=sum(result.started_utc is not None for result in self.episodes),
+                technical_termination_count=sum(
+                    not result.normal_termination and (
+                        result.termination_reason != "start_cancelled" or bool(result.errors)
+                    )
+                    for result in self.episodes
+                ),
+                termination_counts=dict(termination_counts),
+            ),
             self.output_dir / "session_result.json", overwrite=overwrite,
         )
 
@@ -329,6 +341,12 @@ class PolicySession:
     def warmup_policy(self):
         deadline = time.monotonic() + MODEL_STARTUP_TIMEOUT_S
         self.wait_model(deadline)
+        # 模型/相机启动可能耗尽 connect 的首帧期限；尚未运动，重新建立本次反馈等待。
+        self.robot.reset_hand_feedback()
+        self.robot.read_initial_state(
+            required_tactile=self.control_needs.required_tactile,
+            cancel_requested=lambda: not self.runtime_state.requests_allow_motion(),
+        )
         rows = []
         dt_ns = round(self.info.control_dt_s * 1e9)
         next_sample_ns = time.monotonic_ns()

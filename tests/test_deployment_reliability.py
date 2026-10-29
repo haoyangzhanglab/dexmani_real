@@ -44,7 +44,8 @@ def observation(now):
     arm = np.zeros(1, dtype=STATUS_DTYPE)["frame"]
     hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
     arm["timestamp_ns"] = now
-    hand["timestamp_ns"] = now
+    for name in ("timestamp_ns", "tactile_aggregate_timestamp_ns", "tactile_dense_timestamp_ns"):
+        hand[name] = now
     hand["qpos"] = .2
     return Observation(arm, hand, None, None, None, now)
 
@@ -58,7 +59,8 @@ class DeploymentTests(unittest.TestCase):
             policy_name="test", task_name="test", action_key="action" if mode == "joint" else "action_ee",
             eval=dict(use_ema=False, inference_steps=1),
             agent=dict(n_obs_steps=n_obs, n_action_steps=1, horizon=n_obs, action_dim=19 if mode == "joint" else 21),
-            dataset=dict(sensor_modalities=["joint_state"]),
+            dataset=dict(sensor_modalities=["joint_state", "finger_tactile_force"] if history else ["joint_state"]),
+            tactile_source="real" if history else None,
             policy_metadata=dict(action_start_index=n_obs - 1, control_action_dim=19 if mode == "joint" else 21,
                                  supported_execution_modes=["sync"],
                                  action_context_shapes={} if history is None else {"hand_history": [history, 12]}),
@@ -94,13 +96,18 @@ class DeploymentTests(unittest.TestCase):
                     session.info, session.runtime = info, runtime
                     session.runtime_state = SessionState()
                     session.keyboard = SimpleNamespace(estop_latched=False, check_health=lambda: True)
+                    ready_calls = []
                     session.robot = SimpleNamespace(service_feedback=lambda: None,
+                                                    reset_hand_feedback=lambda: ready_calls.append("reset"),
+                                                    read_initial_state=lambda **kwargs: ready_calls.append(kwargs),
                                                     read_state=lambda: observation(time.monotonic_ns()))
                     session.sensors = SimpleNamespace(channels=None)
                     session.control_needs, session.observations, session.model = needs, builder, worker
                     try:
                         worker.load()
                         session.warmup_policy()
+                        self.assertEqual(ready_calls[0], "reset")
+                        self.assertEqual(ready_calls[1]["required_tactile"], ("aggregate",) if history else ())
                         self.assertEqual(session.runtime_state.safety_state, SafetyState.DISARMED)
                         worker.reset()
                         session.wait_model(time.monotonic() + 2.)
@@ -131,6 +138,103 @@ class DeploymentTests(unittest.TestCase):
                 resolve_deployment_config(replace(cloud_info, pointcloud_config=missing), runtime, ObservationNeeds())
             with self.assertRaisesRegex(ValueError, "control_dt_s"):
                 resolve_deployment_config(replace(info, control_dt_s=None), runtime, ObservationNeeds())
+
+    def make_rollout(self, directory, clock, *, n_obs=1):
+        info = self.info(directory, n_obs=n_obs)
+        runtime = resolve_deployment_config(info, load_config(), ObservationNeeds())
+        state = SessionState()
+        state.arm()
+        builder = ObservationBuilder(info, runtime, dependencies=policy_dependencies(info.observation_fields),
+                                     needs=ObservationNeeds())
+        model = SimpleNamespace(has_pending_task=False, predict=lambda *args, **kwargs: None,
+                                poll=lambda: None)
+        robot = SimpleNamespace(stop_required=False, prepare_streaming=lambda epoch: state.stop_signal.clear(),
+                                stop=lambda: None, read_state=lambda: observation(clock.now), send_action=lambda *a, **k: None)
+        rollout = Rollout(state, runtime, info, preparing_epoch=state.run_id, robot=robot,
+                          observations=builder, record_needs=ObservationNeeds(), needs=ObservationNeeds(),
+                          sensors=SimpleNamespace(channels=None), action_mapper=None, model=model,
+                          max_running_s=60., capture_ids=iter(range(1, 100)), index=1,
+                          output_dir=Path(directory), record_raw=False)
+        rollout.start_observation = lambda: observation(clock.now)
+        rollout.admit()
+        rollout.read_observation = lambda: (observation(clock.now), None, clock.now + 100_000_000)
+        return rollout
+
+    def test_sync_results_receive_a_full_period(self):
+        for phase in (10_000_000, 5_000_000):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                clock = Clock()
+                with patch("time.monotonic_ns", side_effect=lambda: clock.now):
+                    rollout = self.make_rollout(directory, clock)
+                    rollout.step()  # 首个观测提交预测，保留 sync_row。
+                    old_tick = rollout.next_step_ns
+                    clock.now = old_tick - phase
+                    rollout.query.result = np.zeros((1, 19))
+                    sent = []
+
+                    def map_command(row, slot):
+                        clock.advance(6_000_000)
+                        return RobotCommand(rollout.run_id, np.zeros(7), np.zeros(12)), None
+
+                    rollout.command_for_slot = map_command
+                    rollout.robot.send_action = lambda command, **kwargs: sent.append(kwargs)
+                    rollout.step()
+                    self.assertFalse(rollout.finished)
+                    self.assertEqual(len(sent), 1)
+                    self.assertGreater(sent[0]["valid_until_ns"], clock.now)
+                    self.assertEqual(rollout.result.metrics["observation_to_submit_count"], 1)
+                    self.assertAlmostEqual(rollout.result.metrics["observation_to_submit_mean_s"],
+                                           (clock.now - rollout.started_ns) / 1e9)
+
+    def test_long_history_has_separate_prediction_budget_and_total_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock = Clock()
+            with patch("time.monotonic_ns", side_effect=lambda: clock.now):
+                rollout = self.make_rollout(directory, clock, n_obs=42)
+                original_deadline = rollout.run_deadline_ns
+                self.assertEqual(rollout.wait_deadline_ns, clock.now + 41 * rollout.dt_ns + ACTION_TIMEOUT_NS)
+                calls = []
+                rollout.model.predict = lambda rows, **kwargs: calls.append(rows)
+                for index in range(42):
+                    clock.now = rollout.started_ns + index * rollout.dt_ns
+                    rollout.step()
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(len({row.observation_timestamp_ns for row in calls[0]}), 42)
+                self.assertEqual(rollout.wait_deadline_ns, clock.now + ACTION_TIMEOUT_NS)
+                self.assertEqual(rollout.run_deadline_ns, original_deadline)
+                # 实验总截止期仍先于预测等待截止时立即终止。
+                rollout.run_deadline_ns = clock.now
+                rollout.step()
+                self.assertEqual(rollout.result.termination_details, "duration_timeout")
+
+    def test_late_prediction_is_retired_and_directory_creation_is_atomic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock = Clock()
+            with patch("time.monotonic_ns", side_effect=lambda: clock.now):
+                rollout = self.make_rollout(directory, clock)
+                rollout.model.has_pending_task = True
+                rollout.query = Prediction(rollout.run_id, 0, None, clock.now, clock.now)
+                rollout.stop("cancel")
+                rollout.model.poll = lambda: ("predict", PredictionResult(np.zeros((1, 19)), 1))
+                rollout.poll_model()
+                self.assertIsNone(rollout.query)
+                self.assertIsNone(rollout.plan)
+            with patch("dexmani_real.deployment.run.time.strftime", return_value="same"):
+                with ThreadPoolExecutor(2) as executor:
+                    paths = list(executor.map(lambda _: session_directory(Path(directory), rollout.policy_info), range(2)))
+            self.assertNotEqual(*paths)
+            session = PolicySession.__new__(PolicySession)
+            session.output_dir = Path(directory)
+            session.summary, session.errors = {"outcome": "finished"}, []
+            session.episodes = [EpisodeResult(1, started_utc="now", termination_reason="timeout",
+                                             termination_details="duration_timeout"),
+                                EpisodeResult(2, started_utc="now", termination_reason="executor_boundary"),
+                                EpisodeResult(3, termination_reason="start_cancelled", errors=[{"message": "late error"}])]
+            session.save_results()
+            result = json.loads((Path(directory) / "session_result.json").read_text())
+            self.assertEqual(result["outcome"], "finished")
+            self.assertEqual(result["started_episode_count"], 2)
+            self.assertEqual(result["technical_termination_count"], 2)
 
 
 if __name__ == "__main__":
