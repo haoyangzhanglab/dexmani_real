@@ -8,10 +8,10 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.config.xarm7 import (
+    EXECUTOR_TIMEOUT_S,
     HOME_CONVERGENCE_TIMEOUT_S,
-    HOME_TARGET_TIMEOUT_S,
 )
-from dexmani_real.control.homing import HomePathRejected
+from dexmani_real.control.homing import HomePathRejected, home_segment_timeout_s
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.runtime.state import SafetyState
 from dexmani_real.utils.timing import sample_is_fresh
@@ -110,14 +110,14 @@ def home_arm(state, robot, planner, *, cancel_requested):
             return HomeResult(False, "home interrupted during planning", interrupted=True)
 
         logger.debug("arm home: %d planned milestones", len(waypoints))
-        travel = (
-            float(np.max(np.abs(np.diff(waypoints, axis=0)), axis=1).sum())
-            if len(waypoints) > 1 else 0
-        )
-        duration_s = max(
-            10.0,
-            2 * travel / config.homing.max_speed_rad_per_s
-            + len(waypoints) * HOME_TARGET_TIMEOUT_S + 7,
+        # worker 先停稳，再查询起点/切换模式；每段允许计划起点的收敛误差。
+        duration_s = HOME_CONVERGENCE_TIMEOUT_S + EXECUTOR_TIMEOUT_S + config.feedback_max_age_s
+        duration_s += (
+            sum(
+                home_segment_timeout_s(float(distance) + config.homing.convergence_rad, config)
+                for distance in np.max(np.abs(np.diff(waypoints, axis=0)), axis=1)
+            )
+            if len(waypoints) > 1 else HOME_CONVERGENCE_TIMEOUT_S
         )
         deadline_ns = time.monotonic_ns() + int(duration_s * 1e9)
         try:

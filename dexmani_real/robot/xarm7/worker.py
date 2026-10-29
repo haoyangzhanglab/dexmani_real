@@ -9,8 +9,8 @@ import numpy as np
 from dexmani_real.config.xarm7 import (
     HOME_CONVERGENCE_TIMEOUT_S,
     HOME_DWELL_S,
-    HOME_TARGET_TIMEOUT_S,
 )
+from dexmani_real.control.homing import home_segment_timeout_s
 from dexmani_real.robot.commands import OperationCancelled, validate_arm_target
 from dexmani_real.robot.xarm7.protocol import (
     STATUS_DTYPE,
@@ -148,13 +148,10 @@ class ArmController:
                 check_abort()
                 self.driver.move_home_milestone(target)
                 check_abort()
-                nominal = (
-                    float(np.max(np.abs(target - current))) / self.cfg.homing.max_speed_rad_per_s
-                )
                 self.wait_settled(
                     check_abort,
                     stage=f"home milestone {index}",
-                    timeout_s=2 * nominal + HOME_TARGET_TIMEOUT_S,
+                    timeout_s=home_segment_timeout_s(float(np.max(np.abs(target - current))), self.cfg),
                     target=target,
                     tolerance_rad=min(self.cfg.homing.convergence_rad, np.deg2rad(0.5)),
                 )
@@ -167,7 +164,7 @@ class ArmController:
                 stage="home dwell",
                 strict=True,
                 target=final_qpos,
-                timeout_s=HOME_DWELL_S + (1 / self.cfg.feedback_hz),
+                timeout_s=HOME_CONVERGENCE_TIMEOUT_S,
             )
         check_abort()
 
