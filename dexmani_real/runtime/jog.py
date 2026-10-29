@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from dexmani_real.control.ik import IKResult
 from dexmani_real.geometry.pose import Pose, quat_multiply
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
 from dexmani_real.runtime.keyboard import CARTESIAN_JOG_KEYS, JOG_KEY_PAIRS
@@ -18,10 +18,6 @@ from dexmani_real.runtime.observation import (
     read_observation,
 )
 from dexmani_real.runtime.state import SafetyState
-
-if TYPE_CHECKING:
-    from dexmani_real.control.ik import IKResult
-
 
 logger = logging.getLogger(__name__)
 
@@ -92,12 +88,11 @@ class CartesianJog:
                 hand_qpos=(row.hand["qpos"][0] if row.hand is not None
                            else np.deg2rad(runtime.hand.home_qpos_deg)),
             )
-            if result is not None:
-                if result.qpos is None:
-                    logger.warning("IK rejected target: %s", result.reason)
-                    self.blocked_until_release = True
-                elif keys.snapshot() == pressed_keys:
-                    target = result.qpos
+            if result.qpos is None:
+                logger.warning("IK rejected target: %s", result.reason)
+                self.blocked_until_release = True
+            elif keys.snapshot() == pressed_keys:
+                target = result.qpos
         if target is None:
             self.clear_reference()
         command = RobotCommand(epoch, arm_qpos=target, arm_hold=target is None)
@@ -110,7 +105,7 @@ class CartesianJog:
         if target is not None:
             self.command_pose, self.command_qpos = pose.copy(), command.arm_qpos
 
-    def propose(self, pressed_keys, measured_qpos, *, hand_qpos) -> tuple[Pose, IKResult | None]:
+    def propose(self, pressed_keys, measured_qpos, *, hand_qpos) -> tuple[Pose, IKResult]:
         baseline_qpos, baseline_pose = self.command_qpos, self.command_pose
         if baseline_pose is None:
             baseline_qpos = measured_qpos
@@ -122,12 +117,17 @@ class CartesianJog:
             baseline_pose, dx, drpy,
             self.position_lower, self.position_upper,
         )
-        result = None
         if changed:
             result = self.solver.solve(
                 pose, measured_qpos, baseline_qpos,
                 hand_qpos=hand_qpos,
             )
+        else:
+            # 饱和仍是持续输入；保留已接受的目标，同时检查变化后的手部几何。
+            reason = self.solver.constraints.rejection(
+                baseline_qpos, collision_hand_qpos=hand_qpos,
+            )
+            result = IKResult(qpos=baseline_qpos if reason is None else None, reason=reason or "")
         return pose, result
 
 

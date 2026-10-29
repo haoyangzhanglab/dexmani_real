@@ -15,10 +15,6 @@ from dexmani_real.robot.model import ARM_JOINT_SHAPE
 
 PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=bool)
 
-# 工作空间边缘允许 FK 非线性插值产生 1 mm 外扩。
-WORKSPACE_BOUNDS_TOLERANCE_M = 1e-3
-
-
 def home_segment_timeout_s(distance: float, arm: ArmConfig) -> float:
     """静止到静止的运动估计，加既有运动余量、停稳及查询预算。"""
     speed = arm.homing.max_speed_rad_per_s
@@ -103,8 +99,9 @@ class HomePlanner:
         if reason is not None:
             raise HomePathRejected(f"collision: {reason}")
         position = self.collision_model.eef_position()
-        if np.any(position < self.workspace_bounds[:, 0] - WORKSPACE_BOUNDS_TOLERANCE_M) or np.any(
-            position > self.workspace_bounds[:, 1] + WORKSPACE_BOUNDS_TOLERANCE_M
+        margin = self.environment.eef_workspace_margin_m
+        if np.any(position < self.workspace_bounds[:, 0] - margin) or np.any(
+            position > self.workspace_bounds[:, 1] + margin
         ):
             raise HomePathRejected(f"path leaves workspace: {position}")
         clearance, measurement, source = self._table_clearance()

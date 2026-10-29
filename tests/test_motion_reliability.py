@@ -116,3 +116,80 @@ def test_partial_hand_connection_preserves_original_error_and_cleans_arm(monkeyp
         robot.close()
     assert robot.stop_required
     assert robot.stop_failure is not None
+
+
+def test_saturated_jog_keeps_accepted_target_and_rechecks_hand(monkeypatch):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.geometry.pose import Pose
+    from dexmani_real.runtime import jog
+
+    runtime = RealConfig()
+    constraints = SimpleNamespace(rejection=Mock(return_value=None))
+    solver = SimpleNamespace(constraints=constraints)
+    motion = jog.CartesianJog(solver, runtime.keyboard_teleop, (np.full(3, -1), np.ones(3)))
+    motion.command_pose = Pose(p=np.array([1.0, 0.0, 0.0]), q=np.array([1.0, 0.0, 0.0, 0.0]))
+    accepted = np.full(7, 0.5)
+    motion.command_qpos = accepted
+    row = SimpleNamespace(arm={"qpos": [np.zeros(7)], "timestamp_ns": [1]}, hand={"qpos": [np.zeros(12)]})
+    monkeypatch.setattr(jog, "read_observation", lambda *_: row)
+    monkeypatch.setattr(jog, "check_observation", lambda *_, **__: ([], 1_000_000_000))
+    state = SessionState(safety_state=SafetyState.RUNNING)
+    robot, keys = SimpleNamespace(send_action=Mock()), SimpleNamespace(snapshot=lambda: frozenset("w"))
+    for _ in range(3):
+        motion.step(robot, keys, state, runtime)
+        command = robot.send_action.call_args.args[0]
+        assert not command.arm_hold
+        np.testing.assert_array_equal(command.arm_qpos, accepted)
+        np.testing.assert_array_equal(motion.command_qpos, accepted)
+    row.hand["qpos"][0][0] = 0.2
+    constraints.rejection.return_value = "hand collision"
+    motion.step(robot, keys, state, runtime)
+    assert robot.send_action.call_args.args[0].arm_hold
+    assert motion.blocked_until_release
+    assert constraints.rejection.call_args.kwargs["collision_hand_qpos"][0] == 0.2
+
+
+def test_ik_scores_the_selected_absolute_branch():
+    from dexmani_real.control.ik import IKSolver
+    from dexmani_real.geometry.pose import Pose
+
+    solver = IKSolver.__new__(IKSolver)
+    solver.limits = np.tile([-3.1, 3.1], (7, 1))
+    solver.joint_ranges = np.full(7, 6.2)
+    solver.position_tolerance = solver.rotation_tolerance = 0.01
+    raw, current = np.zeros(7), np.zeros(7)
+    raw[0], current[0] = -3.1, 3.1
+    solver.model = SimpleNamespace(compute_IK_CLIK=lambda *_: (raw, True, None))
+    solver.eef_link_id = 0
+    solver.constraints = SimpleNamespace(endpoint_rejection=lambda *_, **__: None)
+    pose = Pose(p=np.zeros(3), q=np.array([1.0, 0.0, 0.0, 0.0]))
+    solver.compute_eef_pose_base = lambda _: pose
+    solver.joint_limit_penalty = lambda _: 0
+    candidate, _ = solver.try_clik(current, pose, pose, current, current, [])
+    assert candidate.displacement_rad == pytest.approx(6.2)
+    assert candidate.cost > 2
+
+
+@pytest.mark.parametrize("outside", [0.003, 0.006])
+def test_home_and_online_workspace_share_the_configured_margin(outside):
+    from dexmani_real.config.control import EnvironmentConfig
+    from dexmani_real.control.constraints import MotionConstraints
+    from dexmani_real.control.homing import HomePathRejected, HomePlanner
+
+    environment = EnvironmentConfig()
+    bounds = environment.workspace.as_array()
+    position = bounds.mean(axis=1)
+    position[0] = bounds[0, 1] + outside
+    collision = SimpleNamespace(rejection=lambda _: None, eef_position=lambda: position)
+    online = MotionConstraints.__new__(MotionConstraints)
+    online.workspace, online.margin = bounds, environment.eef_workspace_margin_m
+    online.collision_model = collision
+    planner = HomePlanner.__new__(HomePlanner)
+    planner.environment, planner.workspace_bounds, planner.collision_model = environment, bounds, collision
+    planner._table_clearance = lambda: (1, 1, "test")
+    rejected = online.endpoint_rejection(np.zeros(7), position=position) is not None
+    if rejected:
+        with pytest.raises(HomePathRejected, match="workspace"):
+            planner._check_state(tuple(np.zeros(7)))
+    else:
+        planner._check_state(tuple(np.zeros(7)))

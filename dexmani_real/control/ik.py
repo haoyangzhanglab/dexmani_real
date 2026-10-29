@@ -5,7 +5,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.control.constraints import (
-    equivalent_joint_delta,
     joint_target_rejection,
     wrap_nearest_equivalent,
 )
@@ -174,8 +173,8 @@ class IKSolver:
         if position_error > self.position_tolerance or rotation_error > self.rotation_tolerance:
             return None, "pose_error"
 
-        delta = equivalent_joint_delta(q, current)
-        previous_delta = equivalent_joint_delta(q, previous)
+        delta = q - current
+        previous_delta = q - previous
         cost = (
             np.sqrt(np.sum(JOINT_WEIGHTS * (delta / self.joint_ranges) ** 2))
             + 0.25 * np.sqrt(np.sum(PREVIOUS_WEIGHTS * (previous_delta / self.joint_ranges) ** 2))
