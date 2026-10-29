@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from cordvip_geometry.cli import capture_object
+from cordvip_geometry.cli import build_object, capture_object
 from cordvip_geometry.io import load_initial_selection, write_confirmed_selection
 from cordvip_geometry.live_workers import (
     CloseStatus, SceneWorker, SourceSnapshot, wait_worker,
@@ -35,8 +35,12 @@ def frame():
 
 class CordVIPReliabilityTests(unittest.TestCase):
     def test_close_discards_results_and_preserves_independent_failures(self):
-        for failure in (ValueError("model failed"), CancelledError("expected close")):
-            with self.subTest(failure=type(failure).__name__):
+        for failure, completed in (
+            (ValueError("model failed"), False),
+            (CancelledError("expected close"), False),
+            (ValueError("model failed"), True),
+        ):
+            with self.subTest(failure=type(failure).__name__, completed=completed):
                 entered, release = threading.Event(), threading.Event()
 
                 def step(*args, **kwargs):
@@ -60,7 +64,13 @@ class CordVIPReliabilityTests(unittest.TestCase):
                     wait_worker(worker, heartbeat, loading=True)
                     self.assertTrue(worker.submit("step", frame()))
                     self.assertTrue(entered.wait(1))
-                    self.assertTrue(worker.close(timeout_s=0).pending)
+                    if completed:
+                        release.set()
+                        while worker.snapshot().busy:
+                            heartbeat()
+                            time.sleep(0.001)
+                    else:
+                        self.assertTrue(worker.close(timeout_s=0).pending)
                 finally:
                     release.set()
                     status = worker.close(timeout_s=2)
@@ -119,6 +129,40 @@ class CordVIPReliabilityTests(unittest.TestCase):
                 if model_error:
                     self.assertIn("independent model failure", str(failure.exception))
 
+    def test_builder_owns_failed_sam_start_and_preserves_the_load_error(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.png"
+            source.write_bytes(b"source is copied after the RGB has been loaded")
+            args = SimpleNamespace(
+                headless=True, instance=0, list_only=False, rgbd=None,
+                output_dir=root / "output", workspace=root, text="object",
+                sam_python=root / "python", sam_root=root / "sam",
+                sam_checkpoint=root / "sam.pt", sam_config="sam",
+                dino_weights=root / "dino", box_threshold=0.3, text_threshold=0.25,
+            )
+            segmenter = GroundedSAM2Segmenter(
+                args.sam_python, args.sam_root, args.sam_checkpoint,
+                sam_config=args.sam_config, dino_weights=args.dino_weights,
+                log_path=root / "sam.log",
+            )
+            try:
+                with (
+                    patch.object(build_object, "load_rgb", return_value=(frame().rgb, source, {})),
+                    patch("cordvip_geometry.segmentation.GroundedSAM2Segmenter", return_value=segmenter),
+                    patch("cordvip_geometry.segmentation.subprocess.Popen"),
+                    patch.object(segmenter, "call", side_effect=ValueError("load failed")),
+                    patch.object(segmenter, "close", side_effect=RuntimeError("close failed")) as close,
+                    self.assertLogs(build_object.__name__, level="ERROR") as logs,
+                ):
+                    with self.assertRaisesRegex(ValueError, "load failed"):
+                        build_object.ObjectModelBuilder(args).segment()
+                    close.assert_called_once()
+                self.assertIn("close failed", "\n".join(logs.output))
+            finally:
+                if segmenter._log is not None:
+                    segmenter._log.close()
+
     def test_selection_relocation_keeps_content_and_recorded_identity_checks(self):
         original = frame()
         moved = replace(original, source_id="raw:/new/episode:camera:1")
@@ -156,10 +200,13 @@ class CordVIPReliabilityTests(unittest.TestCase):
     def test_pose_initialization_uses_actual_stride_support(self):
         source = frame()
         masks = {"object": np.ones((8, 8), dtype=bool)}
-        segmenter = SimpleNamespace(
-            initialize=lambda *args, **kwargs: masks, track=lambda *args, **kwargs: masks,
-            last_metrics={},
-        )
+
+        def new_segmenter():
+            return SimpleNamespace(
+                initialize=lambda *args, **kwargs: masks, track=lambda *args, **kwargs: masks,
+                last_metrics={},
+            )
+
         points, normals = np.zeros((1, 3)), np.array([[0, 0, 1]])
         pose_tracker = SimpleNamespace(register=Mock(return_value=np.eye(4)))
         renderer = SimpleNamespace(render=lambda *args: np.ones((8, 8), dtype=np.float32))
@@ -169,7 +216,7 @@ class CordVIPReliabilityTests(unittest.TestCase):
             patch("cordvip_geometry.scene_tracking.ModelDepthRenderer", return_value=renderer),
         ):
             tracker = SceneTracker(
-                segmenter, {"object": (None, points, normals)},
+                new_segmenter(), {"object": (None, points, normals)},
                 foundationpose_root="unused", debug_dir="unused", pixel_stride=2,
             )
             with self.assertRaisesRegex(ValueError, "16.*requires 30"):
@@ -177,7 +224,12 @@ class CordVIPReliabilityTests(unittest.TestCase):
             self.assertIsNone(tracker.instance_ids)
             pose_tracker.register.assert_not_called()
 
-            tracker.min_matched_pixels = 16
+            # 首次初始化失败后须开启新会话，不在已初始化的 SAM 上重试。
+            tracker = SceneTracker(
+                new_segmenter(), {"object": (None, points, normals)},
+                foundationpose_root="unused", debug_dir="unused", pixel_stride=2,
+                min_matched_pixels=16,
+            )
             with patch.object(tracker, "sync"):
                 first = tracker.step(
                     source, source.rgb, source.depth_m, source.K, initial_masks=masks,
@@ -188,7 +240,7 @@ class CordVIPReliabilityTests(unittest.TestCase):
             later_result = tracker.step(later, later.rgb, depth, later.K)
             self.assertEqual(later_result["objects"]["object"]["state"], "POSE_LOST")
 
-        mask_only = SceneTracker(segmenter, {}, foundationpose_root="unused", debug_dir="unused")
+        mask_only = SceneTracker(new_segmenter(), {}, foundationpose_root="unused", debug_dir="unused")
         observed = mask_only.step(
             source, source.rgb, source.depth_m, source.K, initial_masks=masks,
         )

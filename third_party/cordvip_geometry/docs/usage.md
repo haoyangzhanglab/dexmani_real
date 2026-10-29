@@ -194,6 +194,10 @@ python -m cordvip_geometry prepare \
 
 相机/replay iterator 和模型分别由各自的线程持有；GUI 读取 latest mailbox，每次最多一个推理请求。输入数组发布后不可变。关闭先撤销待处理结果，再等待 owner 清理；已经进入 SDK/CUDA 的调用不能由 GUI 强行中断。SAM cancel 仅撤销自己的进程组，不中断父进程 FoundationPose CUDA 调用。
 
+模型 owner 统一负责成功及加载失败后的关闭。撤销几何结果不会抹掉独立模型错误，包括已完成但尚未消费的错误；预期取消不算新的故障。主操作与关闭同时失败时保留主错误，并单独记录关闭错误。
+
+`capture` 已冻结的 RGB-D 副本可以在随后来源故障后由操作者按 Enter 保存；故障仍显示并写入 `result.json`，此时 `capture_saved=true` 与 `status=failed` 可以同时出现。未冻结时来源故障直接结束，不自动保存或恢复。
+
 Frame 保留原 RGB-D、source identity、row 和 clock。没有相机来源证据时显式使用 Raw row/relative identity；主机接收时间不是曝光时间。离线首帧可以等待注册，live source 持续前进；MP4 解码 RGB 不声称与最初采集像素逐位相同，耗尽迭代器才验证完整帧数。
 
 几何统一在 color-camera frame 中使用 m。深度是 camera Z，零代表缺测；Open3D ray direction 保持 Z=1，因此命中参数也是 Z，不能归一化成欧氏射线。去畸变仅接收已支持的 forward Brown-Conrady 模型，depth/mask 使用最近邻，避免跨边界伪造深度。

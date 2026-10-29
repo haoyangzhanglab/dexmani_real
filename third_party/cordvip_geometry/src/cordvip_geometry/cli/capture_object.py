@@ -138,7 +138,6 @@ def run(args):
     frozen_ns = None
     saved = None
     error = None
-    stopped = True
     window_open = False
     try:
         cv2.namedWindow(title, cv2.WINDOW_NORMAL)

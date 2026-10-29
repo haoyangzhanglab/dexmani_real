@@ -16,7 +16,8 @@ from .segmentation_protocol import receive, send
 
 class GroundedSAM2Segmenter:
     """One owner-thread request; start loads the child model and cancel revokes its process group.
-    Parent FoundationPose CUDA work must finish on its own thread before cleanup."""
+    The owner calls close after either successful or failed start. Parent FoundationPose
+    CUDA work must finish on its own thread before cleanup."""
 
     def __init__(self, sam_python, sam_root, checkpoint, *, sam_config, dino_weights, log_path):
         self.python = Path(sam_python).expanduser().absolute()
@@ -75,12 +76,8 @@ class GroundedSAM2Segmenter:
                 self._log.close()
                 self._log = None
                 raise
-        try:
-            reply, _ = self.call("load")
-            self.provenance = reply["provenance"]
-        except BaseException:
-            self.close()
-            raise
+        reply, _ = self.call("load")
+        self.provenance = reply["provenance"]
         return self
 
     def call(self, operation, arrays=None, *, frame_key=None, **parameters):

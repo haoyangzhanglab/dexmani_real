@@ -209,6 +209,9 @@ class SceneWorker:
     def close(self, timeout_s=1.5):
         self.stop_event.set()
         with self.lock:
+            if self.result is not None and self.result.error is not None:
+                message = self.result.error
+                self.error = f"{message}; {self.error}" if self.error else message
             self.result = self.pending_task = None
         self.segmenter.cancel()
         self.wake_event.set()

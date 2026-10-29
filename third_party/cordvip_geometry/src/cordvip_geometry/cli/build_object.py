@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -14,6 +15,8 @@ from pathlib import Path
 from ..io import existing_file, output_path, write_json
 from .arguments import parse_object_args
 from .object_selection import choose, display_available, save_candidates, save_selection
+
+logger = logging.getLogger(__name__)
 
 
 def load_rgb(args):
@@ -140,8 +143,13 @@ class ObjectModelBuilder:
             provenance.update(
                 model=self.segmenter.provenance, performance=self.segmenter.last_metrics
             )
-        finally:
-            self.segmenter.close()
+        except BaseException:
+            try:
+                self.segmenter.close()
+            except BaseException:
+                logger.exception("SAM2 cleanup also failed")
+            raise
+        self.segmenter.close()
         if not candidates:
             write_json(output / "segmentation_result.json", {**provenance, "num_candidates": 0})
             raise RuntimeError(f"没有检测到目标；原图和请求已保留在 {output}，可调整文本或阈值")
