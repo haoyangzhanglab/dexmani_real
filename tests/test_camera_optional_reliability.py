@@ -123,14 +123,16 @@ class CameraReliabilityTests(unittest.TestCase):
             pointcloud=SimpleNamespace(remove_table=False),
         )
         args = SimpleNamespace(save_dir=None, config=None, camera_calibration=None)
-        for failed in (False, True):
-            with self.subTest(failed=failed):
+        for failed, restore_failed in ((False, False), (True, False), (True, True), (False, True)):
+            with self.subTest(failed=failed, restore_failed=restore_failed):
                 priority = [1.0]
                 changes = []
 
                 def set_option(option, value):
                     priority[0] = value
                     changes.append(value)
+                    if restore_failed and value == 1.0:
+                        raise RuntimeError("restore failed")
 
                 camera = SimpleNamespace(
                     connect=Mock(), disconnect=Mock(),
@@ -157,6 +159,9 @@ class CameraReliabilityTests(unittest.TestCase):
                 ):
                     if failed:
                         with self.assertRaisesRegex(ValueError, "capture failed"):
+                            view_pointcloud.run_pointcloud_diagnostic(args)
+                    elif restore_failed:
+                        with self.assertRaisesRegex(RuntimeError, "restore failed"):
                             view_pointcloud.run_pointcloud_diagnostic(args)
                     else:
                         self.assertEqual(view_pointcloud.run_pointcloud_diagnostic(args), 0)

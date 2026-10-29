@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -36,6 +37,8 @@ from dexmani_real.utils.visualization.pointcloud import PointCloudViewer
 
 if TYPE_CHECKING:
     from dexmani_real.sensor.realsense import RealSenseCamera
+
+logger = logging.getLogger(__name__)
 
 
 TABLE_CALIBRATION_FRAMES = 5
@@ -334,6 +337,7 @@ def run_pointcloud_diagnostic(args) -> int:
     configure_logging()
     camera = RealSenseCamera(runtime.camera, auto_exposure_priority=None)
     original_priority = None
+    failure = None
     print("Connecting to RealSense...")
     try:
         camera.connect()
@@ -430,15 +434,29 @@ def run_pointcloud_diagnostic(args) -> int:
             camera=camera,
             processor=processor,
         )
+    except BaseException as exc:
+        failure = exc
     finally:
         try:
             if original_priority is not None:
                 restored = set_ae_priority(camera, original_priority)
                 if restored is None or not np.isclose(restored, original_priority):
                     raise RuntimeError(f"exposure priority readback mismatch: {restored}")
-        finally:
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+            else:
+                logger.exception("exposure restoration also failed")
+        try:
             camera.disconnect()
             print("RealSense pipeline stopped cleanly.")
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+            else:
+                logger.exception("camera disconnect also failed")
+        if failure is not None:
+            raise failure
 
     # 所有采集已完成；静态浏览不再占用相机。
     viewer = PointCloudViewer(
