@@ -103,6 +103,7 @@ class HandFK:
         self.sdk_to_urdf = np.array([
             XHAND_SDK_JOINT_NAMES.index(name) for _, name in active
         ], dtype=np.intp)
+        self.urdf_to_sdk = np.argsort(self.sdk_to_urdf)
         if len(fingertip_link_names) != 5 or len(set(fingertip_link_names)) != 5:
             raise ValueError("hand FK requires five distinct fingertip frames")
         self.fingertip_frame_ids = tuple(self.model.getFrameId(n) for n in fingertip_link_names)
@@ -117,6 +118,20 @@ class HandFK:
             self.pin.updateFramePlacement(self.model, self.data, fid).homogeneous
             for fid in frame_ids
         ])
+
+    def positions_and_jacobians(self, qpos: np.ndarray, frame_ids: Sequence[int]):
+        """手基座系位置及其对 SDK 顺序关节的解析导数；一次 FK 服务所有目标。"""
+        q = np.asarray(qpos, dtype=np.float64)[self.sdk_to_urdf]
+        self.pin.computeJointJacobians(self.model, self.data, q)
+        self.pin.updateFramePlacements(self.model, self.data)
+        positions = np.stack([self.data.oMf[fid].translation for fid in frame_ids])
+        jacobians = np.stack([
+            self.pin.getFrameJacobian(
+                self.model, self.data, fid, self.pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+            )[:3, self.urdf_to_sdk]
+            for fid in frame_ids
+        ])
+        return positions, jacobians
 
 
 def eef_poses(arm_qpos: np.ndarray, *, arm_fk: ArmFK | None = None) -> np.ndarray:

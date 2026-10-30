@@ -11,7 +11,11 @@ from dexmani_real.config.teleop import DEFAULT_TASK_NAME
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.recorder import RecordingError
-from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
+from dexmani_real.ipc.sensors import (
+    SensorChannels,
+    read_vr_frame,
+    snapshot_camera_parameters,
+)
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import initialize_hand
@@ -33,6 +37,7 @@ from dexmani_real.teleop.loop import TeleopLoop, failure_reason
 from dexmani_real.teleop.vr import VRController
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.table_plane import load_table_plane
+from dexmani_real.utils.timing import sample_is_fresh
 from dexmani_real.utils.vr_heading import load_vr_transform
 
 logger = logging.getLogger(__name__)
@@ -247,6 +252,8 @@ def initialize_teleop(loop, vr_process) -> bool:
             break
         if time.monotonic() >= deadline:
             raise RuntimeError("VR failed to become ready before the startup timeout")
+    if not calibrate_hand(loop):
+        return False
     loop.keyboard.discard_events("b", "c", "h", "t")
     print(
         "就绪：B 开始 | C 暂停/继续（继续时新建录制段） | H 保存并回初始位 | "
@@ -264,9 +271,57 @@ def finish_audio(audio):
         audio.close()
 
 
+def calibrate_hand(loop):
+    """只消费新鲜、来源时间递增的 VR 帧；重复读取缓存不计作标定样本。"""
+    retargeter = loop.controller.hand_retargeter
+    if retargeter is None:
+        return True
+    from dexmani_real.teleop.retargeting.landmarks import prepare_landmarks
+
+    config = loop.runtime.hand_retargeting
+    print("正在标定手部骨长：请保持右手清晰可见；无需保持伸直。S/Q/Esc 可取消。", flush=True)
+    deadline = time.monotonic() + config.calibration_timeout_s
+    frames, last_sequence, last_source_ns = [], None, 0
+    last_error = "no fresh hand frames"
+    while len(frames) < config.calibration_samples:
+        if not loop.keyboard.check_health():
+            loop.runtime_state.request_emergency_stop()
+        if loop.poll_blocking_commands():
+            loop.runtime_state.request_quit()
+            return False
+        loop.robot.service_idle()
+        if not loop.sensors.check(names=("vr",)):
+            raise RuntimeError("VR worker exited during hand calibration")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"hand calibration timed out ({len(frames)}/{config.calibration_samples}): {last_error}"
+            )
+        frame = read_vr_frame(loop.sensors.channels)
+        if frame is not None:
+            stamp = int(frame["recv_ts_ns"])
+            now_ns = time.monotonic_ns()
+            if (
+                frame["ring_sequence"] != last_sequence and stamp > last_source_ns
+                and sample_is_fresh(stamp, loop.runtime.teleop.vr_stale_threshold_s, now_ns)
+            ):
+                last_sequence, last_source_ns = frame["ring_sequence"], stamp
+                try:
+                    prepare_landmarks(frame["landmarks"])
+                except ValueError as exc:
+                    last_error = str(exc)
+                else:
+                    frames.append(frame["landmarks"].copy())
+        time.sleep(0.005)
+    retargeter.calibrate(frames)
+    logger.info("Hand morphology calibrated from %s distinct frames", len(frames))
+    return True
+
+
 def build_hand_retargeter(runtime):
     if not runtime.hand.enabled:
         return None
-    from dexmani_real.teleop.retargeting.dexpilot import DexPilotRetargeter
+    from dexmani_real.teleop.retargeting.adaptive import AdaptiveHandRetargeter
 
-    return DexPilotRetargeter(runtime.dexpilot_retargeting, runtime.hand)
+    return AdaptiveHandRetargeter(
+        runtime.hand_retargeting, runtime.hand, control_hz=runtime.teleop.control_hz,
+    )

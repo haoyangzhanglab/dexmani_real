@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import astuple, dataclass
+from dataclasses import dataclass
 from math import radians
 
 import numpy as np
@@ -62,22 +62,48 @@ class KeyboardTeleopConfig:
 
 
 @dataclass(frozen=True)
-class DexPilotConfig:
-    scaling_factor: float = 1.15
-    pinky_scale: float = 1.15
-    pinky_palm_scale: float = 1.0
-    low_pass_alpha: float = 0.5
-    # 抓取投影的进入与退出距离。
-    project_dist_m: float = 0.03
-    escape_dist_m: float = 0.05
+class HandRetargetingConfig:
+    """米/弧度/秒；权重作用于无量纲残差，默认值是待真机验证的起点。"""
+
+    calibration_samples: int = 25
+    calibration_timeout_s: float = 5.0
+    calibration_max_relative_mad: float = 0.10
+    bone_length_tolerance: float = 0.35
+    position_scale_m: float = 0.10
+    huber_delta_m: float = 0.02
+    shape_weight: float = 1.0
+    tip_weight: float = 2.0
+    direction_weight: float = 0.08
+    pinch_weight: float = 12.0
+    pinch_start_m: float = 0.05
+    pinch_full_m: float = 0.02
+    pinch_gap_m: float = 0.012
+    # 近端正则系数按 1/dt 缩放，相当于离散阻尼；不是力或实测速度约束。
+    damping_s: float = 0.002
+    smoothing_tau_s: float = 0.04
+    max_joint_speed_rad_s: float = 4.0
+    max_evaluations: int = 50
+    max_solve_time_s: float = 0.025
+    ftol_abs: float = 1e-7
 
     def validate(self) -> None:
-        if not all(np.all(np.isfinite(value)) for value in astuple(self)):
-            raise ValueError("DexPilot parameters must be finite")
-        if not 0.0 <= self.low_pass_alpha <= 1.0:
-            raise ValueError("DexPilot low_pass_alpha must be in [0, 1]")
-        if not 0 < self.project_dist_m <= self.escape_dist_m:
-            raise ValueError("DexPilot distances must satisfy 0 < project_dist_m <= escape_dist_m")
+        for name in ("calibration_samples", "max_evaluations"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 2:
+                raise ValueError(f"hand_retargeting.{name} must be an integer >= 2")
+        nonnegative = (
+            "shape_weight", "tip_weight", "direction_weight", "pinch_weight",
+            "damping_s", "smoothing_tau_s",
+        )
+        for name, value in vars(self).items():
+            if not np.isfinite(value) or (value < 0 if name in nonnegative else value <= 0):
+                raise ValueError(f"invalid hand_retargeting.{name}")
+        if self.tip_weight <= 0:
+            raise ValueError("hand_retargeting.tip_weight must be positive")
+        if not 0 < self.pinch_gap_m <= self.pinch_full_m < self.pinch_start_m:
+            raise ValueError("pinch distances must satisfy 0 < gap <= full < start")
+        if not 0 < self.calibration_max_relative_mad < self.bone_length_tolerance < 1:
+            raise ValueError("calibration MAD and bone tolerance must satisfy 0 < MAD < tolerance < 1")
 
 
 DEFAULT_TASK_NAME = "test"

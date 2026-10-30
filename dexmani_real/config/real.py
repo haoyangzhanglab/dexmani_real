@@ -20,7 +20,7 @@ from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.config.sensor import CameraConfig, VRConfig
 from dexmani_real.config.teleop import (
     CollectionConfig,
-    DexPilotConfig,
+    HandRetargetingConfig,
     KeyboardTeleopConfig,
     TeleopConfig,
 )
@@ -41,7 +41,7 @@ class RealConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
-    dexpilot_retargeting: DexPilotConfig = field(default_factory=DexPilotConfig)
+    hand_retargeting: HandRetargetingConfig = field(default_factory=HandRetargetingConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
 
 
