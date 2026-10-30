@@ -22,7 +22,6 @@ from dexmani_real.config.teleop import (
     CollectionConfig,
     DexPilotConfig,
     KeyboardTeleopConfig,
-    TAGConfig,
     TeleopConfig,
 )
 from dexmani_real.config.xarm7 import ArmConfig
@@ -42,7 +41,6 @@ class RealConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
-    tag_retargeting: TAGConfig = field(default_factory=TAGConfig)
     dexpilot_retargeting: DexPilotConfig = field(default_factory=DexPilotConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
 

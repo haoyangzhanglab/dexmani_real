@@ -6,6 +6,7 @@ from dex_retargeting.optimizer_utils import LPFilter
 from dex_retargeting.robot_wrapper import RobotWrapper
 
 from dexmani_real.config.teleop import DexPilotConfig
+from dexmani_real.config.xhand import HandConfig
 from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
     XHAND_FINGERTIP_LINK_NAMES,
@@ -16,7 +17,7 @@ from dexmani_real.teleop.retargeting.landmarks import prepare_landmarks
 
 
 class DexPilotRetargeter:
-    def __init__(self, config: DexPilotConfig):
+    def __init__(self, config: DexPilotConfig, hand_config: HandConfig):
         config.validate()
         self.config = config
         robot = RobotWrapper(str(XHAND_RIGHT_URDF_PATH))
@@ -28,8 +29,16 @@ class DexPilotRetargeter:
             project_dist=config.project_dist_m,
             escape_dist=config.escape_dist_m,
         )
-        self.limits = robot.joint_limits[self.optimizer.idx_pin2target]
-        self.optimizer.set_joint_limit(self.limits)
+        model_limits = robot.joint_limits[self.optimizer.idx_pin2target]
+        self.limits = np.column_stack((hand_config.qpos_min_rad, hand_config.qpos_max_rad))
+        if (
+            self.limits.shape != model_limits.shape
+            or np.any(self.limits[:, 0] < model_limits[:, 0] - 1e-6)
+            or np.any(self.limits[:, 1] > model_limits[:, 1] + 1e-6)
+        ):
+            raise ValueError("hand command limits exceed the DexPilot model limits")
+        # 求解与发送使用同一范围；不使用上游默认向外扩张的 epsilon。
+        self.optimizer.set_joint_limit(self.limits, epsilon=0)
         self.landmark_pairs = self.optimizer.target_link_human_indices
         self.fixed_qpos = np.empty(0, dtype=np.float32)
         self.filter = LPFilter(config.low_pass_alpha)

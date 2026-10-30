@@ -125,7 +125,7 @@ class Robot:
         self.reset_hand_feedback(deadline_ns=deadline_ns)
         self.read_initial_state(cancel_requested=cancelled)
 
-    def reset_tactile_sensors(self, *, cancel_requested):
+    def reset_tactile_sensors(self, *, cancel_requested, required_tactile=()):
         self.check()
         if self.hand is None:
             return False
@@ -145,7 +145,7 @@ class Robot:
         finally:
             self.reset_hand_feedback()
         if reset:
-            self.read_initial_state(cancel_requested=cancelled)
+            self.read_initial_state(required_tactile=required_tactile, cancel_requested=cancelled)
         return reset
 
     def reset_hand_feedback(self, *, deadline_ns=None):

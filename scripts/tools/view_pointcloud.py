@@ -169,13 +169,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--config", type=Path, help="Optional experiment YAML overrides")
     parser.add_argument("--camera-calibration", type=Path)
-    parser.add_argument("--benchmark", choices=("offline", "live"), help="非交互评估当前点云处理器")
-    parser.add_argument("--episode-root", type=Path, default=Path("episodes/pick_place_toy"))
-    parser.add_argument("--live-session", type=Path, help="重放包含 frames.npz/metadata.json 的实机会话")
-    parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--roi-file", type=Path, help="固定 target_boxes/noise_boxes 的 JSON")
-    parser.add_argument("--scan-all", action="store_true", help="检查全部 episode 的每一帧")
-    parser.add_argument("--profile-stages", action="store_true", help="记录生产处理器各阶段耗时及进程内存峰值")
     return parser.parse_args(argv)
 
 
@@ -461,12 +454,7 @@ def run_pointcloud_diagnostic(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    if args.benchmark is not None:
-        from dexmani_real.perception.benchmark import run_benchmark
-
-        return run_benchmark(args)
-    return run_pointcloud_diagnostic(args)
+    return run_pointcloud_diagnostic(parse_args(argv))
 
 
 if __name__ == "__main__":

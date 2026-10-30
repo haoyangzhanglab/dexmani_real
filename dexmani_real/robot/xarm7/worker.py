@@ -1,5 +1,6 @@
 """机械臂 SDK 与伺服循环；阻塞的原生调用无法在此中断。"""
 
+import json
 import logging
 import time
 from typing import cast
@@ -17,6 +18,7 @@ from dexmani_real.robot.xarm7.protocol import (
     HomeRequest,
 )
 from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
+from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,15 @@ class ArmController:
         self.cfg, self.io, self.pipe, self.driver = cfg, io, pipe, driver
         self.status = np.zeros((), dtype=STATUS_DTYPE)
         self.active = self.reference = None
+        self.timings = {}
+        self.last_servo_ns = None
+
+    def record_timing(self, name, elapsed_ns):
+        # 每段仅累计次数、总耗时与最大值，不在伺服循环中输出日志。
+        values = self.timings.setdefault(name, [0, 0, 0])
+        values[0] += 1
+        values[1] += elapsed_ns
+        values[2] = max(values[2], elapsed_ns)
 
     def authorized(self, run_id):
         return (
@@ -58,6 +69,8 @@ class ArmController:
             self.status["frame"]["timestamp_ns"] = 0
             raise
         finally:
+            if self.active is not None:
+                self.record_timing("feedback_query", time.monotonic_ns() - started)
             self.io.publish_status(self.status)
 
     def wait_settled(
@@ -168,6 +181,7 @@ class ArmController:
     def stop(self):
         self.io.stop.set()
         self.status["prepared_run_id"] = 0
+        active = self.active
         self.active = self.reference = None
         self.io.take_goal(block=True)
         self.io.publish_status(self.status)
@@ -181,6 +195,13 @@ class ArmController:
             self.fault(exc)
         finally:
             self.io.stopped.set()  # 处理结束；停止失败仍保存在 close_error。
+            if active is not None:
+                summary = {
+                    name: dict(count=count, mean_ms=total / count / 1e6, max_ms=maximum / 1e6)
+                    for name, (count, total, maximum) in self.timings.items()
+                }
+                logger.info("Arm timing run=%d nominal_period_ms=%.3f: %s",
+                            int(active["run_id"]), 1000 / self.cfg.servo_hz, json.dumps(summary))
 
     def operation(self, message):
         kind = "home" if isinstance(message, HomeRequest) else "prepare"
@@ -246,6 +267,8 @@ class ArmController:
                 if np.max(np.abs(v)) > self.cfg.homing.velocity_convergence_rad_s:
                     raise RuntimeError("arm moved after standstill preparation")
                 self.reference = ArmTrajectory(self.cfg, q, v)
+                self.timings.clear()
+                self.last_servo_ns = None
             self.active = pending
         q = cast(ArmTrajectory, self.reference).step(
             pending["q_goal"] if pending is not None and not pending["hold"] else None,
@@ -259,7 +282,13 @@ class ArmController:
             self.io.stop.set()
             return None
         started = time.monotonic_ns()
-        self.driver.servo(q)
+        try:
+            self.driver.servo(q)
+        finally:
+            self.record_timing("servo_call", time.monotonic_ns() - started)
+            if self.last_servo_ns is not None:
+                self.record_timing("servo_interval", started - self.last_servo_ns)
+            self.last_servo_ns = started
         return started
 
     def run(self):
@@ -325,6 +354,7 @@ class ArmController:
 
 
 def run_arm(cfg, io, pipe):
+    configure_logging()
     from dexmani_real.robot.xarm7.driver import XArm7
 
     ArmController(cfg, io, pipe, XArm7(cfg)).run()

@@ -63,11 +63,23 @@ python scripts/replay_episode.py episodes/TASK/EPISODE
 
 键盘点动使用 WASD、方向键及 IJKL，R 回零，Q 退出，Esc 急停。其他入口按启动时显示的操作提示使用。真机回放以录制首帧的实测姿态为起点，默认手部准备目标用 0.5 秒插值到该实测姿态，另行等待实测到位；准备目标必须满足操作限位，之后按原记录目标序列播放。首个目标仍受原有执行约束，不再提前平滑到首个 action。
 
+VR 遥操作和策略部署每次启动会话时自动将手部回到 HOME，确认实测到位后请求五个触觉传感器复位，并等待复位后的 aggregate/dense 反馈；启动前应让手部无接触。复位请求失败或反馈不可用时不进入遥操作或策略 warmup。SDK 请求成功及反馈就绪不等同于已验证触觉零点；复位元数据会随 Raw 保存。暂停后继续不重复复位手部或触觉。
+
+遥操作使用 `B` 开始、`C` 暂停/继续、`H` 保存当前段并回初始位、`S` 保存并结束当前段、`D` 丢弃当前段。暂停期间不追加数据，按 `C` 继续会保存前段、新建录制段，并用准备完成后的实测姿态与 VR 输入重新建立锚点。运行或暂停中第一次按 `Q` 进入退出等待，再按 `Q` 保存退出；此时 `C` 可继续，`S/D` 保存/丢弃后回到空闲。空闲时 `Q` 直接退出。`Esc` 急停，`T` 仅在空闲且手部无接触时请求触觉复位。
+
+每段在 PREPARING 阶段先做一次不下发的目标预计算；机械臂准备完成后再用新观测重建锚点及滤波初值，开始控制与录制计时。首个目标成功提交并入录制队列后才播放开始/继续提示。控制期限或目标准入导致的停止使用结束提示，日志保留具体原因并提示按 B 重新开始；急停和运行故障仍使用异常提示。
+
+VR 手部重定向固定使用 DexPilot，求解范围直接采用 `hand.qpos_min_rad/qpos_max_rad`，发送边界仍检查并截断目标。腕部位移倍率 `teleop.vr_pos_scale` 为 0.7；位置/旋转 EMA 的新样本权重分别为 0.95/0.85，手部单层 `dexpilot_retargeting.low_pass_alpha` 为 0.5。权重越大越跟手，越小越平滑；腕部侧重减少滤波滞后，手部适度抑制目标跳变。控制与录制仍为 16 Hz。
+
+遥操作 Raw 的 `meta` 属性保存 `runtime_config_json`、实际使用的 `vr_to_robot_rotation` 和 `teleop_run_id`；`meta/termination_details` 保存预计算耗时、`teleop_anchor` 初始观测，以及录制期间处理的按键和失败时的 `control_timing`。所有新增事件时间戳均为主机单调时钟；`submit_start_ns/submit_end_ns` 表示父进程提交调用，不代表机械臂到达目标。终端按键日志记录处理时的阶段与运行编号。
+
 键盘和相机标定在显示操作提示前完成 jog 准备。普通按键变化只更新目标；松键时从当前伺服参考减速到零并保持，不停机重启，也不继续追赶积累的远处目标。IK 拒绝后减速保持，松开全部 jog 键才能恢复。HOME、标定采样、退出和急停仍执行真正停止，恢复连续控制时重新准备。按键在控制循环中采样，完全落在两次采样之间的极短按键不会补发运动。
 
 机械臂连续控制采用 Mode 1 与 Ruckig 轨迹；prepare 切换模式并确认实测停稳后，控制端再读取有效观测。实际控制、策略输入和到达确认检查反馈时效。按 R 回零时先输出 `Returning home...`，取消或失败时保留具体原因。HOME 使用 Mode 0 执行路径并确认到达，完成后停止收尾，下次连续控制重新 prepare。
 
-伺服默认 100 Hz，每次发送将 Ruckig 参考推进 10 ms；调度延迟后只继续下一步，并从实际发送时刻安排下一周期，因此延迟会拉长轨迹执行时间。新目标和松键制动沿用上一参考的位置、速度和加速度，参考只在准备后用实测反馈初始化。`arm.max_joint_jerk_deg_per_s3` 默认 6000 °/s³，限制加速度变化率，使启停和换向连续；平滑制动需要更长的停止时间和距离。发送前检查命令期限、反馈时效、控制器状态和新轨迹的关节位置极值（包含制动段），SDK 调用后检查返回码。速度、加速度与 jerk 约束作用于参考序列，实际跟随效果需在真机上确认。
+伺服默认 100 Hz，每次发送将 Ruckig 参考推进 10 ms；调度延迟后只继续下一步，并从实际发送时刻安排下一周期，因此延迟会拉长轨迹执行时间。新目标和松键制动沿用上一参考的位置、速度和加速度，参考只在准备后用实测反馈初始化。`arm.max_joint_jerk_deg_per_s3` 默认 12000 °/s³，限制加速度变化率，使启停和换向连续；平滑制动需要更长的停止时间和距离。该默认值由所有机械臂入口共用，速度/加速度上限仍为 150 °/s、900 °/s²。发送前检查命令期限、反馈时效、控制器状态和新轨迹的关节位置极值（包含制动段），SDK 调用后检查返回码。速度、加速度与 jerk 约束作用于参考序列，实际跟随效果需在真机上确认。
+
+机械臂每段停止后输出 `Arm timing run=...`：伺服 SDK 调用、相邻调用开始间隔及运行期间反馈查询的次数、平均值和最大耗时。统计包含失败的调用尝试，按运行编号与遥操作 Raw 对照；准备和 HOME 不计入这些连续控制统计。
 
 SDK 连接与伺服由机械臂子进程持有。关节反馈默认 25 Hz，每次主动查询错误码，再调用一次 `get_joint_states(num=2)` 获取七轴位置和真实速度，来源时间为这组查询开始时刻。模式与状态直接使用 SDK 的 100 Hz real 上报缓存，伺服发送前检查 Mode 1 和可运动状态；错误码由主动查询和运动命令返回码检查。模式切换直接检查 SDK 返回码，不另建回报快照、时效预算或等待报告的握手。父进程读取关节缓存不发起 SDK 查询，也不更新时间戳；查询失败或反馈过期均终止执行。设备关闭统一由运行入口的 finally 执行，只报告实际停止与断开失败。
 
@@ -83,7 +95,7 @@ HOME 的 `HomePlanner` 使用 `environment.table`、标定平面和 `soft_cleara
 
 策略预取冻结的目标已完成端点准入且不可变，在固定环境中只复查依赖当前关节位置的等价分支；执行授权、反馈时效和命令期限仍在提交时检查。
 
-启动时模型加载与设备准备可重叠；设备就绪后先等待所需触觉和真实观测历史，再在授权运动前用同一观测构造器 warmup。热身不写 Raw，也不占用正式轮次预算；每轮重新采集历史。`session_result.json` 的 `finished` 表示会话生命周期正常结束，轮数仍统计已进入 RUNNING 的轮次；各轮终止原因、技术终止次数另行列出，不代表任务成功率。`inference` 统计模型线程内观测构造至 CPU 动作返回，`prediction_wait` 统计预测请求提交至主循环消费结果，`observation_to_submit` 从该预测最新观测快照完成时刻算至目标提交返回；后者不是曝光、相机接收或硬件 apply latency。
+启动时模型加载与设备准备可重叠；设备就绪后先完成手部 HOME 与触觉复位，等待所需真实观测历史，再在策略运动开始前用同一观测构造器 warmup。热身不写 Raw，也不占用正式轮次预算；每轮重新采集历史。`session_result.json` 的 `finished` 表示会话生命周期正常结束，轮数仍统计已进入 RUNNING 的轮次；各轮终止原因、技术终止次数另行列出，不代表任务成功率。`inference` 统计模型线程内观测构造至 CPU 动作返回，`prediction_wait` 统计预测请求提交至主循环消费结果，`observation_to_submit` 从该预测最新观测快照完成时刻算至目标提交返回；后者不是曝光、相机接收或硬件 apply latency。
 
 arm 的独立期限不能终止父进程内阻塞的 hand SDK。此次只读核对的 `xhand_controller 1.5.2` 中，`read_state`/`send_command` 的公开签名没有调用期限参数，也没有公开 timeout 设置方法；这不证明内部调用具有时间上界。hand 调用和停止延迟仍待现场测量，不新增独立 hand owner。臂手提交是顺序下发尝试，部分失败沿已有停止路径处理，不保证原子执行或同时到位。
 
@@ -103,22 +115,11 @@ arm 的独立期限不能终止父进程内阻塞的 hand SDK。此次只读核�
 
 相机标定前须拆除 XHand，或将其固定在配置的 HOME 姿态。SDK 接受命令不代表机器人已到位或停稳。
 
-交互式 RealSense 和点云诊断使用 OpenCV RGB-D 面板及 Open3D 点云窗口，需可用的桌面显示环境及 OpenGL 上下文；上述 `visualization` 安装项包含 Open3D 和离线查看所用的 Rerun。非交互 benchmark 无需显示窗口。
+RealSense 和点云诊断使用 OpenCV RGB-D 面板及 Open3D 点云窗口，需可用的桌面显示环境及 OpenGL 上下文；上述 `visualization` 安装项包含 Open3D 和离线查看所用的 Rerun。
 
 点云处理、导出和预览共用 `PointCloudProcessor`，输出基座系 `float32[N,6]` XYZRGB；无有效点时返回 `(0,6)` 数组，预览清空显示，训练导出拒绝该行。默认工作空间为基座系米制 `x=[0.15,0.85]、y=[-0.50,0.50]、z=[0,0.80]`，由 `pointcloud.workspace` 配置。桌面裁减默认保留距标定平面大于 10 mm 的点，可通过 `pointcloud.table_margin_m` 调整。
 
 点云在深度图中检查同表面邻域支持，体素聚合后执行半径密度与最少 10 点的连通分量过滤，再进行 FPS，抑制悬浮小点团对采样的影响。深度断层处的四邻域支持要求会收缩边缘，可能删除仅 1–2 像素宽的真实细结构。
-
-非交互 benchmark 直接运行当前 `PointCloudProcessor`，输出逐帧耗时、空云统计、配置、源码副本及代表帧。默认抽样 episode 和帧，`--scan-all` 检查全部录像的每一帧。离线模式使用当前 `RawReader`，数据须满足当前 Raw 格式及对齐 RGB-D 元数据要求：
-
-```bash
-python scripts/tools/view_pointcloud.py --benchmark offline --episode-root episodes/TASK --output-dir outputs/pointcloud_study/offline
-python scripts/tools/view_pointcloud.py --benchmark live --output-dir outputs/pointcloud_study/live
-```
-
-实机模式默认采集 180 个新深度帧，完成后释放相机、恢复完整设备设置并读回验证，再处理保存的数据；`--live-session PATH` 可重放当前采集格式的 `frames.npz` 和 `metadata.json`，其中必须包含对齐语义及帧时间信息。离线桌面平面取自 `--config` 的 `environment.table.plane_path`，应与录像场景一致。`--profile-stages` 使用生产处理器的可选计时，记录深度过滤、裁剪、体素聚合、半径与连通分量过滤、采样的耗时，总耗时包含计时开销；进程内存峰值包含解码和数据载入。
-
-`--roi-file` 接受固定的 `target_boxes`（像素 `xmin,ymin,xmax,ymax`）与 `noise_boxes`（基座系米制 XYZ 下界和上界），也可放在 `sources` 对象下，以来源目录名为键，报告最终点云在标注区域内的点数。点数与耗时用于对照，不单独证明去噪质量或真实目标保留率。
 
 相机时间取 depth/color 各自首次主机回调接收时间中的较早者，并随帧进入单个最新帧槽；出队及另一通道更新不会刷新旧通道年龄。这只覆盖回调接收后的年龄，不是曝光时间，也未覆盖设备/SDK 到回调之前的延迟。此次环境的 `pyrealsense2` 为 2.54.2；实际设备、对齐 backend、depth→color 外参及 aligned-depth Z 近似误差尚未测量，继续保留现行离线/在线表示。需要改投影时须先满足论文精度条件并同步重新导出，不能单改部署。曝光恢复目前由无设备测试验证了请求及异常控制流，跨 pipeline 持久化效果仍待设备确认。
 
@@ -129,7 +130,7 @@ python scripts/tools/view_pointcloud.py --benchmark live --output-dir outputs/po
 
 ## 模型与手点云
 
-整机 FK、IK 与碰撞检查共用 [xarm7_xhand_right.urdf](assets/robots/xhand/xarm7_xhand_right.urdf)，手部安装位姿由该模型定义。TAG/DexPilot 重定向使用独立的 [xhand_right.urdf](assets/robots/xhand/xhand_right.urdf)。
+整机 FK、IK 与碰撞检查共用 [xarm7_xhand_right.urdf](assets/robots/xhand/xarm7_xhand_right.urdf)，手部安装位姿由该模型定义。DexPilot 重定向使用独立的 [xhand_right.urdf](assets/robots/xhand/xhand_right.urdf)。
 
 手点云模板位于 `assets/pointcloud_template/hand/hand_<点数>.npz`，默认使用 1024 点。离线导出与部署共用模板及 FK；训练和部署应使用同一份模板。更改点数或手部 visual 网格、颜色、位姿后，重新生成对应模板：
 

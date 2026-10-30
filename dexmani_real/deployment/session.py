@@ -19,7 +19,7 @@ from dexmani_real.deployment.rollout import Rollout, failure_reason, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import home_robot
+from dexmani_real.runtime.home import home_robot, initialize_hand
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
@@ -237,12 +237,20 @@ class PolicySession:
                 raise RuntimeError("static camera failed to close normally")
             self.sensors.channels = None
         self.robot.check()
-        self.warmup_policy()
-        self.keyboard.discard_events("h", "b", "t")
         with self.runtime_state.motion_lock:
             if not self.runtime_state.requests_allow_motion():
                 raise OperationCancelled("startup cancelled before arming")
             self.runtime_state.arm()
+        result = initialize_hand(
+            self.runtime_state, self.robot, cancel_requested=self.home_abort_requested,
+        )
+        if not result.ok:
+            if result.interrupted:
+                raise OperationCancelled(result.reason)
+            raise RuntimeError(f"startup hand initialization failed: {result.reason}")
+        self.warmup_policy()
+        self.keyboard.discard_events("h", "b", "t")
+        self.check_startup()
 
     def close(self, *, failure=None):
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S

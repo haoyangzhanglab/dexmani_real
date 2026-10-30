@@ -14,7 +14,7 @@ from dexmani_real.data.recorder import RecordingError
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import RobotError
 from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import home_hand
+from dexmani_real.runtime.home import initialize_hand
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
@@ -216,8 +216,8 @@ def run_teleop(
 
 
 def initialize_teleop(loop, vr_process) -> bool:
-    # 启动手部回零前，键盘停止回调已经生效。
-    home_result = home_hand(
+    # 自动复位前，键盘停止回调已经生效。
+    home_result = initialize_hand(
         loop.runtime_state,
         loop.robot,
         cancel_requested=loop.poll_blocking_commands,
@@ -226,7 +226,7 @@ def initialize_teleop(loop, vr_process) -> bool:
         if home_result.interrupted:
             loop.runtime_state.request_quit()
             return False
-        raise RuntimeError(f"startup hand home failed: {home_result.reason}")
+        raise RuntimeError(f"startup hand initialization failed: {home_result.reason}")
     if loop.poll_blocking_commands():
         return False
     loop.sensors.start(
@@ -247,7 +247,12 @@ def initialize_teleop(loop, vr_process) -> bool:
             break
         if time.monotonic() >= deadline:
             raise RuntimeError("VR failed to become ready before the startup timeout")
-    print("准备进入遥操作；空闲且确认手部无接触后按 T 请求复位触觉，S/Q/ESC 可取消。", flush=True)
+    loop.keyboard.discard_events("b", "c", "h", "t")
+    print(
+        "就绪：B 开始 | C 暂停/继续（继续时新建录制段） | H 保存并回初始位 | "
+        "S 保存 | D 丢弃 | Q 暂停待退出，再按 Q 保存退出 | Esc 急停 | T 空闲时复位触觉。",
+        flush=True,
+    )
     return True
 
 
@@ -262,12 +267,6 @@ def finish_audio(audio):
 def build_hand_retargeter(runtime):
     if not runtime.hand.enabled:
         return None
-    if runtime.teleop.hand_retargeting_type == "tag":
-        from dexmani_real.teleop.retargeting.tag import TAGRetargeter
+    from dexmani_real.teleop.retargeting.dexpilot import DexPilotRetargeter
 
-        return TAGRetargeter(runtime.tag_retargeting)
-    if runtime.teleop.hand_retargeting_type == "dexpilot":
-        from dexmani_real.teleop.retargeting.dexpilot import DexPilotRetargeter
-
-        return DexPilotRetargeter(runtime.dexpilot_retargeting)
-    raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")
+    return DexPilotRetargeter(runtime.dexpilot_retargeting, runtime.hand)

@@ -56,6 +56,36 @@ def home_robot(state, robot, planner, *, cancel_requested):
     return home_arm(state, robot, planner, cancel_requested=cancel_requested)
 
 
+def initialize_hand(state, robot, *, cancel_requested):
+    """会话启动时先确认手部回零，再请求触觉复位并等待复位后的反馈。"""
+    if not robot.hand_config.enabled:
+        return HomeResult(True)
+    logger.info("启动复位：手部回 HOME 后自动复位触觉，请保持手部无接触。")
+    result = home_hand(state, robot, cancel_requested=cancel_requested)
+    if not result.ok:
+        return result
+    run_id = state.run_id
+
+    def cancelled():
+        return cancel_requested() or not state.can_move(
+            run_id=run_id, required_safety_state=SafetyState.ARMED,
+        )
+
+    try:
+        if cancelled():
+            raise OperationCancelled("hand initialization interrupted")
+        if not robot.reset_tactile_sensors(
+            cancel_requested=cancelled, required_tactile=("aggregate", "dense"),
+        ):
+            return HomeResult(False, "tactile reset request failed")
+        if cancelled():
+            raise OperationCancelled("hand initialization interrupted")
+    except OperationCancelled as exc:
+        return HomeResult(False, str(exc), interrupted=True)
+    logger.info("手部 HOME 已到位，触觉复位请求已完成，复位后反馈已就绪。")
+    return HomeResult(True)
+
+
 def home_arm(state, robot, planner, *, cancel_requested):
     config, hand = robot.arm_config, robot.hand_config
     target = np.asarray(config.home_qpos, dtype=np.float64)

@@ -11,11 +11,10 @@ import numpy as np
 @dataclass(frozen=True)
 class TeleopConfig:
     control_hz: float = 16.0
-    ema_alpha_pos: float = 0.7
-    ema_alpha_rot: float = 0.5
-    vr_pos_scale: float = 0.4
+    ema_alpha_pos: float = 0.95
+    ema_alpha_rot: float = 0.85
+    vr_pos_scale: float = 0.7
     vr_stale_threshold_s: float = 0.5
-    hand_retargeting_type: str = "tag"
 
     def validate(self) -> None:
         if not (0.0 <= self.ema_alpha_pos <= 1.0 and 0.0 <= self.ema_alpha_rot <= 1.0):
@@ -25,8 +24,6 @@ class TeleopConfig:
             for v in (self.vr_pos_scale, self.vr_stale_threshold_s)
         ):
             raise ValueError("VR position scale and stale threshold must be finite and positive")
-        if self.hand_retargeting_type not in {"tag", "dexpilot"}:
-            raise ValueError("hand_retargeting_type must be 'tag' or 'dexpilot'")
 
 
 @dataclass(frozen=True)
@@ -65,43 +62,11 @@ class KeyboardTeleopConfig:
 
 
 @dataclass(frozen=True)
-class TAGConfig:
-    # 长度单位米，顺序为拇指到小指。
-    human_finger_lengths: tuple[float, ...] = (0.13, 0.18, 0.19, 0.18, 0.145)
-    finger_scale_boost: float = 1.0
-
-    pinky_scale: float = 1.3
-    pinky_palm_scale: float = 1.25
-
-    smooth_weight: float = 0.003
-
-    pinch_base_weight: float = 2000.0
-    pinch_start_dist_m: float = 0.030
-    pinch_full_dist_m: float = 0.008
-    pinch_ema_alpha: float = 0.75
-    reg_stage1_weight: float = 1.0
-    reg_last_weight: float = 0.8
-
-    def validate(self) -> None:
-        if not all(np.all(np.isfinite(value)) for value in astuple(self)):
-            raise ValueError("TAG parameters must be finite")
-        human = np.asarray(self.human_finger_lengths, dtype=np.float64)
-        if human.shape != (5,):
-            raise ValueError("TAG requires five human finger lengths")
-        if np.any(human <= 0):
-            raise ValueError("TAG finger lengths must be positive")
-        if not 0 <= self.pinch_full_dist_m < self.pinch_start_dist_m:
-            raise ValueError("TAG pinch distances must satisfy 0 <= full < start")
-        if not 0.0 <= self.pinch_ema_alpha <= 1.0:
-            raise ValueError("TAG pinch EMA alpha must be in [0, 1]")
-
-
-@dataclass(frozen=True)
 class DexPilotConfig:
     scaling_factor: float = 1.15
     pinky_scale: float = 1.15
     pinky_palm_scale: float = 1.0
-    low_pass_alpha: float = 0.6
+    low_pass_alpha: float = 0.5
     # 抓取投影的进入与退出距离。
     project_dist_m: float = 0.03
     escape_dist_m: float = 0.05

@@ -13,6 +13,9 @@ logger = logging.getLogger(__name__)
 
 EVENT_FILES = {
     "begin": "遥操作启动.wav",
+    "pause": "操作暂停.wav",
+    "resume": "工作继续.wav",
+    "quit": "准备退出遥操作.wav",
     "save": "成功保存轨迹.wav",
     "discard": "放弃保存轨迹.wav",
     "home": "即将回到初始姿态.wav",

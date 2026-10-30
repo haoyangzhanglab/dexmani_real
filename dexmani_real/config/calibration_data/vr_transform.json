@@ -1,9 +1,10 @@
 {
+  "theta_deg": 75.70671262353301,
   "ref": "head",
-  "theta_deg": 74.5335151934751,
   "quality": {
-    "std_deg": 0.2527781328442123,
-    "max_deviation_deg": 0.5758639777159997,
-    "frames": 649
-  }
+    "std_deg": 0.876651999537481,
+    "max_deviation_deg": 1.2634384883746337,
+    "frames": 720
+  },
+  "calibrated_at_utc": "2026-10-30T10:49:57.426460+00:00"
 }

@@ -1,7 +1,5 @@
 """对齐 RGB-D 到 xArm 基座系的 float32[N,6] XYZRGB；无有效点时返回 (0,6)。"""
 
-from time import perf_counter
-
 import cv2
 import numpy as np
 from fpsample import bucket_fps_kdline_sampling
@@ -179,24 +177,9 @@ class PointCloudProcessor:
             self.table_height_per_depth = rays @ plane_color[:3]
             self.table_offset = plane_color[3]
 
-    def process(
-        self,
-        depth_raw: np.ndarray,
-        color: np.ndarray,
-        *,
-        timings_ms: dict[str, float] | None = None,
-    ) -> np.ndarray:
-        """可选阶段计时与正常处理共用同一条路径；未执行的阶段记为零。"""
-        if timings_ms is not None:
-            timings_ms.clear()
-            timings_ms.update(dict.fromkeys(("depth", "crop", "voxel", "radius_components", "sample"), 0.0))
-        stage_started = perf_counter() if timings_ms is not None else 0.0
+    def process(self, depth_raw: np.ndarray, color: np.ndarray) -> np.ndarray:
         depth_m = depth_raw.astype(np.float32) * self.depth_scale
         valid = filter_depth(depth_m)
-        if timings_ms is not None:
-            now = perf_counter()
-            timings_ms["depth"] = (now - stage_started) * 1000.0
-            stage_started = now
         if self.config.remove_table:
             # 先沿射线裁掉桌面，避免为桌面像素分配三维点。
             height = depth_m * self.table_height_per_depth + self.table_offset
@@ -205,30 +188,15 @@ class PointCloudProcessor:
             coordinate = self.rays_base[..., axis] * depth_m + self.translation[axis]
             valid &= (coordinate >= self.lower[axis]) & (coordinate <= self.upper[axis])
         pixels = np.flatnonzero(valid)
-        points = self.rays_base.reshape(-1, 3)[pixels] * depth_m.ravel()[pixels, None] + self.translation
-        colors = color.reshape(-1, 3)[pixels].astype(np.float32) / 255.0
-        if timings_ms is not None:
-            now = perf_counter()
-            timings_ms["crop"] = (now - stage_started) * 1000.0
-            stage_started = now
         if not len(pixels):
             return np.empty((0, 6), dtype=np.float32)
+        points = self.rays_base.reshape(-1, 3)[pixels] * depth_m.ravel()[pixels, None] + self.translation
+        colors = color.reshape(-1, 3)[pixels].astype(np.float32) / 255.0
         points, colors = voxel_downsample(points, colors)
-        if timings_ms is not None:
-            now = perf_counter()
-            timings_ms["voxel"] = (now - stage_started) * 1000.0
-            stage_started = now
         keep = radius_inliers(points)
         points, colors = points[keep], colors[keep]
-        if timings_ms is not None:
-            now = perf_counter()
-            timings_ms["radius_components"] = (now - stage_started) * 1000.0
-            stage_started = now
         if len(points) == 0:
             return np.empty((0, 6), dtype=np.float32)
 
         selected = sample_indices(points, self.config.num_points)
-        cloud = np.column_stack((points[selected], colors[selected]))
-        if timings_ms is not None:
-            timings_ms["sample"] = (perf_counter() - stage_started) * 1000.0
-        return cloud
+        return np.column_stack((points[selected], colors[selected]))
