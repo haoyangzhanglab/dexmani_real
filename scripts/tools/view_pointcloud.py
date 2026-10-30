@@ -1,11 +1,9 @@
-#!/usr/bin/env python3
 """连接 RealSense 查看点云处理效果，支持桌面平面标定及确认后发布。"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import logging
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -37,9 +35,6 @@ from dexmani_real.utils.visualization.pointcloud import PointCloudViewer
 
 if TYPE_CHECKING:
     from dexmani_real.sensor.realsense import RealSenseCamera
-
-logger = logging.getLogger(__name__)
-
 
 TABLE_CALIBRATION_FRAMES = 5
 VIS_DEPTH_MIN_M = 0.3
@@ -174,6 +169,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--config", type=Path, help="Optional experiment YAML overrides")
     parser.add_argument("--camera-calibration", type=Path)
+    parser.add_argument("--benchmark", choices=("offline", "live"), help="非交互评估当前点云处理器")
+    parser.add_argument("--episode-root", type=Path, default=Path("episodes/pick_place_toy"))
+    parser.add_argument("--live-session", type=Path, help="重放包含 frames.npz/metadata.json 的实机会话")
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--roi-file", type=Path, help="固定 target_boxes/noise_boxes 的 JSON")
+    parser.add_argument("--scan-all", action="store_true", help="检查全部 episode 的每一帧")
+    parser.add_argument("--profile-stages", action="store_true", help="记录生产处理器各阶段耗时及进程内存峰值")
     return parser.parse_args(argv)
 
 
@@ -337,7 +339,6 @@ def run_pointcloud_diagnostic(args) -> int:
     configure_logging()
     camera = RealSenseCamera(runtime.camera, auto_exposure_priority=None)
     original_priority = None
-    failure = None
     print("Connecting to RealSense...")
     try:
         camera.connect()
@@ -434,29 +435,15 @@ def run_pointcloud_diagnostic(args) -> int:
             camera=camera,
             processor=processor,
         )
-    except BaseException as exc:
-        failure = exc
     finally:
         try:
             if original_priority is not None:
                 restored = set_ae_priority(camera, original_priority)
                 if restored is None or not np.isclose(restored, original_priority):
                     raise RuntimeError(f"exposure priority readback mismatch: {restored}")
-        except BaseException as exc:
-            if failure is None:
-                failure = exc
-            else:
-                logger.exception("exposure restoration also failed")
-        try:
+        finally:
             camera.disconnect()
             print("RealSense pipeline stopped cleanly.")
-        except BaseException as exc:
-            if failure is None:
-                failure = exc
-            else:
-                logger.exception("camera disconnect also failed")
-        if failure is not None:
-            raise failure
 
     # 所有采集已完成；静态浏览不再占用相机。
     viewer = PointCloudViewer(
@@ -474,7 +461,12 @@ def run_pointcloud_diagnostic(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    return run_pointcloud_diagnostic(parse_args(argv))
+    args = parse_args(argv)
+    if args.benchmark is not None:
+        from dexmani_real.perception.benchmark import run_benchmark
+
+        return run_benchmark(args)
+    return run_pointcloud_diagnostic(args)
 
 
 if __name__ == "__main__":

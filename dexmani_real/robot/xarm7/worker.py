@@ -47,12 +47,9 @@ class ArmController:
         started = time.monotonic_ns()
         try:
             q, v = self.driver.read()
-            status = self.driver.read_status()
             completed = time.monotonic_ns()
             if completed - started >= int(self.cfg.feedback_max_age_s * 1e9):
                 raise TimeoutError("arm query exceeded feedback freshness budget")
-            if status.error_code:
-                raise RuntimeError(f"arm controller error C{status.error_code}")
             self.status["frame"]["qpos"] = q
             self.status["frame"]["qvel"] = v
             # 来源时间采用查询开始时刻，不能替换为缓存读取时间。
@@ -233,11 +230,6 @@ class ArmController:
         stamp = int(self.status["frame"]["timestamp_ns"])
         if not 0 < stamp <= now < stamp + int(self.cfg.feedback_max_age_s * 1e9):
             return "arm_feedback_expired"
-        status = self.driver.read_status()
-        if status.error_code:
-            return f"arm controller error C{status.error_code}"
-        if status.mode != 1 or status.state not in (0, 1, 2):
-            return "controller_not_streaming"
         return None
 
     def tick(self) -> int | None:

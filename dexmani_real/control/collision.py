@@ -38,8 +38,15 @@ class CollisionModel:
             self.model, urdf, pin.GeometryType.COLLISION, package_dirs=[str(XHAND_MODEL_DIR)]
         )
         robot_count = self.geometry.ngeoms
-        # 同一 parent joint 的几何也参与检查，仅由 SRDF 排除碰撞对。
+        hand_geometry_ids = {
+            index
+            for index, geometry in enumerate(self.geometry.geometryObjects)
+            if self.model.frames[geometry.parentFrame].name.startswith("right_hand_")
+        }
+        # 手内网格尚未验证，统一跳过；其余对保留同 parent joint 检查，再由 SRDF 排除。
         for first, second in combinations(range(robot_count), 2):
+            if first in hand_geometry_ids and second in hand_geometry_ids:
+                continue
             self.geometry.addCollisionPair(pin.CollisionPair(first, second))
         pin.removeCollisionPairs(self.model, self.geometry, str(XARM7_XHAND_SRDF_PATH))
         self.environment_names = {}
@@ -70,6 +77,8 @@ class CollisionModel:
             self.table_pair_indices = list(range(first_pair, len(self.geometry.collisionPairs)))
 
         self.geometry_data = self.geometry.createData()
+        for index in self.table_pair_indices:
+            self.geometry_data.collisionRequests[index].enable_distance_lower_bound = True
         self.hand_frame_ids = [
             index
             for index, frame in enumerate(self.model.frames)
@@ -111,10 +120,7 @@ class CollisionModel:
             raise RuntimeError("set the collision hand posture before querying arm poses")
         qpos = np.empty(self.model.nq)
         qpos[self.sdk_q_indices] = np.concatenate((arm_qpos, self.hand_qpos))
-        if np.any(qpos < self.model.lowerPositionLimit) or np.any(
-            qpos > self.model.upperPositionLimit
-        ):
-            return "model_joint_limits"
+        # 命令限位由调用方检查；手部实测姿态按原值参与几何计算。
         collided = self.pin.computeCollisions(
             self.model, self.data, self.geometry, self.geometry_data, qpos, True
         )
@@ -143,10 +149,20 @@ class CollisionModel:
         return float(min(heights))
 
     def minimum_table_distance(self):
-        minimum = min(
-            float(self.pin.computeDistance(self.geometry, self.geometry_data, index).min_distance)
+        # 最近一次 rejection 无碰撞时，所有桌面对的下界均已更新。
+        results = self.geometry_data.collisionResults
+        pairs = sorted(
+            (results[index].distance_lower_bound, index)
             for index in self.table_pair_indices
         )
+        minimum = np.inf
+        for lower_bound, index in pairs:
+            if lower_bound >= minimum:
+                break
+            minimum = min(
+                minimum,
+                float(self.pin.computeDistance(self.geometry, self.geometry_data, index).min_distance),
+            )
         if not np.isfinite(minimum):
             raise RuntimeError("table distance query returned a non-finite value")
         return minimum

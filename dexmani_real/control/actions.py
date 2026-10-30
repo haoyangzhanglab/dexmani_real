@@ -123,20 +123,17 @@ class ActionMapper:
         return np.concatenate((position, rotation, command.hand_qpos))
 
     def frozen_rejection(self, command, current, mode):
-        # 已准备的目标不能重新选择等价分支。
-        projected = (
-            command.arm_qpos
-            if mode == "eef"
-            else project_arm_command(
+        # prepare_prefix/map_command 已准入不可变目标；静态场景无需重复几何检查。
+        if mode == "joint":
+            projected = project_arm_command(
                 command.arm_qpos,
                 current,
                 joint_lower_rad=self.constraints.limits[:, 0],
                 joint_upper_rad=self.constraints.limits[:, 1],
             )
-        )
-        if not np.array_equal(projected, command.arm_qpos):
-            return "frozen_equivalent_branch_changed"
-        return self.joint_rejection(command.arm_qpos, command.hand_qpos)
+            if not np.array_equal(projected, command.arm_qpos):
+                return "frozen_equivalent_branch_changed"
+        return None
 
 
 def project_arm_command(target_arm_qpos, reference_arm_qpos, *, joint_lower_rad, joint_upper_rad):

@@ -100,37 +100,30 @@ class Robot:
                 or self.emergency_signal.is_set()
             )
 
-        try:
-            if cancelled():
-                raise OperationCancelled("robot startup cancelled")
-            from dexmani_real.robot.xarm7.process import ArmProcess
+        # 各运行入口的 finally 统一关闭设备，也覆盖部分连接失败。
+        if cancelled():
+            raise OperationCancelled("robot startup cancelled")
+        from dexmani_real.robot.xarm7.process import ArmProcess
 
-            self.arm = ArmProcess(
-                self.arm_config,
-                run_signal=self.run_signal,
-                stop_signal=self.stop_signal,
-                emergency_signal=self.emergency_signal,
-                signal_lock=self.signal_lock,
-            )
-            self.arm.connect(check_services=self.check_services)
-            if cancelled():
-                raise OperationCancelled("robot startup cancelled before hand connection")
-            deadline_ns = None
-            if self.hand_config.enabled:
-                from dexmani_real.robot.xhand.driver import XHand
+        self.arm = ArmProcess(
+            self.arm_config,
+            run_signal=self.run_signal,
+            stop_signal=self.stop_signal,
+            emergency_signal=self.emergency_signal,
+            signal_lock=self.signal_lock,
+        )
+        self.arm.connect(check_services=self.check_services)
+        if cancelled():
+            raise OperationCancelled("robot startup cancelled before hand connection")
+        deadline_ns = None
+        if self.hand_config.enabled:
+            from dexmani_real.robot.xhand.driver import XHand
 
-                self.hand = XHand(self.hand_config)
-                deadline_ns = self.hand.connect(cancel_requested=cancelled)
-            self.connected = True
-            self.reset_hand_feedback(deadline_ns=deadline_ns)
-            self.read_initial_state(cancel_requested=cancelled)
-        except BaseException:
-            self.stop_signal.set()
-            try:
-                self.close()
-            except BaseException:
-                logger.exception("partial robot connection cleanup failed")
-            raise
+            self.hand = XHand(self.hand_config)
+            deadline_ns = self.hand.connect(cancel_requested=cancelled)
+        self.connected = True
+        self.reset_hand_feedback(deadline_ns=deadline_ns)
+        self.read_initial_state(cancel_requested=cancelled)
 
     def reset_tactile_sensors(self, *, cancel_requested):
         self.check()
@@ -361,9 +354,13 @@ class Robot:
         if self.owner is None:
             return
         self.check_owner()
+        if self.arm is None and self.hand is None:
+            return
+        # 共用的 stop 信号先通知 arm；close 只报告停止/断开失败，不重抛运行故障。
+        self.stop_signal.set()
         errors = []
         try:
-            self.stop()
+            self.stop_hand(passive=True)
         except BaseException as exc:
             errors.append(exc)
         if self.arm is not None:
@@ -376,17 +373,11 @@ class Robot:
 
         if self.hand is not None:
             try:
-                if self.hand.is_connected:
-                    self.stop_hand(passive=True)
+                self.hand.disconnect()
             except BaseException as exc:
                 errors.append(exc)
-            finally:
-                try:
-                    self.hand.disconnect()
-                except BaseException as exc:
-                    errors.append(exc)
-                else:
-                    self.hand = None
+            else:
+                self.hand = None
 
         self.connected = False
         if errors:
@@ -394,3 +385,4 @@ class Robot:
             for error in errors[1:]:
                 logger.error("additional robot close failure", exc_info=(type(error), error, error.__traceback__))
             raise errors[0]
+        self.stop_required = False

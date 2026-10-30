@@ -10,7 +10,7 @@ class PointCloudConfig:
     remove_table: bool = True
     num_points: int = 1024
     table_margin_m: float = 0.010
-    workspace: tuple[float, ...] = (0.0, -0.50, 0.0, 0.80, 0.50, 0.80)
+    workspace: tuple[float, ...] = (0.15, -0.50, 0.0, 0.85, 0.50, 0.80)
 
     def __post_init__(self):
         if type(self.remove_table) is not bool:

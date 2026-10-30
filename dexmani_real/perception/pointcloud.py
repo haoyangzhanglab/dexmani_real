@@ -1,8 +1,12 @@
 """对齐 RGB-D 到 xArm 基座系的 float32[N,6] XYZRGB；无有效点时返回 (0,6)。"""
 
+from time import perf_counter
+
 import cv2
 import numpy as np
 from fpsample import bucket_fps_kdline_sampling
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 from dexmani_real.config.perception import PointCloudConfig
@@ -12,9 +16,12 @@ NEIGHBORHOOD_KERNEL = np.ones((3, 3), dtype=np.uint8)
 DEPTH_RANGE_M = (0.30, 1.50)
 EDGE_JUMP_M = 0.030
 EDGE_SURFACE_BAND_M = 0.008
+DEPTH_MIN_SUPPORT = 2
+EDGE_MIN_SUPPORT = 5
 VOXEL_SIZE_M = 0.005
 OUTLIER_RADIUS_M = 0.012
 OUTLIER_MIN_NEIGHBORS = 6
+OUTLIER_MIN_COMPONENT_POINTS = 10
 
 
 def filter_depth(depth_m: np.ndarray) -> np.ndarray:
@@ -32,9 +39,36 @@ def filter_depth(depth_m: np.ndarray) -> np.ndarray:
         borderValue=(float("-inf"),),
     )
     # 深度断层中，远离前后表面的中间值视为飞点。
-    edge = (local_max - local_min) > EDGE_JUMP_M
+    local_count = cv2.boxFilter(
+        valid.astype(np.uint8),
+        ddepth=cv2.CV_8U,
+        ksize=(3, 3),
+        normalize=False,
+        borderType=cv2.BORDER_CONSTANT,
+    )
+    edge = valid & (local_count >= 3) & ((local_max - local_min) > EDGE_JUMP_M)
     distance = np.minimum(depth_m - local_min, local_max - depth_m)
-    return valid & ~(edge & (distance > EDGE_SURFACE_BAND_M))
+    trusted = valid & ~(edge & (distance > EDGE_SURFACE_BAND_M))
+
+    # 每个无向邻接只算一次深度差，同时累计两端，保留原八邻域支持规则。
+    support_count = np.zeros(depth_m.shape, dtype=np.uint8)
+    cardinal_count = np.zeros(depth_m.shape, dtype=np.uint8)
+    for first, second, cardinal in (
+        (np.s_[:, :-1], np.s_[:, 1:], True),
+        (np.s_[:-1, :], np.s_[1:, :], True),
+        (np.s_[:-1, :-1], np.s_[1:, 1:], False),
+        (np.s_[:-1, 1:], np.s_[1:, :-1], False),
+    ):
+        same_surface = trusted[first] & trusted[second] & (
+            np.abs(depth_m[first] - depth_m[second]) <= EDGE_SURFACE_BAND_M
+        )
+        support_count[first] += same_surface
+        support_count[second] += same_surface
+        if cardinal:
+            cardinal_count[first] += same_surface
+            cardinal_count[second] += same_surface
+    required_support = np.where(edge, EDGE_MIN_SUPPORT, DEPTH_MIN_SUPPORT)
+    return trusted & (support_count >= required_support) & (~edge | (cardinal_count == 4))
 
 
 def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
@@ -62,7 +96,16 @@ def radius_inliers(points: np.ndarray) -> np.ndarray:
         OUTLIER_RADIUS_M,
         output_type="ndarray",
     )
-    return np.bincount(pairs.ravel(), minlength=len(points)) >= OUTLIER_MIN_NEIGHBORS
+    density_keep = np.bincount(pairs.ravel(), minlength=len(points)) >= OUTLIER_MIN_NEIGHBORS
+    # 密度检查会移除邻居并留下孤立残片；只在保留下来的点之间求连通分量。
+    pairs = pairs[density_keep[pairs[:, 0]] & density_keep[pairs[:, 1]]]
+    graph = coo_matrix(
+        (np.ones(len(pairs), dtype=np.uint8), (pairs[:, 0], pairs[:, 1])),
+        shape=(len(points), len(points)),
+    )
+    _, labels = connected_components(graph, directed=False, return_labels=True)
+    component_sizes = np.bincount(labels)
+    return density_keep & (component_sizes[labels] >= OUTLIER_MIN_COMPONENT_POINTS)
 
 
 def sample_indices(points: np.ndarray, num_points: int) -> np.ndarray:
@@ -136,9 +179,24 @@ class PointCloudProcessor:
             self.table_height_per_depth = rays @ plane_color[:3]
             self.table_offset = plane_color[3]
 
-    def process(self, depth_raw: np.ndarray, color: np.ndarray) -> np.ndarray:
+    def process(
+        self,
+        depth_raw: np.ndarray,
+        color: np.ndarray,
+        *,
+        timings_ms: dict[str, float] | None = None,
+    ) -> np.ndarray:
+        """可选阶段计时与正常处理共用同一条路径；未执行的阶段记为零。"""
+        if timings_ms is not None:
+            timings_ms.clear()
+            timings_ms.update(dict.fromkeys(("depth", "crop", "voxel", "radius_components", "sample"), 0.0))
+        stage_started = perf_counter() if timings_ms is not None else 0.0
         depth_m = depth_raw.astype(np.float32) * self.depth_scale
         valid = filter_depth(depth_m)
+        if timings_ms is not None:
+            now = perf_counter()
+            timings_ms["depth"] = (now - stage_started) * 1000.0
+            stage_started = now
         if self.config.remove_table:
             # 先沿射线裁掉桌面，避免为桌面像素分配三维点。
             height = depth_m * self.table_height_per_depth + self.table_offset
@@ -147,15 +205,30 @@ class PointCloudProcessor:
             coordinate = self.rays_base[..., axis] * depth_m + self.translation[axis]
             valid &= (coordinate >= self.lower[axis]) & (coordinate <= self.upper[axis])
         pixels = np.flatnonzero(valid)
-        if not len(pixels):
-            return np.empty((0, 6), dtype=np.float32)
         points = self.rays_base.reshape(-1, 3)[pixels] * depth_m.ravel()[pixels, None] + self.translation
         colors = color.reshape(-1, 3)[pixels].astype(np.float32) / 255.0
+        if timings_ms is not None:
+            now = perf_counter()
+            timings_ms["crop"] = (now - stage_started) * 1000.0
+            stage_started = now
+        if not len(pixels):
+            return np.empty((0, 6), dtype=np.float32)
         points, colors = voxel_downsample(points, colors)
+        if timings_ms is not None:
+            now = perf_counter()
+            timings_ms["voxel"] = (now - stage_started) * 1000.0
+            stage_started = now
         keep = radius_inliers(points)
         points, colors = points[keep], colors[keep]
+        if timings_ms is not None:
+            now = perf_counter()
+            timings_ms["radius_components"] = (now - stage_started) * 1000.0
+            stage_started = now
         if len(points) == 0:
             return np.empty((0, 6), dtype=np.float32)
 
         selected = sample_indices(points, self.config.num_points)
-        return np.column_stack((points[selected], colors[selected]))
+        cloud = np.column_stack((points[selected], colors[selected]))
+        if timings_ms is not None:
+            timings_ms["sample"] = (perf_counter() - stage_started) * 1000.0
+        return cloud

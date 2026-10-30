@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import replace
+from dataclasses import fields, replace
 from typing import TYPE_CHECKING
 
 from dexmani_real.config.deployment import ExecutionConfig
@@ -16,13 +16,12 @@ if TYPE_CHECKING:
 
 
 def _restore_cloud_config(recipe, config_type):
-    names = (
-        ("remove_table", "num_points", "table_margin_m", "workspace")
-        if config_type is PointCloudConfig else ("num_points",)
-    )
-    if not isinstance(recipe, dict) or any(name not in recipe for name in names):
-        raise ValueError(f"Real deployment requires saved numerical {config_type.__name__} fields: {names}")
-    return config_type(**{name: recipe[name] for name in names})
+    names = {field.name for field in fields(config_type)}
+    if not isinstance(recipe, dict) or set(recipe) != names:
+        raise ValueError(
+            f"Saved {config_type.__name__} must contain exactly these fields: {sorted(names)}"
+        )
+    return config_type(**recipe)
 
 
 def validate_execution_config(info, execution: ExecutionConfig) -> None:
