@@ -69,7 +69,18 @@ VR 遥操作和策略部署每次启动会话时自动将手部回到 HOME，确
 
 每段在 PREPARING 阶段先做一次不下发的目标预计算；机械臂准备完成后再用新观测重建锚点及滤波初值，开始控制与录制计时。首个目标成功提交并入录制队列后才播放开始/继续提示。控制期限或目标准入导致的停止使用结束提示，日志保留具体原因并提示按 B 重新开始；急停和运行故障仍使用异常提示。
 
-VR 手部重定向固定使用 DexPilot，求解范围直接采用 `hand.qpos_min_rad/qpos_max_rad`，发送边界仍检查并截断目标。腕部位移倍率 `teleop.vr_pos_scale` 为 0.7；位置/旋转 EMA 的新样本权重分别为 0.95/0.85，手部单层 `dexpilot_retargeting.low_pass_alpha` 为 0.5。权重越大越跟手，越小越平滑；腕部侧重减少滤波滞后，手部适度抑制目标跳变。控制与录制仍为 16 Hz。
+VR 手部重定向使用面向 XHand 的联合优化：固定骨长标定、手形/指尖/末节方向、连续对指距离和时间阻尼。启动时采集 25 个新鲜且来源时间递增的右手样本，取骨长中位数；不要求伸直，标定在本次会话内固定，暂停继续不重复标定。请保持右手清晰可见；标定 5 秒内未完成或骨长不稳定时明确退出，S/Q/Esc 可取消。
+
+配置改为 `hand_retargeting`，旧 `dexpilot_retargeting` 键会明确报错。求解范围采用 `hand.qpos_min_rad/qpos_max_rad`，另限制相邻提交目标的变化率，默认 4 rad/s；这不是实测电机速度或接触力保证。单层滤波使用时间常数 `smoothing_tau_s=0.04`，按实际观测间隔计算权重；候选只有在提交成功后才更新下一帧的初值、阻尼和滤波状态。无效输入和求解失败会保留具体原因并终止当前段。腕部位移倍率 0.7、位置/旋转 EMA 权重 0.95/0.85、控制与录制 16 Hz 保持原配置。
+
+重定向仅需 NumPy、Pinocchio 和 NLopt，不再通过 `dex_retargeting`/Torch 求导。算法推导、Sharpa/Wuji 来源、配置迁移、离线评估和验证边界见 [手部重定向说明](docs/hand_retargeting.md)。Raw 的 `meta.hand_retargeting_calibration_json` 保存实际骨长标定，供重放恢复。
+
+```bash
+# 不连接设备：确定性合成序列及目标函数消融
+python scripts/tools/evaluate_hand_retargeting.py --synthetic --ablations
+# 使用现有 Raw 的 VR 字段；新录制优先恢复保存的标定
+python scripts/tools/evaluate_hand_retargeting.py --episode episodes/TASK/EPISODE --config local.yaml
+```
 
 遥操作 Raw 的 `meta` 属性保存 `runtime_config_json`、实际使用的 `vr_to_robot_rotation` 和 `teleop_run_id`；`meta/termination_details` 保存预计算耗时、`teleop_anchor` 初始观测，以及录制期间处理的按键和失败时的 `control_timing`。所有新增事件时间戳均为主机单调时钟；`submit_start_ns/submit_end_ns` 表示父进程提交调用，不代表机械臂到达目标。终端按键日志记录处理时的阶段与运行编号。
 
@@ -130,7 +141,7 @@ RealSense 和点云诊断使用 OpenCV RGB-D 面板及 Open3D 点云窗口，需
 
 ## 模型与手点云
 
-整机 FK、IK 与碰撞检查共用 [xarm7_xhand_right.urdf](assets/robots/xhand/xarm7_xhand_right.urdf)，手部安装位姿由该模型定义。DexPilot 重定向使用独立的 [xhand_right.urdf](assets/robots/xhand/xhand_right.urdf)。
+整机 FK、IK 与碰撞检查共用 [xarm7_xhand_right.urdf](assets/robots/xhand/xarm7_xhand_right.urdf)，手部安装位姿由该模型定义。手部重定向使用独立的 [xhand_right.urdf](assets/robots/xhand/xhand_right.urdf)。
 
 手点云模板位于 `assets/pointcloud_template/hand/hand_<点数>.npz`，默认使用 1024 点。离线导出与部署共用模板及 FK；训练和部署应使用同一份模板。更改点数或手部 visual 网格、颜色、位姿后，重新生成对应模板：
 

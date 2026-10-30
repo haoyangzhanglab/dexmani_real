@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         if runtime.collection.enabled:
             sections.append("camera")
         if runtime.hand.enabled:
-            sections.append("dexpilot_retargeting")
+            sections.append("hand_retargeting")
         print("# 声明配置；CLI 专属参数仍需在命令行指定。")
         for name in ("task_name", "vr_transform", "camera_calibration", "no_hand"):
             print(f"# {name}: {getattr(args, name)}")

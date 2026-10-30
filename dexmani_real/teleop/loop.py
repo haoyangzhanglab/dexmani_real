@@ -303,6 +303,7 @@ class TeleopLoop:
         try:
             self.controller.reset(row)
             result = self.controller.compute_target(row)
+            hand_rejection = self.controller.rejection_reason
         finally:
             elapsed_ms = (time.monotonic_ns() - started_ns) / 1e6
             self.termination_details.append(dict(stage="precompute", elapsed_ms=elapsed_ms))
@@ -311,7 +312,10 @@ class TeleopLoop:
             return
         logger.info("Teleop precompute run=%s: %.2f ms", self.run_id, elapsed_ms)
         if result is None or result.rejection_reason is not None or result.arm_qpos is None:
-            detail = result.rejection_reason if result is not None else "hand geometry rejected"
+            detail = (
+                result.rejection_reason if result is not None
+                else hand_rejection or "hand target rejected"
+            )
             self.abort_episode(f"preparation_target_unavailable: {detail}")
             return
 
@@ -326,6 +330,10 @@ class TeleopLoop:
                 vr_to_robot_rotation=self.controller.rotation.tolist(),
                 teleop_run_id=self.run_id,
             )
+            if self.controller.hand_retargeter is not None:
+                metadata["hand_retargeting_calibration_json"] = json.dumps(
+                    self.controller.hand_retargeter.calibration_metadata(), allow_nan=False,
+                )
             self.recorder = EpisodeRecorder(
                 self.recording_dir, control_hz=self.runtime.teleop.control_hz,
             )
@@ -498,8 +506,13 @@ class TeleopLoop:
         try:
             result = self.controller.compute_target(row)
             timing["compute_end_ns"] = time.monotonic_ns()
+            if self.controller.hand_retargeter is not None:
+                timing["hand_retargeting"] = self.controller.hand_retargeter.last_diagnostics.copy()
             if result is None or result.rejection_reason is not None or result.arm_qpos is None:
-                detail = result.rejection_reason if result is not None else "hand geometry rejected"
+                detail = (
+                    result.rejection_reason if result is not None
+                    else self.controller.rejection_reason or "hand target rejected"
+                )
                 reason = f"target_unavailable: {detail}"
             else:
                 if self.recorder is not None:
