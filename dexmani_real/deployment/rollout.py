@@ -56,26 +56,13 @@ class EpisodeResult:
     termination_details: str | None = None
     errors: list[dict] = field(default_factory=list)
     raw: dict | None = None
-    metrics: dict = field(default_factory=lambda: dict(
-        inference_count=0, inference_mean_s=None, inference_max_s=None, skipped_slots=0,
-        prediction_wait_count=0, prediction_wait_mean_s=None, prediction_wait_max_s=None,
-        observation_to_submit_count=0, observation_to_submit_mean_s=None, observation_to_submit_max_s=None,
-    ))
+    skipped_slots: int = 0
 
     @property
     def normal_termination(self):
         return not self.errors and self.termination_reason in {
             "operator", "quit", "duration_complete",
         }
-
-    def record_duration(self, name, duration_ns):
-        metrics = self.metrics
-        count = metrics[f"{name}_count"]
-        mean = metrics[f"{name}_mean_s"] or 0.0
-        duration = duration_ns / 1e9
-        metrics[f"{name}_count"] = count + 1
-        metrics[f"{name}_mean_s"] = mean + (duration - mean) / (count + 1)
-        metrics[f"{name}_max_s"] = max(metrics[f"{name}_max_s"] or 0.0, duration)
 
 
 class Rollout:
@@ -366,9 +353,7 @@ class Rollout:
             self.stop("owner_authority_revoked")
             self.query = None
             return
-        self.result.record_duration("inference", result.duration_ns)
-        self.result.record_duration("prediction_wait", time.monotonic_ns() - self.query.submitted_ns)
-        self.query.result = result.actions
+        self.query.result = result
 
     def submit(self, slot, *, handoff_slot=None, prefix=None, commands=None):
         authorized, expired = self.has_motion_authority(), self.expired_budget()
@@ -383,7 +368,7 @@ class Rollout:
         )
         query = Prediction(
             self.run_id, slot, handoff_slot,
-            observation_ns=rows[-1].observation_timestamp_ns, submitted_ns=time.monotonic_ns(),
+            submitted_ns=time.monotonic_ns(),
         )
         self.model.predict(rows, **kwargs)
         if self.plan is None:
@@ -529,7 +514,7 @@ class Rollout:
                     if record_issues:
                         raise RecordingError("recording sources: " + "; ".join(record_issues))
                 if now >= self.next_step_ns:
-                    self.result.metrics["skipped_slots"] += 1 + (now - self.next_step_ns) // self.dt_ns
+                    self.result.skipped_slots += 1 + (now - self.next_step_ns) // self.dt_ns
                     self.next_step_ns = next_tick_ns(self.next_step_ns, self.dt_ns, now)
                 if self.query.result is None:
                     return
@@ -544,7 +529,7 @@ class Rollout:
                 )
                 if slot is None:
                     return
-                self.result.metrics["skipped_slots"] += skipped
+                self.result.skipped_slots += skipped
                 if skipped and self.execution.mode == "rtc":
                     self.stop(f"missed_slot: expected={self.last_slot + 1}, actual={slot}")
                     return
@@ -623,7 +608,6 @@ class Rollout:
                 budget_expired = limit is not None and now >= limit[0]
                 if authorized and not action_expired and not budget_expired:
                     self.previous_arm = command.arm_qpos
-            self.result.record_duration("observation_to_submit", now - self.plan.observation_ns)
             if not authorized:
                 self.stop("motion authority revoked during submission")
                 return

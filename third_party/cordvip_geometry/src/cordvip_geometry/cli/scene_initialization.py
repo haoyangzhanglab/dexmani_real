@@ -154,7 +154,6 @@ def choose_masks(objects, frame, args, output, segmenter):
                 mask_grid="original_rgb_grid; not_automatically_rectified",
                 source_id=frame.source_id, timestamp_ns=frame.timestamp_ns, clock=frame.clock,
                 prompt=item.get("prompt"),
-                detection_metrics=segmenter.last_metrics if item.get("prompt") else None,
                 detection_score=candidate["score"] if candidate else None,
                 mask_score=candidate["mask_score"] if candidate else None,
                 segmentation_model=segmenter.provenance,

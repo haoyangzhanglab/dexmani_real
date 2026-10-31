@@ -136,27 +136,27 @@ class AdaptiveHandRetargeter:
             )
             return None
         status = int(self.optimizer.last_optimize_result())
-        self.last_diagnostics = dict(
-            status=status, evaluations=self.optimizer.get_numevals(),
-            solve_ms=(time.perf_counter() - started) * 1000,
-            budget_limited=status in (nlopt.MAXEVAL_REACHED, nlopt.MAXTIME_REACHED),
-            initial_loss=initial_loss, dt_s=dt_s,
-            thumb_base_observable=targets.thumb_base_observable,
-        )
+        solve_ms = (time.perf_counter() - started) * 1000
         if (
             status <= 0 or solution.shape != HAND_JOINT_SHAPE
             or not np.isfinite(solution).all()
             or np.any(solution < lower - 1e-9) or np.any(solution > upper + 1e-9)
         ):
             self.rejection_reason = f"hand solver returned an invalid bounded solution (status={status})"
+            self.last_diagnostics = dict(
+                status=status, evaluations=self.optimizer.get_numevals(), solve_ms=solve_ms,
+                initial_loss=initial_loss, dt_s=dt_s, failure_reason=self.rejection_reason,
+            )
             return None
         solution = np.clip(solution, lower, upper)
         final_loss = objective(solution, np.empty(0))
-        self.last_diagnostics["final_loss"] = final_loss if np.isfinite(final_loss) else None
         if not np.isfinite(final_loss) or final_loss > initial_loss + self.config.ftol_abs:
             self.rejection_reason = "hand solver did not improve the committed-command seed"
-            self.last_diagnostics["failure_reason"] = (
-                "non-finite final loss" if not np.isfinite(final_loss) else self.rejection_reason
+            self.last_diagnostics = dict(
+                status=status, evaluations=self.optimizer.get_numevals(), solve_ms=solve_ms,
+                initial_loss=initial_loss, dt_s=dt_s,
+                final_loss=final_loss if np.isfinite(final_loss) else None,
+                failure_reason="non-finite final loss" if not np.isfinite(final_loss) else self.rejection_reason,
             )
             return None
         # 同一个已提交目标同时作为 warm start、阻尼中心和唯一滤波状态。

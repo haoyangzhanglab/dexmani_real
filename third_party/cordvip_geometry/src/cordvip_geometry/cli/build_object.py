@@ -121,9 +121,7 @@ def segment(args, *, output_dir=None, list_only=False):
             box_threshold=args.box_threshold,
             text_threshold=args.text_threshold,
         )
-        provenance.update(
-            model=segmenter.provenance, performance=segmenter.last_metrics
-        )
+        provenance.update(model=segmenter.provenance)
     except BaseException:
         try:
             segmenter.close()

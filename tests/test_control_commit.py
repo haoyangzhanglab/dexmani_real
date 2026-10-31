@@ -72,6 +72,43 @@ class ControlCommitTests(unittest.TestCase):
         np.testing.assert_array_equal(self.controller.previous_arm_command, np.full(7, 0.1))
         self.assertFalse(command.hand_qpos.flags.writeable)
 
+    def test_success_does_not_copy_discarded_solver_diagnostics(self):
+        self.hand_retargeter.last_diagnostics.copy.side_effect = AssertionError("unused diagnostic copy")
+
+        def compute(row):
+            self.controller.hand_observation_id = 1
+            return self.result
+
+        self.controller.compute_target.side_effect = compute
+        self.loop.execute_control_step(self.row, 200, 300)
+        self.hand_retargeter.last_diagnostics.copy.assert_not_called()
+        self.loop.record_control_timing.assert_not_called()
+        self.hand_retargeter.commit.assert_called_once()
+
+    def test_failure_keeps_actual_compute_and_submission_times(self):
+        self.loop.record_control_timing = TeleopLoop.record_control_timing.__get__(self.loop)
+        self.loop.termination_details = []
+
+        def compute(row):
+            self.now = 125
+            return self.result
+
+        def failed_send(*args, **kwargs):
+            self.now = 150
+            raise RobotError("SDK failed during submit")
+
+        self.controller.compute_target.side_effect = compute
+        self.loop.robot.send_action.side_effect = failed_send
+        with self.assertRaisesRegex(RobotError, "SDK failed during submit"):
+            self.loop.execute_control_step(self.row, 200, 300)
+        timing = self.loop.termination_details[0]
+        self.assertEqual(timing["compute_start_ns"], 100)
+        self.assertEqual(timing["compute_end_ns"], 125)
+        self.assertEqual(timing["submit_start_ns"], 125)
+        self.assertNotIn("submit_end_ns", timing)
+        self.assertEqual(timing["ended_ns"], 150)
+        self.assert_uncommitted()
+
     def test_sdk_failure_does_not_advance_retarget_or_smoothing(self):
         self.loop.robot.send_action.side_effect = RobotError("hand SDK rejected")
         with self.assertRaisesRegex(RobotError, "hand SDK rejected"):

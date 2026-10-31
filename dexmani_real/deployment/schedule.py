@@ -14,7 +14,6 @@ class Prediction:
     run_id: int
     slot: int
     handoff_slot: int | None
-    observation_ns: int
     submitted_ns: int
     result: np.ndarray | None = None
 
@@ -27,7 +26,6 @@ class ActionChunk:
     anchor_slot: int
     segment_end: int
     frozen: dict[int, RobotCommand]
-    observation_ns: int
 
 
 def handoff_plan(
@@ -59,7 +57,6 @@ def handoff_plan(
             anchor_slot=slot if bootstrap and mode == "rtc" else query.slot,
             segment_end=segment_end,
             frozen={},
-            observation_ns=query.observation_ns,
         ),
         None,
     )

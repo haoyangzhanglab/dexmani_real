@@ -3,7 +3,6 @@
 import argparse
 import os
 import sys
-import time
 import traceback
 
 from .segmentation_protocol import receive, send
@@ -29,7 +28,6 @@ def main():
             except EOFError:
                 break
             reply = {key: request[key] for key in ("session", "request", "frame_key")}
-            started = time.monotonic_ns()
             try:
                 if session is None:
                     session = request["session"]
@@ -67,17 +65,6 @@ def main():
                     reply["ids"] = engine.ids
                 else:
                     raise ValueError(f"Unknown operation: {operation}")
-                import torch
-
-                torch.cuda.synchronize()
-                reply["metrics"] = dict(
-                    compute_ms=(time.monotonic_ns() - started) / 1e6,
-                    cuda_allocated_bytes=torch.cuda.memory_allocated(),
-                    cuda_reserved_bytes=torch.cuda.memory_reserved(),
-                    cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
-                    cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
-                    cached_frames=engine.cached_frames(),
-                )
                 send(protocol, reply, output)
             except Exception as error:
                 traceback.print_exc(file=sys.stderr)

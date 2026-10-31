@@ -25,7 +25,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "collect":
         from dexmani_real.config.real import load_config
+        from dexmani_real.utils.log import configure_logging
 
+        configure_logging()
         collect_samples(load_config(args.config), args.output)
     else:
         solve_samples(args.samples, args.output, exclude=args.exclude)

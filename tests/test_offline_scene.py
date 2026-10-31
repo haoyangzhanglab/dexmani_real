@@ -4,7 +4,9 @@ import contextlib
 from dataclasses import replace
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -22,6 +24,9 @@ from cordvip_geometry.integrations.dexmani import iter_raw_rows
 from cordvip_geometry.io import load_initial_selection, write_confirmed_selection
 from cordvip_geometry.rgbd import Frame, save_frame
 from cordvip_geometry.scene_tracking import SceneTracker, scene_arrays
+from cordvip_geometry.segmentation import GroundedSAM2Segmenter
+from cordvip_geometry.segmentation_protocol import send
+from cordvip_geometry.segmentation_protocol import receive
 import cordvip_geometry.cli.check_tracking
 import cordvip_geometry.sam2_config
 import cordvip_geometry.segmentation
@@ -31,7 +36,6 @@ class Segmenter:
     """固定 mask 的局部模型边界 fake；Raw、编码、点云与 FK 走真实实现。"""
 
     provenance = {"model": "local test fake"}
-    last_metrics = {}
 
     def __init__(self, *args, **kwargs):
         self.rows = []
@@ -94,15 +98,27 @@ class OfflineSceneTests(unittest.TestCase):
             "--output", str(output), "--headless", *extra,
         ], workspace=self.root)
         segmenter = segmenter or Segmenter()
-        with patch("cordvip_geometry.cli.check_tracking.check_tracking_environment", return_value={"ok": True, "checks": []}) as environment, patch(
-            "cordvip_geometry.sam2_config.check_sam_environment", return_value=[]
+        with patch("cordvip_geometry.cli.check_tracking.check_tracking_environment", side_effect=RuntimeError("optional probe unavailable")) as environment, patch(
+            "cordvip_geometry.sam2_config.check_sam_environment", side_effect=RuntimeError("optional probe unavailable")
         ), patch("cordvip_geometry.segmentation.GroundedSAM2Segmenter", return_value=segmenter), patch(
             "dexmani_real.data.raw.RawReader", wraps=RawReader
         ) as reader, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(run(args), 0)
-            self.assertFalse(environment.call_args.kwargs["need_pose"])
+            environment.assert_not_called()
             reader.assert_called_once()
         return output, segmenter
+
+    def test_environment_probes_are_explicit_and_check_does_not_open_raw(self):
+        args = parse_tracking_args(["--check"], workspace=self.root)
+        with patch("cordvip_geometry.cli.check_tracking.check_tracking_environment", return_value={"ok": True, "checks": []}) as environment, patch(
+            "cordvip_geometry.sam2_config.check_sam_environment", return_value=[]
+        ) as sam, patch("dexmani_real.data.raw.RawReader") as reader, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(run(args), 0)
+        self.assertFalse(environment.call_args.kwargs["need_pose"])
+        self.assertFalse(environment.call_args.kwargs["need_camera"])
+        self.assertFalse(environment.call_args.kwargs["need_gui"])
+        sam.assert_called_once()
+        reader.assert_not_called()
 
     def test_default_processes_every_raw_row_and_mask_only_needs_no_fp(self):
         with patch.dict(sys.modules, {"torch": None, "open3d": None}):
@@ -229,7 +245,7 @@ class ScenePoseTests(unittest.TestCase):
         assets = {name: (None, np.zeros((1, 3)), np.array([[1., 0., 0.]])) for name in masks}
         with patch("cordvip_geometry.foundationpose.FoundationPosePlusTracker", return_value=fake_tracker), patch(
             "cordvip_geometry.scene_tracking.ModelDepthRenderer", Renderer
-        ), patch("cordvip_geometry.scene_tracking.prepare_tracking_frame", return_value={}), patch.object(SceneTracker, "sync"):
+        ), patch("cordvip_geometry.scene_tracking.prepare_tracking_frame", return_value={}):
             tracker = SceneTracker(Segmenter(), assets, foundationpose_root=Path("unused"), debug_dir=Path("unused"), min_matched_pixels=1)
             result = tracker.step(frame, rgb, depth, K, initial_masks=masks)
             self.assertIs(rays[0], rays[1])
@@ -245,6 +261,64 @@ class ScenePoseTests(unittest.TestCase):
             self.assertEqual(len(lost["left__observed_points_camera"]), 8)
             self.assertEqual(len(lost["left__model_points_camera"]), 0)
             self.assertEqual(str(lost["left__state"]), "POSE_LOST")
+
+    def test_pose_failure_keeps_the_original_traceback_visible(self):
+        rgb = np.zeros((8, 8, 3), np.uint8)
+        depth = np.full((8, 8), .5, np.float32)
+        K = np.array([[16., 0., 4.], [0., 16., 4.], [0., 0., 1.]])
+        frame = Frame(rgb, depth, K, "none", (0.,) * 5, "test:0", 100, "recorded", 0)
+        tracker = unittest.mock.Mock()
+        original = RuntimeError("original pose failure")
+        tracker.register.side_effect = original
+        assets = {"object": (None, np.zeros((1, 3)), np.array([[1., 0., 0.]]))}
+        with patch("cordvip_geometry.foundationpose.FoundationPosePlusTracker", return_value=tracker), patch(
+            "cordvip_geometry.scene_tracking.ModelDepthRenderer"
+        ), self.assertLogs("cordvip_geometry.scene_tracking", level="ERROR") as logs:
+            scene = SceneTracker(Segmenter(), assets, foundationpose_root=Path("unused"), debug_dir=Path("unused"), min_matched_pixels=1)
+            arrays = scene_arrays(scene.step(frame, rgb, depth, K, initial_masks={"object": np.ones((8, 8), bool)}))
+        self.assertIs(logs.records[0].exc_info[1], original)
+        self.assertIsNotNone(logs.records[0].exc_info[2])
+        self.assertFalse(arrays["object__pose_valid"])
+        self.assertTrue(arrays["object__observed_valid"])
+
+
+class SegmentationReplyTests(unittest.TestCase):
+    def test_worker_error_preserves_its_original_traceback_channel(self):
+        request = io.BytesIO()
+        send(request, dict(session="test", request=2, frame_key=None, operation="track"))
+        environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "third_party/cordvip_geometry/src"))
+        result = subprocess.run([
+            sys.executable, "-m", "cordvip_geometry.segmentation_worker",
+            "--sam-root", "unused", "--checkpoint", "unused", "--sam-config", "unused",
+            "--dino-weights", "unused",
+        ], input=request.getvalue(), capture_output=True, timeout=5, env=environment)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"Traceback (most recent call last)", result.stderr)
+        self.assertIn(b"ValueError: Out-of-order SAM2 request", result.stderr)
+        reply, _ = receive(io.BytesIO(result.stdout))
+        self.assertIn("Out-of-order SAM2 request", reply["error"])
+
+    def test_successful_rpc_needs_only_identity_and_result_arrays(self):
+        segmenter = GroundedSAM2Segmenter("python", "source", "checkpoint", sam_config="config", dino_weights="weights", log_path="unused.log")
+        stream = io.BytesIO()
+        frame_key = {"row_index": 3, "timestamp_ns": 100}
+        send(stream, dict(session=segmenter._session, request=1, frame_key=frame_key), {"masks": np.ones((1, 2, 2), bool)})
+        stream.seek(0)
+        segmenter._process = unittest.mock.Mock(stdin=io.BytesIO(), stdout=stream)
+        reply, arrays = segmenter.call("track", frame_key=frame_key)
+        self.assertNotIn("metrics", reply)
+        np.testing.assert_array_equal(arrays["masks"], np.ones((1, 2, 2), bool))
+
+    def test_wrong_rpc_frame_is_still_rejected(self):
+        segmenter = GroundedSAM2Segmenter("python", "source", "checkpoint", sam_config="config", dino_weights="weights", log_path="unused.log")
+        stream = io.BytesIO()
+        send(stream, dict(session=segmenter._session, request=1, frame_key={"row_index": 2}))
+        stream.seek(0)
+        segmenter._process = unittest.mock.Mock(stdin=io.BytesIO(), stdout=stream)
+        with patch.object(segmenter, "cancel") as cancel:
+            with self.assertRaisesRegex(RuntimeError, "mismatched SAM2 reply"):
+                segmenter.call("track", frame_key={"row_index": 3})
+            cancel.assert_called_once()
 
 
 if __name__ == "__main__":

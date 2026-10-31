@@ -393,7 +393,7 @@ finally:
 | T4 | 实现完成；模型回归未验证 | 单 RawReader 同行 RGB-D/实测关节/时钟→首帧确认→默认全行→必存逐行结果→独立 view；删除 live/capture/latest/心跳/STALE/unlink、外层 worker/播放器与阶段 CLI 转发。保留 mask-only/多物体、SAM RPC/历史、法向与深度 pose-valid 门控。共享只读 rays；生成只保存未定尺度 mesh，最终米制仅采样一次。89 项 unittest、相关 CLI help、diff 检查通过；24 组渲染和固定点/法向精确相等；真实 Raw 前三行新旧 RGB-D/手几何/关节/时钟/metadata 精确一致，reader 打开 2→1。sandbox 外 FP 两组真实权重已加载，非真实场景精度验证；SAM/DINO/Hunyuan 默认权重和已确认真实场景资产缺失，完整模型结果/长序列/GUI 未验证。 |
 | T5 | 完成 | 内部 ArmFK/EEF/手几何改原生 SE(3)，必需显式 FK，仅 Canonical/policy 边界编码9D/21D；删除无消费 pose/helper/几何镜像，保留独立真实命令入口校验和动态重检。手标定复用已接纳测量，固定几何在原对象内预计算；ftol 双用途/default/接受式不变。97 项 unittest 及 diff 检查通过；20 组 EEF/指尖/1024手云、5行13模态与 T0 全部精确相等；VR旋转差≤2.22e-16，回放朝向指标差≤1.44e-11度；28个标定输入接受集合一致，标定/targets/loss/gradient精确一致，非法rot6d仍拒绝、FK无别名覆写。未测真机/求解吞吐。 |
 | T6 | 完成 | 相机 `collect` 只读采样（每组 connect/read/close 后断开以便独立摆位），`solve` 只读保存样本、按原 ID 剔除并保存残差/质量报告；删除旧控制类/jog/HOME/在线求解和 JSON cancelled 链。相机/点云查看合一，桌面拟合/快照/benchmark 显式阶段共用连接；episode viewer 主循环直接传 RGB。112 项 unittest、CLI help、diff 检查通过；fake 底层 SDK 证明零 enable/mode/config/servo/stop；真实 ArUco 图像5帧→NPZ写读、坏RGB/时钟/静止/真实I/O失败均测；16个含噪样本及剔除原ID3后的解/残差与基线 atol1e-10一致，原serial外参读取兼容；五帧桌面拟合与旧函数精确一致。未连接真实 SDK/相机，未验 GUI 或真实标定数据。 |
-| T7 | 未开始 | — |
+| T7 | 完成 | 默认仅终端 INFO，删除各进程 DEBUG 文件/日志环境 fallback、预测耗时 wrapper/聚合、arm timing 字典及几何/RPC profile/显存/冗余同步；成功控制步不再复制完整诊断，失败时点仍在实际事件采集。保留 worker 原始 traceback、算法诊断与来源/期限；环境探针仅显式 --check。新增只读 analyze_timing.py，重写 README。119 项 unittest、diff 检查通过；真实小 Raw 分析结果符合已知间隔/来源年龄；屏蔽13类设备/GPU/交互包后14脚本19项 help/print 与离线导入成功且零触发屏蔽模块。无依赖退出完整消费链，未强删 PyYAML 等现有依赖。未验证实际设备、GUI 或完整模型性能。 |
 | T8 | 未开始 | — |
 
 只有实施后才更新状态。记录保持短：修改结果、实际执行的命令/对照、尚未验证的范围即可，不复制全量日志。跨上下文续做时，先读本表、相关提交和工作区 diff，不重新审计整个仓库。

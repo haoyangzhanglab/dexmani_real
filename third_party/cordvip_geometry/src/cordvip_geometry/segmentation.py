@@ -6,7 +6,6 @@ from pathlib import Path
 import signal
 import subprocess
 import threading
-import time
 import uuid
 
 import numpy as np
@@ -27,7 +26,6 @@ class GroundedSAM2Segmenter:
         self.config = sam_config
         self.dino_weights = Path(dino_weights).expanduser().resolve()
         self.provenance = None
-        self.last_metrics = {}
         self._process = self._log = None
         self._session = uuid.uuid4().hex
         self._counter = 0
@@ -90,7 +88,6 @@ class GroundedSAM2Segmenter:
                 raise RuntimeError("SAM2 session is not running")
             self._counter += 1
             identity = dict(session=self._session, request=self._counter, frame_key=frame_key)
-            started = time.monotonic_ns()
             send(self._process.stdin, dict(**identity, operation=operation, **parameters), arrays)
             reply, result = receive(self._process.stdout)
             if any(reply.get(k) != v for k, v in identity.items()):
@@ -99,11 +96,6 @@ class GroundedSAM2Segmenter:
                 raise RuntimeError(f"SAM2 {operation}: {reply['error']}; log: {self.log_path}")
             if self._cancelled.is_set():
                 raise CancelledError("Rejected cancelled SAM2 reply")
-            self.last_metrics = reply["metrics"]
-            self.last_metrics["round_trip_ms"] = (time.monotonic_ns() - started) / 1e6
-            self.last_metrics["ipc_and_dispatch_ms"] = max(
-                0.0, self.last_metrics["round_trip_ms"] - self.last_metrics["compute_ms"]
-            )
             return reply, result
         except (EOFError, BrokenPipeError) as error:
             if self._cancelled.is_set():

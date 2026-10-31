@@ -13,9 +13,6 @@ logger = logging.getLogger(__name__)
 
 
 def run(args):
-    from ..sam2_config import check_sam_environment
-    from .check_tracking import check_tracking_environment, print_tracking_report
-
     objects = load_scene(args.scene, args.workspace, headless=args.headless) if args.scene else {
         "object": dict(
             id="object", role="object", asset=args.asset,
@@ -33,14 +30,16 @@ def run(args):
         raise ValueError("位姿深度容差、匹配像素数必须为正，匹配比例必须位于 (0,1]")
     if need_grounding and not (0 < args.box_threshold < 1 and 0 < args.text_threshold < 1):
         raise ValueError("首帧检测阈值必须位于 (0,1)")
-    report = check_tracking_environment(
-        args.foundationpose_root, need_camera=False, need_pose=need_pose,
-        need_gui=not args.check and any(not item.get("initial_selection") for item in objects.values()),
-    )
-    report["checks"].extend(check_sam_environment(args, require_grounding=need_grounding))
-    report["ok"] = all(item["ok"] for item in report["checks"])
-    print_tracking_report(report)
-    if args.check or not report["ok"]:
+    if args.check:
+        from ..sam2_config import check_sam_environment
+        from .check_tracking import check_tracking_environment, print_tracking_report
+
+        report = check_tracking_environment(
+            args.foundationpose_root, need_camera=False, need_pose=need_pose, need_gui=False,
+        )
+        report["checks"].extend(check_sam_environment(args, require_grounding=need_grounding))
+        report["ok"] = all(item["ok"] for item in report["checks"])
+        print_tracking_report(report)
         return 0 if report["ok"] else 2
 
     from dexmani_real.data.raw import RawReader

@@ -176,7 +176,7 @@ class EpisodeLifecycleTests(unittest.TestCase):
             self.assertTrue(entered.wait(1))
             self.assertFalse(done.is_set())
             self.assertFalse(session.request_start())
-            retired.set_result(SimpleNamespace(actions=np.ones((3, 21)), duration_ns=1))
+            retired.set_result(np.ones((3, 21)))
             thread.join(1)
             self.assertFalse(thread.is_alive())
             self.assertEqual(errors, [])
@@ -259,7 +259,7 @@ class EpisodeLifecycleTests(unittest.TestCase):
     def test_rtc_guidance_freezes_only_after_prediction_submission(self):
         episode, _ = make_episode()
         episode.execution = ExecutionConfig(mode="rtc", prefetch_steps=2, rtc_guidance_cap=1)
-        episode.plan = ActionChunk(np.zeros((8, 19)), 0, 4, {}, 123)
+        episode.plan = ActionChunk(np.zeros((8, 19)), 0, 4, {})
         episode.model.predict = Mock()
         episode.history = deque([SimpleNamespace(observation_timestamp_ns=123)])
         episode.action_mapper = SimpleNamespace(

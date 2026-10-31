@@ -1,9 +1,7 @@
 """One subprocess-owned SAM2 model handles first-frame grounding and causal propagation."""
 
 import gc
-from importlib.metadata import version
 from pathlib import Path
-import sys
 
 import numpy as np
 
@@ -44,7 +42,6 @@ class SAM2Engine:
     def __init__(self, root, checkpoint, config, dino_weights):
         root = validate_sam_source(root)
         checkpoint = validate_sam_checkpoint(root, checkpoint, config)
-        versions = {name: version(name) for name in ("torch", "torchvision", "numpy")}
         import torch
         import sam2
         from sam2.build_sam import build_sam2_video_predictor
@@ -92,8 +89,6 @@ class SAM2Engine:
             sam_config=config,
             device=str(self.device),
             precision="SAM2 bfloat16 autocast",
-            python_version=sys.version.split()[0],
-            package_versions=versions,
             history_frames=self.history_frames,
             fill_hole_area=0,
             max_sprinkle_area=0,
@@ -136,7 +131,6 @@ class SAM2Engine:
             modeling_grounding_dino.load_cuda_kernels = loader
         self.provenance["grounding"] = dict(
             directory=str(directory),
-            transformers_version=version("transformers"),
             precision="float32",
             disable_custom_kernels=True,
         )
@@ -277,8 +271,3 @@ class SAM2Engine:
         except BaseException:
             self.state = None
             raise
-
-    def cached_frames(self):
-        if self.state is None:
-            return 0
-        return sum(len(v) for v in self.state["output_dict"].values())

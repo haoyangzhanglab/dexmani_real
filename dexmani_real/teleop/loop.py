@@ -446,9 +446,26 @@ class TeleopLoop:
             vr_recv_ts_ns=int(row.vr["recv_ts_ns"]),
         ))
 
-    def record_control_timing(self, timing):
+    def record_control_timing(
+        self, row, epoch, deadline_ns, compute_start_ns, compute_end_ns,
+        submit_start_ns, submit_end_ns, previous_hand_observation_id,
+    ):
+        """仅失败时编码诊断；所有开始/完成时点已在实际事件处采集。"""
         ended_ns = time.monotonic_ns()
-        timing["ended_ns"] = ended_ns
+        timing = dict(
+            stage="control_timing", run_id=epoch, tick=self.tick_index,
+            control_ns=int(row.control_timestamp_ns), observation_ns=int(row.observation_timestamp_ns),
+            deadline_ns=int(deadline_ns), compute_start_ns=compute_start_ns, ended_ns=ended_ns,
+        )
+        for name, stamp in (("compute_end_ns", compute_end_ns), ("submit_start_ns", submit_start_ns),
+                            ("submit_end_ns", submit_end_ns)):
+            if stamp is not None:
+                timing[name] = stamp
+        if (
+            self.controller.hand_retargeter is not None
+            and self.controller.hand_observation_id != previous_hand_observation_id
+        ):
+            timing["hand_retargeting"] = self.controller.hand_retargeter.last_diagnostics.copy()
         timing["durations_ms"] = dict(
             read=(timing["observation_ns"] - timing["control_ns"]) / 1e6,
             before_compute=(timing["compute_start_ns"] - timing["observation_ns"]) / 1e6,
@@ -467,21 +484,12 @@ class TeleopLoop:
         command = None
         reason = None
         cancelled = False
-        timing = dict(
-            stage="control_timing", run_id=epoch, tick=self.tick_index,
-            control_ns=int(row.control_timestamp_ns), observation_ns=int(row.observation_timestamp_ns),
-            deadline_ns=int(deadline_ns), compute_start_ns=time.monotonic_ns(),
-        )
+        compute_start_ns = time.monotonic_ns()
+        compute_end_ns = submit_start_ns = submit_end_ns = None
         previous_hand_observation_id = self.controller.hand_observation_id
         try:
             result = self.controller.compute_target(row)
-            timing["compute_end_ns"] = time.monotonic_ns()
-            # 缓存命中没有发生求解，不能重复记入上次的耗时和求解次数。
-            if (
-                self.controller.hand_retargeter is not None
-                and self.controller.hand_observation_id != previous_hand_observation_id
-            ):
-                timing["hand_retargeting"] = self.controller.hand_retargeter.last_diagnostics.copy()
+            compute_end_ns = time.monotonic_ns()
             if result is None or result.rejection_reason is not None or result.arm_qpos is None:
                 detail = (
                     result.rejection_reason if result is not None
@@ -497,14 +505,14 @@ class TeleopLoop:
                     if time.monotonic_ns() >= deadline_ns:
                         raise TimeoutError("teleop expired before submission")
                     command = RobotCommand(epoch, result.arm_qpos, result.hand_qpos)
-                    timing["submit_start_ns"] = time.monotonic_ns()
+                    submit_start_ns = time.monotonic_ns()
                     self.robot.send_action(
                         command,
                         valid_until_ns=deadline_ns,
                         execute_until_ns=int(row.vr["recv_ts_ns"])
                         + int(self.runtime.teleop.vr_stale_threshold_s * 1e9),
                     )
-                    timing["submit_end_ns"] = time.monotonic_ns()
+                    submit_end_ns = time.monotonic_ns()
                 except OperationCancelled as exc:
                     cancelled = True
                     reason = f"control_interrupted: {exc}"
@@ -535,7 +543,10 @@ class TeleopLoop:
                     # 回调先撤权、后入队；由按键决定保存/丢弃，未完成的行不补录。
                     return
         except BaseException as exc:
-            self.record_control_timing(timing)
+            self.record_control_timing(
+                row, epoch, deadline_ns, compute_start_ns, compute_end_ns,
+                submit_start_ns, submit_end_ns, previous_hand_observation_id,
+            )
             self.record_error("control", exc)
             try:
                 self.abort_episode(
@@ -549,7 +560,10 @@ class TeleopLoop:
             raise
 
         if reason is not None:
-            self.record_control_timing(timing)
+            self.record_control_timing(
+                row, epoch, deadline_ns, compute_start_ns, compute_end_ns,
+                submit_start_ns, submit_end_ns, previous_hand_observation_id,
+            )
             self.abort_episode(reason, row=row, command=command)
         else:
             if self.recorder is not None:

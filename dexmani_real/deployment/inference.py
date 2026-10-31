@@ -1,12 +1,8 @@
 """模型生命周期与预测在同一个工作线程串行执行。"""
 
 import logging
-import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
-
-import numpy as np
 
 from dexmani_real.utils.log import error_detail
 
@@ -14,12 +10,6 @@ if TYPE_CHECKING:
     from dexmani_policy.deployment import PolicyRuntime
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class PredictionResult:
-    actions: np.ndarray
-    duration_ns: int
 
 
 class PolicyWorker:
@@ -58,11 +48,8 @@ class PolicyWorker:
         self._submit("reset", lambda: cast("PolicyRuntime", self.model).reset_episode())
 
     def _predict(self, rows, **kwargs):
-        started_ns = time.monotonic_ns()
         observation = self.build_observation(rows)
-        actions = cast("PolicyRuntime", self.model).predict(observation, **kwargs)
-        # predict 返回 CPU 动作后才停止计时。
-        return PredictionResult(actions, time.monotonic_ns() - started_ns)
+        return cast("PolicyRuntime", self.model).predict(observation, **kwargs)
 
     def predict(self, rows, **kwargs):
         self._submit("predict", self._predict, rows, **kwargs)

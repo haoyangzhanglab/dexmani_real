@@ -57,8 +57,8 @@ def run_vr(shared, config: VRConfig) -> None:
                 try:
                     wrist_pos, wrist_quat = _pose_to_flu(event.wrist)
                     landmarks = _landmarks_to_flu(event.landmarks.points)
-                except ValueError:
-                    logger.warning("Invalid VR hand frame rejected", exc_info=True)
+                except ValueError as exc:
+                    logger.warning("Invalid VR hand frame rejected: %s", exc)
                     continue
                 # IPC 写入失败属于 worker 故障，不能当作坏包跳过。
                 shared.vr_ring.write(

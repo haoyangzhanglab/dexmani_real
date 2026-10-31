@@ -14,6 +14,8 @@ python -m cordvip_geometry download --models grounding sam
 python -m cordvip_geometry check --offline-input --headless
 ```
 
+环境清单和版本查询只在显式 `check` 或追踪的 `--check` 中执行。正常追踪直接加载所需源码、权重并执行边界检查；不默认同步 GPU 生成逐步耗时、显存或环境报告。算法使用的深度支持量和 pose-valid 门控仍逐行保存。
+
 安装脚本为缺失源码选择以下 revision；已有目录直接复用：
 
 | 上游 | revision |
@@ -83,6 +85,8 @@ python scripts/cordvip/track_object.py \
 | `models.json` | 实际模型来源、配置及加载事实 |
 | `result.json` | completed / partial / interrupted / failed、已处理行数及清理错误 |
 | `sam2_worker.log` | 隔离分割进程的原始日志 |
+
+SAM 失败保留子进程原始 traceback，父进程错误指向该日志。单物体 FoundationPose 失败进入 `POSE_LOST`，原始 traceback 同时输出到终端，其他独立实测点仍保留。
 
 逐行结果必存，文件名对应源 row，不是墙钟序号。对象字段使用 `toy__`、`basket__` 或单物体 `object__` 前缀，对象清单与 role 只存于 `scene.json`。每个实例分别保存 `pose_valid` 和 `observed_valid`；pose 无效时变换为 NaN、模型点为空，独立实测点仍可有效。
 

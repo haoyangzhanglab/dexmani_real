@@ -1,7 +1,7 @@
 """Raw 同行分割、实测点云与可选位姿；逐行结果直接编码。"""
 
 from pathlib import Path
-import time
+import logging
 
 import numpy as np
 
@@ -9,6 +9,8 @@ from .geometry import transform_points
 from .foundationpose import prepare_tracking_frame
 from .model_depth import ModelDepthRenderer, camera_rays
 from .scene_geometry import extract_scene_clouds, add_model_depth_support
+
+logger = logging.getLogger(__name__)
 
 
 class SceneTracker:
@@ -47,13 +49,6 @@ class SceneTracker:
             self.trackers[name] = tracker
             self.renderers[name] = ModelDepthRenderer(mesh, pixel_stride=pixel_stride)
 
-    @staticmethod
-    def sync():
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
     def step(self, frame, rgb, depth_m, K, *, initial_masks=None):
         identity = (frame.source_id, frame.row_index, frame.clock, frame.timestamp_ns)
         first = self.instance_ids is None
@@ -78,7 +73,6 @@ class SceneTracker:
                 )
         elif not set(self.assets).issubset(initial_masks):
             raise ValueError("Every pose asset requires a named initial instance mask")
-        started_ns = time.monotonic_ns()
         frame_key = dict(
             source_id=frame.source_id,
             row_index=frame.row_index,
@@ -90,7 +84,6 @@ class SceneTracker:
             if first
             else self.segmenter.track(rgb, frame_key=frame_key)
         )
-        segmentation_ns = time.monotonic_ns()
         instance_ids = tuple(initial_masks) if first else self.instance_ids
         if tuple(masks) != instance_ids:
             raise RuntimeError("Streaming segmentation changed instance identity/order")
@@ -108,10 +101,9 @@ class SceneTracker:
             self.instance_ids = instance_ids
             self.image_shape, self.intrinsics = rgb.shape, K.copy()
             self.directions = camera_rays(depth_m.shape, K, self.pixel_stride) if self.assets else None
-        poses, depths, pose_ms = {}, {}, {}
+        poses, depths = {}, {}
         prepared_frame = None
         for name, tracker in self.trackers.items():
-            start = time.monotonic_ns()
             if name in self.lost_objects:
                 continue
             cloud = measured.objects[name]
@@ -129,12 +121,11 @@ class SceneTracker:
                     if first
                     else tracker.track(rgb, depth_m, K, mask, prepared_frame=prepared_frame)
                 )
-                self.sync()
-                pose_ms[name] = (time.monotonic_ns() - start) / 1e6
                 depths[name] = self.renderers[name].render(
                     depth_m.shape, K, poses[name], directions=self.directions,
                 )
             except Exception as error:
+                logger.exception("%s pose failed at Raw row %s (%s)", name, frame.row_index, frame.source_id)
                 poses.pop(name, None)
                 self.lost_objects[name] = f"{type(error).__name__}: {error}"
         add_model_depth_support(measured, depths, depth_tolerance_m=self.depth_tolerance_m)
@@ -174,22 +165,14 @@ class SceneTracker:
                 error=self.lost_objects.get(name),
                 diagnostic_pose=poses.get(name),
                 observed_valid=bool(len(cloud.observed_points_camera)),
-                semantic_model_support_fraction=fraction if name in depths else None,
             )
         self.previous_frame_identity = identity
         return dict(
             frame=frame,
             rgb=rgb,
-            depth_m=depth_m,
             K=K,
             objects=objects,
-            overlap_mask=measured.overlap_mask,
-            started_ns=started_ns,
-            completed_ns=time.monotonic_ns(),
             operation="initialize" if first else "track",
-            segmentation_ms=(segmentation_ns - started_ns) / 1e6,
-            pose_ms=pose_ms,
-            segmentation_metrics=dict(self.segmenter.last_metrics),
         )
 
     def close(self):
