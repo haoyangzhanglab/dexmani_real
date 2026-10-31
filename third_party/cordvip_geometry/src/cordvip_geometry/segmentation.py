@@ -51,16 +51,14 @@ class GroundedSAM2Segmenter:
         self.provenance = reply["provenance"]
         return self
 
-    def call(self, operation, arrays=None, *, frame_key=None, **parameters):
+    def call(self, operation, arrays=None, **parameters):
         if self._process is None:
             raise RuntimeError("SAM2 process is not running")
         try:
-            send(self._process.stdin, dict(frame_key=frame_key, operation=operation, **parameters), arrays)
+            send(self._process.stdin, dict(operation=operation, **parameters), arrays)
             reply, result = receive(self._process.stdout)
         except (EOFError, BrokenPipeError) as error:
             raise RuntimeError(f"SAM2 worker stopped; log: {self.log_path}") from error
-        if reply["frame_key"] != frame_key:
-            raise RuntimeError("Rejected mismatched SAM2 frame reply")
         if reply.get("error"):
             raise RuntimeError(f"SAM2 {operation}: {reply['error']}; log: {self.log_path}")
         return reply, result
@@ -72,7 +70,7 @@ class GroundedSAM2Segmenter:
             raise ValueError("SAM2 expects RGB uint8 [H,W,3]")
         return rgb
 
-    def predict(self, rgb, text, *, box_threshold=0.3, text_threshold=0.25, frame_key=None):
+    def predict(self, rgb, text, *, box_threshold=0.3, text_threshold=0.25):
         if self._ids is not None:
             raise RuntimeError("Text detection is only allowed before fixed-ID tracking starts")
         rgb = self.rgb(rgb)
@@ -88,7 +86,6 @@ class GroundedSAM2Segmenter:
             text=text.strip(),
             box_threshold=box_threshold,
             text_threshold=text_threshold,
-            frame_key=frame_key,
         )
         masks, labels = arrays["masks"], reply["labels"]
         count = len(masks)
@@ -115,7 +112,7 @@ class GroundedSAM2Segmenter:
             for i, mask in enumerate(masks)
         ]
 
-    def initialize(self, rgb, masks, *, frame_key=None):
+    def initialize(self, rgb, masks):
         rgb = self.rgb(rgb)
         if self._ids is not None:
             raise RuntimeError("Create a new SAM2 session for explicit reinitialization")
@@ -132,7 +129,6 @@ class GroundedSAM2Segmenter:
             "initialize",
             {"rgb": rgb, "masks": np.stack(list(masks.values()))},
             ids=ids,
-            frame_key=frame_key,
         )
         self._ids, self._shape = ids, rgb.shape[:2]
         return self.masks(reply, arrays)
@@ -148,11 +144,11 @@ class GroundedSAM2Segmenter:
             raise RuntimeError("SAM2 returned invalid masks or changed fixed identities")
         return dict(zip(self._ids, masks))
 
-    def track(self, rgb, *, frame_key=None):
+    def track(self, rgb):
         rgb = self.rgb(rgb)
         if self._ids is None or rgb.shape[:2] != self._shape:
             raise ValueError("Initialize first; frame shape must remain fixed")
-        reply, arrays = self.call("track", {"rgb": rgb}, frame_key=frame_key)
+        reply, arrays = self.call("track", {"rgb": rgb})
         return self.masks(reply, arrays)
 
     def signal_group(self, sig):

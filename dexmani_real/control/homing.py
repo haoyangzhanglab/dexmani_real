@@ -36,15 +36,16 @@ class HomePathRejected(ValueError):
 
 
 class HomePlanner:
+    """使用已由 load_table_plane 准入的桌面平面规划 HOME 路径。"""
+
     def __init__(
         self,
         environment: EnvironmentConfig,
         arm: ArmConfig,
         *,
-        table_plane_abcd: tuple[float, float, float, float] | None,
+        table_plane_abcd: tuple[float, float, float, float],
     ) -> None:
         self.arm = arm
-        self.environment = environment
         self.limits = np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper))
         margin = environment.eef_workspace_margin_m
         self.workspace_bounds = environment.workspace.as_array() + (-margin, margin)
@@ -53,11 +54,6 @@ class HomePlanner:
             table=environment.table,
             table_plane_abcd=table_plane_abcd,
         )
-        if self.collision_model.table is None:
-            if not np.isfinite(environment.table_z_surface_m):
-                raise ValueError("table_z_surface_m must be finite")
-            if not np.isfinite(environment.hand_safety_margin_m) or environment.hand_safety_margin_m < 0:
-                raise ValueError("hand_safety_margin_m must be finite and non-negative")
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
         self.collision_model.set_hand_qpos(hand_qpos)
@@ -110,24 +106,11 @@ class HomePlanner:
             position > self.workspace_bounds[:, 1]
         ):
             raise HomePathRejected(f"path leaves workspace: {position}")
-        clearance, measurement, source = self._table_clearance()
+        distance = float(self.collision_model.minimum_table_distance())
+        clearance = distance - float(self.collision_model.table.soft_clearance_m)
         if not np.isfinite(clearance):
             raise RuntimeError("table_check_nonfinite")
-        return clearance, measurement, source
-
-    def _table_clearance(self) -> tuple[float, float, str]:
-        """返回净间隙、原始测量和测量来源。"""
-        collision_model = self.collision_model
-        if collision_model.table is not None:
-            distance_m = float(collision_model.minimum_table_distance())
-            clearance_m = distance_m - float(collision_model.table.soft_clearance_m)
-            return clearance_m, distance_m, "calibrated_mesh_distance"
-        hand_min_z_m = float(collision_model.minimum_hand_frame_z())
-        environment = self.environment
-        clearance_m = (
-            hand_min_z_m - environment.hand_safety_margin_m - environment.table_z_surface_m
-        )
-        return clearance_m, hand_min_z_m, "hand_frame_proxy"
+        return clearance, distance
 
     def _check_path(
         self,
@@ -142,7 +125,7 @@ class HomePlanner:
         check_state(tuple(path[len(path) // 2]))
         best_clearance = -np.inf
         for index, waypoint in enumerate(path):
-            clearance, measurement, source = check_state(tuple(waypoint))
+            clearance, distance = check_state(tuple(waypoint))
             # 退出软间隙前的回退容差相对历史最佳间隙，退出后不能重新进入。
             if clearance < 0.0 and (
                 not allow_table_soft_escape
@@ -152,7 +135,7 @@ class HomePlanner:
             ):
                 raise HomePathRejected(
                     f"table_clearance at waypoint {index}: clearance={clearance:g} m, "
-                    f"{source}={measurement:g} m"
+                    f"distance={distance:g} m"
                 )
             best_clearance = max(best_clearance, clearance)
 

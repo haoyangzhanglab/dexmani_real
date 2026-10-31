@@ -8,7 +8,6 @@ from math import isfinite, radians
 import numpy as np
 
 from dexmani_real.config.calibration_data import TABLE_PLANE_RELATIVE_PATH
-from dexmani_real.geometry.pose import validate_unit_quaternion_wxyz
 
 
 @dataclass(frozen=True)
@@ -42,18 +41,12 @@ class WorkspaceBounds:
 
 @dataclass(frozen=True)
 class StaticCollisionBox:
-    """基座系静态盒体；尺寸为完整边长，四元数使用 WXYZ。"""
+    """基座系轴对齐静态盒体；尺寸为沿 X/Y/Z 轴的完整边长，单位米。"""
 
-    name: str = "obstacle"
     center_xyz_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
     size_xyz_m: tuple[float, float, float] = (1.0, 1.0, 1.0)
-    quat_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
 
     def validate(self) -> None:
-        if not isinstance(self.name, str) or not self.name.strip() or self.name == "table":
-            raise ValueError(
-                "static collision box name must be non-empty and must not use reserved name 'table'"
-            )
         vectors = np.asarray((self.center_xyz_m, self.size_xyz_m), dtype=np.float64)
         if vectors.shape != (2, 3):
             raise ValueError("static collision box center and size must both have shape (3,)")
@@ -61,14 +54,12 @@ class StaticCollisionBox:
             raise ValueError("static collision box values must be finite")
         if np.any(vectors[1] <= 0.0):
             raise ValueError("static collision box size_xyz_m must contain positive full side lengths")
-        validate_unit_quaternion_wxyz(self.quat_wxyz, name="static collision box quaternion")
 
 
 @dataclass(frozen=True)
 class TableCollisionConfig:
     """HOME 桌面碰撞盒与软间隙；标定平面由环境单独提供。"""
 
-    enabled: bool = True
     size_xy_m: tuple[float, float] = (2.0, 2.0)
     thickness_m: float = 0.04
     # 包含标定得到的法兰模型残差。
@@ -99,18 +90,11 @@ class EnvironmentConfig:
     # HOME 和点云直接使用同一份标定事实。
     table_plane_path: str | None = TABLE_PLANE_RELATIVE_PATH
     table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
-    # HOME 未启用标定桌面模型时使用的手部 frame 高度代理。
-    table_z_surface_m: float = 0.022
-    hand_safety_margin_m: float = 0.05
 
     def validate(self) -> None:
         self.workspace.as_array()
         if not isfinite(self.eef_workspace_margin_m) or self.eef_workspace_margin_m < 0:
             raise ValueError("eef_workspace_margin_m must be finite and non-negative")
-        if self.table.enabled:
-            self.table.validate()
+        self.table.validate()
         for box in self.static_boxes:
             box.validate()
-        names = [box.name for box in self.static_boxes]
-        if len(names) != len(set(names)):
-            raise ValueError("static collision box names must be unique")

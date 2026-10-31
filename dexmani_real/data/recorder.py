@@ -19,7 +19,6 @@ from dexmani_real.utils.io import publish
 logger = logging.getLogger(__name__)
 RECORDER_START_TIMEOUT_S = 10.0
 RECORDER_STOP_TIMEOUT_S = 60.0
-COLLECTION_SOURCES = frozenset({"teleop", "policy_rollout"})
 
 
 class RecordingError(RuntimeError):
@@ -110,8 +109,6 @@ class EpisodeRecorder:
         try:
             if not isinstance(task_label, str) or not task_label.strip():
                 raise ValueError("task_label must be a non-empty string")
-            if collection_source not in COLLECTION_SOURCES:
-                raise ValueError(f"collection_source must be one of {sorted(COLLECTION_SOURCES)}")
             metadata = dict(metadata, task_label=task_label, collection_source=collection_source)
             if episode_name is not None and (
                 type(episode_name) is not str

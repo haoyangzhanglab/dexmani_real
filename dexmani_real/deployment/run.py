@@ -84,11 +84,7 @@ def run_policy(
     )
     runtime = resolve_deployment_config(info, runtime)
     observations = ObservationBuilder(info, runtime)
-    table_plane_abcd = (
-        load_table_plane(runtime.environment.table_plane_path)
-        if runtime.environment.table.enabled or (observations.needs.point_cloud and runtime.pointcloud.remove_table)
-        else None
-    )
+    table_plane_abcd = load_table_plane(runtime.environment.table_plane_path)
 
     if camera_calibration_path is not None:
         camera_calibration_path = Path(camera_calibration_path).expanduser().resolve()
@@ -100,10 +96,7 @@ def run_policy(
         "camera_calibration_path": str(camera_calibration_path or CAMERAS_PATH),
         "effective_camera": None,
         "table_plane_abcd": table_plane_abcd,
-        "table_plane_path": (
-            str(resolve_table_plane_path(runtime.environment.table_plane_path))
-            if table_plane_abcd is not None else None
-        ),
+        "table_plane_path": str(resolve_table_plane_path(runtime.environment.table_plane_path)),
         "seed": seed,
         "device": device,
         "num_episodes": num_episodes,

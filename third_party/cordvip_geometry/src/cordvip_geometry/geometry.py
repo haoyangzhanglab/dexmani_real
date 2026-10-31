@@ -56,10 +56,7 @@ def transform_points(points, pose):
 
 
 def save_points(path, points):
-    """Save a fixed sampling asset without overwriting an existing file."""
-    points = float32_points(validate_points(points))
-    if not len(points):
-        raise ValueError("A sampling asset must contain at least one point")
+    """Save an already generated sampling asset without overwriting an existing file."""
     with Path(path).open("xb") as stream:
         np.save(stream, points, allow_pickle=False)
 

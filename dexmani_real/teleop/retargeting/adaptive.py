@@ -26,9 +26,6 @@ FINGER_FRAME_NAMES = (
 class AdaptiveHandRetargeter:
     def __init__(self, config, hand_config, *, control_hz):
         config.validate()
-        hand_config.validate_home_pose()
-        if not np.isfinite(control_hz) or control_hz <= 0:
-            raise ValueError("retargeting control_hz must be finite and positive")
         self.config, self.nominal_dt_s = config, 1.0 / control_hz
         self.fk = HandFK()
         self.limits = np.column_stack((hand_config.qpos_min_rad, hand_config.qpos_max_rad))
@@ -78,8 +75,6 @@ class AdaptiveHandRetargeter:
 
     def reset(self, initial_qpos, *, timestamp_ns):
         qpos = np.asarray(initial_qpos, dtype=np.float64)
-        if qpos.shape != HAND_JOINT_SHAPE or not np.isfinite(qpos).all():
-            raise ValueError("hand initial_qpos must be a finite (12,) array")
         if timestamp_ns <= 0:
             raise ValueError("hand reset timestamp must be positive")
         self.previous_command = np.clip(qpos, self.limits[:, 0], self.limits[:, 1])

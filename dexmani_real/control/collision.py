@@ -3,7 +3,6 @@
 from itertools import combinations
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 from dexmani_real.robot.model import (
     XARM7_JOINT_NAMES,
@@ -47,12 +46,11 @@ class CollisionModel:
         pin.removeCollisionPairs(self.model, self.geometry, str(XARM7_XHAND_SRDF_PATH))
         self.environment_names = {}
         self.table_pair_indices = []
-        self.table = table if table is not None and table.enabled else None
+        self.table = table
 
-        for box in static_boxes:
-            rotation = Rotation.from_quat(np.asarray(box.quat_wxyz)[[1, 2, 3, 0]]).as_matrix()
-            placement = pin.SE3(rotation, np.asarray(box.center_xyz_m))
-            self.add_obstacle(box.name, Box(*box.size_xyz_m), placement, robot_count)
+        for index, box in enumerate(static_boxes):
+            placement = pin.SE3(np.eye(3), np.asarray(box.center_xyz_m))
+            self.add_obstacle(f"obstacle_{index}", Box(*box.size_xyz_m), placement, robot_count)
 
         if self.table is not None:
             unknown_links = set(table.allowed_contact_links) - {
@@ -80,11 +78,6 @@ class CollisionModel:
         self.geometry_data = self.geometry.createData()
         for index in self.table_pair_indices:
             self.geometry_data.collisionRequests[index].enable_distance_lower_bound = True
-        self.hand_frame_ids = [
-            index
-            for index, frame in enumerate(self.model.frames)
-            if frame.name.startswith("right_hand_")
-        ]
         self.eef_frame_id = self.model.getFrameId("custom_eef_link")
         self.hand_qpos = None
 
@@ -136,13 +129,6 @@ class CollisionModel:
     # 以下查询共用最近一次 rejection 更新的运动学。
     def eef_position(self):
         return self.pin.updateFramePlacement(self.model, self.data, self.eef_frame_id).translation
-
-    def minimum_hand_frame_z(self):
-        self.pin.updateFramePlacements(self.model, self.data)
-        heights = [self.data.oMf[index].translation[2] for index in self.hand_frame_ids]
-        if not heights or not np.isfinite(heights).all():
-            raise RuntimeError("XHand frame placements unavailable")
-        return float(min(heights))
 
     def minimum_table_distance(self):
         # 最近一次 rejection 无碰撞时，所有桌面对的下界均已更新。

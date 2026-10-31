@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 def run_teleop(
     runtime,
     *,
+    record: bool,
+    episodes_dir: str,
+    max_duration_s: float,
+    runtime_config_json: str | None,
     task_name=DEFAULT_TASK_NAME,
     vr_transform_path=VR_TRANSFORM_PATH,
     camera_calibration_path=None,
@@ -62,16 +66,19 @@ def run_teleop(
     validate_control_rate(runtime, runtime.teleop.control_hz)
     runtime.teleop.validate()
     runtime.vr.validate()
-    if runtime.collection.enabled:
-        runtime.collection.validate()
+    if record:
+        if not isinstance(episodes_dir, str) or not episodes_dir.strip():
+            raise ValueError("episodes_dir must be non-empty")
+        if not np.isfinite(max_duration_s) or max_duration_s <= 0:
+            raise ValueError("max_duration_s must be finite and positive")
         runtime.camera.validate()
-    table_plane_abcd = (
-        load_table_plane(runtime.environment.table_plane_path)
-        if runtime.environment.table.enabled else None
+    recording_dir = (
+        Path(__file__).resolve().parents[2] / episodes_dir / task_name if record else None
     )
-    if not runtime.hand.enabled and runtime.collection.enabled:
+    table_plane_abcd = load_table_plane(runtime.environment.table_plane_path)
+    if not runtime.hand.enabled and record:
         raise ValueError("hand-disabled operation cannot record episodes")
-    calibration = load_vr_transform(vr_transform_path)
+    vr_to_robot_rotation = load_vr_transform(vr_transform_path)
     controller = VRController(
         ActionMapper.for_mode(
             "eef",
@@ -82,7 +89,7 @@ def run_teleop(
         ),
         build_hand_retargeter(runtime),
         runtime.teleop,
-        calibration.transform,
+        vr_to_robot_rotation,
     )
     home_planner = HomePlanner(
         runtime.environment,
@@ -93,7 +100,7 @@ def run_teleop(
     runtime_state = SessionState()
     channels = SensorChannels(
         ctx,
-        camera=runtime.camera if runtime.collection.enabled else None,
+        camera=runtime.camera if record else None,
         vr=True,
     )
     sensors = robot = None
@@ -127,11 +134,9 @@ def run_teleop(
             controller=controller,
             home_planner=home_planner,
             keyboard=keyboard,
-            recording_dir=(
-                Path(__file__).resolve().parents[2] / runtime.collection.episodes_dir / task_name
-                if runtime.collection.enabled
-                else None
-            ),
+            recording_dir=recording_dir,
+            max_duration_s=max_duration_s,
+            runtime_config_json=runtime_config_json,
         )
         keyboard.bindings["d"] = loop.request_discard
         keyboard.start()
@@ -139,13 +144,13 @@ def run_teleop(
         def check_services():
             if not keyboard.check_health() or not sensors.check(names=("vr",)):
                 raise RobotError("teleop control service unavailable")
-            if runtime.collection.enabled and not sensors.check(names=("camera",)):
+            if record and not sensors.check(names=("camera",)):
                 raise RecordingError("recording camera process exited")
             return True
 
         robot.check_services = check_services
         robot.connect()
-        if runtime.collection.enabled:
+        if record:
             sensors.start(
                 ctx.Process(
                     name="camera",

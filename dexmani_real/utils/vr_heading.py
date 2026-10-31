@@ -31,13 +31,6 @@ class HeadingCalibration:
     def grade(self):
         return "excellent" if self.std_deg < 2 else "good" if self.std_deg < 5 else "poor"
 
-    @property
-    def transform(self):
-        # R_z(-theta) 将 VR FLU 前向映射到机器人基座 +X。
-        theta = np.deg2rad(self.theta_deg)
-        cosine, sine = np.cos(theta), np.sin(theta)
-        return np.array([[cosine, sine, 0], [-sine, cosine, 0], [0, 0, 1]])
-
 
 def estimate_heading(forwards: np.ndarray, reference: str) -> HeadingCalibration:
     if reference not in ("head", "wrist"):
@@ -72,29 +65,16 @@ def estimate_heading(forwards: np.ndarray, reference: str) -> HeadingCalibration
     )
 
 
-def load_vr_transform(path: str | Path) -> HeadingCalibration:
+def load_vr_transform(path: str | Path) -> np.ndarray:
+    """从有效角度构造运行变换，历史标定报告不参与运行准入。"""
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    quality = payload["quality"]
-    calibration = HeadingCalibration(
-        float(payload["theta_deg"]),
-        payload["ref"],
-        float(quality["std_deg"]),
-        float(quality["max_deviation_deg"]),
-        quality["frames"],
-    )
-    if calibration.reference not in ("head", "wrist"):
-        raise ValueError("VR reference must be 'head' or 'wrist'")
-    if not -180 <= calibration.theta_deg <= 180:
+    theta_deg = float(payload["theta_deg"])
+    if not -180 <= theta_deg <= 180:
         raise ValueError("VR heading must be finite and within [-180, 180]")
-    if not 0 <= calibration.std_deg <= calibration.max_deviation_deg <= 180:
-        raise ValueError("invalid VR heading scatter")
-    if not isinstance(calibration.frames, int) or calibration.frames < MIN_HEADING_SAMPLES:
-        raise ValueError(f"need at least {MIN_HEADING_SAMPLES} VR heading samples")
-    if calibration.grade == "poor":
-        raise ValueError(
-            f"VR heading scatter is {calibration.std_deg:.2f}°; recalibration required"
-        )
-    return calibration
+    # R_z(-theta) 将 VR FLU 前向映射到机器人基座 +X。
+    theta = np.deg2rad(theta_deg)
+    cosine, sine = np.cos(theta), np.sin(theta)
+    return np.array([[cosine, sine, 0], [-sine, cosine, 0], [0, 0, 1]])
 
 
 def save_vr_transform(calibration: HeadingCalibration, path: str | Path = VR_TRANSFORM_PATH) -> Path:

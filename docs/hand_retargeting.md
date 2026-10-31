@@ -6,11 +6,15 @@
 
 | 模块 | 职责 |
 | --- | --- |
-| `teleop/retargeting/landmarks.py` | HTS 输入校验、掌系、固定骨长标定及 XHand 目标对应 |
+| `teleop/retargeting/landmarks.py` | 掌系、骨长检查、固定骨长标定及 XHand 目标对应 |
 | `teleop/retargeting/objective.py` | 位置、方向、对指、阻尼的函数值与解析梯度 |
 | `teleop/retargeting/adaptive.py` | 求解限位、滤波、诊断及提交状态 |
 
-在线入口为 `sensor/vr.py` → `teleop/vr.py::VRController` → `AdaptiveHandRetargeter`。候选求解不推进状态；只有动作提交成功并在授权锁内复核后，`commit` 才从实际 `RobotCommand` 更新 warm start、阻尼中心、滤波中心和时间戳。重复读取同一 VR 缓存帧（由 `ring_sequence` 识别）时复用手部候选，每个新段从新实测关节重置，会话内骨长标定保留。无效输入或求解失败明确终止当前段，不静默保持旧目标冒充成功。
+在线入口为 `sensor/vr.py` → `teleop/vr.py::VRController` → `AdaptiveHandRetargeter`。候选求解不推进状态；只有动作提交成功并在授权锁内复核后，`commit` 才从实际 `RobotCommand` 更新 warm start、阻尼中心、滤波中心和时间戳。重复读取同一 VR 缓存帧（由 `ring_sequence` 识别）时复用手部候选，每个新段从新实测关节重置，会话内骨长标定保留。重定向几何检查或求解失败会明确结束当前段。
+
+运行入口在构造前检查机器人配置和控制频率。关节反馈的形状及有限性由 XHand SDK 边界保证；HTS 21 点在接收并转换为 FLU 后完成同样检查。重定向保留 float64 转换、reset 时的操作限位裁剪和独立数组，以及骨长和掌退化检查。
+
+腕部原始四元数在 SDK 基变换前检查并归一化，零范数或非有限姿态被拒绝。接收边界的坏帧不发布，控制侧继续按原来源时间检查观测时效。
 
 失败或异常控制步会将诊断保存到 `termination_details` 的 `stage="control_timing"` 条目；`hand_retargeting` 字段来自本步重定向调用已生成的诊断。成功控制步不逐帧保存这些诊断；重复读取同一 VR 缓存帧时不附带上次求解的诊断。
 

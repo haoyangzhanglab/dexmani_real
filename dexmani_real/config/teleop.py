@@ -1,4 +1,4 @@
-"""遥操作、手部重定向及本地采集参数；不导入优化器或设备后端。"""
+"""遥操作与手部重定向参数；不导入优化器或设备后端。"""
 
 from __future__ import annotations
 
@@ -25,21 +25,6 @@ class TeleopConfig:
             for v in (self.vr_pos_scale, self.vr_stale_threshold_s)
         ):
             raise ValueError("VR position scale and stale threshold must be finite and positive")
-
-
-@dataclass(frozen=True)
-class CollectionConfig:
-    """录制路径与时长；入口仅在启用录制时校验。"""
-
-    enabled: bool = True
-    episodes_dir: str = "episodes"
-    max_duration_s: float = 60.0
-
-    def validate(self) -> None:
-        if not isinstance(self.episodes_dir, str) or not self.episodes_dir.strip():
-            raise ValueError("collection.episodes_dir must be non-empty")
-        if not np.isfinite(self.max_duration_s) or self.max_duration_s <= 0:
-            raise ValueError("collection.max_duration_s must be finite and positive")
 
 
 @dataclass(frozen=True)

@@ -47,13 +47,6 @@ def normalize_quat_wxyz(value, *, name="quaternion"):
     return quat / norm
 
 
-def validate_unit_quaternion_wxyz(value, *, name="quaternion"):
-    quat, norm = _quaternion(value, name)
-    if abs(norm - 1.0) > ROTATION_ATOL:
-        raise ValueError(f"{name} must be unit length within {ROTATION_ATOL}")
-    return quat.copy()
-
-
 @dataclass
 class Pose:
     """位置单位米，四元数顺序 WXYZ。"""

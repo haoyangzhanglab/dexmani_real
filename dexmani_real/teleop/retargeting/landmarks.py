@@ -21,10 +21,8 @@ class HandTargets:
 
 
 def prepare_landmarks(landmarks):
-    """米制、右手输入；输出右手掌系 (+X 掌侧、+Y 拇指侧、+Z 指向中指)。"""
+    """已准入的米制右手输入；输出掌系 (+X 掌侧、+Y 拇指侧、+Z 指向中指)。"""
     points = np.asarray(landmarks, dtype=np.float64)
-    if points.shape != (21, 3) or not np.isfinite(points).all():
-        raise ValueError("hand landmarks must be a finite (21, 3) array in metres")
     lengths = np.linalg.norm(points[BONE_CHILDREN] - points[BONE_PARENTS], axis=1)
     if np.any(lengths < 0.002) or np.any(lengths > 0.18):
         raise ValueError("hand bone lengths must be between 2 and 180 mm")

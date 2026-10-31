@@ -4,7 +4,6 @@ import json
 import logging
 import sys
 import time
-from dataclasses import asdict
 from enum import Enum
 from typing import cast
 
@@ -51,6 +50,8 @@ class TeleopLoop:
         controller,
         home_planner,
         recording_dir,
+        max_duration_s,
+        runtime_config_json,
         keyboard,
         camera_snapshot=None,
     ):
@@ -66,11 +67,8 @@ class TeleopLoop:
         self.controller = controller
         self.home_planner = home_planner
         self.recording_dir = recording_dir
-        # 会话配置固定；连接设备前生成录制快照，避免分段开始时才发现序列化错误。
-        self.runtime_config_json = (
-            json.dumps(asdict(runtime), ensure_ascii=False, allow_nan=False)
-            if recording_dir is not None else None
-        )
+        self.max_duration_s = max_duration_s
+        self.runtime_config_json = runtime_config_json
         self.task_label = task_label
         self.camera_snapshot = camera_snapshot
         self.keyboard = keyboard
@@ -542,7 +540,7 @@ class TeleopLoop:
             self.recorder is not None
             and self.recorder.is_recording
             and time.monotonic() - self.capture_started_s
-            >= self.runtime.collection.max_duration_s
+            >= self.max_duration_s
         ):
             self.request_episode_end(
                 "max_record_duration", run_end_reason=RunEndReason.DURATION_COMPLETE, failed=False,

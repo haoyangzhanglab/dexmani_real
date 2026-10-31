@@ -14,7 +14,6 @@ from dexmani_real.config.deployment import ExecutionConfig
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.config.sensor import CameraConfig, VRConfig
 from dexmani_real.config.teleop import (
-    CollectionConfig,
     HandRetargetingConfig,
     KeyboardTeleopConfig,
     TeleopConfig,
@@ -30,7 +29,6 @@ class RealConfig:
     hand: HandConfig = field(default_factory=HandConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
     teleop: TeleopConfig = field(default_factory=TeleopConfig)
-    collection: CollectionConfig = field(default_factory=CollectionConfig)
     keyboard_teleop: KeyboardTeleopConfig = field(default_factory=KeyboardTeleopConfig)
     vr: VRConfig = field(default_factory=VRConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)

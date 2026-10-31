@@ -135,8 +135,6 @@ def choose_masks(objects, frame, args, output, segmenter, maps):
             candidates = segmenter.predict(
                 frame.rgb, item["prompt"], box_threshold=args.box_threshold,
                 text_threshold=args.text_threshold,
-                frame_key=dict(source_id=frame.source_id, row_index=frame.row_index,
-                               timestamp_ns=frame.timestamp_ns, clock=frame.clock),
             ) if item.get("prompt") else []
             while True:
                 mask, index = select_mask(frame.rgb, candidates, name)

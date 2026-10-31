@@ -35,10 +35,7 @@ def run_replay(
         raise ValueError("hand_start_duration_s must be finite and >= 0")
     validate_robot_config(runtime)
     validate_control_rate(runtime, trajectory.fps)
-    table_plane_abcd = (
-        load_table_plane(runtime.environment.table_plane_path)
-        if runtime.environment.table.enabled else None
-    )
+    table_plane_abcd = load_table_plane(runtime.environment.table_plane_path)
     target = Path(output_dir)
     if target.exists() and (not target.is_dir() or any(target.iterdir())):
         raise ValueError("replay output must be missing or empty")

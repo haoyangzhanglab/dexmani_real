@@ -28,10 +28,9 @@ def _pose_to_flu(pose):
 def _rotation_to_flu(pose):
     from hand_tracking_sdk import unity_left_to_flu_rotation
 
-    return normalize_quat_wxyz(
-        xyzw_to_wxyz(unity_left_to_flu_rotation(pose.qx, pose.qy, pose.qz, pose.qw)),
-        name="quaternion",
-    )
+    # SDK 基变换会把零四元数变成单位姿态，必须先检查原始输入。
+    qw, qx, qy, qz = normalize_quat_wxyz((pose.qw, pose.qx, pose.qy, pose.qz))
+    return xyzw_to_wxyz(unity_left_to_flu_rotation(qx, qy, qz, qw))
 
 
 def _landmarks_to_flu(points):

@@ -50,16 +50,10 @@ class SceneTracker:
         first = initial_masks is not None
         if first and not set(self.assets).issubset(initial_masks):
             raise ValueError("Every pose asset requires a named initial instance mask")
-        frame_key = dict(
-            source_id=frame.source_id,
-            row_index=frame.row_index,
-            clock=frame.clock,
-            timestamp_ns=frame.timestamp_ns,
-        )
         masks = (
-            self.segmenter.initialize(rgb, initial_masks, frame_key=frame_key)
+            self.segmenter.initialize(rgb, initial_masks)
             if first
-            else self.segmenter.track(rgb, frame_key=frame_key)
+            else self.segmenter.track(rgb)
         )
         if first:
             self.directions = camera_rays(depth_m.shape, K, self.pixel_stride)

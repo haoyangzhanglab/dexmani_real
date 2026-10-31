@@ -25,7 +25,7 @@ def main():
                 request, arrays = receive(sys.stdin.buffer)
             except EOFError:
                 break
-            reply = dict(frame_key=request["frame_key"])
+            reply = {}
             try:
                 operation = request["operation"]
                 output = {}
