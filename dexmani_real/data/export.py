@@ -22,6 +22,7 @@ from dexmani_real.geometry.camera import (
     validate_aligned_depth_distortion,
 )
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
+from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.robot.model import (
@@ -216,8 +217,8 @@ def iter_canonical_blocks(
             block = {
                 "joint_state": np.concatenate((arm, hand), axis=1, dtype=np.float32),
                 "action": np.concatenate((arm_action, hand_action), axis=1, dtype=np.float32),
-                "action_ee": np.concatenate((action_poses, hand_action), axis=1, dtype=np.float32),
-                "eef_pose": poses.astype(np.float32),
+                "action_ee": np.concatenate((encode_eef_pose(action_poses), hand_action), axis=1, dtype=np.float32),
+                "eef_pose": encode_eef_pose(poses).astype(np.float32),
                 "finger_tactile_force": raw["hand_contact"],
                 "taxel_tactile_force": raw["hand_tactile_force"],
                 **hand_features,

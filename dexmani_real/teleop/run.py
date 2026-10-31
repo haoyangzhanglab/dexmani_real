@@ -257,15 +257,15 @@ def calibrate_hand(loop):
     retargeter = loop.controller.hand_retargeter
     if retargeter is None:
         return True
-    from dexmani_real.teleop.retargeting.landmarks import prepare_landmarks
+    from dexmani_real.teleop.retargeting.landmarks import hand_lengths, prepare_landmarks
 
     config = loop.runtime.hand_retargeting
     print("正在标定手部骨长：请保持右手清晰可见；无需保持伸直。S/Q/Esc 可取消。", flush=True)
     deadline = time.monotonic() + config.calibration_timeout_s
-    frames: list[np.ndarray] = []
+    measurements: list[np.ndarray] = []
     last_sequence, last_source_ns = None, 0
     last_error = "no fresh hand frames"
-    while len(frames) < config.calibration_samples:
+    while len(measurements) < config.calibration_samples:
         if not loop.keyboard.check_health():
             loop.runtime_state.request_emergency_stop()
         if loop.poll_blocking_commands():
@@ -276,7 +276,7 @@ def calibrate_hand(loop):
             raise RuntimeError("VR worker exited during hand calibration")
         if time.monotonic() >= deadline:
             raise RuntimeError(
-                f"hand calibration timed out ({len(frames)}/{config.calibration_samples}): {last_error}"
+                f"hand calibration timed out ({len(measurements)}/{config.calibration_samples}): {last_error}"
             )
         frame = read_vr_frame(loop.sensors.channels)
         if frame is not None:
@@ -288,14 +288,14 @@ def calibrate_hand(loop):
             ):
                 last_sequence, last_source_ns = frame["ring_sequence"], stamp
                 try:
-                    prepare_landmarks(frame["landmarks"])
+                    measurement = hand_lengths(prepare_landmarks(frame["landmarks"]))
                 except ValueError as exc:
                     last_error = str(exc)
                 else:
-                    frames.append(frame["landmarks"].copy())
+                    measurements.append(measurement)
         time.sleep(0.005)
-    retargeter.calibrate(frames)
-    logger.info("Hand morphology calibrated from %s distinct frames", len(frames))
+    retargeter.calibrate(measurements)
+    logger.info("Hand morphology calibrated from %s distinct frames", len(measurements))
     return True
 
 

@@ -16,9 +16,6 @@ class SceneObjectCloud:
     observed_colors: np.ndarray
     observed_pixel_indices: np.ndarray
     model_supported_mask: np.ndarray | None
-    model_supported_points_camera: np.ndarray | None
-    model_supported_colors: np.ndarray | None
-    model_supported_pixel_indices: np.ndarray | None
     observed_model_depth_residual_m: np.ndarray | None
     diagnostics: dict
 
@@ -99,9 +96,6 @@ def extract_scene_clouds(rgb, depth_m, K, masks, *, pixel_stride=2):
             observed_colors=colors,
             observed_pixel_indices=pixel_indices,
             model_supported_mask=None,
-            model_supported_points_camera=None,
-            model_supported_colors=None,
-            model_supported_pixel_indices=None,
             observed_model_depth_residual_m=None,
             diagnostics=diagnostics,
         )
@@ -142,7 +136,7 @@ def add_model_depth_support(measured, model_depths, *, depth_tolerance_m=0.015):
     for name, model in validated_models.items():
         cloud = measured.objects[name]
         pixels = cloud.observed_pixel_indices
-        points, colors = cloud.observed_points_camera, cloud.observed_colors
+        points = cloud.observed_points_camera
         count = len(points)
         model_depth = model[pixels[:, 0], pixels[:, 1]]
         comparable = model_depth > 0
@@ -150,9 +144,6 @@ def add_model_depth_support(measured, model_depths, *, depth_tolerance_m=0.015):
         residual[comparable] = points[comparable, 2] - model_depth[comparable]
         supported = comparable & (np.abs(residual) <= depth_tolerance_m)
         support_pixels = pixels[supported]
-        cloud.model_supported_points_camera = points[supported]
-        cloud.model_supported_colors = colors[supported]
-        cloud.model_supported_pixel_indices = support_pixels
         cloud.model_supported_mask = np.zeros(shape, dtype=bool)
         cloud.model_supported_mask[support_pixels[:, 0], support_pixels[:, 1]] = True
         cloud.observed_model_depth_residual_m = residual

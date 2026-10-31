@@ -4,7 +4,6 @@ import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
-from dexmani_real.geometry.pose import rot6d_to_rotmat
 from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE
 
 HAND_TEMPLATE_DIR = ASSET_DIR / "pointcloud_template" / "hand"
@@ -56,7 +55,7 @@ class HandPointCloud:
 
 
 def hand_geometry(
-    eef_pose_history: np.ndarray,
+    eef_transforms: np.ndarray,
     hand_qpos: np.ndarray,
     *,
     arm_fk: ArmFK,
@@ -65,12 +64,7 @@ def hand_geometry(
     include_fingertips: bool = True,
 ) -> dict[str, np.ndarray]:
     """使用组合 URDF 的安装变换生成指尖与手点云，每行共用一次手部 FK。"""
-    poses = np.asarray(eef_pose_history, dtype=np.float64)
-    rotations = rot6d_to_rotmat(poses[:, 3:])
-    base_from_hand = np.tile(np.eye(4), (len(poses), 1, 1))
-    mount = arm_fk.eef_from_handbase
-    base_from_hand[:, :3, :3] = rotations @ mount[:3, :3]
-    base_from_hand[:, :3, 3] = rotations @ mount[:3, 3] + poses[:, :3]
+    base_from_hand = eef_transforms @ arm_fk.eef_from_handbase
 
     frame_ids = list(hand_fk.fingertip_frame_ids) if include_fingertips else []
     tip_count = len(frame_ids)
@@ -78,10 +72,10 @@ def hand_geometry(
         frame_ids.extend(hand_cloud.frame_ids)
     arrays = {}
     if include_fingertips:
-        arrays["fingertip_xyz"] = np.empty((len(poses), *HAND_FINGERTIP_SHAPE), dtype=np.float32)
+        arrays["fingertip_xyz"] = np.empty((len(eef_transforms), *HAND_FINGERTIP_SHAPE), dtype=np.float32)
     if hand_cloud is not None:
         arrays["hand_pointcloud"] = np.empty(
-            (len(poses), *hand_cloud.local_points.shape), dtype=np.float32
+            (len(eef_transforms), *hand_cloud.local_points.shape), dtype=np.float32
         )
 
     for index, transform in enumerate(base_from_hand):

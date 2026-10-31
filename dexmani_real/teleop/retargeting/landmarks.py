@@ -54,8 +54,8 @@ class HandCalibration:
     sample_count: int
 
     @classmethod
-    def from_frames(cls, frames, config):
-        values = np.array([hand_lengths(prepare_landmarks(frame)) for frame in frames])
+    def from_measurements(cls, measurements, config):
+        values = np.asarray(measurements, dtype=np.float64)
         if len(values) < config.calibration_samples:
             raise ValueError(f"hand calibration requires {config.calibration_samples} frames")
         median = np.median(values, axis=0)
@@ -67,7 +67,10 @@ class HandCalibration:
             raise ValueError("hand bone lengths changed beyond the calibrated tolerance")
         return cls(median[:15].reshape(5, 3), float(median[15]), len(values))
 
-    def targets(self, points, robot_points, thumb_cmc, config):
+    def targets(
+        self, points, robot_points, config, *, robot_segments, robot_palm_width,
+        thumb_base_xy, thumb_base_radius,
+    ):
         """校验标定骨长并映射三点/指：thumb MCP/IP/TIP；其余 MCP/PIP/TIP。"""
         chains = points[FINGER_CHAINS]
         bones = np.diff(chains, axis=1)
@@ -80,12 +83,10 @@ class HandCalibration:
         base = unit_bones[0, 0, :2]
         norm = np.linalg.norm(base)
         observable = bool(norm > 1e-6)
-        robot_segments = np.linalg.norm(np.diff(robot_points, axis=1), axis=2)
         targets = robot_points.copy()
         # 拇指第一轴只改变 MCP 的 XY 方位；高度和轨迹半径由 URDF 固定。
         if observable:
-            robot_base = robot_points[0, 0] - thumb_cmc
-            targets[0, 0, :2] = thumb_cmc[:2] + base / norm * np.linalg.norm(robot_base[:2])
+            targets[0, 0, :2] = thumb_base_xy + base / norm * thumb_base_radius
         # 否则沿用中立占位坐标；Objective 显式关闭不可辨识的拇指位置项。
         targets[0, 1] = targets[0, 0] + bones[0, 1] * robot_segments[0, 0] / self.bone_lengths[0, 1]
         targets[0, 2] = targets[0, 1] + bones[0, 2] * robot_segments[0, 1] / self.bone_lengths[0, 2]
@@ -100,7 +101,7 @@ class HandCalibration:
         )
         directions = unit_bones[:, [0, 2]]
         directions[0, 0] = unit_bones[0, 1]  # 拇指近段为 MCP→IP。
-        palm_scale = np.linalg.norm(robot_points[1, 0] - robot_points[4, 0]) / self.palm_width
+        palm_scale = robot_palm_width / self.palm_width
         distances = np.linalg.norm(points[TIP_INDICES[1:]] - points[4], axis=1) * palm_scale
         x = np.clip(
             (config.pinch_start_m - distances) / (config.pinch_start_m - config.pinch_full_m),

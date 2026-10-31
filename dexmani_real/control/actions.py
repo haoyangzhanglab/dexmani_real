@@ -6,7 +6,7 @@ import numpy as np
 
 from dexmani_real.control.constraints import MotionConstraints, wrap_nearest_equivalent
 from dexmani_real.control.ik import IKSolver
-from dexmani_real.geometry.pose import Pose
+from dexmani_real.geometry.pose import Pose, encode_eef_pose
 
 
 @dataclass(frozen=True)
@@ -119,8 +119,8 @@ class ActionMapper:
     def control_from_command(self, command, mode):
         if mode == "joint":
             return np.concatenate((command.arm_qpos, command.hand_qpos))
-        position, rotation = self.constraints.target_fk.forward(command.arm_qpos)
-        return np.concatenate((position, rotation, command.hand_qpos))
+        pose = self.constraints.target_fk.forward(command.arm_qpos)
+        return np.concatenate((encode_eef_pose(pose), command.hand_qpos))
 
     def frozen_rejection(self, command, current, mode):
         # prepare_prefix/map_command 已准入不可变目标；静态场景无需重复几何检查。

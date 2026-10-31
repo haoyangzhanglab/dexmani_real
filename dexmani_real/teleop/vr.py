@@ -6,7 +6,6 @@ from dexmani_real.geometry.pose import (
     WXYZ_TO_XYZW,
     XYZW_TO_WXYZ,
     Pose,
-    rot6d_to_quat_wxyz,
 )
 
 
@@ -29,11 +28,12 @@ class VRController:
     def reset(self, row):
         self.clear()
         arm_qpos = row.arm["qpos"][0].copy()
-        position, rot6d = self.action_mapper.constraints.target_fk.forward(arm_qpos)
-        pose = Pose(position, rot6d_to_quat_wxyz(rot6d))
+        transform = self.action_mapper.constraints.target_fk.forward(arm_qpos)
+        eef_rotation = Rotation.from_matrix(transform[:3, :3])
+        pose = Pose(transform[:3, 3], eef_rotation.as_quat()[XYZW_TO_WXYZ])
         wrist_rotation = Rotation.from_quat(row.vr["wrist_quat_wxyz"][WXYZ_TO_XYZW])
         # R_target = A W (A W0)^-1 E0，初始腕姿态映射到实测 EEF 姿态。
-        rotation_right = (self.rotation * wrist_rotation).inv() * Rotation.from_quat(pose.q[WXYZ_TO_XYZW])
+        rotation_right = (self.rotation * wrist_rotation).inv() * eef_rotation
         if self.hand_retargeter is not None:
             self.hand_retargeter.reset(
                 initial_qpos=row.hand["qpos"][0], timestamp_ns=row.observation_timestamp_ns,

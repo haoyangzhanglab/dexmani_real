@@ -68,10 +68,6 @@ class Pose:
         if not np.isfinite(self.p).all():
             raise ValueError("Pose position must be finite")
 
-    @classmethod
-    def identity(cls) -> "Pose":
-        return cls(p=np.zeros(3, dtype=np.float64), q=np.array([1.0, 0.0, 0.0, 0.0]))
-
     def copy(self) -> "Pose":
         return Pose(p=self.p.copy(), q=self.q.copy())
 
@@ -112,6 +108,13 @@ def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
     return xyzw_to_wxyz(quat_xyzw)
 
 
+def encode_eef_pose(transform: np.ndarray) -> np.ndarray:
+    """将内部 SE(3) 编码为外部 XYZ+列序 rot6d，支持 (...,4,4)。"""
+    return np.concatenate(
+        (transform[..., :3, 3], transform[..., :3, 0], transform[..., :3, 1]), axis=-1,
+    )
+
+
 def rot6d_to_rotmat(r6: np.ndarray) -> np.ndarray:
     """Gram-Schmidt 将 (...,6) 列序 rot6d 还原为 (...,3,3) 旋转矩阵。"""
     values = np.asarray(r6, dtype=np.float64)
@@ -136,11 +139,6 @@ def rot6d_to_rotmat(r6: np.ndarray) -> np.ndarray:
         raise ValueError("rot6d contains a near-collinear basis")
     unit_second = orthogonal_second / orthogonal_norm
     return np.stack((unit_first, unit_second, np.cross(unit_first, unit_second)), axis=-1)
-
-
-def quat_wxyz_to_rotmat(q_wxyz: ArrayLike) -> np.ndarray:
-    quat_xyzw = wxyz_to_xyzw(q_wxyz)
-    return Rotation.from_quat(quat_xyzw).as_matrix()
 
 
 def forward_from_quat_wxyz(q_wxyz: ArrayLike) -> np.ndarray:

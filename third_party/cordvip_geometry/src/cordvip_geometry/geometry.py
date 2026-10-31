@@ -24,15 +24,6 @@ def float32_points(points):
     return points
 
 
-def validate_normals(value, points):
-    normals = float32_points(validate_points(value))
-    if normals.shape != points.shape or not np.allclose(
-        np.linalg.norm(normals, axis=1), 1.0, rtol=0, atol=1e-4
-    ):
-        raise ValueError("Normals must be unit vectors corresponding to every model point")
-    return normals
-
-
 def project_points(points, K):
     points = np.asarray(points)
     valid = np.isfinite(points).all(axis=1) & (points[:, 2] > 1e-5)
@@ -235,15 +226,3 @@ def rectify_rgbd(rgb, depth_m, intrinsics, distortion, mask=None, *, maps=None):
             mask.astype(np.uint8), map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT
         ).astype(bool)
     return rgb, depth_m, intrinsics, mask
-
-
-def deproject_depth(depth_m, intrinsics, mask=None):
-    """Deproject an admitted rectified frame and its preview mask in row-major order."""
-    valid = depth_m > 0
-    if mask is not None:
-        valid &= mask
-    v, u = np.nonzero(valid)
-    z = depth_m[v, u]
-    x = (u - intrinsics[0, 2]) * z / intrinsics[0, 0]
-    y = (v - intrinsics[1, 2]) * z / intrinsics[1, 1]
-    return float32_points(np.column_stack((x, y, z)))

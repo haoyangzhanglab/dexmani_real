@@ -66,13 +66,13 @@ class ArmFK:
         pin.forwardKinematics(self.model, self.data, np.zeros(self.model.nq))
         eef = pin.updateFramePlacement(self.model, self.data, self.eef_frame_id)
         handbase = pin.updateFramePlacement(self.model, self.data, handbase_id)
-        self.eef_from_handbase = (eef.inverse() * handbase).homogeneous
+        self.eef_from_handbase = (eef.inverse() * handbase).homogeneous.copy()
 
-    def forward(self, qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def forward(self, qpos: np.ndarray) -> np.ndarray:
+        """返回独立的基座系 EEF SE(3)，后续 FK 不会覆写它。"""
         self.pin.forwardKinematics(self.model, self.data, np.asarray(qpos, dtype=np.float64))
         pose = self.pin.updateFramePlacement(self.model, self.data, self.eef_frame_id)
-        rotation = pose.rotation
-        return pose.translation.copy(), np.concatenate((rotation[:, 0], rotation[:, 1]))
+        return pose.homogeneous.copy()
 
 
 class HandFK:
@@ -121,10 +121,9 @@ class HandFK:
         return positions, jacobians
 
 
-def eef_poses(arm_qpos: np.ndarray, *, arm_fk: ArmFK | None = None) -> np.ndarray:
-    """返回 float64[T,9]，依次为基座系 XYZ 和旋转矩阵前两列。"""
-    fk = ArmFK() if arm_fk is None else arm_fk
-    poses = np.empty((len(arm_qpos), 9), dtype=np.float64)
+def eef_poses(arm_qpos: np.ndarray, *, arm_fk: ArmFK) -> np.ndarray:
+    """用调用方拥有的 FK 返回 float64[T,4,4] 基座系 EEF 变换。"""
+    poses = np.empty((len(arm_qpos), 4, 4), dtype=np.float64)
     for index, qpos in enumerate(arm_qpos):
-        poses[index, :3], poses[index, 3:] = fk.forward(qpos)
+        poses[index] = arm_fk.forward(qpos)
     return poses

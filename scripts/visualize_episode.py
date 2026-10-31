@@ -17,6 +17,7 @@ from dexmani_real.config.perception import PointCloudConfig
 from dexmani_real.config.real import load_config
 from dexmani_real.data.raw import RawReader
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
+from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.perception.hand_cloud import hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
@@ -194,11 +195,12 @@ class EpisodeVisualizer:
         state["hand_fingertip"] = np.full((self.frame_count, 5, 3), np.nan, dtype=np.float32)
         if np.any(arm_valid):
             arm_fk = ArmFK()
-            state["arm_ee"][arm_valid] = eef_poses(arm[arm_valid], arm_fk=arm_fk)
+            poses = eef_poses(arm[arm_valid], arm_fk=arm_fk)
+            state["arm_ee"][arm_valid] = encode_eef_pose(poses)
         if np.any(hand_valid):
             hand_fk = HandFK(self.fingertip_link_names)
             state["hand_fingertip"][hand_valid] = hand_geometry(
-                state["arm_ee"][hand_valid],
+                poses[hand_valid[arm_valid]],
                 hand[hand_valid],
                 arm_fk=arm_fk,
                 hand_fk=hand_fk,

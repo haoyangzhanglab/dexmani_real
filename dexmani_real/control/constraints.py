@@ -51,7 +51,7 @@ class MotionConstraints:
 
     def endpoint_rejection(self, target, *, position=None):
         if position is None:
-            position, _ = self.target_fk.forward(target)
+            position = self.target_fk.forward(target)[:3, 3]
         if np.any(position < self.workspace_with_margin[:, 0]) or np.any(
             position > self.workspace_with_margin[:, 1]
         ):

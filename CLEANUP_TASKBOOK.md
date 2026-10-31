@@ -391,7 +391,7 @@ finally:
 | T3 | 完成 | 可信 Python `CONFIG: RealConfig` 单入口，删除 YAML 递归/嵌套覆盖，迁移 10 个 CLI 与示例；无手参数仅明确确认。桌面标定路径移出 HOME 盒体，业务校验只随启用分支；完整快照严格 JSON。删除音频线程/播放代际/等待及 12 个无消费 WAV，文档更新五键与 HOME 行为。13 个配置测试、此前 60 项回归、10 个 CLI help、无设备 print 与旧参数拒绝检查通过；默认完整值（除路径移位）及 Canonical recipe 精确一致。PyYAML 为外部模型/运行快照保留。Policy 并行更新已改为 checkpoint 恢复配方，文案按当前事实修正；用户另明确批准同步删除旧 LAMP 动作历史分支，后续独立记录适配。未验证设备配置实际生效。 |
 | Policy 接口适配 | 完成 | 用户明确批准退出旧 LAMP 动作历史；按当前 Policy `32a64d0` 公共 API 删除本仓 hand_history/action_context 分支，不加别名或 fallback，不修改配套仓。10 项生命周期与 6 项三模式调度测试通过；真实 checkpoint 加载尚未验证。 |
 | T4 | 实现完成；模型回归未验证 | 单 RawReader 同行 RGB-D/实测关节/时钟→首帧确认→默认全行→必存逐行结果→独立 view；删除 live/capture/latest/心跳/STALE/unlink、外层 worker/播放器与阶段 CLI 转发。保留 mask-only/多物体、SAM RPC/历史、法向与深度 pose-valid 门控。共享只读 rays；生成只保存未定尺度 mesh，最终米制仅采样一次。89 项 unittest、相关 CLI help、diff 检查通过；24 组渲染和固定点/法向精确相等；真实 Raw 前三行新旧 RGB-D/手几何/关节/时钟/metadata 精确一致，reader 打开 2→1。sandbox 外 FP 两组真实权重已加载，非真实场景精度验证；SAM/DINO/Hunyuan 默认权重和已确认真实场景资产缺失，完整模型结果/长序列/GUI 未验证。 |
-| T5 | 未开始 | — |
+| T5 | 完成 | 内部 ArmFK/EEF/手几何改原生 SE(3)，必需显式 FK，仅 Canonical/policy 边界编码9D/21D；删除无消费 pose/helper/几何镜像，保留独立真实命令入口校验和动态重检。手标定复用已接纳测量，固定几何在原对象内预计算；ftol 双用途/default/接受式不变。97 项 unittest 及 diff 检查通过；20 组 EEF/指尖/1024手云、5行13模态与 T0 全部精确相等；VR旋转差≤2.22e-16，回放朝向指标差≤1.44e-11度；28个标定输入接受集合一致，标定/targets/loss/gradient精确一致，非法rot6d仍拒绝、FK无别名覆写。未测真机/求解吞吐。 |
 | T6 | 未开始 | — |
 | T7 | 未开始 | — |
 | T8 | 未开始 | — |

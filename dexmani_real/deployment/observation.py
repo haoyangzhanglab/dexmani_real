@@ -11,6 +11,7 @@ from dexmani_real.geometry.kinematics import (
     HandFK,
     eef_poses,
 )
+from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.runtime.observation import ObservationNeeds
@@ -128,7 +129,7 @@ class ObservationBuilder:
                 arm = np.stack([r.values["arm_qpos"] for r in new_rows])
                 poses = eef_poses(arm, arm_fk=self.arm_fk)
                 if "eef_pose" in fields:
-                    features["eef_pose"] = poses.astype(np.float32)
+                    features["eef_pose"] = encode_eef_pose(poses).astype(np.float32)
                 if self.hand_fk is not None:
                     features.update(hand_geometry(
                         poses, np.stack([r.values["hand_qpos"] for r in new_rows]),

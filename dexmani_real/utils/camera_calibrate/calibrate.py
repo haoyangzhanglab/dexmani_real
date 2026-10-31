@@ -16,7 +16,6 @@ from dexmani_real.config.calibration_data import CAMERAS_PATH
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.control.ik import IKSolver
-from dexmani_real.geometry.pose import rot6d_to_rotmat
 from dexmani_real.ipc.sensors import (
     SensorChannels,
     read_camera_frame,
@@ -150,17 +149,14 @@ class CameraCalibrator:
         if self.cancel_requested():
             return
         arm_qpos, marker_pose = sample
-        position, orientation = self.constraints.target_fk.forward(arm_qpos)
-        eef_pose = np.eye(4)
-        eef_pose[:3, :3] = rot6d_to_rotmat(orientation)
-        eef_pose[:3, 3] = position
+        eef_pose = self.constraints.target_fk.forward(arm_qpos)
         if self.cancel_requested():
             return
         self.robot.check()
         self.samples.append((eef_pose, marker_pose))
         self.result = None
         self.status = "Sample captured; ENTER=solve when enough poses are collected"
-        print(f"OK (total {len(self.samples)})  EE={np.round(position, 3)}m")
+        print(f"OK (total {len(self.samples)})  EE={np.round(eef_pose[:3, 3], 3)}m")
 
     def show_preview(self):
         if self.cancel_requested():

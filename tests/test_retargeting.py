@@ -91,7 +91,8 @@ class RetargetingTests(unittest.TestCase):
                 retargeter.calibration.targets.return_value = SimpleNamespace(thumb_base_observable=True)
                 retargeter.previous_command = np.full(12, .5)
                 retargeter.command_timestamp_ns = 1_000_000_000
-                retargeter.robot_points = retargeter.thumb_cmc = retargeter.fk = None
+                retargeter.robot_points = retargeter.robot_segments = retargeter.fk = None
+                retargeter.robot_palm_width = retargeter.thumb_base_xy = retargeter.thumb_base_radius = None
                 retargeter.frame_ids = []
                 retargeter.limits = np.tile([0., 1.], (12, 1))
                 retargeter.optimizer = Mock()

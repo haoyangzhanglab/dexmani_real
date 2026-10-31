@@ -49,10 +49,14 @@ class AdaptiveHandRetargeter:
             raise ValueError("XHand retargeting frames are missing from the URDF")
         neutral = self.fk.forward(np.zeros(12), [*self.frame_ids, thumb_cmc_id])
         self.robot_points = neutral[:15, :3, 3].reshape(5, 3, 3)
-        self.thumb_cmc = neutral[15, :3, 3]
+        self.robot_segments = np.linalg.norm(np.diff(self.robot_points, axis=1), axis=2)
+        self.robot_palm_width = np.linalg.norm(self.robot_points[1, 0] - self.robot_points[4, 0])
+        self.thumb_base_xy = neutral[15, :2, 3]
+        self.thumb_base_radius = np.linalg.norm(self.robot_points[0, 0, :2] - self.thumb_base_xy)
         self.optimizer = nlopt.opt(nlopt.LD_SLSQP, 12)
         self.optimizer.set_maxeval(config.max_evaluations)
         self.optimizer.set_maxtime(config.max_solve_time_s)
+        # 同一 loss 单位的容差也用于下方 seed 改善接受，保持既有双重语义。
         self.optimizer.set_ftol_abs(config.ftol_abs)
         self.calibration = None
         self.previous_command = None
@@ -60,8 +64,8 @@ class AdaptiveHandRetargeter:
         self.rejection_reason = None
         self.last_diagnostics = {}
 
-    def calibrate(self, frames):
-        self.calibration = HandCalibration.from_frames(frames, self.config)
+    def calibrate(self, measurements):
+        self.calibration = HandCalibration.from_measurements(measurements, self.config)
 
     def calibration_metadata(self):
         if self.calibration is None:
@@ -94,7 +98,11 @@ class AdaptiveHandRetargeter:
         self.last_diagnostics = {}
         try:
             points = prepare_landmarks(landmarks)
-            targets = self.calibration.targets(points, self.robot_points, self.thumb_cmc, self.config)
+            targets = self.calibration.targets(
+                points, self.robot_points, self.config,
+                robot_segments=self.robot_segments, robot_palm_width=self.robot_palm_width,
+                thumb_base_xy=self.thumb_base_xy, thumb_base_radius=self.thumb_base_radius,
+            )
         except ValueError as exc:
             self.rejection_reason = str(exc)
             return None

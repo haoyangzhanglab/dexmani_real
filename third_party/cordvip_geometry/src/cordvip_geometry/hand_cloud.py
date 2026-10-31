@@ -98,7 +98,6 @@ class HandCloudModel:
                 meshes.append(trimesh.util.concatenate(parts))
         if not meshes or num_points < len(meshes):
             raise ValueError("num_points must cover every included visual link at least once")
-        self.link_names = tuple(names)
         self._frame_ids = [self._model.getFrameId(name) for name in names]
         areas = np.asarray([mesh.area for mesh in meshes])
         allocation = (int(num_points) - len(meshes)) * areas / areas.sum()
