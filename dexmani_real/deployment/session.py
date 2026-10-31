@@ -86,29 +86,33 @@ class PolicySession:
         )
         print("正在初始化模型和设备…", flush=True)
         self.save_results(overwrite=False)
-        failure = None
+        failure: BaseException | None = None
         try:
-            self.prepare_resources()
-            self.start_devices()
-            print("就绪：H 回初始位 → B 开始 | S 保存本轮 | D 丢弃本轮 | Q 保存退出 | Esc 急停 | T 复位触觉。", flush=True)
-            self.run_control_loop()
+            try:
+                self.prepare_resources()
+                self.start_devices()
+            except OperationCancelled:
+                if self.runtime_state is None or not (
+                    self.runtime_state.stop_request or self.runtime_state.quit_requested
+                    or self.runtime_state.estop_request
+                ):
+                    raise
+                self.runtime_state.request_quit()
+                self.summary["reason"] = "startup_cancelled"
+            else:
+                print("就绪：H 回初始位 → B 开始 | S 保存本轮 | D 丢弃本轮 | Q 保存退出 | Esc 急停 | T 复位触觉。", flush=True)
+                self.run_control_loop()
         except KeyboardInterrupt as exc:
             failure = exc
             if self.runtime_state is not None:
                 self.runtime_state.request_emergency_stop()
         except Exception as exc:
-            if isinstance(exc, OperationCancelled) and self.runtime_state is not None and (
-                self.runtime_state.stop_request or self.runtime_state.quit_requested or self.runtime_state.estop_request
-            ):
-                self.runtime_state.request_quit()
-                self.summary["reason"] = "startup_cancelled"
-            else:
-                failure, reason = exc, failure_reason(exc)
-                self.errors.append(error_detail("session", exc))
-                if self.runtime_state is not None:
-                    self.runtime_state.mark_error()
-                    self.runtime_state.end_session(reason=reason)
-                logger.exception("policy session failed")
+            failure = exc
+            self.errors.append(error_detail("session", exc))
+            if self.runtime_state is not None:
+                self.runtime_state.mark_error()
+                self.runtime_state.end_session(reason=failure_reason(exc))
+            logger.exception("policy session failed")
         finally:
             exit_code = self.close(failure=failure)
         return exit_code

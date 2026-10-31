@@ -155,7 +155,7 @@ def training_prefix(reader: RawReader) -> dict:
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
     """枚举所有 episode 目录，损坏文件由读取边界直接报错。"""
-    requested_path = Path(input_root)
+    requested_path = Path(input_root).expanduser()
     root = requested_path.resolve()
     if requested_path.name.startswith(".tmp_") or root.name.startswith(".tmp_"):
         raise ValueError(f"unpublished Raw episode is not readable: {root}")
@@ -251,14 +251,15 @@ def export_zarr(
     exclude: tuple[str, ...] = (),
     progress_callback=None,
 ) -> dict:
-    source = Path(input_root).expanduser().resolve()
+    requested_source = Path(input_root).expanduser()
+    source = requested_source.resolve()
     output = Path(output_path).expanduser()
     target = output.resolve()
     if target == source or source in target.parents or target in source.parents:
         raise ValueError("output and Raw input must not contain one another")
     if os.path.lexists(output):
         raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {output}")
-    selected, excluded = select_episodes(source, exclude)
+    selected, excluded = select_episodes(requested_source, exclude)
     arm_fk, hand_fk = ArmFK(), HandFK()
     hand_cloud = HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
     staging = None

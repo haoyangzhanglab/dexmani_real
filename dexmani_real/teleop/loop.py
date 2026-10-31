@@ -197,10 +197,10 @@ class TeleopLoop:
         if self.runtime_state.requests_allow_motion():
             logger.info("本段已停止；按 B 重新开始。")
 
-    def poll_blocking_commands(self, commands=()):
+    def poll_blocking_commands(self):
         self.robot.check()
         terminal = tuple(
-            cmd for cmd in (*commands, *self.keyboard.poll(timeout=0))
+            cmd for cmd in self.keyboard.poll(timeout=0)
             if cmd in ("esc", "q", "s", "d")
         )
         if terminal:
@@ -239,7 +239,7 @@ class TeleopLoop:
         if self.recorder is not None:
             raise RecordingError("previous capture still owns resources")
         with self.runtime_state.motion_lock:
-            # 开始/继续只能属于取出按键前的代际，不能越过稍后到达的 STOP。
+            # 开始只能属于取出按键前的代际，不能越过稍后到达的 STOP。
             if (
                 expected_run_id != self.runtime_state.run_id
                 or not self.runtime_state.requests_allow_motion()
@@ -335,7 +335,7 @@ class TeleopLoop:
         self.prepared_after_ns = time.monotonic_ns()
         self.preparation_interrupted()
 
-    def handle_operator_command(self, cmd, *, home_commands=(), expected_run_id=None):
+    def handle_operator_command(self, cmd, *, expected_run_id=None):
         event = dict(
             stage="operator", key=cmd, phase=self.phase.value,
             run_id=self.run_id, timestamp_ns=time.monotonic_ns(),
@@ -377,7 +377,7 @@ class TeleopLoop:
             if self.phase is not TeleopPhase.IDLE or self.recorder is not None:
                 logger.warning("HOME requires idle without an active capture")
                 return True
-            if not self.poll_blocking_commands(home_commands):
+            if not self.poll_blocking_commands():
                 logger.info("正在回初始位…")
                 result = home_robot(
                     self.runtime_state, self.robot, self.home_planner,
@@ -402,13 +402,12 @@ class TeleopLoop:
             if terminal in commands:
                 commands = [terminal]
                 break
-        for index, cmd in enumerate(commands):
+        for cmd in commands:
             previous_phase, previous_run = self.phase, self.run_id
             try:
                 handled = self.handle_operator_command(
                     cmd,
                     expected_run_id=expected_run_id,
-                    home_commands=commands[index + 1 :] if cmd == "h" else (),
                 )
             finally:
                 # 停止按键先处理撤权与设备停止，再输出日志。

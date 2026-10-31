@@ -352,7 +352,7 @@ class RawWriter:
 
 class RawReader:
     def __init__(self, episode_path: str | Path):
-        requested_path = Path(episode_path)
+        requested_path = Path(episode_path).expanduser()
         self.path = requested_path.resolve()
         if requested_path.name.startswith(".tmp_") or self.path.name.startswith(".tmp_"):
             raise ValueError(f"unpublished Raw episode is not readable: {self.path}")

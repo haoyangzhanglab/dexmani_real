@@ -99,6 +99,8 @@ python scripts/tools/view_realsense.py --config experiments/default.py --cloud p
 
 collect 的相机持续连接，Enter 为一组只读机械臂采样，完成立即断开臂；Q 结束。五帧原 RGB、检测、来源时间、实测位置/速度和样本 ID 保存为 NPZ，速度、帧新鲜度及前后漂移仍检查。solve 不连接设备，按原 ID 排除样本，保存逐样本残差和 used/excluded/worst IDs；质量合格后写入原 serial 映射格式外参，报告使用同名 `.result.json`。VR 头朝向直接消费头帧，不要求右手就绪。
 
+solve 的外参输出与派生报告不得覆盖 `capture.json` 或原始采样 NPZ；其他新结果仍可保存在采样目录内。
+
 相机查看统一使用 view_realsense.py：P 开关点云、S 切 raw/processed、F 冻结点云、D 切深度颜色、R 重置、C 打印配置、A 切曝光优先级、Q/Esc 退出。退出恢复原曝光设置。`--save-dir PATH` 保存 RGB-D、两类点云及来源事实；`--benchmark-frames N` 才运行性能测量。`--calibrate-table` 在终端明确确认后更新共享平面，阶段复用一个连接。窗口需要桌面/OpenGL，代码清理测试不自动连接真实设备。
 
 点云默认使用基座系 XYZRGB，工作空间 `x=[0.15,0.85]、y=[-0.50,0.50]、z=[0,0.80] m`，去桌面间隙 10 mm。深度邻域支持、体素、半径密度和连通分量过滤后 FPS；空点云在 viewer 清除、导出拒绝。几何规则可能丢失细结构，参数和配方必须随实验保持一致。

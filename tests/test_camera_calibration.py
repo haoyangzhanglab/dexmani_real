@@ -223,7 +223,7 @@ class CalibrationSolveTests(unittest.TestCase):
         ):
             for excluded in ((), (self.identities[3],)):
                 with self.subTest(excluded=excluded):
-                    output = self.root / ("all.json" if not excluded else "excluded.json")
+                    output = self.root / "all.json" if not excluded else self.source / "calibration.json"
                     result = solve_samples(self.source, output, exclude=excluded)
                     np.testing.assert_allclose(result.T_base_from_camera, self.transform, atol=1e-10, rtol=0)
                     report = json.loads(output.with_suffix(".result.json").read_text())
@@ -232,6 +232,27 @@ class CalibrationSolveTests(unittest.TestCase):
                     self.assertIn(report["worst_sample_id"], report["used_sample_ids"])
                     saved = json.loads(output.read_text())["test-camera"]
                     self.assertEqual(saved["calibration_capture"]["sample_count"], len(self.identities) - len(excluded))
+
+    def test_outputs_and_derived_report_cannot_overwrite_capture_inputs(self):
+        capture = self.source / "capture.json"
+        sample = self.source / "samples" / "000000.npz"
+        original = {path: path.read_bytes() for path in (capture, sample)}
+        output_alias = self.root / "output-alias.json"
+        output_alias.symlink_to(capture)
+        report_alias = self.source / "solution.result.json"
+        report_alias.symlink_to(capture)
+        for output in (capture, sample, output_alias, self.source / "solution.json"):
+            with self.subTest(output=output):
+                with self.assertRaisesRegex(ValueError, "must not overwrite capture inputs"):
+                    solve_samples(self.source, output)
+                for path, contents in original.items():
+                    self.assertEqual(path.read_bytes(), contents)
+        metadata_target = self.root / "linked-capture.json"
+        capture.rename(metadata_target)
+        capture.symlink_to(metadata_target)
+        with self.assertRaisesRegex(ValueError, "must not overwrite capture inputs"):
+            solve_samples(self.source, metadata_target)
+        self.assertEqual(metadata_target.read_bytes(), original[capture])
 
     def test_unknown_and_invalid_sample_ids_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "unknown excluded sample IDs"):

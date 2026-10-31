@@ -1,8 +1,11 @@
+import contextlib
+import io
 import threading
 import time
 import unittest
 from collections import deque
 from concurrent.futures import Future
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -13,7 +16,7 @@ from dexmani_real.deployment.inference import PolicyWorker
 from dexmani_real.deployment.rollout import EpisodeResult, Rollout
 from dexmani_real.deployment.schedule import ActionChunk
 from dexmani_real.deployment.session import PolicySession
-from dexmani_real.robot.commands import RobotCommand
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.runtime.state import RunEndReason, SessionState
@@ -278,6 +281,57 @@ class EpisodeLifecycleTests(unittest.TestCase):
         self.assertIs(episode.plan.frozen[3], command)
         self.assertEqual(episode.model.predict.call_args.kwargs["delay_steps"], 2)
         np.testing.assert_array_equal(episode.plan.actions, np.zeros((8, 19)))
+
+
+class SessionFailureTests(unittest.TestCase):
+    def session(self):
+        session = PolicySession.__new__(PolicySession)
+        session.runtime_state = SessionState()
+        session.info = SimpleNamespace(
+            checkpoint_path=Path("checkpoint.pt"), weights="raw", inference_steps=1,
+            control_dt_s=.01,
+        )
+        session.runtime = SimpleNamespace(execution=ExecutionConfig(action_steps=2))
+        session.summary = dict(reason=None)
+        session.errors = []
+        session.save_results = Mock()
+        session.prepare_resources = Mock()
+        session.start_devices = Mock()
+        session.run_control_loop = Mock()
+        session.close = Mock(return_value=1)
+        return session
+
+    def test_requested_startup_cancellation_is_normal_and_does_not_enter_loop(self):
+        session = self.session()
+        session.runtime_state.request_stop()
+        session.start_devices.side_effect = OperationCancelled("startup stopped by operator")
+        with patch("dexmani_real.deployment.session.configure_logging"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            session.run()
+        self.assertEqual(session.summary["reason"], "startup_cancelled")
+        self.assertTrue(session.runtime_state.quit_requested)
+        session.run_control_loop.assert_not_called()
+        session.close.assert_called_once_with(failure=None)
+        self.assertEqual(session.errors, [])
+
+    def test_runtime_cancellation_failure_is_not_relabelled_as_startup(self):
+        session = self.session()
+        error = OperationCancelled("actual episode failure after operator stop")
+
+        def fail():
+            session.runtime_state.request_stop()
+            raise error
+
+        session.run_control_loop.side_effect = fail
+        with patch("dexmani_real.deployment.session.configure_logging"), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                self.assertLogs("dexmani_real.deployment.session", level="ERROR"):
+            session.run()
+        session.close.assert_called_once_with(failure=error)
+        self.assertTrue(session.runtime_state.error_state)
+        self.assertFalse(session.runtime_state.running)
+        self.assertIsNone(session.summary["reason"])
+        self.assertEqual(session.errors[0]["message"], str(error))
 
 
 if __name__ == "__main__":

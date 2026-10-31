@@ -302,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.max_frames is not None and args.max_frames <= 0:
         parser.error("--max-frames must be a positive integer")
-    episode_path = Path(args.episode).expanduser().resolve()
+    episode_path = Path(args.episode).expanduser()
     if not episode_path.is_dir():
         logger.error("Episode not found: %s", episode_path)
         return 1

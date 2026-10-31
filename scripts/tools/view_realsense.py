@@ -245,7 +245,9 @@ class RealSenseViewer:
             raise NotADirectoryError(f"snapshot output root is not a directory: {self.args.save_dir}")
         self.pointcloud_config = runtime.pointcloud
         self.table_plane_path = runtime.environment.table_plane_path
-        self.base_from_color = self.processor = self.table_plane = None
+        self.base_from_color: np.ndarray | None = None
+        self.processor: PointCloudProcessor | None = None
+        self.table_plane: tuple[float, float, float, float] | None = None
         self.table_plane_source = "disabled"
         self.fitted_plane = None
 
@@ -273,10 +275,9 @@ class RealSenseViewer:
             else:
                 print("  auto_exposure_priority unavailable; leaving it unchanged")
             if self.args.calibrate_table:
-                self.ensure_cloud_transform()
                 self.fitted_plane = calibrate_table_plane(
                     camera=self.camera, intrinsics=self.camera.color_intrinsics,
-                    T_xarm_base_from_color=self.base_from_color, config=self.pointcloud_config,
+                    T_xarm_base_from_color=self.ensure_cloud_transform(), config=self.pointcloud_config,
                     plane_path=resolve_table_plane_path(self.table_plane_path),
                     frame_count=TABLE_CALIBRATION_FRAMES,
                 )
@@ -309,21 +310,22 @@ class RealSenseViewer:
             raise failure
         return 0
 
-    def ensure_cloud_transform(self):
+    def ensure_cloud_transform(self) -> np.ndarray:
         if self.base_from_color is None:
             self.base_from_color = load_camera_extrinsics(
                 self.camera.active_serial, self.args.camera_calibration,
             )
+        return self.base_from_color
 
     def ensure_processor(self):
         if self.processor is None:
-            self.ensure_cloud_transform()
+            base_from_color = self.ensure_cloud_transform()
             if self.pointcloud_config.remove_table:
                 self.table_plane = self.fitted_plane if self.args.calibrate_table else load_table_plane(self.table_plane_path)
                 self.table_plane_source = "calibrated_this_run" if self.args.calibrate_table else "resolved_runtime"
             self.processor = PointCloudProcessor(
                 depth_scale_m=self.camera.depth_scale_m, intrinsics=self.camera.color_intrinsics,
-                T_xarm_base_from_color=self.base_from_color, table_plane_abcd=self.table_plane,
+                T_xarm_base_from_color=base_from_color, table_plane_abcd=self.table_plane,
                 config=self.pointcloud_config,
             )
         return self.processor
@@ -399,15 +401,16 @@ class RealSenseViewer:
                 rgb, depth = frame.rgb, frame.depth
                 if snapshot_pending:
                     processed = self.ensure_processor().process(depth, rgb)
+                    base_from_color = self.ensure_cloud_transform()
                     raw = build_raw_point_cloud(
                         depth_raw=depth, color=rgb, depth_scale_m=depth_scale_m,
-                        intrinsics=intrinsics, T_xarm_base_from_color=self.base_from_color,
+                        intrinsics=intrinsics, T_xarm_base_from_color=base_from_color,
                     )
                     target = save_diagnostic_snapshot(
                         output_root=self.args.save_dir, frame=frame,
                         raw_point_cloud=raw, processed_point_cloud=processed,
                         depth_scale_m=depth_scale_m, intrinsics=intrinsics,
-                        T_xarm_base_from_color=self.base_from_color,
+                        T_xarm_base_from_color=base_from_color,
                         table_plane_abcd=self.table_plane, table_plane_source=self.table_plane_source,
                         pointcloud_config=self.pointcloud_config, camera_info=self.camera_info,
                     )

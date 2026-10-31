@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
@@ -71,6 +72,20 @@ class VisualizeEpisodeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "RGB shape or dtype invalid at frame 1"):
                     viz.log_camera(1, rgb)
                 log.assert_not_called()
+
+    def test_explicit_temporary_alias_is_rejected_by_cli_and_direct_viewer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            published = Path(directory) / "episode_published"
+            published.mkdir()
+            alias = Path(directory) / ".tmp_alias"
+            alias.symlink_to(published, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "unpublished"):
+                viewer.main([str(alias), "--info"])
+            rerun = Mock()
+            with patch.dict("sys.modules", {"rerun": rerun}):
+                with self.assertRaisesRegex(ValueError, "unpublished"):
+                    viewer.EpisodeVisualizer(str(alias), table_plane_path=None)
+            rerun.init.assert_not_called()
 
 
 if __name__ == "__main__":

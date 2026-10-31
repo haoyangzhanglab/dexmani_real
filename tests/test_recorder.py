@@ -11,7 +11,7 @@ from unittest.mock import patch
 import av
 import numpy as np
 
-from dexmani_real.data.export import discover_episode_dirs, training_prefix
+from dexmani_real.data.export import ExportConfig, discover_episode_dirs, export_zarr, training_prefix
 from dexmani_real.data.raw import RawReader, RawWriter, snapshot_recording_metadata
 from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
 from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
@@ -158,7 +158,10 @@ class RecorderOwnershipTests(unittest.TestCase):
                 with self.assertRaises(RecordingError):
                     self.recorder.finish(save=True, reason="late completion")
                 self.assertTrue(self.recorder.staging_path.exists())
-                self.assertFalse(self.recorder.episode_dir.exists())
+                destination = self.recorder.staging_path.with_name(
+                    self.recorder.staging_path.name.removeprefix(".tmp_")
+                )
+                self.assertFalse(destination.exists())
 
     def test_queue_full_keeps_first_failure_and_retains_staging(self):
         entered, release = threading.Event(), threading.Event()
@@ -271,7 +274,10 @@ class RecorderOwnershipTests(unittest.TestCase):
             release.set()
             self.recorder.thread.join(1)
         self.assertIs(self.recorder.error, first_error)
-        self.assertFalse(self.recorder.episode_dir.exists())
+        destination = self.recorder.staging_path.with_name(
+            self.recorder.staging_path.name.removeprefix(".tmp_")
+        )
+        self.assertFalse(destination.exists())
 
     def test_publication_failure_is_not_retried(self):
         with patch("dexmani_real.data.recorder.RawWriter", return_value=_Writer()), patch(
@@ -324,6 +330,23 @@ class RawRecordingTests(unittest.TestCase):
                 self.assertIsNone(json.loads(reader.data_file["meta/termination_details"][()])[0]["final_loss"])
                 self.assertEqual(training_prefix(reader)["row_stop"], 3 if status == "normal" else 2)
         self.assertEqual(len(discover_episode_dirs(self.root)), 2)
+
+    def test_export_api_and_cli_keep_the_explicit_temporary_request_name(self):
+        from scripts import export_zarr as export_cli
+
+        published = self.record("episode_published", "normal")
+        alias = self.root / ".tmp_alias"
+        alias.symlink_to(published, target_is_directory=True)
+        output = self.root / "output.zarr"
+        processing = ExportConfig()
+        with self.assertRaisesRegex(ValueError, "unpublished"):
+            export_zarr(alias, output, processing=processing)
+        with patch.object(export_cli, "load_processing_config", return_value=processing), patch.object(
+            export_cli, "tqdm",
+        ), patch("dexmani_real.utils.log.configure_logging"):
+            with self.assertRaisesRegex(ValueError, "unpublished"):
+                export_cli.main([str(alias), "--output", str(output)])
+        self.assertFalse(output.exists())
 
     def test_unpublished_explicit_path_and_symlink_are_rejected(self):
         path = self.root / ".tmp_episode_001"

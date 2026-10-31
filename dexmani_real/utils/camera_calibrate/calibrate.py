@@ -128,9 +128,14 @@ def solve_samples(sample_dir, output_path, *, exclude=()) -> HandEyeResult:
     capture = json.loads((source / "capture.json").read_text(encoding="utf-8"))
     camera = capture["camera"]
     intrinsics = CameraIntrinsics(**camera["color"])
+    sample_paths = sorted((source / "samples").glob("*.npz"))
+    inputs = {(source / "capture.json").resolve(), *(path.resolve() for path in sample_paths)}
+    report_path = output.with_suffix(".result.json")
+    if output in inputs or report_path.resolve() in inputs:
+        raise ValueError("calibration outputs must not overwrite capture inputs")
     excluded = set(exclude)
     samples, all_ids = {}, set()
-    for path in sorted((source / "samples").glob("*.npz")):
+    for path in sample_paths:
         with np.load(path, allow_pickle=False) as data:
             identity = data["sample_id"]
             if identity.shape != () or identity.dtype.kind not in "iu":
@@ -161,7 +166,7 @@ def solve_samples(sample_dir, output_path, *, exclude=()) -> HandEyeResult:
         calibrated_at_utc=datetime.now(timezone.utc).isoformat(),
     )
     write_json(dict(camera_serial=camera["serial"], T_base_from_camera=result.T_base_from_camera.tolist(),
-                    **report), output.with_suffix(".result.json"))
+                    **report), report_path)
     if not result.quality_ok:
         raise ValueError(
             f"hand-eye quality failed: {result.position_rms_mm:.3f} mm / "

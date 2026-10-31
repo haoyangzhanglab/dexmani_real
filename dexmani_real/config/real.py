@@ -48,9 +48,10 @@ def load_config(path: str | Path | None = None) -> RealConfig:
         path = Path(path).expanduser()
         if path.suffix != ".py":
             raise ValueError("experiment config must be a Python .py file")
-        config = runpy.run_path(str(path)).get("CONFIG")
-        if not isinstance(config, RealConfig):
+        loaded = runpy.run_path(str(path)).get("CONFIG")
+        if not isinstance(loaded, RealConfig):
             raise TypeError(f"{path} must define CONFIG: RealConfig")
+        config = loaded
     # 全配置会随实验存档；业务域校验仍由实际使用的入口负责。
     json.dumps(asdict(config), allow_nan=False)
     return config

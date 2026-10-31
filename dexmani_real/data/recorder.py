@@ -12,6 +12,8 @@ from queue import Empty, Full, Queue
 import numpy as np
 
 from dexmani_real.data.raw import RawWriter
+from dexmani_real.robot.commands import RobotCommand
+from dexmani_real.runtime.observation import Observation
 from dexmani_real.utils.io import publish
 
 logger = logging.getLogger(__name__)
@@ -40,7 +42,7 @@ class EpisodeRecorder:
         self.data_dir = Path(data_dir)
         self.control_hz = float(control_hz)
         self.thread = None
-        self.queue = Queue(maxsize=16)
+        self.queue: Queue[tuple[Observation, RobotCommand | None] | _FinishRequest] = Queue(maxsize=16)
         self.ready = threading.Event()
         self.cancelled = threading.Event()
         self.error = None
@@ -48,7 +50,8 @@ class EpisodeRecorder:
         self.start_attempted = False
         self.finish_request = None
         self.closed_counts = None
-        self.staging_path = self.episode_dir = self.published_path = None
+        self.staging_path: Path | None = None
+        self.published_path: Path | None = None
         self.submitted_frames = 0
         self.writer = None
 
@@ -132,7 +135,7 @@ class EpisodeRecorder:
                     raise FileExistsError(f"explicit episode name already exists: {destination}")
                 suffix += 1
             staging.mkdir(exist_ok=False)
-            self.staging_path, self.episode_dir = staging, destination
+            self.staging_path = staging
             self.thread = threading.Thread(
                 target=self.write_episode,
                 args=(metadata,),
@@ -196,9 +199,10 @@ class EpisodeRecorder:
             if self.closed_counts != (self.submitted_frames, self.submitted_frames):
                 raise RecordingError("recording accepted/written/camera row count mismatch")
             if save:
-                publish(self.staging_path, self.episode_dir)
-                self.published_path, self.staging_path = self.episode_dir, None
-                logger.info("Raw 已保存：%s（%d 帧）。", self.episode_dir.name, self.written_frames)
+                destination = self.staging_path.with_name(self.staging_path.name.removeprefix(".tmp_"))
+                publish(self.staging_path, destination)
+                self.published_path, self.staging_path = destination, None
+                logger.info("Raw 已保存：%s（%d 帧）。", destination.name, self.written_frames)
             else:
                 shutil.rmtree(self.staging_path)
                 self.staging_path = None
