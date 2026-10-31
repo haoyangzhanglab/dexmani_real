@@ -19,14 +19,19 @@ def finite_vector(value, shape, name):
 
 
 def _pose_to_flu(pose):
-    from hand_tracking_sdk import unity_left_to_flu_position, unity_left_to_flu_rotation
+    from hand_tracking_sdk import unity_left_to_flu_position
 
     position = finite_vector(unity_left_to_flu_position(pose.x, pose.y, pose.z), (3,), "position")
-    rotation = normalize_quat_wxyz(
+    return position, _rotation_to_flu(pose)
+
+
+def _rotation_to_flu(pose):
+    from hand_tracking_sdk import unity_left_to_flu_rotation
+
+    return normalize_quat_wxyz(
         xyzw_to_wxyz(unity_left_to_flu_rotation(pose.qx, pose.qy, pose.qz, pose.qw)),
         name="quaternion",
     )
-    return position, rotation
 
 
 def _landmarks_to_flu(points):
@@ -38,27 +43,15 @@ def _landmarks_to_flu(points):
 
 
 def run_vr(shared, config: VRConfig) -> None:
-    """接收 HTS 事件，保留头部状态并发布右手观测。"""
+    """接收 HTS 右手事件并发布控制观测。"""
     configure_logging()
-    from hand_tracking_sdk import HandFrame, HandSide, HeadFrame
+    from hand_tracking_sdk import HandFrame, HandSide
 
-    head_pos = np.full(3, np.nan)
-    head_quat_wxyz = np.full(4, np.nan)
-    head_recv_ts_ns = 0
     try:
-        with closing(iter_vr_events(shared, config)) as events:
+        with closing(iter_vr_events(config, running=lambda: shared.is_running.value)) as events:
             for event in events:
                 if not shared.is_running.value:
                     break
-                if isinstance(event, HeadFrame):
-                    try:
-                        position, rotation = _pose_to_flu(event.head)
-                    except ValueError:
-                        logger.warning("Invalid VR head pose rejected", exc_info=True)
-                        continue
-                    head_pos, head_quat_wxyz = position, rotation
-                    head_recv_ts_ns = event.recv_ts_ns
-                    continue
                 if not isinstance(event, HandFrame) or event.side != HandSide.RIGHT:
                     continue
                 try:
@@ -72,9 +65,6 @@ def run_vr(shared, config: VRConfig) -> None:
                     wrist_pos=wrist_pos,
                     wrist_quat_wxyz=wrist_quat,
                     landmarks=landmarks,
-                    head_pos=head_pos,
-                    head_quat_wxyz=head_quat_wxyz,
-                    head_recv_ts_ns=head_recv_ts_ns,
                     recv_ts_ns=min(event.wrist_recv_ts_ns, event.landmarks_recv_ts_ns),
                     sequence_id=event.sequence_id,
                 )
@@ -86,7 +76,8 @@ def run_vr(shared, config: VRConfig) -> None:
     logger.info("VR receiver exited")
 
 
-def iter_vr_events(shared, config: VRConfig):
+def iter_vr_events(config: VRConfig, *, running, include_head_frames=False):
+    """每次有限读取后返回事件或 None，让调用方检查自己的期限与退出条件。"""
     from hand_tracking_sdk import (
         HandFrameAssembler,
         ParseError,
@@ -113,31 +104,35 @@ def iter_vr_events(shared, config: VRConfig):
         receiver = TCPClientLineReceiver(
             TCPClientConfig(config.host, config.port, connect_timeout_s=1.0, read_timeout_s=1.0)
         )
-    assembler = HandFrameAssembler(include_wall_time=False, include_head_frames=True)
-    if not shared.is_running.value:
+    assembler = HandFrameAssembler(
+        include_wall_time=False, include_head_frames=include_head_frames,
+    )
+    if not running():
         return
     with receiver:
         logger.info("VR receiver opened: %s port=%d", mode.value, config.port)
         # 使用有期限的单次读取，空闲连接也能响应退出。
-        while shared.is_running.value:
+        while running():
             try:
                 line = receiver.recv_line()
             except TransportTimeoutError:
+                yield None
                 continue
             except TransportDisconnectedError:
                 if mode == TransportMode.TCP_CLIENT:
                     receiver.close()
-                    if shared.is_running.value:
+                    if running():
                         time.sleep(0.25)
-                    if shared.is_running.value:
+                    if running():
                         receiver.open()
+                yield None
                 continue
-            if not shared.is_running.value:
+            if not running():
                 break
             try:
                 packet = parse_line(line)
             except ParseError:
+                yield None
                 continue
             event = assembler.push_packet(packet)
-            if event is not None:
-                yield event
+            yield event

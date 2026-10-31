@@ -10,17 +10,14 @@ from dexmani_real.utils.camera_calibrate.extrinsics import (
     load_optional_camera_extrinsics,
 )
 
-# 右手发布携带最近头部姿态；recv_ts_ns 取腕部与关键点中较早的接收时刻。
+# recv_ts_ns 取腕部与关键点中较早的接收时刻。
 VR_DTYPE = np.dtype(
     [
         ("wrist_pos", "<f8", (3,)),
         ("wrist_quat_wxyz", "<f8", (4,)),
         ("landmarks", "<f8", (21, 3)),
-        ("head_pos", "<f8", (3,)),
-        ("head_quat_wxyz", "<f8", (4,)),
         ("recv_ts_ns", "<u8"),
         ("sequence_id", "<u8"),
-        ("head_recv_ts_ns", "<u8"),
     ],
     align=True,
 )

@@ -1,7 +1,6 @@
 """Isolated Hunyuan3D-2.1 shape inference; metric scale and object axes need explicit calibration."""
 
 import gc
-import importlib.metadata
 import os
 from pathlib import Path
 import sys
@@ -90,7 +89,6 @@ def generate_mesh(
         if target.index is not None and target.index >= torch.cuda.device_count():
             raise ValueError(f"CUDA device does not exist: {target}")
         torch.cuda.init()
-        torch.cuda.reset_peak_memory_stats(target)
         pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
             str(checkpoint_path),
             str(config_path),
@@ -128,8 +126,6 @@ def generate_mesh(
         with output.open("xb") as stream:
             stream.write(payload)
         elapsed = time.monotonic() - started
-        peak_allocated_bytes = int(torch.cuda.max_memory_allocated(target))
-        peak_reserved_bytes = int(torch.cuda.max_memory_reserved(target))
     finally:
         pipeline = None
         component = None
@@ -170,16 +166,4 @@ def generate_mesh(
         "faces": int(len(mesh.faces)),
         "bounds_unscaled": mesh.bounds.tolist(),
         "generation_seconds": elapsed,
-        "peak_allocated_bytes": peak_allocated_bytes,
-        "peak_reserved_bytes": peak_reserved_bytes,
-        "memory_scope": "PyTorch CUDA allocator; excludes external CUDA allocations",
-        "versions": {
-            name: importlib.metadata.version(name)
-            for name in (
-                "torch",
-                "transformers",
-                "diffusers",
-                "trimesh",
-            )
-        },
     }

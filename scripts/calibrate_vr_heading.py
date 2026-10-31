@@ -5,21 +5,13 @@ from __future__ import annotations
 
 import argparse
 import math
-import multiprocessing as mp
 import time
+from contextlib import closing
 from pathlib import Path
 
 from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
 from dexmani_real.config.sensor import VRConfig
-from dexmani_real.ipc.sensors import SensorChannels
-from dexmani_real.runtime.lifecycle import (
-    VR_READY_TIMEOUT_S,
-    SensorWorkers,
-    close_runtime,
-)
-from dexmani_real.runtime.state import SessionState
-from dexmani_real.sensor.vr import run_vr
-from dexmani_real.teleop.audio import AudioFeedback
+from dexmani_real.sensor.vr import iter_vr_events
 from dexmani_real.utils.vr_heading import (
     collect_headings,
     estimate_heading,
@@ -28,26 +20,23 @@ from dexmani_real.utils.vr_heading import (
 )
 
 PRINT_INTERVAL_S = 5.0
-JOIN_TIMEOUT_S = 5.0
 COUNTDOWN_DWELL_S = 1.0
-AUDIO_IDLE_TIMEOUT_S = 5.0
 DEFAULT_DURATION_S = 10.0
-TRACKING_DATA_TIMEOUT_S = 15.0
+TRACKING_DATA_TIMEOUT_S = 120.0
 SETTLE_S = 3.0
 
 
 def wait_for_vr_tracking(
-    channels: SensorChannels,
-    sensors: SensorWorkers,
+    events,
     reference: str,
     timeout_s: float,
 ) -> bool:
     deadline = time.monotonic() + timeout_s
     last_print = 0.0
-    while time.monotonic() < deadline:
-        if not sensors.check():
-            return False
-        if read_heading(channels, reference) is not None:
+    for event in events:
+        if time.monotonic() >= deadline:
+            break
+        if read_heading(event, reference) is not None:
             print("  VR tracking active\n", flush=True)
             return True
         now = time.monotonic()
@@ -55,18 +44,16 @@ def wait_for_vr_tracking(
             elapsed = int(now - (deadline - timeout_s))
             print(f"    waiting... ({elapsed}s elapsed)", flush=True)
             last_print = now
-        time.sleep(0.1)
     return False
 
 
-def play_completion_audio() -> None:
-    audio = AudioFeedback()
-    try:
-        audio.play("calibrated")
-        if not audio.wait_until_idle(timeout_s=AUDIO_IDLE_TIMEOUT_S):
-            print("  WARNING: audio feedback timed out")
-    finally:
-        audio.close()
+def drain_events(events, duration_s):
+    """摆位和倒计时期间仍读取网络，避免采样开始时消费积压旧帧。"""
+    deadline = time.monotonic() + duration_s
+    for _ in events:
+        if time.monotonic() >= deadline:
+            return
+    raise RuntimeError("VR receiver stopped before collection")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -111,41 +98,20 @@ def main(argv: list[str] | None = None) -> int:
     from dexmani_real.utils.log import configure_logging
 
     configure_logging()
-    ctx = mp.get_context("spawn")
-    runtime_state = SessionState()
-    channels = SensorChannels(ctx, vr=True)
-    sensors = SensorWorkers(channels)
-    vr_proc = ctx.Process(
-        name="vr", target=run_vr, args=(channels, vr_config), daemon=True
-    )
-    try:
+    with closing(iter_vr_events(
+        vr_config, running=lambda: True, include_head_frames=args.ref == "head",
+    )) as events:
         print(
-            f"\n  Waiting for VR connection (up to {VR_READY_TIMEOUT_S:g} s) "
+            f"\n  Waiting for VR tracking (up to {TRACKING_DATA_TIMEOUT_S:g} s) "
             "— put on Quest headset...",
             flush=True,
         )
-        try:
-            sensors.start(
-                vr_proc,
-                ready=channels.vr_ready,
-                timeout_s=VR_READY_TIMEOUT_S,
-                may_start=runtime_state.requests_allow_motion,
-            )
-        except RuntimeError as exc:
-            print(f"  ERROR: VR receiver startup failed: {exc}", flush=True)
-            return 1
-        print("  VR connected", flush=True)
-
-        print(
-            f"  Waiting for VR tracking data (up to {TRACKING_DATA_TIMEOUT_S:g} s)...",
-            flush=True,
-        )
-        if not wait_for_vr_tracking(channels, sensors, args.ref, TRACKING_DATA_TIMEOUT_S):
+        if not wait_for_vr_tracking(events, args.ref, TRACKING_DATA_TIMEOUT_S):
             print("  ERROR: no VR tracking data received", flush=True)
             return 1
 
         print(f"  Settling ({SETTLE_S:.0f} s) — fine-tune your pose...", flush=True)
-        time.sleep(SETTLE_S)
+        drain_events(events, SETTLE_S)
 
         if args.ref == "head":
             print("  Face the robot +X direction, hold your head still...")
@@ -153,20 +119,10 @@ def main(argv: list[str] | None = None) -> int:
             print("  Extend your right arm, point fingers toward robot +X, hold steady...")
         for i in [3, 2, 1]:
             print(f"  {i}...")
-            time.sleep(COUNTDOWN_DWELL_S)
+            drain_events(events, COUNTDOWN_DWELL_S)
 
         print(f"  Collecting {args.duration}s (hold still)...")
-        forwards, stale_count = collect_headings(channels, sensors, args.ref, args.duration)
-    finally:
-        shutdown_clean = close_runtime(
-            runtime_state,
-            sensors=sensors,
-            deadline=time.monotonic() + JOIN_TIMEOUT_S,
-        )
-
-    if not shutdown_clean:
-        print("ERROR: VR receiver cleanup failed; calibration was not published")
-        return 1
+        forwards, stale_count = collect_headings(events, args.ref, args.duration)
 
     try:
         calibration = estimate_heading(forwards, args.ref)
@@ -190,7 +146,6 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\nSaved to: {output_path}")
 
-    play_completion_audio()
     return 0
 
 

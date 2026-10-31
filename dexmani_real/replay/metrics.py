@@ -25,12 +25,24 @@ def joint_errors(original, replayed):
 
 
 def compute_metrics(trajectory: Trajectory, replay_data: dict) -> dict:
-    count = min(len(trajectory), len(replay_data["arm_qpos"]))
+    arm = np.asarray(replay_data["arm_qpos"])
+    hand = np.asarray(replay_data["hand_qpos"])
+    for name, values, joints in (("arm_qpos", arm, 7), ("hand_qpos", hand, 12)):
+        if (
+            values.ndim != 2
+            or values.shape[1] != joints
+            or values.dtype.kind not in "fiu"
+            or not np.isfinite(values).all()
+        ):
+            raise ValueError(f"replay {name} must be finite real [rows,{joints}]")
+    if len(arm) != len(hand):
+        raise ValueError("replay arm and hand measurements must have the same row count")
+    count = min(len(trajectory), len(arm))
     metrics = {
         "episode_path": trajectory.episode_path,
         "task_label": trajectory.task_label,
         "original_frames": len(trajectory),
-        "replayed_frames": len(replay_data["arm_qpos"]),
+        "replayed_frames": len(arm),
         "matching_frames": count,
         "arm_joint": None,
         "hand_joint": None,
@@ -40,8 +52,7 @@ def compute_metrics(trajectory: Trajectory, replay_data: dict) -> dict:
     if not count:
         return metrics
 
-    arm = replay_data["arm_qpos"][:count]
-    hand = replay_data["hand_qpos"][:count]
+    arm, hand = arm[:count], hand[:count]
     metrics["arm_joint"] = joint_errors(trajectory.arm_qpos[:count], arm)
     metrics["hand_joint"] = joint_errors(trajectory.hand_qpos[:count], hand)
 

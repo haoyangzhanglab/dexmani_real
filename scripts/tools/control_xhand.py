@@ -93,7 +93,7 @@ class XHandControlExample(XHand):
 
     def read_sdk_version(self) -> None:
         self.header("SDK versions")
-        print(f"  Software SDK: {self.device_identity['sdk_version']}")
+        print(f"  Software SDK: {self.control.get_sdk_version()}")
 
         error_struct, version = self.control.read_version(self.cfg.device_id, 0)
         print(f"  Hardware SDK: {version}  (error_code={error_struct.error_code})")
@@ -108,7 +108,11 @@ class XHandControlExample(XHand):
         print(f"  hand_id:       {info.hand_id}")
         print(f"  ev_hand:       {info.ev_hand}")
 
-        print(f"  hand_type:     {self.device_identity['hand_type']}")
+        error_struct, hand_type = self.control.get_hand_type(self.cfg.device_id)
+        if error_struct.error_code == 0:
+            print(f"  hand_type:     {hand_type}")
+        else:
+            print(f"  hand_type unavailable (error_code={error_struct.error_code})")
 
     def read_state(self, finger_id: int = 2) -> None:
         self.header(f"Read state (finger {finger_id})")

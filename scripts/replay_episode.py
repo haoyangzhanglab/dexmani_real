@@ -41,7 +41,7 @@ Controls:
         "--output",
         type=str,
         default=None,
-        help="Missing or empty directory for replay data and consistency metrics.",
+        help="Missing or empty directory for replay samples and control result.",
     )
     parser.add_argument(
         "--hand-start-duration",

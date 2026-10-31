@@ -1,6 +1,7 @@
 """VR 朝向估计、质量检查与基座对齐。"""
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,11 +11,12 @@ import numpy as np
 
 from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
 from dexmani_real.geometry.pose import forward_from_quat_wxyz
-from dexmani_real.ipc.sensors import read_vr_frame
+from dexmani_real.sensor.vr import _rotation_to_flu
 from dexmani_real.utils.io import write_json
 
 MIN_HEADING_SAMPLES = 30
 MIN_FORWARD_NORM = 1e-6
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -110,27 +112,34 @@ def save_vr_transform(calibration: HeadingCalibration, path: str | Path = VR_TRA
     }, path)
 
 
-def read_heading(channels, reference):
-    frame = read_vr_frame(channels)
-    if frame is None:
+def read_heading(event, reference):
+    from hand_tracking_sdk import HandFrame, HandSide, HeadFrame
+
+    if reference == "head" and isinstance(event, HeadFrame):
+        sequence, pose = int(event.recv_ts_ns), event.head
+        if sequence <= 0:
+            return None
+    elif reference == "wrist" and isinstance(event, HandFrame) and event.side == HandSide.RIGHT:
+        sequence, pose = int(event.sequence_id), event.wrist
+    else:
         return None
-    # 头部姿态会随手部帧重复发布，必须使用头部自身的接收时间去重。
-    if reference == "head":
-        stamp = int(frame["head_recv_ts_ns"])
-        return (stamp, frame["head_quat_wxyz"]) if stamp > 0 else None
-    return int(frame["sequence_id"]), frame["wrist_quat_wxyz"]
+    try:
+        return sequence, _rotation_to_flu(pose)
+    except ValueError as exc:
+        logger.warning("Invalid VR %s heading rejected: %s", reference, exc)
+        return None
 
 
-def collect_headings(channels, sensors, reference, duration_s):
+def collect_headings(events, reference, duration_s):
     deadline = time.monotonic() + duration_s
     forwards = []
     duplicates = 0
     previous = None
     last_print = 0.0
-    while time.monotonic() < deadline:
-        if not sensors.check():
-            raise RuntimeError("VR receiver exited during collection")
-        sample = read_heading(channels, reference)
+    for event in events:
+        if time.monotonic() >= deadline:
+            break
+        sample = read_heading(event, reference)
         if sample is not None:
             sequence, quaternion = sample
             if sequence == previous:
@@ -142,5 +151,6 @@ def collect_headings(channels, sensors, reference, duration_s):
         if now - last_print >= 1.0:
             print(f"    collected {len(forwards)} frames...")
             last_print = now
-        time.sleep(0.01)
+    else:
+        raise RuntimeError("VR receiver stopped during collection")
     return np.asarray(forwards, dtype=np.float64).reshape(-1, 3), duplicates

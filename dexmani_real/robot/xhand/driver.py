@@ -145,13 +145,6 @@ class XHand:
         self.send_crc_count = 0
         self.read_crc = False
         self.tactile_unavailable: set[str] = set()
-        self.device_identity = {
-            "backend": "hardware",
-            "hand_type": "unavailable",
-            "sdk_version": "unavailable",
-            "serial_number": "unavailable",
-        }
-
         self.control: Any = None
         self.command: Any = None
         self.tactile_reset_metadata: dict[str, object] = {}
@@ -185,7 +178,6 @@ class XHand:
                     -1,
                     f"configured device_id={self.cfg.device_id} not found in {hand_ids}",
                 )
-            self.read_identity()
             return self.initialize_command(cancel_requested=cancel_requested)
         except BaseException:
             try:
@@ -209,25 +201,6 @@ class XHand:
             error = self.control.open_ethercat(device_name)
         if error.error_code != 0:
             raise XHandError("connect", error.error_code, error.error_message)
-
-    def read_identity(self) -> None:
-        self.device_identity["sdk_version"] = str(self.control.get_sdk_version())
-        for key, getter in (
-            ("hand_type", self.control.get_hand_type),
-            ("serial_number", self.control.get_serial_number),
-        ):
-            error, value = getter(self.cfg.device_id)
-            if int(error.error_code) == 0:
-                self.device_identity[key] = str(value)
-            else:
-                logger.warning("XHand %s unavailable: code=%s", key, int(error.error_code))
-        logger.debug(
-            "XHand ready: SDK=%s type=%s serial=%s device_id=%d",
-            self.device_identity["sdk_version"],
-            self.device_identity["hand_type"],
-            self.device_identity["serial_number"],
-            self.cfg.device_id,
-        )
 
     def initialize_command(self, *, cancel_requested=lambda: False) -> int:
         deadline_ns = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)

@@ -113,6 +113,10 @@ class AdaptiveHandRetargeter:
         self.optimizer.set_min_objective(objective)
         seed = self.previous_command.copy()
         initial_loss = objective(seed, np.empty(0))
+        if not np.isfinite(initial_loss):
+            self.rejection_reason = "hand solver seed loss is non-finite"
+            self.last_diagnostics = dict(initial_loss=None, failure_reason=self.rejection_reason)
+            return None
         started = time.perf_counter()
         try:
             solution = np.asarray(self.optimizer.optimize(seed), dtype=np.float64)
@@ -140,9 +144,12 @@ class AdaptiveHandRetargeter:
             return None
         solution = np.clip(solution, lower, upper)
         final_loss = objective(solution, np.empty(0))
-        self.last_diagnostics["final_loss"] = final_loss
+        self.last_diagnostics["final_loss"] = final_loss if np.isfinite(final_loss) else None
         if not np.isfinite(final_loss) or final_loss > initial_loss + self.config.ftol_abs:
             self.rejection_reason = "hand solver did not improve the committed-command seed"
+            self.last_diagnostics["failure_reason"] = (
+                "non-finite final loss" if not np.isfinite(final_loss) else self.rejection_reason
+            )
             return None
         # 同一个已提交目标同时作为 warm start、阻尼中心和唯一滤波状态。
         command = self.previous_command + alpha * (solution - self.previous_command)

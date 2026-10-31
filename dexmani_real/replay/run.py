@@ -6,7 +6,6 @@ from pathlib import Path
 
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.replay.joint_replay import JointReplay, ReplayResult, ReplayStatus
-from dexmani_real.replay.metrics import compute_metrics
 from dexmani_real.replay.trajectory import save_replay_data, validate_trajectory
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.system import Robot
@@ -30,7 +29,7 @@ def run_replay(
     output_dir,
     hand_start_duration_s=0.5,
 ) -> ReplayResult:
-    """运行一次回放，完成机器人收尾并保存评估结果。"""
+    """运行一次回放，完成机器人收尾并保存控制结果和实测采样。"""
     configure_logging()
     if not math.isfinite(hand_start_duration_s) or hand_start_duration_s < 0:
         raise ValueError("hand_start_duration_s must be finite and >= 0")
@@ -113,17 +112,11 @@ def run_replay(
             outcome.reason = outcome.reason or "operator emergency stop"
 
         try:
-            # 先保存采样，离线 FK 或指标计算失败后仍可重新评估。
             save_replay_data(outcome.replay_data, target)
-            metrics = compute_metrics(trajectory, outcome.replay_data)
-            write_json(metrics, target / "metrics.json")
-            print(f"Replay: {metrics['matching_frames']}/{metrics['original_frames']} matching frames")
-            for name in ("arm_joint", "hand_joint", "eef_position", "eef_orientation"):
-                print(f"  {name}: {metrics[name]}")
         except Exception as exc:
-            logger.exception("replay evaluation failed")
+            logger.exception("replay data save failed")
             outcome.status = ReplayStatus.FAULT
-            outcome.reason = f"{outcome.reason}; evaluation: {exc}".lstrip("; ")
+            outcome.reason = f"{outcome.reason}; replay data: {exc}".lstrip("; ")
         finally:
             summary.update(
                 status=outcome.status.value,

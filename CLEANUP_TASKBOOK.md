@@ -386,7 +386,7 @@ finally:
 | 批次 | 状态 | 提交 / 实际验证 / 阻塞 |
 | --- | --- | --- |
 | T0 | 完成 | 基线 `580ac65`，初始 main 工作区/暂存区干净；工作分支 `cleanup/personal-research-t0-t8`。`real_robot/bin/python` 可用；固定 FK/手云、三模式轨迹、3 行 normal/failed H5+MP4 与 13 模态 Zarr 对照保存在 `/tmp/dexmani-cleanup-baseline`。238 行真实 Raw 准入及前三行 FK 已读；Policy 当前 `4618a2e`，只读保留其已有改动。sandbox 外 CUDA/光栅化/FP 深度核通过；Warp 启动有驱动 API 报错但实测核成功。SAM/DINO/Hunyuan 默认权重缺失；完整模型、真机未验证。 |
-| T1 | 未开始 | — |
+| T1 | 完成 | 删除 XHand 默认身份缓存/探针、VR 标定的右手 IPC/头缓存与音频依赖、默认回放指标及 mesh 版本/显存报告。非有限 loss 仍拒绝，诊断可严格 JSON 保存；tip=0 保留方向/pinch。新增离线 `evaluate_replay.py`。`PYTHONDONTWRITEBYTECODE=1 real_robot/bin/python -m unittest discover -s tests -v`：19 项通过，含 FK 梯度、纯头帧、超时/关闭、真实文件写入及失败注入；`git diff --check` 通过。未验证网络 VR、实际生成权重和真机。 |
 | T2 | 未开始 | — |
 | T3 | 未开始 | — |
 | T4 | 未开始 | — |
