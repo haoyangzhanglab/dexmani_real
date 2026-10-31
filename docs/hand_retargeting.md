@@ -10,7 +10,7 @@
 | `teleop/retargeting/objective.py` | 位置、方向、对指、阻尼的函数值与解析梯度 |
 | `teleop/retargeting/adaptive.py` | 求解限位、滤波、诊断及提交状态 |
 
-在线入口为 `sensor/vr.py` → `teleop/vr.py::VRController` → `AdaptiveHandRetargeter`。候选求解不推进状态；只有动作提交成功后，`commit` 才更新 warm start、阻尼中心、滤波中心和时间戳。重复读取同一 VR 缓存帧（由 `ring_sequence` 识别）时复用手部候选，暂停恢复从新实测关节重置，会话内骨长标定保留。无效输入或求解失败明确终止当前段，不静默保持旧目标冒充成功。
+在线入口为 `sensor/vr.py` → `teleop/vr.py::VRController` → `AdaptiveHandRetargeter`。候选求解不推进状态；只有动作提交成功并在授权锁内复核后，`commit` 才从实际 `RobotCommand` 更新 warm start、阻尼中心、滤波中心和时间戳。重复读取同一 VR 缓存帧（由 `ring_sequence` 识别）时复用手部候选，每个新段从新实测关节重置，会话内骨长标定保留。无效输入或求解失败明确终止当前段，不静默保持旧目标冒充成功。
 
 失败或异常控制步会将诊断保存到 `termination_details` 的 `stage="control_timing"` 条目；`hand_retargeting` 字段来自本步重定向调用已生成的诊断。成功控制步不逐帧保存这些诊断；重复读取同一 VR 缓存帧时不附带上次求解的诊断。
 

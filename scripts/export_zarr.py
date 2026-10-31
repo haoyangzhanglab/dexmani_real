@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help="Optional experiment YAML overrides for offline processing",
+        help="Trusted Python experiment file exporting CONFIG: RealConfig",
     )
     parser.add_argument(
         "--exclude",
@@ -56,11 +56,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="EPISODE",
         help="Exclude a whole episode by directory name; may be repeated.",
-    )
-    parser.add_argument(
-        "--pointcloud-num-points",
-        type=int,
-        default=None,
     )
     return parser
 
@@ -76,14 +71,11 @@ def default_output_path(input_root: Path) -> Path:
     return Path("datasets") / f"{task_name}.zarr"
 
 
-def load_processing_config(path: Path | None, *, num_points: int | None) -> ExportConfig:
+def load_processing_config(path: Path | None) -> ExportConfig:
     """Load processing values; read the current table plane only for table removal."""
-    runtime = load_config(
-        path=path,
-        overrides={"pointcloud": {"num_points": num_points}},
-    )
+    runtime = load_config(path)
     plane = (
-        load_table_plane(runtime.environment.table) if runtime.pointcloud.remove_table else None
+        load_table_plane(runtime.environment.table_plane_path) if runtime.pointcloud.remove_table else None
     )
     return ExportConfig(
         pointcloud=runtime.pointcloud,
@@ -99,7 +91,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_path = (
         args.output if args.output is not None else default_output_path(args.input_root)
     )
-    processing = load_processing_config(args.config, num_points=args.pointcloud_num_points)
+    processing = load_processing_config(args.config)
     from dexmani_real.utils.log import configure_logging
 
     configure_logging()

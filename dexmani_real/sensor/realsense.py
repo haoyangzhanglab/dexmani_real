@@ -86,6 +86,11 @@ class RealSenseCamera:
             self.color_sensor = device.first_color_sensor()
             info = self.device_info(device)
             if info["product_line"] == "L500" or "L515" in info["name"].upper():
+                preset, confidence = self.config.l515_visual_preset, self.config.l515_confidence_threshold
+                if type(preset) is not int or not 0 <= preset <= 5:
+                    raise ValueError("camera l515_visual_preset must be an integer in [0, 5]")
+                if confidence is not None and (type(confidence) is not int or not 0 <= confidence <= 3):
+                    raise ValueError("camera l515_confidence_threshold must be in [0, 3] or null")
                 depth_sensor.set_option(rs.option.visual_preset, self.config.l515_visual_preset)
                 time.sleep(0.5)
                 if self.config.l515_confidence_threshold is not None:

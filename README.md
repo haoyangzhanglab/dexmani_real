@@ -14,7 +14,22 @@ python -m pip install -e ".[interactive,control,geometry,visualization]"
 
 设备 SDK、Pinocchio、MPlib 和 NLopt 需按实验环境另行安装；策略部署还需安装 `dexmani_policy`。机器人模型与模板从源码目录的 `assets/` 加载，运行时须保留源码 checkout。
 
-默认配置集中在 [config/](dexmani_real/config/)，[config/real.py](dexmani_real/config/real.py) 提供 `RealConfig` 和 `load_config`，负责组合配置及合并覆盖；各子配置可独立导入。支持的入口可通过 `--config local.yaml` 覆盖，优先级为 **CLI > YAML > 默认值**；未知配置键会报错。运行前核对机械臂 IP、手部串口、工作空间和当前设备的标定参数。
+默认配置集中在 [config/](dexmani_real/config/)，[config/real.py](dexmani_real/config/real.py) 提供 `RealConfig` 和 `load_config`。复制 [experiments/default.py](experiments/default.py)，在可信本地 Python 文件中直接导出 `CONFIG: RealConfig`，通过 `--config experiments/my_experiment.py` 使用；省略路径采用 dataclass 默认值。本仓不再读取实验 YAML 或递归合并 CLI overrides，设备参数、执行模式、增益、频率和点数直接在实验文件修改。运行前核对机械臂 IP、手部串口、工作空间和当前设备的标定参数。
+
+例如在实验文件中明确修改两个参数：
+
+```python
+from dataclasses import replace
+from dexmani_real.config.real import RealConfig
+
+base = RealConfig()
+CONFIG = replace(base,
+    execution=replace(base.execution, mode="sync"),
+    teleop=replace(base.teleop, control_hz=16.0),
+)
+```
+
+任务名、输入输出路径、段数/时长、是否录制仍由 CLI 选择；推理的 `--weights`、`--inference-steps`、`--seed`、`--device` 保留。`--no-hand` 只确认实验文件已显式设置 `hand.enabled=False`，不修改设备配置；遥操作的无手调试还必须关闭录制。旧本仓 YAML 请一次改写为 Python 文件，用户文件不会被自动删除。Policy 的研究配方从 checkpoint 恢复，其训练配置及运行快照可继续保存 YAML；本仓的 Python 配置迁移不改配套 Policy 的外部协议。
 
 | 配置文件 | 内容 |
 | --- | --- |
@@ -28,13 +43,13 @@ python -m pip install -e ".[interactive,control,geometry,visualization]"
 
 策略与真机配置的匹配及部署前校验位于 [deployment/preflight.py](dexmani_real/deployment/preflight.py)。
 
-训练与真机部署应固定配套源码版本。部署使用公开 `PolicyInfo`；控制周期、depth 形状/单位及实际使用的点云、手点云和指尖配方沿 Canonical → 训练配置/checkpoint → 公开元信息传递，触觉来源来自已验证训练配置。Real 在设备启动前要求 joint/EEF 的控制动作分别为 19/21 维，并拒绝缺少的部署事实，不用当前 YAML 猜测训练配方。普通仿真训练和纯 policy inspect 不要求这些 Real 配方。
+训练与真机部署应固定配套源码版本。部署使用公开 `PolicyInfo`；控制周期、depth 形状/单位及实际使用的点云、手点云和指尖配方沿 Canonical → 训练配置/checkpoint → 公开元信息传递，触觉来源来自已验证训练配置。Real 在设备启动前要求 joint/EEF 的控制动作分别为 19/21 维，并拒绝缺少的部署事实，不用当前实验配置猜测训练配方。普通仿真训练和纯 policy inspect 不要求这些 Real 配方。
 
-以下命令仅打印配置，不连接设备：
+以下命令只打印请求配置的 JSON，不连接设备、不读取标定或解析 checkpoint，也不代表实测相机事实：
 
 ```bash
-python scripts/collect_teleop.py --print-config
-python scripts/run_policy.py --print-config
+python scripts/collect_teleop.py --config experiments/default.py --print-config
+python scripts/run_policy.py --config experiments/default.py --print-config
 ```
 
 ## 常用命令
@@ -43,37 +58,37 @@ python scripts/run_policy.py --print-config
 
 ```bash
 # 键盘点动
-python scripts/keyboard_teleop.py
+python scripts/keyboard_teleop.py --config experiments/default.py
 
 # VR/HTS 示教与录制
-python scripts/collect_teleop.py TASK
+python scripts/collect_teleop.py TASK --config experiments/default.py
 
 # 策略部署；执行模式支持 sync、async、rtc
-python scripts/run_policy.py EXPERIMENT --execution-mode sync
+python scripts/run_policy.py EXPERIMENT --checkpoint latest --config experiments/default.py --num-episodes 5
 
 # Raw 数据导出为 Canonical Zarr
-python scripts/export_zarr.py episodes/TASK
+python scripts/export_zarr.py episodes/TASK --config experiments/default.py --output datasets/TASK.zarr
 
 # 离线查看 episode
-python scripts/visualize_episode.py episodes/TASK/EPISODE
+python scripts/visualize_episode.py episodes/TASK/EPISODE --config experiments/default.py
 
 # 真机轨迹回放
-python scripts/replay_episode.py episodes/TASK/EPISODE
+python scripts/replay_episode.py episodes/TASK/EPISODE --config experiments/default.py --output replay_results/run_001
 ```
 
 键盘点动使用 WASD、方向键及 IJKL，R 回零，Q 退出，Esc 急停。其他入口按启动时显示的操作提示使用。真机回放以录制首帧的实测姿态为起点，默认手部准备目标用 0.5 秒插值到该实测姿态，另行等待实测到位；准备目标必须满足操作限位，之后按原记录目标序列播放。首个目标仍受原有执行约束，不再提前平滑到首个 action。
 
-VR 遥操作和策略部署每次启动会话时自动将手部回到 HOME，确认实测到位后请求五个触觉传感器复位，并等待复位后的 aggregate/dense 反馈；启动前应让手部无接触。复位请求失败或反馈不可用时不进入遥操作或策略 warmup。SDK 请求成功及反馈就绪不等同于已验证触觉零点；复位元数据会随 Raw 保存。暂停后继续不重复复位手部或触觉。
+VR 遥操作和策略部署每次启动会话时自动将手部回到 HOME，确认实测到位后请求五个触觉传感器复位，并等待复位后的 aggregate/dense 反馈；启动前应让手部无接触。复位请求失败或反馈不可用时不进入遥操作或策略 warmup。SDK 请求成功及反馈就绪不等同于已验证触觉零点；复位元数据会随 Raw 保存。各段之间复用设备和模型，初始化与触觉复位不会随每段重做。
 
-遥操作使用 `B` 开始、`C` 暂停/继续、`H` 保存当前段并回初始位、`S` 保存并结束当前段、`D` 丢弃当前段。暂停期间不追加数据，按 `C` 继续会保存前段、新建录制段，并用准备完成后的实测姿态与 VR 输入重新建立锚点。运行或暂停中第一次按 `Q` 进入退出等待，再按 `Q` 保存退出；此时 `C` 可继续，`S/D` 保存/丢弃后回到空闲。空闲时 `Q` 直接退出。`Esc` 急停，`T` 仅在空闲且手部无接触时请求触觉复位。
+遥操作和策略会话使用 `B` 开始、`S` 保存并结束本段、`D` 丢弃本段、`Q` 保存并退出、`Esc` 急停。`H` 仅在空闲且没有活动段时回初始位；`T` 仅在空闲且手部无接触时请求触觉复位。已取消 C 暂停/续写、双 Q 确认和音频播放，日常提示直接输出到终端。
 
-每段在 PREPARING 阶段先做一次不下发的目标预计算；机械臂准备完成后再用新观测重建锚点及滤波初值，开始控制与录制计时。首个目标成功提交并入录制队列后才播放开始/继续提示。控制期限或目标准入导致的停止使用结束提示，日志保留具体原因并提示按 B 重新开始；急停和运行故障仍使用异常提示。
+每段在 PREPARING 阶段先做一次不下发的目标预计算；机械臂准备完成后再用新观测重建锚点及滤波初值，开始控制与录制计时。本段先撤权并请求停止，再等待录制关闭，由监督方决定发布或丢弃，全部完成后才接收下一段。收尾期间积累的 B/H 等准备按键失效；writer 或模型任务未退出则终止会话，不再授权下一段。
 
-腕部按每段初始观测做相对映射：位置增量通过 VR 朝向标定转入机器人基座系，再按 `vr_pos_scale` 缩放；姿态从初始实测 EEF 朝向跟随腕部相对旋转。映射与旋转 EMA 共用 `Rotation` 表示，沿最短旋转插值；相对旋转恰为 180° 时存在两条等长最短弧，不保证穿过该点的插值方向连续。平滑参考使用最近成功提交的工作空间投影目标，暂停恢复后重新锚定。
+腕部按每段初始观测做相对映射：位置增量通过 VR 朝向标定转入机器人基座系，再按 `vr_pos_scale` 缩放；姿态从初始实测 EEF 朝向跟随腕部相对旋转。映射与旋转 EMA 共用 `Rotation` 表示，沿最短旋转插值；相对旋转恰为 180° 时存在两条等长最短弧，不保证穿过该点的插值方向连续。平滑参考使用最近成功提交的工作空间投影目标，新段开始时重新锚定。
 
 腕部 `ema_alpha_pos/ema_alpha_rot` 是每控制步中新目标的固定权重；在滤波计算中，0 保留参考，1 直接采用新目标。同一 VR 缓存帧可跨多个控制步复用，腕部 EMA 在每次成功提交后继续趋近该观测；手部重复读取该缓存帧则复用候选，不重复求解或滤波。
 
-VR 手部重定向使用固定骨长标定，联合拟合 XHand 可对应的近端/末段方向、骨链/指尖位置、有意对指距离和时间阻尼。启动时采集 25 个新鲜且来源时间递增的右手样本，取骨长中位数；不要求伸直，标定在本次会话内固定，暂停继续不重复标定。请保持右手清晰可见；标定 5 秒内未完成或骨长不稳定时明确退出，S/Q/Esc 可取消。
+VR 手部重定向使用固定骨长标定，联合拟合 XHand 可对应的近端/末段方向、骨链/指尖位置、有意对指距离和时间阻尼。启动时采集 25 个新鲜且来源时间递增的右手样本，取骨长中位数；不要求伸直，标定在本次会话内固定，同一会话的各段之间复用标定。请保持右手清晰可见；标定 5 秒内未完成或骨长不稳定时明确退出，S/Q/Esc 可取消。
 
 手部参数位于 `hand_retargeting`。求解范围采用 `hand.qpos_min_rad/qpos_max_rad`，另限制相邻提交目标的变化率，默认 4 rad/s；这不是实测电机速度或接触力保证。单层滤波使用时间常数 `smoothing_tau_s=0.02`，按本次控制观测与上次成功提交观测的时间差计算权重；候选只有在提交成功后才更新下一帧的初值、阻尼和滤波状态。无效输入和求解失败会保留具体原因并终止当前段。腕部位移倍率为 0.7、位置/旋转 EMA 权重为 0.95/0.85、控制与录制频率为 16 Hz。
 
@@ -97,9 +112,9 @@ HOME 保留直达、近端优先、远端优先及等价关节分支，按关节
 
 HOME 的 `HomePlanner` 使用 `environment.table`、标定平面和 `soft_clearance_m` 检查桌面；关闭该桌面模型时，仍用 `table_z_surface_m` 与 `hand_safety_margin_m` 检查手部 frame 高度代理。在线 `MotionConstraints` 的环境碰撞模型只加入 `environment.static_boxes`，不会自动继承 HOME 的桌面几何、软间隙或高度代理规则。`static_boxes` 同时用于 HOME 与在线目标检查；HOME 的桌面检查不能作为在线抓取具有同等桌面保护的依据。
 
-工作空间和静态盒体位置均使用机器人基座系；盒体尺寸为完整边长，旋转四元数使用 WXYZ 顺序。`allowed_contact_links` 必须填写 URDF 中的机器人 link 名，未知名称或关节名会在桌面模型构造时明确报错。桌面配置关闭时仍须保持字段合法，因为其标定路径也供点云使用，完整配置还会写入录制元数据。
+工作空间和静态盒体位置均使用机器人基座系；盒体尺寸为完整边长，旋转四元数使用 WXYZ 顺序。`allowed_contact_links` 必须填写 URDF 中的机器人 link 名，未知名称或关节名会在桌面模型构造时明确报错。关闭桌面模型时不检查其休眠业务范围，完整配置仍须可严格序列化；启用时执行完整业务校验。
 
-`environment.table.plane_path` 也供点云去桌面和诊断工具使用；`pointcloud.remove_table` 只裁剪观测点云，不执行机器人碰撞检查。
+`environment.table_plane_path` 是 HOME 和点云共用的桌面标定来源，独立于 HOME 碰撞盒体参数；`pointcloud.remove_table` 只裁剪观测点云，不执行机器人碰撞检查。
 
 键盘与标定 jog 的目标执行期限均从机械臂反馈的来源时间计算，读取缓存不会延长目标寿命。机械臂进程独立检查目标执行期限、机械臂反馈时效和控制器状态，HOME 另有执行期限。执行或反馈故障会保留原始原因，停止、断开设备并退出机械臂进程。父进程阻塞时，机械臂仍按这些条件处理停止；软件期限不代表物理停止延迟。
 

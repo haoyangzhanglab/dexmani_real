@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -13,21 +12,20 @@ from dexmani_real import PACKAGE_DIR
 from dexmani_real.geometry.plane import TablePlaneFit
 from dexmani_real.utils.io import write_json
 
-if TYPE_CHECKING:
-    from dexmani_real.config.control import TableCollisionConfig
 
-
-def resolve_table_plane_path(table: TableCollisionConfig) -> Path:
-    if table.plane_path is None:
-        raise RuntimeError("runtime table calibration has no plane_path")
-    path = Path(table.plane_path).expanduser()
+def resolve_table_plane_path(value: str | Path | None) -> Path:
+    if value is None:
+        raise RuntimeError("runtime table calibration has no table_plane_path")
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        raise ValueError("table_plane_path must be a non-empty path")
+    path = Path(value).expanduser()
     if not path.is_absolute():
         path = PACKAGE_DIR.parent / path
     return path.resolve()
 
 
-def load_table_plane(table: TableCollisionConfig) -> tuple[float, float, float, float]:
-    plane_path = resolve_table_plane_path(table)
+def load_table_plane(path: str | Path | None) -> tuple[float, float, float, float]:
+    plane_path = resolve_table_plane_path(path)
     with plane_path.open(encoding="utf-8") as stream:
         plane = json.load(stream)
     coefficients = (float(plane["a"]), float(plane["b"]), float(plane["c"]), float(plane["d"]))

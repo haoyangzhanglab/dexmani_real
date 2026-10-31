@@ -79,7 +79,7 @@ class RealSenseViewer:
         # Resolve experiment settings before enumerating or opening a camera.
         runtime = load_config(path=self.args.config)
         self.pointcloud_config = runtime.pointcloud
-        self.table = runtime.environment.table
+        self.table_plane_path = runtime.environment.table_plane_path
 
         from dexmani_real.sensor.realsense import RealSenseCamera
 
@@ -228,7 +228,7 @@ class RealSenseViewer:
                                 depth_scale_m=depth_scale_m, intrinsics=intrinsics,
                                 T_xarm_base_from_color=base_from_color,
                                 table_plane_abcd=(
-                                    load_table_plane(self.table)
+                                    load_table_plane(self.table_plane_path)
                                     if self.pointcloud_config.remove_table else None
                                 ),
                                 config=self.pointcloud_config,
@@ -267,7 +267,7 @@ class RealSenseViewer:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", help="Optional experiment YAML overrides")
+    parser.add_argument("--config", help="Trusted Python experiment file exporting CONFIG: RealConfig")
     parser.add_argument("--camera-calibration")
     return RealSenseViewer(parser.parse_args(argv)).run()
 

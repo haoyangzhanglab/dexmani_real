@@ -16,7 +16,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         epilog="""
 Examples:
   python scripts/replay_episode.py episodes/<task_name>/<episode_dir>
-  python scripts/replay_episode.py episodes/<task_name>/<episode_dir> --config local.yaml
+  python scripts/replay_episode.py episodes/<task_name>/<episode_dir> --config experiments/default.py
   python scripts/replay_episode.py episodes/<task_name>/<episode_dir> --output replay_results/my_replay/
 
 Controls:
@@ -35,7 +35,7 @@ Controls:
         ),
     )
     parser.add_argument(
-        "--config", type=str, default=None, help="Optional experiment YAML overrides"
+        "--config", type=str, default=None, help="Trusted Python experiment file exporting CONFIG: RealConfig"
     )
     parser.add_argument(
         "--output",

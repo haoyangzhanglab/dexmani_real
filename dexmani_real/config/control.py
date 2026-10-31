@@ -66,11 +66,9 @@ class StaticCollisionBox:
 
 @dataclass(frozen=True)
 class TableCollisionConfig:
-    """HOME 的标定桌面几何与软间隙；在线 MotionConstraints 不使用此配置。"""
+    """HOME 桌面碰撞盒与软间隙；标定平面由环境单独提供。"""
 
     enabled: bool = True
-    # 点云去桌面也使用此标定平面文件。
-    plane_path: str | None = TABLE_PLANE_RELATIVE_PATH
     size_xy_m: tuple[float, float] = (2.0, 2.0)
     thickness_m: float = 0.04
     # 包含标定得到的法兰模型残差。
@@ -78,10 +76,6 @@ class TableCollisionConfig:
     allowed_contact_links: tuple[str, ...] = ("link_base",)
 
     def validate(self) -> None:
-        if self.plane_path is not None and (
-            not isinstance(self.plane_path, str) or not self.plane_path.strip()
-        ):
-            raise ValueError("table plane_path must be a non-empty string or null")
         size = np.asarray(self.size_xy_m, dtype=np.float64)
         if size.shape != (2,) or not np.isfinite(size).all() or np.any(size <= 0.0):
             raise ValueError("table size_xy_m must contain two finite positive lengths")
@@ -102,6 +96,8 @@ class EnvironmentConfig:
     # HOME 与在线目标检查共用的静态障碍物。
     static_boxes: tuple[StaticCollisionBox, ...] = ()
 
+    # HOME 和点云直接使用同一份标定事实。
+    table_plane_path: str | None = TABLE_PLANE_RELATIVE_PATH
     table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
     # HOME 未启用标定桌面模型时使用的手部 frame 高度代理。
     table_z_surface_m: float = 0.022
@@ -115,8 +111,8 @@ class EnvironmentConfig:
             value = getattr(self, name)
             if not isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
-        # 模型关闭时，桌面配置仍用于点云标定路径及完整配置元数据。
-        self.table.validate()
+        if self.table.enabled:
+            self.table.validate()
         for box in self.static_boxes:
             box.validate()
         names = [box.name for box in self.static_boxes]

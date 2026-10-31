@@ -36,7 +36,7 @@ def run_replay(
     validate_robot_config(runtime)
     validate_control_rate(runtime, trajectory.fps)
     table_plane_abcd = (
-        load_table_plane(runtime.environment.table)
+        load_table_plane(runtime.environment.table_plane_path)
         if runtime.environment.table.enabled else None
     )
     target = Path(output_dir)

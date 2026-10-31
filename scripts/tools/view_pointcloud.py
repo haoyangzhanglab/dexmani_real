@@ -167,7 +167,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "processed clouds, and reconstruction metadata below this directory"
         ),
     )
-    parser.add_argument("--config", type=Path, help="Optional experiment YAML overrides")
+    parser.add_argument("--config", type=Path, help="Trusted Python experiment file exporting CONFIG: RealConfig")
     parser.add_argument("--camera-calibration", type=Path)
     return parser.parse_args(argv)
 
@@ -324,7 +324,7 @@ def run_pointcloud_diagnostic(args) -> int:
     runtime.camera.validate()
     pcd_config = runtime.pointcloud
     table_plane_abcd = (
-        load_table_plane(runtime.environment.table)
+        load_table_plane(runtime.environment.table_plane_path)
         if pcd_config.remove_table and not fit_table_requested
         else None
     )
@@ -369,7 +369,7 @@ def run_pointcloud_diagnostic(args) -> int:
                 intrinsics=intrinsics,
                 T_xarm_base_from_color=T_xarm_base_from_color,
                 config=pcd_config,
-                plane_path=resolve_table_plane_path(runtime.environment.table),
+                plane_path=resolve_table_plane_path(runtime.environment.table_plane_path),
                 frame_count=TABLE_CALIBRATION_FRAMES,
             )
             table_plane_abcd = fitted_plane if pcd_config.remove_table else None

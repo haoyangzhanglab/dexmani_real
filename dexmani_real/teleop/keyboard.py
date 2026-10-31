@@ -32,7 +32,7 @@ class KeyboardTeleop:
         configure_logging()
         validate_robot_config(self.runtime)
         self.table_plane_abcd = (
-            load_table_plane(self.runtime.environment.table)
+            load_table_plane(self.runtime.environment.table_plane_path)
             if self.runtime.environment.table.enabled else None
         )
         self.bounds = jog_bounds(self.runtime)

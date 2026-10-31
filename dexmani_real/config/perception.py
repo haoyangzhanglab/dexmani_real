@@ -24,7 +24,7 @@ class PointCloudConfig:
             or np.any(workspace[:3] >= workspace[3:])
         ):
             raise ValueError("workspace must contain finite ordered xyz lower/upper bounds")
-        if not np.isfinite(self.table_margin_m) or self.table_margin_m < 0:
+        if self.remove_table and (not np.isfinite(self.table_margin_m) or self.table_margin_m < 0):
             raise ValueError("table_margin_m must be finite and nonnegative")
         object.__setattr__(self, "workspace", tuple(float(v) for v in workspace))
 

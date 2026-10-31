@@ -92,7 +92,7 @@ def run_policy(
     needs = control_needs.union(record_needs)
     runtime = resolve_deployment_config(info, runtime, needs)
     table_plane_abcd = (
-        load_table_plane(runtime.environment.table)
+        load_table_plane(runtime.environment.table_plane_path)
         if runtime.environment.table.enabled or (needs.point_cloud and runtime.pointcloud.remove_table)
         else None
     )
@@ -108,7 +108,7 @@ def run_policy(
         "effective_camera": None,
         "table_plane_abcd": table_plane_abcd,
         "table_plane_path": (
-            str(resolve_table_plane_path(runtime.environment.table))
+            str(resolve_table_plane_path(runtime.environment.table_plane_path))
             if table_plane_abcd is not None else None
         ),
         "seed": seed,

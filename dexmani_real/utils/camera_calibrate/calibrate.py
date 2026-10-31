@@ -441,7 +441,7 @@ class CameraCalibrator:
             )
         validate_robot_config(self.runtime)
         table_plane_abcd = (
-            load_table_plane(self.runtime.environment.table)
+            load_table_plane(self.runtime.environment.table_plane_path)
             if self.runtime.environment.table.enabled else None
         )
         bounds = jog_bounds(self.runtime)

@@ -29,13 +29,6 @@ class CameraConfig:
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"camera {name} must be a positive integer")
-        if type(self.l515_visual_preset) is not int or not 0 <= self.l515_visual_preset <= 5:
-            raise ValueError("camera l515_visual_preset must be an integer in [0, 5]")
-        if self.l515_confidence_threshold is not None and (
-            type(self.l515_confidence_threshold) is not int
-            or not 0 <= self.l515_confidence_threshold <= 3
-        ):
-            raise ValueError("camera l515_confidence_threshold must be in [0, 3] or null")
         if self.serial is not None and (
             not isinstance(self.serial, str) or not self.serial.strip()
         ):

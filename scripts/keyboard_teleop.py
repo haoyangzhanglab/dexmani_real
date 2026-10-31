@@ -14,23 +14,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-hand",
         action="store_true",
-        help="Do not connect XHand; it must be absent or secured at configured home",
+        help="Confirm hand.enabled=False in config; hand must be absent or secured at home",
     )
     parser.add_argument(
-        "--config", type=Path, default=None, help="Optional experiment YAML overrides"
+        "--config", type=Path, default=None, help="Trusted Python experiment file exporting CONFIG: RealConfig"
     )
-    parser.add_argument("--control-hz", type=float, default=None, help="Keyboard target frequency")
     args = parser.parse_args(argv)
 
-    from dexmani_real.teleop.keyboard import KeyboardTeleop
+    runtime = load_config(args.config)
+    if args.no_hand and runtime.hand.enabled:
+        parser.error("--no-hand requires hand.enabled=False in the experiment config")
+    if not runtime.hand.enabled and not args.no_hand:
+        parser.error("hand.enabled=False requires explicit --no-hand confirmation")
 
-    runtime = load_config(
-        path=args.config,
-        overrides={
-            "hand": {"enabled": False if args.no_hand else None},
-            "keyboard_teleop": {"control_hz": args.control_hz},
-        },
-    )
+    from dexmani_real.teleop.keyboard import KeyboardTeleop
     return KeyboardTeleop(runtime, no_hand=args.no_hand).run()
 
 

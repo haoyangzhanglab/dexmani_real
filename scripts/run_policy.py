@@ -4,14 +4,13 @@
 from __future__ import annotations
 
 import argparse
-import math
+import json
 from dataclasses import asdict
 from pathlib import Path
 
 from dexmani_real.config.deployment import (
     DEFAULT_MAX_RUNNING_S,
     DEFAULT_NUM_EPISODES,
-    RUNTIME_SECTIONS,
 )
 
 
@@ -26,13 +25,6 @@ def nonnegative_int(raw: str) -> int:
     value = int(raw)
     if value < 0:
         raise argparse.ArgumentTypeError("must be a non-negative integer")
-    return value
-
-
-def nonnegative_float(raw: str) -> float:
-    value = float(raw)
-    if not math.isfinite(value) or value < 0.0:
-        raise argparse.ArgumentTypeError("must be a finite non-negative number")
     return value
 
 
@@ -52,8 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         help=(
-            "Optional Real hardware/execution YAML; execution CLI options take precedence. "
-            "Policy uses experiment/config.yaml"
+            "Trusted Python experiment file exporting CONFIG: RealConfig. "
+            "Policy recipe is restored from its checkpoint"
         ),
     )
     parser.add_argument(
@@ -98,35 +90,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable Raw recording; evaluation results are always saved",
     )
-    execution = parser.add_argument_group("Real execution")
-    execution.add_argument(
-        "--execution-mode",
-        choices=("sync", "async", "rtc"),
-        default=None,
-        help="Override execution mode (default: YAML or sync)",
-    )
-    execution.add_argument(
-        "--prefetch-steps",
-        type=positive_int,
-        default=None,
-        help="Override prefetch delay d for async/RTC; requires 1 <= d <= A_exec and A_exec+d <= P",
-    )
-    execution.add_argument(
-        "--rtc-guidance-cap",
-        type=nonnegative_float,
-        default=None,
-        help="Override finite nonnegative RTC guidance cap; 0 retains prefix freezing without guidance",
-    )
-    execution.add_argument(
-        "--n-action-steps",
-        type=positive_int,
-        default=None,
-        help=(
-            "A_exec: actions per segment (nominal replan length in async; "
-            "valid old tails may run longer) "
-            "(default: YAML execution.action_steps or saved Policy n_action_steps)"
-        ),
-    )
     research = parser.add_argument_group("Policy inference")
     research.add_argument("--weights", choices=("ema", "raw"), default=None)
     research.add_argument(
@@ -148,31 +111,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args.print_config and args.experiment is None:
         parser.error("EXPERIMENT is required unless --print-config is used")
 
-    import yaml
-
     from dexmani_real.config.real import load_config
 
-    runtime = load_config(
-        path=args.config,
-        overrides={"execution": {
-            "mode": args.execution_mode,
-            "prefetch_steps": args.prefetch_steps,
-            "rtc_guidance_cap": args.rtc_guidance_cap,
-            "action_steps": args.n_action_steps,
-        }},
-    )
+    runtime = load_config(args.config)
     if args.print_config:
-        print("# 声明配置；数值表示 recipe 来自训练 artifact，此处不加载策略。")
-        print("# 以下 CLI 专属参数仍需在命令行指定：")
-        for name in (
-            "experiment", "checkpoint", "output", "camera_calibration", "no_record",
-            "num_episodes", "max_running_s", "weights", "inference_steps", "seed", "device",
-        ):
-            print(f"# {name}: {getattr(args, name)}")
-        print(yaml.safe_dump(
-            {name: asdict(getattr(runtime, name)) for name in RUNTIME_SECTIONS},
-            allow_unicode=True, sort_keys=False,
-        ), end="")
+        print(json.dumps(asdict(runtime), ensure_ascii=False, indent=2, allow_nan=False))
         return 0
 
     from dexmani_real.deployment.run import run_policy

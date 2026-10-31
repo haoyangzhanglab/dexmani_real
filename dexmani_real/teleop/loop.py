@@ -52,7 +52,6 @@ class TeleopLoop:
         home_planner,
         recording_dir,
         keyboard,
-        audio,
         camera_snapshot=None,
     ):
         self.runtime_state = runtime_state
@@ -71,7 +70,7 @@ class TeleopLoop:
         )
         self.task_label = task_label
         self.camera_snapshot = camera_snapshot
-        self.keyboard, self.audio = keyboard, audio
+        self.keyboard = keyboard
 
         self.phase = TeleopPhase.IDLE
         self.run_id = None
@@ -132,7 +131,7 @@ class TeleopLoop:
 
     def end_episode(
         self, save, reason, *, run_end_reason=RunEndReason.OPERATOR,
-        expected_run_id=None, announce=True, row=None, command=None,
+        expected_run_id=None, row=None, command=None,
     ):
         if not save:
             self.discard_requested = True
@@ -147,9 +146,6 @@ class TeleopLoop:
             failure = exc
         self.controller.clear()
 
-        if announce and self.capture_failed:
-            emergency = self.runtime_state.estop_request or self.runtime_state.error_state
-            self.audio.play("emergency" if emergency else "end")
         try:
             if row is not None and self.recorder is not None:
                 self.recorder.append(row, command)
@@ -158,7 +154,7 @@ class TeleopLoop:
             logger.exception("teleop final frame failed")
             failure = failure or exc
         try:
-            self.finish_recording(save, announce=announce and not self.capture_failed)
+            self.finish_recording(save)
         except BaseException as exc:
             self.record_error("recording_cleanup", exc)
             logger.exception("teleop recording cleanup failed")
@@ -169,7 +165,7 @@ class TeleopLoop:
             raise failure
         return True
 
-    def finish_recording(self, save, *, announce=True):
+    def finish_recording(self, save):
         recorder = self.recorder
         if recorder is None or not recorder.start_attempted:
             self.recorder = None
@@ -186,8 +182,7 @@ class TeleopLoop:
         )
         # finish 失败时保留 recorder，让会话收尾继续持有未释放的 writer。
         self.recorder = None
-        if announce:
-            self.audio.play("save" if published is not None else "discard")
+        logger.info("本段%s。", "已保存" if published is not None else "已丢弃")
 
     def abort_episode(
         self, reason, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY, row=None, command=None,
@@ -349,7 +344,6 @@ class TeleopLoop:
             self.termination_details.append(event)
         if cmd == "esc":
             self.runtime_state.request_emergency_stop()
-            self.audio.play("emergency")
             return True
         if (
             self.runtime_state.estop_request or self.runtime_state.error_state
@@ -360,7 +354,7 @@ class TeleopLoop:
         if cmd == "q":
             self.runtime_state.request_quit()
             if self.phase is not TeleopPhase.IDLE or self.recorder is not None:
-                self.end_episode(True, "quit", run_end_reason=RunEndReason.QUIT, announce=False)
+                self.end_episode(True, "quit", run_end_reason=RunEndReason.QUIT)
             return True
         if cmd in ("s", "d"):
             self.end_episode(cmd == "s", "stop" if cmd == "s" else "discard")
@@ -384,13 +378,13 @@ class TeleopLoop:
                 logger.warning("HOME requires idle without an active capture")
                 return True
             if not self.poll_blocking_commands(home_commands):
-                self.audio.play("home")
+                logger.info("正在回初始位…")
                 result = home_robot(
                     self.runtime_state, self.robot, self.home_planner,
                     cancel_requested=self.poll_blocking_commands,
                 )
                 if result.ok:
-                    self.audio.play("home_done", interrupt=False)
+                    logger.info("已回初始位。")
                 elif result.interrupted:
                     logger.info("HOME cancelled: %s", result.reason)
                 else:
@@ -562,7 +556,6 @@ class TeleopLoop:
                 self.recorder.append(row, command)
             if self.tick_index == 1:
                 logger.info("Teleop first target submitted run=%s", epoch)
-                self.audio.play("begin", interrupt=False)
 
     def admit_observation(self, row):
         issues, feedback_until_ns = check_observation(
@@ -644,7 +637,7 @@ class TeleopLoop:
             return
         if self.phase is not TeleopPhase.IDLE or self.recorder is not None:
             self.end_episode(
-                True, "interrupted", run_end_reason=RunEndReason.RUNTIME_SHUTDOWN, announce=False,
+                True, "interrupted", run_end_reason=RunEndReason.RUNTIME_SHUTDOWN,
             )
 
     def run_episode(self, expected_run_id):
@@ -688,7 +681,7 @@ class TeleopLoop:
             try:
                 if failure is not None and self.phase is not TeleopPhase.IDLE:
                     self.end_episode(
-                        True, str(failure), run_end_reason=failure_reason(failure), announce=False,
+                        True, str(failure), run_end_reason=failure_reason(failure),
                     )
                 else:
                     self.close()

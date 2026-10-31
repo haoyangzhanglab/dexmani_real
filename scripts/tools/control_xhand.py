@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import resource
 import signal
@@ -15,7 +16,6 @@ from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
-import yaml
 
 from dexmani_real.config.real import load_config
 from dexmani_real.config.xhand import HandConfig
@@ -301,11 +301,8 @@ def run_isolated_hardware_session(argv: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--config", type=Path, help="Optional experiment YAML; uses its hand section"
+        "--config", type=Path, help="Trusted Python experiment file; uses CONFIG.hand"
     )
-    parser.add_argument("--comm", choices=("serial", "ethercat"), help="Override hand transport")
-    parser.add_argument("--device", help="Serial path or EtherCAT interface name")
-    parser.add_argument("--hand-id", type=int, help="Override hand device id")
     parser.add_argument(
         "--finger-id", type=int, default=5, help="Joint id inspected for tactile health"
     )
@@ -322,22 +319,15 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
     try:
-        config = load_config(
-            path=args.config,
-            overrides={"hand": {
-                "comm_type": args.comm,
-                "device_name": args.device,
-                "device_id": args.hand_id,
-            }},
-        ).hand
+        config = load_config(args.config).hand
         if not args.print_config:
             config.validate()
         if not 0 <= args.finger_id < HAND_DOF:
             raise ValueError(f"finger-id must be in 0..{HAND_DOF - 1}")
-    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         parser.error(str(exc))
     if args.print_config:
-        print(yaml.safe_dump({"hand": asdict(config)}, sort_keys=False), end="")
+        print(json.dumps({"hand": asdict(config)}, ensure_ascii=False, indent=2, allow_nan=False))
         return 0
     if args.xhand_hardware_worker:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))

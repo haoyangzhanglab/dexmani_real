@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 from dexmani_real.config.calibration_data import CAMERAS_PATH
@@ -13,15 +14,10 @@ from dexmani_real.config.real import load_config
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ArUco eye-to-hand camera calibration")
     parser.add_argument(
-        "--serial",
-        default=None,
-        help="RealSense serial (required with multiple devices)",
-    )
-    parser.add_argument(
         "--config",
         type=Path,
         default=None,
-        help="Optional experiment YAML overrides; --serial takes precedence",
+        help="Trusted Python experiment file exporting CONFIG: RealConfig",
     )
     parser.add_argument(
         "--output",
@@ -45,10 +41,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     print("=" * 60)
 
-    runtime = load_config(
-        path=args.config,
-        overrides={"camera": {"serial": args.serial}, "hand": {"enabled": False}},
-    )
+    runtime = load_config(args.config)
+    runtime = replace(runtime, hand=replace(runtime.hand, enabled=False))
 
     return CameraCalibrator(
         runtime,

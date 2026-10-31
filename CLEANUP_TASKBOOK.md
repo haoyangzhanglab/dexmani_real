@@ -388,7 +388,7 @@ finally:
 | T0 | 完成 | 基线 `580ac65`，初始 main 工作区/暂存区干净；工作分支 `cleanup/personal-research-t0-t8`。`real_robot/bin/python` 可用；固定 FK/手云、三模式轨迹、3 行 normal/failed H5+MP4 与 13 模态 Zarr 对照保存在 `/tmp/dexmani-cleanup-baseline`。238 行真实 Raw 准入及前三行 FK 已读；Policy 当前 `4618a2e`，只读保留其已有改动。sandbox 外 CUDA/光栅化/FP 深度核通过；Warp 启动有驱动 API 报错但实测核成功。SAM/DINO/Hunyuan 默认权重缺失；完整模型、真机未验证。 |
 | T1 | 完成 | 删除 XHand 默认身份缓存/探针、VR 标定的右手 IPC/头缓存与音频依赖、默认回放指标及 mesh 版本/显存报告。非有限 loss 仍拒绝，诊断可严格 JSON 保存；tip=0 保留方向/pinch。新增离线 `evaluate_replay.py`。`PYTHONDONTWRITEBYTECODE=1 real_robot/bin/python -m unittest discover -s tests -v`：19 项通过，含 FK 梯度、纯头帧、超时/关闭、真实文件写入及失败注入；`git diff --check` 通过。未验证网络 VR、实际生成权重和真机。 |
 | T2 | 完成 | writer 只写/关，监督方唯一发布；删除发布锁/取消竞争、重复 finish/refresh 与外层 tick 收尾。Teleop/Policy 单段顺序返回，迟到模型任务有界回收，未退出则终止会话；实发 RobotCommand 与授权锁内 commit；机器码区分时长完成/预测超时。为使遥操作整段返回，暂停/双 Q 同批移除，HOME 仅空闲。60 项 unittest 通过，含 open/队满/close/超时晚到、连续两段、Esc/撤权/RTC、真实 H5+MP4；13 模态重导出与 T0 精确一致（新 source_id 按原行为生成），Policy split 恢复通过，diff/语法检查通过。保留原 Raw 封存时点：未参与控制的退休预测报错令 session 失败，不回写已发布 Raw，不改变原准入集合。未验证真实 checkpoint 推理/真机节拍与停机。 |
-| T3 | 未开始 | — |
+| T3 | 完成 | 可信 Python `CONFIG: RealConfig` 单入口，删除 YAML 递归/嵌套覆盖，迁移 10 个 CLI 与示例；无手参数仅明确确认。桌面标定路径移出 HOME 盒体，业务校验只随启用分支；完整快照严格 JSON。删除音频线程/播放代际/等待及 12 个无消费 WAV，文档更新五键与 HOME 行为。13 个配置测试、此前 60 项回归、10 个 CLI help、无设备 print 与旧参数拒绝检查通过；默认完整值（除路径移位）及 Canonical recipe 精确一致。PyYAML 为外部模型/运行快照保留。Policy 并行更新已改为 checkpoint 恢复配方，文案按当前事实修正；用户另明确批准同步删除旧 LAMP 动作历史分支，后续独立记录适配。未验证设备配置实际生效。 |
 | T4 | 未开始 | — |
 | T5 | 未开始 | — |
 | T6 | 未开始 | — |

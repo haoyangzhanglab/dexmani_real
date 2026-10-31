@@ -7,14 +7,12 @@ import argparse
 import logging
 import os
 import time
-from dataclasses import replace
 from pathlib import Path
 
 os.environ.setdefault("RUST_LOG", "error")
 
 import numpy as np
 
-from dexmani_real.config.control import TableCollisionConfig
 from dexmani_real.config.perception import PointCloudConfig
 from dexmani_real.config.real import load_config
 from dexmani_real.data.raw import RawReader
@@ -87,7 +85,7 @@ class EpisodeVisualizer:
         episode_path: str,
         *,
         fingertip_link_names: tuple[str, ...],
-        table_config: TableCollisionConfig,
+        table_plane_path: str | Path | None,
         max_frames: int | None = None,
         pointcloud_config: PointCloudConfig | None = None,
     ):
@@ -126,7 +124,7 @@ class EpisodeVisualizer:
             self.pointcloud_processing_ns = 0
             self.pointcloud_processed_frames = 0
             if pointcloud_config is not None and self.T_xarm_base_from_color is not None:
-                table_plane = load_table_plane(table_config) if pointcloud_config.remove_table else None
+                table_plane = load_table_plane(table_plane_path) if pointcloud_config.remove_table else None
                 self.pointcloud_processor = PointCloudProcessor(
                     depth_scale_m=self.camera_model.depth_scale_m,
                     intrinsics=self.camera_model.color,
@@ -293,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Limit number of state frames to load.",
     )
     parser.add_argument(
-        "--config", type=Path, help="Optional experiment YAML for point-cloud processing and table calibration"
+        "--config", type=Path, help="Trusted Python experiment file exporting CONFIG: RealConfig"
     )
     parser.add_argument(
         "--info",
@@ -306,17 +304,9 @@ def main(argv: list[str] | None = None) -> int:
         default=True,
         help=("Display the canonical point cloud (default: enabled)."),
     )
-    parser.add_argument(
-        "--pointcloud-num-points",
-        type=int,
-        default=None,
-        help="Override the point-cloud count used for this offline view.",
-    )
     args = parser.parse_args(argv)
     if args.max_frames is not None and args.max_frames <= 0:
         parser.error("--max-frames must be a positive integer")
-    if args.point_cloud is False and args.pointcloud_num_points is not None:
-        parser.error("--pointcloud-num-points requires --point-cloud")
     episode_path = Path(args.episode).expanduser().resolve()
     if not episode_path.is_dir():
         logger.error("Episode not found: %s", episode_path)
@@ -333,13 +323,11 @@ def main(argv: list[str] | None = None) -> int:
     pointcloud_config = None
     if args.point_cloud:
         pointcloud_config = runtime.pointcloud
-        if args.pointcloud_num_points is not None:
-            pointcloud_config = replace(pointcloud_config, num_points=args.pointcloud_num_points)
 
     viz = EpisodeVisualizer(
         str(episode_path),
         fingertip_link_names=XHAND_FINGERTIP_LINK_NAMES,
-        table_config=runtime.environment.table,
+        table_plane_path=runtime.environment.table_plane_path,
         max_frames=args.max_frames,
         pointcloud_config=pointcloud_config,
     )

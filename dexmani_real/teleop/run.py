@@ -3,7 +3,6 @@
 import logging
 import multiprocessing as mp
 import time
-from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +33,6 @@ from dexmani_real.runtime.preflight import validate_control_rate, validate_robot
 from dexmani_real.runtime.state import RunEndReason, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.sensor.vr import run_vr
-from dexmani_real.teleop.audio import AudioFeedback
 from dexmani_real.teleop.loop import TeleopLoop, failure_reason
 from dexmani_real.teleop.vr import VRController
 from dexmani_real.utils.log import configure_logging
@@ -43,7 +41,6 @@ from dexmani_real.utils.timing import sample_is_fresh
 from dexmani_real.utils.vr_heading import load_vr_transform
 
 logger = logging.getLogger(__name__)
-END_AUDIO_GRACE_S = 3.0
 
 
 def run_teleop(
@@ -71,7 +68,7 @@ def run_teleop(
         runtime.collection.validate()
         runtime.camera.validate()
     table_plane_abcd = (
-        load_table_plane(runtime.environment.table)
+        load_table_plane(runtime.environment.table_plane_path)
         if runtime.environment.table.enabled else None
     )
     if not runtime.hand.enabled and (runtime.collection.enabled or not allow_no_hand):
@@ -111,7 +108,7 @@ def run_teleop(
     sensors = robot = None
     clean = False
     loop = None
-    keyboard = audio = None
+    keyboard = None
     try:
         sensors = SensorWorkers(channels)
         robot = Robot(
@@ -130,7 +127,6 @@ def run_teleop(
                 "q": lambda: runtime_state.request_stop(reason=RunEndReason.QUIT),
             },
         )
-        audio = AudioFeedback()
         loop = TeleopLoop(
             runtime_state,
             runtime,
@@ -142,7 +138,6 @@ def run_teleop(
             controller=controller,
             home_planner=home_planner,
             keyboard=keyboard,
-            audio=audio,
             recording_dir=(
                 Path(__file__).resolve().parents[2] / runtime.collection.episodes_dir / task_name
                 if runtime.collection.enabled
@@ -188,7 +183,6 @@ def run_teleop(
             loop.record_error("runtime", exc)
             runtime_state.revoke_motion(reason=failure_reason(exc))
             sensors.request_shutdown()
-            audio.play("emergency")
             raise
         clean = bool(runtime_state.quit_requested)
     except KeyboardInterrupt:
@@ -198,19 +192,12 @@ def run_teleop(
         logger.exception("teleop session failed")
     finally:
 
-        def close_component(stage, close):
-            try:
-                close()
-            except Exception:
-                runtime_state.mark_error()
-                logger.exception("teleop %s cleanup failed", stage)
-
         try:
-            with ExitStack() as cleanup:
-                if audio is not None:
-                    cleanup.callback(close_component, "audio", lambda: finish_audio(audio))
-                if loop is not None:
-                    cleanup.callback(close_component, "capture", loop.close)
+            if loop is not None:
+                loop.close()
+        except Exception:
+            runtime_state.mark_error()
+            logger.exception("teleop capture cleanup failed")
         finally:
             shutdown_clean = close_runtime(
                 runtime_state,
@@ -263,14 +250,6 @@ def initialize_teleop(loop, vr_process) -> bool:
         flush=True,
     )
     return True
-
-
-def finish_audio(audio):
-    try:
-        if not audio.wait_until_idle(timeout_s=END_AUDIO_GRACE_S):
-            logger.warning("Final audio did not finish within %.1fs", END_AUDIO_GRACE_S)
-    finally:
-        audio.close()
 
 
 def calibrate_hand(loop):

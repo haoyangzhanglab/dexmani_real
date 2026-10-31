@@ -4,9 +4,8 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
-
-import yaml
+import json
+from dataclasses import asdict, replace
 
 from dexmani_real.config.real import load_config
 from dexmani_real.config.teleop import DEFAULT_TASK_NAME
@@ -28,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
         "--no-hand",
         action="store_true",
         help=(
-            "Do not start XHand; it must be absent or secured at configured home. "
+            "Confirm hand.enabled=False in the experiment config; hand must be absent or secured at home. "
             "Arm debug only; also pass --no-record (or disable recording in config)."
         ),
     )
@@ -42,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Maximum duration of each capture in seconds",
     )
     parser.add_argument(
-        "--config", type=str, default=None, help="Optional experiment YAML overrides"
+        "--config", type=str, default=None, help="Trusted Python experiment file exporting CONFIG: RealConfig"
     )
     parser.add_argument(
         "--print-config",
@@ -53,42 +52,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--camera-calibration", default=None, help="Explicit camera extrinsics JSON"
     )
-    parser.add_argument(
-        "--control-hz",
-        type=float,
-        default=None,
-        help="Teleop/action/recording frequency; xArm servo frequency is independent",
-    )
     args = parser.parse_args(argv)
 
-    runtime = load_config(
-        path=args.config,
-        overrides={
-            "collection": {
-                "enabled": args.record,
-                "episodes_dir": args.episodes_dir,
-                "max_duration_s": args.max_duration,
-            },
-            "teleop": {"control_hz": args.control_hz},
-            "hand": {"enabled": False if args.no_hand else None},
-        },
-    )
+    runtime = load_config(args.config)
+    runtime = replace(runtime, collection=replace(
+        runtime.collection,
+        enabled=runtime.collection.enabled if args.record is None else args.record,
+        episodes_dir=runtime.collection.episodes_dir if args.episodes_dir is None else args.episodes_dir,
+        max_duration_s=runtime.collection.max_duration_s if args.max_duration is None else args.max_duration,
+    ))
+    if args.no_hand and runtime.hand.enabled:
+        parser.error("--no-hand requires hand.enabled=False in the experiment config")
     if args.print_config:
-        sections = ["arm", "hand", "motion", "teleop", "collection", "vr", "environment"]
-        if runtime.collection.enabled:
-            sections.append("camera")
-        if runtime.hand.enabled:
-            sections.append("hand_retargeting")
-        print("# 声明配置；CLI 专属参数仍需在命令行指定。")
-        for name in ("task_name", "vr_transform", "camera_calibration", "no_hand"):
-            print(f"# {name}: {getattr(args, name)}")
-        print(yaml.safe_dump(
-            {name: asdict(getattr(runtime, name)) for name in sections},
-            allow_unicode=True, sort_keys=False,
-        ), end="")
+        print(json.dumps(asdict(runtime), ensure_ascii=False, indent=2, allow_nan=False))
         return 0
     if not runtime.hand.enabled and not args.no_hand:
-        parser.error("hand.enabled=false requires explicit --no-hand confirmation")
+        parser.error("hand.enabled=False requires explicit --no-hand confirmation")
 
     from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
     from dexmani_real.teleop.run import run_teleop
