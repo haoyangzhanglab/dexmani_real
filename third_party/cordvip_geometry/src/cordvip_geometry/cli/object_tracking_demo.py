@@ -30,6 +30,7 @@ def view_results(directory, *, show_3d=True, headless=False):
         raise ValueError('scene result contains no saved frames')
     viewer = None
     show_model = False
+    model_templates = None
     count = 0
     try:
         if not headless:
@@ -38,6 +39,7 @@ def view_results(directory, *, show_3d=True, headless=False):
             scene = json.loads((directory / 'scene.json').read_text())
             run = json.loads((directory / 'run.json').read_text())
             names = [item['id'] for item in scene['objects']]
+            model_names = [item['id'] for item in scene['objects'] if item.get('asset')]
             colors = run['colors_rgb']
             viewer = DemoViewer(show_3d=show_3d)
         for path in paths:
@@ -53,8 +55,7 @@ def view_results(directory, *, show_3d=True, headless=False):
                         if bool(frame[prefix + 'pose_valid']):
                             frame[prefix + 'T_camera_object'] = saved[prefix + 'T_camera_object']
                         if show_3d:
-                            for field in ('observed_points_camera', 'model_points_camera'):
-                                frame[prefix + field] = saved[prefix + field]
+                            frame[prefix + 'observed_points_camera'] = saved[prefix + 'observed_points_camera']
                 if show_3d and not headless and 'hand_points_camera' in saved.files:
                     frame['hand_points_camera'] = saved['hand_points_camera']
             rgb = frame['rgb']
@@ -67,7 +68,9 @@ def view_results(directory, *, show_3d=True, headless=False):
             if not headless:
                 viewer.update(scene_display(frame, names, colors))
                 if show_3d:
-                    points, point_colors = scene_clouds(frame, names, colors, show_model=show_model)
+                    points, point_colors = scene_clouds(
+                        frame, names, colors, model_templates=model_templates if show_model else None,
+                    )
                     viewer.update_cloud(points, point_colors)
             while not headless:
                 key = viewer.poll()
@@ -76,7 +79,20 @@ def view_results(directory, *, show_3d=True, headless=False):
                 if key == ord('v'):
                     show_model = not show_model
                     if show_3d:
-                        points, point_colors = scene_clouds(frame, names, colors, show_model=show_model)
+                        if show_model and model_templates is None:
+                            model_templates = {}
+                            for name in model_names:
+                                with np.load(directory / 'model_templates' / f'{name}.npz', allow_pickle=False) as saved:
+                                    points = saved['points_object']
+                                if (
+                                    points.dtype != np.float32 or points.ndim != 2 or points.shape[1] != 3
+                                    or not len(points) or not np.isfinite(points).all()
+                                ):
+                                    raise ValueError(f'{name}: template points must be nonempty finite float32 [N,3]')
+                                model_templates[name] = points
+                        points, point_colors = scene_clouds(
+                            frame, names, colors, model_templates=model_templates if show_model else None,
+                        )
                         viewer.update_cloud(points, point_colors)
                 elif key in (ord('n'), ord(' '), 13):
                     break

@@ -51,7 +51,6 @@ python scripts/collect_teleop.py TASK
 python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr
 python scripts/run_policy.py EXPERIMENT --checkpoint latest --num-episodes 5
 python scripts/replay_episode.py episodes/TASK/EPISODE --output replay_results/run_001
-python scripts/evaluate_replay.py --episode episodes/TASK/EPISODE --replay replay_results/run_001
 python scripts/visualize_episode.py episodes/TASK/EPISODE
 python scripts/keyboard_teleop.py
 ```
@@ -73,6 +72,8 @@ Raw 将实测 state 与提交尝试 action 分开保存。组合命令按设备�
 Canonical 保留 [固定 13 模态](dexmani_real/data/export.py)、原字段/单位/dtype、EEF 9D 与 EEF action 21D。内部 FK 使用独立 SE(3)，仅在数据和 policy 边界编码 rot6d。默认导出固定周期的有效连续前缀，技术失败段保守排除末行；正常保存、可导出和可物理回放的集合不同。结构损坏或保留范围内坏帧明确失败，不重采样或改写来源时间。
 
 `control_ns` 是采样起点，`observation_ns` 是快照完成时刻；臂、手、触觉、相机的来源时间独立保留。相机使用 depth/color 首次主机接收时间中的较早者，读取缓存不会延长年龄；这不等同于曝光时刻。相机与点云 owner、五帧相机历史、防撕裂和同源配对继续保留。额外录制相机不会缩短纯控制动作期限。
+
+训练导出与物理回放均按 `control_ns` 检查相邻周期及相对整段首行的累计网格偏差；回放严格接纳整段，导出可保留有效连续前缀。真实观测时间仍须递增、处于本控制周期内且不与下一次采样重叠，不要求读出耗时恒定。实际回放按标称整数周期逐行尝试提交，仍拒绝漏槽、过期反馈和超期提交。
 
 每次新导出生成独立 `source_id`，原样搬迁保留 ID。split/resume 必须匹配同一数据身份，旧数据和 checkpoint 不自动改写。Canonical 保存影响数值结果的处理配方与完整 URDF；实验应记录 source_id、导出 Real SHA、训练 Policy SHA 及手模板来源。修改处理算法或模板后重新导出，已有未知来源须如实保留。
 
@@ -112,6 +113,7 @@ python scripts/tools/view_realsense.py --cloud processed
 python scripts/tools/view_realsense.py --calibrate-table
 python scripts/tools/view_realsense.py --save-dir snapshots
 python scripts/tools/view_realsense.py --benchmark-frames 20
+python scripts/tools/view_pointcloud.py
 ```
 
 collect 的相机持续连接，Enter 为一组只读机械臂采样，完成立即断开臂；Q 结束。五帧原 RGB、检测、来源时间、实测位置/速度和样本 ID 保存为 NPZ，速度、帧新鲜度及前后漂移仍检查。solve 不连接设备，按原 ID 排除样本，保存逐样本残差和 used/excluded/worst IDs；质量合格后写入原 serial 映射格式外参，报告使用同名 `.result.json`。VR 头朝向直接消费头帧，不要求右手就绪。
@@ -120,9 +122,11 @@ VR 运行读取 JSON 中有限且位于 `[-180, 180]` 的 `theta_deg`，例如 `
 
 solve 的外参输出与派生报告不得覆盖 `capture.json` 或原始采样 NPZ；其他新结果仍可保存在采样目录内。
 
-相机查看统一使用 view_realsense.py：默认 RGB-D，`--cloud raw/processed` 在启动时选择固定点云类型；Q/Esc 或关闭任一窗口退出。预览不修改曝光优先级，不提供运行中模式切换和逐帧诊断面板。`--save-dir PATH` 保存单帧原始 RGB-D 到一个 `rgbd_*.npz`，打印文件路径后退出；`--benchmark-frames N` 测量 N 个新深度帧；`--calibrate-table` 采集五帧拟合桌面并在终端明确确认后更新共享平面。这三项互斥，执行后退出。窗口需要桌面/OpenGL，代码清理测试不自动连接真实设备。
+实时相机查看使用 view_realsense.py：默认 RGB-D，`--cloud raw/processed` 在启动时选择固定点云类型；Q/Esc 或关闭任一窗口退出。预览不修改曝光优先级，不提供运行中模式切换和逐帧诊断面板。`--save-dir PATH` 保存单帧原始 RGB-D 到一个 `rgbd_*.npz`，打印文件路径后退出；`--benchmark-frames N` 测量 N 个新深度帧；`--calibrate-table` 采集五帧拟合桌面并在终端明确确认后更新共享平面。这三项互斥，执行后退出。窗口需要桌面/OpenGL，代码清理测试不自动连接真实设备。
 
-标定样本与原始快照均以独占方式创建 NPZ，拒绝覆盖。写入或关闭失败时清理本次新建文件；连续失败时保留首个异常和原 traceback，后续关闭或删除错误另记日志。
+view_pointcloud.py 提供独立诊断流程：先在终端选择是否拟合桌面，RGB-D 预览按 Enter 继续，随后处理一帧点云、打印点数和本帧处理耗时，关闭相机后静态查看结果；Q/Esc 或关窗退出。拟合结果可供本次处理使用，仅确认发布才改写共享桌面标定。`--config`、`--camera-calibration` 指定当前实验配置和外参。该流程复用当前点云算法和采集实现，预览不额外修改曝光设置。
+
+相机标定样本与 view_realsense 原始快照均以独占方式创建 NPZ，拒绝覆盖。写入或关闭失败时清理本次新建文件；连续失败时保留首个异常和原 traceback，后续关闭或删除错误另记日志。
 
 快照可用 `np.load(path, allow_pickle=False)` 读取：`rgb` 为 RGB uint8，`depth_aligned_to_color_raw` 为对齐到 color 网格的 uint16 原始计数；`K`、`distortion_model`、`distortion_coeffs` 描述该网格，`depth_scale_m_per_unit` 是每计数的米数。另保存实际 `camera_serial`、`source_timestamp_ns`、`source_clock` 和 depth/color frame number。来源时钟为 `host_monotonic_oldest_rgbd_receive`，时间取两通道首次主机接收时刻中的较早者，不是文件创建时间或曝光时间。深度换算为 `depth_raw.astype(np.float32) * np.float32(depth_scale_m_per_unit)`。原始快照无需外参、桌面文件或点云处理配置；需要基座点云时，离线显式加载对应 serial 的相机标定后重建。
 
@@ -139,11 +143,10 @@ CordVIP 流程为同一 Raw 首帧人工确认 mask → 顺序全部行 → 保�
 ```bash
 python scripts/cordvip/track_object.py --episode episodes/TASK/EPISODE --scene scene.json --with-hand --output outputs/scene_001
 python -m cordvip_geometry view outputs/scene_001
-python scripts/analyze_timing.py episodes/TASK/EPISODE
 ```
 
 物体生成先保存未定尺度 mesh，实测定尺度后才一次采样最终点/法向。初始 mask 仅可复用于相同 RGB-D、相机几何、行和来源时间。流程、模型安装与结果字段见 [CordVIP 文档](scripts/cordvip/README.md)。同行关联不证明手/相机物理同步，模型表面与语义点不代表实测接触。
 
-默认日志为终端 INFO、拒绝原因、完整异常 traceback 和简短段结果，需要留档时使用 shell 重定向。回放指标通过 evaluate_replay.py 显式计算，分析失败不回写控制结果；指标按索引比较实测轨迹，不代表目标跟踪或时间对齐。analyze_timing.py 只报告采样间隔、readout 和来源年龄，明确列出缺失/非法来源，不推断曝光或 SDK 延迟。几何环境检查使用独立命令 `python -m cordvip_geometry check`。
+默认日志为终端 INFO、拒绝原因、完整异常 traceback 和简短段结果，需要留档时使用 shell 重定向。几何环境检查使用独立命令 `python -m cordvip_geometry check`。
 
 开发约定见 [AGENTS.md](AGENTS.md)。

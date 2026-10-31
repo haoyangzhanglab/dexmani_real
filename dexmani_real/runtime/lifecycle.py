@@ -102,15 +102,10 @@ def close_runtime(
     """先撤销运动权限，再关闭设备、输入和传感进程。"""
     if deadline is None:
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
-    with runtime_state.motion_lock:
-        runtime_state.revoke_motion(
-            (
-                SafetyState.FAULT
-                if runtime_state.safety_state == SafetyState.FAULT
-                else SafetyState.DISARMED
-            ),
-            reason=RunEndReason.RUNTIME_SHUTDOWN,
-        )
+    runtime_state.revoke_motion(
+        SafetyState.DISARMED,
+        reason=RunEndReason.RUNTIME_SHUTDOWN,
+    )
     for stage, close in (
         ("robot_close", robot.close if robot is not None else None),
         ("keyboard_stop", keyboard.stop if keyboard is not None else None),
@@ -143,10 +138,9 @@ def close_runtime(
         sensors_clean
         and not runtime_state.error_state
         and not runtime_state.estop_request
-        and runtime_state.safety_state != SafetyState.FAULT
     )
     if not clean and not runtime_state.estop_request:
         runtime_state.mark_error()
     # DISARMED 只表示软件权限已撤销，不证明机器人已物理停止。
-    runtime_state.revoke_motion(SafetyState.DISARMED if clean else SafetyState.FAULT)
+    runtime_state.revoke_motion(SafetyState.DISARMED)
     return clean

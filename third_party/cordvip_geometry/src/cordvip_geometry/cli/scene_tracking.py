@@ -33,7 +33,7 @@ def run(args):
 
     from ..geometry import RectificationMaps
     from ..integrations.dexmani import RawHandCloudProvider, iter_raw_rows
-    from ..io import load_asset, new_output, write_json, write_scene_frame
+    from ..io import load_asset, new_output, write_json, write_npz
     from ..rgbd import rectify_frame
     from ..scene_tracking import SceneTracker, scene_arrays
     from ..segmentation import GroundedSAM2Segmenter
@@ -63,6 +63,12 @@ def run(args):
             if item.get("asset"):
                 mesh, points, normals, metadata = load_asset(item["asset"])
                 assets[name], asset_metadata[name] = (mesh, points, normals), metadata
+        if assets:
+            (output / "model_templates").mkdir()
+            for name, (_, points, normals) in assets.items():
+                write_npz(output / "model_templates" / f"{name}.npz", dict(
+                    points_object=points, normals_object=normals,
+                ))
         hand_provider = RawHandCloudProvider(reader, camera, num_points=args.hand_points) if args.with_hand else None
         palette = [(50, 220, 230), (220, 90, 230), (80, 220, 100), (240, 220, 70)]
         write_json(output / "run.json", dict(
@@ -95,7 +101,7 @@ def run(args):
             rgb, depth, _, _ = rectify_frame(frame, maps=maps)
             current = tracker.step(frame, rgb, depth, initial_masks=initial_masks if processed == 0 else None)
             hand = hand_provider.for_row(frame, timing) if hand_provider else None
-            write_scene_frame(output / "frames" / f"{frame.row_index:06d}.npz", scene_arrays(current, hand))
+            write_npz(output / "frames" / f"{frame.row_index:06d}.npz", scene_arrays(current, hand))
             processed += 1
             if args.max_frames is not None and processed >= args.max_frames and processed < source_rows:
                 break

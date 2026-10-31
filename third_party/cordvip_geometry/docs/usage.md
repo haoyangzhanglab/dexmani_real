@@ -80,21 +80,22 @@ python scripts/cordvip/track_object.py \
 | --- | --- |
 | `scene.json` | 一次保存对象 ID、role、asset、确认选择与标签 |
 | `run.json` | 实际参数、资产与相机/FK 来源、单位及数据语义 |
-| `frames/000000.npz` 等 | 每个已处理 Raw row 的源身份/时钟、状态、失败原因、候选/有效位姿、mask、observed/model 点、支持证据、法向与可选手点 |
+| `model_templates/<object_id>.npz` | 每个有资产对象的固定 `points_object`、`normals_object`，在处理帧前保存一次；mask-only 无模板 |
+| `frames/000000.npz` 等 | 每个已处理 Raw row 的源身份/时钟、状态、失败原因、候选/有效位姿、mask、observed 点、支持证据与可选手点/法向 |
 | `models.json` | 循环开始前保存已就绪模型来源、配置及加载事实；初始化失败时仍保存已取得的信息 |
 | `result.json` | completed / partial / interrupted / failed、已处理行数及清理错误 |
 | `sam2_worker.log` | 隔离分割进程的原始日志 |
 
-SAM 失败保留子进程原始 traceback，父进程错误指向该日志。FoundationPose、renderer 或其他技术异常直接结束任务为 failed，保留已写入的成功前缀和原始错误，不伪造当前行；当前 NPZ 写入失败时删除自己创建的未完成文件，已有结果拒绝覆盖。深度点或模型支持不足按算法形成 `POSE_LOST`，该行独立实测点仍保留。
+SAM 失败保留子进程原始 traceback，父进程错误指向该日志。FoundationPose、renderer 或其他技术异常直接结束任务为 failed，保留已写入的成功前缀和原始错误，不伪造当前行。模板与逐帧 NPZ 均独占创建；写入或关闭失败时删除自己创建的未完成文件，保留首错，已有文件拒绝覆盖。模板失败发生在处理帧前，不继续输出依赖模板的结果。深度点或模型支持不足按算法形成 `POSE_LOST`，该行独立实测点仍保留。
 
-逐行 NPZ 是唯一逐帧结果。文件名对应源 row，不是墙钟序号。对象字段使用 `toy__`、`basket__` 或单物体 `object__` 前缀，对象清单与 role 只存于 `scene.json`。每个实例分别保存 `pose_valid` 和 `observed_valid`；pose 无效时变换为 NaN、模型点为空，独立实测点仍可有效。`candidate_T_camera_object` 保存门控前候选（没有候选时为 NaN），不能视为有效位姿。已计算的 `model_supported_mask` 与 `observed_model_depth_residual_m` 在拒绝候选的失败帧中也保存；支持点数/比例只在实际完成模型深度比较时保存。
+逐行 NPZ 是唯一逐帧结果。文件名对应源 row，不是墙钟序号。对象字段使用 `toy__`、`basket__` 或单物体 `object__` 前缀，对象清单与 role 只存于 `scene.json`。每个实例分别保存 `pose_valid` 和 `observed_valid`；pose 无效时 `T_camera_object` 为 NaN，查看或分析时模型点为空，独立实测点仍可有效。`candidate_T_camera_object` 保存门控前候选（没有候选时为 NaN），不能代替有效位姿重建模型点。已计算的 `model_supported_mask` 与 `observed_model_depth_residual_m` 在拒绝候选的失败帧中也保存；支持点数/比例只在实际完成模型深度比较时保存。
 
-点云和法向仅保存 camera 表示：`hand_points_camera`、`hand_normals_camera` 及各对象的 `observed_points_camera`、`model_points_camera`、`model_normals_camera`。不再逐帧计算或写入对应 base 数组。每个 NPZ 保留 `K`；启用 `--with-hand` 时同一文件还含 `T_base_camera`、`hand_link_ids` 和关节状态，无需跨文件解析标定。需要 base 坐标时按原 float32 语义转换：
+模板中的 `points_object` 与 `normals_object` 保持资产载入后的原始顺序、float32、米制 object frame，不归一化、重采样或翻转。逐帧保留 `observed_points_camera`、可选的 `hand_points_camera`/`hand_normals_camera` 和有效 pose；不再计算或写入 `model_points_camera`、`model_normals_camera`。每个 NPZ 保留 `K`；启用 `--with-hand` 时同一文件还含 `T_base_camera`、`hand_link_ids` 和关节状态，无需跨文件解析标定。重建模型后若需 base 坐标，点保持 float32，法向保持矩乘的自然 dtype：
 
 ```python
 R, t = T_base_camera[:3, :3], T_base_camera[:3, 3]
 points_base = (points_camera @ R.T + t).astype(np.float32)
-normals_base = (normals_camera @ R.T).astype(np.float32)
+normals_base = normals_camera @ R.T
 ```
 
 ```bash
@@ -103,13 +104,24 @@ python -m cordvip_geometry view outputs/scene_001 --no-3d
 python -m cordvip_geometry view outputs/scene_001 --headless
 ```
 
-离线分析直接读取当前行，不重新执行模型：
+离线分析从输出内模板与有效 pose 重建，不访问原资产或重新执行模型。下面以有资产的单物体 `object` 为例；多物体分别使用自己的模板与字段前缀，mask-only 直接保留空模型点：
 
 ```python
 import numpy as np
 
+with np.load("outputs/scene_001/model_templates/object.npz", allow_pickle=False) as template:
+    points_object = template["points_object"]
+    normals_object = template["normals_object"]
+
 with np.load("outputs/scene_001/frames/000000.npz", allow_pickle=False) as row:
     valid = bool(row["object__pose_valid"])
+    if valid:
+        pose = row["object__T_camera_object"]
+        points_camera = (points_object @ pose[:3, :3].T + pose[:3, 3]).astype(np.float32)
+        normals_camera = normals_object @ pose[:3, :3].T
+    else:
+        points_camera = np.empty((0, 3), np.float32)
+        normals_camera = np.empty((0, 3), np.float32)
     candidate = row["object__candidate_T_camera_object"]  # 有限候选仍可能被门控拒绝
     error = str(row["object__error"])
     if "object__observed_model_depth_residual_m" in row:
@@ -117,7 +129,11 @@ with np.load("outputs/scene_001/frames/000000.npz", allow_pickle=False) as row:
         median_error = np.median(np.abs(residual[np.isfinite(residual)])) if np.isfinite(residual).any() else np.nan
 ```
 
-查看器按 `n`/Space 前进一行、`v` 切换 observed/model、`q`/`Q`/Esc 或关窗退出。每行只解压显示字段一次；开启 3D 时读取 observed/model camera 点供切换，`--no-3d` 不读取点云。`view --headless` 仅检查 RGB 的 uint8 网格、文件名对应的 row 及来源时间/时钟，不读取对象显示字段或生成 overlay，不加载 OpenCV/Open3D。新行更新 RGB 和几何，`v` 只更新几何，静止时仅轮询事件和渲染；不读取未展示的法向、候选位姿或残差。查看不重新执行模型。追踪退出后保留已写行及明确最终状态，离线分析直接读取 `scene.json` 和逐行 NPZ。
+有效模型点保持原 float32 输出；法向不额外转换 dtype，当前 float64 pose 下结果为 float64。无效 pose 的空数组沿用 float32。模板与逐帧 pose 均来自输出目录，`scene.json`/`run.json` 的原资产路径仅作来源记录。
+
+查看器按 `n`/Space 前进一行、`v` 切换 observed/model、`q`/`Q`/Esc 或关窗退出。每行只解压显示字段一次；3D 默认 observed，首次切换 model 才加载各声明资产的模板点，并用普通字典在本次查看中复用。只在新行或表示切换时重建需要显示的模型点；pose 无效或 mask-only 显示空点，声明资产缺模板明确报错。`--no-3d` 不读取模板或点云。`view --headless` 仅检查 RGB 的 uint8 网格、文件名对应的 row 及来源时间/时钟，不读取 scene/run、模板、对象字段或生成 overlay，不加载 OpenCV/Open3D。新行更新 RGB 和几何，`v` 只更新几何，静止时仅轮询事件和渲染；不读取未展示的法向、候选位姿或残差。查看不访问 Raw、mesh、URDF、FK 或模型环境。
+
+新布局不自动迁移历史结果。有资产对象的 model 模式要求 `model_templates/<object_id>.npz`，不会回退读取旧帧内的两个派生数组；mask-only 无需模板。旧结果仍可按原格式用 NumPy 分析。满足现有字段要求的历史结果仍可用 headless、二维叠加或 observed 模式查看。
 
 ## 准备物体资产
 

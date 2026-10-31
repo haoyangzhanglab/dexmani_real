@@ -55,7 +55,7 @@ python scripts/cordvip/track_object.py \
 
 `role` 是一次保存的标签，不改变算法。省略某个 `asset` 时，该对象只输出连续 mask 与实测深度点，不估计 pose；全部省略时不要求 FoundationPose。无窗口运行要求每个实例都有当前首帧的确认选择，不会自动接受最高分候选。
 
-默认顺序处理全部 Raw 行，不按墙钟跳帧。`--max-frames N` 显式限制处理前缀，结果标为 partial。输出目录必须尚不存在；每行结果只保存为 `frames/000000.npz` 等，源 row ID、时间和时钟保留；不再生成 `records.jsonl` 或默认分析报告。查看结果是独立步骤：
+默认顺序处理全部 Raw 行，不按墙钟跳帧。`--max-frames N` 显式限制处理前缀，结果标为 partial。输出目录必须尚不存在；处理前将各资产的固定点/法向写入 `model_templates/<object_id>.npz` 一次，每行结果保存为 `frames/000000.npz` 等，源 row ID、时间和时钟保留。逐帧保存有效/候选 pose 与实测数据，不再派生或保存模型点/法向。mask-only 不生成模板。查看结果是独立步骤：
 
 ```bash
 python -m cordvip_geometry view outputs/scene_001
@@ -64,11 +64,11 @@ python -m cordvip_geometry view outputs/scene_001 --no-3d
 python -m cordvip_geometry view outputs/scene_001 --headless
 ```
 
-查看器用 `n`/Space 前进一行，`v` 只更新 observed/model 点云，`q`/`Q`/Esc 或关窗退出；静止时仅轮询事件和渲染。`--no-3d` 不解压点云，`view --headless` 只检查 RGB 和来源行/时钟，不加载 OpenCV/Open3D。查看不重新执行感知模型。
+查看器用 `n`/Space 前进一行，`v` 只更新 observed/model 点云，`q`/`Q`/Esc 或关窗退出；首次 model 切换加载输出内模板，本次查看复用。静止时仅轮询事件和渲染。`--no-3d` 不读取模板或解压点云，`view --headless` 只检查 RGB 和来源行/时钟，不加载 OpenCV/Open3D。查看无需原资产、Raw 或模型环境；资产路径只作来源记录。
 
-实测点来自当前 mask 与深度，模型点来自固定资产与有效 pose；深度支持参与 `POSE_LOST` 判定。正常 pose 丢失仍保留独立语义实测点，以及已计算的支持掩码/残差和门控前候选位姿；候选不等于有效位姿。模型或 renderer 的技术异常结束任务为 failed，并保留已写入前缀。`--with-hand` 直接使用同一 Raw 行的 19 维实测关节生成 FK 手点，不使用 action，不证明物理同步，也不代表通过训练时序准入。法向继续保存。
+实测点来自当前 mask 与深度，模型点由模板与有效 pose 重建；深度支持参与 `POSE_LOST` 判定。正常 pose 丢失仍保留独立语义实测点，以及已计算的支持掩码/残差和门控前候选位姿；候选不等于有效位姿，无效 pose 和 mask-only 在 model 模式显示空点。模型或 renderer 的技术异常结束任务为 failed，并保留已写入前缀。`--with-hand` 直接使用同一 Raw 行的 19 维实测关节生成 FK 手点，不使用 action，不证明物理同步，也不代表通过训练时序准入。
 
-逐帧点云和法向仅存 camera 坐标；同一 NPZ 保留 `K`，手几何启用时还保留 `T_base_camera`、link IDs 与关节状态。需要 base 坐标时，从 `T_base_camera` 取 `R = T[:3, :3]`、`t = T[:3, 3]`，点用 `(points_camera @ R.T + t).astype(np.float32)`，法向用 `(normals_camera @ R.T).astype(np.float32)`。
+模板的 `points_object`、`normals_object` 保持资产载入后的顺序、float32 和米制 object frame；camera 模型点按原公式变换为 float32，法向矩乘保留自然 dtype。同一帧 NPZ 保留 `K`，手几何启用时还保留 camera 手点/法向、`T_base_camera`、link IDs 与关节状态。NumPy 重建示例及旧结果读取边界见[使用文档](../../third_party/cordvip_geometry/docs/usage.md#输出与查看)。
 
 默认 `--sam-variant small`；large 对照先下载对应权重，再指定 `--sam-variant large`。自训模型须同时指定 `--sam-config` 与 `--sam-checkpoint`。SAM RPC 隔离继续保留；模型回归、显存及吞吐需在实际 GPU 上验证。
 

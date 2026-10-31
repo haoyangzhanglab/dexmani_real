@@ -46,6 +46,8 @@ class ImageViewer:
             return ["closed"]
         if key in (ord("q"), ord("Q")):
             return ["q"]
+        if key in (10, 13):
+            return ["enter"]
         return ["esc"] if key == 27 else []
 
     def close(self) -> None:

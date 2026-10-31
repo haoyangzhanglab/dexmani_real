@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 
 from .foundationpose import MIN_DEPTH_PIXELS, prepare_tracking_frame
-from .geometry import transform_points
 from .model_depth import ModelDepthRenderer, camera_rays
 from .scene_geometry import add_model_depth_support, extract_scene_clouds
 
@@ -28,7 +27,6 @@ class SceneTracker:
         from .foundationpose import FoundationPosePlusTracker
 
         self.segmenter = segmenter
-        self.assets = assets
         self.pixel_stride = pixel_stride
         self.depth_tolerance_m = depth_tolerance_m
         self.min_matched_pixels = min_matched_pixels
@@ -37,7 +35,7 @@ class SceneTracker:
         self.lost_objects = {}
         self.directions = None
         shared = None
-        for name, (mesh, points, normals) in self.assets.items():
+        for name, (mesh, _, _) in assets.items():
             tracker = FoundationPosePlusTracker(
                 foundationpose_root, mesh, Path(debug_dir) / name, shared_with=shared
             )
@@ -48,7 +46,7 @@ class SceneTracker:
     def step(self, frame, rgb, depth_m, *, initial_masks=None):
         K = frame.K
         first = initial_masks is not None
-        if first and not set(self.assets).issubset(initial_masks):
+        if first and not set(self.trackers).issubset(initial_masks):
             raise ValueError("Every pose asset requires a named initial instance mask")
         masks = (
             self.segmenter.initialize(rgb, initial_masks)
@@ -102,26 +100,14 @@ class SceneTracker:
                 self.lost_objects[name] = "Semantic depth/model disagreement; pose lost"
                 pose = None
             pose_valid = pose is not None
-            points = (
-                transform_points(self.assets[name][1], pose)
-                if pose_valid
-                else np.empty((0, 3), np.float32)
-            )
-            normals = (
-                self.assets[name][2] @ pose[:3, :3].T
-                if pose_valid
-                else np.empty((0, 3), np.float32)
-            )
             objects[name] = dict(
                 cloud=cloud,
                 pose=pose,
                 pose_valid=pose_valid,
-                model_points_camera=points,
-                model_normals_camera=normals,
                 state=(
                     "TRACKING"
                     if pose_valid
-                    else "POSE_LOST" if name in self.assets else "OBSERVED_ONLY"
+                    else "POSE_LOST" if name in self.trackers else "OBSERVED_ONLY"
                 ),
                 error=self.lost_objects.get(name),
                 candidate_pose=poses.get(name),
@@ -140,7 +126,7 @@ class SceneTracker:
 
 
 def scene_arrays(result, hand=None):
-    """仅编码当前已处理 Raw 行；对象角色保存在一次性的 scene.json。"""
+    """编码当前 Raw 行；固定模型保存在 model_templates，模型逐行仅保存位姿。"""
     frame = result["frame"]
     payload = dict(
         source_id=frame.source_id,
@@ -177,8 +163,6 @@ def scene_arrays(result, hand=None):
             candidate_T_camera_object=(
                 item["candidate_pose"] if item["candidate_pose"] is not None else np.full((4, 4), np.nan)
             ),
-            model_points_camera=item["model_points_camera"],
-            model_normals_camera=item["model_normals_camera"],
             observed_points_camera=cloud.observed_points_camera,
             observed_colors=cloud.observed_colors,
             semantic_mask=cloud.semantic_mask,

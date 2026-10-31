@@ -17,7 +17,6 @@ class SafetyState(IntEnum):
     DISARMED = 0
     ARMED = 1
     RUNNING = 2
-    FAULT = 3
 
 
 class RunEndReason(IntEnum):
@@ -81,8 +80,9 @@ class SessionState:
 
     def arm(self) -> None:
         with self.motion_lock:
-            if not self.requests_allow_motion() or not self.revoke_motion():
+            if not self.requests_allow_motion():
                 raise RuntimeError("arming rejected")
+            self.revoke_motion()
 
     def begin_motion(self) -> tuple[int, int] | None:
         with self.motion_lock:
@@ -111,23 +111,18 @@ class SessionState:
         *,
         reason=RunEndReason.EXECUTOR_BOUNDARY,
         expected_run_id=None,
-    ) -> bool:
+    ) -> None:
         with self.motion_lock:
             if expected_run_id is not None and self.run_id != expected_run_id:
-                return False
-            if self.safety_state == SafetyState.FAULT and new_state == SafetyState.ARMED:
-                return False
+                return
             if self.safety_state == SafetyState.RUNNING:
                 if self.estop_request:
                     reason = RunEndReason.ESTOP
-                elif new_state == SafetyState.FAULT and reason == RunEndReason.EXECUTOR_BOUNDARY:
-                    reason = RunEndReason.HARDWARE_FAULT
                 self.run_ended_id = self.run_id
                 self.run_ended_reason = reason
             self.stop_signal.set()
             self.run_signal.value += 1
             self.safety_state = new_state
-            return True
 
     def request_emergency_stop(self):
         # 先通知 SDK 所属进程，再等待本地状态锁。
@@ -146,7 +141,7 @@ class SessionState:
                 )
 
     def mark_error(self):
-        """会话错误独立于硬件 FAULT 锁存。"""
+        """保留会话错误并通知执行器停止。"""
         with self.motion_lock:
             self.error_state = True
             self.stop_signal.set()

@@ -38,7 +38,7 @@ def next_tick_ns(planned_ns, period_ns, now_ns):
 
 
 def sampling_clock_ns(control_hz):
-    """整数采样周期及网格容差；训练导出和严格回放分别选择时钟。"""
+    """训练导出、严格回放与执行共用的整数 control 周期及网格容差。"""
     if not math.isfinite(control_hz) or control_hz <= 0:
         raise ValueError("control_hz must be finite and positive")
     dt_ns = round(1e9 / control_hz)

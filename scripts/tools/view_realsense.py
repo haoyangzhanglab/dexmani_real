@@ -185,7 +185,7 @@ def calibrate_table_plane(
         save_table_plane(plane_path, fit)
         print("  Published table calibration.")
     else:
-        print("  Calibration file unchanged; exiting without publication.")
+        print("  Calibration file unchanged.")
     return fit.plane_abcd
 
 

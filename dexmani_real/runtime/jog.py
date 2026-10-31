@@ -36,18 +36,11 @@ class CartesianJog:
         self.command_pose = self.command_qpos = None
 
     def stop(self, robot, state):
-        revoked = state.revoke_motion()
+        state.revoke_motion()
         try:
             robot.stop()
         finally:
             self.clear_reference()
-        return revoked
-
-    def pause(self, robot, state):
-        try:
-            return self.stop(robot, state)
-        finally:
-            self.blocked_until_release = True
 
     def prepare(self, robot, state):
         """仅在进入会话或真实停止后准备；普通按键变化不重新准备。"""

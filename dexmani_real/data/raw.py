@@ -452,22 +452,25 @@ class RawReader:
         return self["timing/rows"].fields(tuple(fields))[:]
 
     def validate_replay_timing(self):
-        """物理回放的严格整段准入；训练导出另行选择连续前缀。"""
+        """按 control 时钟严格准入整段回放，独立检查真实观测与来源时间。"""
         chunk_frames = 4096
         timing = self["timing/rows"]
         fields = ("observation_ns", "control_ns", "arm_ns", "hand_ns")
         dt_ns, tolerance_ns = sampling_clock_ns(self.control_hz)
-        first_observation = None
+        first_control = None
         for start in range(0, self.num_frames, chunk_frames):
             first, end = max(0, start - 1), min(start + chunk_frames, self.num_frames)
             rows = timing.fields(fields)[first:end]
+            control = rows["control_ns"]
             observation = rows["observation_ns"]
+            if np.any(control <= 0) or np.any(np.diff(control) <= 0):
+                raise ValueError("control clocks must be positive and strictly increasing")
             if np.any(observation <= 0) or np.any(np.diff(observation) <= 0):
                 raise ValueError("observation clocks must be positive and strictly increasing")
-            if first_observation is None:
-                first_observation = int(observation[0])
-            intervals = np.diff(observation)
-            deviations = observation - first_observation - np.arange(first, end) * dt_ns
+            if first_control is None:
+                first_control = int(control[0])
+            intervals = np.diff(control)
+            deviations = control - first_control - np.arange(first, end) * dt_ns
             bad = np.abs(deviations) > tolerance_ns
             bad[1:] |= np.abs(intervals - dt_ns) > tolerance_ns
             if bad.any():
@@ -478,7 +481,13 @@ class RawReader:
                     f"nominal_ns={dt_ns}, grid_deviation_ns={deviations[row]:.0f}, "
                     f"tolerance_ns={tolerance_ns}"
                 )
-            for name in fields[1:]:
+            if np.any(observation < control):
+                raise ValueError("observation clocks must not precede control clocks")
+            if np.any(observation - control >= dt_ns):
+                raise ValueError("observation readout must be shorter than one control period")
+            if np.any(observation[:-1] >= control[1:]):
+                raise ValueError("observations must not overlap the next control sample")
+            for name in ("arm_ns", "hand_ns"):
                 values = rows[name]
                 if np.any(values <= 0) or np.any(values > observation):
                     raise ValueError(f"invalid consumed source clock: {name}")

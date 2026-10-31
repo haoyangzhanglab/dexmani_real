@@ -6,6 +6,8 @@ import logging
 
 import numpy as np
 
+from .geometry import transform_points
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,11 +42,20 @@ def scene_display(frame, object_ids, colors) -> np.ndarray:
     return np.ascontiguousarray(overlay[..., ::-1])
 
 
-def scene_clouds(frame, object_ids, colors, *, show_model=False) -> tuple[np.ndarray, np.ndarray]:
-    """只拼接当前选择的 camera 点云；切换表示时复用已生成的 RGB 叠加。"""
+def scene_clouds(
+    frame, object_ids, colors, *, model_templates: dict[str, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """None 选择实测点，模板字典选择由有效位姿重建的模型点。"""
     points, point_colors = [], []
     for name in object_ids:
-        cloud = frame[name + ('__model_points_camera' if show_model else '__observed_points_camera')]
+        if model_templates is not None:
+            cloud = (
+                transform_points(model_templates[name], frame[name + '__T_camera_object'])
+                if name in model_templates and bool(frame[name + '__pose_valid'])
+                else np.empty((0, 3), np.float32)
+            )
+        else:
+            cloud = frame[name + '__observed_points_camera']
         points.append(cloud)
         point_colors.append(np.tile(np.asarray(colors[name]) / 255., (len(cloud), 1)))
     if 'hand_points_camera' in frame:

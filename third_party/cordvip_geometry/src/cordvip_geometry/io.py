@@ -169,8 +169,8 @@ def load_initial_selection(directory, frame, maps):
     return mask
 
 
-def write_scene_frame(path, arrays):
-    """独占写入一行；失败移除自己创建的未完成文件，不覆盖已有行。"""
+def write_npz(path, arrays):
+    """独占写入 NPZ；失败移除自己创建的未完成文件，不覆盖已有文件。"""
     import numpy as np
 
     path = Path(path)
@@ -186,10 +186,10 @@ def write_scene_frame(path, arrays):
         if failure is None:
             failure = error
         else:
-            logger.exception("scene frame close also failed: %s", path)
+            logger.exception("NPZ close also failed: %s", path)
     if failure is not None:
         try:
             path.unlink()
         except OSError:
-            logger.exception("unfinished scene frame removal also failed: %s", path)
+            logger.exception("unfinished NPZ removal also failed: %s", path)
         raise failure
