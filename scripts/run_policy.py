@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="latest",
         help=(
             "latest (default), best, milestone percentage (e.g. 80pct), "
-            "or an explicit checkpoint path (relative paths use the current working directory)"
+            "or a checkpoint file path (relative paths use the experiment's checkpoints directory)"
         ),
     )
     parser.add_argument(

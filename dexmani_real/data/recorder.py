@@ -236,12 +236,16 @@ class EpisodeRecorder:
                 else:
                     writer.flush()
             except BaseException as exc:
+                if self.error is not None and exc is not self.error:
+                    logger.exception("Additional recording worker failure")
                 self.store_error(exc)
             finally:
                 writer.close()
             if finish is not None and self.error is None:
                 self.closed_counts = counts
         except BaseException as exc:
+            if self.error is not None and exc is not self.error:
+                logger.exception("Recording worker close also failed")
             self.store_error(exc)
         finally:
             self.ready.set()

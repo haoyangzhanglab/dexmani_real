@@ -224,6 +224,27 @@ class RecorderOwnershipTests(unittest.TestCase):
         self.assertTrue(writer.closed)
         self.assertTrue(self.recorder.staging_path.exists())
 
+    def test_secondary_worker_close_error_is_visible_without_replacing_primary(self):
+        writer = _Writer()
+
+        def fail_append(*args):
+            raise OSError("primary append failure")
+
+        def fail_close():
+            raise OSError("secondary close failure")
+
+        writer.append_frame, writer.close = fail_append, fail_close
+        with patch("dexmani_real.data.recorder.RawWriter", return_value=writer), \
+                self.assertLogs("dexmani_real.data.recorder", level="ERROR") as recorded:
+            self.start()
+            self.recorder.append(raw_row(0))
+            with self.assertRaisesRegex(RecordingError, "primary append failure"):
+                self.recorder.finish(save=True, reason="failed")
+        self.assertEqual(str(self.recorder.error), "primary append failure")
+        self.assertIn("secondary close failure", "\n".join(recorded.output))
+        self.assertIsNone(self.recorder.published_path)
+        self.assertTrue(self.recorder.staging_path.exists())
+
     def test_finish_queue_timeout_cannot_publish_later(self):
         entered, release = threading.Event(), threading.Event()
         writer = _Writer()

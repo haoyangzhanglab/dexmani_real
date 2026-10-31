@@ -1,6 +1,7 @@
 """Raw 顺序离线流程、首帧来源与 observed/pose 独立语义。"""
 
 import contextlib
+from concurrent.futures import CancelledError
 from dataclasses import replace
 import io
 import json
@@ -27,6 +28,7 @@ from cordvip_geometry.scene_tracking import SceneTracker, scene_arrays
 from cordvip_geometry.segmentation import GroundedSAM2Segmenter
 from cordvip_geometry.segmentation_protocol import send
 from cordvip_geometry.segmentation_protocol import receive
+from cordvip_geometry.sam2_engine import prune_state
 import cordvip_geometry.cli.check_tracking
 import cordvip_geometry.sam2_config
 import cordvip_geometry.segmentation
@@ -283,6 +285,41 @@ class ScenePoseTests(unittest.TestCase):
 
 
 class SegmentationReplyTests(unittest.TestCase):
+    def test_cancelled_late_reply_cannot_enter_a_new_session(self):
+        segmenter = GroundedSAM2Segmenter("python", "source", "checkpoint", sam_config="config", dino_weights="weights", log_path="unused.log")
+        segmenter._process = unittest.mock.Mock(stdin=io.BytesIO())
+        frame_key = {"row_index": 3, "timestamp_ns": 100}
+
+        def late_reply(stream):
+            segmenter.cancel()
+            return dict(session=segmenter._session, request=1, frame_key=frame_key), {}
+
+        with patch.object(segmenter, "signal_group") as stop, patch("cordvip_geometry.segmentation.receive", side_effect=late_reply):
+            with self.assertRaisesRegex(CancelledError, "cancelled SAM2 reply"):
+                segmenter.call("track", frame_key=frame_key)
+            stop.assert_called_once()
+        following = GroundedSAM2Segmenter("python", "source", "checkpoint", sam_config="config", dino_weights="weights", log_path="unused.log")
+        self.assertNotEqual(following._session, segmenter._session)
+        self.assertFalse(following._cancelled.is_set())
+        self.assertIsNone(following._ids)
+
+    def test_pruning_keeps_conditioning_and_the_required_temporal_window(self):
+        def outputs():
+            return dict(cond_frame_outputs={0: "initial"}, non_cond_frame_outputs={index: index for index in range(1, 11)})
+
+        state = dict(
+            output_dict=outputs(), output_dict_per_obj={"one": outputs(), "two": outputs()},
+            temp_output_dict_per_obj={"one": outputs()},
+            frames_already_tracked={index: index for index in range(11)},
+            consolidated_frame_inds={"non_cond_frame_outputs": set(range(1, 11))},
+        )
+        prune_state(state, frame_index=10, history_frames=4)
+        for result in [state["output_dict"], *state["output_dict_per_obj"].values(), *state["temp_output_dict_per_obj"].values()]:
+            self.assertEqual(result["cond_frame_outputs"], {0: "initial"})
+            self.assertEqual(set(result["non_cond_frame_outputs"]), {7, 8, 9, 10})
+        self.assertEqual(set(state["frames_already_tracked"]), {0, 7, 8, 9, 10})
+        self.assertEqual(state["consolidated_frame_inds"]["non_cond_frame_outputs"], {7, 8, 9, 10})
+
     def test_worker_error_preserves_its_original_traceback_channel(self):
         request = io.BytesIO()
         send(request, dict(session="test", request=2, frame_key=None, operation="track"))
