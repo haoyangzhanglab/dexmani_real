@@ -98,7 +98,7 @@ VR 手部重定向使用固定骨长标定，联合拟合 XHand 可对应的近�
 
 `meta/termination_details` 保存预计算耗时、`teleop_anchor` 初始观测，以及录制期间处理的按键和失败时的 `control_timing`。事件时间戳均为主机单调时钟；`submit_start_ns/submit_end_ns` 表示父进程提交调用，不代表机械臂到达目标。终端按键日志记录处理时的阶段与运行编号。
 
-键盘和相机标定在显示操作提示前完成 jog 准备。普通按键变化只更新目标；松键时从当前伺服参考减速到零并保持，不停机重启，也不继续追赶积累的远处目标。IK 拒绝后减速保持，松开全部 jog 键才能恢复。HOME、标定采样、退出和急停仍执行真正停止，恢复连续控制时重新准备。按键在控制循环中采样，完全落在两次采样之间的极短按键不会补发运动。
+键盘点动在显示操作提示前完成 jog 准备。普通按键变化只更新目标；松键时从当前伺服参考减速到零并保持，不停机重启，也不继续追赶积累的远处目标。IK 拒绝后减速保持，松开全部 jog 键才能恢复。HOME、退出和急停仍执行真正停止，恢复连续控制时重新准备。按键在控制循环中采样，完全落在两次采样之间的极短按键不会补发运动。
 
 机械臂连续控制采用 Mode 1 与 Ruckig 轨迹；prepare 切换模式并确认实测停稳后，控制端再读取有效观测。实际控制、策略输入和到达确认检查反馈时效。按 R 回零时先输出 `Returning home...`，取消或失败时保留具体原因。HOME 使用 Mode 0 执行路径并确认到达，完成后停止收尾，下次连续控制重新 prepare。
 
@@ -116,7 +116,7 @@ HOME 的 `HomePlanner` 使用 `environment.table`、标定平面和 `soft_cleara
 
 `environment.table_plane_path` 是 HOME 和点云共用的桌面标定来源，独立于 HOME 碰撞盒体参数；`pointcloud.remove_table` 只裁剪观测点云，不执行机器人碰撞检查。
 
-键盘与标定 jog 的目标执行期限均从机械臂反馈的来源时间计算，读取缓存不会延长目标寿命。机械臂进程独立检查目标执行期限、机械臂反馈时效和控制器状态，HOME 另有执行期限。执行或反馈故障会保留原始原因，停止、断开设备并退出机械臂进程。父进程阻塞时，机械臂仍按这些条件处理停止；软件期限不代表物理停止延迟。
+键盘 jog 的目标执行期限从机械臂反馈的来源时间计算，读取缓存不会延长目标寿命。机械臂进程独立检查目标执行期限、机械臂反馈时效和控制器状态，HOME 另有执行期限。执行或反馈故障会保留原始原因，停止、断开设备并退出机械臂进程。父进程阻塞时，机械臂仍按这些条件处理停止；软件期限不代表物理停止延迟。
 
 策略执行与轨迹逐帧回放每次提交目标时设置 2 秒执行期限；持续收到新目标就刷新期限，断流后由机械臂进程检查并停止。策略等待下一动作也使用这一预算，实验总时长仍限制执行期限。每轮首次历史准备另有 `(n_obs_steps-1)*dt + 2 秒` 的有限预算，首次提交预测后开始独立的 2 秒推理等待；实验总时长从 RUNNING 准入起计算，包含本轮历史准备。sync 收到预测后开始完整控制周期，来源时效与总期限仍生效。回放开始前的手部准备另按到位等待期限保持机械臂。
 
@@ -134,13 +134,22 @@ arm 的独立期限不能终止父进程内阻塞的 hand SDK。此次只读核�
 | --- | --- |
 | 相机外参标定 | [calibrate_camera.py](scripts/calibrate_camera.py) |
 | VR 朝向标定 | [calibrate_vr_heading.py](scripts/calibrate_vr_heading.py) |
-| RealSense 预览 | [view_realsense.py](scripts/tools/view_realsense.py) |
-| 点云预览与桌面标定 | [view_pointcloud.py](scripts/tools/view_pointcloud.py) |
+| RGB-D、点云预览与桌面标定 | [view_realsense.py](scripts/tools/view_realsense.py) |
 | XHand 状态与动作诊断 | [control_xhand.py](scripts/tools/control_xhand.py) |
 
 默认标定参数位于 [config/calibration_data/](dexmani_real/config/calibration_data/)，包含相机外参、桌面平面和 VR 朝向三个 JSON。相机标定实现位于 [utils/camera_calibrate/](dexmani_real/utils/camera_calibrate/)，桌面与 VR 标定辅助代码分别位于 [utils/table_plane.py](dexmani_real/utils/table_plane.py) 和 [utils/vr_heading.py](dexmani_real/utils/vr_heading.py)。
 
-相机标定前须拆除 XHand，或将其固定在配置的 HOME 姿态。SDK 接受命令不代表机器人已到位或停稳。
+相机标定分为只读采样与离线求解。标记须相对 EEF 刚性固定，使用多种姿态提供充分旋转激励。先用厂商示教或独立的 `keyboard_teleop.py` 摆位，停止并退出控制连接后再采样，不能同时运行控制连接。SDK 接受命令不代表机器人已到位或停稳。
+
+```bash
+python scripts/calibrate_camera.py collect --config experiments/default.py --output calibration_samples/run_001
+python scripts/calibrate_camera.py solve calibration_samples/run_001 --output camera_calibration.json
+# 需要离线剔除时，按原始 sample ID 指定，例如 --exclude 3；可重复指定不同 ID。
+```
+
+collect 保持相机连接，每次终端 Enter 才建立机械臂只读连接，采样后立即断开；Q 结束。它只调用 xArm 的 connect/read/close，不启用运动、切模式、配置运动参数或执行 HOME/jog/stop。每组保留 5 个新鲜且帧号递增的 RGB、检测结果、来源时间、前后及逐帧实测关节，并检查速度和前后漂移；仍采用原有至少 2 帧成功检测的聚合门槛。新目录中的 `capture.json` 保存实际相机与静止条件，`samples/000000.npz` 等保存原 sample ID 与原始事实，已有目录不追加或覆盖。
+
+solve 不连接设备，按原始 ID 剔除样本并复用原 eye-to-hand 数学。`camera_calibration.result.json` 保存使用/排除 ID、逐样本残差、最差原始 ID 和质量结果；仅合格解更新按 serial 索引的外参 JSON，保留其他 serial。任何写入失败直接报错。
 
 RealSense 和点云诊断使用 OpenCV RGB-D 面板及 Open3D 点云窗口，需可用的桌面显示环境及 OpenGL 上下文；上述 `visualization` 安装项包含 Open3D 和离线查看所用的 Rerun。
 
@@ -150,9 +159,9 @@ RealSense 和点云诊断使用 OpenCV RGB-D 面板及 Open3D 点云窗口，需
 
 相机时间取 depth/color 各自首次主机回调接收时间中的较早者，并随帧进入单个最新帧槽；出队及另一通道更新不会刷新旧通道年龄。这只覆盖回调接收后的年龄，不是曝光时间，也未覆盖设备/SDK 到回调之前的延迟。此次环境的 `pyrealsense2` 为 2.54.2；实际设备、对齐 backend、depth→color 外参及 aligned-depth Z 近似误差尚未测量，继续保留现行离线/在线表示。需要改投影时须先满足论文精度条件并同步重新导出，不能单改部署。曝光恢复目前由无设备测试验证了请求及异常控制流，跨 pipeline 持久化效果仍待设备确认。
 
-- RealSense：窗口内 `P` 开关点云、`S` 切换 raw/processed、`F` 仅冻结点云、`D` 切换 Jet/灰度、`R` 重置显示、`C` 打印配置、`A` 切换曝光优先级、`Q/Esc` 退出。关闭 RGB-D 窗口退出程序；关闭点云窗口仅关闭点云，可按 `P` 重开。退出时恢复原曝光优先级。
-- 点云诊断：RGB-D 窗口按 Enter 继续，`Q/Esc` 或关闭窗口取消；桌面标定和发布确认在终端进行。采集、快照和 benchmark 完成后即释放相机，最终静态点云窗口显示工作空间框及基座/相机坐标轴。
-- 相机标定：保留全局点动按键；Space 采样、Enter 求解并在质量合格后保存、Backspace 撤销、X 删除最差样本。预览显示检测、采样、求解和保存状态；关闭预览窗口请求退出，采样、求解/发布检查和回零等待共用同一取消入口。
+- RGB-D 与点云共用 `python scripts/tools/view_realsense.py --config experiments/default.py`；`--cloud raw` 或 `--cloud processed` 直接打开相应点云视图。窗口内 `P` 开关点云、`S` 切换 raw/processed、`F` 仅冻结点云、`D` 切换 Jet/灰度、`R` 重置显示、`C` 打印配置、`A` 切换曝光优先级、`Q/Esc` 退出。关闭 RGB-D 窗口退出程序；关闭点云窗口仅关闭点云，可按 `P` 重开。退出时恢复原曝光优先级。
+- 同一入口的 `--calibrate-table` 在预览前用五个新深度帧拟合桌面，终端确认后才更新共享标定文件；不发布时本次预览仍使用新拟合值。`--save-dir PATH` 保存首个预览帧的 RGB-D、raw/processed 点云、原来源时间及帧号；`--benchmark-frames N` 才显式运行 N 帧测量。阶段间复用同一相机连接，退出预览时释放相机；不再有独立点云诊断入口。
+- 相机标定：终端 Enter 只读采样，Q 结束；样本剔除与求解在独立 solve 命令中完成。
 - 离线 episode：左侧为基座场景/点云标签页和 RGB，中间为 Depth，右侧为 State、Action、Contact Force 曲线。曲线按列批量发送，与图像共用 `step` 和 `time` 时间轴。
 
 ## 模型与手点云

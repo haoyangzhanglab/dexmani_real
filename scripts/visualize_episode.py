@@ -7,6 +7,7 @@ import argparse
 import logging
 import os
 import time
+from itertools import islice
 from pathlib import Path
 
 os.environ.setdefault("RUST_LOG", "error")
@@ -20,7 +21,6 @@ from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
 from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.perception.hand_cloud import hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
-from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.visualization.rerun import (
     episode_blueprint,
@@ -85,7 +85,6 @@ class EpisodeVisualizer:
         self,
         episode_path: str,
         *,
-        fingertip_link_names: tuple[str, ...],
         table_plane_path: str | Path | None,
         max_frames: int | None = None,
         pointcloud_config: PointCloudConfig | None = None,
@@ -95,7 +94,6 @@ class EpisodeVisualizer:
         self.rr = rr
 
         episode_name = Path(episode_path).stem
-        self.fingertip_link_names = fingertip_link_names
         self.reader = RawReader(episode_path)
         try:
             self.timestamps_s = self.reader.timestamps_s
@@ -114,8 +112,6 @@ class EpisodeVisualizer:
                 raise ValueError("episode must contain at least one row")
             if max_frames is not None:
                 self.frame_count = min(self.frame_count, max_frames)
-            self.rgb_frames = iter(self.reader.iter_rgb_frames())
-            self.rgb_index = -1
             self.camera_model = self.reader.read_camera()
             self.T_xarm_base_from_color = self.camera_model.T_xarm_base_from_color
             if self.T_xarm_base_from_color is None:
@@ -198,7 +194,7 @@ class EpisodeVisualizer:
             poses = eef_poses(arm[arm_valid], arm_fk=arm_fk)
             state["arm_ee"][arm_valid] = encode_eef_pose(poses)
         if np.any(hand_valid):
-            hand_fk = HandFK(self.fingertip_link_names)
+            hand_fk = HandFK()
             state["hand_fingertip"][hand_valid] = hand_geometry(
                 poses[hand_valid[arm_valid]],
                 hand[hand_valid],
@@ -222,10 +218,10 @@ class EpisodeVisualizer:
             )
         log_camera_geometry(self.camera_model.color, self.T_xarm_base_from_color)
 
-    def log_step(self, step_idx: int) -> None:
+    def log_step(self, step_idx: int, rgb: np.ndarray) -> None:
         self.rr.set_time_sequence("step", step_idx)
         self.rr.set_time_seconds("time", float(self.timestamps_s[step_idx]))
-        rgb, depth = self.log_camera(step_idx)
+        depth = self.log_camera(step_idx, rgb)
         self.log_pointcloud(rgb, depth)
         fingertips = self.state["hand_fingertip"][step_idx]
         log_points(
@@ -238,19 +234,16 @@ class EpisodeVisualizer:
             colors=[EEF_COLOR], radii=0.020,
         )
 
-    def log_camera(self, step_idx: int) -> tuple[np.ndarray, np.ndarray]:
-        if step_idx != self.rgb_index + 1:
-            raise ValueError("viewer reads frames sequentially")
-        rgb = next(self.rgb_frames, None)
-        if rgb is None:
-            raise ValueError(f"RGB missing at frame {step_idx}")
-        self.rgb_index = step_idx
+    def log_camera(self, step_idx: int, rgb: np.ndarray) -> np.ndarray:
+        color = self.camera_model.color
+        if rgb.dtype != np.uint8 or rgb.shape != (color.height, color.width, 3):
+            raise ValueError(f"RGB shape or dtype invalid at frame {step_idx}")
         depth = np.asarray(self.reader["depth"][step_idx])
         log_rgbd(
             rgb, depth, depth_scale_m=self.camera_model.depth_scale_m,
             depth_range_m=(0, 10000 * self.camera_model.depth_scale_m),
         )
-        return rgb, depth
+        return depth
 
     def log_pointcloud(self, rgb: np.ndarray, depth: np.ndarray) -> None:
         if self.pointcloud_processor is None:
@@ -328,17 +321,20 @@ def main(argv: list[str] | None = None) -> int:
 
     viz = EpisodeVisualizer(
         str(episode_path),
-        fingertip_link_names=XHAND_FINGERTIP_LINK_NAMES,
         table_plane_path=runtime.environment.table_plane_path,
         max_frames=args.max_frames,
         pointcloud_config=pointcloud_config,
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.frame_count)
-        for step in range(viz.frame_count):
-            viz.log_step(step)
+        logged_frames = 0
+        for step, rgb in enumerate(islice(viz.reader.iter_rgb_frames(), viz.frame_count)):
+            viz.log_step(step, rgb)
+            logged_frames += 1
             if step % 500 == 0:
                 logger.info("  frame %d/%d", step, viz.frame_count)
+        if logged_frames != viz.frame_count:
+            raise ValueError(f"RGB missing at frame {logged_frames}")
         mean_pointcloud_ms = viz.mean_pointcloud_processing_ms
         if mean_pointcloud_ms is not None:
             logger.info(

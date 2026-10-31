@@ -1,474 +1,180 @@
-"""键盘移动、静止采样与 eye-to-hand 标定。"""
+"""只读相机标定采样与离线 eye-to-hand 求解。"""
 
 from __future__ import annotations
 
-import logging
-import multiprocessing as mp
+import json
 import time
-from concurrent.futures import CancelledError
+from contextlib import ExitStack
+from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, cast
+from pathlib import Path
 
 import cv2
 import numpy as np
 
-from dexmani_real.config.calibration_data import CAMERAS_PATH
-from dexmani_real.control.constraints import MotionConstraints
-from dexmani_real.control.homing import HomePlanner
-from dexmani_real.control.ik import IKSolver
-from dexmani_real.ipc.sensors import (
-    SensorChannels,
-    read_camera_frame,
-    snapshot_camera_parameters,
-)
-from dexmani_real.robot.commands import OperationCancelled
-from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import home_arm
-from dexmani_real.runtime.jog import CartesianJog
-from dexmani_real.runtime.keyboard import Keyboard
-from dexmani_real.runtime.lifecycle import (
-    CAMERA_READY_TIMEOUT_S,
-    SHUTDOWN_TIMEOUT_S,
-    SensorWorkers,
-    close_runtime,
-)
-from dexmani_real.runtime.preflight import (
-    jog_bounds,
-    validate_robot_config,
-)
-from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState, device_failure_reason
-from dexmani_real.sensor.realsense import run_camera
+from dexmani_real.geometry.camera import CameraIntrinsics
+from dexmani_real.geometry.pose import validate_rigid_transform
 from dexmani_real.utils.camera_calibrate.aruco import (
-    ARUCO_DICT_NAME,
-    MARKER_ID,
-    MARKER_SIZE_M,
-    ArucoSampler,
+    ARUCO_DICT_NAME, CAPTURE_FRAMES, MARKER_ID, MARKER_SIZE_M, ArucoSampler,
 )
 from dexmani_real.utils.camera_calibrate.extrinsics import save_camera_calibration
-from dexmani_real.utils.camera_calibrate.hand_eye import (
-    MIN_SAMPLES,
-    HandEyeResult,
-    solve_hand_eye,
-)
-from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.table_plane import load_table_plane
-from dexmani_real.utils.timing import Rate, sample_is_fresh
-from dexmani_real.utils.visualization.image import ImageViewer, draw_aruco, draw_text
-
-if TYPE_CHECKING:
-    from dexmani_real.config.real import RealConfig
-
-logger = logging.getLogger(__name__)
-
-WINDOW_NAME = "ArUco Calibration"
+from dexmani_real.utils.camera_calibrate.hand_eye import HandEyeResult, solve_hand_eye
+from dexmani_real.utils.io import write_json
+from dexmani_real.utils.timing import sample_is_fresh
 
 
-class CameraCalibrator:
-    def __init__(
-        self,
-        runtime: RealConfig,
-        *,
-        output_path=CAMERAS_PATH,
-    ):
-        self.runtime = runtime
-        self.output_path = output_path
-        self.samples: list[tuple[np.ndarray, np.ndarray]] = []
-        self.result: HandEyeResult | None = None
-        self.calibration_saved = False
-        self.preview: ImageViewer | None = None
-        self.display_image: np.ndarray | None = None
-        self.preview_sequence = 0
-        self.preview_timestamp_ns = 0
-        self.marker_detected = False
-        self.status = "SPACE=capture a stationary pose"
+def read_arm_feedback(arm, max_age_s):
+    # 来源时间是这次 SDK 查询开始时刻，不是返回后读取缓存的时刻。
+    timestamp_ns = time.monotonic_ns()
+    qpos, qvel = arm.read()
+    if not sample_is_fresh(timestamp_ns, max_age_s):
+        raise TimeoutError("arm feedback query exceeded calibration freshness budget")
+    return dict(qpos=qpos, qvel=qvel, timestamp_ns=timestamp_ns)
 
-    def check_services(self):
-        return self.keys.check_health() and self.sensors.check()
 
-    def fault(self, reason, *, estop=False, run_end_reason=RunEndReason.HARDWARE_FAULT):
-        if estop:
-            self.runtime_state.request_emergency_stop()
-        else:
-            self.runtime_state.mark_error()
-        self.runtime_state.revoke_motion(SafetyState.FAULT, reason=run_end_reason)
-        logger.error("Calibration fault: %s", reason)
+def save_sample(path, sample_id, sample, eef_pose):
+    frames = sample["frames"]
+    arrays = dict(
+        sample_id=sample_id,
+        T_base_from_eef=eef_pose,
+        T_camera_from_marker=sample["T_camera_from_marker"],
+        rgb=np.stack([frame["rgb"] for frame in frames]),
+        camera_timestamp_ns=np.array([frame["timestamp_ns"] for frame in frames], dtype=np.int64),
+        color_frame_number=np.array([frame["color_frame_number"] for frame in frames], dtype=np.int64),
+        marker_corners_xy=np.stack([frame["corners"] for frame in frames]),
+        marker_rvec=np.stack([frame["rvec"] for frame in frames]),
+        marker_tvec=np.stack([frame["tvec"] for frame in frames]),
+        marker_detected=np.array([frame["detected"] for frame in frames]),
+        arm_qpos=np.stack([frame["arm"]["qpos"] for frame in frames]),
+        arm_qvel=np.stack([frame["arm"]["qvel"] for frame in frames]),
+        arm_timestamp_ns=np.array([frame["arm"]["timestamp_ns"] for frame in frames], dtype=np.int64),
+    )
+    for stage in ("before", "after"):
+        for name, value in sample[f"arm_{stage}"].items():
+            arrays[f"arm_{stage}_{name}"] = value
+    with Path(path).open("xb") as stream:
+        np.savez_compressed(stream, **arrays)
 
-    def cancel_requested(self) -> bool:
-        # 所有等待阶段（包括 HOME）使用同一取消入口，窗口关闭仅请求退出一次。
-        if (
-            not self.runtime_state.quit_requested
-            and self.preview is not None
-            and "closed" in self.preview.poll_events()
-        ):
-            self.runtime_state.request_quit()
-        return bool(
-            self.runtime_state.quit_requested
-            or self.runtime_state.estop_request
-            or self.runtime_state.error_state
-            or self.runtime_state.safety_state == SafetyState.FAULT
-            or not self.runtime_state.running
-            or self.keys.is_pressed("q")
-            or self.keys.is_pressed("esc")
-        )
 
-    def read_capture_feedback(self):
-        if self.cancel_requested():
-            raise CancelledError("calibration capture cancelled")
-        arm = self.robot.read_state().arm[0]
-        if not sample_is_fresh(arm["timestamp_ns"], self.runtime.arm.feedback_max_age_s):
-            self.fault("arm feedback stale")
-        if self.cancel_requested():
-            raise CancelledError("calibration capture cancelled")
-        return arm
+def collect_samples(runtime, output_dir):
+    """相机保持连接；每次摆位完成后只读连接机械臂，采样并立即断开。"""
+    from dexmani_real.geometry.kinematics import ArmFK
+    from dexmani_real.robot.xarm7.driver import XArm7
+    from dexmani_real.sensor.realsense import RealSenseCamera
 
-    def capture_sample(self):
-        if self.cancel_requested():
-            return
-        if not self.jog.pause(self.robot, self.runtime_state) or self.cancel_requested():
-            return
-        self.status = "CAPTURING: waiting for stationary arm and fresh images"
-        self.show_preview()
-        if self.cancel_requested():
-            return
-        print(f"\n  [{len(self.samples) + 1}] capturing ArUco pose...", end=" ", flush=True)
-        try:
-            sample = self.sampler.capture(
-                self.sensors.channels,
-                self.read_capture_feedback,
-                camera_config=self.runtime.camera,
-                arm_config=self.runtime.arm,
-            )
-        except CancelledError:
-            self.status = "Capture cancelled"
-            print("CANCELLED")
-            return
-        except (TimeoutError, ValueError, cv2.error) as exc:
-            self.status = f"Capture failed: {exc}"
-            print(f"FAILED — {exc}, skipped")
-            return
-        if self.cancel_requested():
-            return
-        arm_qpos, marker_pose = sample
-        eef_pose = self.constraints.target_fk.forward(arm_qpos)
-        if self.cancel_requested():
-            return
-        self.robot.check()
-        self.samples.append((eef_pose, marker_pose))
-        self.result = None
-        self.status = "Sample captured; ENTER=solve when enough poses are collected"
-        print(f"OK (total {len(self.samples)})  EE={np.round(eef_pose[:3, 3], 3)}m")
-
-    def show_preview(self):
-        if self.cancel_requested():
-            return
-        frame = read_camera_frame(self.sensors.channels, fields=("rgb",))
-        if (
-            frame
-            and frame["ring_sequence"] > self.preview_sequence
-            and sample_is_fresh(frame["timestamp_ns"], self.runtime.camera.max_frame_age_s)
-        ):
-            image = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
-            detection = self.sampler.detect(frame["rgb"])
-            draw_aruco(
-                image, detection.corners, detection.ids, detection.pose,
-                intrinsics=self.sampler.intrinsics, distortion=self.sampler.distortion,
-                axis_length=MARKER_SIZE_M / 2,
-            )
-            self.marker_detected = detection.pose is not None
-            self.display_image = image
-            self.preview_sequence = frame["ring_sequence"]
-            self.preview_timestamp_ns = frame["timestamp_ns"]
-        fresh = sample_is_fresh(self.preview_timestamp_ns, self.runtime.camera.max_frame_age_s)
-        image = (
-            self.display_image.copy() if self.display_image is not None
-            else np.zeros((self.camera.color.height, self.camera.color.width, 3), dtype=np.uint8)
-        )
-        marker = "STALE" if not fresh else "OK" if self.marker_detected else "NOT FOUND"
-        draw_text(
-            image, [f"MARKER {marker}"],
-            color=(0, 200, 0) if fresh and self.marker_detected else (0, 0, 255),
-        )
-        draw_text(image, [
-            f"samples={len(self.samples)}/{MIN_SAMPLES}  {self.status}",
-            "SPACE=capture ENTER=solve/save BACKSPACE=undo X=remove worst",
-            "WASD/Up/Down=move Left/Right/IJKL=rotate R=home Q=quit Esc=stop",
-        ], origin=(10, 50))
-        cast(ImageViewer, self.preview).show(image)
-        self.cancel_requested()
-
-    def solve_and_save(self):
-        if not self.jog.pause(self.robot, self.runtime_state) or self.cancel_requested():
-            return
-        epoch = self.runtime_state.run_id
-
-        def cancelled():
-            self.robot.check()
-            return self.cancel_requested() or self.runtime_state.run_id != epoch
-
-        self.result = None
-        self.status = "SOLVING calibration"
-        self.show_preview()
-        if cancelled():
-            return
-        try:
-            if not self.samples:
-                raise ValueError("no calibration samples")
-            eef_poses, marker_poses = (np.stack(poses) for poses in zip(*self.samples))
-            result = solve_hand_eye(eef_poses, marker_poses)
-        except (ValueError, cv2.error) as exc:
-            self.status = f"Solve failed: {exc}"
-            print(f"Calibration failed: {exc}")
-            return
-        if cancelled():
-            return
-        self.result = result
-        print(
-            f"{result.method}: position RMS={result.position_rms_mm:.2f}mm, "
-            f"rotation RMS={result.rotation_rms_deg:.2f}°, worst sample=#{result.worst_sample + 1}"
-        )
-        if not result.quality_ok:
-            self.status = (
-                f"Quality failed: {result.position_rms_mm:.2f}mm / "
-                f"{result.rotation_rms_deg:.2f}deg; X=remove worst"
-            )
-            print(
-                "Calibration exceeds RMS limits; press X to remove the worst sample and recapture"
-            )
-            return
-        metadata = {
-            "width": self.camera.color.width,
-            "height": self.camera.color.height,
-            "intrinsics": self.camera.color.matrix().tolist(),
-            "distortion": list(self.camera.color.distortion_coeffs),
-            "method": result.method,
-            "sample_count": len(self.samples),
-            "position_rms_mm": result.position_rms_mm,
-            "rotation_rms_deg": result.rotation_rms_deg,
-            "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
-        }
-        try:
-            save_camera_calibration(
-                result.T_base_from_camera,
-                self.camera.serial,
-                self.output_path,
-                calibration_capture=metadata,
-                cancelled=cancelled,
-            )
-        except CancelledError:
-            self.status = "Publication cancelled"
-            print("Calibration publication cancelled")
-            return
-        self.calibration_saved = True
-        self.status = f"SAVED: {result.method} {result.position_rms_mm:.2f}mm / {result.rotation_rms_deg:.2f}deg"
-        print(f"Calibration saved → {self.output_path} (serial: {self.camera.serial})")
-
-    def handle_sample_events(self, events):
-        for event in events:
-            if self.cancel_requested():
-                return
-            self.robot.check()
-            if event in ("space", "enter"):
-                try:
-                    if event == "space":
-                        self.capture_sample()
-                    else:
-                        self.solve_and_save()
-                finally:
-                    self.keys.discard_events("space", "enter", "backspace", "x", "r")
-                return  # 同一批次余下的一次性操作已基于旧场景。
-            elif event == "backspace" and self.samples:
-                self.samples.pop()
-                self.result = None
-                self.status = "Sample removed; ENTER=recompute"
-                print(f"Undone, {len(self.samples)} samples remaining")
-            elif event == "x":
-                if self.result is None:
-                    self.status = "ENTER=solve before removing worst sample"
-                    print("Press ENTER to evaluate before removing the worst sample")
-                else:
-                    worst = self.result.worst_sample
-                    self.samples.pop(worst)
-                    self.result = None
-                    self.status = f"Removed sample #{worst + 1}; ENTER=recompute"
-                    print(f"Removed sample #{worst + 1}; press ENTER to recompute")
-
-    def run(self) -> int:
-        self.prepare()
-        exit_code = 1
-        try:
-            self.keys.start()
-            if not self.keys.check_health():
-                raise RuntimeError("keyboard stop listener unavailable")
-            self.robot.connect()
-            self.sensors.start(
-                mp.get_context("spawn").Process(
-                    name="camera", target=run_camera,
-                    args=(self.sensors.channels, self.runtime.camera),
-                ),
-                ready=self.sensors.channels.camera_ready,
-                timeout_s=CAMERA_READY_TIMEOUT_S,
-                may_start=lambda: self.keys.check_health() and self.runtime_state.requests_allow_motion(),
-            )
-            self.robot.check()
-            self.runtime_state.arm()
-            print("  local arm connected (owner process)")
-            self.camera = snapshot_camera_parameters(
-                self.sensors.channels, self.runtime.camera, None, include_extrinsics=False,
-            )
-            print(f"  Camera serial: {self.camera.serial}")
-            print(f"  Resolution: {self.camera.color.width}x{self.camera.color.height}")
-            self.preview = ImageViewer(WINDOW_NAME)
-            exit_code = self.run_control_loop()
-        except KeyboardInterrupt:
-            self.fault("KeyboardInterrupt", estop=True)
-            exit_code = 130
-        except OperationCancelled as exc:
-            logger.info("Calibration cancelled: %s", exc)
-            if self.runtime_state.quit_requested:
-                exit_code = 0 if self.calibration_saved else 2
-        except Exception as exc:
-            self.fault(
-                f"calibration session failed: {exc}",
-                run_end_reason=device_failure_reason(exc) or RunEndReason.RUNTIME_FAILURE,
-            )
-            logger.exception("calibration session failed")
-        finally:
-            if not self.close():
-                exit_code = 1
-        print(f"  calibration session exit code: {exit_code}")
-        return exit_code
-
-    def close(self) -> bool:
-        clean = close_runtime(
-            self.runtime_state,
-            self.robot,
-            sensors=self.sensors,
-            keyboard=self.keys,
-            deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S,
-        )
-        if self.preview is not None:
+    runtime.camera.validate()
+    criteria = dict(
+        capture_frames=CAPTURE_FRAMES,
+        min_detected_frames=CAPTURE_FRAMES // 2,
+        arm_max_speed_rad_s=runtime.arm.homing.velocity_convergence_rad_s,
+        arm_max_drift_rad=runtime.arm.homing.convergence_rad,
+        arm_feedback_max_age_s=runtime.arm.feedback_max_age_s,
+        camera_max_age_s=runtime.camera.max_frame_age_s,
+    )
+    for name in ("arm_max_speed_rad_s", "arm_max_drift_rad", "arm_feedback_max_age_s"):
+        if not np.isfinite(criteria[name]) or criteria[name] <= 0:
+            raise ValueError(f"calibration {name} must be finite and positive")
+    output = Path(output_dir).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    samples = output / "samples"
+    samples.mkdir()
+    camera = RealSenseCamera(runtime.camera, auto_exposure_priority=None)
+    fk = ArmFK()
+    count = 0
+    with ExitStack() as resources:
+        resources.callback(camera.disconnect)
+        camera.connect()
+        write_json(dict(
+            camera=dict(serial=camera.active_serial, color=camera.color_intrinsics.to_dict(),
+                        depth_scale_m=camera.depth_scale_m),
+            marker=dict(dictionary=ARUCO_DICT_NAME, id=MARKER_ID, size_m=MARKER_SIZE_M),
+            criteria=criteria, requested_config=asdict(runtime),
+        ), output / "capture.json", overwrite=False)
+        sampler = ArucoSampler(camera.color_intrinsics.matrix(),
+                               np.asarray(camera.color_intrinsics.distortion_coeffs))
+        print("标记须相对 EEF 刚性固定。用厂商示教或独立点动工具摆位，停止并退出控制连接。")
+        print("相机保持连接；Enter 只读采样，完成后机械臂连接立即关闭；Q 结束。")
+        while True:
+            command = input(f"sample {count}: Enter 采样 / Q 结束 > ").strip().lower()
+            if command == "q":
+                break
+            if command:
+                continue
+            arm = XArm7(runtime.arm)
             try:
-                self.preview.close()
-            except cv2.error:
-                logger.exception("calibration window cleanup failed")
-                clean = False
-        return clean
+                # XArm7.connect 仅建立 SDK/读取连接，不调用 initialize 或任何运动配置。
+                arm.connect(check_abort=lambda: None)
+                try:
+                    sample = sampler.capture(
+                        camera.read, lambda: read_arm_feedback(arm, runtime.arm.feedback_max_age_s),
+                        camera_config=runtime.camera, arm_config=runtime.arm,
+                    )
+                except (TimeoutError, ValueError, cv2.error) as exc:
+                    print(f"采样拒绝：{exc}；未新增样本，请重新摆位。", flush=True)
+                    continue
+            finally:
+                arm.close()
+            path = samples / f"{count:06d}.npz"
+            save_sample(path, count, sample, fk.forward(sample["arm_after"]["qpos"]))
+            print(f"已保存 sample {count}：{path}", flush=True)
+            count += 1
+    return count
 
-    def run_control_loop(self):
-        self.sampler = ArucoSampler(
-            self.camera.color.matrix(), np.asarray(self.camera.color.distortion_coeffs),
+
+def solve_samples(sample_dir, output_path, *, exclude=()) -> HandEyeResult:
+    """只读采样文件，按原 ID 剔除样本；不导入设备连接或执行在线标定。"""
+    source = Path(sample_dir).expanduser().resolve()
+    output = Path(output_path).expanduser().resolve()
+    capture = json.loads((source / "capture.json").read_text(encoding="utf-8"))
+    camera = capture["camera"]
+    intrinsics = CameraIntrinsics(**camera["color"])
+    excluded = set(exclude)
+    samples, all_ids = {}, set()
+    for path in sorted((source / "samples").glob("*.npz")):
+        with np.load(path, allow_pickle=False) as data:
+            identity = data["sample_id"]
+            if identity.shape != () or identity.dtype.kind not in "iu":
+                raise ValueError(f"{path}: sample_id must be a scalar integer")
+            sample_id = int(identity)
+            if sample_id < 0 or sample_id in all_ids:
+                raise ValueError(f"{path}: invalid or duplicate sample_id {sample_id}")
+            all_ids.add(sample_id)
+            if sample_id not in excluded:
+                samples[sample_id] = (
+                    validate_rigid_transform(data["T_base_from_eef"], label=f"sample {sample_id} EEF"),
+                    validate_rigid_transform(data["T_camera_from_marker"], label=f"sample {sample_id} marker"),
+                )
+    if excluded - all_ids:
+        raise ValueError(f"unknown excluded sample IDs: {sorted(excluded - all_ids)}")
+    if not samples:
+        raise ValueError("no calibration samples remain")
+    used_ids = sorted(samples)
+    eef, markers = (np.stack(poses) for poses in zip(*(samples[identity] for identity in used_ids)))
+    result = solve_hand_eye(eef, markers)
+    report = dict(
+        sample_directory=str(source), used_sample_ids=used_ids, excluded_sample_ids=sorted(excluded),
+        sample_count=len(used_ids), method=result.method,
+        position_errors_mm=result.position_errors_mm.tolist(),
+        rotation_errors_deg=result.rotation_errors_deg.tolist(),
+        position_rms_mm=result.position_rms_mm, rotation_rms_deg=result.rotation_rms_deg,
+        worst_sample_id=used_ids[result.worst_sample], quality_ok=result.quality_ok,
+        calibrated_at_utc=datetime.now(timezone.utc).isoformat(),
+    )
+    write_json(dict(camera_serial=camera["serial"], T_base_from_camera=result.T_base_from_camera.tolist(),
+                    **report), output.with_suffix(".result.json"))
+    if not result.quality_ok:
+        raise ValueError(
+            f"hand-eye quality failed: {result.position_rms_mm:.3f} mm / "
+            f"{result.rotation_rms_deg:.3f} deg; worst sample ID {report['worst_sample_id']}"
         )
-        self.jog.prepare(self.robot, self.runtime_state)
-        self.rate = Rate(self.runtime.keyboard_teleop.control_hz)
-
-        print(f"\n  ArUco: {ARUCO_DICT_NAME} ID={MARKER_ID} size={MARKER_SIZE_M * 1000:.1f}mm")
-        print("  Controls: WASD/arrows move, ←→/I/J/K/L rotate, SPACE capture, ENTER calibrate")
-        print(
-            "  Release jog keys to brake and hold; release all jog keys after a rejected target"
-        )
-        print(f"  Preview window: {WINDOW_NAME} (green=detected, red=not found)")
-
-        while self.runtime_state.running:
-            self.rate.wait(service=self.robot.service_idle)
-            self.robot.service_feedback()
-
-            if self.runtime_state.estop_request or self.keys.is_pressed("esc"):
-                self.fault("operator e-stop", estop=True)
-                return 1
-            if (
-                self.runtime_state.error_state
-                or self.runtime_state.safety_state == SafetyState.FAULT
-            ):
-                self.fault("runtime fault during calibration")
-                return 1
-            if not self.keys.check_health():
-                self.fault("keyboard listener exited", estop=True)
-                return 1
-            if not self.sensors.check():
-                self.fault("camera worker exited")
-                return 1
-
-            if self.runtime_state.quit_requested or self.keys.is_pressed("q"):
-                self.runtime_state.revoke_motion(reason=RunEndReason.QUIT)
-                self.robot.stop()
-                return 0 if self.calibration_saved else 2
-            self.show_preview()
-            events = self.keys.poll(timeout=0)
-            if self.cancel_requested():
-                continue
-            if "r" in events:
-                self.run_home()
-                if self.runtime_state.safety_state == SafetyState.FAULT:
-                    return 1
-                continue
-            self.handle_sample_events(events)
-            if self.cancel_requested():
-                continue
-            self.jog.step(self.robot, self.keys, self.runtime_state, self.runtime)
-        return 0
-
-    def run_home(self):
-        logger.info("Returning home...")
-        try:
-            self.jog.stop(self.robot, self.runtime_state)
-            home_result = home_arm(
-                self.runtime_state,
-                self.robot,
-                self.home_planner,
-                cancel_requested=self.cancel_requested,
-            )
-            if self.runtime_state.estop_request:
-                self.fault("operator e-stop during homing")
-                return
-            if not home_result.ok:
-                if home_result.interrupted:
-                    logger.info("HOME cancelled: %s", home_result.reason)
-                else:
-                    logger.warning("HOME failed: %s", home_result.reason)
-        finally:
-            self.keys.discard_events("space", "enter", "backspace", "x", "r")
-            self.rate.reset()
-
-    def prepare(self) -> None:
-        configure_logging()
-        if self.runtime.hand.enabled:
-            raise ValueError(
-                "camera calibration requires hand.enabled=false and secured/absent hand"
-            )
-        validate_robot_config(self.runtime)
-        table_plane_abcd = (
-            load_table_plane(self.runtime.environment.table_plane_path)
-            if self.runtime.environment.table.enabled else None
-        )
-        bounds = jog_bounds(self.runtime)
-        self.runtime.camera.validate()
-        print("  XHand must be removed or secured at HOME; collision checks use the fixed-HOME envelope")
-
-        # HOME 路径与在线 IK 使用各自的碰撞场景。
-        self.home_planner = HomePlanner(
-            self.runtime.environment, self.runtime.arm, table_plane_abcd=table_plane_abcd,
-        )
-        self.home_planner.set_hand_qpos(np.deg2rad(self.runtime.hand.home_qpos_deg))
-        self.constraints = MotionConstraints(self.runtime.arm, self.runtime.environment)
-        solver = IKSolver(
-            self.constraints,
-            position_tolerance=self.runtime.keyboard_teleop.ik_max_pose_error_pos_m,
-            rotation_tolerance=self.runtime.keyboard_teleop.ik_max_pose_error_rot_rad,
-        )
-        ctx = mp.get_context("spawn")
-        self.runtime_state = SessionState()
-        self.sensors = SensorWorkers(SensorChannels(ctx, camera=self.runtime.camera))
-        self.keys = Keyboard(
-            estop_callback=self.runtime_state.request_emergency_stop,
-            bindings={'q': self.runtime_state.request_quit},
-        )
-        self.robot: Robot = Robot(
-            self.runtime.arm,
-            self.runtime.hand,
-            run_signal=self.runtime_state.run_signal,
-            stop_signal=self.runtime_state.stop_signal,
-            emergency_signal=self.runtime_state.emergency_signal,
-            signal_lock=self.runtime_state.motion_lock,
-            check_services=self.check_services,
-        )
-        self.jog: CartesianJog = CartesianJog(solver, self.runtime.keyboard_teleop, bounds)
+    save_camera_calibration(
+        result.T_base_from_camera, camera["serial"], output,
+        calibration_capture=dict(
+            width=intrinsics.width, height=intrinsics.height,
+            intrinsics=intrinsics.matrix().tolist(), distortion=list(intrinsics.distortion_coeffs),
+            **report,
+        ),
+    )
+    print(f"{result.method}: RMS={result.position_rms_mm:.3f} mm / {result.rotation_rms_deg:.3f} deg; "
+          f"worst sample ID={report['worst_sample_id']}; 已保存 {output}")
+    return result

@@ -43,7 +43,6 @@ def save_camera_calibration(
     json_path: Path,
     *,
     calibration_capture: dict[str, object] | None = None,
-    cancelled=None,
 ) -> None:
     if not isinstance(serial, str) or not serial.strip():
         raise ValueError("camera serial must be non-empty")
@@ -55,4 +54,4 @@ def save_camera_calibration(
     if calibration_capture is not None:
         entry["calibration_capture"] = calibration_capture
     cameras[serial] = entry
-    write_json(cameras, json_path, cancelled=cancelled)
+    write_json(cameras, json_path)

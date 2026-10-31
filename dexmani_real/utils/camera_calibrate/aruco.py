@@ -8,7 +8,6 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.utils.timing import sample_is_fresh
 
 ARUCO_DICT = cv2.aruco.DICT_7X7_50
@@ -48,6 +47,9 @@ class ArucoSampler:
         )
 
     def detect(self, rgb: np.ndarray) -> ArucoDetection:
+        rgb = np.asarray(rgb)
+        if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3 or min(rgb.shape[:2]) < 2:
+            raise ValueError("calibration RGB must be uint8 (H, W, 3)")
         corners, ids, _ = self.detector.detectMarkers(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY))
         if ids is None:
             return ArucoDetection(corners, ids, None)
@@ -78,30 +80,47 @@ class ArucoSampler:
             return arm
         raise TimeoutError("fresh arm feedback unavailable after capture barrier")
 
-    def capture(self, channels, read_arm, *, camera_config, arm_config):
+    def capture(self, read_camera, read_arm, *, camera_config, arm_config):
         arm_before = self.stationary_arm(read_arm, arm_config, time.monotonic_ns())
         last_stamp, last_color_frame = time.monotonic_ns(), -1
-        rotations, translations = [], []
+        rotations, translations, frames = [], [], []
         for _ in range(CAPTURE_FRAMES):
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
                 arm = read_arm()
                 if np.max(np.abs(arm["qvel"])) > arm_config.homing.velocity_convergence_rad_s:
                     raise ValueError("arm is moving during calibration capture")
-                frame = read_camera_frame(channels, fields=("rgb",))
+                frame = read_camera()
                 if (
-                    frame
-                    and frame["timestamp_ns"] > last_stamp
-                    and frame["color_frame_number"] > last_color_frame
-                    and sample_is_fresh(frame["timestamp_ns"], camera_config.max_frame_age_s)
+                    frame is not None
+                    and frame.timestamp_ns > last_stamp
+                    and frame.color_frame_number > last_color_frame
+                    and sample_is_fresh(frame.timestamp_ns, camera_config.max_frame_age_s)
                 ):
                     break
                 time.sleep(0.01)
             else:
                 raise TimeoutError("fresh calibration image unavailable")
-            last_stamp = frame["timestamp_ns"]
-            last_color_frame = frame["color_frame_number"]
-            pose = self.detect(frame["rgb"]).pose
+            last_stamp = frame.timestamp_ns
+            last_color_frame = frame.color_frame_number
+            if not isinstance(frame.rgb, np.ndarray) or frame.rgb.shape != (
+                camera_config.height, camera_config.width, 3,
+            ):
+                raise ValueError("calibration RGB shape differs from configured camera")
+            detection = self.detect(frame.rgb)
+            pose = detection.pose
+            target_corners = np.full((4, 2), np.nan)
+            if detection.ids is not None:
+                indices = np.flatnonzero(detection.ids.ravel() == MARKER_ID)
+                if len(indices):
+                    target_corners = np.asarray(detection.corners[indices[0]]).reshape(4, 2)
+            frames.append(dict(
+                rgb=frame.rgb, timestamp_ns=frame.timestamp_ns,
+                color_frame_number=frame.color_frame_number, corners=target_corners,
+                rvec=pose[0] if pose is not None else np.full(3, np.nan),
+                tvec=pose[1] if pose is not None else np.full(3, np.nan),
+                detected=pose is not None, arm=arm,
+            ))
             if pose is not None:
                 rotations.append(pose[0])
                 translations.append(pose[1])
@@ -117,4 +136,7 @@ class ArucoSampler:
         transform = np.eye(4)
         transform[:3, :3] = Rotation.from_rotvec(rotations).mean().as_matrix()
         transform[:3, 3] = np.median(translations, axis=0)
-        return arm_after["qpos"], transform
+        return dict(
+            arm_before=arm_before, arm_after=arm_after,
+            frames=frames, T_camera_from_marker=transform,
+        )

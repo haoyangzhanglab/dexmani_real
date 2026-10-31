@@ -6,7 +6,6 @@ import ctypes
 import json
 import os
 import tempfile
-from concurrent.futures import CancelledError
 from pathlib import Path
 
 
@@ -27,13 +26,11 @@ def publish(src: str | Path, dst: str | Path) -> Path:
     return target
 
 
-def _write_text(text, target, *, cancelled=None, overwrite=True):
+def _write_text(text, target, *, overwrite=True):
     fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.tmp-", dir=target.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(text)
-        if cancelled is not None and cancelled():
-            raise CancelledError("publication cancelled")
         if overwrite:
             os.replace(temporary, target)
         else:
@@ -50,9 +47,9 @@ def write_yaml(obj: object, path: str | Path) -> Path:
     return _write_text(text, Path(path))
 
 
-def write_json(obj: object, path: str | Path, *, cancelled=None, overwrite=True) -> Path:
-    """序列化成功后原子发布；取消检查紧邻发布边界。"""
+def write_json(obj: object, path: str | Path, *, overwrite=True) -> Path:
+    """序列化成功后原子发布，保留调用方明确的覆盖政策。"""
     text = json.dumps(obj, indent=2, ensure_ascii=False, allow_nan=False)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    return _write_text(text, target, cancelled=cancelled, overwrite=overwrite)
+    return _write_text(text, target, overwrite=overwrite)
