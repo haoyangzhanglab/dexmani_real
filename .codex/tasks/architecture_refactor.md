@@ -1,5 +1,7 @@
 # Codex CLI 任务书：DexMani Real 目录与模块边界重构
 
+> 历史记录，非当前实施说明。根目录 `tests` 已按用户要求删除；下文路径、测试命令及数量仅记录当时状态，不再作为当前入口或验证指引。
+
 ## 0. 任务身份与执行方式
 
 - 仓库：`haoyangzhanglab/dexmani_real`。

@@ -12,7 +12,7 @@ python -m pip install -e ".[interactive,control,geometry,visualization]"
 
 设备 SDK、HTS、Pinocchio、MPlib、NLopt 和配套 Policy 按实际实验环境安装。机器人模型和手模板从源码目录 `assets/` 加载，运行时保留 checkout。几何模型的独立环境见 [CordVIP 使用说明](third_party/cordvip_geometry/docs/usage.md)。
 
-复制 [experiments/default.py](experiments/default.py)，用可信本地 Python 文件导出 `CONFIG: RealConfig`。设备、模式、增益、频率和点数直接在实验文件修改；省略 `--config` 使用 dataclass 默认值。例如：
+省略 `--config` 使用 dataclass 默认值。需要修改设备、模式、增益、频率或点数时，新建可信本地 Python 文件并导出 `CONFIG: RealConfig`；例如将下例保存为 `~/dexmani_config.py`，运行时传入 `--config ~/dexmani_config.py`：
 
 ```python
 from dataclasses import replace
@@ -28,8 +28,8 @@ CONFIG = replace(base,
 本仓已退出实验 YAML、递归覆盖和任意嵌套 CLI override，旧实验文件需一次迁移，用户文件不会被自动删除。任务、路径、段数、时长、录制选择及 `--weights/--inference-steps/--seed/--device` 留在 CLI。`--no-hand` 只确认配置已显式关闭手，遥操作无手调试还须关闭录制。Policy 配方从 checkpoint 恢复，其训练配置和运行快照可继续用 YAML；本仓迁移不改变外部模型协议。
 
 ```bash
-python scripts/collect_teleop.py --config experiments/default.py --print-config
-python scripts/run_policy.py --config experiments/default.py --print-config
+python scripts/collect_teleop.py --print-config
+python scripts/run_policy.py --print-config
 ```
 
 这些命令只打印请求配置的 JSON，不连接设备、不读取标定或加载 checkpoint。启用分支负责业务校验，完整实验快照仍须可严格序列化；实测相机事实在连接后单独记录。
@@ -39,13 +39,13 @@ python scripts/run_policy.py --config experiments/default.py --print-config
 将 TASK、EPISODE、EXPERIMENT 替换为任务、已发布 episode 和保存的 Policy 实验路径。
 
 ```bash
-python scripts/collect_teleop.py TASK --config experiments/default.py
-python scripts/export_zarr.py episodes/TASK --config experiments/default.py --output datasets/TASK.zarr
-python scripts/run_policy.py EXPERIMENT --checkpoint latest --config experiments/default.py --num-episodes 5
-python scripts/replay_episode.py episodes/TASK/EPISODE --config experiments/default.py --output replay_results/run_001
+python scripts/collect_teleop.py TASK
+python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr
+python scripts/run_policy.py EXPERIMENT --checkpoint latest --num-episodes 5
+python scripts/replay_episode.py episodes/TASK/EPISODE --output replay_results/run_001
 python scripts/evaluate_replay.py --episode episodes/TASK/EPISODE --replay replay_results/run_001
-python scripts/visualize_episode.py episodes/TASK/EPISODE --config experiments/default.py
-python scripts/keyboard_teleop.py --config experiments/default.py
+python scripts/visualize_episode.py episodes/TASK/EPISODE
+python scripts/keyboard_teleop.py
 ```
 
 采集和策略会话使用 B 开始、S 保存并结束本段、D 丢弃本段、Q 保存并退出、Esc 急停。H 只在无活动段时回初始位，T 只在空闲、手部无接触时复位触觉。已退出 C 暂停/续写、双 Q 确认和音频播放。物理回放保留 S 停止、H 回零、Q 退出；键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出。
@@ -89,12 +89,12 @@ python scripts/generate_hand_template.py --num-points 1024 --overwrite
 默认相机外参、桌面平面与 VR 朝向 JSON 位于 [config/calibration_data/](dexmani_real/config/calibration_data/)。相机标记须相对 EEF 刚性固定，摆位提供充分旋转激励；先退出厂商示教/独立点动控制连接，再只读采样。
 
 ```bash
-python scripts/calibrate_camera.py collect --config experiments/default.py --output calibration_samples/run_001
+python scripts/calibrate_camera.py collect --output calibration_samples/run_001
 python scripts/calibrate_camera.py solve calibration_samples/run_001 --output camera_calibration.json
 python scripts/calibrate_camera.py solve calibration_samples/run_001 --exclude 3 --output camera_calibration_clean.json
 python scripts/calibrate_vr_heading.py --ref head
-python scripts/tools/view_realsense.py --config experiments/default.py
-python scripts/tools/view_realsense.py --config experiments/default.py --cloud processed --calibrate-table
+python scripts/tools/view_realsense.py
+python scripts/tools/view_realsense.py --cloud processed --calibrate-table
 ```
 
 collect 的相机持续连接，Enter 为一组只读机械臂采样，完成立即断开臂；Q 结束。五帧原 RGB、检测、来源时间、实测位置/速度和样本 ID 保存为 NPZ，速度、帧新鲜度及前后漂移仍检查。solve 不连接设备，按原 ID 排除样本，保存逐样本残差和 used/excluded/worst IDs；质量合格后写入原 serial 映射格式外参，报告使用同名 `.result.json`。VR 头朝向直接消费头帧，不要求右手就绪。
@@ -119,4 +119,4 @@ python scripts/analyze_timing.py episodes/TASK/EPISODE
 
 默认日志为终端 INFO、拒绝原因、完整异常 traceback 和简短段结果；不再创建每进程 DEBUG 文件或默认聚合性能指标。需要留档时使用 shell 重定向。回放指标通过 evaluate_replay.py 显式计算，分析失败不回写控制结果；指标按索引比较实测轨迹，不代表目标跟踪或时间对齐。analyze_timing.py 只报告采样间隔、readout 和来源年龄，明确列出缺失/非法来源，不推断曝光或 SDK 延迟。几何环境检查仅显式 `--check` 运行。
 
-开发约定见 [AGENTS.md](AGENTS.md)，清理批次、实际验证和未验证项见 [CLEANUP_TASKBOOK.md](CLEANUP_TASKBOOK.md) 第 12 节。
+开发约定见 [AGENTS.md](AGENTS.md)。
