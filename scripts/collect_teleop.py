@@ -24,14 +24,6 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--no-hand",
-        action="store_true",
-        help=(
-            "Confirm hand.enabled=False in the experiment config; hand must be absent or secured at home. "
-            "Arm debug only; also pass --no-record (or disable recording in config)."
-        ),
-    )
-    parser.add_argument(
         "--record", action=argparse.BooleanOptionalAction, default=None,
         help="Enable/disable capture and camera; overrides collection.enabled",
     )
@@ -61,13 +53,9 @@ def main(argv: list[str] | None = None) -> int:
         episodes_dir=runtime.collection.episodes_dir if args.episodes_dir is None else args.episodes_dir,
         max_duration_s=runtime.collection.max_duration_s if args.max_duration is None else args.max_duration,
     ))
-    if args.no_hand and runtime.hand.enabled:
-        parser.error("--no-hand requires hand.enabled=False in the experiment config")
     if args.print_config:
         print(json.dumps(asdict(runtime), ensure_ascii=False, indent=2, allow_nan=False))
         return 0
-    if not runtime.hand.enabled and not args.no_hand:
-        parser.error("hand.enabled=False requires explicit --no-hand confirmation")
 
     from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
     from dexmani_real.teleop.run import run_teleop
@@ -75,7 +63,6 @@ def main(argv: list[str] | None = None) -> int:
     return run_teleop(
         runtime,
         task_name=args.task_name,
-        allow_no_hand=args.no_hand,
         vr_transform_path=args.vr_transform or VR_TRANSFORM_PATH,
         camera_calibration_path=args.camera_calibration,
     )

@@ -19,6 +19,11 @@ def positive_int(value: str) -> int:
     return number
 
 
+def add_grounding_arguments(parser):
+    parser.add_argument("--box-threshold", type=float, default=0.3, help="Grounding DINO 候选框阈值")
+    parser.add_argument("--text-threshold", type=float, default=0.25, help="Grounding DINO 文本 token 阈值")
+
+
 def parse_tracking_args(argv=None, *, workspace=None):
     workspace = Path(workspace or Path.cwd()).expanduser().resolve()
     parser = argparse.ArgumentParser(description="顺序处理 Raw 每行；确认首帧 mask 后保存离线场景结果。")
@@ -41,10 +46,8 @@ def parse_tracking_args(argv=None, *, workspace=None):
     from ..sam2_config import add_sam_arguments
 
     add_sam_arguments(parser, workspace)
-    parser.add_argument(
-        "--check", action="store_true", help="只检查环境，不加载模型、创建窗口或连接相机"
-    )
-    parser.add_argument("--episode", type=Path, help="只读已发布 Raw episode；默认处理全部行")
+    add_grounding_arguments(parser)
+    parser.add_argument("--episode", type=Path, required=True, help="只读已发布 Raw episode；默认处理全部行")
     parser.add_argument(
         "--initial-selection", type=Path, help="复用已确认的 select 目录；必须与离线源首帧完全对应"
     )
@@ -61,13 +64,11 @@ def parse_tracking_args(argv=None, *, workspace=None):
     parser.add_argument("--min-matched-pixels", type=int, default=30)
     parser.add_argument("--min-matched-fraction", type=float, default=0.15)
     args = parser.parse_args(argv)
-    if not args.check and args.episode is None:
-        parser.error("追踪需要 --episode；只检查环境可用 --check")
     if args.scene and (args.asset or args.initial_selection or args.object_prompt):
         parser.error("--scene 内逐个指定资产、选择和 prompt，不能混用单物体参数")
     if args.max_frames is not None and args.max_frames < 1:
         parser.error("--max-frames 必须为正整数")
-    if args.headless and args.initial_selection is None and args.scene is None and not args.check:
+    if args.headless and args.initial_selection is None and args.scene is None:
         parser.error("--headless 需要 --initial-selection，或为 scene 中每个实例指定选择")
     if args.object_prompt is not None and not args.object_prompt.strip():
         parser.error("--object-prompt 不能为空")
@@ -89,6 +90,7 @@ def add_segment_arguments(parser, *, workspace):
     from ..sam2_config import add_sam_arguments
 
     add_sam_arguments(parser, workspace)
+    add_grounding_arguments(parser)
     parser.add_argument("--instance", type=int, help="零起始候选索引；headless 必须显式选择")
     parser.add_argument("--headless", action="store_true", help="不创建窗口；必须提供 --instance")
 

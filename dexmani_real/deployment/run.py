@@ -13,10 +13,9 @@ from dexmani_real.config.deployment import (
     DEFAULT_NUM_EPISODES,
     RUNTIME_SECTIONS,
 )
-from dexmani_real.deployment.observation import policy_dependencies, policy_needs
+from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.deployment.session import PolicySession
-from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.utils.io import write_yaml
 from dexmani_real.utils.table_plane import (
     load_table_plane,
@@ -83,17 +82,11 @@ def run_policy(
     info = inspect_policy(
         experiment, checkpoint=checkpoint, weights=weights, inference_steps=inference_steps,
     )
-    dependencies = policy_dependencies(info.observation_fields)
-    control_needs = policy_needs(dependencies)
-    record_needs = (
-        ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
-        if record_raw else ObservationNeeds()
-    )
-    needs = control_needs.union(record_needs)
-    runtime = resolve_deployment_config(info, runtime, needs)
+    runtime = resolve_deployment_config(info, runtime)
+    observations = ObservationBuilder(info, runtime)
     table_plane_abcd = (
         load_table_plane(runtime.environment.table_plane_path)
-        if runtime.environment.table.enabled or (needs.point_cloud and runtime.pointcloud.remove_table)
+        if runtime.environment.table.enabled or (observations.needs.point_cloud and runtime.pointcloud.remove_table)
         else None
     )
 
@@ -138,6 +131,5 @@ def run_policy(
         camera_calibration_path=camera_calibration_path,
         table_plane_abcd=table_plane_abcd,
         run_config=payload,
-        dependencies=dependencies, control_needs=control_needs,
-        record_needs=record_needs, needs=needs,
+        observations=observations,
     ).run()

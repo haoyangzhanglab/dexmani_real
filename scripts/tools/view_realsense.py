@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""实时查看 RealSense RGB-D/点云，退出时恢复原曝光优先级。"""
+"""预览 RealSense RGB-D 和固定类型点云，或执行一次快照、测量、桌面拟合。"""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
-from datetime import datetime
 import json
 import logging
 import sys
 import time
-from collections import deque
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.config.real import load_config
 from dexmani_real.config.perception import PointCloudConfig
+from dexmani_real.config.real import load_config
 from dexmani_real.geometry.camera import CameraIntrinsics
 from dexmani_real.geometry.plane import fit_table_plane
 from dexmani_real.perception.pointcloud import (
@@ -26,26 +25,21 @@ from dexmani_real.perception.pointcloud import (
     aligned_depth_points_in_base,
     build_raw_point_cloud,
 )
-from dexmani_real.sensor.realsense import get_ae_priority, set_ae_priority
 from dexmani_real.utils.camera_calibrate.extrinsics import load_camera_extrinsics
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.table_plane import load_table_plane, resolve_table_plane_path, save_table_plane
+from dexmani_real.utils.table_plane import (
+    load_table_plane,
+    resolve_table_plane_path,
+    save_table_plane,
+)
 from dexmani_real.utils.visualization.image import ImageViewer, rgbd_panel
 from dexmani_real.utils.visualization.pointcloud import PointCloudViewer
 
 if TYPE_CHECKING:
     from dexmani_real.sensor.realsense import RealSenseCamera
 
-FPS_WINDOW = 100
 TABLE_CALIBRATION_FRAMES = 5
 logger = logging.getLogger(__name__)
-
-
-def depth_valid_ratio(depth: np.ndarray, min_d: float, max_d: float) -> float:
-    """Return the fraction of depth pixels inside the display band."""
-    depth_f32 = np.asarray(depth, dtype=np.float32)
-    valid = np.isfinite(depth_f32) & (depth_f32 > 0.0) & (depth_f32 >= min_d) & (depth_f32 <= max_d)
-    return float(valid.mean()) if depth_f32.size else 0.0
 
 
 def read_rgbd(camera):
@@ -59,21 +53,6 @@ def read_rgbd(camera):
     if frame.depth.dtype != np.uint16 or frame.depth.shape != shape:
         raise ValueError("aligned camera depth must be uint16 [H,W] matching color intrinsics")
     return frame
-
-
-def toggle_ae_priority(camera: RealSenseCamera) -> None:
-    """Toggle auto_exposure_priority; OFF caps exposure at the requested frame period."""
-    current = get_ae_priority(camera)
-    if current is None:
-        print("  auto_exposure_priority: not supported on this color sensor")
-        return
-    target = 0.0 if current >= 0.5 else 1.0
-    readback = set_ae_priority(camera, target)
-    if readback is None:
-        print("  auto_exposure_priority: set failed (unsupported)")
-        return
-    label = "OFF (cap exposure at frame period)" if target == 0.0 else "ON (may reduce FPS)"
-    print(f"  auto_exposure_priority: {current:g} -> {readback:g}  [{label}]")
 
 
 def save_diagnostic_snapshot(
@@ -175,6 +154,7 @@ def calibrate_table_plane(
     plane_path: Path,
     frame_count: int,
 ) -> tuple[float, float, float, float]:
+    lower, upper = config.workspace_bounds()
     print("\n" + "=" * 60)
     print("Table Plane Calibration (multi-frame RANSAC)")
     print("=" * 60)
@@ -191,8 +171,6 @@ def calibrate_table_plane(
         depth_frames.append(frame.depth)
 
     point_batches: list[np.ndarray] = []
-    lower = np.asarray(config.workspace[:3], dtype=np.float32)
-    upper = np.asarray(config.workspace[3:], dtype=np.float32)
     for depth_raw in depth_frames:
         points = aligned_depth_points_in_base(
             depth_raw=depth_raw,
@@ -228,18 +206,17 @@ def calibrate_table_plane(
         save_table_plane(plane_path, fit)
         print("  Published table calibration.")
     else:
-        print("  Calibration file unchanged; using the new fit for this run only.")
+        print("  Calibration file unchanged; exiting without publication.")
     return fit.plane_abcd
 
 
 class RealSenseViewer:
-    """Own live preview state and restore the captured exposure priority on exit."""
+    """一次相机连接用于预览或一个显式的一次性操作。"""
 
     def __init__(self, args):
         self.args = args
 
     def run(self) -> int:
-        # Resolve experiment settings before enumerating or opening a camera.
         runtime = load_config(path=self.args.config)
         if self.args.save_dir is not None and self.args.save_dir.exists() and not self.args.save_dir.is_dir():
             raise NotADirectoryError(f"snapshot output root is not a directory: {self.args.save_dir}")
@@ -249,65 +226,43 @@ class RealSenseViewer:
         self.processor: PointCloudProcessor | None = None
         self.table_plane: tuple[float, float, float, float] | None = None
         self.table_plane_source = "disabled"
-        self.fitted_plane = None
+        if self.args.cloud is not None:
+            self.pointcloud_config.workspace_bounds()
 
         from dexmani_real.sensor.realsense import RealSenseCamera
 
-        # Leave exposure priority untouched until it is snapshotted.
-        config = runtime.camera
-        config.validate()
+        runtime.camera.validate()
         configure_logging()
-
-        self.camera = RealSenseCamera(config, auto_exposure_priority=None)
-        original_priority = None
-        failure = None
+        # 预览不额外修改曝光优先级；其余启动设置使用实验配置。
+        self.camera = RealSenseCamera(runtime.camera, auto_exposure_priority=None)
         try:
             self.camera.connect()
             self.camera_info = self.camera.get_device_info()
             print(f"Connected: {self.camera_info}")
-            original_priority = get_ae_priority(self.camera)
-            if original_priority is not None:
-                print(f"  auto_exposure_priority (original): {original_priority:g}")
-                if original_priority != 0.0:
-                    applied = set_ae_priority(self.camera, 0.0)
-                    if applied is None or not np.isclose(applied, 0.0):
-                        raise RuntimeError("could not apply diagnostic exposure priority")
-            else:
-                print("  auto_exposure_priority unavailable; leaving it unchanged")
             if self.args.calibrate_table:
-                self.fitted_plane = calibrate_table_plane(
+                calibrate_table_plane(
                     camera=self.camera, intrinsics=self.camera.color_intrinsics,
                     T_xarm_base_from_color=self.ensure_cloud_transform(), config=self.pointcloud_config,
                     plane_path=resolve_table_plane_path(self.table_plane_path),
                     frame_count=TABLE_CALIBRATION_FRAMES,
                 )
-            if self.args.benchmark_frames:
+            elif self.args.benchmark_frames is not None:
                 benchmark_production_pipeline(
                     camera=self.camera, processor=self.ensure_processor(),
                     frame_count=self.args.benchmark_frames,
                 )
-            self.capture(allow_exposure_changes=original_priority is not None)
-        except BaseException as exc:
-            failure = exc
+            elif self.args.save_dir is not None:
+                self.save_snapshot()
+            else:
+                self.capture()
         finally:
+            original_error = sys.exc_info()[1]
             try:
-                if original_priority is not None:
-                    try:
-                        restored = set_ae_priority(self.camera, original_priority)
-                        if restored is None or not np.isclose(restored, original_priority):
-                            raise RuntimeError(f"exposure priority readback mismatch: {restored}")
-                        print(f"  [restore] auto_exposure_priority -> {restored:g}")
-                    except BaseException as exc:
-                        logger.exception("exposure priority restore failed")
-                        failure = failure or exc
-            finally:
-                try:
-                    self.camera.disconnect()
-                except BaseException as exc:
-                    logger.exception("camera disconnect failed")
-                    failure = failure or exc
-        if failure is not None:
-            raise failure
+                self.camera.disconnect()
+            except BaseException:
+                if original_error is None:
+                    raise
+                logger.exception("camera disconnect failed")
         return 0
 
     def ensure_cloud_transform(self) -> np.ndarray:
@@ -321,8 +276,8 @@ class RealSenseViewer:
         if self.processor is None:
             base_from_color = self.ensure_cloud_transform()
             if self.pointcloud_config.remove_table:
-                self.table_plane = self.fitted_plane if self.args.calibrate_table else load_table_plane(self.table_plane_path)
-                self.table_plane_source = "calibrated_this_run" if self.args.calibrate_table else "resolved_runtime"
+                self.table_plane = load_table_plane(self.table_plane_path)
+                self.table_plane_source = "resolved_runtime"
             self.processor = PointCloudProcessor(
                 depth_scale_m=self.camera.depth_scale_m, intrinsics=self.camera.color_intrinsics,
                 T_xarm_base_from_color=base_from_color, table_plane_abcd=self.table_plane,
@@ -330,126 +285,60 @@ class RealSenseViewer:
             )
         return self.processor
 
-    def capture(self, *, allow_exposure_changes: bool) -> None:
-        print("\nQ/Esc=退出 P=点云 S=raw/processed F=冻结 R=重置 C=配置 D=配色 A=曝光优先级")
-        print("快捷键在诊断窗口内生效；关闭 RGB-D 退出，关闭点云窗口仅关闭点云。")
-        intervals: deque[float] = deque(maxlen=FPS_WINDOW)
-        previous_frame_start = None
-        frame_count = 0
-        enabled, frozen = self.args.cloud is not None, False
-        mode, colormap = self.args.cloud or "processed", "jet"
-        cached_cloud = np.empty((0, 6), dtype=np.float32)
+    def save_snapshot(self):
+        while (frame := read_rgbd(self.camera)) is None:
+            pass
+        processed = self.ensure_processor().process(frame.depth, frame.rgb)
+        base_from_color = self.ensure_cloud_transform()
+        raw = build_raw_point_cloud(
+            depth_raw=frame.depth, color=frame.rgb, depth_scale_m=self.camera.depth_scale_m,
+            intrinsics=self.camera.color_intrinsics, T_xarm_base_from_color=base_from_color,
+        )
+        target = save_diagnostic_snapshot(
+            output_root=self.args.save_dir, frame=frame,
+            raw_point_cloud=raw, processed_point_cloud=processed,
+            depth_scale_m=self.camera.depth_scale_m, intrinsics=self.camera.color_intrinsics,
+            T_xarm_base_from_color=base_from_color,
+            table_plane_abcd=self.table_plane, table_plane_source=self.table_plane_source,
+            pointcloud_config=self.pointcloud_config, camera_info=self.camera_info,
+        )
+        print(f"Snapshot: {target}")
+
+    def capture(self) -> None:
+        print("Q/Esc 或关闭任一窗口退出；点云类型由 --cloud raw/processed 选择。")
         image_viewer = cloud_viewer = None
-        intrinsics = self.camera.color_intrinsics
         depth_scale_m = self.camera.depth_scale_m
-        snapshot_pending = self.args.save_dir is not None
         try:
             image_viewer = ImageViewer("RealSense RGB-D | RGB / Depth")
+            if self.args.cloud is not None:
+                cloud_viewer = PointCloudViewer(
+                    workspace=self.pointcloud_config.workspace,
+                    base_from_color=self.ensure_cloud_transform(),
+                )
             while True:
                 events = image_viewer.poll_events()
-                if "closed" in events:
-                    return
                 if cloud_viewer is not None:
-                    cloud_events = cloud_viewer.poll_events()
-                    if "closed" in cloud_events:
-                        cloud_viewer.close()
-                        cloud_viewer = None
-                        enabled, frozen = False, False
-                        cached_cloud = np.empty((0, 6), dtype=np.float32)
-                    events.extend(key for key in cloud_events if key != "closed")
-                for key in events:
-                    if key in {"q", "esc"}:
-                        return
-                    if key == "a" and allow_exposure_changes:
-                        toggle_ae_priority(self.camera)
-                    elif key == "a":
-                        print("Exposure changes disabled: priority is unsupported")
-                    elif key == "c":
-                        print(f"Point cloud: enabled={enabled} mode={mode} config={self.pointcloud_config}")
-                    elif key == "d":
-                        colormap = "gray" if colormap == "jet" else "jet"
-                    elif key == "f":
-                        if enabled and len(cached_cloud):
-                            frozen = not frozen
-                        else:
-                            print("Freeze unavailable until a nonempty point cloud is displayed")
-                    elif key in {"p", "s", "r"}:
-                        frozen = False
-                        cached_cloud = np.empty((0, 6), dtype=np.float32)
-                        if key == "p":
-                            enabled = not enabled
-                        elif key == "s":
-                            mode = "raw" if mode == "processed" else "processed"
-                        else:
-                            enabled, mode, colormap = False, "processed", "jet"
-                        if cloud_viewer is not None:
-                            if enabled:
-                                cloud_viewer.update(cached_cloud)
-                            else:
-                                cloud_viewer.close()
-                                cloud_viewer = None
-
-                started = time.perf_counter()
+                    events.extend(cloud_viewer.poll_events())
+                if any(key in {"q", "esc", "closed"} for key in events):
+                    return
                 frame = read_rgbd(self.camera)
                 if frame is None:
                     continue
-                read_ms = (time.perf_counter() - started) * 1000
-                if previous_frame_start is not None:
-                    intervals.append(started - previous_frame_start)
-                previous_frame_start = started
-                frame_count += 1
-                rgb, depth = frame.rgb, frame.depth
-                if snapshot_pending:
-                    processed = self.ensure_processor().process(depth, rgb)
-                    base_from_color = self.ensure_cloud_transform()
-                    raw = build_raw_point_cloud(
-                        depth_raw=depth, color=rgb, depth_scale_m=depth_scale_m,
-                        intrinsics=intrinsics, T_xarm_base_from_color=base_from_color,
-                    )
-                    target = save_diagnostic_snapshot(
-                        output_root=self.args.save_dir, frame=frame,
-                        raw_point_cloud=raw, processed_point_cloud=processed,
-                        depth_scale_m=depth_scale_m, intrinsics=intrinsics,
-                        T_xarm_base_from_color=base_from_color,
-                        table_plane_abcd=self.table_plane, table_plane_source=self.table_plane_source,
-                        pointcloud_config=self.pointcloud_config, camera_info=self.camera_info,
-                    )
-                    print(f"Snapshot: {target}")
-                    snapshot_pending = False
-                pcd_ms = 0.0
-                if enabled and not frozen:
-                    self.ensure_cloud_transform()
-                    if cloud_viewer is None:
-                        cloud_viewer = PointCloudViewer(
-                            workspace=self.pointcloud_config.workspace,
-                            base_from_color=self.base_from_color, keys="psfrcda",
-                        )
-                    started = time.perf_counter()
-                    if mode == "processed":
-                        cached_cloud = self.ensure_processor().process(depth, rgb)
+                if cloud_viewer is not None:
+                    if self.args.cloud == "processed":
+                        cloud = self.ensure_processor().process(frame.depth, frame.rgb)
                     else:
-                        cached_cloud = build_raw_point_cloud(
-                            depth_raw=depth, color=rgb, depth_scale_m=depth_scale_m,
-                            intrinsics=intrinsics, T_xarm_base_from_color=self.base_from_color,
+                        cloud = build_raw_point_cloud(
+                            depth_raw=frame.depth, color=frame.rgb, depth_scale_m=depth_scale_m,
+                            intrinsics=self.camera.color_intrinsics,
+                            T_xarm_base_from_color=self.ensure_cloud_transform(),
                         )
-                    pcd_ms = (time.perf_counter() - started) * 1000
-                    cloud_viewer.update(cached_cloud)
-                depth_m = depth.astype(np.float32) * depth_scale_m
-                fps = len(intervals) / sum(intervals) if intervals else 0.0
-                valid = depth_valid_ratio(depth_m, *DEPTH_RANGE_M)
-                point_count = len(cached_cloud)
-                lines = [
-                    f"frame={frame_count} fps={fps:.1f} read={read_ms:.1f}ms pcd={pcd_ms:.1f}ms",
-                    f"valid={valid:.3f} points={point_count} PCD={mode if enabled else 'OFF'} frozen={frozen}",
-                    f"K=[{intrinsics.fx:.1f},{intrinsics.fy:.1f},{intrinsics.ppx:.1f},{intrinsics.ppy:.1f}]",
-                    f"depth={DEPTH_RANGE_M}m cmap={colormap}",
-                    "P=cloud S=raw/processed F=freeze D=colormap R=reset C=config A=AE Q/Esc=quit",
-                ]
+                    cloud_viewer.update(cloud)
                 image_viewer.show(rgbd_panel(
-                    rgb, depth_m, depth_range_m=DEPTH_RANGE_M, colormap=colormap, lines=lines,
+                    frame.rgb, frame.depth.astype(np.float32) * depth_scale_m,
+                    depth_range_m=DEPTH_RANGE_M,
                 ))
         finally:
-            print(f"Captured {frame_count} frames")
             original_error = sys.exc_info()[1]
             cleanup_error = None
             for resource in (cloud_viewer, image_viewer):
@@ -468,12 +357,13 @@ def main(argv=None) -> int:
     parser.add_argument("--config", help="Trusted Python experiment file exporting CONFIG: RealConfig")
     parser.add_argument("--camera-calibration")
     parser.add_argument("--cloud", choices=("raw", "processed"), help="启动时打开所选点云视图")
-    parser.add_argument("--calibrate-table", action="store_true", help="预览前采集五帧拟合桌面；终端确认后才发布")
-    parser.add_argument("--save-dir", type=Path, help="保存首个预览帧的 RGB-D、raw/processed 点云与来源事实")
-    parser.add_argument("--benchmark-frames", type=int, default=0, metavar="N", help="显式测量 N 个新深度帧；默认不运行")
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument("--calibrate-table", action="store_true", help="采集五帧拟合桌面，确认发布后退出")
+    operation.add_argument("--save-dir", type=Path, help="保存一帧 RGB-D、raw/processed 点云与来源事实后退出")
+    operation.add_argument("--benchmark-frames", type=int, metavar="N", help="测量 N 个新深度帧后退出")
     args = parser.parse_args(argv)
-    if args.benchmark_frames < 0:
-        parser.error("--benchmark-frames 必须非负")
+    if args.benchmark_frames is not None and args.benchmark_frames < 1:
+        parser.error("--benchmark-frames 必须为正整数")
     return RealSenseViewer(args).run()
 
 

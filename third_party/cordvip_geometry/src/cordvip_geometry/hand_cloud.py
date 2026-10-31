@@ -21,7 +21,10 @@ class HandCloudModel:
     """Fixed per-link visual samples and mesh-face normals; joints use explicit order and radians.
     URDF origins/scales define metres; IDs and area-weighted sample counts stay fixed."""
 
-    def __init__(self, urdf_path, joint_names, excluded_links=(), num_points=1024, seed=0):
+    def __init__(
+        self, urdf_path, joint_names, excluded_links=(), num_points=1024, seed=0,
+        *, T_camera_from_root,
+    ):
         if (
             isinstance(num_points, bool)
             or not isinstance(num_points, (int, np.integer))
@@ -30,6 +33,8 @@ class HandCloudModel:
             raise ValueError("num_points must be a positive integer")
         if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)) or seed < 0:
             raise ValueError("seed must be a nonnegative integer")
+        self.T_camera_from_root = validate_pose(T_camera_from_root)
+        self.T_camera_from_root.setflags(write=False)
         import pinocchio as pin
         import trimesh
 
@@ -129,20 +134,19 @@ class HandCloudModel:
             "normals": "visual_mesh_face_normals",
         }
 
-    def transform(self, q, T_camera_from_root):
-        """Map measured URDF joints and the URDF-root pose to camera-frame geometry."""
+    def transform(self, q):
+        """Map measured URDF joints through the fixed recorded camera extrinsics."""
         if np.iscomplexobj(q):
             raise ValueError("joint angles must be real")
         q = np.asarray(q, dtype=np.float64)
         if q.shape != (len(self.joint_names),) or not np.isfinite(q).all():
             raise ValueError("joint angles must be finite and match joint_names")
-        pose = validate_pose(T_camera_from_root)
         configuration = np.empty(self._model.nq)
         configuration[self._q_indices] = q
         self._pin.forwardKinematics(self._model, self._data, configuration)
         self._pin.updateFramePlacements(self._model, self._data)
         transforms = np.stack(
-            [pose @ self._data.oMf[index].homogeneous for index in self._frame_ids]
+            [self.T_camera_from_root @ self._data.oMf[index].homogeneous for index in self._frame_ids]
         )[self.link_ids]
         points = np.einsum("nij,nj->ni", transforms[:, :3, :3], self.points) + transforms[:, :3, 3]
         normals = np.einsum("nij,nj->ni", transforms[:, :3, :3], self._normals)

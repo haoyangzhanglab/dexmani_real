@@ -53,6 +53,11 @@ class HomePlanner:
             table=environment.table,
             table_plane_abcd=table_plane_abcd,
         )
+        if self.collision_model.table is None:
+            if not np.isfinite(environment.table_z_surface_m):
+                raise ValueError("table_z_surface_m must be finite")
+            if not np.isfinite(environment.hand_safety_margin_m) or environment.hand_safety_margin_m < 0:
+                raise ValueError("hand_safety_margin_m must be finite and non-negative")
 
     def set_hand_qpos(self, hand_qpos: np.ndarray) -> None:
         self.collision_model.set_hand_qpos(hand_qpos)

@@ -159,6 +159,7 @@ class PointCloudProcessor:
         table_plane_abcd: tuple[float, float, float, float] | None,
         config: PointCloudConfig,
     ):
+        config.validate()
         if T_xarm_base_from_color is None:
             raise ValueError("pointcloud requires camera extrinsics")
         if config.remove_table and table_plane_abcd is None:

@@ -68,20 +68,14 @@ class ArucoSampler:
             return ArucoDetection(corners, ids, (rvec.ravel(), tvec.ravel()))
         return ArucoDetection(corners, ids, None)
 
-    def stationary_arm(self, read_arm, arm_config, after_ns):
-        deadline = time.monotonic_ns() + int(arm_config.feedback_max_age_s * 1e9)
-        while time.monotonic_ns() < deadline:
-            arm = read_arm()
-            if arm["timestamp_ns"] <= after_ns:
-                time.sleep(0.01)
-                continue
-            if np.max(np.abs(arm["qvel"])) > arm_config.homing.velocity_convergence_rad_s:
-                raise ValueError("arm is moving during calibration capture")
-            return arm
-        raise TimeoutError("fresh arm feedback unavailable after capture barrier")
+    def stationary_arm(self, read_arm, arm_config):
+        arm = read_arm()
+        if np.max(np.abs(arm["qvel"])) > arm_config.homing.velocity_convergence_rad_s:
+            raise ValueError("arm is moving during calibration capture")
+        return arm
 
     def capture(self, read_camera, read_arm, *, camera_config, arm_config):
-        arm_before = self.stationary_arm(read_arm, arm_config, time.monotonic_ns())
+        arm_before = self.stationary_arm(read_arm, arm_config)
         last_stamp, last_color_frame = time.monotonic_ns(), -1
         rotations, translations, frames = [], [], []
         for _ in range(CAPTURE_FRAMES):
@@ -125,7 +119,7 @@ class ArucoSampler:
                 rotations.append(pose[0])
                 translations.append(pose[1])
 
-        arm_after = self.stationary_arm(read_arm, arm_config, time.monotonic_ns())
+        arm_after = self.stationary_arm(read_arm, arm_config)
         if (
             np.max(np.abs(arm_after["qpos"] - arm_before["qpos"]))
             > arm_config.homing.convergence_rad

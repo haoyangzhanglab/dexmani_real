@@ -98,8 +98,7 @@ class ActionMapper:
         hand = self.prepare_hand(hand)
         if self.solver is None:
             raise ValueError("EEF mapping requires an online IK solver")
-        # 先验证原始位姿，再裁剪位置；不能让 clip 掩盖非有限输入。
-        pose = Pose(pose.p, pose.q)
+        # 两个调用方均交出刚构造的临时 Pose；位置与四元数已在构造时检查。
         workspace = self.constraints.workspace
         pose.p = np.clip(pose.p, workspace[:, 0], workspace[:, 1])
         result = self.solver.solve(

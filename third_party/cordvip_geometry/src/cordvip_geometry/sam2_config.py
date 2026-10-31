@@ -1,9 +1,8 @@
 """Local Grounded-SAM2 inputs; checks never import models or open devices."""
 
-import json
-from pathlib import Path
-import subprocess
+import os
 import sys
+from pathlib import Path
 
 from .io import existing_file
 
@@ -64,12 +63,6 @@ def add_sam_arguments(parser, workspace):
         type=Path,
         default=workspace / "reports/cordvip_models" / GROUNDING_MODEL["directory"],
     )
-    parser.add_argument(
-        "--box-threshold", type=float, default=0.3, help="Grounding DINO 候选框阈值"
-    )
-    parser.add_argument(
-        "--text-threshold", type=float, default=0.25, help="Grounding DINO 文本 token 阈值"
-    )
 
 
 def resolve_sam_arguments(args, workspace):
@@ -112,73 +105,22 @@ def validate_grounding_weights(directory):
     return directory
 
 
-def check_sam_environment(args, *, require_grounding=True):
+def check_sam_environment(args):
     checks = []
     for name, check in (
+        ("SAM Python", lambda: existing_file(args.sam_python)),
         ("Grounded-SAM2 source", lambda: validate_sam_source(args.sam_root)),
         (
             "SAM2.1 checkpoint/config",
             lambda: validate_sam_checkpoint(args.sam_root, args.sam_checkpoint, args.sam_config),
         ),
+        ("Grounding DINO local files", lambda: validate_grounding_weights(args.dino_weights)),
     ):
         try:
             detail = check()
+            if name == "SAM Python" and not os.access(detail, os.X_OK):
+                raise ValueError(f"Python is not executable: {detail}")
             checks.append(dict(name=name, ok=True, detail=str(detail)))
         except (OSError, ValueError) as error:
             checks.append(dict(name=name, ok=False, detail=str(error)))
-    if require_grounding:
-        try:
-            directory = validate_grounding_weights(args.dino_weights)
-            checks.append(dict(name="Grounding DINO local files", ok=True, detail=str(directory)))
-        except (OSError, ValueError) as error:
-            checks.append(dict(name="Grounding DINO local files", ok=False, detail=str(error)))
-    # Metadata only. The worker adds the local source directory to its import path.
-    script = """
-import importlib.metadata
-import importlib.util
-import json
-import sys
-
-packages = ["torch", "torchvision", "numpy"]
-modules = ["hydra", "omegaconf", "iopath", "PIL", "tqdm"]
-if sys.argv[1] == "grounding":
-    packages.append("transformers")
-    modules.append("safetensors")
-versions = {}
-for name in packages:
-    try:
-        versions[name] = importlib.metadata.version(name)
-    except importlib.metadata.PackageNotFoundError:
-        versions[name] = None
-print(json.dumps(dict(
-    python=list(sys.version_info[:2]),
-    packages=versions,
-    modules={name: importlib.util.find_spec(name) is not None for name in modules},
-)))
-"""
-    try:
-        result = subprocess.run(
-            [
-                str(args.sam_python.expanduser().absolute()),
-                "-I",
-                "-c",
-                script,
-                "grounding" if require_grounding else "tracking",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=True,
-        )
-        data = json.loads(result.stdout)
-        ok = all(data["packages"].values()) and all(data["modules"].values())
-        checks.append(dict(name="Grounded-SAM2 environment", ok=ok, detail=json.dumps(data)))
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        checks.append(
-            dict(
-                name="Grounded-SAM2 environment",
-                ok=False,
-                detail=getattr(error, "stderr", None) or str(error),
-            )
-        )
     return checks

@@ -19,21 +19,14 @@ def main():
     protocol = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     engine = None
-    session = None
-    last_request = 0
     try:
         while True:
             try:
                 request, arrays = receive(sys.stdin.buffer)
             except EOFError:
                 break
-            reply = {key: request[key] for key in ("session", "request", "frame_key")}
+            reply = dict(frame_key=request["frame_key"])
             try:
-                if session is None:
-                    session = request["session"]
-                if request["session"] != session or request["request"] != last_request + 1:
-                    raise ValueError("Out-of-order SAM2 request")
-                last_request = request["request"]
                 operation = request["operation"]
                 output = {}
                 if operation == "load":

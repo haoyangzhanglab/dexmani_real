@@ -25,7 +25,7 @@ def generate_hand_template(
 ) -> Path:
     import trimesh
 
-    HandCloudConfig(num_points=num_points)
+    HandCloudConfig(num_points=num_points).validate()
     path = output_dir / f"hand_{num_points}.npz"
     if path.exists() and not overwrite:
         raise FileExistsError(f"Hand template already exists: {path}; use --overwrite to regenerate")

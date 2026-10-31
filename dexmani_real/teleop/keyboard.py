@@ -24,9 +24,8 @@ logger = logging.getLogger(__name__)
 
 
 class KeyboardTeleop:
-    def __init__(self, runtime, *, no_hand):
+    def __init__(self, runtime):
         self.runtime = runtime
-        self.no_hand = no_hand
 
     def run(self):
         configure_logging()
@@ -36,9 +35,6 @@ class KeyboardTeleop:
             if self.runtime.environment.table.enabled else None
         )
         self.bounds = jog_bounds(self.runtime)
-        if not self.runtime.hand.enabled and not self.no_hand:
-            raise ValueError("hand-disabled operation requires --no-hand")
-
         self.runtime_state = SessionState()
         self.robot = Robot(
             self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,

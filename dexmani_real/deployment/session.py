@@ -2,6 +2,7 @@
 
 import logging
 import multiprocessing as mp
+import sys
 import time
 from collections import Counter
 from dataclasses import asdict
@@ -12,7 +13,6 @@ from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.raw import camera_metadata
 from dexmani_real.data.recorder import RecordingError
-from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.rollout import Rollout, failure_reason, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
@@ -26,7 +26,11 @@ from dexmani_real.runtime.lifecycle import (
     SensorWorkers,
     close_runtime,
 )
-from dexmani_real.runtime.observation import check_observation, read_observation
+from dexmani_real.runtime.observation import (
+    ObservationNeeds,
+    check_observation,
+    read_observation,
+)
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.io import write_json, write_yaml
@@ -40,7 +44,7 @@ class PolicySession:
     def __init__(
         self, runtime, info, *, output_dir, run_config, device, seed,
         max_running_s, num_episodes, record_raw, camera_calibration_path, table_plane_abcd,
-        dependencies, control_needs, record_needs, needs,
+        observations,
     ):
         self.run_config = run_config
         self.runtime, self.info = runtime, info
@@ -50,8 +54,11 @@ class PolicySession:
         self.record_raw = record_raw
         self.output_dir = output_dir
         self.camera_calibration_path = camera_calibration_path
-        self.dependencies = dependencies
-        self.control_needs, self.record_needs, self.needs = control_needs, record_needs, needs
+        self.observations = observations
+        self.record_needs = (
+            ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
+            if record_raw else ObservationNeeds()
+        )
         self.runtime_state = self.sensors = self.robot = self.keyboard = self.model = None
         self.episode = self.start_epoch = None
         self.capture_ids = count(1)
@@ -108,7 +115,6 @@ class PolicySession:
                 self.runtime_state.request_emergency_stop()
         except Exception as exc:
             failure = exc
-            self.errors.append(error_detail("session", exc))
             if self.runtime_state is not None:
                 self.runtime_state.mark_error()
                 self.runtime_state.end_session(reason=failure_reason(exc))
@@ -122,11 +128,11 @@ class PolicySession:
 
         from dexmani_real.deployment.inference import PolicyWorker
 
+        needs = self.observations.needs.union(self.record_needs)
+        if needs.camera_worker:
+            self.runtime.camera.validate()
         self.runtime_state = SessionState()
         self.camera_snapshot = None
-        self.observations = ObservationBuilder(
-            self.info, self.runtime, dependencies=self.dependencies, needs=self.control_needs,
-        )
         self.action_mapper = ActionMapper.for_mode(
             self.info.action_mode, arm=self.runtime.arm, hand=self.runtime.hand,
             motion=self.runtime.motion, environment=self.runtime.environment,
@@ -149,8 +155,8 @@ class PolicySession:
         channels = (
             SensorChannels(
                 self.process_context, camera=self.runtime.camera,
-                pointcloud_num_points=self.runtime.pointcloud.num_points if self.needs.point_cloud else None,
-            ) if self.needs.camera_worker else None
+                pointcloud_num_points=self.runtime.pointcloud.num_points if needs.point_cloud else None,
+            ) if needs.camera_worker else None
         )
         self.sensors = SensorWorkers(channels)
         self.robot = Robot(
@@ -163,8 +169,9 @@ class PolicySession:
         if self.keyboard.estop_latched or not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
             return False
-        control_camera = bool(self.control_needs.camera_fields) or self.control_needs.point_cloud
-        for name, needed in (("camera", control_camera), ("pointcloud", self.control_needs.point_cloud)):
+        needs = self.observations.needs
+        control_camera = bool(needs.camera_fields) or needs.point_cloud
+        for name, needed in (("camera", control_camera), ("pointcloud", needs.point_cloud)):
             if needed and not self.sensors.check(names=(name,)):
                 raise RobotError(f"control {name} process exited")
         if self.record_needs.camera_fields and not control_camera and not self.sensors.check(names=("camera",)):
@@ -172,8 +179,9 @@ class PolicySession:
         return True
 
     def start_devices(self):
+        needs = self.observations.needs.union(self.record_needs)
         self.robot.connect()
-        if self.needs.camera_worker:
+        if needs.camera_worker:
             self.sensors.start(
                 self.process_context.Process(
                     name="camera",
@@ -184,7 +192,7 @@ class PolicySession:
                 timeout_s=CAMERA_READY_TIMEOUT_S,
                 may_start=lambda: self.keyboard.check_health() and self.runtime_state.requests_allow_motion(),
             )
-            needs_extrinsics = self.needs.point_cloud or "camera_extrinsic" in self.info.observation_fields
+            needs_extrinsics = needs.point_cloud or "camera_extrinsic" in self.info.observation_fields
             self.camera_snapshot = snapshot_camera_parameters(
                 self.sensors.channels, self.runtime.camera, self.camera_calibration_path,
                 require_extrinsics=needs_extrinsics,
@@ -201,7 +209,7 @@ class PolicySession:
             write_yaml(
                 self.run_config, self.output_dir / "run_config.yaml",
             )
-        if self.needs.point_cloud:
+        if needs.point_cloud:
             from dexmani_real.perception.worker import run_pointcloud_worker
 
             self.sensors.start(
@@ -216,7 +224,7 @@ class PolicySession:
                 timeout_s=POINTCLOUD_READY_TIMEOUT_S,
                 may_start=lambda: self.keyboard.check_health() and self.runtime_state.requests_allow_motion(),
             )
-        if self.needs.camera_static and not self.needs.camera_fields and not self.needs.point_cloud:
+        if needs.camera_static and not needs.camera_fields and not needs.point_cloud:
             if not self.sensors.shutdown(deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S):
                 raise RuntimeError("static camera failed to close normally")
             self.sensors.channels = None
@@ -330,7 +338,7 @@ class PolicySession:
         # 模型/相机启动可能耗尽 connect 的首帧期限；尚未运动，重新建立本次反馈等待。
         self.robot.reset_hand_feedback()
         self.robot.read_initial_state(
-            required_tactile=self.control_needs.required_tactile,
+            required_tactile=self.observations.needs.required_tactile,
             cancel_requested=lambda: not self.runtime_state.requests_allow_motion(),
         )
         rows = []
@@ -345,8 +353,8 @@ class PolicySession:
             if now < next_sample_ns:
                 time.sleep(min(0.005, (next_sample_ns - now) / 1e9))
                 continue
-            row = read_observation(self.sensors.channels, self.robot, needs=self.control_needs)
-            issues, _ = check_observation(row, self.runtime, self.control_needs)
+            row = read_observation(self.sensors.channels, self.robot, needs=self.observations.needs)
+            issues, _ = check_observation(row, self.runtime, self.observations.needs)
             if issues:
                 raise ValueError("warmup observation: " + "; ".join(issues))
             rows.append(self.observations.project(row))
@@ -505,17 +513,14 @@ class PolicySession:
                 self.runtime_state, self.runtime, self.info, preparing_epoch=epoch,
                 robot=self.robot, sensors=self.sensors, observations=self.observations,
                 record_needs=self.record_needs, action_mapper=self.action_mapper, model=self.model,
-                needs=self.needs,
                 max_running_s=self.max_running_s, capture_ids=self.capture_ids,
                 index=len(self.episodes) + 1, output_dir=self.output_dir, record_raw=self.record_raw,
                 camera_snapshot=self.camera_snapshot,
             )
-            failure = None
             try:
                 episode.run(keyboard=self.keyboard, poll_operator=self.poll_operator)
-            except BaseException as exc:
-                failure = exc
             finally:
+                primary_failure = sys.exc_info()[0] is not None
                 self.episodes.append(episode.result)
                 self.start_epoch = None
                 # 返回时若仍有 native 任务，保留所属轮次句柄，异常会终止会话。
@@ -526,9 +531,8 @@ class PolicySession:
                 except BaseException as exc:
                     logger.exception("episode result write failed")
                     self.errors.append(error_detail("episode_save", exc))
-                    failure = failure or exc
-            if failure is not None:
-                raise failure
+                    if not primary_failure:
+                        raise
             result = episode.result
             if result.started_utc is not None:
                 completed = sum(item.started_utc is not None for item in self.episodes)

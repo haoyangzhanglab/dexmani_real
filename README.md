@@ -25,7 +25,7 @@ CONFIG = replace(base,
 )
 ```
 
-本仓已退出实验 YAML、递归覆盖和任意嵌套 CLI override，旧实验文件需一次迁移，用户文件不会被自动删除。任务、路径、段数、时长、录制选择及 `--weights/--inference-steps/--seed/--device` 留在 CLI。`--no-hand` 只确认配置已显式关闭手，遥操作无手调试还须关闭录制。Policy 配方从 checkpoint 恢复，其训练配置和运行快照可继续用 YAML；本仓迁移不改变外部模型协议。
+本仓已退出实验 YAML、递归覆盖和任意嵌套 CLI override，旧实验文件需一次迁移，用户文件不会被自动删除。任务、路径、段数、时长、录制选择及 `--weights/--inference-steps/--seed/--device` 留在 CLI。无手运行只需在 Python 配置中设 `hand.enabled=False`；VR 遥操作还须关闭录制（配置或 `--no-record`），实物手须移除或固定在配置的 HOME 姿态，供碰撞规划使用。Policy 配方从 checkpoint 恢复，其训练配置和运行快照可继续用 YAML；本仓迁移不改变外部模型协议。
 
 ```bash
 python scripts/collect_teleop.py --print-config
@@ -94,20 +94,25 @@ python scripts/calibrate_camera.py solve calibration_samples/run_001 --output ca
 python scripts/calibrate_camera.py solve calibration_samples/run_001 --exclude 3 --output camera_calibration_clean.json
 python scripts/calibrate_vr_heading.py --ref head
 python scripts/tools/view_realsense.py
-python scripts/tools/view_realsense.py --cloud processed --calibrate-table
+python scripts/tools/view_realsense.py --cloud processed
+python scripts/tools/view_realsense.py --calibrate-table
+python scripts/tools/view_realsense.py --save-dir snapshots
+python scripts/tools/view_realsense.py --benchmark-frames 20
 ```
 
 collect 的相机持续连接，Enter 为一组只读机械臂采样，完成立即断开臂；Q 结束。五帧原 RGB、检测、来源时间、实测位置/速度和样本 ID 保存为 NPZ，速度、帧新鲜度及前后漂移仍检查。solve 不连接设备，按原 ID 排除样本，保存逐样本残差和 used/excluded/worst IDs；质量合格后写入原 serial 映射格式外参，报告使用同名 `.result.json`。VR 头朝向直接消费头帧，不要求右手就绪。
 
 solve 的外参输出与派生报告不得覆盖 `capture.json` 或原始采样 NPZ；其他新结果仍可保存在采样目录内。
 
-相机查看统一使用 view_realsense.py：P 开关点云、S 切 raw/processed、F 冻结点云、D 切深度颜色、R 重置、C 打印配置、A 切曝光优先级、Q/Esc 退出。退出恢复原曝光设置。`--save-dir PATH` 保存 RGB-D、两类点云及来源事实；`--benchmark-frames N` 才运行性能测量。`--calibrate-table` 在终端明确确认后更新共享平面，阶段复用一个连接。窗口需要桌面/OpenGL，代码清理测试不自动连接真实设备。
+相机查看统一使用 view_realsense.py：默认 RGB-D，`--cloud raw/processed` 在启动时选择固定点云类型；Q/Esc 或关闭任一窗口退出。预览不修改曝光优先级，不提供运行中模式切换和逐帧诊断面板。`--save-dir PATH` 保存一帧 RGB-D、两类点云及来源事实；`--benchmark-frames N` 测量 N 个新深度帧；`--calibrate-table` 采集五帧拟合桌面并在终端明确确认后更新共享平面。这三项互斥，执行后退出。窗口需要桌面/OpenGL，代码清理测试不自动连接真实设备。
 
 点云默认使用基座系 XYZRGB，工作空间 `x=[0.15,0.85]、y=[-0.50,0.50]、z=[0,0.80] m`，去桌面间隙 10 mm。深度邻域支持、体素、半径密度和连通分量过滤后 FPS；空点云在 viewer 清除、导出拒绝。几何规则可能丢失细结构，参数和配方必须随实验保持一致。
 
 ## 离线物体几何和分析
 
 CordVIP 流程为同一 Raw 首帧人工确认 mask → 顺序全部行 → 必存逐行结果 → 独立查看。保留单/多物体、无资产 mask-only、独立 observed/model、法向、手 FK、SAM RPC 与历史清理；深度支持量参与 pose-valid，pose 丢失不删除独立实测点。已退出 live/capture、latest/心跳/STALE 服务和按墙钟跳行。
+
+逐帧结果统一保存在 `frames/*.npz`，包含状态、失败原因、门控前候选位姿与已计算的深度支持数据；候选存在不代表 `pose_valid=True`。场景、配置、模型来源和结束摘要各保存一次，默认不再生成逐帧 `records.jsonl` 或分析报告。可按需用 `numpy.load(path, allow_pickle=False)` 读取 NPZ 离线计算指标。
 
 ```bash
 python scripts/cordvip/track_object.py --episode episodes/TASK/EPISODE --scene scene.json --with-hand --output outputs/scene_001
@@ -117,6 +122,6 @@ python scripts/analyze_timing.py episodes/TASK/EPISODE
 
 物体生成先保存未定尺度 mesh，实测定尺度后才一次采样最终点/法向。初始 mask 仅可复用于相同 RGB-D、相机几何、行和来源时间。流程、模型安装与结果字段见 [CordVIP 文档](scripts/cordvip/README.md)。同行关联不证明手/相机物理同步，模型表面与语义点不代表实测接触。
 
-默认日志为终端 INFO、拒绝原因、完整异常 traceback 和简短段结果；不再创建每进程 DEBUG 文件或默认聚合性能指标。需要留档时使用 shell 重定向。回放指标通过 evaluate_replay.py 显式计算，分析失败不回写控制结果；指标按索引比较实测轨迹，不代表目标跟踪或时间对齐。analyze_timing.py 只报告采样间隔、readout 和来源年龄，明确列出缺失/非法来源，不推断曝光或 SDK 延迟。几何环境检查仅显式 `--check` 运行。
+默认日志为终端 INFO、拒绝原因、完整异常 traceback 和简短段结果；不再创建每进程 DEBUG 文件或默认聚合性能指标。需要留档时使用 shell 重定向。回放指标通过 evaluate_replay.py 显式计算，分析失败不回写控制结果；指标按索引比较实测轨迹，不代表目标跟踪或时间对齐。analyze_timing.py 只报告采样间隔、readout 和来源年龄，明确列出缺失/非法来源，不推断曝光或 SDK 延迟。几何环境检查使用独立命令 `python -m cordvip_geometry check`。
 
 开发约定见 [AGENTS.md](AGENTS.md)。

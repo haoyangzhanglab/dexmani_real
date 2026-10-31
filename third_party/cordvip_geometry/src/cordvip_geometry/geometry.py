@@ -148,6 +148,11 @@ def validate_rgbd(rgb, depth_m, intrinsics):
     rgb = np.asarray(rgb)
     if rgb.dtype != np.uint8 or rgb.shape != (*depth_m.shape, 3):
         raise ValueError("RGB must be uint8 (H, W, 3), aligned with depth")
+    return rgb, depth_m, validate_intrinsics(intrinsics)
+
+
+def validate_intrinsics(intrinsics):
+    """Own one finite pinhole matrix at the input boundary."""
     if np.iscomplexobj(intrinsics):
         raise ValueError("Intrinsics must be real")
     intrinsics = np.array(intrinsics, dtype=np.float64, copy=True)
@@ -159,70 +164,59 @@ def validate_rgbd(rgb, depth_m, intrinsics):
         raise ValueError("Intrinsics have an invalid homogeneous row")
     if abs(intrinsics[0, 1]) > 1e-9 or abs(intrinsics[1, 0]) > 1e-9:
         raise ValueError("Only zero-skew pinhole intrinsics are supported")
-    return rgb, depth_m, intrinsics
+    intrinsics.setflags(write=False)
+    return intrinsics
+
+
+def validate_distortion(model, coefficients):
+    """Admit the recorded forward distortion model once per camera."""
+    model = model.removeprefix("distortion.")
+    if model not in {"none", "brown_conrady"}:
+        raise ValueError(f"Unsupported distortion model: {model}")
+    if np.iscomplexobj(coefficients):
+        raise ValueError("Distortion coefficients must be real")
+    coefficients = np.asarray(coefficients, dtype=np.float64)
+    if coefficients.shape != (5,) or not np.isfinite(coefficients).all():
+        raise ValueError("Brown-Conrady distortion must be a finite five-element vector")
+    if model == "none" and np.any(coefficients != 0):
+        raise ValueError("none distortion requires zero coefficients")
+    return tuple(coefficients)
 
 
 class RectificationMaps:
-    """One session's last image geometry; bounded to one pair of OpenCV maps."""
+    """One admitted fixed camera's maps; no per-frame camera cache or stream switching."""
 
-    def __init__(self):
-        self.key = self.maps = None
+    def __init__(self, shape, intrinsics, distortion):
+        self.maps = None
+        if np.any(distortion):
+            import cv2
 
-    def get(self, shape, intrinsics, distortion):
-        import cv2
-
-        key = (
-            tuple(shape),
-            np.asarray(intrinsics, dtype=np.float64).tobytes(),
-            np.asarray(distortion, dtype=np.float64).tobytes(),
-        )
-        if key != self.key:
             height, width = shape
-            maps = cv2.initUndistortRectifyMap(
+            self.maps = cv2.initUndistortRectifyMap(
                 intrinsics,
-                distortion,
+                np.asarray(distortion),
                 None,
                 intrinsics,
                 (width, height),
                 cv2.CV_32FC1,
             )
-            self.key, self.maps = key, maps
-        return self.maps
 
+    def apply(self, rgb, depth_m, mask=None):
+        """Rectify arrays; a separately supplied selection mask remains an input boundary."""
+        if mask is not None:
+            mask = np.asarray(mask)
+            if mask.shape != depth_m.shape or not np.isfinite(mask).all():
+                raise ValueError("Mask must be finite and have the same (H, W) shape as depth")
+            mask = mask.astype(bool)
+        if self.maps is None:
+            return rgb.copy(), depth_m.copy(), None if mask is None else mask.copy()
+        import cv2
 
-def rectify_rgbd(rgb, depth_m, intrinsics, distortion, mask=None, *, maps=None):
-    """Rectify admitted Frame arrays; a separately supplied mask remains an input boundary."""
-    intrinsics = intrinsics.copy()
-    if mask is not None:
-        mask = np.asarray(mask)
-        if mask.shape != depth_m.shape or not np.isfinite(mask).all():
-            raise ValueError("Mask must be finite and have the same (H, W) shape as depth")
-        mask = mask.astype(bool)
-    if np.iscomplexobj(distortion):
-        raise ValueError("Distortion coefficients must be real")
-    distortion = np.asarray(distortion, dtype=np.float64)
-    if distortion.shape != (5,) or not np.isfinite(distortion).all():
-        raise ValueError("Brown-Conrady distortion must be a finite five-element vector")
-    if not np.any(distortion):
-        return rgb.copy(), depth_m.copy(), intrinsics, None if mask is None else mask.copy()
-    import cv2
-
-    height, width = depth_m.shape
-    if maps is None:
-        map_x, map_y = cv2.initUndistortRectifyMap(
-            intrinsics,
-            distortion,
-            None,
-            intrinsics,
-            (width, height),
-            cv2.CV_32FC1,
-        )
-    else:
-        map_x, map_y = maps.get((height, width), intrinsics, distortion)
-    rgb = cv2.remap(rgb, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-    depth_m = cv2.remap(depth_m, map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
-    if mask is not None:
-        mask = cv2.remap(
-            mask.astype(np.uint8), map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT
-        ).astype(bool)
-    return rgb, depth_m, intrinsics, mask
+        map_x, map_y = self.maps
+        rgb = cv2.remap(rgb, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        depth_m = cv2.remap(depth_m, map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
+        if mask is not None:
+            mask = cv2.remap(
+                mask.astype(np.uint8), map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT
+            ).astype(bool)
+        return rgb, depth_m, mask

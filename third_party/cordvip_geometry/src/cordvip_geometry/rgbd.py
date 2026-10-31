@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .geometry import validate_rgbd
+from .geometry import RectificationMaps, validate_distortion, validate_rgbd
 
 
 @dataclass(frozen=True)
@@ -23,21 +23,6 @@ class Frame:
     timestamp_ns: int
     clock: str
     row_index: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.depth_m.dtype != np.float32:
-            raise ValueError("aligned depth must be finite nonnegative float32 [H,W] metres")
-        _, _, intrinsics = validate_rgbd(self.rgb, self.depth_m, self.K)
-        intrinsics.setflags(write=False)
-        object.__setattr__(self, "K", intrinsics)
-        if (
-            len(self.distortion_coeffs) != 5
-            or not np.isfinite(self.distortion_coeffs).all()
-            or not self.distortion_model
-        ):
-            raise ValueError("camera distortion requires its model and five finite coefficients")
-        if not self.source_id or not self.clock or self.timestamp_ns < 0:
-            raise ValueError("frame requires source identity, clock, and a nonnegative timestamp")
 
 
 def load_frame(path: str | Path) -> Frame:
@@ -75,11 +60,15 @@ def load_frame(path: str | Path) -> Frame:
         if coefficients.shape != (5,) or coefficients.dtype.kind not in {"f", "i", "u"}:
             raise ValueError(f"{path.name}: distortion_coeffs must contain five numbers")
         k1, k2, p1, p2, k3 = map(float, coefficients)
+        if saved["depth_m"].dtype != np.float32:
+            raise ValueError("aligned depth must be finite nonnegative float32 [H,W] metres")
+        rgb, depth_m, K = validate_rgbd(saved["rgb"], saved["depth_m"], saved["K"])
+        distortion = validate_distortion(text["distortion_model"], (k1, k2, p1, p2, k3))
         return Frame(
-            rgb=saved["rgb"],
-            depth_m=saved["depth_m"],
-            K=saved["K"],
-            distortion_coeffs=(k1, k2, p1, p2, k3),
+            rgb=rgb,
+            depth_m=depth_m,
+            K=K,
+            distortion_coeffs=distortion,
             row_index=integer.get("row_index"),
             timestamp_ns=integer["timestamp_ns"],
             **text,
@@ -105,12 +94,7 @@ def save_frame(path, frame):
 
 def rectify_frame(frame, mask=None, *, maps=None):
     """Return aligned RGB, measured depth, K and optional mask on the pinhole grid."""
-    from .geometry import rectify_rgbd
-
-    model = frame.distortion_model.removeprefix("distortion.")
-    coefficients = np.asarray(frame.distortion_coeffs)
-    if model not in {"none", "brown_conrady"}:
-        raise ValueError(f"Unsupported distortion model: {frame.distortion_model}")
-    if model == "none" and np.any(coefficients != 0):
-        raise ValueError("none distortion requires zero coefficients")
-    return rectify_rgbd(frame.rgb, frame.depth_m, frame.K, coefficients, mask=mask, maps=maps)
+    if maps is None:
+        maps = RectificationMaps(frame.depth_m.shape, frame.K, frame.distortion_coeffs)
+    rgb, depth_m, mask = maps.apply(frame.rgb, frame.depth_m, mask)
+    return rgb, depth_m, frame.K, mask

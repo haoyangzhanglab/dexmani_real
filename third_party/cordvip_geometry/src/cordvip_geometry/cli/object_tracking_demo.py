@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def main(argv=None, *, workspace=None):
@@ -61,7 +65,13 @@ def view_results(directory, *, show_3d=True, headless=False):
             count += 1
     finally:
         if viewer is not None:
-            viewer.close()
+            failed = sys.exc_info()[0] is not None
+            try:
+                viewer.close()
+            except BaseException:
+                if not failed:
+                    raise
+                logger.exception("scene viewer close also failed")
     print(f'已读取 {count} 行场景结果：{directory}')
     return 0
 

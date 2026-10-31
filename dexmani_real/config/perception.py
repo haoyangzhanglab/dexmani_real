@@ -12,11 +12,7 @@ class PointCloudConfig:
     table_margin_m: float = 0.010
     workspace: tuple[float, ...] = (0.15, -0.50, 0.0, 0.85, 0.50, 0.80)
 
-    def __post_init__(self):
-        if type(self.remove_table) is not bool:
-            raise TypeError("remove_table must be bool")
-        if type(self.num_points) is not int or self.num_points < 1:
-            raise ValueError("num_points must be a positive integer")
+    def workspace_bounds(self):
         workspace = np.asarray(self.workspace, dtype=np.float64)
         if (
             workspace.shape != (6,)
@@ -24,15 +20,22 @@ class PointCloudConfig:
             or np.any(workspace[:3] >= workspace[3:])
         ):
             raise ValueError("workspace must contain finite ordered xyz lower/upper bounds")
+        return workspace.reshape(2, 3)
+
+    def validate(self):
+        if type(self.remove_table) is not bool:
+            raise TypeError("remove_table must be bool")
+        if type(self.num_points) is not int or self.num_points < 1:
+            raise ValueError("num_points must be a positive integer")
+        self.workspace_bounds()
         if self.remove_table and (not np.isfinite(self.table_margin_m) or self.table_margin_m < 0):
             raise ValueError("table_margin_m must be finite and nonnegative")
-        object.__setattr__(self, "workspace", tuple(float(v) for v in workspace))
 
 
 @dataclass(frozen=True)
 class HandCloudConfig:
     num_points: int = 1024
 
-    def __post_init__(self):
+    def validate(self):
         if type(self.num_points) is not int or self.num_points < 1:
             raise ValueError("hand point count must be a positive integer")

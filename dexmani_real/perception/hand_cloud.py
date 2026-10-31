@@ -3,6 +3,7 @@
 import numpy as np
 
 from dexmani_real import ASSET_DIR
+from dexmani_real.config.perception import HandCloudConfig
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
 from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE
 
@@ -11,6 +12,7 @@ HAND_TEMPLATE_DIR = ASSET_DIR / "pointcloud_template" / "hand"
 
 class HandPointCloud:
     def __init__(self, hand_fk: HandFK, num_points: int):
+        HandCloudConfig(num_points=num_points).validate()
         path = HAND_TEMPLATE_DIR / f"hand_{num_points}.npz"
         try:
             with np.load(path, allow_pickle=False) as template:

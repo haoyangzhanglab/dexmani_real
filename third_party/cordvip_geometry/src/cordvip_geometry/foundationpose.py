@@ -1,21 +1,21 @@
 """FoundationPose adapter with process-local CUDA imports; construct only in the standalone owner."""
 
 import importlib
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import numpy as np
 
 from .geometry import validate_pose
 
-
 PLUS_REVISION = "58aa7154de23ae86d542366858fc6bcca3b747b0"
+MIN_DEPTH_PIXELS = 4
 
 
 def prepare_tracking_frame(rgb, depth_m, intrinsics):
     """Share upstream tracking tensors within one frame; registration keeps its own preprocessing."""
     import torch
-    from Utils import erode_depth, bilateral_filter_depth, depth2xyzmap_batch
+    from Utils import bilateral_filter_depth, depth2xyzmap_batch, erode_depth
 
     depth = torch.as_tensor(depth_m, device="cuda", dtype=torch.float)
     depth = erode_depth(depth, radius=2, device="cuda")
@@ -31,11 +31,9 @@ def guide_centered_pose(pose_camera_centered, intrinsics, mask):
     """Guide the centered mesh from the 2-D bbox, preserving previous Z and rotation.
     T_camera_asset = T_camera_centered @ T_centered_asset; never fill depth to infer a centroid."""
     pose = validate_pose(pose_camera_centered)
-    K, mask = np.asarray(intrinsics), np.asarray(mask)
+    K, mask = intrinsics, np.asarray(mask)
     if mask.ndim != 2 or mask.dtype != np.bool_ or not mask.any():
         raise ValueError("2D guidance requires a nonempty exclusive bool mask")
-    if K.shape != (3, 3) or not np.isfinite(K).all() or K[0, 0] <= 0 or K[1, 1] <= 0:
-        raise ValueError("Invalid camera intrinsics for 2D guidance")
     z = pose[2, 3]
     if z <= 0:
         raise ValueError("Previous centered pose must be in front of the camera")
@@ -69,39 +67,40 @@ class FoundationPosePlusTracker:
                 raise ValueError("Refinement iterations must be positive integers")
         self.register_iterations = register_iterations
         self.track_iterations = track_iterations
-        self.intrinsics = None
 
-        import torch
+        if shared_with is None:
+            import torch
 
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "FoundationPose requires CUDA; input validation alone does not run tracking"
-            )
-        # Upstream uses generic module names. Refuse a mixture of different source directories.
-        for name in ("estimater", "Utils", "learning", "datareader"):
-            existing = sys.modules.get(name)
-            if existing is not None:
-                source = getattr(existing, "__file__", None)
-                locations = [source] if source else list(getattr(existing, "__path__", ()))
-                if not locations or any(
-                    not Path(path).resolve().is_relative_to(self.root) for path in locations
-                ):
-                    raise RuntimeError(
-                        f"Module {name!r} is already loaded outside {self.root}; use a fresh process"
-                    )
-        sys.path.insert(0, str(self.root))
-        estimator_module = importlib.import_module("estimater")
-        import nvdiffrast.torch as dr
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "FoundationPose requires CUDA; input validation alone does not run tracking"
+                )
+            # Upstream uses generic module names. Refuse a mixture of different source directories.
+            for name in ("estimater", "Utils", "learning", "datareader"):
+                existing = sys.modules.get(name)
+                if existing is not None:
+                    source = getattr(existing, "__file__", None)
+                    locations = [source] if source else list(getattr(existing, "__path__", ()))
+                    if not locations or any(
+                        not Path(path).resolve().is_relative_to(self.root) for path in locations
+                    ):
+                        raise RuntimeError(
+                            f"Module {name!r} is already loaded outside {self.root}; use a fresh process"
+                        )
+            sys.path.insert(0, str(self.root))
+            estimator_module = importlib.import_module("estimater")
+            import nvdiffrast.torch as dr
 
-        # Share immutable weights/context on one owner; each object retains its own mesh and pose.
-        self.context = (
-            shared_with.context if shared_with is not None else dr.RasterizeCudaContext()
-        )
+            estimator_type = estimator_module.FoundationPose
+            self.context = dr.RasterizeCudaContext()
+        else:
+            estimator_type = type(shared_with.estimator)
+            self.context = shared_with.context
         # 固定网格直径采样，避免物体顺序影响裁剪与体素化；随后恢复调用方 RNG。
         random_state = np.random.get_state()
         try:
             np.random.seed(0)
-            self.estimator = estimator_module.FoundationPose(
+            self.estimator = estimator_type(
                 model_pts=mesh.vertices,
                 model_normals=mesh.vertex_normals,
                 mesh=mesh,
@@ -116,11 +115,6 @@ class FoundationPosePlusTracker:
 
     def register(self, rgb, depth_m, intrinsics, mask):
         """Initialize pose from an explicitly supplied object mask on the first frame."""
-        self.intrinsics = None
-        if np.count_nonzero(mask & (depth_m >= 0.001)) < 4:
-            raise ValueError("Registration requires at least four masked valid depth pixels")
-        # An upstream early return must not preserve a previous registration.
-        self.estimator.pose_last = None
         pose = self.estimator.register(
             K=intrinsics,
             rgb=rgb,
@@ -130,47 +124,39 @@ class FoundationPosePlusTracker:
         )
         if self.estimator.pose_last is None:
             raise RuntimeError("FoundationPose registration did not initialize tracking")
-        pose = validate_pose(pose)
-        self.intrinsics = intrinsics
-        return pose
+        return validate_pose(pose)
 
     def track(self, rgb, depth_m, intrinsics, mask, *, prepared_frame):
         """Mask-guided FoundationPose++ core, without Kalman or pose confidence."""
-        if self.intrinsics is None:
+        if self.estimator.pose_last is None:
             raise RuntimeError("Register an object before tracking")
-        try:
-            if np.count_nonzero(mask & (depth_m >= 0.001)) < 4:
-                raise ValueError("Tracking requires current exclusive mask and valid depth")
-            import torch
+        import torch
 
-            previous = self.estimator.pose_last
-            guided = guide_centered_pose(
-                previous.detach().cpu().numpy().reshape(4, 4), intrinsics, mask
-            )
-            self.estimator.pose_last = torch.as_tensor(
-                guided, dtype=previous.dtype, device=previous.device
-            ).reshape(previous.shape)
-            estimator = self.estimator
-            # Refine centered-mesh poses using the upstream call and this frame's shared tensors.
-            pose, _ = estimator.refiner.predict(
-                **prepared_frame,
-                K=intrinsics,
-                iteration=self.track_iterations,
-                ob_in_cams=estimator.pose_last.reshape(1, 4, 4).detach().cpu().numpy(),
-                normal_map=None,
-                mesh=estimator.mesh,
-                mesh_tensors=estimator.mesh_tensors,
-                mesh_diameter=estimator.diameter,
-                glctx=estimator.glctx,
-                get_vis=False,
-            )
-            estimator.pose_last = pose
-            return validate_pose(
-                (pose @ estimator.get_tf_to_centered_mesh()).detach().cpu().numpy().reshape(4, 4)
-            )
-        except Exception:
-            self.intrinsics = None
-            raise
+        previous = self.estimator.pose_last
+        guided = guide_centered_pose(
+            previous.detach().cpu().numpy().reshape(4, 4), intrinsics, mask
+        )
+        self.estimator.pose_last = torch.as_tensor(
+            guided, dtype=previous.dtype, device=previous.device
+        ).reshape(previous.shape)
+        estimator = self.estimator
+        # Refine centered-mesh poses using the upstream call and this frame's shared tensors.
+        pose, _ = estimator.refiner.predict(
+            **prepared_frame,
+            K=intrinsics,
+            iteration=self.track_iterations,
+            ob_in_cams=estimator.pose_last.reshape(1, 4, 4).detach().cpu().numpy(),
+            normal_map=None,
+            mesh=estimator.mesh,
+            mesh_tensors=estimator.mesh_tensors,
+            mesh_diameter=estimator.diameter,
+            glctx=estimator.glctx,
+            get_vis=False,
+        )
+        estimator.pose_last = pose
+        return validate_pose(
+            (pose @ estimator.get_tf_to_centered_mesh()).detach().cpu().numpy().reshape(4, 4)
+        )
 
     @property
     def provenance(self):

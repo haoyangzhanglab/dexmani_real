@@ -162,16 +162,11 @@ class AdaptiveHandRetargeter:
         # 同一个已提交目标同时作为 warm start、阻尼中心和唯一滤波状态。
         command = self.previous_command + alpha * (solution - self.previous_command)
         # 凸组合理论上不越限，但浮点减加可在限位上产生舍入量级的越界。
-        # 消除舍入误差后仍由 commit 严格校验，不放宽关节或最终速率限值。
+        # 消除舍入误差，不放宽关节或最终速率限值。
         return np.clip(command, self.limits[:, 0], self.limits[:, 1])
 
     def commit(self, qpos, *, timestamp_ns):
-        qpos = np.asarray(qpos, dtype=np.float64)
-        if (
-            qpos.shape != HAND_JOINT_SHAPE or not np.isfinite(qpos).all()
-            or np.any(qpos < self.limits[:, 0]) or np.any(qpos > self.limits[:, 1])
-        ):
-            raise ValueError("committed hand command must be finite and within operating limits")
+        # 调用方仅在不可变 RobotCommand 已发送并复核授权后提交状态。
         if self.command_timestamp_ns is None or timestamp_ns < self.command_timestamp_ns:
             raise ValueError("committed hand time moved backwards or reset is missing")
         self.previous_command = qpos.copy()

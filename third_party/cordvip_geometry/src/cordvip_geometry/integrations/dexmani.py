@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..geometry import validate_distortion, validate_intrinsics
 from ..rgbd import Frame
+
+HAND_SAMPLE_SEED = 0
 
 
 def raw_frame_identity(episode, row_index, timing):
@@ -23,8 +26,14 @@ def iter_raw_rows(reader, camera):
     """完整消费时核对 MP4 总行数；调用方拥有并关闭唯一 reader。"""
     reader.require_fields("rgb", "depth")
     intrinsics = camera.color
-    K = intrinsics.matrix()
+    K = validate_intrinsics(intrinsics.matrix())
+    distortion = validate_distortion(intrinsics.distortion_model, intrinsics.distortion_coeffs)
     expected_shape = (intrinsics.height, intrinsics.width)
+    if min(expected_shape) <= 0:
+        raise ValueError("Raw camera image dimensions must be positive")
+    depth_scale = np.float32(camera.depth_scale_m)
+    if not np.isfinite(depth_scale) or depth_scale <= 0:
+        raise ValueError("Raw depth scale must be finite and positive")
     depth = reader["depth"]
     if depth.shape != (reader.num_frames, *expected_shape) or depth.dtype != np.uint16:
         raise ValueError("Raw depth must be uint16 [rows,H,W] matching color intrinsics")
@@ -35,6 +44,7 @@ def iter_raw_rows(reader, camera):
     if np.any(observation <= 0) or np.any(np.diff(observation) <= 0):
         raise ValueError("Raw observation clocks must be positive and strictly increasing")
     images = iter(reader.iter_rgb_frames())
+    previous_time = previous_clock = None
     for row_index in range(reader.num_frames):
         rgb = next(images, None)
         if rgb is None:
@@ -42,12 +52,18 @@ def iter_raw_rows(reader, camera):
         if rgb.shape != (*expected_shape, 3) or rgb.dtype != np.uint8:
             raise ValueError(f"Raw RGB row {row_index} does not match color intrinsics")
         source_id, timestamp_ns, clock = raw_frame_identity(reader.path, row_index, timing[row_index])
+        if previous_clock is not None and (clock != previous_clock or timestamp_ns < previous_time):
+            raise ValueError("Raw camera rows require chronological timestamps on one source clock")
+        previous_time, previous_clock = timestamp_ns, clock
+        depth_m = depth[row_index].astype(np.float32) * depth_scale
+        if not np.isfinite(depth_m).all():
+            raise ValueError(f"Raw depth row {row_index} exceeds finite float32 metres")
         yield Frame(
             rgb=rgb,
-            depth_m=depth[row_index].astype(np.float32) * np.float32(camera.depth_scale_m),
+            depth_m=depth_m,
             K=K,
             distortion_model=intrinsics.distortion_model,
-            distortion_coeffs=intrinsics.distortion_coeffs,
+            distortion_coeffs=distortion,
             source_id=source_id,
             timestamp_ns=timestamp_ns,
             clock=clock,
@@ -60,7 +76,7 @@ def iter_raw_rows(reader, camera):
 class RawHandCloudProvider:
     """使用同一 Raw 行实测关节、记录外参和完整组合 URDF；行对齐不证明物理同步。"""
 
-    def __init__(self, reader, camera, num_points=1024, seed=0):
+    def __init__(self, reader, camera, num_points=1024):
         import xml.etree.ElementTree as ET
 
         from dexmani_real.robot.model import (
@@ -82,7 +98,6 @@ class RawHandCloudProvider:
             for key in ("notes", "timestamp_source", "termination_reason")
             if key in reader.meta
         }
-        self.T_camera_base = np.linalg.inv(self.T_base_camera)
         excluded = ("right_hand_ee_link", *XHAND_FINGERTIP_LINK_NAMES)
         excluded_links = [
             link.attrib["name"]
@@ -94,7 +109,8 @@ class RawHandCloudProvider:
             (*XARM7_JOINT_NAMES, *XHAND_SDK_JOINT_NAMES),
             excluded_links=excluded_links,
             num_points=num_points,
-            seed=seed,
+            seed=HAND_SAMPLE_SEED,
+            T_camera_from_root=np.linalg.inv(self.T_base_camera),
         )
         self.metadata = {
             **self.hand_model.metadata,
@@ -115,7 +131,7 @@ class RawHandCloudProvider:
             int(timing[name]) for name in ("arm_ns", "hand_ns", "camera_ns")
         )
         joint_state = np.concatenate((self.reader["arm_qpos"][row], self.reader["hand_qpos"][row]))
-        cloud = self.hand_model.transform(joint_state, self.T_camera_base)
+        cloud = self.hand_model.transform(joint_state)
         timing_available = (
             min(arm_ns, hand_ns, camera_ns) > 0
             and frame.clock == "host_monotonic_oldest_rgbd_receive"
@@ -129,12 +145,9 @@ class RawHandCloudProvider:
             **cloud,
             "joint_state": joint_state,
             "T_base_camera": self.T_base_camera,
-            "source_id": frame.source_id,
-            "row_index": int(row),
             "arm_timestamp_ns": arm_ns,
             "hand_timestamp_ns": hand_ns,
             "camera_timestamp_ns": camera_ns,
-            "clock": frame.clock,
             "timing_available": bool(timing_available),
             "skew_ms": skew_ms,
         }

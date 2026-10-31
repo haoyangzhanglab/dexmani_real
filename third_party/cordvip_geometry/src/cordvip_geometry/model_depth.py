@@ -2,6 +2,8 @@
 
 import numpy as np
 
+RAYCAST_THREADS = 1
+
 
 def camera_rays(shape, intrinsics, pixel_stride):
     """One scene's read-only stride grid; Z=1 preserves camera-depth ray parameters."""
@@ -21,10 +23,9 @@ def camera_rays(shape, intrinsics, pixel_stride):
 class ModelDepthRenderer:
     """Cache a metre-scale mesh; render camera Z on the global stride grid, with zero for missing hits."""
 
-    def __init__(self, mesh, *, pixel_stride=2, nthreads=1):
-        for name, value in (("pixel_stride", pixel_stride), ("nthreads", nthreads)):
-            if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
+    def __init__(self, mesh, *, pixel_stride=2):
+        if isinstance(pixel_stride, bool) or not isinstance(pixel_stride, (int, np.integer)) or pixel_stride <= 0:
+            raise ValueError("pixel_stride must be a positive integer")
         vertices = np.asarray(mesh.vertices)
         faces = np.asarray(mesh.faces)
         if (
@@ -58,9 +59,8 @@ class ModelDepthRenderer:
         import open3d as o3d
 
         self.pixel_stride = int(pixel_stride)
-        self._nthreads = int(nthreads)
         self._tensor = o3d.core.Tensor
-        self._scene = o3d.t.geometry.RaycastingScene(nthreads=self._nthreads)
+        self._scene = o3d.t.geometry.RaycastingScene(nthreads=RAYCAST_THREADS)
         self._scene.add_triangles(
             self._tensor(vertices),
             self._tensor(faces.astype(np.uint32)),
@@ -115,7 +115,7 @@ class ModelDepthRenderer:
         # meters, not Euclidean range. Do not normalize these ray directions.
         hit = np.full(directions.shape[:2], np.inf, dtype=np.float32)
         if rays.size:
-            hit[roi] = self._scene.cast_rays(self._tensor(rays), nthreads=self._nthreads)[
+            hit[roi] = self._scene.cast_rays(self._tensor(rays), nthreads=RAYCAST_THREADS)[
                 "t_hit"
             ].numpy()
         projected = np.isfinite(hit) & (hit > 0)

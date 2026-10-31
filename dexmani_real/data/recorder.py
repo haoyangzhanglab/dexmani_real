@@ -49,6 +49,7 @@ class EpisodeRecorder:
         self.is_recording = False
         self.start_attempted = False
         self.finish_request = None
+        self.stop_deadline = None
         self.closed_counts = None
         self.staging_path: Path | None = None
         self.published_path: Path | None = None
@@ -149,8 +150,10 @@ class EpisodeRecorder:
             self.is_recording = True
         except BaseException as exc:
             self.store_error(exc)
+            if self.stop_deadline is None:
+                self.stop_deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
             if self.thread is not None and self.thread.ident is not None:
-                self.thread.join(timeout=RECORDER_STOP_TIMEOUT_S)
+                self.thread.join(timeout=max(0.0, self.stop_deadline - time.monotonic()))
             if not isinstance(exc, Exception):
                 raise
             self.check_error()
@@ -169,8 +172,8 @@ class EpisodeRecorder:
             raise error from exc
         self.submitted_frames += 1
 
-    def finish(self, *, save, reason, details=None, technical_status="failed"):
-        """调用方已撤权并请求停机；本次决定在 writer 关闭后才生效。"""
+    def finish(self, *, save, reason, details=None, technical_status="failed", deadline=None):
+        """关闭后由监督方发布；单段收尾期限可缩短首次停止预算。"""
         if self.finish_request is not None:
             self.check_error()
             return self.published_path
@@ -178,7 +181,12 @@ class EpisodeRecorder:
         self.finish_request = request = _FinishRequest(
             reason, tuple(dict(item) for item in (details or ())), technical_status,
         )
-        deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
+        # START 失败后的 finally 与正常 finish 共用第一次停止时建立的预算。
+        if self.stop_deadline is None:
+            self.stop_deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
+            if deadline is not None:
+                self.stop_deadline = min(self.stop_deadline, deadline)
+        deadline = self.stop_deadline
         try:
             if was_recording and self.writer_pending and not self.cancelled.is_set():
                 self.queue.put(request, timeout=max(0.0, deadline - time.monotonic()))
@@ -190,7 +198,7 @@ class EpisodeRecorder:
             self.store_error(exc)
             if not isinstance(exc, Exception):
                 raise
-        if self.writer_pending:
+        if self.writer_pending or time.monotonic() >= deadline:
             self.store_error(TimeoutError("recording writer did not exit before the deadline"))
         self.check_error()
         if self.staging_path is None:

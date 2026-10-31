@@ -42,8 +42,8 @@ class SAM2Engine:
     def __init__(self, root, checkpoint, config, dino_weights):
         root = validate_sam_source(root)
         checkpoint = validate_sam_checkpoint(root, checkpoint, config)
-        import torch
         import sam2
+        import torch
         from sam2.build_sam import build_sam2_video_predictor
         from sam2.sam2_image_predictor import SAM2ImagePredictor
         from sam2.utils.misc import process_stream_frame
@@ -139,8 +139,6 @@ class SAM2Engine:
         if self.state is not None:
             raise RuntimeError("Grounding is only allowed before fixed-ID tracking starts")
         text = normalize_prompt(text)
-        if any(not np.isfinite(x) or not 0 < x < 1 for x in (box_threshold, text_threshold)):
-            raise ValueError("Detection thresholds must lie in (0,1)")
         import torch
         from PIL import Image
 
@@ -245,29 +243,21 @@ class SAM2Engine:
         gc.collect()
         torch.cuda.empty_cache()
         self.ids, self.shape, self.index = list(ids), rgb.shape[:2], -1
-        try:
-            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                self.state = self.tracker.init_state(video_path=None)
-                self.state["video_height"], self.state["video_width"] = self.shape
-                self.append(rgb)
-                for name, mask in zip(ids, masks):
-                    self.tracker.add_new_mask(self.state, frame_idx=0, obj_id=name, mask=mask)
-                return self.output(self.tracker.infer_single_frame(self.state, 0))
-        except BaseException:
-            self.state = None
-            raise
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            self.state = self.tracker.init_state(video_path=None)
+            self.state["video_height"], self.state["video_width"] = self.shape
+            self.append(rgb)
+            for name, mask in zip(ids, masks):
+                self.tracker.add_new_mask(self.state, frame_idx=0, obj_id=name, mask=mask)
+            return self.output(self.tracker.infer_single_frame(self.state, 0))
 
     def track(self, rgb):
         import torch
 
         if self.state is None:
             raise RuntimeError("Initialize masks before tracking")
-        try:
-            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                self.append(rgb)
-                masks = self.output(self.tracker.infer_single_frame(self.state, self.index))
-                prune_state(self.state, self.index, self.history_frames)
-                return masks
-        except BaseException:
-            self.state = None
-            raise
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            self.append(rgb)
+            masks = self.output(self.tracker.infer_single_frame(self.state, self.index))
+            prune_state(self.state, self.index, self.history_frames)
+            return masks

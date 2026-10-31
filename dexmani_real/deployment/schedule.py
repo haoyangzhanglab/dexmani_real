@@ -14,7 +14,6 @@ class Prediction:
     run_id: int
     slot: int
     handoff_slot: int | None
-    submitted_ns: int
     result: np.ndarray | None = None
 
 

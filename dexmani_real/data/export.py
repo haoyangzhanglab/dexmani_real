@@ -251,6 +251,9 @@ def export_zarr(
     exclude: tuple[str, ...] = (),
     progress_callback=None,
 ) -> dict:
+    # Canonical 始终导出两种点云，须在按点数创建存储前接纳实际启用的配置。
+    processing.pointcloud.validate()
+    processing.hand_pointcloud.validate()
     requested_source = Path(input_root).expanduser()
     source = requested_source.resolve()
     output = Path(output_path).expanduser()

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import sys
 import time
-from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,12 +16,18 @@ import numpy as np
 from dexmani_real.geometry.camera import CameraIntrinsics
 from dexmani_real.geometry.pose import validate_rigid_transform
 from dexmani_real.utils.camera_calibrate.aruco import (
-    ARUCO_DICT_NAME, CAPTURE_FRAMES, MARKER_ID, MARKER_SIZE_M, ArucoSampler,
+    ARUCO_DICT_NAME,
+    CAPTURE_FRAMES,
+    MARKER_ID,
+    MARKER_SIZE_M,
+    ArucoSampler,
 )
 from dexmani_real.utils.camera_calibrate.extrinsics import save_camera_calibration
 from dexmani_real.utils.camera_calibrate.hand_eye import HandEyeResult, solve_hand_eye
 from dexmani_real.utils.io import write_json
 from dexmani_real.utils.timing import sample_is_fresh
+
+logger = logging.getLogger(__name__)
 
 
 def read_arm_feedback(arm, max_age_s):
@@ -81,8 +88,7 @@ def collect_samples(runtime, output_dir):
     camera = RealSenseCamera(runtime.camera, auto_exposure_priority=None)
     fk = ArmFK()
     count = 0
-    with ExitStack() as resources:
-        resources.callback(camera.disconnect)
+    try:
         camera.connect()
         write_json(dict(
             camera=dict(serial=camera.active_serial, color=camera.color_intrinsics.to_dict(),
@@ -113,11 +119,25 @@ def collect_samples(runtime, output_dir):
                     print(f"采样拒绝：{exc}；未新增样本，请重新摆位。", flush=True)
                     continue
             finally:
-                arm.close()
+                original_error = sys.exc_info()[1]
+                try:
+                    arm.close()
+                except BaseException:
+                    if original_error is None:
+                        raise
+                    logger.exception("calibration arm close also failed")
             path = samples / f"{count:06d}.npz"
             save_sample(path, count, sample, fk.forward(sample["arm_after"]["qpos"]))
             print(f"已保存 sample {count}：{path}", flush=True)
             count += 1
+    finally:
+        original_error = sys.exc_info()[1]
+        try:
+            camera.disconnect()
+        except BaseException:
+            if original_error is None:
+                raise
+            logger.exception("calibration camera disconnect also failed")
     return count
 
 

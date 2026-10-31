@@ -31,34 +31,28 @@ FIELD_DEPENDENCIES = {
 }
 
 
-def policy_dependencies(fields):
-    unknown = set(fields) - FIELD_DEPENDENCIES.keys()
-    if unknown:
-        raise ValueError(f"Real has no live producer for requested modalities: {sorted(unknown)}")
-    return frozenset(source for name in fields for source in FIELD_DEPENDENCIES[name])
-
-
-def policy_needs(dependencies):
-    return ObservationNeeds(
-        camera_fields=tuple(name for name in ("rgb", "depth") if name in dependencies),
-        point_cloud="cloud" in dependencies,
-        required_tactile=tuple(c for c in ("aggregate", "dense") if c in dependencies),
-        camera_static="camera_static" in dependencies,
-    )
-
-
 @dataclass(frozen=True)
 class PolicyObservationRow:
     values: dict[str, np.ndarray]
-    observation_timestamp_ns: int
     features: dict[str, np.ndarray] = field(default_factory=dict, compare=False)
 
 
 class ObservationBuilder:
-    def __init__(self, info, runtime, *, dependencies, needs):
+    def __init__(self, info, runtime):
         self.info = info
         self.fields = tuple(info.observation_fields)
-        self.dependencies, self.needs = dependencies, needs
+        unknown = set(self.fields) - FIELD_DEPENDENCIES.keys()
+        if unknown:
+            raise ValueError(f"Real has no live producer for requested modalities: {sorted(unknown)}")
+        self.dependencies = frozenset(
+            source for name in self.fields for source in FIELD_DEPENDENCIES[name]
+        )
+        self.needs = ObservationNeeds(
+            camera_fields=tuple(name for name in ("rgb", "depth") if name in self.dependencies),
+            point_cloud="cloud" in self.dependencies,
+            required_tactile=tuple(c for c in ("aggregate", "dense") if c in self.dependencies),
+            camera_static="camera_static" in self.dependencies,
+        )
         self.camera_parameters = {}
         self.arm_fk = ArmFK() if "arm_fk" in self.dependencies else None
         self.hand_fk = self.hand_cloud = None
@@ -87,7 +81,7 @@ class ObservationBuilder:
                 values[name] = row.point_cloud
             elif name in {"rgb", "depth"}:
                 values[name] = row.camera[name]
-        return PolicyObservationRow(values, row.observation_timestamp_ns)
+        return PolicyObservationRow(values)
 
     def configure_camera(self, camera):
         self.camera_parameters = {}

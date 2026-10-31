@@ -12,7 +12,6 @@ from dexmani_real.runtime.preflight import validate_control_rate, validate_robot
 
 if TYPE_CHECKING:
     from dexmani_real.config.real import RealConfig
-    from dexmani_real.runtime.observation import ObservationNeeds
 
 
 def _restore_cloud_config(recipe, config_type):
@@ -21,7 +20,9 @@ def _restore_cloud_config(recipe, config_type):
         raise ValueError(
             f"Saved {config_type.__name__} must contain exactly these fields: {sorted(names)}"
         )
-    return config_type(**recipe)
+    config = config_type(**recipe)
+    config.validate()
+    return config
 
 
 def validate_execution_config(info, execution: ExecutionConfig) -> None:
@@ -61,9 +62,7 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
             raise ValueError("rtc_guidance_cap requires an explicit finite nonnegative value")
 
 
-def resolve_deployment_config(
-    info, runtime: RealConfig, needs: ObservationNeeds,
-) -> RealConfig:
+def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     from dexmani_policy.common.config import require_tactile_source
 
     source = require_tactile_source(info.observation_fields, info.tactile_source)
@@ -114,6 +113,4 @@ def resolve_deployment_config(
     )
     validate_robot_config(runtime)
     validate_control_rate(runtime, 1.0 / info.control_dt_s)
-    if needs.camera_worker:
-        runtime.camera.validate()
     return runtime

@@ -120,7 +120,7 @@ def select_mask(rgb, candidates, name):
         cv2.destroyWindow(title)
 
 
-def choose_masks(objects, frame, args, output, segmenter):
+def choose_masks(objects, frame, args, output, segmenter, maps):
     import numpy as np
 
     from ..io import load_initial_selection, write_confirmed_selection, write_json
@@ -129,7 +129,7 @@ def choose_masks(objects, frame, args, output, segmenter):
     masks, scene_objects = {}, []
     for name, item in objects.items():
         if item.get("initial_selection"):
-            masks[name] = load_initial_selection(item["initial_selection"], frame)
+            masks[name] = load_initial_selection(item["initial_selection"], frame, maps)
             selected = item["initial_selection"]
         else:
             candidates = segmenter.predict(
@@ -140,7 +140,7 @@ def choose_masks(objects, frame, args, output, segmenter):
             ) if item.get("prompt") else []
             while True:
                 mask, index = select_mask(frame.rgb, candidates, name)
-                _, depth, _, rectified_mask = rectify_frame(frame, mask)
+                _, depth, _, rectified_mask = rectify_frame(frame, mask, maps=maps)
                 if np.count_nonzero(rectified_mask & (depth > 0)) >= 4:
                     break
                 print(f"{name}: mask 至少需要四个有效深度像素，请重新选择。", flush=True)

@@ -1,8 +1,11 @@
 """资产与初始选择边界校验，以及离线结果写入。"""
 
-from datetime import datetime
 import json
+import logging
+from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def new_output(path, *, workspace, protected=()):
@@ -16,6 +19,7 @@ def new_output(path, *, workspace, protected=()):
 def load_asset(path):
     """Load one metric asset and its ordered surface samples."""
     import numpy as np
+
     from .geometry import load_metric_mesh, load_points
 
     path = Path(path).expanduser().resolve()
@@ -119,9 +123,10 @@ def write_confirmed_selection(directory, mask, metadata, *, mask_file, foregroun
     return result
 
 
-def load_initial_selection(directory, frame):
+def load_initial_selection(directory, frame, maps):
     """Reuse only an explicitly selected mask for the exact original RGB-D frame."""
     import numpy as np
+
     from .rgbd import load_frame, rectify_frame
 
     directory = Path(directory).expanduser().resolve()
@@ -158,16 +163,33 @@ def load_initial_selection(directory, frame):
     if not mask_path.is_relative_to(directory):
         raise ValueError("initial-selection mask must remain inside its directory")
     mask = load_mask(mask_path, frame.depth_m.shape)
-    _, depth, _, mask = rectify_frame(frame, mask)
+    _, depth, _, mask = rectify_frame(frame, mask, maps=maps)
     if np.count_nonzero(mask & (depth > 0)) < 4:
         raise ValueError("initial-selection has fewer than four valid rectified depth samples")
     return mask
 
 
 def write_scene_frame(path, arrays):
-    """独占写入一个离线 Raw 行结果；写入失败保持可见，不覆盖已有行。"""
+    """独占写入一行；失败移除自己创建的未完成文件，不覆盖已有行。"""
     import numpy as np
 
     path = Path(path)
-    with path.open("xb") as stream:
+    stream = path.open("xb")
+    failure = None
+    try:
         np.savez_compressed(stream, **arrays)
+    except BaseException as error:
+        failure = error
+    try:
+        stream.close()
+    except BaseException as error:
+        if failure is None:
+            failure = error
+        else:
+            logger.exception("scene frame close also failed: %s", path)
+    if failure is not None:
+        try:
+            path.unlink()
+        except OSError:
+            logger.exception("unfinished scene frame removal also failed: %s", path)
+        raise failure

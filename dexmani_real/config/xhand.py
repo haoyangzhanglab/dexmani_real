@@ -84,9 +84,11 @@ class HandConfig:
                     "hand device_name for EtherCAT must be an interface name, not a device path; "
                     "set hand.device_name to the interface name or null for discovery"
                 )
+        communication_field = (
+            ("baudrate", 1) if self.comm_type == "serial" else ("ethercat_slave_position", -1)
+        )
         for name, minimum in (
-            ("baudrate", 1), ("device_id", 0), ("ethercat_slave_position", -1),
-            ("send_crc_limit", 1), ("ki", 0), ("kd", 0),
+            communication_field, ("device_id", 0), ("send_crc_limit", 1), ("ki", 0), ("kd", 0),
         ):
             value = getattr(self, name)
             if type(value) is not int or value < minimum:

@@ -1,7 +1,6 @@
 """确认 Raw 首帧实例，顺序处理每行并保存可独立查看的离线结果。"""
 
 import itertools
-import json
 import logging
 import math
 from pathlib import Path
@@ -30,18 +29,6 @@ def run(args):
         raise ValueError("位姿深度容差、匹配像素数必须为正，匹配比例必须位于 (0,1]")
     if need_grounding and not (0 < args.box_threshold < 1 and 0 < args.text_threshold < 1):
         raise ValueError("首帧检测阈值必须位于 (0,1)")
-    if args.check:
-        from ..sam2_config import check_sam_environment
-        from .check_tracking import check_tracking_environment, print_tracking_report
-
-        report = check_tracking_environment(
-            args.foundationpose_root, need_pose=need_pose, need_gui=False,
-        )
-        report["checks"].extend(check_sam_environment(args, require_grounding=need_grounding))
-        report["ok"] = all(item["ok"] for item in report["checks"])
-        print_tracking_report(report)
-        return 0 if report["ok"] else 2
-
     from dexmani_real.data.raw import RawReader
 
     from ..geometry import RectificationMaps
@@ -57,10 +44,11 @@ def run(args):
     output = new_output(args.output, workspace=args.workspace, protected=protected)
     (output / "frames").mkdir()
     print(f"Scene output: {output}", flush=True)
-    reader = segmenter = tracker = records = None
+    reader = segmenter = tracker = None
     failure = None
     cleanup_errors = []
     processed = source_rows = 0
+    model_sources: dict[str, object] = dict(segmentation=None, poses={})
     try:
         reader = RawReader(args.episode)
         camera = reader.read_camera()
@@ -69,6 +57,7 @@ def run(args):
         first = next(rows, None)
         if first is None:
             raise ValueError("Raw episode contains no RGB-D rows")
+        maps = RectificationMaps(first[0].depth_m.shape, first[0].K, first[0].distortion_coeffs)
         assets, asset_metadata = {}, {}
         for name, item in objects.items():
             if item.get("asset"):
@@ -92,46 +81,35 @@ def run(args):
             dino_weights=args.dino_weights, log_path=output / "sam2_worker.log",
         )
         segmenter.start()
-        initial_masks = choose_masks(objects, first[0], args, output, segmenter)
+        model_sources["segmentation"] = segmenter.provenance
+        initial_masks = choose_masks(objects, first[0], args, output, segmenter, maps)
         tracker = SceneTracker(
             segmenter, assets, foundationpose_root=args.foundationpose_root,
             debug_dir=output / "foundationpose", pixel_stride=args.pixel_stride,
             depth_tolerance_m=args.depth_tolerance_m, min_matched_pixels=args.min_matched_pixels,
             min_matched_fraction=args.min_matched_fraction,
         )
-        records = (output / "records.jsonl").open("x", encoding="utf-8")
-        maps = RectificationMaps()
+        model_sources["poses"] = {name: item.provenance for name, item in tracker.trackers.items()}
+        write_json(output / "models.json", model_sources)
         for frame, timing in itertools.chain((first,), rows):
-            rgb, depth, K = rectify_frame(frame, maps=maps)[:3]
-            current = tracker.step(frame, rgb, depth, K, initial_masks=initial_masks if processed == 0 else None)
+            rgb, depth, _, _ = rectify_frame(frame, maps=maps)
+            current = tracker.step(frame, rgb, depth, initial_masks=initial_masks if processed == 0 else None)
             hand = hand_provider.for_row(frame, timing) if hand_provider else None
             write_scene_frame(output / "frames" / f"{frame.row_index:06d}.npz", scene_arrays(current, hand))
-            record = dict(
-                source_id=frame.source_id, row_index=frame.row_index,
-                timestamp_ns=frame.timestamp_ns, clock=frame.clock,
-                operation=current["operation"],
-                objects={name: dict(
-                    state=item["state"], error=item["error"], pose_valid=item["pose_valid"],
-                    observed_valid=item["observed_valid"], diagnostics=item["cloud"].diagnostics,
-                    diagnostic_T_camera_object=(
-                        item["diagnostic_pose"].tolist() if item["diagnostic_pose"] is not None else None
-                    ),
-                ) for name, item in current["objects"].items()},
-            )
-            records.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
             processed += 1
             if args.max_frames is not None and processed >= args.max_frames and processed < source_rows:
                 break
-        write_json(output / "models.json", dict(
-            segmentation=segmenter.provenance,
-            poses={name: tracker.provenance for name, tracker in tracker.trackers.items()},
-        ))
     except BaseException as exc:
         failure = exc
     finally:
+        # Initialization can fail after SAM is ready; preserve those model facts before closing.
+        if failure is not None and not (output / "models.json").exists():
+            try:
+                write_json(output / "models.json", model_sources)
+            except BaseException:
+                logger.exception("scene model sources write also failed")
         for name, resource in (
-            ("tracker", tracker), ("segmenter", segmenter if tracker is None else None),
-            ("records", records), ("reader", reader),
+            ("tracker", tracker), ("segmenter", segmenter), ("reader", reader),
         ):
             if resource is not None:
                 try:

@@ -9,10 +9,10 @@ conda activate real_robot
 # 新工作站先准备基础环境；安装脚本不下载模型、不连接设备。
 bash third_party/cordvip_geometry/scripts/install_perception.sh
 python -m cordvip_geometry download --models grounding sam
-python -m cordvip_geometry check --headless
+python -m cordvip_geometry check
 ```
 
-`real_robot` 是示例环境名。SAM 可通过 `--sam-python` 使用独立解释器，RPC 隔离保留。默认型号 small；官方型号由 `--sam-variant` 同时选定配置与本地 checkpoint，自训模型显式提供完整配对。静态检查不证明 GPU 推理、扩展 ABI 或长序列内存可用。
+`real_robot` 是示例环境名。SAM 可通过 `--sam-python` 使用独立解释器，RPC 隔离保留。默认型号 small；官方型号由 `--sam-variant` 同时选定配置与本地 checkpoint，自训模型显式提供完整配对。显式 `check` 只核对解释器、源码和权重路径，可加 `--json`；不证明 GPU 推理、扩展 ABI 或长序列内存可用。
 
 主流程为 Raw 首帧确认 → 单个 RawReader 顺序处理每行 → 保存每行结果 → 独立查看。全部对象不带 asset 时只做 mask 与实测点，不要求 FoundationPose。带 asset 时，深度几何支持参与 pose-valid 与 `POSE_LOST`，并非纯诊断；observed/model 点及法向仍分别保存。手点来自同行实测关节和数据对应的相机标定，同行关联不证明物理同步。
 
@@ -23,7 +23,7 @@ python scripts/cordvip/track_object.py \
 python -m cordvip_geometry view outputs/scene_001
 ```
 
-追踪默认处理全部行，只有 `--max-frames` 显式限制前缀。`frames/` 必存，`scene.json` 保存一次对象/role/asset/selection，`run.json`、`records.jsonl`、`result.json` 记录配置、逐行事实与最终结果。输出使用新目录，Raw 始终只读。首帧选择仍需与源数据及相机几何精确对应。
+追踪默认处理全部行，只有 `--max-frames` 显式限制前缀。`frames/` 必存，`scene.json` 保存一次对象/role/asset/selection，`run.json`、`models.json`、`result.json` 分别记录配置、已就绪模型来源与最终结果。逐帧事实只写入 NPZ，包括失败原因、门控前候选位姿和已计算的支持掩码、深度残差；不再生成 `records.jsonl` 或默认报告统计。输出使用新目录，Raw 始终只读。首帧选择仍需与源数据及相机几何精确对应。
 
 建模的分割和 prepare 直接调用普通函数；只有 Hunyuan 生成使用一次子进程，退出释放 GPU。生成只保存未定尺度 mesh；最终米制资产按原 seed/点数采样一次。结果查看器只按行前进及切换 observed/model，不另建实时服务。
 

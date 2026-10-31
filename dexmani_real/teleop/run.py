@@ -17,7 +17,7 @@ from dexmani_real.ipc.sensors import (
     read_vr_frame,
     snapshot_camera_parameters,
 )
-from dexmani_real.robot.commands import RobotError
+from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import initialize_hand
 from dexmani_real.runtime.keyboard import Keyboard
@@ -28,12 +28,11 @@ from dexmani_real.runtime.lifecycle import (
     SensorWorkers,
     close_runtime,
 )
-from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 from dexmani_real.runtime.state import RunEndReason, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.sensor.vr import run_vr
-from dexmani_real.teleop.loop import TeleopLoop, failure_reason
+from dexmani_real.teleop.loop import TeleopLoop
 from dexmani_real.teleop.vr import VRController
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.table_plane import load_table_plane
@@ -47,7 +46,6 @@ def run_teleop(
     runtime,
     *,
     task_name=DEFAULT_TASK_NAME,
-    allow_no_hand=False,
     vr_transform_path=VR_TRANSFORM_PATH,
     camera_calibration_path=None,
 ) -> int:
@@ -71,8 +69,8 @@ def run_teleop(
         load_table_plane(runtime.environment.table_plane_path)
         if runtime.environment.table.enabled else None
     )
-    if not runtime.hand.enabled and (runtime.collection.enabled or not allow_no_hand):
-        raise ValueError("hand-disabled operation requires explicit unrecorded debug mode")
+    if not runtime.hand.enabled and runtime.collection.enabled:
+        raise ValueError("hand-disabled operation cannot record episodes")
     calibration = load_vr_transform(vr_transform_path)
     controller = VRController(
         ActionMapper.for_mode(
@@ -91,19 +89,12 @@ def run_teleop(
         runtime.arm,
         table_plane_abcd=table_plane_abcd,
     )
-    control_needs = ObservationNeeds(vr=True)
-    record_needs = (
-        ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
-        if runtime.collection.enabled
-        else ObservationNeeds()
-    )
-    needs = control_needs.union(record_needs)
     ctx = mp.get_context("spawn")
     runtime_state = SessionState()
     channels = SensorChannels(
         ctx,
-        camera=runtime.camera if needs.camera_worker else None,
-        vr=needs.vr,
+        camera=runtime.camera if runtime.collection.enabled else None,
+        vr=True,
     )
     sensors = robot = None
     clean = False
@@ -132,8 +123,6 @@ def run_teleop(
             runtime,
             robot,
             task_label=task_name,
-            control_needs=control_needs,
-            record_needs=record_needs,
             sensors=sensors,
             controller=controller,
             home_planner=home_planner,
@@ -156,7 +145,7 @@ def run_teleop(
 
         robot.check_services = check_services
         robot.connect()
-        if needs.camera_worker:
+        if runtime.collection.enabled:
             sensors.start(
                 ctx.Process(
                     name="camera",
@@ -174,19 +163,21 @@ def run_teleop(
             )
         robot.check()
         runtime_state.arm()
-        try:
-            if initialize_teleop(
-                loop, ctx.Process(name="vr", target=run_vr, args=(channels, runtime.vr))
-            ):
-                loop.run()
-        except BaseException as exc:
-            loop.record_error("runtime", exc)
-            runtime_state.revoke_motion(reason=failure_reason(exc))
-            sensors.request_shutdown()
-            raise
+        if initialize_teleop(
+            loop, ctx.Process(name="vr", target=run_vr, args=(channels, runtime.vr))
+        ):
+            loop.run()
         clean = bool(runtime_state.quit_requested)
     except KeyboardInterrupt:
         runtime_state.request_emergency_stop()
+    except OperationCancelled:
+        if runtime_state.stop_request or runtime_state.quit_requested or runtime_state.estop_request:
+            runtime_state.request_quit()
+            clean = True
+            logger.info("Teleop startup cancelled")
+        else:
+            runtime_state.mark_error()
+            logger.exception("teleop operation cancelled without a stop request")
     except Exception:
         runtime_state.mark_error()
         logger.exception("teleop session failed")
@@ -257,7 +248,10 @@ def calibrate_hand(loop):
     retargeter = loop.controller.hand_retargeter
     if retargeter is None:
         return True
-    from dexmani_real.teleop.retargeting.landmarks import hand_lengths, prepare_landmarks
+    from dexmani_real.teleop.retargeting.landmarks import (
+        hand_lengths,
+        prepare_landmarks,
+    )
 
     config = loop.runtime.hand_retargeting
     print("正在标定手部骨长：请保持右手清晰可见；无需保持伸直。S/Q/Esc 可取消。", flush=True)

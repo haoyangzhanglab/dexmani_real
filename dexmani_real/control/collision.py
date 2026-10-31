@@ -108,15 +108,10 @@ class CollisionModel:
         return np.column_stack((local_x, local_y, normal))
 
     def set_hand_qpos(self, hand_qpos):
-        hand_qpos = np.asarray(hand_qpos, dtype=np.float64)
-        if hand_qpos.shape != (12,) or not np.isfinite(hand_qpos).all():
-            raise ValueError("collision hand posture must be finite shape (12,)")
-        self.hand_qpos = hand_qpos.copy()
+        # 来源为已投影目标、设备反馈或已校验的 HOME 姿态；隔离后续来源更新。
+        self.hand_qpos = np.array(hand_qpos, dtype=np.float64, copy=True)
 
     def rejection(self, arm_qpos):
-        arm_qpos = np.asarray(arm_qpos, dtype=np.float64)
-        if arm_qpos.shape != (7,) or not np.isfinite(arm_qpos).all():
-            raise ValueError("collision arm posture must be finite shape (7,)")
         if self.hand_qpos is None:
             raise RuntimeError("set the collision hand posture before querying arm poses")
         qpos = np.empty(self.model.nq)

@@ -1,6 +1,7 @@
 """单轮策略执行：准备、预测、控制与录制收尾。"""
 
 import logging
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -68,7 +69,7 @@ class EpisodeResult:
 class Rollout:
     def __init__(
         self, runtime_state, runtime, policy_info, *, preparing_epoch, robot,
-        observations, record_needs, needs, sensors, action_mapper, model, max_running_s,
+        observations, record_needs, sensors, action_mapper, model, max_running_s,
         capture_ids, index, output_dir, record_raw, camera_snapshot=None,
     ):
         self.runtime_state = runtime_state
@@ -77,8 +78,7 @@ class Rollout:
         self.execution = runtime.execution
         self.robot, self.sensors = robot, sensors
         self.observations = observations
-        self.control_needs, self.record_needs = observations.needs, record_needs
-        self.needs = needs
+        self.record_needs = record_needs
         self.action_mapper, self.model = action_mapper, model
         self.recorder = (
             EpisodeRecorder(output_dir, control_hz=1.0 / policy_info.control_dt_s)
@@ -108,9 +108,10 @@ class Rollout:
 
     def read_observation(self):
         row = read_observation(
-            self.sensors.channels, self.robot, needs=self.needs,
+            self.sensors.channels, self.robot,
+            needs=self.observations.needs.union(self.record_needs),
         )
-        issues, feedback_until_ns = check_observation(row, self.runtime, self.control_needs)
+        issues, feedback_until_ns = check_observation(row, self.runtime, self.observations.needs)
         if not issues:
             if self.recorder is not None:
                 record_issues, _ = check_observation(row, self.runtime, self.record_needs)
@@ -161,20 +162,11 @@ class Rollout:
             self.query = self.preparing_epoch = None
         self.history.clear()
         self.previous_arm = self.wait_deadline_ns = self.run_deadline_ns = None
-        try:
-            if epoch is not None or self.robot.stop_required:
-                self.robot.stop()
-            self.runtime_state.acknowledge_stop(stopped_epoch)
-        except BaseException as exc:
-            logger.exception("robot stop failed")
-            self.result.errors.append(error_detail("stop", exc))
-            if isinstance(exc, KeyboardInterrupt):
-                self.runtime_state.request_emergency_stop()
-            if epoch is None:
-                self.result.termination_reason = "preparation_failed"
-            raise
+        if epoch is not None or self.robot.stop_required:
+            self.robot.stop()
+        self.runtime_state.acknowledge_stop(stopped_epoch)
 
-    def finish_recording(self):
+    def finish_recording(self, *, deadline):
         result = self.result
         if self.recorder is not None and self.recorder.start_attempted:
             failure = None
@@ -190,6 +182,7 @@ class Rollout:
                     save=not self.discard_requested, reason=result.termination_reason,
                     details=[dict(stage="termination", reason=result.termination_details), *result.errors],
                     technical_status="normal" if result.normal_termination else "failed",
+                    deadline=deadline,
                 )
             except BaseException as exc:
                 result.errors.append(error_detail("recorder_finalize", exc))
@@ -207,40 +200,54 @@ class Rollout:
 
     def run(self, *, keyboard, poll_operator):
         """一段控制及其收尾顺序完成；返回后不再依赖外层 tick 回收任务。"""
-        failure = None
         try:
+            poll_operator()
+            if self.preparation_valid():
+                self.prepare()
+            else:
+                self.stop("cancelled before preparation")
             while not self.finished:
                 self.robot.arm.check_error()
                 poll_operator()
-                if self.run_id is None:
-                    self.robot.service_idle()
-                else:
-                    self.robot.service_feedback()
+                self.robot.service_idle()
+                if not self.preparation_valid():
+                    self.stop("cancelled during model reset")
+                    break
+                if self.model.poll() is not None:
+                    self.admit(poll_operator)
+                    break
+                time.sleep(0.005)
+            while not self.finished:
+                self.robot.arm.check_error()
+                poll_operator()
+                self.robot.service_feedback()
                 self.step()
                 if not self.finished:
-                    time.sleep(0.001 if self.run_id is not None else 0.005)
+                    time.sleep(0.001)
+        except OperationCancelled as exc:
+            self.stop(str(exc))
         except BaseException as exc:
-            failure = exc
             if isinstance(exc, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()
             if not self.finished:
+                stage = "preparation" if self.run_id is None else "control"
                 try:
                     self.stop(
                         str(exc), run_end_reason=failure_reason(exc),
-                        errors=[error_detail("control", exc)],
+                        errors=[error_detail(stage, exc)],
                     )
-                except BaseException:
+                except BaseException as stop_error:
+                    self.result.errors.append(error_detail("stop", stop_error))
                     logger.exception("episode stop also failed")
+            else:
+                self.result.errors.append(error_detail("stop", exc))
+            raise
         finally:
+            primary_failure = sys.exc_info()[0] is not None
+            cleanup_failure = None
             deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
-            # stop() 已撤权并请求设备停止；阻塞收尾不持 motion_lock，Esc 回调仍有效。
-            try:
-                self.finish_recording()
-            except BaseException as exc:
-                logger.exception("episode recording finalization failed")
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                failure = failure or exc
+            # 模型回收失败必须先进入本段结果，Raw 才能保存正确的结束状态。
+            # stop() 已撤权；两项收尾共用 deadline，不持 motion_lock。
             try:
                 self.model.discard_pending(deadline - time.monotonic())
             except BaseException as exc:
@@ -248,11 +255,20 @@ class Rollout:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
                 self.result.errors.append(error_detail("retired_model", exc))
-                failure = failure or exc
-            self.query = self.preparing_epoch = None
+                cleanup_failure = exc
+            finally:
+                try:
+                    self.finish_recording(deadline=deadline)
+                except BaseException as exc:
+                    logger.exception("episode recording finalization failed")
+                    if isinstance(exc, KeyboardInterrupt):
+                        self.runtime_state.request_emergency_stop()
+                    cleanup_failure = cleanup_failure or exc
+            if not self.model.has_pending_task:
+                self.query = self.preparing_epoch = None
             keyboard.discard_events("b", "h", "t")
-        if failure is not None:
-            raise failure
+            if cleanup_failure is not None and not primary_failure:
+                raise cleanup_failure
         return self.result
 
     def preparation_valid(self):
@@ -280,25 +296,21 @@ class Rollout:
         return row
 
     def prepare(self):
-        try:
-            self.robot.reset_hand_feedback()
-            self.robot.read_initial_state(
-                required_tactile=self.needs.required_tactile,
-                cancel_requested=lambda: not self.preparation_valid(),
-            )
-            if not self.preparation_valid():
-                raise OperationCancelled("cancelled during initial feedback acquisition")
-            row = self.start_observation()
-        except OperationCancelled as exc:
-            self.stop(str(exc))
-            return
+        self.robot.reset_hand_feedback()
+        self.robot.read_initial_state(
+            required_tactile=self.observations.needs.union(self.record_needs).required_tactile,
+            cancel_requested=lambda: not self.preparation_valid(),
+        )
+        if not self.preparation_valid():
+            raise OperationCancelled("cancelled during initial feedback acquisition")
+        row = self.start_observation()
         if row is None:
             self.stop(self.preparation_issue)
             return
         logger.info("正在准备本轮模型…")
         self.model.reset()
 
-    def admit(self):
+    def admit(self, poll_operator):
         if not self.preparation_valid():
             self.stop("cancelled during model reset")
             return
@@ -315,10 +327,18 @@ class Rollout:
                 episode_name=f"episode_{capture_id:03d}", collection_source="policy_rollout", metadata=metadata,
             )
         # 录制启动和设备模式恢复可能阻塞，之后分别读取新反馈。
+        poll_operator()
+        if not self.preparation_valid():
+            self.stop("cancelled during recorder start")
+            return
         if self.start_observation() is None:
             self.stop(self.preparation_issue)
             return
         self.robot.prepare_streaming(epoch)
+        poll_operator()
+        if not self.preparation_valid():
+            self.stop("cancelled during streaming preparation")
+            return
         if self.start_observation() is None:
             self.stop(self.preparation_issue)
             return
@@ -342,13 +362,7 @@ class Rollout:
         item = self.model.poll()
         if item is None:
             return
-        operation, result = item
-        if operation == "reset":
-            if self.preparation_valid():
-                self.admit()
-            else:
-                self.stop("cancelled during model reset")
-            return
+        _, result = item
         if not self.has_motion_authority():
             self.stop("owner_authority_revoked")
             self.query = None
@@ -366,13 +380,11 @@ class Rollout:
             dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot,
                  rtc_guidance_cap=self.execution.rtc_guidance_cap) if prefix is not None else {}
         )
-        query = Prediction(
-            self.run_id, slot, handoff_slot,
-            submitted_ns=time.monotonic_ns(),
-        )
+        submitted_ns = time.monotonic_ns()
+        query = Prediction(self.run_id, slot, handoff_slot)
         self.model.predict(rows, **kwargs)
         if self.plan is None:
-            self.wait_deadline_ns = query.submitted_ns + ACTION_TIMEOUT_NS
+            self.wait_deadline_ns = submitted_ns + ACTION_TIMEOUT_NS
         self.query = query
         if commands is not None:
             self.plan.frozen.update(commands)
@@ -467,21 +479,14 @@ class Rollout:
 
     def step(self):
         row = attempted_command = None
-        failure = None
         try:
             if self.finished:
                 return
-            if self.run_id is None and not self.model.has_pending_task:
-                self.prepare()
-                return
-            if self.run_id is None and not self.preparation_valid():
-                self.stop("cancelled during model reset")
-                return
-            if self.run_id is not None and not self.has_motion_authority():
+            if not self.has_motion_authority():
                 self.stop("owner_authority_revoked")
                 return
             self.poll_model()
-            if self.finished or self.run_id is None:
+            if self.finished:
                 return
             if self.recorder is not None:
                 self.recorder.check_error()
@@ -598,9 +603,6 @@ class Rollout:
             except OperationCancelled as exc:
                 self.stop(str(exc))
                 return
-            except TimeoutError as exc:
-                self.stop(str(exc), errors=[error_detail("submission", exc)])
-                return
             with self.runtime_state.motion_lock:
                 now = time.monotonic_ns()
                 authorized = self.has_motion_authority()
@@ -621,41 +623,20 @@ class Rollout:
             self.wait_deadline_ns = None
             if slot + 1 == self.plan.segment_end and self.execution.mode == "sync":
                 self.plan = None
-        except BaseException as exc:
-            preparing = self.run_id is None and not self.finished
-            cancelled = preparing and isinstance(exc, OperationCancelled)
-            failure = None if cancelled else exc
-            if isinstance(exc, KeyboardInterrupt):
-                self.runtime_state.request_emergency_stop()
-            if not self.finished:
-                stage = "preparation" if preparing else "control"
-                try:
-                    self.stop(
-                        f"{stage}_failed: {type(exc).__name__}: {exc}", run_end_reason=failure_reason(exc),
-                        errors=[] if cancelled or isinstance(exc, KeyboardInterrupt) else [error_detail(stage, exc)],
-                    )
-                except BaseException as stop_error:
-                    failure = failure or stop_error
         finally:
-            # 本步只尝试入队一次；终止时已先撤权和请求停止。
+            # 逐行录制只执行一次；附加写盘失败不能覆盖控制主因。
+            primary_error = sys.exc_info()[1]
+            if primary_error is not None:
+                self.runtime_state.revoke_motion(
+                    reason=failure_reason(primary_error), expected_run_id=self.run_id,
+                )
             if row is None and self.finished:
                 row, self.sync_row = self.sync_row, None
             try:
                 if row is not None and self.recorder is not None:
                     self.recorder.append(row, attempted_command)
             except BaseException as exc:
-                failure = failure or exc
+                if primary_error is None:
+                    raise
                 self.result.errors.append(error_detail("recording", exc))
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                try:
-                    self.stop(str(exc), run_end_reason=failure_reason(exc))
-                except BaseException as stop_error:
-                    failure = failure or stop_error
-            try:
-                if (limit := self.expired_budget()) is not None:
-                    self.stop_budget(limit)
-            except BaseException as exc:
-                failure = failure or exc
-            if failure is not None:
-                raise failure
+                logger.exception("episode frame recording also failed")

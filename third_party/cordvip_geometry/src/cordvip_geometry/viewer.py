@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def scene_display(frame, object_ids, colors, *, show_model=False, include_clouds=False):
@@ -32,7 +36,9 @@ def scene_display(frame, object_ids, colors, *, show_model=False, include_clouds
                 for axis, axis_color in enumerate(((255, 70, 70), (70, 255, 70), (70, 70, 255)), 1):
                     cv2.line(overlay, tuple(uv[0]), tuple(uv[axis]), axis_color, 2)
         state = str(frame[prefix + 'state'])
-        cv2.putText(overlay, f'{name}: {state}', (10, 24 + index * 22),
+        error = str(frame[prefix + 'error'])
+        label = f'{name}: {state}' + (f' | {error}' if error else '')
+        cv2.putText(overlay, label, (10, 24 + index * 22),
                     cv2.FONT_HERSHEY_SIMPLEX, .5, color, 1)
         if include_clouds:
             cloud = frame[prefix + ('model_points_camera' if show_model else 'observed_points_camera')]
@@ -55,19 +61,24 @@ class DemoViewer:
         self.vis = None
         self._has_points = False
         cv2.namedWindow(self.title, cv2.WINDOW_NORMAL)
-        if show_3d:
-            import open3d as o3d
+        try:
+            if show_3d:
+                import open3d as o3d
 
-            self.o3d = o3d
-            self.vis = o3d.visualization.Visualizer()
-            if not self.vis.create_window('Scene in color-camera frame', 960, 720):
-                self.vis = None
-                cv2.destroyWindow(self.title)
-                raise RuntimeError('Open3D could not create a window; use --no-3d or --headless')
-            self.cloud = o3d.geometry.PointCloud()
-            self.vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=.1))
-            self.vis.add_geometry(self.cloud)
-            self.vis.get_render_option().point_size = 3.
+                self.o3d = o3d
+                self.vis = o3d.visualization.Visualizer()
+                if not self.vis.create_window('Scene in color-camera frame', 960, 720):
+                    raise RuntimeError('Open3D could not create a window; use --no-3d or --headless')
+                self.cloud = o3d.geometry.PointCloud()
+                self.vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=.1))
+                self.vis.add_geometry(self.cloud)
+                self.vis.get_render_option().point_size = 3.
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                logger.exception("scene viewer cleanup also failed")
+            raise
 
     def update(self, panel, points, colors):
         import cv2
@@ -90,6 +101,18 @@ class DemoViewer:
     def close(self):
         import cv2
 
+        failure = None
         if self.vis is not None:
-            self.vis.destroy_window()
-        cv2.destroyWindow(self.title)
+            try:
+                self.vis.destroy_window()
+            except BaseException as error:
+                failure = error
+        try:
+            cv2.destroyWindow(self.title)
+        except BaseException as error:
+            if failure is None:
+                failure = error
+            else:
+                logger.exception("scene RGB window close also failed")
+        if failure is not None:
+            raise failure

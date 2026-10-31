@@ -235,27 +235,6 @@ class RealSenseCamera:
         return [RealSenseCamera.device_info(device) for device in rs.context().query_devices()]
 
 
-def get_ae_priority(camera: RealSenseCamera) -> float | None:
-    """读取曝光优先级；设备不支持时返回 None。"""
-    import pyrealsense2 as rs
-
-    sensor = camera.color_sensor
-    option = rs.option.auto_exposure_priority
-    return float(sensor.get_option(option)) if sensor.supports(option) else None
-
-
-def set_ae_priority(camera: RealSenseCamera, value: float) -> float | None:
-    """设置并读回曝光优先级；设备不支持时返回 None。"""
-    import pyrealsense2 as rs
-
-    sensor = camera.color_sensor
-    option = rs.option.auto_exposure_priority
-    if not sensor.supports(option):
-        return None
-    sensor.set_option(option, float(value))
-    return float(sensor.get_option(option))
-
-
 def run_camera(shared, config: CameraConfig):
     configure_logging()
     camera = RealSenseCamera(config)

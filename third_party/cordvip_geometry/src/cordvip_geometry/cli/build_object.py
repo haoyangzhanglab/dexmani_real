@@ -122,13 +122,14 @@ def segment(args, *, output_dir=None, list_only=False):
             text_threshold=args.text_threshold,
         )
         provenance.update(model=segmenter.provenance)
-    except BaseException:
+    finally:
+        failed = sys.exc_info()[0] is not None
         try:
             segmenter.close()
         except BaseException:
+            if not failed:
+                raise
             logger.exception("SAM2 cleanup also failed")
-        raise
-    segmenter.close()
     if not candidates:
         write_json(output / "segmentation_result.json", {**provenance, "num_candidates": 0})
         raise RuntimeError(f"没有检测到目标；原图和请求已保留在 {output}，可调整文本或阈值")

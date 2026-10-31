@@ -105,12 +105,8 @@ class EnvironmentConfig:
 
     def validate(self) -> None:
         self.workspace.as_array()
-        if not isfinite(self.table_z_surface_m):
-            raise ValueError("table_z_surface_m must be finite")
-        for name in ("eef_workspace_margin_m", "hand_safety_margin_m"):
-            value = getattr(self, name)
-            if not isfinite(value) or value < 0:
-                raise ValueError(f"{name} must be finite and non-negative")
+        if not isfinite(self.eef_workspace_margin_m) or self.eef_workspace_margin_m < 0:
+            raise ValueError("eef_workspace_margin_m must be finite and non-negative")
         if self.table.enabled:
             self.table.validate()
         for box in self.static_boxes:
