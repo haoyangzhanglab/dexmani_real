@@ -74,11 +74,12 @@ def load_frame(path: str | Path) -> Frame:
         coefficients = saved["distortion_coeffs"]
         if coefficients.shape != (5,) or coefficients.dtype.kind not in {"f", "i", "u"}:
             raise ValueError(f"{path.name}: distortion_coeffs must contain five numbers")
+        k1, k2, p1, p2, k3 = map(float, coefficients)
         return Frame(
             rgb=saved["rgb"],
             depth_m=saved["depth_m"],
             K=saved["K"],
-            distortion_coeffs=tuple(float(value) for value in coefficients),
+            distortion_coeffs=(k1, k2, p1, p2, k3),
             row_index=integer.get("row_index"),
             timestamp_ns=integer["timestamp_ns"],
             **text,

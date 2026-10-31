@@ -68,7 +68,7 @@ def select_mask(rgb, candidates, name):
     title = f"Select {name}: 1-9/[ ] candidate | p polygon | Enter confirm | q cancel"
     header = 54
     polygon = []
-    index = 0 if candidates else None
+    index = 0
     manual = not candidates
 
     def mouse(event, x, y, flags, param):
@@ -100,7 +100,7 @@ def select_mask(rgb, candidates, name):
             if key in (27, ord("q")) or cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
                 raise KeyboardInterrupt("Initial scene selection cancelled")
             if key == ord("p"):
-                manual, index = True, None
+                manual = True
                 polygon.clear()
             elif not manual and key in (ord("["), ord("]")):
                 index = (index + (1 if key == ord("]") else -1)) % len(candidates)
@@ -115,7 +115,7 @@ def select_mask(rgb, candidates, name):
                     mask = mask.astype(bool)
                 else:
                     mask = candidates[index]["mask"].copy()
-                return mask, index
+                return mask, None if manual else index
     finally:
         cv2.destroyWindow(title)
 
@@ -129,7 +129,7 @@ def choose_masks(objects, frame, args, output, segmenter):
     masks, scene_objects = {}, []
     for name, item in objects.items():
         if item.get("initial_selection"):
-            masks[name], _ = load_initial_selection(item["initial_selection"], frame)
+            masks[name] = load_initial_selection(item["initial_selection"], frame)
             selected = item["initial_selection"]
         else:
             candidates = segmenter.predict(
@@ -158,11 +158,10 @@ def choose_masks(objects, frame, args, output, segmenter):
                 mask_score=candidate["mask_score"] if candidate else None,
                 segmentation_model=segmenter.provenance,
             ), mask_file="mask.npy")
-        scene_objects.append({**item, "initial_selection": str(selected)})
-    write_json(output / "scene.json", {
-        "objects": [
-            {key: str(value) if isinstance(value, Path) else value for key, value in item.items()}
-            for item in scene_objects
-        ]
-    })
+        scene_item = item.copy()
+        for key, path in (("asset", item.get("asset")), ("initial_selection", selected)):
+            if path is not None:
+                scene_item[key] = str(Path(path).expanduser().resolve())
+        scene_objects.append(scene_item)
+    write_json(output / "scene.json", {"objects": scene_objects})
     return masks

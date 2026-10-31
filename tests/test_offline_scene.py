@@ -19,19 +19,18 @@ from dexmani_real.data.raw import RawReader, RawWriter
 from test_recorder import raw_metadata, raw_row
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "third_party/cordvip_geometry/src"))
+from cordvip_geometry.cli import check_tracking
 from cordvip_geometry.cli.arguments import parse_tracking_args
+from cordvip_geometry.cli.scene_initialization import choose_masks, load_scene
 from cordvip_geometry.cli.scene_tracking import run
 from cordvip_geometry.integrations.dexmani import iter_raw_rows
-from cordvip_geometry.io import load_initial_selection, write_confirmed_selection
+from cordvip_geometry.io import load_initial_selection, write_confirmed_selection, write_json
 from cordvip_geometry.rgbd import Frame, save_frame
 from cordvip_geometry.scene_tracking import SceneTracker, scene_arrays
 from cordvip_geometry.segmentation import GroundedSAM2Segmenter
 from cordvip_geometry.segmentation_protocol import send
 from cordvip_geometry.segmentation_protocol import receive
 from cordvip_geometry.sam2_engine import prune_state
-import cordvip_geometry.cli.check_tracking
-import cordvip_geometry.sam2_config
-import cordvip_geometry.segmentation
 
 
 class Segmenter:
@@ -100,7 +99,7 @@ class OfflineSceneTests(unittest.TestCase):
             "--output", str(output), "--headless", *extra,
         ], workspace=self.root)
         segmenter = segmenter or Segmenter()
-        with patch("cordvip_geometry.cli.check_tracking.check_tracking_environment", side_effect=RuntimeError("optional probe unavailable")) as environment, patch(
+        with patch.object(check_tracking, "check_tracking_environment", side_effect=RuntimeError("optional probe unavailable")) as environment, patch(
             "cordvip_geometry.sam2_config.check_sam_environment", side_effect=RuntimeError("optional probe unavailable")
         ), patch("cordvip_geometry.segmentation.GroundedSAM2Segmenter", return_value=segmenter), patch(
             "dexmani_real.data.raw.RawReader", wraps=RawReader
@@ -117,10 +116,39 @@ class OfflineSceneTests(unittest.TestCase):
         ) as sam, patch("dexmani_real.data.raw.RawReader") as reader, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(run(args), 0)
         self.assertFalse(environment.call_args.kwargs["need_pose"])
-        self.assertFalse(environment.call_args.kwargs["need_camera"])
+        self.assertNotIn("need_camera", environment.call_args.kwargs)
         self.assertFalse(environment.call_args.kwargs["need_gui"])
         sam.assert_called_once()
         reader.assert_not_called()
+
+    def test_saved_scene_references_survive_a_different_workspace(self):
+        asset = self.root / "asset"
+        asset.mkdir()
+        output = self.root / "result"
+        output.mkdir()
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            masks = choose_masks({"object": dict(
+                id="object", role="object", asset=Path("asset"),
+                initial_selection=Path("selected"), prompt=None,
+            )}, self.first, None, output, Segmenter())
+        finally:
+            os.chdir(previous)
+        np.testing.assert_array_equal(masks["object"], self.mask)
+        restored = load_scene(output / "scene.json", self.root / "other_workspace", headless=True)
+        self.assertEqual(restored["object"]["asset"], asset)
+        self.assertEqual(restored["object"]["initial_selection"], self.selection)
+
+    def test_invalid_json_does_not_leave_a_partial_artifact(self):
+        path = self.root / "result.json"
+        with self.assertRaises(ValueError):
+            write_json(path, {"nested": {"value": float("nan")}})
+        self.assertFalse(path.exists())
+        write_json(path, {"status": "completed"})
+        with self.assertRaises(FileExistsError):
+            write_json(path, {"status": "failed"})
+        self.assertEqual(json.loads(path.read_text()), {"status": "completed"})
 
     def test_default_processes_every_raw_row_and_mask_only_needs_no_fp(self):
         with patch.dict(sys.modules, {"torch": None, "open3d": None}):

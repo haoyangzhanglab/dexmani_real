@@ -11,7 +11,7 @@ conda activate real_robot
 bash third_party/cordvip_geometry/scripts/install_perception.sh --help
 bash third_party/cordvip_geometry/scripts/install_perception.sh
 python -m cordvip_geometry download --models grounding sam
-python -m cordvip_geometry check --offline-input --headless
+python -m cordvip_geometry check --headless
 ```
 
 环境清单和版本查询只在显式 `check` 或追踪的 `--check` 中执行。正常追踪直接加载所需源码、权重并执行边界检查；不默认同步 GPU 生成逐步耗时、显存或环境报告。算法使用的深度支持量和 pose-valid 门控仍逐行保存。

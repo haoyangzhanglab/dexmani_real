@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""静态检查独立实时追踪示例的本地依赖；不导入模型或连接相机。"""
+"""显式静态检查离线追踪的本地依赖；不导入模型。"""
 
 from __future__ import annotations
 
@@ -14,9 +14,7 @@ from pathlib import Path
 STATIC_CHECK_LIMITATION = "静态检查不证明 CUDA 可用、扩展 ABI 兼容或推理成功；未枚举或连接相机。"
 
 
-def check_tracking_environment(
-    root, *, need_camera=True, need_gui=True, need_pose=True, need_3d_viewer=False
-) -> dict:
+def check_tracking_environment(root, *, need_gui=True, need_pose=True) -> dict:
     """Inspect top-level module specs only; importing dotted parents could initialize CUDA or SDKs."""
     root = Path(root).expanduser().resolve()
     checks = []
@@ -75,15 +73,13 @@ def check_tracking_environment(
                 "matplotlib",
             ]
         )
-    if need_pose or need_3d_viewer:
+    if need_pose:
         modules.append("open3d")
-    if need_camera:
-        modules.append("pyrealsense2")
     for name in modules:
         try:
             spec = importlib.util.find_spec(name)
             ok = spec is not None
-            detail = (spec.origin or "namespace package") if ok else "当前 Python 环境找不到该模块"
+            detail = (spec.origin or "namespace package") if spec is not None else "当前 Python 环境找不到该模块"
         except (ImportError, ValueError, OSError) as error:
             ok, detail = False, str(error)
         if ok and name in {"torch", "torchvision", "open3d"}:
@@ -169,9 +165,6 @@ def parse_args(argv=None, *, workspace=None):
         help="本地 FoundationPose 源码及 weights 目录",
     )
     parser.add_argument(
-        "--offline-input", action="store_true", help="只检查离线输入所需依赖，不要求 RealSense SDK"
-    )
-    parser.add_argument(
         "--headless",
         action="store_true",
         help="不要求图形会话；仍检查 FoundationPose 使用的 Open3D",
@@ -186,7 +179,7 @@ def parse_args(argv=None, *, workspace=None):
 def main(argv=None, *, workspace=None) -> int:
     args = parse_args(argv, workspace=workspace)
     report = check_tracking_environment(
-        args.foundationpose_root, need_camera=not args.offline_input, need_gui=not args.headless
+        args.foundationpose_root, need_gui=not args.headless
     )
     from ..sam2_config import check_sam_environment
 

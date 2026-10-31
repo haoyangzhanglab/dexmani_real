@@ -35,7 +35,7 @@ def run(args):
         from .check_tracking import check_tracking_environment, print_tracking_report
 
         report = check_tracking_environment(
-            args.foundationpose_root, need_camera=False, need_pose=need_pose, need_gui=False,
+            args.foundationpose_root, need_pose=need_pose, need_gui=False,
         )
         report["checks"].extend(check_sam_environment(args, require_grounding=need_grounding))
         report["ok"] = all(item["ok"] for item in report["checks"])

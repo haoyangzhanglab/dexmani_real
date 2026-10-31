@@ -27,7 +27,6 @@ def prepare_mesh(
         raise ValueError("scale_to_meters must be finite and positive")
     source = existing_file(mesh)
     output = output_path(output_dir, workspace=workspace)
-    import trimesh
     from ..geometry import (
         load_metric_mesh,
         mesh_scale_from_extent,
@@ -65,7 +64,6 @@ def prepare_mesh(
         "sampling": "area_weighted_triangle_barycentric",
         "normals_method": "mesh_face",
         "bounds_m": mesh.bounds.tolist(),
-        "trimesh_version": trimesh.__version__,
     }
     write_json(output / "asset.json", metadata)
     print(f"已准备物体资产：{output / 'asset.json'}")

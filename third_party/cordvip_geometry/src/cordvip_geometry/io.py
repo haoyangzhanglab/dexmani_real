@@ -82,9 +82,9 @@ def output_path(path: Path, *, workspace, protected=(), allow_existing=False) ->
 
 
 def write_json(path: Path, value: dict) -> None:
+    text = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     with path.open("x", encoding="utf-8") as stream:
-        json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
-        stream.write("\n")
+        stream.write(text)
 
 
 def write_confirmed_selection(directory, mask, metadata, *, mask_file, foreground_rgb=None):
@@ -126,7 +126,10 @@ def load_initial_selection(directory, frame):
 
     directory = Path(directory).expanduser().resolve()
     metadata = json.loads((directory / "selection.json").read_text())
-    if metadata.get("selection") not in {"explicit_headless_instance", "gui_confirmed"}:
+    if (
+        metadata.get("selection") not in {"explicit_headless_instance", "gui_confirmed"}
+        or "selected_instance" not in metadata
+    ):
         raise ValueError("initial-selection must contain an explicitly confirmed selection")
     if metadata.get("mask_grid") != "original_rgb_grid; not_automatically_rectified":
         raise ValueError("initial-selection mask must use the original source RGB grid")
@@ -158,13 +161,7 @@ def load_initial_selection(directory, frame):
     _, depth, _, mask = rectify_frame(frame, mask)
     if np.count_nonzero(mask & (depth > 0)) < 4:
         raise ValueError("initial-selection has fewer than four valid rectified depth samples")
-    return mask, dict(
-        method="reused_confirmed_selection",
-        directory=str(directory),
-        source_check="exact_rgb_depth_K_distortion_identity_without_raw_path_time_clock_row",
-        selection_source_id=saved.source_id,
-        selected_instance=metadata["selected_instance"],
-    )
+    return mask
 
 
 def write_scene_frame(path, arrays):

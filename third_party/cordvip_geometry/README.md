@@ -9,7 +9,7 @@ conda activate real_robot
 # 新工作站先准备基础环境；安装脚本不下载模型、不连接设备。
 bash third_party/cordvip_geometry/scripts/install_perception.sh
 python -m cordvip_geometry download --models grounding sam
-python -m cordvip_geometry check --offline-input --headless
+python -m cordvip_geometry check --headless
 ```
 
 `real_robot` 是示例环境名。SAM 可通过 `--sam-python` 使用独立解释器，RPC 隔离保留。默认型号 small；官方型号由 `--sam-variant` 同时选定配置与本地 checkpoint，自训模型显式提供完整配对。静态检查不证明 GPU 推理、扩展 ABI 或长序列内存可用。
