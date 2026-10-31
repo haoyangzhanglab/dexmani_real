@@ -7,8 +7,6 @@ from collections import Counter
 from dataclasses import asdict
 from itertools import count
 
-import numpy as np
-
 from dexmani_real.config.deployment import ACTION_TIMEOUT_NS
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePlanner
@@ -349,17 +347,13 @@ class PolicySession:
                 raise ValueError("warmup observation: " + "; ".join(issues))
             rows.append(self.observations.project(row))
             next_sample_ns = time.monotonic_ns() + dt_ns
-        context = None
-        if self.info.hand_history_steps is not None:
-            initial_hand = rows[-1].values["hand_qpos"].astype(np.float32)
-            context = {"hand_history": np.repeat(initial_hand[None], self.info.hand_history_steps, axis=0)}
         kwargs = {}
         if self.runtime.execution.mode == "rtc":
             kwargs = dict(
                 rtc_guidance_cap=self.runtime.execution.rtc_guidance_cap,
                 rtc_delay=self.runtime.execution.prefetch_steps,
             )
-        self.model.warmup(tuple(rows), action_context=context, samples=5, **kwargs)
+        self.model.warmup(tuple(rows), samples=5, **kwargs)
         self.wait_model(time.monotonic() + MODEL_STARTUP_TIMEOUT_S)
 
     def request_stop(self, *, reason=RunEndReason.OPERATOR) -> None:

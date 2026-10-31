@@ -31,7 +31,7 @@ def make_episode(*, model=None, recorder=None):
     model = model or SimpleNamespace(has_pending_task=False, discard_pending=Mock())
     episode = Rollout(
         state, SimpleNamespace(execution=ExecutionConfig()),
-        SimpleNamespace(control_dt_s=.01, n_obs_steps=1, hand_history_steps=None),
+        SimpleNamespace(control_dt_s=.01, n_obs_steps=1),
         preparing_epoch=epoch, robot=robot, observations=SimpleNamespace(needs=ObservationNeeds()),
         record_needs=ObservationNeeds(), needs=ObservationNeeds(), sensors=None,
         action_mapper=None, model=model, max_running_s=None, capture_ids=iter(()),

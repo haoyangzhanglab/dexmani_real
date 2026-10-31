@@ -79,13 +79,6 @@ def resolve_deployment_config(
     )
     validate_execution_config(info, execution)
     names = set(info.observation_fields)
-    if info.hand_history_steps is not None and (
-        info.action_mode != "joint"
-        or "joint_state" not in names
-        or (info.horizon, info.n_obs_steps, info.n_action_steps, execution.action_steps)
-        != (1, 1, 1, 1)
-    ):
-        raise ValueError("LAMP hand history requires joint, joint_state, H=Nobs=C=A_exec=1")
     if not runtime.hand.enabled:
         raise ValueError("Dexterous policy deployment requires hand.enabled=true")
     if "fingertip_xyz" in names:

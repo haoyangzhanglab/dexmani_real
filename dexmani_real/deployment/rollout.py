@@ -104,10 +104,6 @@ class Rollout:
         self.preparing_epoch = preparing_epoch
         self.run_id = None
         self.history = deque(maxlen=policy_info.n_obs_steps)
-        self.hand_history = (
-            deque(maxlen=policy_info.hand_history_steps)
-            if policy_info.hand_history_steps is not None else None
-        )
         self.plan = self.query = None
         self.preparation_issue = None
         self.run_deadline_ns = self.wait_deadline_ns = None
@@ -177,8 +173,6 @@ class Rollout:
         if not self.model.has_pending_task:
             self.query = self.preparing_epoch = None
         self.history.clear()
-        if self.hand_history is not None:
-            self.hand_history.clear()
         self.previous_arm = self.wait_deadline_ns = self.run_deadline_ns = None
         try:
             if epoch is not None or self.robot.stop_required:
@@ -387,20 +381,6 @@ class Rollout:
             dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot,
                  rtc_guidance_cap=self.execution.rtc_guidance_cap) if prefix is not None else {}
         )
-        initial_hand_history = None
-        if self.hand_history is not None:
-            if not self.hand_history:
-                # 与训练时一致，初始历史使用 float32 精度的实测手姿。
-                hand = rows[-1].values["hand_qpos"].astype(np.float32)
-                initial_hand_history = tuple(
-                    hand.copy() for _ in range(self.hand_history.maxlen)
-                )
-            # 推理持有独立历史快照，不受后续提交或重置影响。
-            kwargs["action_context"] = {
-                "hand_history": np.stack(
-                    self.hand_history if initial_hand_history is None else initial_hand_history
-                )
-            }
         query = Prediction(
             self.run_id, slot, handoff_slot,
             observation_ns=rows[-1].observation_timestamp_ns, submitted_ns=time.monotonic_ns(),
@@ -408,8 +388,6 @@ class Rollout:
         self.model.predict(rows, **kwargs)
         if self.plan is None:
             self.wait_deadline_ns = query.submitted_ns + ACTION_TIMEOUT_NS
-        if initial_hand_history is not None:
-            self.hand_history.extend(initial_hand_history)
         self.query = query
         if commands is not None:
             self.plan.frozen.update(commands)
@@ -645,9 +623,6 @@ class Rollout:
                 budget_expired = limit is not None and now >= limit[0]
                 if authorized and not action_expired and not budget_expired:
                     self.previous_arm = command.arm_qpos
-                    if self.hand_history is not None:
-                        # 对应正常返回的实际提交目标，不代表设备已物理到位。
-                        self.hand_history.append(command.hand_qpos.copy())
             self.result.record_duration("observation_to_submit", now - self.plan.observation_ns)
             if not authorized:
                 self.stop("motion authority revoked during submission")
