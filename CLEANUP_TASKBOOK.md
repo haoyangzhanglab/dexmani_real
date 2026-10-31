@@ -387,7 +387,7 @@ finally:
 | --- | --- | --- |
 | T0 | 完成 | 基线 `580ac65`，初始 main 工作区/暂存区干净；工作分支 `cleanup/personal-research-t0-t8`。`real_robot/bin/python` 可用；固定 FK/手云、三模式轨迹、3 行 normal/failed H5+MP4 与 13 模态 Zarr 对照保存在 `/tmp/dexmani-cleanup-baseline`。238 行真实 Raw 准入及前三行 FK 已读；Policy 当前 `4618a2e`，只读保留其已有改动。sandbox 外 CUDA/光栅化/FP 深度核通过；Warp 启动有驱动 API 报错但实测核成功。SAM/DINO/Hunyuan 默认权重缺失；完整模型、真机未验证。 |
 | T1 | 完成 | 删除 XHand 默认身份缓存/探针、VR 标定的右手 IPC/头缓存与音频依赖、默认回放指标及 mesh 版本/显存报告。非有限 loss 仍拒绝，诊断可严格 JSON 保存；tip=0 保留方向/pinch。新增离线 `evaluate_replay.py`。`PYTHONDONTWRITEBYTECODE=1 real_robot/bin/python -m unittest discover -s tests -v`：19 项通过，含 FK 梯度、纯头帧、超时/关闭、真实文件写入及失败注入；`git diff --check` 通过。未验证网络 VR、实际生成权重和真机。 |
-| T2 | 未开始 | — |
+| T2 | 完成 | writer 只写/关，监督方唯一发布；删除发布锁/取消竞争、重复 finish/refresh 与外层 tick 收尾。Teleop/Policy 单段顺序返回，迟到模型任务有界回收，未退出则终止会话；实发 RobotCommand 与授权锁内 commit；机器码区分时长完成/预测超时。为使遥操作整段返回，暂停/双 Q 同批移除，HOME 仅空闲。60 项 unittest 通过，含 open/队满/close/超时晚到、连续两段、Esc/撤权/RTC、真实 H5+MP4；13 模态重导出与 T0 精确一致（新 source_id 按原行为生成），Policy split 恢复通过，diff/语法检查通过。保留原 Raw 封存时点：未参与控制的退休预测报错令 session 失败，不回写已发布 Raw，不改变原准入集合。未验证真实 checkpoint 推理/真机节拍与停机。 |
 | T3 | 未开始 | — |
 | T4 | 未开始 | — |
 | T5 | 未开始 | — |

@@ -34,6 +34,8 @@ class RunEndReason(IntEnum):
     RUNTIME_SHUTDOWN = 8
     RECORDING_FAILURE = 9
     RUNTIME_FAILURE = 10
+    DURATION_COMPLETE = 11
+    PREDICTION_TIMEOUT = 12
 
 
 def device_failure_reason(error):

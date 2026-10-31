@@ -258,8 +258,8 @@ def initialize_teleop(loop, vr_process) -> bool:
         return False
     loop.keyboard.discard_events("b", "c", "h", "t")
     print(
-        "就绪：B 开始 | C 暂停/继续（继续时新建录制段） | H 保存并回初始位 | "
-        "S 保存 | D 丢弃 | Q 暂停待退出，再按 Q 保存退出 | Esc 急停 | T 空闲时复位触觉。",
+        "就绪：B 开始 | S 保存结束本段 | D 丢弃本段 | Q 保存退出 | Esc 急停 | "
+        "H 空闲时回初始位 | T 空闲时复位触觉。",
         flush=True,
     )
     return True

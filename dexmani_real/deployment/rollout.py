@@ -24,6 +24,7 @@ from dexmani_real.deployment.schedule import (
 from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
+from dexmani_real.runtime.lifecycle import SHUTDOWN_TIMEOUT_S
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
@@ -63,11 +64,9 @@ class EpisodeResult:
 
     @property
     def normal_termination(self):
-        return not self.errors and (
-            self.termination_reason in {"operator", "quit"} or (
-                self.termination_reason == "timeout" and self.termination_details == "duration_timeout"
-            )
-        )
+        return not self.errors and self.termination_reason in {
+            "operator", "quit", "duration_complete",
+        }
 
     def record_duration(self, name, duration_ns):
         metrics = self.metrics
@@ -118,6 +117,7 @@ class Rollout:
         self.previous_arm = None
         # sync 推理期间持有本步观测，结果到达后只提交/录制一次。
         self.sync_row = None
+        self.discard_requested = False
 
     @property
     def finished(self):
@@ -193,7 +193,7 @@ class Rollout:
                 self.result.termination_reason = "preparation_failed"
             raise
 
-    def finish(self):
+    def finish_recording(self):
         result = self.result
         if self.recorder is not None and self.recorder.start_attempted:
             failure = None
@@ -206,7 +206,7 @@ class Rollout:
                     failure = exc
             try:
                 self.recorder.finish(
-                    save=True, reason=result.termination_reason,
+                    save=not self.discard_requested, reason=result.termination_reason,
                     details=[dict(stage="termination", reason=result.termination_details), *result.errors],
                     technical_status="normal" if result.normal_termination else "failed",
                 )
@@ -220,20 +220,59 @@ class Rollout:
             if failure is not None:
                 raise failure
 
-    def close(self):
-        if self.recorder is not None:
-            try:
-                self.recorder.close()
-            finally:
-                self.refresh_raw()
-
-    def refresh_raw(self):
-        if self.recorder is not None:
-            self.result.raw = self.recorder.result()
-
     @property
     def writer_pending(self):
         return self.recorder is not None and self.recorder.writer_pending
+
+    def run(self, *, keyboard, poll_operator):
+        """一段控制及其收尾顺序完成；返回后不再依赖外层 tick 回收任务。"""
+        failure = None
+        try:
+            while not self.finished:
+                self.robot.arm.check_error()
+                poll_operator()
+                if self.run_id is None:
+                    self.robot.service_idle()
+                else:
+                    self.robot.service_feedback()
+                self.step()
+                if not self.finished:
+                    time.sleep(0.001 if self.run_id is not None else 0.005)
+        except BaseException as exc:
+            failure = exc
+            if isinstance(exc, KeyboardInterrupt):
+                self.runtime_state.request_emergency_stop()
+            if not self.finished:
+                try:
+                    self.stop(
+                        str(exc), run_end_reason=failure_reason(exc),
+                        errors=[error_detail("control", exc)],
+                    )
+                except BaseException:
+                    logger.exception("episode stop also failed")
+        finally:
+            deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
+            # stop() 已撤权并请求设备停止；阻塞收尾不持 motion_lock，Esc 回调仍有效。
+            try:
+                self.finish_recording()
+            except BaseException as exc:
+                logger.exception("episode recording finalization failed")
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
+                failure = failure or exc
+            try:
+                self.model.discard_pending(deadline - time.monotonic())
+            except BaseException as exc:
+                logger.exception("retired episode model task failed")
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
+                self.result.errors.append(error_detail("retired_model", exc))
+                failure = failure or exc
+            self.query = self.preparing_epoch = None
+            keyboard.discard_events("b", "h", "t")
+        if failure is not None:
+            raise failure
+        return self.result
 
     def preparation_valid(self):
         return self.runtime_state.can_move(
@@ -319,18 +358,10 @@ class Rollout:
         self.result.started_utc = utc_now()
 
     def poll_model(self):
-        try:
-            item = self.model.poll()
-        except BaseException as exc:
-            if self.finished:
-                self.result.errors.append(error_detail("retired_model", exc))
-            raise
+        item = self.model.poll()
         if item is None:
             return
         operation, result = item
-        if self.finished:
-            self.query = self.preparing_epoch = None
-            return
         if operation == "reset":
             if self.preparation_valid():
                 self.admit()
@@ -458,16 +489,24 @@ class Rollout:
     def stop_rejection(self, detail):
         expired = self.expired_budget()
         if expired is not None:
-            self.stop(f"{expired[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
+            self.stop_budget(expired)
         else:
             self.stop(detail)
+
+    def stop_budget(self, limit):
+        self.stop(
+            f"{limit[1]}_timeout",
+            run_end_reason=(
+                RunEndReason.DURATION_COMPLETE if limit[1] == "duration"
+                else RunEndReason.PREDICTION_TIMEOUT
+            ),
+        )
 
     def step(self):
         row = attempted_command = None
         failure = None
         try:
             if self.finished:
-                self.poll_model()
                 return
             if self.run_id is None and not self.model.has_pending_task:
                 self.prepare()
@@ -484,7 +523,7 @@ class Rollout:
             if self.recorder is not None:
                 self.recorder.check_error()
             if (limit := self.expired_budget()) is not None:
-                self.stop(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
+                self.stop_budget(limit)
                 return
 
             now = time.monotonic_ns()
@@ -579,7 +618,7 @@ class Rollout:
                 return
             limit = self.budget_limit()
             if limit is not None and time.monotonic_ns() >= limit[0]:
-                self.stop(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
+                self.stop_budget(limit)
                 return
             action_deadline_ns = min(self.next_step_ns, feedback_until_ns)
             valid_until_ns = min(action_deadline_ns, limit[0]) if limit else action_deadline_ns
@@ -599,22 +638,27 @@ class Rollout:
             except TimeoutError as exc:
                 self.stop(str(exc), errors=[error_detail("submission", exc)])
                 return
-            now = time.monotonic_ns()
+            with self.runtime_state.motion_lock:
+                now = time.monotonic_ns()
+                authorized = self.has_motion_authority()
+                action_expired = now >= action_deadline_ns
+                budget_expired = limit is not None and now >= limit[0]
+                if authorized and not action_expired and not budget_expired:
+                    self.previous_arm = command.arm_qpos
+                    if self.hand_history is not None:
+                        # 对应正常返回的实际提交目标，不代表设备已物理到位。
+                        self.hand_history.append(command.hand_qpos.copy())
             self.result.record_duration("observation_to_submit", now - self.plan.observation_ns)
-            if not self.has_motion_authority():
+            if not authorized:
                 self.stop("motion authority revoked during submission")
                 return
-            if now >= action_deadline_ns:
+            if action_expired:
                 error = TimeoutError("submission returned after action deadline")
                 self.stop(str(error), errors=[error_detail("submission", error)])
                 return
-            if limit is not None and now >= limit[0]:
-                self.stop(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
+            if budget_expired:
+                self.stop_budget(limit)
                 return
-            self.previous_arm = command.arm_qpos
-            if self.hand_history is not None:
-                # 记录正常返回的提交尝试，包含 CRC 未确认执行的目标。
-                self.hand_history.append(command.hand_qpos.copy())
             self.wait_deadline_ns = None
             if slot + 1 == self.plan.segment_end and self.execution.mode == "sync":
                 self.plan = None
@@ -651,7 +695,7 @@ class Rollout:
                     failure = failure or stop_error
             try:
                 if (limit := self.expired_budget()) is not None:
-                    self.stop(f"{limit[1]}_timeout", run_end_reason=RunEndReason.TIMEOUT)
+                    self.stop_budget(limit)
             except BaseException as exc:
                 failure = failure or exc
             if failure is not None:

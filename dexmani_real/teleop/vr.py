@@ -80,8 +80,8 @@ class VRController:
             target, hand, row.arm["qpos"][0], self.previous_arm_command
         )
 
-    def commit(self, result):
+    def commit(self, command, *, eef_pose):
         if self.hand_retargeter is not None:
-            self.hand_retargeter.commit(result.hand_qpos, timestamp_ns=self.target_timestamp_ns)
-        self.previous_arm_command = result.arm_qpos.copy()
-        self.previous_eef_target = result.eef_pose.copy()
+            self.hand_retargeter.commit(command.hand_qpos, timestamp_ns=self.target_timestamp_ns)
+        self.previous_arm_command = command.arm_qpos.copy()
+        self.previous_eef_target = eef_pose.copy()

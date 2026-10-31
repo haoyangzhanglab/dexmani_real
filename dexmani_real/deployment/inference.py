@@ -2,7 +2,7 @@
 
 import logging
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -74,6 +74,21 @@ class PolicyWorker:
         self.future = self.operation = None
         return operation, future.result()
 
+    def discard_pending(self, timeout_s):
+        """本段撤权后回收尚未消费的任务；超时保留归属，禁止下一段复用。"""
+        future = self.future
+        if future is None:
+            return
+        try:
+            future.result(timeout=max(0.0, timeout_s))
+        except FutureTimeoutError:
+            if not future.done():
+                raise TimeoutError("episode model task remains pending") from None
+            raise
+        finally:
+            if future.done():
+                self.future = self.operation = None
+
     def close(self):
         if self.close_future is not None:
             return self.close_future
@@ -104,7 +119,7 @@ class PolicyWorker:
         future = cast(Future[list[dict]], self.close_future)
         try:
             errors = future.result(timeout=max(0.0, timeout_s))
-        except TimeoutError:
+        except FutureTimeoutError:
             return "pending", []
         except BaseException as exc:
             status = "failed" if future.done() else "pending"

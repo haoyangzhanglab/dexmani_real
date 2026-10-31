@@ -331,8 +331,7 @@ class RawWriter:
             or self.frame_count != expected_frames
         ):
             raise RuntimeError("recording accepted/written/camera row count mismatch")
-        # 视频完成编码后才标记技术状态。
-        self.video.close()
+        # 关闭资源成功与否由 recorder 监督方确认，元数据本身不代表已发布。
         if details:
             self.meta.create_dataset(
                 "termination_details", data=json.dumps(details, allow_nan=False)
@@ -341,6 +340,7 @@ class RawWriter:
             termination_reason=reason,
             technical_status=technical_status,
         )
+        return self.frame_count, self.video.frame_count
 
     def close(self):
         try:
@@ -352,7 +352,10 @@ class RawWriter:
 
 class RawReader:
     def __init__(self, episode_path: str | Path):
-        self.path = Path(episode_path)
+        requested_path = Path(episode_path)
+        self.path = requested_path.resolve()
+        if requested_path.name.startswith(".tmp_") or self.path.name.startswith(".tmp_"):
+            raise ValueError(f"unpublished Raw episode is not readable: {self.path}")
         self.rgb_path = self.path / "rgb.mp4"
         self.video_container = None
         self.dataset_cache: dict[str, h5py.Dataset] = {}

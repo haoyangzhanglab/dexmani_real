@@ -26,7 +26,6 @@ class RecordingError(RuntimeError):
 
 @dataclass(frozen=True)
 class _FinishRequest:
-    save: bool
     reason: str
     details: tuple[dict, ...]
     technical_status: str
@@ -44,12 +43,11 @@ class EpisodeRecorder:
         self.queue = Queue(maxsize=16)
         self.ready = threading.Event()
         self.cancelled = threading.Event()
-        self.publication_lock = threading.Lock()
         self.error = None
         self.is_recording = False
         self.start_attempted = False
         self.finish_request = None
-        self.stop_deadline = None
+        self.closed_counts = None
         self.staging_path = self.episode_dir = self.published_path = None
         self.submitted_frames = 0
         self.writer = None
@@ -148,9 +146,8 @@ class EpisodeRecorder:
             self.is_recording = True
         except BaseException as exc:
             self.store_error(exc)
-            self.stop_deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
             if self.thread is not None and self.thread.ident is not None:
-                self.thread.join(timeout=max(0.0, self.stop_deadline - time.monotonic()))
+                self.thread.join(timeout=RECORDER_STOP_TIMEOUT_S)
             if not isinstance(exc, Exception):
                 raise
             self.check_error()
@@ -169,75 +166,51 @@ class EpisodeRecorder:
             raise error from exc
         self.submitted_frames += 1
 
-    def close(self):
-        if self.start_attempted:
-            self.finish(save=True, reason="close")
-
-    def cancel_publication(self):
-        """提交点之后不可撤销；控制线程不得等待发布锁。"""
-        if not self.publication_lock.acquire(blocking=False):
-            return False
-        try:
-            if self.published_path is not None:
-                return False
-            self.cancelled.set()
-            return True
-        finally:
-            self.publication_lock.release()
-
     def finish(self, *, save, reason, details=None, technical_status="failed"):
+        """调用方已撤权并请求停机；本次决定在 writer 关闭后才生效。"""
+        if self.finish_request is not None:
+            self.check_error()
+            return self.published_path
         was_recording, self.is_recording = self.is_recording, False
-        first_request = self.finish_request is None
-        if first_request:
-            self.finish_request = _FinishRequest(
-                save,
-                reason,
-                tuple(dict(item) for item in (details or ())),
-                technical_status,
-            )
-        if self.stop_deadline is None:
-            self.stop_deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
-        request = self.finish_request
-        if not request.save:
-            self.cancel_publication()
-
+        self.finish_request = request = _FinishRequest(
+            reason, tuple(dict(item) for item in (details or ())), technical_status,
+        )
+        deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
         try:
-            if (
-                first_request
-                and was_recording
-                and self.writer_pending
-                and not self.cancelled.is_set()
-            ):
-                self.queue.put(request, timeout=max(0.0, self.stop_deadline - time.monotonic()))
+            if was_recording and self.writer_pending and not self.cancelled.is_set():
+                self.queue.put(request, timeout=max(0.0, deadline - time.monotonic()))
             if self.thread is not None and self.thread.ident is not None:
-                self.thread.join(timeout=max(0.0, self.stop_deadline - time.monotonic()))
+                self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
         except Full:
-            self.store_error(TimeoutError("recording finalization pending; finish queue timed out"))
+            self.store_error(TimeoutError("recording finish queue timed out"))
         except BaseException as exc:
-            self.cancel_publication()
+            self.store_error(exc)
+            if not isinstance(exc, Exception):
+                raise
+        if self.writer_pending:
+            self.store_error(TimeoutError("recording writer did not exit before the deadline"))
+        self.check_error()
+        if self.staging_path is None:
+            return None
+        try:
+            if self.closed_counts != (self.submitted_frames, self.submitted_frames):
+                raise RecordingError("recording accepted/written/camera row count mismatch")
+            if save:
+                publish(self.staging_path, self.episode_dir)
+                self.published_path, self.staging_path = self.episode_dir, None
+                logger.info("Raw 已保存：%s（%d 帧）。", self.episode_dir.name, self.written_frames)
+            else:
+                shutil.rmtree(self.staging_path)
+                self.staging_path = None
+        except BaseException as exc:
             self.store_error(exc)
             if not isinstance(exc, Exception):
                 raise
             self.check_error()
-
-        if self.writer_pending:
-            cancelled = self.cancel_publication()
-            error = TimeoutError(
-                f"recording finalization pending; publication_cancelled={cancelled}"
-            )
-            if cancelled:
-                self.store_error(error)
-            raise RecordingError(str(error)) from error
-
-        self.drain_frames()
-        if not request.save and self.staging_path is not None:
-            shutil.rmtree(self.staging_path)
-            self.staging_path = None
-        self.check_error()
         return self.published_path
 
     def write_episode(self, metadata):
-        staging, destination = self.staging_path, self.episode_dir
+        staging = self.staging_path
         finish = None
         try:
             self.writer = writer = RawWriter(staging, control_hz=self.control_hz)
@@ -253,12 +226,8 @@ class EpisodeRecorder:
                         finish = item
                         break
                     writer.append_frame(*item)
-            except BaseException as exc:
-                # 先撤销发布，再进入可能阻塞的资源收尾。
-                self.store_error(exc)
-            try:
                 if finish is not None and self.error is None:
-                    writer.finish(
+                    counts = writer.finish(
                         finish.reason,
                         finish.details,
                         expected_frames=self.submitted_frames,
@@ -270,18 +239,8 @@ class EpisodeRecorder:
                 self.store_error(exc)
             finally:
                 writer.close()
-
-            with self.publication_lock:
-                if (
-                    self.error is None
-                    and not self.cancelled.is_set()
-                    and finish is not None
-                    and finish.save
-                ):
-                    publish(staging, destination)
-                    self.published_path, self.staging_path = destination, None
-            if self.published_path is not None:
-                logger.info("Raw 已保存：%s（%d 帧）。", destination.name, self.written_frames)
+            if finish is not None and self.error is None:
+                self.closed_counts = counts
         except BaseException as exc:
             self.store_error(exc)
         finally:

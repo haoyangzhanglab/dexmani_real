@@ -154,7 +154,10 @@ def training_prefix(reader: RawReader) -> dict:
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
     """枚举所有 episode 目录，损坏文件由读取边界直接报错。"""
-    root = Path(input_root).resolve()
+    requested_path = Path(input_root)
+    root = requested_path.resolve()
+    if requested_path.name.startswith(".tmp_") or root.name.startswith(".tmp_"):
+        raise ValueError(f"unpublished Raw episode is not readable: {root}")
     if not root.is_dir():
         raise NotADirectoryError(root)
     if (root / "data.h5").is_file():

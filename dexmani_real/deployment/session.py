@@ -54,15 +54,6 @@ class PolicySession:
         self.camera_calibration_path = camera_calibration_path
         self.dependencies = dependencies
         self.control_needs, self.record_needs, self.needs = control_needs, record_needs, needs
-        self.control_services = tuple(
-            name for name, needed in (
-                ("camera", bool(self.control_needs.camera_fields) or self.control_needs.point_cloud),
-                ("pointcloud", self.control_needs.point_cloud),
-            ) if needed
-        )
-        self.record_services = (
-            ("camera",) if self.record_needs.camera_fields and "camera" not in self.control_services else ()
-        )
         self.runtime_state = self.sensors = self.robot = self.keyboard = self.model = None
         self.episode = self.start_epoch = None
         self.capture_ids = count(1)
@@ -98,14 +89,13 @@ class PolicySession:
         print("正在初始化模型和设备…", flush=True)
         self.save_results(overwrite=False)
         failure = None
-        reason = RunEndReason.RUNTIME_SHUTDOWN
         try:
             self.prepare_resources()
             self.start_devices()
-            print("就绪：H 回初始位 → B 开始 | S 结束本轮 | Q 退出 | Esc 急停 | T 复位触觉。", flush=True)
+            print("就绪：H 回初始位 → B 开始 | S 保存本轮 | D 丢弃本轮 | Q 保存退出 | Esc 急停 | T 复位触觉。", flush=True)
             self.run_control_loop()
         except KeyboardInterrupt as exc:
-            failure, reason = exc, RunEndReason.ESTOP
+            failure = exc
             if self.runtime_state is not None:
                 self.runtime_state.request_emergency_stop()
         except Exception as exc:
@@ -122,16 +112,6 @@ class PolicySession:
                     self.runtime_state.end_session(reason=reason)
                 logger.exception("policy session failed")
         finally:
-            try:
-                self.advance_episode(shutdown=True, failure=failure, reason=reason)
-            except BaseException as exc:
-                failure = failure or exc
-                self.errors.append(error_detail("episode_cleanup", exc))
-                if self.runtime_state is not None:
-                    if isinstance(exc, KeyboardInterrupt):
-                        self.runtime_state.request_emergency_stop()
-                    else:
-                        self.runtime_state.mark_error()
             exit_code = self.close(failure=failure)
         return exit_code
 
@@ -154,7 +134,7 @@ class PolicySession:
         )
         self.keyboard = Keyboard(
             estop_callback=self.runtime_state.request_emergency_stop,
-            bindings={"s": self.request_stop, "q": self.request_quit},
+            bindings={"s": self.request_stop, "d": self.request_discard, "q": self.request_quit},
         )
         self.keyboard.start()
         self.model = PolicyWorker(
@@ -181,9 +161,11 @@ class PolicySession:
         if self.keyboard.estop_latched or not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
             return False
-        if self.control_services and not self.sensors.check(names=self.control_services):
-            raise RobotError("control sensor process exited")
-        if self.record_services and not self.sensors.check(names=self.record_services):
+        control_camera = bool(self.control_needs.camera_fields) or self.control_needs.point_cloud
+        for name, needed in (("camera", control_camera), ("pointcloud", self.control_needs.point_cloud)):
+            if needed and not self.sensors.check(names=(name,)):
+                raise RobotError(f"control {name} process exited")
+        if self.record_needs.camera_fields and not control_camera and not self.sensors.check(names=("camera",)):
             raise RecordingError("recording camera process exited")
         return True
 
@@ -272,11 +254,6 @@ class PolicySession:
             except BaseException as exc:
                 model_status = "failed"
                 cleanup_errors.append(error_detail("model_close", exc))
-        if self.episode is not None:
-            try:
-                self.episode.close()
-            except BaseException as exc:
-                cleanup_errors.append(error_detail("recorder_close", exc))
         runtime_clean = True
         try:
             if self.runtime_state is not None:
@@ -290,10 +267,7 @@ class PolicySession:
         if self.model is not None and model_status != "failed":
             model_status, errors = self.model.wait_closed(deadline - time.monotonic())
             cleanup_errors.extend(errors)
-        writer_pending = False
-        if self.episode is not None:
-            self.episode.refresh_raw()
-            writer_pending = self.episode.writer_pending
+        writer_pending = self.episode is not None and self.episode.writer_pending
         pending = model_status == "pending" or writer_pending
         shutdown = (
             "pending" if pending else "completed"
@@ -399,6 +373,12 @@ class PolicySession:
             self.start_epoch = None
             self.runtime_state.request_quit()
 
+    def request_discard(self) -> None:
+        with self.runtime_state.motion_lock:
+            if self.episode is not None:
+                self.episode.discard_requested = True
+            self.request_stop()
+
     def poll_operator(self, *, allow_tactile_reset: bool = False) -> None:
         if self.keyboard.estop_latched or not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
@@ -412,8 +392,8 @@ class PolicySession:
         if "esc" in signals:
             self.runtime_state.request_emergency_stop()
             return
-        if any(signal in {"s", "q"} for signal in signals):
-            logger.warning("operator: S/Q suppresses preparation commands in this batch")
+        if any(signal in {"s", "d", "q"} for signal in signals):
+            logger.warning("operator: S/D/Q suppresses preparation commands in this batch")
             return
         preparation_blocked = False
         for signal in signals:
@@ -443,7 +423,7 @@ class PolicySession:
 
     def run_home(self) -> bool:
         with self.runtime_state.motion_lock:
-            home_allowed = self.runtime_state.can_move(
+            home_allowed = self.episode is None and self.runtime_state.can_move(
                 run_id=self.runtime_state.run_id,
                 required_safety_state=SafetyState.ARMED,
             )
@@ -505,14 +485,25 @@ class PolicySession:
             self.start_epoch = epoch
             return True
 
-    def advance_episode(self, *, shutdown=False, failure=None, reason=RunEndReason.RUNTIME_SHUTDOWN):
-        if self.episode is None:
-            epoch, self.start_epoch = self.start_epoch, None
-            if shutdown or epoch is None:
-                return
-            if not self.runtime_state.can_move(run_id=epoch, required_safety_state=SafetyState.ARMED):
-                return
-            self.episode = Rollout(
+    def run_control_loop(self):
+        while self.runtime_state.running and not self.runtime_state.quit_requested:
+            self.robot.arm.check_error()
+            self.poll_operator(allow_tactile_reset=True)
+            if self.runtime_state.estop_request or self.runtime_state.error_state:
+                break
+            self.robot.service_idle()
+            if not self.robot.stop_required:
+                self.runtime_state.acknowledge_stop(self.runtime_state.run_id)
+            with self.runtime_state.motion_lock:
+                epoch, self.start_epoch = self.start_epoch, None
+                if epoch is not None and not self.runtime_state.can_move(
+                    run_id=epoch, required_safety_state=SafetyState.ARMED,
+                ):
+                    epoch = None
+            if epoch is None:
+                time.sleep(0.005)
+                continue
+            episode = self.episode = Rollout(
                 self.runtime_state, self.runtime, self.info, preparing_epoch=epoch,
                 robot=self.robot, sensors=self.sensors, observations=self.observations,
                 record_needs=self.record_needs, action_mapper=self.action_mapper, model=self.model,
@@ -521,71 +512,31 @@ class PolicySession:
                 index=len(self.episodes) + 1, output_dir=self.output_dir, record_raw=self.record_raw,
                 camera_snapshot=self.camera_snapshot,
             )
-        episode = self.episode
-        error = None
-        try:
-            if shutdown:
-                episode.stop(
-                    str(failure) if failure else "shutdown", run_end_reason=reason,
-                )
-            else:
-                episode.step()
-        except BaseException as exc:
-            error = exc
-        finally:
-            if episode.finished and episode.result.index > len(self.episodes):
+            failure = None
+            try:
+                episode.run(keyboard=self.keyboard, poll_operator=self.poll_operator)
+            except BaseException as exc:
+                failure = exc
+            finally:
+                self.episodes.append(episode.result)
+                self.start_epoch = None
+                # 返回时若仍有 native 任务，保留所属轮次句柄，异常会终止会话。
+                if not episode.writer_pending and not self.model.has_pending_task:
+                    self.episode = None
                 try:
-                    episode.finish()
+                    self.save_results()
                 except BaseException as exc:
-                    error = error or exc
-                finally:
-                    result = episode.result
-                    self.episodes.append(result)
-                    self.start_epoch = None
-                    self.keyboard.discard_events("b")
-                    if result.started_utc is not None:
-                        completed = sum(item.started_utc is not None for item in self.episodes)
-                        logger.info("第 %d 轮结束：%s（%s，%.1f s）。", completed,
-                                    result.termination_reason, result.termination_details, result.duration_s)
-                        if self.num_episodes is not None and completed >= self.num_episodes:
-                            self.runtime_state.request_quit()
-                        elif self.runtime_state.requests_allow_motion():
-                            print("等待下一轮：H 回初始位 → B 开始；Q 退出。", flush=True)
-                    try:
-                        self.save_results()
-                    except BaseException as exc:
-                        self.errors.append(error_detail("evaluation_save", exc))
-                        error = error or exc
-            # pending 资源仍由所属轮次持有，下一轮不能覆盖它。
-            if episode.finished and not self.model.has_pending_task and not episode.writer_pending:
-                episode.refresh_raw()
-                self.episode = None
-        if error is not None:
-            # 单轮已登记主因并完成收尾；外层只登记不属于单轮的新故障。
-            logger.error("policy episode failed", exc_info=(type(error), error, error.__traceback__))
-            if not isinstance(error, Exception):
-                raise error
-            self.runtime_state.mark_error()
-            self.runtime_state.end_session(reason=failure_reason(error))
-
-    def run_control_loop(self):
-        while self.runtime_state.running and not self.runtime_state.quit_requested:
-            self.robot.arm.check_error()
-            self.poll_operator(
-                allow_tactile_reset=(
-                    self.episode is None and not self.model.has_pending_task
-                )
-            )
-            if self.runtime_state.estop_request or self.runtime_state.error_state:
-                break
-            if self.episode is None or self.episode.run_id is None:
-                self.robot.service_idle()
-                if not self.robot.stop_required and (
-                    self.episode is None or self.episode.finished
-                ):
-                    self.runtime_state.acknowledge_stop(self.runtime_state.run_id)
-            else:
-                self.robot.service_feedback()
-            self.advance_episode()
-            running = self.episode is not None and self.episode.run_id is not None
-            time.sleep(0.001 if running else 0.005)
+                    logger.exception("episode result write failed")
+                    self.errors.append(error_detail("episode_save", exc))
+                    failure = failure or exc
+            if failure is not None:
+                raise failure
+            result = episode.result
+            if result.started_utc is not None:
+                completed = sum(item.started_utc is not None for item in self.episodes)
+                logger.info("第 %d 轮结束：%s（%s，%.1f s）。", completed,
+                            result.termination_reason, result.termination_details, result.duration_s)
+                if self.num_episodes is not None and completed >= self.num_episodes:
+                    self.runtime_state.request_quit()
+                elif self.runtime_state.requests_allow_motion():
+                    print("等待下一轮：H 回初始位 → B 开始；Q 退出。", flush=True)
