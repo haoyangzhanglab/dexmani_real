@@ -21,7 +21,7 @@ def positive_int(value: str) -> int:
 
 def parse_tracking_args(argv=None, *, workspace=None):
     workspace = Path(workspace or Path.cwd()).expanduser().resolve()
-    parser = argparse.ArgumentParser(description="单物体与多物体 RGB-D 追踪；默认连接 RealSense，离线源只读。")
+    parser = argparse.ArgumentParser(description="顺序处理 Raw 每行；确认首帧 mask 后保存离线场景结果。")
     parser.set_defaults(workspace=workspace)
     parser.add_argument(
         "--asset", type=Path, help="reconstruct_object.py 或 prepare 生成的米制物体资产目录"
@@ -30,9 +30,6 @@ def parse_tracking_args(argv=None, *, workspace=None):
         "--scene",
         type=Path,
         help="多物体 JSON：objects 中逐个声明 id/role/asset/initial_selection/prompt",
-    )
-    parser.add_argument(
-        "--all-frames", action="store_true", help="离线模式逐帧处理，不按回放速率丢帧或等待"
     )
     parser.add_argument("--max-frames", type=int, help="最多处理的帧数；用于显式的部分验收")
     parser.add_argument(
@@ -47,78 +44,40 @@ def parse_tracking_args(argv=None, *, workspace=None):
     parser.add_argument(
         "--check", action="store_true", help="只检查环境，不加载模型、创建窗口或连接相机"
     )
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument(
-        "--episode", type=Path, help="用只读 Raw 替代相机，按 replay-fps 演示异步流程"
-    )
-    source.add_argument("--rgbd-dir", type=Path, help="用 RGB-D NPZ 替代相机")
-    parser.add_argument("--replay-fps", type=float, default=30)
-    parser.add_argument("--serial", help="RealSense serial；省略时由 SDK 选择相机")
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument(
-        "--no-3d", action="store_true", help="仅显示双 RGB 窗口；仍生成两类物体点云"
-    )
+    parser.add_argument("--episode", type=Path, help="只读已发布 Raw episode；默认处理全部行")
     parser.add_argument(
         "--initial-selection", type=Path, help="复用已确认的 select 目录；必须与离线源首帧完全对应"
     )
     parser.add_argument(
-        "--headless", action="store_true", help="无窗口离线回放；需要 --initial-selection"
+        "--headless", action="store_true", help="不打开首帧确认窗口；每个实例须有相同首帧的 initial-selection"
     )
     parser.add_argument(
         "--with-hand", action="store_true", help="读取同一 Raw 行的实测关节，附加 XHand FK 点云"
     )
     parser.add_argument("--hand-points", type=int, default=1024, help="固定手表面采样点数")
     parser.add_argument("--output", type=Path, help="尚不存在的新输出目录")
-    parser.add_argument(
-        "--save-inputs", action="store_true", help="保存所有送入推理的源 RGB-D；注册帧总是保存"
-    )
-    parser.add_argument(
-        "--save-frames",
-        action="store_true",
-        help="逐次保存实际处理结果到 frames/；不补齐跳过的源帧",
-    )
-    parser.add_argument(
-        "--save-video", action="store_true", help="保存处理帧叠加视频；播放率为 replay-fps"
-    )
-    parser.add_argument("--max-age-ms", type=float, default=500, help="源帧最大有效年龄，毫秒")
     parser.add_argument("--pixel-stride", type=int, default=2, help="物体实测点云的像素采样步长")
     parser.add_argument("--depth-tolerance-m", type=float, default=0.015)
     parser.add_argument("--min-matched-pixels", type=int, default=30)
     parser.add_argument("--min-matched-fraction", type=float, default=0.15)
     args = parser.parse_args(argv)
-    if not args.check and args.asset is None and args.scene is None:
-        parser.error("追踪需要 --asset 或 --scene；只检查环境可用 --check")
+    if not args.check and args.episode is None:
+        parser.error("追踪需要 --episode；只检查环境可用 --check")
     if args.scene and (args.asset or args.initial_selection or args.object_prompt):
         parser.error("--scene 内逐个指定资产、选择和 prompt，不能混用单物体参数")
     if args.max_frames is not None and args.max_frames < 1:
         parser.error("--max-frames 必须为正整数")
-    if args.serial and (args.episode or args.rgbd_dir):
-        parser.error("--serial 只用于实时相机")
-    offline = args.episode is not None or args.rgbd_dir is not None
-    if args.all_frames and not offline:
-        parser.error("--all-frames 仅用于离线源")
-    if args.initial_selection is not None and not offline:
-        parser.error("--initial-selection 仅用于离线源，不能将历史 mask 用于新的相机帧")
-    if args.headless and (not offline or (args.initial_selection is None and args.scene is None)):
-        parser.error("--headless 需要离线源和 --initial-selection")
-    if args.with_hand and args.episode is None:
-        parser.error("--with-hand 需要 --episode，以同一 Raw 行的实测关节生成手点")
+    if args.headless and args.initial_selection is None and args.scene is None and not args.check:
+        parser.error("--headless 需要 --initial-selection，或为 scene 中每个实例指定选择")
     if args.object_prompt is not None and not args.object_prompt.strip():
         parser.error("--object-prompt 不能为空")
-    if not offline and min(args.width, args.height, args.fps) < 1:
-        parser.error("实时相机 width、height、fps 必须为正整数")
     if args.pixel_stride < 1:
         parser.error("--pixel-stride 必须为正整数")
     if args.with_hand and args.hand_points < 1:
         parser.error("--hand-points 必须为正整数")
-    if not math.isfinite(args.max_age_ms) or args.max_age_ms <= 0:
-        parser.error("--max-age-ms 必须为有限正数")
-    if (args.save_video or (offline and not args.all_frames)) and (
-        not math.isfinite(args.replay_fps) or args.replay_fps <= 0
-    ):
-        parser.error("--replay-fps 必须为有限正数")
+    from ..sam2_config import resolve_sam_arguments
+
+    resolve_sam_arguments(args, workspace)
     return args
 
 
@@ -147,7 +106,7 @@ def add_generate_arguments(parser, *, workspace):
         "--num-points",
         type=positive_int,
         default=1024,
-        help="固定表面点数；点云与 mesh 使用相同坐标系和单位",
+        help="preview 临时采样点数；build 在最终米制尺度保存的固定点数",
     )
     parser.add_argument(
         "--preview", action="store_true", help="生成后交互查看 mesh、表面点云和坐标轴"
@@ -172,7 +131,7 @@ def parse_object_args(argv=None, *, workspace=None):
     select.add_argument("--segmentation-dir", type=Path, required=True)
     select.add_argument("--instance", type=int)
     select.add_argument("--headless", action="store_true")
-    generate = commands.add_parser("generate", help="从已确认的 RGBA 生成未定尺度 mesh 与表面点云")
+    generate = commands.add_parser("generate", help="从已确认的 RGBA 仅生成未定尺度 mesh")
     generate.add_argument("--segmentation-dir", type=Path, required=True)
     add_generate_arguments(generate, workspace=workspace)
     build = commands.add_parser("build", help="按分割、生成、可选米制资产准备串行执行")
@@ -193,6 +152,10 @@ def parse_object_args(argv=None, *, workspace=None):
     for command in (generate, build):
         command.add_argument("--device", default="cuda:0", help="Hunyuan 生成阶段使用的 CUDA 设备")
     args = parser.parse_args(argv)
+    if hasattr(args, "sam_variant"):
+        from ..sam2_config import resolve_sam_arguments
+
+        resolve_sam_arguments(args, workspace)
     if hasattr(args, "seed") and args.seed < 0:
         raise ValueError("--seed 必须非负")
     for name in ("box_threshold", "text_threshold"):

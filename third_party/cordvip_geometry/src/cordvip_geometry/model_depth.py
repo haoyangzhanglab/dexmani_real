@@ -3,6 +3,21 @@
 import numpy as np
 
 
+def camera_rays(shape, intrinsics, pixel_stride):
+    """One scene's read-only stride grid; Z=1 preserves camera-depth ray parameters."""
+    v, u = np.mgrid[0 : shape[0] : pixel_stride, 0 : shape[1] : pixel_stride]
+    directions = np.stack(
+        (
+            (u - intrinsics[0, 2]) / intrinsics[0, 0],
+            (v - intrinsics[1, 2]) / intrinsics[1, 1],
+            np.ones_like(u),
+        ),
+        axis=-1,
+    )
+    directions.setflags(write=False)
+    return directions
+
+
 class ModelDepthRenderer:
     """Cache a metre-scale mesh; render camera Z on the global stride grid, with zero for missing hits."""
 
@@ -60,25 +75,6 @@ class ModelDepthRenderer:
             ],
             dtype=np.float64,
         )
-        self._image_shape = None
-        self._intrinsics = None
-        self._directions_camera = None
-
-    def camera_rays(self, shape, intrinsics):
-        if self._image_shape != shape or not np.array_equal(self._intrinsics, intrinsics):
-            v, u = np.mgrid[0 : shape[0] : self.pixel_stride, 0 : shape[1] : self.pixel_stride]
-            self._directions_camera = np.stack(
-                (
-                    (u - intrinsics[0, 2]) / intrinsics[0, 0],
-                    (v - intrinsics[1, 2]) / intrinsics[1, 1],
-                    np.ones_like(u),
-                ),
-                axis=-1,
-            )
-            self._image_shape = shape
-            self._intrinsics = intrinsics.copy()
-        return self._directions_camera
-
     def ray_roi(self, directions, intrinsics, pose):
         """Conservatively bound the mesh projection on the global sampling grid."""
         height, width = directions.shape[:2]
@@ -102,10 +98,9 @@ class ModelDepthRenderer:
         upper = np.clip(upper, (0, 0), (width, height)).astype(int)
         return slice(lower[1], upper[1]), slice(lower[0], upper[0])
 
-    def render(self, image_shape, intrinsics, T_camera_object):
+    def render(self, image_shape, intrinsics, T_camera_object, *, directions):
         """Render the first positive model intersection for this frame's camera/pose."""
         pose = T_camera_object
-        directions = self.camera_rays(image_shape, intrinsics)
         roi = self.ray_roi(directions, intrinsics, pose)
         roi_directions = directions[roi]
         rotation, translation = pose[:3, :3], pose[:3, 3]

@@ -390,7 +390,7 @@ finally:
 | T2 | 完成 | writer 只写/关，监督方唯一发布；删除发布锁/取消竞争、重复 finish/refresh 与外层 tick 收尾。Teleop/Policy 单段顺序返回，迟到模型任务有界回收，未退出则终止会话；实发 RobotCommand 与授权锁内 commit；机器码区分时长完成/预测超时。为使遥操作整段返回，暂停/双 Q 同批移除，HOME 仅空闲。60 项 unittest 通过，含 open/队满/close/超时晚到、连续两段、Esc/撤权/RTC、真实 H5+MP4；13 模态重导出与 T0 精确一致（新 source_id 按原行为生成），Policy split 恢复通过，diff/语法检查通过。保留原 Raw 封存时点：未参与控制的退休预测报错令 session 失败，不回写已发布 Raw，不改变原准入集合。未验证真实 checkpoint 推理/真机节拍与停机。 |
 | T3 | 完成 | 可信 Python `CONFIG: RealConfig` 单入口，删除 YAML 递归/嵌套覆盖，迁移 10 个 CLI 与示例；无手参数仅明确确认。桌面标定路径移出 HOME 盒体，业务校验只随启用分支；完整快照严格 JSON。删除音频线程/播放代际/等待及 12 个无消费 WAV，文档更新五键与 HOME 行为。13 个配置测试、此前 60 项回归、10 个 CLI help、无设备 print 与旧参数拒绝检查通过；默认完整值（除路径移位）及 Canonical recipe 精确一致。PyYAML 为外部模型/运行快照保留。Policy 并行更新已改为 checkpoint 恢复配方，文案按当前事实修正；用户另明确批准同步删除旧 LAMP 动作历史分支，后续独立记录适配。未验证设备配置实际生效。 |
 | Policy 接口适配 | 完成 | 用户明确批准退出旧 LAMP 动作历史；按当前 Policy `32a64d0` 公共 API 删除本仓 hand_history/action_context 分支，不加别名或 fallback，不修改配套仓。10 项生命周期与 6 项三模式调度测试通过；真实 checkpoint 加载尚未验证。 |
-| T4 | 未开始 | — |
+| T4 | 实现完成；模型回归未验证 | 单 RawReader 同行 RGB-D/实测关节/时钟→首帧确认→默认全行→必存逐行结果→独立 view；删除 live/capture/latest/心跳/STALE/unlink、外层 worker/播放器与阶段 CLI 转发。保留 mask-only/多物体、SAM RPC/历史、法向与深度 pose-valid 门控。共享只读 rays；生成只保存未定尺度 mesh，最终米制仅采样一次。89 项 unittest、相关 CLI help、diff 检查通过；24 组渲染和固定点/法向精确相等；真实 Raw 前三行新旧 RGB-D/手几何/关节/时钟/metadata 精确一致，reader 打开 2→1。sandbox 外 FP 两组真实权重已加载，非真实场景精度验证；SAM/DINO/Hunyuan 默认权重和已确认真实场景资产缺失，完整模型结果/长序列/GUI 未验证。 |
 | T5 | 未开始 | — |
 | T6 | 未开始 | — |
 | T7 | 未开始 | — |

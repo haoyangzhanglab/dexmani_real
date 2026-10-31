@@ -1,5 +1,6 @@
 import contextlib
 import importlib.metadata
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -58,7 +59,9 @@ class MeshGenerationTests(unittest.TestCase):
             max_memory_reserved=forbidden,
         )
         output = root / "mesh.obj"
-        with mock.patch.dict(sys.modules, {"torch": torch, "hy3dshape": hy3dshape}), mock.patch.object(
+        # 生成函数只承诺一次子进程用途；测试自己隔离导入路径与离线环境。
+        with mock.patch.dict(os.environ), mock.patch.object(sys, "path", sys.path.copy()), \
+                mock.patch.dict(sys.modules, {"torch": torch, "hy3dshape": hy3dshape}), mock.patch.object(
             importlib.metadata, "version", side_effect=RuntimeError("optional version report unavailable")
         ) as version:
             result = generate_mesh(image, root / "source", weights, output)

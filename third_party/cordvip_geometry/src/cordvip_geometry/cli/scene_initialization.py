@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 
-def load_scene(path, workspace, *, offline, headless):
+def load_scene(path, workspace, *, headless):
     data = json.loads(Path(path).read_text())
     if (
         not isinstance(data, dict)
@@ -47,8 +47,6 @@ def load_scene(path, workspace, *, offline, headless):
                 ).resolve()
                 if not item[key].is_dir():
                     raise ValueError(f"{name}: missing {key} directory {item[key]}")
-        if item.get("initial_selection") and not offline:
-            raise ValueError("Historical initial_selection cannot initialize a new camera frame")
         if headless and not item.get("initial_selection"):
             raise ValueError(f"{name}: headless scene requires an exact-source initial_selection")
         if item.get("prompt") is not None and (
@@ -59,143 +57,113 @@ def load_scene(path, workspace, *, offline, headless):
     return objects
 
 
-def choose_masks(objects, frame, args, viewer, output, worker):
+def select_mask(rgb, candidates, name):
+    """只在冻结首帧选候选或画多边形；没有后台查看/模型任务。"""
+    import cv2
+    import numpy as np
+
+    from .object_selection import display_available, overlay
+
+    display_available()
+    title = f"Select {name}: 1-9/[ ] candidate | p polygon | Enter confirm | q cancel"
+    header = 54
+    polygon = []
+    index = 0 if candidates else None
+    manual = not candidates
+
+    def mouse(event, x, y, flags, param):
+        nonlocal index
+        y -= header
+        if not (0 <= x < rgb.shape[1] and 0 <= y < rgb.shape[0]):
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if manual:
+                polygon.append((x, y))
+            else:
+                index = next((i for i, candidate in enumerate(candidates) if candidate["mask"][y, x]), index)
+        elif event == cv2.EVENT_RBUTTONDOWN and manual and polygon:
+            polygon.pop()
+
+    cv2.namedWindow(title, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(title, mouse)
+    try:
+        while True:
+            image = rgb.copy() if manual else np.asarray(overlay(rgb, candidates[index], index)).copy()
+            if polygon:
+                cv2.polylines(image, [np.asarray(polygon, dtype=np.int32)], len(polygon) >= 3, (255, 220, 30), 2)
+            canvas = np.zeros((rgb.shape[0] + header, rgb.shape[1], 3), dtype=np.uint8)
+            canvas[header:] = image[..., ::-1]
+            cv2.putText(canvas, "Polygon: left click / right undo" if manual else "Candidate: [ / ] or click", (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            cv2.putText(canvas, "Enter confirms; p draws polygon; q cancels", (8, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            cv2.imshow(title, canvas)
+            key = cv2.waitKey(30) & 0xFF
+            if key in (27, ord("q")) or cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
+                raise KeyboardInterrupt("Initial scene selection cancelled")
+            if key == ord("p"):
+                manual, index = True, None
+                polygon.clear()
+            elif not manual and key in (ord("["), ord("]")):
+                index = (index + (1 if key == ord("]") else -1)) % len(candidates)
+            elif not manual and ord("1") <= key <= ord("9") and key - ord("1") < len(candidates):
+                index = key - ord("1")
+            elif key in (10, 13):
+                if manual:
+                    if len(polygon) < 3:
+                        continue
+                    mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+                    cv2.fillPoly(mask, [np.asarray(polygon, dtype=np.int32)], 1)
+                    mask = mask.astype(bool)
+                else:
+                    mask = candidates[index]["mask"].copy()
+                return mask, index
+    finally:
+        cv2.destroyWindow(title)
+
+
+def choose_masks(objects, frame, args, output, segmenter):
     import numpy as np
 
     from ..io import load_initial_selection, write_confirmed_selection, write_json
-    from ..live_workers import wait_worker
     from ..rgbd import rectify_frame, save_frame
 
-    masks, details, replay_objects = {}, {}, []
-    try:
-        for name, item in objects.items():
-            candidates = []
-            detection_metrics = None
-            if item.get("initial_selection"):
-                masks[name], details[name] = load_initial_selection(
-                    item["initial_selection"], frame
-                )
-                replay_objects.append({**item, "initial_selection": str(item["initial_selection"])})
-                continue
-            # Confirm on the original RGB grid so the same source-verified selection can be reused.
-            viewer.begin_selection(frame.rgb, manual=not item.get("prompt"))
-            if item.get("prompt"):
-                if not worker.submit(
-                    "predict",
-                    frame,
-                    item["prompt"],
-                    box_threshold=args.box_threshold,
-                    text_threshold=args.text_threshold,
-                ):
-                    raise RuntimeError("Scene worker was not ready for selection")
-
-                def selecting():
-                    key = viewer.update(
-                        frame.rgb,
-                        frame.rgb,
-                        lines=[f"Grounded-SAM2: finding {name}"],
-                        status_text="Text segmentation",
-                        help_text="q: cancel",
-                    )
-                    if key in (27, ord("q")):
-                        raise KeyboardInterrupt("Selection cancelled")
-
-                result = wait_worker(worker, selecting)
-                if result.frame is not frame or result.operation != "predict":
-                    raise RuntimeError("Rejected mismatched detection result")
-                candidates = result.value
-                detection_metrics = dict(worker.segmenter.last_metrics)
-                viewer.set_candidates(candidates)
-                if not candidates:
-                    viewer.use_polygon()
+    masks, scene_objects = {}, []
+    for name, item in objects.items():
+        if item.get("initial_selection"):
+            masks[name], _ = load_initial_selection(item["initial_selection"], frame)
+            selected = item["initial_selection"]
+        else:
+            candidates = segmenter.predict(
+                frame.rgb, item["prompt"], box_threshold=args.box_threshold,
+                text_threshold=args.text_threshold,
+                frame_key=dict(source_id=frame.source_id, row_index=frame.row_index,
+                               timestamp_ns=frame.timestamp_ns, clock=frame.clock),
+            ) if item.get("prompt") else []
             while True:
-                key = viewer.update(
-                    frame.rgb,
-                    frame.rgb,
-                    lines=[f'Select {name} ({item["role"]}), then Enter. q cancels the scene.'],
-                    status_text="Confirm every instance on the same frozen frame",
-                    help_text="1-9 / [ ] / click: candidate | p: polygon | Enter: confirm | q: quit",
-                )
-                if key in (ord("q"), 27):
-                    raise KeyboardInterrupt("Scene selection cancelled")
-                if key == ord("p"):
-                    viewer.use_polygon()
-                viewer.choose_candidate(key)
-                if key in (10, 13):
-                    mask = viewer.selected_mask()
-                    if mask is not None and np.count_nonzero(mask & (frame.depth_m > 0)) >= 4:
-                        _, selected_depth, _, selected_mask = rectify_frame(frame, mask)
-                        if np.count_nonzero(selected_mask & (selected_depth > 0)) < 4:
-                            continue
-                        masks[name] = selected_mask
-                        details[name] = dict(
-                            method="gui_confirmed",
-                            prompt=item.get("prompt"),
-                            selected_instance=viewer.selected_candidate_index,
-                            detection_metrics=detection_metrics,
-                        )
-                        selected_index = viewer.selected_candidate_index
-                        candidate = (
-                            candidates[selected_index] if selected_index is not None else None
-                        )
-                        scores = dict(
-                            detection_score=candidate["score"] if candidate is not None else None,
-                            mask_score=candidate["mask_score"] if candidate is not None else None,
-                            score_kind="grounding_dino" if candidate is not None else None,
-                            mask_score_kind="sam2_predicted_iou" if candidate is not None else None,
-                            box_threshold=args.box_threshold,
-                            text_threshold=args.text_threshold,
-                        )
-                        details[name].update(scores)
-                        selected = output / "initial_selections" / name
-                        selected.mkdir(parents=True)
-                        save_frame(selected / "source_rgbd.npz", frame)
-                        write_confirmed_selection(
-                            selected,
-                            mask,
-                            dict(
-                                selection="gui_confirmed",
-                                selected_instance=viewer.selected_candidate_index,
-                                mask_grid="original_rgb_grid; not_automatically_rectified",
-                                source_id=frame.source_id,
-                                timestamp_ns=frame.timestamp_ns,
-                                clock=frame.clock,
-                                prompt=item.get("prompt"),
-                                detection_metrics=detection_metrics,
-                                **scores,
-                                segmentation_model=(
-                                    worker.metadata["segmentation"] if item.get("prompt") else None
-                                ),
-                            ),
-                            mask_file="mask.npy",
-                        )
-                        replay_objects.append({**item, "initial_selection": str(selected)})
-                        break
-            viewer.cancel_selection()
-        save_frame(output / "initial_source_rgbd.npz", frame)
-        for name, mask in masks.items():
-            path = output / f"initial_{name}_rectified.npy"
-            np.save(path, mask, allow_pickle=False)
-        write_json(
-            output / "initialization.json",
-            dict(
-                source_id=frame.source_id,
-                timestamp_ns=frame.timestamp_ns,
-                clock=frame.clock,
-                row_index=frame.row_index,
-                objects=details,
-            ),
-        )
-        write_json(
-            output / "replay_scene.json",
-            {
-                "objects": [
-                    {k: str(v) if isinstance(v, Path) else v for k, v in item.items()}
-                    for item in replay_objects
-                ]
-            },
-        )
-        return masks
-    finally:
-        if viewer is not None:
-            viewer.cancel_selection()
+                mask, index = select_mask(frame.rgb, candidates, name)
+                _, depth, _, rectified_mask = rectify_frame(frame, mask)
+                if np.count_nonzero(rectified_mask & (depth > 0)) >= 4:
+                    break
+                print(f"{name}: mask 至少需要四个有效深度像素，请重新选择。", flush=True)
+            masks[name] = rectified_mask
+            selected = output / "initial_selections" / name
+            selected.mkdir(parents=True)
+            save_frame(selected / "source_rgbd.npz", frame)
+            candidate = candidates[index] if index is not None else None
+            write_confirmed_selection(selected, mask, dict(
+                selection="gui_confirmed", selected_instance=index,
+                mask_grid="original_rgb_grid; not_automatically_rectified",
+                source_id=frame.source_id, timestamp_ns=frame.timestamp_ns, clock=frame.clock,
+                prompt=item.get("prompt"),
+                detection_metrics=segmenter.last_metrics if item.get("prompt") else None,
+                detection_score=candidate["score"] if candidate else None,
+                mask_score=candidate["mask_score"] if candidate else None,
+                segmentation_model=segmenter.provenance,
+            ), mask_file="mask.npy")
+        scene_objects.append({**item, "initial_selection": str(selected)})
+    write_json(output / "scene.json", {
+        "objects": [
+            {key: str(value) if isinstance(value, Path) else value for key, value in item.items()}
+            for item in scene_objects
+        ]
+    })
+    return masks

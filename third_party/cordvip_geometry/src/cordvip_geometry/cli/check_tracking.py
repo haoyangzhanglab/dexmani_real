@@ -177,10 +177,10 @@ def parse_args(argv=None, *, workspace=None):
         help="不要求图形会话；仍检查 FoundationPose 使用的 Open3D",
     )
     parser.add_argument("--json", action="store_true", help="以 JSON 输出全部检查项目")
-    from ..sam2_config import add_sam_arguments
+    from ..sam2_config import add_sam_arguments, resolve_sam_arguments
 
     add_sam_arguments(parser, workspace)
-    return parser.parse_args(argv)
+    return resolve_sam_arguments(parser.parse_args(argv), workspace)
 
 
 def main(argv=None, *, workspace=None) -> int:

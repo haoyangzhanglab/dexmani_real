@@ -1,4 +1,4 @@
-"""RGB-D 位姿与点云可视化；默认连接 RealSense，--rgbd-dir 使用离线源。"""
+"""按 Raw 行顺序离线追踪场景，保存位姿与点云结果。"""
 
 import sys
 from pathlib import Path

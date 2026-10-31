@@ -1,34 +1,58 @@
-"""RGB projections and an optional camera-frame Open3D view."""
+"""已保存场景结果的 RGB 投影与可选 Open3D 点云视图。"""
 
 from __future__ import annotations
 
 import numpy as np
 
 
-def make_panel(rgb, depth_m, *, lines=()):
+def scene_display(frame, object_ids, colors, *, show_model=False, include_clouds=False):
     import cv2
 
-    overlay = np.ascontiguousarray(rgb[..., ::-1]).copy()
-    valid_depth = np.isfinite(depth_m) & (depth_m > 0)
-    # Fixed 0--2 m display range affects colors only, never tracking inputs.
-    depth_u8 = (np.clip(np.where(valid_depth, depth_m, 0) / 2, 0, 1) * 255).astype(np.uint8)
-    depth_vis = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
-    depth_vis[~valid_depth] = 0
-    panel = np.hstack((overlay, depth_vis))
-    text_lines = ["RGB | measured depth (0--2 m)", *lines]
-    for index, line in enumerate(text_lines):
-        origin = (10, 22 + index * 22)
-        cv2.putText(panel, str(line), origin, cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 3)
-        cv2.putText(panel, str(line), origin, cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
-    return panel
+    from .geometry import project_points
+
+    rgb = frame['rgb']
+    if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3 or min(rgb.shape[:2]) == 0:
+        raise ValueError('scene result RGB must be nonempty uint8 [H,W,3]')
+    overlay = rgb.copy()
+    points, point_colors = [], []
+    for index, name in enumerate(object_ids):
+        prefix = name + '__'
+        color = tuple(int(value) for value in colors[name])
+        mask = frame[prefix + 'semantic_mask']
+        if mask.shape != rgb.shape[:2] or mask.dtype != np.bool_:
+            raise ValueError(f'{name}: semantic mask must match the saved RGB grid')
+        overlay[mask] = (overlay[mask] * .62 + np.asarray(color) * .38).astype(np.uint8)
+        pose_valid = bool(frame[prefix + 'pose_valid'])
+        if pose_valid:
+            pose = frame[prefix + 'T_camera_object']
+            axes = np.array([[0, 0, 0], [.035, 0, 0], [0, .035, 0], [0, 0, .035]])
+            uv, good = project_points(axes @ pose[:3, :3].T + pose[:3, 3], frame['K'])
+            if good.all() and np.abs(uv).max() < 1e6:
+                uv = np.rint(uv).astype(int)
+                for axis, axis_color in enumerate(((255, 70, 70), (70, 255, 70), (70, 70, 255)), 1):
+                    cv2.line(overlay, tuple(uv[0]), tuple(uv[axis]), axis_color, 2)
+        state = str(frame[prefix + 'state'])
+        cv2.putText(overlay, f'{name}: {state}', (10, 24 + index * 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, .5, color, 1)
+        if include_clouds:
+            cloud = frame[prefix + ('model_points_camera' if show_model else 'observed_points_camera')]
+            points.append(cloud)
+            point_colors.append(np.tile(np.asarray(color) / 255., (len(cloud), 1)))
+    if include_clouds and 'hand_points_camera' in frame:
+        hand = frame['hand_points_camera']
+        points.append(hand)
+        point_colors.append(np.tile([1., .55, .14], (len(hand), 1)))
+    cloud = np.concatenate(points) if points else np.empty((0, 3), np.float32)
+    cloud_colors = np.concatenate(point_colors) if point_colors else np.empty((0, 3), np.float32)
+    return np.ascontiguousarray(overlay[..., ::-1]), cloud, cloud_colors
 
 
 class DemoViewer:
     def __init__(self, *, show_3d=True):
         import cv2
 
-        self.title = "CordViP object example | space pause | n step | s snapshot | q quit"
-        self.vis = self.observed = None
+        self.title = 'Offline scene | n/space next | v observed/model | q quit'
+        self.vis = None
         self._has_points = False
         cv2.namedWindow(self.title, cv2.WINDOW_NORMAL)
         if show_3d:
@@ -36,100 +60,36 @@ class DemoViewer:
 
             self.o3d = o3d
             self.vis = o3d.visualization.Visualizer()
-            if not self.vis.create_window("Camera frame: observed depth points", 960, 720):
+            if not self.vis.create_window('Scene in color-camera frame', 960, 720):
                 self.vis = None
                 cv2.destroyWindow(self.title)
-                raise RuntimeError("Open3D could not create a window; use --no-3d or --headless")
-            self.observed = o3d.geometry.PointCloud()
-            self.vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1))
-            self.vis.add_geometry(self.observed)
-            options = self.vis.get_render_option()
-            options.background_color = np.array([0.08, 0.08, 0.08])
-            options.point_size = 3.0
+                raise RuntimeError('Open3D could not create a window; use --no-3d or --headless')
+            self.cloud = o3d.geometry.PointCloud()
+            self.vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=.1))
+            self.vis.add_geometry(self.cloud)
+            self.vis.get_render_option().point_size = 3.
 
-    def update(self, panel, observed_points, *, paused=False):
+    def update(self, panel, points, colors):
         import cv2
 
-        if paused:
-            panel = panel.copy()
-            cv2.putText(
-                panel,
-                "PAUSED: space continue / n next frame",
-                (10, panel.shape[0] - 15),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 255),
-                2,
-            )
         cv2.imshow(self.title, panel)
         if self.vis is not None:
-            self.observed.points = self.o3d.utility.Vector3dVector(observed_points)
-            self.observed.paint_uniform_color([0.55, 0.55, 0.55])
-            self.vis.update_geometry(self.observed)
-            if not self._has_points and len(observed_points):
+            self.cloud.points = self.o3d.utility.Vector3dVector(points)
+            self.cloud.colors = self.o3d.utility.Vector3dVector(colors)
+            self.vis.update_geometry(self.cloud)
+            if not self._has_points and len(points):
                 self.vis.reset_view_point(True)
                 self._has_points = True
             if not self.vis.poll_events():
-                return ord("q")
+                return ord('q')
             self.vis.update_renderer()
         if cv2.getWindowProperty(self.title, cv2.WND_PROP_VISIBLE) < 1:
-            return ord("q")
-        return cv2.waitKey(1) & 0xFF
-
-    def screenshot(self, path):
-        if self.vis is not None:
-            self.vis.capture_screen_image(str(path), do_render=True)
+            return ord('q')
+        return cv2.waitKey(20) & 0xff
 
     def close(self):
         import cv2
 
         if self.vis is not None:
             self.vis.destroy_window()
-        cv2.destroyAllWindows()
-
-
-def scene_display(result, colors, hand=None, *, include_clouds):
-    import cv2
-    import numpy as np
-
-    from .geometry import project_points
-
-    overlay = result["rgb"].copy()
-    observed, models, observed_colors, model_colors = [], [], [], []
-    for name, item in result["objects"].items():
-        color = colors[name]
-        mask = item["cloud"].semantic_mask
-        overlay[mask] = (overlay[mask] * 0.62 + np.asarray(color) * 0.38).astype(np.uint8)
-        contours, _ = cv2.findContours(
-            mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        cv2.drawContours(overlay, contours, -1, color, 1)
-        if include_clouds:
-            points = item["cloud"].observed_points_camera
-            observed.append(points)
-            observed_colors.append(np.tile(np.asarray(color) / 255.0, (len(points), 1)))
-            points = item["model_points_camera"]
-            models.append(points)
-            model_colors.append(np.tile(np.asarray(color) / 255.0, (len(points), 1)))
-        if item["pose_valid"]:
-            p = item["pose"]
-            axes = np.array([[0, 0, 0], [0.035, 0, 0], [0, 0.035, 0], [0, 0, 0.035]])
-            uv, good = project_points(axes @ p[:3, :3].T + p[:3, 3], result["K"])
-            if good.all() and np.abs(uv).max() < 1e6:
-                uv = np.rint(uv).astype(int)
-                for i, axis_color in enumerate(((255, 70, 70), (70, 255, 70), (70, 70, 255)), 1):
-                    cv2.line(overlay, tuple(uv[0]), tuple(uv[i]), axis_color, 2)
-                cv2.putText(overlay, name, tuple(uv[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
-    if hand is not None:
-        uv, good = project_points(hand["points_camera"], result["K"])
-        h, w = overlay.shape[:2]
-        good &= (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
-        for u, v in np.rint(uv[good]).astype(int):
-            cv2.circle(overlay, (int(u), int(v)), 1, (255, 140, 35), -1)
-    clouds = dict(
-        observed_points=np.concatenate(observed),
-        model_points=np.concatenate(models),
-        observed_colors=np.concatenate(observed_colors),
-        model_colors=np.concatenate(model_colors),
-    ) if include_clouds else {}
-    return overlay, clouds
+        cv2.destroyWindow(self.title)

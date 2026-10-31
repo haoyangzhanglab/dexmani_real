@@ -1,11 +1,9 @@
-"""Aligned RGB-D frames and offline NPZ inputs, independent of hardware packages."""
+"""Raw 首帧选择使用的 RGB-D、相机几何和来源时钟。"""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-import re
 
 import numpy as np
 
@@ -115,17 +113,3 @@ def rectify_frame(frame, mask=None, *, maps=None):
     if model == "none" and np.any(coefficients != 0):
         raise ValueError("none distortion requires zero coefficients")
     return rectify_rgbd(frame.rgb, frame.depth_m, frame.K, coefficients, mask=mask, maps=maps)
-
-
-def iter_rgbd_directory(path: str | Path) -> Iterator[Frame]:
-    """Read lexically ordered ``000000.npz`` frames; ``row_index`` stays optional."""
-    directory = Path(path).expanduser().resolve()
-    if not directory.is_dir():
-        raise ValueError(f"RGB-D input must be a directory: {directory}")
-    paths = sorted(directory.glob("*.npz"))
-    if not paths:
-        raise ValueError(f"RGB-D directory contains no NPZ frames: {directory}")
-    if any(re.fullmatch(r"[0-9]{6}\.npz", file.name) is None for file in paths):
-        raise ValueError("RGB-D frame filenames must contain six digits, for example 000000.npz")
-    for frame_path in paths:
-        yield load_frame(frame_path)

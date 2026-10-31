@@ -47,14 +47,17 @@ def add_sam_arguments(parser, workspace):
     )
     parser.add_argument("--sam-root", type=Path, default=workspace / "third_party/Grounded-SAM-2")
     parser.add_argument(
+        "--sam-variant", choices=SAM_MODELS,
+        help="官方 SAM2.1 型号；省略时使用 small，同时选择匹配的配置与本地权重",
+    )
+    parser.add_argument(
         "--sam-checkpoint",
         type=Path,
-        default=workspace / "reports/cordvip_models" / SAM_MODELS["small"]["weight"],
+        help="自训模型本地权重；须与 --sam-config 完整配对，不能混用 --sam-variant",
     )
     parser.add_argument(
         "--sam-config",
-        default=SAM_MODELS["small"]["config"],
-        help="SAM2 包内配置；切换 large 时须同时指定匹配 checkpoint",
+        help="自训模型在 SAM2 包内的配置；须与 --sam-checkpoint 完整配对",
     )
     parser.add_argument(
         "--dino-weights",
@@ -67,6 +70,22 @@ def add_sam_arguments(parser, workspace):
     parser.add_argument(
         "--text-threshold", type=float, default=0.25, help="Grounding DINO 文本 token 阈值"
     )
+
+
+def resolve_sam_arguments(args, workspace):
+    """在 CLI 边界一次确定官方配对或显式自训配对，不访问模型。"""
+    custom = args.sam_checkpoint is not None or args.sam_config is not None
+    if custom:
+        if args.sam_checkpoint is None or args.sam_config is None:
+            raise ValueError("--sam-checkpoint 与 --sam-config 必须完整配对")
+        if args.sam_variant is not None:
+            raise ValueError("自训配对不能同时指定 --sam-variant")
+    else:
+        args.sam_variant = args.sam_variant or "small"
+        model = SAM_MODELS[args.sam_variant]
+        args.sam_config = model["config"]
+        args.sam_checkpoint = Path(workspace) / "reports/cordvip_models" / model["weight"]
+    return args
 
 
 def validate_sam_source(root):

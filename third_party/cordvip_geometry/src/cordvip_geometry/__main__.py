@@ -1,4 +1,4 @@
-"""物体感知工具：拍照、资产准备、追踪和离线回放。"""
+"""物体资产准备、Raw 离线追踪和结果查看。"""
 
 import argparse
 from importlib import import_module
@@ -6,11 +6,10 @@ from pathlib import Path
 import sys
 
 COMMANDS = {
-    "capture": ("capture_object", "冻结并保存 RGB-D；默认连接相机"),
     "object": ("build_object", "分割、单图生成和资产准备"),
     "prepare": ("prepare_object", "将已有 mesh 校准为米制资产"),
-    "track": ("scene_tracking", "实时位姿与点云；默认连接相机"),
-    "replay": ("object_tracking_demo", "只读 Raw 或 RGB-D 离线回放"),
+    "track": ("scene_tracking", "确认首帧实例后顺序处理 Raw 全部行"),
+    "view": ("object_tracking_demo", "查看已保存的离线场景结果，不加载模型"),
     "check": ("check_tracking", "静态检查追踪依赖，不连接设备"),
     "download": ("download_models", "从明确的官方 revision 下载模型权重"),
 }

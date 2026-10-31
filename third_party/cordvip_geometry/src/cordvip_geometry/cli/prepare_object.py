@@ -4,23 +4,29 @@
 from __future__ import annotations
 
 import argparse
+from math import isfinite
 from pathlib import Path
 
 from ..io import existing_file, output_path, write_json
 from .arguments import positive_float, positive_int
 
 
-def prepare(args: argparse.Namespace) -> None:
-    if (args.size_axis is None) != (args.size_meters is None):
+def prepare_mesh(
+    mesh, output_dir, *, workspace, scale_to_meters=None, size_axis=None,
+    size_meters=None, num_points=1024, seed=0, preview=False,
+) -> Path:
+    if (size_axis is None) != (size_meters is None):
         raise ValueError("--size-axis 与 --size-meters 必须同时提供")
-    if args.scale_to_meters is None and args.size_axis is None:
+    if scale_to_meters is None and size_axis is None:
         raise ValueError("必须提供 --scale-to-meters 或 --size-axis 与 --size-meters")
-    if args.scale_to_meters is not None and args.size_axis is not None:
+    if scale_to_meters is not None and size_axis is not None:
         raise ValueError("缩放因子和实测轴尺寸只能选择一种")
-    if args.seed < 0:
+    if seed < 0:
         raise ValueError("--seed 必须是非负整数")
-    source = existing_file(args.mesh)
-    output = output_path(args.output_dir, workspace=args.workspace)
+    if scale_to_meters is not None and (not isfinite(scale_to_meters) or scale_to_meters <= 0):
+        raise ValueError("scale_to_meters must be finite and positive")
+    source = existing_file(mesh)
+    output = output_path(output_dir, workspace=workspace)
     import trimesh
     from ..geometry import (
         load_metric_mesh,
@@ -29,16 +35,16 @@ def prepare(args: argparse.Namespace) -> None:
         save_points,
     )
 
-    mesh = load_metric_mesh(source, scale_to_meters=1.0)
-    scale = args.scale_to_meters
+    mesh = load_metric_mesh(source)
+    scale = scale_to_meters
     measured_extent = None
     if scale is None:
-        axis = "xyz".index(args.size_axis)
-        scale = mesh_scale_from_extent(mesh, axis, args.size_meters)
-        measured_extent = {"axis": args.size_axis, "extent_m": args.size_meters}
+        axis = "xyz".index(size_axis)
+        scale = mesh_scale_from_extent(mesh, axis, size_meters)
+        measured_extent = {"axis": size_axis, "extent_m": size_meters}
     # 米制缩放也作用于原点偏移；不自动居中，以保留唯一 object frame。
     mesh.apply_scale(scale)
-    points, normals = sample_mesh_surface(mesh, args.num_points, args.seed)
+    points, normals = sample_mesh_surface(mesh, num_points, seed)
     output.mkdir(parents=True, exist_ok=False)
     mesh_file = output / "mesh_m.obj"
     mesh.export(mesh_file, file_type="obj")
@@ -54,8 +60,8 @@ def prepare(args: argparse.Namespace) -> None:
         "scale_to_meters": scale,
         "measured_extent": measured_extent,
         "origin": "source_mesh_origin_scaled_without_recentering",
-        "num_points": args.num_points,
-        "seed": args.seed,
+        "num_points": num_points,
+        "seed": seed,
         "sampling": "area_weighted_triangle_barycentric",
         "normals_method": "mesh_face",
         "bounds_m": mesh.bounds.tolist(),
@@ -63,7 +69,7 @@ def prepare(args: argparse.Namespace) -> None:
     }
     write_json(output / "asset.json", metadata)
     print(f"已准备物体资产：{output / 'asset.json'}")
-    if args.preview:
+    if preview:
         import open3d as o3d
 
         cloud = o3d.geometry.PointCloud()
@@ -73,6 +79,7 @@ def prepare(args: argparse.Namespace) -> None:
             size=float(mesh.extents.max()) * 0.25
         )
         o3d.visualization.draw_geometries([cloud, frame], window_name="物体点云（米）")
+    return output
 
 
 def build_parser(*, workspace=None) -> argparse.ArgumentParser:
@@ -101,7 +108,11 @@ def build_parser(*, workspace=None) -> argparse.ArgumentParser:
 def main(argv=None, *, workspace=None) -> int:
     parser = build_parser(workspace=workspace)
     args = parser.parse_args(argv)
-    prepare(args)
+    prepare_mesh(
+        args.mesh, args.output_dir, workspace=args.workspace,
+        scale_to_meters=args.scale_to_meters, size_axis=args.size_axis, size_meters=args.size_meters,
+        num_points=args.num_points, seed=args.seed, preview=args.preview,
+    )
     return 0
 
 

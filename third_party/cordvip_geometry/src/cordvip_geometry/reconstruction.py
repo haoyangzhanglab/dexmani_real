@@ -1,6 +1,5 @@
 """Isolated Hunyuan3D-2.1 shape inference; metric scale and object axes need explicit calibration."""
 
-import gc
 import os
 from pathlib import Path
 import sys
@@ -64,88 +63,57 @@ def generate_mesh(
     if conditioner.get("config") is None:
         raise ValueError("Hunyuan conditioner must use embedded model config, without downloads")
 
-    loaded = sys.modules.get("hy3dshape")
-    if loaded is not None:
-        source = getattr(loaded, "__file__", None)
-        if source is None or not Path(source).resolve().is_relative_to(package_parent):
-            raise RuntimeError("A different hy3dshape package is loaded; use a fresh subprocess")
-    previous_path = sys.path.copy()
-    offline_keys = ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_HUB_DISABLE_TELEMETRY")
-    previous_env = {key: os.environ.get(key) for key in offline_keys}
-    pipeline = None
-    component = None
+    # 本函数在一次生成子进程内调用，进程退出释放模型与 CUDA 资源。
     started = time.monotonic()
-    try:
-        os.environ.update({key: "1" for key in offline_keys})
-        sys.path.insert(0, str(package_parent))
-        import torch
-        from hy3dshape import Hunyuan3DDiTFlowMatchingPipeline
+    os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1")
+    sys.path.insert(0, str(package_parent))
+    import torch
+    from hy3dshape import Hunyuan3DDiTFlowMatchingPipeline
 
-        target = torch.device(device)
-        if target.type != "cuda":
-            raise ValueError("This shape-generation example requires an explicit CUDA device")
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is unavailable; shape generation was not started")
-        if target.index is not None and target.index >= torch.cuda.device_count():
-            raise ValueError(f"CUDA device does not exist: {target}")
-        torch.cuda.init()
-        pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
-            str(checkpoint_path),
-            str(config_path),
-            device=str(target),
-            dtype=torch.float16,
-            use_safetensors=False,
+    target = torch.device(device)
+    if target.type != "cuda":
+        raise ValueError("This shape-generation example requires an explicit CUDA device")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable; shape generation was not started")
+    if target.index is not None and target.index >= torch.cuda.device_count():
+        raise ValueError(f"CUDA device does not exist: {target}")
+    torch.cuda.init()
+    pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
+        str(checkpoint_path),
+        str(config_path),
+        device=str(target),
+        dtype=torch.float16,
+        use_safetensors=False,
+    )
+    # inference_mode disables gradients; eval also selects the DiT MoE inference branch.
+    for component in (pipeline.model, pipeline.vae, pipeline.conditioner):
+        component.eval().requires_grad_(False)
+    with torch.inference_mode():
+        meshes = pipeline(
+            image=image,
+            generator=torch.Generator(device=target).manual_seed(seed),
+            num_inference_steps=steps,
+            octree_resolution=octree_resolution,
+            num_chunks=num_chunks,
+            output_type="trimesh",
         )
-        # inference_mode disables gradients; eval also selects the DiT MoE inference branch.
-        for component in (pipeline.model, pipeline.vae, pipeline.conditioner):
-            component.eval().requires_grad_(False)
-        component = None
-        with torch.inference_mode():
-            meshes = pipeline(
-                image=image,
-                generator=torch.Generator(device=target).manual_seed(seed),
-                num_inference_steps=steps,
-                octree_resolution=octree_resolution,
-                num_chunks=num_chunks,
-                output_type="trimesh",
-            )
-        if not isinstance(meshes, list) or len(meshes) != 1 or meshes[0] is None:
-            raise RuntimeError("Hunyuan did not return exactly one valid mesh")
-        mesh = meshes[0]
-        if (
-            len(mesh.vertices) < 4
-            or len(mesh.faces) < 4
-            or not np.isfinite(mesh.vertices).all()
-            or np.any(mesh.extents <= 0)
-        ):
-            raise RuntimeError("Hunyuan returned empty, nonfinite or degenerate geometry")
-        payload = mesh.export(file_type=output.suffix[1:].lower())
-        if isinstance(payload, str):
-            payload = payload.encode("utf-8")
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with output.open("xb") as stream:
-            stream.write(payload)
-        elapsed = time.monotonic() - started
-    finally:
-        pipeline = None
-        component = None
-        sys.path[:] = previous_path
-        for key, value in previous_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        gc.collect()
-        torch_module = sys.modules.get("torch")
-        if (
-            torch_module is not None
-            and "target" in locals()
-            and target.type == "cuda"
-            and torch_module.cuda.is_available()
-            and (target.index is None or target.index < torch_module.cuda.device_count())
-        ):
-            with torch_module.cuda.device(target):
-                torch_module.cuda.empty_cache()
+    if not isinstance(meshes, list) or len(meshes) != 1 or meshes[0] is None:
+        raise RuntimeError("Hunyuan did not return exactly one valid mesh")
+    mesh = meshes[0]
+    if (
+        len(mesh.vertices) < 4
+        or len(mesh.faces) < 4
+        or not np.isfinite(mesh.vertices).all()
+        or np.any(mesh.extents <= 0)
+    ):
+        raise RuntimeError("Hunyuan returned empty, nonfinite or degenerate geometry")
+    payload = mesh.export(file_type=output.suffix[1:].lower())
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("xb") as stream:
+        stream.write(payload)
+    elapsed = time.monotonic() - started
 
     return {
         "method": "Hunyuan3D-2.1 shape-only",

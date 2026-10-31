@@ -1,30 +1,30 @@
 # cordvip_geometry
 
-独立的 CordViP / ProxiDex 手—物感知工具。Grounding DINO 提供首帧文本候选，SAM2.1 small 生成 mask 并逐帧传播；FoundationPose++ 核心用当前 mask 的 2D bbox 中心引导位姿细化。当前变体不使用 Kalman。Hunyuan3D-2.1 继续负责可选的离线单图建模，生成 mesh 须经实测尺度校准。
+用于个人研究的离线物体资产准备与 Raw 几何处理。Grounding DINO 提供首帧文本候选，人工确认后由 SAM2.1 连续传播；可选 FoundationPose++ 使用 2D bbox guidance 细化位姿，不含 Kalman。Hunyuan3D-2.1 单图生成的 mesh 需要显式校准米制尺度。
 
-两个示例入口 [reconstruct_object.py](../../scripts/cordvip/reconstruct_object.py) 和 [track_object.py](../../scripts/cordvip/track_object.py) 分别调用 `python -m cordvip_geometry object build` 与 `track` 的同一实现。先看[示例](../../scripts/cordvip/README.md)，安装、Python 调用和输出说明见[使用文档](docs/usage.md)。
+常用入口是 [reconstruct_object.py](../../scripts/cordvip/reconstruct_object.py) 和 [track_object.py](../../scripts/cordvip/track_object.py)。先看[短示例](../../scripts/cordvip/README.md)；安装、数据与输出细节见[使用文档](docs/usage.md)。
 
 ```bash
 conda activate real_robot
+# 新工作站先准备基础环境；安装脚本不下载模型、不连接设备。
 bash third_party/cordvip_geometry/scripts/install_perception.sh
 python -m cordvip_geometry download --models grounding sam
 python -m cordvip_geometry check --offline-input --headless
 ```
 
-`real_robot` 是示例环境名。SAM 子解释器检查依赖是否存在，父环境按实际启用的位姿、手点或显示能力检查；具体要求见[使用文档](docs/usage.md)。运行允许使用修改过的源码和自选权重，配置与所需 API 须匹配。模型从本地加载；`--help`、静态检查和普通 import 不加载模型或连接设备。
+`real_robot` 是示例环境名。SAM 可通过 `--sam-python` 使用独立解释器，RPC 隔离保留。默认型号 small；官方型号由 `--sam-variant` 同时选定配置与本地 checkpoint，自训模型显式提供完整配对。静态检查不证明 GPU 推理、扩展 ABI 或长序列内存可用。
 
-默认 SAM2.1 small、BF16、eager。文本检测只用于首帧候选确认，进入跟踪后释放 Grounding DINO；多实例共享图像编码与位姿细化预处理。已有确认 mask 可直接开始传播。large 对照、参数及内存接口见[使用文档](docs/usage.md)。
+主流程为 Raw 首帧确认 → 单个 RawReader 顺序处理每行 → 保存每行结果 → 独立查看。全部对象不带 asset 时只做 mask 与实测点，不要求 FoundationPose。带 asset 时，深度几何支持参与 pose-valid 与 `POSE_LOST`，并非纯诊断；observed/model 点及法向仍分别保存。手点来自同行实测关节和数据对应的相机标定，同行关联不证明物理同步。
 
-单物体与多物体使用同一个追踪入口。默认处理最新帧，离线加 `--all-frames` 逐帧处理。`replay` 提供无模型 RGB-D 预览。
+```bash
+python scripts/cordvip/track_object.py \
+  --episode episodes/pick_place/episode_001 --scene scene.json \
+  --with-hand --headless --output outputs/scene_001
+python -m cordvip_geometry view outputs/scene_001
+```
 
-`SceneTrackingSession` 按准备、启动、逐帧处理、发布显示和关闭组织流程；正常帧、过期提示与退出共用最新结果发布入口，失效时同时撤销手和物体的可用几何。二维预览和视频跳过 3D 窗口专用的点云拼接与着色。位姿失败后不自动重试，当前会话仍保留独立分割得到的实测点。
+追踪默认处理全部行，只有 `--max-frames` 显式限制前缀。`frames/` 必存，`scene.json` 保存一次对象/role/asset/selection，`run.json`、`records.jsonl`、`result.json` 记录配置、逐行事实与最终结果。输出使用新目录，Raw 始终只读。首帧选择仍需与源数据及相机几何精确对应。
 
-CLI 参数集中在 `cli/arguments.py`；场景声明与首帧选择位于 `cli/scene_initialization.py`，离线建模的候选确认位于 `cli/object_selection.py`。`live_workers.py` 管理线程与等待，`viewer.py` 提供结果绘制；会话仍统一管理发布状态和资源关闭。
+建模的分割和 prepare 直接调用普通函数；只有 Hunyuan 生成使用一次子进程，退出释放 GPU。生成只保存未定尺度 mesh；最终米制资产按原 seed/点数采样一次。结果查看器只按行前进及切换 observed/model，不另建实时服务。
 
-语义实测点来自当前 mask 和原始实测深度；完整物体点来自固定资产和追踪位姿。二者独立保存，模型与深度的一致性仅用于诊断。分割误差、遮挡、物体形变及资产尺度误差仍须结合源数据评估。
-
-`--with-hand` 从同一 Raw 行的实测关节生成 FK 手点，使用数据对应的相机外参与当前实验安装配置。手—物表示与原始模型输入的适配、训练和 contact/proximity 标签属于 `dexmani_policy`。
-
-实时相机命令会连接 RealSense；`--with-hand` 目前只支持只读 Raw。宿主接入时应复用已有 RGB-D、实测关节和时间证据。主包 runtime、采集、13 字段导出与部署尚未接入本工具。
-
-运行产物与模型默认放在 workspace 的 `reports/` 下，也可显式指定其他输出位置。运行产物使用新目录，不覆盖输入文件或写回 Raw；模型下载可复用已有缓存目录。脚本入口显式传入 workspace，模块入口默认使用当前目录。
+本工具不提供实时相机追踪、latest/心跳发布或外部 Frame 宿主，也未接入主包控制、Raw writer、Canonical 导出或策略部署。上游源码与模型继续遵循各自的许可证及模型条款，详见[安装与权重](docs/usage.md#安装与权重)。

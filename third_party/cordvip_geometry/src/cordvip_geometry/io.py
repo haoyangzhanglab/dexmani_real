@@ -1,4 +1,4 @@
-"""Asset/selection validation and result publication; no model or device imports."""
+"""资产与初始选择边界校验，以及离线结果写入。"""
 
 from datetime import datetime
 import json
@@ -39,7 +39,10 @@ def load_asset(path):
         raise ValueError("资产法向必须与固定点一一对应，且为有限实数 (N, 3) 数组")
     if not np.allclose(np.linalg.norm(normals.astype(np.float64), axis=1), 1, rtol=0, atol=1e-5):
         raise ValueError("资产法向必须是单位向量；不自动修补或归一化")
-    return mesh, points, normals.astype(np.float32), metadata
+    normals = normals.astype(np.float32)
+    points.setflags(write=False)
+    normals.setflags(write=False)
+    return mesh, points, normals, metadata
 
 
 def load_mask(path, shape):
@@ -164,12 +167,10 @@ def load_initial_selection(directory, frame):
     )
 
 
-def write_observation(path, payload):
-    """Atomically publish a snapshot; consumers must recheck source freshness."""
+def write_scene_frame(path, arrays):
+    """独占写入一个离线 Raw 行结果；写入失败保持可见，不覆盖已有行。"""
     import numpy as np
 
     path = Path(path)
-    temporary = path.with_suffix(".tmp")
-    with temporary.open("wb") as stream:
-        np.savez(stream, **payload)
-    temporary.replace(path)
+    with path.open("xb") as stream:
+        np.savez_compressed(stream, **arrays)

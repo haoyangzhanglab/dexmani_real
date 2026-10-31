@@ -80,11 +80,8 @@ def load_points(path):
     return points
 
 
-def load_metric_mesh(path, *, scale_to_meters=1.0):
-    """Load one triangle mesh, preserving its origin and scaling all axes equally."""
-    scale_to_meters = float(scale_to_meters)
-    if not np.isfinite(scale_to_meters) or scale_to_meters <= 0:
-        raise ValueError("scale_to_meters must be finite and positive")
+def load_metric_mesh(path):
+    """Load one triangle mesh in its stored units, preserving origin and orientation."""
     import trimesh
 
     mesh = trimesh.load(str(Path(path)), process=False)
@@ -94,8 +91,6 @@ def load_metric_mesh(path, *, scale_to_meters=1.0):
         raise ValueError("Mesh must contain vertices and triangular faces")
     if np.asarray(mesh.faces).ndim != 2 or np.asarray(mesh.faces).shape[1] != 3:
         raise ValueError("Mesh faces must be triangles")
-    mesh = mesh.copy()
-    mesh.apply_scale(scale_to_meters)
     validate_points(mesh.vertices)
     return mesh
 

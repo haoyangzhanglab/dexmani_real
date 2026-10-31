@@ -1,20 +1,13 @@
-"""Same-frame measured clouds and optional poses; acquisition and timestamps stay with the host."""
+"""Raw 同行分割、实测点云与可选位姿；逐行结果直接编码。"""
 
 from pathlib import Path
 import time
 
 import numpy as np
 
-from .geometry import (
-    float32_points,
-    transform_points,
-    validate_points,
-    validate_pose,
-    validate_rgbd,
-    validate_normals,
-)
+from .geometry import transform_points
 from .foundationpose import prepare_tracking_frame
-from .model_depth import ModelDepthRenderer
+from .model_depth import ModelDepthRenderer, camera_rays
 from .scene_geometry import extract_scene_clouds, add_model_depth_support
 
 
@@ -36,14 +29,7 @@ class SceneTracker:
         from .foundationpose import FoundationPosePlusTracker
 
         self.segmenter = segmenter
-        self.assets = {}
-        # The documented memory API may supply assets without going through load_asset.
-        for name, (mesh, points, normals) in assets.items():
-            points = validate_points(points).copy()
-            normals = validate_normals(normals, points)
-            points.setflags(write=False)
-            normals.setflags(write=False)
-            self.assets[name] = mesh, points, normals
+        self.assets = assets
         self.pixel_stride = pixel_stride
         self.depth_tolerance_m = depth_tolerance_m
         self.min_matched_pixels = min_matched_pixels
@@ -51,6 +37,7 @@ class SceneTracker:
         self.trackers, self.renderers = {}, {}
         self.lost_objects = {}
         self.instance_ids = self.previous_frame_identity = self.image_shape = self.intrinsics = None
+        self.directions = None
         shared = None
         for name, (mesh, points, normals) in self.assets.items():
             tracker = FoundationPosePlusTracker(
@@ -68,7 +55,6 @@ class SceneTracker:
             torch.cuda.synchronize()
 
     def step(self, frame, rgb, depth_m, K, *, initial_masks=None):
-        rgb, depth_m, K = validate_rgbd(rgb, depth_m, K)
         identity = (frame.source_id, frame.row_index, frame.clock, frame.timestamp_ns)
         first = self.instance_ids is None
         if first != (initial_masks is not None):
@@ -121,6 +107,7 @@ class SceneTracker:
                     )
             self.instance_ids = instance_ids
             self.image_shape, self.intrinsics = rgb.shape, K.copy()
+            self.directions = camera_rays(depth_m.shape, K, self.pixel_stride) if self.assets else None
         poses, depths, pose_ms = {}, {}, {}
         prepared_frame = None
         for name, tracker in self.trackers.items():
@@ -144,7 +131,9 @@ class SceneTracker:
                 )
                 self.sync()
                 pose_ms[name] = (time.monotonic_ns() - start) / 1e6
-                depths[name] = self.renderers[name].render(depth_m.shape, K, poses[name])
+                depths[name] = self.renderers[name].render(
+                    depth_m.shape, K, poses[name], directions=self.directions,
+                )
             except Exception as error:
                 poses.pop(name, None)
                 self.lost_objects[name] = f"{type(error).__name__}: {error}"
@@ -209,126 +198,57 @@ class SceneTracker:
         self.renderers.clear()
 
 
-def scene_payload(result, roles, *, valid, state, max_age_ms, hand=None):
-    """Named plain arrays separate pose/observation validity; invalid sessions expose no usable geometry."""
-    if (
-        isinstance(max_age_ms, (bool, np.bool_))
-        or not isinstance(max_age_ms, (int, float, np.integer, np.floating))
-        or not np.isfinite(max_age_ms)
-        or max_age_ms <= 0
-    ):
-        raise ValueError("max_age_ms must be finite and positive")
-    if valid and (result is None or result.get("frame") is None):
-        raise ValueError("A valid scene observation requires a result and source frame")
-    frame = result["frame"] if result else None
+def scene_arrays(result, hand=None):
+    """仅编码当前已处理 Raw 行；对象角色保存在一次性的 scene.json。"""
+    frame = result["frame"]
     payload = dict(
-        valid=bool(valid),
-        state=state,
-        units="m",
-        coordinate_frame="color_camera",
-        object_ids=np.asarray(list(roles), dtype=str),
-        object_roles=np.asarray(list(roles.values()), dtype=str),
-        source_id=frame.source_id if frame else "",
-        row_index=frame.row_index if frame and frame.row_index is not None else -1,
-        timestamp_ns=frame.timestamp_ns if frame else -1,
-        clock=frame.clock if frame else "",
-        completed_ns=result["completed_ns"] if result else -1,
-        published_ns=time.monotonic_ns(),
-        max_age_ms=max_age_ms,
-        K=result["K"] if result else np.full((3, 3), np.nan),
+        source_id=frame.source_id,
+        row_index=frame.row_index,
+        timestamp_ns=frame.timestamp_ns,
+        clock=frame.clock,
+        rgb=result["rgb"],
+        K=result["K"],
     )
-    empty = np.empty((0, 3), np.float32)
-    if hand is not None and valid:
-        if (
-            hand["source_id"] != frame.source_id
-            or hand["row_index"] != frame.row_index
-            or hand["clock"] != frame.clock
-        ):
-            raise ValueError("Hand and scene must refer to exactly the same source row and clock")
-        T_base_camera = validate_pose(hand["T_base_camera"])
-        hand_points = float32_points(validate_points(hand["points_camera"]))
-        hand_normals = validate_normals(hand["normals_camera"], hand_points)
-        link_ids = np.asarray(hand["link_ids"])
-        joints = np.asarray(hand["joint_state"])
-        if (
-            not len(hand_points)
-            or link_ids.shape != (len(hand_points),)
-            or not np.issubdtype(link_ids.dtype, np.integer)
-            or np.any(link_ids < 0)
-        ):
-            raise ValueError("Hand link IDs must correspond to nonempty sampled points")
-        if (
-            joints.ndim != 1
-            or not len(joints)
-            or joints.dtype.kind not in "fiu"
-            or not np.isfinite(joints).all()
-        ):
-            raise ValueError("Joint state must contain finite measured joint positions")
-        stamps = [
-            hand[key] for key in ("arm_timestamp_ns", "hand_timestamp_ns", "camera_timestamp_ns")
-        ]
-        if any(
-            isinstance(stamp, (bool, np.bool_)) or not isinstance(stamp, (int, np.integer))
-            for stamp in stamps
-        ):
-            raise ValueError("Source timestamps must be integer nanoseconds")
-        if not isinstance(hand["timing_available"], (bool, np.bool_)):
-            raise ValueError("timing_available must be a boolean source-evidence flag")
-        timing = bool(hand["timing_available"])
-        skew_ms = np.nan
-        if timing:
-            if min(stamps) <= 0 or stamps[2] != frame.timestamp_ns:
-                raise ValueError(
-                    "Available timing requires positive source stamps and matching camera time"
-                )
-            skew_ms = (max(stamps) - min(stamps)) / 1e6
-            supplied_skew = hand["skew_ms"]
-            if (
-                isinstance(supplied_skew, (bool, np.bool_))
-                or not isinstance(supplied_skew, (int, float, np.integer, np.floating))
-                or not np.isfinite(supplied_skew)
-                or not np.isclose(supplied_skew, skew_ms, rtol=0, atol=1e-9)
-            ):
-                raise ValueError("Hand/camera skew must be calculated from original source times")
+    if hand is not None:
+        T_base_camera = hand["T_base_camera"]
+        hand_points, hand_normals = hand["points_camera"], hand["normals_camera"]
         payload.update(
             hand_points_camera=hand_points,
             hand_normals_camera=hand_normals,
             hand_points_base=transform_points(hand_points, T_base_camera),
             hand_normals_base=(hand_normals @ T_base_camera[:3, :3].T).astype(np.float32),
-            hand_link_ids=link_ids,
-            joint_state=joints,
+            hand_link_ids=hand["link_ids"],
+            joint_state=hand["joint_state"],
             T_base_camera=T_base_camera,
-            hand_timing_available=timing,
-            hand_camera_skew_ms=skew_ms,
-            arm_timestamp_ns=stamps[0],
-            hand_timestamp_ns=stamps[1],
-            camera_timestamp_ns=stamps[2],
+            hand_timing_available=hand["timing_available"],
+            hand_camera_skew_ms=hand["skew_ms"] if hand["timing_available"] else np.nan,
+            arm_timestamp_ns=hand["arm_timestamp_ns"],
+            hand_timestamp_ns=hand["hand_timestamp_ns"],
+            camera_timestamp_ns=hand["camera_timestamp_ns"],
         )
-    for name in roles:
-        item = result["objects"][name] if result and valid else None
-        cloud = item["cloud"] if item else None
-        pose_ok = bool(item and item["pose_valid"])
+    for name, item in result["objects"].items():
+        cloud, pose_ok = item["cloud"], item["pose_valid"]
         fields = dict(
-            state=item["state"] if item else state,
+            state=item["state"],
             pose_valid=pose_ok,
-            error=str(item["error"]) if item and item.get("error") is not None else "",
-            observed_valid=bool(item and item["observed_valid"]),
+            error=item["error"] or "",
+            observed_valid=item["observed_valid"],
             T_camera_object=item["pose"].copy() if pose_ok else np.full((4, 4), np.nan),
-            model_points_camera=item["model_points_camera"] if pose_ok else empty,
-            model_normals_camera=item["model_normals_camera"] if pose_ok else empty,
-            observed_points_camera=cloud.observed_points_camera if cloud else empty,
-            observed_colors=cloud.observed_colors if cloud else np.empty((0, 3), np.uint8),
-            semantic_mask=cloud.semantic_mask if cloud else np.empty((0, 0), bool),
-            observed_mask=cloud.observed_mask if cloud else np.empty((0, 0), bool),
+            model_points_camera=item["model_points_camera"],
+            model_normals_camera=item["model_normals_camera"],
+            observed_points_camera=cloud.observed_points_camera,
+            observed_colors=cloud.observed_colors,
+            semantic_mask=cloud.semantic_mask,
+            observed_mask=cloud.observed_mask,
         )
-        if hand is not None and valid:
+        if hand is not None:
             fields["observed_points_base"] = transform_points(
                 fields["observed_points_camera"], T_base_camera
             )
             fields["model_points_base"] = transform_points(
                 fields["model_points_camera"], T_base_camera
             )
-        if pose_ok and cloud is not None and cloud.model_supported_mask is not None:
+        if pose_ok and cloud.model_supported_mask is not None:
             fields["model_supported_mask"] = cloud.model_supported_mask
             fields["observed_model_depth_residual_m"] = cloud.observed_model_depth_residual_m
         payload.update({f"{name}__{key}": value for key, value in fields.items()})

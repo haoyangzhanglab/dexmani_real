@@ -195,9 +195,16 @@ Canonical 默认保持固定周期有效前缀、完整 13 模态，并对真实
 | [geometry/](dexmani_real/geometry/) · [perception/](dexmani_real/perception/) | 坐标变换、FK、点云与手部表示 |
 | [control/](dexmani_real/control/) · [runtime/](dexmani_real/runtime/) · [ipc/](dexmani_real/ipc/) | 动作计算、运行协调与进程通信 |
 | [teleop/](dexmani_real/teleop/) · [deployment/](dexmani_real/deployment/) · [replay/](dexmani_real/replay/) | 遥操作、策略执行与回放 |
-| [config/](dexmani_real/config/) | 配置定义、覆盖合并与标定参数 |
+| [config/](dexmani_real/config/) | dataclass 定义、Python 配置入口与标定参数 |
 | [data/](dexmani_real/data/) | 数据记录与导出 |
 | [utils/](dexmani_real/utils/) | 标定工具、可视化与通用辅助函数 |
 | [scripts/](scripts/) | 实验与工具入口 |
 
-CordVIP 对象重建与跟踪见 [scripts/cordvip/README.md](scripts/cordvip/README.md)。依赖配置见 [pyproject.toml](pyproject.toml)，开发约定见 [AGENTS.md](AGENTS.md)。
+CordVIP 使用离线 Raw：确认同一首帧的实例 mask，顺序处理全部行，保存逐行结果后独立查看。已退出实时相机追踪、latest/心跳服务与按墙钟跳行；保留单/多物体、无资产的 mask-only、SAM 隔离和法向。深度支持量参与 pose-valid 判定；pose 失效不删除独立语义实测点。
+
+```bash
+python scripts/cordvip/track_object.py --episode episodes/TASK/EPISODE --scene scene.json --with-hand --output outputs/scene_001
+python -m cordvip_geometry view outputs/scene_001
+```
+
+场景、首帧选择、米制资产及结果字段见 [scripts/cordvip/README.md](scripts/cordvip/README.md)。依赖配置见 [pyproject.toml](pyproject.toml)，开发约定见 [AGENTS.md](AGENTS.md)。
