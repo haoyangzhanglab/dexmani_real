@@ -98,8 +98,8 @@ class ActionMapper:
         hand = self.prepare_hand(hand)
         if self.solver is None:
             raise ValueError("EEF mapping requires an online IK solver")
-        # 复制后投影，避免改写输入目标及 Teleop 的 EMA 参考。
-        pose = pose.copy()
+        # 先验证原始位姿，再裁剪位置；不能让 clip 掩盖非有限输入。
+        pose = Pose(pose.p, pose.q)
         workspace = self.constraints.workspace
         pose.p = np.clip(pose.p, workspace[:, 0], workspace[:, 1])
         result = self.solver.solve(

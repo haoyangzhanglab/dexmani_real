@@ -11,6 +11,15 @@ FINGER_CHAINS = np.arange(1, 21).reshape(5, 4)
 TIP_INDICES = np.array([4, 8, 12, 16, 20])
 
 
+@dataclass(frozen=True)
+class HandTargets:
+    positions: np.ndarray
+    directions: np.ndarray  # (5, 2, 3): proximal / terminal
+    activation: np.ndarray
+    pinch_distances: np.ndarray
+    thumb_base_observable: bool
+
+
 def prepare_landmarks(landmarks):
     """米制、右手输入；输出右手掌系 (+X 掌侧、+Y 拇指侧、+Z 指向中指)。"""
     points = np.asarray(landmarks, dtype=np.float64)
@@ -45,56 +54,52 @@ class HandCalibration:
     sample_count: int
 
     @classmethod
-    def from_metadata(cls, metadata):
-        if metadata.get("method") != "adaptive_xhand_v1":
-            raise ValueError("unsupported hand calibration method")
-        bones = np.asarray(metadata["human_bone_lengths_m"], dtype=np.float64)
-        width, count = metadata["human_palm_width_m"], metadata["sample_count"]
-        if (
-            bones.shape != (5, 3) or not np.isfinite(bones).all()
-            or np.any(bones < 0.002) or np.any(bones > 0.18)
-            or not np.isfinite(width) or not 0.01 <= width <= 0.36
-            or type(count) is not int or count < 2
-        ):
-            raise ValueError("invalid saved hand morphology calibration")
-        return cls(bones.copy(), float(width), count)
-
-    @classmethod
-    def from_frames(cls, frames, *, min_samples, max_relative_mad):
+    def from_frames(cls, frames, config):
         values = np.array([hand_lengths(prepare_landmarks(frame)) for frame in frames])
-        if len(values) < min_samples:
-            raise ValueError(f"hand calibration requires {min_samples} distinct frames")
+        if len(values) < config.calibration_samples:
+            raise ValueError(f"hand calibration requires {config.calibration_samples} frames")
         median = np.median(values, axis=0)
         relative_mad = np.median(np.abs(values - median), axis=0) / median
-        if np.max(relative_mad) > max_relative_mad:
+        if np.max(relative_mad) > config.calibration_max_relative_mad:
             raise ValueError("hand calibration bone lengths are unstable")
+        # MAD 对少量异常值不敏感；每个样本还须满足运行时的骨长容差。
+        if np.max(np.abs(values / median - 1.0)) > config.bone_length_tolerance:
+            raise ValueError("hand bone lengths changed beyond the calibrated tolerance")
         return cls(median[:15].reshape(5, 3), float(median[15]), len(values))
 
-    def validate_frame(self, points, tolerance):
-        reference = np.r_[self.bone_lengths.ravel(), self.palm_width]
-        if np.max(np.abs(hand_lengths(points) / reference - 1.0)) > tolerance:
-            raise ValueError("hand bone lengths changed beyond the calibrated tolerance")
-
     def targets(self, points, robot_points, thumb_cmc, config):
-        """三点/指：thumb MCP/IP/TIP；其余 MCP/PIP/TIP（合并人手 DIP）。"""
+        """校验标定骨长并映射三点/指：thumb MCP/IP/TIP；其余 MCP/PIP/TIP。"""
         chains = points[FINGER_CHAINS]
         bones = np.diff(chains, axis=1)
+        lengths = np.linalg.norm(bones, axis=2)
+        measured = np.r_[lengths.ravel(), np.linalg.norm(points[5] - points[17])]
+        reference = np.r_[self.bone_lengths.ravel(), self.palm_width]
+        if np.max(np.abs(measured / reference - 1.0)) > config.bone_length_tolerance:
+            raise ValueError("hand bone lengths changed beyond the calibrated tolerance")
+        unit_bones = bones / lengths[:, :, None]
+        base = unit_bones[0, 0, :2]
+        norm = np.linalg.norm(base)
+        observable = bool(norm > 1e-6)
         robot_segments = np.linalg.norm(np.diff(robot_points, axis=1), axis=2)
         targets = robot_points.copy()
-        thumb_metacarpal = np.linalg.norm(robot_points[0, 0] - thumb_cmc)
-        targets[0, 0] = thumb_cmc + bones[0, 0] * thumb_metacarpal / self.bone_lengths[0, 0]
+        # 拇指第一轴只改变 MCP 的 XY 方位；高度和轨迹半径由 URDF 固定。
+        if observable:
+            robot_base = robot_points[0, 0] - thumb_cmc
+            targets[0, 0, :2] = thumb_cmc[:2] + base / norm * np.linalg.norm(robot_base[:2])
+        # 否则沿用中立占位坐标；Objective 显式关闭不可辨识的拇指位置项。
         targets[0, 1] = targets[0, 0] + bones[0, 1] * robot_segments[0, 0] / self.bone_lengths[0, 1]
         targets[0, 2] = targets[0, 1] + bones[0, 2] * robot_segments[0, 1] / self.bone_lengths[0, 2]
         targets[1:, 1] = (
             targets[1:, 0] + bones[1:, 0]
             * (robot_segments[1:, 0] / self.bone_lengths[1:, 0])[:, None]
         )
-        # 先从原始点计算合并向量，再缩放；不会逐点覆盖造成骨段翻转。
+        # 位置目标合并 PIP→DIP→TIP，末段方向另行保留。
         targets[1:, 2] = (
             targets[1:, 1] + (chains[1:, 3] - chains[1:, 1])
             * (robot_segments[1:, 1] / self.bone_lengths[1:, 1:].sum(axis=1))[:, None]
         )
-        directions = bones[:, 2] / np.linalg.norm(bones[:, 2], axis=1)[:, None]
+        directions = unit_bones[:, [0, 2]]
+        directions[0, 0] = unit_bones[0, 1]  # 拇指近段为 MCP→IP。
         palm_scale = np.linalg.norm(robot_points[1, 0] - robot_points[4, 0]) / self.palm_width
         distances = np.linalg.norm(points[TIP_INDICES[1:]] - points[4], axis=1) * palm_scale
         x = np.clip(
@@ -102,5 +107,8 @@ class HandCalibration:
             0.0, 1.0,
         )
         activation = x * x * (3.0 - 2.0 * x)
-        pinch_distances = (1.0 - activation) * distances + activation * config.pinch_gap_m
-        return targets, directions, activation, pinch_distances
+        # 距离接近不足以证明对掌；末段夹角 60→90 度逐渐启用辅助。
+        opposition = np.degrees(np.arccos(np.clip(unit_bones[1:, 2] @ unit_bones[0, 2], -1, 1)))
+        x = np.clip((opposition - 60.0) / 30.0, 0.0, 1.0)
+        activation *= x * x * (3.0 - 2.0 * x)
+        return HandTargets(targets, directions, activation, distances, observable)

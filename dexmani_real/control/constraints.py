@@ -39,7 +39,8 @@ class MotionConstraints:
         self.target_fk = ArmFK()
         self.limits = np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper))
         self.workspace = environment.workspace.as_array()
-        self.margin = environment.eef_workspace_margin_m
+        margin = environment.eef_workspace_margin_m
+        self.workspace_with_margin = self.workspace + (-margin, margin)
 
     def rejection(self, target, *, collision_hand_qpos):
         reason = joint_target_rejection(target, self.limits)
@@ -51,8 +52,8 @@ class MotionConstraints:
     def endpoint_rejection(self, target, *, position=None):
         if position is None:
             position, _ = self.target_fk.forward(target)
-        if np.any(position < self.workspace[:, 0] - self.margin) or np.any(
-            position > self.workspace[:, 1] + self.margin
+        if np.any(position < self.workspace_with_margin[:, 0]) or np.any(
+            position > self.workspace_with_margin[:, 1]
         ):
             return "final_eef_workspace"
         return self.collision_model.rejection(target)

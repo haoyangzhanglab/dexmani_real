@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import radians
+from math import isfinite, radians
 
 import numpy as np
 
@@ -13,12 +13,16 @@ from dexmani_real.geometry.pose import validate_unit_quaternion_wxyz
 
 @dataclass(frozen=True)
 class MotionConfig:
+    """遥操作与策略 EEF 逆解的误差容差。"""
+
     ik_max_pose_error_pos_m: float = 0.02
     ik_max_pose_error_rot_rad: float = radians(5.0)
 
 
 @dataclass(frozen=True)
 class WorkspaceBounds:
+    """机器人基座系 XYZ 工作空间，单位 m。"""
+
     x_min: float = 0.25
     x_max: float = 0.72
     y_min: float = -0.50
@@ -28,11 +32,7 @@ class WorkspaceBounds:
 
     def as_array(self) -> np.ndarray:
         bounds = np.array(
-            [
-                [self.x_min, self.x_max],
-                [self.y_min, self.y_max],
-                [self.z_min, self.z_max],
-            ],
+            ((self.x_min, self.x_max), (self.y_min, self.y_max), (self.z_min, self.z_max)),
             dtype=np.float64,
         )
         if not np.isfinite(bounds).all() or np.any(bounds[:, 0] >= bounds[:, 1]):
@@ -42,6 +42,8 @@ class WorkspaceBounds:
 
 @dataclass(frozen=True)
 class StaticCollisionBox:
+    """基座系静态盒体；尺寸为完整边长，四元数使用 WXYZ。"""
+
     name: str = "obstacle"
     center_xyz_m: tuple[float, float, float] = (0.0, 0.0, 0.0)
     size_xyz_m: tuple[float, float, float] = (1.0, 1.0, 1.0)
@@ -52,16 +54,13 @@ class StaticCollisionBox:
             raise ValueError(
                 "static collision box name must be non-empty and must not use reserved name 'table'"
             )
-        center = np.asarray(self.center_xyz_m, dtype=np.float64)
-        size = np.asarray(self.size_xyz_m, dtype=np.float64)
-        if center.shape != (3,) or size.shape != (3,):
+        vectors = np.asarray((self.center_xyz_m, self.size_xyz_m), dtype=np.float64)
+        if vectors.shape != (2, 3):
             raise ValueError("static collision box center and size must both have shape (3,)")
-        if not np.all(np.isfinite(np.concatenate((center, size)))):
+        if not np.isfinite(vectors).all():
             raise ValueError("static collision box values must be finite")
-        if np.any(size <= 0.0):
-            raise ValueError(
-                "static collision box size_xyz_m must contain positive full side lengths"
-            )
+        if np.any(vectors[1] <= 0.0):
+            raise ValueError("static collision box size_xyz_m must contain positive full side lengths")
         validate_unit_quaternion_wxyz(self.quat_wxyz, name="static collision box quaternion")
 
 
@@ -70,7 +69,7 @@ class TableCollisionConfig:
     """HOME 的标定桌面几何与软间隙；在线 MotionConstraints 不使用此配置。"""
 
     enabled: bool = True
-    # 此标定平面路径也供点云去桌面和诊断工具使用。
+    # 点云去桌面也使用此标定平面文件。
     plane_path: str | None = TABLE_PLANE_RELATIVE_PATH
     size_xy_m: tuple[float, float] = (2.0, 2.0)
     thickness_m: float = 0.04
@@ -84,11 +83,11 @@ class TableCollisionConfig:
         ):
             raise ValueError("table plane_path must be a non-empty string or null")
         size = np.asarray(self.size_xy_m, dtype=np.float64)
-        if size.shape != (2,) or not np.isfinite(size).all():
-            raise ValueError("table size_xy_m must be finite shape (2,)")
-        if np.any(size <= 0.0) or not np.isfinite(self.thickness_m) or self.thickness_m <= 0.0:
-            raise ValueError("table size and thickness must be finite and positive")
-        if not np.isfinite(self.soft_clearance_m) or self.soft_clearance_m < 0.0:
+        if size.shape != (2,) or not np.isfinite(size).all() or np.any(size <= 0.0):
+            raise ValueError("table size_xy_m must contain two finite positive lengths")
+        if not isfinite(self.thickness_m) or self.thickness_m <= 0.0:
+            raise ValueError("table thickness_m must be finite and positive")
+        if not isfinite(self.soft_clearance_m) or self.soft_clearance_m < 0.0:
             raise ValueError("table soft_clearance_m must be finite and non-negative")
         if any(
             not isinstance(name, str) or not name.strip() for name in self.allowed_contact_links
@@ -100,23 +99,24 @@ class TableCollisionConfig:
 class EnvironmentConfig:
     workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
     eef_workspace_margin_m: float = 0.005
+    # HOME 与在线目标检查共用的静态障碍物。
+    static_boxes: tuple[StaticCollisionBox, ...] = ()
+
+    table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
     # HOME 未启用标定桌面模型时使用的手部 frame 高度代理。
     table_z_surface_m: float = 0.022
     hand_safety_margin_m: float = 0.05
-    table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
-    # HOME 与在线 MotionConstraints 共同使用的静态障碍物。
-    static_boxes: tuple[StaticCollisionBox, ...] = ()
 
     def validate(self) -> None:
         self.workspace.as_array()
-        if not np.isfinite(self.table_z_surface_m):
+        if not isfinite(self.table_z_surface_m):
             raise ValueError("table_z_surface_m must be finite")
-        if not np.isfinite(self.hand_safety_margin_m) or self.hand_safety_margin_m < 0:
-            raise ValueError("hand_safety_margin_m must be finite and non-negative")
-        if not np.isfinite(self.eef_workspace_margin_m) or self.eef_workspace_margin_m < 0:
-            raise ValueError("EEF workspace margin must be finite and nonnegative")
-        if self.table.enabled:
-            self.table.validate()
+        for name in ("eef_workspace_margin_m", "hand_safety_margin_m"):
+            value = getattr(self, name)
+            if not isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        # 模型关闭时，桌面配置仍用于点云标定路径及完整配置元数据。
+        self.table.validate()
         for box in self.static_boxes:
             box.validate()
         names = [box.name for box in self.static_boxes]

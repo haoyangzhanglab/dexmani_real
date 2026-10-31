@@ -6,6 +6,8 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
+import numpy as np
+
 from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
 from dexmani_real.config.teleop import DEFAULT_TASK_NAME
 from dexmani_real.control.actions import ActionMapper
@@ -64,9 +66,9 @@ def run_teleop(
     validate_robot_config(runtime)
     validate_control_rate(runtime, runtime.teleop.control_hz)
     runtime.teleop.validate()
-    runtime.collection.validate()
     runtime.vr.validate()
     if runtime.collection.enabled:
+        runtime.collection.validate()
         runtime.camera.validate()
     table_plane_abcd = (
         load_table_plane(runtime.environment.table)
@@ -281,7 +283,8 @@ def calibrate_hand(loop):
     config = loop.runtime.hand_retargeting
     print("正在标定手部骨长：请保持右手清晰可见；无需保持伸直。S/Q/Esc 可取消。", flush=True)
     deadline = time.monotonic() + config.calibration_timeout_s
-    frames, last_sequence, last_source_ns = [], None, 0
+    frames: list[np.ndarray] = []
+    last_sequence, last_source_ns = None, 0
     last_error = "no fresh hand frames"
     while len(frames) < config.calibration_samples:
         if not loop.keyboard.check_health():

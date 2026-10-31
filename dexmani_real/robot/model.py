@@ -52,7 +52,6 @@ XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
 XHAND_MODEL_DIR = ASSET_DIR / "robots" / "xhand"
 XARM7_XHAND_RIGHT_URDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand_right.urdf"
 XARM7_XHAND_SRDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand.srdf"
-XHAND_RIGHT_URDF_PATH = XHAND_MODEL_DIR / "xhand_right.urdf"
 
 
 XARM7_HARD_LOWER = (

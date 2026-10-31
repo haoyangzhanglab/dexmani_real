@@ -5,6 +5,7 @@ import logging
 import time
 from dataclasses import asdict
 from enum import Enum
+from typing import cast
 
 from dexmani_real.data.raw import snapshot_recording_metadata
 from dexmani_real.data.recorder import (
@@ -65,6 +66,11 @@ class TeleopLoop:
         self.controller = controller
         self.home_planner = home_planner
         self.recording_dir = recording_dir
+        # 会话配置固定；连接设备前生成录制快照，避免分段开始时才发现序列化错误。
+        self.runtime_config_json = (
+            json.dumps(asdict(runtime), ensure_ascii=False, allow_nan=False)
+            if recording_dir is not None else None
+        )
         self.task_label = task_label
         self.camera_snapshot = camera_snapshot
         self.keyboard, self.audio = keyboard, audio
@@ -178,22 +184,23 @@ class TeleopLoop:
         return True
 
     def finish_recording(self, save, *, announce=True):
-        published = None
-        captured = self.recorder is not None and self.recorder.start_attempted
-        if captured:
-            reason = self.pending_termination_reason
-            published = self.recorder.finish(
-                save=save and not self.discard_requested,
-                reason=reason,
-                details=self.termination_details,
-                technical_status=(
-                    "normal" if not self.capture_failed and reason in {"operator", "quit", "timeout"}
-                    else "failed"
-                ),
-            )
+        recorder = self.recorder
+        if recorder is None or not recorder.start_attempted:
+            self.recorder = None
+            return
+        reason = self.pending_termination_reason
+        published = recorder.finish(
+            save=save and not self.discard_requested,
+            reason=reason,
+            details=self.termination_details,
+            technical_status=(
+                "normal" if not self.capture_failed and reason in {"operator", "quit", "timeout"}
+                else "failed"
+            ),
+        )
         # finish 失败时保留 recorder，让会话收尾继续持有未释放的 writer。
         self.recorder = None
-        if announce and captured:
+        if announce:
             self.audio.play("save" if published is not None else "discard")
 
     def abort_episode(
@@ -326,8 +333,8 @@ class TeleopLoop:
                 tactile_hold_max_age_s=self.runtime.hand.feedback_max_age_s,
             )
             metadata.update(
-                runtime_config_json=json.dumps(asdict(self.runtime), ensure_ascii=False, allow_nan=False),
-                vr_to_robot_rotation=self.controller.rotation.tolist(),
+                runtime_config_json=self.runtime_config_json,
+                vr_to_robot_rotation=self.controller.rotation.as_matrix().tolist(),
                 teleop_run_id=self.run_id,
             )
             if self.controller.hand_retargeter is not None:
@@ -493,7 +500,7 @@ class TeleopLoop:
         self.termination_details.append(timing)
 
     def execute_control_step(self, row, deadline_ns, feedback_until_ns):
-        epoch = self.run_id
+        epoch = cast(int, self.run_id)  # 仅 ACTIVE 阶段调用，保留本段的授权 ID 快照。
         deadline_ns = min(deadline_ns, feedback_until_ns)
         command = None
         reason = None
@@ -503,10 +510,15 @@ class TeleopLoop:
             control_ns=int(row.control_timestamp_ns), observation_ns=int(row.observation_timestamp_ns),
             deadline_ns=int(deadline_ns), compute_start_ns=time.monotonic_ns(),
         )
+        previous_hand_observation_id = self.controller.hand_observation_id
         try:
             result = self.controller.compute_target(row)
             timing["compute_end_ns"] = time.monotonic_ns()
-            if self.controller.hand_retargeter is not None:
+            # 缓存命中没有发生求解，不能重复记入上次的耗时和求解次数。
+            if (
+                self.controller.hand_retargeter is not None
+                and self.controller.hand_observation_id != previous_hand_observation_id
+            ):
                 timing["hand_retargeting"] = self.controller.hand_retargeter.last_diagnostics.copy()
             if result is None or result.rejection_reason is not None or result.arm_qpos is None:
                 detail = (

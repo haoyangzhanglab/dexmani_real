@@ -46,7 +46,8 @@ class HomePlanner:
         self.arm = arm
         self.environment = environment
         self.limits = np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper))
-        self.workspace_bounds = environment.workspace.as_array()
+        margin = environment.eef_workspace_margin_m
+        self.workspace_bounds = environment.workspace.as_array() + (-margin, margin)
         self.collision_model = CollisionModel(
             static_boxes=environment.static_boxes,
             table=environment.table,
@@ -100,9 +101,8 @@ class HomePlanner:
         if reason is not None:
             raise HomePathRejected(f"collision: {reason}")
         position = self.collision_model.eef_position()
-        margin = self.environment.eef_workspace_margin_m
-        if np.any(position < self.workspace_bounds[:, 0] - margin) or np.any(
-            position > self.workspace_bounds[:, 1] + margin
+        if np.any(position < self.workspace_bounds[:, 0]) or np.any(
+            position > self.workspace_bounds[:, 1]
         ):
             raise HomePathRejected(f"path leaves workspace: {position}")
         clearance, measurement, source = self._table_clearance()

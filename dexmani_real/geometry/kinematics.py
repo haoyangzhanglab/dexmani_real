@@ -2,7 +2,6 @@
 
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
-from pathlib import Path
 
 import numpy as np
 
@@ -77,31 +76,19 @@ class ArmFK:
 
 
 class HandFK:
-    """默认提取整机中的手部子树；重定向可显式加载独立的纯手 URDF。"""
+    """从组合 URDF 提取手部子树，输入关节及雅可比列均按 SDK 顺序。"""
 
-    def __init__(
-        self,
-        fingertip_link_names: Sequence[str] = XHAND_FINGERTIP_LINK_NAMES,
-        *,
-        urdf_path: Path | None = None,
-    ):
+    def __init__(self, fingertip_link_names: Sequence[str] = XHAND_FINGERTIP_LINK_NAMES):
         import pinocchio as pin
 
         self.pin = pin
-        self.model = (
-            pin.buildModelFromXML(kinematic_urdf("right_hand_link"))
-            if urdf_path is None else pin.buildModelFromUrdf(str(urdf_path))
-        )
+        self.model = pin.buildModelFromXML(kinematic_urdf("right_hand_link"))
         self.data = self.model.createData()
-        active = sorted(
-            (joint.idx_q, self.model.names[i])
-            for i, joint in enumerate(self.model.joints)
-            if i and joint.nq
-        )
-        if self.model.nq != 12 or {name for _, name in active} != set(XHAND_SDK_JOINT_NAMES):
+        active = tuple(self.model.names[1:])
+        if self.model.nq != 12 or set(active) != set(XHAND_SDK_JOINT_NAMES):
             raise ValueError("hand FK must contain the twelve XHand SDK joints")
         self.sdk_to_urdf = np.array([
-            XHAND_SDK_JOINT_NAMES.index(name) for _, name in active
+            XHAND_SDK_JOINT_NAMES.index(name) for name in active
         ], dtype=np.intp)
         self.urdf_to_sdk = np.argsort(self.sdk_to_urdf)
         if len(fingertip_link_names) != 5 or len(set(fingertip_link_names)) != 5:
@@ -128,9 +115,9 @@ class HandFK:
         jacobians = np.stack([
             self.pin.getFrameJacobian(
                 self.model, self.data, fid, self.pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
-            )[:3, self.urdf_to_sdk]
+            )[:3]
             for fid in frame_ids
-        ])
+        ])[:, :, self.urdf_to_sdk]
         return positions, jacobians
 
 

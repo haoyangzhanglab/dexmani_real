@@ -22,11 +22,7 @@ class CollisionModel:
         self.pin = pin
         urdf = str(XARM7_XHAND_RIGHT_URDF_PATH)
         self.model = pin.buildModelFromUrdf(urdf)
-        active = {
-            self.model.names[i]
-            for i, joint in enumerate(self.model.joints)
-            if i and joint.nq > 0
-        }
+        active = set(self.model.names[1:])
         sdk_names = (*XARM7_JOINT_NAMES, *XHAND_SDK_JOINT_NAMES)
         if self.model.nq != 19 or active != set(sdk_names):
             raise ValueError("collision model must contain the xArm7 and XHand SDK joints")
@@ -59,6 +55,11 @@ class CollisionModel:
             self.add_obstacle(box.name, Box(*box.size_xyz_m), placement, robot_count)
 
         if self.table is not None:
+            unknown_links = set(table.allowed_contact_links) - {
+                frame.name for frame in self.model.frames if frame.type == pin.FrameType.BODY
+            }
+            if unknown_links:
+                raise ValueError(f"table allowed_contact_links not found in URDF: {sorted(unknown_links)}")
             plane = np.asarray(table_plane_abcd, dtype=np.float64)
             norm = np.linalg.norm(plane[:3])
             normal = plane[:3] / norm

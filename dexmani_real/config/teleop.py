@@ -11,6 +11,7 @@ import numpy as np
 @dataclass(frozen=True)
 class TeleopConfig:
     control_hz: float = 16.0
+    # 每控制步中新目标的权重：0 保留参考，1 直接跟随新目标。
     ema_alpha_pos: float = 0.95
     ema_alpha_rot: float = 0.85
     vr_pos_scale: float = 0.7
@@ -28,7 +29,7 @@ class TeleopConfig:
 
 @dataclass(frozen=True)
 class CollectionConfig:
-    """时长限制仅用于录制。"""
+    """录制路径与时长；入口仅在启用录制时校验。"""
 
     enabled: bool = True
     episodes_dir: str = "episodes"
@@ -37,7 +38,7 @@ class CollectionConfig:
     def validate(self) -> None:
         if not isinstance(self.episodes_dir, str) or not self.episodes_dir.strip():
             raise ValueError("collection.episodes_dir must be non-empty")
-        if self.enabled and (not np.isfinite(self.max_duration_s) or self.max_duration_s <= 0):
+        if not np.isfinite(self.max_duration_s) or self.max_duration_s <= 0:
             raise ValueError("collection.max_duration_s must be finite and positive")
 
 
@@ -69,18 +70,19 @@ class HandRetargetingConfig:
     calibration_timeout_s: float = 5.0
     calibration_max_relative_mad: float = 0.10
     bone_length_tolerance: float = 0.35
-    position_scale_m: float = 0.10
     huber_delta_m: float = 0.02
-    shape_weight: float = 1.0
+    shape_weight: float = 0.25
     tip_weight: float = 2.0
-    direction_weight: float = 0.08
-    pinch_weight: float = 12.0
-    pinch_start_m: float = 0.05
-    pinch_full_m: float = 0.02
-    pinch_gap_m: float = 0.012
+    proximal_direction_weight: float = 2.0
+    direction_weight: float = 1.0
+    # 单位方向弦长；0.3 约为 17.3°。Huber / delta 限制大残差的牵引。
+    direction_huber_delta: float = 0.3
+    pinch_weight: float = 8.0
+    pinch_start_m: float = 0.03
+    pinch_full_m: float = 0.015
     # 近端正则系数按 1/dt 缩放，相当于离散阻尼；不是力或实测速度约束。
     damping_s: float = 0.002
-    smoothing_tau_s: float = 0.04
+    smoothing_tau_s: float = 0.02
     max_joint_speed_rad_s: float = 4.0
     max_evaluations: int = 50
     max_solve_time_s: float = 0.025
@@ -92,16 +94,15 @@ class HandRetargetingConfig:
             if type(value) is not int or value < 2:
                 raise ValueError(f"hand_retargeting.{name} must be an integer >= 2")
         nonnegative = (
-            "shape_weight", "tip_weight", "direction_weight", "pinch_weight",
+            "shape_weight", "direction_weight", "pinch_weight",
+            "proximal_direction_weight",
             "damping_s", "smoothing_tau_s",
         )
         for name, value in vars(self).items():
             if not np.isfinite(value) or (value < 0 if name in nonnegative else value <= 0):
                 raise ValueError(f"invalid hand_retargeting.{name}")
-        if self.tip_weight <= 0:
-            raise ValueError("hand_retargeting.tip_weight must be positive")
-        if not 0 < self.pinch_gap_m <= self.pinch_full_m < self.pinch_start_m:
-            raise ValueError("pinch distances must satisfy 0 < gap <= full < start")
+        if not 0 < self.pinch_full_m < self.pinch_start_m:
+            raise ValueError("pinch distances must satisfy 0 < full < start")
         if not 0 < self.calibration_max_relative_mad < self.bone_length_tolerance < 1:
             raise ValueError("calibration MAD and bone tolerance must satisfy 0 < MAD < tolerance < 1")
 

@@ -1,18 +1,13 @@
 """VR 锚点映射、手部重定向与提交后的位姿平滑。"""
 
-import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.geometry.pose import Pose, quat_wxyz_to_rotmat, rot6d_to_quat_wxyz
-
-
-def ema_smooth_pose(target: Pose, previous: Pose, alpha_pos: float, alpha_rot: float) -> Pose:
-    """平移做 EMA，旋转沿最短相对旋转插值。"""
-    position = alpha_pos * target.p + (1.0 - alpha_pos) * previous.p
-    rotation = Rotation.from_quat(previous.q[[1, 2, 3, 0]])
-    relative = rotation.inv() * Rotation.from_quat(target.q[[1, 2, 3, 0]])
-    smoothed = rotation * Rotation.from_rotvec(alpha_rot * relative.as_rotvec())
-    return Pose(position, smoothed.as_quat()[[3, 0, 1, 2]])
+from dexmani_real.geometry.pose import (
+    WXYZ_TO_XYZW,
+    XYZW_TO_WXYZ,
+    Pose,
+    rot6d_to_quat_wxyz,
+)
 
 
 class VRController:
@@ -20,13 +15,13 @@ class VRController:
         self.action_mapper = action_mapper
         self.hand_retargeter = hand_retargeter
         self.config = config
-        self.rotation = np.array(vr_to_robot_rot, dtype=np.float64, copy=True)
+        self.rotation = Rotation.from_matrix(vr_to_robot_rot)
         self.clear()
 
     def clear(self):
         self.anchor = None
         self.previous_arm_command = None
-        self.smoothed_eef_pose = None
+        self.previous_eef_target = None
         self.hand_observation_id = self.hand_target = None
         self.target_timestamp_ns = None
         self.rejection_reason = None
@@ -35,9 +30,10 @@ class VRController:
         self.clear()
         arm_qpos = row.arm["qpos"][0].copy()
         position, rot6d = self.action_mapper.constraints.target_fk.forward(arm_qpos)
-        pose = Pose(position.copy(), rot6d_to_quat_wxyz(rot6d))
-        wrist_rotation = quat_wxyz_to_rotmat(row.vr["wrist_quat_wxyz"])
-        rotation_right = wrist_rotation.T @ self.rotation.T @ quat_wxyz_to_rotmat(pose.q)
+        pose = Pose(position, rot6d_to_quat_wxyz(rot6d))
+        wrist_rotation = Rotation.from_quat(row.vr["wrist_quat_wxyz"][WXYZ_TO_XYZW])
+        # R_target = A W (A W0)^-1 E0，初始腕姿态映射到实测 EEF 姿态。
+        rotation_right = (self.rotation * wrist_rotation).inv() * Rotation.from_quat(pose.q[WXYZ_TO_XYZW])
         if self.hand_retargeter is not None:
             self.hand_retargeter.reset(
                 initial_qpos=row.hand["qpos"][0], timestamp_ns=row.observation_timestamp_ns,
@@ -46,29 +42,26 @@ class VRController:
         # 所有初始化成功后才发布新锚点；首帧 EMA 从同一个实测 FK 位姿开始。
         self.anchor = row.vr["wrist_pos"].copy(), pose.p, rotation_right
         self.previous_arm_command = arm_qpos
-        self.smoothed_eef_pose = pose
+        self.previous_eef_target = pose
 
-    def map_wrist(self, wrist_pos, wrist_quat_wxyz):
-        if self.anchor is None:
+    def _wrist_target(self, wrist_pos, wrist_quat_wxyz):
+        """锚点相对映射与最短旋转 EMA；平滑参考只在提交后更新。"""
+        previous = self.previous_eef_target
+        if self.anchor is None or previous is None:
             raise RuntimeError("VR wrist mapping requires a reset anchor")
         wrist_origin, eef_origin, rotation_right = self.anchor
-        position = eef_origin + self.config.vr_pos_scale * (
-            self.rotation @ (wrist_pos - wrist_origin)
-        )
-        rotation = self.rotation @ quat_wxyz_to_rotmat(wrist_quat_wxyz) @ rotation_right
-        quaternion = Rotation.from_matrix(rotation).as_quat()[[3, 0, 1, 2]]
-        return Pose(position, quaternion if quaternion[0] >= 0 else -quaternion)
+        position = eef_origin + self.config.vr_pos_scale * self.rotation.apply(wrist_pos - wrist_origin)
+        rotation = self.rotation * Rotation.from_quat(wrist_quat_wxyz[WXYZ_TO_XYZW]) * rotation_right
+        previous_rotation = Rotation.from_quat(previous.q[WXYZ_TO_XYZW])
+        relative = previous_rotation.inv() * rotation
+        smoothed = previous_rotation * Rotation.from_rotvec(self.config.ema_alpha_rot * relative.as_rotvec())
+        alpha_pos = self.config.ema_alpha_pos
+        return Pose(alpha_pos * position + (1.0 - alpha_pos) * previous.p, smoothed.as_quat()[XYZW_TO_WXYZ])
 
     def compute_target(self, row):
         self.target_timestamp_ns = row.observation_timestamp_ns
         self.rejection_reason = None
-        mapped = self.map_wrist(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
-        target = ema_smooth_pose(
-            mapped,
-            self.smoothed_eef_pose,
-            self.config.ema_alpha_pos,
-            self.config.ema_alpha_rot,
-        )
+        target = self._wrist_target(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
         hand = None
         if self.hand_retargeter is not None:
             observation_id = row.vr["ring_sequence"]
@@ -91,4 +84,4 @@ class VRController:
         if self.hand_retargeter is not None:
             self.hand_retargeter.commit(result.hand_qpos, timestamp_ns=self.target_timestamp_ns)
         self.previous_arm_command = result.arm_qpos.copy()
-        self.smoothed_eef_pose = result.eef_pose.copy()
+        self.previous_eef_target = result.eef_pose.copy()

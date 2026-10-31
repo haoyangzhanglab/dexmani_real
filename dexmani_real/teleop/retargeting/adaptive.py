@@ -1,6 +1,7 @@
 """有界、可诊断的 XHand 在线重定向；只有提交成功才推进命令状态。"""
 
 import time
+from math import expm1
 
 import nlopt
 import numpy as np
@@ -9,7 +10,6 @@ from dexmani_real.geometry.kinematics import HandFK
 from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
     XHAND_FINGERTIP_LINK_NAMES,
-    XHAND_RIGHT_URDF_PATH,
 )
 from dexmani_real.teleop.retargeting.landmarks import HandCalibration, prepare_landmarks
 from dexmani_real.teleop.retargeting.objective import HandObjective
@@ -30,7 +30,7 @@ class AdaptiveHandRetargeter:
         if not np.isfinite(control_hz) or control_hz <= 0:
             raise ValueError("retargeting control_hz must be finite and positive")
         self.config, self.nominal_dt_s = config, 1.0 / control_hz
-        self.fk = HandFK(urdf_path=XHAND_RIGHT_URDF_PATH)
+        self.fk = HandFK()
         self.limits = np.column_stack((hand_config.qpos_min_rad, hand_config.qpos_max_rad))
         model_limits = np.column_stack((
             self.fk.model.lowerPositionLimit, self.fk.model.upperPositionLimit,
@@ -61,20 +61,13 @@ class AdaptiveHandRetargeter:
         self.last_diagnostics = {}
 
     def calibrate(self, frames):
-        calibration = HandCalibration.from_frames(
-            frames, min_samples=self.config.calibration_samples,
-            max_relative_mad=self.config.calibration_max_relative_mad,
-        )
-        # MAD 不会拒绝少量异常点；中位数仍须与输入边界匹配。
-        for frame in frames:
-            calibration.validate_frame(prepare_landmarks(frame), self.config.bone_length_tolerance)
-        self.calibration = calibration
+        self.calibration = HandCalibration.from_frames(frames, self.config)
 
     def calibration_metadata(self):
         if self.calibration is None:
             raise RuntimeError("hand retargeting requires morphology calibration")
         return dict(
-            method="adaptive_xhand_v1", sample_count=self.calibration.sample_count,
+            sample_count=self.calibration.sample_count,
             human_bone_lengths_m=self.calibration.bone_lengths.tolist(),
             human_palm_width_m=self.calibration.palm_width,
         )
@@ -95,21 +88,21 @@ class AdaptiveHandRetargeter:
             raise RuntimeError("hand retargeting requires calibration and a measured reset pose")
         if timestamp_ns < self.command_timestamp_ns:
             raise ValueError("hand observation time moved backwards")
+        # 准备阶段 reset 后用同一观测预计算，零间隔使用名义控制周期。
         dt_s = (timestamp_ns - self.command_timestamp_ns) * 1e-9 or self.nominal_dt_s
         self.rejection_reason = None
         self.last_diagnostics = {}
         try:
             points = prepare_landmarks(landmarks)
-            self.calibration.validate_frame(points, self.config.bone_length_tolerance)
+            targets = self.calibration.targets(points, self.robot_points, self.thumb_cmc, self.config)
         except ValueError as exc:
             self.rejection_reason = str(exc)
             return None
-        targets = self.calibration.targets(points, self.robot_points, self.thumb_cmc, self.config)
+        tau = self.config.smoothing_tau_s
+        alpha = 1.0 if tau == 0 else -expm1(-dt_s / tau)
         objective = HandObjective(
             self.fk, self.frame_ids, targets, self.previous_command, dt_s, self.config,
         )
-        tau = self.config.smoothing_tau_s
-        alpha = 1.0 if tau == 0 else -np.expm1(-dt_s / tau)
         # 搜索的是滤波前候选；补偿 alpha 后，最终命令仍可达到 v_max。
         # 若候选先限为 v_max*dt 再滤波，高频时实际速率上限会降为 alpha*v_max。
         step = self.config.max_joint_speed_rad_s * dt_s / alpha
@@ -136,7 +129,7 @@ class AdaptiveHandRetargeter:
             solve_ms=(time.perf_counter() - started) * 1000,
             budget_limited=status in (nlopt.MAXEVAL_REACHED, nlopt.MAXTIME_REACHED),
             initial_loss=initial_loss, dt_s=dt_s,
-            pinch_activation=targets[2].tolist(),
+            thumb_base_observable=targets.thumb_base_observable,
         )
         if (
             status <= 0 or solution.shape != HAND_JOINT_SHAPE
@@ -152,7 +145,10 @@ class AdaptiveHandRetargeter:
             self.rejection_reason = "hand solver did not improve the committed-command seed"
             return None
         # 同一个已提交目标同时作为 warm start、阻尼中心和唯一滤波状态。
-        return self.previous_command + alpha * (solution - self.previous_command)
+        command = self.previous_command + alpha * (solution - self.previous_command)
+        # 凸组合理论上不越限，但浮点减加可在限位上产生舍入量级的越界。
+        # 消除舍入误差后仍由 commit 严格校验，不放宽关节或最终速率限值。
+        return np.clip(command, self.limits[:, 0], self.limits[:, 1])
 
     def commit(self, qpos, *, timestamp_ns):
         qpos = np.asarray(qpos, dtype=np.float64)

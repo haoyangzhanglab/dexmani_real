@@ -12,7 +12,7 @@
 python -m pip install -e ".[interactive,control,geometry,visualization]"
 ```
 
-设备 SDK、Pinocchio、MPlib 和手部重定向所需依赖需按实验环境另行安装；策略部署还需安装 `dexmani_policy`。机器人模型与模板从源码目录的 `assets/` 加载，运行时须保留源码 checkout。
+设备 SDK、Pinocchio、MPlib 和 NLopt 需按实验环境另行安装；策略部署还需安装 `dexmani_policy`。机器人模型与模板从源码目录的 `assets/` 加载，运行时须保留源码 checkout。
 
 默认配置集中在 [config/](dexmani_real/config/)，[config/real.py](dexmani_real/config/real.py) 提供 `RealConfig` 和 `load_config`，负责组合配置及合并覆盖；各子配置可独立导入。支持的入口可通过 `--config local.yaml` 覆盖，优先级为 **CLI > YAML > 默认值**；未知配置键会报错。运行前核对机械臂 IP、手部串口、工作空间和当前设备的标定参数。
 
@@ -69,20 +69,19 @@ VR 遥操作和策略部署每次启动会话时自动将手部回到 HOME，确
 
 每段在 PREPARING 阶段先做一次不下发的目标预计算；机械臂准备完成后再用新观测重建锚点及滤波初值，开始控制与录制计时。首个目标成功提交并入录制队列后才播放开始/继续提示。控制期限或目标准入导致的停止使用结束提示，日志保留具体原因并提示按 B 重新开始；急停和运行故障仍使用异常提示。
 
-VR 手部重定向使用面向 XHand 的联合优化：固定骨长标定、手形/指尖/末节方向、连续对指距离和时间阻尼。启动时采集 25 个新鲜且来源时间递增的右手样本，取骨长中位数；不要求伸直，标定在本次会话内固定，暂停继续不重复标定。请保持右手清晰可见；标定 5 秒内未完成或骨长不稳定时明确退出，S/Q/Esc 可取消。
+腕部按每段初始观测做相对映射：位置增量通过 VR 朝向标定转入机器人基座系，再按 `vr_pos_scale` 缩放；姿态从初始实测 EEF 朝向跟随腕部相对旋转。映射与旋转 EMA 共用 `Rotation` 表示，沿最短旋转插值；相对旋转恰为 180° 时存在两条等长最短弧，不保证穿过该点的插值方向连续。平滑参考使用最近成功提交的工作空间投影目标，暂停恢复后重新锚定。
 
-配置改为 `hand_retargeting`，旧 `dexpilot_retargeting` 键会明确报错。求解范围采用 `hand.qpos_min_rad/qpos_max_rad`，另限制相邻提交目标的变化率，默认 4 rad/s；这不是实测电机速度或接触力保证。单层滤波使用时间常数 `smoothing_tau_s=0.04`，按实际观测间隔计算权重；候选只有在提交成功后才更新下一帧的初值、阻尼和滤波状态。无效输入和求解失败会保留具体原因并终止当前段。腕部位移倍率 0.7、位置/旋转 EMA 权重 0.95/0.85、控制与录制 16 Hz 保持原配置。
+腕部 `ema_alpha_pos/ema_alpha_rot` 是每控制步中新目标的固定权重；在滤波计算中，0 保留参考，1 直接采用新目标。同一 VR 缓存帧可跨多个控制步复用，腕部 EMA 在每次成功提交后继续趋近该观测；手部重复读取该缓存帧则复用候选，不重复求解或滤波。
 
-重定向仅需 NumPy、Pinocchio 和 NLopt，不再通过 `dex_retargeting`/Torch 求导。算法推导、Sharpa/Wuji 来源、配置迁移、离线评估和验证边界见 [手部重定向说明](docs/hand_retargeting.md)。Raw 的 `meta.hand_retargeting_calibration_json` 保存实际骨长标定，供重放恢复。
+VR 手部重定向使用固定骨长标定，联合拟合 XHand 可对应的近端/末段方向、骨链/指尖位置、有意对指距离和时间阻尼。启动时采集 25 个新鲜且来源时间递增的右手样本，取骨长中位数；不要求伸直，标定在本次会话内固定，暂停继续不重复标定。请保持右手清晰可见；标定 5 秒内未完成或骨长不稳定时明确退出，S/Q/Esc 可取消。
 
-```bash
-# 不连接设备：确定性合成序列及目标函数消融
-python scripts/tools/evaluate_hand_retargeting.py --synthetic --ablations
-# 使用现有 Raw 的 VR 字段；新录制优先恢复保存的标定
-python scripts/tools/evaluate_hand_retargeting.py --episode episodes/TASK/EPISODE --config local.yaml
-```
+手部参数位于 `hand_retargeting`。求解范围采用 `hand.qpos_min_rad/qpos_max_rad`，另限制相邻提交目标的变化率，默认 4 rad/s；这不是实测电机速度或接触力保证。单层滤波使用时间常数 `smoothing_tau_s=0.02`，按本次控制观测与上次成功提交观测的时间差计算权重；候选只有在提交成功后才更新下一帧的初值、阻尼和滤波状态。无效输入和求解失败会保留具体原因并终止当前段。腕部位移倍率为 0.7、位置/旋转 EMA 权重为 0.95/0.85、控制与录制频率为 16 Hz。
 
-遥操作 Raw 的 `meta` 属性保存 `runtime_config_json`、实际使用的 `vr_to_robot_rotation` 和 `teleop_run_id`；`meta/termination_details` 保存预计算耗时、`teleop_anchor` 初始观测，以及录制期间处理的按键和失败时的 `control_timing`。所有新增事件时间戳均为主机单调时钟；`submit_start_ns/submit_end_ns` 表示父进程提交调用，不代表机械臂到达目标。终端按键日志记录处理时的阶段与运行编号。
+手部 FK 和优化使用 NumPy、Pinocchio 和 NLopt，实现与机构约束见 [手部重定向说明](docs/hand_retargeting.md)。Raw 的 `meta.hand_retargeting_calibration_json` 保存标定样本数、15 段骨长和掌宽。
+
+遥操作 Raw 的 `meta` 属性保存 `runtime_config_json`、实际使用的 `vr_to_robot_rotation` 和 `teleop_run_id`。启用录制时，会话配置在构造控制循环、连接设备前序列化，各分段复用同一快照；此步骤检查完整配置的 JSON 可序列化性，各参数的业务约束仍由其使用入口校验。
+
+`meta/termination_details` 保存预计算耗时、`teleop_anchor` 初始观测，以及录制期间处理的按键和失败时的 `control_timing`。事件时间戳均为主机单调时钟；`submit_start_ns/submit_end_ns` 表示父进程提交调用，不代表机械臂到达目标。终端按键日志记录处理时的阶段与运行编号。
 
 键盘和相机标定在显示操作提示前完成 jog 准备。普通按键变化只更新目标；松键时从当前伺服参考减速到零并保持，不停机重启，也不继续追赶积累的远处目标。IK 拒绝后减速保持，松开全部 jog 键才能恢复。HOME、标定采样、退出和急停仍执行真正停止，恢复连续控制时重新准备。按键在控制循环中采样，完全落在两次采样之间的极短按键不会补发运动。
 
@@ -97,6 +96,8 @@ SDK 连接与伺服由机械臂子进程持有。关节反馈默认 25 Hz，每�
 HOME 保留直达、近端优先、远端优先及等价关节分支，按关节行程与逐段停稳开销选择通过校验的完整路径，终点始终为配置中的绝对 HOME 关节角。规划先检查公共端点和路径中点以快速拒绝无效路径，仍按不大于 1° 的关节步长完整检查碰撞、工作空间和桌面间隙；几何查询仅在单次规划内复用。桌面距离复用同次碰撞查询的距离下界，仅对可能缩小最小距离的几何对执行精确求距。停稳时长从首个合格样本查询完成算到后续合格样本查询开始，排除首尾查询的等待时间；超出本阶段期限的查询不能确认到达。
 
 HOME 的 `HomePlanner` 使用 `environment.table`、标定平面和 `soft_clearance_m` 检查桌面；关闭该桌面模型时，仍用 `table_z_surface_m` 与 `hand_safety_margin_m` 检查手部 frame 高度代理。在线 `MotionConstraints` 的环境碰撞模型只加入 `environment.static_boxes`，不会自动继承 HOME 的桌面几何、软间隙或高度代理规则。`static_boxes` 同时用于 HOME 与在线目标检查；HOME 的桌面检查不能作为在线抓取具有同等桌面保护的依据。
+
+工作空间和静态盒体位置均使用机器人基座系；盒体尺寸为完整边长，旋转四元数使用 WXYZ 顺序。`allowed_contact_links` 必须填写 URDF 中的机器人 link 名，未知名称或关节名会在桌面模型构造时明确报错。桌面配置关闭时仍须保持字段合法，因为其标定路径也供点云使用，完整配置还会写入录制元数据。
 
 `environment.table.plane_path` 也供点云去桌面和诊断工具使用；`pointcloud.remove_table` 只裁剪观测点云，不执行机器人碰撞检查。
 
@@ -141,7 +142,7 @@ RealSense 和点云诊断使用 OpenCV RGB-D 面板及 Open3D 点云窗口，需
 
 ## 模型与手点云
 
-整机 FK、IK 与碰撞检查共用 [xarm7_xhand_right.urdf](assets/robots/xhand/xarm7_xhand_right.urdf)，手部安装位姿由该模型定义。手部重定向使用独立的 [xhand_right.urdf](assets/robots/xhand/xhand_right.urdf)。
+整机 FK、IK 与碰撞检查共用 [xarm7_xhand_right.urdf](assets/robots/xhand/xarm7_xhand_right.urdf)，手部安装位姿由该模型定义。机械臂与手部 FK、IK 从该模型提取各自的运动学子树，手部重定向与数据导出、部署共用同一手部模型来源。
 
 手点云模板位于 `assets/pointcloud_template/hand/hand_<点数>.npz`，默认使用 1024 点。离线导出与部署共用模板及 FK；训练和部署应使用同一份模板。更改点数或手部 visual 网格、颜色、位姿后，重新生成对应模板：
 
@@ -151,7 +152,7 @@ python scripts/generate_hand_template.py --num-points 1024 --overwrite
 
 Canonical 保留实际 `source_id`、影响数值结果的处理配方及完整 URDF。部署恢复训练保存的完整点云配置，缺失或未知字段直接报错。实验复现由人工记录 `source_id → 导出使用的 Real commit SHA、训练使用的 Policy commit SHA、手模板路径`，示例见 [Policy 的实验产物说明](https://github.com/haoyangzhanglab/dexmani_policy#实验产物)。Git 已跟踪的模板可按对应提交和路径恢复；不同处理阶段使用不同版本时分别记录。未提交的代码或自定义模板应随实验手动归档，或先提交再记录；已有实验缺失的来源信息须如实保留为未知。
 
-修改加工算法或模板后须重新导出数据，不能只复用同名配置或模板文件。没有实际 sampler/点云的耗时和内存收益证据时，保留当前 Zarr chunks、邻居枚举、冻结目标几何检查及两套 FK。
+修改加工算法或模板后须重新导出数据，不能只复用同名配置或模板文件。
 
 ## 数据与代码导航
 
