@@ -52,21 +52,37 @@ def save_rgbd_snapshot(
     output_root = output_root.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     target = output_root / timestamp.strftime("rgbd_%Y%m%d_%H%M%S_%f.npz")
-    with target.open("xb") as stream:
-        np.savez_compressed(
-            stream,
-            rgb=frame.rgb,
-            depth_aligned_to_color_raw=frame.depth,
-            K=intrinsics.matrix(),
-            distortion_model=intrinsics.distortion_model,
-            distortion_coeffs=np.asarray(intrinsics.distortion_coeffs, dtype=np.float64),
-            depth_scale_m_per_unit=float(depth_scale_m),
-            camera_serial=serial,
-            source_timestamp_ns=int(frame.timestamp_ns),
-            source_clock="host_monotonic_oldest_rgbd_receive",
-            depth_frame_number=int(frame.depth_frame_number),
-            color_frame_number=int(frame.color_frame_number),
-        )
+    stream = target.open("xb")
+    try:
+        try:
+            np.savez_compressed(
+                stream,
+                rgb=frame.rgb,
+                depth_aligned_to_color_raw=frame.depth,
+                K=intrinsics.matrix(),
+                distortion_model=intrinsics.distortion_model,
+                distortion_coeffs=np.asarray(intrinsics.distortion_coeffs, dtype=np.float64),
+                depth_scale_m_per_unit=float(depth_scale_m),
+                camera_serial=serial,
+                source_timestamp_ns=int(frame.timestamp_ns),
+                source_clock="host_monotonic_oldest_rgbd_receive",
+                depth_frame_number=int(frame.depth_frame_number),
+                color_frame_number=int(frame.color_frame_number),
+            )
+        except BaseException:
+            try:
+                stream.close()
+            except BaseException:
+                logger.exception("RGB-D snapshot close also failed: %s", target)
+            raise
+        else:
+            stream.close()
+    except BaseException:
+        try:
+            target.unlink()
+        except BaseException:
+            logger.exception("failed to remove incomplete RGB-D snapshot: %s", target)
+        raise
     return target
 
 

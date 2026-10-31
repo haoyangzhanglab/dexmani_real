@@ -65,7 +65,7 @@ class SceneTracker:
             self.directions = camera_rays(depth_m.shape, K, self.pixel_stride)
         # Independent evidence survives pose failure or the absence of an asset.
         measured = extract_scene_clouds(rgb, depth_m, self.directions, masks, pixel_stride=self.pixel_stride)
-        poses, depths = {}, {}
+        poses, model_z_by_object = {}, {}
         prepared_frame = None
         for name, tracker in self.trackers.items():
             if name in self.lost_objects:
@@ -93,10 +93,10 @@ class SceneTracker:
                 if first
                 else tracker.track(rgb, depth_m, K, mask, prepared_frame=prepared_frame)
             )
-            depths[name] = self.renderers[name].render(
-                depth_m.shape, K, poses[name], directions=self.directions,
+            model_z_by_object[name] = self.renderers[name].render(
+                cloud.observed_pixel_indices, K, poses[name], directions=self.directions,
             )
-        add_model_depth_support(measured, depths, depth_tolerance_m=self.depth_tolerance_m)
+        add_model_depth_support(measured, model_z_by_object, depth_tolerance_m=self.depth_tolerance_m)
         objects = {}
         for name, cloud in measured.items():
             pose = poses.get(name)

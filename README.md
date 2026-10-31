@@ -25,7 +25,7 @@ CONFIG = replace(base,
 )
 ```
 
-本仓已退出实验 YAML、递归覆盖和任意嵌套 CLI override，旧实验文件需一次迁移，用户文件不会被自动删除。任务、路径、段数、时长、录制选择及 `--weights/--inference-steps/--seed/--device` 留在 CLI。无手运行只需在 Python 配置中设 `hand.enabled=False`；VR 遥操作还须关闭录制（配置或 `--no-record`），实物手须移除或固定在配置的 HOME 姿态，供碰撞规划使用。Policy 配方从 checkpoint 恢复，其训练配置和运行快照可继续用 YAML；本仓迁移不改变外部模型协议。
+任务、路径、段数、时长、录制选择及 `--weights/--inference-steps/--seed/--device` 通过 CLI 指定。无手运行只需在 Python 配置中设 `hand.enabled=False`；VR 遥操作还须关闭录制（配置或 `--no-record`），实物手须移除或固定在配置的 HOME 姿态，供碰撞规划使用。Policy 配方从 checkpoint 恢复，其训练配置和运行快照可使用 YAML。
 
 ```bash
 python scripts/collect_teleop.py --print-config
@@ -104,7 +104,9 @@ collect 的相机持续连接，Enter 为一组只读机械臂采样，完成立
 
 solve 的外参输出与派生报告不得覆盖 `capture.json` 或原始采样 NPZ；其他新结果仍可保存在采样目录内。
 
-相机查看统一使用 view_realsense.py：默认 RGB-D，`--cloud raw/processed` 在启动时选择固定点云类型；Q/Esc 或关闭任一窗口退出。预览不修改曝光优先级，不提供运行中模式切换和逐帧诊断面板。`--save-dir PATH` 保存单帧原始 RGB-D 到一个 `rgbd_*.npz`，打印文件路径后退出，拒绝覆盖；`--benchmark-frames N` 测量 N 个新深度帧；`--calibrate-table` 采集五帧拟合桌面并在终端明确确认后更新共享平面。这三项互斥，执行后退出。窗口需要桌面/OpenGL，代码清理测试不自动连接真实设备。
+相机查看统一使用 view_realsense.py：默认 RGB-D，`--cloud raw/processed` 在启动时选择固定点云类型；Q/Esc 或关闭任一窗口退出。预览不修改曝光优先级，不提供运行中模式切换和逐帧诊断面板。`--save-dir PATH` 保存单帧原始 RGB-D 到一个 `rgbd_*.npz`，打印文件路径后退出；`--benchmark-frames N` 测量 N 个新深度帧；`--calibrate-table` 采集五帧拟合桌面并在终端明确确认后更新共享平面。这三项互斥，执行后退出。窗口需要桌面/OpenGL，代码清理测试不自动连接真实设备。
+
+标定样本与原始快照均以独占方式创建 NPZ，拒绝覆盖。写入或关闭失败时清理本次新建文件；连续失败时保留首个异常和原 traceback，后续关闭或删除错误另记日志。
 
 快照可用 `np.load(path, allow_pickle=False)` 读取：`rgb` 为 RGB uint8，`depth_aligned_to_color_raw` 为对齐到 color 网格的 uint16 原始计数；`K`、`distortion_model`、`distortion_coeffs` 描述该网格，`depth_scale_m_per_unit` 是每计数的米数。另保存实际 `camera_serial`、`source_timestamp_ns`、`source_clock` 和 depth/color frame number。来源时钟为 `host_monotonic_oldest_rgbd_receive`，时间取两通道首次主机接收时刻中的较早者，不是文件创建时间或曝光时间。深度换算为 `depth_raw.astype(np.float32) * np.float32(depth_scale_m_per_unit)`。原始快照无需外参、桌面文件或点云处理配置；需要基座点云时，离线显式加载对应 serial 的相机标定后重建。
 

@@ -59,8 +59,25 @@ def save_sample(path, sample_id, sample, eef_pose):
     for stage in ("before", "after"):
         for name, value in sample[f"arm_{stage}"].items():
             arrays[f"arm_{stage}_{name}"] = value
-    with Path(path).open("xb") as stream:
-        np.savez_compressed(stream, **arrays)
+    path = Path(path)
+    stream = path.open("xb")
+    try:
+        try:
+            np.savez_compressed(stream, **arrays)
+        except BaseException:
+            try:
+                stream.close()
+            except BaseException:
+                logger.exception("calibration sample close also failed: %s", path)
+            raise
+        else:
+            stream.close()
+    except BaseException:
+        try:
+            path.unlink()
+        except BaseException:
+            logger.exception("failed to remove incomplete calibration sample: %s", path)
+        raise
 
 
 def collect_samples(runtime, output_dir):

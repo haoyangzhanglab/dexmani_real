@@ -1,14 +1,17 @@
 """Open3D 点云窗口；点和静态几何均位于 xArm 基座系。"""
 
+import logging
 from collections.abc import Sequence
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class PointCloudViewer:
     def __init__(
         self, *, workspace: Sequence[float], base_from_color: np.ndarray,
-        keys: Sequence[str] = (), title: str = "Point Cloud",
+        title: str = "Point Cloud",
     ):
         import open3d as o3d
 
@@ -34,11 +37,14 @@ class PointCloudViewer:
             options = self.vis.get_render_option()
             options.point_size = 3.0
             options.background_color = np.ones(3)
-            for key in {*keys, "q", "esc"}:
+            for key in ("q", "esc"):
                 code = 256 if key == "esc" else ord(key.upper())
                 self.vis.register_key_action_callback(code, self.key_callback(key))
         except BaseException:
-            self.close()
+            try:
+                self.close()
+            except BaseException:
+                logger.exception("point-cloud window cleanup also failed")
             raise
 
     def key_callback(self, key: str):

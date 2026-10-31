@@ -147,7 +147,7 @@ python -m cordvip_geometry prepare \
 
 几何使用 color-camera frame 和米。深度是 camera Z，0 表示缺测；ray direction 保持 Z=1，因此命中参数也是 Z，不归一化成欧氏距离。去畸变只接受已支持的 forward Brown-Conrady 模型，depth/mask 使用最近邻。源 ID、row、clock 和来源时间保持原值，主机接收时间不等于曝光时间。
 
-语义实测点只来自同帧互斥 mask 与实测深度，不修补孔洞、不分配重叠像素，也不依赖 mesh。像素按全局 stride 网格的 row-major `(v,u)` 排列。模型支持与残差复用同一点序，残差为 measured Z − rendered Z，无模型表面处为 NaN。默认 stride 为 2、深度容差 0.015 m、最少匹配 30 像素及支持比例 0.15；这些支持条件参与 pose-valid 和 `POSE_LOST`，不能写成仅诊断。支持比例不是概率置信度。默认不计算 semantic/overlap/coverage/median 等纯报告指标，需要时从 NPZ 离线计算。
+语义实测点只来自同帧互斥 mask 与实测深度，不修补孔洞、不分配重叠像素，也不依赖 mesh。像素按全局 stride 网格的 row-major `(v,u)` 排列。renderer 保留 ROI raycast，直接按实测点序收集模型 Z 向量，不构造整幅模型深度图。模型支持与残差复用同一点序，残差为 measured Z − rendered Z，无模型表面处为 NaN；支持 mask 仍保留完整图像网格。默认 stride 为 2、深度容差 0.015 m、最少匹配 30 像素及支持比例 0.15；这些支持条件参与 pose-valid 和 `POSE_LOST`，不能写成仅诊断。支持比例不是概率置信度。默认不计算 semantic/overlap/coverage/median 等纯报告指标，需要时从 NPZ 离线计算。
 
 模型点来自固定资产及有效 pose，不是实测接触。FoundationPose++ 的 bbox 中心只引导 centered mesh 的 2D 位置，保留旧 Z/rotation，不用深度孔洞构造 3D 质心；输出为 `T_camera_asset = T_camera_centered @ T_centered_asset`。单个 pose 正常丢失不删除别的物体或独立实测点。
 

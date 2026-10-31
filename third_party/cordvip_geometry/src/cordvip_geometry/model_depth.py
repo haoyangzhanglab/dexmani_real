@@ -21,7 +21,7 @@ def camera_rays(shape, intrinsics, pixel_stride):
 
 
 class ModelDepthRenderer:
-    """Cache a metre-scale mesh; render camera Z on the global stride grid, with zero for missing hits."""
+    """Cache a metre-scale mesh; return camera Z in observed pixel order, with zero for missing hits."""
 
     def __init__(self, mesh, *, pixel_stride=2):
         if isinstance(pixel_stride, bool) or not isinstance(pixel_stride, (int, np.integer)) or pixel_stride <= 0:
@@ -98,8 +98,8 @@ class ModelDepthRenderer:
         upper = np.clip(upper, (0, 0), (width, height)).astype(int)
         return slice(lower[1], upper[1]), slice(lower[0], upper[0])
 
-    def render(self, image_shape, intrinsics, T_camera_object, *, directions):
-        """Render the first positive model intersection for this frame's camera/pose."""
+    def render(self, observed_pixel_indices, intrinsics, T_camera_object, *, directions):
+        """Gather first positive model intersections at this frame's observed pixels."""
         pose = T_camera_object
         roi = self.ray_roi(directions, intrinsics, pose)
         roi_directions = directions[roi]
@@ -113,12 +113,18 @@ class ModelDepthRenderer:
         # Open3D returns the parameter in origin + t_hit * direction. Because
         # camera rays have Z=1 and the transform is rigid, t_hit is camera Z in
         # meters, not Euclidean range. Do not normalize these ray directions.
-        hit = np.full(directions.shape[:2], np.inf, dtype=np.float32)
+        observed_model_z = np.zeros(len(observed_pixel_indices), dtype=np.float32)
         if rays.size:
-            hit[roi] = self._scene.cast_rays(self._tensor(rays), nthreads=RAYCAST_THREADS)[
+            roi_hit = self._scene.cast_rays(self._tensor(rays), nthreads=RAYCAST_THREADS)[
                 "t_hit"
             ].numpy()
-        projected = np.isfinite(hit) & (hit > 0)
-        model_depth = np.zeros(image_shape, dtype=np.float32)
-        model_depth[:: self.pixel_stride, :: self.pixel_stride] = np.where(projected, hit, 0)
-        return model_depth
+            sampled_pixels = observed_pixel_indices // self.pixel_stride
+            rows = sampled_pixels[:, 0] - roi[0].start
+            cols = sampled_pixels[:, 1] - roi[1].start
+            inside_roi = (
+                (rows >= 0) & (rows < roi_hit.shape[0])
+                & (cols >= 0) & (cols < roi_hit.shape[1])
+            )
+            hits = roi_hit[rows[inside_roi], cols[inside_roi]]
+            observed_model_z[inside_roi] = np.where(np.isfinite(hits) & (hits > 0), hits, 0)
+        return observed_model_z

@@ -6,15 +6,17 @@ import json
 from contextlib import ExitStack
 from fractions import Fraction
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import av
-import h5py
 import numpy as np
 
 from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.geometry.pose import validate_rigid_transform
 from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
 from dexmani_real.utils.timing import sampling_clock_ns
+
+if TYPE_CHECKING:
+    import h5py
 
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
 TACTILE_PROCESSING = "sdk_native_bounded_previous_valid_channel_frame_hold"
@@ -169,6 +171,8 @@ class _VideoWriter:
         self.frame_count = 0
 
     def open(self):
+        import av
+
         self.container = av.open(str(self.path), "w", format="mp4")
         self.stream = self.container.add_stream("libx264", rate=self.rate)
         self.stream.width = self.width
@@ -181,6 +185,8 @@ class _VideoWriter:
         self.container.start_encoding()
 
     def write_frame(self, frame):
+        import av
+
         av_frame = av.VideoFrame.from_ndarray(frame, format="rgb24").reformat(format="yuv444p")
         av_frame.pts = self.frame_count
         av_frame.time_base = 1 / self.rate
@@ -212,6 +218,8 @@ class RawWriter:
         self.previous_stamp = None
 
     def open(self, metadata):
+        import h5py
+
         data = self.resources.enter_context(h5py.File(self.path / "data.h5", "w"))
         self.meta = data.create_group("meta")
         self.meta.attrs.update(metadata)
@@ -352,6 +360,8 @@ class RawWriter:
 
 class RawReader:
     def __init__(self, episode_path: str | Path):
+        import h5py
+
         requested_path = Path(episode_path).expanduser()
         self.path = requested_path.resolve()
         if requested_path.name.startswith(".tmp_") or self.path.name.startswith(".tmp_"):
@@ -387,6 +397,8 @@ class RawReader:
 
     @property
     def fields(self):
+        import h5py
+
         names = {key for key, value in self.data_file.items() if isinstance(value, h5py.Dataset)}
         if self.rgb_path.is_file():
             names.add("rgb")
@@ -484,6 +496,8 @@ class RawReader:
         return 1.0 / self.control_hz
 
     def iter_rgb_frames(self):
+        import av
+
         self.require_fields("rgb")
         if self.video_container is None:
             self.video_container = self.resources.enter_context(av.open(str(self.rgb_path), "r"))

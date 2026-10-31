@@ -54,19 +54,18 @@ def extract_scene_clouds(rgb, depth_m, directions, masks, *, pixel_stride=2) -> 
 
 
 def add_model_depth_support(
-    measured: dict[str, SceneObjectCloud], model_depths: dict[str, np.ndarray], *, depth_tolerance_m=0.015,
+    measured: dict[str, SceneObjectCloud], model_z_by_object: dict[str, np.ndarray], *, depth_tolerance_m=0.015,
 ) -> None:
-    """原位附加同网格模型深度支持；保持实测点序，无模型表面处残差为 NaN。"""
-    # ModelDepthRenderer owns float32 nonnegative depth on the fixed scene grid.
-    for name, model in model_depths.items():
+    """原位附加同序模型 Z 的深度支持；无模型表面处残差为 NaN。"""
+    # ModelDepthRenderer owns float32 nonnegative camera Z in observed point order.
+    for name, model_z in model_z_by_object.items():
         cloud = measured[name]
         pixels = cloud.observed_pixel_indices
         points = cloud.observed_points_camera
         count = len(points)
-        model_depth = model[pixels[:, 0], pixels[:, 1]]
-        comparable = model_depth > 0
+        comparable = model_z > 0
         residual = np.full(count, np.nan, dtype=np.float32)
-        residual[comparable] = points[comparable, 2] - model_depth[comparable]
+        residual[comparable] = points[comparable, 2] - model_z[comparable]
         supported = comparable & (np.abs(residual) <= depth_tolerance_m)
         support_pixels = pixels[supported]
         cloud.model_supported_mask = np.zeros(cloud.observed_mask.shape, dtype=bool)
