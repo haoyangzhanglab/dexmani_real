@@ -206,7 +206,7 @@ class EpisodeRecorder:
         try:
             if self.closed_counts != (self.submitted_frames, self.submitted_frames):
                 raise RecordingError("recording accepted/written/camera row count mismatch")
-            if save:
+            if save and self.submitted_frames > 0:
                 destination = self.staging_path.with_name(self.staging_path.name.removeprefix(".tmp_"))
                 publish(self.staging_path, destination)
                 self.published_path, self.staging_path = destination, None
@@ -214,6 +214,8 @@ class EpisodeRecorder:
             else:
                 shutil.rmtree(self.staging_path)
                 self.staging_path = None
+                if self.submitted_frames == 0:
+                    logger.info("未录到数据，本段未发布。")
         except BaseException as exc:
             self.store_error(exc)
             if not isinstance(exc, Exception):

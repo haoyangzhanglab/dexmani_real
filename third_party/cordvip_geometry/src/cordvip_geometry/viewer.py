@@ -9,16 +9,13 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def scene_display(frame, object_ids, colors, *, show_model=False, include_clouds=False):
+def scene_display(frame, object_ids, colors) -> np.ndarray:
     import cv2
 
     from .geometry import project_points
 
     rgb = frame['rgb']
-    if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3 or min(rgb.shape[:2]) == 0:
-        raise ValueError('scene result RGB must be nonempty uint8 [H,W,3]')
     overlay = rgb.copy()
-    points, point_colors = [], []
     for index, name in enumerate(object_ids):
         prefix = name + '__'
         color = tuple(int(value) for value in colors[name])
@@ -40,17 +37,23 @@ def scene_display(frame, object_ids, colors, *, show_model=False, include_clouds
         label = f'{name}: {state}' + (f' | {error}' if error else '')
         cv2.putText(overlay, label, (10, 24 + index * 22),
                     cv2.FONT_HERSHEY_SIMPLEX, .5, color, 1)
-        if include_clouds:
-            cloud = frame[prefix + ('model_points_camera' if show_model else 'observed_points_camera')]
-            points.append(cloud)
-            point_colors.append(np.tile(np.asarray(color) / 255., (len(cloud), 1)))
-    if include_clouds and 'hand_points_camera' in frame:
+    return np.ascontiguousarray(overlay[..., ::-1])
+
+
+def scene_clouds(frame, object_ids, colors, *, show_model=False) -> tuple[np.ndarray, np.ndarray]:
+    """只拼接当前选择的 camera 点云；切换表示时复用已生成的 RGB 叠加。"""
+    points, point_colors = [], []
+    for name in object_ids:
+        cloud = frame[name + ('__model_points_camera' if show_model else '__observed_points_camera')]
+        points.append(cloud)
+        point_colors.append(np.tile(np.asarray(colors[name]) / 255., (len(cloud), 1)))
+    if 'hand_points_camera' in frame:
         hand = frame['hand_points_camera']
         points.append(hand)
         point_colors.append(np.tile([1., .55, .14], (len(hand), 1)))
     cloud = np.concatenate(points) if points else np.empty((0, 3), np.float32)
     cloud_colors = np.concatenate(point_colors) if point_colors else np.empty((0, 3), np.float32)
-    return np.ascontiguousarray(overlay[..., ::-1]), cloud, cloud_colors
+    return cloud, cloud_colors
 
 
 class DemoViewer:
@@ -80,10 +83,14 @@ class DemoViewer:
                 logger.exception("scene viewer cleanup also failed")
             raise
 
-    def update(self, panel, points, colors):
+    def update(self, panel: np.ndarray) -> None:
+        """新行到达时更新 RGB 内容。"""
         import cv2
 
         cv2.imshow(self.title, panel)
+
+    def update_cloud(self, points: np.ndarray, colors: np.ndarray) -> None:
+        """仅在点云内容变化时提交 Open3D 几何。"""
         if self.vis is not None:
             self.cloud.points = self.o3d.utility.Vector3dVector(points)
             self.cloud.colors = self.o3d.utility.Vector3dVector(colors)
@@ -91,6 +98,12 @@ class DemoViewer:
             if not self._has_points and len(points):
                 self.vis.reset_view_point(True)
                 self._has_points = True
+
+    def poll(self) -> int:
+        """维持窗口响应和必要渲染，不重建显示内容。"""
+        import cv2
+
+        if self.vis is not None:
             if not self.vis.poll_events():
                 return ord('q')
             self.vis.update_renderer()

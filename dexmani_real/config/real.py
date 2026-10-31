@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import runpy
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dexmani_real.config.control import (
@@ -52,6 +51,5 @@ def load_config(path: str | Path | None = None) -> RealConfig:
         if not isinstance(loaded, RealConfig):
             raise TypeError(f"{path} must define CONFIG: RealConfig")
         config = loaded
-    # 全配置会随实验存档；业务域校验仍由实际使用的入口负责。
-    json.dumps(asdict(config), allow_nan=False)
+    # 业务校验和序列化由实际使用或归档该配置的边界负责。
     return config

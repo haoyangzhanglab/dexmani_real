@@ -70,15 +70,15 @@ class SceneTracker:
         for name, tracker in self.trackers.items():
             if name in self.lost_objects:
                 continue
-            cloud = measured.objects[name]
-            mask = masks[name] & ~measured.overlap_mask
+            cloud = measured[name]
+            mask = masks[name]
             count = len(cloud.observed_points_camera)
             fp_count = np.count_nonzero(mask & (depth_m >= 0.001))
             if count < self.min_matched_pixels or fp_count < MIN_DEPTH_PIXELS:
                 if first:
                     raise ValueError(
                         f"{name}: pose initialization has {count} independent depth points "
-                        f"after segmentation/overlap/stride and {fp_count} FoundationPose depth pixels; "
+                        f"after segmentation/stride and {fp_count} FoundationPose depth pixels; "
                         f"requires {self.min_matched_pixels} and {MIN_DEPTH_PIXELS}, respectively. "
                         "Select a supported instance and start a new session."
                     )
@@ -98,7 +98,7 @@ class SceneTracker:
             )
         add_model_depth_support(measured, depths, depth_tolerance_m=self.depth_tolerance_m)
         objects = {}
-        for name, cloud in measured.objects.items():
+        for name, cloud in measured.items():
             pose = poses.get(name)
             supported = cloud.model_supported_point_count
             fraction = cloud.model_supported_fraction
@@ -163,8 +163,6 @@ def scene_arrays(result, hand=None):
         payload.update(
             hand_points_camera=hand_points,
             hand_normals_camera=hand_normals,
-            hand_points_base=transform_points(hand_points, T_base_camera),
-            hand_normals_base=(hand_normals @ T_base_camera[:3, :3].T).astype(np.float32),
             hand_link_ids=hand["link_ids"],
             joint_state=hand["joint_state"],
             T_base_camera=T_base_camera,
@@ -192,13 +190,6 @@ def scene_arrays(result, hand=None):
             semantic_mask=cloud.semantic_mask,
             observed_mask=cloud.observed_mask,
         )
-        if hand is not None:
-            fields["observed_points_base"] = transform_points(
-                fields["observed_points_camera"], T_base_camera
-            )
-            fields["model_points_base"] = transform_points(
-                fields["model_points_camera"], T_base_camera
-            )
         if cloud.model_supported_mask is not None:
             fields["model_supported_mask"] = cloud.model_supported_mask
             fields["observed_model_depth_residual_m"] = cloud.observed_model_depth_residual_m

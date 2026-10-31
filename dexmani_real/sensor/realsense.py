@@ -80,12 +80,13 @@ class RealSenseCamera:
                 self.pending_frame = self.callback_error = self.last_identity = None
                 self.received_ns = [time.monotonic_ns()] * 2
             self.pipeline = rs.pipeline()
-            self.profile = self.pipeline.start(config, self.receive_frame)
-            device = self.profile.get_device()
+            profile = self.pipeline.start(config, self.receive_frame)
+            device = profile.get_device()
             depth_sensor = device.first_depth_sensor()
-            self.color_sensor = device.first_color_sensor()
-            info = self.device_info(device)
-            if info["product_line"] == "L500" or "L515" in info["name"].upper():
+            color_sensor = device.first_color_sensor()
+            name = device.get_info(rs.camera_info.name)
+            product_line = device.get_info(rs.camera_info.product_line)
+            if product_line == "L500" or "L515" in name.upper():
                 preset, confidence = self.config.l515_visual_preset, self.config.l515_confidence_threshold
                 if type(preset) is not int or not 0 <= preset <= 5:
                     raise ValueError("camera l515_visual_preset must be an integer in [0, 5]")
@@ -106,14 +107,14 @@ class RealSenseCamera:
                         depth_sensor.set_option(option, value)
             if self.auto_exposure_priority is not None:
                 option = rs.option.auto_exposure_priority
-                if self.color_sensor.supports(option):
-                    self.color_sensor.set_option(option, self.auto_exposure_priority)
+                if color_sensor.supports(option):
+                    color_sensor.set_option(option, self.auto_exposure_priority)
 
             self.depth_scale_m = float(depth_sensor.get_depth_scale())
             if not np.isfinite(self.depth_scale_m) or self.depth_scale_m <= 0:
                 raise ValueError("RealSense depth scale must be finite and positive")
             color = (
-                self.profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+                profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
             )
             self.color_intrinsics = CameraIntrinsics(
                 width=color.width,
@@ -210,29 +211,6 @@ class RealSenseCamera:
             self.pipeline = None
             with self.condition:
                 self.pending_frame = None
-
-    def get_device_info(self):
-        return self.device_info(self.profile.get_device())
-
-    @staticmethod
-    def device_info(device):
-        import pyrealsense2 as rs
-
-        return {
-            name: device.get_info(key) if device.supports(key) else ""
-            for name, key in (
-                ("name", rs.camera_info.name),
-                ("serial", rs.camera_info.serial_number),
-                ("firmware", rs.camera_info.firmware_version),
-                ("product_line", rs.camera_info.product_line),
-            )
-        }
-
-    @staticmethod
-    def list_cameras():
-        import pyrealsense2 as rs
-
-        return [RealSenseCamera.device_info(device) for device in rs.context().query_devices()]
 
 
 def run_camera(shared, config: CameraConfig):

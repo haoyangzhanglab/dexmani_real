@@ -87,7 +87,15 @@ python scripts/cordvip/track_object.py \
 
 SAM 失败保留子进程原始 traceback，父进程错误指向该日志。FoundationPose、renderer 或其他技术异常直接结束任务为 failed，保留已写入的成功前缀和原始错误，不伪造当前行；当前 NPZ 写入失败时删除自己创建的未完成文件，已有结果拒绝覆盖。深度点或模型支持不足按算法形成 `POSE_LOST`，该行独立实测点仍保留。
 
-逐行 NPZ 是唯一逐帧结果，不再生成 `records.jsonl`。文件名对应源 row，不是墙钟序号。对象字段使用 `toy__`、`basket__` 或单物体 `object__` 前缀，对象清单与 role 只存于 `scene.json`。每个实例分别保存 `pose_valid` 和 `observed_valid`；pose 无效时变换为 NaN、模型点为空，独立实测点仍可有效。`candidate_T_camera_object` 保存门控前候选（没有候选时为 NaN），不能视为有效位姿。已计算的 `model_supported_mask` 与 `observed_model_depth_residual_m` 在拒绝候选的失败帧中也保存；支持点数/比例只在实际完成模型深度比较时保存。
+逐行 NPZ 是唯一逐帧结果。文件名对应源 row，不是墙钟序号。对象字段使用 `toy__`、`basket__` 或单物体 `object__` 前缀，对象清单与 role 只存于 `scene.json`。每个实例分别保存 `pose_valid` 和 `observed_valid`；pose 无效时变换为 NaN、模型点为空，独立实测点仍可有效。`candidate_T_camera_object` 保存门控前候选（没有候选时为 NaN），不能视为有效位姿。已计算的 `model_supported_mask` 与 `observed_model_depth_residual_m` 在拒绝候选的失败帧中也保存；支持点数/比例只在实际完成模型深度比较时保存。
+
+点云和法向仅保存 camera 表示：`hand_points_camera`、`hand_normals_camera` 及各对象的 `observed_points_camera`、`model_points_camera`、`model_normals_camera`。不再逐帧计算或写入对应 base 数组。每个 NPZ 保留 `K`；启用 `--with-hand` 时同一文件还含 `T_base_camera`、`hand_link_ids` 和关节状态，无需跨文件解析标定。需要 base 坐标时按原 float32 语义转换：
+
+```python
+R, t = T_base_camera[:3, :3], T_base_camera[:3, 3]
+points_base = (points_camera @ R.T + t).astype(np.float32)
+normals_base = (normals_camera @ R.T).astype(np.float32)
+```
 
 ```bash
 python -m cordvip_geometry view outputs/scene_001
@@ -109,7 +117,7 @@ with np.load("outputs/scene_001/frames/000000.npz", allow_pickle=False) as row:
         median_error = np.median(np.abs(residual[np.isfinite(residual)])) if np.isfinite(residual).any() else np.nan
 ```
 
-查看器只按 `n`/Space 前进一行、`v` 切换 observed/model、`q` 退出；`--headless` 读取检查结果而不开窗口。查看不重新执行模型。追踪退出后保留已写行及明确最终状态，不再生成 latest、心跳、STALE 或退出失效快照。旧 notebook 应直接读取 `scene.json` 和逐行 NPZ；没有实时相机、通用外部 Frame 宿主或 Raw/NPZ 多源播放器。
+查看器按 `n`/Space 前进一行、`v` 切换 observed/model、`q`/`Q`/Esc 或关窗退出。每行只解压显示字段一次；开启 3D 时读取 observed/model camera 点供切换，`--no-3d` 不读取点云。`view --headless` 仅检查 RGB 的 uint8 网格、文件名对应的 row 及来源时间/时钟，不读取对象显示字段或生成 overlay，不加载 OpenCV/Open3D。新行更新 RGB 和几何，`v` 只更新几何，静止时仅轮询事件和渲染；不读取未展示的法向、候选位姿或残差。查看不重新执行模型。追踪退出后保留已写行及明确最终状态，离线分析直接读取 `scene.json` 和逐行 NPZ。
 
 ## 准备物体资产
 
@@ -143,6 +151,6 @@ python -m cordvip_geometry prepare \
 
 模型点来自固定资产及有效 pose，不是实测接触。FoundationPose++ 的 bbox 中心只引导 centered mesh 的 2D 位置，保留旧 Z/rotation，不用深度孔洞构造 3D 质心；输出为 `T_camera_asset = T_camera_centered @ T_centered_asset`。单个 pose 正常丢失不删除别的物体或独立实测点。
 
-`--with-hand` 用同一 Raw 行的 19 维实测 arm/hand 关节（rad）、数据对应的相机外参与 URDF `link_base` 生成手点，不用 action、不插值、不连接设备。固定样本、link ID 与法向沿用 URDF/mesh，保留 camera/base 两坐标系；时间证据未知时明确标为不可用。同行关联不证明手/相机物理同步，几何有效也不代表通过策略输入的时序准入。
+`--with-hand` 用同一 Raw 行的 19 维实测 arm/hand 关节（rad）、数据对应的相机外参与 URDF `link_base` 生成手点，不用 action、不插值、不连接设备。固定样本、link ID 与法向沿用 URDF/mesh，手点和法向只存 camera 坐标；时间证据未知时明确标为不可用。同行关联不证明手/相机物理同步，几何有效也不代表通过策略输入的时序准入。
 
 控制、训练适配及 contact/proximity 标签仍属于主包和配套 Policy。本工具不接管设备或动作发布；真实 GPU 模型的结果、长序列内存与性能须用实际模型和 Raw 单独验证。

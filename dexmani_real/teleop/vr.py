@@ -83,6 +83,6 @@ class VRController:
     def commit(self, command, *, eef_pose):
         if self.hand_retargeter is not None:
             self.hand_retargeter.commit(command.hand_qpos, timestamp_ns=self.target_timestamp_ns)
-        self.previous_arm_command = command.arm_qpos.copy()
+        self.previous_arm_command = command.arm_qpos
         # map_eef 交出的临时目标此后归控制器所有。
         self.previous_eef_target = eef_pose

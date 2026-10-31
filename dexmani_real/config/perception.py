@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+DEPTH_RANGE_M = (0.30, 1.50)
+
 
 @dataclass(frozen=True)
 class PointCloudConfig:

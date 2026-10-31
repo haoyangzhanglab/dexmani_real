@@ -21,29 +21,16 @@ class SceneObjectCloud:
     model_supported_fraction: float = 0.0
 
 
-@dataclass
-class SceneCloudResult:
-    objects: dict[str, SceneObjectCloud]
-    overlap_mask: np.ndarray
-
-
-def extract_scene_clouds(rgb, depth_m, directions, masks, *, pixel_stride=2):
+def extract_scene_clouds(rgb, depth_m, directions, masks, *, pixel_stride=2) -> dict[str, SceneObjectCloud]:
     """反投影互斥掩码中的非零实测深度。"""
     shape = depth_m.shape
-    seen = np.zeros(shape, dtype=bool)
-    overlap = np.zeros(shape, dtype=bool)
-    # The SAM pipe boundary admits fixed, named boolean masks on this RGB-D grid.
-    for mask in masks.values():
-        overlap |= seen & mask
-        seen |= mask
-
     sample = (slice(None, None, pixel_stride), slice(None, None, pixel_stride))
     sampled_depth = depth_m[sample]
     sampled_rgb = rgb[sample]
     objects = {}
     for name, semantic in masks.items():
-        exclusive = semantic[sample] & ~overlap[sample]
-        selected = exclusive & (sampled_depth > 0)
+        # The SAM pipe boundary already admits mutually exclusive masks.
+        selected = semantic[sample] & (sampled_depth > 0)
         v, u = np.nonzero(selected)
         pixel_indices = np.column_stack((v * pixel_stride, u * pixel_stride)).astype(np.int32)
         z = sampled_depth[selected]
@@ -63,15 +50,16 @@ def extract_scene_clouds(rgb, depth_m, directions, masks, *, pixel_stride=2):
             model_supported_mask=None,
             observed_model_depth_residual_m=None,
         )
-    return SceneCloudResult(objects=objects, overlap_mask=overlap)
+    return objects
 
 
-def add_model_depth_support(measured, model_depths, *, depth_tolerance_m=0.015):
+def add_model_depth_support(
+    measured: dict[str, SceneObjectCloud], model_depths: dict[str, np.ndarray], *, depth_tolerance_m=0.015,
+) -> None:
     """原位附加同网格模型深度支持；保持实测点序，无模型表面处残差为 NaN。"""
     # ModelDepthRenderer owns float32 nonnegative depth on the fixed scene grid.
-    shape = measured.overlap_mask.shape
     for name, model in model_depths.items():
-        cloud = measured.objects[name]
+        cloud = measured[name]
         pixels = cloud.observed_pixel_indices
         points = cloud.observed_points_camera
         count = len(points)
@@ -81,7 +69,7 @@ def add_model_depth_support(measured, model_depths, *, depth_tolerance_m=0.015):
         residual[comparable] = points[comparable, 2] - model_depth[comparable]
         supported = comparable & (np.abs(residual) <= depth_tolerance_m)
         support_pixels = pixels[supported]
-        cloud.model_supported_mask = np.zeros(shape, dtype=bool)
+        cloud.model_supported_mask = np.zeros(cloud.observed_mask.shape, dtype=bool)
         cloud.model_supported_mask[support_pixels[:, 0], support_pixels[:, 1]] = True
         cloud.observed_model_depth_residual_m = residual
         cloud.model_supported_point_count = len(support_pixels)

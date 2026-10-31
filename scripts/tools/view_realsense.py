@@ -4,38 +4,22 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 import time
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.config.perception import PointCloudConfig
-from dexmani_real.config.real import load_config
+from dexmani_real.config.perception import DEPTH_RANGE_M
 from dexmani_real.geometry.camera import CameraIntrinsics
-from dexmani_real.geometry.plane import fit_table_plane
-from dexmani_real.perception.pointcloud import (
-    DEPTH_RANGE_M,
-    PointCloudProcessor,
-    aligned_depth_points_in_base,
-    build_raw_point_cloud,
-)
-from dexmani_real.utils.camera_calibrate.extrinsics import load_camera_extrinsics
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.table_plane import (
-    load_table_plane,
-    resolve_table_plane_path,
-    save_table_plane,
-)
-from dexmani_real.utils.visualization.image import ImageViewer, rgbd_panel
-from dexmani_real.utils.visualization.pointcloud import PointCloudViewer
 
 if TYPE_CHECKING:
+    from dexmani_real.config.perception import PointCloudConfig
+    from dexmani_real.perception.pointcloud import PointCloudProcessor
     from dexmani_real.sensor.realsense import RealSenseCamera
 
 TABLE_CALIBRATION_FRAMES = 5
@@ -43,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def read_rgbd(camera):
-    """检查 SDK 帧的网格和类型，保留设备侧来源时间与帧号。"""
+    """检查 SDK 帧的网格和类型，保留首次主机接收时间与设备帧号。"""
     frame = camera.read()
     if frame is None:
         return None
@@ -55,59 +39,34 @@ def read_rgbd(camera):
     return frame
 
 
-def save_diagnostic_snapshot(
+def save_rgbd_snapshot(
     *,
     output_root: Path,
     frame,
-    raw_point_cloud: np.ndarray,
-    processed_point_cloud: np.ndarray,
     depth_scale_m: float,
     intrinsics: CameraIntrinsics,
-    T_xarm_base_from_color: np.ndarray,
-    table_plane_abcd: tuple[float, float, float, float] | None,
-    table_plane_source: str,
-    pointcloud_config: PointCloudConfig,
-    camera_info: dict,
+    serial: str,
 ) -> Path:
+    """仅保存原始对齐 RGB-D 和来源事实；原始深度计数乘 scale 后为米。"""
     timestamp = datetime.now().astimezone()
-    target = output_root.expanduser().resolve() / timestamp.strftime("pointcloud_%Y%m%d_%H%M%S_%f")
-    target.mkdir(parents=True)
-
-    arrays = {
-        "rgb.npy": frame.rgb,
-        "depth_aligned_to_color_raw.npy": frame.depth,
-        "raw_point_cloud.npy": raw_point_cloud,
-        "processed_point_cloud.npy": processed_point_cloud,
-        "T_xarm_base_from_color.npy": T_xarm_base_from_color,
-    }
-    metadata = {
-        "created_at": timestamp.isoformat(),
-        "source_timestamp_ns": int(frame.timestamp_ns),
-        "depth_frame_number": int(frame.depth_frame_number),
-        "color_frame_number": int(frame.color_frame_number),
-        "source_clock": "host_monotonic_oldest_rgbd_receive",
-        "payload_mode": "depth_to_color_aligned_rgbd",
-        "depth_payload_frame": "color",
-        "depth_scale_m_per_unit": float(depth_scale_m),
-        "color_intrinsics": intrinsics.to_dict(),
-        "table_plane_abcd": None if table_plane_abcd is None else list(table_plane_abcd),
-        "table_plane_source": table_plane_source,
-        "pointcloud_config": asdict(pointcloud_config),
-        "point_cloud_frame": "xarm_base",
-        "point_cloud_columns": ["x_m", "y_m", "z_m", "r", "g", "b"],
-        "raw_point_cloud_semantics": "all_finite_nonzero_aligned_depth_pixels",
-        "processed_point_cloud_empty": processed_point_cloud.shape[0] == 0,
-        "camera": {key: camera_info[key] for key in ("name", "serial", "firmware")},
-        "arrays": {
-            name: {"shape": list(value.shape), "dtype": str(value.dtype)}
-            for name, value in arrays.items()
-        },
-    }
-
-    for name, value in arrays.items():
-        np.save(target / name, value, allow_pickle=False)
-    with (target / "metadata.json").open("w", encoding="utf-8") as stream:
-        json.dump(metadata, stream, ensure_ascii=False, indent=2, allow_nan=False)
+    output_root = output_root.expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    target = output_root / timestamp.strftime("rgbd_%Y%m%d_%H%M%S_%f.npz")
+    with target.open("xb") as stream:
+        np.savez_compressed(
+            stream,
+            rgb=frame.rgb,
+            depth_aligned_to_color_raw=frame.depth,
+            K=intrinsics.matrix(),
+            distortion_model=intrinsics.distortion_model,
+            distortion_coeffs=np.asarray(intrinsics.distortion_coeffs, dtype=np.float64),
+            depth_scale_m_per_unit=float(depth_scale_m),
+            camera_serial=serial,
+            source_timestamp_ns=int(frame.timestamp_ns),
+            source_clock="host_monotonic_oldest_rgbd_receive",
+            depth_frame_number=int(frame.depth_frame_number),
+            color_frame_number=int(frame.color_frame_number),
+        )
     return target
 
 
@@ -154,6 +113,10 @@ def calibrate_table_plane(
     plane_path: Path,
     frame_count: int,
 ) -> tuple[float, float, float, float]:
+    from dexmani_real.geometry.plane import fit_table_plane
+    from dexmani_real.perception.pointcloud import aligned_depth_points_in_base
+    from dexmani_real.utils.table_plane import save_table_plane
+
     lower, upper = config.workspace_bounds()
     print("\n" + "=" * 60)
     print("Table Plane Calibration (multi-frame RANSAC)")
@@ -217,6 +180,9 @@ class RealSenseViewer:
         self.args = args
 
     def run(self) -> int:
+        from dexmani_real.config.real import load_config
+        from dexmani_real.sensor.realsense import RealSenseCamera
+
         runtime = load_config(path=self.args.config)
         if self.args.save_dir is not None and self.args.save_dir.exists() and not self.args.save_dir.is_dir():
             raise NotADirectoryError(f"snapshot output root is not a directory: {self.args.save_dir}")
@@ -224,22 +190,16 @@ class RealSenseViewer:
         self.table_plane_path = runtime.environment.table_plane_path
         self.base_from_color: np.ndarray | None = None
         self.processor: PointCloudProcessor | None = None
-        self.table_plane: tuple[float, float, float, float] | None = None
-        self.table_plane_source = "disabled"
-        if self.args.cloud is not None:
-            self.pointcloud_config.workspace_bounds()
-
-        from dexmani_real.sensor.realsense import RealSenseCamera
-
         runtime.camera.validate()
         configure_logging()
         # 预览不额外修改曝光优先级；其余启动设置使用实验配置。
         self.camera = RealSenseCamera(runtime.camera, auto_exposure_priority=None)
         try:
             self.camera.connect()
-            self.camera_info = self.camera.get_device_info()
-            print(f"Connected: {self.camera_info}")
+            print(f"Connected: {self.camera.active_serial}")
             if self.args.calibrate_table:
+                from dexmani_real.utils.table_plane import resolve_table_plane_path
+
                 calibrate_table_plane(
                     camera=self.camera, intrinsics=self.camera.color_intrinsics,
                     T_xarm_base_from_color=self.ensure_cloud_transform(), config=self.pointcloud_config,
@@ -267,6 +227,10 @@ class RealSenseViewer:
 
     def ensure_cloud_transform(self) -> np.ndarray:
         if self.base_from_color is None:
+            from dexmani_real.utils.camera_calibrate.extrinsics import (
+                load_camera_extrinsics,
+            )
+
             self.base_from_color = load_camera_extrinsics(
                 self.camera.active_serial, self.args.camera_calibration,
             )
@@ -274,13 +238,17 @@ class RealSenseViewer:
 
     def ensure_processor(self):
         if self.processor is None:
+            from dexmani_real.perception.pointcloud import PointCloudProcessor
+
             base_from_color = self.ensure_cloud_transform()
+            table_plane = None
             if self.pointcloud_config.remove_table:
-                self.table_plane = load_table_plane(self.table_plane_path)
-                self.table_plane_source = "resolved_runtime"
+                from dexmani_real.utils.table_plane import load_table_plane
+
+                table_plane = load_table_plane(self.table_plane_path)
             self.processor = PointCloudProcessor(
                 depth_scale_m=self.camera.depth_scale_m, intrinsics=self.camera.color_intrinsics,
-                T_xarm_base_from_color=base_from_color, table_plane_abcd=self.table_plane,
+                T_xarm_base_from_color=base_from_color, table_plane_abcd=table_plane,
                 config=self.pointcloud_config,
             )
         return self.processor
@@ -288,29 +256,25 @@ class RealSenseViewer:
     def save_snapshot(self):
         while (frame := read_rgbd(self.camera)) is None:
             pass
-        processed = self.ensure_processor().process(frame.depth, frame.rgb)
-        base_from_color = self.ensure_cloud_transform()
-        raw = build_raw_point_cloud(
-            depth_raw=frame.depth, color=frame.rgb, depth_scale_m=self.camera.depth_scale_m,
-            intrinsics=self.camera.color_intrinsics, T_xarm_base_from_color=base_from_color,
-        )
-        target = save_diagnostic_snapshot(
+        target = save_rgbd_snapshot(
             output_root=self.args.save_dir, frame=frame,
-            raw_point_cloud=raw, processed_point_cloud=processed,
             depth_scale_m=self.camera.depth_scale_m, intrinsics=self.camera.color_intrinsics,
-            T_xarm_base_from_color=base_from_color,
-            table_plane_abcd=self.table_plane, table_plane_source=self.table_plane_source,
-            pointcloud_config=self.pointcloud_config, camera_info=self.camera_info,
+            serial=self.camera.active_serial,
         )
         print(f"Snapshot: {target}")
 
     def capture(self) -> None:
+        from dexmani_real.utils.visualization.image import ImageViewer, rgbd_panel
+
         print("Q/Esc 或关闭任一窗口退出；点云类型由 --cloud raw/processed 选择。")
         image_viewer = cloud_viewer = None
         depth_scale_m = self.camera.depth_scale_m
         try:
             image_viewer = ImageViewer("RealSense RGB-D | RGB / Depth")
             if self.args.cloud is not None:
+                from dexmani_real.utils.visualization.pointcloud import PointCloudViewer
+
+                self.pointcloud_config.workspace_bounds()
                 cloud_viewer = PointCloudViewer(
                     workspace=self.pointcloud_config.workspace,
                     base_from_color=self.ensure_cloud_transform(),
@@ -328,6 +292,10 @@ class RealSenseViewer:
                     if self.args.cloud == "processed":
                         cloud = self.ensure_processor().process(frame.depth, frame.rgb)
                     else:
+                        from dexmani_real.perception.pointcloud import (
+                            build_raw_point_cloud,
+                        )
+
                         cloud = build_raw_point_cloud(
                             depth_raw=frame.depth, color=frame.rgb, depth_scale_m=depth_scale_m,
                             intrinsics=self.camera.color_intrinsics,
@@ -359,7 +327,7 @@ def main(argv=None) -> int:
     parser.add_argument("--cloud", choices=("raw", "processed"), help="启动时打开所选点云视图")
     operation = parser.add_mutually_exclusive_group()
     operation.add_argument("--calibrate-table", action="store_true", help="采集五帧拟合桌面，确认发布后退出")
-    operation.add_argument("--save-dir", type=Path, help="保存一帧 RGB-D、raw/processed 点云与来源事实后退出")
+    operation.add_argument("--save-dir", type=Path, help="保存一帧原始 RGB-D 与来源事实为单个 NPZ 后退出，无需外参或桌面标定")
     operation.add_argument("--benchmark-frames", type=int, metavar="N", help="测量 N 个新深度帧后退出")
     args = parser.parse_args(argv)
     if args.benchmark_frames is not None and args.benchmark_frames < 1:

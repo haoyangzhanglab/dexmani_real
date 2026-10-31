@@ -7,7 +7,6 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import ArrayLike
-from scipy.spatial.transform import Rotation
 
 WXYZ_TO_XYZW = np.array([1, 2, 3, 0], dtype=np.intp)
 XYZW_TO_WXYZ = np.array([3, 0, 1, 2], dtype=np.intp)
@@ -104,6 +103,8 @@ def compute_pose_error(target: Pose, actual: Pose) -> tuple[float, float]:
 
 
 def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
+    from scipy.spatial.transform import Rotation
+
     quat_xyzw = Rotation.from_matrix(rot6d_to_rotmat(r6)).as_quat()
     return xyzw_to_wxyz(quat_xyzw)
 
@@ -143,5 +144,7 @@ def rot6d_to_rotmat(r6: np.ndarray) -> np.ndarray:
 
 def forward_from_quat_wxyz(q_wxyz: ArrayLike) -> np.ndarray:
     """返回旋转后的 FLU +X 朝向。"""
+    from scipy.spatial.transform import Rotation
+
     quat_xyzw = wxyz_to_xyzw(q_wxyz)
     return Rotation.from_quat(quat_xyzw).apply(np.array([1.0, 0.0, 0.0]))

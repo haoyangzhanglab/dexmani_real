@@ -23,8 +23,10 @@ python scripts/cordvip/track_object.py \
 python -m cordvip_geometry view outputs/scene_001
 ```
 
-追踪默认处理全部行，只有 `--max-frames` 显式限制前缀。`frames/` 必存，`scene.json` 保存一次对象/role/asset/selection，`run.json`、`models.json`、`result.json` 分别记录配置、已就绪模型来源与最终结果。逐帧事实只写入 NPZ，包括失败原因、门控前候选位姿和已计算的支持掩码、深度残差；不再生成 `records.jsonl` 或默认报告统计。输出使用新目录，Raw 始终只读。首帧选择仍需与源数据及相机几何精确对应。
+追踪默认处理全部行，只有 `--max-frames` 显式限制前缀。`frames/` 必存，`scene.json` 保存一次对象/role/asset/selection，`run.json`、`models.json`、`result.json` 分别记录配置、已就绪模型来源与最终结果。逐帧事实只写入 NPZ，包括失败原因、门控前候选位姿和已计算的支持掩码、深度残差。输出使用新目录，Raw 始终只读。首帧选择仍需与源数据及相机几何精确对应。
 
-建模的分割和 prepare 直接调用普通函数；只有 Hunyuan 生成使用一次子进程，退出释放 GPU。生成只保存未定尺度 mesh；最终米制资产按原 seed/点数采样一次。结果查看器只按行前进及切换 observed/model，不另建实时服务。
+逐帧点云和法向仅保存 camera 坐标。每个 NPZ 仍自包含 `K`，使用 `--with-hand` 时保留 `T_base_camera`、link IDs 与关节状态。若需 base 坐标，从 `T_base_camera` 取 `R = T[:3, :3]`、`t = T[:3, 3]`，使用 `(points_camera @ R.T + t).astype(np.float32)`；法向为 `(normals_camera @ R.T).astype(np.float32)`。
+
+建模的分割和 prepare 直接调用普通函数；只有 Hunyuan 生成使用一次子进程，退出释放 GPU。生成只保存未定尺度 mesh；最终米制资产按原 seed/点数采样一次。结果查看器在换行时更新显示，`v` 只更新 observed/model 点云；静止时仅轮询窗口事件和渲染。`--no-3d` 不读取点云数组；`view --headless` 仅检查 RGB 和来源行/时钟，不加载 OpenCV/Open3D。
 
 本工具不提供实时相机追踪、latest/心跳发布或外部 Frame 宿主，也未接入主包控制、Raw writer、Canonical 导出或策略部署。上游源码与模型继续遵循各自的许可证及模型条款，详见[安装与权重](docs/usage.md#安装与权重)。

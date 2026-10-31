@@ -50,11 +50,11 @@ python scripts/keyboard_teleop.py
 
 采集和策略会话使用 B 开始、S 保存并结束本段、D 丢弃本段、Q 保存并退出、Esc 急停。H 只在无活动段时回初始位，T 只在空闲、手部无接触时复位触觉。已退出 C 暂停/续写、双 Q 确认和音频播放。物理回放保留 S 停止、H 回零、Q 退出；键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出。
 
-设备和模型在会话内复用。启动时手部 HOME、触觉复位和真实反馈就绪后才 warmup；SDK 请求成功与反馈就绪不证明已完成触觉零点标定。每段准备后用新实测姿态和 VR 输入建立锚点。本段先撤权并请求停止，再关闭录制，由监督方唯一决定发布或丢弃；writer 无发布权。写入/关闭失败、计数不一致或超时不会发布，临时目录保留。收尾期间的 B/H 等准备按键失效，未退出的 writer/模型任务阻止下一段授权。Python 等待期限不能终止阻塞 native 调用。
+设备和模型在会话内复用。启动时手部 HOME、触觉复位和真实反馈就绪后才 warmup；SDK 请求成功与反馈就绪不证明已完成触觉零点标定。Teleop 每段顺序完成准备、等待 streaming 准备后的新观测、用实测姿态和 VR 输入重建锚点及最终准入，再进入 ACTIVE 控制；初始预计算观测不作为准入锚点。本段先撤权并请求停止，再关闭录制，由监督方唯一决定发布或丢弃；writer 无发布权。成功关闭且计数一致的零行段提示“未录到数据”，不发布并清理临时目录；非空技术失败段仍保存已录数据。写入/关闭失败、计数不一致或超时不会发布，临时目录保留。收尾期间的 B/H 等准备按键失效，未退出的 writer/模型任务阻止下一段授权。Python 等待期限不能终止阻塞 native 调用。
 
 策略周期、数值 recipe、模态和动作窗口从 checkpoint 恢复。sync 等待预测后推进实际动作步；async 按时间锚点交接，可消费旧预测仍有效的尾部；RTC 保留冻结前缀、引导与严格交接时刻，错过动作不会补发。async/RTC 要求 `1 <= prefetch_steps <= action_steps` 且二者之和不超过预测窗口；RTC guidance cap 须显式为有限非负值。旧 LAMP 动作历史分支已按当前配套 Policy 公共 API 退出。
 
-`session_result.json` 保存每段主因、补充清理错误、时长、跳步及 Raw 结果。时长完成、预测超时、操作者结束、目标准入和设备故障分别分类。已进入 RUNNING 的段计入 `--num-episodes`，准备失败或取消不计。会话正常结束不代表任务成功率。未消费的退休预测报错会终止会话，不回写已封存 Raw。
+`session_result.json` 保存会话 outcome/reason/shutdown、错误及 episodes 原始结果，包括每段主因、补充清理错误、时长、跳步及 Raw 结果；段数和终止原因计数由 episodes 计算，不重复持久化。时长完成、预测超时、操作者结束、目标准入和设备故障分别分类。已进入 RUNNING 的段计入 `--num-episodes`，准备失败或取消不计。会话正常结束不代表任务成功率。未消费的退休预测报错会终止会话，不回写已封存 Raw。
 
 ## 数据、来源和执行语义
 
@@ -104,15 +104,19 @@ collect 的相机持续连接，Enter 为一组只读机械臂采样，完成立
 
 solve 的外参输出与派生报告不得覆盖 `capture.json` 或原始采样 NPZ；其他新结果仍可保存在采样目录内。
 
-相机查看统一使用 view_realsense.py：默认 RGB-D，`--cloud raw/processed` 在启动时选择固定点云类型；Q/Esc 或关闭任一窗口退出。预览不修改曝光优先级，不提供运行中模式切换和逐帧诊断面板。`--save-dir PATH` 保存一帧 RGB-D、两类点云及来源事实；`--benchmark-frames N` 测量 N 个新深度帧；`--calibrate-table` 采集五帧拟合桌面并在终端明确确认后更新共享平面。这三项互斥，执行后退出。窗口需要桌面/OpenGL，代码清理测试不自动连接真实设备。
+相机查看统一使用 view_realsense.py：默认 RGB-D，`--cloud raw/processed` 在启动时选择固定点云类型；Q/Esc 或关闭任一窗口退出。预览不修改曝光优先级，不提供运行中模式切换和逐帧诊断面板。`--save-dir PATH` 保存单帧原始 RGB-D 到一个 `rgbd_*.npz`，打印文件路径后退出，拒绝覆盖；`--benchmark-frames N` 测量 N 个新深度帧；`--calibrate-table` 采集五帧拟合桌面并在终端明确确认后更新共享平面。这三项互斥，执行后退出。窗口需要桌面/OpenGL，代码清理测试不自动连接真实设备。
+
+快照可用 `np.load(path, allow_pickle=False)` 读取：`rgb` 为 RGB uint8，`depth_aligned_to_color_raw` 为对齐到 color 网格的 uint16 原始计数；`K`、`distortion_model`、`distortion_coeffs` 描述该网格，`depth_scale_m_per_unit` 是每计数的米数。另保存实际 `camera_serial`、`source_timestamp_ns`、`source_clock` 和 depth/color frame number。来源时钟为 `host_monotonic_oldest_rgbd_receive`，时间取两通道首次主机接收时刻中的较早者，不是文件创建时间或曝光时间。深度换算为 `depth_raw.astype(np.float32) * np.float32(depth_scale_m_per_unit)`。原始快照无需外参、桌面文件或点云处理配置；需要基座点云时，离线显式加载对应 serial 的相机标定后重建。
 
 点云默认使用基座系 XYZRGB，工作空间 `x=[0.15,0.85]、y=[-0.50,0.50]、z=[0,0.80] m`，去桌面间隙 10 mm。深度邻域支持、体素、半径密度和连通分量过滤后 FPS；空点云在 viewer 清除、导出拒绝。几何规则可能丢失细结构，参数和配方必须随实验保持一致。
 
 ## 离线物体几何和分析
 
-CordVIP 流程为同一 Raw 首帧人工确认 mask → 顺序全部行 → 必存逐行结果 → 独立查看。保留单/多物体、无资产 mask-only、独立 observed/model、法向、手 FK、SAM RPC 与历史清理；深度支持量参与 pose-valid，pose 丢失不删除独立实测点。已退出 live/capture、latest/心跳/STALE 服务和按墙钟跳行。
+CordVIP 流程为同一 Raw 首帧人工确认 mask → 顺序全部行 → 保存逐行结果 → 独立查看。支持单/多物体、无资产 mask-only、独立 observed/model、法向、手 FK 与 SAM RPC；深度支持量参与 pose-valid，pose 丢失不删除独立实测点。
 
-逐帧结果统一保存在 `frames/*.npz`，包含状态、失败原因、门控前候选位姿与已计算的深度支持数据；候选存在不代表 `pose_valid=True`。场景、配置、模型来源和结束摘要各保存一次，默认不再生成逐帧 `records.jsonl` 或分析报告。可按需用 `numpy.load(path, allow_pickle=False)` 读取 NPZ 离线计算指标。
+逐帧结果统一保存在 `frames/*.npz`，点云和法线仅保存 camera 坐标，包含状态、失败原因、门控前候选位姿与已计算的深度支持数据；候选存在不代表 `pose_valid=True`。每帧仍保留 K，以及手几何启用时的 `T_base_camera`、link_ids 等事实。由 `T_base_camera` 取 R、t，基座系点为 `(points_camera @ R.T + t).astype(np.float32)`，法线为 `(normals_camera @ R.T).astype(np.float32)`。场景、配置、模型来源和结束摘要各保存一次。可按需用 `numpy.load(path, allow_pickle=False)` 读取 NPZ 离线计算指标。
+
+离线查看在换行时更新 RGB 叠加和几何，`v` 只切换点云，静止时仅处理窗口事件和渲染。`--no-3d` 不解压点云；`--headless` 只读取并检查 RGB、源 row/time/clock，不读取对象字段或场景配置，也不加载 OpenCV/Open3D。
 
 ```bash
 python scripts/cordvip/track_object.py --episode episodes/TASK/EPISODE --scene scene.json --with-hand --output outputs/scene_001

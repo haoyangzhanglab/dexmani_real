@@ -60,9 +60,10 @@ def load_frame(path: str | Path) -> Frame:
         if coefficients.shape != (5,) or coefficients.dtype.kind not in {"f", "i", "u"}:
             raise ValueError(f"{path.name}: distortion_coeffs must contain five numbers")
         k1, k2, p1, p2, k3 = map(float, coefficients)
-        if saved["depth_m"].dtype != np.float32:
+        depth_m = saved["depth_m"]
+        if depth_m.dtype != np.float32:
             raise ValueError("aligned depth must be finite nonnegative float32 [H,W] metres")
-        rgb, depth_m, K = validate_rgbd(saved["rgb"], saved["depth_m"], saved["K"])
+        rgb, depth_m, K = validate_rgbd(saved["rgb"], depth_m, saved["K"])
         distortion = validate_distortion(text["distortion_model"], (k1, k2, p1, p2, k3))
         return Frame(
             rgb=rgb,

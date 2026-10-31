@@ -1,17 +1,11 @@
 """对齐 RGB-D 到 xArm 基座系的 float32[N,6] XYZRGB；无有效点时返回 (0,6)。"""
 
-import cv2
 import numpy as np
-from fpsample import bucket_fps_kdline_sampling
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
-from scipy.spatial import cKDTree
 
-from dexmani_real.config.perception import PointCloudConfig
+from dexmani_real.config.perception import DEPTH_RANGE_M, PointCloudConfig
 from dexmani_real.geometry.camera import CameraIntrinsics, deproject_depth, depth_rays
 
 NEIGHBORHOOD_KERNEL = np.ones((3, 3), dtype=np.uint8)
-DEPTH_RANGE_M = (0.30, 1.50)
 EDGE_JUMP_M = 0.030
 EDGE_SURFACE_BAND_M = 0.008
 DEPTH_MIN_SUPPORT = 2
@@ -23,6 +17,8 @@ OUTLIER_MIN_COMPONENT_POINTS = 10
 
 
 def filter_depth(depth_m: np.ndarray) -> np.ndarray:
+    import cv2
+
     valid = (depth_m >= DEPTH_RANGE_M[0]) & (depth_m <= DEPTH_RANGE_M[1])
     local_min: np.ndarray = cv2.erode(
         np.where(valid, depth_m, np.float32(np.inf)),
@@ -90,6 +86,10 @@ def voxel_downsample(points: np.ndarray, colors: np.ndarray):
 
 
 def radius_inliers(points: np.ndarray) -> np.ndarray:
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+
     pairs = cKDTree(points, compact_nodes=False, balanced_tree=False).query_pairs(
         OUTLIER_RADIUS_M,
         output_type="ndarray",
@@ -108,6 +108,8 @@ def radius_inliers(points: np.ndarray) -> np.ndarray:
 
 def sample_indices(points: np.ndarray, num_points: int) -> np.ndarray:
     if len(points) > num_points:
+        from fpsample import bucket_fps_kdline_sampling
+
         return bucket_fps_kdline_sampling(
             points,
             num_points,
