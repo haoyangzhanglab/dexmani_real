@@ -13,6 +13,7 @@ from dexmani_real.data.raw import RawWriter
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.runtime.observation import Observation
 from dexmani_real.utils.io import publish
+from dexmani_real.utils.log import attach_cleanup_errors
 from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -61,18 +62,16 @@ class EpisodeRecorder:
     def store_error(self, error, *, stage="recording_cleanup"):
         if self.error is None:
             self.error = error
-        elif error is not self.error and error.__cause__ is not self.error:
-            setattr(self.error, "cleanup_errors", [
-                *getattr(self.error, "cleanup_errors", ()), (stage, error),
-            ])
+        else:
+            attach_cleanup_errors(self.error, [(stage, error)])
 
     def check_error(self):
         if self.error is not None:
-            if isinstance(self.error, RecordingError):
-                raise self.error
-            failure = RecordingError(f"Recording failed: {self.error}")
-            setattr(failure, "cleanup_errors", getattr(self.error, "cleanup_errors", ()))
-            raise failure from self.error
+            if not isinstance(self.error, RecordingError):
+                failure = RecordingError("Recording failed")
+                failure.__cause__ = self.error
+                self.error = failure
+            raise self.error
 
     def result(self):
         """仅报告最后可观察的结果，pending 不推断线程之后的结局。"""

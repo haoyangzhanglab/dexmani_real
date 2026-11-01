@@ -5,6 +5,7 @@ import time
 
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.runtime.state import RunEndReason, SafetyState
+from dexmani_real.utils.log import attach_cleanup_errors
 
 logger = logging.getLogger(__name__)
 
@@ -89,10 +90,7 @@ class SensorWorkers:
                 logger.exception("worker %s shutdown failed", process.name)
         self.started = unresolved
         if errors:
-            setattr(errors[0], "cleanup_errors", [
-                *getattr(errors[0], "cleanup_errors", ()),
-                *(("sensor_shutdown", error) for error in errors[1:]),
-            ])
+            attach_cleanup_errors(errors[0], (("sensor_shutdown", error) for error in errors[1:]))
             raise errors[0]
 
 
@@ -117,5 +115,5 @@ def close_runtime(runtime_state, robot=None, *, sensors=None, keyboard=None):
             logger.exception("%s failed", stage)
     if errors:
         first = errors[0][1]
-        setattr(first, "cleanup_errors", [*getattr(first, "cleanup_errors", ()), *errors[1:]])
+        attach_cleanup_errors(first, errors[1:])
         raise first

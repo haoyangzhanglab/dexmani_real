@@ -22,7 +22,7 @@ from dexmani_real.runtime.observation import (
     read_observation,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState, device_failure_reason
-from dexmani_real.utils.log import error_detail
+from dexmani_real.utils.log import attach_cleanup_errors, error_detail
 from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -113,14 +113,15 @@ class TeleopLoop:
         self.robot.stop()
 
     def end_episode(
-        self, reason, *, run_end_reason=RunEndReason.OPERATOR,
+        self, reason, *, run_end_reason=RunEndReason.OPERATOR, primary_failure=None,
     ):
         failure = None
         try:
             self.stop_control(reason, run_end_reason=run_end_reason)
         except BaseException as exc:
             self.record_error("stop", exc)
-            failure = exc
+            failure = primary_failure if primary_failure is not None else exc
+            attach_cleanup_errors(failure, [("episode_stop", exc)])
         self.controller.clear()
 
         if self.soft_timeout_count:
@@ -136,7 +137,9 @@ class TeleopLoop:
             self.finish_recording()
         except BaseException as exc:
             self.record_error("recording_cleanup", exc)
-            failure = failure or exc
+            if failure is None:
+                failure = primary_failure if primary_failure is not None else exc
+            attach_cleanup_errors(failure, [("recording_cleanup", exc)])
         self.phase = TeleopPhase.IDLE
         self.run_id = None
         if failure is not None:
@@ -614,13 +617,12 @@ class TeleopLoop:
                     self.end_episode(
                         self.pending_termination_reason or "interrupted",
                         run_end_reason=RunEndReason.RUNTIME_SHUTDOWN,
+                        primary_failure=primary_failure,
                     )
             except BaseException as exc:
                 if primary_failure is None:
                     raise
-                setattr(primary_failure, "cleanup_errors", [
-                    *getattr(primary_failure, "cleanup_errors", ()), ("episode_cleanup", exc),
-                ])
+                attach_cleanup_errors(primary_failure, [("episode_cleanup", exc)])
                 logger.exception("teleop episode cleanup also failed")
             finally:
                 self.keyboard.discard_events("b", "h", "t")

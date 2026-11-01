@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dexmani_real.config.perception import DEPTH_RANGE_M
-from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.log import attach_cleanup_errors, configure_logging
 
 if TYPE_CHECKING:
     from dexmani_real.perception.pointcloud import PointCloudProcessor
@@ -46,9 +46,10 @@ class RealSenseViewer:
             original_error = sys.exc_info()[1]
             try:
                 self.camera.disconnect()
-            except BaseException:
+            except BaseException as exc:
                 if original_error is None:
                     raise
+                attach_cleanup_errors(original_error, [("camera_disconnect", exc)])
                 logger.exception("camera disconnect failed")
         return 0
 
@@ -147,16 +148,20 @@ class RealSenseViewer:
                 ))
         finally:
             original_error = sys.exc_info()[1]
-            cleanup_error = None
-            for resource in (cloud_viewer, image_viewer):
+            errors = []
+            for stage, resource in (
+                ("cloud_viewer_close", cloud_viewer), ("image_viewer_close", image_viewer),
+            ):
                 if resource is not None:
                     try:
                         resource.close()
                     except BaseException as exc:
                         logger.exception("preview window close failed")
-                        cleanup_error = cleanup_error or exc
-            if original_error is None and cleanup_error is not None:
-                raise cleanup_error
+                        errors.append((stage, exc))
+            if errors:
+                if original_error is None:
+                    raise attach_cleanup_errors(errors[0][1], errors[1:])
+                attach_cleanup_errors(original_error, errors)
 
 
 def main(argv=None) -> int:

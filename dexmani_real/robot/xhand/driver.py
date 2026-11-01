@@ -27,6 +27,7 @@ from dexmani_real.robot.model import (
     XHAND_TACTILE_SENSOR_FINGER_IDS,
 )
 from dexmani_real.robot.xhand.feedback import XHandState
+from dexmani_real.utils.log import attach_cleanup_errors
 
 logger = logging.getLogger(__name__)
 
@@ -193,9 +194,7 @@ class XHand:
             try:
                 self.disconnect()
             except BaseException as cleanup_error:
-                setattr(failure, "cleanup_errors", [
-                    *getattr(failure, "cleanup_errors", ()), ("hand_disconnect", cleanup_error),
-                ])
+                attach_cleanup_errors(failure, [("hand_disconnect", cleanup_error)])
                 logger.exception("XHand connection cleanup failed")
             raise
 
@@ -235,10 +234,7 @@ class XHand:
         finally:
             self.connected_flag = False
         if errors:
-            setattr(errors[0], "cleanup_errors", [
-                *getattr(errors[0], "cleanup_errors", ()),
-                *(("hand_disconnect", error) for error in errors[1:]),
-            ])
+            attach_cleanup_errors(errors[0], (("hand_disconnect", error) for error in errors[1:]))
             for error in errors[1:]:
                 logger.error("additional XHand disconnect failure", exc_info=(type(error), error, error.__traceback__))
             raise errors[0]

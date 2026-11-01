@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dexmani_real.utils.log import attach_cleanup_errors
+
 if TYPE_CHECKING:
     from dexmani_real.config.perception import PointCloudConfig
     from dexmani_real.sensor.realsense import RealSenseCamera
@@ -147,9 +149,10 @@ def run_pointcloud_diagnostic(args):
             original_error = sys.exc_info()[1]
             try:
                 preview.close()
-            except BaseException:
+            except BaseException as exc:
                 if original_error is None:
                     raise
+                attach_cleanup_errors(original_error, [("image_viewer_close", exc)])
                 logger.exception("RGB-D preview close also failed")
 
         intrinsics = camera.color_intrinsics
@@ -176,9 +179,10 @@ def run_pointcloud_diagnostic(args):
         original_error = sys.exc_info()[1]
         try:
             camera.disconnect()
-        except BaseException:
+        except BaseException as exc:
             if original_error is None:
                 raise
+            attach_cleanup_errors(original_error, [("camera_disconnect", exc)])
             logger.exception("camera disconnect also failed")
 
     # 采集全部结束且相机成功关闭后才创建静态点云窗口。
@@ -193,9 +197,10 @@ def run_pointcloud_diagnostic(args):
         original_error = sys.exc_info()[1]
         try:
             viewer.close()
-        except BaseException:
+        except BaseException as exc:
             if original_error is None:
                 raise
+            attach_cleanup_errors(original_error, [("cloud_viewer_close", exc)])
             logger.exception("point-cloud window close also failed")
     return 0
 

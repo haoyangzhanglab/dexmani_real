@@ -12,6 +12,7 @@ import numpy as np
 from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.geometry.pose import validate_rigid_transform
 from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
+from dexmani_real.utils.log import attach_cleanup_errors
 from dexmani_real.utils.timing import sampling_clock_ns
 
 if TYPE_CHECKING:
@@ -211,9 +212,7 @@ class _VideoWriter:
             if failure is None:
                 failure = exc
             else:
-                setattr(failure, "cleanup_errors", [
-                    *getattr(failure, "cleanup_errors", ()), ("video_container_close", exc),
-                ])
+                attach_cleanup_errors(failure, [("video_container_close", exc)])
         else:
             self.container = None
         if failure is not None:
@@ -372,7 +371,7 @@ class RawWriter:
         self.timing_rows = None
         if errors:
             first = errors[0][1]
-            setattr(first, "cleanup_errors", [*getattr(first, "cleanup_errors", ()), *errors[1:]])
+            attach_cleanup_errors(first, errors[1:])
             raise first
 
 
@@ -411,9 +410,7 @@ class RawReader:
             try:
                 self.close()
             except BaseException as cleanup:
-                setattr(error, "cleanup_errors", [
-                    *getattr(error, "cleanup_errors", ()), ("raw_reader_close", cleanup),
-                ])
+                attach_cleanup_errors(error, [("raw_reader_close", cleanup)])
             raise
 
     @property
@@ -509,7 +506,7 @@ class RawReader:
                     setattr(self, attribute, None)
         if errors:
             first = errors[0][1]
-            setattr(first, "cleanup_errors", [*getattr(first, "cleanup_errors", ()), *errors[1:]])
+            attach_cleanup_errors(first, errors[1:])
             raise first
 
     def __enter__(self):
@@ -521,6 +518,4 @@ class RawReader:
         except BaseException as cleanup:
             if error is None:
                 raise
-            setattr(error, "cleanup_errors", [
-                *getattr(error, "cleanup_errors", ()), ("raw_reader_close", cleanup),
-            ])
+            attach_cleanup_errors(error, [("raw_reader_close", cleanup)])

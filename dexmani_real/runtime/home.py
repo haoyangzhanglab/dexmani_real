@@ -14,6 +14,7 @@ from dexmani_real.config.xarm7 import (
 from dexmani_real.control.homing import HomePlanner, home_segment_timeout_s
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.runtime.state import SafetyState
+from dexmani_real.utils.log import attach_cleanup_errors
 from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.timing import sample_is_fresh
 
@@ -51,9 +52,7 @@ def _home_motion(state, robot):
                 state.request_emergency_stop()
             if failure is None:
                 raise
-            setattr(failure, "cleanup_errors", [
-                *getattr(failure, "cleanup_errors", ()), ("home_stop", exc),
-            ])
+            attach_cleanup_errors(failure, [("home_stop", exc)])
             logger.exception("HOME cleanup also failed")
 
 
