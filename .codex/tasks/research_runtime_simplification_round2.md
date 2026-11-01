@@ -1,6 +1,6 @@
 # DexMani Real 第二轮任务书：修正取消与提交时序，删除重复运行机制
 
-日期：2026-11-01。状态：**方案已确定，R0–R5 均待实施与验收**。
+日期：2026-11-01。状态：**R0–R5 实施与下述离线验证已完成；真机及真实模型验收待执行**。
 
 目标：面向个人真实机器人研究，让代码轻而薄、职责清楚、行为正确、容易使用和修改。本轮先修正已复现的时序问题，再删除没有独立职责的状态、等待和诊断工作；不建设新的运行平台。
 
@@ -265,26 +265,34 @@ with motion_lock:
 
 ## 9. 完成定义与提交要求
 
-- [ ] F1 采用同一共享锁串行化最终 set 与 clear，未引入第二套协议；实际 SDK stop 顺序有验证。
-- [ ] F2 使用 submit_end 作为已提交参考，零间隔不再获得虚构运动额度，未发送候选不推进状态。
-- [ ] F3 的软超时诊断为固定大小，并保留真实终止原因和必要失败详情。
-- [ ] 不再有模型启动观测时钟、真实节拍预热采样、双 episode 身份、SessionState.running/end_session、recorder.cancelled。
-- [ ] 不再有三个 sensor ready Event、键盘无输入 prepare、列明的重复健康遍历和序列去重。
-- [ ] 退出顺序可直接追踪，设备停止先于长时间回收；错误、pending、部分初始化与发布语义不退化。
-- [ ] 第 6 节明确保留的控制/数据契约未被顺手改写；没有新增通用 manager、heartbeat、lease、ACK 或配置开关。
-- [ ] 相关调用方、导入、提示和现有文档同步；所有新增临时文件/缓存/不必要兼容层已清理。
-- [ ] 验证证据填写在下表；未执行项明确标注，未达到真机验收不得写“全部验收通过”。
-- [ ] 最终报告包含实际删除的机制、可感知行为变化、命令与结果、剩余限制和提交/工作区状态。
+- [x] F1 采用同一共享锁串行化最终 set 与 clear，未引入第二套协议；生产 stop 方法的 SDK 调用顺序以替代 SDK 验证，物理停止待真机。
+- [x] F2 使用 submit_end 作为已提交参考，零间隔不再获得虚构运动额度，未发送候选不推进状态。
+- [x] F3 的软超时诊断为固定大小，并保留真实终止原因和必要失败详情。
+- [x] 不再有模型启动观测时钟、真实节拍预热采样、双 episode 身份、SessionState.running/end_session、recorder.cancelled。
+- [x] 不再有三个 sensor ready Event、键盘无输入 prepare、列明的重复健康遍历和序列去重。
+- [x] 退出顺序可直接追踪；离线验证覆盖停止先于长时间回收、错误、pending、部分初始化及发布语义，物理行为待真机。
+- [x] 第 6 节明确保留的控制/数据契约未被顺手改写；没有新增通用 manager、heartbeat、lease、ACK 或配置开关。
+- [x] 相关调用方、导入、提示和现有文档同步；仓库内没有新增临时 probe、测试框架或工具缓存。
+- [x] 验证证据填写在下表；未执行项明确标注，未达到真机验收不得写“全部验收通过”。
+- [x] 最终报告包含实际删除的机制、可感知行为变化、命令与结果、剩余限制和提交/工作区状态。
 
 按完整职责提交可审查的小批次改动；不需每改一个函数单独提交，也不得重写用户历史。本轮任务文件之外，不新建平行设计书或“最终报告”文件；实施记录就地补充本表即可。第一轮任务书保留历史，不重写其中证据来制造本轮已完成的印象。
 
 | 阶段 | 状态 | 实施后填写：变更 / 验证命令与关键结果 / 限制 |
 | --- | --- | --- |
-| R0 | 待实施 | — |
-| R1 | 待实施 | — |
-| R2 | 待实施 | — |
-| R3 | 待实施 | — |
-| R4 | 待实施 | — |
-| R5 | 待实施 | — |
+| R0 | 已完成 | 初始 HEAD=`891699269d64c67a649bdf0bf13b71ff23f2965c`，工作区干净；与审查基线 `fe807c3` 的差异仅为本任务书。阅读 AGENTS 和当前调用链后，用 `/tmp/dex_round2_baseline.py` 调用生产方法，真实 Value/RLock 下确定性重现 F1 的 epoch=2、stop=false；F2 的受限替代优化器反例为 6.493506 rad/s；F3 的 10,000 次求解晚到留下 10,000 条详情。无历史通过记录充当本轮证据。 |
+| R1 | 已实施，离线通过 | 共享代际锁内完成条件检查、代际更新和最终 set；两处锁内 clear 原本正确，核实后保留，没有重构它们或把 SDK 移入锁。commit 改用 submit_end，删除 nominal_dt/control_hz fallback。两条软超时路径只更新计数和最后标量摘要，结束仅汇总一次。`round2_control_probe.py` 覆盖 A1–A4、A5 的操作请求、B1–B4、C1–C2：生产 HOME/arm 恢复在 clear 中由屏障暂停，真实锁验证两个先后顺序、旧 epoch 拒绝及迟到收尾无副作用；持 generation/goal/status 锁时 SDK stop 替代调用仍先发生。tau=0/.02/.2、近限位及重复输入，提交边界反例降为 3.896103896 rad/s；相等时间不动、倒退失败，拒绝/取消/异常不推进手臂/EEF/时间参考。有/无 recorder 各 10,000 次求解晚到＋10,000 次复制晚到，详情不增长、solver 字典复制为零；后续成功保留摘要，终止保留详情，段结束重置。`round2_device_boundary_probe.py` 进一步用生产 Robot 组合发送验证 arm 已提交而 hand 抛错不 commit、保留 HARDWARE_FAULT、实际 stop 调用先于 writer finish；目标到期不 servo，SDK stop 失败不会报停机成功。`round2_hand_solver_probe.py` 使用真实 HandFK/NLopt，在三种 tau 下各 20 次标定重复帧求解通过。时序反例用替代优化器/目标函数，设备边界用替代 SDK；均不代表电机速度或停止延迟。 |
+| R2 | 已实施，离线通过 | Rollout 从创建至结束只持 epoch，以 started_ns 判断开始；删除所有 SessionState.running/end_session 和 recorder.cancelled 消费者。close_runtime 统一撤权至 DISARMED 后逐项关闭，PolicySession 随后关闭模型并共享原 deadline；段结束立即停止仍先于 Future/writer 等待。`round2_policy_probe.py` 覆盖 E1/E2：准备前、writer start 中、开始后取消的 epoch/duration/原因；重新 admission；迟到 Future 成功/失败与唯一所有权；runtime/model 同时关闭失败证据。`probe_round2_recorder.py` 覆盖 E3 主要路径：真实 HDF5＋AV 写入/关闭、3 行 RawReader 解码、真实 FK/点云/手模板的 13 字段 Zarr 导出、无动作行仍 NaN；open/append/finish/close 注入失败保留首因和 staging，16 队列满、有限 finish pending、迟到关闭仍 failed；视频/HDF5 双关闭失败、部分初始化及所有资源尝试关闭通过。真实 writer 管线已执行，外部故障注入与设备/模型用替代对象；未用 fake 格式库冒充数据集成。 |
+| R3 | 已实施，离线通过 | wait_model 仅服务必要健康、请求、单 Future 与超时；warmup 只校验/投影一次快照并复用其引用，不采真实历史节拍。核实 ObservationBuilder.features 仅由同一模型 worker 填充，主线程等待不修改，不另复制 RGB-D/点云。`round2_policy_probe.py` 的 D1–D3 部分：slow load/slow warmup、完成/异常/取消/超时/设备故障期间零观测组装；n_obs_steps=1/4 × 普通/RTC，真实 builder/Pinocchio/PolicyWorker/上游 warmup 和 torch.Generator，形状正确，普通2次/RTC4次替代 predict，RNG 恢复。三个 sensor ready Event 改为 ring 首个发布，started 只存 process；键盘首次运动键才 prepare，准备独占一轮。`round2_sensor_jog_probe.py` 覆盖 F1–F3：三类真实 spawn/SharedRing 的首帧、超时、取消、发帧前后退出；生产相机函数首帧前写完 metadata，static-only 不准入；生产 jog 无输入不准备/不 hold、准备后重读松键、运行松键 hold、拒绝需重按、停止/HOME 边界后再准备。真实 SDK、网络、键盘监听和模型权重未验。 |
+| R4 | 已实施，离线通过 | Robot.read_state 只检查 owner/连接并消费缓存，arm.snapshot 保留设备错误；service 保留外部健康，删除紧邻的重复遍历。HOME 回调先检查故障再判断取消；Rollout 用内层取消检查和外层统一错误边界，防止取消吞故障，没有新增健康状态。删除点云 read 后重复序列判断，VR 标定只按递增且新鲜 recv_ts_ns 去重，删除 VR 业务 ring_sequence，保留相机/SDK/来源序列。`probe_round2_health.py` 验证 replay 与两种 HOME 的同时取消＋SDK 故障；policy probe 验证纯取消、同刻 SDK/worker 故障和 stop 失败。sensor probe 使用实际 PointCloudProcessor 验证同帧只处理一次、RGB-D/点云同源，生产 calibrate_hand 跳过重复/倒退 stamp 且保留 sequence_id。缓存读取无服务遍历及 snapshot 故障透明由 recorder probe 验证。静态逐一审计 teleop/policy/jog/replay/HOME/初始化 service 调用；具体硬件路径仍待设备验收。 |
+| R5 | 已完成本轮离线验收和文档 | README、hand_retargeting 与本表同步。`probe_round2_modes.py` 使用生产 Rollout/Robot/ObservationBuilder/ActionMapper/PolicyWorker，替代模型与 SDK，验证 sync/async/RTC 的真实节拍历史、首预测 reset、新执行快照、有效尾部、RTC 前缀/交接当槽映射、跳槽/耗尽及 Future 归属。18 个修改 Python 文件 AST/compile/import、6 个入口 --help、collect_teleop/run_policy --print-config JSON、ruff F/E9、mypy 默认检查及 git diff --check 通过；mypy 未覆盖无注解函数体。额外 Ruff ALL 试跑未通过，包含大量存量文档/标注/复杂度规则，以及本轮新摘要函数未注解/无 docstring、中文标点等风格项；不扩展为全仓风格整改，不称全规则通过。最终 diff 无训练时间网格/arm IPC 重写/schema/dexmani_policy 改动，无新增依赖、manager 或配置开关。初版诊断 probe 时钟未固定导致走错分支，改用确定性时钟后重跑通过；初版导出合成内参令真实离群滤波输出空云，修正测试内参后完整管线通过，生产算法未改。真机与真实模型待验范围见下文。 |
+
+本轮验证环境：`/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`，Python 3.10.20、NumPy 1.26.4，已有 SciPy、Pinocchio、NLopt、Ruckig、PyTorch、h5py、AV、Zarr；未安装新依赖。上表所有 probe 实际命令均为 `PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python /tmp/<文件名>`，标准输出和预期注入失败的 traceback 留在对应 `/tmp/<文件名>.log`（基线重现输出记录于本表）。临时 probe 只在仓库外，不是后续运行依赖。
+
+静态命令：`PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/tmp/dexmani_round2_mpl /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python /tmp/round2_static_checks.py`；该脚本对本轮修改的18个 Python 文件做 AST、compile、import，并实际执行上述 CLI。ruff 使用 `python -m ruff check --no-cache --select F,E9 <修改文件>`，mypy 使用 `python -m mypy --cache-dir /tmp/round2-mypy --follow-imports=silent --ignore-missing-imports <修改文件>`。没有运行 pytest，没有新建根 tests 树，没有仓库内 mypy/pytest/ruff 缓存。
+
+本轮尚未执行：真实机器人取消/急停与恢复、停止延迟、手部发送时序及实际跟踪、HOME 路径/收敛、实际 sensor 来源过期与复制竞争压力、真实键盘监听/VR 网络、带权重的三模式推理及 GPU 预热性能、真实采集负载下长时录制/退出。离线的 SDK/模型替代与源码审计不算这些项目通过。SharedRing 的奇偶标记/复制复核及 HOME 必要收敛实现未改；没有将首帧条件当作持续健康或 freshness。
+
+代码按完整职责提交为 `c28e9c7`（撤权、提交时序及有界诊断）和 `9f13b6c`（状态、启动、传感器、健康检查及收尾简化）；本实施记录另行提交。最终跨入口检查在这些代码的最终版本执行，额外覆盖补充 stop 错误为 KeyboardInterrupt 时先急停再回收 Future，保留原主因。
 
 验收的最终问题是：同一个事实是否只维护一次，控制流是否更容易读懂，删掉的机制是否真的没有留下同义替代，以及真实设备/数据边界是否仍能正确报告失败。
