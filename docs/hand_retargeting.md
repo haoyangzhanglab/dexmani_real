@@ -22,7 +22,7 @@
 
 右手输入为米制、HTS 原始 21 点：wrist=0；拇指 CMC/MCP/IP/TIP=1/2/3/4；四指 MCP/PIP/DIP/TIP=5–8、9–12、13–16、17–20。接收端将 Unity 左手 XYZ 转为 FLU `(z,-x,y)`。掌系由 wrist→middle MCP 与 pinky MCP→index MCP 确定：+X 掌侧、+Y 拇指侧、+Z 中指侧，不逐指配准。
 
-启动采集 25 个新鲜且来源时间递增的有效样本，固定 15 段骨长和掌宽的中位数；不要求平手，不从弯曲前缀估计零关节角。有效骨长范围 2–180 mm，标定稳定性要求相对 MAD≤10%；单个历史离群值不再按最大偏差否决稳定标定。运行帧相对标定骨长变化仍须≤35%，异常帧不能用于重定向，也不推进提交参考。新录制的 `meta.hand_retargeting_calibration_json` 保存 `sample_count`、`human_bone_lengths_m`（5×3，米）及 `human_palm_width_m`（米）；`sample_count` 是实际收集数量，不代表全部为 inlier。
+启动采集 25 个新鲜且来源时间递增的有效样本，固定 15 段骨长和掌宽的中位数；不要求平手，不从弯曲前缀估计零关节角。有效骨长范围 2–180 mm，`calibration_max_relative_mad` 控制标定样本的统计稳定性，默认要求相对 MAD≤10%；单个历史离群值不再按最大偏差否决稳定标定。`bone_length_tolerance` 控制运行帧相对标定骨长的偏差，默认须≤35%，异常帧不能用于重定向，也不推进提交参考。两个门限分别要求有限且位于 `(0, 1)`，不要求大小排序。新录制的 `meta.hand_retargeting_calibration_json` 保存 `sample_count`、`human_bone_lengths_m`（5×3，米）及 `human_palm_width_m`（米）；`sample_count` 是实际收集数量，不代表全部为 inlier。
 
 每个候选帧先完成掌系与骨长校验，无效时继续采样；通过后只保留已算出的 16 项测量，最终直接求 median/MAD，不再次准备原始帧。URDF 的中立骨段、掌宽、拇指基点与圆轨迹半径在重定向对象构造时固定，逐帧映射复用这些几何量。
 

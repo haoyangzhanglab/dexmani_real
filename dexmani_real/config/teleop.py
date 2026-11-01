@@ -78,8 +78,12 @@ class HandRetargetingConfig:
             value = getattr(self, name)
             if type(value) is not int or value < 2:
                 raise ValueError(f"hand_retargeting.{name} must be an integer >= 2")
+        for name in ("calibration_max_relative_mad", "bone_length_tolerance"):
+            value = getattr(self, name)
+            if not np.isfinite(value) or not 0 < value < 1:
+                raise ValueError(f"hand_retargeting.{name} must be finite and in (0, 1)")
         for name in (
-            "calibration_timeout_s", "calibration_max_relative_mad", "bone_length_tolerance",
+            "calibration_timeout_s",
             "huber_delta_m", "direction_huber_delta", "pinch_start_m", "pinch_full_m",
             "max_joint_speed_rad_s", "max_solve_time_s", "ftol_abs",
         ):
@@ -95,8 +99,6 @@ class HandRetargetingConfig:
                 raise ValueError(f"hand_retargeting.{name} must be finite and non-negative")
         if not 0 < self.pinch_full_m < self.pinch_start_m:
             raise ValueError("pinch distances must satisfy 0 < full < start")
-        if not 0 < self.calibration_max_relative_mad < self.bone_length_tolerance < 1:
-            raise ValueError("calibration MAD and bone tolerance must satisfy 0 < MAD < tolerance < 1")
 
 
 DEFAULT_TASK_NAME = "test"
