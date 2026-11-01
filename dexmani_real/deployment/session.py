@@ -103,6 +103,7 @@ class PolicySession:
             else:
                 print("就绪：H 回初始位 → B 开始 | S 保存本轮 | D 丢弃本轮 | Q 保存退出 | Esc 急停 | T 复位触觉。", flush=True)
                 self.run_control_loop()
+                self.robot.check()
         except KeyboardInterrupt as exc:
             failure = exc
             if self.runtime_state is not None:
