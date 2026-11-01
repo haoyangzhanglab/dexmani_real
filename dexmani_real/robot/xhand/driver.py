@@ -264,7 +264,7 @@ class XHand:
             raise XHandError("ethercat INIT", int(error.error_code), "INIT request failed")
         time.sleep(0.2)
 
-    def reset_tactile_sensors(self, *, cancel_requested=lambda: False) -> bool:
+    def reset_tactile_sensors(self, *, cancel_requested=lambda: False) -> None:
         """仅在静止、卸载时复位；SDK 成功不等于固件零点已生效。"""
         if self.control is None or not self.connected_flag:
             raise RuntimeError("XHand is not connected")
@@ -294,17 +294,12 @@ class XHand:
                 result["hand_tactile_reset_result"] = (
                     f"failed ({completed}/5), sensor=0x{sensor_id:02x}, code={code}"
                 )
-                logger.warning(
-                    "触觉复位调用失败：sensor=0x%02x，code=%s，已完成 %d/5 次：%s",
-                    sensor_id,
-                    code,
-                    completed,
+                raise XHandError(
+                    f"tactile reset sensor=0x{sensor_id:02x} ({completed}/5 completed)", code,
                     reply.error_message,
                 )
-                return False
             result["hand_tactile_reset_result"] = f"sdk_completed ({completed + 1}/5)"
         logger.info("五指触觉复位请求的 SDK 调用完成（5/5），未确认固件复位或零点效果。")
-        return True
 
     def get_tactile_reset_metadata(self) -> dict[str, object]:
         return {

@@ -6,13 +6,13 @@ from contextlib import contextmanager
 
 import numpy as np
 
+from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.config.xarm7 import (
     EXECUTOR_TIMEOUT_S,
     HOME_CONVERGENCE_TIMEOUT_S,
 )
-from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.control.homing import HomePlanner, home_segment_timeout_s
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.runtime.state import SafetyState
 from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.timing import sample_is_fresh
@@ -59,9 +59,9 @@ def _home_motion(state, robot):
 
 
 def home_robot(state, robot, get_planner, *, run_id, cancel_requested):
+    """固定身份贯穿回零；cancel_requested 同时服务故障与操作者输入。"""
     # send_hand_home 自己完成整机停止边界，arm HOME 由 owner 停稳准备。
     home_hand(state, robot, run_id=run_id, cancel_requested=cancel_requested)
-    robot.check()
     if cancel_requested() or not state.can_move(
         run_id=run_id, required_safety_state=SafetyState.ARMED,
     ):
@@ -86,14 +86,9 @@ def initialize_hand(state, robot, *, run_id, required_tactile, cancel_requested)
             run_id=run_id, required_safety_state=SafetyState.ARMED,
         )
 
-    if cancelled():
-        raise OperationCancelled("hand initialization interrupted")
-    if not robot.reset_tactile_sensors(
+    robot.reset_tactile_sensors(
         run_id=run_id, cancel_requested=cancelled, required_tactile=required_tactile,
-    ):
-        raise RobotError("tactile reset request failed")
-    if cancelled():
-        raise OperationCancelled("hand initialization interrupted")
+    )
     logger.info("触觉复位请求已完成，所需通道反馈已就绪。")
 
 

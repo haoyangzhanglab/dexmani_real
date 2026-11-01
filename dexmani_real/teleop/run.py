@@ -158,11 +158,7 @@ def run_teleop(
                 camera_calibration_path,
             )
         robot.check()
-        with runtime_state.motion_lock:
-            if runtime_state.stop_signal.is_set() or not runtime_state.requests_allow_motion():
-                raise OperationCancelled("startup cancelled before arming")
-            runtime_state.arm()
-            startup_run_id = runtime_state.run_id
+        startup_run_id = runtime_state.arm()
         if initialize_teleop(
             loop, ctx.Process(name="vr", target=run_vr, args=(channels, runtime.vr)),
             run_id=startup_run_id,

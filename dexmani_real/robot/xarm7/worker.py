@@ -352,6 +352,7 @@ class ArmController:
                 self.fault(exc)
             else:
                 logger.warning("arm operation ended: %s", exc)
+                self.io.closing.set()
                 self.io.stop.set()
         finally:
             self.io.ready.set()

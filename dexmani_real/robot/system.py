@@ -148,10 +148,10 @@ class Robot:
         self.reset_hand_feedback(deadline_ns=deadline_ns)
         self.read_initial_state(run_id, cancel_requested=cancelled)
 
-    def reset_tactile_sensors(self, *, run_id, cancel_requested, required_tactile=()):
+    def reset_tactile_sensors(self, *, run_id, cancel_requested, required_tactile=()) -> None:
         self.check()
         if self.hand is None:
-            return False
+            raise RobotError("XHand unavailable for tactile reset")
 
         def cancelled():
             self.check()
@@ -165,16 +165,14 @@ class Robot:
             raise OperationCancelled("tactile reset cancelled before stopping")
         self.stop()
         try:
-            reset = self.hand.reset_tactile_sensors(cancel_requested=cancelled)
+            self.hand.reset_tactile_sensors(cancel_requested=cancelled)
         finally:
             self.reset_hand_feedback()
-        if reset:
-            self.read_initial_state(
-                run_id, required_tactile=required_tactile, cancel_requested=cancelled,
-            )
+        self.read_initial_state(
+            run_id, required_tactile=required_tactile, cancel_requested=cancelled,
+        )
         if cancelled():
             raise OperationCancelled("tactile reset cancelled")
-        return reset
 
     def reset_hand_feedback(self, *, deadline_ns=None):
         self.check_owner()

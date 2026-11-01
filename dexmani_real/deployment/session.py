@@ -42,12 +42,12 @@ MODEL_STARTUP_TIMEOUT_S = 300.0
 class PolicySession:
     def __init__(
         self, runtime, info, *, output_dir, run_config, device, seed,
-        max_running_s, num_episodes, record_raw, camera_calibration_path, table_plane_abcd,
+        max_running_s, num_episodes, record_raw, camera_calibration_path,
         observations,
     ):
         self.run_config = run_config
         self.runtime, self.info = runtime, info
-        self.table_plane_abcd = table_plane_abcd
+        self.table_plane_abcd = None
         self.home_planner = None
         self.device, self.seed = device, seed
         self.max_running_s, self.num_episodes = max_running_s, num_episodes
@@ -222,11 +222,7 @@ class PolicySession:
             self.sensors.shutdown()
             self.sensors.channels = None
         self.robot.check()
-        with self.runtime_state.motion_lock:
-            if self.runtime_state.stop_signal.is_set() or not self.runtime_state.requests_allow_motion():
-                raise OperationCancelled("startup cancelled before arming")
-            self.runtime_state.arm()
-            startup_run_id = self.runtime_state.run_id
+        startup_run_id = self.runtime_state.arm()
         initialize_hand(
             self.runtime_state, self.robot, run_id=startup_run_id,
             required_tactile=needs.required_tactile,
@@ -368,6 +364,9 @@ class PolicySession:
                 if self.run_home(event.run_id):
                     return
             elif signal == "t":
+                if not self.runtime.hand.enabled:
+                    logger.info("T ignored: hand is disabled")
+                    continue
                 if preparation_blocked:
                     continue
                 preparation_blocked = True
@@ -401,7 +400,7 @@ class PolicySession:
             if home_allowed:
                 self.start_epoch = None
         if not home_allowed:
-            logger.warning("operator: ignored H unless ARMED without shutdown, fault or stop")
+            logger.warning("operator: ignored H unless ARMED with a current intent and no active episode")
             return False
         logger.info("正在回初始位…")
         try:

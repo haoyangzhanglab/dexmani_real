@@ -92,10 +92,7 @@ class KeyboardTeleop:
         self.robot.check_services = lambda: self.keys.check_health()
         self.robot.connect()
         self.robot.check()
-        with self.runtime_state.motion_lock:
-            if self.runtime_state.stop_signal.is_set() or not self.runtime_state.requests_allow_motion():
-                raise OperationCancelled("startup cancelled before arming")
-            self.runtime_state.arm()
+        self.runtime_state.arm()
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         print(
             "The first jog input prepares motion; release jog keys while running to brake and hold. "

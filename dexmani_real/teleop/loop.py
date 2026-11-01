@@ -301,6 +301,9 @@ class TeleopLoop:
                     failed=False,
                 )
         elif cmd == "t":
+            if not self.runtime.hand.enabled:
+                logger.info("T ignored: hand is disabled")
+                return False
             if (
                 self.phase is not TeleopPhase.IDLE or self.recorder is not None
                 or not self.runtime_state.can_move(

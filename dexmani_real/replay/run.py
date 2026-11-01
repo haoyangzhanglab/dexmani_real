@@ -70,11 +70,7 @@ def run_replay(
         robot.check_services = lambda: keyboard.check_health()
         robot.connect()
         robot.check()
-        with runtime_state.motion_lock:
-            if runtime_state.stop_signal.is_set() or not runtime_state.requests_allow_motion():
-                raise OperationCancelled("startup cancelled before arming")
-            runtime_state.arm()
-            run_id = runtime_state.run_id
+        run_id = runtime_state.arm()
         outcome = JointReplay(runtime_state, runtime, keyboard, robot=robot).run(
             trajectory, run_id=run_id, hand_start_duration_s=hand_start_duration_s,
         )

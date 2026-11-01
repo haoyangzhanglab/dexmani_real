@@ -56,15 +56,13 @@ class ArmProcess:
 
         def check_startup():
             # 故障也会设置 stop；仅无故障的退出可以按操作者取消处理。
-            if self.io.fault.value or self.io.close_error.value:
-                self.check_error()
-            if not self.io.fault.value and (
+            self.check_error()
+            if (
                 self.io.run_id.value != run_id
                 or self.io.stop.is_set()
                 or self.io.emergency.is_set()
             ):
                 raise OperationCancelled("arm startup cancelled")
-            self.check_error()
             if check_services is not None and not check_services():
                 raise RobotError("runtime service unavailable during arm startup")
 
@@ -167,7 +165,6 @@ class ArmProcess:
                     *getattr(failure, "cleanup_errors", ()),
                     ("arm_operation_cleanup", cleanup_error),
                 ])
-                raise failure from cleanup_error
             raise
 
     def begin_operation(self, run_id):

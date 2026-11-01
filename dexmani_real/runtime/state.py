@@ -11,7 +11,7 @@ from enum import IntEnum
 from multiprocessing.sharedctypes import Synchronized
 from multiprocessing.synchronize import Event
 
-from dexmani_real.robot.commands import RobotError
+from dexmani_real.robot.commands import OperationCancelled, RobotError
 
 
 class SafetyState(IntEnum):
@@ -72,11 +72,12 @@ class SessionState:
             and not self.quit_requested
         )
 
-    def arm(self) -> None:
+    def arm(self) -> int:
         with self.motion_lock:
-            if not self.requests_allow_motion():
-                raise RuntimeError("arming rejected")
+            if self.stop_signal.is_set() or not self.requests_allow_motion():
+                raise OperationCancelled("startup cancelled before arming")
             self.revoke_motion()
+            return self.run_id
 
     def begin_motion(self) -> int | None:
         with self.motion_lock:

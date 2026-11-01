@@ -116,7 +116,6 @@ def run_policy(
         record_raw=record_raw,
         output_dir=session_dir,
         camera_calibration_path=camera_calibration_path,
-        table_plane_abcd=None,
         run_config=payload,
         observations=observations,
     ).run()
