@@ -35,7 +35,7 @@ from dexmani_real.runtime.observation import (
     read_observation,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState, device_failure_reason
-from dexmani_real.utils.log import error_detail
+from dexmani_real.utils.log import attach_cleanup_errors, error_detail
 
 if TYPE_CHECKING:
     from dexmani_real.deployment.observation import PolicyObservationRow
@@ -209,13 +209,14 @@ class Rollout:
                     if isinstance(stop_error, KeyboardInterrupt):
                         self.runtime_state.request_emergency_stop()
                     self.result.errors.append(error_detail("stop", stop_error))
+                    attach_cleanup_errors(exc, [("stop", stop_error)])
                     logger.exception("episode stop also failed")
             else:
                 self.result.errors.append(error_detail("stop", exc))
             raise
         finally:
-            primary_failure = sys.exc_info()[0] is not None
-            cleanup_failure = None
+            primary_failure = sys.exc_info()[1]
+            failure = primary_failure
             deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
             # 模型回收失败必须先进入本段结果，Raw 才能保存正确的结束状态。
             # stop() 已撤权；两项收尾共用 deadline，不持 motion_lock。
@@ -226,7 +227,10 @@ class Rollout:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
                 self.result.errors.append(error_detail("retired_model", exc))
-                cleanup_failure = exc
+                if failure is None:
+                    failure = exc
+                else:
+                    attach_cleanup_errors(failure, [("retired_model", exc)])
             finally:
                 try:
                     self.finish_recording(deadline=deadline)
@@ -234,12 +238,15 @@ class Rollout:
                     logger.exception("episode recording finalization failed")
                     if isinstance(exc, KeyboardInterrupt):
                         self.runtime_state.request_emergency_stop()
-                    cleanup_failure = cleanup_failure or exc
+                    if failure is None:
+                        failure = exc
+                    else:
+                        attach_cleanup_errors(failure, [("recorder_finalize", exc)])
             if not self.model.has_pending_task:
                 self.query = None
             keyboard.discard_events("b", "h", "t")
-            if cleanup_failure is not None and not primary_failure:
-                raise cleanup_failure
+            if failure is not None and primary_failure is None:
+                raise failure
         return self.result
 
     def preparation_valid(self):
@@ -498,5 +505,6 @@ class Rollout:
             except BaseException as exc:
                 if primary_error is None:
                     raise
+                attach_cleanup_errors(primary_error, [("recording", exc)])
                 self.result.errors.append(error_detail("recording", exc))
                 logger.exception("episode frame recording also failed")

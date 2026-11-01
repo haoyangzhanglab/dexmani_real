@@ -32,7 +32,11 @@ from dexmani_real.runtime.observation import (
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.io import write_json, write_yaml
-from dexmani_real.utils.log import attach_cleanup_errors, configure_logging, error_detail
+from dexmani_real.utils.log import (
+    attach_cleanup_errors,
+    configure_logging,
+    error_detail,
+)
 from dexmani_real.utils.table_plane import load_table_plane, resolve_table_plane_path
 
 logger = logging.getLogger(__name__)
@@ -103,6 +107,7 @@ class PolicySession:
             else:
                 print("就绪：H 回初始位 → B 开始 | S 保存本轮 | D 丢弃本轮 | Q 保存退出 | Esc 急停 | T 复位触觉。", flush=True)
                 self.run_control_loop()
+                self.robot.check()
         except KeyboardInterrupt as exc:
             failure = exc
             if self.runtime_state is not None:
@@ -233,25 +238,24 @@ class PolicySession:
 
     def close(self, *, failure=None):
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
-        cleanup_errors = []
-        runtime_failure = None
+        close_errors = []
+        model_errors = []
         try:
             if self.runtime_state is not None:
                 close_runtime(
                     self.runtime_state, self.robot, sensors=self.sensors, keyboard=self.keyboard,
                 )
         except BaseException as exc:
-            runtime_failure = exc
+            close_errors.append(("shutdown", exc))
         model_status = "completed"
         if self.model is not None:
             try:
                 self.model.close()
             except BaseException as exc:
                 model_status = "failed"
-                cleanup_errors.append(error_detail("model_close", exc))
+                close_errors.append(("model_close", exc))
             else:
-                model_status, errors = self.model.wait_closed(deadline - time.monotonic())
-                cleanup_errors.extend(errors)
+                model_status, model_errors = self.model.wait_closed(deadline - time.monotonic())
         writer_pending = self.episode is not None and self.episode.writer_pending
         robot_pending = self.robot is not None and (
             self.robot.arm is not None or self.robot.hand is not None
@@ -260,25 +264,29 @@ class PolicySession:
         pending = any((model_status == "pending", writer_pending, robot_pending, sensor_pending))
         shutdown = (
             "pending" if pending else "completed"
-            if model_status == "completed" and runtime_failure is None and not cleanup_errors else "failed"
+            if model_status == "completed" and not close_errors and not model_errors else "failed"
         )
+        failure_detail = None
         if failure is not None:
-            if runtime_failure is not None:
-                attach_cleanup_errors(failure, [("shutdown", runtime_failure)])
-            self.errors.append(error_detail("session", failure))
-        elif runtime_failure is not None:
-            self.errors.append(error_detail("shutdown", runtime_failure))
-        self.errors.extend(cleanup_errors)
+            attach_cleanup_errors(failure, close_errors)
+            failure_detail = error_detail("session", failure)
+        elif close_errors:
+            stage, first = close_errors[0]
+            attach_cleanup_errors(first, close_errors[1:])
+            failure_detail = error_detail(stage, first)
+        if failure_detail is not None:
+            self.errors.append(failure_detail)
+        self.errors.extend(model_errors)
         episode_error = next((error for result in self.episodes for error in result.errors), None)
         successful = (
-            failure is None and not self.errors and shutdown == "completed"
+            not self.errors and shutdown == "completed"
             and episode_error is None
             and self.runtime_state is not None and self.runtime_state.quit_requested
             and not self.runtime_state.estop_request and not self.runtime_state.error_state
         )
         reason = self.summary["reason"]
-        if failure is not None:
-            reason = error_detail("session", failure)["message"] or type(failure).__name__
+        if failure_detail is not None:
+            reason = failure_detail["message"] or failure_detail["exception_type"]
         elif self.errors:
             reason = self.errors[0]["message"]
         elif episode_error is not None:

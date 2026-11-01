@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Iterable
 
 CONSOLE_FORMATTER = logging.Formatter(
     "[%(asctime)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S"
@@ -20,9 +21,11 @@ def configure_logging() -> None:
     logger.propagate = False
 
 
-def attach_cleanup_errors(error, errors):
+def attach_cleanup_errors(
+    error: BaseException, errors: Iterable[tuple[str, BaseException]],
+) -> BaseException:
     """按对象及 cause 关系附加后续错误，保留主错，避免重复和反向引用。"""
-    def related_ids(root):
+    def related_ids(root: BaseException) -> set[int]:
         pending, seen = [root], set()
         while pending:
             current = pending.pop()
@@ -42,11 +45,11 @@ def attach_cleanup_errors(error, errors):
         additions.append((stage, detail))
         known.update(related_ids(detail))
     if additions:
-        error.cleanup_errors = [*getattr(error, "cleanup_errors", ()), *additions]
+        setattr(error, "cleanup_errors", [*getattr(error, "cleanup_errors", ()), *additions])
     return error
 
 
-def error_detail(stage, error):
+def error_detail(stage: str, error: BaseException) -> dict[str, str]:
     message = str(error)
     if error.__cause__ is not None:
         cause = error.__cause__

@@ -164,6 +164,7 @@ def run_teleop(
             run_id=startup_run_id,
         ):
             loop.run()
+        robot.check()
         clean = bool(runtime_state.quit_requested)
     except KeyboardInterrupt:
         runtime_state.request_emergency_stop()

@@ -22,6 +22,7 @@ from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
 from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.perception.hand_cloud import hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
+from dexmani_real.utils.log import attach_cleanup_errors
 from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.visualization.rerun import (
     episode_blueprint,
@@ -278,9 +279,7 @@ class EpisodeVisualizer:
                 if failure is None:
                     failure = exc
                 else:
-                    setattr(failure, "cleanup_errors", [
-                        *getattr(failure, "cleanup_errors", ()), (stage, exc),
-                    ])
+                    attach_cleanup_errors(failure, [(stage, exc)])
             else:
                 setattr(self, attribute, None)
         if failure is not None and error is None:

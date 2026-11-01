@@ -26,7 +26,6 @@ from dexmani_real.runtime.observation import (
     read_observation,
 )
 from dexmani_real.runtime.state import RunEndReason, device_failure_reason
-from dexmani_real.utils.log import error_detail
 from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -45,7 +44,7 @@ class ReplayResult:
     status: ReplayStatus
     replay_data: dict[str, np.ndarray] = field(default_factory=lambda: ReplayBuffer(0).to_dict())
     reason: str = ""
-    cleanup_errors: list[BaseException] = field(default_factory=list)
+    errors: list[BaseException] = field(default_factory=list)
 
     @property
     def successful(self) -> bool:
@@ -100,7 +99,7 @@ class JointReplay:
             self.runtime_state.mark_error()
             logger.exception("replay failed")
             result.status = ReplayStatus.FAULT
-            result.reason = error_detail("replay", exc)["message"]
+            result.errors.append(exc)
             run_end_reason = device_failure_reason(exc) or RunEndReason.RUNTIME_FAILURE
         finally:
             if result.status == ReplayStatus.USER_QUIT:
@@ -115,7 +114,7 @@ class JointReplay:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
                 logger.exception("replay stop failed")
-                result.cleanup_errors.append(exc)
+                result.errors.append(exc)
                 result.status = ReplayStatus.FAULT
         result.replay_data = self.capture.to_dict()
         return result

@@ -65,7 +65,7 @@ python scripts/keyboard_teleop.py
 
 取消入口先快速通知 stop，再在现有共享代际锁内更新代际并最终 set stop；设备显式准备/HOME 在同一锁内核对代际并 clear。B/H/R/T 入队时绑定现有代际，准入后固定身份贯穿准备、规划、手/臂 HOME 和触觉等待；停止前排队的旧意图不能重新获权，停止后的新意图仍可显式准备。持续 jog 保留当前按键快照语义。旧段迟到收尾不能取消新段；共享锁内不做 SDK I/O。正常取消不冒充硬件故障，正在关闭的对象不能复用；真实故障或附带停止/清理失败的取消仍按失败结束。最终退出由 `close_runtime` 顺序撤权、关闭机器人、键盘及传感器，再回收模型；各资源关闭失败仍尝试后续资源并保留错误。段结束的立即停止仍先于 writer flush 和预测回收；recorder START 只启动和报错，首次 finish 建立唯一等待预算并决定发布。遥操作手部参考以正常发送返回的 `submit_end_ns` 推进，软超时仅保存固定大小摘要，详见 [手部重定向](docs/hand_retargeting.md)。
 
-arm owner 产生真实故障并在 SDK 调用处保留 traceback；启动停稳、反馈或初始化预算耗尽按失败报告。`ready` 只结束启动等待，父进程先检查 fault/close_error，再按实际停止或代际撤销判断取消。普通目标到期和 HOME/prepare 自身期限仍结束当前意图，不自动变成永久 fault。`ArmProcess.close` 在 join 后检查最终 fault、close_error、退出码及停止确认；Robot 继续关闭其他设备，`close_runtime` 继续关闭其余资源。各会话在清理结束后才决定退出码和结果；晚到故障不能被 Q 或启动取消覆盖，已退出资源释放引用，未完成关闭的资源保留句柄并如实报告 pending。异常聚合保留原主错及独立后续错误，按对象与 cause 关系避免自引用和重复，不按文本去重。
+arm owner 产生真实故障并在 SDK 调用处保留 traceback；启动停稳、反馈或初始化预算耗尽按失败报告。`ready` 只结束启动等待，父进程先检查 fault/close_error，再按实际停止或代际撤销判断取消。普通目标到期和 HOME/prepare 自身期限仍结束当前意图，不自动变成永久 fault。退出前的 `Robot.check` 仍检查键盘和必需传感服务健康；`ArmProcess.close` 在 join 后检查最终 fault、close_error、退出码及停止确认，两者职责不同。Robot 继续关闭其他设备，`close_runtime` 继续关闭其余资源。各会话在清理结束后才决定退出码和结果，晚到故障不能被 Q 或启动取消覆盖；已退出资源释放引用，未完成关闭的资源保留句柄。Policy 的结果文件按仍保留的设备、传感进程、模型及 writer 报告 pending；键盘回调禁用后仍允许 backend 线程继续退出。异常聚合保留原主错及独立后续错误，按对象与 cause 关系避免自引用和重复，不按文本去重；回放的异常也保留到最终报告出口再生成诊断。
 
 `session_result.json` 保存会话 outcome/reason/shutdown、错误及 episodes 原始结果，包括每段主因、补充清理错误、时长、跳步及 Raw 结果；段数和终止原因计数由 episodes 计算，不重复持久化。时长完成、预测超时、操作者结束、目标准入和设备故障分别分类。已进入 RUNNING 的段计入 `--num-episodes`，准备失败或取消不计。会话正常结束不代表任务成功率。未消费的退休预测报错会终止会话，不回写已封存 Raw。
 

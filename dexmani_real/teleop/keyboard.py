@@ -1,6 +1,7 @@
 """键盘笛卡尔点动与回零。"""
 
 import logging
+import sys
 import time
 
 from dexmani_real.config.control import HomeConfigurationError
@@ -18,7 +19,7 @@ from dexmani_real.runtime.preflight import (
     validate_robot_config,
 )
 from dexmani_real.runtime.state import RunEndReason, SessionState, device_failure_reason
-from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.log import attach_cleanup_errors, configure_logging
 from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class KeyboardTeleop:
             try:
                 self.start()
                 clean = self.run_control_loop()
+                self.robot.check()
             except OperationCancelled as exc:
                 self.robot.check(operation_error=exc)
                 logger.info("Keyboard teleop cancelled: %s", exc)
@@ -66,9 +68,12 @@ class KeyboardTeleop:
             )
             raise
         finally:
+            failure = sys.exc_info()[1]
             try:
                 close_runtime(self.runtime_state, self.robot, keyboard=self.keys)
-            except BaseException:
+            except BaseException as exc:
+                if failure is not None:
+                    attach_cleanup_errors(failure, [("shutdown", exc)])
                 logger.exception("keyboard runtime cleanup failed")
             else:
                 shutdown_clean = True

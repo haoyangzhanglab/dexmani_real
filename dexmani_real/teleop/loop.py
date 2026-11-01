@@ -488,6 +488,7 @@ class TeleopLoop:
             except BaseException as exc:
                 if primary_error is None:
                     raise
+                attach_cleanup_errors(primary_error, [("recording_frame", exc)])
                 self.termination_details.append(error_detail("recording_frame", exc))
                 logger.exception("teleop frame recording also failed")
 
@@ -541,8 +542,7 @@ class TeleopLoop:
 
     def close(self):
         if self.recorder is not None and self.recorder.finish_request is not None:
-            if self.recorder.writer_pending:
-                raise RecordingError("recording worker has not exited; capture remains unpublished")
+            self.recorder.check_error()
             return
         if self.phase is not TeleopPhase.IDLE or self.recorder is not None:
             self.end_episode(
