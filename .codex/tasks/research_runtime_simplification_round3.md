@@ -321,3 +321,24 @@ planner 构造和规划不在 motion_lock/共享代际锁内执行。停止发�
 最终按键生产/消费、准入→准备→观测→提交、启动取消/正常退出、HOME 多设备阶段、recorder 两启动调用方、viewer 主错/清理和 Raw→回放链已重新核对。没有第二套事件协议、计数器、ACK、事件 TTL、恢复队列或配置开关；第 6 节训练切段、IK 搜索、点云算法和数组所有权研究项未混入生产改动。
 
 **未执行与剩余限制：** 未连接真实机器人、手、相机或 VR；未加载并运行真实 checkpoint 做 sync/async/RTC 部署；未执行物理停止/跟随/收敛、VR 实操、实际相机录像完整性和 Rerun GUI 验收。真实 Raw 多帧集成使用合成观测，不代表真实采集。事件边界仅为本进程读取意图代际的时刻；SDK/native 调用仍可能阻塞，Python 等待预算不能强制终止它。真机与真实模型复选框保持未勾选，上述离线结果不替代物理安全或算法效果验收。
+
+### 2026-11-01 系统审查与清理补充
+
+审查起点 `c801094`，工作区干净。沿按键/启动/准备/HOME/设备 owner/触觉、录制/RawReader/viewer/回放，以及调度/几何/观测实际调用链复查，没有回退第三轮修复。代码提交为 `2c2e5a6`（运行时）和 `3116f98`（数据生命周期）；README 与本节随文档提交保存。
+
+- 修复启动退出分类的遗漏：parent 先检查真实故障/退出，再接受取消；owner 仅在自身明确按正常取消或自身预算退出时设置已有 closing。意外 exitcode=0 不再被 stop 信号及 parent 后设 closing 掩盖，停止/断开失败仍优先报错。生命周期请求附带清理错误时保留原 SDK cause。
+- 统一触觉复位为成功返回 None、失败抛异常，移除 driver→Robot→initialize_hand 的布尔双轨；修复两个交互 T 入口忽略 False、漏报 SDK 失败的问题。禁用手部时明确忽略 T，保留传感器编号、错误码、已完成次数及固定身份取消语义。
+- 把四入口重复的启动停止检查和 epoch 获取合并到已有 SessionState.arm；删除 PolicySession 恒传 None 的平面构造参数、HOME 紧邻健康回调的重复检查，以及 initialize_hand 中已由 Robot.reset 拥有的前后取消检查。真实 I/O/等待后的检查保持。
+- RawReader 成功关闭子资源后清空句柄，失败资源保留，viewer 重试不再重复关闭已经释放的视频资源。recorder 的 stop_deadline 无后续消费者，删除实例字段，首次 finish 使用局部期限；finish_request 仍阻止重复等待/发布。
+- README 区分遥操作/策略启动手 HOME、keyboard 不自动 HOME、replay 初态检查和手姿渐入，并说明触觉 SDK 失败语义。相关生产代码没有 SHA-256/哈希校验或旧格式兼容路径可删；当前 Raw 格式、action semantics、完成状态、有限目标、来源时间、限位与停止确认均有实际职责，继续保留。未改变第 6 节研究项、schema、依赖或算法效果。
+
+本次实际验证仍使用既有 real_robot 环境，临时探针及缓存均在 `/tmp`，未连接真实设备：
+
+- `/tmp/dexmani_round3_owner_exit_probe.py`：10 组通过。真实 spawn、生产 ArmController/ArmProcess/共享通道/Pipe，仅替代 SDK；覆盖正常已退出/仍在关闭、自身预算、意外退出 0/7、停止/断开失败，以及回复已到/仍在途时的 SDK cause 与清理错误保留。
+- `/tmp/dexmani_tactile_reset_probe.py`：真实 driver→Robot→两个 T handler，验证首个/第 3 个 sensor 错误码、原 Python SDK 异常、恰好 5 次正常请求、所需触觉反馈等待、显式取消/撤权、旧 T 和禁手 T。使用 `git show c801094` 的完整旧生产模块重现旧布尔失败被忽略；新接口及 initialize_hand 成功/失败透传通过。
+- `/tmp/round3_startup_arm_boundary.py`：4 组真实 Value/RLock/Event 边界通过；四入口 `/tmp/dexmani_round3_startup_probe.py` 24 场景回归通过。停止先到拒绝、锁竞争快速通知与最终 set、返回身份固定及 ARMED 合法新意图均保留。
+- `/tmp/round3_data_ownership_audit.py`：实际 viewer→RawReader→真实 HDF5 的部分关闭失败先重现、后修复通过；`/tmp/round3_lifecycle_probe.py` 的 14 场景回归通过，包含真实 HDF5/AV、预算、迟到退出与 Rerun client。
+- HOME 11 场景、原固定身份/错误记录探针，以及算法组的 24-slot 调度、真实 retargeter、498 组几何与 6 组静态障碍、真实 IK/VR 锚点、16 组 freshness 边界复核通过。涉及外部设备、观测或模型的替代边界仍不能视作物理验收。
+- 15 个变更 Python 模块的语法/实际导入、五个 CLI 帮助、两个配置 JSON、Ruff F/E9、默认范围 Mypy 和完整 diff 检查通过。额外启用 `--check-untyped-defs` 后仍有既有类型诊断；在仓库外导出 `c801094` 同范围源码对照，诊断从 70 项到 66 项，没有新增。未以断言、兼容层、忽略规则或放宽校验掩盖这些基线问题，也未称严格类型检查全部通过。
+
+上述结果为本次重新执行的离线证据。真实 SDK、物理停止/收敛、触觉零点、真实模型部署和相机采集验收仍未执行，原真机/模型复选框继续保持未勾选。
