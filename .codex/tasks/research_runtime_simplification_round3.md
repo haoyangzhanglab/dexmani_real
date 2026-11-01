@@ -1,6 +1,6 @@
 # DexMani Real 第三轮任务书：绑定操作意图，厘清故障边界，按需启用功能
 
-日期：2026-11-01。状态：**方案已确定；R0–R6 均待实施和重新验收**。
+日期：2026-11-01。状态：**R0–R6 已实施并完成下述离线验证；真机与真实模型验收未执行**。
 
 目标：让个人真实机器人研究代码轻而薄、职责清楚、行为正确、容易使用和修改。本轮修正两处真实的权限/错误语义问题，删除已确认的重复工作和过严限制；保留与设备停止、数据含义及算法效果有实际关系的保障。
 
@@ -259,15 +259,65 @@ planner 构造和规划不在 motion_lock/共享代际锁内执行。停止发�
 
 完成标准是明确问题被解决、责任更少且行为可解释，不是达到某个删行比例。尤其检查：一个事实仍有一个 owner；新事件仅携带原有身份；没有两套按键接口；没有新共享状态/配置开关；没有无消费方的包装函数；异常未被降级为成功；第 6 节研究项未混入生产改动。
 
-- [ ] R0：基线、现状和关键问题重现完成。
-- [ ] R1：固定操作身份、取消/故障分类完成并验证。
-- [ ] R2：HOME 按需依赖和可恢复拒绝完成并验证。
-- [ ] R3：async 与标定规则完成并验证。
-- [ ] R4：录制、viewer 与回放准入完成并验证。
-- [ ] R5：重复计算/检查清理完成并验证。
-- [ ] R6：完整受影响链复查、现有文档和实际证据记录完成。
+- [x] R0：基线、现状和关键问题重现完成。
+- [x] R1：固定操作身份、取消/故障分类完成并验证。
+- [x] R2：HOME 按需依赖和可恢复拒绝完成并验证。
+- [x] R3：async 与标定规则完成并验证。
+- [x] R4：录制、viewer 与回放准入完成并验证。
+- [x] R5：重复计算/检查清理完成并验证。
+- [x] R6：完整受影响链复查、现有文档和实际证据记录完成。
 - [ ] 真机与真实模型验收已实际执行；若未执行，保持未勾选并说明。
 
 实施者在此追加精简记录：实施 HEAD/提交、各项具体改动、V1–V18 实际运行结果、依赖/硬件限制、仍待确认的风险。缺失依赖就写未执行，局部探针就写局部证据，不写“全面通过”。不要仅罗列 diff 或编译结果来代替行为验收。
 
-当前实施记录：**尚未实施。本文提交只增加任务书，不修改生产代码。**
+任务书提交时的记录：**尚未实施。本文提交只增加任务书，不修改生产代码。**
+
+### 2026-11-01 实施记录
+
+实施起点为任务书提交 `bcd5a645`，工作区干净；与审查基线 `b06e9b7` 相比只有任务书新增，未发现需要保留的用户改动或已修复生产项。本轮重新观察到旧 B 的错误准入、正常 closing 误报、生产 `send_hand_home` 内 fault+stop 被先分类为取消，以及 async/标定反例；这些基线重现是局部证据，不是完整真机启动复现。
+
+实施提交：
+
+| 阶段 | 提交 | 实际改动 |
+| --- | --- | --- |
+| R1 | `1908291` | 单一不可变 KeyEvent 携带入队代际；迁移全部生产者/消费者，准备、HOME、初始化与触觉等待固定身份；区分真实故障、取消与 closing，实际 I/O 禁止复用关闭对象 |
+| R2 | `38fdf40` | 四入口延迟构造 HOME，按最终点云需求加载/记录/复用桌面事实；仅窄配置错误与干净路径拒绝可恢复；补启动 STOP 边界及错误细节保留 |
+| R3 | `25a85d2` | 普通 async 允许可用短尾，RTC 保留完整窗口；删除历史最大骨长偏差否决 |
+| R4 | `3f6c927` | START 不 join，finish 独占预算/发布；viewer 保留主错并尝试全部清理；回放按内容而非采集来源准入，CLI 同步更新 |
+| R5 | `4f5d341` | 删除独立 target_fk，VR 复用 IK 位姿；清理 arm 发布/键盘健康重复预检，观测复用 freshness helper |
+| R6 | `af6883a` 及包含本记录的文档提交 | 最终完整链复查补齐 policy 退出前并发故障裁决；更新 README、手部说明与实际验收记录 |
+
+所有探针位于 `/tmp`，使用 `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`，设置 `PYTHONDONTWRITEBYTECODE=1`（或 `-B`）、`PYTHONPATH=.`；Matplotlib 与工具缓存置于 `/tmp`。未升级依赖、添加仓库测试框架或恢复根目录 tests。该既有环境实际可导入 numpy/scipy/Pinocchio/hppfcl/MPlib/h5py/AV/Rerun/Ruckig/pynput/dexmani_policy；系统解释器缺包不构成本轮依赖缺失结论。
+
+本轮实际结果如下。表中设备替代只覆盖外部 SDK、进程/模型 I/O 或观测边界，生产队列、共享原语、准入、HOME、录制和结果裁决仍实际执行；不能据此声称物理设备或真实模型全面通过。
+
+| 验收 | 实际执行与结果 |
+| --- | --- |
+| V1 | 真实 Keyboard/Condition、SessionState/Value/RLock/Event；S 撤权完成但未入队时消费旧 B，teleop/policy 均不 prepare/begin/submit；迟到 S 后仍停止 |
+| V2 | 停止后新 B 经生产 prepare、ArmProcess/Pipe、begin_motion、IPC 发布可用；新 B 后再停止失效；同批 B/S、D、Q、Esc 终止优先级保持 |
+| V3 | 旧 H/R/T 拒绝；Event 控制另一线程在加载、规划、hand→arm 间撤权，不再发送 arm；合法 R 只主动换一次代际并完成生产 HOME/真实几何/IPC；初始化和 reset 等待不重取权，新 T 可用 |
+| V4 | STOP/ESTOP 与共享锁内 clear 的两种顺序均保留快速通知和最终 set；owner 计算后、SDK 前的最终检查仍拒绝撤权目标 |
+| V5 | 实际 ArmProcess.connect 正常取消，存活 closing 与干净退出均不报硬件故障；四外层入口检查取消结果与退出 |
+| V6 | 实际 home_hand→send_hand_home 在 stop_required=False 时注入 fault+stop，报告真实故障；取消附停止/清理失败仍非成功，原错和补充错误保留 |
+| V7 | 未请求关闭的 exitcode=0、非零退出、缺停稳确认、close_error 均拒绝；干净关闭的对象不报故障但不能再次 snapshot/submit/prepare/request_operation |
+| V8 | 实际四入口装配/启停链使用缺失平面及坏 HOME 专用配置，无 HOME 可运行；关节、RGB、仅录制 RGB-D、未去桌面点云均不加载，仅最终 point_cloud&&remove_table 在 worker 前加载；未加载元数据为 None，首次使用记录并复用事实；首次 H/R 的缺标定提示和停止状态正确 |
+| V9 | 四交互 handler 经生产 HOME/真实几何，拒绝后可新 H/R 成功、缓存同一 planner；replay 的 COMPLETED 保留并分别记录 HOME 失败/成功；SDK、收敛超时、技术错误及 stop 失败不能恢复为成功 |
+| V10 | 生产 preflight/schedule 连续 24 slots 交接，P=8/A=8/d=2 窗口为 8、6、6、6；P=A=d、offset 达 P 拒绝，RTC 仍拒绝 A+d>P，sync 不依赖 d |
+| V11 | 25×16 稳定测量夹一个离群值得到 median，过高 MAD 拒绝，sample_count 保持实际数量；真实 AdaptiveHandRetargeter 拒绝运行异常骨长且不推进关节/时间参考 |
+| V12 | START 打开失败、阻塞/超时、KeyboardInterrupt 不 join；实际 TeleopLoop/Rollout 启动失败观察先 stop 后 finish join；唯一预算、pending/staging、首错和迟到退出不发布均验证 |
+| V13 | 真实 HDF5/AV 两来源各 4 帧，写入、关闭、原子发布、RawReader 读取与视频解码；Event 暂停真实 close 时不提前发布；队列满/关闭失败注入保留 staging，无假成功 |
+| V14 | 真实 Pinocchio/hppfcl 与基线完整生产模块比较 498 组 target/手姿，接受集合相同（43 接受，其他拒绝）；另 6 组静态障碍、真实 MPlib IK solve、VR 锚点、已有 position 不重复 FK 均验证；允许的首错优先级变化不影响准入 |
+| V15 | 真实 mailbox/代际锁等待中撤权或恰好到期仍拒绝；组合非法 hand 在 arm 发布前拒绝，arm 后停止拦住 hand，owner 最终检查保留；监听器死亡经真实 poll 锁存急停 |
+| V16 | 16 组生产 observation 与基线对照：0、未来、恰好 deadline、前 1 ns、可选 hand、所需触觉及点云；每次只取一个 now，来源时间不更新 |
+| V17 | 真实 viewer 构造/main，叠加 reader/disconnect 失败仍保留主异常对象、traceback 和全部补充错误；纯清理失败顺序、失败句柄保留、成功关闭幂等均验证；另跑真实 RawReader/FK/Rerun client 四帧正常循环，禁用 GUI spawn |
+| V18 | 真实 HDF5/RawReader 接受相同有限内容的 teleop/policy Raw；NaN、未完成、空数据、临时路径、非法初态/semantics 和越限在设备执行前拒绝，不补值/筛行/压缩时间 |
+
+临时可复现脚本：`/tmp/dexmani_round3_r1_probe.py`（15 场景组）；`/tmp/dexmani_round3_home_probe.py`、`/tmp/dexmani_round3_home_handlers_probe.py`（固定身份、真实几何及 handler）；`/tmp/dexmani_round3_startup_probe.py`（24 个外层入口场景，含 DISARMED 启动 STOP 和退出 Q+fault；policy 最后 Q 使用真实控制循环）；`/tmp/round3_home_probe.py`（11 场景组，四入口/最终 needs/元数据）；`/tmp/dexmani_round3_r3_r5_probe.py`（数值/几何/来源时间）；`/tmp/round3_lifecycle_probe.py`（14 场景组，含真实 HDF5/AV 和 viewer）；`/tmp/dexmani_round3_error_record_probe.py`（3 场景组，错误记录/异常对象及 cause 保留，无递归环）。部分脚本导入前一探针，会重复打印其场景；不累加为更多独立验收。临时文件不是仓库依赖，也不保证后续环境仍保留。
+
+末次 FK 局部微基准 P50/P95（μs）：有效候选旧 18.25/18.60 → 新 17.69/17.90，工作空间外旧 5.88/6.00 → 新 16.45/16.77。有效候选删除一次独立 FK，但先算碰撞使部分工作空间外目标更慢；不能宣称所有输入提速。
+
+24 个变更 Python 模块的内存语法解析与实际导入、五个受影响 CLI 的 `--help`、两个已有 `--print-config` 的 JSON 输出、Ruff `--no-cache --select F,E9` 与 `git diff --check` 通过。Mypy 使用 `/tmp` cache、`--follow-imports=silent --ignore-missing-imports --explicit-package-bases` 检查 24 文件通过；默认不检查无注解函数体，不据此声称完整类型证明。默认完整 Ruff 规则另有风格告警（如既有 dict()/BaseException/setattr 用法），本轮未扩为全仓风格重写，也不称全规则通过。
+
+最终按键生产/消费、准入→准备→观测→提交、启动取消/正常退出、HOME 多设备阶段、recorder 两启动调用方、viewer 主错/清理和 Raw→回放链已重新核对。没有第二套事件协议、计数器、ACK、事件 TTL、恢复队列或配置开关；第 6 节训练切段、IK 搜索、点云算法和数组所有权研究项未混入生产改动。
+
+**未执行与剩余限制：** 未连接真实机器人、手、相机或 VR；未加载并运行真实 checkpoint 做 sync/async/RTC 部署；未执行物理停止/跟随/收敛、VR 实操、实际相机录像完整性和 Rerun GUI 验收。真实 Raw 多帧集成使用合成观测，不代表真实采集。事件边界仅为本进程读取意图代际的时刻；SDK/native 调用仍可能阻塞，Python 等待预算不能强制终止它。真机与真实模型复选框保持未勾选，上述离线结果不替代物理安全或算法效果验收。
