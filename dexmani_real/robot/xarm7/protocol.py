@@ -21,15 +21,8 @@ GOAL_DTYPE = np.dtype(
         ("pending", "?"),
         ("run_id", "<i8"),
         ("hold", "?"),
-        ("submit_until_ns", "<i8"),
-        ("execute_until_ns", "<i8"),
+        ("expires_ns", "<i8"),
         ("q_goal", "<f8", ARM_JOINT_SHAPE),
-    ]
-)
-STATUS_DTYPE = np.dtype(
-    [
-        ("frame", ARM_STATE_DTYPE),
-        ("prepared_run_id", "<i8"),
     ]
 )
 
@@ -49,44 +42,50 @@ class HomeRequest:
 
 class ArmChannels:
     def __init__(
-        self, ctx, *, run_signal, stop_signal, emergency_signal, signal_lock
+        self, ctx, *, run_signal, stop_signal, emergency_signal
     ):
         self.run_id, self.stop, self.emergency = run_signal, stop_signal, emergency_signal
-        self.signal_lock = signal_lock
         self.closing, self.stopped, self.ready = (ctx.Event() for _ in range(3))
         self.connected = ctx.Event()
         self.fault = ctx.Array("c", 1024, lock=False)
         self.close_error = ctx.Array("c", 1024, lock=False)
         self.goal_lock, self.status_lock = ctx.Lock(), ctx.Lock()
         self.goal = ctx.RawArray("b", GOAL_DTYPE.itemsize)
-        self.status = ctx.RawArray("b", STATUS_DTYPE.itemsize)
+        self.status = ctx.RawArray("b", ARM_STATE_DTYPE.itemsize)
 
-    def publish_goal(self, command, *, submit_until_ns, execute_until_ns):
-        prepared_run_id = self.read_status()["prepared_run_id"]
-        with self.goal_lock:
+    def publish_goal(self, command, *, expires_ns):
+        if not self.goal_lock.acquire(timeout=max(0, expires_ns - time.monotonic_ns()) / 1e9):
+            raise TimeoutError("arm target publication expired waiting for mailbox")
+        try:
             # IPC 等待之后重新检查运行身份和停止信号。
+            generation_lock = self.run_id.get_lock()
+            if not generation_lock.acquire(timeout=max(0, expires_ns - time.monotonic_ns()) / 1e9):
+                raise TimeoutError("arm target generation lock unavailable")
+            try:
+                run_id = self.run_id.get_obj().value
+            finally:
+                generation_lock.release()
             if (
                 self.closing.is_set()
                 or self.stop.is_set()
                 or self.emergency.is_set()
-                or self.run_id.value != command.run_id
+                or run_id != command.run_id
             ):
                 raise OperationCancelled("arm target run cancelled")
-            if time.monotonic_ns() >= min(submit_until_ns, execute_until_ns):
+            if time.monotonic_ns() >= expires_ns:
                 raise TimeoutError("arm target deadline expired")
-            if prepared_run_id != command.run_id:
-                raise RuntimeError("arm target run was not prepared")
             np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)[0] = (
                 True,
                 command.run_id,
                 command.arm_hold,
-                submit_until_ns,
-                execute_until_ns,
+                expires_ns,
                 command.arm_qpos if command.arm_qpos is not None else 0.0,
             )
+        finally:
+            self.goal_lock.release()
 
-    def take_goal(self, *, block=False):
-        if not self.goal_lock.acquire(block):
+    def take_goal(self):
+        if not self.goal_lock.acquire(False):
             return None  # 父进程持锁时跳过本次读取，不阻塞伺服。
         try:
             slot = np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)
@@ -98,11 +97,19 @@ class ArmChannels:
         finally:
             self.goal_lock.release()
 
-    def read_status(self):
-        with self.status_lock:
-            return np.frombuffer(self.status, dtype=STATUS_DTYPE, count=1)[0].copy()
+    def read_status(self, *, timeout_s):
+        if not self.status_lock.acquire(timeout=timeout_s):
+            raise TimeoutError("arm feedback snapshot lock unavailable")
+        try:
+            return np.frombuffer(self.status, dtype=ARM_STATE_DTYPE, count=1)[0].copy()
+        finally:
+            self.status_lock.release()
 
     def publish_status(self, status):
-        # 锁内只复制快照，不执行 SDK I/O。
-        with self.status_lock:
-            np.frombuffer(self.status, dtype=STATUS_DTYPE, count=1)[0] = status
+        # 发布竞争不能阻塞 owner 的停止或伺服。
+        if not self.status_lock.acquire(False):
+            return
+        try:
+            np.frombuffer(self.status, dtype=ARM_STATE_DTYPE, count=1)[0] = status
+        finally:
+            self.status_lock.release()

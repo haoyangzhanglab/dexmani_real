@@ -21,4 +21,8 @@ def configure_logging() -> None:
 
 
 def error_detail(stage, error):
-    return dict(stage=stage, exception_type=type(error).__name__, message=str(error))
+    message = str(error)
+    for cleanup_stage, detail in getattr(error, "cleanup_errors", ()):
+        detail_message = error_detail(cleanup_stage, detail)["message"]
+        message += f"; {cleanup_stage}: {type(detail).__name__}: {detail_message}"
+    return dict(stage=stage, exception_type=type(error).__name__, message=message)

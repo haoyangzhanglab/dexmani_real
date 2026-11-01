@@ -11,7 +11,6 @@ from dexmani_real.config.deployment import ACTION_TIMEOUT_NS
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.raw import camera_metadata
-from dexmani_real.data.recorder import RecordingError
 from dexmani_real.deployment.rollout import Rollout, failure_reason, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
@@ -34,6 +33,7 @@ from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.io import write_json, write_yaml
 from dexmani_real.utils.log import configure_logging, error_detail
+from dexmani_real.utils.timing import next_tick_ns
 
 logger = logging.getLogger(__name__)
 MODEL_STARTUP_TIMEOUT_S = 300.0
@@ -54,10 +54,11 @@ class PolicySession:
         self.output_dir = output_dir
         self.camera_calibration_path = camera_calibration_path
         self.observations = observations
-        self.record_needs = (
+        record_needs = (
             ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
             if record_raw else ObservationNeeds()
         )
+        self.needs = observations.needs.union(record_needs)
         self.runtime_state = self.sensors = self.robot = self.keyboard = self.model = None
         self.episode = self.start_epoch = None
         self.capture_ids = count(1)
@@ -90,7 +91,7 @@ class PolicySession:
                 self.start_devices()
             except OperationCancelled:
                 if self.runtime_state is None or not (
-                    self.runtime_state.stop_request or self.runtime_state.quit_requested
+                    self.runtime_state.stop_signal.is_set() or self.runtime_state.quit_requested
                     or self.runtime_state.estop_request
                 ):
                     raise
@@ -118,8 +119,9 @@ class PolicySession:
 
         from dexmani_real.deployment.inference import PolicyWorker
 
-        needs = self.observations.needs.union(self.record_needs)
-        if needs.camera_worker:
+        needs = self.needs
+        camera_required = needs.camera_worker or self.observations.camera_static
+        if camera_required:
             self.runtime.camera.validate()
         self.runtime_state = SessionState()
         self.camera_snapshot = None
@@ -146,32 +148,29 @@ class PolicySession:
             SensorChannels(
                 self.process_context, camera=self.runtime.camera,
                 pointcloud_num_points=self.runtime.pointcloud.num_points if needs.point_cloud else None,
-            ) if needs.camera_worker else None
+                pointcloud_camera_fields=needs.camera_fields,
+            ) if camera_required else None
         )
         self.sensors = SensorWorkers(channels)
         self.robot = Robot(
             self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
             stop_signal=self.runtime_state.stop_signal, emergency_signal=self.runtime_state.emergency_signal,
-            signal_lock=self.runtime_state.motion_lock, check_services=self.check_services,
+            check_services=self.check_services,
         )
 
     def check_services(self):
         if self.keyboard.estop_latched or not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
             return False
-        needs = self.observations.needs
-        control_camera = bool(needs.camera_fields) or needs.point_cloud
-        for name, needed in (("camera", control_camera), ("pointcloud", needs.point_cloud)):
+        for name, needed in (("camera", self.needs.camera_worker), ("pointcloud", self.needs.point_cloud)):
             if needed and not self.sensors.check(names=(name,)):
-                raise RobotError(f"control {name} process exited")
-        if self.record_needs.camera_fields and not control_camera and not self.sensors.check(names=("camera",)):
-            raise RecordingError("recording camera process exited")
+                raise RobotError(f"required {name} process exited")
         return True
 
     def start_devices(self):
-        needs = self.observations.needs.union(self.record_needs)
+        needs = self.needs
         self.robot.connect()
-        if needs.camera_worker:
+        if needs.camera_worker or self.observations.camera_static:
             self.sensors.start(
                 self.process_context.Process(
                     name="camera",
@@ -214,22 +213,18 @@ class PolicySession:
                 timeout_s=POINTCLOUD_READY_TIMEOUT_S,
                 may_start=lambda: self.keyboard.check_health() and self.runtime_state.requests_allow_motion(),
             )
-        if needs.camera_static and not needs.camera_fields and not needs.point_cloud:
-            if not self.sensors.shutdown(deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S):
-                raise RuntimeError("static camera failed to close normally")
+        if self.observations.camera_static and not needs.camera_worker:
+            self.sensors.shutdown()
             self.sensors.channels = None
         self.robot.check()
         with self.runtime_state.motion_lock:
             if not self.runtime_state.requests_allow_motion():
                 raise OperationCancelled("startup cancelled before arming")
             self.runtime_state.arm()
-        result = initialize_hand(
-            self.runtime_state, self.robot, cancel_requested=self.home_abort_requested,
+        initialize_hand(
+            self.runtime_state, self.robot, required_tactile=needs.required_tactile,
+            cancel_requested=self.home_abort_requested,
         )
-        if not result.ok:
-            if result.interrupted:
-                raise OperationCancelled(result.reason)
-            raise RuntimeError(f"startup hand initialization failed: {result.reason}")
         self.warmup_policy()
         self.keyboard.discard_events("h", "b", "t")
         self.check_startup()
@@ -254,15 +249,12 @@ class PolicySession:
             except BaseException as exc:
                 model_status = "failed"
                 cleanup_errors.append(error_detail("model_close", exc))
-        runtime_clean = True
         try:
             if self.runtime_state is not None:
-                runtime_clean = close_runtime(
-                    self.runtime_state, self.robot, sensors=self.sensors,
-                    keyboard=self.keyboard, deadline=deadline, errors=cleanup_errors,
+                close_runtime(
+                    self.runtime_state, self.robot, sensors=self.sensors, keyboard=self.keyboard,
                 )
         except BaseException as exc:
-            runtime_clean = False
             cleanup_errors.append(error_detail("shutdown", exc))
         if self.model is not None and model_status != "failed":
             model_status, errors = self.model.wait_closed(deadline - time.monotonic())
@@ -271,7 +263,7 @@ class PolicySession:
         pending = model_status == "pending" or writer_pending
         shutdown = (
             "pending" if pending else "completed"
-            if runtime_clean and model_status == "completed" and not cleanup_errors else "failed"
+            if model_status == "completed" and not cleanup_errors else "failed"
         )
         self.errors.extend(cleanup_errors)
         episode_error = next((error for result in self.episodes for error in result.errors), None)
@@ -312,25 +304,28 @@ class PolicySession:
         self.robot.service_feedback()
 
     def wait_model(self, deadline):
+        next_check_ns = time.monotonic_ns()
+        dt_ns = round(self.info.control_dt_s * 1e9)
         while True:
             self.check_startup()
+            now = time.monotonic_ns()
+            if now >= next_check_ns:
+                row = read_observation(self.sensors.channels, self.robot, needs=self.needs)
+                issues = check_observation(row, self.runtime, self.needs)
+                if issues:
+                    raise ValueError("model startup inputs: " + "; ".join(issues))
+                next_check_ns = next_tick_ns(next_check_ns, dt_ns, now)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("model load/warmup deadline expired")
             completion = self.model.poll()
             if completion is not None:
                 return completion
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("model load/warmup timed out; native call remains pending")
             time.sleep(min(0.005, remaining))
 
     def warmup_policy(self):
         deadline = time.monotonic() + MODEL_STARTUP_TIMEOUT_S
         self.wait_model(deadline)
-        # 模型/相机启动可能耗尽 connect 的首帧期限；尚未运动，重新建立本次反馈等待。
-        self.robot.reset_hand_feedback()
-        self.robot.read_initial_state(
-            required_tactile=self.observations.needs.required_tactile,
-            cancel_requested=lambda: not self.runtime_state.requests_allow_motion(),
-        )
         rows = []
         dt_ns = round(self.info.control_dt_s * 1e9)
         next_sample_ns = time.monotonic_ns()
@@ -343,8 +338,8 @@ class PolicySession:
             if now < next_sample_ns:
                 time.sleep(min(0.005, (next_sample_ns - now) / 1e9))
                 continue
-            row = read_observation(self.sensors.channels, self.robot, needs=self.observations.needs)
-            issues, _ = check_observation(row, self.runtime, self.observations.needs)
+            row = read_observation(self.sensors.channels, self.robot, needs=self.needs)
+            issues = check_observation(row, self.runtime, self.needs)
             if issues:
                 raise ValueError("warmup observation: " + "; ".join(issues))
             rows.append(self.observations.project(row))
@@ -355,25 +350,24 @@ class PolicySession:
                 rtc_guidance_cap=self.runtime.execution.rtc_guidance_cap,
                 rtc_delay=self.runtime.execution.prefetch_steps,
             )
-        self.model.warmup(tuple(rows), samples=5, **kwargs)
+        self.model.warmup(tuple(rows), samples=1, **kwargs)
         self.wait_model(time.monotonic() + MODEL_STARTUP_TIMEOUT_S)
 
     def request_stop(self, *, reason=RunEndReason.OPERATOR) -> None:
-        """阻塞操作期间也立即撤销运动权限。"""
+        """先使停止信号可见，再清理主线程局部请求。"""
+        self.runtime_state.request_stop(reason=reason)
         with self.runtime_state.motion_lock:
             self.start_epoch = None
-            self.runtime_state.request_stop(reason=reason)
 
     def request_quit(self) -> None:
+        self.runtime_state.request_quit()
         with self.runtime_state.motion_lock:
             self.start_epoch = None
-            self.runtime_state.request_quit()
 
     def request_discard(self) -> None:
-        with self.runtime_state.motion_lock:
-            if self.episode is not None:
-                self.episode.discard_requested = True
-            self.request_stop()
+        if self.episode is not None:
+            self.episode.discard_requested = True
+        self.request_stop()
 
     def poll_operator(self, *, allow_tactile_reset: bool = False) -> None:
         if self.keyboard.estop_latched or not self.keyboard.check_health():
@@ -410,7 +404,10 @@ class PolicySession:
                     continue
                 try:
                     logger.info("正在复位触觉，请保持手部无接触；S/Q/Esc 可中断。")
-                    self.robot.reset_tactile_sensors(cancel_requested=self.home_abort_requested)
+                    self.robot.reset_tactile_sensors(
+                        cancel_requested=self.home_abort_requested,
+                        required_tactile=self.needs.required_tactile,
+                    )
                 except OperationCancelled as exc:
                     logger.info("%s", exc)
                 finally:
@@ -429,45 +426,22 @@ class PolicySession:
             logger.warning("operator: ignored H unless ARMED without shutdown, fault or stop")
             return False
         logger.info("正在回初始位…")
-        result = home_robot(
-            self.runtime_state, self.robot, self.home_planner,
-            cancel_requested=self.home_abort_requested,
-        )
-        with self.runtime_state.motion_lock:
-            completed_without_stop = result.ok and self.runtime_state.can_move(
-                run_id=self.runtime_state.run_id,
-                required_safety_state=SafetyState.ARMED,
+        try:
+            home_robot(
+                self.runtime_state, self.robot, self.home_planner,
+                cancel_requested=self.home_abort_requested,
             )
-        interrupted = bool(
-            result.interrupted
-            or (
-                result.ok
-                and (
-                    self.runtime_state.quit_requested
-                    or self.runtime_state.estop_request
-                    or self.runtime_state.stop_request
-                )
-            )
-        )
-        if not completed_without_stop and not interrupted:
-            self.errors.append(dict(stage="home", exception_type=None, message=result.reason))
-        if completed_without_stop:
-            logger.info("已回初始位，按 B 开始。")
+        except OperationCancelled as exc:
+            logger.info("回初始位已中断：%s", exc)
         else:
-            logger.warning("回初始位未完成，请检查当前姿态：%s", result.reason)
-        # HOME 阻塞期间积累的准备按键失效，保留停止与退出请求。
-        self.keyboard.discard_events("t", "h", "b")
+            logger.info("已回初始位，按 B 开始。")
+        finally:
+            self.keyboard.discard_events("t", "h", "b")
         return True
 
     def home_abort_requested(self) -> bool:
         self.robot.check()
-        return bool(
-            not self.runtime_state.running
-            or self.runtime_state.quit_requested
-            or self.runtime_state.error_state
-            or self.runtime_state.estop_request
-            or self.runtime_state.stop_request
-        )
+        return not self.runtime_state.requests_allow_motion()
 
     def request_start(self):
         with self.runtime_state.motion_lock:
@@ -488,8 +462,6 @@ class PolicySession:
             if self.runtime_state.estop_request or self.runtime_state.error_state:
                 break
             self.robot.service_idle()
-            if not self.robot.stop_required:
-                self.runtime_state.acknowledge_stop(self.runtime_state.run_id)
             with self.runtime_state.motion_lock:
                 epoch, self.start_epoch = self.start_epoch, None
                 if epoch is not None and not self.runtime_state.can_move(
@@ -502,7 +474,7 @@ class PolicySession:
             episode = self.episode = Rollout(
                 self.runtime_state, self.runtime, self.info, preparing_epoch=epoch,
                 robot=self.robot, sensors=self.sensors, observations=self.observations,
-                record_needs=self.record_needs, action_mapper=self.action_mapper, model=self.model,
+                needs=self.needs, action_mapper=self.action_mapper, model=self.model,
                 max_running_s=self.max_running_s, capture_ids=self.capture_ids,
                 index=len(self.episodes) + 1, output_dir=self.output_dir, record_raw=self.record_raw,
                 camera_snapshot=self.camera_snapshot,

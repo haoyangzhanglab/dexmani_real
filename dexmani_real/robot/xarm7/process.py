@@ -2,7 +2,6 @@
 
 import multiprocessing as mp
 import time
-from contextlib import ExitStack
 
 from dexmani_real.config.xarm7 import (
     EXECUTOR_TIMEOUT_S,
@@ -24,7 +23,6 @@ class ArmProcess:
         run_signal,
         stop_signal,
         emergency_signal,
-        signal_lock,
     ):
         self.cfg = cfg
         self.ctx = mp.get_context("spawn")
@@ -33,11 +31,9 @@ class ArmProcess:
             run_signal=run_signal,
             stop_signal=stop_signal,
             emergency_signal=emergency_signal,
-            signal_lock=signal_lock,
         )
         self.pipe, self.child_pipe = self.ctx.Pipe()
         self.process = None
-        self.operation_unresolved = False
 
     @property
     def is_connected(self):
@@ -94,31 +90,24 @@ class ArmProcess:
         issue = self.fault
         if not issue and self.process is not None and not self.process.is_alive():
             issue = f"arm owner exited: {self.process.exitcode}"
+        if not issue and self.io.closing.is_set():
+            issue = "arm owner closing; lifecycle operation cannot be reused"
         if issue:
             raise RobotError(f"xArm controller fault: {issue}")
 
     def snapshot(self):
         self.check_error()
-        status = self.io.read_status()
-        stamp = int(status["frame"]["timestamp_ns"])
-        if not 0 < stamp <= time.monotonic_ns() < stamp + int(
-            self.cfg.feedback_max_age_s * 1e9
-        ):
-            raise RobotError("arm feedback unavailable/stale")
-        frame = status["frame"].copy().reshape(1)
+        status = self.io.read_status(timeout_s=self.cfg.feedback_max_age_s)
+        frame = status.reshape(1)
         frame.flags.writeable = False
         return frame
 
-    def submit(self, command, *, submit_until_ns, execute_until_ns):
-        self.io.publish_goal(
-            command,
-            submit_until_ns=submit_until_ns,
-            execute_until_ns=execute_until_ns,
-        )
+    def submit(self, command, *, expires_ns):
+        self.io.publish_goal(command, expires_ns=expires_ns)
 
     def request_operation(self, request, *, service, abort, deadline_ns):
-        if not self.is_connected or self.operation_unresolved:
-            raise RobotError("arm unavailable or previous operation unresolved")
+        if not self.is_connected or self.io.closing.is_set():
+            raise RobotError("arm unavailable for lifecycle operation")
         service()
         if abort():
             raise OperationCancelled("arm operation cancelled before submission")
@@ -136,37 +125,55 @@ class ArmProcess:
             error = self.pipe.recv()
             received = True
             if error is not None:
-                if self.io.close_error.value:
-                    raise RobotError(self.io.close_error.value.decode(errors="replace")) from error
-                if isinstance(error, (OperationCancelled, TimeoutError)) or not isinstance(error, Exception):
+                if (isinstance(error, OperationCancelled)
+                        or isinstance(error, TimeoutError) and not self.fault
+                        or not isinstance(error, Exception)):
                     raise error
                 raise RobotError(f"arm operation failed: {error}") from error
             if abort():
                 raise OperationCancelled("arm operation cancelled")
             if time.monotonic_ns() >= deadline_ns:
                 raise TimeoutError("arm operation completed after deadline")
-        except BaseException:
+        except BaseException as failure:
             self.request_stop()
-            # 取消回调可同步等待停止；退出请求等待后才交由收尾消费旧回复。
-            self.operation_unresolved = not received
+            # 本请求仍独占自己的回复；停止等待绝不接管 Pipe。
+            cleanup_until = time.monotonic() + EXECUTOR_TIMEOUT_S
+            try:
+                if not received:
+                    if not self.pipe.poll(max(0, cleanup_until - time.monotonic())):
+                        raise TimeoutError("cancelled arm operation reply remains pending")
+                    reply = self.pipe.recv()
+                    if reply is not None and not isinstance(reply, OperationCancelled):
+                        raise RobotError(f"arm operation also failed: {reply}") from reply
+                self.wait_stopped(deadline=cleanup_until)
+            except BaseException as cleanup_error:
+                # 不再复用这个 owner；保留句柄直到明确关闭。
+                self.io.closing.set()
+                setattr(failure, "cleanup_errors", [
+                    *getattr(failure, "cleanup_errors", ()),
+                    ("arm_operation_cleanup", cleanup_error),
+                ])
+                raise failure from cleanup_error
             raise
 
     def begin_operation(self, run_id):
         self.check_error()
         self.request_stop()
         self.wait_stopped()
-        with self.io.signal_lock:
+        lock = self.io.run_id.get_lock()
+        if not lock.acquire(timeout=EXECUTOR_TIMEOUT_S):
+            raise TimeoutError("arm preparation generation lock unavailable")
+        try:
             self.check_error()
             if (
-                self.io.run_id.value != run_id
+                self.io.run_id.get_obj().value != run_id
                 or self.io.emergency.is_set()
-                or self.io.closing.is_set()
             ):
                 raise OperationCancelled("operation cancelled before preparation")
-            if not self.io.stopped.is_set() or self.operation_unresolved:
-                raise RobotError("previous arm operation is still unresolved")
-            self.io.stop.clear()
             self.io.stopped.clear()
+            self.io.stop.clear()
+        finally:
+            lock.release()
 
     def prepare(self, run_id, *, service):
         self.begin_operation(run_id)
@@ -189,29 +196,18 @@ class ArmProcess:
     def request_stop(self):
         self.io.stop.set()
 
-    def wait_stopped(self):
-        deadline = time.monotonic() + EXECUTOR_TIMEOUT_S
+    def wait_stopped(self, *, deadline=None):
+        deadline = time.monotonic() + EXECUTOR_TIMEOUT_S if deadline is None else deadline
         if self.process is not None and self.process.is_alive():
-            if not self.io.stopped.wait(EXECUTOR_TIMEOUT_S):
-                raise TimeoutError(
-                    "arm stop unresolved; SDK acceptance not confirmed"
-                )
-            if self.operation_unresolved:
-                if not self.pipe.poll(max(0, deadline - time.monotonic())):
-                    raise TimeoutError(
-                        "arm stopped but cancelled lifecycle operation remains unresolved"
-                    )
-                error = self.pipe.recv()
-                self.operation_unresolved = False
-                if error is not None and not isinstance(error, OperationCancelled):
-                    if isinstance(error, TimeoutError) or not isinstance(error, Exception):
-                        raise error
-                    raise RobotError(f"arm operation failed while stopping: {error}") from error
-        elif self.process is not None and self.process.exitcode not in (None, 0):
-            raise RuntimeError(f"arm owner exited without confirming stop: {self.process.exitcode}")
+            if not self.io.stopped.wait(max(0, deadline - time.monotonic())):
+                raise TimeoutError("arm stop unresolved; SDK acceptance not confirmed")
+        elif self.process is not None and (
+            self.process.exitcode not in (None, 0)
+            or self.process.exitcode == 0 and not self.io.stopped.is_set()
+        ):
+            raise RobotError(f"arm owner exited without confirming stop: {self.process.exitcode}")
         if self.io.close_error.value:
-            raise RuntimeError(self.io.close_error.value.decode(errors="replace"))
-        # stopped 只确认停止请求已处理，不能抹掉同时发生的 owner 故障。
+            raise RobotError(self.io.close_error.value.decode(errors="replace"))
         issue = self.fault
         if issue:
             raise RobotError(f"xArm controller fault: {issue}")
@@ -223,11 +219,23 @@ class ArmProcess:
             self.process.join(EXECUTOR_TIMEOUT_S)
             if self.process.is_alive():
                 raise TimeoutError("arm owner process still active; stop/disconnect unresolved")
-        # 存活的 owner 仍持有管道；确认退出后，即使某项关闭失败也释放其余端点。
-        with ExitStack() as resources:
-            resources.callback(self.child_pipe.close)
-            resources.callback(self.pipe.close)
-            if self.process is not None and self.process.exitcode not in (None, 0):
-                raise RuntimeError(f"arm owner abnormal exit: {self.process.exitcode}")
-            if self.io.close_error.value:
-                raise RuntimeError(self.io.close_error.value.decode(errors="replace"))
+        # 活着的 owner 保留管道；确认退出后尝试关闭全部端点，保留首次失败。
+        errors = []
+        if self.io.close_error.value:
+            errors.append(RuntimeError(self.io.close_error.value.decode(errors="replace")))
+        if self.process is not None and (
+            self.process.exitcode not in (None, 0)
+            or self.process.exitcode == 0 and not self.io.stopped.is_set()
+        ):
+            errors.append(RobotError(f"arm owner exited without a clean stop: {self.process.exitcode}"))
+        for pipe in (self.child_pipe, self.pipe):
+            try:
+                pipe.close()
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            setattr(errors[0], "cleanup_errors", [
+                *getattr(errors[0], "cleanup_errors", ()),
+                *(("arm_close", error) for error in errors[1:]),
+            ])
+            raise errors[0]

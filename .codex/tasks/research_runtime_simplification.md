@@ -1,6 +1,6 @@
 # DexMani Real 研究运行链路精简任务书
 
-> 状态：设计已确定，代码实施待开始。本文是本轮唯一实施规格，可独立交给 Codex，不依赖聊天记录。
+> 状态：P0–P6 本地软件实施及针对性离线验证已完成；真机/GPU 验收未执行。本文为本轮唯一实施规格与执行记录。
 >
 > 目标：面向单机、单套机器人、单人论文实验，使项目轻而薄、职责清晰、正确好用、简单高效。通过删除状态、协调和重复检查降低复杂度，同时保留硬件边界与实验数据的真实含义。
 
@@ -480,17 +480,17 @@ sensor worker 不承担 Raw flush，不再共享 writer 的 60/65 秒漫长关�
 
 ### 14.1 完成定义
 
-- [ ] 输入链只有一次当前所需来源裁决，视觉图像/点云同源包成立，历史配对协议已删除。
-- [ ] 一个共享运动代际、父线程局部锁、owner 局部准备状态；stop 和 RPC 不再互相接管旧状态/回复。
-- [ ] 高频目标只有一个有效期，所有 teleop/jog/policy/replay 调用方已迁移，旧参数/兼容层消失。
-- [ ] 停止路径不会先被 goal/status/代际锁无限挡住；普通到期与 SDK 故障分开。
-- [ ] teleop 一次锚定、每 tick 手映射、按需触觉、HOME 去重复但保留真实收敛条件。
-- [ ] 模型单 owner/单任务、首预测 reset；sync/async/RTC 均按新规格工作，不靠删除一种模式简化。
-- [ ] RTC 无未来 RobotCommand 冻结与批量提前 IK；前缀、交接和 EEF/关节语义差异已有证据。
-- [ ] writer 只有一个关闭一致性裁决；Raw/Canonical/Replay 用途明确，真实时间和来源未伪造。
-- [ ] 收尾只保留一个主要失败与实际补充错误，现有结果格式可正确输出，无无关共享状态。
-- [ ] README/CLI 与真实行为一致；旧任务书没有被误当作当前规格。
-- [ ] 有针对性的离线证据；未做的硬件/GPU检查如实标注；无新框架、无双套实现、无临时产物混进代码。
+- [x] 输入链只有一次当前所需来源裁决，视觉图像/点云同源包成立，历史配对协议已删除。
+- [x] 一个共享运动代际、父线程局部锁、owner 局部准备状态；stop 和 RPC 不再互相接管旧状态/回复。
+- [x] 高频目标只有一个有效期，所有 teleop/jog/policy/replay 调用方已迁移，旧参数/兼容层消失。
+- [x] 停止路径不会先被 goal/status/代际锁无限挡住；普通到期与 SDK 故障分开。
+- [x] teleop 一次锚定、每 tick 手映射、按需触觉、HOME 去重复但保留真实收敛条件。
+- [x] 模型单 owner/单任务、首预测 reset；sync/async/RTC 均按新规格工作，不靠删除一种模式简化。
+- [x] RTC 无未来 RobotCommand 冻结与批量提前 IK；前缀、交接和 EEF/关节语义差异已有证据。
+- [x] writer 只有一个关闭一致性裁决；Raw/Canonical/Replay 用途明确，真实时间和来源未伪造。
+- [x] 收尾只保留一个主要失败与实际补充错误，现有结果格式可正确输出，无无关共享状态。
+- [x] README/CLI 与真实行为一致；旧任务书没有被误当作当前规格。
+- [x] 有针对性的离线证据；未做的硬件/GPU检查如实标注；无新框架、无双套实现、无临时产物混进代码。
 
 ### 14.2 实施边界
 
@@ -511,16 +511,77 @@ sensor worker 不承担 Raw flush，不再共享 writer 的 60/65 秒漫长关�
 
 ## 15. 执行记录
 
-本文当前只完成设计与仓库保存，下面所有代码阶段尚未执行。实施者在同一表中更新简短事实，避免再生成第二份计划或长期审计文档。
+本轮在现有工作区原地实施，未回退基线；软件验收时尚未提交或推送 Git，随后按操作者授权交付，提交标识与同步结果以 Git 历史和会话交付为准。无已有用户改动需要合并。以下证据仅证明离线软件行为，不证明真实到位、碰撞安全或停止延迟。
 
 | 阶段 | 状态 | 证据、必要偏差或阻塞 |
 | --- | --- | --- |
-| P0 基线 | 待开始 | 设计基线见第 0 节；需记录实际工作 HEAD 与本地改动 |
-| P1 身份与设备 | 待开始 | |
-| P2 观测与感知 | 待开始 | |
-| P3 Teleop/HOME | 待开始 | |
-| P4 模型与调度 | 待开始 | |
-| P5 数据与收尾 | 待开始 | |
-| P6 离线验收 | 待开始 | |
-| 真机/GPU 验收 | 未执行 | 由操作者另行安排；不在本任务默认执行范围 |
+| P0 基线 | 完成 | 起始 HEAD `dce626ad69b7f91746ee73982e889ce14a90f0b1`，工作区干净；相对 `e077df1` 只新增任务书。适用指令仅根 AGENTS。实际 Policy HEAD `df11303209600b8a43910eec438d956084b78408`，deployment/runtime.py 相对任务书引用版无差异，支持 samples=1/RNG-only reset。 |
+| P1 身份与设备 | 完成 | 父线程 RLock、单共享代际、owner 局部 prepared、单 expires；stop 在 SDK 之后才非阻塞清理 IPC。取消 RPC 原 owner 消费回复，未解决 owner closing 禁复用。共享锁交错/fake SDK 覆盖旧代际、到期等号、占锁停止、取消 prepare、Pipe EOF、部分发送、停止失败、反馈刷新顺序。 |
+| P2 观测与感知 | 完成 | needs 入口装配一次；缓存仅快照，观测只返回 issues；视觉包按启动需求携带同源 RGB-D。覆盖20新相机帧与处理期间10帧覆盖，marker 防撕裂、独立来源/重复帧端点、静态相机启动需求验证；删除随机历史查询。 |
+| P3 Teleop/HOME | 完成 | writer→prepare→一次锚定，每 tick 手映射，soft tick 丢迟到候选且不推进参考。按需触觉、HOME 异常、手 HOME 停止归 Robot；零路径一次目标 dwell，非零路径逐 waypoint 保留收敛，复用刚读有效反馈。真实 NLopt 重复帧8tick收敛及限速通过。 |
+| P4 模型与调度 | 完成 | 首预测同线程 reset，warmup samples=1；无独立 reset Future/sync_row/预测授权副本/未来 RobotCommand 冻结。sync 等待、async 晚交接全尾、两次 RTC 严格交接与逐槽映射、bootstrap 重锚、pending/迟到错误/部分失败通过；实际上游 warmup 方法配 fake predict/RNG 验证普通2次、RTC4次及 RNG 恢复。 |
+| P5 数据与收尾 | 完成 | writer 独占 expected_frames 与最终计数；真实 HDF5/MP4/Zarr、满队列/写入/关闭失败与一次发布通过。policy Raw 默认示教导出拒绝；replay 首行起点+完整目标，历史不规则 timing 接纳、坏目标拒绝。既有13字段/schema/source_id/URDF及 CordVIP read_timing_rows 保留；关闭首因与嵌套补充错误保留。 |
+| P6 离线验收 | 完成 | 下列临时矩阵、95文件 AST、33个改动生产模块导入、5入口 help、2入口 print-config、git diff --check、实际消费者与旧机制残留搜索通过。README/手映射文档/CLI同步。无新增依赖、框架、根 tests 或永久审计脚本。 |
+| 真机/GPU 验收 | 未执行 | 操作者安排，不在本轮本地软件实施范围。 |
 
+### 15.1 命令与覆盖
+
+使用已有 `real_robot` 环境，未安装/升级依赖：Python3.10.20、NumPy1.26.4、SciPy1.15.3、Pinocchio2.7.0、Ruckig0.17.3、OpenCV4.9.0、fpsample0.3.3、h5py3.16.0、av17.1.0、zarr2.18.3。系统无 python 命令，系统 python3 的依赖不符合项目；最终用现有环境完成验证，没有以 skip 代替缺失依赖。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_p1_verify.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_p1_owner.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_p1_review.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_p23_checks.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_p23_numeric.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_p23_sources.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_p23_home.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_p4_validation.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_p5_verify.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_final_checks.py
+git diff --check
+```
+
+最终命令均 exit0。故意注入 SDK stop、writer、model、shutdown 错误的 traceback 被断言为预期事实。临时脚本、日志、合成 Raw/Canonical 仅在 /tmp，不加入仓库；供本次工作区复现，若临时文件被系统清理须按上述场景重建。
+
+数值对比用 git show e077df1 加载基线，不改变工作树：5组固定状态 ArmFK/HandFK/Jacobian、指尖及1024手点云、固定 RGB-D 过滤+FPS点云、11种模型观测字段精确 array_equal（含shape/dtype），模型投影独立复制。重复 landmarks 的新动力学另验连续收敛、4rad/s限制、丢弃候选不改参考，不声称与旧逐VR帧轨迹等价。
+
+默认1024点视觉包24,592B，带640×480 RGB-D包1,560,600B；1000次固定输入复制约2.6/26μs，160×120固定深度点云处理约8ms。只证明该主机离线固定输入开销；未测真实相机吞吐、权重/GPU warmup或端到端控制时延。
+
+### 15.2 行为变化、修正与待验
+
+- 明确采用新契约：来源/目标等号过期；有效期从新发布起点算，删除来源期限传播与首次SDK同槽保证；teleop/jog soft ticks；重复VR每tick手映射；RTC策略前缀替代未来关节冻结；sync执行快照配对；replay不要求历史采集timing合格。均为批准的行为变化。
+- 交叉审查实际复现并修正：等代际锁期间取消仍可能进入hand SDK；Ruckig计算后授权读取失败仍沿未发送参考推进；外层关闭覆盖嵌套补充错误。回归通过。owner恢复调度先刷新到期反馈，成功但过慢查询保留来源时间、停止本轮而不写永久SDK fault；真实SDK/query异常继续报告故障。
+- 无规格偏离或外部接口冲突。sensor退出预算在lifecycle一处定为3s（现有相机read0.3s、stall2s），terminate/kill各1s；模型/writer仍用原有有限收尾预算，未把强制终止套给arm/model。ring少量槽仅缓冲复制竞争。
+- 真机/GPU未执行：停止/取消与模式切换、SDK stop失败及实际延迟、重复VR手部限速/收敛、HOME逐段到位、三策略模式与EEF当前状态映射、Raw导出有效前缀、replay目标跟踪、目标到期后的物理行为、视觉包与权重warmup开销。fake SDK/模型不证明物理安全、真实IK分支或GPU性能。
+
+
+### 15.3 全链路复审与对齐
+
+在上述38个未提交文件的基础上继续复审并原地修正，没有回退、覆盖用户工作或建立兼容双轨；新增涉及的生产文件仅为点云 dtype 注解、相机关闭与两个标定调用方。本节记录软件验收时的工作区状态，后续 Git 提交与同步按操作者授权执行。
+
+- **设备与 HOME**：删除仅剩单字段的 STATUS_DTYPE/frame 包装，双方直接传 ARM_STATE_DTYPE。区分 owner 自己等待预算耗尽与 SDK 原生 TimeoutError，后者保留 fault；新增内部 TimeoutError 子类仅用于该已复现的错误分类，不增加状态或协议。手 HOME 在阻塞 stop 后刷新反馈；arm HOME 在模式操作后检查起点，过慢的新查询也不能发 waypoint。wait_stopped/close 均拒绝 owner exit0但未处理停止的情况；Pipe关闭失败保留在最初设备错误之后。撤权失败不跳过后续资源关闭。
+- **控制与观测**：修复 teleop/keyboard 急停、writer清理失败或Q+ESC被返回为成功；jog输入过期按取消，真实目标拒绝停止当前motion，松开后新按键才能prepare。T显式复位传实际触觉需求。目标拒绝保留原有手部诊断。相机接收错误不被disconnect错误覆盖。sample_is_fresh改为必选显式now_ns的纯函数，HOME与两个标定消费者同步迁移；共享ring字段集合只在构造时验证，worker复用该布局事实。点云dtype注解不改变算法。
+- **模型与调度**：以真实Future复现回收超时/完成交错吞掉late exception，改用标准wait确认完成再result；未回收仍占用。取消分支stop失败进入段结果和Raw技术失败状态。启动等待在deadline等号先拒绝、再考虑poll结果；实际pending由Future事实表达。删除unused import，三种研究调度和上游接口保持当前有效契约。
+- **数据与回放**：实际复现并修复AV flush/container close/HDF5 close覆盖首因，以及RawReader构造/处理错误被close覆盖。资源owner直接持有并关闭真实H5/AV对象，不再重复维护ExitStack；writer/recorder的实际补充错误进入已有结果出口。replay手起点准备把有限收敛等待与固定2s命令租期分开，逐行expires从已记录submit_started计算。13字段、来源、URDF、Canonical前缀及正常teleop Replay准入保持；未发现生产SHA-256/hash校验或旧格式兼容分支可删，未误删防撕裂、限位、数据计数和来源校验。
+
+复审新增临时验证（统一使用前述real_robot Python、PYTHONDONTWRITEBYTECODE=1、PYTHONPATH=.）：
+
+```bash
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_followup_device.py
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_device_review_second.py
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_policy_review.py --fixed
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_p23_review.py --verify --verify-tactile --verify-diagnostics --verify-jog-rejection --verify-camera-cleanup
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_data_recheck.py
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_data_admission_recheck.py
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B /tmp/dexmani_followup_build.py
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B -m mypy --cache-dir=/tmp/dexmani_followup_mypy_cache --ignore-missing-imports --follow-imports=silent --namespace-packages --explicit-package-bases dexmani_real scripts
+/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B -m ruff check --no-cache --select F dexmani_real scripts
+git diff --check
+```
+
+新增6份回归与原10份矩阵最终共16份脚本均exit0；上述build另通过，wheel在/tmp/dexmani_followup_build_8n85k60f，构建使用--no-deps/--no-index/--no-build-isolation/--no-cache-dir，不安装依赖，确认包含全部Python模块与标定JSON。Ruff F检查全源码和F/I检查全部改动Python文件均exit0。Mypy默认检查95文件exit0，未注解函数体未全面检查，第三方缺失类型信息使用ignore-missing-imports，不声称全量严格类型验证。语法、37个改动生产模块导入、五CLI help、两print-config、旧机制搜索、diff检查与无缓存/无新增永久文件检查通过；真实FK/点云/手特征和模型投影再次与e077精确相同。
+
+完整默认Ruff规则集实际exit1、99项，包含C408字典写法、BLE001资源清理边界捕获、B010动态异常元数据和脚本EXE001等风格规则；未修改配置、批量格式化无关源码或将其称为全部通过。报告在/tmp/dexmani_followup_ruff_full_default.json，F/I报告在/tmp/dexmani_followup_ruff_changed_FI.json。没有恢复根tests或加入永久审计脚本。
+
+仍未执行真实硬件、权重推理/GPU、物理停止/到位及实际性能验收；新增安全边界用fake SDK和真实软件锁/文件I/O证明调用顺序与错误状态，不能替代真机测量。README、CLI提示与当前接口同步。

@@ -1,4 +1,4 @@
-"""Raw 轨迹读取与回放采样缓存。"""
+"""读取标称频率目标序列及首行实测起点，保存本次回放的真实采样。"""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,11 +17,11 @@ class Trajectory:
     task_label: str
     action_arm_joint: np.ndarray
     action_hand_joint: np.ndarray
-    arm_qpos: np.ndarray
-    hand_qpos: np.ndarray
+    initial_arm_qpos: np.ndarray
+    initial_hand_qpos: np.ndarray
 
     def __len__(self):
-        return len(self.arm_qpos)
+        return len(self.action_arm_joint)
 
 
 def load_trajectory(episode_path):
@@ -30,26 +30,22 @@ def load_trajectory(episode_path):
         if meta["collection_source"] != "teleop":
             raise ValueError("physical replay requires a teleop episode")
         reader.validate_completion()
-        arm, hand, aq, hq = [
-            reader[k][:]
-            for k in (
-                "action_arm_joint_target",
-                "action_hand_joint_target",
-                "arm_qpos",
-                "hand_qpos",
-            )
-        ]
-        if len(arm) == 0 or not all(np.isfinite(v).all() for v in (arm, hand, aq, hq)):
-            raise ValueError("replay requires nonempty finite targets and robot states")
-        reader.validate_replay_timing()
+        arm = reader["action_arm_joint_target"][:]
+        hand = reader["action_hand_joint_target"][:]
+        if len(arm) == 0 or not all(np.isfinite(v).all() for v in (arm, hand)):
+            raise ValueError("replay requires nonempty finite targets")
+        initial_arm = reader["arm_qpos"][0]
+        initial_hand = reader["hand_qpos"][0]
+        if not all(np.isfinite(v).all() for v in (initial_arm, initial_hand)):
+            raise ValueError("replay requires finite initial robot states")
         return Trajectory(
             str(reader.path),
             reader.control_hz,
             meta["task_label"],
             arm,
             hand,
-            aq,
-            hq,
+            initial_arm,
+            initial_hand,
         )
 
 

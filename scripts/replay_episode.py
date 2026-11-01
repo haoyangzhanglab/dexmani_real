@@ -11,7 +11,11 @@ from dexmani_real.config.real import load_config
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Physically replay a recorded trajectory on the xArm7 and XHand.",
+        description=(
+            "Submit teleop Raw targets at their nominal frequency on the xArm7 and XHand. "
+            "Recorded timing need not be regular; completion means all targets were submitted, "
+            "not that historical physical motion was reproduced."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

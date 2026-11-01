@@ -87,7 +87,7 @@ class AdaptiveHandRetargeter:
             raise RuntimeError("hand retargeting requires calibration and a measured reset pose")
         if timestamp_ns < self.command_timestamp_ns:
             raise ValueError("hand observation time moved backwards")
-        # 准备阶段 reset 后用同一观测预计算，零间隔使用名义控制周期。
+        # 同一控制时刻的首 tick 使用名义周期；其后基于最后实际提交参考。
         dt_s = (timestamp_ns - self.command_timestamp_ns) * 1e-9 or self.nominal_dt_s
         self.rejection_reason = None
         self.last_diagnostics = {}
@@ -161,7 +161,7 @@ class AdaptiveHandRetargeter:
         return np.clip(command, self.limits[:, 0], self.limits[:, 1])
 
     def commit(self, qpos, *, timestamp_ns):
-        # 调用方仅在不可变 RobotCommand 已发送并复核授权后提交状态。
+        # 控制线程仅在发送正常返回后更新最后提交参考。
         if self.command_timestamp_ns is None or timestamp_ns < self.command_timestamp_ns:
             raise ValueError("committed hand time moved backwards or reset is missing")
         self.previous_command = qpos.copy()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -239,4 +240,13 @@ def run_camera(shared, config: CameraConfig):
             shared.camera_ready.set()
     finally:
         shared.camera_ready.clear()
-        camera.disconnect()
+        failure = sys.exc_info()[1]
+        try:
+            camera.disconnect()
+        except BaseException as exc:
+            if failure is None:
+                raise
+            setattr(failure, "cleanup_errors", [
+                *getattr(failure, "cleanup_errors", ()), ("camera_disconnect", exc),
+            ])
+            logger.exception("camera shutdown also failed")

@@ -18,7 +18,8 @@ from dexmani_real.utils.table_plane import load_table_plane
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Export one valid continuous prefix per Raw episode to a canonical multimodal Zarr. "
+            "Export one valid continuous prefix per teleop Raw episode to a canonical multimodal Zarr. "
+            "Policy rollout evaluation logs are not demonstration data. "
             "Report trimmed tails; reject structural corruption or an empty valid prefix."
         )
     )

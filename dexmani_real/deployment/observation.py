@@ -51,8 +51,8 @@ class ObservationBuilder:
             camera_fields=tuple(name for name in ("rgb", "depth") if name in self.dependencies),
             point_cloud="cloud" in self.dependencies,
             required_tactile=tuple(c for c in ("aggregate", "dense") if c in self.dependencies),
-            camera_static="camera_static" in self.dependencies,
         )
+        self.camera_static = "camera_static" in self.dependencies
         self.camera_parameters = {}
         self.arm_fk = ArmFK() if "arm_fk" in self.dependencies else None
         self.hand_fk = self.hand_cloud = None
@@ -76,11 +76,11 @@ class ObservationBuilder:
                 # 独立复制，避免聚合触觉视图持有仅供录制的稠密载荷。
                 values[name] = row.hand["tactile_aggregate"][0].copy()
             elif name == "taxel_tactile_force":
-                values[name] = row.hand["tactile_dense"][0]
+                values[name] = row.hand["tactile_dense"][0].copy()
             elif name == "point_cloud":
-                values[name] = row.point_cloud
+                values[name] = row.point_cloud.copy()
             elif name in {"rgb", "depth"}:
-                values[name] = row.camera[name]
+                values[name] = row.camera[name].copy()
         return PolicyObservationRow(values)
 
     def configure_camera(self, camera):

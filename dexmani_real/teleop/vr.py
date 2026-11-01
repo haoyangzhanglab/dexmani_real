@@ -21,8 +21,6 @@ class VRController:
         self.anchor = None
         self.previous_arm_command = None
         self.previous_eef_target = None
-        self.hand_observation_id = self.hand_target = None
-        self.target_timestamp_ns = None
         self.rejection_reason = None
 
     def reset(self, row):
@@ -58,31 +56,24 @@ class VRController:
         alpha_pos = self.config.ema_alpha_pos
         return Pose(alpha_pos * position + (1.0 - alpha_pos) * previous.p, smoothed.as_quat()[XYZW_TO_WXYZ])
 
-    def compute_target(self, row):
-        self.target_timestamp_ns = row.observation_timestamp_ns
+    def compute_target(self, row, *, control_ns):
         self.rejection_reason = None
         target = self._wrist_target(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
         hand = None
         if self.hand_retargeter is not None:
-            observation_id = row.vr["ring_sequence"]
-            if self.hand_observation_id != observation_id:
-                # 先标记输入，求解失败后也不重复消费同一帧。
-                self.hand_observation_id = observation_id
-                self.hand_target = None
-                self.hand_target = self.hand_retargeter.retarget(
-                    row.vr["landmarks"], timestamp_ns=row.observation_timestamp_ns,
-                )
-            if self.hand_target is None:
+            hand = self.hand_retargeter.retarget(
+                row.vr["landmarks"], timestamp_ns=control_ns,
+            )
+            if hand is None:
                 self.rejection_reason = self.hand_retargeter.rejection_reason
                 return None
-            hand = self.hand_target
         return self.action_mapper.map_eef(
             target, hand, row.arm["qpos"][0], self.previous_arm_command
         )
 
-    def commit(self, command, *, eef_pose):
+    def commit(self, command, *, eef_pose, control_ns):
         if self.hand_retargeter is not None:
-            self.hand_retargeter.commit(command.hand_qpos, timestamp_ns=self.target_timestamp_ns)
+            self.hand_retargeter.commit(command.hand_qpos, timestamp_ns=control_ns)
         self.previous_arm_command = command.arm_qpos
         # map_eef 交出的临时目标此后归控制器所有。
         self.previous_eef_target = eef_pose

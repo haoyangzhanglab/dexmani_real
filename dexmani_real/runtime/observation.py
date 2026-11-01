@@ -15,11 +15,10 @@ class ObservationNeeds:
     point_cloud: bool = False
     vr: bool = False
     required_tactile: tuple[str, ...] = ()
-    camera_static: bool = False
 
     @property
     def camera_worker(self):
-        return bool(self.camera_fields) or self.point_cloud or self.camera_static
+        return bool(self.camera_fields) or self.point_cloud
 
     def union(self, other):
         return ObservationNeeds(
@@ -33,7 +32,6 @@ class ObservationNeeds:
                 channel for channel in ("aggregate", "dense")
                 if channel in self.required_tactile or channel in other.required_tactile
             ),
-            camera_static=self.camera_static or other.camera_static,
         )
 
 
@@ -58,9 +56,12 @@ def read_observation(channels, robot, *, needs=ObservationNeeds()):
     if needs.camera_fields:
         if needs.point_cloud:
             if cloud is not None:
-                camera = read_camera_frame(
-                    channels, int(cloud["source_camera_sequence"]), fields=needs.camera_fields,
-                )
+                camera = {
+                    "timestamp_ns": int(cloud["timestamp_ns"]),
+                    "ring_sequence": int(cloud["source_camera_sequence"]),
+                    "color_frame_number": int(cloud["color_frame_number"]),
+                    **{name: cloud[name] for name in needs.camera_fields},
+                }
         else:
             camera = read_camera_frame(channels, fields=needs.camera_fields)
     vr = read_vr_frame(channels) if needs.vr else None
@@ -74,12 +75,11 @@ def read_observation(channels, robot, *, needs=ObservationNeeds()):
 
 
 def check_observation(row, runtime, needs, *, require_hand=True):
-    """复制传感器快照后复核来源年龄，返回问题及绝对提交期限。"""
+    """在入口对需求并集裁决一次；缓存读取不续期或传播来源期限。"""
     now = time.monotonic_ns()
     issues = []
     stamp = int(row.arm["timestamp_ns"][0])
     deadline = stamp + int(runtime.arm.feedback_max_age_s * 1e9)
-    deadlines = [deadline]
     if not 0 < stamp <= now < deadline:
         issues.append("arm_feedback_stale")
     if require_hand and row.hand is None:
@@ -88,7 +88,6 @@ def check_observation(row, runtime, needs, *, require_hand=True):
         for name in ("timestamp_ns", *(f"tactile_{c}_timestamp_ns" for c in needs.required_tactile)):
             stamp = int(row.hand[name][0])
             deadline = stamp + int(runtime.hand.feedback_max_age_s * 1e9)
-            deadlines.append(deadline)
             if require_hand and not 0 < stamp <= now < deadline:
                 issues.append(f"hand_{name}_unavailable_or_stale")
     if needs.camera_fields:
@@ -96,15 +95,15 @@ def check_observation(row, runtime, needs, *, require_hand=True):
             issues.append("camera_source_unavailable_or_unmatched")
         else:
             stamp = int(row.camera["timestamp_ns"])
-            deadlines.append(stamp + int(runtime.camera.max_frame_age_s * 1e9))
-            if not sample_is_fresh(stamp, runtime.camera.max_frame_age_s, now):
+            if not needs.point_cloud and not sample_is_fresh(
+                stamp, runtime.camera.max_frame_age_s, now,
+            ):
                 issues.append("camera_source_stale")
     if needs.point_cloud:
         if row.point_cloud is None:
             issues.append("pointcloud_unavailable")
         else:
             stamp = row.pointcloud_timestamp_ns
-            deadlines.append(stamp + int(runtime.camera.max_frame_age_s * 1e9))
             if not sample_is_fresh(stamp, runtime.camera.max_frame_age_s, now):
                 issues.append("pointcloud_stale")
     if needs.vr:
@@ -113,7 +112,6 @@ def check_observation(row, runtime, needs, *, require_hand=True):
         else:
             stamp = int(row.vr["recv_ts_ns"])
             age = runtime.teleop.vr_stale_threshold_s
-            deadlines.append(stamp + int(age * 1e9) + 1)
             if not sample_is_fresh(stamp, age, now):
                 issues.append("vr_stale")
-    return issues, None if issues else min(deadlines)
+    return issues

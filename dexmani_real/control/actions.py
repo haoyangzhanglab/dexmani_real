@@ -6,7 +6,7 @@ import numpy as np
 
 from dexmani_real.control.constraints import MotionConstraints, wrap_nearest_equivalent
 from dexmani_real.control.ik import IKSolver
-from dexmani_real.geometry.pose import Pose, encode_eef_pose
+from dexmani_real.geometry.pose import Pose, rot6d_to_rotmat
 
 
 @dataclass(frozen=True)
@@ -115,24 +115,20 @@ class ActionMapper:
             eef_pose=pose,
         )
 
-    def control_from_command(self, command, mode):
-        if mode == "joint":
-            return np.concatenate((command.arm_qpos, command.hand_qpos))
-        pose = self.constraints.target_fk.forward(command.arm_qpos)
-        return np.concatenate((encode_eef_pose(pose), command.hand_qpos))
-
-    def frozen_rejection(self, command, current, mode):
-        # prepare_prefix/map_command 已准入不可变目标；静态场景无需重复几何检查。
-        if mode == "joint":
-            projected = project_arm_command(
-                command.arm_qpos,
-                current,
-                joint_lower_rad=self.constraints.limits[:, 0],
-                joint_upper_rad=self.constraints.limits[:, 1],
-            )
-            if not np.array_equal(projected, command.arm_qpos):
-                return "frozen_equivalent_branch_changed"
-        return None
+    def normalize_policy_actions(self, actions, mode):
+        """RTC 承诺策略动作；关节等价分支和 IK 留到实际执行槽。"""
+        values = np.array(actions, dtype=np.float64, copy=True)
+        size = 19 if mode == "joint" else 21
+        if values.ndim != 2 or values.shape[1] != size or not np.isfinite(values).all():
+            raise ValueError(f"policy actions require finite (P, {size}) values")
+        hand_start = 7 if mode == "joint" else 9
+        values[:, hand_start:] = np.clip(values[:, hand_start:], self.hand_lower, self.hand_upper)
+        if mode == "eef":
+            workspace = self.constraints.workspace
+            values[:, :3] = np.clip(values[:, :3], workspace[:, 0], workspace[:, 1])
+            rotation = rot6d_to_rotmat(values[:, 3:9])
+            values[:, 3:9] = np.concatenate((rotation[:, :, 0], rotation[:, :, 1]), axis=1)
+        return values
 
 
 def project_arm_command(target_arm_qpos, reference_arm_qpos, *, joint_lower_rad, joint_upper_rad):

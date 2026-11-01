@@ -10,13 +10,13 @@
 | `teleop/retargeting/objective.py` | 位置、方向、对指、阻尼的函数值与解析梯度 |
 | `teleop/retargeting/adaptive.py` | 求解限位、滤波、诊断及提交状态 |
 
-在线入口为 `sensor/vr.py` → `teleop/vr.py::VRController` → `AdaptiveHandRetargeter`。候选求解不推进状态；只有动作提交成功并在授权锁内复核后，`commit` 才从实际 `RobotCommand` 更新 warm start、阻尼中心、滤波中心和时间戳。重复读取同一 VR 缓存帧（由 `ring_sequence` 识别）时复用手部候选，每个新段从新实测关节重置，会话内骨长标定保留。重定向几何检查或求解失败会明确结束当前段。
+在线入口为 `sensor/vr.py` → `teleop/vr.py::VRController` → `AdaptiveHandRetargeter`。候选求解不推进状态；只有设备提交正常返回后，控制线程才从实际 `RobotCommand` 更新 warm start、阻尼中心、滤波中心和时间戳；不再另建授权事务。每个控制 tick 都重新映射最新有效 landmarks，重复 VR 帧也可在速度限制内继续收敛。每个新段在 arm prepare 后从一份当前有效快照建立实测/VR 锚点，会话内骨长标定保留。重定向几何检查或求解失败会明确结束当前段。
 
 运行入口在构造前检查机器人配置和控制频率。关节反馈的形状及有限性由 XHand SDK 边界保证；HTS 21 点在接收并转换为 FLU 后完成同样检查。重定向保留 float64 转换、reset 时的操作限位裁剪和独立数组，以及骨长和掌退化检查。
 
 腕部原始四元数在 SDK 基变换前检查并归一化，零范数或非有限姿态被拒绝。接收边界的坏帧不发布，控制侧继续按原来源时间检查观测时效。
 
-失败或异常控制步会将诊断保存到 `termination_details` 的 `stage="control_timing"` 条目；`hand_retargeting` 字段来自本步重定向调用已生成的诊断。成功控制步不逐帧保存这些诊断；重复读取同一 VR 缓存帧时不附带上次求解的诊断。
+失败或异常控制步会将诊断保存到 `termination_details` 的 `stage="control_timing"` 条目；`hand_retargeting` 字段来自本步重定向调用已生成的诊断。成功控制步不逐帧保存这些诊断；重复 VR 帧也产生当次求解诊断。
 
 ## 输入与机构对应
 
@@ -55,7 +55,7 @@
 
 捏合是辅助目标：掌宽归一化距离门控乘以末段夹角 60→90° 的门控，使用观察到的缩放距离，不强制固定间隙，也不削弱姿态项。它只是几何意图代理，数据中没有接触或意图真值。
 
-求解变量是滤波前候选。最终命令为 `previous + alpha*(candidate-previous)`，`alpha=-expm1(-dt/tau)`；`tau=0` 时 `alpha=1`。`dt` 来自本次控制观测与上次成功提交观测的主机时间戳差，不使用 VR 来源帧间隔；准备阶段同一观测的 reset 与预计算使用名义控制周期。搜索步长除以 alpha，保证滤波不额外压低最终变化率上限。返回前按限位裁剪浮点舍入误差，运行链路映射时检查操作范围、发送时检查机械范围和反馈时效；`commit` 消费成功发送的不可变命令，只更新时间和状态。
+求解变量是滤波前候选。最终命令为 `previous + alpha*(candidate-previous)`，`alpha=-expm1(-dt/tau)`；`tau=0` 时 `alpha=1`。`dt` 来自本次控制计算开始与上次实际提交参考的 monotonic 时间差，不使用 VR 来源帧间隔。首 tick 若与 reset 同时则使用名义控制周期。超出本 tick 提交机会的候选直接丢弃，最后提交的关节、滤波和时间参考保持不变；这使重复帧动力学和柔性节拍相对旧实现发生明确变化。搜索步长除以 alpha，保证滤波不额外压低最终变化率上限。返回前按限位裁剪浮点舍入误差，运行链路映射时检查操作范围、发送时检查机械范围和反馈时效；`commit` 消费成功发送的不可变命令，只更新时间和状态。
 
 ## 验证边界与限制
 

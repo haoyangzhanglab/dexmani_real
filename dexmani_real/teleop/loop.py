@@ -59,11 +59,11 @@ class TeleopLoop:
         self.runtime = runtime
         self.robot = robot
         self.sensors = sensors
-        self.control_needs = ObservationNeeds(vr=True)
-        self.record_needs = (
+        record_needs = (
             ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
             if recording_dir is not None else ObservationNeeds()
         )
+        self.needs = ObservationNeeds(vr=True).union(record_needs)
         self.controller = controller
         self.home_planner = home_planner
         self.recording_dir = recording_dir
@@ -75,7 +75,6 @@ class TeleopLoop:
 
         self.phase = TeleopPhase.IDLE
         self.run_id = None
-        self.prepared_after_ns = 0
         self.tick_origin_ns = None
         self.tick_index = 0
         self.control_dt_ns, _ = sampling_clock_ns(runtime.teleop.control_hz)
@@ -94,9 +93,8 @@ class TeleopLoop:
         return self.tick_origin_ns + self.tick_index * self.control_dt_ns
 
     def request_discard(self):
-        with self.runtime_state.motion_lock:
-            self.discard_requested = True
-            self.runtime_state.request_stop()
+        self.discard_requested = True
+        self.runtime_state.request_stop()
 
     def record_error(self, stage, exc):
         if isinstance(exc, KeyboardInterrupt):
@@ -108,12 +106,9 @@ class TeleopLoop:
         self.termination_details.append(error_detail(stage, exc))
 
     def stop_control(self, reason, *, run_end_reason=RunEndReason.OPERATOR):
-        with self.runtime_state.motion_lock:
-            self.request_episode_end(reason, run_end_reason=run_end_reason, failed=False)
-            stopped_epoch = self.runtime_state.run_id
+        self.request_episode_end(reason, run_end_reason=run_end_reason, failed=False)
         if self.robot.stop_required:
             self.robot.stop()
-        self.runtime_state.acknowledge_stop(stopped_epoch)
 
     def end_episode(
         self, reason, *, run_end_reason=RunEndReason.OPERATOR,
@@ -163,8 +158,8 @@ class TeleopLoop:
     ):
         """先撤权并保留结束意图，资源收尾由 run_episode 的边界执行。"""
         self.capture_failed |= failed
+        self.runtime_state.revoke_motion(reason=run_end_reason, expected_run_id=self.run_id)
         with self.runtime_state.motion_lock:
-            self.runtime_state.revoke_motion(reason=run_end_reason, expected_run_id=self.run_id)
             if self.pending_termination_reason is None:
                 self.pending_termination_reason = (
                     self.runtime_state.run_ended_reason
@@ -193,7 +188,7 @@ class TeleopLoop:
             return True
         if self.preparation_valid():
             return False
-        if self.runtime_state.stop_request:
+        if self.runtime_state.stop_signal.is_set():
             return True  # 停止回调已撤权，按键随后给出保存/丢弃意图。
         self.request_episode_end("preparation_revoked")
         return True
@@ -216,45 +211,7 @@ class TeleopLoop:
         self.capture_failed = self.discard_requested = False
         self.pending_termination_reason = None
         self.termination_details = []
-        self.robot.stop()
         if self.preparation_interrupted():
-            return
-
-        self.robot.reset_hand_feedback()
-        needs = self.control_needs.union(self.record_needs)
-        self.robot.read_initial_state(
-            required_tactile=needs.required_tactile,
-            cancel_requested=lambda: self.poll_blocking_commands() or not self.preparation_valid(),
-        )
-        if self.preparation_interrupted():
-            return
-        row = read_observation(self.sensors.channels, self.robot, needs=needs)
-        issues, _ = self.admit_observation(row)
-        if issues:
-            self.request_episode_end("preparation_unavailable")
-            return
-        if self.preparation_interrupted():
-            return
-
-        # 首次求解在准备阶段完成，不占用第一帧的控制期限，也不提交预计算目标。
-        started_ns = time.monotonic_ns()
-        try:
-            self.controller.reset(row)
-            result = self.controller.compute_target(row)
-            hand_rejection = self.controller.rejection_reason
-        finally:
-            elapsed_ms = (time.monotonic_ns() - started_ns) / 1e6
-            self.termination_details.append(dict(stage="precompute", elapsed_ms=elapsed_ms))
-            self.controller.clear()
-        if self.preparation_interrupted():
-            return
-        logger.info("Teleop precompute run=%s: %.2f ms", self.run_id, elapsed_ms)
-        if result is None or result.rejection_reason is not None or result.arm_qpos is None:
-            detail = (
-                result.rejection_reason if result is not None
-                else hand_rejection or "hand target rejected"
-            )
-            self.request_episode_end(f"preparation_target_unavailable: {detail}")
             return
 
         if self.recording_dir is not None:
@@ -282,9 +239,15 @@ class TeleopLoop:
         if self.preparation_interrupted():
             return
         self.robot.prepare_streaming(self.run_id)
-        # 锚点与反馈必须来自 prepare 完成之后。
-        self.prepared_after_ns = time.monotonic_ns()
-        self.preparation_interrupted()
+        if self.preparation_interrupted():
+            return
+        self.robot.service_feedback()
+        row = read_observation(self.sensors.channels, self.robot, needs=self.needs)
+        issues = self.admit_observation(row)
+        if issues:
+            self.request_episode_end("preparation_sources: " + "; ".join(issues))
+            return
+        self.try_begin(row)
 
     def handle_operator_command(self, cmd, *, expected_run_id=None):
         event = dict(
@@ -325,7 +288,10 @@ class TeleopLoop:
                 return False
             try:
                 logger.info("正在请求触觉传感器复位，请保持手部无接触；S/Q/Esc 可中断后续请求。")
-                self.robot.reset_tactile_sensors(cancel_requested=self.poll_blocking_commands)
+                self.robot.reset_tactile_sensors(
+                    cancel_requested=self.poll_blocking_commands,
+                    required_tactile=self.needs.required_tactile,
+                )
             except OperationCancelled as exc:
                 logger.info("%s", exc)
             finally:
@@ -337,16 +303,15 @@ class TeleopLoop:
                 return True
             if not self.poll_blocking_commands():
                 logger.info("正在回初始位…")
-                result = home_robot(
-                    self.runtime_state, self.robot, self.home_planner,
-                    cancel_requested=self.poll_blocking_commands,
-                )
-                if result.ok:
-                    logger.info("已回初始位。")
-                elif result.interrupted:
-                    logger.info("HOME cancelled: %s", result.reason)
+                try:
+                    home_robot(
+                        self.runtime_state, self.robot, self.home_planner,
+                        cancel_requested=self.poll_blocking_commands,
+                    )
+                except OperationCancelled as exc:
+                    logger.info("HOME cancelled: %s", exc)
                 else:
-                    raise RuntimeError(f"HOME failed: {result.reason}")
+                    logger.info("已回初始位。")
             self.poll_blocking_commands()
             return True
         elif cmd == "b":
@@ -377,11 +342,6 @@ class TeleopLoop:
     def try_begin(self, row):
         if self.preparation_interrupted():
             return
-        stamps = [row.arm["timestamp_ns"][0], row.vr["recv_ts_ns"]]
-        if row.hand is not None:
-            stamps.append(row.hand["timestamp_ns"][0])
-        if min(stamps) <= self.prepared_after_ns:
-            return
         self.controller.reset(row)
         with self.runtime_state.motion_lock:
             authorized = self.preparation_valid() and self.runtime_state.begin_motion()
@@ -405,7 +365,7 @@ class TeleopLoop:
 
     def record_control_timing(
         self, row, epoch, deadline_ns, compute_start_ns, compute_end_ns,
-        submit_start_ns, submit_end_ns, previous_hand_observation_id,
+        submit_start_ns, submit_end_ns,
     ):
         """仅失败时编码诊断；所有开始/完成时点已在实际事件处采集。"""
         ended_ns = time.monotonic_ns()
@@ -418,100 +378,68 @@ class TeleopLoop:
                             ("submit_end_ns", submit_end_ns)):
             if stamp is not None:
                 timing[name] = stamp
-        if (
-            self.controller.hand_retargeter is not None
-            and self.controller.hand_observation_id != previous_hand_observation_id
-        ):
+        if self.controller.hand_retargeter is not None:
             timing["hand_retargeting"] = self.controller.hand_retargeter.last_diagnostics.copy()
         self.termination_details.append(timing)
 
-    def execute_control_step(self, row, deadline_ns, feedback_until_ns):
-        epoch = cast(int, self.run_id)  # 仅 ACTIVE 阶段调用，保留本段的授权 ID 快照。
-        deadline_ns = min(deadline_ns, feedback_until_ns)
+    def execute_control_step(self, row, tick_end_ns):
+        epoch = cast(int, self.run_id)
         command = None
-        reason = None
-        cancelled = False
         compute_start_ns = time.monotonic_ns()
         compute_end_ns = submit_start_ns = submit_end_ns = None
-        previous_hand_observation_id = self.controller.hand_observation_id
-        operator_end = False
         try:
-            result = self.controller.compute_target(row)
+            result = self.controller.compute_target(row, control_ns=compute_start_ns)
             compute_end_ns = time.monotonic_ns()
             if result is None or result.rejection_reason is not None or result.arm_qpos is None:
                 detail = (
                     result.rejection_reason if result is not None
                     else self.controller.rejection_reason or "hand target rejected"
                 )
-                reason = f"target_unavailable: {detail}"
-            else:
-                if self.recorder is not None:
-                    self.recorder.check_error()
-                try:
-                    if not self.runtime_state.can_move(run_id=epoch):
-                        raise OperationCancelled("teleop cancelled before submission")
-                    if time.monotonic_ns() >= deadline_ns:
-                        reason = "teleop expired before submission"
-                    else:
-                        command = RobotCommand(epoch, result.arm_qpos, result.hand_qpos)
-                        submit_start_ns = time.monotonic_ns()
-                        self.robot.send_action(
-                            command,
-                            valid_until_ns=deadline_ns,
-                            execute_until_ns=int(row.vr["recv_ts_ns"])
-                            + int(self.runtime.teleop.vr_stale_threshold_s * 1e9),
-                        )
-                        submit_end_ns = time.monotonic_ns()
-                except OperationCancelled as exc:
-                    cancelled = True
-                    reason = f"control_interrupted: {exc}"
-
-            if reason is None or cancelled:
-                # 授权检查和内部状态提交同属一个临界区；锁内没有设备或写盘 I/O。
-                with self.runtime_state.motion_lock:
-                    if not self.runtime_state.can_move(run_id=epoch):
-                        reason, cancelled = reason or "motion_revoked", True
-                    elif time.monotonic_ns() >= deadline_ns:
-                        reason, cancelled = "submission_deadline_expired", False
-                    elif reason is None:
-                        self.controller.commit(command, eef_pose=result.eef_pose)
-            if cancelled:
-                # 撤权不能掩盖同时发生的设备/服务故障。
-                self.robot.check()
-                with self.runtime_state.motion_lock:
-                    ended = self.runtime_state.run_ended_reason
-                    operator_end = (
-                        self.runtime_state.run_ended_id == epoch
-                        and ended in (RunEndReason.OPERATOR, RunEndReason.QUIT)
-                        and not self.runtime_state.estop_request
-                        and not self.runtime_state.error_state
-                    )
-                if operator_end:
-                    # 回调先撤权、后入队；由按键决定保存/丢弃，未完成的行不补录。
-                    return
-            if reason is not None:
                 self.record_control_timing(
-                    row, epoch, deadline_ns, compute_start_ns, compute_end_ns,
-                    submit_start_ns, submit_end_ns, previous_hand_observation_id,
+                    row, epoch, tick_end_ns, compute_start_ns, compute_end_ns,
+                    submit_start_ns, submit_end_ns,
                 )
-                self.request_episode_end(reason)
-            elif self.tick_index == 1:
+                self.request_episode_end(f"target_unavailable: {detail}")
+                return
+            if self.recorder is not None:
+                self.recorder.check_error()
+            if not self.runtime_state.can_move(run_id=epoch):
+                raise OperationCancelled("teleop cancelled before submission")
+            if time.monotonic_ns() >= tick_end_ns:
+                # 未发送的候选不推进滤波、关节或时间参考；下周期从最新输入继续。
+                self.record_control_timing(
+                    row, epoch, tick_end_ns, compute_start_ns, compute_end_ns,
+                    submit_start_ns, submit_end_ns,
+                )
+                return
+            command = RobotCommand(epoch, result.arm_qpos, result.hand_qpos)
+            submit_start_ns = time.monotonic_ns()
+            self.robot.send_action(
+                command,
+                expires_ns=submit_start_ns + int(self.runtime.teleop.vr_stale_threshold_s * 1e9),
+            )
+            submit_end_ns = time.monotonic_ns()
+            self.controller.commit(command, eef_pose=result.eef_pose, control_ns=compute_start_ns)
+            if self.tick_index == 1:
                 logger.info("Teleop first target submitted run=%s", epoch)
+        except OperationCancelled as exc:
+            # 取消不能掩盖同时发生的 SDK/worker 故障；排队的按键随后决定保存意图。
+            self.robot.check()
+            self.poll_blocking_commands()
+            if self.pending_termination_reason is None:
+                self.request_episode_end(f"control_interrupted: {exc}")
         finally:
             primary_error = sys.exc_info()[1]
             if primary_error is not None:
                 self.runtime_state.revoke_motion(
                     reason=failure_reason(primary_error), expected_run_id=epoch,
                 )
-                try:
-                    self.record_control_timing(
-                        row, epoch, deadline_ns, compute_start_ns, compute_end_ns,
-                        submit_start_ns, submit_end_ns, previous_hand_observation_id,
-                    )
-                except BaseException:
-                    logger.exception("teleop failure timing also failed")
+                self.record_control_timing(
+                    row, epoch, tick_end_ns, compute_start_ns, compute_end_ns,
+                    submit_start_ns, submit_end_ns,
+                )
             try:
-                if self.recorder is not None and not operator_end:
+                if self.recorder is not None:
                     self.recorder.append(row, command)
             except BaseException as exc:
                 if primary_error is None:
@@ -520,21 +448,14 @@ class TeleopLoop:
                 logger.exception("teleop frame recording also failed")
 
     def admit_observation(self, row):
-        issues, feedback_until_ns = check_observation(
-            row, self.runtime, self.control_needs, require_hand=self.runtime.hand.enabled,
+        return check_observation(
+            row, self.runtime, self.needs, require_hand=self.runtime.hand.enabled,
         )
-        if issues:
-            return issues, feedback_until_ns
-        if self.recording_dir is not None:
-            record_issues, _ = check_observation(row, self.runtime, self.record_needs)
-            if record_issues:
-                raise RecordingError("recording sources: " + "; ".join(record_issues))
-        return issues, feedback_until_ns
 
     def run_control_tick(self):
         if self.phase is not TeleopPhase.ACTIVE:
             return
-        if self.runtime_state.stop_request:
+        if self.runtime_state.stop_signal.is_set():
             return  # 等待已经撤权、尚未入队的停止按键。
         if (
             self.recorder is not None
@@ -550,22 +471,12 @@ class TeleopLoop:
         if self.tick_origin_ns is not None:
             if now_ns < self.next_tick_ns:
                 return
-            if now_ns >= self.next_tick_ns + self.control_dt_ns:
-                self.termination_details.append(
-                    dict(
-                        stage="sampling",
-                        reason="missed_tick",
-                        tick=self.tick_index,
-                        due_ns=self.next_tick_ns,
-                        observed_ns=now_ns,
-                    )
-                )
-                self.request_episode_end("missed_tick")
-                return
+            # 绝对网格上跳过错过的时点，不追赶历史控制决策。
+            self.tick_index += (now_ns - self.next_tick_ns) // self.control_dt_ns
         row = read_observation(
-            self.sensors.channels, self.robot, needs=self.control_needs.union(self.record_needs),
+            self.sensors.channels, self.robot, needs=self.needs,
         )
-        issues, feedback_until_ns = self.admit_observation(row)
+        issues = self.admit_observation(row)
         if issues:
             self.request_episode_end("control_sources: " + "; ".join(issues))
             return
@@ -573,22 +484,13 @@ class TeleopLoop:
         if self.tick_origin_ns is None:
             self.tick_origin_ns = stamp
         if stamp >= self.next_tick_ns + self.control_dt_ns:
-            self.termination_details.append(
-                dict(
-                    stage="sampling",
-                    reason="late_observation",
-                    tick=self.tick_index,
-                    due_ns=self.next_tick_ns,
-                    observed_ns=stamp,
-                )
-            )
-            # 停止后才保存迟到的观测。
-            self.request_episode_end("late_observation")
+            # 本次复制已错过提交机会；不映射、不提交，下个未来时点重新读。
+            self.tick_index += (stamp - self.next_tick_ns) // self.control_dt_ns + 1
             if self.recorder is not None:
                 self.recorder.append(row)
             return
         self.tick_index += 1
-        self.execute_control_step(row, self.next_tick_ns, feedback_until_ns)
+        self.execute_control_step(row, self.next_tick_ns)
 
     def close(self):
         if self.recorder is not None and self.recorder.finish_request is not None:
@@ -602,7 +504,7 @@ class TeleopLoop:
 
     def service_episode(self, timeout):
         self.robot.arm.check_error()
-        if self.runtime_state.stop_request:
+        if self.runtime_state.stop_signal.is_set():
             self.robot.service_idle()
         else:
             self.robot.service_feedback()
@@ -623,19 +525,31 @@ class TeleopLoop:
         if self.phase is TeleopPhase.ACTIVE and self.next_tick_ns is not None:
             timeout = min(timeout, max(0.0, (self.next_tick_ns - time.monotonic_ns()) / 1e9))
         self.handle_commands(self.keyboard.poll(timeout=timeout), self.runtime_state.run_id)
+        if (
+            self.phase is TeleopPhase.ACTIVE and self.pending_termination_reason is None
+            and self.runtime_state.stop_signal.is_set()
+        ):
+            # owner 的普通租期到期也会置 stop；不能只等永远不会出现的键盘事件。
+            with self.runtime_state.motion_lock:
+                operator_pending = (
+                    self.runtime_state.run_ended_id == self.run_id
+                    and self.runtime_state.run_ended_reason in (RunEndReason.OPERATOR, RunEndReason.QUIT)
+                )
+            if not operator_pending:
+                self.request_episode_end("executor_stopped")
         return (
             self.pending_termination_reason is None
             and self.runtime_state.running and not self.runtime_state.quit_requested
         )
 
     def run_episode(self, expected_run_id):
-        """顺序准备、等待新观测、控制，最后在唯一边界停止和收尾。"""
+        """顺序 prepare、一次快照锚定、控制，最后在唯一边界停止和收尾。"""
         try:
             try:
                 self.start_episode(expected_run_id)
             except OperationCancelled:
                 self.poll_blocking_commands()
-                if self.pending_termination_reason is None and not self.runtime_state.stop_request:
+                if self.pending_termination_reason is None and not self.runtime_state.stop_signal.is_set():
                     self.request_episode_end(
                         "preparation_revoked", failed=False,
                         run_end_reason=(
@@ -644,20 +558,6 @@ class TeleopLoop:
                             else RunEndReason.EXECUTOR_BOUNDARY
                         ),
                     )
-            while self.phase is TeleopPhase.PREPARING:
-                if not self.service_episode(0.005):
-                    break
-                if self.preparation_interrupted():
-                    continue  # 停止回调先撤权，继续轮询直到按键给出保存/丢弃意图。
-                row = read_observation(
-                    self.sensors.channels, self.robot,
-                    needs=self.control_needs.union(self.record_needs),
-                )
-                issues, _ = self.admit_observation(row)
-                if issues:
-                    self.request_episode_end("control_sources: " + "; ".join(issues))
-                    break
-                self.try_begin(row)
             while self.phase is TeleopPhase.ACTIVE:
                 if not self.service_episode(0.005):
                     break
@@ -667,16 +567,19 @@ class TeleopLoop:
             self.request_episode_end(str(exc), run_end_reason=failure_reason(exc))
             raise
         finally:
-            primary_failure = sys.exc_info()[0] is not None
+            primary_failure = sys.exc_info()[1]
             try:
                 if self.phase is not TeleopPhase.IDLE:
                     self.end_episode(
                         self.pending_termination_reason or "interrupted",
                         run_end_reason=RunEndReason.RUNTIME_SHUTDOWN,
                     )
-            except BaseException:
-                if not primary_failure:
+            except BaseException as exc:
+                if primary_failure is None:
                     raise
+                setattr(primary_failure, "cleanup_errors", [
+                    *getattr(primary_failure, "cleanup_errors", ()), ("episode_cleanup", exc),
+                ])
                 logger.exception("teleop episode cleanup also failed")
             finally:
                 self.keyboard.discard_events("b", "h", "t")
@@ -689,6 +592,4 @@ class TeleopLoop:
                 self.runtime_state.request_emergency_stop()
             if self.runtime_state.estop_request or self.runtime_state.error_state:
                 break
-            if not self.robot.stop_required:
-                self.runtime_state.acknowledge_stop(self.runtime_state.run_id)
             self.handle_commands(self.keyboard.poll(timeout=0.005), self.runtime_state.run_id)

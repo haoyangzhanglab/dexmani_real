@@ -1,6 +1,7 @@
 """键盘笛卡尔点动与回零。"""
 
 import logging
+import time
 
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePlanner
@@ -18,7 +19,7 @@ from dexmani_real.runtime.preflight import (
 from dexmani_real.runtime.state import RunEndReason, SessionState, device_failure_reason
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.table_plane import load_table_plane
-from dexmani_real.utils.timing import Rate
+from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,6 @@ class KeyboardTeleop:
             self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
             stop_signal=self.runtime_state.stop_signal,
             emergency_signal=self.runtime_state.emergency_signal,
-            signal_lock=self.runtime_state.motion_lock,
         )
 
         self.keys = Keyboard(
@@ -46,6 +46,7 @@ class KeyboardTeleop:
         )
         self.jog_config = self.runtime.keyboard_teleop
         clean = False
+        shutdown_clean = False
         try:
             self.start()
             clean = self.run_control_loop()
@@ -62,10 +63,16 @@ class KeyboardTeleop:
             )
             raise
         finally:
-            shutdown_clean = close_runtime(
-                self.runtime_state, self.robot, keyboard=self.keys
-            )
-        return int(not clean or not shutdown_clean)
+            try:
+                close_runtime(self.runtime_state, self.robot, keyboard=self.keys)
+            except BaseException:
+                logger.exception("keyboard runtime cleanup failed")
+            else:
+                shutdown_clean = True
+        return int(
+            not clean or not shutdown_clean
+            or self.runtime_state.error_state or self.runtime_state.estop_request
+        )
 
     def start(self):
         constraints = MotionConstraints(self.runtime.arm, self.runtime.environment)
@@ -90,13 +97,21 @@ class KeyboardTeleop:
         self.jog.prepare(self.robot, self.runtime_state)
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         print(
-            "Release jog keys to brake and hold; release all jog keys after a rejected target"
+            "Release jog keys to brake and hold; a rejected target stops motion. "
+            "Release all jog keys, then press again to prepare a new motion."
         )
-        self.rate = Rate(self.jog_config.control_hz)
+        self.period_ns, _ = sampling_clock_ns(self.jog_config.control_hz)
+        self.tick_due_ns = time.monotonic_ns() + self.period_ns
 
     def run_control_loop(self):
         while self.runtime_state.running and not self.runtime_state.quit_requested:
-            self.rate.wait(service=self.robot.service_idle)
+            while time.monotonic_ns() < self.tick_due_ns:
+                self.robot.service_idle()
+                remaining_ns = self.tick_due_ns - time.monotonic_ns()
+                if remaining_ns > 0:
+                    time.sleep(min(0.005, remaining_ns / 1e9))
+            now_ns = time.monotonic_ns()
+            self.tick_due_ns += ((now_ns - self.tick_due_ns) // self.period_ns) * self.period_ns
             self.robot.service_feedback()
             events = self.keys.poll(timeout=0)
             if (
@@ -111,22 +126,25 @@ class KeyboardTeleop:
             if "r" in events:
                 self.run_home()
                 continue
-            self.jog.step(self.robot, self.keys, self.runtime_state, self.runtime)
+            self.jog.step(
+                self.robot, self.keys, self.runtime_state, self.runtime,
+                tick_end_ns=self.tick_due_ns + self.period_ns,
+            )
+            self.tick_due_ns = next_tick_ns(self.tick_due_ns, self.period_ns, time.monotonic_ns())
         return bool(self.runtime_state.quit_requested)
 
     def run_home(self):
         logger.info("Returning home...")
         self.jog.stop(self.robot, self.runtime_state)
-        home_result = home_robot(
-            self.runtime_state, self.robot, self.home_planner,
-            cancel_requested=lambda: (
-                bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
-                or not self.keys.check_health()
-            ),
-        )
-        if not home_result.ok:
-            if not home_result.interrupted:
-                raise RuntimeError(f"HOME failed: {home_result.reason}")
-            logger.info("HOME cancelled: %s", home_result.reason)
+        try:
+            home_robot(
+                self.runtime_state, self.robot, self.home_planner,
+                cancel_requested=lambda: (
+                    bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
+                    or not self.keys.check_health()
+                ),
+            )
+        except OperationCancelled as exc:
+            logger.info("HOME cancelled: %s", exc)
         self.keys.discard_events("r")
-        self.rate.reset()
+        self.tick_due_ns = time.monotonic_ns() + self.period_ns

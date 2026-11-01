@@ -15,7 +15,7 @@ from dexmani_real.runtime.lifecycle import close_runtime
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 from dexmani_real.runtime.state import SessionState
 from dexmani_real.utils.io import write_json
-from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.log import configure_logging, error_detail
 from dexmani_real.utils.table_plane import load_table_plane
 
 DEFAULT_OUTPUT_DIR = "replay_results"
@@ -52,7 +52,7 @@ def run_replay(
     runtime_state = SessionState()
     robot = keyboard = None
     trajectory_status = None
-    outcome = ReplayResult(ReplayStatus.REJECTED, reason="startup failed")
+    outcome = ReplayResult(ReplayStatus.REJECTED)
     try:
         robot = Robot(
             runtime.arm,
@@ -60,7 +60,6 @@ def run_replay(
             run_signal=runtime_state.run_signal,
             stop_signal=runtime_state.stop_signal,
             emergency_signal=runtime_state.emergency_signal,
-            signal_lock=runtime_state.motion_lock,
         )
 
         keyboard = Keyboard(
@@ -98,12 +97,24 @@ def run_replay(
         runtime_state.mark_error()
         logger.exception("replay session failed")
         outcome.status = ReplayStatus.FAULT
-        outcome.reason = f"{outcome.reason}; {type(exc).__name__}: {exc}".lstrip("; ")
+        if outcome.reason:
+            outcome.cleanup_errors.append(exc)
+        else:
+            outcome.reason = f"{type(exc).__name__}: {exc}"
     finally:
-        shutdown_clean = close_runtime(runtime_state, robot, keyboard=keyboard)
+        shutdown_clean = False
+        try:
+            close_runtime(runtime_state, robot, keyboard=keyboard)
+            shutdown_clean = not runtime_state.error_state and not runtime_state.estop_request
+        except BaseException as exc:
+            outcome.cleanup_errors.append(exc)
+            logger.exception("replay shutdown failed")
+            if isinstance(exc, KeyboardInterrupt):
+                runtime_state.request_emergency_stop()
         if runtime_state.error_state or (not shutdown_clean and not runtime_state.estop_request):
             outcome.status = ReplayStatus.FAULT
-            outcome.reason = f"{outcome.reason}; hardware/shutdown failure".lstrip("; ")
+            if not outcome.reason and not outcome.cleanup_errors:
+                outcome.reason = "hardware/shutdown failure"
         elif runtime_state.estop_request:
             outcome.status = ReplayStatus.ESTOP
             outcome.reason = outcome.reason or "operator emergency stop"
@@ -113,8 +124,14 @@ def run_replay(
         except Exception as exc:
             logger.exception("replay data save failed")
             outcome.status = ReplayStatus.FAULT
-            outcome.reason = f"{outcome.reason}; replay data: {exc}".lstrip("; ")
+            outcome.cleanup_errors.append(exc)
         finally:
+            # 主要原因保持在前；实际清理错误只在现有 JSON 出口合并一次。
+            outcome.reason = "; ".join(filter(None, (
+                outcome.reason,
+                *(f"{type(exc).__name__}: {error_detail('cleanup', exc)['message']}"
+                  for exc in outcome.cleanup_errors),
+            )))
             summary.update(
                 status=outcome.status.value,
                 reason=outcome.reason,
@@ -130,7 +147,6 @@ def wait_for_home(runtime_state, robot, keyboard, home_planner, outcome, home_re
     keyboard.discard_events("h")
     print("H: planned return_home; Q: exit", flush=True)
     while runtime_state.running and not runtime_state.quit_requested:
-        stopped_epoch = runtime_state.run_id
         robot.service_idle()
         if not keyboard.check_health():
             runtime_state.request_emergency_stop()
@@ -139,42 +155,34 @@ def wait_for_home(runtime_state, robot, keyboard, home_planner, outcome, home_re
         signals = keyboard.poll(timeout=0.1)
         if runtime_state.quit_requested or "q" in signals:
             break
-        if runtime_state.stop_request or "s" in signals:
-            if not robot.stop_required:
-                runtime_state.acknowledge_stop(stopped_epoch)
+        if "s" in signals:
             continue
         if "h" in signals:
-            home_result = home_robot(
-                runtime_state,
-                robot,
-                home_planner,
-                cancel_requested=lambda: (
-                    bool(runtime_state.estop_request or runtime_state.quit_requested)
-                    or not keyboard.check_health()
-                ),
-            )
-            keyboard.discard_events("h")
-            home_results.append(
-                dict(
-                    ok=home_result.ok,
-                    interrupted=home_result.interrupted,
-                    reason=home_result.reason,
+            try:
+                home_robot(
+                    runtime_state,
+                    robot,
+                    home_planner,
+                    cancel_requested=lambda: (
+                        bool(runtime_state.estop_request or runtime_state.quit_requested)
+                        or not keyboard.check_health()
+                    ),
                 )
-            )
-            if not home_result.ok:
-                if (
-                    home_result.interrupted
-                    and runtime_state.stop_request
-                    and not (runtime_state.quit_requested or runtime_state.estop_request)
-                ):
+            except OperationCancelled as exc:
+                home_results.append(dict(ok=False, interrupted=True, reason=str(exc)))
+                if not (runtime_state.quit_requested or runtime_state.estop_request):
                     continue
-                if home_result.interrupted and runtime_state.quit_requested:
-                    status = ReplayStatus.USER_QUIT
-                elif runtime_state.estop_request:
-                    status = ReplayStatus.ESTOP
-                else:
-                    status = ReplayStatus.FAULT
-                outcome.status = status
-                outcome.reason = f"return_home incomplete: {home_result.reason}"
+                outcome.status = (
+                    ReplayStatus.ESTOP if runtime_state.estop_request else ReplayStatus.USER_QUIT
+                )
+                outcome.reason = outcome.reason or str(exc)
                 break
+            except Exception as exc:
+                home_results.append(dict(ok=False, interrupted=False, reason=str(exc)))
+                outcome.status = ReplayStatus.FAULT
+                outcome.reason = outcome.reason or f"return_home incomplete: {exc}"
+                break
+            finally:
+                keyboard.discard_events("h")
+            home_results.append(dict(ok=True, interrupted=False, reason=""))
             print("Return-home completed. H: planned return_home; Q: exit", flush=True)

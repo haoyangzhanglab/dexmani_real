@@ -6,8 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S, HandConfig
-from dexmani_real.robot.commands import RobotError
+from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S
 from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
     HAND_TACTILE_FORCE_SHAPE,
@@ -38,8 +37,7 @@ class XHandState:
 
 
 class XHandFeedback:
-    def __init__(self, config: HandConfig):
-        self.config = config
+    def __init__(self):
         self.latest: np.ndarray | None = None
         self.initial_deadline_ns = 0
 
@@ -49,9 +47,9 @@ class XHandFeedback:
             now_ns + int(INITIAL_STATE_TIMEOUT_S * 1e9) if deadline_ns is None else deadline_ns
         )
 
-    def consume(self, state: XHandState | None, *, source_ns: int, now_ns: int) -> np.ndarray | None:
+    def consume(self, state: XHandState | None, *, source_ns: int) -> np.ndarray | None:
         if state is None:
-            return self.checked_feedback(now_ns)
+            return self.snapshot()
 
         if self.latest is None:
             frame = np.zeros(1, dtype=HAND_STATE_DTYPE)
@@ -68,15 +66,8 @@ class XHandFeedback:
         frame["timestamp_ns"] = source_ns
         frame.flags.writeable = False
         self.latest = frame
-        return self.checked_feedback(now_ns)
+        return self.snapshot()
 
-    def checked_feedback(self, now_ns: int) -> np.ndarray | None:
-        frame = self.latest
-        if frame is None:
-            if now_ns < self.initial_deadline_ns:
-                return None
-            raise RobotError("XHand initial feedback timed out: no fresh joint state")
-        stamp = int(frame["timestamp_ns"][0])
-        if not 0 < stamp <= now_ns < stamp + int(self.config.feedback_max_age_s * 1e9):
-            raise RobotError("XHand joint feedback unavailable/stale")
-        return frame
+    def snapshot(self) -> np.ndarray | None:
+        """只读缓存；来源年龄由观测或实际发送边界裁决。"""
+        return self.latest

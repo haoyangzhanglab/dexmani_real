@@ -1,7 +1,8 @@
 """模型生命周期与预测在同一个工作线程串行执行。"""
 
 import logging
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import TYPE_CHECKING, cast
 
 from dexmani_real.utils.log import error_detail
@@ -39,20 +40,19 @@ class PolicyWorker:
 
     def _warmup(self, rows, **kwargs):
         observation = self.build_observation(rows)
-        return cast("PolicyRuntime", self.model).warmup(observation, **kwargs)
+        cast("PolicyRuntime", self.model).warmup(observation, **kwargs)
 
     def warmup(self, rows, **kwargs):
         self._submit("warmup", self._warmup, rows, **kwargs)
 
-    def reset(self):
-        self._submit("reset", lambda: cast("PolicyRuntime", self.model).reset_episode())
-
-    def _predict(self, rows, **kwargs):
+    def _predict(self, rows, *, reset_episode, **kwargs):
         observation = self.build_observation(rows)
+        if reset_episode:
+            cast("PolicyRuntime", self.model).reset_episode()
         return cast("PolicyRuntime", self.model).predict(observation, **kwargs)
 
-    def predict(self, rows, **kwargs):
-        self._submit("predict", self._predict, rows, **kwargs)
+    def predict(self, rows, *, reset_episode=False, **kwargs):
+        self._submit("predict", self._predict, rows, reset_episode=reset_episode, **kwargs)
 
     def poll(self):
         if self.future is None or not self.future.done():
@@ -66,15 +66,11 @@ class PolicyWorker:
         future = self.future
         if future is None:
             return
-        try:
-            future.result(timeout=max(0.0, timeout_s))
-        except FutureTimeoutError:
-            if not future.done():
-                raise TimeoutError("episode model task remains pending") from None
-            raise
-        finally:
-            if future.done():
-                self.future = self.operation = None
+        # 超时瞬间可能刚好完成；未确认回收时保留归属，不能只凭 done 清掉异常。
+        if future not in wait((future,), timeout=max(0.0, timeout_s)).done:
+            raise TimeoutError("episode model task remains pending")
+        self.future = self.operation = None
+        future.result()
 
     def close(self):
         if self.close_future is not None:

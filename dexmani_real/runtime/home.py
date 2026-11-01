@@ -3,7 +3,6 @@
 import logging
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
 
 import numpy as np
 
@@ -11,20 +10,13 @@ from dexmani_real.config.xarm7 import (
     EXECUTOR_TIMEOUT_S,
     HOME_CONVERGENCE_TIMEOUT_S,
 )
-from dexmani_real.control.homing import HomePathRejected, home_segment_timeout_s
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand
+from dexmani_real.control.homing import home_segment_timeout_s
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
 from dexmani_real.runtime.state import SafetyState
 from dexmani_real.utils.timing import sample_is_fresh
 
 logger = logging.getLogger(__name__)
 HOME_CONSECUTIVE_SAMPLES = 3
-
-
-@dataclass(frozen=True)
-class HomeResult:
-    ok: bool
-    reason: str = ""
-    interrupted: bool = False
 
 
 @contextmanager
@@ -46,24 +38,26 @@ def _home_motion(state, robot):
                     state.request_emergency_stop()
                 if failure is None:
                     raise
+                setattr(failure, "cleanup_errors", [
+                    *getattr(failure, "cleanup_errors", ()), ("home_stop", exc),
+                ])
                 logger.exception("HOME cleanup also failed")
 
 
 def home_robot(state, robot, planner, *, cancel_requested):
-    result = home_hand(state, robot, cancel_requested=cancel_requested)
-    if not result.ok:
-        return result
-    return home_arm(state, robot, planner, cancel_requested=cancel_requested)
+    # send_hand_home 自己完成整机停止边界，arm HOME 由 owner 停稳准备。
+    home_hand(state, robot, cancel_requested=cancel_requested)
+    home_arm(state, robot, planner, cancel_requested=cancel_requested)
 
 
-def initialize_hand(state, robot, *, cancel_requested):
-    """会话启动时先确认手部回零，再请求触觉复位并等待复位后的反馈。"""
+def initialize_hand(state, robot, *, required_tactile, cancel_requested):
+    """确认手部 HOME；只有实际消费者需要触觉时才 reset 并等待对应通道。"""
     if not robot.hand_config.enabled:
-        return HomeResult(True)
-    logger.info("启动复位：手部回 HOME 后自动复位触觉，请保持手部无接触。")
-    result = home_hand(state, robot, cancel_requested=cancel_requested)
-    if not result.ok:
-        return result
+        return
+    home_hand(state, robot, cancel_requested=cancel_requested)
+    if not required_tactile:
+        return
+    logger.info("手部 HOME 已到位，正在请求触觉复位，请保持手部无接触。")
     run_id = state.run_id
 
     def cancelled():
@@ -71,26 +65,22 @@ def initialize_hand(state, robot, *, cancel_requested):
             run_id=run_id, required_safety_state=SafetyState.ARMED,
         )
 
-    try:
-        if cancelled():
-            raise OperationCancelled("hand initialization interrupted")
-        if not robot.reset_tactile_sensors(
-            cancel_requested=cancelled, required_tactile=("aggregate", "dense"),
-        ):
-            return HomeResult(False, "tactile reset request failed")
-        if cancelled():
-            raise OperationCancelled("hand initialization interrupted")
-    except OperationCancelled as exc:
-        return HomeResult(False, str(exc), interrupted=True)
-    logger.info("手部 HOME 已到位，触觉复位请求已完成，复位后反馈已就绪。")
-    return HomeResult(True)
+    if cancelled():
+        raise OperationCancelled("hand initialization interrupted")
+    if not robot.reset_tactile_sensors(
+        cancel_requested=cancelled, required_tactile=required_tactile,
+    ):
+        raise RobotError("tactile reset request failed")
+    if cancelled():
+        raise OperationCancelled("hand initialization interrupted")
+    logger.info("触觉复位请求已完成，所需通道反馈已就绪。")
 
 
 def home_arm(state, robot, planner, *, cancel_requested):
     config, hand = robot.arm_config, robot.hand_config
     target = np.asarray(config.home_qpos, dtype=np.float64)
     if state.safety_state != SafetyState.ARMED:
-        return HomeResult(False, "home requires ARMED")
+        raise OperationCancelled("home requires ARMED")
     run_id = state.run_id
     boundary_ns = time.monotonic_ns()
 
@@ -104,14 +94,15 @@ def home_arm(state, robot, planner, *, cancel_requested):
         feedback_issue = "fresh stationary arm state unavailable"
         while time.monotonic() < deadline:
             if cancelled():
-                return HomeResult(False, "home interrupted", interrupted=True)
+                raise OperationCancelled("home interrupted")
             robot.service_feedback()
             feedback = robot.read_state()
             arm_state = feedback.arm
+            now_ns = time.monotonic_ns()
             feedback_issue = "fresh stationary arm state unavailable"
             if (
                 int(arm_state["timestamp_ns"][0]) > boundary_ns
-                and sample_is_fresh(arm_state["timestamp_ns"][0], config.feedback_max_age_s)
+                and sample_is_fresh(arm_state["timestamp_ns"][0], config.feedback_max_age_s, now_ns)
                 and np.max(np.abs(arm_state["qvel"][0])) <= config.homing.velocity_convergence_rad_s
             ):
                 if not hand.enabled:
@@ -122,22 +113,19 @@ def home_arm(state, robot, planner, *, cancel_requested):
                 if (
                     hand_state is not None
                     and int(hand_state["timestamp_ns"][0]) > boundary_ns
-                    and sample_is_fresh(hand_state["timestamp_ns"][0], hand.feedback_max_age_s)
+                    and sample_is_fresh(hand_state["timestamp_ns"][0], hand.feedback_max_age_s, now_ns)
                 ):
                     hand_qpos = hand_state["qpos"][0]
                     break
                 feedback_issue = "fresh post-home hand state unavailable"
             time.sleep(0.01)
         else:
-            return HomeResult(False, feedback_issue)
+            raise TimeoutError(feedback_issue)
 
         planner.set_hand_qpos(hand_qpos)
-        try:
-            waypoints = planner.plan(arm_state["qpos"][0], target)
-        except HomePathRejected as exc:
-            return HomeResult(False, f"home planning failed: {exc}")
+        waypoints = planner.plan(arm_state["qpos"][0], target)
         if cancelled():
-            return HomeResult(False, "home interrupted during planning", interrupted=True)
+            raise OperationCancelled("home interrupted during planning")
 
         logger.debug("arm home: %d planned milestones", len(waypoints))
         # worker 先停稳，再查询起点/切换模式；每段允许计划起点的收敛误差。
@@ -150,24 +138,18 @@ def home_arm(state, robot, planner, *, cancel_requested):
             if len(waypoints) > 1 else HOME_CONVERGENCE_TIMEOUT_S
         )
         deadline_ns = time.monotonic_ns() + int(duration_s * 1e9)
-        try:
-            robot.home_arm(
-                waypoints, target, run_id, cancelled,
-                deadline_ns=deadline_ns,
-            )
-        except OperationCancelled as exc:
-            return HomeResult(False, str(exc), interrupted=True)
-        except TimeoutError as exc:
-            return HomeResult(False, f"arm home timed out: {exc}")
-        return HomeResult(True)
+        robot.home_arm(
+            waypoints, target, run_id, cancelled,
+            deadline_ns=deadline_ns,
+        )
 
 
 def home_hand(state, robot, *, cancel_requested):
     hand = robot.hand_config
     if not hand.enabled:
-        return HomeResult(True)
+        return
     if state.safety_state != SafetyState.ARMED:
-        return HomeResult(False, "hand home requires ARMED")
+        raise OperationCancelled("hand home requires ARMED")
     run_id = state.run_id
     target = np.deg2rad(hand.home_qpos_deg)
     deadline = time.monotonic_ns() + int(hand.home_timeout_s * 1e9)
@@ -179,28 +161,25 @@ def home_hand(state, robot, *, cancel_requested):
         )
 
     if cancelled():
-        return HomeResult(False, "home interrupted", interrupted=True)
+        raise OperationCancelled("home interrupted")
     with _home_motion(state, robot):
-        try:
-            robot.send_hand_home(RobotCommand(run_id, hand_qpos=target), valid_until_ns=deadline)
-        except OperationCancelled:
-            return HomeResult(False, "home interrupted", interrupted=True)
+        robot.send_hand_home(RobotCommand(run_id, hand_qpos=target), expires_ns=deadline)
 
         # 只有提交完成之后的新样本才能确认到达。
         last_sample_ns = time.monotonic_ns()
         consecutive = 0
         while time.monotonic_ns() < deadline:
             if cancelled():
-                return HomeResult(False, "home interrupted", interrupted=True)
+                raise OperationCancelled("home interrupted")
             robot.service_feedback()
-            feedback = robot.hand_feedback.checked_feedback(time.monotonic_ns())
+            feedback = robot.hand_feedback.snapshot()
             if feedback is not None:
                 sample = feedback[0]
                 stamp = int(sample["timestamp_ns"])
                 if stamp > last_sample_ns:
                     last_sample_ns = stamp
                     if (
-                        sample_is_fresh(stamp, hand.feedback_max_age_s)
+                        sample_is_fresh(stamp, hand.feedback_max_age_s, time.monotonic_ns())
                         and np.max(np.abs(sample["qpos"] - target)) <= tolerance
                     ):
                         consecutive += 1
@@ -208,9 +187,9 @@ def home_hand(state, robot, *, cancel_requested):
                         consecutive = 0
                     if consecutive >= HOME_CONSECUTIVE_SAMPLES:
                         if cancelled():
-                            return HomeResult(False, "home interrupted", interrupted=True)
+                            raise OperationCancelled("home interrupted")
                         if time.monotonic_ns() < deadline:
-                            return HomeResult(True)
+                            return
                         break
             time.sleep(0.01)
-        return HomeResult(False, "hand home convergence timed out")
+        raise TimeoutError("hand home convergence timed out")

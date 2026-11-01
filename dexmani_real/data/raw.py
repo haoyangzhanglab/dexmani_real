@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from contextlib import ExitStack
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -197,22 +196,35 @@ class _VideoWriter:
     def close(self):
         if self.container is None:
             return
+        failure = None
         try:
             if self.stream is not None:
                 for packet in self.stream.encode(None):
                     self.container.mux(packet)
+        except BaseException as exc:
+            failure = exc
         finally:
-            # 编码失败也关闭文件；关闭失败时保留句柄。
             self.stream = None
+        try:
             self.container.close()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+            else:
+                setattr(failure, "cleanup_errors", [
+                    *getattr(failure, "cleanup_errors", ()), ("video_container_close", exc),
+                ])
+        else:
             self.container = None
+        if failure is not None:
+            raise failure
 
 
 class RawWriter:
     def __init__(self, path, *, control_hz):
         self.path = Path(path)
         self.control_hz = control_hz
-        self.resources = ExitStack()
+        self.data_file = self.video = None
         self.frame_count = 0
         self.buffered = 0
         self.previous_stamp = None
@@ -220,7 +232,7 @@ class RawWriter:
     def open(self, metadata):
         import h5py
 
-        data = self.resources.enter_context(h5py.File(self.path / "data.h5", "w"))
+        self.data_file = data = h5py.File(self.path / "data.h5", "w")
         self.meta = data.create_group("meta")
         self.meta.attrs.update(metadata)
         self.meta.attrs.update(
@@ -287,7 +299,6 @@ class RawWriter:
         self.video = _VideoWriter(
             self.path / "rgb.mp4", fps=self.control_hz, width=width, height=height
         )
-        self.resources.callback(self.video.close)
         self.video.open()
 
     def append_frame(self, row, command):
@@ -348,14 +359,21 @@ class RawWriter:
             termination_reason=reason,
             technical_status=technical_status,
         )
-        return self.frame_count, self.video.frame_count
 
     def close(self):
-        try:
-            self.resources.close()
-        finally:
-            self.arrays = {}
-            self.timing_rows = None
+        errors = []
+        for stage, resource in (("video_close", self.video), ("hdf5_close", self.data_file)):
+            if resource is not None:
+                try:
+                    resource.close()
+                except BaseException as exc:
+                    errors.append((stage, exc))
+        self.arrays = {}
+        self.timing_rows = None
+        if errors:
+            first = errors[0][1]
+            setattr(first, "cleanup_errors", [*getattr(first, "cleanup_errors", ()), *errors[1:]])
+            raise first
 
 
 class RawReader:
@@ -370,8 +388,8 @@ class RawReader:
         self.video_container = None
         self.dataset_cache: dict[str, h5py.Dataset] = {}
         self.tactile_hold_max_age_s: float | None = None
-        with ExitStack() as resources:
-            self.data_file = resources.enter_context(h5py.File(self.path / "data.h5", "r"))
+        self.data_file = h5py.File(self.path / "data.h5", "r")
+        try:
             meta = self.meta
             for name, expected in (
                 ("arm_action_semantics", ARM_ACTION_SEMANTICS),
@@ -389,7 +407,14 @@ class RawReader:
             self.num_frames = len(self.data_file["timing/rows"])
             self.control_hz = float(meta["control_hz"])
             sampling_clock_ns(self.control_hz)
-            self.resources = resources.pop_all()
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as cleanup:
+                setattr(error, "cleanup_errors", [
+                    *getattr(error, "cleanup_errors", ()), ("raw_reader_close", cleanup),
+                ])
+            raise
 
     @property
     def meta(self):
@@ -451,49 +476,6 @@ class RawReader:
     def read_timing_rows(self, fields):
         return self["timing/rows"].fields(tuple(fields))[:]
 
-    def validate_replay_timing(self):
-        """按 control 时钟严格准入整段回放，独立检查真实观测与来源时间。"""
-        chunk_frames = 4096
-        timing = self["timing/rows"]
-        fields = ("observation_ns", "control_ns", "arm_ns", "hand_ns")
-        dt_ns, tolerance_ns = sampling_clock_ns(self.control_hz)
-        first_control = None
-        for start in range(0, self.num_frames, chunk_frames):
-            first, end = max(0, start - 1), min(start + chunk_frames, self.num_frames)
-            rows = timing.fields(fields)[first:end]
-            control = rows["control_ns"]
-            observation = rows["observation_ns"]
-            if np.any(control <= 0) or np.any(np.diff(control) <= 0):
-                raise ValueError("control clocks must be positive and strictly increasing")
-            if np.any(observation <= 0) or np.any(np.diff(observation) <= 0):
-                raise ValueError("observation clocks must be positive and strictly increasing")
-            if first_control is None:
-                first_control = int(control[0])
-            intervals = np.diff(control)
-            deviations = control - first_control - np.arange(first, end) * dt_ns
-            bad = np.abs(deviations) > tolerance_ns
-            bad[1:] |= np.abs(intervals - dt_ns) > tolerance_ns
-            if bad.any():
-                row = int(np.flatnonzero(bad)[0])
-                interval = intervals[row - 1] if row else float("nan")
-                raise ValueError(
-                    f"timing row {row + first}: interval_ns={interval:.0f}, "
-                    f"nominal_ns={dt_ns}, grid_deviation_ns={deviations[row]:.0f}, "
-                    f"tolerance_ns={tolerance_ns}"
-                )
-            if np.any(observation < control):
-                raise ValueError("observation clocks must not precede control clocks")
-            if np.any(observation - control >= dt_ns):
-                raise ValueError("observation readout must be shorter than one control period")
-            if np.any(observation[:-1] >= control[1:]):
-                raise ValueError("observations must not overlap the next control sample")
-            for name in ("arm_ns", "hand_ns"):
-                values = rows[name]
-                if np.any(values <= 0) or np.any(values > observation):
-                    raise ValueError(f"invalid consumed source clock: {name}")
-                if np.any(np.diff(values) < 0):
-                    raise ValueError(f"consumed source clock regressed: {name}")
-
     @property
     def timestamps_s(self):
         stamps = self["timing/rows"].fields("observation_ns")[:]
@@ -509,17 +491,36 @@ class RawReader:
 
         self.require_fields("rgb")
         if self.video_container is None:
-            self.video_container = self.resources.enter_context(av.open(str(self.rgb_path), "r"))
+            self.video_container = av.open(str(self.rgb_path), "r")
         self.video_container.seek(0)
         for frame in self.video_container.decode(video=0):
             yield frame.to_ndarray(format="rgb24")
 
     def close(self):
         self.dataset_cache.clear()
-        self.resources.close()
+        errors = []
+        for stage, resource in (
+            ("video_reader_close", self.video_container), ("hdf5_reader_close", self.data_file),
+        ):
+            if resource is not None:
+                try:
+                    resource.close()
+                except BaseException as exc:
+                    errors.append((stage, exc))
+        if errors:
+            first = errors[0][1]
+            setattr(first, "cleanup_errors", [*getattr(first, "cleanup_errors", ()), *errors[1:]])
+            raise first
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *args):
-        self.close()
+    def __exit__(self, exc_type, error, traceback):
+        try:
+            self.close()
+        except BaseException as cleanup:
+            if error is None:
+                raise
+            setattr(error, "cleanup_errors", [
+                *getattr(error, "cleanup_errors", ()), ("raw_reader_close", cleanup),
+            ])

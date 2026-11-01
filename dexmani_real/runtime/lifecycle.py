@@ -5,14 +5,16 @@ import time
 
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.runtime.state import RunEndReason, SafetyState
-from dexmani_real.utils.log import error_detail
 
 logger = logging.getLogger(__name__)
 
 CAMERA_READY_TIMEOUT_S = 15.0
 POINTCLOUD_READY_TIMEOUT_S = 30.0
 VR_READY_TIMEOUT_S = 120.0
+# 模型任务与持久化收尾的会话上限，传感器不使用此预算。
 SHUTDOWN_TIMEOUT_S = 65.0
+# 相机 read <= 0.3 s、来源 stall 2 s；不与 writer 的 flush 预算共享。
+SENSOR_SHUTDOWN_TIMEOUT_S = 3.0
 WORKER_STOP_TIMEOUT_S = 1.0
 
 
@@ -55,12 +57,10 @@ class SensorWorkers:
                 healthy = False
         return healthy
 
-    def shutdown(self, *, deadline=None):
-        """共享正常退出期限，超时后逐个终止；仅保留回收失败的句柄。"""
+    def shutdown(self):
+        """短时退出，必要时终止 sensor；仅保留实际未回收的句柄。"""
         self.request_shutdown()
-        if deadline is None:
-            deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
-        clean = True
+        deadline = time.monotonic() + SENSOR_SHUTDOWN_TIMEOUT_S
         errors = []
         unresolved = []
         for process, ready in self.started:
@@ -79,7 +79,7 @@ class SensorWorkers:
                     raise RuntimeError(f"process {process.name} could not be confirmed stopped")
                 ready.clear()
                 if process.exitcode != 0 or escalation != "graceful":
-                    clean = False
+                    errors.append(RuntimeError(f"worker {process.name}: exitcode={process.exitcode}, {escalation}"))
                     logger.warning(
                         "worker %s stopped: exitcode=%s escalation=%s",
                         process.name,
@@ -92,55 +92,34 @@ class SensorWorkers:
                 logger.exception("worker %s shutdown failed", process.name)
         self.started = unresolved
         if errors:
+            setattr(errors[0], "cleanup_errors", [
+                *getattr(errors[0], "cleanup_errors", ()),
+                *(("sensor_shutdown", error) for error in errors[1:]),
+            ])
             raise errors[0]
-        return clean
 
 
-def close_runtime(
-    runtime_state, robot=None, *, sensors=None, keyboard=None, deadline=None, errors=None,
-):
-    """先撤销运动权限，再关闭设备、输入和传感进程。"""
-    if deadline is None:
-        deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
-    runtime_state.revoke_motion(
-        SafetyState.DISARMED,
-        reason=RunEndReason.RUNTIME_SHUTDOWN,
-    )
+def close_runtime(runtime_state, robot=None, *, sensors=None, keyboard=None):
+    """撤权后尝试全部关闭；正常返回或保留首个异常及其补充关闭错误。"""
+    runtime_state.stop_signal.set()
+    errors = []
     for stage, close in (
+        ("revoke_motion", lambda: runtime_state.revoke_motion(
+            SafetyState.DISARMED, reason=RunEndReason.RUNTIME_SHUTDOWN,
+        )),
         ("robot_close", robot.close if robot is not None else None),
         ("keyboard_stop", keyboard.stop if keyboard is not None else None),
+        ("sensor_shutdown", sensors.shutdown if sensors is not None else None),
+        ("end_session", runtime_state.end_session),
     ):
         if close is None:
             continue
         try:
             close()
         except BaseException as exc:
-            if errors is not None:
-                errors.append(error_detail(stage, exc))
-            if isinstance(exc, KeyboardInterrupt):
-                runtime_state.request_emergency_stop()
-            runtime_state.mark_error()
-            logger.exception("local runtime cleanup failed")
-    runtime_state.end_session()
-    sensors_clean = True
-    if sensors is not None:
-        try:
-            sensors_clean = sensors.shutdown(deadline=deadline)
-        except BaseException as exc:
-            if errors is not None:
-                errors.append(error_detail("sensor_shutdown", exc))
-            if isinstance(exc, KeyboardInterrupt):
-                runtime_state.request_emergency_stop()
-            runtime_state.mark_error()
-            logger.exception("sensor shutdown failed; unresolved process handles retained")
-            sensors_clean = False
-    clean = (
-        sensors_clean
-        and not runtime_state.error_state
-        and not runtime_state.estop_request
-    )
-    if not clean and not runtime_state.estop_request:
-        runtime_state.mark_error()
-    # DISARMED 只表示软件权限已撤销，不证明机器人已物理停止。
-    runtime_state.revoke_motion(SafetyState.DISARMED)
-    return clean
+            errors.append((stage, exc))
+            logger.exception("%s failed", stage)
+    if errors:
+        first = errors[0][1]
+        setattr(first, "cleanup_errors", [*getattr(first, "cleanup_errors", ()), *errors[1:]])
+        raise first

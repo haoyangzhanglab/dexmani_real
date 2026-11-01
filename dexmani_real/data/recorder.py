@@ -49,7 +49,6 @@ class EpisodeRecorder:
         self.start_attempted = False
         self.finish_request = None
         self.stop_deadline = None
-        self.closed_counts = None
         self.staging_path: Path | None = None
         self.published_path: Path | None = None
         self.submitted_frames = 0
@@ -63,16 +62,22 @@ class EpisodeRecorder:
     def writer_pending(self):
         return self.thread is not None and self.thread.is_alive()
 
-    def store_error(self, error):
+    def store_error(self, error, *, stage="recording_cleanup"):
         if self.error is None:
             self.error = error
+        elif error is not self.error and error.__cause__ is not self.error:
+            setattr(self.error, "cleanup_errors", [
+                *getattr(self.error, "cleanup_errors", ()), (stage, error),
+            ])
         self.cancelled.set()
 
     def check_error(self):
         if self.error is not None:
             if isinstance(self.error, RecordingError):
                 raise self.error
-            raise RecordingError(f"Recording failed: {self.error}") from self.error
+            failure = RecordingError(f"Recording failed: {self.error}")
+            setattr(failure, "cleanup_errors", getattr(self.error, "cleanup_errors", ()))
+            raise failure from self.error
 
     def result(self):
         """仅报告最后可观察的结果，pending 不推断线程之后的结局。"""
@@ -201,8 +206,6 @@ class EpisodeRecorder:
         if self.staging_path is None:
             return None
         try:
-            if self.closed_counts != (self.submitted_frames, self.submitted_frames):
-                raise RecordingError("recording accepted/written/camera row count mismatch")
             if save and self.submitted_frames > 0:
                 destination = self.staging_path.with_name(self.staging_path.name.removeprefix(".tmp_"))
                 publish(self.staging_path, destination)
@@ -238,7 +241,7 @@ class EpisodeRecorder:
                         break
                     writer.append_frame(*item)
                 if finish is not None and self.error is None:
-                    counts = writer.finish(
+                    writer.finish(
                         finish.reason,
                         finish.details,
                         expected_frames=self.submitted_frames,
@@ -252,12 +255,10 @@ class EpisodeRecorder:
                 self.store_error(exc)
             finally:
                 writer.close()
-            if finish is not None and self.error is None:
-                self.closed_counts = counts
         except BaseException as exc:
             if self.error is not None and exc is not self.error:
                 logger.exception("Recording worker close also failed")
-            self.store_error(exc)
+            self.store_error(exc, stage="writer_close")
         finally:
             self.ready.set()
             self.drain_frames()

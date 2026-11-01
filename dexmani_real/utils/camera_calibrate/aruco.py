@@ -89,7 +89,7 @@ class ArucoSampler:
                     frame is not None
                     and frame.timestamp_ns > last_stamp
                     and frame.color_frame_number > last_color_frame
-                    and sample_is_fresh(frame.timestamp_ns, camera_config.max_frame_age_s)
+                    and sample_is_fresh(frame.timestamp_ns, camera_config.max_frame_age_s, time.monotonic_ns())
                 ):
                     break
                 time.sleep(0.01)

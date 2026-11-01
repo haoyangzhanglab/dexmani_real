@@ -36,15 +36,17 @@ def camera_dtype(height: int, width: int) -> np.dtype:
     )
 
 
-def pointcloud_dtype(num_points: int) -> np.dtype:
-    return np.dtype(
-        [
-            ("source_camera_sequence", "<u8"),
-            ("timestamp_ns", "<u8"),
-            ("point_cloud", "<f4", (num_points, 6)),
-        ],
-        align=True,
-    )
+def pointcloud_dtype(num_points: int, camera=None, camera_fields=()) -> np.dtype:
+    fields: list[tuple] = [
+        ("source_camera_sequence", "<u8"),
+        ("timestamp_ns", "<u8"),
+        ("point_cloud", "<f4", (num_points, 6)),
+    ]
+    if camera_fields:
+        image_dtype = camera_dtype(camera.height, camera.width)
+        fields.append(("color_frame_number", "<u8"))
+        fields.extend((name, image_dtype[name]) for name in camera_fields)
+    return np.dtype(fields, align=True)
 
 
 class SensorChannels:
@@ -55,6 +57,7 @@ class SensorChannels:
         camera: CameraConfig | None = None,
         vr: bool = False,
         pointcloud_num_points: int | None = None,
+        pointcloud_camera_fields: tuple[str, ...] = (),
     ):
         self.camera_ring = (
             SharedRing(ctx, camera_dtype(camera.height, camera.width), 5)
@@ -63,7 +66,9 @@ class SensorChannels:
         )
         self.vr_ring = SharedRing(ctx, VR_DTYPE, 8) if vr else None
         self.pointcloud_ring = (
-            SharedRing(ctx, pointcloud_dtype(pointcloud_num_points), 8)
+            SharedRing(
+                ctx, pointcloud_dtype(pointcloud_num_points, camera, pointcloud_camera_fields), 8,
+            )
             if pointcloud_num_points is not None
             else None
         )
@@ -102,9 +107,9 @@ def read_vr_frame(channels):
     return {**{name: record[name] for name in record.dtype.names}, "ring_sequence": sequence}
 
 
-def read_camera_frame(channels, sequence=None, *, fields=("rgb", "depth")):
+def read_camera_frame(channels, *, fields=("rgb", "depth")):
     result = channels.camera_ring.read(
-        fields=("timestamp_ns", "color_frame_number", *fields), sequence=sequence,
+        fields=("timestamp_ns", "color_frame_number", *fields),
     )
     if result is None:
         return None

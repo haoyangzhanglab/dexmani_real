@@ -34,7 +34,7 @@ def read_arm_feedback(arm, max_age_s):
     # 来源时间是这次 SDK 查询开始时刻，不是返回后读取缓存的时刻。
     timestamp_ns = time.monotonic_ns()
     qpos, qvel = arm.read()
-    if not sample_is_fresh(timestamp_ns, max_age_s):
+    if not sample_is_fresh(timestamp_ns, max_age_s, time.monotonic_ns()):
         raise TimeoutError("arm feedback query exceeded calibration freshness budget")
     return dict(qpos=qpos, qvel=qvel, timestamp_ns=timestamp_ns)
 

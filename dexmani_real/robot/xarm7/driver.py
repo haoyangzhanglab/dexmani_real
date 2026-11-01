@@ -115,7 +115,8 @@ class XArm7:
 
     def enter_mode(self, mode, *, check_abort):
         check_abort()
-        check_sdk_return_code(self.api.set_mode(mode), f"set_mode({mode})")
+        if self.api.mode != mode:
+            check_sdk_return_code(self.api.set_mode(mode), f"set_mode({mode})")
         check_abort()
         check_sdk_return_code(self.api.set_state(0), f"set_state(0) after Mode {mode}")
         check_abort()

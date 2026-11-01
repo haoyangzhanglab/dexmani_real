@@ -1,6 +1,9 @@
 """对齐 RGB-D 到 xArm 基座系的 float32[N,6] XYZRGB；无有效点时返回 (0,6)。"""
 
+from typing import cast
+
 import numpy as np
+from numpy.typing import NDArray
 
 from dexmani_real.config.perception import DEPTH_RANGE_M, PointCloudConfig
 from dexmani_real.geometry.camera import CameraIntrinsics, deproject_depth, depth_rays
@@ -33,13 +36,13 @@ def filter_depth(depth_m: np.ndarray) -> np.ndarray:
         borderValue=(float("-inf"),),
     )
     # 深度断层中，远离前后表面的中间值视为飞点。
-    local_count = cv2.boxFilter(
+    local_count = cast(NDArray[np.uint8], cv2.boxFilter(
         valid.astype(np.uint8),
         ddepth=cv2.CV_8U,
         ksize=(3, 3),
         normalize=False,
         borderType=cv2.BORDER_CONSTANT,
-    )
+    ))
     edge = valid & (local_count >= 3) & ((local_max - local_min) > EDGE_JUMP_M)
     distance = np.minimum(depth_m - local_min, local_max - depth_m)
     trusted = valid & ~(edge & (distance > EDGE_SURFACE_BAND_M))

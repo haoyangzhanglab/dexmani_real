@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Iterable
 
 import numpy as np
@@ -10,7 +11,7 @@ from scipy.spatial.transform import Rotation
 
 from dexmani_real.control.ik import IKResult
 from dexmani_real.geometry.pose import Pose, quat_multiply
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.runtime.keyboard import CARTESIAN_JOG_KEYS, JOG_KEY_PAIRS
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
@@ -49,7 +50,7 @@ class CartesianJog:
         if state.begin_motion() is None:
             raise OperationCancelled("jog cancelled during preparation")
 
-    def step(self, robot, keys, state, runtime):
+    def step(self, robot, keys, state, runtime, *, tick_end_ns):
         """发布点动目标或减速保持；故障由会话边界记录、撤权并收尾。"""
         pressed_keys = keys.snapshot()
         if CARTESIAN_JOG_KEYS.isdisjoint(pressed_keys):
@@ -63,17 +64,17 @@ class CartesianJog:
             self.stop(robot, state)
             return
         if safety_state == SafetyState.ARMED:
-            if not self.blocked_until_release:
+            if not self.blocked_until_release and jog_motion_requested(pressed_keys):
                 self.prepare(robot, state)
             # 准备是独立轮次；下一轮重新读取按键与反馈，不补交准备前的输入。
             return
 
         row = read_observation(None, robot)
-        issues, feedback_until_ns = check_observation(
+        issues = check_observation(
             row, runtime, ObservationNeeds(), require_hand=runtime.hand.enabled,
         )
         if issues:
-            raise RobotError("jog feedback rejected: " + "; ".join(issues))
+            raise OperationCancelled("jog feedback rejected: " + "; ".join(issues))
         target = None
         if jog_motion_requested(pressed_keys) and not self.blocked_until_release:
             pose, result = self.propose(
@@ -84,19 +85,21 @@ class CartesianJog:
             if result.qpos is None:
                 logger.warning("IK rejected target: %s", result.reason)
                 self.blocked_until_release = True
+                self.stop(robot, state)
+                return
             elif keys.snapshot() == pressed_keys:
                 target = result.qpos
-        if target is None:
-            self.clear_reference()
+        if time.monotonic_ns() >= tick_end_ns:
+            return
         command = RobotCommand(epoch, arm_qpos=target, arm_hold=target is None)
-        source_ns = int(row.arm["timestamp_ns"][0])
         robot.send_action(
             command,
-            valid_until_ns=feedback_until_ns,
-            execute_until_ns=source_ns + int(self.config.target_max_age_s * 1e9),
+            expires_ns=time.monotonic_ns() + int(self.config.target_max_age_s * 1e9),
         )
         if target is not None:
             self.command_pose, self.command_qpos = pose.copy(), command.arm_qpos
+        else:
+            self.clear_reference()
 
     def propose(self, pressed_keys, measured_qpos, *, hand_qpos) -> tuple[Pose, IKResult]:
         baseline_qpos, baseline_pose = self.command_qpos, self.command_pose

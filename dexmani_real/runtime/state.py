@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import threading
 import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -53,12 +54,9 @@ class SessionState:
     error_state: bool = False
     estop_request: bool = False
     quit_requested: bool = False
-    stop_request: bool = False
     safety_state: SafetyState = SafetyState.DISARMED
-    # 共享锁仅保护代际与停止状态，SDK I/O 在锁外执行。
-    motion_lock: AbstractContextManager = field(
-        default_factory=lambda: mp.get_context("spawn").RLock(), repr=False
-    )
+    # 仅父进程线程使用；child 只读取共享代际，不共享本地流程锁。
+    motion_lock: AbstractContextManager = field(default_factory=threading.RLock, repr=False)
     run_signal: Synchronized = field(
         default_factory=lambda: mp.get_context("spawn").Value("q", 1), repr=False
     )
@@ -75,7 +73,6 @@ class SessionState:
             and not self.error_state
             and not self.estop_request
             and not self.quit_requested
-            and not self.stop_request
         )
 
     def arm(self) -> None:
@@ -142,24 +139,18 @@ class SessionState:
 
     def mark_error(self):
         """保留会话错误并通知执行器停止。"""
+        self.stop_signal.set()
         with self.motion_lock:
             self.error_state = True
-            self.stop_signal.set()
 
     def request_stop(self, *, reason=RunEndReason.OPERATOR):
         self.stop_signal.set()
         with self.motion_lock:
-            self.stop_request = True
             if self.safety_state in (SafetyState.ARMED, SafetyState.RUNNING):
                 self.revoke_motion(reason=reason)
 
-    def acknowledge_stop(self, expected_run_id):
-        """完成停止的所有者只能确认对应代际的请求。"""
-        with self.motion_lock:
-            if self.run_id == expected_run_id and self.safety_state != SafetyState.RUNNING:
-                self.stop_request = False
-
     def request_quit(self):
+        self.stop_signal.set()
         with self.motion_lock:
             self.quit_requested = True
             self.request_stop(reason=RunEndReason.QUIT)

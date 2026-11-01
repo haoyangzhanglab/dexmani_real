@@ -2,7 +2,9 @@ import numpy as np
 
 
 class SharedRing:
-    """Linux x86_64 上单写多读，以奇偶序列标记保护数据副本。"""
+    """Linux x86_64 上单写多读，以奇偶序列标记保护最新数据副本。
+
+    槽仅为复制竞争提供缓冲，不提供可查询历史或跨平台无锁保证。"""
 
     def __init__(self, ctx, dtype: np.dtype, capacity: int):
         self.dtype = np.dtype(dtype)
@@ -10,7 +12,7 @@ class SharedRing:
         names = self.dtype.names
         if names is None or self.dtype.hasobject:
             raise ValueError("shared-memory payload requires fields without Python objects")
-        self._field_names = frozenset(names)
+        self.field_names = frozenset(names)
         self.slot_dtype = np.dtype(
             [
                 ("sequence", "<u8"),
@@ -31,7 +33,7 @@ class SharedRing:
         return np.frombuffer(self.buffer, dtype=self.slot_dtype, count=self.capacity)
 
     def write(self, **fields) -> int:
-        if fields.keys() != self._field_names:
+        if fields.keys() != self.field_names:
             raise ValueError("ring fields do not match the payload dtype")
         sequence = self.latest_sequence + 1
         slot = self.slots[sequence % self.capacity]
@@ -43,8 +45,8 @@ class SharedRing:
         self._sequence.value = sequence
         return sequence
 
-    def read(self, *, sequence=None, fields=None) -> tuple[np.void | dict, int] | None:
-        sequence = self.latest_sequence if sequence is None else sequence
+    def read(self, *, fields=None) -> tuple[np.void | dict, int] | None:
+        sequence = self.latest_sequence
         if sequence <= 0:
             return None
         slot = self.slots[sequence % self.capacity]

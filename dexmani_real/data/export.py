@@ -72,6 +72,11 @@ def canonical_array_specs(
 
 
 def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
+    if reader.meta["collection_source"] != "teleop":
+        raise ValueError(
+            "canonical demonstration export requires teleop Raw; policy_rollout is an "
+            "evaluation log whose execution observations are not training input/action pairs"
+        )
     frames = reader.num_frames
     if frames <= 0:
         raise ValueError("episode contains no rows")
@@ -263,8 +268,6 @@ def export_zarr(
     if os.path.lexists(output):
         raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {output}")
     selected, excluded = select_episodes(requested_source, exclude)
-    arm_fk, hand_fk = ArmFK(), HandFK()
-    hand_cloud = HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
     staging = None
     ends: list[int] = []
     episode_ids: list[str] = []
@@ -286,6 +289,8 @@ def export_zarr(
                     raise ValueError("task_label must be nonempty without control characters")
                 height, width = camera.color.height, camera.color.width
                 if index == 0:
+                    arm_fk, hand_fk = ArmFK(), HandFK()
+                    hand_cloud = HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     staging = Path(
                         tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)

@@ -23,7 +23,6 @@ from dexmani_real.runtime.home import initialize_hand
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
-    SHUTDOWN_TIMEOUT_S,
     VR_READY_TIMEOUT_S,
     SensorWorkers,
     close_runtime,
@@ -105,6 +104,7 @@ def run_teleop(
     )
     sensors = robot = None
     clean = False
+    shutdown_clean = False
     loop = None
     keyboard = None
     try:
@@ -115,7 +115,6 @@ def run_teleop(
             run_signal=runtime_state.run_signal,
             stop_signal=runtime_state.stop_signal,
             emergency_signal=runtime_state.emergency_signal,
-            signal_lock=runtime_state.motion_lock,
             check_services=sensors.check,
         )
         keyboard = Keyboard(
@@ -176,7 +175,7 @@ def run_teleop(
     except KeyboardInterrupt:
         runtime_state.request_emergency_stop()
     except OperationCancelled:
-        if runtime_state.stop_request or runtime_state.quit_requested or runtime_state.estop_request:
+        if runtime_state.stop_signal.is_set() or runtime_state.quit_requested or runtime_state.estop_request:
             runtime_state.request_quit()
             clean = True
             logger.info("Teleop startup cancelled")
@@ -187,7 +186,6 @@ def run_teleop(
         runtime_state.mark_error()
         logger.exception("teleop session failed")
     finally:
-
         try:
             if loop is not None:
                 loop.close()
@@ -195,28 +193,25 @@ def run_teleop(
             runtime_state.mark_error()
             logger.exception("teleop capture cleanup failed")
         finally:
-            shutdown_clean = close_runtime(
-                runtime_state,
-                robot,
-                sensors=sensors,
-                keyboard=keyboard,
-                deadline=time.monotonic() + SHUTDOWN_TIMEOUT_S,
-            )
-    return int(not clean or not shutdown_clean)
+            try:
+                close_runtime(runtime_state, robot, sensors=sensors, keyboard=keyboard)
+            except BaseException:
+                logger.exception("teleop runtime cleanup failed")
+            else:
+                shutdown_clean = True
+    return int(
+        not clean or not shutdown_clean or runtime_state.error_state or runtime_state.estop_request
+    )
 
 
 def initialize_teleop(loop, vr_process) -> bool:
     # 自动复位前，键盘停止回调已经生效。
-    home_result = initialize_hand(
+    initialize_hand(
         loop.runtime_state,
         loop.robot,
+        required_tactile=loop.needs.required_tactile,
         cancel_requested=loop.poll_blocking_commands,
     )
-    if not home_result.ok:
-        if home_result.interrupted:
-            loop.runtime_state.request_quit()
-            return False
-        raise RuntimeError(f"startup hand initialization failed: {home_result.reason}")
     if loop.poll_blocking_commands():
         return False
     loop.sensors.start(
