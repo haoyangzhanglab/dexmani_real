@@ -59,7 +59,7 @@ class SensorWorkers:
         if self.channels is not None:
             self.channels.is_running.value = False
         deadline = time.monotonic() + SENSOR_SHUTDOWN_TIMEOUT_S
-        errors = []
+        errors: list[BaseException] = []
         unresolved = []
         for process in self.started:
             try:

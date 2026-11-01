@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 
 from dexmani_real.config.xarm7 import EXECUTOR_TIMEOUT_S
+from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S
 from dexmani_real.robot.commands import (
     OperationCancelled,
     RobotError,
@@ -69,13 +70,13 @@ class Robot:
         if self.owner != threading.get_ident():
             raise RuntimeError("robot I/O belongs to its connecting thread")
 
-    def check(self, *, operation_error=None):
+    def check(self, *, operation_error: BaseException | None = None) -> None:
         try:
             self.check_owner()
             if self.arm is not None:
                 self.arm.check_error()
             if self.stop_failure is not None:
-                failure = RobotError("previous robot stop remains unresolved")
+                failure = RobotError("previous robot stop failed")
                 setattr(failure, "cleanup_errors", [("robot_stop", self.stop_failure)])
                 raise failure from self.stop_failure
             if self.check_services is not None and not self.check_services():
@@ -86,7 +87,7 @@ class Robot:
                     *getattr(failure, "cleanup_errors", ()), ("operation", operation_error),
                 ])
             raise
-        if operation_error is not None and getattr(operation_error, "cleanup_errors", ()):
+        if operation_error is not None and getattr(operation_error, "cleanup_errors", False):
             raise operation_error
 
     def check_run(self, run_id, *, expires_ns=None):
@@ -135,17 +136,18 @@ class Robot:
             stop_signal=self.stop_signal,
             emergency_signal=self.emergency_signal,
         )
+        self.stop_required = True  # 连接后仍需完成首次整机停止确认。
         self.arm.connect(check_services=self.check_services)
         if cancelled():
             raise OperationCancelled("robot startup cancelled before hand connection")
-        deadline_ns = None
         if self.hand_config.enabled:
             from dexmani_real.robot.xhand.driver import XHand
 
             self.hand = XHand(self.hand_config)
-            deadline_ns = self.hand.connect(cancel_requested=cancelled)
+            initial = self.hand.connect(cancel_requested=cancelled)
+            self.hand_feedback.consume(initial)
+            self.feedback_next_ns = initial.timestamp_ns + FEEDBACK_PERIOD_NS
         self.connected = True
-        self.reset_hand_feedback(deadline_ns=deadline_ns)
         self.read_initial_state(run_id, cancel_requested=cancelled)
 
     def reset_tactile_sensors(self, *, run_id, cancel_requested, required_tactile=()) -> None:
@@ -167,31 +169,20 @@ class Robot:
         try:
             self.hand.reset_tactile_sensors(cancel_requested=cancelled)
         finally:
-            self.reset_hand_feedback()
+            self.hand_feedback.reset()
+            self.feedback_next_ns = 0
         self.read_initial_state(
             run_id, required_tactile=required_tactile, cancel_requested=cancelled,
         )
         if cancelled():
             raise OperationCancelled("tactile reset cancelled")
 
-    def reset_hand_feedback(self, *, deadline_ns=None):
-        self.check_owner()
-        if self.stop_required:
-            raise RuntimeError("cannot clear hand feedback during motion")
-        self.hand_feedback.reset(time.monotonic_ns(), deadline_ns=deadline_ns)
-        self.feedback_next_ns = 0
-
     def read_hand(self):
         if self.hand is None:
             return None
         if not self.hand.is_connected:
             raise RobotError("XHand disconnected")
-        query_started_ns = time.monotonic_ns()
-        state = self.hand.get_state()
-        return self.hand_feedback.consume(
-            state,
-            source_ns=query_started_ns,
-        )
+        return self.hand_feedback.consume(self.hand.get_state())
 
     def read_state(self):
         """消费来源时间不变的反馈缓存，不执行硬件查询。"""
@@ -218,11 +209,11 @@ class Robot:
             raise
 
     def read_initial_state(self, run_id, *, required_tactile=(), cancel_requested=None):
-        self.check_owner()
-        deadline_ns = self.hand_feedback.initial_deadline_ns
+        deadline_ns = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
         max_age_ns = int(self.hand_config.feedback_max_age_s * 1e9)
 
         def check_wait():
+            self.check()
             if (
                 (cancel_requested is not None and cancel_requested())
                 or self.run_signal.value != run_id
@@ -237,29 +228,28 @@ class Robot:
 
         while True:
             check_wait()
-            self.service_feedback()
             state = self.read_state()
             check_wait()
             now_ns = time.monotonic_ns()
             arm_stamp = int(state.arm["timestamp_ns"][0])
-            if not 0 < arm_stamp <= now_ns < arm_stamp + int(self.arm_config.feedback_max_age_s * 1e9):
-                time.sleep(0.005)
-                continue
-            if self.hand is None:
-                return state
-            if state.hand is not None:
+            arm_ready = 0 < arm_stamp <= now_ns < arm_stamp + int(self.arm_config.feedback_max_age_s * 1e9)
+            hand_ready = self.hand is None
+            if self.hand is not None and state.hand is not None:
                 fields = ("timestamp_ns", *(f"tactile_{c}_timestamp_ns" for c in required_tactile))
                 stamps = (int(state.hand[name][0]) for name in fields)
-                if all(0 < stamp <= now_ns < stamp + max_age_ns for stamp in stamps):
-                    return state
-            remaining_ns = deadline_ns - time.monotonic_ns()
-            if remaining_ns > 0:
-                time.sleep(min(0.01, remaining_ns / 1e9))
+                hand_ready = all(0 < stamp <= now_ns < stamp + max_age_ns for stamp in stamps)
+            if arm_ready and hand_ready:
+                return state
+            wait_ns = min(self.feedback_next_ns, deadline_ns) - time.monotonic_ns()
+            if wait_ns > 0:
+                time.sleep(min(0.01, wait_ns / 1e9))
+            check_wait()
+            self.service_feedback()
 
     def prepare_streaming(self, run_id):
         self.check_owner()
         if self.stop_failure is not None:
-            raise RobotError("previous robot stop remains unresolved")
+            raise RobotError("previous robot stop failed")
         self.stop_required = True
         cast("ArmProcess", self.arm).prepare(run_id, service=self.service_feedback)
         self.check_run(run_id)
@@ -273,7 +263,7 @@ class Robot:
         """组合命令格式与绝对限位必须先于任一设备副作用。"""
         self.check_owner()
         if self.stop_failure is not None:
-            raise RobotError("previous robot stop remains unresolved")
+            raise RobotError("previous robot stop failed")
         if command.arm_qpos is not None or command.arm_hold:
             if not self.connected or self.arm is None or not self.arm.is_connected:
                 raise RobotError("arm device unavailable")
@@ -285,18 +275,15 @@ class Robot:
             validate_hand_target(command.hand_qpos, self.hand_lower, self.hand_upper)
 
     def _send_action(self, command, *, expires_ns):
-        def check_send():
-            self.check_run(command.run_id, expires_ns=expires_ns)
-            if time.monotonic_ns() >= expires_ns:
-                raise TimeoutError("target expired before device submission")
-            self.stop_required = True
-
         try:
             if command.arm_qpos is not None or command.arm_hold:
                 self.stop_required = True
                 cast("ArmProcess", self.arm).submit(command, expires_ns=expires_ns)
             if command.hand_qpos is not None:
-                check_send()
+                self.check_run(command.run_id, expires_ns=expires_ns)
+                if time.monotonic_ns() >= expires_ns:
+                    raise TimeoutError("target expired before device submission")
+                self.stop_required = True
                 frame = self.hand_feedback.snapshot()
                 now = time.monotonic_ns()
                 stamp = int(frame["timestamp_ns"][0]) if frame is not None else 0
@@ -328,7 +315,7 @@ class Robot:
     def home_arm(self, waypoints, target, run_id, abort_check, *, deadline_ns):
         self.check_owner()
         if self.stop_failure is not None:
-            raise RobotError("previous robot stop remains unresolved")
+            raise RobotError("previous robot stop failed")
         if abort_check():
             raise OperationCancelled("arm HOME cancelled before submission")
         self.stop_required = True
@@ -346,19 +333,19 @@ class Robot:
     def stop_hand(self, *, passive=False):
         if self.hand is None:
             return
-        frame = self.hand_feedback.latest
+        frame = self.hand_feedback.snapshot()
         if not passive and frame is not None:
             self.hand.stop(frame["qpos"][0], timestamp_ns=int(frame["timestamp_ns"][0]))
         else:
             self.hand.stop()
 
     def stop(self):
+        """停止确认成功后可重复调用；准备和目标提交会重新置 stop_required。"""
         self.check_owner()
         self.stop_signal.set()
+        if not self.stop_required:
+            return
         errors = []
-        unresolved_motion = self.stop_required
-        if self.arm is not None or self.hand is not None:
-            self.stop_required = True
         if self.arm is not None:
             try:
                 self.arm.request_stop()
@@ -373,9 +360,10 @@ class Robot:
                 self.arm.wait_stopped()
             except BaseException as exc:
                 errors.append(exc)
-        if self.arm is None and self.hand is None and unresolved_motion:
+        if self.arm is None and self.hand is None:
             errors.append(RobotError("motion remains unresolved after disconnect"))
         if errors:
+            # 本次会话保留停止故障；后续收尾成功也不能把运行伪装成正常结束。
             self.stop_failure = self.stop_failure or errors[0]
             for error in errors[1:]:
                 logger.error("additional robot stop failure", exc_info=(type(error), error, error.__traceback__))

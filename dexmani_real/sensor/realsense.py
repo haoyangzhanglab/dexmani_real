@@ -42,7 +42,7 @@ class RealSenseCamera:
         self.active_serial: str
         self.pipeline: rs.pipeline | None = None
         self.condition = threading.Condition()
-        self.pending_frame = None
+        self.pending_frame: tuple[rs.composite_frame, tuple[int, int], tuple[int, int]] | None = None
         self.callback_error: Exception | None = None
         self.last_identity: tuple[int, int] | None = None
         self.received_ns = [0, 0]
@@ -127,6 +127,8 @@ class RealSenseCamera:
                 distortion_model=str(color.model),
                 distortion_coeffs=tuple(color.coeffs),
             )
+            if (color.height, color.width) != self.config.depth_shape:
+                raise ValueError("RealSense color profile differs from the configured RGB-D shape")
             self.aligner = rs.align(rs.stream.color)
             for _ in range(WARMUP_FRAMES):
                 self.read()
@@ -165,7 +167,7 @@ class RealSenseCamera:
                 if identity == self.last_identity:
                     return
                 frames.keep()
-                self.pending_frame = frames, identity, tuple(self.received_ns)
+                self.pending_frame = frames, identity, (self.received_ns[0], self.received_ns[1])
                 self.last_identity = identity
                 self.condition.notify()
         except Exception as error:
@@ -199,13 +201,15 @@ class RealSenseCamera:
         aligned = self.aligner.process(frames).get_depth_frame()
         if not aligned:
             raise RuntimeError("Failed to align RealSense depth to color")
-        # SDK 缓冲在返回后可能复用，像素必须拥有独立内存。
-        depth_array = np.array(aligned.get_data(), dtype=np.uint16, copy=True, order="C")
-        rgb = np.array(
-            np.asarray(frames.get_color_frame().get_data())[..., ::-1],
-            dtype=np.uint8, copy=True, order="C",
-        )
-        return RGBDFrame(rgb, depth_array, *identity, min(received_ns))
+        depth = np.asarray(aligned.get_data())
+        bgr = np.asarray(frames.get_color_frame().get_data())
+        shape = (self.color_intrinsics.height, self.color_intrinsics.width)
+        if depth.dtype != np.uint16 or depth.shape != shape:
+            raise ValueError("aligned camera depth must be uint16 [H,W] matching color intrinsics")
+        if bgr.dtype != np.uint8 or bgr.shape != (*shape, 3):
+            raise ValueError("camera color must be uint8 [H,W,3] matching color intrinsics")
+        # SDK 缓冲在返回后可能复用；输出 RGB 和原始深度计数各自拥有独立内存。
+        return RGBDFrame(bgr[..., ::-1].copy(order="C"), depth.copy(), *identity, min(received_ns))
 
     def disconnect(self):
         # stop 失败时保留句柄，让资源所有者能继续收尾。
@@ -220,8 +224,8 @@ class RealSenseCamera:
 def run_camera(shared, config: CameraConfig):
     configure_logging()
     camera = RealSenseCamera(config)
-    camera.connect()
     try:
+        camera.connect()
         shared.camera_depth_scale.value = camera.depth_scale_m
         shared.camera_serial.value = camera.active_serial.encode()
         shared.camera_intrinsics.value = json.dumps(camera.color_intrinsics.to_dict()).encode()
@@ -229,11 +233,6 @@ def run_camera(shared, config: CameraConfig):
             frame = camera.read()
             if frame is None:
                 continue
-            if (
-                frame.rgb.shape != (config.height, config.width, 3)
-                or frame.depth.shape != (config.height, config.width)
-            ):
-                raise ValueError("camera pixels must match the configured RGB-D shape")
             shared.camera_ring.write(
                 timestamp_ns=frame.timestamp_ns,
                 color_frame_number=frame.color_frame_number,

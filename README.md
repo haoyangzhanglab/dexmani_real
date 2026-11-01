@@ -55,9 +55,9 @@ python scripts/visualize_episode.py episodes/TASK/EPISODE
 python scripts/keyboard_teleop.py
 ```
 
-采集和策略会话使用 B 开始、S 保存并结束本段、D 丢弃本段、Q 保存并退出、Esc 急停。H 只在无活动段时回初始位，T 只在空闲、手部无接触时复位触觉，并等待当前入口实际需要的通道；禁用手部时忽略 T，SDK 复位失败则按故障结束。物理回放使用 S 停止、H 回零、Q 退出；键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出。键盘启动后保持 ARMED，首次实际运动键才准备；准备单独占一轮，下一轮重读按键与反馈。运行后松键仍制动并 hold；jog 目标被 IK/约束拒绝时停止当前运动，松开全部点动键后再次按下才重新准备。普通输入过期按取消处理，SDK/停止失败仍是故障。
+采集和策略会话使用 B 开始、S 保存并结束本段、D 丢弃本段、Q 保存并退出、Esc 急停。H 只在无活动段时回初始位，T 只在空闲、手部无接触时复位触觉，并等待当前入口实际需要的通道；禁用手部时忽略 T，SDK 复位失败则按故障结束。物理回放使用 S 停止、H 回零、Q 退出；键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出。键盘在启动及 R 回零结束后完成伺服准备并进入 RUNNING/hold，再提示点动就绪；方向键只更新目标。松键或 jog 目标被 IK/约束拒绝时均制动并 hold，下一轮按当前键态继续，不撤权、不要求松开再按。hold 也有制动距离；运动候选错过本轮提交机会时丢弃，制动 hold 仍立即提交。普通输入过期按取消处理，SDK/停止失败仍是故障。
 
-设备和模型在会话内复用。遥操作和策略在启用手部时，启动先完成手部 HOME；仅实际模态或录制需要触觉时才请求复位并等待对应通道，无需求时元数据保留 `not_requested`。键盘点动不自动 HOME；回放先检查与录制起始实测姿态的偏差，并按配置渐入首帧手姿。各入口仍检查关节反馈就绪。SDK 请求成功与反馈就绪不证明已完成触觉零点标定。Teleop 每段按 writer → arm prepare → 一份当前有效快照 → 实测姿态/VR 锚定 → 最终代际检查进入 ACTIVE；prepare 前采得但仍新鲜的样本可用，不清空手缓存或重复预计算。本段先撤权并请求停止，再关闭录制，由监督方唯一决定发布或丢弃；writer 无发布权。成功关闭且计数一致的零行段提示“未录到数据”，不发布并清理临时目录；非空技术失败段仍保存已录数据。写入/关闭失败、计数不一致或超时不会发布，临时目录保留。收尾期间的 B/H 等准备按键失效，未退出的 writer/模型任务阻止下一段授权。Python 等待期限不能终止阻塞 native 调用。
+设备和模型在会话内复用。遥操作和策略在启用手部时，启动先完成手部 HOME；仅实际模态或录制需要触觉时才请求复位并等待对应通道，无需求时元数据保留 `not_requested`。键盘点动不自动 HOME；回放先检查与录制起始实测姿态的偏差，并按配置渐入首帧手姿。各入口仍检查关节反馈就绪。SDK 请求成功与反馈就绪不证明已完成触觉零点标定。Teleop 每段按 writer → arm prepare → 一份当前有效快照 → 实测姿态/VR 锚定 → 最终代际检查进入 ACTIVE；prepare 前采得但仍新鲜的样本可用，不清空手缓存或重复预计算。VR 和策略的 B 是一次性开始事件，松键不取消准备；每段仍有伺服准备延迟，VR 在准备后重新锚定，策略随后按真实节拍收集观测历史并等待首批预测。两者目标被拒绝时仍结束本段，避免跨越录制或策略动作时序继续运行。本段先撤权并请求停止，再关闭录制，由监督方唯一决定发布或丢弃；writer 无发布权。成功关闭且计数一致的零行段提示“未录到数据”，不发布并清理临时目录；非空技术失败段仍保存已录数据。写入/关闭失败、计数不一致或超时不会发布，临时目录保留。收尾期间的 B/H 等准备按键失效，未退出的 writer/模型任务阻止下一段授权。Python 等待期限不能终止阻塞 native 调用。
 
 策略周期、数值 recipe、模态和动作窗口从 checkpoint 恢复。sync 等待预测后推进实际动作步；async 按时间锚点交接，可消费旧预测仍有效的尾部；RTC 固定物理单位的策略动作前缀，每个执行槽才按当前实测状态映射一次，不预先冻结关节命令或批量 IK。bootstrap 就绪后以当期重新锚定全长；稳态前缀与交接时刻严格，错过承诺槽即结束。EEF 前缀相同不保证未来 IK 分支或关节目标相同，未来映射失败在该槽终止。记预测长度为 P、`action_steps` 为 A、`prefetch_steps` 为 d：sync 要求整数 `1 <= A <= P`，不消费 d；async 要求整数 `1 <= d <= A <= P` 且 `d < P`，A 是计划交接窗口上限，允许交接后的可用尾部短于 A；RTC 另要求 `A+d <= P`，保持完整执行窗口，guidance cap 须显式为有限非负值。async 晚交接裁掉已过期前部并重锚，名义窗口之外的有效尾部仍可消费，全过期结果拒绝。模型只保留一个未回收任务；首预测在模型线程先 reset RNG，再 predict。预热使用上游 `samples=1`，普通路径仍有 2 次预测、RTC 共 4 次，预热后恢复 RNG。sync 已有目标时的预测等待上限不晚于该目标的 `expires_ns`。
 
@@ -86,6 +86,10 @@ Canonical 保留 [固定 13 模态](dexmani_real/data/export.py)、原字段/单
 ## 控制和几何边界
 
 机械臂 SDK、模式、伺服和实测反馈仍由单独 arm owner 持有。父线程使用局部 RLock，仅一个运行代际与停止/急停信号共享；prepare 状态归 owner 本地，低频请求由原请求函数消费自己的回复，未解决的请求禁止复用。停止先使本地目标失效并尝试 SDK stop，再非阻塞清理 IPC；stopped 仅表示停止请求处理完毕。高频目标只有 `expires_ns = 发布起点 + 断流预算`：teleop/jog 默认 0.5 s，policy/replay 2 s；hold 也按此到期。来源年龄 helper 只消费调用方显式提供的 `now_ns`；同一快照使用一次当前时间。来源年龄统一为 `0 < source_ns <= now_ns` 且年龄严格小于阈值，目标使用条件为 `now_ns < expires_ns`。arm/hand 默认年龄预算为 4/30 s，arm 反馈默认 25 Hz；相机预算 4/fps，VR 为 0.5 s。取消、输入过期、目标耗尽和 owner 自身等待预算耗尽等普通结束与 SDK 故障分开；SDK 抛出的 TimeoutError 仍属于真实设备异常。HOME 在模式操作后按当前有效反馈检查起点，过慢的新查询也不能用于下发 waypoint。来源年龄只在读取时裁决，不再保证 SDK 发送瞬间观测仍新鲜，或首次 servo 在原控制槽内；这些预算不构成端到端实时保证。执行器当前反馈、controller 状态与 SDK 返回码仍在实际副作用边界检查。Ruckig 保留 jerk、关节位置及制动极值约束；默认伺服 100 Hz、速度 150 °/s、加速度 900 °/s²、jerk 12000 °/s³，参数以 Python 配置为准。调度延迟后从实际发送时刻安排下一步，实际跟随和停止延迟需真机测量。hand SDK 的阻塞调用不受 arm 期限强制中断。
+
+XHand 连接以设备 ID 已发现且取得首份可信关节反馈为就绪条件，两者共用 2 秒期限，不额外固定等待串口。首帧带 SDK 查询起点的单调时间，同时初始化位置命令和反馈缓存；缓存不持有启动期限，读取不会刷新来源时间。正常目标每次只发送一份位置命令，CRC 回复未确认时立即报错并停止本次运行，不累计次数或自动重发旧目标。SDK 采样、发送或触觉复位直接抛错，以及停止 CRC 重试耗尽，均按设备故障报告，保留原始异常原因。停止请求保留有期限的 CRC 重试：反馈仍新鲜时保持实测姿态，否则进入 passive。调用方统一请求停止，由 Robot.stop 复用已确认的停止结果；新的准备或运动提交重新要求停止，退出仍发送 passive。停止失败保留为本次会话故障，后续收尾成功也不抹去运行错误。
+
+xArm 初始化直接进入 Mode 1，Mode 0 仅用于规划 HOME。prepare/HOME 共用停止、核权、提交和回复收尾流程；一次请求携带一个截止时间，覆盖准备前的停止等待与请求执行，父进程和 owner 使用同一预算，失败后按既有停止预算收尾。生命周期核权最多等待一个伺服周期的代际锁竞争，伺服核权不等待锁。伺服 tick 先消费邮箱中的最新目标，再检查权限、时效和反馈；旧目标到期不会丢弃已经发布的新目标。停止、断流和发送前检查仍由 owner 执行。
 
 HOME 保留路径搜索、等价关节分支、逐段停稳和碰撞检查。HOME 桌面盒体/软间隙与在线目标检查职责不同；在线环境使用 static_boxes，允许抓取中的桌面接触。
 
@@ -116,9 +120,6 @@ python scripts/calibrate_camera.py solve calibration_samples/run_001 --exclude 3
 python scripts/calibrate_vr_heading.py --ref head
 python scripts/tools/view_realsense.py
 python scripts/tools/view_realsense.py --cloud processed
-python scripts/tools/view_realsense.py --calibrate-table
-python scripts/tools/view_realsense.py --save-dir snapshots
-python scripts/tools/view_realsense.py --benchmark-frames 20
 python scripts/tools/view_pointcloud.py
 ```
 
@@ -128,13 +129,11 @@ VR 运行读取 JSON 中有限且位于 `[-180, 180]` 的 `theta_deg`，例如 `
 
 solve 的外参输出与派生报告不得覆盖 `capture.json` 或原始采样 NPZ；其他新结果仍可保存在采样目录内。
 
-实时相机查看使用 view_realsense.py：默认 RGB-D，`--cloud raw/processed` 在启动时选择固定点云类型；Q/Esc 或关闭任一窗口退出。预览不修改曝光优先级，不提供运行中模式切换和逐帧诊断面板。`--save-dir PATH` 保存单帧原始 RGB-D 到一个 `rgbd_*.npz`，打印文件路径后退出；`--benchmark-frames N` 测量 N 个新深度帧；`--calibrate-table` 采集五帧拟合桌面并在终端明确确认后更新共享平面。这三项互斥，执行后退出。窗口需要桌面/OpenGL，代码清理测试不自动连接真实设备。
+实时相机查看使用 view_realsense.py：默认 RGB-D，在 RGB-D 或点云窗口内按 P 开关点云、S 切换 raw/processed（默认 processed）；`--cloud raw/processed` 可在启动时打开点云并指定初始类型。Q/Esc 或关闭 RGB-D 窗口退出；关闭点云窗口仅关闭点云，按 P 可重新打开。预览不修改曝光优先级，不提供逐帧诊断面板。RGB-D 仅预览时不加载外参、桌面或点云处理器；启用对应点云类型时才加载所需资源。窗口需要桌面/OpenGL，代码清理测试不自动连接真实设备。
 
-view_pointcloud.py 提供独立诊断流程：先在终端选择是否拟合桌面，RGB-D 预览按 Enter 继续，随后处理一帧点云、打印点数和本帧处理耗时，关闭相机后静态查看结果；Q/Esc 或关窗退出。拟合结果可供本次处理使用，仅确认发布才改写共享桌面标定。`--config`、`--camera-calibration` 指定当前实验配置和外参。该流程复用当前点云算法和采集实现，预览不额外修改曝光设置。
+view_pointcloud.py 提供独立诊断流程：先在终端选择是否拟合桌面，RGB-D 预览按 Enter 继续，随后处理一帧点云、打印点数和本帧处理耗时，关闭相机后静态查看结果；Q/Esc 或关窗退出。桌面拟合固定采集五份不同深度帧，使用当前相机内参；拟合结果可供本次处理使用，仅确认发布才改写共享桌面标定。`--config`、`--camera-calibration` 指定当前实验配置和外参。该流程复用当前点云算法和采集实现，预览不额外修改曝光设置。RGB-D 类型、网格和缓冲所有权由 RealSenseCamera.read 统一保证，预览、标定和采集入口使用同一读取边界。
 
-相机标定样本与 view_realsense 原始快照均以独占方式创建 NPZ，拒绝覆盖。写入或关闭失败时清理本次新建文件；连续失败时保留首个异常和原 traceback，后续关闭或删除错误另记日志。
-
-快照可用 `np.load(path, allow_pickle=False)` 读取：`rgb` 为 RGB uint8，`depth_aligned_to_color_raw` 为对齐到 color 网格的 uint16 原始计数；`K`、`distortion_model`、`distortion_coeffs` 描述该网格，`depth_scale_m_per_unit` 是每计数的米数。另保存实际 `camera_serial`、`source_timestamp_ns`、`source_clock` 和 depth/color frame number。来源时钟为 `host_monotonic_oldest_rgbd_receive`，时间取两通道首次主机接收时刻中的较早者，不是文件创建时间或曝光时间。深度换算为 `depth_raw.astype(np.float32) * np.float32(depth_scale_m_per_unit)`。原始快照无需外参、桌面文件或点云处理配置；需要基座点云时，离线显式加载对应 serial 的相机标定后重建。
+相机标定样本以独占方式创建 NPZ，拒绝覆盖。写入或关闭失败时清理本次新建文件；连续失败时保留首个异常和原 traceback，后续关闭或删除错误另记日志。
 
 点云默认使用基座系 XYZRGB，工作空间 `x=[0.15,0.85]、y=[-0.50,0.50]、z=[0,0.80] m`，去桌面间隙 10 mm。深度邻域支持、体素、半径密度和连通分量过滤后 FPS；空点云在 viewer 清除、导出拒绝。几何规则可能丢失细结构，参数和配方必须随实验保持一致。
 
@@ -154,5 +153,7 @@ python -m cordvip_geometry view outputs/scene_001
 物体生成先保存未定尺度 mesh，实测定尺度后才一次采样最终点/法向。初始 mask 仅可复用于相同 RGB-D、相机几何、行和来源时间。流程、模型安装与结果字段见 [CordVIP 文档](scripts/cordvip/README.md)。同行关联不证明手/相机物理同步，模型表面与语义点不代表实测接触。
 
 默认日志为终端 INFO、拒绝原因、完整异常 traceback 和简短段结果，需要留档时使用 shell 重定向。几何环境检查使用独立命令 `python -m cordvip_geometry check`。
+
+离线回归使用 `python -B -m unittest discover -s tests`，模拟 SDK 帧、机器人输出和窗口事件，不连接机器人、相机或创建真实窗口。
 
 开发约定见 [AGENTS.md](AGENTS.md)。

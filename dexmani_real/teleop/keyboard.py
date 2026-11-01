@@ -7,7 +7,7 @@ from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.homing import HomePathRejected
 from dexmani_real.control.ik import IKSolver
-from dexmani_real.robot.commands import OperationCancelled
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import build_home_planner, home_robot
 from dexmani_real.runtime.jog import CartesianJog
@@ -92,15 +92,26 @@ class KeyboardTeleop:
         self.robot.check_services = lambda: self.keys.check_health()
         self.robot.connect()
         self.robot.check()
-        self.runtime_state.arm()
+        self.prepare_jog(self.runtime_state.arm())
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         print(
-            "The first jog input prepares motion; release jog keys while running to brake and hold. "
-            "A rejected target stops motion. "
-            "Release all jog keys, then press again to prepare a new motion."
+            "Jog is ready. Release jog keys to brake and hold. "
+            "Rejected targets brake and hold; valid targets resume motion."
         )
         self.period_ns, _ = sampling_clock_ns(self.jog_config.control_hz)
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
+
+    def prepare_jog(self, run_id):
+        self.jog.clear_reference()
+        self.robot.prepare_streaming(run_id)
+        with self.runtime_state.motion_lock:
+            if self.runtime_state.run_id != run_id or self.runtime_state.begin_motion() is None:
+                raise OperationCancelled("jog cancelled during preparation")
+        self.robot.send_action(
+            RobotCommand(run_id, arm_hold=True),
+            expires_ns=time.monotonic_ns() + int(self.jog_config.target_max_age_s * 1e9),
+        )
+        logger.info("Keyboard jog ready")
 
     def run_control_loop(self):
         while not self.runtime_state.quit_requested:
@@ -143,7 +154,6 @@ class KeyboardTeleop:
             self.runtime_state.revoke_motion()
             run_id = self.runtime_state.run_id
         logger.info("Returning home...")
-        self.jog.clear_reference()
 
         def cancelled():
             self.robot.check()
@@ -155,12 +165,12 @@ class KeyboardTeleop:
                 run_id=run_id,
                 cancel_requested=cancelled,
             )
-        except OperationCancelled as exc:
-            self.robot.check(operation_error=exc)
-            logger.info("HOME cancelled: %s", exc)
         except (HomeConfigurationError, HomePathRejected) as exc:
             self.robot.check(operation_error=exc)
             logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
+        else:
+            logger.info("HOME completed")
+        self.prepare_jog(run_id)
         self.keys.discard_events("r")
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
 

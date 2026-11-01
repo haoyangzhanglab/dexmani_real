@@ -152,7 +152,7 @@ class XHandControlExample(XHand):
         deadline_ns = time.monotonic_ns() + int(self.cfg.home_timeout_s * 1e9)
         self.motion_pending = True  # SDK exceptions do not establish non-delivery.
         self.send_action(target)
-        print("  final target submission attempted; checking measured convergence")
+        print("  Position command accepted by SDK; checking measured convergence")
         tolerance_rad = np.deg2rad(self.cfg.home_tolerance_deg)
         consecutive = 0
         while time.monotonic_ns() < deadline_ns:
@@ -171,14 +171,15 @@ class XHandControlExample(XHand):
     def stop_action(self) -> None:
         if not self.motion_pending:
             return
-        started_ns = time.monotonic_ns()
-        measured = None
+        state = None
         try:
             # Cleanup must still read/stop after the operator has cancelled.
             state = self.get_state()
-            measured = None if state is None else state.qpos
         finally:
-            self.stop(measured, timestamp_ns=started_ns)
+            self.stop(
+                None if state is None else state.qpos,
+                timestamp_ns=0 if state is None else state.timestamp_ns,
+            )
             self.motion_pending = False
         print("  Stop command accepted by SDK")
 

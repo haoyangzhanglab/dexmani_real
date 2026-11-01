@@ -8,17 +8,17 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from view_realsense import (
-    TABLE_CALIBRATION_FRAMES,
-    calibrate_table_plane,
-    read_rgbd,
-)
+if TYPE_CHECKING:
+    from dexmani_real.config.perception import PointCloudConfig
+    from dexmani_real.sensor.realsense import RealSenseCamera
 
 logger = logging.getLogger(__name__)
 VIS_DEPTH_RANGE_M = (0.3, 2.5)
+TABLE_CALIBRATION_FRAMES = 5
 
 
 def parse_args(argv=None):
@@ -28,11 +28,78 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def capture_frame(camera):
-    """取得一份通过当前 RGB-D 边界校验的对齐帧。"""
-    while (frame := read_rgbd(camera)) is None:
+def capture_frame(camera: RealSenseCamera):
+    """等待相机读取边界校验过的对齐帧；停流错误由相机报告。"""
+    while (frame := camera.read()) is None:
         pass
     return frame
+
+
+def calibrate_table_plane(
+    *,
+    camera: RealSenseCamera,
+    T_xarm_base_from_color: np.ndarray,
+    config: PointCloudConfig,
+    plane_path: Path,
+) -> tuple[float, float, float, float]:
+    from dexmani_real.geometry.plane import fit_table_plane
+    from dexmani_real.perception.pointcloud import aligned_depth_points_in_base
+    from dexmani_real.utils.table_plane import save_table_plane
+
+    lower, upper = config.workspace_bounds()
+    print("\n" + "=" * 60)
+    print("Table Plane Calibration (multi-frame RANSAC)")
+    print("=" * 60)
+    print("  Clear movable objects from the visible table before continuing.")
+    input("  Press Enter to capture calibration frames...")
+
+    depth_frames: list[np.ndarray] = []
+    last_depth_frame_number = None
+    while len(depth_frames) < TABLE_CALIBRATION_FRAMES:
+        frame = camera.read()
+        if frame is None or frame.depth_frame_number == last_depth_frame_number:
+            continue
+        last_depth_frame_number = frame.depth_frame_number
+        depth_frames.append(frame.depth)
+
+    point_batches: list[np.ndarray] = []
+    for depth_raw in depth_frames:
+        points = aligned_depth_points_in_base(
+            depth_raw=depth_raw,
+            depth_scale_m=camera.depth_scale_m,
+            aligned_depth_intrinsics=camera.color_intrinsics,
+            T_xarm_base_from_color=T_xarm_base_from_color,
+        )
+        points = points[np.all((points >= lower) & (points <= upper), axis=1)]
+        if points.shape[0] > 30_000:
+            step = max(1, points.shape[0] // 30_000)
+            points = points[::step][:30_000]
+        point_batches.append(points)
+    calibration_points = np.concatenate(point_batches, axis=0)
+    fit = fit_table_plane(calibration_points)
+
+    a, b, c, d = fit.plane_abcd
+    print(f"  Plane: {a:.6f}x + {b:.6f}y + {c:.6f}z + {d:.6f} = 0")
+    print(
+        f"  Support: {fit.inlier_points}/{fit.evaluated_points} "
+        f"({fit.inlier_ratio * 100:.1f}%), RMS={fit.rms_residual_m * 1000:.2f} mm, "
+        f"tilt={fit.tilt_deg:.2f} deg"
+    )
+
+    print(
+        "  WARNING: publishing updates the shared plane used by point-cloud "
+        "cropping and table collision geometry."
+    )
+    confirmed = input(f"Publish to {plane_path}? [y/N] ").strip().lower() in {
+        "y",
+        "yes",
+    }
+    if confirmed:
+        save_table_plane(plane_path, fit)
+        print("  Published table calibration.")
+    else:
+        print("  Calibration file unchanged.")
+    return fit.plane_abcd
 
 
 def run_pointcloud_diagnostic(args):
@@ -41,10 +108,13 @@ def run_pointcloud_diagnostic(args):
     from dexmani_real.sensor.realsense import RealSenseCamera
     from dexmani_real.utils.camera_calibrate.extrinsics import load_camera_extrinsics
     from dexmani_real.utils.log import configure_logging
-    from dexmani_real.utils.table_plane import load_table_plane, resolve_table_plane_path
+    from dexmani_real.utils.table_plane import (
+        load_table_plane,
+        resolve_table_plane_path,
+    )
     from dexmani_real.utils.visualization.image import ImageViewer, rgbd_panel
 
-    fit_requested = input("\nRun table calibration? [y/N] ").strip().lower() in {"y", "yes"}
+    fit_requested = input("Run table calibration? [y/N] ").strip().lower() in {"y", "yes"}
     runtime = load_config(path=args.config)
     runtime.camera.validate()
     config = runtime.pointcloud
@@ -86,9 +156,8 @@ def run_pointcloud_diagnostic(args):
         base_from_color = load_camera_extrinsics(camera.active_serial, args.camera_calibration)
         if fit_requested:
             fitted = calibrate_table_plane(
-                camera=camera, intrinsics=intrinsics, T_xarm_base_from_color=base_from_color,
+                camera=camera, T_xarm_base_from_color=base_from_color,
                 config=config, plane_path=resolve_table_plane_path(runtime.environment.table_plane_path),
-                frame_count=TABLE_CALIBRATION_FRAMES,
             )
             table_plane = fitted if config.remove_table else None
 

@@ -110,8 +110,7 @@ class TeleopLoop:
 
     def stop_control(self, reason, *, run_end_reason=RunEndReason.OPERATOR):
         self.request_episode_end(reason, run_end_reason=run_end_reason, failed=False)
-        if self.robot.stop_required:
-            self.robot.stop()
+        self.robot.stop()
 
     def end_episode(
         self, reason, *, run_end_reason=RunEndReason.OPERATOR,
@@ -225,6 +224,7 @@ class TeleopLoop:
             self.runtime_state.revoke_motion()
             self.run_id = self.runtime_state.run_id
             self.phase = TeleopPhase.PREPARING
+        logger.info("Teleop preparing run=%s", self.run_id)
         self.capture_failed = self.discard_requested = False
         self.pending_termination_reason = None
         self.termination_details = []
@@ -386,6 +386,8 @@ class TeleopLoop:
                 self.request_episode_end("begin_unavailable")
             return
         self.phase = TeleopPhase.ACTIVE
+        self.first_target_pending = True
+        logger.info("Teleop active run=%s", self.run_id)
         self.capture_started_s = started_ns / 1e9
         self.tick_origin_ns = None
         self.tick_index = 0
@@ -459,8 +461,9 @@ class TeleopLoop:
             )
             submit_end_ns = time.monotonic_ns()
             self.controller.commit(command, eef_pose=result.eef_pose, submit_end_ns=submit_end_ns)
-            if self.tick_index == 1:
+            if self.first_target_pending:
                 logger.info("Teleop first target submitted run=%s", epoch)
+                self.first_target_pending = False
         except OperationCancelled as exc:
             # 取消不能掩盖同时发生的 SDK/worker 故障；排队的按键随后决定保存意图。
             self.poll_blocking_commands(cancellation=exc)

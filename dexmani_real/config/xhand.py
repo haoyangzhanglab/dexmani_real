@@ -14,7 +14,7 @@ from dexmani_real.robot.model import (
     XHAND_RATED_QPOS_MIN_RAD,
 )
 
-SERIAL_SETTLE_S = 1.0
+CONNECT_TIMEOUT_S = 2.0
 INITIAL_STATE_TIMEOUT_S = 1.0
 
 
@@ -67,9 +67,6 @@ class HandConfig:
     )
 
     feedback_max_age_s: float = 4 / 30
-    # 未经硬件定标的工程起点；达到该连续发送 CRC 次数即使普通位置发送失败。
-    send_crc_limit: int = 5
-
     home_timeout_s: float = 2.0
     home_tolerance_deg: float = 5.0
 
@@ -88,7 +85,7 @@ class HandConfig:
             ("baudrate", 1) if self.comm_type == "serial" else ("ethercat_slave_position", -1)
         )
         for name, minimum in (
-            communication_field, ("device_id", 0), ("send_crc_limit", 1), ("ki", 0), ("kd", 0),
+            communication_field, ("device_id", 0), ("ki", 0), ("kd", 0),
         ):
             value = getattr(self, name)
             if type(value) is not int or value < minimum:

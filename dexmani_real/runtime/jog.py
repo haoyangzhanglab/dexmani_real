@@ -12,13 +12,12 @@ from scipy.spatial.transform import Rotation
 from dexmani_real.control.ik import IKResult
 from dexmani_real.geometry.pose import Pose, quat_multiply
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
-from dexmani_real.runtime.keyboard import CARTESIAN_JOG_KEYS, JOG_KEY_PAIRS
+from dexmani_real.runtime.keyboard import JOG_KEY_PAIRS
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
     read_observation,
 )
-from dexmani_real.runtime.state import SafetyState
 
 logger = logging.getLogger(__name__)
 
@@ -31,43 +30,18 @@ class CartesianJog:
         self.config = config
         self.position_lower, self.position_upper = bounds
         self.command_pose = self.command_qpos = None
-        self.blocked_until_release = False
+        self.rejection_reason = None
 
     def clear_reference(self):
         self.command_pose = self.command_qpos = None
 
-    def stop(self, robot, state):
-        state.revoke_motion()
-        try:
-            robot.stop()
-        finally:
-            self.clear_reference()
-
-    def prepare(self, robot, state):
-        """仅在 ARMED 收到实际点动输入时准备；普通按键变化不重新准备。"""
-        self.clear_reference()
-        robot.prepare_streaming(state.run_id)
-        if state.begin_motion() is None:
-            raise OperationCancelled("jog cancelled during preparation")
-
     def step(self, robot, keys, state, runtime, *, tick_end_ns):
         """发布点动目标或减速保持；故障由会话边界记录、撤权并收尾。"""
         pressed_keys = keys.snapshot()
-        if CARTESIAN_JOG_KEYS.isdisjoint(pressed_keys):
-            self.blocked_until_release = False
         with state.motion_lock:
-            safety_state, epoch = state.safety_state, state.run_id
-            allowed = state.requests_allow_motion() and safety_state in (
-                SafetyState.ARMED, SafetyState.RUNNING,
-            )
-        if not allowed:
-            self.stop(robot, state)
-            return
-        if safety_state == SafetyState.ARMED:
-            if not self.blocked_until_release and jog_motion_requested(pressed_keys):
-                self.prepare(robot, state)
-            # 准备是独立轮次；下一轮重新读取按键与反馈，不补交准备前的输入。
-            return
+            epoch = state.run_id
+            if not state.can_move(run_id=epoch):
+                raise OperationCancelled("jog authority revoked")
 
         row = read_observation(None, robot)
         issues = check_observation(
@@ -76,20 +50,22 @@ class CartesianJog:
         if issues:
             raise OperationCancelled("jog feedback rejected: " + "; ".join(issues))
         target = None
-        if jog_motion_requested(pressed_keys) and not self.blocked_until_release:
+        rejection_reason = None
+        if jog_motion_requested(pressed_keys):
             pose, result = self.propose(
                 pressed_keys, row.arm["qpos"][0],
                 hand_qpos=(row.hand["qpos"][0] if row.hand is not None
                            else np.deg2rad(runtime.hand.home_qpos_deg)),
             )
             if result.qpos is None:
-                logger.warning("IK rejected target: %s", result.reason)
-                self.blocked_until_release = True
-                self.stop(robot, state)
-                return
+                rejection_reason = result.reason
             elif keys.snapshot() == pressed_keys:
                 target = result.qpos
-        if time.monotonic_ns() >= tick_end_ns:
+        if rejection_reason is not None and rejection_reason != self.rejection_reason:
+            logger.warning("IK rejected target; braking and holding: %s", rejection_reason)
+        self.rejection_reason = rejection_reason
+        # 运动目标错过本轮就丢弃；松键或目标拒绝后的制动不能等下一轮。
+        if target is not None and time.monotonic_ns() >= tick_end_ns:
             return
         command = RobotCommand(epoch, arm_qpos=target, arm_hold=target is None)
         robot.send_action(

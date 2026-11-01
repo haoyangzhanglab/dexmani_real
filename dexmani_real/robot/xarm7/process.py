@@ -116,18 +116,43 @@ class ArmProcess:
             raise RuntimeError("arm unavailable for target submission")
         self.io.publish_goal(command, expires_ns=expires_ns)
 
-    def request_operation(self, request, *, service, abort, deadline_ns):
+    def request_operation(self, request: PrepareRequest | HomeRequest, *, service, abort):
+        """准备和 HOME 共用停止、授权、提交与回复收尾边界。"""
+        deadline_ns = request.deadline_ns
         self.check_error()
         if not self.is_connected:
             raise RuntimeError("arm unavailable for lifecycle operation")
-        service()
-        if abort():
-            raise OperationCancelled("arm operation cancelled before submission")
-        if time.monotonic_ns() >= deadline_ns:
-            raise TimeoutError("arm operation deadline expired before submission")
-        self.pipe.send(request)
-        received = False
+        self.request_stop()
+        self.wait_stopped(deadline=min(
+            time.monotonic() + EXECUTOR_TIMEOUT_S, deadline_ns / 1e9,
+        ))
+        lock = self.io.run_id.get_lock()
+        if not lock.acquire(timeout=max(0, min(
+            EXECUTOR_TIMEOUT_S, (deadline_ns - time.monotonic_ns()) / 1e9,
+        ))):
+            raise TimeoutError("arm operation generation lock unavailable")
         try:
+            self.check_error()
+            if (
+                self.io.run_id.get_obj().value != request.run_id
+                or self.io.emergency.is_set()
+            ):
+                raise OperationCancelled("operation cancelled before preparation")
+            if time.monotonic_ns() >= deadline_ns:
+                raise TimeoutError("arm operation deadline expired before preparation")
+            self.io.stopped.clear()
+            self.io.stop.clear()
+        finally:
+            lock.release()
+        reply_pending = False
+        try:
+            service()
+            if abort():
+                raise OperationCancelled("arm operation cancelled before submission")
+            if time.monotonic_ns() >= deadline_ns:
+                raise TimeoutError("arm operation deadline expired before submission")
+            self.pipe.send(request)
+            reply_pending = True
             while not self.pipe.poll(0.005):
                 service()
                 if abort():
@@ -135,13 +160,11 @@ class ArmProcess:
                 if time.monotonic_ns() >= deadline_ns or not self.is_connected:
                     raise TimeoutError("arm operation unresolved before deadline")
             error = self.pipe.recv()
-            received = True
+            reply_pending = False
             if error is not None:
-                if (isinstance(error, OperationCancelled)
-                        or isinstance(error, TimeoutError) and not self.fault
-                        or not isinstance(error, Exception)):
-                    raise error
-                raise RobotError(f"arm operation failed: {error}") from error
+                if isinstance(error, Exception) and self.fault:
+                    raise RobotError(f"arm operation failed: {error}") from error
+                raise error
             if abort():
                 raise OperationCancelled("arm operation cancelled")
             if time.monotonic_ns() >= deadline_ns:
@@ -151,11 +174,13 @@ class ArmProcess:
             # 本请求仍独占自己的回复；停止等待绝不接管 Pipe。
             cleanup_until = time.monotonic() + EXECUTOR_TIMEOUT_S
             try:
-                if not received:
+                if reply_pending:
                     if not self.pipe.poll(max(0, cleanup_until - time.monotonic())):
                         raise TimeoutError("cancelled arm operation reply remains pending")
                     reply = self.pipe.recv()
-                    if reply is not None and not isinstance(reply, OperationCancelled):
+                    if reply is not None and (
+                        self.fault or not isinstance(reply, (OperationCancelled, TimeoutError))
+                    ):
                         raise RobotError(f"arm operation also failed: {reply}") from reply
                 self.wait_stopped(deadline=cleanup_until)
             except BaseException as cleanup_error:
@@ -167,43 +192,21 @@ class ArmProcess:
                 ])
             raise
 
-    def begin_operation(self, run_id):
-        self.check_error()
-        if not self.is_connected:
-            raise RuntimeError("arm unavailable for preparation")
-        self.request_stop()
-        self.wait_stopped()
-        lock = self.io.run_id.get_lock()
-        if not lock.acquire(timeout=EXECUTOR_TIMEOUT_S):
-            raise TimeoutError("arm preparation generation lock unavailable")
-        try:
-            self.check_error()
-            if (
-                self.io.run_id.get_obj().value != run_id
-                or self.io.emergency.is_set()
-            ):
-                raise OperationCancelled("operation cancelled before preparation")
-            self.io.stopped.clear()
-            self.io.stop.clear()
-        finally:
-            lock.release()
-
     def prepare(self, run_id, *, service):
-        self.begin_operation(run_id)
         self.request_operation(
-            PrepareRequest(run_id),
+            PrepareRequest(
+                run_id,
+                time.monotonic_ns() + int((HOME_CONVERGENCE_TIMEOUT_S + EXECUTOR_TIMEOUT_S) * 1e9),
+            ),
             service=service,
             abort=lambda: self.io.run_id.value != run_id or self.io.stop.is_set(),
-            deadline_ns=time.monotonic_ns() + int((HOME_CONVERGENCE_TIMEOUT_S + 2) * 1e9),
         )
 
     def home(self, waypoints, target, run_id, *, service, abort, deadline_ns):
-        self.begin_operation(run_id)
         self.request_operation(
             HomeRequest(run_id, waypoints, target, deadline_ns),
             service=service,
             abort=abort,
-            deadline_ns=deadline_ns,
         )
 
     def request_stop(self):
@@ -233,7 +236,7 @@ class ArmProcess:
             if self.process.is_alive():
                 raise TimeoutError("arm owner process still active; stop/disconnect unresolved")
         # 活着的 owner 保留管道；确认退出后尝试关闭全部端点，保留首次失败。
-        errors = []
+        errors: list[BaseException] = []
         if self.io.close_error.value:
             errors.append(RuntimeError(self.io.close_error.value.decode(errors="replace")))
         if self.process is not None and (

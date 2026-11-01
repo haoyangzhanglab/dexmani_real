@@ -62,7 +62,7 @@ class XArm7:
         self.check_controller_error()
         check_abort()
         check_sdk_return_code(self.api.motion_enable(True), "startup motion_enable")
-        self.enter_mode(0, check_abort=check_abort)
+        self.enter_mode(1, check_abort=check_abort)
         check_abort()
         self.apply_config()
 

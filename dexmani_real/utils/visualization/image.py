@@ -40,15 +40,14 @@ class ImageViewer:
     def poll_events(self) -> list[str]:
         if self.closed:
             return ["closed"]
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(1)
         if cv2.getWindowProperty(self.title, cv2.WND_PROP_VISIBLE) < 1:
             self.close()
             return ["closed"]
-        if key in (ord("q"), ord("Q")):
-            return ["q"]
-        if key in (10, 13):
-            return ["enter"]
-        return ["esc"] if key == 27 else []
+        if key < 0:
+            return []
+        key &= 0xFF
+        return [{27: "esc", 13: "enter", 10: "enter"}.get(key, chr(key).lower())]
 
     def close(self) -> None:
         if not self.closed:

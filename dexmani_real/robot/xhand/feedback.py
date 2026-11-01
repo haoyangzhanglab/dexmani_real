@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S
 from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
     HAND_TACTILE_FORCE_SHAPE,
@@ -29,25 +28,22 @@ HAND_STATE_DTYPE = np.dtype(
 
 @dataclass
 class XHandState:
-    """关节可信；触觉为准确形状、有限值的 float32 完整帧，或无新帧的 None。"""
+    """关节可信；触觉为完整有效帧或 None；时间为 SDK 查询起点，单位 ns。"""
 
     qpos: np.ndarray
     tactile_aggregate: np.ndarray | None
     tactile_dense: np.ndarray | None
+    timestamp_ns: int
 
 
 class XHandFeedback:
     def __init__(self):
         self.latest: np.ndarray | None = None
-        self.initial_deadline_ns = 0
 
-    def reset(self, now_ns: int, *, deadline_ns: int | None = None) -> None:
+    def reset(self) -> None:
         self.latest = None
-        self.initial_deadline_ns = (
-            now_ns + int(INITIAL_STATE_TIMEOUT_S * 1e9) if deadline_ns is None else deadline_ns
-        )
 
-    def consume(self, state: XHandState | None, *, source_ns: int) -> np.ndarray | None:
+    def consume(self, state: XHandState | None) -> np.ndarray | None:
         if state is None:
             return self.snapshot()
 
@@ -62,8 +58,8 @@ class XHandFeedback:
             values = getattr(state, f"tactile_{name}")
             if values is not None:
                 frame[f"tactile_{name}"] = values
-                frame[f"tactile_{name}_timestamp_ns"] = source_ns
-        frame["timestamp_ns"] = source_ns
+                frame[f"tactile_{name}_timestamp_ns"] = state.timestamp_ns
+        frame["timestamp_ns"] = state.timestamp_ns
         frame.flags.writeable = False
         self.latest = frame
         return self.snapshot()

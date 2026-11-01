@@ -15,6 +15,7 @@ from dexmani_real.robot.commands import OperationCancelled, validate_arm_target
 from dexmani_real.robot.xarm7.protocol import (
     ARM_STATE_DTYPE,
     HomeRequest,
+    PrepareRequest,
 )
 from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
 from dexmani_real.utils.log import configure_logging
@@ -33,12 +34,12 @@ class ArmController:
         self.active = self.reference = None
         self.prepared_run_id = 0
 
-    def authorized(self, run_id):
+    def authorized(self, run_id: int, *, timeout_s: float = 0.0) -> bool | None:
         if (self.io.stop.is_set() or self.io.emergency.is_set()
                 or self.io.closing.is_set() or self.io.fault.value):
             return False
         lock = self.io.run_id.get_lock()
-        if not lock.acquire(False):
+        if not lock.acquire(timeout=timeout_s):
             return None  # 争用时本次不发送，不阻挡停止。
         try:
             return (
@@ -203,7 +204,7 @@ class ArmController:
             self.io.publish_status(self.status)
             self.io.stopped.set()  # 处理结束；停止失败仍保存在 close_error。
 
-    def operation(self, message):
+    def operation(self, message: PrepareRequest | HomeRequest):
         kind = "home" if isinstance(message, HomeRequest) else "prepare"
         error = None
         try:
@@ -218,17 +219,14 @@ class ArmController:
                         self.io.closing.set()
                         raise OperationCancelled("parent pipe closed") from exc
                     raise RuntimeError("overlapping arm lifecycle requests")
-                if self.authorized(run_id) is not True:
+                # 生命周期等待一次短锁竞争；伺服 tick 仍使用非阻塞检查。
+                if self.authorized(run_id, timeout_s=1 / self.cfg.servo_hz) is not True:
                     raise OperationCancelled(f"{kind} authority revoked")
-                if isinstance(message, HomeRequest) and time.monotonic_ns() >= message.deadline_ns:
-                    raise _OperationTimeout("HOME execution deadline expired")
+                if time.monotonic_ns() >= message.deadline_ns:
+                    raise _OperationTimeout(f"{kind} execution deadline expired")
 
             check_abort()
-            if self.active is not None:
-                raise RuntimeError("prepare/HOME requires stopped streaming")
-            self.io.take_goal()
-            self.prepared_run_id = 0
-            self.io.stopped.clear()
+            # request_operation 已等待本 owner 的停止确认，目标和伺服参考已清除。
             if isinstance(message, HomeRequest):
                 if len(message.waypoints) > 1:
                     self.wait_stationary(check_abort)
@@ -267,6 +265,7 @@ class ArmController:
         return None
 
     def tick(self) -> int | None:
+        # 先消费最新目标再判时效；旧 active 到期不能覆盖邮箱中的新目标。
         pending = self.io.take_goal()
         goal = pending if pending is not None else self.active
         if goal is None:
@@ -299,7 +298,7 @@ class ArmController:
     def run(self):
         try:
             lock = self.io.run_id.get_lock()
-            if not lock.acquire(False):
+            if not lock.acquire(timeout=1 / self.cfg.servo_hz):
                 raise OperationCancelled("startup generation unavailable")
             try:
                 run_id = self.io.run_id.get_obj().value
@@ -307,7 +306,7 @@ class ArmController:
                 lock.release()
 
             def startup_abort():
-                if self.authorized(run_id) is not True:
+                if self.authorized(run_id, timeout_s=1 / self.cfg.servo_hz) is not True:
                     raise OperationCancelled("arm startup authority revoked")
 
             self.driver.connect(check_abort=startup_abort)
@@ -329,11 +328,6 @@ class ArmController:
                     feedback_due = time.monotonic_ns()
                     continue
                 now = time.monotonic_ns()
-                if self.active is not None:
-                    authorization = self.authorized(int(self.active["run_id"]))
-                    if authorization is False or now >= self.active["expires_ns"]:
-                        self.io.stop.set()
-                        continue
                 # 先刷新到期反馈，再判断伺服当前反馈，调度迟到不写永久 fault。
                 if now >= feedback_due:
                     self.read_feedback()

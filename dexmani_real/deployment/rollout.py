@@ -1,11 +1,14 @@
 """单轮策略执行：准备、预测、控制与录制收尾。"""
 
+from __future__ import annotations
+
 import logging
 import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
@@ -16,6 +19,7 @@ from dexmani_real.config.deployment import (
 from dexmani_real.data.raw import snapshot_recording_metadata
 from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
 from dexmani_real.deployment.schedule import (
+    ActionChunk,
     Prediction,
     control_slot,
     handoff_plan,
@@ -32,6 +36,9 @@ from dexmani_real.runtime.observation import (
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState, device_failure_reason
 from dexmani_real.utils.log import error_detail
+
+if TYPE_CHECKING:
+    from dexmani_real.deployment.observation import PolicyObservationRow
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +94,9 @@ class Rollout:
         self.max_duration_ns = int(max_running_s * 1e9) if max_running_s is not None else None
         self.capture_ids = capture_ids
         self.epoch = epoch
-        self.history = deque(maxlen=policy_info.n_obs_steps)
-        self.plan = self.query = None
+        self.history: deque[PolicyObservationRow] = deque(maxlen=policy_info.n_obs_steps)
+        self.plan: ActionChunk | None = None
+        self.query: Prediction | None = None
         self.preparation_issue = None
         self.run_deadline_ns = self.wait_deadline_ns = None
         self.last_slot = -1
@@ -146,8 +154,7 @@ class Rollout:
             self.query = None
         self.history.clear()
         self.previous_arm = self.wait_deadline_ns = self.run_deadline_ns = None
-        if self.started_ns or self.robot.stop_required:
-            self.robot.stop()
+        self.robot.stop()
 
     def finish_recording(self, *, deadline):
         result = self.result
@@ -263,6 +270,7 @@ class Rollout:
         return row
 
     def prepare(self, poll_operator):
+        logger.info("Policy preparing run=%s", self.epoch)
         if self.recorder is not None:
             metadata = snapshot_recording_metadata(
                 self.camera_snapshot,
@@ -302,6 +310,8 @@ class Rollout:
             self.started_ns + self.max_duration_ns if self.max_duration_ns is not None else None
         )
         self.result.started_utc = utc_now()
+        logger.info("Policy active run=%s; collecting %d observation frames before first prediction",
+                    self.epoch, self.history.maxlen)
 
     def poll_model(self):
         item = self.model.poll()
@@ -311,7 +321,8 @@ class Rollout:
             expected = (self.policy_info.future_steps, self.policy_info.control_action_dim)
             if actions.shape != expected or not np.isfinite(actions).all():
                 raise ValueError(f"policy prediction requires finite shape {expected}")
-            self.query.result = actions
+            # 预测任务与 query 成对创建，结束前由当前 rollout 独占回收。
+            cast(Prediction, self.query).result = actions
 
     def submit(self, slot, *, handoff_slot=None, prefix=None):
         submitted_ns = time.monotonic_ns()
@@ -345,9 +356,9 @@ class Rollout:
             return None, f"action_rejected: {decoded.rejection_reason}"
         return RobotCommand(self.epoch, decoded.arm_qpos, decoded.hand_qpos), None
 
-    def submit_prefetch(self, slot):
+    def submit_prefetch(self, plan: ActionChunk, slot):
         handoff_slot, issue = prefetch_handoff(
-            self.plan, slot=slot, mode=self.execution.mode,
+            plan, slot=slot, mode=self.execution.mode,
             action_steps=self.execution.action_steps,
             prefetch_steps=self.execution.prefetch_steps,
             query_pending=self.query is not None,
@@ -356,7 +367,7 @@ class Rollout:
             return issue
         # 与执行使用同一规范化策略动作；不提前映射未来 RobotCommand。
         prefix = (
-            self.plan.actions[slot - self.plan.anchor_slot:].copy()
+            plan.actions[slot - plan.anchor_slot:].copy()
             if self.execution.mode == "rtc" else None
         )
         return self.submit(slot, handoff_slot=handoff_slot, prefix=prefix)
@@ -395,8 +406,8 @@ class Rollout:
 
             now = time.monotonic_ns()
             synchronous = self.execution.mode == "sync"
-            waiting = synchronous and self.plan is None and self.query is not None
-            if waiting and self.query.result is not None:
+            waiting_query = self.query if synchronous and self.plan is None else None
+            if waiting_query is not None and waiting_query.result is not None:
                 # 结果到达时读取执行快照，给予一个完整提交机会；不再进入模型 history。
                 slot = self.last_slot + 1
                 self.next_step_ns = now + self.dt_ns
@@ -418,10 +429,10 @@ class Rollout:
             if issue is not None:
                 self.stop(issue)
                 return
-            if waiting and self.query.result is None:
+            if waiting_query is not None and waiting_query.result is None:
                 # 当前输入持续裁决；等待行是评估事实，不重复插入模型历史。
                 return
-            if not waiting:
+            if waiting_query is None:
                 self.history.append(self.observations.project(row))
 
             new_plan, issue = handoff_plan(self.query, slot=slot, mode=self.execution.mode)
@@ -444,7 +455,7 @@ class Rollout:
 
             issue = plan_rejection(self.plan, slot, self.execution.mode, self.execution.action_steps)
             if issue is None:
-                issue = self.submit_prefetch(slot)
+                issue = self.submit_prefetch(self.plan, slot)
             if issue is not None:
                 self.stop_rejection(issue)
                 return
@@ -465,6 +476,8 @@ class Rollout:
             expires_ns = now + ACTION_TIMEOUT_NS
             attempted_command = command
             self.robot.send_action(command, expires_ns=expires_ns)
+            if self.previous_arm is None:
+                logger.info("Policy first target submitted run=%s", self.epoch)
             self.previous_arm = command.arm_qpos
             self.target_expires_ns = expires_ns
             self.wait_deadline_ns = None

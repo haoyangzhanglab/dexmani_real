@@ -30,6 +30,7 @@ GOAL_DTYPE = np.dtype(
 @dataclass(frozen=True)
 class PrepareRequest:
     run_id: int
+    deadline_ns: int
 
 
 @dataclass(frozen=True)

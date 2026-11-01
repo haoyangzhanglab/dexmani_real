@@ -19,7 +19,6 @@ JOG_KEY_PAIRS = (
     ("w", "s"), ("d", "a"), ("up", "down"),
     ("left", "right"), ("i", "k"), ("j", "l"),
 )
-CARTESIAN_JOG_KEYS = frozenset(key for pair in JOG_KEY_PAIRS for key in pair)
 
 
 @dataclass(frozen=True)

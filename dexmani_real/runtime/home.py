@@ -44,30 +44,27 @@ def _home_motion(state, robot):
             state.request_emergency_stop()
         raise
     finally:
-        if robot.stop_required:
-            try:
-                robot.stop()
-            except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    state.request_emergency_stop()
-                if failure is None:
-                    raise
-                setattr(failure, "cleanup_errors", [
-                    *getattr(failure, "cleanup_errors", ()), ("home_stop", exc),
-                ])
-                logger.exception("HOME cleanup also failed")
+        try:
+            robot.stop()
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                state.request_emergency_stop()
+            if failure is None:
+                raise
+            setattr(failure, "cleanup_errors", [
+                *getattr(failure, "cleanup_errors", ()), ("home_stop", exc),
+            ])
+            logger.exception("HOME cleanup also failed")
 
 
 def home_robot(state, robot, get_planner, *, run_id, cancel_requested):
     """固定身份贯穿回零；cancel_requested 同时服务故障与操作者输入。"""
-    # send_hand_home 自己完成整机停止边界，arm HOME 由 owner 停稳准备。
     home_hand(state, robot, run_id=run_id, cancel_requested=cancel_requested)
     if cancel_requested() or not state.can_move(
         run_id=run_id, required_safety_state=SafetyState.ARMED,
     ):
         raise OperationCancelled("HOME interrupted before planner initialization")
-    if not robot.hand_config.enabled:
-        robot.stop()
+    robot.stop()
     planner = get_planner()
     home_arm(state, robot, planner, run_id=run_id, cancel_requested=cancel_requested)
 

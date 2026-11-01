@@ -9,8 +9,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.xhand import (
-    INITIAL_STATE_TIMEOUT_S,
-    SERIAL_SETTLE_S,
+    CONNECT_TIMEOUT_S,
     HandConfig,
 )
 from dexmani_real.robot.commands import (
@@ -32,7 +31,7 @@ from dexmani_real.robot.xhand.feedback import XHandState
 logger = logging.getLogger(__name__)
 
 SDK_PROTOCOL = {"ethercat": "EtherCAT", "serial": "RS485"}
-INITIAL_STATE_READ_INTERVAL_S = 0.02
+CONNECT_POLL_INTERVAL_S = 0.02
 COMMUNICATION_CRC_ERROR_CODE = 1_501_070
 COMBINED_FORCE_UNAVAILABLE_CODE = 1_501_018
 DISTRIBUTED_FORCE_UNAVAILABLE_CODE = 1_501_019
@@ -142,7 +141,6 @@ class XHand:
         self.mechanical_lower = np.asarray(XHAND_RATED_QPOS_MIN_RAD, dtype=np.float64)
         self.mechanical_upper = np.asarray(XHAND_RATED_QPOS_MAX_RAD, dtype=np.float64)
         self.connected_flag = False
-        self.send_crc_count = 0
         self.read_crc = False
         self.tactile_unavailable: set[str] = set()
         self.control: Any = None
@@ -153,32 +151,44 @@ class XHand:
     def is_connected(self) -> bool:
         return self.connected_flag
 
-    def connect(self, *, cancel_requested=lambda: False) -> int | None:
-        """返回连接阶段初始反馈的固定单调时钟截止时间，单位 ns。"""
+    def connect(self, *, cancel_requested=lambda: False) -> XHandState:
+        """设备发现与首帧读取共用期限；命令与上层缓存使用同一份实测状态。"""
+        if self.connected_flag:
+            raise RuntimeError("XHand is already connected")
         from xhand_controller import xhand_control
 
         self.sdk = xhand_control
-        if self.connected_flag:
-            return None
-
         try:
+            if cancel_requested():
+                raise OperationCancelled("XHand connection cancelled")
             self.open_device()
-            self.send_crc_count = 0
+            self.command = None
             self.read_crc = False
             self.tactile_unavailable.clear()
             self.tactile_reset_metadata = {}
-            if self.cfg.comm_type == "serial":
-                time.sleep(SERIAL_SETTLE_S)
-
             self.connected_flag = True
-            hand_ids = list(self.control.list_hands_id())
-            if self.cfg.device_id not in hand_ids:
-                raise XHandError(
-                    "connect",
-                    -1,
-                    f"configured device_id={self.cfg.device_id} not found in {hand_ids}",
-                )
-            return self.initialize_command(cancel_requested=cancel_requested)
+            deadline_ns = time.monotonic_ns() + int(CONNECT_TIMEOUT_S * 1e9)
+            hand_ids = []
+            while time.monotonic_ns() < deadline_ns:
+                if cancel_requested():
+                    raise OperationCancelled("XHand connection cancelled")
+                # SDK 的串口读取线程异步发现设备；这里只查询已发现的 ID。
+                hand_ids = list(self.control.list_hands_id())
+                sample = self.get_state() if self.cfg.device_id in hand_ids else None
+                if cancel_requested():
+                    raise OperationCancelled("XHand connection cancelled")
+                remaining_ns = deadline_ns - time.monotonic_ns()
+                if remaining_ns <= 0:
+                    break
+                if sample is not None:
+                    self.command = self.make_command(sample.qpos)
+                    return sample
+                time.sleep(min(CONNECT_POLL_INTERVAL_S, remaining_ns / 1e9))
+            raise XHandError(
+                "connect", -1,
+                f"initial XHand feedback timed out; device_id={self.cfg.device_id}, "
+                f"discovered={hand_ids}",
+            )
         except BaseException as failure:
             try:
                 self.disconnect()
@@ -204,23 +214,6 @@ class XHand:
             error = self.control.open_ethercat(device_name)
         if error.error_code != 0:
             raise XHandError("connect", error.error_code, error.error_message)
-
-    def initialize_command(self, *, cancel_requested=lambda: False) -> int:
-        deadline_ns = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
-        while time.monotonic_ns() < deadline_ns:
-            if cancel_requested():
-                raise OperationCancelled("XHand initial joint feedback acquisition cancelled")
-            sample = self.get_state()
-            if cancel_requested():
-                raise OperationCancelled("XHand initial joint feedback acquisition cancelled")
-            remaining_ns = deadline_ns - time.monotonic_ns()
-            if remaining_ns <= 0:
-                break
-            if sample is not None:
-                self.command = self.make_command(sample.qpos)
-                return deadline_ns
-            time.sleep(min(INITIAL_STATE_READ_INTERVAL_S, remaining_ns / 1e9))
-        raise XHandError("connect", -1, "initial XHand joint feedback timed out")
 
     def disconnect(self) -> None:
         connected_ethercat = self.connected_flag and self.cfg.comm_type == "ethercat"
@@ -288,7 +281,7 @@ class XHand:
                 result["hand_tactile_reset_result"] = (
                     f"exception ({completed}/5), sensor=0x{sensor_id:02x}: {exc}"
                 )
-                raise
+                raise RobotError(f"XHand tactile reset SDK call failed: {type(exc).__name__}: {exc}") from exc
             code = int(reply.error_code)
             if code != 0:
                 result["hand_tactile_reset_result"] = (
@@ -311,7 +304,11 @@ class XHand:
         """读 CRC 无可信新关节；触觉通道无完整有效新帧时对应字段为 None。"""
         if self.control is None or not self.connected_flag:
             raise RuntimeError("XHand is not connected")
-        error, raw_state = self.control.read_state(self.cfg.device_id, True)
+        query_started_ns = time.monotonic_ns()
+        try:
+            error, raw_state = self.control.read_state(self.cfg.device_id, True)
+        except Exception as exc:
+            raise RobotError(f"XHand read SDK call failed: {type(exc).__name__}: {exc}") from exc
         code = int(error.error_code)
         if code == COMMUNICATION_CRC_ERROR_CODE:
             if not self.read_crc:
@@ -373,6 +370,7 @@ class XHand:
             qpos=qpos,
             tactile_aggregate=tactile["aggregate"],
             tactile_dense=tactile["dense"],
+            timestamp_ns=query_started_ns,
         )
 
     def send_action(self, action: np.ndarray) -> None:
@@ -381,11 +379,10 @@ class XHand:
 
     def _send_action(self, target: np.ndarray) -> None:
         """Robot 的组合预检或本驱动的公开入口已验证目标。"""
-        self._send_position(target)
-        if self.send_crc_count >= self.cfg.send_crc_limit:
+        if self._send_position(target) == COMMUNICATION_CRC_ERROR_CODE:
             raise XHandError(
                 "send", COMMUNICATION_CRC_ERROR_CODE,
-                f"continuous send CRC reached limit={self.cfg.send_crc_limit}",
+                "CRC reply; target delivery unconfirmed",
             )
 
     def _send_position(self, target: np.ndarray) -> int:
@@ -431,24 +428,19 @@ class XHand:
             if remaining <= 0:
                 break
             time.sleep(min(STOP_RETRY_INTERVAL_S, remaining))
-        raise RuntimeError("XHand stop timed out: CRC replies remain unconfirmed")
+        raise XHandError("stop", COMMUNICATION_CRC_ERROR_CODE,
+                         "stop timed out: CRC replies remain unconfirmed")
 
     def send_command(self) -> int:
-        error = self.control.send_command(self.cfg.device_id, self.command)
+        try:
+            error = self.control.send_command(self.cfg.device_id, self.command)
+        except Exception as exc:
+            raise RobotError(f"XHand send SDK call failed: {type(exc).__name__}: {exc}") from exc
 
         code = int(error.error_code)
-        if code == COMMUNICATION_CRC_ERROR_CODE:
-            if self.send_crc_count == 0:
-                logger.warning("XHand send CRC; delivery unconfirmed")
-            self.send_crc_count += 1
-            return code
-        if code not in NONFATAL_SDK_CODES:
+        if code not in NONFATAL_SDK_CODES and code != COMMUNICATION_CRC_ERROR_CODE:
             # 1501035 表示过流，必须终止本次运行。
             raise XHandError("send", code, error.error_message)
-        # 包括成功停止请求；读取反馈不能当作发送确认。
-        if self.send_crc_count:
-            logger.info("XHand send responses recovered")
-        self.send_crc_count = 0
         return code
 
     def make_command(self, qpos: np.ndarray) -> Any:

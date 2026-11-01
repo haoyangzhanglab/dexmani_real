@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 class PointCloudViewer:
     def __init__(
         self, *, workspace: Sequence[float], base_from_color: np.ndarray,
-        title: str = "Point Cloud",
+        title: str = "Point Cloud", keys: Sequence[str] = (),
     ):
         import open3d as o3d
 
@@ -37,7 +37,7 @@ class PointCloudViewer:
             options = self.vis.get_render_option()
             options.point_size = 3.0
             options.background_color = np.ones(3)
-            for key in ("q", "esc"):
+            for key in ("q", "esc", *keys):
                 code = 256 if key == "esc" else ord(key.upper())
                 self.vis.register_key_action_callback(code, self.key_callback(key))
         except BaseException:
