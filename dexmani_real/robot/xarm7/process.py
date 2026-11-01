@@ -13,6 +13,7 @@ from dexmani_real.robot.xarm7.protocol import (
     HomeRequest,
     PrepareRequest,
 )
+from dexmani_real.utils.log import attach_cleanup_errors
 
 
 class ArmProcess:
@@ -40,6 +41,13 @@ class ArmProcess:
         return (
             self.process is not None and self.process.is_alive()
             and self.io.connected.is_set() and not self.io.closing.is_set()
+        )
+
+    @property
+    def is_closed(self):
+        return (
+            (self.process is None or not self.process.is_alive())
+            and self.pipe.closed and self.child_pipe.closed
         )
 
     @property
@@ -163,7 +171,7 @@ class ArmProcess:
             reply_pending = False
             if error is not None:
                 if isinstance(error, Exception) and self.fault:
-                    raise RobotError(f"arm operation failed: {error}") from error
+                    raise RobotError("arm operation failed") from error
                 raise error
             if abort():
                 raise OperationCancelled("arm operation cancelled")
@@ -181,13 +189,12 @@ class ArmProcess:
                     if reply is not None and (
                         self.fault or not isinstance(reply, (OperationCancelled, TimeoutError))
                     ):
-                        raise RobotError(f"arm operation also failed: {reply}") from reply
+                        raise RobotError("arm operation also failed") from reply
                 self.wait_stopped(deadline=cleanup_until)
             except BaseException as cleanup_error:
                 # 不再复用这个 owner；保留句柄直到明确关闭。
                 self.io.closing.set()
-                setattr(failure, "cleanup_errors", [
-                    *getattr(failure, "cleanup_errors", ()),
+                attach_cleanup_errors(failure, [
                     ("arm_operation_cleanup", cleanup_error),
                 ])
             raise
@@ -231,27 +238,31 @@ class ArmProcess:
     def close(self):
         self.request_stop()
         self.io.closing.set()
-        if self.process is not None and self.process.pid is not None:
-            self.process.join(EXECUTOR_TIMEOUT_S)
-            if self.process.is_alive():
-                raise TimeoutError("arm owner process still active; stop/disconnect unresolved")
-        # 活着的 owner 保留管道；确认退出后尝试关闭全部端点，保留首次失败。
         errors: list[BaseException] = []
-        if self.io.close_error.value:
-            errors.append(RuntimeError(self.io.close_error.value.decode(errors="replace")))
-        if self.process is not None and (
-            self.process.exitcode not in (None, 0)
-            or self.process.exitcode == 0 and not self.io.stopped.is_set()
-        ):
-            errors.append(RobotError(f"arm owner exited without a clean stop: {self.process.exitcode}"))
-        for pipe in (self.child_pipe, self.pipe):
+        if self.process is not None and self.process.pid is not None:
             try:
-                pipe.close()
+                self.process.join(EXECUTOR_TIMEOUT_S)
             except BaseException as exc:
                 errors.append(exc)
+        # SDK 可在 join 期间才返回故障；最终事实必须在等待之后读取。
+        if self.fault:
+            errors.insert(0, RobotError(f"xArm controller fault: {self.fault}"))
+        if self.io.close_error.value:
+            errors.append(RobotError(self.io.close_error.value.decode(errors="replace")))
+        alive = self.process is not None and self.process.is_alive()
+        if alive:
+            errors.append(TimeoutError("arm owner process still active; stop/disconnect unresolved"))
+        else:
+            if self.process is not None and self.process.exitcode not in (None, 0):
+                errors.append(RobotError(f"arm owner exited: {self.process.exitcode}"))
+            if self.process is not None and self.process.pid is not None and not self.io.stopped.is_set():
+                errors.append(RobotError("arm owner exited without confirming stop"))
+            # 活着的 owner 保留管道；确认退出后尝试关闭全部端点。
+            for pipe in (self.child_pipe, self.pipe):
+                try:
+                    pipe.close()
+                except BaseException as exc:
+                    errors.append(exc)
         if errors:
-            setattr(errors[0], "cleanup_errors", [
-                *getattr(errors[0], "cleanup_errors", ()),
-                *(("arm_close", error) for error in errors[1:]),
-            ])
+            attach_cleanup_errors(errors[0], (("arm_close", error) for error in errors[1:]))
             raise errors[0]

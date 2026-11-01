@@ -32,7 +32,7 @@ from dexmani_real.runtime.observation import (
 from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.io import write_json, write_yaml
-from dexmani_real.utils.log import configure_logging, error_detail
+from dexmani_real.utils.log import attach_cleanup_errors, configure_logging, error_detail
 from dexmani_real.utils.table_plane import load_table_plane, resolve_table_plane_path
 
 logger = logging.getLogger(__name__)
@@ -103,7 +103,6 @@ class PolicySession:
             else:
                 print("就绪：H 回初始位 → B 开始 | S 保存本轮 | D 丢弃本轮 | Q 保存退出 | Esc 急停 | T 复位触觉。", flush=True)
                 self.run_control_loop()
-                self.robot.check()
         except KeyboardInterrupt as exc:
             failure = exc
             if self.runtime_state is not None:
@@ -235,13 +234,14 @@ class PolicySession:
     def close(self, *, failure=None):
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
         cleanup_errors = []
+        runtime_failure = None
         try:
             if self.runtime_state is not None:
                 close_runtime(
                     self.runtime_state, self.robot, sensors=self.sensors, keyboard=self.keyboard,
                 )
         except BaseException as exc:
-            cleanup_errors.append(error_detail("shutdown", exc))
+            runtime_failure = exc
         model_status = "completed"
         if self.model is not None:
             try:
@@ -253,11 +253,21 @@ class PolicySession:
                 model_status, errors = self.model.wait_closed(deadline - time.monotonic())
                 cleanup_errors.extend(errors)
         writer_pending = self.episode is not None and self.episode.writer_pending
-        pending = model_status == "pending" or writer_pending
+        robot_pending = self.robot is not None and (
+            self.robot.arm is not None or self.robot.hand is not None
+        )
+        sensor_pending = self.sensors is not None and bool(self.sensors.started)
+        pending = any((model_status == "pending", writer_pending, robot_pending, sensor_pending))
         shutdown = (
             "pending" if pending else "completed"
-            if model_status == "completed" and not cleanup_errors else "failed"
+            if model_status == "completed" and runtime_failure is None and not cleanup_errors else "failed"
         )
+        if failure is not None:
+            if runtime_failure is not None:
+                attach_cleanup_errors(failure, [("shutdown", runtime_failure)])
+            self.errors.append(error_detail("session", failure))
+        elif runtime_failure is not None:
+            self.errors.append(error_detail("shutdown", runtime_failure))
         self.errors.extend(cleanup_errors)
         episode_error = next((error for result in self.episodes for error in result.errors), None)
         successful = (
@@ -286,7 +296,7 @@ class PolicySession:
             successful = False
             logger.exception("session result publication failed")
         if pending:
-            logger.warning("Cleanup remains pending; native model/writer calls may outlive this wait")
+            logger.warning("Cleanup remains pending; retained resources may outlive this wait")
         return int(not successful)
 
     def check_startup(self):

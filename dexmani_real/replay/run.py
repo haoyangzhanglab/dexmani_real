@@ -79,7 +79,6 @@ def run_replay(
             wait_for_home(
                 runtime_state, runtime, robot, keyboard, outcome, summary["home_results"],
             )
-        robot.check()
     except OperationCancelled as exc:
         try:
             if robot is not None:
@@ -108,15 +107,17 @@ def run_replay(
             outcome.reason = f"{type(exc).__name__}: {error_detail('replay', exc)['message']}"
     finally:
         shutdown_clean = False
+        shutdown_failure = False
         try:
             close_runtime(runtime_state, robot, keyboard=keyboard)
             shutdown_clean = not runtime_state.error_state and not runtime_state.estop_request
         except BaseException as exc:
+            shutdown_failure = True
             outcome.cleanup_errors.append(exc)
             logger.exception("replay shutdown failed")
             if isinstance(exc, KeyboardInterrupt):
                 runtime_state.request_emergency_stop()
-        if runtime_state.error_state or (not shutdown_clean and not runtime_state.estop_request):
+        if outcome.status == ReplayStatus.FAULT or runtime_state.error_state or shutdown_failure:
             outcome.status = ReplayStatus.FAULT
             if not outcome.reason and not outcome.cleanup_errors:
                 outcome.reason = "hardware/shutdown failure"

@@ -289,14 +289,15 @@ class XHandTests(unittest.TestCase):
     def test_failed_stop_does_not_skip_next_attempt_or_clear_fault(self):
         self.connect_robot()
         self.control.send_command.return_value = reply(1_501_035)
-        with self.assertRaises(XHandError):
+        with self.assertRaises(XHandError) as stopped:
             self.robot.stop()
         self.assertTrue(self.robot.stop_required)
         self.control.send_command.return_value = reply()
         self.robot.stop()
         self.assertEqual(self.arm.request_stop.call_count, 2)
-        with self.assertRaisesRegex(RobotError, "previous robot stop"):
+        with self.assertRaises(XHandError) as checked:
             self.robot.check()
+        self.assertIs(checked.exception, stopped.exception)
 
     def test_home_crc_stops_without_waiting_for_convergence(self):
         epoch = self.connect_robot()

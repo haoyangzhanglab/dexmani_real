@@ -52,7 +52,6 @@ class KeyboardTeleop:
             try:
                 self.start()
                 clean = self.run_control_loop()
-                self.robot.check()
             except OperationCancelled as exc:
                 self.robot.check(operation_error=exc)
                 logger.info("Keyboard teleop cancelled: %s", exc)

@@ -21,6 +21,7 @@ from dexmani_real.robot.model import (
     XHAND_RATED_QPOS_MIN_RAD,
 )
 from dexmani_real.robot.xhand.feedback import XHandFeedback
+from dexmani_real.utils.log import attach_cleanup_errors
 from dexmani_real.utils.timing import next_tick_ns
 
 FEEDBACK_PERIOD_NS = round(1e9 / 30)
@@ -76,16 +77,15 @@ class Robot:
             if self.arm is not None:
                 self.arm.check_error()
             if self.stop_failure is not None:
-                failure = RobotError("previous robot stop failed")
-                setattr(failure, "cleanup_errors", [("robot_stop", self.stop_failure)])
-                raise failure from self.stop_failure
+                raise self.stop_failure
             if self.check_services is not None and not self.check_services():
                 raise RobotError("required runtime service unavailable")
         except BaseException as failure:
             if operation_error is not None:
-                setattr(failure, "cleanup_errors", [
-                    *getattr(failure, "cleanup_errors", ()), ("operation", operation_error),
-                ])
+                if not isinstance(operation_error, OperationCancelled):
+                    attach_cleanup_errors(operation_error, [("robot_check", failure)])
+                    raise operation_error
+                attach_cleanup_errors(failure, [("operation", operation_error)])
             raise
         if operation_error is not None and getattr(operation_error, "cleanup_errors", False):
             raise operation_error
@@ -249,7 +249,7 @@ class Robot:
     def prepare_streaming(self, run_id):
         self.check_owner()
         if self.stop_failure is not None:
-            raise RobotError("previous robot stop failed")
+            raise self.stop_failure
         self.stop_required = True
         cast("ArmProcess", self.arm).prepare(run_id, service=self.service_feedback)
         self.check_run(run_id)
@@ -263,7 +263,7 @@ class Robot:
         """组合命令格式与绝对限位必须先于任一设备副作用。"""
         self.check_owner()
         if self.stop_failure is not None:
-            raise RobotError("previous robot stop failed")
+            raise self.stop_failure
         if command.arm_qpos is not None or command.arm_hold:
             if not self.connected or self.arm is None or not self.arm.is_connected:
                 raise RobotError("arm device unavailable")
@@ -315,7 +315,7 @@ class Robot:
     def home_arm(self, waypoints, target, run_id, abort_check, *, deadline_ns):
         self.check_owner()
         if self.stop_failure is not None:
-            raise RobotError("previous robot stop failed")
+            raise self.stop_failure
         if abort_check():
             raise OperationCancelled("arm HOME cancelled before submission")
         self.stop_required = True
@@ -367,11 +367,8 @@ class Robot:
             self.stop_failure = self.stop_failure or errors[0]
             for error in errors[1:]:
                 logger.error("additional robot stop failure", exc_info=(type(error), error, error.__traceback__))
-            setattr(errors[0], "cleanup_errors", [
-                *getattr(errors[0], "cleanup_errors", ()),
-                *(("robot_stop", error) for error in errors[1:]),
-            ])
-            raise errors[0]
+            attach_cleanup_errors(self.stop_failure, (("robot_stop", error) for error in errors))
+            raise self.stop_failure
         self.stop_required = False
 
     def service_idle(self):
@@ -386,9 +383,9 @@ class Robot:
         self.check_owner()
         if self.arm is None and self.hand is None:
             return
-        # 共用的 stop 信号先通知 arm；close 只报告停止/断开失败，不重抛运行故障。
+        # 共用 stop 先通知 arm；owner 退出后的最终故障也由 close 带回。
         self.stop_signal.set()
-        errors = []
+        errors = [self.stop_failure] if self.stop_failure is not None else []
         try:
             self.stop_hand(passive=True)
         except BaseException as exc:
@@ -398,25 +395,23 @@ class Robot:
                 self.arm.close()
             except BaseException as exc:
                 errors.append(exc)
-            else:
-                self.arm = None
+            finally:
+                if self.arm.is_closed:
+                    self.arm = None
 
         if self.hand is not None:
             try:
                 self.hand.disconnect()
             except BaseException as exc:
                 errors.append(exc)
-            else:
-                self.hand = None
+            finally:
+                if self.hand.control is None:
+                    self.hand = None
 
         self.connected = False
+        self.stop_required = self.arm is not None or self.hand is not None
         if errors:
-            self.stop_required = True
             for error in errors[1:]:
                 logger.error("additional robot close failure", exc_info=(type(error), error, error.__traceback__))
-            setattr(errors[0], "cleanup_errors", [
-                *getattr(errors[0], "cleanup_errors", ()),
-                *(("robot_close", error) for error in errors[1:]),
-            ])
+            attach_cleanup_errors(errors[0], (("robot_close", error) for error in errors[1:]))
             raise errors[0]
-        self.stop_required = False

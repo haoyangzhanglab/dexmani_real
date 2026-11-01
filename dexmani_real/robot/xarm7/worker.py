@@ -220,7 +220,10 @@ class ArmController:
                         raise OperationCancelled("parent pipe closed") from exc
                     raise RuntimeError("overlapping arm lifecycle requests")
                 # 生命周期等待一次短锁竞争；伺服 tick 仍使用非阻塞检查。
-                if self.authorized(run_id, timeout_s=1 / self.cfg.servo_hz) is not True:
+                authorization = self.authorized(run_id, timeout_s=1 / self.cfg.servo_hz)
+                if authorization is None:
+                    raise _OperationTimeout(f"{kind} generation lock unavailable")
+                if not authorization:
                     raise OperationCancelled(f"{kind} authority revoked")
                 if time.monotonic_ns() >= message.deadline_ns:
                     raise _OperationTimeout(f"{kind} execution deadline expired")
@@ -299,14 +302,19 @@ class ArmController:
         try:
             lock = self.io.run_id.get_lock()
             if not lock.acquire(timeout=1 / self.cfg.servo_hz):
-                raise OperationCancelled("startup generation unavailable")
+                if self.io.stop.is_set() or self.io.emergency.is_set() or self.io.closing.is_set():
+                    raise OperationCancelled("arm startup cancelled")
+                raise _OperationTimeout("startup generation lock unavailable")
             try:
                 run_id = self.io.run_id.get_obj().value
             finally:
                 lock.release()
 
             def startup_abort():
-                if self.authorized(run_id, timeout_s=1 / self.cfg.servo_hz) is not True:
+                authorization = self.authorized(run_id, timeout_s=1 / self.cfg.servo_hz)
+                if authorization is None:
+                    raise _OperationTimeout("startup generation lock unavailable")
+                if not authorization:
                     raise OperationCancelled("arm startup authority revoked")
 
             self.driver.connect(check_abort=startup_abort)
@@ -342,7 +350,7 @@ class ArmController:
                 else:
                     self.io.stop.wait(delay)
         except BaseException as exc:
-            if not isinstance(exc, (OperationCancelled, _OperationTimeout)):
+            if not isinstance(exc, OperationCancelled):
                 self.fault(exc)
             else:
                 logger.warning("arm operation ended: %s", exc)
