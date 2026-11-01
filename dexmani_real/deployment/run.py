@@ -17,10 +17,6 @@ from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.deployment.session import PolicySession
 from dexmani_real.utils.io import write_yaml
-from dexmani_real.utils.table_plane import (
-    load_table_plane,
-    resolve_table_plane_path,
-)
 
 
 def session_directory(root: Path, info) -> Path:
@@ -84,8 +80,6 @@ def run_policy(
     )
     runtime = resolve_deployment_config(info, runtime)
     observations = ObservationBuilder(info, runtime)
-    table_plane_abcd = load_table_plane(runtime.environment.table_plane_path)
-
     if camera_calibration_path is not None:
         camera_calibration_path = Path(camera_calibration_path).expanduser().resolve()
     root = output or Path(__file__).resolve().parents[2] / "rollouts"
@@ -95,8 +89,8 @@ def run_policy(
         "runtime": {name: asdict(getattr(runtime, name)) for name in RUNTIME_SECTIONS},
         "camera_calibration_path": str(camera_calibration_path or CAMERAS_PATH),
         "effective_camera": None,
-        "table_plane_abcd": table_plane_abcd,
-        "table_plane_path": str(resolve_table_plane_path(runtime.environment.table_plane_path)),
+        "table_plane_abcd": None,
+        "table_plane_path": None,
         "seed": seed,
         "device": device,
         "num_episodes": num_episodes,
@@ -122,7 +116,7 @@ def run_policy(
         record_raw=record_raw,
         output_dir=session_dir,
         camera_calibration_path=camera_calibration_path,
-        table_plane_abcd=table_plane_abcd,
+        table_plane_abcd=None,
         run_config=payload,
         observations=observations,
     ).run()

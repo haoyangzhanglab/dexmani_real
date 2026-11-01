@@ -186,7 +186,7 @@ class Rollout:
                         time.sleep(0.001)
             except OperationCancelled as exc:
                 # 取消不能掩盖同时发生的设备或 worker 故障。
-                self.robot.check(cancellation=exc)
+                self.robot.check(operation_error=exc)
                 self.stop(str(exc))
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):

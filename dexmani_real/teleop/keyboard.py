@@ -3,12 +3,13 @@
 import logging
 import time
 
+from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.control.constraints import MotionConstraints
-from dexmani_real.control.homing import HomePlanner
+from dexmani_real.control.homing import HomePathRejected
 from dexmani_real.control.ik import IKSolver
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import home_robot
+from dexmani_real.runtime.home import build_home_planner, home_robot
 from dexmani_real.runtime.jog import CartesianJog
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime
@@ -18,7 +19,6 @@ from dexmani_real.runtime.preflight import (
 )
 from dexmani_real.runtime.state import RunEndReason, SessionState, device_failure_reason
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ class KeyboardTeleop:
     def run(self):
         configure_logging()
         validate_robot_config(self.runtime)
-        self.table_plane_abcd = load_table_plane(self.runtime.environment.table_plane_path)
+        self.home_planner = None
         self.bounds = jog_bounds(self.runtime)
         self.runtime_state = SessionState()
         self.robot = Robot(
@@ -52,8 +52,9 @@ class KeyboardTeleop:
             try:
                 self.start()
                 clean = self.run_control_loop()
+                self.robot.check()
             except OperationCancelled as exc:
-                self.robot.check(cancellation=exc)
+                self.robot.check(operation_error=exc)
                 logger.info("Keyboard teleop cancelled: %s", exc)
                 clean = bool(self.runtime_state.quit_requested)
         except KeyboardInterrupt:
@@ -85,18 +86,16 @@ class KeyboardTeleop:
             rotation_tolerance=self.jog_config.ik_max_pose_error_rot_rad,
         )
         self.jog = CartesianJog(solver, self.jog_config, self.bounds)
-        self.home_planner = HomePlanner(
-            self.runtime.environment,
-            self.runtime.arm,
-            table_plane_abcd=self.table_plane_abcd,
-        )
         self.keys.start()
         if not self.keys.check_health():
             raise RuntimeError("keyboard stop listener unavailable")
         self.robot.check_services = lambda: self.keys.check_health()
         self.robot.connect()
         self.robot.check()
-        self.runtime_state.arm()
+        with self.runtime_state.motion_lock:
+            if self.runtime_state.stop_signal.is_set() or not self.runtime_state.requests_allow_motion():
+                raise OperationCancelled("startup cancelled before arming")
+            self.runtime_state.arm()
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         print(
             "The first jog input prepares motion; release jog keys while running to brake and hold. "
@@ -147,10 +146,7 @@ class KeyboardTeleop:
             self.runtime_state.revoke_motion()
             run_id = self.runtime_state.run_id
         logger.info("Returning home...")
-        try:
-            self.robot.stop()
-        finally:
-            self.jog.clear_reference()
+        self.jog.clear_reference()
 
         def cancelled():
             self.robot.check()
@@ -158,12 +154,20 @@ class KeyboardTeleop:
 
         try:
             home_robot(
-                self.runtime_state, self.robot, self.home_planner,
+                self.runtime_state, self.robot, self.get_home_planner,
                 run_id=run_id,
                 cancel_requested=cancelled,
             )
         except OperationCancelled as exc:
-            self.robot.check(cancellation=exc)
+            self.robot.check(operation_error=exc)
             logger.info("HOME cancelled: %s", exc)
+        except (HomeConfigurationError, HomePathRejected) as exc:
+            self.robot.check(operation_error=exc)
+            logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
         self.keys.discard_events("r")
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
+
+    def get_home_planner(self):
+        if self.home_planner is None:
+            self.home_planner = build_home_planner(self.runtime.environment, self.runtime.arm)
+        return self.home_planner

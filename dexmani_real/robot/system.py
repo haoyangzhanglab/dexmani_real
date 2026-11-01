@@ -69,23 +69,25 @@ class Robot:
         if self.owner != threading.get_ident():
             raise RuntimeError("robot I/O belongs to its connecting thread")
 
-    def check(self, *, cancellation=None):
+    def check(self, *, operation_error=None):
         try:
             self.check_owner()
             if self.arm is not None:
                 self.arm.check_error()
             if self.stop_failure is not None:
-                raise RobotError("previous robot stop remains unresolved") from self.stop_failure
+                failure = RobotError("previous robot stop remains unresolved")
+                setattr(failure, "cleanup_errors", [("robot_stop", self.stop_failure)])
+                raise failure from self.stop_failure
             if self.check_services is not None and not self.check_services():
                 raise RobotError("required runtime service unavailable")
         except BaseException as failure:
-            if cancellation is not None:
+            if operation_error is not None:
                 setattr(failure, "cleanup_errors", [
-                    *getattr(failure, "cleanup_errors", ()), ("cancelled_operation", cancellation),
+                    *getattr(failure, "cleanup_errors", ()), ("operation", operation_error),
                 ])
             raise
-        if cancellation is not None and getattr(cancellation, "cleanup_errors", ()):
-            raise cancellation
+        if operation_error is not None and getattr(operation_error, "cleanup_errors", ()):
+            raise operation_error
 
     def check_run(self, run_id, *, expires_ns=None):
         # stop 与 fault 可以同时到达；不能先把真实失败分类为取消。

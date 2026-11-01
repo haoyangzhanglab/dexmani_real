@@ -4,6 +4,7 @@ from itertools import combinations
 
 import numpy as np
 
+from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.robot.model import (
     XARM7_JOINT_NAMES,
     XARM7_XHAND_RIGHT_URDF_PATH,
@@ -57,7 +58,9 @@ class CollisionModel:
                 frame.name for frame in self.model.frames if frame.type == pin.FrameType.BODY
             }
             if unknown_links:
-                raise ValueError(f"table allowed_contact_links not found in URDF: {sorted(unknown_links)}")
+                raise HomeConfigurationError(
+                    f"table allowed_contact_links not found in URDF: {sorted(unknown_links)}"
+                )
             plane = np.asarray(table_plane_abcd, dtype=np.float64)
             norm = np.linalg.norm(plane[:3])
             normal = plane[:3] / norm

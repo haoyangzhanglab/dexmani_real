@@ -56,6 +56,10 @@ class StaticCollisionBox:
             raise ValueError("static collision box size_xyz_m must contain positive full side lengths")
 
 
+class HomeConfigurationError(ValueError):
+    """HOME 专用标定或配置无效，本次操作不能执行。"""
+
+
 @dataclass(frozen=True)
 class TableCollisionConfig:
     """HOME 桌面碰撞盒与软间隙；标定平面由环境单独提供。"""
@@ -95,6 +99,5 @@ class EnvironmentConfig:
         self.workspace.as_array()
         if not isfinite(self.eef_workspace_margin_m) or self.eef_workspace_margin_m < 0:
             raise ValueError("eef_workspace_margin_m must be finite and non-negative")
-        self.table.validate()
         for box in self.static_boxes:
             box.validate()

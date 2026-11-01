@@ -7,7 +7,7 @@ from itertools import pairwise
 
 import numpy as np
 
-from dexmani_real.config.control import EnvironmentConfig
+from dexmani_real.config.control import EnvironmentConfig, HomeConfigurationError
 from dexmani_real.config.xarm7 import HOME_DWELL_S, HOME_TARGET_TIMEOUT_S, ArmConfig
 from dexmani_real.control.collision import CollisionModel
 from dexmani_real.control.constraints import wrap_nearest_equivalent
@@ -45,7 +45,12 @@ class HomePlanner:
         *,
         table_plane_abcd: tuple[float, float, float, float],
     ) -> None:
+        try:
+            environment.table.validate()
+        except (TypeError, ValueError) as exc:
+            raise HomeConfigurationError(f"HOME table configuration: {exc}") from exc
         self.arm = arm
+        self.table_plane_abcd = table_plane_abcd
         self.limits = np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper))
         margin = environment.eef_workspace_margin_m
         self.workspace_bounds = environment.workspace.as_array() + (-margin, margin)

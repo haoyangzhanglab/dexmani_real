@@ -10,7 +10,6 @@ import numpy as np
 from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
 from dexmani_real.config.teleop import DEFAULT_TASK_NAME
 from dexmani_real.control.actions import ActionMapper
-from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.recorder import RecordingError
 from dexmani_real.ipc.sensors import (
     SensorChannels,
@@ -34,7 +33,6 @@ from dexmani_real.sensor.vr import run_vr
 from dexmani_real.teleop.loop import TeleopLoop
 from dexmani_real.teleop.vr import VRController
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.timing import sample_is_fresh
 from dexmani_real.utils.vr_heading import load_vr_transform
 
@@ -74,7 +72,6 @@ def run_teleop(
     recording_dir = (
         Path(__file__).resolve().parents[2] / episodes_dir / task_name if record else None
     )
-    table_plane_abcd = load_table_plane(runtime.environment.table_plane_path)
     if not runtime.hand.enabled and record:
         raise ValueError("hand-disabled operation cannot record episodes")
     vr_to_robot_rotation = load_vr_transform(vr_transform_path)
@@ -89,11 +86,6 @@ def run_teleop(
         build_hand_retargeter(runtime),
         runtime.teleop,
         vr_to_robot_rotation,
-    )
-    home_planner = HomePlanner(
-        runtime.environment,
-        runtime.arm,
-        table_plane_abcd=table_plane_abcd,
     )
     ctx = mp.get_context("spawn")
     runtime_state = SessionState()
@@ -132,7 +124,6 @@ def run_teleop(
             task_label=task_name,
             sensors=sensors,
             controller=controller,
-            home_planner=home_planner,
             keyboard=keyboard,
             recording_dir=recording_dir,
             max_duration_s=max_duration_s,
@@ -168,6 +159,8 @@ def run_teleop(
             )
         robot.check()
         with runtime_state.motion_lock:
+            if runtime_state.stop_signal.is_set() or not runtime_state.requests_allow_motion():
+                raise OperationCancelled("startup cancelled before arming")
             runtime_state.arm()
             startup_run_id = runtime_state.run_id
         if initialize_teleop(
@@ -175,13 +168,14 @@ def run_teleop(
             run_id=startup_run_id,
         ):
             loop.run()
+        robot.check()
         clean = bool(runtime_state.quit_requested)
     except KeyboardInterrupt:
         runtime_state.request_emergency_stop()
     except OperationCancelled as exc:
         try:
             if robot is not None:
-                robot.check(cancellation=exc)
+                robot.check(operation_error=exc)
             if not (
                 runtime_state.stop_signal.is_set() or runtime_state.quit_requested
                 or runtime_state.estop_request

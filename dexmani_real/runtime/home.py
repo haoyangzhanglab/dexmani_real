@@ -10,13 +10,27 @@ from dexmani_real.config.xarm7 import (
     EXECUTOR_TIMEOUT_S,
     HOME_CONVERGENCE_TIMEOUT_S,
 )
-from dexmani_real.control.homing import home_segment_timeout_s
+from dexmani_real.config.control import HomeConfigurationError
+from dexmani_real.control.homing import HomePlanner, home_segment_timeout_s
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
 from dexmani_real.runtime.state import SafetyState
+from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.timing import sample_is_fresh
 
 logger = logging.getLogger(__name__)
 HOME_CONSECUTIVE_SAMPLES = 3
+
+
+def build_home_planner(environment, arm, *, table_plane_abcd=None):
+    if table_plane_abcd is None:
+        try:
+            table_plane_abcd = load_table_plane(environment.table_plane_path)
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            raise HomeConfigurationError(
+                f"HOME table calibration {environment.table_plane_path!r}: {exc}"
+            ) from exc
+    # 模型构建的技术异常不属于可恢复的输入拒绝。
+    return HomePlanner(environment, arm, table_plane_abcd=table_plane_abcd)
 
 
 @contextmanager
@@ -44,9 +58,17 @@ def _home_motion(state, robot):
                 logger.exception("HOME cleanup also failed")
 
 
-def home_robot(state, robot, planner, *, run_id, cancel_requested):
+def home_robot(state, robot, get_planner, *, run_id, cancel_requested):
     # send_hand_home 自己完成整机停止边界，arm HOME 由 owner 停稳准备。
     home_hand(state, robot, run_id=run_id, cancel_requested=cancel_requested)
+    robot.check()
+    if cancel_requested() or not state.can_move(
+        run_id=run_id, required_safety_state=SafetyState.ARMED,
+    ):
+        raise OperationCancelled("HOME interrupted before planner initialization")
+    if not robot.hand_config.enabled:
+        robot.stop()
+    planner = get_planner()
     home_arm(state, robot, planner, run_id=run_id, cancel_requested=cancel_requested)
 
 

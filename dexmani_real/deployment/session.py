@@ -7,14 +7,15 @@ import time
 from dataclasses import asdict
 from itertools import count
 
+from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.control.actions import ActionMapper
-from dexmani_real.control.homing import HomePlanner
+from dexmani_real.control.homing import HomePathRejected
 from dexmani_real.data.raw import camera_metadata
 from dexmani_real.deployment.rollout import Rollout, failure_reason, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import home_robot, initialize_hand
+from dexmani_real.runtime.home import build_home_planner, home_robot, initialize_hand
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
@@ -32,6 +33,7 @@ from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.io import write_json, write_yaml
 from dexmani_real.utils.log import configure_logging, error_detail
+from dexmani_real.utils.table_plane import load_table_plane, resolve_table_plane_path
 
 logger = logging.getLogger(__name__)
 MODEL_STARTUP_TIMEOUT_S = 300.0
@@ -46,6 +48,7 @@ class PolicySession:
         self.run_config = run_config
         self.runtime, self.info = runtime, info
         self.table_plane_abcd = table_plane_abcd
+        self.home_planner = None
         self.device, self.seed = device, seed
         self.max_running_s, self.num_episodes = max_running_s, num_episodes
         self.record_raw = record_raw
@@ -89,7 +92,7 @@ class PolicySession:
                 self.start_devices()
             except OperationCancelled as exc:
                 if self.robot is not None:
-                    self.robot.check(cancellation=exc)
+                    self.robot.check(operation_error=exc)
                 if self.runtime_state is None or not (
                     self.runtime_state.stop_signal.is_set() or self.runtime_state.quit_requested
                     or self.runtime_state.estop_request
@@ -129,9 +132,6 @@ class PolicySession:
             self.info.action_mode, arm=self.runtime.arm, hand=self.runtime.hand,
             motion=self.runtime.motion, environment=self.runtime.environment,
         )
-        self.home_planner = HomePlanner(
-            self.runtime.environment, self.runtime.arm, table_plane_abcd=self.table_plane_abcd,
-        )
         self.keyboard = Keyboard(
             get_run_id=lambda: self.runtime_state.run_id,
             estop_callback=self.runtime_state.request_emergency_stop,
@@ -160,7 +160,7 @@ class PolicySession:
         )
 
     def check_services(self):
-        if self.keyboard.estop_latched or not self.keyboard.check_health():
+        if not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
             return False
         for name, needed in (("camera", self.needs.camera_worker), ("pointcloud", self.needs.point_cloud)):
@@ -202,6 +202,9 @@ class PolicySession:
         if needs.point_cloud:
             from dexmani_real.perception.worker import run_pointcloud_worker
 
+            if self.runtime.pointcloud.remove_table and self.table_plane_abcd is None:
+                self.table_plane_abcd = load_table_plane(self.runtime.environment.table_plane_path)
+                self.record_table_plane()
             self.sensors.start(
                 self.process_context.Process(
                     name="pointcloud", target=run_pointcloud_worker,
@@ -219,7 +222,7 @@ class PolicySession:
             self.sensors.channels = None
         self.robot.check()
         with self.runtime_state.motion_lock:
-            if not self.runtime_state.requests_allow_motion():
+            if self.runtime_state.stop_signal.is_set() or not self.runtime_state.requests_allow_motion():
                 raise OperationCancelled("startup cancelled before arming")
             self.runtime_state.arm()
             startup_run_id = self.runtime_state.run_id
@@ -268,7 +271,7 @@ class PolicySession:
         )
         reason = self.summary["reason"]
         if failure is not None:
-            reason = str(failure) or type(failure).__name__
+            reason = error_detail("session", failure)["message"] or type(failure).__name__
         elif self.errors:
             reason = self.errors[0]["message"]
         elif episode_error is not None:
@@ -385,7 +388,7 @@ class PolicySession:
                         required_tactile=self.needs.required_tactile,
                     )
                 except OperationCancelled as exc:
-                    self.robot.check(cancellation=exc)
+                    self.robot.check(operation_error=exc)
                     logger.info("%s", exc)
                 finally:
                     self.keyboard.discard_events("t", "h", "b")
@@ -405,18 +408,38 @@ class PolicySession:
         logger.info("正在回初始位…")
         try:
             home_robot(
-                self.runtime_state, self.robot, self.home_planner,
+                self.runtime_state, self.robot, self.get_home_planner,
                 run_id=run_id,
                 cancel_requested=self.home_abort_requested,
             )
         except OperationCancelled as exc:
-            self.robot.check(cancellation=exc)
+            self.robot.check(operation_error=exc)
             logger.info("回初始位已中断：%s", exc)
+        except (HomeConfigurationError, HomePathRejected) as exc:
+            self.robot.check(operation_error=exc)
+            logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
         else:
             logger.info("已回初始位，按 B 开始。")
         finally:
             self.keyboard.discard_events("t", "h", "b")
         return True
+
+    def get_home_planner(self):
+        if self.home_planner is None:
+            self.home_planner = build_home_planner(
+                self.runtime.environment, self.runtime.arm, table_plane_abcd=self.table_plane_abcd,
+            )
+            if self.table_plane_abcd is None:
+                self.table_plane_abcd = self.home_planner.table_plane_abcd
+                self.record_table_plane()
+        return self.home_planner
+
+    def record_table_plane(self):
+        self.run_config.update(
+            table_plane_abcd=self.table_plane_abcd,
+            table_plane_path=str(resolve_table_plane_path(self.runtime.environment.table_plane_path)),
+        )
+        write_yaml(self.run_config, self.output_dir / "run_config.yaml")
 
     def home_abort_requested(self) -> bool:
         self.robot.check()

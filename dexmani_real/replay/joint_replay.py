@@ -26,6 +26,7 @@ from dexmani_real.runtime.observation import (
     read_observation,
 )
 from dexmani_real.runtime.state import RunEndReason, device_failure_reason
+from dexmani_real.utils.log import error_detail
 from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -84,7 +85,7 @@ class JointReplay:
                     if result.status == ReplayStatus.COMPLETED:
                         result.status, result.reason = self.replay_rows(trajectory, period_ns)
             except OperationCancelled as exc:
-                self.robot.check(cancellation=exc)
+                self.robot.check(operation_error=exc)
                 result.status = (
                     ReplayStatus.USER_QUIT if self.runtime_state.quit_requested else ReplayStatus.REJECTED
                 )
@@ -98,7 +99,8 @@ class JointReplay:
         except Exception as exc:
             self.runtime_state.mark_error()
             logger.exception("replay failed")
-            result.status, result.reason = ReplayStatus.FAULT, str(exc)
+            result.status = ReplayStatus.FAULT
+            result.reason = error_detail("replay", exc)["message"]
             run_end_reason = device_failure_reason(exc) or RunEndReason.RUNTIME_FAILURE
         finally:
             if result.status == ReplayStatus.USER_QUIT:

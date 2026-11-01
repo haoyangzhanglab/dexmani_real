@@ -7,13 +7,15 @@ import time
 from enum import Enum
 from typing import cast
 
+from dexmani_real.config.control import HomeConfigurationError
+from dexmani_real.control.homing import HomePathRejected
 from dexmani_real.data.raw import snapshot_recording_metadata
 from dexmani_real.data.recorder import (
     EpisodeRecorder,
     RecordingError,
 )
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
-from dexmani_real.runtime.home import home_robot
+from dexmani_real.runtime.home import build_home_planner, home_robot
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
@@ -48,7 +50,6 @@ class TeleopLoop:
         task_label,
         sensors,
         controller,
-        home_planner,
         recording_dir,
         max_duration_s,
         runtime_config_json,
@@ -65,7 +66,7 @@ class TeleopLoop:
         )
         self.needs = ObservationNeeds(vr=True).union(record_needs)
         self.controller = controller
-        self.home_planner = home_planner
+        self.home_planner = None
         self.recording_dir = recording_dir
         self.max_duration_s = max_duration_s
         self.runtime_config_json = runtime_config_json
@@ -179,7 +180,7 @@ class TeleopLoop:
                 self.termination_details.append(dict(stage="termination", reason=reason))
 
     def poll_blocking_commands(self, *, cancellation=None):
-        self.robot.check(cancellation=cancellation)
+        self.robot.check(operation_error=cancellation)
         terminal = tuple(
             event for event in self.keyboard.poll(timeout=0)
             if event.key in ("esc", "q", "s", "d")
@@ -192,6 +193,11 @@ class TeleopLoop:
         return self.phase is TeleopPhase.PREPARING and self.runtime_state.can_move(
             run_id=self.run_id, required_safety_state=SafetyState.ARMED,
         )
+
+    def get_home_planner(self):
+        if self.home_planner is None:
+            self.home_planner = build_home_planner(self.runtime.environment, self.runtime.arm)
+        return self.home_planner
 
     def preparation_interrupted(self):
         self.poll_blocking_commands()
@@ -311,7 +317,7 @@ class TeleopLoop:
                     required_tactile=self.needs.required_tactile,
                 )
             except OperationCancelled as exc:
-                self.robot.check(cancellation=exc)
+                self.robot.check(operation_error=exc)
                 logger.info("%s", exc)
             finally:
                 self.keyboard.discard_events("t", "b")
@@ -329,13 +335,16 @@ class TeleopLoop:
                 logger.info("正在回初始位…")
                 try:
                     home_robot(
-                        self.runtime_state, self.robot, self.home_planner,
+                        self.runtime_state, self.robot, self.get_home_planner,
                         run_id=expected_run_id,
                         cancel_requested=self.poll_blocking_commands,
                     )
                 except OperationCancelled as exc:
-                    self.robot.check(cancellation=exc)
+                    self.robot.check(operation_error=exc)
                     logger.info("HOME cancelled: %s", exc)
+                except (HomeConfigurationError, HomePathRejected) as exc:
+                    self.robot.check(operation_error=exc)
+                    logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
                 else:
                     logger.info("已回初始位。")
             self.poll_blocking_commands()
