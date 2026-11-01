@@ -43,7 +43,6 @@ class EpisodeRecorder:
         self.thread = None
         self.queue: Queue[tuple[Observation, RobotCommand | None] | _FinishRequest] = Queue(maxsize=16)
         self.ready = threading.Event()
-        self.cancelled = threading.Event()
         self.error = None
         self.is_recording = False
         self.start_attempted = False
@@ -69,7 +68,6 @@ class EpisodeRecorder:
             setattr(self.error, "cleanup_errors", [
                 *getattr(self.error, "cleanup_errors", ()), (stage, error),
             ])
-        self.cancelled.set()
 
     def check_error(self):
         if self.error is not None:
@@ -190,7 +188,7 @@ class EpisodeRecorder:
                 self.stop_deadline = min(self.stop_deadline, deadline)
         deadline = self.stop_deadline
         try:
-            if was_recording and self.writer_pending and not self.cancelled.is_set():
+            if was_recording and self.writer_pending and self.error is None:
                 self.queue.put(request, timeout=max(0.0, deadline - time.monotonic()))
             if self.thread is not None and self.thread.ident is not None:
                 self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -231,7 +229,7 @@ class EpisodeRecorder:
             try:
                 writer.open(metadata)
                 self.ready.set()
-                while not self.cancelled.is_set():
+                while self.error is None:
                     try:
                         item = self.queue.get(timeout=0.05)
                     except Empty:

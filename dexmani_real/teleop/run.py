@@ -156,7 +156,7 @@ def run_teleop(
                     target=run_camera,
                     args=(sensors.channels, runtime.camera),
                 ),
-                ready=sensors.channels.camera_ready,
+                ring=sensors.channels.camera_ring,
                 timeout_s=CAMERA_READY_TIMEOUT_S,
                 may_start=lambda: keyboard.check_health() and runtime_state.requests_allow_motion(),
             )
@@ -216,7 +216,7 @@ def initialize_teleop(loop, vr_process) -> bool:
         return False
     loop.sensors.start(
         vr_process,
-        ready=loop.sensors.channels.vr_ready,
+        ring=loop.sensors.channels.vr_ring,
         may_start=lambda: loop.keyboard.check_health() and loop.runtime_state.requests_allow_motion(),
     )
     deadline = time.monotonic() + VR_READY_TIMEOUT_S
@@ -226,10 +226,13 @@ def initialize_teleop(loop, vr_process) -> bool:
         if loop.poll_blocking_commands():
             return False
         loop.robot.service_idle()
-        if loop.sensors.channels.vr_ready.wait(timeout=0.05):
+        if loop.sensors.channels.vr_ring.latest_sequence > 0:
             if loop.poll_blocking_commands():
                 return False
+            if not loop.sensors.check():
+                raise RuntimeError("VR worker exited during startup")
             break
+        time.sleep(0.05)
         if time.monotonic() >= deadline:
             raise RuntimeError("VR failed to become ready before the startup timeout")
     if not calibrate_hand(loop):
@@ -257,7 +260,7 @@ def calibrate_hand(loop):
     print("正在标定手部骨长：请保持右手清晰可见；无需保持伸直。S/Q/Esc 可取消。", flush=True)
     deadline = time.monotonic() + config.calibration_timeout_s
     measurements: list[np.ndarray] = []
-    last_sequence, last_source_ns = None, 0
+    last_source_ns = 0
     last_error = "no fresh hand frames"
     while len(measurements) < config.calibration_samples:
         if not loop.keyboard.check_health():
@@ -277,10 +280,10 @@ def calibrate_hand(loop):
             stamp = int(frame["recv_ts_ns"])
             now_ns = time.monotonic_ns()
             if (
-                frame["ring_sequence"] != last_sequence and stamp > last_source_ns
+                stamp > last_source_ns
                 and sample_is_fresh(stamp, loop.runtime.teleop.vr_stale_threshold_s, now_ns)
             ):
-                last_sequence, last_source_ns = frame["ring_sequence"], stamp
+                last_source_ns = stamp
                 try:
                     measurement = hand_lengths(prepare_landmarks(frame["landmarks"]))
                 except ValueError as exc:

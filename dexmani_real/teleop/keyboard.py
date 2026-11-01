@@ -94,17 +94,17 @@ class KeyboardTeleop:
         self.robot.connect()
         self.robot.check()
         self.runtime_state.arm()
-        self.jog.prepare(self.robot, self.runtime_state)
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         print(
-            "Release jog keys to brake and hold; a rejected target stops motion. "
+            "The first jog input prepares motion; release jog keys while running to brake and hold. "
+            "A rejected target stops motion. "
             "Release all jog keys, then press again to prepare a new motion."
         )
         self.period_ns, _ = sampling_clock_ns(self.jog_config.control_hz)
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
 
     def run_control_loop(self):
-        while self.runtime_state.running and not self.runtime_state.quit_requested:
+        while not self.runtime_state.quit_requested:
             while time.monotonic_ns() < self.tick_due_ns:
                 self.robot.service_idle()
                 remaining_ns = self.tick_due_ns - time.monotonic_ns()
@@ -117,7 +117,6 @@ class KeyboardTeleop:
             if (
                 self.runtime_state.estop_request
                 or self.runtime_state.error_state
-                or not self.keys.check_health()
             ):
                 break
             if self.runtime_state.quit_requested or self.keys.is_pressed("q"):
@@ -136,13 +135,15 @@ class KeyboardTeleop:
     def run_home(self):
         logger.info("Returning home...")
         self.jog.stop(self.robot, self.runtime_state)
+
+        def cancelled():
+            self.robot.check()
+            return bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
+
         try:
             home_robot(
                 self.runtime_state, self.robot, self.home_planner,
-                cancel_requested=lambda: (
-                    bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
-                    or not self.keys.check_health()
-                ),
+                cancel_requested=cancelled,
             )
         except OperationCancelled as exc:
             logger.info("HOME cancelled: %s", exc)

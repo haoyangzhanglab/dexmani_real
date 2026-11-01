@@ -44,7 +44,7 @@ class CartesianJog:
             self.clear_reference()
 
     def prepare(self, robot, state):
-        """仅在进入会话或真实停止后准备；普通按键变化不重新准备。"""
+        """仅在 ARMED 收到实际点动输入时准备；普通按键变化不重新准备。"""
         self.clear_reference()
         robot.prepare_streaming(state.run_id)
         if state.begin_motion() is None:

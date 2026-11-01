@@ -48,7 +48,6 @@ def device_failure_reason(error):
 
 @dataclass
 class SessionState:
-    running: bool = True
     run_ended_id: int = 0
     run_ended_reason: RunEndReason = RunEndReason.NONE
     error_state: bool = False
@@ -69,8 +68,7 @@ class SessionState:
 
     def requests_allow_motion(self):
         return (
-            self.running
-            and not self.error_state
+            not self.error_state
             and not self.estop_request
             and not self.quit_requested
         )
@@ -156,11 +154,3 @@ class SessionState:
         with self.motion_lock:
             self.quit_requested = True
             self.request_stop(reason=RunEndReason.QUIT)
-
-    def end_session(self, *, reason=RunEndReason.RUNTIME_SHUTDOWN) -> None:
-        with self.motion_lock:
-            self.running = False
-            if self.safety_state == SafetyState.RUNNING:
-                self.revoke_motion(reason=reason)
-            else:
-                self.stop_signal.set()

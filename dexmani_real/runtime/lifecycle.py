@@ -27,12 +27,12 @@ class SensorWorkers:
         if self.channels is not None:
             self.channels.is_running.value = False
 
-    def start(self, process, *, ready, timeout_s=None, may_start) -> None:
+    def start(self, process, *, ring, timeout_s=None, may_start) -> None:
         """传入超时时等待就绪，否则仅启动；失败后仍由本对象回收进程。"""
         if not may_start():
             raise OperationCancelled("sensor startup cancelled")
         process.start()
-        self.started.append((process, ready))
+        self.started.append(process)
         if timeout_s is not None:
             deadline = time.monotonic() + timeout_s
             while time.monotonic() < deadline:
@@ -40,19 +40,19 @@ class SensorWorkers:
                     raise OperationCancelled(f"{process.name} startup cancelled")
                 if not self.check():
                     raise RuntimeError(f"{process.name} exited during startup")
-                if ready.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
+                if ring.latest_sequence > 0:
                     if not may_start():
                         raise OperationCancelled(f"{process.name} startup cancelled")
                     if not self.check():
                         raise RuntimeError(f"{process.name} exited during startup")
                     return
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
             raise RuntimeError(f"{process.name} failed to become ready")
 
     def check(self, *, names=None) -> bool:
         healthy = True
-        for process, ready in self.started:
+        for process in self.started:
             if (names is None or process.name in names) and not process.is_alive():
-                ready.clear()
                 logger.error("required worker %s exited: %s", process.name, process.exitcode)
                 healthy = False
         return healthy
@@ -63,7 +63,7 @@ class SensorWorkers:
         deadline = time.monotonic() + SENSOR_SHUTDOWN_TIMEOUT_S
         errors = []
         unresolved = []
-        for process, ready in self.started:
+        for process in self.started:
             try:
                 process.join(timeout=max(0.0, deadline - time.monotonic()))
                 escalation = "graceful"
@@ -77,7 +77,6 @@ class SensorWorkers:
                     process.join(timeout=WORKER_STOP_TIMEOUT_S)
                 if process.is_alive() or process.exitcode is None:
                     raise RuntimeError(f"process {process.name} could not be confirmed stopped")
-                ready.clear()
                 if process.exitcode != 0 or escalation != "graceful":
                     errors.append(RuntimeError(f"worker {process.name}: exitcode={process.exitcode}, {escalation}"))
                     logger.warning(
@@ -87,7 +86,7 @@ class SensorWorkers:
                         escalation,
                     )
             except BaseException as exc:
-                unresolved.append((process, ready))
+                unresolved.append(process)
                 errors.append(exc)
                 logger.exception("worker %s shutdown failed", process.name)
         self.started = unresolved
@@ -110,7 +109,6 @@ def close_runtime(runtime_state, robot=None, *, sensors=None, keyboard=None):
         ("robot_close", robot.close if robot is not None else None),
         ("keyboard_stop", keyboard.stop if keyboard is not None else None),
         ("sensor_shutdown", sensors.shutdown if sensors is not None else None),
-        ("end_session", runtime_state.end_session),
     ):
         if close is None:
             continue

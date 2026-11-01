@@ -274,7 +274,7 @@ class TeleopLoop:
             return True
         if (
             self.runtime_state.estop_request or self.runtime_state.error_state
-            or self.runtime_state.quit_requested or not self.runtime_state.running
+            or self.runtime_state.quit_requested
         ):
             return True
 
@@ -525,13 +525,10 @@ class TeleopLoop:
             )
 
     def service_episode(self, timeout):
-        self.robot.arm.check_error()
         if self.runtime_state.stop_signal.is_set():
             self.robot.service_idle()
         else:
             self.robot.service_feedback()
-        if not self.keyboard.check_health():
-            self.runtime_state.request_emergency_stop()
         if self.runtime_state.estop_request or self.runtime_state.error_state:
             self.request_episode_end(
                 "estop" if self.runtime_state.estop_request else "runtime_failure",
@@ -561,7 +558,7 @@ class TeleopLoop:
                 self.request_episode_end("executor_stopped")
         return (
             self.pending_termination_reason is None
-            and self.runtime_state.running and not self.runtime_state.quit_requested
+            and not self.runtime_state.quit_requested
         )
 
     def run_episode(self, expected_run_id):
@@ -607,11 +604,8 @@ class TeleopLoop:
                 self.keyboard.discard_events("b", "h", "t")
 
     def run(self):
-        while self.runtime_state.running and not self.runtime_state.quit_requested:
-            self.robot.arm.check_error()
+        while not self.runtime_state.quit_requested:
             self.robot.service_idle()
-            if not self.keyboard.check_health():
-                self.runtime_state.request_emergency_stop()
             if self.runtime_state.estop_request or self.runtime_state.error_state:
                 break
             self.handle_commands(self.keyboard.poll(timeout=0.005), self.runtime_state.run_id)

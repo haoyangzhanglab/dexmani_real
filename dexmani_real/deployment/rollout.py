@@ -66,7 +66,7 @@ class EpisodeResult:
 
 class Rollout:
     def __init__(
-        self, runtime_state, runtime, policy_info, *, preparing_epoch, robot,
+        self, runtime_state, runtime, policy_info, *, epoch, robot,
         observations, needs, sensors, action_mapper, model, max_running_s,
         capture_ids, index, output_dir, record_raw, camera_snapshot=None,
     ):
@@ -86,8 +86,7 @@ class Rollout:
         self.camera_snapshot = camera_snapshot
         self.max_duration_ns = int(max_running_s * 1e9) if max_running_s is not None else None
         self.capture_ids = capture_ids
-        self.preparing_epoch = preparing_epoch
-        self.run_id = None
+        self.epoch = epoch
         self.history = deque(maxlen=policy_info.n_obs_steps)
         self.plan = self.query = None
         self.preparation_issue = None
@@ -123,35 +122,34 @@ class Rollout:
         return limit if limit is not None and time.monotonic_ns() >= limit[0] else None
 
     def has_motion_authority(self):
-        return self.runtime_state.can_move(run_id=self.run_id)
+        return self.runtime_state.can_move(run_id=self.epoch)
 
     def stop(self, detail, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY, errors=()):
         if self.finished:
             return
-        epoch = self.run_id
         ended_ns = time.monotonic_ns()
         self.runtime_state.revoke_motion(
             reason=run_end_reason,
-            expected_run_id=epoch if epoch is not None else self.preparing_epoch,
+            expected_run_id=self.epoch,
         )
         with self.runtime_state.motion_lock:
             reason = (
                 self.runtime_state.run_ended_reason
-                if epoch is not None and self.runtime_state.run_ended_id == epoch else run_end_reason
+                if self.started_ns and self.runtime_state.run_ended_id == self.epoch else run_end_reason
             )
-        self.result.duration_s = (ended_ns - self.started_ns) / 1e9 if epoch is not None else 0.0
+        self.result.duration_s = (ended_ns - self.started_ns) / 1e9 if self.started_ns else 0.0
         self.result.termination_reason = (
-            reason.name.lower() if epoch is not None
+            reason.name.lower() if self.started_ns
             else "preparation_failed" if self.preparation_issue or errors else "start_cancelled"
         )
         self.result.termination_details = detail
         self.result.errors.extend(errors)
-        self.run_id = self.plan = None
+        self.plan = None
         if not self.model.has_pending_task:
-            self.query = self.preparing_epoch = None
+            self.query = None
         self.history.clear()
         self.previous_arm = self.wait_deadline_ns = self.run_deadline_ns = None
-        if epoch is not None or self.robot.stop_required:
+        if self.started_ns or self.robot.stop_required:
             self.robot.stop()
 
     def finish_recording(self, *, deadline):
@@ -177,37 +175,35 @@ class Rollout:
     def run(self, *, keyboard, poll_operator):
         """一段控制及其收尾顺序完成；返回后不再依赖外层 tick 回收任务。"""
         try:
-            poll_operator()
-            if self.preparation_valid():
-                self.prepare(poll_operator)
-            else:
-                self.stop("cancelled before preparation")
-            while not self.finished:
-                self.robot.arm.check_error()
-                poll_operator()
-                self.robot.service_feedback()
-                self.step()
-                if not self.finished:
-                    time.sleep(0.001)
-        except OperationCancelled as exc:
             try:
+                poll_operator()
+                if self.preparation_valid():
+                    self.prepare(poll_operator)
+                else:
+                    self.stop("cancelled before preparation")
+                while not self.finished:
+                    poll_operator()
+                    self.robot.service_feedback()
+                    self.step()
+                    if not self.finished:
+                        time.sleep(0.001)
+            except OperationCancelled as exc:
+                # 取消不能掩盖同时发生的设备或 worker 故障。
+                self.robot.check()
                 self.stop(str(exc))
-            except BaseException as stop_error:
-                if isinstance(stop_error, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                self.result.errors.append(error_detail("stop", stop_error))
-                raise
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()
             if not self.finished:
-                stage = "preparation" if self.run_id is None else "control"
+                stage = "control" if self.started_ns else "preparation"
                 try:
                     self.stop(
                         str(exc), run_end_reason=failure_reason(exc),
                         errors=[error_detail(stage, exc)],
                     )
                 except BaseException as stop_error:
+                    if isinstance(stop_error, KeyboardInterrupt):
+                        self.runtime_state.request_emergency_stop()
                     self.result.errors.append(error_detail("stop", stop_error))
                     logger.exception("episode stop also failed")
             else:
@@ -236,7 +232,7 @@ class Rollout:
                         self.runtime_state.request_emergency_stop()
                     cleanup_failure = cleanup_failure or exc
             if not self.model.has_pending_task:
-                self.query = self.preparing_epoch = None
+                self.query = None
             keyboard.discard_events("b", "h", "t")
             if cleanup_failure is not None and not primary_failure:
                 raise cleanup_failure
@@ -244,7 +240,7 @@ class Rollout:
 
     def preparation_valid(self):
         return self.runtime_state.can_move(
-            run_id=self.preparing_epoch,
+            run_id=self.epoch,
             required_safety_state=SafetyState.ARMED,
         )
 
@@ -267,7 +263,6 @@ class Rollout:
         return row
 
     def prepare(self, poll_operator):
-        epoch = self.preparing_epoch
         if self.recorder is not None:
             metadata = snapshot_recording_metadata(
                 self.camera_snapshot,
@@ -284,7 +279,7 @@ class Rollout:
         if not self.preparation_valid():
             self.stop("cancelled during recorder start")
             return
-        self.robot.prepare_streaming(epoch)
+        self.robot.prepare_streaming(self.epoch)
         poll_operator()
         if not self.preparation_valid():
             self.stop("cancelled during streaming preparation")
@@ -293,12 +288,11 @@ class Rollout:
             self.stop(self.preparation_issue)
             return
         with self.runtime_state.motion_lock:
-            admitted = self.runtime_state.begin_motion() if epoch == self.runtime_state.run_id else None
+            admitted = self.runtime_state.begin_motion() if self.epoch == self.runtime_state.run_id else None
         if admitted is None:
             self.stop("final admission declined")
             return
-        self.run_id, self.started_ns = admitted
-        self.preparing_epoch = None
+        _, self.started_ns = admitted
         self.next_step_ns = self.started_ns
         self.wait_deadline_ns = (
             self.started_ns + (self.policy_info.n_obs_steps - 1) * self.dt_ns + ACTION_TIMEOUT_NS
@@ -348,7 +342,7 @@ class Rollout:
             decoded = self.action_mapper.map_eef(pose, action[9:], current, self.previous_arm)
         if decoded.rejection_reason is not None or decoded.arm_qpos is None:
             return None, f"action_rejected: {decoded.rejection_reason}"
-        return RobotCommand(self.run_id, decoded.arm_qpos, decoded.hand_qpos), None
+        return RobotCommand(self.epoch, decoded.arm_qpos, decoded.hand_qpos), None
 
     def submit_prefetch(self, slot):
         handoff_slot, issue = prefetch_handoff(
@@ -384,7 +378,6 @@ class Rollout:
 
     def step(self):
         row = attempted_command = None
-        run_id = self.run_id
         try:
             if self.finished:
                 return
@@ -482,7 +475,7 @@ class Rollout:
             primary_error = sys.exc_info()[1]
             if primary_error is not None:
                 self.runtime_state.revoke_motion(
-                    reason=failure_reason(primary_error), expected_run_id=run_id,
+                    reason=failure_reason(primary_error), expected_run_id=self.epoch,
                 )
             try:
                 if row is not None and self.recorder is not None:

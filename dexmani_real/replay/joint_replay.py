@@ -199,22 +199,19 @@ class JointReplay:
 
     def wait_replay(self, deadline_ns):
         while True:
-            self.robot.check()
+            self.robot.service_feedback()
             signals = self.keyboard.poll(timeout=0)
-            if not self.keyboard.check_health():
-                self.runtime_state.request_emergency_stop()
             if self.runtime_state.estop_request:
                 return ReplayStatus.ESTOP, "operator emergency stop"
             if self.runtime_state.error_state:
                 return ReplayStatus.FAULT, "runtime failure"
             if self.runtime_state.quit_requested or "q" in signals:
                 return ReplayStatus.USER_QUIT, "operator quit"
-            if not self.runtime_state.running or self.runtime_state.run_id != self.epoch:
+            if self.runtime_state.run_id != self.epoch:
                 cause = self.runtime_state.run_ended_reason
                 if cause == RunEndReason.QUIT:
                     return ReplayStatus.USER_QUIT, "operator quit"
                 return ReplayStatus.REJECTED, f"motion interrupted: {cause.name.lower()}"
-            self.robot.service_feedback()
             remaining_ns = deadline_ns - time.monotonic_ns()
             if remaining_ns <= 0:
                 return None

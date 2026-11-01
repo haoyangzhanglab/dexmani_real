@@ -74,7 +74,6 @@ class SensorChannels:
         )
 
         self.is_running = ctx.RawValue("b", True)
-        self.vr_ready, self.camera_ready, self.pointcloud_ready = (ctx.Event() for _ in range(3))
         self.camera_depth_scale = ctx.RawValue("d", 0.0)
         self.camera_serial = ctx.RawArray("c", 32)
         self.camera_intrinsics = ctx.RawArray("c", 2048)
@@ -83,9 +82,9 @@ class SensorChannels:
 def snapshot_camera_parameters(
     channels, config, calibration_path, *, require_extrinsics=False, include_extrinsics=True,
 ):
-    """在 ready 边界复制相机静态参数，之后不再依赖 worker 或共享通道。"""
-    if not channels.camera_ready.is_set():
-        raise ValueError("camera parameters require a ready camera")
+    """在首帧完整发布后复制相机静态参数，之后不再依赖 worker 或共享通道。"""
+    if channels.camera_ring.latest_sequence <= 0:
+        raise ValueError("camera parameters require a published camera frame")
     serial = channels.camera_serial.value.decode("utf-8").strip()
     if config.serial is not None and serial != config.serial:
         raise ValueError("active camera serial differs from configuration")
@@ -103,8 +102,8 @@ def read_vr_frame(channels):
     result = channels.vr_ring.read()
     if result is None:
         return None
-    record, sequence = result
-    return {**{name: record[name] for name in record.dtype.names}, "ring_sequence": sequence}
+    record, _ = result
+    return {name: record[name] for name in record.dtype.names}
 
 
 def read_camera_frame(channels, *, fields=("rgb", "depth")):

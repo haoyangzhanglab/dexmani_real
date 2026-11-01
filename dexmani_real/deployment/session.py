@@ -7,7 +7,6 @@ import time
 from dataclasses import asdict
 from itertools import count
 
-from dexmani_real.config.deployment import ACTION_TIMEOUT_NS
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePlanner
 from dexmani_real.data.raw import camera_metadata
@@ -33,7 +32,6 @@ from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.io import write_json, write_yaml
 from dexmani_real.utils.log import configure_logging, error_detail
-from dexmani_real.utils.timing import next_tick_ns
 
 logger = logging.getLogger(__name__)
 MODEL_STARTUP_TIMEOUT_S = 300.0
@@ -108,7 +106,7 @@ class PolicySession:
             failure = exc
             if self.runtime_state is not None:
                 self.runtime_state.mark_error()
-                self.runtime_state.end_session(reason=failure_reason(exc))
+                self.runtime_state.revoke_motion(reason=failure_reason(exc))
             logger.exception("policy session failed")
         finally:
             exit_code = self.close(failure=failure)
@@ -177,7 +175,7 @@ class PolicySession:
                     target=run_camera,
                     args=(self.sensors.channels, self.runtime.camera),
                 ),
-                ready=self.sensors.channels.camera_ready,
+                ring=self.sensors.channels.camera_ring,
                 timeout_s=CAMERA_READY_TIMEOUT_S,
                 may_start=lambda: self.keyboard.check_health() and self.runtime_state.requests_allow_motion(),
             )
@@ -209,7 +207,7 @@ class PolicySession:
                         self.camera_snapshot, self.table_plane_abcd,
                     ),
                 ),
-                ready=self.sensors.channels.pointcloud_ready,
+                ring=self.sensors.channels.pointcloud_ring,
                 timeout_s=POINTCLOUD_READY_TIMEOUT_S,
                 may_start=lambda: self.keyboard.check_health() and self.runtime_state.requests_allow_motion(),
             )
@@ -232,23 +230,6 @@ class PolicySession:
     def close(self, *, failure=None):
         deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
         cleanup_errors = []
-        if self.runtime_state is not None:
-            try:
-                self.runtime_state.revoke_motion(reason=RunEndReason.RUNTIME_SHUTDOWN)
-            except BaseException as exc:
-                cleanup_errors.append(error_detail("revoke_motion", exc))
-        if self.robot is not None and self.robot.stop_required:
-            try:
-                self.robot.stop()
-            except BaseException as exc:
-                cleanup_errors.append(error_detail("stop", exc))
-        model_status = "completed"
-        if self.model is not None:
-            try:
-                self.model.close()
-            except BaseException as exc:
-                model_status = "failed"
-                cleanup_errors.append(error_detail("model_close", exc))
         try:
             if self.runtime_state is not None:
                 close_runtime(
@@ -256,6 +237,13 @@ class PolicySession:
                 )
         except BaseException as exc:
             cleanup_errors.append(error_detail("shutdown", exc))
+        model_status = "completed"
+        if self.model is not None:
+            try:
+                self.model.close()
+            except BaseException as exc:
+                model_status = "failed"
+                cleanup_errors.append(error_detail("model_close", exc))
         if self.model is not None and model_status != "failed":
             model_status, errors = self.model.wait_closed(deadline - time.monotonic())
             cleanup_errors.extend(errors)
@@ -299,22 +287,13 @@ class PolicySession:
     def check_startup(self):
         if self.keyboard.estop_latched or not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
+        self.robot.service_feedback()
         if not self.runtime_state.requests_allow_motion():
             raise OperationCancelled("startup cancelled")
-        self.robot.service_feedback()
 
     def wait_model(self, deadline):
-        next_check_ns = time.monotonic_ns()
-        dt_ns = round(self.info.control_dt_s * 1e9)
         while True:
             self.check_startup()
-            now = time.monotonic_ns()
-            if now >= next_check_ns:
-                row = read_observation(self.sensors.channels, self.robot, needs=self.needs)
-                issues = check_observation(row, self.runtime, self.needs)
-                if issues:
-                    raise ValueError("model startup inputs: " + "; ".join(issues))
-                next_check_ns = next_tick_ns(next_check_ns, dt_ns, now)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("model load/warmup deadline expired")
@@ -326,31 +305,20 @@ class PolicySession:
     def warmup_policy(self):
         deadline = time.monotonic() + MODEL_STARTUP_TIMEOUT_S
         self.wait_model(deadline)
-        rows = []
-        dt_ns = round(self.info.control_dt_s * 1e9)
-        next_sample_ns = time.monotonic_ns()
-        history_deadline_ns = next_sample_ns + (self.info.n_obs_steps - 1) * dt_ns + ACTION_TIMEOUT_NS
-        while len(rows) < self.info.n_obs_steps:
-            self.check_startup()
-            now = time.monotonic_ns()
-            if now >= history_deadline_ns:
-                raise TimeoutError("warmup observation history timed out")
-            if now < next_sample_ns:
-                time.sleep(min(0.005, (next_sample_ns - now) / 1e9))
-                continue
-            row = read_observation(self.sensors.channels, self.robot, needs=self.needs)
-            issues = check_observation(row, self.runtime, self.needs)
-            if issues:
-                raise ValueError("warmup observation: " + "; ".join(issues))
-            rows.append(self.observations.project(row))
-            next_sample_ns = time.monotonic_ns() + dt_ns
+        self.check_startup()
+        row = read_observation(self.sensors.channels, self.robot, needs=self.needs)
+        issues = check_observation(row, self.runtime, self.needs)
+        if issues:
+            raise ValueError("warmup observation: " + "; ".join(issues))
+        # 仅预热重复一个快照；features 缓存此后由唯一模型线程独占。
+        rows = (self.observations.project(row),) * self.info.n_obs_steps
         kwargs = {}
         if self.runtime.execution.mode == "rtc":
             kwargs = dict(
                 rtc_guidance_cap=self.runtime.execution.rtc_guidance_cap,
                 rtc_delay=self.runtime.execution.prefetch_steps,
             )
-        self.model.warmup(tuple(rows), samples=1, **kwargs)
+        self.model.warmup(rows, samples=1, **kwargs)
         self.wait_model(time.monotonic() + MODEL_STARTUP_TIMEOUT_S)
 
     def request_stop(self, *, reason=RunEndReason.OPERATOR) -> None:
@@ -456,12 +424,11 @@ class PolicySession:
             return True
 
     def run_control_loop(self):
-        while self.runtime_state.running and not self.runtime_state.quit_requested:
-            self.robot.arm.check_error()
+        while not self.runtime_state.quit_requested:
             self.poll_operator(allow_tactile_reset=True)
+            self.robot.service_idle()
             if self.runtime_state.estop_request or self.runtime_state.error_state:
                 break
-            self.robot.service_idle()
             with self.runtime_state.motion_lock:
                 epoch, self.start_epoch = self.start_epoch, None
                 if epoch is not None and not self.runtime_state.can_move(
@@ -472,7 +439,7 @@ class PolicySession:
                 time.sleep(0.005)
                 continue
             episode = self.episode = Rollout(
-                self.runtime_state, self.runtime, self.info, preparing_epoch=epoch,
+                self.runtime_state, self.runtime, self.info, epoch=epoch,
                 robot=self.robot, sensors=self.sensors, observations=self.observations,
                 needs=self.needs, action_mapper=self.action_mapper, model=self.model,
                 max_running_s=self.max_running_s, capture_ids=self.capture_ids,

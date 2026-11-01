@@ -177,7 +177,7 @@ class Robot:
 
     def read_state(self):
         """消费来源时间不变的反馈缓存，不执行硬件查询。"""
-        self.check()
+        self.check_owner()
         if not self.connected or self.arm is None:
             raise RobotError("robot is not connected")
         return RobotState(

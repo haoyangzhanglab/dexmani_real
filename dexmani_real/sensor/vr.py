@@ -46,32 +46,26 @@ def run_vr(shared, config: VRConfig) -> None:
     configure_logging()
     from hand_tracking_sdk import HandFrame, HandSide
 
-    try:
-        with closing(iter_vr_events(config, running=lambda: shared.is_running.value)) as events:
-            for event in events:
-                if not shared.is_running.value:
-                    break
-                if not isinstance(event, HandFrame) or event.side != HandSide.RIGHT:
-                    continue
-                try:
-                    wrist_pos, wrist_quat = _pose_to_flu(event.wrist)
-                    landmarks = _landmarks_to_flu(event.landmarks.points)
-                except ValueError as exc:
-                    logger.warning("Invalid VR hand frame rejected: %s", exc)
-                    continue
-                # IPC 写入失败属于 worker 故障，不能当作坏包跳过。
-                shared.vr_ring.write(
-                    wrist_pos=wrist_pos,
-                    wrist_quat_wxyz=wrist_quat,
-                    landmarks=landmarks,
-                    recv_ts_ns=min(event.wrist_recv_ts_ns, event.landmarks_recv_ts_ns),
-                    sequence_id=event.sequence_id,
-                )
-                if not shared.vr_ready.is_set():
-                    shared.vr_ready.set()
-                    logger.info("VR ready: first valid right-hand frame published")
-    finally:
-        shared.vr_ready.clear()
+    with closing(iter_vr_events(config, running=lambda: shared.is_running.value)) as events:
+        for event in events:
+            if not shared.is_running.value:
+                break
+            if not isinstance(event, HandFrame) or event.side != HandSide.RIGHT:
+                continue
+            try:
+                wrist_pos, wrist_quat = _pose_to_flu(event.wrist)
+                landmarks = _landmarks_to_flu(event.landmarks.points)
+            except ValueError as exc:
+                logger.warning("Invalid VR hand frame rejected: %s", exc)
+                continue
+            # IPC 写入失败属于 worker 故障，不能当作坏包跳过。
+            shared.vr_ring.write(
+                wrist_pos=wrist_pos,
+                wrist_quat_wxyz=wrist_quat,
+                landmarks=landmarks,
+                recv_ts_ns=min(event.wrist_recv_ts_ns, event.landmarks_recv_ts_ns),
+                sequence_id=event.sequence_id,
+            )
     logger.info("VR receiver exited")
 
 

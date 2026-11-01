@@ -144,12 +144,14 @@ def run_replay(
 
 
 def wait_for_home(runtime_state, robot, keyboard, home_planner, outcome, home_results):
+    def home_cancelled():
+        robot.check()
+        return runtime_state.estop_request or runtime_state.quit_requested
+
     keyboard.discard_events("h")
     print("H: planned return_home; Q: exit", flush=True)
-    while runtime_state.running and not runtime_state.quit_requested:
+    while not runtime_state.quit_requested:
         robot.service_idle()
-        if not keyboard.check_health():
-            runtime_state.request_emergency_stop()
         if runtime_state.error_state or runtime_state.estop_request:
             break
         signals = keyboard.poll(timeout=0.1)
@@ -163,10 +165,7 @@ def wait_for_home(runtime_state, robot, keyboard, home_planner, outcome, home_re
                     runtime_state,
                     robot,
                     home_planner,
-                    cancel_requested=lambda: (
-                        bool(runtime_state.estop_request or runtime_state.quit_requested)
-                        or not keyboard.check_health()
-                    ),
+                    cancel_requested=home_cancelled,
                 )
             except OperationCancelled as exc:
                 home_results.append(dict(ok=False, interrupted=True, reason=str(exc)))

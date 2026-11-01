@@ -49,36 +49,23 @@ def run_pointcloud_worker(
         if name in pointcloud_ring.field_names
     )
 
-    try:
-        while shared.is_running.value:
-            if camera_ring.latest_sequence <= last_camera_sequence:
-                time.sleep(IDLE_POLL_S)
-                continue
-            result = camera_ring.read()
-            if result is None:
-                time.sleep(IDLE_POLL_S)
-                continue
-            data, camera_sequence = result
-            if camera_sequence == last_camera_sequence:
-                time.sleep(IDLE_POLL_S)
-                continue
-            last_camera_sequence = camera_sequence
+    while shared.is_running.value:
+        if camera_ring.latest_sequence <= last_camera_sequence:
+            time.sleep(IDLE_POLL_S)
+            continue
+        result = camera_ring.read()
+        if result is None:
+            time.sleep(IDLE_POLL_S)
+            continue
+        data, camera_sequence = result
+        last_camera_sequence = camera_sequence
 
-            cloud = processor.process(data["depth"], data["rgb"])
-            if not len(cloud):
-                continue
-            pointcloud_ring.write(
-                source_camera_sequence=camera_sequence,
-                timestamp_ns=data["timestamp_ns"],
-                point_cloud=cloud,
-                **{name: data[name] for name in image_fields},
-            )
-            if not shared.pointcloud_ready.is_set():
-                shared.pointcloud_ready.set()
-                logger.debug(
-                    "run_pointcloud_worker: ready (shape=(%d,6), frame=xarm_base)",
-                    pointcloud.num_points,
-                )
-    finally:
-        shared.pointcloud_ready.clear()
-        logger.debug("run_pointcloud_worker: exited")
+        cloud = processor.process(data["depth"], data["rgb"])
+        if not len(cloud):
+            continue
+        pointcloud_ring.write(
+            source_camera_sequence=camera_sequence,
+            timestamp_ns=data["timestamp_ns"],
+            point_cloud=cloud,
+            **{name: data[name] for name in image_fields},
+        )

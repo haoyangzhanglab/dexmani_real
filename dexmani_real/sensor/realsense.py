@@ -237,9 +237,7 @@ def run_camera(shared, config: CameraConfig):
                 rgb=frame.rgb,
                 depth=frame.depth,
             )
-            shared.camera_ready.set()
     finally:
-        shared.camera_ready.clear()
         failure = sys.exc_info()[1]
         try:
             camera.disconnect()
