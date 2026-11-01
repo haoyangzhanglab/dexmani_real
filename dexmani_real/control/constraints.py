@@ -3,7 +3,6 @@
 import numpy as np
 
 from dexmani_real.control.collision import CollisionModel
-from dexmani_real.geometry.kinematics import ArmFK
 from dexmani_real.robot.model import XARM7_EQUIVALENT_JOINT_MASK
 
 EQUIVALENT_JOINTS = np.asarray(XARM7_EQUIVALENT_JOINT_MASK, dtype=bool)
@@ -36,7 +35,6 @@ class MotionConstraints:
 
     def __init__(self, arm, environment):
         self.collision_model = CollisionModel(static_boxes=environment.static_boxes)
-        self.target_fk = ArmFK()
         self.limits = np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper))
         self.workspace = environment.workspace.as_array()
         margin = environment.eef_workspace_margin_m
@@ -50,10 +48,13 @@ class MotionConstraints:
         return self.endpoint_rejection(target)
 
     def endpoint_rejection(self, target, *, position=None):
+        reason = self.collision_model.rejection(target)
+        if reason is not None:
+            return reason
         if position is None:
-            position = self.target_fk.forward(target)[:3, 3]
+            position = self.collision_model.eef_position()
         if np.any(position < self.workspace_with_margin[:, 0]) or np.any(
             position > self.workspace_with_margin[:, 1]
         ):
             return "final_eef_workspace"
-        return self.collision_model.rejection(target)
+        return None

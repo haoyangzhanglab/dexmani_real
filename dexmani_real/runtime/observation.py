@@ -79,16 +79,14 @@ def check_observation(row, runtime, needs, *, require_hand=True):
     now = time.monotonic_ns()
     issues = []
     stamp = int(row.arm["timestamp_ns"][0])
-    deadline = stamp + int(runtime.arm.feedback_max_age_s * 1e9)
-    if not 0 < stamp <= now < deadline:
+    if not sample_is_fresh(stamp, runtime.arm.feedback_max_age_s, now):
         issues.append("arm_feedback_stale")
     if require_hand and row.hand is None:
         issues.append("hand_feedback_unavailable")
     if row.hand is not None:
         for name in ("timestamp_ns", *(f"tactile_{c}_timestamp_ns" for c in needs.required_tactile)):
             stamp = int(row.hand[name][0])
-            deadline = stamp + int(runtime.hand.feedback_max_age_s * 1e9)
-            if require_hand and not 0 < stamp <= now < deadline:
+            if require_hand and not sample_is_fresh(stamp, runtime.hand.feedback_max_age_s, now):
                 issues.append(f"hand_{name}_unavailable_or_stale")
     if needs.camera_fields:
         if row.camera is None:

@@ -344,9 +344,6 @@ class PolicySession:
         self.request_stop()
 
     def poll_operator(self, *, allow_tactile_reset: bool = False) -> None:
-        if self.keyboard.estop_latched or not self.keyboard.check_health():
-            self.runtime_state.request_emergency_stop()
-            return
         self.handle_command_batch(
             self.keyboard.poll(timeout=0),
             allow_tactile_reset=allow_tactile_reset,

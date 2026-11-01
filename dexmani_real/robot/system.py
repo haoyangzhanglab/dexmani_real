@@ -295,7 +295,7 @@ class Robot:
 
         try:
             if command.arm_qpos is not None or command.arm_hold:
-                check_send()
+                self.stop_required = True
                 cast("ArmProcess", self.arm).submit(command, expires_ns=expires_ns)
             if command.hand_qpos is not None:
                 check_send()
