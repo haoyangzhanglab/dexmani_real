@@ -148,10 +148,6 @@ class EpisodeRecorder:
             self.is_recording = True
         except BaseException as exc:
             self.store_error(exc)
-            if self.stop_deadline is None:
-                self.stop_deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
-            if self.thread is not None and self.thread.ident is not None:
-                self.thread.join(timeout=max(0.0, self.stop_deadline - time.monotonic()))
             if not isinstance(exc, Exception):
                 raise
             self.check_error()
@@ -171,7 +167,7 @@ class EpisodeRecorder:
         self.submitted_frames += 1
 
     def finish(self, *, save, reason, details=None, technical_status="failed", deadline=None):
-        """关闭后由监督方发布；单段收尾期限可缩短首次停止预算。"""
+        """关闭后由监督方发布；首次 finish 建立唯一收尾预算。"""
         if self.finish_request is not None:
             self.check_error()
             return self.published_path
@@ -179,11 +175,10 @@ class EpisodeRecorder:
         self.finish_request = request = _FinishRequest(
             reason, tuple(dict(item) for item in (details or ())), technical_status,
         )
-        # START 失败后的 finally 与正常 finish 共用第一次停止时建立的预算。
-        if self.stop_deadline is None:
-            self.stop_deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
-            if deadline is not None:
-                self.stop_deadline = min(self.stop_deadline, deadline)
+        # START 只报错；外层先停止设备，再由首次 finish 建立等待预算。
+        self.stop_deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
+        if deadline is not None:
+            self.stop_deadline = min(self.stop_deadline, deadline)
         deadline = self.stop_deadline
         try:
             if was_recording and self.writer_pending and self.error is None:

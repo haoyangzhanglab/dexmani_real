@@ -27,8 +27,6 @@ class Trajectory:
 def load_trajectory(episode_path):
     with RawReader(episode_path) as reader:
         meta = reader.meta
-        if meta["collection_source"] != "teleop":
-            raise ValueError("physical replay requires a teleop episode")
         reader.validate_completion()
         arm = reader["action_arm_joint_target"][:]
         hand = reader["action_hand_joint_target"][:]

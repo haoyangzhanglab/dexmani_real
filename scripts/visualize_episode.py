@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 import time
 from itertools import islice
 from pathlib import Path
@@ -94,8 +95,8 @@ class EpisodeVisualizer:
         self.rr = rr
 
         episode_name = Path(episode_path).stem
-        self.reader = RawReader(episode_path)
         try:
+            self.reader = RawReader(episode_path)
             self.timestamps_s = self.reader.timestamps_s
             self.reader.require_fields(
                 "rgb",
@@ -174,8 +175,8 @@ class EpisodeVisualizer:
                 make_active=True, make_default=True,
             )
             self.log_recording_data()
-        except BaseException:
-            self.close()
+        except BaseException as exc:
+            self.close(exc)
             raise
 
     def preload_state(self) -> dict[str, np.ndarray]:
@@ -263,11 +264,27 @@ class EpisodeVisualizer:
             return None
         return self.pointcloud_processing_ns / self.pointcloud_processed_frames / 1e6
 
-    def close(self) -> None:
-        try:
-            self.reader.close()
-        finally:
-            self.rr.disconnect()
+    def close(self, error: BaseException | None = None) -> None:
+        failure = error
+        for attribute, method, stage in (
+            ("reader", "close", "reader_close"), ("rr", "disconnect", "rerun_disconnect"),
+        ):
+            resource = getattr(self, attribute, None)
+            if resource is None:
+                continue
+            try:
+                getattr(resource, method)()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+                else:
+                    setattr(failure, "cleanup_errors", [
+                        *getattr(failure, "cleanup_errors", ()), (stage, exc),
+                    ])
+            else:
+                setattr(self, attribute, None)
+        if failure is not None and error is None:
+            raise failure
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -348,7 +365,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         logger.info("数据已发送，脚本结束；可在 Rerun 中继续浏览。")
     finally:
-        viz.close()
+        viz.close(sys.exc_info()[1])
     return 0
 
 

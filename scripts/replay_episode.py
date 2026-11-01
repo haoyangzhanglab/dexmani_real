@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""在真机上按标称节拍回放 teleop Raw 关节目标，并保存回放结果。"""
+"""在真机上按标称节拍回放完整 Raw 关节目标，并保存回放结果。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from dexmani_real.config.real import load_config
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Submit teleop Raw targets at their nominal frequency on the xArm7 and XHand. "
+            "Submit complete Raw targets at their nominal frequency on the xArm7 and XHand. "
             "Recorded timing need not be regular; completion means all targets were submitted, "
             "not that historical physical motion was reproduced."
         ),
@@ -34,7 +34,7 @@ Controls:
         "episode",
         type=str,
         help=(
-            "Published Raw teleop episode directory (episodes/<task_name>/episode_*) "
+            "Published Raw episode directory (episodes/<task_name>/episode_*) "
             "with a technically normal capture and complete finite submission-attempt targets."
         ),
     )
