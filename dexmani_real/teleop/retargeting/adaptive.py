@@ -53,7 +53,7 @@ class AdaptiveHandRetargeter:
         self.optimizer = nlopt.opt(nlopt.LD_SLSQP, 12)
         self.optimizer.set_maxeval(config.max_evaluations)
         self.optimizer.set_maxtime(config.max_solve_time_s)
-        # 同一 loss 单位的容差也用于下方 seed 改善接受，保持既有双重语义。
+        # 同一 loss 容差用于优化收敛和下方 seed 改善判据。
         self.optimizer.set_ftol_abs(config.ftol_abs)
         self.calibration = None
         self.previous_command = None

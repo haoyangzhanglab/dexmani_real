@@ -221,8 +221,6 @@ def initialize_teleop(loop, vr_process) -> bool:
     )
     deadline = time.monotonic() + VR_READY_TIMEOUT_S
     while True:
-        if not loop.keyboard.check_health():
-            loop.runtime_state.request_emergency_stop()
         if loop.poll_blocking_commands():
             return False
         loop.robot.service_idle()
@@ -263,14 +261,10 @@ def calibrate_hand(loop):
     last_source_ns = 0
     last_error = "no fresh hand frames"
     while len(measurements) < config.calibration_samples:
-        if not loop.keyboard.check_health():
-            loop.runtime_state.request_emergency_stop()
         if loop.poll_blocking_commands():
             loop.runtime_state.request_quit()
             return False
         loop.robot.service_idle()
-        if not loop.sensors.check(names=("vr",)):
-            raise RuntimeError("VR worker exited during hand calibration")
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 f"hand calibration timed out ({len(measurements)}/{config.calibration_samples}): {last_error}"

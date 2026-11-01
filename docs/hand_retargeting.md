@@ -10,7 +10,7 @@
 | `teleop/retargeting/objective.py` | 位置、方向、对指、阻尼的函数值与解析梯度 |
 | `teleop/retargeting/adaptive.py` | 求解限位、滤波、诊断及提交状态 |
 
-在线入口为 `sensor/vr.py` → `teleop/vr.py::VRController` → `AdaptiveHandRetargeter`。候选求解不推进状态；只有设备提交正常返回后，控制线程才从实际 `RobotCommand` 更新 warm start、阻尼中心、滤波中心和时间戳；不再另建授权事务。每个控制 tick 都重新映射最新有效 landmarks，重复 VR 帧也可在速度限制内继续收敛。每个新段在 arm prepare 后从一份当前有效快照建立实测/VR 锚点，会话内骨长标定保留。重定向几何检查或求解失败会明确结束当前段。
+在线入口为 `sensor/vr.py` → `teleop/vr.py::VRController` → `AdaptiveHandRetargeter`。腕部映射与手部拒绝统一通过 `ActionResult` 返回，拒绝原因随本次结果传递。候选求解不推进状态；只有设备提交正常返回后，控制线程才从实际 `RobotCommand` 更新 warm start、阻尼中心、滤波中心和时间戳。每个控制 tick 都重新映射最新有效 landmarks，重复 VR 帧也可在速度限制内继续收敛。每个新段在 arm prepare 后从一份当前有效快照建立实测/VR 锚点，会话内骨长标定保留；进入 RUNNING 时记录的开始时刻也作为录制时长起点。重定向几何检查或求解失败会明确结束当前段。
 
 运行入口在构造前检查机器人配置和控制频率。关节反馈的形状及有限性由 XHand SDK 边界保证；HTS 21 点在接收并转换为 FLU 后完成同样检查。重定向保留 float64 转换、reset 时的操作限位裁剪和独立数组，以及骨长和掌退化检查。
 
@@ -51,7 +51,7 @@
 | 最终命令变化率上限 | 4 rad/s |
 | 求解预算 | 50 次 / 25 ms |
 
-次数预算限制求解工作量，时间预算限制计算耗时。`ftol_abs` 同时作为 NLopt 的绝对 loss 收敛容差，以及接受判据 `final_loss <= seed_loss + ftol_abs` 的容差；两处使用同一 loss 单位，默认值与接受集合保持原状。阻尼在优化中惩罚相对已提交命令的位移，EMA 在求解后平滑输出，两者作用不同。
+次数预算限制求解工作量，时间预算限制计算耗时。`ftol_abs` 同时作为 NLopt 的绝对 loss 收敛容差，以及接受判据 `final_loss <= seed_loss + ftol_abs` 的容差；两处使用同一 loss 单位。阻尼在优化中惩罚相对已提交命令的位移，EMA 在求解后平滑输出，两者作用不同。
 
 捏合是辅助目标：掌宽归一化距离门控乘以末段夹角 60→90° 的门控，使用观察到的缩放距离，不强制固定间隙，也不削弱姿态项。它只是几何意图代理，数据中没有接触或意图真值。
 

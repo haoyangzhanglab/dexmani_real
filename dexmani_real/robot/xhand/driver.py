@@ -179,10 +179,13 @@ class XHand:
                     f"configured device_id={self.cfg.device_id} not found in {hand_ids}",
                 )
             return self.initialize_command(cancel_requested=cancel_requested)
-        except BaseException:
+        except BaseException as failure:
             try:
                 self.disconnect()
-            except BaseException:
+            except BaseException as cleanup_error:
+                setattr(failure, "cleanup_errors", [
+                    *getattr(failure, "cleanup_errors", ()), ("hand_disconnect", cleanup_error),
+                ])
                 logger.exception("XHand connection cleanup failed")
             raise
 
@@ -239,6 +242,10 @@ class XHand:
         finally:
             self.connected_flag = False
         if errors:
+            setattr(errors[0], "cleanup_errors", [
+                *getattr(errors[0], "cleanup_errors", ()),
+                *(("hand_disconnect", error) for error in errors[1:]),
+            ])
             for error in errors[1:]:
                 logger.error("additional XHand disconnect failure", exc_info=(type(error), error, error.__traceback__))
             raise errors[0]

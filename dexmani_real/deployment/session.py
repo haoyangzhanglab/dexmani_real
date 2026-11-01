@@ -88,6 +88,8 @@ class PolicySession:
                 self.prepare_resources()
                 self.start_devices()
             except OperationCancelled:
+                if self.robot is not None:
+                    self.robot.check()
                 if self.runtime_state is None or not (
                     self.runtime_state.stop_signal.is_set() or self.runtime_state.quit_requested
                     or self.runtime_state.estop_request
@@ -244,9 +246,9 @@ class PolicySession:
             except BaseException as exc:
                 model_status = "failed"
                 cleanup_errors.append(error_detail("model_close", exc))
-        if self.model is not None and model_status != "failed":
-            model_status, errors = self.model.wait_closed(deadline - time.monotonic())
-            cleanup_errors.extend(errors)
+            else:
+                model_status, errors = self.model.wait_closed(deadline - time.monotonic())
+                cleanup_errors.extend(errors)
         writer_pending = self.episode is not None and self.episode.writer_pending
         pending = model_status == "pending" or writer_pending
         shutdown = (
@@ -285,8 +287,6 @@ class PolicySession:
         return int(not successful)
 
     def check_startup(self):
-        if self.keyboard.estop_latched or not self.keyboard.check_health():
-            self.runtime_state.request_emergency_stop()
         self.robot.service_feedback()
         if not self.runtime_state.requests_allow_motion():
             raise OperationCancelled("startup cancelled")

@@ -23,28 +23,25 @@ class SensorWorkers:
         self.channels = channels
         self.started = []
 
-    def request_shutdown(self):
-        if self.channels is not None:
-            self.channels.is_running.value = False
-
     def start(self, process, *, ring, timeout_s=None, may_start) -> None:
         """传入超时时等待就绪，否则仅启动；失败后仍由本对象回收进程。"""
-        if not may_start():
+        allowed = may_start()
+        if not self.check():
+            raise RuntimeError("required sensor worker exited before startup")
+        if not allowed:
             raise OperationCancelled("sensor startup cancelled")
         process.start()
         self.started.append(process)
         if timeout_s is not None:
             deadline = time.monotonic() + timeout_s
             while time.monotonic() < deadline:
-                if not may_start():
-                    raise OperationCancelled(f"{process.name} startup cancelled")
+                allowed = may_start()
+                sequence = ring.latest_sequence
                 if not self.check():
                     raise RuntimeError(f"{process.name} exited during startup")
-                if ring.latest_sequence > 0:
-                    if not may_start():
-                        raise OperationCancelled(f"{process.name} startup cancelled")
-                    if not self.check():
-                        raise RuntimeError(f"{process.name} exited during startup")
+                if not allowed:
+                    raise OperationCancelled(f"{process.name} startup cancelled")
+                if sequence > 0:
                     return
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
             raise RuntimeError(f"{process.name} failed to become ready")
@@ -59,7 +56,8 @@ class SensorWorkers:
 
     def shutdown(self):
         """短时退出，必要时终止 sensor；仅保留实际未回收的句柄。"""
-        self.request_shutdown()
+        if self.channels is not None:
+            self.channels.is_running.value = False
         deadline = time.monotonic() + SENSOR_SHUTDOWN_TIMEOUT_S
         errors = []
         unresolved = []

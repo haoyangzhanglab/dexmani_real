@@ -357,13 +357,13 @@ class TeleopLoop:
             return
         self.controller.reset(row)
         with self.runtime_state.motion_lock:
-            authorized = self.preparation_valid() and self.runtime_state.begin_motion()
-        if not authorized:
+            started_ns = self.runtime_state.begin_motion() if self.preparation_valid() else None
+        if started_ns is None:
             if not self.preparation_interrupted():
                 self.request_episode_end("begin_unavailable")
             return
         self.phase = TeleopPhase.ACTIVE
-        self.capture_started_s = time.monotonic()
+        self.capture_started_s = started_ns / 1e9
         self.tick_origin_ns = None
         self.tick_index = 0
         self.termination_details.append(dict(
@@ -410,16 +410,12 @@ class TeleopLoop:
         try:
             result = self.controller.compute_target(row, control_ns=compute_start_ns)
             compute_end_ns = time.monotonic_ns()
-            if result is None or result.rejection_reason is not None or result.arm_qpos is None:
-                detail = (
-                    result.rejection_reason if result is not None
-                    else self.controller.rejection_reason or "hand target rejected"
-                )
+            if result.rejection_reason is not None or result.arm_qpos is None:
                 self.record_control_timing(
                     row, epoch, tick_end_ns, compute_start_ns, compute_end_ns,
                     submit_start_ns, submit_end_ns,
                 )
-                self.request_episode_end(f"target_unavailable: {detail}")
+                self.request_episode_end(f"target_unavailable: {result.rejection_reason}")
                 return
             if self.recorder is not None:
                 self.recorder.check_error()

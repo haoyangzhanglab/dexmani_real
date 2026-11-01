@@ -2,6 +2,7 @@
 
 from scipy.spatial.transform import Rotation
 
+from dexmani_real.control.actions import ActionResult
 from dexmani_real.geometry.pose import (
     WXYZ_TO_XYZW,
     XYZW_TO_WXYZ,
@@ -21,7 +22,6 @@ class VRController:
         self.anchor = None
         self.previous_arm_command = None
         self.previous_eef_target = None
-        self.rejection_reason = None
 
     def reset(self, row):
         self.clear()
@@ -56,8 +56,7 @@ class VRController:
         alpha_pos = self.config.ema_alpha_pos
         return Pose(alpha_pos * position + (1.0 - alpha_pos) * previous.p, smoothed.as_quat()[XYZW_TO_WXYZ])
 
-    def compute_target(self, row, *, control_ns):
-        self.rejection_reason = None
+    def compute_target(self, row, *, control_ns) -> ActionResult:
         target = self._wrist_target(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
         hand = None
         if self.hand_retargeter is not None:
@@ -65,8 +64,7 @@ class VRController:
                 row.vr["landmarks"], timestamp_ns=control_ns,
             )
             if hand is None:
-                self.rejection_reason = self.hand_retargeter.rejection_reason
-                return None
+                return ActionResult(None, None, self.hand_retargeter.rejection_reason)
         return self.action_mapper.map_eef(
             target, hand, row.arm["qpos"][0], self.previous_arm_command
         )

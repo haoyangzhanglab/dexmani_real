@@ -473,9 +473,6 @@ class RawReader:
             self.tactile_hold_max_age_s = age
         return self.tactile_hold_max_age_s
 
-    def read_timing_rows(self, fields):
-        return self["timing/rows"].fields(tuple(fields))[:]
-
     @property
     def timestamps_s(self):
         stamps = self["timing/rows"].fields("observation_ns")[:]

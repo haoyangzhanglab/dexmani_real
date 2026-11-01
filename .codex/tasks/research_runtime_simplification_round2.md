@@ -295,4 +295,29 @@ with motion_lock:
 
 代码按完整职责提交为 `c28e9c7`（撤权、提交时序及有界诊断）和 `9f13b6c`（状态、启动、传感器、健康检查及收尾简化）；本实施记录另行提交。最终跨入口检查在这些代码的最终版本执行，额外覆盖补充 stop 错误为 KeyboardInterrupt 时先急停再回收 Future，保留原主因。
 
+### 后续全链路审查与清理（基线 `899506b`）
+
+按后续请求审查了上述改动及控制映射、机器人边界、录制/Raw/Canonical、policy worker、观测构造、配置和六个实际脚本入口。开始时工作区干净；本轮没有操作硬件或修改 `dexmani_policy`。
+
+- `begin_motion` 的四个调用方均不消费返回的代际，现只返回实际开始时间；Rollout 和 Teleop 同步使用该时刻，Teleop 删除第二次开始计时。VR 统一返回已有 `ActionResult`，删除控制器拒绝原因副本及 `None` 结果回退分支。删除无消费者的 `RunEndReason.TIMEOUT`、`RawReader.read_timing_rows`、只转发调用的 `has_motion_authority` 和 `request_shutdown`。
+- 录制频率复用 `sampling_clock_ns` 的整数周期校验，删除独立 NumPy 校验与导入；Raw/Canonical schema、来源时间、唯一行数核对和训练时间网格未变。搜索确认相关生产代码中没有 SHA-256/哈希校验或旧格式版本兼容机制；`source_id`、完整 URDF、recipe 和完成状态有实际消费者，予以保留。
+- 补齐 writer/streaming 准备后、最终准入、活动失权、策略启动和键盘退出等取消分支的故障核查；错误仍进入原有阶段和收尾边界。replay 本地反馈/控制槽超期复用 `OperationCancelled`，保留 REJECTED；SDK 抛出的 `TimeoutError` 及未确认的发送/共享资源超时进入 FAULT，部分提交失败仍保留捕获行并实际停止。没有用异常文本判断类别，也没有新建异常层级或协议。
+- SensorWorkers 每轮采请求及发布序列后再检查进程健康，最后决定取消或首帧成功，避免取消吞掉退出或读取序列时退出却被准入；只遍历健康一次。删除启动、标定中已由 poll/service 覆盖的键盘及 sensor 重复遍历。相机与 XHand 启动清理、XHand 多项断开失败保留主因及补充错误，未解决句柄仍归原 owner。
+- README、手部文档、返回类型、实际调用方及注释同步；没有新增依赖、配置开关、兼容层、仓库测试树或工具缓存。
+
+本轮行为证据均重新执行，命令前缀为 `PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/tmp/dexmani_audit_mpl /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`，文件与日志在 `/tmp`：
+
+| 实际脚本 | 结果与范围 |
+| --- | --- |
+| `audit_control_probe.py` | 生产 Teleop/VR/ActionMapper/HandFK/重定向的开始时间及统一拒绝结果；生产 replay 完成、反馈过期、部分发送 SDK 超时、纯取消/同时 arm fault、采样保留和 stop；键盘取消同时故障；XHand 连接/多项断开错误证据均通过。SDK 和键盘外部副作用替代。初版 probe 复用已满采样缓冲、误以默认串口测试 EtherCAT 清理，修正测试夹具后通过，未据此放宽生产检查。 |
+| `audit_policy_probe.py` | 五个准备/失权边界 × 正常取消/SDK/worker 故障，单条正确阶段错误、stop 先于回收；真实会话启动取消/close_runtime 和单轮键盘遍历通过；脚本内重新执行原 policy probe。 |
+| `audit_sensor_probe.py`、`audit_sensor_final_alive_probe.py --expect-rejection` | 取消与 worker 退出同轮、健康取消、RealSense 双失败、标定取消同时 worker fault 通过。后者用真实 spawn 与 SharedRing，在读取序列处 join 已发布后退出的进程：修改前确定性误通过，修改后拒绝，不依赖 sleep 压测。 |
+| `audit_data_boundaries.py`、`probe_round2_recorder.py` | 频率准入在 I/O 前完成；本轮重跑真实 HDF5/AV、RawReader、实际 FK/点云/手模板、13 字段 Zarr 导出及失败/pending/发布语义，通过。 |
+| `round2_sensor_jog_probe.py`、`probe_round2_modes.py` | 本轮重跑真实 spawn/ring/点云/标定/jog 及 sync/async/RTC 生产调用链，通过；模型预测与 SDK 替代。 |
+| `round2_control_probe.py`、`round2_device_boundary_probe.py` | 本轮重跑共享锁竞态、真实 stop 调用顺序、提交边界 3.896103896 rad/s 反例、每种录制模式 20,000 次混合软超时、部分发送失败和 owner 到期/停止失败，均通过。 |
+
+`audit_static_build.py` 本轮最终覆盖 30 个相关 Python 文件 AST/compile、24 个生产模块 import、6 个 CLI help、2 个配置 JSON、Ruff F/E9 和默认 mypy，均通过。只在 `/tmp` 复制源码后用现有 setuptools 构建 wheel，84 个 Python/标定 JSON payload 齐全，仓库无 build/egg-info 产物；这仅证明打包，不证明外部机器人资产或安装后设备集成。`audit_type_body_compare.py` 对相同文件执行 `mypy --check-untyped-defs` 并与 `899506b` 比较：基线78条、当前75条，无新增错误，两者均非零退出，未宣称严格类型全通过。mypy 缓存均在 `/tmp`，Ruff 禁用缓存。最终 diff 和悬空引用检查通过。
+
+剩余限制沿用 §8.3：真实停止/跟踪、HOME、设备与网络/监听、真实模型权重/GPU，以及实际采集负载下的长期录制和退出仍待实验环境验证。本轮未把外部副作用替代、构建或源码审查当作这些项目的集成验收。
+
 验收的最终问题是：同一个事实是否只维护一次，控制流是否更容易读懂，删掉的机制是否真的没有留下同义替代，以及真实设备/数据边界是否仍能正确报告失败。

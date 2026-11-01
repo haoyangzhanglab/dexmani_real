@@ -72,25 +72,25 @@ class JointReplay:
         result = ReplayResult(ReplayStatus.COMPLETED)
         run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
         try:
-            result.status, result.reason, row = self.admit_replay(trajectory)
-            if result.status == ReplayStatus.COMPLETED:
-                if hand_start_duration_s > 0:
-                    interrupted = self.prepare_hand(
-                        trajectory, row, hand_start_duration_s, period_ns
-                    )
-                    if interrupted is not None:
-                        result.status, result.reason = interrupted
+            try:
+                result.status, result.reason, row = self.admit_replay(trajectory)
                 if result.status == ReplayStatus.COMPLETED:
-                    result.status, result.reason = self.replay_rows(trajectory, period_ns)
-        except (OperationCancelled, TimeoutError) as exc:
-            operator_quit = (
-                isinstance(exc, OperationCancelled)
-                and self.runtime_state.quit_requested
-            )
-            result.status = ReplayStatus.USER_QUIT if operator_quit else ReplayStatus.REJECTED
-            if self.runtime_state.estop_request:
-                result.status = ReplayStatus.ESTOP
-            result.reason = str(exc)
+                    if hand_start_duration_s > 0:
+                        interrupted = self.prepare_hand(
+                            trajectory, row, hand_start_duration_s, period_ns
+                        )
+                        if interrupted is not None:
+                            result.status, result.reason = interrupted
+                    if result.status == ReplayStatus.COMPLETED:
+                        result.status, result.reason = self.replay_rows(trajectory, period_ns)
+            except OperationCancelled as exc:
+                self.robot.check()
+                result.status = (
+                    ReplayStatus.USER_QUIT if self.runtime_state.quit_requested else ReplayStatus.REJECTED
+                )
+                if self.runtime_state.estop_request:
+                    result.status = ReplayStatus.ESTOP
+                result.reason = str(exc)
         except KeyboardInterrupt:
             self.runtime_state.request_emergency_stop()
             result.status, result.reason = ReplayStatus.ESTOP, "KeyboardInterrupt"
@@ -122,7 +122,7 @@ class JointReplay:
         row = read_observation(None, self.robot)
         issues = check_observation(row, self.runtime, ObservationNeeds())
         if issues:
-            raise TimeoutError("replay feedback: " + "; ".join(issues))
+            raise OperationCancelled("replay feedback: " + "; ".join(issues))
         return row
 
     def admit_replay(self, trajectory):
@@ -160,7 +160,7 @@ class JointReplay:
                 status, reason = interrupted
                 break
             if time.monotonic_ns() >= slot_deadline_ns:
-                raise TimeoutError(f"replay slot {index} missed before observation")
+                raise OperationCancelled(f"replay slot {index} missed before observation")
             row = self.read_feedback()
             mapped = self.action_mapper.map_joint(
                 trajectory.action_arm_joint[index],
@@ -182,7 +182,7 @@ class JointReplay:
     def submit_row(self, index, row, arm, hand, tick_end_ns):
         captured = self.capture.append(row, arm, hand)
         if time.monotonic_ns() >= tick_end_ns:
-            raise TimeoutError(f"replay slot {index} expired before submission")
+            raise OperationCancelled(f"replay slot {index} expired before submission")
         # 候选与提交尝试分开记录，send_action 返回不代表机器人已到位。
         started_ns = time.monotonic_ns()
         self.capture.data["submit_started_ns"][captured] = started_ns
@@ -195,7 +195,7 @@ class JointReplay:
             completed_ns = time.monotonic_ns()
             self.capture.data["submit_completed_ns"][captured] = completed_ns
         if completed_ns >= tick_end_ns:
-            raise TimeoutError(f"replay slot {index} submission returned after deadline")
+            raise OperationCancelled(f"replay slot {index} submission returned after deadline")
 
     def wait_replay(self, deadline_ns):
         while True:

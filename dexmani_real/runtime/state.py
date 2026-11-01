@@ -27,7 +27,6 @@ class RunEndReason(IntEnum):
     EXECUTOR_BOUNDARY = 1
     OPERATOR = 2
     QUIT = 3
-    TIMEOUT = 4
     POLICY_FAILURE = 5
     ESTOP = 6
     HARDWARE_FAULT = 7
@@ -79,7 +78,7 @@ class SessionState:
                 raise RuntimeError("arming rejected")
             self.revoke_motion()
 
-    def begin_motion(self) -> tuple[int, int] | None:
+    def begin_motion(self) -> int | None:
         with self.motion_lock:
             if (
                 self.safety_state != SafetyState.ARMED
@@ -89,7 +88,7 @@ class SessionState:
             started = time.monotonic_ns()
             self.run_ended_reason = RunEndReason.NONE
             self.safety_state = SafetyState.RUNNING
-            return self.run_id, started
+            return started
 
     def can_move(self, *, run_id, required_safety_state=SafetyState.RUNNING):
         with self.motion_lock:

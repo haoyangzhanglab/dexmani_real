@@ -9,12 +9,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty, Full, Queue
 
-import numpy as np
-
 from dexmani_real.data.raw import RawWriter
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.runtime.observation import Observation
 from dexmani_real.utils.io import publish
+from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
 RECORDER_START_TIMEOUT_S = 10.0
@@ -36,8 +35,7 @@ class EpisodeRecorder:
     """每个 episode 独占一个 writer，调用方须先停止运动再阻塞收尾。"""
 
     def __init__(self, data_dir, *, control_hz):
-        if not np.isfinite(control_hz) or control_hz <= 0:
-            raise ValueError("recording control_hz must be finite and positive")
+        sampling_clock_ns(control_hz)
         self.data_dir = Path(data_dir)
         self.control_hz = float(control_hz)
         self.thread = None

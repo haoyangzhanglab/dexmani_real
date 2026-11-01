@@ -130,10 +130,13 @@ class RealSenseCamera:
             self.aligner = rs.align(rs.stream.color)
             for _ in range(WARMUP_FRAMES):
                 self.read()
-        except BaseException:
+        except BaseException as failure:
             try:
                 self.disconnect()
-            except BaseException:
+            except BaseException as exc:
+                setattr(failure, "cleanup_errors", [
+                    *getattr(failure, "cleanup_errors", ()), ("camera_disconnect", exc),
+                ])
                 logger.exception("RealSense startup cleanup failed")
             raise
 

@@ -121,9 +121,6 @@ class Rollout:
         limit = self.budget_limit()
         return limit if limit is not None and time.monotonic_ns() >= limit[0] else None
 
-    def has_motion_authority(self):
-        return self.runtime_state.can_move(run_id=self.epoch)
-
     def stop(self, detail, *, run_end_reason=RunEndReason.EXECUTOR_BOUNDARY, errors=()):
         if self.finished:
             return
@@ -239,10 +236,13 @@ class Rollout:
         return self.result
 
     def preparation_valid(self):
-        return self.runtime_state.can_move(
+        valid = self.runtime_state.can_move(
             run_id=self.epoch,
             required_safety_state=SafetyState.ARMED,
         )
+        if not valid:
+            self.robot.check()
+        return valid
 
     def start_observation(self):
         self.robot.service_feedback()
@@ -288,11 +288,12 @@ class Rollout:
             self.stop(self.preparation_issue)
             return
         with self.runtime_state.motion_lock:
-            admitted = self.runtime_state.begin_motion() if self.epoch == self.runtime_state.run_id else None
-        if admitted is None:
+            started_ns = self.runtime_state.begin_motion() if self.epoch == self.runtime_state.run_id else None
+        if started_ns is None:
+            self.robot.check()
             self.stop("final admission declined")
             return
-        _, self.started_ns = admitted
+        self.started_ns = started_ns
         self.next_step_ns = self.started_ns
         self.wait_deadline_ns = (
             self.started_ns + (self.policy_info.n_obs_steps - 1) * self.dt_ns + ACTION_TIMEOUT_NS
@@ -381,7 +382,8 @@ class Rollout:
         try:
             if self.finished:
                 return
-            if not self.has_motion_authority():
+            if not self.runtime_state.can_move(run_id=self.epoch):
+                self.robot.check()
                 self.stop("owner_authority_revoked")
                 return
             self.poll_model()

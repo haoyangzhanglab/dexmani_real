@@ -54,6 +54,7 @@ class KeyboardTeleop:
             self.runtime_state.request_emergency_stop()
             raise
         except OperationCancelled as exc:
+            self.robot.check()
             logger.info("Keyboard teleop cancelled: %s", exc)
             clean = bool(self.runtime_state.quit_requested)
         except Exception as exc:
