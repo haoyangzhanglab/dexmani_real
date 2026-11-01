@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""离线查看 Raw episode 的观测与点云，或输出数据概要。"""
+"""
+    离线查看 Raw episode 的观测与点云，或输出数据概要。
+    python scripts/visualize_episode.py episodes/pnp_apple_banana/episode_20261101_165909
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""XHand SDK 边界；CRC 不代表发送成功，触觉有效性单独判断。"""
+"""XHand SDK 边界；过流仅告警，CRC 不代表发送成功，触觉有效性单独判断。"""
 
 from __future__ import annotations
 
@@ -37,6 +37,9 @@ COMMUNICATION_CRC_ERROR_CODE = 1_501_070
 COMBINED_FORCE_UNAVAILABLE_CODE = 1_501_018
 DISTRIBUTED_FORCE_UNAVAILABLE_CODE = 1_501_019
 TEMPERATURE_UNAVAILABLE_CODE = 1_501_020
+OVERCURRENT_WARNING_CODE = 1_501_035
+# X-Hand 协议中的关节板原始错误码；SDK 将其映射为 1501035。
+OVERCURRENT_BOARD_CODE = 110
 
 # 这些状态仍允许关节读写，触觉有效性单独判断。
 NONFATAL_SDK_CODES = frozenset(
@@ -45,6 +48,7 @@ NONFATAL_SDK_CODES = frozenset(
         COMBINED_FORCE_UNAVAILABLE_CODE,
         DISTRIBUTED_FORCE_UNAVAILABLE_CODE,
         TEMPERATURE_UNAVAILABLE_CODE,
+        OVERCURRENT_WARNING_CODE,
     }
 )
 
@@ -58,7 +62,10 @@ STOP_RETRY_TIMEOUT_S = 0.25
 
 
 def _tactile_validity(code: int, *, comm_type: str) -> tuple[bool, bool]:
-    """RS485 201 仅禁用 dense、202 不禁用触觉；EtherCAT 要求状态为零。"""
+    """过流不禁用触觉；其余状态按通信协议分别判断。"""
+    # 电机过流本身不使触觉失效；仍检查各指尖状态和数据完整性。
+    if code == OVERCURRENT_WARNING_CODE:
+        return (True, True)
     if comm_type == "ethercat":
         return (code == 0, code == 0)
     if code == 0:
@@ -86,7 +93,7 @@ def _parse_joints(
         comm_error = int(joint.commboard_err)
         # SDK 字段名实际拼写为 jonitboard_err。
         joint_error = int(joint.jonitboard_err)
-        if comm_error or joint_error:
+        if comm_error or joint_error not in (0, OVERCURRENT_BOARD_CODE):
             raise ValueError(
                 f"joint/communication board fault at joint[{index}]: "
                 f"commboard_err={comm_error}, jointboard_err={joint_error}"
@@ -147,6 +154,7 @@ class XHand:
         self.control: Any = None
         self.command: Any = None
         self.tactile_reset_metadata: dict[str, object] = {}
+        self.next_overcurrent_warning_ns = 0
 
     @property
     def is_connected(self) -> bool:
@@ -159,6 +167,7 @@ class XHand:
         from xhand_controller import xhand_control
 
         self.sdk = xhand_control
+        self.next_overcurrent_warning_ns = 0
         try:
             if cancel_requested():
                 raise OperationCancelled("XHand connection cancelled")
@@ -211,7 +220,9 @@ class XHand:
             error = self.control.open_serial(device_name, self.cfg.baudrate)
         else:
             error = self.control.open_ethercat(device_name)
-        if error.error_code != 0:
+        if error.error_code == OVERCURRENT_WARNING_CODE:
+            self.warn_overcurrent("connect", error.error_message)
+        elif error.error_code != 0:
             raise XHandError("connect", error.error_code, error.error_message)
 
     def disconnect(self) -> None:
@@ -249,7 +260,9 @@ class XHand:
             EC_STATE_INIT,
             500_000,
         )
-        if int(error.error_code) != 0:
+        if int(error.error_code) == OVERCURRENT_WARNING_CODE:
+            self.warn_overcurrent("ethercat INIT", error.error_message)
+        elif int(error.error_code) != 0:
             raise XHandError("ethercat INIT", int(error.error_code), "INIT request failed")
         time.sleep(0.2)
 
@@ -279,7 +292,9 @@ class XHand:
                 )
                 raise RobotError(f"XHand tactile reset SDK call failed: {type(exc).__name__}: {exc}") from exc
             code = int(reply.error_code)
-            if code != 0:
+            if code == OVERCURRENT_WARNING_CODE:
+                self.warn_overcurrent(f"tactile reset sensor=0x{sensor_id:02x}", reply.error_message)
+            elif code != 0:
                 result["hand_tactile_reset_result"] = (
                     f"failed ({completed}/5), sensor=0x{sensor_id:02x}, code={code}"
                 )
@@ -320,6 +335,13 @@ class XHand:
             qpos, joints = _parse_joints(raw_state)
         except (AttributeError, TypeError, ValueError, OverflowError) as exc:
             raise XHandError("read", code, f"invalid joint payload: {exc}") from exc
+
+        overcurrent_joints = [
+            index for index, joint in joints.items()
+            if int(joint.jonitboard_err) == OVERCURRENT_BOARD_CODE
+        ]
+        if code == OVERCURRENT_WARNING_CODE or overcurrent_joints:
+            self.warn_overcurrent("read", f"{error.error_message}; joints={overcurrent_joints}")
 
         channels = ("aggregate", "dense")
         unavailable = {
@@ -435,9 +457,19 @@ class XHand:
 
         code = int(error.error_code)
         if code not in NONFATAL_SDK_CODES and code != COMMUNICATION_CRC_ERROR_CODE:
-            # 1501035 表示过流，必须终止本次运行。
             raise XHandError("send", code, error.error_message)
+        if code == OVERCURRENT_WARNING_CODE:
+            self.warn_overcurrent("send", error.error_message)
         return code
+
+    def warn_overcurrent(self, operation: str, message: str) -> None:
+        now_ns = time.monotonic_ns()
+        if now_ns >= self.next_overcurrent_warning_ns:
+            logger.warning(
+                "XHand 过流告警（继续运行）：%s code=%d msg=%s",
+                operation, OVERCURRENT_WARNING_CODE, message,
+            )
+            self.next_overcurrent_warning_ns = now_ns + 1_000_000_000
 
     def make_command(self, qpos: np.ndarray) -> Any:
         command = self.sdk.HandCommand_t()

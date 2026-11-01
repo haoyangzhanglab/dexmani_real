@@ -19,7 +19,7 @@ from dexmani_real.runtime.preflight import (
     validate_robot_config,
 )
 from dexmani_real.runtime.state import RunEndReason, SessionState, device_failure_reason
-from dexmani_real.utils.log import attach_cleanup_errors, configure_logging
+from dexmani_real.utils.log import attach_cleanup_errors, configure_logging, error_detail
 from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -74,9 +74,15 @@ class KeyboardTeleop:
             except BaseException as exc:
                 if failure is not None:
                     attach_cleanup_errors(failure, [("shutdown", exc)])
-                logger.exception("keyboard runtime cleanup failed")
+                else:
+                    logger.error(
+                        "keyboard runtime cleanup failed: %s", error_detail("shutdown", exc)["message"],
+                    )
             else:
                 shutdown_clean = True
+            # 主错由原异常继续传播；补充错误只在会话出口打印，不重复主错 traceback。
+            for stage, error in getattr(failure, "cleanup_errors", ()):
+                logger.error("%s failed: %s", stage, error_detail(stage, error)["message"])
         return int(
             not clean or not shutdown_clean
             or self.runtime_state.error_state or self.runtime_state.estop_request

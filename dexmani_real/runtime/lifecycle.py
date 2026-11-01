@@ -95,7 +95,7 @@ class SensorWorkers:
 
 
 def close_runtime(runtime_state, robot=None, *, sensors=None, keyboard=None):
-    """撤权后尝试全部关闭；正常返回或保留首个异常及其补充关闭错误。"""
+    """撤权后尝试全部关闭并聚合错误；日志和最终结果由会话出口报告。"""
     runtime_state.stop_signal.set()
     errors = []
     for stage, close in (
@@ -112,7 +112,6 @@ def close_runtime(runtime_state, robot=None, *, sensors=None, keyboard=None):
             close()
         except BaseException as exc:
             errors.append((stage, exc))
-            logger.exception("%s failed", stage)
     if errors:
         first = errors[0][1]
         attach_cleanup_errors(first, errors[1:])

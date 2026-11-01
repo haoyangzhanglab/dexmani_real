@@ -35,6 +35,8 @@ class ArmProcess:
         )
         self.pipe, self.child_pipe = self.ctx.Pipe()
         self.process = None
+        self._fault_error = None
+        self._close_error = None
 
     @property
     def is_connected(self):
@@ -97,17 +99,33 @@ class ArmProcess:
             self.io.closing.set()
             raise
 
-    def check_error(self):
+    def _read_fault(self):
+        # owner 的首个故障不会被清除；父进程复用同一异常，保留 cause 和收尾详情。
         issue = self.fault
-        close_error = self.io.close_error.value.decode(errors="replace")
-        if close_error:
-            issue = f"{issue}; {close_error}" if issue else close_error
-        if not issue and self.process is not None and not self.process.is_alive() and not (
-            self.io.closing.is_set() and self.io.stopped.is_set() and self.process.exitcode == 0
-        ):
-            issue = f"arm owner exited: {self.process.exitcode}"
-        if issue:
-            raise RobotError(f"xArm controller fault: {issue}")
+        if (not issue and self.process is not None and self.process.pid is not None
+                and not self.process.is_alive()):
+            if self.process.exitcode != 0 or not self.io.closing.is_set():
+                issue = f"arm owner exited: {self.process.exitcode}"
+            elif not self.io.stopped.is_set():
+                issue = "arm owner exited without confirming stop"
+        if issue and self._fault_error is None:
+            self._fault_error = RobotError(f"xArm controller fault: {issue}")
+        return self._fault_error
+
+    def _read_close_error(self):
+        message = self.io.close_error.value.decode(errors="replace")
+        # disconnect 会追加详情；更新已有异常，避免再附加一份已报告的停止错误。
+        if message:
+            if self._close_error is None:
+                self._close_error = RobotError(message)
+            else:
+                self._close_error.args = (message,)
+        return self._close_error
+
+    def check_error(self):
+        error = self._read_fault() or self._read_close_error()
+        if error is not None:
+            raise error
 
     def snapshot(self):
         self.check_error()
@@ -171,7 +189,7 @@ class ArmProcess:
             reply_pending = False
             if error is not None:
                 if isinstance(error, Exception) and self.fault:
-                    raise RobotError("arm operation failed") from error
+                    raise self._read_fault() from error
                 raise error
             if abort():
                 raise OperationCancelled("arm operation cancelled")
@@ -189,6 +207,8 @@ class ArmProcess:
                     if reply is not None and (
                         self.fault or not isinstance(reply, (OperationCancelled, TimeoutError))
                     ):
+                        if self.fault:
+                            raise self._read_fault() from reply
                         raise RobotError("arm operation also failed") from reply
                 self.wait_stopped(deadline=cleanup_until)
             except BaseException as cleanup_error:
@@ -224,39 +244,38 @@ class ArmProcess:
         if self.process is not None and self.process.is_alive():
             if not self.io.stopped.wait(max(0, deadline - time.monotonic())):
                 raise TimeoutError("arm stop unresolved; SDK acceptance not confirmed")
-        elif self.process is not None and (
-            self.process.exitcode not in (None, 0)
-            or self.process.exitcode == 0 and not self.io.stopped.is_set()
-        ):
-            raise RobotError(f"arm owner exited without confirming stop: {self.process.exitcode}")
-        if self.io.close_error.value:
-            raise RobotError(self.io.close_error.value.decode(errors="replace"))
-        issue = self.fault
-        if issue:
-            raise RobotError(f"xArm controller fault: {issue}")
+        error = self._read_close_error()
+        if error is not None:
+            raise error
+        self.check_error()
 
     def close(self):
         self.request_stop()
         self.io.closing.set()
         errors: list[BaseException] = []
+        reported_fault = self._fault_error
+        reported_close_error = str(self._close_error) if self._close_error is not None else None
         if self.process is not None and self.process.pid is not None:
             try:
                 self.process.join(EXECUTOR_TIMEOUT_S)
             except BaseException as exc:
                 errors.append(exc)
-        # SDK 可在 join 期间才返回故障；最终事实必须在等待之后读取。
-        if self.fault:
-            errors.insert(0, RobotError(f"xArm controller fault: {self.fault}"))
-        if self.io.close_error.value:
-            errors.append(RobotError(self.io.close_error.value.decode(errors="replace")))
+        # join 后保留晚到故障；已上报的运行故障不再冒充一次关闭失败。
+        fault, close_error = self._read_fault(), self._read_close_error()
+        if fault is not None and fault is not reported_fault:
+            errors.insert(0, fault)
+        if close_error is not None and str(close_error) != reported_close_error:
+            errors.append(close_error)
         alive = self.process is not None and self.process.is_alive()
         if alive:
             errors.append(TimeoutError("arm owner process still active; stop/disconnect unresolved"))
         else:
-            if self.process is not None and self.process.exitcode not in (None, 0):
-                errors.append(RobotError(f"arm owner exited: {self.process.exitcode}"))
-            if self.process is not None and self.process.pid is not None and not self.io.stopped.is_set():
-                errors.append(RobotError("arm owner exited without confirming stop"))
+            # 无 SDK fault 的异常退出已由 _read_fault 报告；有主错时保留独立退出失败。
+            if self.fault and self.process is not None and self.process.pid is not None:
+                if self.process.exitcode != 0:
+                    errors.append(RobotError(f"arm owner exited: {self.process.exitcode}"))
+                elif not self.io.stopped.is_set():
+                    errors.append(RobotError("arm owner exited without confirming stop"))
             # 活着的 owner 保留管道；确认退出后尝试关闭全部端点。
             for pipe in (self.child_pipe, self.pipe):
                 try:

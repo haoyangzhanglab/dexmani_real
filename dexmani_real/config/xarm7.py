@@ -9,7 +9,9 @@ import numpy as np
 
 from dexmani_real.robot.model import ARM_DOF, XARM7_HARD_LOWER, XARM7_HARD_UPPER
 
-SDK_TIMEOUT_S = 0.020
+# 低频命令允许较慢回复；set_state 内还会查询状态，需给 3 s 停止等待留余量。
+SDK_TIMEOUT_S = 1.0
+SDK_STREAM_TIMEOUT_S = 0.020
 EXECUTOR_TIMEOUT_S = 3.0
 HOME_TARGET_TIMEOUT_S = 0.5
 HOME_DWELL_S = 0.30

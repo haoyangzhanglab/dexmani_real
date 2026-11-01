@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""通过 VR 控制 xArm7/XHand，并将示教录制为 Raw episode。"""
+"""
+    通过 VR 控制 xArm7/XHand，并将示教录制为 Raw episode。
+    python scripts/collect_teleop.py pnp_apple_banana
+"""
 
 from __future__ import annotations
 

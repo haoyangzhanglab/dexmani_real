@@ -20,6 +20,8 @@ from dexmani_real.robot.xarm7 import process as arm_process
 from dexmani_real.robot.xhand.driver import (
     COMMUNICATION_CRC_ERROR_CODE,
     DISTRIBUTED_FORCE_UNAVAILABLE_CODE,
+    OVERCURRENT_BOARD_CODE,
+    OVERCURRENT_WARNING_CODE,
     XHand,
     XHandError,
 )
@@ -155,13 +157,102 @@ class XHandTests(unittest.TestCase):
         self.control.close_device.assert_called_once()
 
     def test_initial_sdk_fault_is_not_retried(self):
-        self.control.read_state.return_value = reply(1_501_035), self.raw
+        self.control.read_state.return_value = reply(1_501_034), self.raw
         with self.assertRaises(XHandError) as captured:
             self.hand.connect()
-        self.assertEqual(captured.exception.code, 1_501_035)
+        self.assertEqual(captured.exception.code, 1_501_034)
         self.control.read_state.assert_called_once()
         self.clock.sleep.assert_not_called()
         self.control.close_device.assert_called_once()
+
+    def test_initial_overcurrent_is_warning_and_preserves_feedback(self):
+        self.control.open_serial.return_value = reply(OVERCURRENT_WARNING_CODE)
+        self.control.read_state.return_value = reply(OVERCURRENT_WARNING_CODE), self.raw
+        self.raw.finger_state[4].jonitboard_err = OVERCURRENT_BOARD_CODE
+        with self.assertLogs("dexmani_real.robot.xhand.driver", level="WARNING") as logs:
+            state = self.hand.connect()
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("1501035", logs.output[0])
+        self.assertTrue(self.hand.is_connected)
+        np.testing.assert_array_equal(state.qpos, self.qpos)
+        self.assertIsNotNone(state.tactile_aggregate)
+        self.assertIsNotNone(state.tactile_dense)
+        self.control.close_device.assert_not_called()
+
+    def test_overcurrent_feedback_uses_board_and_tactile_status(self):
+        self.hand.connect()
+        self.raw.finger_state[4].jonitboard_err = OVERCURRENT_BOARD_CODE
+        with patch("dexmani_real.robot.xhand.driver.logger") as log:
+            for comm_type in ("serial", "ethercat"):
+                self.hand.cfg = replace(self.hand.cfg, comm_type=comm_type)
+                for code in (0, OVERCURRENT_WARNING_CODE):
+                    with self.subTest(comm_type=comm_type, code=code):
+                        self.control.read_state.return_value = reply(code), self.raw
+                        self.raw.finger_state[5].tipboard_err = 0
+                        state = self.hand.get_state()
+                        np.testing.assert_array_equal(state.qpos, self.qpos)
+                        self.assertIsNotNone(state.tactile_aggregate)
+                        self.assertIsNotNone(state.tactile_dense)
+                        self.raw.finger_state[5].tipboard_err = 201
+                        self.assertIsNone(self.hand.get_state().tactile_dense)
+        self.assertIn("joints=[4]", str(log.warning.call_args_list[0]))
+
+    def test_overcurrent_does_not_hide_other_faults_or_invalid_feedback(self):
+        self.hand.connect()
+        self.control.read_state.return_value = reply(OVERCURRENT_WARNING_CODE), self.raw
+        self.raw.finger_state[4].jonitboard_err = OVERCURRENT_BOARD_CODE
+        for field, value in (("commboard_err", 308), ("jonitboard_err", 103), ("position", np.nan)):
+            with self.subTest(field=field):
+                joint = self.raw.finger_state[6]
+                previous = getattr(joint, field)
+                setattr(joint, field, value)
+                with self.assertRaisesRegex(XHandError, "invalid joint payload"):
+                    self.hand.get_state()
+                setattr(joint, field, previous)
+        self.control.read_state.return_value = reply(OVERCURRENT_WARNING_CODE), None
+        with self.assertRaisesRegex(XHandError, "missing state payload"):
+            self.hand.get_state()
+
+    def test_overcurrent_keeps_robot_running_and_feedback_fresh(self):
+        epoch = self.connect_robot()
+        self.robot.prepare_streaming(epoch)
+        self.state.begin_motion()
+        self.control.send_command.return_value = reply(OVERCURRENT_WARNING_CODE)
+        self.control.read_state.return_value = reply(OVERCURRENT_WARNING_CODE), self.raw
+        self.raw.finger_state[4].jonitboard_err = OVERCURRENT_BOARD_CODE
+        with self.assertLogs("dexmani_real.robot.xhand.driver", level="WARNING") as logs:
+            for _ in range(25):
+                self.robot.send_action(RobotCommand(epoch, hand_qpos=self.qpos),
+                                       expires_ns=self.clock.now_ns + 1_000_000_000)
+                self.clock.advance(.05)
+                self.robot.service_feedback()
+                self.robot.check_run(epoch)
+            self.assertFalse(self.state.stop_signal.is_set())
+            self.robot.stop()
+            self.robot.check()
+        self.assertEqual(len(logs.output), 2)  # 持续过流 1.25 秒，读写共享每秒一条告警。
+        self.assertEqual(self.control.send_command.call_count, 26)
+        self.assertFalse(self.robot.stop_required)
+        self.assertIsNone(self.robot.stop_failure)
+        self.assertEqual(self.state.run_ended_reason, RunEndReason.NONE)
+        feedback = self.robot.hand_feedback.snapshot()
+        for field in ("timestamp_ns", "tactile_aggregate_timestamp_ns", "tactile_dense_timestamp_ns"):
+            self.assertEqual(feedback[field][0], self.clock.now_ns)
+
+    def test_overcurrent_during_reset_and_ethercat_init_only_warns(self):
+        self.hand.connect()
+        self.control.reset_sensor.return_value = reply(OVERCURRENT_WARNING_CODE)
+        with self.assertLogs("dexmani_real.robot.xhand.driver", level="WARNING"):
+            self.hand.reset_tactile_sensors()
+        self.assertEqual(self.control.reset_sensor.call_count, 5)
+        self.assertEqual(self.hand.get_tactile_reset_metadata()["hand_tactile_reset_result"],
+                         "sdk_completed (5/5)")
+        self.hand.cfg = replace(self.hand.cfg, ethercat_slave_position=0)
+        self.control.set_firmware_state.return_value = reply(OVERCURRENT_WARNING_CODE), None
+        self.clock.advance(1)
+        with self.assertLogs("dexmani_real.robot.xhand.driver", level="WARNING"):
+            self.hand.request_ethercat_init()
+        self.control.set_firmware_state.assert_called_once()
 
     def test_source_time_precedes_blocking_sdk_read(self):
         start = self.clock.now_ns
@@ -288,7 +379,7 @@ class XHandTests(unittest.TestCase):
 
     def test_failed_stop_does_not_skip_next_attempt_or_clear_fault(self):
         self.connect_robot()
-        self.control.send_command.return_value = reply(1_501_035)
+        self.control.send_command.return_value = reply(1_501_034)
         with self.assertRaises(XHandError) as stopped:
             self.robot.stop()
         self.assertTrue(self.robot.stop_required)
@@ -298,6 +389,10 @@ class XHandTests(unittest.TestCase):
         with self.assertRaises(XHandError) as checked:
             self.robot.check()
         self.assertIs(checked.exception, stopped.exception)
+        self.robot.close()  # 已上报的停止故障不再伪装成本次关闭失败。
+        with self.assertRaises(XHandError) as checked_after_close:
+            self.robot.check()
+        self.assertIs(checked_after_close.exception, stopped.exception)
 
     def test_home_crc_stops_without_waiting_for_convergence(self):
         epoch = self.connect_robot()

@@ -116,7 +116,7 @@ def run_replay(
         except BaseException as exc:
             shutdown_failure = True
             outcome.errors.append(exc)
-            logger.exception("replay shutdown failed")
+            logger.error("replay shutdown failed: %s", error_detail("shutdown", exc)["message"])
             if isinstance(exc, KeyboardInterrupt):
                 runtime_state.request_emergency_stop()
         if outcome.status == ReplayStatus.FAULT or runtime_state.error_state or shutdown_failure:

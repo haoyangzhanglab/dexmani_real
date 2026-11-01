@@ -28,7 +28,9 @@ class ArmTrajectory:
         self.input.current_position = validate_arm_target(q, self.lower, self.upper).tolist()
         if np.any(np.abs(v) > cfg.max_joint_velocity_rad_per_s + 1e-8):
             raise ValueError("initial arm velocity exceeds limit")
-        self.input.current_velocity = v.tolist()
+        # SDK 停稳反馈仍有浮点残差；仅初始化时清理 <1e-12 rad/s 的噪声，
+        # 避免同位目标触发 Ruckig 的近零时长同步退化。
+        self.input.current_velocity = np.where(np.abs(v) < 1e-12, 0.0, v).tolist()
         self.input.target_position = self.input.current_position
 
     def step(self, goal: np.ndarray | None = None, *, hold: bool = False) -> np.ndarray:

@@ -1,6 +1,5 @@
 """父进程独占手部 I/O，机械臂 SDK 由子进程持有。"""
 
-import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -29,9 +28,6 @@ FEEDBACK_PERIOD_NS = round(1e9 / 30)
 if TYPE_CHECKING:
     from dexmani_real.robot.xarm7.process import ArmProcess
     from dexmani_real.robot.xhand.driver import XHand
-
-logger = logging.getLogger(__name__)
-
 
 @dataclass(frozen=True)
 class RobotState:
@@ -365,8 +361,6 @@ class Robot:
         if errors:
             # 本次会话保留停止故障；后续收尾成功也不能把运行伪装成正常结束。
             self.stop_failure = self.stop_failure or errors[0]
-            for error in errors[1:]:
-                logger.error("additional robot stop failure", exc_info=(type(error), error, error.__traceback__))
             attach_cleanup_errors(self.stop_failure, (("robot_stop", error) for error in errors))
             raise self.stop_failure
         self.stop_required = False
@@ -385,7 +379,8 @@ class Robot:
             return
         # 共用 stop 先通知 arm；owner 退出后的最终故障也由 close 带回。
         self.stop_signal.set()
-        errors = [self.stop_failure] if self.stop_failure is not None else []
+        # stop_failure 已由 stop/check 上报；这里仅收集本次关闭产生的失败。
+        errors = []
         try:
             self.stop_hand(passive=True)
         except BaseException as exc:
@@ -411,7 +406,5 @@ class Robot:
         self.connected = False
         self.stop_required = self.arm is not None or self.hand is not None
         if errors:
-            for error in errors[1:]:
-                logger.error("additional robot close failure", exc_info=(type(error), error, error.__traceback__))
             attach_cleanup_errors(errors[0], (("robot_close", error) for error in errors[1:]))
             raise errors[0]

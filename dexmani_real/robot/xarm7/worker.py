@@ -194,15 +194,14 @@ class ArmController:
         try:
             self.driver.stop()
         except BaseException as exc:
-            if not self.io.close_error.value:
-                self.io.close_error.value = f"stop SDK failure: {exc}".encode()[:1023]
             if self.io.fault.value:
+                self.io.close_error.value = f"stop SDK failure: {exc}".encode()[:1023]
                 logger.exception("arm stop also failed")
             self.fault(exc)
         finally:
             self.io.take_goal()
             self.io.publish_status(self.status)
-            self.io.stopped.set()  # 处理结束；停止失败仍保存在 close_error。
+            self.io.stopped.set()  # 处理结束；停止失败仍保存在 fault/close_error。
 
     def operation(self, message: PrepareRequest | HomeRequest):
         kind = "home" if isinstance(message, HomeRequest) else "prepare"

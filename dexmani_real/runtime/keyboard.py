@@ -83,8 +83,8 @@ class Keyboard:
                 self.held_keys.remove(name)
                 return
 
-        # 不持 Condition 读取代际；快停止键不等待代际快照。
-        run_id = self.get_run_id() if name in {"b", "h", "r", "t"} else None
+        # 不持 Condition 读取代际；C 的快照用于继续时拒绝陈旧意图。
+        run_id = self.get_run_id() if name in {"b", "c", "h", "r", "t"} else None
         # 停止回调先撤销权限，再发布按下事件；回调不执行 SDK I/O。
         callback = self.bindings.get(name)
         if callback is not None:

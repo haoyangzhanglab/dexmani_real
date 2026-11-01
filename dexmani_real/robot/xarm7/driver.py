@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from dexmani_real.config.xarm7 import (
+    SDK_STREAM_TIMEOUT_S,
     SDK_TIMEOUT_S,
     ArmConfig,
 )
@@ -82,8 +83,12 @@ class XArm7:
 
     def read(self) -> tuple[np.ndarray, np.ndarray]:
         # real 上报没有错误码，且 SDK 的关节读取会将控制器错误标志归一化为成功。
-        self.check_controller_error()
-        code, states = self.api.get_joint_states(is_radian=True, num=2)
+        self.api.set_timeout(SDK_STREAM_TIMEOUT_S)
+        try:
+            self.check_controller_error()
+            code, states = self.api.get_joint_states(is_radian=True, num=2)
+        finally:
+            self.api.set_timeout(SDK_TIMEOUT_S)
         check_sdk_return_code(code, "get_joint_states")
         if not isinstance(states, (list, tuple)) or len(states) != 2:
             raise RuntimeError("get_joint_states(num=2) must return position and velocity")
@@ -99,7 +104,11 @@ class XArm7:
         """Mode 1 只发送采样参考，SDK 速度参数不负责轨迹规划。"""
         if self.api.mode != 1 or self.api.state not in (0, 1, 2):
             raise RuntimeError("xArm is not in streaming mode/state")
-        code = self.api.set_servo_angle_j(angles=qpos.tolist(), is_radian=True)
+        self.api.set_timeout(SDK_STREAM_TIMEOUT_S)
+        try:
+            code = self.api.set_servo_angle_j(angles=qpos.tolist(), is_radian=True)
+        finally:
+            self.api.set_timeout(SDK_TIMEOUT_S)
         check_sdk_return_code(code, "servo")
 
     def move_home_milestone(self, target: np.ndarray) -> None:
