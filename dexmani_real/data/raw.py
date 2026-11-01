@@ -496,14 +496,17 @@ class RawReader:
     def close(self):
         self.dataset_cache.clear()
         errors = []
-        for stage, resource in (
-            ("video_reader_close", self.video_container), ("hdf5_reader_close", self.data_file),
+        for attribute, stage in (
+            ("video_container", "video_reader_close"), ("data_file", "hdf5_reader_close"),
         ):
+            resource = getattr(self, attribute)
             if resource is not None:
                 try:
                     resource.close()
                 except BaseException as exc:
                     errors.append((stage, exc))
+                else:
+                    setattr(self, attribute, None)
         if errors:
             first = errors[0][1]
             setattr(first, "cleanup_errors", [*getattr(first, "cleanup_errors", ()), *errors[1:]])

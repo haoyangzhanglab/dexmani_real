@@ -45,7 +45,6 @@ class EpisodeRecorder:
         self.is_recording = False
         self.start_attempted = False
         self.finish_request = None
-        self.stop_deadline = None
         self.staging_path: Path | None = None
         self.published_path: Path | None = None
         self.submitted_frames = 0
@@ -176,10 +175,8 @@ class EpisodeRecorder:
             reason, tuple(dict(item) for item in (details or ())), technical_status,
         )
         # START 只报错；外层先停止设备，再由首次 finish 建立等待预算。
-        self.stop_deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
-        if deadline is not None:
-            self.stop_deadline = min(self.stop_deadline, deadline)
-        deadline = self.stop_deadline
+        stop_deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
+        deadline = stop_deadline if deadline is None else min(stop_deadline, deadline)
         try:
             if was_recording and self.writer_pending and self.error is None:
                 self.queue.put(request, timeout=max(0.0, deadline - time.monotonic()))
