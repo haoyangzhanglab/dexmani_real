@@ -44,21 +44,20 @@ def _home_motion(state, robot):
                 logger.exception("HOME cleanup also failed")
 
 
-def home_robot(state, robot, planner, *, cancel_requested):
+def home_robot(state, robot, planner, *, run_id, cancel_requested):
     # send_hand_home 自己完成整机停止边界，arm HOME 由 owner 停稳准备。
-    home_hand(state, robot, cancel_requested=cancel_requested)
-    home_arm(state, robot, planner, cancel_requested=cancel_requested)
+    home_hand(state, robot, run_id=run_id, cancel_requested=cancel_requested)
+    home_arm(state, robot, planner, run_id=run_id, cancel_requested=cancel_requested)
 
 
-def initialize_hand(state, robot, *, required_tactile, cancel_requested):
+def initialize_hand(state, robot, *, run_id, required_tactile, cancel_requested):
     """确认手部 HOME；只有实际消费者需要触觉时才 reset 并等待对应通道。"""
     if not robot.hand_config.enabled:
         return
-    home_hand(state, robot, cancel_requested=cancel_requested)
+    home_hand(state, robot, run_id=run_id, cancel_requested=cancel_requested)
     if not required_tactile:
         return
     logger.info("手部 HOME 已到位，正在请求触觉复位，请保持手部无接触。")
-    run_id = state.run_id
 
     def cancelled():
         return cancel_requested() or not state.can_move(
@@ -68,7 +67,7 @@ def initialize_hand(state, robot, *, required_tactile, cancel_requested):
     if cancelled():
         raise OperationCancelled("hand initialization interrupted")
     if not robot.reset_tactile_sensors(
-        cancel_requested=cancelled, required_tactile=required_tactile,
+        run_id=run_id, cancel_requested=cancelled, required_tactile=required_tactile,
     ):
         raise RobotError("tactile reset request failed")
     if cancelled():
@@ -76,12 +75,11 @@ def initialize_hand(state, robot, *, required_tactile, cancel_requested):
     logger.info("触觉复位请求已完成，所需通道反馈已就绪。")
 
 
-def home_arm(state, robot, planner, *, cancel_requested):
+def home_arm(state, robot, planner, *, run_id, cancel_requested):
     config, hand = robot.arm_config, robot.hand_config
     target = np.asarray(config.home_qpos, dtype=np.float64)
     if state.safety_state != SafetyState.ARMED:
         raise OperationCancelled("home requires ARMED")
-    run_id = state.run_id
     boundary_ns = time.monotonic_ns()
 
     def cancelled():
@@ -144,13 +142,12 @@ def home_arm(state, robot, planner, *, cancel_requested):
         )
 
 
-def home_hand(state, robot, *, cancel_requested):
+def home_hand(state, robot, *, run_id, cancel_requested):
     hand = robot.hand_config
     if not hand.enabled:
         return
     if state.safety_state != SafetyState.ARMED:
         raise OperationCancelled("hand home requires ARMED")
-    run_id = state.run_id
     target = np.deg2rad(hand.home_qpos_deg)
     deadline = time.monotonic_ns() + int(hand.home_timeout_s * 1e9)
     tolerance = np.deg2rad(hand.home_tolerance_deg)

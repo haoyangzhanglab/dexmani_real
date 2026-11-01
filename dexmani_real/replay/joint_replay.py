@@ -58,8 +58,8 @@ class JointReplay:
         self.keyboard = keyboard
         self.robot = robot
 
-    def run(self, trajectory, *, hand_start_duration_s):
-        self.epoch = self.runtime_state.run_id
+    def run(self, trajectory, *, run_id, hand_start_duration_s):
+        self.epoch = run_id
         self.capture = ReplayBuffer(len(trajectory))
         self.action_mapper = ActionMapper.for_mode(
             "joint",
@@ -84,7 +84,7 @@ class JointReplay:
                     if result.status == ReplayStatus.COMPLETED:
                         result.status, result.reason = self.replay_rows(trajectory, period_ns)
             except OperationCancelled as exc:
-                self.robot.check()
+                self.robot.check(cancellation=exc)
                 result.status = (
                     ReplayStatus.USER_QUIT if self.runtime_state.quit_requested else ReplayStatus.REJECTED
                 )
@@ -201,11 +201,12 @@ class JointReplay:
         while True:
             self.robot.service_feedback()
             signals = self.keyboard.poll(timeout=0)
+            keys = {event.key for event in signals}
             if self.runtime_state.estop_request:
                 return ReplayStatus.ESTOP, "operator emergency stop"
             if self.runtime_state.error_state:
                 return ReplayStatus.FAULT, "runtime failure"
-            if self.runtime_state.quit_requested or "q" in signals:
+            if self.runtime_state.quit_requested or "q" in keys:
                 return ReplayStatus.USER_QUIT, "operator quit"
             if self.runtime_state.run_id != self.epoch:
                 cause = self.runtime_state.run_ended_reason

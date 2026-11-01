@@ -41,6 +41,7 @@ class KeyboardTeleop:
         )
 
         self.keys = Keyboard(
+            get_run_id=lambda: self.runtime_state.run_id,
             estop_callback=self.runtime_state.request_emergency_stop,
             bindings={'q': self.runtime_state.request_quit},
         )
@@ -48,15 +49,16 @@ class KeyboardTeleop:
         clean = False
         shutdown_clean = False
         try:
-            self.start()
-            clean = self.run_control_loop()
+            try:
+                self.start()
+                clean = self.run_control_loop()
+            except OperationCancelled as exc:
+                self.robot.check(cancellation=exc)
+                logger.info("Keyboard teleop cancelled: %s", exc)
+                clean = bool(self.runtime_state.quit_requested)
         except KeyboardInterrupt:
             self.runtime_state.request_emergency_stop()
             raise
-        except OperationCancelled as exc:
-            self.robot.check()
-            logger.info("Keyboard teleop cancelled: %s", exc)
-            clean = bool(self.runtime_state.quit_requested)
         except Exception as exc:
             self.runtime_state.mark_error()
             self.runtime_state.revoke_motion(
@@ -123,8 +125,9 @@ class KeyboardTeleop:
             if self.runtime_state.quit_requested or self.keys.is_pressed("q"):
                 return True
 
-            if "r" in events:
-                self.run_home()
+            home_event = next((event for event in events if event.key == "r"), None)
+            if home_event is not None:
+                self.run_home(home_event.run_id)
                 continue
             self.jog.step(
                 self.robot, self.keys, self.runtime_state, self.runtime,
@@ -133,20 +136,34 @@ class KeyboardTeleop:
             self.tick_due_ns = next_tick_ns(self.tick_due_ns, self.period_ns, time.monotonic_ns())
         return bool(self.runtime_state.quit_requested)
 
-    def run_home(self):
+    def run_home(self, expected_run_id):
+        with self.runtime_state.motion_lock:
+            if (
+                expected_run_id != self.runtime_state.run_id
+                or not self.runtime_state.requests_allow_motion()
+            ):
+                logger.info("Ignored revoked HOME intent")
+                return
+            self.runtime_state.revoke_motion()
+            run_id = self.runtime_state.run_id
         logger.info("Returning home...")
-        self.jog.stop(self.robot, self.runtime_state)
+        try:
+            self.robot.stop()
+        finally:
+            self.jog.clear_reference()
 
         def cancelled():
             self.robot.check()
-            return bool(self.runtime_state.estop_request or self.runtime_state.quit_requested)
+            return not self.runtime_state.requests_allow_motion()
 
         try:
             home_robot(
                 self.runtime_state, self.robot, self.home_planner,
+                run_id=run_id,
                 cancel_requested=cancelled,
             )
         except OperationCancelled as exc:
+            self.robot.check(cancellation=exc)
             logger.info("HOME cancelled: %s", exc)
         self.keys.discard_events("r")
         self.tick_due_ns = time.monotonic_ns() + self.period_ns

@@ -118,6 +118,7 @@ def run_teleop(
             check_services=sensors.check,
         )
         keyboard = Keyboard(
+            get_run_id=lambda: runtime_state.run_id,
             estop_callback=runtime_state.request_emergency_stop,
             bindings={
                 "s": runtime_state.request_stop,
@@ -166,22 +167,35 @@ def run_teleop(
                 camera_calibration_path,
             )
         robot.check()
-        runtime_state.arm()
+        with runtime_state.motion_lock:
+            runtime_state.arm()
+            startup_run_id = runtime_state.run_id
         if initialize_teleop(
-            loop, ctx.Process(name="vr", target=run_vr, args=(channels, runtime.vr))
+            loop, ctx.Process(name="vr", target=run_vr, args=(channels, runtime.vr)),
+            run_id=startup_run_id,
         ):
             loop.run()
         clean = bool(runtime_state.quit_requested)
     except KeyboardInterrupt:
         runtime_state.request_emergency_stop()
-    except OperationCancelled:
-        if runtime_state.stop_signal.is_set() or runtime_state.quit_requested or runtime_state.estop_request:
+    except OperationCancelled as exc:
+        try:
+            if robot is not None:
+                robot.check(cancellation=exc)
+            if not (
+                runtime_state.stop_signal.is_set() or runtime_state.quit_requested
+                or runtime_state.estop_request
+            ):
+                raise
+        except Exception as failure:
+            runtime_state.mark_error()
+            if loop is not None:
+                loop.record_error("cancellation", failure)
+            logger.exception("teleop cancellation also failed")
+        else:
             runtime_state.request_quit()
             clean = True
             logger.info("Teleop startup cancelled")
-        else:
-            runtime_state.mark_error()
-            logger.exception("teleop operation cancelled without a stop request")
     except Exception:
         runtime_state.mark_error()
         logger.exception("teleop session failed")
@@ -204,11 +218,12 @@ def run_teleop(
     )
 
 
-def initialize_teleop(loop, vr_process) -> bool:
+def initialize_teleop(loop, vr_process, *, run_id) -> bool:
     # 自动复位前，键盘停止回调已经生效。
     initialize_hand(
         loop.runtime_state,
         loop.robot,
+        run_id=run_id,
         required_tactile=loop.needs.required_tactile,
         cancel_requested=loop.poll_blocking_commands,
     )

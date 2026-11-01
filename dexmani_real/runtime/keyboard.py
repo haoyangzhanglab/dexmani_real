@@ -7,6 +7,8 @@ import sys
 import termios
 import threading
 from collections import deque
+from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -18,6 +20,12 @@ JOG_KEY_PAIRS = (
     ("left", "right"), ("i", "k"), ("j", "l"),
 )
 CARTESIAN_JOG_KEYS = frozenset(key for pair in JOG_KEY_PAIRS for key in pair)
+
+
+@dataclass(frozen=True)
+class KeyEvent:
+    key: str
+    run_id: int | None = None
 
 
 def suppress_terminal_echo():
@@ -37,8 +45,9 @@ def restore_terminal_echo(saved):
 
 
 class Keyboard:
-    def __init__(self, *, bindings=None, estop_callback=None):
-        self.events: deque[str] = deque()
+    def __init__(self, *, get_run_id: Callable[[], int], bindings=None, estop_callback=None):
+        self.events: deque[KeyEvent] = deque()
+        self.get_run_id = get_run_id
         self.held_keys: set[str] = set()
         self.condition = threading.Condition(threading.Lock())
         self.listener: Any = None
@@ -61,7 +70,7 @@ class Keyboard:
         finally:
             with self.condition:
                 if self.active:
-                    self.events.append("esc")
+                    self.events.append(KeyEvent("esc"))
                     self.condition.notify()
 
     def handle_key(self, name, pressed):
@@ -75,6 +84,8 @@ class Keyboard:
                 self.held_keys.remove(name)
                 return
 
+        # 不持 Condition 读取代际；快停止键不等待代际快照。
+        run_id = self.get_run_id() if name in {"b", "h", "r", "t"} else None
         # 停止回调先撤销权限，再发布按下事件；回调不执行 SDK I/O。
         callback = self.bindings.get(name)
         if callback is not None:
@@ -83,7 +94,7 @@ class Keyboard:
             if not self.active:
                 return
             self.held_keys.add(name)
-            self.events.append(name)
+            self.events.append(KeyEvent(name, run_id))
             self.condition.notify()
 
     def callbacks(self, keyboard):
@@ -162,7 +173,7 @@ class Keyboard:
             restore_terminal_echo(self.saved_termios)
             self.saved_termios = None
 
-    def poll(self, timeout=0.05) -> list[str]:
+    def poll(self, timeout=0.05) -> list[KeyEvent]:
         if self.active and not self.check_health():
             timeout = 0
         with self.condition:
@@ -195,4 +206,4 @@ class Keyboard:
 
     def discard_events(self, *keys):
         with self.condition:
-            self.events = deque(key for key in self.events if key not in keys)
+            self.events = deque(event for event in self.events if event.key not in keys)

@@ -69,14 +69,27 @@ class Robot:
         if self.owner != threading.get_ident():
             raise RuntimeError("robot I/O belongs to its connecting thread")
 
-    def check(self):
-        self.check_owner()
-        if self.check_services is not None and not self.check_services():
-            raise RobotError("required runtime service unavailable")
-        if self.arm is not None:
-            self.arm.check_error()
+    def check(self, *, cancellation=None):
+        try:
+            self.check_owner()
+            if self.arm is not None:
+                self.arm.check_error()
+            if self.stop_failure is not None:
+                raise RobotError("previous robot stop remains unresolved") from self.stop_failure
+            if self.check_services is not None and not self.check_services():
+                raise RobotError("required runtime service unavailable")
+        except BaseException as failure:
+            if cancellation is not None:
+                setattr(failure, "cleanup_errors", [
+                    *getattr(failure, "cleanup_errors", ()), ("cancelled_operation", cancellation),
+                ])
+            raise
+        if cancellation is not None and getattr(cancellation, "cleanup_errors", ()):
+            raise cancellation
 
     def check_run(self, run_id, *, expires_ns=None):
+        # stop 与 fault 可以同时到达；不能先把真实失败分类为取消。
+        self.check()
         if self.stop_signal.is_set() or self.emergency_signal.is_set():
             raise OperationCancelled("device operation cancelled")
         lock = self.run_signal.get_lock()
@@ -131,14 +144,12 @@ class Robot:
             deadline_ns = self.hand.connect(cancel_requested=cancelled)
         self.connected = True
         self.reset_hand_feedback(deadline_ns=deadline_ns)
-        self.read_initial_state(cancel_requested=cancelled)
+        self.read_initial_state(run_id, cancel_requested=cancelled)
 
-    def reset_tactile_sensors(self, *, cancel_requested, required_tactile=()):
+    def reset_tactile_sensors(self, *, run_id, cancel_requested, required_tactile=()):
         self.check()
         if self.hand is None:
             return False
-        self.stop()
-        run_id = self.run_signal.value
 
         def cancelled():
             self.check()
@@ -148,12 +159,19 @@ class Robot:
                 or self.emergency_signal.is_set()
             )
 
+        if cancelled():
+            raise OperationCancelled("tactile reset cancelled before stopping")
+        self.stop()
         try:
             reset = self.hand.reset_tactile_sensors(cancel_requested=cancelled)
         finally:
             self.reset_hand_feedback()
         if reset:
-            self.read_initial_state(required_tactile=required_tactile, cancel_requested=cancelled)
+            self.read_initial_state(
+                run_id, required_tactile=required_tactile, cancel_requested=cancelled,
+            )
+        if cancelled():
+            raise OperationCancelled("tactile reset cancelled")
         return reset
 
     def reset_hand_feedback(self, *, deadline_ns=None):
@@ -199,9 +217,8 @@ class Robot:
             self.stop_signal.set()
             raise
 
-    def read_initial_state(self, *, required_tactile=(), cancel_requested=None):
+    def read_initial_state(self, run_id, *, required_tactile=(), cancel_requested=None):
         self.check_owner()
-        run_id = self.run_signal.value
         deadline_ns = self.hand_feedback.initial_deadline_ns
         max_age_ns = int(self.hand_config.feedback_max_age_s * 1e9)
 

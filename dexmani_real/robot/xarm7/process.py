@@ -37,7 +37,10 @@ class ArmProcess:
 
     @property
     def is_connected(self):
-        return self.process is not None and self.process.is_alive() and self.io.connected.is_set()
+        return (
+            self.process is not None and self.process.is_alive()
+            and self.io.connected.is_set() and not self.io.closing.is_set()
+        )
 
     @property
     def fault(self):
@@ -53,6 +56,8 @@ class ArmProcess:
 
         def check_startup():
             # 故障也会设置 stop；仅无故障的退出可以按操作者取消处理。
+            if self.io.fault.value or self.io.close_error.value:
+                self.check_error()
             if not self.io.fault.value and (
                 self.io.run_id.value != run_id
                 or self.io.stop.is_set()
@@ -88,26 +93,35 @@ class ArmProcess:
 
     def check_error(self):
         issue = self.fault
-        if not issue and self.process is not None and not self.process.is_alive():
+        close_error = self.io.close_error.value.decode(errors="replace")
+        if close_error:
+            issue = f"{issue}; {close_error}" if issue else close_error
+        if not issue and self.process is not None and not self.process.is_alive() and not (
+            self.io.closing.is_set() and self.io.stopped.is_set() and self.process.exitcode == 0
+        ):
             issue = f"arm owner exited: {self.process.exitcode}"
-        if not issue and self.io.closing.is_set():
-            issue = "arm owner closing; lifecycle operation cannot be reused"
         if issue:
             raise RobotError(f"xArm controller fault: {issue}")
 
     def snapshot(self):
         self.check_error()
+        if not self.is_connected:
+            raise RuntimeError("arm unavailable for feedback snapshot")
         status = self.io.read_status(timeout_s=self.cfg.feedback_max_age_s)
         frame = status.reshape(1)
         frame.flags.writeable = False
         return frame
 
     def submit(self, command, *, expires_ns):
+        self.check_error()
+        if not self.is_connected:
+            raise RuntimeError("arm unavailable for target submission")
         self.io.publish_goal(command, expires_ns=expires_ns)
 
     def request_operation(self, request, *, service, abort, deadline_ns):
-        if not self.is_connected or self.io.closing.is_set():
-            raise RobotError("arm unavailable for lifecycle operation")
+        self.check_error()
+        if not self.is_connected:
+            raise RuntimeError("arm unavailable for lifecycle operation")
         service()
         if abort():
             raise OperationCancelled("arm operation cancelled before submission")
@@ -158,6 +172,8 @@ class ArmProcess:
 
     def begin_operation(self, run_id):
         self.check_error()
+        if not self.is_connected:
+            raise RuntimeError("arm unavailable for preparation")
         self.request_stop()
         self.wait_stopped()
         lock = self.io.run_id.get_lock()

@@ -13,7 +13,7 @@ from dexmani_real.runtime.home import home_robot
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
-from dexmani_real.runtime.state import SessionState
+from dexmani_real.runtime.state import SafetyState, SessionState
 from dexmani_real.utils.io import write_json
 from dexmani_real.utils.log import configure_logging, error_detail
 from dexmani_real.utils.table_plane import load_table_plane
@@ -63,6 +63,7 @@ def run_replay(
         )
 
         keyboard = Keyboard(
+            get_run_id=lambda: runtime_state.run_id,
             estop_callback=runtime_state.request_emergency_stop,
             bindings={'q': runtime_state.request_quit, 's': runtime_state.request_stop},
         )
@@ -75,9 +76,11 @@ def run_replay(
         robot.check_services = lambda: keyboard.check_health()
         robot.connect()
         robot.check()
-        runtime_state.arm()
+        with runtime_state.motion_lock:
+            runtime_state.arm()
+            run_id = runtime_state.run_id
         outcome = JointReplay(runtime_state, runtime, keyboard, robot=robot).run(
-            trajectory, hand_start_duration_s=hand_start_duration_s,
+            trajectory, run_id=run_id, hand_start_duration_s=hand_start_duration_s,
         )
         trajectory_status = outcome.status.value
         if outcome.successful:
@@ -85,11 +88,20 @@ def run_replay(
                 runtime_state, robot, keyboard, home_planner, outcome, summary["home_results"],
             )
     except OperationCancelled as exc:
-        outcome.status = (
-            ReplayStatus.ESTOP if runtime_state.estop_request else
-            ReplayStatus.USER_QUIT if runtime_state.quit_requested else ReplayStatus.REJECTED
-        )
-        outcome.reason = str(exc)
+        try:
+            if robot is not None:
+                robot.check(cancellation=exc)
+        except Exception as failure:
+            runtime_state.mark_error()
+            outcome.status = ReplayStatus.FAULT
+            outcome.reason = f"{type(failure).__name__}: {error_detail('cancellation', failure)['message']}"
+            logger.exception("replay cancellation also failed")
+        else:
+            outcome.status = (
+                ReplayStatus.ESTOP if runtime_state.estop_request else
+                ReplayStatus.USER_QUIT if runtime_state.quit_requested else ReplayStatus.REJECTED
+            )
+            outcome.reason = str(exc)
     except KeyboardInterrupt:
         runtime_state.request_emergency_stop()
         outcome.status, outcome.reason = ReplayStatus.ESTOP, "KeyboardInterrupt"
@@ -155,19 +167,27 @@ def wait_for_home(runtime_state, robot, keyboard, home_planner, outcome, home_re
         if runtime_state.error_state or runtime_state.estop_request:
             break
         signals = keyboard.poll(timeout=0.1)
-        if runtime_state.quit_requested or "q" in signals:
+        keys = {event.key for event in signals}
+        if runtime_state.quit_requested or "q" in keys:
             break
-        if "s" in signals:
+        if "s" in keys:
             continue
-        if "h" in signals:
+        home_event = next((event for event in signals if event.key == "h"), None)
+        if home_event is not None:
+            if not runtime_state.can_move(
+                run_id=home_event.run_id, required_safety_state=SafetyState.ARMED,
+            ):
+                continue
             try:
                 home_robot(
                     runtime_state,
                     robot,
                     home_planner,
+                    run_id=home_event.run_id,
                     cancel_requested=home_cancelled,
                 )
             except OperationCancelled as exc:
+                robot.check(cancellation=exc)
                 home_results.append(dict(ok=False, interrupted=True, reason=str(exc)))
                 if not (runtime_state.quit_requested or runtime_state.estop_request):
                     continue

@@ -87,9 +87,9 @@ class PolicySession:
             try:
                 self.prepare_resources()
                 self.start_devices()
-            except OperationCancelled:
+            except OperationCancelled as exc:
                 if self.robot is not None:
-                    self.robot.check()
+                    self.robot.check(cancellation=exc)
                 if self.runtime_state is None or not (
                     self.runtime_state.stop_signal.is_set() or self.runtime_state.quit_requested
                     or self.runtime_state.estop_request
@@ -133,6 +133,7 @@ class PolicySession:
             self.runtime.environment, self.runtime.arm, table_plane_abcd=self.table_plane_abcd,
         )
         self.keyboard = Keyboard(
+            get_run_id=lambda: self.runtime_state.run_id,
             estop_callback=self.runtime_state.request_emergency_stop,
             bindings={"s": self.request_stop, "d": self.request_discard, "q": self.request_quit},
         )
@@ -221,8 +222,10 @@ class PolicySession:
             if not self.runtime_state.requests_allow_motion():
                 raise OperationCancelled("startup cancelled before arming")
             self.runtime_state.arm()
+            startup_run_id = self.runtime_state.run_id
         initialize_hand(
-            self.runtime_state, self.robot, required_tactile=needs.required_tactile,
+            self.runtime_state, self.robot, run_id=startup_run_id,
+            required_tactile=needs.required_tactile,
             cancel_requested=self.home_abort_requested,
         )
         self.warmup_policy()
@@ -347,19 +350,21 @@ class PolicySession:
         )
 
     def handle_command_batch(self, signals, *, allow_tactile_reset=False) -> None:
-        if "esc" in signals:
+        keys = {event.key for event in signals}
+        if "esc" in keys:
             self.runtime_state.request_emergency_stop()
             return
-        if any(signal in {"s", "d", "q"} for signal in signals):
+        if keys.intersection({"s", "d", "q"}):
             logger.warning("operator: S/D/Q suppresses preparation commands in this batch")
             return
         preparation_blocked = False
-        for signal in signals:
+        for event in signals:
+            signal = event.key
             if signal == "b":
-                if preparation_blocked or not self.request_start():
+                if preparation_blocked or not self.request_start(event.run_id):
                     logger.warning("operator: ignored B while stopped or preparing")
             elif signal == "h":
-                if self.run_home():
+                if self.run_home(event.run_id):
                     return
             elif signal == "t":
                 if preparation_blocked:
@@ -368,24 +373,28 @@ class PolicySession:
                 if self.start_epoch is not None or not allow_tactile_reset:
                     logger.warning("T ignored: tactile reset requires idle without pending work")
                     continue
-                if self.runtime_state.safety_state != SafetyState.ARMED:
+                if not self.runtime_state.can_move(
+                    run_id=event.run_id, required_safety_state=SafetyState.ARMED,
+                ):
                     continue
                 try:
                     logger.info("正在复位触觉，请保持手部无接触；S/Q/Esc 可中断。")
                     self.robot.reset_tactile_sensors(
+                        run_id=event.run_id,
                         cancel_requested=self.home_abort_requested,
                         required_tactile=self.needs.required_tactile,
                     )
                 except OperationCancelled as exc:
+                    self.robot.check(cancellation=exc)
                     logger.info("%s", exc)
                 finally:
                     self.keyboard.discard_events("t", "h", "b")
                 return
 
-    def run_home(self) -> bool:
+    def run_home(self, run_id) -> bool:
         with self.runtime_state.motion_lock:
             home_allowed = self.episode is None and self.runtime_state.can_move(
-                run_id=self.runtime_state.run_id,
+                run_id=run_id,
                 required_safety_state=SafetyState.ARMED,
             )
             if home_allowed:
@@ -397,9 +406,11 @@ class PolicySession:
         try:
             home_robot(
                 self.runtime_state, self.robot, self.home_planner,
+                run_id=run_id,
                 cancel_requested=self.home_abort_requested,
             )
         except OperationCancelled as exc:
+            self.robot.check(cancellation=exc)
             logger.info("回初始位已中断：%s", exc)
         else:
             logger.info("已回初始位，按 B 开始。")
@@ -411,11 +422,10 @@ class PolicySession:
         self.robot.check()
         return not self.runtime_state.requests_allow_motion()
 
-    def request_start(self):
+    def request_start(self, epoch):
         with self.runtime_state.motion_lock:
             if self.episode is not None or self.model.has_pending_task:
                 return False
-            epoch = self.runtime_state.run_id
             if not self.runtime_state.can_move(
                 run_id=epoch, required_safety_state=SafetyState.ARMED,
             ):
