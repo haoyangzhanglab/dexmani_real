@@ -24,9 +24,9 @@ FINGER_FRAME_NAMES = (
 
 
 class AdaptiveHandRetargeter:
-    def __init__(self, config, hand_config, *, control_hz):
+    def __init__(self, config, hand_config):
         config.validate()
-        self.config, self.nominal_dt_s = config, 1.0 / control_hz
+        self.config = config
         self.fk = HandFK()
         self.limits = np.column_stack((hand_config.qpos_min_rad, hand_config.qpos_max_rad))
         model_limits = np.column_stack((
@@ -86,11 +86,12 @@ class AdaptiveHandRetargeter:
         if self.calibration is None or self.previous_command is None:
             raise RuntimeError("hand retargeting requires calibration and a measured reset pose")
         if timestamp_ns < self.command_timestamp_ns:
-            raise ValueError("hand observation time moved backwards")
-        # 同一控制时刻的首 tick 使用名义周期；其后基于最后实际提交参考。
-        dt_s = (timestamp_ns - self.command_timestamp_ns) * 1e-9 or self.nominal_dt_s
+            raise ValueError("hand computation time moved backwards")
+        dt_s = (timestamp_ns - self.command_timestamp_ns) * 1e-9
         self.rejection_reason = None
         self.last_diagnostics = {}
+        if dt_s == 0:
+            return self.previous_command.copy()
         try:
             points = prepare_landmarks(landmarks)
             targets = self.calibration.targets(

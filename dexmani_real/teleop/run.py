@@ -299,5 +299,5 @@ def build_hand_retargeter(runtime):
     from dexmani_real.teleop.retargeting.adaptive import AdaptiveHandRetargeter
 
     return AdaptiveHandRetargeter(
-        runtime.hand_retargeting, runtime.hand, control_hz=runtime.teleop.control_hz,
+        runtime.hand_retargeting, runtime.hand,
     )

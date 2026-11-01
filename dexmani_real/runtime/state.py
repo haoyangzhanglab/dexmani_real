@@ -109,16 +109,18 @@ class SessionState:
         reason=RunEndReason.EXECUTOR_BOUNDARY,
         expected_run_id=None,
     ) -> None:
-        with self.motion_lock:
-            if expected_run_id is not None and self.run_id != expected_run_id:
+        # 与设备准备/HOME 共用代际锁；始终先取得本地流程锁。
+        with self.motion_lock, self.run_signal.get_lock():
+            old_epoch = self.run_signal.get_obj().value
+            if expected_run_id is not None and old_epoch != expected_run_id:
                 return
             if self.safety_state == SafetyState.RUNNING:
                 if self.estop_request:
                     reason = RunEndReason.ESTOP
-                self.run_ended_id = self.run_id
+                self.run_ended_id = old_epoch
                 self.run_ended_reason = reason
+            self.run_signal.get_obj().value = old_epoch + 1
             self.stop_signal.set()
-            self.run_signal.value += 1
             self.safety_state = new_state
 
     def request_emergency_stop(self):

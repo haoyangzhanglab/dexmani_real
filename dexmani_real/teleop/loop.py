@@ -85,6 +85,8 @@ class TeleopLoop:
         self.discard_requested = False
         self.pending_termination_reason = None
         self.termination_details = []
+        self.soft_timeout_count = 0
+        self.last_soft_timeout = None
 
     @property
     def next_tick_ns(self):
@@ -121,6 +123,15 @@ class TeleopLoop:
             failure = exc
         self.controller.clear()
 
+        if self.soft_timeout_count:
+            summary = {
+                "stage": "soft_timeouts", "count": self.soft_timeout_count, "last": self.last_soft_timeout,
+            }
+            logger.info("Teleop soft timeouts: %s", summary)
+            if self.recorder is not None:
+                self.termination_details.append(summary)
+            self.soft_timeout_count = 0
+            self.last_soft_timeout = None
         try:
             self.finish_recording()
         except BaseException as exc:
@@ -211,6 +222,8 @@ class TeleopLoop:
         self.capture_failed = self.discard_requested = False
         self.pending_termination_reason = None
         self.termination_details = []
+        self.soft_timeout_count = 0
+        self.last_soft_timeout = None
         if self.preparation_interrupted():
             return
 
@@ -382,6 +395,13 @@ class TeleopLoop:
             timing["hand_retargeting"] = self.controller.hand_retargeter.last_diagnostics.copy()
         self.termination_details.append(timing)
 
+    def record_soft_timeout(self, stage, *, deadline_ns, observed_ns):
+        self.soft_timeout_count += 1
+        self.last_soft_timeout = {
+            "stage": stage, "tick": self.tick_index,
+            "deadline_ns": int(deadline_ns), "observed_ns": int(observed_ns),
+        }
+
     def execute_control_step(self, row, tick_end_ns):
         epoch = cast(int, self.run_id)
         command = None
@@ -405,11 +425,11 @@ class TeleopLoop:
                 self.recorder.check_error()
             if not self.runtime_state.can_move(run_id=epoch):
                 raise OperationCancelled("teleop cancelled before submission")
-            if time.monotonic_ns() >= tick_end_ns:
+            checked_ns = time.monotonic_ns()
+            if checked_ns >= tick_end_ns:
                 # 未发送的候选不推进滤波、关节或时间参考；下周期从最新输入继续。
-                self.record_control_timing(
-                    row, epoch, tick_end_ns, compute_start_ns, compute_end_ns,
-                    submit_start_ns, submit_end_ns,
+                self.record_soft_timeout(
+                    "compute", deadline_ns=tick_end_ns, observed_ns=checked_ns,
                 )
                 return
             command = RobotCommand(epoch, result.arm_qpos, result.hand_qpos)
@@ -419,12 +439,11 @@ class TeleopLoop:
                 expires_ns=submit_start_ns + int(self.runtime.teleop.vr_stale_threshold_s * 1e9),
             )
             submit_end_ns = time.monotonic_ns()
-            self.controller.commit(command, eef_pose=result.eef_pose, control_ns=compute_start_ns)
+            self.controller.commit(command, eef_pose=result.eef_pose, submit_end_ns=submit_end_ns)
             if self.tick_index == 1:
                 logger.info("Teleop first target submitted run=%s", epoch)
         except OperationCancelled as exc:
             # 取消不能掩盖同时发生的 SDK/worker 故障；排队的按键随后决定保存意图。
-            self.robot.check()
             self.poll_blocking_commands()
             if self.pending_termination_reason is None:
                 self.request_episode_end(f"control_interrupted: {exc}")
@@ -485,6 +504,9 @@ class TeleopLoop:
             self.tick_origin_ns = stamp
         if stamp >= self.next_tick_ns + self.control_dt_ns:
             # 本次复制已错过提交机会；不映射、不提交，下个未来时点重新读。
+            self.record_soft_timeout(
+                "observation", deadline_ns=self.next_tick_ns + self.control_dt_ns, observed_ns=stamp,
+            )
             self.tick_index += (stamp - self.next_tick_ns) // self.control_dt_ns + 1
             if self.recorder is not None:
                 self.recorder.append(row)
