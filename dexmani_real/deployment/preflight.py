@@ -47,12 +47,15 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
         if (
             type(prefetch_steps) is not int
             or not 1 <= prefetch_steps <= action_steps
-            or action_steps + prefetch_steps > prediction_steps
         ):
             raise ValueError(
-                "async/rtc require 1 <= d <= A_exec and A_exec+d <= P; "
+                "async/rtc require integer 1 <= d <= A_exec; "
                 f"A_exec={action_steps}, P={prediction_steps}, d={prefetch_steps}"
             )
+        if execution.mode == "async" and prefetch_steps >= prediction_steps:
+            raise ValueError("async requires d < P so a prediction tail remains at handoff")
+        if execution.mode == "rtc" and action_steps + prefetch_steps > prediction_steps:
+            raise ValueError("rtc requires A_exec+d <= P to preserve a full execution window")
     if execution.mode == "rtc":
         cap = execution.rtc_guidance_cap
         if (

@@ -60,9 +60,6 @@ class HandCalibration:
         relative_mad = np.median(np.abs(values - median), axis=0) / median
         if np.max(relative_mad) > config.calibration_max_relative_mad:
             raise ValueError("hand calibration bone lengths are unstable")
-        # MAD 对少量异常值不敏感；每个样本还须满足运行时的骨长容差。
-        if np.max(np.abs(values / median - 1.0)) > config.bone_length_tolerance:
-            raise ValueError("hand bone lengths changed beyond the calibrated tolerance")
         return cls(median[:15].reshape(5, 3), float(median[15]), len(values))
 
     def targets(
