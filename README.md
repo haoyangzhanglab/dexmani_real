@@ -87,7 +87,7 @@ Raw 使用 `data.h5` + `rgb.mp4`，默认在 `episodes/TASK/`；训练导出到 
 
 Raw 将实测 state 与提交尝试 action 分开保存。组合命令按设备顺序提交，部分失败保持原故障并停止；送入 arm mailbox 只代表目标发布，不保证每个目标进入 SDK 或物理到位。手部 warm start、阻尼和滤波参考由控制线程在提交正常返回后更新；同一 VR 帧每个控制 tick 仍运行手映射和速度限制。dt 使用本次计算时刻减上次实际提交参考时刻，迟到丢弃的候选不推进参考或时间。SDK 调用正常返回也不证明手部物理执行。
 
-Canonical 保留 [固定 13 模态](dexmani_real/data/export.py)、原字段/单位/dtype、EEF 9D 与 EEF action 21D。内部 FK 使用独立 SE(3)，仅在数据和 policy 边界编码 rot6d。默认只从 teleop Raw 导出固定周期的有效连续前缀，policy_rollout 在用途入口明确拒绝；policy Raw 是评估日志，sync 行配对为执行时快照与本次提交尝试，并不表示该 action 由同行观测推理得到。技术失败段保守排除末行；正常保存、可导出和可物理回放的集合不同。结构损坏或保留范围内坏帧明确失败，不重采样或改写来源时间。
+Canonical 保留 [固定 13 模态](dexmani_real/data/export.py)、原字段/单位/dtype、EEF 9D 与 EEF action 21D。内部 FK 使用独立 SE(3)，仅在数据和 policy 边界编码 rot6d。当前示教导出仅支持 teleop Raw，导出固定周期的有效连续前缀；其他 `collection_source` 暂不支持。sync policy Raw 的行配对为执行时快照与本次提交尝试，并不表示该 action 由同行观测推理得到。技术失败段保守排除末行；正常保存、可导出和可物理回放的集合不同。结构损坏或保留范围内坏帧明确失败，不重采样或改写来源时间。
 
 `timing/rows` 的时间使用主机单调时钟，单位 ns，缺失值为 -1；`camera_sequence` 是来源序号。`control_ns` 是采样起点，`observation_ns` 是快照完成时刻；臂、手、触觉、相机的来源时间独立保留。相机使用 depth/color 首次主机接收时间中的较早者，读取缓存不会延长年龄；这不等同于曝光时刻。相机与点云仍各有 owner；点云 worker 发布含来源 sequence/time 及所需原 RGB-D 的自包含同源包，不回查相机历史。point-cloud-only 不分配或复制图像字段；少量 ring 槽只缓冲复制竞争，不提供历史查询。消费端按字段取得独立副本；录制与模型历史只读共享这些快照数组，模型组装时仍 stack，关节与触觉小数组独立 detach。SharedRing 保留数据复制和前后版本检查，适用范围为当前 Linux x86_64 单写多读。控制与录制需求在装配时取并集，每次快照裁决一次；启用录制就接受所需源或 writer 失败结束本轮。
 
@@ -172,7 +172,7 @@ python scripts/cordvip/track_object.py --episode episodes/TASK/EPISODE --scene s
 python -m cordvip_geometry view /tmp/cordvip/scene_001
 ```
 
-物体生成在导出前将 mesh 简化到最多 20,000 面，实测定尺度后采样固定点与法向。初始 mask 仅可复用于相同来源 ID、RGB-D、相机几何、行和时钟。多物体点数分配默认写入 task 内的 `sampled_1024/`，示例 apple / banana / bowl 为 432 / 324 / 268 点。流程、模型安装与结果字段见 [CordVIP 文档](scripts/cordvip/README.md)。同行关联不证明手/相机物理同步，模型表面与语义点不代表实测接触。
+物体生成在导出前将 mesh 简化到最多 20,000 面，实测定尺度后采样固定点与法向。初始 mask 复用要求 RGB-D、相机几何、行号和时钟完全相同；Raw 搬迁后可直接复用已确认 mask，含路径的 `source_id` 仅作来源说明。多物体点数分配默认写入 task 内的 `sampled_1024/`，示例 apple / banana / bowl 为 432 / 324 / 268 点。流程、模型安装与结果字段见 [CordVIP 文档](scripts/cordvip/README.md)。同行关联不证明手/相机物理同步，模型表面与语义点不代表实测接触。
 
 物体资产按 `assets/pointcloud_template/object/<任务>/<物体>/` 组织，`reference.jpg`、`asset.json`、NPY 和 PLY 点云纳入 Git；`mesh/mesh_m.obj` 与 `third_party/weights/` 仅保留本地。克隆后可直接读取点云；FoundationPose 位姿估计需要先本地重建网格，具体步骤见[物体重建流程](docs/object_reconstruction.md)。
 

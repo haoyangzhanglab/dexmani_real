@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .geometry import RectificationMaps, validate_distortion, validate_intrinsics
+from .geometry import validate_distortion, validate_intrinsics
 
 
 @dataclass(frozen=True)
@@ -124,11 +124,3 @@ def save_frame(path, frame):
     if frame.row_index is not None:
         payload["row_index"] = frame.row_index
     np.savez_compressed(path, **payload)
-
-
-def rectify_frame(frame, mask=None, *, maps=None):
-    """转换到 pinhole 网格，深度仍为实测 camera Z。"""
-    if maps is None:
-        maps = RectificationMaps(frame.depth_m.shape, frame.K, frame.distortion_coeffs)
-    rgb, depth_m, mask = maps.apply(frame.rgb, frame.depth_m, mask)
-    return rgb, depth_m, frame.K, mask

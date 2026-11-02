@@ -19,7 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Export one valid continuous prefix per teleop Raw episode to a canonical multimodal Zarr. "
-            "Policy rollout evaluation logs are not demonstration data. "
+            "Other Raw collection sources are currently unsupported. "
             "Report trimmed tails; reject structural corruption or an empty valid prefix."
         )
     )

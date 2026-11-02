@@ -10,7 +10,7 @@ HAND_SAMPLE_SEED = 0
 
 
 def raw_frame_identity(episode, row_index, timing):
-    """使用 Raw 纳秒时钟；缺失相机时钟时明确标记为观测时钟。"""
+    """使用 Raw 纳秒时钟，缺失相机时钟时标记为观测时钟；含路径的 ID 仅作来源说明。"""
     source = f"raw:{episode}:row:{row_index}"
     stamp = int(timing["observation_ns"])
     clock = "host_monotonic_observation"

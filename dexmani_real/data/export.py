@@ -75,8 +75,8 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     validate_task_label(reader.meta["task_label"])
     if reader.meta["collection_source"] != "teleop":
         raise ValueError(
-            "canonical demonstration export requires teleop Raw; policy_rollout is an "
-            "evaluation log whose execution observations are not training input/action pairs"
+            "canonical demonstration export currently supports only teleop Raw; "
+            f"got collection_source={reader.meta['collection_source']!r}"
         )
     frames = reader.num_frames
     if frames <= 0:

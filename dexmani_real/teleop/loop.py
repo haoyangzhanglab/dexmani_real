@@ -132,7 +132,10 @@ class TeleopLoop:
             summary = {
                 "stage": "soft_timeouts", "count": self.soft_timeout_count, "last": self.last_soft_timeout,
             }
-            logger.info("Teleop soft timeouts: %s", summary)
+            last_lateness_ms = (
+                self.last_soft_timeout["observed_ns"] - self.last_soft_timeout["deadline_ns"]
+            ) / 1_000_000
+            logger.info("Teleop soft timeouts: %s; last_lateness_ms=%.3f", summary, last_lateness_ms)
             if self.recorder is not None:
                 self.termination_details.append(summary)
             self.soft_timeout_count = 0

@@ -1,5 +1,8 @@
-"""调用真实 Raw/Canonical 实现；只替换故障边界，不连接设备。"""
+"""调用真实 Raw/Canonical 与首帧选择链路；设备和感知模型使用替身。"""
 
+import json
+from dataclasses import replace
+from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -70,6 +73,105 @@ def record(path, capture, *, frames=3, save=True, status="normal"):
         recorder.append(row(index), command)
     result = recorder.finish(save=save, reason="test", technical_status=status)
     return recorder, result
+
+
+@pytest.fixture(params=["mask.npy", "mask.png"])
+def initial_selection(tmp_path, capture, monkeypatch, request):
+    monkeypatch.syspath_prepend(str(
+        Path(__file__).resolve().parents[1] / "third_party/cordvip_geometry/src"
+    ))
+    from cordvip_geometry.io import write_confirmed_selection
+    from cordvip_geometry.raw import iter_raw_rows
+    from cordvip_geometry.rgbd import save_frame
+
+    metadata, _, _ = capture
+    metadata["camera_color_distortion_model"] = "brown_conrady"
+    _, episode = record(tmp_path / "raw", capture, frames=1)
+    with RawReader(episode) as reader:
+        [(frame, _)] = iter_raw_rows(reader, reader.read_camera())
+    mask = np.indices(frame.depth_m.shape).sum(axis=0) % 2 == 0
+    directory = tmp_path / "selection"
+    directory.mkdir()
+    save_frame(directory / "source_rgbd.npz", frame)
+    write_confirmed_selection(directory, mask, {
+        "selection": "gui_confirmed", "selected_instance": None,
+        "mask_grid": "original_rgb_grid; not_automatically_rectified",
+    }, mask_file=request.param)
+    return episode, directory, frame, mask
+
+
+def test_initial_selection_reuses_mask_after_raw_move(tmp_path, initial_selection):
+    from cordvip_geometry.cli.scene import choose_masks, load_scene
+    from cordvip_geometry.geometry import RectificationMaps
+    from cordvip_geometry.io import load_initial_selection
+    from cordvip_geometry.raw import iter_raw_rows
+    from cordvip_geometry.rgbd import load_frame
+    from cordvip_geometry.tracking import SceneTracker
+
+    episode, directory, original, mask = initial_selection
+    np.testing.assert_array_equal(load_initial_selection(directory, original), mask)
+    moved = episode.rename(tmp_path / "moved_episode")
+    with RawReader(moved) as reader:
+        [(frame, _)] = iter_raw_rows(reader, reader.read_camera())
+    assert frame.source_id != original.source_id
+    np.testing.assert_array_equal(load_initial_selection(directory, frame), mask)
+    assert load_frame(directory / "source_rgbd.npz").source_id == original.source_id
+
+    output = tmp_path / "tracking"
+    output.mkdir()
+    segmenter = Mock()
+    segmenter.initialize.side_effect = lambda rgb, masks: masks
+    masks = choose_masks(
+        {"object": {"id": "object", "initial_selection": directory}},
+        frame, SimpleNamespace(), output, segmenter,
+        RectificationMaps(frame.depth_m.shape, frame.K, frame.distortion_coeffs),
+    )
+    np.testing.assert_array_equal(masks["object"], mask)
+    segmenter.predict.assert_not_called()
+    scene = load_scene(output / "scene.json", headless=True)
+    tracker = SceneTracker(
+        segmenter, {}, foundationpose_root=tmp_path, debug_dir=tmp_path,
+        initial_selections={name: item["initial_selection"] for name, item in scene.items()},
+    )
+    result = tracker.step(frame)
+    assert result["operation"] == "initialize"
+    np.testing.assert_array_equal(result["objects"]["object"]["cloud"].semantic_mask, mask)
+
+
+@pytest.mark.parametrize("key,change", [
+    ("rgb", lambda value: value ^ np.uint8(1)),
+    ("depth_m", lambda value: np.nextafter(value, np.float32(np.inf))),
+    ("K", lambda value: value + np.diag([1e-12, 0., 0.])),
+    ("distortion_model", lambda value: "none"),
+    ("distortion_coeffs", lambda value: (1e-12, *value[1:])),
+    ("timestamp_ns", lambda value: value + 1),
+    ("clock", lambda value: "host_monotonic_observation"),
+    ("row_index", lambda value: value + 1),
+])
+def test_initial_selection_rejects_changed_binding(initial_selection, key, change):
+    from cordvip_geometry.io import load_initial_selection
+
+    _, directory, frame, _ = initial_selection
+    changed = replace(frame, **{key: change(getattr(frame, key))})
+    with pytest.raises(ValueError, match=f"initial-selection {key} differs"):
+        load_initial_selection(directory, changed)
+
+
+@pytest.mark.parametrize("mask_file", ["../outside.npy", "linked.npy"])
+def test_initial_selection_rejects_mask_outside_directory(tmp_path, initial_selection, mask_file):
+    from cordvip_geometry.io import load_initial_selection
+
+    _, directory, frame, mask = initial_selection
+    outside = tmp_path / "outside.npy"
+    np.save(outside, mask, allow_pickle=False)
+    if mask_file == "linked.npy":
+        (directory / mask_file).symlink_to(outside)
+    metadata_path = directory / "selection.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["mask_file"] = mask_file
+    metadata_path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="mask must remain inside its directory"):
+        load_initial_selection(directory, frame)
 
 
 @pytest.mark.parametrize("frames,save,status", [(3, True, "normal"), (3, True, "failed"),
@@ -155,6 +257,57 @@ def test_canonical_export_real_fk_and_thirteen_fields(tmp_path, capture):
     assert root.attrs["source_id"]
     assert root.attrs["dt"] == .1
     assert "timing_admission" not in root.attrs
+
+
+@pytest.mark.parametrize("source", ["policy_rollout", "other"])
+def test_export_rejects_non_teleop_raw(tmp_path, capture, source):
+    _, path = record(tmp_path / "raw", capture)
+    with h5py.File(path / "data.h5", "r+") as data:
+        data["meta"].attrs["collection_source"] = source
+    with RawReader(path) as reader, pytest.raises(ValueError, match=f"got collection_source={source!r}"):
+        validate_export_episode(reader)
+    output = tmp_path / "canonical.zarr"
+    with pytest.raises(ValueError, match=f"got collection_source={source!r}"):
+        export_zarr(path, output, processing=ExportConfig())
+    assert not output.exists()
+    assert not list(tmp_path.glob(".canonical.zarr.tmp-*"))
+
+
+@pytest.mark.parametrize("recording", [False, True])
+def test_soft_timeout_summary_keeps_raw_nanoseconds(tmp_path, capture, caplog, recording):
+    from test_interaction import begin, make_loop
+
+    loop = make_loop()
+    begin(loop)
+    if recording:
+        metadata, row, command = capture
+        recorder = loop.recorder = EpisodeRecorder(tmp_path, control_hz=10)
+        recorder.start(task_label="fixture", collection_source="teleop", metadata=metadata)
+        recorder.append(row(0), command)
+    caplog.set_level("INFO", logger="dexmani_real.teleop.loop")
+    loop.record_soft_timeout("observation", deadline_ns=1_000_000_000, observed_ns=1_100_000_000)
+    loop.record_soft_timeout("compute", deadline_ns=2_000_000_000, observed_ns=2_012_345_000)
+    before_end = list(caplog.records)
+    last = loop.last_soft_timeout.copy()
+    loop.end_episode("operator")
+    assert not any(record.getMessage().startswith("Teleop soft timeouts:") for record in before_end)
+    summaries = [record for record in caplog.records
+                 if record.getMessage().startswith("Teleop soft timeouts:")]
+    assert len(summaries) == 1
+    assert summaries[0].levelname == "INFO"
+    assert summaries[0].getMessage().endswith("last_lateness_ms=12.345")
+    expected = {"stage": "soft_timeouts", "count": 2, "last": last}
+    details = [item for item in loop.termination_details if item["stage"] == "soft_timeouts"]
+    assert details == ([expected] if recording else [])
+    assert set(last) == {"stage", "tick", "deadline_ns", "observed_ns"}
+    if recording:
+        with RawReader(recorder.published_path) as reader:
+            persisted = json.loads(reader.data_file["meta/termination_details"][()])
+        assert next(item for item in persisted if item["stage"] == "soft_timeouts") == expected
+    assert loop.soft_timeout_count == 0
+    assert loop.last_soft_timeout is None
+    loop.robot.stop.assert_called_once()
+    assert [call.args[0] for call in loop.audio.play.call_args_list] == (["save"] if recording else [])
 
 
 def test_export_prefix_still_checks_raw_field_shape(tmp_path, capture):

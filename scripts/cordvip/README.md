@@ -31,7 +31,7 @@ python scripts/cordvip/track_object.py \
   --with-hand --output /tmp/cordvip/scene_001
 ```
 
-在冻结的 Raw 首帧上确认文本候选，或省略 prompt 手动画 mask。选择保存到输出的 `initial_selections/`；`scene.json` 记录可复用的对象与选择路径。再次运行可指定 `--initial-selection DIR`。复用仍严格核对首帧 RGB-D、内参、畸变、来源时间和行身份，不把历史 mask 套到另一段录像。
+在冻结的 Raw 首帧上确认文本候选，或省略 prompt 手动画 mask。选择保存到输出的 `initial_selections/`；`scene.json` 记录可复用的对象与选择路径。再次运行可指定 `--initial-selection DIR`。复用仍逐项精确核对首帧 RGB-D、内参、畸变、时间戳、时钟和行号。含路径的 `source_id` 仅作来源说明；Raw 搬迁后这些绑定数据完全相同即可直接复用，无须改写已有选择文件。mask 文件仍须位于选择目录内。
 
 多物体由一个场景 JSON 声明，路径相对仓库根目录：
 

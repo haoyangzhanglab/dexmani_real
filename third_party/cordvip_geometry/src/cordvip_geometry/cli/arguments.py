@@ -76,7 +76,8 @@ def parse_tracking_args(argv=None, *, workspace=None):
     )
     parser.add_argument("--prompt", help="首帧文本候选；省略时手画 mask")
     parser.add_argument(
-        "--initial-selection", type=Path, help="复用同一首帧的已确认选择"
+        "--initial-selection", type=Path,
+        help="复用绑定数据完全相同的首帧确认选择，允许 Raw 搬迁",
     )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(

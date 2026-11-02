@@ -1,8 +1,10 @@
-"""场景声明和首帧实例确认；保留来源一致的选择产物。"""
+"""场景声明和首帧实例确认；选择产物绑定首帧实际数据。"""
 
 import json
 import re
 from pathlib import Path
+
+from ..foundationpose import MIN_DEPTH_PIXELS
 
 
 def load_scene(path, *, headless):
@@ -43,7 +45,7 @@ def load_scene(path, *, headless):
             raise ValueError("Scene role must be object or reference")
         if headless and not item.get("initial_selection"):
             raise ValueError(
-                f"{name}: headless scene requires an exact-source initial_selection"
+                f"{name}: headless scene requires a confirmed initial_selection for the first frame"
             )
         if item.get("prompt") is not None and (
             not isinstance(item["prompt"], str) or not item["prompt"].strip()
@@ -184,10 +186,11 @@ def choose_masks(objects, frame, args, output, segmenter, maps):
             while True:
                 mask, index = select_mask(frame.rgb, candidates, name)
                 rectified_mask = maps.apply_mask(mask)
-                if np.count_nonzero(rectified_mask & (depth > 0)) >= 4:
+                if np.count_nonzero(rectified_mask & (depth > 0)) >= MIN_DEPTH_PIXELS:
                     break
                 print(
-                    f"{name}: mask 至少需要四个有效深度像素，请重新选择。", flush=True
+                    f"{name}: mask 至少需要 {MIN_DEPTH_PIXELS} 个有效深度像素，请重新选择。",
+                    flush=True,
                 )
             masks[name] = mask
             selected = output / "initial_selections" / name

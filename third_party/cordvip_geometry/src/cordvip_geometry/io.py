@@ -103,7 +103,7 @@ def write_confirmed_selection(
 
 
 def load_initial_selection(directory, frame):
-    """已确认 mask 只复用于相同来源和几何的首帧。"""
+    """按 RGB-D、几何、行与时钟精确复用已确认 mask；source_id 仅作来源说明。"""
     import numpy as np
 
     from .rgbd import load_frame
@@ -129,7 +129,6 @@ def load_initial_selection(directory, frame):
         "timestamp_ns",
         "clock",
         "row_index",
-        "source_id",
     ):
         if not np.array_equal(getattr(saved, key), getattr(frame, key)):
             raise ValueError(
