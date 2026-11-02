@@ -555,3 +555,120 @@ def test_arm_rechecks_expiration_after_trajectory_calculation(devices, monkeypat
     assert owner.reference is not None  # 使用真实 Ruckig 计算后，才推进时钟到到期边界。
     driver.servo.assert_not_called()
     assert channels.stop.is_set()
+
+
+@pytest.mark.parametrize('query_ms,interval_ms', [(10, 40), (40, 80), (55, 80), (90, 120)])
+def test_arm_worker_feedback_grid_and_stop(monkeypatch, query_ms, interval_ms):
+    # 只替换 SDK、时钟和等待边界；启动、prepare、mailbox、tick 与 Ruckig 均真实运行。
+    clock = SimpleNamespace(now=1_000_000_000)
+    events = []
+
+    class ClockEvent:
+        flag = False
+
+        def is_set(self):
+            return self.flag
+
+        def set(self):
+            self.flag = True
+
+        def wait(self, timeout):
+            if not self.flag:
+                if pipe.streaming:
+                    assert timeout > 0  # 流式循环不忙等。
+                clock.now += round(timeout * 1e9)
+            return self.flag
+
+    ctx = mp.get_context('spawn')
+    stop = ClockEvent()
+    io = ArmChannels(ctx, run_signal=ctx.Value('q', 1), stop_signal=stop,
+                     emergency_signal=ctx.Event())
+    cfg = RealConfig().arm
+    q = np.asarray(cfg.home_qpos)
+
+    class Pipe:
+        sent_prepare = False
+        streaming = False
+        feedback_count = 0
+
+        def poll(self, timeout=0):
+            if timeout:
+                clock.now += round(timeout * 1e9)
+            return io.ready.is_set() and not self.sent_prepare
+
+        def recv(self):
+            self.sent_prepare = True
+            return PrepareRequest(1, clock.now + 5_000_000_000)
+
+        def send(self, error):
+            assert error is None
+            self.streaming = True
+            events.append(('prepared', clock.now))
+            target = q.copy()
+            target[0] += .01
+            io.publish_goal(RobotCommand(1, target, None), expires_ns=clock.now + 2_000_000_000)
+
+        def close(self):
+            pass
+
+    pipe = Pipe()
+
+    class Driver:
+        def connect(self, *, check_abort):
+            check_abort()
+
+        def initialize(self, *, check_abort):
+            check_abort()
+
+        def enter_mode(self, mode, *, check_abort):
+            check_abort()
+
+        def read(self):
+            if pipe.streaming:
+                events.append(('read_start', clock.now))
+            clock.now += query_ms * 1_000_000
+            if pipe.streaming:
+                events.append(('read_end', clock.now))
+                pipe.feedback_count += 1
+                if pipe.feedback_count == 5:
+                    stop.set()
+                    events.append(('stop_requested', clock.now))
+            return q.copy(), np.zeros(7)
+
+        def servo(self, value):
+            events.append(('servo', clock.now))
+
+        def stop(self):
+            events.append(('stop', clock.now))
+            io.closing.set()
+
+        def close(self):
+            pass
+
+    fake_time = SimpleNamespace(monotonic_ns=lambda: clock.now)
+    monkeypatch.setattr(arm_worker, 'time', fake_time)
+    monkeypatch.setattr(protocol, 'time', fake_time)
+    owner = arm_worker.ArmController(cfg, io, pipe, Driver())
+    owner.run()
+    assert not io.fault.value, io.fault.value
+    starts = [stamp for event, stamp in events if event == 'read_start']
+    assert len(starts) == 5
+    assert starts[0] == events[0][1]  # prepare 完成后立即重新安排反馈。
+    np.testing.assert_array_equal(np.diff(starts), interval_ms * 1_000_000)
+    assert int(owner.status['timestamp_ns']) == starts[-1]
+    stop_time = next(stamp for event, stamp in events if event == 'stop_requested')
+    assert not any(event == 'servo' and stamp >= stop_time for event, stamp in events)
+    # 同一个 owner 中查询先于发送；查询期间绝无 servo，查询后仍服务 servo。
+    for start in starts[:-1]:
+        assert ('servo', start + query_ms * 1_000_000) in events
+        assert not any(event == 'servo' and start <= stamp < start + query_ms * 1_000_000
+                       for event, stamp in events)
+    assert events[-1] == ('stop', stop_time)
+
+
+def test_initial_state_requires_and_observes_cancellation(devices):
+    _, state, robot, _, _, _ = devices
+    with pytest.raises(TypeError, match='cancel_requested'):
+        robot.read_initial_state(state.run_id)
+    with pytest.raises(OperationCancelled, match='initial feedback'):
+        robot.read_initial_state(state.run_id, cancel_requested=lambda: True)

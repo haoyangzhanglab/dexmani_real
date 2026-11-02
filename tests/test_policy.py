@@ -567,3 +567,92 @@ def test_busy_operation_revokes_delayed_preparation_key(tmp_path, monkeypatch, o
     assert len(events) == 1
     assert not session.request_start(events[0].run_id)
     session.keyboard.stop()
+
+
+@pytest.mark.parametrize('point_cloud', [False, True])
+@pytest.mark.parametrize('camera_fields,stored_fields', [
+    ((), ()), ((), ('rgb', 'depth')), (('rgb',), ('rgb',)),
+    (('rgb',), ('rgb', 'depth')), (('depth',), ('depth',)),
+    (('rgb', 'depth'), ('rgb', 'depth')),
+])
+def test_observation_snapshot_ownership(point_cloud, camera_fields, stored_fields):
+    import multiprocessing as mp
+
+    from dexmani_real.deployment.observation import ObservationBuilder
+    from dexmani_real.ipc.sensors import SensorChannels
+    from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
+    from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
+    from dexmani_real.runtime.observation import ObservationNeeds, read_observation
+
+    runtime = RealConfig()
+    camera = replace(runtime.camera, width=4, height=3)
+    channels = SensorChannels(mp.get_context('spawn'), camera=camera,
+                              pointcloud_num_points=5, pointcloud_camera_fields=stored_fields)
+    rgb = np.arange(36, dtype=np.uint8).reshape(3, 4, 3)
+    depth = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    cloud = np.arange(30, dtype=np.float32).reshape(5, 6)
+    payload = {'timestamp_ns': 10, 'source_camera_sequence': 7, 'color_frame_number': 17,
+               'rgb': rgb, 'depth': depth, 'point_cloud': cloud}
+    payload = {name: payload[name] for name in channels.pointcloud_ring.field_names}
+    channels.pointcloud_ring.write(**payload)
+    channels.camera_ring.write(timestamp_ns=20, color_frame_number=18, rgb=rgb + 1, depth=depth + 1)
+    arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+    hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
+    hand['tactile_aggregate'] = np.arange(15).reshape(5, 3)
+    robot = SimpleNamespace(read_state=lambda: SimpleNamespace(arm=arm, hand=hand))
+    needs = ObservationNeeds(camera_fields=camera_fields, point_cloud=point_cloud)
+    row = read_observation(channels, robot, needs=needs)
+    fields = (*camera_fields, *(('point_cloud',) if point_cloud else ()),
+              'finger_tactile_force', 'joint_state')
+    builder = ObservationBuilder(SimpleNamespace(observation_fields=fields), runtime)
+    projected = builder.project(row)
+    expected = {name: value.copy() for name, value in projected.values.items()}
+    for name in (*camera_fields, *(('point_cloud',) if point_cloud else ())):
+        source = row.point_cloud if name == 'point_cloud' else row.camera[name]
+        assert projected.values[name] is source  # 投影不做第二次大数组复制。
+        assert source.flags.owndata  # 不经 structured payload 持有未请求的字段。
+    assert not np.shares_memory(projected.values['finger_tactile_force'], hand)
+    assert not np.shares_memory(projected.values['hand_qpos'], hand)
+    assert not np.shares_memory(projected.values['arm_qpos'], arm)
+    if camera_fields:
+        assert set(row.camera) == {'timestamp_ns', 'ring_sequence', 'color_frame_number', *camera_fields}
+        assert row.camera['timestamp_ns'] == (10 if point_cloud else 20)
+        assert row.camera['ring_sequence'] == (7 if point_cloud else 1)
+        assert row.camera['color_frame_number'] == (17 if point_cloud else 18)
+        for name in camera_fields:
+            np.testing.assert_array_equal(row.camera[name], {'rgb': rgb, 'depth': depth}[name] + (not point_cloud))
+    assert row.pointcloud_timestamp_ns == (10 if point_cloud else 0)
+    if point_cloud:
+        np.testing.assert_array_equal(row.point_cloud, cloud)
+    # 覆盖包括原槽；模型输入即使被消费者修改，也不应影响录制/历史快照。
+    for _ in range(channels.pointcloud_ring.capacity):
+        channels.pointcloud_ring.write(**{name: value + 2 for name, value in payload.items()})
+        channels.camera_ring.write(timestamp_ns=30, color_frame_number=19, rgb=rgb + 2, depth=depth + 2)
+    built = builder.build((projected, projected))
+    for name in fields:
+        if name != 'joint_state':
+            assert built[name].dtype == expected[name].dtype
+            np.testing.assert_array_equal(built[name], np.stack([expected[name]] * 2))
+        built[name].fill(0)
+    for name, value in expected.items():
+        np.testing.assert_array_equal(projected.values[name], value)
+
+
+def test_ring_rejects_incomplete_or_overwritten_read():
+    import multiprocessing as mp
+
+    from dexmani_real.ipc.ring import SharedRing
+
+    ring = SharedRing(mp.get_context('spawn'), np.dtype([('a', 'i8'), ('b', 'i8')]), 1)
+    assert ring.read() is None
+    ring.write(a=1, b=2)
+    ring.slots[0]['sequence'] = 1
+    assert ring.read(fields=('a',)) is None
+    ring.write(a=3, b=4)
+
+    def fields():
+        yield 'a'
+        ring.write(a=5, b=6)
+        yield 'b'
+
+    assert ring.read(fields=fields()) is None

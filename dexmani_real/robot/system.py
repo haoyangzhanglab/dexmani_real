@@ -183,13 +183,13 @@ class Robot:
             self.stop_signal.set()
             raise
 
-    def read_initial_state(self, run_id, *, required_tactile=(), cancel_requested=None):
+    def read_initial_state(self, run_id, *, cancel_requested, required_tactile=()):
         deadline_ns = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
 
         def check_wait():
             self.check()
             if (
-                (cancel_requested is not None and cancel_requested())
+                cancel_requested()
                 or self.run_signal.value != run_id
                 or self.emergency_signal.is_set()
             ):

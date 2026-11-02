@@ -11,7 +11,7 @@ def next_tick_ns(planned_ns, period_ns, now_ns):
 
 
 def sampling_clock_ns(control_hz):
-    """训练导出、回放与执行共用的整数 control 周期及训练网格容差。"""
+    """将采样频率转换为有效整数周期；第二项为训练网格使用的四分之一周期容差。"""
     if not math.isfinite(control_hz) or control_hz <= 0:
         raise ValueError("control_hz must be finite and positive")
     dt_ns = round(1e9 / control_hz)

@@ -10,6 +10,7 @@ import numpy as np
 from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
 from dexmani_real.config.teleop import DEFAULT_TASK_NAME
 from dexmani_real.control.actions import ActionMapper
+from dexmani_real.data.raw import validate_task_label
 from dexmani_real.data.recorder import RecordingError
 from dexmani_real.ipc.sensors import (
     SensorChannels,
@@ -53,12 +54,12 @@ def run_teleop(
 ) -> int:
     """装配遥操作资源，运行并按原保存意图完成收尾。"""
     configure_logging()
-    name = task_name
-    if not isinstance(name, str) or not name or name != name.strip():
-        raise ValueError("task_name must be a non-empty string without surrounding whitespace")
-    if name.startswith("."):
+    validate_task_label(task_name)
+    if task_name != task_name.strip():
+        raise ValueError("task_name must not contain surrounding whitespace")
+    if task_name.startswith("."):
         raise ValueError("task_name must not be a hidden or relative directory name")
-    if "/" in name or "\\" in name or any(ord(char) < 32 for char in name):
+    if "/" in task_name or "\\" in task_name:
         raise ValueError("task_name must be one safe directory component")
     validate_robot_config(runtime)
     validate_control_rate(runtime, runtime.teleop.control_hz)

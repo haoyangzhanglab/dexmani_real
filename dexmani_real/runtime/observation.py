@@ -50,7 +50,12 @@ class Observation:
 def read_observation(channels, robot, *, needs=ObservationNeeds()):
     control_ns = time.monotonic_ns()
     state = robot.read_state()
-    cloud_result = channels.pointcloud_ring.read() if needs.point_cloud else None
+    cloud_result = None
+    if needs.point_cloud:
+        fields = ("timestamp_ns", "source_camera_sequence", "point_cloud")
+        if needs.camera_fields:
+            fields += ("color_frame_number", *needs.camera_fields)
+        cloud_result = channels.pointcloud_ring.read(fields=fields)
     cloud = cloud_result[0] if cloud_result else None
     camera = None
     if needs.camera_fields:

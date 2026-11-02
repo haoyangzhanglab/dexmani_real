@@ -24,8 +24,8 @@ FIELD_DEPENDENCIES = {
     "finger_tactile_force": ("aggregate",),
     "taxel_tactile_force": ("dense",),
     "point_cloud": ("cloud",),
-    "rgb": ("camera", "rgb"),
-    "depth": ("camera", "depth"),
+    "rgb": ("rgb",),
+    "depth": ("depth",),
     "camera_intrinsic": ("camera_static",),
     "camera_extrinsic": ("camera_static",),
 }
@@ -71,6 +71,7 @@ class ObservationBuilder:
             values["arm_qpos"] = row.arm["qpos"][0].copy()
         if "hand" in dependencies:
             values["hand_qpos"] = row.hand["qpos"][0].copy()
+        # 大数组已由 ring 独立复制；交给录制和模型历史后，快照数组只读。
         for name in fields:
             if name == "finger_tactile_force":
                 # 独立复制，避免聚合触觉视图持有仅供录制的稠密载荷。
@@ -78,9 +79,9 @@ class ObservationBuilder:
             elif name == "taxel_tactile_force":
                 values[name] = row.hand["tactile_dense"][0].copy()
             elif name == "point_cloud":
-                values[name] = row.point_cloud.copy()
+                values[name] = row.point_cloud
             elif name in {"rgb", "depth"}:
-                values[name] = row.camera[name].copy()
+                values[name] = row.camera[name]
         return PolicyObservationRow(values)
 
     def configure_camera(self, camera):

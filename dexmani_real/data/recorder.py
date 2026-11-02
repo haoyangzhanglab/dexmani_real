@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty, Full, Queue
 
-from dexmani_real.data.raw import RawWriter
+from dexmani_real.data.raw import RawWriter, validate_task_label
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.runtime.observation import Observation
 from dexmani_real.utils.io import publish
@@ -105,8 +105,7 @@ class EpisodeRecorder:
             raise RecordingError("recorder permits only one START attempt")
         self.start_attempted = True
         try:
-            if not isinstance(task_label, str) or not task_label.strip():
-                raise ValueError("task_label must be a non-empty string")
+            validate_task_label(task_label)
             metadata = dict(metadata, task_label=task_label, collection_source=collection_source)
             if episode_name is not None and (
                 type(episode_name) is not str

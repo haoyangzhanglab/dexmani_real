@@ -198,8 +198,6 @@ class PolicySession:
             self.run_config["effective_camera"] = {
                 "camera_T_xarm_base_from_color": None,
                 **camera_metadata(self.camera_snapshot),
-                "transform_direction": "color_optical_to_xarm_base",
-                "translation_units": "m",
             }
             write_yaml(
                 self.run_config, self.output_dir / "run_config.yaml",

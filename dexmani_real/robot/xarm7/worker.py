@@ -19,7 +19,7 @@ from dexmani_real.robot.xarm7.protocol import (
 )
 from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.timing import sample_is_fresh
+from dexmani_real.utils.timing import next_tick_ns, sample_is_fresh, sampling_clock_ns
 
 logger = logging.getLogger(__name__)
 
@@ -324,8 +324,9 @@ class ArmController:
             self.read_feedback()
             self.io.ready.set()
             period = round(1e9 / self.cfg.servo_hz)
+            feedback_period, _ = sampling_clock_ns(self.cfg.feedback_hz)
             tick = time.monotonic_ns() + period
-            feedback_due = time.monotonic_ns() + round(1e9 / self.cfg.feedback_hz)
+            feedback_due = time.monotonic_ns() + feedback_period
             while not self.io.closing.is_set() and not self.io.fault.value:
                 if self.io.stop.is_set() and not self.io.stopped.is_set():
                     self.stop()
@@ -339,7 +340,9 @@ class ArmController:
                 # 先刷新到期反馈，再判断伺服当前反馈，调度迟到不写永久 fault。
                 if now >= feedback_due:
                     self.read_feedback()
-                    feedback_due = time.monotonic_ns() + round(1e9 / self.cfg.feedback_hz)
+                    feedback_due = next_tick_ns(
+                        feedback_due, feedback_period, time.monotonic_ns(),
+                    )
                 if time.monotonic_ns() >= tick:
                     sent_ns = self.tick()
                     tick = (sent_ns if sent_ns is not None else time.monotonic_ns()) + period

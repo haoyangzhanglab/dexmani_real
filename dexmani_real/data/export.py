@@ -15,7 +15,7 @@ import numpy as np
 import zarr
 
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
-from dexmani_real.data.raw import ROBOT_DATASET_SPECS, RawReader
+from dexmani_real.data.raw import ROBOT_DATASET_SPECS, RawReader, validate_task_label
 from dexmani_real.geometry.camera import (
     CameraSnapshot,
     camera_parameters_cv,
@@ -72,6 +72,7 @@ def canonical_array_specs(
 
 
 def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
+    validate_task_label(reader.meta["task_label"])
     if reader.meta["collection_source"] != "teleop":
         raise ValueError(
             "canonical demonstration export requires teleop Raw; policy_rollout is an "
@@ -281,8 +282,6 @@ def export_zarr(
                             episode.name, frames, reader.num_frames, reader.num_frames - frames,
                             quality["source_technical_status"], quality["trim_reason"])
                 task = reader.meta["task_label"]
-                if not task.strip() or any(ord(char) < 32 or ord(char) == 127 for char in task):
-                    raise ValueError("task_label must be nonempty without control characters")
                 height, width = camera.color.height, camera.color.width
                 if index == 0:
                     arm_fk, hand_fk = ArmFK(), HandFK()

@@ -13,6 +13,7 @@ from dexmani_real.config.deployment import (
     DEFAULT_NUM_EPISODES,
     RUNTIME_SECTIONS,
 )
+from dexmani_real.data.raw import validate_task_label
 from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.deployment.session import PolicySession
@@ -20,6 +21,7 @@ from dexmani_real.utils.io import write_yaml
 
 
 def session_directory(root: Path, info) -> Path:
+    validate_task_label(info.task_name)
     parts = (info.policy_name, info.task_name, info.experiment_dir.name)
     if any(
         not isinstance(part, str)

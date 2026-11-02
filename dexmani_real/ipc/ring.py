@@ -58,6 +58,6 @@ class SharedRing:
         if fields is None:
             data = payload.copy()
         else:
-            # 单独复制字段，避免只读 RGB 时仍持有完整深度数据。
+            # 每个字段取得独立副本，避免视图长期持有未请求的载荷。
             data = {name: payload[name].copy() for name in fields}
         return (data, sequence) if marker == int(slot["sequence"]) else None

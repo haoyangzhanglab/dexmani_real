@@ -404,3 +404,91 @@ def test_writer_close_failure_keeps_staging_and_original_cause(
     assert recorder.writer.video.container is None
     if write_fails:
         assert any(record.exc_info and record.exc_info[1] is cleanup for record in caplog.records)
+
+
+@pytest.mark.parametrize('label', [None, 17, '', '   ', '\u3000', *('demo' + chr(c) for c in (*range(32), 127))])
+def test_task_label_rejected_before_recording_side_effects(tmp_path, label):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.data.raw import validate_task_label
+    from dexmani_real.deployment.run import session_directory
+    from dexmani_real.teleop.run import run_teleop
+
+    with pytest.raises(ValueError, match='task_label'):
+        validate_task_label(label)
+    destination = tmp_path / 'new'
+    recorder = EpisodeRecorder(destination, control_hz=10)
+    with pytest.raises(RecordingError) as caught:
+        recorder.start(task_label=label, collection_source='teleop', metadata={})
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert not destination.exists() and recorder.thread is None
+    info = SimpleNamespace(task_name=label, policy_name='policy', experiment_dir=tmp_path / 'experiment')
+    with pytest.raises(ValueError, match='task_label'):
+        session_directory(destination, info)
+    assert not destination.exists()
+    with pytest.raises(ValueError, match='task_label'):
+        run_teleop(RealConfig(), record=True, episodes_dir=str(destination),
+                   max_duration_s=1, runtime_config_json=None, task_name=label)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize('label', ['抓取 toy', ' pick/place ', '.natural language', 'a\\b'])
+def test_natural_language_labels_round_trip_without_directory_rules(tmp_path, capture, label):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.teleop.run import run_teleop
+
+    metadata, row, command = capture
+    recorder = EpisodeRecorder(tmp_path / 'raw', control_hz=10)
+    recorder.start(task_label=label, collection_source='teleop', metadata=metadata)
+    for index in range(3):
+        recorder.append(row(index), command)
+    path = recorder.finish(save=True, reason='test', technical_status='normal')
+    output = tmp_path / 'export.zarr'
+    export_zarr(path, output, processing=ExportConfig(pointcloud=PointCloudConfig(
+        remove_table=False, num_points=32, workspace=(-1., -1., 0., 1., 1., 1.),
+    )))
+    assert zarr.open_group(str(output), mode='r').attrs['task_name'] == label
+    if label != '抓取 toy':
+        with pytest.raises(ValueError, match='task_name'):
+            run_teleop(RealConfig(), record=True, episodes_dir=str(tmp_path),
+                       max_duration_s=1, runtime_config_json=None, task_name=label)
+
+
+@pytest.mark.parametrize('label', [17, '   ', 'demo\x01', 'demo\x1f', 'demo\x7f'])
+def test_export_rejects_invalid_stored_task_label(tmp_path, capture, label):
+    _, path = record(tmp_path / 'raw', capture)
+    # 模拟历史 Raw 的外部输入；只修改测试临时产物。
+    with h5py.File(path / 'data.h5', 'r+') as data:
+        data['meta'].attrs['task_label'] = label
+    with RawReader(path) as reader, pytest.raises(ValueError, match='task_label'):
+        validate_export_episode(reader)
+    output = tmp_path / 'invalid.zarr'
+    with pytest.raises(ValueError, match='task_label'):
+        export_zarr(path, output, processing=ExportConfig())
+    assert not output.exists()
+
+
+def test_model_history_build_preserves_recording_input(tmp_path, capture):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.deployment.observation import ObservationBuilder
+
+    metadata, make_row, command = capture
+    row = make_row(0)
+    fields = ('rgb', 'depth', 'finger_tactile_force', 'taxel_tactile_force', 'joint_state')
+    builder = ObservationBuilder(SimpleNamespace(observation_fields=fields), RealConfig())
+    history = builder.project(row)
+    recorder = EpisodeRecorder(tmp_path, control_hz=10)
+    recorder.start(task_label='model and recording', collection_source='teleop', metadata=metadata)
+    recorder.append(row, command)
+    for value in builder.build((history,)).values():
+        value.fill(0)
+    path = recorder.finish(save=True, reason='test', technical_status='normal')
+    np.testing.assert_array_equal(row.camera['rgb'], 80)
+    with RawReader(path) as reader:
+        for recorded, expected in (
+            ('depth', row.camera['depth']),
+            ('hand_contact', row.hand['tactile_aggregate'][0]),
+            ('hand_tactile_force', row.hand['tactile_dense'][0]),
+            ('arm_qpos', row.arm['qpos'][0]),
+        ):
+            np.testing.assert_array_equal(reader[recorded][0], expected)
+        assert reader['timing/rows'][0]['camera_ns'] == row.camera['timestamp_ns']
