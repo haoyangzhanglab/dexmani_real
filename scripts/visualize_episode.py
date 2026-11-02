@@ -24,7 +24,6 @@ from dexmani_real.data.raw import RawReader
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
-from dexmani_real.utils.log import attach_cleanup_errors
 from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.visualization.rerun import (
     episode_blueprint,
@@ -280,7 +279,7 @@ class EpisodeVisualizer:
                 if failure is None:
                     failure = exc
                 else:
-                    attach_cleanup_errors(failure, [(stage, exc)])
+                    logger.exception("%s also failed", stage)
             else:
                 setattr(self, attribute, None)
         if failure is not None and error is None:

@@ -1,7 +1,6 @@
 """键盘笛卡尔点动与回零。"""
 
 import logging
-import sys
 import time
 
 from dexmani_real.config.control import HomeConfigurationError
@@ -19,7 +18,7 @@ from dexmani_real.runtime.preflight import (
     validate_robot_config,
 )
 from dexmani_real.runtime.state import RunEndReason, SessionState, device_failure_reason
-from dexmani_real.utils.log import attach_cleanup_errors, configure_logging, error_detail
+from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -55,7 +54,7 @@ class KeyboardTeleop:
                 clean = self.run_control_loop()
                 self.robot.check()
             except OperationCancelled as exc:
-                self.robot.check(operation_error=exc)
+                self.robot.check()
                 logger.info("Keyboard teleop cancelled: %s", exc)
                 clean = bool(self.runtime_state.quit_requested)
         except KeyboardInterrupt:
@@ -68,21 +67,12 @@ class KeyboardTeleop:
             )
             raise
         finally:
-            failure = sys.exc_info()[1]
             try:
                 close_runtime(self.runtime_state, self.robot, keyboard=self.keys)
-            except BaseException as exc:
-                if failure is not None:
-                    attach_cleanup_errors(failure, [("shutdown", exc)])
-                else:
-                    logger.error(
-                        "keyboard runtime cleanup failed: %s", error_detail("shutdown", exc)["message"],
-                    )
+            except BaseException:
+                logger.exception("keyboard runtime cleanup failed")
             else:
                 shutdown_clean = True
-            # 主错由原异常继续传播；补充错误只在会话出口打印，不重复主错 traceback。
-            for stage, error in getattr(failure, "cleanup_errors", ()):
-                logger.error("%s failed: %s", stage, error_detail(stage, error)["message"])
         return int(
             not clean or not shutdown_clean
             or self.runtime_state.error_state or self.runtime_state.estop_request
@@ -139,7 +129,7 @@ class KeyboardTeleop:
                 or self.runtime_state.error_state
             ):
                 break
-            if self.runtime_state.quit_requested or self.keys.is_pressed("q"):
+            if self.runtime_state.quit_requested:
                 return True
 
             home_event = next((event for event in events if event.key == "r"), None)
@@ -176,7 +166,7 @@ class KeyboardTeleop:
                 cancel_requested=cancelled,
             )
         except (HomeConfigurationError, HomePathRejected) as exc:
-            self.robot.check(operation_error=exc)
+            self.robot.check()
             logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
         else:
             logger.info("HOME completed")

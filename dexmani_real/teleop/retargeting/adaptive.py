@@ -1,6 +1,5 @@
 """有界、可诊断的 XHand 在线重定向；只有提交成功才推进命令状态。"""
 
-import time
 from math import expm1
 
 import nlopt
@@ -59,7 +58,6 @@ class AdaptiveHandRetargeter:
         self.previous_command = None
         self.command_timestamp_ns = None
         self.rejection_reason = None
-        self.last_diagnostics = {}
 
     def calibrate(self, measurements):
         self.calibration = HandCalibration.from_measurements(measurements, self.config)
@@ -80,7 +78,6 @@ class AdaptiveHandRetargeter:
         self.previous_command = np.clip(qpos, self.limits[:, 0], self.limits[:, 1])
         self.command_timestamp_ns = int(timestamp_ns)
         self.rejection_reason = None
-        self.last_diagnostics = {}
 
     def retarget(self, landmarks, *, timestamp_ns):
         if self.calibration is None or self.previous_command is None:
@@ -89,7 +86,6 @@ class AdaptiveHandRetargeter:
             raise ValueError("hand computation time moved backwards")
         dt_s = (timestamp_ns - self.command_timestamp_ns) * 1e-9
         self.rejection_reason = None
-        self.last_diagnostics = {}
         if dt_s == 0:
             return self.previous_command.copy()
         try:
@@ -119,41 +115,24 @@ class AdaptiveHandRetargeter:
         initial_loss = objective(seed, np.empty(0))
         if not np.isfinite(initial_loss):
             self.rejection_reason = "hand solver seed loss is non-finite"
-            self.last_diagnostics = dict(initial_loss=None, failure_reason=self.rejection_reason)
             return None
-        started = time.perf_counter()
         try:
             solution = np.asarray(self.optimizer.optimize(seed), dtype=np.float64)
         except (RuntimeError, nlopt.RoundoffLimited) as exc:
             self.rejection_reason = f"hand solver failed: {type(exc).__name__}: {exc}"
-            self.last_diagnostics = dict(
-                status=int(self.optimizer.last_optimize_result()),
-                solve_ms=(time.perf_counter() - started) * 1000,
-            )
             return None
         status = int(self.optimizer.last_optimize_result())
-        solve_ms = (time.perf_counter() - started) * 1000
         if (
             status <= 0 or solution.shape != HAND_JOINT_SHAPE
             or not np.isfinite(solution).all()
             or np.any(solution < lower - 1e-9) or np.any(solution > upper + 1e-9)
         ):
             self.rejection_reason = f"hand solver returned an invalid bounded solution (status={status})"
-            self.last_diagnostics = dict(
-                status=status, evaluations=self.optimizer.get_numevals(), solve_ms=solve_ms,
-                initial_loss=initial_loss, dt_s=dt_s, failure_reason=self.rejection_reason,
-            )
             return None
         solution = np.clip(solution, lower, upper)
         final_loss = objective(solution, np.empty(0))
         if not np.isfinite(final_loss) or final_loss > initial_loss + self.config.ftol_abs:
             self.rejection_reason = "hand solver did not improve the committed-command seed"
-            self.last_diagnostics = dict(
-                status=status, evaluations=self.optimizer.get_numevals(), solve_ms=solve_ms,
-                initial_loss=initial_loss, dt_s=dt_s,
-                final_loss=final_loss if np.isfinite(final_loss) else None,
-                failure_reason="non-finite final loss" if not np.isfinite(final_loss) else self.rejection_reason,
-            )
             return None
         # 同一个已提交目标同时作为 warm start、阻尼中心和唯一滤波状态。
         command = self.previous_command + alpha * (solution - self.previous_command)

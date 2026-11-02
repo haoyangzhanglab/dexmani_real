@@ -93,8 +93,6 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
         logger.warning(
             "%s: single row, no sampling interval to verify", reader.path
         )
-    for name in ROBOT_DATASET_SPECS:
-        reader[name]
     return camera, training_prefix(reader)
 
 

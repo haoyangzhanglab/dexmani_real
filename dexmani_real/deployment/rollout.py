@@ -35,7 +35,7 @@ from dexmani_real.runtime.observation import (
     read_observation,
 )
 from dexmani_real.runtime.state import RunEndReason, SafetyState, device_failure_reason
-from dexmani_real.utils.log import attach_cleanup_errors, error_detail
+from dexmani_real.utils.log import error_detail
 
 if TYPE_CHECKING:
     from dexmani_real.deployment.observation import PolicyObservationRow
@@ -75,7 +75,7 @@ class Rollout:
     def __init__(
         self, runtime_state, runtime, policy_info, *, epoch, robot,
         observations, needs, sensors, action_mapper, model, max_running_s,
-        capture_ids, index, output_dir, record_raw, camera_snapshot=None,
+        capture_ids, index, output_dir, record_raw, audio, camera_snapshot=None,
     ):
         self.runtime_state = runtime_state
         self.runtime = runtime
@@ -85,6 +85,7 @@ class Rollout:
         self.observations = observations
         self.needs = needs
         self.action_mapper, self.model = action_mapper, model
+        self.audio = audio
         self.recorder = (
             EpisodeRecorder(output_dir, control_hz=1.0 / policy_info.control_dt_s)
             if record_raw else None
@@ -155,22 +156,29 @@ class Rollout:
         self.history.clear()
         self.previous_arm = self.wait_deadline_ns = self.run_deadline_ns = None
         self.robot.stop()
+        if self.runtime_state.estop_request:
+            self.audio.play("emergency")
 
     def finish_recording(self, *, deadline):
         result = self.result
         if self.recorder is not None and self.recorder.start_attempted:
+            # 与键盘回调共同锁定首次 finish 的保存意图，等待 writer 时不持锁。
+            with self.runtime_state.motion_lock:
+                save = not self.discard_requested
             try:
-                self.recorder.finish(
-                    save=not self.discard_requested, reason=result.termination_reason,
-                    details=[dict(stage="termination", reason=result.termination_details), *result.errors],
+                published = self.recorder.finish(
+                    save=save, reason=result.termination_reason,
+                    details=[dict(stage="termination", reason=result.termination_details)],
                     technical_status="normal" if result.normal_termination else "failed",
                     deadline=deadline,
                 )
-            except BaseException as exc:
-                result.errors.append(error_detail("recorder_finalize", exc))
-                raise
             finally:
                 result.raw = self.recorder.result()
+            if not result.errors and not self.runtime_state.estop_request:
+                if published is not None and result.normal_termination:
+                    self.audio.play("save", interrupt=False)
+                elif not save:
+                    self.audio.play("discard", interrupt=False)
 
     @property
     def writer_pending(self):
@@ -193,7 +201,7 @@ class Rollout:
                         time.sleep(0.001)
             except OperationCancelled as exc:
                 # 取消不能掩盖同时发生的设备或 worker 故障。
-                self.robot.check(operation_error=exc)
+                self.robot.check()
                 self.stop(str(exc))
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
@@ -209,10 +217,10 @@ class Rollout:
                     if isinstance(stop_error, KeyboardInterrupt):
                         self.runtime_state.request_emergency_stop()
                     self.result.errors.append(error_detail("stop", stop_error))
-                    attach_cleanup_errors(exc, [("stop", stop_error)])
                     logger.exception("episode stop also failed")
             else:
                 self.result.errors.append(error_detail("stop", exc))
+            self.audio.play("emergency")
             raise
         finally:
             primary_failure = sys.exc_info()[1]
@@ -227,23 +235,25 @@ class Rollout:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
                 self.result.errors.append(error_detail("retired_model", exc))
+                self.audio.play("emergency")
                 if failure is None:
                     failure = exc
-                else:
-                    attach_cleanup_errors(failure, [("retired_model", exc)])
             finally:
                 try:
                     self.finish_recording(deadline=deadline)
                 except BaseException as exc:
-                    logger.exception("episode recording finalization failed")
+                    if exc is not primary_failure:
+                        self.result.errors.append(error_detail("recorder_finalize", exc))
+                        logger.exception("episode recording finalization failed")
                     if isinstance(exc, KeyboardInterrupt):
                         self.runtime_state.request_emergency_stop()
+                    self.audio.play("emergency")
                     if failure is None:
                         failure = exc
-                    else:
-                        attach_cleanup_errors(failure, [("recorder_finalize", exc)])
             if not self.model.has_pending_task:
                 self.query = None
+            # 清队列之前结束收尾代际，也撤销已取身份但尚未入队的旧 B/H/T。
+            self.runtime_state.revoke_motion()
             keyboard.discard_events("b", "h", "t")
             if failure is not None and primary_failure is None:
                 raise failure
@@ -485,6 +495,7 @@ class Rollout:
             self.robot.send_action(command, expires_ns=expires_ns)
             if self.previous_arm is None:
                 logger.info("Policy first target submitted run=%s", self.epoch)
+                self.audio.play("begin", interrupt=False)
             self.previous_arm = command.arm_qpos
             self.target_expires_ns = expires_ns
             self.wait_deadline_ns = None
@@ -497,14 +508,16 @@ class Rollout:
             primary_error = sys.exc_info()[1]
             if primary_error is not None:
                 self.runtime_state.revoke_motion(
-                    reason=failure_reason(primary_error), expected_run_id=self.epoch,
+                    reason=(
+                        RunEndReason.EXECUTOR_BOUNDARY
+                        if isinstance(primary_error, OperationCancelled) else failure_reason(primary_error)
+                    ),
+                    expected_run_id=self.epoch,
                 )
             try:
                 if row is not None and self.recorder is not None:
                     self.recorder.append(row, attempted_command)
-            except BaseException as exc:
+            except BaseException:
                 if primary_error is None:
                     raise
-                attach_cleanup_errors(primary_error, [("recording", exc)])
-                self.result.errors.append(error_detail("recording", exc))
                 logger.exception("episode frame recording also failed")

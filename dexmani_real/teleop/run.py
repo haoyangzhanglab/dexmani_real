@@ -27,13 +27,13 @@ from dexmani_real.runtime.lifecycle import (
     close_runtime,
 )
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
-from dexmani_real.runtime.state import RunEndReason, SessionState
+from dexmani_real.runtime.state import SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.sensor.vr import run_vr
 from dexmani_real.teleop.audio import AudioFeedback
 from dexmani_real.teleop.loop import TeleopLoop
 from dexmani_real.teleop.vr import VRController
-from dexmani_real.utils.log import configure_logging, error_detail
+from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import sample_is_fresh
 from dexmani_real.utils.vr_heading import load_vr_transform
 
@@ -100,6 +100,7 @@ def run_teleop(
     shutdown_clean = False
     loop = None
     keyboard = audio = None
+    primary_failure = None
     try:
         sensors = SensorWorkers(channels)
         robot = Robot(
@@ -115,7 +116,8 @@ def run_teleop(
             estop_callback=runtime_state.request_emergency_stop,
             bindings={
                 "s": runtime_state.request_stop,
-                "q": lambda: runtime_state.request_stop(reason=RunEndReason.QUIT),
+                "c": runtime_state.request_stop,
+                "q": runtime_state.request_quit,
             },
         )
         audio = AudioFeedback()
@@ -133,7 +135,6 @@ def run_teleop(
             runtime_config_json=runtime_config_json,
         )
         keyboard.bindings["d"] = loop.request_discard
-        keyboard.bindings["c"] = loop.request_pause
         keyboard.start()
 
         def check_services():
@@ -170,41 +171,46 @@ def run_teleop(
             loop.run()
         robot.check()
         clean = bool(runtime_state.quit_requested)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
+        primary_failure = exc
         runtime_state.request_emergency_stop()
-    except OperationCancelled as exc:
+    except OperationCancelled:
         try:
             if robot is not None:
-                robot.check(operation_error=exc)
+                robot.check()
             if not (
                 runtime_state.stop_signal.is_set() or runtime_state.quit_requested
                 or runtime_state.estop_request
             ):
                 raise
         except Exception as failure:
+            primary_failure = failure
             runtime_state.mark_error()
             if loop is not None:
                 loop.record_error("cancellation", failure)
-            logger.exception("teleop cancellation also failed: %s", error_detail("cancellation", failure)["message"])
+            logger.exception("teleop cancellation also failed")
         else:
             runtime_state.request_quit()
             clean = True
             logger.info("Teleop startup cancelled")
     except Exception as exc:
+        primary_failure = exc
         runtime_state.mark_error()
-        logger.exception("teleop session failed: %s", error_detail("session", exc)["message"])
+        logger.exception("teleop session failed")
     finally:
         try:
             if loop is not None:
                 loop.close()
         except Exception as exc:
             runtime_state.mark_error()
-            logger.exception("teleop capture cleanup failed: %s", error_detail("capture", exc)["message"])
+            if exc is not primary_failure:
+                logger.exception("teleop capture cleanup failed")
         finally:
             try:
                 close_runtime(runtime_state, robot, sensors=sensors, keyboard=keyboard)
             except BaseException as exc:
-                logger.error("teleop runtime cleanup failed: %s", error_detail("shutdown", exc)["message"])
+                if exc is not primary_failure:
+                    logger.exception("teleop runtime cleanup failed")
             else:
                 shutdown_clean = True
             finally:
@@ -214,17 +220,17 @@ def run_teleop(
                             clean and shutdown_clean and not runtime_state.error_state
                             and not runtime_state.estop_request
                         )
-                        audio.play(
-                            "end" if success else "emergency", interrupt=not success,
-                        )
                         try:
+                            audio.play(
+                                "end" if success else "emergency", interrupt=not success,
+                            )
                             if not audio.wait_until_idle(timeout_s=5.0):
                                 logger.warning("退出提示音未在 5 秒内播放完毕。")
                         finally:
                             audio.close()
-                    except Exception as exc:
+                    except Exception:
                         shutdown_clean = False
-                        logger.error("teleop audio cleanup failed: %s", exc)
+                        logger.exception("teleop audio cleanup failed")
     return int(
         not clean or not shutdown_clean or runtime_state.error_state or runtime_state.estop_request
     )
@@ -262,10 +268,11 @@ def initialize_teleop(loop, vr_process, *, run_id) -> bool:
             raise RuntimeError("VR failed to become ready before the startup timeout")
     if not calibrate_hand(loop):
         return False
-    loop.keyboard.discard_events("b", "c", "h", "t")
+    loop.runtime_state.revoke_motion()
+    loop.keyboard.discard_events("b", "h", "t")
     print(
-        "就绪：B 开始/继续 | C 暂停/继续 | S 保存结束本段 | D 丢弃本段 | "
-        "Q 暂停后再按确认退出（空闲时直接退出） | Esc 急停 | H 保存后回初始位 | "
+        "就绪：B 空闲时开始新段 | S/C 保存结束本段 | D 丢弃本段 | "
+        "Q 保存并退出 | Esc 急停 | H 空闲时回初始位 | "
         "T 空闲时复位触觉。",
         flush=True,
     )

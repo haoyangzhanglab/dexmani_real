@@ -27,7 +27,6 @@ from dexmani_real.robot.model import (
     XHAND_TACTILE_SENSOR_FINGER_IDS,
 )
 from dexmani_real.robot.xhand.feedback import XHandState
-from dexmani_real.utils.log import attach_cleanup_errors
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +202,8 @@ class XHand:
             try:
                 self.disconnect()
             except BaseException as cleanup_error:
-                attach_cleanup_errors(failure, [("hand_disconnect", cleanup_error)])
+                if isinstance(failure, OperationCancelled):
+                    raise cleanup_error
                 logger.exception("XHand connection cleanup failed")
             raise
 
@@ -245,7 +245,6 @@ class XHand:
         finally:
             self.connected_flag = False
         if errors:
-            attach_cleanup_errors(errors[0], (("hand_disconnect", error) for error in errors[1:]))
             for error in errors[1:]:
                 logger.error("additional XHand disconnect failure", exc_info=(type(error), error, error.__traceback__))
             raise errors[0]
@@ -269,7 +268,7 @@ class XHand:
     def reset_tactile_sensors(self, *, cancel_requested=lambda: False) -> None:
         """仅在静止、卸载时复位；SDK 成功不等于固件零点已生效。"""
         if self.control is None or not self.connected_flag:
-            raise RuntimeError("XHand is not connected")
+            raise RobotError("XHand is not connected")
         result = {
             "hand_tactile_reset_time_ns": time.time_ns(),
             "hand_tactile_reset_result": "incomplete (0/5)",
@@ -314,7 +313,7 @@ class XHand:
     def get_state(self) -> XHandState | None:
         """读 CRC 无可信新关节；触觉通道无完整有效新帧时对应字段为 None。"""
         if self.control is None or not self.connected_flag:
-            raise RuntimeError("XHand is not connected")
+            raise RobotError("XHand is not connected")
         query_started_ns = time.monotonic_ns()
         try:
             error, raw_state = self.control.read_state(self.cfg.device_id, True)

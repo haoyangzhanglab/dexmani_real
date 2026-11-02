@@ -1,5 +1,6 @@
 """父进程提交目标和生命周期请求，SDK 调用由子进程完成。"""
 
+import logging
 import multiprocessing as mp
 import time
 
@@ -13,7 +14,8 @@ from dexmani_real.robot.xarm7.protocol import (
     HomeRequest,
     PrepareRequest,
 )
-from dexmani_real.utils.log import attach_cleanup_errors
+
+logger = logging.getLogger(__name__)
 
 
 class ArmProcess:
@@ -100,7 +102,7 @@ class ArmProcess:
             raise
 
     def _read_fault(self):
-        # owner 的首个故障不会被清除；父进程复用同一异常，保留 cause 和收尾详情。
+        # owner 的首个故障不会被清除；父进程复用同一异常，保留原始 cause。
         issue = self.fault
         if (not issue and self.process is not None and self.process.pid is not None
                 and not self.process.is_alive()):
@@ -196,7 +198,11 @@ class ArmProcess:
             if time.monotonic_ns() >= deadline_ns:
                 raise TimeoutError("arm operation completed after deadline")
         except BaseException as failure:
-            self.request_stop()
+            errors = []
+            try:
+                self.request_stop()
+            except BaseException as exc:
+                errors.append(("arm_operation_stop_request", exc))
             # 本请求仍独占自己的回复；停止等待绝不接管 Pipe。
             cleanup_until = time.monotonic() + EXECUTOR_TIMEOUT_S
             try:
@@ -204,19 +210,29 @@ class ArmProcess:
                     if not self.pipe.poll(max(0, cleanup_until - time.monotonic())):
                         raise TimeoutError("cancelled arm operation reply remains pending")
                     reply = self.pipe.recv()
-                    if reply is not None and (
-                        self.fault or not isinstance(reply, (OperationCancelled, TimeoutError))
-                    ):
-                        if self.fault:
-                            raise self._read_fault() from reply
-                        raise RobotError("arm operation also failed") from reply
+                    if reply is not None:
+                        from dexmani_real.robot.xarm7.worker import _OperationTimeout
+
+                        # owner 自身的预算回复已消费；SDK TimeoutError 仍是故障。
+                        if self.fault or not isinstance(reply, (OperationCancelled, _OperationTimeout)):
+                            if self.fault:
+                                raise self._read_fault() from reply
+                            raise RobotError("arm operation also failed") from reply
+            except BaseException as exc:
+                errors.append(("arm_operation_reply", exc))
+            try:
                 self.wait_stopped(deadline=cleanup_until)
-            except BaseException as cleanup_error:
-                # 不再复用这个 owner；保留句柄直到明确关闭。
+            except BaseException as exc:
+                errors.append(("arm_operation_stop", exc))
+            if errors:
+                # 回复和停止分别收尾；任一未确认都禁止复用这个 owner。
                 self.io.closing.set()
-                attach_cleanup_errors(failure, [
-                    ("arm_operation_cleanup", cleanup_error),
-                ])
+                for stage, error in errors[1:]:
+                    logger.error("%s failed", stage, exc_info=(type(error), error, error.__traceback__))
+                if isinstance(failure, OperationCancelled):
+                    raise errors[0][1]
+                stage, error = errors[0]
+                logger.error("%s also failed", stage, exc_info=(type(error), error, error.__traceback__))
             raise
 
     def prepare(self, run_id, *, service):
@@ -283,5 +299,6 @@ class ArmProcess:
                 except BaseException as exc:
                     errors.append(exc)
         if errors:
-            attach_cleanup_errors(errors[0], (("arm_close", error) for error in errors[1:]))
+            for error in errors[1:]:
+                logger.error("additional arm close failure", exc_info=(type(error), error, error.__traceback__))
             raise errors[0]

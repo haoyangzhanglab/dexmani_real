@@ -8,7 +8,7 @@
 | --- | --- |
 | `teleop/retargeting/landmarks.py` | 掌系、骨长检查、固定骨长标定及 XHand 目标对应 |
 | `teleop/retargeting/objective.py` | 位置、方向、对指、阻尼的函数值与解析梯度 |
-| `teleop/retargeting/adaptive.py` | 求解限位、滤波、诊断及提交状态 |
+| `teleop/retargeting/adaptive.py` | 求解限位、滤波、拒绝原因及提交状态 |
 
 在线入口为 `sensor/vr.py` → `teleop/vr.py::VRController` → `AdaptiveHandRetargeter`。腕部映射与手部拒绝统一通过 `ActionResult` 返回，拒绝原因随本次结果传递。候选求解不推进状态；只有设备提交正常返回后，控制线程才从实际 `RobotCommand` 更新 warm start、阻尼中心、滤波中心和时间戳。每个控制 tick 都重新映射最新有效 landmarks，重复 VR 帧也可在速度限制内继续收敛。每个新段在 arm prepare 后从一份当前有效快照建立实测/VR 锚点，会话内骨长标定保留；进入 RUNNING 时记录的开始时刻也作为录制时长起点。重定向几何检查或求解失败会明确结束当前段。
 
@@ -16,7 +16,7 @@
 
 腕部原始四元数在 SDK 基变换前检查并归一化，零范数或非有限姿态被拒绝。接收边界的坏帧不发布，控制侧继续按原来源时间检查观测时效。
 
-真正终止的拒绝或异常控制步会将诊断保存到 `termination_details` 的 `stage="control_timing"` 条目；`hand_retargeting` 字段来自本步重定向调用已生成的诊断。错过提交窗口只累计软超时计数和最后一次的阶段、tick、时刻，不复制求解诊断；结束时打印一次，有 recorder 时只写一份汇总。成功控制步不逐帧保存这些诊断；重复 VR 帧也产生当次求解诊断。
+每段首次结束时记录一条简短原因日志；求解拒绝包含具体原因，异常保留原 traceback，不再持久化逐次 `control_timing` 或 operator 事件。错过提交窗口只累计软超时计数和最后一次的阶段、tick、时刻；结束时打印一次，有 recorder 时只写一份汇总。正常控制步不逐帧保存诊断，重复 VR 帧仍运行当次求解。控制与来源时间、动作截止时间和提交正常返回后的 `submit_end_ns` 保留。
 
 ## 输入与机构对应
 

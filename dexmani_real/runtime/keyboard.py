@@ -83,8 +83,8 @@ class Keyboard:
                 self.held_keys.remove(name)
                 return
 
-        # 不持 Condition 读取代际；C 的快照用于继续时拒绝陈旧意图。
-        run_id = self.get_run_id() if name in {"b", "c", "h", "r", "t"} else None
+        # 不持 Condition 读取代际；开始和准备操作绑定输入时的代际。
+        run_id = self.get_run_id() if name in {"b", "h", "r", "t"} else None
         # 停止回调先撤销权限，再发布按下事件；回调不执行 SDK I/O。
         callback = self.bindings.get(name)
         if callback is not None:
@@ -165,7 +165,7 @@ class Keyboard:
             if self.listener is not None:
                 self.listener.stop()
                 self.listener.join(timeout=LISTENER_STOP_TIMEOUT_S)
-                # XRecord 线程可能仍阻塞；active 已禁止它再次调用会话。
+                # 后端可能仍阻塞；关闭后不再入队，已接纳的幂等停止回调仍可完成。
                 if self.listener.is_alive():
                     logger.debug("keyboard backend still exiting after stop")
         finally:
@@ -192,12 +192,6 @@ class Keyboard:
                 if self.held_keys:
                     self.held_keys.clear()
         return healthy
-
-    def is_pressed(self, key):
-        if key == "esc":
-            return self.estop_latched
-        with self.condition:
-            return key in self.held_keys
 
     def snapshot(self) -> frozenset[str]:
         with self.condition:

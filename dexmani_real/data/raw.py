@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -12,11 +13,12 @@ import numpy as np
 from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.geometry.pose import validate_rigid_transform
 from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
-from dexmani_real.utils.log import attach_cleanup_errors
 from dexmani_real.utils.timing import sampling_clock_ns
 
 if TYPE_CHECKING:
     import h5py
+
+logger = logging.getLogger(__name__)
 
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
 TACTILE_PROCESSING = "sdk_native_bounded_previous_valid_channel_frame_hold"
@@ -212,7 +214,7 @@ class _VideoWriter:
             if failure is None:
                 failure = exc
             else:
-                attach_cleanup_errors(failure, [("video_container_close", exc)])
+                logger.exception("video container close also failed")
         else:
             self.container = None
         if failure is not None:
@@ -371,7 +373,8 @@ class RawWriter:
         self.timing_rows = None
         if errors:
             first = errors[0][1]
-            attach_cleanup_errors(first, errors[1:])
+            for stage, error in errors[1:]:
+                logger.error("%s also failed", stage, exc_info=(type(error), error, error.__traceback__))
             raise first
 
 
@@ -406,11 +409,11 @@ class RawReader:
             self.num_frames = len(self.data_file["timing/rows"])
             self.control_hz = float(meta["control_hz"])
             sampling_clock_ns(self.control_hz)
-        except BaseException as error:
+        except BaseException:
             try:
                 self.close()
-            except BaseException as cleanup:
-                attach_cleanup_errors(error, [("raw_reader_close", cleanup)])
+            except BaseException:
+                logger.exception("Raw reader close also failed")
             raise
 
     @property
@@ -457,9 +460,7 @@ class RawReader:
     def validate_tactile_metadata(self):
         if self.tactile_hold_max_age_s is None:
             for name, expected in (
-                ("hand_tactile_processing", TACTILE_PROCESSING),
                 ("hand_tactile_units", TACTILE_UNITS),
-                ("hand_tactile_axes", TACTILE_AXES),
                 ("hand_tactile_finger_order", TACTILE_FINGER_ORDER),
             ):
                 if self.meta[name] != expected:
@@ -506,7 +507,8 @@ class RawReader:
                     setattr(self, attribute, None)
         if errors:
             first = errors[0][1]
-            attach_cleanup_errors(first, errors[1:])
+            for stage, error in errors[1:]:
+                logger.error("%s also failed", stage, exc_info=(type(error), error, error.__traceback__))
             raise first
 
     def __enter__(self):
@@ -515,7 +517,7 @@ class RawReader:
     def __exit__(self, exc_type, error, traceback):
         try:
             self.close()
-        except BaseException as cleanup:
+        except BaseException:
             if error is None:
                 raise
-            attach_cleanup_errors(error, [("raw_reader_close", cleanup)])
+            logger.exception("Raw reader close also failed")

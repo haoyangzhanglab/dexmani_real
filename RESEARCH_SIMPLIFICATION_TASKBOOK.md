@@ -293,15 +293,15 @@ VR Teleop 与 Policy 使用一致的分段概念。Teleop 删除 `PAUSED`、`QUI
 
 ## 13. 最终完成标准与报告
 
-- [ ] 音频功能和资源保留，原有非阻塞播放、抢占及退出回收行为可用。
-- [ ] T1 分类错误与陈旧身份说明修正；键盘关闭承诺与真实行为一致。
-- [ ] T2 适用重复检查/包装删除，删除依据覆盖所有当前入口。
-- [ ] T3 使用统一按键表，旧暂停/确认状态没有隐藏兼容分支。
-- [ ] T4 不再构造递归 cleanup 异常图；真实失败、后续清理失败和未完成资源不会被取消掩盖。
-- [ ] T5 留有足够实验数据，重复事件/诊断与无用硬标签减少；数值配置有且仅有真实来源。
-- [ ] T6 每项明确已修复、不适用或待真实输入核实，不把条件问题写成普遍 bug。
-- [ ] Canonical、Raw、FK、触觉、动作及时序含义保持；没有新框架、身份协议或回执协议。
-- [ ] 文档与调用方同步；工作区无测试缓存、无无关改动、无被覆盖的用户工作。
+- [x] 音频功能和资源保留，非阻塞播放、抢占及退出回收通过 fake subprocess 回归；真实播放未验证。
+- [x] T1 分类错误与陈旧身份说明修正；键盘关闭承诺与真实行为一致。
+- [x] T2 适用重复检查/包装删除，删除依据覆盖所有当前入口。
+- [x] T3 使用统一按键表，旧暂停/确认状态没有隐藏兼容分支。
+- [x] T4 不再构造递归 cleanup 异常图；真实失败、后续清理失败和未完成资源不会被取消掩盖。
+- [x] T5 留有足够实验数据，重复事件/诊断与无用硬标签减少；数值配方仍由现有配置与 checkpoint 提供。
+- [x] T6 条件组合已复现；实际部署消费者待 checkpoint 核实，不把条件问题写成普遍 bug。
+- [x] Canonical、Raw、FK、触觉、动作及时序含义保持；没有新框架、身份协议或回执协议。
+- [x] 文档与调用方同步；工作区无测试缓存、无无关改动、无被覆盖的用户工作。
 
 最终报告保持简短但可核查：
 
@@ -312,3 +312,24 @@ VR Teleop 与 Policy 使用一致的分段概念。Teleop 删除 `PAUSED`、`QUI
 5. 剩余限制和需要用户决定的具体后续项。普通源码核实和实现选择自行完成，不把未完成工作包装成已落地。
 
 实施完成后在本文件末尾追加一小段实际结果或勾选完成项即可，不另建报告目录、状态数据库或新的长期任务框架。
+
+## 实际实施结果（2026-11-03）
+
+- 从干净的 `main@da1a3be` 建立 `research/simplification-a-e`；该 HEAD 比审查基线仅多本任务书。A→E 的适用修改已落实，并同步了可视化脚本中遗漏的异常 helper 调用方。配套 Policy 仅只读核对，保留其原有修改；未操作实验数据、连接设备、发布或合并分支。
+- Teleop/Policy 使用统一按键表，C=S、单 Q 保存退出、H 仅限空闲；D 在撤权锁内锁存，首次 finish 固定保存意图，收尾后清除旧 B/H/T。音频实现与所有 WAV 保留，Policy 补齐同一播放器接线，提交/发布/HOME 的实际返回决定提示时机，设备关闭先于尾音等待。
+- 删除父线程 owner 断言、重复 hand 连接和 RTC 内部 shape/finite 检查、冗余 Q 查询、单次 stop 包装、暂停/恢复/确认分支、递归 cleanup 异常图、逐次操作/控制时点 dict 及失去消费者的 retargeting diagnostics。保留设备/模型/文件边界、SDK/CRC、代际/限位/停止、来源时间、单份锚点、Raw 完整发布和连续训练前缀。
+- 未采用的减法：`Rollout.sensors` 仍有真实消费者；VR 就绪循环与服务检查保留；HOME 标定已按需加载，无需重做；checkpoint cloud recipe 的 exact-field gate 保留，因为 Policy 读取链未保证数值字段完整。处理器与提前准入的配置检查保持各自独立入口，不为消除初始化检查新增 validated 状态或开关。
+- 自动回归命令：`PYTHONDONTWRITEBYTECODE=1 /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m pytest -p no:cacheprovider -q tests`，结果 **97 passed**。覆盖真实 Robot/Replay/HOME/IPC 收尾、按键与键盘屏障、真实 AudioFeedback + fake subprocess、模型生命周期与 sync/async/RTC、真实 HDF5/MP4 发布与失败、连续导出前缀、Canonical 13 字段、FK/同源 RGB-D 和查看器关闭。测试不代表物理运动成功或真实音频可听。
+- 修改过的 Python 文件及测试执行 `python -m ruff check --no-cache --select E9,F,I …` 与 `git diff --check` 通过。Teleop（含 no-record）、Policy 配置打印，以及 keyboard/replay/export/visualize/view_realsense/view_pointcloud/control_xhand 的共 10 个 `--help`/`--print-config` 检查均退出 0，不启动设备。
+- 另以 `git show HEAD:<源码>` 加载修改前真实实现：128 组 joint/EEF 规范化、64 组关节映射、8 组 arm/hand FK 数组逐元素相等；手重定向使用真实标定/FK/Objective、仅替换有时限的 optimizer，8 组计算/commit/拒绝路径及退化输入与基线输出完全相同。未测量实际控制耗时，不宣称实时性能提升。
+- 几何：只读 Raw `episode_20261101_174738` 确认为 640×480、非零 Brown 系数；使用真实 Real 反投影与 Policy pinhole 投影，五个固定像素的单位深度合成样例最大误差为零系数约 `2.78e-5 px`、记录系数约 `3.3044 px`。没有实际部署 checkpoint，仍无法确认当前模型是否命中该融合消费者，因此未修改图像/点云数值或添加泛化 gate。若实验确用该消费者，后续须明确选择统一 rectification 或 Policy 支持畸变；本轮不跨仓实施。
+- **真机未验证**：低速启停/急停、VR 新段重锚、S/C 保存与 D 丢弃、HOME 取消、触觉就绪/过期、真实音频抢占与退出、设备时序和 NLopt 实时求解耗时，均需操作者现场验收。
+
+### 二次调用链审查与收口（2026-11-03）
+
+- 屏障测试复现并修复了已取得忙时代际、延迟到清队列后才入队的准备事件重新获权问题。Teleop/Policy 的启动、段收尾、HOME、触觉复位完成边界均撤销旧输入代际；不增加新状态或输入协议。Policy 本地提交取消改记 executor boundary，避免误报 policy failure。
+- 同一缓存异常经 Replay 运行/停止/健康检查/关闭重抛，以及同一 recorder 首错经 Teleop/Policy 运行/finish/close 重抛时，只保留一份主错结果及 traceback；独立后错仍报告。Policy 直接在构造时持有 SessionState，删除其重复初始化和无意义的 None 分支；移除 HOME 的空赋值和重复开始准入。
+- 删除无消费者的 pause/resume 音频事件接线，WAV 原样保留；收尾期间 Esc 不再触发普通 save/discard 提示。Policy 先发布设备/模型收尾结果再选择退出音频，结果发布失败或中断也会关闭播放器；新发生的音频关闭失败补记到已发布结果，不重试先前失败的发布。无录制时的普通目标拒绝仍打印一条明确终止原因。
+- 删除 Canonical 导出中由 training_prefix/RawReader 覆盖的重复字段预遍历；补齐真实 writer.close 失败及 write+close 同时失败的拒绝发布验证。受影响源码无 SHA-256、历史格式双轨或自定义版本机制可删；设备 CRC、数据 shape/dtype/指序/单位、完整发布与连续前缀检查继续保留。
+- 最新完整回归：同上禁缓存命令，**138 passed in 1.38s**；改动文件 Ruff、语法编译、10 个无硬件入口检查、临时源码副本的 wheel 构建与 `git diff --check` 均通过，仓库无禁止的测试缓存。定向 mypy 默认检查 5 个源文件通过，除 Session 外的 4 个源文件开启 `--check-untyped-defs` 也通过；Session 增强检查仍有 37 条生命周期资源可选字段注解问题（同组 HEAD 基线为 56 条），未用 ignore、额外断言或放宽检查掩盖，不宣称全仓类型检查通过。mypy 缓存和构建产物均在仓库外。
+- 未改变 sync/async/RTC 调度和数值算法，未改配套 Policy 或实验数据。此前几何条件及真机未验证限制保持。

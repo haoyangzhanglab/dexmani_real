@@ -5,7 +5,6 @@ import time
 
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.runtime.state import RunEndReason, SafetyState
-from dexmani_real.utils.log import attach_cleanup_errors
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +59,7 @@ class SensorWorkers:
         if self.channels is not None:
             self.channels.is_running.value = False
         deadline = time.monotonic() + SENSOR_SHUTDOWN_TIMEOUT_S
-        errors: list[BaseException] = []
+        errors = []
         unresolved = []
         for process in self.started:
             try:
@@ -77,7 +76,7 @@ class SensorWorkers:
                 if process.is_alive() or process.exitcode is None:
                     raise RuntimeError(f"process {process.name} could not be confirmed stopped")
                 if process.exitcode != 0 or escalation != "graceful":
-                    errors.append(RuntimeError(f"worker {process.name}: exitcode={process.exitcode}, {escalation}"))
+                    errors.append((process.name, RuntimeError(f"worker {process.name}: exitcode={process.exitcode}, {escalation}")))
                     logger.warning(
                         "worker %s stopped: exitcode=%s escalation=%s",
                         process.name,
@@ -86,16 +85,16 @@ class SensorWorkers:
                     )
             except BaseException as exc:
                 unresolved.append(process)
-                errors.append(exc)
-                logger.exception("worker %s shutdown failed", process.name)
+                errors.append((process.name, exc))
         self.started = unresolved
         if errors:
-            attach_cleanup_errors(errors[0], (("sensor_shutdown", error) for error in errors[1:]))
-            raise errors[0]
+            for stage, error in errors[1:]:
+                logger.error("worker %s shutdown failed", stage, exc_info=(type(error), error, error.__traceback__))
+            raise errors[0][1]
 
 
 def close_runtime(runtime_state, robot=None, *, sensors=None, keyboard=None):
-    """撤权后尝试全部关闭并聚合错误；日志和最终结果由会话出口报告。"""
+    """撤权后尝试全部关闭；首错向上传播，其余错误在此报告。"""
     runtime_state.stop_signal.set()
     errors = []
     for stage, close in (
@@ -113,6 +112,6 @@ def close_runtime(runtime_state, robot=None, *, sensors=None, keyboard=None):
         except BaseException as exc:
             errors.append((stage, exc))
     if errors:
-        first = errors[0][1]
-        attach_cleanup_errors(first, errors[1:])
-        raise first
+        for stage, error in errors[1:]:
+            logger.error("%s failed", stage, exc_info=(type(error), error, error.__traceback__))
+        raise errors[0][1]

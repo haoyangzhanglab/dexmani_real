@@ -12,7 +12,7 @@ import numpy as np
 
 from dexmani_real.config.sensor import CameraConfig
 from dexmani_real.geometry.camera import CameraIntrinsics
-from dexmani_real.utils.log import attach_cleanup_errors, configure_logging
+from dexmani_real.utils.log import configure_logging
 
 if TYPE_CHECKING:
     import pyrealsense2 as rs
@@ -132,11 +132,10 @@ class RealSenseCamera:
             self.aligner = rs.align(rs.stream.color)
             for _ in range(WARMUP_FRAMES):
                 self.read()
-        except BaseException as failure:
+        except BaseException:
             try:
                 self.disconnect()
-            except BaseException as exc:
-                attach_cleanup_errors(failure, [("camera_disconnect", exc)])
+            except BaseException:
                 logger.exception("RealSense startup cleanup failed")
             raise
 
@@ -241,8 +240,7 @@ def run_camera(shared, config: CameraConfig):
         failure = sys.exc_info()[1]
         try:
             camera.disconnect()
-        except BaseException as exc:
+        except BaseException:
             if failure is None:
                 raise
-            attach_cleanup_errors(failure, [("camera_disconnect", exc)])
             logger.exception("camera shutdown also failed")

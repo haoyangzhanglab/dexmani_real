@@ -1,0 +1,291 @@
+"""调用真实 Raw/Canonical 实现；只替换故障边界，不连接设备。"""
+
+from threading import Event
+from unittest.mock import Mock
+
+import h5py
+import numpy as np
+import pytest
+import zarr
+
+from dexmani_real.config.perception import PointCloudConfig
+from dexmani_real.data.export import (
+    ExportConfig,
+    canonical_array_specs,
+    export_zarr,
+    training_prefix,
+    validate_export_episode,
+)
+from dexmani_real.data.raw import RawReader, RawWriter, snapshot_recording_metadata
+from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
+from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
+from dexmani_real.robot.commands import RobotCommand
+from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
+from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
+from dexmani_real.runtime.observation import Observation
+
+
+@pytest.fixture
+def capture():
+    camera = CameraSnapshot(
+        "synthetic", CameraIntrinsics(32, 32, 200., 200., 15.5, 15.5, "none", (0.,) * 5),
+        .001, np.eye(4),
+    )
+    metadata = snapshot_recording_metadata(
+        camera, tactile_reset_metadata={}, tactile_hold_max_age_s=.5,
+    )
+
+    def row(index):
+        stamp = 1_000_000_000 + index * 100_000_000
+        arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+        hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
+        arm["timestamp_ns"] = stamp
+        for name in ("timestamp_ns", "tactile_aggregate_timestamp_ns", "tactile_dense_timestamp_ns"):
+            hand[name] = stamp
+        hand["tactile_aggregate"] = np.arange(15).reshape(5, 3)
+        hand["tactile_dense"] = np.arange(1800).reshape(5, 120, 3)
+        return Observation(
+            arm=arm, hand=hand,
+            camera={"rgb": np.full((32, 32, 3), 80, np.uint8),
+                    "depth": np.full((32, 32), 500, np.uint16),
+                    "timestamp_ns": stamp, "ring_sequence": index // 2},
+            vr={"wrist_pos": np.zeros(3), "wrist_quat_wxyz": np.array([1., 0., 0., 0.]),
+                "landmarks": np.zeros((21, 3)), "recv_ts_ns": stamp, "sequence_id": index},
+            point_cloud=None, observation_timestamp_ns=stamp + 1_000_000,
+            control_timestamp_ns=stamp,
+        )
+
+    return metadata, row, RobotCommand(1, np.zeros(7), np.zeros(12))
+
+
+def record(path, capture, *, frames=3, save=True, status="normal"):
+    metadata, row, command = capture
+    recorder = EpisodeRecorder(path, control_hz=10)
+    recorder.start(task_label="fixture", collection_source="teleop", metadata=metadata)
+    for index in range(frames):
+        recorder.append(row(index), command)
+    result = recorder.finish(save=save, reason="test", technical_status=status)
+    return recorder, result
+
+
+@pytest.mark.parametrize("frames,save,status", [(3, True, "normal"), (3, True, "failed"),
+                                                   (0, True, "normal"), (3, False, "normal")])
+def test_raw_publication_and_video(tmp_path, capture, frames, save, status):
+    recorder, result = record(tmp_path, capture, frames=frames, save=save, status=status)
+    assert not recorder.writer_pending
+    assert recorder.written_frames == frames
+    if frames and save:
+        assert result == recorder.published_path
+        with RawReader(result) as reader:
+            assert reader.num_frames == frames
+            assert reader.meta["technical_status"] == status
+            np.testing.assert_array_equal(reader["depth"][0], 500)
+            assert len(list(reader.iter_rgb_frames())) == frames
+    else:
+        assert result is None
+        assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("case,expected,reason", [
+    ("normal", 3, None),
+    ("gap", 2, "control_grid_drift"),
+    ("nan", 2, "nonfinite:action_arm_joint_target"),
+    ("failed", 2, "technical_failure_last_row"),
+    ("tactile", 2, "stale_source:tactile_dense_ns"),
+])
+def test_real_raw_continuous_training_prefix(tmp_path, capture, case, expected, reason):
+    _, path = record(tmp_path, capture, status="failed" if case == "failed" else "normal")
+    if case in {"gap", "nan", "tactile"}:
+        with h5py.File(path / "data.h5", "r+") as data:
+            if case == "nan":
+                data["action_arm_joint_target"][2] = np.full(7, np.nan)
+            else:
+                rows = data["timing/rows"][:]
+                if case == "gap":
+                    rows["control_ns"][2] += 100_000_000
+                    rows["observation_ns"][2] += 100_000_000
+                else:
+                    rows["tactile_dense_ns"] = rows["control_ns"][0]
+                    data["meta"].attrs["hand_tactile_hold_max_age_s"] = .15
+                data["timing/rows"][:] = rows
+    with RawReader(path) as reader:
+        quality = training_prefix(reader)
+        assert quality["row_stop"] == expected
+        assert quality["trim_reason"] == reason
+        # 重复相机 sequence 合法，不能按帧号删控制行。
+        np.testing.assert_array_equal(reader["timing/rows"]["camera_sequence"], [0, 0, 1])
+
+
+def test_canonical_export_real_fk_and_thirteen_fields(tmp_path, capture):
+    _, path = record(tmp_path / "raw", capture)
+    output = tmp_path / "canonical.zarr"
+    result = export_zarr(path, output, processing=ExportConfig(pointcloud=PointCloudConfig(
+        remove_table=False, num_points=32, workspace=(-1., -1., 0., 1., 1., 1.),
+    )))
+    assert result["total_frames"] == 3
+    root = zarr.open_group(str(output), mode="r")
+    specs = canonical_array_specs(32, 32, 32, 1024)
+    assert len(specs) == 13
+    assert set(root["data"].array_keys()) == set(specs)
+    for name, (shape, dtype) in specs.items():
+        array = root["data"][name]
+        assert array.shape == (3, *shape)
+        assert array.dtype == dtype
+        np.testing.assert_array_equal(array[0], array[1])
+    np.testing.assert_array_equal(root["data/finger_tactile_force"][0], np.arange(15).reshape(5, 3))
+    np.testing.assert_array_equal(root["data/taxel_tactile_force"][0], np.arange(1800).reshape(5, 120, 3))
+    assert root.attrs["source_id"]
+
+
+def test_export_prefix_still_checks_raw_field_shape(tmp_path, capture):
+    _, path = record(tmp_path, capture)
+    with h5py.File(path / "data.h5", "r+") as data:
+        del data["action_hand_joint_target"]
+        data.create_dataset("action_hand_joint_target", data=np.zeros((3, 11)))
+    with RawReader(path) as reader, pytest.raises(ValueError, match="incompatible shape/dtype"):
+        validate_export_episode(reader)
+
+
+@pytest.mark.parametrize("description", ["absent", "changed"])
+def test_tactile_explanatory_text_is_not_admission(tmp_path, capture, description):
+    _, path = record(tmp_path, capture)
+    with h5py.File(path / "data.h5", "r+") as data:
+        for name in ("hand_tactile_processing", "hand_tactile_axes"):
+            if description == "absent":
+                del data["meta"].attrs[name]
+            else:
+                data["meta"].attrs[name] = "explanatory text changed"
+    with RawReader(path) as reader:
+        assert reader.validate_tactile_metadata() == .5
+
+
+@pytest.mark.parametrize("name,value", [("hand_tactile_units", "N"),
+                                        ("hand_tactile_finger_order", "pinky,ring,middle,index,thumb"),
+                                        ("hand_tactile_hold_max_age_s", float("nan"))])
+def test_tactile_numeric_semantics_still_required(tmp_path, capture, name, value):
+    _, path = record(tmp_path, capture)
+    with h5py.File(path / "data.h5", "r+") as data:
+        data["meta"].attrs[name] = value
+    with RawReader(path) as reader, pytest.raises(ValueError):
+        reader.validate_tactile_metadata()
+
+
+def test_raw_close_attempts_all_resources_and_raises_first(caplog):
+    writer = RawWriter("unused", control_hz=10)
+    primary, secondary = OSError("video failed"), OSError("hdf5 failed")
+    writer.video = Mock(close=Mock(side_effect=primary))
+    writer.data_file = Mock(close=Mock(side_effect=secondary))
+    with pytest.raises(OSError) as caught:
+        writer.close()
+    assert caught.value is primary
+    writer.data_file.close.assert_called_once()
+    assert "hdf5_close also failed" in caplog.text
+    assert not hasattr(primary, "cleanup_errors")
+
+
+def test_reader_context_preserves_primary_and_reports_close(tmp_path, capture, monkeypatch, caplog):
+    _, path = record(tmp_path, capture)
+    reader = RawReader(path)
+    real_close = reader.close
+
+    def failed_close():
+        real_close()
+        raise OSError("injected reader close failure")
+
+    monkeypatch.setattr(reader, "close", failed_close)
+    primary = ValueError("input failure")
+    with pytest.raises(ValueError) as caught:
+        with reader:
+            raise primary
+    assert caught.value is primary
+    assert "injected reader close failure" in caplog.text
+
+
+def test_recording_first_cause_and_secondary_failure_are_flat(caplog):
+    recorder = EpisodeRecorder("unused", control_hz=10)
+    primary, secondary = OSError("write failure"), OSError("close failure")
+    recorder.store_error(primary)
+    recorder.store_error(secondary, stage="writer_close")
+    with pytest.raises(RecordingError) as caught:
+        recorder.check_error()
+    assert caught.value.__cause__ is primary
+    assert not hasattr(primary, "cleanup_errors")
+    assert "writer_close also failed" in caplog.text
+
+
+@pytest.mark.parametrize("failure", ["flush", "count"])
+def test_writer_failure_does_not_publish(tmp_path, capture, monkeypatch, failure):
+    original_finish = RawWriter.finish
+
+    def fail_finish(self, reason, details, *, expected_frames, technical_status):
+        if failure == "flush":
+            raise OSError("injected flush failure")
+        return original_finish(self, reason, details, expected_frames=expected_frames + 1,
+                               technical_status=technical_status)
+
+    if failure == "flush":
+        monkeypatch.setattr(RawWriter, "flush", Mock(side_effect=OSError("injected flush failure")))
+    else:
+        monkeypatch.setattr(RawWriter, "finish", fail_finish)
+    with pytest.raises(RecordingError):
+        record(tmp_path, capture)
+    assert all(path.name.startswith(".tmp_") for path in tmp_path.iterdir())
+    assert list(tmp_path.glob(".tmp_*/data.h5"))
+
+
+def test_queue_full_keeps_staging_and_original_cause(tmp_path, capture, monkeypatch):
+    entered, release = Event(), Event()
+    original_append = RawWriter.append_frame
+
+    def blocked_append(self, *args):
+        entered.set()
+        assert release.wait(5)
+        return original_append(self, *args)
+
+    monkeypatch.setattr(RawWriter, "append_frame", blocked_append)
+    metadata, row, command = capture
+    recorder = EpisodeRecorder(tmp_path, control_hz=10)
+    recorder.start(task_label="fixture", collection_source="teleop", metadata=metadata)
+    try:
+        recorder.append(row(0), command)
+        assert entered.wait(5)
+        for index in range(1, 17):
+            recorder.append(row(index), command)
+        with pytest.raises(RecordingError, match="queue full"):
+            recorder.append(row(17), command)
+    finally:
+        release.set()
+        with pytest.raises(RecordingError, match="queue full"):
+            recorder.finish(save=True, reason="test")
+    assert recorder.published_path is None
+    assert recorder.staging_path.is_dir()
+    assert not recorder.writer_pending
+
+
+@pytest.mark.parametrize("write_fails", [False, True])
+def test_writer_close_failure_keeps_staging_and_original_cause(
+    tmp_path, capture, monkeypatch, caplog, write_fails,
+):
+    primary, cleanup = OSError("injected write failure"), OSError("injected close failure")
+    original_close = RawWriter.close
+
+    def failed_close(writer):
+        original_close(writer)
+        raise cleanup
+
+    monkeypatch.setattr(RawWriter, "close", failed_close)
+    if write_fails:
+        monkeypatch.setattr(RawWriter, "append_frame", Mock(side_effect=primary))
+    metadata, row, command = capture
+    recorder = EpisodeRecorder(tmp_path, control_hz=10)
+    recorder.start(task_label="fixture", collection_source="teleop", metadata=metadata)
+    recorder.append(row(0), command)
+    with pytest.raises(RecordingError) as caught:
+        recorder.finish(save=True, reason="test", technical_status="normal")
+    assert caught.value.__cause__ is (primary if write_fails else cleanup)
+    assert not recorder.writer_pending and recorder.published_path is None
+    assert recorder.staging_path.is_dir()
+    assert not recorder.writer.data_file.id.valid
+    assert recorder.writer.video.container is None
+    if write_fails:
+        assert any(record.exc_info and record.exc_info[1] is cleanup for record in caplog.records)

@@ -84,7 +84,7 @@ class JointReplay:
                     if result.status == ReplayStatus.COMPLETED:
                         result.status, result.reason = self.replay_rows(trajectory, period_ns)
             except OperationCancelled as exc:
-                self.robot.check(operation_error=exc)
+                self.robot.check()
                 result.status = (
                     ReplayStatus.USER_QUIT if self.runtime_state.quit_requested else ReplayStatus.REJECTED
                 )
@@ -113,8 +113,9 @@ class JointReplay:
                 self.runtime_state.mark_error()
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
-                logger.exception("replay stop failed")
-                result.errors.append(exc)
+                if not any(exc is error for error in result.errors):
+                    result.errors.append(exc)
+                    logger.exception("replay stop failed")
                 result.status = ReplayStatus.FAULT
         result.replay_data = self.capture.to_dict()
         return result

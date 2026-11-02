@@ -1,0 +1,341 @@
+"""分段意图、代际与键盘关闭竞态；外部设备由最小 fake 替换。"""
+
+from pathlib import Path
+from threading import Event, Thread
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import numpy as np
+import pytest
+
+from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
+from dexmani_real.robot.commands import OperationCancelled
+from dexmani_real.runtime.keyboard import Keyboard, KeyEvent
+from dexmani_real.runtime.state import SessionState
+from dexmani_real.teleop.loop import TeleopLoop, TeleopPhase
+from dexmani_real.teleop.run import initialize_teleop
+
+
+def make_loop():
+    state = SessionState()
+    state.arm()
+    runtime = SimpleNamespace(
+        teleop=SimpleNamespace(control_hz=30, vr_stale_threshold_s=0.2),
+        hand=SimpleNamespace(enabled=False),
+    )
+    robot = Mock()
+    robot.prepare_streaming.side_effect = lambda epoch: state.stop_signal.clear()
+    controller = Mock(hand_retargeter=None)
+    controller.compute_target.return_value = SimpleNamespace(
+        rejection_reason=None, arm_qpos=np.zeros(7), hand_qpos=None, eef_pose=None,
+    )
+    keyboard = Keyboard(get_run_id=lambda: state.run_id, bindings={
+        's': state.request_stop, 'c': state.request_stop, 'q': state.request_quit,
+    }, estop_callback=state.request_emergency_stop)
+    keyboard.active = True
+    keyboard.listener = Mock()
+    keyboard.listener.is_alive.return_value = True
+    loop = TeleopLoop(
+        state, runtime, robot, task_label='test', sensors=SimpleNamespace(channels=None),
+        controller=controller, recording_dir=None, max_duration_s=100,
+        runtime_config_json=None, keyboard=keyboard, audio=Mock(),
+    )
+    keyboard.bindings['d'] = loop.request_discard
+    return loop
+
+
+def observation():
+    return SimpleNamespace(
+        observation_timestamp_ns=1, arm={'qpos': np.zeros((1, 7))}, hand=None,
+        vr={'wrist_pos': np.zeros(3), 'wrist_quat_wxyz': np.array([1., 0., 0., 0.]),
+            'recv_ts_ns': 1},
+    )
+
+
+def begin(loop):
+    with patch('dexmani_real.teleop.loop.read_observation', return_value=observation()), \
+         patch.object(loop, 'admit_observation', return_value=[]):
+        loop.start_episode(loop.runtime_state.run_id)
+    assert loop.phase is TeleopPhase.ACTIVE
+
+
+class Recorder:
+    start_attempted = True
+    finish_request = None
+    published_path = None
+    submitted_frames = 1
+
+    def __init__(self, on_finish=lambda: None):
+        self.on_finish = on_finish
+        self.calls = []
+
+    def finish(self, **kwargs):
+        self.calls.append(kwargs)
+        self.finish_request = kwargs
+        self.on_finish()
+        return Path('/tmp/episode') if kwargs['save'] and self.submitted_frames else None
+
+
+@pytest.mark.parametrize('key', ['s', 'c'])
+def test_stop_ends_segment_and_new_b_reanchors(key):
+    loop = make_loop()
+    begin(loop)
+    old_epoch = loop.run_id
+    loop.keyboard.handle_key(key, True)
+    loop.handle_commands(loop.keyboard.poll(0))
+    loop.end_episode('operator')
+    assert loop.phase is TeleopPhase.IDLE
+    loop.robot.stop.assert_called_once()
+    begin(loop)
+    assert loop.run_id != old_epoch
+    assert loop.controller.reset.call_count == 2
+
+
+def test_c_idle_does_not_start_or_create_recorder():
+    loop = make_loop()
+    loop.handle_commands([KeyEvent('c')])
+    assert loop.phase is TeleopPhase.IDLE
+    assert loop.recorder is None
+    loop.robot.prepare_streaming.assert_not_called()
+
+
+@pytest.mark.parametrize('key', ['s', 'c', 'd', 'q', 'esc'])
+def test_prepare_can_be_cancelled_by_keyboard(key):
+    loop = make_loop()
+
+    def prepare(epoch):
+        loop.runtime_state.stop_signal.clear()
+        loop.keyboard.handle_key(key, True)
+        raise OperationCancelled('prepare revoked')
+
+    loop.robot.prepare_streaming.side_effect = prepare
+    loop.run_episode(loop.runtime_state.run_id)
+    assert loop.phase is TeleopPhase.IDLE
+    loop.robot.stop.assert_called_once()
+    loop.controller.reset.assert_not_called()
+    if key in ('s', 'c', 'd'):
+        loop.audio.play.assert_not_called()
+    assert loop.runtime_state.quit_requested == (key == 'q')
+    assert loop.runtime_state.estop_request == (key == 'esc')
+
+
+def test_discard_then_single_q_does_not_publish():
+    loop = make_loop()
+    begin(loop)
+    recorder = loop.recorder = Recorder()
+    loop.keyboard.handle_key('d', True)
+    loop.keyboard.handle_key('q', True)
+    loop.handle_commands(loop.keyboard.poll(0))
+    loop.end_episode('quit')
+    assert loop.runtime_state.quit_requested
+    assert recorder.calls[0]['save'] is False
+    assert 'save' not in [call.args[0] for call in loop.audio.play.call_args_list]
+
+
+def test_finish_freezes_save_and_drops_preparation_keys():
+    loop = make_loop()
+    begin(loop)
+
+    def during_finish():
+        loop.request_discard()
+        for key in ('b', 'h', 't'):
+            loop.keyboard.handle_key(key, True)
+
+    recorder = loop.recorder = Recorder(during_finish)
+    loop.end_episode('operator')
+    assert recorder.calls[0]['save'] is True
+    assert not loop.discard_requested
+    assert loop.keyboard.poll(0) == []
+
+
+def test_h_active_does_not_stop_or_home():
+    loop = make_loop()
+    begin(loop)
+    with patch('dexmani_real.teleop.loop.home_robot') as home:
+        loop.handle_commands([KeyEvent('h', loop.runtime_state.run_id)])
+    assert loop.phase is TeleopPhase.ACTIVE
+    loop.robot.stop.assert_not_called()
+    home.assert_not_called()
+
+
+def test_old_start_intent_cannot_reauthorize():
+    loop = make_loop()
+    epoch = loop.runtime_state.run_id
+    loop.runtime_state.request_stop()
+    loop.start_episode(epoch)
+    assert loop.phase is TeleopPhase.IDLE
+    loop.robot.prepare_streaming.assert_not_called()
+
+
+def test_keyboard_stop_allows_admitted_stop_callback_without_queueing():
+    entered, release = Event(), Event()
+    stopped = Mock()
+
+    def get_run_id():
+        entered.set()
+        assert release.wait(2)
+        return 1
+
+    keyboard = Keyboard(get_run_id=get_run_id, bindings={'b': stopped})
+    keyboard.active = True
+    worker = Thread(target=keyboard.handle_key, args=('b', True))
+    worker.start()
+    assert entered.wait(2)
+    keyboard.stop()
+    release.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    stopped.assert_called_once()
+    assert not keyboard.events and not keyboard.held_keys
+    keyboard.handle_key('b', True)
+    stopped.assert_called_once()
+
+
+def test_primary_error_survives_stop_and_writer_failures():
+    loop = make_loop()
+    primary = ValueError('mapping failed')
+    writer = OSError('writer close failed')
+    recorder = loop.recorder = Recorder()
+    recorder.finish = Mock(side_effect=writer)
+
+    def fail_start(epoch):
+        loop.run_id = epoch
+        loop.phase = TeleopPhase.PREPARING
+        raise primary
+
+    loop.start_episode = fail_start
+    loop.robot.stop.side_effect = RuntimeError('stop failed')
+    with pytest.raises(ValueError) as raised:
+        loop.run_episode(loop.runtime_state.run_id)
+    assert raised.value is primary
+    assert not hasattr(primary, 'cleanup_errors')
+    recorder.finish.assert_called_once()
+    assert loop.runtime_state.error_state
+    assert {item['stage'] for item in loop.termination_details} >= {
+        'episode', 'stop', 'recording_cleanup',
+    }
+
+
+def test_recording_primary_is_not_reported_again_by_finish(tmp_path):
+    loop = make_loop()
+    begin(loop)
+    recorder = loop.recorder = EpisodeRecorder(tmp_path, control_hz=30)
+    recorder.start_attempted = True
+    original = recorder.error = OSError('writer failed')
+    with pytest.raises(RecordingError) as raised:
+        loop.run_episode(loop.run_id)
+    assert raised.value is recorder.error
+    assert raised.value.__cause__ is original
+    assert recorder.finish_request is not None
+    assert [item['stage'] for item in loop.termination_details if 'exception_type' in item] == ['episode']
+    loop.robot.stop.assert_called_once()
+
+
+def test_discard_is_latched_before_stop_can_trigger_finish():
+    loop = make_loop()
+    begin(loop)
+    recorder = loop.recorder = Recorder()
+    revoked, release, finishing, finished = Event(), Event(), Event(), Event()
+    original_stop = loop.runtime_state.request_stop
+
+    def stop_at_boundary():
+        original_stop()
+        revoked.set()
+        assert release.wait(2)
+
+    def finish():
+        finishing.set()
+        loop.finish_recording()
+        finished.set()
+
+    with patch.object(loop.runtime_state, 'request_stop', side_effect=stop_at_boundary):
+        callback = Thread(target=loop.request_discard)
+        callback.start()
+        try:
+            assert revoked.wait(2)
+            control = Thread(target=finish)
+            control.start()
+            assert finishing.wait(2)
+            assert not finished.wait(0.05)
+        finally:
+            release.set()
+            callback.join(2)
+        control.join(2)
+    assert not callback.is_alive() and not control.is_alive()
+    assert finished.is_set()
+    assert recorder.calls[0]['save'] is False
+
+
+@pytest.mark.parametrize('boundary', ['finish', 'startup', 'home', 'tactile'])
+@pytest.mark.parametrize('key', ['b', 'h', 't'])
+def test_preparation_event_delayed_until_after_boundary_is_revoked(boundary, key):
+    loop = make_loop()
+    captured, release = Event(), Event()
+    workers = []
+
+    def delayed_generation():
+        epoch = loop.runtime_state.run_id
+        captured.set()
+        assert release.wait(2)
+        return epoch
+
+    def input_at_boundary():
+        loop.keyboard.get_run_id = delayed_generation
+        worker = Thread(target=loop.keyboard.handle_key, args=(key, True))
+        workers.append(worker)
+        worker.start()
+        assert captured.wait(2)
+        return True
+
+    try:
+        if boundary == 'finish':
+            begin(loop)
+            loop.recorder = Recorder(input_at_boundary)
+            loop.end_episode('operator')
+        elif boundary == 'startup':
+            loop.sensors.channels = SimpleNamespace(vr_ring=SimpleNamespace(latest_sequence=1))
+            loop.sensors.start = Mock()
+            loop.sensors.check = input_at_boundary
+            with patch('dexmani_real.teleop.run.initialize_hand'):
+                assert initialize_teleop(loop, Mock(), run_id=loop.runtime_state.run_id)
+        elif boundary == 'home':
+            with patch('dexmani_real.teleop.loop.home_robot', side_effect=lambda *a, **kw: input_at_boundary()):
+                loop.handle_operator_command(KeyEvent('h', loop.runtime_state.run_id))
+        else:
+            loop.runtime.hand.enabled = True
+            loop.robot.reset_tactile_sensors.side_effect = lambda **kwargs: input_at_boundary()
+            loop.handle_operator_command(KeyEvent('t', loop.runtime_state.run_id))
+    finally:
+        release.set()
+        for worker in workers:
+            worker.join(2)
+            assert not worker.is_alive()
+    queued = loop.keyboard.poll(0)
+    assert len(queued) == 1 and queued[0].key == key
+    assert queued[0].run_id != loop.runtime_state.run_id
+    with patch.object(loop, 'run_episode') as run, patch('dexmani_real.teleop.loop.home_robot') as home:
+        loop.handle_commands(queued)
+        if key == 'b':
+            # B 的最终代际准入在 start_episode，不能用单纯的 mock 冒充该检查。
+            loop.start_episode(queued[0].run_id)
+            assert loop.phase is TeleopPhase.IDLE
+        else:
+            run.assert_not_called()
+        home.assert_not_called()
+    begin(loop)
+
+
+def test_target_rejection_without_recording_reports_reason_once(caplog):
+    loop = make_loop()
+    begin(loop)
+    caplog.set_level('INFO', logger='dexmani_real.teleop.loop')
+    loop.controller.compute_target.return_value = SimpleNamespace(
+        rejection_reason='hand solver did not improve the committed-command seed', arm_qpos=None,
+    )
+    loop.execute_control_step(observation(), tick_end_ns=10**18)
+    loop.robot.send_action.assert_not_called()
+    assert loop.recorder is None
+    loop.end_episode('interrupted')
+    messages = [record.getMessage() for record in caplog.records if '本段结束' in record.getMessage()]
+    assert len(messages) == 1
+    assert 'target_unavailable: hand solver did not improve the committed-command seed' in messages[0]

@@ -13,7 +13,6 @@ from dexmani_real.data.raw import RawWriter
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.runtime.observation import Observation
 from dexmani_real.utils.io import publish
-from dexmani_real.utils.log import attach_cleanup_errors
 from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -62,8 +61,8 @@ class EpisodeRecorder:
     def store_error(self, error, *, stage="recording_cleanup"):
         if self.error is None:
             self.error = error
-        else:
-            attach_cleanup_errors(self.error, [(stage, error)])
+        elif error is not self.error:
+            logger.error("%s also failed", stage, exc_info=(type(error), error, error.__traceback__))
 
     def check_error(self):
         if self.error is not None:
@@ -237,24 +236,16 @@ class EpisodeRecorder:
                 else:
                     writer.flush()
             except BaseException as exc:
-                if self.error is not None and exc is not self.error:
-                    logger.exception("Additional recording worker failure")
                 self.store_error(exc)
             finally:
                 writer.close()
         except BaseException as exc:
-            if self.error is not None and exc is not self.error:
-                logger.exception("Recording worker close also failed")
             self.store_error(exc, stage="writer_close")
         finally:
             self.ready.set()
             self.drain_frames()
             if self.error is not None:
-                logger.error(
-                    "Recording failed; staging retained: %s",
-                    staging,
-                    exc_info=(type(self.error), self.error, self.error.__traceback__),
-                )
+                logger.error("Recording failed; staging retained: %s", staging)
 
     def drain_frames(self):
         while True:

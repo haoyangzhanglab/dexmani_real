@@ -16,11 +16,7 @@ from dexmani_real.runtime.lifecycle import close_runtime
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 from dexmani_real.runtime.state import SafetyState, SessionState
 from dexmani_real.utils.io import write_json
-from dexmani_real.utils.log import (
-    attach_cleanup_errors,
-    configure_logging,
-    error_detail,
-)
+from dexmani_real.utils.log import configure_logging
 
 DEFAULT_OUTPUT_DIR = "replay_results"
 logger = logging.getLogger(__name__)
@@ -87,12 +83,13 @@ def run_replay(
     except OperationCancelled as exc:
         try:
             if robot is not None:
-                robot.check(operation_error=exc)
+                robot.check()
         except Exception as failure:
             runtime_state.mark_error()
             outcome.status = ReplayStatus.FAULT
-            outcome.errors.append(failure)
-            logger.exception("replay cancellation also failed")
+            if not any(failure is error for error in outcome.errors):
+                outcome.errors.append(failure)
+                logger.exception("replay cancellation also failed")
         else:
             outcome.status = (
                 ReplayStatus.ESTOP if runtime_state.estop_request else
@@ -104,9 +101,10 @@ def run_replay(
         outcome.status, outcome.reason = ReplayStatus.ESTOP, "KeyboardInterrupt"
     except Exception as exc:
         runtime_state.mark_error()
-        logger.exception("replay session failed")
         outcome.status = ReplayStatus.FAULT
-        outcome.errors.append(exc)
+        if not any(exc is error for error in outcome.errors):
+            outcome.errors.append(exc)
+            logger.exception("replay session failed")
     finally:
         shutdown_clean = False
         shutdown_failure = False
@@ -115,8 +113,9 @@ def run_replay(
             shutdown_clean = not runtime_state.error_state and not runtime_state.estop_request
         except BaseException as exc:
             shutdown_failure = True
-            outcome.errors.append(exc)
-            logger.error("replay shutdown failed: %s", error_detail("shutdown", exc)["message"])
+            if not any(exc is error for error in outcome.errors):
+                outcome.errors.append(exc)
+                logger.exception("replay shutdown failed")
             if isinstance(exc, KeyboardInterrupt):
                 runtime_state.request_emergency_stop()
         if outcome.status == ReplayStatus.FAULT or runtime_state.error_state or shutdown_failure:
@@ -134,15 +133,10 @@ def run_replay(
             outcome.status = ReplayStatus.FAULT
             outcome.errors.append(exc)
         finally:
-            # 保留非异常结束原因；真实错误按对象聚合后只在最终出口渲染。
-            if outcome.errors:
-                first = outcome.errors[0]
-                attach_cleanup_errors(first, (("replay_cleanup", exc) for exc in outcome.errors[1:]))
-                outcome.errors = [first]
+            # 保留非异常原因，各真实错误只写一份简短结果。
             outcome.reason = "; ".join(filter(None, (
                 outcome.reason,
-                *(f"{type(exc).__name__}: {error_detail('replay', exc)['message']}"
-                  for exc in outcome.errors),
+                *(f"{type(exc).__name__}: {exc}" for exc in outcome.errors),
             )))
             summary.update(
                 status=outcome.status.value,
@@ -195,7 +189,7 @@ def wait_for_home(runtime_state, runtime, robot, keyboard, outcome, home_results
                     cancel_requested=home_cancelled,
                 )
             except OperationCancelled as exc:
-                robot.check(operation_error=exc)
+                robot.check()
                 home_results.append(dict(ok=False, interrupted=True, reason=str(exc)))
                 if not (runtime_state.quit_requested or runtime_state.estop_request):
                     continue
@@ -205,13 +199,13 @@ def wait_for_home(runtime_state, runtime, robot, keyboard, outcome, home_results
                 outcome.reason = outcome.reason or str(exc)
                 break
             except (HomeConfigurationError, HomePathRejected) as exc:
-                robot.check(operation_error=exc)
+                robot.check()
                 home_results.append(dict(ok=False, interrupted=False, reason=str(exc)))
                 logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
                 continue
             except Exception as exc:
                 home_results.append(dict(
-                    ok=False, interrupted=False, reason=error_detail("home", exc)["message"],
+                    ok=False, interrupted=False, reason=str(exc),
                 ))
                 outcome.status = ReplayStatus.FAULT
                 outcome.reason = outcome.reason or "return_home incomplete"
