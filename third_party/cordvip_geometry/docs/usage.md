@@ -14,7 +14,7 @@ python -m cordvip_geometry download --models grounding sam
 python -m cordvip_geometry check
 ```
 
-显式 `check` 只核对解释器、源码、编译扩展和权重路径，可加 `--json` 读取结构化结果；追踪不再提供 `--check`，`check` 也不接收只影响推理的检测阈值。正常追踪直接加载所需源码、权重并执行边界检查，不生成环境报告或默认分析统计。算法使用的深度支持量和 pose-valid 门控仍逐行保存。
+显式 `check` 核对解释器、源码、编译扩展和权重路径，可加 `--json` 读取结构化结果。正常追踪直接加载所需源码、权重并执行边界检查；算法使用的深度支持量和 pose-valid 门控逐行保存。
 
 安装脚本为缺失源码选择以下 revision；已有目录直接复用：
 
@@ -27,7 +27,7 @@ python -m cordvip_geometry check
 
 FoundationPose 的官方权重需按其[官方说明](https://github.com/NVlabs/FoundationPose)另行取得，放入 `third_party/FoundationPose/weights/2023-10-28-18-33-37` 和 `2024-01-11-20-02-45`；每个目录包含 `config.yml` 与 `model_best.pth`。源码、权重与再分发分别遵循上游仓库和模型来源的许可证；本仓不变更其授权。
 
-下载命令从 [sam2_config.py](../src/cordvip_geometry/sam2_config.py) 和 [download_models.py](../src/cordvip_geometry/cli/download_models.py) 的明确官方 revision 获取所选模型，并保存下载来源。默认位置是 `reports/cordvip_models/`。运行只加载本地权重，不隐式联网下载。安装脚本保留 `TORCH_CUDA_ARCH_LIST`；无可见 GPU 的离线编译需按最终设备显式设置。
+下载命令从 [sam2_config.py](../src/cordvip_geometry/sam2_config.py) 和 [download_models.py](../src/cordvip_geometry/cli/download_models.py) 的明确官方 revision 获取所选模型，并保存下载来源。下载、分割和建模共用默认目录 `third_party/weights/`，该目录已被 Git 忽略。本地所需权重与配置文件齐全且非空时，下载命令直接复用，不联网或重复下载；此检查不验证文件内容，损坏文件应移走后重新下载。运行只加载本地权重，不隐式联网下载。安装脚本保留 `TORCH_CUDA_ARCH_LIST`；无可见 GPU 的离线编译需按最终设备显式设置。
 
 SAM 默认 small、BF16、eager；使用 `--sam-variant large` 时自动配对 large 的配置与本地权重：
 
@@ -47,8 +47,8 @@ Grounding DINO 仅用于首帧文本候选，确认后释放；复用 mask 或�
 ```bash
 python scripts/cordvip/track_object.py \
   --episode episodes/pick_place/episode_001 \
-  --asset outputs/object_asset --object-prompt 'white basket.' \
-  --with-hand --output outputs/scene_001
+  --asset /tmp/cordvip/object_asset --object-prompt 'white basket.' \
+  --with-hand --output /tmp/cordvip/scene_001
 ```
 
 Raw 首帧被冻结，用户确认候选，或省略 prompt 手画 mask。选择保存到 `initial_selections/`；已有选择通过 `--initial-selection DIR` 复用。复用仍核对原始 RGB、深度、K、畸变、来源时间、时钟及 Raw 行身份，不能用于另一段录像。Raw 原样搬迁目录时，内容与行身份核对仍须成立。
@@ -57,17 +57,17 @@ Raw 首帧被冻结，用户确认候选，或省略 prompt 手画 mask。选择
 
 ```json
 {"objects": [
-  {"id": "toy", "role": "object", "asset": "outputs/toy_asset",
-   "initial_selection": "outputs/toy_first_frame"},
-  {"id": "basket", "role": "reference", "asset": "outputs/basket_asset",
-   "initial_selection": "outputs/basket_first_frame"}
+  {"id": "toy", "role": "object", "asset": "/tmp/cordvip/toy_asset",
+   "initial_selection": "/tmp/cordvip/toy_first_frame"},
+  {"id": "basket", "role": "reference", "asset": "/tmp/cordvip/basket_asset",
+   "initial_selection": "/tmp/cordvip/basket_first_frame"}
 ]}
 ```
 
 ```bash
 python scripts/cordvip/track_object.py \
   --episode episodes/pick_place/episode_001 --scene scene.json \
-  --with-hand --headless --output outputs/scene_002
+  --with-hand --headless --output /tmp/cordvip/scene_002
 ```
 
 `role` 仅是 metadata 标签。省略某个 `asset` 就保留该实例的 mask 和语义实测点，不估计或伪造 pose；全部省略时不需要 FoundationPose。新场景可用 `prompt` 逐个确认，也可手画。无窗口运行要求每个实例都有当前首帧的确认选择，不自动接受最高分候选。单物体同样支持 mask-only：省略 `--asset` 即可。
@@ -90,7 +90,7 @@ SAM 失败保留子进程原始 traceback，父进程错误指向该日志。Fou
 
 逐行 NPZ 是唯一逐帧结果。文件名对应源 row，不是墙钟序号。对象字段使用 `toy__`、`basket__` 或单物体 `object__` 前缀，对象清单与 role 只存于 `scene.json`。每个实例分别保存 `pose_valid` 和 `observed_valid`；pose 无效时 `T_camera_object` 为 NaN，查看或分析时模型点为空，独立实测点仍可有效。`candidate_T_camera_object` 保存门控前候选（没有候选时为 NaN），不能代替有效位姿重建模型点。已计算的 `model_supported_mask` 与 `observed_model_depth_residual_m` 在拒绝候选的失败帧中也保存；支持点数/比例只在实际完成模型深度比较时保存。
 
-模板中的 `points_object` 与 `normals_object` 保持资产载入后的原始顺序、float32、米制 object frame，不归一化、重采样或翻转。逐帧保留 `observed_points_camera`、可选的 `hand_points_camera`/`hand_normals_camera` 和有效 pose；不再计算或写入 `model_points_camera`、`model_normals_camera`。每个 NPZ 保留 `K`；启用 `--with-hand` 时同一文件还含 `T_base_camera`、`hand_link_ids` 和关节状态，无需跨文件解析标定。重建模型后若需 base 坐标，点保持 float32，法向保持矩乘的自然 dtype：
+模板中的 `points_object` 与 `normals_object` 保持资产载入后的原始顺序、float32、米制 object frame，不归一化、重采样或翻转。逐帧保留 `observed_points_camera`、可选的 `hand_points_camera`/`hand_normals_camera` 和有效 pose；模型点与法向由模板和有效 pose 重建。每个 NPZ 保留 `K`；启用 `--with-hand` 时同一文件还含 `T_base_camera`、`hand_link_ids` 和关节状态，无需跨文件解析标定。重建模型后若需 base 坐标，点保持 float32，法向保持矩乘的自然 dtype：
 
 ```python
 R, t = T_base_camera[:3, :3], T_base_camera[:3, 3]
@@ -99,9 +99,9 @@ normals_base = normals_camera @ R.T
 ```
 
 ```bash
-python -m cordvip_geometry view outputs/scene_001
-python -m cordvip_geometry view outputs/scene_001 --no-3d
-python -m cordvip_geometry view outputs/scene_001 --headless
+python -m cordvip_geometry view /tmp/cordvip/scene_001
+python -m cordvip_geometry view /tmp/cordvip/scene_001 --no-3d
+python -m cordvip_geometry view /tmp/cordvip/scene_001 --headless
 ```
 
 离线分析从输出内模板与有效 pose 重建，不访问原资产或重新执行模型。下面以有资产的单物体 `object` 为例；多物体分别使用自己的模板与字段前缀，mask-only 直接保留空模型点：
@@ -109,11 +109,11 @@ python -m cordvip_geometry view outputs/scene_001 --headless
 ```python
 import numpy as np
 
-with np.load("outputs/scene_001/model_templates/object.npz", allow_pickle=False) as template:
+with np.load("/tmp/cordvip/scene_001/model_templates/object.npz", allow_pickle=False) as template:
     points_object = template["points_object"]
     normals_object = template["normals_object"]
 
-with np.load("outputs/scene_001/frames/000000.npz", allow_pickle=False) as row:
+with np.load("/tmp/cordvip/scene_001/frames/000000.npz", allow_pickle=False) as row:
     valid = bool(row["object__pose_valid"])
     if valid:
         pose = row["object__T_camera_object"]
@@ -133,31 +133,11 @@ with np.load("outputs/scene_001/frames/000000.npz", allow_pickle=False) as row:
 
 查看器按 `n`/Space 前进一行、`v` 切换 observed/model、`q`/`Q`/Esc 或关窗退出。每行只解压显示字段一次；3D 默认 observed，首次切换 model 才加载各声明资产的模板点，并用普通字典在本次查看中复用。只在新行或表示切换时重建需要显示的模型点；pose 无效或 mask-only 显示空点，声明资产缺模板明确报错。`--no-3d` 不读取模板或点云。`view --headless` 仅检查 RGB 的 uint8 网格、文件名对应的 row 及来源时间/时钟，不读取 scene/run、模板、对象字段或生成 overlay，不加载 OpenCV/Open3D。新行更新 RGB 和几何，`v` 只更新几何，静止时仅轮询事件和渲染；不读取未展示的法向、候选位姿或残差。查看不访问 Raw、mesh、URDF、FK 或模型环境。
 
-新布局不自动迁移历史结果。有资产对象的 model 模式要求 `model_templates/<object_id>.npz`，不会回退读取旧帧内的两个派生数组；mask-only 无需模板。旧结果仍可按原格式用 NumPy 分析。满足现有字段要求的历史结果仍可用 headless、二维叠加或 observed 模式查看。
-
 ## 准备物体资产
 
-```bash
-python -m cordvip_geometry download --models shape
-python scripts/cordvip/reconstruct_object.py \
-  --image /path/to/object.jpg --text 'white basket.' \
-  --output-dir outputs/object_build --preview
-```
+操作命令、尺度定义、输出文件和无窗口流程统一见[物体重建与 1024 点点云](../../../docs/object_reconstruction.md)。`reconstruct_object.py` 与 `object build` 共用实现；已有 CAD/扫描网格可直接 `prepare`。
 
-分割需要人工确认，生成的 `foreground_rgba.png` 才是 Hunyuan 输入。分割和 prepare 是普通函数调用，Hunyuan 生成单独运行一次子进程，退出释放 GPU；SAM 仍有自己的隔离子进程。生成只输出未定尺度 mesh 与来源记录，不再落盘未定尺度点云。`--preview` 临时采样，不影响最终资产。
-
-检查模型轴后，若 z 轴确实对应实测 12 cm 高度：
-
-```bash
-python -m cordvip_geometry prepare \
-  --mesh outputs/object_build/generation/mesh_unscaled.obj \
-  --size-axis z --size-meters 0.12 --num-points 1024 --seed 0 \
-  --output-dir outputs/object_asset --preview
-```
-
-也可显式提供 `--scale-to-meters`；已有米制 mesh 使用 1。最终资产包含 `mesh_m.obj`、`points.npy`、`normals.npy` 与 `asset.json`。缩放作用于原点偏移，保持对象朝向，不自动居中；按原 seed 和点数在最终米制 mesh 上只采样一次。已有 CAD/扫描 mesh 可直接 prepare。
-
-完整流程 `object build` 与 `reconstruct_object.py` 共用实现。分阶段可用 `object segment --list-only` 保存候选、`object select` 确认、`object generate` 生成；无窗口选择必须指定 `--instance`。score 是 Grounding DINO 检测分数，mask_score 是 SAM2 预测 IoU，均非人工真值。Hunyuan 使用本地 2.1 权重，不隐式执行 rembg、清理、居中或尺度估计。
+分割与尺度校准直接执行，Hunyuan 生成运行在独立子进程中，退出释放 GPU。分割的 `foreground_rgba.png` 是重建输入；生成结果是未定尺度网格，最终点云只在指定米制尺度后保存。`--preview` 临时采样不改变最终资产。
 
 ## 数据语义
 

@@ -19,8 +19,8 @@ python -m cordvip_geometry check
 ```bash
 python scripts/cordvip/track_object.py \
   --episode episodes/pick_place/episode_001 --scene scene.json \
-  --with-hand --headless --output outputs/scene_001
-python -m cordvip_geometry view outputs/scene_001
+  --with-hand --headless --output /tmp/cordvip/scene_001
+python -m cordvip_geometry view /tmp/cordvip/scene_001
 ```
 
 追踪默认处理全部行，只有 `--max-frames` 显式限制前缀。`frames/` 必存，`scene.json` 保存一次对象/role/asset/selection，`run.json`、`models.json`、`result.json` 分别记录配置、已就绪模型来源与最终结果。有资产的对象在处理帧前写入 `model_templates/<object_id>.npz`，含原顺序、float32、米制 object frame 的 `points_object` 与 `normals_object`；mask-only 对象不写模板。逐帧事实只写入 NPZ，包括失败原因、门控前候选位姿和已计算的支持掩码、深度残差。输出使用新目录，Raw 始终只读。首帧选择仍需与源数据及相机几何精确对应。

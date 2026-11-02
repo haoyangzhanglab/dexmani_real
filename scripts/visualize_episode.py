@@ -18,12 +18,11 @@ os.environ.setdefault("RUST_LOG", "error")
 
 import numpy as np
 
-from dexmani_real.config.perception import PointCloudConfig
+from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.config.real import load_config
 from dexmani_real.data.raw import RawReader
-from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
-from dexmani_real.geometry.pose import encode_eef_pose
-from dexmani_real.perception.hand_cloud import hand_geometry
+from dexmani_real.geometry.kinematics import ArmFK, HandFK
+from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.utils.log import attach_cleanup_errors
 from dexmani_real.utils.table_plane import load_table_plane
@@ -93,6 +92,7 @@ class EpisodeVisualizer:
         table_plane_path: str | Path | None,
         max_frames: int | None = None,
         pointcloud_config: PointCloudConfig | None = None,
+        hand_pointcloud_config: HandCloudConfig = HandCloudConfig(),
     ):
         import rerun as rr
 
@@ -119,8 +119,8 @@ class EpisodeVisualizer:
                 self.frame_count = min(self.frame_count, max_frames)
             self.camera_model = self.reader.read_camera()
             self.T_xarm_base_from_color = self.camera_model.T_xarm_base_from_color
-            if self.T_xarm_base_from_color is None:
-                logger.warning("No camera extrinsics: displaying pixels without point cloud")
+            if pointcloud_config is not None and self.T_xarm_base_from_color is None:
+                logger.warning("No camera extrinsics: camera point cloud disabled")
             self.pointcloud_processor = None
             self.empty_cloud_count = 0
             self.pointcloud_processing_ns = 0
@@ -142,6 +142,9 @@ class EpisodeVisualizer:
 
             logger.info("Frames=%d", self.frame_count)
 
+            self.arm_fk = ArmFK()
+            self.hand_fk = HandFK()
+            self.hand_cloud = HandPointCloud(self.hand_fk, hand_pointcloud_config.num_points)
             self.state = self.preload_state()
 
             app_id = f"DexMani - {episode_name}"
@@ -188,25 +191,6 @@ class EpisodeVisualizer:
             key: self.reader[key][: self.frame_count] for key in RAW_SERIES_FIELDS
         }
 
-        arm = state["arm_qpos"]
-        hand = state["hand_qpos"]
-        arm_valid = np.all(np.isfinite(arm), axis=1)
-        hand_valid = arm_valid & np.all(np.isfinite(hand), axis=1)
-        state["arm_ee"] = np.full((self.frame_count, 9), np.nan)
-        state["hand_fingertip"] = np.full((self.frame_count, 5, 3), np.nan, dtype=np.float32)
-        if np.any(arm_valid):
-            arm_fk = ArmFK()
-            poses = eef_poses(arm[arm_valid], arm_fk=arm_fk)
-            state["arm_ee"][arm_valid] = encode_eef_pose(poses)
-        if np.any(hand_valid):
-            hand_fk = HandFK()
-            state["hand_fingertip"][hand_valid] = hand_geometry(
-                poses[hand_valid[arm_valid]],
-                hand[hand_valid],
-                arm_fk=arm_fk,
-                hand_fk=hand_fk,
-            )["fingertip_xyz"]
-
         contact = self.reader["hand_contact"][: self.frame_count]
         state["hand_contact_mag"] = np.linalg.norm(contact, axis=2)
         state["hand_force_thumb"] = contact[:, 0, :]
@@ -228,14 +212,28 @@ class EpisodeVisualizer:
         self.rr.set_time_seconds("time", float(self.timestamps_s[step_idx]))
         depth = self.log_camera(step_idx, rgb)
         self.log_pointcloud(rgb, depth)
-        fingertips = self.state["hand_fingertip"][step_idx]
+        self.log_hand_geometry(step_idx)
+
+    def log_hand_geometry(self, step_idx: int) -> None:
+        arm = self.state["arm_qpos"][step_idx]
+        hand = self.state["hand_qpos"][step_idx]
+        pose = self.arm_fk.forward(arm) if np.isfinite(arm).all() else None
+        fingertips, cloud = None, None
+        if pose is not None and np.isfinite(hand).all():
+            # 指尖和表面点共用一次手部 FK，逐帧发送避免缓存整段稠密点云。
+            geometry = hand_geometry(
+                pose[None], hand[None],
+                arm_fk=self.arm_fk, hand_fk=self.hand_fk, hand_cloud=self.hand_cloud,
+            )
+            fingertips = geometry["fingertip_xyz"][0]
+            cloud = geometry["hand_pointcloud"][0]
+        log_points("hand_pointcloud", cloud)
         log_points(
-            "fingertips", fingertips if np.isfinite(fingertips).all() else None,
+            "fingertips", fingertips,
             colors=FINGERTIP_COLORS, radii=0.012,
         )
-        pose = self.state["arm_ee"][step_idx]
         log_points(
-            "eef", pose[None, :3] if np.isfinite(pose).all() else None,
+            "eef", pose[None, :3, 3] if pose is not None else None,
             colors=[EEF_COLOR], radii=0.020,
         )
 
@@ -316,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         "--point-cloud",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help=("Display the canonical point cloud (default: enabled)."),
+        help="Display the camera point cloud; FK hand cloud is always shown (default: enabled).",
     )
     args = parser.parse_args(argv)
     if args.max_frames is not None and args.max_frames <= 0:
@@ -343,6 +341,7 @@ def main(argv: list[str] | None = None) -> int:
         table_plane_path=runtime.environment.table_plane_path,
         max_frames=args.max_frames,
         pointcloud_config=pointcloud_config,
+        hand_pointcloud_config=runtime.hand_pointcloud,
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.frame_count)

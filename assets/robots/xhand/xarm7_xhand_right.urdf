@@ -218,7 +218,7 @@
   <link name="custom_eef_link" />
 
   <joint name="flange_joint2" type="fixed">
-    <origin rpy="0 -1.5708 0" xyz="0.0 0 0.04" />
+    <origin rpy="0 -1.5708 0" xyz="0.002256 0.001696 0.036836" />
     <parent link="link_eef" />
     <child link="custom_eef_link" />
   </joint>

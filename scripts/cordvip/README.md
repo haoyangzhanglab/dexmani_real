@@ -1,27 +1,10 @@
 # 物体资产与 Raw 离线几何
 
-两个入口分别负责[单图建模](reconstruct_object.py)和[逐行追踪](track_object.py)。算法及安装说明见 [cordvip_geometry](../../third_party/cordvip_geometry/README.md) 和[使用文档](../../third_party/cordvip_geometry/docs/usage.md)。以下命令在仓库根目录、已准备依赖的环境中执行；示例 Raw、资产和模型不随仓库分发。
+两个入口分别负责[单图建模](reconstruct_object.py)和[逐行追踪](track_object.py)。算法及安装说明见 [cordvip_geometry](../../third_party/cordvip_geometry/README.md) 和[使用文档](../../third_party/cordvip_geometry/docs/usage.md)。以下命令在仓库根目录、已准备依赖的环境中执行；示例 Raw、网格和模型权重不随仓库分发，参考图和点云资产位于 [pnp_apple_banana](../../assets/pointcloud_template/object/pnp_apple_banana)。
 
 ## 准备米制资产
 
-先分割并人工确认目标，再生成未定尺度 mesh：
-
-```bash
-python scripts/cordvip/reconstruct_object.py \
-  --image /path/to/object.jpg --text 'white basket.' \
-  --output-dir outputs/object_build --preview
-```
-
-`generation/` 只保存 `mesh_unscaled.obj` 与请求、结果记录。预览点临时生成。单图没有真实尺度；检查模型轴后，若 z 轴确实对应实测 12 cm 高度：
-
-```bash
-python -m cordvip_geometry prepare \
-  --mesh outputs/object_build/generation/mesh_unscaled.obj \
-  --size-axis z --size-meters 0.12 \
-  --output-dir outputs/object_asset --preview
-```
-
-最终 `mesh_m.obj`、`points.npy`、`normals.npy` 和 `asset.json` 使用米制 object frame，保持原点与朝向。固定点和法向只在最终尺度按 seed 生成一次。也可向建模入口直接提供尺寸或 `--scale-to-meters`，米制资产会保存到 `asset/`；已有 CAD/扫描 mesh 可直接 prepare。
+按[物体重建与 1024 点点云](../../docs/object_reconstruction.md)完成分割、重建与尺度校准。最终资产目录包含米制 `mesh/mesh_m.obj`、固定采样的 `points.npy`、`normals.npy` 和 `asset.json`。参考图 `reference.jpg`、元数据、NPY 与导出的 PLY 点云纳入 Git；`mesh/` 和 `third_party/weights/` 仅保留本地。克隆后可直接使用点云；FoundationPose 需要先在本地重建完整资产，再将该目录传给下方 `--asset`，缺失网格会明确报错。
 
 ## 确认首帧并逐行追踪
 
@@ -30,8 +13,8 @@ python -m cordvip_geometry prepare \
 ```bash
 python scripts/cordvip/track_object.py \
   --episode episodes/pick_place/episode_001 \
-  --asset outputs/object_asset --object-prompt 'white basket.' \
-  --with-hand --output outputs/scene_001
+  --asset /tmp/cordvip/object_asset --object-prompt 'white basket.' \
+  --with-hand --output /tmp/cordvip/scene_001
 ```
 
 在冻结的 Raw 首帧上确认文本候选，或省略 prompt 手动画 mask。选择保存到输出的 `initial_selections/`；`scene.json` 记录可复用的对象与选择路径。再次运行可指定 `--initial-selection DIR`。复用仍严格核对首帧 RGB-D、内参、畸变、来源时间和行身份，不把历史 mask 套到另一段录像。
@@ -40,17 +23,17 @@ python scripts/cordvip/track_object.py \
 
 ```json
 {"objects": [
-  {"id": "toy", "role": "object", "asset": "outputs/toy_asset",
-   "initial_selection": "outputs/toy_first_frame"},
-  {"id": "basket", "role": "reference", "asset": "outputs/basket_asset",
-   "initial_selection": "outputs/basket_first_frame"}
+  {"id": "toy", "role": "object", "asset": "/tmp/cordvip/toy_asset",
+   "initial_selection": "/tmp/cordvip/toy_first_frame"},
+  {"id": "basket", "role": "reference", "asset": "/tmp/cordvip/basket_asset",
+   "initial_selection": "/tmp/cordvip/basket_first_frame"}
 ]}
 ```
 
 ```bash
 python scripts/cordvip/track_object.py \
   --episode episodes/pick_place/episode_001 --scene scene.json \
-  --with-hand --headless --output outputs/scene_002
+  --with-hand --headless --output /tmp/cordvip/scene_002
 ```
 
 `role` 是一次保存的标签，不改变算法。省略某个 `asset` 时，该对象只输出连续 mask 与实测深度点，不估计 pose；全部省略时不要求 FoundationPose。无窗口运行要求每个实例都有当前首帧的确认选择，不会自动接受最高分候选。
@@ -58,10 +41,10 @@ python scripts/cordvip/track_object.py \
 默认顺序处理全部 Raw 行，不按墙钟跳帧。`--max-frames N` 显式限制处理前缀，结果标为 partial。输出目录必须尚不存在；处理前将各资产的固定点/法向写入 `model_templates/<object_id>.npz` 一次，每行结果保存为 `frames/000000.npz` 等，源 row ID、时间和时钟保留。逐帧保存有效/候选 pose 与实测数据，不再派生或保存模型点/法向。mask-only 不生成模板。查看结果是独立步骤：
 
 ```bash
-python -m cordvip_geometry view outputs/scene_001
+python -m cordvip_geometry view /tmp/cordvip/scene_001
 # 只看二维结果，或无窗口读取检查
-python -m cordvip_geometry view outputs/scene_001 --no-3d
-python -m cordvip_geometry view outputs/scene_001 --headless
+python -m cordvip_geometry view /tmp/cordvip/scene_001 --no-3d
+python -m cordvip_geometry view /tmp/cordvip/scene_001 --headless
 ```
 
 查看器用 `n`/Space 前进一行，`v` 只更新 observed/model 点云，`q`/`Q`/Esc 或关窗退出；首次 model 切换加载输出内模板，本次查看复用。静止时仅轮询事件和渲染。`--no-3d` 不读取模板或解压点云，`view --headless` 只检查 RGB 和来源行/时钟，不加载 OpenCV/Open3D。查看无需原资产、Raw 或模型环境；资产路径只作来源记录。

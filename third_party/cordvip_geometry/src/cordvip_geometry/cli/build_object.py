@@ -73,8 +73,6 @@ def preview_mesh(mesh_path, *, units="unscaled", points=None, normals=None):
 
 
 def segment(args, *, output_dir=None, list_only=False):
-    if args.headless and args.instance is None and not list_only:
-        raise ValueError("headless 须提供 --instance N；未知索引时先使用 --list-only")
     if not args.headless and not list_only:
         display_available()
     rgb, source, provenance = load_rgb(args)
@@ -217,7 +215,6 @@ def generate(
         output_mesh_path=mesh_path, seed=seed, steps=steps,
         octree_resolution=octree_resolution, num_chunks=num_chunks, device=device,
     )
-    existing_file(mesh_path)
     write_json(output / "generation_result.json", {
         **result, "mesh_file": mesh_path.name, "units": "unscaled", "frame": "object",
         "origin": "source_mesh_origin_without_recentering",
@@ -245,14 +242,6 @@ def generation_parameters(args, segmentation_dir, output_dir):
 
 
 def build(args):
-    if args.headless and args.preview:
-        raise ValueError("--headless 与 --preview 不能同时使用")
-    if (args.size_axis is None) != (args.size_meters is None):
-        raise ValueError("--size-axis 与 --size-meters 必须一起提供")
-    if args.scale_to_meters is not None and args.size_axis is not None:
-        raise ValueError("--scale-to-meters 与 --size-axis 不能同时使用")
-    if args.headless and args.instance is None:
-        raise ValueError("headless 必须显式提供 --instance N")
     output = output_path(args.output_dir, workspace=args.workspace)
     output.mkdir(parents=True)
     segment(args, output_dir=output / "segmentation")

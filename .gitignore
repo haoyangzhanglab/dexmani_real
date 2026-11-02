@@ -3,9 +3,16 @@
 /datasets/
 /rollouts/
 /replay_results/
-/outputs/
 /logs/
 *.log
+
+# Local pretrained model weights
+/third_party/weights/
+
+# Reconstructed object meshes stay local; point clouds remain tracked.
+/assets/pointcloud_template/object/**/mesh/
+/assets/pointcloud_template/object/**/*.obj
+/assets/pointcloud_template/object/**/*.glb
 
 # Python build and bytecode artifacts
 __pycache__/

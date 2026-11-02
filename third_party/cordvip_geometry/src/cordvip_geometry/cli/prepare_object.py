@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from math import isfinite
+from os.path import relpath
 from pathlib import Path
 
 from ..io import existing_file, output_path, write_json
@@ -45,17 +46,18 @@ def prepare_mesh(
     mesh.apply_scale(scale)
     points, normals = sample_mesh_surface(mesh, num_points, seed)
     output.mkdir(parents=True, exist_ok=False)
-    mesh_file = output / "mesh_m.obj"
+    mesh_file = output / "mesh/mesh_m.obj"
+    mesh_file.parent.mkdir()
     mesh.export(mesh_file, file_type="obj")
     save_points(output / "points.npy", points)
     save_points(output / "normals.npy", normals)
     metadata = {
-        "mesh_file": mesh_file.name,
+        "mesh_file": mesh_file.relative_to(output).as_posix(),
         "points_file": "points.npy",
         "normals_file": "normals.npy",
         "frame": "object",
         "units": "m",
-        "source_mesh": str(source),
+        "source_mesh": relpath(source, output),
         "scale_to_meters": scale,
         "measured_extent": measured_extent,
         "origin": "source_mesh_origin_scaled_without_recentering",

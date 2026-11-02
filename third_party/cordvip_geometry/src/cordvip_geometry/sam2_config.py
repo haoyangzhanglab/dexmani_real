@@ -6,6 +6,8 @@ from pathlib import Path
 
 from .io import existing_file
 
+DEFAULT_MODELS_DIR = Path("third_party/weights")
+
 SAM_MODELS = {
     "small": dict(
         config="configs/sam2.1/sam2.1_hiera_s.yaml",
@@ -28,6 +30,7 @@ GROUNDING_MODEL = dict(
     patterns=["*.json", "model.safetensors", "vocab.txt", "README.md", "LICENSE*"],
 )
 GROUNDING_FILES = (
+    GROUNDING_MODEL["weight"],
     "config.json",
     "preprocessor_config.json",
     "tokenizer.json",
@@ -61,7 +64,7 @@ def add_sam_arguments(parser, workspace):
     parser.add_argument(
         "--dino-weights",
         type=Path,
-        default=workspace / "reports/cordvip_models" / GROUNDING_MODEL["directory"],
+        default=workspace / DEFAULT_MODELS_DIR / GROUNDING_MODEL["directory"],
     )
 
 
@@ -77,7 +80,7 @@ def resolve_sam_arguments(args, workspace):
         args.sam_variant = args.sam_variant or "small"
         model = SAM_MODELS[args.sam_variant]
         args.sam_config = model["config"]
-        args.sam_checkpoint = Path(workspace) / "reports/cordvip_models" / model["weight"]
+        args.sam_checkpoint = Path(workspace) / DEFAULT_MODELS_DIR / model["weight"]
     return args
 
 
@@ -101,7 +104,6 @@ def validate_grounding_weights(directory):
     directory = Path(directory).expanduser().resolve()
     for name in GROUNDING_FILES:
         existing_file(directory / name)
-    existing_file(directory / GROUNDING_MODEL["weight"])
     return directory
 
 

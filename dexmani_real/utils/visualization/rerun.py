@@ -27,6 +27,10 @@ def episode_blueprint(
             rrb.Tabs(
                 rrb.Spatial3DView(origin="/", contents=spatial, name="xArm-base"),
                 rrb.Spatial3DView(origin="/", contents=["/pcd/**"], name="Point Cloud"),
+                rrb.Spatial3DView(
+                    origin="/", contents=["/hand_pointcloud/**", "/fingertips/**", "/eef/**"],
+                    name="Hand Point Cloud",
+                ),
                 active_tab=0,
             ),
             rrb.Spatial2DView(origin="camera/color/rgb", name="RGB"),

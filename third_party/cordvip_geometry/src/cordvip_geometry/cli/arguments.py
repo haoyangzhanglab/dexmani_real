@@ -96,10 +96,15 @@ def add_segment_arguments(parser, *, workspace):
 
 
 def add_generate_arguments(parser, *, workspace):
-    models = workspace / "reports" / "cordvip_models"
+    from ..sam2_config import DEFAULT_MODELS_DIR
+
+    models = workspace / DEFAULT_MODELS_DIR
     source_root = workspace / "third_party"
     parser.add_argument("--hunyuan-root", type=Path, default=source_root / "Hunyuan3D-2.1")
-    parser.add_argument("--weights", type=Path, default=models / "Hunyuan3D-2.1")
+    parser.add_argument(
+        "--weights", type=Path, default=models / "Hunyuan3D-2.1",
+        help="本地 Hunyuan3D-2.1 根目录，内含 hunyuan3d-dit-v2-1/ 配置及权重",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=positive_int, default=50)
     parser.add_argument("--octree-resolution", type=positive_int, default=384)
@@ -154,13 +159,28 @@ def parse_object_args(argv=None, *, workspace=None):
     for command in (generate, build):
         command.add_argument("--device", default="cuda:0", help="Hunyuan 生成阶段使用的 CUDA 设备")
     args = parser.parse_args(argv)
+    if args.command in {"segment", "select", "build"}:
+        if args.headless and args.instance is None and not getattr(args, "list_only", False):
+            parser.error("--headless 必须显式指定 --instance；未知索引时先 segment --list-only")
+    if args.command == "build":
+        if args.headless and args.preview:
+            parser.error("--headless 与 --preview 不能同时使用")
+        if (args.size_axis is None) != (args.size_meters is None):
+            parser.error("--size-axis 与 --size-meters 必须一起提供")
+        if args.scale_to_meters is not None and args.size_axis is not None:
+            parser.error("--scale-to-meters 与 --size-axis 不能同时使用")
     if hasattr(args, "sam_variant"):
         from ..sam2_config import resolve_sam_arguments
 
-        resolve_sam_arguments(args, workspace)
+        try:
+            resolve_sam_arguments(args, workspace)
+        except ValueError as error:
+            parser.error(str(error))
     if hasattr(args, "seed") and args.seed < 0:
-        raise ValueError("--seed 必须非负")
+        parser.error("--seed 必须非负")
+    if hasattr(args, "octree_resolution") and args.octree_resolution < 16:
+        parser.error("--octree-resolution 必须不小于 16")
     for name in ("box_threshold", "text_threshold"):
         if hasattr(args, name) and not 0 < getattr(args, name) < 1:
-            raise ValueError(f"{name} 必须在 (0, 1) 内")
+            parser.error(f"{name} 必须在 (0, 1) 内")
     return args

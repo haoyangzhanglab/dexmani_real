@@ -34,9 +34,7 @@ def generate_mesh(
     root = Path(source_root).expanduser().resolve()
     package_parent = root / "hy3dshape"
     existing_file(package_parent / "hy3dshape" / "pipelines.py")
-    weights = Path(weights_dir).expanduser().resolve()
-    if (weights / "hunyuan3d-dit-v2-1").is_dir():
-        weights = weights / "hunyuan3d-dit-v2-1"
+    weights = Path(weights_dir).expanduser().resolve() / "hunyuan3d-dit-v2-1"
     config_path = existing_file(weights / "config.yaml")
     checkpoint_path = existing_file(weights / "model.fp16.ckpt")
     output = Path(output_mesh_path).expanduser().resolve()

@@ -32,6 +32,8 @@ def load_asset(path):
         if not file.is_relative_to(path):
             raise ValueError("资产文件必须位于资产目录内")
         files[name] = file
+    if not files["mesh"].is_file():
+        raise FileNotFoundError(f"资产所需的本地 mesh 文件缺失，请先准备该文件：{files['mesh']}")
     mesh, points = load_metric_mesh(files["mesh"]), load_points(files["points"])
     # Normals describe the generated surface, not measured contact geometry.
     normals = np.load(files["normals"], allow_pickle=False)

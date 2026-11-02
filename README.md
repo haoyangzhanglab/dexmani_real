@@ -55,6 +55,8 @@ python scripts/visualize_episode.py episodes/TASK/EPISODE
 python scripts/keyboard_teleop.py
 ```
 
+Episode 可视化默认按实测 `arm_qpos`、`hand_qpos` 通过 FK 重建手部表面点云；在 3D 区域切换到 `Hand Point Cloud` 可查看手部点云、指尖和 EEF 锚点，`xArm-base` 显示相机点云及指尖、EEF 锚点。两者共用基座坐标系和时间轴。手部点数由 `CONFIG.hand_pointcloud.num_points` 指定；`--no-point-cloud` 只关闭相机点云，手部重建不依赖相机外参。
+
 VR 遥操作/采集使用 B 开始或继续、C 暂停或继续、S 保存并结束本段、D 丢弃本段、Esc 急停。暂停后停止控制并保留本段；C/B 继续时先保存前段，再准备、重新锚定并新建一段，暂停间隔不会拼入连续示教。活动或暂停时第一次 Q 进入退出确认，再按 Q 保存退出，也可 C/B 继续；空闲时 Q 直接退出。H 先停止并保存当前段，再回初始位。T 仅在空闲、手部无接触时复位触觉。开始/继续的语音在首个目标实际提交后播放，暂停、保存、丢弃、HOME 和退出也有提示；后台使用系统 `aplay` 或 `paplay` 播放 `assets/audio` 内的 WAV，播放失败会明确警告，控制流程不等待语音。退出时先释放设备，再有限等待末尾提示并关闭播放器。
 
 策略会话使用 B 开始、S 保存并结束本段、D 丢弃本段、Q 保存并退出、Esc 急停，H 只在无活动段时回初始位。遥操作和策略的 T 都等待当前入口实际需要的触觉通道；禁用手部时忽略 T，SDK 复位失败则按故障结束。物理回放使用 S 停止、H 回零、Q 退出；键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出。键盘在启动及 R 回零结束后完成伺服准备并进入 RUNNING/hold，再提示点动就绪；方向键只更新目标。松键或 jog 目标被 IK/约束拒绝时均制动并 hold，下一轮按当前键态继续，不撤权、不要求松开再按。hold 也有制动距离；运动候选错过本轮提交机会时丢弃，制动 hold 仍立即提交。普通输入过期按取消处理，SDK/停止失败仍是故障。
@@ -139,7 +141,7 @@ VR 运行读取 JSON 中有限且位于 `[-180, 180]` 的 `theta_deg`，例如 `
 
 solve 的外参输出与派生报告不得覆盖 `capture.json` 或原始采样 NPZ；其他新结果仍可保存在采样目录内。
 
-实时相机查看使用 view_realsense.py：默认 RGB-D，在 RGB-D 或点云窗口内按 P 开关点云、S 切换 raw/processed（默认 processed）；`--cloud raw/processed` 可在启动时打开点云并指定初始类型。Q/Esc 或关闭 RGB-D 窗口退出；关闭点云窗口仅关闭点云，按 P 可重新打开。预览不修改曝光优先级，不提供逐帧诊断面板。RGB-D 仅预览时不加载外参、桌面或点云处理器；启用对应点云类型时才加载所需资源。窗口需要桌面/OpenGL，代码清理测试不自动连接真实设备。
+实时相机查看使用 view_realsense.py：默认 RGB-D，在 RGB-D 或点云窗口内按 P 开关点云、S 切换 raw/processed（默认 processed）；`--cloud raw/processed` 可在启动时打开点云并指定初始类型。Q/Esc 或关闭 RGB-D 窗口退出；关闭点云窗口仅关闭点云，按 P 可重新打开。预览不修改曝光优先级，不提供逐帧诊断面板。RGB-D 仅预览时不加载外参、桌面或点云处理器；启用对应点云类型时才加载所需资源。窗口需要桌面/OpenGL。
 
 view_pointcloud.py 提供独立诊断流程：先在终端选择是否拟合桌面，RGB-D 预览按 Enter 继续，随后处理一帧点云、打印点数和本帧处理耗时，关闭相机后静态查看结果；Q/Esc 或关窗退出。桌面拟合固定采集五份不同深度帧，使用当前相机内参；拟合结果可供本次处理使用，仅确认发布才改写共享桌面标定。`--config`、`--camera-calibration` 指定当前实验配置和外参。该流程复用当前点云算法和采集实现，预览不额外修改曝光设置。RGB-D 类型、网格和缓冲所有权由 RealSenseCamera.read 统一保证，预览、标定和采集入口使用同一读取边界。
 
@@ -156,14 +158,14 @@ CordVIP 流程为同一 Raw 首帧人工确认 mask → 顺序全部行 → 保�
 离线查看在换行时更新 RGB 叠加和几何，`v` 只切换点云，静止时仅处理窗口事件和渲染。`--no-3d` 不解压点云；`--headless` 只读取并检查 RGB、源 row/time/clock，不读取对象字段或场景配置，也不加载 OpenCV/Open3D。
 
 ```bash
-python scripts/cordvip/track_object.py --episode episodes/TASK/EPISODE --scene scene.json --with-hand --output outputs/scene_001
-python -m cordvip_geometry view outputs/scene_001
+python scripts/cordvip/track_object.py --episode episodes/TASK/EPISODE --scene scene.json --with-hand --output /tmp/cordvip/scene_001
+python -m cordvip_geometry view /tmp/cordvip/scene_001
 ```
 
 物体生成先保存未定尺度 mesh，实测定尺度后才一次采样最终点/法向。初始 mask 仅可复用于相同 RGB-D、相机几何、行和来源时间。流程、模型安装与结果字段见 [CordVIP 文档](scripts/cordvip/README.md)。同行关联不证明手/相机物理同步，模型表面与语义点不代表实测接触。
 
-默认日志为终端 INFO、拒绝原因、完整异常 traceback 和简短段结果，需要留档时使用 shell 重定向。几何环境检查使用独立命令 `python -m cordvip_geometry check`。
+物体资产按 `assets/pointcloud_template/object/<任务>/<物体>/` 组织，`reference.jpg`、`asset.json`、NPY 和 PLY 点云纳入 Git；`mesh/mesh_m.obj` 与 `third_party/weights/` 仅保留本地。克隆后可直接读取点云；FoundationPose 位姿估计需要先本地重建网格，具体步骤见[物体重建流程](docs/object_reconstruction.md)。
 
-离线回归使用 `python -B -m unittest discover -s tests`，模拟 SDK 帧、机器人输出和窗口事件，不连接机器人、相机或创建真实窗口。
+默认日志为终端 INFO、拒绝原因、完整异常 traceback 和简短段结果，需要留档时使用 shell 重定向。几何环境检查使用独立命令 `python -m cordvip_geometry check`。
 
 开发约定见 [AGENTS.md](AGENTS.md)。

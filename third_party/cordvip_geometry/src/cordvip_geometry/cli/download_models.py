@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 from ..io import existing_file, output_path
-from ..sam2_config import GROUNDING_MODEL, SAM_MODELS, validate_grounding_weights
+from ..sam2_config import DEFAULT_MODELS_DIR, GROUNDING_FILES, GROUNDING_MODEL, SAM_MODELS
 
 MODELS = {
     "grounding": GROUNDING_MODEL,
@@ -33,7 +33,7 @@ def build_parser(*, workspace=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.set_defaults(workspace=workspace)
     parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
-    parser.add_argument("--output", type=Path, default=workspace / "reports/cordvip_models")
+    parser.add_argument("--output", type=Path, default=workspace / DEFAULT_MODELS_DIR)
     parser.add_argument(
         "--sam-variant", choices=SAM_MODELS, default="small", help="SAM2.1 权重型号"
     )
@@ -45,8 +45,6 @@ def main(argv=None, *, workspace=None):
     args = parser.parse_args(argv)
     output = output_path(args.output, workspace=args.workspace, allow_existing=True)
     output.mkdir(parents=True, exist_ok=True)
-    from huggingface_hub import snapshot_download
-
     for name in args.models:
         if name == "sam":
             model = SAM_MODELS[args.sam_variant]
@@ -54,6 +52,17 @@ def main(argv=None, *, workspace=None):
         else:
             spec = MODELS[name]
         destination = output / spec["directory"]
+        if name == "grounding":
+            required = [destination / filename for filename in GROUNDING_FILES]
+        else:
+            required = [destination / spec["weight"]]
+            if name == "shape":
+                required.append(destination / "hunyuan3d-dit-v2-1/config.yaml")
+        if all(path.is_file() and path.stat().st_size > 0 for path in required):
+            print(f"复用本地模型，跳过下载：{destination / spec['weight']}", flush=True)
+            continue
+        from huggingface_hub import snapshot_download
+
         print(f"Downloading {spec['repo_id']} @ {spec['revision']}", flush=True)
         snapshot_download(
             repo_id=spec["repo_id"],
@@ -63,10 +72,8 @@ def main(argv=None, *, workspace=None):
             cache_dir=output / ".hub_cache",
             max_workers=3,
         )
-        if name == "grounding":
-            validate_grounding_weights(destination)
-        else:
-            existing_file(destination / spec["weight"])
+        for path in required:
+            existing_file(path)
         files = [
             str(p.relative_to(destination))
             for pattern in spec["patterns"]

@@ -62,8 +62,6 @@ def choose(rgb, candidates, instance, *, headless):
     if instance is not None and not 0 <= instance < len(candidates):
         raise ValueError(f"--instance 必须位于 0..{len(candidates) - 1}；索引参见 candidates.jpg")
     if headless:
-        if instance is None:
-            raise ValueError("headless 必须显式指定 --instance N；不会按检测分数自动选物体")
         return instance
     display_available()
     import cv2
