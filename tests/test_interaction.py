@@ -99,6 +99,21 @@ def test_c_idle_does_not_start_or_create_recorder():
     loop.robot.prepare_streaming.assert_not_called()
 
 
+@pytest.mark.parametrize('key', ['s', 'c', 'd', 'q'])
+def test_stop_event_consumption_does_not_repeat_keyboard_revocation(key):
+    loop = make_loop()
+    begin(loop)
+    loop.keyboard.handle_key(key, True)
+    revoked_epoch = loop.runtime_state.run_id
+    assert loop.runtime_state.stop_signal.is_set()
+    loop.handle_commands(loop.keyboard.poll(0))
+    assert loop.runtime_state.run_id == revoked_epoch
+    assert loop.discard_requested == (key == 'd')
+    assert loop.runtime_state.quit_requested == (key == 'q')
+    assert loop.pending_termination_reason == ('quit' if key == 'q' else 'operator')
+    loop.robot.stop.assert_not_called()
+
+
 @pytest.mark.parametrize('key', ['s', 'c', 'd', 'q', 'esc'])
 def test_prepare_can_be_cancelled_by_keyboard(key):
     loop = make_loop()
@@ -119,12 +134,13 @@ def test_prepare_can_be_cancelled_by_keyboard(key):
     assert loop.runtime_state.estop_request == (key == 'esc')
 
 
-def test_discard_then_single_q_does_not_publish():
+@pytest.mark.parametrize('keys', [('d', 'q'), ('q', 'd')])
+def test_discard_and_single_q_do_not_publish(keys):
     loop = make_loop()
     begin(loop)
     recorder = loop.recorder = Recorder()
-    loop.keyboard.handle_key('d', True)
-    loop.keyboard.handle_key('q', True)
+    for key in keys:
+        loop.keyboard.handle_key(key, True)
     loop.handle_commands(loop.keyboard.poll(0))
     loop.end_episode('quit')
     assert loop.runtime_state.quit_requested
@@ -132,7 +148,7 @@ def test_discard_then_single_q_does_not_publish():
     assert 'save' not in [call.args[0] for call in loop.audio.play.call_args_list]
 
 
-def test_finish_freezes_save_and_drops_preparation_keys():
+def test_save_decision_precedes_late_discard_and_drops_preparation_keys():
     loop = make_loop()
     begin(loop)
 
@@ -144,8 +160,24 @@ def test_finish_freezes_save_and_drops_preparation_keys():
     recorder = loop.recorder = Recorder(during_finish)
     loop.end_episode('operator')
     assert recorder.calls[0]['save'] is True
-    assert not loop.discard_requested
+    prompts = [call.args[0] for call in loop.audio.play.call_args_list]
+    assert 'save' in prompts and 'discard' not in prompts
     assert loop.keyboard.poll(0) == []
+
+
+def test_discard_without_recording_stops_and_new_episode_resets_intent():
+    loop = make_loop()
+    loop.runtime_state.stop_signal.clear()
+    loop.request_discard()
+    assert loop.runtime_state.stop_signal.is_set()
+    loop.robot.stop.assert_not_called()
+    begin(loop)
+    loop.request_discard()
+    loop.end_episode('discard')
+    begin(loop)
+    recorder = loop.recorder = Recorder()
+    loop.end_episode('operator')
+    assert recorder.calls[0]['save'] is True
 
 
 def test_h_active_does_not_stop_or_home():
@@ -235,35 +267,43 @@ def test_discard_is_latched_before_stop_can_trigger_finish():
     loop = make_loop()
     begin(loop)
     recorder = loop.recorder = Recorder()
-    revoked, release, finishing, finished = Event(), Event(), Event(), Event()
-    original_stop = loop.runtime_state.request_stop
+    stopped, release, finishing, finished = Event(), Event(), Event(), Event()
+    original_set = loop.runtime_state.stop_signal.set
 
     def stop_at_boundary():
-        original_stop()
-        revoked.set()
-        assert release.wait(2)
+        original_set()
+        if not stopped.is_set():
+            stopped.set()
+            assert release.wait(2)
 
     def finish():
         finishing.set()
         loop.finish_recording()
         finished.set()
 
-    with patch.object(loop.runtime_state, 'request_stop', side_effect=stop_at_boundary):
+    with patch.object(loop.runtime_state.stop_signal, 'set', side_effect=stop_at_boundary):
         callback = Thread(target=loop.request_discard)
         callback.start()
+        control = Thread(target=finish)
         try:
-            assert revoked.wait(2)
-            control = Thread(target=finish)
+            assert stopped.wait(2)
             control.start()
             assert finishing.wait(2)
-            assert not finished.wait(0.05)
+            # 首次停止信号暴露时，D 必须仍持有保存决定使用的锁。
+            acquired = loop.runtime_state.motion_lock.acquire(blocking=False)
+            if acquired:
+                loop.runtime_state.motion_lock.release()
+            assert not acquired
         finally:
             release.set()
             callback.join(2)
-        control.join(2)
+            if control.ident is not None:
+                control.join(2)
     assert not callback.is_alive() and not control.is_alive()
     assert finished.is_set()
     assert recorder.calls[0]['save'] is False
+    prompts = [call.args[0] for call in loop.audio.play.call_args_list]
+    assert 'discard' in prompts and 'save' not in prompts
 
 
 @pytest.mark.parametrize('boundary', ['finish', 'startup', 'home', 'tactile'])

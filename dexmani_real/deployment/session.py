@@ -283,20 +283,26 @@ class PolicySession:
             and self.runtime_state.quit_requested
             and not self.runtime_state.estop_request and not self.runtime_state.error_state
         )
+        if self.audio is not None:
+            try:
+                self.audio.finish(successful)
+            except BaseException as exc:
+                logger.exception("policy audio shutdown failed")
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
+                self.errors.append(error_detail("audio_close", exc))
+                successful = False
+                if shutdown != "pending":
+                    shutdown = "failed"
         reason = self.summary["reason"]
-        if failure_detail is not None:
-            reason = failure_detail["message"] or failure_detail["exception_type"]
-        elif self.errors:
-            reason = self.errors[0]["message"]
-        elif episode_error is not None:
-            reason = episode_error["message"]
+        reason_error = failure_detail or (self.errors[0] if self.errors else episode_error)
+        if reason_error is not None:
+            reason = reason_error["message"] or reason_error["exception_type"]
         elif not successful:
             reason = "shutdown_pending" if pending else "session_stopped"
         self.summary.update(ended_utc=utc_now(), outcome="finished" if successful else "fault", reason=reason, shutdown=shutdown)
-        results_saved = False
         try:
             self.save_results()
-            results_saved = True
         except BaseException as exc:
             self.errors.append(error_detail("session_save", exc))
             if isinstance(exc, KeyboardInterrupt):
@@ -306,30 +312,6 @@ class PolicySession:
                 self.summary["reason"] = str(exc) or type(exc).__name__
             successful = False
             logger.exception("session result publication failed")
-        if self.audio is not None:
-            try:
-                try:
-                    self.audio.play("end" if successful else "emergency", interrupt=not successful)
-                    if not self.audio.wait_until_idle(timeout_s=5.0):
-                        logger.warning("退出提示音未在 5 秒内播放完毕。")
-                finally:
-                    self.audio.close()
-            except BaseException as exc:
-                logger.exception("policy audio shutdown failed")
-                self.errors.append(error_detail("audio_close", exc))
-                self.summary["outcome"] = "fault"
-                if successful:
-                    self.summary["reason"] = str(exc) or type(exc).__name__
-                successful = False
-                if shutdown != "pending":
-                    self.summary["shutdown"] = "failed"
-                # 只补记新发生的音频关闭失败；不重试先前失败的结果发布。
-                if results_saved:
-                    try:
-                        self.save_results()
-                    except BaseException as save_error:
-                        self.errors.append(error_detail("session_save", save_error))
-                        logger.exception("audio shutdown result publication failed")
         if pending:
             logger.warning("Cleanup remains pending; retained resources may outlive this wait")
         return int(not successful)
@@ -381,12 +363,9 @@ class PolicySession:
             self.start_epoch = None
 
     def request_discard(self) -> None:
-        # 先发停止信号；Q 只锁存退出，不改写本段已经请求的丢弃。
-        self.runtime_state.stop_signal.set()
+        # 与保存决定排序；决定之后的 D 仍停止，但不逆转局部 save。
         with self.runtime_state.motion_lock:
-            if self.episode is not None and (
-                self.episode.recorder is None or self.episode.recorder.finish_request is None
-            ):
+            if self.episode is not None:
                 self.episode.discard_requested = True
             self.request_stop()
 

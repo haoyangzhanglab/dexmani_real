@@ -6,6 +6,7 @@ import time
 from dataclasses import replace
 from itertools import count
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -21,10 +22,13 @@ from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.runtime.keyboard import Keyboard, KeyEvent
 from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.runtime.state import RunEndReason, SessionState
+from dexmani_real.teleop.audio import AudioFeedback
 from dexmani_real.utils.log import error_detail
 
 
 class Audio:
+    finish = AudioFeedback.finish
+
     def __init__(self, events=None):
         self.events = [] if events is None else events
 
@@ -214,11 +218,11 @@ def make_session(tmp_path):
     return session, events
 
 
-@pytest.mark.parametrize("failure_stage", [None, "audio", "results", "robot"])
+@pytest.mark.parametrize("failure_stage", [None, "session", "audio", "results", "robot"])
 def test_session_closes_resources_before_audio_and_final_result(tmp_path, failure_stage):
     session, events = make_session(tmp_path)
     def fail():
-        events.append(failure_stage)
+        events.append({"audio": "audio_close", "robot": "robot_close"}.get(failure_stage, failure_stage))
         raise OSError(failure_stage)
     if failure_stage == "audio":
         session.audio.close = fail
@@ -226,23 +230,29 @@ def test_session_closes_resources_before_audio_and_final_result(tmp_path, failur
         session.save_results = fail
     elif failure_stage == "robot":
         session.robot.close = fail
-    assert session.close() == int(failure_stage is not None)
+    failure = OSError("primary failure") if failure_stage == "session" else None
+    assert session.close(failure=failure) == int(failure_stage is not None)
     assert events.index("sensor_shutdown") < events.index("audio_wait")
     assert events.index("model_close") < events.index("audio_wait")
-    assert events.index("results") < events.index("audio_wait")
-    if failure_stage == "results":
+    assert events.index("audio_close") < events.index("results")
+    assert events.count("results") == events.count("audio_close") == 1
+    if failure_stage in ("robot", "session"):
         assert "emergency" in events and "end" not in events
-        assert events.count("results") == 1
+    else:
+        assert "end" in events and "emergency" not in events
     assert session.summary["outcome"] == ("fault" if failure_stage else "finished")
+    if failure_stage == "session":
+        assert session.errors[0] == error_detail("session", failure)
 
 
-def test_policy_intents_and_pending_work_block_preparation(tmp_path):
+@pytest.mark.parametrize("keys", [("d", "q"), ("q", "d")])
+def test_policy_intents_and_pending_work_block_preparation(tmp_path, keys):
     session, _ = make_session(tmp_path)
     session.runtime_state = SessionState()
     epoch = session.runtime_state.arm()
     session.episode = SimpleNamespace(discard_requested=False, recorder=None)
-    session.request_discard()
-    session.request_quit()
+    for key in keys:
+        {"d": session.request_discard, "q": session.request_quit}[key]()
     assert session.episode.discard_requested and session.runtime_state.quit_requested
     session.episode = None
     session.runtime_state = SessionState()
@@ -256,6 +266,65 @@ def test_policy_intents_and_pending_work_block_preparation(tmp_path):
     assert session.start_epoch is None
     assert session.request_start(epoch)
     assert not session.request_start(epoch)
+
+
+def test_policy_discard_is_latched_before_first_stop_signal(tmp_path, monkeypatch):
+    episode, _ = make_rollout(tmp_path)
+    session, _ = make_session(tmp_path)
+    session.runtime_state, session.episode = episode.runtime_state, episode
+    episode.result.termination_reason = "operator"
+    saves = []
+
+    def finish(**kwargs):
+        saves.append(kwargs["save"])
+        return "episode_001" if kwargs["save"] else None
+
+    episode.recorder = SimpleNamespace(start_attempted=True, finish_request=None, finish=finish,
+                                       result=lambda: {"status": "finished"})
+    stopped, release, finishing, finished = (threading.Event() for _ in range(4))
+    original_set = session.runtime_state.stop_signal.set
+
+    def stop_at_boundary():
+        original_set()
+        if not stopped.is_set():
+            stopped.set()
+            assert release.wait(2)
+
+    def finalize():
+        finishing.set()
+        episode.finish_recording(deadline=time.monotonic() + 2)
+        finished.set()
+
+    monkeypatch.setattr(session.runtime_state.stop_signal, "set", stop_at_boundary)
+    callback = threading.Thread(target=session.request_discard)
+    control = threading.Thread(target=finalize)
+    callback.start()
+    try:
+        assert stopped.wait(2)
+        control.start()
+        assert finishing.wait(2)
+        acquired = session.runtime_state.motion_lock.acquire(blocking=False)
+        if acquired:
+            session.runtime_state.motion_lock.release()
+        assert not acquired
+    finally:
+        release.set()
+        callback.join(2)
+        if control.ident is not None:
+            control.join(2)
+    assert not callback.is_alive() and not control.is_alive()
+    assert finished.is_set() and saves == [False]
+    assert episode.audio.events == ["discard"]
+
+
+def test_policy_discard_without_recording_stops(tmp_path):
+    session, _ = make_session(tmp_path)
+    session.runtime_state = SessionState()
+    session.runtime_state.arm()
+    session.runtime_state.stop_signal.clear()
+    session.request_discard()
+    assert session.runtime_state.stop_signal.is_set()
+    assert session.episode is None and session.start_epoch is None
 
 
 def test_error_detail_does_not_serialize_cause_tracebacks():
@@ -300,14 +369,17 @@ def test_rollout_keeps_primary_and_reports_model_and_writer_failures(tmp_path):
 ])
 def test_recording_audio_follows_frozen_finish_result(tmp_path, save, published, expected):
     episode, _ = make_rollout(tmp_path)
+    session, _ = make_session(tmp_path)
+    session.runtime_state, session.episode = episode.runtime_state, episode
     episode.result.termination_reason = "quit"
     episode.discard_requested = not save
     def finish(**kwargs):
         assert kwargs["save"] == save
         assert episode.audio.events == []
-        episode.discard_requested = True  # 收尾期间的 D 不修改已传入的保存意图。
+        # 保存决定已读取，recorder 尚未设置 finish_request 的窗口。
+        session.request_discard()
         return published
-    episode.recorder = SimpleNamespace(start_attempted=True, finish=finish,
+    episode.recorder = SimpleNamespace(start_attempted=True, finish_request=None, finish=finish,
                                        result=lambda: {"path": published})
     episode.finish_recording(deadline=time.monotonic() + 1)
     assert episode.audio.events == expected
@@ -379,28 +451,77 @@ def test_preparation_key_delayed_until_after_finish_stays_revoked(tmp_path):
     keyboard.stop()
 
 
-def test_audio_close_failure_updates_published_session_result(tmp_path):
+@pytest.mark.parametrize("model_pending", [False, True])
+@pytest.mark.parametrize("failure", [None, OSError("primary failure")])
+def test_audio_close_failure_is_in_single_final_result(tmp_path, model_pending, failure):
     session, _ = make_session(tmp_path)
-    session.save_results = PolicySession.save_results.__get__(session)
+    session.save_results = Mock(wraps=PolicySession.save_results.__get__(session))
+    if model_pending:
+        session.model.wait_closed = lambda timeout: ("pending", [])
     def fail_close():
         raise OSError("audio worker remains pending")
-    session.audio.close = fail_close
+    session.audio.close = Mock(side_effect=fail_close)
+    assert session.close(failure=failure) == 1
+    session.audio.close.assert_called_once_with()
+    session.save_results.assert_called_once_with()
+    result = json.loads((tmp_path / "session_result.json").read_text())
+    assert result["outcome"] == "fault"
+    assert result["shutdown"] == ("pending" if model_pending else "failed")
+    expected = [error_detail("session", failure)] if failure is not None else []
+    expected.append(dict(stage="audio_close", exception_type="OSError",
+                         message="audio worker remains pending"))
+    assert result["errors"] == expected
+    assert result["reason"] == ("primary failure" if failure else "audio worker remains pending")
+
+
+@pytest.mark.parametrize("failure", [OSError("final JSON failed"), KeyboardInterrupt()])
+def test_final_result_publication_failure_is_reported_after_audio(tmp_path, monkeypatch, caplog, failure):
+    session, events = make_session(tmp_path)
+    session.save_results = PolicySession.save_results.__get__(session)
+    def fail_write(*args, **kwargs):
+        events.append("results")
+        raise failure
+    write = Mock(side_effect=fail_write)
+    monkeypatch.setattr("dexmani_real.deployment.session.write_json", write)
     assert session.close() == 1
+    assert "end" in events and "emergency" not in events
+    assert events.count("audio_close") == 1
+    assert events.index("audio_close") < events.index("results")
+    write.assert_called_once()
+    assert session.runtime_state.estop_request == isinstance(failure, KeyboardInterrupt)
+    assert session.errors[-1]["stage"] == "session_save"
+    assert session.summary["outcome"] == "fault"
+    assert not (tmp_path / "session_result.json").exists()
+    assert any(record.exc_info and record.exc_info[1] is failure for record in caplog.records)
+
+
+def test_audio_shutdown_interrupt_marks_emergency_before_final_result(tmp_path):
+    session, _ = make_session(tmp_path)
+    session.audio.close = Mock(side_effect=KeyboardInterrupt())
+    session.save_results = Mock(wraps=PolicySession.save_results.__get__(session))
+    assert session.close() == 1
+    assert session.runtime_state.estop_request
+    session.audio.close.assert_called_once_with()
+    session.save_results.assert_called_once_with()
     result = json.loads((tmp_path / "session_result.json").read_text())
     assert result["outcome"] == "fault" and result["shutdown"] == "failed"
-    assert result["errors"] == [dict(stage="audio_close", exception_type="OSError",
-                                      message="audio worker remains pending")]
+    assert result["reason"] == "KeyboardInterrupt"
+    assert result["errors"] == [dict(stage="audio_close", exception_type="KeyboardInterrupt", message="")]
 
 
-def test_interrupted_result_publication_still_closes_audio(tmp_path):
-    session, events = make_session(tmp_path)
-    def interrupt():
-        raise KeyboardInterrupt()
-    session.save_results = interrupt
-    assert session.close() == 1
-    assert "emergency" in events and "audio_close" in events
-    assert session.runtime_state.estop_request
-    assert session.errors[-1]["stage"] == "session_save"
+def test_missing_player_still_closes_audio_before_final_result(tmp_path, monkeypatch, caplog):
+    session, _ = make_session(tmp_path)
+    monkeypatch.setattr("dexmani_real.teleop.audio.shutil.which", lambda name: None)
+    session.audio = AudioFeedback()
+    session.audio.close = Mock(wraps=session.audio.close)
+    session.save_results = Mock(wraps=PolicySession.save_results.__get__(session))
+    assert session.close() == 0
+    assert session.audio.worker is None and session.audio.closed
+    session.audio.close.assert_called_once_with()
+    session.save_results.assert_called_once_with()
+    assert "No audio player" in caplog.text
+    result = json.loads((tmp_path / "session_result.json").read_text())
+    assert result["outcome"] == "finished" and not result["errors"]
 
 
 @pytest.mark.parametrize("operation", ["startup", "home", "tactile"])

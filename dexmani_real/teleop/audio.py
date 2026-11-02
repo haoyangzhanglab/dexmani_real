@@ -66,6 +66,24 @@ class AudioFeedback:
                 self.condition.wait(timeout=remaining)
         return True
 
+    def finish(self, successful: bool) -> None:
+        """播放会话尾音，并始终关闭播放器。"""
+        failure = None
+        try:
+            self.play("end" if successful else "emergency", interrupt=not successful)
+            if not self.wait_until_idle(timeout_s=5.0):
+                logger.warning("退出提示音未在 5 秒内播放完毕。")
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            try:
+                self.close()
+            except BaseException:
+                if failure is None:
+                    raise
+                logger.exception("Audio close also failed")
+
     def close(self):
         with self.condition:
             self.closed = True

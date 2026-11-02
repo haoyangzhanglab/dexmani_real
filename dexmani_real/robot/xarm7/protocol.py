@@ -74,7 +74,7 @@ class ArmChannels:
             ):
                 raise OperationCancelled("arm target run cancelled")
             if time.monotonic_ns() >= expires_ns:
-                raise TimeoutError("arm target deadline expired")
+                raise OperationCancelled("arm target deadline expired")
             np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)[0] = (
                 True,
                 command.run_id,

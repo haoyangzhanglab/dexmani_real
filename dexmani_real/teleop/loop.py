@@ -99,8 +99,7 @@ class TeleopLoop:
         return self.tick_origin_ns + self.tick_index * self.control_dt_ns
 
     def request_discard(self):
-        # 键盘线程仅锁存意图；首次 finish 后不改写该段的保存决策。
-        self.runtime_state.stop_signal.set()
+        # 与保存决定排序；回调只锁存意图和撤权，不等待资源收尾。
         with self.runtime_state.motion_lock:
             if self.run_id is not None:
                 self.discard_requested = True
@@ -166,7 +165,6 @@ class TeleopLoop:
         reason = self.pending_termination_reason
         with self.runtime_state.motion_lock:
             save = not self.discard_requested
-            self.run_id = None  # 冻结本段意图，关闭期间 D 只负责停止。
         published = recorder.finish(
             save=save,
             reason=reason,
@@ -323,7 +321,6 @@ class TeleopLoop:
             return True
 
         if cmd == "q":
-            self.runtime_state.request_quit()
             self.audio.play("quit", interrupt=False)
             if self.phase is not TeleopPhase.IDLE:
                 self.request_episode_end("quit", run_end_reason=RunEndReason.QUIT, failed=False)
@@ -331,9 +328,6 @@ class TeleopLoop:
         if self.runtime_state.quit_requested:
             return True
         if cmd in ("s", "c", "d"):
-            if cmd == "d":
-                self.discard_requested = True
-            self.runtime_state.request_stop()
             if self.phase is not TeleopPhase.IDLE:
                 self.request_episode_end(
                     "discard" if cmd == "d" else "stop", run_end_reason=RunEndReason.OPERATOR,
@@ -411,9 +405,7 @@ class TeleopLoop:
         if any(event.key == "esc" for event in commands):
             self.runtime_state.request_emergency_stop()
             return
-        # D 的快速回调已经锁存；即使同批 Q 优先退出也不能反转丢弃意图。
-        if any(event.key == "d" for event in commands):
-            self.request_discard()
+        # 键盘回调已完成撤权及 D/Q 意图；这里只选择段收尾，不重新处理意图。
         for terminal in ("q", "d", "s", "c"):
             terminal_event = next((event for event in commands if event.key == terminal), None)
             if terminal_event is not None:

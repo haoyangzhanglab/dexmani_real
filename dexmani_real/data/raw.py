@@ -21,9 +21,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
-TACTILE_PROCESSING = "sdk_native_bounded_previous_valid_channel_frame_hold"
 TACTILE_UNITS = "sdk_native_unknown_physical_scale"
-TACTILE_AXES = "sdk_sensor_axes_not_world_frame"
 TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
 
 
@@ -153,9 +151,7 @@ def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata, tact
     metadata = camera_metadata(camera_snapshot)
     metadata.update(tactile_reset_metadata)
     metadata.update(
-        hand_tactile_processing=TACTILE_PROCESSING,
         hand_tactile_units=TACTILE_UNITS,
-        hand_tactile_axes=TACTILE_AXES,
         hand_tactile_finger_order=TACTILE_FINGER_ORDER,
         hand_tactile_hold_max_age_s=float(tactile_hold_max_age_s),
     )
@@ -249,13 +245,6 @@ class RawWriter:
         specs = ROBOT_DATASET_SPECS
         if metadata["collection_source"] == "teleop":
             specs = specs | VR_DATASET_SPECS
-            self.meta.attrs.update(
-                vr_hand_side="right",
-                vr_coordinate_axes="FLU",
-                vr_position_units="m",
-                vr_landmark_order="sdk_original",
-                vr_timestamp_source="oldest_channel_first_host_receive_monotonic",
-            )
         self.datasets = {
             name: data.create_dataset(
                 name,
@@ -267,11 +256,6 @@ class RawWriter:
             for name, (tail_shape, dtype) in specs.items()
         }
         timing = data.create_group("timing")
-        timing.attrs.update(
-            clock="host_monotonic_ns",
-            missing_value=-1,
-            camera_timestamp_source="oldest_channel_first_host_receive_monotonic",
-        )
         self.row_times = timing.create_dataset(
             "rows", shape=(0,), maxshape=(None,), dtype=TIMING_ROW_DTYPE
         )

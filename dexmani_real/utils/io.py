@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def publish(src: str | Path, dst: str | Path) -> Path:
@@ -35,8 +38,12 @@ def _write_text(text, target, *, overwrite=True):
             os.replace(temporary, target)
         else:
             publish(temporary, target)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    except BaseException:
+        try:
+            Path(temporary).unlink(missing_ok=True)
+        except BaseException:
+            logger.exception("Temporary file cleanup also failed: %s", temporary)
+        raise
     return target
 
 

@@ -98,10 +98,8 @@ class ArmConfig:
             value = getattr(self, name)
             if not isfinite(value) or value <= 0:
                 raise ValueError(f"arm {name} must be finite and positive")
-        if not (
-            self.feedback_hz <= self.servo_hz and 1 / self.feedback_hz < self.feedback_max_age_s
-        ):
-            raise ValueError("feedback period must fit freshness budget and not exceed servo rate")
+        if 1 / self.feedback_hz >= self.feedback_max_age_s:
+            raise ValueError("feedback period must fit freshness budget")
         self.homing.validate()
         speed = self.max_joint_velocity_rad_per_s
         if not isfinite(speed) or not 0.0001 <= speed <= pi:

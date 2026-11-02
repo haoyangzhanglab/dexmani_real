@@ -20,7 +20,7 @@ from dexmani_real.robot.model import (
     XHAND_RATED_QPOS_MIN_RAD,
 )
 from dexmani_real.robot.xhand.feedback import XHandFeedback
-from dexmani_real.utils.timing import next_tick_ns
+from dexmani_real.utils.timing import next_tick_ns, sample_is_fresh
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +185,6 @@ class Robot:
 
     def read_initial_state(self, run_id, *, required_tactile=(), cancel_requested=None):
         deadline_ns = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
-        max_age_ns = int(self.hand_config.feedback_max_age_s * 1e9)
 
         def check_wait():
             self.check()
@@ -194,10 +193,10 @@ class Robot:
                 or self.run_signal.value != run_id
                 or self.emergency_signal.is_set()
             ):
-                raise OperationCancelled("XHand initial feedback acquisition cancelled")
+                raise OperationCancelled("robot initial feedback acquisition cancelled")
             if time.monotonic_ns() >= deadline_ns:
                 raise RobotError(
-                    "XHand initial feedback acquisition timed out; "
+                    "robot initial feedback acquisition timed out; "
                     f"required tactile={required_tactile}"
                 )
 
@@ -207,12 +206,15 @@ class Robot:
             check_wait()
             now_ns = time.monotonic_ns()
             arm_stamp = int(state.arm["timestamp_ns"][0])
-            arm_ready = 0 < arm_stamp <= now_ns < arm_stamp + int(self.arm_config.feedback_max_age_s * 1e9)
+            arm_ready = sample_is_fresh(arm_stamp, self.arm_config.feedback_max_age_s, now_ns)
             hand_ready = self.hand is None
             if self.hand is not None and state.hand is not None:
                 fields = ("timestamp_ns", *(f"tactile_{c}_timestamp_ns" for c in required_tactile))
                 stamps = (int(state.hand[name][0]) for name in fields)
-                hand_ready = all(0 < stamp <= now_ns < stamp + max_age_ns for stamp in stamps)
+                hand_ready = all(
+                    sample_is_fresh(stamp, self.hand_config.feedback_max_age_s, now_ns)
+                    for stamp in stamps
+                )
             if arm_ready and hand_ready:
                 return state
             wait_ns = min(self.feedback_next_ns, deadline_ns) - time.monotonic_ns()
@@ -254,13 +256,13 @@ class Robot:
                 cast("ArmProcess", self.arm).submit(command, expires_ns=expires_ns)
             if command.hand_qpos is not None:
                 self.check_run(command.run_id, expires_ns=expires_ns)
-                if time.monotonic_ns() >= expires_ns:
-                    raise OperationCancelled("target expired before device submission")
-                self.stop_required = True
                 frame = self.hand_feedback.snapshot()
                 now = time.monotonic_ns()
+                if now >= expires_ns:
+                    raise OperationCancelled("target expired before device submission")
+                self.stop_required = True
                 stamp = int(frame["timestamp_ns"][0]) if frame is not None else 0
-                if not 0 < stamp <= now < stamp + int(self.hand_config.feedback_max_age_s * 1e9):
+                if not sample_is_fresh(stamp, self.hand_config.feedback_max_age_s, now):
                     raise OperationCancelled("current hand feedback unavailable/stale at send")
                 cast("XHand", self.hand)._send_action(command.hand_qpos)
             self.check_run(command.run_id, expires_ns=expires_ns)

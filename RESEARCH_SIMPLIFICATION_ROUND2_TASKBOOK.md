@@ -199,14 +199,39 @@ Policy 最终关闭顺序统一为：
 
 ## 14. 完成标准与实施记录
 
-- [ ] R1 的实际保存决定在 Teleop/Policy 中一致，覆盖首次停止可见窗口；无新状态或锁内阻塞 I/O，Esc 快速通知保留。
-- [ ] R2 只修本地目标到期分类，真实锁/SDK/停止失败仍正确传播。
-- [ ] R3 不再因监督线程迟醒误拒完整产物，实际 writer/文件失败仍不发布。
-- [ ] R4 保留原始 I/O 主错，录制结果显示具体原因，没有递归错误框架。
-- [ ] S1 删除错误频率关系，等价新鲜度表达统一，时间与副作用边界保持。
-- [ ] S2 指定固定标签与误导统计删除；数组、必要配方、单位、指序、时钟和前缀语义保持；exact-field 检查保留。
-- [ ] S3 音频功能完整，尾音流程共用，Policy 只写一次最终结果，资源和错误不丢失。
-- [ ] README 与行为一致；没有新增长期报告目录、架构层、配置项或兼容协议；无无关文件、数据改写或他人改动被覆盖。
-- [ ] 实际检查、未验证条件和真机待办如实记录，未运行的检查未标通过。
+- [x] R1 的实际保存决定在 Teleop/Policy 中一致，覆盖首次停止可见窗口；无新状态或锁内阻塞 I/O，Esc 快速通知保留。
+- [x] R2 只修本地目标到期分类，真实锁/SDK/停止失败仍正确传播。
+- [x] R3 不再因监督线程迟醒误拒完整产物，实际 writer/文件失败仍不发布。
+- [x] R4 保留原始 I/O 主错，录制结果显示具体原因，没有递归错误框架。
+- [x] S1 删除错误频率关系，等价新鲜度表达统一，时间与副作用边界保持。
+- [x] S2 指定固定标签与误导统计删除；数组、必要配方、单位、指序、时钟和前缀语义保持；exact-field 检查保留。
+- [x] S3 音频功能完整，尾音流程共用，Policy 只写一次最终结果，资源和错误不丢失。
+- [x] README 与行为一致；没有新增长期报告目录、架构层、配置项或兼容协议；无无关文件、数据改写或他人改动被覆盖。
+- [x] 实际检查、未验证条件和真机待办如实记录，未运行的检查未标通过。
 
 实施完成后在本文末尾追加一段简短结果或勾选上述项目，不创建第二份验收报告体系。报告包含：行为变化、删掉与保留的机制、实际测试命令与结果、未执行项、`git diff --stat`；分别统计运行时代码、测试和文档的净增减。净减量不是硬指标，不用删必要检查、压缩排版或移动文件伪造精简；优先让主路径与责任归属更容易理解。
+
+
+### 2026-11-03 首次实施记录
+
+- 起点为干净的 `main@592ab9d`；相对 `18d77b0` 仅新增本任务书，R1–R4、S1–S3 均仍适用，按 A→D 完成。第一轮工作未重做；Policy 新 Rollout 在对外赋值前初始化丢弃意图已满足要求，因此没有形式修改。
+- D 与保存决定复用 `motion_lock`，局部 `save` 决定发布和提示；删除提前清空段身份及键盘层 `finish_request` 判断，保留 Esc 快通知。arm 仅锁取得后、mailbox 发布前的确定到期改为取消；锁等待、SDK 与停止失败仍为故障。writer 只按存活及实际错误裁决，首次失败粘性、完整关闭/计数/零行/staging 规则保留。原子写清理失败记录一次而不替换主错，录制错误显示具体 I/O 原因并保留 cause。
+- 删除无依据的频率关系、指定固定元数据、`timing_admission` 和 readout 的 dt/4 统计；删除前核对本仓及只读 Policy 基线/当前消费者，无运行时依赖。必要单位、指序、hold、标定、数值 recipe、exact-field、source_id、在线准入与发送前复查保留，各自职责未合并。音频资源、非阻塞与抢占保留；尾音/关闭共用 `AudioFeedback.finish`，Policy 音频后只写一次最终结果，音频错误影响 JSON 和退出码，JSON 失败不重播或重试。README 同步上述行为与格式说明。
+- 四项 bug 回归先在旧实现验证失败：R1 首次停止信号屏障在两个入口 2 failed；R2 真实 mailbox→Robot→Replay 的本地到期误落 FAULT；R3/R4 等新增数据回归 6 failed、1 passed（含迟醒、清理覆盖、成功后多余 unlink、错误消息）。测试调用生产函数，只在外部 I/O、时钟、锁竞争和调度边界控制行为，没有源码截取或镜像实现。
+- 首次实施验证命令：`PYTHONDONTWRITEBYTECODE=1 /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m pytest -p no:cacheprovider -q tests/test_interaction.py tests/test_errors.py tests/test_data.py tests/test_audio.py tests/test_policy.py` → **171 passed in 0.82s**（修改前同组为 128 passed）。阶段联验 A 97、B 63、C 81，D audio/policy 59 passed；计数有重叠，不累计。
+- 真实小型 HDF5/MP4→Zarr fixture 前后对照：26 个 Raw/Canonical 数组的 dtype 和数值逐项完全一致，包含全部 13 个 Canonical 字段和 timing rows；连续前缀位置/首因保持，补测 readout 在 dt/4 与 dt 之间接纳、到达 dt 截断。对照产物只在 `/tmp`，未改写实验数据。
+- 静态检查使用上述 Python 的 `-m ruff check --no-cache --select E9,F,I`，参数为 `git diff --name-only -- '*.py'` 所列 18 个修改文件，全部通过；同 18 文件用 `compile` 内存语法检查通过。上述 Python 运行 collect_teleop/run_policy 的 `--print-config`（JSON 可解析）及 collect_teleop/run_policy/export_zarr/replay_episode 的 `--help`，6 项均退出 0；这些入口均在设备初始化前返回。`git diff --check` 通过，未生成仓库内禁止缓存；不宣称全仓类型或全规则静态检查通过。
+- 未连接或驱动真机，未修改配套 Policy、checkpoint 或历史数据，未推送/合并。现场低速启停、急停、D/S/C/Q 与准备/收尾边界、HOME 取消、真实反馈/采样延迟和音频抢占/听感仍**未执行**；真实模型及部署 checkpoint 未验证。非零 Brown 畸变保持条件性后续项，不宣称已修复，未改图像/点云或增加准入门禁。
+- 首次实施阶段 `git diff --stat`：20 files changed, 551 insertions(+), 161 deletions(-)。分类：运行时代码 13 文件 +54/-96（净 -42），测试 5 文件 +466/-49（净 +417），文档 2 文件 +31/-16（净 +15）；总净 +390。未增加新文件、依赖、配置、状态协议或报告体系。
+
+
+### 2026-11-03 全链路审查收口
+
+- 保留首次实施的未提交改动，沿 Keyboard/Teleop/Policy→Robot→arm/hand、Recorder→Raw→Canonical→replay/viewer/脚本及音频→最终 JSON 核对实际调用与消费者。未发现此范围的 SHA-256、哈希门禁、迁移或版本兼容层；没有为满足“删除”制造改动。`source_id`、非版本格式标签、exact-field、数值/单位/指序及完整发布检查各有用途，继续保留。
+- 删除 Teleop 事件消费阶段重复执行的 S/C/D/Q 撤权和意图写入，统一由键盘回调负责；控制线程只结束段和提示。hand 在读取反馈缓存后用同一个 now 检查目标期限和来源年龄，消除缓存读取期间到期仍进入 SDK 的窗口，同时减少一次时钟读取。两项真实函数回归分别先在旧实现 4 failed、1 failed。
+- 音频播放/等待主错与关闭后错同时发生时保留主错，关闭后错单独记录一次；无主错的关闭失败仍传播，不降级为成功。Policy 音频中断锁存急停，统一最终 reason 的取值与空消息异常的类型说明，最终 JSON 仍只写一次。上述新增定向回归均先暴露原问题；Teleop 主异常类型补为 `BaseException | None`，尾音入口明确 bool/None 接口。删除仅注入已删除说明属性的过时测试及 README 中相应历史兼容描述，未新增兼容分支。
+- 最终测试：`PYTHONDONTWRITEBYTECODE=1 /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -m pytest -p no:cacheprovider -q tests/test_interaction.py tests/test_errors.py tests/test_data.py tests/test_audio.py tests/test_policy.py tests/test_viewers.py` → **185 passed in 0.85s**。真实 Raw→Canonical、13 字段、连续前缀、资源关闭与故障分类回归均在其中；不代表硬件动作成功。
+- 29 个修改文件及相关上下游 Python 文件的 `compile` 内存语法检查和 `-m ruff check --no-cache --select E9,F,I` 通过；同范围排除测试后的 24 个生产/脚本文件用 `-m mypy --cache-dir=/tmp/dexmani_chain_review_mypy --ignore-missing-imports --follow-imports=silent --namespace-packages --explicit-package-bases` 通过。13 个修改源文件额外启用 `--check-untyped-defs`，与临时 HEAD 源码副本对照为 50→48 条诊断，无新增；当前 Raw 生命周期 8、Audio 类型 3、Session 生命周期 37 条仍未解决，不宣称增强检查通过，不用 ignore、断言或运行时兜底掩盖。
+- 只在 `/tmp/dexmani_chain_build_qkd9hd4a` 复制当前源码，通过 `setuptools.build_meta.build_wheel` 构建 wheel；85 项 Python/标定 JSON payload 齐全，解包后四个受影响模块确认从构建产物导入。6 项无硬件 CLI 配置打印/help 再次通过。该验证不保证 wheel 自带仓库外机器人资产，运行仍按 README 保留 checkout。
+- README 与最终交互、时效和音频错误行为对齐；`git diff --check` 及禁止缓存检查通过。无新增文件、依赖、状态协议、配置兼容或报告目录；未连接真机、修改实验数据/配套 Policy 或推送/合并。真机停止、真实采样延迟、音频听感、实际模型及 Brown 畸变消费者仍未验证。
+- 全部未提交改动 `git diff --stat`：20 files changed, 652 insertions(+), 188 deletions(-)；运行时代码 13 文件 +73/-113（净 -40），测试 5 文件 +536/-59（净 +477），文档 2 文件 +43/-16（净 +27），总净 +464。相较首次实施，运行时代码净 +2、测试净 +60、文档净 +12；新增量用于已复现错误与实际验收，未扩展架构。

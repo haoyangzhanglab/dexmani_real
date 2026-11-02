@@ -100,7 +100,7 @@ def run_teleop(
     shutdown_clean = False
     loop = None
     keyboard = audio = None
-    primary_failure = None
+    primary_failure: BaseException | None = None
     try:
         sensors = SensorWorkers(channels)
         robot = Robot(
@@ -220,14 +220,7 @@ def run_teleop(
                             clean and shutdown_clean and not runtime_state.error_state
                             and not runtime_state.estop_request
                         )
-                        try:
-                            audio.play(
-                                "end" if success else "emergency", interrupt=not success,
-                            )
-                            if not audio.wait_until_idle(timeout_s=5.0):
-                                logger.warning("退出提示音未在 5 秒内播放完毕。")
-                        finally:
-                            audio.close()
+                        audio.finish(success)
                     except Exception:
                         shutdown_clean = False
                         logger.exception("teleop audio cleanup failed")

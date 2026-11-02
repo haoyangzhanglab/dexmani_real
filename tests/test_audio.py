@@ -89,7 +89,31 @@ def test_missing_player_warns_and_does_not_create_worker(caplog):
     assert 'No audio player' in caplog.text
     audio.play('begin')
     assert audio.worker is None
-    audio.close()
+    audio.finish(True)
+    assert audio.closed
+
+
+@pytest.mark.parametrize('primary', [None, RuntimeError('tail wait failed'), KeyboardInterrupt()])
+def test_audio_finish_preserves_primary_and_reports_close_failure(primary, caplog):
+    cleanup = RuntimeError('audio worker join failed')
+    with patch('dexmani_real.teleop.audio.shutil.which', return_value=None):
+        audio = AudioFeedback()
+    audio.worker = Mock()
+    audio.worker.join.side_effect = cleanup
+    expected = primary if primary is not None else cleanup
+    with patch.object(audio, 'wait_until_idle', side_effect=primary, return_value=True):
+        # 调用者已有异常不代表 finish 自身失败；单独的 close 错误仍须传播。
+        try:
+            raise ValueError('caller failure')
+        except ValueError:
+            with pytest.raises(BaseException) as caught:
+                audio.finish(False)
+    assert caught.value is expected
+    assert audio.closed
+    audio.worker.join.assert_called_once_with(timeout=1.0)
+    cleanup_logs = [record for record in caplog.records
+                    if record.exc_info and record.exc_info[1] is cleanup]
+    assert len(cleanup_logs) == int(primary is not None)
 
 
 def test_emergency_preempts_running_audio_without_waiting():
@@ -123,7 +147,7 @@ def test_emergency_preempts_running_audio_without_waiting():
     assert audio.worker is not None and not audio.worker.is_alive()
 
 
-@pytest.mark.parametrize('failure', [None, 'play', 'close', 'recording'])
+@pytest.mark.parametrize('failure', [None, 'play', 'wait', 'timeout', 'close', 'recording'])
 def test_teleop_releases_devices_before_waiting_for_tail_audio(tmp_path, failure, caplog):
     from dexmani_real.config.real import RealConfig
 
@@ -131,7 +155,14 @@ def test_teleop_releases_devices_before_waiting_for_tail_audio(tmp_path, failure
     runtime = replace(defaults, hand=replace(defaults.hand, enabled=False))
     order = []
     audio = Mock()
-    audio.wait_until_idle.side_effect = lambda **kwargs: order.append('audio_wait') or True
+    audio.finish = AudioFeedback.finish.__get__(audio)
+    def wait_audio(*, timeout_s):
+        assert timeout_s == 5.0
+        order.append('audio_wait')
+        if failure == 'wait':
+            raise RuntimeError('audio wait failed')
+        return failure != 'timeout'
+    audio.wait_until_idle.side_effect = wait_audio
     def close_audio():
         order.append('audio_close')
         if failure == 'close':
@@ -165,15 +196,20 @@ def test_teleop_releases_devices_before_waiting_for_tail_audio(tmp_path, failure
          patch('dexmani_real.teleop.run.close_runtime', side_effect=lambda *a, **k: order.append('devices')):
         code = run_teleop(runtime, record=False, episodes_dir=str(tmp_path), max_duration_s=1,
                           runtime_config_json=None)
-    assert code == int(failure is not None)
-    if failure in ('play', 'close'):
+    assert code == int(failure not in (None, 'timeout'))
+    if failure in ('play', 'wait', 'close'):
         assert 'teleop audio cleanup failed' in caplog.text
+    if failure == 'timeout':
+        assert '退出提示音未在 5 秒内播放完毕' in caplog.text
     if failure == 'recording':
         assert sum(record.exc_info is not None and isinstance(record.exc_info[1], RecordingError)
                    for record in caplog.records) == 1
         assert 'teleop capture cleanup failed' not in caplog.text
     assert order == (['devices', 'audio_close'] if failure == 'play' else
                      ['devices', 'audio_wait', 'audio_close'])
+    audio.close.assert_called_once()
+    audio.play.assert_called_with('emergency' if failure == 'recording' else 'end',
+                                  interrupt=failure == 'recording')
 
 
 def test_emergency_during_popen_creation_cancels_old_generation():

@@ -152,7 +152,6 @@ def training_prefix(reader: RawReader) -> dict:
         source_technical_status=status, trim_reason=reason,
         max_control_grid_deviation_ns=int(np.abs(grid_error[:end]).max()),
         max_readout_ns=int(readout[:end].max()),
-        readout_over_tolerance_rows=int(np.count_nonzero(readout[:end] > tolerance)),
     )
 
 
@@ -278,10 +277,9 @@ def export_zarr(
             with RawReader(episode) as reader:
                 camera, quality = validate_export_episode(reader)
                 frames = quality["row_stop"]
-                logger.info("%s: training rows [0, %d)/%d; discarded=%d; status=%s; trim=%s; readout over dt/4 rows=%d",
+                logger.info("%s: training rows [0, %d)/%d; discarded=%d; status=%s; trim=%s",
                             episode.name, frames, reader.num_frames, reader.num_frames - frames,
-                            quality["source_technical_status"], quality["trim_reason"],
-                            quality["readout_over_tolerance_rows"])
+                            quality["source_technical_status"], quality["trim_reason"])
                 task = reader.meta["task_label"]
                 if not task.strip() or any(ord(char) < 32 or ord(char) == 127 for char in task):
                     raise ValueError("task_label must be nonempty without control characters")
@@ -357,7 +355,6 @@ def create_store(path, processing, camera, *, task, control_hz):
     )
     row_bytes = sum(int(np.prod(shape)) * dtype.itemsize for shape, dtype in specs.values())
     chunk = min(MAX_BATCH_FRAMES, max(1, PROCESSING_BYTES // row_bytes))
-    period_ns, tolerance_ns = sampling_clock_ns(control_hz)
     root = zarr.open_group(str(path), mode="w")
     root.attrs.update(
         format=CANONICAL_FORMAT,
@@ -370,16 +367,6 @@ def create_store(path, processing, camera, *, task, control_hz):
         kinematics_urdf=XARM7_XHAND_RIGHT_URDF_PATH.read_text(encoding="utf-8"),
         table_plane_abcd=processing.table_plane_abcd,
         depth_scale_m_per_unit=camera.depth_scale_m,
-        timing_admission=dict(
-            rule="continuous_control_prefix_with_bounded_readout",
-            period_ns=period_ns,
-            control_tolerance_ns=tolerance_ns,
-            control_clock="control_ns",
-            observation_clock="observation_ns",
-            readout_limit_ns=period_ns,
-            resampled=False,
-            failed_capture_tail="exclude_last_row",
-        ),
     )
     data = root.create_group("data")
     arrays = {}

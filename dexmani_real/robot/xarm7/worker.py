@@ -19,6 +19,7 @@ from dexmani_real.robot.xarm7.protocol import (
 )
 from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
 from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.timing import sample_is_fresh
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,7 @@ class ArmController:
                 break
             q, v = self.status["qpos"], self.status["qvel"]
             sample_ns = int(self.status["timestamp_ns"])
-            if not 0 < sample_ns <= completed_ns < sample_ns + int(self.cfg.feedback_max_age_s * 1e9):
+            if not sample_is_fresh(sample_ns, self.cfg.feedback_max_age_s, completed_ns):
                 raise _OperationTimeout(f"{stage}: current arm feedback unavailable/stale")
             valid = np.max(np.abs(v)) <= self.cfg.homing.velocity_convergence_rad_s
             if target is not None:
@@ -145,12 +146,12 @@ class ArmController:
         # 模式操作可能阻塞；紧接着才取得并裁决真正用于起点检查的反馈。
         now = time.monotonic_ns()
         stamp = int(self.status["timestamp_ns"])
-        if not 0 < stamp <= now < stamp + int(self.cfg.feedback_max_age_s * 1e9):
+        if not sample_is_fresh(stamp, self.cfg.feedback_max_age_s, now):
             self.read_feedback()
         check_abort()
         now = time.monotonic_ns()
         stamp = int(self.status["timestamp_ns"])
-        if not 0 < stamp <= now < stamp + int(self.cfg.feedback_max_age_s * 1e9):
+        if not sample_is_fresh(stamp, self.cfg.feedback_max_age_s, now):
             raise _OperationTimeout("HOME start feedback unavailable/stale")
         current = self.status["qpos"].copy()
         velocity = self.status["qvel"]
@@ -262,7 +263,7 @@ class ArmController:
         if now >= goal["expires_ns"]:
             return "command_expired"
         stamp = int(self.status["timestamp_ns"])
-        if not 0 < stamp <= now < stamp + int(self.cfg.feedback_max_age_s * 1e9):
+        if not sample_is_fresh(stamp, self.cfg.feedback_max_age_s, now):
             return "arm_feedback_expired"
         return None
 

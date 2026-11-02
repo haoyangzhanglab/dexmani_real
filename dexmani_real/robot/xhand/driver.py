@@ -27,6 +27,7 @@ from dexmani_real.robot.model import (
     XHAND_TACTILE_SENSOR_FINGER_IDS,
 )
 from dexmani_real.robot.xhand.feedback import XHandState
+from dexmani_real.utils.timing import sample_is_fresh
 
 logger = logging.getLogger(__name__)
 
@@ -435,9 +436,7 @@ class XHand:
         deadline = time.monotonic() + STOP_RETRY_TIMEOUT_S
         while time.monotonic() < deadline:
             now_ns = time.monotonic_ns()
-            fresh = 0 < int(timestamp_ns) <= now_ns and now_ns - int(timestamp_ns) < int(
-                self.cfg.feedback_max_age_s * 1e9
-            )
+            fresh = sample_is_fresh(timestamp_ns, self.cfg.feedback_max_age_s, now_ns)
             status = self.hold_current(qpos) if qpos is not None and fresh else self.set_passive()
             if status != COMMUNICATION_CRC_ERROR_CODE:
                 return

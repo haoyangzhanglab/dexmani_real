@@ -1,9 +1,11 @@
 """错误分类与收尾回归：调用真实运行边界，外部设备/IPC 使用替身。"""
 
 import json
+import multiprocessing as mp
 import sys
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -18,13 +20,16 @@ from dexmani_real.replay.trajectory import Trajectory
 from dexmani_real.robot import system
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
 from dexmani_real.robot.system import Robot
+from dexmani_real.robot.xarm7 import protocol
+from dexmani_real.robot.xarm7 import worker as arm_worker
 from dexmani_real.robot.xarm7.process import ArmProcess
-from dexmani_real.robot.xarm7.protocol import PrepareRequest
+from dexmani_real.robot.xarm7.protocol import ArmChannels, PrepareRequest
 from dexmani_real.robot.xhand.driver import XHand
 from dexmani_real.robot.xhand.feedback import XHandState
 from dexmani_real.runtime.home import _home_motion
 from dexmani_real.runtime.lifecycle import SensorWorkers, close_runtime
 from dexmani_real.runtime.state import SafetyState, SessionState
+from dexmani_real.utils.timing import sample_is_fresh
 
 
 @pytest.fixture
@@ -100,6 +105,95 @@ def test_replay_classifies_submission_and_stops_partial_command(devices, monkeyp
         assert result.errors[0] is robot.stop_failure
         with pytest.raises(TimeoutError, match="stop acceptance unresolved"):
             robot.check()
+
+
+@pytest.mark.parametrize("failure", ["expired", "mailbox_lock", "generation_lock", "stop_failure"])
+def test_arm_publication_rejection_and_lock_faults_use_real_mailbox(devices, monkeypatch, failure):
+    runtime, state, robot, command, _, now = devices
+    channels = ArmChannels(
+        mp.get_context("spawn"), run_signal=state.run_signal,
+        stop_signal=state.stop_signal, emergency_signal=state.emergency_signal,
+    )
+    original_goal = bytes(channels.goal)
+    deadline = now + 100_000_000
+    if failure == "stop_failure":
+        robot.arm.wait_stopped.side_effect = TimeoutError("stop acceptance unresolved")
+
+    def submit(command, *, expires_ns):
+        # 只在锁等待/时钟边界控制调度，目标发布与回放错误分类均走生产实现。
+        acquired, release = threading.Event(), threading.Event()
+        holder = None
+        if failure in {"mailbox_lock", "generation_lock"}:
+            lock = channels.goal_lock if failure == "mailbox_lock" else state.run_signal.get_lock()
+
+            def hold_lock():
+                with lock:
+                    acquired.set()
+                    assert release.wait(2)
+
+            holder = threading.Thread(target=hold_lock)
+            holder.start()
+            assert acquired.wait(2)
+            clock = lambda: deadline
+        else:
+            stamps = iter((now, now, deadline))
+            clock = lambda: next(stamps)
+        monkeypatch.setattr(protocol, "time", SimpleNamespace(monotonic_ns=clock))
+        try:
+            channels.publish_goal(command, expires_ns=expires_ns)
+        finally:
+            release.set()
+            if holder is not None:
+                holder.join(2)
+                assert not holder.is_alive()
+
+    robot.arm.submit.side_effect = submit
+    monkeypatch.setattr("dexmani_real.replay.joint_replay.ActionMapper.for_mode", Mock(return_value=None))
+    replay = JointReplay(state, runtime, None, robot=robot)
+    replay.admit_replay = lambda trajectory: robot.send_action(command, expires_ns=deadline)
+    trajectory = Trajectory(
+        "fake_episode", 30, "classification", command.arm_qpos[None], command.hand_qpos[None],
+        command.arm_qpos, command.hand_qpos,
+    )
+    result = replay.run(trajectory, run_id=command.run_id, hand_start_duration_s=0)
+
+    assert result.status == (ReplayStatus.REJECTED if failure == "expired" else ReplayStatus.FAULT)
+    if failure == "expired":
+        assert result.reason == "arm target deadline expired"
+        assert result.errors == []
+    else:
+        assert isinstance(result.errors[0], TimeoutError)
+        if failure == "stop_failure":
+            assert result.errors == [robot.stop_failure]
+    assert bytes(channels.goal) == original_goal
+    for lock in (channels.goal_lock, state.run_signal.get_lock()):
+        assert lock.acquire(False)
+        lock.release()
+    robot.hand._send_action.assert_not_called()
+    robot.arm.request_stop.assert_called_once()
+    robot.arm.wait_stopped.assert_called_once()
+    robot.hand.stop.assert_called_once()
+    assert state.stop_signal.is_set()
+
+
+def test_hand_expiration_during_feedback_snapshot_prevents_sdk(devices, monkeypatch):
+    _, state, robot, command, _, now = devices
+    deadline = now + 10_000_000
+    clock = [now]
+    snapshot = robot.hand_feedback.snapshot
+
+    def delayed_snapshot():
+        frame = snapshot()
+        clock[0] = deadline  # 缓存读取期间调度迟延，反馈仍新鲜但目标已到期。
+        return frame
+
+    monkeypatch.setattr(system, "time", SimpleNamespace(monotonic_ns=lambda: clock[0]))
+    monkeypatch.setattr(robot.hand_feedback, "snapshot", delayed_snapshot)
+    with pytest.raises(OperationCancelled, match="target expired before device submission"):
+        robot.send_action(command, expires_ns=deadline)
+    robot.arm.submit.assert_called_once()
+    robot.hand._send_action.assert_not_called()
+    assert state.stop_signal.is_set()
 
 
 def test_stop_attempts_both_devices_and_keeps_first_error(devices, caplog):
@@ -390,3 +484,74 @@ def test_replay_stop_does_not_repeat_cached_operation_error(devices, monkeypatch
     result = replay.run(trajectory, run_id=command.run_id, hand_start_duration_s=0)
     assert result.errors == ([primary, stop_error] if independent else [primary])
     assert result.status is ReplayStatus.FAULT
+
+
+@pytest.mark.parametrize("stamp,expected", [
+    (0, False), (1_000_000_001, False), (900_000_000, False),
+    (900_000_001, True), (1_000_000_000, True),
+])
+def test_sample_freshness_boundaries(stamp, expected):
+    assert sample_is_fresh(stamp, 0.1, 1_000_000_000) is expected
+
+
+def test_feedback_rate_can_exceed_servo_rate():
+    replace(RealConfig().arm, feedback_hz=50, servo_hz=25).validate()
+
+
+@pytest.mark.parametrize("changes", [
+    {"servo_hz": 0}, {"servo_hz": float("inf")},
+    {"feedback_hz": -1}, {"feedback_hz": float("nan")},
+    {"feedback_max_age_s": 0},
+    {"feedback_hz": 50, "feedback_max_age_s": 0.02},
+    {"feedback_hz": 50, "feedback_max_age_s": 0.01},
+])
+def test_feedback_config_still_rejects_invalid_rates_and_budget(changes):
+    with pytest.raises(ValueError):
+        replace(RealConfig().arm, **changes).validate()
+
+
+def test_robot_cache_reads_preserve_each_source_timestamp(devices, monkeypatch):
+    _, _, robot, _, _, now = devices
+    robot.arm.snapshot = Mock(return_value={"timestamp_ns": np.array([now])})
+    robot.hand.get_state = Mock(side_effect=AssertionError("cache read queried SDK"))
+    robot.hand_feedback.consume(XHandState(
+        np.zeros(12), np.ones((5, 3)), np.ones((5, 120, 3)), now,
+    ))
+    # 新关节反馈没有触觉数据时，两路触觉继续保留各自旧来源时间。
+    robot.hand_feedback.consume(XHandState(np.ones(12), None, None, now + 1_000_000_000))
+    monkeypatch.setattr(system, "time", SimpleNamespace(monotonic_ns=lambda: now + 2_000_000_000))
+    for _ in range(2):
+        state = robot.read_state()
+        assert state.arm["timestamp_ns"][0] == now
+        assert state.hand["timestamp_ns"][0] == now + 1_000_000_000
+        for channel in ("aggregate", "dense"):
+            assert state.hand[f"tactile_{channel}_timestamp_ns"][0] == now
+            np.testing.assert_array_equal(state.hand[f"tactile_{channel}"], 1)
+    robot.hand.get_state.assert_not_called()
+
+
+@pytest.mark.parametrize("expires", ["command", "feedback"])
+def test_arm_rechecks_expiration_after_trajectory_calculation(devices, monkeypatch, expires):
+    runtime, state, _, command, _, now = devices
+    channels = ArmChannels(
+        mp.get_context("spawn"), run_signal=state.run_signal,
+        stop_signal=state.stop_signal, emergency_signal=state.emergency_signal,
+    )
+    driver = SimpleNamespace(servo=Mock())
+    owner = arm_worker.ArmController(runtime.arm, channels, None, driver)
+    owner.status["qpos"] = runtime.arm.home_qpos
+    owner.status["timestamp_ns"] = now
+    owner.prepared_run_id = state.run_id
+    target = command.arm_qpos.copy()
+    target[0] += 0.01
+    elapsed = (10_000_000 if expires == "command"
+               else int(runtime.arm.feedback_max_age_s * 1e9))
+    deadline = now + (elapsed if expires == "command" else 1_000_000_000)
+    monkeypatch.setattr(protocol, "time", SimpleNamespace(monotonic_ns=lambda: now))
+    channels.publish_goal(RobotCommand(state.run_id, target, None), expires_ns=deadline)
+    clock = iter((now, now + elapsed))
+    monkeypatch.setattr(arm_worker, "time", SimpleNamespace(monotonic_ns=lambda: next(clock)))
+    assert owner.tick() is None
+    assert owner.reference is not None  # 使用真实 Ruckig 计算后，才推进时钟到到期边界。
+    driver.servo.assert_not_called()
+    assert channels.stop.is_set()

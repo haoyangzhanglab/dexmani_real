@@ -67,7 +67,7 @@ class EpisodeRecorder:
     def check_error(self):
         if self.error is not None:
             if not isinstance(self.error, RecordingError):
-                failure = RecordingError("Recording failed")
+                failure = RecordingError(f"Recording failed: {type(self.error).__name__}: {self.error}")
                 failure.__cause__ = self.error
                 self.error = failure
             raise self.error
@@ -186,7 +186,7 @@ class EpisodeRecorder:
             self.store_error(exc)
             if not isinstance(exc, Exception):
                 raise
-        if self.writer_pending or time.monotonic() >= deadline:
+        if self.writer_pending:
             self.store_error(TimeoutError("recording writer did not exit before the deadline"))
         self.check_error()
         if self.staging_path is None:
