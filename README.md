@@ -151,9 +151,9 @@ view_pointcloud.py 提供独立诊断流程：先在终端选择是否拟合桌�
 
 ## 离线物体几何和分析
 
-CordVIP 流程为同一 Raw 首帧人工确认 mask → 顺序全部行 → 保存逐行结果 → 独立查看。支持单/多物体、无资产 mask-only、独立 observed/model、法向、手 FK 与 SAM RPC；深度支持量参与 pose-valid，pose 丢失不删除独立实测点。
+CordVIP 共用同一几何核心处理 Raw 和宿主相机样本：`SceneTracker.open` 加载资产与模型，`track_raw` 顺序处理 Raw，`RGBDFrame.from_camera` 与 `tracker.step` 用于逐帧调用。API 返回内存结果，当前主包的策略观测未接线。支持单/多物体、无资产对象的分割与实测点云、模型点云及手 FK；深度支持不足时 pose 失效，独立实测点仍保留。
 
-逐帧结果统一保存在 `frames/*.npz`，点云和法线仅保存 camera 坐标，包含状态、失败原因、门控前候选位姿与已计算的深度支持数据；候选存在不代表 `pose_valid=True`。每帧仍保留 K，以及手几何启用时的 `T_base_camera`、link_ids 等事实。由 `T_base_camera` 取 R、t，基座系点为 `(points_camera @ R.T + t).astype(np.float32)`，法线为 `(normals_camera @ R.T).astype(np.float32)`。场景、配置、模型来源和结束摘要各保存一次。可按需用 `numpy.load(path, allow_pickle=False)` 读取 NPZ 离线计算指标。
+CLI 在 Raw 首帧人工确认 mask 后顺序处理各行，将固定模型点与法向保存为 `model_templates/<id>.npz`（object frame），将实测点、可选手点及位姿保存为 `frames/*.npz`（color-camera frame），单位均为米。模型点由固定模板和有效 pose 重建；候选位姿存在不代表 `pose_valid=True`。帧文件保留 K、状态、失败原因和已计算的深度支持，手几何启用时另含 `T_base_camera`、link_ids 与关节状态。API 可用 `tracker.model_points(..., T_target_camera=...)` 直接取得目标坐标系点云；离线指标可用 `numpy.load(path, allow_pickle=False)` 读取。
 
 离线查看在换行时更新 RGB 叠加和几何，`v` 只切换点云，静止时仅处理窗口事件和渲染。`--no-3d` 不解压点云；`--headless` 只读取并检查 RGB、源 row/time/clock，不读取对象字段或场景配置，也不加载 OpenCV/Open3D。
 
@@ -162,7 +162,7 @@ python scripts/cordvip/track_object.py --episode episodes/TASK/EPISODE --scene s
 python -m cordvip_geometry view /tmp/cordvip/scene_001
 ```
 
-物体生成先保存未定尺度 mesh，实测定尺度后才一次采样最终点/法向。初始 mask 仅可复用于相同 RGB-D、相机几何、行和来源时间。流程、模型安装与结果字段见 [CordVIP 文档](scripts/cordvip/README.md)。同行关联不证明手/相机物理同步，模型表面与语义点不代表实测接触。
+物体生成在导出前将 mesh 简化到最多 20,000 面，实测定尺度后采样固定点与法向。初始 mask 仅可复用于相同来源 ID、RGB-D、相机几何、行和时钟。多物体点数分配默认写入 task 内的 `sampled_1024/`，示例 apple / banana / bowl 为 432 / 324 / 268 点。流程、模型安装与结果字段见 [CordVIP 文档](scripts/cordvip/README.md)。同行关联不证明手/相机物理同步，模型表面与语义点不代表实测接触。
 
 物体资产按 `assets/pointcloud_template/object/<任务>/<物体>/` 组织，`reference.jpg`、`asset.json`、NPY 和 PLY 点云纳入 Git；`mesh/mesh_m.obj` 与 `third_party/weights/` 仅保留本地。克隆后可直接读取点云；FoundationPose 位姿估计需要先本地重建网格，具体步骤见[物体重建流程](docs/object_reconstruction.md)。
 

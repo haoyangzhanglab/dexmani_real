@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """从明确的官方 revision 下载分割与单图建模权重；不加载模型或连接设备。"""
 
 from __future__ import annotations
@@ -6,34 +5,31 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 from ..io import existing_file, output_path
-from ..sam2_config import DEFAULT_MODELS_DIR, GROUNDING_FILES, GROUNDING_MODEL, SAM_MODELS
-
-MODELS = {
-    "grounding": GROUNDING_MODEL,
-    "sam": None,  # Resolved from the explicit SAM2.1 variant below.
-    "shape": {
-        "repo_id": "tencent/Hunyuan3D-2.1",
-        "revision": "0b94677654c57bb9a6b6845cd7b704ccf551d327",
-        "directory": "Hunyuan3D-2.1",
-        "patterns": [
-            "hunyuan3d-dit-v2-1/config.yaml",
-            "hunyuan3d-dit-v2-1/model.fp16.ckpt",
-            "README.md",
-            "LICENSE*",
-        ],
-        "weight": "hunyuan3d-dit-v2-1/model.fp16.ckpt",
-    },
-}
+from ..models import (
+    DEFAULT_MODELS_DIR,
+    GROUNDING_FILES,
+    GROUNDING_MODEL,
+    SAM_MODELS,
+    SHAPE_MODEL,
+)
 
 
 def build_parser(*, workspace=None):
     workspace = Path(workspace or Path.cwd()).expanduser().resolve()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.set_defaults(workspace=workspace)
-    parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
-    parser.add_argument("--output", type=Path, default=workspace / DEFAULT_MODELS_DIR)
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        choices=("grounding", "sam", "shape"),
+        default=["grounding", "sam", "shape"],
+    )
+    parser.add_argument(
+        "--models-dir", type=Path, default=workspace / DEFAULT_MODELS_DIR
+    )
     parser.add_argument(
         "--sam-variant", choices=SAM_MODELS, default="small", help="SAM2.1 权重型号"
     )
@@ -43,14 +39,15 @@ def build_parser(*, workspace=None):
 def main(argv=None, *, workspace=None):
     parser = build_parser(workspace=workspace)
     args = parser.parse_args(argv)
-    output = output_path(args.output, workspace=args.workspace, allow_existing=True)
+    output = output_path(args.models_dir, workspace=args.workspace, allow_existing=True)
     output.mkdir(parents=True, exist_ok=True)
     for name in args.models:
+        spec: dict[str, Any]
         if name == "sam":
             model = SAM_MODELS[args.sam_variant]
             spec = dict(**model, directory=".", patterns=[model["weight"]])
         else:
-            spec = MODELS[name]
+            spec = {"grounding": GROUNDING_MODEL, "shape": SHAPE_MODEL}[name]
         destination = output / spec["directory"]
         if name == "grounding":
             required = [destination / filename for filename in GROUNDING_FILES]

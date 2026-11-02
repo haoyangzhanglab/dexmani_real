@@ -1,4 +1,4 @@
-"""Raw 首帧选择使用的 RGB-D、相机几何和来源时钟。"""
+"""RGB-D、相机几何与来源时钟。"""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ from pathlib import Path
 
 import numpy as np
 
-from .geometry import RectificationMaps, validate_distortion, validate_rgbd
+from .geometry import RectificationMaps, validate_distortion, validate_intrinsics
 
 
 @dataclass(frozen=True)
-class Frame:
-    """Aligned color-camera RGB-D in metres; source identity and clock describe the recorded timing."""
+class RGBDFrame:
+    """color-camera 网格的米制 RGB-D，附来源与时钟。"""
 
     rgb: np.ndarray
     depth_m: np.ndarray
@@ -24,77 +24,110 @@ class Frame:
     clock: str
     row_index: int | None = None
 
-
-def load_frame(path: str | Path) -> Frame:
-    """Read one source-grid NPZ without inferring calibration, units or timing."""
-    path = Path(path).expanduser().resolve()
-    required = {
-        "rgb",
-        "depth_m",
-        "K",
-        "distortion_model",
-        "distortion_coeffs",
-        "source_id",
-        "timestamp_ns",
-        "clock",
-    }
-    with np.load(path, allow_pickle=False) as saved:
-        missing = required - set(saved.files)
-        if missing:
-            raise ValueError(f"{path.name}: missing fields {sorted(missing)}")
-        text = {}
-        for key in ("distortion_model", "source_id", "clock"):
-            value = saved[key]
-            if value.shape != () or value.dtype.kind != "U" or not str(value.item()):
-                raise ValueError(f"{path.name}: {key} must be a nonempty scalar Unicode string")
-            text[key] = str(value.item())
-        integer = {}
-        for key in ("timestamp_ns", "row_index"):
-            if key not in saved.files:
+    def __post_init__(self):
+        rgb, depth_m = np.asarray(self.rgb), np.asarray(self.depth_m)
+        if (
+            depth_m.dtype != np.float32
+            or depth_m.ndim != 2
+            or not all(depth_m.shape)
+            or not np.isfinite(depth_m).all()
+            or np.any(depth_m < 0)
+        ):
+            raise ValueError(
+                "depth_m must be nonempty finite nonnegative float32 [H,W] metres"
+            )
+        if rgb.dtype != np.uint8 or rgb.shape != (*depth_m.shape, 3):
+            raise ValueError("RGB must be uint8 [H,W,3] aligned with depth_m")
+        for name in ("source_id", "clock"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a nonempty string")
+        for name, minimum in (("timestamp_ns", 1), ("row_index", 0)):
+            value = getattr(self, name)
+            if name == "row_index" and value is None:
                 continue
-            value = saved[key]
-            if value.shape != () or value.dtype.kind not in {"i", "u"} or int(value.item()) < 0:
-                raise ValueError(f"{path.name}: {key} must be a nonnegative scalar integer")
-            integer[key] = int(value.item())
-        coefficients = saved["distortion_coeffs"]
-        if coefficients.shape != (5,) or coefficients.dtype.kind not in {"f", "i", "u"}:
-            raise ValueError(f"{path.name}: distortion_coeffs must contain five numbers")
-        k1, k2, p1, p2, k3 = map(float, coefficients)
-        depth_m = saved["depth_m"]
-        if depth_m.dtype != np.float32:
-            raise ValueError("aligned depth must be finite nonnegative float32 [H,W] metres")
-        rgb, depth_m, K = validate_rgbd(saved["rgb"], depth_m, saved["K"])
-        distortion = validate_distortion(text["distortion_model"], (k1, k2, p1, p2, k3))
-        return Frame(
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, np.integer))
+                or value < minimum
+            ):
+                raise ValueError(f"{name} must be an integer >= {minimum}")
+            object.__setattr__(self, name, int(value))
+        object.__setattr__(self, "rgb", rgb)
+        object.__setattr__(self, "depth_m", depth_m)
+        object.__setattr__(self, "K", validate_intrinsics(self.K))
+        object.__setattr__(
+            self,
+            "distortion_coeffs",
+            validate_distortion(
+                self.distortion_model,
+                self.distortion_coeffs,
+            ),
+        )
+
+    @classmethod
+    def from_camera(cls, camera, camera_row):
+        """复用 CameraSnapshot 标定，将运行时相机行转为米制帧。"""
+        rgb = np.asarray(camera_row["rgb"])
+        depth = np.asarray(camera_row["depth"])
+        shape = (camera.color.height, camera.color.width)
+        if depth.dtype != np.uint16 or depth.shape != shape:
+            raise ValueError(
+                "camera depth must be uint16 [H,W] matching color intrinsics"
+            )
+        sequence = camera_row["ring_sequence"]
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, (int, np.integer))
+            or sequence <= 0
+        ):
+            raise ValueError("camera ring_sequence must be a positive integer")
+        return cls(
             rgb=rgb,
-            depth_m=depth_m,
-            K=K,
-            distortion_coeffs=distortion,
-            row_index=integer.get("row_index"),
-            timestamp_ns=integer["timestamp_ns"],
-            **text,
+            depth_m=np.multiply(depth, camera.depth_scale_m, dtype=np.float32),
+            K=camera.color.matrix(),
+            distortion_model=camera.color.distortion_model,
+            distortion_coeffs=camera.color.distortion_coeffs,
+            source_id=f"camera:{camera.serial}:{int(sequence)}",
+            timestamp_ns=camera_row["timestamp_ns"],
+            clock="host_monotonic_oldest_rgbd_receive",
+        )
+
+
+def load_frame(path: str | Path) -> RGBDFrame:
+    path = Path(path).expanduser().resolve()
+    with np.load(path, allow_pickle=False) as saved:
+        return RGBDFrame(
+            rgb=saved["rgb"],
+            depth_m=saved["depth_m"],
+            K=saved["K"],
+            distortion_model=saved["distortion_model"].item(),
+            distortion_coeffs=saved["distortion_coeffs"],
+            source_id=saved["source_id"].item(),
+            timestamp_ns=saved["timestamp_ns"].item(),
+            clock=saved["clock"].item(),
+            row_index=saved["row_index"].item() if "row_index" in saved.files else None,
         )
 
 
 def save_frame(path, frame):
-    """Save the original aligned RGB-D grid and its source identity and timing."""
-    payload = dict(
-        rgb=frame.rgb,
-        depth_m=frame.depth_m,
-        K=frame.K,
-        distortion_model=frame.distortion_model,
-        distortion_coeffs=frame.distortion_coeffs,
-        source_id=frame.source_id,
-        timestamp_ns=frame.timestamp_ns,
-        clock=frame.clock,
-    )
+    payload = {
+        "rgb": frame.rgb,
+        "depth_m": frame.depth_m,
+        "K": frame.K,
+        "distortion_model": frame.distortion_model,
+        "distortion_coeffs": frame.distortion_coeffs,
+        "source_id": frame.source_id,
+        "timestamp_ns": frame.timestamp_ns,
+        "clock": frame.clock,
+    }
     if frame.row_index is not None:
         payload["row_index"] = frame.row_index
     np.savez_compressed(path, **payload)
 
 
 def rectify_frame(frame, mask=None, *, maps=None):
-    """Return aligned RGB, measured depth, K and optional mask on the pinhole grid."""
+    """转换到 pinhole 网格，深度仍为实测 camera Z。"""
     if maps is None:
         maps = RectificationMaps(frame.depth_m.shape, frame.K, frame.distortion_coeffs)
     rgb, depth_m, mask = maps.apply(frame.rgb, frame.depth_m, mask)

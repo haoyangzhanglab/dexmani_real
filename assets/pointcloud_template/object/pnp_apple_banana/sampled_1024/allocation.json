@@ -1,0 +1,19 @@
+{
+  "source_task": "/home/zhanghaoyang/Desktop/dexmani_real/assets/pointcloud_template/object/pnp_apple_banana",
+  "total_points": 1024,
+  "volume_method": "mesh",
+  "objects": {
+    "apple": {
+      "volume_m3": 0.0002478785108064177,
+      "num_points": 432
+    },
+    "banana": {
+      "volume_m3": 0.00018598557097295482,
+      "num_points": 324
+    },
+    "bowl": {
+      "volume_m3": 0.0001535530022555612,
+      "num_points": 268
+    }
+  }
+}

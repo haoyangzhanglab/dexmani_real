@@ -1,22 +1,21 @@
-# Raw 离线几何与物体资产
+# 物体资产与 RGB-D 几何
 
-主流程固定为首帧人工确认、顺序处理 Raw 每行、保存结果、独立查看。命令从 workspace 根目录执行；脚本入口以 dexmani_real 根目录为 workspace，模块入口默认当前目录。输出必须使用新目录，不覆盖输入或写回 Raw。
+CLI 提供资产准备、Raw 逐行追踪和结果查看；Python API 返回内存结果，供宿主处理 Raw 或相机样本。命令默认在 workspace 根目录执行。来源数据和物体资产只读，追踪结果写入新目录。
 
 ## 安装与权重
 
-`real_robot` 只是示例环境名。先准备兼容的 Torch、Torchvision、NumPy、Transformers、CUDA 编译器及头文件，再运行安装脚本；脚本约束已有基础版本，补齐增量依赖及 nvdiffrast / FoundationPose mycpp，不替换已有源码和本地修改。
+先准备兼容的 Torch、Torchvision、NumPy、Transformers、CUDA 编译器和头文件，以及 Boost system/program_options 和 OpenMP，再运行安装脚本：
 
 ```bash
 conda activate real_robot
-bash third_party/cordvip_geometry/scripts/install_perception.sh --help
 bash third_party/cordvip_geometry/scripts/install_perception.sh
-python -m cordvip_geometry download --models grounding sam
-python -m cordvip_geometry check
+python -m cordvip_geometry download --models grounding sam shape
+python -m cordvip_geometry check --json
 ```
 
-显式 `check` 核对解释器、源码、编译扩展和权重路径，可加 `--json` 读取结构化结果。正常追踪直接加载所需源码、权重并执行边界检查；算法使用的深度支持量和 pose-valid 门控逐行保存。
+`real_robot` 是环境名示例。安装脚本约束已有基础版本、复用本地源码，补齐增量依赖并编译 nvdiffrast / FoundationPose mycpp。保留已有 `CPATH`、`MAX_JOBS` 和 `TORCH_CUDA_ARCH_LIST`；离线编译需按最终 GPU 设置架构。
 
-安装脚本为缺失源码选择以下 revision；已有目录直接复用：
+源码默认 revision：
 
 | 上游 | revision |
 | --- | --- |
@@ -25,35 +24,41 @@ python -m cordvip_geometry check
 | [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) | `82920d643c0dc2f7bfd7255f45f62d386edfe60c` |
 | [nvdiffrast](https://github.com/NVlabs/nvdiffrast) | `253ac4fcea7de5f396371124af597e6cc957bfae` |
 
-FoundationPose 的官方权重需按其[官方说明](https://github.com/NVlabs/FoundationPose)另行取得，放入 `third_party/FoundationPose/weights/2023-10-28-18-33-37` 和 `2024-01-11-20-02-45`；每个目录包含 `config.yml` 与 `model_best.pth`。源码、权重与再分发分别遵循上游仓库和模型来源的许可证；本仓不变更其授权。
+源码放在 workspace 的 `third_party/`，权重默认位于 `third_party/weights/`，可用 `--models-dir` 更改根目录。下载采用 [models](../src/cordvip_geometry/models.py) 中固定的官方 revision，文件齐全时直接复用；运行仅加载本地模型。
 
-下载命令从 [sam2_config.py](../src/cordvip_geometry/sam2_config.py) 和 [download_models.py](../src/cordvip_geometry/cli/download_models.py) 的明确官方 revision 获取所选模型，并保存下载来源。下载、分割和建模共用默认目录 `third_party/weights/`，该目录已被 Git 忽略。本地所需权重与配置文件齐全且非空时，下载命令直接复用，不联网或重复下载；此检查不验证文件内容，损坏文件应移走后重新下载。运行只加载本地权重，不隐式联网下载。安装脚本保留 `TORCH_CUDA_ARCH_LIST`；无可见 GPU 的离线编译需按最终设备显式设置。
+FoundationPose 权重按其[官方说明](https://github.com/NVlabs/FoundationPose)另行取得，分别放入 `third_party/FoundationPose/weights/2023-10-28-18-33-37` 和 `2024-01-11-20-02-45`，各含 `config.yml` 与 `model_best.pth`。授权以各上游仓库和模型条款为准。
 
-SAM 默认 small、BF16、eager；使用 `--sam-variant large` 时自动配对 large 的配置与本地权重：
+SAM 默认 small、BF16、eager。large 先下载权重，再为相关命令传 `--sam-variant large`；自训模型同时传 `--sam-config` 和 `--sam-checkpoint`。`--sam-python` 可指定独立解释器，父子进程通过标准 Python 序列化传递数组。分割、位姿与建模均使用进程可见的第 0 张 CUDA 卡，通过 `CUDA_VISIBLE_DEVICES` 选择。
+
+`check` 只核对本地解释器、源码、权重与扩展路径；GPU 推理、扩展 ABI 和长序列显存需单独实测。普通 import 和 help 不加载模型或设备。
+
+## 准备物体资产
+
+单图建模和已有 mesh 校准流程见[物体重建与点云](../../../docs/object_reconstruction.md)。阶段命令为 `object segment/select/generate/build/prepare/preview`，输出参数统一为 `--output`，文本参数为 `--prompt`。
+
+Hunyuan 在独立生成进程中运行；生成 mesh 导出前简化到最多 20,000 面，仍需显式指定米制尺度。`generation_result.json` 记录 `source_faces`、`mesh_simplification` 和实际导出的 `faces` / `vertices`。prepare 保留原点与朝向，在米制网格上按指定 seed / 点数采样固定点及三角面法向。
+
+多个物体的总点数分配：
 
 ```bash
-python -m cordvip_geometry download --models sam --sam-variant large
-# 在 track 或 object segment/build 命令中追加 --sam-variant large
+python scripts/cordvip/allocate_points.py \
+  assets/pointcloud_template/object/pnp_apple_banana
 ```
 
-自训模型必须同时给出 `--sam-config` 与 `--sam-checkpoint`，并省略 `--sam-variant`。`--sam-root`、`--dino-weights` 可指定本地路径，实际源码 API、配置和 checkpoint 结构必须匹配。`--sam-python` 默认当前解释器，可指向独立环境；SAM 保持独立解释器和私有进程管道，一个实例顺序处理请求，失败后关闭；不支持跨线程取消或复用失败实例。分割和位姿使用各进程可见的第 0 张 CUDA 卡；建模的 `--device` 单独选择 Hunyuan 设备。
-
-Grounding DINO 仅用于首帧文本候选，确认后释放；复用 mask 或手动画多边形不要求检测权重。SAM2 按模型所需历史窗口清理长序列状态，仍保留首帧 conditioning；初始 mask 会重采样，不承诺首帧传播结果逐像素相同。mask-only 不要求 FoundationPose；带 asset 的位姿分支仍需要其 CUDA/Open3D 环境。FK 手点需 Real 的离线运动学依赖，3D 结果查看另需 Open3D。help、普通 import 和静态检查不加载模型或连接设备；静态检查不证明实际推理、ABI、显存或吞吐。
+默认生成 `task/sampled_1024/`；已有输出拒绝覆盖，可用 `--output` 指定新目录。每个物体至少 1 点，剩余按闭合实体体积比例分配并用最大余数法补齐，总计 1024 点。碗计算壁和底的实体体积。新目录包含完整资产、NPY、PLY 和 `allocation.json`，可直接作为跟踪资产。
 
 ## 首帧确认与逐行追踪
-
-单物体使用米制资产及文本选择：
 
 ```bash
 python scripts/cordvip/track_object.py \
   --episode episodes/pick_place/episode_001 \
-  --asset /tmp/cordvip/object_asset --object-prompt 'white basket.' \
+  --asset /tmp/cordvip/object_asset --prompt 'white basket.' \
   --with-hand --output /tmp/cordvip/scene_001
 ```
 
-Raw 首帧被冻结，用户确认候选，或省略 prompt 手画 mask。选择保存到 `initial_selections/`；已有选择通过 `--initial-selection DIR` 复用。复用仍核对原始 RGB、深度、K、畸变、来源时间、时钟及 Raw 行身份，不能用于另一段录像。Raw 原样搬迁目录时，内容与行身份核对仍须成立。
+首帧冻结后人工确认候选，或省略 prompt 手画 mask。选择保存为 `initial_selections/<id>/`。复用时，`source_rgbd.npz` 中的来源 ID、RGB-D、标定、行号和时钟必须与实际首帧一致；它是来源与几何的唯一依据。mask 始终属于原始 RGB 网格，由 tracker 统一去畸变一次。
 
-多物体由 `scene.json` 声明，路径相对 workspace：
+多物体通过场景文件声明，路径相对 workspace：
 
 ```json
 {"objects": [
@@ -70,33 +75,73 @@ python scripts/cordvip/track_object.py \
   --with-hand --headless --output /tmp/cordvip/scene_002
 ```
 
-`role` 仅是 metadata 标签。省略某个 `asset` 就保留该实例的 mask 和语义实测点，不估计或伪造 pose；全部省略时不需要 FoundationPose。新场景可用 `prompt` 逐个确认，也可手画。无窗口运行要求每个实例都有当前首帧的确认选择，不自动接受最高分候选。单物体同样支持 mask-only：省略 `--asset` 即可。
+无 asset 的对象输出 mask 和独立实测点。`role` 仅作 metadata。headless 要求每个对象都有当前首帧的确认选择。默认处理全部 Raw 行；`--max-frames N` 显式限制前缀，结果标为 partial。同一 Raw 行提供 RGB-D、实测关节与时钟，行关联不证明物理同步。
 
-默认逐行处理全部 Raw，不按墙钟等待或跳帧。`--max-frames N` 明确限制前缀，最终结果标为 partial；没有全帧、存盘或实时源的第二条运行路径。一个 RawReader 同行提供 RGB-D、实测关节和来源时钟。首帧深度支持不足时明确失败；pose 丢失按对象保持失效，重新注册需要重新运行并确认首帧。
+## Python API
+
+独立子包安装后直接 import。`SceneTracker.open` 负责一次加载与收尾；`workspace` 默认当前目录，资产和选择的相对路径基于 workspace。`models_dir`、`sam_python` 及 SAM 配对可按需指定。`log_dir` 省略时，SAM 日志输出到 stderr。
+
+```python
+from dexmani_real.data.raw import RawReader
+from cordvip_geometry import SceneTracker, track_raw
+
+with (
+    RawReader(episode) as reader,
+    SceneTracker.open(
+        {"object": asset_dir}, initial_selections={"object": selection_dir}
+    ) as tracker,
+):
+    for result in track_raw(reader, tracker, with_hand=True):
+        points_camera = tracker.model_points(result, "object")
+```
+
+`track_raw` 不接管 reader / tracker 的生命周期，也不保存结果；`result["hand"]` 是同行手几何。宿主持有相机时：
+
+```python
+from cordvip_geometry import RGBDFrame, SceneTracker
+
+with SceneTracker.open({"object": asset_dir}) as tracker:
+    first = RGBDFrame.from_camera(camera, first_row.camera)
+    result = tracker.step(first, initial_masks={"object": confirmed_mask})
+    for row in rows:
+        result = tracker.step(RGBDFrame.from_camera(camera, row.camera))
+        points_base = tracker.model_points(
+            result, "object", T_target_camera=camera.T_xarm_base_from_color
+        )
+```
+
+`camera` 是标定快照，样本包含 `uint8 rgb`、原始 `uint16 depth`、`timestamp_ns` 与 `ring_sequence`。Frame 统一检查动态数组、米制深度、标定和时钟；tracker 固定使用一套相机几何，按来源时序处理。实时重复帧复用结果，Raw 每行独立处理。`model_points` 返回米制 `float32 (N, 3)`；默认 camera frame，指定有效 `T_target_camera` 可变换到目标系。pose 无效或无 asset 时返回空点。
+
+宿主在所需位置主动调用这些接口；当前主包的控制、Raw writer 和策略观测未接线。
 
 ## 输出与查看
 
 | 输出 | 内容 |
 | --- | --- |
-| `scene.json` | 一次保存对象 ID、role、asset、确认选择与标签 |
-| `run.json` | 实际参数、资产与相机/FK 来源、单位及数据语义 |
-| `model_templates/<object_id>.npz` | 每个有资产对象的固定 `points_object`、`normals_object`，在处理帧前保存一次；mask-only 无模板 |
-| `frames/000000.npz` 等 | 每个已处理 Raw row 的源身份/时钟、状态、失败原因、候选/有效位姿、mask、observed 点、支持证据与可选手点/法向 |
-| `models.json` | 循环开始前保存已就绪模型来源、配置及加载事实；初始化失败时仍保存已取得的信息 |
-| `result.json` | completed / partial / interrupted / failed、已处理行数及清理错误 |
-| `sam2_worker.log` | 隔离分割进程的原始日志 |
+| `scene.json` | 对象 ID、role、asset、选择与标签 |
+| `run.json` | 实际参数、资产来源、颜色、单位及可选手标定 |
+| `model_templates/<id>.npz` | 有资产对象的固定 `points_object` / `normals_object`，米制 float32，原顺序 |
+| `frames/<row>.npz` | 来源行/时钟、RGB、K、mask、实测点、位姿状态和深度支持；可附手几何 |
+| `models.json` | 工厂已返回的模型来源；初始化失败时只记录已取得的信息 |
+| `result.json` | completed / partial / interrupted / failed、失败原因及处理行数 |
+| `sam2_worker.log` | CLI 的分割进程日志与 traceback |
 
-SAM 失败保留子进程原始 traceback，父进程错误指向该日志。FoundationPose、renderer 或其他技术异常直接结束任务为 failed，保留已写入的成功前缀和原始错误，不伪造当前行。模板与逐帧 NPZ 均独占创建；写入或关闭失败时删除自己创建的未完成文件，保留首错，已有文件拒绝覆盖。模板失败发生在处理帧前，不继续输出依赖模板的结果。深度点或模型支持不足按算法形成 `POSE_LOST`，该行独立实测点仍保留。
-
-逐行 NPZ 是唯一逐帧结果。文件名对应源 row，不是墙钟序号。对象字段使用 `toy__`、`basket__` 或单物体 `object__` 前缀，对象清单与 role 只存于 `scene.json`。每个实例分别保存 `pose_valid` 和 `observed_valid`；pose 无效时 `T_camera_object` 为 NaN，查看或分析时模型点为空，独立实测点仍可有效。`candidate_T_camera_object` 保存门控前候选（没有候选时为 NaN），不能代替有效位姿重建模型点。已计算的 `model_supported_mask` 与 `observed_model_depth_residual_m` 在拒绝候选的失败帧中也保存；支持点数/比例只在实际完成模型深度比较时保存。
-
-模板中的 `points_object` 与 `normals_object` 保持资产载入后的原始顺序、float32、米制 object frame，不归一化、重采样或翻转。逐帧保留 `observed_points_camera`、可选的 `hand_points_camera`/`hand_normals_camera` 和有效 pose；模型点与法向由模板和有效 pose 重建。每个 NPZ 保留 `K`；启用 `--with-hand` 时同一文件还含 `T_base_camera`、`hand_link_ids` 和关节状态，无需跨文件解析标定。重建模型后若需 base 坐标，点保持 float32，法向保持矩乘的自然 dtype：
+逐帧对象字段使用 `<id>__` 前缀。`pose_valid` 与 `observed_valid` 独立；pose 失效时 `T_camera_object` 为 NaN，实测点仍可有效。`candidate_T_camera_object` 仅供诊断；已计算的深度支持 mask、残差和统计在失败帧中也保存。模型点由模板与有效 pose 重建：
 
 ```python
-R, t = T_base_camera[:3, :3], T_base_camera[:3, 3]
-points_base = (points_camera @ R.T + t).astype(np.float32)
-normals_base = normals_camera @ R.T
+import numpy as np
+
+with np.load(directory / "model_templates/object.npz", allow_pickle=False) as saved:
+    points_object = saved["points_object"]
+with np.load(directory / "frames/000000.npz", allow_pickle=False) as row:
+    if bool(row["object__pose_valid"]):
+        pose = row["object__T_camera_object"]
+        points_camera = (points_object @ pose[:3, :3].T + pose[:3, 3]).astype(
+            np.float32
+        )
 ```
+
+模板与帧文件独占创建；未完成的 NPZ 会清理。技术错误直接结束运行并保留成功前缀，深度支持不足按算法形成 `POSE_LOST`。模板使用 object frame，实测点和手点使用 color-camera frame，单位均为米；启用手几何时每帧附外参、关节状态与来源时间。法向仅表示网格表面几何。
 
 ```bash
 python -m cordvip_geometry view /tmp/cordvip/scene_001
@@ -104,49 +149,4 @@ python -m cordvip_geometry view /tmp/cordvip/scene_001 --no-3d
 python -m cordvip_geometry view /tmp/cordvip/scene_001 --headless
 ```
 
-离线分析从输出内模板与有效 pose 重建，不访问原资产或重新执行模型。下面以有资产的单物体 `object` 为例；多物体分别使用自己的模板与字段前缀，mask-only 直接保留空模型点：
-
-```python
-import numpy as np
-
-with np.load("/tmp/cordvip/scene_001/model_templates/object.npz", allow_pickle=False) as template:
-    points_object = template["points_object"]
-    normals_object = template["normals_object"]
-
-with np.load("/tmp/cordvip/scene_001/frames/000000.npz", allow_pickle=False) as row:
-    valid = bool(row["object__pose_valid"])
-    if valid:
-        pose = row["object__T_camera_object"]
-        points_camera = (points_object @ pose[:3, :3].T + pose[:3, 3]).astype(np.float32)
-        normals_camera = normals_object @ pose[:3, :3].T
-    else:
-        points_camera = np.empty((0, 3), np.float32)
-        normals_camera = np.empty((0, 3), np.float32)
-    candidate = row["object__candidate_T_camera_object"]  # 有限候选仍可能被门控拒绝
-    error = str(row["object__error"])
-    if "object__observed_model_depth_residual_m" in row:
-        residual = row["object__observed_model_depth_residual_m"]
-        median_error = np.median(np.abs(residual[np.isfinite(residual)])) if np.isfinite(residual).any() else np.nan
-```
-
-有效模型点保持原 float32 输出；法向不额外转换 dtype，当前 float64 pose 下结果为 float64。无效 pose 的空数组沿用 float32。模板与逐帧 pose 均来自输出目录，`scene.json`/`run.json` 的原资产路径仅作来源记录。
-
-查看器按 `n`/Space 前进一行、`v` 切换 observed/model、`q`/`Q`/Esc 或关窗退出。每行只解压显示字段一次；3D 默认 observed，首次切换 model 才加载各声明资产的模板点，并用普通字典在本次查看中复用。只在新行或表示切换时重建需要显示的模型点；pose 无效或 mask-only 显示空点，声明资产缺模板明确报错。`--no-3d` 不读取模板或点云。`view --headless` 仅检查 RGB 的 uint8 网格、文件名对应的 row 及来源时间/时钟，不读取 scene/run、模板、对象字段或生成 overlay，不加载 OpenCV/Open3D。新行更新 RGB 和几何，`v` 只更新几何，静止时仅轮询事件和渲染；不读取未展示的法向、候选位姿或残差。查看不访问 Raw、mesh、URDF、FK 或模型环境。
-
-## 准备物体资产
-
-操作命令、尺度定义、输出文件和无窗口流程统一见[物体重建与 1024 点点云](../../../docs/object_reconstruction.md)。`reconstruct_object.py` 与 `object build` 共用实现；已有 CAD/扫描网格可直接 `prepare`。
-
-分割与尺度校准直接执行，Hunyuan 生成运行在独立子进程中，退出释放 GPU。分割的 `foreground_rgba.png` 是重建输入；生成结果是未定尺度网格，最终点云只在指定米制尺度后保存。`--preview` 临时采样不改变最终资产。
-
-## 数据语义
-
-几何使用 color-camera frame 和米。深度是 camera Z，0 表示缺测；ray direction 保持 Z=1，因此命中参数也是 Z，不归一化成欧氏距离。去畸变只接受已支持的 forward Brown-Conrady 模型，depth/mask 使用最近邻。源 ID、row、clock 和来源时间保持原值，主机接收时间不等于曝光时间。
-
-语义实测点只来自同帧互斥 mask 与实测深度，不修补孔洞、不分配重叠像素，也不依赖 mesh。像素按全局 stride 网格的 row-major `(v,u)` 排列。renderer 保留 ROI raycast，直接按实测点序收集模型 Z 向量，不构造整幅模型深度图。模型支持与残差复用同一点序，残差为 measured Z − rendered Z，无模型表面处为 NaN；支持 mask 仍保留完整图像网格。默认 stride 为 2、深度容差 0.015 m、最少匹配 30 像素及支持比例 0.15；这些支持条件参与 pose-valid 和 `POSE_LOST`，不能写成仅诊断。支持比例不是概率置信度。默认不计算 semantic/overlap/coverage/median 等纯报告指标，需要时从 NPZ 离线计算。
-
-模型点来自固定资产及有效 pose，不是实测接触。FoundationPose++ 的 bbox 中心只引导 centered mesh 的 2D 位置，保留旧 Z/rotation，不用深度孔洞构造 3D 质心；输出为 `T_camera_asset = T_camera_centered @ T_centered_asset`。单个 pose 正常丢失不删除别的物体或独立实测点。
-
-`--with-hand` 用同一 Raw 行的 19 维实测 arm/hand 关节（rad）、数据对应的相机外参与 URDF `link_base` 生成手点，不用 action、不插值、不连接设备。固定样本、link ID 与法向沿用 URDF/mesh，手点和法向只存 camera 坐标；时间证据未知时明确标为不可用。同行关联不证明手/相机物理同步，几何有效也不代表通过策略输入的时序准入。
-
-控制、训练适配及 contact/proximity 标签仍属于主包和配套 Policy。本工具不接管设备或动作发布；真实 GPU 模型的结果、长序列内存与性能须用实际模型和 Raw 单独验证。
+查看器使用 `n` / Space 前进、`v` 切换 observed / model、`q` / Esc 或关窗退出。每行只读取显示字段一次，模板在首次 model 显示时加载；静止时只轮询事件与渲染。`--no-3d` 只显示二维结果，`--headless` 只读取 RGB 与来源行/时钟。查看仅依赖输出目录。

@@ -1,13 +1,32 @@
-"""Isolated Hunyuan3D-2.1 shape inference; metric scale and object axes need explicit calibration."""
+"""Hunyuan3D-2.1 单图形状生成；尺度由资产准备阶段确定。"""
 
 import os
-from pathlib import Path
 import sys
 import time
+from numbers import Integral
+from pathlib import Path
 
 import numpy as np
 
+from .geometry import MAX_MESH_FACES, simplify_mesh
 from .io import existing_file
+
+
+def validate_generation_parameters(
+    seed=0, steps=50, octree_resolution=384, num_chunks=8000
+):
+    for name, value, minimum in (
+        ("seed", seed, 0),
+        ("steps", steps, 1),
+        ("octree_resolution", octree_resolution, 16),
+        ("num_chunks", num_chunks, 1),
+    ):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Integral)
+            or value < minimum
+        ):
+            raise ValueError(f"{name} 必须是大于等于 {minimum} 的整数")
 
 
 def generate_mesh(
@@ -19,17 +38,11 @@ def generate_mesh(
     steps=50,
     octree_resolution=384,
     num_chunks=8000,
-    device="cuda",
 ):
-    """Generate from local 2.1 weights and retain provenance; no mesh cleanup or metric scaling."""
-    for name, value, minimum in (
-        ("seed", seed, 0),
-        ("steps", steps, 1),
-        ("octree_resolution", octree_resolution, 16),
-        ("num_chunks", num_chunks, 1),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-            raise ValueError(f"{name} must be an integer >= {minimum}")
+    validate_generation_parameters(seed, steps, octree_resolution, num_chunks)
+    seed, steps, octree_resolution, num_chunks = map(
+        int, (seed, steps, octree_resolution, num_chunks)
+    )
     image_path = existing_file(image_rgba_path)
     root = Path(source_root).expanduser().resolve()
     package_parent = root / "hy3dshape"
@@ -40,41 +53,48 @@ def generate_mesh(
     output = Path(output_mesh_path).expanduser().resolve()
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite generated mesh: {output}")
-    if output.suffix.lower() not in (".obj", ".ply", ".glb"):
-        raise ValueError("Generated mesh output must use .obj, .ply or .glb")
+    if output.suffix.lower() != ".obj":
+        raise ValueError("Generated mesh output must use .obj")
 
-    from PIL import Image
     import yaml
+    from PIL import Image
 
     with Image.open(image_path) as source_image:
         if source_image.mode != "RGBA":
-            raise ValueError("Hunyuan input must be RGBA with the selected object's alpha mask")
+            raise ValueError(
+                "Hunyuan input must be RGBA with the selected object's alpha mask"
+            )
         image = source_image.copy()
     alpha = np.asarray(image)[..., 3]
     visible = np.argwhere(alpha > 0)
-    if len(visible) < 4 or np.any(np.ptp(visible, axis=0) < 2) or not np.any(alpha == 0):
-        raise ValueError("RGBA input must contain a nonempty foreground and transparent background")
+    if (
+        len(visible) < 4
+        or np.any(np.ptp(visible, axis=0) < 2)
+        or not np.any(alpha == 0)
+    ):
+        raise ValueError(
+            "RGBA input must contain a nonempty foreground and transparent background"
+        )
     with config_path.open(encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
-    # Local DinoV2 weights must prevent the conditioner from downloading models implicitly.
+    # 内嵌 DinoV2 配置，禁止 conditioner 隐式下载。
     conditioner = config["conditioner"]["params"]["main_image_encoder"]["kwargs"]
     if conditioner.get("config") is None:
-        raise ValueError("Hunyuan conditioner must use embedded model config, without downloads")
+        raise ValueError(
+            "Hunyuan conditioner must use embedded model config, without downloads"
+        )
 
-    # 本函数在一次生成子进程内调用，进程退出释放模型与 CUDA 资源。
     started = time.monotonic()
-    os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1")
+    os.environ.update(
+        HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1"
+    )
     sys.path.insert(0, str(package_parent))
     import torch
     from hy3dshape import Hunyuan3DDiTFlowMatchingPipeline
 
-    target = torch.device(device)
-    if target.type != "cuda":
-        raise ValueError("This shape-generation example requires an explicit CUDA device")
+    target = torch.device("cuda:0")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; shape generation was not started")
-    if target.index is not None and target.index >= torch.cuda.device_count():
-        raise ValueError(f"CUDA device does not exist: {target}")
     torch.cuda.init()
     pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
         str(checkpoint_path),
@@ -83,7 +103,7 @@ def generate_mesh(
         dtype=torch.float16,
         use_safetensors=False,
     )
-    # inference_mode disables gradients; eval also selects the DiT MoE inference branch.
+    # eval 还会启用 DiT MoE 的推理分支。
     for component in (pipeline.model, pipeline.vae, pipeline.conditioner):
         component.eval().requires_grad_(False)
     with torch.inference_mode():
@@ -105,9 +125,9 @@ def generate_mesh(
         or np.any(mesh.extents <= 0)
     ):
         raise RuntimeError("Hunyuan returned empty, nonfinite or degenerate geometry")
-    payload = mesh.export(file_type=output.suffix[1:].lower())
-    if isinstance(payload, str):
-        payload = payload.encode("utf-8")
+    source_faces = len(mesh.faces)
+    mesh = simplify_mesh(mesh)
+    payload = mesh.export(file_type="obj").encode("utf-8")
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("xb") as stream:
         stream.write(payload)
@@ -119,17 +139,17 @@ def generate_mesh(
         "image_rgba_path": str(image_path),
         "weights_directory": str(weights),
         "mesh_path": str(output),
-        "units": "unscaled",
-        "object_frame": "generator_output_without_recentering",
         "seed": seed,
         "steps": steps,
         "octree_resolution": octree_resolution,
         "num_chunks": num_chunks,
-        "device": str(device),
-        "dtype": "float16",
-        "model_mode": "eval",
-        "vertices": int(len(mesh.vertices)),
-        "faces": int(len(mesh.faces)),
+        "device": str(target),
+        "source_faces": source_faces,
+        "mesh_simplification": "quadric_decimation"
+        if source_faces > MAX_MESH_FACES
+        else "none",
+        "vertices": len(mesh.vertices),
+        "faces": len(mesh.faces),
         "bounds_unscaled": mesh.bounds.tolist(),
         "generation_seconds": elapsed,
     }

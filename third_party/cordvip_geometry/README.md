@@ -1,32 +1,44 @@
 # cordvip_geometry
 
-用于个人研究的离线物体资产准备与 Raw 几何处理。Grounding DINO 提供首帧文本候选，人工确认后由 SAM2.1 连续传播；可选 FoundationPose++ 使用 2D bbox guidance 细化位姿，不含 Kalman。Hunyuan3D-2.1 单图生成的 mesh 需要显式校准米制尺度。
+物体资产准备、Raw 逐行处理与宿主 RGB-D 跟踪共用同一个几何核心。Grounding DINO 提供首帧候选，人工确认后由 SAM2.1 传播；有米制 mesh 的对象使用 FoundationPose++ 估计位姿，无资产的对象输出分割与实测点云。
 
-常用入口是 [reconstruct_object.py](../../scripts/cordvip/reconstruct_object.py) 和 [track_object.py](../../scripts/cordvip/track_object.py)。先看[短示例](../../scripts/cordvip/README.md)；安装、数据与输出细节见[使用文档](docs/usage.md)。
+## 安装与命令
+
+在 workspace 根目录、已有兼容 Torch/CUDA 的环境中执行：
 
 ```bash
-conda activate real_robot
-# 新工作站先准备基础环境；安装脚本不下载模型、不连接设备。
 bash third_party/cordvip_geometry/scripts/install_perception.sh
 python -m cordvip_geometry download --models grounding sam
 python -m cordvip_geometry check
 ```
 
-`real_robot` 是示例环境名。SAM 可通过 `--sam-python` 使用独立解释器，RPC 隔离保留。默认型号 small；官方型号由 `--sam-variant` 同时选定配置与本地 checkpoint，自训模型显式提供完整配对。显式 `check` 只核对解释器、源码和权重路径，可加 `--json`；不证明 GPU 推理、扩展 ABI 或长序列内存可用。
+源码固定放在 `third_party/Grounded-SAM-2`、`FoundationPose`、`Hunyuan3D-2.1`；权重默认位于 `third_party/weights`，可用 `--models-dir` 指定。SAM 默认 small，可指定 large 或完整自训配置/权重配对；`--sam-python` 选择独立解释器。模型只从本地加载，GPU 通过 `CUDA_VISIBLE_DEVICES` 选择。
 
-主流程为 Raw 首帧确认 → 单个 RawReader 顺序处理每行 → 保存每行结果 → 独立查看。全部对象不带 asset 时只做 mask 与实测点，不要求 FoundationPose。带 asset 时，深度几何支持参与 pose-valid 与 `POSE_LOST`；固定模型点和法向保存一次，逐帧保存位姿供查看或分析时重建。手点来自同行实测关节和数据对应的相机标定，同行关联不证明物理同步。
+常用脚本是[物体重建](../../scripts/cordvip/reconstruct_object.py)、[体积点数分配](../../scripts/cordvip/allocate_points.py)和[Raw 追踪](../../scripts/cordvip/track_object.py)。命令与数据示例见[脚本说明](../../scripts/cordvip/README.md)，细节见[使用文档](docs/usage.md)。
 
-```bash
-python scripts/cordvip/track_object.py \
-  --episode episodes/pick_place/episode_001 --scene scene.json \
-  --with-hand --headless --output /tmp/cordvip/scene_001
-python -m cordvip_geometry view /tmp/cordvip/scene_001
+## Python 调用
+
+```python
+from dexmani_real.data.raw import RawReader
+from cordvip_geometry import SceneTracker, track_raw
+
+with (
+    RawReader(episode) as reader,
+    SceneTracker.open(assets, initial_selections=selections) as tracker,
+):
+    for result in track_raw(reader, tracker, with_hand=True):
+        points_camera = tracker.model_points(result, "object")
 ```
 
-追踪默认处理全部行，只有 `--max-frames` 显式限制前缀。`frames/` 必存，`scene.json` 保存一次对象/role/asset/selection，`run.json`、`models.json`、`result.json` 分别记录配置、已就绪模型来源与最终结果。有资产的对象在处理帧前写入 `model_templates/<object_id>.npz`，含原顺序、float32、米制 object frame 的 `points_object` 与 `normals_object`；mask-only 对象不写模板。逐帧事实只写入 NPZ，包括失败原因、门控前候选位姿和已计算的支持掩码、深度残差。输出使用新目录，Raw 始终只读。首帧选择仍需与源数据及相机几何精确对应。
+`assets` 为对象名到资产目录的映射，`selections` 为对象名到首帧确认目录的映射。宿主持有相机时，用 `RGBDFrame.from_camera(camera, row.camera)` 构造帧，再调用 `tracker.step(frame)`；首帧显式传入原 RGB 网格的 `initial_masks`。实时重复样本复用结果，Raw 每行均独立处理。点云按需重建为米制 `float32 (N, 3)`，可用 `T_target_camera` 变换到基座坐标系。
 
-逐帧保留 camera 坐标的 observed 点与可选手点/法向，以及有效的 `T_camera_object`，不再计算或保存 `model_points_camera`、`model_normals_camera`。模型点用输出内模板及有效 pose 重建，点保持 float32，法向矩乘保持自然 dtype（当前有效 pose 为 float64）。每个 NPZ 仍自包含 `K`，使用 `--with-hand` 时保留 `T_base_camera`、link IDs 与关节状态。完整 NumPy 重建示例见[输出与查看](docs/usage.md#输出与查看)。
+`SceneTracker.open` 一次加载资产与模型，并负责资源收尾。API 返回内存结果；SAM 日志默认输出到宿主 stderr，指定 `log_dir` 可保存日志。CLI 使用同一工厂，并写入可独立查看的结果目录。接口和返回语义见 [Python API](docs/usage.md#python-api)。
 
-建模的分割和 prepare 直接调用普通函数；只有 Hunyuan 生成使用一次子进程，退出释放 GPU。生成只保存未定尺度 mesh；最终米制资产按原 seed/点数采样一次。结果查看器在换行时更新显示，`v` 只更新 observed/model 点云；首次选择 model 才加载模板，本次查看复用。静止时仅轮询窗口事件和渲染。`--no-3d` 不读取模板或点云数组；`view --headless` 仅检查 RGB 和来源行/时钟，不加载 OpenCV/Open3D。查看仅依赖输出目录，不访问来源资产、Raw 或模型环境。
+## 几何约定
 
-本工具不提供实时相机追踪、latest/心跳发布或外部 Frame 宿主，也未接入主包控制、Raw writer、Canonical 导出或策略部署。上游源码与模型继续遵循各自的许可证及模型条款，详见[安装与权重](docs/usage.md#安装与权重)。
+- 深度为 color-camera Z，单位米；0 表示缺测。物体资产保留原点和朝向，固定点与法向按原始顺序使用。
+- 生成 mesh 在导出前简化到最多 20,000 面；已有高面数资产在跟踪初始化时简化一次，位姿与模型深度比较共用该网格。
+- 模型深度只查询当前实测像素。深度支持不足时 pose 失效，独立实测点仍保留；无效 pose 的模型点为空。
+- 点数分配脚本按闭合实体体积采样，总计 1024 点；当前示例在 `pnp_apple_banana/sampled_1024`，分配为 432 / 324 / 268。
+
+上游源码、模型授权和安装前提见[安装与权重](docs/usage.md#安装与权重)。

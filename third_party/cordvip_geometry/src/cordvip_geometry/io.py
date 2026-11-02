@@ -1,8 +1,8 @@
-"""资产与初始选择边界校验，以及离线结果写入。"""
+"""首帧选择与离线结果读写。"""
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -10,45 +10,12 @@ logger = logging.getLogger(__name__)
 
 def new_output(path, *, workspace, protected=()):
     reports = (Path(workspace).expanduser().resolve() / "reports").resolve()
-    path = path or reports / "cordvip_demo" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = path or reports / "cordvip" / datetime.now(timezone.utc).strftime(
+        "%Y%m%d_%H%M%S_%f"
+    )
     path = output_path(path, workspace=workspace, protected=protected)
     path.mkdir(parents=True, exist_ok=False)
     return path
-
-
-def load_asset(path):
-    """Load one metric asset and its ordered surface samples."""
-    import numpy as np
-
-    from .geometry import load_metric_mesh, load_points
-
-    path = Path(path).expanduser().resolve()
-    metadata = json.loads((path / "asset.json").read_text())
-    if metadata.get("units") != "m" or metadata.get("frame") != "object":
-        raise ValueError("资产必须使用 object frame 和米制单位")
-    files = {}
-    for name in ("mesh", "points", "normals"):
-        file = (path / metadata[f"{name}_file"]).resolve()
-        if not file.is_relative_to(path):
-            raise ValueError("资产文件必须位于资产目录内")
-        files[name] = file
-    if not files["mesh"].is_file():
-        raise FileNotFoundError(f"资产所需的本地 mesh 文件缺失，请先准备该文件：{files['mesh']}")
-    mesh, points = load_metric_mesh(files["mesh"]), load_points(files["points"])
-    # Normals describe the generated surface, not measured contact geometry.
-    normals = np.load(files["normals"], allow_pickle=False)
-    if (
-        normals.dtype.kind not in "fiu"
-        or normals.shape != points.shape
-        or not np.isfinite(normals).all()
-    ):
-        raise ValueError("资产法向必须与固定点一一对应，且为有限实数 (N, 3) 数组")
-    if not np.allclose(np.linalg.norm(normals.astype(np.float64), axis=1), 1, rtol=0, atol=1e-5):
-        raise ValueError("资产法向必须是单位向量；不自动修补或归一化")
-    normals = normals.astype(np.float32)
-    points.setflags(write=False)
-    normals.setflags(write=False)
-    return mesh, points, normals, metadata
 
 
 def load_mask(path, shape):
@@ -60,7 +27,11 @@ def load_mask(path, shape):
         import cv2
 
         mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if mask is None or mask.shape != shape or mask.dtype not in (np.dtype(bool), np.dtype("uint8")):
+    if (
+        mask is None
+        or mask.shape != shape
+        or mask.dtype not in (np.dtype(bool), np.dtype("uint8"))
+    ):
         raise ValueError("mask 必须为与起始 RGB-D 同尺寸的 bool/uint8 单通道图")
     return mask > 0
 
@@ -77,9 +48,11 @@ def output_path(path: Path, *, workspace, protected=(), allow_existing=False) ->
     path = requested.resolve()
     workspace = Path(workspace).expanduser().resolve()
     for source in (workspace / "episodes", workspace / "rollouts", *protected):
-        if source is not None and path.is_relative_to(Path(source).expanduser().resolve()):
+        if source is not None and path.is_relative_to(
+            Path(source).expanduser().resolve()
+        ):
             raise ValueError("输出不能写入 Raw、RGB-D 输入或物体资产目录内部")
-    # Published Raw may also live outside the workspace's default capture roots.
+    # Raw 也可能位于 workspace 之外。
     if any((parent / "data.h5").is_file() for parent in (path, *path.parents)):
         raise ValueError("输出不能写入 Raw episode 内部")
     if not allow_existing and (path.exists() or requested.is_symlink()):
@@ -93,10 +66,10 @@ def write_json(path: Path, value: dict) -> None:
         stream.write(text)
 
 
-def write_confirmed_selection(directory, mask, metadata, *, mask_file, foreground_rgb=None):
-    """Save an explicitly confirmed mask; RGBA is a build attachment."""
+def write_confirmed_selection(
+    directory, mask, metadata, *, mask_file, foreground_rgb=None
+):
     import numpy as np
-    from PIL import Image
 
     directory = Path(directory)
     mask = np.asarray(mask)
@@ -110,11 +83,15 @@ def write_confirmed_selection(directory, mask, metadata, *, mask_file, foregroun
     if path.suffix == ".npy":
         np.save(path, mask, allow_pickle=False)
     elif path.suffix == ".png":
+        from PIL import Image
+
         Image.fromarray(mask.astype(np.uint8) * 255).save(path)
     else:
         raise ValueError("confirmed masks use PNG or NPY")
     result = {**metadata, "mask_file": mask_file}
     if foreground_rgb is not None:
+        from PIL import Image
+
         rgb = np.asarray(foreground_rgb)
         if rgb.dtype != np.uint8 or rgb.shape != (*mask.shape, 3):
             raise ValueError("foreground RGB must align with the confirmed mask")
@@ -125,11 +102,11 @@ def write_confirmed_selection(directory, mask, metadata, *, mask_file, foregroun
     return result
 
 
-def load_initial_selection(directory, frame, maps):
-    """Reuse only an explicitly selected mask for the exact original RGB-D frame."""
+def load_initial_selection(directory, frame):
+    """已确认 mask 只复用于相同来源和几何的首帧。"""
     import numpy as np
 
-    from .rgbd import load_frame, rectify_frame
+    from .rgbd import load_frame
 
     directory = Path(directory).expanduser().resolve()
     metadata = json.loads((directory / "selection.json").read_text())
@@ -137,38 +114,31 @@ def load_initial_selection(directory, frame, maps):
         metadata.get("selection") not in {"explicit_headless_instance", "gui_confirmed"}
         or "selected_instance" not in metadata
     ):
-        raise ValueError("initial-selection must contain an explicitly confirmed selection")
+        raise ValueError(
+            "initial-selection must contain an explicitly confirmed selection"
+        )
     if metadata.get("mask_grid") != "original_rgb_grid; not_automatically_rectified":
         raise ValueError("initial-selection mask must use the original source RGB grid")
     saved = load_frame(directory / "source_rgbd.npz")
     for key in (
-        "rgb", "depth_m", "K", "distortion_model", "distortion_coeffs",
-        "timestamp_ns", "clock", "row_index",
+        "rgb",
+        "depth_m",
+        "K",
+        "distortion_model",
+        "distortion_coeffs",
+        "timestamp_ns",
+        "clock",
+        "row_index",
+        "source_id",
     ):
         if not np.array_equal(getattr(saved, key), getattr(frame, key)):
-            raise ValueError(f"initial-selection {key} differs from the actual first source frame")
-    if saved.source_id != frame.source_id:
-        saved_raw, current_raw = (source.rsplit(":", 2) for source in (
-            saved.source_id, frame.source_id,
-        ))
-        if not (
-            saved.source_id.startswith("raw:") and frame.source_id.startswith("raw:")
-            and len(saved_raw) == len(current_raw) == 3
-            and saved_raw[1] in {"row", "camera"}
-            and saved_raw[1:] == current_raw[1:]
-        ):
-            raise ValueError("initial-selection source_id differs from the actual first source frame")
-    for key in ("source_id", "timestamp_ns", "clock"):
-        if metadata.get(key) != getattr(saved, key):
-            raise ValueError(f"initial-selection metadata {key} differs from the source frame")
+            raise ValueError(
+                f"initial-selection {key} differs from the actual first source frame"
+            )
     mask_path = (directory / metadata["mask_file"]).resolve()
     if not mask_path.is_relative_to(directory):
         raise ValueError("initial-selection mask must remain inside its directory")
-    mask = load_mask(mask_path, frame.depth_m.shape)
-    _, depth, _, mask = rectify_frame(frame, mask, maps=maps)
-    if np.count_nonzero(mask & (depth > 0)) < 4:
-        raise ValueError("initial-selection has fewer than four valid rectified depth samples")
-    return mask
+    return load_mask(mask_path, frame.depth_m.shape)
 
 
 def write_npz(path, arrays):
@@ -180,7 +150,7 @@ def write_npz(path, arrays):
     failure = None
     try:
         np.savez_compressed(stream, **arrays)
-    except BaseException as error:
+    except BaseException as error:  # noqa: BLE001 - 释放资源后重抛首错
         failure = error
     try:
         stream.close()

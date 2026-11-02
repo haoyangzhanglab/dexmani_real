@@ -1,0 +1,57 @@
+{
+  "mesh_file": "mesh/mesh_m.obj",
+  "points_file": "points.npy",
+  "normals_file": "normals.npy",
+  "frame": "object",
+  "units": "m",
+  "scale_to_meters": 0.08490138174640842,
+  "measured_extent": null,
+  "origin": "source_mesh_origin_scaled_without_recentering",
+  "num_points": 268,
+  "seed": 0,
+  "sampling": "area_weighted_triangle_barycentric",
+  "normals_method": "mesh_face",
+  "bounds_m": [
+    [
+      -0.08476468203165853,
+      -0.04505455427335788,
+      -0.08487698024028069
+    ],
+    [
+      0.08435414224923758,
+      0.044678269651430166,
+      0.08446164777486016
+    ]
+  ],
+  "pointcloud_file": "pointcloud.ply",
+  "source_image": "reference.jpg",
+  "calibration": {
+    "source": "user_provided_approximate_dimension",
+    "dimension": "bowl rim outer diameter",
+    "target_m": 0.17,
+    "mesh_measurement": "maximum diameter of the XZ projection (Y is up)",
+    "source_span_unscaled": 2.0023231248199505,
+    "source_span_endpoints": [
+      [
+        0.83006734,
+        0.48007792,
+        0.55353248
+      ],
+      [
+        -0.83488327,
+        0.47483116,
+        -0.55877924
+      ]
+    ],
+    "uncertainty": "Approximate user dimensions; single-image generated geometry, not a metric 3D scan."
+  },
+  "reconstruction": {
+    "method": "Grounding DINO + SAM2.1 small + Hunyuan3D-2.1 shape-only",
+    "seed": 0,
+    "steps": 50,
+    "octree_resolution": 384
+  },
+  "mesh_cleanup": {
+    "zero_area_faces_removed": 2
+  }
+}

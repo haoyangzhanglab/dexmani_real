@@ -18,6 +18,7 @@ Preserve the existing base environment, fetch missing official source checkouts
 at recorded revisions, install incremental requirements, and build
 nvdiffrast and FoundationPose mycpp. No model downloads or device access.
 Existing source directories and local edits are reused without checkout or reset.
+System Boost (system/program_options) and OpenMP development files are required.
 The workspace defaults to the current directory; --workspace must be the first option.
 Logs and environment snapshots are saved under its reports/cordvip_install/.
 USAGE
@@ -99,14 +100,13 @@ python -m pip install \
     --constraint "$cordvip_log_dir/base_constraints.txt" \
     --requirement "$cordvip_library/requirements-perception.txt"
 
-# Build against the active conda CUDA toolkit; do not install upstream dependency
-# lists that could replace the existing robot environment's Torch/CUDA versions.
+# 使用现有 conda CUDA 编译，保留基础 Torch/CUDA 版本。
 export CUDA_HOME="$CONDA_PREFIX"
-export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include"
+export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include${CPATH:+:$CPATH}"
 export PATH="$CONDA_PREFIX/bin:$PATH"
-export MAX_JOBS=4
+export MAX_JOBS="${MAX_JOBS:-4}"
 python -m pip install --no-build-isolation --no-deps \
-    -e third_party/cordvip_geometry
+    -e "$cordvip_library"
 python -m pip install --no-build-isolation --no-deps third_party/nvdiffrast
 
 cordvip_pybind_dir="$(python -m pybind11 --cmakedir)"
@@ -120,7 +120,7 @@ cmake -S third_party/FoundationPose/mycpp -B third_party/FoundationPose/mycpp/bu
     -DPYTHON_EXECUTABLE="$CONDA_PREFIX/bin/python" \
     -Dpybind11_DIR="$cordvip_pybind_dir" \
     -DCMAKE_PREFIX_PATH="$cordvip_cmeel_prefix"
-cmake --build third_party/FoundationPose/mycpp/build -j4
+cmake --build third_party/FoundationPose/mycpp/build -j"$MAX_JOBS"
 
 python -m pip list --format=json > "$cordvip_log_dir/packages_after.json"
 printf 'Dependency installation and builds completed. No models or devices were opened.\n'

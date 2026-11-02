@@ -1,4 +1,4 @@
-"""Fixed URDF surface samples moved by measured joints; no device or robot imports."""
+"""固定 URDF 表面采样与关节 FK。"""
 
 from __future__ import annotations
 
@@ -17,24 +17,25 @@ def parse_urdf_vector(text, default):
     return value
 
 
-class HandCloudModel:
-    """Fixed per-link visual samples and mesh-face normals; joints use explicit order and radians.
-    URDF origins/scales define metres; IDs and area-weighted sample counts stay fixed."""
-
+class HandCloud:
     def __init__(
-        self, urdf_path, joint_names, excluded_links=(), num_points=1024, seed=0,
-        *, T_camera_from_root,
+        self,
+        urdf_path,
+        joint_names,
+        excluded_links=(),
+        num_points=1024,
+        seed=0,
+        *,
+        T_camera_from_root,
     ):
-        if (
-            isinstance(num_points, bool)
-            or not isinstance(num_points, (int, np.integer))
-            or num_points < 1
-        ):
-            raise ValueError("num_points must be a positive integer")
-        if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)) or seed < 0:
-            raise ValueError("seed must be a nonnegative integer")
+        for name, value, minimum in (("num_points", num_points, 1), ("seed", seed, 0)):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, np.integer))
+                or value < minimum
+            ):
+                raise ValueError(f"{name} must be an integer >= {minimum}")
         self.T_camera_from_root = validate_pose(T_camera_from_root)
-        self.T_camera_from_root.setflags(write=False)
         import pinocchio as pin
         import trimesh
 
@@ -54,30 +55,34 @@ class HandCloudModel:
             or set(self.joint_names) != set(active)
             or any(joint.nq != 1 for joint in active.values())
         ):
-            raise ValueError("joint_names must name every one-DoF URDF joint exactly once")
+            raise ValueError(
+                "joint_names must name every one-DoF URDF joint exactly once"
+            )
         self._q_indices = np.asarray([active[name].idx_q for name in self.joint_names])
         root = ET.parse(path).getroot()
         excluded = set(excluded_links)
-        unknown = excluded - {link.get("name") for link in root.findall("link")}
+        unknown = excluded - {link.attrib["name"] for link in root.findall("link")}
         if unknown:
             raise ValueError(f"excluded links are absent from URDF: {sorted(unknown)}")
         meshes, names, assets = [], [], [str(path)]
         for link in root.findall("link"):
-            name = link.get("name")
+            name = link.attrib["name"]
             if name in excluded:
                 continue
             parts = []
             for visual in link.findall("visual"):
                 mesh_tag = visual.find("geometry/mesh")
                 if mesh_tag is None:
-                    raise ValueError(f"{name}: only explicit visual triangle meshes are supported")
+                    raise ValueError(
+                        f"{name}: only explicit visual triangle meshes are supported"
+                    )
                 filename = mesh_tag.get("filename", "")
                 if not filename or "://" in filename:
                     raise ValueError(f"{name}: mesh must use a local filesystem path")
                 mesh_path = (path.parent / filename).resolve()
                 mesh = trimesh.load(str(mesh_path), process=False)
                 if not isinstance(mesh, trimesh.Trimesh):
-                    raise ValueError(f"{mesh_path}: expected a single triangle mesh")
+                    raise TypeError(f"{mesh_path}: expected a single triangle mesh")
                 scale = parse_urdf_vector(mesh_tag.get("scale"), (1, 1, 1))
                 if np.any(scale <= 0):
                     raise ValueError(f"{name}: mesh scale must be positive")
@@ -95,20 +100,26 @@ class HandCloudModel:
                     or not np.isfinite(mesh.area)
                     or mesh.area <= 0
                 ):
-                    raise ValueError(f"{mesh_path}: mesh must have finite, positive surface area")
+                    raise ValueError(
+                        f"{mesh_path}: mesh must have finite, positive surface area"
+                    )
                 parts.append(mesh)
                 assets.append(str(mesh_path))
             if parts:
                 names.append(name)
                 meshes.append(trimesh.util.concatenate(parts))
         if not meshes or num_points < len(meshes):
-            raise ValueError("num_points must cover every included visual link at least once")
+            raise ValueError(
+                "num_points must cover every included visual link at least once"
+            )
         self._frame_ids = [self._model.getFrameId(name) for name in names]
         areas = np.asarray([mesh.area for mesh in meshes])
         allocation = (int(num_points) - len(meshes)) * areas / areas.sum()
         counts = np.floor(allocation).astype(int) + 1
         remainder = int(num_points) - int(counts.sum())
-        counts[np.argsort(-(allocation - np.floor(allocation)), kind="stable")[:remainder]] += 1
+        counts[
+            np.argsort(-(allocation - np.floor(allocation)), kind="stable")[:remainder]
+        ] += 1
         points, normals, link_ids = [], [], []
         for index, (mesh, count) in enumerate(zip(meshes, counts)):
             xyz, normal = sample_mesh_surface(mesh, int(count), seed=int(seed) + index)
@@ -129,13 +140,10 @@ class HandCloudModel:
             "num_points": int(num_points),
             "seed": int(seed),
             "units": "m",
-            "sampling": "fixed_per_link_area_samples_one_minimum_no_per_frame_fps",
             "points_per_link": counts.tolist(),
-            "normals": "visual_mesh_face_normals",
         }
 
     def transform(self, q):
-        """Map measured URDF joints through the fixed recorded camera extrinsics."""
         if np.iscomplexobj(q):
             raise ValueError("joint angles must be real")
         q = np.asarray(q, dtype=np.float64)
@@ -146,12 +154,18 @@ class HandCloudModel:
         self._pin.forwardKinematics(self._model, self._data, configuration)
         self._pin.updateFramePlacements(self._model, self._data)
         transforms = np.stack(
-            [self.T_camera_from_root @ self._data.oMf[index].homogeneous for index in self._frame_ids]
+            [
+                self.T_camera_from_root @ self._data.oMf[index].homogeneous
+                for index in self._frame_ids
+            ]
         )[self.link_ids]
-        points = np.einsum("nij,nj->ni", transforms[:, :3, :3], self.points) + transforms[:, :3, 3]
+        points = (
+            np.einsum("nij,nj->ni", transforms[:, :3, :3], self.points)
+            + transforms[:, :3, 3]
+        )
         normals = np.einsum("nij,nj->ni", transforms[:, :3, :3], self._normals)
-        with np.errstate(over="ignore", invalid="ignore"):
-            points, normals = points.astype(np.float32), normals.astype(np.float32)
-        if not np.isfinite(points).all() or not np.isfinite(normals).all():
-            raise ValueError("hand FK produced nonfinite float32 geometry")
-        return dict(points_camera=points, normals_camera=normals, link_ids=self.link_ids)
+        return {
+            "points_camera": points.astype(np.float32),
+            "normals_camera": normals.astype(np.float32),
+            "link_ids": self.link_ids,
+        }

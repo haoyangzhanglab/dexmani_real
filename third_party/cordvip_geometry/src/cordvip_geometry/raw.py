@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..geometry import validate_distortion, validate_intrinsics
-from ..rgbd import Frame
+from .rgbd import RGBDFrame
 
 HAND_SAMPLE_SEED = 0
 
@@ -26,54 +25,59 @@ def iter_raw_rows(reader, camera):
     """完整消费时核对 MP4 总行数；调用方拥有并关闭唯一 reader。"""
     reader.require_fields("rgb", "depth")
     intrinsics = camera.color
-    K = validate_intrinsics(intrinsics.matrix())
-    distortion = validate_distortion(intrinsics.distortion_model, intrinsics.distortion_coeffs)
+    K = intrinsics.matrix()
     expected_shape = (intrinsics.height, intrinsics.width)
-    if min(expected_shape) <= 0:
-        raise ValueError("Raw camera image dimensions must be positive")
     depth_scale = np.float32(camera.depth_scale_m)
-    if not np.isfinite(depth_scale) or depth_scale <= 0:
-        raise ValueError("Raw depth scale must be finite and positive")
     depth = reader["depth"]
     if depth.shape != (reader.num_frames, *expected_shape) or depth.dtype != np.uint16:
-        raise ValueError("Raw depth must be uint16 [rows,H,W] matching color intrinsics")
-    timing = reader.read_timing_rows(
-        ("observation_ns", "arm_ns", "hand_ns", "camera_sequence", "camera_ns")
-    )
+        raise ValueError(
+            "Raw depth must be uint16 [rows,H,W] matching color intrinsics"
+        )
+    timing = reader["timing/rows"][:]
     observation = timing["observation_ns"]
     if np.any(observation <= 0) or np.any(np.diff(observation) <= 0):
-        raise ValueError("Raw observation clocks must be positive and strictly increasing")
+        raise ValueError(
+            "Raw observation clocks must be positive and strictly increasing"
+        )
     images = iter(reader.iter_rgb_frames())
-    previous_time = previous_clock = None
     for row_index in range(reader.num_frames):
         rgb = next(images, None)
         if rgb is None:
             raise ValueError(f"Raw RGB ended before row {row_index}")
-        if rgb.shape != (*expected_shape, 3) or rgb.dtype != np.uint8:
-            raise ValueError(f"Raw RGB row {row_index} does not match color intrinsics")
-        source_id, timestamp_ns, clock = raw_frame_identity(reader.path, row_index, timing[row_index])
-        if previous_clock is not None and (clock != previous_clock or timestamp_ns < previous_time):
-            raise ValueError("Raw camera rows require chronological timestamps on one source clock")
-        previous_time, previous_clock = timestamp_ns, clock
+        source_id, timestamp_ns, clock = raw_frame_identity(
+            reader.path, row_index, timing[row_index]
+        )
         depth_m = depth[row_index].astype(np.float32) * depth_scale
-        if not np.isfinite(depth_m).all():
-            raise ValueError(f"Raw depth row {row_index} exceeds finite float32 metres")
-        yield Frame(
-            rgb=rgb,
-            depth_m=depth_m,
-            K=K,
-            distortion_model=intrinsics.distortion_model,
-            distortion_coeffs=distortion,
-            source_id=source_id,
-            timestamp_ns=timestamp_ns,
-            clock=clock,
-            row_index=row_index,
-        ), timing[row_index]
+        yield (
+            RGBDFrame(
+                rgb=rgb,
+                depth_m=depth_m,
+                K=K,
+                distortion_model=intrinsics.distortion_model,
+                distortion_coeffs=intrinsics.distortion_coeffs,
+                source_id=source_id,
+                timestamp_ns=timestamp_ns,
+                clock=clock,
+                row_index=row_index,
+            ),
+            timing[row_index],
+        )
     if next(images, None) is not None:
         raise ValueError("Raw RGB contains more frames than the HDF5 rows")
 
 
-class RawHandCloudProvider:
+def track_raw(reader, tracker, *, with_hand=False, hand_points=1024):
+    """逐行返回几何结果；reader 与 tracker 的生命周期由调用者管理。"""
+    camera = reader.read_camera()
+    hand = RawHandCloud(reader, camera, num_points=hand_points) if with_hand else None
+    for frame, timing in iter_raw_rows(reader, camera):
+        result = tracker.step(frame)
+        if hand is not None:
+            result["hand"] = hand.for_row(frame, timing)
+        yield result
+
+
+class RawHandCloud:
     """使用同一 Raw 行实测关节、记录外参和完整组合 URDF；行对齐不证明物理同步。"""
 
     def __init__(self, reader, camera, num_points=1024):
@@ -86,7 +90,7 @@ class RawHandCloudProvider:
             XHAND_SDK_JOINT_NAMES,
         )
 
-        from ..hand_cloud import HandCloudModel
+        from .hand import HandCloud
 
         self.reader = reader
         reader.require_fields("arm_qpos", "hand_qpos")
@@ -102,9 +106,10 @@ class RawHandCloudProvider:
         excluded_links = [
             link.attrib["name"]
             for link in ET.parse(XARM7_XHAND_RIGHT_URDF_PATH).getroot().findall("link")
-            if not link.attrib["name"].startswith("right_hand_") or link.attrib["name"] in excluded
+            if not link.attrib["name"].startswith("right_hand_")
+            or link.attrib["name"] in excluded
         ]
-        self.hand_model = HandCloudModel(
+        self.hand_model = HandCloud(
             XARM7_XHAND_RIGHT_URDF_PATH,
             (*XARM7_JOINT_NAMES, *XHAND_SDK_JOINT_NAMES),
             excluded_links=excluded_links,
@@ -116,11 +121,8 @@ class RawHandCloudProvider:
             **self.hand_model.metadata,
             "episode": str(reader.path),
             "joint_source": str(reader.path / "data.h5"),
-            "joint_state_semantics": "measured_arm_qpos_then_measured_hand_qpos_no_interpolation",
             "T_base_camera": self.T_base_camera.tolist(),
             "camera_extrinsics_source": "Raw meta.camera_T_xarm_base_from_color",
-            "timing_semantics": "host_monotonic_source_times_if_present_no_exposure_time_claim",
-            "missing_timing": "row_aligned_geometry_only_not_verified_for_policy",
             "raw_notes": raw_notes,
         }
 
@@ -130,7 +132,9 @@ class RawHandCloudProvider:
         arm_ns, hand_ns, camera_ns = (
             int(timing[name]) for name in ("arm_ns", "hand_ns", "camera_ns")
         )
-        joint_state = np.concatenate((self.reader["arm_qpos"][row], self.reader["hand_qpos"][row]))
+        joint_state = np.concatenate(
+            (self.reader["arm_qpos"][row], self.reader["hand_qpos"][row])
+        )
         cloud = self.hand_model.transform(joint_state)
         timing_available = (
             min(arm_ns, hand_ns, camera_ns) > 0

@@ -1,186 +1,188 @@
-"""追踪和物体构建的命令行参数、默认值与输入校验；不加载模型或设备。"""
+"""命令行参数与输入约束；解析不加载感知模型。"""
 
 import argparse
-import math
+import sys
 from pathlib import Path
 
 
-def positive_float(value: str) -> float:
-    number = float(value)
-    if not math.isfinite(number) or number <= 0:
-        raise argparse.ArgumentTypeError("必须是有限正数")
-    return number
-
-
-def positive_int(value: str) -> int:
+def positive_int(value):
     number = int(value)
     if number <= 0:
         raise argparse.ArgumentTypeError("必须是正整数")
     return number
 
 
+def probability(value):
+    number = float(value)
+    if not 0 < number < 1:
+        raise argparse.ArgumentTypeError("必须在 (0, 1) 内")
+    return number
+
+
+def add_models_directory(parser, workspace):
+    from ..models import DEFAULT_MODELS_DIR
+
+    parser.add_argument(
+        "--models-dir", type=Path, default=workspace / DEFAULT_MODELS_DIR
+    )
+
+
+def add_sam_arguments(parser, workspace):
+    from ..models import SAM_MODELS
+
+    add_models_directory(parser, workspace)
+    parser.add_argument("--sam-python", type=Path, default=Path(sys.executable))
+    parser.add_argument(
+        "--sam-variant", choices=SAM_MODELS, help="官方 SAM2.1 型号，默认 small"
+    )
+    parser.add_argument(
+        "--sam-checkpoint", type=Path, help="自训权重，须与 --sam-config 配对"
+    )
+    parser.add_argument("--sam-config", help="自训模型在 SAM2 包内的配置")
+
+
+def resolve_sam_arguments(args, workspace=None):
+    from ..models import resolve_sam_model
+
+    if workspace is not None:
+        args.workspace = Path(workspace).expanduser().resolve()
+    args.models_dir = args.models_dir.expanduser().resolve()
+    custom = args.sam_checkpoint is not None or args.sam_config is not None
+    args.sam_checkpoint, args.sam_config = resolve_sam_model(
+        args.models_dir, args.sam_variant, args.sam_checkpoint, args.sam_config
+    )
+    if not custom:
+        args.sam_variant = args.sam_variant or "small"
+    return args
+
+
 def add_grounding_arguments(parser):
-    parser.add_argument("--box-threshold", type=float, default=0.3, help="Grounding DINO 候选框阈值")
-    parser.add_argument("--text-threshold", type=float, default=0.25, help="Grounding DINO 文本 token 阈值")
+    parser.add_argument("--box-threshold", type=probability, default=0.3)
+    parser.add_argument("--text-threshold", type=probability, default=0.25)
 
 
 def parse_tracking_args(argv=None, *, workspace=None):
     workspace = Path(workspace or Path.cwd()).expanduser().resolve()
-    parser = argparse.ArgumentParser(description="顺序处理 Raw 每行；确认首帧 mask 后保存离线场景结果。")
+    parser = argparse.ArgumentParser(
+        description="确认 Raw 首帧实例，逐行保存位姿和几何。"
+    )
     parser.set_defaults(workspace=workspace)
     parser.add_argument(
-        "--asset", type=Path, help="reconstruct_object.py 或 prepare 生成的米制物体资产目录"
+        "--episode", type=Path, required=True, help="只读已发布 Raw episode"
     )
+    parser.add_argument("--scene", type=Path, help="多物体 JSON")
     parser.add_argument(
-        "--scene",
-        type=Path,
-        help="多物体 JSON：objects 中逐个声明 id/role/asset/initial_selection/prompt",
+        "--asset", type=Path, help="米制物体资产；省略时只处理 mask 和实测点"
     )
-    parser.add_argument("--max-frames", type=int, help="最多处理的帧数；用于显式的部分验收")
+    parser.add_argument("--prompt", help="首帧文本候选；省略时手画 mask")
     parser.add_argument(
-        "--foundationpose-root", type=Path, default=workspace / "third_party/FoundationPose"
+        "--initial-selection", type=Path, help="复用同一首帧的已确认选择"
     )
+    parser.add_argument("--headless", action="store_true")
     parser.add_argument(
-        "--object-prompt", help='Grounded-SAM2 文本目标，例如 "red mug."；省略时手动圈选'
+        "--with-hand", action="store_true", help="附加同行实测关节的 FK 手点云"
     )
-    from ..sam2_config import add_sam_arguments
-
-    add_sam_arguments(parser, workspace)
-    add_grounding_arguments(parser)
-    parser.add_argument("--episode", type=Path, required=True, help="只读已发布 Raw episode；默认处理全部行")
-    parser.add_argument(
-        "--initial-selection", type=Path, help="复用已确认的 select 目录；必须与离线源首帧完全对应"
-    )
-    parser.add_argument(
-        "--headless", action="store_true", help="不打开首帧确认窗口；每个实例须有相同首帧的 initial-selection"
-    )
-    parser.add_argument(
-        "--with-hand", action="store_true", help="读取同一 Raw 行的实测关节，附加 XHand FK 点云"
-    )
-    parser.add_argument("--hand-points", type=int, default=1024, help="固定手表面采样点数")
-    parser.add_argument("--output", type=Path, help="尚不存在的新输出目录")
-    parser.add_argument("--pixel-stride", type=int, default=2, help="物体实测点云的像素采样步长")
+    parser.add_argument("--hand-points", type=int, default=1024)
+    parser.add_argument("--pixel-stride", type=int, default=2)
     parser.add_argument("--depth-tolerance-m", type=float, default=0.015)
     parser.add_argument("--min-matched-pixels", type=int, default=30)
     parser.add_argument("--min-matched-fraction", type=float, default=0.15)
-    args = parser.parse_args(argv)
-    if args.scene and (args.asset or args.initial_selection or args.object_prompt):
-        parser.error("--scene 内逐个指定资产、选择和 prompt，不能混用单物体参数")
-    if args.max_frames is not None and args.max_frames < 1:
-        parser.error("--max-frames 必须为正整数")
-    if args.headless and args.initial_selection is None and args.scene is None:
-        parser.error("--headless 需要 --initial-selection，或为 scene 中每个实例指定选择")
-    if args.object_prompt is not None and not args.object_prompt.strip():
-        parser.error("--object-prompt 不能为空")
-    if args.pixel_stride < 1:
-        parser.error("--pixel-stride 必须为正整数")
-    if args.with_hand and args.hand_points < 1:
-        parser.error("--hand-points 必须为正整数")
-    from ..sam2_config import resolve_sam_arguments
-
-    resolve_sam_arguments(args, workspace)
-    return args
-
-
-def add_segment_arguments(parser, *, workspace):
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--image", type=Path, help="物体照片；按 EXIF 纠正朝向")
-    source.add_argument("--rgbd", type=Path, help="单帧已保存的规范 RGB-D NPZ；不连接相机")
-    parser.add_argument("--text", required=True, help="英文物体描述，例如 'red mug.'")
-    from ..sam2_config import add_sam_arguments
-
+    parser.add_argument("--max-frames", type=positive_int, help="显式限制处理前缀")
+    parser.add_argument("--output", type=Path, help="尚不存在的新输出目录")
     add_sam_arguments(parser, workspace)
     add_grounding_arguments(parser)
-    parser.add_argument("--instance", type=int, help="零起始候选索引；headless 必须显式选择")
-    parser.add_argument("--headless", action="store_true", help="不创建窗口；必须提供 --instance")
+    args = parser.parse_args(argv)
+    for name in ("episode", "scene", "asset", "initial_selection"):
+        value = getattr(args, name)
+        if value is not None:
+            setattr(args, name, (workspace / value.expanduser()).resolve())
+    if args.scene and (args.asset or args.initial_selection or args.prompt):
+        parser.error("--scene 不能混用单物体参数")
+    if args.headless and args.initial_selection is None and args.scene is None:
+        parser.error("--headless 需要 --initial-selection 或 --scene")
+    if args.prompt is not None and not args.prompt.strip():
+        parser.error("--prompt 不能为空")
+    try:
+        return resolve_sam_arguments(args)
+    except ValueError as error:
+        parser.error(str(error))
 
 
-def add_generate_arguments(parser, *, workspace):
-    from ..sam2_config import DEFAULT_MODELS_DIR
+def add_segment_arguments(parser, workspace):
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--image", type=Path, help="按 EXIF 纠正朝向的物体照片")
+    source.add_argument("--rgbd", type=Path, help="保存的单帧 RGB-D NPZ")
+    parser.add_argument("--prompt", required=True, help="英文物体描述")
+    parser.add_argument("--instance", type=int, help="零起始候选索引")
+    parser.add_argument("--headless", action="store_true")
+    add_sam_arguments(parser, workspace)
+    add_grounding_arguments(parser)
 
-    models = workspace / DEFAULT_MODELS_DIR
-    source_root = workspace / "third_party"
-    parser.add_argument("--hunyuan-root", type=Path, default=source_root / "Hunyuan3D-2.1")
-    parser.add_argument(
-        "--weights", type=Path, default=models / "Hunyuan3D-2.1",
-        help="本地 Hunyuan3D-2.1 根目录，内含 hunyuan3d-dit-v2-1/ 配置及权重",
-    )
+
+def add_generate_arguments(parser):
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--steps", type=positive_int, default=50)
-    parser.add_argument("--octree-resolution", type=positive_int, default=384)
-    parser.add_argument("--num-chunks", type=positive_int, default=8000)
-    parser.add_argument(
-        "--num-points",
-        type=positive_int,
-        default=1024,
-        help="preview 临时采样点数；build 在最终米制尺度保存的固定点数",
-    )
-    parser.add_argument(
-        "--preview", action="store_true", help="生成后交互查看 mesh、表面点云和坐标轴"
-    )
+    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--octree-resolution", type=int, default=384)
+    parser.add_argument("--num-chunks", type=int, default=8000)
+    parser.add_argument("--preview", action="store_true")
+
+
+def add_scale_arguments(parser):
+    parser.add_argument("--scale-to-meters", type=float)
+    parser.add_argument("--size-axis", choices=("x", "y", "z"))
+    parser.add_argument("--size-meters", type=float)
+    parser.add_argument("--num-points", type=int, default=1024)
 
 
 def parse_object_args(argv=None, *, workspace=None):
     workspace = Path(workspace or Path.cwd()).expanduser().resolve()
-    parser = argparse.ArgumentParser(
-        description="单图分割、重建与显式定尺度；build 串行运行子进程，阶段结束释放 GPU。"
-    )
+    parser = argparse.ArgumentParser(description="物体分割、重建和米制资产准备。")
     parser.set_defaults(workspace=workspace)
     commands = parser.add_subparsers(dest="command", required=True)
-    segment = commands.add_parser("segment", help="Grounded-SAM2 分割并确认物体")
-    add_segment_arguments(segment, workspace=workspace)
+    segment = commands.add_parser("segment", help="分割并确认物体")
+    add_segment_arguments(segment, workspace)
     segment.add_argument(
-        "--list-only",
-        action="store_true",
-        help="只保存候选和预览图，后续用 select 选择；不创建窗口",
+        "--list-only", action="store_true", help="保存候选，稍后 select"
     )
-    select = commands.add_parser("select", help="从保存的候选继续确认，不再加载模型")
+    select = commands.add_parser("select", help="从已有候选确认物体")
     select.add_argument("--segmentation-dir", type=Path, required=True)
     select.add_argument("--instance", type=int)
     select.add_argument("--headless", action="store_true")
-    generate = commands.add_parser("generate", help="从已确认的 RGBA 仅生成未定尺度 mesh")
+    generate = commands.add_parser("generate", help="从确认的 RGBA 生成未定尺度 mesh")
     generate.add_argument("--segmentation-dir", type=Path, required=True)
-    add_generate_arguments(generate, workspace=workspace)
-    build = commands.add_parser("build", help="按分割、生成、可选米制资产准备串行执行")
-    add_segment_arguments(build, workspace=workspace)
-    add_generate_arguments(build, workspace=workspace)
-    build.add_argument("--scale-to-meters", type=positive_float)
-    build.add_argument("--size-axis", choices=("x", "y", "z"))
-    build.add_argument("--size-meters", type=positive_float)
-    preview = commands.add_parser("preview", help="单独查看 mesh，无需加载任何模型")
+    add_models_directory(generate, workspace)
+    add_generate_arguments(generate)
+    build = commands.add_parser("build", help="分割、生成，并按显式尺度准备资产")
+    add_segment_arguments(build, workspace)
+    add_generate_arguments(build)
+    add_scale_arguments(build)
+    prepare = commands.add_parser("prepare", help="将已有 mesh 校准为米制资产")
+    prepare.add_argument("--mesh", type=Path, required=True)
+    prepare.add_argument("--seed", type=int, default=0)
+    prepare.add_argument("--preview", action="store_true")
+    add_scale_arguments(prepare)
+    preview = commands.add_parser("preview", help="查看 mesh，无需加载模型")
     preview.add_argument("--mesh", type=Path, required=True)
-    preview.add_argument(
-        "--units", choices=("unscaled", "m"), default="unscaled", help="显示标签；不进行缩放"
-    )
-    for command in (segment, select, generate, build):
+    preview.add_argument("--units", choices=("unscaled", "m"), default="unscaled")
+    for command in (segment, select, generate, build, prepare):
         command.add_argument(
-            "--output-dir", type=Path, required=True, help="尚不存在的新输出目录，拒绝覆盖"
+            "--output", type=Path, required=True, help="尚不存在的新输出目录"
         )
-    for command in (generate, build):
-        command.add_argument("--device", default="cuda:0", help="Hunyuan 生成阶段使用的 CUDA 设备")
     args = parser.parse_args(argv)
-    if args.command in {"segment", "select", "build"}:
-        if args.headless and args.instance is None and not getattr(args, "list_only", False):
-            parser.error("--headless 必须显式指定 --instance；未知索引时先 segment --list-only")
-    if args.command == "build":
-        if args.headless and args.preview:
-            parser.error("--headless 与 --preview 不能同时使用")
-        if (args.size_axis is None) != (args.size_meters is None):
-            parser.error("--size-axis 与 --size-meters 必须一起提供")
-        if args.scale_to_meters is not None and args.size_axis is not None:
-            parser.error("--scale-to-meters 与 --size-axis 不能同时使用")
+    if (
+        args.command in {"segment", "select", "build"}
+        and args.headless
+        and args.instance is None
+        and not getattr(args, "list_only", False)
+    ):
+        parser.error("--headless 必须指定 --instance；未知索引时先 segment --list-only")
+    if args.command == "build" and args.headless and args.preview:
+        parser.error("--headless 与 --preview 不能同时使用")
     if hasattr(args, "sam_variant"):
-        from ..sam2_config import resolve_sam_arguments
-
         try:
-            resolve_sam_arguments(args, workspace)
+            resolve_sam_arguments(args)
         except ValueError as error:
             parser.error(str(error))
-    if hasattr(args, "seed") and args.seed < 0:
-        parser.error("--seed 必须非负")
-    if hasattr(args, "octree_resolution") and args.octree_resolution < 16:
-        parser.error("--octree-resolution 必须不小于 16")
-    for name in ("box_threshold", "text_threshold"):
-        if hasattr(args, name) and not 0 < getattr(args, name) < 1:
-            parser.error(f"{name} 必须在 (0, 1) 内")
+    elif hasattr(args, "models_dir"):
+        args.models_dir = args.models_dir.expanduser().resolve()
     return args
