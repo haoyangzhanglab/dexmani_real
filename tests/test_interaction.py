@@ -83,7 +83,8 @@ def test_stop_ends_segment_and_new_b_reanchors(key):
     old_epoch = loop.run_id
     loop.keyboard.handle_key(key, True)
     loop.handle_commands(loop.keyboard.poll(0))
-    loop.request_episode_end('operator', run_end_reason=RunEndReason.OPERATOR, failed=False)
+    assert loop.pending_termination_reason == 'operator'
+    assert not loop.capture_failed
     loop.end_episode()
     assert loop.phase is TeleopPhase.IDLE
     loop.robot.stop.assert_called_once()
@@ -143,7 +144,8 @@ def test_discard_and_single_q_do_not_publish(keys):
     for key in keys:
         loop.keyboard.handle_key(key, True)
     loop.handle_commands(loop.keyboard.poll(0))
-    loop.request_episode_end('quit', run_end_reason=RunEndReason.OPERATOR, failed=False)
+    assert loop.pending_termination_reason == ('operator' if keys[0] == 'd' else 'quit')
+    assert not loop.capture_failed
     loop.end_episode()
     assert loop.runtime_state.quit_requested
     assert recorder.calls[0]['save'] is False

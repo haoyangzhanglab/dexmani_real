@@ -33,7 +33,7 @@ CONFIG = replace(base,
 python scripts/collect_teleop.py TASK --record --episodes-dir captures --max-duration 90
 ```
 
-设备、控制和感知等实验参数通过 `--config` 加载可信 Python 文件中的 `CONFIG: RealConfig`。
+查看请求配置：
 
 ```bash
 python scripts/collect_teleop.py --print-config
@@ -63,13 +63,13 @@ VR 遥操作与策略会话：B 空闲时开始新段；S/C 停止并保存；D 
 
 物理回放使用 S 停止、H 回零、Q 退出；键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出。键盘在启动及 R 回零结束后完成伺服准备并进入 RUNNING/hold，再提示点动就绪；方向键只更新目标。松键或 jog 目标被 IK/约束拒绝时均制动并 hold，下一轮按当前键态继续，不撤权、不要求松开再按。hold 也有制动距离；运动候选错过本轮提交机会时丢弃，制动 hold 仍立即提交。普通输入过期按取消处理，SDK/停止失败仍是故障。
 
-设备和模型在会话内复用。启用手部时，Teleop/Policy 启动先完成手部 HOME；仅模态或录制需要时复位触觉，反馈就绪不证明零点标定完成。每段 B 后仍有伺服准备延迟；VR 重新锚定，Policy 重新采集观测历史。停止先于录制收尾，writer 完整关闭且计数一致后才按保存意图发布；失败保留 staging，零行不发布。未回收的 writer 或模型任务禁止开始新段。
+设备和模型在会话内复用。启用手部时，Teleop/Policy 启动先完成手部 HOME；仅模态或录制需要时复位触觉，反馈就绪不证明零点标定完成。每段 B 后仍有伺服准备延迟；VR 重新锚定，Policy 重新采集观测历史。未回收的 writer 或模型任务禁止开始新段。
 
 策略周期、数值 recipe、输入模态和动作窗口从 checkpoint 恢复，不改变录制的完整多模态 schema。sync 等待预测后顺序执行动作；async 按时间锚点裁掉过期动作，可继续旧计划的有效尾部；RTC 固定策略动作前缀并严格交接，错过承诺槽即结束。记预测长度为 P、`action_steps` 为 A、`prefetch_steps` 为 d：sync 要求 `1 <= A <= P`；async 要求 `1 <= d <= A <= P` 且 `d < P`；RTC 另要求 `A+d <= P`，guidance cap 须显式为有限非负值。EEF 前缀相同不保证未来 IK 分支相同。多帧 history 断档后清空重积累，窗口完整前不提交新预测；单帧模式不变。首预测 reset RNG，预热后恢复 RNG；sync 的预测等待不得超过已有目标期限。
 
-每段结束先撤权并停止设备，再独立完成录制和模型回收；录制与模型各用完整的独立收尾预算，设备关闭耗时也不挤占模型等待。完整的异常 Raw 可按原保存意图发布为 failed，后续模型回收失败不会改写已发布文件。退出仍尝试关闭所有核心资源，未确认关闭的资源报告 pending。Python 等待期限无法强制终止阻塞 native 调用。手部重定向及实际提交参考的说明见 [手部重定向](docs/hand_retargeting.md)。
+每段结束先撤权并停止设备，再完成录制和模型回收；writer 与模型各有完整的独立收尾预算。writer 完整关闭且计数一致后才按首次保存意图发布；失败保留 staging，零行不发布。Raw 记录执行结束时的状态，完整的异常段可保存为 failed；发布后的模型回收错误只进入 episode/session，不回写 Raw。退出先释放设备，再完成慢速收尾与尾音等待。
 
-`session_result.json` 保存会话 outcome/reason/shutdown、episode 终止原因、独立错误及 Raw 发布结果。已进入运行的段计入 `--num-episodes`，准备失败或取消不计；会话正常结束不代表任务成功。核心资源先关闭，随后音频尽力收尾，最后保存结果。真正的 KeyboardInterrupt 保留中断语义，结果文件写入失败仍导致非零退出。
+`session_result.json` 保存会话 outcome/reason/shutdown、急停请求、episode 终止原因、独立错误及 Raw 发布结果。关闭阶段真正的 KeyboardInterrupt 立即锁存急停和跨进程 emergency/stop 信号，仍尝试剩余资源并保存 Policy 最终结果，非零退出；已有核心主错及最终原因继续保留，中断事实独立可见。等待中断不会被当作关闭完成，未回收资源保留句柄并报告 pending，不重新开始等待预算。Python 等待期限无法强制终止阻塞 native 调用；结果文件写入失败仍是核心失败。已进入运行的段计入 `--num-episodes`，准备失败或取消不计；技术正常不代表任务成功。
 
 ## 数据、来源和执行语义
 
@@ -83,13 +83,17 @@ Canonical 保留 [固定 13 模态](dexmani_real/data/export.py)、原单位和 
 
 `timing/rows` 使用主机单调时钟，单位 ns，缺失值为 -1；`control_ns` 是采样起点，`observation_ns` 是快照完成时刻。臂、手、触觉和相机保留各自来源时间，缓存读取不刷新年龄；相机来源为首次主机接收时间，不等于曝光时刻。同行数据不代表硬件同步。录制和模型输入共用当前快照，启用录制就要求完整采集来源有效。
 
-Teleop/jog/async 跳过错过的控制时点，不追赶旧动作，Raw 因此可能有时间缺口。**当前 Canonical 导出仍采用有效连续前缀，并对技术失败段排除末行，并非异常 episode 整段拒绝。** 网格及相邻采样间隔容差为 dt/4，readout 必须小于 dt，来源时间保留原值；不补帧或重采样。该准入尚不满足“训练只接受完整有效 episode”的研究目标。物理回放要求完整发布、技术正常、合法非空有限目标和首行实测起点；含无命令 NaN 行的 Policy Raw 会被拒绝，不筛行或补值。
+Teleop/jog/async 跳过错过的控制时点，不追赶旧动作，Raw 因此可能有时间缺口。**Canonical 只接纳完整发布、正常关闭、结构及计数一致、`technical_status == "normal"` 且全部行有效的 teleop episode。** 必需模态、有限值、动作、时间和来源时间检查任一失败就拒绝整段；不要求任务成功。网格及相邻采样间隔容差仍为 dt/4，readout 小于 dt，触觉来源年龄须小于 Raw 记录的 hold 上限。合法时间抖动和重复相机帧号不会删行。`episode_quality` 仅记录整段最大网格偏差和 readout，段长由 `meta/episode_ends` 确定。
+
+导出保留分块数值扫描、RGB 逐帧解码和流式写入；接纳后导出全部帧，不截断、切分、插值、补帧或重采样。批量遇到不合格 episode 明确失败，错误标明 episode、原因及适用的行索引；可通过 `--exclude EPISODE` 排除整段后重试，不自动跳过或改写 Raw。全部完成后才原子发布 Canonical；准入或转换失败仅保留隐藏 staging，不留下可见半成品，也不覆盖已有输出。
+
+物理回放要求完整发布、技术正常、合法非空有限目标和首行实测起点；含无命令 NaN 行的 Policy Raw 会被拒绝，不筛行或补值。
 
 每次新导出生成独立 `source_id`，原样搬迁保留 ID，供人工归档和实验说明。它不是内容 hash，不保证 split/resume 使用同一数据；配套 Policy 训练恢复允许显式更换数据路径，并按其当前实现检查实际模型/数据兼容项。旧数据和 checkpoint 不自动改写。Canonical 保存影响数值结果的处理配方与完整 URDF；实验应记录 source_id、导出 Real SHA、训练 Policy SHA 及手模板来源。修改处理算法或模板后重新导出，已有未知来源须如实保留。
 
 遥操作额外逐行保存 `vr_wrist_pos`、`vr_wrist_quat_wxyz`、`vr_landmarks`、`vr_recv_ts_ns`、`vr_sequence_id`，用于调试，不进入训练导出。VR 使用右手数据，21 个 landmark 保持 SDK 原顺序；来源时间取所需通道首次主机接收时间的较早者。接收端先校验并归一化原始姿态四元数，再转换为 FLU；零范数或非有限姿态被拒绝。位置用米、四元数 WXYZ；来源帧重复时 ID 和时间保持原值。`runtime_config_json`、VR 变换、手标定和每段一份初始锚点随 Raw 保存。逐次操作与失败控制时点用日志诊断，软超时只保存一份固定大小摘要。
 
-触觉 aggregate `(5,3)` 与 dense `(5,120,3)` 分别保存 SDK 最后一份完整有效通道帧及来源时间，按各自来源年龄及配置的 hold 上限限时保持。数据使用 SDK sensor axes，原生物理尺度未知，指序为 thumb/index/middle/ring/pinky；不解释为牛顿或布尔接触，也不假定 dense 求和等于 aggregate。原生单位、指序、hold age 和实际触觉复位结果继续归档；读取仍校验数值语义，不据说明文案推断校准或真实接触。固定说明集中于此，Raw 不重复写入 processing/axes、VR 结构和 timing 时钟的说明属性。
+触觉 aggregate `(5,3)` 与 dense `(5,120,3)` 分别保存 SDK 最后一份完整有效通道帧及来源时间，按各自来源年龄及配置的 hold 上限限时保持。数据使用 SDK sensor axes，原生物理尺度未知，指序为 thumb/index/middle/ring/pinky；不解释为牛顿或布尔接触，也不假定 dense 求和等于 aggregate。原生单位、指序、hold age 和实际触觉复位结果继续归档；读取仍校验数值语义，不据说明文案推断校准或真实接触。
 
 ## 控制和几何边界
 
@@ -145,7 +149,7 @@ solve 的外参输出与派生报告不得覆盖 `capture.json` 或原始采样 
 
 view_pointcloud.py 提供独立诊断流程：先在终端选择是否拟合桌面，RGB-D 预览按 Enter 继续，随后处理一帧点云、打印点数和本帧处理耗时，关闭相机后静态查看结果；Q/Esc 或关窗退出。桌面拟合固定采集五份不同深度帧，使用当前相机内参；拟合结果可供本次处理使用，仅确认发布才改写共享桌面标定。`--config`、`--camera-calibration` 指定当前实验配置和外参。该流程复用当前点云算法和采集实现，预览不额外修改曝光设置。RGB-D 类型、网格和缓冲所有权由 RealSenseCamera.read 统一保证，预览、标定和采集入口使用同一读取边界。
 
-RGB-D 的非零 Brown 畸变需要结合实际模型消费者判断：Real 反投影会反解 Brown，而配套 Policy 的空间投影仅使用 K 和外参。已有 `pnp_apple_banana` Raw 记录了非零 Brown；以记录参数构造五个像素、单位深度的合成反投影→pinhole 投影，最大误差约 3.30 px，零系数约 0.000028 px。这不是相机实测误差，也不能据此断言所有设备受影响。本轮未取得实际部署 checkpoint，是否使用该投影消费者仍未验证；图像与点云数值保持原状。使用空间投影融合前须核对模型及相机参数，若命中须明确拒绝不支持的组合，或另行使在线/离线几何共同支持畸变；不能只凭同时存在 RGB 与 point_cloud 推断命中。
+RGB-D 的非零 Brown 畸变需结合实际模型消费者判断：Real 反投影会反解 Brown，配套 Policy 的空间投影仅使用 K 和外参。使用空间投影融合前须核对 checkpoint 与相机参数；不支持的组合须明确拒绝，或另行使在线/离线几何共同支持畸变。不能仅凭同时存在 RGB 与 point_cloud 推断模型使用了空间投影。
 
 点云默认使用基座系 XYZRGB，工作空间 `x=[0.15,0.85]、y=[-0.50,0.50]、z=[0,0.80] m`，去桌面间隙 10 mm。深度邻域支持、体素、半径密度和连通分量过滤后 FPS；空点云在 viewer 清除、导出拒绝。几何规则可能丢失细结构，参数和配方必须随实验保持一致。
 
@@ -164,4 +168,10 @@ python -m cordvip_geometry view /tmp/cordvip/scene_001
 
 默认日志为终端 INFO、拒绝原因、完整异常 traceback 和简短段结果，需要留档时使用 shell 重定向。几何环境检查使用独立命令 `python -m cordvip_geometry check`。
 
-开发约定见 [AGENTS.md](AGENTS.md)。
+相关离线回归（需安装真实数值、视频及几何依赖，不连接设备）：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider -q tests/test_audio.py tests/test_errors.py tests/test_interaction.py tests/test_policy.py tests/test_data.py
+```
+
+这些测试不证明真实 SDK 中断响应、物理停稳或 native 阻塞回收。开发约定见 [AGENTS.md](AGENTS.md)。

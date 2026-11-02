@@ -4,7 +4,7 @@ import logging
 import time
 
 from dexmani_real.robot.commands import OperationCancelled
-from dexmani_real.runtime.state import RunEndReason, SafetyState
+from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +52,12 @@ class SensorWorkers:
                 healthy = False
         return healthy
 
-    def shutdown(self):
+    def shutdown(self, runtime_state: SessionState) -> None:
         """短时退出，必要时终止 sensor；仅保留实际未回收的句柄。"""
         if self.channels is not None:
             self.channels.is_running.value = False
         deadline = time.monotonic() + SENSOR_SHUTDOWN_TIMEOUT_S
-        errors = []
+        errors: list[tuple[str, BaseException]] = []
         unresolved = []
         for process in self.started:
             try:
@@ -82,8 +82,11 @@ class SensorWorkers:
                         escalation,
                     )
             except BaseException as exc:
-                unresolved.append(process)
+                if isinstance(exc, KeyboardInterrupt):
+                    runtime_state.request_emergency_stop()
                 errors.append((process.name, exc))
+                if process.is_alive() or process.exitcode is None:
+                    unresolved.append(process)
         self.started = unresolved
         if errors:
             for stage, error in errors[1:]:
@@ -91,8 +94,8 @@ class SensorWorkers:
             raise errors[0][1]
 
 
-def close_runtime(runtime_state, robot=None, *, sensors=None, keyboard=None):
-    """撤权后尝试全部关闭；首错向上传播，其余错误在此报告。"""
+def close_runtime(runtime_state: SessionState, robot=None, *, sensors=None, keyboard=None) -> None:
+    """撤权后尝试全部关闭；即时锁存中断，首错传播，其余错误记录 traceback。"""
     runtime_state.stop_signal.set()
     errors = []
     for stage, close in (
@@ -101,13 +104,15 @@ def close_runtime(runtime_state, robot=None, *, sensors=None, keyboard=None):
         )),
         ("robot_close", robot.close if robot is not None else None),
         ("keyboard_stop", keyboard.stop if keyboard is not None else None),
-        ("sensor_shutdown", sensors.shutdown if sensors is not None else None),
+        ("sensor_shutdown", (lambda: sensors.shutdown(runtime_state)) if sensors is not None else None),
     ):
         if close is None:
             continue
         try:
             close()
         except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                runtime_state.request_emergency_stop()
             errors.append((stage, exc))
     if errors:
         for stage, error in errors[1:]:

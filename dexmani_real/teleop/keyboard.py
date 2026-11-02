@@ -35,9 +35,7 @@ class KeyboardTeleop:
         self.bounds = jog_bounds(self.runtime)
         self.runtime_state = SessionState()
         self.robot = Robot(
-            self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
-            stop_signal=self.runtime_state.stop_signal,
-            emergency_signal=self.runtime_state.emergency_signal,
+            self.runtime.arm, self.runtime.hand, runtime_state=self.runtime_state,
         )
 
         self.keys = Keyboard(

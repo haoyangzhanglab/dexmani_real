@@ -72,6 +72,7 @@ def canonical_array_specs(
 
 
 def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
+    """验证整段元数据、结构与数值；RGB 计数和解码在流式转换时确认。"""
     validate_task_label(reader.meta["task_label"])
     if reader.meta["collection_source"] != "teleop":
         raise ValueError(
@@ -81,6 +82,7 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     frames = reader.num_frames
     if frames <= 0:
         raise ValueError("episode contains no rows")
+    reader.validate_completion()
     reader.require_fields(*ROBOT_DATASET_SPECS, "rgb", "depth")
     camera = reader.read_camera()
     validate_aligned_depth_distortion(camera.color.distortion_model)
@@ -94,65 +96,45 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
         logger.warning(
             "%s: single row, no sampling interval to verify", reader.path
         )
-    return camera, training_prefix(reader)
-
-
-def training_prefix(reader: RawReader) -> dict:
-    """只接纳从第零行开始的真实连续片段，不重采样或改写来源时钟。"""
-    status = reader.meta["technical_status"]
-    if status not in {"normal", "failed"}:
-        raise ValueError(f"unknown Raw technical_status: {status}")
     rows = reader["timing/rows"][:]
-    count = len(rows)
     period, tolerance = sampling_clock_ns(reader.control_hz)
-    # Raw 未逐行记录提交成功；技术失败的末行不能推断为已成功提交。
-    end = count - 1 if status == "failed" else count
-    reason = "technical_failure_last_row" if status == "failed" else None
 
-    def cut_at(bad, detail, offset=0):
-        nonlocal end, reason
+    def reject_invalid(bad, detail, offset=0):
         indices = np.flatnonzero(bad)
-        if len(indices) and int(indices[0]) + offset <= end:
-            end, reason = int(indices[0]) + offset, detail
+        if len(indices):
+            row = int(indices[0]) + offset
+            raise ValueError(f"{detail} at row {row}")
 
     control, observation = rows["control_ns"], rows["observation_ns"]
-    cut_at((control <= 0) | (observation < control), "invalid_control_or_observation_clock")
-    cut_at(np.diff(observation) <= 0, "observation_clock_not_increasing", 1)
-    grid_error = control - int(control[0]) - np.arange(count) * period
-    cut_at(np.abs(np.diff(control) - period) > tolerance, "control_interval_gap_or_drift", 1)
-    cut_at(np.abs(grid_error) > tolerance, "control_grid_drift")
+    reject_invalid((control <= 0) | (observation < control), "invalid_control_or_observation_clock")
+    reject_invalid(np.diff(observation) <= 0, "observation_clock_not_increasing", 1)
+    grid_error = control - int(control[0]) - np.arange(frames) * period
+    reject_invalid(np.abs(np.diff(control) - period) > tolerance, "control_interval_gap_or_drift", 1)
+    reject_invalid(np.abs(grid_error) > tolerance, "control_grid_drift")
     readout = observation - control
-    cut_at(readout >= period, "observation_crossed_control_period")
-    cut_at(observation[:-1] >= control[1:], "overlapping_control_observations")
+    reject_invalid(readout >= period, "observation_crossed_control_period")
+    reject_invalid(observation[:-1] >= control[1:], "overlapping_control_observations")
 
     for name in ("arm_ns", "hand_ns", "tactile_aggregate_ns", "tactile_dense_ns", "camera_ns"):
         values = rows[name]
-        cut_at((values <= 0) | (values > observation), f"invalid_source_clock:{name}")
-        cut_at(np.diff(values) < 0, f"source_clock_regressed:{name}", 1)
+        reject_invalid((values <= 0) | (values > observation), f"invalid_source_clock:{name}")
+        reject_invalid(np.diff(values) < 0, f"source_clock_regressed:{name}", 1)
     sequence = rows["camera_sequence"]
-    cut_at(sequence < 0, "invalid_camera_sequence")
-    cut_at(np.diff(sequence) < 0, "camera_sequence_regressed", 1)
+    reject_invalid(sequence < 0, "invalid_camera_sequence")
+    reject_invalid(np.diff(sequence) < 0, "camera_sequence_regressed", 1)
     tactile_age = int(reader.validate_tactile_metadata() * 1e9)
     for name in ("tactile_aggregate_ns", "tactile_dense_ns"):
-        cut_at(observation - rows[name] >= tactile_age, f"stale_source:{name}")
+        reject_invalid(observation - rows[name] >= tactile_age, f"stale_source:{name}")
 
-    # 结构已整段验证；数值只需扫描可能保留的前缀，不读整段 RGB-D 到内存。
-    for start in range(0, end, 4096):
-        if start >= end:
-            break
+    # 扫描完整数值字段；深度仍按块读取，RGB 留在转换时逐帧验证与解码。
+    for start in range(0, frames, 4096):
         for name in ROBOT_DATASET_SPECS:
-            values = reader[name][start:min(end, start + 4096)]
+            values = reader[name][start:start + 4096]
             valid = np.isfinite(values).reshape(len(values), -1).all(axis=1)
-            cut_at(~valid, f"nonfinite:{name}", start)
-            if end == start:
-                break
-    if end <= 0:
-        raise ValueError(f"Raw {reader.path}: no valid training prefix ({reason})")
-    return dict(
-        raw_frames=count, row_start=0, row_stop=end,
-        source_technical_status=status, trim_reason=reason,
-        max_control_grid_deviation_ns=int(np.abs(grid_error[:end]).max()),
-        max_readout_ns=int(readout[:end].max()),
+            reject_invalid(~valid, f"nonfinite:{name}", start)
+    return camera, dict(
+        max_control_grid_deviation_ns=int(np.abs(grid_error).max()),
+        max_readout_ns=int(readout.max()),
     )
 
 
@@ -187,9 +169,9 @@ def iter_canonical_blocks(
     hand_cloud,
     chunk_frames: int,
     camera: CameraSnapshot,
-    frames: int,
 ):
     """分块转换，不修补缺失观测或重采样行。"""
+    frames = reader.num_frames
     height, width = camera.color.height, camera.color.width
     processor = PointCloudProcessor(
         depth_scale_m=camera.depth_scale_m,
@@ -244,6 +226,8 @@ def iter_canonical_blocks(
                 rgb[offset], clouds[offset] = image, cloud
             block.update(rgb=rgb, depth=depth, point_cloud=clouds)
             yield block
+        if next(images, None) is not None:
+            raise ValueError(f"{reader.path / 'rgb.mp4'}: unexpected RGB frame at row {frames}")
 
 
 def export_zarr(
@@ -275,50 +259,54 @@ def export_zarr(
             if progress_callback:
                 progress_callback(index, len(selected))
             offset = ends[-1] if ends else 0
-            with RawReader(episode) as reader:
-                camera, quality = validate_export_episode(reader)
-                frames = quality["row_stop"]
-                logger.info("%s: training rows [0, %d)/%d; discarded=%d; status=%s; trim=%s",
-                            episode.name, frames, reader.num_frames, reader.num_frames - frames,
-                            quality["source_technical_status"], quality["trim_reason"])
-                task = reader.meta["task_label"]
-                height, width = camera.color.height, camera.color.width
-                if index == 0:
-                    arm_fk, hand_fk = ArmFK(), HandFK()
-                    hand_cloud = HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    staging = Path(
-                        tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
-                    )
-                    root, arrays, chunk = create_store(
-                        staging,
-                        processing,
-                        camera,
-                        task=task,
-                        control_hz=reader.control_hz,
-                    )
-                if task != root.attrs["task_name"] or not np.isclose(
-                    reader.dt, root.attrs["dt"], rtol=0, atol=1e-12
-                ):
-                    raise ValueError("one canonical store requires uniform task and dt")
-                if camera.depth_scale_m != root.attrs["depth_scale_m_per_unit"]:
-                    raise ValueError("depth_scale_m_per_unit must be uniform")
-                if (height, width, 3) != arrays["rgb"].shape[1:]:
-                    raise ValueError("inconsistent RGB shape")
+            try:
+                with RawReader(episode) as reader:
+                    camera, quality = validate_export_episode(reader)
+                    frames = reader.num_frames
+                    logger.info("%s: exporting full episode (%d frames)", episode.name, frames)
+                    task = reader.meta["task_label"]
+                    height, width = camera.color.height, camera.color.width
+                    if index == 0:
+                        arm_fk, hand_fk = ArmFK(), HandFK()
+                        hand_cloud = HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        staging = Path(
+                            tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
+                        )
+                        root, arrays, chunk = create_store(
+                            staging,
+                            processing,
+                            camera,
+                            task=task,
+                            control_hz=reader.control_hz,
+                        )
+                    else:
+                        if task != root.attrs["task_name"] or not np.isclose(
+                            reader.dt, root.attrs["dt"], rtol=0, atol=1e-12
+                        ):
+                            raise ValueError("one canonical store requires uniform task and dt")
+                        if camera.depth_scale_m != root.attrs["depth_scale_m_per_unit"]:
+                            raise ValueError("depth_scale_m_per_unit must be uniform")
+                        if (height, width, 3) != arrays["rgb"].shape[1:]:
+                            raise ValueError("inconsistent RGB shape")
 
-                blocks = iter_canonical_blocks(
-                    reader,
-                    processing,
-                    arm_fk=arm_fk,
-                    hand_fk=hand_fk,
-                    hand_cloud=hand_cloud,
-                    chunk_frames=chunk,
-                    camera=camera,
-                    frames=frames,
-                )
-                append_episode(arrays, offset, blocks, frames)
-                ends.append(offset + frames)
-                episode_quality.append(quality)
+                    blocks = iter_canonical_blocks(
+                        reader,
+                        processing,
+                        arm_fk=arm_fk,
+                        hand_fk=hand_fk,
+                        hand_cloud=hand_cloud,
+                        chunk_frames=chunk,
+                        camera=camera,
+                    )
+                    append_episode(arrays, offset, blocks, frames)
+                    ends.append(offset + frames)
+                    episode_quality.append(quality)
+            except (KeyError, ValueError) as exc:
+                raise ValueError(f"Raw {episode}: {exc}") from exc
+            except Exception:
+                logger.exception("Export failed at %s", episode)
+                raise
             episode_ids.append(
                 episode.name if episode == source else episode.relative_to(source).as_posix()
             )
@@ -336,9 +324,6 @@ def export_zarr(
             episode_count=len(ends), total_frames=ends[-1], excluded_episodes=sorted(excluded),
             episode_quality=episode_quality,
         )
-    except Exception:
-        logger.exception("Export failed at %s", episode)
-        raise
     finally:
         if staging is not None:
             logger.warning("Export staging retained: %s", staging)
@@ -389,7 +374,7 @@ def append_episode(arrays, offset, blocks, frames):
     for block in blocks:
         rows = len(block["joint_state"])
         for name, values in block.items():
-            # 两份触觉 float32 原样拷贝，已由 training_prefix 扫描；转换和新计算仍检查。
+            # 两份触觉 float32 原样拷贝，已由整段准入扫描；转换和新计算仍检查。
             if np.issubdtype(values.dtype, np.floating) and name not in {
                 "finger_tactile_force", "taxel_tactile_force",
             }:

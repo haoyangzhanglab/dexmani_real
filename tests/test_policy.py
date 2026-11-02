@@ -19,7 +19,11 @@ from dexmani_real.deployment.rollout import Rollout
 from dexmani_real.deployment.schedule import Prediction
 from dexmani_real.deployment.session import PolicySession
 from dexmani_real.robot.commands import OperationCancelled
+from dexmani_real.robot.system import Robot
+from dexmani_real.robot.xarm7.process import ArmProcess
+from dexmani_real.robot.xhand.driver import XHand
 from dexmani_real.runtime.keyboard import Keyboard, KeyEvent
+from dexmani_real.runtime.lifecycle import SensorWorkers
 from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.runtime.state import RunEndReason, SessionState
 from dexmani_real.teleop.audio import AudioFeedback
@@ -321,7 +325,7 @@ def test_worker_pending_blocks_reuse_and_consumes_late_error():
         assert not worker.has_pending_task
     finally:
         release.set()
-        worker.close()
+        worker.close(SessionState())
         assert worker.wait_closed(2) == ("completed", [])
 
 
@@ -335,9 +339,9 @@ def make_session(tmp_path):
     session.runtime_state.request_quit()
     events = []
     session.robot = SimpleNamespace(arm=None, hand=None, close=lambda: events.append("robot_close"))
-    session.keyboard = SimpleNamespace(stop=lambda: events.append("keyboard_stop"))
-    session.sensors = SimpleNamespace(started=[], shutdown=lambda: events.append("sensor_shutdown"))
-    session.model = SimpleNamespace(close=lambda: events.append("model_close"),
+    session.keyboard = SimpleNamespace(listener=None, stop=lambda: events.append("keyboard_stop"))
+    session.sensors = SimpleNamespace(started=[], shutdown=lambda state: events.append("sensor_shutdown"))
+    session.model = SimpleNamespace(close=lambda state: events.append("model_close"),
                                     wait_closed=lambda timeout: ("completed", []), has_pending_task=False)
     session.audio = Audio(events)
     session.save_results = lambda **kwargs: events.append("results")
@@ -387,6 +391,179 @@ def test_session_model_wait_has_full_budget_after_slow_device_close(tmp_path, mo
     session.model.wait_closed.assert_called_once_with(MODEL_SHUTDOWN_TIMEOUT_S)
     assert events.index("robot_close") < events.index("model_close") < events.index("audio_wait")
     assert session.summary["shutdown"] == "completed"
+
+
+@pytest.mark.parametrize("stage", ["robot", "keyboard", "sensors", "arm", "hand"])
+def test_core_shutdown_interrupt_survives_nested_first_error(tmp_path, monkeypatch, caplog, stage):
+    session, events = make_session(tmp_path)
+    state = session.runtime_state
+    interrupt = KeyboardInterrupt()
+    primary = interrupt if stage == "robot" else OSError("first close failure")
+    cause = ValueError("original cause")
+
+    def fail_primary(*args, **kwargs):
+        raise primary from cause
+
+    def check_emergency(*args, **kwargs):
+        assert state.estop_request
+        assert state.emergency_signal.is_set() and state.stop_signal.is_set()
+        events.append("after_interrupt")
+
+    session.save_results = Mock(wraps=PolicySession.save_results.__get__(session))
+    session.sensors.shutdown = Mock(side_effect=check_emergency)
+    if stage in {"robot", "keyboard"}:
+        session.robot.close = Mock(side_effect=fail_primary)
+        if stage == "keyboard":
+            release = threading.Event()
+            listener = threading.Thread(target=lambda: release.wait(5))
+            listener.start()
+            join = listener.join
+            monkeypatch.setattr(listener, "stop", Mock(), raising=False)
+            monkeypatch.setattr(listener, "join", Mock(side_effect=interrupt))
+            session.keyboard = Keyboard(get_run_id=lambda: state.run_id)
+            session.keyboard.active = True
+            session.keyboard.listener = listener
+    elif stage == "sensors":
+        sensors = session.sensors = SensorWorkers(SimpleNamespace(is_running=SimpleNamespace(value=True)))
+        first = SimpleNamespace(name="failed", join=Mock(side_effect=fail_primary),
+                                is_alive=lambda: True, exitcode=None)
+        # join 被打断时进程已退出，不把它误记为 pending。
+        interrupted = SimpleNamespace(name="interrupted", join=Mock(side_effect=interrupt),
+                                      is_alive=lambda: False, exitcode=0)
+        last = SimpleNamespace(name="last", join=Mock(side_effect=check_emergency),
+                               is_alive=lambda: False, exitcode=0)
+        sensors.started = [first, interrupted, last]
+    else:
+        robot = session.robot = Robot(session.runtime.arm, session.runtime.hand, runtime_state=state)
+        if stage == "arm":
+            arm = robot.arm = ArmProcess(
+                session.runtime.arm, run_signal=state.run_signal,
+                stop_signal=state.stop_signal, emergency_signal=state.emergency_signal,
+            )
+            arm.process = SimpleNamespace(pid=123, is_alive=lambda: True,
+                                          join=Mock(side_effect=interrupt))
+            hand = robot.hand = SimpleNamespace(stop=Mock(side_effect=fail_primary), control=object())
+            def disconnect(**kwargs):
+                check_emergency()
+                hand.control = None
+            hand.disconnect = Mock(side_effect=disconnect)
+        else:
+            hand = robot.hand = XHand(session.runtime.hand)
+            hand.cfg = SimpleNamespace(comm_type="ethercat")
+            hand.connected_flag = True
+            hand.stop = Mock()
+            hand.request_ethercat_init = Mock(side_effect=fail_primary)
+            hand.control = SimpleNamespace(close_device=Mock(side_effect=interrupt))
+            monkeypatch.setattr("dexmani_real.robot.xhand.driver.time.sleep", check_emergency)
+    try:
+        assert session.close() == 1
+        check_emergency()
+        assert "model_close" in events and "audio_close" in events
+        session.save_results.assert_called_once_with()
+        result = json.loads((tmp_path / "session_result.json").read_text())
+        assert result["outcome"] == "fault" and result["emergency_stop_requested"]
+        assert result["reason"] == ("KeyboardInterrupt" if stage == "robot" else str(primary))
+        assert result["errors"][0] == error_detail("shutdown", primary)
+        assert result["shutdown"] == ("failed" if stage == "robot" else "pending")
+        assert primary.__cause__ is cause
+        traceback = primary.__traceback__
+        while traceback.tb_next is not None:
+            traceback = traceback.tb_next
+        assert traceback.tb_frame.f_code.co_name == "fail_primary"
+        assert any(record.exc_info and record.exc_info[1] is primary for record in caplog.records)
+        assert any(record.exc_info and record.exc_info[1] is interrupt for record in caplog.records)
+        if stage == "keyboard":
+            assert session.keyboard.listener is listener and listener.is_alive()
+            assert not session.keyboard.active
+            listener.stop.assert_called_once_with()
+            listener.join.assert_called_once()
+        elif stage == "sensors":
+            assert sensors.started == [first] and not sensors.channels.is_running.value
+            for process in (first, interrupted, last):
+                process.join.assert_called_once()
+        elif stage == "arm":
+            assert robot.arm is arm and robot.hand is None
+            assert not arm.pipe.closed and not arm.child_pipe.closed
+            arm.process.join.assert_called_once()
+            hand.disconnect.assert_called_once()
+        elif stage == "hand":
+            assert robot.hand is hand and hand.control is not None
+            hand.control.close_device.assert_called_once_with()
+    finally:
+        if stage == "keyboard":
+            release.set()
+            join(2)
+        elif stage == "arm":
+            arm.pipe.close()
+            arm.child_pipe.close()
+
+
+@pytest.mark.parametrize("wait_failure", [KeyboardInterrupt(), OSError("wait failed"), SystemExit(7)])
+@pytest.mark.parametrize("done", [False, True])
+@pytest.mark.parametrize("primary", [None, OSError("control failed first")])
+def test_model_wait_failure_saves_result_and_keeps_real_future(
+    tmp_path, monkeypatch, done, primary, wait_failure,
+):
+    session, events = make_session(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    def close_model():
+        entered.set()
+        assert release.wait(5)
+    worker = session.model = PolicyWorker(None, build_observation=lambda rows: rows)
+    worker.model = SimpleNamespace(close=Mock(side_effect=close_model))
+    close = worker.close
+    interrupted = isinstance(wait_failure, KeyboardInterrupt)
+    def begin_close(state):
+        future = close(state)
+        assert entered.wait(2)
+        if done:
+            release.set()
+            future.result(timeout=2)
+        monkeypatch.setattr(future, "result", Mock(side_effect=wait_failure))
+        return future
+    worker.close = Mock(side_effect=begin_close)
+    session.save_results = Mock(wraps=PolicySession.save_results.__get__(session))
+    try:
+        assert session.close(failure=primary) == 1
+        assert session.runtime_state.estop_request == interrupted
+        assert session.runtime_state.emergency_signal.is_set() == interrupted
+        assert session.runtime_state.stop_signal.is_set()
+        worker.close.assert_called_once_with(session.runtime_state)
+        worker.close_future.result.assert_called_once_with(timeout=MODEL_SHUTDOWN_TIMEOUT_S)
+        assert worker.close_future.done() == done
+        session.save_results.assert_called_once_with()
+        assert "sensor_shutdown" in events and "audio_close" in events
+        result = json.loads((tmp_path / "session_result.json").read_text())
+        assert result["outcome"] == "fault" and result["emergency_stop_requested"] == interrupted
+        assert result["shutdown"] == ("failed" if done else "pending")
+        assert result["reason"] == (str(primary) if primary else str(wait_failure) or type(wait_failure).__name__)
+        assert result["errors"] == (
+            ([error_detail("session", primary)] if primary else [])
+            + [error_detail("model_close_wait", wait_failure)]
+        )
+    finally:
+        release.set()
+        worker.close_future.exception(timeout=2)
+
+
+def test_retired_model_failure_does_not_hide_model_close_interrupt(tmp_path):
+    session, _ = make_session(tmp_path)
+    primary, interrupt = OSError("model load failed"), KeyboardInterrupt()
+    worker = session.model = PolicyWorker(Mock(side_effect=primary), build_observation=lambda rows: rows)
+    worker.load()
+    assert worker.future.exception(timeout=2) is primary
+    assert worker.has_pending_task  # 已完成、未消费的任务仍由 worker 持有。
+    worker.model = SimpleNamespace(close=Mock(side_effect=interrupt))
+    session.save_results = PolicySession.save_results.__get__(session)
+    assert session.close() == 1
+    worker.model.close.assert_called_once_with()
+    assert worker.close_future.done() and not worker.has_pending_task
+    assert session.runtime_state.estop_request
+    assert session.runtime_state.emergency_signal.is_set() and session.runtime_state.stop_signal.is_set()
+    result = json.loads((tmp_path / "session_result.json").read_text())
+    assert result["reason"] == str(primary) and result["shutdown"] == "failed"
+    assert result["emergency_stop_requested"]
+    assert result["errors"] == [error_detail("retired_load", primary), error_detail("model_close", interrupt)]
 
 
 @pytest.mark.parametrize("keys", [("d", "q"), ("q", "d")])

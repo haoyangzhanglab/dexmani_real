@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""将 Raw 的有效连续前缀导出为全模态 Canonical Zarr。"""
+"""将完整有效的 teleop Raw episode 导出为全模态 Canonical Zarr。"""
 
 from __future__ import annotations
 
@@ -18,9 +18,9 @@ from dexmani_real.utils.table_plane import load_table_plane
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Export one valid continuous prefix per teleop Raw episode to a canonical multimodal Zarr. "
+            "Export complete, technically normal teleop Raw episodes to a canonical multimodal Zarr. "
             "Other Raw collection sources are currently unsupported. "
-            "Report trimmed tails; reject structural corruption or an empty valid prefix."
+            "Reject the whole episode on any invalid row; use --exclude and retry."
         )
     )
     parser.add_argument(
@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "One raw task or episode directory. Exports to "
             "datasets/<task_name>.zarr by default (see --output). "
-            "All retained modalities share the same row range and must be valid. "
+            "Every row and required modality must be valid. "
             "The destination must not already exist."
         ),
     )

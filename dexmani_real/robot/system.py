@@ -29,6 +29,8 @@ FEEDBACK_PERIOD_NS = round(1e9 / 30)
 if TYPE_CHECKING:
     from dexmani_real.robot.xarm7.process import ArmProcess
     from dexmani_real.robot.xhand.driver import XHand
+    from dexmani_real.runtime.state import SessionState
+
 
 @dataclass(frozen=True)
 class RobotState:
@@ -42,9 +44,7 @@ class Robot:
         arm_config,
         hand_config,
         *,
-        run_signal,
-        stop_signal,
-        emergency_signal,
+        runtime_state: "SessionState",
         check_services=None,
     ):
         self.arm_config, self.hand_config = arm_config, hand_config
@@ -52,14 +52,13 @@ class Robot:
         self.arm_upper = np.asarray(arm_config.joint_limit_upper, dtype=np.float64)
         self.hand_lower = np.asarray(XHAND_RATED_QPOS_MIN_RAD, dtype=np.float64)
         self.hand_upper = np.asarray(XHAND_RATED_QPOS_MAX_RAD, dtype=np.float64)
-        self.run_signal, self.stop_signal = run_signal, stop_signal
-        self.emergency_signal = emergency_signal
+        self.runtime_state = runtime_state
         self.check_services = check_services
         self.arm: ArmProcess | None = None
         self.hand: XHand | None = None
         self.connected = False
         self.stop_required = False
-        self.stop_failure = None
+        self.stop_failure: BaseException | None = None
         self.hand_feedback = XHandFeedback()
         self.feedback_next_ns = 0
 
@@ -74,33 +73,33 @@ class Robot:
     def check_run(self, run_id, *, expires_ns=None):
         # stop 与 fault 可以同时到达；不能先把真实失败分类为取消。
         self.check()
-        if self.stop_signal.is_set() or self.emergency_signal.is_set():
+        if self.runtime_state.stop_signal.is_set() or self.runtime_state.emergency_signal.is_set():
             raise OperationCancelled("device operation cancelled")
-        lock = self.run_signal.get_lock()
+        lock = self.runtime_state.run_signal.get_lock()
         timeout_s = (EXECUTOR_TIMEOUT_S if expires_ns is None
                      else max(0, expires_ns - time.monotonic_ns()) / 1e9)
         if not lock.acquire(timeout=timeout_s):
             raise TimeoutError("device generation lock unavailable")
         try:
-            if self.run_signal.get_obj().value != run_id:
+            if self.runtime_state.run_signal.get_obj().value != run_id:
                 raise OperationCancelled("device operation cancelled")
         finally:
             lock.release()
         if self.arm is not None:
             self.arm.check_error()
         # 等待共享锁期间可能已有取消；不能在手 SDK 之后才观察到。
-        if self.stop_signal.is_set() or self.emergency_signal.is_set():
+        if self.runtime_state.stop_signal.is_set() or self.runtime_state.emergency_signal.is_set():
             raise OperationCancelled("device operation cancelled")
 
     def connect(self):
-        run_id = self.run_signal.value
+        run_id = self.runtime_state.run_signal.value
 
         def cancelled():
             self.check()
             return (
-                self.run_signal.value != run_id
-                or self.stop_signal.is_set()
-                or self.emergency_signal.is_set()
+                self.runtime_state.run_signal.value != run_id
+                or self.runtime_state.stop_signal.is_set()
+                or self.runtime_state.emergency_signal.is_set()
             )
 
         # 各运行入口的 finally 统一关闭设备，也覆盖部分连接失败。
@@ -110,9 +109,9 @@ class Robot:
 
         self.arm = ArmProcess(
             self.arm_config,
-            run_signal=self.run_signal,
-            stop_signal=self.stop_signal,
-            emergency_signal=self.emergency_signal,
+            run_signal=self.runtime_state.run_signal,
+            stop_signal=self.runtime_state.stop_signal,
+            emergency_signal=self.runtime_state.emergency_signal,
         )
         self.stop_required = True  # 连接后仍需完成首次整机停止确认。
         self.arm.connect(check_services=self.check_services)
@@ -122,7 +121,7 @@ class Robot:
             from dexmani_real.robot.xhand.driver import XHand
 
             self.hand = XHand(self.hand_config)
-            initial = self.hand.connect(cancel_requested=cancelled)
+            initial = self.hand.connect(cancel_requested=cancelled, runtime_state=self.runtime_state)
             self.hand_feedback.consume(initial)
             self.feedback_next_ns = initial.timestamp_ns + FEEDBACK_PERIOD_NS
         self.connected = True
@@ -137,8 +136,8 @@ class Robot:
             self.check()
             return bool(
                 cancel_requested()
-                or self.run_signal.value != run_id
-                or self.emergency_signal.is_set()
+                or self.runtime_state.run_signal.value != run_id
+                or self.runtime_state.emergency_signal.is_set()
             )
 
         if cancelled():
@@ -180,7 +179,7 @@ class Robot:
                     self.feedback_next_ns or now, FEEDBACK_PERIOD_NS, time.monotonic_ns(),
                 )
         except BaseException:
-            self.stop_signal.set()
+            self.runtime_state.stop_signal.set()
             raise
 
     def read_initial_state(self, run_id, *, cancel_requested, required_tactile=()):
@@ -190,8 +189,8 @@ class Robot:
             self.check()
             if (
                 cancel_requested()
-                or self.run_signal.value != run_id
-                or self.emergency_signal.is_set()
+                or self.runtime_state.run_signal.value != run_id
+                or self.runtime_state.emergency_signal.is_set()
             ):
                 raise OperationCancelled("robot initial feedback acquisition cancelled")
             if time.monotonic_ns() >= deadline_ns:
@@ -267,7 +266,7 @@ class Robot:
                 cast("XHand", self.hand)._send_action(command.hand_qpos)
             self.check_run(command.run_id, expires_ns=expires_ns)
         except BaseException:
-            self.stop_signal.set()
+            self.runtime_state.stop_signal.set()
             raise
 
     def send_hand_home(self, command, *, expires_ns):
@@ -276,13 +275,16 @@ class Robot:
         self.validate_command(command)
         self.stop()
         self.service_feedback()
-        lock = self.run_signal.get_lock()
+        lock = self.runtime_state.run_signal.get_lock()
         if not lock.acquire(timeout=max(0, expires_ns - time.monotonic_ns()) / 1e9):
             raise TimeoutError("hand HOME generation lock unavailable")
         try:
-            if self.run_signal.get_obj().value != command.run_id or self.emergency_signal.is_set():
+            if (
+                self.runtime_state.run_signal.get_obj().value != command.run_id
+                or self.runtime_state.emergency_signal.is_set()
+            ):
                 raise OperationCancelled("hand HOME cancelled before submission")
-            self.stop_signal.clear()
+            self.runtime_state.stop_signal.clear()
         finally:
             lock.release()
         self._send_action(command, expires_ns=expires_ns)
@@ -315,7 +317,7 @@ class Robot:
 
     def stop(self):
         """停止确认成功后可重复调用；准备和目标提交会重新置 stop_required。"""
-        self.stop_signal.set()
+        self.runtime_state.stop_signal.set()
         if not self.stop_required:
             return
         errors = []
@@ -323,15 +325,21 @@ class Robot:
             try:
                 self.arm.request_stop()
             except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
                 errors.append(("arm_stop_request", exc))
         try:
             self.stop_hand()
         except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                self.runtime_state.request_emergency_stop()
             errors.append(("hand_stop", exc))
         if self.arm is not None:
             try:
                 self.arm.wait_stopped()
             except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
                 errors.append(("arm_stop_confirm", exc))
         if self.arm is None and self.hand is None:
             errors.append(("stop", RobotError("motion remains unresolved after disconnect")))
@@ -345,7 +353,9 @@ class Robot:
         self.stop_required = False
 
     def service_idle(self):
-        if self.stop_required and (self.stop_signal.is_set() or self.emergency_signal.is_set()):
+        if self.stop_required and (
+            self.runtime_state.stop_signal.is_set() or self.runtime_state.emergency_signal.is_set()
+        ):
             self.stop()
         if self.connected:
             self.service_feedback()
@@ -354,17 +364,21 @@ class Robot:
         if self.arm is None and self.hand is None:
             return
         # 共用 stop 先通知 arm；owner 退出后的最终故障也由 close 带回。
-        self.stop_signal.set()
+        self.runtime_state.stop_signal.set()
         # stop_failure 已由 stop/check 上报；这里仅收集本次关闭产生的失败。
         errors = []
         try:
             self.stop_hand(passive=True)
         except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                self.runtime_state.request_emergency_stop()
             errors.append(("hand_passive_stop", exc))
         if self.arm is not None:
             try:
-                self.arm.close()
+                self.arm.close(self.runtime_state)
             except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
                 errors.append(("arm_close", exc))
             finally:
                 if self.arm.is_closed:
@@ -372,8 +386,10 @@ class Robot:
 
         if self.hand is not None:
             try:
-                self.hand.disconnect()
+                self.hand.disconnect(runtime_state=self.runtime_state)
             except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
                 errors.append(("hand_disconnect", exc))
             finally:
                 if self.hand.control is None:

@@ -10,6 +10,8 @@ from dexmani_real.utils.log import error_detail
 if TYPE_CHECKING:
     from dexmani_policy.deployment import PolicyRuntime
 
+    from dexmani_real.runtime.state import SessionState
+
 logger = logging.getLogger(__name__)
 MODEL_SHUTDOWN_TIMEOUT_S = 65.0
 
@@ -73,7 +75,7 @@ class PolicyWorker:
         self.future = self.operation = None
         future.result()
 
-    def close(self):
+    def close(self, runtime_state: "SessionState"):
         if self.close_future is not None:
             return self.close_future
         retired, operation = self.future, self.operation
@@ -84,12 +86,16 @@ class PolicyWorker:
                 try:
                     retired.result()
                 except BaseException as exc:
+                    if isinstance(exc, KeyboardInterrupt):
+                        runtime_state.request_emergency_stop()
                     logger.exception("retired model task failed: %s", operation)
                     errors.append(error_detail(f"retired_{operation}", exc))
             try:
                 if self.model is not None:
                     self.model.close()
             except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    runtime_state.request_emergency_stop()
                 logger.exception("model close failed")
                 errors.append(error_detail("model_close", exc))
             return errors
@@ -105,7 +111,4 @@ class PolicyWorker:
             errors = future.result(timeout=max(0.0, timeout_s))
         except FutureTimeoutError:
             return "pending", []
-        except BaseException as exc:
-            status = "failed" if future.done() else "pending"
-            return status, [error_detail("model_close_wait", exc)]
         return "failed" if errors else "completed", errors

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -28,6 +28,9 @@ from dexmani_real.robot.model import (
 )
 from dexmani_real.robot.xhand.feedback import XHandState
 from dexmani_real.utils.timing import sample_is_fresh
+
+if TYPE_CHECKING:
+    from dexmani_real.runtime.state import SessionState
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +163,7 @@ class XHand:
     def is_connected(self) -> bool:
         return self.connected_flag
 
-    def connect(self, *, cancel_requested=lambda: False) -> XHandState:
+    def connect(self, *, cancel_requested=lambda: False, runtime_state: SessionState | None = None) -> XHandState:
         """设备发现与首帧读取共用期限；命令与上层缓存使用同一份实测状态。"""
         if self.connected_flag:
             raise RuntimeError("XHand is already connected")
@@ -200,11 +203,13 @@ class XHand:
                 f"discovered={hand_ids}",
             )
         except BaseException as failure:
+            if isinstance(failure, KeyboardInterrupt) and runtime_state is not None:
+                runtime_state.request_emergency_stop()
             try:
-                self.disconnect()
-            except BaseException as cleanup_error:
+                self.disconnect(runtime_state=runtime_state)
+            except BaseException:
                 if isinstance(failure, OperationCancelled):
-                    raise cleanup_error
+                    raise
                 logger.exception("XHand connection cleanup failed")
             raise
 
@@ -226,7 +231,8 @@ class XHand:
         elif error.error_code != 0:
             raise XHandError("connect", error.error_code, error.error_message)
 
-    def disconnect(self) -> None:
+    def disconnect(self, *, runtime_state: SessionState | None = None) -> None:
+        # 独立手部诊断没有 SessionState；会话调用必须在吞回首错前锁存中断。
         connected_ethercat = self.connected_flag and self.cfg.comm_type == "ethercat"
         errors = []
         try:
@@ -235,14 +241,23 @@ class XHand:
                     try:
                         self.request_ethercat_init()
                     except BaseException as exc:
+                        if isinstance(exc, KeyboardInterrupt) and runtime_state is not None:
+                            runtime_state.request_emergency_stop()
                         errors.append(exc)
                 try:
                     self.control.close_device()
                     self.control = None
                 except BaseException as exc:
+                    if isinstance(exc, KeyboardInterrupt) and runtime_state is not None:
+                        runtime_state.request_emergency_stop()
                     errors.append(exc)
                 if connected_ethercat:
-                    time.sleep(POST_EC_DISCONNECT_S)
+                    try:
+                        time.sleep(POST_EC_DISCONNECT_S)
+                    except BaseException as exc:
+                        if isinstance(exc, KeyboardInterrupt) and runtime_state is not None:
+                            runtime_state.request_emergency_stop()
+                        errors.append(exc)
         finally:
             self.connected_flag = False
         if errors:

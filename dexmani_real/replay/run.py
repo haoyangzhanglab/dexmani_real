@@ -56,9 +56,7 @@ def run_replay(
         robot = Robot(
             runtime.arm,
             runtime.hand,
-            run_signal=runtime_state.run_signal,
-            stop_signal=runtime_state.stop_signal,
-            emergency_signal=runtime_state.emergency_signal,
+            runtime_state=runtime_state,
         )
 
         keyboard = Keyboard(

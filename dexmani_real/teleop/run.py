@@ -107,9 +107,7 @@ def run_teleop(
         robot = Robot(
             runtime.arm,
             runtime.hand,
-            run_signal=runtime_state.run_signal,
-            stop_signal=runtime_state.stop_signal,
-            emergency_signal=runtime_state.emergency_signal,
+            runtime_state=runtime_state,
             check_services=sensors.check,
         )
         keyboard = Keyboard(
@@ -200,6 +198,10 @@ def run_teleop(
         try:
             if loop is not None:
                 loop.close()
+        except KeyboardInterrupt as exc:
+            runtime_state.request_emergency_stop()
+            if exc is not primary_failure:
+                logger.exception("teleop capture cleanup interrupted")
         except Exception as exc:
             runtime_state.mark_error()
             if exc is not primary_failure:
@@ -208,6 +210,8 @@ def run_teleop(
             try:
                 close_runtime(runtime_state, robot, sensors=sensors, keyboard=keyboard)
             except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    runtime_state.request_emergency_stop()
                 if exc is not primary_failure:
                     logger.exception("teleop runtime cleanup failed")
             else:

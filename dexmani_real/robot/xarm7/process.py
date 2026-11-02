@@ -3,6 +3,7 @@
 import logging
 import multiprocessing as mp
 import time
+from typing import TYPE_CHECKING
 
 from dexmani_real.config.xarm7 import (
     EXECUTOR_TIMEOUT_S,
@@ -14,6 +15,9 @@ from dexmani_real.robot.xarm7.protocol import (
     HomeRequest,
     PrepareRequest,
 )
+
+if TYPE_CHECKING:
+    from dexmani_real.runtime.state import SessionState
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +269,7 @@ class ArmProcess:
             raise error
         self.check_error()
 
-    def close(self):
+    def close(self, runtime_state: "SessionState") -> None:
         self.request_stop()
         self.io.closing.set()
         errors: list[BaseException] = []
@@ -275,6 +279,8 @@ class ArmProcess:
             try:
                 self.process.join(EXECUTOR_TIMEOUT_S)
             except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    runtime_state.request_emergency_stop()
                 errors.append(exc)
         # join 后保留晚到故障；已上报的运行故障不再冒充一次关闭失败。
         fault, close_error = self._read_fault(), self._read_close_error()
@@ -297,6 +303,8 @@ class ArmProcess:
                 try:
                     pipe.close()
                 except BaseException as exc:
+                    if isinstance(exc, KeyboardInterrupt):
+                        runtime_state.request_emergency_stop()
                     errors.append(exc)
         if errors:
             for error in errors[1:]:

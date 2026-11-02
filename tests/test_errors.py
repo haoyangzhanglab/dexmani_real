@@ -51,8 +51,7 @@ def devices(monkeypatch):
         stop=Mock(side_effect=lambda *args, **kwargs: calls.append("hand_stop")),
     )
     robot = Robot(
-        runtime.arm, runtime.hand, run_signal=state.run_signal,
-        stop_signal=state.stop_signal, emergency_signal=state.emergency_signal,
+        runtime.arm, runtime.hand, runtime_state=state,
     )
     robot.arm, robot.hand, robot.connected = arm, hand, True
     now = 1_000_000_000
@@ -135,10 +134,12 @@ def test_arm_publication_rejection_and_lock_faults_use_real_mailbox(devices, mon
             holder = threading.Thread(target=hold_lock)
             holder.start()
             assert acquired.wait(2)
-            clock = lambda: deadline
+            def clock():
+                return deadline
         else:
             stamps = iter((now, now, deadline))
-            clock = lambda: next(stamps)
+            def clock():
+                return next(stamps)
         monkeypatch.setattr(protocol, "time", SimpleNamespace(monotonic_ns=clock))
         try:
             channels.publish_goal(command, expires_ns=expires_ns)
@@ -230,7 +231,7 @@ def test_close_runtime_attempts_all_resources_and_reports_other_error(caplog):
         close_runtime(
             state, SimpleNamespace(close=lambda: close("robot", first)),
             keyboard=SimpleNamespace(stop=lambda: close("keyboard", second)),
-            sensors=SimpleNamespace(shutdown=lambda: close("sensors")),
+            sensors=SimpleNamespace(shutdown=lambda state: close("sensors")),
         )
     assert caught.value is first
     assert calls == ["revoke", "robot", "keyboard", "sensors"]
@@ -353,13 +354,13 @@ def test_sensor_shutdown_attempts_all_and_retains_only_unresolved(caplog):
     workers = SensorWorkers()
     first, second = RuntimeError("first join failed"), OSError("second join failed")
     failed = [
-        SimpleNamespace(name="first", join=Mock(side_effect=first)),
-        SimpleNamespace(name="second", join=Mock(side_effect=second)),
+        SimpleNamespace(name="first", join=Mock(side_effect=first), is_alive=lambda: True, exitcode=None),
+        SimpleNamespace(name="second", join=Mock(side_effect=second), is_alive=lambda: True, exitcode=None),
     ]
     finished = SimpleNamespace(name="finished", join=Mock(), is_alive=lambda: False, exitcode=0)
     workers.started = [*failed, finished]
     with pytest.raises(RuntimeError) as caught:
-        workers.shutdown()
+        workers.shutdown(SessionState())
     assert caught.value is first
     finished.join.assert_called_once()
     assert workers.started == failed

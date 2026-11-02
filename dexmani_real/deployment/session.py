@@ -75,6 +75,7 @@ class PolicySession:
         write_json(
             dict(
                 self.summary, errors=self.errors, episodes=[asdict(result) for result in self.episodes],
+                emergency_stop_requested=self.runtime_state.estop_request,
             ),
             self.output_dir / "session_result.json", overwrite=overwrite,
         )
@@ -157,8 +158,7 @@ class PolicySession:
         )
         self.sensors = SensorWorkers(channels)
         self.robot = Robot(
-            self.runtime.arm, self.runtime.hand, run_signal=self.runtime_state.run_signal,
-            stop_signal=self.runtime_state.stop_signal, emergency_signal=self.runtime_state.emergency_signal,
+            self.runtime.arm, self.runtime.hand, runtime_state=self.runtime_state,
             check_services=self.check_services,
         )
 
@@ -219,7 +219,7 @@ class PolicySession:
                 may_start=lambda: self.keyboard.check_health() and self.runtime_state.requests_allow_motion(),
             )
         if self.observations.camera_static and not needs.camera_worker:
-            self.sensors.shutdown()
+            self.sensors.shutdown(self.runtime_state)
             self.sensors.channels = None
         self.robot.check()
         startup_run_id = self.runtime_state.arm()
@@ -241,24 +241,36 @@ class PolicySession:
                 self.runtime_state, self.robot, sensors=self.sensors, keyboard=self.keyboard,
             )
         except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                self.runtime_state.request_emergency_stop()
             logger.exception("policy runtime shutdown failed")
             close_errors.append(("shutdown", exc))
         model_status = "completed"
         if self.model is not None:
+            stage = "model_close"
             try:
-                self.model.close()
-            except BaseException as exc:
-                logger.exception("policy model shutdown failed")
-                model_status = "failed"
-                close_errors.append(("model_close", exc))
-            else:
+                self.model.close(self.runtime_state)
+                stage = "model_close_wait"
                 model_status, model_errors = self.model.wait_closed(MODEL_SHUTDOWN_TIMEOUT_S)
+            except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
+                logger.exception("policy %s failed", stage)
+                model_status = (
+                    "failed" if self.model.close_future is not None and self.model.close_future.done()
+                    else "pending"
+                )
+                close_errors.append((stage, exc))
         writer_pending = self.episode is not None and self.episode.writer_pending
         robot_pending = self.robot is not None and (
             self.robot.arm is not None or self.robot.hand is not None
         )
         sensor_pending = self.sensors is not None and bool(self.sensors.started)
-        pending = any((model_status == "pending", writer_pending, robot_pending, sensor_pending))
+        keyboard_pending = (
+            self.keyboard is not None and self.keyboard.listener is not None
+            and self.keyboard.listener.is_alive()
+        )
+        pending = any((model_status == "pending", writer_pending, robot_pending, sensor_pending, keyboard_pending))
         shutdown = (
             "pending" if pending else "completed"
             if model_status == "completed" and not close_errors and not model_errors else "failed"
@@ -524,6 +536,8 @@ class PolicySession:
                 try:
                     self.save_results()
                 except BaseException as exc:
+                    if isinstance(exc, KeyboardInterrupt):
+                        self.runtime_state.request_emergency_stop()
                     if not primary_failure:
                         raise
                     logger.exception("episode result write failed")

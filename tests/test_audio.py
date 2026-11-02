@@ -164,7 +164,8 @@ def test_emergency_preempts_running_audio_without_waiting():
 
 
 @pytest.mark.parametrize('failure', [
-    None, 'play', 'wait', 'timeout', 'close', 'recording', 'recording_close', 'interrupt', 'exit',
+    None, 'play', 'wait', 'timeout', 'close', 'recording', 'recording_close',
+    'capture_interrupt', 'runtime_interrupt', 'interrupt', 'exit',
 ])
 def test_teleop_releases_devices_before_waiting_for_tail_audio(tmp_path, failure, caplog):
     from dexmani_real.config.real import RealConfig
@@ -194,7 +195,12 @@ def test_teleop_releases_devices_before_waiting_for_tail_audio(tmp_path, failure
         audio.play.side_effect = RuntimeError('audio request failed')
     audio.close.side_effect = close_audio
 
+    state = None
     def initialize(loop, *args, **kwargs):
+        nonlocal state
+        state = loop.runtime_state
+        if failure == 'capture_interrupt':
+            loop.close = Mock(side_effect=KeyboardInterrupt())
         if failure in ('recording', 'recording_close'):
             loop.phase = TeleopPhase.ACTIVE
             loop.run_id = loop.runtime_state.run_id
@@ -204,6 +210,13 @@ def test_teleop_releases_devices_before_waiting_for_tail_audio(tmp_path, failure
             loop.run_episode(loop.run_id)
         loop.runtime_state.request_quit()
         return False
+
+    def close_devices(*args, **kwargs):
+        order.append('devices')
+        if failure == 'capture_interrupt':
+            assert state.estop_request and state.emergency_signal.is_set()
+        if failure == 'runtime_interrupt':
+            raise KeyboardInterrupt
 
     with patch('dexmani_real.teleop.run.validate_robot_config'), \
          patch('dexmani_real.teleop.run.ActionMapper'), \
@@ -215,7 +228,7 @@ def test_teleop_releases_devices_before_waiting_for_tail_audio(tmp_path, failure
          patch('dexmani_real.teleop.run.Keyboard'), \
          patch('dexmani_real.teleop.run.AudioFeedback', return_value=audio), \
          patch('dexmani_real.teleop.run.initialize_teleop', side_effect=initialize), \
-         patch('dexmani_real.teleop.run.close_runtime', side_effect=lambda *a, **k: order.append('devices')):
+         patch('dexmani_real.teleop.run.close_runtime', side_effect=close_devices):
         kwargs = {
             "record": False, "episodes_dir": str(tmp_path), "max_duration_s": 1,
             "runtime_config_json": None,
@@ -225,7 +238,10 @@ def test_teleop_releases_devices_before_waiting_for_tail_audio(tmp_path, failure
                 run_teleop(runtime, **kwargs)
         else:
             code = run_teleop(runtime, **kwargs)
-            assert code == int(failure in ('recording', 'recording_close'))
+            assert code == int(failure in ('recording', 'recording_close', 'capture_interrupt', 'runtime_interrupt'))
+            if failure in ('capture_interrupt', 'runtime_interrupt'):
+                assert state.estop_request
+                assert state.emergency_signal.is_set() and state.stop_signal.is_set()
     if failure in ('play', 'wait', 'close', 'recording_close'):
         logs = [record for record in caplog.records if record.message == 'teleop audio cleanup failed']
         assert len(logs) == 1 and logs[0].levelname == 'WARNING' and logs[0].exc_info
@@ -238,8 +254,8 @@ def test_teleop_releases_devices_before_waiting_for_tail_audio(tmp_path, failure
     assert order == (['devices', 'audio_close'] if failure == 'play' else
                      ['devices', 'audio_wait', 'audio_close'])
     audio.close.assert_called_once()
-    audio.play.assert_called_with('emergency' if failure in ('recording', 'recording_close') else 'end',
-                                  interrupt=failure in ('recording', 'recording_close'))
+    emergency = failure in ('recording', 'recording_close', 'capture_interrupt', 'runtime_interrupt')
+    audio.play.assert_called_with('emergency' if emergency else 'end', interrupt=emergency)
 
 
 def test_emergency_during_popen_creation_cancels_old_generation():

@@ -20,10 +20,14 @@ from dexmani_real.data.export import (
     ExportConfig,
     canonical_array_specs,
     export_zarr,
-    training_prefix,
     validate_export_episode,
 )
-from dexmani_real.data.raw import RawReader, RawWriter, snapshot_recording_metadata
+from dexmani_real.data.raw import (
+    RawReader,
+    RawWriter,
+    _VideoWriter,
+    snapshot_recording_metadata,
+)
 from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
 from dexmani_real.deployment.inference import MODEL_SHUTDOWN_TIMEOUT_S, PolicyWorker
 from dexmani_real.deployment.rollout import Rollout
@@ -204,42 +208,78 @@ def test_raw_publication_and_video(tmp_path, capture, frames, save, status):
         assert not list(tmp_path.iterdir())
 
 
-@pytest.mark.parametrize("case,expected,reason", [
-    ("normal", 3, None),
-    ("gap", 2, "control_grid_drift"),
-    ("nan", 2, "nonfinite:action_arm_joint_target"),
-    ("failed", 2, "technical_failure_last_row"),
-    ("tactile", 2, "stale_source:tactile_dense_ns"),
-    ("readout_between", 3, None),
-    ("readout_limit", 2, "observation_crossed_control_period"),
+@pytest.mark.parametrize("case,reason,row_index", [
+    ("normal", None, None),
+    ("jitter", None, None),
+    ("gap", "control_interval_gap_or_drift", 1),
+    ("nan", "nonfinite:action_arm_joint_target", 2),
+    ("inf", "nonfinite:hand_tactile_force", 2),
+    ("failed", "technical failure", None),
+    ("tactile", "stale_source:tactile_dense_ns", 2),
+    ("readout_between", None, None),
+    ("readout_limit", "observation_crossed_control_period", 2),
+    ("source_future", "invalid_source_clock:arm_ns", 2),
+    ("source_missing", "invalid_source_clock:hand_ns", 2),
+    ("source_regressed", "source_clock_regressed:camera_ns", 2),
+    ("sequence_regressed", "camera_sequence_regressed", 2),
 ])
-def test_real_raw_continuous_training_prefix(tmp_path, capture, case, expected, reason):
-    _, path = record(tmp_path, capture, status="failed" if case == "failed" else "normal")
-    if case in {"gap", "nan", "tactile", "readout_between", "readout_limit"}:
-        with h5py.File(path / "data.h5", "r+") as data:
-            if case == "nan":
-                data["action_arm_joint_target"][2] = np.full(7, np.nan)
-            else:
-                rows = data["timing/rows"][:]
-                if case == "gap":
-                    rows["control_ns"][2] += 100_000_000
-                    rows["observation_ns"][2] += 100_000_000
-                elif case.startswith("readout"):
-                    readout_ns = 30_000_000 if case == "readout_between" else 100_000_000
-                    rows["observation_ns"][2] = rows["control_ns"][2] + readout_ns
-                else:
-                    rows["tactile_dense_ns"] = rows["control_ns"][0]
-                    data["meta"].attrs["hand_tactile_hold_max_age_s"] = .15
-                data["timing/rows"][:] = rows
-    with RawReader(path) as reader:
-        quality = training_prefix(reader)
-        assert quality["row_stop"] == expected
-        assert quality["trim_reason"] == reason
-        assert "readout_over_tolerance_rows" not in quality
+def test_training_admits_only_complete_episode(tmp_path, capture, case, reason, row_index):
+    _, path = record(tmp_path / "raw", capture, status="failed" if case == "failed" else "normal")
+    with h5py.File(path / "data.h5", "r+") as data:
+        if case == "nan":
+            data["action_arm_joint_target"][2] = np.full(7, np.nan)
+        elif case == "inf":
+            data["hand_tactile_force"][2] = np.full((5, 120, 3), np.inf)
+        else:
+            rows = data["timing/rows"][:]
+            if case == "gap":
+                rows["control_ns"][1:] += 100_000_000
+                rows["observation_ns"][1:] += 100_000_000
+            elif case == "jitter":
+                # dt/4 边界仍接纳，来源值不随导出重采样。
+                rows["control_ns"][1] += 25_000_000
+                rows["observation_ns"][1] += 25_000_000
+            elif case.startswith("readout"):
+                readout_ns = 30_000_000 if case == "readout_between" else 100_000_000
+                rows["observation_ns"][2] = rows["control_ns"][2] + readout_ns
+            elif case == "tactile":
+                rows["tactile_dense_ns"] = rows["control_ns"][0]
+                data["meta"].attrs["hand_tactile_hold_max_age_s"] = .15
+            elif case == "source_future":
+                rows["arm_ns"][2] = rows["observation_ns"][2] + 1
+            elif case == "source_missing":
+                rows["hand_ns"][2] = -1
+            elif case == "source_regressed":
+                rows["camera_ns"][2] = rows["camera_ns"][0]
+            elif case == "sequence_regressed":
+                rows["camera_sequence"] = [0, 1, 0]
+            data["timing/rows"][:] = rows
+    before = {file.name: file.read_bytes() for file in path.iterdir()}
+    output = tmp_path / "canonical.zarr"
+    processing = ExportConfig(pointcloud=PointCloudConfig(
+        remove_table=False, num_points=32, workspace=(-1., -1., 0., 1., 1., 1.),
+    ))
+    if reason is not None:
+        with pytest.raises(ValueError, match=reason) as caught:
+            export_zarr(path, output, processing=processing)
+        assert str(path) in str(caught.value)
+        if row_index is not None:
+            assert f"row {row_index}" in str(caught.value)
+        assert not output.exists()
+        assert not list(tmp_path.glob(".canonical.zarr.tmp-*"))
+    else:
+        result = export_zarr(path, output, processing=processing)
+        root = zarr.open_group(str(output), mode="r")
+        assert result["total_frames"] == 3
+        np.testing.assert_array_equal(root["meta/episode_ends"][:], [3])
+        assert all(array.shape[0] == 3 for _, array in root["data"].arrays())
+        quality = root.attrs["episode_quality"][0]
+        assert set(quality) == {"max_control_grid_deviation_ns", "max_readout_ns"}
         if case == "readout_between":
             assert quality["max_readout_ns"] == 30_000_000
-        # 重复相机 sequence 合法，不能按帧号删控制行。
-        np.testing.assert_array_equal(reader["timing/rows"]["camera_sequence"], [0, 0, 1])
+        if case == "jitter":
+            assert quality["max_control_grid_deviation_ns"] == 25_000_000
+    assert before == {file.name: file.read_bytes() for file in path.iterdir()}
 
 
 def test_canonical_export_real_fk_and_thirteen_fields(tmp_path, capture):
@@ -263,6 +303,78 @@ def test_canonical_export_real_fk_and_thirteen_fields(tmp_path, capture):
     assert root.attrs["source_id"]
     assert root.attrs["dt"] == .1
     assert "timing_admission" not in root.attrs
+
+
+@pytest.mark.parametrize("failure", ["failed", "rgb_short", "rgb_extra", "empty_depth_tail"])
+def test_batch_export_rejects_whole_episode_without_publishing_or_changing_raw(tmp_path, capture, failure):
+    source = tmp_path / "raw"
+    _, good = record(source, capture)
+    _, bad = record(source, capture, status="failed" if failure == "failed" else "normal")
+    if failure.startswith("rgb"):
+        video = _VideoWriter(bad / "rgb.mp4", fps=10, width=32, height=32)
+        video.open()
+        try:
+            for _ in range(2 if failure == "rgb_short" else 4):
+                video.write_frame(np.full((32, 32, 3), 80, np.uint8))
+        finally:
+            video.close()
+    elif failure == "empty_depth_tail":
+        with h5py.File(bad / "data.h5", "r+") as data:
+            data["depth"][2] = np.zeros((32, 32), np.uint16)
+    before = {file: file.read_bytes() for path in (good, bad) for file in path.iterdir()}
+    output = tmp_path / "canonical.zarr"
+    processing = ExportConfig(pointcloud=PointCloudConfig(
+        remove_table=False, num_points=32, workspace=(-1., -1., 0., 1., 1., 1.),
+    ))
+    with pytest.raises(ValueError) as caught:
+        export_zarr(source, output, processing=processing)
+    assert str(bad) in str(caught.value)
+    if failure != "failed":
+        assert f"row {3 if failure == 'rgb_extra' else 2}" in str(caught.value)
+    assert not output.exists()
+    # 失败 staging 继续保留用于诊断，绝不作为可见 Canonical 发布。
+    assert len(list(tmp_path.glob(".canonical.zarr.tmp-*"))) == 1
+    result = export_zarr(source, output, processing=processing, exclude=(bad.name,))
+    assert result["episode_count"] == 1 and result["total_frames"] == 3
+    assert result["excluded_episodes"] == [bad.name]
+    assert zarr.open_group(str(output), mode="r").attrs["episode_ids"] == [good.name]
+    assert before == {file: file.read_bytes() for path in (good, bad) for file in path.iterdir()}
+
+
+@pytest.mark.parametrize("field", ["task_label", "technical_status"])
+def test_export_missing_metadata_reports_episode_without_row_number(tmp_path, capture, field):
+    _, path = record(tmp_path / "raw", capture)
+    with h5py.File(path / "data.h5", "r+") as data:
+        del data["meta"].attrs[field]
+    output = tmp_path / "canonical.zarr"
+    with pytest.raises(ValueError) as caught:
+        export_zarr(path, output, processing=ExportConfig())
+    assert str(path) in str(caught.value) and field in str(caught.value)
+    assert "at row" not in str(caught.value)
+    assert isinstance(caught.value.__cause__, KeyError)
+    assert not output.exists() and not list(tmp_path.glob(".canonical.zarr.tmp-*"))
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_export_progress_failure_preserves_exception_and_publication(tmp_path, capture, completed):
+    _, path = record(tmp_path / "raw", capture)
+    output = tmp_path / "canonical.zarr"
+    failure = ValueError("progress callback failed")
+    def progress(done, total):
+        if (done == total) == completed:
+            raise failure
+    processing = ExportConfig(pointcloud=PointCloudConfig(
+        remove_table=False, num_points=32, workspace=(-1., -1., 0., 1., 1., 1.),
+    ))
+    with pytest.raises(ValueError) as caught:
+        export_zarr(path, output, processing=processing, progress_callback=progress)
+    assert caught.value is failure
+    assert output.exists() == completed
+    assert not list(tmp_path.glob(".canonical.zarr.tmp-*"))
+    if completed:
+        root = zarr.open_group(str(output), mode="r")
+        np.testing.assert_array_equal(root["meta/episode_ends"][:], [3])
+        assert all(array.shape[0] == 3 for _, array in root["data"].arrays())
 
 
 @pytest.mark.parametrize("source", ["policy_rollout", "other"])
@@ -317,7 +429,7 @@ def test_soft_timeout_summary_keeps_raw_nanoseconds(tmp_path, capture, caplog, r
     assert [call.args[0] for call in loop.audio.play.call_args_list] == (["save"] if recording else [])
 
 
-def test_export_prefix_still_checks_raw_field_shape(tmp_path, capture):
+def test_export_checks_full_raw_field_shape(tmp_path, capture):
     _, path = record(tmp_path, capture)
     with h5py.File(path / "data.h5", "r+") as data:
         del data["action_hand_joint_target"]
@@ -529,7 +641,7 @@ def test_rollout_writer_finishes_independently_of_model(
                 np.testing.assert_array_equal(reader["action_arm_joint_target"][0], command.arm_qpos)
     finally:
         release.set()
-        worker.close()
+        worker.close(state)
         assert worker.wait_closed(2) == ("completed", [])
 
 
@@ -566,6 +678,60 @@ def test_finish_timeout_stays_failed_after_writer_exits(tmp_path, capture, monke
     with pytest.raises(RecordingError) as repeated:
         recorder.finish(save=True, reason="test", technical_status="normal")
     assert repeated.value is caught.value
+
+
+def test_interrupted_writer_wait_stays_pending_without_restarting_finish(tmp_path, capture, monkeypatch):
+    from test_policy import make_rollout, make_session
+
+    from dexmani_real.deployment.session import PolicySession
+
+    entered, release = Event(), Event()
+    append = RawWriter.append_frame
+    def blocked_append(writer, *args):
+        entered.set()
+        assert release.wait(5)
+        return append(writer, *args)
+    monkeypatch.setattr(RawWriter, "append_frame", blocked_append)
+    metadata, row, command = capture
+    recorder = EpisodeRecorder(tmp_path / "raw", control_hz=10)
+    recorder.start(task_label="fixture", collection_source="policy_rollout", metadata=metadata)
+    recorder.append(row(0), command)
+    join = recorder.thread.join
+    interrupt = KeyboardInterrupt()
+    interrupted_join = Mock(side_effect=interrupt)
+    monkeypatch.setattr(recorder.thread, "join", interrupted_join)
+    try:
+        assert entered.wait(2)
+        episode, _ = make_rollout(tmp_path)
+        episode.recorder = recorder
+        episode.preparation_valid = lambda: True
+        episode.prepare = lambda poll: episode.stop("operator", run_end_reason=RunEndReason.OPERATOR)
+        with pytest.raises(KeyboardInterrupt) as caught:
+            episode.run(keyboard=Mock(), poll_operator=lambda: None)
+        assert caught.value is interrupt
+        state = episode.runtime_state
+        assert state.estop_request and state.emergency_signal.is_set() and state.stop_signal.is_set()
+        assert episode.writer_pending and episode.result.raw["status"] == "pending"
+        assert recorder.finish_request is not None and recorder.published_path is None
+        session, events = make_session(tmp_path)
+        session.runtime_state, session.episode, session.episodes = state, episode, [episode.result]
+        session.save_results = PolicySession.save_results.__get__(session)
+        assert session.close(failure=interrupt) == 1
+        result = json.loads((tmp_path / "session_result.json").read_text())
+        assert result["shutdown"] == "pending" and result["outcome"] == "fault"
+        assert result["reason"] == "KeyboardInterrupt" and result["emergency_stop_requested"]
+        assert result["episodes"][0]["raw"]["status"] == "pending"
+        assert "model_close" in events and "audio_close" in events
+        interrupted_join.assert_called_once()
+    finally:
+        release.set()
+        join(2)
+    assert not recorder.writer_pending
+    with pytest.raises(RecordingError) as repeated:
+        recorder.finish(save=True, reason="retry", technical_status="normal")
+    assert repeated.value.__cause__ is interrupt
+    interrupted_join.assert_called_once()
+    assert recorder.published_path is None and recorder.staging_path.is_dir()
 
 
 @pytest.mark.parametrize("overwrite", [False, True])
