@@ -11,6 +11,7 @@ from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePathRejected
 from dexmani_real.data.raw import camera_metadata
+from dexmani_real.deployment.inference import MODEL_SHUTDOWN_TIMEOUT_S, PolicyWorker
 from dexmani_real.deployment.rollout import Rollout, failure_reason, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
@@ -20,7 +21,6 @@ from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
     POINTCLOUD_READY_TIMEOUT_S,
-    SHUTDOWN_TIMEOUT_S,
     SensorWorkers,
     close_runtime,
 )
@@ -121,8 +121,6 @@ class PolicySession:
 
     def prepare_resources(self):
         from dexmani_policy.deployment import load_policy
-
-        from dexmani_real.deployment.inference import PolicyWorker
 
         needs = self.needs
         camera_required = needs.camera_worker or self.observations.camera_static
@@ -236,7 +234,6 @@ class PolicySession:
         self.keyboard.discard_events("h", "b", "t")
 
     def close(self, *, failure=None):
-        deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
         close_errors = []
         model_errors = []
         try:
@@ -255,7 +252,7 @@ class PolicySession:
                 model_status = "failed"
                 close_errors.append(("model_close", exc))
             else:
-                model_status, model_errors = self.model.wait_closed(deadline - time.monotonic())
+                model_status, model_errors = self.model.wait_closed(MODEL_SHUTDOWN_TIMEOUT_S)
         writer_pending = self.episode is not None and self.episode.writer_pending
         robot_pending = self.robot is not None and (
             self.robot.arm is not None or self.robot.hand is not None
@@ -268,9 +265,11 @@ class PolicySession:
         )
         failure_detail = None
         if failure is not None:
-            failure_detail = error_detail("session", failure)
-            # 失败段保留自己的错误；会话仅记录独立的启动/运行时错误。
-            if self.episode is None or not self.episode.result.errors:
+            # episode 已完成归因；会话只登记独立的启动/运行时错误。
+            if self.episode is not None and self.episode.result.errors:
+                failure_detail = self.episode.result.errors[0]
+            else:
+                failure_detail = error_detail("session", failure)
                 self.errors.append(failure_detail)
         self.errors.extend(error_detail(stage, error) for stage, error in close_errors)
         self.errors.extend(model_errors)
@@ -284,10 +283,11 @@ class PolicySession:
         if self.audio is not None:
             try:
                 self.audio.finish(successful)
-            except BaseException as exc:
-                logger.exception("policy audio shutdown failed")
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
+            except Exception:
+                logger.warning("policy audio shutdown failed", exc_info=True)
+            except KeyboardInterrupt as exc:
+                logger.exception("policy audio shutdown interrupted")
+                self.runtime_state.request_emergency_stop()
                 self.errors.append(error_detail("audio_close", exc))
                 successful = False
                 if shutdown != "pending":
@@ -524,10 +524,10 @@ class PolicySession:
                 try:
                     self.save_results()
                 except BaseException as exc:
-                    logger.exception("episode result write failed")
-                    self.errors.append(error_detail("episode_save", exc))
                     if not primary_failure:
                         raise
+                    logger.exception("episode result write failed")
+                    self.errors.append(error_detail("episode_save", exc))
             result = episode.result
             if result.started_utc is not None:
                 completed = sum(item.started_utc is not None for item in self.episodes)

@@ -11,8 +11,6 @@ logger = logging.getLogger(__name__)
 CAMERA_READY_TIMEOUT_S = 15.0
 POINTCLOUD_READY_TIMEOUT_S = 30.0
 VR_READY_TIMEOUT_S = 120.0
-# 模型任务与持久化收尾的会话上限，传感器不使用此预算。
-SHUTDOWN_TIMEOUT_S = 65.0
 # 相机 read <= 0.3 s、来源 stall 2 s；不与 writer 的 flush 预算共享。
 SENSOR_SHUTDOWN_TIMEOUT_S = 3.0
 WORKER_STOP_TIMEOUT_S = 1.0

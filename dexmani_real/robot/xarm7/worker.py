@@ -291,11 +291,12 @@ class ArmController:
         # 计算结束后、进入 SDK 前统一检查期限、反馈和最新控制器上报。
         issue = self.command_issue(goal, time.monotonic_ns())
         if issue:
-            # Ruckig 已推进但目标未发送；结束本段，不能沿未发送参考继续。
-            self.io.stop.set()
+            if issue != "generation_busy":
+                self.io.stop.set()
             return None
         started = time.monotonic_ns()
         self.driver.servo(q)
+        self.reference.commit()
         return started
 
     def run(self):

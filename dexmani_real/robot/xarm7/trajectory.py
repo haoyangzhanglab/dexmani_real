@@ -34,6 +34,7 @@ class ArmTrajectory:
         self.input.target_position = self.input.current_position
 
     def step(self, goal: np.ndarray | None = None, *, hold: bool = False) -> np.ndarray:
+        """计算候选；input.current_* 始终保留最近一次成功发送的参考。"""
         # 保持请求只制动；各关节独立停稳，不继续追赶此前积累的位置目标。
         if hold:
             self.input.control_interface = ControlInterface.Velocity
@@ -70,5 +71,9 @@ class ArmTrajectory:
                     raise ValueError(
                         f"reference braking/position extremum outside joint {i + 1} limits"
                     )
-        self.output.pass_to_input(self.input)
         return np.asarray(self.output.new_position)
+
+    def commit(self) -> None:
+        # update 只推进 output 和库内比较缓存。未 commit 时，下次 update
+        # 会因 input 与缓存不同而从已提交参考重算，无需回滚或重置轨迹。
+        self.output.pass_to_input(self.input)

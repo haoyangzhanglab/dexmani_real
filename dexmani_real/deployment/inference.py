@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from dexmani_policy.deployment import PolicyRuntime
 
 logger = logging.getLogger(__name__)
+MODEL_SHUTDOWN_TIMEOUT_S = 65.0
 
 
 class PolicyWorker:

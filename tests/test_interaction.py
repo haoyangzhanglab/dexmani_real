@@ -11,7 +11,7 @@ import pytest
 from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.runtime.keyboard import Keyboard, KeyEvent
-from dexmani_real.runtime.state import SessionState
+from dexmani_real.runtime.state import RunEndReason, SessionState
 from dexmani_real.teleop.loop import TeleopLoop, TeleopPhase
 from dexmani_real.teleop.run import initialize_teleop
 
@@ -83,7 +83,8 @@ def test_stop_ends_segment_and_new_b_reanchors(key):
     old_epoch = loop.run_id
     loop.keyboard.handle_key(key, True)
     loop.handle_commands(loop.keyboard.poll(0))
-    loop.end_episode('operator')
+    loop.request_episode_end('operator', run_end_reason=RunEndReason.OPERATOR, failed=False)
+    loop.end_episode()
     assert loop.phase is TeleopPhase.IDLE
     loop.robot.stop.assert_called_once()
     begin(loop)
@@ -142,7 +143,8 @@ def test_discard_and_single_q_do_not_publish(keys):
     for key in keys:
         loop.keyboard.handle_key(key, True)
     loop.handle_commands(loop.keyboard.poll(0))
-    loop.end_episode('quit')
+    loop.request_episode_end('quit', run_end_reason=RunEndReason.OPERATOR, failed=False)
+    loop.end_episode()
     assert loop.runtime_state.quit_requested
     assert recorder.calls[0]['save'] is False
     assert 'save' not in [call.args[0] for call in loop.audio.play.call_args_list]
@@ -158,7 +160,8 @@ def test_save_decision_precedes_late_discard_and_drops_preparation_keys():
             loop.keyboard.handle_key(key, True)
 
     recorder = loop.recorder = Recorder(during_finish)
-    loop.end_episode('operator')
+    loop.request_episode_end('operator', run_end_reason=RunEndReason.OPERATOR, failed=False)
+    loop.end_episode()
     assert recorder.calls[0]['save'] is True
     prompts = [call.args[0] for call in loop.audio.play.call_args_list]
     assert 'save' in prompts and 'discard' not in prompts
@@ -173,10 +176,12 @@ def test_discard_without_recording_stops_and_new_episode_resets_intent():
     loop.robot.stop.assert_not_called()
     begin(loop)
     loop.request_discard()
-    loop.end_episode('discard')
+    loop.request_episode_end('discard', run_end_reason=RunEndReason.OPERATOR, failed=False)
+    loop.end_episode()
     begin(loop)
     recorder = loop.recorder = Recorder()
-    loop.end_episode('operator')
+    loop.request_episode_end('operator', run_end_reason=RunEndReason.OPERATOR, failed=False)
+    loop.end_episode()
     assert recorder.calls[0]['save'] is True
 
 
@@ -223,7 +228,7 @@ def test_keyboard_stop_allows_admitted_stop_callback_without_queueing():
     stopped.assert_called_once()
 
 
-def test_primary_error_survives_stop_and_writer_failures():
+def test_primary_error_survives_stop_and_writer_failures(caplog):
     loop = make_loop()
     primary = ValueError('mapping failed')
     writer = OSError('writer close failed')
@@ -236,10 +241,13 @@ def test_primary_error_survives_stop_and_writer_failures():
         raise primary
 
     loop.start_episode = fail_start
-    loop.robot.stop.side_effect = RuntimeError('stop failed')
+    stop_error = loop.robot.stop.side_effect = RuntimeError('stop failed')
     with pytest.raises(ValueError) as raised:
         loop.run_episode(loop.runtime_state.run_id)
     assert raised.value is primary
+    assert raised.traceback[-1].name == 'fail_start'
+    for error in (stop_error, writer):
+        assert sum(record.exc_info is not None and record.exc_info[1] is error for record in caplog.records) == 1
     assert not hasattr(primary, 'cleanup_errors')
     recorder.finish.assert_called_once()
     assert loop.runtime_state.error_state
@@ -331,7 +339,8 @@ def test_preparation_event_delayed_until_after_boundary_is_revoked(boundary, key
         if boundary == 'finish':
             begin(loop)
             loop.recorder = Recorder(input_at_boundary)
-            loop.end_episode('operator')
+            loop.request_episode_end('operator', run_end_reason=RunEndReason.OPERATOR, failed=False)
+            loop.end_episode()
         elif boundary == 'startup':
             loop.sensors.channels = SimpleNamespace(vr_ring=SimpleNamespace(latest_sequence=1))
             loop.sensors.start = Mock()
@@ -375,7 +384,35 @@ def test_target_rejection_without_recording_reports_reason_once(caplog):
     loop.execute_control_step(observation(), tick_end_ns=10**18)
     loop.robot.send_action.assert_not_called()
     assert loop.recorder is None
-    loop.end_episode('interrupted')
+    loop.request_episode_end('interrupted', run_end_reason=RunEndReason.OPERATOR, failed=False)
+    loop.end_episode()
     messages = [record.getMessage() for record in caplog.records if '本段结束' in record.getMessage()]
     assert len(messages) == 1
     assert 'target_unavailable: hand solver did not improve the committed-command seed' in messages[0]
+
+
+def test_revocation_returns_first_reason_without_revoking_new_run():
+    loop = make_loop()
+    begin(loop)
+    state, epoch = loop.runtime_state, loop.run_id
+    state.request_stop()
+    assert state.revoke_motion(reason=RunEndReason.HARDWARE_FAULT,
+                               expected_run_id=epoch) == RunEndReason.OPERATOR
+    loop.request_episode_end('late SDK error', run_end_reason=RunEndReason.HARDWARE_FAULT)
+    loop.end_episode()
+    begin(loop)
+    current = state.run_id
+    state.revoke_motion(expected_run_id=epoch)
+    assert state.run_id == current and state.can_move(run_id=current)
+
+
+def test_emergency_signals_precede_motion_lock():
+    state = SessionState()
+    worker = Thread(target=state.request_emergency_stop)
+    with state.motion_lock:
+        worker.start()
+        assert state.emergency_signal.wait(2)
+        assert state.stop_signal.wait(2)
+        assert not state.estop_request  # 本地状态仍在等锁，owner 已可观察停止。
+    worker.join(2)
+    assert not worker.is_alive() and state.estop_request

@@ -18,6 +18,7 @@ from dexmani_real.config.deployment import (
 )
 from dexmani_real.data.raw import snapshot_recording_metadata
 from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
+from dexmani_real.deployment.inference import MODEL_SHUTDOWN_TIMEOUT_S
 from dexmani_real.deployment.schedule import (
     ActionChunk,
     Prediction,
@@ -29,7 +30,6 @@ from dexmani_real.deployment.schedule import (
 )
 from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
-from dexmani_real.runtime.lifecycle import SHUTDOWN_TIMEOUT_S
 from dexmani_real.runtime.observation import (
     check_observation,
     read_observation,
@@ -96,6 +96,7 @@ class Rollout:
         self.capture_ids = capture_ids
         self.epoch = epoch
         self.history: deque[PolicyObservationRow] = deque(maxlen=policy_info.n_obs_steps)
+        self.last_history_timestamp_ns = None
         self.plan: ActionChunk | None = None
         self.query: Prediction | None = None
         self.preparation_issue = None
@@ -134,15 +135,10 @@ class Rollout:
         if self.finished:
             return
         ended_ns = time.monotonic_ns()
-        self.runtime_state.revoke_motion(
+        reason = self.runtime_state.revoke_motion(
             reason=run_end_reason,
             expected_run_id=self.epoch,
         )
-        with self.runtime_state.motion_lock:
-            reason = (
-                self.runtime_state.run_ended_reason
-                if self.started_ns and self.runtime_state.run_ended_id == self.epoch else run_end_reason
-            )
         self.result.duration_s = (ended_ns - self.started_ns) / 1e9 if self.started_ns else 0.0
         self.result.termination_reason = (
             reason.name.lower() if self.started_ns
@@ -150,16 +146,14 @@ class Rollout:
         )
         self.result.termination_details = detail
         self.result.errors.extend(errors)
-        self.plan = None
-        if not self.model.has_pending_task:
-            self.query = None
+        self.plan = self.query = None
         self.history.clear()
         self.previous_arm = self.wait_deadline_ns = self.run_deadline_ns = None
         self.robot.stop()
         if self.runtime_state.estop_request:
             self.audio.play("emergency")
 
-    def finish_recording(self, *, deadline):
+    def finish_recording(self):
         result = self.result
         if self.recorder is not None and self.recorder.start_attempted:
             # 与键盘回调共同锁定首次 finish 的保存意图，等待 writer 时不持锁。
@@ -170,7 +164,6 @@ class Rollout:
                     save=save, reason=result.termination_reason,
                     details=[dict(stage="termination", reason=result.termination_details)],
                     technical_status="normal" if result.normal_termination else "failed",
-                    deadline=deadline,
                 )
             finally:
                 result.raw = self.recorder.result()
@@ -225,33 +218,24 @@ class Rollout:
         finally:
             primary_failure = sys.exc_info()[1]
             failure = primary_failure
-            deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
-            # 模型回收失败必须先进入本段结果，Raw 才能保存正确的结束状态。
-            # stop() 已撤权；两项收尾共用 deadline，不持 motion_lock。
-            try:
-                self.model.discard_pending(deadline - time.monotonic())
-            except BaseException as exc:
-                logger.exception("retired episode model task failed")
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                self.result.errors.append(error_detail("retired_model", exc))
-                self.audio.play("emergency")
-                if failure is None:
-                    failure = exc
-            finally:
+            # stop() 已撤权并请求设备停止；writer 独占自己的完整收尾预算。
+            # Raw 记录执行结束状态，之后的模型回收错误仅进入 episode/session 结果。
+            for stage, finish in (
+                ("recorder_finalize", self.finish_recording),
+                ("retired_model", lambda: self.model.discard_pending(MODEL_SHUTDOWN_TIMEOUT_S)),
+            ):
                 try:
-                    self.finish_recording(deadline=deadline)
+                    finish()
                 except BaseException as exc:
-                    if exc is not primary_failure:
-                        self.result.errors.append(error_detail("recorder_finalize", exc))
-                        logger.exception("episode recording finalization failed")
                     if isinstance(exc, KeyboardInterrupt):
                         self.runtime_state.request_emergency_stop()
+                    if exc is not failure:
+                        self.result.errors.append(error_detail(stage, exc))
+                        if failure is not None:
+                            logger.exception("episode %s also failed", stage)
                     self.audio.play("emergency")
                     if failure is None:
                         failure = exc
-            if not self.model.has_pending_task:
-                self.query = None
             # 清队列之前结束收尾代际，也撤销已取身份但尚未入队的旧 B/H/T。
             self.runtime_state.revoke_motion()
             keyboard.discard_events("b", "h", "t")
@@ -382,6 +366,8 @@ class Rollout:
         )
         if issue is not None or handoff_slot is None:
             return issue
+        if len(self.history) < self.policy_info.n_obs_steps:
+            return "prefetch_history_incomplete" if self.execution.mode == "rtc" else None
         # 与执行使用同一规范化策略动作；不提前映射未来 RobotCommand。
         prefix = (
             plan.actions[slot - plan.anchor_slot:].copy()
@@ -450,6 +436,16 @@ class Rollout:
                 # 当前输入持续裁决；等待行是评估事实，不重复插入模型历史。
                 return
             if waiting_query is None:
+                if self.policy_info.n_obs_steps > 1:
+                    # sync 等待预测时不追加样本；只比较真正进入 history 的采样时刻。
+                    # 半周期余量容忍小幅抖动，明确漏槽则直接重建连续窗口。
+                    gap = (
+                        row.control_timestamp_ns - self.last_history_timestamp_ns > 1.5 * self.dt_ns
+                        if synchronous and self.last_history_timestamp_ns is not None else skipped > 0
+                    )
+                    if gap:
+                        self.history.clear()
+                    self.last_history_timestamp_ns = row.control_timestamp_ns
                 self.history.append(self.observations.project(row))
 
             new_plan, issue = handoff_plan(self.query, slot=slot, mode=self.execution.mode)
@@ -464,7 +460,7 @@ class Rollout:
                 self.plan, self.query = new_plan, None
                 self.wait_deadline_ns = None
             if self.plan is None:
-                if len(self.history) == self.history.maxlen and self.query is None:
+                if len(self.history) == self.policy_info.n_obs_steps and self.query is None:
                     issue = self.submit(slot)
                     if issue is not None:
                         self.stop_rejection(issue)
@@ -514,10 +510,12 @@ class Rollout:
                     ),
                     expected_run_id=self.epoch,
                 )
-            try:
-                if row is not None and self.recorder is not None:
+            if row is not None and self.recorder is not None:
+                try:
                     self.recorder.append(row, attempted_command)
-            except BaseException:
-                if primary_error is None:
-                    raise
-                logger.exception("episode frame recording also failed")
+                except BaseException as exc:
+                    if primary_error is None:
+                        raise
+                    if isinstance(exc, KeyboardInterrupt):
+                        self.runtime_state.request_emergency_stop()
+                    self.recorder.store_error(exc)

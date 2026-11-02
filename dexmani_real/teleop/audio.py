@@ -79,10 +79,10 @@ class AudioFeedback:
         finally:
             try:
                 self.close()
-            except BaseException:
+            except Exception:
                 if failure is None:
                     raise
-                logger.exception("Audio close also failed")
+                logger.warning("Audio close also failed", exc_info=True)
 
     def close(self):
         with self.condition:

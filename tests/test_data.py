@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import replace
+from itertools import count
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ import pytest
 import zarr
 
 from dexmani_real.config.perception import PointCloudConfig
+from dexmani_real.config.real import RealConfig
 from dexmani_real.data import recorder as recorder_module
 from dexmani_real.data.export import (
     ExportConfig,
@@ -23,11 +25,15 @@ from dexmani_real.data.export import (
 )
 from dexmani_real.data.raw import RawReader, RawWriter, snapshot_recording_metadata
 from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
+from dexmani_real.deployment.inference import MODEL_SHUTDOWN_TIMEOUT_S, PolicyWorker
+from dexmani_real.deployment.rollout import Rollout
+from dexmani_real.deployment.schedule import Prediction
 from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
 from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
 from dexmani_real.runtime.observation import Observation
+from dexmani_real.runtime.state import RunEndReason, SessionState
 from dexmani_real.utils import io
 from dexmani_real.utils.log import error_detail
 
@@ -289,7 +295,8 @@ def test_soft_timeout_summary_keeps_raw_nanoseconds(tmp_path, capture, caplog, r
     loop.record_soft_timeout("compute", deadline_ns=2_000_000_000, observed_ns=2_012_345_000)
     before_end = list(caplog.records)
     last = loop.last_soft_timeout.copy()
-    loop.end_episode("operator")
+    loop.request_episode_end("operator", run_end_reason=RunEndReason.OPERATOR, failed=False)
+    loop.end_episode()
     assert not any(record.getMessage().startswith("Teleop soft timeouts:") for record in before_end)
     summaries = [record for record in caplog.records
                  if record.getMessage().startswith("Teleop soft timeouts:")]
@@ -402,6 +409,128 @@ def test_exited_writer_can_publish_after_supervisor_wakes_late(tmp_path, capture
         reader.validate_completion()
         np.testing.assert_array_equal(reader["action_arm_joint_target"][0], command.arm_qpos)
         assert len(list(reader.iter_rgb_frames())) == 1
+
+
+@pytest.mark.parametrize("writer_failure", [False, True])
+@pytest.mark.parametrize("model_failure", ["pending", "error"])
+def test_rollout_writer_finishes_independently_of_model(
+    tmp_path, capture, monkeypatch, writer_failure, model_failure,
+):
+    metadata, row, command = capture
+    entered, release = Event(), Event()
+    events = []
+    late_error = RuntimeError("late prediction failure")
+
+    def predict(rows):
+        entered.set()
+        assert release.wait(5)
+        if model_failure == "error":
+            raise late_error
+        return np.zeros((6, 19))
+
+    worker = PolicyWorker(
+        lambda: SimpleNamespace(predict=predict, close=lambda: events.append("model_close")),
+        build_observation=lambda rows: rows,
+    )
+    state = SessionState()
+    epoch = state.arm()
+    state.stop_signal.clear()
+    state.begin_motion()
+
+    def stop():
+        assert state.stop_signal.is_set()
+        events.append("stop")
+
+    episode = Rollout(
+        state, RealConfig(), SimpleNamespace(control_dt_s=.1, n_obs_steps=1),
+        epoch=epoch, robot=SimpleNamespace(stop=stop), observations=None, needs=None,
+        sensors=None, action_mapper=None, model=worker, max_running_s=None,
+        capture_ids=count(1), index=1, output_dir=tmp_path, record_raw=True, audio=Mock(),
+    )
+    episode.started_ns = 1
+    episode.query = Prediction(0, None)
+    recorder = episode.recorder
+    writer_close = RawWriter.close
+
+    def close_writer(writer):
+        assert events == ["stop"] and worker.has_pending_task
+        assert worker.future.running()
+        writer_close(writer)
+        events.append("writer_close")
+        if writer_failure:
+            raise OSError("writer close failed")
+
+    monkeypatch.setattr(RawWriter, "close", close_writer)
+    now = [0.0]
+    monkeypatch.setattr(recorder_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+
+    def prepare(poll):
+        recorder.start(task_label="fixture", collection_source="policy_rollout",
+                       metadata=metadata, episode_name="episode_001")
+        recorder.append(row(0), command)
+        join = recorder.thread.join
+
+        def finish_join(timeout):
+            assert timeout == recorder_module.RECORDER_STOP_TIMEOUT_S
+            join(timeout=2)
+            assert not recorder.writer_pending
+            # 模拟 writer 消耗完整预算；模型仍应得到自己的完整等待预算。
+            now[0] += recorder_module.RECORDER_STOP_TIMEOUT_S
+
+        monkeypatch.setattr(recorder.thread, "join", finish_join)
+        episode.stop("operator", run_end_reason=RunEndReason.OPERATOR)
+
+    discard_pending = worker.discard_pending
+
+    def retire(timeout):
+        assert timeout == MODEL_SHUTDOWN_TIMEOUT_S
+        assert events == ["stop", "writer_close"]
+        assert recorder.result()["status"] == ("failed" if writer_failure else "published")
+        events.append("model_retire")
+        if model_failure == "error":
+            release.set()
+            worker.future.exception(timeout=2)
+        discard_pending(0)  # 离线测试不实际等待完整的模型超时。
+
+    monkeypatch.setattr(worker, "discard_pending", retire)
+    episode.preparation_valid = lambda: True
+    episode.prepare = prepare
+    keyboard = SimpleNamespace(discard_events=lambda *args: events.append("keys"))
+    try:
+        worker.load()
+        worker.future.result(timeout=2)
+        worker.poll()
+        worker.predict(())
+        assert entered.wait(2)
+        expected = RecordingError if writer_failure else TimeoutError if model_failure == "pending" else RuntimeError
+        with pytest.raises(expected) as caught:
+            episode.run(keyboard=keyboard, poll_operator=lambda: None)
+        assert events == ["stop", "writer_close", "model_retire", "keys"]
+        assert [error["stage"] for error in episode.result.errors] == (
+            ["recorder_finalize", "retired_model"] if writer_failure else ["retired_model"]
+        )
+        assert not episode.result.normal_termination
+        assert worker.has_pending_task == (model_failure == "pending")
+        assert episode.query is None
+        if worker.has_pending_task:
+            with pytest.raises(RuntimeError, match="unreclaimed"):
+                worker.predict(())
+        if writer_failure:
+            assert caught.value is recorder.error
+            assert episode.result.raw["status"] == "failed" and recorder.published_path is None
+        else:
+            assert episode.result.raw["status"] == "published" and recorder.error is None
+            if model_failure == "error":
+                assert caught.value is late_error
+            with RawReader(recorder.published_path) as reader:
+                assert reader.num_frames == 1
+                reader.validate_completion()
+                assert reader.meta["technical_status"] == "normal"
+                np.testing.assert_array_equal(reader["action_arm_joint_target"][0], command.arm_qpos)
+    finally:
+        release.set()
+        worker.close()
+        assert worker.wait_closed(2) == ("completed", [])
 
 
 @pytest.mark.parametrize("failure", ["writer", "queue"])

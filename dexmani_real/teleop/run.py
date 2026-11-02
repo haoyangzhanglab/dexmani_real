@@ -187,8 +187,6 @@ def run_teleop(
         except Exception as failure:
             primary_failure = failure
             runtime_state.mark_error()
-            if loop is not None:
-                loop.record_error("cancellation", failure)
             logger.exception("teleop cancellation also failed")
         else:
             runtime_state.request_quit()
@@ -223,8 +221,7 @@ def run_teleop(
                         )
                         audio.finish(success)
                     except Exception:
-                        shutdown_clean = False
-                        logger.exception("teleop audio cleanup failed")
+                        logger.warning("teleop audio cleanup failed", exc_info=True)
     return int(
         not clean or not shutdown_clean or runtime_state.error_state or runtime_state.estop_request
     )

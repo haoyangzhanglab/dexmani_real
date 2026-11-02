@@ -24,6 +24,7 @@ from dexmani_real.robot.xarm7 import protocol
 from dexmani_real.robot.xarm7 import worker as arm_worker
 from dexmani_real.robot.xarm7.process import ArmProcess
 from dexmani_real.robot.xarm7.protocol import ArmChannels, PrepareRequest
+from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
 from dexmani_real.robot.xhand.driver import XHand
 from dexmani_real.robot.xhand.feedback import XHandState
 from dexmani_real.runtime.home import _home_motion
@@ -530,7 +531,7 @@ def test_robot_cache_reads_preserve_each_source_timestamp(devices, monkeypatch):
     robot.hand.get_state.assert_not_called()
 
 
-@pytest.mark.parametrize("expires", ["command", "feedback"])
+@pytest.mark.parametrize("expires", ["command", "feedback", "revoked", "unprepared"])
 def test_arm_rechecks_expiration_after_trajectory_calculation(devices, monkeypatch, expires):
     runtime, state, _, command, _, now = devices
     channels = ArmChannels(
@@ -550,15 +551,118 @@ def test_arm_rechecks_expiration_after_trajectory_calculation(devices, monkeypat
     monkeypatch.setattr(protocol, "time", SimpleNamespace(monotonic_ns=lambda: now))
     channels.publish_goal(RobotCommand(state.run_id, target, None), expires_ns=deadline)
     clock = iter((now, now + elapsed))
-    monkeypatch.setattr(arm_worker, "time", SimpleNamespace(monotonic_ns=lambda: next(clock)))
+    def tick_time():
+        stamp = next(clock)
+        if stamp != now:
+            if expires == "revoked":
+                state.revoke_motion()
+            elif expires == "unprepared":
+                owner.prepared_run_id = -1
+        return stamp
+    monkeypatch.setattr(arm_worker, "time", SimpleNamespace(monotonic_ns=tick_time))
     assert owner.tick() is None
     assert owner.reference is not None  # 使用真实 Ruckig 计算后，才推进时钟到到期边界。
     driver.servo.assert_not_called()
     assert channels.stop.is_set()
+    np.testing.assert_array_equal(owner.reference.input.current_position, runtime.arm.home_qpos)
+    np.testing.assert_array_equal(owner.reference.input.current_velocity, np.zeros(7))
+    np.testing.assert_array_equal(owner.reference.input.current_acceleration, np.zeros(7))
 
 
-@pytest.mark.parametrize('query_ms,interval_ms', [(10, 40), (40, 80), (55, 80), (90, 120)])
-def test_arm_worker_feedback_grid_and_stop(monkeypatch, query_ms, interval_ms):
+@pytest.mark.parametrize("busy_check", [1, 2])
+@pytest.mark.parametrize("new_target", [False, True])
+def test_arm_generation_busy_preserves_last_sent_reference(devices, monkeypatch, busy_check, new_target):
+    runtime, state, _, command, _, now = devices
+    channels = ArmChannels(
+        mp.get_context("spawn"), run_signal=state.run_signal,
+        stop_signal=state.stop_signal, emergency_signal=state.emergency_signal,
+    )
+    driver = SimpleNamespace(servo=Mock())
+    owner = arm_worker.ArmController(runtime.arm, channels, None, driver)
+    owner.status["qpos"] = runtime.arm.home_qpos
+    owner.status["timestamp_ns"] = now
+    owner.prepared_run_id = state.run_id
+    fake_time = SimpleNamespace(monotonic_ns=lambda: now)
+    monkeypatch.setattr(protocol, "time", fake_time)
+    monkeypatch.setattr(arm_worker, "time", fake_time)
+    target = command.arm_qpos.copy()
+    target[0] += .3
+    channels.publish_goal(RobotCommand(state.run_id, target, None), expires_ns=now + 1_000_000_000)
+    owner.tick()
+    reference = owner.reference
+    committed = [reference.input.current_position, reference.input.current_velocity,
+                 reference.input.current_acceleration]
+    authorize = owner.authorized
+    owner.authorized = Mock(side_effect=[None] if busy_check == 1 else [True, None])
+    assert owner.tick() is None
+    assert not channels.stop.is_set() and not channels.fault.value
+    assert driver.servo.call_count == 1
+    np.testing.assert_array_equal(
+        [reference.input.current_position, reference.input.current_velocity,
+         reference.input.current_acceleration], committed,
+    )
+    if new_target:
+        target[0] -= .6
+        channels.publish_goal(RobotCommand(state.run_id, target, None), expires_ns=now + 1_000_000_000)
+    expected = ArmTrajectory(runtime.arm, np.asarray(committed[0]), np.asarray(committed[1]))
+    expected.input.current_acceleration = committed[2]
+    candidate = expected.step(target)
+    owner.authorized = authorize
+    owner.tick()
+    assert driver.servo.call_count == 2 and not channels.stop.is_set()
+    np.testing.assert_allclose(driver.servo.call_args.args[0], candidate, atol=1e-12)
+    np.testing.assert_array_equal(reference.input.current_position, driver.servo.call_args.args[0])
+
+
+def test_trajectory_preview_commit_and_hold_constraints():
+    cfg = RealConfig().arm
+    q = np.asarray(cfg.home_qpos)
+    trajectory = ArmTrajectory(cfg, q, np.zeros(7))
+    target = q.copy()
+    target[0] += 1.0
+    last_acceleration = np.zeros(7)
+    for tick in range(100):
+        hold = tick >= 10
+        before = [trajectory.input.current_position, trajectory.input.current_velocity,
+                  trajectory.input.current_acceleration]
+        candidate = trajectory.step(None if hold else target, hold=hold)
+        np.testing.assert_array_equal(
+            [trajectory.input.current_position, trajectory.input.current_velocity,
+             trajectory.input.current_acceleration], before,
+        )
+        # 重复 preview 不消耗控制周期，包含运动中和最终停稳状态。
+        np.testing.assert_allclose(trajectory.step(None if hold else target, hold=hold), candidate, atol=1e-12)
+        trajectory.commit()
+        position, velocity, acceleration = map(np.asarray, (
+            trajectory.input.current_position, trajectory.input.current_velocity,
+            trajectory.input.current_acceleration,
+        ))
+        assert np.all(position >= cfg.joint_limit_lower) and np.all(position <= cfg.joint_limit_upper)
+        assert max(abs(velocity)) <= cfg.max_joint_velocity_rad_per_s + 1e-8
+        assert max(abs(acceleration)) <= cfg.max_joint_acceleration_rad_per_s2 + 1e-8
+        assert max(abs(acceleration - last_acceleration)) * cfg.servo_hz <= cfg.max_joint_jerk_rad_per_s3 + 1e-8
+        last_acceleration = acceleration
+    np.testing.assert_allclose(velocity, 0, atol=1e-12)
+    np.testing.assert_allclose(acceleration, 0, atol=1e-12)
+    assert q[0] < position[0] < target[0]
+
+
+@pytest.mark.parametrize("hold", [False, True])
+def test_trajectory_rejects_braking_extrema_without_committing(hold):
+    cfg = RealConfig().arm
+    q, v = np.asarray(cfg.home_qpos), np.zeros(7)
+    q[0], v[0] = cfg.joint_limit_upper[0] - .001, .5
+    trajectory = ArmTrajectory(cfg, q, v)
+    with pytest.raises(ValueError, match="extremum outside joint 1"):
+        trajectory.step(np.asarray(cfg.home_qpos), hold=hold)
+    np.testing.assert_array_equal(trajectory.input.current_position, q)
+    np.testing.assert_array_equal(trajectory.input.current_velocity, v)
+
+
+@pytest.mark.parametrize('query_ms,interval_ms,sdk_failure', [
+    (10, 40, False), (40, 80, False), (55, 80, False), (90, 120, False), (10, 40, True),
+])
+def test_arm_worker_feedback_grid_and_stop(monkeypatch, query_ms, interval_ms, sdk_failure):
     # 只替换 SDK、时钟和等待边界；启动、prepare、mailbox、tick 与 Ruckig 均真实运行。
     clock = SimpleNamespace(now=1_000_000_000)
     events = []
@@ -637,8 +741,16 @@ def test_arm_worker_feedback_grid_and_stop(monkeypatch, query_ms, interval_ms):
 
         def servo(self, value):
             events.append(('servo', clock.now))
+            if sdk_failure:
+                self.failed_reference = owner.reference
+                raise OSError("servo failed")
 
         def stop(self):
+            if sdk_failure:
+                reference = self.failed_reference
+                np.testing.assert_array_equal(reference.input.current_position, q)
+                np.testing.assert_array_equal(reference.input.current_velocity, np.zeros(7))
+                np.testing.assert_array_equal(reference.input.current_acceleration, np.zeros(7))
             events.append(('stop', clock.now))
             io.closing.set()
 
@@ -650,6 +762,11 @@ def test_arm_worker_feedback_grid_and_stop(monkeypatch, query_ms, interval_ms):
     monkeypatch.setattr(protocol, 'time', fake_time)
     owner = arm_worker.ArmController(cfg, io, pipe, Driver())
     owner.run()
+    if sdk_failure:
+        assert b"OSError: servo failed" == io.fault.value
+        assert stop.is_set() and io.stopped.is_set()
+        assert events[-1][0] == 'stop'
+        return
     assert not io.fault.value, io.fault.value
     starts = [stamp for event, stamp in events if event == 'read_start']
     assert len(starts) == 5
