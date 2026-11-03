@@ -1,16 +1,11 @@
 """模型生命周期与预测在同一个工作线程串行执行。"""
 
-import logging
-import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from dexmani_policy.deployment import PolicyRuntime
 
-    from dexmani_real.runtime.state import SessionState
-
-logger = logging.getLogger(__name__)
 MODEL_SHUTDOWN_TIMEOUT_S = 65.0
 
 
@@ -21,12 +16,10 @@ class PolicyWorker:
         self.model = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-model")
         self.future = self.close_future = None
-        self.cleanup_deadline = None
 
     def _submit(self, function, *args, **kwargs):
         if self.close_future is not None or self.future is not None:
             raise RuntimeError("Policy worker already has an unreclaimed task or is closing")
-        self.cleanup_deadline = None
         self.future = self.executor.submit(function, *args, **kwargs)
 
     def _load(self):
@@ -63,54 +56,25 @@ class PolicyWorker:
         future = self.future
         if future is None:
             return
-        # 超时瞬间可能刚好完成；未确认回收时保留归属，不能只凭 done 清掉异常。
-        if self.cleanup_deadline is None:
-            self.cleanup_deadline = time.monotonic() + timeout_s
-        remaining = max(0.0, self.cleanup_deadline - time.monotonic())
-        if future not in wait((future,), timeout=remaining).done:
+        if future not in wait((future,), timeout=timeout_s).done:
             raise TimeoutError("episode model task remains pending")
         self.future = None
-        self.cleanup_deadline = None
         future.result()
 
-    def close(self, runtime_state: "SessionState"):
+    def close(self):
         if self.close_future is not None:
             return self.close_future
         retired = self.future
 
         def close_model():
-            failure = None
-            if retired is not None:
-                try:
-                    retired.result()
-                except BaseException as exc:
-                    if isinstance(exc, KeyboardInterrupt):
-                        runtime_state.request_emergency_stop()
-                    logger.exception("retired model task failed")
-                    failure = exc
             try:
+                if retired is not None:
+                    retired.result()
+            finally:
                 if self.model is not None:
                     self.model.close()
-            except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    runtime_state.request_emergency_stop()
-                logger.exception("model close failed")
-                if failure is None:
-                    failure = exc
-            if failure is not None:
-                raise failure
 
         self.close_future = self.executor.submit(close_model)
         self.future = None
         self.executor.shutdown(wait=False, cancel_futures=False)
         return self.close_future
-
-    def wait_closed(self, timeout_s=0.0) -> bool:
-        future = cast(Future[None], self.close_future)
-        if self.cleanup_deadline is None:
-            self.cleanup_deadline = time.monotonic() + timeout_s
-        remaining = max(0.0, self.cleanup_deadline - time.monotonic())
-        if future not in wait((future,), timeout=remaining).done:
-            return False
-        future.result()
-        return True

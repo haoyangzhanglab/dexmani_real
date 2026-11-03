@@ -362,22 +362,8 @@ class RawReader:
         self.dataset_cache: dict[str, h5py.Dataset] = {}
         self.data_file = h5py.File(self.path / "data.h5", "r")
         try:
-            meta = self.meta
-            for name, expected in (
-                ("arm_action_semantics", ARM_ACTION_SEMANTICS),
-                ("timestamp_source", "host_monotonic_ns"),
-                ("joint_units", "rad"),
-            ):
-                if meta[name] != expected:
-                    raise ValueError(f"Raw {name}: expected {expected}")
-            for name, joint_names in (
-                ("arm_joint_names", XARM7_JOINT_NAMES),
-                ("hand_joint_names", XHAND_SDK_JOINT_NAMES),
-            ):
-                if json.loads(meta[name]) != list(joint_names):
-                    raise ValueError(f"Raw {name}: incompatible joint order")
             self.num_frames = len(self.data_file["timing/rows"])
-            self.control_hz = float(meta["control_hz"])
+            self.control_hz = float(self.meta["control_hz"])
             sampling_clock_ns(self.control_hz)
         except BaseException:
             try:
@@ -408,6 +394,15 @@ class RawReader:
         if name not in self.dataset_cache:
             if name in {"hand_contact", "hand_tactile_force"}:
                 self.validate_tactile_metadata()
+            elif name in {"arm_qpos", "action_arm_joint_target"}:
+                self.validate_joint_metadata("arm", XARM7_JOINT_NAMES)
+            elif name in {"hand_qpos", "action_hand_joint_target"}:
+                self.validate_joint_metadata("hand", XHAND_SDK_JOINT_NAMES)
+            if name in {"action_arm_joint_target", "action_hand_joint_target"}:
+                if self.meta["arm_action_semantics"] != ARM_ACTION_SEMANTICS:
+                    raise ValueError(f"Raw arm_action_semantics: expected {ARM_ACTION_SEMANTICS}")
+            if name == "timing/rows" and self.meta["timestamp_source"] != "host_monotonic_ns":
+                raise ValueError("Raw timestamp_source: expected host_monotonic_ns")
             array = self.data_file[name]
             spec = (
                 ((), TIMING_ROW_DTYPE) if name == "timing/rows"
@@ -415,13 +410,21 @@ class RawReader:
             )
             if spec is not None:
                 shape, dtype = spec
-                if array.shape != (self.num_frames, *shape) or array.dtype != dtype:
+                valid_dtype = array.dtype.kind == "f" if dtype.kind == "f" else array.dtype == dtype
+                if array.shape != (self.num_frames, *shape) or not valid_dtype:
                     raise ValueError(f"Raw {name}: incompatible shape/dtype")
             self.dataset_cache[name] = array
         return self.dataset_cache[name]
 
     def read_camera(self) -> CameraSnapshot:
         return decode_camera_metadata(self.meta)
+
+    def validate_joint_metadata(self, device, joint_names) -> None:
+        if self.meta["joint_units"] != "rad":
+            raise ValueError("Raw joint_units: expected rad")
+        name = f"{device}_joint_names"
+        if json.loads(self.meta[name]) != list(joint_names):
+            raise ValueError(f"Raw {name}: incompatible joint order")
 
     def validate_tactile_metadata(self) -> None:
         for name, expected in (

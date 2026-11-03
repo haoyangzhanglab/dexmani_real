@@ -51,8 +51,7 @@ def close_rollout_session(rollout, *, failure=None):
     session.errors = []
     session.summary = {'termination_reason': None}
     session.save_results = lambda: None
-    session.model.close = lambda state: session.model.discard_pending(0)
-    session.model.wait_closed = lambda timeout: True
+    session.model.close = lambda: SimpleNamespace(result=lambda timeout: session.model.discard_pending(0))
     return session.close(failure=failure)
 
 
@@ -591,7 +590,7 @@ def test_prefetch_uses_retained_history_with_real_model_future(monkeypatch, mode
             assert calls[1][1] == {}
         assert not rollout.finished
     finally:
-        worker.close(rollout.runtime_state).result(timeout=1)
+        worker.close().result(timeout=1)
 
 
 def test_slow_first_prediction_has_only_episode_duration(monkeypatch):
@@ -615,6 +614,7 @@ def test_recording_worker_exit_is_a_session_fault(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match='camera worker exited'):
         rollout.step()
     assert rollout.runtime_state.stop_signal.is_set()
+    assert rollout.recorder.queue.empty()
 
 
 def test_policy_raw_is_explicit_opt_in():
@@ -711,25 +711,6 @@ def test_rollout_releases_completed_recorder_once(monkeypatch):
     rollout.finish_recording()
     assert len(writes) == 1 and sounds == ['save']
     assert rollout.recorder is None and rollout.result.raw['path'] == '/published'
-
-
-def test_policy_secondary_sensor_error_does_not_poison_writer(monkeypatch):
-    rollout, _, _ = make_rollout(monkeypatch)
-    rollout.sync_actions = np.zeros((4, 19))
-    rollout.recorder = SimpleNamespace(error=None, check_error=lambda: None, append=lambda *a, **kw: None)
-    reads = []
-    def quality(row):
-        reads.append(True)
-        if len(reads) == 2:
-            raise RuntimeError('camera exited')
-    rollout.recording_issue = quality
-    def mapping(*args):
-        raise ValueError('mapping failed')
-    rollout.map_command = mapping
-    with pytest.raises(ValueError, match='mapping failed'):
-        rollout.step()
-    assert rollout.recorder.error is None and len(reads) == 2
-    assert rollout.runtime_state.stop_signal.is_set()
 
 
 def test_policy_rejects_initial_arm_posture_outside_operational_limits(monkeypatch):

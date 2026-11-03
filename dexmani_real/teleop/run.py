@@ -60,11 +60,7 @@ def run_teleop(
     runtime.vr.validate()
     if record:
         validate_task_label(task_name)
-        if task_name != task_name.strip():
-            raise ValueError("task_name must not contain surrounding whitespace")
-        if task_name.startswith("."):
-            raise ValueError("task_name must not be a hidden or relative directory name")
-        if "/" in task_name or "\\" in task_name:
+        if task_name in {".", ".."} or "/" in task_name or "\\" in task_name:
             raise ValueError("task_name must be one safe directory component")
         if not isinstance(episodes_dir, str) or not episodes_dir.strip():
             raise ValueError("episodes_dir must be non-empty")

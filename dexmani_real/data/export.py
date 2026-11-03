@@ -81,11 +81,6 @@ def canonical_array_specs(
 def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     """前置验证元数据、结构和时间；数值及 RGB 在流式转换时验证。"""
     validate_task_label(reader.meta["task_label"])
-    if reader.meta["collection_source"] != "teleop":
-        raise ValueError(
-            "canonical demonstration export currently supports only teleop Raw; "
-            f"got collection_source={reader.meta['collection_source']!r}"
-        )
     frames = reader.num_frames
     if frames <= 0:
         raise ValueError("episode contains no rows")
@@ -138,6 +133,7 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     for name in ROBOT_DATASET_SPECS:
         reader[name]
     return camera, dict(
+        collection_source=reader.meta.get("collection_source"),
         max_control_grid_deviation_ns=int(np.abs(grid_error).max()),
         max_readout_ns=int(readout.max()),
         max_tactile_aggregate_age_ns=int((observation - rows["tactile_aggregate_ns"]).max()),
@@ -219,8 +215,8 @@ def iter_canonical_blocks(
                 "action": np.concatenate((arm_action, hand_action), axis=1, dtype=np.float32),
                 "action_ee": np.concatenate((encode_eef_pose(action_poses), hand_action), axis=1, dtype=np.float32),
                 "eef_pose": encode_eef_pose(poses).astype(np.float32),
-                "finger_tactile_force": raw["hand_contact"],
-                "taxel_tactile_force": raw["hand_tactile_force"],
+                "finger_tactile_force": raw["hand_contact"].astype(np.float32, copy=False),
+                "taxel_tactile_force": raw["hand_tactile_force"].astype(np.float32, copy=False),
                 **hand_features,
             }
             for name, values in camera_parameters.items():
@@ -402,10 +398,7 @@ def append_episode(arrays, offset, blocks, frames):
     for block in blocks:
         rows = len(block["joint_state"])
         for name, values in block.items():
-            # 两份触觉 float32 原样拷贝，已由原始块检查；转换和新计算仍检查。
-            if np.issubdtype(values.dtype, np.floating) and name not in {
-                "finger_tactile_force", "taxel_tactile_force",
-            }:
+            if np.issubdtype(values.dtype, np.floating):
                 valid = np.isfinite(values).reshape(rows, -1).all(axis=1)
                 if not valid.all():
                     row = count + int(np.flatnonzero(~valid)[0])
