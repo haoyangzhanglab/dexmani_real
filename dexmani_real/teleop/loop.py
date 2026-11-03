@@ -4,6 +4,7 @@ import json
 import logging
 import sys
 import time
+from collections.abc import Sequence
 from enum import Enum
 from typing import cast
 
@@ -161,7 +162,7 @@ class TeleopLoop:
         commands = self.keyboard.poll(self.runtime_state, timeout=0)[0]
         terminal = tuple(
             event for event in commands
-            if event.key in ("esc", "q", "s", "c", "d")
+            if event in ("esc", "q", "s", "c", "d")
         )
         if terminal:
             self.handle_commands(terminal)
@@ -260,8 +261,7 @@ class TeleopLoop:
             self.poll_blocking_commands()
             self.runtime_state.request_quit()
 
-    def handle_operator_command(self, key_event):
-        cmd = key_event.key
+    def handle_operator_command(self, cmd: str):
         expected_cancel_epoch = None
         if cmd in {"b", "h", "t"}:
             expected_cancel_epoch = self.keyboard.accept_operation(self.runtime_state)
@@ -355,18 +355,13 @@ class TeleopLoop:
             return False
         return False
 
-    def handle_commands(self, commands):
-        if any(event.key == "d" for event in commands) and self.phase is not TeleopPhase.IDLE:
+    def handle_commands(self, commands: Sequence[str]):
+        if "d" in commands and self.phase is not TeleopPhase.IDLE:
             self.discard_requested = True
-        emergency = next((event for event in commands if event.key == "esc"), None)
-        if emergency is not None:
-            self.handle_operator_command(emergency)
-            return
-        # 回调已置停止信号；D 保存意图由本线程登记，再选择本段结束原因。
-        for terminal in ("q", "d", "s", "c"):
-            terminal_event = next((event for event in commands if event.key == terminal), None)
-            if terminal_event is not None:
-                self.handle_operator_command(terminal_event)
+        # 回调已置停止信号；先登记 D 意图，再按原优先级选择结束原因。
+        for terminal in ("esc", "q", "d", "s", "c"):
+            if terminal in commands:
+                self.handle_operator_command(terminal)
                 return
         for event in commands:
             if self.handle_operator_command(event):

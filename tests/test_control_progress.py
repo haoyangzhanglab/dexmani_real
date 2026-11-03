@@ -784,3 +784,73 @@ def test_observation_builder_depth_scale(scale, accepted):
     else:
         with pytest.raises(ValueError, match='Live depth scale'):
             builder.configure_camera(camera)
+
+
+@pytest.mark.parametrize('before,after,accepted,rejected', [
+    ({'w'}, {'w', 'x'}, True, False), ({'w', 'x'}, {'w'}, True, False),
+    ({'w'}, set(), False, False), ({'w'}, {'s'}, False, False),
+    ({'w'}, {'w', 'd'}, False, False), ({'w'}, {'w', 'r'}, False, False),
+    ({'w'}, {'w', 'x'}, False, True),
+])
+def test_jog_compares_only_control_keys(monkeypatch, before, after, accepted, rejected):
+    from dexmani_real.runtime.jog import CartesianJog
+    rollout, _, _ = make_rollout(monkeypatch)
+    row, _ = rollout.read_observation()
+    monkeypatch.setattr('dexmani_real.runtime.jog.read_observation', lambda *a: row)
+    keys = Keyboard()
+    keys.held_keys = before
+    jog = CartesianJog(None, SimpleNamespace(target_max_age_s=.5), (None, None))
+    target = np.ones(7)
+    jog.command_pose = jog.command_qpos = np.zeros(7)
+    def propose(*args, **kwargs):
+        keys.held_keys = after
+        return target, SimpleNamespace(qpos=None if rejected else target, reason='IK rejected')
+    jog.propose = propose
+    sent = []
+    rollout.robot.send_action = lambda command, **kw: sent.append(command)
+    jog.step(rollout.robot, keys, SessionState(), rollout.runtime)
+    assert sent[0].arm_hold == (not accepted)
+    if accepted:
+        np.testing.assert_array_equal(sent[0].arm_qpos, target)
+        np.testing.assert_array_equal(jog.command_pose, target)
+        np.testing.assert_array_equal(jog.command_qpos, target)
+    else:
+        assert jog.command_pose is jog.command_qpos is None
+
+
+@pytest.mark.parametrize('key', ['q', 'esc'])
+def test_jog_cancel_during_ik_reaches_publication_guard(monkeypatch, key):
+    from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.robot.system import Robot
+    from dexmani_real.robot.xarm7.process import ArmProcess
+    from dexmani_real.runtime.jog import CartesianJog
+    import threading
+    import multiprocessing as mp
+    ctx = mp.get_context('spawn')
+    monkeypatch.setattr(ctx, 'Event', threading.Event)
+    monkeypatch.setattr(ctx, 'Lock', threading.Lock)
+    rollout, _, _ = make_rollout(monkeypatch)
+    row, _ = rollout.read_observation()
+    monkeypatch.setattr('dexmani_real.runtime.jog.read_observation', lambda *a: row)
+    state = SessionState()
+    robot = Robot(rollout.runtime.arm, rollout.runtime.hand, runtime_state=state)
+    robot.connected = True
+    arm = robot.arm = ArmProcess(rollout.runtime.arm, runtime_state=state)
+    arm.process = SimpleNamespace(pid=1, exitcode=None, is_alive=lambda: True)
+    arm.io.ready.set()
+    keys = Keyboard(bindings={'q': state.request_quit}, estop_callback=state.request_emergency_stop)
+    keys.active = True
+    keys.handle_key('w', True)
+    jog = CartesianJog(None, SimpleNamespace(target_max_age_s=.5), (None, None))
+    def propose(*args, **kwargs):
+        keys.handle_key(key, True)
+        return np.zeros(7), SimpleNamespace(qpos=np.zeros(7))
+    jog.propose = propose
+    try:
+        with pytest.raises(OperationCancelled):
+            jog.step(robot, keys, state, rollout.runtime)
+        assert arm.io.take_goal() is None
+        assert jog.command_qpos is None
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()

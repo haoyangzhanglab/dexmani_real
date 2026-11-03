@@ -1,4 +1,5 @@
 import json
+from typing import cast
 
 import numpy as np
 
@@ -78,17 +79,13 @@ class SensorChannels:
 
 
 def snapshot_camera_parameters(
-    channels, config, calibration_path, *, require_extrinsics=False, include_extrinsics=True,
-):
-    """在首帧完整发布后复制相机静态参数，之后不再依赖 worker 或共享通道。"""
-    if channels.camera_ring.latest_sequence <= 0:
+    channels: SensorChannels, calibration_path, *, require_extrinsics=False, include_extrinsics=True,
+) -> CameraSnapshot:
+    """调用方已启用相机通道；首帧发布后复制静态参数，之后不再依赖 worker。"""
+    if cast(SharedRing, channels.camera_ring).latest_sequence <= 0:
         raise ValueError("camera parameters require a published camera frame")
     serial = channels.camera_serial.value.decode("utf-8").strip()
-    if config.serial is not None and serial != config.serial:
-        raise ValueError("active camera serial differs from configuration")
     color = CameraIntrinsics(**json.loads(channels.camera_intrinsics.value.decode("utf-8")))
-    if (color.height, color.width) != (config.height, config.width):
-        raise ValueError("camera intrinsics differ from configured resolution")
     transform = None
     if include_extrinsics:
         loader = load_camera_extrinsics if require_extrinsics else load_optional_camera_extrinsics

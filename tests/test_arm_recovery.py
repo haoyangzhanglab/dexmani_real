@@ -95,7 +95,7 @@ def test_cancel_during_recovery_is_not_cleared(cancel, stage, home):
     state = SessionState()
     process = ArmProcess(ArmConfig(), runtime_state=state)
     process.process = SimpleNamespace(is_alive=lambda: True)
-    process.io.connected.set()
+    process.io.ready.set()
     process.check_error = lambda: None
     process.wait_stopped = lambda **kwargs: None
     if stage == "stop_confirmation":
@@ -125,7 +125,7 @@ def test_unconsumed_reply_prevents_new_operation():
     state = SessionState()
     process = ArmProcess(ArmConfig(), runtime_state=state)
     process.process = SimpleNamespace(is_alive=lambda: True)
-    process.io.connected.set()
+    process.io.ready.set()
     process.check_error = lambda: None
     process.reply_pending = True
     try:
@@ -237,7 +237,7 @@ def test_recovery_reports_owner_fault_even_when_operator_also_cancelled():
     state = SessionState()
     process = ArmProcess(ArmConfig(), runtime_state=state)
     process.process = SimpleNamespace(is_alive=lambda: True, pid=1, exitcode=None)
-    process.io.connected.set()
+    process.io.ready.set()
     epoch = state.cancel_epoch
     state.request_stop()
     process.io.fault.value = b'OSError: SDK feedback failed'
@@ -331,7 +331,7 @@ def test_cancel_inflight_keeps_reply_owned_and_closes_session():
     state = SessionState()
     arm = ArmProcess(ArmConfig(), runtime_state=state)
     arm.process = SimpleNamespace(is_alive=lambda: True, pid=1, exitcode=None)
-    arm.io.connected.set()
+    arm.io.ready.set()
     arm.resume = lambda *args, **kwargs: None
     services = []
     def service():
@@ -366,6 +366,60 @@ def test_preparation_resume_failure_also_closes_owner(error):
             arm.prepare(state.cancel_epoch, service=lambda: None)
         assert arm.io.stop.is_set() and arm.io.closing.is_set()
         assert not arm.reply_pending and not arm.child_pipe.poll()
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+def test_feedback_requires_live_ready_owner_and_survives_stop():
+    arm = ArmProcess(ArmConfig(), runtime_state=SessionState())
+    alive = [True]
+    arm.process = SimpleNamespace(pid=1, exitcode=0, is_alive=lambda: alive[0])
+    try:
+        with pytest.raises(RuntimeError, match='unavailable'):
+            arm.snapshot()
+        arm.io.ready.set()
+        assert arm.is_connected
+        arm.snapshot()
+        arm.request_stop()
+        arm.io.stopped.set()
+        assert arm.is_connected
+        arm.snapshot()
+        arm.io.closing.set()
+        with pytest.raises(RuntimeError, match='unavailable'):
+            arm.snapshot()
+        alive[0] = False
+        assert not arm.is_connected
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+@pytest.mark.parametrize('operation', ['connect', 'snapshot', 'submit', 'prepare'])
+def test_failed_startup_ready_never_authorizes_operation(monkeypatch, operation):
+    from dexmani_real.robot.commands import RobotError
+    arm = ArmProcess(ArmConfig(), runtime_state=SessionState())
+    def fail_start():
+        arm.io.fault.value = b'OSError: initialization failed'
+        arm.io.ready.set()  # worker 的失败收尾也唤醒父进程。
+    process = SimpleNamespace(pid=1, exitcode=None, is_alive=lambda: True, start=fail_start)
+    monkeypatch.setattr(arm.ctx, 'Process', lambda **kwargs: process)
+    try:
+        with pytest.raises(RobotError, match='initialization failed'):
+            if operation == 'connect':
+                arm.connect()
+            else:
+                arm.process = process
+                fail_start()
+                if operation == 'snapshot':
+                    arm.snapshot()
+                elif operation == 'submit':
+                    arm.submit(RobotCommand(arm_qpos=np.zeros(7)),
+                               expires_ns=time.monotonic_ns() + 1_000_000_000)
+                else:
+                    arm.prepare(arm.runtime_state.cancel_epoch, service=lambda: None)
+        assert arm.io.take_goal() is None
+        assert not arm.reply_pending
     finally:
         arm.pipe.close()
         arm.child_pipe.close()

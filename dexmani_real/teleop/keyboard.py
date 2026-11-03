@@ -127,11 +127,7 @@ class KeyboardTeleop:
             if self.runtime_state.quit_requested:
                 return True
 
-            home_event = next((
-                event for event in events
-                if event.key == "r"
-            ), None)
-            if home_event is not None:
+            if "r" in events:
                 epoch = self.keys.accept_operation(self.runtime_state)
                 if epoch is not None:
                     self.run_home(epoch)

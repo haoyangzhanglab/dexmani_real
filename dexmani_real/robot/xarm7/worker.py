@@ -278,7 +278,6 @@ class ArmController:
 
             startup_abort()
             self.driver.connect(check_abort=startup_abort)
-            self.io.connected.set()
             settled_deadline_ns = min(
                 startup_deadline_ns,
                 time.monotonic_ns() + int(HOME_CONVERGENCE_TIMEOUT_S * 1e9),
@@ -345,7 +344,6 @@ class ArmController:
                 self.io.close_error.value = (
                     f"{previous}; {detail}" if previous else detail
                 ).encode()[:1023]
-            self.io.connected.clear()
             self.pipe.close()
 
 

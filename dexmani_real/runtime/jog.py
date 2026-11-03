@@ -21,6 +21,8 @@ from dexmani_real.runtime.observation import (
 
 logger = logging.getLogger(__name__)
 
+JOG_CONTROL_KEYS = frozenset(key for pair in JOG_KEY_PAIRS for key in pair) | {"q", "r", "esc"}
+
 
 class CartesianJog:
     """持有成功提交的目标参考；跟踪误差不改变操作者目标。"""
@@ -37,7 +39,7 @@ class CartesianJog:
 
     def step(self, robot, keys, state, runtime):
         """发布点动目标或减速保持；故障由会话边界记录、撤权并收尾。"""
-        pressed_keys = keys.snapshot()
+        pressed_keys = keys.snapshot() & JOG_CONTROL_KEYS
         with state.motion_lock:
             if not (state.requests_allow_motion() and not state.stop_signal.is_set()):
                 raise OperationCancelled("jog authority revoked")
@@ -58,7 +60,7 @@ class CartesianJog:
             )
             if result.qpos is None:
                 rejection_reason = result.reason
-            elif keys.snapshot() == pressed_keys:
+            elif keys.snapshot() & JOG_CONTROL_KEYS == pressed_keys:
                 target = result.qpos
         if rejection_reason is not None and rejection_reason != self.rejection_reason:
             logger.warning("IK rejected target; braking and holding: %s", rejection_reason)

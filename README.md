@@ -29,7 +29,7 @@ CONFIG = replace(base,
 
 Policy 默认只保存 `run_config.yaml` 和 `session_result.json`；需要完整 Raw 时使用 `python scripts/run_policy.py EXPERIMENT --record-raw`。未录制时只启动模型实际输入和静态参数所需的传感器与标定。
 
-遥操作录制选项由 CLI 提供：`--record/--no-record` 默认开启，`--episodes-dir` 默认 `episodes`，`--max-duration` 默认每段 60 秒。相对录制目录相对仓库根目录，绝对路径直接使用，再拼接 TASK。例如：
+遥操作录制选项由 CLI 提供：`--record/--no-record` 默认开启，`--episodes-dir` 默认 `episodes`，`--max-duration` 默认每段 60 秒。相对录制目录相对仓库根目录，绝对路径直接使用，再拼接 TASK。录制时 TASK 须为非空目录名，不含首尾空白、点前缀或路径分隔符；`--no-record` 不使用 TASK，也不校验录制目录规则。例如：
 
 ```bash
 python scripts/collect_teleop.py TASK --record --episodes-dir captures --max-duration 90
@@ -67,7 +67,7 @@ VR 遥操作与策略会话：B 空闲时开始新段；S/C 停止并保存；D 
 
 物理回放使用 S/Q 停止并退出、Esc/Ctrl+C 急停并非零退出，收尾期间的急停同样生效；正常播完自动关闭。需要 HOME 时使用已有遥操作或键盘点动入口。
 
-键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出；S/D 在该入口仍是方向键。启动及 HOME 后先完成伺服准备，再进入点动/hold。松键或 IK/约束拒绝时制动并 hold；有效候选不会只因名义 tick 已过而丢弃。busy 期间仍维护按键释放，长按启动键不会穿过收尾自动启动。
+键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出；S/D 在该入口仍是方向键。启动及 HOME 后先完成伺服准备，再进入点动/hold。松键或 IK/约束拒绝时制动并 hold；有效候选不会只因名义 tick 已过而丢弃。IK 前后只比较方向键及 Q/R/Esc 的输入快照，无关键按下或释放不丢弃有效目标；Q/Esc 的取消仍由回调和实际发布边界执行。busy 期间仍维护按键释放，长按启动键不会穿过收尾自动启动。
 
 传感进程在尝试 start 前登记归属，启动后中断仍由统一收尾回收；明确无 PID 的对象不 join。关闭依次请求退出、有界等待，必要时 terminate/kill，最后确认退出：退出码 0 为正常回收；退出码对应本次已尝试的 SIGTERM/SIGKILL 时只记 warning。其他非零退出、清理调用异常及未确认退出仍报错，未确认退出的句柄保留。成功回收不清除已有运行错误、停止失败或急停结果。Policy 按实际受管进程检查健康，静态参数相机关闭后不再参与检查。
 

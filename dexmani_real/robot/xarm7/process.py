@@ -45,10 +45,11 @@ class ArmProcess:
         self.close_deadline: float | None = None
 
     @property
-    def is_connected(self):
+    def is_connected(self) -> bool:
+        # ready 也用于失败唤醒；操作入口仍须先 check_error。
         return (
             self.process is not None and self.process.is_alive()
-            and self.io.connected.is_set() and not self.io.closing.is_set()
+            and self.io.ready.is_set() and not self.io.closing.is_set()
         )
 
     @property

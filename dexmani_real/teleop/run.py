@@ -53,19 +53,19 @@ def run_teleop(
 ) -> int:
     """装配遥操作资源，运行并按原保存意图完成收尾。"""
     configure_logging()
-    validate_task_label(task_name)
-    if task_name != task_name.strip():
-        raise ValueError("task_name must not contain surrounding whitespace")
-    if task_name.startswith("."):
-        raise ValueError("task_name must not be a hidden or relative directory name")
-    if "/" in task_name or "\\" in task_name:
-        raise ValueError("task_name must be one safe directory component")
     validate_robot_config(runtime)
     runtime.environment.validate()
     validate_control_rate(runtime, runtime.teleop.control_hz)
     runtime.teleop.validate()
     runtime.vr.validate()
     if record:
+        validate_task_label(task_name)
+        if task_name != task_name.strip():
+            raise ValueError("task_name must not contain surrounding whitespace")
+        if task_name.startswith("."):
+            raise ValueError("task_name must not be a hidden or relative directory name")
+        if "/" in task_name or "\\" in task_name:
+            raise ValueError("task_name must be one safe directory component")
         if not isinstance(episodes_dir, str) or not episodes_dir.strip():
             raise ValueError("episodes_dir must be non-empty")
         if not np.isfinite(max_duration_s) or max_duration_s <= 0:
@@ -98,8 +98,6 @@ def run_teleop(
         vr=True,
     )
     sensors = robot = None
-    clean = False
-    shutdown_clean = False
     loop = None
     keyboard = audio = None
     primary_failure: BaseException | None = None
@@ -158,7 +156,6 @@ def run_teleop(
                 )
                 loop.camera_snapshot = snapshot_camera_parameters(
                     channels,
-                    runtime.camera,
                     camera_calibration_path,
                 )
             robot.check()
@@ -176,12 +173,10 @@ def run_teleop(
                     and runtime_state.requests_allow_motion()):
                 raise
             runtime_state.request_quit()
-            clean = True
             logger.info("Teleop startup cancelled")
         else:
             loop.run()
             robot.check()
-            clean = bool(runtime_state.quit_requested)
     except (Exception, KeyboardInterrupt) as exc:
         primary_failure = exc
         if loop is not None:
@@ -203,8 +198,6 @@ def run_teleop(
             elif isinstance(exc, KeyboardInterrupt):
                 runtime_state.request_emergency_stop()
             logger.exception("teleop runtime cleanup failed")
-        else:
-            shutdown_clean = True
         try:
             if loop is not None:
                 loop.finish_recording()
@@ -222,7 +215,7 @@ def run_teleop(
                 primary_failure = primary_failure or exc
                 logger.exception("teleop audio cleanup failed")
     return int(
-        not clean or not shutdown_clean or primary_failure is not None or runtime_state.estop_request
+        not runtime_state.quit_requested or primary_failure is not None or runtime_state.estop_request
     )
 
 

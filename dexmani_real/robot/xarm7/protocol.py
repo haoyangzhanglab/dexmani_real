@@ -43,7 +43,6 @@ class ArmChannels:
     ):
         self.stop, self.emergency = stop_signal, emergency_signal
         self.closing, self.stopped, self.ready = (ctx.Event() for _ in range(3))
-        self.connected = ctx.Event()
         self.fault = ctx.Array("c", 1024, lock=False)
         self.close_error = ctx.Array("c", 1024, lock=False)
         self.goal_lock, self.status_lock = ctx.Lock(), ctx.Lock()

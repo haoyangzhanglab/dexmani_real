@@ -4,6 +4,7 @@ import logging
 import multiprocessing as mp
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import asdict
 
 from dexmani_real.config.control import HomeConfigurationError
@@ -189,7 +190,7 @@ class PolicySession:
             )
             needs_extrinsics = needs.point_cloud or "camera_extrinsic" in self.info.observation_fields
             self.camera_snapshot = snapshot_camera_parameters(
-                self.sensors.channels, self.runtime.camera, self.camera_calibration_path,
+                self.sensors.channels, self.camera_calibration_path,
                 require_extrinsics=needs_extrinsics,
                 include_extrinsics=needs_extrinsics or self.record_raw,
             )
@@ -334,8 +335,8 @@ class PolicySession:
             allow_tactile_reset=allow_tactile_reset,
         )
 
-    def handle_command_batch(self, signals, *, allow_tactile_reset=False) -> int | None:
-        keys = {event.key for event in signals}
+    def handle_command_batch(self, signals: Sequence[str], *, allow_tactile_reset=False) -> int | None:
+        keys = set(signals)
         if "d" in keys and self.episode is not None and not self.episode.finished:
             self.episode.discard_requested = True
         if self.episode is not None and keys.intersection({"s", "c", "d", "q", "esc"}):
@@ -350,8 +351,7 @@ class PolicySession:
         if keys.intersection({"s", "c", "d", "q"}):
             logger.debug("operator: S/C/D/Q suppresses preparation commands in this batch")
             return None
-        for event in signals:
-            signal = event.key
+        for signal in signals:
             if signal not in {"b", "h", "t"}:
                 continue
             cancel_epoch = self.keyboard.accept_operation(self.runtime_state)

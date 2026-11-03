@@ -202,7 +202,7 @@ RTC bootstrap 尚无既有前缀承诺，继续保留当前从就绪结果开始
 - 普通控制发送必须拒绝 stop。prepare/HOME 通过专用操作入口和本次取消计数进入，不能把旧 `required_safety_state=ARMED` 换名成另一种通用许可。
 - emergency 立即置位且本会话不清除；先设置急停/stop，再进行可能竞争的锁操作。
 - 不持键盘锁、状态锁或邮箱锁执行 SDK、模型推理、大数组读取、join 或长等待。
-- 不把 cancel_epoch 写入共享目标、KeyEvent、Raw 或 Pipe 请求；不得引入 command generation/lease token。
+- 不把 cancel_epoch 写入共享目标、键盘事件、Raw 或 Pipe 请求；不得引入 command generation/lease token。
 
 `RunEndReason` 只服务报表分类时可直接改为本地简明字符串，更新调用方；不建立新的跨层结束原因协议。无需为删除一个小 enum 机械制造大量格式迁移。
 

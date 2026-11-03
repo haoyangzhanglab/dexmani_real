@@ -8,7 +8,6 @@ import termios
 import threading
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -19,11 +18,6 @@ JOG_KEY_PAIRS = (
     ("w", "s"), ("d", "a"), ("up", "down"),
     ("left", "right"), ("i", "k"), ("j", "l"),
 )
-
-
-@dataclass(frozen=True)
-class KeyEvent:
-    key: str
 
 
 def suppress_terminal_echo():
@@ -44,7 +38,7 @@ def restore_terminal_echo(saved):
 
 class Keyboard:
     def __init__(self, *, bindings=None, estop_callback=None):
-        self.events: deque[KeyEvent] = deque()
+        self.events: deque[str] = deque()
         self.accepting_starts = False
         self.held_keys: set[str] = set()
         self.condition = threading.Condition(threading.Lock())
@@ -64,10 +58,10 @@ class Keyboard:
                 if self.estop_callback is not None:
                     self.estop_callback()
             finally:
-                self.events.append(KeyEvent("esc"))
+                self.events.append("esc")
                 self.condition.notify()
 
-    def handle_key(self, name, pressed):
+    def handle_key(self, name: str, pressed: bool):
         if name == "esc" and pressed:
             self.latch_emergency_stop()
             return
@@ -83,7 +77,7 @@ class Keyboard:
             callback = self.bindings.get(name)
             if callback is not None:
                 callback()
-            self.events.append(KeyEvent(name))
+            self.events.append(name)
             self.condition.notify()
 
     def allow_start(self):
@@ -95,11 +89,11 @@ class Keyboard:
         """与快停回调排序；返回主线程当前操作的取消上下文。"""
         with self.condition:
             if not self.accepting_starts or any(
-                event.key in self.bindings or event.key == "esc" for event in self.events
+                event in self.bindings or event == "esc" for event in self.events
             ):
                 return None
             self.accepting_starts = False
-            self.events = deque(event for event in self.events if event.key not in {"b", "h", "t", "r"})
+            self.events = deque(event for event in self.events if event not in {"b", "h", "t", "r"})
             with state.motion_lock:
                 if not state.requests_allow_motion():
                     return None
@@ -202,7 +196,7 @@ class Keyboard:
         if failure is not None:
             raise failure
 
-    def poll(self, state, timeout=0.05):
+    def poll(self, state, timeout=0.05) -> tuple[list[str], bool]:
         """事件与 stop 在同一输入临界区取快照；调用方在锁外处理。"""
         if self.active and not self.check_health():
             timeout = 0
@@ -220,8 +214,7 @@ class Keyboard:
                 logger.error("keyboard listener exited; latching emergency stop")
             self.latch_emergency_stop()
             with self.condition:
-                if self.held_keys:
-                    self.held_keys.clear()
+                self.held_keys.clear()
         return healthy
 
     def snapshot(self) -> frozenset[str]:

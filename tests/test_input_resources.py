@@ -18,7 +18,7 @@ def test_busy_press_requires_release_and_new_press():
     assert keyboard.events == keyboard.events.__class__()
     keyboard.handle_key('b', False)
     keyboard.handle_key('b', True)
-    assert [event.key for event in keyboard.events] == ['b']
+    assert list(keyboard.events) == ['b']
 
 
 def test_cancel_between_poll_and_admission_prevents_start():
@@ -89,7 +89,7 @@ def test_busy_admission_and_cancellation_preserve_operator_intent():
     state.stop_signal.clear()
     assert state.cancel_epoch == epoch and not state.stop_signal.is_set()
     keyboard.handle_key('s', True)
-    assert [event.key for event in keyboard.events] == ["s"]
+    assert list(keyboard.events) == ["s"]
     assert state.cancel_epoch != epoch
 
 
@@ -273,19 +273,18 @@ def test_sensor_recovery_preserves_policy_failure(prior_result):
 @pytest.mark.parametrize('keys', [('x',), ('x', 'b')])
 def test_policy_ignores_unbound_keys_before_start_admission(keys):
     from dexmani_real.deployment.session import PolicySession
-    from dexmani_real.runtime.keyboard import KeyEvent
     session = PolicySession.__new__(PolicySession)
     session.runtime_state = SessionState()
     session.keyboard = Keyboard()
     session.keyboard.allow_start()
     session.episode = None
-    epoch = session.handle_command_batch([KeyEvent(key) for key in keys])
+    epoch = session.handle_command_batch(list(keys))
     if 'b' in keys:
         assert epoch == session.runtime_state.cancel_epoch
     else:
         assert epoch is None
         # 无关按键不能消耗接纳，随后 B 仍可开始。
-        assert session.handle_command_batch([KeyEvent('b')]) == session.runtime_state.cancel_epoch
+        assert session.handle_command_batch(['b']) == session.runtime_state.cancel_epoch
 
 
 @pytest.mark.parametrize('key', ['s', 'c', 'd', 'q', 'esc'])
@@ -379,14 +378,16 @@ def test_poll_waits_for_fast_stop_and_returns_consistent_snapshot():
         callback.join(2)
         reader.join(2)
     events, stopped = snapshots[0]
-    assert [event.key for event in events] == ['s'] and stopped
+    assert events == ['s'] and stopped
 
 
 @pytest.mark.parametrize('stage,key,exit_code', [
     ('vr', 's', 0), ('vr', 'c', 0), ('vr', 'd', 0), ('vr', 'q', 0), ('vr', 'esc', 1),
     ('connect', None, 1), ('running', 's', 1), ('cleanup', None, 1), ('idle', 'esc', 1),
+    ('normal', None, 0), ('recorded', None, 0), ('no_quit', None, 1),
+    ('recording_cleanup', None, 1), ('audio_cleanup', None, 1),
 ])
-def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_code):
+def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_code, published_camera):
     import threading
 
     import numpy as np
@@ -416,7 +417,7 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
             return self.pid is not None and self.exitcode is None
         def join(self, **kwargs):
             self.exitcode = 0
-            closed.append('vr')
+            closed.append(self.name)
 
     class Robot:
         def __init__(self, arm, hand, *, runtime_state, **kwargs):
@@ -435,15 +436,25 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
                 raise OSError('robot close failed')
 
     monkeypatch.setattr(run.mp, 'get_context', lambda kind: SimpleNamespace(Process=Process, Event=threading.Event))
-    monkeypatch.setattr(run, 'SensorChannels', lambda *a, **kw: SimpleNamespace(
-        is_running=SimpleNamespace(value=True), vr_ring=SimpleNamespace(latest_sequence=1)))
+    published_camera.is_running = SimpleNamespace(value=True)
+    published_camera.vr_ring = SimpleNamespace(latest_sequence=1)
+    monkeypatch.setattr(run, 'SensorChannels', lambda *a, **kw: published_camera)
+    monkeypatch.setattr('dexmani_real.ipc.sensors.load_optional_camera_extrinsics', lambda *a: None)
     monkeypatch.setattr(run, 'Robot', Robot)
     monkeypatch.setattr(run, 'load_vr_transform', lambda path: np.eye(3))
     monkeypatch.setattr(run.ActionMapper, 'for_mode', lambda *a, **kw: None)
     monkeypatch.setattr(run, 'build_hand_retargeter', lambda runtime: None)
     monkeypatch.setattr(run, 'VRController', lambda *args: SimpleNamespace(hand_retargeter=None))
-    monkeypatch.setattr(run, 'AudioFeedback', lambda: SimpleNamespace(play=sounds.append,
-                                                                   close=lambda: closed.append('audio')))
+    def close_audio():
+        closed.append('audio')
+        if stage == 'audio_cleanup':
+            raise OSError('audio close failed')
+    monkeypatch.setattr(run, 'AudioFeedback', lambda: SimpleNamespace(play=sounds.append, close=close_audio))
+    def finish_recording(self):
+        closed.append('recording')
+        if stage == 'recording_cleanup':
+            raise OSError('recording finish failed')
+    monkeypatch.setattr(run.TeleopLoop, 'finish_recording', finish_recording)
     monkeypatch.setattr(run, 'initialize_hand', lambda *args, **kwargs: None)
     run_loop_idle = run.TeleopLoop.run
     def run_loop(self):
@@ -451,20 +462,25 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
             self.keyboard.handle_key(key, True)
             run_loop_idle(self)
             return
-        if stage == 'cleanup':
+        if stage in {'normal', 'recorded', 'cleanup', 'recording_cleanup', 'audio_cleanup'}:
+            if stage == 'recorded':
+                assert self.camera_snapshot.serial == 'actual-camera'
             self.runtime_state.request_quit()
+            return
+        if stage == 'no_quit':
             return
         if stage == 'running':
             self.runtime_state.request_stop()  # 之前一段的正常 S 不能授权吞掉新故障。
             raise OperationCancelled('unexpected running interruption')
         pytest.fail('cancelled startup entered control')
     monkeypatch.setattr(run.TeleopLoop, 'run', run_loop)
-    result = run.run_teleop(RealConfig(), record=False, episodes_dir='unused', max_duration_s=1,
+    result = run.run_teleop(RealConfig(), record=stage == 'recorded', episodes_dir='unused', max_duration_s=1,
                             runtime_config_json=None)
     assert result == exit_code
     if stage in {'connect', 'running', 'cleanup'} or key == 'esc':
         assert 'emergency' in sounds
     assert 'robot' in closed and 'keyboard' in closed and 'audio' in closed
+    assert closed.index('robot') < closed.index('recording') < closed.index('audio')
     if stage == 'vr':
         assert 'vr' in closed
 
@@ -557,3 +573,129 @@ def test_policy_starts_only_sensors_requested_by_control_or_recording(monkeypatc
     assert bool(channels) == record_raw
     assert session.capture_needs.camera_worker == record_raw
     assert session.capture_needs.required_tactile == (('aggregate', 'dense') if record_raw else ())
+
+
+@pytest.mark.parametrize('task_name', ['.research', ' research', 'research ', 'a/b', 'a\\b', '', 'a\n'])
+@pytest.mark.parametrize('record', [False, True])
+def test_task_directory_rules_only_apply_to_recording(monkeypatch, task_name, record):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.teleop import run
+    class ReachedResourceSetup(Exception):
+        pass
+    def load(path):
+        raise ReachedResourceSetup()
+    monkeypatch.setattr(run, 'load_vr_transform', load)
+    with pytest.raises(ValueError if record else ReachedResourceSetup):
+        run.run_teleop(RealConfig(), record=record, task_name=task_name,
+                      episodes_dir='unused', max_duration_s=1, runtime_config_json=None)
+
+
+@pytest.fixture
+def published_camera():
+    import json
+    color = dict(width=16, height=12, fx=100., fy=100., ppx=8., ppy=6.,
+                 distortion_model='none', distortion_coeffs=[0.] * 5)
+    return SimpleNamespace(camera_ring=SimpleNamespace(latest_sequence=1),
+        camera_serial=SimpleNamespace(value=b'actual-camera'),
+        camera_intrinsics=SimpleNamespace(value=json.dumps(color).encode()),
+        camera_depth_scale=SimpleNamespace(value=.001))
+
+
+@pytest.mark.parametrize('mode', ['optional', 'required', 'excluded'])
+def test_camera_snapshot_uses_published_serial(monkeypatch, mode, published_camera):
+    import json
+    import numpy as np
+    from dexmani_real.ipc import sensors
+    channels = published_camera
+    color = json.loads(channels.camera_intrinsics.value)
+    calls = []
+    def load(serial, path):
+        calls.append((serial, path))
+        return np.eye(4)
+    monkeypatch.setattr(sensors, 'load_camera_extrinsics', load)
+    monkeypatch.setattr(sensors, 'load_optional_camera_extrinsics', load)
+    snapshot = sensors.snapshot_camera_parameters(channels, 'calibration.json',
+        require_extrinsics=mode == 'required', include_extrinsics=mode != 'excluded')
+    assert snapshot.serial == 'actual-camera' and snapshot.color.width == 16
+    assert calls == ([] if mode == 'excluded' else [('actual-camera', 'calibration.json')])
+    channels.camera_ring.latest_sequence = 0
+    with pytest.raises(ValueError, match='published camera frame'):
+        sensors.snapshot_camera_parameters(channels, None)
+    channels.camera_ring.latest_sequence = 1
+    channels.camera_depth_scale.value = 0
+    with pytest.raises(ValueError, match='depth_scale'):
+        sensors.snapshot_camera_parameters(channels, None, include_extrinsics=False)
+    channels.camera_depth_scale.value = .001
+    color['fx'] = 0
+    channels.camera_intrinsics.value = json.dumps(color).encode()
+    with pytest.raises(ValueError, match='focal lengths'):
+        sensors.snapshot_camera_parameters(channels, None, include_extrinsics=False)
+
+
+def test_keyboard_events_keep_order_and_deduplicate_presses():
+    keyboard = Keyboard()
+    keyboard.active = True
+    keyboard.listener = SimpleNamespace(is_alive=lambda: True)
+    for key in ['x', 'w', 'w', 's']:
+        keyboard.handle_key(key, True)
+    keyboard.handle_key('w', False)
+    keyboard.handle_key('w', True)
+    events, stopped = keyboard.poll(SessionState(), timeout=0)
+    assert events == ['x', 'w', 's', 'w'] and not stopped
+    assert keyboard.snapshot() == frozenset({'x', 'w', 's'})
+
+
+@pytest.mark.parametrize('extrinsics', [False, True])
+def test_policy_camera_startup_uses_snapshot_interface(monkeypatch, tmp_path, published_camera, extrinsics):
+    import json
+    import numpy as np
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.deployment import session as deployment
+    from dexmani_real.runtime.observation import ObservationNeeds
+
+    calibration = tmp_path / 'camera.json'
+    calibration.write_text(json.dumps({'actual-camera': {'T_base_from_camera': np.eye(4).tolist()}}))
+    session = deployment.PolicySession.__new__(deployment.PolicySession)
+    session.runtime = RealConfig()
+    session.runtime_state = SessionState()
+    session.startup_cancel_epoch = session.runtime_state.cancel_epoch
+    session.capture_needs = ObservationNeeds(camera_fields=('rgb',))
+    session.record_raw = False
+    session.info = SimpleNamespace(observation_fields=('camera_extrinsic',) if extrinsics else ())
+    session.camera_calibration_path = calibration
+    configured, started = [], []
+    session.observations = SimpleNamespace(camera_static=True, configure_camera=configured.append)
+    session.check_startup = lambda: None
+    session.startup_allowed = lambda: True
+    session.home_abort_requested = lambda: False
+    session.warmup_policy = lambda: None
+    session.robot = SimpleNamespace(connect=lambda: None)
+    session.sensors = SimpleNamespace(channels=published_camera,
+        start=lambda process, **kw: started.append(process.name))
+    session.process_context = SimpleNamespace(Process=lambda **kw: SimpleNamespace(**kw))
+    session.run_config, session.output_dir = {}, tmp_path
+    monkeypatch.setattr(deployment, 'initialize_hand', lambda *a, **kw: None)
+    session.start_devices()
+    assert started == ['camera']
+    assert configured == [session.camera_snapshot]
+    assert session.run_config['effective_camera']['camera_serial'] == 'actual-camera'
+    assert (session.camera_snapshot.T_xarm_base_from_color is not None) == extrinsics
+
+
+@pytest.mark.parametrize('commands,selected', [
+    (['b', 's', 'q', 'd'], 'q'), (['q', 'd', 'esc'], 'esc'),
+    (['s', 'd'], 'd'), (['c', 's'], 's'), (['h', 'b'], 'h'),
+])
+def test_teleop_string_commands_preserve_priority_and_discard(commands, selected):
+    from dexmani_real.teleop.loop import TeleopLoop, TeleopPhase
+    loop = TeleopLoop.__new__(TeleopLoop)
+    loop.phase = TeleopPhase.ACTIVE
+    loop.discard_requested = False
+    handled = []
+    def handle(command):
+        handled.append(command)
+        return True
+    loop.handle_operator_command = handle
+    loop.handle_commands(commands)
+    assert handled == [selected]
+    assert loop.discard_requested == ('d' in commands)
