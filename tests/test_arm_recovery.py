@@ -20,6 +20,14 @@ from dexmani_real.robot.xarm7.worker import ArmController
 from dexmani_real.runtime.state import SessionState
 
 
+@pytest.fixture(autouse=True)
+def in_process_sync(monkeypatch):
+    # 本文件的 owner 均为线程或 fake process；同步不跨进程，Pipe 和共享缓冲仍用真实实现。
+    ctx = mp.get_context('spawn')
+    monkeypatch.setattr(ctx, 'Event', threading.Event)
+    monkeypatch.setattr(ctx, 'Lock', threading.Lock)
+
+
 def channels(state):
     return ArmChannels(mp.get_context('spawn'), stop_signal=state.stop_signal,
                        emergency_signal=state.emergency_signal)

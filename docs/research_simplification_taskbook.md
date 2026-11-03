@@ -388,3 +388,28 @@ git diff --check
 - 当前源码副本使用 python3 -B -m build --wheel --no-isolation 在 /tmp 成功构建 wheel，核对四个修改模块与源码内容一致，已删除 joint_replay 未进入包；构建产物和日志在 /tmp/dexmani-chain-build-oqvk1agg。未在仓库生成 pytest/ruff/mypy 缓存。
 
 全部业务验证仍为假设备；真实机器人、checkpoint/GPU 推理、物理跟随和停止延迟未执行。
+
+### resource_tracker 告警定位与修复（2026-11-04）
+
+排查开始时 HEAD 为 `3787987d769df4c5a9522e9efd3b790a92017202`，工作区干净，无后续修复。使用 `/usr/bin/python3`：`3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]`，平台 `Linux-6.17.0-40-generic-x86_64-with-glibc2.39`。依赖沿用 `/tmp/dexmani-test-deps`：pytest 9.2.0、pluggy 1.7.0、NumPy 1.26.4、SciPy 1.17.1、h5py 3.16.0、Zarr 2.18.7、av 19.0.2、Ruckig 0.17.3、PyYAML 6.0.1、Ruff 0.17.3。系统默认启动方式为 fork，但涉事 `SessionState` 和 `ArmChannels` 明确使用 spawn context；arm 测试本身只运行线程或 fake process。
+
+修复前三个变更测试文件单独运行为 123 项通过、无告警；完整套件复现 188 项通过、64 条重入清理告警。同环境、同完整测试命令对 `git archive` 导出的 `2b1e846bbf59c786c0fbe23b053732880909eade` 完整副本（包含 scripts/URDF）验证为 150 项通过、无告警。收集完整套件后仅执行 arm 测试也产生 64 条告警，而单独执行 arm 文件无告警，说明触发依赖分配/GC 时机，不要求执行后续业务测试。上述完整运行均无退出阶段 stderr；告警是 `ResourceTracker called reentrantly ... might leak`，不是 `leaked semaphore objects ... at shutdown` 泄漏报告，也没有测试失败。
+
+具体调用链为 `SessionState → spawn.Event`，以及 `ArmProcess → ArmChannels → spawn.Event/Lock`，每个 arm 用例共创建 32 个命名信号量。`test_cancel_during_recovery_is_not_cleared` 的 mailbox-clear 替身保存 `clear_goal` 绑定方法，形成 `ArmChannels → clear_and_cancel 闭包 → 绑定方法 → ArmChannels` 循环，并持有 SessionState。临时诊断确认该对象在用例返回后仍存活，GC 后可回收；重复该分支 40 次产生 320 条告警。捕获的栈显示，新信号量注册期间 tracker 持锁，GC 触发旧 SemLock 的 finalizer 注销，再次进入 tracker。纯标准库循环引用 Event 也能复现，与 [CPython #109593](https://github.com/python/cpython/issues/109593) 和 [#131788](https://github.com/python/cpython/issues/131788) 的运行时重入问题吻合。此前清理 join 闭包不能消除这一独立触发路径。
+
+本次仅在 `tests/test_arm_recovery.py` 增加每例自动恢复的 fixture，将 spawn context 的 Event/Lock 工厂替换为 threading.Event/Lock。该文件没有真正启动跨进程 owner，无需这些命名信号量；真实 Pipe、共享缓冲、线程等待、pending 句柄和故障断言保持。没有修改生产代码、解释器要求或依赖，没有屏蔽警告、修改 tracker、手动注销资源或加入生产 GC。这是测试资源使用触发运行时限制，未取得生产生命周期泄漏的证据。
+
+实际验证命令：
+
+```bash
+export PYTHONPATH=/tmp/dexmani-test-deps:$PWD
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+/usr/bin/python3 -B -m pytest -p no:cacheprovider -q tests -k test_arm_recovery
+/usr/bin/python3 -B -m pytest -p no:cacheprovider -q tests
+/usr/bin/python3 -B -m ruff check --no-cache --select F tests/test_arm_recovery.py
+git diff --check
+```
+
+落盘后先通过现有 fixture 重跑最小复现 40 次：无告警，80 个 Pipe 端点全部关闭，无命名 SemLock、无活动子进程、仅主线程存活，原 Event/Lock 工厂恢复。随后相关测试 **24 项通过、164 项未选中**（0.89 s），完整离线套件 **188 项通过**（1.38 s），均无告警。通过父进程捕获完整 stdout/stderr 并等待解释器退出，两次 stderr 均为空，运行前后 `/dev/shm/sem.mp-*` 无新增残留；Ruff F 和 diff 空白检查通过。诊断脚本未加入仓库，未生成 pytest/ruff/mypy 缓存。
+
+本次验证未观测到资源残留，不将其扩大为所有运行环境的释放保证；其他 Python 版本和真实设备未验证。原始来源时间、缓存不续期、映射后 TTL、目标租期、SDK 前检查、async 窗口内晚提交、RTC 承诺时序、最近 N 次接纳观测 history，以及 replay 的公共设备服务、正常取消与真实故障传播均未改变，相关离线回归随完整套件通过。
