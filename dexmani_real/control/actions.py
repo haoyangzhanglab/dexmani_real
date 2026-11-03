@@ -59,12 +59,6 @@ class ActionMapper:
             home_hand_qpos=np.deg2rad(hand.home_qpos_deg),
         )
 
-    def joint_rejection(self, target, hand):
-        physical_hand = hand if hand is not None else self.home_hand_qpos
-        return self.constraints.rejection(
-            target, collision_hand_qpos=physical_hand
-        )
-
     def prepare_hand(self, hand):
         if self.hand_enabled:
             if hand is None:
@@ -90,7 +84,10 @@ class ActionMapper:
             joint_lower_rad=self.constraints.limits[:, 0],
             joint_upper_rad=self.constraints.limits[:, 1],
         )
-        return ActionResult(target, hand, self.joint_rejection(target, hand))
+        self.constraints.collision_model.set_hand_qpos(
+            hand if hand is not None else self.home_hand_qpos
+        )
+        return ActionResult(target, hand, self.constraints.endpoint_rejection(target))
 
     def map_eef(self, pose: Pose, hand, current_arm_qpos, previous_arm_command_qpos=None):
         current = np.asarray(current_arm_qpos, dtype=np.float64)

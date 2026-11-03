@@ -54,7 +54,7 @@
 **ARM 操作回滚。** `request_operation()` 捕获原错后仍会停止、消费本请求回复、等待停止。其中二次 `KeyboardInterrupt` 目前可能只进入错误列表；原 `OSError` 继续抛出，但急停没有锁存。
 
 1. 父进程的 `ArmProcess` 在构造时接收并保存现有 `runtime_state`，从它取得三个共享信号；相应删除构造参数的三份传递和 `close(runtime_state)` 的重复注入，统一为 `close()`。唯一生产构造处和测试一起更新，不保留双签名。
-2. 子进程仍只接收现有配置、IPC 通道和 Pipe，不传整个 `SessionState`，不改变锁与进程所有权。
+2. 子进程接收配置、IPC 通道、Pipe，以及父层捕获的启动身份和绝对期限；不传整个 `SessionState`，不改变锁与进程所有权。
 3. 在原错及回滚实际捕获 `KeyboardInterrupt` 的边界立即调用 `request_emergency_stop()`，随后继续应做的回复回收、停止确认和关闭；原来的运行主错保留。
 4. 原来仅为 `OperationCancelled`、但收尾实际失败时，仍升级为收尾故障；未确认停止或回复消费时仍禁止复用 owner。不要为“统一首错”把故障降为普通取消。
 

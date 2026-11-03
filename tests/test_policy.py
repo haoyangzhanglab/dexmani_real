@@ -71,7 +71,7 @@ def make_rollout(tmp_path, mode="sync", n_obs_steps=1):
     )
     mapper = ActionMapper(
         SimpleNamespace(limits=np.tile([-np.pi, np.pi], (7, 1)),
-                        rejection=lambda *args, **kwargs: None),
+                        collision_model=Mock(), endpoint_rejection=lambda *args: None),
         hand_enabled=True, hand_lower_rad=np.zeros(12), hand_upper_rad=np.ones(12),
         home_hand_qpos=np.zeros(12),
     )
@@ -545,7 +545,6 @@ def test_rollout_keeps_primary_and_reports_model_and_writer_failures(tmp_path):
     def finish(**kwargs):
         events.append("writer")
         raise writer_failure
-    episode.preparation_valid = lambda: True
     episode.prepare = prepare
     episode.model.discard_pending = retire
     episode.recorder = SimpleNamespace(start_attempted=True, finish=finish,
@@ -585,7 +584,6 @@ def test_recording_audio_follows_frozen_finish_result(tmp_path, save, published,
 def test_local_submission_rejection_is_not_policy_failure(tmp_path, monkeypatch):
     episode, _ = make_rollout(tmp_path)
     monkeypatch.setattr(time, "monotonic_ns", lambda: episode.started_ns)
-    episode.preparation_valid = lambda: True
     episode.prepare = lambda poll: None
     episode.query = Prediction(0, None, np.zeros((6, 19)))
     def reject(*args, **kwargs):
@@ -604,7 +602,6 @@ def test_persistent_recorder_error_reported_once(tmp_path, caplog):
     primary = RecordingError("queue full")
     primary.__cause__ = OSError("file failed")
     episode.recorder.store_error(primary)
-    episode.preparation_valid = lambda: True
     episode.prepare = lambda poll: episode.recorder.check_error()
     with pytest.raises(RecordingError) as caught:
         episode.run(poll_operator=lambda: None)
@@ -628,7 +625,6 @@ def test_preparation_key_delayed_until_after_finish_stays_revoked(tmp_path):
     def finish(**kwargs):
         key_thread.start()
         assert captured.wait(2)
-    episode.preparation_valid = lambda: True
     episode.prepare = lambda poll: episode.stop("operator", run_end_reason=RunEndReason.OPERATOR)
     episode.recorder = SimpleNamespace(start_attempted=True, finish=finish,
                                        result=lambda: {"status": "not_published"})
@@ -789,7 +785,6 @@ def test_frame_recording_failure_is_reported_only_at_finish(tmp_path, monkeypatc
     episode, _ = make_rollout(tmp_path)
     primary, writer = ValueError('mapping failed'), RecordingError('writer failed')
     monkeypatch.setattr(time, 'monotonic_ns', lambda: episode.started_ns)
-    episode.preparation_valid = lambda: True
     episode.prepare = lambda poll: None
     episode.query = Prediction(0, None, np.zeros((6, 19)))
     episode.map_command = Mock(side_effect=primary)
@@ -846,6 +841,9 @@ def test_policy_disabled_t_does_not_block_start(tmp_path):
 
 def test_policy_raw_uses_result_index(tmp_path, monkeypatch):
     episode, _ = make_rollout(tmp_path)
+    from dexmani_real.runtime.state import SafetyState
+    episode.runtime_state.safety_state = SafetyState.ARMED
+    episode.start_observation = Mock(return_value=object())
     episode.result.index = 2
     episode.policy_info.task_name = 'fixture'
     episode.recorder = Mock()
@@ -855,3 +853,65 @@ def test_policy_raw_uses_result_index(tmp_path, monkeypatch):
     monkeypatch.setattr('dexmani_real.deployment.rollout.snapshot_recording_metadata', lambda *a, **kw: {})
     episode.prepare(lambda: None)
     assert episode.recorder.start.call_args.kwargs['episode_name'] == 'episode_002'
+
+
+@pytest.mark.parametrize('stage', ['device_error', 'device_stop', 'device_emergency', 'writer_error', 'writer_stop', 'writer_emergency', 'observation_stop', 'success'])
+def test_prepare_resource_order_and_cleanup(tmp_path, monkeypatch, stage):
+    from dexmani_real.runtime.state import SafetyState
+    episode, sent = make_rollout(tmp_path)
+    state = episode.runtime_state
+    state.safety_state = SafetyState.ARMED
+    episode.started_ns = 0
+    episode.policy_info.task_name = 'fixture'
+    events = []
+    error = OSError('preparation failure')
+    episode.robot.stop = lambda: events.append('stop')
+    episode.robot.hand = Mock()
+    monkeypatch.setattr('dexmani_real.deployment.rollout.snapshot_recording_metadata', lambda *a, **kw: {})
+    def boundary(name):
+        events.append(name)
+        assert state.safety_state == SafetyState.ARMED and not sent
+        if stage == name + '_error':
+            raise error
+        if stage == name + '_stop':
+            state.request_stop()
+        if stage == name + '_emergency':
+            state.request_emergency_stop()
+    episode.robot.prepare_streaming = lambda run_id: boundary('device')
+    recorder = episode.recorder = Mock(start_attempted=False)
+    def start(**kwargs):
+        recorder.start_attempted = True
+        boundary('writer')
+    recorder.start.side_effect = start
+    recorder.finish.side_effect = lambda **kwargs: events.append('finish')
+    recorder.result.return_value = {}
+    episode.start_observation = lambda: boundary('observation') or object()
+    episode.step = lambda: episode.stop('done')
+    if stage.endswith('error'):
+        with pytest.raises(OSError) as caught:
+            episode.run(poll_operator=lambda: None)
+        assert caught.value is error
+    else:
+        episode.run(poll_operator=lambda: None)
+    assert events[0] == 'device'
+    if stage.startswith('device_'):
+        recorder.start.assert_not_called()
+        recorder.finish.assert_not_called()
+    else:
+        assert events[:2] == ['device', 'writer']
+        assert events.index('stop') < events.index('finish')
+        recorder.finish.assert_called_once()
+    assert bool(episode.started_ns) == (stage == 'success')
+    assert not sent
+
+
+def test_rollout_preparation_entry_polls_once(tmp_path):
+    episode, _ = make_rollout(tmp_path)
+    episode.started_ns = 0
+    episode.runtime_state.request_stop()
+    poll = Mock()
+    episode.robot.prepare_streaming = Mock()
+    result = episode.run(poll_operator=poll)
+    poll.assert_called_once_with()
+    episode.robot.prepare_streaming.assert_not_called()
+    assert result.termination_reason == 'start_cancelled'

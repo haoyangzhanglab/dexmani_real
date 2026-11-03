@@ -8,12 +8,12 @@ import numpy as np
 import pytest
 
 from dexmani_real.config.real import RealConfig
+from dexmani_real.deployment.inference import PolicyWorker
+from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.xarm7.process import ArmProcess
 from dexmani_real.robot.xarm7.protocol import PrepareRequest
-from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.runtime.keyboard import Keyboard, KeyEvent
 from dexmani_real.runtime.state import SessionState
-from dexmani_real.deployment.inference import PolicyWorker
 
 
 @pytest.mark.parametrize('stage', ['stop', 'join', 'restore'])
@@ -82,9 +82,9 @@ def test_worker_own_timeout_is_failure_not_pending():
 
 @pytest.mark.parametrize('reject', [False, True])
 def test_replay_home_revokes_key_captured_before_enqueue(monkeypatch, reject):
-    from dexmani_real.replay.run import wait_for_home
-    from dexmani_real.replay.joint_replay import ReplayResult, ReplayStatus
     from dexmani_real.control.homing import HomePathRejected
+    from dexmani_real.replay.joint_replay import ReplayResult, ReplayStatus
+    from dexmani_real.replay.run import wait_for_home
     state = SessionState()
     state.arm()
     keyboard = Keyboard(get_run_id=lambda: state.run_id)
@@ -171,9 +171,9 @@ def test_audio_pending_replacement_and_popen_close_race(monkeypatch):
 
 @pytest.mark.parametrize('fresh', [True, False])
 def test_home_arm_accepts_existing_fresh_hand_sample(monkeypatch, fresh):
-    from dexmani_real.runtime.home import home_arm
     from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
     from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
+    from dexmani_real.runtime.home import home_arm
     config = RealConfig()
     state = SessionState()
     run_id = state.arm()
@@ -267,8 +267,9 @@ def test_arm_close_interrupt_still_closes_pipes():
 
 def test_home_hand_old_sample_cannot_confirm(monkeypatch):
     from dataclasses import replace
-    from dexmani_real.runtime.home import home_hand
+
     from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
+    from dexmani_real.runtime.home import home_hand
     config = RealConfig()
     state = SessionState()
     run_id = state.arm()
@@ -476,7 +477,7 @@ def test_owner_interrupt_exposes_emergency_even_after_fault(stage, existing):
             # 取消启动，走真实 run 的 stop/disconnect finally。
             driver.connect.side_effect = OperationCancelled('cancel startup')
             driver.close.side_effect = interrupt
-            owner.run()
+            owner.run(state.run_id, time.monotonic_ns() + 30_000_000_000)
             assert arm.io.stopped.is_set() and arm.child_pipe.closed
             assert arm.io.close_error.value
         assert state.estop_request and state.stop_signal.is_set()
@@ -491,7 +492,7 @@ def test_owner_interrupt_exposes_emergency_even_after_fault(stage, existing):
 
 @pytest.mark.parametrize('prior_stop', [False, True])
 def test_shared_emergency_still_revokes_parent_and_cannot_rearm(prior_stop):
-    from dexmani_real.runtime.state import SafetyState, RunEndReason
+    from dexmani_real.runtime.state import RunEndReason, SafetyState
     state = SessionState()
     run_id = state.arm()
     state.stop_signal.clear()
@@ -640,7 +641,7 @@ def test_standstill_outside_home_retains_independent_budget(monkeypatch, stage):
     owner = ArmController(arm.cfg, arm.io, arm.child_pipe, driver)
     try:
         if stage == 'startup':
-            owner.run()
+            owner.run(state.run_id, time.monotonic_ns() + 30_000_000_000)
             assert b'_OperationTimeout' in arm.io.fault.value
             driver.initialize.assert_not_called()
         else:
@@ -691,6 +692,407 @@ def test_arm_startup_wait_interrupt_latches_before_cleanup(monkeypatch):
             arm.connect()
         assert arm.io.closing.is_set()
         assert arm.process is process and not arm.pipe.closed
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+@pytest.mark.parametrize('operation', ['startup', 'home', 'prepare'])
+@pytest.mark.parametrize('ending', ['release', 'stop', 'emergency', 'closing', 'generation', 'eof', 'timeout', 'overlap'])
+def test_lifecycle_lock_contention(monkeypatch, operation, ending):
+    from dexmani_real.robot.xarm7.protocol import HomeRequest
+    from dexmani_real.robot.xarm7.worker import ArmController, _OperationTimeout
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    run_id = state.run_id
+    clock = [1_000_000_000]
+    deadline = clock[0] + 100_000_000
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: clock[0])
+    driver = Mock()
+    driver.read.return_value = (np.array(arm.cfg.home_qpos), np.zeros(7))
+    owner = ArmController(arm.cfg, arm.io, arm.child_pipe, driver)
+    owner.wait_settled = lambda check_abort, **kw: check_abort()
+    ready = arm.io.ready.set
+    def ready_then_exit():
+        ready()
+        arm.io.closing.set()
+    monkeypatch.setattr(arm.io.ready, 'set', ready_then_exit)
+    driver.connect.side_effect = lambda **kw: kw['check_abort']()
+    # 真锁由另一线程持有；受控时钟推进超过一个伺服周期后才释放/撤权。
+    held, release = Event(), Event()
+    lock = state.run_signal.get_lock()
+    def holder():
+        with lock:
+            held.set()
+            assert release.wait(3)
+    thread = Thread(target=holder)
+    thread.start()
+    assert held.wait(2)
+    acquire = lock.acquire
+    calls = []
+    def contended(*args, **kwargs):
+        calls.append(kwargs.get('timeout', 0))
+        if not release.is_set():
+            assert not driver.connect.called and not driver.enter_mode.called
+        clock[0] += 5_000_000
+        if len(calls) == 4:
+            if ending == 'generation':
+                state.run_signal.get_obj().value += 1
+            elif ending in ('stop', 'emergency', 'closing'):
+                getattr(arm.io, ending).set()
+            elif ending == 'eof':
+                arm.pipe.close()
+            elif ending == 'overlap':
+                arm.pipe.send(PrepareRequest(run_id, deadline))
+            if ending in ('release', 'generation'):
+                release.set()
+                thread.join(2)
+        return acquire(*args, **kwargs)
+    monkeypatch.setattr(lock, 'acquire', contended)
+    try:
+        if operation == 'startup':
+            owner.run(run_id, deadline)
+            if ending == 'release':
+                driver.initialize.assert_called_once()
+                driver.read.assert_called_once()
+            else:
+                driver.connect.assert_not_called()
+        else:
+            request = (PrepareRequest(run_id, deadline) if operation == 'prepare' else
+                       HomeRequest(run_id, np.empty((0, 7)), np.array(arm.cfg.home_qpos), deadline))
+            owner.operation(request)
+            if ending != 'eof':
+                reply = arm.pipe.recv()
+                if ending == 'release':
+                    assert reply is None
+                else:
+                    expected = _OperationTimeout if ending == 'timeout' else RuntimeError if ending == 'overlap' else OperationCancelled
+                    assert isinstance(reply, expected)
+        if ending not in ('release',):
+            driver.stop.assert_called_once()
+        if ending not in ('timeout', 'overlap'):
+            assert not arm.io.fault.value
+        if ending == 'timeout':
+            assert clock[0] == deadline
+        assert len(calls) >= 4
+    finally:
+        release.set()
+        thread.join(2)
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+def test_servo_authorization_does_not_wait_on_busy_lock(monkeypatch):
+    from dexmani_real.robot.xarm7.worker import ArmController
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    owner = ArmController(arm.cfg, arm.io, arm.child_pipe, Mock())
+    acquire = Mock(return_value=False)
+    monkeypatch.setattr(state.run_signal.get_lock(), 'acquire', acquire)
+    try:
+        assert owner.authorized(1) is None
+        acquire.assert_called_once_with(timeout=0.0)
+        owner.driver.servo.assert_not_called()
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+@pytest.mark.parametrize('stage', ['startup', 'prepare'])
+@pytest.mark.parametrize('budget_ns', [10_000_000_000, 30_000_000_000])
+def test_standstill_lock_wait_uses_stage_deadline(monkeypatch, stage, budget_ns):
+    from dexmani_real.config.xarm7 import HOME_CONVERGENCE_TIMEOUT_S
+    from dexmani_real.robot.xarm7.worker import ArmController, _OperationTimeout
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    clock = [1_000_000_000]
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: clock[0])
+    owner = ArmController(arm.cfg, arm.io, arm.child_pipe, Mock())
+    expected_deadline = clock[0] + min(budget_ns, int(HOME_CONVERGENCE_TIMEOUT_S * 1e9))
+    def settle(check_abort, *, deadline_ns, **kw):
+        assert deadline_ns == expected_deadline
+        clock[0] = deadline_ns - 1_000_000
+        def busy(**kw):
+            clock[0] += round(kw['timeout'] * 1e9)
+            return False
+        monkeypatch.setattr(state.run_signal.get_lock(), 'acquire', busy)
+        check_abort()
+        pytest.fail('expired stage authorized')
+    owner.wait_settled = settle
+    try:
+        if stage == 'startup':
+            owner.run(state.run_id, clock[0] + budget_ns)
+            owner.driver.initialize.assert_not_called()
+        else:
+            owner.operation(PrepareRequest(state.run_id, clock[0] + budget_ns))
+            assert isinstance(arm.pipe.recv(), _OperationTimeout)
+            assert owner.prepared_run_id == 0
+        assert clock[0] == expected_deadline
+        owner.driver.stop.assert_called_once()
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+@pytest.mark.parametrize('boundary', ['revoked', 'expired'])
+def test_parent_startup_passes_identity_and_deadline(monkeypatch, boundary):
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    clock = [1_000_000_000]
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: clock[0])
+    captured = {}
+    process = Mock()
+    def create(**kwargs):
+        captured.update(kwargs)
+        return process
+    def start():
+        assert captured['args'][3] == 1
+        if boundary == 'revoked':
+            state.request_stop()
+        else:
+            clock[0] = captured['args'][4]
+        arm.io.ready.set()
+    process.start.side_effect = start
+    monkeypatch.setattr(arm.ctx, 'Process', create)
+    try:
+        with pytest.raises(OperationCancelled if boundary == 'revoked' else TimeoutError):
+            arm.connect()
+        assert arm.io.closing.is_set()
+        assert arm.process is process
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+@pytest.mark.parametrize('case', ['ready', 'cancel', 'fault', 'timeout', 'stale'])
+def test_initial_feedback_callback_boundaries(monkeypatch, case):
+    from dexmani_real.robot.commands import RobotError
+    from dexmani_real.robot.system import Robot
+    from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
+    cfg = RealConfig()
+    robot = Robot(cfg.arm, cfg.hand, runtime_state=SessionState())
+    clock = [1_000_000_000]
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: clock[0])
+    robot.check = Mock(side_effect=AssertionError('duplicate internal check'))
+    frame = np.zeros(1, dtype=ARM_STATE_DTYPE)
+    frame['timestamp_ns'] = clock[0]
+    events = []
+    error = OSError('real feedback fault')
+    def cancel():
+        events.append('check')
+        if len(events) > 1 and case == 'fault':
+            raise error
+        return len(events) > 1 and case == 'cancel'
+    def read():
+        events.append('read')
+        if case == 'timeout':
+            clock[0] += 100_000_000_000
+        if case == 'stale':
+            frame['timestamp_ns'] = 0
+        return SimpleNamespace(arm=frame, hand=None)
+    robot.read_state = read
+    robot.service_feedback = Mock(side_effect=error)
+    if case == 'ready':
+        assert robot._read_initial_state(cancel_requested=cancel).arm is frame
+    else:
+        expected = OperationCancelled if case == 'cancel' else RobotError if case == 'timeout' else OSError
+        with pytest.raises(expected) as caught:
+            robot._read_initial_state(cancel_requested=cancel)
+        if case in ('fault', 'stale'):
+            assert caught.value is error
+    assert events[:3] == ['check', 'read', 'check']
+    robot.check.assert_not_called()
+
+
+@pytest.mark.parametrize('cancel', ['none', 'stop', 'emergency'])
+def test_tactile_reset_accepts_own_stop_but_observes_operator(cancel):
+    from dexmani_real.robot.system import Robot
+    cfg = RealConfig()
+    state = SessionState()
+    run_id = state.arm()
+    robot = Robot(cfg.arm, cfg.hand, runtime_state=state)
+    robot.hand = Mock()
+    def reset(*, cancel_requested):
+        assert state.stop_signal.is_set()
+        assert not cancel_requested()
+        if cancel == 'stop':
+            state.request_stop()
+        elif cancel == 'emergency':
+            state.request_emergency_stop()
+    robot.hand.reset_tactile_sensors.side_effect = reset
+    def initial(**kwargs):
+        if kwargs['cancel_requested']():
+            raise OperationCancelled('reset cancelled')
+    robot._read_initial_state = Mock(side_effect=initial)
+    if cancel == 'none':
+        robot.reset_tactile_sensors(run_id=run_id, cancel_requested=lambda: False)
+        robot._read_initial_state.assert_called_once()
+    else:
+        with pytest.raises(OperationCancelled):
+            robot.reset_tactile_sensors(run_id=run_id, cancel_requested=lambda: False)
+
+
+@pytest.mark.parametrize('stage', ['startup', 'prepare'])
+def test_sdk_timeout_remains_permanent_device_fault(stage):
+    from dexmani_real.robot.xarm7.worker import ArmController
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    driver = Mock()
+    error = TimeoutError('SDK timeout')
+    driver.connect.side_effect = error
+    driver.enter_mode.side_effect = error
+    owner = ArmController(arm.cfg, arm.io, arm.child_pipe, driver)
+    try:
+        if stage == 'startup':
+            owner.run(state.run_id, time.monotonic_ns() + 10**9)
+        else:
+            owner.operation(PrepareRequest(state.run_id, time.monotonic_ns() + 10**9))
+            assert type(arm.pipe.recv()) is TimeoutError
+        assert b'TimeoutError: SDK timeout' in arm.io.fault.value
+        driver.stop.assert_called_once()
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+def test_owner_rejects_startup_identity_captured_before_revocation():
+    from dexmani_real.robot.xarm7.worker import ArmController
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    expected = state.run_id
+    state.run_signal.value += 1
+    owner = ArmController(arm.cfg, arm.io, arm.child_pipe, Mock())
+    try:
+        owner.run(expected, time.monotonic_ns() + 10**9)
+        owner.driver.connect.assert_not_called()
+        owner.driver.stop.assert_called_once()
+        owner.driver.close.assert_called_once()
+        assert not arm.io.fault.value
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+@pytest.mark.parametrize('reason', [None, 'collision', 'final_eef_workspace'])
+@pytest.mark.parametrize('hand_enabled', [False, True])
+def test_projected_joint_still_checks_endpoint(reason, hand_enabled):
+    from dexmani_real.control.actions import ActionMapper
+    from dexmani_real.control.constraints import MotionConstraints
+    constraints = MotionConstraints.__new__(MotionConstraints)
+    constraints.limits = np.tile([-1., 1.], (7, 1))
+    constraints.collision_model = Mock()
+    constraints.collision_model.rejection.return_value = 'collision' if reason == 'collision' else None
+    constraints.collision_model.eef_position.return_value = np.full(3, 2. if reason == 'final_eef_workspace' else 0.)
+    constraints.workspace_with_margin = np.tile([-1., 1.], (3, 1))
+    mapper = ActionMapper(constraints, hand_enabled=hand_enabled, hand_lower_rad=np.zeros(12),
+                          hand_upper_rad=np.ones(12), home_hand_qpos=np.full(12, .2))
+    hand = np.full(12, .4) if hand_enabled else None
+    result = mapper.map_joint(np.full(7, 2.), hand, np.zeros(7))
+    assert result.rejection_reason == reason
+    assert np.all(result.arm_qpos <= 1) and np.all(result.arm_qpos >= -1)
+    np.testing.assert_array_equal(constraints.collision_model.set_hand_qpos.call_args.args[0],
+                                  hand if hand_enabled else mapper.home_hand_qpos)
+    assert constraints.rejection(np.full(7, 2.), collision_hand_qpos=np.zeros(12)) == 'operational_limits'
+
+
+@pytest.mark.parametrize('message', ['eof', 'overlap'])
+def test_lifecycle_observes_pipe_arrival_while_acquiring_lock(monkeypatch, message):
+    from dexmani_real.robot.xarm7.worker import ArmController
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    owner = ArmController(arm.cfg, arm.io, arm.child_pipe, Mock())
+    request = PrepareRequest(state.run_id, time.monotonic_ns() + 10**9)
+    lock = state.run_signal.get_lock()
+    acquire = lock.acquire
+    def arrive(**kwargs):
+        if message == 'eof':
+            arm.pipe.close()
+        else:
+            arm.pipe.send(request)
+        return acquire(**kwargs)
+    monkeypatch.setattr(lock, 'acquire', arrive)
+    try:
+        owner.operation(request)
+        owner.driver.enter_mode.assert_not_called()
+        owner.driver.stop.assert_called_once()
+        if message == 'eof':
+            assert arm.io.closing.is_set() and not arm.io.fault.value
+        else:
+            assert isinstance(arm.pipe.recv(), RuntimeError)
+            assert b'overlapping' in arm.io.fault.value
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+@pytest.mark.parametrize('ending', ['release', 'generation', 'stop', 'emergency', 'closing', 'timeout', 'fault'])
+def test_parent_ready_generation_wait_is_cancellable(monkeypatch, ending):
+    from dexmani_real.robot.commands import RobotError
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    process = Mock()
+    monkeypatch.setattr(arm.ctx, 'Process', lambda **kwargs: process)
+    clock = [1_000_000_000]
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: clock[0])
+    lock = state.run_signal.get_lock()
+    acquired, release = Event(), Event()
+    def hold():
+        with lock:
+            acquired.set()
+            assert release.wait(3)
+            if ending == 'generation':
+                state.run_signal.get_obj().value += 1
+    thread = Thread(target=hold)
+    def start():
+        thread.start()
+        assert acquired.wait(2)
+        arm.io.ready.set()
+    process.start.side_effect = start
+    waits = []
+    def wait(delay):
+        waits.append(delay)
+        assert 0 < delay <= .005
+        if ending in ('release', 'generation'):
+            release.set()
+            thread.join(2)
+        elif ending == 'timeout':
+            clock[0] += 30_000_000_000
+        elif ending == 'fault':
+            arm.io.fault.value = b'OSError: startup SDK failure'
+            arm.io.stop.set()
+        else:
+            getattr(arm.io, ending).set()
+    monkeypatch.setattr(arm.io.stop, 'wait', wait)
+    try:
+        if ending == 'release':
+            arm.connect()
+            assert not arm.io.closing.is_set()
+        else:
+            expected = TimeoutError if ending == 'timeout' else RobotError if ending == 'fault' else OperationCancelled
+            with pytest.raises(expected):
+                arm.connect()
+            assert arm.io.closing.is_set() and arm.io.stop.is_set()
+        assert len(waits) == 1
+        assert arm.process is process
+    finally:
+        release.set()
+        thread.join(2)
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+def test_process_start_interrupt_preserves_handle_and_signals(monkeypatch):
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    process = Mock()
+    process.start.side_effect = KeyboardInterrupt()
+    monkeypatch.setattr(arm.ctx, 'Process', lambda **kwargs: process)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            arm.connect()
+        assert state.estop_request and arm.io.stop.is_set() and arm.io.closing.is_set()
+        assert arm.process is process
+        assert not arm.pipe.closed and not arm.child_pipe.closed
     finally:
         arm.pipe.close()
         arm.child_pipe.close()

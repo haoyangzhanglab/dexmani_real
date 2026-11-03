@@ -70,36 +70,51 @@ class ArmProcess:
             raise RuntimeError("arm process is single-use")
 
         run_id = self.io.run_id.value
+        startup_deadline_ns = time.monotonic_ns() + int(
+            (HOME_CONVERGENCE_TIMEOUT_S + EXECUTOR_TIMEOUT_S) * 1e9
+        )
 
         def check_startup():
-            # 故障也会设置 stop；仅无故障的退出可以按操作者取消处理。
-            self.check_error()
-            if (
-                self.io.run_id.value != run_id
-                or self.io.stop.is_set()
-                or self.io.emergency.is_set()
-            ):
-                raise OperationCancelled("arm startup cancelled")
-            if check_services is not None and not check_services():
-                raise RobotError("runtime service unavailable during arm startup")
+            lock = self.io.run_id.get_lock()
+            while True:
+                # 故障也会设置 stop；真实故障先于取消报告。
+                self.check_error()
+                if check_services is not None and not check_services():
+                    raise RobotError("runtime service unavailable during arm startup")
+                acquired = lock.acquire(False)
+                if acquired:
+                    try:
+                        current_run_id = self.io.run_id.get_obj().value
+                    finally:
+                        lock.release()
+                if (
+                    self.io.stop.is_set()
+                    or self.io.emergency.is_set()
+                    or self.io.closing.is_set()
+                    or (acquired and current_run_id != run_id)
+                ):
+                    raise OperationCancelled("arm startup cancelled")
+                remaining_ns = startup_deadline_ns - time.monotonic_ns()
+                if remaining_ns <= 0:
+                    raise TimeoutError("arm initialization unresolved; owner process may still be in SDK")
+                if acquired:
+                    return
+                self.io.stop.wait(min(0.005, remaining_ns / 1e9))
 
         check_startup()
         self.process = self.ctx.Process(
             target=run_arm,
-            args=(self.cfg, self.io, self.child_pipe),
+            args=(self.cfg, self.io, self.child_pipe, run_id, startup_deadline_ns),
             name="xarm-owner",
             daemon=False,
         )
-        self.process.start()
-        self.child_pipe.close()
-        deadline = time.monotonic() + (HOME_CONVERGENCE_TIMEOUT_S + EXECUTOR_TIMEOUT_S)
         try:
-            while not self.io.ready.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
+            self.process.start()
+            self.child_pipe.close()
+            while not self.io.ready.wait(timeout=min(
+                0.05, max(0, startup_deadline_ns - time.monotonic_ns()) / 1e9,
+            )):
                 check_startup()
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        "arm initialization unresolved; owner process may still be in SDK"
-                    )
             check_startup()
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):

@@ -156,7 +156,7 @@ def test_training_admits_only_complete_episode(tmp_path, capture, case, reason, 
         if row_index is not None:
             assert f"row {row_index}" in str(caught.value)
         assert not output.exists()
-        assert not list(tmp_path.glob(".canonical.zarr.tmp-*"))
+        assert bool(list(tmp_path.glob(".canonical.zarr.tmp-*"))) == (case in {"nan", "inf"})
     else:
         result = export_zarr(path, output, processing=processing)
         root = zarr.open_group(str(output), mode="r")
@@ -261,7 +261,6 @@ def test_rollout_writer_finishes_independently_of_model(
         discard_pending(0)  # 离线测试不实际等待完整的模型超时。
 
     monkeypatch.setattr(worker, "discard_pending", retire)
-    episode.preparation_valid = lambda: True
     episode.prepare = prepare
     session, _ = make_session(tmp_path)
     session.runtime_state = state
@@ -370,7 +369,6 @@ def test_interrupted_writer_wait_stays_pending_without_restarting_finish(tmp_pat
         assert entered.wait(2)
         episode, _ = make_rollout(tmp_path)
         episode.recorder = recorder
-        episode.preparation_valid = lambda: True
         episode.prepare = lambda poll: episode.stop("operator", run_end_reason=RunEndReason.OPERATOR)
         with pytest.raises(KeyboardInterrupt) as caught:
             episode.run(poll_operator=lambda: None)
@@ -407,8 +405,9 @@ def test_interrupted_writer_wait_stays_pending_without_restarting_finish(tmp_pat
     (59_375_000, 3, True), (59_374_999, 3, False), (62_500_000, 1, True),
 ])
 def test_export_mean_period_boundary(tmp_path, capture, period, frames, accepted, monkeypatch, caplog):
-    from dexmani_real.data.export import validate_export_episode
     from queue import Queue
+
+    from dexmani_real.data.export import validate_export_episode
     # 批量构造磁盘 fixture，不以生产速度提交合成帧。
     monkeypatch.setattr(recorder_module, 'Queue', lambda **kw: Queue(maxsize=frames + 1))
     _, path = record(tmp_path / 'raw', capture, frames=frames)
@@ -475,6 +474,7 @@ def test_single_125ms_gap_at_16hz_rejects_episode(tmp_path, capture):
 @pytest.mark.parametrize('key', ['s', 'c', 'd', 'q', 'esc'])
 def test_teleop_blocking_stop_preserves_recorder_boundary(tmp_path, capture, monkeypatch, stage, key):
     from test_interaction import make_loop
+
     from dexmani_real.robot.commands import OperationCancelled
     from dexmani_real.teleop.loop import TeleopPhase
     loop = make_loop()
@@ -534,3 +534,115 @@ def test_sampling_clock_returns_integer_period():
     from dexmani_real.utils.timing import sampling_clock_ns
     assert type(sampling_clock_ns(16)) is int
     assert sampling_clock_ns(16) == 62_500_000
+
+
+@pytest.mark.parametrize('field', ['arm_qpos', 'hand_qpos', 'action_arm_joint_target', 'action_hand_joint_target', 'hand_contact', 'hand_tactile_force'])
+@pytest.mark.parametrize('bad_row', [0, 4])
+def test_numeric_blocks_read_once_and_never_publish_bad_episode(tmp_path, capture, monkeypatch, field, bad_row):
+    from dexmani_real.data import export as module
+    from dexmani_real.data.raw import ROBOT_DATASET_SPECS
+    _, path = record(tmp_path / 'raw', capture, frames=5)
+    with h5py.File(path / 'data.h5', 'r+') as data:
+        data[field][bad_row] = np.inf if bad_row else np.nan
+    monkeypatch.setattr(module, 'MAX_BATCH_FRAMES', 2)
+    reads = {name: [] for name in ROBOT_DATASET_SPECS}
+    original = h5py.Dataset.__getitem__
+    def read(dataset, key, *args, **kwargs):
+        name = dataset.name.lstrip('/')
+        if name in reads:
+            reads[name].append(key)
+        return original(dataset, key, *args, **kwargs)
+    monkeypatch.setattr(h5py.Dataset, '__getitem__', read)
+    with RawReader(path) as reader:
+        module.validate_export_episode(reader)
+    assert all(not count for count in reads.values())
+    output = tmp_path / 'canonical.zarr'
+    with pytest.raises(ValueError, match=f'nonfinite:{field} at row {bad_row}') as caught:
+        export_zarr(path, output, processing=ExportConfig(pointcloud=PointCloudConfig(
+            remove_table=False, num_points=32, workspace=(-1., -1., 0., 1., 1., 1.),
+        )))
+    assert str(path) in str(caught.value)
+    expected = [slice(start, min(start + 2, 5)) for start in range(0, bad_row + 1, 2)]
+    assert all(count == expected for count in reads.values())
+    assert not output.exists()
+    assert len(list(tmp_path.glob('.canonical.zarr.tmp-*'))) == 1
+
+
+@pytest.mark.parametrize('failure', ['overflow', 'later_episode', 'derived'])
+def test_late_conversion_failure_keeps_batch_unpublished(tmp_path, capture, monkeypatch, failure):
+    from dexmani_real.data import export as module
+    _, first = record(tmp_path / 'raw', capture)
+    _, second = record(tmp_path / 'raw', capture)
+    with h5py.File(second / 'data.h5', 'r+') as data:
+        if failure == 'later_episode':
+            data['hand_contact'][2] = np.nan
+        elif failure == 'overflow':
+            data['action_hand_joint_target'][2] = 1e300
+    if failure == 'derived':
+        geometry = module.hand_geometry
+        def invalid(*args, **kwargs):
+            result = geometry(*args, **kwargs)
+            result['fingertip_xyz'][-1] = np.nan
+            return result
+        monkeypatch.setattr(module, 'hand_geometry', invalid)
+    output = tmp_path / 'canonical.zarr'
+    with np.errstate(over='ignore'), pytest.raises(ValueError, match='nonfinite'):
+        export_zarr(first.parent, output, processing=ExportConfig(pointcloud=PointCloudConfig(
+            remove_table=False, num_points=32, workspace=(-1., -1., 0., 1., 1., 1.),
+        )))
+    assert not output.exists()
+    assert len(list(tmp_path.glob('.canonical.zarr.tmp-*'))) == 1
+
+
+@pytest.mark.parametrize('field', ['arm_qpos', 'hand_tactile_force'])
+@pytest.mark.parametrize('invalid', ['shape', 'dtype'])
+def test_numeric_structure_rejected_before_staging(tmp_path, capture, field, invalid):
+    _, path = record(tmp_path / 'raw', capture)
+    with h5py.File(path / 'data.h5', 'r+') as data:
+        values = data[field][:]
+        del data[field]
+        data[field] = values[:-1] if invalid == 'shape' else values.astype(np.int64)
+    output = tmp_path / 'canonical.zarr'
+    with pytest.raises(ValueError, match=f'{field}: incompatible shape/dtype'):
+        export_zarr(path, output, processing=ExportConfig())
+    assert not output.exists()
+    assert not list(tmp_path.glob('.canonical.zarr.tmp-*'))
+
+
+def test_rollout_reclaims_partially_opened_writer(tmp_path, capture, monkeypatch):
+    from test_policy import make_rollout
+
+    from dexmani_real.runtime.state import SafetyState
+
+    episode, _ = make_rollout(tmp_path)
+    episode.runtime_state.safety_state = SafetyState.ARMED
+    episode.started_ns = 0
+    episode.policy_info.task_name = 'fixture'
+    episode.robot.hand = Mock()
+    episode.robot.prepare_streaming = Mock()
+    episode.robot.stop = Mock()
+    episode.start_observation = Mock()
+    recorder = episode.recorder = EpisodeRecorder(tmp_path, control_hz=10)
+    metadata, _, _ = capture
+    monkeypatch.setattr('dexmani_real.deployment.rollout.snapshot_recording_metadata',
+                        lambda *args, **kwargs: metadata)
+    primary = OSError('failure after opening Raw files')
+    open_writer = RawWriter.open
+    def fail_after_open(writer, metadata):
+        open_writer(writer, metadata)
+        raise primary
+    monkeypatch.setattr(RawWriter, 'open', fail_after_open)
+    finish = recorder.finish
+    def finish_after_stop(**kwargs):
+        episode.robot.stop.assert_called_once()
+        return finish(**kwargs)
+    monkeypatch.setattr(recorder, 'finish', finish_after_stop)
+    with pytest.raises(RecordingError) as caught:
+        episode.run(poll_operator=lambda: None)
+    assert caught.value.__cause__ is primary
+    assert recorder.start_attempted and not recorder.writer_pending
+    assert not recorder.writer.data_file.id.valid
+    assert recorder.writer.video.container is None
+    assert episode.result.raw['status'] == 'failed'
+    assert recorder.staging_path.is_dir() and recorder.published_path is None
+    episode.start_observation.assert_not_called()

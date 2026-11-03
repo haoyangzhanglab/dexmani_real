@@ -51,6 +51,26 @@ class ArmController:
         finally:
             lock.release()
 
+    def check_lifecycle(self, run_id, *, deadline_ns, stage):
+        """短轮询仅限制取消观察间隔；授权等待共用阶段的绝对期限。"""
+        while True:
+            remaining = max(0, deadline_ns - time.monotonic_ns()) / 1e9
+            authorization = self.authorized(run_id, timeout_s=min(0.005, remaining))
+            # 等锁期间父进程可能关闭或提交重叠请求，必须在设备操作前观察。
+            if self.pipe.poll():
+                try:
+                    self.pipe.recv()
+                except EOFError as exc:
+                    self.io.closing.set()
+                    raise OperationCancelled("parent pipe closed") from exc
+                raise RuntimeError("overlapping arm lifecycle requests")
+            if authorization is False:
+                raise OperationCancelled(f"{stage} authority revoked")
+            if time.monotonic_ns() >= deadline_ns:
+                raise _OperationTimeout(f"{stage} execution deadline expired")
+            if authorization:
+                return
+
     def fault(self, reason):
         if isinstance(reason, KeyboardInterrupt):
             self.io.emergency.set()
@@ -146,7 +166,7 @@ class ArmController:
         stamp = int(self.status["timestamp_ns"])
         if not sample_is_fresh(stamp, self.cfg.feedback_max_age_s, now):
             raise _OperationTimeout("HOME start feedback unavailable/stale")
-        current = self.status["qpos"].copy()
+        current = self.status["qpos"]
         velocity = self.status["qvel"]
         if len(waypoints) == 0:
             if (
@@ -168,8 +188,7 @@ class ArmController:
                     target=target,
                     tolerance_rad=min(self.cfg.homing.convergence_rad, np.deg2rad(0.5)),
                 )
-                current = self.status["qpos"].copy()
-            if np.max(np.abs(current - final_qpos)) > self.cfg.homing.convergence_rad:
+            if np.max(np.abs(self.status["qpos"] - final_qpos)) > self.cfg.homing.convergence_rad:
                 raise RuntimeError("home final target error")
         else:
             self.wait_settled(
@@ -207,22 +226,7 @@ class ArmController:
             run_id = message.run_id
 
             def check_abort():
-                if self.pipe.poll():
-                    # 单请求期间 Pipe 只可能关闭；EOF 必须在下一 waypoint 前观察到。
-                    try:
-                        self.pipe.recv()
-                    except EOFError as exc:
-                        self.io.closing.set()
-                        raise OperationCancelled("parent pipe closed") from exc
-                    raise RuntimeError("overlapping arm lifecycle requests")
-                # 生命周期等待一次短锁竞争；伺服 tick 仍使用非阻塞检查。
-                authorization = self.authorized(run_id, timeout_s=1 / self.cfg.servo_hz)
-                if authorization is None:
-                    raise _OperationTimeout(f"{kind} generation lock unavailable")
-                if not authorization:
-                    raise OperationCancelled(f"{kind} authority revoked")
-                if time.monotonic_ns() >= message.deadline_ns:
-                    raise _OperationTimeout(f"{kind} execution deadline expired")
+                self.check_lifecycle(run_id, deadline_ns=message.deadline_ns, stage=kind)
 
             check_abort()
             # request_operation 已等待本 owner 的停止确认，目标和伺服参考已清除。
@@ -237,12 +241,15 @@ class ArmController:
                 )
             else:
                 self.driver.enter_mode(1, check_abort=check_abort)
+                settled_deadline_ns = min(
+                    message.deadline_ns,
+                    time.monotonic_ns() + int(HOME_CONVERGENCE_TIMEOUT_S * 1e9),
+                )
                 self.wait_settled(
-                    check_abort, stage="arm standstill",
-                    deadline_ns=min(
-                        message.deadline_ns,
-                        time.monotonic_ns() + int(HOME_CONVERGENCE_TIMEOUT_S * 1e9),
+                    lambda: self.check_lifecycle(
+                        run_id, deadline_ns=settled_deadline_ns, stage="prepare standstill",
                     ),
+                    stage="arm standstill", deadline_ns=settled_deadline_ns,
                 )
                 check_abort()
                 self.prepared_run_id = run_id
@@ -306,33 +313,27 @@ class ArmController:
         self.reference.commit()
         return started
 
-    def run(self):
+    def run(self, run_id, startup_deadline_ns):
         try:
-            lock = self.io.run_id.get_lock()
-            if not lock.acquire(timeout=1 / self.cfg.servo_hz):
-                if self.io.stop.is_set() or self.io.emergency.is_set() or self.io.closing.is_set():
-                    raise OperationCancelled("arm startup cancelled")
-                raise _OperationTimeout("startup generation lock unavailable")
-            try:
-                run_id = self.io.run_id.get_obj().value
-            finally:
-                lock.release()
-
             def startup_abort():
-                authorization = self.authorized(run_id, timeout_s=1 / self.cfg.servo_hz)
-                if authorization is None:
-                    raise _OperationTimeout("startup generation lock unavailable")
-                if not authorization:
-                    raise OperationCancelled("arm startup authority revoked")
+                self.check_lifecycle(run_id, deadline_ns=startup_deadline_ns, stage="startup")
 
+            startup_abort()
             self.driver.connect(check_abort=startup_abort)
             self.io.connected.set()
+            settled_deadline_ns = min(
+                startup_deadline_ns,
+                time.monotonic_ns() + int(HOME_CONVERGENCE_TIMEOUT_S * 1e9),
+            )
             self.wait_settled(
-                startup_abort, stage="arm standstill",
-                deadline_ns=time.monotonic_ns() + int(HOME_CONVERGENCE_TIMEOUT_S * 1e9),
+                lambda: self.check_lifecycle(
+                    run_id, deadline_ns=settled_deadline_ns, stage="startup standstill",
+                ),
+                stage="arm standstill", deadline_ns=settled_deadline_ns,
             )
             self.driver.initialize(check_abort=startup_abort)
             self.read_feedback()
+            startup_abort()
             self.io.ready.set()
             period = round(1e9 / self.cfg.servo_hz)
             feedback_period = sampling_clock_ns(self.cfg.feedback_hz)
@@ -390,8 +391,8 @@ class ArmController:
             self.pipe.close()
 
 
-def run_arm(cfg, io, pipe):
+def run_arm(cfg, io, pipe, run_id, startup_deadline_ns):
     configure_logging()
     from dexmani_real.robot.xarm7.driver import XArm7
 
-    ArmController(cfg, io, pipe, XArm7(cfg)).run()
+    ArmController(cfg, io, pipe, XArm7(cfg)).run(run_id, startup_deadline_ns)

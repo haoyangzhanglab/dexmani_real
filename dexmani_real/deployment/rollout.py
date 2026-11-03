@@ -180,11 +180,7 @@ class Rollout:
         """一段控制及其收尾顺序完成；返回后不再依赖外层 tick 回收任务。"""
         try:
             try:
-                poll_operator()
-                if self.preparation_valid():
-                    self.prepare(poll_operator)
-                else:
-                    self.stop("cancelled before preparation")
+                self.prepare(poll_operator)
                 while not self.finished:
                     poll_operator()
                     self.robot.service_feedback()
@@ -270,6 +266,15 @@ class Rollout:
 
     def prepare(self, poll_operator):
         logger.info("Policy preparing run=%s", self.run_id)
+        poll_operator()
+        if not self.preparation_valid():
+            self.stop("cancelled before preparation")
+            return
+        self.robot.prepare_streaming(self.run_id)
+        poll_operator()
+        if not self.preparation_valid():
+            self.stop("cancelled during streaming preparation")
+            return
         if self.recorder is not None:
             metadata = snapshot_recording_metadata(
                 self.camera_snapshot,
@@ -280,16 +285,11 @@ class Rollout:
                 task_label=self.policy_info.task_name,
                 episode_name=f"episode_{self.result.index:03d}", collection_source="policy_rollout", metadata=metadata,
             )
-        # writer 与模式恢复之后只读一次有效快照，不要求来源晚于 prepare。
         poll_operator()
         if not self.preparation_valid():
             self.stop("cancelled during recorder start")
             return
-        self.robot.prepare_streaming(self.run_id)
-        poll_operator()
-        if not self.preparation_valid():
-            self.stop("cancelled during streaming preparation")
-            return
+        # 设备准备和 writer 启动后重新取得最终快照。
         if self.start_observation() is None:
             self.stop(self.preparation_issue)
             return

@@ -20,7 +20,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Export complete, technically normal teleop Raw episodes to a canonical multimodal Zarr. "
             "Other Raw collection sources are currently unsupported. "
-            "Reject the whole episode on any invalid row; use --exclude and retry."
+            "Validate structure and timing first, numeric values during chunk conversion. "
+            "Reject the whole export on any invalid row and publish only after all episodes succeed; "
+            "use --exclude and retry."
         )
     )
     parser.add_argument(

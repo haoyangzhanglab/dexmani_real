@@ -72,7 +72,7 @@ def canonical_array_specs(
 
 
 def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
-    """验证整段元数据、结构与数值；RGB 计数和解码在流式转换时确认。"""
+    """前置验证元数据、结构和时间；数值及 RGB 在流式转换时验证。"""
     validate_task_label(reader.meta["task_label"])
     if reader.meta["collection_source"] != "teleop":
         raise ValueError(
@@ -134,12 +134,9 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     for name in ("tactile_aggregate_ns", "tactile_dense_ns"):
         reject_invalid(observation - rows[name] >= tactile_age, f"stale_source:{name}")
 
-    # 扫描完整数值字段；深度仍按块读取，RGB 留在转换时逐帧验证与解码。
-    for start in range(0, frames, 4096):
-        for name in ROBOT_DATASET_SPECS:
-            values = reader[name][start:start + 4096]
-            valid = np.isfinite(values).reshape(len(values), -1).all(axis=1)
-            reject_invalid(~valid, f"nonfinite:{name}", start)
+    # 访问 dataset 触发 RawReader 的结构/dtype 校验，不读取数值切片。
+    for name in ROBOT_DATASET_SPECS:
+        reader[name]
     return camera, dict(
         max_control_grid_deviation_ns=int(np.abs(grid_error).max()),
         max_readout_ns=int(readout.max()),
@@ -179,7 +176,7 @@ def iter_canonical_blocks(
     chunk_frames: int,
     camera: CameraSnapshot,
 ):
-    """分块转换，不修补缺失观测或重采样行。"""
+    """每块原始数值只读一次，全部通过 finite 检查后转换；坏块拒绝整段。"""
     frames = reader.num_frames
     height, width = camera.color.height, camera.color.width
     processor = PointCloudProcessor(
@@ -194,6 +191,11 @@ def iter_canonical_blocks(
         for start in range(0, frames, chunk_frames):
             end = min(frames, start + chunk_frames)
             raw = {name: reader[name][start:end] for name in ROBOT_DATASET_SPECS}
+            for name, values in raw.items():
+                valid = np.isfinite(values).reshape(end - start, -1).all(axis=1)
+                if not valid.all():
+                    row = start + int(np.flatnonzero(~valid)[0])
+                    raise ValueError(f"nonfinite:{name} at row {row}")
             arm, hand = raw["arm_qpos"], raw["hand_qpos"]
             arm_action, hand_action = (
                 raw["action_arm_joint_target"],
@@ -383,7 +385,7 @@ def append_episode(arrays, offset, blocks, frames):
     for block in blocks:
         rows = len(block["joint_state"])
         for name, values in block.items():
-            # 两份触觉 float32 原样拷贝，已由整段准入扫描；转换和新计算仍检查。
+            # 两份触觉 float32 原样拷贝，已由原始块检查；转换和新计算仍检查。
             if np.issubdtype(values.dtype, np.floating) and name not in {
                 "finger_tactile_force", "taxel_tactile_force",
             }:

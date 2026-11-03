@@ -123,7 +123,7 @@ class Robot:
             self.hand_feedback.consume(initial)
             self.feedback_next_ns = initial.timestamp_ns + FEEDBACK_PERIOD_NS
         self.connected = True
-        self.read_initial_state(run_id, cancel_requested=cancelled)
+        self._read_initial_state(cancel_requested=cancelled)
 
     def reset_tactile_sensors(self, *, run_id, cancel_requested, required_tactile=()) -> None:
         self.check()
@@ -146,8 +146,8 @@ class Robot:
         finally:
             self.hand_feedback.reset()
             self.feedback_next_ns = 0
-        self.read_initial_state(
-            run_id, required_tactile=required_tactile, cancel_requested=cancelled,
+        self._read_initial_state(
+            required_tactile=required_tactile, cancel_requested=cancelled,
         )
         if cancelled():
             raise OperationCancelled("tactile reset cancelled")
@@ -180,16 +180,12 @@ class Robot:
             self.runtime_state.stop_signal.set()
             raise
 
-    def read_initial_state(self, run_id, *, cancel_requested, required_tactile=()):
+    def _read_initial_state(self, *, cancel_requested, required_tactile=()):
+        """回调负责完整故障检查及当前操作的取消语义，异常原样传播。"""
         deadline_ns = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
 
         def check_wait():
-            self.check()
-            if (
-                cancel_requested()
-                or self.runtime_state.run_signal.value != run_id
-                or self.runtime_state.emergency_signal.is_set()
-            ):
+            if cancel_requested():
                 raise OperationCancelled("robot initial feedback acquisition cancelled")
             if time.monotonic_ns() >= deadline_ns:
                 raise RobotError(
