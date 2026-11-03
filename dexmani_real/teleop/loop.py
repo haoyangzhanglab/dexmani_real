@@ -443,9 +443,7 @@ class TeleopLoop:
             if self.recorder is not None:
                 try:
                     # 示教行要求真实提交尝试；末次映射失败不能写 NaN 否定此前前缀。
-                    issue = self.recording_issue(row)
-                    if issue is None and command is None:
-                        issue = "recording_no_command"
+                    issue = "recording_no_command" if command is None else None
                     issue = self.recorder.append(row, command, quality_issue=issue)
                     if issue is not None:
                         self.request_episode_end(issue)

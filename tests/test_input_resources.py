@@ -61,20 +61,57 @@ def test_model_completion_is_distinct_from_pending(outcome):
         worker.executor.shutdown(wait=False)
 
 
-def test_model_cleanup_deadline_is_not_restarted(monkeypatch):
-    clock = [100.0]
-    monkeypatch.setattr('dexmani_real.deployment.inference.time.monotonic', lambda: clock[0])
-    worker = PolicyWorker(lambda: None, build_observation=lambda rows: rows)
-    worker.future = Future()
-    worker.close_future = Future()
+@pytest.mark.parametrize('prediction_fails', [False, True])
+def test_model_close_waits_for_prediction_on_its_thread(prediction_fails):
+    from threading import Event, get_ident
+    started, release = Event(), Event()
+    calls = []
+    def record(stage):
+        calls.append((stage, get_ident()))
+    def predict(rows):
+        record('predict')
+        started.set()
+        assert release.wait(2)
+        if prediction_fails:
+            raise ValueError('prediction failed')
+    def load():
+        record('load')
+        return SimpleNamespace(predict=predict, close=lambda: record('close'))
+    worker = PolicyWorker(load, build_observation=lambda rows: rows)
     try:
+        worker.load()
+        worker.future.result(timeout=1)
+        worker.poll().result()
+        worker.predict([])
+        assert started.wait(1)
         with pytest.raises(TimeoutError):
             worker.discard_pending(0)
-        clock[0] += 10
-        assert not worker.wait_closed(65)
-        assert worker.cleanup_deadline == 100
+        closed = worker.close()
+        with pytest.raises(TimeoutError):
+            closed.result(timeout=0)
+        release.set()
+        if prediction_fails:
+            with pytest.raises(ValueError, match='prediction failed'):
+                closed.result(timeout=1)
+        else:
+            closed.result(timeout=1)
+        assert [stage for stage, _ in calls] == ['load', 'predict', 'close']
+        assert len({thread for _, thread in calls}) == 1
+        assert calls[0][1] != get_ident()
     finally:
+        release.set()
         worker.executor.shutdown(wait=False)
+
+
+def test_cloud_recipe_can_use_defaults_but_rejects_invalid_values():
+    from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
+    from dexmani_real.deployment.preflight import _restore_cloud_config
+    for config_type in (PointCloudConfig, HandCloudConfig):
+        assert _restore_cloud_config({'num_points': 128}, config_type) == config_type(num_points=128)
+        with pytest.raises(TypeError):
+            _restore_cloud_config({'num_ponts': 128}, config_type)
+        with pytest.raises(ValueError, match='positive integer'):
+            _restore_cloud_config({'num_points': 0}, config_type)
 
 
 def test_busy_admission_and_cancellation_preserve_operator_intent():
@@ -575,9 +612,12 @@ def test_policy_starts_only_sensors_requested_by_control_or_recording(monkeypatc
     assert session.capture_needs.required_tactile == (('aggregate', 'dense') if record_raw else ())
 
 
-@pytest.mark.parametrize('task_name', ['.research', ' research', 'research ', 'a/b', 'a\\b', '', 'a\n'])
+@pytest.mark.parametrize('task_name,valid_directory', [
+    ('.research', True), (' research', True), ('research ', True),
+    ('.', False), ('..', False), ('a/b', False), ('a\\b', False), ('', False), ('a\n', False),
+])
 @pytest.mark.parametrize('record', [False, True])
-def test_task_directory_rules_only_apply_to_recording(monkeypatch, task_name, record):
+def test_task_directory_rules_only_apply_to_recording(monkeypatch, task_name, valid_directory, record):
     from dexmani_real.config.real import RealConfig
     from dexmani_real.teleop import run
     class ReachedResourceSetup(Exception):
@@ -585,7 +625,7 @@ def test_task_directory_rules_only_apply_to_recording(monkeypatch, task_name, re
     def load(path):
         raise ReachedResourceSetup()
     monkeypatch.setattr(run, 'load_vr_transform', load)
-    with pytest.raises(ValueError if record else ReachedResourceSetup):
+    with pytest.raises(ValueError if record and not valid_directory else ReachedResourceSetup):
         run.run_teleop(RealConfig(), record=record, task_name=task_name,
                       episodes_dir='unused', max_duration_s=1, runtime_config_json=None)
 

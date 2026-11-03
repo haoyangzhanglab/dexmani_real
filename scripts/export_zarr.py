@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""将完整有效的 teleop Raw episode 导出为全模态 Canonical Zarr。"""
+"""将完整有效的 Raw episode 导出为全模态 Canonical Zarr。"""
 
 from __future__ import annotations
 
@@ -18,8 +18,7 @@ from dexmani_real.utils.table_plane import load_table_plane
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Export published teleop Raw episodes with valid data to a canonical multimodal Zarr. "
-            "Other Raw collection sources are currently unsupported. "
+            "Export published Raw episodes with valid data to a canonical multimodal Zarr. "
             "Validate structure and timing first, numeric values during chunk conversion. "
             "Reject the whole export on any invalid row and publish only after all episodes succeed; "
             "use --exclude and retry."

@@ -256,9 +256,7 @@ class PolicySession:
                 self.errors.append(error_detail("recorder_finalize", exc))
         if self.model is not None:
             try:
-                self.model.close(self.runtime_state)
-                if not self.model.wait_closed(MODEL_SHUTDOWN_TIMEOUT_S):
-                    raise TimeoutError("model close still pending; task handle retained")
+                self.model.close().result(timeout=MODEL_SHUTDOWN_TIMEOUT_S)
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()

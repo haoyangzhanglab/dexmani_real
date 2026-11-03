@@ -224,6 +224,72 @@ def test_real_raw_container_termination_and_corruption_boundaries(raw_episode, r
         load_trajectory(staging, RealConfig())
 
 
+@pytest.mark.parametrize('field,value,dataset', [
+    ('joint_units', 'deg', 'arm_qpos'),
+    ('arm_joint_names', '[]', 'arm_qpos'),
+    ('hand_joint_names', '[]', 'hand_qpos'),
+    ('arm_action_semantics', 'next_step_arrival', 'action_arm_joint_target'),
+    ('timestamp_source', 'wall_clock', 'timing/rows'),
+])
+def test_raw_metadata_is_checked_when_its_data_is_used(raw_episode, field, value, dataset):
+    import h5py
+    from dexmani_real.data.raw import RawReader
+    path = raw_episode()
+    with h5py.File(path / 'data.h5', 'r+') as data:
+        data['meta'].attrs[field] = value
+    with RawReader(path) as reader:
+        assert len(list(reader.iter_rgb_frames())) == 3
+        assert reader['depth'].shape == (3, 16, 16)
+        if field in {'hand_joint_names', 'arm_action_semantics', 'timestamp_source'}:
+            assert reader['arm_qpos'].shape == (3, 7)
+        with pytest.raises(ValueError, match=field):
+            reader[dataset]
+
+
+@pytest.mark.parametrize('source', ['teleop', 'policy_rollout', 'imported'])
+@pytest.mark.parametrize('dtype', [np.float32, np.float64])
+def test_export_accepts_float_storage_and_preserves_collection_source(raw_episode, tmp_path, source, dtype):
+    import h5py
+    import zarr
+    from dexmani_real.data.export import export_zarr
+    path = raw_episode()
+    with h5py.File(path / 'data.h5', 'r+') as data:
+        data['meta'].attrs['collection_source'] = source
+        for name in ROBOT_DATASET_SPECS:
+            values = data[name][:].astype(dtype)
+            del data[name]
+            data.create_dataset(name, data=values)
+    target = tmp_path / 'export.zarr'
+    result = export_zarr(path, target, processing=export_processing())
+    assert result['total_frames'] == 3
+    assert result['episode_quality'][0]['collection_source'] == source
+    with zarr.DirectoryStore(str(target)) as store:
+        root = zarr.open_group(store, mode='r')
+        for name in ('joint_state', 'action', 'finger_tactile_force', 'taxel_tactile_force'):
+            assert root[f'data/{name}'].dtype == np.float32
+            assert np.isfinite(root[f'data/{name}'][:]).all()
+
+
+@pytest.mark.parametrize('damage', ['missing_action', 'tactile_overflow'])
+def test_policy_export_still_rejects_invalid_numeric_rows(raw_episode, tmp_path, damage):
+    import h5py
+    from dexmani_real.data.export import export_zarr
+    path = raw_episode()
+    with h5py.File(path / 'data.h5', 'r+') as data:
+        data['meta'].attrs['collection_source'] = 'policy_rollout'
+        if damage == 'missing_action':
+            data['action_arm_joint_target'][1, 0] = np.nan
+        else:
+            values = data['hand_contact'][:].astype(np.float64)
+            values[1, 0, 0] = 1e100
+            del data['hand_contact']
+            data.create_dataset('hand_contact', data=values)
+    target = tmp_path / 'bad.zarr'
+    with np.errstate(over='ignore'), pytest.raises(ValueError, match='nonfinite.*row 1'):
+        export_zarr(path, target, processing=export_processing())
+    assert not target.exists()
+
+
 def test_writer_partial_start_failure_is_closed_and_retained(monkeypatch, tmp_path):
     closed = []
     class Writer:

@@ -8,7 +8,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import numpy as np
 
@@ -34,9 +34,6 @@ from dexmani_real.runtime.observation import (
 )
 from dexmani_real.runtime.state import RunEndReason
 from dexmani_real.utils.log import error_detail
-
-if TYPE_CHECKING:
-    from dexmani_real.deployment.observation import PolicyObservationRow
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +83,7 @@ class Rollout:
         self.camera_snapshot = camera_snapshot
         self.max_duration_ns = int(max_running_s * 1e9) if max_running_s is not None else None
         self.cancel_epoch = cancel_epoch
-        self.history: deque[PolicyObservationRow] = deque(maxlen=policy_info.n_obs_steps)
+        self.history: deque[dict[str, np.ndarray]] = deque(maxlen=policy_info.n_obs_steps)
         self.sync_actions = None
         self.sync_cursor = 0
         self.plan: ActionChunk | None = None
@@ -394,12 +391,12 @@ class Rollout:
                     self.stop(f"missed_slot: expected={self.last_slot + 1}, actual={slot}")
                     return
                 self.last_slot = slot
-            row, issue = self.read_observation()
-            if self.recorder is not None and (quality := self.recording_issue(row)) is not None:
-                self.recorder.append(row, quality_issue=quality)
+            observation, issue = self.read_observation()
+            if self.recorder is not None and (quality := self.recording_issue(observation)) is not None:
+                self.recorder.append(observation, quality_issue=quality)
                 self.stop(quality)
-                row = None
                 return
+            row = observation
             if not sources_available(row, self.control_needs):
                 row = None
                 if self.execution.mode == "rtc" and self.plan is not None:
@@ -495,7 +492,7 @@ class Rollout:
                 self.runtime_state.stop_signal.set()
             if row is not None and self.recorder is not None:
                 try:
-                    issue = self.recorder.append(row, attempted_command, quality_issue=self.recording_issue(row))
+                    issue = self.recorder.append(row, attempted_command)
                     if issue is not None:
                         self.stop(issue)
                 except BaseException as exc:

@@ -1,7 +1,5 @@
 """从已校验的传感快照构造策略观测。"""
 
-from dataclasses import dataclass, field
-
 import numpy as np
 
 from dexmani_real.geometry.camera import camera_parameters_cv, depth_scales_match
@@ -28,12 +26,6 @@ FIELD_DEPENDENCIES = {
     "camera_intrinsic": ("camera_static",),
     "camera_extrinsic": ("camera_static",),
 }
-
-
-@dataclass(frozen=True)
-class PolicyObservationRow:
-    values: dict[str, np.ndarray]
-    features: dict[str, np.ndarray] = field(default_factory=dict, compare=False)
 
 
 class ObservationBuilder:
@@ -81,7 +73,7 @@ class ObservationBuilder:
                 values[name] = row.point_cloud
             elif name in {"rgb", "depth"}:
                 values[name] = row.camera[name]
-        return PolicyObservationRow(values)
+        return values
 
     def configure_camera(self, camera):
         self.camera_parameters = {}
@@ -106,7 +98,7 @@ class ObservationBuilder:
         arrays = {}
         if "joint_state" in fields:
             arrays["joint_state"] = np.stack([
-                np.concatenate((r.values["arm_qpos"], r.values["hand_qpos"])) for r in rows
+                np.concatenate((r["arm_qpos"], r["hand_qpos"])) for r in rows
             ]).astype(np.float32)
         for name in fields:
             sources = FIELD_DEPENDENCIES[name]
@@ -114,28 +106,18 @@ class ObservationBuilder:
                 values = self.camera_parameters[name]
                 arrays[name] = np.broadcast_to(values, (len(rows), values.size)).copy()
             elif name != "joint_state" and "arm_fk" not in sources:
-                arrays[name] = np.stack([r.values[name] for r in rows])
+                arrays[name] = np.stack([r[name] for r in rows])
 
         if self.arm_fk is not None:
-            # warmup 会重复引用同一行；缓存按行身份计算，不按窗口位置重复计算。
-            new_rows = list({id(row): row for row in rows if not row.features}.values())
-            features = {}
-            if new_rows:
-                arm = np.stack([r.values["arm_qpos"] for r in new_rows])
-                poses = eef_poses(arm, arm_fk=self.arm_fk)
-                if "eef_pose" in fields:
-                    features["eef_pose"] = encode_eef_pose(poses).astype(np.float32)
-                if self.hand_fk is not None:
-                    features.update(hand_geometry(
-                        poses, np.stack([r.values["hand_qpos"] for r in new_rows]),
-                        arm_fk=self.arm_fk, hand_fk=self.hand_fk,
-                        hand_cloud=self.hand_cloud,
-                        include_fingertips="fingertips" in dependencies,
-                    ))
-            for index, row in enumerate(new_rows):
-                row.features.update({name: value[index].copy() for name, value in features.items()})
-            for name in fields:
-                if "arm_fk" in FIELD_DEPENDENCIES[name]:
-                    arrays[name] = np.stack([r.features[name] for r in rows])
+            poses = eef_poses(np.stack([r["arm_qpos"] for r in rows]), arm_fk=self.arm_fk)
+            if "eef_pose" in fields:
+                arrays["eef_pose"] = encode_eef_pose(poses).astype(np.float32)
+            if self.hand_fk is not None:
+                arrays.update(hand_geometry(
+                    poses, np.stack([r["hand_qpos"] for r in rows]),
+                    arm_fk=self.arm_fk, hand_fk=self.hand_fk,
+                    hand_cloud=self.hand_cloud,
+                    include_fingertips="fingertips" in dependencies,
+                ))
 
         return {name: arrays[name] for name in fields}
