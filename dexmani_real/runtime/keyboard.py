@@ -44,7 +44,7 @@ def restore_terminal_echo(saved):
 
 
 class Keyboard:
-    def __init__(self, *, get_run_id: Callable[[], int], bindings=None, estop_callback=None):
+    def __init__(self, *, get_run_id: Callable[[], int | None], bindings=None, estop_callback=None):
         self.events: deque[KeyEvent] = deque()
         self.get_run_id = get_run_id
         self.held_keys: set[str] = set()
@@ -83,7 +83,7 @@ class Keyboard:
                 self.held_keys.remove(name)
                 return
 
-        # 不持 Condition 读取代际；开始和准备操作绑定输入时的代际。
+        # 不持 Condition 读取身份；None 表示此时输入没有可执行身份。
         run_id = self.get_run_id() if name in {"b", "h", "r", "t"} else None
         # 停止回调先撤销权限，再发布按下事件；回调不执行 SDK I/O。
         callback = self.bindings.get(name)

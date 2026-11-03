@@ -146,9 +146,8 @@ class JointReplay:
         ):
             return ReplayStatus.REJECTED, "start posture differs by more than 10 degrees", row
 
-        with self.runtime_state.motion_lock:
-            if self.runtime_state.run_id != self.epoch or not self.runtime_state.begin_motion():
-                return ReplayStatus.REJECTED, "motion authority unavailable", row
+        if self.runtime_state.begin_motion(run_id=self.epoch) is None:
+            return ReplayStatus.REJECTED, "motion authority unavailable", row
         return ReplayStatus.COMPLETED, "", row
 
     def replay_rows(self, trajectory, period_ns):

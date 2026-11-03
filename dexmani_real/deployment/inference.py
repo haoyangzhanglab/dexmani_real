@@ -24,11 +24,6 @@ class PolicyWorker:
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-model")
         self.future = self.operation = self.close_future = None
 
-    @property
-    def has_pending_task(self):
-        # 完成但尚未回收的任务仍归当前轮次所有。
-        return self.future is not None
-
     def _submit(self, operation, function, *args, **kwargs):
         if self.close_future is not None or self.future is not None:
             raise RuntimeError("Policy worker already has an unreclaimed task or is closing")

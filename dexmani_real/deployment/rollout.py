@@ -120,7 +120,7 @@ class Rollout:
 
     def budget_limit(self):
         if self.wait_deadline_ns is not None and (
-            self.run_deadline_ns is None or self.wait_deadline_ns <= self.run_deadline_ns
+            self.run_deadline_ns is None or self.wait_deadline_ns < self.run_deadline_ns
         ):
             return self.wait_deadline_ns, "wait"
         if self.run_deadline_ns is not None:
@@ -296,8 +296,7 @@ class Rollout:
         if self.start_observation() is None:
             self.stop(self.preparation_issue)
             return
-        with self.runtime_state.motion_lock:
-            started_ns = self.runtime_state.begin_motion() if self.epoch == self.runtime_state.run_id else None
+        started_ns = self.runtime_state.begin_motion(run_id=self.epoch)
         if started_ns is None:
             self.robot.check()
             self.stop("final admission declined")
@@ -326,21 +325,23 @@ class Rollout:
             cast(Prediction, self.query).result = actions
 
     def submit(self, slot, *, handoff_slot=None, prefix=None):
+        # 不能用新等待窗口续期已经耗尽的 bootstrap/预测预算。
+        if self.expired_budget() is not None:
+            return "prediction_budget_exhausted"
         submitted_ns = time.monotonic_ns()
         if self.plan is None:
             limits = [submitted_ns + ACTION_TIMEOUT_NS]
             if self.target_expires_ns is not None:
                 limits.append(self.target_expires_ns)
-            if self.run_deadline_ns is not None:
-                limits.append(self.run_deadline_ns)
             self.wait_deadline_ns = min(limits)
-            if submitted_ns >= self.wait_deadline_ns:
-                return "prediction_wait_exhausted"
         kwargs = (
             dict(rtc_prefix=prefix, delay_steps=handoff_slot - slot,
                  rtc_guidance_cap=self.execution.rtc_guidance_cap) if prefix is not None else {}
         )
-        self.model.predict(tuple(self.history), reset_episode=self.first_prediction, **kwargs)
+        rows = tuple(self.history)
+        if self.expired_budget() is not None:
+            return "prediction_budget_exhausted"
+        self.model.predict(rows, reset_episode=self.first_prediction, **kwargs)
         self.first_prediction = False
         self.query = Prediction(slot, handoff_slot)
         return None

@@ -39,7 +39,7 @@ class KeyboardTeleop:
         )
 
         self.keys = Keyboard(
-            get_run_id=lambda: self.runtime_state.run_id,
+            get_run_id=self.running_run_id,
             estop_callback=self.runtime_state.request_emergency_stop,
             bindings={'q': self.runtime_state.request_quit},
         )
@@ -99,12 +99,17 @@ class KeyboardTeleop:
         self.period_ns, _ = sampling_clock_ns(self.jog_config.control_hz)
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
 
+    def running_run_id(self) -> int | None:
+        # 输入绑定时确定资格；忙时读到的 R 不因延迟入队而获得授权。
+        with self.runtime_state.motion_lock:
+            run_id = self.runtime_state.run_id
+            return run_id if self.runtime_state.can_move(run_id=run_id) else None
+
     def prepare_jog(self, run_id):
         self.jog.clear_reference()
         self.robot.prepare_streaming(run_id)
-        with self.runtime_state.motion_lock:
-            if self.runtime_state.run_id != run_id or self.runtime_state.begin_motion() is None:
-                raise OperationCancelled("jog cancelled during preparation")
+        if self.runtime_state.begin_motion(run_id=run_id) is None:
+            raise OperationCancelled("jog cancelled during preparation")
         self.robot.send_action(
             RobotCommand(run_id, arm_hold=True),
             expires_ns=time.monotonic_ns() + int(self.jog_config.target_max_age_s * 1e9),
@@ -130,7 +135,10 @@ class KeyboardTeleop:
             if self.runtime_state.quit_requested:
                 return True
 
-            home_event = next((event for event in events if event.key == "r"), None)
+            home_event = next((
+                event for event in events
+                if event.key == "r" and event.run_id == self.runtime_state.run_id
+            ), None)
             if home_event is not None:
                 self.run_home(home_event.run_id)
                 continue
@@ -143,10 +151,7 @@ class KeyboardTeleop:
 
     def run_home(self, expected_run_id):
         with self.runtime_state.motion_lock:
-            if (
-                expected_run_id != self.runtime_state.run_id
-                or not self.runtime_state.requests_allow_motion()
-            ):
+            if not self.runtime_state.can_move(run_id=expected_run_id):
                 logger.info("Ignored revoked HOME intent")
                 return
             self.runtime_state.revoke_motion()
@@ -169,7 +174,6 @@ class KeyboardTeleop:
         else:
             logger.info("HOME completed")
         self.prepare_jog(run_id)
-        self.keys.discard_events("r")
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
 
     def get_home_planner(self):

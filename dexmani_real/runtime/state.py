@@ -79,10 +79,11 @@ class SessionState:
             self.revoke_motion()
             return self.run_id
 
-    def begin_motion(self) -> int | None:
+    def begin_motion(self, *, run_id: int) -> int | None:
         with self.motion_lock:
             if (
-                self.safety_state != SafetyState.ARMED
+                self.run_id != run_id
+                or self.safety_state != SafetyState.ARMED
                 or not self.requests_allow_motion() or self.stop_signal.is_set()
             ):
                 return None

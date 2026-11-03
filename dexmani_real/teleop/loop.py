@@ -422,8 +422,10 @@ class TeleopLoop:
         if self.preparation_interrupted():
             return
         self.controller.reset(row)
-        with self.runtime_state.motion_lock:
-            started_ns = self.runtime_state.begin_motion() if self.preparation_valid() else None
+        started_ns = (
+            self.runtime_state.begin_motion(run_id=self.run_id)
+            if self.phase is TeleopPhase.PREPARING else None
+        )
         if started_ns is None:
             if not self.preparation_interrupted():
                 self.request_episode_end("begin_unavailable")

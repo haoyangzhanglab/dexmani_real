@@ -29,7 +29,7 @@ from dexmani_real.runtime.observation import (
     check_observation,
     read_observation,
 )
-from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
+from dexmani_real.runtime.state import SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.teleop.audio import AudioFeedback
 from dexmani_real.utils.io import write_json, write_yaml
@@ -64,7 +64,8 @@ class PolicySession:
         self.runtime_state = SessionState()
         self.sensors = self.robot = self.keyboard = self.model = None
         self.audio = None
-        self.episode = self.start_epoch = None
+        self.episode = None
+        self.start_epoch: int | None = None  # 仅主线程设置和消费。
         self.capture_ids = count(1)
         self.episodes, self.errors = [], []
         self.summary = dict(
@@ -137,8 +138,8 @@ class PolicySession:
             get_run_id=lambda: self.runtime_state.run_id,
             estop_callback=self.runtime_state.request_emergency_stop,
             bindings={
-                "s": self.request_stop, "c": self.request_stop,
-                "d": self.request_discard, "q": self.request_quit,
+                "s": self.runtime_state.request_stop, "c": self.runtime_state.request_stop,
+                "d": self.request_discard, "q": self.runtime_state.request_quit,
             },
         )
         self.keyboard.start()
@@ -361,23 +362,12 @@ class PolicySession:
         self.model.warmup(rows, samples=1, **kwargs)
         self.wait_model(time.monotonic() + MODEL_STARTUP_TIMEOUT_S)
 
-    def request_stop(self, *, reason=RunEndReason.OPERATOR) -> None:
-        """先使停止信号可见，再清理主线程局部请求。"""
-        self.runtime_state.request_stop(reason=reason)
-        with self.runtime_state.motion_lock:
-            self.start_epoch = None
-
-    def request_quit(self) -> None:
-        self.runtime_state.request_quit()
-        with self.runtime_state.motion_lock:
-            self.start_epoch = None
-
     def request_discard(self) -> None:
         # 与保存决定排序；决定之后的 D 仍停止，但不逆转局部 save。
         with self.runtime_state.motion_lock:
             if self.episode is not None:
                 self.episode.discard_requested = True
-            self.request_stop()
+            self.runtime_state.request_stop()
 
     def poll_operator(self, *, allow_tactile_reset: bool = False) -> None:
         self.handle_command_batch(
@@ -413,9 +403,9 @@ class PolicySession:
                 preparation_blocked = True
                 if (
                     self.start_epoch is not None or not allow_tactile_reset
-                    or self.episode is not None or self.model.has_pending_task
+                    or self.episode is not None
                 ):
-                    logger.warning("T ignored: tactile reset requires idle without pending work")
+                    logger.warning("T ignored: tactile reset requires idle without a start intent")
                     continue
                 if not self.runtime_state.can_move(
                     run_id=event.run_id, required_safety_state=SafetyState.ARMED,
@@ -437,15 +427,14 @@ class PolicySession:
                 return
 
     def run_home(self, run_id) -> bool:
-        with self.runtime_state.motion_lock:
-            home_allowed = (
-                self.episode is None and self.start_epoch is None
-                and not self.model.has_pending_task and self.runtime_state.can_move(
-                    run_id=run_id, required_safety_state=SafetyState.ARMED,
-                )
+        home_allowed = (
+            self.episode is None and self.start_epoch is None
+            and self.runtime_state.can_move(
+                run_id=run_id, required_safety_state=SafetyState.ARMED,
             )
+        )
         if not home_allowed:
-            logger.warning("H 仅限空闲且无待完成任务时使用；活动段请先按 S。")
+            logger.warning("H 仅限空闲且未请求启动时使用；活动段请先按 S。")
             return False
         logger.info("正在回初始位…")
         self.audio.play("home")
@@ -491,15 +480,14 @@ class PolicySession:
         return not self.runtime_state.requests_allow_motion()
 
     def request_start(self, epoch):
-        with self.runtime_state.motion_lock:
-            if self.start_epoch is not None or self.episode is not None or self.model.has_pending_task:
-                return False
-            if not self.runtime_state.can_move(
-                run_id=epoch, required_safety_state=SafetyState.ARMED,
-            ):
-                return False
-            self.start_epoch = epoch
-            return True
+        if self.start_epoch is not None or self.episode is not None:
+            return False
+        if not self.runtime_state.can_move(
+            run_id=epoch, required_safety_state=SafetyState.ARMED,
+        ):
+            return False
+        self.start_epoch = epoch
+        return True
 
     def run_control_loop(self):
         while not self.runtime_state.quit_requested:
@@ -507,12 +495,11 @@ class PolicySession:
             self.robot.service_idle()
             if self.runtime_state.estop_request or self.runtime_state.error_state:
                 break
-            with self.runtime_state.motion_lock:
-                epoch, self.start_epoch = self.start_epoch, None
-                if epoch is not None and not self.runtime_state.can_move(
-                    run_id=epoch, required_safety_state=SafetyState.ARMED,
-                ):
-                    epoch = None
+            epoch, self.start_epoch = self.start_epoch, None
+            if epoch is not None and not self.runtime_state.can_move(
+                run_id=epoch, required_safety_state=SafetyState.ARMED,
+            ):
+                epoch = None
             if epoch is None:
                 time.sleep(0.005)
                 continue
@@ -529,9 +516,8 @@ class PolicySession:
             finally:
                 primary_failure = sys.exc_info()[0] is not None
                 self.episodes.append(episode.result)
-                self.start_epoch = None
-                # 未回收资源仍属于本段；失败段也保留句柄，避免会话重复存它的主错。
-                if not primary_failure and not episode.writer_pending and not self.model.has_pending_task:
+                # 正常返回已同步收尾；失败段保留资源和主错，供最终关闭诊断。
+                if not primary_failure:
                     self.episode = None
                 try:
                     self.save_results()

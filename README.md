@@ -61,11 +61,11 @@ VR 遥操作与策略会话：B 空闲时开始新段；S/C 停止并保存；D 
 
 音效使用系统 `aplay` 或 `paplay` 播放提示，普通播放或关闭失败仅 warning，不影响实验结果和退出码。提示音不能证明机器人已停止、物理到位或任务成功。
 
-物理回放使用 S 停止、H 回零、Q 退出；键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出。键盘在启动及 R 回零结束后完成伺服准备并进入 RUNNING/hold，再提示点动就绪；方向键只更新目标。松键或 jog 目标被 IK/约束拒绝时均制动并 hold，下一轮按当前键态继续，不撤权、不要求松开再按。hold 也有制动距离；运动候选错过本轮提交机会时丢弃，制动 hold 仍立即提交。普通输入过期按取消处理，SDK/停止失败仍是故障。
+物理回放使用 S 停止、H 回零、Q 退出；键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出。键盘在启动及 R 回零结束后完成伺服准备并进入 RUNNING/hold，再提示点动就绪；R 仅在 jog 已获 RUNNING 授权时接纳；HOME 和重新准备期间的 R 不会延后执行。方向键只更新目标。松键或 jog 目标被 IK/约束拒绝时均制动并 hold，下一轮按当前键态继续，不撤权、不要求松开再按。hold 也有制动距离；运动候选错过本轮提交机会时丢弃，制动 hold 仍立即提交。普通输入过期按取消处理，SDK/停止失败仍是故障。
 
-设备和模型在会话内复用。启用手部时，Teleop/Policy 启动先完成手部 HOME；仅模态或录制需要时复位触觉，反馈就绪不证明零点标定完成。每段 B 后仍有伺服准备延迟；VR 重新锚定，Policy 重新采集观测历史。未回收的 writer 或模型任务禁止开始新段。
+设备和模型在会话内复用。启用手部时，Teleop/Policy 启动先完成手部 HOME；仅模态或录制需要时复位触觉，反馈就绪不证明零点标定完成。每段 B 后仍有伺服准备延迟；VR 重新锚定，Policy 重新采集观测历史。Rollout 正常返回前同步收尾 writer 和模型任务；收尾失败保留资源归属并退出会话，不进入下一段。
 
-策略周期、数值 recipe、输入模态和动作窗口从 checkpoint 恢复，不改变录制的完整多模态 schema。sync 等待预测后顺序执行动作；async 按时间锚点裁掉过期动作，可继续旧计划的有效尾部；RTC 固定策略动作前缀并严格交接，错过承诺槽即结束。记预测长度为 P、`action_steps` 为 A、`prefetch_steps` 为 d：sync 要求 `1 <= A <= P`；async 要求 `1 <= d <= A <= P` 且 `d < P`；RTC 另要求 `A+d <= P`，guidance cap 须显式为有限非负值。EEF 前缀相同不保证未来 IK 分支相同。多帧 history 断档后清空重积累，窗口完整前不提交新预测；单帧模式不变。首预测 reset RNG，预热后恢复 RNG；sync 的预测等待不得超过已有目标期限。
+策略周期、数值 recipe、输入模态和动作窗口从 checkpoint 恢复，不改变录制的完整多模态 schema。sync 等待预测后顺序执行动作；async 按时间锚点裁掉过期动作，可继续旧计划的有效尾部；RTC 固定策略动作前缀并严格交接，错过承诺槽即结束。记预测长度为 P、`action_steps` 为 A、`prefetch_steps` 为 d：sync 要求 `1 <= A <= P`；async 要求 `1 <= d <= A <= P` 且 `d < P`；RTC 另要求 `A+d <= P`，guidance cap 须显式为有限非负值。EEF 前缀相同不保证未来 IK 分支相同。多帧 history 断档后清空重积累，窗口完整前不提交新预测；单帧模式不变。首预测 reset RNG，预热后恢复 RNG；sync 的预测等待不得超过已有目标期限。运行时长期限与预测等待期限独立保存，选择更早者；恰好相等时按正常时长完成归因，真实错误和已发生的操作者停止仍按原规则处理。
 
 每段结束先撤权并停止设备，再完成录制和模型回收；writer 与模型各有完整的独立收尾预算。writer 完整关闭且计数一致后才按首次保存意图发布；失败保留 staging，零行不发布。Raw 记录执行结束时的状态，完整的异常段可保存为 failed；发布后的模型回收错误只进入 episode/session，不回写 Raw。退出先释放设备，再完成慢速收尾与尾音等待。
 
@@ -169,3 +169,5 @@ python -m cordvip_geometry view /tmp/cordvip/scene_001
 默认日志为终端 INFO、拒绝原因、完整异常 traceback 和简短段结果，需要留档时使用 shell 重定向。几何环境检查使用独立命令 `python -m cordvip_geometry check`。
 
 开发约定见 [AGENTS.md](AGENTS.md)。
+
+离线回归：`python -m pytest -p no:cacheprovider tests`。测试使用 fake、Mock、可控时钟和 Event，不连接真实设备；覆盖授权、期限、输入竞争、收尾归属及 Raw/导出准入。需在已安装项目依赖和 pytest 的环境运行；离线通过不代表真机停止延迟或 SDK 实时性已验证。
