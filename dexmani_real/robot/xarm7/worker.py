@@ -2,7 +2,6 @@
 
 import logging
 import time
-from typing import cast
 
 import numpy as np
 
@@ -27,7 +26,8 @@ class ArmController:
     def __init__(self, cfg, io, pipe, driver):
         self.cfg, self.io, self.pipe, self.driver = cfg, io, pipe, driver
         self.status = np.zeros((), dtype=ARM_STATE_DTYPE)
-        self.active = self.reference = None
+        self.active = None
+        self.reference: ArmTrajectory | None = None
 
     def cancelled(self):
         return (self.io.stop.is_set() or self.io.emergency.is_set()
@@ -257,7 +257,7 @@ class ArmController:
             if np.max(np.abs(v)) > self.cfg.homing.velocity_convergence_rad_s:
                 raise RuntimeError("arm moved after standstill preparation")
             self.reference = ArmTrajectory(self.cfg, q, v)
-        q = cast(ArmTrajectory, self.reference).step(
+        q = self.reference.step(
             goal["q_goal"] if not goal["hold"] else None,
             hold=bool(goal["hold"]),
         )
@@ -268,7 +268,7 @@ class ArmController:
             return None
         started = time.monotonic_ns()
         self.driver.servo(q)
-        self.reference.commit()
+        self.reference.commit(q)
         return started
 
     def run(self, startup_deadline_ns):

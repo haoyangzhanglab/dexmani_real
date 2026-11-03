@@ -1,4 +1,4 @@
-"""正常停止复用与异常退出的离线回归；所有 SDK 操作使用 fake driver。"""
+"""机械臂轨迹、停止复用与异常退出的离线回归；SDK 操作使用 fake driver。"""
 import multiprocessing as mp
 import threading
 import time
@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from dexmani_real.config.xarm7 import EXECUTOR_TIMEOUT_S, ArmConfig
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand, validate_arm_target
 from dexmani_real.robot.xarm7.process import ArmProcess
 from dexmani_real.robot.xarm7.protocol import (
     GOAL_DTYPE,
@@ -16,6 +16,7 @@ from dexmani_real.robot.xarm7.protocol import (
     HomeRequest,
     PrepareRequest,
 )
+from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
 from dexmani_real.robot.xarm7.worker import ArmController
 from dexmani_real.runtime.state import SessionState
 
@@ -31,6 +32,176 @@ def in_process_sync(monkeypatch):
 def channels(state):
     return ArmChannels(mp.get_context('spawn'), stop_signal=state.stop_signal,
                        emergency_signal=state.emergency_signal)
+
+
+@pytest.mark.parametrize('target', ['lower', 'upper', 'interior'])
+def test_arm_trajectory_boundary_roundoff_and_commit(target):
+    cfg = ArmConfig()
+    start = np.asarray(cfg.home_qpos)
+    goal = start.copy()
+    goal[3] = dict(lower=cfg.joint_limit_lower[3], upper=cfg.joint_limit_upper[3],
+                   interior=.1)[target]
+    validate_arm_target(goal, cfg.joint_limit_lower, cfg.joint_limit_upper)
+    trajectory = ArmTrajectory(cfg, start, np.zeros(7))
+    previous = start
+    # 覆盖完整运动和到位后的持续计算；每一帧都按 worker 的发送/commit 顺序推进。
+    for _ in range(1000):
+        q = trajectory.step(goal)
+        validate_arm_target(q, cfg.joint_limit_lower, cfg.joint_limit_upper)
+        np.testing.assert_array_equal(trajectory.input.current_position, previous)
+        np.testing.assert_allclose(trajectory.output.new_position, q, rtol=0, atol=1e-12)
+        trajectory.commit(q)
+        np.testing.assert_array_equal(trajectory.input.current_position, q)
+        previous = q
+        if trajectory.output.time >= trajectory.output.trajectory.duration:
+            np.testing.assert_allclose(q, goal, rtol=0, atol=1e-12)
+            np.testing.assert_allclose(trajectory.input.current_velocity, 0, rtol=0, atol=1e-12)
+    assert trajectory.output.time >= trajectory.output.trajectory.duration
+
+
+@pytest.mark.parametrize('direction', [-1, 1], ids=['lower', 'upper'])
+@pytest.mark.parametrize('hold', [False, True])
+def test_arm_trajectory_rejects_braking_outside_limits(direction, hold):
+    cfg = ArmConfig()
+    goal = np.asarray(cfg.home_qpos)
+    start, velocity = goal.copy(), np.zeros(7)
+    bound = cfg.joint_limit_lower[3] if direction < 0 else cfg.joint_limit_upper[3]
+    start[3] = bound - direction * .001
+    velocity[3] = direction * .5
+    validate_arm_target(goal, cfg.joint_limit_lower, cfg.joint_limit_upper)
+    trajectory = ArmTrajectory(cfg, start, velocity)
+    with pytest.raises(ValueError, match='extremum outside joint 4 limits'):
+        trajectory.step(goal, hold=hold)
+    np.testing.assert_array_equal(trajectory.input.current_position, start)
+
+
+@pytest.fixture
+def stubbed_arm_trajectory():
+    from ruckig import Result
+    cfg = ArmConfig()
+    trajectory = ArmTrajectory(cfg, np.asarray(cfg.home_qpos), np.zeros(7))
+    profiles = [SimpleNamespace(p=[p], v=[], a=[], j=[], t=[],
+                                brake=SimpleNamespace(p=[], v=[], a=[], j=[], t=[]))
+                for p in cfg.home_qpos]
+    trajectory.output = SimpleNamespace(new_calculation=True, new_position=list(cfg.home_qpos),
+                                         trajectory=SimpleNamespace(profiles=[profiles]))
+    trajectory.otg = SimpleNamespace(update=lambda *args: Result.Working)
+    return trajectory
+
+
+@pytest.mark.parametrize('source', ['extremum', 'sample'])
+@pytest.mark.parametrize('direction', [-1, 1], ids=['lower', 'upper'])
+@pytest.mark.parametrize('offset', [5e-13, 2e-12, np.nan, np.inf, -np.inf])
+def test_arm_trajectory_roundoff_tolerance_is_small_and_finite(
+    stubbed_arm_trajectory, source, direction, offset,
+):
+    trajectory = stubbed_arm_trajectory
+    bound = trajectory.lower[3] if direction < 0 else trajectory.upper[3]
+    value = bound + direction * offset
+    if source == 'extremum':
+        trajectory.output.trajectory.profiles[0][3].p = [value]
+    else:
+        trajectory.output.new_calculation = False
+        trajectory.output.new_position[3] = value
+    if offset == 5e-13:
+        q = trajectory.step()
+        validate_arm_target(q, trajectory.lower, trajectory.upper)
+        if source == 'sample':
+            assert q[3] == bound
+    else:
+        with pytest.raises(ValueError, match='outside joint'):
+            trajectory.step()
+
+
+@pytest.mark.parametrize('segment', ['brake', 'profile'])
+@pytest.mark.parametrize('jerk', [0., .6])
+def test_arm_trajectory_checks_internal_extrema(stubbed_arm_trajectory, segment, jerk):
+    trajectory = stubbed_arm_trajectory
+    p = trajectory.lower[3] + .01
+    v, a, duration = (-.2, .4, 1.) if jerk == 0 else (-.3, 0., 2.)
+    end = p + duration * (v + duration * (a / 2 + duration * jerk / 6))
+    assert trajectory.lower[3] < min(p, end) <= max(p, end) < trajectory.upper[3]
+    profile = trajectory.output.trajectory.profiles[0][3]
+    section = profile.brake if segment == 'brake' else profile
+    section.p, section.v, section.a, section.j, section.t = [p, end], [v], [a], [jerk], [duration]
+    # 两端合法，只有段内 v=0 的位置越界；制动段与主轨迹都必须检查。
+    with pytest.raises(ValueError, match='extremum outside joint 4 limits'):
+        trajectory.step()
+
+
+@pytest.mark.parametrize('result', ['success', 'sdk_error', 'expired'])
+def test_owner_commits_boundary_reference_only_after_send(monkeypatch, result):
+    cfg = ArmConfig()
+    goal = np.asarray(cfg.home_qpos).copy()
+    goal[3] = cfg.joint_limit_lower[3]
+    now = [1_000_000_000]
+    monkeypatch.setattr('dexmani_real.robot.xarm7.worker.time.monotonic_ns', lambda: now[0])
+    io = channels(SessionState())
+    expires_ns = now[0] + 1_000_000_000
+    io.publish_goal(RobotCommand(arm_qpos=goal), expires_ns=expires_ns)
+    sent = []
+
+    def servo(q):
+        validate_arm_target(q, cfg.joint_limit_lower, cfg.joint_limit_upper)
+        sent.append(q.copy())
+        if result == 'sdk_error' and q[3] == goal[3]:
+            raise OSError('servo failed')
+
+    owner = ArmController(cfg, io, None, SimpleNamespace(servo=servo))
+    owner.status['qpos'] = cfg.home_qpos
+    owner.status['timestamp_ns'] = now[0]
+    owner.tick()
+    trajectory = owner.reference
+    ticks = int(np.ceil(trajectory.output.trajectory.duration * cfg.servo_hz))
+    for _ in range(ticks - 2):
+        owner.tick()
+    previous = np.array([trajectory.input.current_position, trajectory.input.current_velocity,
+                         trajectory.input.current_acceleration])
+    if result == 'expired':
+        step = trajectory.step
+
+        def expire_during_step(*args, **kwargs):
+            q = step(*args, **kwargs)
+            now[0] = expires_ns
+            return q
+
+        monkeypatch.setattr(trajectory, 'step', expire_during_step)
+    if result == 'sdk_error':
+        with pytest.raises(OSError, match='servo failed'):
+            owner.tick()
+    else:
+        owner.tick()
+    assert trajectory.output.new_position[3] < goal[3]
+    if result == 'success':
+        assert sent[-1][3] == goal[3]
+        np.testing.assert_array_equal(trajectory.input.current_position, sent[-1])
+    else:
+        np.testing.assert_array_equal(
+            [trajectory.input.current_position, trajectory.input.current_velocity,
+             trajectory.input.current_acceleration], previous,
+        )
+    assert len(sent) == ticks - (result == 'expired')
+    assert io.stop.is_set() == (result == 'expired')
+
+
+@pytest.mark.parametrize('invalid', ['shape', 'nan', 'inf', 'below', 'above'])
+def test_public_arm_targets_remain_strict(invalid):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.robot.system import Robot
+    cfg = RealConfig()
+    q = np.asarray(cfg.arm.home_qpos).copy()
+    if invalid == 'shape':
+        q = q[:-1]
+    else:
+        q[3] = dict(nan=np.nan, inf=np.inf,
+                    below=np.nextafter(cfg.arm.joint_limit_lower[3], -np.inf),
+                    above=np.nextafter(cfg.arm.joint_limit_upper[3], np.inf))[invalid]
+    robot = Robot(cfg.arm, cfg.hand, runtime_state=SessionState())
+    robot.connected = True
+    robot.arm = SimpleNamespace(is_connected=True,
+                                submit=lambda *a, **kw: pytest.fail('invalid target submitted'))
+    with pytest.raises(ValueError, match='shape|finite|joint limits'):
+        robot.send_action(RobotCommand(arm_qpos=q), expires_ns=time.monotonic_ns() + 1_000_000_000)
 
 
 def test_late_publisher_cannot_install_target_while_stopped():

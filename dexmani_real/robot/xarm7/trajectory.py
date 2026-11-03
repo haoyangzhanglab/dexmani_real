@@ -14,6 +14,10 @@ from dexmani_real.config.xarm7 import ArmConfig
 from dexmani_real.robot.commands import validate_arm_target
 
 
+# 仅容纳轨迹计算的浮点舍入误差（rad），不是运动或到位容差。
+_POSITION_ROUNDOFF_RAD = 1e-12
+
+
 class ArmTrajectory:
     def __init__(self, cfg: ArmConfig, q: np.ndarray, v: np.ndarray) -> None:
         self.lower = np.asarray(cfg.joint_limit_lower)
@@ -65,15 +69,25 @@ class ArmTrajectory:
                                 extrema.append(p + tau * (v + tau * (a / 2 + tau * j / 6)))
                 if (
                     not np.isfinite(extrema).all()
-                    or min(extrema) < self.lower[i]
-                    or max(extrema) > self.upper[i]
+                    or min(extrema) < self.lower[i] - _POSITION_ROUNDOFF_RAD
+                    or max(extrema) > self.upper[i] + _POSITION_ROUNDOFF_RAD
                 ):
                     raise ValueError(
                         f"reference braking/position extremum outside joint {i + 1} limits"
                     )
-        return np.asarray(self.output.new_position)
+        q = np.asarray(self.output.new_position)
+        if (
+            not np.isfinite(q).all()
+            or np.any(q < self.lower - _POSITION_ROUNDOFF_RAD)
+            or np.any(q > self.upper + _POSITION_ROUNDOFF_RAD)
+        ):
+            raise ValueError("reference position outside joint limits")
+        # 完整轨迹已通过极值检查；只归一采样点的舍入越界。
+        return np.clip(q, self.lower, self.upper)
 
-    def commit(self) -> None:
+    def commit(self, q: np.ndarray) -> None:
+        """SDK 发送成功后，提交 step 返回的位置及对应速度、加速度。"""
         # update 只推进 output 和库内比较缓存。未 commit 时，下次 update
         # 会因 input 与缓存不同而从已提交参考重算，无需回滚或重置轨迹。
         self.output.pass_to_input(self.input)
+        self.input.current_position = q.tolist()
