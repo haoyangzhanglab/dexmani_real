@@ -109,9 +109,7 @@ class Robot:
 
         self.arm = ArmProcess(
             self.arm_config,
-            run_signal=self.runtime_state.run_signal,
-            stop_signal=self.runtime_state.stop_signal,
-            emergency_signal=self.runtime_state.emergency_signal,
+            runtime_state=self.runtime_state,
         )
         self.stop_required = True  # 连接后仍需完成首次整机停止确认。
         self.arm.connect(check_services=self.check_services)
@@ -375,7 +373,7 @@ class Robot:
             errors.append(("hand_passive_stop", exc))
         if self.arm is not None:
             try:
-                self.arm.close(self.runtime_state)
+                self.arm.close()
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()

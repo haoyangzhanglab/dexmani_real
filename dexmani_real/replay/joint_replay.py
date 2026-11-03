@@ -59,7 +59,7 @@ class JointReplay:
         self.robot = robot
 
     def run(self, trajectory, *, run_id, hand_start_duration_s):
-        self.epoch = run_id
+        self.run_id = run_id
         self.capture = ReplayBuffer(len(trajectory))
         self.action_mapper = ActionMapper.for_mode(
             "joint",
@@ -117,6 +117,9 @@ class JointReplay:
                     result.errors.append(exc)
                     logger.exception("replay stop failed")
                 result.status = ReplayStatus.FAULT
+            finally:
+                # 停止等待期间取得身份但尚未入队的 HOME 也属于旧回放。
+                self.runtime_state.revoke_motion()
         result.replay_data = self.capture.to_dict()
         return result
 
@@ -128,7 +131,7 @@ class JointReplay:
         return row
 
     def admit_replay(self, trajectory):
-        self.robot.prepare_streaming(self.epoch)
+        self.robot.prepare_streaming(self.run_id)
         row = self.read_feedback()
         start_arm = wrap_nearest_equivalent(
             trajectory.initial_arm_qpos,
@@ -146,7 +149,7 @@ class JointReplay:
         ):
             return ReplayStatus.REJECTED, "start posture differs by more than 10 degrees", row
 
-        if self.runtime_state.begin_motion(run_id=self.epoch) is None:
+        if self.runtime_state.begin_motion(run_id=self.run_id) is None:
             return ReplayStatus.REJECTED, "motion authority unavailable", row
         return ReplayStatus.COMPLETED, "", row
 
@@ -189,7 +192,7 @@ class JointReplay:
         self.capture.data["submit_started_ns"][captured] = started_ns
         try:
             self.robot.send_action(
-                RobotCommand(self.epoch, arm, hand),
+                RobotCommand(self.run_id, arm, hand),
                 expires_ns=started_ns + ACTION_TIMEOUT_NS,
             )
         finally:
@@ -209,7 +212,7 @@ class JointReplay:
                 return ReplayStatus.FAULT, "runtime failure"
             if self.runtime_state.quit_requested or "q" in keys:
                 return ReplayStatus.USER_QUIT, "operator quit"
-            if self.runtime_state.run_id != self.epoch:
+            if self.runtime_state.run_id != self.run_id:
                 cause = self.runtime_state.run_ended_reason
                 if cause == RunEndReason.QUIT:
                     return ReplayStatus.USER_QUIT, "operator quit"
@@ -264,7 +267,7 @@ class JointReplay:
                 return ReplayStatus.REJECTED, f"hand start target: {rejection}"
             expires_ns = time.monotonic_ns() + ACTION_TIMEOUT_NS
             self.robot.send_action(
-                RobotCommand(self.epoch, arm_hold, hand),
+                RobotCommand(self.run_id, arm_hold, hand),
                 expires_ns=expires_ns,
             )
             submitted_ns = time.monotonic_ns()

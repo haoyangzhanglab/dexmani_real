@@ -60,7 +60,7 @@ def test_observation_crosses_duration(tmp_path, monkeypatch, mode):
 def test_late_r_cannot_repeat_home(monkeypatch, boundary):
     jog = KeyboardTeleop(RealConfig())
     state = jog.runtime_state = SessionState()
-    epoch = state.arm()
+    run_id = state.arm()
     state.stop_signal.clear()
     # 使用生产绑定，不启动监听器或设备。
     monkeypatch.setattr('dexmani_real.teleop.keyboard.validate_robot_config', lambda _: None)
@@ -71,7 +71,7 @@ def test_late_r_cannot_repeat_home(monkeypatch, boundary):
     jog.start = lambda: None
     jog.run_control_loop = lambda: True
     jog.run()
-    state.begin_motion(run_id=epoch)
+    state.begin_motion(run_id=run_id)
     original = jog.keys.get_run_id
     captured, release = Event(), Event()
     def delayed():
@@ -105,7 +105,7 @@ def test_late_r_cannot_repeat_home(monkeypatch, boundary):
     jog.period_ns = 40_000_000
     monkeypatch.setattr('dexmani_real.teleop.keyboard.home_robot', home)
     try:
-        jog.run_home(epoch)
+        jog.run_home(run_id)
         release.set()
         thread.join(2)
         assert not thread.is_alive()
@@ -127,18 +127,18 @@ def test_late_r_cannot_repeat_home(monkeypatch, boundary):
 @pytest.mark.parametrize('stop_method', ['request_stop', 'request_quit', 'request_emergency_stop'])
 def test_stop_visible_before_lock_and_begin_refused(stop_method):
     state = SessionState()
-    epoch = state.arm()
+    run_id = state.arm()
     state.stop_signal.clear()
     thread = Thread(target=getattr(state, stop_method))
     with state.motion_lock:
         thread.start()
         assert state.stop_signal.wait(2)
-        assert state.begin_motion(run_id=epoch) is None
+        assert state.begin_motion(run_id=run_id) is None
     thread.join(2)
     assert not thread.is_alive()
 
 
-def test_begin_rejects_old_epoch():
+def test_begin_rejects_old_run_id():
     state = SessionState()
     old = state.arm()
     state.revoke_motion()
@@ -154,20 +154,20 @@ def test_start_intent_blocks_same_batch_and_stop_invalidates(tmp_path, key):
     from dexmani_real.runtime.keyboard import KeyEvent
     session, _ = make_session(tmp_path)
     state = session.runtime_state = SessionState()
-    epoch = state.arm()
+    run_id = state.arm()
     session.robot.reset_tactile_sensors = Mock()
-    session.handle_command_batch([KeyEvent('b', epoch), KeyEvent(key, epoch)], allow_tactile_reset=True)
-    assert session.start_epoch == epoch
+    selected = session.handle_command_batch([KeyEvent('b', run_id), KeyEvent(key, run_id)], allow_tactile_reset=True)
+    assert selected == run_id
     session.robot.reset_tactile_sensors.assert_not_called()
     state.request_stop()
     # 回调不修改主线程意图；主线程消费时拒绝已撤销的代际。
-    assert session.start_epoch == epoch
+    assert selected == run_id
     def idle():
         state.request_quit()
     session.robot.service_idle = idle
-    session.poll_operator = lambda **kwargs: None
+    session.poll_operator = lambda **kwargs: selected
     session.run_control_loop()
-    assert session.episode is None and session.start_epoch is None
+    assert session.episode is None
 
 
 @pytest.mark.parametrize('error', [ValueError('model failed'), RuntimeError('writer failed')])
@@ -193,9 +193,9 @@ def test_jog_stop_during_home_and_prepare(monkeypatch, boundary, key):
     from dexmani_real.runtime.state import SafetyState
     jog = KeyboardTeleop(RealConfig())
     state = jog.runtime_state = SessionState()
-    epoch = state.arm()
+    run_id = state.arm()
     state.stop_signal.clear()
-    state.begin_motion(run_id=epoch)
+    state.begin_motion(run_id=run_id)
     jog.keys = Keyboard(get_run_id=jog.running_run_id,
                         estop_callback=state.request_emergency_stop,
                         bindings={'q': state.request_quit})
@@ -216,7 +216,7 @@ def test_jog_stop_during_home_and_prepare(monkeypatch, boundary, key):
     jog.robot.prepare_streaming.side_effect = prepare
     monkeypatch.setattr('dexmani_real.teleop.keyboard.home_robot', home)
     with pytest.raises(OperationCancelled):
-        jog.run_home(epoch)
+        jog.run_home(run_id)
     assert state.safety_state != SafetyState.RUNNING
     jog.robot.send_action.assert_not_called()
     assert state.quit_requested == (key == 'q')
@@ -234,14 +234,14 @@ def test_preparation_cannot_reauthorize(tmp_path, caller, stop_method):
     episode, _ = make_rollout(tmp_path)
     state = episode.runtime_state
     state.safety_state = SafetyState.ARMED
-    episode.robot.prepare_streaming = lambda epoch: getattr(state, stop_method)()
+    episode.robot.prepare_streaming = lambda run_id: getattr(state, stop_method)()
     if caller == 'policy':
         episode.start_observation = Mock(return_value=object())
         episode.prepare(lambda: None)
         assert episode.finished
     else:
         replay = JointReplay(state, episode.runtime, None, robot=episode.robot)
-        replay.epoch = episode.epoch
+        replay.run_id = episode.run_id
         replay.read_feedback = lambda: SimpleNamespace(
             arm={'qpos': np.zeros((1, 7))}, hand={'qpos': np.zeros((1, 12))})
         status, _, _ = replay.admit_replay(SimpleNamespace(
@@ -281,13 +281,12 @@ def test_successful_rollout_returns_idle_only_after_reclaim(tmp_path, monkeypatc
     session, _ = make_session(tmp_path)
     session.runtime_state = state
     session.model = worker
-    session.start_epoch = episode.epoch
     session.num_episodes = None
     session.action_mapper = session.camera_snapshot = None
     session.robot.service_idle = lambda: None
     session.keyboard = Mock()
     def prepare(poll):
-        assert state.begin_motion(run_id=episode.epoch) is not None
+        assert state.begin_motion(run_id=episode.run_id) is not None
         worker.predict(())
         assert entered.wait(2)
         episode.stop('operator', run_end_reason=RunEndReason.OPERATOR)
@@ -301,6 +300,7 @@ def test_successful_rollout_returns_idle_only_after_reclaim(tmp_path, monkeypatc
         if session.episodes:
             assert session.episode is None and worker.future is None
             state.request_quit()
+        return episode.run_id
     session.poll_operator = poll
     factory = Mock(return_value=episode)
     monkeypatch.setattr('dexmani_real.deployment.session.Rollout', factory)
@@ -311,7 +311,7 @@ def test_successful_rollout_returns_idle_only_after_reclaim(tmp_path, monkeypatc
     finally:
         release.set()
         worker.close(state)
-        assert worker.wait_closed(2) == ('completed', [])
+        assert worker.wait_closed(2) is True
     assert len(owners) == 4 and len(set(owners)) == 1
     assert owners[0] != get_ident()
 
@@ -356,14 +356,14 @@ def test_jog_consumes_fresh_r_after_invalid_events(monkeypatch, events):
 
     jog = KeyboardTeleop(RealConfig())
     state = jog.runtime_state = SessionState()
-    epoch = state.arm()
+    run_id = state.arm()
     state.stop_signal.clear()
-    state.begin_motion(run_id=epoch)
+    state.begin_motion(run_id=run_id)
     jog.keys = Keyboard(get_run_id=jog.running_run_id)
     jog.keys.active = True
     jog.keys.listener = Mock()
     jog.keys.handle_key('w', True)
-    identities = {'busy': None, 'old': epoch - 1, 'fresh': epoch}
+    identities = {'busy': None, 'old': run_id - 1, 'fresh': run_id}
     jog.keys.events.extend(KeyEvent('r', identities[event]) for event in events)
     jog.tick_due_ns = 100
     jog.period_ns = 40
@@ -374,19 +374,19 @@ def test_jog_consumes_fresh_r_after_invalid_events(monkeypatch, events):
     monkeypatch.setattr(time, 'monotonic_ns', lambda: 100)
     try:
         assert jog.run_control_loop()
-        home.assert_called_once_with(epoch)
+        home.assert_called_once_with(run_id)
         assert 'w' in jog.keys.snapshot()
         jog.jog.step.assert_not_called()
     finally:
         jog.keys.stop()
 
 
-def test_stop_between_start_check_and_intent_assignment(tmp_path, monkeypatch):
+def test_stop_between_start_selection_and_admission(tmp_path, monkeypatch):
     from test_policy import make_session
 
     session, _ = make_session(tmp_path)
     state = session.runtime_state = SessionState()
-    epoch = state.arm()
+    run_id = state.arm()
     can_move = state.can_move
     def stop_after_check(**kwargs):
         allowed = can_move(**kwargs)
@@ -394,9 +394,10 @@ def test_stop_between_start_check_and_intent_assignment(tmp_path, monkeypatch):
         return allowed
     with monkeypatch.context() as patch:
         patch.setattr(state, 'can_move', stop_after_check)
-        assert session.request_start(epoch)
-    assert session.start_epoch == epoch
-    session.poll_operator = lambda **kwargs: None
+        from dexmani_real.runtime.keyboard import KeyEvent
+        selected = session.handle_command_batch([KeyEvent("b", run_id)])
+    assert selected == run_id
+    session.poll_operator = lambda **kwargs: selected
     # 第一轮消费旧意图，第二轮退出；不能构造任何 Rollout。
     calls = [0]
     def idle():
@@ -408,4 +409,4 @@ def test_stop_between_start_check_and_intent_assignment(tmp_path, monkeypatch):
     monkeypatch.setattr('dexmani_real.deployment.session.Rollout', factory)
     session.run_control_loop()
     factory.assert_not_called()
-    assert session.start_epoch is None
+    assert session.episode is None

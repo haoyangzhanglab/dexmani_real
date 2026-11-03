@@ -2,10 +2,7 @@
 
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import TYPE_CHECKING, cast
-
-from dexmani_real.utils.log import error_detail
 
 if TYPE_CHECKING:
     from dexmani_policy.deployment import PolicyRuntime
@@ -76,7 +73,7 @@ class PolicyWorker:
         retired, operation = self.future, self.operation
 
         def close_model():
-            errors = []
+            failure = None
             if retired is not None:
                 try:
                     retired.result()
@@ -84,7 +81,7 @@ class PolicyWorker:
                     if isinstance(exc, KeyboardInterrupt):
                         runtime_state.request_emergency_stop()
                     logger.exception("retired model task failed: %s", operation)
-                    errors.append(error_detail(f"retired_{operation}", exc))
+                    failure = exc
             try:
                 if self.model is not None:
                     self.model.close()
@@ -92,18 +89,19 @@ class PolicyWorker:
                 if isinstance(exc, KeyboardInterrupt):
                     runtime_state.request_emergency_stop()
                 logger.exception("model close failed")
-                errors.append(error_detail("model_close", exc))
-            return errors
+                if failure is None:
+                    failure = exc
+            if failure is not None:
+                raise failure
 
         self.close_future = self.executor.submit(close_model)
         self.future = self.operation = None
         self.executor.shutdown(wait=False, cancel_futures=False)
         return self.close_future
 
-    def wait_closed(self, timeout_s=0.0):
-        future = cast(Future[list[dict]], self.close_future)
-        try:
-            errors = future.result(timeout=max(0.0, timeout_s))
-        except FutureTimeoutError:
-            return "pending", []
-        return "failed" if errors else "completed", errors
+    def wait_closed(self, timeout_s=0.0) -> bool:
+        future = cast(Future[None], self.close_future)
+        if future not in wait((future,), timeout=max(0.0, timeout_s)).done:
+            return False
+        future.result()
+        return True

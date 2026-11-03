@@ -73,9 +73,9 @@ class EpisodeResult:
 
 class Rollout:
     def __init__(
-        self, runtime_state, runtime, policy_info, *, epoch, robot,
+        self, runtime_state, runtime, policy_info, *, run_id, robot,
         observations, needs, sensors, action_mapper, model, max_running_s,
-        capture_ids, index, output_dir, record_raw, audio, camera_snapshot=None,
+        index, output_dir, record_raw, audio, camera_snapshot=None,
     ):
         self.runtime_state = runtime_state
         self.runtime = runtime
@@ -93,8 +93,7 @@ class Rollout:
         self.result = EpisodeResult(index)
         self.camera_snapshot = camera_snapshot
         self.max_duration_ns = int(max_running_s * 1e9) if max_running_s is not None else None
-        self.capture_ids = capture_ids
-        self.epoch = epoch
+        self.run_id = run_id
         self.history: deque[PolicyObservationRow] = deque(maxlen=policy_info.n_obs_steps)
         self.last_history_timestamp_ns = None
         self.plan: ActionChunk | None = None
@@ -137,7 +136,7 @@ class Rollout:
         ended_ns = time.monotonic_ns()
         reason = self.runtime_state.revoke_motion(
             reason=run_end_reason,
-            expected_run_id=self.epoch,
+            expected_run_id=self.run_id,
         )
         self.result.duration_s = (ended_ns - self.started_ns) / 1e9 if self.started_ns else 0.0
         self.result.termination_reason = (
@@ -169,15 +168,15 @@ class Rollout:
                 result.raw = self.recorder.result()
             if not result.errors and not self.runtime_state.estop_request:
                 if published is not None and result.normal_termination:
-                    self.audio.play("save", interrupt=False)
+                    self.audio.play("save")
                 elif not save:
-                    self.audio.play("discard", interrupt=False)
+                    self.audio.play("discard")
 
     @property
     def writer_pending(self):
         return self.recorder is not None and self.recorder.writer_pending
 
-    def run(self, *, keyboard, poll_operator):
+    def run(self, *, poll_operator):
         """一段控制及其收尾顺序完成；返回后不再依赖外层 tick 回收任务。"""
         try:
             try:
@@ -236,16 +235,15 @@ class Rollout:
                     self.audio.play("emergency")
                     if failure is None:
                         failure = exc
-            # 清队列之前结束收尾代际，也撤销已取身份但尚未入队的旧 B/H/T。
+            # 结束收尾代际，也撤销已取身份但尚未入队的旧 B/H/T。
             self.runtime_state.revoke_motion()
-            keyboard.discard_events("b", "h", "t")
             if failure is not None and primary_failure is None:
                 raise failure
         return self.result
 
     def preparation_valid(self):
         valid = self.runtime_state.can_move(
-            run_id=self.epoch,
+            run_id=self.run_id,
             required_safety_state=SafetyState.ARMED,
         )
         if not valid:
@@ -271,24 +269,23 @@ class Rollout:
         return row
 
     def prepare(self, poll_operator):
-        logger.info("Policy preparing run=%s", self.epoch)
+        logger.info("Policy preparing run=%s", self.run_id)
         if self.recorder is not None:
             metadata = snapshot_recording_metadata(
                 self.camera_snapshot,
                 tactile_reset_metadata=self.robot.hand.get_tactile_reset_metadata(),
                 tactile_hold_max_age_s=self.runtime.hand.feedback_max_age_s,
             )
-            capture_id = next(self.capture_ids)
             self.recorder.start(
                 task_label=self.policy_info.task_name,
-                episode_name=f"episode_{capture_id:03d}", collection_source="policy_rollout", metadata=metadata,
+                episode_name=f"episode_{self.result.index:03d}", collection_source="policy_rollout", metadata=metadata,
             )
         # writer 与模式恢复之后只读一次有效快照，不要求来源晚于 prepare。
         poll_operator()
         if not self.preparation_valid():
             self.stop("cancelled during recorder start")
             return
-        self.robot.prepare_streaming(self.epoch)
+        self.robot.prepare_streaming(self.run_id)
         poll_operator()
         if not self.preparation_valid():
             self.stop("cancelled during streaming preparation")
@@ -296,7 +293,7 @@ class Rollout:
         if self.start_observation() is None:
             self.stop(self.preparation_issue)
             return
-        started_ns = self.runtime_state.begin_motion(run_id=self.epoch)
+        started_ns = self.runtime_state.begin_motion(run_id=self.run_id)
         if started_ns is None:
             self.robot.check()
             self.stop("final admission declined")
@@ -311,7 +308,7 @@ class Rollout:
         )
         self.result.started_utc = utc_now()
         logger.info("Policy active run=%s; collecting %d observation frames before first prediction",
-                    self.epoch, self.history.maxlen)
+                    self.run_id, self.history.maxlen)
 
     def poll_model(self):
         item = self.model.poll()
@@ -356,7 +353,7 @@ class Rollout:
             decoded = self.action_mapper.map_eef(pose, action[9:], current, self.previous_arm)
         if decoded.rejection_reason is not None or decoded.arm_qpos is None:
             return None, f"action_rejected: {decoded.rejection_reason}"
-        return RobotCommand(self.epoch, decoded.arm_qpos, decoded.hand_qpos), None
+        return RobotCommand(self.run_id, decoded.arm_qpos, decoded.hand_qpos), None
 
     def submit_prefetch(self, plan: ActionChunk, slot):
         handoff_slot, issue = prefetch_handoff(
@@ -397,7 +394,7 @@ class Rollout:
         try:
             if self.finished:
                 return
-            if not self.runtime_state.can_move(run_id=self.epoch):
+            if not self.runtime_state.can_move(run_id=self.run_id):
                 self.robot.check()
                 self.stop("owner_authority_revoked")
                 return
@@ -491,8 +488,8 @@ class Rollout:
             attempted_command = command
             self.robot.send_action(command, expires_ns=expires_ns)
             if self.previous_arm is None:
-                logger.info("Policy first target submitted run=%s", self.epoch)
-                self.audio.play("begin", interrupt=False)
+                logger.info("Policy first target submitted run=%s", self.run_id)
+                self.audio.play("begin")
             self.previous_arm = command.arm_qpos
             self.target_expires_ns = expires_ns
             self.wait_deadline_ns = None
@@ -509,7 +506,7 @@ class Rollout:
                         RunEndReason.EXECUTOR_BOUNDARY
                         if isinstance(primary_error, OperationCancelled) else failure_reason(primary_error)
                     ),
-                    expected_run_id=self.epoch,
+                    expected_run_id=self.run_id,
                 )
             if row is not None and self.recorder is not None:
                 try:

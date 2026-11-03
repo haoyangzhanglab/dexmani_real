@@ -5,7 +5,6 @@ import multiprocessing as mp
 import sys
 import time
 from dataclasses import asdict
-from itertools import count
 
 from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.control.actions import ActionMapper
@@ -65,8 +64,6 @@ class PolicySession:
         self.sensors = self.robot = self.keyboard = self.model = None
         self.audio = None
         self.episode = None
-        self.start_epoch: int | None = None  # 仅主线程设置和消费。
-        self.capture_ids = count(1)
         self.episodes, self.errors = [], []
         self.summary = dict(
             started_utc=utc_now(), ended_utc=None, outcome="incomplete", reason=None, shutdown=None,
@@ -232,11 +229,9 @@ class PolicySession:
         self.warmup_policy()
         self.check_startup()
         self.runtime_state.revoke_motion()
-        self.keyboard.discard_events("h", "b", "t")
 
     def close(self, *, failure=None):
         close_errors = []
-        model_errors = []
         try:
             close_runtime(
                 self.runtime_state, self.robot, sensors=self.sensors, keyboard=self.keyboard,
@@ -252,7 +247,8 @@ class PolicySession:
             try:
                 self.model.close(self.runtime_state)
                 stage = "model_close_wait"
-                model_status, model_errors = self.model.wait_closed(MODEL_SHUTDOWN_TIMEOUT_S)
+                model_status = ("completed" if self.model.wait_closed(MODEL_SHUTDOWN_TIMEOUT_S)
+                                else "pending")
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
@@ -274,7 +270,7 @@ class PolicySession:
         pending = any((model_status == "pending", writer_pending, robot_pending, sensor_pending, keyboard_pending))
         shutdown = (
             "pending" if pending else "completed"
-            if model_status == "completed" and not close_errors and not model_errors else "failed"
+            if model_status == "completed" and not close_errors else "failed"
         )
         failure_detail = None
         if failure is not None:
@@ -285,17 +281,15 @@ class PolicySession:
                 failure_detail = error_detail("session", failure)
                 self.errors.append(failure_detail)
         self.errors.extend(error_detail(stage, error) for stage, error in close_errors)
-        self.errors.extend(model_errors)
-        episode_error = next((error for result in self.episodes for error in result.errors), None)
         successful = (
             not self.errors and shutdown == "completed"
-            and episode_error is None
+            and failure is None
             and self.runtime_state.quit_requested
             and not self.runtime_state.estop_request and not self.runtime_state.error_state
         )
         if self.audio is not None:
             try:
-                self.audio.finish(successful)
+                self.audio.close()
             except Exception:
                 logger.warning("policy audio shutdown failed", exc_info=True)
             except KeyboardInterrupt as exc:
@@ -306,7 +300,7 @@ class PolicySession:
                 if shutdown != "pending":
                     shutdown = "failed"
         reason = self.summary["reason"]
-        reason_error = failure_detail or (self.errors[0] if self.errors else episode_error)
+        reason_error = failure_detail or (self.errors[0] if self.errors else None)
         if reason_error is not None:
             reason = reason_error["message"] or reason_error["exception_type"]
         elif not successful:
@@ -369,43 +363,38 @@ class PolicySession:
                 self.episode.discard_requested = True
             self.runtime_state.request_stop()
 
-    def poll_operator(self, *, allow_tactile_reset: bool = False) -> None:
-        self.handle_command_batch(
+    def poll_operator(self, *, allow_tactile_reset: bool = False) -> int | None:
+        return self.handle_command_batch(
             self.keyboard.poll(timeout=0),
             allow_tactile_reset=allow_tactile_reset,
         )
 
-    def handle_command_batch(self, signals, *, allow_tactile_reset=False) -> None:
+    def handle_command_batch(self, signals, *, allow_tactile_reset=False) -> int | None:
         keys = {event.key for event in signals}
         if "esc" in keys:
             self.runtime_state.request_emergency_stop()
-            return
+            return None
         if "q" in keys:
             self.audio.play("quit")
         if keys.intersection({"s", "c", "d", "q"}):
             logger.debug("operator: S/C/D/Q suppresses preparation commands in this batch")
-            return
-        preparation_blocked = False
+            return None
         for event in signals:
             signal = event.key
             if signal == "b":
-                if preparation_blocked or not self.request_start(event.run_id):
-                    logger.warning("operator: ignored B while stopped or preparing")
+                if self.episode is None and self.runtime_state.can_move(
+                    run_id=event.run_id, required_safety_state=SafetyState.ARMED,
+                ):
+                    return event.run_id
             elif signal == "h":
                 if self.run_home(event.run_id):
-                    return
+                    return None
             elif signal == "t":
                 if not self.runtime.hand.enabled:
                     logger.info("T ignored: hand is disabled")
                     continue
-                if preparation_blocked:
-                    continue
-                preparation_blocked = True
-                if (
-                    self.start_epoch is not None or not allow_tactile_reset
-                    or self.episode is not None
-                ):
-                    logger.warning("T ignored: tactile reset requires idle without a start intent")
+                if not allow_tactile_reset or self.episode is not None:
+                    logger.warning("T ignored: tactile reset requires idle")
                     continue
                 if not self.runtime_state.can_move(
                     run_id=event.run_id, required_safety_state=SafetyState.ARMED,
@@ -423,18 +412,18 @@ class PolicySession:
                     logger.info("%s", exc)
                 finally:
                     self.runtime_state.revoke_motion()
-                    self.keyboard.discard_events("t", "h", "b")
-                return
+                return None
+        return None
 
     def run_home(self, run_id) -> bool:
         home_allowed = (
-            self.episode is None and self.start_epoch is None
+            self.episode is None
             and self.runtime_state.can_move(
                 run_id=run_id, required_safety_state=SafetyState.ARMED,
             )
         )
         if not home_allowed:
-            logger.warning("H 仅限空闲且未请求启动时使用；活动段请先按 S。")
+            logger.warning("H 仅限空闲时使用；活动段请先按 S。")
             return False
         logger.info("正在回初始位…")
         self.audio.play("home")
@@ -451,11 +440,10 @@ class PolicySession:
             self.robot.check()
             logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
         else:
-            self.audio.play("home_done", interrupt=False)
+            self.audio.play("home_done")
             logger.info("已回初始位，按 B 开始。")
         finally:
             self.runtime_state.revoke_motion()
-            self.keyboard.discard_events("t", "h", "b")
         return True
 
     def get_home_planner(self):
@@ -479,40 +467,29 @@ class PolicySession:
         self.robot.check()
         return not self.runtime_state.requests_allow_motion()
 
-    def request_start(self, epoch):
-        if self.start_epoch is not None or self.episode is not None:
-            return False
-        if not self.runtime_state.can_move(
-            run_id=epoch, required_safety_state=SafetyState.ARMED,
-        ):
-            return False
-        self.start_epoch = epoch
-        return True
-
     def run_control_loop(self):
         while not self.runtime_state.quit_requested:
-            self.poll_operator(allow_tactile_reset=True)
+            run_id = self.poll_operator(allow_tactile_reset=True)
             self.robot.service_idle()
             if self.runtime_state.estop_request or self.runtime_state.error_state:
                 break
-            epoch, self.start_epoch = self.start_epoch, None
-            if epoch is not None and not self.runtime_state.can_move(
-                run_id=epoch, required_safety_state=SafetyState.ARMED,
+            if run_id is not None and not self.runtime_state.can_move(
+                run_id=run_id, required_safety_state=SafetyState.ARMED,
             ):
-                epoch = None
-            if epoch is None:
+                run_id = None
+            if run_id is None:
                 time.sleep(0.005)
                 continue
             episode = self.episode = Rollout(
-                self.runtime_state, self.runtime, self.info, epoch=epoch,
+                self.runtime_state, self.runtime, self.info, run_id=run_id,
                 robot=self.robot, sensors=self.sensors, observations=self.observations,
                 needs=self.needs, action_mapper=self.action_mapper, model=self.model,
-                max_running_s=self.max_running_s, capture_ids=self.capture_ids,
+                max_running_s=self.max_running_s,
                 index=len(self.episodes) + 1, output_dir=self.output_dir, record_raw=self.record_raw,
                 camera_snapshot=self.camera_snapshot, audio=self.audio,
             )
             try:
-                episode.run(keyboard=self.keyboard, poll_operator=self.poll_operator)
+                episode.run(poll_operator=self.poll_operator)
             finally:
                 primary_failure = sys.exc_info()[0] is not None
                 self.episodes.append(episode.result)

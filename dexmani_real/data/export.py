@@ -110,7 +110,14 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     reject_invalid(np.diff(observation) <= 0, "observation_clock_not_increasing", 1)
     grid_error = control - int(control[0]) - np.arange(frames) * period
     reject_invalid(np.abs(np.diff(control) - period) > tolerance, "control_interval_gap_or_drift", 1)
-    reject_invalid(np.abs(grid_error) > tolerance, "control_grid_drift")
+    mean_period = None
+    if frames >= 2:
+        duration = int(control[-1]) - int(control[0])
+        expected_duration = (frames - 1) * period
+        # 固定 5% 平均周期容差；局部采样质量仍由相邻间隔约束。
+        if 20 * abs(duration - expected_duration) > expected_duration:
+            raise ValueError("mean_control_period_drift")
+        mean_period = duration / (frames - 1)
     readout = observation - control
     reject_invalid(readout >= period, "observation_crossed_control_period")
     reject_invalid(observation[:-1] >= control[1:], "overlapping_control_observations")
@@ -135,6 +142,7 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     return camera, dict(
         max_control_grid_deviation_ns=int(np.abs(grid_error).max()),
         max_readout_ns=int(readout.max()),
+        mean_control_period_ns=mean_period,
     )
 
 

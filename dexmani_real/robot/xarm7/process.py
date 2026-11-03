@@ -17,6 +17,8 @@ from dexmani_real.robot.xarm7.protocol import (
 )
 
 if TYPE_CHECKING:
+    from multiprocessing.process import BaseProcess
+
     from dexmani_real.runtime.state import SessionState
 
 logger = logging.getLogger(__name__)
@@ -27,22 +29,21 @@ class ArmProcess:
         self,
         cfg,
         *,
-        run_signal,
-        stop_signal,
-        emergency_signal,
+        runtime_state: "SessionState",
     ):
+        self.runtime_state = runtime_state
         self.cfg = cfg
         self.ctx = mp.get_context("spawn")
         self.io = ArmChannels(
             self.ctx,
-            run_signal=run_signal,
-            stop_signal=stop_signal,
-            emergency_signal=emergency_signal,
+            run_signal=runtime_state.run_signal,
+            stop_signal=runtime_state.stop_signal,
+            emergency_signal=runtime_state.emergency_signal,
         )
         self.pipe, self.child_pipe = self.ctx.Pipe()
-        self.process = None
-        self._fault_error = None
-        self._close_error = None
+        self.process: BaseProcess | None = None
+        self._fault_error: RobotError | None = None
+        self._close_error: RobotError | None = None
 
     @property
     def is_connected(self):
@@ -202,10 +203,14 @@ class ArmProcess:
             if time.monotonic_ns() >= deadline_ns:
                 raise TimeoutError("arm operation completed after deadline")
         except BaseException as failure:
+            if isinstance(failure, KeyboardInterrupt):
+                self.runtime_state.request_emergency_stop()
             errors = []
             try:
                 self.request_stop()
             except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
                 errors.append(("arm_operation_stop_request", exc))
             # 本请求仍独占自己的回复；停止等待绝不接管 Pipe。
             cleanup_until = time.monotonic() + EXECUTOR_TIMEOUT_S
@@ -223,10 +228,14 @@ class ArmProcess:
                                 raise self._read_fault() from reply
                             raise RobotError("arm operation also failed") from reply
             except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
                 errors.append(("arm_operation_reply", exc))
             try:
                 self.wait_stopped(deadline=cleanup_until)
             except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
                 errors.append(("arm_operation_stop", exc))
             if errors:
                 # 回复和停止分别收尾；任一未确认都禁止复用这个 owner。
@@ -269,7 +278,7 @@ class ArmProcess:
             raise error
         self.check_error()
 
-    def close(self, runtime_state: "SessionState") -> None:
+    def close(self) -> None:
         self.request_stop()
         self.io.closing.set()
         errors: list[BaseException] = []
@@ -280,7 +289,7 @@ class ArmProcess:
                 self.process.join(EXECUTOR_TIMEOUT_S)
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
-                    runtime_state.request_emergency_stop()
+                    self.runtime_state.request_emergency_stop()
                 errors.append(exc)
         # join 后保留晚到故障；已上报的运行故障不再冒充一次关闭失败。
         fault, close_error = self._read_fault(), self._read_close_error()
@@ -304,7 +313,7 @@ class ArmProcess:
                     pipe.close()
                 except BaseException as exc:
                     if isinstance(exc, KeyboardInterrupt):
-                        runtime_state.request_emergency_stop()
+                        self.runtime_state.request_emergency_stop()
                     errors.append(exc)
         if errors:
             for error in errors[1:]:

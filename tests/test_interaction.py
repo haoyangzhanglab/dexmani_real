@@ -24,7 +24,7 @@ def make_loop():
         hand=SimpleNamespace(enabled=False),
     )
     robot = Mock()
-    robot.prepare_streaming.side_effect = lambda epoch: state.stop_signal.clear()
+    robot.prepare_streaming.side_effect = lambda run_id: state.stop_signal.clear()
     controller = Mock(hand_retargeter=None)
     controller.compute_target.return_value = SimpleNamespace(
         rejection_reason=None, arm_qpos=np.zeros(7), hand_qpos=None, eef_pose=None,
@@ -80,7 +80,7 @@ class Recorder:
 def test_stop_ends_segment_and_new_b_reanchors(key):
     loop = make_loop()
     begin(loop)
-    old_epoch = loop.run_id
+    old_run_id = loop.run_id
     loop.keyboard.handle_key(key, True)
     loop.handle_commands(loop.keyboard.poll(0))
     assert loop.pending_termination_reason == 'operator'
@@ -89,7 +89,7 @@ def test_stop_ends_segment_and_new_b_reanchors(key):
     assert loop.phase is TeleopPhase.IDLE
     loop.robot.stop.assert_called_once()
     begin(loop)
-    assert loop.run_id != old_epoch
+    assert loop.run_id != old_run_id
     assert loop.controller.reset.call_count == 2
 
 
@@ -106,10 +106,10 @@ def test_stop_event_consumption_does_not_repeat_keyboard_revocation(key):
     loop = make_loop()
     begin(loop)
     loop.keyboard.handle_key(key, True)
-    revoked_epoch = loop.runtime_state.run_id
+    revoked_run_id = loop.runtime_state.run_id
     assert loop.runtime_state.stop_signal.is_set()
     loop.handle_commands(loop.keyboard.poll(0))
-    assert loop.runtime_state.run_id == revoked_epoch
+    assert loop.runtime_state.run_id == revoked_run_id
     assert loop.discard_requested == (key == 'd')
     assert loop.runtime_state.quit_requested == (key == 'q')
     assert loop.pending_termination_reason == ('quit' if key == 'q' else 'operator')
@@ -120,7 +120,7 @@ def test_stop_event_consumption_does_not_repeat_keyboard_revocation(key):
 def test_prepare_can_be_cancelled_by_keyboard(key):
     loop = make_loop()
 
-    def prepare(epoch):
+    def prepare(run_id):
         loop.runtime_state.stop_signal.clear()
         loop.keyboard.handle_key(key, True)
         raise OperationCancelled('prepare revoked')
@@ -152,7 +152,7 @@ def test_discard_and_single_q_do_not_publish(keys):
     assert 'save' not in [call.args[0] for call in loop.audio.play.call_args_list]
 
 
-def test_save_decision_precedes_late_discard_and_drops_preparation_keys():
+def test_save_decision_precedes_late_discard_and_revokes_preparation_keys():
     loop = make_loop()
     begin(loop)
 
@@ -162,12 +162,14 @@ def test_save_decision_precedes_late_discard_and_drops_preparation_keys():
             loop.keyboard.handle_key(key, True)
 
     recorder = loop.recorder = Recorder(during_finish)
-    loop.request_episode_end('operator', run_end_reason=RunEndReason.OPERATOR, failed=False)
+    loop.keyboard.handle_key('s', True)
+    loop.handle_commands(loop.keyboard.poll(0))
     loop.end_episode()
     assert recorder.calls[0]['save'] is True
     prompts = [call.args[0] for call in loop.audio.play.call_args_list]
     assert 'save' in prompts and 'discard' not in prompts
-    assert loop.keyboard.poll(0) == []
+    loop.handle_commands(loop.keyboard.poll(0))
+    assert loop.phase is TeleopPhase.IDLE
 
 
 def test_discard_without_recording_stops_and_new_episode_resets_intent():
@@ -177,12 +179,13 @@ def test_discard_without_recording_stops_and_new_episode_resets_intent():
     assert loop.runtime_state.stop_signal.is_set()
     loop.robot.stop.assert_not_called()
     begin(loop)
-    loop.request_discard()
-    loop.request_episode_end('discard', run_end_reason=RunEndReason.OPERATOR, failed=False)
+    loop.keyboard.handle_key('d', True)
+    loop.handle_commands(loop.keyboard.poll(0))
     loop.end_episode()
     begin(loop)
     recorder = loop.recorder = Recorder()
-    loop.request_episode_end('operator', run_end_reason=RunEndReason.OPERATOR, failed=False)
+    loop.keyboard.handle_key('s', True)
+    loop.handle_commands(loop.keyboard.poll(0))
     loop.end_episode()
     assert recorder.calls[0]['save'] is True
 
@@ -199,9 +202,9 @@ def test_h_active_does_not_stop_or_home():
 
 def test_old_start_intent_cannot_reauthorize():
     loop = make_loop()
-    epoch = loop.runtime_state.run_id
+    run_id = loop.runtime_state.run_id
     loop.runtime_state.request_stop()
-    loop.start_episode(epoch)
+    loop.start_episode(run_id)
     assert loop.phase is TeleopPhase.IDLE
     loop.robot.prepare_streaming.assert_not_called()
 
@@ -237,8 +240,8 @@ def test_primary_error_survives_stop_and_writer_failures(caplog):
     recorder = loop.recorder = Recorder()
     recorder.finish = Mock(side_effect=writer)
 
-    def fail_start(epoch):
-        loop.run_id = epoch
+    def fail_start(run_id):
+        loop.run_id = run_id
         loop.phase = TeleopPhase.PREPARING
         raise primary
 
@@ -324,10 +327,10 @@ def test_preparation_event_delayed_until_after_boundary_is_revoked(boundary, key
     workers = []
 
     def delayed_generation():
-        epoch = loop.runtime_state.run_id
+        run_id = loop.runtime_state.run_id
         captured.set()
         assert release.wait(2)
-        return epoch
+        return run_id
 
     def input_at_boundary():
         loop.keyboard.get_run_id = delayed_generation
@@ -341,7 +344,8 @@ def test_preparation_event_delayed_until_after_boundary_is_revoked(boundary, key
         if boundary == 'finish':
             begin(loop)
             loop.recorder = Recorder(input_at_boundary)
-            loop.request_episode_end('operator', run_end_reason=RunEndReason.OPERATOR, failed=False)
+            loop.keyboard.handle_key('s', True)
+            loop.handle_commands(loop.keyboard.poll(0))
             loop.end_episode()
         elif boundary == 'startup':
             loop.sensors.channels = SimpleNamespace(vr_ring=SimpleNamespace(latest_sequence=1))
@@ -386,7 +390,6 @@ def test_target_rejection_without_recording_reports_reason_once(caplog):
     loop.execute_control_step(observation(), tick_end_ns=10**18)
     loop.robot.send_action.assert_not_called()
     assert loop.recorder is None
-    loop.request_episode_end('interrupted', run_end_reason=RunEndReason.OPERATOR, failed=False)
     loop.end_episode()
     messages = [record.getMessage() for record in caplog.records if '本段结束' in record.getMessage()]
     assert len(messages) == 1
@@ -396,15 +399,15 @@ def test_target_rejection_without_recording_reports_reason_once(caplog):
 def test_revocation_returns_first_reason_without_revoking_new_run():
     loop = make_loop()
     begin(loop)
-    state, epoch = loop.runtime_state, loop.run_id
+    state, run_id = loop.runtime_state, loop.run_id
     state.request_stop()
     assert state.revoke_motion(reason=RunEndReason.HARDWARE_FAULT,
-                               expected_run_id=epoch) == RunEndReason.OPERATOR
+                               expected_run_id=run_id) == RunEndReason.OPERATOR
     loop.request_episode_end('late SDK error', run_end_reason=RunEndReason.HARDWARE_FAULT)
     loop.end_episode()
     begin(loop)
     current = state.run_id
-    state.revoke_motion(expected_run_id=epoch)
+    state.revoke_motion(expected_run_id=run_id)
     assert state.run_id == current and state.can_move(run_id=current)
 
 
@@ -419,3 +422,69 @@ def test_emergency_signals_precede_motion_lock():
     worker.join(2)
     assert not worker.is_alive() and state.estop_request
 
+
+
+@pytest.mark.parametrize('read_ms,send', [(20, True), (62.5, False), (80, False)])
+def test_first_control_read_uses_start_clock(monkeypatch, read_ms, send):
+    loop = make_loop()
+    begin(loop)
+    loop.control_dt_ns = 62_500_000
+    clock = [1_000_000_000]
+    monkeypatch.setattr('dexmani_real.teleop.loop.time.monotonic_ns', lambda: clock[0])
+    def read(*args, **kwargs):
+        row = observation()
+        row.control_timestamp_ns = clock[0]
+        clock[0] += int(read_ms * 1e6)
+        row.observation_timestamp_ns = clock[0]
+        return row
+    monkeypatch.setattr('dexmani_real.teleop.loop.read_observation', read)
+    loop.admit_observation = lambda row: []
+    loop.run_control_tick()
+    assert loop.robot.send_action.called == send
+    assert loop.controller.compute_target.called == send
+    assert loop.next_tick_ns == 1_000_000_000 + (62_500_000 if send else 125_000_000)
+    if send:
+        clock[0] = 1_000_000_000 + 3 * 62_500_000 + 1_000_000
+        loop.run_control_tick()
+        assert loop.robot.send_action.call_count == 2
+        assert loop.next_tick_ns == 1_250_000_000
+
+
+@pytest.mark.parametrize('old_key', ['b', 'h', 't'])
+def test_old_preparation_does_not_consume_fresh_start(old_key):
+    loop = make_loop()
+    run_id = loop.runtime_state.run_id
+    loop.run_episode = Mock()
+    loop.handle_commands([KeyEvent(old_key, run_id-1), KeyEvent('b', run_id)])
+    loop.run_episode.assert_called_once_with(run_id)
+
+
+@pytest.mark.parametrize('cause', ['deadline', 'stop'])
+def test_target_computation_cannot_submit_after_revocation_or_deadline(monkeypatch, cause):
+    loop = make_loop()
+    begin(loop)
+    clock = [1_000_000_000]
+    monkeypatch.setattr('dexmani_real.teleop.loop.time.monotonic_ns', lambda: clock[0])
+    target = loop.controller.compute_target.return_value
+    def compute(*args, **kwargs):
+        if cause == 'deadline':
+            clock[0] += 100_000_000
+        else:
+            loop.runtime_state.request_stop()
+        return target
+    loop.controller.compute_target.side_effect = compute
+    loop.execute_control_step(observation(), tick_end_ns=clock[0] + 62_500_000)
+    loop.robot.send_action.assert_not_called()
+    loop.controller.commit.assert_not_called()
+
+
+@pytest.mark.parametrize('recording', [True, False])
+def test_record_duration_only_applies_to_recording(monkeypatch, recording):
+    loop = make_loop()
+    begin(loop)
+    loop.recorder = Mock(is_recording=recording)
+    loop.capture_deadline_ns = 100
+    loop.next_tick_ns = 1000
+    monkeypatch.setattr('dexmani_real.teleop.loop.time.monotonic_ns', lambda: 100)
+    loop.run_control_tick()
+    assert loop.pending_termination_reason == ('duration_complete' if recording else None)

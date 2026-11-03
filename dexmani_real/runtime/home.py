@@ -127,12 +127,11 @@ def home_arm(state, robot, planner, *, run_id, cancel_requested):
                 hand_state = feedback.hand
                 if (
                     hand_state is not None
-                    and int(hand_state["timestamp_ns"][0]) > boundary_ns
                     and sample_is_fresh(hand_state["timestamp_ns"][0], hand.feedback_max_age_s, now_ns)
                 ):
                     hand_qpos = hand_state["qpos"][0]
                     break
-                feedback_issue = "fresh post-home hand state unavailable"
+                feedback_issue = "fresh hand state unavailable"
             time.sleep(0.01)
         else:
             raise TimeoutError(feedback_issue)

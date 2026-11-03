@@ -1,7 +1,6 @@
 """调用真实 Raw/Canonical 与首帧选择链路；设备和感知模型使用替身。"""
 
 import json
-from itertools import count
 from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -105,6 +104,7 @@ def test_raw_publication_and_video(tmp_path, capture, frames, save, status):
     ("tactile", "stale_source:tactile_dense_ns", 2),
     ("readout_between", None, None),
     ("readout_limit", "observation_crossed_control_period", 2),
+    ("overlap", "overlapping_control_observations", 0),
     ("source_future", "invalid_source_clock:arm_ns", 2),
     ("source_missing", "invalid_source_clock:hand_ns", 2),
     ("source_regressed", "source_clock_regressed:camera_ns", 2),
@@ -126,6 +126,9 @@ def test_training_admits_only_complete_episode(tmp_path, capture, case, reason, 
                 # dt/4 边界仍接纳，来源值不随导出重采样。
                 rows["control_ns"][1] += 25_000_000
                 rows["observation_ns"][1] += 25_000_000
+            elif case == "overlap":
+                rows["observation_ns"][0] = rows["control_ns"][0] + 80_000_000
+                rows["control_ns"][1] -= 25_000_000
             elif case.startswith("readout"):
                 readout_ns = 30_000_000 if case == "readout_between" else 100_000_000
                 rows["observation_ns"][2] = rows["control_ns"][2] + readout_ns
@@ -161,7 +164,7 @@ def test_training_admits_only_complete_episode(tmp_path, capture, case, reason, 
         np.testing.assert_array_equal(root["meta/episode_ends"][:], [3])
         assert all(array.shape[0] == 3 for _, array in root["data"].arrays())
         quality = root.attrs["episode_quality"][0]
-        assert set(quality) == {"max_control_grid_deviation_ns", "max_readout_ns"}
+        assert set(quality) == {"max_control_grid_deviation_ns", "max_readout_ns", "mean_control_period_ns"}
         if case == "readout_between":
             assert quality["max_readout_ns"] == 30_000_000
         if case == "jitter":
@@ -195,7 +198,7 @@ def test_rollout_writer_finishes_independently_of_model(
         build_observation=lambda rows: rows,
     )
     state = SessionState()
-    epoch = state.arm()
+    run_id = state.arm()
     state.stop_signal.clear()
     state.begin_motion(run_id=state.run_id)
 
@@ -205,9 +208,9 @@ def test_rollout_writer_finishes_independently_of_model(
 
     episode = Rollout(
         state, RealConfig(), SimpleNamespace(control_dt_s=.1, n_obs_steps=1),
-        epoch=epoch, robot=SimpleNamespace(stop=stop), observations=None, needs=None,
+        run_id=run_id, robot=SimpleNamespace(stop=stop), observations=None, needs=None,
         sensors=None, action_mapper=None, model=worker, max_running_s=None,
-        capture_ids=count(1), index=1, output_dir=tmp_path, record_raw=True, audio=Mock(),
+        index=1, output_dir=tmp_path, record_raw=True, audio=Mock(),
     )
     episode.started_ns = 1
     episode.query = Prediction(0, None)
@@ -227,7 +230,7 @@ def test_rollout_writer_finishes_independently_of_model(
     monkeypatch.setattr(recorder_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
 
     def prepare(poll):
-        assert state.begin_motion(run_id=epoch) is not None
+        assert state.begin_motion(run_id=run_id) is not None
         worker.predict(())
         assert entered.wait(2)
         recorder.start(task_label="fixture", collection_source="policy_rollout",
@@ -260,15 +263,12 @@ def test_rollout_writer_finishes_independently_of_model(
     monkeypatch.setattr(worker, "discard_pending", retire)
     episode.preparation_valid = lambda: True
     episode.prepare = prepare
-    keyboard = SimpleNamespace(discard_events=lambda *args: events.append("keys"))
     session, _ = make_session(tmp_path)
     session.runtime_state = state
     session.model = worker
-    session.start_epoch = epoch
-    session.poll_operator = Mock()
+    session.poll_operator = Mock(return_value=run_id)
     session.robot.service_idle = Mock()
     session.action_mapper = session.camera_snapshot = None
-    session.keyboard = keyboard
     state.safety_state = SafetyState.ARMED
     factory = Mock(return_value=episode)
     monkeypatch.setattr('dexmani_real.deployment.session.Rollout', factory)
@@ -283,7 +283,7 @@ def test_rollout_writer_finishes_independently_of_model(
         assert session.episodes == [episode.result]
         factory.assert_called_once()
         session.robot.service_idle.assert_called_once()
-        assert events == ["stop", "writer_close", "model_retire", "keys"]
+        assert events == ["stop", "writer_close", "model_retire"]
         assert [error["stage"] for error in episode.result.errors] == (
             ["recorder_finalize", "retired_model"] if writer_failure else ["retired_model"]
         )
@@ -308,7 +308,7 @@ def test_rollout_writer_finishes_independently_of_model(
     finally:
         release.set()
         worker.close(state)
-        assert worker.wait_closed(2) == ("completed", [])
+        assert worker.wait_closed(2) is True
 
 
 @pytest.mark.parametrize("failure", ["writer", "queue"])
@@ -373,7 +373,7 @@ def test_interrupted_writer_wait_stays_pending_without_restarting_finish(tmp_pat
         episode.preparation_valid = lambda: True
         episode.prepare = lambda poll: episode.stop("operator", run_end_reason=RunEndReason.OPERATOR)
         with pytest.raises(KeyboardInterrupt) as caught:
-            episode.run(keyboard=Mock(), poll_operator=lambda: None)
+            episode.run(poll_operator=lambda: None)
         assert caught.value is interrupt
         state = episode.runtime_state
         assert state.estop_request and state.emergency_signal.is_set() and state.stop_signal.is_set()
@@ -399,3 +399,71 @@ def test_interrupted_writer_wait_stays_pending_without_restarting_finish(tmp_pat
     interrupted_join.assert_called_once()
     assert recorder.published_path is None and recorder.staging_path.is_dir()
 
+
+
+@pytest.mark.parametrize('period,frames,accepted', [
+    (62_500_000, 160, True), (62_600_000, 160, True), (70_000_000, 160, False),
+    (65_625_000, 3, True), (65_625_001, 3, False),
+    (59_375_000, 3, True), (59_374_999, 3, False), (62_500_000, 1, True),
+])
+def test_export_mean_period_boundary(tmp_path, capture, period, frames, accepted, monkeypatch):
+    from dexmani_real.data.export import validate_export_episode
+    from queue import Queue
+    # 批量构造磁盘 fixture，不以生产速度提交合成帧。
+    monkeypatch.setattr(recorder_module, 'Queue', lambda **kw: Queue(maxsize=frames + 1))
+    _, path = record(tmp_path / 'raw', capture, frames=frames)
+    with h5py.File(path / 'data.h5', 'r+') as data:
+        data['meta'].attrs['control_hz'] = 16
+        rows = data['timing/rows'][:]
+        stamps = 1_000_000_000 + np.arange(frames) * period
+        for name in ('control_ns', 'arm_ns', 'hand_ns', 'tactile_aggregate_ns', 'tactile_dense_ns', 'camera_ns'):
+            rows[name] = stamps
+        rows['observation_ns'] = stamps + 1_000_000
+        data['timing/rows'][:] = rows
+    with RawReader(path) as reader:
+        if not accepted:
+            with pytest.raises(ValueError, match='mean_control_period_drift'):
+                validate_export_episode(reader)
+        else:
+            _, quality = validate_export_episode(reader)
+            assert quality['mean_control_period_ns'] == (period if frames > 1 else None)
+
+
+@pytest.mark.parametrize('frames', [2, 4])
+def test_rgb_count_mismatch_rejects_whole_episode(tmp_path, capture, frames):
+    from dexmani_real.data.raw import _VideoWriter
+    _, path = record(tmp_path / 'raw', capture)
+    writer = _VideoWriter(path / 'rgb.mp4', fps=10, width=32, height=32)
+    writer.open()
+    try:
+        for _ in range(frames):
+            writer.write_frame(np.zeros((32, 32, 3), dtype=np.uint8))
+    finally:
+        writer.close()
+    output = tmp_path / 'bad.zarr'
+    with pytest.raises(ValueError):
+        export_zarr(path, output, processing=ExportConfig(pointcloud=PointCloudConfig(
+            remove_table=False, num_points=32, workspace=(-1., -1., 0., 1., 1., 1.),
+        )))
+    assert not output.exists()
+
+
+def test_episode_discovery_allows_number_gaps(tmp_path):
+    from dexmani_real.data.export import discover_episode_dirs
+    for name in ('episode_002', 'episode_005'):
+        (tmp_path / name).mkdir()
+    assert [p.name for p in discover_episode_dirs(tmp_path)] == ['episode_002', 'episode_005']
+
+
+def test_single_125ms_gap_at_16hz_rejects_episode(tmp_path, capture):
+    from dexmani_real.data.export import validate_export_episode
+    _, path = record(tmp_path / 'raw', capture)
+    with h5py.File(path / 'data.h5', 'r+') as data:
+        data['meta'].attrs['control_hz'] = 16
+        rows = data['timing/rows'][:]
+        rows['control_ns'] = [1_000_000_000, 1_062_500_000, 1_187_500_000]
+        rows['observation_ns'] = rows['control_ns'] + 1_000_000
+        data['timing/rows'][:] = rows
+    with RawReader(path) as reader:
+        with pytest.raises(ValueError, match='control_interval_gap_or_drift at row 2'):
+            validate_export_episode(reader)

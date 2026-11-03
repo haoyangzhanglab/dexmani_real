@@ -4,7 +4,7 @@ import json
 import threading
 import time
 from dataclasses import replace
-from itertools import count, pairwise
+from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -22,22 +22,16 @@ from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.runtime.keyboard import Keyboard, KeyEvent
 from dexmani_real.runtime.observation import ObservationNeeds
 from dexmani_real.runtime.state import RunEndReason, SessionState
-from dexmani_real.teleop.audio import AudioFeedback
 from dexmani_real.utils.log import error_detail
 
 
 class Audio:
-    finish = AudioFeedback.finish
 
     def __init__(self, events=None):
         self.events = [] if events is None else events
 
-    def play(self, event, **kwargs):
+    def play(self, event):
         self.events.append(event)
-
-    def wait_until_idle(self, **kwargs):
-        self.events.append("audio_wait")
-        return True
 
     def close(self):
         self.events.append("audio_close")
@@ -67,7 +61,7 @@ def make_rollout(tmp_path, mode="sync", n_obs_steps=1):
         runtime.execution, mode=mode, action_steps=3, prefetch_steps=1, rtc_guidance_cap=1.0,
     ))
     state = SessionState()
-    epoch = state.arm()
+    run_id = state.arm()
     state.stop_signal.clear()
     state.begin_motion(run_id=state.run_id)
     sent = []
@@ -85,10 +79,10 @@ def make_rollout(tmp_path, mode="sync", n_obs_steps=1):
                            control_action_dim=19, action_mode="joint")
     model, audio = Model(), Audio()
     episode = Rollout(
-        state, runtime, info, epoch=epoch, robot=robot,
+        state, runtime, info, run_id=run_id, robot=robot,
         observations=SimpleNamespace(project=lambda row: row), needs=ObservationNeeds(),
         sensors=SimpleNamespace(channels=None), action_mapper=mapper, model=model,
-        max_running_s=None, capture_ids=count(1), index=1, output_dir=tmp_path,
+        max_running_s=None, index=1, output_dir=tmp_path,
         record_raw=False, audio=audio,
     )
     episode.read_observation = lambda: (SimpleNamespace(
@@ -321,7 +315,7 @@ def test_worker_pending_blocks_reuse_and_consumes_late_error():
     finally:
         release.set()
         worker.close(SessionState())
-        assert worker.wait_closed(2) == ("completed", [])
+        assert worker.wait_closed(2) is True
 
 
 def make_session(tmp_path):
@@ -337,7 +331,7 @@ def make_session(tmp_path):
     session.keyboard = SimpleNamespace(listener=None, stop=lambda: events.append("keyboard_stop"))
     session.sensors = SimpleNamespace(started=[], shutdown=lambda state: events.append("sensor_shutdown"))
     session.model = SimpleNamespace(close=lambda state: events.append("model_close"),
-                                    wait_closed=lambda timeout: ("completed", []))
+                                    wait_closed=lambda timeout: True)
     session.audio = Audio(events)
     session.save_results = lambda **kwargs: events.append("results")
     return session, events
@@ -358,14 +352,11 @@ def test_session_closes_resources_before_audio_and_final_result(tmp_path, failur
     failure = OSError("primary failure") if failure_stage == "session" else None
     failed = failure_stage not in (None, "audio")
     assert session.close(failure=failure) == int(failed)
-    assert events.index("sensor_shutdown") < events.index("audio_wait")
-    assert events.index("model_close") < events.index("audio_wait")
+    assert events.index("sensor_shutdown") < events.index("audio_close")
+    assert events.index("model_close") < events.index("audio_close")
     assert events.index("audio_close") < events.index("results")
     assert events.count("results") == events.count("audio_close") == 1
-    if failure_stage in ("robot", "session"):
-        assert "emergency" in events and "end" not in events
-    else:
-        assert "end" in events and "emergency" not in events
+    assert "end" not in events and "emergency" not in events
     assert session.summary["outcome"] == ("fault" if failed else "finished")
     if failure_stage == "session":
         assert session.errors[0] == error_detail("session", failure)
@@ -381,10 +372,10 @@ def test_session_model_wait_has_full_budget_after_slow_device_close(tmp_path, mo
         clock[0] += MODEL_SHUTDOWN_TIMEOUT_S + 1.0
 
     session.robot.close = close_robot
-    session.model.wait_closed = Mock(return_value=("completed", []))
+    session.model.wait_closed = Mock(return_value=True)
     assert session.close() == 0
     session.model.wait_closed.assert_called_once_with(MODEL_SHUTDOWN_TIMEOUT_S)
-    assert events.index("robot_close") < events.index("model_close") < events.index("audio_wait")
+    assert events.index("robot_close") < events.index("model_close") < events.index("audio_close")
     assert session.summary["shutdown"] == "completed"
 
 
@@ -409,7 +400,7 @@ def test_model_wait_failure_saves_result_and_keeps_real_future(
         if done:
             release.set()
             future.result(timeout=2)
-        monkeypatch.setattr(future, "result", Mock(side_effect=wait_failure))
+        monkeypatch.setattr(worker, "wait_closed", Mock(side_effect=wait_failure))
         return future
     worker.close = Mock(side_effect=begin_close)
     session.save_results = Mock(wraps=PolicySession.save_results.__get__(session))
@@ -419,7 +410,7 @@ def test_model_wait_failure_saves_result_and_keeps_real_future(
         assert session.runtime_state.emergency_signal.is_set() == interrupted
         assert session.runtime_state.stop_signal.is_set()
         worker.close.assert_called_once_with(session.runtime_state)
-        worker.close_future.result.assert_called_once_with(timeout=MODEL_SHUTDOWN_TIMEOUT_S)
+        worker.wait_closed.assert_called_once_with(MODEL_SHUTDOWN_TIMEOUT_S)
         assert worker.close_future.done() == done
         session.save_results.assert_called_once_with()
         assert "sensor_shutdown" in events and "audio_close" in events
@@ -453,26 +444,25 @@ def test_retired_model_failure_does_not_hide_model_close_interrupt(tmp_path):
     result = json.loads((tmp_path / "session_result.json").read_text())
     assert result["reason"] == str(primary) and result["shutdown"] == "failed"
     assert result["emergency_stop_requested"]
-    assert result["errors"] == [error_detail("retired_load", primary), error_detail("model_close", interrupt)]
+    assert result["errors"] == [error_detail("model_close_wait", primary)]
 
 
 @pytest.mark.parametrize("keys", [("d", "q"), ("q", "d")])
 def test_policy_discard_quit_and_batch_preparation(tmp_path, keys):
     session, _ = make_session(tmp_path)
     session.runtime_state = SessionState()
-    epoch = session.runtime_state.arm()
+    run_id = session.runtime_state.arm()
     session.episode = SimpleNamespace(discard_requested=False, recorder=None)
     for key in keys:
         {"d": session.request_discard, "q": session.runtime_state.request_quit}[key]()
     assert session.episode.discard_requested and session.runtime_state.quit_requested
     session.episode = None
     session.runtime_state = SessionState()
-    epoch = session.runtime_state.arm()
+    run_id = session.runtime_state.arm()
     # C/S in the same input batch suppress B without adding preparation state.
-    session.handle_command_batch([KeyEvent("c"), KeyEvent("b", epoch)])
-    assert session.start_epoch is None
-    assert session.request_start(epoch)
-    assert not session.request_start(epoch)
+    session.handle_command_batch([KeyEvent("c"), KeyEvent("b", run_id)])
+    assert session.episode is None
+    assert session.handle_command_batch([KeyEvent("b", run_id), KeyEvent("b", run_id)]) == run_id
 
 
 def test_policy_discard_is_latched_before_first_stop_signal(tmp_path, monkeypatch):
@@ -531,7 +521,7 @@ def test_policy_discard_without_recording_stops(tmp_path):
     session.runtime_state.stop_signal.clear()
     session.request_discard()
     assert session.runtime_state.stop_signal.is_set()
-    assert session.episode is None and session.start_epoch is None
+    assert session.episode is None
 
 
 def test_error_detail_does_not_serialize_cause_tracebacks():
@@ -560,12 +550,11 @@ def test_rollout_keeps_primary_and_reports_model_and_writer_failures(tmp_path):
     episode.model.discard_pending = retire
     episode.recorder = SimpleNamespace(start_attempted=True, finish=finish,
                                        result=lambda: {"status": "failed"})
-    keyboard = SimpleNamespace(discard_events=lambda *args: events.append("keys"))
     with pytest.raises(ValueError) as caught:
-        episode.run(keyboard=keyboard, poll_operator=lambda: None)
+        episode.run(poll_operator=lambda: None)
     assert caught.value is primary
     assert caught.traceback[-1].name == "prepare"
-    assert events == ["writer", "model", "keys"]
+    assert events == ["writer", "model"]
     assert [item["stage"] for item in episode.result.errors] == [
         "control", "recorder_finalize", "retired_model",
     ]
@@ -602,8 +591,7 @@ def test_local_submission_rejection_is_not_policy_failure(tmp_path, monkeypatch)
     def reject(*args, **kwargs):
         raise OperationCancelled("current hand feedback unavailable/stale at send")
     episode.robot.send_action = reject
-    keyboard = SimpleNamespace(discard_events=lambda *args: None)
-    result = episode.run(keyboard=keyboard, poll_operator=lambda: None)
+    result = episode.run(poll_operator=lambda: None)
     assert result.errors == []
     assert result.termination_reason == "executor_boundary"
     assert "current hand feedback" in result.termination_details
@@ -618,9 +606,8 @@ def test_persistent_recorder_error_reported_once(tmp_path, caplog):
     episode.recorder.store_error(primary)
     episode.preparation_valid = lambda: True
     episode.prepare = lambda poll: episode.recorder.check_error()
-    keyboard = SimpleNamespace(discard_events=lambda *args: None)
     with pytest.raises(RecordingError) as caught:
-        episode.run(keyboard=keyboard, poll_operator=lambda: None)
+        episode.run(poll_operator=lambda: None)
     assert caught.value is primary
     assert [item["stage"] for item in episode.result.errors] == ["control"]
     assert episode.result.raw["status"] == "failed"
@@ -631,10 +618,10 @@ def test_preparation_key_delayed_until_after_finish_stays_revoked(tmp_path):
     episode, _ = make_rollout(tmp_path)
     captured, release = threading.Event(), threading.Event()
     def get_run_id():
-        epoch = episode.runtime_state.run_id
+        run_id = episode.runtime_state.run_id
         captured.set()
         assert release.wait(2)
-        return epoch
+        return run_id
     keyboard = Keyboard(get_run_id=get_run_id)
     keyboard.active = True
     key_thread = threading.Thread(target=keyboard.handle_key, args=("b", True))
@@ -646,7 +633,7 @@ def test_preparation_key_delayed_until_after_finish_stays_revoked(tmp_path):
     episode.recorder = SimpleNamespace(start_attempted=True, finish=finish,
                                        result=lambda: {"status": "not_published"})
     try:
-        episode.run(keyboard=keyboard, poll_operator=lambda: None)
+        episode.run(poll_operator=lambda: None)
     finally:
         release.set()
         key_thread.join(2)
@@ -655,7 +642,7 @@ def test_preparation_key_delayed_until_after_finish_stays_revoked(tmp_path):
     assert len(events) == 1
     session, _ = make_session(tmp_path)
     session.runtime_state = episode.runtime_state
-    assert not session.request_start(events[0].run_id)
+    assert session.handle_command_batch(events) is None
     keyboard.stop()
 
 
@@ -667,7 +654,7 @@ def test_audio_close_failure_does_not_change_final_result(tmp_path, model_pendin
     session.summary["reason"] = "quit"
     session.save_results = Mock(wraps=PolicySession.save_results.__get__(session))
     if model_pending:
-        session.model.wait_closed = lambda timeout: ("pending", [])
+        session.model.wait_closed = lambda timeout: False
     session.audio.close = Mock(side_effect=audio_error)
     failed = model_pending or failure is not None
     assert session.close(failure=failure) == int(failed)
@@ -693,7 +680,7 @@ def test_final_result_publication_failure_is_reported_after_audio(tmp_path, monk
     write = Mock(side_effect=fail_write)
     monkeypatch.setattr("dexmani_real.deployment.session.write_json", write)
     assert session.close() == 1
-    assert "end" in events and "emergency" not in events
+    assert "end" not in events and "emergency" not in events
     assert events.count("audio_close") == 1
     assert events.index("audio_close") < events.index("results")
     write.assert_called_once()
@@ -704,7 +691,7 @@ def test_final_result_publication_failure_is_reported_after_audio(tmp_path, monk
     assert any(record.exc_info and record.exc_info[1] is failure for record in caplog.records)
 
 
-@pytest.mark.parametrize("stage", ["wait_until_idle", "close"])
+@pytest.mark.parametrize("stage", ["close"])
 def test_audio_shutdown_interrupt_marks_emergency_before_final_result(tmp_path, stage):
     session, _ = make_session(tmp_path)
     session.audio.close = Mock(wraps=session.audio.close)
@@ -727,10 +714,10 @@ def test_busy_operation_revokes_delayed_preparation_key(tmp_path, monkeypatch, o
     session.runtime_state = SessionState()
     captured, release = threading.Event(), threading.Event()
     def get_run_id():
-        epoch = session.runtime_state.run_id
+        run_id = session.runtime_state.run_id
         captured.set()
         assert release.wait(2)
-        return epoch
+        return run_id
     session.keyboard = Keyboard(get_run_id=get_run_id)
     session.keyboard.active = True
     key_thread = threading.Thread(target=session.keyboard.handle_key, args=(key, True))
@@ -747,13 +734,13 @@ def test_busy_operation_revokes_delayed_preparation_key(tmp_path, monkeypatch, o
             monkeypatch.setattr("dexmani_real.deployment.session.initialize_hand", lambda *a, **k: None)
             session.start_devices()
         else:
-            epoch = session.runtime_state.arm()
+            run_id = session.runtime_state.arm()
             if operation == "home":
                 monkeypatch.setattr("dexmani_real.deployment.session.home_robot", busy)
-                assert session.run_home(epoch)
+                assert session.run_home(run_id)
             else:
                 session.robot.reset_tactile_sensors = busy
-                session.handle_command_batch([KeyEvent("t", epoch)], allow_tactile_reset=True)
+                session.handle_command_batch([KeyEvent("t", run_id)], allow_tactile_reset=True)
     finally:
         release.set()
         if key_thread.ident is not None:
@@ -761,7 +748,7 @@ def test_busy_operation_revokes_delayed_preparation_key(tmp_path, monkeypatch, o
     with session.keyboard.condition:
         events = list(session.keyboard.events)
     assert len(events) == 1
-    assert not session.request_start(events[0].run_id)
+    assert session.handle_command_batch(events) is None
     session.keyboard.stop()
 
 
@@ -771,8 +758,8 @@ def test_episode_snapshot_failure_is_recorded_once(tmp_path, monkeypatch, primar
 
     session, _ = make_session(tmp_path)
     session.runtime_state = SessionState()
-    session.start_epoch = session.runtime_state.arm()
-    session.poll_operator = lambda **kwargs: None
+    run_id = session.runtime_state.arm()
+    session.poll_operator = lambda **kwargs: run_id
     session.robot.service_idle = lambda: None
     session.action_mapper = session.camera_snapshot = None
     snapshot_error = OSError('episode snapshot failed')
@@ -813,9 +800,58 @@ def test_frame_recording_failure_is_reported_only_at_finish(tmp_path, monkeypatc
         raise writer
     recorder.append = append
     with pytest.raises(ValueError) as caught:
-        episode.run(keyboard=SimpleNamespace(discard_events=lambda *args: None), poll_operator=lambda: None)
+        episode.run(poll_operator=lambda: None)
     assert caught.value is primary
     assert [error['stage'] for error in episode.result.errors] == ['control', 'recorder_finalize']
     assert sum(record.exc_info is not None and record.exc_info[1] is writer for record in caplog.records) == 1
     assert episode.result.raw['status'] == 'failed'
 
+
+
+@pytest.mark.parametrize('keys,selected,home,tactile', [
+    (['b', 'h'], True, False, False), (['b', 't'], True, False, False),
+    (['b', 'b'], True, False, False), (['h', 'b'], False, True, False),
+    (['t', 'b'], False, False, True), (['old_t', 'b'], True, False, False),
+    (['old_h', 'h'], False, True, False),
+])
+def test_policy_preparation_batch_dispatch(tmp_path, monkeypatch, keys, selected, home, tactile):
+    session, _ = make_session(tmp_path)
+    session.runtime_state = SessionState()
+    run_id = session.runtime_state.arm()
+    home_call = Mock()
+    monkeypatch.setattr('dexmani_real.deployment.session.home_robot', home_call)
+    session.robot.reset_tactile_sensors = Mock()
+    events = [KeyEvent(key.removeprefix('old_'), run_id-1 if key.startswith('old_') else run_id) for key in keys]
+    result = session.handle_command_batch(events, allow_tactile_reset=True)
+    assert result == (run_id if selected else None)
+    assert home_call.called == home
+    assert session.robot.reset_tactile_sensors.called == tactile
+
+
+@pytest.mark.parametrize('key', ['s', 'c', 'd', 'q', 'esc'])
+def test_policy_stopping_batch_never_selects_start(tmp_path, key):
+    session, _ = make_session(tmp_path)
+    session.runtime_state = SessionState()
+    run_id = session.runtime_state.arm()
+    assert session.handle_command_batch([KeyEvent('b', run_id), KeyEvent(key)], allow_tactile_reset=True) is None
+
+
+def test_policy_disabled_t_does_not_block_start(tmp_path):
+    session, _ = make_session(tmp_path)
+    session.runtime_state = SessionState()
+    run_id = session.runtime_state.arm()
+    session.runtime = replace(session.runtime, hand=replace(session.runtime.hand, enabled=False))
+    assert session.handle_command_batch([KeyEvent('t', run_id), KeyEvent('b', run_id)], allow_tactile_reset=True) == run_id
+
+
+def test_policy_raw_uses_result_index(tmp_path, monkeypatch):
+    episode, _ = make_rollout(tmp_path)
+    episode.result.index = 2
+    episode.policy_info.task_name = 'fixture'
+    episode.recorder = Mock()
+    episode.robot.hand = Mock()
+    episode.robot.prepare_streaming = Mock()
+    episode.robot.check = Mock()
+    monkeypatch.setattr('dexmani_real.deployment.rollout.snapshot_recording_metadata', lambda *a, **kw: {})
+    episode.prepare(lambda: None)
+    assert episode.recorder.start.call_args.kwargs['episode_name'] == 'episode_002'

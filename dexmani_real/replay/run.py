@@ -160,7 +160,6 @@ def wait_for_home(runtime_state, runtime, robot, keyboard, outcome, home_results
         robot.check()
         return runtime_state.estop_request or runtime_state.quit_requested
 
-    keyboard.discard_events("h")
     print("H: planned return_home; Q: exit", flush=True)
     while not runtime_state.quit_requested:
         robot.service_idle()
@@ -172,12 +171,10 @@ def wait_for_home(runtime_state, runtime, robot, keyboard, outcome, home_results
             break
         if "s" in keys:
             continue
-        home_event = next((event for event in signals if event.key == "h"), None)
+        home_event = next((event for event in signals if event.key == "h" and runtime_state.can_move(
+            run_id=event.run_id, required_safety_state=SafetyState.ARMED,
+        )), None)
         if home_event is not None:
-            if not runtime_state.can_move(
-                run_id=home_event.run_id, required_safety_state=SafetyState.ARMED,
-            ):
-                continue
             try:
                 home_robot(
                     runtime_state,
@@ -211,6 +208,6 @@ def wait_for_home(runtime_state, runtime, robot, keyboard, outcome, home_results
                 logger.exception("replay HOME failed")
                 break
             finally:
-                keyboard.discard_events("h")
+                runtime_state.revoke_motion()
             home_results.append(dict(ok=True, interrupted=False, reason=""))
             print("Return-home completed. H: planned return_home; Q: exit", flush=True)

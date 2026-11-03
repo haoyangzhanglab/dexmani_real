@@ -39,8 +39,8 @@ class CartesianJog:
         """发布点动目标或减速保持；故障由会话边界记录、撤权并收尾。"""
         pressed_keys = keys.snapshot()
         with state.motion_lock:
-            epoch = state.run_id
-            if not state.can_move(run_id=epoch):
+            run_id = state.run_id
+            if not state.can_move(run_id=run_id):
                 raise OperationCancelled("jog authority revoked")
 
         row = read_observation(None, robot)
@@ -67,7 +67,7 @@ class CartesianJog:
         # 运动目标错过本轮就丢弃；松键或目标拒绝后的制动不能等下一轮。
         if target is not None and time.monotonic_ns() >= tick_end_ns:
             return
-        command = RobotCommand(epoch, arm_qpos=target, arm_hold=target is None)
+        command = RobotCommand(run_id, arm_qpos=target, arm_hold=target is None)
         robot.send_action(
             command,
             expires_ns=time.monotonic_ns() + int(self.config.target_max_age_s * 1e9),

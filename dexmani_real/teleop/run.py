@@ -219,11 +219,10 @@ def run_teleop(
             finally:
                 if audio is not None:
                     try:
-                        success = (
-                            clean and shutdown_clean and not runtime_state.error_state
-                            and not runtime_state.estop_request
-                        )
-                        audio.finish(success)
+                        audio.close()
+                    except KeyboardInterrupt:
+                        runtime_state.request_emergency_stop()
+                        logger.exception("teleop audio cleanup interrupted")
                     except Exception:
                         logger.warning("teleop audio cleanup failed", exc_info=True)
     return int(
@@ -264,7 +263,6 @@ def initialize_teleop(loop, vr_process, *, run_id) -> bool:
     if not calibrate_hand(loop):
         return False
     loop.runtime_state.revoke_motion()
-    loop.keyboard.discard_events("b", "h", "t")
     print(
         "就绪：B 空闲时开始新段 | S/C 保存结束本段 | D 丢弃本段 | "
         "Q 保存并退出 | Esc 急停 | H 空闲时回初始位 | "

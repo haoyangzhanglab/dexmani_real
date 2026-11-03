@@ -110,15 +110,15 @@ class SessionState:
     ) -> RunEndReason:
         # 与设备准备/HOME 共用代际锁；始终先取得本地流程锁。
         with self.motion_lock, self.run_signal.get_lock():
-            old_epoch = self.run_signal.get_obj().value
-            if expected_run_id is not None and old_epoch != expected_run_id:
+            old_run_id = self.run_signal.get_obj().value
+            if expected_run_id is not None and old_run_id != expected_run_id:
                 return self.run_ended_reason if self.run_ended_id == expected_run_id else reason
             if self.safety_state == SafetyState.RUNNING:
                 if self.estop_request:
                     reason = RunEndReason.ESTOP
-                self.run_ended_id = old_epoch
+                self.run_ended_id = old_run_id
                 self.run_ended_reason = reason
-            self.run_signal.get_obj().value = old_epoch + 1
+            self.run_signal.get_obj().value = old_run_id + 1
             self.stop_signal.set()
             self.safety_state = new_state
             return reason

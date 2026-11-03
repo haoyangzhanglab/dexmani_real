@@ -149,7 +149,7 @@ class Keyboard:
         except BaseException:
             try:
                 self.stop()
-            except Exception:
+            except BaseException:
                 logger.exception("keyboard startup cleanup failed")
             raise
 
@@ -161,16 +161,28 @@ class Keyboard:
             self.events.clear()
             self.held_keys.clear()
             self.condition.notify_all()
-        try:
-            if self.listener is not None:
-                self.listener.stop()
-                self.listener.join(timeout=LISTENER_STOP_TIMEOUT_S)
-                # 后端可能仍阻塞；关闭后不再入队，已接纳的幂等停止回调仍可完成。
-                if self.listener.is_alive():
-                    logger.debug("keyboard backend still exiting after stop")
-        finally:
-            restore_terminal_echo(self.saved_termios)
-            self.saved_termios = None
+        saved, self.saved_termios = self.saved_termios, None
+        failure = None
+        steps: list[Callable[[], None]] = []
+        if self.listener is not None:
+            steps.extend((self.listener.stop,
+                          lambda: self.listener.join(timeout=LISTENER_STOP_TIMEOUT_S)))
+        steps.append(lambda: restore_terminal_echo(saved))
+        for step in steps:
+            try:
+                step()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+                else:
+                    logger.exception("additional keyboard shutdown failure")
+                if isinstance(exc, KeyboardInterrupt) and self.estop_callback is not None:
+                    try:
+                        self.estop_callback()
+                    except BaseException:
+                        logger.exception("keyboard shutdown emergency callback failed")
+        if failure is not None:
+            raise failure
 
     def poll(self, timeout=0.05) -> list[KeyEvent]:
         if self.active and not self.check_health():
@@ -196,7 +208,3 @@ class Keyboard:
     def snapshot(self) -> frozenset[str]:
         with self.condition:
             return frozenset(self.held_keys)
-
-    def discard_events(self, *keys):
-        with self.condition:
-            self.events = deque(event for event in self.events if event.key not in keys)
